@@ -268,7 +268,7 @@ check_ros_installation() {
     # Check if ROS 2 Humble is installed
     if [[ ! -f /opt/ros/humble/setup.bash ]]; then
         log_warn "ROS 2 Humble not found at /opt/ros/humble/setup.bash"
-        log_info "Running ROS 2 and colcon installation script..."
+        log_info "Running ROS 2 installation script..."
 
         local install_args=()
         if [[ "${AUTO_YES}" == true ]]; then
@@ -278,16 +278,37 @@ check_ros_installation() {
             install_args+=("--no-sudo")
         fi
 
-        if "${WORKSPACE}/scripts/install_ros_colcon.sh" "${install_args[@]}"; then
-            log_done "ROS 2 Humble and colcon installed"
+        if "${WORKSPACE}/scripts/install_ros.sh" "${install_args[@]}"; then
+            log_done "ROS 2 Humble installed"
         else
             log_error "ROS 2 installation failed"
-            log_error "Please run ${WORKSPACE}/scripts/install_ros_colcon.sh manually to diagnose the issue"
+            log_error "Please run ${WORKSPACE}/scripts/install_ros.sh manually to diagnose the issue"
             exit 1
         fi
     else
         log_info "ROS 2 Humble is already installed"
     fi
+}
+
+ensure_colcon() {
+    if command -v colcon &>/dev/null; then
+        log_info "colcon is already installed"
+        return 0
+    fi
+
+    log_info "Installing colcon build tool..."
+    if command -v apt-get &> /dev/null; then
+        run_sudo apt-get install -y python3-colcon-common-extensions
+    elif command -v dnf &> /dev/null; then
+        # On openEuler, we usually install colcon via pip to get the latest extensions
+        if command -v pip3 &> /dev/null; then
+            pip3 install colcon-common-extensions --quiet
+        else
+            log_error "pip3 not found, cannot install colcon."
+            exit 1
+        fi
+    fi
+    log_done "colcon installed"
 }
 
 check_openeuler() {
@@ -416,6 +437,7 @@ ensure_rosdepc() {
 install_system_deps() {
     # Check for ROS 2 installation first
     check_ros_installation
+    ensure_colcon
 
     check_openeuler
     ensure_rosdepc

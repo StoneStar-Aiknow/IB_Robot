@@ -1,9 +1,9 @@
 #!/bin/bash
-# install_ros_colcon.sh - Automated ROS 2 Humble and colcon installation script
+# install_ros.sh - Automated ROS 2 Humble installation script
 #
 # Description:
-#   This script automates the installation of ROS 2 Humble and the colcon build
-#   tool on supported Linux distributions. It detects the operating system,
+#   This script automates the installation of ROS 2 Humble
+#   on supported Linux distributions. It detects the operating system,
 #   configures the appropriate package repositories, and installs all required
 #   components.
 #
@@ -13,16 +13,15 @@
 #
 # What gets installed:
 #   - ROS 2 Humble (desktop on Ubuntu, base + selected packages on openEuler)
-#   - colcon build tool (python3-colcon-common-extensions or via pip3)
 #   - Required dependencies for the IB_Robot project (MoveIt, ros2_control, etc.)
 #
 # Usage:
-#   ./scripts/install_ros_colcon.sh           # Interactive mode with prompts
-#   ./scripts/install_ros_colcon.sh --yes     # Automated mode (skip prompts)
-#   ./scripts/install_ros_colcon.sh --help    # Show help message
+#   ./scripts/install_ros.sh           # Interactive mode with prompts
+#   ./scripts/install_ros.sh --yes     # Automated mode (skip prompts)
+#   ./scripts/install_ros.sh --help    # Show help message
 #
 # Requirements:
-#   - sudo privileges for package installation
+#   - sudo privileges (or root) for package installation
 #   - internet connection for downloading packages
 #   - supported operating system (Ubuntu or openEuler)
 #
@@ -109,10 +108,12 @@ show_usage() {
     cat << EOF
 Usage: $(basename "$0") [OPTIONS]
 
-Automated ROS 2 Humble and colcon installation script.
+Automated ROS 2 Humble installation script.
 
 OPTIONS:
     --yes, -y       Auto-yes mode (skip all confirmation prompts)
+    --no-sudo       Run without sudo (for root users or containers)
+    --sudo          Force use of sudo (default if not root)
     --help, -h      Show this help message and exit
 
 SUPPORTED OPERATING SYSTEMS:
@@ -121,7 +122,6 @@ SUPPORTED OPERATING SYSTEMS:
 
 WHAT THIS SCRIPT INSTALLS:
     - ROS 2 Humble (desktop or base package depending on OS)
-    - colcon build tool
     - Required dependencies for IB_Robot project
 
 EXAMPLES:
@@ -196,21 +196,11 @@ check_ros_installation() {
     fi
 }
 
-check_colcon_installation() {
-    if command -v colcon &>/dev/null; then
-        log_info "colcon is already installed ($(command -v colcon))"
-        COLCON_INSTALLED=true
-    else
-        log_info "colcon is not installed"
-        COLCON_INSTALLED=false
-    fi
-}
-
 # Check if everything is already installed
 check_if_complete() {
-    if [[ "$ROS_INSTALLED" == true && "$COLCON_INSTALLED" == true ]]; then
+    if [[ "$ROS_INSTALLED" == true ]]; then
         log_info "============================================================"
-        log_info "ROS 2 ${ROS_DISTRO} and colcon are both already installed!"
+        log_info "ROS 2 ${ROS_DISTRO} is already installed!"
         log_info "============================================================"
         log_info "No installation needed. You're all set!"
         log_info "To use ROS 2, source the setup script:"
@@ -223,9 +213,6 @@ confirm_installation() {
     local components=()
     if [[ "$ROS_INSTALLED" == false ]]; then
         components+=("ROS 2 ${ROS_DISTRO}")
-    fi
-    if [[ "$COLCON_INSTALLED" == false ]]; then
-        components+=("colcon")
     fi
 
     local list
@@ -330,19 +317,6 @@ install_ubuntu_ros() {
         return 1
     fi
     log_info "ROS 2 ${ROS_DISTRO} desktop installed successfully"
-
-    # Install colcon
-    if [[ "$COLCON_INSTALLED" == false ]]; then
-        log_info "Installing colcon..."
-        if ! run_sudo apt-get install -y python3-colcon-common-extensions; then
-            log_warn "Failed to install colcon via apt, trying pip3..."
-            if ! pip3 install colcon-common-extensions; then
-                log_error "Failed to install colcon via pip3"
-                return 1
-            fi
-        fi
-        log_info "colcon installed successfully"
-    fi
 }
 
 # ============================================================================
@@ -351,10 +325,6 @@ install_ubuntu_ros() {
 install_openeuler_ros() {
     if [[ "$ROS_INSTALLED" == true ]]; then
         log_info "Skipping ROS 2 installation (already installed)"
-        # Still check if colcon needs to be installed
-        if [[ "$COLCON_INSTALLED" == false ]]; then
-            install_openeuler_colcon
-        fi
         return 0
     fi
 
@@ -423,25 +393,6 @@ install_openeuler_ros_packages() {
     done
 
     log_info "ROS 2 packages installation completed"
-
-    # Install colcon
-    install_openeuler_colcon
-}
-
-install_openeuler_colcon() {
-    if [[ "$COLCON_INSTALLED" == true ]]; then
-        log_info "colcon already installed, skipping"
-        return 0
-    fi
-
-    log_info "Installing colcon for openEuler..."
-
-    if ! pip3 install colcon-common-extensions; then
-        log_error "Failed to install colcon via pip3"
-        return 1
-    fi
-
-    log_info "colcon installed successfully"
 }
 
 # ============================================================================
@@ -478,16 +429,6 @@ verify_installation() {
         errors=$((errors + 1))
     fi
 
-    # Check colcon installation
-    if command -v colcon &>/dev/null; then
-        local colcon_version
-        colcon_version=$(colcon --version 2>/dev/null | head -n1)
-        log_info "✓ colcon installed: $colcon_version"
-    else
-        log_error "✗ colcon installation not found"
-        errors=$((errors + 1))
-    fi
-
     log_info "============================================================"
 
     if [[ $errors -eq 0 ]]; then
@@ -505,7 +446,7 @@ show_success_message() {
     log_info "Installation Complete!"
     log_info "============================================================"
     echo ""
-    log_info "ROS 2 ${ROS_DISTRO} and colcon have been installed successfully."
+    log_info "ROS 2 ${ROS_DISTRO} has been installed successfully."
     echo ""
     log_info "To start using ROS 2, source the setup script:"
     log_info "  source /opt/ros/${ROS_DISTRO}/setup.bash"
@@ -532,7 +473,6 @@ main() {
 
     # Check existing installations
     check_ros_installation
-    check_colcon_installation
 
     # Check if everything is already installed
     check_if_complete
