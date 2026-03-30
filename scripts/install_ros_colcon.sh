@@ -44,6 +44,21 @@ set -e
 # Configuration
 # ============================================================================
 AUTO_YES=false
+USE_SUDO=true
+
+# Detect if running as root
+if [[ $EUID -eq 0 ]]; then
+    USE_SUDO=false
+fi
+
+# Helper to run commands with or without sudo
+run_sudo() {
+    if [[ "${USE_SUDO}" == true ]]; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
 
 # Colors for output
 RED='\033[0;31m'
@@ -63,6 +78,8 @@ parse_args() {
     for arg in "$@"; do
         case "${arg}" in
             --yes|-y) AUTO_YES=true ;;
+            --no-sudo) USE_SUDO=false ;;
+            --sudo) USE_SUDO=true ;;
             --help|-h) show_usage; exit 0 ;;
             *)
                 log_error "Unknown argument: ${arg}"
@@ -77,6 +94,10 @@ parse_args() {
 # Pre-flight Checks
 # ============================================================================
 check_sudo() {
+    if [[ "${USE_SUDO}" == false ]]; then
+        log_info "Running without sudo (root or --no-sudo requested)"
+        return 0
+    fi
     if ! sudo -v &>/dev/null; then
         log_error "This script requires sudo privileges to install packages."
         log_error "Please ensure you have sudo access and try again."
@@ -239,17 +260,17 @@ install_ubuntu_ros() {
 
     # Add ROS 2 GPG key
     log_info "Adding ROS 2 GPG key..."
-    if ! sudo apt update &>/dev/null; then
+    if ! run_sudo apt update &>/dev/null; then
         log_error "Failed to update package lists"
         return 1
     fi
 
-    if ! sudo apt install -y ca-certificates &>/dev/null; then
+    if ! run_sudo apt install -y ca-certificates &>/dev/null; then
         log_error "Failed to install ca-certificates"
         return 1
     fi
 
-    if ! sudo install -m 0755 -d /etc/apt/keyrings &>/dev/null; then
+    if ! run_sudo install -m 0755 -d /etc/apt/keyrings &>/dev/null; then
         log_error "Failed to create keyrings directory"
         return 1
     fi
@@ -260,12 +281,12 @@ install_ubuntu_ros() {
         return 1
     fi
 
-    if ! sudo mv /tmp/ros.asc /etc/apt/keyrings/ros.asc &>/dev/null; then
+    if ! run_sudo mv /tmp/ros.asc /etc/apt/keyrings/ros.asc &>/dev/null; then
         log_error "Failed to move GPG key to keyrings directory"
         return 1
     fi
 
-    if ! sudo chmod a+r /etc/apt/keyrings/ros.asc &>/dev/null; then
+    if ! run_sudo chmod a+r /etc/apt/keyrings/ros.asc &>/dev/null; then
         log_error "Failed to set GPG key permissions"
         return 1
     fi
@@ -275,7 +296,7 @@ install_ubuntu_ros() {
     # Add ROS 2 repository to sources list
     log_info "Adding ROS 2 repository to apt sources..."
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/ros.asc] $ROS_REPO_URL $(lsb_release -cs) main" | \
-        sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
+        run_sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
 
     log_info "ROS 2 repository added successfully"
 
@@ -286,7 +307,7 @@ install_ubuntu_ros() {
     local success=false
 
     while [[ $retry -lt $max_retries && $success == false ]]; do
-        if sudo apt-get update -qq; then
+        if run_sudo apt-get update -qq; then
             success=true
             log_info "Package lists updated successfully"
         else
@@ -304,7 +325,7 @@ install_ubuntu_ros() {
 
     # Install ROS 2 Humble desktop
     log_info "Installing ROS 2 ${ROS_DISTRO} desktop..."
-    if ! sudo apt-get install -y ros-${ROS_DISTRO}-desktop; then
+    if ! run_sudo apt-get install -y ros-${ROS_DISTRO}-desktop; then
         log_error "Failed to install ROS 2 ${ROS_DISTRO} desktop"
         return 1
     fi
@@ -313,7 +334,7 @@ install_ubuntu_ros() {
     # Install colcon
     if [[ "$COLCON_INSTALLED" == false ]]; then
         log_info "Installing colcon..."
-        if ! sudo apt-get install -y python3-colcon-common-extensions; then
+        if ! run_sudo apt-get install -y python3-colcon-common-extensions; then
             log_warn "Failed to install colcon via apt, trying pip3..."
             if ! pip3 install colcon-common-extensions; then
                 log_error "Failed to install colcon via pip3"
@@ -341,7 +362,7 @@ install_openeuler_ros() {
 
     # Create ROS.repo with dynamic architecture
     log_info "Creating ROS repository configuration..."
-    sudo bash -c "cat << EOF > /etc/yum.repos.d/ROS.repo
+    run_sudo bash -c "cat << EOF > /etc/yum.repos.d/ROS.repo
 [openEulerROS-${ROS_DISTRO}]
 name=openEulerROS-${ROS_DISTRO}
 baseurl=${ROS_REPO_URL}
@@ -358,11 +379,11 @@ EOF"
 
     # Update package cache
     log_info "Updating dnf package cache..."
-    if ! sudo dnf clean all &>/dev/null; then
+    if ! run_sudo dnf clean all &>/dev/null; then
         log_warn "dnf clean all failed, continuing..."
     fi
 
-    if ! sudo dnf makecache; then
+    if ! run_sudo dnf makecache; then
         log_error "Failed to update dnf package cache"
         log_error "Please check your internet connection and repository configuration"
         return 1
@@ -394,7 +415,7 @@ install_openeuler_ros_packages() {
 
     for pkg in "${ros_packages[@]}"; do
         log_info "Installing $pkg..."
-        if ! sudo dnf install -y --nogpgcheck "$pkg"; then
+        if ! run_sudo dnf install -y --nogpgcheck "$pkg"; then
             log_warn "Failed to install $pkg (may not be available in repo)"
         else
             log_info "Successfully installed $pkg"
