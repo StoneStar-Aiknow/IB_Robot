@@ -402,9 +402,18 @@ ensure_rosdepc() {
             log_info "Python SSL cert path: ${ssl_pem}"
             log_info "System CA bundle: ${ca_bundle}"
 
-            log_warn "This fix will copy the system CA bundle to Python's SSL cert path."
-            log_warn "This is a global change that may affect other Python applications."
-            if ask_yn "Apply SSL certificate fix (copy system CA bundle to Python SSL path)?" "n"; then
+            # Check if source and destination are the same file (e.g. symlinks)
+            local real_ssl_pem real_ca_bundle
+            real_ssl_pem=$(realpath "${ssl_pem}" 2>/dev/null || echo "${ssl_pem}")
+            real_ca_bundle=$(realpath "${ca_bundle}" 2>/dev/null || echo "${ca_bundle}")
+
+            if [[ "${real_ssl_pem}" == "${real_ca_bundle}" ]]; then
+                log_info "Python SSL cert path and system CA bundle are already the same file."
+                log_info "  ${ssl_pem} -> ${real_ssl_pem}"
+                log_info "  ${ca_bundle} -> ${real_ca_bundle}"
+                log_info "No copy needed. SSL certificates are already correctly configured."
+                log_done "SSL certificates verified (already linked)"
+            elif ask_yn "Apply SSL certificate fix (copy system CA bundle to Python SSL path)?" "n"; then
                 log_info "Creating directory: $(dirname "${ssl_pem}")"
                 run_sudo mkdir -p "$(dirname "${ssl_pem}")"
 
