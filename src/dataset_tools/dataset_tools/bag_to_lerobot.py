@@ -102,6 +102,14 @@ from robot_config.contract_utils import (
     stamp_from_header_ns,
     zero_pad as make_zero_pad,
 )
+from robot_config.utils import (
+    build_joint_conversion_table,
+    build_joint_conversion_table_from_calibration,
+    normalize_lerobot_norm_mode,
+    resolve_calibration_path_from_config,
+    resolve_gripper_joints_from_config,
+    resolve_lerobot_norm_mode,
+)
 
 # Import decoders to register them
 import tensormsg.converter  # noqa: F401
@@ -151,6 +159,98 @@ def _dataset_metadata_for_bag(bag_dir: Path) -> Dict[str, Any]:
     if not dataset_meta.exists():
         return {}
     return _read_yaml(dataset_meta)
+
+
+def _lerobot_metadata_entry(
+    dataset_meta: Dict[str, Any],
+    bag_info: Dict[str, Any],
+) -> Tuple[str, Dict[str, Any]]:
+    """Resolve the active LeRobot conversion metadata for one bag."""
+    if not isinstance(dataset_meta, dict):
+        return "", {}
+
+    lerobot_meta = dataset_meta.get("lerobot")
+    if not isinstance(lerobot_meta, dict):
+        return "", {}
+
+    conversions = lerobot_meta.get("conversions")
+    if not isinstance(conversions, dict):
+        return "", {}
+
+    custom_data = bag_info.get("custom_data")
+    fingerprint = ""
+    if isinstance(custom_data, dict):
+        fingerprint = str(custom_data.get("ibrobot.lerobot_conversion_fingerprint", "") or "")
+    if not fingerprint:
+        fingerprint = str(lerobot_meta.get("default_conversion_fingerprint", "") or "")
+    if not fingerprint:
+        return "", {}
+
+    conversion_meta = conversions.get(fingerprint)
+    if not isinstance(conversion_meta, dict):
+        return fingerprint, {}
+    return fingerprint, conversion_meta
+
+
+def _resolve_fallback_conversion_config(robot_config_path: Path) -> Dict[str, Any]:
+    """Resolve conversion inputs directly from robot_config for older datasets."""
+    robot_config = _read_yaml(robot_config_path)
+    if not robot_config:
+        return {}
+    return {
+        "norm_mode": resolve_lerobot_norm_mode(robot_config),
+        "gripper_joints": resolve_gripper_joints_from_config(robot_config),
+        "calibration_file": resolve_calibration_path_from_config(robot_config),
+    }
+
+
+def _build_feature_conversion_table(
+    feature_names: List[str],
+    conversion_meta: Dict[str, Any],
+    fallback_config: Dict[str, Any],
+) -> List[Tuple[float, float, float, float]]:
+    """Build a per-feature conversion table in the feature's declared joint order."""
+    ordered_names = [str(name) for name in feature_names]
+    if not ordered_names:
+        return []
+
+    if conversion_meta:
+        norm_mode = normalize_lerobot_norm_mode(str(conversion_meta.get("norm_mode", "")))
+        if norm_mode == "none":
+            return []
+        calibration = conversion_meta.get("calibration")
+        if isinstance(calibration, dict):
+            return build_joint_conversion_table_from_calibration(
+                calibration=calibration,
+                joint_names=ordered_names,
+                gripper_joints=conversion_meta.get("gripper_joints"),
+                norm_mode=norm_mode,
+            )
+        raise ValueError("Dataset conversion metadata is missing calibration snapshot")
+
+    calib_file = str(fallback_config.get("calibration_file", "") or "")
+    if not calib_file:
+        return []
+    return build_joint_conversion_table(
+        calib_file=calib_file,
+        joint_names=ordered_names,
+        gripper_joints=fallback_config.get("gripper_joints"),
+        norm_mode=str(fallback_config.get("norm_mode", "")),
+    )
+
+
+def _rad_to_lerobot(values: np.ndarray, table: List[Tuple[float, float, float, float]]) -> np.ndarray:
+    """Convert a flat radian vector into LeRobot units using a conversion table."""
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    if not table:
+        return arr
+
+    out = arr.copy()
+    for i, (rad_min, rad_max, span, offset) in enumerate(table):
+        if i >= out.shape[0]:
+            break
+        out[i] = (arr[i] - rad_min) / (rad_max - rad_min) * span + offset
+    return out
 
 
 def _topic_type_map(reader: rosbag2_py.SequentialReader) -> Dict[str, str]:
@@ -289,6 +389,7 @@ def export_bags_to_lerobot(
         If a bag contains no usable/decodable messages.
     """
     contract = _load_contract_from_robot_config(robot_config_path)
+    fallback_conversion_config = _resolve_fallback_conversion_config(robot_config_path)
     fps = int(contract.rate_hz)
     if fps <= 0:
         raise ValueError("Contract rate_hz must be > 0")
@@ -418,6 +519,18 @@ def export_bags_to_lerobot(
         if ft["dtype"] in ("video", "image", "float32", "float64", "string")
     ]
     shapes = {k: tuple(features[k]["shape"]) for k in write_keys}
+    state_feature_names = [
+        str(name) for name in features.get("observation.state", {}).get("names", [])
+    ]
+    action_feature_names = {
+        action_key: [str(name) for name in features[action_key].get("names", [])]
+        for action_key in action_specs_by_key
+        if action_key in features
+    }
+    conversion_table_cache: Dict[
+        Tuple[str, Tuple[str, ...]],
+        List[Tuple[float, float, float, float]],
+    ] = {}
 
     # Episodes
     for epi_idx, bag_dir in enumerate(bag_dirs):
@@ -434,6 +547,7 @@ def export_bags_to_lerobot(
             info = meta.get("rosbag2_bagfile_information") or {}
             storage = info.get("storage_identifier") or "mcap"
             meta_dur_ns = int((info.get("duration") or {}).get("nanoseconds") or 0)
+            conversion_fp, conversion_meta = _lerobot_metadata_entry(dataset_meta, info)
 
             # Operator prompt (if present). Accept either old/new keys gracefully.
             prompt = ""
@@ -558,6 +672,42 @@ def export_bags_to_lerobot(
                 pol, ts, st.val, ticks_ns, step_ns, st.spec.asof_tol_ms
             )
 
+        state_conversion_table: List[Tuple[float, float, float, float]] = []
+        if state_feature_names:
+            cache_key = (conversion_fp or "robot_config", tuple(state_feature_names))
+            if cache_key not in conversion_table_cache:
+                try:
+                    conversion_table_cache[cache_key] = _build_feature_conversion_table(
+                        feature_names=state_feature_names,
+                        conversion_meta=conversion_meta,
+                        fallback_config=fallback_conversion_config,
+                    )
+                except (FileNotFoundError, KeyError, ValueError) as exc:
+                    print(
+                        f"[WARN] Failed to build observation.state conversion table for "
+                        f"{bag_dir}: {exc}"
+                    )
+                    conversion_table_cache[cache_key] = []
+            state_conversion_table = conversion_table_cache[cache_key]
+
+        action_conversion_tables: Dict[str, List[Tuple[float, float, float, float]]] = {}
+        for action_key, feature_names in action_feature_names.items():
+            cache_key = (conversion_fp or "robot_config", tuple(feature_names))
+            if cache_key not in conversion_table_cache:
+                try:
+                    conversion_table_cache[cache_key] = _build_feature_conversion_table(
+                        feature_names=feature_names,
+                        conversion_meta=conversion_meta,
+                        fallback_config=fallback_conversion_config,
+                    )
+                except (FileNotFoundError, KeyError, ValueError) as exc:
+                    print(
+                        f"[WARN] Failed to build {action_key} conversion table for "
+                        f"{bag_dir}: {exc}"
+                    )
+                    conversion_table_cache[cache_key] = []
+            action_conversion_tables[action_key] = conversion_table_cache[cache_key]
+
         # Write frames
         for i in range(n_ticks):
             frame: Dict[str, Any] = {}
@@ -577,6 +727,17 @@ def export_bags_to_lerobot(
                 if state_values:
                     # Concatenate all state values
                     concatenated_state = np.concatenate(state_values)
+                    exp = int(features["observation.state"]["shape"][0])
+                    if concatenated_state.shape[0] != exp:
+                        fixed = np.zeros((exp,), dtype=np.float32)
+                        fixed[: min(exp, concatenated_state.shape[0])] = concatenated_state[
+                            : min(exp, concatenated_state.shape[0])
+                        ]
+                        concatenated_state = fixed
+                    if state_conversion_table:
+                        concatenated_state = _rad_to_lerobot(
+                            concatenated_state, state_conversion_table
+                        )
                     frame["observation.state"] = concatenated_state
                 else:
                     # Use zero padding if no state values available
@@ -603,8 +764,15 @@ def export_bags_to_lerobot(
                         exp = int(features[action_key]["shape"][0])
                         if concatenated_action.shape[0] != exp:
                             fixed = np.zeros((exp,), dtype=np.float32)
-                            fixed[: min(exp, concatenated_action.shape[0])] = concatenated_action[: min(exp, concatenated_action.shape[0])]
+                            fixed[: min(exp, concatenated_action.shape[0])] = (
+                                concatenated_action[: min(exp, concatenated_action.shape[0])]
+                            )
                             concatenated_action = fixed
+                        conversion_table = action_conversion_tables.get(action_key, [])
+                        if conversion_table:
+                            concatenated_action = _rad_to_lerobot(
+                                concatenated_action, conversion_table
+                            )
 
                         frame[action_key] = concatenated_action
                     else:

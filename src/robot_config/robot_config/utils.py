@@ -449,6 +449,58 @@ def build_lerobot_conversion_metadata(
     return metadata
 
 
+def build_joint_conversion_table_from_calibration(
+    calibration: Dict[str, Any],
+    joint_names: List[str],
+    gripper_joints: Optional[List[str]] = None,
+    norm_mode: str = NORM_MODE_RANGE,
+) -> List[JointConversionEntry]:
+    """Build a conversion table from calibration content already in memory."""
+    mode = normalize_lerobot_norm_mode(norm_mode)
+    if mode == NORM_MODE_NONE:
+        return []
+
+    ordered_joints = [str(name) for name in joint_names]
+    gripper_joint_set = {str(name) for name in (gripper_joints or [])}
+    table: List[JointConversionEntry] = []
+
+    for joint_name in ordered_joints:
+        if joint_name not in calibration:
+            raise KeyError(f"Joint '{joint_name}' missing from calibration data")
+
+        entry = calibration[joint_name]
+        if not isinstance(entry, dict):
+            raise ValueError(f"Calibration entry for joint '{joint_name}' must be an object")
+
+        tick_min = int(entry["range_min"])
+        tick_max = int(entry["range_max"])
+
+        if mode == NORM_MODE_DEGREES:
+            mid = (tick_min + tick_max) / 2.0
+            max_res = _MODEL_RESOLUTION - 1  # 4095
+            deg_at_tick_min = (tick_min - mid) * 360.0 / max_res
+            deg_at_tick_max = (tick_max - mid) * 360.0 / max_res
+
+            rad_min = (tick_min - 2048.0) / _TICKS_PER_RAD
+            rad_max = (tick_max - 2048.0) / _TICKS_PER_RAD
+            span = deg_at_tick_max - deg_at_tick_min
+            offset = deg_at_tick_min
+        else:
+            rad_min = (tick_min - 2048.0) / _TICKS_PER_RAD
+            rad_max = (tick_max - 2048.0) / _TICKS_PER_RAD
+
+            if joint_name in gripper_joint_set:
+                span = 100.0
+                offset = 0.0
+            else:
+                span = 200.0
+                offset = -100.0
+
+        table.append((rad_min, rad_max, span, offset))
+
+    return table
+
+
 def build_joint_conversion_table(
     calib_file: str,
     joint_names: List[str],
@@ -499,52 +551,10 @@ def build_joint_conversion_table(
         degree endpoints, and ``span / offset`` encode the degree range so that
         the same linear formula works.
     """
-    norm_mode = normalize_lerobot_norm_mode(norm_mode)
-    if norm_mode == NORM_MODE_NONE:
-        return []
-
-    if gripper_joints is None:
-        gripper_joints = []
-
-    with open(calib_file, "r") as fh:
-        calib = json.load(fh)
-
-    table: List[JointConversionEntry] = []
-    for jname in joint_names:
-        entry = calib[jname]
-        tick_min = entry["range_min"]
-        tick_max = entry["range_max"]
-
-        if norm_mode == NORM_MODE_DEGREES:
-            # LeRobot DEGREES: deg = (tick - mid) * 360 / (resolution - 1)
-            # Compute the degree values at tick_min and tick_max, then
-            # derive (rad_min, rad_max, span, offset) so the generic
-            # linear formula gives us the correct degree output.
-            mid = (tick_min + tick_max) / 2.0
-            max_res = _MODEL_RESOLUTION - 1  # 4095
-            deg_at_tick_min = (tick_min - mid) * 360.0 / max_res
-            deg_at_tick_max = (tick_max - mid) * 360.0 / max_res
-
-            rad_min = (tick_min - 2048.0) / _TICKS_PER_RAD
-            rad_max = (tick_max - 2048.0) / _TICKS_PER_RAD
-
-            # We want:  deg = (rad - rad_min) / (rad_max - rad_min) * span + offset
-            # At rad_min → deg_at_tick_min,  at rad_max → deg_at_tick_max
-            # => offset = deg_at_tick_min,  span = deg_at_tick_max - deg_at_tick_min
-            span = deg_at_tick_max - deg_at_tick_min
-            offset = deg_at_tick_min
-        else:
-            # RANGE_M100_100 / RANGE_0_100
-            rad_min = (tick_min - 2048.0) / _TICKS_PER_RAD
-            rad_max = (tick_max - 2048.0) / _TICKS_PER_RAD
-
-            if jname in gripper_joints:
-                span = 100.0
-                offset = 0.0
-            else:
-                span = 200.0
-                offset = -100.0
-
-        table.append((rad_min, rad_max, span, offset))
-
-    return table
+    calibration = load_calibration_data(calib_file)
+    return build_joint_conversion_table_from_calibration(
+        calibration=calibration,
+        joint_names=joint_names,
+        gripper_joints=gripper_joints,
+        norm_mode=norm_mode,
+    )
