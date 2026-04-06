@@ -49,6 +49,26 @@ ros2 launch robot_config robot.launch.py \
 ros2 run dataset_tools record_cli
 ```
 
+episodic 录制目录现在按 dataset 组织：
+
+```text
+<bag_base_dir>/
+└── <dataset_name>/
+    ├── dataset.yaml
+    └── episodes/
+        ├── episode_000001/
+        │   ├── metadata.yaml
+        │   └── *.mcap
+        └── episode_000002/
+            ├── metadata.yaml
+            └── *.mcap
+```
+
+- `bag_base_dir` 来自 `robot_config.recording.bag_base_dir`
+- `dataset_name` 默认取 `recording.dataset_name`，未配置时回退到机器人名
+- `dataset.yaml` 保存 dataset 级元信息；可选通过 `recording.default_task`、`recording.task_family` 预填任务语义
+- episode 级 prompt 仍写入各自 bag 的 `metadata.yaml`
+
 **使用方式**：
 ```
 ========================================================
@@ -79,6 +99,12 @@ ros2 run dataset_tools bag_to_lerobot \
     --bags /path/to/epi1 /path/to/epi2 \
     --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
     --out /path/to/output_dataset
+
+# 直接转换一个 dataset 根目录（推荐）
+ros2 run dataset_tools bag_to_lerobot \
+    --bags-dir ~/rosbag/episodes/so101_single_arm \
+    --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
+    --out /path/to/output_dataset
 ```
 
 **参数说明**：
@@ -87,6 +113,7 @@ ros2 run dataset_tools bag_to_lerobot \
 |------|------|--------|
 | `--bag` | 单个 bag 目录路径 | 必需（与 --bags 二选一） |
 | `--bags` | 多个 bag 目录路径 | 必需（与 --bag 二选一） |
+| `--bags-dir` | episode 目录或 dataset 根目录，自动发现多个 bag | 必需（与 --bag 二选一） |
 | `--robot-config` | robot_config.yaml 路径 | 必需 |
 | `--out` | 输出数据集目录 | 必需 |
 | `--repo-id` | 数据集 repo_id | `rosbag_v30` |
@@ -117,6 +144,7 @@ output_dataset/
 由 launch 文件自动启动的录制服务，提供 `record_episode` Action Server。
 
 通常不需要直接运行，由 `robot.launch.py` 根据 `record_mode:=episodic` 参数自动加载。
+录制结果会写到 `<bag_base_dir>/<dataset_name>/episodes/episode_XXXXXX/`，并在 dataset 根目录生成 `dataset.yaml`。
 
 ### 4. camera_alignment - 基于 ArUco 的相机对齐工具
 

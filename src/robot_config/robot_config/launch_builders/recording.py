@@ -9,6 +9,7 @@ Supports two recording modes:
 """
 
 import os
+import re
 from pathlib import Path
 from datetime import datetime
 from typing import List, Union
@@ -16,6 +17,13 @@ from launch_ros.actions import Node
 from launch.actions import ExecuteProcess
 
 from robot_config.utils import resolve_ros_path
+
+
+def _sanitize_dataset_name(value: str) -> str:
+    """Normalize dataset names so launch logs match recorder output paths."""
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
+    normalized = normalized.strip("._-")
+    return normalized or "dataset"
 
 
 def generate_recording_nodes(robot_config: dict, active_control_mode: str, record_mode: str = 'continuous') -> List[Union[Node, ExecuteProcess]]:
@@ -104,8 +112,8 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
     Generate episodic recording node using episode_recorder Action Server.
 
     This creates an Action Server that waits for trigger commands to start
-    recording individual episodes. Each episode is saved as a separate bag file
-    with semantic metadata (operator prompt).
+    recording individual episodes. Each episode is saved as a dataset-scoped
+    bag directory with semantic metadata (operator prompt).
 
     **IMPORTANT**: The episode_recorder Action Server runs in the background.
     You MUST manually run `record_cli` in a separate terminal to trigger recordings.
@@ -120,7 +128,7 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
     Behavior:
         - Uses contract section directly from robot_config.yaml (Single Source of Truth)
         - Starts episode_recorder Action Server (background service)
-        - Each episode saved as: ~/rosbag_demos/episodes/<timestamp>
+        - Each episode saved as: <bag_base_dir>/<dataset_name>/episodes/episode_XXXXXX
         - Operator prompt embedded in bag metadata
     """
     print(f"[recording_builder] Using EPISODIC recording (episode_recorder Action Server)")
@@ -146,6 +154,17 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
             "robot_config dict is missing '_config_path'. Cannot launch episodic recording without it."
         )
 
+    dataset_name = _sanitize_dataset_name(
+        str(
+            recording_config.get('dataset_name')
+            or robot_config.get('name')
+            or Path(robot_config_path).stem
+        )
+    )
+    dataset_root = Path(bag_base_dir).expanduser() / str(dataset_name)
+    default_task = str(recording_config.get('default_task', '') or '')
+    task_family = str(recording_config.get('task_family', '') or '')
+
     # Create episode_recorder node (Action Server)
     episode_recorder_node = Node(
         package='dataset_tools',
@@ -155,14 +174,21 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
         parameters=[
             {'robot_config_path': robot_config_path},
             {'bag_base_dir': bag_base_dir},
+            {'dataset_name': str(dataset_name)},
+            {'control_mode': active_control_mode},
+            {'default_task': default_task},
+            {'task_family': task_family},
         ],
     )
 
     print(f"[recording_builder] ✓ Episode recorder node created")
+    print(f"[recording_builder] Dataset root: {dataset_root}")
     print(f"[recording_builder]")
     print(f"[recording_builder] " + "="*70)
     print(f"[recording_builder] ⚠️  IMPORTANT: Use SEPARATE TERMINAL to trigger recordings:")
     print(f"[recording_builder]     ros2 run dataset_tools record_cli")
+    print(f"[recording_builder] Convert later with:")
+    print(f"[recording_builder]     ros2 run dataset_tools bag_to_lerobot --bags-dir {dataset_root} --robot-config {robot_config_path} --out /path/to/output_dataset")
     print(f"[recording_builder] " + "="*70)
 
     return [episode_recorder_node]

@@ -143,6 +143,16 @@ def _read_yaml(p: Path) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+def _dataset_metadata_for_bag(bag_dir: Path) -> Dict[str, Any]:
+    """Load dataset metadata when the bag lives under <dataset_root>/episodes/."""
+    if bag_dir.parent.name != "episodes":
+        return {}
+    dataset_meta = bag_dir.parent.parent / "dataset.yaml"
+    if not dataset_meta.exists():
+        return {}
+    return _read_yaml(dataset_meta)
+
+
 def _topic_type_map(reader: rosbag2_py.SequentialReader) -> Dict[str, str]:
     """Build a `{topic: type}` map from a rosbag2 reader."""
     return {t.name: t.type for t in reader.get_all_topics_and_types()}
@@ -420,6 +430,7 @@ def export_bags_to_lerobot(
 
         try:
             meta = _read_yaml(bag_dir / "metadata.yaml")
+            dataset_meta = _dataset_metadata_for_bag(bag_dir)
             info = meta.get("rosbag2_bagfile_information") or {}
             storage = info.get("storage_identifier") or "mcap"
             meta_dur_ns = int((info.get("duration") or {}).get("nanoseconds") or 0)
@@ -429,6 +440,12 @@ def export_bags_to_lerobot(
             cd = info.get("custom_data")
             if isinstance(cd, dict):
                 prompt = cd.get("lerobot.operator_prompt", prompt) or prompt
+            if not prompt and isinstance(dataset_meta, dict):
+                prompt = str(
+                    dataset_meta.get("default_task")
+                    or dataset_meta.get("task")
+                    or prompt
+                )
 
             # Reader
             reader = rosbag2_py.SequentialReader()
@@ -770,8 +787,15 @@ def main() -> None:
     elif args.bags:
         bag_dirs = [Path(p) for p in args.bags]
     else:
-        # Auto-discover: find all subdirectories that contain metadata.yaml
         session_dir = Path(args.bags_dir)
+        if (session_dir / "dataset.yaml").exists() and (session_dir / "episodes").is_dir():
+            print(
+                f"[bag_to_lerobot] Using dataset root {session_dir} "
+                f"→ scanning {session_dir / 'episodes'}"
+            )
+            session_dir = session_dir / "episodes"
+
+        # Auto-discover: find all subdirectories that contain metadata.yaml
         bag_dirs = sorted(
             p for p in session_dir.iterdir()
             if p.is_dir() and (p / "metadata.yaml").exists()
