@@ -4,11 +4,17 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+from launch import LaunchContext
 from launch.actions import RegisterEventHandler
 from launch_ros.actions import Node
 
 from robot_config.launch_builders import tracing as tracing_builder
-from robot_config.launch_builders.control import generate_controller_spawners
+from robot_config.launch_builders.control import (
+    generate_controller_spawners,
+    generate_ros2_control_nodes,
+)
+from robot_config.launch_builders.navigation import generate_navigation_nodes
+from robot_config.launch_builders.teleop import generate_teleop_nodes
 from robot_config.launch_builders.sim_backend import get_sim_backend
 from robot_config.loader import load_robot_config_dict
 from robot_config.wait_for_controllers import missing_inactive_controllers
@@ -128,3 +134,100 @@ def test_custom_trace_session_collision_fails(monkeypatch, tmp_path):
         assert "custom_trace" in str(exc)
     else:
         raise AssertionError("Expected custom tracing session collision to raise RuntimeError")
+
+
+def test_generate_navigation_nodes_for_lekiwi_mode():
+    ekf_config = str(
+        Path(__file__).resolve().parents[1] / "config" / "lekiwi" / "navigation" / "ekf.yaml"
+    )
+    nodes = generate_navigation_nodes(
+        {
+            "navigation": {
+                "enabled": True,
+                "default_mode": "full",
+                "modes": {"full": {"config": ekf_config}},
+            }
+        }
+    )
+
+    assert len(nodes) == 1
+    assert isinstance(nodes[0], Node)
+
+
+def test_lekiwi_sim_uses_sim_controller_override():
+    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "lekiwi.yaml"
+    robot_config = load_robot_config_dict(config_path)
+
+    _nodes, controller_names, _deferred_spawners, _robot_description = generate_ros2_control_nodes(
+        robot_config,
+        use_sim=True,
+        auto_start_controllers="true",
+    )
+
+    assert controller_names == ["joint_state_broadcaster", "base_controller"]
+
+
+def test_generate_navigation_nodes_honors_force_enable_override():
+    ekf_config = str(
+        Path(__file__).resolve().parents[1] / "config" / "lekiwi" / "navigation" / "ekf.yaml"
+    )
+    nodes = generate_navigation_nodes(
+        {
+            "navigation": {
+                "enabled": False,
+                "default_mode": "full",
+                "modes": {"full": {"config": ekf_config}},
+            }
+        },
+        force_enable=True,
+    )
+
+    assert len(nodes) == 1
+    assert isinstance(nodes[0], Node)
+
+
+def test_launch_setup_enables_navigation_when_requested():
+    context = LaunchContext()
+    context.launch_configurations["robot_config"] = "lekiwi"
+    context.launch_configurations["use_sim"] = "false"
+    context.launch_configurations["auto_start_controllers"] = "false"
+    context.launch_configurations["control_mode"] = "teleop"
+    context.launch_configurations["with_navigation"] = "true"
+    context.launch_configurations["navigation_mode"] = "full"
+
+    actions = robot_launch.launch_setup(context)
+    nav_nodes = [
+        action for action in actions
+        if isinstance(action, Node) and action.node_package == "robot_localization"
+    ]
+
+    assert len(nav_nodes) == 1
+
+
+def test_launch_loader_preserves_config_path_for_runtime_consumers():
+    robot_config = robot_launch.load_robot_config("lekiwi")
+
+    assert robot_config["name"] == "lekiwi"
+    assert robot_config["_config_path"].endswith("config/robots/lekiwi.yaml")
+
+
+def test_generate_joy_teleop_nodes_for_mobile_base():
+    nodes = generate_teleop_nodes(
+        {
+            "teleoperation": {
+                "enabled": True,
+                "active_device": "lekiwi_gamepad",
+                "devices": [
+                    {
+                        "name": "lekiwi_gamepad",
+                        "type": "joy_teleop",
+                        "config_path": "$(find robot_config)/config/lekiwi/lekiwi_teleop.yaml",
+                        "input_device": "/dev/input/js0",
+                    }
+                ],
+            }
+        }
+    )
+
+    assert len(nodes) == 2
+    assert all(isinstance(node, Node) for node in nodes)

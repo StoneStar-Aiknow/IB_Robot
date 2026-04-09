@@ -17,7 +17,13 @@
 
   <!-- Camera drivers (executed, not linked) -->
   <exec_depend>usb_cam</exec_depend>
+  <exec_depend>camera_ros</exec_depend>
   <exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>ldlidar_ros2</exec_depend>
+  <exec_depend>joy</exec_depend>
+  <exec_depend>joy_teleop</exec_depend>
+  <exec_depend>robot_localization</exec_depend>
+  <exec_depend>omni_wheel_controller</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>voice_asr_service</exec_depend>
 

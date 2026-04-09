@@ -145,7 +145,12 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
 
         if control_mode_name:
             mode_config = control_modes[control_mode_name]
-            controller_names = mode_config.get("controllers", [])
+            if is_sim and mode_config.get("sim_controllers") is not None:
+                controller_names = mode_config.get("sim_controllers", [])
+            elif not is_sim and mode_config.get("hardware_controllers") is not None:
+                controller_names = mode_config.get("hardware_controllers", [])
+            else:
+                controller_names = mode_config.get("controllers", [])
             mode_description = mode_config.get("description", "No description")
             logger.info(f"Using control mode: {control_mode_name}")
             logger.info(f"  Description: {mode_description}")

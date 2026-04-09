@@ -299,29 +299,37 @@ def validate_config(config: RobotConfig) -> List[str]:
         if calib_file and not Path(calib_file).exists():
             errors.append(f"Calibration file not found: {calib_file}")
 
-    # Validate cameras
-    camera_names = set()
-    for cam in config.peripherals:
-        if cam.name in camera_names:
-            errors.append(f"Duplicate camera name: {cam.name}")
-        camera_names.add(cam.name)
+    # Validate peripherals
+    peripheral_names = set()
+    for periph in config.peripherals:
+        if periph.name in peripheral_names:
+            if isinstance(periph, CameraConfig):
+                errors.append(f"Duplicate camera name: {periph.name}")
+            else:
+                errors.append(f"Duplicate peripheral name: {periph.name}")
+        peripheral_names.add(periph.name)
+
+        if not isinstance(periph, CameraConfig):
+            continue
 
         # Validate camera parameters
-        if cam.width <= 0 or cam.height <= 0:
-            errors.append(f"Invalid camera dimensions for {cam.name}: {cam.width}x{cam.height}")
-        if cam.fps <= 0:
-            errors.append(f"Invalid FPS for {cam.name}: {cam.fps}")
+        if periph.width <= 0 or periph.height <= 0:
+            errors.append(
+                f"Invalid camera dimensions for {periph.name}: {periph.width}x{periph.height}"
+            )
+        if periph.fps <= 0:
+            errors.append(f"Invalid FPS for {periph.name}: {periph.fps}")
 
         # Validate calibration file if specified
-        if cam.camera_info_url and cam.camera_info_url.startswith("file://"):
-            calib_path = Path(cam.camera_info_url.replace("file://", ""))
+        if periph.camera_info_url and periph.camera_info_url.startswith("file://"):
+            calib_path = Path(periph.camera_info_url.replace("file://", ""))
             if not calib_path.exists():
                 errors.append(f"Camera calibration file not found: {calib_path}")
 
     # Validate contract-peripheral references
     for obs in config.contract.observations:
         if obs.peripheral:
-            if obs.peripheral not in camera_names:
+            if obs.peripheral not in peripheral_names:
                 errors.append(
                     f"Observation '{obs.key}' references undefined peripheral: {obs.peripheral}"
                 )

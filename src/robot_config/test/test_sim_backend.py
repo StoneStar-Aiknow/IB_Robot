@@ -104,17 +104,20 @@ def test_sim_peripheral_bridge_multi_camera():
     assert len(nodes) == 1  # single bridge_node handles all 3 cameras (6 topics in YAML)
 
 
-def test_sim_peripheral_bridge_non_camera_ignored():
-    """Non-camera peripherals (lidar, imu) produce no bridge nodes."""
+def test_sim_peripheral_bridge_lidar_and_imu_supported():
+    """LiDAR + IMU peripherals share one bridge_node in Gazebo."""
     from robot_config.launch_builders.sim_peripheral_bridge import (
         generate_peripheral_sim_bridges,
     )
+    from launch_ros.actions import Node
+
     peripherals = [
-        {"type": "lidar",   "name": "main_lidar"},
-        {"type": "imu",     "name": "imu_sensor"},
+        {"type": "lidar", "name": "main_lidar", "params": {"laser_scan_topic_name": "/scan"}},
+        {"type": "imu", "name": "imu_sensor", "topic": "/imu_sensor_broadcaster/imu"},
     ]
     nodes = generate_peripheral_sim_bridges(peripherals, model_name="test_robot")
-    assert nodes == []
+    assert len(nodes) == 1
+    assert isinstance(nodes[0], Node)
 
 
 def test_gazebo_start_backend_returns_create_node():

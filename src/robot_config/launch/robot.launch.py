@@ -71,12 +71,14 @@ Launch Arguments:
     config_path: Optional full path to robot config file
     use_sim: Use simulation mode (default: false)
     auto_start_controllers: Automatically spawn controllers (default: true, set to false for debugging)
-    control_mode: Override control mode from YAML (teleop, model_inference, or moveit_planning). If empty, uses default_control_mode from config file
+    control_mode: Override control mode from YAML (teleop, model_inference, moveit_planning, etc.). If empty, uses default_control_mode from config file
     with_inference: Enable inference pipeline. If empty, auto-detects from control mode config
     cloud_local: In distributed mode, also launch cloud node locally (default: false)
     execution_mode: Override execution mode from YAML ('monolithic' or 'distributed'). If empty, uses YAML value
     with_moveit: Enable MoveIt motion planning. If empty, auto-detects from control mode name
     moveit_display: Launch RViz for MoveIt visualization (default: true, only used if MoveIt is enabled)
+    with_navigation: Enable navigation pipeline. If empty, uses robot.navigation.enabled from config
+    navigation_mode: Override robot.navigation.default_mode when navigation is enabled
     record: Enable automatic rosbag recording (default: false, auto-discovers topics from config)
     record_mode: Recording mode - 'continuous' (default, all-in-one bag) or 'episodic' (triggered episode-by-episode, requires manual record_cli in separate terminal)
     record_visualizer: Recording visualizer - 'none' (default) or 'rerun' (launch a Rerun sidecar for live cameras, joints, and action curves)
@@ -98,12 +100,23 @@ from launch_ros.actions import Node
 
 # Import node generators from launch_builders modules
 from robot_config.launch_builders.control import generate_ros2_control_nodes
-from robot_config.launch_builders.execution import generate_execution_nodes
-from robot_config.launch_builders.perception import generate_camera_nodes, generate_tf_nodes
-from robot_config.launch_builders.recording import generate_recording_nodes, generate_rerun_viewer_node
+from robot_config.launch_builders.perception import (
+    generate_camera_nodes,
+    generate_lidar_nodes,
+    generate_tf_nodes,
+)
 from robot_config.launch_builders.sim_backend import get_sim_backend
+from robot_config.launch_builders.execution import generate_execution_nodes
 from robot_config.launch_builders.teleop import generate_teleop_nodes
-from robot_config.launch_builders.tracing import DEFAULT_TRACE_SESSION_NAME, generate_tracing_actions
+from robot_config.launch_builders.recording import (
+    generate_recording_nodes,
+    generate_rerun_viewer_node,
+)
+from robot_config.launch_builders.navigation import generate_navigation_nodes
+from robot_config.launch_builders.tracing import (
+    DEFAULT_TRACE_SESSION_NAME,
+    generate_tracing_actions,
+)
 from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
 from robot_config.loader import load_robot_config_dict
 from robot_config.logger_utils import get_colored_logger
@@ -134,7 +147,9 @@ def load_robot_config(robot_config_name, config_path_override=None):
     if config_path_override:
         config_path = Path(config_path_override)
     else:
-        config_path = Path(robot_config_share) / "config" / "robots" / f"{robot_config_name}.yaml"
+        config_path = (
+            Path(robot_config_share) / "config" / "robots" / f"{robot_config_name}.yaml"
+        )
 
     logger.info(f"Loading config from: {config_path}")
     logger.info(f"Config exists: {config_path.exists()}")
@@ -188,7 +203,9 @@ def _resolve_controller_startup_timeout(robot_config: dict, use_sim: bool) -> fl
     return timeout
 
 
-def _create_controller_ready_waiter(robot_config: dict, controller_names, use_sim: bool):
+def _create_controller_ready_waiter(
+    robot_config: dict, controller_names, use_sim: bool
+):
     """Create a probe that exits when the required controllers are active."""
     timeout = _resolve_controller_startup_timeout(robot_config, use_sim)
     return Node(
@@ -228,7 +245,9 @@ def launch_setup(context, *args, **kwargs):
     robot_config_name = context.launch_configurations.get("robot_config", "test_cam")
     config_path_override = context.launch_configurations.get("config_path", "")
     use_sim_str = context.launch_configurations.get("use_sim", "false")
-    auto_start_controllers = context.launch_configurations.get("auto_start_controllers", "true")
+    auto_start_controllers = context.launch_configurations.get(
+        "auto_start_controllers", "true"
+    )
     control_mode_override = context.launch_configurations.get("control_mode", "")
 
     # Normalize use_sim to boolean
@@ -243,7 +262,9 @@ def launch_setup(context, *args, **kwargs):
 
     # ========== 2. Load robot configuration ==========
     try:
-        robot_config = load_robot_config(robot_config_name, config_path_override if config_path_override else None)
+        robot_config = load_robot_config(
+            robot_config_name, config_path_override if config_path_override else None
+        )
     except Exception as e:
         logger.error(f"loading config: {e}")
         raise
@@ -270,7 +291,9 @@ def launch_setup(context, *args, **kwargs):
     if with_inference_str != "":
         with_inference = parse_bool(with_inference_str, default=False)
     else:
-        control_mode_config = robot_config.get("control_modes", {}).get(active_control_mode, {})
+        control_mode_config = robot_config.get("control_modes", {}).get(
+            active_control_mode, {}
+        )
         with_inference = control_mode_config.get("inference", {}).get("enabled", False)
 
     # Force disable inference in teleop mode if not explicitly overridden
@@ -299,8 +322,8 @@ def launch_setup(context, *args, **kwargs):
     controller_names = []
     robot_description = {}
     try:
-        control_nodes, controller_names, deferred_sim_spawners, robot_description = generate_ros2_control_nodes(
-            robot_config, use_sim, auto_start_controllers
+        control_nodes, controller_names, deferred_sim_spawners, robot_description = (
+            generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers)
         )
         actions.extend(control_nodes)
         logger.info(f"Added {len(control_nodes)} control nodes")
@@ -319,7 +342,7 @@ def launch_setup(context, *args, **kwargs):
     # ========== 5. Generate Simulation Nodes (only in simulation mode) ==========
     gz_create_entity = None
     if use_sim:
-        logger.info("========== Generating Simulation Nodes ==========")
+        logger.info(f"========== Generating Simulation Nodes ==========")
         sim_platform = robot_config.get("simulation", {}).get("platform", "gazebo")
         logger.info(f"Sim platform: {sim_platform}")
         try:
@@ -368,8 +391,15 @@ def launch_setup(context, *args, **kwargs):
         actions.extend(camera_nodes)
         logger.info(f"Added {len(camera_nodes)} camera nodes")
 
+        # LiDAR nodes (Physical drivers)
+        lidar_nodes = generate_lidar_nodes(robot_config, use_sim)
+        actions.extend(lidar_nodes)
+        print(f"[robot_config] Added {len(lidar_nodes)} lidar nodes")
+
         # Virtual camera relay nodes (Topic tools)
-        from robot_config.launch_builders.perception import generate_virtual_camera_relays
+        from robot_config.launch_builders.perception import (
+            generate_virtual_camera_relays,
+        )
 
         virtual_nodes = generate_virtual_camera_relays(robot_config)
         actions.extend(virtual_nodes)
@@ -395,13 +425,17 @@ def launch_setup(context, *args, **kwargs):
             # Check if teleoperation is configured
             teleop_config = robot_config.get("teleoperation", {})
             if not teleop_config.get("enabled", False):
-                logger.info("WARNING: Teleop mode requested but teleoperation config not found")
+                logger.info(
+                    f"WARNING: Teleop mode requested but teleoperation config not found"
+                )
             else:
                 # Generate teleop nodes
                 teleop_nodes = generate_teleop_nodes(robot_config, robot_description)
 
                 if controller_ready_waiter is not None:
-                    logger.info("Deferring teleop nodes until required controllers are active...")
+                    logger.info(
+                        "Deferring teleop nodes until required controllers are active..."
+                    )
                     controller_dependent_actions.extend(teleop_nodes)
                 else:
                     logger.info("No controller readiness probe active, launching teleop immediately")
@@ -425,15 +459,50 @@ def launch_setup(context, *args, **kwargs):
         logger.error(f"generating voice ASR nodes: {e}")
         raise
 
-    # ========== 9. Generate Execution Nodes ==========
-    logger.info("========== Generating Execution Nodes ==========")
+    # ========== 9. Generate Navigation Nodes ==========
+    logger.info(f"========== Checking Navigation ==========")
+    try:
+        with_navigation_str = context.launch_configurations.get("with_navigation", "")
+        navigation_mode = context.launch_configurations.get("navigation_mode", "")
+        navigation_config = robot_config.get("navigation", {})
+
+        if with_navigation_str != "":
+            with_navigation = parse_bool(with_navigation_str, default=False)
+        else:
+            with_navigation = navigation_config.get("enabled", False)
+
+        if with_navigation:
+            navigation_nodes = generate_navigation_nodes(
+                robot_config,
+                use_sim=use_sim,
+                navigation_mode=navigation_mode,
+                force_enable=True,
+            )
+            if controller_ready_waiter is not None:
+                logger.info(
+                    "Deferring navigation nodes until required controllers are active..."
+                )
+                controller_dependent_actions.extend(navigation_nodes)
+            else:
+                actions.extend(navigation_nodes)
+            logger.info(f"Prepared {len(navigation_nodes)} navigation node(s)")
+        else:
+            logger.info(f"Skipping navigation nodes")
+    except Exception as e:
+        logger.error(f"generating navigation nodes: {e}")
+        raise
+
+    # ========== 10. Generate Execution Nodes ==========
+    logger.info(f"========== Generating Execution Nodes ==========")
     try:
         if with_inference:
             execution_nodes = generate_execution_nodes(
                 robot_config, active_control_mode, use_sim, cloud_local=cloud_local
             )
             if controller_ready_waiter is not None:
-                logger.info("Deferring execution nodes until required controllers are active...")
+                logger.info(
+                    "Deferring execution nodes until required controllers are active..."
+                )
                 controller_dependent_actions.extend(execution_nodes)
             else:
                 actions.extend(execution_nodes)
@@ -444,11 +513,13 @@ def launch_setup(context, *args, **kwargs):
         logger.error(f"generating execution nodes: {e}")
         raise
 
-    # ========== 10. Generate MoveIt Nodes ==========
+    # ========== 11. Generate MoveIt Nodes ==========
     try:
         # Determine with_moveit flag
         with_moveit_str = context.launch_configurations.get("with_moveit", "")
-        moveit_display = parse_bool(context.launch_configurations.get("moveit_display", "true"), default=True)
+        moveit_display = parse_bool(
+            context.launch_configurations.get("moveit_display", "true"), default=True
+        )
 
         if with_moveit_str != "":
             with_moveit = parse_bool(with_moveit_str, default=False)
@@ -460,10 +531,14 @@ def launch_setup(context, *args, **kwargs):
         if with_moveit:
             from robot_config.launch_builders.moveit import generate_moveit_nodes
 
-            moveit_nodes = generate_moveit_nodes(robot_config, active_control_mode, use_sim, moveit_display)
+            moveit_nodes = generate_moveit_nodes(
+                robot_config, active_control_mode, use_sim, moveit_display
+            )
 
             if controller_ready_waiter is not None:
-                logger.info("Deferring MoveIt nodes until required controllers are active...")
+                logger.info(
+                    "Deferring MoveIt nodes until required controllers are active..."
+                )
                 controller_dependent_actions.extend(moveit_nodes)
             else:
                 logger.info("No controller readiness probe active, launching MoveIt immediately")
@@ -474,7 +549,7 @@ def launch_setup(context, *args, **kwargs):
         logger.error(f"generating MoveIt nodes: {e}")
         logger.info("Continuing without MoveIt...")
 
-    # ========== 11. Automatic Recording (if record:=true) ==========
+    # ========== 12. Automatic Recording (if record:=true) ==========
     try:
         record_str = context.launch_configurations.get("record", "false")
         record_enabled = parse_bool(record_str, default=False)
@@ -486,7 +561,9 @@ def launch_setup(context, *args, **kwargs):
             logger.info(f"========== Setting up Recording (mode: {record_mode}) ==========")
 
             # Generate recording nodes using the recording builder
-            recording_nodes = generate_recording_nodes(robot_config, active_control_mode, record_mode)
+            recording_nodes = generate_recording_nodes(
+                robot_config, active_control_mode, record_mode
+            )
             actions.extend(recording_nodes)
             logger.info(f"Added {len(recording_nodes)} recording node(s)")
         else:
@@ -589,6 +666,16 @@ def generate_launch_description():
                 "with_moveit",
                 default_value="",
                 description="Enable MoveIt motion planning. If empty, auto-detects from control mode config",
+            ),
+            DeclareLaunchArgument(
+                "with_navigation",
+                default_value="",
+                description="Enable navigation nodes. If empty, auto-detects from robot.navigation.enabled",
+            ),
+            DeclareLaunchArgument(
+                "navigation_mode",
+                default_value="",
+                description="Override robot.navigation.default_mode (for example: full, odom_only, imu_only)",
             ),
             DeclareLaunchArgument(
                 "moveit_display",

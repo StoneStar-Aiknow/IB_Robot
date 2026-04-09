@@ -76,11 +76,58 @@ def _build_camera_bridge_entries(periph: dict, model_name: str, world_name: str)
     ]
 
 
+def _build_lidar_bridge_entries(
+    periph: dict,
+    model_name: str,
+    world_name: str,
+    simulation_config: dict | None = None,
+    platform: str = "gazebo",
+) -> list:
+    """Return one LaserScan bridge config dict for a lidar peripheral."""
+    params = periph.get("params", {})
+    ros_topic = params.get("laser_scan_topic_name") or periph.get("topic") or "/scan"
+    ros_topic = ros_topic if ros_topic.startswith("/") else f"/{ros_topic}"
+    gz_topic = ros_topic
+    return [
+        {
+            "ros_topic_name": ros_topic,
+            "gz_topic_name": gz_topic,
+            "ros_type_name": "sensor_msgs/msg/LaserScan",
+            "gz_type_name": "gz.msgs.LaserScan",
+            "direction": "GZ_TO_ROS",
+            "lazy": False,
+        }
+    ]
+
+
+def _build_imu_bridge_entries(
+    periph: dict,
+    model_name: str,
+    world_name: str,
+    simulation_config: dict | None = None,
+    platform: str = "gazebo",
+) -> list:
+    """Return one IMU bridge config dict for an imu peripheral."""
+    ros_topic = periph.get("topic") or "/imu/data"
+    ros_topic = ros_topic if ros_topic.startswith("/") else f"/{ros_topic}"
+    gz_topic = ros_topic
+    return [
+        {
+            "ros_topic_name": ros_topic,
+            "gz_topic_name": gz_topic,
+            "ros_type_name": "sensor_msgs/msg/Imu",
+            "gz_type_name": "gz.msgs.IMU",
+            "direction": "GZ_TO_ROS",
+            "lazy": False,
+        }
+    ]
+
+
 # Registry: peripheral type → bridge entry builder function.
 _PERIPHERAL_BRIDGE_BUILDERS = {
     "camera": _build_camera_bridge_entries,
-    # "lidar": _build_lidar_bridge_entries,  # reserved
-    # "imu":   _build_imu_bridge_entries,    # reserved
+    "lidar": _build_lidar_bridge_entries,
+    "imu": _build_imu_bridge_entries,
     # "rgbd":  _build_rgbd_bridge_entries,   # reserved
 }
 
@@ -129,7 +176,7 @@ def generate_peripheral_sim_bridges(
         Node(
             package="ros_gz_bridge",
             executable="bridge_node",
-            name="camera_peripheral_bridge",
+            name="peripheral_bridge",
             parameters=[{"config_file": _BRIDGE_CONFIG_PATH}],
             output="screen",
         )

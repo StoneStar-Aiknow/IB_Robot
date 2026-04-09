@@ -20,6 +20,7 @@ from robot_config.launch_builders.control import (
 
 from robot_config.launch_builders.perception import (
     generate_camera_nodes,
+    generate_lidar_nodes,
     generate_tf_nodes,
     generate_virtual_camera_relays
 )
@@ -36,6 +37,10 @@ from robot_config.launch_builders.voice_asr import (
     generate_voice_asr_nodes
 )
 
+from robot_config.launch_builders.navigation import (
+    generate_navigation_nodes,
+)
+
 __all__ = [
     # Description
     'generate_robot_description',
@@ -45,6 +50,7 @@ __all__ = [
     'validate_joint_config',
     # Perception
     'generate_camera_nodes',
+    'generate_lidar_nodes',
     'generate_tf_nodes',
     'generate_virtual_camera_relays',
     # Simulation
@@ -53,4 +59,6 @@ __all__ = [
     'generate_moveit_nodes',
     # Voice ASR
     'generate_voice_asr_nodes',
+    # Navigation
+    'generate_navigation_nodes',
 ]

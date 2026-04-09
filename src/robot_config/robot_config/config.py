@@ -138,7 +138,7 @@ class RobotConfig:
     type: str
     robot_type: str  # For LeRobot dataset metadata (e.g., so_101)
     ros2_control: Ros2ControlConfig
-    peripherals: List[CameraConfig] = field(default_factory=list)
+    peripherals: List[Union[CameraConfig, PeripheralConfig]] = field(default_factory=list)
     contract: ContractExtensionConfig = field(default_factory=ContractExtensionConfig)
     voice_asr: VoiceASRConfig = field(default_factory=VoiceASRConfig)
 

@@ -6,6 +6,7 @@ import pytest
 
 from robot_config.config import (
     CameraConfig,
+    PeripheralConfig,
     ContractExtensionConfig,
     RobotConfig,
     Ros2ControlConfig,
@@ -16,6 +17,7 @@ from robot_config.loader import (
     load_robot_config_dict,
     validate_config,
 )
+from robot_config.launch_builders.recording import get_recording_topics
 
 
 def test_load_single_arm_config():
@@ -208,6 +210,32 @@ def test_dict_contract_builder_allows_empty_topic_for_peripheral_observation():
     assert contract.observations[0].type == "sensor_msgs/msg/Image"
 
 
+def test_load_lekiwi_config_dict():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "lekiwi.yaml"
+    robot_config = load_robot_config_dict(config_path)
+
+    assert robot_config["name"] == "lekiwi"
+    assert robot_config["ros2_control"]["urdf_path"] == "$(find lekiwi_description)/urdf/base.urdf.xacro"
+    assert robot_config["control_modes"]["teleop"]["controllers"] == [
+        "joint_state_broadcaster",
+        "imu_sensor_broadcaster",
+        "base_controller",
+    ]
+    assert robot_config["navigation"]["default_mode"] == "full"
+
+def test_recording_topics_follow_contract_and_peripherals():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "lekiwi.yaml"
+    robot_config = load_robot_config_dict(config_path)
+    topics = get_recording_topics(robot_config)
+
+    assert "/joint_states" in topics
+    assert "/camera/front/image_raw" in topics
+    assert "/camera/front/camera_info" in topics
+    assert "/base_controller/odom" in topics
+    assert "/base_controller/cmd_vel" in topics
+    assert "/scan" in topics
+
+
 def test_validate_valid_config():
     """Test validation of valid configuration."""
     config = RobotConfig(
@@ -228,6 +256,43 @@ def test_validate_valid_config():
                 fps=30,
                 frame_id="camera_test_frame",
             )
+        ],
+        contract=ContractExtensionConfig(
+            observations=[],
+            actions=[],
+        ),
+    )
+
+    errors = validate_config(config)
+    assert len(errors) == 0
+
+
+def test_validate_generic_peripherals_do_not_break_camera_validation():
+    config = RobotConfig(
+        name="lekiwi",
+        type="lekiwi",
+        robot_type="lekiwi",
+        ros2_control=Ros2ControlConfig(
+            hardware_plugin="sts_hardware_interface/STSHardwareInterface",
+            params={"port": "/dev/ttySERVO"},
+        ),
+        peripherals=[
+            CameraConfig(
+                name="front",
+                driver="camera_ros",
+                index_or_port=0,
+                width=640,
+                height=480,
+                fps=15,
+                frame_id="camera",
+            ),
+            PeripheralConfig(
+                type="lidar",
+                name="laser",
+                driver="ldlidar",
+                params={"laser_scan_topic_name": "scan"},
+                frame_id="laser_frame",
+            ),
         ],
         contract=ContractExtensionConfig(
             observations=[],

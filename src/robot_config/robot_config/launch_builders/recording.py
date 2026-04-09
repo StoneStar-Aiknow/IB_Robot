@@ -285,23 +285,42 @@ def get_recording_topics(robot_config: dict) -> list[str]:
     """
     topics = []
 
-    # Always record joint states
-    topics.append("/joint_states")
+    def _append(topic: str):
+        if not topic:
+            return
+        normalized = topic if topic.startswith("/") else f"/{topic}"
+        if normalized not in topics:
+            topics.append(normalized)
 
-    # Add controller command topics
-    topics.append("/arm_position_controller/commands")
-    topics.append("/gripper_position_controller/commands")
+    # Always record joint states for ros2_control-backed robots.
+    _append("/joint_states")
+    _append("/arm_position_controller/commands")
+    _append("/gripper_position_controller/commands")
 
-    # Add diagnostics
-    topics.append("/diagnostics")
+    # Record contract-defined observations/actions first.
+    contract = robot_config.get("contract", {})
+    for obs in contract.get("observations", []):
+        _append(obs.get("topic", ""))
+    for action in contract.get("actions", []):
+        _append((action.get("publish") or {}).get("topic", ""))
 
-    # Add camera topics from peripherals
-    peripherals = robot_config.get("peripherals", [])
-    for peripheral in peripherals:
-        if peripheral.get("type") == "camera":
-            name = peripheral.get("name", "camera")
-            # Add common camera topics
-            topics.append(f"/camera/{name}/image_raw")
-            topics.append(f"/camera/{name}/camera_info")
+    # Add peripheral-specific auxiliary topics that contracts usually omit.
+    for peripheral in robot_config.get("peripherals", []):
+        ptype = peripheral.get("type")
+        name = peripheral.get("name", "peripheral")
+        if ptype == "camera":
+            _append(f"/camera/{name}/image_raw")
+            _append(f"/camera/{name}/camera_info")
+        elif ptype == "lidar":
+            params = peripheral.get("params", {})
+            _append(params.get("laser_scan_topic_name", peripheral.get("topic", "/scan")))
+            _append(params.get("point_cloud_2d_topic_name", ""))
+        elif ptype == "imu":
+            _append(peripheral.get("topic", ""))
+
+    # Diagnostics / navigation extras.
+    _append("/diagnostics")
+    for extra_topic in robot_config.get("recording", {}).get("extra_topics", []):
+        _append(extra_topic)
 
     return topics

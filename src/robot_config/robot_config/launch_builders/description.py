@@ -46,6 +46,8 @@ def _build_cameras_urdf_from_yaml(peripherals: list, platform: str = "gazebo") -
     for periph in peripherals:
         if periph.get("type") != "camera":
             continue
+        if (periph.get("simulation") or {}).get("embedded_sensor", False):
+            continue
         name        = periph["name"]
         frame_id    = periph.get("frame_id", f"camera_{name}_frame")
 
@@ -209,6 +211,20 @@ def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: s
         # literal single-quoted string '{"1":0.0}' and fail to parse it.
         'reset_positions': reset_positions_json,
     }
+    custom_xacro_mappings = ros2_control_config.get("xacro_mappings", {})
+    for key, value in custom_xacro_mappings.items():
+        if isinstance(value, bool):
+            xacro_mappings[str(key)] = "true" if value else "false"
+        elif isinstance(value, (dict, list)):
+            xacro_mappings[str(key)] = json.dumps(value)
+        elif value is not None:
+            xacro_mappings[str(key)] = str(value)
+
+    if "serial_port" not in xacro_mappings and port:
+        xacro_mappings["serial_port"] = str(port)
+    if "use_mock" not in xacro_mappings:
+        xacro_mappings["use_mock"] = "true" if is_sim else "false"
+
     if is_sim:
         sim_platform = robot_config.get("simulation", {}).get("platform", "gazebo")
         if sim_platform == "mujoco":
@@ -216,9 +232,11 @@ def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: s
             if mujoco_model_path:
                 xacro_mappings["mujoco_model"] = mujoco_model_path
         # Gazebo: xacro default="gz_ros2_control/GazeboSimSystem" — no explicit mapping needed
-        _gz_ctrl_yaml = resolve_ros_path("$(find so101_hardware)/config/so101_controllers.yaml")
-        if Path(_gz_ctrl_yaml).exists():
-            xacro_mappings["gz_ros2_control_parameters_file"] = str(Path(_gz_ctrl_yaml).resolve())
+        controllers_config = ros2_control_config.get("controllers_config")
+        if controllers_config:
+            controllers_config = resolve_ros_path(controllers_config)
+            if Path(controllers_config).exists():
+                xacro_mappings["gz_ros2_control_parameters_file"] = str(Path(controllers_config).resolve())
 
     try:
         doc = _xacro_lib.process_file(urdf_path, mappings=xacro_mappings)

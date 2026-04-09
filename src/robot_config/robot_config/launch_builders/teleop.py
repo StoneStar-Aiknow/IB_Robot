@@ -149,6 +149,9 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
 
     control_frequency = device_config.get('control_frequency', 50.0)
 
+    if device_type == 'joy_teleop':
+        return _create_joy_teleop_nodes(device_config)
+
     # Prepare lerobot environment
     env = prepare_lerobot_env()
 
@@ -223,6 +226,40 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
         nodes.append(servo_node)
         logger.info("Generated servo_node for Cartesian control")
 
+    return nodes
+
+
+def _create_joy_teleop_nodes(device_config: dict) -> List[Node]:
+    """Create joy_node + joy_teleop launch actions for mobile-base teleoperation."""
+    nodes = []
+
+    input_dev = device_config.get('input_device', '/dev/input/js0')
+    joy_params = {
+        'dev': input_dev,
+        'deadzone': float(device_config.get('deadzone', 0.1)),
+        'autorepeat_rate': float(device_config.get('autorepeat_rate', 20.0)),
+        'sticky_buttons': bool(device_config.get('sticky_buttons', False)),
+    }
+    nodes.append(Node(
+        package='joy',
+        executable='joy_node',
+        name='joy_node',
+        parameters=[joy_params],
+        output='screen',
+    ))
+
+    config_path = device_config.get('config_path')
+    if not config_path:
+        raise ValueError("joy_teleop device requires 'config_path'")
+
+    nodes.append(Node(
+        package='joy_teleop',
+        executable='joy_teleop',
+        name='joy_teleop',
+        parameters=[resolve_ros_path(config_path)],
+        output='screen',
+    ))
+    print(f"[teleop_builder] Generated joy_teleop stack using {config_path}")
     return nodes
 
 
