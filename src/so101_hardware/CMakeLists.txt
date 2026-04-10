@@ -23,7 +23,7 @@ find_package(nlohmann_json REQUIRED)
 include(FetchContent)
 FetchContent_Declare(
   ftservo_sdk_external
-  GIT_REPOSITORY https://github.com/ftservo/FTServo_Linux.git
+  GIT_REPOSITORY https://gitee.com/ftservo/FTServo_Linux.git
   GIT_TAG        main
 )
 FetchContent_MakeAvailable(ftservo_sdk_external)
