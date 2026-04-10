@@ -352,6 +352,15 @@ ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_
 
 # MoveIt 模式无 RViz（headless）
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=moveit_planning use_sim:=true moveit_display:=false
+
+# 分布式推理 — 单机调试（Edge + Cloud 同时启动）
+ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=model_inference execution_mode:=distributed use_sim:=true cloud_local:=true
+
+# 分布式推理 — 跨机器部署（端侧仅启动 Edge，Cloud 在算力机器上单独启动）
+# 端侧：
+ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=model_inference execution_mode:=distributed use_sim:=true
+# 算力机器（需设置相同 ROS_DOMAIN_ID）：
+# ros2 launch inference_service cloud_inference.launch.py policy_path:=/path/to/model device:=cuda
 ```
 
 ### 验证配置

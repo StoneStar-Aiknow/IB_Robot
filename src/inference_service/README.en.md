@@ -34,6 +34,23 @@ To preserve compatibility with the pull-based `action_dispatch` system without c
 * **Performance**: Achieves "Compute Offloading" perfectly. The Device only sends the exact frames needed for inference (e.g., 20Hz), saving massive network bandwidth.
 * **Config**: `execution_mode: "distributed"`
 
+```
+Device Machine (Robot / Sim)               GPU Machine (Edge/Cloud)
+┌──────────────────────────────┐          ┌──────────────────────────┐
+│  action_dispatcher_node      │          │                          │
+│       ↓                      │          │  pure_inference_node     │
+│  lerobot_policy_node (Proxy) │          │  ├─ Subscribe            │
+│  ├─ TensorPreprocessor (CPU) │          │  │  /preprocessed/batch  │
+│  ├─ threading.Event          │          │  ├─ PureInferenceEngine  │
+│  └─ TensorPostprocessor(CPU) │          │  │  (GPU)                │
+│       ↓ Pub        ↑ Sub     │          │  └─ Publish              │
+│  /preprocessed  /inference   │          │     /inference/action    │
+│  /batch         /action      │          │                          │
+└──────────┬──────────┬────────┘          └───────┬──────────┬───────┘
+           │          │      LAN (same ROS_DOMAIN_ID)        │          │
+           └──────────┴──────────────────────────┴──────────┘
+```
+
 ---
 
 ## ⚙️ Configuration & Usage
@@ -52,19 +69,77 @@ control_modes:
 
 ### Launching
 
-**Device (Robot)**:
-Launch your robot normally. The launch builder automatically reads the YAML and configures the node behavior.
+#### Scenario 1: Cross-Machine Distributed Deployment (Recommended for Production)
+
+Both machines must share the **same `ROS_DOMAIN_ID`** and be on the same LAN.
+
+**Step 1 — On the Robot (Device)**:
+
+The Device launches only the Edge proxy node (pre/post-processing), without loading GPU models:
 ```bash
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=model_inference
+export ROS_DOMAIN_ID=42
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=model_inference \
+    execution_mode:=distributed \
+    use_sim:=true   # For simulation; omit for real hardware
 ```
 
-**Edge/Cloud (GPU Server - Only needed if `execution_mode: "distributed"`)**:
-Ensure you are on the same ROS Domain ID. Launch the dedicated standalone cloud node.
+**Step 2 — On the GPU Server (Edge/Cloud)**:
+
 ```bash
+export ROS_DOMAIN_ID=42   # Must match the Device!
 ros2 launch inference_service cloud_inference.launch.py \
     policy_path:=/path/to/models/pretrained_model \
     device:=cuda
 ```
+
+#### Scenario 2: Single-Machine Debug (Development)
+
+Run both Edge + Cloud nodes on one machine by adding `cloud_local:=true`:
+
+```bash
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=model_inference \
+    execution_mode:=distributed \
+    use_sim:=true \
+    cloud_local:=true
+```
+
+### Verifying Distributed Mode
+
+```bash
+# 1. Confirm both inference nodes are online
+ros2 node list | grep -E 'act_inference|pure_inference'
+# Expected:
+#   /act_inference_node      ← Edge (pre/post-processing)
+#   /pure_inference           ← Cloud (GPU inference)
+
+# 2. Confirm distributed topics exist
+ros2 topic list | grep -E 'preprocessed|inference/action'
+# Expected:
+#   /preprocessed/batch      ← Edge → Cloud
+#   /inference/action         ← Cloud → Edge
+
+# 3. Monitor inference frequency
+ros2 topic hz /inference/action
+```
+
+### Logging Reference
+
+After launch, each node prints key lifecycle messages for quick status diagnosis:
+
+| Node | Example Log | Meaning |
+|------|-------------|---------|
+| `pure_inference` | `Waiting for preprocessed batches from edge node...` | Cloud node ready, waiting for Edge data |
+| `pure_inference` | `✓ First inference completed: latency=XXms` | First inference succeeded, end-to-end link confirmed |
+| `pure_inference` | `[stats] count=XX, avg=XXms, last=XXms` | Performance stats every 5 seconds |
+| `act_inference_node` | `✓ First inference complete (distributed): total=XXms` | Edge node completed full inference round-trip |
+| `action_dispatcher` | `✓ First inference received: chunk=XX, latency=XXms` | Dispatcher received first executable actions |
+| `action_dispatcher` | `[stats] inferences=XX, avg_latency=XXms, queue=XX, hold=XX` | Dispatch stats every 5s; `hold` = times queue exhausted and last frame held |
+
+---
 
 ## 🧪 Testing
 Because the core components are isolated from ROS, they can be validated entirely offline:

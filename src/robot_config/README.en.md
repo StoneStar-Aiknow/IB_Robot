@@ -417,6 +417,15 @@ ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm
 
 # Launch with simulation
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true
+
+# Distributed inference — single-machine debug (Edge + Cloud co-located)
+ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=model_inference execution_mode:=distributed use_sim:=true cloud_local:=true
+
+# Distributed inference — cross-machine (Device only launches Edge; Cloud runs separately on GPU server)
+# Device side:
+ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=model_inference execution_mode:=distributed use_sim:=true
+# GPU server (set same ROS_DOMAIN_ID):
+# ros2 launch inference_service cloud_inference.launch.py policy_path:=/path/to/model device:=cuda
 ```
 
 ### Validating Configuration

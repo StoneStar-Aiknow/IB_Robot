@@ -72,11 +72,15 @@ class PureInferenceNode(Node):
 
         self._inference_count = 0
         self._total_latency_ms = 0.0
+        self._last_log_time = 0.0
+        self._log_interval_s = 5.0
 
         self.get_logger().info(
             f"PureInferenceNode ready: "
-            f"input={input_topic}, output={output_topic}"
+            f"input={input_topic}, output={output_topic}, "
+            f"device={self._engine._device}"
         )
+        self.get_logger().info("Waiting for preprocessed batches from edge node...")
 
     def _inference_cb(self, msg: VariantsList):
         """Run inference on preprocessed input."""
@@ -105,13 +109,22 @@ class PureInferenceNode(Node):
             self._inference_count += 1
             self._total_latency_ms += inference_latency_ms
 
-            if self._inference_count % 100 == 0:
+            if self._inference_count == 1:
+                self.get_logger().info(
+                    f"✓ First inference completed: "
+                    f"latency={inference_latency_ms:.1f}ms, "
+                    f"action_shape={list(result.action.shape)}"
+                )
+
+            now = time.monotonic()
+            if now - self._last_log_time >= self._log_interval_s:
                 avg_latency = self._total_latency_ms / self._inference_count
                 self.get_logger().info(
-                    f"Inference stats: count={self._inference_count}, "
-                    f"avg_latency={avg_latency:.1f}ms, "
-                    f"last_latency={inference_latency_ms:.1f}ms"
+                    f"[stats] count={self._inference_count}, "
+                    f"avg={avg_latency:.1f}ms, "
+                    f"last={inference_latency_ms:.1f}ms"
                 )
+                self._last_log_time = now
 
         except Exception as e:
             self.get_logger().error(f"Inference failed: {e}")

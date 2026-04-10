@@ -158,6 +158,16 @@ class ActionDispatcherNode(Node):
             f"Dispatcher ready. Hz: {self._control_hz}, Watermark: {self._watermark}, "
             f"Smoothing: {'ON' if self._smoothing_enabled else 'OFF'}"
         )
+        self.get_logger().info(f"Waiting for inference server: {self._server_name}")
+
+        # Periodic stats tracking
+        self._dispatch_count = 0
+        self._total_inference_latency_ms = 0.0
+        self._last_stats_time = time.monotonic()
+        self._stats_interval_s = 5.0
+        self._hold_count = 0
+        self._consecutive_failures = 0
+        self._last_stats_dispatch_count = 0
 
     def _joint_cb(self, msg):
         """Optional: could use current state for safety or initialization."""
@@ -194,8 +204,8 @@ class ActionDispatcherNode(Node):
                 action = self._queue.popleft()
             self._last_action = action
         elif self._last_action is not None:
-            # Hold last action if queue empty
             action = self._last_action
+            self._hold_count += 1
         
         # C. Execute
         if action is not None:
@@ -204,6 +214,21 @@ class ActionDispatcherNode(Node):
             else:
                 action_np = np.array(action)
             self._executor.execute(action_np)
+
+        # D. Periodic stats (only when new inferences arrived)
+        now = time.monotonic()
+        if now - self._last_stats_time >= self._stats_interval_s:
+            new_inferences = self._dispatch_count - self._last_stats_dispatch_count
+            if new_inferences > 0:
+                avg_lat = self._total_inference_latency_ms / self._dispatch_count
+                self.get_logger().info(
+                    f"[stats] inferences={self._dispatch_count}, "
+                    f"avg_latency={avg_lat:.1f}ms, "
+                    f"queue={q_size}, hold={self._hold_count}"
+                )
+            self._last_stats_dispatch_count = self._dispatch_count
+            self._hold_count = 0
+            self._last_stats_time = now
 
     def _request_inference(self):
         """Send async goal to inference service."""
@@ -239,8 +264,21 @@ class ActionDispatcherNode(Node):
         result = future.result().result
         
         if not result.success:
-            self.get_logger().error(f"Inference FAILED: {result.message}")
+            self._consecutive_failures += 1
+            if self._consecutive_failures == 1:
+                self.get_logger().warn(f"Inference failed: {result.message}")
+            else:
+                self.get_logger().debug(
+                    f"Inference failed (#{self._consecutive_failures}): {result.message}")
             return
+
+        if self._consecutive_failures > 0:
+            self.get_logger().info(
+                f"Inference recovered (after {self._consecutive_failures} failures)")
+            self._consecutive_failures = 0
+
+        self._dispatch_count += 1
+        self._total_inference_latency_ms += result.inference_latency_ms
 
         # Decode VariantsList to Numpy/Tensor
         batch = TensorMsgConverter.from_variant(result.action_chunk)
@@ -267,19 +305,26 @@ class ActionDispatcherNode(Node):
             if self._smoother is not None:
                 # Use smoother for cross-frame smoothing
                 new_length = self._smoother.update(action_chunk_tensor, actions_executed)
-                self.get_logger().info(
-                    f"Smoothed update: {len(action_chunk_np)} new actions, "
-                    f"{actions_executed} executed during inference, "
-                    f"new plan length: {new_length}"
+                self.get_logger().debug(
+                    f"Smoothed update: {len(action_chunk_np)} new, "
+                    f"skipped {actions_executed}, plan={new_length}"
                 )
             else:
                 # Simple queue mode: align and replace
                 relevant_actions = action_chunk_np[actions_executed:]
                 self._queue.clear()
                 self._queue.extend(relevant_actions)
+                self.get_logger().debug(
+                    f"Queue update: {len(relevant_actions)} actions "
+                    f"(skipped {actions_executed}), total={len(self._queue)}"
+                )
+
+            if self._dispatch_count == 1:
                 self.get_logger().info(
-                    f"Queue update: {len(relevant_actions)} actions (skipped {actions_executed}), "
-                    f"total: {len(self._queue)}"
+                    f"✓ First inference received: "
+                    f"chunk={len(action_chunk_np)}, "
+                    f"latency={result.inference_latency_ms:.1f}ms, "
+                    f"queue={self._get_plan_length()}"
                 )
 
     def _reset_cb(self, request, response):

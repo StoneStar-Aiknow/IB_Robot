@@ -143,6 +143,8 @@ class LeRobotPolicyNode(Node):
         
         self._last_inference_time: Optional[float] = None
         self._inference_count = 0
+        self._consecutive_timeouts = 0
+        self._cloud_connected = False
         self._health_status = DiagnosticStatus.OK
         self._error_message = ""
         
@@ -516,8 +518,24 @@ class LeRobotPolicyNode(Node):
             self._last_inference_time = time.time()
             self._inference_count += 1
             
+            if self._consecutive_timeouts > 0:
+                self.get_logger().info(
+                    f"Cloud inference connected (after {self._consecutive_timeouts} timeouts)")
+                self._consecutive_timeouts = 0
+            self._cloud_connected = True
+            
+            if self._inference_count == 1:
+                mode_tag = "distributed" if self._config.execution_mode == "distributed" else "monolithic"
+                self.get_logger().info(
+                    f"✓ First inference complete ({mode_tag}): "
+                    f"total={result.total_latency_ms:.1f}ms "
+                    f"(pre={result.preprocess_latency_ms:.1f}ms, "
+                    f"inf={result.inference_latency_ms:.1f}ms, "
+                    f"post={result.postprocess_latency_ms:.1f}ms)"
+                )
+            
             self.get_logger().debug(
-                f"Inference complete: {goal.inference_id}, "
+                f"Inference #{self._inference_count}: {goal.inference_id}, "
                 f"latency: {result.total_latency_ms:.1f}ms "
                 f"(pre: {result.preprocess_latency_ms:.1f}ms, "
                 f"inf: {result.inference_latency_ms:.1f}ms, "
@@ -527,7 +545,18 @@ class LeRobotPolicyNode(Node):
             return response
             
         except TimeoutError:
-            self.get_logger().error(f"Inference timeout for request {goal.inference_id}")
+            self._consecutive_timeouts += 1
+            if self._consecutive_timeouts == 1 and not self._cloud_connected:
+                self.get_logger().warn(
+                    "Waiting for cloud inference node... "
+                    f"(timeout={self._config.request_timeout}s, "
+                    f"topic=/preprocessed/batch → /inference/action)")
+            elif self._consecutive_timeouts == 1 and self._cloud_connected:
+                self.get_logger().warn("Cloud inference disconnected, waiting for reconnect...")
+                self._cloud_connected = False
+            else:
+                self.get_logger().debug(
+                    f"Cloud timeout #{self._consecutive_timeouts}")
             
             response = DispatchInfer.Result()
             response.action_chunk = VariantsList()

@@ -17,7 +17,8 @@ from launch_ros.actions import Node
 from robot_config.utils import parse_bool, prepare_lerobot_env
 
 
-def generate_inference_node(robot_config, control_mode, use_sim=False):
+def generate_inference_node(robot_config, control_mode, use_sim=False,
+                            cloud_local=False):
     """Generate inference service node with auto-synthesized contract.
 
     This function:
@@ -29,6 +30,7 @@ def generate_inference_node(robot_config, control_mode, use_sim=False):
         robot_config: Robot configuration dict
         control_mode: Active control mode
         use_sim: Simulation mode flag
+        cloud_local: In distributed mode, also launch cloud node locally
 
     Returns:
         Node action for inference service, or None if not enabled
@@ -53,7 +55,8 @@ def generate_inference_node(robot_config, control_mode, use_sim=False):
     execution_mode = inference_config.get("execution_mode", "monolithic")
 
     if execution_mode == "distributed":
-        return generate_distributed_inference_nodes(robot_config, control_mode, use_sim)
+        return generate_distributed_inference_nodes(
+            robot_config, control_mode, use_sim, cloud_local=cloud_local)
 
     return generate_monolithic_inference_node(robot_config, control_mode, use_sim)
 
@@ -127,14 +130,25 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
     return inference_node
 
 
-def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=False):
-    """Generate distributed inference nodes (edge proxy + cloud inference).
+def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=False,
+                                         cloud_local=False):
+    """Generate distributed inference nodes.
 
-    This generates:
-    1. Edge node (lerobot_policy_node) - handles preprocessing, postprocessing, and Action Server
-    2. Cloud node (pure_inference_node) - handles GPU inference
+    By default only the edge proxy node is generated here. The cloud
+    (pure_inference_node) is intended to run on a separate GPU machine
+    via ``cloud_inference.launch.py``.
 
-    The edge node acts as a transparent proxy for action_dispatch.
+    Set *cloud_local=True* to co-locate both nodes for single-machine
+    testing / debugging.
+
+    Args:
+        robot_config: Robot configuration dict
+        control_mode: Active control mode
+        use_sim: Simulation mode flag
+        cloud_local: If True, also launch cloud node locally (single-machine test)
+
+    Returns:
+        List of Node actions
     """
     is_sim = parse_bool(use_sim, default=False)
 
@@ -151,6 +165,7 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
     )
     print(f"[robot_config] Control mode: {control_mode}")
     print(f"[robot_config] Architecture: Edge Proxy + Cloud Inference")
+    print(f"[robot_config] Cloud co-located: {cloud_local}")
 
     robot_config_path = robot_config.get('_config_path', '')
     if not robot_config_path:
@@ -176,6 +191,7 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
 
     nodes = []
 
+    # --- Edge node: always launched locally ---
     edge_node_params = {
         "checkpoint": policy_path,
         "robot_config_path": str(robot_config_path),
@@ -203,26 +219,33 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
     print(f"[robot_config]     Publishing to: {cloud_inference_topic}")
     print(f"[robot_config]     Subscribed to: {cloud_result_topic}")
 
-    cloud_node_params = {
-        "policy_path": policy_path,
-        "input_topic": cloud_inference_topic,
-        "output_topic": cloud_result_topic,
-        "device": "auto",
-        "use_sim_time": is_sim,
-    }
+    # --- Cloud node: only launched locally when cloud_local=True ---
+    if cloud_local:
+        cloud_node_params = {
+            "policy_path": policy_path,
+            "input_topic": cloud_inference_topic,
+            "output_topic": cloud_result_topic,
+            "device": "auto",
+            "use_sim_time": is_sim,
+        }
 
-    cloud_node = Node(
-        package="inference_service",
-        executable="pure_inference_node",
-        name="pure_inference",
-        env=env,
-        parameters=[cloud_node_params],
-        output="screen",
-    )
-    nodes.append(cloud_node)
-    print(f"[robot_config]   Cloud Node (pure_inference_node): GPU Inference")
-    print(f"[robot_config]     Subscribed to: {cloud_inference_topic}")
-    print(f"[robot_config]     Publishing to: {cloud_result_topic}")
+        cloud_node = Node(
+            package="inference_service",
+            executable="pure_inference_node",
+            name="pure_inference",
+            env=env,
+            parameters=[cloud_node_params],
+            output="screen",
+        )
+        nodes.append(cloud_node)
+        print(f"[robot_config]   Cloud Node (pure_inference_node): GPU Inference (co-located)")
+        print(f"[robot_config]     Subscribed to: {cloud_inference_topic}")
+        print(f"[robot_config]     Publishing to: {cloud_result_topic}")
+    else:
+        print(f"[robot_config]   ⚠ Cloud node NOT launched locally.")
+        print(f"[robot_config]     Launch it on the GPU machine with:")
+        print(f"[robot_config]       ros2 launch inference_service cloud_inference.launch.py \\")
+        print(f"[robot_config]         policy_path:={policy_path} device:=cuda")
 
     print(
         f"[robot_config] ✓ Distributed inference nodes configured ({len(nodes)} nodes)"
@@ -310,7 +333,8 @@ def generate_action_dispatcher_node(robot_config, control_mode, use_sim=False):
     return action_dispatcher_node
 
 
-def generate_execution_nodes(robot_config, control_mode="model_inference", use_sim=False):
+def generate_execution_nodes(robot_config, control_mode="model_inference",
+                             use_sim=False, cloud_local=False):
     """Generate all execution nodes (inference + dispatcher).
 
     This is the main entry point for execution system generation.
@@ -321,6 +345,7 @@ def generate_execution_nodes(robot_config, control_mode="model_inference", use_s
         robot_config: Robot configuration dict
         control_mode: Active control mode (defaults to robot's default_control_mode)
         use_sim: Simulation mode flag
+        cloud_local: In distributed mode, also launch cloud node locally
 
     Returns:
         List of Node actions for execution system
@@ -331,7 +356,8 @@ def generate_execution_nodes(robot_config, control_mode="model_inference", use_s
         control_mode = robot_config.get("default_control_mode", "model_inference")
 
     try:
-        inference_result = generate_inference_node(robot_config, control_mode, use_sim)
+        inference_result = generate_inference_node(
+            robot_config, control_mode, use_sim, cloud_local=cloud_local)
         if inference_result:
             if isinstance(inference_result, list):
                 nodes.extend(inference_result)
