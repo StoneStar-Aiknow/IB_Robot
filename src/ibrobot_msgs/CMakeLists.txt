@@ -14,18 +14,22 @@ find_package(rosidl_default_generators REQUIRED)
 find_package(action_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
+find_package(geometry_msgs REQUIRED)
 
 # Generate interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Variant.msg"
   "msg/VariantsList.msg"
   "msg/RobotStatus.msg"
+  "msg/TaskStep.msg"
   "action/RecordEpisode.action"
   "action/RunPolicy.action"
   "action/DispatchInfer.action"
+  "action/ExecuteTaskPlan.action"
   "srv/RecognizeFile.srv"
   "srv/SetHotwords.srv"
-  DEPENDENCIES std_msgs action_msgs builtin_interfaces
+  "srv/MoveToPose.srv"
+  DEPENDENCIES std_msgs action_msgs builtin_interfaces geometry_msgs
 )
 
 if(BUILD_TESTING)

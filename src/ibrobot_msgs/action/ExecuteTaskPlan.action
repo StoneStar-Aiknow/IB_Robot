@@ -1,0 +1,22 @@
+# ExecuteTaskPlan.action - Execute a sequence of task steps via MoveIt.
+#
+# The task_dispatch TaskExecutorNode serves this action.
+# Planners (visual_grasp, VoxPoser, etc.) are action clients.
+
+# --- Goal ---
+ibrobot_msgs/TaskStep[] steps
+string task_id                    # Unique task identifier (UUID recommended)
+string task_description           # Human-readable description
+---
+# --- Result ---
+bool success
+string message
+int32 steps_completed             # Number of steps successfully executed
+float64 total_duration_s
+---
+# --- Feedback ---
+int32 current_step                # 0-indexed
+int32 total_steps
+string current_label
+string status                     # "executing" | "waiting" | "completed" | "failed"
+float32 progress                  # 0.0 - 1.0

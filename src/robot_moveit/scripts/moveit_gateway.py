@@ -1,24 +1,42 @@
 #!/usr/bin/env python3
 """
 MoveIt 2 Gateway Node for IB-Robot.
+
+ROS Interfaces:
+    Subscriptions:
+        /cmd_pose (geometry_msgs/Pose) — fire-and-forget Pose commands
+        /joint_states (sensor_msgs/JointState)
+    Publishers:
+        /robot_status/ee_pose (geometry_msgs/PoseStamped) — 10 Hz
+        /moveit_gateway/motion_status (std_msgs/String) — "idle" | "executing" | "succeeded" | "failed"
+    Services:
+        /moveit_gateway/move_to_pose (ibrobot_msgs/MoveToPose) — synchronous move (blocks until done)
 """
 
-import rclpy
-from rclpy.node import Node
-from rclpy.executors import MultiThreadedExecutor
-from rclpy.callback_groups import ReentrantCallbackGroup
-from geometry_msgs.msg import PoseStamped, Pose
-from moveit_msgs.msg import Constraints, OrientationConstraint
-from std_msgs.msg import Header
-from sensor_msgs.msg import JointState
-import time
 import math
+import time
+
 import numpy as np
+import rclpy
+from geometry_msgs.msg import Pose, PoseStamped
+from moveit_msgs.msg import Constraints, OrientationConstraint
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
 from scipy.spatial.transform import Rotation as R
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Header, String
+
+try:
+    from ibrobot_msgs.srv import MoveToPose
+
+    _HAS_MOVE_TO_POSE_SRV = True
+except ImportError:
+    _HAS_MOVE_TO_POSE_SRV = False
 
 # TF2 and MoveIt 2 imports
 import tf2_ros
-from tf2_ros import TransformException
+
 from pymoveit2 import MoveIt2
 
 
@@ -43,7 +61,7 @@ class MoveItGateway(Node):
         self.shoulder_link = self.get_parameter("shoulder_link").value
 
         self.latest_joint_state = None
-        self.get_logger().info(f"Initializing MoveIt Gateway for SO101...")
+        self.get_logger().info("Initializing MoveIt Gateway for SO101...")
 
         # 3. TF2 setup
         self.tf_buffer = tf2_ros.Buffer()
@@ -74,9 +92,7 @@ class MoveItGateway(Node):
             callback_group=self.callback_group,
         )
 
-        self.ee_pose_pub = self.create_publisher(
-            PoseStamped, "/robot_status/ee_pose", 10
-        )
+        self.ee_pose_pub = self.create_publisher(PoseStamped, "/robot_status/ee_pose", 10)
 
         self.cmd_pose_sub = self.create_subscription(
             Pose,
@@ -86,9 +102,25 @@ class MoveItGateway(Node):
             callback_group=self.callback_group,
         )
 
-        self.timer = self.create_timer(
-            0.1, self.publish_ee_pose, callback_group=self.callback_group
-        )
+        # 6. Motion status publisher (for task_dispatch and external monitors)
+        self.motion_status_pub = self.create_publisher(String, "/moveit_gateway/motion_status", 10)
+        self._motion_status = "idle"
+
+        # 7. MoveToPose service (synchronous move, used by task_dispatch)
+        if _HAS_MOVE_TO_POSE_SRV:
+            self.move_to_pose_srv = self.create_service(
+                MoveToPose,
+                "/moveit_gateway/move_to_pose",
+                self._move_to_pose_service_cb,
+                callback_group=self.callback_group,
+            )
+            self.get_logger().info("MoveToPose service registered")
+        else:
+            self.get_logger().warn(
+                "ibrobot_msgs.srv.MoveToPose not available — service disabled (rebuild ibrobot_msgs to enable)"
+            )
+
+        self.timer = self.create_timer(0.1, self.publish_ee_pose, callback_group=self.callback_group)
 
         self.get_logger().info("MoveIt Gateway fully initialized")
 
@@ -225,9 +257,7 @@ class MoveItGateway(Node):
             shoulder_to_base_q = self.quaternion_conjugate(base_to_shoulder_q)
 
         except Exception as e:
-            self.get_logger().warning(
-                f"Failed to get base->shoulder transform: {e}, using identity"
-            )
+            self.get_logger().warning(f"Failed to get base->shoulder transform: {e}, using identity")
             # 如果获取失败，假设base和shoulder对齐
             base_to_shoulder_q = (0.0, 0.0, 0.0, 1.0)
             shoulder_to_base_q = (0.0, 0.0, 0.0, 1.0)
@@ -282,15 +312,11 @@ class MoveItGateway(Node):
         q_shoulder_constrained = self.rotation_matrix_to_quaternion(R_constrained)
 
         # 6. 转换回base坐标系: q_base = q_shoulder_to_base * q_shoulder_constrained
-        q_base_constrained = self.quaternion_multiply(
-            shoulder_to_base_q, q_shoulder_constrained
-        )
+        q_base_constrained = self.quaternion_multiply(shoulder_to_base_q, q_shoulder_constrained)
 
         return q_base_constrained
 
-    def create_orientation_constraint(
-        self, target_quat, link_name, frame_id, tolerances=(0.3, 0.3, 0.05)
-    ):
+    def create_orientation_constraint(self, target_quat, link_name, frame_id, tolerances=(0.3, 0.3, 0.05)):
         """
         创建带有容差的姿态约束，用于5DOF机械臂的IK求解。
 
@@ -329,14 +355,10 @@ class MoveItGateway(Node):
         self.latest_joint_state = msg
         # 调试：打印关节状态
         if msg is not None and hasattr(msg, "name") and hasattr(msg, "position"):
-            self.get_logger().debug(
-                f"Joint state updated: {list(msg.name)} = {[f'{p:.3f}' for p in msg.position]}"
-            )
+            self.get_logger().debug(f"Joint state updated: {list(msg.name)} = {[f'{p:.3f}' for p in msg.position]}")
 
     def cmd_pose_callback(self, msg):
-        self.get_logger().info(
-            f"Target Pose: x={msg.position.x:.3f}, y={msg.position.y:.3f}, z={msg.position.z:.3f}"
-        )
+        self.get_logger().info(f"Target Pose: x={msg.position.x:.3f}, y={msg.position.y:.3f}, z={msg.position.z:.3f}")
         # 计算并输出目标位置在shoulder坐标系中的Z轴坐标
         try:
             trans = self.tf_buffer.lookup_transform(
@@ -367,21 +389,13 @@ class MoveItGateway(Node):
             R = self.quaternion_to_rotation_matrix((t_x, t_y, t_z, t_w))
 
             p_shoulder = (
-                R[0][0] * p_relative[0]
-                + R[0][1] * p_relative[1]
-                + R[0][2] * p_relative[2],
-                R[1][0] * p_relative[0]
-                + R[1][1] * p_relative[1]
-                + R[1][2] * p_relative[2],
-                R[2][0] * p_relative[0]
-                + R[2][1] * p_relative[1]
-                + R[2][2] * p_relative[2],
+                R[0][0] * p_relative[0] + R[0][1] * p_relative[1] + R[0][2] * p_relative[2],
+                R[1][0] * p_relative[0] + R[1][1] * p_relative[1] + R[1][2] * p_relative[2],
+                R[2][0] * p_relative[0] + R[2][1] * p_relative[1] + R[2][2] * p_relative[2],
             )
 
             # 计算距离shoulder原点的距离
-            dist_shoulder = math.sqrt(
-                p_shoulder[0] ** 2 + p_shoulder[1] ** 2 + p_shoulder[2] ** 2
-            )
+            dist_shoulder = math.sqrt(p_shoulder[0] ** 2 + p_shoulder[1] ** 2 + p_shoulder[2] ** 2)
 
             # 计算距离base原点的距离
             dist_base = math.sqrt(p_base[0] ** 2 + p_base[1] ** 2 + p_base[2] ** 2)
@@ -390,9 +404,7 @@ class MoveItGateway(Node):
                 f"  Target in shoulder frame: x={p_shoulder[0]:.3f}, y={p_shoulder[1]:.3f}, z={p_shoulder[2]:.3f}"
             )
             self.get_logger().info(f"  Distance from base origin: {dist_base:.3f} m")
-            self.get_logger().info(
-                f"  Distance from shoulder origin: {dist_shoulder:.3f} m"
-            )
+            self.get_logger().info(f"  Distance from shoulder origin: {dist_shoulder:.3f} m")
         except Exception as e:
             self.get_logger().warning(f"Failed to transform to shoulder frame: {e}")
 
@@ -411,9 +423,7 @@ class MoveItGateway(Node):
             and abs(orig_quat[2]) < 1e-9
             and abs(orig_quat[3]) < 1e-9
         ):
-            self.get_logger().warning(
-                "Received zero quaternion, using default orientation (0, 0, 0, 1)"
-            )
+            self.get_logger().warning("Received zero quaternion, using default orientation (0, 0, 0, 1)")
             orig_quat = (0.0, 0.0, 0.0, 1.0)
 
         # 尝试多种约束策略，从严格到宽松
@@ -442,9 +452,7 @@ class MoveItGateway(Node):
             strategies.append(("Current orientation (position only)", current_quat))
         except Exception as e:
             self.get_logger().warning(f"Failed to get current orientation: {e}")
-            strategies.append(
-                ("Default orientation (no rotation)", (0.0, 0.0, 0.0, 1.0))
-            )
+            strategies.append(("Default orientation (no rotation)", (0.0, 0.0, 0.0, 1.0)))
 
         # 定义分层容差策略（从严格到宽松）
         tolerance_strategies = [
@@ -477,9 +485,7 @@ class MoveItGateway(Node):
                     self.get_logger().info(f"IK succeeded with {full_strategy}")
                     return
                 else:
-                    self.get_logger().debug(
-                        f"  Failed with {tol_name}, trying next tolerance..."
-                    )
+                    self.get_logger().debug(f"  Failed with {tol_name}, trying next tolerance...")
 
         self.get_logger().error("IK failed with all strategies!")
 
@@ -501,6 +507,85 @@ class MoveItGateway(Node):
         except Exception:
             pass
 
+    def _publish_motion_status(self, status: str):
+        """Publish motion status for external observers (task_dispatch, etc.)."""
+        self._motion_status = status
+        msg = String()
+        msg.data = status
+        self.motion_status_pub.publish(msg)
+
+    def _move_to_pose_service_cb(self, request, response):
+        """Synchronous move-to-pose service handler for task_dispatch integration.
+
+        Performs the full IK + plan + execute pipeline and blocks until
+        motion completes (or fails/times out).
+        """
+        t0 = time.time()
+        target = request.target_pose
+        self.get_logger().info(
+            f"[Service] MoveToPose request: ({target.position.x:.3f}, {target.position.y:.3f}, {target.position.z:.3f})"
+        )
+        self._publish_motion_status("executing")
+
+        try:
+            # Use the existing cmd_pose pipeline (includes all 5DOF strategies)
+            # Reuse the full cmd_pose_callback logic via solve_and_move
+            success = self.solve_and_move(target)
+            if success:
+                # Poll execution state instead of calling wait_until_executed(),
+                # which uses rclpy.spin_once() and deadlocks under MultiThreadedExecutor.
+                is_executing_attr = "_MoveIt2__is_executing"
+                is_requested_attr = "_MoveIt2__is_motion_requested"
+
+                # Phase 1: Wait for motion to actually start (goal accepted)
+                start_timeout = 5.0
+                t_start = time.time()
+                while time.time() - t_start < start_timeout:
+                    if getattr(self.moveit2, is_executing_attr, False):
+                        break
+                    if not getattr(self.moveit2, is_requested_attr, False):
+                        break
+                    time.sleep(0.05)
+
+                # Phase 2: Wait for motion to complete
+                exec_timeout = 30.0
+                t_exec = time.time()
+                while time.time() - t_exec < exec_timeout:
+                    if not getattr(self.moveit2, is_executing_attr, False):
+                        break
+                    time.sleep(0.1)
+
+                total_exec = time.time() - t_start
+                if total_exec >= exec_timeout + start_timeout:
+                    self.get_logger().warn(f"[Service] MoveToPose execution timed out after {total_exec:.1f}s")
+                    response.success = False
+                    response.message = f"Execution timed out after {total_exec:.1f}s"
+                    self._publish_motion_status("failed")
+                elif self.moveit2.motion_suceeded:
+                    response.success = True
+                    response.message = "Motion completed"
+                    self._publish_motion_status("succeeded")
+                else:
+                    response.success = False
+                    response.message = "Motion execution failed (MoveIt reported unsuccessful)"
+                    self._publish_motion_status("failed")
+            else:
+                response.success = False
+                response.message = "IK/planning failed"
+                self._publish_motion_status("failed")
+        except Exception as e:
+            response.success = False
+            response.message = f"Exception: {e}"
+            self.get_logger().error(f"[Service] MoveToPose exception: {e}")
+            self._publish_motion_status("failed")
+
+        response.execution_time_s = time.time() - t0
+        self._publish_motion_status("idle")
+        self.get_logger().info(
+            f"[Service] MoveToPose result: success={response.success}, time={response.execution_time_s:.1f}s"
+        )
+        return response
+
     def solve_and_move(self, target_pose, orientation_tolerance=None):
         """
         尝试IK求解并移动到目标位姿。
@@ -518,32 +603,24 @@ class MoveItGateway(Node):
 
         # 打印目标位置（用于调试可达性）
         target_pos = target_pose.position
-        self.get_logger().info(
-            f"  Target position: ({target_pos.x:.3f}, {target_pos.y:.3f}, {target_pos.z:.3f})"
-        )
+        self.get_logger().info(f"  Target position: ({target_pos.x:.3f}, {target_pos.y:.3f}, {target_pos.z:.3f})")
 
         # 简单的可达性检查：距离原点的距离
-        dist_from_origin = math.sqrt(
-            target_pos.x**2 + target_pos.y**2 + target_pos.z**2
-        )
+        dist_from_origin = math.sqrt(target_pos.x**2 + target_pos.y**2 + target_pos.z**2)
         self.get_logger().info(f"  Distance from origin: {dist_from_origin:.3f} m")
 
         # 打印当前关节状态（如果有）
-        if self.latest_joint_state is not None and hasattr(
-            self.latest_joint_state, "position"
-        ):
-            self.get_logger().debug(
-                f"  Current joints: {[f'{p:.2f}' for p in self.latest_joint_state.position]}"
-            )
+        if self.latest_joint_state is not None and hasattr(self.latest_joint_state, "position"):
+            self.get_logger().debug(f"  Current joints: {[f'{p:.2f}' for p in self.latest_joint_state.position]}")
 
         try:
             # 检查关节状态是否有效
             start_state = None
             if self.latest_joint_state is not None:
                 # 验证关节状态是否包含所需的关节数量
-                if hasattr(self.latest_joint_state, "position") and len(
-                    self.latest_joint_state.position
-                ) >= len(self.joint_names):
+                if hasattr(self.latest_joint_state, "position") and len(self.latest_joint_state.position) >= len(
+                    self.joint_names
+                ):
                     start_state = self.latest_joint_state
                 else:
                     self.get_logger().warning(
@@ -551,9 +628,7 @@ class MoveItGateway(Node):
                         f"need {len(self.joint_names)}. Using solver's internal state."
                     )
             else:
-                self.get_logger().warning(
-                    "No joint state available, using solver's internal state"
-                )
+                self.get_logger().warning("No joint state available, using solver's internal state")
 
             # 创建Constraints（如果指定了容差）
             constraints = None
@@ -573,9 +648,7 @@ class MoveItGateway(Node):
                         tolerances=orientation_tolerance,
                     )
                 )
-                self.get_logger().info(
-                    f"Using orientation tolerance: {orientation_tolerance}"
-                )
+                self.get_logger().info(f"Using orientation tolerance: {orientation_tolerance}")
 
             # 1. Use async IK call to avoid internal spin_once calls
             # 只在有有效状态时才传递start_joint_state参数
@@ -643,7 +716,7 @@ class MoveItGateway(Node):
     def move_to_joint(self, joint_positions):
         if not self.moveit2:
             return False
-        self.get_logger().info(f"Moving to joints...")
+        self.get_logger().info("Moving to joints...")
         try:
             self.moveit2.clear_goal_constraints()
             self.moveit2.move_to_configuration(joint_positions)

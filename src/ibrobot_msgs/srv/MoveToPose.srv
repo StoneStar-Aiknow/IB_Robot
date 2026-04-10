@@ -1,0 +1,11 @@
+# MoveToPose.srv - Synchronous move-to-pose via MoveIt gateway.
+#
+# Served by moveit_gateway. Called by task_dispatch for each
+# MOVE_TO_POSE step. Blocks until motion completes or fails.
+
+geometry_msgs/Pose target_pose
+float64 velocity_scaling          # 0.0 = use default, otherwise 0.0-1.0
+---
+bool success
+string message
+float64 execution_time_s
