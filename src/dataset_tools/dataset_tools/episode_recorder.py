@@ -215,8 +215,8 @@ class EpisodeRecorderServer(Node):
         self.declare_parameter("default_task", "")
         self.declare_parameter("task_family", "")
         self.declare_parameter("lerobot_norm_mode", "")
-        self.declare_parameter("joint_names", [])
-        self.declare_parameter("gripper_joints", [])
+        self.declare_parameter("joint_names", [""])
+        self.declare_parameter("gripper_joints", [""])
         self.declare_parameter("calibration_file", "")
         # Storage tuning (kept optional & conservative by default)
         self.declare_parameter("storage_preset_profile", "")  # e.g., "zstd_fast"
@@ -262,12 +262,8 @@ class EpisodeRecorderServer(Node):
         self._lerobot_norm_mode = (
             self.get_parameter("lerobot_norm_mode").get_parameter_value().string_value
         )
-        self._joint_names = list(
-            self.get_parameter("joint_names").get_parameter_value().string_array_value
-        )
-        self._gripper_joints = list(
-            self.get_parameter("gripper_joints").get_parameter_value().string_array_value
-        )
+        self._joint_names = [j for j in self.get_parameter("joint_names").get_parameter_value().string_array_value if j]
+        self._gripper_joints = [j for j in self.get_parameter("gripper_joints").get_parameter_value().string_array_value if j]
         self._calibration_file = (
             self.get_parameter("calibration_file").get_parameter_value().string_value
         )
@@ -349,6 +345,14 @@ class EpisodeRecorderServer(Node):
             callback_group=self._cbg,
         )
 
+        # Info service
+        self._info_service = self.create_service(
+            Trigger,
+            "record_episode/get_info",
+            self._info_service_cb,
+            callback_group=self._cbg,
+        )
+
         # ROS timers for episode lifecycle/feedback (created per-episode)
         self._timeout_timer: Optional[Timer] = None
         self._feedback_timer: Optional[Timer] = None
@@ -412,6 +416,30 @@ class EpisodeRecorderServer(Node):
         self._episode_done_evt.set()
         resp.success = True
         resp.message = "Recording cancelled"
+        return resp
+
+    def _info_service_cb(
+        self, _req: Trigger.Request, resp: Trigger.Response
+    ) -> Trigger.Response:
+        """Return current dataset path and episode count as JSON."""
+        import json
+        resp.success = True
+        resp.message = json.dumps({
+            "path": str(self._dataset_root),
+            "episodes": len(self._episode_dirs())
+        })
+        return resp
+
+    def _info_service_cb(
+        self, _req: Trigger.Request, resp: Trigger.Response
+    ) -> Trigger.Response:
+        """Return current dataset path and episode count as JSON."""
+        import json
+        resp.success = True
+        resp.message = json.dumps({
+            "path": str(self._dataset_root),
+            "episodes": len(self._episode_dirs())
+        })
         return resp
 
     def _shutdown_cb(self) -> None:
@@ -605,6 +633,8 @@ class EpisodeRecorderServer(Node):
 
     def _episode_dirs(self) -> List[Path]:
         """Return existing episode directories under the active dataset."""
+        if not self._episodes_dir.exists():
+            self._episodes_dir.mkdir(parents=True, exist_ok=True)
         return sorted(
             p
             for p in self._episodes_dir.iterdir()
@@ -803,8 +833,11 @@ class EpisodeRecorderServer(Node):
             goal_handle.abort()
             return RecordEpisode.Result(success=False, message="Writer error")
         elif was_stop_requested:
-            goal_handle.canceled()
-            return RecordEpisode.Result(success=False, message="Cancelled")
+            # Always succeed even if stopped early, because a partial episode is still a valid bag.
+            # Calling canceled() is prone to race conditions if the state hasn't transitioned to CANCELING yet.
+            if goal_handle.is_active:
+                goal_handle.succeed()
+            return RecordEpisode.Result(success=True, message="Stopped early (Saved)")
         else:
             goal_handle.succeed()
             self.get_logger().info(
