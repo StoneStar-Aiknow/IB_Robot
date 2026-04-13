@@ -120,6 +120,24 @@ verify_lerobot() {
     return 0
 }
 
+verify_pygraphviz() {
+    local venv_python="${VENV_PYTHON}"
+
+    case "${SETUP_PLATFORM_ID}" in
+        openeuler-embedded-24.03)
+            log_info "Verifying pygraphviz..."
+
+            if ! PYTHONNOUSERSITE=1 "${venv_python}" -c "import pygraphviz" >/dev/null 2>&1; then
+                log_error "Verification failed: pygraphviz is not importable from the workspace venv."
+                log_error "Re-run ./scripts/setup.sh after ensuring graphviz and graphviz-devel are installed."
+                return 1
+            fi
+            ;;
+    esac
+
+    return 0
+}
+
 verify_tracing() {
     local venv_python="${VENV_PYTHON}"
     local ros_setup="${SETUP_ROS_SETUP_PATH}"
@@ -223,6 +241,7 @@ verify_env() {
     verify_colcon || return 1
     verify_numpy_compat || return 1
     verify_lerobot || return 1
+    verify_pygraphviz || return 1
     verify_tracing || return 1
 
     log_done "Verified ROS, rosdep, colcon, lerobot, and NumPy compatibility"
