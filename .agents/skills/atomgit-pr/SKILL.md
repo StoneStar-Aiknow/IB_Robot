@@ -1,12 +1,21 @@
 ---
-name: atomgit-submit-pr
-description: "AtomGit PR 提交工具。当用户需要“提交PR”、“创建合并请求”、“create pull request”、“submit PR”、“更新PR描述”、“update PR description”、“generate PR summary”或在功能开发完成后准备合入官方 upstream 仓库时调用。"
+name: atomgit-pr
+description: "AtomGit PR 工作流工具。当用户需要在本仓库或 AtomGit 上“创建PR”、“更新PR描述”、“同步PR标题/正文”、“生成PR摘要”、“create pull request”、“open merge request”、“update PR description”、“generate PR summary”或围绕 PR 管理动作工作时调用。它负责 PR 资源的创建和维护，不负责通用代码 review；只要目标是本仓库的 PR / merge request 管理，默认优先使用本 skill，而不是 GitHub 默认能力。"
 license: MIT
 ---
 
-# AtomGit PR Submit Tool
+# AtomGit PR Workflow Tool
 
-创建新 PR 或更新现有 PR 描述。
+创建新 PR、提取 PR 管理上下文或更新现有 PR 描述。
+
+如果用户的目标是“**review 一个 PR / 帮我看看这个 PR 有没有问题 / 分析已有评论**”，不要使用本 skill，改用 `atomgit-pr-review`；如果目标是 SSOT / 契约 / 架构职责边界检查，改用 `atomgit-pr-architecture-review`。
+
+在 IB_Robot 仓库中，只要用户提到 PR / merge request 且未明确指定 GitHub，默认视为 AtomGit 工作流并优先使用本 skill。
+
+本 skill 支持对 **任意 AtomGit 仓库** 指定目标：
+
+- `--owner` / `--repo`: 显式覆盖 `config.json` 中的仓库
+- `--url`: 从 AtomGit / GitCode 的仓库或 PR 链接自动解析 `owner/repo`
 
 ## ⚠️ 环境准备
 
@@ -46,6 +55,7 @@ Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler
 **PR 描述强制要求：**
 
 1.  **Markdown 渲染质量**: **必须**确保所有的 Markdown 语法（包括标题、加粗、列表、代码块、Mermaid 图表）都能被正确渲染。避免直接在 shell 命令中使用未处理的换行符。
+    *   **Mermaid 语法约束**: Mermaid 节点文本里如果包含 `()`、`&` 等特殊字符，**必须用引号包裹节点文本**，否则极易产生语法错误。例如使用 `A[\"Build & Verify (ROS 2)\"]`，不要直接写成 `A[Build & Verify (ROS 2)]`。
 2.  **超链接使用**: 对相关的 Issue、PR、技术规范或设计文档，**必须**使用 Markdown 超链接进行关联（如 `[PR #32](https://atomgit.com/openeuler/IB_Robot/pull/32)`），以方便审阅者查阅背景。
 3.  **深度结构化内容**:
     *   **Background & Motivation (背景与动机)**: 详细说明问题的根源、业务痛点或功能需求。
@@ -65,7 +75,7 @@ git diff upstream/master..HEAD
 # 必须包含上述 5 个部分，并包含 Mermaid 图。
 
 # 3. 创建 PR
-python3 create_pr.py --branch feat/my-feature --fork-owner BreezeWu --title "feat(scope): technical summary" --description-file pr_description.md
+python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --title "feat(scope): technical summary" --description-file pr_description.md
 ```
 
 ### 基础用法
@@ -75,7 +85,13 @@ python3 create_pr.py --branch feat/my-feature --fork-owner BreezeWu --title "fea
 git remote -v
 
 # 步骤2: 创建 PR (必须包含 Summary/Changes/Verification 三大核心板块)
-python3 create_pr.py --branch feat/my-feature --fork-owner BreezeWu --title "fix: specific issue" --body "## Background\n...\n## Changes\n...\n## Verification\n..."
+python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --title "fix: specific issue" --body "## Background\n...\n## Changes\n...\n## Verification\n..."
+
+# 跨仓库：直接指定目标仓库
+python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --owner some-org --repo some-repo --body "..."
+
+# 跨仓库：从链接自动解析 owner/repo
+python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --url https://atomgit.com/some-org/some-repo --body "..."
 ```
 
 ### 生成/更新 PR 描述 (Agent 驱动)
@@ -84,9 +100,12 @@ python3 create_pr.py --branch feat/my-feature --fork-owner BreezeWu --title "fix
 
 **步骤 1: 提取 PR 上下文**
 ```bash
-python3 generate_pr.py --pr 123 --fetch-info
+python3 pr_management.py --pr 123 --fetch-info
+
+# 默认会包含 PR 评论；如只看提交和 Diff，可显式关闭
+python3 pr_management.py --pr 123 --fetch-info --no-comments
 ```
-Agent 会读取生成的 `tmp/pr_123_context.json`，其中包含所有提交记录、修改文件以及代码 Diff (patch)。
+Agent 会读取生成的 `tmp/{repo}_pr_123_context.json`，其中默认包含提交记录、修改文件、代码 Diff (patch) 以及 PR 评论。
 
 **步骤 2: Agent 分析与同步**
 Agent 分析完 Diff 后，会生成一份 `description.json`:
@@ -98,12 +117,12 @@ Agent 分析完 Diff 后，会生成一份 `description.json`:
 ```
 然后运行同步命令：
 ```bash
-python3 generate_pr.py --pr 123 --update-pr description.json
+python3 pr_management.py --pr 123 --update-pr description.json
 ```
 
 ## API 说明
 
-### create_pr.py
+### pr_creation.py
 
 创建新的 Pull Request。
 
@@ -113,19 +132,22 @@ python3 generate_pr.py --pr 123 --update-pr description.json
 - `--title`: PR 标题（可选，自动生成）
 - `--body`: PR 描述（可选，自动生成）
 - `--base`: 目标分支（默认：master）
+- `--owner`: 目标仓库 owner（可选，覆盖 `config.json`）
+- `--repo`: 目标仓库 repo（可选，覆盖 `config.json`）
+- `--url`: AtomGit / GitCode 仓库或 PR 链接（可选，自动解析 `owner/repo`）
 - `--draft`: 创建草稿 PR（可选）
 - `--dry-run`: 仅显示计划，不创建
 
 **示例**:
 ```bash
 # 完整示例
-python3 create_pr.py --branch feat/new-feature --fork-owner BreezeWu
+python3 pr_creation.py --branch feat/new-feature --fork-owner BreezeWu
 
 # 指定标题
-python3 create_pr.py --branch feat/new-feature --fork-owner BreezeWu --title "feat: add new feature"
+python3 pr_creation.py --branch feat/new-feature --fork-owner BreezeWu --title "feat: add new feature"
 ```
 
-### generate_pr.py
+### pr_management.py
 
 管理和维护已有 PR 的数据。
 
@@ -134,8 +156,12 @@ python3 create_pr.py --branch feat/new-feature --fork-owner BreezeWu --title "fe
 2. `--pr <NUM> --update-pr <JSON>`: 将 Agent 生成的描述同步到服务器。
 
 **参数**:
-- `--pr`: PR 编号 (**必需**)
+- `--pr`: PR 编号（可由 `--url` 自动解析）
+- `--owner`: 目标仓库 owner（可选，覆盖 `config.json`）
+- `--repo`: 目标仓库 repo（可选，覆盖 `config.json`）
+- `--url`: PR 链接（可选，自动解析 `owner/repo/pr_number`）
 - `--output-dir`: JSON 输出目录 (默认: ./tmp)
+- `--no-comments`: 在 `--fetch-info` 模式下跳过 PR 评论抓取
 - `--ai-model`: 签名使用的 AI 名称 (默认: agent)
 - `--dry-run`: 预览生成的描述但不执行更新
 
@@ -154,3 +180,4 @@ PR 描述会自动包含：
 2. **提交信息**: 确保提交信息符合规范
 3. **代码审查**: 创建 PR 后等待代码审查
 4. **CI 检查**: 确保 CI 通过后再合并
+5. **跨仓库前提**: 创建 PR 时当前本地 worktree 仍需与目标仓库代码相匹配；`--owner/--repo/--url` 只负责切换 AtomGit API 目标，不会替你切换本地 Git 工作区

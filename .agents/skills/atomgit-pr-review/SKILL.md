@@ -1,12 +1,21 @@
 ---
-name: atomgit-code-review
-description: "AtomGit 代码审查工具。当用户需要“代码审查”、“代码评审”、“code review”、“PR review”、“审阅代码”、“检查Bug”、“logic check”、“发现错误”、“审视PR”或提交检视意见到 AtomGit 时使用。适用于“审阅 #123 号PR”、“检查代码逻辑”等指令。"
+name: atomgit-pr-review
+description: "AtomGit PR 评审工具。当用户需要在本仓库或 AtomGit 上“代码审查”、“PR review”、“review pull request”、“审阅PR”、“帮我看看这个PR”、“检查这个PR有没有问题”、“检查Bug”、“logic check”、“获取完整review上下文”、“提交检视意见”或分析指定 PR 的改动与已有评论时使用。只要目标是本仓库的 PR review，默认优先使用本 skill，而不是 GitHub 默认 review 能力。"
 license: MIT
 ---
 
-# AtomGit Code Review
+# AtomGit PR Review
 
-提取 PR 信息并提交代码审查评论到 AtomGit。
+提取适合 review 的完整 PR 上下文，并提交代码审查评论到 AtomGit。
+
+在 IB_Robot 仓库中，只要用户提到 review / 审查 / 审阅 PR 且未明确指定 GitHub，默认视为 AtomGit PR 评审流程并优先使用本 skill。
+
+本 skill 支持对 **任意 AtomGit 仓库的 PR** 做通用代码审查：
+
+- `--owner` / `--repo`: 显式覆盖 `config.json` 中的仓库
+- `--url`: 从 AtomGit / GitCode 的 PR 链接自动解析 `owner/repo/pr_number`
+
+当用户的目标是“**review 一个 PR / 帮我看看这个 PR 有没有问题**”时，优先使用本 skill。**不需要**先切到 `atomgit-pr` 获取上下文；本 skill 的提取模式默认就会带出 PR 现有评论。
 
 ## ⚠️ 环境准备
 
@@ -23,7 +32,7 @@ source .shrc_local
 **输出文件位于项目 `./tmp` 目录**，AI Agent 应使用 shell 命令读取：
 
 ```bash
-# 读取 PR 信息
+# 读取 review 上下文
 cat ./tmp/ib_robot_pr_123_info.json
 
 # 读取审查结果（提交前确认）
@@ -52,14 +61,20 @@ jq '.pr.changed_files[] | select(.filename | contains("lib/")) | {filename, cont
 
 ```bash
 # 步骤1: 提取 PR 信息
-python3 atomgit_reviewer.py --pr 123
+python3 pr_review.py --pr 123
+
+# 直接从链接解析目标 PR
+python3 pr_review.py --url https://atomgit.com/some-org/some-repo/pull/123
+
+# 如只关注代码 diff，可显式跳过已有评论
+python3 pr_review.py --pr 123 --no-comments
 
 # 步骤2: 你分析代码并生成 issues.json
 
 # 步骤3: 人类确认审查结果
 
 # 步骤4: 提交审查结果（⚠️ 必须指定 --ai-model）
-python3 atomgit_reviewer.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issues.json --ai-model claude-sonnet-4
+python3 pr_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issues.json --ai-model claude-sonnet-4
 ```
 
 **重要**: 
@@ -72,13 +87,15 @@ python3 atomgit_reviewer.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issue
 ### 提取 PR 信息
 
 ```bash
-python3 atomgit_reviewer.py --pr 123
+python3 pr_review.py --pr 123
 ```
 
 **输出**: 项目临时目录 `./tmp/{repo}_pr_{number}_info.json`（例如：`./tmp/ib_robot_pr_123_info.json`）
 
 **注意**: 
 - 默认输出到项目 `./tmp` 目录，**不需要指定 `--output-dir`**
+- 默认包含 `changed_files`、`commits` 和已有 `comments`
+- 如果评论量太大，可追加 `--no-comments`
 
 ```json
 {
@@ -87,6 +104,12 @@ python3 atomgit_reviewer.py --pr 123
     "title": "...",
     "author": "...",
     "branch": "feature → main",
+    "stats": {
+      "files_changed": 3,
+      "commits": 2,
+      "comments": 5,
+      "unresolved_comments": 2
+    },
     "changed_files": [
       {
         "filename": "lib/api.py",
@@ -95,23 +118,29 @@ python3 atomgit_reviewer.py --pr 123
         "content": "..."
       }
     ]
-  }
+  },
+  "commits": [...],
+  "comments": [...]
 }
 ```
 
-**⚠️ 重要**：提取的 JSON 文件已经包含了所有 diff（`patch`）和文件内容（`content`）。
+**⚠️ 重要**：提取的 JSON 文件已经包含了所有 diff（`patch`）、文件内容（`content`）以及已有 PR 评论。
 - **不需要** `git fetch` 或 `git diff`
 - **不需要** 切换分支或修改本地代码
-- 直接读取 JSON 文件中的 `changed_files` 进行审查即可
+- 直接读取 JSON 文件中的 `changed_files`、`commits` 和 `comments` 进行审查即可
 
 ### 提交审查结果
 
 ```bash
-python3 atomgit_reviewer.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issues.json --ai-model claude-sonnet-4
+python3 pr_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issues.json --ai-model claude-sonnet-4
 ```
 
 **参数**：
 - `--pr`: PR 编号
+- `--owner`: 目标仓库 owner（可选，覆盖 `config.json`）
+- `--repo`: 目标仓库 repo（可选，覆盖 `config.json`）
+- `--url`: PR 链接（可选，自动解析 `owner/repo/pr_number`）
+- `--no-comments`: 在提取信息模式下跳过抓取已有 PR 评论
 - `--submit-review`: 审查结果 JSON 文件
 - `--ai-model`: AI 模型名称（**必须指定真实模型名称**，用于签名）
 - `--dry-run`: 仅显示计划
@@ -182,5 +211,8 @@ python3 atomgit_reviewer.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issue
 
 ## Related Skills
 
-- `atomgit-code-review-repair`: 修复检视意见
-- `atomgit-architecture-review`: 架构审查
+- `atomgit-pr`: 创建 PR、同步标题/描述、获取 PR 管理上下文；**不负责**通用 review 判定
+- `atomgit-review-resolution`: 处理检视意见
+- `atomgit-pr-architecture-review`: 架构审查
+
+> **注意**: `atomgit-pr-architecture-review` 仍然是 **IB_Robot 专用** 的架构规范审查，不会随着本 skill 一起泛化到其他仓库。

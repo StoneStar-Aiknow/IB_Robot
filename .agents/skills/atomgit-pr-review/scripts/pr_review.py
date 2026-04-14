@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AtomGit 架构审查脚本
+AtomGit PR Review Workflow
 支持三种模式：
 1. --extract-info: 提取 PR 信息（输出JSON）- AI Agent 使用
 2. --submit-review: 提交审查结果（从JSON读取）- AI Agent 使用
@@ -14,16 +14,17 @@ import argparse
 from pathlib import Path
 from typing import List, Dict, Optional
 
+from atomgit_sdk import AtomGitClient, AtomGitConfig, CodeIssue
+from atomgit_sdk.utils import calculate_diff_position, add_line_numbers
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
-from atomgit_sdk import AtomGitClient, AtomGitConfig, ArchitectureIssue
-from atomgit_sdk.utils import calculate_diff_position, add_line_numbers
 from comment_formatter import CommentFormatter
-from llm_architecture_reviewer import LLMArchitectureReviewer
+from llm_reviewer import LLMCodeReviewer
 
 
-class ArchitectureReviewer:
-    """架构审查器"""
+class CodeReviewer:
+    """代码审查器"""
 
     def __init__(self, client: AtomGitClient, formatter: CommentFormatter):
         self.client = client
@@ -37,7 +38,7 @@ class ArchitectureReviewer:
 
         changed_files = []
         for f in files:
-            if f.get("status") != "removed" and f.get("filename").endswith(".py"):
+            if f.get("status") != "removed":
                 file_data = {
                     "filename": f.get("filename"),
                     "status": f.get("status"),
@@ -46,7 +47,6 @@ class ArchitectureReviewer:
                     "patch": f.get("patch"),
                 }
 
-                # 获取文件内容（使用 PR 的 head SHA）
                 try:
                     content = self.client.get_file_content(f.get("filename"), head_sha)
                     file_data["content"] = add_line_numbers(content)
@@ -66,71 +66,80 @@ class ArchitectureReviewer:
             }
         }
 
-    def load_issues_from_json(self, json_path: str) -> List[ArchitectureIssue]:
+    def load_issues_from_json(self, json_path: str) -> List[CodeIssue]:
         """从 JSON 文件加载问题"""
         with open(json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
         issues = []
         for item in data:
-            issue = ArchitectureIssue(
+            issue = CodeIssue(
                 file=item.get("file", ""),
                 line=item.get("line", 0),
+                type=item.get("type", "bug"),
+                severity=item.get("severity", "warning"),
+                confidence=item.get("confidence", 80),
                 title=item.get("title", ""),
                 description=item.get("description", ""),
-                severity=item.get("severity", "warning"),
-                pillar=item.get("pillar", "python"),
-                fix=item.get("fix"),
-                context_code=item.get("context_code"),
+                context_code=item.get("contextCode") or item.get("context_code"),
+                fix_code=item.get("fix", {}).get("code")
+                if isinstance(item.get("fix"), dict)
+                else item.get("fix_code"),
+                fix_explanation=item.get("fix", {}).get("explanation")
+                if isinstance(item.get("fix"), dict)
+                else item.get("fix_explanation"),
             )
             issues.append(issue)
 
         return issues
 
-    def submit_review(self, pr_number: int, issues: List[ArchitectureIssue]) -> None:
-        """提交审查结果"""
-        if not issues:
-            summary = self.formatter.format_summary(issues)
-            self.client.submit_pr_comment(pr_number, summary)
-            print(f"✅ 提交架构审查通过评论到 PR #{pr_number}")
-            return
+    def submit_issues(self, pr_number: int, issues: List[CodeIssue]) -> Dict:
+        """提交问题到 PR"""
+        pr = self.client.get_pull_request(pr_number)
+        diffs = self.client.get_pr_diff(pr_number)
 
-        pr_files = self.client.get_pr_files(pr_number)
-        changed_filenames = {f.get("filename") for f in pr_files}
+        issues = self.formatter.deduplicate(issues)
 
-        inline_issues = []
-        pr_level_issues = []
+        positions = {}
         for issue in issues:
-            if issue.file in changed_filenames:
-                inline_issues.append(issue)
-            else:
-                pr_level_issues.append(issue)
+            if issue.file not in positions:
+                positions[issue.file] = {}
 
-        if inline_issues:
-            comments = self.formatter.format_issues(inline_issues)
+            diff_info = diffs.get(issue.file, {})
+            is_new_file = diff_info.get("status") == "added"
+            patch = diff_info.get("patch", "")
+            position = calculate_diff_position(patch, issue.line, is_new_file)
+            if position is not None:
+                positions[issue.file][issue.line] = position
+
+        comments = self.formatter.format_issues(issues, positions)
+
+        summary = self.formatter.format_summary(issues, pr_number, pr.get("title", ""))
+        self.client.submit_pr_comment(pr_number, summary)
+        print(f"✅ 已提交摘要评论\n")
+
+        if comments:
             results = self.client.submit_batch_comments(pr_number, comments)
-
             success_count = sum(1 for r in results if r["success"])
-            print(
-                f"✅ 提交 {success_count}/{len(results)} 条行内评论到 PR #{pr_number}"
-            )
+
+            print(f"✅ 提交 {success_count}/{len(results)} 条评论\n")
 
             for result in results:
-                if not result["success"]:
-                    print(f"  ❌ 失败: {result['comment']['path']} - {result['error']}")
+                if result["success"]:
+                    print(f"  ✅ {result['comment']['path']} → {result['comment_url']}")
+                else:
+                    print(f"  ❌ {result['comment']['path']} - {result['error']}")
+        else:
+            print("⚠️  没有符合条件的问题需要提交\n")
 
-        if pr_level_issues:
-            body = self.formatter.format_pr_level_issues(pr_level_issues)
-            try:
-                self.client.submit_pr_comment(pr_number, body)
-                print(
-                    f"✅ 提交 {len(pr_level_issues)} 条 PR 评论到 PR #{pr_number}（非变更文件，降级为 PR 级评论）"
-                )
-            except Exception as e:
-                print(f"  ❌ PR 评论提交失败: {e}")
+        return {
+            "total_issues": len(issues),
+            "submitted_comments": len(comments),
+            "summary_submitted": True,
+        }
 
 
-def mode_extract_info(args, reviewer: ArchitectureReviewer):
+def mode_extract_info(args, reviewer: CodeReviewer):
     """模式1: 提取 PR 信息（AI Agent 使用）"""
     print("\n" + "=" * 60)
     print("📥 模式: 提取 PR 信息")
@@ -141,9 +150,8 @@ def mode_extract_info(args, reviewer: ArchitectureReviewer):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 从配置中获取仓库名称
     repo_name = reviewer.client.config.repo.lower().replace("-", "_")
-    output_file = output_dir / f"{repo_name}_pr_{args.pr}_arch_info.json"
+    output_file = output_dir / f"{repo_name}_pr_{args.pr}_info.json"
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(pr_info, f, indent=2, ensure_ascii=False)
 
@@ -152,21 +160,20 @@ def mode_extract_info(args, reviewer: ArchitectureReviewer):
     print(f"   标题: {pr_info['pr']['title']}")
     print(f"   作者: {pr_info['pr']['author']}")
     print(f"   分支: {pr_info['pr']['branch']}")
-    print(f"   Python文件: {len(pr_info['pr']['changed_files'])} 个")
+    print(f"   文件: {len(pr_info['pr']['changed_files'])} 个")
 
     print("\n💡 下一步:")
     print("  AI Agent 应该:")
-    print("  1. 读取此文件并进行架构审查")
-    print("  2. 检查是否符合 IB_Robot 架构四大支柱")
-    print("  3. 生成 arch-issues.json（包含所有架构问题和建议）")
-    print("  4. ⚠️ 将审查结果以用户可读的格式展示给用户确认")
-    print("  5. 用户确认后，运行提交命令")
+    print("  1. 读取此文件并进行代码审查")
+    print("  2. 生成 issues.json（包含所有发现的问题和建议修复方案）")
+    print("  3. ⚠️ 将审查结果以用户可读的格式展示给用户确认")
+    print("  4. 用户确认后，运行提交命令")
     print(
-        f"\n     python3 atomgit_reviewer.py --pr {args.pr} --submit-review arch-issues.json --ai-model <your-model-name>"
+        f"\n     python3 pr_review.py --pr {args.pr} --submit-review issues.json --ai-model <your-model-name>"
     )
 
 
-def mode_submit_review(args, reviewer: ArchitectureReviewer):
+def mode_submit_review(args, reviewer: CodeReviewer):
     """模式2: 提交审查结果（AI Agent 使用）"""
     print("\n" + "=" * 60)
     print("📤 模式: 提交审查结果")
@@ -175,34 +182,33 @@ def mode_submit_review(args, reviewer: ArchitectureReviewer):
     print(f"\n📂 从 JSON 加载问题: {args.submit_review}\n")
 
     issues = reviewer.load_issues_from_json(args.submit_review)
-    print(f"📝 加载了 {len(issues)} 个架构问题\n")
+    print(f"📝 加载了 {len(issues)} 个问题\n")
 
     if args.dry_run:
         print("ℹ️  Dry run 模式：将显示提交计划但不执行\n")
         for issue in issues:
-            print(f"  - {issue.file}:{issue.line} [{issue.severity}] {issue.title}")
+            if issue.confidence >= args.threshold:
+                print(f"  - {issue.file}:{issue.line} [{issue.severity}] {issue.title}")
         print("")
         return
 
-    reviewer.submit_review(args.pr, issues)
+    result = reviewer.submit_issues(args.pr, issues)
 
     print(f"\n" + "=" * 60)
-    print("✅ 审查完成")
+    print(f"✅ 审查完成")
     print("=" * 60 + "\n")
     print(f"📊 统计:")
-    print(f"   总问题数: {len(issues)}")
+    print(f"   总问题数: {result['total_issues']}")
+    print(f"   提交评论数: {result['submitted_comments']}")
     print(f"\n🔗 PR 链接: {reviewer.client.get_pr_url(args.pr)}\n")
 
 
-def mode_auto(
-    args, client: AtomGitClient, reviewer: ArchitectureReviewer, config: dict
-):
+def mode_auto(args, client: AtomGitClient, reviewer: CodeReviewer, config: dict):
     """模式3: 自动审查（CI 使用，需要 LLM 配置）"""
     print("\n" + "=" * 60)
     print("🤖 模式: 自动审查（LLM驱动）")
     print("=" * 60)
 
-    # 检查 LLM 配置
     if not config.get("anthropic", {}).get("apiKey"):
         print("\n❌ 自动模式需要配置 Anthropic API Key")
         print("   请在 config.json 中添加:")
@@ -212,20 +218,18 @@ def mode_auto(
         print("     }")
         print("   }")
         print("\n或者使用手动模式（AI Agent 调用）:")
-        print(f"   python3 atomgit_reviewer.py --pr {args.pr} --extract-info")
+        print(f"   python3 pr_review.py --pr {args.pr} --extract-info")
         return
 
-    # 创建 LLM 审查器
-    llm_reviewer = LLMArchitectureReviewer(
+    pr_info = client.get_pull_request(args.pr)
+    head_sha = pr_info.get("head", {}).get("sha", "HEAD")
+
+    llm_reviewer = LLMCodeReviewer(
         api_key=config["anthropic"]["apiKey"],
         base_url=config["anthropic"].get("baseUrl", ""),
         llm_provider=args.llm_provider,
         llm_model=args.llm_model,
     )
-
-    # 获取 PR 信息以获取 head_sha
-    pr_info = client.get_pull_request(args.pr)
-    head_sha = pr_info.get("head", {}).get("sha", "HEAD")
 
     print(f"\n📝 获取 PR 文件变更...")
     files = client.get_pr_files(args.pr)
@@ -235,34 +239,26 @@ def mode_auto(
     for i, file_info in enumerate(files, 1):
         file_path = file_info["filename"]
 
-        # 只审查 Python 文件
         if not file_path.endswith(".py"):
             continue
 
-        # 跳过测试文件
         if "test" in file_path.lower():
-            continue
-
-        # 跳过 __init__.py
-        if file_path.endswith("__init__.py"):
             continue
 
         print(f"\n[{i}/{len(files)}] 审查 {file_path}")
 
         try:
-            # 获取文件内容（使用 head_sha）
             content = client.get_file_content(file_path, head_sha)
             diff = file_info.get("patch", "")
 
-            # 调用 LLM 审查
-            print("  ⏳ 调用 LLM 进行架构审查...")
+            print("  ⏳ 调用 LLM 进行审查...")
             issues = llm_reviewer.review_file(file_path, content, diff)
 
             if issues:
-                print(f"  ✓ 发现 {len(issues)} 个架构问题")
+                print(f"  ✓ 发现 {len(issues)} 个问题")
                 all_issues.extend(issues)
             else:
-                print(f"  ✓ 未发现架构问题")
+                print(f"  ✓ 未发现问题")
 
         except Exception as e:
             print(f"  ✗ 审查失败: {e}")
@@ -271,31 +267,31 @@ def mode_auto(
         print(f"\n" + "=" * 60)
         print("⚠️  Dry run 模式，未提交评论")
         print("=" * 60)
-        print(f"\n发现 {len(all_issues)} 个架构问题：")
+        print(f"\n发现 {len(all_issues)} 个问题：")
         for issue in all_issues:
             print(f"  - {issue.file}:{issue.line} [{issue.severity}] {issue.title}")
         return
 
-    # 提交审查结果
     if all_issues:
-        print(f"\n📦 提交 {len(all_issues)} 个架构审查结果...")
-        reviewer.submit_review(args.pr, all_issues)
+        print(f"\n📦 提交 {len(all_issues)} 个审查结果...")
+        result = reviewer.submit_issues(args.pr, all_issues)
 
         print(f"\n" + "=" * 60)
         print("✅ 审查完成")
         print("=" * 60)
         print(f"\n📊 统计:")
         print(
-            f"   审查文件: {len([f for f in files if f['filename'].endswith('.py') and 'test' not in f['filename'].lower()])} 个"
+            f"   审查文件: {len([f for f in files if f['filename'].endswith('.py')])} 个"
         )
-        print(f"   发现问题: {len(all_issues)} 个")
+        print(f"   发现问题: {result['total_issues']} 个")
+        print(f"   提交评论: {result['submitted_comments']} 条")
     else:
-        # 提交通过评论
-        print(f"\n📦 提交架构审查通过评论...")
-        reviewer.submit_review(args.pr, [])
+        pr = client.get_pull_request(args.pr)
+        summary = reviewer.formatter.format_summary([], args.pr, pr.get("title", ""))
+        client.submit_pr_comment(args.pr, summary)
 
         print(f"\n" + "=" * 60)
-        print("✅ 审查完成 - 未发现架构问题")
+        print("✅ 审查完成 - 未发现问题")
         print("=" * 60)
 
     print(f"\n🔗 PR 链接: {client.get_pr_url(args.pr)}\n")
@@ -303,14 +299,12 @@ def mode_auto(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AtomGit 架构审查",
+        description="AtomGit 代码审查",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    # 必需参数
     parser.add_argument("--pr", type=int, required=True, help="PR 编号")
 
-    # 模式选择（互斥）
     mode_group = parser.add_mutually_exclusive_group(required=False)
     mode_group.add_argument(
         "--extract-info",
@@ -327,13 +321,13 @@ def main():
         "--auto", action="store_true", help="模式3: 自动审查（CI 使用，需要 LLM 配置）"
     )
 
-    # 通用参数
     parser.add_argument(
         "--config", type=str, default="config.json", help="配置文件路径"
     )
     parser.add_argument(
         "--output-dir", type=str, default="./tmp", help="输出目录 (默认: ./tmp)"
     )
+    parser.add_argument("--threshold", type=int, default=80, help="置信度阈值")
     parser.add_argument(
         "--ai-model",
         type=str,
@@ -342,7 +336,6 @@ def main():
     )
     parser.add_argument("--dry-run", action="store_true", help="仅显示计划，不提交")
 
-    # 自动模式专用参数（LLM 配置）
     parser.add_argument(
         "--llm-provider",
         type=str,
@@ -358,7 +351,6 @@ def main():
 
     args = parser.parse_args()
 
-    # 警告：如果使用默认的 ai-model，提醒指定真实模型名称
     if args.ai_model == "ai":
         print("\n⚠️  警告: 未指定 --ai-model 参数，将使用默认值 'ai'")
         print("   建议指定真实模型名称，例如：")
@@ -368,10 +360,9 @@ def main():
         print()
 
     print("\n" + "=" * 60)
-    print("🔍 AtomGit 架构审查工具")
+    print("🔍 AtomGit 代码审查工具")
     print("=" * 60)
 
-    # 加载配置
     try:
         with open(args.config, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -382,16 +373,17 @@ def main():
         print(f"\n❌ 加载配置失败: {e}")
         sys.exit(1)
 
-    # 创建 API 实例
-    api = AtomGitClient(AtomGitConfig.from_json(args.config))
-    formatter = CommentFormatter(ai_model=args.ai_model)
-    reviewer = ArchitectureReviewer(api, formatter)
+    sdk_config = AtomGitConfig.from_json(args.config)
+    client = AtomGitClient(sdk_config)
+    formatter = CommentFormatter(
+        confidence_threshold=args.threshold, ai_model=args.ai_model
+    )
+    reviewer = CodeReviewer(client, formatter)
 
     print(f"\n📋 PR: #{args.pr}")
-    print(f"🏠 仓库: {api.config.owner}/{api.config.repo}")
+    print(f"🏠 仓库: {client.config.owner}/{client.config.repo}")
     print(f"🤖 AI模型: {args.ai_model}")
 
-    # 检查模式
     if args.auto:
         print(f"🧠 LLM模型: {args.llm_model} (provider: {args.llm_provider})")
         print("📦 模式: 自动（CI 模式，Skill 内部调用 LLM）")
@@ -400,20 +392,18 @@ def main():
     elif args.submit_review:
         print("📤 模式: 提交审查（AI Agent 模式）")
     else:
-        # 默认：提取信息模式（AI Agent 友好）
         args.extract_info = True
         print("📥 模式: 提取信息（默认，AI Agent 模式）")
 
     if args.dry_run:
         print("⚠️  Dry Run 模式（仅显示计划）")
 
-    # 根据模式执行
     if args.extract_info:
         mode_extract_info(args, reviewer)
     elif args.submit_review:
         mode_submit_review(args, reviewer)
     elif args.auto:
-        mode_auto(args, api, reviewer, config)
+        mode_auto(args, client, reviewer, config)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AtomGit Issue Submission Tool
+AtomGit Issue Management Tool
 """
 
 import argparse
@@ -22,7 +22,9 @@ except ImportError:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Submit or update AtomGit issues")
+    parser = argparse.ArgumentParser(
+        description="Manage AtomGit issues across create, fetch, update, and close flows"
+    )
     parser.add_argument("--title", help="Issue title")
     parser.add_argument("--body", help="Issue body")
     parser.add_argument("--labels", help="Comma-separated labels")

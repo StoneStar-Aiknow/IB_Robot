@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AtomGit PR Review Comment Repair Script
+AtomGit Review Resolution Workflow
 支持三种模式：
 1. --fetch-comments: 获取检视意见（输出JSON）
 2. --apply-fixes: 应用修复方案（从JSON读取）
@@ -211,7 +211,7 @@ def mode_fetch_comments(args, api: RepairService):
     print("  3. ⚠️ 将修复方案以用户可读的格式展示给用户确认")
     print("  4. 用户确认后，运行提交命令")
     print(
-        f"\n     python3 repair_pr.py --pr {args.pr} --apply-fixes fixes.json --ai-model <your-model-name>"
+        f"\n     python3 review_resolution.py --pr {args.pr} --apply-fixes fixes.json --ai-model <your-model-name>"
     )
 
 
@@ -340,7 +340,7 @@ def mode_auto(args, api: RepairService, config: dict):
         print("     }")
         print("   }")
         print("\n或者使用手动模式:")
-        print(f"   python3 repair_pr.py --pr {args.pr} --fetch-comments")
+        print(f"   python3 review_resolution.py --pr {args.pr} --fetch-comments")
         return
 
     # 设置 API Key
@@ -461,7 +461,7 @@ def mode_auto(args, api: RepairService, config: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="AtomGit PR 检视意见修复工具",
+        description="AtomGit 评审意见处理工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -533,7 +533,7 @@ def main():
         print("ℹ️  未指定模式，使用默认的提取信息模式（AI Agent 使用）")
 
     print("\n" + "=" * 60)
-    print("🔧 AtomGit PR 检视意见修复工具")
+    print("🔧 AtomGit 评审意见处理工具")
     print("=" * 60)
 
     # 加载配置
@@ -548,7 +548,7 @@ def main():
 
     # 创建 API 实例
     api = AtomGitClient(AtomGitConfig.from_json(args.config))
-repair_service = RepairService(client)
+    repair_service = RepairService(api)
 
     print(f"\n📋 PR: #{args.pr}")
     print(f"🏠 仓库: {api.config.owner}/{api.config.repo}")

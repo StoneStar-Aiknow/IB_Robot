@@ -111,7 +111,7 @@ for i, test in enumerate(test_cases, 1):
 
 print(f"\n  Results: {passed}/{len(test_cases)} passed")
 
-# 测试 3: 真实的 Diff 场景（从 atomgit-code-review 提取）
+# 测试 3: 真实的 Diff 场景（从 atomgit-pr-review 提取）
 print("\n[TEST 3] Real-world Diff Scenario")
 print("-" * 80)
 

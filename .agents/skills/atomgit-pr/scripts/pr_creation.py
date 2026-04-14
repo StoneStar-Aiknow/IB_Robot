@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-AtomGit Pull Request Creator
+AtomGit Pull Request Creation Tool
 
 自动创建 PR，从当前分支生成 PR 标题和描述
 
 用法：
-    python3 create_pr.py --branch <branch> --fork-owner <owner> [--title "标题"] [--dry-run]
+    python3 pr_creation.py --branch <branch> --fork-owner <owner> [--title "标题"] [--dry-run]
 """
 
 import os

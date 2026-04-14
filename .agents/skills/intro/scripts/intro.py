@@ -157,7 +157,7 @@ def generate_recommendations(
     if prs.get("prs_with_comments"):
         for pr_info in prs["prs_with_comments"][:1]:
             recommendations.append({
-                "skill": "atomgit-code-review-repair",
+                "skill": "atomgit-review-resolution",
                 "reason": f"PR #{pr_info['number']}「{pr_info['title']}」有 {pr_info['comment_count']} 条评论待处理",
                 "priority": "🟡 中",
                 "trigger": f"修复 #{pr_info['number']} 号 PR 的评审意见",
@@ -175,7 +175,7 @@ def generate_recommendations(
     # 优先级 4: 有未推送的 commit
     if branch.get("unpushed_commits", 0) > 0:
         recommendations.append({
-            "skill": "atomgit-submit-pr",
+            "skill": "atomgit-pr",
             "reason": f"当前分支 `{branch['branch']}` 有 {branch['unpushed_commits']} 个未推送的 commit",
             "priority": "🟢 低",
             "trigger": "帮我提交一个 PR",

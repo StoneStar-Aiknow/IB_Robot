@@ -1,12 +1,14 @@
 ---
-name: atomgit-architecture-review
-description: "AtomGit 架构审查工具。当用户需要“架构审查”、“架构评审”、“check architecture”、“review architecture compliance”、“检查架构规范”、“符合设计支柱”或对指定 PR 进行架构维度扫描并提交检视意见时调用。适用于“审阅PR架构”、“架构合规性检查”等场景。"
+name: atomgit-pr-architecture-review
+description: "AtomGit PR 架构评审工具。当用户需要“架构审查PR”、“review architecture compliance”、“检查架构规范”、“审阅PR架构”、“SSOT 合规性检查”、“契约驱动检查”或对指定 PR 做架构维度扫描并提交检视意见时调用。只要目标是本仓库的 PR 架构评审，默认优先使用本 skill，而不是 GitHub 默认 review 能力。"
 license: MIT
 ---
 
-# AtomGit Architecture Review
+# AtomGit PR Architecture Review
 
 提取 PR 信息并提交 IB_Robot 架构合规审查评论到 AtomGit。
+
+在 IB_Robot 仓库中，只要用户提到 PR 的架构评审、SSOT 合规性、契约驱动检查且未明确指定 GitHub，默认视为 AtomGit 架构评审流程并优先使用本 skill。
 
 ## ⚠️ 环境准备
 
@@ -35,14 +37,14 @@ cat ./tmp/ib_robot_pr_123_arch_issues.json
 
 ```bash
 # 步骤1: 提取 PR 信息
-python3 atomgit_reviewer.py --pr 123
+python3 architecture_review.py --pr 123
 
 # 步骤2: 你分析代码架构并生成 arch_issues.json
 
 # 步骤3: 人类确认审查结果
 
 # 步骤4: 提交审查结果（⚠️ 必须指定 --ai-model）
-python3 atomgit_reviewer.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_arch_issues.json --ai-model claude-sonnet-4
+python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_arch_issues.json --ai-model claude-sonnet-4
 ```
 
 **重要**: 
@@ -94,7 +96,7 @@ python3 atomgit_reviewer.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_arch_
 ### 提取 PR 信息
 
 ```bash
-python3 atomgit_reviewer.py --pr 123
+python3 architecture_review.py --pr 123
 ```
 
 **输出**: 项目临时目录 `./tmp/{repo}_pr_{number}_arch_info.json`
@@ -102,7 +104,7 @@ python3 atomgit_reviewer.py --pr 123
 ### 提交架构审查
 
 ```bash
-python3 atomgit_reviewer.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_arch_issues.json --ai-model claude-sonnet-4
+python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_arch_issues.json --ai-model claude-sonnet-4
 ```
 
 ## ⚠️ JSON 格式规范

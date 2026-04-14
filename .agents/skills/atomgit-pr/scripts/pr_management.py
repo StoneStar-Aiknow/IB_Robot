@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AtomGit PR 数据维护工具 (Agent 驱动版)
+AtomGit PR Management Tool (Agent 驱动版)
 
 专门为 AI Agent 设计，提供两个核心能力：
 1. --fetch-info: 为 Agent 提取 PR 的完整上下文 (提交、文件、Diff)

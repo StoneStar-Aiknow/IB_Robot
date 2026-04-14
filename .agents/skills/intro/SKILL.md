@@ -26,16 +26,17 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 
 | Skill | 一句话描述 |
 | :--- | :--- |
-| **atomgit-code-review** | 对 PR 进行代码质量审查，发现 Bug 与逻辑问题 |
-| **atomgit-architecture-review** | 检查 PR 是否符合 SSOT、契约驱动等架构规范 |
-| **atomgit-code-review-repair** | 根据 AtomGit 上的检视意见自动修复代码 |
+| **atomgit-collaboration** | 拦截泛化的 AtomGit 协作请求，并分流到 PR / Issue / review / comment 对应流程 |
+| **atomgit-pr-review** | 对 PR 进行代码质量审查，发现 Bug 与逻辑问题 |
+| **atomgit-pr-architecture-review** | 检查 PR 是否符合 SSOT、契约驱动等架构规范 |
+| **atomgit-review-resolution** | 根据 AtomGit 上的检视意见修复代码、回复评论并闭环 |
 
 ### 📝 项目管理
 
 | Skill | 一句话描述 |
 | :--- | :--- |
-| **atomgit-submit-pr** | 创建或更新合并请求（PR），自动生成描述 |
-| **atomgit-submit-issue** | 创建或管理 Issue，报告 Bug、提出建议 |
+| **atomgit-pr** | 创建、读取或更新合并请求（PR），自动生成/同步描述 |
+| **atomgit-issue** | 创建、读取或管理 Issue，报告 Bug、提出建议 |
 
 ### 🚀 工作流
 
@@ -50,15 +51,16 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 只需用自然语言告诉 Agent 你想做什么：
 
 ```
-帮我审查 #25 号 PR              → atomgit-code-review
-帮我更新 PR 描述                → atomgit-submit-pr
-帮我提交一个 Issue              → atomgit-submit-issue
-修复 PR 里的评审意见            → atomgit-code-review-repair
+帮我审查 #25 号 PR              → atomgit-pr-review
+帮我看看 PR #25                 → atomgit-collaboration
+帮我更新 PR 描述                → atomgit-pr
+帮我提交一个 Issue              → atomgit-issue
+修复 PR 里的评审意见            → atomgit-review-resolution
 编译一下项目                    → ibrobot-build
 启动机器人仿真                  → ibrobot-launch
 初始化环境                      → ibrobot-env
 提交代码                        → ibrobot-git-flow
-检查架构合规性                  → atomgit-architecture-review
+检查架构合规性                  → atomgit-pr-architecture-review
 解释系统架构                    → ibrobot-architecture
 有哪些功能 / help / 入门       → intro (本技能)
 ```
@@ -77,12 +79,18 @@ source .shrc_local && python3 .agents/skills/intro/scripts/intro.py
 
 | 检测条件 | 推荐 Skill |
 | :--- | :--- |
-| 有未提交的代码改动 (`git status`) | `ibrobot-git-flow` 或 `atomgit-submit-pr` |
+| 有未提交的代码改动 (`git status`) | `ibrobot-git-flow` 或 `atomgit-pr` |
 | 编译产物缺失（`install/` 目录为空或不存在） | `ibrobot-build` |
-| 存在 open 状态的 PR 且有未回复评论 | `atomgit-code-review-repair` |
+| 存在 open 状态的 PR 且有未回复评论 | `atomgit-review-resolution` |
 | 无特殊状态 | 展示「今日推荐」skill |
 
 Agent 应将脚本输出的推荐内容展示给用户，帮助用户快速进入正确的工作流。
+
+## 🌐 AtomGit 路由优先级
+
+当用户在 IB_Robot 仓库里提到 PR / merge request / Issue / review / comments，且没有明确说 GitHub / github.com 时，Agent 应默认优先选择 AtomGit 相关 skill，而不是 GitHub 默认能力。
+
+如果用户的表达仍然比较泛，例如“帮我看看这个 PR / Issue / 评论”，优先先进入 `atomgit-collaboration`，再分流到具体 skill。
 
 ---
 
