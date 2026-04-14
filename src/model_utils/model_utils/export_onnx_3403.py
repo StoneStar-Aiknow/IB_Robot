@@ -18,9 +18,8 @@ logger(f"lerobot path: {lerobot.__file__}")
 def export_act(args):
     from lerobot.policies.act.modeling_act import ACTPolicy
 
-    model_folder = args.policy_path
-    model_path = os.path.join(model_folder, "pretrained_model")
-    onnx_path = os.path.join(model_folder, "act_ros2.onnx")
+    model_path = args.policy_path
+    onnx_path = os.path.join(model_path, "act_ros2.onnx")
 
     policy = ACTPolicy.from_pretrained(model_path)
 
@@ -55,7 +54,7 @@ def export_act(args):
     model_simp, check = simplify(onnx_model)
     if not check:
         raise ValueError("Simplified ONNX model could not be validated")
-    onnx.save(model_simp, model_folder + "act_ros2_simplified.onnx")
+    onnx.save(model_simp, os.path.join(model_path, "act_ros2_simplified.onnx"))
     print("finished exporting onnx")
 
 

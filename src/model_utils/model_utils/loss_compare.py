@@ -49,16 +49,17 @@ class LossUtils:
         print(f"avg loss: {avg_loss}")
 
     def prepare_policy(self):
+        cli_overrides = [f"--device={self.args.device}"]
         if self.args.policy_type == "act":
             from lerobot.policies.act.modeling_act import ACTPolicy
 
             policy_path = self.args.policy_path
-            policy = ACTPolicy.from_pretrained(policy_path)
+            policy = ACTPolicy.from_pretrained(policy_path, cli_overrides=cli_overrides)
         elif self.args.policy_type == "pi05":
             from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
             policy_path = self.args.policy_path
-            policy = PI05Policy.from_pretrained(policy_path)
+            policy = PI05Policy.from_pretrained(policy_path, cli_overrides=cli_overrides)
         else:
             raise NotImplementedError(f"Policy type {self.args.policy_type} not implemented")
 
@@ -87,7 +88,7 @@ class LossUtils:
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=self.policy, pretrained_path=self.args.policy_path
         )
-        device = get_safe_torch_device(self.policy.config.device)
+        device = get_safe_torch_device(self.args.device)
         outputs = []
         for i in tqdm(range(len(batches)), desc="forwarding"):
             # Fix random seed per batch so that diffusion/flow-matching noise is

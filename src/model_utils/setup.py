@@ -19,8 +19,6 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'export_onnx_node = model_utils.export_onnx_node:main',
-            'loss_compare_node = model_utils.loss_compare_node:main',
         ],
     },
 )
