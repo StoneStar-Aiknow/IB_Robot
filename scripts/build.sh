@@ -135,7 +135,7 @@ setup_venv() {
         "/home/ros/colcon_venv/venv"
         "${VIRTUAL_ENV:-}"
     )
-    
+
     for venv in "${venv_paths[@]}"; do
         if [[ -n "${venv}" && -f "${venv}/bin/activate" ]]; then
             source "${venv}/bin/activate"
@@ -146,43 +146,24 @@ setup_venv() {
     return 1
 }
 
-ensure_python_deps() {
-    [[ -z "${VIRTUAL_ENV:-}" ]] && return 0
-    
-    local deps=("serial:pyserial" "feetech_servo_sdk:feetech-servo-sdk" "sherpa_onnx:sherpa-onnx" "soundfile:soundfile" "sounddevice:sounddevice")
-    for dep in "${deps[@]}"; do
-        local module="${dep%%:*}"
-        local package="${dep##*:}"
-        if ! python3 -c "import ${module}" 2>/dev/null; then
-            echo "Installing ${package} in venv..."
-            python3 -m pip install --quiet "${package}"
-        fi
-    done
-}
-
-setup_venv || true
-ensure_python_deps
-
-# ============================================================================
-# Install lerobot from libs/
-# ============================================================================
-if [[ -d "${WORKSPACE}/libs/lerobot" ]]; then
-    # Force use of venv pip to prevent pollution of ROS 2 install directory
-    PIP_BIN="${WORKSPACE}/venv/bin/pip"
-    if [[ ! -f "${PIP_BIN}" ]]; then
-        log_error "Virtual environment not found at ${WORKSPACE}/venv. Please run setup.sh first."
+require_setup_environment() {
+    if ! setup_venv; then
+        log_error "Virtual environment not found. Please run ./scripts/setup.sh first."
         exit 1
     fi
 
-    log_info "Installing lerobot into venv (editable mode)..."
-    # Use -e to handle src-layout correctly and point to source instead of copying
-    "${PIP_BIN}" install -e "${WORKSPACE}/libs/lerobot" --quiet
+    if ! python3 -c "import lerobot" 2>/dev/null; then
+        log_warning "lerobot is not importable in the current venv."
+        log_warning "Run ./scripts/setup.sh to install or repair the Python environment before building."
+    fi
 
-    # Critical Fix: Force-reinstall compatible versions WITHIN venv
-    # This ensures NumPy 1.x for ROS 2 Humble compatibility and avoids NumPy 2.x/OpenCV 4.12 issues
-    log_info "Re-aligning dependencies for ROS 2 compatibility..."
-    "${PIP_BIN}" install "numpy<2" "opencv-python-headless<4.12" --quiet
-fi
+    if ! python3 -c "import numpy; assert numpy.__version__.startswith('1.26.')" 2>/dev/null; then
+        log_warning "NumPy is not pinned to the expected ROS-compatible 1.26.x series."
+        log_warning "Run ./scripts/setup.sh to repair the Python environment before building."
+    fi
+}
+
+require_setup_environment
 
 
 # ============================================================================

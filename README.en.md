@@ -102,19 +102,22 @@ IB_Robot/                           # Main Workspace
 
 ### 0. System Requirements
 
-- **OS**: openEuler Embedded 24.03
+- **OS**: Ubuntu or openEuler Embedded
 - **ROS Version**: ROS 2 Humble
 - **Python**: System native Python 3.11. **Do NOT run in an active Conda environment to avoid library version conflicts (e.g., libstdc++).**
+- **Accelerator**: Supports NVIDIA GPU, Ascend 310B, Ascend 310P, or CPU-only fallback.
 
 ### 1. One-click Initialization
 
 Run `./scripts/setup.sh`. This script automates heavy operations:
 
 1. **Submodule Sync**: Runs `git submodule update --init --recursive` to download core source code.
-2. **System Dependencies**: Installs C++ build tools, `nlohmann-json`, and other hardware driver dependencies via the system package manager.
-3. **Virtual Environment (venv)**: Creates a `venv` directory in the root to isolate ML dependencies (like PyTorch) from the system ROS 2 environment.
-4. **ML Stack Installation**: Automatically installs `torch`, `lerobot`, and specific `numpy (< 2.0)` versions compatible with ROS 2 Humble.
-5. **Environment Script**: Generates or updates `.shrc_local` for one-click environment loading.
+2. **Platform and Accelerator Detection**: Detects Ubuntu / openEuler Embedded and NVIDIA GPU / Ascend 310B / 310P / CPU-only environments.
+3. **ROS 2 Installation**: Detects and installs ROS 2 Humble and colcon tooling when missing.
+4. **System Dependencies**: Installs C++ build tools, `nlohmann-json`, and other hardware driver dependencies via the system package manager.
+5. **Virtual Environment (venv)**: Creates a `venv` directory in the root to isolate ML dependencies while reusing system `rclpy` through `--system-site-packages`.
+6. **ML Stack Installation**: Installs `lerobot`, hardware dependencies, and the ROS-compatible NumPy 1.26.x series.
+7. **Environment Verification**: Verifies `rosdepc`, `colcon`, `rclpy`, `lerobot`, and NumPy compatibility.
 
 ### 2. Developer Fork Setup (Optional)
 
@@ -126,10 +129,17 @@ The script will ask if you want to set up personal forks. If you are a core deve
 
 ### 1. Load Environment
 
-Every time you open a new terminal, you must load the project environment variables:
+The current `setup.sh` does **not** generate `.shrc_local`. Load the environment manually in each new terminal:
 
 ```bash
-source .shrc_local
+source venv/bin/activate
+source /opt/ros/humble/setup.sh
+```
+
+After the first build, also load the workspace overlay:
+
+```bash
+source install/setup.sh
 ```
 
 ### 2. Assign Domain ID
@@ -147,6 +157,8 @@ Run the unified build script after any code changes:
 ```bash
 ./scripts/build.sh
 ```
+
+*Note: `build.sh` now focuses on environment loading and workspace builds only. Python environment repair, editable `lerobot` installation, and NumPy compatibility are handled centrally by `setup.sh`.*
 
 *Note: This script handles editable installation of lerobot and cleans up build pollution.*
 

@@ -3,17 +3,19 @@
 # Handles repository import, dependency installation, and environment setup
 #
 # Usage:
-#   ./scripts/setup.sh               # Interactive mode (prompts for each step)
-#   ./scripts/setup.sh --yes         # Auto-yes mode (skips all prompts with defaults)
-#   ./scripts/setup.sh -y            # Same as --yes
-#   ./scripts/setup.sh --git-http    # Use HTTP instead of SSH for git remotes
-#   ./scripts/setup.sh -y --git-http # Combine options
+#   ./scripts/setup.sh                              # Interactive mode
+#   ./scripts/setup.sh --yes                        # Auto-yes mode
+#   ./scripts/setup.sh --skip-submodules            # Keep existing submodule state
+#   ./scripts/setup.sh --skip-system-deps           # Skip ROS/system dependency installation
+#   ./scripts/setup.sh --skip-python                # Skip venv/Python dependency setup
+#   ./scripts/setup.sh --skip-verify                # Skip final verification
+#   ./scripts/setup.sh --help                       # Show help
 #
 # Auto-yes defaults:
 #   - Submodule init:  initialize all submodules (option 1)
 #   - Fork setup:      skipped
 #   - Other prompts:   confirmed automatically
-set -e
+set -euo pipefail
 
 # ============================================================================
 # Configuration
@@ -21,9 +23,16 @@ set -e
 WORKSPACE="${WORKSPACE:-$(pwd)}"
 PARALLEL_WORKERS=$(($(nproc) / 2))
 AUTO_YES=false
-GIT_HTTP=false
 USE_SUDO=true
+VERBOSE=false
+DRY_RUN=false
+SKIP_SUBMODULES=false
+SKIP_SYSTEM_DEPS=false
+SKIP_PYTHON=false
+SKIP_VERIFY=false
 SUMMARY=()
+DETECTED_OS="unknown"
+DETECTED_ACCELERATOR="cpu-only"
 
 # Detect if running as root
 if [[ $EUID -eq 0 ]]; then
@@ -33,9 +42,9 @@ fi
 # Helper to run commands with or without sudo
 run_sudo() {
     if [[ "${USE_SUDO}" == true ]]; then
-        sudo "$@"
+        run_cmd sudo "$@"
     else
-        "$@"
+        run_cmd "$@"
     fi
 }
 
@@ -48,8 +57,24 @@ NC='\033[0m' # No Color
 log_info()    { echo -e "${GREEN}[INFO]${NC} $*"; }
 log_warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
+log_debug()   { [[ "${VERBOSE}" == true ]] && echo -e "[DEBUG] $*"; }
 log_done()    { SUMMARY+=("${GREEN}✓${NC} $*"); }
-log_skipped() { SUMMARY+=("${YELLOW}⊘${NC} $* (skipped by --yes)"); }
+log_skipped() { SUMMARY+=("${YELLOW}⊘${NC} $* (skipped)"); }
+
+print_cmd() {
+    printf '%q ' "$@"
+    printf '\n'
+}
+
+run_cmd() {
+    if [[ "${DRY_RUN}" == true ]]; then
+        echo -n "[DRY-RUN] "
+        print_cmd "$@"
+        return 0
+    fi
+    [[ "${VERBOSE}" == true ]] && { echo -n "[CMD] "; print_cmd "$@"; }
+    "$@"
+}
 
 is_openeuler() {
     uname -r | grep -qi "openeuler" || grep -qi "openeuler" /etc/os-release 2>/dev/null
@@ -72,11 +97,67 @@ ask_yn() {
     [[ "${REPLY}" == "y" || "${REPLY}" == "Y" ]]
 }
 
+show_help() {
+    cat <<'EOF'
+Workspace setup script for ROS 2 Humble
+
+Usage:
+  ./scripts/setup.sh [OPTIONS]
+
+Options:
+  -y, --yes              Auto-confirm prompts using default actions
+      --sudo             Force sudo for privileged operations
+      --no-sudo          Never use sudo
+      --verbose          Show extra detection and execution details
+      --dry-run          Print mutating commands without executing them
+      --skip-submodules  Skip submodule initialization/update
+      --skip-system-deps Skip ROS/system dependency installation
+      --skip-python      Skip venv and Python dependency setup
+      --skip-verify      Skip final verification stage
+  -h, --help             Show this help
+
+Supported platforms:
+  - Ubuntu with ROS 2 Humble
+  - openEuler Embedded with ROS 2 Humble
+
+Supported accelerator profiles:
+  - NVIDIA GPU
+  - Ascend 310B / 310P
+  - CPU-only fallback
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes|-y) AUTO_YES=true ;;
+            --no-sudo) USE_SUDO=false ;;
+            --sudo) USE_SUDO=true ;;
+            --verbose) VERBOSE=true ;;
+            --dry-run) DRY_RUN=true ;;
+            --skip-submodules) SKIP_SUBMODULES=true ;;
+            --skip-system-deps) SKIP_SYSTEM_DEPS=true ;;
+            --skip-python) SKIP_PYTHON=true ;;
+            --skip-verify) SKIP_VERIFY=true ;;
+            --help|-h)
+                show_help
+                exit 0
+                ;;
+            *)
+                log_error "Unknown argument: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+        shift
+    done
+}
+
 # ============================================================================
 # Environment Checks
 # ============================================================================
 check_conda() {
-    if [[ -n "${CONDA_PREFIX}" ]]; then
+    if [[ -n "${CONDA_PREFIX:-}" ]]; then
         log_error "Active Conda environment detected at: ${CONDA_PREFIX}"
         log_warn "Conda environments are known to conflict with ROS 2 dependencies (especially Python libraries)."
         log_warn "Please deactivate the Conda environment before running this script:"
@@ -85,24 +166,72 @@ check_conda() {
     fi
 }
 
+detect_os() {
+    local os_id="" os_name=""
+    if [[ -r /etc/os-release ]]; then
+        os_id="$(awk -F= '$1=="ID"{gsub(/"/,"",$2); print tolower($2)}' /etc/os-release)"
+        os_name="$(awk -F= '$1=="NAME"{gsub(/"/,"",$2); print tolower($2)}' /etc/os-release)"
+    fi
+
+    if [[ "${os_id}" == "ubuntu" ]]; then
+        DETECTED_OS="ubuntu"
+    elif [[ "${os_id}" == "openeuler" ]] || [[ "${os_name}" == *"openeuler"* ]] || uname -r | grep -qi "openeuler"; then
+        DETECTED_OS="openeuler-embedded"
+    else
+        log_error "Unsupported OS detected. This setup script supports Ubuntu and openEuler Embedded."
+        exit 1
+    fi
+}
+
+detect_accelerator() {
+    DETECTED_ACCELERATOR="cpu-only"
+
+    if command -v nvidia-smi &>/dev/null; then
+        DETECTED_ACCELERATOR="nvidia-gpu"
+        return
+    fi
+
+    if command -v npu-smi &>/dev/null; then
+        local npu_info=""
+        npu_info="$(npu-smi info 2>/dev/null || true)"
+        if echo "${npu_info}" | grep -qi "310b"; then
+            DETECTED_ACCELERATOR="ascend-310b"
+            return
+        fi
+        if echo "${npu_info}" | grep -qi "310p"; then
+            DETECTED_ACCELERATOR="ascend-310p"
+            return
+        fi
+        DETECTED_ACCELERATOR="ascend-unknown"
+        return
+    fi
+
+    if [[ -d /usr/local/Ascend ]]; then
+        DETECTED_ACCELERATOR="ascend-unknown"
+    fi
+}
+
+print_environment_summary() {
+    echo ""
+    echo -e "${YELLOW}--- Environment Detection ---${NC}"
+    log_info "Detected OS: ${DETECTED_OS}"
+    log_info "Detected accelerator: ${DETECTED_ACCELERATOR}"
+
+    if [[ "${DETECTED_ACCELERATOR}" == "ascend-unknown" ]]; then
+        log_warn "Ascend runtime detected, but the device model could not be identified as 310B or 310P."
+    fi
+}
+
 # ============================================================================
 # Repository Management
 # ============================================================================
-apply_git_http_config() {
-    if [[ "${GIT_HTTP}" == true ]]; then
-        log_info "Configuring git to use HTTPS instead of SSH globally for this session..."
-        # Use git config insteadOf for all major domains
-        # We use 'git config' without --global to keep it local to this repo
-        git config url."https://gitcode.com/".insteadOf "git@gitcode.com:" || true
-        git config url."https://github.com/".insteadOf "git@github.com:" || true
-        git config url."https://atomgit.com/".insteadOf "git@atomgit.com:" || true
-
-        # Sync submodule URLs to apply the insteadOf mapping to .git/config
-        log_info "Syncing submodule URLs..."
-        git submodule sync --recursive
-    fi
-}
 update_submodules() {
+    if [[ "${SKIP_SUBMODULES}" == true ]]; then
+        log_info "Skipping submodule initialization/update (--skip-submodules)."
+        log_skipped "Submodule sync/update"
+        return 0
+    fi
+
     echo ""
     echo -e "${YELLOW}--- Git Submodule Management ---${NC}"
 
@@ -138,7 +267,7 @@ update_submodules() {
         fi
         log_info "Updating all submodules..."
         export GIT_LFS_SKIP_SMUDGE=1
-        git submodule update --init --recursive
+        run_cmd git submodule update --init --recursive
         log_done "Submodules synced/updated"
         return 0
     fi
@@ -171,19 +300,19 @@ update_submodules() {
         1)
             log_info "Initializing all submodules..."
             export GIT_LFS_SKIP_SMUDGE=1
-            git submodule update --init --recursive
+            run_cmd git submodule update --init --recursive
             log_done "Submodules initialized: all"
             ;;
         2)
             log_info "Initializing LeRobot (libs/lerobot)..."
             export GIT_LFS_SKIP_SMUDGE=1
-            git submodule update --init --recursive libs/lerobot
+            run_cmd git submodule update --init --recursive libs/lerobot
             log_done "Submodules initialized: LeRobot"
             ;;
         3)
             log_info "Initializing PyMoveIt2 (src/pymoveit2)..."
             export GIT_LFS_SKIP_SMUDGE=1
-            git submodule update --init --recursive src/pymoveit2
+            run_cmd git submodule update --init --recursive src/pymoveit2
             log_done "Submodules initialized: PyMoveIt2"
             ;;
         4)
@@ -194,7 +323,7 @@ update_submodules() {
                 if ask_yn "Initialize ${name} (${path})?" "y"; then
                     log_info "Initializing ${name}..."
                     export GIT_LFS_SKIP_SMUDGE=1
-                    git submodule update --init --recursive "${path}"
+                    run_cmd git submodule update --init --recursive "${path}"
                     log_done "Submodule initialized: ${name}"
                 else
                     log_warn "Skipped ${name}"
@@ -230,8 +359,6 @@ setup_developer_forks() {
     if [[ -n "${USERNAME}" ]]; then
         local MAIN_FORK LEROBOT_FORK UPSTREAM_URL
 
-        # We define as SSH format, which will be auto-translated to HTTPS 
-        # if GIT_HTTP is true due to 'insteadOf' config applied in main()
         MAIN_FORK="git@gitcode.com:${USERNAME}/IB_Robot.git"
         LEROBOT_FORK="git@gitcode.com:${USERNAME}/lerobot_ros2.git"
         UPSTREAM_URL="git@atomgit.com:openeuler/IB_Robot.git"
@@ -244,14 +371,22 @@ setup_developer_forks() {
             log_info "Configuring personal forks..."
             
             # 1. Update main repo remotes
-            git remote set-url origin "${MAIN_FORK}"
-            git remote add upstream "${UPSTREAM_URL}" 2>/dev/null || git remote set-url upstream "${UPSTREAM_URL}"
+            run_cmd git remote set-url origin "${MAIN_FORK}"
+            if git remote get-url upstream &>/dev/null; then
+                run_cmd git remote set-url upstream "${UPSTREAM_URL}"
+            else
+                run_cmd git remote add upstream "${UPSTREAM_URL}"
+            fi
 
             # 2. Update submodule fork
             if [[ -d "libs/lerobot/.git" ]]; then
-                (cd libs/lerobot && git remote set-url origin "${LEROBOT_FORK}")
+                (cd libs/lerobot && run_cmd git remote set-url origin "${LEROBOT_FORK}")
                 local LEROBOT_UPSTREAM=$(git config -f .gitmodules submodule.libs/lerobot.url)
-                (cd libs/lerobot && git remote add upstream "${LEROBOT_UPSTREAM}" 2>/dev/null || git remote set-url upstream "${LEROBOT_UPSTREAM}")
+                if (cd libs/lerobot && git remote get-url upstream &>/dev/null); then
+                    (cd libs/lerobot && run_cmd git remote set-url upstream "${LEROBOT_UPSTREAM}")
+                else
+                    (cd libs/lerobot && run_cmd git remote add upstream "${LEROBOT_UPSTREAM}")
+                fi
             fi
 
             log_info "Forks configured successfully!"
@@ -282,7 +417,7 @@ check_ros_installation() {
             install_args+=("--no-sudo")
         fi
 
-        if "${WORKSPACE}/scripts/install_ros.sh" "${install_args[@]}"; then
+        if run_cmd "${WORKSPACE}/scripts/install_ros.sh" "${install_args[@]}"; then
             log_done "ROS 2 Humble installed"
         else
             log_error "ROS 2 installation failed"
@@ -306,7 +441,7 @@ ensure_colcon() {
     elif command -v dnf &> /dev/null; then
         # On openEuler, we usually install colcon via pip to get the latest extensions
         if command -v pip3 &> /dev/null; then
-            pip3 install colcon-common-extensions --quiet
+            run_cmd pip3 install colcon-common-extensions --quiet
         else
             log_error "pip3 not found, cannot install colcon."
             exit 1
@@ -316,7 +451,7 @@ ensure_colcon() {
 }
 
 check_openeuler() {
-    if is_openeuler; then
+    if [[ "${DETECTED_OS}" == "openeuler-embedded" ]]; then
         log_warn "openEuler detected. Setting ROS_OS_OVERRIDE=rhel:8 for rosdep compatibility."
         export ROS_OS_OVERRIDE=rhel:8
 
@@ -326,7 +461,8 @@ check_openeuler() {
             log_info "Adding openEuler repo for ${arch}..."
             run_sudo dnf install -y dnf-plugins-core
             run_sudo dnf config-manager --add-repo "https://repo.openeuler.org/openEuler-24.03-LTS/OS/${arch}"
-            run_sudo dnf clean all && run_sudo dnf makecache
+            run_sudo dnf clean all
+            run_sudo dnf makecache
         else
             log_info "openEuler repo already configured, skipping add-repo."
         fi
@@ -345,9 +481,9 @@ ensure_rosdepc() {
     if ! command -v rosdepc &> /dev/null; then
         log_warn "rosdepc not found. Installing rosdepc (rosdep with Chinese mirror support)..."
         if command -v pip3 &> /dev/null; then
-            pip3 install rosdepc
+            run_cmd pip3 install rosdepc
         elif command -v pip &> /dev/null; then
-            pip install rosdepc
+            run_cmd pip install rosdepc
         else
             log_error "pip/pip3 not found. Cannot install rosdepc automatically."
             exit 1
@@ -365,6 +501,15 @@ ensure_rosdepc() {
     # Init if sources list doesn't exist yet
     if [[ ! -d /etc/ros/rosdep/sources.list.d ]]; then
         log_info "Initializing rosdepc..."
+
+        if [[ "${DRY_RUN}" == true ]]; then
+            local rosdepc_bin="rosdepc"
+            if command -v rosdepc &>/dev/null; then
+                rosdepc_bin="$(command -v rosdepc)"
+            fi
+            run_sudo -E env PATH="${PATH}" "${rosdepc_bin}" init
+            return 0
+        fi
         
         # Pre-authenticate sudo so password prompt is visible
         if [[ "${USE_SUDO}" == true ]]; then
@@ -458,6 +603,12 @@ ensure_rosdepc() {
 }
 
 install_system_deps() {
+    if [[ "${SKIP_SYSTEM_DEPS}" == true ]]; then
+        log_info "Skipping ROS/system dependency installation (--skip-system-deps)."
+        log_skipped "System ROS dependencies"
+        return 0
+    fi
+
     # Check for ROS 2 installation first
     check_ros_installation
     ensure_colcon
@@ -465,19 +616,23 @@ install_system_deps() {
     check_openeuler
     ensure_rosdepc
 
-    if command -v apt-get &> /dev/null; then
+    if [[ "${DETECTED_OS}" == "ubuntu" ]]; then
+        if ! command -v apt-get &> /dev/null; then
+            log_error "apt-get not found on Ubuntu system."
+            exit 1
+        fi
         log_info "Updating apt package lists..."
         run_sudo apt-get update -qq
 
         log_info "Updating rosdepc database..."
-        if ! rosdepc update --rosdistro=humble; then
+        if ! run_cmd rosdepc update --rosdistro=humble; then
             log_error "rosdepc update failed. This is usually due to network issues."
             log_error "Please check your network connection and re-run ./scripts/setup.sh"
             exit 1
         fi
 
         log_info "Installing ROS dependencies via apt..."
-        if ! rosdepc install \
+        if ! run_cmd rosdepc install \
             --from-paths src \
             --ignore-src \
             --rosdistro=humble \
@@ -497,18 +652,22 @@ install_system_deps() {
             log_error "Please check your network connection or dependency lists and re-run ./scripts/setup.sh"
             exit 1
         fi
-    elif command -v dnf &> /dev/null; then
+    elif [[ "${DETECTED_OS}" == "openeuler-embedded" ]]; then
+        if ! command -v dnf &> /dev/null; then
+            log_error "dnf not found on openEuler Embedded system."
+            exit 1
+        fi
         log_info "Updating dnf package repositories..."
 
         log_info "Updating rosdepc database..."
-        if ! rosdepc update --rosdistro=humble; then
+        if ! run_cmd rosdepc update --rosdistro=humble; then
             log_error "rosdepc update failed. This is usually due to network issues."
             log_error "Please check your network connection and re-run ./scripts/setup.sh"
             exit 1
         fi
 
         log_info "Installing ROS dependencies via dnf..."
-        if ! rosdepc install \
+        if ! run_cmd rosdepc install \
             --from-paths src \
             --ignore-src \
             --rosdistro=humble \
@@ -531,51 +690,79 @@ install_system_deps() {
     else
         log_warn "Unknown package manager. Please ensure ROS 2 Humble dependencies are installed manually."
     fi
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        log_done "System ROS dependency steps planned"
+    else
+        log_done "System ROS dependencies installed"
+    fi
 }
 
 setup_python_venv() {
+    if [[ "${SKIP_PYTHON}" == true ]]; then
+        log_info "Skipping Python environment setup (--skip-python)."
+        log_skipped "Python virtual environment"
+        return 0
+    fi
+
     local venv_path="${WORKSPACE}/venv"
     
     # 1. Ensure system-level venv tools are installed
     log_info "Checking for Python venv and pip..."
-    if command -v apt-get &> /dev/null; then
+    if [[ "${DETECTED_OS}" == "ubuntu" ]]; then
         run_sudo apt-get update -qq
         run_sudo apt-get install -y python3-venv python3-pip -qq
-    elif command -v dnf &> /dev/null; then
+    elif [[ "${DETECTED_OS}" == "openeuler-embedded" ]]; then
         run_sudo dnf install -y --nogpgcheck python3-virtualenv python3-pip python3-devel -q
     fi
 
     # 2. 创建虚拟环境 (必须包含 --system-site-packages 以使用系统的 rclpy)
     if [[ ! -d "${venv_path}" ]]; then
         log_info "Creating virtual environment at ${venv_path} with --system-site-packages..."
-        python3 -m venv --system-site-packages "${venv_path}"
+        run_cmd python3 -m venv --system-site-packages "${venv_path}"
     else
         log_info "Virtual environment already exists at ${venv_path}."
     fi
 
     # 3. 激活虚拟环境并安装依赖
+    if [[ "${DRY_RUN}" == true ]]; then
+        log_info "Skipping venv activation in dry-run mode."
+        run_cmd python3 -m pip install --upgrade pip --quiet
+        run_cmd python3 -m pip install "setuptools<80" "setuptools>=71" --quiet
+        if [[ -d "${WORKSPACE}/libs/lerobot" ]]; then
+            run_cmd python3 -m pip install -e "${WORKSPACE}/libs/lerobot"
+        fi
+        run_cmd python3 -m pip install pyserial feetech-servo-sdk --quiet
+        run_cmd python3 -m pip install scipy --quiet
+        run_cmd python3 -m pip install gitlint --quiet
+        run_cmd python3 -m pip install "numpy==1.26.4" --quiet
+        run_cmd gitlint install-hook
+        log_done "Python dependencies planned for venv"
+        return 0
+    fi
+
     log_info "Configuring Python environment and dependencies..."
     source "${venv_path}/bin/activate"
     
     # 升级 pip
-    python3 -m pip install --upgrade pip --quiet
+    run_cmd python3 -m pip install --upgrade pip --quiet
     
     # 解决 setuptools 版本冲突 (兼容 LeRobot 和 colcon)
-    python3 -m pip install "setuptools<80" "setuptools>=71" --quiet
+    run_cmd python3 -m pip install "setuptools<80" "setuptools>=71" --quiet
 
     # 以可编辑模式安装 LeRobot
     if [[ -d "${WORKSPACE}/libs/lerobot" ]]; then
         log_info "Installing LeRobot in editable mode..."
-        python3 -m pip install -e "${WORKSPACE}/libs/lerobot"
+        run_cmd python3 -m pip install -e "${WORKSPACE}/libs/lerobot"
     fi
 
     # 安装原有的硬件依赖
     log_info "Installing hardware dependencies (pyserial, feetech)..."
-    python3 -m pip install pyserial feetech-servo-sdk --quiet
+    run_cmd python3 -m pip install pyserial feetech-servo-sdk --quiet
 
     # 安装 scipy 用于数学计算 (四元数/旋转矩阵转换)
     log_info "Installing scipy for mathematical computations..."
-    python3 -m pip install scipy --quiet
+    run_cmd python3 -m pip install scipy --quiet
 
     # 安装训练可视化依赖
     log_info "Installing training visualization dependencies (tensorboard)..."
@@ -592,7 +779,7 @@ setup_python_venv() {
 
     # 安装 gitlint 并设置 git hook
     log_info "Installing gitlint..."
-    python3 -m pip install gitlint --quiet
+    run_cmd python3 -m pip install gitlint --quiet
 
     # 安装 ruff (代码规范) 和 pre-commit hook
     log_info "Installing ruff and pre-commit..."
@@ -604,43 +791,94 @@ setup_python_venv() {
     # 核心修复：所有依赖安装完毕后，强制固定 NumPy 1.26.4 以兼容 ROS 2 系统组件
     # 必须放在最后，防止 lerobot/scipy 等依赖将 numpy 升级到 2.x
     log_info "Pinning NumPy to 1.26.4 for ROS 2 compatibility..."
-    python3 -m pip install "numpy==1.26.4" --quiet
+    run_cmd python3 -m pip install "numpy==1.26.4" --quiet
     log_info "Installing gitlint pre-commit hook..."
-    yes | gitlint install-hook
-
-    # 4. 环境验证
-    log_info "Verifying ROS 2 connection..."
-    # 显式加载 ROS 2 环境后再验证
-    if (source /opt/ros/humble/setup.sh && python3 -c "import rclpy; print('ROS 2 Humble connection successful')") 2>/dev/null; then
-        log_info "Verification complete: venv can access ROS 2 packages."
+    if [[ "${DRY_RUN}" == true ]]; then
+        run_cmd gitlint install-hook
     else
-        log_error "Verification failed: rclpy not found. Ensure ROS 2 is installed and --system-site-packages was used."
+        yes | gitlint install-hook
     fi
+
+    log_done "Python environment configured"
+}
+
+verify_setup() {
+    if [[ "${SKIP_VERIFY}" == true ]]; then
+        log_info "Skipping final verification (--skip-verify)."
+        log_skipped "Setup verification"
+        return 0
+    fi
+
+    local venv_python="${WORKSPACE}/venv/bin/python3"
+
+    log_info "Running final verification..."
+
+    if [[ ! -x "${venv_python}" ]]; then
+        log_error "Verification failed: virtual environment python not found at ${venv_python}"
+        exit 1
+    fi
+
+    if ! command -v rosdepc &>/dev/null; then
+        log_error "Verification failed: rosdepc is not available in PATH."
+        exit 1
+    fi
+
+    if ! command -v colcon &>/dev/null; then
+        log_error "Verification failed: colcon is not available in PATH."
+        exit 1
+    fi
+
+    if ! (source /opt/ros/humble/setup.sh && "${venv_python}" -c "import rclpy" >/dev/null 2>&1); then
+        log_error "Verification failed: rclpy is not accessible from the virtual environment."
+        exit 1
+    fi
+
+    if ! "${venv_python}" -c "import lerobot" >/dev/null 2>&1; then
+        log_error "Verification failed: lerobot import failed."
+        exit 1
+    fi
+
+    if ! "${venv_python}" -c "import numpy; assert numpy.__version__.startswith('1.26.')" >/dev/null 2>&1; then
+        log_error "Verification failed: NumPy is not pinned to the expected ROS-compatible 1.26.x series."
+        exit 1
+    fi
+
+    log_done "Verified ROS, rosdepc, colcon, lerobot, and NumPy compatibility"
+}
+
+print_summary() {
+    echo ""
+    echo -e "${YELLOW}============================================================${NC}"
+    echo -e "${YELLOW} Setup Summary${NC}"
+    echo -e "${YELLOW}============================================================${NC}"
+    for entry in "${SUMMARY[@]}"; do
+        echo -e "  ${entry}"
+    done
+    echo ""
+}
+
+print_next_steps() {
+    log_info "Setup complete! Recommended next steps:"
+    echo "  source venv/bin/activate"
+    echo "  source /opt/ros/humble/setup.sh"
+    echo "  ./scripts/build.sh"
+    echo "  # After the first build, also source: source install/setup.sh"
 }
 
 # ============================================================================
 # Main
 # ============================================================================
 main() {
-    # Parse arguments
-    for arg in "$@"; do
-        case "${arg}" in
-            --yes|-y) AUTO_YES=true ;;
-            --git-http) GIT_HTTP=true ;;
-            --no-sudo) USE_SUDO=false ;;
-            --sudo) USE_SUDO=true ;;
-            *) log_warn "Unknown argument: ${arg}" ;;
-        esac
-    done
+    parse_args "$@"
 
     cd "${WORKSPACE}"
     
     # Check for conflicting environments
     check_conda
+    detect_os
+    detect_accelerator
+    print_environment_summary
     
-    # Apply git HTTP config if requested
-    apply_git_http_config
-
     log_info "Setting up workspace at ${WORKSPACE}"
     
     # Update submodules
@@ -651,19 +889,10 @@ main() {
     
     # Install dependencies
     install_system_deps
-    log_done "System ROS dependencies installed"
     setup_python_venv
-    log_done "Python virtual environment configured"
-
-    echo ""
-    echo -e "${YELLOW}============================================================${NC}"
-    echo -e "${YELLOW} Setup Summary${NC}"
-    echo -e "${YELLOW}============================================================${NC}"
-    for entry in "${SUMMARY[@]}"; do
-        echo -e "  ${entry}"
-    done
-    echo ""
-    log_info "Setup complete! Run ./scripts/build.sh to build the workspace."
+    verify_setup
+    print_summary
+    print_next_steps
 }
 
 # Run if executed directly (not sourced)

@@ -97,20 +97,22 @@ IB_Robot/                           # 主工作空间 (本仓库)
 
 ### 0. 系统要求
 
-- **操作系统**: openEuler Embedded 24.03
+- **操作系统**: Ubuntu 或 openEuler Embedded
 - **ROS 版本**: ROS 2 Humble
 - **Python**: 系统原生 Python 3.11。**严禁在 Conda 激活的环境中执行，否则会导致动态库冲突。**
+- **加速器**: 支持 NVIDIA GPU、Ascend 310B、Ascend 310P，若未检测到则按 CPU-only 路径运行。
 
 ### 1. 执行一键初始化
 
 运行 `./scripts/setup.sh`。该脚本会自动完成以下重型操作：
 
 1.  **子模块同步**: 执行 `git submodule update --init --recursive`，下载核心源码。
-2.  **ROS 2 安装** (如未安装): 自动检测并安装 ROS 2 Humble 和 colcon 构建工具。
-3.  **系统依赖安装**: 通过系统包管理器安装 C++ 编译工具、`nlohmann-json` 等硬件驱动依赖。
-4.  **虚拟环境 (venv) 构建**: 在根目录创建 `venv` 文件夹。这能确保 ML 相关依赖（如 PyTorch）与系统 ROS 2 环境隔离，防止破坏系统工具。
-5.  **ML 栈安装**: 自动在 `venv` 中安装 `torch`、`lerobot` 以及适配 ROS 2 Humble 的特定版本 `numpy (< 2.0)`。
-5.  **环境脚本注入**: 自动生成或更新 `.shrc_local`，用于一键加载开发环境。
+2.  **平台与硬件检测**: 自动识别 Ubuntu / openEuler Embedded，以及 NVIDIA GPU / Ascend 310B / 310P / CPU-only 环境。
+3.  **ROS 2 安装** (如未安装): 自动检测并安装 ROS 2 Humble 和 colcon 构建工具。
+4.  **系统依赖安装**: 通过系统包管理器安装 C++ 编译工具、`nlohmann-json` 等硬件驱动依赖。
+5.  **虚拟环境 (venv) 构建**: 在根目录创建 `venv` 文件夹。这能确保 ML 相关依赖与系统 ROS 2 环境隔离，同时通过 `--system-site-packages` 复用系统 `rclpy`。
+6.  **ML 栈安装**: 自动在 `venv` 中安装 `lerobot`、硬件依赖以及适配 ROS 2 Humble 的 NumPy 1.26.x。
+7.  **环境验证**: 自动验证 `rosdepc`、`colcon`、`rclpy`、`lerobot` 与 NumPy 兼容性。
 
 ### 2. 开发者 Fork 设置 (可选)
 
@@ -122,10 +124,17 @@ IB_Robot/                           # 主工作空间 (本仓库)
 
 ### 1. 加载环境
 
-每次开启新终端，必须先加载项目环境变量。这会激活 `venv` 并注入必要的 `PYTHONPATH`。
+当前 `setup.sh` **不会**生成 `.shrc_local`。每次开启新终端后，请手动加载环境：
 
 ```bash
-source .shrc_local
+source venv/bin/activate
+source /opt/ros/humble/setup.sh
+```
+
+完成首次构建后，再额外加载工作区环境：
+
+```bash
+source install/setup.sh
 ```
 
 ### 2. 分配 Domain ID
@@ -144,7 +153,7 @@ export ROS_DOMAIN_ID=<0-232之间的唯一数字>
 ./scripts/build.sh
 ```
 
-*注：该脚本会自动处理* *`lerobot`* *的可编辑安装，并清理潜在的构建污染。*
+*注：`build.sh` 现在只负责加载环境并执行构建；Python 环境、`lerobot` 可编辑安装与 NumPy 兼容性由 `setup.sh` 统一负责。*
 
 ***
 
