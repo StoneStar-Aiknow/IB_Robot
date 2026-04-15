@@ -60,12 +60,10 @@ SKIP_SUBMODULES=false
 SKIP_SYSTEM_DEPS=false
 SKIP_PYTHON=false
 SKIP_VERIFY=false
-CURRENT_STAGE="initializing"
-SYSTEM_DEPS_STATUS="pending"
-PYTHON_ENV_STATUS="pending"
-SETUP_ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL:-https://mirrors.tuna.tsinghua.edu.cn/rosdistro/index-v4.yaml}"
-SETUP_ROSDEP_DEFAULT_SOURCES_URL="${SETUP_ROSDEP_DEFAULT_SOURCES_URL:-https://mirrors.tuna.tsinghua.edu.cn/github-raw/ros/rosdistro/master/rosdep/sources.list.d/20-default.list}"
-SETUP_ROSDEP_DEFAULT_SOURCES_FILE="${SETUP_ROSDEP_DEFAULT_SOURCES_FILE:-/etc/ros/rosdep/sources.list.d/20-default.list}"
+SUMMARY=()
+DETECTED_OS="unknown"
+DETECTED_ACCELERATOR="cpu-only"
+ROS_DISTRO="${ROS_DISTRO:-humble}"
 
 # Mirror build.sh / .shrc_local: ignore ~/.local site-packages so that the
 # install-time view of Python packages matches what the build/runtime sees.
@@ -1326,9 +1324,116 @@ install_system_deps() {
     ensure_sudo_session
     ensure_colcon
     ensure_rosdepc
-    platform_install_rosdeps
-    SYSTEM_DEPS_STATUS="done"
-    log_done "System ROS dependencies installed"
+
+    if [[ "${DETECTED_OS}" == "ubuntu" ]]; then
+        if ! command -v apt-get &> /dev/null; then
+            log_error "apt-get not found on Ubuntu system."
+            exit 1
+        fi
+        log_info "Updating apt package lists..."
+        run_sudo apt-get update -qq
+
+        log_info "Updating rosdepc database..."
+        if ! run_cmd "${ROSDEPC_BIN}" update --rosdistro=humble; then
+            log_error "rosdepc update failed. This is usually due to network issues."
+            log_error "Please check your network connection and re-run ./scripts/setup.sh"
+            exit 1
+        fi
+
+        log_info "Installing ROS dependencies via apt..."
+        if ! run_cmd "${ROSDEPC_BIN}" install \
+            --from-paths src \
+            --ignore-src \
+            --rosdistro=humble \
+            -y -r \
+            --skip-keys=catkin \
+            --skip-keys=roscpp \
+            --skip-keys=lerobot \
+            --skip-keys=trimesh\[easy\] \
+            --skip-keys=simple-parsing \
+            --skip-keys=cupy-cuda12x \
+            --skip-keys=ctl_system_interface \
+            --skip-keys=numpy_lessthan_2 \
+            --skip-keys=ament_python \
+            --skip-keys=feetech-servo-sdk \
+            --skip-keys=pyserial; then
+            log_error "rosdepc install failed."
+            log_error "Please check your network connection or dependency lists and re-run ./scripts/setup.sh"
+            exit 1
+        fi
+
+        # The remaining tracing packages below do not currently have reliable
+        # rosdep/rosdepc rules in this environment, so they stay as explicit
+        # setup-time installs even though the ROS-resolvable tracing deps now
+        # live in src/robot_config/package.xml.
+        log_info "Installing remaining tracing tools without rosdep rules..."
+        run_sudo apt-get install -y --no-install-recommends \
+            python3-lttngust \
+            babeltrace2
+
+        if ! groups | grep -q '\btracing\b'; then
+            run_sudo usermod -aG tracing "$(whoami)" 2>/dev/null || true
+            log_warn "Added $(whoami) to the 'tracing' group; re-login may be required before using LTTng."
+        fi
+    elif [[ "${DETECTED_OS}" == "openeuler-embedded" ]]; then
+        if ! command -v dnf &> /dev/null; then
+            log_error "dnf not found on openEuler Embedded system."
+            exit 1
+        fi
+        log_info "Updating dnf package repositories..."
+
+        log_info "Updating rosdepc database..."
+        if ! run_cmd "${ROSDEPC_BIN}" update --rosdistro=humble; then
+            log_error "rosdepc update failed. This is usually due to network issues."
+            log_error "Please check your network connection and re-run ./scripts/setup.sh"
+            exit 1
+        fi
+
+        # openEuler relies on manual/system installs for these keys or does not
+        # currently provide matching rosdep package mappings.
+        log_info "Installing ROS dependencies via dnf..."
+        if ! run_cmd "${ROSDEPC_BIN}" install \
+            --from-paths src \
+            --ignore-src \
+            --rosdistro=humble \
+            -y -r \
+            --skip-keys=catkin \
+            --skip-keys=roscpp \
+            --skip-keys=lerobot \
+            --skip-keys=trimesh \
+            --skip-keys=simple-parsing \
+            --skip-keys=cupy-cuda12x \
+            --skip-keys=ctl_system_interface \
+            --skip-keys=numpy_lessthan_2 \
+            --skip-keys=ament_python \
+            --skip-keys=feetech-servo-sdk \
+            --skip-keys=tracetools \
+            --skip-keys=ros2trace \
+            --skip-keys=lttng-tools \
+            --skip-keys=nlohmann-json-dev \
+            --skip-keys=python3-opencv \
+            --skip-keys=python3-aiortc \
+            --skip-keys=gz_ros2_control \
+            --skip-keys=ros_gz_sim \
+            --skip-keys=ros_gz_bridge \
+            --skip-keys=mujoco_ros2_control \
+            --skip-keys=pyserial; then
+            log_error "rosdepc install failed."
+            log_error "Please check your network connection or dependency lists and re-run ./scripts/setup.sh"
+            exit 1
+        fi
+
+        log_warn "Tracing tool auto-install is not implemented on openEuler Embedded yet."
+        log_warn "If you need tracing on openEuler, install LTTng / ros2_tracing manually."
+    else
+        log_warn "Unknown package manager. Please ensure ROS 2 Humble dependencies are installed manually."
+    fi
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        log_done "System ROS dependency steps planned"
+    else
+        log_done "System ROS dependencies installed"
+    fi
 }
 
 setup_python_venv() {
@@ -1596,6 +1701,12 @@ PY
     log_info "Ensuring rosdepc is present in the workspace venv..."
     run_cmd "${pip_install[@]}" rosdepc --quiet
 
+    log_info "Installing tracing analysis tooling (tracetools-analysis)..."
+    if ! run_cmd "${pip_install[@]}" tracetools-analysis --quiet; then
+        log_warn "Failed to install tracetools-analysis into the workspace venv."
+        log_warn "You can retry manually with: ${venv_python} -m pip install tracetools-analysis"
+    fi
+
     # 强制把 NumPy/OpenCV 拉回 ROS 2 Humble ABI 兼容版本。
     # lerobot 安装会带入 numpy 2.x，这里无条件覆盖，确保 cv_bridge / image_transport
     # 等 ROS 包在 runtime 不会触发 numpy.core.multiarray 二进制不兼容错误。
@@ -1768,6 +1879,33 @@ PY
         exit 1
     fi
 
+    if [[ "${DETECTED_OS}" == "ubuntu" ]]; then
+        if ! command -v lttng &>/dev/null; then
+            log_error "Verification failed: lttng CLI is not available on PATH."
+            exit 1
+        fi
+
+        if ! command -v babeltrace2 &>/dev/null; then
+            log_error "Verification failed: babeltrace2 CLI is not available on PATH."
+            exit 1
+        fi
+
+        if ! (set +u; source /opt/ros/humble/setup.sh && set -u && ros2 trace --help >/dev/null 2>&1); then
+            log_error "Verification failed: ros2 trace CLI is not available from the ROS 2 environment."
+            exit 1
+        fi
+
+        if ! "${venv_python}" -c "import lttngust" >/dev/null 2>&1; then
+            log_error "Verification failed: python3-lttngust is not importable from the workspace venv."
+            exit 1
+        fi
+
+        if ! "${venv_python}" -c "import tracetools_analysis" >/dev/null 2>&1; then
+            log_error "Verification failed: tracetools-analysis is not importable from the workspace venv."
+            exit 1
+        fi
+    fi
+
     log_done "Verified ROS, rosdepc, colcon, lerobot, and NumPy compatibility"
 }
 
@@ -1843,15 +1981,44 @@ main() {
         echo -e "  ${entry}"
     done
     echo ""
-    local completion_message="Setup complete! Run ./scripts/build.sh to build the workspace."
-    if ! platform_supports_local_workspace_build; then
-        completion_message="Setup complete! OpenHarmony runtime verified; cross-build deployables on the host."
-    fi
-    if [[ "${USE_GUM}" == true ]]; then
-        "${GUM_BIN}" style --foreground 42 --bold "[INFO] ${completion_message}"
-    else
-        echo -e "\033[1;32m[INFO] ${completion_message}${NC}"
-    fi
+}
+
+print_next_steps() {
+    log_info "Setup complete! Recommended next steps:"
+    echo "  source .shrc_local"
+    echo "  ./scripts/build.sh"
+    echo "  # tracing is now included: ros2 launch robot_config robot.launch.py enable_tracing:=true ..."
+    echo "  # .shrc_local also disables ~/.local Python packages to avoid mixed venv imports"
+}
+
+# ============================================================================
+# Main
+# ============================================================================
+main() {
+    parse_args "$@"
+
+    cd "${WORKSPACE}"
+    
+    # Check for conflicting environments
+    check_conda
+    detect_os
+    detect_accelerator
+    print_environment_summary
+    
+    log_info "Setting up workspace at ${WORKSPACE}"
+    
+    # Update submodules
+    update_submodules
+    
+    # Optional: Setup developer forks
+    setup_developer_forks
+    
+    # Install dependencies
+    install_system_deps
+    setup_python_venv
+    verify_setup
+    print_summary
+    print_next_steps
 }
 
 # Run if executed directly (not sourced)

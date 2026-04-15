@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Minimal Action Dispatcher Node.
 
@@ -9,34 +8,36 @@ Publishes actions to ros2_control via TopicExecutor at a fixed frequency.
 Supports cross-frame temporal smoothing for action chunks.
 """
 
-import time
 import collections
-from pathlib import Path
-from typing import Optional, Dict, Any, List, Union
+
+# Business tracepoints via Python logging.
+# When lttngust is imported, these are auto-captured by LTTng as
+# python:logging events — no wrapper package needed.
+import time
+import uuid
 
 import numpy as np
-import torch
 import rclpy
 import rclpy.action
-from rclpy.node import Node
+import torch
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
-
-from std_msgs.msg import Int32, Bool
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Bool, Int32
 from std_srvs.srv import Empty
 
 from ibrobot_msgs.action import DispatchInfer
-from ibrobot_msgs.msg import VariantsList
 from robot_config.contract_utils import iter_specs
+from robot_config.tracing_utils import create_trace_logger
 from tensormsg.converter import TensorMsgConverter
 
-from .topic_executor import TopicExecutor
 from .temporal_smoother import (
-    TemporalSmoother,
-    TemporalSmootherConfig,
     TemporalSmootherManager,
 )
+from .topic_executor import TopicExecutor
+
+_trace = create_trace_logger("ib_trace.dispatch")
 
 
 class ActionDispatcherNode(Node):
@@ -58,9 +59,7 @@ class ActionDispatcherNode(Node):
         self.declare_parameter("queue_size", 100)
         self.declare_parameter("watermark_threshold", 20)
         self.declare_parameter("control_frequency", 100.0)
-        self.declare_parameter(
-            "inference_action_server", "/act_inference_node/DispatchInfer"
-        )
+        self.declare_parameter("inference_action_server", "/act_inference_node/DispatchInfer")
         self.declare_parameter("robot_config_path", "")
         self.declare_parameter("joint_state_topic", "/joint_states")
 
@@ -77,9 +76,7 @@ class ActionDispatcherNode(Node):
 
         # Smoothing config
         self._smoothing_enabled = self.get_parameter("temporal_smoothing_enabled").value
-        self._temporal_ensemble_coeff = self.get_parameter(
-            "temporal_ensemble_coeff"
-        ).value
+        self._temporal_ensemble_coeff = self.get_parameter("temporal_ensemble_coeff").value
         self._chunk_size = self.get_parameter("chunk_size").value
         smoothing_device = self.get_parameter("smoothing_device").value
         if smoothing_device == "":
@@ -87,7 +84,7 @@ class ActionDispatcherNode(Node):
 
         # 2. State & Queue
         self._queue = collections.deque(maxlen=self._queue_limit)
-        self._last_action: Optional[np.ndarray] = None
+        self._last_action: np.ndarray | None = None
         self._inference_in_progress = False
         self._is_running = True
 
@@ -95,7 +92,7 @@ class ActionDispatcherNode(Node):
         self._plan_length_at_inference_start: int = 0
 
         # 3. Initialize Temporal Smoother (if enabled)
-        self._smoother: Optional[TemporalSmootherManager] = None
+        self._smoother: TemporalSmootherManager | None = None
         if self._smoothing_enabled:
             self._smoother = TemporalSmootherManager(
                 enabled=True,
@@ -104,8 +101,7 @@ class ActionDispatcherNode(Node):
                 device=smoothing_device,
             )
             self.get_logger().info(
-                f"Temporal smoothing ENABLED: coeff={self._temporal_ensemble_coeff}, "
-                f"chunk_size={self._chunk_size}"
+                f"Temporal smoothing ENABLED: coeff={self._temporal_ensemble_coeff}, chunk_size={self._chunk_size}"
             )
         else:
             self.get_logger().info("Temporal smoothing DISABLED (using simple queue)")
@@ -115,23 +111,16 @@ class ActionDispatcherNode(Node):
         self._action_specs = []
         if robot_config_path:
             try:
-                from robot_config.loader import (
-                    load_robot_config_dict,
-                    build_contract_from_robot_config_dict,
-                )
+                from robot_config.loader import load_robot_config
 
-                robot_cfg = load_robot_config_dict(robot_config_path)
-                self._contract = build_contract_from_robot_config_dict(robot_cfg)
+                robot_cfg = load_robot_config(robot_config_path)
+                self._contract = robot_cfg.to_contract()
                 self._action_specs = [s for s in iter_specs(self._contract) if s.is_action]
                 self.get_logger().info(f"Loaded {len(self._action_specs)} action specs from robot_config")
             except Exception as e:
-                self.get_logger().error(
-                    f"Failed to load contract from {robot_config_path}: {e}"
-                )
+                self.get_logger().error(f"Failed to load contract from {robot_config_path}: {e}")
         else:
-            self.get_logger().warn(
-                "No robot_config_path provided! TopicExecutor will use defaults."
-            )
+            self.get_logger().warn("No robot_config_path provided! TopicExecutor will use defaults.")
 
         # 5. Executor (Topic-based)
         self._executor = TopicExecutor(self, {"action_specs": self._action_specs})
@@ -139,9 +128,7 @@ class ActionDispatcherNode(Node):
             raise RuntimeError("Failed to initialize TopicExecutor")
 
         # 6. Communication
-        self._infer_client = rclpy.action.ActionClient(
-            self, DispatchInfer, self._server_name
-        )
+        self._infer_client = rclpy.action.ActionClient(self, DispatchInfer, self._server_name)
 
         # Subscriptions
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -154,21 +141,15 @@ class ActionDispatcherNode(Node):
 
         # Publishers
         self._queue_size_pub = self.create_publisher(Int32, "~/queue_size", 10)
-        self._smoothing_enabled_pub = self.create_publisher(
-            Bool, "~/smoothing_enabled", 10
-        )
+        self._smoothing_enabled_pub = self.create_publisher(Bool, "~/smoothing_enabled", 10)
 
         # 7. Timers
         self._cb_group = MutuallyExclusiveCallbackGroup()
-        self._timer = self.create_timer(
-            1.0 / self._control_hz, self._control_loop, callback_group=self._cb_group
-        )
+        self._timer = self.create_timer(1.0 / self._control_hz, self._control_loop, callback_group=self._cb_group)
 
         # Services
         self._reset_srv = self.create_service(Empty, "~/reset", self._reset_cb)
-        self._toggle_smoothing_srv = self.create_service(
-            Empty, "~/toggle_smoothing", self._toggle_smoothing_cb
-        )
+        self._toggle_smoothing_srv = self.create_service(Empty, "~/toggle_smoothing", self._toggle_smoothing_cb)
 
         self.get_logger().info(
             f"Dispatcher ready. Hz: {self._control_hz}, Watermark: {self._watermark}, "
@@ -184,6 +165,9 @@ class ActionDispatcherNode(Node):
         self._hold_count = 0
         self._consecutive_failures = 0
         self._last_stats_dispatch_count = 0
+        self._active_request_id = ""
+        self._actions_executed_from_active_request = 0
+        self._last_queue_refill_monotonic_ns = 0
 
     def _joint_cb(self, msg):
         """Optional: could use current state for safety or initialization."""
@@ -209,6 +193,7 @@ class ActionDispatcherNode(Node):
 
         # B. Get Action
         action = None
+        action_source = "empty"
         if q_size > 0:
             if self._smoother is not None:
                 action_tensor = self._smoother.get_next_action()
@@ -216,12 +201,15 @@ class ActionDispatcherNode(Node):
                     action = action_tensor.detach().cpu().numpy()
                 else:
                     action = action_tensor
+                action_source = "smoother"
             else:
                 action = self._queue.popleft()
+                action_source = "queue"
             self._last_action = action
         elif self._last_action is not None:
             action = self._last_action
             self._hold_count += 1
+            action_source = "hold"
 
         # C. Execute
         if action is not None:
@@ -229,7 +217,39 @@ class ActionDispatcherNode(Node):
                 action_np = action.detach().cpu().numpy()
             else:
                 action_np = np.array(action)
-            self._executor.execute(action_np)
+            execute_index = self._actions_executed_from_active_request
+            execute_start = time.perf_counter()
+            self._executor.execute(
+                action_np,
+                {
+                    "request_id": self._active_request_id,
+                    "execute_index": execute_index,
+                    "queue_size": q_size,
+                },
+            )
+            publish_ms = (time.perf_counter() - execute_start) * 1000.0
+            queue_after = self._get_plan_length()
+            since_refill_ms = (
+                max(
+                    0.0,
+                    (time.monotonic_ns() - self._last_queue_refill_monotonic_ns) / 1_000_000,
+                )
+                if self._last_queue_refill_monotonic_ns
+                else -1.0
+            )
+            _trace.info(
+                "[action_execute] request_id=%s index=%d source=%s "
+                "queue_before=%d queue_after=%d since_refill_ms=%.2f publish_ms=%.2f",
+                self._active_request_id,
+                execute_index,
+                action_source,
+                q_size,
+                queue_after,
+                since_refill_ms,
+                publish_ms,
+            )
+            if action_source != "hold":
+                self._actions_executed_from_active_request += 1
 
         # D. Periodic stats (only when new inferences arrived)
         now = time.monotonic()
@@ -253,10 +273,18 @@ class ActionDispatcherNode(Node):
 
         self._inference_in_progress = True
         self._plan_length_at_inference_start = self._get_plan_length()
+        self._current_request_id = uuid.uuid4().hex[:8]
 
         goal = DispatchInfer.Goal()
         goal.obs_timestamp = self.get_clock().now().to_msg()
+        goal.inference_id = self._current_request_id
 
+        _trace.info(
+            "[dispatch_request] request_id=%s queue_size=%d watermark=%d",
+            self._current_request_id,
+            self._plan_length_at_inference_start,
+            self._watermark,
+        )
         self.get_logger().debug(
             f"Requesting inference @ {goal.obs_timestamp.sec}, "
             f"plan_length_at_start: {self._plan_length_at_inference_start}"
@@ -278,28 +306,36 @@ class ActionDispatcherNode(Node):
     def _result_cb(self, future):
         self._inference_in_progress = False
         result = future.result().result
-
+        req_id = getattr(self, "_current_request_id", "")
         if not result.success:
             self._consecutive_failures += 1
+            _trace.info(
+                "[dispatch_result] request_id=%s success=False",
+                req_id,
+            )
             if self._consecutive_failures == 1:
                 self.get_logger().warn(f"Inference failed: {result.message}")
             else:
-                self.get_logger().debug(
-                    f"Inference failed (#{self._consecutive_failures}): {result.message}"
-                )
+                self.get_logger().debug(f"Inference failed (#{self._consecutive_failures}): {result.message}")
             return
 
         if self._consecutive_failures > 0:
-            self.get_logger().info(
-                f"Inference recovered (after {self._consecutive_failures} failures)"
-            )
+            self.get_logger().info(f"Inference recovered (after {self._consecutive_failures} failures)")
             self._consecutive_failures = 0
 
         self._dispatch_count += 1
         self._total_inference_latency_ms += result.inference_latency_ms
 
         # Decode VariantsList to Numpy/Tensor
+        decode_start = time.perf_counter()
         batch = TensorMsgConverter.from_variant(result.action_chunk)
+        decode_ms = (time.perf_counter() - decode_start) * 1000.0
+        _trace.info(
+            "[dispatch_decode] request_id=%s chunk_size=%d decode_ms=%.2f",
+            req_id,
+            result.chunk_size,
+            decode_ms,
+        )
         if "action" in batch:
             action_chunk = batch["action"]
 
@@ -318,24 +354,46 @@ class ActionDispatcherNode(Node):
 
             # Calculate actions executed during inference
             current_plan_length = self._get_plan_length()
-            actions_executed = max(
-                0, self._plan_length_at_inference_start - current_plan_length
+            actions_executed = max(0, self._plan_length_at_inference_start - current_plan_length)
+
+            _trace.info(
+                "[dispatch_result] request_id=%s success=True latency_ms=%.2f chunk_size=%d",
+                req_id,
+                result.inference_latency_ms,
+                len(action_chunk_np),
             )
 
             if self._smoother is not None:
                 # Use smoother for cross-frame smoothing
-                new_length = self._smoother.update(
-                    action_chunk_tensor, actions_executed
+                new_length = self._smoother.update(action_chunk_tensor, actions_executed)
+                self._active_request_id = req_id
+                self._actions_executed_from_active_request = 0
+                self._last_queue_refill_monotonic_ns = time.monotonic_ns()
+                _trace.info(
+                    "[queue_refill] request_id=%s new=%d skipped=%d after=%d",
+                    req_id,
+                    len(action_chunk_np),
+                    actions_executed,
+                    new_length,
                 )
                 self.get_logger().debug(
-                    f"Smoothed update: {len(action_chunk_np)} new, "
-                    f"skipped {actions_executed}, plan={new_length}"
+                    f"Smoothed update: {len(action_chunk_np)} new, skipped {actions_executed}, plan={new_length}"
                 )
             else:
                 # Simple queue mode: align and replace
                 relevant_actions = action_chunk_np[actions_executed:]
                 self._queue.clear()
                 self._queue.extend(relevant_actions)
+                self._active_request_id = req_id
+                self._actions_executed_from_active_request = 0
+                self._last_queue_refill_monotonic_ns = time.monotonic_ns()
+                _trace.info(
+                    "[queue_refill] request_id=%s new=%d skipped=%d after=%d",
+                    req_id,
+                    len(relevant_actions),
+                    actions_executed,
+                    len(self._queue),
+                )
                 self.get_logger().debug(
                     f"Queue update: {len(relevant_actions)} actions "
                     f"(skipped {actions_executed}), total={len(self._queue)}"
@@ -357,6 +415,10 @@ class ActionDispatcherNode(Node):
         self._inference_in_progress = False
         self._plan_length_at_inference_start = 0
         self._last_action = None
+        self._active_request_id = ""
+        self._actions_executed_from_active_request = 0
+        self._last_queue_refill_monotonic_ns = 0
+        self._current_request_id = ""
         return response
 
     def _toggle_smoothing_cb(self, request, response):
@@ -369,9 +431,7 @@ class ActionDispatcherNode(Node):
         self._smoother._config.enabled = self._smoothing_enabled
         self._smoother._smoother.config.enabled = self._smoothing_enabled
 
-        self.get_logger().info(
-            f"Temporal smoothing {'ENABLED' if self._smoothing_enabled else 'DISABLED'}"
-        )
+        self.get_logger().info(f"Temporal smoothing {'ENABLED' if self._smoothing_enabled else 'DISABLED'}")
         return response
 
 

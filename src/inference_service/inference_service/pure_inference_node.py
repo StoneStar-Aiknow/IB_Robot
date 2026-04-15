@@ -17,20 +17,21 @@ Request-Response Matching:
 from __future__ import annotations
 
 import time
-import os
-from typing import Any, Dict, Optional
+from typing import Any
 
 import rclpy
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
-from tensormsg.converter import TensorMsgConverter
 from ibrobot_msgs.msg import VariantsList
 from inference_service.core.pure_inference_engine import (
     PureInferenceEngine,
-    resolve_device,
 )
+from robot_config.tracing_utils import create_trace_logger
+from tensormsg.converter import TensorMsgConverter
+
+_trace = create_trace_logger("ib_trace.inference")
 
 
 class PureInferenceNode(Node):
@@ -46,7 +47,7 @@ class PureInferenceNode(Node):
     def __init__(
         self,
         node_name: str = "pure_inference",
-        policy_path: Optional[str] = None,
+        policy_path: str | None = None,
         input_topic: str = "/preprocessed/batch",
         output_topic: str = "/inference/action",
         device: str = "auto",
@@ -59,13 +60,9 @@ class PureInferenceNode(Node):
         self._input_topic = input_topic
         self._output_topic = output_topic
 
-        self.get_logger().info(
-            f"Loading policy from {policy_path} on device {device}..."
-        )
+        self.get_logger().info(f"Loading policy from {policy_path} on device {device}...")
         self._engine = PureInferenceEngine(policy_path=policy_path, device=device)
-        self.get_logger().info(
-            f"Engine loaded: {self._engine.policy_type}, chunk_size={self._engine.chunk_size}"
-        )
+        self.get_logger().info(f"Engine loaded: {self._engine.policy_type}, chunk_size={self._engine.chunk_size}")
 
         self._sub = self.create_subscription(
             VariantsList,
@@ -83,9 +80,7 @@ class PureInferenceNode(Node):
         self._log_interval_s = 5.0
 
         self.get_logger().info(
-            f"PureInferenceNode ready: "
-            f"input={input_topic}, output={output_topic}, "
-            f"device={self._engine._device}"
+            f"PureInferenceNode ready: input={input_topic}, output={output_topic}, device={self._engine._device}"
         )
         self.get_logger().info("Waiting for preprocessed batches from edge node...")
 
@@ -97,15 +92,27 @@ class PureInferenceNode(Node):
             batch = TensorMsgConverter.from_variant(msg, self._engine._device)
 
             req_list = batch.pop("task.request_id", None)
-            request_id = (
-                req_list[0] if req_list and isinstance(req_list, list) else None
+            request_id = req_list[0] if req_list and isinstance(req_list, list) else None
+
+            _trace.info(
+                "[inference_begin] request_id=%s model=%s device=%s",
+                request_id or "",
+                self._engine.policy_type,
+                self._engine._device,
             )
 
             result = self._engine(batch)
 
             inference_latency_ms = (time.perf_counter() - start_time) * 1000.0
 
-            out_batch: Dict[str, Any] = {"action": result.action}
+            _trace.info(
+                "[inference_end] request_id=%s latency_ms=%.2f shape=%s",
+                request_id or "",
+                inference_latency_ms,
+                list(result.action.shape),
+            )
+
+            out_batch: dict[str, Any] = {"action": result.action}
 
             if request_id is not None:
                 out_batch["action.request_id"] = [request_id]
@@ -129,9 +136,7 @@ class PureInferenceNode(Node):
             if now - self._last_log_time >= self._log_interval_s:
                 avg_latency = self._total_latency_ms / self._inference_count
                 self.get_logger().info(
-                    f"[stats] count={self._inference_count}, "
-                    f"avg={avg_latency:.1f}ms, "
-                    f"last={inference_latency_ms:.1f}ms"
+                    f"[stats] count={self._inference_count}, avg={avg_latency:.1f}ms, last={inference_latency_ms:.1f}ms"
                 )
                 self._last_log_time = now
 

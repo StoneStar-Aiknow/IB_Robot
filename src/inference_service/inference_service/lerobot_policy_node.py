@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 LeRobot policy inference node - Supports both Monolithic and Distributed modes.
 
@@ -39,48 +38,56 @@ import threading
 import time
 import traceback
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 import numpy as np
 import rclpy
 import rclpy.action
 import torch
+from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
-from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
 
 from ibrobot_msgs.action import DispatchInfer
 from ibrobot_msgs.msg import VariantsList
-from robot_config.contract_utils import (
-    iter_specs,
-    SpecView,
-    feature_from_spec,
-    zero_pad,
-    qos_profile_from_dict,
-    StreamBuffer,
-    decode_value,
-    stamp_from_header_ns,
-)
-from robot_config.utils import (
-    build_joint_conversion_table,
-    resolve_calibration_path_from_config,
-    resolve_gripper_joints_from_config,
-    resolve_joint_names_from_config,
-)
-
 from inference_service.core import (
-    InferenceCoordinator,
-    CoordinatorConfig,
     CoordinatorResult,
+    InferenceCoordinator,
     resolve_device,
 )
-from inference_service.core.preprocessor import TensorPreprocessor
 from inference_service.core.postprocessor import TensorPostprocessor
+from inference_service.core.preprocessor import TensorPreprocessor
+from robot_config.contract_utils import (
+    SpecView,
+    StreamBuffer,
+    decode_value,
+    feature_from_spec,
+    iter_specs,
+    qos_profile_from_dict,
+    stamp_from_header_ns,
+    zero_pad,
+)
+from robot_config.tracing_utils import create_trace_logger
+from robot_config.utils import build_joint_conversion_table
 from tensormsg.converter import TensorMsgConverter
+
+_trace = create_trace_logger("ib_trace.policy")
+
+
+def _trace_shape(value: Any) -> str:
+    """Return a compact shape string for tracing fields."""
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        if len(shape) == 0:
+            return "scalar"
+        return "x".join(str(int(dim)) for dim in shape)
+    if isinstance(value, list | tuple):
+        return str(len(value))
+    return "scalar"
 
 
 @dataclass
@@ -98,9 +105,9 @@ class _NodeConfig:
     name: str = "lerobot_policy"
     node_name: str = "lerobot_policy_node"
     model_type: str = "lerobot_policy"
-    repo_id: Optional[str] = None
-    checkpoint: Optional[str] = None
-    robot_config_path: Optional[str] = None
+    repo_id: str | None = None
+    checkpoint: str | None = None
+    robot_config_path: str | None = None
     lerobot_norm_mode: str = "range_m100_100"
     device: str = "auto"
     frequency: float = 10.0
@@ -134,16 +141,10 @@ class LeRobotPolicyNode(Node):
     different observation requirements.
     """
 
-    def __init__(self, model_config: Dict):
+    def __init__(self, model_config: dict):
         super().__init__(model_config.get("node_name", "lerobot_policy_node"))
 
-        self._config = _NodeConfig(
-            **{
-                k: v
-                for k, v in model_config.items()
-                if k in _NodeConfig.__dataclass_fields__
-            }
-        )
+        self._config = _NodeConfig(**{k: v for k, v in model_config.items() if k in _NodeConfig.__dataclass_fields__})
 
         self.get_logger().info(f"Initializing {self._config.name} node")
         self.get_logger().info(f"Execution mode: {self._config.execution_mode}")
@@ -151,7 +152,7 @@ class LeRobotPolicyNode(Node):
         self._device = resolve_device(self._config.device)
         self.get_logger().info(f"Using device: {self._device}")
 
-        self._last_inference_time: Optional[float] = None
+        self._last_inference_time: float | None = None
         self._inference_count = 0
         self._consecutive_timeouts = 0
         self._cloud_connected = False
@@ -159,11 +160,11 @@ class LeRobotPolicyNode(Node):
         self._error_message = ""
 
         self._contract = None
-        self._obs_specs: List[SpecView] = []
-        self._obs_zero: Dict[str, np.ndarray] = {}
-        self._subs: Dict[str, _SubState] = {}
-        self._state_specs: List[SpecView] = []
-        self._policy_config: Optional[Dict] = None
+        self._obs_specs: list[SpecView] = []
+        self._obs_zero: dict[str, np.ndarray] = {}
+        self._subs: dict[str, _SubState] = {}
+        self._state_specs: list[SpecView] = []
+        self._policy_config: dict | None = None
         self._required_inputs: set = set()  # Input features required by model
         self._joint_rad_limits: list = []  # populated in _load_contract()
 
@@ -185,11 +186,7 @@ class LeRobotPolicyNode(Node):
 
         self._health_timer = self.create_timer(1.0, self._health_callback)
 
-        mode_str = (
-            "distributed (edge proxy)"
-            if self._config.execution_mode == "distributed"
-            else "monolithic"
-        )
+        mode_str = "distributed (edge proxy)" if self._config.execution_mode == "distributed" else "monolithic"
         self.get_logger().info(
             f"{self._config.name} node ready ({mode_str}): "
             f"policy_type={self._policy_type}, "
@@ -210,16 +207,14 @@ class LeRobotPolicyNode(Node):
             self.get_logger().warn(f"Model config not found: {config_path}")
             return
 
-        with open(config_path, "r") as f:
+        with open(config_path) as f:
             self._policy_config = json.load(f)
 
         # Extract required input features
         input_features = self._policy_config.get("input_features", {})
         self._required_inputs = set(input_features.keys())
 
-        self.get_logger().info(
-            f"Model requires {len(self._required_inputs)} input features:"
-        )
+        self.get_logger().info(f"Model requires {len(self._required_inputs)} input features:")
         for key in self._required_inputs:
             self.get_logger().info(f"  - {key}")
 
@@ -250,28 +245,21 @@ class LeRobotPolicyNode(Node):
                 norm_mode=norm_mode,
             )
             self.get_logger().info(
-                f"Loaded joint conversion table (mode={norm_mode}): "
-                f"{len(self._joint_rad_limits)} joints"
+                f"Loaded joint conversion table (mode={norm_mode}): {len(self._joint_rad_limits)} joints"
             )
         else:
             self._joint_rad_limits = []
-            self.get_logger().warn(
-                "Missing calib_file or joint_names; rad↔pct conversion disabled"
-            )
+            self.get_logger().warn("Missing calib_file or joint_names; rad↔pct conversion disabled")
 
         # Get all observation specs from contract
         all_obs_specs = [s for s in iter_specs(self._contract) if not s.is_action]
 
         # Filter by model's required inputs
         if self._required_inputs:
-            self._obs_specs = [
-                s for s in all_obs_specs if s.key in self._required_inputs
-            ]
+            self._obs_specs = [s for s in all_obs_specs if s.key in self._required_inputs]
             skipped = len(all_obs_specs) - len(self._obs_specs)
             if skipped > 0:
-                self.get_logger().info(
-                    f"Filtered observations: {len(self._obs_specs)} required, {skipped} skipped"
-                )
+                self.get_logger().info(f"Filtered observations: {len(self._obs_specs)} required, {skipped} skipped")
         else:
             # No model config, use all observations
             self._obs_specs = all_obs_specs
@@ -289,9 +277,7 @@ class LeRobotPolicyNode(Node):
     def _setup_observation_subscriptions(self):
         """Setup observation subscriptions from loaded contract."""
         if not self._contract:
-            self.get_logger().warn(
-                "No contract loaded, skipping observation subscriptions"
-            )
+            self.get_logger().warn("No contract loaded, skipping observation subscriptions")
             return
 
         from rosidl_runtime_py.utilities import get_message
@@ -335,9 +321,7 @@ class LeRobotPolicyNode(Node):
         """Setup for monolithic (single-process) inference."""
         policy_path = self._config.repo_id or self._config.checkpoint
         if not policy_path:
-            raise RuntimeError(
-                "LeRobotPolicyNode: 'repo_id' or 'checkpoint' is required"
-            )
+            raise RuntimeError("LeRobotPolicyNode: 'repo_id' or 'checkpoint' is required")
 
         self._coordinator = InferenceCoordinator(
             policy_path=policy_path,
@@ -350,7 +334,7 @@ class LeRobotPolicyNode(Node):
 
         self._preprocessor = None
         self._postprocessor = None
-        self._pending_requests: Dict[str, Any] = {}
+        self._pending_requests: dict[str, Any] = {}
         self._pub_batch = None
         self._sub_result = None
 
@@ -358,9 +342,7 @@ class LeRobotPolicyNode(Node):
         """Setup for distributed (cloud-edge) inference."""
         policy_path = self._config.repo_id or self._config.checkpoint
         if not policy_path:
-            raise RuntimeError(
-                "LeRobotPolicyNode: 'repo_id' or 'checkpoint' is required"
-            )
+            raise RuntimeError("LeRobotPolicyNode: 'repo_id' or 'checkpoint' is required")
 
         self._preprocessor = TensorPreprocessor(
             policy_path=policy_path,
@@ -381,7 +363,7 @@ class LeRobotPolicyNode(Node):
         self._chunk_size = temp_engine.chunk_size
         self._use_action_chunking = temp_engine.use_action_chunking
 
-        self._pending_requests: Dict[str, Any] = {}
+        self._pending_requests: dict[str, Any] = {}
 
         self._pub_batch = self.create_publisher(
             VariantsList,
@@ -433,13 +415,14 @@ class LeRobotPolicyNode(Node):
 
     def _obs_cb(self, msg, spec: SpecView):
         """Observation callback - push to StreamBuffer."""
+        recv_ts_ns = self.get_clock().now().nanoseconds
         use_header = (spec.stamp_src == "header") or self._config.use_header_time
 
         if use_header:
             ts = stamp_from_header_ns(msg)
-            ts_ns = int(ts) if ts is not None else self.get_clock().now().nanoseconds
+            ts_ns = int(ts) if ts is not None else recv_ts_ns
         else:
-            ts_ns = self.get_clock().now().nanoseconds
+            ts_ns = recv_ts_ns
 
         val = decode_value(spec.ros_type, msg, spec)
         if val is not None:
@@ -447,26 +430,56 @@ class LeRobotPolicyNode(Node):
                 dict_key = f"{spec.key}_{spec.topic.replace('/', '_')}"
             else:
                 dict_key = spec.key
+            transport_ms = max(0.0, (recv_ts_ns - ts_ns) / 1_000_000)
+            _trace.info(
+                "[obs_receive] key=%s topic=%s source=%s source_ts_ns=%d recv_ts_ns=%d transport_ms=%.3f shape=%s",
+                dict_key,
+                spec.topic,
+                "header" if use_header else "receive",
+                ts_ns,
+                recv_ts_ns,
+                transport_ms,
+                _trace_shape(val),
+            )
             self._subs[dict_key].buf.push(ts_ns, val)
 
-    def _sample_obs_frame(self, sample_t_ns: Optional[int] = None) -> Dict[str, Any]:
+    def _sample_obs_frame(
+        self,
+        sample_t_ns: int | None = None,
+        request_id: str = "",
+    ) -> dict[str, Any]:
         """Sample observation frame at a given timestamp."""
         if sample_t_ns is None:
             sample_t_ns = self.get_clock().now().nanoseconds
 
-        obs_frame: Dict[str, Any] = {}
+        obs_frame: dict[str, Any] = {}
+        ready_count = 0
+        missing_count = 0
 
         if len(self._state_specs) > 1:
             parts = []
             for sv in self._state_specs:
                 key = f"{sv.key}_{sv.topic.replace('/', '_')}"
-                v = (
-                    self._subs[key].buf.sample(sample_t_ns)
-                    if key in self._subs
-                    else None
-                )
-                parts.append(
-                    v if v is not None else self._obs_zero.get(key, np.zeros(1))
+                buf = self._subs[key].buf if key in self._subs else None
+                v = buf.sample(sample_t_ns) if buf is not None else None
+                source_ts_ns = buf.last_ts if buf is not None and buf.last_ts is not None else 0
+                sampled = v if v is not None else self._obs_zero.get(key, np.zeros(1))
+                parts.append(sampled)
+                ready = int(v is not None)
+                ready_count += ready
+                missing_count += int(not ready)
+                age_ms = max(0.0, (sample_t_ns - source_ts_ns) / 1_000_000) if source_ts_ns else -1.0
+                _trace.info(
+                    "[obs_sample] request_id=%s key=%s topic=%s ready=%d "
+                    "age_ms=%.3f source_ts_ns=%d sample_ts_ns=%d shape=%s",
+                    request_id,
+                    key,
+                    sv.topic,
+                    ready,
+                    age_ms,
+                    source_ts_ns,
+                    sample_t_ns,
+                    _trace_shape(sampled),
                 )
             obs_frame["observation.state"] = np.concatenate(parts)
 
@@ -474,9 +487,34 @@ class LeRobotPolicyNode(Node):
             if key.startswith("observation.state_") and len(self._state_specs) > 1:
                 continue
             v = st.buf.sample(sample_t_ns)
-            obs_frame[key] = (
-                v if v is not None else self._obs_zero.get(key, np.zeros(1))
+            sampled = v if v is not None else self._obs_zero.get(key, np.zeros(1))
+            obs_frame[key] = sampled
+            ready = int(v is not None)
+            ready_count += ready
+            missing_count += int(not ready)
+            source_ts_ns = st.buf.last_ts if st.buf.last_ts is not None else 0
+            age_ms = max(0.0, (sample_t_ns - source_ts_ns) / 1_000_000) if source_ts_ns else -1.0
+            _trace.info(
+                "[obs_sample] request_id=%s key=%s topic=%s ready=%d "
+                "age_ms=%.3f source_ts_ns=%d sample_ts_ns=%d shape=%s",
+                request_id,
+                key,
+                st.spec.topic,
+                ready,
+                age_ms,
+                source_ts_ns,
+                sample_t_ns,
+                _trace_shape(sampled),
             )
+
+        _trace.info(
+            "[obs_frame] request_id=%s sample_ts_ns=%d ready=%d missing=%d total=%d",
+            request_id,
+            sample_t_ns,
+            ready_count,
+            missing_count,
+            ready_count + missing_count,
+        )
 
         return obs_frame
 
@@ -518,35 +556,39 @@ class LeRobotPolicyNode(Node):
         """Execute inference requested by dispatcher."""
         goal = goal_handle.request
         obs_timestamp_ns = goal.obs_timestamp.sec * 10**9 + goal.obs_timestamp.nanosec
+        request_id = goal.inference_id or ""
 
         try:
-            obs_frame = self._sample_obs_frame(obs_timestamp_ns)
+            obs_frame = self._sample_obs_frame(obs_timestamp_ns, request_id=request_id)
 
             # Convert observation.state from radians (ros2_control) to LeRobot
             # units to match the dataset statistics used for normalization.
             if "observation.state" in obs_frame:
-                obs_frame["observation.state"] = self._rad_to_lerobot(
-                    obs_frame["observation.state"]
-                )
+                obs_frame["observation.state"] = self._rad_to_lerobot(obs_frame["observation.state"])
 
             if self._config.execution_mode == "distributed":
-                result = self._execute_distributed(obs_frame, goal.inference_id)
+                result = self._execute_distributed(obs_frame, request_id)
             else:
-                result = self._execute_monolithic(obs_frame)
+                result = self._execute_monolithic(obs_frame, request_id)
 
             # Convert action chunk from LeRobot units back to radians
             # so the dispatcher receives Contract-declared units (radians).
             action_rad = result.action
             if self._joint_rad_limits:
-                action_np = (
-                    result.action.detach().cpu().numpy()
-                    if torch.is_tensor(result.action)
-                    else result.action
-                )
+                action_np = result.action.detach().cpu().numpy() if torch.is_tensor(result.action) else result.action
                 action_rad = torch.from_numpy(self._lerobot_to_rad(action_np)).float()
 
+            publish_start = time.perf_counter()
             action_msg = self._create_action_msg(action_rad)
             self._action_pub.publish(action_msg)
+            publish_latency_ms = (time.perf_counter() - publish_start) * 1000.0
+            _trace.info(
+                "[action_chunk_publish] request_id=%s chunk_size=%d publish_ms=%.2f shape=%s",
+                request_id,
+                result.chunk_size,
+                publish_latency_ms,
+                _trace_shape(action_rad),
+            )
 
             response = DispatchInfer.Result()
             response.action_chunk = action_msg
@@ -560,18 +602,12 @@ class LeRobotPolicyNode(Node):
             self._inference_count += 1
 
             if self._consecutive_timeouts > 0:
-                self.get_logger().info(
-                    f"Cloud inference connected (after {self._consecutive_timeouts} timeouts)"
-                )
+                self.get_logger().info(f"Cloud inference connected (after {self._consecutive_timeouts} timeouts)")
                 self._consecutive_timeouts = 0
             self._cloud_connected = True
 
             if self._inference_count == 1:
-                mode_tag = (
-                    "distributed"
-                    if self._config.execution_mode == "distributed"
-                    else "monolithic"
-                )
+                mode_tag = "distributed" if self._config.execution_mode == "distributed" else "monolithic"
                 self.get_logger().info(
                     f"✓ First inference complete ({mode_tag}): "
                     f"total={result.total_latency_ms:.1f}ms "
@@ -599,9 +635,7 @@ class LeRobotPolicyNode(Node):
                     f"topic=/preprocessed/batch → /inference/action)"
                 )
             elif self._consecutive_timeouts == 1 and self._cloud_connected:
-                self.get_logger().warn(
-                    "Cloud inference disconnected, waiting for reconnect..."
-                )
+                self.get_logger().warn("Cloud inference disconnected, waiting for reconnect...")
                 self._cloud_connected = False
             else:
                 self.get_logger().debug(f"Cloud timeout #{self._consecutive_timeouts}")
@@ -635,13 +669,31 @@ class LeRobotPolicyNode(Node):
 
             return response
 
-    def _execute_monolithic(self, obs_frame: Dict[str, Any]) -> CoordinatorResult:
+    def _execute_monolithic(
+        self,
+        obs_frame: dict[str, Any],
+        inference_id: str,
+    ) -> CoordinatorResult:
         """Execute inference in monolithic mode (zero-copy)."""
-        return self._coordinator(obs_frame)
+        request_id = inference_id or ""
+        _trace.info(
+            "[inference_begin] request_id=%s model=%s device=%s",
+            request_id,
+            self._policy_type,
+            self._device,
+        )
+        result = self._coordinator(obs_frame)
+        _trace.info(
+            "[inference_end] request_id=%s latency_ms=%.2f shape=%s",
+            request_id,
+            result.total_latency_ms,
+            list(result.action.shape),
+        )
+        return result
 
     def _execute_distributed(
         self,
-        obs_frame: Dict[str, Any],
+        obs_frame: dict[str, Any],
         inference_id: str,
     ) -> CoordinatorResult:
         """
@@ -654,19 +706,28 @@ class LeRobotPolicyNode(Node):
         4. Postprocess locally (edge CPU)
         """
         total_start = time.perf_counter()
+        request_id = inference_id or str(uuid.uuid4())
 
+        _trace.info("[preprocess_begin] request_id=%s", request_id)
         preprocess_start = time.perf_counter()
         batch = self._preprocessor(obs_frame)
         preprocess_latency = (time.perf_counter() - preprocess_start) * 1000.0
-
-        request_id = str(uuid.uuid4())
+        _trace.info(
+            "[preprocess_end] request_id=%s latency_ms=%.2f",
+            request_id,
+            preprocess_latency,
+        )
         batch["task.request_id"] = [request_id]
 
         msg = TensorMsgConverter.to_variant(batch)
 
         event = threading.Event()
         self._pending_requests[request_id] = [event, None]
-
+        _trace.info(
+            "[edge_publish] request_id=%s topic=%s",
+            request_id,
+            self._config.cloud_inference_topic,
+        )
         self._pub_batch.publish(msg)
         self.get_logger().debug(f"Published batch to cloud, request_id={request_id}")
 
@@ -683,11 +744,21 @@ class LeRobotPolicyNode(Node):
         cloud_result = req_data[1]
 
         inference_latency = cloud_result.get("_latency_ms", 0.0)
+        _trace.info(
+            "[edge_receive] request_id=%s latency_ms=%.2f",
+            request_id,
+            inference_latency,
+        )
 
+        _trace.info("[postprocess_begin] request_id=%s", request_id)
         postprocess_start = time.perf_counter()
         action = self._postprocessor(cloud_result["action"])
         postprocess_latency = (time.perf_counter() - postprocess_start) * 1000.0
-
+        _trace.info(
+            "[postprocess_end] request_id=%s latency_ms=%.2f",
+            request_id,
+            postprocess_latency,
+        )
         total_latency = (time.perf_counter() - total_start) * 1000.0
 
         return CoordinatorResult(
@@ -711,35 +782,28 @@ class LeRobotPolicyNode(Node):
             batch = TensorMsgConverter.from_variant(msg, self._device)
 
             req_list = batch.pop("action.request_id", None)
-            request_id = (
-                req_list[0] if req_list and isinstance(req_list, list) else None
-            )
+            request_id = req_list[0] if req_list and isinstance(req_list, list) else None
 
             if request_id is None:
-                self.get_logger().warn(
-                    "Received cloud result without action.request_id"
-                )
+                self.get_logger().warn("Received cloud result without action.request_id")
                 return
 
             if request_id in self._pending_requests:
                 req = self._pending_requests[request_id]
                 req[1] = batch
                 req[0].set()
-                self.get_logger().debug(
-                    f"Cloud result received for request_id={request_id}"
-                )
+                self.get_logger().debug(f"Cloud result received for request_id={request_id}")
             else:
-                self.get_logger().warn(
-                    f"No pending request found for request_id={request_id}"
-                )
+                self.get_logger().warn(f"No pending request found for request_id={request_id}")
 
         except Exception as e:
             self.get_logger().error(f"Error processing cloud result: {e}")
 
     def _create_action_msg(self, action: torch.Tensor) -> VariantsList:
         """Create VariantsList message from action tensor."""
-        from ibrobot_msgs.msg import Variant
         from std_msgs.msg import MultiArrayDimension
+
+        from ibrobot_msgs.msg import Variant
 
         if torch.is_tensor(action):
             action = action.detach().cpu().numpy()
@@ -756,9 +820,7 @@ class LeRobotPolicyNode(Node):
             dim_msg = MultiArrayDimension()
             dim_msg.label = f"dim_{i}"
             dim_msg.size = int(dim)
-            dim_msg.stride = (
-                1 if i == len(action.shape) - 1 else int(np.prod(action.shape[i + 1 :]))
-            )
+            dim_msg.stride = 1 if i == len(action.shape) - 1 else int(np.prod(action.shape[i + 1 :]))
             array_msg.layout.dim.append(dim_msg)
 
         array_msg.data = action.flatten().tolist()
@@ -771,18 +833,14 @@ class LeRobotPolicyNode(Node):
             self._health_status = DiagnosticStatus.OK
         elif time.time() - self._last_inference_time > self._config.frequency * 2:
             self._health_status = DiagnosticStatus.WARN
-            self._error_message = (
-                f"No inference for {time.time() - self._last_inference_time:.1f}s"
-            )
+            self._error_message = f"No inference for {time.time() - self._last_inference_time:.1f}s"
         else:
             self._health_status = DiagnosticStatus.OK
 
         health_msg = DiagnosticStatus()
         health_msg.level = self._health_status
         health_msg.name = self._config.node_name
-        health_msg.message = (
-            self._error_message or f"{self._config.name} operating normally"
-        )
+        health_msg.message = self._error_message or f"{self._config.name} operating normally"
         health_msg.hardware_id = self._config.node_name
         health_msg.values = [
             KeyValue(key="inference_count", value=str(self._inference_count)),
@@ -858,12 +916,8 @@ def main() -> None:
         config["use_header_time"] = temp_node.get_parameter("use_header_time").value
         config["execution_mode"] = temp_node.get_parameter("execution_mode").value
         config["request_timeout"] = temp_node.get_parameter("request_timeout").value
-        config["cloud_inference_topic"] = temp_node.get_parameter(
-            "cloud_inference_topic"
-        ).value
-        config["cloud_result_topic"] = temp_node.get_parameter(
-            "cloud_result_topic"
-        ).value
+        config["cloud_inference_topic"] = temp_node.get_parameter("cloud_inference_topic").value
+        config["cloud_result_topic"] = temp_node.get_parameter("cloud_result_topic").value
         temp_node.destroy_node()
 
         node = LeRobotPolicyNode(config)
