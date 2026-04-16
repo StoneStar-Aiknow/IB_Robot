@@ -5,7 +5,7 @@ upstream:
 
 patch_stack:
   generated_from_submodule_branch: compat/python310
-  reference_submodule_commit: b455fd50b13714f80e25097eaf71a95ae29cc9ad
+  reference_submodule_commit: 62bf71a1c46e1c952c847172998dffb2322fb0ee
   local_branch_name: ibrobot/lerobot-v0.5.1-patched
   application_method: git-am
 
@@ -25,9 +25,18 @@ patches:
       python: ">=3.10"
       libc: [glibc, musl]
       profiles: [core, ros, hardware, dev]
+  - file: 0003-python-compat-typing-unpack.patch
+    purpose:
+      - Replace Python 3.11-only `typing.Unpack` imports with a shared compatibility shim.
+      - Add a conditional `typing-extensions` dependency for Python 3.10 runtimes.
+    applies_to:
+      python: ">=3.10"
+      libc: [glibc, musl]
+      profiles: [core, ros, hardware, dev]
 
 notes:
   - This stack intentionally targets the broadest common Python baseline used by IB_Robot.
   - NumPy >= 2 requirements from upstream lerobot v0.5.1 are not solved by these patches.
+  - Policy inference on Python 3.10 also requires the shared typing compatibility shim introduced in patch 0003.
   - Platform-specific patches for musl/OpenHarmony should be added as new numbered patches instead of forking this stack.
   - The reference_submodule_commit records the current local development result, but repeated git-am application will produce different commit hashes unless committer identity and dates are reproduced exactly.

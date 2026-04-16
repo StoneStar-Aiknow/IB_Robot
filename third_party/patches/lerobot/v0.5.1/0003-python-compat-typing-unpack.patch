@@ -1,0 +1,173 @@
+From 62bf71a1c46e1c952c847172998dffb2322fb0ee Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Thu, 16 Apr 2026 11:36:35 +0800
+Subject: [PATCH] compat: backport typing Unpack for py310
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ pyproject.toml                                     | 1 +
+ src/lerobot/policies/factory.py                    | 3 ++-
+ src/lerobot/policies/pi0/modeling_pi0.py           | 3 ++-
+ src/lerobot/policies/pi05/modeling_pi05.py         | 3 ++-
+ src/lerobot/policies/pi0_fast/modeling_pi0_fast.py | 3 ++-
+ src/lerobot/policies/pretrained.py                 | 3 ++-
+ src/lerobot/policies/smolvla/modeling_smolvla.py   | 3 ++-
+ src/lerobot/utils/typing_compat.py                 | 8 ++++++++
+ 8 files changed, 21 insertions(+), 6 deletions(-)
+ create mode 100644 src/lerobot/utils/typing_compat.py
+
+diff --git a/pyproject.toml b/pyproject.toml
+index 8caa9984..e5d4d3a3 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -69,6 +69,7 @@ dependencies = [
+ 
+     # Core dependencies
+     "numpy>=2.0.0,<2.3.0", # NOTE: Explicitly listing numpy helps the resolver converge faster. Upper bound imposed by opencv-python-headless.
++    "typing-extensions>=4.9.0,<5.0.0; python_version < '3.11'",
+     "setuptools>=71.0.0,<81.0.0",
+     "cmake>=3.29.0.1,<4.2.0",
+     "packaging>=24.2,<26.0",
+diff --git a/src/lerobot/policies/factory.py b/src/lerobot/policies/factory.py
+index 501dd7af..3c5fa26f 100644
+--- a/src/lerobot/policies/factory.py
++++ b/src/lerobot/policies/factory.py
+@@ -18,7 +18,7 @@ from __future__ import annotations
+ 
+ import importlib
+ import logging
+-from typing import Any, TypedDict, Unpack
++from typing import Any, TypedDict
+ 
+ import torch
+ 
+@@ -57,6 +57,7 @@ from lerobot.utils.constants import (
+     POLICY_POSTPROCESSOR_DEFAULT_NAME,
+     POLICY_PREPROCESSOR_DEFAULT_NAME,
+ )
++from lerobot.utils.typing_compat import Unpack
+ 
+ 
+ def _reconnect_relative_absolute_steps(
+diff --git a/src/lerobot/policies/pi0/modeling_pi0.py b/src/lerobot/policies/pi0/modeling_pi0.py
+index aebf3296..869fb81a 100644
+--- a/src/lerobot/policies/pi0/modeling_pi0.py
++++ b/src/lerobot/policies/pi0/modeling_pi0.py
+@@ -20,7 +20,7 @@ import logging
+ import math
+ from collections import deque
+ from pathlib import Path
+-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
++from typing import TYPE_CHECKING, Literal, TypedDict
+ 
+ import torch
+ import torch.nn.functional as F  # noqa: N812
+@@ -59,6 +59,7 @@ from lerobot.utils.constants import (
+     OBS_STATE,
+     OPENPI_ATTENTION_MASK_VALUE,
+ )
++from lerobot.utils.typing_compat import Unpack
+ 
+ 
+ class ActionSelectKwargs(TypedDict, total=False):
+diff --git a/src/lerobot/policies/pi05/modeling_pi05.py b/src/lerobot/policies/pi05/modeling_pi05.py
+index 96c4002f..e0f96ccc 100644
+--- a/src/lerobot/policies/pi05/modeling_pi05.py
++++ b/src/lerobot/policies/pi05/modeling_pi05.py
+@@ -20,7 +20,7 @@ import logging
+ import math
+ from collections import deque
+ from pathlib import Path
+-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
++from typing import TYPE_CHECKING, Literal, TypedDict
+ 
+ import torch
+ import torch.nn.functional as F  # noqa: N812
+@@ -56,6 +56,7 @@ from lerobot.utils.constants import (
+     OBS_LANGUAGE_TOKENS,
+     OPENPI_ATTENTION_MASK_VALUE,
+ )
++from lerobot.utils.typing_compat import Unpack
+ 
+ 
+ class ActionSelectKwargs(TypedDict, total=False):
+diff --git a/src/lerobot/policies/pi0_fast/modeling_pi0_fast.py b/src/lerobot/policies/pi0_fast/modeling_pi0_fast.py
+index 1bcf9794..bbe8ffe7 100644
+--- a/src/lerobot/policies/pi0_fast/modeling_pi0_fast.py
++++ b/src/lerobot/policies/pi0_fast/modeling_pi0_fast.py
+@@ -19,7 +19,7 @@ import logging
+ import math
+ from collections import deque
+ from pathlib import Path
+-from typing import TYPE_CHECKING, Literal, TypedDict, Unpack
++from typing import TYPE_CHECKING, Literal, TypedDict
+ 
+ import numpy as np
+ import torch
+@@ -60,6 +60,7 @@ from lerobot.utils.constants import (
+     OBS_LANGUAGE_TOKENS,
+     OPENPI_ATTENTION_MASK_VALUE,
+ )
++from lerobot.utils.typing_compat import Unpack
+ 
+ 
+ class ActionSelectKwargs(TypedDict, total=False):
+diff --git a/src/lerobot/policies/pretrained.py b/src/lerobot/policies/pretrained.py
+index 70efeba6..7827ec89 100644
+--- a/src/lerobot/policies/pretrained.py
++++ b/src/lerobot/policies/pretrained.py
+@@ -19,7 +19,7 @@ import os
+ from importlib.resources import files
+ from pathlib import Path
+ from tempfile import TemporaryDirectory
+-from typing import TypedDict, TypeVar, Unpack
++from typing import TypedDict, TypeVar
+ 
+ import packaging
+ import safetensors
+@@ -33,6 +33,7 @@ from lerobot.configs.policies import PreTrainedConfig
+ from lerobot.configs.train import TrainPipelineConfig
+ from lerobot.policies.utils import log_model_loading_keys
+ from lerobot.utils.hub import HubMixin
++from lerobot.utils.typing_compat import Unpack
+ 
+ T = TypeVar("T", bound="PreTrainedPolicy")
+ 
+diff --git a/src/lerobot/policies/smolvla/modeling_smolvla.py b/src/lerobot/policies/smolvla/modeling_smolvla.py
+index 7110ba7d..440828f4 100644
+--- a/src/lerobot/policies/smolvla/modeling_smolvla.py
++++ b/src/lerobot/policies/smolvla/modeling_smolvla.py
+@@ -54,7 +54,7 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
+ 
+ import math
+ from collections import deque
+-from typing import TypedDict, Unpack
++from typing import TypedDict
+ 
+ import torch
+ import torch.nn.functional as F  # noqa: N812
+@@ -69,6 +69,7 @@ from lerobot.policies.utils import (
+ )
+ from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+ from lerobot.utils.device_utils import get_safe_dtype
++from lerobot.utils.typing_compat import Unpack
+ 
+ 
+ class ActionSelectKwargs(TypedDict, total=False):
+diff --git a/src/lerobot/utils/typing_compat.py b/src/lerobot/utils/typing_compat.py
+new file mode 100644
+index 00000000..e02ffcb0
+--- /dev/null
++++ b/src/lerobot/utils/typing_compat.py
+@@ -0,0 +1,8 @@
++from __future__ import annotations
++
++try:
++    from typing import Unpack
++except ImportError:
++    from typing_extensions import Unpack
++
++__all__ = ["Unpack"]
+-- 
+2.34.1
+

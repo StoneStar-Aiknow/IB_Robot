@@ -34,6 +34,27 @@ ensure_lerobot_patch_stack_applied() {
             log_info "Switching libs/lerobot to existing patched branch ${branch_name}..."
             git -C "${submodule_dir}" checkout "${branch_name}" >/dev/null
         fi
+
+        local expected_patch_count
+        local applied_patch_count
+        expected_patch_count="$(grep -cv '^[[:space:]]*$' "${series_file}")"
+        applied_patch_count="$(git -C "${submodule_dir}" rev-list --count "${base_commit}..HEAD")"
+
+        if [[ "${applied_patch_count}" -ge "${expected_patch_count}" ]]; then
+            return 0
+        fi
+
+        if ! git -C "${submodule_dir}" diff --quiet || ! git -C "${submodule_dir}" diff --cached --quiet; then
+            log_error "libs/lerobot has local changes; refusing to update the IB_Robot patch stack automatically."
+            exit 1
+        fi
+
+        log_info "Applying ${expected_patch_count}-${applied_patch_count} new LeRobot compatibility patch(es) on ${branch_name}..."
+        tail -n +"$((applied_patch_count + 1))" "${series_file}" | while IFS= read -r patch_file; do
+            [[ -z "${patch_file}" ]] && continue
+            git -C "${submodule_dir}" am "${patch_dir}/${patch_file}" >/dev/null
+        done
+        log_done "LeRobot patch stack updated"
         return 0
     fi
 
