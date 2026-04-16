@@ -37,6 +37,9 @@ Usage:
     # Teleop mode with episodic recording (episode-by-episode)
     ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=teleop record:=true record_mode:=episodic
 
+    # Episodic recording with Rerun live visualization (cameras, joints, actions)
+    ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=teleop record:=true record_mode:=episodic record_visualizer:=rerun
+
     # MoveIt planning mode (auto-detected, with RViz)
     ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=moveit_planning use_sim:=true
 
@@ -76,6 +79,7 @@ Launch Arguments:
     moveit_display: Launch RViz for MoveIt visualization (default: true, only used if MoveIt is enabled)
     record: Enable automatic rosbag recording (default: false, auto-discovers topics from config)
     record_mode: Recording mode - 'continuous' (default, all-in-one bag) or 'episodic' (triggered episode-by-episode, requires manual record_cli in separate terminal)
+    record_visualizer: Recording visualizer - 'none' (default) or 'rerun' (launch a Rerun sidecar for live cameras, joints, and action curves)
 """
 
 import os
@@ -103,7 +107,7 @@ from robot_config.launch_builders.perception import generate_camera_nodes, gener
 from robot_config.launch_builders.sim_backend import get_sim_backend
 from robot_config.launch_builders.execution import generate_execution_nodes
 from robot_config.launch_builders.teleop import generate_teleop_nodes
-from robot_config.launch_builders.recording import generate_recording_nodes
+from robot_config.launch_builders.recording import generate_recording_nodes, generate_rerun_viewer_node
 from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
 
 logger = get_colored_logger("robot_config.launch")
@@ -514,6 +518,20 @@ def launch_setup(context, *args, **kwargs):
         logger.error(f"setting up recording: {e}")
         logger.info(f"Continuing without recording...")
 
+    # ========== 12. Recording Visualizer (optional rerun sidecar) ==========
+    try:
+        record_viz = context.launch_configurations.get('record_visualizer', 'none').lower()
+        if record_viz == 'rerun':
+            logger.info("========== Setting up Rerun Visualizer ==========")
+            rerun_nodes = generate_rerun_viewer_node(robot_config)
+            actions.extend(rerun_nodes)
+            logger.info(f"Added {len(rerun_nodes)} rerun viewer node(s)")
+        elif record_viz != 'none':
+            logger.warning(f"Unknown record_visualizer value: '{record_viz}' (expected 'rerun' or 'none')")
+    except Exception as e:
+        logger.error(f"setting up rerun visualizer: {e}")
+        logger.info(f"Continuing without recording visualizer...")
+
     if controller_dependent_actions:
         if controller_ready_waiter is not None:
             logger.info(
@@ -602,6 +620,11 @@ def generate_launch_description():
             "record_mode",
             default_value="continuous",
             description="Recording mode: 'continuous' (all-in-one bag) or 'episodic' (triggered episode-by-episode via episode_recorder)",
+        ),
+        DeclareLaunchArgument(
+            "record_visualizer",
+            default_value="none",
+            description="Recording visualizer: 'rerun' (launch Rerun sidecar for live cameras/joints/actions) or 'none' (no visualizer)",
         ),
         OpaqueFunction(function=launch_setup),
     ])

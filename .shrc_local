@@ -16,27 +16,30 @@ if [ -f "venv/bin/activate" ]; then
     source venv/bin/activate
 fi
 
-# 4. 设置 PYTHONPATH
+# 4. 禁用用户 site-packages，避免 ~/.local 与 workspace venv 混装
+export PYTHONNOUSERSITE=1
+
+# 5. 设置 PYTHONPATH
 # 确保优先使用 venv 和 libs 中的源码，使用绝对路径以支持跨目录调用
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-${(%):-%x}}")" && pwd)"
 PYTHON_VER="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
 export PYTHONPATH="${WORKSPACE_DIR}/libs/lerobot/src:${WORKSPACE_DIR}/libs/atomgit_sdk/src:${WORKSPACE_DIR}/venv/lib/${PYTHON_VER}/site-packages:${PYTHONPATH}"
 
-# 5. 日志与调试增强
+# 6. 日志与调试增强
 export RCUTILS_COLORIZED_OUTPUT=1
 export PYTHONUNBUFFERED=1
 
-# 6. 加载本地编译后的包 (如果已编译)
+# 7. 加载本地编译后的包 (如果已编译)
 if [ -f "${WORKSPACE_DIR}/install/setup.sh" ]; then
     source "${WORKSPACE_DIR}/install/setup.sh"
 fi
 
-# 7. 别名设置
-alias cb='colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release'
-alias cbp='colcon build --symlink-install --packages-select'
+# 8. 别名设置
+alias cb='python3 -m colcon build --symlink-install --merge-install --cmake-args -DCMAKE_BUILD_TYPE=Release'
+alias cbp='python3 -m colcon build --symlink-install --merge-install --packages-select'
 alias src='source install/setup.sh'
 
-# 8. 欢迎信息 (跨 Shell 颜色处理)
+# 9. 欢迎信息 (跨 Shell 颜色处理)
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'

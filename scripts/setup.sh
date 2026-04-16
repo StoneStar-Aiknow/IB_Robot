@@ -787,6 +787,12 @@ setup_python_venv() {
     log_info "Installing training visualization dependencies (tensorboard)..."
     python3 -m pip install tensorboard --quiet
 
+    # 安装录制可视化依赖
+    log_info "Installing recording visualization dependency (rerun-sdk)..."
+    python3 -m pip install "rerun-sdk>=0.24,<0.27" --quiet
+    log_info "Installing rerun compatibility dependency (typing-extensions>=4.12)..."
+    python3 -m pip install "typing-extensions>=4.12" --quiet
+
     # 安装 ONNX 导出相关依赖
     if is_openeuler; then
         log_info "Installing ONNX export dependencies (onnx, onnxruntime); skipping onnxsim on openEuler..."

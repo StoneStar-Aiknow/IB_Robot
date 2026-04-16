@@ -28,6 +28,7 @@ setup(
             'bag_to_lerobot = dataset_tools.bag_to_lerobot:main',
             'record_cli = dataset_tools.record_cli:main',
             'frame_detector = dataset_tools.frame_detector:main',
+            'rerun_viewer = dataset_tools.rerun_viewer:main',
         ],
     },
 )

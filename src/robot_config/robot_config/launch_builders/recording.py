@@ -214,6 +214,42 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
     return [episode_recorder_node]
 
 
+def generate_rerun_viewer_node(robot_config: dict) -> List[Node]:
+    """Generate a Rerun visualization sidecar node for recording observation.
+
+    The node loads the same contract as ``episode_recorder`` and subscribes to
+    all observation/action topics, forwarding data to a Rerun viewer in
+    real-time.  It is a **pure observer** — it never writes to the bag.
+
+    Args:
+        robot_config: Robot configuration dictionary loaded from YAML.
+                      Must contain ``_config_path`` (set by the launch system).
+
+    Returns:
+        List containing a single Node action, or empty if config path is missing.
+    """
+    robot_config_path = robot_config.get('_config_path', '')
+    if not robot_config_path:
+        logger.error(
+            "robot_config dict is missing '_config_path'. "
+            "Cannot launch rerun_viewer without it."
+        )
+        return []
+
+    rerun_node = Node(
+        package='dataset_tools',
+        executable='rerun_viewer',
+        name='rerun_viewer',
+        output='screen',
+        parameters=[
+            {'robot_config_path': robot_config_path},
+        ],
+    )
+
+    logger.info("✓ Rerun viewer node created (sidecar)")
+    return [rerun_node]
+
+
 def find_workspace_root() -> str:
     """
     Find IB_Robot workspace root directory.

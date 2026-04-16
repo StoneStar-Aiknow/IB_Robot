@@ -140,6 +140,8 @@ setup_venv() {
         if [[ -n "${venv}" && -f "${venv}/bin/activate" ]]; then
             source "${venv}/bin/activate"
             export PATH="${venv}/bin:$PATH"
+            export COLCON_PYTHON_EXECUTABLE="${venv}/bin/python3"
+            export PYTHONNOUSERSITE=1
             return 0
         fi
     done
@@ -209,7 +211,7 @@ echo "════════════════════════�
 EVENT_HANDLERS="status- summary-"
 ${VERBOSE} && EVENT_HANDLERS="console_cohesion+"
 
-colcon build \
+python3 -m colcon build \
     --continue-on-error \
     --parallel-workers "$(nproc)" \
     --merge-install \
