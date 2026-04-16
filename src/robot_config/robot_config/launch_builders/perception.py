@@ -62,6 +62,7 @@ def generate_camera_nodes(robot_config, use_sim=False):
                 "image_width": periph.get("width", 640),
                 "image_height": periph.get("height", 480),
                 "pixel_format": periph.get("pixel_format", "mjpeg"),
+                "brightness": periph.get("brightness", 0),
                 "camera_frame_id": periph.get("frame_id", f"camera_{name}_frame"),
                 "video_device": video_device,
             }
@@ -70,7 +71,7 @@ def generate_camera_nodes(robot_config, use_sim=False):
                 params["camera_info_url"] = periph["camera_info_url"]
 
             # Optional parameters
-            for key in ["brightness", "contrast", "saturation", "sharpness"]:
+            for key in ["contrast", "saturation", "sharpness"]:
                 if key in periph:
                     params[key] = periph[key]
 
