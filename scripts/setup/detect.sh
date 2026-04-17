@@ -16,6 +16,99 @@ detect_libc() {
     echo "glibc"
 }
 
+format_kib_as_gb() {
+    local kib="${1:-0}"
+    awk -v kib="${kib}" 'BEGIN {
+        if (kib <= 0) {
+            print "unknown"
+            exit
+        }
+        printf "%.0f GB", kib / 1024 / 1024
+    }'
+}
+
+detect_gpu_summary() {
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local gpu_name cuda_version
+        gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1)"
+        cuda_version="$(nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: \([0-9.]\+\).*/\1/p' | head -n1)"
+
+        if [[ -n "${gpu_name}" ]]; then
+            if [[ -n "${cuda_version}" ]]; then
+                echo "${gpu_name} (CUDA ${cuda_version})"
+            else
+                echo "${gpu_name}"
+            fi
+            return 0
+        fi
+    fi
+
+    if command -v lspci >/dev/null 2>&1; then
+        local gpu_name
+        gpu_name="$(lspci | awk -F': ' '/VGA compatible controller|3D controller/{print $2; exit}')"
+        if [[ -n "${gpu_name}" ]]; then
+            echo "${gpu_name}"
+            return 0
+        fi
+    fi
+
+    echo "not detected"
+}
+
+detect_ram_summary() {
+    if [[ -r /proc/meminfo ]]; then
+        local total_kib
+        total_kib="$(awk '/MemTotal/{print $2; exit}' /proc/meminfo)"
+        format_kib_as_gb "${total_kib}"
+        return 0
+    fi
+
+    echo "unknown"
+}
+
+detect_disk_free_summary() {
+    local free_kib
+    free_kib="$(df -Pk "${WORKSPACE}" 2>/dev/null | awk 'NR==2 {print $4}')"
+
+    if [[ -n "${free_kib}" ]]; then
+        echo "$(format_kib_as_gb "${free_kib}") free"
+        return 0
+    fi
+
+    echo "unknown"
+}
+
+detect_ros_summary() {
+    if [[ -n "${SETUP_ROS_SETUP_PATH}" && -f "${SETUP_ROS_SETUP_PATH}" ]]; then
+        local ros_distro=""
+
+        ros_distro="$(
+            bash -lc '
+                source "$1" >/dev/null 2>&1
+                printf "%s" "${ROS_DISTRO:-}"
+            ' _ "${SETUP_ROS_SETUP_PATH}" 2>/dev/null
+        )"
+
+        if [[ -z "${ros_distro}" ]] && [[ "${SETUP_ROS_SETUP_PATH}" =~ /opt/ros/([^/]+)/ ]]; then
+            ros_distro="${BASH_REMATCH[1]}"
+        fi
+
+        if [[ -n "${ros_distro}" ]]; then
+            echo "${ros_distro}"
+        else
+            echo "installed"
+        fi
+        return 0
+    fi
+
+    if [[ "${SETUP_PLATFORM_ID}" == "openharmony-5.1.0-musl" ]]; then
+        echo "not configured"
+        return 0
+    fi
+
+    echo "not installed"
+}
+
 detect_host_metadata() {
     SETUP_ARCH="$(uname -m)"
     SETUP_KERNEL="$(uname -sr)"
@@ -37,6 +130,10 @@ detect_host_metadata() {
     elif command -v dnf >/dev/null 2>&1; then
         SETUP_PACKAGE_MANAGER="dnf"
     fi
+
+    SETUP_GPU_SUMMARY="$(detect_gpu_summary)"
+    SETUP_RAM_SUMMARY="$(detect_ram_summary)"
+    SETUP_DISK_FREE_SUMMARY="$(detect_disk_free_summary)"
 }
 
 detect_platform_id() {
@@ -137,20 +234,36 @@ detect_python_runtimes() {
 
     SETUP_BOOTSTRAP_PYTHON_VERSION="$(python_version_of "${SETUP_BOOTSTRAP_PYTHON_BIN}" || true)"
     SETUP_ROS_SETUP_PATH="$(platform_ros_setup_path)"
+    SETUP_ROS_SUMMARY="$(detect_ros_summary)"
 }
 
 print_platform_summary() {
-    echo ""
-    echo -e "${YELLOW}--- Platform Detection ---${NC}"
-    log_info "Platform: ${SETUP_PLATFORM_ID}"
-    log_info "OS: ${SETUP_OS_PRETTY_NAME} (${SETUP_ARCH})"
-    log_info "Kernel: ${SETUP_KERNEL}"
-    log_info "libc: ${SETUP_LIBC}"
-    log_info "Package manager: ${SETUP_PACKAGE_MANAGER}"
-    log_info "Shell python: ${SETUP_SHELL_PYTHON_BIN:-not found} ${SETUP_SHELL_PYTHON_VERSION:+(${SETUP_SHELL_PYTHON_VERSION})}"
-    log_info "Bootstrap python: ${SETUP_BOOTSTRAP_PYTHON_BIN:-not found} ${SETUP_BOOTSTRAP_PYTHON_VERSION:+(${SETUP_BOOTSTRAP_PYTHON_VERSION})}"
-    log_info "ROS setup: ${SETUP_ROS_SETUP_PATH:-not configured}"
-    log_info "Workspace: ${WORKSPACE}"
+    local python_summary="${SETUP_BOOTSTRAP_PYTHON_VERSION:-not found}"
+    local summary_block=""
+
+    if [[ -n "${SETUP_SHELL_PYTHON_VERSION}" && -n "${SETUP_BOOTSTRAP_PYTHON_VERSION}" && "${SETUP_SHELL_PYTHON_VERSION}" != "${SETUP_BOOTSTRAP_PYTHON_VERSION}" ]]; then
+        python_summary="${SETUP_BOOTSTRAP_PYTHON_VERSION} (shell: ${SETUP_SHELL_PYTHON_VERSION})"
+    fi
+
+    summary_block="$(printf "OS:       %s\nPython:   %s\nGPU:      %s\nROS:      %s\nRAM:      %s\nDisk:     %s" \
+        "${SETUP_OS_PRETTY_NAME} (${SETUP_ARCH})" \
+        "${python_summary}" \
+        "${SETUP_GPU_SUMMARY}" \
+        "${SETUP_ROS_SUMMARY}" \
+        "${SETUP_RAM_SUMMARY}" \
+        "${SETUP_DISK_FREE_SUMMARY}")"
+
+    ui_render_block "${summary_block}"
+
+    if [[ "${SETUP_PACKAGE_MANAGER}" != "unknown" ]]; then
+        if [[ "${USE_GUM}" == true ]]; then
+            "${GUM_BIN}" style --foreground 42 "✓ will use ${SETUP_PACKAGE_MANAGER} system package manager"
+        else
+            echo -e "${GREEN}✓${NC} will use ${SETUP_PACKAGE_MANAGER} system package manager"
+        fi
+    else
+        log_warn "No supported system package manager detected; system dependencies may need manual provisioning."
+    fi
 
     if [[ -n "${SETUP_ACTIVE_VENV}" ]]; then
         log_warn "Active virtualenv detected: ${SETUP_ACTIVE_VENV}"
