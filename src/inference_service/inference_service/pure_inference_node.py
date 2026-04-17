@@ -27,7 +27,10 @@ from rclpy.node import Node
 
 from tensormsg.converter import TensorMsgConverter
 from ibrobot_msgs.msg import VariantsList
-from inference_service.core.pure_inference_engine import PureInferenceEngine, resolve_device
+from inference_service.core.pure_inference_engine import (
+    PureInferenceEngine,
+    resolve_device,
+)
 
 
 class PureInferenceNode(Node):
@@ -56,9 +59,13 @@ class PureInferenceNode(Node):
         self._input_topic = input_topic
         self._output_topic = output_topic
 
-        self.get_logger().info(f"Loading policy from {policy_path} on device {device}...")
+        self.get_logger().info(
+            f"Loading policy from {policy_path} on device {device}..."
+        )
         self._engine = PureInferenceEngine(policy_path=policy_path, device=device)
-        self.get_logger().info(f"Engine loaded: {self._engine.policy_type}, chunk_size={self._engine.chunk_size}")
+        self.get_logger().info(
+            f"Engine loaded: {self._engine.policy_type}, chunk_size={self._engine.chunk_size}"
+        )
 
         self._sub = self.create_subscription(
             VariantsList,
@@ -90,7 +97,9 @@ class PureInferenceNode(Node):
             batch = TensorMsgConverter.from_variant(msg, self._engine._device)
 
             req_list = batch.pop("task.request_id", None)
-            request_id = req_list[0] if req_list and isinstance(req_list, list) else None
+            request_id = (
+                req_list[0] if req_list and isinstance(req_list, list) else None
+            )
 
             result = self._engine(batch)
 
@@ -129,6 +138,7 @@ class PureInferenceNode(Node):
         except Exception as e:
             self.get_logger().error(f"Inference failed: {e}")
             import traceback
+
             self.get_logger().error(traceback.format_exc())
 
 
@@ -142,7 +152,7 @@ def main():
     temp.declare_parameter("input_topic", "/preprocessed/batch")
     temp.declare_parameter("output_topic", "/inference/action")
     temp.declare_parameter("device", "auto")
-    
+
     if not temp.has_parameter("use_sim_time"):
         temp.declare_parameter("use_sim_time", False)
 
@@ -170,7 +180,9 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        rclpy.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
