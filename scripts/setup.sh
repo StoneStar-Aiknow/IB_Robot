@@ -584,6 +584,13 @@ setup_python_venv() {
     log_info "Installing gitlint..."
     python3 -m pip install gitlint --quiet
 
+    # 安装 ruff (代码规范) 和 pre-commit hook
+    log_info "Installing ruff and pre-commit..."
+    python3 -m pip install ruff pre-commit --quiet
+    if [[ -f "${WORKSPACE}/.pre-commit-config.yaml" ]]; then
+        pre-commit install
+    fi
+
     # 核心修复：所有依赖安装完毕后，强制固定 NumPy 1.26.4 以兼容 ROS 2 系统组件
     # 必须放在最后，防止 lerobot/scipy 等依赖将 numpy 升级到 2.x
     log_info "Pinning NumPy to 1.26.4 for ROS 2 compatibility..."
