@@ -51,6 +51,10 @@ log_error()   { echo -e "${RED}[ERROR]${NC} $*"; }
 log_done()    { SUMMARY+=("${GREEN}✓${NC} $*"); }
 log_skipped() { SUMMARY+=("${YELLOW}⊘${NC} $* (skipped by --yes)"); }
 
+is_openeuler() {
+    uname -r | grep -qi "openeuler" || grep -qi "openeuler" /etc/os-release 2>/dev/null
+}
+
 # ask_yn <prompt> <default>
 # default: "y" = yes by default (Y/n), "n" = no by default (y/N)
 # Returns 0 if confirmed, 1 if declined.
@@ -312,7 +316,7 @@ ensure_colcon() {
 }
 
 check_openeuler() {
-    if uname -r | grep -qi "openeuler" || grep -qi "openeuler" /etc/os-release 2>/dev/null; then
+    if is_openeuler; then
         log_warn "openEuler detected. Setting ROS_OS_OVERRIDE=rhel:8 for rosdep compatibility."
         export ROS_OS_OVERRIDE=rhel:8
 
@@ -320,6 +324,7 @@ check_openeuler() {
             local arch
             arch=$(uname -m)
             log_info "Adding openEuler repo for ${arch}..."
+            run_sudo dnf install -y dnf-plugins-core
             run_sudo dnf config-manager --add-repo "https://repo.openeuler.org/openEuler-24.03-LTS/OS/${arch}"
             run_sudo dnf clean all && run_sudo dnf makecache
         else
@@ -369,7 +374,7 @@ ensure_rosdepc() {
         local init_output=""
         local init_exit=0
         
-        init_output=$(run_sudo -E env PATH="${PATH}" "$(command -v rosdepc)" init 2>&1) || init_exit=$?
+        init_output=$(run_sudo env PATH="${PATH}" "$(command -v rosdepc)" init 2>&1) || init_exit=$?
 
         # Check both exit code and output for SSL/network errors
         if [[ ${init_exit} -ne 0 ]] || echo "${init_output}" | grep -qi "error\|failed\|certificate\|urlopen"; then
@@ -577,8 +582,13 @@ setup_python_venv() {
     python3 -m pip install tensorboard --quiet
 
     # 安装 ONNX 导出相关依赖
-    log_info "Installing ONNX export dependencies (onnx, onnxsim, onnxruntime)..."
-    python3 -m pip install onnx onnxsim onnxruntime --quiet
+    if is_openeuler; then
+        log_info "Installing ONNX export dependencies (onnx, onnxruntime); skipping onnxsim on openEuler..."
+        python3 -m pip install onnx onnxruntime --quiet
+    else
+        log_info "Installing ONNX export dependencies (onnx, onnxsim, onnxruntime)..."
+        python3 -m pip install onnx onnxsim onnxruntime --quiet
+    fi
 
     # 安装 gitlint 并设置 git hook
     log_info "Installing gitlint..."
