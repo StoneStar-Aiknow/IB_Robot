@@ -1,14 +1,21 @@
 """Tests for robot_config package."""
 
-import pytest
 from pathlib import Path
+
+import pytest
+
 from robot_config.config import (
-    RobotConfig,
-    Ros2ControlConfig,
     CameraConfig,
     ContractExtensionConfig,
+    RobotConfig,
+    Ros2ControlConfig,
 )
-from robot_config.loader import load_robot_config, validate_config
+from robot_config.loader import (
+    build_contract_from_robot_config_dict,
+    load_robot_config,
+    load_robot_config_dict,
+    validate_config,
+)
 
 
 def test_load_single_arm_config():
@@ -39,6 +46,166 @@ def test_load_single_arm_config():
     wrist_cam = config.get_camera("wrist")
     assert wrist_cam is not None
     assert wrist_cam.fps == 60  # Higher FPS for wrist camera
+
+
+def test_load_single_arm_config_dict_preserves_launch_schema():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+
+    if not config_path.exists():
+        pytest.skip(f"Config file not found: {config_path}")
+
+    config = load_robot_config_dict(config_path)
+
+    assert config["name"] == "so101_single_arm"
+    assert "models" in config
+    assert "control_modes" in config
+    assert "joints" in config
+    assert "simulation" in config
+    assert config["_config_path"] == str(config_path.resolve())
+
+
+def test_dict_contract_builder_matches_typed_contract_shape():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+
+    if not config_path.exists():
+        pytest.skip(f"Config file not found: {config_path}")
+
+    typed_config = load_robot_config(config_path)
+    dict_config = load_robot_config_dict(config_path)
+
+    typed_contract = typed_config.to_contract()
+    dict_contract = build_contract_from_robot_config_dict(dict_config)
+
+    assert dict_contract.name == typed_contract.name
+    assert dict_contract.robot_type == typed_contract.robot_type
+    assert len(dict_contract.observations) == len(typed_contract.observations)
+    assert len(dict_contract.actions) == len(typed_contract.actions)
+    assert [obs.key for obs in dict_contract.observations] == [obs.key for obs in typed_contract.observations]
+    assert [act.key for act in dict_contract.actions] == [act.key for act in typed_contract.actions]
+    assert dict_contract.tasks == typed_contract.tasks
+
+
+def test_dict_contract_builder_uses_camera_defaults_for_missing_resize():
+    contract = build_contract_from_robot_config_dict(
+        {
+            "name": "test_robot",
+            "robot_type": "so_101",
+            "peripherals": [
+                {
+                    "type": "camera",
+                    "name": "top",
+                    "height": 0,
+                    "width": None,
+                }
+            ],
+            "contract": {
+                "observations": [
+                    {
+                        "key": "observation.images.top",
+                        "topic": "/camera/top/image_raw",
+                        "peripheral": "top",
+                    }
+                ]
+            },
+        }
+    )
+
+    assert contract.observations[0].image == {
+        "resize": [480, 640],
+        "encoding": "bgr8",
+    }
+
+
+def test_dict_contract_builder_warns_when_camera_lookup_fails(capsys):
+    contract = build_contract_from_robot_config_dict(
+        {
+            "name": "test_robot",
+            "robot_type": "so_101",
+            "peripherals": [],
+            "contract": {
+                "observations": [
+                    {
+                        "key": "observation.images.top",
+                        "topic": "/camera/top/image_raw",
+                        "peripheral": "missing_camera",
+                    }
+                ]
+            },
+        }
+    )
+    stderr = capsys.readouterr().err
+
+    assert contract.observations[0].type == "sensor_msgs/msg/Image"
+    assert contract.observations[0].image is None
+    assert "Observation 'observation.images.top' references peripheral 'missing_camera' but no camera found" in stderr
+
+
+def test_dict_contract_builder_ignores_tasks_to_match_typed_contract():
+    contract = build_contract_from_robot_config_dict(
+        {
+            "name": "test_robot",
+            "robot_type": "so_101",
+            "contract": {
+                "tasks": [
+                    {
+                        "key": "task.command",
+                        "topic": "/task",
+                        "type": "std_msgs/msg/String",
+                    }
+                ]
+            },
+        }
+    )
+
+    assert contract.tasks == []
+
+
+def test_dict_contract_builder_requires_topic_without_peripheral():
+    with pytest.raises(
+        ValueError,
+        match="Observation 'observation.state' must specify a topic when no peripheral is set",
+    ):
+        build_contract_from_robot_config_dict(
+            {
+                "name": "test_robot",
+                "robot_type": "so_101",
+                "contract": {
+                    "observations": [
+                        {
+                            "key": "observation.state",
+                        }
+                    ]
+                },
+            }
+        )
+
+
+def test_dict_contract_builder_allows_empty_topic_for_peripheral_observation():
+    contract = build_contract_from_robot_config_dict(
+        {
+            "name": "test_robot",
+            "robot_type": "so_101",
+            "peripherals": [
+                {
+                    "type": "camera",
+                    "name": "top",
+                    "height": 480,
+                    "width": 640,
+                }
+            ],
+            "contract": {
+                "observations": [
+                    {
+                        "key": "observation.images.top",
+                        "peripheral": "top",
+                    }
+                ]
+            },
+        }
+    )
+
+    assert contract.observations[0].topic == ""
+    assert contract.observations[0].type == "sensor_msgs/msg/Image"
 
 
 def test_validate_valid_config():
@@ -185,7 +352,6 @@ def test_get_all_cameras():
     assert len(cameras) == 2
     assert cameras[0].name == "cam1"
     assert cameras[1].name == "cam2"
-
 
 
 def test_validate_voice_asr_requires_model_path_when_enabled():

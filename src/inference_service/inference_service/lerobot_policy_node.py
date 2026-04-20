@@ -65,7 +65,12 @@ from robot_config.contract_utils import (
     decode_value,
     stamp_from_header_ns,
 )
-from robot_config.utils import build_joint_conversion_table
+from robot_config.utils import (
+    build_joint_conversion_table,
+    resolve_calibration_path_from_config,
+    resolve_gripper_joints_from_config,
+    resolve_joint_names_from_config,
+)
 
 from inference_service.core import (
     InferenceCoordinator,
@@ -224,15 +229,18 @@ class LeRobotPolicyNode(Node):
         if not p.exists():
             raise RuntimeError(f"Robot config file not found: {robot_config_path}")
 
-        from robot_config.loader import load_robot_config
+        from robot_config.loader import (
+            load_robot_config_dict,
+            build_contract_from_robot_config_dict,
+        )
 
-        robot_cfg = load_robot_config(robot_config_path)
-        self._contract = robot_cfg.to_contract()
+        robot_cfg = load_robot_config_dict(robot_config_path)
+        self._contract = build_contract_from_robot_config_dict(robot_cfg)
 
         # Build joint conversion table from calibration file
-        calib_file = robot_cfg.ros2_control.params.get("calib_file", "")
-        joint_names = robot_cfg.ros2_control.params.get("joint_names", [])
-        gripper_joints = robot_cfg.ros2_control.params.get("gripper_joints", ["6"])
+        calib_file = resolve_calibration_path_from_config(robot_cfg)
+        joint_names = resolve_joint_names_from_config(robot_cfg)
+        gripper_joints = resolve_gripper_joints_from_config(robot_cfg) or ["6"]
         norm_mode = self._config.lerobot_norm_mode
         if calib_file and joint_names:
             self._joint_rad_limits = build_joint_conversion_table(

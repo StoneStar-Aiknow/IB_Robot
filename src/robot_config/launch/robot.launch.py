@@ -82,8 +82,6 @@ Launch Arguments:
     record_visualizer: Recording visualizer - 'none' (default) or 'rerun' (launch a Rerun sidecar for live cameras, joints, and action curves)
 """
 
-import os
-import yaml
 from pathlib import Path
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -98,7 +96,8 @@ from launch.events import Shutdown
 from launch_ros.actions import Node
 
 # Import utility functions
-from robot_config.utils import resolve_ros_path, parse_bool
+from robot_config.loader import load_robot_config_dict
+from robot_config.utils import parse_bool
 from robot_config.logger_utils import get_colored_logger
 
 # Import node generators from launch_builders modules
@@ -138,11 +137,7 @@ def load_robot_config(robot_config_name, config_path_override=None):
     logger.info(f"Loading config from: {config_path}")
     logger.info(f"Config exists: {config_path.exists()}")
 
-    # Load YAML
-    with open(config_path, "r") as f:
-        data = yaml.safe_load(f)
-
-    robot_config = data.get("robot", {})
+    robot_config = load_robot_config_dict(config_path)
     logger.info(f"Loaded robot: {robot_config.get('name', 'UNKNOWN')}")
     logger.info(f"Peripherals: {len(robot_config.get('peripherals', []))}")
 
@@ -261,16 +256,6 @@ def launch_setup(context, *args, **kwargs):
     except Exception as e:
         logger.error(f"loading config: {e}")
         raise
-
-    # Store config path for downstream modules (e.g., recording)
-    if config_path_override:
-        robot_config['_config_path'] = config_path_override
-    else:
-        try:
-            robot_config_share = get_package_share_directory("robot_config")
-        except:
-            robot_config_share = str(Path(__file__).parent.parent)
-        robot_config['_config_path'] = str(Path(robot_config_share) / "config" / "robots" / f"{robot_config_name}.yaml")
 
     # ========== 3. Apply control mode override ==========
     if control_mode_override:

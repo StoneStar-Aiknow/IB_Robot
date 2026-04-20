@@ -264,11 +264,14 @@ class EpisodeRecorderServer(Node):
             self.get_parameter("robot_config_path").get_parameter_value().string_value
         )
         if robot_config_path:
-            from robot_config.loader import load_robot_config
+            from robot_config.loader import (
+                load_robot_config_dict,
+                build_contract_from_robot_config_dict,
+            )
 
             self._robot_config_path = Path(robot_config_path).expanduser().resolve()
-            robot_config = load_robot_config(str(self._robot_config_path))
-            self._contract = robot_config.to_contract()
+            robot_config = load_robot_config_dict(str(self._robot_config_path))
+            self._contract = build_contract_from_robot_config_dict(robot_config)
         else:
             raise RuntimeError(
                 "The 'robot_config_path' parameter is required."

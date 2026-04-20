@@ -7,7 +7,12 @@ from robot_config.config import (
     ContractExtensionConfig,
     CameraConfig,
 )
-from robot_config.loader import load_robot_config, validate_config
+from robot_config.loader import (
+    load_robot_config,
+    load_robot_config_dict,
+    build_contract_from_robot_config_dict,
+    validate_config,
+)
 
 # Import launch builders
 from robot_config.launch_builders import (
@@ -31,6 +36,8 @@ __all__ = [
     "CameraConfig",
     # Loaders
     "load_robot_config",
+    "load_robot_config_dict",
+    "build_contract_from_robot_config_dict",
     "validate_config",
     # Launch builders
     "generate_ros2_control_nodes",

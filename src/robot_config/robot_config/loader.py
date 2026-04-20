@@ -1,6 +1,6 @@
 """Configuration loader and validator for robot_config."""
 
-import os
+import copy
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Union
 
@@ -21,6 +21,50 @@ from robot_config.config import (
 from .utils import resolve_ros_path
 
 logger = logging.getLogger(__name__)
+
+
+def _load_robot_section(config_path: Union[str, Path]) -> tuple[Path, Dict[str, Any]]:
+    """Load the raw ``robot`` section from a robot_config YAML file."""
+    resolved_config_path = Path(config_path).expanduser().resolve()
+
+    if not resolved_config_path.exists():
+        raise FileNotFoundError(f"Robot configuration not found: {resolved_config_path}")
+
+    with resolved_config_path.open("r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid robot config: expected mapping in {resolved_config_path}")
+
+    if "robot" not in data:
+        raise ValueError(
+            f"Invalid robot config: missing 'robot' section in {resolved_config_path}"
+        )
+
+    robot_data = data["robot"]
+    if not isinstance(robot_data, dict):
+        raise ValueError(
+            f"Invalid robot config: 'robot' section must be a mapping in {resolved_config_path}"
+        )
+
+    name = robot_data.get("name")
+    if not name:
+        raise ValueError(f"Invalid robot config: missing 'name' in {resolved_config_path}")
+
+    return resolved_config_path, robot_data
+
+
+def load_robot_config_dict(config_path: Union[str, Path]) -> Dict[str, Any]:
+    """Load robot configuration as a complete dict.
+
+    This is the canonical loader for launch/builders/runtime consumers. It preserves
+    the full YAML schema under ``robot`` and annotates the resolved source path for
+    downstream users that need provenance.
+    """
+    resolved_config_path, robot_data = _load_robot_section(config_path)
+    robot_config = copy.deepcopy(robot_data)
+    robot_config["_config_path"] = str(resolved_config_path)
+    return robot_config
 
 
 def load_camera_config(data: Dict[str, Any]) -> CameraConfig:
@@ -183,24 +227,11 @@ def load_robot_config(config_path: Union[str, Path]) -> RobotConfig:
         FileNotFoundError: If config file doesn't exist
         ValueError: If config is invalid
     """
-    config_path = Path(config_path)
-    config_dir = config_path.parent
-
-    if not config_path.exists():
-        raise FileNotFoundError(f"Robot configuration not found: {config_path}")
-
-    with open(config_path, "r") as f:
-        data = yaml.safe_load(f)
-
-    if "robot" not in data:
-        raise ValueError(f"Invalid robot config: missing 'robot' section in {config_path}")
-
-    robot_data = data["robot"]
+    resolved_config_path, robot_data = _load_robot_section(config_path)
+    config_dir = resolved_config_path.parent
 
     # Load required fields
     name = robot_data.get("name")
-    if not name:
-        raise ValueError(f"Invalid robot config: missing 'name' in {config_path}")
 
     robot_type = robot_data.get("robot_type", robot_data.get("type", name))
     type_ = robot_data.get("type", name)
@@ -241,6 +272,13 @@ def load_robot_config(config_path: Union[str, Path]) -> RobotConfig:
         contract=contract,
         voice_asr=voice_asr,
     )
+
+
+def build_contract_from_robot_config_dict(robot_config: Dict[str, Any]):
+    """Build a runtime contract directly from the canonical dict loader output."""
+    from robot_config.generators.contract import build_contract_from_robot_config_dict as _build
+
+    return _build(robot_config)
 
 
 def validate_config(config: RobotConfig) -> List[str]:

@@ -195,8 +195,12 @@ def _lerobot_metadata_entry(
 
 def _resolve_fallback_conversion_config(robot_config_path: Path) -> Dict[str, Any]:
     """Resolve conversion inputs directly from robot_config for older datasets."""
-    robot_config = _read_yaml(robot_config_path)
-    if not robot_config:
+    from robot_config.loader import load_robot_config_dict
+
+    try:
+        robot_config = load_robot_config_dict(robot_config_path)
+    except Exception as exc:
+        print(f"[WARN] Failed to load robot_config from {robot_config_path}: {exc}")
         return {}
     return {
         "norm_mode": resolve_lerobot_norm_mode(robot_config),
@@ -444,9 +448,13 @@ def _plan_streams(
 def _load_contract_from_robot_config(robot_config_path: Path) -> Contract:
     """Load contract from robot_config.yaml (Single Source of Truth)."""
     print(f"[bag_to_lerobot] Loading contract from robot_config: {robot_config_path}")
-    from robot_config.loader import load_robot_config
-    robot_config = load_robot_config(str(robot_config_path))
-    contract = robot_config.to_contract()
+    from robot_config.loader import (
+        load_robot_config_dict,
+        build_contract_from_robot_config_dict,
+    )
+
+    robot_config = load_robot_config_dict(str(robot_config_path))
+    contract = build_contract_from_robot_config_dict(robot_config)
     
     print(f"[bag_to_lerobot]   Observations: {len(contract.observations)}")
     for obs in contract.observations:

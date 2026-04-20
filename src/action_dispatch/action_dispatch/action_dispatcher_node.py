@@ -115,16 +115,15 @@ class ActionDispatcherNode(Node):
         self._action_specs = []
         if robot_config_path:
             try:
-                from robot_config.loader import load_robot_config
-
-                robot_cfg = load_robot_config(robot_config_path)
-                self._contract = robot_cfg.to_contract()
-                self._action_specs = [
-                    s for s in iter_specs(self._contract) if s.is_action
-                ]
-                self.get_logger().info(
-                    f"Loaded {len(self._action_specs)} action specs from robot_config"
+                from robot_config.loader import (
+                    load_robot_config_dict,
+                    build_contract_from_robot_config_dict,
                 )
+
+                robot_cfg = load_robot_config_dict(robot_config_path)
+                self._contract = build_contract_from_robot_config_dict(robot_cfg)
+                self._action_specs = [s for s in iter_specs(self._contract) if s.is_action]
+                self.get_logger().info(f"Loaded {len(self._action_specs)} action specs from robot_config")
             except Exception as e:
                 self.get_logger().error(
                     f"Failed to load contract from {robot_config_path}: {e}"

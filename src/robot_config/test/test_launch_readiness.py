@@ -8,6 +8,7 @@ from launch.actions import RegisterEventHandler
 from launch_ros.actions import Node
 
 from robot_config.launch_builders.control import generate_controller_spawners
+from robot_config.loader import load_robot_config_dict
 from robot_config.launch_builders.sim_backend import get_sim_backend
 from robot_config.wait_for_controllers import missing_inactive_controllers
 
@@ -88,3 +89,18 @@ def test_gazebo_start_backend_uses_readiness_probe_instead_of_timer():
     assert isinstance(create_node, Node)
     assert any(isinstance(action, Node) for action in actions)
     assert any(isinstance(action, RegisterEventHandler) for action in actions)
+
+
+def test_shared_loader_preserves_source_path_metadata():
+    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
+    robot_config = load_robot_config_dict(config_path)
+
+    assert robot_config["name"] == "so101_single_arm"
+    assert robot_config["_config_path"] == str(config_path.resolve())
+
+
+def test_launch_loader_uses_shared_dict_loader():
+    robot_config = robot_launch.load_robot_config("so101_single_arm")
+
+    assert robot_config["name"] == "so101_single_arm"
+    assert robot_config["_config_path"].endswith("config/robots/so101_single_arm.yaml")

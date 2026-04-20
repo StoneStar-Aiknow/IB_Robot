@@ -4,21 +4,26 @@ This module extends the rosetta contract system to support peripheral references
 from robot_config, eliminating duplication between hardware configuration and ML I/O.
 """
 
+import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
+
+import yaml
 
 from robot_config.contract_utils import (
+    ActionSpec,
     Contract,
     ObservationSpec,
-    ActionSpec,
+    TaskSpec,
     _as_align,
 )
-import yaml
+
+logger = logging.getLogger(__name__)
 
 
 def load_contract_with_robot_config(
-    contract_path: Union[str, Path],
-    robot_config: Optional[Any] = None,
+    contract_path: str | Path,
+    robot_config: Any | None = None,
 ) -> Contract:
     """Load contract with robot_config peripheral integration.
 
@@ -53,7 +58,7 @@ def load_contract_with_robot_config(
         contract_data = _resolve_peripheral_references(contract_data, robot_config)
 
     # Build contract dataclasses
-    def _obs(it: Dict[str, Any]) -> ObservationSpec:
+    def _obs(it: dict[str, Any]) -> ObservationSpec:
         obs = ObservationSpec(
             key=it["key"],
             topic=it["topic"],
@@ -68,7 +73,7 @@ def load_contract_with_robot_config(
         #     object.__setattr__(obs, "_peripheral", it["_peripheral"])
         return obs
 
-    def _act(it: Dict[str, Any]) -> ActionSpec:
+    def _act(it: dict[str, Any]) -> ActionSpec:
         pub = it["publish"]
         sb = str(it.get("safety_behavior", "zeros")).lower().strip()
         if sb not in ("zeros", "hold"):
@@ -84,8 +89,7 @@ def load_contract_with_robot_config(
             safety_behavior=sb,
         )
 
-    def _task(it: Dict[str, Any]) -> Any:
-        from robot_config.contract_utils import TaskSpec
+    def _task(it: dict[str, Any]) -> Any:
         return TaskSpec(
             key=it.get("key", it["topic"]),
             topic=it["topic"],
@@ -100,6 +104,7 @@ def load_contract_with_robot_config(
     proc = contract_data.get("process") or {}
 
     from robot_config.contract_utils import Contract
+
     return Contract(
         name=contract_data.get("name", "contract"),
         version=int(contract_data.get("version", 1)),
@@ -115,7 +120,7 @@ def load_contract_with_robot_config(
     )
 
 
-def _resolve_peripheral_references(contract_data: Dict, robot_config: Any) -> Dict:
+def _resolve_peripheral_references(contract_data: dict, robot_config: Any) -> dict:
     """Resolve peripheral references in contract using robot_config.
 
     For observations that reference a peripheral (by name), this function
@@ -166,9 +171,9 @@ def _resolve_peripheral_references(contract_data: Dict, robot_config: Any) -> Di
 
 
 def validate_contract_peripheral_consistency(
-    contract_data: Dict,
+    contract_data: dict,
     robot_config: Any,
-) -> List[str]:
+) -> list[str]:
     """Validate that all peripheral references in contract exist in robot_config.
 
     Args:
@@ -183,13 +188,98 @@ def validate_contract_peripheral_consistency(
 
     for obs in contract_data.get("observations", []):
         peripheral_name = obs.get("peripheral")
-        if peripheral_name:
-            if peripheral_name not in peripheral_names:
-                errors.append(
-                    f"Observation '{obs.get('key')}' references undefined peripheral: {peripheral_name}"
-                )
+        if peripheral_name and peripheral_name not in peripheral_names:
+            errors.append(f"Observation '{obs.get('key')}' references undefined peripheral: {peripheral_name}")
 
     return errors
+
+
+def build_contract_from_robot_config_dict(robot_config: dict[str, Any]) -> Contract:
+    """Build a runtime ``Contract`` directly from raw robot_config dict data."""
+
+    def _camera_lookup(name: str) -> dict[str, Any] | None:
+        for periph in robot_config.get("peripherals", []) or []:
+            if not isinstance(periph, dict):
+                continue
+            if periph.get("type") == "camera" and periph.get("name") == name:
+                return periph
+        return None
+
+    contract_config = robot_config.get("contract", {}) or {}
+    obs_specs: list[ObservationSpec] = []
+    for obs in contract_config.get("observations", []) or []:
+        if not isinstance(obs, dict):
+            continue
+
+        image_meta = obs.get("image")
+        topic = str(obs.get("topic", "") or "")
+        topic_type = obs.get("type") or "sensor_msgs/msg/JointState"
+        peripheral_name = obs.get("peripheral")
+        if peripheral_name:
+            topic_type = "sensor_msgs/msg/Image"
+            camera = _camera_lookup(str(peripheral_name))
+            if camera is None:
+                logger.warning(
+                    "Observation '%s' references peripheral '%s' but no camera found",
+                    obs.get("key"),
+                    peripheral_name,
+                )
+            if camera and not image_meta:
+                cam_h = int(camera.get("height", 0) or 0) or 480
+                cam_w = int(camera.get("width", 0) or 0) or 640
+                image_meta = {
+                    "resize": [cam_h, cam_w],
+                    "encoding": camera.get("pixel_format", "bgr8"),
+                }
+        elif not topic:
+            raise ValueError(f"Observation '{obs.get('key', '?')}' must specify a topic when no peripheral is set")
+
+        obs_specs.append(
+            ObservationSpec(
+                key=obs["key"],
+                topic=topic,
+                type=topic_type,
+                selector=obs.get("selector"),
+                image=image_meta,
+                align=_as_align(obs.get("align")),
+                qos=obs.get("qos"),
+            )
+        )
+
+    act_specs: list[ActionSpec] = []
+    for act in contract_config.get("actions", []) or []:
+        if not isinstance(act, dict):
+            continue
+        publish = act.get("publish", {}) or {}
+        safety_behavior = str(act.get("safety_behavior", "zeros")).lower().strip()
+        if safety_behavior not in ("zeros", "hold"):
+            safety_behavior = "zeros"
+        act_specs.append(
+            ActionSpec(
+                key=act["key"],
+                publish_topic=publish.get("topic", ""),
+                type=publish.get("type", ""),
+                selector=act.get("selector"),
+                from_tensor=act.get("from_tensor"),
+                publish_qos=publish.get("qos"),
+                publish_strategy=publish.get("strategy"),
+                safety_behavior=safety_behavior,
+            )
+        )
+
+    return Contract(
+        name=str(robot_config.get("name", "contract")),
+        version=1,
+        rate_hz=float(contract_config.get("rate_hz", 20.0)),
+        max_duration_s=float(contract_config.get("max_duration_s", 30.0)),
+        observations=obs_specs,
+        actions=act_specs,
+        tasks=[],
+        recording={"storage": "mcap"},
+        robot_type=robot_config.get("robot_type", robot_config.get("type")),
+        timestamp_source="receive",
+        process={},
+    )
 
 
 def generate_contract_from_robot_config(robot_config: Any) -> str:
