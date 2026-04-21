@@ -697,6 +697,15 @@ install_system_deps() {
             --skip-keys=numpy_lessthan_2 \
             --skip-keys=ament_python \
             --skip-keys=feetech-servo-sdk \
+            # openEuler relies on manual/system installs for these keys or does
+            # not currently provide matching rosdep package mappings.
+            --skip-keys=nlohmann-json-dev \
+            --skip-keys=python3-opencv \
+            --skip-keys=python3-aiortc \
+            --skip-keys=gz_ros2_control \
+            --skip-keys=ros_gz_sim \
+            --skip-keys=ros_gz_bridge \
+            --skip-keys=mujoco_ros2_control \
             --skip-keys=pyserial; then
             log_error "rosdepc install failed."
             log_error "Please check your network connection or dependency lists and re-run ./scripts/setup.sh"
