@@ -167,10 +167,25 @@ check_conda() {
 }
 
 detect_os() {
-    local os_id="" os_name=""
-    if [[ -r /etc/os-release ]]; then
-        os_id="$(awk -F= '$1=="ID"{gsub(/"/,"",$2); print tolower($2)}' /etc/os-release)"
-        os_name="$(awk -F= '$1=="NAME"{gsub(/"/,"",$2); print tolower($2)}' /etc/os-release)"
+    local os_id="" os_name="" os_release_file="/etc/os-release"
+
+    # Some embedded environments expose /etc/os-release as a symlink whose
+    # readability check is unreliable via [[ -r ]]. Resolve it first when
+    # possible, then fall back to direct reads.
+    if command -v readlink &>/dev/null; then
+        local resolved_os_release
+        resolved_os_release="$(readlink -f /etc/os-release 2>/dev/null || true)"
+        if [[ -n "${resolved_os_release}" ]]; then
+            os_release_file="${resolved_os_release}"
+        fi
+    fi
+
+    if [[ -r "${os_release_file}" ]]; then
+        os_id="$(awk -F= '$1=="ID"{gsub(/"/,"",$2); print tolower($2)}' "${os_release_file}")"
+        os_name="$(awk -F= '$1=="NAME"{gsub(/"/,"",$2); print tolower($2)}' "${os_release_file}")"
+    else
+        os_id="$(awk -F= '$1=="ID"{gsub(/"/,"",$2); print tolower($2)}' /etc/os-release 2>/dev/null || true)"
+        os_name="$(awk -F= '$1=="NAME"{gsub(/"/,"",$2); print tolower($2)}' /etc/os-release 2>/dev/null || true)"
     fi
 
     if [[ "${os_id}" == "ubuntu" ]]; then
