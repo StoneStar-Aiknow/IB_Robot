@@ -77,6 +77,20 @@ run_cmd() {
     "$@"
 }
 
+resolve_venv_python() {
+    local venv_path="$1"
+    local candidate=""
+
+    for candidate in "${venv_path}/bin/python3" "${venv_path}/bin/python"; do
+        if [[ -e "${candidate}" ]] && "${candidate}" -c "import sys" >/dev/null 2>&1; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 is_openeuler() {
     uname -r | grep -qi "openeuler" || grep -qi "openeuler" /etc/os-release 2>/dev/null
 }
@@ -792,64 +806,71 @@ setup_python_venv() {
 
     log_info "Configuring Python environment and dependencies..."
     source "${venv_path}/bin/activate"
+
+    local venv_python=""
+    venv_python="$(resolve_venv_python "${venv_path}" || true)"
+    if [[ -z "${venv_python}" ]]; then
+        log_error "No working Python interpreter found under ${venv_path}/bin."
+        log_error "Expected a working virtual environment python executable."
+        exit 1
+    fi
     
     # 升级 pip
-    run_cmd python3 -m pip install --upgrade pip --quiet
+    run_cmd "${venv_python}" -m pip install --upgrade pip --quiet
     
     # 解决 setuptools 版本冲突 (兼容 LeRobot 和 colcon)
-    run_cmd python3 -m pip install "setuptools<80" "setuptools>=71" --quiet
+    run_cmd "${venv_python}" -m pip install "setuptools<80" "setuptools>=71" --quiet
 
     # 以可编辑模式安装 LeRobot
     log_info "Installing LeRobot in editable mode..."
-    run_cmd python3 -m pip install -e "${lerobot_dir}"
+    run_cmd "${venv_python}" -m pip install -e "${lerobot_dir}"
 
     # 安装原有的硬件依赖
     log_info "Installing hardware dependencies (pyserial, feetech)..."
-    run_cmd python3 -m pip install pyserial feetech-servo-sdk --quiet
+    run_cmd "${venv_python}" -m pip install pyserial feetech-servo-sdk --quiet
 
     if [[ "${DETECTED_OS}" == "openeuler-embedded" ]]; then
         log_info "Installing openEuler fallback dependency (aiortc) into the workspace venv..."
-        run_cmd python3 -m pip install aiortc --quiet
+        run_cmd "${venv_python}" -m pip install aiortc --quiet
     fi
 
     # 安装 scipy 用于数学计算 (四元数/旋转矩阵转换)
     log_info "Installing scipy for mathematical computations..."
-    run_cmd python3 -m pip install scipy --quiet
+    run_cmd "${venv_python}" -m pip install scipy --quiet
 
     # 安装训练可视化依赖
     log_info "Installing training visualization dependencies (tensorboard)..."
-    python3 -m pip install tensorboard --quiet
+    run_cmd "${venv_python}" -m pip install tensorboard --quiet
 
     # 安装录制可视化依赖
     log_info "Installing recording visualization dependency (rerun-sdk)..."
-    python3 -m pip install "rerun-sdk>=0.24,<0.27" --quiet
+    run_cmd "${venv_python}" -m pip install "rerun-sdk>=0.24,<0.26" --quiet
     log_info "Installing rerun compatibility dependency (typing-extensions>=4.12)..."
-    python3 -m pip install "typing-extensions>=4.12" --quiet
+    run_cmd "${venv_python}" -m pip install "typing-extensions>=4.12" --quiet
 
     # 安装 ONNX 导出相关依赖
     if is_openeuler; then
         log_info "Installing ONNX export dependencies (onnx, onnxruntime); skipping onnxsim on openEuler..."
-        python3 -m pip install onnx onnxruntime --quiet
+        run_cmd "${venv_python}" -m pip install onnx onnxruntime --quiet
     else
         log_info "Installing ONNX export dependencies (onnx, onnxsim, onnxruntime)..."
-        python3 -m pip install onnx onnxsim onnxruntime --quiet
+        run_cmd "${venv_python}" -m pip install onnx onnxsim onnxruntime --quiet
     fi
 
     # 安装 gitlint 并设置 git hook
     log_info "Installing gitlint..."
-    run_cmd python3 -m pip install gitlint --quiet
+    run_cmd "${venv_python}" -m pip install gitlint --quiet
 
     # 安装 ruff (代码规范) 和 pre-commit hook
     log_info "Installing ruff and pre-commit..."
-    python3 -m pip install ruff pre-commit --quiet
+    run_cmd "${venv_python}" -m pip install ruff pre-commit --quiet
     if [[ -f "${WORKSPACE}/.pre-commit-config.yaml" ]]; then
         pre-commit install
     fi
 
-    # 核心修复：所有依赖安装完毕后，强制固定 NumPy 1.26.4 以兼容 ROS 2 系统组件
-    # 必须放在最后，防止 lerobot/scipy 等依赖将 numpy 升级到 2.x
-    log_info "Pinning NumPy to 1.26.4 for ROS 2 compatibility..."
-    run_cmd python3 -m pip install "numpy==1.26.4" --quiet
+    # Keep NumPy below 2.0 for ROS 2 Humble and align OpenCV with that ABI.
+    log_info "Pinning NumPy and OpenCV to ROS 2 compatibility versions..."
+    run_cmd "${venv_python}" -m pip install --force-reinstall "numpy==1.26.4" "opencv-python-headless<4.12" --quiet
     local commit_msg_hook
     commit_msg_hook="$(git rev-parse --git-path hooks/commit-msg)"
     if [[ -e "${commit_msg_hook}" ]]; then
@@ -875,12 +896,13 @@ verify_setup() {
         return 0
     fi
 
-    local venv_python="${WORKSPACE}/venv/bin/python3"
+    local venv_python=""
 
     log_info "Running final verification..."
 
-    if [[ ! -x "${venv_python}" ]]; then
-        log_error "Verification failed: virtual environment python not found at ${venv_python}"
+    venv_python="$(resolve_venv_python "${WORKSPACE}/venv" || true)"
+    if [[ -z "${venv_python}" ]]; then
+        log_error "Verification failed: no working virtual environment python was found under ${WORKSPACE}/venv/bin."
         exit 1
     fi
 
