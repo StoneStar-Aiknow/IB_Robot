@@ -25,9 +25,9 @@ rerun_addr : str, default "rerun+http://127.0.0.1:9090/proxy"
     gRPC address when ``rerun_mode`` is ``connect``.
 rerun_save_path : str, default "/tmp/ib_recording.rrd"
     Output path when ``rerun_mode`` is ``save``.
-image_max_fps : float, default 5.0
-    Per-image-stream logging cap inside the sidecar. This reduces viewer memory
-    growth without affecting rosbag recording.
+image_max_fps : float, default 0.0 (auto)
+    Per-image-stream logging cap inside the sidecar. ``0`` means derive a
+    smoother default from the contract rate and cap it at 30 FPS.
 image_max_long_edge : int, default 320
     Downscale large images before logging when their longest edge exceeds this
     value. Set to ``0`` to disable downscaling.
@@ -66,7 +66,7 @@ from robot_config.contract_utils import (
 from tensormsg import TensorMsgConverter
 
 DEFAULT_QOS_DEPTH = 10
-DEFAULT_IMAGE_MAX_FPS = 5.0
+DEFAULT_IMAGE_MAX_FPS = 0.0
 DEFAULT_IMAGE_MAX_LONG_EDGE = 320
 
 # --------------- Color palette for joint/action curves ---------------
@@ -91,6 +91,15 @@ def _color_for(idx: int) -> tuple[int, int, int, int]:
 def _default_rerun_memory_limit() -> str:
     """Match LeRobot's default viewer memory cap and allow env override."""
     return str(os.getenv("LEROBOT_RERUN_MEMORY_LIMIT", "10%") or "10%")
+
+
+def _resolve_image_max_fps(configured_max_fps: float, contract_rate_hz: float) -> float:
+    """Pick a smoother default display rate while keeping viewer load bounded."""
+    if configured_max_fps > 0.0:
+        return configured_max_fps
+    if contract_rate_hz > 0.0:
+        return min(contract_rate_hz, 30.0)
+    return 15.0
 
 
 def _image_msg_to_numpy(msg: Any) -> np.ndarray | None:
@@ -223,8 +232,8 @@ class RerunViewer(Node):
         except ImportError as exc:
             self.get_logger().fatal(
                 f"Failed to import rerun-sdk: {exc}. Rebuild from the workspace "
-                "venv with `source .shrc_local && python3 -m colcon build "
-                "--symlink-install --merge-install --packages-select dataset_tools`."
+                "venv with `source .shrc_local && ./scripts/build.sh -- "
+                "--packages-select dataset_tools`."
             )
             raise RuntimeError(
                 "rerun_viewer requires a compatible rerun-sdk installation in the workspace venv"
@@ -287,7 +296,8 @@ class RerunViewer(Node):
         self._last_image_log_time_s: dict[str, float] = {}
         self._joint_state_name_warned = False
         configured_image_max_fps = self.get_parameter("image_max_fps").get_parameter_value().double_value
-        self._image_min_interval_s = 0.0 if configured_image_max_fps <= 0.0 else 1.0 / configured_image_max_fps
+        self._image_max_fps = _resolve_image_max_fps(configured_image_max_fps, self._contract.rate_hz)
+        self._image_min_interval_s = 0.0 if self._image_max_fps <= 0.0 else 1.0 / self._image_max_fps
         self._image_max_long_edge = max(
             0,
             int(self.get_parameter("image_max_long_edge").get_parameter_value().integer_value),
@@ -302,7 +312,7 @@ class RerunViewer(Node):
         )
         self.get_logger().info(
             "Rerun image safeguards enabled: "
-            f"max_fps={'unlimited' if self._image_min_interval_s <= 0.0 else f'{configured_image_max_fps:.2f}'} "
+            f"max_fps={'unlimited' if self._image_min_interval_s <= 0.0 else f'{self._image_max_fps:.2f}'} "
             f"| max_long_edge={self._image_max_long_edge or 'disabled'}"
         )
 

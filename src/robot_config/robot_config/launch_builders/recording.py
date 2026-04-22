@@ -10,13 +10,13 @@ Supports two recording modes:
 
 import os
 import re
-from pathlib import Path
 from datetime import datetime
-from typing import List, Union
-from launch_ros.actions import Node
-from launch.actions import ExecuteProcess
-from robot_config.logger_utils import get_colored_logger
+from pathlib import Path
 
+from launch.actions import ExecuteProcess
+from launch_ros.actions import Node
+
+from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import (
     resolve_calibration_path_from_config,
     resolve_gripper_joints_from_config,
@@ -31,10 +31,15 @@ def _sanitize_dataset_name(value: str) -> str:
     normalized = normalized.strip("._-")
     return normalized or "dataset"
 
+
 logger = get_colored_logger("robot_config.recording")
 
 
-def generate_recording_nodes(robot_config: dict, active_control_mode: str, record_mode: str = 'continuous') -> List[Union[Node, ExecuteProcess]]:
+def generate_recording_nodes(
+    robot_config: dict,
+    active_control_mode: str,
+    record_mode: str = "continuous",
+) -> list[Node | ExecuteProcess]:
     """
     Generate recording nodes based on robot configuration and recording mode.
 
@@ -65,13 +70,13 @@ def generate_recording_nodes(robot_config: dict, active_control_mode: str, recor
         ros2 launch robot_config robot.launch.py record:=true record_mode:=episodic
         # Then in another terminal: ros2 run dataset_tools record_cli
     """
-    if record_mode == 'episodic':
+    if record_mode == "episodic":
         return generate_episodic_recording_node(robot_config, active_control_mode)
     else:
         return generate_continuous_recording_action(robot_config)
 
 
-def generate_continuous_recording_action(robot_config: dict) -> List[ExecuteProcess]:
+def generate_continuous_recording_action(robot_config: dict) -> list[ExecuteProcess]:
     """
     Generate continuous recording action using ros2 bag record.
 
@@ -89,14 +94,14 @@ def generate_continuous_recording_action(robot_config: dict) -> List[ExecuteProc
         - Generates filename: ~/rosbag/<robot_name>_<timestamp>.mcap
         - Records continuously until node shutdown
     """
-    logger.info(f"Using CONTINUOUS recording (ros2 bag record)")
+    logger.info("Using CONTINUOUS recording (ros2 bag record)")
 
     # Auto-discover topics to record
     topics = get_recording_topics(robot_config)
 
     # Generate filename with timestamp
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    robot_name = robot_config.get('name', 'robot')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    robot_name = robot_config.get("name", "robot")
     output_file = f"~/rosbag/{robot_name}_{timestamp}.mcap"
 
     # Expand ~ to actual home directory
@@ -106,16 +111,13 @@ def generate_continuous_recording_action(robot_config: dict) -> List[ExecuteProc
     logger.info(f"Topics: {topics}")
 
     # Create recording action
-    recording_action = ExecuteProcess(
-        cmd=['ros2', 'bag', 'record', '-o', output_file] + topics,
-        output='screen'
-    )
+    recording_action = ExecuteProcess(cmd=["ros2", "bag", "record", "-o", output_file] + topics, output="screen")
 
-    logger.info(f"✓ Continuous recording action created")
+    logger.info("✓ Continuous recording action created")
     return [recording_action]
 
 
-def generate_episodic_recording_node(robot_config: dict, active_control_mode: str) -> List[Node]:
+def generate_episodic_recording_node(robot_config: dict, active_control_mode: str) -> list[Node]:
     """
     Generate episodic recording node using episode_recorder Action Server.
 
@@ -139,7 +141,7 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
         - Each episode saved as: <bag_base_dir>/<dataset_name>/episodes/episode_XXXXXX
         - Operator prompt embedded in bag metadata
     """
-    logger.info(f"Using EPISODIC recording (episode_recorder Action Server)")
+    logger.info("Using EPISODIC recording (episode_recorder Action Server)")
 
     # Check if contract section exists in robot_config
     contract_config = robot_config.get("contract")
@@ -149,57 +151,51 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
         return []
 
     # Determine bag output directory
-    recording_config = robot_config.get('recording', {})
-    custom_dir = recording_config.get('bag_base_dir', '~/rosbag_demos/episodes')
+    recording_config = robot_config.get("recording", {})
+    custom_dir = recording_config.get("bag_base_dir", "~/rosbag_demos/episodes")
     bag_base_dir = os.path.expanduser(custom_dir)
 
     # Get robot_config file path (passed via launch argument)
     # The launch file should pass the robot_config path as a parameter
-    robot_config_path = robot_config.get('_config_path', '')
-    
+    robot_config_path = robot_config.get("_config_path", "")
+
     if not robot_config_path:
-        raise ValueError(
-            "robot_config dict is missing '_config_path'. Cannot launch episodic recording without it."
-        )
+        raise ValueError("robot_config dict is missing '_config_path'. Cannot launch episodic recording without it.")
 
     dataset_name = _sanitize_dataset_name(
-        str(
-            recording_config.get('dataset_name')
-            or robot_config.get('name')
-            or Path(robot_config_path).stem
-        )
+        str(recording_config.get("dataset_name") or robot_config.get("name") or Path(robot_config_path).stem)
     )
     dataset_root = Path(bag_base_dir).expanduser() / str(dataset_name)
-    default_task = str(recording_config.get('default_task', '') or '')
-    task_family = str(recording_config.get('task_family', '') or '')
+    default_task = str(recording_config.get("default_task", "") or "")
+    task_family = str(recording_config.get("task_family", "") or "")
     lerobot_norm_mode = resolve_lerobot_norm_mode(robot_config, preferred_control_mode=active_control_mode)
     joint_names = resolve_joint_names_from_config(robot_config)
     gripper_joints = resolve_gripper_joints_from_config(robot_config)
     calibration_file = resolve_calibration_path_from_config(robot_config)
-    max_cache_size = int(recording_config.get('max_cache_size', 100 * 1024 * 1024) or 0)
-    storage_preset_profile = str(recording_config.get('storage_preset_profile', '') or '')
-    storage_config_uri = str(recording_config.get('storage_config_uri', '') or '')
+    max_cache_size = int(recording_config.get("max_cache_size", 100 * 1024 * 1024) or 0)
+    storage_preset_profile = str(recording_config.get("storage_preset_profile", "") or "")
+    storage_config_uri = str(recording_config.get("storage_config_uri", "") or "")
 
     # Create episode_recorder node (Action Server)
     episode_recorder_node = Node(
-        package='dataset_tools',
-        executable='episode_recorder',
-        name='episode_recorder',
-        output='screen',
+        package="dataset_tools",
+        executable="episode_recorder",
+        name="episode_recorder",
+        output="screen",
         parameters=[
-            {'robot_config_path': robot_config_path},
-            {'bag_base_dir': bag_base_dir},
-            {'dataset_name': str(dataset_name)},
-            {'control_mode': active_control_mode},
-            {'default_task': default_task},
-            {'task_family': task_family},
-            {'lerobot_norm_mode': lerobot_norm_mode},
-            {'joint_names': joint_names},
-            {'gripper_joints': gripper_joints},
-            {'calibration_file': calibration_file},
-            {'max_cache_size': max_cache_size},
-            {'storage_preset_profile': storage_preset_profile},
-            {'storage_config_uri': storage_config_uri},
+            {"robot_config_path": robot_config_path},
+            {"bag_base_dir": bag_base_dir},
+            {"dataset_name": str(dataset_name)},
+            {"control_mode": active_control_mode},
+            {"default_task": default_task},
+            {"task_family": task_family},
+            {"lerobot_norm_mode": lerobot_norm_mode},
+            {"joint_names": joint_names},
+            {"gripper_joints": gripper_joints},
+            {"calibration_file": calibration_file},
+            {"max_cache_size": max_cache_size},
+            {"storage_preset_profile": storage_preset_profile},
+            {"storage_config_uri": storage_config_uri},
         ],
     )
 
@@ -220,7 +216,7 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
     return [episode_recorder_node]
 
 
-def generate_rerun_viewer_node(robot_config: dict) -> List[Node]:
+def generate_rerun_viewer_node(robot_config: dict) -> list[Node]:
     """Generate a Rerun visualization sidecar node for recording observation.
 
     The node loads the same contract as ``episode_recorder`` and subscribes to
@@ -234,21 +230,19 @@ def generate_rerun_viewer_node(robot_config: dict) -> List[Node]:
     Returns:
         List containing a single Node action, or empty if config path is missing.
     """
-    robot_config_path = robot_config.get('_config_path', '')
+    robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:
-        logger.error(
-            "robot_config dict is missing '_config_path'. "
-            "Cannot launch rerun_viewer without it."
-        )
+        logger.error("robot_config dict is missing '_config_path'. Cannot launch rerun_viewer without it.")
         return []
 
     rerun_node = Node(
-        package='dataset_tools',
-        executable='rerun_viewer',
-        name='rerun_viewer',
-        output='screen',
+        package="dataset_tools",
+        executable="rerun_viewer",
+        name="rerun_viewer",
+        output="screen",
+        additional_env={"PYTHONNOUSERSITE": "1"},
         parameters=[
-            {'robot_config_path': robot_config_path},
+            {"robot_config_path": robot_config_path},
         ],
     )
 
@@ -268,13 +262,13 @@ def find_workspace_root() -> str:
 
     # Walk up the directory tree looking for install/setup.bash
     for parent in current_path.parents:
-        if (parent / 'install' / 'setup.bash').exists():
+        if (parent / "install" / "setup.bash").exists():
             return str(parent)
 
     return None
 
 
-def get_recording_topics(robot_config: dict) -> List[str]:
+def get_recording_topics(robot_config: dict) -> list[str]:
     """
     Get list of topics to record based on robot configuration.
 
@@ -292,22 +286,22 @@ def get_recording_topics(robot_config: dict) -> List[str]:
     topics = []
 
     # Always record joint states
-    topics.append('/joint_states')
+    topics.append("/joint_states")
 
     # Add controller command topics
-    topics.append('/arm_position_controller/commands')
-    topics.append('/gripper_position_controller/commands')
+    topics.append("/arm_position_controller/commands")
+    topics.append("/gripper_position_controller/commands")
 
     # Add diagnostics
-    topics.append('/diagnostics')
+    topics.append("/diagnostics")
 
     # Add camera topics from peripherals
-    peripherals = robot_config.get('peripherals', [])
+    peripherals = robot_config.get("peripherals", [])
     for peripheral in peripherals:
-        if peripheral.get('type') == 'camera':
-            name = peripheral.get('name', 'camera')
+        if peripheral.get("type") == "camera":
+            name = peripheral.get("name", "camera")
             # Add common camera topics
-            topics.append(f'/camera/{name}/image_raw')
-            topics.append(f'/camera/{name}/camera_info')
+            topics.append(f"/camera/{name}/image_raw")
+            topics.append(f"/camera/{name}/camera_info")
 
     return topics

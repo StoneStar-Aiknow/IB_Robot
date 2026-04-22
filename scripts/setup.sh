@@ -948,10 +948,9 @@ print_summary() {
 
 print_next_steps() {
     log_info "Setup complete! Recommended next steps:"
-    echo "  source venv/bin/activate"
-    echo "  source /opt/ros/humble/setup.sh"
+    echo "  source .shrc_local"
     echo "  ./scripts/build.sh"
-    echo "  # After the first build, also execute: source install/setup.sh"
+    echo "  # .shrc_local also disables ~/.local Python packages to avoid mixed venv imports"
 }
 
 # ============================================================================

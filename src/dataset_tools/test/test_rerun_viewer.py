@@ -16,6 +16,7 @@ from dataset_tools.rerun_viewer import (  # noqa: E402
     _default_rerun_memory_limit,
     _downscale_image_for_rerun,
     _image_msg_to_numpy,
+    _resolve_image_max_fps,
     _should_log_sample,
 )
 
@@ -88,3 +89,12 @@ def test_default_rerun_memory_limit_uses_env(monkeypatch: pytest.MonkeyPatch):
 def test_default_rerun_memory_limit_falls_back_to_ten_percent(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("LEROBOT_RERUN_MEMORY_LIMIT", raising=False)
     assert _default_rerun_memory_limit() == "10%"
+
+
+def test_resolve_image_max_fps_prefers_explicit_value():
+    assert _resolve_image_max_fps(12.0, 30.0) == 12.0
+
+
+def test_resolve_image_max_fps_uses_contract_rate_with_cap():
+    assert _resolve_image_max_fps(0.0, 20.0) == 20.0
+    assert _resolve_image_max_fps(0.0, 60.0) == 30.0
