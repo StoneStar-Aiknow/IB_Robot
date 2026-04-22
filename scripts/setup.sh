@@ -20,7 +20,8 @@ set -euo pipefail
 # ============================================================================
 # Configuration
 # ============================================================================
-WORKSPACE="${WORKSPACE:-$(pwd)}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+WORKSPACE="${WORKSPACE:-$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd -P)}"
 PARALLEL_WORKERS=$(($(nproc) / 2))
 AUTO_YES=false
 USE_SUDO=true
@@ -681,6 +682,8 @@ install_system_deps() {
             exit 1
         fi
 
+        # openEuler relies on manual/system installs for these keys or does not
+        # currently provide matching rosdep package mappings.
         log_info "Installing ROS dependencies via dnf..."
         if ! run_cmd rosdepc install \
             --from-paths src \
@@ -697,8 +700,6 @@ install_system_deps() {
             --skip-keys=numpy_lessthan_2 \
             --skip-keys=ament_python \
             --skip-keys=feetech-servo-sdk \
-            # openEuler relies on manual/system installs for these keys or does
-            # not currently provide matching rosdep package mappings.
             --skip-keys=nlohmann-json-dev \
             --skip-keys=python3-opencv \
             --skip-keys=python3-aiortc \
