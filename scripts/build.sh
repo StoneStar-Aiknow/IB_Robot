@@ -154,6 +154,25 @@ require_setup_environment() {
         exit 1
     fi
 
+    # Verify colcon is importable from the venv. PYTHONNOUSERSITE=1 (set by
+    # setup_venv) means a colcon installed under ~/.local cannot rescue us
+    # here; it must live in the venv's site-packages. Surface a precise,
+    # actionable error early instead of letting `python3 -m colcon` fail with
+    # a bare "No module named colcon" deep inside the build pipeline.
+    if ! python3 -m colcon --help >/dev/null 2>&1; then
+        log_error "colcon is not importable from the workspace venv."
+        log_error "This usually means setup.sh installed colcon into ~/.local"
+        log_error "(via 'pip install --user') instead of into the venv, while"
+        log_error "build.sh sets PYTHONNOUSERSITE=1 to ignore ~/.local."
+        log_error ""
+        log_error "Fix it by reinstalling colcon into the venv:"
+        log_error "  source venv/bin/activate"
+        log_error "  PYTHONNOUSERSITE=1 python3 -m pip install --upgrade colcon-common-extensions colcon-mixin"
+        log_error ""
+        log_error "Or re-run ./scripts/setup.sh which now installs colcon into venv automatically."
+        exit 1
+    fi
+
     if ! python3 -c "import lerobot" 2>/dev/null; then
         log_warning "lerobot is not importable in the current venv."
         log_warning "Run ./scripts/setup.sh to install or repair the Python environment before building."
@@ -222,7 +241,6 @@ python3 -m colcon build \
     "${MIXIN_ARGS[@]}" \
     "${CLEAN_ARGS[@]}" \
     "${THIS_ARGS[@]}" \
-    --packages-skip \
     "${EXTRA_ARGS[@]}"
 
 echo ""

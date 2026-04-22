@@ -35,6 +35,26 @@ SUMMARY=()
 DETECTED_OS="unknown"
 DETECTED_ACCELERATOR="cpu-only"
 
+# Mirror build.sh / .shrc_local: ignore ~/.local site-packages so that the
+# install-time view of Python packages matches what the build/runtime sees.
+# Otherwise tools installed via `pip install --user` (e.g. legacy colcon in
+# ~/.local) can make setup verification pass while build.sh fails with
+# "No module named colcon" because PYTHONNOUSERSITE=1 is set there.
+export PYTHONNOUSERSITE=1
+
+# NOTE on NumPy / OpenCV pinning strategy
+# ---------------------------------------
+# We deliberately do NOT pass `-c numpy==1.26.4` to the lerobot install.
+# lerobot's transitive dependency graph (rerun-sdk, opencv, datasets, ...)
+# is solved against numpy>=2.x, and forcing numpy==1.26.4 as a constraint
+# during the lerobot resolution explodes pip backtracking into
+# `resolution-too-deep`. Instead, we let lerobot install whatever NumPy/
+# OpenCV it wants, and AFTERWARDS force-reinstall numpy==1.26.4 +
+# opencv-python-headless<4.12 to restore ROS 2 Humble ABI compatibility.
+# This produces a few cosmetic dependency-resolver warnings during install,
+# which are harmless because we never call the numpy-2-only APIs in the
+# affected packages from the ROS pipeline.
+
 # Detect if running as root
 if [[ $EUID -eq 0 ]]; then
     USE_SUDO=false
@@ -282,7 +302,7 @@ update_submodules() {
     done
 
     # If all submodules exist, ask if user wants to update
-    if [[ ${#need_init} -eq 0 ]]; then
+    if [[ ${#need_init[@]} -eq 0 ]]; then
         log_info "All submodules are already initialized:"
         for entry in "${submodules[@]}"; do
             local path="${entry%%:*}"
@@ -460,24 +480,33 @@ check_ros_installation() {
 }
 
 ensure_colcon() {
+    # Note: this only checks whether a colcon CLI exists somewhere on PATH.
+    # The authoritative installation that build.sh consumes happens later in
+    # setup_python_venv via `${venv_python} -m pip install colcon-common-extensions`,
+    # which guarantees the module is importable from the workspace venv even
+    # when PYTHONNOUSERSITE=1 is set (which is the case in build.sh and
+    # .shrc_local). Installing colcon system-wide here is only a convenience
+    # for users invoking `colcon` directly outside of build.sh.
     if command -v colcon &>/dev/null; then
-        log_info "colcon is already installed"
+        log_info "colcon CLI is already available on PATH (will also be installed into venv later)"
         return 0
     fi
 
-    log_info "Installing colcon build tool..."
+    log_info "Installing colcon build tool (system-level fallback)..."
     if command -v apt-get &> /dev/null; then
         run_sudo apt-get install -y python3-colcon-common-extensions
     elif command -v dnf &> /dev/null; then
-        # On openEuler, we usually install colcon via pip to get the latest extensions
+        # On openEuler, install colcon via pip to get the latest extensions.
+        # The venv-level install still happens later for build.sh consumption.
         if command -v pip3 &> /dev/null; then
             run_cmd pip3 install colcon-common-extensions --quiet
         else
-            log_error "pip3 not found, cannot install colcon."
-            exit 1
+            log_warn "pip3 not found; skipping system-level colcon install."
+            log_warn "colcon will still be installed into the workspace venv later."
+            return 0
         fi
     fi
-    log_done "colcon installed"
+    log_done "colcon installed (system-level)"
 }
 
 check_openeuler() {
@@ -502,45 +531,74 @@ check_openeuler() {
     fi
 }
 
-ensure_rosdepc() {
-    # 1. Ensure user's local bin is in PATH for pip installed tools
-    if [[ -d "${HOME}/.local/bin" && ":$PATH:" != *":${HOME}/.local/bin:"* ]]; then
-        export PATH="${HOME}/.local/bin:${PATH}"
-    fi
+ensure_workspace_venv() {
+    # Idempotent: create ${WORKSPACE}/venv if missing and resolve its
+    # python/rosdepc paths into script-global vars. The full venv setup
+    # (lerobot, colcon, numpy pin, etc.) still happens later in
+    # setup_python_venv; this helper only guarantees the venv exists
+    # early enough that ensure_rosdepc can install rosdepc into it.
+    VENV_PATH="${WORKSPACE}/venv"
 
-    if ! command -v rosdepc &> /dev/null; then
-        log_warn "rosdepc not found. Installing rosdepc (rosdep with Chinese mirror support)..."
-        if command -v pip3 &> /dev/null; then
-            run_cmd pip3 install rosdepc
-        elif command -v pip &> /dev/null; then
-            run_cmd pip install rosdepc
-        else
-            log_error "pip/pip3 not found. Cannot install rosdepc automatically."
+    if [[ ! -d "${VENV_PATH}" ]]; then
+        if [[ "${SKIP_PYTHON}" == true ]]; then
+            log_error "rosdepc requires a workspace venv at ${VENV_PATH}, but --skip-python was passed."
+            log_error "Re-run without --skip-python, or create the venv manually:"
+            log_error "  python3 -m venv --system-site-packages ${VENV_PATH}"
             exit 1
         fi
-        
-        # Refresh bash hash so command -v finds the newly installed binary
-        hash -r
+        log_info "Creating workspace venv at ${VENV_PATH} (early, for rosdepc)..."
+        run_cmd python3 -m venv --system-site-packages "${VENV_PATH}"
     fi
 
-    if ! command -v rosdepc &> /dev/null; then
-        log_error "rosdepc was installed but cannot be found in PATH. Please check your python environment."
+    VENV_PYTHON="$(resolve_venv_python "${VENV_PATH}" || true)"
+    if [[ -z "${VENV_PYTHON}" ]]; then
+        log_error "No working Python interpreter found under ${VENV_PATH}/bin."
         exit 1
     fi
+    ROSDEPC_BIN="${VENV_PATH}/bin/rosdepc"
+}
+
+ensure_rosdepc() {
+    # Single source of truth: rosdepc lives in the workspace venv.
+    #
+    # Why not rely on a system-wide rosdepc on PATH?
+    # - A stale shim from a previous python install (e.g. an orphan
+    #   /usr/local/bin/rosdepc whose shebang points at a python that no
+    #   longer has the module) survives `command -v` checks and only
+    #   blows up at runtime with `ModuleNotFoundError: No module named
+    #   'rosdepc'`.
+    # - `pip3 install --force-reinstall rosdepc` does NOT heal that shim
+    #   when pip3's python differs from the shim's shebang python: pip
+    #   writes a new shim into its own bin dir while the broken one
+    #   keeps winning on PATH.
+    #
+    # Both failure modes vanish if we install rosdepc into the workspace
+    # venv (using the venv's own python) and always invoke it via the
+    # explicit venv path. There is no shim to go stale, and pip always
+    # installs into the same interpreter we then use.
+    ensure_workspace_venv
+
+    if ! "${ROSDEPC_BIN}" --version &>/dev/null; then
+        log_info "Installing rosdepc into the workspace venv..."
+        run_cmd "${VENV_PYTHON}" -m pip install --upgrade pip --quiet
+        run_cmd "${VENV_PYTHON}" -m pip install rosdepc --quiet
+        if ! "${ROSDEPC_BIN}" --version &>/dev/null; then
+            log_error "rosdepc install did not produce a working CLI at ${ROSDEPC_BIN}."
+            log_error "Re-run with VERBOSE=1 to see the full pip output."
+            exit 1
+        fi
+    fi
+    log_info "Using venv rosdepc: ${ROSDEPC_BIN}"
 
     # Init if sources list doesn't exist yet
     if [[ ! -d /etc/ros/rosdep/sources.list.d ]]; then
         log_info "Initializing rosdepc..."
 
         if [[ "${DRY_RUN}" == true ]]; then
-            local rosdepc_bin="rosdepc"
-            if command -v rosdepc &>/dev/null; then
-                rosdepc_bin="$(command -v rosdepc)"
-            fi
-            run_sudo -E env PATH="${PATH}" "${rosdepc_bin}" init
+            run_sudo -E env PATH="${PATH}" "${ROSDEPC_BIN}" init
             return 0
         fi
-        
+
         # Pre-authenticate sudo so password prompt is visible
         if [[ "${USE_SUDO}" == true ]]; then
             sudo -v
@@ -548,8 +606,8 @@ ensure_rosdepc() {
 
         local init_output=""
         local init_exit=0
-        
-        init_output=$(run_sudo env PATH="${PATH}" "$(command -v rosdepc)" init 2>&1) || init_exit=$?
+
+        init_output=$(run_sudo env PATH="${PATH}" "${ROSDEPC_BIN}" init 2>&1) || init_exit=$?
 
         # Check both exit code and output for SSL/network errors
         if [[ ${init_exit} -ne 0 ]] || echo "${init_output}" | grep -qi "error\|failed\|certificate\|urlopen"; then
@@ -564,7 +622,7 @@ ensure_rosdepc() {
 
             # Get the .pem path used by Python's ssl module
             local ssl_pem
-            ssl_pem=$(python3 -c "import ssl; print(ssl.get_default_verify_paths().openssl_cafile)" 2>/dev/null)
+            ssl_pem=$("${VENV_PYTHON}" -c "import ssl; print(ssl.get_default_verify_paths().openssl_cafile)" 2>/dev/null)
 
             if [[ -z "${ssl_pem}" ]]; then
                 log_error "Could not determine Python SSL certificate path."
@@ -617,15 +675,15 @@ ensure_rosdepc() {
 
                 # Retry init, capture output again
                 local retry_output
-                if ! retry_output=$(run_sudo rosdepc init 2>&1) || echo "${retry_output}" | grep -qi "error\|failed\|certificate\|urlopen"; then
+                if ! retry_output=$(run_sudo "${ROSDEPC_BIN}" init 2>&1) || echo "${retry_output}" | grep -qi "error\|failed\|certificate\|urlopen"; then
                     log_error "rosdepc init failed even after SSL fix."
                     echo "${retry_output}"
-                    log_error "Try running manually: run_sudo rosdepc init"
+                    log_error "Try running manually: sudo ${ROSDEPC_BIN} init"
                     exit 1
                 fi
             else
                 log_warn "Skipped SSL fix. Please manually check your network or certificate configuration."
-                log_warn "You can also try running: run_sudo rosdepc init"
+                log_warn "You can also try running: sudo ${ROSDEPC_BIN} init"
                 exit 1
             fi
         fi
@@ -655,14 +713,14 @@ install_system_deps() {
         run_sudo apt-get update -qq
 
         log_info "Updating rosdepc database..."
-        if ! run_cmd rosdepc update --rosdistro=humble; then
+        if ! run_cmd "${ROSDEPC_BIN}" update --rosdistro=humble; then
             log_error "rosdepc update failed. This is usually due to network issues."
             log_error "Please check your network connection and re-run ./scripts/setup.sh"
             exit 1
         fi
 
         log_info "Installing ROS dependencies via apt..."
-        if ! run_cmd rosdepc install \
+        if ! run_cmd "${ROSDEPC_BIN}" install \
             --from-paths src \
             --ignore-src \
             --rosdistro=humble \
@@ -690,7 +748,7 @@ install_system_deps() {
         log_info "Updating dnf package repositories..."
 
         log_info "Updating rosdepc database..."
-        if ! run_cmd rosdepc update --rosdistro=humble; then
+        if ! run_cmd "${ROSDEPC_BIN}" update --rosdistro=humble; then
             log_error "rosdepc update failed. This is usually due to network issues."
             log_error "Please check your network connection and re-run ./scripts/setup.sh"
             exit 1
@@ -699,7 +757,7 @@ install_system_deps() {
         # openEuler relies on manual/system installs for these keys or does not
         # currently provide matching rosdep package mappings.
         log_info "Installing ROS dependencies via dnf..."
-        if ! run_cmd rosdepc install \
+        if ! run_cmd "${ROSDEPC_BIN}" install \
             --from-paths src \
             --ignore-src \
             --rosdistro=humble \
@@ -747,7 +805,28 @@ setup_python_venv() {
     local venv_path="${WORKSPACE}/venv"
     local lerobot_dir="${WORKSPACE}/libs/lerobot"
     local lerobot_submodule_status=""
-    
+
+    # 0. Python interpreter preflight
+    # lerobot + ROS 2 Humble require Python >= 3.10. We print the resolved
+    # interpreter so users can immediately see whether a stale shell prompt
+    # (e.g. starship displaying an old pyenv version) misled them about
+    # which python3 actually drives setup.sh.
+    local host_python_path host_python_version host_py_major host_py_minor
+    host_python_path="$(command -v python3 || true)"
+    if [[ -z "${host_python_path}" ]]; then
+        log_error "python3 not found on PATH. Install python3 (>=3.10) before running setup.sh."
+        exit 1
+    fi
+    host_python_version="$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo "unknown")"
+    log_info "Using host python3: ${host_python_path} (version ${host_python_version})"
+    host_py_major="$(python3 -c 'import sys; print(sys.version_info[0])' 2>/dev/null || echo 0)"
+    host_py_minor="$(python3 -c 'import sys; print(sys.version_info[1])' 2>/dev/null || echo 0)"
+    if (( host_py_major < 3 )) || { (( host_py_major == 3 )) && (( host_py_minor < 10 )); }; then
+        log_error "Python ${host_python_version} is too old. setup.sh requires Python >= 3.10."
+        log_error "On openEuler: 'sudo dnf install -y python3.10 python3.10-devel' and re-run."
+        exit 1
+    fi
+
     # 1. Ensure system-level venv tools are installed
     log_info "Checking for Python venv and pip..."
     if [[ "${DETECTED_OS}" == "ubuntu" ]]; then
@@ -798,7 +877,8 @@ setup_python_venv() {
         fi
         run_cmd python3 -m pip install scipy --quiet
         run_cmd python3 -m pip install gitlint --quiet
-        run_cmd python3 -m pip install "numpy==1.26.4" --quiet
+        run_cmd python3 -m pip install colcon-common-extensions colcon-mixin --quiet
+        run_cmd python3 -m pip install rosdepc --quiet
         run_cmd gitlint install-hook
         log_done "Python dependencies planned for venv"
         return 0
@@ -814,47 +894,52 @@ setup_python_venv() {
         log_error "Expected a working virtual environment python executable."
         exit 1
     fi
-    
+
+    local pip_install=("${venv_python}" -m pip install)
+
     # 升级 pip
     run_cmd "${venv_python}" -m pip install --upgrade pip --quiet
-    
+
     # 解决 setuptools 版本冲突 (兼容 LeRobot 和 colcon)
     run_cmd "${venv_python}" -m pip install "setuptools<80" "setuptools>=71" --quiet
 
     # 以可编辑模式安装 LeRobot
+    # 注意: 不传 -c numpy==1.26.4 约束。lerobot 依赖图(rerun-sdk/opencv/
+    # datasets/...)在 numpy>=2 下解析，硬约束会让 pip 进入 resolution-too-deep。
+    # 这里放任安装 numpy 2.x，最后再 force-reinstall 回 1.26.4 + opencv<4.12。
     log_info "Installing LeRobot in editable mode..."
-    run_cmd "${venv_python}" -m pip install -e "${lerobot_dir}"
+    run_cmd "${pip_install[@]}" -e "${lerobot_dir}"
 
     # 安装原有的硬件依赖
     log_info "Installing hardware dependencies (pyserial, feetech)..."
-    run_cmd "${venv_python}" -m pip install pyserial feetech-servo-sdk --quiet
+    run_cmd "${pip_install[@]}" pyserial feetech-servo-sdk --quiet
 
     if [[ "${DETECTED_OS}" == "openeuler-embedded" ]]; then
         log_info "Installing openEuler fallback dependency (aiortc) into the workspace venv..."
-        run_cmd "${venv_python}" -m pip install aiortc --quiet
+        run_cmd "${pip_install[@]}" aiortc --quiet
     fi
 
     # 安装 scipy 用于数学计算 (四元数/旋转矩阵转换)
     log_info "Installing scipy for mathematical computations..."
-    run_cmd "${venv_python}" -m pip install scipy --quiet
+    run_cmd "${pip_install[@]}" scipy --quiet
 
     # 安装训练可视化依赖
     log_info "Installing training visualization dependencies (tensorboard)..."
-    run_cmd "${venv_python}" -m pip install tensorboard --quiet
+    run_cmd "${pip_install[@]}" tensorboard --quiet
 
     # 安装录制可视化依赖
     log_info "Installing recording visualization dependency (rerun-sdk)..."
-    run_cmd "${venv_python}" -m pip install "rerun-sdk>=0.24,<0.26" --quiet
+    run_cmd "${pip_install[@]}" "rerun-sdk>=0.24,<0.26" --quiet
     log_info "Installing rerun compatibility dependency (typing-extensions>=4.12)..."
-    run_cmd "${venv_python}" -m pip install "typing-extensions>=4.12" --quiet
+    run_cmd "${pip_install[@]}" "typing-extensions>=4.12" --quiet
 
     # 安装 ONNX 导出相关依赖
     if is_openeuler; then
         log_info "Installing ONNX export dependencies (onnx, onnxruntime); skipping onnxsim on openEuler..."
-        run_cmd "${venv_python}" -m pip install onnx onnxruntime --quiet
+        run_cmd "${pip_install[@]}" onnx onnxruntime --quiet
     else
         log_info "Installing ONNX export dependencies (onnx, onnxsim, onnxruntime)..."
-        run_cmd "${venv_python}" -m pip install onnx onnxsim onnxruntime --quiet
+        run_cmd "${pip_install[@]}" onnx onnxsim onnxruntime --quiet
     fi
 
     # 安装 gitlint 并设置 git hook
@@ -868,9 +953,27 @@ setup_python_venv() {
         pre-commit install
     fi
 
-    # Keep NumPy below 2.0 for ROS 2 Humble and align OpenCV with that ABI.
-    log_info "Pinning NumPy and OpenCV to ROS 2 compatibility versions..."
-    run_cmd "${venv_python}" -m pip install --force-reinstall "numpy==1.26.4" "opencv-python-headless<4.12" --quiet
+    # ------------------------------------------------------------------
+    # Authoritative colcon install: build.sh runs `python3 -m colcon` from
+    # this venv with PYTHONNOUSERSITE=1, so colcon MUST live in the venv's
+    # site-packages (not in ~/.local). Without this, build.sh fails with
+    # "No module named colcon" even though `command -v colcon` succeeds.
+    # ------------------------------------------------------------------
+    log_info "Installing colcon-common-extensions + colcon-mixin into the workspace venv..."
+    run_cmd "${pip_install[@]}" colcon-common-extensions colcon-mixin --quiet
+
+    # rosdepc was already installed into this same venv by the early
+    # ensure_workspace_venv + ensure_rosdepc step. Re-running pip install
+    # here is a no-op when the package is current, and acts as a safety net
+    # in case the venv was recreated between the two steps.
+    log_info "Ensuring rosdepc is present in the workspace venv..."
+    run_cmd "${pip_install[@]}" rosdepc --quiet
+
+    # 强制把 NumPy/OpenCV 拉回 ROS 2 Humble ABI 兼容版本。
+    # lerobot 安装会带入 numpy 2.x，这里无条件覆盖，确保 cv_bridge / image_transport
+    # 等 ROS 包在 runtime 不会触发 numpy.core.multiarray 二进制不兼容错误。
+    log_info "Pinning NumPy 1.26.4 + opencv-python-headless<4.12 (ROS 2 Humble ABI)..."
+    run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" "opencv-python-headless<4.12" --quiet
     local commit_msg_hook
     commit_msg_hook="$(git rev-parse --git-path hooks/commit-msg)"
     if [[ -e "${commit_msg_hook}" ]]; then
@@ -884,6 +987,49 @@ setup_python_venv() {
             printf 'y\n' | gitlint install-hook
         fi
         log_done "gitlint commit-msg hook installed"
+    fi
+
+    # Venv summary: print the key facts users need to debug "wrong python /
+    # wrong colcon" issues without having to source the venv themselves.
+    local venv_numpy_ver="unknown" venv_colcon_path="missing" venv_py_ver="unknown"
+    venv_py_ver="$(PYTHONNOUSERSITE=1 "${venv_python}" -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' 2>/dev/null || echo unknown)"
+    venv_numpy_ver="$(PYTHONNOUSERSITE=1 "${venv_python}" -c 'import numpy; print(numpy.__version__)' 2>/dev/null || echo unknown)"
+    venv_colcon_path="$(PYTHONNOUSERSITE=1 "${venv_python}" -c 'import colcon, os; print(os.path.dirname(colcon.__file__))' 2>/dev/null || echo missing)"
+
+    # User-site inspection: even though build.sh sets PYTHONNOUSERSITE=1 and
+    # we install colcon into the venv, a stale ~/.local/lib/.../colcon left
+    # over from a prior `pip install` (without an active venv) is a known
+    # foot-gun: pip's "Requirement already satisfied" short-circuit will
+    # silently skip re-installing colcon at the system level when it sees
+    # the user-site copy, so any future setup change that relies on
+    # system-level colcon would silently no-op. We surface this state in
+    # the summary and warn explicitly when colcon shadows are detected.
+    local user_site user_site_status="not-present" user_site_colcon=""
+    user_site="$("${venv_python}" -m site --user-site 2>/dev/null || true)"
+    if [[ -n "${user_site}" && -d "${user_site}" ]]; then
+        local user_pkg_count
+        user_pkg_count="$(find "${user_site}" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')"
+        user_site_status="${user_pkg_count} packages"
+        if compgen -G "${user_site}/colcon*" >/dev/null 2>&1; then
+            user_site_colcon="$(compgen -G "${user_site}/colcon*" | head -n1)"
+            user_site_status="${user_pkg_count} packages, has colcon (shadowed)"
+        fi
+    fi
+
+    log_info "Venv summary:"
+    log_info "  python      : ${venv_python} (${venv_py_ver})"
+    log_info "  numpy       : ${venv_numpy_ver}"
+    log_info "  colcon path : ${venv_colcon_path}"
+    log_info "  user-site   : ${user_site:-<unknown>} [${user_site_status}]"
+
+    if [[ -n "${user_site_colcon}" ]]; then
+        log_warn "Stale colcon detected in user-site: ${user_site_colcon}"
+        log_warn "  build.sh sets PYTHONNOUSERSITE=1 and will ignore it,"
+        log_warn "  but pip's 'Requirement already satisfied' short-circuit"
+        log_warn "  may have prevented system-level colcon updates from"
+        log_warn "  taking effect during earlier setup runs."
+        log_warn "  Recommended cleanup:"
+        log_warn "    rm -rf ${user_site}/colcon* ${user_site%/lib/*}/bin/colcon*"
     fi
 
     log_done "Python environment configured"
@@ -906,14 +1052,40 @@ verify_setup() {
         exit 1
     fi
 
-    if ! command -v rosdepc &>/dev/null; then
-        log_error "Verification failed: rosdepc is not available in PATH."
+    # Note: do NOT gate on `[[ -x "${ROSDEPC_BIN}" ]]`. The venv/bin
+    # directory is created with mode 0700 by `python3 -m venv`, and bash's
+    # `-x` test consults the access(2)-style permission view, which can
+    # disagree with the actual exec(2) capability under chroot/sudo
+    # combinations (we have hit this on openEuler dev boards). Trying to
+    # run the binary is both more accurate and more useful here.
+    if [[ -z "${ROSDEPC_BIN:-}" ]]; then
+        log_error "Verification failed: ROSDEPC_BIN is unset; ensure_workspace_venv was not called."
+        exit 1
+    fi
+    if ! "${ROSDEPC_BIN}" --help >/dev/null 2>&1; then
+        log_error "Verification failed: ${ROSDEPC_BIN} did not respond to --help."
+        log_error "  - Check that rosdepc was installed into the workspace venv:"
+        log_error "      ${VENV_PYTHON:-${WORKSPACE}/venv/bin/python3} -m pip show rosdepc"
+        log_error "  - Re-run setup with VERBOSE=1 to see the install transcript."
         exit 1
     fi
 
-    if ! command -v colcon &>/dev/null; then
-        log_error "Verification failed: colcon is not available in PATH."
+    # Check colcon the same way build.sh does: import via the venv python with
+    # PYTHONNOUSERSITE=1, NOT via `command -v colcon`. This catches the legacy
+    # case where ~/.local/bin/colcon shadows a missing venv install.
+    if ! PYTHONNOUSERSITE=1 "${venv_python}" -m colcon --help >/dev/null 2>&1; then
+        log_error "Verification failed: 'python3 -m colcon --help' does not work inside the venv."
+        log_error "build.sh runs colcon this exact way; please reinstall colcon into the venv:"
+        log_error "  source venv/bin/activate"
+        log_error "  PYTHONNOUSERSITE=1 python3 -m pip install --upgrade colcon-common-extensions colcon-mixin"
         exit 1
+    fi
+
+    # Keep the legacy CLI-on-PATH check as a soft signal for users who run
+    # colcon directly outside of build.sh.
+    if ! command -v colcon &>/dev/null; then
+        log_warn "colcon is importable from the venv but no 'colcon' CLI is on PATH."
+        log_warn "Activate the venv (source venv/bin/activate) before running colcon directly."
     fi
 
     # ROS 2's setup.sh reads AMENT_TRACE_SETUP_FILES directly and is not nounset-safe.
