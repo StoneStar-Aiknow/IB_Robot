@@ -1,0 +1,29 @@
+From af8d6d55488cde84ce7dc68a7982a4769d39dc6e Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Fri, 24 Apr 2026 22:24:06 +0800
+Subject: [PATCH 6/6] compat: add ascend om config fields
+
+---
+ src/lerobot/configs/policies.py | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/lerobot/configs/policies.py b/src/lerobot/configs/policies.py
+index ce567b8f..9930aa6c 100644
+--- a/src/lerobot/configs/policies.py
++++ b/src/lerobot/configs/policies.py
+@@ -80,6 +80,12 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
+     # saved using `Policy.save_pretrained`. If not provided, the policy is initialized from scratch.
+     pretrained_path: Path | None = None
+ 
++    # Compatibility knobs for the legacy Ascend/OM export workflow that now lives in IB_Robot.
++    is_ascend_om_enabled: bool = False
++    is_ascend_om_3403_enabled: bool = False
++    cpp_executable: str = ""
++    om_model_path: str = ""
++
+     def __post_init__(self) -> None:
+         if not self.device or not is_torch_device_available(self.device):
+             auto_device = auto_select_torch_device()
+-- 
+2.34.1
+

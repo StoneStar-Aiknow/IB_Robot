@@ -1,0 +1,68 @@
+From b66f3b5a595643cdb9cbd59b1fda788e71b43a4d Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Fri, 24 Apr 2026 22:24:06 +0800
+Subject: [PATCH 5/6] compat: add npu device detection
+
+---
+ src/lerobot/utils/device_utils.py | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/lerobot/utils/device_utils.py b/src/lerobot/utils/device_utils.py
+index 37981f07..ea456fb0 100644
+--- a/src/lerobot/utils/device_utils.py
++++ b/src/lerobot/utils/device_utils.py
+@@ -19,11 +19,18 @@ import logging
+ import torch
+ 
+ 
++def _is_npu_available() -> bool:
++    return bool(getattr(torch, "npu", None)) and torch.npu.is_available()
++
++
+ def auto_select_torch_device() -> torch.device:
+     """Tries to select automatically a torch device."""
+     if torch.cuda.is_available():
+         logging.info("Cuda backend detected, using cuda.")
+         return torch.device("cuda")
++    elif _is_npu_available():
++        logging.info("NPU backend detected, using npu.")
++        return torch.device("npu")
+     elif torch.backends.mps.is_available():
+         logging.info("Metal backend detected, using mps.")
+         return torch.device("mps")
+@@ -42,6 +49,9 @@ def get_safe_torch_device(try_device: str, log: bool = False) -> torch.device:
+     if try_device.startswith("cuda"):
+         assert torch.cuda.is_available()
+         device = torch.device(try_device)
++    elif try_device.startswith("npu"):
++        assert _is_npu_available()
++        device = torch.device(try_device)
+     elif try_device == "mps":
+         assert torch.backends.mps.is_available()
+         device = torch.device("mps")
+@@ -90,6 +100,8 @@ def is_torch_device_available(try_device: str) -> bool:
+     try_device = str(try_device)  # Ensure try_device is a string
+     if try_device.startswith("cuda"):
+         return torch.cuda.is_available()
++    elif try_device.startswith("npu"):
++        return _is_npu_available()
+     elif try_device == "mps":
+         return torch.backends.mps.is_available()
+     elif try_device == "xpu":
+@@ -97,11 +109,11 @@ def is_torch_device_available(try_device: str) -> bool:
+     elif try_device == "cpu":
+         return True
+     else:
+-        raise ValueError(f"Unknown device {try_device}. Supported devices are: cuda, mps, xpu or cpu.")
++        raise ValueError(f"Unknown device {try_device}. Supported devices are: cuda, npu, mps, xpu or cpu.")
+ 
+ 
+ def is_amp_available(device: str):
+-    if device in ["cuda", "xpu", "cpu"]:
++    if device in ["cuda", "npu", "xpu", "cpu"]:
+         return True
+     elif device == "mps":
+         return False
+-- 
+2.34.1
+

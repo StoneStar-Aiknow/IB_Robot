@@ -1,0 +1,1655 @@
+From 95e1368ad46dc2b4d81b7dac86c5db66b62ec051 Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Fri, 24 Apr 2026 22:41:22 +0800
+Subject: [PATCH] feature: add mt_act model
+
+---
+ src/lerobot/policies/factory.py               |   9 +-
+ .../policies/mt_act/configuration_mt_act.py   | 167 ++++
+ src/lerobot/policies/mt_act/constants.py      |  19 +
+ .../policies/mt_act/language_embedding.py     |  21 +
+ .../policies/mt_act/modeling_mt_act.py        | 836 ++++++++++++++++++
+ src/lerobot/policies/mt_act/resnet_film.py    | 519 +++++++++++
+ 6 files changed, 1570 insertions(+), 1 deletion(-)
+ create mode 100644 src/lerobot/policies/mt_act/configuration_mt_act.py
+ create mode 100644 src/lerobot/policies/mt_act/constants.py
+ create mode 100644 src/lerobot/policies/mt_act/language_embedding.py
+ create mode 100644 src/lerobot/policies/mt_act/modeling_mt_act.py
+ create mode 100644 src/lerobot/policies/mt_act/resnet_film.py
+
+diff --git a/src/lerobot/policies/factory.py b/src/lerobot/policies/factory.py
+index eb626675..bc084c10 100644
+--- a/src/lerobot/policies/factory.py
++++ b/src/lerobot/policies/factory.py
+@@ -31,6 +31,7 @@ from lerobot.envs.utils import env_to_policy_features
+ from lerobot.policies.act.configuration_act import ACTConfig
+ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+ from lerobot.policies.groot.configuration_groot import GrootConfig
++from lerobot.policies.mt_act.configuration_mt_act import MTACTConfig
+ from lerobot.policies.pi0.configuration_pi0 import PI0Config
+ from lerobot.policies.pi05.configuration_pi05 import PI05Config
+ from lerobot.policies.pretrained import PreTrainedPolicy
+@@ -79,6 +80,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
+         from lerobot.policies.act.modeling_act import ACTPolicy
+ 
+         return ACTPolicy
++    elif name == "mt_act":
++        from lerobot.policies.mt_act.modeling_mt_act import MTACTPolicy
++
++        return MTACTPolicy
+     elif name == "vqbet":
+         from lerobot.policies.vqbet.modeling_vqbet import VQBeTPolicy
+ 
+@@ -136,6 +141,8 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
+         return DiffusionConfig(**kwargs)
+     elif policy_type == "act":
+         return ACTConfig(**kwargs)
++    elif policy_type == "mt_act":
++        return MTACTConfig(**kwargs)
+     elif policy_type == "vqbet":
+         return VQBeTConfig(**kwargs)
+     elif policy_type == "pi0":
+@@ -266,7 +273,7 @@ def make_pre_post_processors(
+             dataset_stats=kwargs.get("dataset_stats"),
+         )
+ 
+-    elif isinstance(policy_cfg, ACTConfig):
++    elif isinstance(policy_cfg, (ACTConfig, MTACTConfig)):
+         from lerobot.policies.act.processor_act import make_act_pre_post_processors
+ 
+         processors = make_act_pre_post_processors(
+diff --git a/src/lerobot/policies/mt_act/configuration_mt_act.py b/src/lerobot/policies/mt_act/configuration_mt_act.py
+new file mode 100644
+index 00000000..14693b64
+--- /dev/null
++++ b/src/lerobot/policies/mt_act/configuration_mt_act.py
+@@ -0,0 +1,167 @@
++#!/usr/bin/env python
++
++# Copyright 2024 Tony Z. Zhao and The HuggingFace Inc. team. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++from dataclasses import dataclass, field, fields
++
++from lerobot.configs.policies import PreTrainedConfig
++from lerobot.configs.types import NormalizationMode
++from lerobot.optim.optimizers import AdamWConfig
++
++
++@dataclass
++class FilmConfig:
++    """FiLM (Feature-wise Linear Modulation) 的配置类"""
++
++    use: bool = True  # 是否在该配置实例中启用FiLM
++    use_in_layers: list[int] = field(
++        default_factory=lambda: [0, 1, 2, 3]  # 对应 layer2, layer3, layer4
++    )
++    task_embedding_dim: int = 2048  # 必须与MTACTConfig中的dim_model相同
++    film_planes: list[int] = field(
++        default_factory=lambda: [64, 128, 256, 512]  # 每层的通道数
++    )
++    append_object_mask: bool | None = None  # 是否添加物体掩码作为额外输入通道
++
++
++@PreTrainedConfig.register_subclass("mt_act")
++@dataclass
++class MTACTConfig(PreTrainedConfig):
++    # 继承ACT的基础配置
++    n_obs_steps: int = 1
++    chunk_size: int = 100
++    n_action_steps: int = 100
++
++    normalization_mapping: dict[str, NormalizationMode] = field(
++        default_factory=lambda: {
++            "VISUAL": NormalizationMode.MEAN_STD,
++            "STATE": NormalizationMode.MEAN_STD,
++            "ACTION": NormalizationMode.MEAN_STD,
++        }
++    )
++
++    # 视觉骨干网络配置
++    vision_backbone: str = "resnet18"
++    pretrained_backbone_weights: str | None = "ResNet18_Weights.IMAGENET1K_V1"
++    replace_final_stride_with_dilation: bool = False
++
++    # Transformer配置
++    pre_norm: bool = False
++    dim_model: int = 2048
++    n_heads: int = 8
++    dim_feedforward: int = 3200
++    feedforward_activation: str = "relu"
++    n_encoder_layers: int = 4
++    n_decoder_layers: int = 7
++
++    # VAE配置
++    use_vae: bool = True
++    latent_dim: int = 32
++    n_vae_encoder_layers: int = 4
++
++    # 推理配置
++    temporal_ensemble_coeff: float | None = None
++    left_act_num: int | None = 90
++
++    # 训练配置
++    dropout: float = 0.1
++    kl_weight: float = 10.0
++    optimizer_lr: float = 1e-5
++    optimizer_weight_decay: float = 1e-4
++    optimizer_lr_backbone: float = 1e-5
++
++    # 新增：语言模型配置
++    use_language: bool = True
++    task_emb_dim: int = 384  # task_embedding初始维度
++    use_film: bool = True  # 是否使用FiLM
++
++    # 初始化FilmConfig实例
++    film_config: FilmConfig = field(default_factory=FilmConfig)
++
++    # Knowledge distillation from a pretrained model.
++    kd: bool = False  # Whether to use knowledge distillation during training.
++    teacher_train_config: str | None = None  # Path to the teacher model's train_config.json
++    decoder_out_dim: int = 1024  # Dimension of the decoder output used in the distillation.
++
++    def __post_init__(self):
++        super().__post_init__()
++        if isinstance(self.film_config, dict):
++            # 获取 FilmConfig 所有合法的字段名
++            valid_film_fields = {f.name for f in fields(FilmConfig)}
++            # 过滤字典，只保留合法字段（防止旧配置中含有废弃参数）
++            filtered_dict = {k: v for k, v in self.film_config.items() if k in valid_film_fields}
++            # 重新实例化为 FilmConfig 对象
++            self.film_config = FilmConfig(**filtered_dict)
++        # 输入验证
++        if not self.vision_backbone.startswith("resnet"):
++            raise ValueError(
++                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
++            )
++        if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
++            raise NotImplementedError("`n_action_steps` must be 1 when using temporal ensembling.")
++        if self.n_action_steps > self.chunk_size:
++            raise ValueError(
++                f"`n_action_steps` ({self.n_action_steps}) must be <= `chunk_size` ({self.chunk_size})."
++            )
++        if self.n_obs_steps != 1:
++            raise ValueError(
++                f"Multiple observation steps not handled yet. Got `n_obs_steps={self.n_obs_steps}`"
++            )
++        # FiLM相关验证（仅在use_film为True时执行）
++        if self.use_film:
++            # 1. 确保film_config.use也是True
++            if not self.film_config.use:
++                raise ValueError("When `use_film` is True, `film_config.use` must also be True")
++
++            # 2. 验证task_embedding_dim与dim_model匹配
++            if self.film_config.task_embedding_dim != self.dim_model:
++                raise ValueError(
++                    f"`film_config.task_embedding_dim` ({self.film_config.task_embedding_dim}) "
++                    f"must be equal to `dim_model` ({self.dim_model}) when using FiLM"
++                )
++
++            # 3. 验证use_in_layers是否为有效索引
++            max_layer_idx = len(self.film_config.film_planes) - 1
++            for layer in self.film_config.use_in_layers:
++                if layer < 0 or layer > max_layer_idx:
++                    raise ValueError(
++                        f"Invalid layer index {layer} in `film_config.use_in_layers`. "
++                        f"Must be between 0 and {max_layer_idx} (inclusive)."
++                    )
++
++    def get_optimizer_preset(self) -> AdamWConfig:
++        return AdamWConfig(
++            lr=self.optimizer_lr,
++            weight_decay=self.optimizer_weight_decay,
++        )
++
++    def get_scheduler_preset(self) -> None:
++        return None
++
++    def validate_features(self) -> None:
++        if not self.image_features and not self.env_state_feature and not self.use_language:
++            raise ValueError("You must provide at least one image, environment state, or language input.")
++
++    @property
++    def observation_delta_indices(self) -> None:
++        return None
++
++    @property
++    def action_delta_indices(self) -> list:
++        return list(range(self.chunk_size))
++
++    @property
++    def reward_delta_indices(self) -> None:
++        return None
+diff --git a/src/lerobot/policies/mt_act/constants.py b/src/lerobot/policies/mt_act/constants.py
+new file mode 100644
+index 00000000..b59357a0
+--- /dev/null
++++ b/src/lerobot/policies/mt_act/constants.py
+@@ -0,0 +1,19 @@
++import numpy as np
++
++box_embeddings = np.load("xxxx")[0]
++plate_embeddings = np.load("xxxx")[0]
++
++tasks = ["Grasp the banana and place it in the box", "Pick up the banana and put it on the plate"]  # 待补充
++
++embeddings = [box_embeddings, plate_embeddings]  # # 待补充
++
++# 创建一个字典将任务映射到嵌入向量
++task_to_embedding_dict = dict(zip(tasks, embeddings, strict=True))
++
++
++def task_to_embedding(task_name):
++    """
++    Maps a task to its corresponding embedding.
++    If the task is not found, returns None.
++    """
++    return task_to_embedding_dict.get(task_name)
+diff --git a/src/lerobot/policies/mt_act/language_embedding.py b/src/lerobot/policies/mt_act/language_embedding.py
+new file mode 100644
+index 00000000..82c2659c
+--- /dev/null
++++ b/src/lerobot/policies/mt_act/language_embedding.py
+@@ -0,0 +1,21 @@
++import numpy as np
++import pandas as pd
++from sentence_transformers import SentenceTransformer
++
++# 加载模型（会自动下载到本地缓存）
++# model = SentenceTransformer('all-MiniLM-L6-v2')
++path = "xxxx"
++model = SentenceTransformer(path)
++
++# 示例文本（可替换为你的问题列表）
++texts = ["Pick up the banana and put it on the plate"]
++
++# 生成嵌入向量（在本地运行，无需API）
++embeddings = model.encode(texts)
++output_npy_path = "plate_embeddings.npy"
++# 直接儲存模型輸出的 embeddings 陣列
++np.save(output_npy_path, embeddings)
++# 转换为DataFrame并展示
++embeddings_df = pd.DataFrame(embeddings)
++print(f"生成的嵌入矩阵形状: {embeddings_df.shape}")  # 应输出 (13, 384)
++print(embeddings_df.head())  # 显示前几行
+diff --git a/src/lerobot/policies/mt_act/modeling_mt_act.py b/src/lerobot/policies/mt_act/modeling_mt_act.py
+new file mode 100644
+index 00000000..1c4406ea
+--- /dev/null
++++ b/src/lerobot/policies/mt_act/modeling_mt_act.py
+@@ -0,0 +1,836 @@
++#!/usr/bin/env python
++
++# Copyright 2024 The HuggingFace Inc. team. All rights reserved.
++# Licensed under the Apache License, Version 2.0 (the "License")
++
++import math
++import os
++from collections import deque
++from collections.abc import Callable
++from itertools import chain
++from typing import Any
++
++import einops
++import numpy as np
++import torch
++import torch.nn.functional as f
++import torchvision
++from torch import Tensor, nn
++from torchvision.models._utils import IntermediateLayerGetter
++
++# LeRobot 内部组件
++from lerobot.policies.act.processor_act import make_act_pre_post_processors
++from lerobot.policies.mt_act.configuration_mt_act import MTACTConfig
++from lerobot.policies.mt_act.constants import task_to_embedding
++from lerobot.policies.mt_act.resnet_film import ResNetFilmBackbone
++from lerobot.policies.pretrained import PreTrainedPolicy
++from lerobot.processor.converters import batch_to_transition
++from lerobot.utils.attention_masking import create_interactive_masks, process_pixel_mask_to_feature_mask
++from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
++from lerobot.utils.visualization import RealTimeVisualizer
++
++
++class MTACTPolicy(PreTrainedPolicy):
++    """
++    Multimodal Action Chunking Transformer Policy.
++    精简版：同步推理，标准队列管理，无平滑，支持语言与掩码。
++    """
++
++    config_class = MTACTConfig
++    name = "mt_act"
++
++    def __init__(self, config: MTACTConfig):
++        super().__init__(config)
++        config.validate_features()
++        self.config = config
++
++        # 1. 核心模型初始化
++        self.model = MTACT(config)
++
++        # 2. 标准动作队列
++        self._action_queue = deque([], maxlen=self.config.n_action_steps)
++
++        # 3. 可视化与交互状态
++        self.inference_step_counter = 0
++        self.enable_visualization = False
++        self.visualization_frequency = 10
++        self.visualization_dir = "inference_visualizations"
++        self.action_queries_to_visualize = list(range(0, config.chunk_size, max(1, config.chunk_size // 5)))
++        self.last_attn_weights = None
++
++        self.enable_interactive_masking = False
++        self.user_attention_masks = {}
++        self._is_first_action_of_episode = True
++        self.gui_save_dir = "gui_interactions"
++
++        # 4. 实时可视化器初始化 (可选)
++        self.visualizer = None
++        if os.environ.get("VIZ_MODE", "file").lower() == "interactive" and self.config.image_features:
++            self.visualizer = RealTimeVisualizer(
++                camera_keys=list(self.config.image_features.keys()),
++                queries_to_visualize=self.action_queries_to_visualize,
++                layer_idx=-1,
++                batch_idx=0,
++                average_heads=True,
++                blend_alpha=0.4,
++            )
++
++        self.reset()
++
++    def reset(self):
++        """环境重置时调用"""
++        self._action_queue.clear()
++        self.inference_step_counter = 0
++        self.last_attn_weights = None
++        self.user_attention_masks.clear()
++        self._is_first_action_of_episode = True
++        if self.visualizer:
++            self.visualizer.close()
++
++    def get_optim_params(self) -> list[dict]:
++        return [
++            {
++                "params": [
++                    p for n, p in self.named_parameters() if "model.backbone" not in n and p.requires_grad
++                ]
++            },
++            {
++                "params": [
++                    p for n, p in self.named_parameters() if "model.backbone" in n and p.requires_grad
++                ],
++                "lr": self.config.optimizer_lr_backbone,
++            },
++        ]
++
++    @torch.no_grad()
++    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
++        """选择动作的核心入口"""
++        self.eval()
++
++        # A. 语言预处理
++        if self.config.use_language and "task" in batch:
++            device = batch[OBS_STATE].device
++            encoded_text = self.model.encode_text(batch["task"]).to(device)
++            batch["language_features"] = encoded_text
++
++        # B. 队列逻辑：如果队列空了，同步推理填充 Chunk
++        if len(self._action_queue) == 0:
++            # 推理获得 (Batch, Chunk, Action_Dim)
++            actions_chunk = self.predict_action_chunk(batch)
++
++            # 截取需要执行的步数 (n_action_steps)
++            # 转置为 (Chunk, Batch, Action_Dim) 放入队列
++            actions_to_queue = actions_chunk[:, : self.config.n_action_steps]
++            self._action_queue.extend(actions_to_queue.transpose(0, 1))
++
++        # C. 从队列弹出一个动作
++        action = self._action_queue.popleft()
++
++        # D. 可视化
++        self.inference_step_counter += 1
++        self._visualize_if_enabled(batch)
++
++        if action.ndim == 2:
++            action = action.squeeze(0)
++
++        return action
++
++    @torch.no_grad()
++    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
++        """同步推理核心逻辑"""
++        if self.config.image_features:
++            batch = dict(batch)
++            # 这里的 batch[OBS_IMAGES] 供 MTACT.forward 使用
++            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
++
++        # 确保语言特征存在
++        if self.config.use_language and "task" in batch and "language_features" not in batch:
++            batch["language_features"] = self.model.encode_text(batch["task"]).to(batch[OBS_STATE].device)
++
++        # 交互式掩码处理
++        if self._is_first_action_of_episode and self.enable_interactive_masking:
++            self._handle_gui_masks(batch)
++            self._is_first_action_of_episode = False
++
++        enc_mask, dec_mask = self._build_transformer_masks(batch)
++
++        # 前向传播
++        actions, _, attn_weights, _ = self.model(
++            batch, attention_mask=dec_mask, encoder_key_padding_mask=enc_mask
++        )
++
++        self.last_attn_weights = attn_weights
++        return actions
++
++    def _handle_gui_masks(self, batch):
++        pixel_masks = create_interactive_masks(batch, self.gui_save_dir)
++        if pixel_masks:
++            for cam_key, mask_gray in pixel_masks.items():
++                f_mask = process_pixel_mask_to_feature_mask(
++                    mask_image=mask_gray, feature_map_size=self.model.get_feature_map_size()
++                )
++                if f_mask is not None:
++                    self.user_attention_masks[cam_key] = f_mask
++
++    def _build_transformer_masks(self, batch) -> tuple[Tensor | None, Tensor | None]:
++        if not self.user_attention_masks:
++            return None, None
++
++        device = batch[OBS_STATE].device
++        f_size = self.model.get_feature_map_size()
++        f_area = f_size[0] * f_size[1]
++
++        all_cam_masks = []
++        for cam_key in self.config.image_features:
++            if cam_key in self.user_attention_masks:
++                all_cam_masks.append(self.user_attention_masks[cam_key].to(device))
++            else:
++                all_cam_masks.append(torch.zeros(f_area, dtype=torch.bool, device=device))
++
++        visual_mask = torch.cat(all_cam_masks)
++        num_1d = (
++            1
++            + (1 if self.config.robot_state_feature else 0)
++            + (1 if self.config.env_state_feature else 0)
++            + (1 if self.config.use_language else 0)
++        )
++
++        one_d_mask = torch.zeros(num_1d, dtype=torch.bool, device=device)
++        full_mask = torch.cat([one_d_mask, visual_mask])
++
++        enc_key_mask = full_mask.unsqueeze(0).expand(batch[OBS_STATE].shape[0], -1)
++        dec_attn_mask = full_mask.unsqueeze(0).expand(self.config.chunk_size, -1)
++        return enc_key_mask, dec_attn_mask
++
++    def _visualize_if_enabled(self, batch):
++        if not self.enable_visualization or self.last_attn_weights is None:
++            return
++        if self.inference_step_counter % self.visualization_frequency != 0:
++            return
++
++        f_size = self.model.get_feature_map_size()
++        if self.visualizer:
++            self.visualizer.update(self.last_attn_weights, batch, f_size)
++
++    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
++        """训练前向逻辑"""
++        if self.config.image_features:
++            batch = dict(batch)
++            batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
++
++        if self.config.use_language and "task" in batch:
++            batch["language_features"] = self.model.encode_text(batch["task"]).to(batch[ACTION].device)
++
++        actions_hat, (mu_hat, log_sigma_x2_hat), _, _ = self.model(batch)
++
++        l1_loss = (
++            f.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
++        ).mean()
++        loss_dict = {"l1_loss": l1_loss.item()}
++
++        if self.config.use_vae and self.training:
++            mean_kld = (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - log_sigma_x2_hat.exp())).sum(-1).mean()
++            loss_dict["kld_loss"] = mean_kld.item()
++            loss = l1_loss + mean_kld * self.config.kl_weight
++        else:
++            loss = l1_loss
++        return loss, loss_dict
++
++
++def make_mt_act_pre_post_processors(config, dataset_stats=None):
++    """
++    专门为 MTACT 定义的处理器工厂。
++    采用极其稳健的字典拼装逻辑，防止由于 'task' 字符串导致的拼装失败。
++    """
++    # 1. 正常调用标准的 ACT 处理器工厂
++
++    preprocessor, postprocessor = make_act_pre_post_processors(config, dataset_stats)
++
++    # 2. 定义高度防御性的转换逻辑
++    def list_safe_to_transition(data):
++        # 如果数据是列表（DataLoader 没拼好的情况）
++        if isinstance(data, list):
++            # 防御检查：如果列表为空
++            if len(data) == 0:
++                return batch_to_transition({})
++
++            # 如果列表里的第一个元素就不是字典，说明数据流彻底乱了，打印诊断信息
++            if not isinstance(data[0], dict):
++                # 这种情况直接尝试转 Tensor 可能会报错，但能看到真实类型
++                return batch_to_transition(data)
++
++            # 稳健的手动拼装逻辑：先把列表转为 Dict[str, List]
++            collated = {}
++            # 我们先遍历第一个元素的所有 Key
++            for key in data[0]:
++                # 使用最原始的循环，不使用列表推导式，方便排错
++                val_list = []
++                for item in data:
++                    # 确保 item 是字典且包含该 key，否则跳过
++                    if isinstance(item, dict) and key in item:
++                        val_list.append(item[key])
++
++                if not val_list:
++                    continue
++
++                # 情况 A: 处理 Tensor
++                if isinstance(val_list[0], torch.Tensor):
++                    # 检查是否为标量或维度不一，stack 前做安全处理
++                    collated[key] = torch.stack(val_list)
++
++                # 情况 B: 处理 NumPy
++                elif isinstance(val_list[0], np.ndarray):
++                    collated[key] = torch.from_numpy(np.stack(val_list))
++
++                # 情况 C: 处理字符串 (task) 或其他
++                else:
++                    collated[key] = val_list
++
++            data = collated
++
++        # 此时 data 必须是一个 dict，交给官方转换器转成 EnvTransition 对象
++        return batch_to_transition(data)
++
++    # 3. 覆盖 preprocessor 的转换器
++    preprocessor.to_transition = list_safe_to_transition
++
++    return preprocessor, postprocessor
++
++
++class MTACT(nn.Module):
++    """MTACT 神经网络主体"""
++
++    def __init__(self, config: MTACTConfig):
++        super().__init__()
++        self.config = config
++
++        # 1. VAE 编码器
++        if self.config.use_vae:
++            self.vae_encoder = ACTEncoder(config, is_vae_encoder=True)
++            self.vae_encoder_cls_embed = nn.Embedding(1, config.dim_model)
++            if self.config.robot_state_feature:
++                self.vae_encoder_robot_state_input_proj = nn.Linear(
++                    config.robot_state_feature.shape[0], config.dim_model
++                )
++            self.vae_encoder_action_input_proj = nn.Linear(config.action_feature.shape[0], config.dim_model)
++            self.vae_encoder_latent_output_proj = nn.Linear(config.dim_model, config.latent_dim * 2)
++            n_vae_tokens = 1 + config.chunk_size + (1 if config.robot_state_feature else 0)
++            self.register_buffer(
++                "vae_encoder_pos_enc",
++                create_sinusoidal_pos_embedding(n_vae_tokens, config.dim_model).unsqueeze(0),
++            )
++
++        # 2. 视觉骨干网络
++        if self.config.image_features:
++            if self.config.use_film:
++                self.backbone = ResNetFilmBackbone(
++                    vision_backbone=config.vision_backbone,
++                    pretrained_backbone_weights=config.pretrained_backbone_weights,
++                    film_config=config.film_config,
++                    dim_model=config.dim_model,
++                )
++            else:
++                backbone_model = getattr(torchvision.models, config.vision_backbone)(
++                    weights=config.pretrained_backbone_weights
++                )
++                self.backbone = IntermediateLayerGetter(
++                    backbone_model, return_layers={"layer4": "feature_map"}
++                )
++
++        # 3. Transformer 核心
++        self.encoder = ACTEncoder(config)
++        self.decoder = ACTDecoder(config)
++
++        # 4. 投影层
++        self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
++        if self.config.robot_state_feature:
++            self.encoder_robot_state_input_proj = nn.Linear(
++                config.robot_state_feature.shape[0], config.dim_model
++            )
++        if self.config.env_state_feature:
++            self.encoder_env_state_input_proj = nn.Linear(config.env_state_feature.shape[0], config.dim_model)
++        if self.config.use_language:
++            self.encoder_language_input_proj = nn.Linear(config.task_emb_dim, config.dim_model)
++
++        if self.config.image_features:
++            # 自动获取输入维度
++            if self.config.use_film:
++                in_features = self.backbone._fc_in_features
++            else:
++                in_features = 512 if self.config.vision_backbone in ["resnet18", "resnet34"] else 2048
++
++            self.encoder_img_feat_input_proj = nn.Conv2d(in_features, config.dim_model, kernel_size=1)
++            self.encoder_cam_feat_pos_embed = ACTSinusoidalPositionEmbedding2d(config.dim_model // 2)
++
++        # 5. 位置编码与输出头
++        n_1d_tokens = (
++            1
++            + (1 if config.robot_state_feature else 0)
++            + (1 if config.env_state_feature else 0)
++            + (1 if config.use_language else 0)
++        )
++        self.encoder_1d_feature_pos_embed = nn.Embedding(n_1d_tokens, config.dim_model)
++        self.decoder_pos_embed = nn.Embedding(config.chunk_size, config.dim_model)
++        self.action_head = nn.Linear(config.dim_model, config.action_feature.shape[0])
++
++        self._reset_parameters()
++
++    def _reset_parameters(self):
++        for p in chain(self.encoder.parameters(), self.decoder.parameters()):
++            if p.dim() > 1:
++                nn.init.xavier_uniform_(p)
++
++    def encode_text(self, texts: list[Any]) -> Tensor:
++        """
++        将任务名列表映射为 embedding 张量。
++        增加稳健性处理：自动处理嵌套列表 (List of List)。
++        """
++        processed_texts = []
++        for t in texts:
++            temp_t = t
++            # 如果 t 是 ['pick up the box'] 这种嵌套列表，取第一个元素
++            while isinstance(temp_t, list) and len(temp_t) > 0:
++                temp_t = temp_t[0]
++
++            if not isinstance(temp_t, str):
++                temp_t = str(temp_t)
++
++            processed_texts.append(temp_t)
++
++        emb_list = []
++        for t in processed_texts:
++            # 获取 Embedding
++            emb = task_to_embedding(t)
++
++            if emb is None:
++                raise ValueError(
++                    f"Task description '{t}' not found in task_to_embedding_dict. Please check constants.py"
++                )
++
++            if not isinstance(emb, torch.Tensor):
++                emb = torch.tensor(emb, dtype=torch.float32)
++
++            if emb.device.type == "cuda":
++                emb = emb.detach().cpu()
++
++            emb_list.append(emb)
++
++        # 堆叠所有嵌入向量
++        emb = torch.stack(emb_list, dim=0)
++
++        # 计算每行的均值和标准差进行标准化
++        mean = torch.mean(emb, dim=1, keepdim=True)
++        std = torch.std(emb, dim=1, keepdim=True)
++        safe_std = torch.max(std, torch.tensor(1e-8))
++
++        return (emb - mean) / safe_std
++
++    def get_feature_map_size(self):
++        if hasattr(self, "_cached_f_size") and self._cached_f_size:
++            return self._cached_f_size
++        return (7, 7)
++
++    def forward(
++        self,
++        batch: dict[str, Tensor],
++        attention_mask: Tensor | None = None,
++        encoder_key_padding_mask: Tensor | None = None,
++    ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None], Tensor | None, Tensor]:
++        """
++        MTACT 前向传播 (方案 A: VAE 不包含图像)
++        处理 LeRobot 的 (Batch, Time, ...) 格式数据
++        """
++        device = batch[OBS_STATE].device
++        # LeRobot 传进来的 batch[OBS_STATE] 通常是 (B, T, D)
++        batch_size = batch[OBS_STATE].shape[0]
++
++        # --- 1. VAE 潜在变量处理 (仅训练阶段) ---
++        if self.config.use_vae and ACTION in batch and self.training:
++            # A. CLS Token: (B, 1, D)
++            cls_embed = einops.repeat(self.vae_encoder_cls_embed.weight, "1 d -> b 1 d", b=batch_size)
++            vae_encoder_input = [cls_embed]
++
++            # B. Robot State: 取最后一帧
++            if self.config.robot_state_feature:
++                curr_state = batch[OBS_STATE]
++                if curr_state.ndim == 3:
++                    curr_state = curr_state[:, -1]  # (B, T, D) -> (B, D)
++
++                # 投影后 (B, D) -> unsqueeze(1) 变成 (B, 1, D)
++                res_state_embed = self.vae_encoder_robot_state_input_proj(curr_state).unsqueeze(1)
++                vae_encoder_input.append(res_state_embed)
++
++            # C. Action Sequence: 已经是 (B, Chunk_Size, Action_Dim)
++            # 投影后 (B, Chunk_Size, D)
++            action_embed = self.vae_encoder_action_input_proj(batch[ACTION])
++            vae_encoder_input.append(action_embed)
++
++            vae_encoder_input = torch.cat(vae_encoder_input, axis=1)
++
++            pos_embed = self.vae_encoder_pos_enc.clone().detach()
++
++            # cls(False), state(False), actions(根据 batch)
++            cls_joint_is_pad = torch.full(
++                (batch_size, 2 if self.config.robot_state_feature else 1),
++                False,
++                device=device,
++            )
++            vae_key_padding_mask = torch.cat([cls_joint_is_pad, batch["action_is_pad"]], axis=1)
++
++            # VAE 编码 (Sequence First: L, B, D)
++            res = self.vae_encoder(
++                vae_encoder_input.permute(1, 0, 2),
++                pos_embed=pos_embed.permute(1, 0, 2),
++                key_padding_mask=vae_key_padding_mask,
++            )
++            cls_token_out = res[0]  # 提取 CLS token 的输出
++
++            latent_pdf_params = self.vae_encoder_latent_output_proj(cls_token_out)
++            mu = latent_pdf_params[:, : self.config.latent_dim]
++            log_sigma_x2 = latent_pdf_params[:, self.config.latent_dim :]
++            latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
++        else:
++            mu = log_sigma_x2 = None
++            latent_sample = torch.zeros(
++                [batch_size, self.config.latent_dim], dtype=torch.float32, device=device
++            )
++
++        encoder_in_tokens = []
++        encoder_in_pos_embed = []
++        p_idx = 0
++
++        # Latent Token (B, D) -> (1, B, D)
++        latent_token = self.encoder_latent_input_proj(latent_sample).unsqueeze(0)
++        encoder_in_tokens.append(latent_token)
++        encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[p_idx].view(1, 1, -1))
++        p_idx += 1
++
++        # Robot State Token: 取最后一帧
++        if self.config.robot_state_feature:
++            curr_state = batch[OBS_STATE]
++            if curr_state.ndim == 3:
++                curr_state = curr_state[:, -1]
++            state_token = self.encoder_robot_state_input_proj(curr_state).unsqueeze(0)
++            encoder_in_tokens.append(state_token)
++            encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[p_idx].view(1, 1, -1))
++            p_idx += 1
++
++        # Env State Token: 取最后一帧
++        if self.config.env_state_feature:
++            curr_env = batch[OBS_ENV_STATE]
++            if curr_env.ndim == 3:
++                curr_env = curr_env[:, -1]
++            env_token = self.encoder_env_state_input_proj(curr_env).unsqueeze(0)
++            encoder_in_tokens.append(env_token)
++            encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[p_idx].view(1, 1, -1))
++            p_idx += 1
++
++        # Language Token (FiLM 调制基础)
++        lang_emb = None
++        if self.config.use_language and "language_features" in batch:
++            lang_token = self.encoder_language_input_proj(batch["language_features"])
++            lang_emb = lang_token
++            encoder_in_tokens.append(lang_token.unsqueeze(0))
++            encoder_in_pos_embed.append(self.encoder_1d_feature_pos_embed.weight[p_idx].view(1, 1, -1))
++            p_idx += 1
++
++        # 图像特征只在主 Encoder 中使用
++        if self.config.image_features:
++            for img in batch[OBS_IMAGES]:
++                # 如果 LeRobot 提供视频序列 (B, T, C, H, W)，取最后一帧
++                if img.ndim == 5:
++                    img = img[:, -1]
++
++                # Backbone 提取特征图 (B, C, H, W)
++                if self.config.use_film:
++                    features = self.backbone(img, task_emb=lang_emb)["feature_map"]
++                else:
++                    features = self.backbone(img)["feature_map"]
++
++                self._cached_f_size = features.shape[-2:]
++
++                # 位置编码
++                pos = self.encoder_cam_feat_pos_embed(features)
++                # 投影到模型维度 (B, D, H, W)
++                proj_features = self.encoder_img_feat_input_proj(features)
++
++                # (B, D, H, W) -> (H*W, B, D)
++                encoder_in_tokens.append(einops.rearrange(proj_features, "b c h w -> (h w) b c"))
++                encoder_in_pos_embed.append(einops.rearrange(pos, "b c h w -> (h w) b c"))
++
++        # 合并所有 Tokens (Sequence First: S, B, D)
++        encoder_in_tokens = torch.cat(encoder_in_tokens, dim=0)
++        encoder_in_pos_embed = torch.cat(encoder_in_pos_embed, dim=0)
++
++        # Encoder
++        encoder_out = self.encoder(
++            encoder_in_tokens, pos_embed=encoder_in_pos_embed, key_padding_mask=encoder_key_padding_mask
++        )
++
++        # Decoder (全 0 Query)
++        decoder_in = torch.zeros(
++            (self.config.chunk_size, batch_size, self.config.dim_model),
++            dtype=encoder_in_pos_embed.dtype,
++            device=device,
++        )
++        decoder_out, all_cross_attn_weights = self.decoder(
++            decoder_in,
++            encoder_out,
++            encoder_pos_embed=encoder_in_pos_embed,
++            decoder_pos_embed=self.decoder_pos_embed.weight.unsqueeze(1),
++            attention_mask=attention_mask,
++        )
++
++        decoder_out = decoder_out.transpose(0, 1)  # (B, Chunk, D)
++        actions = self.action_head(decoder_out)
++
++        return actions, (mu, log_sigma_x2), all_cross_attn_weights, decoder_out
++
++
++class ACTEncoder(nn.Module):
++    """Convenience module for running multiple encoder layers, maybe followed by normalization."""
++
++    def __init__(self, config: MTACTConfig, is_vae_encoder: bool = False):
++        super().__init__()
++        self.is_vae_encoder = is_vae_encoder
++        num_layers = config.n_vae_encoder_layers if self.is_vae_encoder else config.n_encoder_layers
++        self.layers = nn.ModuleList([ACTEncoderLayer(config) for _ in range(num_layers)])
++        self.norm = nn.LayerNorm(config.dim_model) if config.pre_norm else nn.Identity()
++
++    def forward(
++        self, x: Tensor, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None
++    ) -> Tensor:
++        for layer in self.layers:
++            x = layer(x, pos_embed=pos_embed, key_padding_mask=key_padding_mask)
++        x = self.norm(x)
++        return x
++
++
++class ACTEncoderLayer(nn.Module):
++    def __init__(self, config: MTACTConfig):
++        super().__init__()
++        self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
++
++        # Feed forward layers.
++        self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
++        self.dropout = nn.Dropout(config.dropout)
++        self.linear2 = nn.Linear(config.dim_feedforward, config.dim_model)
++
++        self.norm1 = nn.LayerNorm(config.dim_model)
++        self.norm2 = nn.LayerNorm(config.dim_model)
++        self.dropout1 = nn.Dropout(config.dropout)
++        self.dropout2 = nn.Dropout(config.dropout)
++
++        self.activation = get_activation_fn(config.feedforward_activation)
++        self.pre_norm = config.pre_norm
++
++    def forward(self, x, pos_embed: Tensor | None = None, key_padding_mask: Tensor | None = None) -> Tensor:
++        skip = x
++        if self.pre_norm:
++            x = self.norm1(x)
++        q = k = x if pos_embed is None else x + pos_embed
++        x = self.self_attn(q, k, value=x, key_padding_mask=key_padding_mask)
++        x = x[0]  # note: [0] to select just the output, not the attention weights
++        x = skip + self.dropout1(x)
++        if self.pre_norm:
++            skip = x
++            x = self.norm2(x)
++        else:
++            x = self.norm1(x)
++            skip = x
++        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
++        x = skip + self.dropout2(x)
++        if not self.pre_norm:
++            x = self.norm2(x)
++        return x
++
++
++class ACTDecoder(nn.Module):
++    def __init__(self, config: MTACTConfig):
++        """Convenience module for running multiple decoder layers followed by normalization."""
++        super().__init__()
++        self.layers = nn.ModuleList([ACTDecoderLayer(config) for _ in range(config.n_decoder_layers)])
++        self.norm = nn.LayerNorm(config.dim_model)
++
++    def forward(
++        self,
++        x: Tensor,
++        encoder_out: Tensor,
++        decoder_pos_embed: Tensor | None = None,
++        encoder_pos_embed: Tensor | None = None,
++        attention_mask: Tensor | None = None,
++    ) -> tuple[Tensor, Tensor]:
++        all_cross_attn_weights = []
++        for layer in self.layers:
++            x, cross_attn_weights = layer(
++                x,
++                encoder_out,
++                decoder_pos_embed=decoder_pos_embed,
++                encoder_pos_embed=encoder_pos_embed,
++                attention_mask=attention_mask,
++            )
++            all_cross_attn_weights.append(cross_attn_weights)
++        if self.norm is not None:
++            x = self.norm(x)
++        return x, torch.stack(all_cross_attn_weights, dim=0)
++
++
++class ACTDecoderLayer(nn.Module):
++    def __init__(self, config: MTACTConfig):
++        super().__init__()
++        self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
++        self.multihead_attn = nn.MultiheadAttention(
++            config.dim_model, config.n_heads, dropout=config.dropout, batch_first=False
++        )
++
++        # Feed forward layers.
++        self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
++        self.dropout = nn.Dropout(config.dropout)
++        self.linear2 = nn.Linear(config.dim_feedforward, config.dim_model)
++
++        self.norm1 = nn.LayerNorm(config.dim_model)
++        self.norm2 = nn.LayerNorm(config.dim_model)
++        self.norm3 = nn.LayerNorm(config.dim_model)
++        self.dropout1 = nn.Dropout(config.dropout)
++        self.dropout2 = nn.Dropout(config.dropout)
++        self.dropout3 = nn.Dropout(config.dropout)
++
++        self.activation = get_activation_fn(config.feedforward_activation)
++        self.pre_norm = config.pre_norm
++
++    def maybe_add_pos_embed(self, tensor: Tensor, pos_embed: Tensor | None) -> Tensor:
++        return tensor if pos_embed is None else tensor + pos_embed
++
++    def forward(
++        self,
++        x: Tensor,
++        encoder_out: Tensor,
++        decoder_pos_embed: Tensor | None = None,
++        encoder_pos_embed: Tensor | None = None,
++        attention_mask: Tensor | None = None,
++    ) -> tuple[Tensor, Tensor]:
++        """
++        Args:
++            x: (Decoder Sequence, Batch, Channel) tensor of input tokens.
++            encoder_out: (Encoder Sequence, B, C) output features from the last layer of the encoder we are
++                cross-attending with.
++            encoder_pos_embed: (ES, 1, C) positional embedding for keys (from the encoder).
++            decoder_pos_embed: (DS, 1, C) positional embedding for the queries (from the decoder).
++        Returns:
++            (DS, B, C) tensor of decoder output features.
++        """
++        skip = x
++        if self.pre_norm:
++            x = self.norm1(x)
++        q = k = self.maybe_add_pos_embed(x, decoder_pos_embed)
++        x = self.self_attn(q, k, value=x)[0]  # select just the output, not the attention weights
++        x = skip + self.dropout1(x)
++        if self.pre_norm:
++            skip = x
++            x = self.norm2(x)
++        else:
++            x = self.norm1(x)
++            skip = x
++        cross_attn_out, cross_attn_weights = self.multihead_attn(
++            query=self.maybe_add_pos_embed(x, decoder_pos_embed),
++            key=self.maybe_add_pos_embed(encoder_out, encoder_pos_embed),
++            value=encoder_out,
++            attn_mask=attention_mask,
++            need_weights=True,
++            average_attn_weights=False,
++        )
++        x = skip + self.dropout2(cross_attn_out)
++        if self.pre_norm:
++            skip = x
++            x = self.norm3(x)
++        else:
++            x = self.norm2(x)
++            skip = x
++        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
++        x = skip + self.dropout3(x)
++        if not self.pre_norm:
++            x = self.norm3(x)
++        return x, cross_attn_weights
++
++
++def create_sinusoidal_pos_embedding(num_positions: int, dimension: int) -> Tensor:
++    """1D sinusoidal positional embeddings as in Attention is All You Need.
++
++    Args:
++        num_positions: Number of token positions required.
++    Returns: (num_positions, dimension) position embeddings (the first dimension is the batch dimension).
++
++    """
++
++    def get_position_angle_vec(position):
++        return [position / np.power(10000, 2 * (hid_j // 2) / dimension) for hid_j in range(dimension)]
++
++    sinusoid_table = np.array([get_position_angle_vec(pos_i) for pos_i in range(num_positions)])
++    sinusoid_table[:, 0::2] = np.sin(sinusoid_table[:, 0::2])  # dim 2i
++    sinusoid_table[:, 1::2] = np.cos(sinusoid_table[:, 1::2])  # dim 2i+1
++    return torch.from_numpy(sinusoid_table).float()
++
++
++class ACTSinusoidalPositionEmbedding2d(nn.Module):
++    """2D sinusoidal positional embeddings similar to what's presented in Attention Is All You Need.
++
++    The variation is that the position indices are normalized in [0, 2π] (not quite: the lower bound is 1/H
++    for the vertical direction, and 1/W for the horizontal direction.
++    """
++
++    def __init__(self, dimension: int):
++        """
++        Args:
++            dimension: The desired dimension of the embeddings.
++        """
++        super().__init__()
++        self.dimension = dimension
++        self._two_pi = 2 * math.pi
++        self._eps = 1e-6
++        # Inverse "common ratio" for the geometric progression in sinusoid frequencies.
++        self._temperature = 10000
++
++    def forward(self, x: Tensor) -> Tensor:
++        """
++        Args:
++            x: A (B, C, H, W) batch of 2D feature map to generate the embeddings for.
++        Returns:
++            A (1, C, H, W) batch of corresponding sinusoidal positional embeddings.
++        """
++        not_mask = torch.ones_like(x[0, :1])  # (1, H, W)
++        # Note: These are like range(1, H+1) and range(1, W+1) respectively, but in most implementations
++        # they would be range(0, H) and range(0, W). Keeping it at as is to match the original code.
++        y_range = not_mask.cumsum(1, dtype=torch.float32)
++        x_range = not_mask.cumsum(2, dtype=torch.float32)
++
++        # "Normalize" the position index such that it ranges in [0, 2π].
++        # Note: Adding epsilon on the denominator should not be needed as all values of y_embed and x_range
++        # are non-zero by construction. This is an artifact of the original code.
++        y_range = y_range / (y_range[:, -1:, :] + self._eps) * self._two_pi
++        x_range = x_range / (x_range[:, :, -1:] + self._eps) * self._two_pi
++
++        inverse_frequency = self._temperature ** (
++            2 * (torch.arange(self.dimension, dtype=torch.float32, device=x.device) // 2) / self.dimension
++        )
++
++        x_range = x_range.unsqueeze(-1) / inverse_frequency  # (1, H, W, 1)
++        y_range = y_range.unsqueeze(-1) / inverse_frequency  # (1, H, W, 1)
++
++        # Note: this stack then flatten operation results in interleaved sine and cosine terms.
++        # pos_embed_x and pos_embed_y are (1, H, W, C // 2).
++        pos_embed_x = torch.stack((x_range[..., 0::2].sin(), x_range[..., 1::2].cos()), dim=-1).flatten(3)
++        pos_embed_y = torch.stack((y_range[..., 0::2].sin(), y_range[..., 1::2].cos()), dim=-1).flatten(3)
++        pos_embed = torch.cat((pos_embed_y, pos_embed_x), dim=3).permute(0, 3, 1, 2)  # (1, C, H, W)
++
++        return pos_embed
++
++
++def get_activation_fn(activation: str) -> Callable:
++    """Return an activation function given a string."""
++    if activation == "relu":
++        return f.relu
++    if activation == "gelu":
++        return f.gelu
++    if activation == "glu":
++        return f.glu
++    raise RuntimeError(f"activation should be relu/gelu/glu, not {activation}.")
+diff --git a/src/lerobot/policies/mt_act/resnet_film.py b/src/lerobot/policies/mt_act/resnet_film.py
+new file mode 100644
+index 00000000..87170c4e
+--- /dev/null
++++ b/src/lerobot/policies/mt_act/resnet_film.py
+@@ -0,0 +1,519 @@
++from collections.abc import Callable, Mapping
++from typing import Any
++
++import torch
++import torch.nn as nn
++from torch import Tensor
++from torchvision.models import get_weight
++
++
++def is_torch_version_lower_than_17():
++    major_version = float(torch.__version__.split(".")[0])
++    minor_version = float(torch.__version__.split(".")[1])
++    return major_version == 1 and minor_version < 7
++
++
++if not is_torch_version_lower_than_17():
++    # TODO: Make sure the torchvision version is similarly updated.
++    pass
++
++
++def conv3x3(
++    in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1
++) -> nn.Conv2d:
++    """3x3 convolution with padding"""
++    return nn.Conv2d(
++        in_planes,
++        out_planes,
++        kernel_size=3,
++        stride=stride,
++        padding=dilation,
++        groups=groups,
++        bias=False,
++        dilation=dilation,
++    )
++
++
++def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
++    """1x1 convolution"""
++    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
++
++
++class BasicBlock(nn.Module):
++    expansion: int = 1
++
++    def __init__(
++        self,
++        inplanes: int,
++        planes: int,
++        stride: int = 1,
++        downsample: nn.Module | None = None,
++        groups: int = 1,
++        base_width: int = 64,
++        dilation: int = 1,
++        norm_layer: Callable[..., nn.Module] | None = None,
++    ) -> None:
++        super().__init__()
++        if norm_layer is None:
++            norm_layer = nn.BatchNorm2d
++        if groups != 1 or base_width != 64:
++            raise ValueError("BasicBlock only supports groups=1 and base_width=64")
++        if dilation > 1:
++            raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
++        # Both self.conv1 and self.downsample layers downsample the input when stride != 1
++        self.conv1 = conv3x3(inplanes, planes, stride)
++        self.bn1 = norm_layer(planes)
++        self.relu = nn.ReLU(inplace=True)
++        self.conv2 = conv3x3(planes, planes)
++        self.bn2 = norm_layer(planes)
++        self.downsample = downsample
++        self.stride = stride
++
++    def forward(self, x: Tensor, film_features: Tensor | None = None) -> Tensor:
++        identity = x
++
++        out = self.conv1(x)
++        out = self.bn1(out)
++        out = self.relu(out)
++
++        out = self.conv2(out)
++        out = self.bn2(out)
++        # Apply FiLM here
++        if film_features is not None:
++            # gamma, beta will be (B, 1, 1, planes)
++            gamma, beta = torch.split(film_features, 1, dim=1)
++            gamma = gamma.squeeze().view(x.size(0), -1, 1, 1)
++            beta = beta.squeeze().view(x.size(0), -1, 1, 1)
++            out = (1 + gamma) * out + beta
++
++        if self.downsample is not None:
++            identity = self.downsample(x)
++
++        out += identity
++        out = self.relu(out)
++
++        return out
++
++
++class Bottleneck(nn.Module):
++    # Bottleneck in torchvision places the stride for downsampling at 3x3 convolution(self.conv2)
++    # while original implementation places the stride at the first 1x1 convolution(self.conv1)
++    # according to "Deep residual learning for image recognition"https://arxiv.org/abs/1512.03385.
++    # This variant is also known as ResNet V1.5 and improves accuracy according to
++    # https://ngc.nvidia.com/catalog/model-scripts/nvidia:resnet_50_v1_5_for_pytorch.
++
++    expansion: int = 4
++
++    def __init__(
++        self,
++        inplanes: int,
++        planes: int,
++        stride: int = 1,
++        downsample: nn.Module | None = None,
++        groups: int = 1,
++        base_width: int = 64,
++        dilation: int = 1,
++        norm_layer: Callable[..., nn.Module] | None = None,
++    ) -> None:
++        super().__init__()
++        if norm_layer is None:
++            norm_layer = nn.BatchNorm2d
++        width = int(planes * (base_width / 64.0)) * groups
++        # Both self.conv2 and self.downsample layers downsample the input when stride != 1
++        self.conv1 = conv1x1(inplanes, width)
++        self.bn1 = norm_layer(width)
++        self.conv2 = conv3x3(width, width, stride, groups, dilation)
++        self.bn2 = norm_layer(width)
++        self.conv3 = conv1x1(width, planes * self.expansion)
++        self.bn3 = norm_layer(planes * self.expansion)
++        self.relu = nn.ReLU(inplace=True)
++        self.downsample = downsample
++        self.stride = stride
++
++    def forward(self, x: Tensor) -> Tensor:
++        identity = x
++
++        out = self.conv1(x)
++        out = self.bn1(out)
++        out = self.relu(out)
++
++        out = self.conv2(out)
++        out = self.bn2(out)
++        out = self.relu(out)
++
++        out = self.conv3(out)
++        out = self.bn3(out)
++
++        if self.downsample is not None:
++            identity = self.downsample(x)
++
++        out += identity
++
++        out = self.relu(out)
++
++        return out
++
++
++class ResNetWithExtraModules(nn.Module):
++    """Update standard ResNet image classification models with FiLM."""
++
++    def __init__(
++        self,
++        block: type[BasicBlock | Bottleneck],
++        layers: list[int],
++        num_classes: int = 1000,
++        zero_init_residual: bool = False,
++        groups: int = 1,
++        width_per_group: int = 64,
++        replace_stride_with_dilation: list[bool] | None = None,
++        norm_layer: Callable[..., nn.Module] | None = None,
++        film_config: Mapping[str, Any] | None = None,
++    ) -> None:
++        super().__init__()
++        if norm_layer is None:
++            norm_layer = nn.BatchNorm2d
++        self._norm_layer = norm_layer
++
++        # Save how many blocks in each layer
++        self.layers = layers
++
++        # FiLM only implemented for BasicBlock for now
++        self.use_film = film_config is not None and film_config.use
++        if self.use_film:
++            self.film_config = film_config
++            self.film_planes = film_config.film_planes
++
++        self.inplanes = 64
++        self.dilation = 1
++        if replace_stride_with_dilation is None:
++            # each element in the tuple indicates if we should replace
++            # the 2x2 stride with a dilated convolution instead
++            replace_stride_with_dilation = [False, False, False]
++        if len(replace_stride_with_dilation) != 3:
++            raise ValueError(
++                "replace_stride_with_dilation should be None "
++                f"or a 3-element tuple, got {replace_stride_with_dilation}"
++            )
++
++        # 确定输入通道数：如果使用物体掩码则为4（RGB + mask），否则为3（RGB）
++        in_channels_conv1 = (
++            4
++            if (
++                film_config is not None
++                and film_config.append_object_mask is not None
++                and film_config.append_object_mask
++            )
++            else 3
++        )
++
++        self.groups = groups
++        self.base_width = width_per_group
++        self.conv1 = nn.Conv2d(
++            in_channels_conv1, self.inplanes, kernel_size=7, stride=2, padding=3, bias=False
++        )
++        self.bn1 = norm_layer(self.inplanes)
++        self.relu = nn.ReLU(inplace=True)
++        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
++        # 构建ResNet的4个主要层（layer1到layer4）
++        self.layer1 = self._make_layer(block, 64, layers[0])
++        self.layer2 = self._make_layer(
++            block, 128, layers[1], stride=2, dilate=replace_stride_with_dilation[0]
++        )
++        self.layer3 = self._make_layer(
++            block, 256, layers[2], stride=2, dilate=replace_stride_with_dilation[1]
++        )
++        self.layer4 = self._make_layer(
++            block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2]
++        )
++        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
++        self.fc = nn.Linear(512 * block.expansion, num_classes)
++
++        for _m_name, m in self.named_modules():
++            if isinstance(m, nn.Conv2d):
++                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
++            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
++                nn.init.constant_(m.weight, 1)
++                nn.init.constant_(m.bias, 0)
++
++        # Zero-initialize the last BN in each residual branch,
++        # so that the residual branch starts with zeros, and each residual block behaves like an identity.
++        # This improves the model by 0.2~0.3% according to https://arxiv.org/abs/1706.02677
++        if zero_init_residual:
++            for m in self.modules():
++                if isinstance(m, Bottleneck) and m.bn3.weight is not None:
++                    nn.init.constant_(m.bn3.weight, 0)  # type: ignore[arg-type]
++                elif isinstance(m, BasicBlock) and m.bn2.weight is not None:
++                    nn.init.constant_(m.bn2.weight, 0)  # type: ignore[arg-type]
++
++    def _make_layer(
++        self,
++        block: type[BasicBlock | Bottleneck],
++        planes: int,
++        blocks: int,
++        stride: int = 1,
++        dilate: bool = False,
++    ) -> nn.Sequential:
++        norm_layer = self._norm_layer
++        downsample = None
++        previous_dilation = self.dilation
++        if dilate:
++            self.dilation *= stride
++            stride = 1
++        if stride != 1 or self.inplanes != planes * block.expansion:
++            downsample = nn.Sequential(
++                conv1x1(self.inplanes, planes * block.expansion, stride),
++                norm_layer(planes * block.expansion),
++            )
++
++        layers = [
++            block(
++                self.inplanes,
++                planes,
++                stride,
++                downsample,
++                self.groups,
++                self.base_width,
++                previous_dilation,
++                norm_layer,
++            )
++        ]
++        self.inplanes = planes * block.expansion
++        for _ in range(1, blocks):
++            layers.append(
++                block(
++                    self.inplanes,
++                    planes,
++                    groups=self.groups,
++                    base_width=self.base_width,
++                    dilation=self.dilation,
++                    norm_layer=norm_layer,
++                )
++            )
++
++        if self.use_film:
++            return nn.ModuleList(layers)
++        else:
++            return nn.Sequential(*layers)
++
++    def _forward_impl_film(self, x: Tensor, film_features: list[Tensor | None], flatten: bool = True):
++        assert self.use_film and film_features is not None
++
++        # 解析FiLM参数：将每层的FiLM特征拆分为每层每个block的γ和β
++        def _extract_film_features_for_layer(film_feat: Tensor | None, layer_idx: int):
++            if film_features[layer_idx] is None:
++                return [None] * self.layers[layer_idx]
++
++            # 解析：将film_feat重塑为 (batch, 2, num_blocks, num_planes)
++            # 其中2对应γ（scale）和β（bias），num_blocks是该层的block数量
++            num_planes = self.film_planes[layer_idx]
++            num_blocks = self.layers[layer_idx]
++            film_feat = film_feat.view(-1, 2, num_blocks, num_planes)
++            film_feat_per_block = torch.split(film_feat, 1, dim=2)
++            # 按block分割，得到每个block的FiLM参数
++            return film_feat_per_block
++
++        # 对每个层（layer1→layer4）应用FiLM
++        for layer_idx, layer in enumerate([self.layer1, self.layer2, self.layer3, self.layer4]):
++            # 提取当前层每个block的FiLM参数
++            film_feat_per_block = _extract_film_features_for_layer(film_features[layer_idx], layer_idx)
++            # 逐个block执行，传递对应的FiLM参数
++            for block_idx, block in enumerate(layer):
++                if film_feat_per_block[block_idx] is not None:
++                    assert x.shape[0] == film_feat_per_block[block_idx].shape[0], (
++                        "FiLM batch size does not match"
++                    )
++                x = block(x, film_features=film_feat_per_block[block_idx])
++
++        # 分类头处理（ avgpool + fc ）
++        x = self.avgpool(x)
++        if flatten:
++            x = torch.flatten(x, 1)
++        x = self.fc(x)
++        return x
++
++    def _forward_impl(self, x: Tensor, film_features: list[Tensor | None], flatten: bool = True) -> Tensor:
++        # See note [TorchScript super()]
++        x = self.conv1(x)
++        x = self.bn1(x)
++        x = self.relu(x)
++        x = self.maxpool(x)
++
++        if self.use_film:
++            return self._forward_impl_film(x, film_features, flatten=flatten)
++        else:
++            x = self.layer1(x)
++            x = self.layer2(x)
++            x = self.layer3(x)
++            x = self.layer4(x)
++
++            x = self.avgpool(x)
++            if flatten:
++                x = torch.flatten(x, 1)
++            x = self.fc(x)
++
++            return x
++
++    def forward(self, x: Tensor, film_features: list[Tensor | None], **kwargs) -> Tensor:
++        return self._forward_impl(x, film_features, **kwargs)
++
++
++def _resnet(
++    block: type[BasicBlock | Bottleneck],
++    layers: list[int],
++    progress: bool = True,  # 如果 progress=True（默认值），会在控制台显示权重下载的进度条
++    replace_stride_with_dilation: list[bool] = None,
++    norm_layer: Callable[..., nn.Module] = None,
++    pretrained_backbone_weights: str | None = None,
++    **kwargs: Any,
++) -> ResNetWithExtraModules:
++    # 设置默认的dilation配置
++    if replace_stride_with_dilation is None:
++        replace_stride_with_dilation = [False, False, False]
++
++    # 设置默认的规范化层
++    if norm_layer is None:
++        norm_layer = nn.BatchNorm2d
++
++    # 构建模型
++    model = ResNetWithExtraModules(
++        block,
++        layers,
++        replace_stride_with_dilation=replace_stride_with_dilation,
++        norm_layer=norm_layer,
++        **kwargs,
++    )
++
++    # 加载权重
++    if pretrained_backbone_weights is not None:
++        # 使用torchvision的get_weight方法加载指定权重
++        weights = get_weight(pretrained_backbone_weights)
++        model.load_state_dict(weights.get_state_dict(progress=progress))
++
++    return model
++
++
++def resnet18_film(
++    *, progress: bool = True, pretrained_backbone_weights: str | None = None, **kwargs: Any
++) -> ResNetWithExtraModules:
++    """ResNet-18 from `Deep Residual Learning for Image Recognition <https://arxiv.org/pdf/1512.03385.pdf>`__.
++
++    Args:
++        progress (bool, optional): If True, displays a progress bar of the
++            download to stderr. Default is True.
++        pretrained_backbone_weights (str | None, optional): The name of the pretrained
++            weights to use, e.g. "ResNet18_Weights.IMAGENET1K_V1". By default, no
++            pretrained weights are used.
++        **kwargs: parameters passed to the base class.
++    """
++
++    return _resnet(
++        BasicBlock,
++        [2, 2, 2, 2],
++        progress=progress,
++        pretrained_backbone_weights=pretrained_backbone_weights,
++        **kwargs,
++    )
++
++
++def resnet34_film(
++    *, progress: bool = True, pretrained_backbone_weights: str | None = None, **kwargs: Any
++) -> ResNetWithExtraModules:
++    """ResNet-34 from `Deep Residual Learning for Image Recognition <https://arxiv.org/pdf/1512.03385.pdf>`__.
++
++    Args:
++        progress (bool, optional): If True, displays a progress bar of the
++            download to stderr. Default is True.
++        pretrained_backbone_weights (str | None, optional): The name of the pretrained
++            weights to use, e.g. "ResNet34_Weights.IMAGENET1K_V1". By default, no
++            pretrained weights are used.
++        **kwargs: parameters passed to the base class.
++    """
++    return _resnet(
++        BasicBlock,
++        [3, 4, 6, 3],
++        progress=progress,
++        pretrained_backbone_weights=pretrained_backbone_weights,
++        **kwargs,
++    )
++
++
++class ResNetFilmBackbone(nn.Module):
++    def __init__(
++        self,
++        vision_backbone: str,
++        pretrained_backbone_weights: str | None = None,
++        film_config: Mapping[str, Any] | None = None,
++        dim_model: int = 512,
++        replace_stride_with_dilation: list[bool] | None = None,
++        norm_layer: Callable[..., nn.Module] | None = None,
++    ):
++        super().__init__()
++        # 初始化预训练ResNet模型
++        self._pretrained = pretrained_backbone_weights is not None
++
++        if vision_backbone in ("resnet34_film", "resnet34"):
++            backbone = resnet34_film(
++                pretrained_backbone_weights=pretrained_backbone_weights,
++                film_config=film_config,
++                replace_stride_with_dilation=replace_stride_with_dilation,
++                norm_layer=norm_layer,
++            )
++        elif vision_backbone in ("resnet18_film", "resnet18"):
++            backbone = resnet18_film(
++                pretrained_backbone_weights=pretrained_backbone_weights,
++                film_config=film_config,
++                replace_stride_with_dilation=replace_stride_with_dilation,
++                norm_layer=norm_layer,
++            )
++        else:
++            raise NotImplementedError(f"Vision backbone {vision_backbone} not implemented")
++
++        # 移除原始的分类层，只保留特征提取部分
++        self.resnet_film_model = backbone
++        self._dim_model = dim_model  # 将原来的_embedding_dim改为_dim_model
++
++        # 保存原始fc层的in_features
++        self._fc_in_features = self.resnet_film_model.fc.in_features
++
++        # 替换为Identity层
++        self.resnet_film_model.fc = nn.Identity()
++        self.resnet_film_model.avgpool = nn.Identity()
++
++        self.num_channels = self._dim_model  # 同步更新引用
++
++        # 添加fc属性来保持兼容性
++        self.fc = nn.Identity()
++        self.fc.in_features = self._fc_in_features
++
++        # FiLM配置和模型初始化
++        self.film_config = film_config
++        if film_config is not None and film_config.use:
++            film_models = []
++            for layer_idx, num_blocks in enumerate(self.resnet_film_model.layers):
++                if layer_idx in film_config.use_in_layers:
++                    # 为每个需要FiLM调制的层创建线性映射
++                    num_planes = self.resnet_film_model.film_planes[layer_idx]
++                    film_model_layer = nn.Linear(film_config.task_embedding_dim, num_blocks * 2 * num_planes)
++                else:
++                    film_model_layer = None
++                film_models.append(film_model_layer)
++
++            self.film_models = nn.ModuleList(film_models)
++
++    def forward(self, x, texts: list[str] | None = None, task_emb: torch.Tensor | None = None, **kwargs):
++        film_outputs = None
++        if self.film_config is not None and self.film_config.use:
++            film_outputs = []
++            for layer_idx, _num_blocks in enumerate(self.resnet_film_model.layers):
++                if self.film_config.use and self.film_models[layer_idx] is not None:
++                    film_features = self.film_models[layer_idx](task_emb)
++
++                else:
++                    film_features = None
++                film_outputs.append(film_features)
++        features = self.resnet_film_model(x, film_features=film_outputs, flatten=False)
++        return {"feature_map": features}
++
++    @property
++    def dim_model(self):  # 将原来的embed_dim属性改为dim_model
++        return self._dim_model
+-- 
+2.34.1
+

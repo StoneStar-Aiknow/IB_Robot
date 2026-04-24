@@ -1,0 +1,594 @@
+From 9b16100335cc539a78cacd71b49497c72ed6b2b4 Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Fri, 24 Apr 2026 22:41:21 +0800
+Subject: [PATCH] feature: add ascend om act runtime
+
+---
+ src/lerobot/configs/policies.py          |   5 +
+ src/lerobot/oee/ascend/om/ACTWrapper.py  |  39 ++++
+ src/lerobot/oee/ascend/om/OMmodel.py     | 118 +++++++++++++
+ src/lerobot/policies/act/modeling_act.py | 216 ++++++++++++++++-------
+ 4 files changed, 313 insertions(+), 65 deletions(-)
+ create mode 100644 src/lerobot/oee/ascend/om/ACTWrapper.py
+ create mode 100644 src/lerobot/oee/ascend/om/OMmodel.py
+
+diff --git a/src/lerobot/configs/policies.py b/src/lerobot/configs/policies.py
+index 0ecfa169..3563db2e 100644
+--- a/src/lerobot/configs/policies.py
++++ b/src/lerobot/configs/policies.py
+@@ -76,6 +76,11 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
+     # saved using `Policy.save_pretrained`. If not provided, the policy is initialized from scratch.
+     pretrained_path: Path | None = None
+ 
++    # Whether to use Ascend OM model for inference.
++    is_ascend_om_enabled: bool = False
++    # Path to the Ascend  OM model file.(e.g. /path/to/model.om)
++    om_model_path: str = ""
++
+     def __post_init__(self) -> None:
+         if not self.device or not is_torch_device_available(self.device):
+             auto_device = auto_select_torch_device()
+diff --git a/src/lerobot/oee/ascend/om/ACTWrapper.py b/src/lerobot/oee/ascend/om/ACTWrapper.py
+new file mode 100644
+index 00000000..fb48bd61
+--- /dev/null
++++ b/src/lerobot/oee/ascend/om/ACTWrapper.py
+@@ -0,0 +1,39 @@
++"""
++ACTWrapper.py
++
++加载 act om 模型并推理
++"""
++
++import numpy as np
++import torch
++from torch import Tensor
++from .OMmodel import OMmodel
++from lerobot.policies.act.configuration_act import ACTConfig
++
++
++def logger(msg: str):
++    print(f"[ACTWrapper]: {msg}")
++
++
++class ACTWrapper:
++    def __init__(self, model_path: str, config: ACTConfig):
++        self.om_model = OMmodel(model_path)
++        chunk_size = config.chunk_size
++        action_dim = config.output_features["action"].shape
++        self.input_features = config.input_features
++        self.output_shape = [1, chunk_size, *action_dim]
++        logger(f"Loaded ACT OM model from {model_path}, output shape: {self.output_shape}")
++
++    def predict(self, batch: dict[str, Tensor]) -> tuple:
++        input_arr = []
++
++        for f in self.input_features:
++            if f not in batch:
++                logger(f"WARN: key: {f} not in batch, skipping")
++                continue
++            input_arr.append(batch[f].cpu().numpy())
++
++        output = self.om_model.forward(input_arr)[0]
++
++        o_tensor = torch.from_numpy(np.array(output, dtype=np.float32)).reshape(*self.output_shape)
++        return (o_tensor,)
+diff --git a/src/lerobot/oee/ascend/om/OMmodel.py b/src/lerobot/oee/ascend/om/OMmodel.py
+new file mode 100644
+index 00000000..a4e4ef0e
+--- /dev/null
++++ b/src/lerobot/oee/ascend/om/OMmodel.py
+@@ -0,0 +1,118 @@
++"""
++OMmodel.py
++
++om 模型的封装调用
++该程序是基于官方文档并做了一点点修改编写的通用 om 加载与推理程序
++与不同 om 模型的不同输入输出格式无关
++"""
++
++import acl
++import numpy as np
++
++ACL_MEM_MALLOC_HUGE_FIRST = 0
++ACL_MEMCPY_HOST_TO_DEVICE = 1
++ACL_MEMCPY_DEVICE_TO_HOST = 2
++
++
++def logger(msg: str):
++    print(f"[OM_model]: {msg}")
++
++
++class OMmodel:
++    def __init__(self, model_path):
++        logger(f"model path: {model_path}")
++        self.device_id = 0
++
++        ret = acl.init()
++        self.check_ret(ret, "Failed to init")
++
++        ret = acl.rt.set_device(self.device_id)
++        self.check_ret(ret, "Failed to create device")
++        logger(f"set device id {self.device_id}, ret {ret}")
++
++        self.model_id, ret = acl.mdl.load_from_file(model_path)
++        self.check_ret(ret, "Failed to load model from file")
++
++        self.model_desc = acl.mdl.create_desc()
++        ret = acl.mdl.get_desc(self.model_desc, self.model_id)
++        self.check_ret(ret, "Failed to get desc")
++
++        self.input_dataset, self.input_data = self.prepare_dataset("input")
++        self.output_dataset, self.output_data = self.prepare_dataset("output")
++
++    def forward(self, inputs):
++        input_num = len(inputs)
++        for i in range(input_num):
++            bytes_data = inputs[i].tobytes()
++            bytes_ptr = acl.util.bytes_to_ptr(bytes_data)
++            ret = acl.rt.memcpy(
++                self.input_data[i]["buffer"],
++                self.input_data[i]["size"],
++                bytes_ptr,
++                len(bytes_data),
++                ACL_MEMCPY_HOST_TO_DEVICE,
++            )
++            self.check_ret(ret, "Failed to memcpy from host to device")
++
++        ret = acl.mdl.execute(self.model_id, self.input_dataset, self.output_dataset)
++        self.check_ret(ret, "Failed to execute forward")
++
++        inference_result = []
++        for i, _ in enumerate(self.output_data):
++            buffer_host, ret = acl.rt.malloc_host(self.output_data[i]["size"])
++
++            ret = acl.rt.memcpy(
++                buffer_host,
++                self.output_data[i]["size"],
++                self.output_data[i]["buffer"],
++                self.output_data[i]["size"],
++                ACL_MEMCPY_DEVICE_TO_HOST,
++            )
++            self.check_ret(ret, "Failed to memcpy from device to host")
++            bytes_out = acl.util.ptr_to_bytes(buffer_host, self.output_data[i]["size"])
++
++            data = np.frombuffer(bytes_out, dtype=np.float32)
++            inference_result.append(data)
++
++            ret = acl.rt.free_host(buffer_host)
++            self.check_ret(ret, "Failed to free host")
++
++        return inference_result
++
++    def __del__(self):
++        for dataset in [self.input_data, self.output_data]:
++            while dataset:
++                item = dataset.pop()
++                acl.destroy_data_buffer(item["data"])
++                acl.rt.free(item["buffer"])
++        acl.mdl.destroy_dataset(self.input_dataset)
++        acl.mdl.destroy_dataset(self.output_dataset)
++        acl.mdl.destroy_desc(self.model_desc)
++        acl.mdl.unload(self.model_id)
++        acl.rt.reset_device(self.device_id)
++        acl.finalize()
++
++    def prepare_dataset(self, io_type):
++        if io_type == "input":
++            io_num = acl.mdl.get_num_inputs(self.model_desc)
++            acl_mdl_get_size_by_index = acl.mdl.get_input_size_by_index
++        else:
++            io_num = acl.mdl.get_num_outputs(self.model_desc)
++            acl_mdl_get_size_by_index = acl.mdl.get_output_size_by_index
++
++        dataset = acl.mdl.create_dataset()
++        data = []
++        for i in range(io_num):
++            buffer_size = acl_mdl_get_size_by_index(self.model_desc, i)
++            buffer, ret = acl.rt.malloc(buffer_size, ACL_MEM_MALLOC_HUGE_FIRST)
++            self.check_ret(ret, "Prepare dataset: Failed to malloc")
++
++            data_buffer = acl.create_data_buffer(buffer, buffer_size)
++            _, ret = acl.mdl.add_dataset_buffer(dataset, data_buffer)
++            self.check_ret(ret, "Prepare dataset: Failed to add dataset buffer")
++            data.append({"buffer": buffer, "data": data_buffer, "size": buffer_size})
++        return dataset, data
++
++    def check_ret(self, ret, msg):
++        if ret != 0:
++            raise Exception(f"{msg}, Error code: {ret}")
+diff --git a/src/lerobot/policies/act/modeling_act.py b/src/lerobot/policies/act/modeling_act.py
+index e99a0d37..4d118dc9 100644
+--- a/src/lerobot/policies/act/modeling_act.py
++++ b/src/lerobot/policies/act/modeling_act.py
+@@ -20,10 +20,12 @@ The majority of changes here involve removing unused code, unifying naming, and
+ """
+ 
+ import math
++import os
+ from collections import deque
+ from collections.abc import Callable
+ from itertools import chain
+ 
++import cv2
+ import einops
+ import numpy as np
+ import torch
+@@ -35,18 +37,11 @@ from torchvision.ops.misc import FrozenBatchNorm2d
+ 
+ from lerobot.policies.act.configuration_act import ACTConfig
+ from lerobot.policies.pretrained import PreTrainedPolicy
++from lerobot.utils.attention_masking import create_interactive_masks, process_pixel_mask_to_feature_mask
+ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+-
+-import cv2
+-import os
+-from typing import Optional
+-
+-from lerobot.utils.attention_masking import (
+-    create_interactive_masks,
+-    process_pixel_mask_to_feature_mask
+-)
+ from lerobot.utils.visualization import RealTimeVisualizer, visualize_attention_maps
+ 
++
+ class ACTPolicy(PreTrainedPolicy):
+     """
+     Action Chunking Transformer Policy as per Learning Fine-Grained Bimanual Manipulation with Low-Cost
+@@ -80,6 +75,7 @@ class ACTPolicy(PreTrainedPolicy):
+         self.viz_batch_idx = 0
+         self.viz_average_heads = True
+         self.viz_blend_alpha = 0.4
++        self.last_attn_weights = None
+ 
+         # --- 掩码与交互相关参数 ---
+         self.enable_interactive_masking = False
+@@ -87,14 +83,26 @@ class ACTPolicy(PreTrainedPolicy):
+         self._is_first_action_of_episode = True
+         self.gui_save_dir = "gui_interactions"
+ 
+-        self.model = ACT(config)
++        if self.config.is_ascend_om_enabled:
++            print("[INFO] Ascend om enabled, training and visualization are not allowed")
++            self.enable_interactive_masking = False
++            self.enable_visualization = False
++            from lerobot.oee.ascend.om.ACTWrapper import ACTWrapper
++
++            # use precompiled kernels to speed up warm up phase
++            self.om_model = ACTWrapper(self.config.om_model_path, self.config)
++            torch.npu.set_compile_mode(jit_compile=False)
++        else:
++            # only init original act model here to speed up warm up phase in om mode
++            self.model = ACT(config)
+ 
+         if config.temporal_ensemble_coeff is not None:
+             self.temporal_ensembler = ACTTemporalEnsembler(config.temporal_ensemble_coeff, config.chunk_size)
+ 
+         # RealTimeVisualizer初始化
+         self.visualizer = None
+-        if os.environ.get('VIZ_MODE', 'file').lower() == 'interactive':
++        if os.environ.get("VIZ_MODE", "file").lower() == "interactive":
++            self.visualization_frequency = 1
+             print("--- INFO: Real-time interactive visualization mode is ENABLED. ---")
+             if self.config.image_features:
+                 self.visualizer = RealTimeVisualizer(
+@@ -106,7 +114,9 @@ class ACTPolicy(PreTrainedPolicy):
+                     blend_alpha=self.viz_blend_alpha,
+                 )
+             else:
+-                print("--- WARNING: Interactive visualization enabled, but no image features found. Disabling. ---")
++                print(
++                    "--- WARNING: Interactive visualization enabled, but no image features found. Disabling. ---"
++                )
+         self.feature_map_size = None
+         self.reset()
+ 
+@@ -172,14 +182,67 @@ class ACTPolicy(PreTrainedPolicy):
+             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
+             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
+             self._action_queue.extend(actions.transpose(0, 1))
++        self._visualize_if_enabled(batch)
+         return self._action_queue.popleft()
+ 
++    @classmethod
++    def is_next_pred_need_obs(cls) -> bool:
++        """
++        Return whether the next select_action needs new observations.
++        For ACT, as long as there are actions in the action queue, new observations are not needed.
++        """
++        return len(cls._action_queue) == 0 if hasattr(cls, "_action_queue") else True
++
++    def _visualize_if_enabled(self, batch):
++        if not self.enable_visualization or not self.config.image_features:
++            return
++
++        if self.last_attn_weights is None:
++            return
++
++        # 频率控制 (如果是交互模式，visualization_frequency 应该是 1)
++        if (
++            self.visualization_frequency > 0
++            and self.inference_step_counter % self.visualization_frequency != 0
++        ):
++            return
++
++        # 准备实时图像
++        original_images_for_viz = {}
++        # 注意：这里的 batch 是环境传进来的最新实时数据！
++        for cam_key in self.config.image_features:
++            img_tensor = batch[cam_key][0].cpu() * 255.0
++            img_np = img_tensor.permute(1, 2, 0).numpy().astype(np.uint8)
++            original_images_for_viz[cam_key] = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
++
++        if self.visualizer:
++            # 使用最新的 batch 和 上一次的权重 进行更新
++            self.visualizer.update(self.last_attn_weights, batch, self.feature_map_size)
++        else:
++            visualize_attention_maps(
++                original_images=original_images_for_viz,
++                attn_weights=self.last_attn_weights,
++                camera_keys=list(self.config.image_features.keys()),
++                feature_map_size=self.feature_map_size,
++                step_counter=self.inference_step_counter,
++                save_dir=self.visualization_dir,
++                queries_to_visualize=self.action_queries_to_visualize,
++                layer_idx=self.viz_layer_idx,
++                batch_idx=self.viz_batch_idx,
++                average_heads=self.viz_average_heads,
++                blend_alpha=self.viz_blend_alpha,
++            )
++
+     @torch.no_grad()
+     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+         self.eval()
+         self.inference_step_counter += 1
+ 
+-        if self.feature_map_size is None and self.config.image_features:
++        if (
++            (self.enable_visualization or self.enable_interactive_masking)
++            and self.feature_map_size is None
++            and self.config.image_features
++        ):
+             first_cam_key = list(self.config.image_features.keys())[0]
+ 
+             # 使用已经归一化过的batch输入到backbone
+@@ -197,8 +260,7 @@ class ACTPolicy(PreTrainedPolicy):
+             if pixel_masks:
+                 for cam_key, mask_gray in pixel_masks.items():
+                     feature_mask = process_pixel_mask_to_feature_mask(
+-                        mask_image=mask_gray,
+-                        feature_map_size=self.feature_map_size
++                        mask_image=mask_gray, feature_map_size=self.feature_map_size
+                     )
+                     if feature_mask is not None:
+                         self.user_attention_masks[cam_key] = feature_mask
+@@ -210,16 +272,21 @@ class ACTPolicy(PreTrainedPolicy):
+         if self.user_attention_masks and self.config.image_features and self.feature_map_size:
+             feature_map_area = self.feature_map_size[0] * self.feature_map_size[1]
+             all_cam_masks = []
+-            for cam_key in self.config.image_features.keys():
++            for cam_key in self.config.image_features:
+                 mask_device = next(self.model.parameters()).device
+                 if cam_key in self.user_attention_masks:
+                     all_cam_masks.append(self.user_attention_masks[cam_key].to(mask_device))
+                 else:
+                     all_cam_masks.append(torch.zeros(feature_map_area, dtype=torch.bool, device=mask_device))
+             concatenated_visual_mask = torch.cat(all_cam_masks)
+-            num_non_image_tokens = 1 + (1 if self.config.robot_state_feature else 0) + (
+-                1 if self.config.env_state_feature else 0)
+-            non_image_mask = torch.zeros(num_non_image_tokens, dtype=torch.bool, device=concatenated_visual_mask.device)
++            num_non_image_tokens = (
++                1
++                + (1 if self.config.robot_state_feature else 0)
++                + (1 if self.config.env_state_feature else 0)
++            )
++            non_image_mask = torch.zeros(
++                num_non_image_tokens, dtype=torch.bool, device=concatenated_visual_mask.device
++            )
+             mask_1d = torch.cat([non_image_mask, concatenated_visual_mask])
+             final_attention_mask = mask_1d.unsqueeze(0).expand(self.config.chunk_size, -1)
+             batch_size = batch[OBS_STATE].shape[0]
+@@ -230,54 +297,49 @@ class ACTPolicy(PreTrainedPolicy):
+             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+ 
+-        actions, _, attn_weights = self.model(
+-            batch,
+-            attention_mask=final_attention_mask,
+-            encoder_key_padding_mask=final_encoder_key_padding_mask
+-        )
++        if self.config.is_ascend_om_enabled:
++            actions = self.om_model.predict(batch)[0]
++        else:
++            actions, _, attn_weights, _ = self.model(
++                batch,
++                attention_mask=final_attention_mask,
++                encoder_key_padding_mask=final_encoder_key_padding_mask,  # <-- 传入新掩码
++            )
++        if self.enable_visualization and attn_weights is not None:
++            self.last_attn_weights = attn_weights
+ 
+-        should_visualize = (
+-                self.enable_visualization and self.config.image_features and attn_weights is not None and
+-                self.visualization_frequency > 0 and self.inference_step_counter % self.visualization_frequency == 0
++        return actions
++
++    def compute_kd_loss(self, batch, actions_hat, decoder_out, teacher_policy, loss_dict):
++        teacher_action_hat, (teacher_mu, teacher_log_sigma_x2), _, teacher_decoder_out = teacher_policy.model(
++            batch
+         )
+-        if should_visualize:
+-            original_images_for_viz = {}
+-            for cam_key in self.config.image_features.keys():
+-                # 从已归一化的batch中“恢复”图像用于显示
+-                img_tensor = batch[cam_key][0].cpu() * 255.0
+-                img_np = img_tensor.permute(1, 2, 0).numpy().astype(np.uint8)
+-                original_images_for_viz[cam_key] = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+-
+-            if self.visualizer:
+-                self.visualizer.update(attn_weights, batch, self.feature_map_size)
+-            else:
+-                visualize_attention_maps(
+-                    original_images=original_images_for_viz,
+-                    attn_weights=attn_weights,
+-                    camera_keys=list(self.config.image_features.keys()),
+-                    feature_map_size=self.feature_map_size,
+-                    step_counter=self.inference_step_counter,
+-                    save_dir=self.visualization_dir, queries_to_visualize=self.action_queries_to_visualize,
+-                    layer_idx=self.viz_layer_idx, batch_idx=self.viz_batch_idx,
+-                    average_heads=self.viz_average_heads, blend_alpha=self.viz_blend_alpha,
+-                )
+ 
+-        return actions
++        # 计算差异
++        kd_loss = nn.MSELoss()(decoder_out, teacher_decoder_out)
+ 
+-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
++        # 总蒸馏损失
++        loss_dict["kd_loss"] = kd_loss.item()
++        return loss_dict
++
++    # 增加teacher_policy实现蒸馏学习，并记录蒸馏损失
++    def forward(self, batch: dict[str, Tensor], teacher_policy=None) -> tuple[Tensor, dict]:
+         """Run the batch through the model and compute the loss for training or validation."""
+         if self.config.image_features:
+             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
+ 
+-        actions_hat, (mu_hat, log_sigma_x2_hat) = self.model(batch)
++        actions_hat, (mu_hat, log_sigma_x2_hat), _, decoder_out = self.model(batch)
+ 
+         l1_loss = (
+             F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
+         ).mean()
+ 
+         loss_dict = {"l1_loss": l1_loss.item()}
+-        if self.config.use_vae:
++        loss_dict["loss"] = F.l1_loss(batch["action"], actions_hat, reduction="none") * ~batch[
++            "action_is_pad"
++        ].unsqueeze(-1)
++        if self.config.use_vae and self.training:
+             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
+             # each dimension independently, we sum over the latent dimension to get the total
+             # KL-divergence per batch element, then take the mean over the batch.
+@@ -290,6 +352,12 @@ class ACTPolicy(PreTrainedPolicy):
+         else:
+             loss = l1_loss
+ 
++        # 知识蒸馏损失计算
++        if teacher_policy is not None and self.training:
++            loss_dict = self.compute_kd_loss(batch, actions_hat, decoder_out, teacher_policy, loss_dict)
++
++        loss_dict["total_kd_loss"] = loss + loss_dict.get("kd_loss", 0.0)
++
+         return loss, loss_dict
+ 
+ 
+@@ -498,6 +566,12 @@ class ACT(nn.Module):
+         # Final action regression head on the output of the transformer's decoder.
+         self.action_head = nn.Linear(config.dim_model, self.config.action_feature.shape[0])
+ 
++        # 增加蒸馏学习层，如需蒸馏学习，则保证输出的两层为同一维度，需要做修改
++        print("是否蒸馏学习: ", self.config.kd)
++        if self.config.kd:
++            self.trans = nn.Linear(self.config.dim_model, self.config.decoder_out_dim)
++            self.action_head = nn.Linear(self.config.decoder_out_dim, self.config.action_feature.shape[0])
++
+         self._reset_parameters()
+ 
+     def _reset_parameters(self):
+@@ -507,11 +581,11 @@ class ACT(nn.Module):
+                 nn.init.xavier_uniform_(p)
+ 
+     def forward(
+-            self,
+-            batch: dict[str, Tensor],
+-            attention_mask: Optional[Tensor] = None,
+-            encoder_key_padding_mask: Optional[Tensor] = None
+-    ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None], Optional[Tensor]]:
++        self,
++        batch: dict[str, Tensor],
++        attention_mask: Tensor | None = None,
++        encoder_key_padding_mask: Tensor | None = None,
++    ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None], Tensor | None]:
+         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
+ 
+         `batch` should have the following structure:
+@@ -624,7 +698,9 @@ class ACT(nn.Module):
+         encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+ 
+         # Forward pass through the transformer modules.
+-        encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed, key_padding_mask=encoder_key_padding_mask)
++        encoder_out = self.encoder(
++            encoder_in_tokens, pos_embed=encoder_in_pos_embed, key_padding_mask=encoder_key_padding_mask
++        )
+         # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
+         decoder_in = torch.zeros(
+             (self.config.chunk_size, batch_size, self.config.dim_model),
+@@ -642,9 +718,13 @@ class ACT(nn.Module):
+         # Move back to (B, S, C).
+         decoder_out = decoder_out.transpose(0, 1)
+ 
++        # 增加蒸馏学习层
++        if self.config.kd:
++            decoder_out = self.trans(decoder_out)
++
+         actions = self.action_head(decoder_out)
+ 
+-        return actions, (mu, log_sigma_x2), all_cross_attn_weights
++        return actions, (mu, log_sigma_x2), all_cross_attn_weights, decoder_out
+ 
+ 
+ class ACTEncoder(nn.Module):
+@@ -718,12 +798,16 @@ class ACTDecoder(nn.Module):
+         encoder_out: Tensor,
+         decoder_pos_embed: Tensor | None = None,
+         encoder_pos_embed: Tensor | None = None,
+-        attention_mask: Optional[Tensor] = None,
+-        ) -> tuple[Tensor, Tensor]:
++        attention_mask: Tensor | None = None,
++    ) -> tuple[Tensor, Tensor]:
+         all_cross_attn_weights = []
+         for layer in self.layers:
+             x, cross_attn_weights = layer(
+-                x, encoder_out, decoder_pos_embed=decoder_pos_embed, encoder_pos_embed=encoder_pos_embed, attention_mask=attention_mask
++                x,
++                encoder_out,
++                decoder_pos_embed=decoder_pos_embed,
++                encoder_pos_embed=encoder_pos_embed,
++                attention_mask=attention_mask,
+             )
+             all_cross_attn_weights.append(cross_attn_weights)
+         if self.norm is not None:
+@@ -735,7 +819,9 @@ class ACTDecoderLayer(nn.Module):
+     def __init__(self, config: ACTConfig):
+         super().__init__()
+         self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+-        self.multihead_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout, batch_first=False)
++        self.multihead_attn = nn.MultiheadAttention(
++            config.dim_model, config.n_heads, dropout=config.dropout, batch_first=False
++        )
+ 
+         # Feed forward layers.
+         self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
+@@ -761,7 +847,7 @@ class ACTDecoderLayer(nn.Module):
+         encoder_out: Tensor,
+         decoder_pos_embed: Tensor | None = None,
+         encoder_pos_embed: Tensor | None = None,
+-        attention_mask: Optional[Tensor] = None
++        attention_mask: Tensor | None = None,
+     ) -> tuple[Tensor, Tensor]:
+         """
+         Args:
+@@ -791,7 +877,7 @@ class ACTDecoderLayer(nn.Module):
+             value=encoder_out,
+             attn_mask=attention_mask,
+             need_weights=True,
+-            average_attn_weights=False
++            average_attn_weights=False,
+         )
+         x = skip + self.dropout2(cross_attn_out)
+         if self.pre_norm:
+-- 
+2.34.1
+

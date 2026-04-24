@@ -1,0 +1,6 @@
+0007-ascend-om-act-runtime.patch
+0008-ascend-3403-actwrapper.patch
+0009-weighted-training.patch
+0010-knowledge-distillation.patch
+0011-mt-act-model.patch
+0012-attention-visualization-tools.patch

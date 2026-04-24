@@ -1,0 +1,1165 @@
+From 0b11324c0e9dc9fc7647641378e11456d92396e7 Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Fri, 24 Apr 2026 22:41:21 +0800
+Subject: [PATCH] feature: add weighted training
+
+---
+ src/lerobot/configs/train.py                  |  10 +-
+ src/lerobot/policies/act/configuration_act.py |   6 +-
+ src/lerobot/policies/act/modeling_act.py      |  97 ++--
+ src/lerobot/scripts/lerobot_train.py          | 165 +++++--
+ src/lerobot/utils/qat.py                      | 418 ++++++++++++++++++
+ src/lerobot/utils/train_utils.py              |   7 +-
+ 6 files changed, 612 insertions(+), 91 deletions(-)
+ create mode 100644 src/lerobot/utils/qat.py
+
+diff --git a/src/lerobot/configs/train.py b/src/lerobot/configs/train.py
+index d1eedd52..ef57d0c9 100644
+--- a/src/lerobot/configs/train.py
++++ b/src/lerobot/configs/train.py
+@@ -50,10 +50,16 @@ class TrainPipelineConfig(HubMixin):
+     # `seed` is used for training (eg: model initialization, dataset shuffling)
+     # AND for the evaluation environments.
+     seed: int | None = 1000
++    # 静态权重开关
++    custom_weights: bool = False
+     # Adaptive loss weighting parameters
+-    ada_weight: bool = True
++    ada_weight: bool = False
+     # Frequency (in number of steps) to update the adaptive weights
+-    ada_weight_freq: int = 200 
++    ada_weight_freq: int = 200
++    # Weight gradient clipping
++    weight_clipping: bool = False
++    clipping_min: float = 5.96e-08
++    clipping_max: float = 1.31e05
+     # Damping coefficient for the adaptive loss weighting
+     damping_coefficient: float = 0.7
+     # Number of workers for the dataloader.
+diff --git a/src/lerobot/policies/act/configuration_act.py b/src/lerobot/policies/act/configuration_act.py
+index be199a92..2eda7c82 100644
+--- a/src/lerobot/policies/act/configuration_act.py
++++ b/src/lerobot/policies/act/configuration_act.py
+@@ -125,9 +125,9 @@ class ACTConfig(PreTrainedConfig):
+     n_vae_encoder_layers: int = 4
+ 
+     # Knowledge distillation from a pretrained model.
+-    kd: bool = False # Whether to use knowledge distillation during training.
+-    teacher_train_config: str | None = None # Path to the teacher model's train_config.json
+-    decoder_out_dim: int = 1024 # Dimension of the decoder output used in the distillation.
++    kd: bool = False  # Whether to use knowledge distillation during training.
++    teacher_train_config: str | None = None  # Path to the teacher model's train_config.json
++    decoder_out_dim: int = 1024  # Dimension of the decoder output used in the distillation.
+ 
+     # Inference.
+     # Note: the value used in ACT when temporal ensembling is enabled is 0.01.
+diff --git a/src/lerobot/policies/act/modeling_act.py b/src/lerobot/policies/act/modeling_act.py
+index 96027120..4d118dc9 100644
+--- a/src/lerobot/policies/act/modeling_act.py
++++ b/src/lerobot/policies/act/modeling_act.py
+@@ -24,7 +24,6 @@ import os
+ from collections import deque
+ from collections.abc import Callable
+ from itertools import chain
+-from typing import Optional
+ 
+ import cv2
+ import einops
+@@ -35,13 +34,11 @@ import torchvision
+ from torch import Tensor, nn
+ from torchvision.models._utils import IntermediateLayerGetter
+ from torchvision.ops.misc import FrozenBatchNorm2d
++
+ from lerobot.policies.act.configuration_act import ACTConfig
+ from lerobot.policies.pretrained import PreTrainedPolicy
++from lerobot.utils.attention_masking import create_interactive_masks, process_pixel_mask_to_feature_mask
+ from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+-from lerobot.utils.attention_masking import (
+-    create_interactive_masks,
+-    process_pixel_mask_to_feature_mask
+-)
+ from lerobot.utils.visualization import RealTimeVisualizer, visualize_attention_maps
+ 
+ 
+@@ -87,10 +84,11 @@ class ACTPolicy(PreTrainedPolicy):
+         self.gui_save_dir = "gui_interactions"
+ 
+         if self.config.is_ascend_om_enabled:
+-            print(f"[INFO] Ascend om enabled, training and visualization are not allowed")
++            print("[INFO] Ascend om enabled, training and visualization are not allowed")
+             self.enable_interactive_masking = False
+             self.enable_visualization = False
+             from lerobot.oee.ascend.om.ACTWrapper import ACTWrapper
++
+             # use precompiled kernels to speed up warm up phase
+             self.om_model = ACTWrapper(self.config.om_model_path, self.config)
+             torch.npu.set_compile_mode(jit_compile=False)
+@@ -103,7 +101,7 @@ class ACTPolicy(PreTrainedPolicy):
+ 
+         # RealTimeVisualizer初始化
+         self.visualizer = None
+-        if os.environ.get('VIZ_MODE', 'file').lower() == 'interactive':
++        if os.environ.get("VIZ_MODE", "file").lower() == "interactive":
+             self.visualization_frequency = 1
+             print("--- INFO: Real-time interactive visualization mode is ENABLED. ---")
+             if self.config.image_features:
+@@ -116,7 +114,9 @@ class ACTPolicy(PreTrainedPolicy):
+                     blend_alpha=self.viz_blend_alpha,
+                 )
+             else:
+-                print("--- WARNING: Interactive visualization enabled, but no image features found. Disabling. ---")
++                print(
++                    "--- WARNING: Interactive visualization enabled, but no image features found. Disabling. ---"
++                )
+         self.feature_map_size = None
+         self.reset()
+ 
+@@ -191,7 +191,7 @@ class ACTPolicy(PreTrainedPolicy):
+         Return whether the next select_action needs new observations.
+         For ACT, as long as there are actions in the action queue, new observations are not needed.
+         """
+-        return len(cls._action_queue) == 0 if hasattr(cls, '_action_queue') else True
++        return len(cls._action_queue) == 0 if hasattr(cls, "_action_queue") else True
+ 
+     def _visualize_if_enabled(self, batch):
+         if not self.enable_visualization or not self.config.image_features:
+@@ -201,13 +201,16 @@ class ACTPolicy(PreTrainedPolicy):
+             return
+ 
+         # 频率控制 (如果是交互模式，visualization_frequency 应该是 1)
+-        if self.visualization_frequency > 0 and self.inference_step_counter % self.visualization_frequency != 0:
++        if (
++            self.visualization_frequency > 0
++            and self.inference_step_counter % self.visualization_frequency != 0
++        ):
+             return
+ 
+         # 准备实时图像
+         original_images_for_viz = {}
+         # 注意：这里的 batch 是环境传进来的最新实时数据！
+-        for cam_key in self.config.image_features.keys():
++        for cam_key in self.config.image_features:
+             img_tensor = batch[cam_key][0].cpu() * 255.0
+             img_np = img_tensor.permute(1, 2, 0).numpy().astype(np.uint8)
+             original_images_for_viz[cam_key] = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+@@ -235,8 +238,11 @@ class ACTPolicy(PreTrainedPolicy):
+         self.eval()
+         self.inference_step_counter += 1
+ 
+-        if ((self.enable_visualization or self.enable_interactive_masking)
+-                and self.feature_map_size is None and self.config.image_features):
++        if (
++            (self.enable_visualization or self.enable_interactive_masking)
++            and self.feature_map_size is None
++            and self.config.image_features
++        ):
+             first_cam_key = list(self.config.image_features.keys())[0]
+ 
+             # 使用已经归一化过的batch输入到backbone
+@@ -254,8 +260,7 @@ class ACTPolicy(PreTrainedPolicy):
+             if pixel_masks:
+                 for cam_key, mask_gray in pixel_masks.items():
+                     feature_mask = process_pixel_mask_to_feature_mask(
+-                        mask_image=mask_gray,
+-                        feature_map_size=self.feature_map_size
++                        mask_image=mask_gray, feature_map_size=self.feature_map_size
+                     )
+                     if feature_mask is not None:
+                         self.user_attention_masks[cam_key] = feature_mask
+@@ -267,16 +272,21 @@ class ACTPolicy(PreTrainedPolicy):
+         if self.user_attention_masks and self.config.image_features and self.feature_map_size:
+             feature_map_area = self.feature_map_size[0] * self.feature_map_size[1]
+             all_cam_masks = []
+-            for cam_key in self.config.image_features.keys():
++            for cam_key in self.config.image_features:
+                 mask_device = next(self.model.parameters()).device
+                 if cam_key in self.user_attention_masks:
+                     all_cam_masks.append(self.user_attention_masks[cam_key].to(mask_device))
+                 else:
+                     all_cam_masks.append(torch.zeros(feature_map_area, dtype=torch.bool, device=mask_device))
+             concatenated_visual_mask = torch.cat(all_cam_masks)
+-            num_non_image_tokens = 1 + (1 if self.config.robot_state_feature else 0) + (
+-                1 if self.config.env_state_feature else 0)
+-            non_image_mask = torch.zeros(num_non_image_tokens, dtype=torch.bool, device=concatenated_visual_mask.device)
++            num_non_image_tokens = (
++                1
++                + (1 if self.config.robot_state_feature else 0)
++                + (1 if self.config.env_state_feature else 0)
++            )
++            non_image_mask = torch.zeros(
++                num_non_image_tokens, dtype=torch.bool, device=concatenated_visual_mask.device
++            )
+             mask_1d = torch.cat([non_image_mask, concatenated_visual_mask])
+             final_attention_mask = mask_1d.unsqueeze(0).expand(self.config.chunk_size, -1)
+             batch_size = batch[OBS_STATE].shape[0]
+@@ -290,10 +300,10 @@ class ACTPolicy(PreTrainedPolicy):
+         if self.config.is_ascend_om_enabled:
+             actions = self.om_model.predict(batch)[0]
+         else:
+-            actions, _, attn_weights = self.model(
++            actions, _, attn_weights, _ = self.model(
+                 batch,
+                 attention_mask=final_attention_mask,
+-                encoder_key_padding_mask=final_encoder_key_padding_mask  # <-- 传入新掩码
++                encoder_key_padding_mask=final_encoder_key_padding_mask,  # <-- 传入新掩码
+             )
+         if self.enable_visualization and attn_weights is not None:
+             self.last_attn_weights = attn_weights
+@@ -301,7 +311,9 @@ class ACTPolicy(PreTrainedPolicy):
+         return actions
+ 
+     def compute_kd_loss(self, batch, actions_hat, decoder_out, teacher_policy, loss_dict):
+-        teacher_action_hat, (teacher_mu, teacher_log_sigma_x2), _,teacher_decoder_out = teacher_policy.model(batch)
++        teacher_action_hat, (teacher_mu, teacher_log_sigma_x2), _, teacher_decoder_out = teacher_policy.model(
++            batch
++        )
+ 
+         # 计算差异
+         kd_loss = nn.MSELoss()(decoder_out, teacher_decoder_out)
+@@ -324,7 +336,9 @@ class ACTPolicy(PreTrainedPolicy):
+         ).mean()
+ 
+         loss_dict = {"l1_loss": l1_loss.item()}
+-        loss_dict["loss"] = F.l1_loss(batch["action"], actions_hat, reduction="none") * ~batch["action_is_pad"].unsqueeze(-1)
++        loss_dict["loss"] = F.l1_loss(batch["action"], actions_hat, reduction="none") * ~batch[
++            "action_is_pad"
++        ].unsqueeze(-1)
+         if self.config.use_vae and self.training:
+             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
+             # each dimension independently, we sum over the latent dimension to get the total
+@@ -337,7 +351,7 @@ class ACTPolicy(PreTrainedPolicy):
+             loss = l1_loss + mean_kld * self.config.kl_weight
+         else:
+             loss = l1_loss
+-            
++
+         # 知识蒸馏损失计算
+         if teacher_policy is not None and self.training:
+             loss_dict = self.compute_kd_loss(batch, actions_hat, decoder_out, teacher_policy, loss_dict)
+@@ -567,11 +581,11 @@ class ACT(nn.Module):
+                 nn.init.xavier_uniform_(p)
+ 
+     def forward(
+-            self,
+-            batch: dict[str, Tensor],
+-            attention_mask: Optional[Tensor] = None,
+-            encoder_key_padding_mask: Optional[Tensor] = None
+-    ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None], Optional[Tensor]]:
++        self,
++        batch: dict[str, Tensor],
++        attention_mask: Tensor | None = None,
++        encoder_key_padding_mask: Tensor | None = None,
++    ) -> tuple[Tensor, tuple[Tensor, Tensor] | tuple[None, None], Tensor | None]:
+         """A forward pass through the Action Chunking Transformer (with optional VAE encoder).
+ 
+         `batch` should have the following structure:
+@@ -639,7 +653,7 @@ class ACT(nn.Module):
+             latent_pdf_params = self.vae_encoder_latent_output_proj(cls_token_out)
+             mu = latent_pdf_params[:, : self.config.latent_dim]
+             # This is 2log(sigma). Done this way to match the original implementation.
+-            log_sigma_x2 = latent_pdf_params[:, self.config.latent_dim:]
++            log_sigma_x2 = latent_pdf_params[:, self.config.latent_dim :]
+ 
+             # Sample the latent with the reparameterization trick.
+             latent_sample = mu + log_sigma_x2.div(2).exp() * torch.randn_like(mu)
+@@ -684,8 +698,9 @@ class ACT(nn.Module):
+         encoder_in_pos_embed = torch.stack(encoder_in_pos_embed, axis=0)
+ 
+         # Forward pass through the transformer modules.
+-        encoder_out = self.encoder(encoder_in_tokens, pos_embed=encoder_in_pos_embed,
+-                                   key_padding_mask=encoder_key_padding_mask)
++        encoder_out = self.encoder(
++            encoder_in_tokens, pos_embed=encoder_in_pos_embed, key_padding_mask=encoder_key_padding_mask
++        )
+         # TODO(rcadene, alexander-soare): remove call to `device` ; precompute and use buffer
+         decoder_in = torch.zeros(
+             (self.config.chunk_size, batch_size, self.config.dim_model),
+@@ -783,13 +798,16 @@ class ACTDecoder(nn.Module):
+         encoder_out: Tensor,
+         decoder_pos_embed: Tensor | None = None,
+         encoder_pos_embed: Tensor | None = None,
+-        attention_mask: Optional[Tensor] = None,
++        attention_mask: Tensor | None = None,
+     ) -> tuple[Tensor, Tensor]:
+         all_cross_attn_weights = []
+         for layer in self.layers:
+             x, cross_attn_weights = layer(
+-                x, encoder_out, decoder_pos_embed=decoder_pos_embed, encoder_pos_embed=encoder_pos_embed,
+-                attention_mask=attention_mask
++                x,
++                encoder_out,
++                decoder_pos_embed=decoder_pos_embed,
++                encoder_pos_embed=encoder_pos_embed,
++                attention_mask=attention_mask,
+             )
+             all_cross_attn_weights.append(cross_attn_weights)
+         if self.norm is not None:
+@@ -801,8 +819,9 @@ class ACTDecoderLayer(nn.Module):
+     def __init__(self, config: ACTConfig):
+         super().__init__()
+         self.self_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout)
+-        self.multihead_attn = nn.MultiheadAttention(config.dim_model, config.n_heads, dropout=config.dropout,
+-                                                    batch_first=False)
++        self.multihead_attn = nn.MultiheadAttention(
++            config.dim_model, config.n_heads, dropout=config.dropout, batch_first=False
++        )
+ 
+         # Feed forward layers.
+         self.linear1 = nn.Linear(config.dim_model, config.dim_feedforward)
+@@ -828,7 +847,7 @@ class ACTDecoderLayer(nn.Module):
+         encoder_out: Tensor,
+         decoder_pos_embed: Tensor | None = None,
+         encoder_pos_embed: Tensor | None = None,
+-        attention_mask: Optional[Tensor] = None
++        attention_mask: Tensor | None = None,
+     ) -> tuple[Tensor, Tensor]:
+         """
+         Args:
+@@ -858,7 +877,7 @@ class ACTDecoderLayer(nn.Module):
+             value=encoder_out,
+             attn_mask=attention_mask,
+             need_weights=True,
+-            average_attn_weights=False
++            average_attn_weights=False,
+         )
+         x = skip + self.dropout2(cross_attn_out)
+         if self.pre_norm:
+diff --git a/src/lerobot/scripts/lerobot_train.py b/src/lerobot/scripts/lerobot_train.py
+index 123ff7df..754f682c 100644
+--- a/src/lerobot/scripts/lerobot_train.py
++++ b/src/lerobot/scripts/lerobot_train.py
+@@ -13,20 +13,20 @@
+ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
++import copy
+ import logging
++import os
+ import time
+ from contextlib import nullcontext
+ from pprint import pformat
+ from typing import Any
+-from tqdm import tqdm
+-import os
+-import copy
+-import sys
+ 
+ import torch
+ from accelerate import Accelerator
+ from termcolor import colored
+ from torch.optim import Optimizer
++from torch.utils.tensorboard import SummaryWriter
++from tqdm import tqdm
+ 
+ from lerobot.configs import parser
+ from lerobot.configs.train import TrainPipelineConfig
+@@ -39,24 +39,25 @@ from lerobot.optim.factory import make_optimizer_and_scheduler
+ from lerobot.policies.factory import make_policy, make_pre_post_processors
+ from lerobot.policies.pretrained import PreTrainedPolicy
+ from lerobot.rl.wandb_utils import WandBLogger
++from lerobot.scripts.knowledge_distillation import get_teacher_model
+ from lerobot.scripts.lerobot_eval import eval_policy_all
+ from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
++from lerobot.utils.qat import QuantConstraint
+ from lerobot.utils.random_utils import set_seed
+ from lerobot.utils.train_utils import (
++    WeightSampler,
+     get_step_checkpoint_dir,
+     get_step_identifier,
+     load_training_state,
+     save_checkpoint,
+     update_last_checkpoint,
+-    WeightSampler,
+-    normalize_weights,
+ )
+ from lerobot.utils.utils import (
+     format_big_number,
+     has_method,
+     init_logging,
+ )
+-from lerobot.scripts.knowledge_distillation import get_teacher_model
++
+ 
+ def update_policy(
+     train_metrics: MetricsTracker,
+@@ -66,7 +67,7 @@ def update_policy(
+     grad_clip_norm: float,
+     accelerator: Accelerator,
+     lr_scheduler=None,
+-    teacher_policy = None, 
++    teacher_policy=None,
+     lock=None,
+ ) -> tuple[MetricsTracker, dict]:
+     """
+@@ -95,11 +96,17 @@ def update_policy(
+ 
+     # Let accelerator handle mixed precision
+     with accelerator.autocast():
+-        loss, output_dict = policy.forward(batch, teacher_policy)
++        if teacher_policy:
++            loss, output_dict = policy.forward(batch, teacher_policy)
++        else:
++            loss, output_dict = policy.forward(batch)
+         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
+ 
+     # Use accelerator's backward method
+-    accelerator.backward(output_dict["total_kd_loss"])
++    if teacher_policy:
++        accelerator.backward(output_dict["total_kd_loss"])
++    else:
++        accelerator.backward(loss)
+ 
+     # Clip gradients if specified
+     if grad_clip_norm > 0:
+@@ -124,13 +131,49 @@ def update_policy(
+         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+ 
+     train_metrics.loss = loss.item()
+-    train_metrics.total_kd_loss = output_dict["total_kd_loss"] if "total_kd_loss" in output_dict else 0.0
++    if teacher_policy:
++        train_metrics.total_kd_loss = (
++            output_dict.get("total_kd_loss", 0.0) if "total_kd_loss" in output_dict else 0.0
++        )
+     train_metrics.grad_norm = grad_norm.item()
+     train_metrics.lr = optimizer.param_groups[0]["lr"]
+     train_metrics.update_s = time.perf_counter() - start_time
+     return train_metrics, output_dict
+ 
+ 
++def set_train_sample_weights(cfg, dataset, train_dataset, train_num_samples):
++    # 初始化样本权重（初始值均为1.0），初始化样本计数器为0
++    train_sample_weights = [1.0] * train_num_samples
++    if not cfg.custom_weights:
++        return train_sample_weights
++    if hasattr(dataset, "hf_dataset") and "training_weight" in dataset.hf_dataset.features:
++        logging.info("Found 'training_weight' in dataset. Extracting custom weights...")
++        # 直接获取整列权重数据
++        full_weights_column = dataset.hf_dataset["training_weight"]
++
++        # 根据 train_dataset 的索引映射提取对应的权重
++        # train_dataset.indices 存储了该子集在原始数据集中的索引
++        train_sample_weights = [float(full_weights_column[i]) for i in train_dataset.indices]
++
++        logging.info(f"Successfully loaded {len(train_sample_weights)} custom weights.")
++
++        if len(train_sample_weights) > 0:
++            logging.info(f"Weight stats - Max: {max(train_sample_weights)}, Min: {min(train_sample_weights)}")
++
++    else:
++        # 如果没有 hf_dataset 属性或者没有该列，尝试逐个访问
++        # 只有当确认 dataset[0] 包含该 key 时才执行，避免报错
++        if len(dataset) > 0 and "training_weight" in dataset[0]:
++            logging.info("Extracting 'training_weight' by iterating (slow path)...")
++            train_sample_weights = [
++                float(dataset[i]["training_weight"])
++                for i in tqdm(train_dataset.indices, desc="Loading Weights")
++            ]
++        else:
++            logging.warning("'training_weight' not found in dataset features. Using default 1.0 weights.")
++    return train_sample_weights
++
++
+ @parser.wrap()
+ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+     """
+@@ -160,6 +203,16 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+         accelerator = Accelerator(step_scheduler_with_optimizer=False, kwargs_handlers=[ddp_kwargs])
+ 
++    # 创建log和tensorboard保存目录
++    folder_path = "./logs"
++
++    # 检查文件夹是否已存在，避免报错
++    if not os.path.exists(folder_path):
++        os.mkdir(folder_path)
++        print(f"Logs folder {folder_path} created successfully")
++    else:
++        print(f"Logs folder {folder_path} already exists")
++
+     init_logging(accelerator=accelerator)
+ 
+     # Determine if this is the main process (for logging and checkpointing)
+@@ -224,6 +277,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+         rename_map=cfg.rename_map,
+     )
+ 
++    quant_constraint = QuantConstraint(
++        policy=policy,  # 传入完整policy，用于解包分布式封装
++        accelerator=accelerator,
++        quant_param_min=cfg.clipping_min,
++        quant_param_max=cfg.clipping_max,
++        hisi_log_path="./haisi.log",
++    )
++
+     # Wait for all processes to finish policy creation before continuing
+     accelerator.wait_for_everyone()
+ 
+@@ -273,6 +334,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+     num_total_params = sum(p.numel() for p in policy.parameters())
+ 
++    log_dir = f"logs/pytorch/{str(cfg.output_dir).split('/')[-1]}"
++    writer = SummaryWriter(log_dir=log_dir)
++
+     if is_main_process:
+         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
+         if cfg.env is not None:
+@@ -288,7 +352,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+ 
+     # create dataloader for offline training
+     if hasattr(cfg.policy, "drop_n_last_frames"):
+-        shuffle = False
+         sampler = EpisodeAwareSampler(
+             dataset.meta.episodes["dataset_from_index"],
+             dataset.meta.episodes["dataset_to_index"],
+@@ -296,15 +359,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+             shuffle=True,
+         )
+     else:
+-        shuffle = True
+         sampler = None
+ 
+     # 将整理数据集划分为 90% 作为训练集, 10% 作为验证集
+-    train_size = int(0.9 * len(dataset)) # 计算训练集样本数量
+-    val_size = len(dataset) - train_size # 计算验证集样本数量
++    train_size = int(0.9 * len(dataset))  # 计算训练集样本数量
++    val_size = len(dataset) - train_size  # 计算验证集样本数量
+     logging.info(f"train_data_num: {train_size}, eval_data_num: {val_size}")
+     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+-    
++
+     # 如果 train_dataset 是 Subset（random_split 返回的是 Subset），
+     # 保存原始数据集索引 -> 子集内位置的映射，用于后面根据 batch 返回的原始索引更新权重。
+     try:
+@@ -317,16 +379,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+     train_num_samples = len(train_dataset)
+     print(f"train_num_samples: {train_num_samples}")
+     # 初始化样本权重（初始值均为1.0），初始化样本计数器为0
+-    train_sample_weights = [1.0] * train_num_samples
++    train_sample_weights = set_train_sample_weights(cfg, dataset, train_dataset, train_num_samples)
+     train_sample_count = [0] * train_num_samples
+ 
+     # 划分训练和验证集
+-    if cfg.ada_weight:
+-        sampler = WeightSampler(
+-            weights=train_sample_weights,
+-            num_samples=train_num_samples,
+-            replacement=True
+-        )
++    sampler = WeightSampler(weights=train_sample_weights, num_samples=train_num_samples, replacement=True)
+     train_loader = torch.utils.data.DataLoader(
+         train_dataset,
+         num_workers=cfg.num_workers,
+@@ -334,7 +391,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+         sampler=sampler,
+         shuffle=False,
+         pin_memory=device.type != "cpu",
+-        drop_last=False
++        drop_last=False,
+     )
+ 
+     # 验证集不需要设置权重与不均衡采样
+@@ -352,7 +409,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+     policy, optimizer, train_loader, lr_scheduler = accelerator.prepare(
+         policy, optimizer, train_loader, lr_scheduler
+     )
+-    val_loader = accelerator.prepare(val_loader)
+     train_iter = cycle(train_loader)
+     val_iter = cycle(val_loader)
+ 
+@@ -360,13 +416,15 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+ 
+     train_metrics = {
+         "loss": AverageMeter("loss", ":.3f"),
+-        "total_kd_loss": AverageMeter("total_kd_loss", ":.3f"),
+         "grad_norm": AverageMeter("grdn", ":.3f"),
+         "lr": AverageMeter("lr", ":0.1e"),
+         "update_s": AverageMeter("updt_s", ":.3f"),
+         "dataloading_s": AverageMeter("data_s", ":.3f"),
+     }
+ 
++    if cfg.policy.kd:
++        train_metrics["total_kd_loss"] = AverageMeter("total_kd_loss", ":.3f")
++
+     # Use effective batch size for proper epoch calculation in distributed training
+     effective_batch_size = cfg.batch_size * accelerator.num_processes
+     train_tracker = MetricsTracker(
+@@ -392,9 +450,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+             # train_sample_weights = normalize_weights(train_sample_weights)
+             # 根据样本权重更新采样器
+             sampler = WeightSampler(
+-                weights=train_sample_weights,
+-                num_samples=train_num_samples,
+-                replacement=True
++                weights=train_sample_weights, num_samples=train_num_samples, replacement=True
+             )
+             # 在更新采样器后，重新创建 DataLoader 和迭代器
+             train_loader = torch.utils.data.DataLoader(
+@@ -404,7 +460,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+                 sampler=sampler,
+                 shuffle=False,
+                 pin_memory=device.type != "cpu",
+-                drop_last=False
++                drop_last=False,
+             )
+             train_iter = cycle(train_loader)
+ 
+@@ -420,13 +476,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+             cfg.optimizer.grad_clip_norm,
+             accelerator=accelerator,
+             lr_scheduler=lr_scheduler,
+-            teacher_policy=teacher_policy
++            teacher_policy=teacher_policy,
+         )
+ 
++        # 关键：根据当前batch的损失更新样本权重
+         if cfg.ada_weight:
+-            # 关键：根据当前batch的损失更新样本权重
+-            # 策略：损失越大的样本，权重越高（可根据需求修改策略，目前计算公式为 new_weight = old_weight * 0.9 + loss）
+-            loss_mean = output_dict['loss'].mean(dim=[1, 2])
++            # 策略：损失越大的样本，权重越高（可根据需求修改策略，目前计算公式为
++            # new_weight = old_weight * 0.9 + loss）
++            loss_mean = output_dict["loss"].mean(dim=[1, 2])
+             for index, raw_idx in enumerate(batch_indices):
+                 # batch_indices 可能是 tensor
+                 idx_val = int(raw_idx)
+@@ -443,8 +500,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+                         # 未在子集里（不应该发生），跳过
+                         continue
+ 
+-                # 权重更新公式：新权重 = 旧权重 * 0.9 + 损失值（示例）
+-                train_sample_weights[subset_idx] = train_sample_weights[subset_idx] * cfg.damping_coefficient + float(loss_mean[index].item()) * 10
++                # 权重更新公式：新权重 = 旧权重 * damping_coefficient + 损失值 * 10
++                if train_sample_weights[subset_idx] == 0:
++                    continue
++                train_sample_weights[subset_idx] = (
++                    train_sample_weights[subset_idx] * cfg.damping_coefficient
++                    + float(loss_mean[index].item()) * 10
++                )
+                 # 限制权重最小值，避免权重过小导致永远不被选中
+                 train_sample_weights[subset_idx] = max(train_sample_weights[subset_idx], 0.1)
+                 # 记录样本被选中的次数
+@@ -452,6 +514,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+ 
+         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
+         # increment `step` here.
++        if cfg.weight_clipping:
++            quant_constraint.clip_weights()
+         step += 1
+         train_tracker.step()
+         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
+@@ -460,6 +524,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+ 
+         if is_log_step:
+             logging.info(train_tracker)
++            # 写入tensorboard
++            for m in train_tracker.metrics.values():
++                m = str(m)
++                v = float(m.split(":")[-1])
++                n = m.split(":")[0]
++                writer.add_scalar(f"{n}/step", v, step)
++
+             if wandb_logger:
+                 wandb_log_dict = train_tracker.to_dict()
+                 if output_dict:
+@@ -469,28 +540,32 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+ 
+         best_eval_sign = False
+         if not cfg.env and is_eval_step:
++            torch.cuda.empty_cache()
+             policy.eval()
+             step_id = get_step_identifier(step, cfg.steps)
+-            
+-            per_eval_num = len(val_loader) // 4
++            # 减少验证集的评估批次数量，避免过长时间的评估
++            per_eval_num = len(val_loader) // 4 + 1
+             logging.info(f"Start evaluating: {per_eval_num}/{len(val_loader)} batches")
+             eval_loss = 0.0
+-            for i in tqdm(range(per_eval_num)):
+-                val_batch, _ = next(val_iter)
+-                val_batch = preprocessor(val_batch)
+-                with accelerator.autocast():
++            with torch.no_grad():  # 禁止梯度计算，不存储中间激活的梯度信息
++                for _ in tqdm(range(per_eval_num)):
++                    val_batch, _ = next(val_iter)
++                    val_batch = preprocessor(val_batch)
+                     loss, output_dict = policy.forward(val_batch)
+-                eval_loss += loss.item()
++                    eval_loss += loss.item()
++                torch.cuda.empty_cache()
+             eval_loss /= per_eval_num
+             logging.info(f"Eval policy at step {step}, eval_loss: {eval_loss:.3f}")
++            if cfg.ada_weight:
++                logging.info(train_sample_weights[:1000])
++                logging.info(train_sample_count[:1000])
++            writer.add_scalar("Loss/eval", eval_loss, step)
+ 
+             if eval_loss < best_eval_loss:
+                 best_eval_loss = eval_loss
+                 logging.info(f"New best eval loss: {best_eval_loss:.3f}, saving checkpoint")
+                 best_eval_sign = True
+ 
+-            torch.cuda.empty_cache()
+-
+         if (cfg.save_checkpoint and is_saving_step) or best_eval_sign:
+             if is_main_process:
+                 logging.info(f"Checkpoint policy after step {step}")
+diff --git a/src/lerobot/utils/qat.py b/src/lerobot/utils/qat.py
+new file mode 100644
+index 00000000..e6a85df5
+--- /dev/null
++++ b/src/lerobot/utils/qat.py
+@@ -0,0 +1,418 @@
++import argparse
++import logging
++import re
++import sys
++from collections import defaultdict
++
++import numpy as np
++import torch
++import torch.nn as nn
++
++from lerobot.scripts.knowledge_distillation import get_model
++
++
++def parse_hisi_om_log(log_file_path):
++    """
++    自动解析海思OM转换日志，提取所有层的Weight Scale
++    Args:
++        log_file_path: 海思OM转换日志文件路径（如om_convert.log）
++    Returns:
++        layer_weight_scale: dict，格式 {层名: Weight Scale值}
++    """
++    # 匹配层名的正则：Op[/xxx/xxx/Conv]
++    op_pattern = re.compile(r"Op\[(/[\w/\.]+/Conv)\]")
++    # 匹配Weight Scale的正则：Weight[\d+] Scale[\d\.e+-]+
++    weight_scale_pattern = re.compile(r"Weight\[\d+\] Scale\[([\d\.e+-]+)\]")
++
++    layer_weight_scale = {}
++    current_layer = None
++
++    with open(log_file_path, encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            # 第一步：匹配层名
++            op_match = op_pattern.search(line)
++            if op_match:
++                current_layer = op_match.group(1)
++            # 第二步：匹配该层的Weight Scale（仅当已匹配到层名时）
++            if current_layer and "Weight" in line and "Scale" in line:
++                scale_match = weight_scale_pattern.search(line)
++                if scale_match:
++                    scale_value = float(scale_match.group(1))
++                    layer_weight_scale[current_layer] = scale_value
++                    # 重置当前层，避免重复匹配
++                    current_layer = None
++
++    # 去重（同一层可能多次出现，保留最后一个值）
++    layer_weight_scale = dict(layer_weight_scale)
++    print(f"✅ 从日志中解析出 {len(layer_weight_scale)} 个层的Weight Scale：")
++    for layer, scale in layer_weight_scale.items():
++        print(f"  {layer}: {scale}")
++    return layer_weight_scale
++
++
++class QuantConstraint:
++    def __init__(
++        self, policy, accelerator, quant_param_min=5.96e-08, quant_param_max=1.31e05, hisi_log_path=None
++    ):
++        """
++        自动加载Scale：优先从海思日志解析，无日志则动态计算
++        Args:
++            hisi_log_path: 海思OM转换日志文件路径（可选）
++        """
++        self.policy = policy
++        self.accelerator = accelerator
++        self.quant_param_min = quant_param_min
++        self.quant_param_max = quant_param_max
++        self.violation_log = defaultdict(list)
++        self._target_modules = None
++        self.layer_weight_scale = {}
++
++        # 第一步：尝试从日志解析Scale
++        if hisi_log_path:
++            try:
++                self.layer_weight_scale = parse_hisi_om_log(hisi_log_path)
++            except Exception as e:
++                logging.warning(f"解析海思日志失败，将在训练中动态计算Scale：{str(e)}")
++
++    def _get_compatible_layer_types(self):
++        """获取兼容当前PyTorch版本的层类型列表"""
++        # 基础层类型（所有PyTorch版本都支持）
++        base_layers = (
++            # 卷积层
++            nn.Conv1d,
++            nn.Conv2d,
++            nn.Conv3d,
++            nn.ConvTranspose1d,
++            nn.ConvTranspose2d,
++            nn.ConvTranspose3d,
++            # 基础线性层
++            nn.Linear,
++            # BatchNorm层（包括冻结版本）
++            nn.BatchNorm1d,
++            nn.BatchNorm2d,
++            nn.BatchNorm3d,
++            # 嵌入层和归一化层
++            nn.Embedding,
++            nn.LayerNorm,
++        )
++
++        # 可选层类型（根据PyTorch版本动态添加）
++        optional_layers = []
++
++        # 处理量化线性层（版本兼容）
++        try:
++            from torch.nn import quantized
++
++            optional_layers.append(quantized.Linear)
++        except (ImportError, AttributeError):
++            logging.debug("当前PyTorch版本不支持 torch.nn.quantized.Linear，跳过该层类型")
++
++        try:
++            from torch.nn import intrinsic
++
++            optional_layers.append(intrinsic.LinearReLU)
++        except (ImportError, AttributeError):
++            logging.debug("当前PyTorch版本不支持 torch.nn.intrinsic.LinearReLU，跳过该层类型")
++
++        # 合并所有支持的层类型
++        supported_layers = base_layers + tuple(optional_layers)
++        return supported_layers
++
++    def _get_all_weighted_modules(self):
++        """自动匹配所有有权重的层（包括冻结层）"""
++        # 解包分布式封装
++        raw_model = self.accelerator.unwrap_model(self.policy, keep_fp32_wrapper=True)
++        model = raw_model.model
++
++        # 获取兼容当前版本的层类型
++        supported_layers = self._get_compatible_layer_types()
++
++        target_modules = {}
++        for name, module in model.named_modules():
++            # 特殊处理FrozenBatchNorm2d（检测类名而非继承）
++            is_frozen_bn = "FrozenBatchNorm2d" in str(type(module))
++
++            # 匹配条件：
++            # 1. 是支持的层类型 或 是FrozenBatchNorm2d
++            # 2. 有weight属性且不为None
++            if (
++                (isinstance(module, supported_layers) or is_frozen_bn)
++                and hasattr(module, "weight")
++                and module.weight is not None
++            ):
++                target_modules[name] = module
++
++        # 打印匹配结果（仅主进程）
++        if self.accelerator.is_main_process:
++            logging.info("===== 量化约束匹配结果 =====")
++            logging.info(f"匹配到 {len(target_modules)} 个有权重的层（包括冻结层）")
++            # 按类型统计
++            layer_type_count = defaultdict(int)
++            for m in target_modules.values():
++                layer_type = str(type(m).__name__)
++                layer_type_count[layer_type] += 1
++            for layer_type, count in layer_type_count.items():
++                logging.info(f"  {layer_type}: {count} 个")
++            # 单独统计冻结层
++            frozen_count = sum(1 for m in target_modules.values() if "Frozen" in str(type(m)))
++            logging.info(f"  其中冻结层数量: {frozen_count}")
++            logging.info("============================")
++
++        return target_modules
++
++    def _calculate_layer_scale_dynamically(self, module_weights):
++        """
++        动态计算层的Weight Scale（海思Scale的计算逻辑：Scale=(max-min)/4095）
++        Args:
++            module_weights: 层的权重张量（torch.Tensor）
++        Returns:
++            scale_value: 动态计算的Weight Scale
++        """
++        # 海思INT16量化的范围：-2048 ~ 2047，差值为4095
++        quant_range = 2047 - (-2048)  # = 4095
++        weights_min = torch.min(module_weights).item()
++        weights_max = torch.max(module_weights).item()
++        # 计算Scale（避免除以0，加极小值）
++        scale_value = (weights_max - weights_min) / (quant_range + 1e-15)
++        return scale_value
++
++    def clip_weights(self):
++        if self._target_modules is None:
++            self._target_modules = self._get_all_weighted_modules()
++            if not self._target_modules:
++                logging.warning("未匹配到任何有权重的层，量化裁剪未执行！")
++                return
++
++        with torch.no_grad(), self.accelerator.autocast():
++            for name, module in self._target_modules.items():
++                if "Frozen" in str(type(module)):
++                    continue
++
++                try:
++                    weights = module.weight.data
++                    device = weights.device
++                    if not torch.is_floating_point(weights):
++                        weights = weights.float()
++
++                    # 核心：自动获取该层的Scale（优先用日志解析的，无则动态计算）
++                    if name in self.layer_weight_scale:
++                        weight_scale = self.layer_weight_scale[name]
++                        # if weight_scale > 1:
++                        #     print(f"使用日志解析的Scale：层 {name} 的 Scale={weight_scale:.2f}")
++                    else:
++                        # 动态计算Scale（适配未出现在日志中的层）
++                        weight_scale = self._calculate_layer_scale_dynamically(weights)
++                        # 缓存动态计算的Scale，避免重复计算
++                        self.layer_weight_scale[name] = weight_scale
++
++                    # 计算该层的正确裁剪上下限（无需手动配置）
++                    actual_min = self.quant_param_min * weight_scale
++                    actual_max = self.quant_param_max * weight_scale
++
++                    # 计算权重的绝对值，用于后续判断
++                    abs_weights = torch.abs(weights)
++
++                    # 1. 裁剪极小权重（约束下限）
++                    below_min_mask = (abs_weights < actual_min) & (abs_weights > 1e-15)
++                    if torch.any(below_min_mask):
++                        weights[below_min_mask] = torch.sign(weights[below_min_mask]) * actual_min
++
++                    # 2. 裁剪极大权重（约束上限）
++                    above_max_mask = abs_weights > actual_max
++                    if torch.any(above_max_mask):
++                        weights[above_max_mask] = torch.sign(weights[above_max_mask]) * actual_max
++
++                    # 写回权重
++                    module.weight.data = weights.to(device)
++
++                    # 验证+日志（保留原有逻辑）
++                    post_abs_weights = torch.abs(module.weight.data)
++                    post_below_min = torch.sum(post_abs_weights < actual_min).item()
++                    still_violate = post_below_min > 0
++
++                    self.violation_log[name].append(
++                        {
++                            "actual_min": actual_min,
++                            "weight_scale": weight_scale,
++                            "post_below_min": post_below_min,
++                            "still_violate": still_violate,
++                        }
++                    )
++
++                    if self.accelerator.is_main_process and still_violate:
++                        logging.info(f"层 {name} 裁剪完成：")
++                        logging.info(f"  自动计算Scale：{weight_scale:.2f} | 正确下限：{actual_min:.8f}")
++                        logging.info(f"  裁剪后低于下限的权重数：{post_below_min} | 仍超标：{still_violate}")
++
++                except Exception as e:
++                    if self.accelerator.is_main_process:
++                        logging.error(f"层 {name} 裁剪失败：{str(e)}")
++                    continue
++
++
++def check_quant_range_violations(model, quant_min=5.96e-08, quant_max=1.31e05, device="cpu"):
++    """
++    检测模型中超出量化范围的权重层
++
++    Args:
++        model: PyTorch模型实例
++        quant_min: 量化允许的最小值（绝对值）
++        quant_max: 量化允许的最大值（绝对值）
++        device: 模型运行设备（cpu/cuda）
++
++    Returns:
++        violation_info: 包含所有超标层信息的字典
++    """
++    # 将模型设为评估模式并移至指定设备
++    model.eval()
++    model.to(device)
++
++    # 存储超标层信息
++    violation_info = defaultdict(dict)
++    total_violation_layers = 0
++
++    print("=" * 80)
++    print(f"开始检测权重超出量化范围 [{quant_min:.2e}, {quant_max:.2e}] 的层")
++    print("=" * 80)
++
++    # 遍历所有层
++    with torch.no_grad():
++        for name, module in model.named_modules():
++            # 只检查有权重的层（卷积、全连接等）
++            if hasattr(module, "weight") and module.weight is not None:
++                # 获取权重并计算绝对值
++                weights = module.weight.data.cpu().numpy()
++                abs_weights = np.abs(weights)
++
++                # 计算超标情况
++                # 低于最小值的权重
++                below_min_mask = abs_weights < quant_min
++                below_min_count = np.sum(below_min_mask)
++                below_min_ratio = below_min_count / weights.size * 100
++
++                # 高于最大值的权重
++                above_max_mask = abs_weights > quant_max
++                above_max_count = np.sum(above_max_mask)
++                above_max_ratio = above_max_count / weights.size * 100
++
++                # 记录超标层信息
++                if below_min_count > 0 or above_max_count > 0:
++                    total_violation_layers += 1
++                    violation_info[name] = {
++                        "layer_type": str(type(module)),
++                        "weight_shape": weights.shape,
++                        "total_weights": weights.size,
++                        "below_min": {
++                            "count": below_min_count,
++                            "ratio": below_min_ratio,
++                            "min_value": np.min(abs_weights[below_min_mask]) if below_min_count > 0 else None,
++                        },
++                        "above_max": {
++                            "count": above_max_count,
++                            "ratio": above_max_ratio,
++                            "max_value": np.max(abs_weights[above_max_mask]) if above_max_count > 0 else None,
++                        },
++                        "weight_stats": {
++                            "abs_min": np.min(abs_weights),
++                            "abs_max": np.max(abs_weights),
++                            "abs_mean": np.mean(abs_weights),
++                        },
++                    }
++
++                    # 打印当前层的超标信息
++                    print(f"\n【超标层】: {name}")
++                    print(f"  层类型: {violation_info[name]['layer_type'].split('.')[-1].strip('>')}")
++                    print(f"  权重形状: {violation_info[name]['weight_shape']}")
++                    print(f"  总权重数: {violation_info[name]['total_weights']}")
++                    if below_min_count > 0:
++                        print(
++                            f"  低于最小值[{quant_min:.2e}]: {below_min_count}个 ({below_min_ratio:.2f}%) | 最小绝对值: {violation_info[name]['below_min']['min_value']:.2e}"
++                        )
++                    if above_max_count > 0:
++                        print(
++                            f"  高于最大值[{quant_max:.2e}]: {above_max_count}个 ({above_max_ratio:.2f}%) | 最大绝对值: {violation_info[name]['above_max']['max_value']:.2e}"
++                        )
++                    print(
++                        f"  权重绝对值统计: 最小值={violation_info[name]['weight_stats']['abs_min']:.2e}, 最大值={violation_info[name]['weight_stats']['abs_max']:.2e}, 均值={violation_info[name]['weight_stats']['abs_mean']:.2e}"
++                    )
++
++    # 输出汇总信息
++    print("\n" + "=" * 80)
++    print(f"检测完成！共发现 {total_violation_layers} 个层的权重超出量化范围")
++    if total_violation_layers > 0:
++        print("\n超标层列表:")
++        for idx, layer_name in enumerate(violation_info.keys(), 1):
++            print(f"  {idx}. {layer_name}")
++    print("=" * 80)
++
++    return violation_info
++
++
++def save_violation_report(violation_info, save_path="quant_violation_report.txt"):
++    """
++    将超标信息保存为文本报告，方便后续分析
++
++    Args:
++        violation_info: 检测得到的超标信息字典
++        save_path: 报告保存路径
++    """
++    with open(save_path, "w", encoding="utf-8") as f:
++        f.write("模型权重量化范围超标报告\n")
++        f.write("=" * 80 + "\n\n")
++        f.write(f"量化允许范围: [{5.96e-08:.2e}, {1.31e05:.2e}]\n\n")
++
++        if not violation_info:
++            f.write("未发现任何权重超出量化范围的层\n")
++            return
++
++        f.write(f"共发现 {len(violation_info)} 个超标层:\n\n")
++        for name, info in violation_info.items():
++            f.write(f"层名称: {name}\n")
++            f.write(f"  层类型: {info['layer_type'].split('.')[-1].strip('>')}\n")
++            f.write(f"  权重形状: {info['weight_shape']}\n")
++            f.write(f"  总权重数: {info['total_weights']}\n")
++
++            if info["below_min"]["count"] > 0:
++                f.write(
++                    f"  低于最小值: {info['below_min']['count']}个 ({info['below_min']['ratio']:.2f}%) | 最小绝对值: {info['below_min']['min_value']:.2e}\n"
++                )
++            if info["above_max"]["count"] > 0:
++                f.write(
++                    f"  高于最大值: {info['above_max']['count']}个 ({info['above_max']['ratio']:.2f}%) | 最大绝对值: {info['above_max']['max_value']:.2e}\n"
++                )
++
++            f.write(
++                f"  权重绝对值统计: 最小值={info['weight_stats']['abs_min']:.2e}, 最大值={info['weight_stats']['abs_max']:.2e}, 均值={info['weight_stats']['abs_mean']:.2e}\n"
++            )
++            f.write("\n" + "-" * 60 + "\n\n")
++
++    print(f"\n超标报告已保存至: {save_path}")
++
++
++if __name__ == "__main__":
++    # 创建参数解析器
++    parser = argparse.ArgumentParser(
++        description="处理模型配置文件（必填模型路径参数）",
++        epilog="示例: python script.py --model_path=/path/to/train_config.json",
++    )
++    parser.add_argument("--model_path", type=str, help="模型训练配置文件路径")
++
++    # 解析参数
++    if len(sys.argv) == 1:
++        parser.print_help()
++        sys.exit(1)
++    args = parser.parse_args()
++    policy = get_model(args.model_path, 1)
++
++    model = policy.model
++
++    violation_info = check_quant_range_violations(
++        model=model,
++        quant_min=0.008,  # 从警告中提取的最小值
++        quant_max=1.31e05,  # 从警告中提取的最大值
++        device="cpu",  # 根据实际情况选择cpu/cuda
++    )
++
++    # 3. 保存检测报告
++    save_violation_report(violation_info, "quant_violation_report.txt")
+diff --git a/src/lerobot/utils/train_utils.py b/src/lerobot/utils/train_utils.py
+index 6fcf69f0..9c2cbf9e 100644
+--- a/src/lerobot/utils/train_utils.py
++++ b/src/lerobot/utils/train_utils.py
+@@ -35,6 +35,7 @@ from lerobot.utils.constants import (
+ )
+ from lerobot.utils.random_utils import load_rng_state, save_rng_state
+ 
++
+ def get_step_identifier(step: int, total_steps: int) -> str:
+     num_digits = max(6, len(str(total_steps)))
+     return f"{step:0{num_digits}d}"
+@@ -165,6 +166,7 @@ def load_training_state(
+ 
+     return step, optimizer, scheduler
+ 
++
+ # 定义加权采样器
+ class WeightSampler(Sampler):
+     def __init__(self, weights, num_samples, replacement=True):
+@@ -178,7 +180,8 @@ class WeightSampler(Sampler):
+ 
+     def __len__(self):
+         return self.num_samples
+-    
++
++
+ def normalize_weights(weights):
+     total = sum(weights)
+-    return [w / total for w in weights] if total != 0 else weights
+\ No newline at end of file
++    return [w / total for w in weights] if total != 0 else weights
+-- 
+2.34.1
+

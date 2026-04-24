@@ -9,6 +9,19 @@ patch_stack:
   local_branch_name: ibrobot/lerobot-v0.5.1-patched
   application_method: git-am
 
+patch_profiles:
+  - name: default
+    branch_name: ibrobot/lerobot-v0.5.1-patched
+    series_file: series.txt
+    purpose:
+      - Preserve the existing Python 3.10/3.11 compatibility stack used by the legacy ROS host environments.
+  - name: master-parity-candidates
+    branch_name: ibrobot/lerobot-v0.5.1-master-parity-candidates
+    series_file: series.master-parity-candidates.txt
+    purpose:
+      - Track feature-scoped migration patches extracted from the old invasive lerobot_ros2 history.
+      - Keep these master-parity candidates outside the default series until each feature is validated on the current upstream v0.5.1 base.
+
 patches:
   - file: 0001-python-compat-syntax-and-metadata.patch
     purpose:
@@ -33,10 +46,68 @@ patches:
       python: ">=3.10"
       libc: [glibc, musl]
       profiles: [core, ros, hardware, dev]
+  - file: 0005-compat-add-npu-device-detection.patch
+    purpose:
+      - Add torch NPU device recognition to the current upstream device utilities.
+    applies_to:
+      python: ">=3.10"
+      libc: [glibc, musl]
+      profiles: [core, ros, hardware, dev, openharmony, board, inference]
+  - file: 0006-compat-add-ascend-om-config-fields.patch
+    purpose:
+      - Preserve compatibility with legacy Ascend OM config keys still referenced by IB_Robot model export tooling.
+    applies_to:
+      python: ">=3.10"
+      libc: [glibc, musl]
+      profiles: [core, ros, hardware, dev, openharmony, board, inference]
+  - file: 0007-ascend-om-act-runtime.patch
+    purpose:
+      - Restore the invasive Ascend OM ACT runtime support as a feature-scoped migration patch.
+    applies_to:
+      python: ">=3.10"
+      libc: [glibc, musl]
+      profiles: [master-parity-candidates, ascend, om, inference]
+  - file: 0008-ascend-3403-actwrapper.patch
+    purpose:
+      - Restore the SD3403-specific ACT OM worker wrapper as a separate migration patch.
+    applies_to:
+      python: ">=3.10"
+      libc: [glibc, musl]
+      profiles: [master-parity-candidates, ascend, om, 3403, inference]
+  - file: 0009-weighted-training.patch
+    purpose:
+      - Restore weighted-training and quantization-constraint changes extracted from the legacy lerobot_ros2 branch.
+    applies_to:
+      python: ">=3.10"
+      libc: [glibc, musl]
+      profiles: [master-parity-candidates, training]
+  - file: 0010-knowledge-distillation.patch
+    purpose:
+      - Restore knowledge-distillation support for ACT, Diffusion, and PI05 as a dedicated migration patch.
+    applies_to:
+      python: ">=3.10"
+      libc: [glibc, musl]
+      profiles: [master-parity-candidates, training, distillation]
+  - file: 0011-mt-act-model.patch
+    purpose:
+      - Restore the mt_act policy family as a dedicated model patch.
+    applies_to:
+      python: ">=3.10"
+      libc: [glibc, musl]
+      profiles: [master-parity-candidates, models, mt-act]
+  - file: 0012-attention-visualization-tools.patch
+    purpose:
+      - Restore the attention-masking and visualization utility stack used by the legacy model patches.
+    applies_to:
+      python: ">=3.10"
+      libc: [glibc, musl]
+      profiles: [master-parity-candidates, visualization, tooling]
 
 notes:
   - This stack intentionally targets the broadest common Python baseline used by IB_Robot.
   - NumPy >= 2 requirements from upstream lerobot v0.5.1 are not solved by these patches.
   - Policy inference on Python 3.10 also requires the shared typing compatibility shim introduced in patch 0003.
   - Platform-specific patches for musl/OpenHarmony should be added as new numbered patches instead of forking this stack.
+  - The original lerobot_ros2 branch carried much larger Ascend/OM runtime changes; the default series keeps only the current compatible subset while additional candidate patches are tracked separately.
+  - Patches 0007-0012 are feature-scoped migration candidates extracted from lerobot_ros2 for master-parity work. They are intentionally tracked outside the default series until each feature is revalidated on the current upstream lerobot v0.5.1 base.
   - The reference_submodule_commit records the current local development result, but repeated git-am application will produce different commit hashes unless committer identity and dates are reproduced exactly.
