@@ -50,14 +50,14 @@ platform_install_rosdeps() {
     run_sudo apt-get update -qq
 
     log_info "Updating rosdepc database..."
-    if ! rosdepc update --rosdistro=humble; then
+    if ! "${ROSDEPC_BIN:-rosdepc}" update --rosdistro=humble; then
         log_error "rosdepc update failed. This is usually due to network issues."
         log_error "Please check your network connection and re-run ./scripts/setup.sh"
         exit 1
     fi
 
     log_info "Installing ROS dependencies via apt..."
-    if ! rosdepc install \
+    if ! "${ROSDEPC_BIN:-rosdepc}" install \
         --from-paths src \
         --ignore-src \
         --rosdistro=humble \

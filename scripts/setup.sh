@@ -26,6 +26,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="${WORKSPACE:-$(pwd)}"
 PARALLEL_WORKERS=$(($(nproc) / 2))
 AUTO_YES=false
+VERBOSE=${VERBOSE:-false}
+DRY_RUN=${DRY_RUN:-false}
 GIT_HTTP=false
 USE_SUDO=true
 SUMMARY=()
@@ -95,6 +97,38 @@ run_sudo() {
         "$@"
     fi
 }
+
+print_cmd() {
+    printf '%q ' "$@"
+    printf '
+'
+}
+
+run_cmd() {
+    if [[ "${DRY_RUN}" == true ]]; then
+        echo -n "[DRY-RUN] "
+        print_cmd "$@"
+        return 0
+    fi
+    [[ "${VERBOSE}" == true ]] && { echo -n "[CMD] "; print_cmd "$@"; }
+    "$@"
+}
+
+resolve_venv_python() {
+    local venv_path="$1"
+    local candidate=""
+
+    for candidate in "${venv_path}/bin/python3" "${venv_path}/bin/python"; do
+        if [[ -e "${candidate}" ]] && "${candidate}" -c "import sys" >/dev/null 2>&1; then
+            printf '%s
+' "${candidate}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 
 ensure_sudo_session() {
     if [[ "${USE_SUDO}" != true || "${SUDO_AUTH_READY}" == true ]]; then
@@ -1323,7 +1357,7 @@ setup_python_venv() {
     log_info "Installing ruff and pre-commit..."
     run_cmd "${venv_python}" -m pip install ruff pre-commit --quiet
     if [[ -f "${WORKSPACE}/.pre-commit-config.yaml" ]]; then
-        pre-commit install
+        "${venv_python}" -m pre_commit install
     fi
 
     # ------------------------------------------------------------------
