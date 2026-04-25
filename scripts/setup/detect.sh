@@ -2,7 +2,11 @@
 
 python_version_of() {
     local python_bin="${1:-}"
-    [[ -z "${python_bin}" || ! -x "${python_bin}" ]] && return 1
+    # Use -e (existence) rather than -x (executable bit) so foreign-arch
+    # ELF binaries handled via binfmt_misc / qemu-user under chroot are
+    # still considered candidates. The actual --version invocation will
+    # surface a real failure if the binary is genuinely broken.
+    [[ -z "${python_bin}" || ! -e "${python_bin}" ]] && return 1
     "${python_bin}" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
 }
 
@@ -194,10 +198,10 @@ load_platform_impl() {
 
 initialize_platform() {
     detect_host_metadata
-    SETUP_LIBC="$(detect_libc)"
     SETUP_PLATFORM_ID="$(detect_platform_id)"
     load_platform_impl
     detect_python_runtimes
+    export_lerobot_host_facts
 }
 
 detect_python_runtimes() {
@@ -276,4 +280,96 @@ print_platform_summary() {
         log_warn "PYTHONPATH is set: ${SETUP_PYTHONPATH}"
         log_warn "Imported modules may resolve outside this workspace until PYTHONPATH is cleared."
     fi
+}
+
+# -----------------------------------------------------------------------------
+# Host facts for lerobot patch-series dispatch
+# -----------------------------------------------------------------------------
+# These helpers expose the minimal, stable surface consumed by
+# scripts/setup/lerobot_filter_series.py:
+#   IBR_HOST_PYTHON_VERSION  - "X.Y" major.minor of the bootstrap interpreter
+#   IBR_LEROBOT_PROFILES     - comma-separated profile identifiers
+#
+# The applier reads these via os.environ. They are deliberately decoupled
+# from SETUP_* vars so future callers (CI, tooling) can set them directly
+# without sourcing detect.sh.
+
+# Print the major.minor (X.Y) of the most representative host Python.
+# Preference order:
+#   1. SETUP_BOOTSTRAP_PYTHON_BIN  (the interpreter the venv will be built from)
+#   2. SETUP_SHELL_PYTHON_BIN      (whatever python3 is on PATH right now)
+# Emits an empty line and a warning if neither produces a usable version.
+#
+# Note: we deliberately avoid `[ -x ]` for the existence gate because
+# qemu-user emulation under chroot returns false for foreign-arch ELF
+# binaries (binfmt_misc handles exec(2), but access(X_OK) does not).
+# Instead we accept any path that exists and rely on the actual
+# `--version` invocation to surface a real failure.
+detect_host_python_version() {
+    local raw=""
+    local candidate
+
+    candidate="${SETUP_BOOTSTRAP_PYTHON_BIN:-}"
+    if [[ -n "${candidate}" && -e "${candidate}" ]]; then
+        raw="$(python_version_of "${candidate}" 2>/dev/null || true)"
+    fi
+    if [[ -z "${raw}" ]]; then
+        candidate="${SETUP_SHELL_PYTHON_BIN:-}"
+        if [[ -n "${candidate}" && -e "${candidate}" ]]; then
+            raw="$(python_version_of "${candidate}" 2>/dev/null || true)"
+        fi
+    fi
+
+    if [[ -z "${raw}" ]]; then
+        log_warn "detect_host_python_version: no usable Python interpreter found; lerobot filter will treat python_min/python_max as unsatisfiable."
+        echo ""
+        return 0
+    fi
+
+    # Reduce X.Y.Z -> X.Y; tolerate already-X.Y inputs.
+    echo "${raw}" | awk -F. '{ if (NF >= 2) printf "%s.%s", $1, $2; else printf "%s", $0 }'
+}
+
+# Resolve the active lerobot profile list using the documented precedence:
+#   1. IBR_LEROBOT_PROFILES_CLI   (set by --lerobot-profiles)
+#   2. IBR_LEROBOT_PROFILES       (operator override via env)
+#   3. platform_lerobot_profiles  (per-platform default, if defined)
+#   4. "core,ros,hardware,dev"    (legacy fallback == Ubuntu 22.04 baseline)
+# Whitespace around tokens is stripped; empty tokens are dropped.
+resolve_lerobot_profiles() {
+    local raw=""
+
+    if [[ -n "${IBR_LEROBOT_PROFILES_CLI:-}" ]]; then
+        raw="${IBR_LEROBOT_PROFILES_CLI}"
+    elif [[ -n "${IBR_LEROBOT_PROFILES:-}" ]]; then
+        raw="${IBR_LEROBOT_PROFILES}"
+    elif declare -F platform_lerobot_profiles >/dev/null 2>&1; then
+        raw="$(platform_lerobot_profiles 2>/dev/null || true)"
+    fi
+
+    if [[ -z "${raw}" ]]; then
+        raw="core,ros,hardware,dev"
+    fi
+
+    # Normalise: strip whitespace, drop empty fields, preserve order.
+    echo "${raw}" | awk -F, '{
+        out = ""
+        for (i = 1; i <= NF; i++) {
+            tok = $i
+            gsub(/^[ \t]+|[ \t]+$/, "", tok)
+            if (tok == "") continue
+            if (out == "") out = tok
+            else out = out "," tok
+        }
+        printf "%s", out
+    }'
+}
+
+# Compute and export the host-fact env vars consumed by the applier.
+# Idempotent; safe to call after detect_python_runtimes and after
+# load_platform_impl (so platform_lerobot_profiles is in scope).
+export_lerobot_host_facts() {
+    IBR_HOST_PYTHON_VERSION="$(detect_host_python_version)"
+    IBR_LEROBOT_PROFILES="$(resolve_lerobot_profiles)"
+    export IBR_HOST_PYTHON_VERSION IBR_LEROBOT_PROFILES
 }

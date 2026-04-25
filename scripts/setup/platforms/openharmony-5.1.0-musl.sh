@@ -8,6 +8,16 @@ platform_ros_setup_path() {
     fi
 }
 
+# Default lerobot patch-series profile selection for this platform.
+# Consumed by detect.sh::resolve_lerobot_profiles when neither
+# IBR_LEROBOT_PROFILES_CLI nor IBR_LEROBOT_PROFILES is set.
+# 0005-0008 are excluded by manifest design (their profile list intentionally
+# omits 'core'/'openharmony'); 0001-0003 are excluded by python_max
+# (host Python on OpenHarmony is 3.11, while those down-grade patches require <3.11).
+platform_lerobot_profiles() {
+    echo "core,openharmony"
+}
+
 platform_handle_missing_ros() {
     log_error "ROS 2 Humble setup script is not configured for OpenHarmony."
     log_error "Set ROS_HUMBLE_SETUP_PATH to your Python 3.11 ROS Humble environment before running setup."
@@ -15,7 +25,7 @@ platform_handle_missing_ros() {
 }
 
 platform_prepare_host() {
-    log_warn "OpenHarmony musl platform detected."
+    log_warn "OpenHarmony platform detected."
     log_warn "System dependency bootstrap is not yet fully automated for this platform."
     log_warn "Proceeding with shared setup steps only; platform-specific package installation must be supplied separately."
 }
@@ -38,7 +48,7 @@ platform_install_python_bootstrap() {
 }
 
 platform_install_rosdeps() {
-    log_warn "Skipping automated rosdepc installation on OpenHarmony musl."
+    log_warn "Skipping automated rosdepc installation on OpenHarmony."
     log_warn "Provide ROS/system dependencies externally or rerun with --skip-system-deps if this is intentional."
 }
 

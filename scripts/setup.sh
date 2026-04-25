@@ -32,7 +32,6 @@ GIT_HTTP=false
 USE_SUDO=true
 SUMMARY=()
 SETUP_PLATFORM_ID="unknown"
-SETUP_LIBC="unknown"
 SETUP_OS_ID="unknown"
 SETUP_OS_VERSION="unknown"
 SETUP_OS_PRETTY_NAME="unknown"
@@ -481,6 +480,10 @@ Options:
       --skip-python      Skip Python virtual environment setup
       --skip-verify      Skip final ROS/Python verification
       --platform ID      Override platform detection
+      --lerobot-profiles CSV
+                         Override lerobot patch profile selection
+                         (e.g. core,ros,hardware,ascend). Highest
+                         precedence; overrides IBR_LEROBOT_PROFILES env.
   -h, --help             Show this help
 
 Known platform IDs:
@@ -508,6 +511,16 @@ parse_args() {
                     exit 1
                 fi
                 PLATFORM_OVERRIDE="$1"
+                ;;
+            --lerobot-profiles)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    log_error "--lerobot-profiles requires a comma-separated profile list."
+                    exit 1
+                fi
+                # Exported here (not just assigned) so detect.sh's
+                # resolve_lerobot_profiles can consume it later.
+                export IBR_LEROBOT_PROFILES_CLI="$1"
                 ;;
             --help|-h)
                 show_help
@@ -1607,9 +1620,7 @@ main() {
     # Update submodules
     set_stage "syncing submodules"
     update_submodules
-    set_stage "applying lerobot patches"
-    ensure_lerobot_patch_stack_applied
-    
+
     # Optional: Setup developer forks
     set_stage "configuring developer forks"
     setup_developer_forks
@@ -1625,6 +1636,12 @@ main() {
     if [[ "${PYTHON_ENV_STATUS}" == "done" ]]; then
         log_done "Python virtual environment configured"
     fi
+
+    # LeRobot patch stack must run AFTER the venv exists so the
+    # platform-aware filter (lerobot_filter_series.py) can run under
+    # ${VENV_PYTHON} where PyYAML is guaranteed installed.
+    set_stage "applying lerobot patches"
+    ensure_lerobot_patch_stack_applied
 
     echo ""
     echo -e "${YELLOW}============================================================${NC}"

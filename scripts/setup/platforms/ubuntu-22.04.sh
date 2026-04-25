@@ -12,6 +12,13 @@ platform_ros_setup_path() {
     fi
 }
 
+# Default lerobot patch-series profile selection for this platform.
+# Consumed by detect.sh::resolve_lerobot_profiles when neither
+# IBR_LEROBOT_PROFILES_CLI nor IBR_LEROBOT_PROFILES is set.
+platform_lerobot_profiles() {
+    echo "core,ros,hardware,dev"
+}
+
 platform_handle_missing_ros() {
     log_info "Running ROS 2 installation script..."
 

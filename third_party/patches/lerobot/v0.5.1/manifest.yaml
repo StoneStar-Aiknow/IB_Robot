@@ -1,3 +1,5 @@
+schema_version: 2
+
 upstream:
   repo: https://gitcode.com/openharmony-robot/lerobot.git
   tag: v0.5.1
@@ -9,105 +11,134 @@ patch_stack:
   local_branch_name: ibrobot/lerobot-v0.5.1-patched
   application_method: git-am
 
+# Top-level profile dictionary. Each profile is an opaque tag used to gate
+# patch applicability. The applier matches a patch iff the active profile set
+# (resolved via CLI flag, env, platform, or fallback) intersects the patch's
+# `applies_to.profiles` list.
+profiles:
+  core: General-purpose desktop / development workloads.
+  ros: Hosts that build and run the IB_Robot ROS 2 graph.
+  hardware: Hosts wired up to physical robotic hardware.
+  dev: Developer workstations (Ubuntu desktop) tolerating extra dependencies.
+  openeuler: openEuler Embedded targets (currently 24.03 aarch64).
+  openharmony: OpenHarmony 5.x device targets.
+  ascend: Hosts with Huawei Ascend NPUs.
+  om: Hosts running Ascend OM-format model artefacts.
+  "3403": Hisilicon SD3403 boards using the dedicated OM ACT wrapper.
+  inference: Inference-only deployments (no training requirements).
+  training: Hosts that run policy training, including weighted-training tweaks.
+  distillation: Hosts that perform knowledge distillation across policies.
+  models: Hosts that need extra model families beyond the upstream set.
+  mt-act: Multi-task ACT policy variant.
+  visualization: Attention-visualization and tooling stack.
+  tooling: Auxiliary tooling shared by the model patches.
+  master-parity-candidates: Migration patches tracked outside the default series.
+
 patch_profiles:
   - name: default
     branch_name: ibrobot/lerobot-v0.5.1-patched
     series_file: series.txt
     purpose:
-      - Preserve the existing Python 3.10/3.11 compatibility stack used by the legacy ROS host environments.
+      - Default patch series consumed by setup.sh, filtered by the applier
+        against the active host facts and profile set.
   - name: master-parity-candidates
     branch_name: ibrobot/lerobot-v0.5.1-master-parity-candidates
     series_file: series.master-parity-candidates.txt
     purpose:
-      - Track feature-scoped migration patches extracted from the old invasive lerobot_ros2 history.
-      - Keep these master-parity candidates outside the default series until each feature is validated on the current upstream v0.5.1 base.
+      - Track feature-scoped migration patches extracted from the old invasive
+        lerobot_ros2 history.
+      - Keep these master-parity candidates outside the default series until
+        each feature is validated on the current upstream v0.5.1 base.
 
+# Per-patch applicability bounds. Schema v2 contract:
+#   * applies_to.python_min / python_max are PEP 440 specifiers (e.g. ">=3.10",
+#     "<3.11"). Either or both may be omitted to express an unbounded side.
+#   * applies_to.profiles is a list of profile tags; omit to skip profile gating.
+# A patch is applied iff every present predicate matches the active host facts.
 patches:
   - file: 0001-python-compat-syntax-and-metadata.patch
     purpose:
       - Replace Python 3.12-only generic syntax with Python 3.10-compatible typing constructs.
       - Lower project metadata from Python 3.12 to Python 3.11 as the first step in the compatibility stack.
     applies_to:
-      python: ">=3.10"
-      libc: [glibc, musl]
-      profiles: [core, ros, hardware, dev]
+      python_max: "<3.11"
+      profiles: [core, ros, hardware, dev, openeuler]
   - file: 0002-python-compat-min-version-3.10.patch
     purpose:
       - Lower project metadata from Python 3.11 to Python 3.10.
     applies_to:
-      python: ">=3.10"
-      libc: [glibc, musl]
-      profiles: [core, ros, hardware, dev]
+      python_max: "<3.11"
+      profiles: [core, ros, hardware, dev, openeuler]
   - file: 0003-python-compat-typing-unpack.patch
     purpose:
       - Replace Python 3.11-only `typing.Unpack` imports with a shared compatibility shim.
       - Add a conditional `typing-extensions` dependency for Python 3.10 runtimes.
     applies_to:
-      python: ">=3.10"
-      libc: [glibc, musl]
-      profiles: [core, ros, hardware, dev]
+      python_max: "<3.11"
+      profiles: [core, ros, hardware, dev, openeuler]
   - file: 0005-compat-add-npu-device-detection.patch
     purpose:
       - Add torch NPU device recognition to the current upstream device utilities.
     applies_to:
-      python: ">=3.10"
-      libc: [glibc, musl]
-      profiles: [core, ros, hardware, dev, openharmony, board, inference]
+      profiles: [ros, hardware, dev, openeuler, ascend, inference]
   - file: 0006-compat-add-ascend-om-config-fields.patch
     purpose:
       - Preserve compatibility with legacy Ascend OM config keys still referenced by IB_Robot model export tooling.
     applies_to:
-      python: ">=3.10"
-      libc: [glibc, musl]
-      profiles: [core, ros, hardware, dev, openharmony, board, inference]
+      profiles: [ros, hardware, dev, openeuler, ascend, inference]
   - file: 0007-ascend-om-act-runtime.patch
     purpose:
       - Restore the invasive Ascend OM ACT runtime support as a feature-scoped migration patch.
     applies_to:
-      python: ">=3.10"
-      libc: [glibc, musl]
       profiles: [master-parity-candidates, ascend, om, inference]
   - file: 0008-ascend-3403-actwrapper.patch
     purpose:
       - Restore the SD3403-specific ACT OM worker wrapper as a separate migration patch.
     applies_to:
-      python: ">=3.10"
-      libc: [glibc, musl]
-      profiles: [master-parity-candidates, ascend, om, 3403, inference]
+      profiles: [master-parity-candidates, ascend, om, "3403", inference]
   - file: 0009-weighted-training.patch
     purpose:
       - Restore weighted-training and quantization-constraint changes extracted from the legacy lerobot_ros2 branch.
     applies_to:
-      python: ">=3.10"
-      libc: [glibc, musl]
       profiles: [master-parity-candidates, training]
   - file: 0010-knowledge-distillation.patch
     purpose:
       - Restore knowledge-distillation support for ACT, Diffusion, and PI05 as a dedicated migration patch.
     applies_to:
-      python: ">=3.10"
-      libc: [glibc, musl]
       profiles: [master-parity-candidates, training, distillation]
   - file: 0011-mt-act-model.patch
     purpose:
       - Restore the mt_act policy family as a dedicated model patch.
     applies_to:
-      python: ">=3.10"
-      libc: [glibc, musl]
       profiles: [master-parity-candidates, models, mt-act]
   - file: 0012-attention-visualization-tools.patch
     purpose:
       - Restore the attention-masking and visualization utility stack used by the legacy model patches.
     applies_to:
-      python: ">=3.10"
-      libc: [glibc, musl]
       profiles: [master-parity-candidates, visualization, tooling]
 
 notes:
-  - This stack intentionally targets the broadest common Python baseline used by IB_Robot.
-  - NumPy >= 2 requirements from upstream lerobot v0.5.1 are not solved by these patches.
-  - Policy inference on Python 3.10 also requires the shared typing compatibility shim introduced in patch 0003.
-  - Platform-specific patches for musl/OpenHarmony should be added as new numbered patches instead of forking this stack.
-  - The original lerobot_ros2 branch carried much larger Ascend/OM runtime changes; the default series keeps only the current compatible subset while additional candidate patches are tracked separately.
-  - Patches 0007-0012 are feature-scoped migration candidates extracted from lerobot_ros2 for master-parity work. They are intentionally tracked outside the default series until each feature is revalidated on the current upstream lerobot v0.5.1 base.
-  - The reference_submodule_commit records the current local development result, but repeated git-am application will produce different commit hashes unless committer identity and dates are reproduced exactly.
+  - Schema v2 contract — each patch declares applicability via independent
+    `python_min` / `python_max` / `profiles` predicates; the applier skips a
+    patch only when at least one declared predicate fails to match the active
+    host facts.
+  - Patches 0001-0003 are down-grade patches (Python 3.12/3.11 to 3.10); they
+    declare an upper bound of Python 3.11 and MUST be skipped on hosts whose
+    Python is already 3.11 or newer (openEuler 24.03 default 3.11, OpenHarmony
+    3.12).
+  - Patches 0005-0006 add NPU/Ascend OM compatibility. They are silent no-ops
+    on non-Ascend hosts and are profile-gated (ascend / hardware / inference)
+    so the OpenHarmony stack — which currently does not declare any of those
+    profiles — never opts into them.
+  - NumPy >= 2 requirements from upstream lerobot v0.5.1 are not solved by
+    these patches.
+  - Platform-specific patches for OpenHarmony should be added as new numbered
+    patches with explicit `profiles` predicates (e.g. `[openharmony]`) instead
+    of forking this stack.
+  - Patches 0007-0012 are feature-scoped migration candidates extracted from
+    lerobot_ros2 for master-parity work. They are intentionally tracked outside
+    the default series until each feature is revalidated on the current
+    upstream lerobot v0.5.1 base.
+  - The reference_submodule_commit records the current local development
+    result, but repeated git-am application will produce different commit
+    hashes unless committer identity and dates are reproduced exactly.
