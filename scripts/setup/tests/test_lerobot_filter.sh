@@ -18,8 +18,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
 FILTER="${REPO_ROOT}/scripts/setup/lerobot_filter_series.py"
+RESOLVER="${REPO_ROOT}/scripts/setup/lerobot_resolve_active.py"
+INDEX="${REPO_ROOT}/third_party/patches/lerobot/INDEX.yaml"
 MANIFEST="${REPO_ROOT}/third_party/patches/lerobot/v0.5.1/manifest.yaml"
 DEFAULT_SERIES="${REPO_ROOT}/third_party/patches/lerobot/v0.5.1/series.txt"
+EXPECTED_BASE_COMMIT="1396b9fab7aecddd10006c33c47a487ffdcb54b4"
 
 PASS=0
 FAIL=0
@@ -98,41 +101,37 @@ echo "== lerobot_filter_series regression harness =="
 
 # Ubuntu 22.04 / Python 3.10 — must keep the legacy 5-patch series intact so
 # PR #96's baseline output does not regress.
-run_fixture "ubuntu-22.04 / py3.10 glibc / desktop profile" \
+run_fixture "ubuntu-22.04 / py3.10 / desktop profile" \
     "0001-python-compat-syntax-and-metadata.patch,0002-python-compat-min-version-3.10.patch,0003-python-compat-typing-unpack.patch,0005-compat-add-npu-device-detection.patch,0006-compat-add-ascend-om-config-fields.patch" \
     IBR_HOST_PYTHON_VERSION=3.10 \
-    IBR_HOST_LIBC=glibc \
     IBR_LEROBOT_PROFILES=core,ros,hardware,dev \
     --
 
 # openEuler Embedded 24.03 / Python 3.11 — must drop 0001-0003 (down-grade
 # patches) but keep the Ascend-side compat patches.
-run_fixture "openeuler-embedded-24.03 / py3.11 glibc" \
+run_fixture "openeuler-embedded-24.03 / py3.11" \
     "0005-compat-add-npu-device-detection.patch,0006-compat-add-ascend-om-config-fields.patch" \
     IBR_HOST_PYTHON_VERSION=3.11 \
-    IBR_HOST_LIBC=glibc \
     IBR_LEROBOT_PROFILES=core,ros,hardware,openeuler \
     --
 
-# OpenHarmony 5.1.0 / Python 3.12 / musl — must drop both the down-grade and
-# the glibc-bound Ascend compat patches.
-run_fixture "openharmony-5.1.0 / py3.12 musl" \
+# OpenHarmony 5.1.0 / Python 3.12 — must drop both the down-grade and
+# the Ascend compat patches (no profile overlap).
+run_fixture "openharmony-5.1.0 / py3.12" \
     "" \
     IBR_HOST_PYTHON_VERSION=3.12 \
-    IBR_HOST_LIBC=musl \
-    IBR_LEROBOT_PROFILES=core,openharmony,musl \
+    IBR_LEROBOT_PROFILES=core,openharmony \
     --
 
-# Force-Ascend on a glibc host — used for hardware bring-up scenarios where
-# the operator wants the master-parity Ascend patches as well. We point the
+# Force-Ascend bring-up scenario where the operator wants the master-parity
+# Ascend patches as well. We point the
 # filter at the master-parity series file because the default series only
 # contains 0001-0006.
 MASTER_PARITY_SERIES="${REPO_ROOT}/third_party/patches/lerobot/v0.5.1/series.master-parity-candidates.txt"
 if [[ -f "${MASTER_PARITY_SERIES}" ]]; then
-    run_fixture "ascend-forced / py3.10 glibc / master-parity series" \
+    run_fixture "ascend-forced / py3.10 / master-parity series" \
         "0007-ascend-om-act-runtime.patch,0008-ascend-3403-actwrapper.patch,0009-weighted-training.patch,0010-knowledge-distillation.patch,0011-mt-act-model.patch,0012-attention-visualization-tools.patch" \
         IBR_HOST_PYTHON_VERSION=3.10 \
-        IBR_HOST_LIBC=glibc \
         IBR_LEROBOT_PROFILES=core,ascend,master-parity-candidates,om,training,distillation,models,mt-act,visualization,tooling \
         -- \
         "${MASTER_PARITY_SERIES}"
@@ -142,14 +141,147 @@ fi
 
 # Negative: malformed manifest must exit non-zero with parser error.
 TMP_BAD_MANIFEST="$(mktemp)"
-trap 'rm -f "${TMP_BAD_MANIFEST}"' EXIT
+trap 'rm -rf "${TMP_BAD_MANIFEST}" "${TMP_INDEX_DIR:-/nonexistent}"' EXIT
 printf 'patches:\n  - file: 0001\n      bad-indent: true\n' > "${TMP_BAD_MANIFEST}"
 run_negative "malformed manifest exits 1" 1 \
     IBR_HOST_PYTHON_VERSION=3.10 \
-    IBR_HOST_LIBC=glibc \
     IBR_LEROBOT_PROFILES=core \
     -- \
     --manifest "${TMP_BAD_MANIFEST}" --series "${DEFAULT_SERIES}"
+
+# ---------------------------------------------------------------------------
+# Tag binding fixtures (--lerobot-head-commit + INDEX.yaml resolution)
+# ---------------------------------------------------------------------------
+
+# HEAD matching commit_range.min must succeed and produce the same default
+# 5-patch series as the baseline ubuntu fixture above.
+run_fixture "tag-binding / head_commit==range.min keeps default series" \
+    "0001-python-compat-syntax-and-metadata.patch,0002-python-compat-min-version-3.10.patch,0003-python-compat-typing-unpack.patch,0005-compat-add-npu-device-detection.patch,0006-compat-add-ascend-om-config-fields.patch" \
+    IBR_HOST_PYTHON_VERSION=3.10 \
+    IBR_LEROBOT_PROFILES=core,ros,hardware,dev \
+    -- \
+    "${DEFAULT_SERIES}" \
+    --lerobot-head-commit "${EXPECTED_BASE_COMMIT}"
+
+# HEAD that falls outside commit_range must abort with exit 1 even when
+# every per-patch predicate would otherwise match.
+run_negative "tag-binding / head_commit out of range fails closed" 1 \
+    IBR_HOST_PYTHON_VERSION=3.10 \
+    IBR_LEROBOT_PROFILES=core,ros,hardware,dev \
+    -- \
+    --manifest "${MANIFEST}" \
+    --series "${DEFAULT_SERIES}" \
+    --lerobot-head-commit "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+
+# ---------------------------------------------------------------------------
+# Resolver fixtures (lerobot_resolve_active.py + INDEX.yaml)
+# ---------------------------------------------------------------------------
+
+run_resolver_pass() {
+    local name="$1"
+    local index_path="$2"
+    local expected_tag="$3"
+
+    local actual_tag
+    if ! actual_tag="$("${PYTHON_BIN}" "${RESOLVER}" --index "${index_path}" 2>/dev/null \
+            | grep -E '^LEROBOT_TAG=' | head -n1 | cut -d= -f2)"; then
+        printf '  FAIL  %s (resolver exited non-zero)\n' "${name}" >&2
+        FAIL=$((FAIL + 1))
+        return
+    fi
+    if [[ "${actual_tag}" == "${expected_tag}" ]]; then
+        printf '  PASS  %s (LEROBOT_TAG=%s)\n' "${name}" "${actual_tag}"
+        PASS=$((PASS + 1))
+    else
+        printf '  FAIL  %s\n' "${name}" >&2
+        printf '    expected LEROBOT_TAG=%s\n' "${expected_tag}" >&2
+        printf '    actual   LEROBOT_TAG=%s\n' "${actual_tag}" >&2
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+run_resolver_fail() {
+    local name="$1"
+    local index_path="$2"
+
+    local actual_exit=0
+    "${PYTHON_BIN}" "${RESOLVER}" --index "${index_path}" >/dev/null 2>&1 \
+        || actual_exit=$?
+    if [[ "${actual_exit}" -ne 0 ]]; then
+        printf '  PASS  %s (exit %d)\n' "${name}" "${actual_exit}"
+        PASS=$((PASS + 1))
+    else
+        printf '  FAIL  %s\n' "${name}" >&2
+        printf '    expected non-zero exit, got 0\n' >&2
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+# Baseline: in-tree INDEX.yaml resolves cleanly to v0.5.1.
+run_resolver_pass "resolver / in-tree INDEX picks v0.5.1" \
+    "${INDEX}" "v0.5.1"
+
+# Build a synthetic multi-tag INDEX in a temp dir to verify selection
+# semantics without touching the in-tree layout.
+TMP_INDEX_DIR="$(mktemp -d)"
+mkdir -p "${TMP_INDEX_DIR}/v0.5.1" "${TMP_INDEX_DIR}/v0.6.0"
+cp "${MANIFEST}" "${TMP_INDEX_DIR}/v0.5.1/manifest.yaml"
+cp "${DEFAULT_SERIES}" "${TMP_INDEX_DIR}/v0.5.1/series.txt"
+# v0.6.0 fixture: same manifest contents but with lerobot_tag retagged so
+# the resolver can validate cross-checks. We rewrite the two relevant
+# fields with sed so the rest of the manifest stays in sync.
+sed -e 's/^lerobot_tag: v0.5.1/lerobot_tag: v0.6.0/' \
+    -e 's/^  min: 1396b9fab7aecddd10006c33c47a487ffdcb54b4/  min: feedfacefeedfacefeedfacefeedfacefeedface/' \
+    -e 's/^  max: 1396b9fab7aecddd10006c33c47a487ffdcb54b4/  max: feedfacefeedfacefeedfacefeedfacefeedface/' \
+    "${MANIFEST}" > "${TMP_INDEX_DIR}/v0.6.0/manifest.yaml"
+cp "${DEFAULT_SERIES}" "${TMP_INDEX_DIR}/v0.6.0/series.txt"
+
+# Multi-tag INDEX with active_tag=v0.6.0 must resolve to v0.6.0 even
+# though v0.5.1 also exists in supported_tags.
+cat > "${TMP_INDEX_DIR}/INDEX.yaml" <<EOF
+schema_version: 1
+active_tag: v0.6.0
+supported_tags:
+  - tag: v0.5.1
+    dir: v0.5.1
+    upstream_commit: 1396b9fab7aecddd10006c33c47a487ffdcb54b4
+    branch_name: ibrobot/lerobot-v0.5.1-patched
+  - tag: v0.6.0
+    dir: v0.6.0
+    upstream_commit: feedfacefeedfacefeedfacefeedfacefeedface
+    branch_name: ibrobot/lerobot-v0.6.0-patched
+archived_tags: []
+EOF
+run_resolver_pass "resolver / multi-tag selects active_tag=v0.6.0" \
+    "${TMP_INDEX_DIR}/INDEX.yaml" "v0.6.0"
+
+# Archived tag selected as active_tag must be rejected.
+cat > "${TMP_INDEX_DIR}/INDEX.yaml" <<EOF
+schema_version: 1
+active_tag: v0.5.1
+supported_tags: []
+archived_tags:
+  - tag: v0.5.1
+    dir: v0.5.1
+    upstream_commit: 1396b9fab7aecddd10006c33c47a487ffdcb54b4
+    branch_name: ibrobot/lerobot-v0.5.1-patched
+EOF
+run_resolver_fail "resolver / archived tag rejected" \
+    "${TMP_INDEX_DIR}/INDEX.yaml"
+
+# INDEX upstream_commit not matching manifest.lerobot_commit_range.min must fail.
+cat > "${TMP_INDEX_DIR}/INDEX.yaml" <<EOF
+schema_version: 1
+active_tag: v0.5.1
+supported_tags:
+  - tag: v0.5.1
+    dir: v0.5.1
+    upstream_commit: 0000000000000000000000000000000000000000
+    branch_name: ibrobot/lerobot-v0.5.1-patched
+archived_tags: []
+EOF
+run_resolver_fail "resolver / INDEX vs manifest commit mismatch rejected" \
+    "${TMP_INDEX_DIR}/INDEX.yaml"
 
 echo
 echo "== summary: ${PASS} passed, ${FAIL} failed =="

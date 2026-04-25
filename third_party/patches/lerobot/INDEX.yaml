@@ -1,0 +1,41 @@
+# LeRobot patch stack — multi-tag index
+#
+# Single source of truth that tells the setup applier *which* per-tag
+# patch directory under `third_party/patches/lerobot/<tag>/` is currently
+# active for the upstream lerobot submodule pinned in `libs/lerobot`.
+#
+# The applier reads this file via `scripts/setup/lerobot_resolve_active.py`
+# and emits shell-eval'able assignments. Per-tag manifests must declare a
+# matching `lerobot_tag` and `lerobot_commit_range`; the resolver
+# cross-checks them and refuses to run on a mismatch (fail-closed).
+#
+# Upgrade workflow (see `scripts/setup/README.md` for the full procedure):
+#   1. Add a new directory `third_party/patches/lerobot/<new_tag>/` with
+#      its own `manifest.yaml` + `series.txt` set.
+#   2. Append a `supported_tags[]` entry below pointing at it.
+#   3. Flip `active_tag` to the new tag.
+#   4. Move the previous tag entry into `archived_tags[]` once it is no
+#      longer maintained. Archived entries are rejected by the resolver.
+
+schema_version: 1
+
+active_tag: v0.5.1
+
+# Tags whose patch directories are present in-tree and may be selected by
+# `active_tag`. Each entry binds a tag string to its on-disk directory and
+# the upstream commit it was generated against; the per-tag manifest must
+# declare the same `lerobot_tag` and `lerobot_commit_range.min` value.
+supported_tags:
+  - tag: v0.5.1
+    dir: v0.5.1
+    upstream_commit: 1396b9fab7aecddd10006c33c47a487ffdcb54b4
+    branch_name: ibrobot/lerobot-v0.5.1-patched
+    notes: |
+      Initial schema_v2 patch stack landed by PR #96 (platform-aware
+      dispatch). Targets upstream lerobot v0.5.1 on glibc/musl with the
+      five-patch baseline plus master-parity migration candidates.
+
+# Tags retained in-tree for historical reference but no longer eligible
+# to be selected as `active_tag`. The resolver fails closed if
+# `active_tag` references an archived entry.
+archived_tags: []

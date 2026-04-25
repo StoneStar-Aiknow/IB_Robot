@@ -1,9 +1,19 @@
 schema_version: 2
 
+# Top-level tag binding. The setup applier resolves the active tag via
+# `third_party/patches/lerobot/INDEX.yaml`; the resolver fails closed if
+# `lerobot_tag` here does not match the INDEX entry, or if the libs/lerobot
+# submodule HEAD prior to patch application falls outside
+# `lerobot_commit_range`. The min/max sha pair allows fast-forward upstream
+# commits within the same logical tag (e.g. v0.5.1 -> v0.5.1.post1) to share
+# this patch stack without forking a new directory.
+lerobot_tag: v0.5.1
+lerobot_commit_range:
+  min: 1396b9fab7aecddd10006c33c47a487ffdcb54b4
+  max: 1396b9fab7aecddd10006c33c47a487ffdcb54b4
+
 upstream:
   repo: https://gitcode.com/openharmony-robot/lerobot.git
-  tag: v0.5.1
-  commit: 1396b9fab7aecddd10006c33c47a487ffdcb54b4
 
 patch_stack:
   generated_from_submodule_branch: compat/python310

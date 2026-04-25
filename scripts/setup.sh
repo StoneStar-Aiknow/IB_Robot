@@ -662,7 +662,7 @@ PY
             local current_py
             current_py="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")')"
             log_error "libs/lerobot requires Python >= ${min_python}, but the active interpreter is ${current_py}."
-            log_error "The current ROS 2 Humble workspace venv is not new enough for LeRobot v0.5.1."
+            log_error "The current ROS 2 Humble workspace venv is not new enough for the active LeRobot patch tag."
             exit 1
     fi
 }

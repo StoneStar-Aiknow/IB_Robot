@@ -142,10 +142,63 @@ def _resolve_host_python(value: str | None) -> tuple[int, ...] | None:
         return None
 
 
+def _validate_head_commit(
+    manifest: Mapping[str, object],
+    head_commit: str,
+    manifest_path: Path,
+) -> str | None:
+    """Return ``None`` when head_commit is acceptable, else an error string.
+
+    The check is intentionally lenient: callers may pass an empty string when
+    the libs/lerobot worktree is unavailable (e.g. running the filter outside
+    a checkout for fixture testing). In that case the predicate is skipped.
+    Otherwise we require the manifest to declare a ``lerobot_commit_range``
+    and that the head sha is exactly equal to ``min`` (single-commit range)
+    or ``max`` (last accepted fast-forward). Range expansion beyond two
+    sentinel shas requires `git merge-base --is-ancestor` and is intentionally
+    out of scope for this Python helper; widen by setting both endpoints to
+    the new tip when fast-forwarding.
+    """
+
+    if not head_commit:
+        return None
+
+    commit_range = manifest.get("lerobot_commit_range")
+    if not isinstance(commit_range, Mapping):
+        return (
+            f"manifest {manifest_path} is missing 'lerobot_commit_range'; cannot "
+            f"validate libs/lerobot HEAD={head_commit}. Update the manifest to "
+            "include {min, max} sha values."
+        )
+    range_min = str(commit_range.get("min") or "")
+    range_max = str(commit_range.get("max") or "")
+    if not range_min or not range_max:
+        return f"manifest {manifest_path} lerobot_commit_range must declare both 'min' and 'max' sha values."
+    if head_commit not in (range_min, range_max):
+        return (
+            f"libs/lerobot HEAD {head_commit} is not in the manifest "
+            f"commit_range [{range_min}..{range_max}]. Either checkout the "
+            "expected base commit, fast-forward the manifest range, or add a "
+            "new tag directory under third_party/patches/lerobot/ and update "
+            "INDEX.yaml's active_tag."
+        )
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True, type=Path)
     parser.add_argument("--series", required=True, type=Path)
+    parser.add_argument(
+        "--lerobot-head-commit",
+        default="",
+        help=(
+            "Current libs/lerobot HEAD sha (e.g. `git -C libs/lerobot rev-parse "
+            "HEAD`). When non-empty the filter validates it against the "
+            "manifest's lerobot_commit_range and exits 1 on mismatch. Empty "
+            "value disables the check (used by fixture tests)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -166,6 +219,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if not isinstance(manifest, dict) or "patches" not in manifest:
         _log_stderr(f"ERROR: manifest {args.manifest} missing required 'patches' key")
+        return 1
+
+    head_commit_error = _validate_head_commit(manifest, args.lerobot_head_commit, args.manifest)
+    if head_commit_error is not None:
+        _log_stderr(f"ERROR: {head_commit_error}")
         return 1
 
     patches_index = _build_index(manifest.get("patches") or [])

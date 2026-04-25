@@ -3,17 +3,25 @@
 # ----------------------------------------------------------------------------
 # LeRobot patch stack — platform-aware applier
 # ----------------------------------------------------------------------------
-# This module reads third_party/patches/lerobot/v0.5.1/manifest.yaml
-# (schema_version: 2) and applies only the subset of patches that
-# match the current host's Python version and active profile list.
+# This module resolves the active lerobot patch tag through
+# third_party/patches/lerobot/INDEX.yaml (single source of truth for
+# multi-tag support) and applies only the subset of patches that match
+# the current host's Python version and active profile list.
 # Filtering is delegated to scripts/setup/lerobot_filter_series.py
-# which is invoked under ${VENV_PYTHON} so PyYAML is guaranteed available.
+# and tag resolution to scripts/setup/lerobot_resolve_active.py; both run
+# under ${VENV_PYTHON} so PyYAML is guaranteed available.
+#
+# Tag binding contract (fail-closed):
+#   * INDEX.yaml.active_tag MUST match <tag-dir>/manifest.yaml.lerobot_tag.
+#   * INDEX entry's upstream_commit MUST equal manifest.lerobot_commit_range.min.
+#   * libs/lerobot HEAD prior to patch application MUST fall inside
+#     manifest.lerobot_commit_range. Mismatches abort setup with a hint to
+#     update INDEX.yaml or add a new tag directory.
 #
 # Escape hatches (env vars):
-#   IBR_LEROBOT_FORCE_UNFILTERED=1   bypass the filter and apply the raw
-#                                    series.txt verbatim. Use only when the
-#                                    venv lacks PyYAML and you accept the
-#                                    risk of applying inappropriate patches.
+#   IBR_LEROBOT_FORCE_UNFILTERED=1   bypass the platform filter and apply the
+#                                    raw series.txt verbatim. Tag resolution
+#                                    via INDEX.yaml is still enforced.
 #   IBR_LEROBOT_FORCE_REBUILD=1      reset a dirty libs/lerobot worktree
 #                                    before rebuilding the patched branch
 #                                    (default: refuse and exit 1).
@@ -22,21 +30,16 @@
 # are populated by scripts/setup/detect.sh::export_lerobot_host_facts.
 # ----------------------------------------------------------------------------
 
-lerobot_patch_dir() {
-    echo "${WORKSPACE}/third_party/patches/lerobot/v0.5.1"
+_lerobot_index_path() {
+    echo "${WORKSPACE}/third_party/patches/lerobot/INDEX.yaml"
 }
 
-lerobot_patch_base_commit() {
-    local manifest
-    manifest="$(lerobot_patch_dir)/manifest.yaml"
-    grep -E '^  commit:' "${manifest}" | head -n1 | awk '{print $2}'
-}
-
-# Pick the most appropriate Python interpreter to drive the filter.
-# The filter only needs PyYAML, which the venv always provides.
+# Pick the most appropriate Python interpreter to drive the helpers.
+# The helpers only need PyYAML, which the venv always provides.
 # Bootstrap python on stripped openEuler/OpenHarmony may lack PyYAML;
 # in that case the user must either install it or set
-# IBR_LEROBOT_FORCE_UNFILTERED=1.
+# IBR_LEROBOT_FORCE_UNFILTERED=1 (note: this still requires INDEX.yaml
+# resolution to succeed).
 _lerobot_filter_python() {
     if [[ -n "${VENV_PYTHON:-}" && -x "${VENV_PYTHON}" ]]; then
         echo "${VENV_PYTHON}"
@@ -49,16 +52,71 @@ _lerobot_filter_python() {
     command -v python3 || true
 }
 
+# Resolve INDEX.yaml's active tag into shell variables. On success exports:
+#   LEROBOT_TAG, LEROBOT_DIR, LEROBOT_BASE_COMMIT, LEROBOT_BASE_COMMIT_MIN,
+#   LEROBOT_BASE_COMMIT_MAX, LEROBOT_BRANCH_NAME, LEROBOT_MANIFEST,
+#   LEROBOT_SERIES.
+# Returns 1 on any resolver failure (mismatch, archived tag, missing dir).
+_lerobot_resolve_active() {
+    local resolver="${WORKSPACE}/scripts/setup/lerobot_resolve_active.py"
+    local index_file
+    index_file="$(_lerobot_index_path)"
+
+    if [[ ! -f "${index_file}" ]]; then
+        log_error "LeRobot patch INDEX.yaml not found at ${index_file}"
+        return 1
+    fi
+    if [[ ! -f "${resolver}" ]]; then
+        log_error "LeRobot tag resolver not found: ${resolver}"
+        return 1
+    fi
+
+    local py_bin
+    py_bin="$(_lerobot_filter_python)"
+    if [[ -z "${py_bin}" ]]; then
+        log_error "No usable Python interpreter to run lerobot_resolve_active.py."
+        return 1
+    fi
+
+    local resolved
+    if ! resolved="$("${py_bin}" "${resolver}" --index "${index_file}" 2>&1 1>/dev/stdout)"; then
+        log_error "lerobot_resolve_active.py failed:"
+        sed 's/^/    /' <<<"${resolved}" >&2
+        return 1
+    fi
+
+    # The resolver prints `KEY=value` lines on stdout. We deliberately do
+    # NOT eval the output (defence in depth — the values come from a YAML
+    # file checked into the repo, but we still parse strictly).
+    local line key value
+    while IFS= read -r line; do
+        [[ -z "${line}" ]] && continue
+        key="${line%%=*}"
+        value="${line#*=}"
+        case "${key}" in
+            LEROBOT_TAG|LEROBOT_DIR|LEROBOT_BASE_COMMIT|LEROBOT_BASE_COMMIT_MIN|\
+            LEROBOT_BASE_COMMIT_MAX|LEROBOT_BRANCH_NAME|LEROBOT_MANIFEST|LEROBOT_SERIES)
+                printf -v "${key}" '%s' "${value}"
+                export "${key?}"
+                ;;
+            *)
+                log_warn "lerobot_resolve_active emitted unknown key '${key}'; ignoring."
+                ;;
+        esac
+    done <<<"${resolved}"
+    return 0
+}
+
 # Compute the filtered patch series and write one filename per line to
 # the path given by $2. Audit output (KEEP/SKIP reasons) is mirrored to
 # the user via log_info. Returns 0 on success, 1 on filter failure
 # (caller should abort unless IBR_LEROBOT_FORCE_UNFILTERED=1).
 lerobot_compute_filtered_series() {
-    local patch_dir="$1"
-    local out_file="$2"
+    local manifest="$1"
+    local raw_series="$2"
+    local out_file="$3"
+    local head_commit="${4:-}"
 
-    local manifest="${patch_dir}/manifest.yaml"
-    local raw_series="${patch_dir}/series.txt"
     local filter_script="${WORKSPACE}/scripts/setup/lerobot_filter_series.py"
 
     if [[ "${IBR_LEROBOT_FORCE_UNFILTERED:-0}" == "1" ]]; then
@@ -86,6 +144,7 @@ lerobot_compute_filtered_series() {
     if ! "${py_bin}" "${filter_script}" \
             --manifest "${manifest}" \
             --series "${raw_series}" \
+            --lerobot-head-commit "${head_commit}" \
             >"${out_file}" 2>"${audit_file}"; then
         local rc=$?
         log_error "lerobot_filter_series.py failed with exit ${rc}."
@@ -93,7 +152,7 @@ lerobot_compute_filtered_series() {
             log_error "Filter stderr:"
             sed 's/^/    /' "${audit_file}" >&2
         fi
-        log_error "Set IBR_LEROBOT_FORCE_UNFILTERED=1 to bypass the filter and apply the unfiltered series."
+        log_error "Set IBR_LEROBOT_FORCE_UNFILTERED=1 to bypass the platform filter (tag binding still enforced)."
         rm -f "${out_file}" "${audit_file}"
         return 1
     fi
@@ -151,22 +210,36 @@ _lerobot_reset_dirty_worktree() {
 
 ensure_lerobot_patch_stack_applied() {
     local submodule_dir="${WORKSPACE}/libs/lerobot"
-    local patch_dir
-    local base_commit
-    local branch_name="ibrobot/lerobot-v0.5.1-patched"
     local expected_patch_count
     local applied_patch_count
 
     [[ ! -d "${submodule_dir}" ]] && return 0
     [[ ! -d "${submodule_dir}/.git" && ! -f "${submodule_dir}/.git" ]] && return 0
 
-    patch_dir="$(lerobot_patch_dir)"
-    base_commit="$(lerobot_patch_base_commit)"
+    # Resolve the active tag's directory + base commit + branch name from
+    # INDEX.yaml. On failure (mismatch, archived tag, missing manifest)
+    # we abort: tag binding is part of the contract.
+    if ! _lerobot_resolve_active; then
+        log_error "Cannot resolve active lerobot patch tag; aborting setup."
+        exit 1
+    fi
+    local patch_dir="${LEROBOT_DIR}"
+    local base_commit="${LEROBOT_BASE_COMMIT}"
+    local branch_name="${LEROBOT_BRANCH_NAME}"
+    local manifest_file="${LEROBOT_MANIFEST}"
+    local raw_series="${LEROBOT_SERIES}"
 
-    if [[ ! -f "${patch_dir}/series.txt" || -z "${base_commit}" ]]; then
-        log_warn "LeRobot patch stack metadata is missing. Skipping automatic patch application."
+    if [[ ! -f "${raw_series}" || -z "${base_commit}" ]]; then
+        log_warn "LeRobot patch stack metadata is missing for tag ${LEROBOT_TAG}. Skipping automatic patch application."
         return 0
     fi
+
+    # Capture the current libs/lerobot HEAD so the filter can validate it
+    # against manifest.lerobot_commit_range. Empty string when rev-parse
+    # fails (e.g. detached without HEAD); the filter treats empty as
+    # "skip the predicate" rather than fail-closed.
+    local head_commit=""
+    head_commit="$(git -C "${submodule_dir}" rev-parse HEAD 2>/dev/null || true)"
 
     # Compute the platform-filtered series into a temp file. All downstream
     # logic (count comparisons, am, rebuild) consumes this filtered file
@@ -177,13 +250,13 @@ ensure_lerobot_patch_stack_applied() {
     # shellcheck disable=SC2064
     trap "rm -f '${series_file}' '${series_file}.audit'" RETURN
 
-    if ! lerobot_compute_filtered_series "${patch_dir}" "${series_file}"; then
+    if ! lerobot_compute_filtered_series "${manifest_file}" "${raw_series}" "${series_file}" "${head_commit}"; then
         log_error "Cannot compute filtered lerobot patch series; aborting setup."
         exit 1
     fi
 
     expected_patch_count="$(grep -cv '^[[:space:]]*$' "${series_file}")"
-    log_info "Checking IB_Robot lerobot patch stack (${expected_patch_count} patches after platform filter; profiles=${IBR_LEROBOT_PROFILES:-unknown})..."
+    log_info "Checking IB_Robot lerobot patch stack for tag ${LEROBOT_TAG} (${expected_patch_count} patches after platform filter; profiles=${IBR_LEROBOT_PROFILES:-unknown})..."
 
     if [[ "${expected_patch_count}" -eq 0 ]]; then
         log_done "No lerobot patches apply to this platform; nothing to do."
@@ -249,7 +322,7 @@ ensure_lerobot_patch_stack_applied() {
         fi
     fi
 
-    log_info "Applying IB_Robot lerobot patch stack on top of upstream v0.5.1..."
+    log_info "Applying IB_Robot lerobot patch stack on top of upstream ${LEROBOT_TAG}..."
     git -C "${submodule_dir}" checkout -b "${branch_name}" >/dev/null
     lerobot_apply_patch_series "${submodule_dir}" "${patch_dir}" "${series_file}"
     log_done "LeRobot patch stack applied"
