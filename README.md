@@ -135,6 +135,11 @@ source .shrc_local
 
 > **注意**：`.shrc_local` 会自动完成 `venv` 激活、ROS 2 环境加载和工作区 `install/setup.zsh` 的 source。每次另起新终端都必须重新执行上述命令，否则 `ros2` 命令和 Python 包将不可用。
 
+完成首次构建后，再额外加载工作区环境：
+```bash
+source install/setup.sh
+```
+
 ### 2. 分配 Domain ID
 
 为了避免与局域网内其他 ROS 2 用户冲突，建议设置唯一的 Domain ID。**每次另起新终端都需要重新设置**：
@@ -519,6 +524,8 @@ IB-Robot 深度集成 [OpenClaw](https://github.com/openclaw/openclaw) AI Agent 
   启动后，系统将在 `9090` 端口开启 WebSocket 服务。
 
 ### 2. 控制端配置 (OpenClaw)
+
+- OpenClaw 是机器人的“大脑”和“前端”，负责连接社交软件并调用 LLM 理解指令。
 
 > **重要**：在使用 OpenClaw 控制机器人之前，必须确保 OpenClaw 侧的 `ROS_DOMAIN_ID` 与机器人端一致。否则 OpenClaw 将无法发现 ROS2 话题和服务，表现为"ros2 CLI 不可用"或无法发送控制指令。需要在会话时告知 OpenClaw 对应的 `ROS_DOMAIN_ID`。
 
