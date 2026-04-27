@@ -14,9 +14,10 @@
 #   ./scripts/setup.sh --help                        # Show help
 #
 # Auto-yes defaults:
-#   - Submodule init:  initialize all submodules (option 1)
-#   - Fork setup:      skipped
-#   - Other prompts:   confirmed automatically
+#   - Missing submodules:       initialized
+#   - Existing submodule update: skipped
+#   - Fork setup:               skipped
+#   - Other prompts:            confirmed automatically
 set -euo pipefail
 
 # ============================================================================
@@ -276,35 +277,12 @@ ui_stage_progress() {
 run_with_progress() {
     local title="$1"
     shift
-    local status
-    local heartbeat_pid=""
 
-    if [[ -t 1 ]]; then
-        (
-            sleep 8
-            while true; do
-                echo "[INFO] ${title} still running..."
-                sleep 8
-            done
-        ) &
-        heartbeat_pid=$!
-    fi
-
-    if [[ "${USE_GUM}" == true ]]; then
+    if [[ "${USE_GUM}" == true && "${VERBOSE}" != true ]]; then
         "${GUM_BIN}" spin --title "${title}" --spinner dot --show-output -- "$@"
-        status=$?
     else
-        log_info "${title}"
-        "$@"
-        status=$?
+        run_with_live_output "${title}" "$@"
     fi
-
-    if [[ -n "${heartbeat_pid}" ]]; then
-        kill "${heartbeat_pid}" >/dev/null 2>&1 || true
-        wait "${heartbeat_pid}" 2>/dev/null || true
-    fi
-
-    return "${status}"
 }
 
 run_privileged_with_progress() {
@@ -355,10 +333,51 @@ ui_prompt_input() {
     printf '%s\n' "${REPLY}"
 }
 
+ui_choose() {
+    local header="$1"
+    shift
+
+    if [[ "${USE_GUM}" == true ]]; then
+        "${GUM_BIN}" choose --header "${header}" "$@"
+        return $?
+    fi
+
+    return 1
+}
+
 submodule_is_initialized() {
     local path="$1"
     [[ -e "${path}/.git" ]] || return 1
     git -C "${path}" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
+submodule_update_block_reason() {
+    local path="$1"
+    local name="$2"
+    local dirty_status=""
+    local recorded_commit=""
+    local current_commit=""
+    local current_branch=""
+
+    dirty_status="$(git -C "${path}" status --porcelain 2>/dev/null || true)"
+    if [[ -n "${dirty_status}" ]]; then
+        echo "${name} (${path}) has local changes or untracked files."
+        return 0
+    fi
+
+    recorded_commit="$(git ls-tree HEAD -- "${path}" | awk '{print $3}' || true)"
+    current_commit="$(git -C "${path}" rev-parse HEAD 2>/dev/null || true)"
+    if [[ -n "${recorded_commit}" && -n "${current_commit}" && "${current_commit}" != "${recorded_commit}" ]]; then
+        current_branch="$(git -C "${path}" branch --show-current 2>/dev/null || true)"
+        if [[ -n "${current_branch}" ]]; then
+            echo "${name} (${path}) is on ${current_branch} at ${current_commit:0:12}, not recorded gitlink ${recorded_commit:0:12}."
+        else
+            echo "${name} (${path}) is at ${current_commit:0:12}, not recorded gitlink ${recorded_commit:0:12}."
+        fi
+        return 0
+    fi
+
+    return 1
 }
 
 install_gitlint_hook() {
@@ -410,6 +429,7 @@ EOF
         banner="IB Robot"
     fi
 
+    echo ""
     if [[ "${USE_GUM}" == true ]]; then
         "${GUM_BIN}" style --foreground 212 --bold "${banner}"
         echo ""
@@ -759,7 +779,7 @@ platform_install_colcon() {
 
     if command -v dnf &>/dev/null; then
         if command -v pip3 &>/dev/null; then
-            run_with_progress "Installing colcon build tool..." pip3 install colcon-common-extensions --quiet
+            run_with_live_output "Installing colcon build tool..." pip3 install colcon-common-extensions
             return 0
         fi
         log_error "pip3 not found, cannot install colcon."
@@ -767,7 +787,7 @@ platform_install_colcon() {
     fi
 
     if command -v pip3 &>/dev/null; then
-        run_with_progress "Installing colcon build tool..." pip3 install colcon-common-extensions --quiet
+        run_with_live_output "Installing colcon build tool..." pip3 install colcon-common-extensions
         return 0
     fi
 
@@ -808,13 +828,13 @@ platform_install_rosdeps() {
     if command -v apt-get &>/dev/null; then
         run_privileged_with_live_output "Updating apt package lists..." apt-get update
 
-        if ! run_with_progress "Updating rosdepc database..." env ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL}" "${rosdepc_cmd}" update --rosdistro=humble; then
+        if ! run_with_live_output "Updating rosdepc database..." env ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL}" "${rosdepc_cmd}" update --rosdistro=humble; then
             log_error "rosdepc update failed. This is usually due to network issues."
             log_error "Please check your network connection and re-run ./scripts/setup.sh"
             exit 1
         fi
 
-        if ! run_with_progress "Installing ROS dependencies via apt..." env ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL}" "${rosdepc_cmd}" install \
+        if ! run_with_live_output "Installing ROS dependencies via apt..." env ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL}" "${rosdepc_cmd}" install \
             "${rosdep_install_extra_args[@]}" \
             --from-paths src \
             --ignore-src \
@@ -839,13 +859,13 @@ platform_install_rosdeps() {
     fi
 
     if command -v dnf &>/dev/null; then
-        if ! run_with_progress "Updating rosdepc database..." env ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL}" "${rosdepc_cmd}" update --rosdistro=humble; then
+        if ! run_with_live_output "Updating rosdepc database..." env ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL}" "${rosdepc_cmd}" update --rosdistro=humble; then
             log_error "rosdepc update failed. This is usually due to network issues."
             log_error "Please check your network connection and re-run ./scripts/setup.sh"
             exit 1
         fi
 
-        if ! run_with_progress "Installing ROS dependencies via dnf..." env ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL}" "${rosdepc_cmd}" install \
+        if ! run_with_live_output "Installing ROS dependencies via dnf..." env ROSDISTRO_INDEX_URL="${SETUP_ROSDISTRO_INDEX_URL}" "${rosdepc_cmd}" install \
             "${rosdep_install_extra_args[@]}" \
             --from-paths src \
             --ignore-src \
@@ -947,14 +967,40 @@ update_submodules() {
             echo "  ✓ ${name} (${path})"
         done
         echo ""
+        if [[ "${AUTO_YES}" == true ]]; then
+            log_info "Auto-yes: keeping existing submodule checkouts."
+            log_skipped "Submodule sync/update"
+            return 0
+        fi
         if ! ask_yn "Do you want to sync/update all submodules?" "n"; then
             log_info "Skipping submodule update."
             log_skipped "Submodule sync/update"
             return 0
         fi
+
+        local blocked_update_reasons=()
+        local reason=""
+        for entry in "${submodules[@]}"; do
+            local path="${entry%%:*}"
+            local name="${entry##*:}"
+            if reason="$(submodule_update_block_reason "${path}" "${name}")"; then
+                blocked_update_reasons+=("${reason}")
+            fi
+        done
+
+        if [[ ${#blocked_update_reasons[@]} -gt 0 ]]; then
+            log_warn "Skipping optional submodule update to preserve local submodule state:"
+            for reason in "${blocked_update_reasons[@]}"; do
+                log_warn "  - ${reason}"
+            done
+            log_warn "Clean/reset the affected submodule manually before rerunning setup if you really want to refresh it."
+            log_skipped "Submodule sync/update"
+            return 0
+        fi
+
         log_info "Updating all submodules..."
         export GIT_LFS_SKIP_SMUDGE=1
-        run_with_progress "Updating all submodules..." git submodule update --init --recursive
+        run_with_live_output "Updating all submodules..." git submodule update --init --recursive
         log_done "Submodules synced/updated"
         return 0
     fi
@@ -970,7 +1016,7 @@ update_submodules() {
 
     if [[ "${AUTO_YES}" == true ]] || ask_yn "Initialize all missing submodules?" "y"; then
         export GIT_LFS_SKIP_SMUDGE=1
-        run_with_progress "Initializing submodules..." git submodule update --init --recursive
+        run_with_live_output "Initializing submodules..." git submodule update --init --recursive
         log_done "Submodules initialized"
     else
         log_warn "Submodule initialization skipped."
@@ -1127,14 +1173,16 @@ ensure_rosdepc() {
     #
     # Both failure modes vanish if we install rosdepc into the workspace
     # venv (using the venv's own python) and always invoke it via the
-    # explicit venv path. There is no shim to go stale, and pip always
-    # installs into the same interpreter we then use.
+    # explicit venv path. Because this venv uses --system-site-packages,
+    # pip may otherwise short-circuit on a system rosdepc package and never
+    # create venv/bin/rosdepc, so installation must ignore visible system
+    # packages when the venv-owned CLI is missing or broken.
     ensure_workspace_venv
 
     if ! "${ROSDEPC_BIN}" --version &>/dev/null; then
         log_info "Installing rosdepc into the workspace venv..."
         run_cmd "${VENV_PYTHON}" -m pip install --upgrade pip --quiet
-        run_cmd "${VENV_PYTHON}" -m pip install rosdepc --quiet
+        run_cmd "${VENV_PYTHON}" -m pip install --ignore-installed --upgrade rosdepc --quiet
         if ! "${ROSDEPC_BIN}" --version &>/dev/null; then
             log_error "rosdepc install did not produce a working CLI at ${ROSDEPC_BIN}."
             log_error "Re-run with VERBOSE=1 to see the full pip output."
@@ -1326,8 +1374,10 @@ setup_python_venv() {
     # 升级 pip
     run_cmd "${venv_python}" -m pip install --upgrade pip --quiet
 
-    # 解决 setuptools 版本冲突 (兼容 LeRobot 和 colcon)
-    run_cmd "${venv_python}" -m pip install "setuptools<80" "setuptools>=71" --quiet
+    # Pin and force-reinstall setuptools to a version that satisfies both
+    # LeRobot (>=71,<81) and colcon-core (<80), while retaining the legacy
+    # `setup.py develop --editable` option used by colcon's symlink install.
+    run_cmd "${venv_python}" -m pip install --force-reinstall "setuptools==75.8.2" --quiet
 
     # ------------------------------------------------------------------
     # LeRobot patch stack — MUST run before install_lerobot_editable.
@@ -1382,40 +1432,65 @@ setup_python_venv() {
         run_cmd "${pip_install[@]}" hebi teleop --quiet
         log_done "Phone teleoperation dependencies installed (hebi + teleop)"
     else
-        echo ""
-        echo "  Phone teleoperation backends (optional):"
-        echo "    1) iOS only  — hebi  (HEBI Mobile I/O + ARKit)"
-        echo "    2) Android only — teleop  (WebXR WebSocket)"
-        echo "    3) Both (iOS + Android)"
-        echo "    0) Skip phone backends"
-        echo ""
-        while true; do
-            read -r -p "  Enter your choice [0-3]: " PHONE_CHOICE
-            case "${PHONE_CHOICE}" in
-                1)
+        local phone_choice=""
+        if phone_choice="$(ui_choose "Phone teleoperation backends (optional)" \
+            "Skip phone backends" \
+            "iOS only — hebi (HEBI Mobile I/O + ARKit)" \
+            "Android only — teleop (WebXR WebSocket)" \
+            "Both (iOS + Android)")"; then
+            case "${phone_choice}" in
+                "iOS only"*)
                     run_cmd "${pip_install[@]}" hebi --quiet
                     log_done "Phone dependencies installed: hebi (iOS)"
-                    break
                     ;;
-                2)
+                "Android only"*)
                     run_cmd "${pip_install[@]}" teleop --quiet
                     log_done "Phone dependencies installed: teleop (Android)"
-                    break
                     ;;
-                3)
+                "Both"*)
                     run_cmd "${pip_install[@]}" hebi teleop --quiet
                     log_done "Phone dependencies installed: hebi + teleop (iOS + Android)"
-                    break
                     ;;
-                0)
+                "Skip phone backends")
                     log_info "Skipping phone teleoperation dependencies."
-                    break
-                    ;;
-                *)
-                    echo "  Invalid choice. Please enter 0-3."
                     ;;
             esac
-        done
+        else
+            echo ""
+            echo "  Phone teleoperation backends (optional):"
+            echo "    1) iOS only  — hebi  (HEBI Mobile I/O + ARKit)"
+            echo "    2) Android only — teleop  (WebXR WebSocket)"
+            echo "    3) Both (iOS + Android)"
+            echo "    0) Skip phone backends"
+            echo ""
+            while true; do
+                read -r -p "  Enter your choice [0-3]: " PHONE_CHOICE
+                case "${PHONE_CHOICE}" in
+                    1)
+                        run_cmd "${pip_install[@]}" hebi --quiet
+                        log_done "Phone dependencies installed: hebi (iOS)"
+                        break
+                        ;;
+                    2)
+                        run_cmd "${pip_install[@]}" teleop --quiet
+                        log_done "Phone dependencies installed: teleop (Android)"
+                        break
+                        ;;
+                    3)
+                        run_cmd "${pip_install[@]}" hebi teleop --quiet
+                        log_done "Phone dependencies installed: hebi + teleop (iOS + Android)"
+                        break
+                        ;;
+                    0)
+                        log_info "Skipping phone teleoperation dependencies."
+                        break
+                        ;;
+                    *)
+                        echo "  Invalid choice. Please enter 0-3."
+                        ;;
+                esac
+            done
+        fi
     fi
 
     # 安装训练可视化依赖
@@ -1455,7 +1530,29 @@ setup_python_venv() {
     # "No module named colcon" even though `command -v colcon` succeeds.
     # ------------------------------------------------------------------
     log_info "Installing colcon-common-extensions + colcon-mixin into the workspace venv..."
-    run_cmd "${pip_install[@]}" colcon-common-extensions colcon-mixin --quiet
+    run_cmd "${pip_install[@]}" --ignore-installed --upgrade colcon-common-extensions colcon-mixin --quiet
+
+    if ! PYTHONNOUSERSITE=1 "${venv_python}" - <<'PY'
+import setuptools.command.develop as develop
+
+raise SystemExit(
+    0
+    if any(opt[0].startswith("editable") for opt in develop.develop.user_options)
+    else 1
+)
+PY
+    then
+        log_error "The workspace venv setuptools does not support 'setup.py develop --editable'."
+        log_error "This breaks colcon --symlink-install for Python packages."
+        log_error "Re-run setup with VERBOSE=1 to inspect the setuptools install transcript."
+        exit 1
+    fi
+
+    # ROS 2 Humble rosidl_adapter still uses the Empy 3.x API
+    # (e.g. em.BUFFERED_OPT). Empy 4.x removes that symbol and breaks clean
+    # interface package builds after `rm -rf build install log`.
+    log_info "Pinning Empy 3.3.4 for ROS 2 Humble rosidl compatibility..."
+    run_cmd "${pip_install[@]}" --force-reinstall "empy==3.3.4" --quiet
 
     # rosdepc was already installed into this same venv by the early
     # ensure_workspace_venv + ensure_rosdepc step. Re-running pip install
@@ -1584,6 +1681,18 @@ verify_setup() {
         log_error "build.sh runs colcon this exact way; please reinstall colcon into the venv:"
         log_error "  source venv/bin/activate"
         log_error "  PYTHONNOUSERSITE=1 python3 -m pip install --upgrade colcon-common-extensions colcon-mixin"
+        exit 1
+    fi
+
+    if ! PYTHONNOUSERSITE=1 "${venv_python}" - <<'PY'
+import em
+
+raise SystemExit(0 if hasattr(em, "BUFFERED_OPT") else 1)
+PY
+    then
+        log_error "Verification failed: Empy is not ROS 2 Humble compatible."
+        log_error "rosidl_adapter requires Empy 3.x (em.BUFFERED_OPT)."
+        log_error "Re-run ./scripts/setup.sh to restore empy==3.3.4 in the venv."
         exit 1
     fi
 

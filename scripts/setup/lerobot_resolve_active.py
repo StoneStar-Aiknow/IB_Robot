@@ -21,8 +21,9 @@ On success exits 0 and prints (one assignment per line) to stdout:
     LEROBOT_BRANCH_NAME=<branch-from-INDEX>
     LEROBOT_MANIFEST=<absolute-path-to-manifest.yaml>
     LEROBOT_SERIES=<absolute-path-to-series.txt>
+    LEROBOT_UPSTREAM_REPO=<manifest-upstream-repo>
 
-The shell consumer is expected to wrap the call in ``eval "$(...)"``.
+The shell consumer is expected to parse the ``KEY=value`` lines explicitly.
 
 Exit codes:
     0  — Resolution succeeded.
@@ -156,6 +157,11 @@ def main(argv: list[str] | None = None) -> int:
             f"({manifest_path}). The two MUST agree."
         )
         return 1
+    upstream = manifest.get("upstream") or {}
+    if not isinstance(upstream, dict):
+        _err(f"manifest.upstream must be a mapping when present: {manifest_path}")
+        return 1
+    upstream_repo = upstream.get("repo") or ""
 
     sys.stdout.write(f"LEROBOT_TAG={active_tag}\n")
     sys.stdout.write(f"LEROBOT_DIR={tag_dir}\n")
@@ -165,6 +171,7 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.write(f"LEROBOT_BRANCH_NAME={branch_name}\n")
     sys.stdout.write(f"LEROBOT_MANIFEST={manifest_path}\n")
     sys.stdout.write(f"LEROBOT_SERIES={series_path}\n")
+    sys.stdout.write(f"LEROBOT_UPSTREAM_REPO={upstream_repo}\n")
     return 0
 
 

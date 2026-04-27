@@ -273,7 +273,7 @@ echo "════════════════════════�
 EVENT_HANDLERS="status- summary-"
 ${VERBOSE} && EVENT_HANDLERS="console_cohesion+"
 
-colcon build \
+PYTHONNOUSERSITE=1 python3 -m colcon build \
     --continue-on-error \
     --parallel-workers "$(nproc)" \
     --merge-install \

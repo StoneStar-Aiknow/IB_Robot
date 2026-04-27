@@ -55,7 +55,7 @@ _lerobot_filter_python() {
 # Resolve INDEX.yaml's active tag into shell variables. On success exports:
 #   LEROBOT_TAG, LEROBOT_DIR, LEROBOT_BASE_COMMIT, LEROBOT_BASE_COMMIT_MIN,
 #   LEROBOT_BASE_COMMIT_MAX, LEROBOT_BRANCH_NAME, LEROBOT_MANIFEST,
-#   LEROBOT_SERIES.
+#   LEROBOT_SERIES, LEROBOT_UPSTREAM_REPO.
 # Returns 1 on any resolver failure (mismatch, archived tag, missing dir).
 _lerobot_resolve_active() {
     local resolver="${WORKSPACE}/scripts/setup/lerobot_resolve_active.py"
@@ -95,7 +95,8 @@ _lerobot_resolve_active() {
         value="${line#*=}"
         case "${key}" in
             LEROBOT_TAG|LEROBOT_DIR|LEROBOT_BASE_COMMIT|LEROBOT_BASE_COMMIT_MIN|\
-            LEROBOT_BASE_COMMIT_MAX|LEROBOT_BRANCH_NAME|LEROBOT_MANIFEST|LEROBOT_SERIES)
+            LEROBOT_BASE_COMMIT_MAX|LEROBOT_BRANCH_NAME|LEROBOT_MANIFEST|\
+            LEROBOT_SERIES|LEROBOT_UPSTREAM_REPO)
                 printf -v "${key}" '%s' "${value}"
                 export "${key?}"
                 ;;
@@ -219,6 +220,12 @@ lerobot_apply_patch_series() {
     done < "${series_file}"
 }
 
+_lerobot_git_no_lfs_smudge() {
+    local submodule_dir="$1"
+    shift
+    GIT_LFS_SKIP_SMUDGE=1 git -C "${submodule_dir}" "$@"
+}
+
 lerobot_rebuild_patch_branch() {
     local submodule_dir="$1"
     local patch_dir="$2"
@@ -227,9 +234,9 @@ lerobot_rebuild_patch_branch() {
     local branch_name="$5"
 
     log_warn "Rebuilding ${branch_name} to match the in-repo patch stack."
-    git -C "${submodule_dir}" checkout --detach "${base_commit}" >/dev/null
+    _lerobot_git_no_lfs_smudge "${submodule_dir}" checkout --detach "${base_commit}" >/dev/null
     git -C "${submodule_dir}" branch -D "${branch_name}" >/dev/null
-    git -C "${submodule_dir}" checkout -b "${branch_name}" >/dev/null
+    _lerobot_git_no_lfs_smudge "${submodule_dir}" checkout -b "${branch_name}" >/dev/null
     lerobot_apply_patch_series "${submodule_dir}" "${patch_dir}" "${series_file}"
     log_done "LeRobot patch stack rebuilt"
 }
@@ -242,9 +249,59 @@ _lerobot_reset_dirty_worktree() {
     local base_commit="$2"
 
     log_warn "IBR_LEROBOT_FORCE_REBUILD=1: discarding local changes in libs/lerobot."
-    git -C "${submodule_dir}" reset --hard >/dev/null
+    _lerobot_git_no_lfs_smudge "${submodule_dir}" reset --hard >/dev/null
     git -C "${submodule_dir}" clean -fdx >/dev/null
-    git -C "${submodule_dir}" checkout --detach "${base_commit}" >/dev/null
+    _lerobot_git_no_lfs_smudge "${submodule_dir}" checkout --detach "${base_commit}" >/dev/null
+}
+
+_lerobot_ensure_base_commit() {
+    local submodule_dir="$1"
+    local base_commit="$2"
+    local tag="$3"
+    local upstream_repo="$4"
+
+    if git -C "${submodule_dir}" cat-file -e "${base_commit}^{commit}" 2>/dev/null; then
+        return 0
+    fi
+
+    if [[ -z "${upstream_repo}" ]]; then
+        log_error "LeRobot base commit ${base_commit} is missing locally, and manifest.upstream.repo is empty."
+        return 1
+    fi
+
+    log_info "Fetching LeRobot base ${tag} (${base_commit:0:12}) from ${upstream_repo}..."
+    if git -C "${submodule_dir}" fetch --no-tags "${upstream_repo}" "refs/tags/${tag}:refs/tags/${tag}" >/dev/null 2>&1; then
+        git -C "${submodule_dir}" cat-file -e "${base_commit}^{commit}" 2>/dev/null
+        return $?
+    fi
+
+    git -C "${submodule_dir}" fetch --no-tags "${upstream_repo}" "${base_commit}" >/dev/null 2>&1
+}
+
+_lerobot_describe_unmanaged_checkout() {
+    local submodule_dir="$1"
+    local current_head="$2"
+    local base_commit="$3"
+    local branch_name="$4"
+    local current_branch=""
+    local origin_url=""
+    local version_line=""
+
+    current_branch="$(git -C "${submodule_dir}" branch --show-current 2>/dev/null || true)"
+    origin_url="$(git -C "${submodule_dir}" remote get-url origin 2>/dev/null || true)"
+    if [[ -f "${submodule_dir}/pyproject.toml" ]]; then
+        version_line="$(grep -E '^version = ' "${submodule_dir}/pyproject.toml" | head -n1 || true)"
+    fi
+
+    log_error "libs/lerobot is not on the managed IB_Robot LeRobot patch stack."
+    log_error "  current HEAD : ${current_head}"
+    log_error "  current branch: ${current_branch:-<detached>}"
+    log_error "  current origin: ${origin_url:-<unknown>}"
+    log_error "  current ${version_line:-version = <unknown>}"
+    log_error "  expected base : ${base_commit}"
+    log_error "  expected branch: ${branch_name}"
+    log_error "If you do not need to keep this local LeRobot checkout, rerun:"
+    log_error "  IBR_LEROBOT_FORCE_REBUILD=1 ./scripts/setup.sh"
 }
 
 ensure_lerobot_patch_stack_applied() {
@@ -267,6 +324,7 @@ ensure_lerobot_patch_stack_applied() {
     local branch_name="${LEROBOT_BRANCH_NAME}"
     local manifest_file="${LEROBOT_MANIFEST}"
     local raw_series="${LEROBOT_SERIES}"
+    local upstream_repo="${LEROBOT_UPSTREAM_REPO:-}"
 
     if [[ ! -f "${raw_series}" || -z "${base_commit}" ]]; then
         log_warn "LeRobot patch stack metadata is missing for tag ${LEROBOT_TAG}. Skipping automatic patch application."
@@ -308,7 +366,7 @@ ensure_lerobot_patch_stack_applied() {
     if git -C "${submodule_dir}" show-ref --verify --quiet "refs/heads/${branch_name}"; then
         if [[ "$(git -C "${submodule_dir}" branch --show-current)" != "${branch_name}" ]]; then
             log_info "Switching libs/lerobot to existing patched branch ${branch_name}..."
-            git -C "${submodule_dir}" checkout "${branch_name}" >/dev/null
+            _lerobot_git_no_lfs_smudge "${submodule_dir}" checkout "${branch_name}" >/dev/null
         fi
 
         applied_patch_count="$(git -C "${submodule_dir}" rev-list --count "${base_commit}..HEAD")"
@@ -365,6 +423,21 @@ ensure_lerobot_patch_stack_applied() {
         # warn+return, which violated the SSOT contract. We now hard-stop.
         local current_head
         current_head="$(git -C "${submodule_dir}" rev-parse HEAD)"
+        if [[ "${IBR_LEROBOT_FORCE_REBUILD:-0}" == "1" ]]; then
+            if ! _lerobot_ensure_base_commit "${submodule_dir}" "${base_commit}" "${LEROBOT_TAG}" "${upstream_repo}"; then
+                log_error "Unable to fetch required LeRobot base commit ${base_commit}."
+                exit 1
+            fi
+            _lerobot_reset_dirty_worktree "${submodule_dir}" "${base_commit}"
+        else
+            _lerobot_describe_unmanaged_checkout "${submodule_dir}" "${current_head}" "${base_commit}" "${branch_name}"
+            exit 1
+        fi
+    fi
+
+    if [[ "$(git -C "${submodule_dir}" rev-parse HEAD)" != "${base_commit}" ]]; then
+        local current_head
+        current_head="$(git -C "${submodule_dir}" rev-parse HEAD)"
         if ! _lerobot_validate_head_commit "${current_head}"; then
             log_error "libs/lerobot HEAD is outside manifest.lerobot_commit_range for tag ${LEROBOT_TAG}."
             log_error "Hint: add a new tag directory under third_party/patches/lerobot/ and bump INDEX.yaml.active_tag,"
@@ -403,7 +476,7 @@ ensure_lerobot_patch_stack_applied() {
     fi
 
     log_info "Applying IB_Robot lerobot patch stack on top of upstream ${LEROBOT_TAG}..."
-    git -C "${submodule_dir}" checkout -b "${branch_name}" >/dev/null
+    _lerobot_git_no_lfs_smudge "${submodule_dir}" checkout -b "${branch_name}" >/dev/null
     lerobot_apply_patch_series "${submodule_dir}" "${patch_dir}" "${series_file}"
     log_done "LeRobot patch stack applied"
 }
