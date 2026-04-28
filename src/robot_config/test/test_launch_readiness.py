@@ -7,9 +7,10 @@ from types import SimpleNamespace
 from launch.actions import RegisterEventHandler
 from launch_ros.actions import Node
 
+from robot_config.launch_builders import tracing as tracing_builder
 from robot_config.launch_builders.control import generate_controller_spawners
-from robot_config.loader import load_robot_config_dict
 from robot_config.launch_builders.sim_backend import get_sim_backend
+from robot_config.loader import load_robot_config_dict
 from robot_config.wait_for_controllers import missing_inactive_controllers
 
 _LAUNCH_PATH = Path(__file__).resolve().parents[1] / "launch" / "robot.launch.py"
@@ -43,12 +44,7 @@ def test_generate_controller_spawners_groups_activation():
 
     assert len(spawners) == 1
     assert isinstance(spawners[0], Node)
-    cmd_text = [
-        item[0].text
-        for item in spawners[0].cmd
-        if item
-        and hasattr(item[0], "text")
-    ]
+    cmd_text = [item[0].text for item in spawners[0].cmd if item and hasattr(item[0], "text")]
     assert "--controller-manager" in cmd_text
     assert "controller_manager" in cmd_text
     assert "--activate-as-group" in cmd_text
@@ -82,9 +78,7 @@ def test_controller_startup_timeout_comes_from_yaml_mapping():
 
 def test_gazebo_start_backend_uses_readiness_probe_instead_of_timer():
     adapter = get_sim_backend("gazebo")
-    actions, create_node = adapter.start_backend(
-        {"name": "test_robot", "gazebo_world_name": "demo"}
-    )
+    actions, create_node = adapter.start_backend({"name": "test_robot", "gazebo_world_name": "demo"})
 
     assert isinstance(create_node, Node)
     assert any(isinstance(action, Node) for action in actions)
@@ -104,3 +98,33 @@ def test_launch_loader_uses_shared_dict_loader():
 
     assert robot_config["name"] == "so101_single_arm"
     assert robot_config["_config_path"].endswith("config/robots/so101_single_arm.yaml")
+
+
+def test_default_trace_session_auto_suffixes_on_collision(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        tracing_builder, "_trace_session_exists", lambda name: name == tracing_builder.DEFAULT_TRACE_SESSION_NAME
+    )
+    monkeypatch.setattr(
+        tracing_builder,
+        "datetime",
+        SimpleNamespace(now=lambda: SimpleNamespace(strftime=lambda _fmt: "20260428_180000")),
+    )
+
+    session_name, trace_dir = tracing_builder._resolve_trace_session(
+        tracing_builder.DEFAULT_TRACE_SESSION_NAME,
+        tmp_path,
+    )
+
+    assert session_name == "ib_robot_trace_20260428_180000"
+    assert trace_dir == tmp_path / session_name
+
+
+def test_custom_trace_session_collision_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(tracing_builder, "_trace_session_exists", lambda _name: True)
+
+    try:
+        tracing_builder._resolve_trace_session("custom_trace", tmp_path)
+    except RuntimeError as exc:
+        assert "custom_trace" in str(exc)
+    else:
+        raise AssertionError("Expected custom tracing session collision to raise RuntimeError")

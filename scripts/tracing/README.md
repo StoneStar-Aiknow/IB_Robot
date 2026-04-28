@@ -28,8 +28,9 @@ ros2 launch robot_config robot.launch.py \
     enable_tracing:=true
 ```
 
-这会在 launch 入口直接创建一个 LTTng session，同时采集
-ROS 2 UST 事件（`ros2:*`）和 Python 业务追踪点（`ib_trace.*`）。
+这会通过 `robot_config.launch_builders.tracing` 在 launch 期间创建一个 LTTng
+session，同时采集 ROS 2 UST 事件（`ros2:*`）和 Python 业务追踪点
+（`ib_trace.*`）。
 
 如果默认 session 名 `ib_robot_trace` 已经被占用，launch 会自动追加时间戳后缀，
 避免覆盖已有 trace；如果你显式传了 `trace_session_name:=...`，则不会帮你覆盖同名会话。
@@ -64,11 +65,12 @@ python3 scripts/tracing/analyze_trace.py --trace-dir ~/.ros/tracing/ib_robot_tra
 
 不需要额外单独维护一个 tracing 包，整体方案遵循 ROS 2 标准做法：
 
-1. **`robot.launch.py` 中直接管理 LTTng session**  
+1. **`robot_config.launch_builders.tracing` 管理 LTTng session**
+   `robot.launch.py` 只负责声明 launch 参数并组合 builder 输出；tracing builder
    启动时启用 `ros2:*` UST 事件和 Python tracing domain `ib_trace.*`，
    退出时自动 stop/destroy session。
 
-2. **节点中使用 `logging.getLogger('ib_trace.*')` + `lttngust`**  
+2. **节点中使用 `logging.getLogger('ib_trace.*')` + `lttngust`**
    节点为 `ib_trace.*` logger 显式绑定 LTTng Python handler，因此业务事件会
    作为 Python domain 事件写入 trace；当 LTTng 未开启时，额外开销很低。
 
@@ -104,7 +106,9 @@ python3 scripts/tracing/analyze_trace.py --trace-dir ~/.ros/tracing/ib_robot_tra
 ## 文件列表
 
 ```
-robot.launch.py          ← 启动/停止 LTTng session（enable_tracing:=true）
+robot.launch.py          ← launch 编排入口（enable_tracing:=true 时接入 tracing builder）
+src/robot_config/robot_config/launch_builders/tracing.py
+                        ← 启动/停止 LTTng session
 scripts/tracing/
 ├── setup_tracing.sh     ← 给已初始化工作区补装 tracing 依赖（常规 setup 已包含）
 ├── start_trace.sh       ← 手动启动 tracing session

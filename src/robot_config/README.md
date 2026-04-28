@@ -194,6 +194,17 @@ robot:
 ros2 topic pub /arm_position_controller/commands std_msgs/msg/Float64MultiArray "data: [1.0, 2.0, 3.0, 4.0, 5.0]"
 ```
 
+### Tracing（ros2_tracing / LTTng）
+
+`robot.launch.py` 支持两个 tracing 相关 launch 参数：
+
+- `enable_tracing:=true`：在启动时开启 LTTng tracing session
+- `trace_session_name:=...`：覆盖默认 session 名 `ib_robot_trace`
+
+按包内架构，`robot.launch.py` 只保留编排职责；LTTng session 的创建、命名冲突处理、
+以及 shutdown 时的 stop/destroy 生命周期都由
+`robot_config/launch_builders/tracing.py` 统一管理。
+
 #### 2. moveit_planning 模式（轨迹规划控制）
 
 **适用于：** 基于规划的模型（VoxPoser、VLM、目标条件化）

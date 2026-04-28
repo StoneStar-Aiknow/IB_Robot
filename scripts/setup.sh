@@ -1981,6 +1981,7 @@ main() {
         echo -e "  ${entry}"
     done
     echo ""
+    print_next_steps
 }
 
 print_next_steps() {
@@ -1989,36 +1990,6 @@ print_next_steps() {
     echo "  ./scripts/build.sh"
     echo "  # tracing is now included: ros2 launch robot_config robot.launch.py enable_tracing:=true ..."
     echo "  # .shrc_local also disables ~/.local Python packages to avoid mixed venv imports"
-}
-
-# ============================================================================
-# Main
-# ============================================================================
-main() {
-    parse_args "$@"
-
-    cd "${WORKSPACE}"
-    
-    # Check for conflicting environments
-    check_conda
-    detect_os
-    detect_accelerator
-    print_environment_summary
-    
-    log_info "Setting up workspace at ${WORKSPACE}"
-    
-    # Update submodules
-    update_submodules
-    
-    # Optional: Setup developer forks
-    setup_developer_forks
-    
-    # Install dependencies
-    install_system_deps
-    setup_python_venv
-    verify_setup
-    print_summary
-    print_next_steps
 }
 
 # Run if executed directly (not sourced)

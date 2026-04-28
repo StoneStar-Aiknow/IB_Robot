@@ -82,11 +82,8 @@ Launch Arguments:
     record_visualizer: Recording visualizer - 'none' (default) or 'rerun' (launch a Rerun sidecar for live cameras, joints, and action curves)
 """
 
-import subprocess
-from datetime import datetime
 from pathlib import Path
 
-import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
@@ -95,7 +92,7 @@ from launch.actions import (
     OpaqueFunction,
     RegisterEventHandler,
 )
-from launch.event_handlers import OnProcessExit, OnShutdown
+from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch_ros.actions import Node
 
@@ -106,14 +103,15 @@ from robot_config.launch_builders.perception import generate_camera_nodes, gener
 from robot_config.launch_builders.recording import generate_recording_nodes, generate_rerun_viewer_node
 from robot_config.launch_builders.sim_backend import get_sim_backend
 from robot_config.launch_builders.teleop import generate_teleop_nodes
+from robot_config.launch_builders.tracing import DEFAULT_TRACE_SESSION_NAME, generate_tracing_actions
 from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
+from robot_config.loader import load_robot_config_dict
 from robot_config.logger_utils import get_colored_logger
 
 # Import utility functions
 from robot_config.utils import parse_bool
 
 logger = get_colored_logger("robot_config.launch")
-DEFAULT_TRACE_SESSION_NAME = "ib_robot_trace"
 
 
 def load_robot_config(robot_config_name, config_path_override=None):
@@ -141,11 +139,7 @@ def load_robot_config(robot_config_name, config_path_override=None):
     logger.info(f"Loading config from: {config_path}")
     logger.info(f"Config exists: {config_path.exists()}")
 
-    # Load YAML
-    with open(config_path) as f:
-        data = yaml.safe_load(f)
-
-    robot_config = data.get("robot", {})
+    robot_config = load_robot_config_dict(config_path)
     logger.info(f"Loaded robot: {robot_config.get('name', 'UNKNOWN')}")
     logger.info(f"Peripherals: {len(robot_config.get('peripherals', []))}")
 
@@ -211,119 +205,6 @@ def _create_controller_ready_waiter(robot_config: dict, controller_names, use_si
         ],
         output="screen",
     )
-
-
-def _run_trace_command(command: list[str], failure_reason: str) -> None:
-    """Run an LTTng CLI command and raise with captured output on failure."""
-    try:
-        result = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"{failure_reason}: lttng command not found ({exc})") from exc
-
-    if result.returncode == 0:
-        return
-
-    detail = (result.stderr or result.stdout or "").strip()
-    if not detail:
-        detail = f"exit code {result.returncode}"
-    raise RuntimeError(f"{failure_reason}: {detail}")
-
-
-def _trace_session_exists(session_name: str) -> bool:
-    """Return whether an LTTng session with the given name already exists."""
-    try:
-        result = subprocess.run(
-            ["lttng", "list", session_name],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            f"failed to inspect tracing session '{session_name}': lttng command not found ({exc})"
-        ) from exc
-
-    if result.returncode == 0:
-        return True
-
-    detail = (result.stderr or result.stdout or "").strip().lower()
-    if "not found" in detail or "no session" in detail:
-        return False
-
-    raise RuntimeError(f"failed to inspect tracing session '{session_name}': {detail}")
-
-
-def _resolve_trace_session(session_name: str, trace_root: Path) -> tuple[str, Path]:
-    """Resolve a non-destructive session name and output directory."""
-    trace_dir = trace_root / session_name
-    if not _trace_session_exists(session_name) and not trace_dir.exists():
-        return session_name, trace_dir
-
-    if session_name != DEFAULT_TRACE_SESSION_NAME:
-        raise RuntimeError(
-            f"tracing session '{session_name}' already exists or output directory already exists at "
-            f"{trace_dir}; stop the existing session or choose a different trace_session_name"
-        )
-
-    suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
-    index = 0
-    while True:
-        candidate_suffix = f"{suffix}_{index}" if index else suffix
-        candidate_name = f"{session_name}_{candidate_suffix}"
-        candidate_dir = trace_root / candidate_name
-        if not _trace_session_exists(candidate_name) and not candidate_dir.exists():
-            return candidate_name, candidate_dir
-        index += 1
-
-
-def _start_trace_session(session_name: str, trace_dir: Path) -> None:
-    """Create and start a mixed ROS UST + Python logging LTTng session."""
-    trace_dir.parent.mkdir(parents=True, exist_ok=True)
-    _run_trace_command(
-        ["lttng", "create", session_name, "--output", str(trace_dir)],
-        "failed to create tracing session",
-    )
-    _run_trace_command(
-        ["lttng", "enable-event", "--session", session_name, "--userspace", "ros2:*"],
-        "failed to enable ROS 2 UST tracepoints",
-    )
-    _run_trace_command(
-        ["lttng", "enable-event", "--session", session_name, "--python", "ib_trace.*"],
-        "failed to enable Python tracing domain",
-    )
-    _run_trace_command(
-        ["lttng", "start", session_name],
-        "failed to start tracing session",
-    )
-    logger.info(f"[tracing] Writing tracing session to: {trace_dir}")
-
-
-def _make_trace_shutdown_handler(session_name: str):
-    """Return an OnShutdown callback that stops and destroys the session."""
-
-    def _shutdown_trace(_event, _context):
-        for command, action in (
-            (["lttng", "stop", session_name], "stop"),
-            (["lttng", "destroy", session_name], "destroy"),
-        ):
-            result = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                detail = (result.stderr or result.stdout or "").strip()
-                if detail and "Session name not found" not in detail:
-                    logger.warning(f"[tracing] Failed to {action} session '{session_name}': {detail}")
-        return []
-
-    return _shutdown_trace
 
 
 def launch_setup(context, *args, **kwargs):
@@ -653,19 +534,7 @@ def launch_setup(context, *args, **kwargs):
     enable_tracing = parse_bool(context.launch_configurations.get("enable_tracing", "false"), default=False)
     if enable_tracing:
         requested_trace_session = context.launch_configurations.get("trace_session_name", DEFAULT_TRACE_SESSION_NAME)
-        trace_root = Path.home() / ".ros" / "tracing"
-        trace_session, trace_dir = _resolve_trace_session(requested_trace_session, trace_root)
-        if trace_session != requested_trace_session:
-            logger.warning(
-                f"[tracing] Session '{requested_trace_session}' already exists; using unique session "
-                f"'{trace_session}' instead"
-            )
-        logger.info(f"[tracing] Enabling ros2_tracing session: {trace_session}")
-        _start_trace_session(trace_session, trace_dir)
-        actions.insert(
-            0,
-            RegisterEventHandler(event_handler=OnShutdown(on_shutdown=_make_trace_shutdown_handler(trace_session))),
-        )
+        actions[:0] = generate_tracing_actions(enable_tracing=True, requested_session_name=requested_trace_session)
 
     logger.info(f"========== Total nodes to launch: {len(actions)} ==========")
 

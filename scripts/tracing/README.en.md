@@ -29,8 +29,9 @@ ros2 launch robot_config robot.launch.py \
     enable_tracing:=true
 ```
 
-This creates an LTTng session directly from the launch entrypoint, capturing
-ROS 2 UST events (`ros2:*`) and Python business tracepoints (`ib_trace.*`).
+This uses `robot_config.launch_builders.tracing` to create an LTTng session
+during launch, capturing ROS 2 UST events (`ros2:*`) and Python business
+tracepoints (`ib_trace.*`).
 
 If the default session name `ib_robot_trace` is already in use, launch will
 auto-suffix a timestamp instead of overwriting the existing trace. Explicit
@@ -67,9 +68,10 @@ The analyzer now reports two views:
 
 No separate tracing package needed — this follows the ROS 2 standard approach:
 
-1. **Direct LTTng session management in `robot.launch.py`** — enables
-   `ros2:*` UST events and the Python tracing domain `ib_trace.*` on startup,
-   and stops/destroys the session on shutdown.
+1. **`robot_config.launch_builders.tracing` owns LTTng session management** —
+   `robot.launch.py` stays an orchestrator that wires launch arguments into the
+   builder, which enables `ros2:*` UST events and the Python tracing domain
+   `ib_trace.*` on startup and stops/destroys the session on shutdown.
 
 2. **`logging.getLogger('ib_trace.*')` + `lttngust`** in nodes — Python logging
    records are emitted through the LTTng Python handler, so business events are
@@ -104,7 +106,9 @@ Emitted as `logging.info("[event_name] key=value ...")` on `ib_trace.*` loggers:
 ## Files
 
 ```
-robot.launch.py          ← Starts/stops LTTng session (enable_tracing:=true)
+robot.launch.py          ← Launch orchestrator (wires enable_tracing:=true into the tracing builder)
+src/robot_config/robot_config/launch_builders/tracing.py
+                        ← Starts/stops the LTTng session
 scripts/tracing/
 ├── setup_tracing.sh     ← Retrofit tracing tools into an existing workspace
 ├── start_trace.sh       ← Manual session start
