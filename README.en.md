@@ -25,6 +25,16 @@ IB-Robot is an **integrated robot development framework** designed to bridge the
 | **Control** | End-to-end Policies | Hierarchical Planning | **Dual-mode control (ACT vs. MoveIt).** |
 | **Deployment** | Python Scripts | ROS 2 Nodes | Distributed edge-cloud collaborative deployment. |
 
+### Platform Support
+
+The mainline workflow now supports three runtime platforms:
+
+| Platform | Role | Current Support | Typical Scenarios |
+|----------|------|-----------------|-------------------|
+| **Ubuntu 22.04** | Host / developer machine | Full setup, build, simulation, recording, MoveIt, and inference workflows | Gazebo simulation, data collection, single-host inference, edge-cloud debugging |
+| **openEuler Embedded 24.03** | Edge board | Setup, clean build, and board-side runtime verified | NPU inference, real robot control, recording client |
+| **OpenHarmony 5.1** | Edge board | Board runtime workflow, HDC debugging, minimal inference workspace build helper, and LeRobot patch profile support | BQ3588HM board inference, HDC/SSH debugging |
+
 ## System Architecture
 
 ![IB-Robot Architecture](docs/pictures/architecture.png)
@@ -102,7 +112,7 @@ IB_Robot/                           # Main Workspace
 
 ### 0. System Requirements
 
-- **OS**: Ubuntu or openEuler Embedded
+- **OS**: Three-platform workflow support is available: Ubuntu host machines plus openEuler Embedded and OpenHarmony edge boards
 - **ROS Version**: ROS 2 Humble
 - **Python**: System native Python 3.11. **Do NOT run in an active Conda environment to avoid library version conflicts (e.g., libstdc++).**
 - **Accelerator**: Supports NVIDIA GPU, Ascend 310B, Ascend 310P, or CPU-only fallback.
@@ -112,7 +122,7 @@ IB_Robot/                           # Main Workspace
 Run `./scripts/setup.sh`. This script automates heavy operations:
 
 1. **Submodule Sync**: Runs `git submodule update --init --recursive` to download core source code.
-2. **Platform and Accelerator Detection**: Detects Ubuntu / openEuler Embedded and NVIDIA GPU / Ascend 310B / 310P / CPU-only environments.
+2. **Platform and Accelerator Detection**: Detects Ubuntu / openEuler Embedded / OpenHarmony and NVIDIA GPU / Ascend 310B / 310P / CPU-only environments.
 3. **ROS 2 Installation**: Detects and installs ROS 2 Humble and colcon tooling when missing.
 4. **System Dependencies**: Installs C++ build tools, `nlohmann-json`, and other hardware driver dependencies via the system package manager.
 5. **Virtual Environment (venv)**: Creates a `venv` directory in the root to isolate ML dependencies while reusing system `rclpy` through `--system-site-packages`.

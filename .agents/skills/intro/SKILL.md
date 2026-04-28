@@ -20,6 +20,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | **ibrobot-launch** | 启动机器人节点、仿真环境、推理测试或遥操作调试 |
 | **ibrobot-build** | 编译整个工作空间或指定 package（`colcon build`） |
 | **ibrobot-env** | 初始化运行环境，加载 `.shrc_local`、设置 `ROS_DOMAIN_ID` |
+| **ibrobot-bq3588hm-oh** | 管理贝启 BQ3588HM 开发板上的 OpenHarmony 运行时、ROS 环境与 Python 3.12 事实 |
 | **ibrobot-architecture** | 理解 SSOT 架构设计、配置规范与数据流 |
 
 ### 🔍 代码协作
@@ -59,6 +60,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 帮我提交一个 Issue              → atomgit-issue
 修复 PR 里的评审意见            → atomgit-review-resolution
 编译一下项目                    → ibrobot-build
+看看 BQ3588HM 板子上的 OH 环境   → ibrobot-bq3588hm-oh
 启动机器人仿真                  → ibrobot-launch
 初始化环境                      → ibrobot-env
 提交代码                        → ibrobot-git-flow

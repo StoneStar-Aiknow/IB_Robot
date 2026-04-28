@@ -27,6 +27,16 @@ IB-Robot 是一个**智能融合机器人开发框架**，旨在打通 Hugging F
 | **控制方式** | 端到端神经网络模型     | 分层规划控制架构   | **双模控制 (ACT vs MoveIt)** |
 | **部署形态** | Python 脚本     | ROS 2 节点   | 分布式端边协同部署                |
 
+### 平台支持
+
+当前主干工作流已支持三类运行平台：
+
+| 平台 | 角色定位 | 当前支持状态 | 典型场景 |
+| --- | --- | --- | --- |
+| **Ubuntu 22.04** | 主机 / 开发机 | 完整支持 setup、build、仿真、录制、MoveIt、推理联调 | Gazebo 仿真、数据采集、单机推理、边云联调 |
+| **openEuler Embedded 24.03** | 端侧开发板 | 支持 setup、clean build 与板端运行 | NPU 推理、实机控制、录制客户端 |
+| **OpenHarmony 5.1** | 端侧开发板 | 支持板端运行工作流、HDC 调试、最小 inference workspace 构建辅助与 LeRobot patch profile | BQ3588HM 板端推理、HDC/SSH 调试 |
+
 ## 系统架构
 
 ![IB-Robot 架构图](docs/pictures/architecture.png)
@@ -99,7 +109,7 @@ IB_Robot/                           # 主工作空间 (本仓库)
 
 ### 0. 系统要求
 
-- **操作系统**: Ubuntu 主机负责仿真、录制服务或云侧推理；端侧开发板可运行 openEuler Embedded 或 OpenHarmony
+- **操作系统**: 当前支持三平台协同：Ubuntu 主机负责仿真、录制服务或云侧推理；端侧开发板支持 openEuler Embedded 与 OpenHarmony
 - **ROS 版本**: ROS 2 Humble
 - **Python**: 系统原生 Python 3.11。**严禁在 Conda 激活的环境中执行，否则会导致动态库冲突。**
 - **加速器**: 支持 NVIDIA GPU、Ascend 310B、Ascend 310P，若未检测到则按 CPU-only 路径运行。
@@ -109,7 +119,7 @@ IB_Robot/                           # 主工作空间 (本仓库)
 运行 `./scripts/setup.sh`。该脚本会自动完成以下重型操作：
 
 1.  **子模块同步**: 执行 `git submodule update --init --recursive`，下载核心源码。
-2.  **平台与硬件检测**: 自动识别 Ubuntu / openEuler Embedded，以及 NVIDIA GPU / Ascend 310B / 310P / CPU-only 环境。
+2.  **平台与硬件检测**: 自动识别 Ubuntu / openEuler Embedded / OpenHarmony，以及 NVIDIA GPU / Ascend 310B / 310P / CPU-only 环境。
 3.  **ROS 2 安装** (如未安装): 自动检测并安装 ROS 2 Humble 和 colcon 构建工具。
 4.  **系统依赖安装**: 通过系统包管理器安装 C++ 编译工具、`nlohmann-json` 等硬件驱动依赖。
 5.  **虚拟环境 (venv) 构建**: 在根目录创建 `venv` 文件夹。这能确保 ML 相关依赖与系统 ROS 2 环境隔离，同时通过 `--system-site-packages` 复用系统 `rclpy`。
@@ -220,8 +230,16 @@ export ROS_DOMAIN_ID=<0-232之间的唯一数字>
 | 文档 | 简短说明 |
 | :--- | :--- |
 | [`src/inference_service/README.md`](src/inference_service/README.md) | 推理服务架构、单机/分布式部署与 NPU/GPU Cloud 节点启动方式 |
+| [`docs/OpenHarmony_thirdparty_pytorch_validation.md`](docs/OpenHarmony_thirdparty_pytorch_validation.md) | OpenHarmony 板端 `thirdparty_pytorch` / `skh-run` 获取、部署、运行流程，以及当前验证进度与已知限制 |
 | [`src/robot_moveit/README.md`](src/robot_moveit/README.md) | MoveIt Planning 控制、`/cmd_pose` 用法与 headless 启动方式 |
 | [`src/dataset_tools/README.md`](src/dataset_tools/README.md) | episodic 录制、`record_cli` 用法与 `bag_to_lerobot` 数据集转换流程 |
+
+### OpenHarmony 板端快速说明
+
+- **主机侧构建入口**：使用 `scripts/openharmony/build_ibrobot_oh_custom.sh`。脚本会自动准备 OpenHarmony 交叉编译目录，并在打包板端 runtime 时对 `lerobot` 显式应用 `series.openharmony-5.1.0-musl.txt`，确保 lazy-import 等 OpenHarmony 专用 patch 真正进入部署产物。
+- **板端 PyTorch runtime**：使用 `thirdparty_pytorch` 提供的 `test/skh-run.tar.gz`，部署到 `/data/local/skh-run`；IB_Robot 的 OpenHarmony inference 节点会在节点进程级切到这套 runtime，而不会污染 `/data/out/bin/ros2`。
+- **离线权重注意事项**：当前验证使用的 ACT policy 配置了 `resnet18` + `ResNet18_Weights.IMAGENET1K_V1`。如果板端无外网，请预置 `resnet18-f37072fd.pth` 到 `/root/.cache/torch/hub/checkpoints/`。
+- **当前验证结论**：BQ3588HM 板端已完成 CPU 推理验证；NPU 推理链路正在继续打通中。
 
 ### 一、Ubuntu 仿真与控制场景
 
@@ -574,4 +592,3 @@ IB-Robot 深度集成 [OpenClaw](https://github.com/openclaw/openclaw) AI Agent 
 **使用指导**: <https://pages.openeuler.openatom.cn/embedded/docs/build/html/master/features/embodied_ai/index.html>\
 **项目地址**: <https://atomgit.com/openEuler/IB_Robot>\
 **反馈**: <https://atomgit.com/openEuler/IB_Robot/issues>
-
