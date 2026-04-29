@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'camera_alignment = dataset_tools.camera_alignment:main',
+            'camera_isp_calibrator = dataset_tools.camera_isp_calibrator:main',
             'episode_recorder = dataset_tools.episode_recorder:main',
             'bag_to_lerobot = dataset_tools.bag_to_lerobot:main',
             'record_cli = dataset_tools.record_cli:main',

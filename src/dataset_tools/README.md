@@ -173,6 +173,86 @@ ros2 run dataset_tools camera_alignment \
 
 - `docs/tools/camera_alignment.md`
 
+### 5. camera_isp_calibrator - 基于参考图的相机色彩对齐工具
+
+让一台 USB 摄像头（usb_cam 节点）的画面在曝光、白平衡、增益、对比度等
+方面尽可能接近一张参考图片，并把结果保存为 override JSON，下次启动
+`robot.launch.py` 时自动复用，**不修改 YAML SSOT**。
+
+**前置条件**：
+1. 已经通过 `robot.launch.py` 启动 usb_cam 节点（节点名形如 `/top_camera`）；
+2. 准备一张参考图片或视频（视频会取首帧）。
+
+**基本用法**：
+```bash
+# 终端 A：启动机器人 / 摄像头
+source .shrc_local
+ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=teleop
+
+# 终端 B：运行校准工具
+source .shrc_local
+ros2 run dataset_tools camera_isp_calibrator \
+    --camera top \
+    --reference /path/to/reference.png
+```
+
+**界面交互**（单窗口 cv2 GUI，傻瓜操作）：
+
+- `a`：自动模式（Lab + Planckian 投影），4 次迭代收敛后自动停下
+- `c`：**统一 K/C/Sat 搜索**（实验性，详见 §5.1）。有 ROI pair 时走 m 模式 cost，没有就走 AUTO ref-cluster cost；找不到改进会自动回退到 seed。
+- 拖动滑条：手动微调 exposure / wb_kelvin / gain / brightness / contrast / saturation / sharpness（松手 0.4s 后才下发，避免抖动）
+- `s`：保存到 `~/.ros/ibrobot/camera_isp_overrides/{camera}.json`
+- `r`：恢复启动时快照的初始值
+- `p`：保存当前 live 帧 PNG 到工作目录
+- `?` / `h`：显示 keybinding 提示
+- `q`：退出（有未保存改动会先警告一次，再按 `q` 才退出）
+
+**算法**：
+
+| 模式     | 触发    | 说明 |
+|----------|---------|------|
+| Auto     | 按 `a`  | sRGB→Lab 计算 P50 亮度匹配曝光；CIE xy 色度通过 McCamy 公式投影到 Planckian locus，按 delta-form 调节 white_balance kelvin。每帧迭代再读、最多 4 次。|
+| 手动滑条 | 拖动    | 直接下发 V4L2 参数到 usb_cam 节点（已强制 `auto_white_balance=false` / `autoexposure=false`）。|
+
+**保存生效**：保存后下次 `robot.launch.py` 启动时，`perception.py` 会自动
+读取 override 并覆盖 YAML 默认值；删除 JSON 即可回退。
+
+详细算法说明：见 `临时/camera_isp_plan.md` §Phase 2。
+
+#### 5.1 统一 K/C/Sat 色彩搜索（实验性，独立模块）
+
+模块 `dataset_tools/camera_isp/color_search.py` 实现了
+`临时/camera_isp_unified_color_search_plan.md` v4 的统一搜索路径，
+**与既有 4 阶段流水线（曝光/增益/亮度/锐度）并行存在，不修改任何曝光相关代码**。
+旧 `solver` / `hw_pipeline` 全部保留作为初值估计器与失败回退。
+
+公共接口（pure-numpy + scipy；无 ROS / cv2 依赖）：
+
+```python
+from dataset_tools.camera_isp.color_search import (
+    KCS, SettleConfig, SearchConfig, ClusterConfig,
+    kmeans_signature_lab,     # Lab 单边聚类签名
+    nn_match_signatures,      # 匈牙利 ΔE2000 指派
+    delta_e2000,              # CIEDE2000 (vectorised)
+    quantile_distance_L,      # L* 分位数 L1
+    cost_24card,              # 24 色卡 cost 工厂
+    cost_ref_cluster,         # AUTO ref cost 工厂
+    cost_manual_roi,          # m / ROI cost 工厂（带正则）
+    frame_capture,            # settle + drop + trimmed-mean
+    search_KCS,               # 主搜索 driver（直接 3D 网格 + 可选精修）
+    OfflineTables,            # JSON 配置加载
+)
+```
+
+设计原则（开放给后续迭代）：
+
+- **三模式同构**：`search_KCS` 接收任意 `cost_fn`，driver 不感知模式。
+- **失败安全**：未找到改进时回退到 seed 并把硬件值写回 seed。
+- **可注入边界**：`HwWriter` / `FrameGrabber` 协议 + `sleeper` 钩子让单元测试无需真实相机。
+- **离线表外置**：`camera_isp_offline_tables.json`（per device 可覆盖）承载 K/C/Sat 曲线、settle、search 参数；不再硬编码。
+
+测试：`test/test_camera_isp_color_search.py`（16 个用例，覆盖 ΔE2000、聚类、匈牙利、settle、driver fallback、device caps 裁剪）。
+
 ## 数据流
 
 ```

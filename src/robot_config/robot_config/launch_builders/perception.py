@@ -9,6 +9,7 @@ This module handles:
 
 from launch_ros.actions import Node
 
+from robot_config.launch_builders.camera_isp_overrides import load_isp_override
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool
 
@@ -68,10 +69,26 @@ def generate_camera_nodes(robot_config, use_sim=False):
             if "camera_info_url" in periph:
                 params["camera_info_url"] = periph["camera_info_url"]
 
-            # Optional parameters
-            for key in ["contrast", "saturation", "sharpness"]:
+            # Pass-through for all V4L2 / usb_cam ISP knobs declared in YAML.
+            # Keys must match usb_cam_node.cpp:65-85 declarations exactly.
+            # Any key absent from the YAML is left at the usb_cam default
+            # (or the camera_isp_override below, which takes precedence).
+            for key in (
+                "contrast", "saturation", "sharpness", "gain",
+                "auto_white_balance", "white_balance",
+                "autoexposure", "exposure",
+                "autofocus", "focus",
+                "io_method",
+            ):
                 if key in periph:
                     params[key] = periph[key]
+
+            # Apply per-camera ISP override (from camera_isp_calibrator).
+            # Override values take precedence over YAML so calibration
+            # results persist across launches without modifying SSOT.
+            override = load_isp_override(name)
+            if override:
+                params.update(override)
 
             logger.info(f"  Camera params: {params}")
 

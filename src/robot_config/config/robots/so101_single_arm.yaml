@@ -219,31 +219,30 @@ robot:
       fovy: 0
       # camera_info_url: file://$(env HOME)/.ros/camera_info/wrist_camera.yaml
 
-    - type: camera
-      name: front
-      driver: realsense
-      serial_number: ""  # Optional: specific serial number
-      width: 640
-      height: 480
-      fps: 30
-      pixel_format: bgr8
-      enable_pointcloud: false
-      align_depth: true
-      frame_id: camera_front_link
-      optical_frame_id: camera_front_optical_frame
-      # use_default_transform: 启用仿真相机预设位姿。
-      # 为 true 时，下方 transform 和 fovy 被忽略，
-      # 根据相机名和当前仿真平台自动填入位姿与视场角。
-      use_default_transform: true
-      transform:
-        parent_frame: base
-        x: 0.0
-        y: 0.0
-        z: 0.0
-        roll: 0.0
-        pitch: 0.0
-        yaw: 0.0
-      fovy: 0
+    # front 相机 (RealSense) — 暂无硬件，注释掉以避免 realsense2_camera 包缺失报错
+    # 有 RealSense 时取消注释并安装: sudo apt install ros-humble-realsense2-camera
+    # - type: camera
+    #   name: front
+    #   driver: realsense
+    #   serial_number: ""  # Optional: specific serial number
+    #   width: 640
+    #   height: 480
+    #   fps: 30
+    #   pixel_format: bgr8
+    #   enable_pointcloud: false
+    #   align_depth: true
+    #   frame_id: camera_front_link
+    #   optical_frame_id: camera_front_optical_frame
+    #   use_default_transform: true
+    #   transform:
+    #     parent_frame: base
+    #     x: 0.0
+    #     y: 0.0
+    #     z: 0.0
+    #     roll: 0.0
+    #     pitch: 0.0
+    #     yaw: 0.0
+    #   fovy: 0
 
 
   # ============================================
@@ -261,20 +260,21 @@ robot:
     max_duration_s: 90.0
 
     observations:
-      - key: observation.images.front
-        topic: /camera/front/image_raw
-        type: sensor_msgs/msg/Image
-        peripheral: front
-        image:
-          resize: [480, 640]
-        align:
-          strategy: hold
-          stamp: header
-          tol_ms: 1500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 10
+      # front 观测已随 front 相机一起注释（realsense 未安装）
+      # - key: observation.images.front
+      #   topic: /camera/front/image_raw
+      #   type: sensor_msgs/msg/Image
+      #   peripheral: front
+      #   image:
+      #     resize: [480, 640]
+      #   align:
+      #     strategy: hold
+      #     stamp: header
+      #     tol_ms: 1500
+      #   qos:
+      #     reliability: best_effort
+          # history: keep_last
+          # depth: 10
 
       - key: observation.images.top
         topic: /camera/top/image_raw
