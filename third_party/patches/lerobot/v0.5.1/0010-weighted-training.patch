@@ -1,17 +1,13 @@
-From 3ba88d214fd3f6cfba747bf21e259ed9cd404b08 Mon Sep 17 00:00:00 2001
+From bf7274d20faa1fe59a016a9927e2e87f824b7b93 Mon Sep 17 00:00:00 2001
 From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
 Date: Fri, 8 May 2026 16:20:45 +0800
 Subject: [PATCH] train: add weighted training extras
 
-Build on top of the migrated adaptive-weighting prerequisites by adding the
-custom sample-weight loader, quantization-aware weight clipping helpers, and
-the extra logging/summary plumbing used by the weighted-training workflow.
-
 ---
  src/lerobot/configs/train.py         |   8 +-
- src/lerobot/scripts/lerobot_train.py |  87 +++++++++++++---
- src/lerobot/utils/qat.py             | 149 ++++++++++++++++++++++++++++
- 3 files changed, 228 insertions(+), 16 deletions(-)
+ src/lerobot/scripts/lerobot_train.py |  70 ++++++++++---
+ src/lerobot/utils/qat.py             | 149 +++++++++++++++++++++++++++
+ 3 files changed, 211 insertions(+), 16 deletions(-)
  create mode 100644 src/lerobot/utils/qat.py
 
 diff --git a/src/lerobot/configs/train.py b/src/lerobot/configs/train.py
@@ -36,26 +32,10 @@ index 30d0fb2c..b11edf3e 100644
      damping_coefficient: float = 0.7
      # Set to True to use deterministic cuDNN algorithms for reproducibility.
 diff --git a/src/lerobot/scripts/lerobot_train.py b/src/lerobot/scripts/lerobot_train.py
-index dab6f13d..404f86c5 100644
+index dab6f13d..91783809 100644
 --- a/src/lerobot/scripts/lerobot_train.py
 +++ b/src/lerobot/scripts/lerobot_train.py
-@@ -15,6 +15,7 @@
- # limitations under the License.
- import dataclasses
- import logging
-+import os
- import time
- from contextlib import nullcontext
- from pprint import pformat
-@@ -24,6 +25,7 @@ import torch
- from accelerate import Accelerator
- from termcolor import colored
- from torch.optim import Optimizer
-+from torch.utils.tensorboard import SummaryWriter
- from tqdm import tqdm
- 
- from lerobot.configs import parser
-@@ -49,6 +51,7 @@ from lerobot.utils.train_utils import (
+@@ -49,6 +49,7 @@ from lerobot.utils.train_utils import (
      save_checkpoint,
      update_last_checkpoint,
  )
@@ -63,7 +43,7 @@ index dab6f13d..404f86c5 100644
  from lerobot.utils.utils import (
      format_big_number,
      has_method,
-@@ -151,6 +154,31 @@ def update_policy(
+@@ -151,6 +152,31 @@ def update_policy(
      return train_metrics, output_dict
  
  
@@ -95,21 +75,7 @@ index dab6f13d..404f86c5 100644
  @parser.wrap()
  def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
      """
-@@ -187,6 +215,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
-             cpu=force_cpu,
-         )
- 
-+    folder_path = "./logs"
-+    if not os.path.exists(folder_path):
-+        os.mkdir(folder_path)
-+        print(f"Logs folder {folder_path} created successfully")
-+    else:
-+        print(f"Logs folder {folder_path} already exists")
-+
-     init_logging(accelerator=accelerator)
- 
-     # Determine if this is the main process (for logging and checkpointing)
-@@ -244,6 +279,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+@@ -244,6 +270,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
          rename_map=cfg.rename_map,
      )
  
@@ -124,16 +90,7 @@ index dab6f13d..404f86c5 100644
      if cfg.peft is not None:
          logging.info("Using PEFT! Wrapping model.")
          # Convert CLI peft config to dict for overrides
-@@ -337,6 +380,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
- 
-     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
-     num_total_params = sum(p.numel() for p in policy.parameters())
-+    log_dir = f"logs/pytorch/{str(cfg.output_dir).split('/')[-1]}"
-+    writer = SummaryWriter(log_dir=log_dir)
- 
-     if is_main_process:
-         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
-@@ -369,12 +414,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+@@ -369,12 +403,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
          orig_to_subset = None
  
      train_num_samples = len(train_dataset)
@@ -149,7 +106,7 @@ index dab6f13d..404f86c5 100644
          sampler = EpisodeAwareSampler(
              dataset.meta.episodes["dataset_from_index"],
              dataset.meta.episodes["dataset_to_index"],
-@@ -382,7 +426,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+@@ -382,7 +415,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
              drop_n_last_frames=cfg.policy.drop_n_last_frames,
              shuffle=True,
          )
@@ -158,7 +115,7 @@ index dab6f13d..404f86c5 100644
          sampler = None
  
      train_loader = torch.utils.data.DataLoader(
-@@ -391,7 +435,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+@@ -391,7 +424,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
          batch_size=cfg.batch_size,
          shuffle=sampler is None and not cfg.dataset.streaming,
          sampler=sampler,
@@ -167,7 +124,7 @@ index dab6f13d..404f86c5 100644
          drop_last=False,
          prefetch_factor=2 if cfg.num_workers > 0 else None,
      )
-@@ -401,7 +445,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+@@ -401,7 +434,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
          num_workers=cfg.num_workers,
          batch_size=cfg.batch_size,
          shuffle=True,
@@ -176,7 +133,7 @@ index dab6f13d..404f86c5 100644
          drop_last=False,
          prefetch_factor=2 if cfg.num_workers > 0 else None,
      )
-@@ -411,7 +455,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+@@ -411,7 +444,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
      policy, optimizer, train_loader, lr_scheduler = accelerator.prepare(
          policy, optimizer, train_loader, lr_scheduler
      )
@@ -184,7 +141,7 @@ index dab6f13d..404f86c5 100644
      train_iter = cycle(train_loader)
      val_iter = cycle(val_loader)
  
-@@ -461,7 +504,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+@@ -461,7 +493,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                  batch_size=cfg.batch_size,
                  sampler=sampler,
                  shuffle=False,
@@ -193,7 +150,7 @@ index dab6f13d..404f86c5 100644
                  drop_last=False,
                  prefetch_factor=2 if cfg.num_workers > 0 else None,
              )
-@@ -502,6 +545,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+@@ -502,6 +534,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
                  train_sample_weights[subset_idx] = max(train_sample_weights[subset_idx], 0.1)
                  train_sample_count[subset_idx] += 1
  
@@ -203,19 +160,7 @@ index dab6f13d..404f86c5 100644
          # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
          # increment `step` here.
          step += 1
-@@ -514,6 +560,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
- 
-         if is_log_step:
-             logging.info(train_tracker)
-+            for metric in train_tracker.metrics.values():
-+                metric_str = str(metric)
-+                value = float(metric_str.split(":")[-1])
-+                name = metric_str.split(":")[0]
-+                writer.add_scalar(f"{name}/step", value, step)
-             if wandb_logger:
-                 wandb_log_dict = train_tracker.to_dict()
-                 if output_dict:
-@@ -534,18 +585,24 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+@@ -534,18 +569,23 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
          best_eval_sign = False
          if not cfg.env and is_eval_step:
              policy.eval()
@@ -241,7 +186,6 @@ index dab6f13d..404f86c5 100644
 +            if cfg.ada_weight:
 +                logging.info(train_sample_weights[:1000])
 +                logging.info(train_sample_count[:1000])
-+            writer.add_scalar("Loss/eval", eval_loss, step)
 +
              if eval_loss < best_eval_loss:
                  best_eval_loss = eval_loss
@@ -402,4 +346,4 @@ index 00000000..d639a771
 +    args = parser.parse_args()
 +    print(args.model_path)
 -- 
-2.34.1
+2.43.0

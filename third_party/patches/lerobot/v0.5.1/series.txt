@@ -4,3 +4,6 @@
 0004-openharmony-lazy-import-policy-stack.patch
 0005-compat-add-npu-device-detection.patch
 0006-compat-add-ascend-om-config-fields.patch
+0009-adaptive-weight-prerequisites.patch
+0011-knowledge-distillation.patch
+0014-training-logs.patch

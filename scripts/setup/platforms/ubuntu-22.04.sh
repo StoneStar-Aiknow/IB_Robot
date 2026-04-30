@@ -4,7 +4,7 @@
 # Consumed by detect.sh::resolve_lerobot_profiles when neither
 # IBR_LEROBOT_PROFILES_CLI nor IBR_LEROBOT_PROFILES is set.
 platform_lerobot_profiles() {
-    echo "core,ros,hardware,dev"
+    echo "core,ros,hardware,dev,training,distillation"
 }
 
 platform_prepare_host() {
