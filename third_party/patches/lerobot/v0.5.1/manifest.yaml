@@ -107,21 +107,6 @@ patches:
       - Add torch NPU device recognition to the current upstream device utilities.
     applies_to:
       profiles: [ros, hardware, dev, openeuler, ascend, inference]
-  - file: 0006-compat-add-ascend-om-config-fields.patch
-    purpose:
-      - Preserve compatibility with legacy Ascend OM config keys still referenced by IB_Robot model export tooling.
-    applies_to:
-      profiles: [ros, hardware, dev, openeuler, ascend, inference]
-  - file: 0007-ascend-om-act-runtime.patch
-    purpose:
-      - Restore the invasive Ascend OM ACT runtime support as a feature-scoped migration patch.
-    applies_to:
-      profiles: [master-parity-candidates, ascend, om, inference]
-  - file: 0008-ascend-3403-actwrapper.patch
-    purpose:
-      - Restore the SD3403-specific ACT OM worker wrapper as a separate migration patch.
-    applies_to:
-      profiles: [master-parity-candidates, ascend, om, "3403", inference]
   - file: 0009-adaptive-weight-prerequisites.patch
     purpose:
       - Port legacy PR #13 foundations for adaptive sample weighting onto the upstream v0.5.1 training stack.
@@ -166,10 +151,10 @@ notes:
     declare an upper bound of Python 3.11 and MUST be skipped on hosts whose
     Python is already 3.11 or newer (openEuler 24.03 default 3.11, OpenHarmony
     3.12).
-  - Patches 0005-0006 add NPU/Ascend OM compatibility. They are silent no-ops
-    on non-Ascend hosts and are profile-gated (ascend / hardware / inference)
-    so the OpenHarmony stack — which currently does not declare any of those
-    profiles — never opts into them.
+  - Patch 0005 adds NPU device detection. It is a silent no-op on non-Ascend
+    hosts and is profile-gated (ascend / hardware / inference) so the
+    OpenHarmony stack — which currently does not declare any of those profiles
+    — never opts into it.
   - NumPy >= 2 requirements from upstream lerobot v0.5.1 are not solved by
     these patches.
   - Platform-specific patches for OpenHarmony should be added as new numbered
@@ -178,10 +163,10 @@ notes:
   - OpenHarmony 5.1.0 musl uses the `core,openharmony` profile set so the board
     keeps upstream Python 3.12 syntax while applying only the lazy-import fixes
     needed for runtime inference.
-  - Patches 0007-0008, 0010 and 0012-0013 are feature-scoped migration candidates
-    extracted from lerobot_ros2 for master-parity work. They are intentionally
-    tracked outside the default series until each feature is revalidated on
-    the current upstream lerobot v0.5.1 base.
+  - Patches 0010 and 0012-0013 are feature-scoped migration candidates extracted from
+    lerobot_ros2 for master-parity work. They are intentionally tracked outside
+    the default series until each feature is revalidated on the current
+    upstream lerobot v0.5.1 base.
   - Patch 0009 is part of the default series because patch 0011 is rebased on
     top of its training-loop changes. Its adaptive weighting behavior remains
     confined to the training pipeline.

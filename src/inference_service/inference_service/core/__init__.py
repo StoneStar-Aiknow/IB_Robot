@@ -17,6 +17,13 @@ from inference_service.core.pure_inference_engine import (
     MockPolicyWrapper,
     resolve_device,
 )
+from inference_service.core.ascend_om import (
+    AscendOM3403PolicyWrapper,
+    AscendOMPolicyWrapper,
+    create_ascend_om_policy_wrapper,
+    resolve_3403_worker_path,
+    resolve_om_model_path,
+)
 from inference_service.core.preprocessor import (
     TensorPreprocessor,
     PreprocessorBase,
@@ -39,6 +46,11 @@ __all__ = [
     "PolicyWrapper",
     "MockPolicyWrapper",
     "resolve_device",
+    "AscendOM3403PolicyWrapper",
+    "AscendOMPolicyWrapper",
+    "create_ascend_om_policy_wrapper",
+    "resolve_3403_worker_path",
+    "resolve_om_model_path",
     "TensorPreprocessor",
     "PreprocessorBase",
     "MockPreprocessor",

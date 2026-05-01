@@ -345,7 +345,7 @@ class LeRobotPolicyNode(Node):
 
         self._coordinator = InferenceCoordinator(
             policy_path=policy_path,
-            device=str(self._device),
+            device=self._config.device,
         )
 
         self._policy_type = self._coordinator.policy_type

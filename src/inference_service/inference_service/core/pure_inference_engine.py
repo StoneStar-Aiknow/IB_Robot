@@ -38,6 +38,7 @@ def resolve_device(device: str = "auto") -> torch.device:
             - "mps" or "metal": Apple Metal Performance Shaders
             - "cpu": Force CPU
             - "npu" or "npu:N": Ascend NPU (if available)
+            - "ascend_om" or "ascend_om_3403": Ascend OM hardware backend
     
     Returns:
         torch.device instance
@@ -46,7 +47,7 @@ def resolve_device(device: str = "auto") -> torch.device:
         RuntimeError: If requested device is not available
         ValueError: If device string is unknown
     """
-    r = device.lower().strip()
+    r = device.lower().strip().replace("-", "_")
     
     def mps_available() -> bool:
         return (
@@ -79,6 +80,9 @@ def resolve_device(device: str = "auto") -> torch.device:
         return torch.device("mps")
     
     if r == "cpu":
+        return torch.device("cpu")
+
+    if r in ("ascend_om", "ascend_om_3403"):
         return torch.device("cpu")
     
     if r.startswith("npu"):
@@ -274,6 +278,7 @@ class PureInferenceEngine:
         device: str = "auto",
         policy_wrapper: Optional[PolicyWrapper] = None,
     ):
+        self._device_name = device
         self._device = resolve_device(device)
         self._wrapper: Optional[PolicyWrapper] = None
         self._policy_type: str = ""
@@ -289,7 +294,16 @@ class PureInferenceEngine:
             raise ValueError("Either policy_path or policy_wrapper must be provided")
     
     def _load_policy(self, path: str) -> None:
-        self._wrapper = LeRobotPolicyWrapper()
+        # resolve_device() maps OM backends to CPU so tensor plumbing still
+        # works on development hosts; keep the original device string for
+        # backend selection before that normalization loses the OM intent.
+        device_name = str(self._device_name).lower().strip().replace("-", "_")
+        if device_name in ("ascend_om", "ascend_om_3403"):
+            from inference_service.core.ascend_om import create_ascend_om_policy_wrapper
+
+            self._wrapper = create_ascend_om_policy_wrapper(device_name)
+        else:
+            self._wrapper = LeRobotPolicyWrapper()
         self._wrapper.load(path, self._device)
         self._policy_type = self._wrapper.policy_type
         self._chunk_size = self._wrapper.get_chunk_size()

@@ -94,6 +94,28 @@ ros2 launch inference_service cloud_inference.launch.py \
     device:=cuda
 ```
 
+For models exported through the ATC/SVP toolchain, `inference_service` can own
+the OM wrappers migrated from the original LeRobot patches:
+
+```bash
+# Generic Ascend ACL .om backend
+ros2 launch inference_service cloud_inference.launch.py \
+    policy_path:=/path/to/pretrained_model \
+    device:=ascend_om
+
+# SD3403 worker binary protocol backend
+ros2 launch inference_service cloud_inference.launch.py \
+    policy_path:=/path/to/pretrained_model \
+    device:=ascend_om_3403
+```
+
+`device:=ascend_om` resolves the `.om` model from `om_model_path` in
+`policy_path/config.json`, `ASCEND_OM_MODEL_PATH`/`OM_MODEL_PATH`, or common
+files under `policy_path`. `device:=ascend_om_3403` also resolves the worker
+executable from `cpp_executable`, `SVP_WORKER_EXECUTABLE`, or common `out/main`
+layouts. Preprocessing, postprocessing, ROS topics, and distributed transport
+remain the existing `inference_service` pipeline.
+
 #### Scenario 2: Single-Machine Debug (Development)
 
 Run both Edge + Cloud nodes on one machine by adding `cloud_local:=true`:

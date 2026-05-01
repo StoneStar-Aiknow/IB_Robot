@@ -105,6 +105,27 @@ ros2 launch inference_service cloud_inference.launch.py \
     device:=npu
 ```
 
+如果模型已经通过 ATC/SVP 工具链导出为 Ascend OM，可直接让
+`inference_service` 承载从原 LeRobot 补丁迁移过来的 OM wrapper：
+
+```bash
+# 通用 Ascend ACL .om 推理后端
+ros2 launch inference_service cloud_inference.launch.py \
+    policy_path:=/path/to/pretrained_model \
+    device:=ascend_om
+
+# SD3403 worker 二进制协议后端
+ros2 launch inference_service cloud_inference.launch.py \
+    policy_path:=/path/to/pretrained_model \
+    device:=ascend_om_3403
+```
+
+`device:=ascend_om` 会从 `policy_path/config.json` 的 `om_model_path`、环境变量
+`ASCEND_OM_MODEL_PATH`/`OM_MODEL_PATH`，或 `policy_path` 下的 `.om` 文件中解析模型。
+`device:=ascend_om_3403` 额外需要 worker 可执行文件，可通过 `cpp_executable` 配置项、
+`SVP_WORKER_EXECUTABLE` 环境变量或常见 `out/main` 布局解析。两种模式的前/后处理、
+ROS 话题与分布式通信仍沿用 `inference_service` 的现有管线。
+
 #### 场景二：单机调试（开发测试用）
 
 在一台机器上同时运行 Edge + Cloud 节点，添加 `cloud_local:=true`：

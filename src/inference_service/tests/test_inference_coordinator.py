@@ -217,6 +217,38 @@ class TestCoordinatorWithConfig:
         with pytest.raises(Exception):
             InferenceCoordinator(config=config)
 
+    def test_config_preserves_hardware_backend_device(self, monkeypatch, tmp_path):
+        """Coordinator should pass hardware backend names to PureInferenceEngine."""
+        model_path = tmp_path / "model.om"
+        model_path.write_bytes(b"om")
+        (tmp_path / "config.json").write_text(
+            '{"om_model_path": "model.om", "chunk_size": 1}',
+            encoding="utf-8",
+        )
+
+        class FakeACTWrapper:
+            def __init__(self, path, config):
+                self.path = path
+                self.config = config
+
+            def predict(self, batch):
+                return (torch.arange(6, dtype=torch.float32).reshape(1, 1, 6),)
+
+        monkeypatch.setattr(
+            "inference_service.core.ascend_om.policy_wrapper.ACTWrapper",
+            FakeACTWrapper,
+        )
+
+        coordinator = InferenceCoordinator(
+            policy_path=str(tmp_path),
+            device="ascend_om",
+            preprocessor=MockPreprocessor(device=torch.device("cpu")),
+            postprocessor=MockPostprocessor(device=torch.device("cpu")),
+        )
+
+        assert coordinator.device.type == "cpu"
+        assert coordinator.policy_type == "ascend_om"
+
 
 class TestEndToEndPipeline:
     """End-to-end tests for the full pipeline."""

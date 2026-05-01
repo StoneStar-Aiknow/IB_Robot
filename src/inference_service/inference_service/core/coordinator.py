@@ -133,12 +133,13 @@ class InferenceCoordinator:
             policy_path = config.policy_path
             device = config.device
         
+        self._device_name = device
         self._device = resolve_device(device)
         
         if engine is not None:
             self._engine = engine
         elif policy_path is not None:
-            self._engine = PureInferenceEngine(policy_path=policy_path, device=str(self._device))
+            self._engine = PureInferenceEngine(policy_path=policy_path, device=self._device_name)
         else:
             raise ValueError("Either policy_path or engine must be provided")
         
