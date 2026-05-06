@@ -121,20 +121,25 @@ robot:
   # The standalone voice_asr_service launch file is kept only for debugging.
   voice_asr:
     enabled: false
+    auto_download_model: true
+    # 可通过 launch 参数 `voice_asr_auto_start:=true` 临时覆盖为启用并切换到 continuous 监听模式。
     active_mode: manual
     language: zh
-    model_path: "src/voice_asr_service/model/sherpa-onnx-paraformer-zh-2023-09-14/model.int8.onnx"
+    model_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
     tokens_path: ""
     provider: cpu
-    model_type: auto
+    model_type: streaming
     max_recording_duration: 10.0
     vad_sensitivity: 0.5
+    realtime_pre_roll_seconds: 2.0
     publish_partial: true
     sample_rate: 16000
     chunk_size: 512
     buffer_seconds: 5.0
     output_topic: /voice_command
     device_index: -1
+    device_name: ""
+    exit_on_init_failure: true
 
   # ros2_control configuration
   ros2_control:

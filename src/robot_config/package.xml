@@ -25,7 +25,7 @@
   <exec_depend>robot_localization</exec_depend>
   <exec_depend>omni_wheel_controller</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
-  <exec_depend>voice_asr_service</exec_depend>
+  <depend>voice_asr_service</depend>
 
   <!-- ros2_control -->
   <exec_depend>ros2_control</exec_depend>

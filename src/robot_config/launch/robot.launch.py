@@ -243,6 +243,7 @@ def launch_setup(context, *args, **kwargs):
     use_sim_str = context.launch_configurations.get("use_sim", "false")
     auto_start_controllers = context.launch_configurations.get("auto_start_controllers", "true")
     control_mode_override = context.launch_configurations.get("control_mode", "")
+    voice_asr_auto_start_str = context.launch_configurations.get("voice_asr_auto_start", "false")
 
     # Normalize use_sim to boolean
     use_sim = parse_bool(use_sim_str, default=False)
@@ -253,6 +254,7 @@ def launch_setup(context, *args, **kwargs):
     logger.info(f"use_sim: {use_sim} (from '{use_sim_str}')")
     logger.info(f"auto_start_controllers: {auto_start_controllers}")
     logger.info(f"control_mode: {control_mode_override if control_mode_override else '(from config)'}")
+    logger.info(f"voice_asr_auto_start: {voice_asr_auto_start_str}")
 
     # ========== 2. Load robot configuration ==========
     try:
@@ -274,6 +276,16 @@ def launch_setup(context, *args, **kwargs):
     # ========== 3. Apply control mode override ==========
     if control_mode_override:
         robot_config["default_control_mode"] = control_mode_override
+
+    voice_asr_auto_start = parse_bool(voice_asr_auto_start_str, default=False)
+    if voice_asr_auto_start:
+        voice_asr_cfg = robot_config.setdefault("voice_asr", {})
+        voice_asr_cfg["enabled"] = True
+        voice_asr_cfg["active_mode"] = "continuous"
+        voice_asr_cfg.setdefault("auto_download_model", True)
+        logger.info(
+            "CLI override: voice_asr.enabled=true, voice_asr.active_mode=continuous, voice_asr.auto_download_model=true"
+        )
 
     active_control_mode = robot_config.get("default_control_mode", "model_inference")
     logger.info(f"Active control mode: {active_control_mode}")
@@ -681,6 +693,11 @@ def generate_launch_description():
                 "record_mode",
                 default_value="continuous",
                 description="Recording mode: 'continuous' (all-in-one bag) or 'episodic' (triggered episode-by-episode via episode_recorder)",
+            ),
+            DeclareLaunchArgument(
+                "voice_asr_auto_start",
+                default_value="false",
+                description="When true, enable Voice ASR and override robot.voice_asr.active_mode=continuous",
             ),
             DeclareLaunchArgument(
                 "record_visualizer",

@@ -1,20 +1,20 @@
 """Configuration loader and validator for robot_config."""
 
 import copy
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Union
-
 import logging
+from pathlib import Path
+from typing import Any
+
 import yaml
 
 from robot_config.config import (
-    RobotConfig,
-    Ros2ControlConfig,
     CameraConfig,
-    PeripheralConfig,
+    ContractAction,
     ContractExtensionConfig,
     ContractObservation,
-    ContractAction,
+    PeripheralConfig,
+    RobotConfig,
+    Ros2ControlConfig,
     VoiceASRConfig,
 )
 
@@ -23,7 +23,7 @@ from .utils import resolve_ros_path
 logger = logging.getLogger(__name__)
 
 
-def _load_robot_section(config_path: Union[str, Path]) -> tuple[Path, Dict[str, Any]]:
+def _load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
     """Load the raw ``robot`` section from a robot_config YAML file."""
     resolved_config_path = Path(config_path).expanduser().resolve()
 
@@ -37,15 +37,11 @@ def _load_robot_section(config_path: Union[str, Path]) -> tuple[Path, Dict[str, 
         raise ValueError(f"Invalid robot config: expected mapping in {resolved_config_path}")
 
     if "robot" not in data:
-        raise ValueError(
-            f"Invalid robot config: missing 'robot' section in {resolved_config_path}"
-        )
+        raise ValueError(f"Invalid robot config: missing 'robot' section in {resolved_config_path}")
 
     robot_data = data["robot"]
     if not isinstance(robot_data, dict):
-        raise ValueError(
-            f"Invalid robot config: 'robot' section must be a mapping in {resolved_config_path}"
-        )
+        raise ValueError(f"Invalid robot config: 'robot' section must be a mapping in {resolved_config_path}")
 
     name = robot_data.get("name")
     if not name:
@@ -54,7 +50,7 @@ def _load_robot_section(config_path: Union[str, Path]) -> tuple[Path, Dict[str, 
     return resolved_config_path, robot_data
 
 
-def load_robot_config_dict(config_path: Union[str, Path]) -> Dict[str, Any]:
+def load_robot_config_dict(config_path: str | Path) -> dict[str, Any]:
     """Load robot configuration as a complete dict.
 
     This is the canonical loader for launch/builders/runtime consumers. It preserves
@@ -67,7 +63,7 @@ def load_robot_config_dict(config_path: Union[str, Path]) -> Dict[str, Any]:
     return robot_config
 
 
-def load_camera_config(data: Dict[str, Any]) -> CameraConfig:
+def load_camera_config(data: dict[str, Any]) -> CameraConfig:
     """Load camera configuration from dict.
 
     Example:
@@ -108,7 +104,7 @@ def load_camera_config(data: Dict[str, Any]) -> CameraConfig:
     )
 
 
-def load_ros2_control_config(data: Dict[str, Any], config_dir: Optional[Path] = None) -> Ros2ControlConfig:
+def load_ros2_control_config(data: dict[str, Any], config_dir: Path | None = None) -> Ros2ControlConfig:
     """Load ros2_control configuration from dict.
 
     Example:
@@ -126,7 +122,7 @@ def load_ros2_control_config(data: Dict[str, Any], config_dir: Optional[Path] = 
         if key not in ["hardware_plugin", "urdf_path"]:
             # Resolve paths in parameters
             if isinstance(value, str):
-                    value = resolve_ros_path(value)
+                value = resolve_ros_path(value)
             params[key] = value
 
     return Ros2ControlConfig(
@@ -136,7 +132,7 @@ def load_ros2_control_config(data: Dict[str, Any], config_dir: Optional[Path] = 
     )
 
 
-def load_contract_config(data: Dict[str, Any]) -> ContractExtensionConfig:
+def load_contract_config(data: dict[str, Any]) -> ContractExtensionConfig:
     """Load contract extension configuration from dict.
 
     Example:
@@ -190,31 +186,36 @@ def load_contract_config(data: Dict[str, Any]) -> ContractExtensionConfig:
     )
 
 
-def load_voice_asr_config(data: Dict[str, Any]) -> VoiceASRConfig:
+def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
     """Load voice ASR configuration from dict."""
+    defaults = VoiceASRConfig()
     model_path = data.get("model_path", "")
     tokens_path = data.get("tokens_path", "")
 
     return VoiceASRConfig(
-        enabled=data.get("enabled", False),
-        active_mode=data.get("active_mode", "manual"),
-        language=data.get("language", "zh"),
+        enabled=data.get("enabled", defaults.enabled),
+        auto_download_model=data.get("auto_download_model", defaults.auto_download_model),
+        active_mode=data.get("active_mode", defaults.active_mode),
+        language=data.get("language", defaults.language),
         model_path=resolve_ros_path(model_path) if model_path else "",
         tokens_path=resolve_ros_path(tokens_path) if tokens_path else "",
-        provider=data.get("provider", "cpu"),
-        model_type=data.get("model_type", "auto"),
-        max_recording_duration=data.get("max_recording_duration", 10.0),
-        vad_sensitivity=data.get("vad_sensitivity", 0.5),
-        publish_partial=data.get("publish_partial", True),
-        output_topic=data.get("output_topic", "/voice_command"),
-        sample_rate=data.get("sample_rate", 16000),
-        chunk_size=data.get("chunk_size", 512),
-        buffer_seconds=data.get("buffer_seconds", 5.0),
-        device_index=data.get("device_index", -1),
+        provider=data.get("provider", defaults.provider),
+        model_type=data.get("model_type", defaults.model_type),
+        max_recording_duration=data.get("max_recording_duration", defaults.max_recording_duration),
+        vad_sensitivity=data.get("vad_sensitivity", defaults.vad_sensitivity),
+        realtime_pre_roll_seconds=data.get("realtime_pre_roll_seconds", defaults.realtime_pre_roll_seconds),
+        publish_partial=data.get("publish_partial", defaults.publish_partial),
+        output_topic=data.get("output_topic", defaults.output_topic),
+        sample_rate=data.get("sample_rate", defaults.sample_rate),
+        chunk_size=data.get("chunk_size", defaults.chunk_size),
+        buffer_seconds=data.get("buffer_seconds", defaults.buffer_seconds),
+        device_index=data.get("device_index", defaults.device_index),
+        device_name=data.get("device_name", defaults.device_name),
+        exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
     )
 
 
-def load_robot_config(config_path: Union[str, Path]) -> RobotConfig:
+def load_robot_config(config_path: str | Path) -> RobotConfig:
     """Load robot configuration from YAML file.
 
     Args:
@@ -274,14 +275,14 @@ def load_robot_config(config_path: Union[str, Path]) -> RobotConfig:
     )
 
 
-def build_contract_from_robot_config_dict(robot_config: Dict[str, Any]):
+def build_contract_from_robot_config_dict(robot_config: dict[str, Any]):
     """Build a runtime contract directly from the canonical dict loader output."""
     from robot_config.generators.contract import build_contract_from_robot_config_dict as _build
 
     return _build(robot_config)
 
 
-def validate_config(config: RobotConfig) -> List[str]:
+def validate_config(config: RobotConfig) -> list[str]:
     """Validate robot configuration.
 
     Returns:
@@ -314,9 +315,7 @@ def validate_config(config: RobotConfig) -> List[str]:
 
         # Validate camera parameters
         if periph.width <= 0 or periph.height <= 0:
-            errors.append(
-                f"Invalid camera dimensions for {periph.name}: {periph.width}x{periph.height}"
-            )
+            errors.append(f"Invalid camera dimensions for {periph.name}: {periph.width}x{periph.height}")
         if periph.fps <= 0:
             errors.append(f"Invalid FPS for {periph.name}: {periph.fps}")
 
@@ -330,17 +329,15 @@ def validate_config(config: RobotConfig) -> List[str]:
     for obs in config.contract.observations:
         if obs.peripheral:
             if obs.peripheral not in peripheral_names:
-                errors.append(
-                    f"Observation '{obs.key}' references undefined peripheral: {obs.peripheral}"
-                )
+                errors.append(f"Observation '{obs.key}' references undefined peripheral: {obs.peripheral}")
 
-    if config.voice_asr.enabled and not config.voice_asr.model_path:
+    if config.voice_asr.enabled and not config.voice_asr.model_path and not config.voice_asr.auto_download_model:
         errors.append("voice_asr.model_path is required when voice_asr.enabled is true")
 
     return errors
 
 
-def validate_config_file(config_path: Union[str, Path]) -> bool:
+def validate_config_file(config_path: str | Path) -> bool:
     """Validate a robot configuration file.
 
     Returns:

@@ -1547,6 +1547,18 @@ setup_python_venv() {
         run_cmd "${pip_install[@]}" onnx onnxsim onnxruntime --quiet
     fi
 
+    # Pin sherpa-onnx 1.10.46 because this workspace has been validated against
+    # its streaming zipformer / offline paraformer APIs and result shapes.
+    # Revalidate ASR initialization and decoding behavior before upgrading it.
+    # 安装 ASR 相关依赖
+    log_info "Installing ASR dependencies (sherpa-onnx, sounddevice, soundfile)..."
+    python3 -m pip install "sherpa-onnx==1.10.46" sounddevice soundfile --quiet
+
+    log_info "Prefetching default ASR model bundles..."
+    if ! python3 -m voice_asr_service.model_manager --all; then
+        log_warn "ASR model prefetch failed. Runtime auto-download will retry when models are missing."
+    fi
+
     # 安装 gitlint 并设置 git hook
     log_info "Installing gitlint..."
     run_cmd "${venv_python}" -m pip install gitlint --quiet

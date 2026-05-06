@@ -6,18 +6,29 @@ import pytest
 
 from robot_config.config import (
     CameraConfig,
-    PeripheralConfig,
     ContractExtensionConfig,
+    PeripheralConfig,
     RobotConfig,
     Ros2ControlConfig,
+    VoiceASRConfig,
+)
+from robot_config.launch_builders.recording import get_recording_topics
+from robot_config.launch_builders.voice_asr import (
+    default_voice_asr_model_path,
+    resolve_voice_asr_path,
 )
 from robot_config.loader import (
     build_contract_from_robot_config_dict,
     load_robot_config,
     load_robot_config_dict,
+    load_voice_asr_config,
     validate_config,
 )
-from robot_config.launch_builders.recording import get_recording_topics
+from voice_asr_service.model_manager import (
+    STREAMING_ZH_BUNDLE,
+    infer_model_bundle_from_path_hint,
+)
+from voice_asr_service.defaults import VOICE_ASR_DEFAULTS
 
 
 def test_load_single_arm_config():
@@ -36,6 +47,11 @@ def test_load_single_arm_config():
     assert len(config.peripherals) == 3
     assert config.voice_asr.enabled is False
     assert config.voice_asr.output_topic == "/voice_command"
+    assert config.voice_asr.model_path.endswith("models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23")
+    assert config.voice_asr.realtime_pre_roll_seconds == 2.0
+    assert not Path(config.voice_asr.model_path).is_absolute()
+    assert config.voice_asr.device_name == ""
+    assert config.voice_asr.exit_on_init_failure is True
 
     # Check cameras
     top_cam = config.get_camera("top")
@@ -222,6 +238,7 @@ def test_load_lekiwi_config_dict():
         "base_controller",
     ]
     assert robot_config["navigation"]["default_mode"] == "full"
+
 
 def test_recording_topics_follow_contract_and_peripherals():
     config_path = Path(__file__).parent.parent / "config" / "robots" / "lekiwi.yaml"
@@ -419,8 +436,8 @@ def test_get_all_cameras():
     assert cameras[1].name == "cam2"
 
 
-def test_validate_voice_asr_requires_model_path_when_enabled():
-    """Test validation catches enabled voice ASR without a model path."""
+def test_validate_voice_asr_requires_model_path_when_auto_download_is_disabled():
+    """Test validation catches enabled voice ASR without a model path when auto-download is off."""
     config = RobotConfig(
         name="test_robot",
         type="so101",
@@ -435,6 +452,72 @@ def test_validate_voice_asr_requires_model_path_when_enabled():
         ),
     )
     config.voice_asr.enabled = True
+    config.voice_asr.auto_download_model = False
 
     errors = validate_config(config)
     assert any("voice_asr.model_path" in error for error in errors)
+
+
+def test_load_voice_asr_config_preserves_empty_model_path_for_launch_builder():
+    """Test voice ASR loader remains a pure field mapper for launch-time defaulting."""
+    config = load_voice_asr_config(
+        {
+            "enabled": True,
+            "auto_download_model": True,
+            "active_mode": "continuous",
+            "model_type": "streaming",
+        }
+    )
+
+    assert config.model_path == ""
+    assert config.device_name == ""
+    assert config.exit_on_init_failure is True
+
+
+def test_voice_asr_launch_builder_infers_shared_default_model_path():
+    """Test launch builder resolves the shared default Voice ASR model path."""
+    resolved = default_voice_asr_model_path("streaming", "continuous")
+
+    assert resolved.endswith("models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23")
+    assert Path(resolved).is_absolute()
+
+
+def test_resolve_voice_asr_path_uses_workspace_root_for_relative_paths():
+    """Test voice ASR relative paths resolve from the workspace root."""
+    resolved = resolve_voice_asr_path("models/voice_asr/demo-bundle")
+
+    assert Path(resolved).is_absolute()
+    assert resolved.endswith("models/voice_asr/demo-bundle")
+
+
+def test_model_hint_inference_uses_model_manager_ssot():
+    """Test path-hint inference delegates to model_manager."""
+    bundle = infer_model_bundle_from_path_hint("models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23")
+
+    assert bundle is not None
+    assert bundle.profile == STREAMING_ZH_BUNDLE.profile
+
+
+def test_voice_asr_runtime_defaults_match_robot_config_defaults():
+    """Test robot_config defaults stay aligned with runtime Voice ASR defaults."""
+    config_defaults = VoiceASRConfig()
+
+    assert config_defaults.enabled == VOICE_ASR_DEFAULTS["enabled"]
+    assert config_defaults.auto_download_model == VOICE_ASR_DEFAULTS["auto_download_model"]
+    assert config_defaults.active_mode == VOICE_ASR_DEFAULTS["active_mode"]
+    assert config_defaults.language == VOICE_ASR_DEFAULTS["language"]
+    assert config_defaults.model_path == VOICE_ASR_DEFAULTS["model_path"]
+    assert config_defaults.tokens_path == VOICE_ASR_DEFAULTS["tokens_path"]
+    assert config_defaults.provider == VOICE_ASR_DEFAULTS["provider"]
+    assert config_defaults.model_type == VOICE_ASR_DEFAULTS["model_type"]
+    assert config_defaults.max_recording_duration == VOICE_ASR_DEFAULTS["max_recording_duration"]
+    assert config_defaults.vad_sensitivity == VOICE_ASR_DEFAULTS["vad_sensitivity"]
+    assert config_defaults.realtime_pre_roll_seconds == VOICE_ASR_DEFAULTS["realtime_pre_roll_seconds"]
+    assert config_defaults.publish_partial == VOICE_ASR_DEFAULTS["publish_partial"]
+    assert config_defaults.output_topic == VOICE_ASR_DEFAULTS["output_topic"]
+    assert config_defaults.sample_rate == VOICE_ASR_DEFAULTS["sample_rate"]
+    assert config_defaults.chunk_size == VOICE_ASR_DEFAULTS["chunk_size"]
+    assert config_defaults.buffer_seconds == VOICE_ASR_DEFAULTS["buffer_seconds"]
+    assert config_defaults.device_index == VOICE_ASR_DEFAULTS["device_index"]
+    assert config_defaults.device_name == VOICE_ASR_DEFAULTS["device_name"]
+    assert config_defaults.exit_on_init_failure == VOICE_ASR_DEFAULTS["exit_on_init_failure"]

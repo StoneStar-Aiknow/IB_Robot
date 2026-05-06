@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 VoiceASRNode - 语音识别 ROS2 节点
 
@@ -7,27 +6,26 @@ VoiceASRNode - 语音识别 ROS2 节点
 支持麦克风实时采集和音频文件输入
 """
 
-import rclpy
-from rclpy.node import Node
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
-from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
-
-from std_msgs.msg import String, Float32
-from std_srvs.srv import Empty
-from ibrobot_msgs.srv import RecognizeFile, SetHotwords
-
 import threading
 import time
-import numpy as np
-from typing import Optional, Dict, Any
 from dataclasses import dataclass
 
-from .audio_capture_module import AudioCaptureModule, AudioConfig, CaptureState
-from .file_input_module import FileInputModule, FileResult, FileState
-from .asr_inference_module import ASRInferenceModule, ASRResult, ASRState
-from .vad_module import VADModule, VADConfig, VADState
-from .state_machine import StateMachine, NodeState, ActiveMode
+import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.node import Node
+from std_msgs.msg import Float32, String
+from std_srvs.srv import Empty
+
+from ibrobot_msgs.srv import RecognizeFile, SetHotwords
+
+from .asr_inference_module import ASRInferenceModule
+from .audio_capture_module import AudioCaptureModule, AudioConfig
+from .defaults import VOICE_ASR_DEFAULTS
+from .file_input_module import FileInputModule
+from .model_manager import resolve_model_assets
+from .state_machine import ActiveMode, NodeState, StateMachine
+from .vad_module import VADConfig, VADModule, VADState
 
 
 @dataclass
@@ -97,6 +95,31 @@ class VoiceASRNode(Node):
             self._fail_response(response, message)
         return False
 
+    def _ensure_realtime_asr_supported(self, response=None, operation: str = "Realtime ASR request") -> bool:
+        """Realtime microphone recognition requires a streaming-capable model."""
+        if not self._ensure_asr_ready(response=response, operation=operation):
+            return False
+        if self._asr.is_streaming():
+            return True
+
+        message = (
+            f"{operation} requires a streaming ASR model. "
+            "Current model is offline, so microphone realtime recognition is unavailable. "
+            "Offline file recognition remains available via ~/recognize_file."
+        )
+        self.get_logger().error(message)
+        if response is not None:
+            self._fail_response(response, message)
+        return False
+
+    def _stop_realtime_capture(self, trigger: str, reason: str) -> None:
+        """Stop microphone capture when realtime ASR cannot proceed safely."""
+        self.get_logger().error(reason)
+        self._audio_capture.stop_capture()
+        self._recording_start_time = None
+        self._last_partial_text = ""
+        self._transition_state(NodeState.IDLE, trigger)
+
     def __init__(self):
         super().__init__("voice_asr_node")
 
@@ -109,20 +132,24 @@ class VoiceASRNode(Node):
 
     def _declare_parameters(self):
         """声明 ROS 参数"""
-        self.declare_parameter("active_mode", "manual")
-        self.declare_parameter("language", "zh")
-        self.declare_parameter("model_path", "")
-        self.declare_parameter("tokens_path", "")
-        self.declare_parameter("provider", "cpu")
-        self.declare_parameter("model_type", "auto")
-        self.declare_parameter("max_recording_duration", 10.0)
-        self.declare_parameter("vad_sensitivity", 0.5)
-        self.declare_parameter("publish_partial", True)
-        self.declare_parameter("output_topic", "/voice_command")
-        self.declare_parameter("sample_rate", 16000)
-        self.declare_parameter("chunk_size", 512)
-        self.declare_parameter("buffer_seconds", 5.0)
-        self.declare_parameter("device_index", -1)
+        self.declare_parameter("active_mode", VOICE_ASR_DEFAULTS["active_mode"])
+        self.declare_parameter("language", VOICE_ASR_DEFAULTS["language"])
+        self.declare_parameter("model_path", VOICE_ASR_DEFAULTS["model_path"])
+        self.declare_parameter("tokens_path", VOICE_ASR_DEFAULTS["tokens_path"])
+        self.declare_parameter("provider", VOICE_ASR_DEFAULTS["provider"])
+        self.declare_parameter("model_type", VOICE_ASR_DEFAULTS["model_type"])
+        self.declare_parameter("auto_download_model", VOICE_ASR_DEFAULTS["auto_download_model"])
+        self.declare_parameter("max_recording_duration", VOICE_ASR_DEFAULTS["max_recording_duration"])
+        self.declare_parameter("vad_sensitivity", VOICE_ASR_DEFAULTS["vad_sensitivity"])
+        self.declare_parameter("publish_partial", VOICE_ASR_DEFAULTS["publish_partial"])
+        self.declare_parameter("output_topic", VOICE_ASR_DEFAULTS["output_topic"])
+        self.declare_parameter("sample_rate", VOICE_ASR_DEFAULTS["sample_rate"])
+        self.declare_parameter("chunk_size", VOICE_ASR_DEFAULTS["chunk_size"])
+        self.declare_parameter("buffer_seconds", VOICE_ASR_DEFAULTS["buffer_seconds"])
+        self.declare_parameter("realtime_pre_roll_seconds", VOICE_ASR_DEFAULTS["realtime_pre_roll_seconds"])
+        self.declare_parameter("device_index", VOICE_ASR_DEFAULTS["device_index"])
+        self.declare_parameter("device_name", VOICE_ASR_DEFAULTS["device_name"])
+        self.declare_parameter("exit_on_init_failure", VOICE_ASR_DEFAULTS["exit_on_init_failure"])
 
         self._active_mode = self.get_parameter("active_mode").value
         self._language = self.get_parameter("language").value
@@ -130,17 +157,19 @@ class VoiceASRNode(Node):
         self._tokens_path = self.get_parameter("tokens_path").value
         self._provider = self.get_parameter("provider").value
         self._model_type = self.get_parameter("model_type").value
-        self._max_recording_duration = self.get_parameter(
-            "max_recording_duration"
-        ).value
+        self._auto_download_model = self.get_parameter("auto_download_model").value
+        self._max_recording_duration = self.get_parameter("max_recording_duration").value
         self._vad_sensitivity = self.get_parameter("vad_sensitivity").value
         self._publish_partial = self.get_parameter("publish_partial").value
         self._output_topic = self.get_parameter("output_topic").value
         self._sample_rate = self.get_parameter("sample_rate").value
         self._chunk_size = self.get_parameter("chunk_size").value
         self._buffer_seconds = self.get_parameter("buffer_seconds").value
+        self._realtime_pre_roll_seconds = max(0.0, float(self.get_parameter("realtime_pre_roll_seconds").value))
         device_index = self.get_parameter("device_index").value
         self._device_index = device_index if device_index >= 0 else None
+        self._device_name = self.get_parameter("device_name").value
+        self._exit_on_init_failure = self.get_parameter("exit_on_init_failure").value
 
     def _init_modules(self):
         """初始化各模块"""
@@ -148,28 +177,63 @@ class VoiceASRNode(Node):
         self._state_machine.set_mode_str(self._active_mode)
 
         audio_config = AudioConfig(
-            sample_rate=self._sample_rate,
-            chunk_size=self._chunk_size,
-            buffer_seconds=self._buffer_seconds,
+            sample_rate=self._sample_rate, chunk_size=self._chunk_size, buffer_seconds=self._buffer_seconds
         )
         self._audio_capture = AudioCaptureModule(audio_config)
-        self._audio_capture.set_device(self._device_index)
         self._audio_capture.set_error_callback(self._on_audio_error)
+
+        # 打印可用音频设备
+        devices = AudioCaptureModule.list_audio_devices()
+        if devices:
+            self.get_logger().info("Available audio input devices:")
+            for dev in devices:
+                self.get_logger().info(
+                    f"  [{dev['index']}] {dev['name']} "
+                    f"(channels={dev['channels']}, sr={dev['sample_rate']}, backend={dev['backend']})"
+                )
+        else:
+            self.get_logger().warn("No audio input devices found")
+
+        # 优先按名称匹配，否则按 index
+        if self._device_name:
+            if self._audio_capture.set_device_by_name(self._device_name):
+                self.get_logger().info(
+                    f"Audio device selected by name '{self._device_name}' -> index {self._audio_capture._device_index}"
+                )
+            else:
+                self.get_logger().error(
+                    f"Failed to find audio device matching '{self._device_name}'. "
+                    f"Falling back to device_index={self._device_index or 'default'}"
+                )
+                self._audio_capture.set_device(self._device_index)
+        else:
+            self._audio_capture.set_device(self._device_index)
 
         self._file_input = FileInputModule()
         self._file_input.set_progress_callback(self._on_file_progress)
 
-        vad_config = VADConfig(
-            sample_rate=self._sample_rate, frame_size=self._chunk_size
-        )
+        vad_config = VADConfig(sample_rate=self._sample_rate, frame_size=self._chunk_size)
         self._vad = VADModule(vad_config)
+        self._vad.set_logger(self.get_logger())
         self._vad.set_sensitivity(self._vad_sensitivity)
 
         self._asr = ASRInferenceModule()
-        self._asr_init_error: Optional[str] = None
+        self._asr_init_error: str | None = None
 
         if self._model_path:
             try:
+                resolved_assets = resolve_model_assets(
+                    model_path=self._model_path,
+                    tokens_path=self._tokens_path,
+                    model_type=self._model_type,
+                    active_mode=self._active_mode,
+                    language=self._language,
+                    auto_download_model=self._auto_download_model,
+                    logger=self.get_logger(),
+                )
+                self._model_path = resolved_assets.model_path
+                self._tokens_path = resolved_assets.tokens_path
+
                 self._asr.initialize(
                     model_path=self._model_path,
                     tokens_path=self._tokens_path if self._tokens_path else None,
@@ -179,18 +243,31 @@ class VoiceASRNode(Node):
                 )
                 self._vad.initialize()
                 model_type_str = "streaming" if self._asr.is_streaming() else "offline"
-                self.get_logger().info(
-                    f"ASR model loaded: {self._model_path} (type: {model_type_str})"
-                )
+                self.get_logger().info(f"ASR model loaded: {self._model_path} (type: {model_type_str})")
+                if resolved_assets.downloaded:
+                    self.get_logger().info(
+                        f"ASR model bundle '{resolved_assets.profile}' was downloaded automatically."
+                    )
+                if not self._asr.is_streaming():
+                    self.get_logger().info(
+                        "Offline ASR model loaded. File recognition is available; "
+                        "microphone realtime recognition still requires a streaming model."
+                    )
             except Exception as e:
                 self._asr_init_error = str(e)
                 self.get_logger().error(f"Failed to load ASR model: {e}")
+                if self._exit_on_init_failure:
+                    raise RuntimeError(f"ASR initialization failed and exit_on_init_failure is true: {e}")
         else:
-            self._asr_init_error = "ASR model_path is empty. Configure robot.voice_asr.model_path or pass the model_path parameter."
+            self._asr_init_error = (
+                "ASR model_path is empty. Configure robot.voice_asr.model_path or pass the model_path parameter."
+            )
             self.get_logger().warn(self._asr_init_error)
+            if self._exit_on_init_failure:
+                raise RuntimeError(self._asr_init_error)
 
         self._recognition_lock = threading.Lock()
-        self._recording_start_time: Optional[float] = None
+        self._recording_start_time: float | None = None
         self._last_partial_text: str = ""
 
     def _init_ros_interface(self):
@@ -199,58 +276,34 @@ class VoiceASRNode(Node):
         self._pub_partial = self.create_publisher(String, "/voice_partial", 10)
         self._pub_status = self.create_publisher(String, "/voice_status", 10)
         self._pub_confidence = self.create_publisher(Float32, "/voice_confidence", 10)
-        self._pub_file_progress = self.create_publisher(
-            Float32, "/voice_file_progress", 10
-        )
+        self._pub_file_progress = self.create_publisher(Float32, "/voice_file_progress", 10)
 
-        self._sub_control = self.create_subscription(
-            String, "/voice_control", self._on_voice_control, 10
-        )
-        self._sub_file_input = self.create_subscription(
-            String, "/voice_file_input", self._on_file_input, 10
-        )
+        self._sub_control = self.create_subscription(String, "/voice_control", self._on_voice_control, 10)
+        self._sub_file_input = self.create_subscription(String, "/voice_file_input", self._on_file_input, 10)
 
         self._cb_group = MutuallyExclusiveCallbackGroup()
         self._srv_start = self.create_service(
-            Empty,
-            "~/start_recognition",
-            self._on_start_recognition,
-            callback_group=self._cb_group,
+            Empty, "~/start_recognition", self._on_start_recognition, callback_group=self._cb_group
         )
         self._srv_stop = self.create_service(
-            Empty,
-            "~/stop_recognition",
-            self._on_stop_recognition,
-            callback_group=self._cb_group,
+            Empty, "~/stop_recognition", self._on_stop_recognition, callback_group=self._cb_group
         )
         self._srv_set_hotwords = self.create_service(
-            SetHotwords,
-            "~/set_hotwords",
-            self._on_set_hotwords,
-            callback_group=self._cb_group,
+            SetHotwords, "~/set_hotwords", self._on_set_hotwords, callback_group=self._cb_group
         )
 
         self._srv_recognize_file = self.create_service(
-            RecognizeFile,
-            "~/recognize_file",
-            self._on_recognize_file,
-            callback_group=ReentrantCallbackGroup(),
+            RecognizeFile, "~/recognize_file", self._on_recognize_file, callback_group=ReentrantCallbackGroup()
         )
 
         self._state_machine.register_callback(NodeState.IDLE, self._on_state_change)
-        self._state_machine.register_callback(
-            NodeState.LISTENING, self._on_state_change
-        )
-        self._state_machine.register_callback(
-            NodeState.RECOGNIZING, self._on_state_change
-        )
+        self._state_machine.register_callback(NodeState.LISTENING, self._on_state_change)
+        self._state_machine.register_callback(NodeState.RECOGNIZING, self._on_state_change)
         self._state_machine.register_callback(NodeState.ERROR, self._on_state_change)
 
     def _init_control_loop(self):
         """初始化控制循环"""
-        self._control_timer = self.create_timer(
-            0.01, self._control_loop, callback_group=self._cb_group
-        )
+        self._control_timer = self.create_timer(0.01, self._control_loop, callback_group=self._cb_group)
 
         if self._state_machine.mode == ActiveMode.CONTINUOUS:
             self._start_continuous_listening()
@@ -260,7 +313,7 @@ class VoiceASRNode(Node):
         if self._state_machine.is_error():
             return
 
-        if self._state_machine.is_listening():
+        if self._state_machine.is_listening() or self._state_machine.is_recognizing():
             self._process_audio()
 
         if self._state_machine.is_recognizing():
@@ -274,17 +327,37 @@ class VoiceASRNode(Node):
             return
 
         vad_result = self._vad.process(audio_chunk)
-
-        if vad_result.state == VADState.SPEAKING:
+        # 语音活动期间（含开始、持续、结束缓冲）都向 ASR 喂数据
+        if vad_result.state in (VADState.STARTING, VADState.SPEAKING, VADState.ENDING):
             if not self._state_machine.is_recognizing():
-                if not self._transition_state(
-                    NodeState.RECOGNIZING, "vad_speech_detected"
-                ):
+                # 只在 SPEAKING 状态触发新的识别会话，避免 STARTING 误触发
+                if vad_result.state != VADState.SPEAKING:
+                    return
+                if not self._asr.is_streaming():
+                    self._stop_realtime_capture(
+                        "realtime_asr_unavailable",
+                        "Detected speech while using an offline ASR model. "
+                        "Realtime microphone recognition requires a streaming model.",
+                    )
+                    return
+                if not self._transition_state(NodeState.RECOGNIZING, "vad_speech_detected"):
                     return
                 self._recording_start_time = time.time()
-                self._asr.start_streaming()
+                try:
+                    if not self._asr.start_streaming():
+                        self._stop_realtime_capture(
+                            "realtime_asr_unavailable",
+                            "Failed to start the streaming ASR session.",
+                        )
+                        return
+                except Exception as e:
+                    self._stop_realtime_capture(
+                        "realtime_asr_unavailable",
+                        f"Failed to start streaming ASR: {e}",
+                    )
+                    return
 
-                pre_roll = self._audio_capture.get_pre_roll_audio(0.3)
+                pre_roll = self._audio_capture.get_pre_roll_audio(self._realtime_pre_roll_seconds)
                 if len(pre_roll) > 0:
                     self._asr.accept_waveform(pre_roll)
 
@@ -302,9 +375,7 @@ class VoiceASRNode(Node):
                 if final_result.text:
                     self._publish_command(final_result.text, final_result.confidence)
 
-                if not self._transition_state(
-                    NodeState.LISTENING, "vad_silence_detected"
-                ):
+                if not self._transition_state(NodeState.LISTENING, "vad_silence_detected"):
                     return
                 self._recording_start_time = None
                 self._last_partial_text = ""
@@ -318,10 +389,12 @@ class VoiceASRNode(Node):
         if elapsed >= self._max_recording_duration:
             self.get_logger().warn("Recognition timeout, forcing final result")
 
+            latency = time.time() - self._recording_start_time
             final_result = self._asr.end_streaming()
 
             if final_result.text:
                 self._publish_command(final_result.text, final_result.confidence)
+                self.get_logger().info(f"Recognition latency: {latency * 1000:.1f} ms")
 
             if not self._transition_state(NodeState.LISTENING, "timeout"):
                 return
@@ -330,6 +403,8 @@ class VoiceASRNode(Node):
 
     def _start_continuous_listening(self):
         """开始持续监听"""
+        if not self._ensure_realtime_asr_supported(operation="continuous_listening"):
+            return
         if not self._audio_capture.initialize():
             self._state_machine.set_error("Failed to initialize audio capture")
             return
@@ -342,7 +417,7 @@ class VoiceASRNode(Node):
 
     def _on_start_recognition(self, request, response):
         """开始识别服务回调"""
-        if not self._ensure_asr_ready(operation="start_recognition"):
+        if not self._ensure_realtime_asr_supported(response=response, operation="start_recognition"):
             return response
 
         if not self._state_machine.is_idle():
@@ -370,6 +445,8 @@ class VoiceASRNode(Node):
 
         self._audio_capture.stop_capture()
         self._transition_state(NodeState.IDLE, "service_request")
+        self._recording_start_time = None
+        self._last_partial_text = ""
 
         return response
 
@@ -379,11 +456,7 @@ class VoiceASRNode(Node):
             hotwords = {}
             if request.hotwords:
                 for i, word in enumerate(request.hotwords):
-                    boost = (
-                        request.boost_scores[i]
-                        if i < len(request.boost_scores)
-                        else 1.5
-                    )
+                    boost = request.boost_scores[i] if i < len(request.boost_scores) else 1.5
                     hotwords[word] = boost
 
             self._asr.set_hotwords(hotwords)
@@ -410,9 +483,7 @@ class VoiceASRNode(Node):
 
         try:
             asr_results = self._asr.recognize_file(
-                result.audio_data,
-                enable_vad=enable_vad,
-                vad_module=self._vad if enable_vad else None,
+                result.audio_data, enable_vad=enable_vad, vad_module=self._vad if enable_vad else None
             )
         except Exception as e:
             message = f"Failed to recognize file '{file_path}': {e}"
@@ -422,12 +493,8 @@ class VoiceASRNode(Node):
         response.success = True
         response.error_message = ""
         response.results = [r.text for r in asr_results]
-        response.timestamps = [
-            r.start_time if r.start_time is not None else 0.0 for r in asr_results
-        ]
-        response.durations = [
-            r.duration if r.duration is not None else 0.0 for r in asr_results
-        ]
+        response.timestamps = [r.start_time if r.start_time is not None else 0.0 for r in asr_results]
+        response.durations = [r.duration if r.duration is not None else 0.0 for r in asr_results]
 
         for asr_result in asr_results:
             self._publish_command(asr_result.text, asr_result.confidence)
@@ -440,20 +507,23 @@ class VoiceASRNode(Node):
 
         if command in ["start", "开始", "开始监听"]:
             if self._state_machine.is_idle():
+                if not self._ensure_realtime_asr_supported(operation="voice_control.start"):
+                    return
                 if not self._audio_capture.initialize():
                     return
                 if self._audio_capture.start_capture():
                     self._transition_state(NodeState.LISTENING, "topic_command")
 
         elif command in ["stop", "停止", "停止监听"]:
-            if (
-                self._state_machine.is_listening()
-                or self._state_machine.is_recognizing()
-            ):
+            if self._state_machine.is_listening() or self._state_machine.is_recognizing():
                 if self._state_machine.is_recognizing():
-                    self._asr.end_streaming()
+                    final_result = self._asr.end_streaming()
+                    if final_result.text:
+                        self._publish_command(final_result.text, final_result.confidence)
                 self._audio_capture.stop_capture()
                 self._transition_state(NodeState.IDLE, "topic_command")
+                self._recording_start_time = None
+                self._last_partial_text = ""
 
     def _on_file_input(self, msg: String):
         """文件输入话题回调（异步处理）"""
@@ -470,9 +540,7 @@ class VoiceASRNode(Node):
                 return
 
             try:
-                asr_results = self._asr.recognize_file(
-                    result.audio_data, enable_vad=True, vad_module=self._vad
-                )
+                asr_results = self._asr.recognize_file(result.audio_data, enable_vad=True, vad_module=self._vad)
             except Exception as e:
                 self.get_logger().error(f"Failed to recognize file '{file_path}': {e}")
                 return
@@ -500,9 +568,7 @@ class VoiceASRNode(Node):
         msg.data = new_state.value
         self._pub_status.publish(msg)
 
-        self.get_logger().debug(
-            f"State changed: {old_state.value} -> {new_state.value}"
-        )
+        self.get_logger().debug(f"State changed: {old_state.value} -> {new_state.value}")
 
     def _publish_command(self, text: str, confidence: float = 1.0):
         """发布最终识别结果"""
@@ -532,7 +598,15 @@ class VoiceASRNode(Node):
 def main(args=None):
     rclpy.init(args=args)
 
-    node = VoiceASRNode()
+    try:
+        node = VoiceASRNode()
+    except Exception as e:
+        import logging
+
+        logging.getLogger("voice_asr_node").error(f"Node initialization failed: {e}")
+        rclpy.shutdown()
+        return 1
+
     executor = MultiThreadedExecutor()
     executor.add_node(node)
 
@@ -542,8 +616,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.shutdown()
+    return 0
 
 
 if __name__ == "__main__":

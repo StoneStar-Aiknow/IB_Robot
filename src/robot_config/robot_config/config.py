@@ -1,7 +1,7 @@
 """Configuration dataclasses for unified robot configuration."""
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 
 @dataclass
@@ -9,8 +9,8 @@ class Ros2ControlConfig:
     """ros2_control hardware configuration."""
 
     hardware_plugin: str
-    params: Dict[str, Any] = field(default_factory=dict)
-    urdf_path: Optional[str] = None
+    params: dict[str, Any] = field(default_factory=dict)
+    urdf_path: str | None = None
 
 
 @dataclass
@@ -25,31 +25,31 @@ class CameraConfig:
 
     name: str
     driver: str  # opencv, realsense, etc.
-    index_or_port: Union[str, int]  # USB index for opencv, serial/port for realsense
+    index_or_port: str | int  # USB index for opencv, serial/port for realsense
     width: int
     height: int
     fps: int
     frame_id: str
-    optical_frame_id: Optional[str] = None
-    camera_info_url: Optional[str] = None  # Path to calibration file
+    optical_frame_id: str | None = None
+    camera_info_url: str | None = None  # Path to calibration file
     pixel_format: str = "bgr8"  # bgr8, rgb8, etc.
 
     # Realsense-specific parameters
-    depth_width: Optional[int] = None
-    depth_height: Optional[int] = None
-    depth_fps: Optional[int] = None
+    depth_width: int | None = None
+    depth_height: int | None = None
+    depth_fps: int | None = None
     enable_pointcloud: bool = False
     enable_sync: bool = True
     align_depth: bool = False
 
     # USB camera specific parameters
-    brightness: Optional[int] = None
-    contrast: Optional[int] = None
-    saturation: Optional[int] = None
-    sharpness: Optional[int] = None
+    brightness: int | None = None
+    contrast: int | None = None
+    saturation: int | None = None
+    sharpness: int | None = None
 
     # Transform (parent to camera frame)
-    transform: Optional[Dict[str, float]] = None  # {x, y, z, roll, pitch, yaw}
+    transform: dict[str, float] | None = None  # {x, y, z, roll, pitch, yaw}
 
 
 @dataclass
@@ -62,8 +62,8 @@ class PeripheralConfig:
     type: str  # camera, microphone, etc.
     name: str
     driver: str
-    params: Dict[str, Any] = field(default_factory=dict)
-    frame_id: Optional[str] = None
+    params: dict[str, Any] = field(default_factory=dict)
+    frame_id: str | None = None
 
 
 @dataclass
@@ -72,12 +72,12 @@ class ContractObservation:
 
     key: str
     topic: str
-    type: Optional[str] = None  # Explicit ROS message type (e.g. sensor_msgs/msg/PointCloud2)
-    peripheral: Optional[str] = None  # References peripheral by name
-    selector: Optional[Dict[str, Any]] = None
-    image: Optional[Dict[str, Any]] = None
-    align: Optional[Dict[str, Any]] = None
-    qos: Optional[Dict[str, Any]] = None
+    type: str | None = None  # Explicit ROS message type (e.g. sensor_msgs/msg/PointCloud2)
+    peripheral: str | None = None  # References peripheral by name
+    selector: dict[str, Any] | None = None
+    image: dict[str, Any] | None = None
+    align: dict[str, Any] | None = None
+    qos: dict[str, Any] | None = None
 
 
 @dataclass
@@ -85,9 +85,9 @@ class ContractAction:
     """Contract action definition."""
 
     key: str
-    publish: Dict[str, Any]
-    selector: Optional[Dict[str, Any]] = None
-    from_tensor: Optional[Dict[str, Any]] = None
+    publish: dict[str, Any]
+    selector: dict[str, Any] | None = None
+    from_tensor: dict[str, Any] | None = None
     safety_behavior: str = "zeros"
 
 
@@ -95,9 +95,9 @@ class ContractAction:
 class ContractExtensionConfig:
     """Rosetta contract extension configuration."""
 
-    base_contract: Optional[str] = None
-    observations: List[ContractObservation] = field(default_factory=list)
-    actions: List[ContractAction] = field(default_factory=list)
+    base_contract: str | None = None
+    observations: list[ContractObservation] = field(default_factory=list)
+    actions: list[ContractAction] = field(default_factory=list)
     rate_hz: float = 20.0
     max_duration_s: float = 30.0
 
@@ -107,6 +107,7 @@ class VoiceASRConfig:
     """Voice ASR node configuration managed by robot_config."""
 
     enabled: bool = False
+    auto_download_model: bool = True
     active_mode: str = "manual"
     language: str = "zh"
     model_path: str = ""
@@ -115,12 +116,15 @@ class VoiceASRConfig:
     model_type: str = "auto"
     max_recording_duration: float = 10.0
     vad_sensitivity: float = 0.5
+    realtime_pre_roll_seconds: float = 2.0
     publish_partial: bool = True
     output_topic: str = "/voice_command"
     sample_rate: int = 16000
     chunk_size: int = 512
     buffer_seconds: float = 5.0
     device_index: int = -1
+    device_name: str = ""
+    exit_on_init_failure: bool = True
 
 
 @dataclass
@@ -138,18 +142,18 @@ class RobotConfig:
     type: str
     robot_type: str  # For LeRobot dataset metadata (e.g., so_101)
     ros2_control: Ros2ControlConfig
-    peripherals: List[Union[CameraConfig, PeripheralConfig]] = field(default_factory=list)
+    peripherals: list[CameraConfig | PeripheralConfig] = field(default_factory=list)
     contract: ContractExtensionConfig = field(default_factory=ContractExtensionConfig)
     voice_asr: VoiceASRConfig = field(default_factory=VoiceASRConfig)
 
-    def get_camera(self, name: str) -> Optional[CameraConfig]:
+    def get_camera(self, name: str) -> CameraConfig | None:
         """Get camera configuration by name."""
         for cam in self.peripherals:
             if cam.name == name:
                 return cam
         return None
 
-    def get_all_cameras(self) -> List[CameraConfig]:
+    def get_all_cameras(self) -> list[CameraConfig]:
         """Get all camera configurations."""
         return [p for p in self.peripherals if isinstance(p, CameraConfig)]
 
@@ -159,11 +163,10 @@ class RobotConfig:
         This establishes RobotConfig as the Single Source of Truth for I/O mappings.
         """
         from robot_config.contract_utils import (
+            ActionSpec,
+            AlignSpec,
             Contract,
             ObservationSpec,
-            ActionSpec,
-            TaskSpec,
-            AlignSpec,
         )
 
         def _as_align(d):
