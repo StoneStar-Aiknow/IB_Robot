@@ -2661,7 +2661,6 @@ class CalibratorWindow:
         mode: str,
         ref_box: tuple[int, int, int, int] | None = None,
         live_box: tuple[int, int, int, int] | None = None,
-        ref_pair_idx: int | None = None,
         announce: bool = True,
     ) -> "DarkLevelEstimate | None":  # noqa: F821
         """Estimate + apply the signed-Δ pedestal offset.
@@ -2676,10 +2675,6 @@ class CalibratorWindow:
                 used when ``mode == "manual"``.
             live_box: LIVE-frame XYXY box in live native pixels —
                 only used when ``mode == "manual"``.
-            ref_pair_idx: When the user reused an existing ROI pair
-                as the black reference, pass its index (0-based) so
-                we can resolve both boxes from ``self._roi_pairs`` —
-                this skips the modal selection in m-mode.
             announce: When ``True`` the stage publishes a banner /
                 ``_notify`` summarising the chosen Δ. Set ``False``
                 when the caller wants to suppress UI noise (e.g.
@@ -2732,13 +2727,6 @@ class CalibratorWindow:
             ref_resized = self._resize_ref_to(live.shape)
             est = estimate_pedestal_offset_ref_mode(live, ref_resized)
         elif mode == "manual":
-            if ref_pair_idx is not None:
-                if 0 <= ref_pair_idx < len(self._roi_pairs):
-                    ref_box = self._roi_pairs[ref_pair_idx][0]
-                    live_box = self._roi_pairs[ref_pair_idx][1]
-                else:
-                    self._notify("Pedestal: bad pair index", YELLOW, 3.0)
-                    return None
             if ref_box is None:
                 self._notify("Pedestal: no ref box", YELLOW, 3.0)
                 return None
@@ -2938,7 +2926,13 @@ class CalibratorWindow:
             self._run_pedestal_stage(mode="ref")
             return
         if chosen == "reuse" and chosen_idx is not None:
-            self._run_pedestal_stage(mode="manual", ref_pair_idx=chosen_idx)
+            ref_box_rot, live_box = pairs[chosen_idx]
+            ref_box = self._unrotate_box(ref_box_rot, self._reference.shape[:2])
+            self._run_pedestal_stage(
+                mode="manual",
+                ref_box=ref_box,
+                live_box=live_box,
+            )
             return
         if chosen == "new":
             # Two-window REF+LIVE selection. The user picks a black box
