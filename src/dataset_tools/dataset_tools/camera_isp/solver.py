@@ -610,22 +610,25 @@ def _compute_ccm_variants(
 
 
 def _log_ccm_variants(variants: Mapping[str, dict | None], *, prefix: str = "") -> None:
-    """One-line console summary for each successfully solved variant."""
-    tag = f"{prefix} " if prefix else ""
-    for name, entry in variants.items():
-        if entry is None:
-            print(f"[{tag}SW-CCM:{name}] unavailable")
-            continue
-        de = entry.get("delta_e_median")
-        de_str = f"  ΔE_med={de:.3f}" if de is not None else ""
-        lam = entry.get("lambda")
-        lam_str = f"  λ={lam:.1e}" if lam is not None else ""
-        it = entry.get("iters")
-        it_str = f"  iters={it}" if it is not None else ""
-        print(
-            f"[{tag}SW-CCM:{name}] feat={entry['feat_dim']}  "
-            f"pairs={entry['n_pairs']}{lam_str}{it_str}{de_str}"
-        )
+    """One-line console summary for each successfully solved variant.
+
+    NOTE: prints are commented out — CCM is no longer visualized in the UI.
+    """
+    # tag = f"{prefix} " if prefix else ""
+    # for name, entry in variants.items():
+    #     if entry is None:
+    #         print(f"[{tag}SW-CCM:{name}] unavailable")
+    #         continue
+    #     de = entry.get("delta_e_median")
+    #     de_str = f"  ΔE_med={de:.3f}" if de is not None else ""
+    #     lam = entry.get("lambda")
+    #     lam_str = f"  λ={lam:.1e}" if lam is not None else ""
+    #     it = entry.get("iters")
+    #     it_str = f"  iters={it}" if it is not None else ""
+    #     print(
+    #         f"[{tag}SW-CCM:{name}] feat={entry['feat_dim']}  "
+    #         f"pairs={entry['n_pairs']}{lam_str}{it_str}{de_str}"
+    #     )
 
 
 # --------------------------------------------------------------------------
@@ -1258,16 +1261,10 @@ def manual_match_neutral(
         debug["kr_sw"] = kr_sw
         debug["kb_sw"] = kb_sw
         debug["_sw_neutral_n"] = total_px
-        print(
-            f"[solver SW-WB LSQ] {len(all_pairs_for_sw)} pair(s), "
-            f"{total_px} px → alpha={alpha_sw:.4f}  "
-            f"kr_sw={kr_sw:.4f}  kb_sw={kb_sw:.4f}"
-        )
+        # [solver SW-WB LSQ] — suppressed (CCM no longer visualized)
+        # print(f"[solver SW-WB LSQ] {len(all_pairs_for_sw)} pair(s), ...")
     else:
-        print(
-            "[solver SW-WB LSQ] no usable pairs (all saturated/empty) — "
-            "kr/kb/exp left at identity"
-        )
+        pass  # no usable pairs — identity fallback (print suppressed)
 
     # CCM solve: needs ≥ 3 chromatic-distinct pairs. Falls back silently
     # to None (caller uses diag) when underdetermined.
@@ -1276,24 +1273,15 @@ def manual_match_neutral(
         M, n_pairs, ccm_px = ccm_sol
         debug["ccm_sw"] = M
         debug["_sw_ccm_pairs"] = n_pairs
-        print(
-            f"[solver SW-CCM LSQ] {n_pairs} pair(s), {ccm_px} px → 3x3 M:\n"
-            f"  R<- [{M[0,0]:+.3f} {M[0,1]:+.3f} {M[0,2]:+.3f}]\n"
-            f"  G<- [{M[1,0]:+.3f} {M[1,1]:+.3f} {M[1,2]:+.3f}]\n"
-            f"  B<- [{M[2,0]:+.3f} {M[2,1]:+.3f} {M[2,2]:+.3f}]"
-        )
-    else:
-        print(
-            f"[solver SW-CCM LSQ] not solvable (need ≥ 3 chromatic-distinct "
-            f"pairs; got {len(all_pairs_for_sw)}) — diag fallback in effect"
-        )
+        # [solver SW-CCM LSQ] — suppressed (CCM no longer visualized)
+    # else: diag fallback — not printed
 
     # All four variants (key 0/1/2/3 in calibrator GUI). The legacy
     # ``ccm_sw`` field above is kept as the linear-3x3 default for
     # backward compatibility.
     variants = _compute_ccm_variants(ref_bgr, cur_bgr, all_pairs_for_sw)
     debug["ccm_variants"] = variants
-    _log_ccm_variants(variants, prefix="neutral")
+    _log_ccm_variants(variants, prefix="neutral")  # no-op (prints disabled)
 
     if warnings:
         debug["_warning"] = ",".join(warnings)
@@ -1429,12 +1417,8 @@ def manual_match_ref(
                       (_KELVIN_DEFAULT_MIN, _KELVIN_DEFAULT_MAX)):
             warnings.append("kelvin_rail")
         debug["delta_kelvin"] = new_kelvin - cur_kelvin
-        print(
-            f"[solver REF WB] {len(box_pairs)} pair(s), {total_px} px → "
-            f"kr={kr_sw:.4f} kb={kb_sw:.4f}  "
-            f"K_anchor={K_anchor:.0f} K_obs={K_obs:.0f}  "
-            f"ΔK={delta_K:+.0f} → {cur_kelvin}+ΔK→{new_kelvin}K"
-        )
+        # [solver REF WB] — suppressed (CCM no longer visualized)
+        pass
     else:
         warnings.append("wb_underconstrained")
 
@@ -1547,10 +1531,7 @@ def manual_match_ref(
         new_sat = max(sat_lo, min(sat_hi, new_sat))
         debug["sat_ratio"] = sat_ratio
         debug["sat_source"] = "per_pair"
-        print(
-            f"[solver REF sat] per-pair({len(sat_ratios)}) "
-            f"ratio={sat_ratio:.3f} → {cur_sat}→{new_sat}"
-        )
+        # [solver REF sat] per-pair — suppressed
     else:
         # 0 or 1 usable pair → full-frame fallback (same as AUTO uses).
         # Single-pair chroma ratio is too noisy to trust; aggregate is
@@ -1569,10 +1550,7 @@ def manual_match_ref(
                 "full_frame_no_pairs" if not sat_ratios else "full_frame_single_pair"
             )
             warnings.append("sat_from_full_frame")
-            print(
-                f"[solver REF sat] full-frame ({debug['sat_source']}) "
-                f"ratio={sat_ratio:.3f} → {cur_sat}→{new_sat}"
-            )
+            # [solver REF sat] full-frame — suppressed
         else:
             new_sat = cur_sat
             debug["sat_ratio"] = None
@@ -1596,11 +1574,7 @@ def manual_match_ref(
             debug["con_y_spread_ref"] = spread_ref
             debug["con_y_spread_cur"] = spread_cur
             debug["con_source"] = "cross_pair_spread"
-            print(
-                f"[solver REF con] cross-pair({len(y_means_ref)}) "
-                f"spread {spread_cur:.1f}→{spread_ref:.1f} "
-                f"ratio={con_ratio:.3f} → {cur_con}→{new_con}"
-            )
+            # [solver REF con] cross-pair — suppressed
         else:
             # Patches all at similar brightness; fall through to full-frame.
             con_ratio = None
@@ -1619,11 +1593,7 @@ def manual_match_ref(
             debug["con_source"] = "full_frame_fallback"
             if "con_low_y_spread" in warnings:
                 warnings.append("con_from_full_frame")
-            print(
-                f"[solver REF con] full-frame fallback "
-                f"y_std {cur_y.y_std_excl_clip:.4f}→{ref_y.y_std_excl_clip:.4f} "
-                f"ratio={con_ratio:.3f} → {cur_con}→{new_con}"
-            )
+            # [solver REF con] full-frame fallback — suppressed
         else:
             new_con = cur_con
             debug["con_ratio"] = None
@@ -1651,15 +1621,10 @@ def manual_match_ref(
         M, n_pairs, ccm_px = ccm_sol
         debug["ccm_sw"] = M
         debug["_sw_ccm_pairs"] = n_pairs
-        print(
-            f"[solver SW-CCM LSQ] full+{n_pairs - 1} pair(s), {ccm_px} px → 3x3 M:\n"
-            f"  R<- [{M[0,0]:+.3f} {M[0,1]:+.3f} {M[0,2]:+.3f}]\n"
-            f"  G<- [{M[1,0]:+.3f} {M[1,1]:+.3f} {M[1,2]:+.3f}]\n"
-            f"  B<- [{M[2,0]:+.3f} {M[2,1]:+.3f} {M[2,2]:+.3f}]"
-        )
+        # [solver SW-CCM LSQ] full+N — suppressed
     variants = _compute_ccm_variants(ref_bgr, cur_bgr, ccm_pairs)
     debug["ccm_variants"] = variants
-    _log_ccm_variants(variants, prefix="ref")
+    _log_ccm_variants(variants, prefix="ref")  # no-op (prints disabled)
 
     if warnings:
         debug["_warning"] = ",".join(warnings)
@@ -1795,24 +1760,18 @@ def manual_match_patches(
         debug["kr_sw"] = kr_sw
         debug["kb_sw"] = kb_sw
         debug["_sw_neutral_n"] = total_px
-        print(
-            f"[solver SW-WB LSQ patches] {len(pairs_list)} pair(s), "
-            f"{total_px} px → alpha={alpha_sw:.4f}  "
-            f"kr_sw={kr_sw:.4f}  kb_sw={kb_sw:.4f}"
-        )
+        # [solver SW-WB LSQ patches] — suppressed
     ccm_sol = _solve_sw_ccm_lsq(ref_bgr, cur_bgr, pairs_list)
     if ccm_sol is not None:
         M, n_pairs, ccm_px = ccm_sol
         debug["ccm_sw"] = M
         debug["_sw_ccm_pairs"] = n_pairs
-        print(
-            f"[solver SW-CCM LSQ patches] {n_pairs} pair(s), {ccm_px} px → 3x3 M solved"
-        )
+        # [solver SW-CCM LSQ patches] — suppressed
 
     # All four variants for the GUI 0/1/2/3 toggle.
     variants = _compute_ccm_variants(ref_bgr, cur_bgr, pairs_list)
     debug["ccm_variants"] = variants
-    _log_ccm_variants(variants, prefix="patches")
+    _log_ccm_variants(variants, prefix="patches")  # no-op (prints disabled)
 
     if warnings:
         debug["_warning"] = ",".join(warnings)

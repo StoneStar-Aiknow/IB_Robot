@@ -73,7 +73,12 @@ _SLIDERS: tuple[tuple[str, str, int, int, int], ...] = (
     ("exposure",    "exposure",      1,  10000,  312),
     ("wb_kelvin",   "white_balance", 2000, 8000, 4600),
     ("gain",        "gain",          0,    255,    0),
-    ("brightness",  "brightness",    0,    255,  128),
+    # Hardware brightness is one signed constant pixel offset. HighGUI
+    # trackbars render signed ranges poorly across backends, so the UI
+    # presents it as two mutually exclusive 0..64 controls:
+    #   blacklevel  -> writes negative brightness
+    #   brightness  -> writes positive brightness
+    ("brightness",  "brightness",   -64,     64,    0),
     ("contrast",    "contrast",      0,    255,  128),
     ("saturation",  "saturation",    0,    255,  128),
     ("sharpness",   "sharpness",     0,    255,  128),
@@ -182,17 +187,13 @@ class RosBridge:
         with self._latest.lock:
             self._latest.frame = frame
             self._latest.stamp = now
-        # [PublishRate-debug] One-shot per-second arrival counter so we
-        # can tell whether usb_cam keeps publishing during AUTO color
-        # search. If this drops from ~30 Hz to a few Hz once search
-        # starts, the freeze is at the publisher (V4L2 ioctl
-        # contention), not in our GUI thread.
-        st = self.__dict__.setdefault("_rate_state", {"t": now, "n": 0})
-        st["n"] += 1
-        if now - st["t"] >= 1.0:
-            print(f"[PublishRate] {st['n']} fps", flush=True)
-            st["t"] = now
-            st["n"] = 0
+        # [PublishRate-debug] commented out — was spamming terminal every second.
+        # st = self.__dict__.setdefault("_rate_state", {"t": now, "n": 0})
+        # st["n"] += 1
+        # if now - st["t"] >= 1.0:
+        #     print(f"[PublishRate] {st['n']} fps", flush=True)
+        #     st["t"] = now
+        #     st["n"] = 0
 
     @staticmethod
     def _decode(msg) -> np.ndarray | None:
@@ -322,6 +323,10 @@ class RosBridge:
             self._spin_thread.join(timeout=1.0)
         try:
             self._node.destroy_node()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._rclpy.shutdown()
         except Exception:  # noqa: BLE001
             pass
 
@@ -520,7 +525,17 @@ class CalibratorWindow:
         self._auto_thread: threading.Thread | None = None
         self._dirty_save = False
         self._compute_progress = (0, 0)
+        self._last_pedestal_delta: int | None = None
+        self._last_pedestal_used: str = ""
         self._stop_render = False
+
+        # Reference image display rotation (degrees CW: 0 / 90 / 180 / 270).
+        # Only affects display and user-facing selectROI; self._reference
+        # is always the original unrotated image for solver accuracy.
+        self._ref_rotation: int = 0
+        # Canvas-space bounding rect of the [R] rotate button, updated each
+        # _render() call.  None until the first render.
+        self._ref_rot_btn_rect: tuple[int, int, int, int] | None = None
 
         # SW-ISP debug pane state.
         # `_sw_isp` mirrors whatever the last solver call recommended, in
@@ -715,8 +730,27 @@ class CalibratorWindow:
             if key == "exposure" and exp_ui_cap is not None:
                 hi = min(hi, exp_ui_cap)
             self._slider_range[key] = (lo, hi)
-            value = self._pending.get(key, lo)
-            value = max(lo, min(hi, value))
+            if key == "brightness":
+                signed_bri = self._brightness_param_to_signed(
+                    int(self._pending.get(key, 0)),
+                )
+                blacklevel_value = max(0, -signed_bri)
+                brightness_value = max(0, signed_bri)
+                cv.createTrackbar(
+                    "blacklevel", self.WINDOW_NAME,
+                    int(blacklevel_value), 64,
+                    self._make_brightness_split_cb("blacklevel"),
+                )
+                cv.createTrackbar(
+                    "brightness", self.WINDOW_NAME,
+                    int(brightness_value), 64,
+                    self._make_brightness_split_cb("brightness"),
+                )
+                continue
+            ui_lo, ui_hi = self._slider_ui_range(key, lo, hi)
+            value_raw = self._pending.get(key, lo)
+            value = self._param_to_slider_value(key, int(value_raw), lo, hi)
+            value = max(ui_lo, min(ui_hi, value))
             # Clamp _applied / _pending for exposure so the slider
             # snapshot is consistent and the next AUTO sees the same
             # current_exp the user does. We also push the clamped
@@ -726,7 +760,7 @@ class CalibratorWindow:
                 if isinstance(applied_exp, int) and applied_exp > hi:
                     self._applied["exposure"] = hi
                     self._pending["exposure"] = hi
-                    value = hi
+                    value = self._param_to_slider_value(key, hi, lo, hi)
                     # Best-effort write — it's fine if it fails because
                     # the driver hasn't engaged manual mode yet; the
                     # next AUTO run will re-clamp.
@@ -735,9 +769,64 @@ class CalibratorWindow:
                     except Exception:  # noqa: BLE001
                         pass
             cv.createTrackbar(
-                label, self.WINDOW_NAME, value, hi,
+                label, self.WINDOW_NAME, max(0, value), max(0, ui_hi),
                 self._make_trackbar_cb(key, lo, hi),
             )
+        cv.setMouseCallback(self.WINDOW_NAME, self._on_main_mouse)
+
+    def _slider_ui_range(self, key: str, lo: int, hi: int) -> tuple[int, int]:
+        if key != "brightness":
+            return int(lo), int(hi)
+        return 0, 64
+
+    def _brightness_is_signed_control(self) -> bool:
+        _bri_default, bri_min, bri_max = self._bri_default_minmax()
+        return int(bri_min) < 0 < int(bri_max)
+
+    def _brightness_param_to_signed(self, value: int) -> int:
+        if self._brightness_is_signed_control():
+            return max(-64, min(64, int(value)))
+        bri_default, _bri_min, _bri_max = self._bri_default_minmax()
+        return max(-64, min(64, int(value) - int(bri_default)))
+
+    def _brightness_signed_to_param(self, signed_value: int) -> int:
+        signed_value = max(-64, min(64, int(signed_value)))
+        bri_default, bri_min, bri_max = self._bri_default_minmax()
+        if self._brightness_is_signed_control():
+            return max(bri_min, min(bri_max, signed_value))
+        return max(bri_min, min(bri_max, int(bri_default) + signed_value))
+
+    def _param_to_slider_value(self, key: str, value: int, lo: int, hi: int) -> int:
+        if key != "brightness":
+            return max(int(lo), min(int(hi), int(value)))
+        return abs(self._brightness_param_to_signed(int(value)))
+
+    def _slider_value_to_param(self, key: str, value: int, lo: int, hi: int) -> int:
+        if key != "brightness":
+            return max(int(lo), min(int(hi), int(value)))
+        return self._brightness_signed_to_param(int(value))
+
+    def _make_brightness_split_cb(self, kind: str):
+        def cb(val: int) -> None:
+            if self._mode != "IDLE" or self._suppress_cb:
+                return
+            magnitude = max(0, min(64, int(val)))
+            signed_value = -magnitude if kind == "blacklevel" else magnitude
+            opposite = "brightness" if kind == "blacklevel" else "blacklevel"
+            if magnitude > 0:
+                self._suppress_cb = True
+                try:
+                    self._opencv.setTrackbarPos(opposite, self.WINDOW_NAME, 0)
+                except Exception:  # noqa: BLE001
+                    pass
+                finally:
+                    self._suppress_cb = False
+            self._pending["brightness"] = self._brightness_signed_to_param(
+                signed_value,
+            )
+            self._last_change["brightness"] = time.monotonic()
+            self._dirty_save = True
+        return cb
 
     def _make_trackbar_cb(self, key: str, lo: int, hi: int):
         def cb(val: int) -> None:
@@ -752,7 +841,7 @@ class CalibratorWindow:
                 # otherwise reset/sync would round-trip into _pending and
                 # clobber the value we just restored.
                 return
-            self._pending[key] = max(lo, min(hi, val))
+            self._pending[key] = self._slider_value_to_param(key, val, lo, hi)
             self._last_change[key] = time.monotonic()
             self._dirty_save = True
         return cb
@@ -766,12 +855,44 @@ class CalibratorWindow:
         self._banner_until = time.monotonic() + duration
 
     # ------------------------------------------------------------------
+    # Main-window mouse callback
+    # ------------------------------------------------------------------
+
+    def _on_main_mouse(
+        self,
+        event: int,
+        x: int,
+        y: int,
+        _flags: int,
+        _userdata: object,
+    ) -> None:
+        """Handle left-clicks on the [R] rotate button in the ref pane."""
+        if event != self._opencv.EVENT_LBUTTONDOWN:
+            return
+        btn = self._ref_rot_btn_rect
+        if btn is None:
+            return
+        if btn[0] <= x <= btn[2] and btn[1] <= y <= btn[3]:
+            self._ref_rotation = (self._ref_rotation + 90) % 360
+            if self._roi_pairs:
+                self._roi_pairs = []
+                self._notify(
+                    f"Ref rotated to {self._ref_rotation}deg — ROI pairs cleared",
+                    YELLOW, 3.0,
+                )
+            else:
+                self._notify(
+                    f"Ref rotated to {self._ref_rotation}deg",
+                    WHITE, 2.0,
+                )
+
+    # ------------------------------------------------------------------
     # Render
     # ------------------------------------------------------------------
 
     def _render(self, live: np.ndarray | None, live_stale: bool) -> np.ndarray:
         cv = self._opencv
-        ref = self._reference
+        ref = self._get_rotated_ref()
 
         # Resize live to reference height for side-by-side.
         target_h = 480
@@ -833,6 +954,29 @@ class CalibratorWindow:
         # Labels under each pane.
         cv.putText(canvas, "REFERENCE", (10, target_h + 25),
                    cv.FONT_HERSHEY_SIMPLEX, 0.6, WHITE, 2)
+        # [R] rotate-90 button — bottom-right corner of the ref pane.
+        rot_label = f"[R{self._ref_rotation}]"
+        (rtw, rth), _ = cv.getTextSize(
+            rot_label, cv.FONT_HERSHEY_SIMPLEX, 0.5, 1,
+        )
+        btn_x = ref_view.shape[1] - rtw - 10
+        btn_y_top = target_h + 4
+        btn_y_bot = target_h + 4 + rth + 8
+        cv.rectangle(
+            canvas,
+            (btn_x - 4, btn_y_top),
+            (btn_x + rtw + 4, btn_y_bot),
+            (70, 70, 70), -1,
+        )
+        cv.putText(
+            canvas, rot_label,
+            (btn_x, btn_y_bot - 4),
+            cv.FONT_HERSHEY_SIMPLEX, 0.5, YELLOW, 1, cv.LINE_AA,
+        )
+        self._ref_rot_btn_rect = (
+            btn_x - 4, btn_y_top,
+            btn_x + rtw + 4, btn_y_bot,
+        )
         live_label = "LIVE  (stale!)" if live_stale else "LIVE"
         if self._sw_only:
             live_label += "  [hw frozen]"
@@ -935,6 +1079,38 @@ class CalibratorWindow:
             cv.putText(canvas, f"{label}={v}",
                        (params_x, 30 + i * 24),
                        cv.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1)
+        bri_raw = self._applied.get("brightness")
+        try:
+            if bri_raw is None:
+                bri_text = "brightness d=?"
+            elif self._brightness_is_signed_control():
+                bri_text = f"brightness d={int(bri_raw)}"
+            else:
+                bri_default, _bri_min, _bri_max = self._bri_default_minmax()
+                bri_text = f"brightness d={int(bri_raw) - int(bri_default)}"
+        except (TypeError, ValueError):
+            bri_text = "brightness d=?"
+        cv.putText(canvas, bri_text,
+                   (params_x, 30 + 3 * 24),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1)
+        # Pedestal HUD shows the last *estimated* signed d, not the raw
+        # brightness register offset. This avoids confusing a user-set
+        # or driver-restored raw value (e.g. 0) with the estimator's
+        # bounded output (auto d is clamped to [-15, 0]).
+        ped_delta = self._last_pedestal_delta
+        ped_used = self._last_pedestal_used
+        if ped_delta is None:
+            ped_text = "ped d=--"
+            ped_color = GREY
+        else:
+            sign = "+" if ped_delta > 0 else ""
+            ped_text = f"ped d={sign}{ped_delta}"
+            if ped_used:
+                ped_text += f" ({ped_used})"
+            ped_color = WHITE if ped_delta == 0 else YELLOW
+        cv.putText(canvas, ped_text,
+                   (params_x, 30 + 4 * 24),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.55, ped_color, 1)
 
         # Bottom status bar.
         bar_y = target_h + 50
@@ -942,10 +1118,16 @@ class CalibratorWindow:
         save_color = YELLOW if self._dirty_save else GREY
         cv.putText(canvas, save_marker, (10, bar_y + 18),
                    cv.FONT_HERSHEY_SIMPLEX, 0.55, save_color, 1)
-        keys_text = (
-            "[a] Auto  [m] Manual  [s] Save  [r] Reset  "
-            "[p] Snap  [?] Help  [q] Quit"
-        )
+        if self._colorchecker_mode:
+            keys_text = (
+                "[m] ColorChecker wizard  [s] Save  [r] Reset  [p] Snap  [q] Quit  "
+                "| TIP: set exposure/gain/WB to taste BEFORE pressing [m]"
+            )
+        else:
+            keys_text = (
+                "[a] Auto  [m] Manual  [s] Save  [r] Reset  "
+                "[p] Snap  [?] Help  [q] Quit"
+            )
         cv.putText(canvas, keys_text, (170, bar_y + 18),
                    cv.FONT_HERSHEY_SIMPLEX, 0.5, WHITE, 1)
 
@@ -973,7 +1155,8 @@ class CalibratorWindow:
         scale = target_h / float(h)
         new_w = max(1, int(round(w * scale)))
         import cv2 as _cv2
-        return _cv2.resize(img, (new_w, target_h))
+        interp = _cv2.INTER_AREA if scale < 1.0 else _cv2.INTER_LINEAR
+        return _cv2.resize(img, (new_w, target_h), interpolation=interp)
 
     @staticmethod
     def _placeholder(h: int, text: str) -> np.ndarray:
@@ -983,6 +1166,98 @@ class CalibratorWindow:
         _cv2.putText(img, text, ((img.shape[1] - tw) // 2, h // 2),
                      _cv2.FONT_HERSHEY_SIMPLEX, 0.7, YELLOW, 2)
         return img
+
+    # ------------------------------------------------------------------
+    # Reference rotation helpers
+    # ------------------------------------------------------------------
+
+    def _get_rotated_ref(self) -> np.ndarray:
+        """Return self._reference rotated by self._ref_rotation degrees CW."""
+        import cv2 as _cv2
+        rot = self._ref_rotation % 360
+        if rot == 0:
+            return self._reference
+        if rot == 90:
+            return _cv2.rotate(self._reference, _cv2.ROTATE_90_CLOCKWISE)
+        if rot == 180:
+            return _cv2.rotate(self._reference, _cv2.ROTATE_180)
+        return _cv2.rotate(self._reference, _cv2.ROTATE_90_COUNTERCLOCKWISE)
+
+    def _rotate_box(
+        self,
+        box: tuple[int, int, int, int],
+        orig_hw: tuple[int, int],
+    ) -> tuple[int, int, int, int]:
+        """Map a box from original-image coords to rotated-display coords."""
+        x1, y1, x2, y2 = box
+        H, W = orig_hw
+        rot = self._ref_rotation % 360
+        if rot == 0:
+            return box
+        if rot == 90:
+            # rotated image size: (W, H) — new_h=W, new_w=H
+            nx1, ny1, nx2, ny2 = H - 1 - y2, x1, H - 1 - y1, x2
+            rH, rW = W, H
+        elif rot == 180:
+            nx1, ny1, nx2, ny2 = W - 1 - x2, H - 1 - y2, W - 1 - x1, H - 1 - y1
+            rH, rW = H, W
+        else:  # 270
+            # rotated image size: (W, H) — new_h=W, new_w=H
+            nx1, ny1, nx2, ny2 = y1, W - 1 - x2, y2, W - 1 - x1
+            rH, rW = W, H
+        return (
+            max(0, min(rW - 1, nx1)),
+            max(0, min(rH - 1, ny1)),
+            max(0, min(rW - 1, nx2)),
+            max(0, min(rH - 1, ny2)),
+        )
+
+    def _unrotate_box(
+        self,
+        box: tuple[int, int, int, int],
+        orig_hw: tuple[int, int],
+    ) -> tuple[int, int, int, int]:
+        """Map a box from rotated-display coords back to original-image coords."""
+        x1, y1, x2, y2 = box
+        H, W = orig_hw
+        rot = self._ref_rotation % 360
+        if rot == 0:
+            return box
+        if rot == 90:
+            # inverse of 90 CW: x_orig=y_rot, y_orig=H-1-x_rot
+            nx1, ny1, nx2, ny2 = y1, H - 1 - x2, y2, H - 1 - x1
+        elif rot == 180:
+            nx1, ny1, nx2, ny2 = W - 1 - x2, H - 1 - y2, W - 1 - x1, H - 1 - y1
+        else:  # 270
+            # inverse of 270 CW: x_orig=W-1-y_rot, y_orig=x_rot
+            nx1, ny1, nx2, ny2 = W - 1 - y2, x1, W - 1 - y1, x2
+        return (
+            max(0, min(W - 1, nx1)),
+            max(0, min(H - 1, ny1)),
+            max(0, min(W - 1, nx2)),
+            max(0, min(H - 1, ny2)),
+        )
+
+    @staticmethod
+    def _fit_for_roi(
+        img: np.ndarray,
+        max_h: int = 900,
+        max_w: int = 1400,
+    ) -> tuple[np.ndarray, float]:
+        """Scale *img* to fit within max_h × max_w, preserving aspect ratio.
+
+        Returns ``(scaled_img, scale)`` where ``scale <= 1``.  Callers
+        multiply back by ``1/scale`` to recover native-pixel coordinates
+        from the display-space ROI returned by ``cv.selectROI``.
+        """
+        import cv2 as _cv2
+        h, w = img.shape[:2]
+        scale = min(max_h / float(h), max_w / float(w), 1.0)
+        if scale >= 1.0:
+            return img, 1.0
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        return _cv2.resize(img, (new_w, new_h), interpolation=_cv2.INTER_AREA), scale
 
     # ------------------------------------------------------------------
     # Debounced apply + sync trackbars to applied state
@@ -1030,12 +1305,32 @@ class CalibratorWindow:
                 if v is None:
                     continue
                 lo, hi = self._slider_range.get(key, (_lo, _hi))
-                v = max(lo, min(hi, int(v)))
+                if key == "brightness":
+                    signed_bri = self._brightness_param_to_signed(int(v))
+                    blacklevel_value = max(0, -signed_bri)
+                    brightness_value = max(0, signed_bri)
+                    try:
+                        cv.setTrackbarPos(
+                            "blacklevel", self.WINDOW_NAME,
+                            int(blacklevel_value),
+                        )
+                        cv.setTrackbarPos(
+                            "brightness", self.WINDOW_NAME,
+                            int(brightness_value),
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    self._pending[key] = int(v)
+                    self._last_change.pop(key, None)
+                    continue
+                ui_lo, ui_hi = self._slider_ui_range(key, lo, hi)
+                ui_v = self._param_to_slider_value(key, int(v), lo, hi)
+                ui_v = max(ui_lo, min(ui_hi, ui_v))
                 try:
-                    cv.setTrackbarPos(label, self.WINDOW_NAME, v)
+                    cv.setTrackbarPos(label, self.WINDOW_NAME, ui_v)
                 except Exception:  # noqa: BLE001
                     pass
-                self._pending[key] = v
+                self._pending[key] = int(v)
                 # Clear the debounce timer so the next render won't think the
                 # user just changed this slider.
                 self._last_change.pop(key, None)
@@ -1176,7 +1471,7 @@ class CalibratorWindow:
             scale = max_w / annotated.shape[1]
             new_w = int(round(annotated.shape[1] * scale))
             new_h = int(round(annotated.shape[0] * scale))
-            annotated = cv.resize(annotated, (new_w, new_h))
+            annotated = cv.resize(annotated, (new_w, new_h), interpolation=cv.INTER_AREA)
         h_ann, w_ann = annotated.shape[:2]
         footer_h = 70
         canvas = np.full((h_ann + footer_h, w_ann, 3), 30, dtype=np.uint8)
@@ -1265,7 +1560,8 @@ class CalibratorWindow:
         def _fit_h(img: np.ndarray, h: int) -> np.ndarray:
             scale = h / float(img.shape[0])
             new_w = max(1, int(round(img.shape[1] * scale)))
-            return cv.resize(img, (new_w, h))
+            interp = cv.INTER_AREA if scale < 1.0 else cv.INTER_LINEAR
+            return cv.resize(img, (new_w, h), interpolation=interp)
 
         t_view = _fit_h(target, target_h)
         p_h = max(1, int(round(target_h * preview_scale)))
@@ -1324,9 +1620,11 @@ class CalibratorWindow:
         def _fit_h(img: np.ndarray) -> tuple[np.ndarray, float]:
             h, _w = img.shape[:2]
             scale = target_h / float(h)
+            interp = cv.INTER_AREA if scale < 1.0 else cv.INTER_LINEAR
             return cv.resize(
                 img,
                 (max(1, int(round(img.shape[1] * scale))), target_h),
+                interpolation=interp,
             ), scale
 
         ref_view, ref_scale = _fit_h(ref_ann)
@@ -1483,17 +1781,9 @@ class CalibratorWindow:
         self._sw_isp_neutral_n = n_neutral
         self._sw_isp_ref_saturated = ref_sat
         self._sw_isp_ccm_pairs = ccm_pairs
-        # Console debug: always print so the user can verify the linear-domain
-        # math even when the pane looks unchanged (kr≈1 means WB already correct).
-        mode_tag = "CCM" if ccm_arr is not None else "diag"
-        print(
-            f"[SW-ISP] solver dbg → mode={mode_tag}  "
-            f"kr_sw={kr:.4f}  kb_sw={kb:.4f}  exp_scale_sw={exp:.4f}"
-            + (f"  ccm_pairs={ccm_pairs}" if ccm_arr is not None else "")
-            + (f"  neutral_px={n_neutral}" if n_neutral else "  NO neutral boxes!")
-            + ("  REF_SATURATED" if ref_sat else "")
-            + (f"  _warning={dbg['_warning']}" if "_warning" in dbg else "")
-        )
+        # [SW-ISP] solver dbg — suppressed (CCM no longer visualized)
+        # mode_tag = "CCM" if ccm_arr is not None else "diag"
+        # print(f"[SW-ISP] solver dbg → mode={mode_tag} ...")
 
         # Cache all four CCM variants and re-apply whichever the user has
         # currently selected (key '0' / '1' / '2' / '3'). On first call this
@@ -1579,8 +1869,8 @@ class CalibratorWindow:
                 self._notify(note, YELLOW, 2.5)
             else:
                 self._notify(note, GREEN, 2.5)
-        # Console echo regardless of notify, so power-users always see it.
-        print(f"[SW-ISP] applied variant={chosen}  M.shape={M.shape}")
+        # [SW-ISP] applied variant — suppressed
+        # print(f"[SW-ISP] applied variant={chosen}  M.shape={M.shape}")
 
     def _toggle_sw_only(self) -> None:
         self._sw_only = not self._sw_only
@@ -1593,6 +1883,30 @@ class CalibratorWindow:
         else:
             self._notify("SW-only mode OFF  (hardware writes resumed)",
                          GREEN, 3.0)
+
+    def _zero_brightness_for_calibration(self) -> None:
+        """Write brightness=default at the very start of any calibration run.
+
+        Ensures the pipeline, color search, and solver all operate from a
+        neutral baseline before the pedestal stage refines the offset.
+        No-op if brightness is already at the device default or if the
+        instance is not fully initialised (e.g. in unit tests).
+        """
+        if not hasattr(self, "_applied"):
+            return
+        bri_default, _, _ = self._bri_default_minmax()
+        cur_bri = int(self._applied.get("brightness", bri_default))
+        if cur_bri == bri_default:
+            return
+        print(
+            f"[Pedestal] pre-calibration: zeroing brightness "
+            f"{cur_bri} -> {bri_default}", flush=True,
+        )
+        ok, _err = self._apply_via_v4l2_or_ros({"brightness": bri_default})
+        if ok:
+            self._applied["brightness"] = bri_default
+            self._sync_trackbars_to_applied()
+        time.sleep(0.25)  # allow camera to settle
 
     def _run_auto(self) -> None:
         """4-stage hardware ISP calibration (plan v2 §2).
@@ -1635,6 +1949,7 @@ class CalibratorWindow:
             )
             self._mode = "IDLE"
             return
+        self._zero_brightness_for_calibration()
         try:
             self._run_auto_pipeline()
         except Exception as exc:  # noqa: BLE001
@@ -1651,6 +1966,14 @@ class CalibratorWindow:
         # writes) and ColorChecker24 mode (uses dedicated wizard).
         if self._sw_only or self._colorchecker_mode:
             return
+        # Pedestal SSOT: estimate signed Δ against the reference and
+        # write it to ``brightness`` BEFORE color search so K/C/Sat
+        # converge on the corrected dark level (otherwise the search
+        # spends evals fighting a constant offset).
+        try:
+            self._run_pedestal_stage(mode="ref")
+        except Exception as exc:  # noqa: BLE001
+            self._notify(f"Auto: pedestal failed: {exc}", YELLOW, 4.0)
         try:
             self._run_color_search()
         except Exception as exc:  # noqa: BLE001
@@ -1977,12 +2300,10 @@ class CalibratorWindow:
         v4l2_msg = ""
         if device and resolved and _v4l2.have_v4l2_ctl() and v4l2_payload:
             v4l2_ok, v4l2_msg = _v4l2.apply_params(device, resolved, v4l2_payload)
-            # [WriteTrace] tag every actual hardware write so we can tell
-            # whether color search is reaching the device or being
-            # silently filtered by write-diff / clipping.
-            tag = "OK" if v4l2_ok else f"FAIL:{v4l2_msg}"
-            print(f"[WriteTrace] v4l2 mode={self._mode} payload={v4l2_payload} {tag}",
-                  flush=True)
+            # [WriteTrace] commented out — fires on every V4L2 write, too noisy.
+            # tag = "OK" if v4l2_ok else f"FAIL:{v4l2_msg}"
+            # print(f"[WriteTrace] v4l2 mode={self._mode} payload={v4l2_payload} {tag}",
+            #       flush=True)
             if v4l2_ok:
                 # Don't re-send via ROS — driver already has them.
                 v4l2_payload = {}
@@ -2218,6 +2539,13 @@ class CalibratorWindow:
         # with _run_color_search; in cc24 mode we go through the same
         # search infrastructure but with cost_24card.
         try:
+            # Pedestal SSOT: cc24 has no full reference image to
+            # compare against, so use the auto (live-only) estimator.
+            # Δ stays clamped ≤ 0 — cc24 only ever subtracts pedestal.
+            self._run_pedestal_stage(mode="auto")
+        except Exception as exc:  # noqa: BLE001
+            self._notify(f"cc24: pedestal failed: {exc}", YELLOW, 4.0)
+        try:
             self._cc24_search = {
                 "boxes": list(boxes),
                 "ref_indices": list(ref_indices),
@@ -2302,6 +2630,367 @@ class CalibratorWindow:
         finally:
             self._reference = saved_ref
             self._roi_pairs = saved_pairs
+
+    # ------------------------------------------------------------------
+    # Pedestal (signed-Δ ``brightness``) stage — runs BEFORE color search
+    # ------------------------------------------------------------------
+
+    def _bri_default_minmax(self) -> tuple[int, int, int]:
+        """Resolve (default, min, max) for the ``brightness`` register.
+
+        Falls back to the ``_SLIDERS`` baseline when the device caps
+        haven't been probed yet — the pedestal stage must still be
+        able to compose a valid register write.
+        """
+        builtin = next(
+            ((d, lo, hi) for _, k, lo, hi, d in _SLIDERS if k == "brightness"),
+            (128, 0, 255),
+        )
+        cap = (getattr(self, "_device_caps", {}) or {}).get("brightness")
+        if cap is None:
+            return builtin
+        return (
+            int(cap.get("default", builtin[0])),
+            int(cap.get("min", builtin[1])),
+            int(cap.get("max", builtin[2])),
+        )
+
+    def _run_pedestal_stage(
+        self,
+        *,
+        mode: str,
+        ref_box: tuple[int, int, int, int] | None = None,
+        live_box: tuple[int, int, int, int] | None = None,
+        ref_pair_idx: int | None = None,
+        announce: bool = True,
+    ) -> "DarkLevelEstimate | None":  # noqa: F821
+        """Estimate + apply the signed-Δ pedestal offset.
+
+        Args:
+            mode: One of ``"auto"`` (cc24 / no reference), ``"ref"``
+                (full-frame ref-vs-live), ``"manual"`` (user nominated
+                a black patch on both ref and live). The selector is
+                explicit so a future mode (e.g. dark-frame capture)
+                can be added without regressing the existing paths.
+            ref_box: REF-frame XYXY box in REF native pixels — only
+                used when ``mode == "manual"``.
+            live_box: LIVE-frame XYXY box in live native pixels —
+                only used when ``mode == "manual"``.
+            ref_pair_idx: When the user reused an existing ROI pair
+                as the black reference, pass its index (0-based) so
+                we can resolve both boxes from ``self._roi_pairs`` —
+                this skips the modal selection in m-mode.
+            announce: When ``True`` the stage publishes a banner /
+                ``_notify`` summarising the chosen Δ. Set ``False``
+                when the caller wants to suppress UI noise (e.g.
+                tests).
+
+        Returns the :class:`DarkLevelEstimate` for downstream logging,
+        or ``None`` when the stage is skipped (no live frame, etc.).
+        """
+        from dataset_tools.camera_isp.pedestal import (
+            apply_pedestal_offset,
+            estimate_pedestal_offset_auto,
+            estimate_pedestal_offset_manual,
+            estimate_pedestal_offset_ref_mode,
+        )
+
+        live, stamp = self._bridge.latest_frame()
+        if live is None or time.monotonic() - stamp > 1.0:
+            self._notify("Pedestal: no live frame", YELLOW, 3.0)
+            return None
+
+        bri_default, bri_min, bri_max = self._bri_default_minmax()
+        cur_bri = int(self._applied.get("brightness", bri_default))
+
+        # Zero brightness before sampling so that gain*pedestal compound
+        # error is eliminated.  Write bri_default (= offset-zero) to the
+        # hardware, settle for one exposure cycle, then re-grab a fresh
+        # live frame with a known neutral starting point.
+        if cur_bri != bri_default:
+            print(
+                f"[Pedestal] zeroing brightness {cur_bri} -> {bri_default}"
+                f" before sampling", flush=True,
+            )
+            ok_z, err_z = self._apply_via_v4l2_or_ros({"brightness": bri_default})
+            if ok_z:
+                self._applied["brightness"] = bri_default
+                cur_bri = bri_default
+            else:
+                print(
+                    f"[Pedestal] WARNING: brightness zero failed ({err_z});"
+                    f" sampling at bri={cur_bri}", flush=True,
+                )
+            time.sleep(0.25)  # one exposure settle
+            fresh, _ = self._bridge.latest_frame()
+            if fresh is None:
+                self._notify("Pedestal: lost live after brightness reset", YELLOW, 3.0)
+                return None
+            live = fresh
+
+        if mode == "ref":
+            ref_resized = self._resize_ref_to(live.shape)
+            est = estimate_pedestal_offset_ref_mode(live, ref_resized)
+        elif mode == "manual":
+            if ref_pair_idx is not None:
+                if 0 <= ref_pair_idx < len(self._roi_pairs):
+                    ref_box = self._roi_pairs[ref_pair_idx][0]
+                    live_box = self._roi_pairs[ref_pair_idx][1]
+                else:
+                    self._notify("Pedestal: bad pair index", YELLOW, 3.0)
+                    return None
+            if ref_box is None:
+                self._notify("Pedestal: no ref box", YELLOW, 3.0)
+                return None
+            if live_box is None:
+                self._notify("Pedestal: no live box", YELLOW, 3.0)
+                return None
+            ref_resized = self._resize_ref_to(live.shape)
+            # Scale ref_box to ref_resized's coordinate frame if the
+            # reference image was downscaled.
+            if ref_resized.shape != self._reference.shape:
+                sx = ref_resized.shape[1] / float(self._reference.shape[1])
+                sy = ref_resized.shape[0] / float(self._reference.shape[0])
+                ref_box = (
+                    int(ref_box[0] * sx), int(ref_box[1] * sy),
+                    int(ref_box[2] * sx), int(ref_box[3] * sy),
+                )
+            # live_box is already in live-frame pixel coordinates — no scaling.
+            est = estimate_pedestal_offset_manual(ref_resized, live, ref_box, live_box)
+        else:
+            # Default / cc24 path: scan the live frame.
+            est = estimate_pedestal_offset_auto(live)
+
+        new_bri = apply_pedestal_offset(est.delta, bri_default, bri_min, bri_max)
+
+        print(
+            f"[Pedestal] mode={mode}  used={est.used}  delta={est.delta:+d}\n"
+            f"           measured_y={est.measured_y:.2f}"
+            f"  dark_frac={est.dark_pixel_frac:.4f} ({est.n_dark_pixels} px)\n"
+            f"           confidence={est.confidence:.2f}  warn={est.warn!r}\n"
+            f"           bri_default={bri_default}  cur_bri={cur_bri}"
+            f"  -> new_bri={new_bri}",
+            flush=True,
+        )
+        self._last_pedestal_delta = int(est.delta)
+        self._last_pedestal_used = str(est.used)
+
+        if new_bri != cur_bri:
+            ok, err = self._apply_via_v4l2_or_ros({"brightness": int(new_bri)})
+            if ok:
+                self._applied["brightness"] = int(new_bri)
+                self._dirty_save = True
+            else:
+                self._notify(
+                    f"Pedestal: write failed ({err}); kept d=0",
+                    YELLOW, 4.0,
+                )
+                return est
+
+        if announce:
+            sign = "+" if est.delta > 0 else ""
+            head = f"Pedestal d={sign}{est.delta} ({est.used})"
+            if est.warn:
+                self._notify(f"{head} — {est.warn}", YELLOW, 6.0)
+            else:
+                colour = GREEN if est.delta != 0 else GREY
+                self._notify(head, colour, 3.0)
+        return est
+
+    def _run_pedestal_for_manual(
+        self,
+        ref_img: np.ndarray,
+        live_snap: np.ndarray,
+        pairs: list[tuple[tuple[int, int, int, int],
+                          tuple[int, int, int, int]]],
+    ) -> None:
+        """Three-branch pedestal prompt for the ``m`` workflow.
+
+        Layout:
+          ``[1..N]`` reuse pair #k as the black reference (digit key)
+          ``[n]``    pick a NEW box on REF only (no LIVE pair)
+          ``[s]``    skip → fall back to auto pedestal estimation
+
+        Default action = darkest existing pair (Enter). Implementation
+        notes:
+          * Numbered list capped at the 5 darkest pairs to keep the
+            modal readable when the user has many ROI pairs.
+          * The "n" branch reuses ``cv.selectROI`` on a fit-to-screen
+            REF canvas — the new box is **not** appended to ``pairs``
+            (pedestal metadata is intentionally orthogonal to K/C/Sat
+            search ROIs).
+          * Sanity warnings are non-blocking; the user-chosen Δ wins.
+        """
+        from dataset_tools.camera_isp.pedestal import darkest_pair_index
+
+        cv = self._opencv
+
+        # Pre-compute "darkest pair" suggestion so the modal can name
+        # it. Also rank all pairs by ref-Y so we can list at most 5.
+        if pairs:
+            ranked: list[tuple[int, float]] = []
+            for i, (rb, _) in enumerate(pairs):
+                x0, y0, x1, y1 = rb
+                x0 = max(0, min(int(x0), ref_img.shape[1]))
+                x1 = max(0, min(int(x1), ref_img.shape[1]))
+                y0 = max(0, min(int(y0), ref_img.shape[0]))
+                y1 = max(0, min(int(y1), ref_img.shape[0]))
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                crop = ref_img[y0:y1, x0:x1].astype(np.float64)
+                y_mean = float(
+                    0.114 * crop[..., 0].mean()
+                    + 0.587 * crop[..., 1].mean()
+                    + 0.299 * crop[..., 2].mean()
+                )
+                ranked.append((i, y_mean))
+            ranked.sort(key=lambda t: t[1])
+            shown = ranked[:5]
+            darkest_idx = shown[0][0] if shown else None
+        else:
+            shown = []
+            darkest_idx = darkest_pair_index(pairs, ref_img)  # → None
+
+        # Build the prompt window. We deliberately use a small,
+        # self-contained modal (not the main canvas) so the existing
+        # HUD discipline isn't disturbed; it auto-closes on key press.
+        win = "Pedestal: black reference?"
+        text_w = 620
+        thumb_max_w, thumb_max_h = 400, 300
+        # Build REF thumbnail with boxes highlighted and numbered.
+        rh, rw = ref_img.shape[:2]
+        scale = min(thumb_max_w / max(rw, 1), thumb_max_h / max(rh, 1), 1.0)
+        th, tw = max(1, int(rh * scale)), max(1, int(rw * scale))
+        import cv2 as _cv2_thumb
+        thumb = _cv2_thumb.resize(ref_img, (tw, th))
+        # Draw each ranked pair box on the thumbnail (white border, yellow for suggested).
+        _COLOURS = [(255, 255, 255)] * 10
+        for rank, (idx, _ym) in enumerate(shown):
+            rb, _ = pairs[idx]
+            bx0 = int(rb[0] * scale)
+            by0 = int(rb[1] * scale)
+            bx1 = int(rb[2] * scale)
+            by1 = int(rb[3] * scale)
+            col = (0, 200, 255) if idx == darkest_idx else (200, 200, 200)
+            cv.rectangle(thumb, (bx0, by0), (bx1, by1), col, 2)
+            cv.putText(thumb, str(idx + 1), (bx0 + 3, by0 + 18),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
+        canvas_h = max(th, max(180, 90 + 24 * (len(shown) + 2)))
+        canvas_w = text_w + tw + 8
+        canvas = np.full((canvas_h, canvas_w, 3), 30, dtype=np.uint8)
+        # Paste thumbnail on the right.
+        canvas[:th, text_w + 4:text_w + 4 + tw] = thumb
+        cv.putText(canvas, "Reference looks washed?",
+                   (10, 32), cv.FONT_HERSHEY_SIMPLEX, 0.7, WHITE, 2)
+        y_line = 64
+        for rank, (idx, y_mean) in enumerate(shown):
+            tag = f"[{idx + 1}] reuse pair #{idx + 1}  (ref Y={y_mean:.0f})"
+            color = YELLOW if idx == darkest_idx else WHITE
+            if idx == darkest_idx:
+                tag += "   <- suggested (Enter)"
+            cv.putText(canvas, tag, (16, y_line),
+                       cv.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+            y_line += 24
+        cv.putText(canvas, "[n] pick a NEW black box on REF",
+                   (16, y_line), cv.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1)
+        y_line += 24
+        cv.putText(canvas, "[s] skip - use auto pedestal estimation",
+                   (16, y_line), cv.FONT_HERSHEY_SIMPLEX, 0.55, GREY, 1)
+        cv.imshow(win, canvas)
+
+        # Accept digits 1..N (only those listed), n / s, Enter, Esc.
+        listed_digits = {ord(str(idx + 1)) for idx, _ in shown}
+        chosen: str | None = None
+        chosen_idx: int | None = None
+        while chosen is None:
+            k = cv.waitKey(50) & 0xFF
+            if k == 0xFF:
+                continue
+            if k == 27:  # Esc → skip silently
+                chosen = "skip_silent"
+                break
+            if k in (13, 10):  # Enter → darkest pair, or skip if no pairs
+                if darkest_idx is not None:
+                    chosen = "reuse"
+                    chosen_idx = darkest_idx
+                else:
+                    chosen = "skip"
+                break
+            if k in (ord("s"), ord("S")):
+                chosen = "skip"
+                break
+            if k in (ord("n"), ord("N")):
+                chosen = "new"
+                break
+            if k in listed_digits:
+                chosen = "reuse"
+                chosen_idx = int(chr(k)) - 1
+                break
+
+        try:
+            cv.destroyWindow(win)
+        except Exception:  # noqa: BLE001
+            pass
+
+        if chosen == "skip_silent":
+            return
+        if chosen == "skip":
+            self._run_pedestal_stage(mode="ref")
+            return
+        if chosen == "reuse" and chosen_idx is not None:
+            self._run_pedestal_stage(mode="manual", ref_pair_idx=chosen_idx)
+            return
+        if chosen == "new":
+            # Two-window REF+LIVE selection. The user picks a black box
+            # on the ref first, then a matching black box on the live.
+            # Neither box enters ``pairs``; pedestal metadata is
+            # intentionally orthogonal to K/C/Sat search ROIs.
+            new_win = "Pedestal: drag a black box on REF"
+            disp_ref, roi_scale = self._fit_for_roi(ref_img)
+            sel = cv.selectROI(new_win, disp_ref,
+                               showCrosshair=True, fromCenter=False)
+            try:
+                cv.destroyWindow(new_win)
+            except Exception:  # noqa: BLE001
+                pass
+            if sel is None:
+                return
+            sx, sy, sw, sh = (int(sel[0]), int(sel[1]),
+                              int(sel[2]), int(sel[3]))
+            if sw < 4 or sh < 4:
+                self._notify("Pedestal: ref box too small; skipped", YELLOW, 3.0)
+                return
+            # Scale back to full-size rotated-ref coords, then unrotate.
+            inv = 1.0 / max(roi_scale, 1e-9)
+            rot_box = (
+                int(round(sx * inv)), int(round(sy * inv)),
+                int(round((sx + sw) * inv)), int(round((sy + sh) * inv)),
+            )
+            ref_box = self._unrotate_box(rot_box, self._reference.shape[:2])
+
+            # Second window: pick the matching black box on the live frame.
+            live_win = "Pedestal: drag a black box on LIVE"
+            disp_live, live_roi_scale = self._fit_for_roi(live_snap)
+            lsel = cv.selectROI(live_win, disp_live,
+                                showCrosshair=True, fromCenter=False)
+            try:
+                cv.destroyWindow(live_win)
+            except Exception:  # noqa: BLE001
+                pass
+            if lsel is None:
+                return
+            lx, ly, lw, lh = (int(lsel[0]), int(lsel[1]),
+                               int(lsel[2]), int(lsel[3]))
+            if lw < 4 or lh < 4:
+                self._notify("Pedestal: live box too small; skipped", YELLOW, 3.0)
+                return
+            linv = 1.0 / max(live_roi_scale, 1e-9)
+            live_box: tuple[int, int, int, int] = (
+                int(round(lx * linv)), int(round(ly * linv)),
+                int(round((lx + lw) * linv)), int(round((ly + lh) * linv)),
+            )
+            self._run_pedestal_stage(mode="manual", ref_box=ref_box, live_box=live_box)
+            return
 
     # ------------------------------------------------------------------
     # Unified K/C/Sat color search ('c' key) — plan v4
@@ -2471,13 +3160,7 @@ class CalibratorWindow:
                 write_state["eval_n"] += 1
                 n = write_state["eval_n"]
                 if n == 1 or n % 20 == 0:
-                    elapsed = time.monotonic() - write_state["t0"]
-                    print(f"[ColorSearch] eval#{n:4d} "
-                          f"params={dict(params)} "
-                          f"elapsed={elapsed:.1f}s "
-                          f"stuck={debug_grab_state['stuck']}/"
-                          f"{debug_grab_state['ok']+debug_grab_state['stuck']}",
-                          flush=True)
+                    pass  # [ColorSearch] eval# — suppressed
             def grab(self_inner):
                 # Wait for a frame whose ROS receive-timestamp is
                 # strictly newer than the last write OR the last
@@ -2607,24 +3290,9 @@ class CalibratorWindow:
 
         self._mode = "IDLE"
 
-        print(
-            f"[ColorSearch] mode={mode_label} evals={result.n_evals} "
-            f"elapsed={result.elapsed_s:.2f}s seed_J={result.seed_J:.4f} "
-            f"best_J={result.best_J:.4f} fallback={result.fallback_used}"
-        )
-        # [ColorSearch-grab] grab freshness counters
-        print(f"[ColorSearch-grab] grab summary: ok={debug_grab_state['ok']} "
-              f"stuck-on-prev-frame={debug_grab_state['stuck']} "
-              f"(stuck means two consecutive grabs returned identical pixels"
-              f" — high count = ROS spin not delivering fresh frames between"
-              f" writes)")
-        for entry in result.trace[:10]:
-            print(
-                f"  trace K={entry.kcs.K} C={entry.kcs.C} Sat={entry.kcs.Sat} "
-                f"J={entry.J:.4f} {entry.note}"
-            )
-        if len(result.trace) > 10:
-            print(f"  ... ({len(result.trace) - 10} more)")
+        # [ColorSearch] mode summary — suppressed (print spam)
+        # [ColorSearch-grab] summary — suppressed
+        # [trace] — suppressed
 
         if result.fallback_used:
             self._notify(
@@ -2727,6 +3395,9 @@ class CalibratorWindow:
         No "is this neutral gray?" labelling is needed in REF mode — the
         user's correspondences are the ground truth.
         """
+        # Zero brightness before dispatch so both the cc24 wizard and the
+        # regular pair-pick path start from a neutral baseline.
+        self._zero_brightness_for_calibration()
         # ColorChecker24 mode → run the 24-patch wizard instead.
         if self._colorchecker_mode:
             return self._run_color_checker()
@@ -2736,7 +3407,9 @@ class CalibratorWindow:
             self._notify("No fresh live frame for manual match", RED, 4.0)
             return
         live_snap = live.copy()
-        ref = self._reference
+        ref = self._get_rotated_ref()
+        # Original image shape for box coordinate back-projection at save time.
+        _orig_ref_hw = self._reference.shape[:2]
 
         self._notify(
             "Manual: drag REF box -> drag LIVE box -> [Space] more / [Enter] apply / [Esc] cancel.",
@@ -2937,10 +3610,25 @@ class CalibratorWindow:
             if action == "apply":
                 break
 
+        # Pedestal SSOT (signed-Δ ``brightness``) — user has just
+        # confirmed the ROI pairs, so this is the right moment to ask
+        # "is one of these the black reference?" before any color
+        # search runs. Three branches: reuse an existing pair, draw a
+        # fresh REF-only box, or skip → auto.
+        try:
+            self._run_pedestal_for_manual(ref, live_snap, pairs)
+        except Exception as exc:  # noqa: BLE001
+            self._notify(f"Pedestal prompt failed: {exc}", YELLOW, 4.0)
+
         # Persist the boxes for the next AUTO run — every stage will
         # use these ROIs (not just neutral-WB). User clears them with
         # the dedicated key in the run loop.
-        self._roi_pairs = list(pairs)
+        # Ref boxes were picked on the rotated display; unrotate them
+        # back to self._reference (original) pixel coords for the solver.
+        self._roi_pairs = [
+            (self._unrotate_box(rb, _orig_ref_hw), lb)
+            for rb, lb in pairs
+        ]
         self._notify(
             f"ROI saved: {len(self._roi_pairs)} pair(s) — next 'a' will "
             f"calibrate on these regions only ('x' to clear)",
@@ -3016,6 +3704,11 @@ class CalibratorWindow:
         self._snapshot_initial()
         self._build_window()
         self._force_manual_modes()
+        # Zero brightness on startup so the initial state is always the
+        # calibration baseline (brightness=default), not whatever the
+        # device happened to have stored (e.g. 3 from a previous session).
+        self._zero_brightness_for_calibration()
+        self._sync_trackbars_to_applied()
 
         # Install Ctrl-C handler so users can shut the GUI down from the
         # terminal that launched it. cv.waitKey is invoked with a short
@@ -3062,23 +3755,23 @@ class CalibratorWindow:
         try:
             while not self._stop_render:
                 live, stamp = self._bridge.latest_frame()
-                # [GuiRate-debug]
-                now = time.monotonic()
-                gui_dbg["frames"] += 1
-                if stamp != gui_dbg["last_stamp"]:
-                    gui_dbg["fresh"] += 1
-                    gui_dbg["last_stamp"] = stamp
-                if now - gui_dbg["t"] >= 1.0:
-                    print(
-                        f"[GuiRate] gui={gui_dbg['frames']}fps "
-                        f"fresh={gui_dbg['fresh']}/{gui_dbg['frames']} "
-                        f"mode={self._mode} "
-                        f"stamp_age={now - stamp:.2f}s",
-                        flush=True,
-                    )
-                    gui_dbg["t"] = now
-                    gui_dbg["frames"] = 0
-                    gui_dbg["fresh"] = 0
+                # [GuiRate-debug] commented out — was spamming terminal every second.
+                # now = time.monotonic()
+                # gui_dbg["frames"] += 1
+                # if stamp != gui_dbg["last_stamp"]:
+                #     gui_dbg["fresh"] += 1
+                #     gui_dbg["last_stamp"] = stamp
+                # if now - gui_dbg["t"] >= 1.0:
+                #     print(
+                #         f"[GuiRate] gui={gui_dbg['frames']}fps "
+                #         f"fresh={gui_dbg['fresh']}/{gui_dbg['frames']} "
+                #         f"mode={self._mode} "
+                #         f"stamp_age={now - stamp:.2f}s",
+                #         flush=True,
+                #     )
+                #     gui_dbg["t"] = now
+                #     gui_dbg["frames"] = 0
+                #     gui_dbg["fresh"] = 0
                 live_stale = (
                     live is None
                     or (time.monotonic() - stamp > 1.5 if stamp else True)

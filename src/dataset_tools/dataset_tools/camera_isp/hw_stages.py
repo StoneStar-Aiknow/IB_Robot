@@ -602,6 +602,11 @@ def evaluate_gain_step_b(
     bri_lo = max(brightness_caps.minimum, brightness_caps.default - band)
     bri_hi = min(brightness_caps.maximum, brightness_caps.default + band)
     final_bri = max(bri_lo, min(bri_hi, proposed_bri))
+    # Pedestal SSOT: ``brightness`` is a constant offset added to every
+    # pixel — auto modes are forbidden from pushing it positive (would
+    # wash blacks). The signed Δ is owned by the pedestal stage; this
+    # fallback may only *subtract* from default.
+    final_bri = min(final_bri, brightness_caps.default)
 
     return GainStepBResult(
         final_gain=halved,
