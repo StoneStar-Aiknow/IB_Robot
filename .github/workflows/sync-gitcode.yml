@@ -1,0 +1,88 @@
+name: Sync GitCode upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17,47 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-gitcode-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync branches, tags, and LFS
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout GitHub mirror
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: false
+
+      - name: Sync from GitCode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          readonly upstream_url="https://gitcode.com/openeuler/IB_Robot.git"
+          readonly default_branch="master"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git lfs install --local
+
+          if git remote get-url gitcode >/dev/null 2>&1; then
+            git remote set-url gitcode "$upstream_url"
+          else
+            git remote add gitcode "$upstream_url"
+          fi
+
+          git fetch --prune gitcode \
+            "+refs/heads/*:refs/remotes/gitcode/*" \
+            "+refs/tags/*:refs/tags/*"
+
+          git lfs fetch --all gitcode
+          git lfs push --all origin
+
+          git checkout "$default_branch"
+          before_merge="$(git rev-parse HEAD)"
+          git merge --no-edit "gitcode/$default_branch"
+          after_merge="$(git rev-parse HEAD)"
+
+          if [ "$before_merge" != "$after_merge" ]; then
+            git push origin "HEAD:refs/heads/$default_branch"
+          else
+            echo "$default_branch is already up to date."
+          fi
+
+          while IFS= read -r branch; do
+            [ -n "$branch" ] || continue
+            [ "$branch" != "HEAD" ] || continue
+            [ "$branch" != "$default_branch" ] || continue
+            git push origin "refs/remotes/gitcode/$branch:refs/heads/$branch" --force
+          done < <(git for-each-ref --format="%(refname:strip=3)" refs/remotes/gitcode)
+
+          while IFS= read -r branch; do
+            [ -n "$branch" ] || continue
+            [ "$branch" != "$default_branch" ] || continue
+            if ! git show-ref --verify --quiet "refs/remotes/gitcode/$branch"; then
+              git push origin ":refs/heads/$branch"
+            fi
+          done < <(git ls-remote --heads origin | awk '{ sub("refs/heads/", "", $2); print $2 }')
+
+          remote_tags="$(mktemp)"
+          local_tags="$(mktemp)"
+          git ls-remote --tags origin \
+            | awk '$2 !~ /\^\{\}$/ { sub("refs/tags/", "", $2); print $2 }' \
+            | sort > "$remote_tags"
+          git for-each-ref --format="%(refname:strip=2)" refs/tags | sort > "$local_tags"
+          comm -23 "$remote_tags" "$local_tags" | while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            git push origin ":refs/tags/$tag"
+          done
+          git push origin --tags --force
