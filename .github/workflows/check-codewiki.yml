@@ -1,0 +1,76 @@
+name: Check Code Wiki availability
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 1 * * *"
+
+permissions:
+  issues: write
+
+concurrency:
+  group: check-codewiki-availability
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check Code Wiki page
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check Code Wiki RPC
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: "1"
+          CODEWIKI_URL: https://codewiki.google/github.com/StoneStar-Aiknow/IB_Robot
+          CODEWIKI_RPC_URL: https://codewiki.google/_/BoqAngularSdlcAgentsUi/data/batchexecute?rpcids=VSX6ub&source-path=%2Fgithub.com%2FStoneStar-Aiknow%2FIB_Robot&hl=en-US&rt=c
+          CODEWIKI_RPC_BODY: f.req=%5B%5B%5B%22VSX6ub%22%2C%22%5B%5C%22https%3A%2F%2Fgithub.com%2Fstonestar-aiknow%2Fib_robot%5C%22%5D%22%2Cnull%2C%22generic%22%5D%5D%5D&
+        run: |
+          set -euo pipefail
+
+          response="$(mktemp)"
+          http_code="$(
+            curl -sS -L \
+              -o "$response" \
+              -w "%{http_code}" \
+              -X POST \
+              -H "Content-Type: application/x-www-form-urlencoded;charset=UTF-8" \
+              -H "X-Same-Domain: 1" \
+              -H "Referer: https://codewiki.google/" \
+              --data "$CODEWIKI_RPC_BODY" \
+              "$CODEWIKI_RPC_URL" || true
+          )"
+
+          {
+            echo "## Code Wiki availability"
+            echo
+            echo "- URL: $CODEWIKI_URL"
+            echo "- RPC HTTP status: $http_code"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$http_code" != "200" ]; then
+            echo "Code Wiki RPC returned HTTP $http_code; leaving tracking issue open."
+            exit 0
+          fi
+
+          if grep -qi '\[null,\[\[null' "$response"; then
+            echo "Code Wiki is not generated yet."
+            echo "- Status: not generated yet" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if ! grep -qi 'stonestar-aiknow/ib_robot' "$response"; then
+            echo "Code Wiki RPC response was not recognized; leaving tracking issue open."
+            echo "- Status: unknown response" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          state="$(gh issue view "$ISSUE_NUMBER" --json state --jq '.state' 2>/dev/null || true)"
+          if [ "$state" = "OPEN" ]; then
+            gh issue close "$ISSUE_NUMBER" \
+              --comment "Code Wiki appears to be available now: $CODEWIKI_URL"
+            echo "- Status: available; issue #$ISSUE_NUMBER closed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Status: available; tracking issue state is $state" >> "$GITHUB_STEP_SUMMARY"
+          fi
