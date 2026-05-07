@@ -178,7 +178,11 @@ def mode_fetch_comments(args, api: RepairService):
     print("📥 模式: 获取检视意见")
     print("=" * 60)
 
-    comments = api.get_unresolved_comments(args.pr)
+    comments = api.get_review_threads(
+        args.pr,
+        include_self_comments=args.include_self_comments,
+        include_bot_comments=args.include_bot_comments,
+    )
 
     if not comments:
         print("\n✅ 没有需要修复的检视意见")
@@ -197,6 +201,16 @@ def mode_fetch_comments(args, api: RepairService):
     output_data = {
         "pr_number": args.pr,
         "fetch_time": datetime.now().isoformat(),
+        "metadata": {
+            "thread_count": len(comments),
+            "include_self_comments": args.include_self_comments,
+            "include_bot_comments": args.include_bot_comments,
+            "resolved_state_note": (
+                "AtomGit/GitCode review read APIs do not expose a reliable resolved flag. "
+                "This file groups all fetched review discussions and filters out "
+                "self-authored / bot-only threads by default."
+            ),
+        },
         "comments": comments,
     }
 
@@ -204,6 +218,7 @@ def mode_fetch_comments(args, api: RepairService):
         json.dump(output_data, f, indent=2, ensure_ascii=False)
 
     print(f"\n✅ 已保存到: {output_file}")
+    print("ℹ️  已自动抓取所有分页评论，并按 discussion_id 聚合线程。")
     print("\n💡 下一步:")
     print("  AI Agent 应该:")
     print("  1. 读取此文件并分析检视意见")
@@ -281,7 +296,7 @@ def mode_apply_fixes(args, api: RepairService):
             if not args.dry_run and reply:
                 comment_id = fix.get("comment_id")
                 if comment_id:
-                    api.reply_to_comment(args.pr, comment_id, reply)
+                    api.reply_to_comment(args.pr, comment_id, reply, reply_mode=args.reply_mode)
                     print(f"  ✓ 已回复评论 #{comment_id}")
 
             results.append(
@@ -340,11 +355,18 @@ def mode_reply_comment(args, api: RepairService):
         print(f"\n[Dry Run] 将回复评论 #{args.reply_comment}:\n{reply_body}")
         return
 
-    result = api.reply_to_comment(args.pr, args.reply_comment, reply_body)
+    result = api.reply_to_comment(args.pr, args.reply_comment, reply_body, reply_mode=args.reply_mode)
     print(f"\n✅ 已回复评论 #{args.reply_comment}")
     print(f"🔗 PR 链接: {api.get_pr_url(args.pr)}")
-    if result.get("id"):
-        print(f"💬 回复 ID: {result['id']}")
+    reply_id = result.get("note_id") or result.get("id")
+    if reply_id:
+        print(f"💬 回复 ID: {reply_id}")
+    if result.get("reply_mode"):
+        print(f"📝 回复模式: {result['reply_mode']}")
+    if result.get("thread_url"):
+        print(f"🧵 线程链接: {result['thread_url']}")
+    if result.get("visibility_hint"):
+        print(f"ℹ️  可见性提示: {result['visibility_hint']}")
 
 
 def _parse_resolved(value: str) -> bool:
@@ -399,7 +421,11 @@ def mode_auto(args, api: RepairService, config: dict):
     api.llm_model = args.llm_model
 
     print("\n📝 获取未解决检视意见...")
-    comments = api.get_unresolved_comments(args.pr)
+    comments = api.get_review_threads(
+        args.pr,
+        include_self_comments=args.include_self_comments,
+        include_bot_comments=args.include_bot_comments,
+    )
 
     if not comments:
         print("\n✅ 没有需要修复的检视意见")
@@ -475,7 +501,7 @@ def mode_auto(args, api: RepairService, config: dict):
                 reply = format_logic_reply({"reply": fix.reason}, args.ai_model)
 
             # 回复评论
-            api.reply_to_comment(args.pr, comment["id"], reply)
+            api.reply_to_comment(args.pr, comment["id"], reply, reply_mode=args.reply_mode)
             print("  ✓ 已回复评论")
 
             results.append({"file": comment["path"], "has_fix": fix.has_fix, "error": None})
@@ -538,6 +564,23 @@ def main():
     parser.add_argument("--work-dir", type=str, default=".", help="工作目录 (默认: 当前目录)")
     parser.add_argument("--reply-body", type=str, help="直接回复指定评论的正文")
     parser.add_argument("--reply-file", type=str, help="从文件读取直接回复正文")
+    parser.add_argument(
+        "--reply-mode",
+        type=str,
+        choices=["visible", "threaded"],
+        default="threaded",
+        help="回复模式：threaded=discussion嵌套回复，visible=页面可见评论 (默认: threaded)",
+    )
+    parser.add_argument(
+        "--include-self-comments",
+        action="store_true",
+        help="在抓取 review 线程时保留当前登录用户自己的评论",
+    )
+    parser.add_argument(
+        "--include-bot-comments",
+        action="store_true",
+        help="在抓取 review 线程时保留 bot 账号评论",
+    )
     parser.add_argument(
         "--resolved",
         type=str,

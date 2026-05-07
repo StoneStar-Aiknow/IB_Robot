@@ -7,21 +7,18 @@ AtomGit PR Management Tool (Agent 驱动版)
 2. --update-pr: 接收 Agent 生成的精美描述并同步到服务器
 """
 
-import os
-import sys
-import json
 import argparse
-from pathlib import Path
-from typing import List, Dict, Optional
+import json
+import sys
 from datetime import datetime
-
+from pathlib import Path
 
 from atomgit_sdk import AtomGitClient, resolve_atomgit_context
 
 
 def load_config(config_path: str = "config.json") -> dict:
     """加载配置文件"""
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(config_path, encoding="utf-8") as f:
         config = json.load(f)
 
     if not config.get("atomgit") or not config["atomgit"].get("token"):
@@ -41,7 +38,7 @@ def add_ai_signature(description: str, ai_model: str) -> str:
 def mode_fetch_info(args, api: AtomGitClient):
     """
     模式1: 获取 PR 信息 (Agent 学习模式)
-    
+
     此模式会将 PR 的所有上下文导出为 JSON，Agent 读取后可根据代码 Diff
     生成高质量的 PR 描述。
     """
@@ -50,13 +47,13 @@ def mode_fetch_info(args, api: AtomGitClient):
     print("=" * 60)
 
     print(f"\n📝 正在从 #{args.pr} 抓取元数据...")
-    
+
     try:
         pr = api.get_pull_request(args.pr)
         commits = api.get_pr_commits(args.pr)
         files = api.get_pr_files(args.pr)
-        comments = [] if args.no_comments else api.get_pr_comments(args.pr)
-        
+        comments = [] if args.no_comments else api.get_all_pr_comments(args.pr)
+
         # 统计信息
         additions = sum(f.get("additions", 0) for f in files)
         deletions = sum(f.get("deletions", 0) for f in files)
@@ -74,14 +71,15 @@ def mode_fetch_info(args, api: AtomGitClient):
                     "additions": additions,
                     "deletions": deletions,
                     "comments": len(comments),
-                }
+                },
             },
             "commits": [
                 {
                     "sha": c.get("sha", ""),
                     "author": c.get("commit", {}).get("author", {}).get("name", ""),
-                    "message": c.get("commit", {}).get("message", "")
-                } for c in commits
+                    "message": c.get("commit", {}).get("message", ""),
+                }
+                for c in commits
             ],
             "changed_files": [
                 {
@@ -89,8 +87,9 @@ def mode_fetch_info(args, api: AtomGitClient):
                     "status": f.get("status", ""),
                     "additions": f.get("additions", 0),
                     "deletions": f.get("deletions", 0),
-                    "patch": f.get("patch", "")  # 关键：包含代码 Diff
-                } for f in files
+                    "patch": f.get("patch", ""),  # 关键：包含代码 Diff
+                }
+                for f in files
             ],
             "comments": comments,
         }
@@ -98,21 +97,18 @@ def mode_fetch_info(args, api: AtomGitClient):
         # 保存为 Agent 可读的 JSON
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        
+
         repo_name = api.config.repo.lower().replace("-", "_")
         output_file = output_dir / f"{repo_name}_pr_{args.pr}_context.json"
-        
+
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(pr_context, f, indent=2, ensure_ascii=False)
 
         print(f"\n✅ 上下文已准备就绪: {output_file}")
-        print(
-            f"📊 统计: {len(commits)} 提交, {len(files)} 文件修改, +{additions}/-{deletions}, "
-            f"{len(comments)} 评论"
-        )
+        print(f"📊 统计: {len(commits)} 提交, {len(files)} 文件修改, +{additions}/-{deletions}, {len(comments)} 评论")
         print("\n💡 Agent 指令:")
-        print(f"  请分析该 JSON 中的 patch 字段，总结变更背后的逻辑，然后调用:")
-        print(f"  --update-pr <description_json>")
+        print("  请分析该 JSON 中的 patch 字段，总结变更背后的逻辑，然后调用:")
+        print("  --update-pr <description_json>")
 
     except Exception as e:
         print(f"\n❌ 获取数据失败: {e}")
@@ -122,7 +118,7 @@ def mode_fetch_info(args, api: AtomGitClient):
 def mode_update_pr(args, api: AtomGitClient):
     """
     模式2: 同步 PR 描述 (Agent 回传模式)
-    
+
     接收 Agent 生成的高质量内容并同步到服务器。
     """
     print("\n" + "=" * 60)
@@ -131,7 +127,7 @@ def mode_update_pr(args, api: AtomGitClient):
 
     try:
         # 读取 description.json
-        with open(args.update_pr, "r", encoding="utf-8") as f:
+        with open(args.update_pr, encoding="utf-8") as f:
             description_data = json.load(f)
 
         title = description_data.get("title", "")
@@ -168,15 +164,8 @@ def main():
 
     # 模式选择 (互斥)
     mode_group = parser.add_mutually_exclusive_group(required=True)
-    mode_group.add_argument(
-        "--fetch-info", action="store_true", help="提取 PR 上下文供 Agent 学习"
-    )
-    mode_group.add_argument(
-        "--update-pr",
-        type=str,
-        metavar="JSON_FILE",
-        help="同步 Agent 生成的描述 (从 JSON 读取)"
-    )
+    mode_group.add_argument("--fetch-info", action="store_true", help="提取 PR 上下文供 Agent 学习")
+    mode_group.add_argument("--update-pr", type=str, metavar="JSON_FILE", help="同步 Agent 生成的描述 (从 JSON 读取)")
 
     # 可选参数
     parser.add_argument(
@@ -203,17 +192,13 @@ def main():
         action="store_true",
         help="在 --fetch-info 模式下跳过抓取 PR 评论",
     )
-    parser.add_argument(
-        "--ai-model", type=str, default="agent", help="AI 模型签名 (默认: agent)"
-    )
+    parser.add_argument("--ai-model", type=str, default="agent", help="AI 模型签名 (默认: agent)")
     parser.add_argument("--dry-run", action="store_true", help="预览但不提交")
 
     args = parser.parse_args()
 
     try:
-        sdk_config, parsed_url = resolve_atomgit_context(
-            args.config, owner=args.owner, repo=args.repo, url=args.url
-        )
+        sdk_config, parsed_url = resolve_atomgit_context(args.config, owner=args.owner, repo=args.repo, url=args.url)
     except Exception as e:
         print(f"\n❌ 配置错误: {e}")
         sys.exit(1)

@@ -3,6 +3,7 @@ AtomGit API Client
 """
 
 import base64
+import json
 import time
 from typing import Any
 from urllib.parse import quote as url_quote
@@ -173,6 +174,57 @@ class AtomGitClient:
             "GET",
             f"{self._repo_path()}/pulls/{pr_number}/comments",
         )
+
+    def get_pr_comments_page(self, pr_number: int, page: int = 1, per_page: int = 100) -> list[dict]:
+        """Get one paginated page of pull request comments."""
+        return self.request(
+            "GET",
+            f"{self._repo_path()}/pulls/{pr_number}/comments",
+            params={"page": page, "per_page": per_page},
+        )
+
+    def get_all_pr_comments(self, pr_number: int, per_page: int = 100, max_pages: int = 1000) -> list[dict]:
+        """Get all pull request comments across paginated API results."""
+        if max_pages <= 0:
+            raise ValueError("max_pages must be greater than zero")
+
+        comments: list[dict] = []
+        seen_keys: set[int | str] = set()
+        page = 1
+
+        while page <= max_pages:
+            page_comments = self.get_pr_comments_page(pr_number, page=page, per_page=per_page)
+            if not page_comments:
+                break
+
+            for comment in page_comments:
+                comment_id = comment.get("id")
+                # AtomGit may occasionally omit the integer id; fall back to a stable
+                # fingerprint so repeated pagination payloads still dedupe cleanly.
+                dedup_key: int | str
+                if isinstance(comment_id, int):
+                    dedup_key = comment_id
+                else:
+                    dedup_key = json.dumps(comment, sort_keys=True, ensure_ascii=False)
+
+                if dedup_key in seen_keys:
+                    continue
+                seen_keys.add(dedup_key)
+                comments.append(comment)
+
+            if len(page_comments) < per_page:
+                break
+            page += 1
+        else:
+            raise AtomGitAPIError(
+                f"Exceeded max_pages={max_pages} while listing PR comments for pull request {pr_number}"
+            )
+
+        return comments
+
+    def get_current_user(self) -> dict:
+        """Get the authenticated user profile."""
+        return self.request("GET", "/api/v5/user")
 
     def get_pr_comment(self, comment_id: int) -> dict:
         """Get one pull request review comment."""

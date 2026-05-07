@@ -2,6 +2,10 @@
 Repair Service - Review comment repair operations
 """
 
+import warnings
+from collections import defaultdict
+from urllib.parse import quote
+
 from atomgit_sdk.client import AtomGitClient
 
 
@@ -10,10 +14,11 @@ class RepairService:
 
     def __init__(self, client: AtomGitClient):
         self.client = client
+        self._current_user_login: str | None = None
 
     def get_pr_comments(self, pr_number: int) -> list[dict]:
         """Get PR comments"""
-        return self.client.get_pr_comments(pr_number)
+        return self.client.get_all_pr_comments(pr_number)
 
     def get_pr_comment(self, comment_id: int) -> dict:
         """Get a single PR review comment."""
@@ -26,43 +31,107 @@ class RepairService:
         Returns:
             List of comments without resolved_at timestamp
         """
-        comments = self.get_pr_comments(pr_number)
+        warnings.warn(
+            "get_unresolved_comments is deprecated; use get_review_threads instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.get_review_threads(pr_number)
 
-        unresolved = []
-        for comment in comments:
-            if not comment.get("resolved_at"):
-                unresolved.append(
-                    {
-                        "id": comment.get("id"),
-                        "path": comment.get("path") or comment.get("diff_file"),
-                        "position": comment.get("position"),
-                        "line": comment.get("new_line") or comment.get("old_line"),
-                        "body": comment.get("body"),
-                        "commit_id": comment.get("commit_id"),
-                        "discussion_id": comment.get("discussion_id"),
-                        "user": comment.get("author", {}).get("username", "Unknown"),
-                        "url": f"{self.client.get_pr_url(pr_number)}#discussion-{comment.get('discussion_id', comment.get('id'))}",
-                    }
-                )
-
-        return unresolved
-
-    def reply_to_comment(self, pr_number: int, comment_id: int, reply_body: str) -> dict:
+    def get_review_threads(
+        self,
+        pr_number: int,
+        *,
+        include_self_comments: bool = False,
+        include_bot_comments: bool = False,
+    ) -> list[dict]:
         """
-        Reply to a review comment with proper threading support.
+        Get grouped review discussions.
+
+        Notes:
+            AtomGit/GitCode comment read APIs do not expose a reliable resolved flag.
+            This method therefore groups all fetched review discussions and filters out
+            self-authored / bot-only threads by default so follow-up workflows can still
+            operate on the actionable review items.
+        """
+        comments = self.get_pr_comments(pr_number)
+        current_user = self._get_current_user_login()
+
+        grouped: dict[str, list[dict]] = defaultdict(list)
+        for comment in comments:
+            discussion_id = str(comment.get("discussion_id") or comment.get("id"))
+            grouped[discussion_id].append(comment)
+
+        threads: list[dict] = []
+        for thread_comments in grouped.values():
+            sorted_comments = sorted(
+                thread_comments,
+                key=lambda item: (item.get("created_at", ""), item.get("id", 0)),
+            )
+
+            actionable = next(
+                (
+                    comment
+                    for comment in sorted_comments
+                    if self._should_include_comment(
+                        comment,
+                        current_user=current_user,
+                        include_self_comments=include_self_comments,
+                        include_bot_comments=include_bot_comments,
+                    )
+                ),
+                None,
+            )
+            if actionable is None:
+                continue
+
+            latest_comment = sorted_comments[-1]
+            thread_payload = self._serialize_comment(pr_number, actionable)
+            thread_payload.update(
+                {
+                    "thread_size": len(sorted_comments),
+                    "reply_count": max(0, len(sorted_comments) - 1),
+                    "participants": sorted(
+                        {login for login in (self._comment_author_login(item) for item in sorted_comments) if login}
+                    ),
+                    "latest_comment_id": latest_comment.get("id"),
+                    "latest_comment_user": self._comment_author_login(latest_comment),
+                    "latest_comment_body": latest_comment.get("body"),
+                    "thread_comments": [
+                        {
+                            **self._serialize_comment(pr_number, item),
+                            "is_self": self._comment_author_login(item) == current_user,
+                            "is_bot": self._is_bot_user(self._comment_author_login(item)),
+                        }
+                        for item in sorted_comments
+                    ],
+                }
+            )
+            threads.append(thread_payload)
+
+        return sorted(threads, key=lambda item: (item.get("created_at", ""), item.get("id", 0)))
+
+    def reply_to_comment(
+        self,
+        pr_number: int,
+        comment_id: int,
+        reply_body: str,
+        *,
+        reply_mode: str = "threaded",
+    ) -> dict:
+        """
+        Reply to a review comment.
 
         Args:
             pr_number: PR number
             comment_id: Comment ID to reply to
             reply_body: Reply body
+            reply_mode: "threaded" preserves the historic nested-reply behavior,
+                while "visible" posts a top-level / inline reply that is easier to
+                spot in AtomGit UI.
 
         Returns:
             API response
-
-        Note:
-            Uses AtomGit API v5's in_reply_to parameter for proper threading.
-            This ensures replies appear nested under the original comment,
-            not as separate PR-level comments.
         """
         original_comment = self.get_pr_comment(comment_id)
         if not original_comment:
@@ -72,19 +141,96 @@ class RepairService:
         if "Generated by AtomGit SDK" not in signed_reply and "generated by ai@" not in signed_reply:
             signed_reply += "\n\n---\n🤖 Generated by AtomGit SDK"
 
+        thread_url = self._discussion_thread_url(pr_number, original_comment, comment_id)
+
+        if reply_mode == "visible":
+            return self._reply_to_comment_visible(pr_number, comment_id, original_comment, signed_reply, thread_url)
+        if reply_mode == "threaded":
+            return self._reply_to_comment_threaded(pr_number, comment_id, original_comment, signed_reply, thread_url)
+        raise ValueError(f"Unsupported reply mode: {reply_mode}")
+
+    def _reply_to_comment_threaded(
+        self,
+        pr_number: int,
+        comment_id: int,
+        original_comment: dict,
+        signed_reply: str,
+        thread_url: str,
+    ) -> dict:
         discussion_id = original_comment.get("discussion_id")
         if discussion_id:
-            return self.client.reply_to_pr_discussion(pr_number, str(discussion_id), signed_reply)
+            result = self.client.reply_to_pr_discussion(pr_number, str(discussion_id), signed_reply)
+            result.setdefault("discussion_id", str(discussion_id))
+            result.setdefault("thread_url", thread_url)
+            result.setdefault("reply_mode", "threaded")
+            if original_comment.get("is_outdated"):
+                result.setdefault(
+                    "visibility_hint",
+                    "The target review discussion is outdated; the nested reply may only be visible after expanding outdated threads in the PR UI.",
+                )
+            return result
 
-        payload = {
-            "body": signed_reply,
-            "in_reply_to": comment_id,
-        }
-        return self.client.request(
+        payload = {"body": signed_reply, "in_reply_to": comment_id}
+        result = self.client.request(
             "POST",
             f"/api/v5/repos/{self.client.config.owner}/{self.client.config.repo}/pulls/{pr_number}/comments",
             body=payload,
         )
+        result.setdefault("thread_url", self.get_pr_url(pr_number))
+        result.setdefault("reply_mode", "threaded")
+        return result
+
+    def _reply_to_comment_visible(
+        self,
+        pr_number: int,
+        comment_id: int,
+        original_comment: dict,
+        signed_reply: str,
+        thread_url: str,
+    ) -> dict:
+        visible_body = self._build_visible_reply_body(comment_id, thread_url, signed_reply)
+
+        position = original_comment.get("position") or {}
+        file_path = (
+            original_comment.get("path")
+            or original_comment.get("diff_file")
+            or position.get("new_path")
+            or position.get("old_path")
+        )
+        line_number = (
+            position.get("new_line")
+            or position.get("old_line")
+            or original_comment.get("new_line")
+            or original_comment.get("old_line")
+        )
+        commit_id = position.get("head_sha") or original_comment.get("commit_id")
+
+        if file_path and line_number:
+            result = self.client.submit_inline_comment(
+                pr_number,
+                {
+                    "path": file_path,
+                    "line": line_number,
+                    "commit_id": commit_id,
+                    "body": visible_body,
+                },
+            )
+            result.setdefault("thread_url", thread_url)
+            result.setdefault("reply_mode", "visible")
+            result.setdefault(
+                "visibility_hint",
+                "Posted as a visible inline comment because nested discussion replies are not reliably shown in AtomGit UI.",
+            )
+            return result
+
+        result = self.client.submit_pr_comment(pr_number, visible_body)
+        result.setdefault("thread_url", thread_url)
+        result.setdefault("reply_mode", "visible")
+        result.setdefault(
+            "visibility_hint",
+            "Posted as a visible PR comment because nested discussion replies are not reliably shown in AtomGit UI.",
+        )
+        return result
 
     def resolve_comment(self, pr_number: int, comment_id: int, resolved: bool = True) -> dict:
         """Resolve or reopen the discussion containing a specific review comment."""
@@ -124,3 +270,64 @@ class RepairService:
     def get_pr_url(self, pr_number: int) -> str:
         """Get PR URL"""
         return self.client.get_pr_url(pr_number)
+
+    def _get_current_user_login(self) -> str | None:
+        if self._current_user_login is not None:
+            return self._current_user_login
+        try:
+            user = self.client.get_current_user()
+        except Exception:
+            self._current_user_login = ""
+            return None
+        self._current_user_login = user.get("login") or user.get("username") or ""
+        return self._current_user_login or None
+
+    @staticmethod
+    def _comment_author_login(comment: dict) -> str:
+        author = comment.get("author") or comment.get("user") or {}
+        return author.get("username") or author.get("login") or "Unknown"
+
+    @staticmethod
+    def _is_bot_user(login: str | None) -> bool:
+        if not login:
+            return False
+        lowered = login.lower()
+        return lowered.endswith("bot") or "[bot]" in lowered or "-bot" in lowered
+
+    def _should_include_comment(
+        self,
+        comment: dict,
+        *,
+        current_user: str | None,
+        include_self_comments: bool,
+        include_bot_comments: bool,
+    ) -> bool:
+        login = self._comment_author_login(comment)
+        if not include_self_comments and current_user and login == current_user:
+            return False
+        return include_bot_comments or not self._is_bot_user(login)
+
+    def _serialize_comment(self, pr_number: int, comment: dict) -> dict:
+        return {
+            "id": comment.get("id"),
+            "path": comment.get("path") or comment.get("diff_file"),
+            "position": comment.get("position"),
+            "line": comment.get("new_line") or comment.get("old_line"),
+            "body": comment.get("body"),
+            "commit_id": comment.get("commit_id"),
+            "discussion_id": comment.get("discussion_id"),
+            "user": self._comment_author_login(comment),
+            "comment_type": comment.get("comment_type"),
+            "created_at": comment.get("created_at"),
+            "updated_at": comment.get("updated_at"),
+            "is_outdated": comment.get("is_outdated"),
+            "url": f"{self.client.get_pr_url(pr_number)}#discussion-{quote(str(comment.get('discussion_id') or comment.get('id')))}",
+        }
+
+    def _discussion_thread_url(self, pr_number: int, comment: dict, comment_id: int) -> str:
+        discussion_id = comment.get("discussion_id") or comment_id
+        return f"{self.client.get_pr_url(pr_number)}#discussion-{quote(str(discussion_id))}"
+
+    @staticmethod
+    def _build_visible_reply_body(comment_id: int, thread_url: str, signed_reply: str) -> str:
+        return f"Reply to review comment #{comment_id}\nOriginal thread: {thread_url}\n\n{signed_reply}"
