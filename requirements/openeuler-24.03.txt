@@ -1,3 +1,4 @@
 aiortc
 onnx
 onnxruntime
+pygraphviz

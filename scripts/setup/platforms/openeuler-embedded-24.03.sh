@@ -92,6 +92,9 @@ platform_post_install_rosdeps() {
     log_info "Installing python3-scipy (rosdep uses RHEL macro naming on openEuler)..."
     run_sudo dnf install -y --nogpgcheck python3-scipy
 
+    log_info "Installing graphviz packages for ros2 control topology visualization..."
+    run_sudo dnf install -y --nogpgcheck graphviz graphviz-devel -q
+
     # On openEuler, tracing packages are not reliably provisioned by rosdep in
     # the container/chroot validation environment. Keep explicit dnf fallback
     # installs here so setup can converge even when rosdep fails the batch.
