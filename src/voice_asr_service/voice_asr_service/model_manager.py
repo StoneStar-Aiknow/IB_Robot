@@ -187,6 +187,8 @@ def resolve_model_assets(
     model_root: Path | None = None,
     logger=None,
 ) -> ResolvedModelAssets:
+    model_root = model_root or default_model_root()
+
     if not model_path:
         if not auto_download_model:
             return ResolvedModelAssets(model_path="", tokens_path=tokens_path, downloaded=False, profile=None)
@@ -198,14 +200,9 @@ def resolve_model_assets(
             language=language,
         )
         download_model_bundle(bundle=bundle, model_root=model_root, logger=logger)
-        _log(
-            logger,
-            "info",
-            f"ASR model_path is empty; using default bundle '{bundle.directory}'.",
-        )
         return ResolvedModelAssets(
-            model_path=bundle.resolved_model_path(model_root or default_model_root()),
-            tokens_path=bundle.resolved_tokens_path(model_root or default_model_root()),
+            model_path=bundle.resolved_model_path(model_root),
+            tokens_path=bundle.resolved_tokens_path(model_root),
             downloaded=True,
             profile=bundle.profile,
         )
@@ -237,14 +234,9 @@ def resolve_model_assets(
         language=language,
     )
     download_model_bundle(bundle=bundle, model_root=model_root, logger=logger)
-    _log(
-        logger,
-        "info",
-        f"Configured ASR model path '{model_path}' is missing; using downloaded bundle '{bundle.directory}' instead.",
-    )
     return ResolvedModelAssets(
-        model_path=bundle.resolved_model_path(model_root or default_model_root()),
-        tokens_path=bundle.resolved_tokens_path(model_root or default_model_root()),
+        model_path=bundle.resolved_model_path(model_root),
+        tokens_path=bundle.resolved_tokens_path(model_root),
         downloaded=True,
         profile=bundle.profile,
     )

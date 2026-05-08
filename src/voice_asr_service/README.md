@@ -117,7 +117,7 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 launch robot_config robot.
 
 1. `resolve_model_assets()` 先检查 `model_path` 是否为空或已存在。
 2. 如果 `model_path` 为空，或配置的模型缺失，且 `auto_download_model=true`，
-   节点会按当前意图选择默认 bundle。
+   节点会在启动时按当前意图选择默认 bundle 并在缺失时自动下载。
 3. 下载后的 bundle 路径会回填到节点实际使用的运行参数里。
 4. `ASRInferenceModule.initialize()` 根据模型类型创建流式或离线 recognizer。
 
@@ -355,7 +355,7 @@ robot:
 | `start_recognition` 被拒绝 | ASR 未就绪，或当前模型是离线模型 | 查看 `_asr_init_error` 相关日志和模型类型 |
 | 文件识别立即失败 | 文件路径错误或解码失败 | 确认文件存在且格式受支持 |
 | 麦克风没有音频输入 | 设备选择不对 | 检查启动时的设备日志，使用 `device_name` 或 `device_index` 指定 |
-| 模型路径缺失 | bundle 尚未下载完成 | 开启 `auto_download_model` 或在 setup 阶段预拉取模型 |
+| 模型路径缺失 | bundle 尚未下载完成 | 开启 `auto_download_model`，并在首次启动 ASR 节点时等待自动下载完成 |
 
 ## 14. 当前已验证行为
 

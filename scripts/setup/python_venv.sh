@@ -245,10 +245,6 @@ setup_python_venv() {
             ;;
     esac
 
-    log_info "Prefetching default ASR model bundles..."
-    if ! python3 -m voice_asr_service.model_manager --all; then
-        log_warn "ASR model prefetch failed. Runtime auto-download will retry when models are missing."
-    fi
     if [[ -f "${WORKSPACE}/.pre-commit-config.yaml" ]]; then
         "${VENV_PYTHON}" -m pre_commit install
     fi

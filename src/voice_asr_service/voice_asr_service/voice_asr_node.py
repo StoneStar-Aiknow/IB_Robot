@@ -255,7 +255,9 @@ class VoiceASRNode(Node):
             model_type_str = "streaming" if self._asr.is_streaming() else "offline"
             self.get_logger().info(f"ASR model loaded: {self._model_path} (type: {model_type_str})")
             if resolved_assets.downloaded:
-                self.get_logger().info(f"ASR model bundle '{resolved_assets.profile}' was downloaded automatically.")
+                self.get_logger().info(
+                    f"ASR model bundle '{resolved_assets.profile}' was downloaded automatically during node startup."
+                )
             if not self._asr.is_streaming():
                 self.get_logger().info(
                     "Offline ASR model loaded. File recognition is available; "
