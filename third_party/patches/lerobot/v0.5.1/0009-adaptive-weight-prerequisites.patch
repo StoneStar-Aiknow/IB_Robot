@@ -1,0 +1,295 @@
+From 74a723c9ebaa4a5525e88540dbd66c52a593c6b3 Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Fri, 8 May 2026 16:10:45 +0800
+Subject: [PATCH] train: port adaptive weighting prerequisites
+
+This ports the legacy lerobot_ros2 PR #13 adaptive-weighting foundations onto
+the lerobot v0.5.1 base. It introduces the adaptive-weight config knobs,
+returns frame indices from the dataset, exposes per-sample ACT losses, and
+adds the sampler/training-loop glue that later weighted-training patches build
+on.
+
+---
+ src/lerobot/configs/train.py             |   6 ++
+ src/lerobot/datasets/lerobot_dataset.py  |   6 +-
+ src/lerobot/policies/act/modeling_act.py |   5 +-
+ src/lerobot/scripts/lerobot_train.py     | 111 +++++++++++++++++++++++++++----
+ src/lerobot/utils/train_utils.py         |  21 ++++++
+ 5 files changed, 133 insertions(+), 16 deletions(-)
+
+diff --git a/src/lerobot/configs/train.py b/src/lerobot/configs/train.py
+index 8b8aedb2..30d0fb2c 100644
+--- a/src/lerobot/configs/train.py
++++ b/src/lerobot/configs/train.py
+@@ -50,6 +50,12 @@ class TrainPipelineConfig(HubMixin):
+     # `seed` is used for training (eg: model initialization, dataset shuffling)
+     # AND for the evaluation environments.
+     seed: int | None = 1000
++    # Adaptive loss weighting parameters.
++    ada_weight: bool = True
++    # Frequency (in number of steps) to update the adaptive weights.
++    ada_weight_freq: int = 200
++    # Damping coefficient for the adaptive loss weighting.
++    damping_coefficient: float = 0.7
+     # Set to True to use deterministic cuDNN algorithms for reproducibility.
+     # This disables cudnn.benchmark and may reduce training speed by ~10-20 percent.
+     cudnn_deterministic: bool = False
+diff --git a/src/lerobot/datasets/lerobot_dataset.py b/src/lerobot/datasets/lerobot_dataset.py
+index 1725046f..d50798e1 100644
+--- a/src/lerobot/datasets/lerobot_dataset.py
++++ b/src/lerobot/datasets/lerobot_dataset.py
+@@ -424,7 +424,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
+         """Return the number of frames in the selected episodes."""
+         return self.num_frames
+ 
+-    def __getitem__(self, idx) -> dict:
++    def __getitem__(self, idx) -> tuple[dict, int]:
+         """Return a single frame by index, with all transforms applied.
+ 
+         Loads the frame from the underlying HF dataset, expands delta-timestamp
+@@ -435,7 +435,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
+             idx: Index into the (possibly episode-filtered) dataset.
+ 
+         Returns:
+-            Dict mapping feature names to their tensor values for this frame.
++            A tuple of the decoded frame item and its original dataset index.
+ 
+         Raises:
+             RuntimeError: If the dataset is currently being recorded and
+@@ -449,7 +449,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
+         if reader.hf_dataset is None:
+             # One-shot load after finalize()
+             reader.load_and_activate()
+-        return reader.get_item(idx)
++        return reader.get_item(idx), int(idx)
+ 
+     def select_columns(self, column_names: str | list[str]):
+         """Select specific columns from the underlying dataset.
+diff --git a/src/lerobot/policies/act/modeling_act.py b/src/lerobot/policies/act/modeling_act.py
+index a5c48eb3..3c3f5760 100644
+--- a/src/lerobot/policies/act/modeling_act.py
++++ b/src/lerobot/policies/act/modeling_act.py
+@@ -146,7 +146,10 @@ class ACTPolicy(PreTrainedPolicy):
+         ).mean()
+ 
+         loss_dict = {"l1_loss": l1_loss.item()}
+-        if self.config.use_vae:
++        loss_dict["loss"] = F.l1_loss(batch[ACTION], actions_hat, reduction="none") * ~batch[
++            "action_is_pad"
++        ].unsqueeze(-1)
++        if self.config.use_vae and self.training:
+             # Calculate Dₖₗ(latent_pdf || standard_normal). Note: After computing the KL-divergence for
+             # each dimension independently, we sum over the latent dimension to get the total
+             # KL-divergence per batch element, then take the mean over the batch.
+diff --git a/src/lerobot/scripts/lerobot_train.py b/src/lerobot/scripts/lerobot_train.py
+index 0a721291..dab6f13d 100644
+--- a/src/lerobot/scripts/lerobot_train.py
++++ b/src/lerobot/scripts/lerobot_train.py
+@@ -42,6 +42,7 @@ from lerobot.utils.import_utils import register_third_party_plugins
+ from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
+ from lerobot.utils.random_utils import set_seed
+ from lerobot.utils.train_utils import (
++    WeightSampler,
+     get_step_checkpoint_dir,
+     get_step_identifier,
+     load_training_state,
+@@ -354,9 +355,26 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
+         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
+ 
+-    # create dataloader for offline training
+-    if hasattr(cfg.policy, "drop_n_last_frames"):
+-        shuffle = False
++    # Split the dataset into a train/validation view so adaptive weighting can
++    # resample the training subset while keeping a fixed hold-out slice.
++    train_size = int(0.9 * len(dataset))
++    val_size = len(dataset) - train_size
++    logging.info(f"train_data_num: {train_size}, eval_data_num: {val_size}")
++    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
++
++    try:
++        train_orig_indices = train_dataset.indices
++        orig_to_subset = {orig_idx: i for i, orig_idx in enumerate(train_orig_indices)}
++    except AttributeError:
++        orig_to_subset = None
++
++    train_num_samples = len(train_dataset)
++    train_sample_weights = [1.0] * train_num_samples
++    train_sample_count = [0] * train_num_samples
++
++    if cfg.ada_weight:
++        sampler = WeightSampler(weights=train_sample_weights, num_samples=train_num_samples, replacement=True)
++    elif hasattr(cfg.policy, "drop_n_last_frames"):
+         sampler = EpisodeAwareSampler(
+             dataset.meta.episodes["dataset_from_index"],
+             dataset.meta.episodes["dataset_to_index"],
+@@ -365,26 +383,37 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+             shuffle=True,
+         )
+     else:
+-        shuffle = True
+         sampler = None
+ 
+-    dataloader = torch.utils.data.DataLoader(
+-        dataset,
++    train_loader = torch.utils.data.DataLoader(
++        train_dataset,
+         num_workers=cfg.num_workers,
+         batch_size=cfg.batch_size,
+-        shuffle=shuffle and not cfg.dataset.streaming,
++        shuffle=sampler is None and not cfg.dataset.streaming,
+         sampler=sampler,
+         pin_memory=device.type == "cuda",
+         drop_last=False,
+         prefetch_factor=2 if cfg.num_workers > 0 else None,
+     )
+ 
++    val_loader = torch.utils.data.DataLoader(
++        val_dataset,
++        num_workers=cfg.num_workers,
++        batch_size=cfg.batch_size,
++        shuffle=True,
++        pin_memory=device.type == "cuda",
++        drop_last=False,
++        prefetch_factor=2 if cfg.num_workers > 0 else None,
++    )
++
+     # Prepare everything with accelerator
+     accelerator.wait_for_everyone()
+-    policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+-        policy, optimizer, dataloader, lr_scheduler
++    policy, optimizer, train_loader, lr_scheduler = accelerator.prepare(
++        policy, optimizer, train_loader, lr_scheduler
+     )
+-    dl_iter = cycle(dataloader)
++    val_loader = accelerator.prepare(val_loader)
++    train_iter = cycle(train_loader)
++    val_iter = cycle(val_loader)
+ 
+     policy.train()
+ 
+@@ -420,9 +449,25 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
+         )
+ 
++    best_eval_loss = float("inf")
++
+     for _ in range(step, cfg.steps):
+         start_time = time.perf_counter()
+-        batch = next(dl_iter)
++        if cfg.ada_weight and step > 0 and step % cfg.ada_weight_freq == 0:
++            sampler = WeightSampler(weights=train_sample_weights, num_samples=train_num_samples, replacement=True)
++            train_loader = torch.utils.data.DataLoader(
++                train_dataset,
++                num_workers=cfg.num_workers,
++                batch_size=cfg.batch_size,
++                sampler=sampler,
++                shuffle=False,
++                pin_memory=device.type == "cuda",
++                drop_last=False,
++                prefetch_factor=2 if cfg.num_workers > 0 else None,
++            )
++            train_iter = cycle(train_loader)
++
++        batch, batch_indices = next(train_iter)
+         batch = preprocessor(batch)
+         train_tracker.dataloading_s = time.perf_counter() - start_time
+ 
+@@ -437,6 +482,26 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+             rabc_weights_provider=rabc_weights,
+         )
+ 
++        if cfg.ada_weight:
++            loss_mean = output_dict["loss"].mean(dim=[1, 2])
++            for index, raw_idx in enumerate(batch_indices):
++                idx_val = int(raw_idx)
++                if 0 <= idx_val < train_num_samples:
++                    subset_idx = idx_val
++                else:
++                    if orig_to_subset is None:
++                        continue
++                    subset_idx = orig_to_subset.get(idx_val)
++                    if subset_idx is None:
++                        continue
++
++                train_sample_weights[subset_idx] = (
++                    train_sample_weights[subset_idx] * cfg.damping_coefficient
++                    + float(loss_mean[index].item()) * 10
++                )
++                train_sample_weights[subset_idx] = max(train_sample_weights[subset_idx], 0.1)
++                train_sample_count[subset_idx] += 1
++
+         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
+         # increment `step` here.
+         step += 1
+@@ -466,7 +531,29 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+                 wandb_logger.log_dict(wandb_log_dict, step)
+             train_tracker.reset_averages()
+ 
+-        if cfg.save_checkpoint and is_saving_step:
++        best_eval_sign = False
++        if not cfg.env and is_eval_step:
++            policy.eval()
++            per_eval_num = max(1, len(val_loader) // 4)
++            logging.info(f"Start evaluating: {per_eval_num}/{len(val_loader)} batches")
++            eval_loss = 0.0
++            for _ in range(per_eval_num):
++                val_batch, _ = next(val_iter)
++                val_batch = preprocessor(val_batch)
++                with accelerator.autocast():
++                    loss, _ = policy.forward(val_batch)
++                eval_loss += loss.item()
++            eval_loss /= per_eval_num
++            logging.info(f"Eval policy at step {step}, eval_loss: {eval_loss:.3f}")
++
++            if eval_loss < best_eval_loss:
++                best_eval_loss = eval_loss
++                logging.info(f"New best eval loss: {best_eval_loss:.3f}, saving checkpoint")
++                best_eval_sign = True
++
++            policy.train()
++
++        if (cfg.save_checkpoint and is_saving_step) or best_eval_sign:
+             if is_main_process:
+                 logging.info(f"Checkpoint policy after step {step}")
+                 checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+diff --git a/src/lerobot/utils/train_utils.py b/src/lerobot/utils/train_utils.py
+index 02f6aebb..1750751f 100644
+--- a/src/lerobot/utils/train_utils.py
++++ b/src/lerobot/utils/train_utils.py
+@@ -15,8 +15,10 @@
+ # limitations under the License.
+ from pathlib import Path
+ 
++import torch
+ from torch.optim import Optimizer
+ from torch.optim.lr_scheduler import LRScheduler
++from torch.utils.data import Sampler
+ 
+ from lerobot.configs.train import TrainPipelineConfig
+ from lerobot.datasets.io_utils import load_json, write_json
+@@ -167,3 +169,22 @@ def load_training_state(
+         scheduler = load_scheduler_state(scheduler, training_state_dir)
+ 
+     return step, optimizer, scheduler
++
++
++class WeightSampler(Sampler):
++    def __init__(self, weights, num_samples, replacement=True):
++        self.weights = torch.tensor(weights, dtype=torch.float32)
++        self.num_samples = num_samples
++        self.replacement = replacement
++
++    def __iter__(self):
++        indices = torch.multinomial(self.weights, self.num_samples, self.replacement)
++        return iter(indices.tolist())
++
++    def __len__(self):
++        return self.num_samples
++
++
++def normalize_weights(weights):
++    total = sum(weights)
++    return [w / total for w in weights] if total != 0 else weights
+-- 
+2.34.1

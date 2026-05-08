@@ -132,7 +132,7 @@ run_fixture "openharmony-5.1.0 / py3.12" \
 MASTER_PARITY_SERIES="${REPO_ROOT}/third_party/patches/lerobot/v0.5.1/series.master-parity-candidates.txt"
 if [[ -f "${MASTER_PARITY_SERIES}" ]]; then
     run_fixture "ascend-forced / py3.10 / master-parity series" \
-        "0007-ascend-om-act-runtime.patch,0008-ascend-3403-actwrapper.patch,0009-weighted-training.patch,0010-knowledge-distillation.patch,0011-mt-act-model.patch,0012-attention-visualization-tools.patch" \
+        "0007-ascend-om-act-runtime.patch,0008-ascend-3403-actwrapper.patch,0009-adaptive-weight-prerequisites.patch,0010-weighted-training.patch,0011-knowledge-distillation.patch,0012-mt-act-model.patch,0013-attention-visualization-tools.patch" \
         IBR_HOST_PYTHON_VERSION=3.10 \
         IBR_LEROBOT_PROFILES=core,ascend,master-parity-candidates,om,training,distillation,models,mt-act,visualization,tooling \
         -- \
