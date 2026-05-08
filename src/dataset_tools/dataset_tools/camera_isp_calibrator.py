@@ -512,6 +512,7 @@ class CalibratorWindow:
         # trackbar callback can short-circuit and not bounce values back.
         self._suppress_cb = False
         self._trackbars_ready = False
+        self._main_window_seen = False
         self._brightness_user_locked = False
         self._protect_brightness_in_auto_pipeline = False
         # Updated by _force_manual_modes(): True if AWB really turned off at
@@ -3875,14 +3876,8 @@ class CalibratorWindow:
                 canvas = self._render(live, live_stale)
                 cv.imshow(self.WINDOW_NAME, canvas)
                 key = cv.waitKey(30) & 0xFF
-                try:
-                    visible = cv.getWindowProperty(
-                        self.WINDOW_NAME,
-                        cv.WND_PROP_VISIBLE,
-                    )
-                except Exception:  # noqa: BLE001
-                    visible = 1.0
-                if visible == 0.0:
+                if self._main_window_closed() or self._trackbar_panel_closed():
+                    self._stop_render = True
                     break
 
                 if key == 0xFF:
@@ -3947,15 +3942,44 @@ class CalibratorWindow:
                     signal.signal(signal.SIGTSTP, prev_sigtstp)
                 except (ValueError, OSError):
                     pass
-            try:
-                cv.destroyWindow(self.WINDOW_NAME)
-            except Exception:  # noqa: BLE001
-                pass
+            self._destroy_all_windows()
+        return 0
+
+    def _destroy_all_windows(self) -> None:
+        cv = self._opencv
+        for _ in range(8):
             try:
                 cv.destroyAllWindows()
             except Exception:  # noqa: BLE001
                 pass
-        return 0
+            try:
+                cv.waitKey(20)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _main_window_closed(self) -> bool:
+        cv = self._opencv
+        try:
+            visible = cv.getWindowProperty(
+                self.WINDOW_NAME,
+                cv.WND_PROP_VISIBLE,
+            )
+        except Exception:  # noqa: BLE001
+            return self._main_window_seen
+        if visible >= 1.0:
+            self._main_window_seen = True
+            return False
+        return self._main_window_seen
+
+    def _trackbar_panel_closed(self) -> bool:
+        if not self._trackbars_ready:
+            return False
+        cv = self._opencv
+        try:
+            cv.getTrackbarPos("exposure", self.WINDOW_NAME)
+        except Exception:  # noqa: BLE001
+            return True
+        return False
 
 
 # --------------------------------------------------------------------------
