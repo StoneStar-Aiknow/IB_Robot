@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 # install_ros.sh - Automated ROS 2 Humble installation script
 #
 # Description:
@@ -37,7 +38,7 @@
 #
 # For more information, see: https://docs.ros.org/en/humble/Installation.html
 #
-set -e
+
 
 # ============================================================================
 # Configuration
@@ -50,25 +51,14 @@ if [[ $EUID -eq 0 ]]; then
     USE_SUDO=false
 fi
 
-# Helper to run commands with or without sudo
-run_sudo() {
-    if [[ "${USE_SUDO}" == true ]]; then
-        sudo "$@"
-    else
-        "$@"
-    fi
-}
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/setup/common.sh"
 
-# Logging functions
-log_info()    { echo -e "\033[0;32m[INFO] $*${NC}"; }
-log_error()   { echo -e "${RED}[ERROR] $*${NC}"; }
-log_warn()    { echo -e "\033[1;33m[WARNING] $*${NC}"; }
+
+
+
 
 # ============================================================================
 # Argument Parsing
@@ -97,7 +87,7 @@ check_sudo() {
         log_info "Running without sudo (root or --no-sudo requested)"
         return 0
     fi
-    if ! sudo -v &>/dev/null; then
+    if ! sudo -n true &>/dev/null && ! sudo -v &>/dev/null; then
         log_error "This script requires sudo privileges to install packages."
         log_error "Please ensure you have sudo access and try again."
         exit 1
@@ -314,9 +304,17 @@ install_ubuntu_ros() {
 
     # Install ROS 2 Humble desktop-full
     log_info "Installing ROS 2 ${ROS_DISTRO} desktop-full..."
-    if ! run_sudo apt-get install -y ros-${ROS_DISTRO}-desktop-full; then
-        log_error "Failed to install ROS 2 ${ROS_DISTRO} desktop-full"
-        return 1
+    
+    if [[ "${AUTO_YES}" == true ]]; then
+        if ! run_sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y ros-${ROS_DISTRO}-desktop-full; then
+            log_error "Failed to install ROS 2 ${ROS_DISTRO} desktop-full"
+            return 1
+        fi
+    else
+        if ! run_sudo apt-get install -y ros-${ROS_DISTRO}-desktop-full; then
+            log_error "Failed to install ROS 2 ${ROS_DISTRO} desktop-full"
+            return 1
+        fi
     fi
     log_info "ROS 2 ${ROS_DISTRO} desktop-full installed successfully"
 }

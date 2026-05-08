@@ -9,12 +9,12 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Any
+from typing import Any
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 from ..base_teleop import BaseTeleopDevice
-from scipy.spatial.transform import Rotation
 from .config_phone import PhoneConfig, PhoneOS
 
 logger = logging.getLogger(__name__)
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class _CartesianCommand:
     """Internal per-cycle Cartesian command from phone (linear/angular displacement + gripper)."""
+
     linear: "np.ndarray"
     angular: "np.ndarray"
     gripper_pos: float = 0.0
@@ -33,8 +34,8 @@ class BasePhone:
     """Base class for phone teleoperation with calibration support."""
 
     _enabled: bool = False
-    _calib_pos: Optional[np.ndarray] = None
-    _calib_rot_inv: Optional[Rotation] = None
+    _calib_pos: np.ndarray | None = None
+    _calib_rot_inv: Rotation | None = None
 
     def _reapply_position_calibration(self, pos: np.ndarray) -> None:
         """Reapply position calibration (called on enable rising edge)."""
@@ -45,7 +46,7 @@ class BasePhone:
         """Check if the phone has been calibrated."""
         return (self._calib_pos is not None) and (self._calib_rot_inv is not None)
 
-    def get_action_features(self) -> Dict[str, type]:
+    def get_action_features(self) -> dict[str, type]:
         """Get the action features provided by this phone."""
         return {
             "phone.pos": np.ndarray,
@@ -83,9 +84,7 @@ class IOSPhone(BasePhone):
 
             group = lookup.get_group_from_names(["HEBI"], ["mobileIO"])
             if group is None:
-                raise RuntimeError(
-                    "Mobile I/O not found — check name/family settings in the app."
-                )
+                raise RuntimeError("Mobile I/O not found — check name/family settings in the app.")
 
             self._group = group
             self._is_connected = True
@@ -96,12 +95,12 @@ class IOSPhone(BasePhone):
 
         except ImportError:
             logger.error("=" * 60)
-            logger.error("MISSING DEPENDENCY: 'hebi' package not installed!")
+            logger.error("MISSING DEPENDENCY: HEBI Python SDK not installed!")
             logger.error("")
             logger.error("This package is required for iOS phone teleoperation.")
             logger.error("")
             logger.error("Install with:")
-            logger.error("    pip install hebi")
+            logger.error("    pip install hebi-py")
             logger.error("")
             logger.error("Or install all phone dependencies:")
             logger.error("    pip install -r $(ros2 pkg prefix robot_teleop)/share/robot_teleop/requirements.txt")
@@ -126,7 +125,7 @@ class IOSPhone(BasePhone):
         self._enabled = False
         print("Calibration done\n")
 
-    def _wait_for_capture_trigger(self) -> Tuple[np.ndarray, Rotation]:
+    def _wait_for_capture_trigger(self) -> tuple[np.ndarray, Rotation]:
         """Wait for B1 button press to capture calibration pose."""
         while True:
             has_pose, position, rotation, fb_pose = self._read_current_pose()
@@ -147,7 +146,7 @@ class IOSPhone(BasePhone):
 
     def _read_current_pose(
         self,
-    ) -> Tuple[bool, Optional[np.ndarray], Optional[Rotation], Any]:
+    ) -> tuple[bool, np.ndarray | None, Rotation | None, Any]:
         """Read the current 6-DoF pose from the iOS device."""
         if self._group is None:
             return False, None, None, None
@@ -166,14 +165,14 @@ class IOSPhone(BasePhone):
 
         return True, pos, rot, pose
 
-    def get_action(self) -> Dict[str, Any]:
+    def get_action(self) -> dict[str, Any]:
         """Get the current phone action (pose and inputs)."""
         has_pose, raw_position, raw_rotation, fb_pose = self._read_current_pose()
 
         if not has_pose or not self.is_calibrated:
             return {}
 
-        raw_inputs: Dict[str, Any] = {}
+        raw_inputs: dict[str, Any] = {}
         io = getattr(fb_pose, "io", None)
         if io is not None:
             bank_a, bank_b = io.a, io.b
@@ -280,7 +279,7 @@ class AndroidPhone(BasePhone):
         self._enabled = False
         print("Calibration done\n")
 
-    def _wait_for_capture_trigger(self) -> Tuple[np.ndarray, Rotation]:
+    def _wait_for_capture_trigger(self) -> tuple[np.ndarray, Rotation]:
         """Wait for touch move event to capture calibration pose."""
         while True:
             with self._android_lock:
@@ -295,7 +294,7 @@ class AndroidPhone(BasePhone):
 
     def _read_current_pose(
         self,
-    ) -> Tuple[bool, Optional[np.ndarray], Optional[Rotation], Any]:
+    ) -> tuple[bool, np.ndarray | None, Rotation | None, Any]:
         """Read the latest pose from the Android device."""
         with self._android_lock:
             if self._latest_pose is None:
@@ -314,14 +313,14 @@ class AndroidPhone(BasePhone):
             self._latest_pose = pose
             self._latest_message = message
 
-    def get_action(self) -> Dict[str, Any]:
+    def get_action(self) -> dict[str, Any]:
         """Get the current phone action (pose and inputs)."""
         ok, raw_pos, raw_rot, pose = self._read_current_pose()
 
         if not ok or not self.is_calibrated:
             return {}
 
-        raw_inputs: Dict[str, Any] = {}
+        raw_inputs: dict[str, Any] = {}
         msg = self._latest_message or {}
         raw_inputs["move"] = bool(msg.get("move", False))
         raw_inputs["scale"] = float(msg.get("scale", 1.0))
@@ -378,26 +377,26 @@ class PhoneDevice(BaseTeleopDevice):
         else:
             self.phone_config = PhoneConfig()
 
-        self._phone_impl: Optional[BasePhone] = None
+        self._phone_impl: BasePhone | None = None
         self._last_gripper_pos: float = 0.0
-        self._prev_pos: Optional[np.ndarray] = None
-        self._prev_rot: Optional[Rotation] = None
+        self._prev_pos: np.ndarray | None = None
+        self._prev_rot: Rotation | None = None
 
         # _state_lock protects only shared state; ROS calls happen outside the lock
         self._state_lock = threading.Lock()
         self.servo_client = None
         self._joint_state_sub = None
-        self._current_joint_states: Dict[str, float] = {}
+        self._current_joint_states: dict[str, float] = {}
         self._first_state_received = False
         self._going_home = False
         self._servo_enabled = False
-        self._home_start_time: Optional[float] = None
+        self._home_start_time: float | None = None
 
         # Injected by teleop.py launch builder
-        self.arm_joint_names = config.get('arm_joint_names', ['1', '2', '3', '4', '5'])
-        self.gripper_joint_names = config.get('gripper_joint_names', ['6'])
-        self.home_joint_positions = config.get('home_joint_positions', [0.0, 0.0, 0.0, 0.0, 0.0])
-        self._control_dt = 1.0 / config.get('control_frequency', 30.0)
+        self.arm_joint_names = config.get("arm_joint_names", ["1", "2", "3", "4", "5"])
+        self.gripper_joint_names = config.get("gripper_joint_names", ["6"])
+        self.home_joint_positions = config.get("home_joint_positions", [0.0, 0.0, 0.0, 0.0, 0.0])
+        self._control_dt = 1.0 / config.get("control_frequency", 30.0)
 
     def connect(self) -> bool:
         """Connect to phone hardware and initialise MoveIt Servo client."""
@@ -417,15 +416,17 @@ class PhoneDevice(BaseTeleopDevice):
                 return False
 
             from pymoveit2.moveit2_servo import MoveIt2Servo
-            frame_id = self._config.get('base_link_name', 'base')
+
+            frame_id = self._config.get("base_link_name", "base")
             self.servo_client = MoveIt2Servo(
-                node=self._node, frame_id=frame_id,
-                linear_speed=1.0, angular_speed=1.0,
-                enable_at_init=False)
+                node=self._node, frame_id=frame_id, linear_speed=1.0, angular_speed=1.0, enable_at_init=False
+            )
 
             from sensor_msgs.msg import JointState
+
             self._joint_state_sub = self._node.create_subscription(
-                JointState, '/joint_states', self._joint_state_callback, 10)
+                JointState, "/joint_states", self._joint_state_callback, 10
+            )
 
             self._is_connected = True
             self.logger.info("Phone device connected. Servo will be enabled on first control cycle.")
@@ -436,7 +437,7 @@ class PhoneDevice(BaseTeleopDevice):
             self._is_connected = False
             return False
 
-    def get_joint_targets(self) -> Dict[str, float]:
+    def get_joint_targets(self) -> dict[str, float]:
         """
         Drive MoveIt Servo for arm Cartesian control; return gripper target.
 
@@ -452,8 +453,7 @@ class PhoneDevice(BaseTeleopDevice):
             servo_enabled = self._servo_enabled
 
         if going_home:
-            return self._compute_home_targets(
-                current_joints, first_state_rcvd, home_start_time)
+            return self._compute_home_targets(current_joints, first_state_rcvd, home_start_time)
 
         cmd = self._get_cmd_internal()
         if cmd is None:
@@ -476,10 +476,10 @@ class PhoneDevice(BaseTeleopDevice):
                 self._going_home = True
                 self._home_start_time = self._node.get_clock().now().nanoseconds * 1e-9
             if self.servo_client and self.servo_client.is_enabled:
-                self.servo_client.disable()          # ROS call, outside lock
+                self.servo_client.disable()  # ROS call, outside lock
             return self._compute_home_targets(
-                current_joints, first_state_rcvd,
-                self._node.get_clock().now().nanoseconds * 1e-9)
+                current_joints, first_state_rcvd, self._node.get_clock().now().nanoseconds * 1e-9
+            )
 
         # Cartesian control: normalize displacement to [-1, 1] for MoveIt Servo unitless mode.
         # cmd.linear is already clamped to max_ee_step_m, so dividing gives values in [-1, 1].
@@ -493,35 +493,36 @@ class PhoneDevice(BaseTeleopDevice):
 
     def _compute_home_targets(
         self,
-        current_joints: Dict[str, float],
+        current_joints: dict[str, float],
         first_state_rcvd: bool,
-        home_start_time: Optional[float],
-    ) -> Dict[str, float]:
+        home_start_time: float | None,
+    ) -> dict[str, float]:
         """Return home joint targets; clear _going_home flag once arm arrives."""
-        targets = dict(zip(self.arm_joint_names, self.home_joint_positions))
+        targets = dict(zip(self.arm_joint_names, self.home_joint_positions, strict=False))
         targets[self.gripper_joint_names[0]] = self._last_gripper_pos
         now = self._node.get_clock().now().nanoseconds * 1e-9
         elapsed = now - (home_start_time or now)
         # Arrival check: received joint_states + ≥0.5 s elapsed + error < 0.05 rad
         if first_state_rcvd and elapsed >= 0.5:
             actual = [current_joints.get(n) for n in self.arm_joint_names]
-            if None not in actual:
-                if all(abs(a - h) < 0.05 for a, h in zip(actual, self.home_joint_positions)):
-                    with self._state_lock:
-                        self._going_home = False
-                        self._home_start_time = None
-                        self._servo_enabled = True
-                    self.servo_client.enable()       # ROS call, outside lock
+            if None not in actual and all(
+                abs(a - h) < 0.05 for a, h in zip(actual, self.home_joint_positions, strict=False)
+            ):
+                with self._state_lock:
+                    self._going_home = False
+                    self._home_start_time = None
+                    self._servo_enabled = True
+                self.servo_client.enable()  # ROS call, outside lock
         return targets
 
     def _joint_state_callback(self, msg) -> None:
         """Update joint state cache (only writes shared state, never blocks)."""
         with self._state_lock:
-            for name, pos in zip(msg.name, msg.position):
+            for name, pos in zip(msg.name, msg.position, strict=False):
                 self._current_joint_states[name] = pos
             self._first_state_received = True
 
-    def _get_cmd_internal(self) -> Optional[_CartesianCommand]:
+    def _get_cmd_internal(self) -> _CartesianCommand | None:
         """Read phone hardware and compute Cartesian command (ROS-free)."""
         if not self._is_connected or self._phone_impl is None:
             return None
@@ -534,7 +535,7 @@ class PhoneDevice(BaseTeleopDevice):
             self.logger.error(f"Failed to get Cartesian command from phone: {e}")
             return None
 
-    def _compute_cartesian_command(self, action: Dict[str, Any]) -> Optional[_CartesianCommand]:
+    def _compute_cartesian_command(self, action: dict[str, Any]) -> _CartesianCommand | None:
         """Map raw phone action to a _CartesianCommand (pure math, no ROS)."""
         enabled = action.get("phone.enabled", False)
         pos = action.get("phone.pos")
@@ -551,10 +552,7 @@ class PhoneDevice(BaseTeleopDevice):
             a = float(raw_inputs.get("reservedButtonA", 0.0))
             b = float(raw_inputs.get("reservedButtonB", 0.0))
             gripper_vel = a - b
-            go_home = (
-                bool(raw_inputs.get("reservedButtonA", 0))
-                and bool(raw_inputs.get("reservedButtonB", 0))
-            )
+            go_home = bool(raw_inputs.get("reservedButtonA", 0)) and bool(raw_inputs.get("reservedButtonB", 0))
 
         if not enabled:
             self._prev_pos = None
@@ -566,11 +564,13 @@ class PhoneDevice(BaseTeleopDevice):
                 go_home=go_home,
             )
 
-        self._last_gripper_pos = float(np.clip(
-            self._last_gripper_pos + gripper_vel * self.phone_config.gripper_speed_factor,
-            self.phone_config.gripper_range[0],
-            self.phone_config.gripper_range[1],
-        ))
+        self._last_gripper_pos = float(
+            np.clip(
+                self._last_gripper_pos + gripper_vel * self.phone_config.gripper_speed_factor,
+                self.phone_config.gripper_range[0],
+                self.phone_config.gripper_range[1],
+            )
+        )
 
         # First frame after enable: record baseline, output zero
         if self._prev_pos is None or self._prev_rot is None:

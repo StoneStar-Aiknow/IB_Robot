@@ -1,42 +1,10 @@
 #!/bin/bash
 
-platform_ros_setup_path() {
-    if [[ -n "${ROS_HUMBLE_SETUP_PATH:-}" ]]; then
-        echo "${ROS_HUMBLE_SETUP_PATH}"
-    elif [[ -f /opt/ros/humble/setup.sh ]]; then
-        echo "/opt/ros/humble/setup.sh"
-    elif [[ -f /opt/ros/humble/setup.bash ]]; then
-        echo "/opt/ros/humble/setup.bash"
-    else
-        echo "/opt/ros/humble/setup.bash"
-    fi
-}
-
 # Default lerobot patch-series profile selection for this platform.
 # Consumed by detect.sh::resolve_lerobot_profiles when neither
 # IBR_LEROBOT_PROFILES_CLI nor IBR_LEROBOT_PROFILES is set.
 platform_lerobot_profiles() {
     echo "core,ros,hardware,dev"
-}
-
-platform_handle_missing_ros() {
-    log_info "Running ROS 2 installation script..."
-
-    local install_args=()
-    if [[ "${AUTO_YES}" == true ]]; then
-        install_args+=("--yes")
-    fi
-    if [[ "${USE_SUDO}" == false ]]; then
-        install_args+=("--no-sudo")
-    fi
-
-    if "${WORKSPACE}/scripts/install_ros.sh" "${install_args[@]}"; then
-        log_done "ROS 2 Humble installed"
-    else
-        log_error "ROS 2 installation failed"
-        log_error "Please run ${WORKSPACE}/scripts/install_ros.sh manually to diagnose the issue"
-        exit 1
-    fi
 }
 
 platform_prepare_host() {
@@ -52,54 +20,21 @@ platform_install_python_bootstrap() {
     run_sudo apt-get install -y python3-venv python3-pip -qq
 }
 
-platform_install_rosdeps() {
+platform_pre_install_rosdeps() {
     log_info "Updating apt package lists..."
     run_sudo apt-get update -qq
+}
 
-    log_info "Updating rosdepc database..."
-    if ! "${ROSDEPC_BIN:-rosdepc}" update --rosdistro=humble; then
-        log_error "rosdepc update failed. This is usually due to network issues."
-        log_error "Please check your network connection and re-run ./scripts/setup.sh"
-        exit 1
-    fi
-
-    log_info "Installing ROS dependencies via apt..."
-    if ! "${ROSDEPC_BIN:-rosdepc}" install \
-        --from-paths src \
-        --ignore-src \
-        --rosdistro=humble \
-        -y -r \
-        --skip-keys=catkin \
-        --skip-keys=roscpp \
-        --skip-keys=lerobot \
-        --skip-keys=trimesh\[easy\] \
-        --skip-keys=simple-parsing \
-        --skip-keys=cupy-cuda12x \
-        --skip-keys=ctl_system_interface \
-        --skip-keys=numpy_lessthan_2 \
-        --skip-keys=ament_python \
-        --skip-keys=feetech-servo-sdk \
-        --skip-keys=pyserial; then
-        log_error "rosdepc install failed."
-        log_error "Please check your network connection or dependency lists and re-run ./scripts/setup.sh"
-        exit 1
-    fi
-
-    # rosdepc resolves the ros2_tracing and tracetools_analysis packages from
-    # robot_config/package.xml on Ubuntu, but python3-lttngust and babeltrace2
-    # still need explicit system packages in the normal setup flow.
+platform_post_install_rosdeps() {
+    # Explicitly install tracing tools whose rosdep keys exist in base.yaml but
+    # may be skipped when the rosdep database update fails (network issues).
+    # ROS packages (ros2trace, tracetools-analysis) are resolved by rosdep
+    # from package.xml <exec_depend> entries and do not need explicit install.
     log_info "Installing remaining tracing tools without rosdep rules..."
-    run_sudo apt-get install -y --no-install-recommends python3-lttngust babeltrace2 -qq
+    run_sudo apt-get install -y --no-install-recommends lttng-tools python3-lttngust babeltrace2 -qq
 
     if ! groups | grep -q '\btracing\b'; then
         run_sudo usermod -aG tracing "$(whoami)" 2>/dev/null || true
         log_warn "Added $(whoami) to the 'tracing' group; re-login may be required before using LTTng."
     fi
-}
-
-platform_verify_ros_python_bridge() {
-    local ros_setup
-    ros_setup="$(platform_ros_setup_path)"
-    [[ -z "${ros_setup}" || ! -f "${ros_setup}" ]] && return 1
-    (source "${ros_setup}" && python3 -c "import rclpy; print('ROS 2 Humble connection successful')") 2>/dev/null
 }

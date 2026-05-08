@@ -4,7 +4,12 @@
 
 | 文件 | 职责 |
 | --- | --- |
+| `rosdep.sh` | 包含虚拟环境的路径解析、早期建立以及 `rosdepc` 初始化。 |
+| `submodules.sh` | Git submodule 的状态探测和自动同步。 |
+| `python_venv.sh` | 完整建立和配置最终的 Python 环境以及包安装，包括 colcon 及 NumPy 的版本锁定。 |
+| `common.sh` | 通用工具函数，例如日志格式、`run_cmd` 与 `ask_yn`、`sudo` 会话等基础设施提取。 |
 | `detect.sh` | OS / 架构 / Python 探测；解析 `IBR_HOST_*` 与 `IBR_LEROBOT_PROFILES`。 |
+| `verify_env.sh` | 独立环境验证库；暴露 `verify_ros` / `verify_colcon` / `verify_numpy_compat` / `verify_lerobot` / `verify_tracing` 及入口 `verify_env`。 |
 | `platforms/<id>.sh` | 各平台的包管理器、ROS 源、`platform_lerobot_profiles()` 默认值。 |
 | `lerobot_patches.sh` | 驱动 `git am` 将精选的 lerobot 补丁栈应用到 `libs/lerobot`。 |
 | `lerobot_resolve_active.py` | 从 `INDEX.yaml` 解析当前生效的 lerobot tag；并交叉校验对应 `manifest.yaml`。 |
