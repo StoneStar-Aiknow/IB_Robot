@@ -1,0 +1,405 @@
+From 3ba88d214fd3f6cfba747bf21e259ed9cd404b08 Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Fri, 8 May 2026 16:20:45 +0800
+Subject: [PATCH] train: add weighted training extras
+
+Build on top of the migrated adaptive-weighting prerequisites by adding the
+custom sample-weight loader, quantization-aware weight clipping helpers, and
+the extra logging/summary plumbing used by the weighted-training workflow.
+
+---
+ src/lerobot/configs/train.py         |   8 +-
+ src/lerobot/scripts/lerobot_train.py |  87 +++++++++++++---
+ src/lerobot/utils/qat.py             | 149 ++++++++++++++++++++++++++++
+ 3 files changed, 228 insertions(+), 16 deletions(-)
+ create mode 100644 src/lerobot/utils/qat.py
+
+diff --git a/src/lerobot/configs/train.py b/src/lerobot/configs/train.py
+index 30d0fb2c..b11edf3e 100644
+--- a/src/lerobot/configs/train.py
++++ b/src/lerobot/configs/train.py
+@@ -51,9 +51,15 @@ class TrainPipelineConfig(HubMixin):
+     # AND for the evaluation environments.
+     seed: int | None = 1000
+     # Adaptive loss weighting parameters.
+-    ada_weight: bool = True
++    ada_weight: bool = False
+     # Frequency (in number of steps) to update the adaptive weights.
+     ada_weight_freq: int = 200
++    # Static sample-weight toggle.
++    custom_weights: bool = False
++    # Weight clipping toggle for quantization-sensitive training.
++    weight_clipping: bool = False
++    clipping_min: float = 5.96e-08
++    clipping_max: float = 1.31e05
+     # Damping coefficient for the adaptive loss weighting.
+     damping_coefficient: float = 0.7
+     # Set to True to use deterministic cuDNN algorithms for reproducibility.
+diff --git a/src/lerobot/scripts/lerobot_train.py b/src/lerobot/scripts/lerobot_train.py
+index dab6f13d..404f86c5 100644
+--- a/src/lerobot/scripts/lerobot_train.py
++++ b/src/lerobot/scripts/lerobot_train.py
+@@ -15,6 +15,7 @@
+ # limitations under the License.
+ import dataclasses
+ import logging
++import os
+ import time
+ from contextlib import nullcontext
+ from pprint import pformat
+@@ -24,6 +25,7 @@ import torch
+ from accelerate import Accelerator
+ from termcolor import colored
+ from torch.optim import Optimizer
++from torch.utils.tensorboard import SummaryWriter
+ from tqdm import tqdm
+ 
+ from lerobot.configs import parser
+@@ -49,6 +51,7 @@ from lerobot.utils.train_utils import (
+     save_checkpoint,
+     update_last_checkpoint,
+ )
++from lerobot.utils.qat import QuantConstraint
+ from lerobot.utils.utils import (
+     format_big_number,
+     has_method,
+@@ -151,6 +154,31 @@ def update_policy(
+     return train_metrics, output_dict
+ 
+ 
++def set_train_sample_weights(cfg, dataset, train_dataset, train_num_samples):
++    train_sample_weights = [1.0] * train_num_samples
++    if not cfg.custom_weights:
++        return train_sample_weights
++    if hasattr(dataset, "hf_dataset") and "training_weight" in dataset.hf_dataset.features:
++        logging.info("Found 'training_weight' in dataset. Extracting custom weights...")
++        full_weights_column = dataset.hf_dataset["training_weight"]
++        train_sample_weights = [float(full_weights_column[i]) for i in train_dataset.indices]
++
++        logging.info(f"Successfully loaded {len(train_sample_weights)} custom weights.")
++
++        if len(train_sample_weights) > 0:
++            logging.info(f"Weight stats - Max: {max(train_sample_weights)}, Min: {min(train_sample_weights)}")
++    elif len(dataset) > 0 and "training_weight" in dataset[0]:
++        logging.info("Extracting 'training_weight' by iterating (slow path)...")
++        train_sample_weights = [
++            float(dataset[i]["training_weight"])
++            for i in tqdm(train_dataset.indices, desc="Loading Weights")
++        ]
++    else:
++        logging.warning("'training_weight' not found in dataset features. Using default 1.0 weights.")
++
++    return train_sample_weights
++
++
+ @parser.wrap()
+ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+     """
+@@ -187,6 +215,13 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+             cpu=force_cpu,
+         )
+ 
++    folder_path = "./logs"
++    if not os.path.exists(folder_path):
++        os.mkdir(folder_path)
++        print(f"Logs folder {folder_path} created successfully")
++    else:
++        print(f"Logs folder {folder_path} already exists")
++
+     init_logging(accelerator=accelerator)
+ 
+     # Determine if this is the main process (for logging and checkpointing)
+@@ -244,6 +279,14 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+         rename_map=cfg.rename_map,
+     )
+ 
++    quant_constraint = QuantConstraint(
++        policy=policy,
++        accelerator=accelerator,
++        quant_param_min=cfg.clipping_min,
++        quant_param_max=cfg.clipping_max,
++        hisi_log_path="./haisi.log",
++    )
++
+     if cfg.peft is not None:
+         logging.info("Using PEFT! Wrapping model.")
+         # Convert CLI peft config to dict for overrides
+@@ -337,6 +380,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+ 
+     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+     num_total_params = sum(p.numel() for p in policy.parameters())
++    log_dir = f"logs/pytorch/{str(cfg.output_dir).split('/')[-1]}"
++    writer = SummaryWriter(log_dir=log_dir)
+ 
+     if is_main_process:
+         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
+@@ -369,12 +414,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+         orig_to_subset = None
+ 
+     train_num_samples = len(train_dataset)
+-    train_sample_weights = [1.0] * train_num_samples
++    train_sample_weights = set_train_sample_weights(cfg, dataset, train_dataset, train_num_samples)
+     train_sample_count = [0] * train_num_samples
+ 
+-    if cfg.ada_weight:
+-        sampler = WeightSampler(weights=train_sample_weights, num_samples=train_num_samples, replacement=True)
+-    elif hasattr(cfg.policy, "drop_n_last_frames"):
++    sampler = WeightSampler(weights=train_sample_weights, num_samples=train_num_samples, replacement=True)
++    if not cfg.custom_weights and not cfg.ada_weight and hasattr(cfg.policy, "drop_n_last_frames"):
+         sampler = EpisodeAwareSampler(
+             dataset.meta.episodes["dataset_from_index"],
+             dataset.meta.episodes["dataset_to_index"],
+@@ -382,7 +426,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+             drop_n_last_frames=cfg.policy.drop_n_last_frames,
+             shuffle=True,
+         )
+-    else:
++    elif not cfg.custom_weights and not cfg.ada_weight:
+         sampler = None
+ 
+     train_loader = torch.utils.data.DataLoader(
+@@ -391,7 +435,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+         batch_size=cfg.batch_size,
+         shuffle=sampler is None and not cfg.dataset.streaming,
+         sampler=sampler,
+-        pin_memory=device.type == "cuda",
++        pin_memory=device.type != "cpu",
+         drop_last=False,
+         prefetch_factor=2 if cfg.num_workers > 0 else None,
+     )
+@@ -401,7 +445,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+         num_workers=cfg.num_workers,
+         batch_size=cfg.batch_size,
+         shuffle=True,
+-        pin_memory=device.type == "cuda",
++        pin_memory=device.type != "cpu",
+         drop_last=False,
+         prefetch_factor=2 if cfg.num_workers > 0 else None,
+     )
+@@ -411,7 +455,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+     policy, optimizer, train_loader, lr_scheduler = accelerator.prepare(
+         policy, optimizer, train_loader, lr_scheduler
+     )
+-    val_loader = accelerator.prepare(val_loader)
+     train_iter = cycle(train_loader)
+     val_iter = cycle(val_loader)
+ 
+@@ -461,7 +504,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+                 batch_size=cfg.batch_size,
+                 sampler=sampler,
+                 shuffle=False,
+-                pin_memory=device.type == "cuda",
++                pin_memory=device.type != "cpu",
+                 drop_last=False,
+                 prefetch_factor=2 if cfg.num_workers > 0 else None,
+             )
+@@ -502,6 +545,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+                 train_sample_weights[subset_idx] = max(train_sample_weights[subset_idx], 0.1)
+                 train_sample_count[subset_idx] += 1
+ 
++        if cfg.weight_clipping:
++            quant_constraint.clip_weights()
++
+         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
+         # increment `step` here.
+         step += 1
+@@ -514,6 +560,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+ 
+         if is_log_step:
+             logging.info(train_tracker)
++            for metric in train_tracker.metrics.values():
++                metric_str = str(metric)
++                value = float(metric_str.split(":")[-1])
++                name = metric_str.split(":")[0]
++                writer.add_scalar(f"{name}/step", value, step)
+             if wandb_logger:
+                 wandb_log_dict = train_tracker.to_dict()
+                 if output_dict:
+@@ -534,18 +585,24 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+         best_eval_sign = False
+         if not cfg.env and is_eval_step:
+             policy.eval()
+-            per_eval_num = max(1, len(val_loader) // 4)
++            per_eval_num = len(val_loader) // 4 + 1
+             logging.info(f"Start evaluating: {per_eval_num}/{len(val_loader)} batches")
+             eval_loss = 0.0
+-            for _ in range(per_eval_num):
+-                val_batch, _ = next(val_iter)
+-                val_batch = preprocessor(val_batch)
+-                with accelerator.autocast():
++            with torch.no_grad():
++                for _ in tqdm(range(per_eval_num)):
++                    val_batch, _ = next(val_iter)
++                    val_batch = preprocessor(val_batch)
+                     loss, _ = policy.forward(val_batch)
+-                eval_loss += loss.item()
++                    eval_loss += loss.item()
++                torch.cuda.empty_cache()
+             eval_loss /= per_eval_num
+             logging.info(f"Eval policy at step {step}, eval_loss: {eval_loss:.3f}")
+ 
++            if cfg.ada_weight:
++                logging.info(train_sample_weights[:1000])
++                logging.info(train_sample_count[:1000])
++            writer.add_scalar("Loss/eval", eval_loss, step)
++
+             if eval_loss < best_eval_loss:
+                 best_eval_loss = eval_loss
+                 logging.info(f"New best eval loss: {best_eval_loss:.3f}, saving checkpoint")
+diff --git a/src/lerobot/utils/qat.py b/src/lerobot/utils/qat.py
+new file mode 100644
+index 00000000..d639a771
+--- /dev/null
++++ b/src/lerobot/utils/qat.py
+@@ -0,0 +1,149 @@
++import argparse
++import logging
++import re
++import sys
++from collections import defaultdict
++
++import numpy as np
++import torch
++import torch.nn as nn
++
++
++def parse_hisi_om_log(log_file_path):
++    op_pattern = re.compile(r"Op\[(/[\w/\.]+/Conv)\]")
++    weight_scale_pattern = re.compile(r"Weight\[\d+\] Scale\[([\d\.e+-]+)\]")
++
++    layer_weight_scale = {}
++    current_layer = None
++
++    with open(log_file_path, encoding="utf-8") as f:
++        for line in f:
++            line = line.strip()
++            op_match = op_pattern.search(line)
++            if op_match:
++                current_layer = op_match.group(1)
++            if current_layer and "Weight" in line and "Scale" in line:
++                scale_match = weight_scale_pattern.search(line)
++                if scale_match:
++                    scale_value = float(scale_match.group(1))
++                    layer_weight_scale[current_layer] = scale_value
++                    current_layer = None
++
++    layer_weight_scale = dict(layer_weight_scale)
++    print(f"Parsed {len(layer_weight_scale)} layer scales from log")
++    return layer_weight_scale
++
++
++class QuantConstraint:
++    def __init__(
++        self, policy, accelerator, quant_param_min=5.96e-08, quant_param_max=1.31e05, hisi_log_path=None
++    ):
++        self.policy = policy
++        self.accelerator = accelerator
++        self.quant_param_min = quant_param_min
++        self.quant_param_max = quant_param_max
++        self.violation_log = defaultdict(list)
++        self._target_modules = None
++        self.layer_weight_scale = {}
++
++        if hisi_log_path:
++            try:
++                self.layer_weight_scale = parse_hisi_om_log(hisi_log_path)
++            except Exception as e:
++                logging.warning(f"Failed to parse hisi log, falling back to dynamic scale: {e}")
++
++    def _get_all_weighted_modules(self):
++        raw_model = self.accelerator.unwrap_model(self.policy, keep_fp32_wrapper=True)
++        model = raw_model.model
++        target_modules = {}
++        for name, module in model.named_modules():
++            if hasattr(module, "weight") and module.weight is not None:
++                target_modules[name] = module
++        return target_modules
++
++    def _calculate_layer_scale_dynamically(self, module_weights):
++        quant_range = 2047 - (-2048)
++        weights_min = torch.min(module_weights).item()
++        weights_max = torch.max(module_weights).item()
++        return (weights_max - weights_min) / (quant_range + 1e-15)
++
++    def clip_weights(self):
++        if self._target_modules is None:
++            self._target_modules = self._get_all_weighted_modules()
++            if not self._target_modules:
++                logging.warning("No weighted modules matched for quant clipping")
++                return
++
++        with torch.no_grad(), self.accelerator.autocast():
++            for name, module in self._target_modules.items():
++                weights = module.weight.data
++                device = weights.device
++                if not torch.is_floating_point(weights):
++                    weights = weights.float()
++
++                if name in self.layer_weight_scale:
++                    weight_scale = self.layer_weight_scale[name]
++                else:
++                    weight_scale = self._calculate_layer_scale_dynamically(weights)
++                    self.layer_weight_scale[name] = weight_scale
++
++                actual_min = self.quant_param_min * weight_scale
++                actual_max = self.quant_param_max * weight_scale
++
++                abs_weights = torch.abs(weights)
++                below_min_mask = (abs_weights < actual_min) & (abs_weights > 1e-15)
++                if torch.any(below_min_mask):
++                    weights[below_min_mask] = torch.sign(weights[below_min_mask]) * actual_min
++
++                above_max_mask = abs_weights > actual_max
++                if torch.any(above_max_mask):
++                    weights[above_max_mask] = torch.sign(weights[above_max_mask]) * actual_max
++
++                module.weight.data = weights.to(device)
++
++
++def check_quant_range_violations(model, quant_min=0.008, quant_max=1.31e05, device="cpu"):
++    violation_info = {}
++    for name, module in model.named_modules():
++        if hasattr(module, "weight") and module.weight is not None:
++            weight = module.weight.detach().to(device)
++            abs_weight = torch.abs(weight)
++            below_min = ((abs_weight < quant_min) & (abs_weight > 0)).sum().item()
++            above_max = (abs_weight > quant_max).sum().item()
++            if below_min > 0 or above_max > 0:
++                violation_info[name] = {
++                    "layer_type": str(type(module)),
++                    "weight_shape": tuple(weight.shape),
++                    "total_weights": weight.numel(),
++                    "below_min": {"count": below_min},
++                    "above_max": {"count": above_max},
++                    "weight_stats": {
++                        "abs_min": abs_weight.min().item(),
++                        "abs_max": abs_weight.max().item(),
++                        "abs_mean": abs_weight.mean().item(),
++                    },
++                }
++    return violation_info
++
++
++def save_violation_report(violation_info, save_path):
++    with open(save_path, "w", encoding="utf-8") as f:
++        f.write(f"Found {len(violation_info)} violating layers\n\n")
++        for name, info in violation_info.items():
++            f.write(f"Layer: {name}\n")
++            f.write(f"  Type: {info['layer_type']}\n")
++            f.write(f"  Shape: {info['weight_shape']}\n")
++            f.write(f"  Total weights: {info['total_weights']}\n")
++            f.write(f"  Below min: {info['below_min']['count']}\n")
++            f.write(f"  Above max: {info['above_max']['count']}\n")
++            f.write("\n")
++
++
++if __name__ == "__main__":
++    parser = argparse.ArgumentParser(description="Check model quant range violations")
++    parser.add_argument("--model_path", type=str, help="Model training config path")
++    if len(sys.argv) == 1:
++        parser.print_help()
++        sys.exit(1)
++    args = parser.parse_args()
++    print(args.model_path)
+-- 
+2.34.1
