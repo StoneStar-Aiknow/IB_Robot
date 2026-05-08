@@ -106,8 +106,8 @@ class SearchConfig:
       pathological non-convex surfaces.
 
     Saturation reach was widened from the original ±12 (step 4 × 7 pts)
-    to ±40 (step 8 × 11 pts) — users reported the previous range was
-    too narrow given the device's 0..255 saturation cap.
+    to ±56 (step 8 × 15 pts) — users reported the previous range was
+    still too narrow given the device's 0..255 saturation cap.
     """
 
     # K range: step 400K × 9 points = ±1600K reach around the seed
@@ -117,7 +117,7 @@ class SearchConfig:
     step_S: int = 8
     n_K: int = 9
     n_C: int = 7
-    n_S: int = 11
+    n_S: int = 15
     # Cap kept generous so coord descent's extra passes still fit, and
     # the rare "grid" caller still gets reasonable coverage.
     max_evals: int = 300

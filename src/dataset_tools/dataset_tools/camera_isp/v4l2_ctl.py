@@ -40,6 +40,8 @@ _NAME_FALLBACKS: dict[str, tuple[str, ...]] = {
     "brightness":         ("brightness",),
     "saturation":         ("saturation",),
     "contrast":           ("contrast",),
+    "sharpness":          ("sharpness",),
+    "focus":              ("focus_absolute", "focus"),
 }
 
 # Special menu values for `auto_exposure`:
@@ -57,6 +59,7 @@ class CtrlInfo:
     minimum: int | None
     maximum: int | None
     default: int | None = None
+    value: int | None = None
 
 
 def have_v4l2_ctl() -> bool:
@@ -114,6 +117,7 @@ def resolve_ctrls(device: str) -> dict[str, CtrlInfo]:
                     minimum=info.get("min"),
                     maximum=info.get("max"),
                     default=info.get("default"),
+                    value=info.get("value"),
                 )
                 break
     return out

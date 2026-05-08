@@ -84,6 +84,9 @@ _SLIDERS: tuple[tuple[str, str, int, int, int], ...] = (
     ("sharpness",   "sharpness",     0,    255,  128),
 )
 
+_SLIDER_KEYS = {key for _, key, _, _, _ in _SLIDERS}
+_BOOL_ISP_KEYS = {"auto_white_balance", "autoexposure", "autofocus"}
+
 _DEBOUNCE_S = 0.4
 _RECONNECT_S = 2.0
 _SOLVER_RETRIES = 4
@@ -404,6 +407,11 @@ class _CalibratorStageBridge:
     def write_v4l2(self, params: Mapping[str, int]) -> None:
         if not params:
             return
+        if getattr(self._calib, "_protect_brightness_in_auto_pipeline", False):
+            params = {k: v for k, v in params.items() if k != "brightness"}
+            if not params:
+                time.sleep(self._SETTLING_S * 0.5)
+                return
         # Write-diff: skip keys whose value matches what we last applied
         # successfully. Coarse coordinate-descent search varies one of
         # K/C/Sat per eval, so 2/3 of writes are pure no-ops that still
@@ -503,6 +511,9 @@ class CalibratorWindow:
         # Set True while we are programmatically moving sliders so the
         # trackbar callback can short-circuit and not bounce values back.
         self._suppress_cb = False
+        self._trackbars_ready = False
+        self._brightness_user_locked = False
+        self._protect_brightness_in_auto_pipeline = False
         # Updated by _force_manual_modes(): True if AWB really turned off at
         # the driver level (not just the ROS parameter store).
         self._wb_writable = True
@@ -581,9 +592,7 @@ class CalibratorWindow:
     # ------------------------------------------------------------------
 
     def _snapshot_initial(self) -> bool:
-        keys = tuple(k for _, k, _, _, _ in _SLIDERS) + (
-            "auto_white_balance", "autoexposure", "video_device",
-        )
+        keys = _ALL_KEYS + ("video_device",)
         params, err = self._bridge.get_params(keys)
         if err:
             self._notify(f"Init read failed: {err}", RED, 5.0)
@@ -595,13 +604,6 @@ class CalibratorWindow:
         vdev = params.pop("video_device", None)
         if isinstance(vdev, str) and vdev:
             self._bridge.video_device = vdev
-        # Strip the bool keys from _initial / _applied. We never want to
-        # write them via ROS — doing so triggers usb_cam's parameter
-        # callback which re-issues every (often legacy-named) V4L2 control
-        # for several seconds, blowing the SetParameters timeout. Manual
-        # mode is engaged via v4l2-ctl in _force_manual_modes() instead.
-        params.pop("auto_white_balance", None)
-        params.pop("autoexposure", None)
         self._initial = dict(params)
         self._applied = dict(params)
         self._pending = {
@@ -625,6 +627,7 @@ class CalibratorWindow:
                     for logical_key in (
                         "white_balance", "exposure",
                         "gain", "brightness", "saturation", "contrast",
+                        "sharpness", "focus",
                     ):
                         info = resolved.get(logical_key)
                         if info and info.minimum is not None and info.maximum is not None:
@@ -634,10 +637,53 @@ class CalibratorWindow:
                             }
                             if info.default is not None:
                                 cap["default"] = int(info.default)
+                            if info.value is not None:
+                                cap["value"] = int(info.value)
                             self._device_caps[logical_key] = cap
             except Exception as exc:  # noqa: BLE001
                 self._notify(f"v4l2-ctl probe failed: {exc}", YELLOW, 4.0)
+        self._normalize_initial_snapshot()
         return err is None
+
+    def _normalize_isp_value(self, key: str, value: Any) -> Any | None:
+        if key in _BOOL_ISP_KEYS:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            return None
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            return None
+        if key != "brightness" and ivalue < 0:
+            cap = self._device_caps.get(key, {})
+            cap_value = cap.get("value")
+            cap_default = cap.get("default")
+            if cap_value is not None:
+                ivalue = int(cap_value)
+            elif cap_default is not None:
+                ivalue = int(cap_default)
+            else:
+                return None
+        cap = self._device_caps.get(key)
+        if cap is not None:
+            ivalue = max(int(cap["min"]), min(int(cap["max"]), ivalue))
+        return ivalue
+
+    def _normalize_initial_snapshot(self) -> None:
+        for key in _ALL_KEYS:
+            if key not in self._applied:
+                continue
+            normalized = self._normalize_isp_value(key, self._applied[key])
+            if normalized is None:
+                self._applied.pop(key, None)
+                self._initial.pop(key, None)
+                continue
+            self._applied[key] = normalized
+            self._initial[key] = normalized
+            if key in _SLIDER_KEYS:
+                self._pending[key] = int(normalized)
 
     def _force_manual_modes(self) -> None:
         """Disable AWB / AE / AF at the V4L2 driver level (bypassing usb_cam).
@@ -667,6 +713,8 @@ class CalibratorWindow:
         msgs = _v4l2.force_manual_modes(device, resolved)
         if _v4l2.verify_manual_wb(device, resolved):
             self._wb_writable = True
+            self._applied["auto_white_balance"] = False
+            self._applied["autoexposure"] = False
             self._notify("Manual WB / AE engaged at driver", GREEN, 3.0)
         else:
             self._wb_writable = False
@@ -717,6 +765,7 @@ class CalibratorWindow:
     def _build_window(self) -> None:
         cv = self._opencv
         cv.namedWindow(self.WINDOW_NAME, cv.WINDOW_AUTOSIZE)
+        self._trackbars_ready = False
         # Cache effective (lo, hi) per slider so render / sync code uses the
         # device-capability ranges instead of the conservative built-in ones.
         self._slider_range: dict[str, tuple[int, int]] = {}
@@ -773,6 +822,7 @@ class CalibratorWindow:
                 self._make_trackbar_cb(key, lo, hi),
             )
         cv.setMouseCallback(self.WINDOW_NAME, self._on_main_mouse)
+        self._trackbars_ready = True
 
     def _slider_ui_range(self, key: str, lo: int, hi: int) -> tuple[int, int]:
         if key != "brightness":
@@ -825,6 +875,8 @@ class CalibratorWindow:
                 signed_value,
             )
             self._last_change["brightness"] = time.monotonic()
+            if getattr(self, "_trackbars_ready", False):
+                self._brightness_user_locked = True
             self._dirty_save = True
         return cb
 
@@ -1293,6 +1345,20 @@ class CalibratorWindow:
             self._dirty_save = True
         else:
             self._notify(f"set failed: {err}", RED, 4.0)
+
+    def _flush_locked_brightness(self) -> None:
+        if not self._brightness_user_locked:
+            return
+        pending = self._pending.get("brightness")
+        if pending is None or self._applied.get("brightness") == pending:
+            return
+        ok, err = self._apply_via_v4l2_or_ros({"brightness": int(pending)})
+        if not ok:
+            self._notify(f"blacklevel apply failed: {err}", YELLOW, 4.0)
+            return
+        self._applied["brightness"] = int(pending)
+        self._last_change.pop("brightness", None)
+        self._dirty_save = True
 
     def _sync_trackbars_to_applied(self) -> None:
         cv = self._opencv
@@ -1884,15 +1950,17 @@ class CalibratorWindow:
             self._notify("SW-only mode OFF  (hardware writes resumed)",
                          GREEN, 3.0)
 
-    def _zero_brightness_for_calibration(self) -> None:
+    def _zero_brightness_for_calibration(self, *, force: bool = False) -> None:
         """Write brightness=default at the very start of any calibration run.
 
-        Ensures the pipeline, color search, and solver all operate from a
-        neutral baseline before the pedestal stage refines the offset.
+        Ensures the pipeline, color search, and solver operate from a
+        neutral baseline unless the user has explicitly tuned blacklevel.
         No-op if brightness is already at the device default or if the
         instance is not fully initialised (e.g. in unit tests).
         """
         if not hasattr(self, "_applied"):
+            return
+        if self._brightness_user_locked and not force:
             return
         bri_default, _, _ = self._bri_default_minmax()
         cur_bri = int(self._applied.get("brightness", bri_default))
@@ -1949,13 +2017,17 @@ class CalibratorWindow:
             )
             self._mode = "IDLE"
             return
+        self._flush_locked_brightness()
         self._zero_brightness_for_calibration()
+        saved_protect = self._protect_brightness_in_auto_pipeline
         try:
+            self._protect_brightness_in_auto_pipeline = self._brightness_user_locked
             self._run_auto_pipeline()
         except Exception as exc:  # noqa: BLE001
             self._notify(f"Auto crashed: {exc}", RED, 6.0)
             return
         finally:
+            self._protect_brightness_in_auto_pipeline = saved_protect
             self._mode = "IDLE"
             self._compute_progress = (0, 0)
 
@@ -1971,7 +2043,13 @@ class CalibratorWindow:
         # converge on the corrected dark level (otherwise the search
         # spends evals fighting a constant offset).
         try:
-            self._run_pedestal_stage(mode="ref")
+            if self._brightness_user_locked:
+                self._notify(
+                    "Auto: keeping user blacklevel; pedestal skipped",
+                    GREEN, 4.0,
+                )
+            else:
+                self._run_pedestal_stage(mode="ref")
         except Exception as exc:  # noqa: BLE001
             self._notify(f"Auto: pedestal failed: {exc}", YELLOW, 4.0)
         try:
@@ -2205,15 +2283,16 @@ class CalibratorWindow:
     def _save_override(self) -> None:
         path = _override_path(self._bridge.camera_name)
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Save only keys we actually manipulated AND that differ from initial,
-        # plus the auto_* flags so the override fully reproduces the state.
+        # Save the full reproducible ISP state, including usb_cam defaults
+        # after sentinel normalization and the manual auto_* flags engaged
+        # by _force_manual_modes().
         payload: dict[str, Any] = {}
-        keys_to_persist = [k for _, k, _, _, _ in _SLIDERS] + [
-            "auto_white_balance", "autoexposure",
-        ]
-        for k in keys_to_persist:
-            if k in self._applied:
-                payload[k] = self._applied[k]
+        for k in _ALL_KEYS:
+            if k not in self._applied:
+                continue
+            value = self._normalize_isp_value(k, self._applied[k])
+            if value is not None:
+                payload[k] = value
         payload["_camera"] = self._bridge.camera_name
         payload["_saved_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
@@ -2542,7 +2621,13 @@ class CalibratorWindow:
             # Pedestal SSOT: cc24 has no full reference image to
             # compare against, so use the auto (live-only) estimator.
             # Δ stays clamped ≤ 0 — cc24 only ever subtracts pedestal.
-            self._run_pedestal_stage(mode="auto")
+            if self._brightness_user_locked:
+                self._notify(
+                    "cc24: keeping user blacklevel; auto pedestal skipped",
+                    GREEN, 4.0,
+                )
+            else:
+                self._run_pedestal_stage(mode="auto")
         except Exception as exc:  # noqa: BLE001
             self._notify(f"cc24: pedestal failed: {exc}", YELLOW, 4.0)
         try:
@@ -2623,13 +2708,16 @@ class CalibratorWindow:
         # (live pane, save flow) is unaffected.
         saved_ref = self._reference
         saved_pairs = self._roi_pairs
+        saved_protect = self._protect_brightness_in_auto_pipeline
         try:
             self._reference = synthetic
             self._roi_pairs = valid_pairs
+            self._protect_brightness_in_auto_pipeline = self._brightness_user_locked
             self._run_auto_pipeline()
         finally:
             self._reference = saved_ref
             self._roi_pairs = saved_pairs
+            self._protect_brightness_in_auto_pipeline = saved_protect
 
     # ------------------------------------------------------------------
     # Pedestal (signed-Δ ``brightness``) stage — runs BEFORE color search
@@ -2809,6 +2897,13 @@ class CalibratorWindow:
             search ROIs).
           * Sanity warnings are non-blocking; the user-chosen Δ wins.
         """
+        if self._brightness_user_locked:
+            self._notify(
+                "Manual: keeping user blacklevel; pedestal skipped",
+                GREEN, 4.0,
+            )
+            return
+
         from dataset_tools.camera_isp.pedestal import darkest_pair_index
 
         cv = self._opencv
@@ -3389,8 +3484,9 @@ class CalibratorWindow:
         No "is this neutral gray?" labelling is needed in REF mode — the
         user's correspondences are the ground truth.
         """
-        # Zero brightness before dispatch so both the cc24 wizard and the
-        # regular pair-pick path start from a neutral baseline.
+        # Zero brightness before dispatch unless the user has explicitly
+        # tuned the split blacklevel/brightness sliders.
+        self._flush_locked_brightness()
         self._zero_brightness_for_calibration()
         # ColorChecker24 mode → run the 24-patch wizard instead.
         if self._colorchecker_mode:
@@ -3779,6 +3875,15 @@ class CalibratorWindow:
                 canvas = self._render(live, live_stale)
                 cv.imshow(self.WINDOW_NAME, canvas)
                 key = cv.waitKey(30) & 0xFF
+                try:
+                    visible = cv.getWindowProperty(
+                        self.WINDOW_NAME,
+                        cv.WND_PROP_VISIBLE,
+                    )
+                except Exception:  # noqa: BLE001
+                    visible = 1.0
+                if visible == 0.0:
+                    break
 
                 if key == 0xFF:
                     continue
