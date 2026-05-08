@@ -1,17 +1,5 @@
 #!/bin/bash
 
-platform_ros_setup_path() {
-    if [[ -n "${ROS_HUMBLE_SETUP_PATH:-}" ]]; then
-        echo "${ROS_HUMBLE_SETUP_PATH}"
-    elif [[ -f /opt/ros/humble/setup.sh ]]; then
-        echo "/opt/ros/humble/setup.sh"
-    elif [[ -f /opt/ros/humble/setup.bash ]]; then
-        echo "/opt/ros/humble/setup.bash"
-    else
-        echo "/opt/ros/humble/setup.bash"
-    fi
-}
-
 # Default lerobot patch-series profile selection for this platform.
 # Consumed by detect.sh::resolve_lerobot_profiles when neither
 # IBR_LEROBOT_PROFILES_CLI nor IBR_LEROBOT_PROFILES is set.
@@ -19,31 +7,12 @@ platform_lerobot_profiles() {
     echo "core,ros,hardware,openeuler"
 }
 
-platform_handle_missing_ros() {
-    log_info "Running ROS 2 installation script..."
-
-    local install_args=()
-    if [[ "${AUTO_YES}" == true ]]; then
-        install_args+=("--yes")
-    fi
-    if [[ "${USE_SUDO}" == false ]]; then
-        install_args+=("--no-sudo")
-    fi
-
-    if "${WORKSPACE}/scripts/install_ros.sh" "${install_args[@]}"; then
-        log_done "ROS 2 Humble installed"
-    else
-        log_error "ROS 2 installation failed"
-        log_error "Please run ${WORKSPACE}/scripts/install_ros.sh manually to diagnose the issue"
-        exit 1
-    fi
-}
-
 platform_prepare_host() {
     log_warn "openEuler detected. Setting ROS_OS_OVERRIDE=rhel:8 for rosdep compatibility."
     export ROS_OS_OVERRIDE=rhel:8
 
-    ensure_openeuler_base_repo
+    ensure_openeuler_builtin_repos
+    ensure_openeuler_gpg_key
 
     log_info "Installing openEuler host packages required by the workspace..."
     run_sudo dnf install -y --nogpgcheck gcc-c++ vim-enhanced ffmpeg-devel libvpx libvpx-devel nlohmann-json-devel
@@ -58,66 +27,82 @@ platform_install_colcon() {
     fi
 }
 
+openeuler_builtin_repos_configured() {
+    dnf repolist --enabled | awk '
+        $1 == "everything" { everything = 1 }
+        $1 == "update" { update = 1 }
+        $1 == "EPOL" { epol = 1 }
+        END { exit (everything && update && epol) ? 0 : 1 }
+    '
+}
+
+ensure_openeuler_builtin_repos() {
+    if openeuler_builtin_repos_configured; then
+        log_info "Built-in openEuler 24.03 repos already configured."
+        return 0
+    fi
+
+    log_error "Required built-in openEuler repos are missing (expected: everything, update, EPOL)."
+    log_error "Please restore /etc/yum.repos.d/openEuler.repo before running setup.sh."
+    exit 1
+}
+
+ensure_openeuler_gpg_key() {
+    if rpm -qi gpg-pubkey'*' 2>/dev/null | grep -q 'openEuler'; then
+        log_info "openEuler RPM GPG key already imported."
+        return 0
+    fi
+
+    local arch tmp key_url
+    arch=$(uname -m)
+    tmp=$(mktemp)
+    for key_url in \
+        "https://mirrors.tuna.tsinghua.edu.cn/openeuler/openEuler-24.03-LTS/OS/${arch}/RPM-GPG-KEY-openEuler" \
+        "https://repo.openeuler.org/openEuler-24.03-LTS/OS/${arch}/RPM-GPG-KEY-openEuler"
+    do
+        if curl -fsSL "${key_url}" -o "${tmp}"; then
+            log_info "Importing openEuler RPM GPG key from ${key_url}..."
+            run_sudo rpm --import "${tmp}"
+            rm -f "${tmp}"
+            return 0
+        fi
+    done
+
+    rm -f "${tmp}"
+    log_error "Failed to download the openEuler RPM GPG key from all known mirrors."
+    exit 1
+}
+
 platform_install_python_bootstrap() {
     run_sudo dnf install -y --nogpgcheck python3-virtualenv python3-pip python3-devel -q
 }
 
-platform_install_rosdeps() {
+platform_pre_install_rosdeps() {
     log_info "Updating dnf package repositories..."
+}
 
-    log_info "Updating rosdepc database..."
-    if ! "${ROSDEPC_BIN:-rosdepc}" update --rosdistro=humble; then
-        log_error "rosdepc update failed. This is usually due to network issues."
-        log_error "Please check your network connection and re-run ./scripts/setup.sh"
-        exit 1
-    fi
+platform_get_extra_skip_keys() {
+    echo "lttng-tools nlohmann-json-dev python3-opencv python3-aiortc gz_ros2_control ros_gz_sim ros_gz_bridge mujoco_ros2_control python3-scipy robot_localization"
+}
 
-    log_info "Installing ROS dependencies via dnf..."
-    if ! "${ROSDEPC_BIN:-rosdepc}" install \
-        --from-paths src \
-        --ignore-src \
-        --rosdistro=humble \
-        -y -r \
-        --skip-keys=catkin \
-        --skip-keys=roscpp \
-        --skip-keys=lerobot \
-        --skip-keys=trimesh \
-        --skip-keys=simple-parsing \
-        --skip-keys=cupy-cuda12x \
-        --skip-keys=ctl_system_interface \
-        --skip-keys=numpy_lessthan_2 \
-        --skip-keys=ament_python \
-        --skip-keys=feetech-servo-sdk \
-        --skip-keys=lttng-tools \
-        --skip-keys=nlohmann-json-dev \
-        --skip-keys=python3-opencv \
-        --skip-keys=python3-aiortc \
-        --skip-keys=gz_ros2_control \
-        --skip-keys=ros_gz_sim \
-        --skip-keys=ros_gz_bridge \
-        --skip-keys=mujoco_ros2_control \
-        --skip-keys=pyserial; then
-        log_error "rosdepc install failed."
-        log_error "Please check your network connection or dependency lists and re-run ./scripts/setup.sh"
-        exit 1
-    fi
+platform_post_install_rosdeps() {
+    # rosdep resolves python3-scipy to python%{python3_pkgversion}-scipy (RHEL
+    # convention) via ROS_OS_OVERRIDE=rhel:8, but openEuler dnf cannot match
+    # that macro name.  Install with the native package name instead.
+    log_info "Installing python3-scipy (rosdep uses RHEL macro naming on openEuler)..."
+    run_sudo dnf install -y --nogpgcheck python3-scipy
 
-    # On openEuler, babeltrace/python3-babeltrace/lttng-ust still need explicit
-    # dnf installation. lttng-tools remains skipped above because the current
-    # repositories do not provide it.
+    # On openEuler, tracing packages are not reliably provisioned by rosdep in
+    # the container/chroot validation environment. Keep explicit dnf fallback
+    # installs here so setup can converge even when rosdep fails the batch.
     log_info "Installing remaining tracing tools without rosdep rules..."
     run_sudo dnf install -y --nogpgcheck \
+        ros-humble-ros2trace \
+        ros-humble-tracetools-analysis \
         babeltrace \
         python3-babeltrace \
         lttng-ust
 
     log_warn "python3-lttngust is not currently available in the tested openEuler repos."
     log_warn "ROS trace CLI works, but Python-domain ib_trace.* logging remains unavailable for now."
-}
-
-platform_verify_ros_python_bridge() {
-    local ros_setup
-    ros_setup="$(platform_ros_setup_path)"
-    [[ -z "${ros_setup}" || ! -f "${ros_setup}" ]] && return 1
-    (source "${ros_setup}" && python3 -c "import rclpy; print('ROS 2 Humble connection successful')") 2>/dev/null
 }

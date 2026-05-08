@@ -263,11 +263,7 @@ print_platform_summary() {
     ui_render_block "${summary_block}"
 
     if [[ "${SETUP_PACKAGE_MANAGER}" != "unknown" ]]; then
-        if [[ "${USE_GUM}" == true ]]; then
-            "${GUM_BIN}" style --foreground 42 "✓ will use ${SETUP_PACKAGE_MANAGER} system package manager"
-        else
-            echo -e "${GREEN}✓${NC} will use ${SETUP_PACKAGE_MANAGER} system package manager"
-        fi
+        echo -e "${GREEN}✓${NC} will use ${SETUP_PACKAGE_MANAGER} system package manager"
     else
         log_warn "No supported system package manager detected; system dependencies may need manual provisioning."
     fi

@@ -1,0 +1,4 @@
+scipy
+sherpa-onnx==1.10.46
+sounddevice
+soundfile

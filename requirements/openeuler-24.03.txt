@@ -1,0 +1,3 @@
+aiortc
+onnx
+onnxruntime

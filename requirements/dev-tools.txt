@@ -1,0 +1,6 @@
+tensorboard
+rerun-sdk>=0.24,<0.26
+typing-extensions>=4.12
+gitlint
+ruff
+pre-commit

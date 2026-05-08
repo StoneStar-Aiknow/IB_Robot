@@ -228,6 +228,13 @@ lerobot_apply_patch_series() {
 _lerobot_git_no_lfs_smudge() {
     local submodule_dir="$1"
     shift
+    if ! command -v git-lfs >/dev/null 2>&1; then
+        local git_dir
+        git_dir="$(git -C "${submodule_dir}" rev-parse --git-dir 2>/dev/null || true)"
+        if [[ -n "${git_dir}" && -f "${git_dir}/hooks/post-checkout" ]]; then
+            rm -f "${git_dir}/hooks/post-checkout"
+        fi
+    fi
     GIT_LFS_SKIP_SMUDGE=1 git -C "${submodule_dir}" "$@"
 }
 

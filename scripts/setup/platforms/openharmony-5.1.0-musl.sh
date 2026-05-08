@@ -30,7 +30,7 @@ platform_handle_missing_ros() {
 platform_prepare_host() {
     log_warn "OpenHarmony musl platform detected."
     log_warn "This setup path validates the board runtime only; it does not bootstrap a local build workspace."
-    log_warn "Local colcon/venv/rosdepc setup is skipped because OpenHarmony artifacts must be cross-built on the host."
+    log_warn "Local colcon/venv/rosdep setup is skipped because OpenHarmony artifacts must be cross-built on the host."
     log_warn "Use scripts/openharmony/build_ibrobot_oh_custom.sh on the host for deployable builds."
     log_warn "If you want OpenHarmony support through QEMU on the Ubuntu host, see docs/openharmony_qemu.md."
 }
@@ -49,15 +49,9 @@ platform_install_python_bootstrap() {
     return 0
 }
 
-platform_install_rosdeps() {
-    log_warn "Skipping automated rosdepc installation on OpenHarmony musl."
+platform_skip_rosdep_install() {
+    log_warn "Skipping automated rosdep installation on OpenHarmony musl."
     log_warn "Board runtime uses the prebuilt ROS environment instead of local rosdep resolution."
     log_warn "Host-side QEMU helpers are available under scripts/openharmony/."
-}
-
-platform_verify_ros_python_bridge() {
-    local ros_setup
-    ros_setup="$(platform_ros_setup_path)"
-    [[ -z "${ros_setup}" || ! -f "${ros_setup}" ]] && return 1
-    (source "${ros_setup}" && python3 -c "import rclpy; print('ROS 2 Humble connection successful')") 2>/dev/null
+    return 0
 }
