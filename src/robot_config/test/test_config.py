@@ -505,6 +505,31 @@ def test_voice_asr_empty_model_path_auto_resolves_streaming_bundle(tmp_path):
     assert resolved.profile == STREAMING_ZH_BUNDLE.profile
 
 
+def test_voice_asr_runtime_auto_download_sets_downloaded_flag(tmp_path, monkeypatch):
+    """Test runtime auto-download is surfaced via the resolved assets flag."""
+
+    def fake_download(bundle, model_root=None, logger=None):
+        bundle_dir = bundle.bundle_dir(model_root)
+        bundle_dir.mkdir(parents=True)
+        for pattern in bundle.required_patterns:
+            file_name = pattern.replace("*", "")
+            (bundle_dir / file_name).write_text("placeholder")
+        return bundle_dir
+
+    monkeypatch.setattr("voice_asr_service.model_manager.download_model_bundle", fake_download)
+
+    resolved = resolve_model_assets(
+        model_path="",
+        model_type="auto",
+        active_mode="continuous",
+        model_root=tmp_path,
+        auto_download_model=True,
+    )
+
+    assert resolved.downloaded is True
+    assert resolved.profile == STREAMING_ZH_BUNDLE.profile
+
+
 def test_resolve_voice_asr_path_uses_workspace_root_for_relative_paths():
     """Test voice ASR relative paths resolve from the workspace root."""
     resolved = resolve_voice_asr_path("models/voice_asr/demo-bundle")
