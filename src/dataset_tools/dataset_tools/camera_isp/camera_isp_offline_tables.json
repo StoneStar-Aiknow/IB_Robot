@@ -1,0 +1,23 @@
+{
+  "_comment": "Offline tables for the unified K/C/Sat color search. Calibrate per-device and check in the resulting file as e.g. camera_isp_offline_tables_<device_id>.json. The empty defaults below are the safe fallback used when no device-specific file is supplied.",
+  "kelvin_curve": {},
+  "contrast_curve": {},
+  "sat_curve": {},
+  "settle": {
+    "delay_ms": 120,
+    "n_drop": 2,
+    "n_capture": 5,
+    "trim": 0.2
+  },
+  "search": {
+    "step_K": 200,
+    "step_C": 4,
+    "step_S": 4,
+    "n_K": 5,
+    "n_C": 5,
+    "n_S": 5,
+    "max_evals": 80,
+    "improve_tol": 0.01,
+    "final_refine": true
+  }
+}

@@ -125,8 +125,9 @@ patches:
   - file: 0009-adaptive-weight-prerequisites.patch
     purpose:
       - Port legacy PR #13 foundations for adaptive sample weighting onto the upstream v0.5.1 training stack.
+      - Provide the training-loop prerequisites used by knowledge-distillation training.
     applies_to:
-      profiles: [master-parity-candidates, training]
+      profiles: [master-parity-candidates, ros, hardware, dev, openeuler, inference, training, distillation]
   - file: 0010-weighted-training.patch
     purpose:
       - Restore weighted-training and quantization-constraint changes extracted from the legacy lerobot_ros2 branch.
@@ -134,9 +135,11 @@ patches:
       profiles: [master-parity-candidates, training]
   - file: 0011-knowledge-distillation.patch
     purpose:
-      - Restore knowledge-distillation support for ACT, Diffusion, and PI05 as a dedicated migration patch.
+      - Add knowledge-distillation training support for ACT and Diffusion.
+      - Add legacy knowledge-distillation config fields for PI05 compatibility.
+      - Keep the patch independent from the OM runtime migration patches.
     applies_to:
-      profiles: [master-parity-candidates, training, distillation]
+      profiles: [master-parity-candidates, ros, hardware, dev, openeuler, inference, training, distillation]
   - file: 0012-mt-act-model.patch
     purpose:
       - Restore the mt_act policy family as a dedicated model patch.
@@ -147,6 +150,12 @@ patches:
       - Restore the attention-masking and visualization utility stack used by the legacy model patches.
     applies_to:
       profiles: [master-parity-candidates, visualization, tooling]
+  - file: 0014-training-logs.patch
+    purpose:
+      - Add TensorBoard training and evaluation scalar logs for KD-capable training runs.
+      - Keep the logging hooks separate from the weighted-training and quantization helpers.
+    applies_to:
+      profiles: [master-parity-candidates, dev, training, distillation]
 
 notes:
   - Schema v2 contract — each patch declares applicability via independent
@@ -169,10 +178,21 @@ notes:
   - OpenHarmony 5.1.0 musl uses the `core,openharmony` profile set so the board
     keeps upstream Python 3.12 syntax while applying only the lazy-import fixes
     needed for runtime inference.
-  - Patches 0007-0013 are feature-scoped migration candidates extracted from
-    lerobot_ros2 for master-parity work. They are intentionally tracked outside
-    the default series until each feature is revalidated on the current
-    upstream lerobot v0.5.1 base.
+  - Patches 0007-0008, 0010 and 0012-0013 are feature-scoped migration candidates
+    extracted from lerobot_ros2 for master-parity work. They are intentionally
+    tracked outside the default series until each feature is revalidated on
+    the current upstream lerobot v0.5.1 base.
+  - Patch 0009 is part of the default series because patch 0011 is rebased on
+    top of its training-loop changes. Its adaptive weighting behavior remains
+    confined to the training pipeline.
+  - Patch 0011 is part of the default series because it carries the legacy
+    knowledge-distillation config fields needed by old checkpoints and the
+    corresponding ACT / Diffusion training hooks. It is rebased to apply
+    directly after 0009 so it does not require the OM runtime migration
+    candidates 0007-0008.
+  - Patch 0014 is part of the default Ubuntu training series so KD runs emit
+    TensorBoard scalars without pulling in the weighted-training and
+    quantization helpers from patch 0010.
   - The reference_submodule_commit records the current local development
     result, but repeated git-am application will produce different commit
     hashes unless committer identity and dates are reproduced exactly.

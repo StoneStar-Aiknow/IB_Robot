@@ -1,0 +1,50 @@
+From fa82d3fbca9554175af28648fabda1726255048e Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Fri, 8 May 2026 16:20:45 +0800
+Subject: [PATCH] train: add tensorboard training logs
+
+---
+ src/lerobot/scripts/lerobot_train.py | 23 ++++++++++++++++++++---
+ 1 file changed, 20 insertions(+), 3 deletions(-)
+
+diff --git a/src/lerobot/scripts/lerobot_train.py b/src/lerobot/scripts/lerobot_train.py
+index 88f04e32..ea6fc76c 100644
+--- a/src/lerobot/scripts/lerobot_train.py
++++ b/src/lerobot/scripts/lerobot_train.py
+@@ -17,2 +17,3 @@ import dataclasses
+ import logging
++import os
+ import time
+@@ -26,2 +27,3 @@ from termcolor import colored
+ from torch.optim import Optimizer
++from torch.utils.tensorboard import SummaryWriter
+ from tqdm import tqdm
+@@ -207,2 +209,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+-
++    folder_path = "./logs"
++    if not os.path.exists(folder_path):
++        os.mkdir(folder_path)
++        print(f"Logs folder {folder_path} created successfully")
++    else:
++        print(f"Logs folder {folder_path} already exists")
++
+     init_logging(accelerator=accelerator)
+@@ -365,3 +373,5 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+     num_total_params = sum(p.numel() for p in policy.parameters())
+-
++    log_dir = f"logs/pytorch/{str(cfg.output_dir).split('/')[-1]}"
++    writer = SummaryWriter(log_dir=log_dir)
++
+     if is_main_process:
+@@ -545,2 +555,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+             logging.info(train_tracker)
++            for metric in train_tracker.metrics.values():
++                metric_str = str(metric)
++                value = float(metric_str.split(":")[-1])
++                name = metric_str.split(":")[0]
++                writer.add_scalar(f"{name}/step", value, step)
+             if wandb_logger:
+@@ -575,2 +590,3 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+             eval_loss /= per_eval_num
++            writer.add_scalar("Loss/eval", eval_loss, step)
+             logging.info(f"Eval policy at step {step}, eval_loss: {eval_loss:.3f}")

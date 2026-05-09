@@ -64,6 +64,18 @@ robot:
       fps: 30
       frame_id: camera_top_frame
       optical_frame_id: camera_top_optical_frame
+      # 可选 ISP 参数（usb_cam 全部 V4L2 控件，详见 usb_cam_node.cpp:65-85）：
+      # brightness: 128            # 0-255
+      # contrast: 128              # 0-255
+      # saturation: 128            # 0-255
+      # sharpness: 128             # 0-255
+      # gain: 0                    # 0-255
+      # auto_white_balance: false  # 与 white_balance 互斥
+      # white_balance: 4600        # 2000-10000 K
+      # autoexposure: false        # 与 exposure 互斥
+      # exposure: 312              # V4L2 absolute exposure
+      # autofocus: false
+      # focus: 0                   # 0-1023
 
     - type: camera
       name: wrist
@@ -502,6 +514,22 @@ ros2 run camera_calibration cameracalibrator \
   --square 0.024 \
   image:=/camera/top/image_raw
 ```
+
+### 色彩 / ISP 校准 — Override 机制
+
+YAML 是相机参数的 **单一真理来源（SSOT）**，但日常调机时手动改 YAML
+不便。为此 robot_config 在加载相机参数时按以下顺序合并：
+
+1. `peripherals/[name]` YAML 默认值；
+2. `~/.ros/ibrobot/camera_isp_overrides/{camera_name}.json` 中的 override
+   （由 `camera_isp_calibrator` 写入，键为 V4L2 参数名）；
+
+**override 中的值覆盖 YAML**。这样校准结果可以跨次启动复用而不污染
+SSOT；删除 JSON 即可回退到 YAML 默认。
+
+加载逻辑见 `robot_config/launch_builders/camera_isp_overrides.py`，
+合并点见 `robot_config/launch_builders/perception.py`（opencv 分支）。
+配套校准工具：`ros2 run dataset_tools camera_isp_calibrator`。
 
 ## tensormsg 集成
 
