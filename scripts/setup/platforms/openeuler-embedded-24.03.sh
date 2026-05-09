@@ -12,6 +12,7 @@ platform_prepare_host() {
     export ROS_OS_OVERRIDE=rhel:8
 
     ensure_openeuler_builtin_repos
+    ensure_openeuler_extras_repo
     ensure_openeuler_gpg_key
 
     log_info "Installing openEuler host packages required by the workspace..."
@@ -45,6 +46,19 @@ ensure_openeuler_builtin_repos() {
     log_error "Required built-in openEuler repos are missing (expected: everything, update, EPOL)."
     log_error "Please restore /etc/yum.repos.d/openEuler.repo before running setup.sh."
     exit 1
+}
+
+ensure_openeuler_extras_repo() {
+    local extras_repo_url
+    extras_repo_url="https://repo.oepkgs.net/openeuler/rpm/openEuler-24.03-LTS/extras/$(uname -m)"
+
+    if dnf repolist --enabled | awk '$1 == "extras" { found = 1 } END { exit found ? 0 : 1 }'; then
+        log_info "openEuler extras repo already configured."
+        return 0
+    fi
+
+    log_info "Adding openEuler extras repo required for python3-lttngust..."
+    run_sudo dnf config-manager --add-repo "${extras_repo_url}"
 }
 
 ensure_openeuler_gpg_key() {
@@ -104,8 +118,5 @@ platform_post_install_rosdeps() {
         ros-humble-tracetools-analysis \
         babeltrace \
         python3-babeltrace \
-        lttng-ust
-
-    log_warn "python3-lttngust is not currently available in the tested openEuler repos."
-    log_warn "ROS trace CLI works, but Python-domain ib_trace.* logging remains unavailable for now."
+        python3-lttngust
 }
