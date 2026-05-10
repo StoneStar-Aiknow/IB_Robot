@@ -46,6 +46,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 
 | Skill | 一句话描述 |
 | :--- | :--- |
+| **ibrobot-lerobot-patch** | 将 `libs/lerobot` 的本地改动导出为受管 patch，并同步 `series.txt` / `manifest.yaml` / 测试夹具 |
 | **ibrobot-git-flow** | 规范提交代码，确保符合 openEuler DCO/Commit 规范 |
 
 ---
@@ -70,6 +71,8 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 启动机器人仿真                  → ibrobot-launch
 初始化环境                      → ibrobot-env
 提交代码                        → ibrobot-git-flow
+把 libs/lerobot 的改动做成 patch  → ibrobot-lerobot-patch
+导出 lerobot patch 并更新 series  → ibrobot-lerobot-patch
 检查架构合规性                  → atomgit-pr-architecture-review
 解释系统架构                    → ibrobot-architecture
 有哪些功能 / help / 入门       → intro (本技能)
