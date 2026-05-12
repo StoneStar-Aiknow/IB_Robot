@@ -12,7 +12,7 @@ def generate_launch_description():
     device_arg = DeclareLaunchArgument(
         'device',
         default_value='auto',
-        description='Device to run inference on (cuda, cpu, auto)'
+        description='Device to run inference on (cuda, cpu, npu, ascend_om, ascend_om_3403, auto)'
     )
     
     input_topic_arg = DeclareLaunchArgument(
