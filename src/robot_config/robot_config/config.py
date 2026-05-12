@@ -106,6 +106,39 @@ class ContractExtensionConfig:
 
 
 @dataclass
+class EmbodiedConfig:
+    """Minimum embodied claw closure configuration."""
+
+    enabled: bool = False
+    debug_tracing: bool = True
+    task_input_topic: str = "/voice_command"
+    task_command_topic: str = "/embodied/task_command"
+    planned_task_topic: str = "/embodied/planned_task"
+    status_topic: str = "/embodied/task_status"
+    skill_action_name: str = "/embodied/execute_skill"
+    primitive_action_name: str = "/embodied/execute_primitive"
+    validate_skill_service: str = "/embodied/validate_skill"
+    validate_primitive_service: str = "/embodied/validate_primitive"
+    default_target_name: str = "demo_object"
+    default_place_name: str = "tray_right"
+    skill_timeout_sec: float = 15.0
+    primitive_timeout_sec: float = 5.0
+    primitive_wait_sec: float = 1.0
+    timeouts: dict[str, Any] = field(default_factory=dict)
+    relative_motion_step_m: float = 0.03
+    relative_motion_reference_frame: str = "base"
+    relative_motion_direction_mapping: dict[str, Any] = field(default_factory=dict)
+    planner: dict[str, Any] = field(default_factory=dict)
+    perception: dict[str, Any] = field(default_factory=dict)
+    gripper_open_position: float = 1.0
+    gripper_closed_position: float = 0.0
+    skill_templates: dict[str, Any] = field(default_factory=dict)
+    named_poses: dict[str, Any] = field(default_factory=dict)
+    named_targets: dict[str, Any] = field(default_factory=dict)
+    workspace: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class VoiceASRConfig:
     """Voice ASR node configuration managed by robot_config."""
 
@@ -148,11 +181,12 @@ class RobotConfig:
     peripherals: list[CameraConfig | PeripheralConfig] = field(default_factory=list)
     contract: ContractExtensionConfig = field(default_factory=ContractExtensionConfig)
     voice_asr: VoiceASRConfig = field(default_factory=VoiceASRConfig)
+    embodied: EmbodiedConfig = field(default_factory=EmbodiedConfig)
 
     def get_camera(self, name: str) -> CameraConfig | None:
         """Get camera configuration by name."""
         for cam in self.peripherals:
-            if cam.name == name:
+            if isinstance(cam, CameraConfig) and cam.name == name:
                 return cam
         return None
 

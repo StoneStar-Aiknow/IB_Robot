@@ -29,6 +29,11 @@
   <exec_depend>omni_wheel_controller</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <depend>voice_asr_service</depend>
+  <exec_depend>embodied_agent</exec_depend>
+  <exec_depend>skill_library</exec_depend>
+  <exec_depend>safety_guard</exec_depend>
+  <exec_depend>vlm_task_planner</exec_depend>
+  <exec_depend>perception_service</exec_depend>
 
   <!-- ros2_control -->
   <exec_depend>ros2_control</exec_depend>

@@ -12,11 +12,13 @@ from robot_config.config import (
     ContractAction,
     ContractExtensionConfig,
     ContractObservation,
+    EmbodiedConfig,
     PeripheralConfig,
     RobotConfig,
     Ros2ControlConfig,
     VoiceASRConfig,
 )
+from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 from .utils import resolve_calibration_paths_from_config, resolve_ros_path
 
@@ -215,6 +217,46 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
     )
 
 
+def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
+    """Load embodied minimal-closure configuration from dict."""
+    execution = data.get("execution", {})
+    safety = data.get("safety", {})
+    direction_mapping = execution.get("relative_motion_direction_mapping", {})
+    planner = data.get("planner", {})
+    perception = data.get("perception", {})
+    timeout_policy = resolve_embodied_timeout_policy(data)
+
+    return EmbodiedConfig(
+        enabled=data.get("enabled", False),
+        debug_tracing=data.get("debug_tracing", True),
+        task_input_topic=data.get("task_input_topic", "/voice_command"),
+        task_command_topic=data.get("task_command_topic", "/embodied/task_command"),
+        planned_task_topic=data.get("planned_task_topic", "/embodied/planned_task"),
+        status_topic=data.get("status_topic", "/embodied/task_status"),
+        skill_action_name=data.get("skill_action_name", "/embodied/execute_skill"),
+        primitive_action_name=data.get("primitive_action_name", "/embodied/execute_primitive"),
+        validate_skill_service=data.get("validate_skill_service", "/embodied/validate_skill"),
+        validate_primitive_service=data.get("validate_primitive_service", "/embodied/validate_primitive"),
+        default_target_name=data.get("default_target_name", "demo_object"),
+        default_place_name=data.get("default_place_name", "tray_right"),
+        skill_timeout_sec=execution.get("skill_timeout_sec", 15.0),
+        primitive_timeout_sec=execution.get("primitive_timeout_sec", 5.0),
+        primitive_wait_sec=execution.get("primitive_wait_sec", 1.0),
+        timeouts=timeout_policy,
+        relative_motion_step_m=execution.get("relative_motion_step_m", 0.03),
+        relative_motion_reference_frame=execution.get("relative_motion_reference_frame", "base"),
+        relative_motion_direction_mapping=direction_mapping,
+        planner=planner,
+        perception=perception,
+        gripper_open_position=execution.get("gripper_open_position", 1.0),
+        gripper_closed_position=execution.get("gripper_closed_position", 0.0),
+        skill_templates=data.get("skill_templates", {}),
+        named_poses=data.get("named_poses", {}),
+        named_targets=data.get("named_targets", {}),
+        workspace=safety.get("workspace", {}),
+    )
+
+
 def load_robot_config(config_path: str | Path) -> RobotConfig:
     """Load robot configuration from YAML file.
 
@@ -263,6 +305,7 @@ def load_robot_config(config_path: str | Path) -> RobotConfig:
     contract = load_contract_config(contract_data)
 
     voice_asr = load_voice_asr_config(robot_data.get("voice_asr", {}))
+    embodied = load_embodied_config(robot_data.get("embodied", {}))
 
     return RobotConfig(
         name=name,
@@ -272,6 +315,7 @@ def load_robot_config(config_path: str | Path) -> RobotConfig:
         peripherals=peripherals,
         contract=contract,
         voice_asr=voice_asr,
+        embodied=embodied,
     )
 
 
@@ -340,6 +384,298 @@ def validate_config(config: RobotConfig) -> list[str]:
 
     if config.voice_asr.enabled and not config.voice_asr.model_path and not config.voice_asr.auto_download_model:
         errors.append("voice_asr.model_path is required when voice_asr.enabled is true")
+
+    if config.embodied.enabled:
+        valid_directions = {"forward", "backward", "left", "right", "up", "down"}
+        valid_planner_modes = {"rule", "vlm_api", "hybrid"}
+        valid_skills = {
+            "inspect_scene",
+            "observe_target_area",
+            "approach_named_target",
+            "hover_named_target",
+            "pick_named_target",
+            "lift_named_target",
+            "retreat_from_target",
+            "place_named_pose",
+            "release_at_named_pose",
+            "open_gripper_skill",
+            "close_gripper_skill",
+            "recover_safe_pose",
+            "move_relative_ee",
+            "gripper_point_down",
+            "rotate_gripper_cw",
+            "rotate_gripper_ccw",
+        }
+        required_pose_names = {"home", "observe_table", config.embodied.default_place_name}
+        missing_pose_names = sorted(p for p in required_pose_names if p not in config.embodied.named_poses)
+        if missing_pose_names:
+            errors.append("embodied.named_poses is missing required pose(s): " + ", ".join(missing_pose_names))
+
+        if config.embodied.default_target_name not in config.embodied.named_targets:
+            errors.append(
+                f"embodied.default_target_name '{config.embodied.default_target_name}' "
+                "must exist in embodied.named_targets"
+            )
+
+        for target_name, target_cfg in config.embodied.named_targets.items():
+            for pose_key in ("observe_pose", "pregrasp_pose", "hover_pose", "grasp_pose", "lift_pose", "retreat_pose"):
+                pose_name = target_cfg.get(pose_key)
+                if pose_name and pose_name not in config.embodied.named_poses:
+                    errors.append(
+                        f"embodied.named_targets.{target_name}.{pose_key} references undefined pose '{pose_name}'"
+                    )
+
+        skill_templates = config.embodied.skill_templates or {}
+        supported_primitives = {
+            "move_to_named_pose",
+            "move_relative_ee",
+            "open_gripper",
+            "close_gripper",
+            "rotate_gripper_cw",
+            "rotate_gripper_ccw",
+        }
+        for skill_name, template in skill_templates.items():
+            if skill_name not in valid_skills:
+                errors.append(f"embodied.skill_templates contains unsupported skill key: {skill_name}")
+                continue
+            primitive_sequence = template.get("primitive_sequence", [])
+            # inspect_scene is intentionally vision-only with no primitives
+            if skill_name == "inspect_scene":
+                continue
+            if not isinstance(primitive_sequence, list) or not primitive_sequence:
+                errors.append(f"embodied.skill_templates.{skill_name}.primitive_sequence must be a non-empty list")
+                continue
+            for step in primitive_sequence:
+                if not isinstance(step, dict):
+                    errors.append(f"embodied.skill_templates.{skill_name}.primitive_sequence entries must be objects")
+                    continue
+                primitive_name = str(step.get("primitive_name", "")).strip()
+                if primitive_name not in supported_primitives:
+                    errors.append(
+                        f"embodied.skill_templates.{skill_name} uses unsupported primitive '{primitive_name}'"
+                    )
+                    continue
+                if primitive_name == "move_to_named_pose":
+                    pose_name = str(step.get("pose_name", "")).strip()
+                    target_pose_key = str(step.get("target_pose_key", "")).strip()
+                    place_from_request = bool(step.get("place_name_from_request", False))
+                    reference_count = int(bool(pose_name)) + int(bool(target_pose_key)) + int(place_from_request)
+                    if reference_count != 1:
+                        errors.append(
+                            f"embodied.skill_templates.{skill_name} move_to_named_pose step must define exactly one "
+                            "of pose_name, target_pose_key, or place_name_from_request"
+                        )
+                    if pose_name and pose_name not in config.embodied.named_poses:
+                        errors.append(f"embodied.skill_templates.{skill_name} references undefined pose '{pose_name}'")
+                    if target_pose_key:
+                        for target_name, target_cfg in config.embodied.named_targets.items():
+                            resolved_pose_name = str(target_cfg.get(target_pose_key, "")).strip()
+                            if not resolved_pose_name:
+                                errors.append(
+                                    f"embodied.named_targets.{target_name}.{target_pose_key} is required by "
+                                    f"skill template '{skill_name}'"
+                                )
+                            elif resolved_pose_name not in config.embodied.named_poses:
+                                errors.append(
+                                    f"embodied.skill_templates.{skill_name} references undefined pose "
+                                    f"'{resolved_pose_name}' via target '{target_name}.{target_pose_key}'"
+                                )
+                if primitive_name == "move_relative_ee":
+                    literal_direction = str(step.get("motion_direction", "")).strip()
+                    if (
+                        not step.get("motion_direction_from_request", False)
+                        and literal_direction not in valid_directions
+                    ):
+                        errors.append(
+                            f"embodied.skill_templates.{skill_name} move_relative_ee step must provide a valid "
+                            "motion_direction or enable motion_direction_from_request"
+                        )
+                    literal_distance = float(step.get("motion_distance", 0.0) or 0.0)
+                    if not step.get("motion_distance_from_request", False) and literal_distance <= 0.0:
+                        errors.append(
+                            f"embodied.skill_templates.{skill_name} move_relative_ee step must provide a positive "
+                            "motion_distance or enable motion_distance_from_request"
+                        )
+
+        for axis in ("x", "y", "z"):
+            axis_limits = config.embodied.workspace.get(axis)
+            if axis_limits is None:
+                continue
+            if not isinstance(axis_limits, list) or len(axis_limits) != 2:
+                errors.append(f"embodied.safety.workspace.{axis} must be a [min, max] list")
+                continue
+            if axis_limits[0] >= axis_limits[1]:
+                errors.append(f"embodied.safety.workspace.{axis} must satisfy min < max")
+
+        if config.embodied.relative_motion_step_m <= 0.0:
+            errors.append("embodied.execution.relative_motion_step_m must be greater than zero")
+
+        if config.embodied.relative_motion_reference_frame != "base":
+            errors.append("embodied.execution.relative_motion_reference_frame currently must be 'base'")
+
+        direction_mapping = config.embodied.relative_motion_direction_mapping
+        if direction_mapping:
+            missing_directions = valid_directions.difference(direction_mapping.keys())
+            if missing_directions:
+                errors.append(
+                    "embodied.execution.relative_motion_direction_mapping is missing directions: "
+                    + ", ".join(sorted(missing_directions))
+                )
+            for direction, vector in direction_mapping.items():
+                if direction not in valid_directions:
+                    errors.append(
+                        "embodied.execution.relative_motion_direction_mapping contains unsupported "
+                        f"direction: {direction}"
+                    )
+                    continue
+                if not isinstance(vector, list) or len(vector) != 3:
+                    errors.append(
+                        f"embodied.execution.relative_motion_direction_mapping.{direction} must be a 3-element list"
+                    )
+                    continue
+                try:
+                    normalized = [float(v) for v in vector]
+                except (TypeError, ValueError):
+                    errors.append(
+                        f"embodied.execution.relative_motion_direction_mapping.{direction} must contain numeric values"
+                    )
+                    continue
+                if all(abs(v) < 1e-9 for v in normalized):
+                    errors.append(
+                        f"embodied.execution.relative_motion_direction_mapping.{direction} must not be a zero vector"
+                    )
+
+        planner = config.embodied.planner or {}
+        timeout_policy = config.embodied.timeouts or resolve_embodied_timeout_policy(
+            {
+                "execution": {
+                    "skill_timeout_sec": config.embodied.skill_timeout_sec,
+                    "primitive_timeout_sec": config.embodied.primitive_timeout_sec,
+                    "primitive_wait_sec": config.embodied.primitive_wait_sec,
+                },
+                "planner": planner,
+                "perception": config.embodied.perception or {},
+                "timeouts": {},
+            }
+        )
+        planner_mode = str(planner.get("mode", "rule")).lower()
+        valid_vlm_api_providers = {"kimicode", "openai_compatible"}
+        if planner_mode not in valid_planner_modes:
+            errors.append("embodied.planner.mode must be one of: " + ", ".join(sorted(valid_planner_modes)))
+
+        scene_sources = planner.get("scene_sources", {})
+        if planner_mode in {"vlm_api", "hybrid"}:
+            if not scene_sources.get("primary_camera_topic"):
+                errors.append(
+                    "embodied.planner.scene_sources.primary_camera_topic is required when planner.mode uses VLM"
+                )
+            if float(timeout_policy.get("scene_freshness_sec", 0.0)) <= 0.0:
+                errors.append("embodied.timeouts.scene_freshness_sec must be greater than zero")
+            if bool(scene_sources.get("require_depth", False)) and not (
+                scene_sources.get("primary_aligned_depth_topic") or scene_sources.get("wrist_aligned_depth_topic")
+            ):
+                errors.append(
+                    "embodied.planner.scene_sources.require_depth=true requires at least one aligned depth topic"
+                )
+            if bool(scene_sources.get("require_pointcloud", False)) and not (
+                scene_sources.get("primary_pointcloud_topic") or scene_sources.get("wrist_pointcloud_topic")
+            ):
+                errors.append(
+                    "embodied.planner.scene_sources.require_pointcloud=true requires at least one pointcloud topic"
+                )
+            vlm_api = planner.get("vlm_api", {})
+            planner_provider = str(vlm_api.get("provider", "")).strip()
+            if not planner_provider:
+                errors.append("embodied.planner.vlm_api.provider is required when planner.mode uses VLM")
+            elif planner_provider not in valid_vlm_api_providers:
+                errors.append(
+                    "embodied.planner.vlm_api.provider must be one of: " + ", ".join(sorted(valid_vlm_api_providers))
+                )
+            if not vlm_api.get("model"):
+                errors.append("embodied.planner.vlm_api.model is required when planner.mode uses VLM")
+            if planner_provider == "kimicode" and not str(vlm_api.get("api_key_env", "")).strip():
+                errors.append("embodied.planner.vlm_api.api_key_env is required when planner.mode uses VLM")
+            if not vlm_api.get("base_url"):
+                errors.append("embodied.planner.vlm_api.base_url is required when planner.mode uses VLM")
+            if float(timeout_policy.get("model_idle_timeout_sec", 0.0)) <= 0.0:
+                errors.append("embodied.timeouts.model_idle_timeout_sec must be greater than zero")
+
+        planning_policy = planner.get("planning_policy", {})
+        allowed_skills = planning_policy.get("allowed_skills", [])
+        if planner_mode in {"vlm_api", "hybrid"}:
+            if not isinstance(allowed_skills, list) or not allowed_skills:
+                errors.append(
+                    "embodied.planner.planning_policy.allowed_skills must be a non-empty list "
+                    "when planner.mode uses VLM"
+                )
+            else:
+                unsupported = sorted(s for s in allowed_skills if s not in valid_skills)
+                if unsupported:
+                    errors.append(
+                        "embodied.planner.planning_policy.allowed_skills contains unsupported skill(s): "
+                        + ", ".join(unsupported)
+                    )
+            min_confidence = float(planning_policy.get("min_confidence", 0.7))
+            if min_confidence < 0.0 or min_confidence > 1.0:
+                errors.append("embodied.planner.planning_policy.min_confidence must be in [0.0, 1.0]")
+
+        perception = config.embodied.perception or {}
+        if perception.get("enabled", False):
+            if not str(perception.get("request_topic", "")).strip():
+                errors.append("embodied.perception.request_topic is required when perception is enabled")
+            if not str(perception.get("result_topic", "")).strip():
+                errors.append("embodied.perception.result_topic is required when perception is enabled")
+            p_sources = perception.get("scene_sources", {})
+            if not p_sources.get("primary_camera_topic"):
+                errors.append(
+                    "embodied.perception.scene_sources.primary_camera_topic is required when perception is enabled"
+                )
+            if float(timeout_policy.get("scene_freshness_sec", 0.0)) <= 0.0:
+                errors.append("embodied.timeouts.scene_freshness_sec must be greater than zero")
+            if bool(p_sources.get("require_depth", False)) and not (
+                p_sources.get("primary_aligned_depth_topic") or p_sources.get("wrist_aligned_depth_topic")
+            ):
+                errors.append(
+                    "embodied.perception.scene_sources.require_depth=true requires at least one aligned depth topic"
+                )
+            if bool(p_sources.get("require_pointcloud", False)) and not (
+                p_sources.get("primary_pointcloud_topic") or p_sources.get("wrist_pointcloud_topic")
+            ):
+                errors.append(
+                    "embodied.perception.scene_sources.require_pointcloud=true requires at least one pointcloud topic"
+                )
+            p_vlm_api = perception.get("vlm_api", {})
+            p_provider = str(p_vlm_api.get("provider", "")).strip()
+            if not p_provider:
+                errors.append("embodied.perception.vlm_api.provider is required when perception is enabled")
+            elif p_provider not in valid_vlm_api_providers:
+                errors.append(
+                    "embodied.perception.vlm_api.provider must be one of: " + ", ".join(sorted(valid_vlm_api_providers))
+                )
+            if not p_vlm_api.get("model"):
+                errors.append("embodied.perception.vlm_api.model is required when perception is enabled")
+            if p_provider == "kimicode" and not str(p_vlm_api.get("api_key_env", "")).strip():
+                errors.append("embodied.perception.vlm_api.api_key_env is required when perception is enabled")
+            if not p_vlm_api.get("base_url"):
+                errors.append("embodied.perception.vlm_api.base_url is required when perception is enabled")
+            if float(timeout_policy.get("model_idle_timeout_sec", 0.0)) <= 0.0:
+                errors.append("embodied.timeouts.model_idle_timeout_sec must be greater than zero")
+
+        if float(timeout_policy.get("task_budget_sec", 0.0)) <= 0.0:
+            errors.append("embodied.timeouts.task_budget_sec must be greater than zero")
+        if float(timeout_policy.get("rpc_timeout_sec", 0.0)) <= 0.0:
+            errors.append("embodied.timeouts.rpc_timeout_sec must be greater than zero")
+        if float(timeout_policy.get("gripper_settle_sec", 0.0)) <= 0.0:
+            errors.append("embodied.timeouts.gripper_settle_sec must be greater than zero")
+
+        conversation = perception.get("conversation", {})
+        try:
+            max_history_turns = int(conversation.get("max_history_turns", 0))
+        except (TypeError, ValueError):
+            errors.append("embodied.perception.conversation.max_history_turns must be an integer")
+        else:
+            if max_history_turns < 0:
+                errors.append("embodied.perception.conversation.max_history_turns must be >= 0")
 
     return errors
 

@@ -7,6 +7,7 @@ import pytest
 from robot_config.config import (
     CameraConfig,
     ContractExtensionConfig,
+    EmbodiedConfig,
     PeripheralConfig,
     RobotConfig,
     Ros2ControlConfig,
@@ -52,7 +53,7 @@ def test_load_single_arm_config():
     assert config.voice_asr.realtime_pre_roll_seconds == 0.5
     assert not Path(config.voice_asr.model_path).is_absolute()
     assert config.voice_asr.device_name == ""
-    assert config.voice_asr.device_index == 13
+    assert config.voice_asr.device_index == -1
     assert config.voice_asr.exit_on_init_failure is True
 
     # Check cameras
@@ -585,3 +586,328 @@ def test_voice_asr_runtime_defaults_match_robot_config_defaults():
     assert config_defaults.device_index == VOICE_ASR_DEFAULTS["device_index"]
     assert config_defaults.device_name == VOICE_ASR_DEFAULTS["device_name"]
     assert config_defaults.exit_on_init_failure == VOICE_ASR_DEFAULTS["exit_on_init_failure"]
+
+
+def test_validate_embodied_requires_referenced_poses():
+    """Embodied targets must reference defined poses when enabled."""
+    config = RobotConfig(
+        name="test_robot",
+        type="so101",
+        robot_type="so_101",
+        ros2_control=Ros2ControlConfig(
+            hardware_plugin="so101_hardware/SO101SystemHardware",
+            params={},
+        ),
+        contract=ContractExtensionConfig(observations=[], actions=[]),
+        embodied=EmbodiedConfig(
+            enabled=True,
+            named_poses={
+                "home": {"position": {"x": 0.2, "y": 0.0, "z": 0.2}},
+                "observe_table": {"position": {"x": 0.3, "y": 0.0, "z": 0.25}},
+                "tray_right": {"position": {"x": 0.2, "y": -0.15, "z": 0.18}},
+            },
+            named_targets={
+                "demo_object": {
+                    "pregrasp_pose": "missing_pregrasp",
+                    "grasp_pose": "missing_grasp",
+                    "lift_pose": "missing_lift",
+                }
+            },
+            workspace={"x": [0.0, 0.5], "y": [-0.3, 0.3], "z": [0.0, 0.5]},
+        ),
+    )
+
+    errors = validate_config(config)
+    assert any("missing_pregrasp" in error for error in errors)
+
+
+def test_validate_embodied_relative_motion_direction_mapping():
+    """Embodied relative motion mapping must fully describe base-frame directions."""
+    config = RobotConfig(
+        name="test_robot",
+        type="so101",
+        robot_type="so_101",
+        ros2_control=Ros2ControlConfig(
+            hardware_plugin="so101_hardware/SO101SystemHardware",
+            params={},
+        ),
+        contract=ContractExtensionConfig(observations=[], actions=[]),
+        embodied=EmbodiedConfig(
+            enabled=True,
+            relative_motion_reference_frame="base",
+            relative_motion_direction_mapping={
+                "forward": [1.0, 0.0, 0.0],
+                "backward": [-1.0, 0.0, 0.0],
+                "left": [0.0, 1.0, 0.0],
+                "right": [0.0, -1.0, 0.0],
+                "up": [0.0, 0.0, 1.0],
+            },
+            named_poses={
+                "home": {"position": {"x": 0.2, "y": 0.0, "z": 0.2}},
+                "observe_table": {"position": {"x": 0.3, "y": 0.0, "z": 0.25}},
+                "tray_right": {"position": {"x": 0.2, "y": -0.15, "z": 0.18}},
+            },
+            named_targets={
+                "demo_object": {
+                    "pregrasp_pose": "home",
+                    "grasp_pose": "observe_table",
+                    "lift_pose": "tray_right",
+                }
+            },
+            workspace={"x": [0.0, 0.5], "y": [-0.3, 0.3], "z": [0.0, 0.5]},
+        ),
+    )
+
+    errors = validate_config(config)
+    assert any("missing directions: down" in error for error in errors)
+
+
+def test_validate_embodied_vlm_planner_mode():
+    """Embodied planner mode and allowed skills must be valid."""
+    config = RobotConfig(
+        name="test_robot",
+        type="so101",
+        robot_type="so_101",
+        ros2_control=Ros2ControlConfig(
+            hardware_plugin="so101_hardware/SO101SystemHardware",
+            params={},
+        ),
+        contract=ContractExtensionConfig(observations=[], actions=[]),
+        embodied=EmbodiedConfig(
+            enabled=True,
+            planner={
+                "mode": "vlm_api",
+                "scene_sources": {"primary_camera_topic": "/camera/top/image_raw"},
+                "vlm_api": {
+                    "provider": "kimicode",
+                    "base_url": "https://api.kimi.com/coding/v1",
+                    "api_key_env": "KIMICODE_API_KEY",
+                    "model": "kimi-for-coding",
+                },
+                "planning_policy": {
+                    "allowed_skills": ["inspect_scene", "unknown_skill"],
+                    "min_confidence": 0.7,
+                },
+            },
+            skill_templates={
+                "inspect_scene": {
+                    "primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}]
+                }
+            },
+            named_poses={
+                "home": {"position": {"x": 0.2, "y": 0.0, "z": 0.2}},
+                "observe_table": {"position": {"x": 0.3, "y": 0.0, "z": 0.25}},
+                "tray_right": {"position": {"x": 0.2, "y": -0.15, "z": 0.18}},
+            },
+            named_targets={
+                "demo_object": {
+                    "pregrasp_pose": "home",
+                    "grasp_pose": "observe_table",
+                    "lift_pose": "tray_right",
+                }
+            },
+            workspace={"x": [0.0, 0.5], "y": [-0.3, 0.3], "z": [0.0, 0.5]},
+        ),
+    )
+
+    errors = validate_config(config)
+    assert any("allowed_skills contains unsupported skill" in error for error in errors)
+
+
+def test_validate_embodied_perception_conversation_history():
+    """Embodied perception config should validate conversation history setting."""
+    config = RobotConfig(
+        name="test_robot",
+        type="so101",
+        robot_type="so_101",
+        ros2_control=Ros2ControlConfig(
+            hardware_plugin="so101_hardware/SO101SystemHardware",
+            params={},
+        ),
+        contract=ContractExtensionConfig(observations=[], actions=[]),
+        embodied=EmbodiedConfig(
+            enabled=True,
+            perception={
+                "enabled": True,
+                "request_topic": "/embodied/perception_request",
+                "result_topic": "/embodied/perception_result",
+                "scene_sources": {"primary_camera_topic": "/camera/top/image_raw"},
+                "vlm_api": {
+                    "provider": "kimicode",
+                    "base_url": "https://api.kimi.com/coding/v1",
+                    "api_key_env": "KIMICODE_API_KEY",
+                    "model": "kimi-for-coding",
+                },
+                "conversation": {"max_history_turns": -1},
+            },
+            skill_templates={
+                "inspect_scene": {
+                    "primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}]
+                }
+            },
+            named_poses={
+                "home": {"position": {"x": 0.2, "y": 0.0, "z": 0.2}},
+                "observe_table": {"position": {"x": 0.3, "y": 0.0, "z": 0.25}},
+                "tray_right": {"position": {"x": 0.2, "y": -0.15, "z": 0.18}},
+            },
+            named_targets={
+                "demo_object": {
+                    "pregrasp_pose": "home",
+                    "grasp_pose": "observe_table",
+                    "lift_pose": "tray_right",
+                }
+            },
+            workspace={"x": [0.0, 0.5], "y": [-0.3, 0.3], "z": [0.0, 0.5]},
+        ),
+    )
+
+    errors = validate_config(config)
+    assert any("max_history_turns must be >= 0" in error for error in errors)
+
+
+def test_validate_embodied_openai_compatible_allows_empty_api_key_env():
+    config = RobotConfig(
+        name="test_robot",
+        type="so101",
+        robot_type="so_101",
+        ros2_control=Ros2ControlConfig(
+            hardware_plugin="so101_hardware/SO101SystemHardware",
+            params={},
+        ),
+        contract=ContractExtensionConfig(observations=[], actions=[]),
+        embodied=EmbodiedConfig(
+            enabled=True,
+            planner={
+                "mode": "vlm_api",
+                "scene_sources": {"primary_camera_topic": "/camera/top/image_raw"},
+                "vlm_api": {
+                    "provider": "openai_compatible",
+                    "base_url": "http://localhost:8000/v1",
+                    "api_key_env": "",
+                    "model": "Qwen3.5-9B",
+                },
+                "planning_policy": {
+                    "allowed_skills": ["inspect_scene"],
+                    "min_confidence": 0.7,
+                },
+            },
+            skill_templates={
+                "inspect_scene": {
+                    "primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}]
+                }
+            },
+            named_poses={
+                "home": {"position": {"x": 0.2, "y": 0.0, "z": 0.2}},
+                "observe_table": {"position": {"x": 0.3, "y": 0.0, "z": 0.25}},
+                "tray_right": {"position": {"x": 0.2, "y": -0.15, "z": 0.18}},
+            },
+            named_targets={
+                "demo_object": {
+                    "observe_pose": "observe_table",
+                    "pregrasp_pose": "home",
+                    "hover_pose": "observe_table",
+                    "grasp_pose": "observe_table",
+                    "lift_pose": "tray_right",
+                    "retreat_pose": "home",
+                }
+            },
+            workspace={"x": [0.0, 0.5], "y": [-0.3, 0.3], "z": [0.0, 0.5]},
+        ),
+    )
+
+    errors = validate_config(config)
+    assert not any("api_key_env is required" in error for error in errors)
+
+
+def test_validate_embodied_planner_require_depth_needs_topic():
+    config = RobotConfig(
+        name="test_robot",
+        type="so101",
+        robot_type="so_101",
+        ros2_control=Ros2ControlConfig(
+            hardware_plugin="so101_hardware/SO101SystemHardware",
+            params={},
+        ),
+        contract=ContractExtensionConfig(observations=[], actions=[]),
+        embodied=EmbodiedConfig(
+            enabled=True,
+            planner={
+                "mode": "vlm_api",
+                "scene_sources": {
+                    "primary_camera_topic": "/camera/top/image_raw",
+                    "require_depth": True,
+                },
+                "vlm_api": {
+                    "provider": "openai_compatible",
+                    "base_url": "http://localhost:8000/v1",
+                    "api_key_env": "",
+                    "model": "Qwen3.5-9B",
+                },
+                "planning_policy": {
+                    "allowed_skills": ["inspect_scene"],
+                    "min_confidence": 0.7,
+                },
+            },
+            skill_templates={
+                "inspect_scene": {
+                    "primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}]
+                }
+            },
+            named_poses={
+                "home": {"position": {"x": 0.2, "y": 0.0, "z": 0.2}},
+                "observe_table": {"position": {"x": 0.3, "y": 0.0, "z": 0.25}},
+                "tray_right": {"position": {"x": 0.2, "y": -0.15, "z": 0.18}},
+            },
+            named_targets={
+                "demo_object": {
+                    "observe_pose": "observe_table",
+                    "pregrasp_pose": "home",
+                    "hover_pose": "observe_table",
+                    "grasp_pose": "observe_table",
+                    "lift_pose": "tray_right",
+                    "retreat_pose": "home",
+                }
+            },
+            workspace={"x": [0.0, 0.5], "y": [-0.3, 0.3], "z": [0.0, 0.5]},
+        ),
+    )
+
+    errors = validate_config(config)
+    assert any("require_depth=true requires at least one aligned depth topic" in error for error in errors)
+
+
+def test_validate_embodied_skill_template_pose_keys():
+    config = RobotConfig(
+        name="test_robot",
+        type="so101",
+        robot_type="so_101",
+        ros2_control=Ros2ControlConfig(
+            hardware_plugin="so101_hardware/SO101SystemHardware",
+            params={},
+        ),
+        contract=ContractExtensionConfig(observations=[], actions=[]),
+        embodied=EmbodiedConfig(
+            enabled=True,
+            skill_templates={
+                "hover_named_target": {
+                    "primitive_sequence": [{"primitive_name": "move_to_named_pose", "target_pose_key": "hover_pose"}]
+                }
+            },
+            named_poses={
+                "home": {"position": {"x": 0.2, "y": 0.0, "z": 0.2}},
+                "observe_table": {"position": {"x": 0.3, "y": 0.0, "z": 0.25}},
+                "tray_right": {"position": {"x": 0.2, "y": -0.15, "z": 0.18}},
+            },
+            named_targets={
+                "demo_object": {
+                    "pregrasp_pose": "home",
+                    "grasp_pose": "observe_table",
+                    "lift_pose": "tray_right",
+                }
+            },
+            workspace={"x": [0.0, 0.5], "y": [-0.3, 0.3], "z": [0.0, 0.5]},
+        ),
+    )
+
+    errors = validate_config(config)
+    assert any("hover_pose is required" in error for error in errors)

@@ -104,6 +104,7 @@ from launch_ros.actions import Node
 
 # Import node generators from launch_builders modules
 from robot_config.launch_builders.control import generate_ros2_control_nodes
+from robot_config.launch_builders.embodied import generate_embodied_nodes
 from robot_config.launch_builders.execution import generate_execution_nodes
 from robot_config.launch_builders.hardware_mock import (
     mock_mode_skips_subsystem,
@@ -278,6 +279,8 @@ def launch_setup(context, *args, **kwargs):
     auto_start_controllers = context.launch_configurations.get("auto_start_controllers", "true")
     control_mode_override = context.launch_configurations.get("control_mode", "")
     voice_asr_auto_start_str = context.launch_configurations.get("voice_asr_auto_start", "")
+    with_embodied_str = context.launch_configurations.get("with_embodied", "")
+    with_perception_str = context.launch_configurations.get("with_perception", "")
 
     use_sim = parse_bool(use_sim_str, default=False)
 
@@ -289,6 +292,8 @@ def launch_setup(context, *args, **kwargs):
     logger.info(f"auto_start_controllers: {auto_start_controllers}")
     logger.info(f"control_mode: {control_mode_override if control_mode_override else '(from config)'}")
     logger.info(f"voice_asr_auto_start: {voice_asr_auto_start_str}")
+    logger.info(f"with_embodied: {with_embodied_str if with_embodied_str else '(from config)'}")
+    logger.info(f"with_perception: {with_perception_str if with_perception_str else '(from config)'}")
 
     # ========== 2. Load robot configuration ==========
     try:
@@ -333,6 +338,17 @@ def launch_setup(context, *args, **kwargs):
         logger.info(
             "CLI override: voice_asr.enabled=true, voice_asr.active_mode=continuous, voice_asr.auto_download_model=true"
         )
+
+    if with_embodied_str != "":
+        embodied_cfg = robot_config.setdefault("embodied", {})
+        embodied_cfg["enabled"] = parse_bool(with_embodied_str, default=False)
+        logger.info(f"CLI override: embodied.enabled={embodied_cfg['enabled']}")
+
+    if with_perception_str != "":
+        embodied_cfg = robot_config.setdefault("embodied", {})
+        perception_cfg = embodied_cfg.setdefault("perception", {})
+        perception_cfg["enabled"] = parse_bool(with_perception_str, default=False)
+        logger.info(f"CLI override: embodied.perception.enabled={perception_cfg['enabled']}")
 
     active_control_mode = robot_config.get("default_control_mode", "model_inference")
     logger.info(f"Active control mode: {active_control_mode}")
@@ -629,6 +645,20 @@ def launch_setup(context, *args, **kwargs):
         logger.error(f"generating MoveIt nodes: {e}")
         logger.info("Continuing without MoveIt...")
 
+    # ========== 10.5 Generate Embodied Minimal-Closure Nodes ==========
+    try:
+        embodied_nodes = generate_embodied_nodes(robot_config, active_control_mode)
+        if embodied_nodes:
+            if controller_ready_waiter is not None:
+                logger.info("Deferring embodied nodes until required controllers are active...")
+                controller_dependent_actions.extend(embodied_nodes)
+            else:
+                actions.extend(embodied_nodes)
+            logger.info(f"Prepared {len(embodied_nodes)} embodied node(s)")
+    except Exception as e:
+        logger.error(f"generating embodied nodes: {e}")
+        raise
+
     # ========== 11.5 Generate Task Executor Node ==========
     try:
         if with_moveit:
@@ -810,6 +840,16 @@ def generate_launch_description():
                 "voice_asr_auto_start",
                 default_value="false",
                 description="When true, enable Voice ASR and override robot.voice_asr.active_mode=continuous",
+            ),
+            DeclareLaunchArgument(
+                "with_embodied",
+                default_value="",
+                description="Enable the embodied minimal closure. If empty, uses robot.embodied.enabled from YAML.",
+            ),
+            DeclareLaunchArgument(
+                "with_perception",
+                default_value="",
+                description="Enable perception_service. If empty, uses robot.embodied.perception.enabled from YAML.",
             ),
             DeclareLaunchArgument(
                 "record_visualizer",

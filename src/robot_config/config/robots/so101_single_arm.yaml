@@ -159,6 +159,230 @@ robot:
     device_name: ""
     exit_on_init_failure: true
 
+  embodied:
+    enabled: false
+    debug_tracing: true
+    task_input_topic: /voice_command
+    task_command_topic: /embodied/task_command
+    planned_task_topic: /embodied/planned_task
+    status_topic: /embodied/task_status
+    skill_action_name: /embodied/execute_skill
+    primitive_action_name: /embodied/execute_primitive
+    validate_skill_service: /embodied/validate_skill
+    validate_primitive_service: /embodied/validate_primitive
+    default_target_name: demo_object
+    default_place_name: tray_right
+    timeouts:
+      task_budget_sec: 180.0
+      scene_freshness_sec: 0.5
+      model_idle_timeout_sec: 120.0
+      rpc_timeout_sec: 5.0
+      gripper_settle_sec: 1.5
+    planner:
+      mode: hybrid  # rule | vlm_api | hybrid
+      scene_sources:
+        primary_camera_topic: /camera/front_camera/color/image_raw
+        primary_camera_info_topic: /camera/front_camera/color/camera_info
+        primary_aligned_depth_topic: /camera/front_camera/aligned_depth_to_color/image_raw
+        primary_pointcloud_topic: /camera/front_camera/depth/color/points
+        wrist_camera_topic: ""
+        wrist_camera_info_topic: ""
+        wrist_aligned_depth_topic: ""
+        wrist_pointcloud_topic: ""
+        ee_pose_topic: /robot_status/ee_pose
+        joint_state_topic: /joint_states
+        require_depth: false  # 仿真环境无深度流，仅用 RGB
+        require_pointcloud: false
+      vlm_api:
+        provider: kimicode
+        base_url: https://api.kimi.com/coding/v1
+        api_key_env: KIMICODE_API_KEY
+        model: kimi-latest
+        max_image_width: 640
+        jpeg_quality: 80
+      planning_policy:
+        fallback_to_rule_planner: true
+        min_confidence: 0.70
+        allowed_skills:
+          - inspect_scene
+          - observe_target_area
+          - approach_named_target
+          - hover_named_target
+          - pick_named_target
+          - lift_named_target
+          - retreat_from_target
+          - place_named_pose
+          - release_at_named_pose
+          - recover_safe_pose
+          - move_relative_ee
+          - open_gripper_skill
+          - close_gripper_skill
+          - gripper_point_down
+          - rotate_gripper_cw
+          - rotate_gripper_ccw
+    perception:
+      enabled: false
+      request_topic: /embodied/perception_request
+      text_input_topic: /embodied/perception_text
+      result_topic: /embodied/perception_result
+      summary_topic: /embodied/perception_summary
+      default_session_id: default
+      scene_sources:
+        primary_camera_topic: /camera/front_camera/color/image_raw
+        primary_camera_info_topic: /camera/front_camera/color/camera_info
+        primary_aligned_depth_topic: /camera/front_camera/aligned_depth_to_color/image_raw
+        primary_pointcloud_topic: /camera/front_camera/depth/color/points
+        wrist_camera_topic: ""
+        wrist_camera_info_topic: ""
+        wrist_aligned_depth_topic: ""
+        wrist_pointcloud_topic: ""
+        ee_pose_topic: /robot_status/ee_pose
+        joint_state_topic: /joint_states
+        require_depth: false  # 仿真环境无深度流，仅用 RGB
+        require_pointcloud: false
+      vlm_api:
+        provider: openai_compatible
+        base_url: http://localhost:8000/v1
+        api_key_env: ""
+        model: Qwen3.5-9B
+        max_image_width: 320
+        jpeg_quality: 70
+      conversation:
+        max_history_turns: 4
+    execution:
+      relative_motion_step_m: 0.03
+      relative_motion_reference_frame: base
+      relative_motion_direction_mapping:
+        forward: [0.0, -1.0, 0.0]
+        backward: [0.0, 1.0, 0.0]
+        left: [1.0, 0.0, 0.0]
+        right: [-1.0, 0.0, 0.0]
+        up: [0.0, 0.0, 1.0]
+        down: [0.0, 0.0, -1.0]
+      gripper_open_position: 1.0
+      gripper_closed_position: 0.15
+      task_executor_action_name: /task_executor/execute_task_plan
+    safety:
+      workspace:
+        x: [0.00, 0.42]
+        y: [-0.32, 0.25]
+        z: [0.02, 0.40]
+    named_poses:
+      gripper_down:
+        position: {x: 0.22, y: 0.00, z: 0.20}
+        orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+      home:
+        position: {x: 0.22, y: 0.00, z: 0.26}
+        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
+      observe_table:
+        position: {x: 0.28, y: 0.00, z: 0.24}
+        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
+      tray_right:
+        position: {x: 0.24, y: -0.16, z: 0.18}
+        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
+      demo_pregrasp:
+        position: {x: 0.28, y: 0.00, z: 0.14}
+        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
+      demo_observe:
+        position: {x: 0.25, y: 0.00, z: 0.26}
+        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
+      demo_hover:
+        position: {x: 0.30, y: 0.00, z: 0.13}
+        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
+      demo_grasp:
+        position: {x: 0.30, y: 0.00, z: 0.08}
+        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
+      demo_lift:
+        position: {x: 0.28, y: 0.00, z: 0.22}
+        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
+      demo_retreat:
+        position: {x: 0.22, y: 0.00, z: 0.20}
+        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
+    skill_templates:
+      inspect_scene:
+        primitive_sequence: []
+      recover_safe_pose:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: home
+      observe_target_area:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            target_pose_key: observe_pose
+      approach_named_target:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            target_pose_key: pregrasp_pose
+      hover_named_target:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            target_pose_key: hover_pose
+      pick_named_target:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            target_pose_key: pregrasp_pose
+          - primitive_name: move_to_named_pose
+            target_pose_key: grasp_pose
+          - primitive_name: close_gripper
+          - primitive_name: move_to_named_pose
+            target_pose_key: lift_pose
+      lift_named_target:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            target_pose_key: lift_pose
+      retreat_from_target:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            target_pose_key: retreat_pose
+      place_named_pose:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            place_name_from_request: true
+          - primitive_name: open_gripper
+      release_at_named_pose:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            place_name_from_request: true
+          - primitive_name: open_gripper
+      move_relative_ee:
+        primitive_sequence:
+          - primitive_name: move_relative_ee
+            motion_direction_from_request: true
+            motion_distance_from_request: true
+      open_gripper_skill:
+        primitive_sequence:
+          - primitive_name: open_gripper
+      close_gripper_skill:
+        primitive_sequence:
+          - primitive_name: close_gripper
+      gripper_point_down:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: gripper_down
+      rotate_gripper_cw:
+        primitive_sequence:
+          - primitive_name: rotate_gripper_cw
+            motion_distance_from_request: true
+      rotate_gripper_ccw:
+        primitive_sequence:
+          - primitive_name: rotate_gripper_ccw
+            motion_distance_from_request: true
+    named_targets:
+      demo_object:
+        observe_pose: demo_observe
+        pregrasp_pose: demo_pregrasp
+        hover_pose: demo_hover
+        grasp_pose: demo_grasp
+        lift_pose: demo_lift
+        retreat_pose: demo_retreat
+      banana:
+        observe_pose: demo_observe
+        pregrasp_pose: demo_pregrasp
+        hover_pose: demo_hover
+        grasp_pose: demo_grasp
+        lift_pose: demo_lift
+        retreat_pose: demo_retreat
+
   # ros2_control configuration
   ros2_control:
     hardware_plugin: so101_hardware/SO101SystemHardware
@@ -190,7 +414,7 @@ robot:
     - type: camera
       name: top
       driver: opencv
-      index: 0
+      index: 6
       width: 640
       height: 480
       fps: 30
@@ -215,7 +439,7 @@ robot:
     - type: camera
       name: wrist
       driver: opencv
-      index: 2
+      index: 8
       width: 640
       height: 480
       fps: 60
@@ -244,7 +468,7 @@ robot:
       width: 640
       height: 480
       fps: 30
-      pixel_format: bgr8
+      pixel_format: rgb8
       enable_pointcloud: false
       align_depth: true
       frame_id: camera_front_link
