@@ -1,0 +1,2 @@
+[console_scripts]
+safety_guard_node = safety_guard.safety_guard_node:main
