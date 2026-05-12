@@ -21,6 +21,9 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | **ibrobot-build** | 编译整个工作空间或指定 package（`colcon build`） |
 | **ibrobot-env** | 初始化运行环境，加载 `.shrc_local`、设置 `ROS_DOMAIN_ID` |
 | **ibrobot-bq3588hm-oh** | 管理贝启 BQ3588HM 开发板上的 OpenHarmony 运行时、ROS 环境与 Python 3.12 事实 |
+| **ibrobot-hdc** | 连接 BQ3588HM 开发板，执行 hdc shell / file send / file recv 等板端操作 |
+| **rknn-convert** | 将 ONNX 模型转换为 RKNN，并明确主 venv 导出 ONNX、`.venv-rknn` 转 RKNN 的分层流程 |
+| **bq3588-oh-rknn** | 在 BQ3588HM OpenHarmony 板端拉起 RKNN cloud inference，封装 `cloud_inference.launch.py` 的运行环境 |
 | **ibrobot-architecture** | 理解 SSOT 架构设计、配置规范与数据流 |
 
 ### 🔍 代码协作
@@ -61,6 +64,9 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 修复 PR 里的评审意见            → atomgit-review-resolution
 编译一下项目                    → ibrobot-build
 看看 BQ3588HM 板子上的 OH 环境   → ibrobot-bq3588hm-oh
+连接 BQ3588HM 并推送文件         → ibrobot-hdc
+把 ONNX 转成 RKNN               → rknn-convert
+在 BQ3588HM 上启动 RKNN 推理     → bq3588-oh-rknn
 启动机器人仿真                  → ibrobot-launch
 初始化环境                      → ibrobot-env
 提交代码                        → ibrobot-git-flow
