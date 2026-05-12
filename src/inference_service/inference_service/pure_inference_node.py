@@ -59,8 +59,11 @@ class PureInferenceNode(Node):
 
         self._input_topic = input_topic
         self._output_topic = output_topic
+        self._inference_backend = str(device)
 
-        self.get_logger().info(f"Loading policy from {policy_path} on device {device}...")
+        self.get_logger().info(
+            f"Loading policy from {policy_path} with inference_backend={self._inference_backend}..."
+        )
         self._engine = PureInferenceEngine(policy_path=policy_path, device=device)
         self.get_logger().info(f"Engine loaded: {self._engine.policy_type}, chunk_size={self._engine.chunk_size}")
 
@@ -80,7 +83,8 @@ class PureInferenceNode(Node):
         self._log_interval_s = 5.0
 
         self.get_logger().info(
-            f"PureInferenceNode ready: input={input_topic}, output={output_topic}, device={self._engine._device}"
+            f"PureInferenceNode ready: input={input_topic}, output={output_topic}, "
+            f"inference_backend={self._inference_backend}, tensor_device={self._engine.device}"
         )
         self.get_logger().info("Waiting for preprocessed batches from edge node...")
 
@@ -95,10 +99,11 @@ class PureInferenceNode(Node):
             request_id = req_list[0] if req_list and isinstance(req_list, list) else None
 
             _trace.info(
-                "[inference_begin] request_id=%s model=%s device=%s",
+                "[inference_begin] request_id=%s model=%s inference_backend=%s tensor_device=%s",
                 request_id or "",
                 self._engine.policy_type,
-                self._engine._device,
+                self._inference_backend,
+                self._engine.device,
             )
 
             result = self._engine(batch)

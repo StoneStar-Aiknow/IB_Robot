@@ -77,7 +77,7 @@ Both machines must share the **same `ROS_DOMAIN_ID`** and be on the same LAN.
 
 The Device launches only the Edge proxy node (pre/post-processing), without loading GPU models:
 ```bash
-export ROS_DOMAIN_ID=42
+export ROS_DOMAIN_ID=<your_domain_id>
 ros2 launch robot_config robot.launch.py \
     robot_config:=so101_single_arm \
     control_mode:=model_inference \
@@ -88,7 +88,7 @@ ros2 launch robot_config robot.launch.py \
 **Step 2 — On the GPU Server (Edge/Cloud)**:
 
 ```bash
-export ROS_DOMAIN_ID=42   # Must match the Device!
+export ROS_DOMAIN_ID=<same_domain_id_as_device>
 ros2 launch inference_service cloud_inference.launch.py \
     policy_path:=/path/to/models/pretrained_model \
     device:=cuda
@@ -115,6 +115,19 @@ files under `policy_path`. `device:=ascend_om_3403` also resolves the worker
 executable from `cpp_executable`, `SVP_WORKER_EXECUTABLE`, or common `out/main`
 layouts. Preprocessing, postprocessing, ROS topics, and distributed transport
 remain the existing `inference_service` pipeline.
+
+For RK3588 / OpenHarmony boards running RKNN Lite, switch the cloud node to:
+
+```bash
+export ROS_DOMAIN_ID=<same_domain_id_as_device>
+ros2 launch inference_service cloud_inference.launch.py \
+    policy_path:=/path/to/models/pretrained_model \
+    device:=rknn
+```
+
+`device:=rknn` still uses the LeRobot metadata under `policy_path/config.json`
+for preprocessing and postprocessing, while expecting the actual RKNN artifact to
+live inside `policy_path`, using `model.rknn` as the default filename.
 
 #### Scenario 2: Single-Machine Debug (Development)
 

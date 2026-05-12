@@ -79,7 +79,7 @@ control_modes:
 
 端侧只启动 Edge 代理节点（前/后处理），不加载 GPU 模型：
 ```bash
-export ROS_DOMAIN_ID=42
+export ROS_DOMAIN_ID=<你的域ID>
 ros2 launch robot_config robot.launch.py \
     robot_config:=so101_single_arm \
     control_mode:=model_inference \
@@ -90,7 +90,7 @@ ros2 launch robot_config robot.launch.py \
 **步骤 2 — 在算力服务器（边端/云端 Edge/Cloud）上**：
 
 ```bash
-export ROS_DOMAIN_ID=42   # 必须与端侧一致！
+export ROS_DOMAIN_ID=<与你的端侧一致的域ID>
 ros2 launch inference_service cloud_inference.launch.py \
     policy_path:=/path/to/models/pretrained_model \
     device:=cuda
@@ -99,7 +99,7 @@ ros2 launch inference_service cloud_inference.launch.py \
 如果 Cloud 节点运行在端侧开发板（openEuler / OpenHarmony）上的 Ascend NPU，可直接切换为：
 
 ```bash
-export ROS_DOMAIN_ID=42
+export ROS_DOMAIN_ID=<与你的端侧一致的域ID>
 ros2 launch inference_service cloud_inference.launch.py \
     policy_path:=/path/to/models/pretrained_model \
     device:=npu
@@ -125,6 +125,19 @@ ros2 launch inference_service cloud_inference.launch.py \
 `device:=ascend_om_3403` 额外需要 worker 可执行文件，可通过 `cpp_executable` 配置项、
 `SVP_WORKER_EXECUTABLE` 环境变量或常见 `out/main` 布局解析。两种模式的前/后处理、
 ROS 话题与分布式通信仍沿用 `inference_service` 的现有管线。
+
+如果 Cloud 节点运行在 RK3588 / OpenHarmony 板端并使用 RKNN Lite，可直接切换为：
+
+```bash
+export ROS_DOMAIN_ID=<与你的端侧一致的域ID>
+ros2 launch inference_service cloud_inference.launch.py \
+    policy_path:=/path/to/models/pretrained_model \
+    device:=rknn
+```
+
+`device:=rknn` 会继续复用 `policy_path/config.json` 中的 LeRobot 配置用于前后处理，
+同时要求实际的 RKNN 模型文件随 policy 一起纳管到 `policy_path` 目录内，
+默认文件名为 `model.rknn`。
 
 #### 场景二：单机调试（开发测试用）
 

@@ -11,6 +11,9 @@ Execution Modes:
 - distributed: Edge preprocessing → Cloud inference → Edge postprocessing
 """
 
+import os
+from pathlib import Path
+
 from launch_ros.actions import Node
 
 from robot_config.logger_utils import get_colored_logger
@@ -19,6 +22,43 @@ from robot_config.utils import parse_bool, prepare_lerobot_env
 logger = get_colored_logger("robot_config.execution")
 
 INFERENCE_NODE_NAME = "act_inference_node"
+
+
+def _workspace_root() -> Path:
+    return Path(os.environ.get("WORKSPACE") or Path(__file__).resolve().parents[4]).resolve()
+
+
+def _resolve_model_path(model_path: str) -> Path:
+    path = Path(str(model_path)).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (_workspace_root() / path).resolve()
+
+
+def _resolve_inference_binding(model_config):
+    model_path = _resolve_model_path(model_config["path"])
+    env = prepare_lerobot_env()
+
+    if str(model_config.get("device", "")).strip().lower().replace("-", "_") != "rknn":
+        return str(model_path), env
+
+    rknn_candidates = []
+    if model_path.is_file() and model_path.suffix == ".rknn":
+        rknn_candidates.append(model_path)
+    elif model_path.is_dir():
+        rknn_candidates.extend(
+            [
+                model_path / "model.rknn",
+                model_path / f"{model_path.name}.rknn",
+            ]
+        )
+        rknn_candidates.extend(sorted(model_path.glob("*.rknn")))
+
+    rknn_model_path = next((candidate.resolve() for candidate in rknn_candidates if candidate.is_file()), None)
+    if rknn_model_path is None:
+        raise FileNotFoundError(f"RKNN model file not found under policy_path {model_path}")
+
+    return str(model_path), env
 
 
 def generate_inference_node(robot_config, control_mode, use_sim=False, cloud_local=False):
@@ -95,16 +135,15 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
     logger.info(f"  Policy type: {model_config.get('policy_type', 'unknown')}")
     logger.info(f"  Robot config: {robot_config_path}")
 
-    env = prepare_lerobot_env()
+    checkpoint_path, env = _resolve_inference_binding(model_config)
     if env.get("PYTHONPATH"):
         logger.info(f"Injected PYTHONPATH: {env['PYTHONPATH']}")
-
     node_params = {
-        "checkpoint": model_config["path"],
+        "checkpoint": checkpoint_path,
         "robot_config_path": str(robot_config_path),
         "lerobot_norm_mode": model_config.get("lerobot_norm_mode", "range_m100_100"),
         "passive_mode": True,
-        "device": "auto",
+        "device": model_config.get("device", "auto"),
         "use_sim_time": is_sim,
         "node_name": INFERENCE_NODE_NAME,
         "execution_mode": execution_mode,
@@ -171,14 +210,12 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
         return None
 
     model_config = models[model_name]
-    policy_path = model_config["path"]
+    policy_path, env = _resolve_inference_binding(model_config)
 
     logger.info(f"Model: {model_name}")
     logger.info(f"  Path: {policy_path}")
     logger.info(f"  Policy type: {model_config.get('policy_type', 'unknown')}")
     logger.info(f"  Robot config: {robot_config_path}")
-
-    env = prepare_lerobot_env()
 
     nodes = []
 
@@ -188,7 +225,7 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
         "robot_config_path": str(robot_config_path),
         "lerobot_norm_mode": model_config.get("lerobot_norm_mode", "range_m100_100"),
         "passive_mode": True,
-        "device": "auto",
+        "device": model_config.get("device", "auto"),
         "use_sim_time": is_sim,
         "node_name": INFERENCE_NODE_NAME,
         "execution_mode": "distributed",
@@ -216,7 +253,7 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
             "policy_path": policy_path,
             "input_topic": cloud_inference_topic,
             "output_topic": cloud_result_topic,
-            "device": "auto",
+            "device": model_config.get("device", "auto"),
             "use_sim_time": is_sim,
         }
 

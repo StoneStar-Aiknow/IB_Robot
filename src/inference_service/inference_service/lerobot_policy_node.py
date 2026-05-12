@@ -155,7 +155,9 @@ class LeRobotPolicyNode(Node):
         self.get_logger().info(f"Execution mode: {self._config.execution_mode}")
 
         self._device = resolve_device(self._config.device)
-        self.get_logger().info(f"Using device: {self._device}")
+        self.get_logger().info(
+            f"Using inference_backend={self._config.device}, tensor_device={self._device}"
+        )
 
         self._last_inference_time: float | None = None
         self._inference_count = 0
@@ -697,9 +699,10 @@ class LeRobotPolicyNode(Node):
         """Execute inference in monolithic mode (zero-copy)."""
         request_id = inference_id or ""
         _trace.info(
-            "[inference_begin] request_id=%s model=%s device=%s",
+            "[inference_begin] request_id=%s model=%s inference_backend=%s tensor_device=%s",
             request_id,
             self._policy_type,
+            self._config.device,
             self._device,
         )
         result = self._coordinator(obs_frame)

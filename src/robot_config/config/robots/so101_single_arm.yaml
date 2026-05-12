@@ -31,6 +31,12 @@ robot:
       #   none           : no conversion (pass-through, units already match)
       lerobot_norm_mode: range_m100_100
 
+    so101_act_rknn:
+      path: ./models/502000/pretrained_model
+      policy_type: act
+      device: rknn
+      lerobot_norm_mode: range_m100_100
+
   # ============================================
   # Unified joint definitions (Single Source of Truth)
   # ============================================
@@ -92,7 +98,7 @@ robot:
       inference:
         enabled: true
         # execution_mode: "distributed"
-        model: so101_act
+        model: so101_act_rknn
         action_server: /inference/dispatch
       # ============================================
       # Executor configuration
@@ -101,8 +107,10 @@ robot:
         type: topic  # topic | action
         mode: model_inference
         queue_size: 100
-        watermark_threshold: 0
-        control_frequency: 30.0
+        # Keep about 2.5s of buffered actions so ~1.5s distributed RKNN latency
+        # still leaves margin before the dispatcher falls back to hold.
+        watermark_threshold: 50
+        control_frequency: 20.0
 
     moveit_planning:
       description: "MoveIt trajectory planning mode (VoxPoser/VLM)"

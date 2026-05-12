@@ -4,20 +4,40 @@ from __future__ import annotations
 
 import json
 import os
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
 from torch import Tensor
 
-from inference_service.core.ascend_om.ACTWrapper import ACTWrapper
 from inference_service.core.ascend_om.ACTWrapper_3403 import (
-    ACT3403Policy,
     DEFAULT_OM_BASENAME,
     _guess_worker_path_from_model,
     _is_om_path,
 )
 from inference_service.core.pure_inference_engine import PolicyWrapper
+
+ACTWrapper = None
+ACT3403Policy = None
+
+
+def __getattr__(name: str) -> Any:
+    if name == "ACTWrapper":
+        value = import_module("inference_service.core.ascend_om.ACTWrapper").ACTWrapper
+    elif name == "ACT3403Policy":
+        value = import_module("inference_service.core.ascend_om.ACTWrapper_3403").ACT3403Policy
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value
+
+
+def _resolve_runtime_attr(name: str) -> Any:
+    value = globals().get(name)
+    if value is not None:
+        return value
+    return __getattr__(name)
 
 
 class _FeatureConfig:
@@ -195,7 +215,8 @@ class AscendOMPolicyWrapper(PolicyWrapper):
         config_view = _ACTConfigView(config)
         self._chunk_size = config_view.chunk_size
         model_path = resolve_om_model_path(path, config)
-        self._impl = ACTWrapper(str(model_path), config_view)
+        act_wrapper_cls = _resolve_runtime_attr("ACTWrapper")
+        self._impl = act_wrapper_cls(str(model_path), config_view)
 
     def infer(self, batch: Dict[str, Tensor]) -> Tensor:
         if self._impl is None:
@@ -231,7 +252,8 @@ class AscendOM3403PolicyWrapper(PolicyWrapper):
         self._chunk_size = _chunk_size_from_config(config)
         model_path = resolve_om_model_path(path, config)
         worker_path = resolve_3403_worker_path(path, model_path, config)
-        self._impl = ACT3403Policy(str(worker_path), str(model_path))
+        act_3403_cls = _resolve_runtime_attr("ACT3403Policy")
+        self._impl = act_3403_cls(str(worker_path), str(model_path))
 
     def infer(self, batch: Dict[str, Tensor]) -> Tensor:
         if self._impl is None:

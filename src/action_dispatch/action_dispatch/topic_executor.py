@@ -28,8 +28,8 @@ class TopicExecutor:
         self.action_specs = config.get("action_specs", [])
         self._publishers: dict[str, Any] = {}
 
-        # Default QoS: Best Effort, Volatile (standard for ros2_control)
-        self._qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.VOLATILE, depth=1)
+        # Use Reliable delivery so ros2_control command subscribers accept live action topics.
+        self._qos = QoSProfile(reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE, depth=1)
 
     def initialize(self) -> bool:
         """Initialize publishers based on contract."""

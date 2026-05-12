@@ -154,7 +154,7 @@ python export_onnx_rknn.py \
 | `--device` | ❌ | `cpu` | 导出时使用的设备（`cpu` 或 `cuda`） |
 | `--convert_rknn` | ❌ | `false` | 导出后自动转换为 RKNN 格式 |
 | `--rknn_mode` | ❌ | `float16` | RKNN 转换模式（`float16`/`int8`/`hybrid`） |
-| `--rknn_output` | ❌ | 同目录 `.rknn` | RKNN 输出路径 |
+| `--rknn_output` | ❌ | `policy_path/model.rknn` | RKNN 输出路径 |
 | `--rknn_venv_python` | ❌ | 自动检测 `.venv-rknn/bin/python` | RKNN 专用 Python 解释器路径 |
 
 ### 示例
@@ -177,7 +177,8 @@ python export_onnx_rknn.py \
     --rknn_mode=int8
 ```
 
-导出的 ONNX 文件为 `act_ros2_rknn.onnx`。若启用 `--convert_rknn`，还会生成对应的 `.rknn` 文件。
+导出的 ONNX 文件为 `act_ros2_rknn.onnx`。若启用 `--convert_rknn`，默认还会在同一
+`policy_path` 目录下生成 `model.rknn`，供 `device:=rknn` 直接按 `policy_path` 加载。
 
 ---
 
