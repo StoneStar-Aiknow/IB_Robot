@@ -188,7 +188,7 @@ workspace:
 统一 launch 启动后，可以直接查看安全层日志：
 
 ```bash
-cd /home/lwh/code/IB_Robot
+cd ~/IB_Robot
 source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.sh
 ros2 service list | grep embodied
 ```

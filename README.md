@@ -80,7 +80,7 @@ IB_Robot/                           # 主工作空间 (本仓库)
 │   ├── action_dispatch/            # 统一动作执行器 (双模支持)
 │   ├── task_dispatch/              # 任务调度与分发服务
 │   ├── tensormsg/                  # LeRobot ↔ ROS 2 协议转换枢纽
-│   ├── ibrobot_msgs/               # 系统统一接口定义 (Message/Action)
+│   ├── ibrobot_msgs/               # 系统统一接口定义 (Message/Action/Service)
 │   ├── dataset_tools/              # 数据集采集与转换工具 (Episode Recorder)
 │   ├── robot_teleop/               # 遥操作控制 (Leader Arm/Xbox 手柄)
 │   ├── robot_description/          # 统一机器人 URDF/SRDF/MJCF 模型描述
@@ -98,7 +98,13 @@ IB_Robot/                           # 主工作空间 (本仓库)
 │   ├── model_utils/                # 模型工具库
 │   ├── attention_viz/              # 注意力可视化工具
 │   ├── voice_asr_service/          # 语音识别服务
-│   └── workflows/                  # CI/CD 配置
+│   ├── workflows/                  # CI/CD 配置
+│   │
+│   ├── embodied_agent/             # 具身 AI 任务入口与编排 (task_entry / planner / executor)
+│   ├── vlm_task_planner/           # VLM 视觉语言任务规划器 (多模态场景理解 + 技能规划)
+│   ├── perception_service/         # 连续场景理解服务 (RGB-D / 多视角感知)
+│   ├── skill_library/              # 技能执行层 (skill → primitive → MoveIt)
+│   └── safety_guard/               # 显式安全校验层 (白名单 + 工作空间边界)
 │
 ├── docs/                           # 深度架构文档与开发指南
 │   ├── pictures/                   # 架构图与演示 GIF
@@ -436,7 +442,75 @@ bag 目录组织、`dataset.yaml` 元信息和更多转换参数，详见 `src/d
 | `record` | 是否启用录制流水线 | `false` |
 | `record_mode` | 录制模式（`continuous` / `episodic`） | `continuous` |
 | `record_visualizer` | 录制可视化器（`none` / `rerun`） | `none` |
+| `with_embodied` | 强制启用/禁用具身 AI 流水线（空则按 YAML `robot.embodied.enabled` 决定） | 空 |
 | `auto_start_controllers` | 是否在启动后自动激活控制器 | `true` |
+
+***
+
+## 四、具身 AI 流水线
+
+IB-Robot 内置了一条完整的**具身 AI 执行链路**，以自然语言（或 `/voice_command` 话题）为入口，经 VLM 视觉语言理解和技能规划后，驱动 MoveIt 2 执行真实动作。该链路在 `moveit_planning` 控制模式下可用。
+
+### 链路结构
+
+```text
+/voice_command
+  → task_entry_node         # 任务入口，优先规则直达
+  → vlm_task_planner_node   # VLM 视觉语言任务规划（场景理解 + 技能选择）
+  → task_executor_node      # 技能序列编排
+  → skill_executor_node     # 技能 → primitive 分解
+  → safety_guard_node       # 安全校验（白名单 + 工作空间边界）
+  → moveit_gateway          # MoveIt 2 运动规划执行
+```
+
+### 启动具身流水线
+
+```bash
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=moveit_planning \
+    use_sim:=true \
+    with_embodied:=true \
+    moveit_display:=false
+```
+
+### 发送自然语言命令
+
+```bash
+# 场景理解（纯视觉分析，不触发机械臂移动）
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '当前摄像头中可以看到什么'}"
+
+# 相对移动
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
+
+# 抓取任务
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '抓取目标物并放到右侧托盘'}"
+
+# 回安全位
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '回原位'}"
+```
+
+### VLM 配置
+
+具身链路默认对接本地 OpenAI-compatible 服务（如 vLLM / Ollama）：
+
+```yaml
+embodied:
+  planner:
+    mode: vlm_api          # rule / vlm_api / hybrid
+    vlm_api:
+      provider: openai_compatible
+      base_url: http://localhost:8000/v1
+      model: Qwen3.5-9B
+      api_key_env: ""      # 本地服务无需 key
+```
+
+更多配置说明见：
+- [`src/embodied_agent/README.md`](src/embodied_agent/README.md) — 任务入口与编排
+- [`src/vlm_task_planner/README.md`](src/vlm_task_planner/README.md) — VLM 规划器
+- [`src/perception_service/README.md`](src/perception_service/README.md) — 场景感知服务
+- [`src/skill_library/README.md`](src/skill_library/README.md) — 技能执行层
+- [`src/safety_guard/README.md`](src/safety_guard/README.md) — 安全校验层
 
 ***
 

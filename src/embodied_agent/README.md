@@ -34,31 +34,26 @@
 - 安全校验由 `safety_guard` 负责。
 - 技能和原子动作执行由 `skill_library` 负责。
 
-## 2. 当前启动方式
+## 2. 推荐启动方式
 
-当前 PR 只提供具身管线节点和 ROS 接口，不新增 `robot_config` 的统一 launch 参数。
-因此不要使用尚未实现的 `with_embodied` launch 参数；如需联调，应在完成构建后按节点分别启动。
-
-示例：
+建议通过统一 launch 启动，而不是手工分别起节点：
 
 ```bash
-cd /home/lwh/code/IB_Robot
-source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.sh
-
-ros2 run safety_guard safety_guard_node
-ros2 run skill_library skill_executor_node
-ros2 run embodied_agent task_planner_node
-ros2 run embodied_agent task_executor_node
-ros2 run embodied_agent task_entry_node
+cd ~/IB_Robot
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.sh && \
+ros2 launch robot_config robot.launch.py \
+  robot_config:=so101_single_arm \
+  control_mode:=moveit_planning \
+  use_sim:=true \
+  with_embodied:=true \
+  moveit_display:=false
 ```
 
-如果需要 VLM 规划，可另外启动：
+其中 `with_embodied:=true` 会临时覆盖：
 
-```bash
-ros2 run vlm_task_planner vlm_task_planner_node
-```
+- `robot.embodied.enabled=true`
 
-后续若要接入 `robot_config` SSOT，应在单独 PR 中新增 embodied launch builder，并从机器人配置注入相机、技能模板、命名位姿和工作空间等参数。
+默认 YAML 中该能力仍是关闭的。
 
 ## 3. task_entry_node
 
