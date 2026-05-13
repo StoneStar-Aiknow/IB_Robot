@@ -273,6 +273,15 @@ class TaskExecutorNode(Node):
                 self.get_logger().info(
                     f"[embodied-debug] task_executor completed task_id={msg.task_id} skills={completed_skills}"
                 )
+        except Exception as exc:
+            self.get_logger().error(f"[embodied-debug] task_executor unexpected error task_id={msg.task_id}: {exc}")
+            self._publish_status(
+                task_id=msg.task_id,
+                state="failed",
+                success=False,
+                message=f"unexpected error: {exc}",
+                error_code="INTERNAL_ERROR",
+            )
         finally:
             self._active_task_id = ""
             self._active_task_lock.release()

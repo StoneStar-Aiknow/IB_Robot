@@ -6,6 +6,16 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
+_MAX_USER_TEXT_LEN = 2000
+
+
+def _sanitize_user_text(text: str) -> str:
+    """Truncate overly long user inputs to avoid token overflows."""
+    text = (text or "").strip()
+    if len(text) > _MAX_USER_TEXT_LEN:
+        text = text[:_MAX_USER_TEXT_LEN]
+    return text
+
 
 def _contains_any(text: str, keywords: Sequence[str]) -> bool:
     return any(keyword in text for keyword in keywords)
@@ -85,6 +95,7 @@ def build_scene_analysis_messages(
     scene_snapshot: dict[str, Any],
     conversation_history: Sequence[dict[str, str]],
 ) -> list[dict[str, Any]]:
+    user_text = _sanitize_user_text(user_text)
     analysis_preferences = _infer_analysis_preferences(user_text, user_context)
     system_text = (
         "You are a continuous multimodal scene understanding assistant for IB_Robot.\n"

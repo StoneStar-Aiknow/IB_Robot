@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Any
 
 import numpy as np
@@ -12,7 +13,14 @@ def summarize_camera_info(msg: CameraInfo | None) -> dict[str, Any]:
     if msg is None:
         return {"available": False}
     k_values = list(msg.k)
-    k = k_values if len(k_values) >= 9 else ([0.0] * 9)
+    if len(k_values) < 9:
+        warnings.warn(
+            f"CameraInfo K matrix has {len(k_values)} elements (expected 9); padding with zeros",
+            stacklevel=2,
+        )
+        k = [0.0] * 9
+    else:
+        k = k_values
     return {
         "available": True,
         "frame_id": msg.header.frame_id,

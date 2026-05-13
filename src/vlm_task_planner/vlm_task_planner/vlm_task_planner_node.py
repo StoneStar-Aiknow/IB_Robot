@@ -213,6 +213,7 @@ class VLMTaskPlannerNode(Node):
         plan: PlannerResult,
         scene_analysis: SceneAnalysis | None = None,
         fallback_reason: str = "",
+        request_context: dict[str, Any] | None = None,
     ) -> None:
         planned = TaskCommand()
         planned.task_id = msg.task_id
@@ -225,7 +226,11 @@ class VLMTaskPlannerNode(Node):
         planned.motion_distance = float(plan.motion_distance)
         planned.priority = msg.priority
         planned.timeout_sec = msg.timeout_sec
-        request_context = self._load_request_context(msg)
+        if request_context is None:
+            try:
+                request_context = self._load_request_context(msg)
+            except (ValueError, json.JSONDecodeError):
+                request_context = {}
         request_context["skill_sequence"] = plan.skill_sequence
         request_context["planner_source"] = plan.planner_source
         request_context["planner_confidence"] = plan.confidence
@@ -443,11 +448,16 @@ class VLMTaskPlannerNode(Node):
             )
             return
 
+        try:
+            _parsed_context: dict[str, Any] = self._load_request_context(msg)
+        except (ValueError, json.JSONDecodeError):
+            _parsed_context = {}
         self._publish_planned_task(
             msg,
             plan,
             scene_analysis=scene_analysis,
             fallback_reason=fallback_reason,
+            request_context=_parsed_context,
         )
 
 

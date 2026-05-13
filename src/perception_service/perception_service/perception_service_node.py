@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import time
 from typing import Any
 
@@ -95,9 +96,10 @@ class PerceptionServiceNode(Node):
 
         self._result_publisher = self.create_publisher(SceneAnalysisResult, self._result_topic, 10)
         self._summary_publisher = self.create_publisher(String, self._summary_topic, 10)
-        self.create_subscription(SceneAnalysisRequest, self._request_topic, self._handle_request, 10)
+        self.create_subscription(SceneAnalysisRequest, self._request_topic, self._handle_request_cb, 10)
         self.create_subscription(String, self._text_input_topic, self._handle_text_input, 10)
         self._conversation_history: dict[str, list[dict[str, str]]] = {}
+        self._max_history_sessions: int = 32
 
         self.get_logger().info(
             "[embodied-debug] perception_service ready: "
@@ -122,6 +124,9 @@ class PerceptionServiceNode(Node):
 
     def _session_history(self, session_id: str) -> list[dict[str, str]]:
         if session_id not in self._conversation_history:
+            if len(self._conversation_history) >= self._max_history_sessions:
+                oldest = next(iter(self._conversation_history))
+                del self._conversation_history[oldest]
             self._conversation_history[session_id] = []
         return self._conversation_history[session_id]
 
@@ -217,7 +222,10 @@ class PerceptionServiceNode(Node):
         request.user_text = msg.data
         request.context_json = ""
         request.timeout_sec = 0.0
-        self._handle_request(request)
+        threading.Thread(target=self._handle_request, args=(request,), daemon=True).start()
+
+    def _handle_request_cb(self, request: SceneAnalysisRequest) -> None:
+        threading.Thread(target=self._handle_request, args=(request,), daemon=True).start()
 
     def _handle_request(self, request: SceneAnalysisRequest) -> None:
         if not request.request_id:

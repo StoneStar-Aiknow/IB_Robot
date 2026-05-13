@@ -37,10 +37,15 @@ def _extract_json_blob(raw_text: str) -> str:
     if text.startswith("{") and text.endswith("}"):
         return text
 
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if match is None:
-        raise ValueError("planner response does not contain a JSON object")
-    return match.group(0)
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch == "{":
+            try:
+                obj, _ = decoder.raw_decode(text, i)
+                return json.dumps(obj, ensure_ascii=False)
+            except json.JSONDecodeError:
+                continue
+    raise ValueError("planner response does not contain a JSON object")
 
 
 def _infer_task_type(skill_sequence: Sequence[str]) -> str:

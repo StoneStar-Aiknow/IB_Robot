@@ -302,7 +302,15 @@ class SkillExecutorNode(Node):
 
         if goal.primitive_name in {"move_to_named_pose", "move_relative_ee"}:
             if goal.primitive_name == "move_to_named_pose":
-                pose = self._pose_from_name(goal.pose_name)
+                try:
+                    pose = self._pose_from_name(goal.pose_name)
+                except KeyError:
+                    result.success = False
+                    result.error_code = "UNKNOWN_POSE"
+                    result.message = f"unknown named pose: {goal.pose_name!r}"
+                    result.pose_name = goal.pose_name
+                    goal_handle.abort()
+                    return result
             else:
                 pose = target_pose
             if self._debug:
@@ -399,6 +407,9 @@ class SkillExecutorNode(Node):
         qy = qc[3] * qd[1] - qc[0] * qd[2] + qc[1] * qd[3] + qc[2] * qd[0]
         qz = qc[3] * qd[2] + qc[0] * qd[1] - qc[1] * qd[0] + qc[2] * qd[3]
         qw = qc[3] * qd[3] - qc[0] * qd[0] - qc[1] * qd[1] - qc[2] * qd[2]
+        norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+        if norm > 1e-9:
+            qx, qy, qz, qw = qx / norm, qy / norm, qz / norm, qw / norm
 
         target_pose = Pose()
         target_pose.position.x = float(self._latest_ee_pose.pose.position.x)

@@ -6,6 +6,16 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
+_MAX_USER_TEXT_LEN = 2000
+
+
+def _sanitize_user_text(text: str) -> str:
+    """Truncate overly long user inputs to avoid token overflows."""
+    text = (text or "").strip()
+    if len(text) > _MAX_USER_TEXT_LEN:
+        text = text[:_MAX_USER_TEXT_LEN]
+    return text
+
 
 def build_chat_messages(
     task_text: str,
@@ -38,6 +48,7 @@ def build_chat_messages(
         "observe_target_area is only for pre-manipulation positioning, not for answering questions.\n"
     )
 
+    task_text = _sanitize_user_text(task_text)
     snapshot_text = json.dumps(
         {
             "task_text": task_text,

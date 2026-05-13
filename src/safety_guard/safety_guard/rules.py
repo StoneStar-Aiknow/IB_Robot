@@ -9,7 +9,10 @@ from skill_library.skill_templates import SUPPORTED_PRIMITIVES, get_skill_templa
 def load_json_mapping(raw_value: str) -> dict[str, Any]:
     if not raw_value:
         return {}
-    return json.loads(raw_value)
+    try:
+        return json.loads(raw_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON mapping: {exc}") from exc
 
 
 def _extract_pose_xyz(pose: dict[str, Any]) -> tuple[float | None, float | None, float | None]:
@@ -140,9 +143,6 @@ def validate_primitive_request(
         return validate_pose_within_workspace(pose, workspace)
 
     if primitive_name == "move_relative_ee":
-        # Allow zero delta for in-place orientation-only changes (e.g. gripper_point_down)
-        if abs(relative_dx) < 1e-9 and abs(relative_dy) < 1e-9 and abs(relative_dz) < 1e-9:
-            return True, ""
         return validate_xyz_within_workspace(target_x, target_y, target_z, workspace)
 
     if gripper_position < 0.0 or gripper_position > 1.0:

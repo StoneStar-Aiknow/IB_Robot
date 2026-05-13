@@ -48,16 +48,20 @@ class SafetyGuardNode(Node):
         )
 
     def _handle_validate_skill(self, request, response):
-        allowed, reason = validate_skill_request(
-            request.skill_name,
-            request.target_name,
-            request.place_name,
-            request.motion_direction,
-            request.motion_distance,
-            self._named_poses,
-            self._named_targets,
-            self._skill_templates,
-        )
+        try:
+            allowed, reason = validate_skill_request(
+                request.skill_name,
+                request.target_name,
+                request.place_name,
+                request.motion_direction,
+                request.motion_distance,
+                self._named_poses,
+                self._named_targets,
+                self._skill_templates,
+            )
+        except Exception as exc:
+            self.get_logger().error(f"[safety_guard] uncaught exception in skill validation: {exc}")
+            allowed, reason = False, f"internal error: {exc}"
         response.allowed = allowed
         response.reason = reason
         if self._debug:
@@ -70,19 +74,23 @@ class SafetyGuardNode(Node):
         return response
 
     def _handle_validate_primitive(self, request, response):
-        allowed, reason = validate_primitive_request(
-            request.primitive_name,
-            request.pose_name,
-            request.relative_dx,
-            request.relative_dy,
-            request.relative_dz,
-            request.target_x,
-            request.target_y,
-            request.target_z,
-            request.gripper_position,
-            self._named_poses,
-            self._workspace,
-        )
+        try:
+            allowed, reason = validate_primitive_request(
+                request.primitive_name,
+                request.pose_name,
+                request.relative_dx,
+                request.relative_dy,
+                request.relative_dz,
+                request.target_x,
+                request.target_y,
+                request.target_z,
+                request.gripper_position,
+                self._named_poses,
+                self._workspace,
+            )
+        except Exception as exc:
+            self.get_logger().error(f"[safety_guard] uncaught exception in primitive validation: {exc}")
+            allowed, reason = False, f"internal error: {exc}"
         response.allowed = allowed
         response.reason = reason
         if self._debug:

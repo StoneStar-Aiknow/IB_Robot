@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 from typing import Any
 
@@ -70,11 +71,22 @@ class VLMAPIClient:
             configured_timeout_sec=self._timeout_sec,
             override_timeout_sec=timeout_sec,
         )
-        with urllib.request.urlopen(
-            request,
-            timeout=output_idle_timeout_sec,
-        ) as response:
-            body = response.read().decode("utf-8")
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=output_idle_timeout_sec,
+            ) as response:
+                body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            try:
+                error_body = exc.read().decode("utf-8", errors="replace")[:200]
+            except Exception:
+                error_body = ""
+            raise RuntimeError(f"VLM API HTTP {exc.code}: {error_body}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"VLM API network error: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError(f"VLM API timeout after {output_idle_timeout_sec}s") from exc
 
         response_json = json.loads(body)
         choices = response_json.get("choices", [])
