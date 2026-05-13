@@ -2,6 +2,7 @@
 
 import rclpy
 
+from embodied_agent.base_node import BaseTaskNode
 from embodied_agent.command_parser import parse_text_command
 from embodied_agent.task_context import dump_task_context, ensure_timeout_context
 from embodied_common.base_node import BaseTaskNode

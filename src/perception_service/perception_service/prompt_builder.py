@@ -29,6 +29,20 @@ def append_images(content: list[dict[str, Any]], scene_snapshot: dict[str, Any])
         if image_data_url:
             content.append({"type": "image_url", "image_url": {"url": image_data_url}})
 
+def append_images(content: list[dict[str, Any]], scene_snapshot: dict[str, Any]) -> None:
+    """Append image_url content blocks from a scene snapshot to a content list."""
+    images = scene_snapshot.get("images", [])
+    if isinstance(images, list) and images:
+        for item in images:
+            image_data_url = str(item.get("image_data_url", "")).strip()
+            if image_data_url:
+                content.append({"type": "image_url", "image_url": {"url": image_data_url}})
+    else:
+        image_data_url = scene_snapshot.get("image_data_url", "")
+        if image_data_url:
+            content.append({"type": "image_url", "image_url": {"url": image_data_url}})
+
+
 def _contains_any(text: str, keywords: Sequence[str]) -> bool:
     return any(keyword in text for keyword in keywords)
 
