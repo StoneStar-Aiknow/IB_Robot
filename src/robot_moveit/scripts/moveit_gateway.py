@@ -563,7 +563,7 @@ class MoveItGateway(Node):
                     time.sleep(0.1)
 
                 total_exec = time.time() - t_start
-                if total_exec >= exec_timeout + start_timeout:
+                if total_exec >= exec_timeout:
                     self.get_logger().warn(f"[Service] MoveToPose execution timed out after {total_exec:.1f}s")
                     response.success = False
                     response.message = f"Execution timed out after {total_exec:.1f}s"
