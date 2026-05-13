@@ -13,9 +13,10 @@ from robot_config.launch_builders.control import (
     generate_controller_spawners,
     generate_ros2_control_nodes,
 )
+from robot_config.launch_builders.execution import generate_inference_node
 from robot_config.launch_builders.navigation import generate_navigation_nodes
-from robot_config.launch_builders.teleop import generate_teleop_nodes
 from robot_config.launch_builders.sim_backend import get_sim_backend
+from robot_config.launch_builders.teleop import generate_teleop_nodes
 from robot_config.loader import load_robot_config_dict
 from robot_config.wait_for_controllers import missing_inactive_controllers
 
@@ -25,6 +26,22 @@ assert _LAUNCH_SPEC is not None
 assert _LAUNCH_SPEC.loader is not None
 robot_launch = importlib.util.module_from_spec(_LAUNCH_SPEC)
 _LAUNCH_SPEC.loader.exec_module(robot_launch)
+
+
+def _text(substitutions):
+    return "".join(item.text if hasattr(item, "text") else str(item) for item in substitutions)
+
+
+def _node_parameters(node):
+    raw = node._Node__parameters[0]
+    parsed = {}
+    for key, value in raw.items():
+        name = _text(key)
+        if isinstance(value, tuple):
+            parsed[name] = _text(value).strip()
+        else:
+            parsed[name] = value
+    return parsed
 
 
 def test_missing_inactive_controllers_returns_only_non_active():
@@ -137,9 +154,7 @@ def test_custom_trace_session_collision_fails(monkeypatch, tmp_path):
 
 
 def test_generate_navigation_nodes_for_lekiwi_mode():
-    ekf_config = str(
-        Path(__file__).resolve().parents[1] / "config" / "lekiwi" / "navigation" / "ekf.yaml"
-    )
+    ekf_config = str(Path(__file__).resolve().parents[1] / "config" / "lekiwi" / "navigation" / "ekf.yaml")
     nodes = generate_navigation_nodes(
         {
             "navigation": {
@@ -168,9 +183,7 @@ def test_lekiwi_sim_uses_sim_controller_override():
 
 
 def test_generate_navigation_nodes_honors_force_enable_override():
-    ekf_config = str(
-        Path(__file__).resolve().parents[1] / "config" / "lekiwi" / "navigation" / "ekf.yaml"
-    )
+    ekf_config = str(Path(__file__).resolve().parents[1] / "config" / "lekiwi" / "navigation" / "ekf.yaml")
     nodes = generate_navigation_nodes(
         {
             "navigation": {
@@ -197,8 +210,7 @@ def test_launch_setup_enables_navigation_when_requested():
 
     actions = robot_launch.launch_setup(context)
     nav_nodes = [
-        action for action in actions
-        if isinstance(action, Node) and action.node_package == "robot_localization"
+        action for action in actions if isinstance(action, Node) and action.node_package == "robot_localization"
     ]
 
     assert len(nav_nodes) == 1
@@ -209,6 +221,86 @@ def test_launch_loader_preserves_config_path_for_runtime_consumers():
 
     assert robot_config["name"] == "lekiwi"
     assert robot_config["_config_path"].endswith("config/robots/lekiwi.yaml")
+
+
+def test_generate_inference_node_binds_shared_rknn_resources(monkeypatch):
+    workspace = Path("/home/xqw/Research/IB_Robot")
+    model_dir = workspace / "models" / "502000" / "pretrained_model"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model_file = model_dir / "model.rknn"
+    created_model = False
+    if not model_file.exists():
+        model_file.write_bytes(b"rknn")
+        created_model = True
+
+    monkeypatch.setenv("WORKSPACE", str(workspace))
+
+    try:
+        node = generate_inference_node(
+            {
+                "_config_path": "/tmp/so101_single_arm.yaml",
+                "models": {
+                    "so101_act_rknn": {
+                        "path": "./models/502000/pretrained_model",
+                        "policy_type": "act",
+                        "device": "rknn",
+                    }
+                },
+                "control_modes": {
+                    "model_inference": {
+                        "inference": {
+                            "enabled": True,
+                            "model": "so101_act_rknn",
+                        }
+                    }
+                },
+            },
+            "model_inference",
+        )
+
+        params = _node_parameters(node)
+
+        assert "/home/xqw/Research/IB_Robot/models/502000/pretrained_model" in params["checkpoint"]
+        assert "rknn" in str(params["device"])
+    finally:
+        if created_model:
+            model_file.unlink(missing_ok=True)
+
+
+def test_generate_inference_node_uses_policy_path_only_for_rknn(monkeypatch, tmp_path):
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+
+    model_dir = tmp_path / "models" / "502000" / "pretrained_model"
+    model_dir.mkdir(parents=True)
+    (model_dir / "model.rknn").write_bytes(b"rknn")
+
+    node = generate_inference_node(
+        {
+            "_config_path": "/tmp/so101_single_arm.yaml",
+            "models": {
+                "so101_act_rknn": {
+                    "path": "./models/502000/pretrained_model",
+                    "policy_type": "act",
+                    "device": "rknn",
+                }
+            },
+            "control_modes": {
+                "model_inference": {
+                    "inference": {
+                        "enabled": True,
+                        "model": "so101_act_rknn",
+                    }
+                }
+            },
+        },
+        "model_inference",
+    )
+
+    params = _node_parameters(node)
+
+    assert str(model_dir) in params["checkpoint"]
+    assert node.env is not None
+    assert all(_text(key) != "RKNN_MODEL_PATH" for key, _value in node.env)
 
 
 def test_generate_joy_teleop_nodes_for_mobile_base():

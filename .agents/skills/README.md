@@ -10,7 +10,12 @@
 | [ibrobot-env](./ibrobot-env) | 环境 | 加载 `.shrc_local`、设置 `ROS_DOMAIN_ID`、解决 `ModuleNotFoundError` 等。 |
 | [ibrobot-build](./ibrobot-build) | 操作 | 执行项目编译 (`colcon build`)、构建特定 package 或修复编译错误。 |
 | [ibrobot-launch](./ibrobot-launch) | 操作 | 启动机器人系统、运行仿真、测试 ACT 推理或进行遥操作调试。 |
+| [ibrobot-hdc](./ibrobot-hdc) | 板端 | 连接 BQ3588HM 开发板，执行 HDC shell / file send / file recv。 |
+| [ibrobot-bq3588hm-oh](./ibrobot-bq3588hm-oh) | 板端 | 记录 BQ3588HM 板上的 OpenHarmony ROS / Python / RKNN 运行时事实。 |
+| [bq3588-oh-rknn](./bq3588-oh-rknn) | 板端 | 在 BQ3588HM 上拉起 `cloud_inference.launch.py` 的 RKNN 推理路径。 |
+| [rknn-convert](./rknn-convert) | 模型 | 将 ONNX 转成 RKNN，并维护主 `venv` 导出 ONNX、`.venv-rknn` 转 RKNN 的流程边界。 |
 | [ibrobot-architecture](./ibrobot-architecture) | 知识 | 理解 SSOT 模式、修改 `robot_config`、解释数据流或契约设计。 |
+| [ibrobot-lerobot-patch](./ibrobot-lerobot-patch) | 工作流 | 将 `libs/lerobot` 的本地改动导出为 `third_party/patches/lerobot/<tag>/*.patch`，并通过辅助脚本同步 `series/manifest/test`。 |
 | [ibrobot-git-flow](./ibrobot-git-flow) | 工作流 | 提交代码、推送至个人仓库、确保符合 openEuler DCO/Commit 规范。 |
 | [ibrobot-docker-verify](./ibrobot-docker-verify) | 验证 | 在干净 Ubuntu 22.04 Docker 容器中端到端验证 setup.sh + build.sh。 |
 | [ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee) | 验证 | 在 openEuler Embedded (aarch64) Docker 容器中端到端验证 setup.sh + build.sh。 |
@@ -35,7 +40,12 @@
 - **环境管理 ([ibrobot-env](./ibrobot-env))**: 确保 shell 上下文正确继承了项目特有的环境变量。
 - **编译构建 ([ibrobot-build](./ibrobot-build))**: 封装了 ROS 2 复杂的编译参数，确保构建的一致性。
 - **系统启动 ([ibrobot-launch](./ibrobot-launch))**: 机器人系统的总入口，支持一键拉起复杂的节点拓扑。
+- **板端连接 ([ibrobot-hdc](./ibrobot-hdc))**: 统一封装 BQ3588HM 的 HDC over TCP 访问与文件传输。
+- **板端事实 ([ibrobot-bq3588hm-oh](./ibrobot-bq3588hm-oh))**: 汇总 BQ3588HM 板上的 OpenHarmony、ROS、Python、RKNN 运行时事实。
+- **板端 RKNN 运行 ([bq3588-oh-rknn](./bq3588-oh-rknn))**: 专门处理 `cloud_inference.launch.py device:=rknn` 的板端环境叠加与启动。
+- **RKNN 转换 ([rknn-convert](./rknn-convert))**: 明确 ONNX 导出与 RKNN 转换的边界，避免主 `venv` 与 `.venv-rknn` 污染。
 - **架构顾问 ([ibrobot-architecture](./ibrobot-architecture))**: 充当项目的架构师，解答一切关于设计模式和配置规范的问题。
+- **LeRobot 补丁纳管 ([ibrobot-lerobot-patch](./ibrobot-lerobot-patch))**: 把 `libs/lerobot` 的本地改动回收为受管 patch 栈，而不是直接提交子模块 gitlink。
 - **工程规范 ([ibrobot-git-flow](./ibrobot-git-flow))**: 自动化执行开源社区繁琐的提交规范校验。
 - **容器验证 ([ibrobot-docker-verify](./ibrobot-docker-verify))**: 在全新 Ubuntu 22.04 Docker 容器中运行 setup.sh 和 build.sh 的完整端到端验证，确保修改不会破坏首次安装体验。
 - **openEuler 容器验证 ([ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee))**: 在 openEuler Embedded aarch64 Docker 容器（qemu-user 模拟 chroot）中端到端验证 setup.sh + build.sh，以 root 用户模拟真实开发板操作环境。

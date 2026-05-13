@@ -276,13 +276,13 @@ prepare_openharmony_lerobot_runtime_src() {
     rm -rf "${stage_root}"
     ensure_dir "${stage_root}"
 
-    log_info "Preparing OpenHarmony-patched LeRobot runtime staging tree..."
+    log_info "Preparing OpenHarmony-patched LeRobot runtime staging tree..." >&2
     git clone --local --no-checkout "${lerobot_dir}" "${repo_dir}" >/dev/null
     git -C "${repo_dir}" checkout --detach "${LEROBOT_OH_BASE_COMMIT}" >/dev/null
 
     while IFS= read -r patch_file; do
         [[ -z "${patch_file}" || "${patch_file}" == \#* ]] && continue
-        log_info "Applying OpenHarmony lerobot runtime patch ${patch_file}..."
+        log_info "Applying OpenHarmony lerobot runtime patch ${patch_file}..." >&2
         git -C "${repo_dir}" \
             -c "user.name=${git_user_name}" \
             -c "user.email=${git_user_email}" \
@@ -308,6 +308,7 @@ stage_lerobot_runtime() {
 rewrite_runtime_prefix_chain() {
     local install_root="$1"
     local file
+    local package_setup
 
     for file in \
         "${install_root}/setup.sh" \
@@ -317,6 +318,10 @@ rewrite_runtime_prefix_chain() {
         [[ -f "${file}" ]] || continue
         sed -i "s|/mnt/ohos/tmp/install|${OH_BOARD_ROS_PREFIX}|g" "${file}"
     done
+
+    while IFS= read -r -d '' package_setup; do
+        sed -i "s|/mnt/ohos/tmp/install|${OH_BOARD_ROS_PREFIX}|g" "${package_setup}"
+    done < <(find "${install_root}" \( -path '*/local_setup.sh' -o -path '*/local_setup.bash' -o -path '*/local_setup.zsh' -o -path '*/package.sh' \) -type f -print0)
 
     while IFS= read -r -d '' file; do
         sed -i "s|/mnt/ohos/tmp/install|${OH_BOARD_ROS_PREFIX}|g" "${file}"
@@ -349,6 +354,25 @@ fi
 unset _ibrobot_lerobot_src
 EOF
     done
+
+    while IFS= read -r -d '' file; do
+        [[ -f "${file}" ]] || continue
+        if grep -qF "${marker}" "${file}"; then
+            continue
+        fi
+        cat <<EOF >> "${file}"
+
+${marker}
+_ibrobot_lerobot_src="${OH_CUSTOM_PREFIX}/lerobot/src"
+if [ -d "\$_ibrobot_lerobot_src" ]; then
+  case ":\${PYTHONPATH:-}:" in
+    *":\$_ibrobot_lerobot_src:"*) ;;
+    *) export PYTHONPATH="\$_ibrobot_lerobot_src\${PYTHONPATH:+:\$PYTHONPATH}" ;;
+  esac
+fi
+unset _ibrobot_lerobot_src
+EOF
+    done < <(find "${install_root}" -path '*/local_setup.sh' -type f -print0)
 }
 
 rewrite_inference_entrypoints_for_board_runtime() {
@@ -358,12 +382,14 @@ rewrite_inference_entrypoints_for_board_runtime() {
     local script_path=""
 
     while IFS='|' read -r rel_path module_name; do
-        script_path="${install_root}/${rel_path}"
-        [[ -f "${script_path}" ]] || continue
+        for script_path in "${install_root}/${rel_path}" "${install_root}"/*/${rel_path}; do
+            [[ -f "${script_path}" ]] || continue
 
-        cat <<EOF > "${script_path}"
+            cat <<EOF > "${script_path}"
 #!/system/bin/sh
 SKH_ROOT="${OH_BOARD_TORCH_RUNTIME_ROOT}"
+ROS_HOME_ROOT="/data/local/tmp/ros_home"
+ROS_LOG_ROOT="/data/local/tmp/ros_logs"
 
 if [ ! -x "\${SKH_ROOT}/bin/python3" ]; then
   echo "[IB_Robot] Missing OpenHarmony PyTorch runtime at \${SKH_ROOT}" >&2
@@ -371,15 +397,20 @@ if [ ! -x "\${SKH_ROOT}/bin/python3" ]; then
   exit 1
 fi
 
+mkdir -p "\${ROS_HOME_ROOT}" "\${ROS_LOG_ROOT}" >/dev/null 2>&1 || true
+
 export PYTHONHOME="\${SKH_ROOT}"
 export PATH="\${SKH_ROOT}/bin:\$PATH"
-export PYTHONPATH="\${SKH_ROOT}/lib/python3.12/site-packages:\${SKH_ROOT}/usr/lib/python3.12/site-packages:/data/out/lib/python3.12/site-packages\${PYTHONPATH:+:\$PYTHONPATH}"
-export LD_LIBRARY_PATH="\${SKH_ROOT}/lib:\${SKH_ROOT}/lib/python3.12/site-packages/torchaudio/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+export HOME="\${ROS_HOME_ROOT}"
+export ROS_LOG_DIR="\${ROS_LOG_ROOT}"
+export PYTHONPATH="\${SKH_ROOT}/lib/python3.12/site-packages:\${SKH_ROOT}/usr/lib/python3.12/site-packages:/sys_prod/robot/out/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/lerobot/src:${OH_CUSTOM_PREFIX}/inference_service/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/robot_config/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/tensormsg/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib/python3.12/site-packages:${OH_BOARD_ROS_PREFIX}/lib/python3.12/site-packages:/data/out/lib/python3.12/site-packages:/data/out/lib\${PYTHONPATH:+:\$PYTHONPATH}"
+export LD_LIBRARY_PATH="\${SKH_ROOT}/lib:\${SKH_ROOT}/lib/python3.12/site-packages/torchaudio/lib:${OH_CUSTOM_PREFIX}/inference_service/lib:${OH_CUSTOM_PREFIX}/robot_config/lib:${OH_CUSTOM_PREFIX}/tensormsg/lib:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib:${OH_BOARD_ROS_PREFIX}/lib:/data/out/lib:/usr/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 export LD_PRELOAD="\${SKH_ROOT}/lib/libpython3.12.so.1.0:\${SKH_ROOT}/lib/libomp.so\${LD_PRELOAD:+:\$LD_PRELOAD}"
 
 exec "\${SKH_ROOT}/bin/python3" -m ${module_name} "\$@"
 EOF
-        chmod +x "${script_path}"
+            chmod +x "${script_path}"
+        done
     done <<'EOF'
 lib/inference_service/lerobot_policy_node|inference_service.lerobot_policy_node
 lib/inference_service/pure_inference_node|inference_service.pure_inference_node
@@ -399,6 +430,19 @@ postprocess_runtime_bundle() {
     rewrite_runtime_prefix_chain "${install_root}"
     append_lerobot_runtime_hook "${install_root}"
     rewrite_inference_entrypoints_for_board_runtime "${install_root}"
+}
+
+normalize_runtime_bundle_ownership() {
+    local host_uid
+    local host_gid
+
+    host_uid="$(id -u)"
+    host_gid="$(id -g)"
+
+    docker_cmd run --rm \
+        -v "${OH_CUSTOM_ROOT}:/mnt/ohos" \
+        "${OH_CUSTOM_IMAGE}" \
+        sh -c "chown -R ${host_uid}:${host_gid} /mnt/ohos/ibrobot_oh_ws/install /mnt/ohos/ibrobot_oh_ws/build /mnt/ohos/ibrobot_oh_ws/log || true"
 }
 
 ensure_toolchain_root() {
@@ -640,4 +684,5 @@ normalize_paths
 prepare_root_layout
 ensure_builder_image
 run_builder
+normalize_runtime_bundle_ownership
 postprocess_runtime_bundle
