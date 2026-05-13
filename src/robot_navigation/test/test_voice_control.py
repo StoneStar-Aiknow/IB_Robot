@@ -8,9 +8,12 @@ and end-to-end topic bridging.
 import json
 import os
 import tempfile
+import threading
+import time
 
 import pytest
 import rclpy
+from rclpy.executors import SingleThreadedExecutor
 from std_msgs.msg import String
 
 # ── test data ───────────────────────────────────────────────────────────────
@@ -63,18 +66,20 @@ DESTINATIONS_JSON = json.dumps(
 
 
 @pytest.fixture(scope="module")
-def rclpy_init():
+def voice_env():
+    """Set up VoiceControl node with executor spinning in background thread.
+
+    Uses SingleThreadedExecutor + background spin instead of spin_once
+    to avoid rclpy Humble segfault when spin_once is called after
+    rclpy context changes from other test modules.
+    """
     rclpy.init()
-    yield
-    rclpy.shutdown()
+    executor = SingleThreadedExecutor()
 
-
-@pytest.fixture(scope="module")
-def bridge(rclpy_init):
-    """Module-scoped VoiceControl wired to /test/* topics."""
     from robot_navigation.voice_control import VoiceControl
 
     node = VoiceControl()
+    executor.add_node(node)
 
     # Load test keywords & destinations
     node.keywords_json = KEYWORDS_JSON
@@ -91,24 +96,62 @@ def bridge(rclpy_init):
         node.destroy_timer(node._hotword_timer)
         node._hotword_timer = None
 
-    yield node
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+    time.sleep(0.3)
+
+    yield {"node": node, "executor": executor}
+
+    executor.shutdown()
+    spin_thread.join(timeout=5.0)
     node.destroy_node()
+    rclpy.shutdown()
+
+
+@pytest.fixture
+def bridge(voice_env):
+    """Provide the VoiceControl node (alias for backwards compat)."""
+    return voice_env["node"]
 
 
 # ── helper ──────────────────────────────────────────────────────────────────
 
 
 def _collect_msg(node, topic, msg_type, trigger_fn, timeout_sec=1.0):
-    """Subscribe first, spin to connect, then trigger publish and collect."""
+    """Subscribe, trigger publish, wait for message via threading.Event."""
     received = []
-    sub = node.create_subscription(msg_type, topic, lambda m: received.append(m), 10)
-    for _ in range(10):
-        rclpy.spin_once(node, timeout_sec=0.02)
+    event = threading.Event()
+
+    def _cb(msg):
+        received.append(msg)
+        event.set()
+
+    sub = node.create_subscription(msg_type, topic, _cb, 10)
+    time.sleep(0.1)  # let subscription connect
+
     trigger_fn()
-    deadline = node.get_clock().now() + rclpy.duration.Duration(seconds=timeout_sec)
-    while not received and node.get_clock().now() < deadline:
-        rclpy.spin_once(node, timeout_sec=0.05)
+
+    event.wait(timeout=timeout_sec)
     node.destroy_subscription(sub)
+    return received[-1] if received else None
+
+
+def _publish_and_collect(node, text, topic, timeout=1.0):
+    """Publish *text* on /test/voice_command, return first msg on *topic*."""
+    received = []
+    event = threading.Event()
+
+    sub = node.create_subscription(String, topic, lambda m: (received.append(m), event.set()), 10)
+    pub = node.create_publisher(String, "/test/voice_command", 10)
+    time.sleep(0.2)  # let pub/sub connect
+
+    msg = String()
+    msg.data = text
+    pub.publish(msg)
+
+    event.wait(timeout=timeout)
+    node.destroy_subscription(sub)
+    node.destroy_publisher(pub)
     return received[-1] if received else None
 
 
@@ -437,31 +480,8 @@ class TestDynamicKeywordUpdate:
 
 
 class TestEndToEnd:
-    def _publish_and_collect(self, bridge, text, topic, timeout=1.0):
-        """Publish *text* on /test/voice_command, return first msg on *topic*."""
-        received = []
-        sub = bridge.create_subscription(String, topic, lambda m: received.append(m), 10)
-        pub = bridge.create_publisher(String, "/test/voice_command", 10)
-
-        # Let subscriptions connect
-        deadline = bridge.get_clock().now() + rclpy.duration.Duration(seconds=0.3)
-        while bridge.get_clock().now() < deadline:
-            rclpy.spin_once(bridge, timeout_sec=0.05)
-
-        msg = String()
-        msg.data = text
-        pub.publish(msg)
-
-        deadline = bridge.get_clock().now() + rclpy.duration.Duration(seconds=timeout)
-        while not received and bridge.get_clock().now() < deadline:
-            rclpy.spin_once(bridge, timeout_sec=0.05)
-
-        bridge.destroy_subscription(sub)
-        bridge.destroy_publisher(pub)
-        return received[-1] if received else None
-
     def test_e2e_destination(self, bridge):
-        msg = self._publish_and_collect(bridge, "去a点", "/test/keyword_matched")
+        msg = _publish_and_collect(bridge, "去a点", "/test/keyword_matched")
         assert msg is not None
         data = json.loads(msg.data)
         assert data["type"] == "destination"
@@ -469,21 +489,21 @@ class TestEndToEnd:
         assert data["info"]["y"] == pytest.approx(0.2)
 
     def test_e2e_action(self, bridge):
-        msg = self._publish_and_collect(bridge, "捡香蕉", "/test/keyword_matched")
+        msg = _publish_and_collect(bridge, "捡香蕉", "/test/keyword_matched")
         assert msg is not None
         data = json.loads(msg.data)
         assert data["type"] == "action"
         assert data["info"]["task_description"] == "Pick up the banana"
 
     def test_e2e_stop(self, bridge):
-        msg = self._publish_and_collect(bridge, "停止", "/test/nav_stop", timeout=2.0)
+        msg = _publish_and_collect(bridge, "停止", "/test/nav_stop", timeout=2.0)
         assert msg is not None
         assert msg.data == "stop"
 
     def test_e2e_no_match_no_output(self, bridge):
-        msg = self._publish_and_collect(bridge, "今天天气不错", "/test/keyword_matched")
+        msg = _publish_and_collect(bridge, "今天天气不错", "/test/keyword_matched")
         assert msg is None
 
     def test_e2e_empty_text_no_output(self, bridge):
-        msg = self._publish_and_collect(bridge, "", "/test/keyword_matched")
+        msg = _publish_and_collect(bridge, "", "/test/keyword_matched")
         assert msg is None
