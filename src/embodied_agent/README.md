@@ -34,26 +34,31 @@
 - 安全校验由 `safety_guard` 负责。
 - 技能和原子动作执行由 `skill_library` 负责。
 
-## 2. 推荐启动方式
+## 2. 当前启动方式
 
-建议通过统一 launch 启动，而不是手工分别起节点：
+当前 PR 只提供具身管线节点和 ROS 接口，不新增 `robot_config` 的统一 launch 参数。
+因此不要使用尚未实现的 `with_embodied` launch 参数；如需联调，应在完成构建后按节点分别启动。
+
+示例：
 
 ```bash
 cd /home/lwh/code/IB_Robot
-source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.sh && \
-ros2 launch robot_config robot.launch.py \
-  robot_config:=so101_single_arm \
-  control_mode:=moveit_planning \
-  use_sim:=true \
-  with_embodied:=true \
-  moveit_display:=false
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.sh
+
+ros2 run safety_guard safety_guard_node
+ros2 run skill_library skill_executor_node
+ros2 run embodied_agent task_planner_node
+ros2 run embodied_agent task_executor_node
+ros2 run embodied_agent task_entry_node
 ```
 
-其中 `with_embodied:=true` 会临时覆盖：
+如果需要 VLM 规划，可另外启动：
 
-- `robot.embodied.enabled=true`
+```bash
+ros2 run vlm_task_planner vlm_task_planner_node
+```
 
-默认 YAML 中该能力仍是关闭的。
+后续若要接入 `robot_config` SSOT，应在单独 PR 中新增 embodied launch builder，并从机器人配置注入相机、技能模板、命名位姿和工作空间等参数。
 
 ## 3. task_entry_node
 
@@ -94,7 +99,7 @@ ros2 launch robot_config robot.launch.py \
 | `default_place_name` | `tray_right` | 规则直达时使用的默认放置位姿 |
 | `default_relative_motion_step_m` | `0.03` | “一点”默认映射步长（米） |
 | `default_task_timeout_sec` | `180.0` | 单个任务的端到端总超时预算 |
-| `debug_tracing` | `true` | 是否打印调试日志 |
+| `debug_tracing` | `false` | 是否打印调试日志 |
 
 ## 4. task_planner_node
 
@@ -135,7 +140,7 @@ ros2 launch robot_config robot.launch.py \
 | `default_target_name` | `demo_object` | 默认命名目标 |
 | `default_place_name` | `tray_right` | 默认放置位姿 |
 | `default_relative_motion_step_m` | `0.03` | “一点”默认映射步长（米） |
-| `debug_tracing` | `true` | 是否打印规划调试日志 |
+| `debug_tracing` | `false` | 是否打印规划调试日志 |
 
 ## 5. task_executor_node
 
@@ -176,7 +181,7 @@ ros2 launch robot_config robot.launch.py \
 | `skill_action_name` | `/embodied/execute_skill` | 技能 action 名 |
 | `default_task_timeout_sec` | `180.0` | 单个任务的端到端总超时预算 |
 | `rpc_timeout_sec` | `5.0` | 等待 action/server/service 响应的统一 RPC 超时 |
-| `debug_tracing` | `true` | 是否打印执行调试日志 |
+| `debug_tracing` | `false` | 是否打印执行调试日志 |
 
 ## 6. 任务与状态接口
 

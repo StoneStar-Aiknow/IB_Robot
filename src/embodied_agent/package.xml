@@ -4,12 +4,13 @@
   <name>embodied_agent</name>
   <version>0.1.0</version>
   <description>Embodied minimum-closure task entry, planning, and execution nodes</description>
-  <maintainer email="dev@example.com">IB-Robot Team</maintainer>
+  <maintainer email="liuweihong8@huawei.com">liuweihong</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
   <depend>ibrobot_msgs</depend>
+  <depend>embodied_common</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

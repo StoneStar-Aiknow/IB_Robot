@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = "safety_guard"
+package_name = "embodied_common"
 
 setup(
     name=package_name,
@@ -14,11 +14,6 @@ setup(
     zip_safe=True,
     maintainer="liuweihong",
     maintainer_email="liuweihong8@huawei.com",
-    description="Embodied minimum-closure safety validation services",
+    description="Shared neutral helpers for embodied pipeline packages",
     license="Apache-2.0",
-    entry_points={
-        "console_scripts": [
-            "safety_guard_node = safety_guard.safety_guard_node:main",
-        ],
-    },
 )

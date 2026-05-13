@@ -151,3 +151,21 @@ def test_resolve_release_sequence():
         "open_gripper",
     ]
     assert primitives[0].pose_name == "tray_right"
+
+
+def test_default_templates_resolve_gripper_rotation_skill():
+    primitives = resolve_skill_primitives(
+        "rotate_gripper_cw",
+        "",
+        "",
+        "",
+        30.0,
+        {},
+        1.0,
+        0.15,
+        None,
+        None,
+    )
+    assert len(primitives) == 1
+    assert primitives[0].primitive_name == "rotate_gripper_cw"
+    assert primitives[0].relative_dz == 30.0

@@ -4,7 +4,7 @@
   <name>perception_service</name>
   <version>0.1.0</version>
   <description>Continuous multimodal scene understanding service for embodied interaction</description>
-  <maintainer email="dev@example.com">IB-Robot Team</maintainer>
+  <maintainer email="liuweihong8@huawei.com">liuweihong</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
@@ -13,6 +13,9 @@
   <depend>geometry_msgs</depend>
   <depend>cv_bridge</depend>
   <depend>ibrobot_msgs</depend>
+  <depend>embodied_common</depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-opencv</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

@@ -58,7 +58,7 @@ class TaskEntryNode(Node):
         self.declare_parameter("default_place_name", "tray_right")
         self.declare_parameter("default_relative_motion_step_m", 0.03)
         self.declare_parameter("default_task_timeout_sec", 180.0)
-        self.declare_parameter("debug_tracing", True)
+        self.declare_parameter("debug_tracing", False)
 
         self._input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
         self._output_topic = self.get_parameter("output_topic").get_parameter_value().string_value

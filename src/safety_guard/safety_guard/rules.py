@@ -1,18 +1,19 @@
 """Pure safety rules for the embodied minimal closure."""
 
-import json
 from typing import Any
 
-from skill_library.skill_templates import SUPPORTED_PRIMITIVES, get_skill_templates
+from embodied_common.json_utils import load_json_mapping
+from embodied_common.skill_templates import SUPPORTED_PRIMITIVES, get_skill_templates
 
-
-def load_json_mapping(raw_value: str) -> dict[str, Any]:
-    if not raw_value:
-        return {}
-    try:
-        return json.loads(raw_value)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid JSON mapping: {exc}") from exc
+__all__ = [
+    "SUPPORTED_PRIMITIVES",
+    "get_skill_templates",
+    "load_json_mapping",
+    "validate_xyz_within_workspace",
+    "validate_pose_within_workspace",
+    "validate_skill_request",
+    "validate_primitive_request",
+]
 
 
 def _extract_pose_xyz(pose: dict[str, Any]) -> tuple[float | None, float | None, float | None]:

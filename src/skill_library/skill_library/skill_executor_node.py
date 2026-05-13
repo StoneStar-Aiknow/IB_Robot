@@ -39,7 +39,9 @@ class SkillExecutorNode(Node):
         self.declare_parameter("gripper_open_position", 1.0)
         self.declare_parameter("gripper_closed_position", 0.0)
         self.declare_parameter("task_executor_action_name", "/task_executor/execute_task_plan")
-        self.declare_parameter("debug_tracing", True)
+        self.declare_parameter("ee_pose_topic", "/robot_status/ee_pose")
+        self.declare_parameter("joint_state_topic", "/joint_states")
+        self.declare_parameter("debug_tracing", False)
 
         self._skill_action_name = self.get_parameter("skill_action_name").get_parameter_value().string_value
         self._primitive_action_name = self.get_parameter("primitive_action_name").get_parameter_value().string_value
@@ -67,6 +69,8 @@ class SkillExecutorNode(Node):
         self._task_executor_action_name = (
             self.get_parameter("task_executor_action_name").get_parameter_value().string_value
         )
+        self._ee_pose_topic = self.get_parameter("ee_pose_topic").get_parameter_value().string_value
+        self._joint_state_topic = self.get_parameter("joint_state_topic").get_parameter_value().string_value
         self._debug = self.get_parameter("debug_tracing").get_parameter_value().bool_value
         self._latest_ee_pose = None
         self._latest_joint_state = None
@@ -78,14 +82,14 @@ class SkillExecutorNode(Node):
         )
         self.create_subscription(
             PoseStamped,
-            "/robot_status/ee_pose",
+            self._ee_pose_topic,
             self._handle_ee_pose,
             10,
             callback_group=callback_group,
         )
         self.create_subscription(
             JointState,
-            "/joint_states",
+            self._joint_state_topic,
             self._handle_joint_state,
             10,
             callback_group=callback_group,
@@ -120,7 +124,8 @@ class SkillExecutorNode(Node):
             "[embodied-debug] skill_executor ready: "
             f"skill_action={self._skill_action_name}, primitive_action={self._primitive_action_name}, "
             f"relative_frame={self._relative_motion_reference_frame}, "
-            f"direction_mapping={self._relative_motion_direction_mapping or 'default'}"
+            f"direction_mapping={self._relative_motion_direction_mapping or 'default'}, "
+            f"ee_pose_topic={self._ee_pose_topic}, joint_state_topic={self._joint_state_topic}"
         )
 
     def _handle_ee_pose(self, msg: PoseStamped) -> None:
@@ -133,11 +138,22 @@ class SkillExecutorNode(Node):
     def _handle_cancel(_cancel_request):
         return CancelResponse.ACCEPT
 
-    def _wait_for_future(self, future, timeout_sec: float) -> bool:
+    @staticmethod
+    def _wait_for_future(future, timeout_sec: float) -> bool:
         deadline = time.monotonic() + timeout_sec
         while rclpy.ok() and not future.done() and time.monotonic() < deadline:
             time.sleep(0.05)
         return future.done()
+
+    @staticmethod
+    def _abort_skill(result, goal_handle, executed_primitives, error_code: str, message: str):
+        """Set failure fields on *result*, abort the goal, and return result."""
+        result.success = False
+        result.error_code = error_code
+        result.message = message
+        result.executed_primitives = executed_primitives
+        goal_handle.abort()
+        return result
 
     def _cancel_goal(self, goal_handle) -> None:
         if goal_handle is None:
@@ -274,7 +290,7 @@ class SkillExecutorNode(Node):
                 result.success = False
                 result.error_code = "CURRENT_EE_POSE_UNAVAILABLE"
                 result.message = "current ee pose is unavailable for relative motion"
-                result.pose_name = ""
+                result.executed_pose_name = ""
                 goal_handle.abort()
                 return result
 
@@ -291,7 +307,7 @@ class SkillExecutorNode(Node):
             result.success = False
             result.error_code = "SAFETY_REJECTED"
             result.message = reason
-            result.pose_name = goal.pose_name
+            result.executed_pose_name = goal.pose_name
             goal_handle.abort()
             return result
 
@@ -308,7 +324,7 @@ class SkillExecutorNode(Node):
                     result.success = False
                     result.error_code = "UNKNOWN_POSE"
                     result.message = f"unknown named pose: {goal.pose_name!r}"
-                    result.pose_name = goal.pose_name
+                    result.executed_pose_name = goal.pose_name
                     goal_handle.abort()
                     return result
             else:
@@ -328,7 +344,7 @@ class SkillExecutorNode(Node):
                 result.success = False
                 result.error_code = "PRIMITIVE_ARM_FAILED"
                 result.message = err_msg
-                result.pose_name = goal.pose_name
+                result.executed_pose_name = goal.pose_name
                 if goal_handle.is_cancel_requested:
                     goal_handle.canceled()
                 else:
@@ -339,7 +355,7 @@ class SkillExecutorNode(Node):
                 result.success = False
                 result.error_code = "CURRENT_EE_POSE_UNAVAILABLE"
                 result.message = "current ee pose is unavailable for gripper rotation"
-                result.pose_name = ""
+                result.executed_pose_name = ""
                 goal_handle.abort()
                 return result
             move_timeout = float(goal.timeout_sec if goal.timeout_sec > 0.0 else 30.0)
@@ -350,7 +366,7 @@ class SkillExecutorNode(Node):
                 result.success = False
                 result.error_code = "PRIMITIVE_ARM_FAILED"
                 result.message = err_msg
-                result.pose_name = ""
+                result.executed_pose_name = ""
                 if goal_handle.is_cancel_requested:
                     goal_handle.canceled()
                 else:
@@ -365,13 +381,13 @@ class SkillExecutorNode(Node):
                 result.success = False
                 result.error_code = "PRIMITIVE_GRIPPER_FAILED"
                 result.message = err_msg
-                result.pose_name = goal.pose_name
+                result.executed_pose_name = goal.pose_name
                 goal_handle.abort()
                 return result
         result.success = True
         result.error_code = ""
         result.message = f"primitive completed: {goal.primitive_name}"
-        result.pose_name = goal.pose_name
+        result.executed_pose_name = goal.pose_name
         goal_handle.succeed()
         return result
 
@@ -555,12 +571,7 @@ class SkillExecutorNode(Node):
             motion_distance=goal.motion_distance,
         )
         if not allowed:
-            result.success = False
-            result.error_code = "SKILL_REJECTED"
-            result.message = reason
-            result.executed_primitives = []
-            goal_handle.abort()
-            return result
+            return self._abort_skill(result, goal_handle, [], "SKILL_REJECTED", reason)
 
         try:
             primitives: list[PrimitiveSpec] = resolve_skill_primitives(
@@ -576,12 +587,7 @@ class SkillExecutorNode(Node):
                 self._relative_motion_direction_mapping,
             )
         except Exception as exc:
-            result.success = False
-            result.error_code = "SKILL_RESOLUTION_FAILED"
-            result.message = str(exc)
-            result.executed_primitives = []
-            goal_handle.abort()
-            return result
+            return self._abort_skill(result, goal_handle, [], "SKILL_RESOLUTION_FAILED", str(exc))
 
         skill_deadline = None
         if goal.timeout_sec > 0.0:
@@ -611,16 +617,17 @@ class SkillExecutorNode(Node):
                 goal_handle.canceled()
                 return result
 
-            remaining_timeout = float(goal.timeout_sec)
+            remaining_timeout = None
             if skill_deadline is not None:
                 remaining_timeout = skill_deadline - time.monotonic()
-            if remaining_timeout <= 0.0:
-                result.success = False
-                result.error_code = "SKILL_TIMEOUT"
-                result.message = f"skill deadline exceeded before primitive {primitive.primitive_name}"
-                result.executed_primitives = executed_primitives
-                goal_handle.abort()
-                return result
+                if remaining_timeout <= 0.0:
+                    return self._abort_skill(
+                        result,
+                        goal_handle,
+                        executed_primitives,
+                        "SKILL_TIMEOUT",
+                        f"skill deadline exceeded before primitive {primitive.primitive_name}",
+                    )
 
             primitive_name = primitive.primitive_name
             pose_name = primitive.pose_name
@@ -638,58 +645,60 @@ class SkillExecutorNode(Node):
             primitive_goal.relative_dy = float(primitive.relative_dy)
             primitive_goal.relative_dz = float(primitive.relative_dz)
             primitive_goal.gripper_position = float(gripper_position)
-            primitive_goal.timeout_sec = remaining_timeout
+            primitive_goal.timeout_sec = remaining_timeout if remaining_timeout is not None else 0.0
 
             send_goal_future = self._primitive_client.send_goal_async(primitive_goal)
+            send_goal_timeout = (
+                self._rpc_timeout if remaining_timeout is None else min(self._rpc_timeout, remaining_timeout)
+            )
             if not self._wait_for_future(
                 send_goal_future,
-                timeout_sec=max(0.1, min(self._rpc_timeout, remaining_timeout)),
+                timeout_sec=max(0.1, send_goal_timeout),
             ):
-                result.success = False
-                result.error_code = "PRIMITIVE_GOAL_TIMEOUT"
-                result.message = f"timed out sending primitive {primitive_name}"
-                result.executed_primitives = executed_primitives
-                goal_handle.abort()
-                return result
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    executed_primitives,
+                    "PRIMITIVE_GOAL_TIMEOUT",
+                    f"timed out sending primitive {primitive_name}",
+                )
 
             primitive_handle = send_goal_future.result()
             if primitive_handle is None or not primitive_handle.accepted:
-                result.success = False
-                result.error_code = "PRIMITIVE_GOAL_REJECTED"
-                result.message = f"primitive goal rejected: {primitive_name}"
-                result.executed_primitives = executed_primitives
-                goal_handle.abort()
-                return result
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    executed_primitives,
+                    "PRIMITIVE_GOAL_REJECTED",
+                    f"primitive goal rejected: {primitive_name}",
+                )
 
             result_future = primitive_handle.get_result_async()
-            remaining_timeout = float(goal.timeout_sec)
+            remaining_timeout = None
             if skill_deadline is not None:
                 remaining_timeout = skill_deadline - time.monotonic()
-            if remaining_timeout <= 0.0 or not self._wait_for_future(
-                result_future,
-                timeout_sec=max(0.1, remaining_timeout),
-            ):
+                if remaining_timeout <= 0.0:
+                    self._cancel_goal(primitive_handle)
+                    return self._abort_skill(
+                        result,
+                        goal_handle,
+                        executed_primitives,
+                        "SKILL_TIMEOUT",
+                        f"primitive timed out: {primitive_name}",
+                    )
+            wait_timeout = remaining_timeout if remaining_timeout is not None else 30.0
+            if not self._wait_for_future(result_future, timeout_sec=max(0.1, wait_timeout)):
                 self._cancel_goal(primitive_handle)
-                result.success = False
-                result.error_code = "SKILL_TIMEOUT"
-                result.message = f"primitive timed out: {primitive_name}"
-                result.executed_primitives = executed_primitives
-                goal_handle.abort()
-                return result
+                return self._abort_skill(
+                    result, goal_handle, executed_primitives, "SKILL_TIMEOUT", f"primitive timed out: {primitive_name}"
+                )
 
             action_result = result_future.result()
             primitive_result = action_result.result if action_result is not None else None
             if primitive_result is None or not primitive_result.success:
-                result.success = False
-                result.error_code = (
-                    primitive_result.error_code if primitive_result is not None else "MISSING_PRIMITIVE_RESULT"
-                )
-                result.message = (
-                    primitive_result.message if primitive_result is not None else "missing primitive result"
-                )
-                result.executed_primitives = executed_primitives
-                goal_handle.abort()
-                return result
+                error_code = primitive_result.error_code if primitive_result is not None else "MISSING_PRIMITIVE_RESULT"
+                message = primitive_result.message if primitive_result is not None else "missing primitive result"
+                return self._abort_skill(result, goal_handle, executed_primitives, error_code, message)
 
             primitive_label = primitive_name if not pose_name else f"{primitive_name}:{pose_name}"
             if primitive_name == "move_relative_ee":

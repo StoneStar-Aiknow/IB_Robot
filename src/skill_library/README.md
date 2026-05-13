@@ -350,7 +350,10 @@ ros2 action send_goal /embodied/execute_primitive ibrobot_msgs/action/PrimitiveC
 | `gripper_settle_sec` | `1.5` | gripper primitive 的稳定等待时间 |
 | `gripper_open_position` | `1.0` | 张开值 |
 | `gripper_closed_position` | `0.0` | 闭合值 |
-| `debug_tracing` | `true` | 是否输出调试日志 |
+| `task_executor_action_name` | `/task_executor/execute_task_plan` | task_dispatch 执行动作名 |
+| `ee_pose_topic` | `/robot_status/ee_pose` | 末端位姿反馈 topic |
+| `joint_state_topic` | `/joint_states` | 关节状态反馈 topic |
+| `debug_tracing` | `false` | 是否输出调试日志 |
 
 ## 10. 当前限制
 

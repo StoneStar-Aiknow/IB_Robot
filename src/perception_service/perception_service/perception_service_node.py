@@ -49,7 +49,7 @@ class PerceptionServiceNode(Node):
         self.declare_parameter("api_max_image_width", 320)
         self.declare_parameter("api_jpeg_quality", 70)
         self.declare_parameter("max_history_turns", 4)
-        self.declare_parameter("debug_tracing", True)
+        self.declare_parameter("debug_tracing", False)
 
         self._request_topic = self.get_parameter("request_topic").get_parameter_value().string_value
         self._text_input_topic = self.get_parameter("text_input_topic").get_parameter_value().string_value
@@ -64,28 +64,7 @@ class PerceptionServiceNode(Node):
         self._max_history_turns = self.get_parameter("max_history_turns").get_parameter_value().integer_value
         self._debug = self.get_parameter("debug_tracing").get_parameter_value().bool_value
 
-        self._scene_buffer = SceneSnapshotBuffer(
-            self,
-            primary_camera_topic=self.get_parameter("primary_camera_topic").get_parameter_value().string_value,
-            wrist_camera_topic=self.get_parameter("wrist_camera_topic").get_parameter_value().string_value,
-            primary_camera_info_topic=(
-                self.get_parameter("primary_camera_info_topic").get_parameter_value().string_value
-            ),
-            primary_aligned_depth_topic=(
-                self.get_parameter("primary_aligned_depth_topic").get_parameter_value().string_value
-            ),
-            primary_pointcloud_topic=(
-                self.get_parameter("primary_pointcloud_topic").get_parameter_value().string_value
-            ),
-            wrist_camera_info_topic=(self.get_parameter("wrist_camera_info_topic").get_parameter_value().string_value),
-            wrist_aligned_depth_topic=(
-                self.get_parameter("wrist_aligned_depth_topic").get_parameter_value().string_value
-            ),
-            wrist_pointcloud_topic=(self.get_parameter("wrist_pointcloud_topic").get_parameter_value().string_value),
-            ee_pose_topic=self.get_parameter("ee_pose_topic").get_parameter_value().string_value,
-            joint_state_topic=self.get_parameter("joint_state_topic").get_parameter_value().string_value,
-            debug=self._debug,
-        )
+        self._scene_buffer = SceneSnapshotBuffer.from_node(self)
         self._api_client = VLMAPIClient(
             provider=self.get_parameter("api_provider").get_parameter_value().string_value,
             base_url=self.get_parameter("api_base_url").get_parameter_value().string_value,

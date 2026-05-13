@@ -1,16 +1,12 @@
 """Helpers for resolving skills, targets, and named poses."""
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
-from skill_library.skill_templates import get_skill_templates
+from embodied_common.json_utils import load_json_mapping
+from embodied_common.skill_templates import get_skill_templates
 
-
-def load_json_mapping(raw_value: str) -> dict[str, Any]:
-    if not raw_value:
-        return {}
-    return json.loads(raw_value)
+__all__ = ["PrimitiveSpec", "load_json_mapping", "direction_to_delta", "resolve_skill_primitives"]
 
 
 @dataclass

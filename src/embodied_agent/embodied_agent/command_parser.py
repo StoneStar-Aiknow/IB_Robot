@@ -40,7 +40,7 @@ def _resolve_motion_direction(text: str) -> str:
         ("left", ["往左", "向左", "左一点", "往左一点", "向左一点"]),
         ("right", ["往右", "向右", "右一点", "往右一点", "向右一点"]),
         ("up", ["往上", "向上", "上一点", "往上一点", "向上一点"]),
-        ("down", ["往下", "向下", "下一点", "往下一点", "向下一点"]),
+        ("down", ["往下", "向下", "朝下", "下一点", "往下一点", "向下一点"]),
     ]
     for direction, keywords in direction_keywords:
         if _contains_any(text, keywords):
@@ -115,16 +115,6 @@ def parse_text_command(
             motion_direction="",
             motion_distance=0.0,
             skill_sequence=["close_gripper_skill"],
-        )
-
-    if _contains_any(normalized, ["垂直向下", "夹爪向下", "夹爪朝下", "末端向下", "朝下"]):
-        return PlannedTask(
-            task_type="gripper_point_down",
-            target_name="",
-            place_name="",
-            motion_direction="",
-            motion_distance=0.0,
-            skill_sequence=["gripper_point_down"],
         )
 
     cw_match = re.search(r"顺时针(?:旋转)?(\d+(?:\.\d+)?)度", normalized)

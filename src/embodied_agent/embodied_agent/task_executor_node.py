@@ -6,14 +6,14 @@ from typing import Any
 
 import rclpy
 from rclpy.action import ActionClient
-from rclpy.node import Node
 
 from embodied_agent.task_context import ensure_timeout_context, remaining_task_budget_sec
+from embodied_common.base_node import BaseTaskNode
 from ibrobot_msgs.action import SkillCommand
 from ibrobot_msgs.msg import TaskCommand, TaskStatus
 
 
-class TaskExecutorNode(Node):
+class TaskExecutorNode(BaseTaskNode):
     """Execute a planned task by calling the skill action server in sequence."""
 
     def __init__(self, parameter_overrides=None) -> None:
@@ -23,7 +23,7 @@ class TaskExecutorNode(Node):
         self.declare_parameter("skill_action_name", "/embodied/execute_skill")
         self.declare_parameter("default_task_timeout_sec", 180.0)
         self.declare_parameter("rpc_timeout_sec", 5.0)
-        self.declare_parameter("debug_tracing", True)
+        self.declare_parameter("debug_tracing", False)
 
         self._input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
         self._status_topic = self.get_parameter("status_topic").get_parameter_value().string_value
@@ -42,30 +42,6 @@ class TaskExecutorNode(Node):
             f"[embodied-debug] task_executor ready: input_topic={self._input_topic}, "
             f"skill_action={self._skill_action_name}"
         )
-
-    def _publish_status(
-        self,
-        task_id: str,
-        state: str,
-        success: bool,
-        message: str,
-        current_skill: str = "",
-        completed_skills: list[str] | None = None,
-        error_code: str = "",
-        recoverable: bool = False,
-        replan_requested: bool = False,
-    ) -> None:
-        status = TaskStatus()
-        status.task_id = task_id
-        status.state = state
-        status.success = success
-        status.current_skill = current_skill
-        status.completed_skills = completed_skills or []
-        status.error_code = error_code
-        status.message = message
-        status.recoverable = recoverable
-        status.replan_requested = replan_requested
-        self._status_publisher.publish(status)
 
     def _handle_planned_task(self, msg: TaskCommand) -> None:
         if not self._active_task_lock.acquire(blocking=False):

@@ -4,7 +4,7 @@
   <name>vlm_task_planner</name>
   <version>0.1.0</version>
   <description>VLM-backed task planner for the embodied execution pipeline</description>
-  <maintainer email="dev@example.com">IB-Robot Team</maintainer>
+  <maintainer email="liuweihong8@huawei.com">liuweihong</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
@@ -12,6 +12,7 @@
   <depend>geometry_msgs</depend>
   <depend>cv_bridge</depend>
   <depend>ibrobot_msgs</depend>
+  <depend>embodied_common</depend>
   <depend>embodied_agent</depend>
   <depend>perception_service</depend>
 

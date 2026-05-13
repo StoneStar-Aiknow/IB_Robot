@@ -12,8 +12,8 @@ setup(
     ],
     install_requires=["setuptools"],
     zip_safe=True,
-    maintainer="IB-Robot Team",
-    maintainer_email="dev@example.com",
+    maintainer="liuweihong",
+    maintainer_email="liuweihong8@huawei.com",
     description="VLM-backed task planner for the embodied execution pipeline",
     license="Apache-2.0",
     entry_points={

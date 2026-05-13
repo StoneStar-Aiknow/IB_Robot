@@ -22,7 +22,7 @@ class SafetyGuardNode(Node):
         self.declare_parameter("named_targets_json", "{}")
         self.declare_parameter("skill_templates_json", "{}")
         self.declare_parameter("workspace_json", "{}")
-        self.declare_parameter("debug_tracing", True)
+        self.declare_parameter("debug_tracing", False)
 
         self._validate_skill_service = self.get_parameter("validate_skill_service").get_parameter_value().string_value
         self._validate_primitive_service = (

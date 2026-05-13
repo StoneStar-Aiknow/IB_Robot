@@ -6,15 +6,7 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
-_MAX_USER_TEXT_LEN = 2000
-
-
-def _sanitize_user_text(text: str) -> str:
-    """Truncate overly long user inputs to avoid token overflows."""
-    text = (text or "").strip()
-    if len(text) > _MAX_USER_TEXT_LEN:
-        text = text[:_MAX_USER_TEXT_LEN]
-    return text
+from perception_service.prompt_builder import _sanitize_user_text, append_images
 
 
 def build_chat_messages(
@@ -81,23 +73,7 @@ def build_chat_messages(
     )
 
     user_content: list[dict[str, Any]] = [{"type": "text", "text": user_text}]
-    images = scene_snapshot.get("images", [])
-    if isinstance(images, list) and images:
-        for item in images:
-            image_data_url = str(item.get("image_data_url", "")).strip()
-            if image_data_url:
-                user_content.append({"type": "image_url", "image_url": {"url": image_data_url}})
-    else:
-        image_data_url = scene_snapshot.get("image_data_url", "")
-        if image_data_url:
-            user_content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {
-                        "url": image_data_url,
-                    },
-                }
-            )
+    append_images(user_content, scene_snapshot)
 
     return [
         {"role": "system", "content": [{"type": "text", "text": system_text}]},

@@ -1,14 +1,14 @@
 """Rule planner node for the embodied minimal closure."""
 
 import rclpy
-from rclpy.node import Node
 
 from embodied_agent.command_parser import parse_text_command
 from embodied_agent.task_context import dump_task_context, ensure_timeout_context
+from embodied_common.base_node import BaseTaskNode
 from ibrobot_msgs.msg import TaskCommand, TaskStatus
 
 
-class TaskPlannerNode(Node):
+class TaskPlannerNode(BaseTaskNode):
     """Plan a deterministic skill sequence from a TaskCommand."""
 
     def __init__(self, parameter_overrides=None) -> None:
@@ -19,7 +19,7 @@ class TaskPlannerNode(Node):
         self.declare_parameter("default_target_name", "demo_object")
         self.declare_parameter("default_place_name", "tray_right")
         self.declare_parameter("default_relative_motion_step_m", 0.03)
-        self.declare_parameter("debug_tracing", True)
+        self.declare_parameter("debug_tracing", False)
 
         self._input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
         self._output_topic = self.get_parameter("output_topic").get_parameter_value().string_value
@@ -38,29 +38,6 @@ class TaskPlannerNode(Node):
         self.get_logger().info(
             f"[embodied-debug] task_planner ready: input_topic={self._input_topic}, output_topic={self._output_topic}"
         )
-
-    def _publish_status(
-        self,
-        task_id: str,
-        state: str,
-        success: bool,
-        message: str,
-        current_skill: str = "",
-        error_code: str = "",
-        recoverable: bool = False,
-        replan_requested: bool = False,
-    ) -> None:
-        status = TaskStatus()
-        status.task_id = task_id
-        status.state = state
-        status.success = success
-        status.current_skill = current_skill
-        status.completed_skills = []
-        status.error_code = error_code
-        status.message = message
-        status.recoverable = recoverable
-        status.replan_requested = replan_requested
-        self._status_publisher.publish(status)
 
     def _handle_task_command(self, msg: TaskCommand) -> None:
         plan = parse_text_command(

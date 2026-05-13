@@ -118,6 +118,36 @@ class SceneSnapshotBuffer:
         node.create_subscription(PoseStamped, ee_pose_topic, self._handle_ee_pose, 10)
         node.create_subscription(JointState, joint_state_topic, self._handle_joint_state, 10)
 
+    @classmethod
+    def from_node(cls, node: Node) -> SceneSnapshotBuffer:
+        """Construct from a ROS node using the standard camera/pose parameters.
+
+        Expects the node to have declared these parameters:
+        ``primary_camera_topic``, ``wrist_camera_topic``,
+        ``primary_camera_info_topic``, ``primary_aligned_depth_topic``,
+        ``primary_pointcloud_topic``, ``wrist_camera_info_topic``,
+        ``wrist_aligned_depth_topic``, ``wrist_pointcloud_topic``,
+        ``ee_pose_topic``, ``joint_state_topic``, ``debug_tracing``.
+        """
+
+        def _str(name: str) -> str:
+            return node.get_parameter(name).get_parameter_value().string_value
+
+        return cls(
+            node,
+            primary_camera_topic=_str("primary_camera_topic"),
+            wrist_camera_topic=_str("wrist_camera_topic"),
+            primary_camera_info_topic=_str("primary_camera_info_topic"),
+            primary_aligned_depth_topic=_str("primary_aligned_depth_topic"),
+            primary_pointcloud_topic=_str("primary_pointcloud_topic"),
+            wrist_camera_info_topic=_str("wrist_camera_info_topic"),
+            wrist_aligned_depth_topic=_str("wrist_aligned_depth_topic"),
+            wrist_pointcloud_topic=_str("wrist_pointcloud_topic"),
+            ee_pose_topic=_str("ee_pose_topic"),
+            joint_state_topic=_str("joint_state_topic"),
+            debug=node.get_parameter("debug_tracing").get_parameter_value().bool_value,
+        )
+
     def _make_image_handler(self, view_name: str):
         def _handler(msg: Image) -> None:
             view = self._views[view_name]

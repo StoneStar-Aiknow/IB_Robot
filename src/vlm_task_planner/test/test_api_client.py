@@ -1,5 +1,7 @@
 from unittest.mock import patch
 
+import pytest
+
 from vlm_task_planner.api_client import VLMAPIClient
 
 
@@ -41,3 +43,22 @@ def test_openai_compatible_allows_empty_api_key_env():
     assert response["choices"][0]["message"]["content"] == "plan result"
     assert captured["url"] == "http://localhost:8000/v1/chat/completions"
     assert "Authorization" not in captured["headers"]
+
+
+def test_invalid_api_json_raises_runtime_error():
+    client = VLMAPIClient(
+        provider="openai_compatible",
+        base_url="http://localhost:8000/v1",
+        api_key_env="",
+        model="Qwen3.5-9B",
+        timeout_sec=120.0,
+    )
+
+    with (
+        patch("urllib.request.urlopen", return_value=_FakeResponse("not-json")),
+        pytest.raises(
+            RuntimeError,
+            match="invalid JSON",
+        ),
+    ):
+        client.plan([{"role": "user", "content": "plan"}])

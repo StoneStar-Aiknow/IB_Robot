@@ -64,7 +64,7 @@ Task / Skill request
 | `named_poses_json` | `{}` | 命名位姿 |
 | `named_targets_json` | `{}` | 命名目标 |
 | `workspace_json` | `{}` | 工作空间边界 |
-| `debug_tracing` | `true` | 是否输出调试日志 |
+| `debug_tracing` | `false` | 是否输出调试日志 |
 
 ## 4. 当前 ROS 服务接口
 

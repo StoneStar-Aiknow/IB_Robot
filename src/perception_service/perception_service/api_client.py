@@ -11,6 +11,15 @@ from typing import Any
 from perception_service.model_timeout import resolve_model_output_idle_timeout
 
 
+def _parse_response_json(body: str) -> dict[str, Any]:
+    """Parse the HTTP response body as JSON with a friendly error on failure."""
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        preview = body.strip()[:200]
+        raise RuntimeError(f"VLM API returned invalid JSON: {preview!r}") from exc
+
+
 class VLMAPIClient:
     """Call an OpenAI-compatible chat-completions API."""
 
@@ -88,7 +97,7 @@ class VLMAPIClient:
         except TimeoutError as exc:
             raise RuntimeError(f"VLM API timeout after {output_idle_timeout_sec}s") from exc
 
-        response_json = json.loads(body)
+        response_json = _parse_response_json(body)
         choices = response_json.get("choices", [])
         if not choices:
             raise RuntimeError("VLM API returned no choices")

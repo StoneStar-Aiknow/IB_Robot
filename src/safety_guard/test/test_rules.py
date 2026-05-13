@@ -65,6 +65,21 @@ def test_validate_skill_requires_target():
     assert "unknown target" in reason
 
 
+def test_validate_skill_uses_default_templates_without_override():
+    allowed, reason = validate_skill_request(
+        "inspect_scene",
+        "",
+        "",
+        "",
+        0.0,
+        {"observe_table": {}},
+        {},
+        None,
+    )
+    assert allowed
+    assert reason == ""
+
+
 def test_validate_relative_skill_direction():
     allowed, reason = validate_skill_request(
         "move_relative_ee",
@@ -75,6 +90,21 @@ def test_validate_relative_skill_direction():
         {"home": {}, "observe_table": {}, "tray_right": {}},
         {"demo_object": {}},
         SKILL_TEMPLATES,
+    )
+    assert allowed
+    assert reason == ""
+
+
+def test_validate_default_gripper_rotation_skill():
+    allowed, reason = validate_skill_request(
+        "rotate_gripper_cw",
+        "",
+        "",
+        "",
+        30.0,
+        {"home": {}},
+        {},
+        None,
     )
     assert allowed
     assert reason == ""
