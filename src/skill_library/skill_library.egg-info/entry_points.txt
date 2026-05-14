@@ -1,2 +1,0 @@
-[console_scripts]
-skill_executor_node = skill_library.skill_executor_node:main
