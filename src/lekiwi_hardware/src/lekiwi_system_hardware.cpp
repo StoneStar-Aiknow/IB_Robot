@@ -17,10 +17,20 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_init(
     return hardware_interface::CallbackReturn::ERROR;
 
   const size_t n = info_.joints.size();
-  if (n != NUM_JOINTS) {
+  num_joints_ = n;
+  if (n == FULL_JOINTS) {
+    base_only_mode_ = false;
+    num_arm_joints_ = FULL_ARM_JOINTS;
+    num_base_joints_ = FULL_BASE_JOINTS;
+  } else if (n == FULL_BASE_JOINTS) {
+    base_only_mode_ = true;
+    num_arm_joints_ = 0;
+    num_base_joints_ = FULL_BASE_JOINTS;
+  } else {
     RCLCPP_ERROR(
       rclcpp::get_logger("LeKiwiSystemHardware"),
-      "Expected %zu joints, got %zu", NUM_JOINTS, n);
+      "Expected %zu joints (full) or %zu joints (base-only), got %zu",
+      FULL_JOINTS, FULL_BASE_JOINTS, n);
     return hardware_interface::CallbackReturn::ERROR;
   }
 
@@ -33,13 +43,13 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_init(
   motor_ids_.resize(n);
 
   // Arm write buffers
-  arm_target_positions_.resize(NUM_ARM_JOINTS, 0);
-  arm_target_speeds_.resize(NUM_ARM_JOINTS, 0);
-  arm_target_accs_.resize(NUM_ARM_JOINTS, 0);
+  arm_target_positions_.resize(num_arm_joints_, 0);
+  arm_target_speeds_.resize(num_arm_joints_, 0);
+  arm_target_accs_.resize(num_arm_joints_, 0);
 
   for (size_t i = 0; i < n; i++) {
     motor_ids_[i] = std::stoi(info_.joints[i].parameters.at("id"));
-    if (i < NUM_ARM_JOINTS) {
+    if (!base_only_mode_ && i < num_arm_joints_) {
       arm_motor_ids_.push_back(motor_ids_[i]);
     } else {
       base_motor_ids_.push_back(motor_ids_[i]);
@@ -57,6 +67,25 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_configure(
   const rclcpp_lifecycle::State &)
 {
   RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"), "Configuring...");
+
+  const bool base_only = base_only_mode_;
+  auto set_default_limits = [this]() {
+    for (size_t i = 0; i < motor_ids_.size(); i++) {
+      u8 id = motor_ids_[i];
+      homing_offsets_[id] = 0;
+      range_mins_[id] = 0;
+      range_maxes_[id] = 4095;
+    }
+  };
+
+  if (base_only) {
+    set_default_limits();
+    RCLCPP_INFO(
+      rclcpp::get_logger("LeKiwiSystemHardware"),
+      "Base-only mode detected, skipping arm calibration requirements.");
+    RCLCPP_INFO(rclcpp::get_logger("LeKiwiSystemHardware"), "Configured!");
+    return hardware_interface::CallbackReturn::SUCCESS;
+  }
 
   std::ifstream f(calib_file_);
   if (!f.is_open()) {
@@ -81,7 +110,7 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_configure(
   for (size_t i = 0; i < motor_ids_.size(); i++) {
     u8 id = motor_ids_[i];
     // Base motors (wheel mode) don't need calibration data
-    if (i >= NUM_ARM_JOINTS) {
+    if (base_only || i >= num_arm_joints_) {
       homing_offsets_[id] = 0;
       range_mins_[id] = 0;
       range_maxes_[id] = 4095;
@@ -119,7 +148,7 @@ std::vector<hardware_interface::CommandInterface> LeKiwiSystemHardware::export_c
   std::vector<hardware_interface::CommandInterface> command_interfaces;
   for (size_t i = 0; i < info_.joints.size(); i++) {
     // Arm joints (0-5): position command; Base joints (6-8): velocity command
-    if (i < NUM_ARM_JOINTS) {
+    if (i < num_arm_joints_) {
       command_interfaces.emplace_back(
         info_.joints[i].name, hardware_interface::HW_IF_POSITION, &hw_commands_[i]);
     } else {
@@ -217,7 +246,7 @@ hardware_interface::CallbackReturn LeKiwiSystemHardware::on_activate(
         s16 pos = decode_motor_register(data[0], data[1]);
         double rad = ticks_to_radians(pos);
         hw_positions_[i] = rad;
-        if (i < NUM_ARM_JOINTS) {
+        if (i < num_arm_joints_) {
           hw_commands_[i] = rad;  // hold current position
         }
       }
@@ -272,7 +301,7 @@ hardware_interface::return_type LeKiwiSystemHardware::read(
     if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) == 2) {
       s16 pos = decode_motor_register(data[0], data[1]);
 
-      if (i < NUM_ARM_JOINTS) {
+      if (i < num_arm_joints_) {
         // Arm: convert ticks to radians
         hw_positions_[i] = ticks_to_radians(pos);
       } else {
@@ -291,7 +320,7 @@ hardware_interface::return_type LeKiwiSystemHardware::read(
       if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) == 2) {
         s16 speed = decode_motor_register(data[0], data[1]);
 
-        if (i < NUM_ARM_JOINTS) {
+        if (i < num_arm_joints_) {
           // Arm velocity in raw steps/s -> convert to rad/s
           hw_velocities_[i] = steps_to_rad_s(speed);
         } else {
@@ -311,7 +340,7 @@ hardware_interface::return_type LeKiwiSystemHardware::write(
   static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
 
   // ---- Arm motors: position control (SyncWritePosEx) ----
-  for (size_t i = 0; i < NUM_ARM_JOINTS; i++) {
+  for (size_t i = 0; i < num_arm_joints_; i++) {
     arm_target_positions_[i] = radians_to_ticks(hw_commands_[i]);
     arm_target_speeds_[i] = 2400;
     arm_target_accs_[i] = 50;
@@ -325,16 +354,16 @@ hardware_interface::return_type LeKiwiSystemHardware::write(
 
   // ---- Base motors: velocity control (SyncWriteSpe) ----
   if (!base_motor_ids_.empty()) {
-    s16 base_speeds[NUM_BASE_JOINTS];
-    u8 base_accs[NUM_BASE_JOINTS];
-    for (size_t i = 0; i < NUM_BASE_JOINTS; i++) {
-      // hw_commands_[NUM_ARM_JOINTS + i] is velocity in rad/s (ros2_control convention).
+    std::vector<s16> base_speeds(num_base_joints_);
+    std::vector<u8> base_accs(num_base_joints_);
+    for (size_t i = 0; i < num_base_joints_; i++) {
+      // hw_commands_[num_arm_joints_ + i] is velocity in rad/s (ros2_control convention).
       // Convert to raw steps/s for the STS3215 speed register.
-      base_speeds[i] = rad_s_to_steps(hw_commands_[NUM_ARM_JOINTS + i]);
+      base_speeds[i] = rad_s_to_steps(hw_commands_[num_arm_joints_ + i]);
       base_accs[i] = 50;
     }
     sms_sts_.SyncWriteSpe(
-      base_motor_ids_.data(), base_motor_ids_.size(), base_speeds, base_accs);
+      base_motor_ids_.data(), base_motor_ids_.size(), base_speeds.data(), base_accs.data());
   }
 
   return hardware_interface::return_type::OK;

@@ -15,12 +15,10 @@
 namespace lekiwi_hardware
 {
 
-// Number of arm joints (position-controlled)
-static constexpr size_t NUM_ARM_JOINTS = 6;
-// Number of base joints (velocity-controlled omniwheels)
-static constexpr size_t NUM_BASE_JOINTS = 3;
-// Total joints
-static constexpr size_t NUM_JOINTS = NUM_ARM_JOINTS + NUM_BASE_JOINTS;
+// Full LeKiwi robot dimensions
+static constexpr size_t FULL_ARM_JOINTS = 6;
+static constexpr size_t FULL_BASE_JOINTS = 3;
+static constexpr size_t FULL_JOINTS = FULL_ARM_JOINTS + FULL_BASE_JOINTS;
 
 class LeKiwiSystemHardware : public hardware_interface::SystemInterface
 {
@@ -46,6 +44,10 @@ private:
   SMS_STS sms_sts_;
   std::string port_;
   std::string calib_file_;
+  bool base_only_mode_ = false;
+  size_t num_arm_joints_ = 0;
+  size_t num_base_joints_ = 0;
+  size_t num_joints_ = 0;
 
   // State buffers for all 9 joints
   std::vector<double> hw_positions_;   // arm positions (rad) + base velocities (raw)

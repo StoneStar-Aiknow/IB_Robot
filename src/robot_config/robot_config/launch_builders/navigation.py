@@ -131,7 +131,8 @@ def _generate_real_navigation(
 
     # 4. CmdVel bridge (needs to know if EKF is running)
     ekf_rtabmap_config = navigation_config.get("ekf_rtabmap", {})
-    ekf_enabled = ekf_rtabmap_config.get("enabled", False) and not use_sim
+    ekf_node_config = ekf_rtabmap_config.get("ekf", {})
+    ekf_enabled = ekf_rtabmap_config.get("enabled", False) and ekf_node_config.get("enabled", True) and not use_sim
     nodes.extend(generate_cmd_vel_nodes(navigation_config, ekf_enabled=ekf_enabled, use_sim=use_sim))
 
     # 5. Voice-controlled navigation (Nav2 goal client + FunASR)
