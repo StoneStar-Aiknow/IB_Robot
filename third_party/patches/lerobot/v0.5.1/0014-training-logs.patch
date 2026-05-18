@@ -1,50 +1,122 @@
-From fa82d3fbca9554175af28648fabda1726255048e Mon Sep 17 00:00:00 2001
+From 5a06a5ad3b3cc097e10e457d1d43ee07af845d50 Mon Sep 17 00:00:00 2001
 From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
 Date: Fri, 8 May 2026 16:20:45 +0800
-Subject: [PATCH] train: add tensorboard training logs
+Subject: [PATCH] train: add tensorboard logs and eval memory cleanup
 
 ---
- src/lerobot/scripts/lerobot_train.py | 23 ++++++++++++++++++++---
- 1 file changed, 20 insertions(+), 3 deletions(-)
+ src/lerobot/scripts/lerobot_train.py | 64 +++++++++++++++++++---------
+ 1 file changed, 44 insertions(+), 20 deletions(-)
 
 diff --git a/src/lerobot/scripts/lerobot_train.py b/src/lerobot/scripts/lerobot_train.py
-index 88f04e32..ea6fc76c 100644
+index 88f04e32..b6efe791 100644
 --- a/src/lerobot/scripts/lerobot_train.py
 +++ b/src/lerobot/scripts/lerobot_train.py
-@@ -17,2 +17,3 @@ import dataclasses
- import logging
-+import os
- import time
-@@ -26,2 +27,3 @@ from termcolor import colored
+@@ -24,6 +24,7 @@ import torch
+ from accelerate import Accelerator
+ from termcolor import colored
  from torch.optim import Optimizer
 +from torch.utils.tensorboard import SummaryWriter
  from tqdm import tqdm
-@@ -207,2 +209,8 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+ 
+ from lerobot.configs import parser
+@@ -204,7 +205,6 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+             kwargs_handlers=[ddp_kwargs],
+             cpu=force_cpu,
+         )
 -
-+    folder_path = "./logs"
-+    if not os.path.exists(folder_path):
-+        os.mkdir(folder_path)
-+        print(f"Logs folder {folder_path} created successfully")
-+    else:
-+        print(f"Logs folder {folder_path} already exists")
-+
      init_logging(accelerator=accelerator)
-@@ -365,3 +373,5 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+ 
+     # Determine if this is the main process (for logging and checkpointing)
+@@ -363,6 +363,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+ 
+     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
      num_total_params = sum(p.numel() for p in policy.parameters())
++    writer = None
++    if is_main_process:
++        log_dir = cfg.output_dir / "tensorboard"
++        log_dir.mkdir(parents=True, exist_ok=True)
++        writer = SummaryWriter(log_dir=str(log_dir))
+ 
+     if is_main_process:
+         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
+@@ -543,6 +548,11 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+ 
+         if is_log_step:
+             logging.info(train_tracker)
++            if writer is not None:
++                metric_dict = train_tracker.to_dict()
++                for metric_name, metric_value in metric_dict.items():
++                    if metric_name in train_tracker.metrics:
++                        writer.add_scalar(f"{metric_name}/step", metric_value, step)
+             if wandb_logger:
+                 wandb_log_dict = train_tracker.to_dict()
+                 if output_dict:
+@@ -562,25 +572,36 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+ 
+         best_eval_sign = False
+         if not cfg.env and is_eval_step:
+-            policy.eval()
+-            per_eval_num = max(1, len(val_loader) // 4)
+-            logging.info(f"Start evaluating: {per_eval_num}/{len(val_loader)} batches")
+-            eval_loss = 0.0
+-            for _ in range(per_eval_num):
+-                val_batch, _ = next(val_iter)
+-                val_batch = preprocessor(val_batch)
+-                with accelerator.autocast():
+-                    loss, _ = policy.forward(val_batch)
+-                eval_loss += loss.item()
+-            eval_loss /= per_eval_num
+-            logging.info(f"Eval policy at step {step}, eval_loss: {eval_loss:.3f}")
 -
-+    log_dir = f"logs/pytorch/{str(cfg.output_dir).split('/')[-1]}"
-+    writer = SummaryWriter(log_dir=log_dir)
+-            if eval_loss < best_eval_loss:
+-                best_eval_loss = eval_loss
+-                logging.info(f"New best eval loss: {best_eval_loss:.3f}, saving checkpoint")
+-                best_eval_sign = True
+-
+-            policy.train()
++            num_val_batches = len(val_loader)
++            if num_val_batches == 0:
++                logging.warning("Skip eval at step %s because val_loader is empty", step)
++            else:
++                torch.cuda.empty_cache()
++                policy.eval()
++                step_id = get_step_identifier(step, cfg.steps)
++                # Limit eval batches to keep periodic validation from holding GPU memory too long.
++                per_eval_num = min(num_val_batches, max(1, num_val_batches // 4 + 1))
++                logging.info(f"Start evaluating ({step_id}): {per_eval_num}/{num_val_batches} batches")
++                eval_loss = 0.0
++                with torch.no_grad():
++                    for _ in tqdm(range(per_eval_num), desc=f"Eval {step_id}", leave=False, disable=not is_main_process):
++                        val_batch, _ = next(val_iter)
++                        val_batch = preprocessor(val_batch)
++                        with accelerator.autocast():
++                            loss, _ = policy.forward(val_batch)
++                        eval_loss += loss.item()
++                torch.cuda.empty_cache()
++                eval_loss /= per_eval_num
++                if writer is not None:
++                    writer.add_scalar("Loss/eval", eval_loss, step)
++                logging.info(f"Eval policy at step {step}, eval_loss: {eval_loss:.3f}")
++
++                if eval_loss < best_eval_loss:
++                    best_eval_loss = eval_loss
++                    logging.info(f"New best eval loss: {best_eval_loss:.3f}, saving checkpoint")
++                    best_eval_sign = True
++
++                policy.train()
+ 
+         if (cfg.save_checkpoint and is_saving_step) or best_eval_sign:
+             if is_main_process:
+@@ -657,6 +678,9 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
+     if eval_env:
+         close_envs(eval_env)
+ 
++    if writer is not None:
++        writer.close()
 +
      if is_main_process:
-@@ -545,2 +555,7 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
-             logging.info(train_tracker)
-+            for metric in train_tracker.metrics.values():
-+                metric_str = str(metric)
-+                value = float(metric_str.split(":")[-1])
-+                name = metric_str.split(":")[0]
-+                writer.add_scalar(f"{name}/step", value, step)
-             if wandb_logger:
-@@ -575,2 +590,3 @@ def train(cfg: TrainPipelineConfig, accelerator: Accelerator | None = None):
-             eval_loss /= per_eval_num
-+            writer.add_scalar("Loss/eval", eval_loss, step)
-             logging.info(f"Eval policy at step {step}, eval_loss: {eval_loss:.3f}")
+         logging.info("End of training")
+ 
+-- 
+2.34.1
+
