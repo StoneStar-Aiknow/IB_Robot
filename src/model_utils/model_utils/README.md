@@ -1,6 +1,6 @@
 # Model Utils
 
-model_utils 提供了一组用于 LeRobot 策略模型导出与验证的工具脚本，包含以下三个工具：
+model_utils 提供了一组用于 LeRobot 策略模型导出与验证的工具脚本，包含以下工具：
 
 | 脚本 | 用途 |
 | --- | --- |
@@ -8,6 +8,7 @@ model_utils 提供了一组用于 LeRobot 策略模型导出与验证的工具�
 | `export_onnx_3403.py` | 专为 Ascend 3403 硬件导出 ONNX 模型 |
 | `export_onnx_rknn.py` | 专为 RK3588 NPU 导出 ONNX 模型，并可一键转换为 RKNN 格式 |
 | `loss_compare.py` | 跨平台模型推理精度对比验证 |
+| `inspect_frame_inference.py` | 脱机逐帧/区间策略推理检查；需要 `policy-path`、`dataset-root` 和帧选择参数 |
 
 ---
 
