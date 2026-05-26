@@ -302,7 +302,7 @@ class PureInferenceEngine:
         if device_name in ("ascend_om", "ascend_om_3403"):
             from inference_service.core.ascend_om import create_ascend_om_policy_wrapper
 
-            self._wrapper = create_ascend_om_policy_wrapper(device_name)
+            self._wrapper = create_ascend_om_policy_wrapper(device_name, path)
         elif device_name == "rknn":
             from inference_service.core.rknn import create_rknn_policy_wrapper
 
@@ -354,7 +354,11 @@ class PureInferenceEngine:
 
         for key, value in batch.items():
             # Skip non-tensor metadata often injected by LeRobot dataset processors
-            if value is None or isinstance(value, dict | str):
+            # (e.g. ``task`` is a str, but the batch collator wraps it into a
+            # ``list[str]`` of length B — neither is convertible to a tensor).
+            if value is None or isinstance(value, dict | str | bytes):
+                continue
+            if isinstance(value, list | tuple) and (len(value) == 0 or isinstance(value[0], str | bytes | dict)):
                 continue
 
             if isinstance(value, np.ndarray):
@@ -389,7 +393,7 @@ class PureInferenceEngine:
     @property
     def use_action_chunking(self) -> bool:
         """Check if policy uses action chunking."""
-        return self._policy_type in ("act", "tdmpc", "vqbet")
+        return self._policy_type in ("act", "tdmpc", "vqbet", "pi0", "pi05", "smolvla")
 
 
 class MockPolicyWrapper(PolicyWrapper):
