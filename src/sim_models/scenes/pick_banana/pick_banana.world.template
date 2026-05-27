@@ -80,6 +80,7 @@
          The robot arm spawns at z=0 — exactly on this surface. -->
     <model name="table_surface_collision">
       <static>true</static>
+      <pose>0 0 0.002 0 0 0</pose>
       <link name="link">
         <collision name="collision">
           <geometry>
@@ -159,12 +160,11 @@
           </inertia>
         </inertial>
         <collision name="collision">
-          <pose>0 -0.009 0 -1.5708 0 0</pose>
           <geometry>
-            <cylinder>
-              <radius>0.1</radius>
-              <length>0.012</length>
-            </cylinder>
+            <mesh>
+              <uri>file://{{MESHES_DIR}}/plate_collision.stl</uri>
+              <scale>1 1 1</scale>
+            </mesh>
           </geometry>
           <surface>
             <friction>
@@ -179,7 +179,7 @@
           <geometry>
             <mesh>
               <uri>file://{{MESHES_DIR}}/plate.obj</uri>
-              <scale>0.08 0.08 0.08</scale>
+              <scale>0.09539 0.09539 0.09539</scale>
             </mesh>
           </geometry>
           <material>
@@ -191,31 +191,35 @@
       </link>
     </model>
 
-    <!-- Banana: dynamic (grasping target).
-         Collision: box approximating the banana shape at scale=0.012.
-         Inertia: uniform box m=0.1 kg, ~0.15×0.04×0.04 m (post-scale). -->
-    <model name="banana">
-      <pose>0.0 0.02 0.075 1.5708 0 0</pose>
+    <!-- banana_g: 新香蕉模型 (banana_low_yellow.glb 缩放至 17.5cm).
+         质量: 30g (塑料香蕉实测).
+         碰撞: STL 低模 (682面, watertight), 替换旧 box 代理.
+         视觉: GLB 导出 OBJ (709顶点, 带 UV), PBR 贴图.
+         惯量: 均匀长方体近似, BBox=0.175×0.096×0.035 m.
+         Pose: spawn 在桌面上方 10cm, 重力自然落下. -->
+    <model name="banana_g">
+      <pose>0.0 0.02 0.05 0 0 0</pose>
       <link name="link">
         <inertial>
-          <mass>0.1</mass>
+          <mass>0.03</mass>
           <inertia>
-            <ixx>2.3e-5</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>2.0e-4</iyy><iyz>0</iyz>
-            <izz>2.0e-4</izz>
+            <ixx>2.616e-5</ixx><ixy>0</ixy><ixz>0</ixz>
+            <iyy>7.959e-5</iyy><iyz>0</iyz>
+            <izz>9.970e-5</izz>
           </inertia>
         </inertial>
         <collision name="collision">
           <geometry>
-            <box>
-              <size>0.15 0.04 0.04</size>
-            </box>
+            <mesh>
+              <uri>file://{{MESHES_DIR}}/banana_g_collision.stl</uri>
+              <scale>1 1 1</scale>
+            </mesh>
           </geometry>
           <surface>
             <friction>
               <ode>
-                <mu>3.0</mu>
-                <mu2>3.0</mu2>
+                <mu>0.6</mu>
+                <mu2>0.6</mu2>
               </ode>
             </friction>
           </surface>
@@ -223,14 +227,20 @@
         <visual name="visual">
           <geometry>
             <mesh>
-              <uri>file://{{MESHES_DIR}}/banana.obj</uri>
-              <scale>0.012 0.012 0.012</scale>
+              <uri>file://{{MESHES_DIR}}/banana_g.obj</uri>
+              <scale>1 1 1</scale>
             </mesh>
           </geometry>
           <material>
-            <ambient>0.96 0.85 0.10 1</ambient>
-            <diffuse>0.96 0.85 0.10 1</diffuse>
-            <specular>0.1 0.1 0.05 1</specular>
+            <diffuse>1 1 1 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+            <pbr>
+              <metal>
+                <albedo_map>file://{{MESHES_DIR}}/banana_g_basecolor.png</albedo_map>
+                <metalness_map>file://{{MESHES_DIR}}/banana_g_metallic_roughness.png</metalness_map>
+                <normal_map>file://{{MESHES_DIR}}/banana_g_normal.png</normal_map>
+              </metal>
+            </pbr>
           </material>
         </visual>
       </link>
