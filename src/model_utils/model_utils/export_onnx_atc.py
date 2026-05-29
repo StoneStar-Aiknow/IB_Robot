@@ -105,6 +105,7 @@ def convert_onnx_to_om(config, onnx_model_path, om_model_path, soc_version):
 
 def export_act_model(pretrained_model_path, config, onnx_model_path, om_model_path, soc_version):
     import torch
+    from lerobot.configs.policies import PreTrainedConfig
     from lerobot.policies.act.modeling_act import ACTPolicy
 
     input_features = config["input_features"]
@@ -133,17 +134,8 @@ def export_act_model(pretrained_model_path, config, onnx_model_path, om_model_pa
         "batch": act_input_batch,
     }
 
-    # Force-disable OM inference modes so that from_pretrained always
-    # constructs the standard PyTorch model (self.model = ACT(config)),
-    # regardless of what config.json says.  Exporting ONNX/OM requires
-    # the original PyTorch graph — the OM wrapper is irrelevant here.
-    act_policy = ACTPolicy.from_pretrained(
-        pretrained_model_path,
-        cli_overrides=[
-            "--is_ascend_om_enabled=false",
-            "--is_ascend_om_3403_enabled=false",
-        ],
-    )
+    policy_config = PreTrainedConfig.from_pretrained(pretrained_model_path)
+    act_policy = ACTPolicy.from_pretrained(pretrained_model_path, config=policy_config)
     act_policy.model = act_policy.model.to("cpu")
     act_policy.model.eval()
 
