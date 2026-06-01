@@ -1,0 +1,8 @@
+newmtl Material
+Kd 1.000 1.000 1.000
+Ks 0.100 0.100 0.100
+Ke 0.000 0.000 0.000
+Ni 1.500
+d 1.0
+illum 2
+map_Kd banana_tex.png

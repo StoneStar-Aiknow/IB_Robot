@@ -20,12 +20,13 @@ setup(
             "share/sim_models/scenes/pick_banana",
             glob("scenes/pick_banana/*.yaml") + glob("scenes/pick_banana/*.template"),
         ),
-        # pick_banana mesh assets (OBJ, STL, PNG textures)
+        # pick_banana mesh assets (OBJ, STL, PNG textures, MTL materials)
         (
             "share/sim_models/scenes/pick_banana/meshes",
             glob("scenes/pick_banana/meshes/*.obj")
             + glob("scenes/pick_banana/meshes/*.stl")
-            + glob("scenes/pick_banana/meshes/*.png"),
+            + glob("scenes/pick_banana/meshes/*.png")
+            + glob("scenes/pick_banana/meshes/*.mtl"),
         ),
     ],
     install_requires=["setuptools"],

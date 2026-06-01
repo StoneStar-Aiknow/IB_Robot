@@ -251,49 +251,51 @@
                      Same pos/euler as visual geom. -->
                 <geom class="collision" type="mesh" mesh="wrist_roll_follower_col_0"
                       pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"
-                      friction="5.0 0.5 0.05" condim="4"
+                      friction="15.0 0.5 0.05" condim="4"
                       solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                 <geom class="collision" type="mesh" mesh="wrist_roll_follower_col_1"
                       pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"
-                      friction="5.0 0.5 0.05" condim="4"
+                      friction="15.0 0.5 0.05" condim="4"
                       solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                 <geom class="collision" type="mesh" mesh="wrist_roll_follower_col_2"
                       pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"
-                      friction="5.0 0.5 0.05" condim="4"
+                      friction="15.0 0.5 0.05" condim="4"
                       solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                 <geom class="collision" type="mesh" mesh="wrist_roll_follower_col_3"
                       pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"
-                      friction="5.0 0.5 0.05" condim="4"
+                      friction="15.0 0.5 0.05" condim="4"
                       solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                 <geom class="collision" type="mesh" mesh="wrist_roll_follower_col_4"
                       pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"
-                      friction="5.0 0.5 0.05" condim="4"
+                      friction="15.0 0.5 0.05" condim="4"
                       solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                 <geom class="collision" type="mesh" mesh="wrist_roll_follower_col_5"
                       pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"
-                      friction="5.0 0.5 0.05" condim="4"
+                      friction="15.0 0.5 0.05" condim="4"
                       solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                 <geom class="collision" type="mesh" mesh="wrist_roll_follower_col_6"
                       pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"
-                      friction="5.0 0.5 0.05" condim="4"
+                      friction="15.0 0.5 0.05" condim="4"
                       solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                 <geom class="collision" type="mesh" mesh="wrist_roll_follower_col_7"
                       pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"
-                      friction="5.0 0.5 0.05" condim="4"
+                      friction="15.0 0.5 0.05" condim="4"
                       solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                 <geom class="visual" type="mesh" mesh="sts3215"     rgba="0.1 0.1 0.1 1"
                       pos="0.0077 0.0001 -0.0234" euler="-1.5708 0 0" />
                 <geom class="visual" type="mesh" mesh="wrist_roll_follower"
                       pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0" />
 
-                <!-- Contact pad on fixed jaw bottom face (faces world -z toward moving jaw top).
-                     Thin axis = body x (gripper body -x = world -z).
-                     Derived from -x mesh faces at fingertip (z>0.085), converted via Rx180. -->
+                <!-- Contact pad on fixed jaw inner face.
+                       Thin axis = body x (faces +x toward moving jaw).
+                       Bottom (z=-0.1010) covers fingertip, extends 27mm upward (+z). -->
+                <!-- DISABLED:
                 <geom class="collision" type="box"
-                      size="0.0010 0.0070 0.0101"
-                      pos="-0.0194 -0.0003 -0.0936"
+                      size="0.0010 0.0080 0.0135"
+                      pos="-0.0088 0.0008 -0.0875"
                       friction="15.0 0.5 0.05" condim="4"
                       solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
+                -->
 
                 <!-- wrist_camera injected here by mujoco_adapter if YAML has
                      peripherals[name=wrist, driver=opencv, transform.parent_frame=gripper] -->
@@ -317,48 +319,51 @@
                        Same pos/euler as visual geom. -->
                   <geom class="collision" type="mesh" mesh="moving_jaw_col_0"
                         pos="0 0 0.0189" euler="0 0 0"
-                        friction="5.0 0.5 0.05" condim="4"
+                        friction="15.0 0.5 0.05" condim="4"
                         solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                   <geom class="collision" type="mesh" mesh="moving_jaw_col_1"
                         pos="0 0 0.0189" euler="0 0 0"
-                        friction="5.0 0.5 0.05" condim="4"
+                        friction="15.0 0.5 0.05" condim="4"
                         solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                   <geom class="collision" type="mesh" mesh="moving_jaw_col_2"
                         pos="0 0 0.0189" euler="0 0 0"
-                        friction="5.0 0.5 0.05" condim="4"
+                        friction="15.0 0.5 0.05" condim="4"
                         solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                   <geom class="collision" type="mesh" mesh="moving_jaw_col_3"
                         pos="0 0 0.0189" euler="0 0 0"
-                        friction="5.0 0.5 0.05" condim="4"
+                        friction="15.0 0.5 0.05" condim="4"
                         solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                   <geom class="collision" type="mesh" mesh="moving_jaw_col_4"
                         pos="0 0 0.0189" euler="0 0 0"
-                        friction="5.0 0.5 0.05" condim="4"
+                        friction="15.0 0.5 0.05" condim="4"
                         solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                   <geom class="collision" type="mesh" mesh="moving_jaw_col_5"
                         pos="0 0 0.0189" euler="0 0 0"
-                        friction="5.0 0.5 0.05" condim="4"
+                        friction="15.0 0.5 0.05" condim="4"
                         solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                   <geom class="collision" type="mesh" mesh="moving_jaw_col_6"
                         pos="0 0 0.0189" euler="0 0 0"
-                        friction="5.0 0.5 0.05" condim="4"
+                        friction="15.0 0.5 0.05" condim="4"
                         solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
                   <geom class="collision" type="mesh" mesh="moving_jaw_col_7"
                         pos="0 0 0.0189" euler="0 0 0"
-                        friction="5.0 0.5 0.05" condim="4"
+                        friction="15.0 0.5 0.05" condim="4"
                         solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
 
                   <geom class="visual" type="mesh" mesh="moving_jaw"
                         pos="0 0 0.0189" euler="0 0 0" />
 
-                  <!-- Contact pad on moving jaw top face (faces world +z toward fixed jaw bottom).
-                       Thin axis = body x (jaw body +x = world +z).
-                       Derived from +x mesh faces at fingertip (y<-0.065). -->
+                  <!-- Contact pad on moving jaw inner face.
+                       Thin axis = body x (faces -x toward fixed jaw).
+                       Top (z=0.0175) flush with fingertip, extends 22mm toward jaw root (-z).
+                       jaw body z range: -0.0051..0.0429; pad covers -0.0045..0.0175. -->
+                  <!-- DISABLED:
                   <geom class="collision" type="box"
-                        size="0.0010 0.0107 0.0057"
-                        pos="0.0025 -0.0705 0.0188"
+                        size="0.0010 0.0080 0.0110"
+                        pos="-0.0113 -0.0730 0.0065"
                         friction="15.0 0.5 0.05" condim="4"
                         solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
+                  -->
 
                 </body>  <!-- jaw -->
               </body>  <!-- gripper -->
@@ -388,7 +393,7 @@
     <position name="3" joint="3" kp="500" dampratio="1.0" ctrlrange="-1.6813 1.6828"/>
     <position name="4" joint="4" kp="500" dampratio="1.0" ctrlrange="-1.65806 1.65806"/>
     <position name="5" joint="5" kp="500" dampratio="1.0" ctrlrange="-2.9115 2.9115"/>
-    <position name="6" joint="6" kp="3.0" dampratio="1.0" ctrlrange="0.0 1.0"/>
+    <position name="6" joint="6" kp="5" dampratio="1.0" ctrlrange="0.0 1.0" forcerange="-0.75 0.75"/>
   </actuator>
 
 </mujoco>
