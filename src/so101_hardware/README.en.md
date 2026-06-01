@@ -54,6 +54,11 @@ PYTHONPATH=/usr/lib/python3/dist-packages:$PYTHONPATH colcon build --packages-se
 source install/setup.zsh
 ```
 
+## Tool Documentation
+
+- [arm_calibration_transfer](docs/tools/arm_calibration_transfer.md): Legacy calibration data migration and new follower calibration file generation
+- [arm_calibration_checker](docs/tools/arm_calibration_checker.md): Real-robot verification process for calibration results
+
 ## Usage
 
 ### 1. Calibrating the Arm (Python)

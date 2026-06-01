@@ -95,7 +95,7 @@ graph TD
 
 | 任务 | 命令示例 |
 | :--- | :--- |
-| **全量编译** | `./scripts/build.sh` |
+| **全量编译** | `./scripts/build.sh --clean` |
 | **启动 MoveIt 调试** | `ros2 launch robot_config robot.launch.py control_mode:=moveit_planning use_sim:=true` |
 | **启动 AI 推理** | `ros2 launch robot_config robot.launch.py control_mode:=model_inference use_sim:=true with_inference:=true` |
 | **配置一致性检查** | `python3 scripts/validate_config.py` |

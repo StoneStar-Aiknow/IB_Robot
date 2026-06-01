@@ -177,6 +177,8 @@ ros2 run action_dispatch action_dispatcher_node
 | `watermark_threshold` | int | 20 | Watermark threshold to trigger inference |
 | `control_frequency` | double | 100.0 | Control frequency (Hz) |
 | `inference_action_server` | string | `/act_inference_node/DispatchInfer` | Inference service Action name |
+| `inference_reset_service` | string | `/act_inference_node/reset_policy_state` | Inference-side policy reset service; called best-effort during reset |
+| `policy_reset_timeout_sec` | double | 2.0 | Max wait time for inference-side policy reset completion |
 | `contract_path` | string | `''` | Contract file path |
 | `joint_state_topic` | string | `/joint_states` | Joint state topic |
 | `navigation_mode` | bool | false | Navigation mode (stopped at startup, waiting for external trigger) |
@@ -439,7 +441,7 @@ control_modes:
 
 | Service | Type | Description |
 |---------|------|-------------|
-| `~/reset` | `std_srvs/Empty` | Reset queue and state |
+| `~/reset` | `std_srvs/Empty` | Reset queue and state; also best-effort calls `inference_reset_service` to reset inference-side policy state |
 | `~/toggle_smoothing` | `std_srvs/Empty` | Toggle smoothing on/off |
 | `~/start_evaluate` | `std_srvs/Trigger` | Start execution (only when navigation_mode=true) |
 | `~/stop_evaluate` | `std_srvs/Trigger` | Stop execution and stop base (only when navigation_mode=true) |

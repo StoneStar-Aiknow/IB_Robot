@@ -2,9 +2,9 @@
 
 > IB-Robot (Intelligence Boom Robot): 融合 LeRobot 与 ROS 2 生态的智能具身机器人开发框架
 
-## 🌟 重磅更新：支持 OpenClaw 社交控制！
+## 重磅更新：支持 OpenClaw 社交控制！
 
-我们非常激动地宣布，IB-Robot 现在已全面支持通过 **[OpenClaw](https://github.com/openclaw/openclaw)** AI Agent 进行远程社交控制！无论是在 **Gazebo 仿真环境** 还是 **真实 SO-101 机械臂** 上，你都可以通过 飞书、QQ、Discord 等软件，用最自然的语言与机器人对话并下达指令。
+IB-Robot 现已全面支持通过 **[OpenClaw](https://github.com/openclaw/openclaw)** AI Agent 进行远程社交控制！无论是在 **Gazebo 仿真环境** 还是 **真实 SO-101 机械臂** 上，你都可以通过 飞书、QQ、Discord 等软件，用最自然的语言与机器人对话并下达指令。
 
 |                            仿真演示 (Simulation)                            |                             真实硬件 (Real Robot)                            |
 | :---------------------------------------------------------------------: | :----------------------------------------------------------------------: |
@@ -53,9 +53,9 @@ IB-Robot 构建了一个从感知、决策到执行的端到端闭环体系，�
 3. **推理与研发服务 (Inference Service)**:
    - 支持各类 VLA（视觉-语言-动作）大模型（如 SmolVLA, Pi0.5）以及端到端策略模型（如 ACT, Diffusion Policy）。系统支持 **自动检测后端** 并根据控制模式按需启动。
 4. **统一动作执行器 (Action Dispatch)**:
-   - 充当机器人的“小脑”。在 ACT 模式下负责 **Action Chunking** 调度与高频插值；在规划模式下对接 **MoveIt 2** 执行受限轨迹，并提供统一的 `RobotStatus` 汇报。
+   - 充当机器人的"小脑"。在 ACT 模式下负责 **Action Chunking** 调度与高频插值；在规划模式下对接 **MoveIt 2** 执行受限轨迹，并提供统一的 `RobotStatus` 汇报。
 5. **配置驱动中心 (robot\_config)**:
-   - 实现“规格驱动本体行为”。通过单一 YAML 定义关节、控制器模式及传感器外参，支持一键切换仿真与实机环境。
+   - 实现"规格驱动本体行为"。通过单一 YAML 定义关节、控制器模式及传感器外参，支持一键切换仿真与实机环境。
 
 ***
 
@@ -78,19 +78,25 @@ IB_Robot/                           # 主工作空间 (本仓库)
 ├── src/                            # 核心源码包集合
 │   ├── robot_config/               # 系统总控、规格定义与启动入口
 │   ├── action_dispatch/            # 统一动作执行器 (双模支持)
+│   ├── task_dispatch/              # 任务调度与分发服务
 │   ├── tensormsg/                  # LeRobot ↔ ROS 2 协议转换枢纽
 │   ├── ibrobot_msgs/               # 系统统一接口定义 (Message/Action)
 │   ├── dataset_tools/              # 数据集采集与转换工具 (Episode Recorder)
 │   ├── robot_teleop/               # 遥操作控制 (Leader Arm/Xbox 手柄)
 │   ├── robot_description/          # 统一机器人 URDF/SRDF/MJCF 模型描述
+│   ├── lekiwi_description/         # Lekiwi 底盘 URDF/Mesh 模型描述
 │   ├── robot_moveit/               # MoveIt 2 运动规划集成
+│   ├── robot_navigation/           # 导航功能包
 │   ├── inference_service/          # 多模型推理与部署服务
 │   ├── so101_hardware/             # SO-101 电机驱动接口
+│   ├── lekiwi_hardware/            # Lekiwi 底盘硬件驱动接口
+│   ├── hardware_mock/              # 硬件模拟 (Mock) 接口
+│   ├── omni_wheel_controller/      # 全向轮控制器插件
 │   ├── pymoveit2/                  # [子模块] MoveIt2 Python 接口
 │   ├── rosclaw/                    # [子模块] OpenClaw 社交控制集成
 │   ├── sim_models/                 # 仿真场景模型 (Gazebo/MuJoCo)
 │   ├── model_utils/                # 模型工具库
-│   ├── usb_cam/                    # USB 摄像头驱动
+│   ├── attention_viz/              # 注意力可视化工具
 │   ├── voice_asr_service/          # 语音识别服务
 │   └── workflows/                  # CI/CD 配置
 │
@@ -111,7 +117,7 @@ IB_Robot/                           # 主工作空间 (本仓库)
 
 - **操作系统**: 当前支持三平台协同：Ubuntu 主机负责仿真、录制服务或云侧推理；端侧开发板支持 openEuler Embedded 与 OpenHarmony
 - **ROS 版本**: ROS 2 Humble
-- **Python**: 系统原生 Python 3.11。**严禁在 Conda 激活的环境中执行，否则会导致动态库冲突。**
+- **Python**: >= 3.10，默认使用系统自带 Python。**严禁在 Conda 激活的环境中执行，否则会导致动态库冲突。**
 - **加速器**: 支持 NVIDIA GPU、Ascend 310B、Ascend 310P，若未检测到则按 CPU-only 路径运行。
 
 ### 1. 执行一键初始化
@@ -126,10 +132,6 @@ IB_Robot/                           # 主工作空间 (本仓库)
 6.  **ML 栈安装**: 自动在 `venv` 中安装 `lerobot`、硬件依赖以及适配 ROS 2 Humble 的 NumPy 1.26.x。
 7.  **环境验证**: 自动验证 `rosdepc`、`colcon`、`rclpy`、`lerobot` 与 NumPy 兼容性。
 
-### 2. 开发者 Fork 设置 (可选)
-
-脚本会询问是否设置个人 Fork 仓库。如果你是核心开发者，输入你的 AtomGit 用户名，脚本会自动建立 `origin` (你的仓库) 和 `upstream` (主仓库) 的关联。
-
 ***
 
 ## 开发工作流
@@ -139,11 +141,11 @@ IB_Robot/                           # 主工作空间 (本仓库)
 每次开启新终端后，请在 `IB_Robot` 项目根目录下加载环境：
 
 ```bash
-cd ~/IB_Robot
+cd /path/to/IB_Robot
 source .shrc_local
 ```
 
-> **注意**：`.shrc_local` 会自动完成 `venv` 激活、ROS 2 环境加载和工作区 `install/setup.zsh` 的 source。每次另起新终端都必须重新执行上述命令，否则 `ros2` 命令和 Python 包将不可用。
+> **注意**：`.shrc_local` 会自动完成 `venv` 激活、ROS 2 环境加载和工作区 `install/setup.sh` 的 source。每次另起新终端都必须重新执行上述命令，否则 `ros2` 命令和 Python 包将不可用。
 
 完成首次构建后，再额外加载工作区环境：
 ```bash
@@ -165,58 +167,16 @@ export ROS_DOMAIN_ID=<0-232之间的唯一数字>
 代码修改后，运行统一构建脚本：
 
 ```bash
-./scripts/build.sh
+./scripts/build.sh --clean
 ```
 
 *注：`build.sh` 现在只负责加载环境并执行构建；Python 环境、`lerobot` 可编辑安装与 NumPy 兼容性由 `setup.sh` 统一负责。*
 
 ***
 
-## AI Agent Skills
-
-IB-Robot 内置 AI 编程代理技能，帮助 Claude Code、Gemini CLI、OpenCode 等 AI Agent 更好地理解项目架构和开发流程。可用技能详见 [.agents/skills/README.md](.agents/skills/README.md)。
-
-### config.json 配置文件
-
-`config.json` 用于存储 AI Agent 所需的配置信息，目前主要用于 AtomGit API 集成：
-
-```json
-{
-  "atomgit": {
-    "token": "$ATOMGIT_TOKEN",
-    "owner": "openEuler",
-    "repo": "IB_Robot",
-    "baseUrl": "https://api.atomgit.com"
-  }
-}
-```
-
-**获取 AtomGit Personal Access Token**：
-
-1. 访问 <https://atomgit.com> 并登录
-2. 点击右上角头像 → 个人设置
-3. 找到「访问令牌」选项
-4. 点击「新建访问令牌」，勾选 `repo` 和 `pull_request` 权限
-5. **立即复制保存** Token（只显示一次）
-
-设置环境变量：
-
-将以下内容添加到你本地的 `~/.zshrc` 或 `~/.bashrc` 中：
-
-```bash
-export ATOMGIT_TOKEN="your_token_here"
-```
-
-### 支持的 Agent
-
-所有符合 Agent Skills 标准的客户端都会自动扫描 `.agents/skills/`：
-详见 [agentskills.io](https://agentskills.io)。
-
-***
-
 ## 运行指南
 
-所有运行入口都以 `robot_config` 包的统一入口 `robot.launch.py` 为主。下文中的“端侧开发板”统一指可运行 **openEuler Embedded** 或 **OpenHarmony** 的板端设备。
+所有运行入口都以 `robot_config` 包的统一入口 `robot.launch.py` 为主。下文中的"端侧开发板"统一指可运行 **openEuler Embedded** 或 **OpenHarmony** 的板端设备。
 
 开始任一场景前，请先完成环境加载并设置唯一的 `ROS_DOMAIN_ID`。跨机器运行时，参与的所有机器必须使用**相同的 `ROS_DOMAIN_ID`**。
 
@@ -234,14 +194,7 @@ export ROS_DOMAIN_ID=<0-232之间的唯一数字>
 | [`src/robot_moveit/README.md`](src/robot_moveit/README.md) | MoveIt Planning 控制、`/cmd_pose` 用法与 headless 启动方式 |
 | [`src/dataset_tools/README.md`](src/dataset_tools/README.md) | episodic 录制、`record_cli` 用法与 `bag_to_lerobot` 数据集转换流程 |
 
-### OpenHarmony 板端快速说明
-
-- **主机侧构建入口**：使用 `scripts/openharmony/build_ibrobot_oh_custom.sh`。脚本会自动准备 OpenHarmony 交叉编译目录，并在打包板端 runtime 时对 `lerobot` 显式应用 `series.openharmony-5.1.0-musl.txt`，确保 lazy-import 等 OpenHarmony 专用 patch 真正进入部署产物。
-- **板端 PyTorch runtime**：使用 `thirdparty_pytorch` 提供的 `test/skh-run.tar.gz`，部署到 `/data/local/skh-run`；IB_Robot 的 OpenHarmony inference 节点会在节点进程级切到这套 runtime，而不会污染 `/data/out/bin/ros2`。
-- **离线权重注意事项**：当前验证使用的 ACT policy 配置了 `resnet18` + `ResNet18_Weights.IMAGENET1K_V1`。如果板端无外网，请预置 `resnet18-f37072fd.pth` 到 `/root/.cache/torch/hub/checkpoints/`。
-- **当前验证结论**：BQ3588HM 板端已完成 CPU 推理验证；NPU 推理链路正在继续打通中。
-
-### 一、Ubuntu 仿真与控制场景
+### 一、Ubuntu 仿真场景
 
 #### 1. Ubuntu 启动仿真环境（仅仿真与控制器）
 
@@ -302,9 +255,11 @@ ros2 topic pub /cmd_pose geometry_msgs/Pose "{
 ros2 topic echo /robot_status/ee_pose
 ```
 
-#### 4. 端侧开发板启动 MoveIt Planning 控制（真机）
+### 二、真机场景
 
-这部分与 Ubuntu 上的 MoveIt 用法保持一致，只是 `use_sim` 不再开启，适合真实机械臂控制。
+#### 1. 端侧开发板启动 MoveIt Planning 控制（真机）
+
+与 Ubuntu 上的 MoveIt 用法保持一致，只是 `use_sim` 不再开启，适合真实机械臂控制。
 
 ```bash
 ros2 launch robot_config robot.launch.py \
@@ -321,7 +276,7 @@ ros2 topic pub /cmd_pose geometry_msgs/Pose "{
 }" --once
 ```
 
-### 二、分布式推理部署场景
+### 三、分布式推理部署场景
 
 以下说明采用当前分布式部署模式：机器人侧只启动 Edge 代理节点，算力侧单独启动 `cloud_inference.launch.py`。
 
@@ -370,7 +325,14 @@ ros2 topic list | grep -E 'preprocessed|inference/action'
 ros2 topic hz /inference/action
 ```
 
-### 三、数据集录制场景
+#### 3. OpenHarmony 板端作为算力侧（RK3588）
+
+- **主机侧构建入口**：使用 `scripts/openharmony/build_ibrobot_oh_custom.sh`。脚本会自动准备 OpenHarmony 交叉编译目录，并在打包板端 runtime 时对 `lerobot` 显式应用 `series.openharmony-5.1.0-musl.txt`，确保 lazy-import 等 OpenHarmony 专用 patch 真正进入部署产物。
+- **板端 PyTorch runtime**：使用 `thirdparty_pytorch` 提供的 `test/skh-run.tar.gz`，部署到 `/data/local/skh-run`；IB_Robot 的 OpenHarmony inference 节点会在节点进程级切到这套 runtime，而不会污染 `/data/out/bin/ros2`。
+- **离线权重注意事项**：当前验证使用的 ACT policy 配置了 `resnet18` + `ResNet18_Weights.IMAGENET1K_V1`。如果板端无外网，请预置 `resnet18-f37072fd.pth` 到 `/root/.cache/torch/hub/checkpoints/`。
+- **当前验证结论**：BQ3588HM 板端已完成 CPU 推理验证；NPU 推理链路正在继续打通中。
+
+### 四、数据集录制场景
 
 episodic 录制始终由两部分组成：
 
@@ -478,36 +440,49 @@ bag 目录组织、`dataset.yaml` 元信息和更多转换参数，详见 `src/d
 
 ***
 
-## 故障排除
+## AI Agent Skills
 
-### 1. 控制器残留/清理
+IB-Robot 内置 AI 编程代理技能，帮助 Claude Code、Gemini CLI、OpenCode 等 AI Agent 更好地理解项目架构和开发流程。可用技能详见 [.agents/skills/README.md](.agents/skills/README.md)。
 
-如果遇到控制器无法启动或端口占用的问题，请运行清理脚本重置 ROS 2 后台进程：
+### config.json 配置文件
 
-```bash
-./scripts/cleanup_ros.sh
+`config.json` 用于存储 AI Agent 所需的配置信息，目前主要用于 AtomGit API 集成：
+
+```json
+{
+  "atomgit": {
+    "token": "$ATOMGIT_TOKEN",
+    "owner": "openEuler",
+    "repo": "IB_Robot",
+    "baseUrl": "https://api.atomgit.com"
+  }
+}
 ```
 
-### 2. 共享内存 (SHM) 报错
+**获取 AtomGit Personal Access Token**：
 
-若出现 `RTPS_TRANSPORT_SHM Error`，请尝试清理缓存：
+1. 访问 <https://atomgit.com> 并登录
+2. 点击右上角头像 → 个人设置
+3. 找到「访问令牌」选项
+4. 点击「新建访问令牌」，勾选 `repo` 和 `pull_request` 权限
+5. **立即复制保存** Token（只显示一次）
+
+设置环境变量：
+
+将以下内容添加到你本地的 `~/.zshrc` 或 `~/.bashrc` 中：
 
 ```bash
-sudo rm -rf /dev/shm/fastrtps_*
-export ROS_LOCALHOST_ONLY=1
+export ATOMGIT_TOKEN="your_token_here"
 ```
 
-### 3. 仿真窗口无法显示
+### 支持的 Agent
 
-若启动仿真后没有出现可视化窗口（如 MuJoCo/Gazebo），请检查 `DISPLAY` 环境变量。在 Wayland 或某些远程桌面环境下，可能需要手动设置：
-
-```bash
-export DISPLAY=:1
-```
+所有符合 Agent Skills 标准的客户端都会自动扫描 `.agents/skills/`：
+详见 [agentskills.io](https://agentskills.io)。
 
 ***
 
-## 🦾 基于 OpenClaw 的社交控制与远程 AI 代理
+## 基于 OpenClaw 的社交控制与远程 AI 代理
 
 IB-Robot 深度集成 [OpenClaw](https://github.com/openclaw/openclaw) AI Agent 框架，配合 [RosClaw](https://github.com/PlaiPin/rosclaw) 桥接器，实现通过 飞书、QQ、Discord 或 Slack 以自然语言对话的方式远程控制机器人。
 
@@ -543,7 +518,7 @@ IB-Robot 深度集成 [OpenClaw](https://github.com/openclaw/openclaw) AI Agent 
 
 ### 2. 控制端配置 (OpenClaw)
 
-- OpenClaw 是机器人的“大脑”和“前端”，负责连接社交软件并调用 LLM 理解指令。
+- OpenClaw 是机器人的"大脑"和"前端"，负责连接社交软件并调用 LLM 理解指令。
 
 > **重要**：在使用 OpenClaw 控制机器人之前，必须确保 OpenClaw 侧的 `ROS_DOMAIN_ID` 与机器人端一致。否则 OpenClaw 将无法发现 ROS2 话题和服务，表现为"ros2 CLI 不可用"或无法发送控制指令。需要在会话时告知 OpenClaw 对应的 `ROS_DOMAIN_ID`。
 
@@ -581,10 +556,39 @@ IB-Robot 深度集成 [OpenClaw](https://github.com/openclaw/openclaw) AI Agent 
 
 连接成功后，你可以在网页端 (`http://localhost:18789`) 或绑定的飞书、QQ 或 Discord 中输入：
 
-- *“查看机器人当前的能力清单”* —— 获取所有传感器话题。
-- *“把机械臂恢复到初始位置”* —— AI 会根据技能文档自动将角度转换为**弧度**。
-- *“帮我看看桌子上有什么？”* —— AI 会调用 `/camera/top/image_raw` 抓拍并分析图像。
+- *"查看机器人当前的能力清单"* —— 获取所有传感器话题。
+- *"把机械臂恢复到初始位置"* —— AI 会根据技能文档自动将角度转换为**弧度**。
+- *"帮我看看桌子上有什么？"* —— AI 会调用 `/camera/top/image_raw` 抓拍并分析图像。
 - *"帮我抓取桌上的瓶子"* —— AI 将触发 IB-Robot 的 `DispatchInfer` AI 任务。
+
+***
+
+## FAQ
+
+### 1. 控制器残留/清理
+
+如果遇到控制器无法启动或端口占用的问题，请运行清理脚本重置 ROS 2 后台进程：
+
+```bash
+./scripts/cleanup_ros.sh
+```
+
+### 2. 共享内存 (SHM) 报错
+
+若出现 `RTPS_TRANSPORT_SHM Error`，请尝试清理缓存：
+
+```bash
+sudo rm -rf /dev/shm/fastrtps_*
+export ROS_LOCALHOST_ONLY=1
+```
+
+### 3. 仿真窗口无法显示
+
+若启动仿真后没有出现可视化窗口（如 MuJoCo/Gazebo），请检查 `DISPLAY` 环境变量。在 Wayland 或某些远程桌面环境下，可能需要手动设置：
+
+```bash
+export DISPLAY=:1
+```
 
 ***
 

@@ -48,10 +48,10 @@ git submodule update --init --recursive
 
 ```bash
 cd ~/Research/lerobot_ros2/src/ros2/ros2_ws
-source /opt/ros/humble/setup.zsh
+source /opt/ros/humble/setup.sh
 # 建议指定 PYTHONPATH 以确保混合编译成功
 colcon build --packages-select so101_hardware
-source install/setup.zsh
+source install/setup.sh
 ```
 
 ## 工具文档
