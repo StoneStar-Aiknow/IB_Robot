@@ -268,7 +268,7 @@ robot:
   # Simulation Configuration
   # ============================================
   simulation:
-    platform: mujoco        # "gazebo" | "mujoco"
+    platform: gazebo        # "gazebo" | "mujoco"
     scene: pick_banana      # null = 不加载场景；pick_banana = 香蕉抓取场景
     sim_models_pkg: sim_models
 
@@ -387,7 +387,7 @@ robot:
     devices:
       - name: "so101_leader"
         type: "leader_arm"
-        port: "/dev/ttyACM0"
+        port: "/dev/ttyACM1"
         calib_file: "$(env HOME)/.calibrate/so101_leader_calibrate.json"
       - name: "phone_teleop"
         type: "phone"

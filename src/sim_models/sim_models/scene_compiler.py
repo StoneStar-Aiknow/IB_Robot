@@ -43,8 +43,8 @@ _PLATFORM_EXT = {
 # Mesh asset names that require SDF-based non-convex collision.
 # MuJoCo normally convex-hulls all mesh geoms; needsdf=True enables the
 # octree SDF so the exact (non-convex) surface is used for contact.
-# The banana is C-shaped — its convex hull is a triangle wedge, which
-# makes grasping impossible.  SDF gives the real curved surface.
+# The gripper finger meshes are strongly non-convex; without SDF, MuJoCo
+# replaces them with convex hulls that distort fingertip contact.
 _SDF_MESH_NAMES: frozenset[str] = frozenset(
     {
         "wrist_roll_follower",  # fixed jaw finger

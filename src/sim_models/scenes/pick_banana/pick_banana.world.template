@@ -80,7 +80,7 @@
          The robot arm spawns at z=0 — exactly on this surface. -->
     <model name="table_surface_collision">
       <static>true</static>
-      <pose>0 0 0.002 0 0 0</pose>
+      <pose>0 0 0 0 0 0</pose>
       <link name="link">
         <collision name="collision">
           <geometry>
