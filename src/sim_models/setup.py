@@ -20,7 +20,15 @@ setup(
             "share/sim_models/scenes/pick_banana",
             glob("scenes/pick_banana/*.yaml") + glob("scenes/pick_banana/*.template"),
         ),
-        # pick_banana mesh assets (OBJ, STL, PNG textures, MTL materials)
+        # pick_banana mesh assets, grouped by role:
+        #   *.obj — MuJoCo visual meshes (banana_g.obj with PBR material via
+        #           material.mtl; other *.obj files are alternative mesh variants)
+        #   *.stl — CoACD convex-decomposition collision hulls (banana_col_*.stl,
+        #           plate_col_*.stl) plus banana_g.stl Gazebo visual mesh
+        #           (STL avoids OGRE2 GL3Plus buffer double-lock under software
+        #           rendering) and plate_collision.stl
+        #   *.png — PBR texture maps (basecolor, normal, metallic/roughness)
+        #   *.mtl — OBJ material definitions referencing the PNG textures
         (
             "share/sim_models/scenes/pick_banana/meshes",
             glob("scenes/pick_banana/meshes/*.obj")

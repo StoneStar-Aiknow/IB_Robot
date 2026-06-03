@@ -27,6 +27,7 @@ Public API
       omit it for a standalone scene file (MuJoCo Viewer testing).
 """
 
+import logging
 from pathlib import Path
 
 import yaml
@@ -143,15 +144,18 @@ def get_mujoco_scene_path(scene_name: str, robot_xml_path: str = "") -> Path:
     except ImportError:
         return xml_out
 
-    spec = mujoco.MjSpec.from_string(content)
-    for mesh in spec.meshes:
-        if mesh.name in _SDF_MESH_NAMES:
-            mesh.needsdf = True
-
-    model = spec.compile()
-    mjb_out = Path(f"/tmp/sim_models_{scene_name}.mjb")
-    mujoco.mj_saveModel(model, str(mjb_out))
-    return mjb_out
+    try:
+        spec = mujoco.MjSpec.from_string(content)
+        for mesh in spec.meshes:
+            if mesh.name in _SDF_MESH_NAMES:
+                mesh.needsdf = True
+        model = spec.compile()
+        mjb_out = Path(f"/tmp/sim_models_{scene_name}.mjb")
+        mujoco.mj_saveModel(model, str(mjb_out))
+        return mjb_out
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("MuJoCo compile failed, falling back to XML: %s", exc)
+        return xml_out
 
 
 def get_scene_layout(scene_name: str) -> dict:

@@ -252,6 +252,12 @@
         </collision>
         <visual name="visual">
           <geometry>
+            <!-- STL is used here instead of OBJ to avoid an OGRE2 GL3Plus
+                 buffer double-lock assertion that occurs under software
+                 rendering (llvmpipe / Mesa) when loading OBJ+MTL assets.
+                 The Y-axis flip (scale 1 -1 1) compensates for the STL
+                 coordinate convention so the visual aligns with the
+                 collision geometry. -->
             <mesh>
               <uri>file://{{MESHES_DIR}}/banana_g.stl</uri>
               <scale>1 -1 1</scale>

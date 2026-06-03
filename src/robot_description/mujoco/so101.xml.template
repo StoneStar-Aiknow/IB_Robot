@@ -167,8 +167,9 @@
           mass="0.100006"
           fullinertia="8.3759e-05 8.10403e-05 2.39783e-05 7.55525e-08 -1.16342e-06 1.54663e-07" />
 
-
-
+        <!-- No collision geom for shoulder: joints 1-4 rely on joint limits and
+             damping for self-collision avoidance. In pick-and-place scenes the
+             arm should not contact objects; re-add box proxies here if needed. -->
         <geom class="visual" type="mesh" mesh="sts3215"     rgba="0.1 0.1 0.1 1"
               pos="-0.0303992 0.000422241 -0.0417" euler="1.5708 1.5708 0" />
         <geom class="visual" type="mesh" mesh="motor_holder_base"
@@ -191,8 +192,7 @@
             mass="0.103"
             fullinertia="4.08002e-05 0.000147318 0.000142487 -1.97819e-05 -4.03016e-08 8.97326e-09" />
 
-
-
+          <!-- No collision geom for upper_arm: see shoulder comment above. -->
           <geom class="visual" type="mesh" mesh="sts3215"     rgba="0.1 0.1 0.1 1"
                 pos="-0.11257 -0.0155 0.0187" euler="-3.14159 0 -1.5708" />
           <geom class="visual" type="mesh" mesh="upper_arm_mesh"
@@ -213,8 +213,7 @@
               mass="0.104"
               fullinertia="2.87438e-05 0.000159844 0.00014529 7.41152e-06 1.26409e-06 -4.90188e-08" />
 
-
-
+            <!-- No collision geom for lower_arm: see shoulder comment above. -->
             <geom class="visual" type="mesh" mesh="under_arm_mesh"
                   pos="-0.0648499 -0.032 0.0182" euler="-3.14159 0 0" />
             <geom class="visual" type="mesh" mesh="motor_holder_wrist"
@@ -237,8 +236,7 @@
                 mass="0.079"
                 fullinertia="3.68263e-05 2.5391e-05 2.1e-05 1.7893e-08 -5.28128e-08 3.6412e-06" />
 
-
-
+              <!-- No collision geom for wrist: see shoulder comment above. -->
               <geom class="visual" type="mesh" mesh="sts3215_no_horn" rgba="0.1 0.1 0.1 1"
                     pos="0 -0.0424 0.0306" euler="1.5708 1.5708 0" />
               <geom class="visual" type="mesh" mesh="wrist_roll_pitch"
