@@ -40,9 +40,11 @@
       Keeps solref timeconst / timestep ≥ 10× (0.010/0.001), safely above the
       ≥4× stability floor.  Controller still runs at 50 Hz (every 20 physics steps).
 
-    noslip_iterations="5": five Newton-smoothing passes on no-slip constraints.
+    noslip_iterations="20": twenty Newton-smoothing passes on no-slip constraints.
       Prevents micro-slip between gripper faces and grasped objects from
       accumulating into macroscopic sliding / ejection.
+      Higher count (was 5) needed so gripper-banana no-slip converges even when
+      the arm receives a simultaneous contact impulse from the table or plate.
 
     cone="elliptic": exact elliptic friction cone for condim=4 contacts.
       The default pyramidal cone over-approximates friction in the diagonal
@@ -50,7 +52,7 @@
       (condim=4 adds one torsional DOF).  Elliptic cone eliminates this.
   -->
   <option gravity="0 0 -9.81" integrator="implicitfast"
-          timestep="0.001" noslip_iterations="5" cone="elliptic">
+          timestep="0.001" noslip_iterations="20" cone="elliptic">
     <flag contact="enable" />
   </option>
 
@@ -71,7 +73,25 @@
     <mesh name="sts3215_no_horn"    file="sts3215_03a_no_horn_v1.stl"      />
     <mesh name="wrist_roll_pitch"   file="wrist_roll_pitch_so101_v2.stl"   />
     <mesh name="wrist_roll_follower" file="wrist_roll_follower_so101_v1.stl" />
+    <!-- CoACD decomposition of wrist_roll_follower (8 convex pieces) -->
+    <mesh name="wrist_roll_follower_col_0" file="wrist_roll_follower_col_0.stl" />
+    <mesh name="wrist_roll_follower_col_1" file="wrist_roll_follower_col_1.stl" />
+    <mesh name="wrist_roll_follower_col_2" file="wrist_roll_follower_col_2.stl" />
+    <mesh name="wrist_roll_follower_col_3" file="wrist_roll_follower_col_3.stl" />
+    <mesh name="wrist_roll_follower_col_4" file="wrist_roll_follower_col_4.stl" />
+    <mesh name="wrist_roll_follower_col_5" file="wrist_roll_follower_col_5.stl" />
+    <mesh name="wrist_roll_follower_col_6" file="wrist_roll_follower_col_6.stl" />
+    <mesh name="wrist_roll_follower_col_7" file="wrist_roll_follower_col_7.stl" />
     <mesh name="moving_jaw"         file="moving_jaw_so101_v1.stl"         />
+    <!-- CoACD decomposition of moving_jaw (8 convex pieces) -->
+    <mesh name="moving_jaw_col_0" file="moving_jaw_col_0.stl" />
+    <mesh name="moving_jaw_col_1" file="moving_jaw_col_1.stl" />
+    <mesh name="moving_jaw_col_2" file="moving_jaw_col_2.stl" />
+    <mesh name="moving_jaw_col_3" file="moving_jaw_col_3.stl" />
+    <mesh name="moving_jaw_col_4" file="moving_jaw_col_4.stl" />
+    <mesh name="moving_jaw_col_5" file="moving_jaw_col_5.stl" />
+    <mesh name="moving_jaw_col_6" file="moving_jaw_col_6.stl" />
+    <mesh name="moving_jaw_col_7" file="moving_jaw_col_7.stl" />
   </asset>
 
   <!-- ================================================================
@@ -85,6 +105,17 @@
     </default>
     <default class="collision">
       <geom contype="1" conaffinity="1" group="0" rgba="0 0 0 0" />
+      <!--
+        gripper_col: contact parameters for fixed jaw (wrist_roll_follower) and
+        moving jaw (moving_jaw) CoACD mesh pieces — 16 geoms total.
+        Change friction here to tune all of them at once.
+        friction="F 1.0 0.05": F=sliding (↑ = more grip), 1.0=torsional, 0.05=rolling.
+        Effective banana-gripper friction = min(gripper_F, banana_F).
+      -->
+      <default class="gripper_col">
+        <geom friction="10.0 1.0 0.05" condim="4"
+              solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
+      </default>
     </default>
   </default>
 
@@ -130,15 +161,15 @@
       <body name="shoulder" pos="0.0207909 -0.0230745 0.0948817"
             euler="-3.14159 0 1.5708">
         <joint name="1" type="hinge" axis="0 0 1"
-               range="-2.0693 2.0709" damping="0.5" />
+               range="-2.0693 2.0709" damping="1.5" armature="0.005"/>
         <inertial
           pos="-0.0307604 -1.66727e-05 -0.0252713"
           mass="0.100006"
           fullinertia="8.3759e-05 8.10403e-05 2.39783e-05 7.55525e-08 -1.16342e-06 1.54663e-07" />
 
-        <geom class="collision" type="box" size="0.04 0.025 0.055"
-              pos="-0.03 0 0" />
-
+        <!-- No collision geom for shoulder: joints 1-4 rely on joint limits and
+             damping for self-collision avoidance. In pick-and-place scenes the
+             arm should not contact objects; re-add box proxies here if needed. -->
         <geom class="visual" type="mesh" mesh="sts3215"     rgba="0.1 0.1 0.1 1"
               pos="-0.0303992 0.000422241 -0.0417" euler="1.5708 1.5708 0" />
         <geom class="visual" type="mesh" mesh="motor_holder_base"
@@ -155,15 +186,13 @@
         <body name="upper_arm" pos="-0.0303992 -0.0182778 -0.0542"
               euler="-1.5708 -1.5708 0">
           <joint name="2" type="hinge" axis="0 0 1"
-                 range="-1.92 1.92" damping="0.5" />
+                 range="-1.92 1.92" damping="1.5" armature="0.005"/>
           <inertial
             pos="-0.0898471 -0.00838224 0.0184089"
             mass="0.103"
             fullinertia="4.08002e-05 0.000147318 0.000142487 -1.97819e-05 -4.03016e-08 8.97326e-09" />
 
-          <geom class="collision" type="box" size="0.06 0.025 0.025"
-                pos="-0.06 0 0.018" />
-
+          <!-- No collision geom for upper_arm: see shoulder comment above. -->
           <geom class="visual" type="mesh" mesh="sts3215"     rgba="0.1 0.1 0.1 1"
                 pos="-0.11257 -0.0155 0.0187" euler="-3.14159 0 -1.5708" />
           <geom class="visual" type="mesh" mesh="upper_arm_mesh"
@@ -178,15 +207,13 @@
           <body name="lower_arm" pos="-0.11257 -0.028 0"
                 euler="0 0 1.5708">
             <joint name="3" type="hinge" axis="0 0 1"
-                   range="-1.6813 1.6828" damping="0.5" />
+                   range="-1.6813 1.6828" damping="1.5" armature="0.005"/>
             <inertial
               pos="-0.0980701 0.00324376 0.0182831"
               mass="0.104"
               fullinertia="2.87438e-05 0.000159844 0.00014529 7.41152e-06 1.26409e-06 -4.90188e-08" />
 
-            <geom class="collision" type="box" size="0.065 0.025 0.025"
-                  pos="-0.065 0 0.018" />
-
+            <!-- No collision geom for lower_arm: see shoulder comment above. -->
             <geom class="visual" type="mesh" mesh="under_arm_mesh"
                   pos="-0.0648499 -0.032 0.0182" euler="-3.14159 0 0" />
             <geom class="visual" type="mesh" mesh="motor_holder_wrist"
@@ -203,15 +230,13 @@
             <body name="wrist" pos="-0.1349 0.0052 0"
                   euler="0 0 -1.5708">
               <joint name="4" type="hinge" axis="0 0 1"
-                     range="-1.65806 1.65806" damping="0.5" />
+                     range="-1.65806 1.65806" damping="1.5" armature="0.005"/>
               <inertial
                 pos="-0.000103312 -0.0386143 0.0281156"
                 mass="0.079"
                 fullinertia="3.68263e-05 2.5391e-05 2.1e-05 1.7893e-08 -5.28128e-08 3.6412e-06" />
 
-              <geom class="collision" type="box" size="0.025 0.045 0.03"
-                    pos="0 -0.04 0.028" />
-
+              <!-- No collision geom for wrist: see shoulder comment above. -->
               <geom class="visual" type="mesh" mesh="sts3215_no_horn" rgba="0.1 0.1 0.1 1"
                     pos="0 -0.0424 0.0306" euler="1.5708 1.5708 0" />
               <geom class="visual" type="mesh" mesh="wrist_roll_pitch"
@@ -226,45 +251,23 @@
               <body name="gripper" pos="0 -0.0611 0.0181"
                     euler="1.5708 0 3.14159">
                 <joint name="5" type="hinge" axis="0 0 1"
-                       range="-2.9115 2.9115" damping="0.5" />
+                       range="-2.9115 2.9115" damping="1.5" armature="0.005"/>
                 <inertial
                   pos="0.000213627 0.000245138 -0.025187"
                   mass="0.087"
                   fullinertia="2.75087e-05 4.33657e-05 3.45059e-05 -3.35241e-07 -5.7352e-06 -5.17847e-08" />
 
-                <!--
-                  Gripper body collision proxies (three geoms):
-
-                  1. Motor housing box — STS3215 servo chassis.
-                     Covers X[-0.020,+0.020] Y[-0.020,+0.020] Z[-0.065,+0.015].
-
-                  2. Fixed jaw finger — wrist_roll_follower finger region.
-                     STL analysis (Rx180 + offset → gripper frame):
-                       Z[-0.085,-0.065]: X[-0.027,-0.010]
-                       Z[-0.105,-0.085]: X[-0.020,-0.008]
-                     Finger tip at Z≈-0.105 (old single box only reached Z=-0.065).
-                     Box: X[-0.036,-0.008] Y[-0.011,+0.011] Z[-0.106,-0.020]
-
-                  3. Palm back-plate — the large wrist_roll_follower body plate.
-                     STL analysis: 54,418 vertices at Y[+0.020,+0.101] Z[-0.065,+0.015]
-                     with NO prior collision coverage (穿模 primary cause).
-                     Without this geom the banana has no physics boundary to stop it
-                     from visually entering the gripper palm during arm approach or
-                     wrist-roll orientations that face the palm toward the object.
-                     Box: X[-0.024,+0.028] Y[+0.021,+0.101] Z[-0.065,+0.015]
-                       center: (0.002, 0.061, -0.025)  half-size: (0.026, 0.040, 0.040)
-                -->
-                <geom class="collision" type="box" size="0.02 0.02 0.04"
-                      pos="0 0 -0.025"
-                      friction="2.0 0.5 0.05" condim="4"
-                      solimp="0.9 0.95 0.002 0.5 2" solref="0.010 1"/>
-                <geom class="collision" type="box" size="0.014 0.011 0.043"
-                      pos="-0.022 0 -0.063"
-                      friction="2.0 0.5 0.05" condim="4"
-                      solimp="0.9 0.95 0.002 0.5 2" solref="0.010 1"/>
-                <geom class="collision" type="box" size="0.026 0.040 0.040"
-                      pos="0.002 0.061 -0.025"/>
-
+                <!-- Only finger mesh collisions — no arm boxes -->
+                <!-- Fixed jaw: CoACD 8-piece convex decomposition of wrist_roll_follower.
+                     Same pos/euler as visual geom. -->
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_0" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"/>
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_1" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"/>
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_2" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"/>
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_3" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"/>
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_4" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"/>
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_5" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"/>
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_6" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"/>
+                <geom class="gripper_col" type="mesh" mesh="wrist_roll_follower_col_7" pos="0 -0.000218214 0.000949706" euler="-3.14159 0 0"/>
                 <geom class="visual" type="mesh" mesh="sts3215"     rgba="0.1 0.1 0.1 1"
                       pos="0.0077 0.0001 -0.0234" euler="-1.5708 0 0" />
                 <geom class="visual" type="mesh" mesh="wrist_roll_follower"
@@ -282,26 +285,23 @@
                 <body name="jaw" pos="0.0202 0.0188 -0.0234"
                       euler="1.5708 0 0">
                   <joint name="6" type="hinge" axis="0 0 1"
-                         range="0.0 1.0" damping="0.3" />
+                         range="0.0 1.0" damping="1.5"
+                         armature="0.028" frictionloss="0.052" />
                   <inertial
                     pos="-0.00157495 -0.0300244 0.0192755"
                     mass="0.012"
                     fullinertia="6.61427e-06 1.89032e-06 5.28738e-06 -3.19807e-07 -5.90717e-09 -1.09945e-07" />
 
-                  <!--
-                    Moving jaw finger — full-coverage collision box.
-                    STL analysis: jaw_local Y[-0.082,+0.010] Z[-0.024,+0.024]
-                    Old box (size 0.015 0.030 0.020 at pos 0 -0.030 0.019) only reached
-                    jaw_local Y=-0.060 → gripper Z=-0.083; tip at Y=-0.082 → Z=-0.105
-                    was completely uncovered (2.2 cm gap).
-                    New box: jaw_local Y[-0.082,+0.010] fully covered.
-                      center: (0, -0.036, 0.019)  half-size: (0.012, 0.046, 0.021)
-                    In gripper frame: X[0.008,0.032] Y[-0.021,+0.021] Z[-0.105,-0.013] ✓
-                  -->
-                  <geom class="collision" type="box" size="0.012 0.046 0.021"
-                        pos="0 -0.036 0.019"
-                        friction="2.0 0.5 0.05" condim="4"
-                        solimp="0.9 0.95 0.002 0.5 2" solref="0.010 1"/>
+                  <!-- Moving jaw: CoACD 8-piece convex decomposition.
+                       Same pos/euler as visual geom. -->
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_0" pos="0 0 0.0189" euler="0 0 0"/>
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_1" pos="0 0 0.0189" euler="0 0 0"/>
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_2" pos="0 0 0.0189" euler="0 0 0"/>
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_3" pos="0 0 0.0189" euler="0 0 0"/>
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_4" pos="0 0 0.0189" euler="0 0 0"/>
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_5" pos="0 0 0.0189" euler="0 0 0"/>
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_6" pos="0 0 0.0189" euler="0 0 0"/>
+                  <geom class="gripper_col" type="mesh" mesh="moving_jaw_col_7" pos="0 0 0.0189" euler="0 0 0"/>
 
                   <geom class="visual" type="mesh" mesh="moving_jaw"
                         pos="0 0 0.0189" euler="0 0 0" />
@@ -327,14 +327,16 @@
 
   <!-- Position actuators for ros2_control MujocoSystemInterface.
        Actuator names match joint names so get_actuator_id() resolves them.
-       kp controls position stiffness; dampratio=1 gives critical damping. -->
+       Joints 1-5: kp + dampratio=1.0 (MuJoCo auto-computes critical kv each timestep).
+       Joint 6 (gripper): kp + explicit kv; armature is nonzero so kv is fixed and
+       well-defined regardless of timestep. -->
   <actuator>
-    <position name="1" joint="1" kp="500" dampratio="1.0" ctrlrange="-2.0693 2.0709"/>
-    <position name="2" joint="2" kp="500" dampratio="1.0" ctrlrange="-1.92 1.92"/>
-    <position name="3" joint="3" kp="500" dampratio="1.0" ctrlrange="-1.6813 1.6828"/>
-    <position name="4" joint="4" kp="500" dampratio="1.0" ctrlrange="-1.65806 1.65806"/>
-    <position name="5" joint="5" kp="500" dampratio="1.0" ctrlrange="-2.9115 2.9115"/>
-    <position name="6" joint="6" kp="200" dampratio="1.0" ctrlrange="0.0 1.0"/>
+    <position name="1" joint="1" kp="998.22" dampratio="1.0" ctrlrange="-2.0693 2.0709" forcerange="-2.75 2.75"/>
+    <position name="2" joint="2" kp="998.22" dampratio="1.0" ctrlrange="-1.92 1.92" forcerange="-2.75 2.75"/>
+    <position name="3" joint="3" kp="998.22" dampratio="1.0" ctrlrange="-1.6813 1.6828" forcerange="-2.75 2.75"/>
+    <position name="4" joint="4" kp="998.22" dampratio="1.0" ctrlrange="-1.65806 1.65806" forcerange="-2.75 2.75"/>
+    <position name="5" joint="5" kp="998.22" dampratio="1.0" ctrlrange="-2.9115 2.9115" forcerange="-2.75 2.75"/>
+    <position name="6" joint="6" kp="748.66" kv="5.5" ctrlrange="0.0 1.0" forcerange="-2.75 2.75"/>
   </actuator>
 
 </mujoco>

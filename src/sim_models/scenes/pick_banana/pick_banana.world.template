@@ -80,6 +80,7 @@
          The robot arm spawns at z=0 — exactly on this surface. -->
     <model name="table_surface_collision">
       <static>true</static>
+      <pose>0 0 0 0 0 0</pose>
       <link name="link">
         <collision name="collision">
           <geometry>
@@ -159,12 +160,11 @@
           </inertia>
         </inertial>
         <collision name="collision">
-          <pose>0 -0.009 0 -1.5708 0 0</pose>
           <geometry>
-            <cylinder>
-              <radius>0.1</radius>
-              <length>0.012</length>
-            </cylinder>
+            <mesh>
+              <uri>file://{{MESHES_DIR}}/plate_collision.stl</uri>
+              <scale>1 1 1</scale>
+            </mesh>
           </geometry>
           <surface>
             <friction>
@@ -179,7 +179,7 @@
           <geometry>
             <mesh>
               <uri>file://{{MESHES_DIR}}/plate.obj</uri>
-              <scale>0.08 0.08 0.08</scale>
+              <scale>0.09539 0.09539 0.09539</scale>
             </mesh>
           </geometry>
           <material>
@@ -192,39 +192,75 @@
     </model>
 
     <!-- Banana: dynamic (grasping target).
-         Collision: box approximating the banana shape at scale=0.012.
-         Inertia: uniform box m=0.1 kg, ~0.15×0.04×0.04 m (post-scale). -->
+         Collision: 4 convex STL parts from CoACD decomposition (same as MuJoCo).
+         STL files have per-face normals so DART/ODE loads them without segfault.
+         Inertia: uniform box m=0.03 kg, BBox=0.175x0.096x0.035 m. -->
     <model name="banana">
-      <pose>0.0 0.02 0.075 1.5708 0 0</pose>
+      <pose>0.0 0.02 0.05 0 0 0</pose>
       <link name="link">
         <inertial>
-          <mass>0.1</mass>
+          <mass>0.03</mass>
           <inertia>
-            <ixx>2.3e-5</ixx><ixy>0</ixy><ixz>0</ixz>
-            <iyy>2.0e-4</iyy><iyz>0</iyz>
-            <izz>2.0e-4</izz>
+            <ixx>2.616e-5</ixx><ixy>0</ixy><ixz>0</ixz>
+            <iyy>7.959e-5</iyy><iyz>0</iyz>
+            <izz>9.970e-5</izz>
           </inertia>
         </inertial>
-        <collision name="collision">
+        <collision name="collision_0">
           <geometry>
-            <box>
-              <size>0.15 0.04 0.04</size>
-            </box>
+            <mesh>
+              <uri>file://{{MESHES_DIR}}/banana_col_0.stl</uri>
+              <scale>1 1 1</scale>
+            </mesh>
           </geometry>
           <surface>
-            <friction>
-              <ode>
-                <mu>3.0</mu>
-                <mu2>3.0</mu2>
-              </ode>
-            </friction>
+            <friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode></friction>
+          </surface>
+        </collision>
+        <collision name="collision_1">
+          <geometry>
+            <mesh>
+              <uri>file://{{MESHES_DIR}}/banana_col_1.stl</uri>
+              <scale>1 1 1</scale>
+            </mesh>
+          </geometry>
+          <surface>
+            <friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode></friction>
+          </surface>
+        </collision>
+        <collision name="collision_2">
+          <geometry>
+            <mesh>
+              <uri>file://{{MESHES_DIR}}/banana_col_2.stl</uri>
+              <scale>1 1 1</scale>
+            </mesh>
+          </geometry>
+          <surface>
+            <friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode></friction>
+          </surface>
+        </collision>
+        <collision name="collision_3">
+          <geometry>
+            <mesh>
+              <uri>file://{{MESHES_DIR}}/banana_col_3.stl</uri>
+              <scale>1 1 1</scale>
+            </mesh>
+          </geometry>
+          <surface>
+            <friction><ode><mu>3.0</mu><mu2>3.0</mu2></ode></friction>
           </surface>
         </collision>
         <visual name="visual">
           <geometry>
+            <!-- STL is used here instead of OBJ to avoid an OGRE2 GL3Plus
+                 buffer double-lock assertion that occurs under software
+                 rendering (llvmpipe / Mesa) when loading OBJ+MTL assets.
+                 The Y-axis flip (scale 1 -1 1) compensates for the STL
+                 coordinate convention so the visual aligns with the
+                 collision geometry. -->
             <mesh>
-              <uri>file://{{MESHES_DIR}}/banana.obj</uri>
-              <scale>0.012 0.012 0.012</scale>
+              <uri>file://{{MESHES_DIR}}/banana_g.stl</uri>
+              <scale>1 -1 1</scale>
             </mesh>
           </geometry>
           <material>
