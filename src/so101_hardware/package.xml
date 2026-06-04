@@ -17,6 +17,7 @@
   <depend>pluginlib</depend>
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>
+  <depend>ibrobot_msgs</depend>
   <depend>nlohmann-json-dev</depend>
 
   <!-- Python dependencies -->

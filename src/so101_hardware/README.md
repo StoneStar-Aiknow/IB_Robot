@@ -14,6 +14,7 @@ SO-101 机械臂的硬件驱动包，提供高性能 C++ ros2_control 接口和 
 - **混合构建**：采用 ament_cmake_python 支持 C++ 插件和 Python 脚本的混合安装。
 - **启动位置保护**：支持配置 `reset_positions`，防止机械臂在启动时因回零产生剧烈跳动（对机器狗背负式机械臂尤为重要）。
 - **生命周期管理**：支持标准的 `on_configure`, `on_activate`, `on_deactivate` 生命周期。
+- **电流反馈**：C++ 插件和 Python 桥接脚本会按 STS3215 `1 LSB = 6.5mA` 把 Feetech `Present_Current` 转为安培，并通过 `/so101_follower/joint_currents` 或 `/so101_leader/joint_currents` 发布 `ibrobot_msgs/msg/JointCurrent`，供数据集转换生成 `observation.current`。
 - **安全保障**：在节点关闭时自动卸载舵机力矩（Torque Off）。
 
 ## 架构

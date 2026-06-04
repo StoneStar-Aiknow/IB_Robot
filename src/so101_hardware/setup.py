@@ -11,7 +11,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ],
-    install_requires=['setuptools', 'rclpy', 'sensor_msgs', 'pyserial', 'feetech-servo-sdk'],
+    install_requires=['setuptools', 'rclpy', 'sensor_msgs', 'ibrobot_msgs', 'pyserial', 'feetech-servo-sdk'],
     zip_safe=True,
     maintainer='xqw',
     maintainer_email='wuxiaoqiang.rtos@huawei.com',

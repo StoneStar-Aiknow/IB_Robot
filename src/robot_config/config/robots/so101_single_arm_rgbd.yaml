@@ -215,6 +215,19 @@ robot:
           history: keep_last
           depth: 50
 
+      - key: observation.current
+        topic: /so101_follower/joint_currents
+        type: ibrobot_msgs/msg/JointCurrent
+        selector: { names: ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"] }
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 50
+
     actions:
       # Arm joints (1-5) - uses same key "action" for consolidation
       - key: action

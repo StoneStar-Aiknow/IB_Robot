@@ -14,6 +14,7 @@ This package provides a complete hardware driver solution for the SO-101 robotic
 - **Mixed Package Build**: Uses `ament_cmake_python` to support both C++ plugins and Python scripts in a single package.
 - **Startup Position Protection**: Supports `reset_positions` to prevent the arm from jumping to zero on startup (critical for mobile platforms).
 - **Lifecycle Management**: Implements standard `on_init`, `on_configure`, `on_activate`, and `on_deactivate` states.
+- **Current Feedback**: Converts Feetech `Present_Current` to amperes with STS3215 `1 LSB = 6.5mA` and publishes `ibrobot_msgs/msg/JointCurrent` on `/so101_follower/joint_currents` or `/so101_leader/joint_currents` for `observation.current` dataset export.
 - **Safety**: Automatically disables motor torque on node shutdown.
 
 ## Architecture

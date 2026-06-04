@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import rclpy
+from ibrobot_msgs.msg import JointCurrent
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from sensor_msgs.msg import JointState
@@ -7,6 +8,7 @@ from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
 from lerobot.motors import Motor, MotorNormMode, MotorCalibration
 from so101_hardware.calibration.interactive import load_calibration
 from so101_hardware.calibration.constants import LEADER_CALIB_FILE, DEFAULT_SERIAL_PORT, JOINT_NAMES
+from so101_hardware.motor_current import read_motor_currents
 import time
 import math
 import pathlib
@@ -33,6 +35,11 @@ class LeaderArmPublisher(Node):
         self.leader_state_pub = self.create_publisher(
             JointState,
             '/so101_leader/joint_states',
+            10
+        )
+        self.leader_current_pub = self.create_publisher(
+            JointCurrent,
+            '/so101_leader/joint_currents',
             10
         )
 
@@ -168,6 +175,13 @@ class LeaderArmPublisher(Node):
                 self.get_logger().warn(f"读取数据不全: {raw_positions}", throttle_duration_sec=5.0)
                 return
 
+            currents = read_motor_currents(
+                self.bus_,
+                self.joint_names,
+                self.get_logger(),
+                "读取电流失败",
+            )
+
             positions_rad = []
             for n in self.joint_names:
                 raw = raw_positions.get(n, 0)
@@ -192,6 +206,12 @@ class LeaderArmPublisher(Node):
             joint_state_msg.position = positions_rad
 
             self.leader_state_pub.publish(joint_state_msg)
+
+            current_msg = JointCurrent()
+            current_msg.header.stamp = joint_state_msg.header.stamp
+            current_msg.name = list(self.joint_names)
+            current_msg.current = [currents.get(name, 0.0) for name in self.joint_names]
+            self.leader_current_pub.publish(current_msg)
 
         except (IOError, OSError, ConnectionError) as e:
             # 捕获已知通讯异常并退出

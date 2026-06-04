@@ -167,3 +167,24 @@ def test_image_source_override_applied():
     top = next(o for o in plan.observations if o.topic == "/camera/top/image_raw")
     assert top.image.kind == "solid"
     assert top.image.color_rgb == (255, 0, 0)
+
+
+def test_build_plan_accepts_joint_current():
+    robot = _base_robot()
+    robot["contract"]["observations"].append(
+        {
+            "key": "observation.current",
+            "topic": "/joint_currents",
+            "type": "ibrobot_msgs/msg/JointCurrent",
+            "selector": {"names": ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"]},
+            "align": {"tol_ms": 1500},
+            "qos": {"reliability": "best_effort", "depth": 50},
+        }
+    )
+    plan = build_plan(robot)
+
+    jc_obs = [o for o in plan.observations if o.kind == "joint_current"]
+    assert len(jc_obs) == 1
+    assert jc_obs[0].topic == "/joint_currents"
+    assert jc_obs[0].msg_type == "ibrobot_msgs/msg/JointCurrent"
+    assert jc_obs[0].joint_names == ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"]

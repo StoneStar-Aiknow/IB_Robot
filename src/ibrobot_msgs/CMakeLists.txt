@@ -27,6 +27,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SceneAnalysisRequest.msg"
   "msg/SceneAnalysisResult.msg"
   "msg/AttentionWeights.msg"
+  "msg/JointCurrent.msg"
   "action/RecordEpisode.action"
   "action/RunPolicy.action"
   "action/DispatchInfer.action"
