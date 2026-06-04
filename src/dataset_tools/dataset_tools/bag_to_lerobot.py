@@ -75,6 +75,7 @@ Notes
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -256,6 +257,36 @@ def _rad_to_lerobot(values: np.ndarray, table: List[Tuple[float, float, float, f
             break
         out[i] = (arr[i] - rad_min) / (rad_max - rad_min) * span + offset
     return out
+
+
+def _clean_float_array(
+    values: Any,
+    dtype: Any = np.float32,
+    *,
+    feature_name: str = "",
+) -> np.ndarray:
+    """Convert a flat numeric vector and replace non-finite values with zeros.
+
+    When non-finite values are detected, a warning is logged for features
+    other than ``observation.current`` (where NaN indicates expected missing
+    data from older recordings).
+    """
+    arr = np.asarray(values, dtype=dtype).reshape(-1)
+    mask = ~np.isfinite(arr)
+    if mask.any():
+        if feature_name and feature_name != "observation.current":
+            logging.warning(
+                f"{feature_name}: {int(mask.sum())}/{len(arr)} values "
+                f"are non-finite (NaN/Inf), replaced with 0.0. "
+                f"This usually indicates a joint-name mismatch."
+            )
+        arr[mask] = 0.0
+    return arr
+
+
+def _dataset_feature_names_for_spec(spec: Any) -> List[str]:
+    """Return metadata names for a decoded contract spec."""
+    return [str(name) for name in getattr(spec, "names", [])]
 
 
 def _topic_type_map(reader: rosbag2_py.SequentialReader) -> Dict[str, str]:
@@ -570,6 +601,8 @@ def export_bags_to_lerobot(
                 # Update the shape to reflect 3 channels
                 ft["shape"] = list(ft["shape"])
                 ft["shape"][-1] = 3
+            if k == "observation.current":
+                ft["names"] = _dataset_feature_names_for_spec(sv)
             features[k] = ft
         if is_img and primary_image_key is None:
             primary_image_key = sv.key
@@ -859,7 +892,7 @@ def export_bags_to_lerobot(
                     unique_key = f"{sv.key}_{topic_suffix}" if topic_suffix else sv.key
                     stream_val = resampled.get(unique_key, [None] * n_ticks)[i]
                     if stream_val is not None:
-                        val_array = np.asarray(stream_val, dtype=np.float32).reshape(-1)
+                        val_array = _clean_float_array(stream_val, np.float32, feature_name="observation.state")
                         state_values.append(val_array)
 
                 if state_values:
@@ -891,7 +924,7 @@ def export_bags_to_lerobot(
                         unique_key = f"{sv.key}_{topic_suffix}" if topic_suffix else sv.key
                         stream_val = resampled.get(unique_key, [None] * n_ticks)[i]
                         if stream_val is not None:
-                            val_array = np.asarray(stream_val, dtype=np.float32).reshape(-1)
+                            val_array = _clean_float_array(stream_val, np.float32, feature_name=action_key)
                             action_values.append(val_array)
 
                     if action_values:
@@ -943,7 +976,7 @@ def export_bags_to_lerobot(
 
                 elif dtype in ("float32", "float64"):
                     tgt_dt = np.float32 if dtype == "float32" else np.float64
-                    arr = np.asarray(val, dtype=tgt_dt).reshape(-1)
+                    arr = _clean_float_array(val, tgt_dt, feature_name=name)
                     exp = int(ft["shape"][0])
                     if arr.shape[0] != exp:
                         fixed = np.zeros((exp,), dtype=tgt_dt)

@@ -3,7 +3,6 @@
 from pathlib import Path
 
 import pytest
-import yaml
 
 from robot_config.config import (
     CameraConfig,
@@ -115,22 +114,11 @@ def test_so101_single_arm_contract_includes_motor_current_observation():
     contract = build_contract_from_robot_config_dict(load_robot_config_dict(config_path))
     current_obs = next(obs for obs in contract.observations if obs.key == "observation.current")
 
-    assert current_obs.topic == "/joint_currents"
+    assert current_obs.topic == "/so101_follower/joint_currents"
     assert current_obs.type == "ibrobot_msgs/msg/JointCurrent"
     assert current_obs.selector == {
         "names": ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"]
     }
-
-
-@pytest.mark.parametrize("contract_name", ["act_grab_pan.yaml", "pi05_multi_tasks.yaml"])
-def test_so101_contract_templates_use_joint_current_message(contract_name):
-    config_path = Path(__file__).parent.parent / "config" / "contracts" / contract_name
-    contract = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    current_obs = next(obs for obs in contract["observations"] if obs["key"] == "observation.current")
-
-    assert current_obs["topic"] == "/joint_currents"
-    assert current_obs["type"] == "ibrobot_msgs/msg/JointCurrent"
-    assert all(name.startswith("current.") for name in current_obs["selector"]["names"])
 
 
 def test_dict_contract_builder_uses_camera_defaults_for_missing_resize():

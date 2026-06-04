@@ -41,6 +41,8 @@ src/robot_config/config/robots/so101_single_arm.yaml
 - 无需维护重复的 contract 文件
 - 配置变更自动传播到所有组件
 
+SO101 配置中的 `observation.current` 从 `/so101_follower/joint_currents` 的 `ibrobot_msgs/msg/JointCurrent.current` 字段解码，selector 使用 `current.*`，单位为安培。历史数据集缺少 `observation.current` 时，frame_detector 会跳过 critical frame 检测，并让 freeze frame 检测退化为仅使用速度判断。
+
 ## 工具
 
 ### 1. record_cli - 交互式录制客户端

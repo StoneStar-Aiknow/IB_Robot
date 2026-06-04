@@ -43,21 +43,6 @@ observations:
     align: {strategy: hold, stamp: header, tol_ms: 1500}
     qos: {reliability: best_effort, history: keep_last, depth: 50}
 
-  - key: observation.current
-    topic: /joint_currents
-    type: ibrobot_msgs/msg/JointCurrent
-    selector:
-      names: [
-        current.follower_arm:shoulder_pan,
-        current.follower_arm:shoulder_lift,
-        current.follower_arm:elbow_flex,
-        current.follower_arm:wrist_flex,
-        current.follower_arm:wrist_roll,
-        current.follower_arm:gripper
-      ]
-    align: {strategy: hold, stamp: header, tol_ms: 1500}
-    qos: {reliability: best_effort, history: keep_last, depth: 50}
-
 actions:
   - key: action
     selector:

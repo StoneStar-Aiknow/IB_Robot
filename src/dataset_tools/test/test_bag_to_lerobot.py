@@ -10,6 +10,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dataset_tools.bag_to_lerobot import (  # noqa: E402
+    _clean_float_array,
+    _dataset_feature_names_for_spec,
     _estimate_stream_rate_hz,
     _resolve_video_codec,
     _selected_indices_for_ticks,
@@ -69,3 +71,30 @@ def test_selected_indices_for_ticks_exposes_hold_duplicates_from_phase_offset():
     )
 
     assert selected.tolist() == [0, 0, 1]
+
+
+def test_dataset_feature_names_for_current_preserve_contract_names():
+    class Spec:
+        key = "observation.current"
+        names = ["current.1", "current.2"]
+
+    assert _dataset_feature_names_for_spec(Spec()) == ["current.1", "current.2"]
+
+
+def test_clean_float_array_replaces_non_finite_values():
+    arr = _clean_float_array([1.0, np.nan, np.inf, -np.inf], np.float32)
+
+    assert arr.dtype == np.float32
+    assert arr.tolist() == [1.0, 0.0, 0.0, 0.0]
+
+
+def test_clean_float_array_warns_for_non_current_features(caplog):
+    with caplog.at_level("WARNING"):
+        _clean_float_array([1.0, np.nan, 2.0], np.float32, feature_name="observation.state")
+    assert any("observation.state" in rec.message for rec in caplog.records if rec.levelno >= 30)
+
+
+def test_clean_float_array_silent_for_current(caplog):
+    with caplog.at_level("WARNING"):
+        _clean_float_array([1.0, np.nan, 2.0], np.float32, feature_name="observation.current")
+    assert not any("non-finite" in rec.message for rec in caplog.records if rec.levelno >= 30)
