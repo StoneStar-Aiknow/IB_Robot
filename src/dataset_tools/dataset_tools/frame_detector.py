@@ -16,6 +16,7 @@ import json
 import shutil
 import subprocess
 import traceback
+import fnmatch
 from dataclasses import dataclass, field
 from typing import List
 
@@ -44,9 +45,11 @@ class FrameDetectorConfig:
     clip_view: List[str] = field(default_factory=lambda: ["all"])
     enable_critical_detection: bool = True
     gripper_pos: List[int] = field(default_factory=lambda: [-1])
+    gripper_names: List[str] = field(default_factory=lambda: ["*gripper*"])
     critical_frame_min_current_threshold: float = 0.5
     critical_frame_max_velocity_threshold: float = 0.01
     critical_frame_training_weight: float = 2.0
+    critical_frame_min_duration: int = 3
     n_forward_expansion: int = 30
     n_backward_expansion: int = 30
     enable_freeze_detection: bool = True
@@ -109,19 +112,25 @@ class FrameDetector:
         self.total_frames_analyzed = 0
         self.critical_frames_detected = 0
         self.freeze_frames_detected = 0
+        self._warnings_emitted = set()
+        self._meta_info_dirty = False
         
         meta_path = os.path.join(self.dataset_path, "meta", "info.json")
         with open(meta_path, encoding="utf-8") as f:
             self.meta_info = json.load(f)
-        
+
+        _state_feature = self.meta_info.get("features", {}).get("observation.state", {})
+        self._original_state_names = list(_state_feature.get("names") or [])
+
         self.clip_view = cfg.clip_view
         
         self.enable_critical_detection = cfg.enable_critical_detection
         if self.enable_critical_detection:
-            self.gripper_indices = cfg.gripper_pos
+            self.gripper_indices = self._resolve_gripper_indices()
             self.critical_frame_min_current_threshold = cfg.critical_frame_min_current_threshold
             self.critical_frame_max_velocity_threshold = cfg.critical_frame_max_velocity_threshold
             self.critical_frame_training_weight = cfg.critical_frame_training_weight
+            self.critical_frame_min_duration = cfg.critical_frame_min_duration
             self.n_forward_expansion = cfg.n_forward_expansion
             self.n_backward_expansion = cfg.n_backward_expansion
         
@@ -136,9 +145,51 @@ class FrameDetector:
     def _log(self, level: str, msg: str):
         """Log message using ROS logger or print."""
         if self.logger:
-            getattr(self.logger, level)(msg)
+            if level == "debug":
+                self.logger.debug(msg)
+            elif level == "warning":
+                self.logger.warning(msg)
+            elif level == "error":
+                self.logger.error(msg)
+            else:
+                self.logger.info(msg)
         else:
             print(f"[{level.upper()}] {msg}")
+
+    def _resolve_gripper_indices(self) -> list[int]:
+        """Resolve gripper indices from feature names, falling back to config.
+
+        Negative indices in *gripper_pos* are resolved against the
+        ``observation.state`` feature dimension (e.g. ``-1`` with shape
+        ``[6]`` → ``5``).
+        """
+        state_info = self.meta_info.get("features", {}).get("observation.state", {})
+        names = state_info.get("names", [])
+        state_dim = state_info.get("shape", [0])[0] if state_info.get("shape") else 0
+
+        def _normalise(raw: list[int]) -> list[int]:
+            """Resolve negative indices using state_dim; reject positive out-of-range."""
+            result = []
+            for i in raw:
+                if i < 0:
+                    if state_dim > 0:
+                        i = i % state_dim
+                elif state_dim > 0 and i >= state_dim:
+                    raise ValueError(f"gripper_pos index {i} out of range [0, {state_dim})")
+                result.append(i)
+            return result
+
+        if not names:
+            return _normalise(self.cfg.gripper_pos)
+
+        indices: list[int] = []
+        for pattern in self.cfg.gripper_names:
+            for i, name in enumerate(names):
+                if fnmatch.fnmatch(str(name).lower(), f"*{pattern.lower()}*"):
+                    if i not in indices:
+                        indices.append(i)
+
+        return indices if indices else _normalise(self.cfg.gripper_pos)
     
     def run(self):
         """Main execution flow."""
@@ -160,7 +211,8 @@ class FrameDetector:
             return False
         
         view_dirs = self._get_clip_view()
-        self._modify_meta_info()
+        self._add_training_weight_feature_to_meta_info()
+        self._write_meta_info()
         
         clip_dir = os.path.join(self.dataset_path, "video_clips")
         if not create_or_replace_directory(clip_dir, force=True, logger=self.logger):
@@ -190,6 +242,9 @@ class FrameDetector:
                         subprocess.run(command, check=True, capture_output=True, text=True)
             
             self._write_parquet(df, file)
+
+        if self._meta_info_dirty:
+            self._write_meta_info()
         
         if all_processed_dfs:
             self._log("info", "Generating global distribution plot...")
@@ -201,21 +256,51 @@ class FrameDetector:
     def _analyze(self, df):
         """Execute complete analysis."""
         df["training_weight"] = 1.0
-        
+        state_series, current_series = self._resolve_motion_series(df)
+
+        if current_series is not None:
+            self._warn_all_zero_current(current_series)
+
         # Critical frame detection
         if self.enable_critical_detection:
-            df["gripper_current"] = self._extract_data(df["observation.current"], indices=self.gripper_indices)
-            df["gripper_state"] = self._extract_data(df["observation.state"], indices=self.gripper_indices)
-            df["gripper_velocity"] = self._calculate_velocity(df["gripper_state"], df["timestamp"])
-            df["training_weight"] = df.apply(self._calculate_critical_weight, axis=1)
-            df["training_weight"] = self._propagate_weights(df)
+            if current_series is None:
+                self._warn_once(
+                    "missing_current_critical",
+                    "Dataset does not contain observation.current; "
+                    "critical-frame detection is skipped for this dataset.",
+                )
+            else:
+                df["gripper_current"] = self._extract_data(current_series, indices=self.gripper_indices)
+                df["gripper_state"] = self._extract_data(state_series, indices=self.gripper_indices)
+                df["gripper_velocity"] = self._calculate_velocity(
+                    df["gripper_state"], df["timestamp"], df.get("episode_index")
+                )
+                df["training_weight"] = df.apply(self._calculate_critical_weight, axis=1)
+
+                if self.critical_frame_min_duration > 1:
+                    critical_mask = df["training_weight"] == self.critical_frame_training_weight
+                    groups = self._episode_aware_groups(critical_mask, df)
+                    group_sizes = critical_mask.groupby(groups).transform("size")
+                    df.loc[critical_mask & (group_sizes < self.critical_frame_min_duration), "training_weight"] = 1.0
+
+                df["training_weight"] = self._propagate_weights(df)
         
         # Freeze frame detection
         if self.enable_freeze_detection:
-            df["all_current"] = self._extract_data(df["observation.current"], indices=None)
-            df["all_state"] = self._extract_data(df["observation.state"], indices=None)
-            df["all_velocity"] = self._calculate_velocity(df["all_state"], df["timestamp"])
-            df = self._detect_freeze_frames(df)
+            use_current = current_series is not None
+            if use_current:
+                df["all_current"] = self._extract_data(current_series, indices=None)
+            else:
+                self._warn_once(
+                    "missing_current_freeze",
+                    "Dataset does not contain observation.current; "
+                    "freeze-frame detection is using velocity only.",
+                )
+            df["all_state"] = self._extract_data(state_series, indices=None)
+            df["all_velocity"] = self._calculate_velocity(
+                df["all_state"], df["timestamp"], df.get("episode_index")
+            )
+            df = self._detect_freeze_frames(df, use_current=use_current)
         
         # Cleanup columns
         if self.enable_critical_detection:
@@ -224,6 +309,93 @@ class FrameDetector:
             df = df.drop(["all_current", "all_state", "all_velocity"], axis=1, errors='ignore')
         
         return df
+
+    def _warn_once(self, key: str, msg: str) -> None:
+        """Emit a warning at most once per detector run."""
+        if key in self._warnings_emitted:
+            return
+        self._warnings_emitted.add(key)
+        self._log("warning", msg)
+
+    def _warn_all_zero_current(self, current_series) -> None:
+        """Warn if observation.current is entirely zero (likely name mismatch)."""
+        sample_size = min(100, len(current_series))
+        for row in current_series.head(sample_size):
+            if hasattr(row, "__iter__"):
+                if any(float(v) != 0.0 for v in row):
+                    return
+            elif float(row) != 0.0:
+                return
+        self._warn_once(
+            "all_zero_current",
+            f"observation.current is all zeros in the first {sample_size} frames. "
+            "This may indicate a joint-name mismatch between the YAML selector "
+            "and the configured current topic. Verify selector names (e.g. 'current.1') match "
+            "the joint names published by the hardware.",
+        )
+
+    def _resolve_motion_series(self, df):
+        """Return position and current series, recovering legacy mixed-state datasets when possible."""
+        if "observation.state" not in df:
+            raise KeyError("observation.state")
+
+        state_series = df["observation.state"]
+        if "observation.current" in df:
+            return state_series, df["observation.current"]
+
+        split = self._split_state_current_from_metadata(state_series)
+        if split is None:
+            return state_series, None
+
+        state_series, current_series, state_names, current_names = split
+        df["observation.state"] = state_series
+        df["observation.current"] = current_series
+        self._update_split_current_meta(state_names, current_names)
+        if self.enable_critical_detection:
+            self.gripper_indices = self._resolve_gripper_indices()
+        self._warn_once(
+            "split_mixed_state_current",
+            "Recovered observation.current from observation.state metadata; "
+            "rewriting observation.state as position-only values.",
+        )
+        return state_series, current_series
+
+    def _split_state_current_from_metadata(self, state_series):
+        """Split legacy state vectors that contain both *.pos and *.current values."""
+        names = self._original_state_names
+        if not names:
+            return None
+
+        current_indices = [idx for idx, name in enumerate(names) if str(name).endswith(".current")]
+        if not current_indices:
+            return None
+
+        state_indices = [idx for idx, name in enumerate(names) if idx not in current_indices]
+        state_names = [names[idx] for idx in state_indices]
+        current_names = [names[idx] for idx in current_indices]
+
+        position_values = self._extract_data(state_series, indices=state_indices)
+        current_values = self._extract_data(state_series, indices=current_indices)
+        return (
+            pd.Series(position_values, index=state_series.index),
+            pd.Series(current_values, index=state_series.index),
+            state_names,
+            current_names,
+        )
+
+    def _update_split_current_meta(self, state_names, current_names) -> None:
+        """Update dataset metadata after splitting legacy mixed state/current vectors."""
+        features = self.meta_info.setdefault("features", {})
+        state_feature = features.setdefault("observation.state", {})
+        state_feature["dtype"] = "float32"
+        state_feature["shape"] = [len(state_names)]
+        state_feature["names"] = state_names
+        features["observation.current"] = {
+            "dtype": "float32",
+            "shape": [len(current_names)],
+            "names": current_names,
+        }
+        self._meta_info_dirty = True
     
     def _extract_data(self, series, indices=None):
         """Extract motor data from series."""
@@ -245,11 +417,15 @@ class FrameDetector:
                 result.append([0] * length)
         return result
     
-    def _calculate_velocity(self, state_series, timestamp_series):
+    def _calculate_velocity(self, state_series, timestamp_series, episode_series=None):
         """Calculate velocity from state series."""
+        ep_values = episode_series.values if episode_series is not None else None
         velocities = []
         for i in range(len(state_series)):
             if i == 0:
+                num_joints = len(state_series.iloc[i]) if hasattr(state_series.iloc[i], "__len__") else 1
+                velocities.append([0.0] * num_joints)
+            elif ep_values is not None and ep_values[i] != ep_values[i - 1]:
                 num_joints = len(state_series.iloc[i]) if hasattr(state_series.iloc[i], "__len__") else 1
                 velocities.append([0.0] * num_joints)
             else:
@@ -268,6 +444,14 @@ class FrameDetector:
                     velocities.append([0.0] * num_joints)
         return velocities
     
+    def _episode_aware_groups(self, mask, df):
+        """Group consecutive identical mask values, respecting episode boundaries."""
+        status_change = mask != mask.shift()
+        ep = df.get("episode_index")
+        if ep is not None:
+            return (status_change | (ep != ep.shift())).cumsum()
+        return status_change.cumsum()
+
     def _calculate_critical_weight(self, row):
         """Calculate training weight for critical frames."""
         for i in range(len(row["gripper_velocity"])):
@@ -281,28 +465,39 @@ class FrameDetector:
         """Propagate weights to neighboring frames."""
         new_weights = df["training_weight"].copy()
         weight_indices = df[df["training_weight"] == self.critical_frame_training_weight].index
-        
+
+        ep_values = df["episode_index"].values if "episode_index" in df.columns else None
+
         for idx in weight_indices:
-            # Forward expansion
-            start_idx_forward = max(0, idx - self.n_forward_expansion)
-            for i in range(start_idx_forward, idx):
+            ep = ep_values[idx] if ep_values is not None else None
+
+            # Backward expansion — propagate to preceding frames
+            start = max(0, idx - self.n_backward_expansion)
+            for i in range(idx - 1, start - 1, -1):
+                if ep_values is not None and ep_values[i] != ep:
+                    break
                 new_weights.iloc[i] = self.critical_frame_training_weight
-            
-            # Backward expansion
-            end_idx_backward = min(len(df) - 1, idx + self.n_backward_expansion)
-            for i in range(idx + 1, end_idx_backward + 1):
+
+            # Forward expansion — propagate to following frames
+            end = min(len(df) - 1, idx + self.n_forward_expansion)
+            for i in range(idx + 1, end + 1):
+                if ep_values is not None and ep_values[i] != ep:
+                    break
                 new_weights.iloc[i] = self.critical_frame_training_weight
-        
+
         return new_weights
     
-    def _detect_freeze_frames(self, df):
+    def _detect_freeze_frames(self, df, use_current: bool = True):
         """Detect freeze frames based on velocity and current thresholds."""
         
         def is_row_instant_static(row):
             velocities = row["all_velocity"]
-            currents = row["all_current"]
             v_static = all(abs(v) <= self.freeze_frame_max_velocity for v in velocities)
-            c_static = all(abs(c) <= self.freeze_frame_max_current for c in currents)
+            if use_current:
+                currents = row["all_current"]
+                c_static = all(abs(c) <= self.freeze_frame_max_current for c in currents)
+            else:
+                c_static = True
             return v_static and c_static
         
         # Calculate static mask
@@ -310,7 +505,7 @@ class FrameDetector:
         
         # Filter by duration
         if self.freeze_frame_min_duration > 1:
-            groups = (raw_static_mask != raw_static_mask.shift()).cumsum()
+            groups = self._episode_aware_groups(raw_static_mask, df)
             group_sizes = raw_static_mask.groupby(groups).transform("size")
             valid_static_mask = raw_static_mask & (group_sizes >= self.freeze_frame_min_duration)
         else:
@@ -452,14 +647,16 @@ class FrameDetector:
         
         return view_dirs
     
-    def _modify_meta_info(self):
-        """Add training_weight to meta info."""
+    def _add_training_weight_feature_to_meta_info(self):
+        """Add the training_weight feature definition to meta info."""
         self.meta_info["features"]["training_weight"] = {
             "dtype": "float32",
             "shape": [1],
             "names": None
         }
-        
+
+    def _write_meta_info(self):
+        """Write updated meta info to disk."""
         meta_path = os.path.join(self.dataset_path, "meta", "info.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(self.meta_info, f, ensure_ascii=False, indent=4)
@@ -562,6 +759,8 @@ class FrameDetectorNode(Node):
         self.declare_parameter("freeze_frame_max_current", 0.2)
         self.declare_parameter("freeze_frame_training_weight", 0.0)
         self.declare_parameter("freeze_frame_min_duration", 5)
+        self.declare_parameter("gripper_names", ["*gripper*"])
+        self.declare_parameter("critical_frame_min_duration", 3)
     
     def run_detection(self) -> bool:
         """Execute frame detection with parameters."""
@@ -581,6 +780,8 @@ class FrameDetectorNode(Node):
         cfg.freeze_frame_max_current = self.get_parameter("freeze_frame_max_current").get_parameter_value().double_value
         cfg.freeze_frame_training_weight = self.get_parameter("freeze_frame_training_weight").get_parameter_value().double_value
         cfg.freeze_frame_min_duration = self.get_parameter("freeze_frame_min_duration").get_parameter_value().integer_value
+        cfg.gripper_names = list(self.get_parameter("gripper_names").get_parameter_value().string_array_value)
+        cfg.critical_frame_min_duration = self.get_parameter("critical_frame_min_duration").get_parameter_value().integer_value
         
         try:
             cfg.validate()

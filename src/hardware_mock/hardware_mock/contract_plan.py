@@ -214,7 +214,6 @@ def build_plan(robot: dict[str, Any]) -> MockPlan:
             )
         elif msg_type == "ibrobot_msgs/msg/JointCurrent":
             _validate_joint_rate(key, joint_state_rate_hz, align, skip_rate_check)
-            selector_names = list((obs.get("selector") or {}).get("names") or joint_ids)
             obs_specs.append(
                 ObservationSpec(
                     key=key,
@@ -223,7 +222,7 @@ def build_plan(robot: dict[str, Any]) -> MockPlan:
                     rate_hz=joint_state_rate_hz,
                     qos=qos,
                     kind="joint_current",
-                    joint_names=selector_names,
+                    joint_names=list(joint_ids),
                 )
             )
         else:  # pragma: no cover - guarded by ensure_publish_supported

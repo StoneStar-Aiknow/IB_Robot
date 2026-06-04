@@ -174,7 +174,7 @@ def test_build_plan_accepts_joint_current():
     robot["contract"]["observations"].append(
         {
             "key": "observation.current",
-            "topic": "/joint_currents",
+            "topic": "/so101_follower/joint_currents",
             "type": "ibrobot_msgs/msg/JointCurrent",
             "selector": {"names": ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"]},
             "align": {"tol_ms": 1500},
@@ -185,6 +185,6 @@ def test_build_plan_accepts_joint_current():
 
     jc_obs = [o for o in plan.observations if o.kind == "joint_current"]
     assert len(jc_obs) == 1
-    assert jc_obs[0].topic == "/joint_currents"
+    assert jc_obs[0].topic == "/so101_follower/joint_currents"
     assert jc_obs[0].msg_type == "ibrobot_msgs/msg/JointCurrent"
-    assert jc_obs[0].joint_names == ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"]
+    assert jc_obs[0].joint_names == ["1", "2", "3", "4", "5", "6"]
