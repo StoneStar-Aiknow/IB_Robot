@@ -8,8 +8,21 @@ ROS 2 数据集采集与转换工具，用于 LeRobot v3 数据集格式。
 
 - **Episode 录制**: 通过 Action Server 控制的分段录制
 - **Bag 转 LeRobot**: 将 ROS 2 bag 转换为 LeRobot v3 数据集格式
+- **相机标定辅助**: `camera_alignment` 支持真机 OpenCV 相机与仿真 ROS 2 image topic；仿真模式通过 `rclpy` 订阅图像，并可与 `sim_models` 中的相机调节/ArUco 标定板工具联动
+
+仿真相关能力是可选运行路径：常规录制与 bag 转换仍只依赖 `robot_config` 契约和 ROS 2 bag；只有使用 `camera_alignment --use_sim` 处理仿真相机 topic 时，才会进入 `dataset_tools → sim_models → robot_config` 的跨包交互。
 
 ## 架构设计
+
+### 仿真相机标定边界
+
+`camera_alignment --use_sim` 是仿真相机标定辅助路径，不参与 episode 录制或 bag 转换主流程。该路径的职责边界如下：
+
+1. `dataset_tools.camera_alignment` 负责交互式对齐 UI、参考图/参考 marker 数据保存，以及订阅仿真相机 ROS 2 image topic；
+2. `sim_models` 负责仿真侧相机调节辅助进程、Gazebo ArUco 标定板 spawn/despawn，以及将调节结果保存为 `~/.ros/ibrobot/sim_camera_overrides/<camera>.yaml`；
+3. `robot_config` 在后续 `robot.launch.py use_sim:=true` 启动时读取 robot YAML 和可选 override，生成对应仿真相机位姿。
+
+因此，`sim_models` 只属于 `camera_alignment --use_sim` 的可选运行时依赖；真机相机对齐、录制服务和 bag 转换不依赖该包。
 
 ### 单一真理来源 (Single Source of Truth)
 
@@ -161,12 +174,17 @@ output_dataset/
 
 ### 4. camera_alignment - 基于 ArUco 的相机对齐工具
 
-用于在数据采集或复现前，直接读取本机视频设备并对齐摄像头视角。
+用于在数据采集或复现前对齐摄像头视角。`--camera-source` 同时支持真机视频设备和仿真 ROS 2 image topic：
 
-**基本用法**：
+| 输入形态 | 路径 | 行为 |
+|---|---|---|
+| `/dev/videoN` / 整数 / 本地视频文件 | 真机路径（OpenCV） | 保持原有工作流，支持显式请求分辨率、帧率和采集格式 |
+| `/camera/<name>/image_raw` | 仿真路径（ROS 2 topic） | 通过 `rclpy` 订阅图像，并接入 sim calibration 辅助能力 |
+
+**真机用法**：
 ```bash
 ros2 run dataset_tools camera_alignment \
-    --cameras_index_or_path /dev/video0 \
+    --camera-source /dev/video0 \
     --width 640 \
     --height 480 \
     --fps 60 \
@@ -175,12 +193,32 @@ ros2 run dataset_tools camera_alignment \
     --reference-image-path /tmp/reference_img.png
 ```
 
+**仿真用法**：
+```bash
+ros2 run dataset_tools camera_alignment \
+    --camera-source /camera/top/image_raw \
+    --markerless \
+    --reference-image-path ref_img/reftop.png
+```
+
 工具支持：
 
 - 保存当前 ArUco 角点作为参考基准
 - 实时显示与参考画面的平均像素误差
 - 进入“虚影对齐”界面辅助恢复视角
 - 显式请求 OpenCV 采集分辨率、帧率和采集格式，并提示实际生效值
+
+仿真模式下额外行为：
+
+- 启动时尝试通过 `sim_models.aruco_spawner` 向 Gazebo 动态插入 ArUco A4 标定板，退出时自动清理。
+- 当输入是 `/camera/<name>/image_raw` 时，会自动切到 `/camera_align/<name>/image_raw` 代理话题，便于与 `sim_camera_adjuster` 联动。
+- 按 `p` 保存当前帧到 `capture_YYYYMMDD_HHMMSS.png`。
+- 按 `s` 时，`camera_alignment` 会写入 `~/.ros/ibrobot/sim_camera_overrides/<camera>.yaml` 的 stub 文件；真正的位姿值由 `sim_models.sim_camera_adjuster` 保存并在下次仿真启动时被 `robot_config` 读取。
+
+兼容性边界：
+
+- 真机路径的 `OpenCVFrameSource` 工作流保持兼容；ROS 2 依赖只会在仿真 topic 路径下触发。
+- markerless 模式只跳过 ArUco 误差计算，不影响真机模式的原有 reference JSON / image 行为。
 
 详细说明见：
 

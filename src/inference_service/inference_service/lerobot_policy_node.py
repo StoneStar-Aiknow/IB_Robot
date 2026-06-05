@@ -108,6 +108,7 @@ try:
         create_interactive_masks,
     )
     from attention_viz.utils import attention_data_to_msg
+
     _HAS_ATTENTION_VIZ = True
 except ImportError:
     _HAS_ATTENTION_VIZ = False
@@ -171,11 +172,7 @@ class LeRobotPolicyNode(Node):
     def __init__(self, model_config: dict):
         super().__init__(model_config.get("node_name", "lerobot_policy_node"))
 
-        self._config = _NodeConfig(**{
-            k: v
-            for k, v in model_config.items()
-            if k in _NodeConfig.__dataclass_fields__
-        })
+        self._config = _NodeConfig(**{k: v for k, v in model_config.items() if k in _NodeConfig.__dataclass_fields__})
 
         self.get_logger().info(f"Initializing {self._config.name} node")
         self.get_logger().info(f"Execution mode: {self._config.execution_mode}")
@@ -219,17 +216,12 @@ class LeRobotPolicyNode(Node):
         self._attn_hook = None
         self._attn_pub = None
         self._attention_mask_prompted = False
-        needs_attention_tools = (
-            self._config.publish_attention
-            or self._config.attention_interactive_masking
-        )
+        needs_attention_tools = self._config.publish_attention or self._config.attention_interactive_masking
         if self._config.execution_mode == "monolithic" and needs_attention_tools:
             if _HAS_ATTENTION_VIZ:
                 self._setup_attention_publishing()
             else:
-                self.get_logger().warn(
-                    "attention tools are enabled but attention_viz is unavailable"
-                )
+                self.get_logger().warn("attention tools are enabled but attention_viz is unavailable")
         self._setup_action_server()
 
         self._health_timer = self.create_timer(1.0, self._health_callback)
@@ -239,11 +231,7 @@ class LeRobotPolicyNode(Node):
         else:
             self._warn_unsupported_attention_publishing()
 
-        mode_str = (
-            "distributed (edge proxy)"
-            if self._config.execution_mode == "distributed"
-            else "monolithic"
-        )
+        mode_str = "distributed (edge proxy)" if self._config.execution_mode == "distributed" else "monolithic"
         self.get_logger().info(
             f"{self._config.name} node ready ({mode_str}): "
             f"policy_type={self._policy_type}, "
@@ -347,9 +335,7 @@ class LeRobotPolicyNode(Node):
 
         self._state_specs = [s for s in self._obs_specs if s.key == "observation.state"]
         self._camera_topics_by_key = {
-            s.key: s.topic
-            for s in self._obs_specs
-            if s.key.startswith("observation.images.")
+            s.key: s.topic for s in self._obs_specs if s.key.startswith("observation.images.")
         }
         self._topic_to_qos = {}
         for obs in self._contract.observations or []:
@@ -503,25 +489,16 @@ class LeRobotPolicyNode(Node):
                 if raw_policy is not None:
                     self._attn_hook = StackedAttentionHook()
                     if self._attn_hook.install(raw_policy):
-                        self.get_logger().info(
-                            "Attention visualization hook installed"
-                        )
+                        self.get_logger().info("Attention visualization hook installed")
                         if self._config.publish_attention:
-                            self.get_logger().info(
-                                f"Publishing attention to "
-                                f"{self._config.attention_viz_topic}"
-                            )
+                            self.get_logger().info(f"Publishing attention to {self._config.attention_viz_topic}")
                         if self._config.attention_interactive_masking:
-                            self.get_logger().info(
-                                "Interactive attention masking enabled"
-                            )
+                            self.get_logger().info("Interactive attention masking enabled")
                     else:
                         self.get_logger().warn("Failed to install attention hook")
                         self._attn_hook = None
                 else:
-                    self.get_logger().warn(
-                        "raw_policy is None, cannot install attention hook"
-                    )
+                    self.get_logger().warn("raw_policy is None, cannot install attention hook")
         except Exception as e:
             self.get_logger().warn(f"Attention visualization setup failed: {e}")
             self._attn_hook = None
@@ -540,13 +517,9 @@ class LeRobotPolicyNode(Node):
             raw_policy.last_attn_weights = None
         self._attn_feature_map_size = None
         self._attention_mask_prompted = False
-        if self._attn_hook is not None and hasattr(
-            self._attn_hook, "reset_for_new_inference"
-        ):
+        if self._attn_hook is not None and hasattr(self._attn_hook, "reset_for_new_inference"):
             self._attn_hook.reset_for_new_inference()
-        if self._attn_hook is not None and hasattr(
-            self._attn_hook, "clear_attention_masks"
-        ):
+        if self._attn_hook is not None and hasattr(self._attn_hook, "clear_attention_masks"):
             self._attn_hook.clear_attention_masks()
 
     def _setup_policy_reset_service(self):
@@ -559,11 +532,7 @@ class LeRobotPolicyNode(Node):
         )
 
     def _reset_policy_state_cb(self, _request, response):
-        raw_policy = (
-            self._coordinator.raw_policy
-            if self._coordinator is not None
-            else None
-        )
+        raw_policy = self._coordinator.raw_policy if self._coordinator is not None else None
         if raw_policy is None:
             response.success = False
             response.message = "Policy runtime reset unavailable in current execution mode"
@@ -576,13 +545,9 @@ class LeRobotPolicyNode(Node):
 
     def _warn_unsupported_attention_publishing(self):
         if self._config.publish_attention:
-            self.get_logger().warn(
-                "Attention publishing is only supported in monolithic mode"
-            )
+            self.get_logger().warn("Attention publishing is only supported in monolithic mode")
         if self._config.attention_interactive_masking:
-            self.get_logger().warn(
-                "Interactive attention masking is only supported in monolithic mode"
-            )
+            self.get_logger().warn("Interactive attention masking is only supported in monolithic mode")
 
     def _setup_action_server(self):
         """Setup DispatchInfer Action Server."""
@@ -887,8 +852,7 @@ class LeRobotPolicyNode(Node):
 
         total_start = time.perf_counter()
         attention_tools_active = self._attn_hook is not None and (
-            self._config.publish_attention
-            or self._config.attention_interactive_masking
+            self._config.publish_attention or self._config.attention_interactive_masking
         )
         if not attention_tools_active:
             result = self._coordinator(obs_frame)
@@ -1035,13 +999,9 @@ class LeRobotPolicyNode(Node):
                 req = self._pending_requests[request_id]
                 req[1] = batch
                 req[0].set()
-                self.get_logger().debug(
-                    f"Cloud result received for request_id={request_id}"
-                )
+                self.get_logger().debug(f"Cloud result received for request_id={request_id}")
             else:
-                self.get_logger().warn(
-                    f"No pending request found for request_id={request_id}"
-                )
+                self.get_logger().warn(f"No pending request found for request_id={request_id}")
 
         except Exception as e:
             self.get_logger().error(f"Error processing cloud result: {e}")
@@ -1064,9 +1024,7 @@ class LeRobotPolicyNode(Node):
         if camera_keys:
             self._attn_hook.set_camera_keys(camera_keys)
 
-        self._attn_hook.set_num_non_image_tokens(
-            self._count_non_image_tokens(policy_config, batch)
-        )
+        self._attn_hook.set_num_non_image_tokens(self._count_non_image_tokens(policy_config, batch))
 
         if self._attn_feature_map_size is not None:
             self._attn_hook.set_feature_map_size(self._attn_feature_map_size)
@@ -1087,14 +1045,10 @@ class LeRobotPolicyNode(Node):
         try:
             with torch.no_grad():
                 feature_map = backbone(batch[first_cam_key][:1])["feature_map"]
-            self._attn_feature_map_size = tuple(
-                int(v) for v in feature_map.shape[-2:]
-            )
+            self._attn_feature_map_size = tuple(int(v) for v in feature_map.shape[-2:])
             self._attn_hook.set_feature_map_size(self._attn_feature_map_size)
         except Exception as e:
-            self.get_logger().debug(
-                f"Failed to compute attention feature map size: {e}"
-            )
+            self.get_logger().debug(f"Failed to compute attention feature map size: {e}")
             self._refresh_attention_feature_map_size_from_model(model)
 
     def _prepare_interactive_attention_mask(
@@ -1112,16 +1066,10 @@ class LeRobotPolicyNode(Node):
             return
         if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
             self._attention_mask_prompted = True
-            self.get_logger().warn(
-                "Interactive attention masking requested but no graphical "
-                "display is available"
-            )
+            self.get_logger().warn("Interactive attention masking requested but no graphical display is available")
             return
         if self._attn_feature_map_size is None:
-            self.get_logger().warn(
-                "Interactive attention masking skipped because feature map "
-                "size is unavailable"
-            )
+            self.get_logger().warn("Interactive attention masking skipped because feature map size is unavailable")
             return
 
         raw_policy = self._coordinator.raw_policy if self._coordinator else None
@@ -1146,9 +1094,7 @@ class LeRobotPolicyNode(Node):
                 self._attn_feature_map_size,
             )
             if not feature_masks:
-                self.get_logger().info(
-                    "Interactive attention masking finished without masks"
-                )
+                self.get_logger().info("Interactive attention masking finished without masks")
                 return
 
             chunk_size = int(getattr(policy_config, "chunk_size", self._chunk_size))
@@ -1166,14 +1112,8 @@ class LeRobotPolicyNode(Node):
                 device=self._device,
             )
             self._attn_hook.set_attention_masks(decoder_mask, encoder_mask)
-            masked_tokens = sum(
-                int(mask.sum().item())
-                for mask in feature_masks.values()
-            )
-            self.get_logger().info(
-                f"Interactive attention mask installed: {masked_tokens} "
-                f"visual tokens masked"
-            )
+            masked_tokens = sum(int(mask.sum().item()) for mask in feature_masks.values())
+            self.get_logger().info(f"Interactive attention mask installed: {masked_tokens} visual tokens masked")
         except Exception as e:
             self.get_logger().warn(f"Interactive attention masking failed: {e}")
 
@@ -1206,9 +1146,7 @@ class LeRobotPolicyNode(Node):
         try:
             feature_map_size = getter()
         except Exception as e:
-            self.get_logger().debug(
-                f"Failed to read attention feature map size from model: {e}"
-            )
+            self.get_logger().debug(f"Failed to read attention feature map size from model: {e}")
             return False
         if not feature_map_size:
             return False
@@ -1234,10 +1172,7 @@ class LeRobotPolicyNode(Node):
                 return
             attn_payload = dict(attn_data)
             camera_keys = attn_payload.get("camera_keys", [])
-            attn_payload["camera_topics"] = [
-                self._camera_topics_by_key.get(key, "")
-                for key in camera_keys
-            ]
+            attn_payload["camera_topics"] = [self._camera_topics_by_key.get(key, "") for key in camera_keys]
             stamp = self.get_clock().now().to_msg()
 
             msg = attention_data_to_msg(
@@ -1306,6 +1241,22 @@ class LeRobotPolicyNode(Node):
 
 def main() -> None:
     """Main entry point for LeRobot policy node."""
+    import logging
+
+    for _name in (
+        "draccus",
+        "draccus.wrappers",
+        "draccus.wrappers.dataclass_wrapper",
+        "draccus.wrappers.field_wrapper",
+        "draccus.wrappers.field_metavar",
+        "draccus.wrappers.docstring",
+        "draccus.wrappers.help_formatter",
+        "draccus.parsers",
+        "draccus.parsers.decoding",
+        "draccus.argparsing",
+    ):
+        logging.getLogger(_name).setLevel(logging.WARNING)
+
     rclpy.init()
 
     try:
@@ -1383,12 +1334,8 @@ def main() -> None:
         config["cloud_result_topic"] = temp_node.get_parameter("cloud_result_topic").value
         config["publish_attention"] = temp_node.get_parameter("publish_attention").value
         config["attention_viz_topic"] = temp_node.get_parameter("attention_viz_topic").value
-        config["attention_interactive_masking"] = temp_node.get_parameter(
-            "attention_interactive_masking"
-        ).value
-        config["attention_mask_save_dir"] = temp_node.get_parameter(
-            "attention_mask_save_dir"
-        ).value
+        config["attention_interactive_masking"] = temp_node.get_parameter("attention_interactive_masking").value
+        config["attention_mask_save_dir"] = temp_node.get_parameter("attention_mask_save_dir").value
         temp_node.destroy_node()
 
         node = LeRobotPolicyNode(config)

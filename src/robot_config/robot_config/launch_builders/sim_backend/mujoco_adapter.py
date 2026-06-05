@@ -15,15 +15,15 @@ Camera convention:
     (camera forward = -Z).  No cross-platform conversion is needed.
 """
 
-import math
 import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from launch_ros.actions import Node
-from robot_config.logger_utils import get_colored_logger
 
+from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import resolve_ros_path
+
 from .base_adapter import SimBackendAdapter
 
 logger = get_colored_logger("robot_config.sim_backend.mujoco")
@@ -46,8 +46,8 @@ class MujocoAdapter(SimBackendAdapter):
         #    Must run before generate_robot_description so mujoco_model_path can be
         #    injected into the URDF <hardware> block (new upstream API).
         scene_name = robot_config.get("simulation", {}).get("scene")
-        robot_spawn = {}
-        if scene_name:
+        robot_spawn = robot_config.get("simulation", {}).get("robot_spawn", {}) or {}
+        if scene_name and not robot_spawn:
             try:
                 layout = get_scene_layout(scene_name)
                 robot_spawn = layout.get("robot_spawn", {})
@@ -63,16 +63,13 @@ class MujocoAdapter(SimBackendAdapter):
                 mujoco_model_path = str(get_mujoco_scene_path(scene_name, robot_xml_path))
                 logger.info(f"MuJoCo scene: {mujoco_model_path}")
             except Exception as e:
-                logger.warning(
-                    f"scene '{scene_name}' failed: {e}; using robot-only XML"
-                )
+                logger.warning(f"scene '{scene_name}' failed: {e}; using robot-only XML")
                 mujoco_model_path = robot_xml_path
         else:
             mujoco_model_path = robot_xml_path
 
         # 3. Generate URDF with MujocoSystemInterface plugin, model path injected via xacro
-        result = generate_robot_description(robot_config, True,
-                                            mujoco_model_path=mujoco_model_path)
+        result = generate_robot_description(robot_config, True, mujoco_model_path=mujoco_model_path)
         if result is None:
             raise RuntimeError("[mujoco_adapter] generate_robot_description failed")
         _, robot_desc_params = result
@@ -90,7 +87,7 @@ class MujocoAdapter(SimBackendAdapter):
         # 7. Build node parameters (mujoco_model_path now in URDF, not a node param)
         params = [
             robot_desc_params,
-            {'use_sim_time': True},
+            {"use_sim_time": True},
         ]
         if controllers_cfg and Path(controllers_cfg).exists():
             params.append(controllers_cfg)
@@ -99,13 +96,13 @@ class MujocoAdapter(SimBackendAdapter):
 
         additional_env = {}
         if mujoco_plugin_path:
-            additional_env['MUJOCO_PLUGIN_PATH'] = mujoco_plugin_path
+            additional_env["MUJOCO_PLUGIN_PATH"] = mujoco_plugin_path
             logger.info(f"MUJOCO_PLUGIN_PATH={mujoco_plugin_path}")
 
         mujoco_node = Node(
-            package='mujoco_ros2_control',
-            executable='ros2_control_node',
-            output='screen',
+            package="mujoco_ros2_control",
+            executable="ros2_control_node",
+            output="screen",
             parameters=params,
             remappings=remappings,
             additional_env=additional_env,
@@ -140,14 +137,13 @@ class MujocoAdapter(SimBackendAdapter):
         """
         try:
             import mujoco
+
             plugin_dir = os.path.join(os.path.dirname(mujoco.__file__), "plugin")
             if os.path.isdir(plugin_dir):
                 return plugin_dir
             logger.warning(f"mujoco plugin dir not found at {plugin_dir}")
         except ImportError:
-            logger.warning(
-                "mujoco Python package not found; MUJOCO_PLUGIN_PATH will not be set"
-            )
+            logger.warning("mujoco Python package not found; MUJOCO_PLUGIN_PATH will not be set")
         return ""
 
     def _generate_robot_mujoco_xml(self, robot_spawn: dict, peripherals: list) -> str:
@@ -165,93 +161,109 @@ class MujocoAdapter(SimBackendAdapter):
         """
         from ament_index_python.packages import get_package_share_directory
 
-        pkg = get_package_share_directory('robot_description')
-        meshes_dir = os.path.join(pkg, 'meshes', 'lerobot', 'so101')
-        template_path = os.path.join(pkg, 'mujoco', 'so101.xml.template')
+        pkg = get_package_share_directory("robot_description")
+        meshes_dir = os.path.join(pkg, "meshes", "lerobot", "so101")
+        template_path = os.path.join(pkg, "mujoco", "so101.xml.template")
 
         if not os.path.exists(template_path):
-            raise FileNotFoundError(
-                f"[mujoco_adapter] MuJoCo template not found: {template_path}"
-            )
+            raise FileNotFoundError(f"[mujoco_adapter] MuJoCo template not found: {template_path}")
 
-        base_x = robot_spawn.get('x', 0.0)
-        base_y = robot_spawn.get('y', 0.0)
-        base_z = robot_spawn.get('z', 0.0)
+        base_x = robot_spawn.get("x", 0.0)
+        base_y = robot_spawn.get("y", 0.0)
+        base_z = robot_spawn.get("z", 0.0)
 
         # Step 1: string substitution (placeholders are inside attribute values)
         with open(template_path) as f:
             content = f.read()
-        content = content.replace('{{MESHES_DIR}}', meshes_dir)
-        content = content.replace('{{ROBOT_BASE_POS}}', f'{base_x} {base_y} {base_z}')
+        content = content.replace("{{MESHES_DIR}}", meshes_dir)
+        content = content.replace("{{ROBOT_BASE_POS}}", f"{base_x} {base_y} {base_z}")
 
         # Step 2: parse XML and inject YAML-driven cameras
         root = ET.fromstring(content)
-        worldbody = root.find('worldbody')
+        worldbody = root.find("worldbody")
         if worldbody is None:
             raise RuntimeError("[mujoco_adapter] <worldbody> not found in so101.xml.template")
 
-        from .camera_presets import get_preset
+        from .camera_overrides import load_gazebo_override
+        from .camera_presets import gazebo_rpy_to_mujoco_rpy, get_preset
 
         for periph in peripherals:
-            if periph.get('type') != 'camera':
+            if periph.get("type") != "camera":
                 continue
-            if periph.get('driver') != 'opencv':
+            if periph.get("driver") != "opencv":
                 continue  # realsense / other real-hardware cameras: skip
 
-            name = periph['name']          # YAML name, e.g. "top"
-            cam_name = f'{name}_camera'    # MJCF name convention, e.g. "top_camera"
-                                           # must match _build_camera_remappings
+            name = periph["name"]  # YAML name, e.g. "top"
+            cam_name = f"{name}_camera"  # MJCF name convention, e.g. "top_camera"
+            # must match _build_camera_remappings
 
             # --- preset lookup ---
-            t = periph.get('transform', {})
-            cam_fovy = periph.get('fovy', 60)
-            if periph.get('use_default_transform', False):
-                preset = get_preset("mujoco", name)
-                if preset:
-                    t = preset
-                    cam_fovy = preset.get('fovy', cam_fovy)
+            # Priority: real Gazebo override YAML → MuJoCo hardcoded preset → YAML
+            # transform field. sim_camera_adjuster always saves poses in Gazebo
+            # convention; only real user-saved overrides should be translated to
+            # MuJoCo convention below. If no override exists, use the native
+            # MuJoCo preset directly rather than the Gazebo fallback preset.
+            t = periph.get("transform", {})
+            cam_fovy = periph.get("fovy", 60)
+            from_gazebo_calibration = False
+            if periph.get("use_default_transform", False):
+                gz_override = load_gazebo_override(name)
+                if gz_override is not None:
+                    t = gz_override
+                    cam_fovy = gz_override.get("fovy", cam_fovy)
+                    from_gazebo_calibration = True
+                else:
+                    mj_preset = get_preset("mujoco", name)
+                    if mj_preset:
+                        t = mj_preset
+                        cam_fovy = mj_preset.get("fovy", cam_fovy)
 
-            parent_frame = t.get('parent_frame', 'world')
+            parent_frame = t.get("parent_frame", "world")
             pos = f"{t.get('x', 0.0)} {t.get('y', 0.0)} {t.get('z', 0.0)}"
 
-            # Camera orientation: values are already in MuJoCo convention
-            # (camera forward = -Z) when loaded from presets.
-            # No cross-platform conversion needed.
-            mj_roll = t.get('roll', 0.0)
-            mj_pitch = t.get('pitch', 0.0)
-            mj_yaw = t.get('yaw', 0.0)
-            euler = f'{mj_roll:.6f} {mj_pitch:.6f} {mj_yaw:.6f}'
+            # Camera orientation.
+            # * Gazebo-calibrated pose: apply R_fix transform (Gazebo optical
+            #   axis +X / up +Z  ->  MuJoCo optical -Z / up +Y).
+            # * MuJoCo hardcoded preset: already in MuJoCo convention, use raw.
+            gz_roll = float(t.get("roll", 0.0))
+            gz_pitch = float(t.get("pitch", 0.0))
+            gz_yaw = float(t.get("yaw", 0.0))
+            if from_gazebo_calibration:
+                mj_roll, mj_pitch, mj_yaw = gazebo_rpy_to_mujoco_rpy(gz_roll, gz_pitch, gz_yaw)
+                logger.info(
+                    f"[cam-convert] {name}: gz rpy=({gz_roll:+.4f},{gz_pitch:+.4f},"
+                    f"{gz_yaw:+.4f}) -> mj rpy=({mj_roll:+.4f},{mj_pitch:+.4f},"
+                    f"{mj_yaw:+.4f})"
+                )
+            else:
+                mj_roll, mj_pitch, mj_yaw = gz_roll, gz_pitch, gz_yaw
+            euler = f"{mj_roll:.6f} {mj_pitch:.6f} {mj_yaw:.6f}"
 
             fovy = str(cam_fovy)
             resolution = f"{periph.get('width', 640)} {periph.get('height', 480)}"
 
-            cam_elem = ET.Element('camera')
-            cam_elem.set('name', cam_name)
-            cam_elem.set('pos', pos)
-            cam_elem.set('euler', euler)
-            cam_elem.set('fovy', fovy)
-            cam_elem.set('resolution', resolution)
+            cam_elem = ET.Element("camera")
+            cam_elem.set("name", cam_name)
+            cam_elem.set("pos", pos)
+            cam_elem.set("euler", euler)
+            cam_elem.set("fovy", fovy)
+            cam_elem.set("resolution", resolution)
 
-            if parent_frame in ('world', 'worldbody'):
+            if parent_frame in ("world", "worldbody"):
                 worldbody.append(cam_elem)
                 logger.info(f"Injected camera '{cam_name}' into worldbody")
             else:
                 body = worldbody.find(f'.//body[@name="{parent_frame}"]')
                 if body is not None:
                     body.append(cam_elem)
-                    logger.info(
-                        f"Injected camera '{cam_name}' into body '{parent_frame}'"
-                    )
+                    logger.info(f"Injected camera '{cam_name}' into body '{parent_frame}'")
                 else:
-                    logger.warning(
-                        f"body '{parent_frame}' not found "
-                        f"for camera '{cam_name}'; skipping"
-                    )
+                    logger.warning(f"body '{parent_frame}' not found for camera '{cam_name}'; skipping")
 
         # Step 3: write to /tmp/
-        out_path = '/tmp/so101_mujoco.xml'
-        ET.indent(root, space='  ')
-        ET.ElementTree(root).write(out_path, encoding='unicode', xml_declaration=True)
+        out_path = "/tmp/so101_mujoco.xml"
+        ET.indent(root, space="  ")
+        ET.ElementTree(root).write(out_path, encoding="unicode", xml_declaration=True)
         logger.info(f"Robot MJCF written to {out_path}")
         return out_path
 
@@ -268,14 +280,16 @@ class MujocoAdapter(SimBackendAdapter):
         """
         remappings = []
         for periph in peripherals:
-            if periph.get('type') != 'camera':
+            if periph.get("type") != "camera":
                 continue
-            if periph.get('driver') != 'opencv':
+            if periph.get("driver") != "opencv":
                 continue
-            name = periph['name']
-            mj_cam = f'{name}_camera'
-            remappings.extend([
-                (f'/{mj_cam}/color',       f'/camera/{name}/image_raw'),
-                (f'/{mj_cam}/camera_info', f'/camera/{name}/camera_info'),
-            ])
+            name = periph["name"]
+            mj_cam = f"{name}_camera"
+            remappings.extend(
+                [
+                    (f"/{mj_cam}/color", f"/camera/{name}/image_raw"),
+                    (f"/{mj_cam}/camera_info", f"/camera/{name}/camera_info"),
+                ]
+            )
         return remappings

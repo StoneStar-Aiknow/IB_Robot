@@ -8,6 +8,7 @@ publishes on the raw Gazebo sensor topic, not on /camera/{name}/image_raw.
 This will be fixed in T3.
 """
 
+import copy
 import os
 from pathlib import Path
 
@@ -132,8 +133,8 @@ class GazeboAdapter(SimBackendAdapter):
 
         # Scene override: if simulation.scene is set, replace the default world
         # with the sim_models template (resolves mesh paths to absolute URIs).
-        # Also reads robot_spawn from layout.yaml to override initial_pose_z,
-        # so the scene (not the robot YAML) owns the table-relative spawn position.
+        # Also applies robot_spawn from robot_config YAML (falling back to the
+        # scene layout for legacy scenes) to override initial_pose_{x,y,z}.
         _scene_name = robot_config.get("simulation", {}).get("scene")
         if _scene_name:
             try:
@@ -142,7 +143,9 @@ class GazeboAdapter(SimBackendAdapter):
                 world_path = str(get_gazebo_world_path(_scene_name))
                 logger.info(f"sim_models scene '{_scene_name}' → {world_path}")
                 layout = get_scene_layout(_scene_name)
-                spawn = layout.get("robot_spawn", {})
+                spawn = copy.deepcopy(
+                    robot_config.get("simulation", {}).get("robot_spawn", {}) or layout.get("robot_spawn", {})
+                )
                 for axis in ("x", "y", "z"):
                     key = f"initial_pose_{axis}"
                     if axis in spawn:
@@ -207,11 +210,23 @@ class GazeboAdapter(SimBackendAdapter):
         )
 
         # ---- Gazebo server + GUI (must be listed before spawn; see below) ----
+        # IBROBOT_GAZEBO_HEADLESS=1 switches to server-only headless mode (no GUI,
+        # no rendering window).  Used by sim_camera_adjuster when the primary
+        # simulator is MuJoCo and a parallel Gazebo stack is spawned purely for
+        # camera pose calibration.  Default (env unset) preserves the normal
+        # Gazebo UX exactly.
+        headless_prefix = ""
+        if os.environ.get("IBROBOT_GAZEBO_HEADLESS", "0") == "1":
+            headless_prefix = "-s --headless-rendering "
+            logger.info("IBROBOT_GAZEBO_HEADLESS=1 -> Gazebo server-only headless mode")
+
         gz_args = ""
         if Path(world_path).exists():
-            gz_args = f"-r {world_path}"
+            gz_args = f"{headless_prefix}-r {world_path}"
         else:
             logger.info("Using empty Gazebo world (world file not found)")
+            if headless_prefix:
+                gz_args = headless_prefix.strip()
 
         gazebo_launch = IncludeLaunchDescription(
             PythonLaunchDescriptionSource(

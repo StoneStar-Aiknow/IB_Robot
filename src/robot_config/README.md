@@ -38,6 +38,25 @@ robot_config YAML（单一数据源）
                 └───► PolicyBridge / EpisodeRecorder
 ```
 
+## Sim camera pose override（仅限仿真标定，opt-in）
+
+仿真启动时，URDF / MJCF 中相机位姿默认来自 robot YAML 与
+`launch_builders/sim_backend/camera_presets.py:PRESETS`。为了让开发者在仿真里
+调出的视角可以跨重启复用，launch adapter 层会通过
+`launch_builders/sim_backend/camera_overrides.py` 读取一条不进版本控制的用户级旁路：
+
+| 项 | 说明 |
+|---|---|
+| 文件路径 | `~/.ros/ibrobot/sim_camera_overrides/<camera_name>.yaml` |
+| 写入方 | `dataset_tools.camera_alignment`（stub）和 `sim_models.sim_camera_adjuster`（真实位姿） |
+| 字段 | `parent_frame`, `pose.{x,y,z,roll,pitch,yaw}`, `fovy_deg` |
+| 直接生效平台 | `gazebo` |
+| MuJoCo 路径 | 不直接读取同一套角度，而是由 `mujoco_adapter.py` 做显式坐标系转换 |
+| 文件缺失或 stub | 回退到 `PRESETS`，保持历史默认行为 |
+
+这条 override 只服务于开发者标定，不应该被运行时业务逻辑当作新的 SSOT。
+如果仿真相机姿态和 YAML 里看到的不一致，先检查这个目录里是否残留了历史 override。
+
 ## 配置示例
 
 ```yaml

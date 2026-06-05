@@ -98,7 +98,7 @@ robot:
       inference:
         enabled: true
         # execution_mode: "distributed"
-        model: so101_act_rknn
+        model: so101_act
         action_server: /inference/dispatch
         publish_attention: false
         attention_viz_topic: /attention/weights
@@ -270,6 +270,10 @@ robot:
   simulation:
     platform: gazebo        # "gazebo" | "mujoco"
     scene: pick_banana      # null = 不加载场景；pick_banana = 香蕉抓取场景
+    robot_spawn:            # Robot spawn pose owned by robot_config SSOT
+      x: 0.0
+      y: 0.30
+      z: -0.03
     sim_models_pkg: sim_models
 
   # IB-Robot contract integration

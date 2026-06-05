@@ -1,0 +1,17 @@
+# A4 paper materials
+# Used when a4_paper.obj is loaded with an MTL-aware renderer.
+# Keep this file in the same directory as a4_paper.obj and a4_tex.png.
+
+newmtl paper_top
+  Ka 1.0 1.0 1.0
+  Kd 1.0 1.0 1.0
+  Ks 0.05 0.05 0.05
+  Ns 10.0
+  illum 1
+  map_Kd a4_tex.png
+
+newmtl paper_side
+  Ka 1.0 1.0 1.0
+  Kd 1.0 1.0 1.0
+  Ks 0.0 0.0 0.0
+  illum 1
