@@ -12,14 +12,45 @@ import json
 import math
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
 import xacro as _xacro_lib
+
 from robot_config.logger_utils import get_colored_logger
-from robot_config.utils import resolve_ros_path, parse_bool
+from robot_config.utils import parse_bool, resolve_ros_path
 
 logger = get_colored_logger("robot_config.description")
 
 
-def _build_cameras_urdf_from_yaml(peripherals: list, platform: str = "gazebo") -> str:
+def _get_model_spawn_offset(robot_config: dict) -> tuple[float, float, float]:
+    """Return the robot model spawn (x, y, z) from robot YAML.
+
+    This is the ``simulation.robot_spawn`` section of the loaded robot_config.
+    URDF-injected cameras with ``parent="world"`` need to subtract this offset
+    because the URDF ``world`` link is model-local (it sits at the spawn
+    position in Gazebo, NOT at the true world origin).
+
+    Returns (0, 0, 0) when no robot spawn is configured.
+    """
+    if any(f"initial_pose_{a}" in robot_config for a in ("x", "y", "z")):
+        return (
+            float(robot_config.get("initial_pose_x", 0.0)),
+            float(robot_config.get("initial_pose_y", 0.0)),
+            float(robot_config.get("initial_pose_z", 0.0)),
+        )
+
+    spawn = robot_config.get("simulation", {}).get("robot_spawn", {}) or {}
+    return (
+        float(spawn.get("x", 0.0)),
+        float(spawn.get("y", 0.0)),
+        float(spawn.get("z", 0.0)),
+    )
+
+
+def _build_cameras_urdf_from_yaml(
+    peripherals: list,
+    platform: str = "gazebo",
+    model_spawn_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
+) -> str:
     """从 YAML peripherals 动态生成相机 link/joint/gazebo XML。
 
     命名约定（与 sim_peripheral_bridge.py 的 bridge 路径对齐）：
@@ -36,11 +67,20 @@ def _build_cameras_urdf_from_yaml(peripherals: list, platform: str = "gazebo") -
 
     当 use_default_transform=True 时，从 camera_presets 读取平台专属默认位姿。
 
+    ``parent_frame="world"`` 特殊处理：URDF 的 ``world`` link 虽然名字叫 world
+    但实际是模型根，在 Gazebo 里会随机器人 spawn 位置移动。因此对此类
+    camera，我们把 override 里的世界绝对坐标减去 robot_config YAML 中的
+    ``simulation.robot_spawn`` 偏移，使生成的 URDF origin 表示 "相对于 URDF
+    world link 的 offset" —— 机器人 spawn 到任何位置时，相机都落在用户标定的
+    真正世界坐标。
+
     Args:
         peripherals: YAML peripherals 列表。
         platform: 当前仿真平台 ("gazebo" 或 "mujoco")。
+        model_spawn_offset: 机器人模型在 Gazebo 世界坐标的 spawn 位置
+            (x, y, z) —— 用于修正 ``parent_frame="world"`` 的相机位姿。
     """
-    from robot_config.launch_builders.sim_backend.camera_presets import get_preset
+    from robot_config.launch_builders.sim_backend.camera_overrides import load_with_override
 
     parts = []
     for periph in peripherals:
@@ -48,28 +88,37 @@ def _build_cameras_urdf_from_yaml(peripherals: list, platform: str = "gazebo") -
             continue
         if (periph.get("simulation") or {}).get("embedded_sensor", False):
             continue
-        name        = periph["name"]
-        frame_id    = periph.get("frame_id", f"camera_{name}_frame")
+        name = periph["name"]
+        frame_id = periph.get("frame_id", f"camera_{name}_frame")
 
-        # --- preset 查找 ---
-        t           = periph.get("transform", {})
-        cam_fovy    = periph.get("fovy", 60)
+        # --- preset 查找 (优先读 override YAML，fallback 到硬编码默认值) ---
+        t = periph.get("transform", {})
+        cam_fovy = periph.get("fovy", 60)
         if periph.get("use_default_transform", False):
-            preset = get_preset(platform, name)
+            preset = load_with_override(platform, name)
             if preset:
                 t = preset
                 cam_fovy = preset.get("fovy", cam_fovy)
 
-        parent      = t.get("parent_frame", "world")
-        x           = t.get("x",     0.0)
-        y           = t.get("y",     0.0)
-        z           = t.get("z",     0.0)
-        roll        = t.get("roll",  0.0)
-        pitch       = t.get("pitch", 0.0)
-        yaw         = t.get("yaw",   0.0)
-        width       = periph.get("width",  640)
-        height      = periph.get("height", 480)
-        fps         = periph.get("fps",     30)
+        parent = t.get("parent_frame", "world")
+        x = t.get("x", 0.0)
+        y = t.get("y", 0.0)
+        z = t.get("z", 0.0)
+        roll = t.get("roll", 0.0)
+        pitch = t.get("pitch", 0.0)
+        yaw = t.get("yaw", 0.0)
+
+        # The URDF "world" link is actually model-local (sits at model spawn
+        # position in Gazebo).  Convert user-saved world-absolute coords into
+        # offsets from that model-local "world" link by subtracting spawn.
+        if parent == "world":
+            x -= model_spawn_offset[0]
+            y -= model_spawn_offset[1]
+            z -= model_spawn_offset[2]
+
+        width = periph.get("width", 640)
+        height = periph.get("height", 480)
+        fps = periph.get("fps", 30)
         sensor_name = f"{name}_camera"
 
         # fovy (vertical, degrees) → horizontal_fov (radians)
@@ -128,8 +177,7 @@ def _inject_mujoco_camera_sensors(full_urdf: str, peripherals: list) -> str:
         Modified URDF string with sensor blocks injected, or the original
         string unchanged if no opencv cameras are present or parsing fails.
     """
-    opencv_cams = [p for p in peripherals
-                   if p.get("type") == "camera" and p.get("driver") == "opencv"]
+    opencv_cams = [p for p in peripherals if p.get("type") == "camera" and p.get("driver") == "opencv"]
     if not opencv_cams:
         return full_urdf
     try:
@@ -139,22 +187,19 @@ def _inject_mujoco_camera_sensors(full_urdf: str, peripherals: list) -> str:
             return full_urdf
         for periph in opencv_cams:
             name = periph["name"]
-            cam_name = f"{name}_camera"   # must match mujoco_adapter.py convention
-            optical_frame = periph.get("optical_frame_id",
-                                       f"camera_{name}_optical_frame")
+            cam_name = f"{name}_camera"  # must match mujoco_adapter.py convention
+            optical_frame = periph.get("optical_frame_id", f"camera_{name}_optical_frame")
             sensor = ET.SubElement(ros2_ctrl, "sensor")
             sensor.set("name", cam_name)
             for param_key, param_val in [
-                ("frame_name",  optical_frame),
+                ("frame_name", optical_frame),
                 ("image_topic", f"{cam_name}/color"),
-                ("info_topic",  f"{cam_name}/camera_info"),
+                ("info_topic", f"{cam_name}/camera_info"),
                 ("depth_topic", f"{cam_name}/depth"),
             ]:
                 p = ET.SubElement(sensor, "param", name=param_key)
                 p.text = param_val
-        logger.info(
-            f"Injected {len(opencv_cams)} MuJoCo camera sensor(s) into ros2_control block"
-        )
+        logger.info(f"Injected {len(opencv_cams)} MuJoCo camera sensor(s) into ros2_control block")
         return ET.tostring(root, encoding="unicode")
     except ET.ParseError as e:
         logger.warning(f"could not inject MuJoCo camera sensors: {e}")
@@ -201,21 +246,21 @@ def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: s
     reset_positions_json = json.dumps(ros2_control_config.get("reset_positions", {}))
 
     xacro_mappings = {
-        'use_sim': 'true' if is_sim else 'false',
-        'port': port,
-        'calib_file': calib_file,
+        "use_sim": "true" if is_sim else "false",
+        "port": port,
+        "calib_file": calib_file,
         # Pass raw JSON — no extra quotes. xacro receives this as a plain
         # string arg and injects it into <param name="reset_positions"> as
         # text content (not an XML attribute), so no XML-escaping is needed.
         # Wrapping in f"'{json}'" caused the hardware plugin to receive a
         # literal single-quoted string '{"1":0.0}' and fail to parse it.
-        'reset_positions': reset_positions_json,
+        "reset_positions": reset_positions_json,
     }
     custom_xacro_mappings = ros2_control_config.get("xacro_mappings", {})
     for key, value in custom_xacro_mappings.items():
         if isinstance(value, bool):
             xacro_mappings[str(key)] = "true" if value else "false"
-        elif isinstance(value, (dict, list)):
+        elif isinstance(value, dict | list):
             xacro_mappings[str(key)] = json.dumps(value)
         elif value is not None:
             xacro_mappings[str(key)] = str(value)
@@ -248,7 +293,14 @@ def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: s
     # Dynamically inject camera URDF blocks from YAML peripherals
     peripherals = robot_config.get("peripherals", [])
     sim_platform = robot_config.get("simulation", {}).get("platform", "gazebo") if is_sim else "gazebo"
-    cameras_xml = _build_cameras_urdf_from_yaml(peripherals, platform=sim_platform)
+    # World-fixed cameras (parent="world") need the robot model spawn offset
+    # because URDF "world" link is model-local.  Has no effect on other parents.
+    spawn_offset = _get_model_spawn_offset(robot_config) if is_sim and sim_platform == "gazebo" else (0.0, 0.0, 0.0)
+    cameras_xml = _build_cameras_urdf_from_yaml(
+        peripherals,
+        platform=sim_platform,
+        model_spawn_offset=spawn_offset,
+    )
     if cameras_xml:
         full_urdf = base_urdf.replace("</robot>", cameras_xml + "\n</robot>", 1)
         logger.info(

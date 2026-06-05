@@ -270,6 +270,10 @@ robot:
   simulation:
     platform: gazebo        # "gazebo" | "mujoco"
     scene: pick_banana      # null = 不加载场景；pick_banana = 香蕉抓取场景
+    robot_spawn:            # Robot spawn pose owned by robot_config SSOT
+      x: 0.0
+      y: 0.30
+      z: -0.03
     sim_models_pkg: sim_models
 
   # IB-Robot contract integration

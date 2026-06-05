@@ -36,6 +36,10 @@ setup(
             + glob("scenes/pick_banana/meshes/*.png")
             + glob("scenes/pick_banana/meshes/*.mtl"),
         ),
+        # aruco_a4 calibration prop
+        ("share/sim_models/props/calib/aruco_a4/meshes", glob("props/calib/aruco_a4/meshes/*")),
+        ("share/sim_models/props/calib/aruco_a4/gazebo", glob("props/calib/aruco_a4/gazebo/*")),
+        ("share/sim_models/props/calib/aruco_a4/mujoco", glob("props/calib/aruco_a4/mujoco/*")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -44,6 +48,8 @@ setup(
     description="Scene assets and scene compiler for IB-Robot simulation",
     license="Apache-2.0",
     entry_points={
-        "console_scripts": [],
+        "console_scripts": [
+            "sim_camera_adjuster = sim_models.sim_camera_adjuster:main",
+        ],
     },
 )
