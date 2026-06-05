@@ -12,7 +12,8 @@
 
 当前工具保持原始迁移工具的输入方式，并支持显式指定采集格式：
 
-- `--cameras_index_or_path`：直接从本机摄像头或视频设备读取
+- `--camera-source`：直接从本机摄像头索引、视频设备或本地视频文件读取；配合 `--use_sim` 时也可接收 ROS 2 image topic
+- `--cameras_index_or_path`：旧版兼容别名，建议新命令使用 `--camera-source`
 - `--width` / `--height`：请求 OpenCV 以指定分辨率打开设备
 - `--fps`：请求指定帧率
 - `--format`：请求指定采集格式，例如 `MJPG`、`YUYV`
@@ -66,7 +67,7 @@ cd /path/to/IB_Robot
 source .shrc_local
 
 ros2 run dataset_tools camera_alignment \
-  --cameras_index_or_path /dev/video0 \
+  --camera-source /dev/video0 \
   --width 640 \
   --height 480 \
   --fps 60 \
@@ -78,7 +79,7 @@ ros2 run dataset_tools camera_alignment \
 如果设备号是整数，也可以写成：
 
 ```bash
-ros2 run dataset_tools camera_alignment --cameras_index_or_path 0
+ros2 run dataset_tools camera_alignment --camera-source 0
 ```
 
 ## 使用步骤
@@ -117,7 +118,8 @@ q
 
 | 参数 | 说明 |
 | --- | --- |
-| `--cameras_index_or_path` | 本机摄像头索引或设备路径，如 `0`、`/dev/video0` |
+| `--camera-source` | 相机输入源。真机模式可为摄像头索引、设备路径或视频文件，如 `0`、`/dev/video0`；仿真模式配合 `--use_sim` 时可为 ROS 2 image topic |
+| `--cameras_index_or_path` | 旧版兼容别名，等价于 `--camera-source` |
 | `--reference-path` | 参考角点 JSON 输出路径 |
 | `--reference-image-path` | 参考图输出路径 |
 | `--width` | 请求采集宽度，单位为像素 |

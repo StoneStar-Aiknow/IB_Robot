@@ -1,0 +1,35 @@
+<!--
+  MuJoCo MJCF fragment — ArUco A4 calibration paper for IB-Robot.
+
+  This is NOT a standalone MJCF file. It is read by aruco_spawner.verify_mujoco_model(),
+  which replaces {{MESHES_DIR}} with the absolute installed meshes path and wraps it
+  in a complete <mujoco> document for offline validation (mujoco.MjModel.from_xml_string).
+
+  For Phase 3 runtime integration the asset declarations below must be merged into
+  the parent scene's <asset> block, and the <body> included in <worldbody>.
+
+  MuJoCo runtime note (Phase 3):
+    MuJoCo 3.6 supports runtime geom_rgba (show/hide) and mocap_pos (move).
+    mujoco_ros2_control 0.0.2 exposes only ResetWorld service — no direct ROS
+    interface for geom or mocap control. A custom bridge plugin is needed (Phase 3).
+    Default pos z=-100 places the body below the scene floor (invisible to cameras)
+    until the bridge moves it into view.
+
+  Asset declarations (for parent scene's <asset> block):
+    <texture name="a4_tex" type="2d" file="{{MESHES_DIR}}/a4_tex.png"/>
+    <material name="a4_mat" texture="a4_tex" texrepeat="1 1" texuniform="true"
+              shininess="0.05" specular="0.05" reflectance="0.0"/>
+    <mesh name="a4_paper" file="{{MESHES_DIR}}/a4_paper.obj" scale="0.001 0.001 0.001" inertia="shell"/>
+-->
+<body name="aruco_a4" pos="0 0 -100" euler="90 0 0">
+  <!-- euler="90 0 0": rotate 90° CCW around X so Z points up (out of paper face).
+       Gazebo uses independent box geometry and is unaffected by this rotation. -->
+  <!-- Visual-only textured mesh; no mass, no collision -->
+  <geom name="aruco_a4_visual"
+        type="mesh"
+        mesh="a4_paper"
+        material="a4_mat"
+        contype="0"
+        conaffinity="0"
+        mass="0"/>
+</body>

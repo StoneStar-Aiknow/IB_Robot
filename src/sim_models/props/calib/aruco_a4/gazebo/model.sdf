@@ -1,0 +1,70 @@
+<?xml version="1.0"?>
+<!--
+  Gazebo SDF — ArUco A4 calibration paper for IB-Robot sim camera alignment.
+
+  IMPORTANT: Uses box geometry + PBR texture instead of DAE mesh to avoid an
+  Ogre2 2.2.5 buffer-lock crash (Ignition Gazebo 6) that occurs when DAE meshes
+  are dynamically spawned and loaded concurrently by the sensor and GUI render threads.
+
+  This file is NOT used directly by Gazebo. aruco_spawner.py reads it, replaces
+  {{MESH_PATH}} with the ament_index-resolved absolute path, then passes the SDF
+  string inline to the /world/{world}/create service.
+
+  Physical dimensions: 210 x 297 x 1 mm (A4 paper).
+  Box geometry in link-local frame (before rotation):
+    X: 0 → 0.297 m (paper length, long side)
+    Y: 0 → 0.21 m  (paper width, short side)
+    Z: 0 → 0.001 m (paper thickness)
+  Link is pre-rotated -90° around Z (yaw = -1.5708 rad).
+  After rotation, in model/world frame:
+    X: 0 → 0.21 m  (short side, paper width)
+    Y: -0.297 → 0 m (long side, paper length, extends in -Y)
+  Spawn at (0, 0.297, z) to place the paper fully in positive XY quadrant.
+-->
+<sdf version="1.6">
+  <model name="aruco_a4">
+
+    <static>true</static>
+
+    <link name="link">
+      <!-- Baked-in -90° Z rotation: long side (0.297m) goes along -Y in world frame.
+           UV mapping is in link-local frame, so texture portrait orientation is preserved. -->
+      <pose>0 0 0  0 0 -1.5708</pose>
+
+      <visual name="visual">
+        <!-- Box centre in link-local frame (before rotation).
+             Ignition Gazebo 6 top-face UV: U→Y, V→X (link-local).
+             Texture 1240px(U/Y=0.21m) × 1754px(V/X=0.297m) → same px/m → no distortion. -->
+        <pose>0.1485 0.105 0.0005  0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.297 0.21 0.001</size>
+          </box>
+        </geometry>
+        <material>
+          <diffuse>1 1 1 1</diffuse>
+          <specular>0.05 0.05 0.05 1</specular>
+          <pbr>
+            <metal>
+              <albedo_map>file://{{MESH_PATH}}/a4_tex.png</albedo_map>
+              <!-- metalness=0: pure diffuse (non-metallic); roughness=1: no specular highlight.
+                   Default metalness=1.0 in Ignition makes the surface appear black. -->
+              <metalness>0.0</metalness>
+              <roughness>1.0</roughness>
+            </metal>
+          </pbr>
+        </material>
+      </visual>
+
+      <collision name="collision">
+        <pose>0.1485 0.105 0.0005  0 0 0</pose>
+        <geometry>
+          <box>
+            <size>0.297 0.21 0.001</size>
+          </box>
+        </geometry>
+      </collision>
+
+    </link>
+  </model>
+</sdf>
