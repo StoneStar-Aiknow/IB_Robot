@@ -681,7 +681,7 @@ class RKNNRuntimeSession:
         ret = self._rknn.load_rknn(str(model_path))
         if ret != 0:
             raise RuntimeError(f"RKNN load_rknn failed with ret={ret}")
-        ret = self._rknn.init_runtime(target=None)
+        ret = self._rknn.init_runtime(target=None, core_mask=RKNNLite.NPU_CORE_ALL)
         if ret != 0:
             raise RuntimeError(f"RKNN init_runtime failed with ret={ret}")
 
