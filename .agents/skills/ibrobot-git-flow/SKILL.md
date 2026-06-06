@@ -9,6 +9,21 @@ This skill automates code commit process for IB_Robot project (root repo with sr
 
 ## Core Specifications
 
+### 0. Commit Scope — Only Commit What You Changed
+
+**Do NOT blindly `git add .` and commit everything.** Before staging, carefully inspect `git diff` and `git status` to ensure only files related to the current task are included.
+
+**`libs/lerobot` exclusion rule:**
+- `libs/lerobot` is managed via a **patch stack** (`third_party/patches/lerobot/`). Changes inside `libs/lerobot` must be exported as patches using the `ibrobot-lerobot-patch` skill — they should **never** be committed directly to the root repo via `git add libs/lerobot`.
+- Therefore, during normal `git commit` workflow, **always exclude `libs/lerobot` from staging**. Use `git add` on specific files or paths, NOT `git add .` from the repo root.
+- The only exception: the user explicitly asks to commit lerobot changes directly (e.g., "把 lerobot 的改动也提交了").
+
+**Practical rule:**
+1. Review `git status` output carefully.
+2. Stage only the files that belong to the current task using `git add <specific-paths>`.
+3. If `libs/lerobot` appears in `git status`, explicitly skip it with `git restore --staged libs/lerobot` or simply do not stage it.
+4. If unrelated files (not part of the current task) appear modified, skip them too unless the user asks to include them.
+
 ### 1. Commit Message Format
 Must strictly follow this structure with exactly one blank line between sections:
 
@@ -55,27 +70,46 @@ If user explicitly requests **local commit only** (e.g., "commit to local", "onl
 ### Phase 2: Compose Commit Message
 1. Help user draft commit message (Title, Body, Footer) following specifications above.
 2. **Validate**: Check title length, format, blank lines, and Chinese characters.
+3. **Confirm staging scope**: Show the user which files will be committed, explicitly noting any excluded files (especially `libs/lerobot`).
 
 ### Phase 3: Execute Commit and Push
 
-For submodule `libs/lerobot` (if changed):
+**Important**: `libs/lerobot` is patch-managed and must NOT be committed to the root repo during normal commits. Only commit the files related to the current task.
+
+For root repository:
+1. Stage only the relevant files: `git add <specific-paths>` (NOT `git add .`).
+2. If `libs/lerobot` was accidentally staged, unstage it: `git restore --staged libs/lerobot`.
+3. Verify staging area with `git diff --cached --stat` before committing.
+4. **Lint staged Python files only**: Run ruff check and format **only on the files you are about to commit**, NOT on the entire project:
+   ```bash
+   # Get the list of staged Python files
+   STAGED_PY=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
+   if [ -n "$STAGED_PY" ]; then
+     ruff check $STAGED_PY && ruff format $STAGED_PY
+   fi
+   ```
+   If ruff auto-fixed or reformatted any file, re-stage it: `git add <fixed-files>`.
+   **Never** run bare `ruff check --fix .` or `ruff format .` — that modifies unrelated files and pollutes the commit.
+5. Run `git commit -s`.
+6. If NOT "local commit only":
+   - Execute `git push origin <branch>` (use `--force-with-lease` for amend push).
+   - **Get remote info**: Extract username and repo name via `git remote get-url origin`.
+   - **Check for existing PR**: After push, check whether this branch already has an open PR on the target repo. If the push output or remote hook response contains a PR/MR URL, extract the PR number. Otherwise, query via `pr_management.py --fetch-info` or check AtomGit UI.
+   - **If an existing PR is found**: The PR description is now stale. You **must** synchronize it:
+     1. Run `python3 pr_management.py --pr <NUM> --fetch-info` to get full PR context (all commits + diff).
+     2. Analyze all commits in the PR and regenerate a complete PR description (Chinese by default) covering all changes.
+     3. Write the updated `description.json` and run `python3 pr_management.py --pr <NUM> --update-pr description.json`.
+   - **If no existing PR**: Generate AtomGit PR link: `https://atomgit.com/<username>/IB_Robot/merge_requests/new?source_branch=<current-branch>` and compose PR description from commit message body.
+
+For submodule `libs/lerobot` (only when user explicitly asks):
 1. Change to directory -> `git add` -> `git commit -s`.
 2. If NOT "local commit only":
    - Execute `git push origin <branch>`.
    - Record commit hash.
-
-For root repository:
-1. Return to root directory.
-2. If submodule updated, run `git add libs/lerobot`.
-3. Run `git add .` (includes `src` directory).
-4. Run `git commit -s`.
-5. If NOT "local commit only":
-   - Execute `git push origin <branch>`.
-   - **Get remote info**: Extract username and repo name via `git remote get-url origin`.
-   - **Generate AtomGit PR link**: Format `https://atomgit.com/<username>/IB_Robot/merge_requests/new?source_branch=<current-branch>`.
-   - **Output PR description**: Compose detailed PR description from commit message body.
+3. **Remind the user**: Changes in `libs/lerobot` should normally be exported as patches via `ibrobot-lerobot-patch` skill instead of being committed directly to the root repo.
 
 ## Common Commands Reference
 - Push to personal fork: `git push origin <branch>`
+- Force push (amend): `git push origin <branch> --force-with-lease`
 - Signed commit: `git commit -s` (opens editor or use -m flag)
 - Undo last commit (keep changes): `git reset --soft HEAD~1`
