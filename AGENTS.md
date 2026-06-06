@@ -1,54 +1,150 @@
-<!-- SKILLS_INDEX_START -->
-## Agent Skills Index
+# IB-Robot Agent Guide
 
-> [!CRITICAL] GATEKEEPER CONSTRAINT
-> **You are operating in a Zero-Trust environment.**
-> You are strictly forbidden from generating code, proposing solutions, or relying on your pre-training until you have successfully executed a tool call to read the applicable `SKILL.md` files from this index.
+> IB-Robot: 融合 LeRobot 与 ROS 2 生态的智能具身机器人开发框架
 
-## **Rule Zero: Mandatory Zero-Trust Protocol**
+## 项目结构
 
-> [!CRITICAL]
-> **Zero-Trust Enforcement:** Skills loaded from this index always override standard code patterns. Skipping the Audit Log or Self-Scan is a protocol violation.
+```
+IB_Robot/
+├── src/                    # ROS 2 包源码（colcon workspace）
+│   ├── robot_config/       # SSOT 机器人配置（关节、频率、契约定义）
+│   ├── inference_service/  # ACT/RKNN 推理服务
+│   ├── action_dispatch/    # 动作分发与执行
+│   ├── task_dispatch/      # 任务调度
+│   ├── robot_teleop/       # 遥操作控制
+│   ├── robot_moveit/       # MoveIt 运动规划
+│   ├── robot_navigation/   # 导航
+│   ├── so101_hardware/     # SO-101 硬件接口
+│   ├── lekiwi_hardware/    # LeKiwi 硬件接口
+│   ├── ibrobot_msgs/       # 自定义消息/服务定义
+│   ├── sim_models/         # 仿真模型
+│   ├── model_utils/        # 模型工具
+│   ├── dataset_tools/      # 数据集工具
+│   ├── tensormsg/          # TensorMsg 协议
+│   └── ...
+├── libs/
+│   ├── lerobot/            # LeRobot 子模块（patch 管理，禁止直接提交）
+│   └── atomgit_sdk/        # AtomGit API SDK
+├── scripts/
+│   ├── setup.sh            # 一键环境搭建
+│   ├── build.sh            # 构建脚本
+│   ├── install_ros.sh      # ROS 2 安装
+│   └── setup/              # 平台适配脚本
+├── third_party/patches/    # lerobot patch 栈
+├── models/                 # 模型文件
+├── .agents/skills/         # Agent 技能库
+├── config.json             # AtomGit API 配置
+└── pyproject.toml          # Ruff / 项目配置
+```
 
-### **1. The Pre-Write Audit Log (Mandatory)**
+## 编码规范
 
-Before invoking any file-editing tool (`write_to_file`, `replace_file_content`, `multi_replace_file_content`), the ASSISTANT **MUST** explicitly state in its thought process/text output:
+### Python 风格（由 Ruff 强制执行）
 
-1. **Skills Identified**: List the Skill IDs triggered by the file path or current task keywords.
-2. **Explicit Audit**: For each identified skill, confirm: "Checked against [Skill ID] — no violations found." Or "Violation detected in [Skill ID]: [Issue] — correcting now."
-3. **No-Skill Justification**: If no skills apply, explicitly state: "No project-specific skills applicable to this file/transaction."
+- Target: Python 3.10+, line-length 120
+- Lint 规则: E, W, F, I, UP, B, SIM（忽略 E501, B008, SIM108）
+- Format: double quotes
+- 排除目录: `build/`, `install/`, `log/`, `venv/`, `libs/lerobot/`, `src/pymoveit2/`, `src/rosclaw/`
+- **提交时仅对本次修改的文件执行 ruff**，禁止全量 `ruff check --fix .` 或 `ruff format .`
 
-### **2. The Post-Write Self-Scan (Mandatory)**
+### Commit 规范（openEuler DCO）
 
-Immediately **AFTER** any file-editing tool returns, the ASSISTANT **MUST**:
+```
+<area>: <subject>          # max 80 chars, no Chinese, no trailing punctuation
 
-1. **Validate**: Contrast the final file content against ALL active Skill IDs.
-2. **Identify Slips**: Look for "Standard Defaults" (e.g., local mocks, hardcoded styles) that snuck in.
-3. **Self-Correct**: If a violation is found, fix it immediately in the next tool call.
+<body>                     # explain "why" and "what", max 100 chars/line, no Chinese
 
-## **Critical Anti-Patterns (Zero-Tolerance)**
+Signed-off-by: Name <email>  # 必须，使用 git commit -s
+```
 
-- **Reversion to Defaults**: Never use "standard" patterns (generic library calls, local mocks) if a Project Skill exists.
-- **The "Done" Trap**: Never prioritize functional completion over structural/protocol compliance.
-- **Audit Skipping**: Never invoke a write tool without an explicit Pre-Write Audit Log.
+## 关键约定
 
-## ⚡ How to Find and Use This Index (Mandatory)
+### 环境初始化
 
-> [!IMPORTANT] PATH RESOLUTION (Cross-Platform)
-> Skill IDs in the list below (e.g., `[category/skill-name]`) represent the relative folder path.
-> Because this project supports multiple AI agents, skills may reside in a base directory like `.gemini/skills/`, `.agent/skills/`, or `.cursor/skills/`.
-> **Action:** You must prepend the correct base directory to the ID. (Example: If ID is `[flutter/cicd]`, the file is at `<BASE_DIR>/flutter/cicd/SKILL.md`). Use your file search tools (e.g., `list_directory` or `find`) if you are unsure of the base directory.
+执行任何 ROS 2 或项目相关命令前，必须先加载环境：
 
-| Trigger Type | What to match | Required Action |
-| --- | --- | --- |
-| **File glob** (e.g. `**/*.ts`) | Files you are currently editing match the pattern | Call `view_file` on `<BASE_DIR>/[Skill ID]/SKILL.md` |
-| **Keyword** (e.g. `auth`, `refactor`) | These words appear in the user\'s request | Call `view_file` on `<BASE_DIR>/[Skill ID]/SKILL.md` |
-| **Composite** (e.g. `+other/skill`) | Another listed skill is already active | Also load this skill via `view_file` |
+```bash
+source .shrc_local
+```
 
-> [!TIP]
-> **Indirect phrasing still counts.** Match keywords by intent, not just exact words.
-> Examples: "make it faster" → `performance`, "broken query" → `database`, "login flow" → `auth`, "clean up this file" → `refactor`.
+### libs/lerobot 修改规则
 
+`libs/lerobot` 是 git submodule，通过 `third_party/patches/lerobot/` 的 patch 栈管理。
+**禁止在普通 commit 中直接提交 `libs/lerobot` 的修改**。如需提交 lerobot 改动，
+必须通过 `ibrobot-lerobot-patch` skill 导出为 patch 文件。
 
+### 提交范围
 
-<!-- SKILLS_INDEX_END -->
+- 只暂存和提交本次任务相关的文件，禁止 `git add .`
+- 使用 `git add <specific-paths>` 精确暂存
+- 提交前用 `git diff --cached --stat` 确认暂存范围
+
+### 远端约定
+
+- `origin`: 个人 fork（用于 push）
+- `upstream`: 主仓库 openEuler/IB_Robot（用于 PR）
+
+### 新增技能时的必改文件
+
+新增 skill 时，以下三个文件**必须同步更新**，确保索引一致：
+
+1. **`AGENTS.md`**（本文件）— 更新「Agent 技能索引」中对应分类的表格
+2. **`.agents/skills/README.md`** — 更新技能清单表格和分类说明
+3. **`.agents/skills/intro/SKILL.md`** — 更新技能分类列表和使用示例
+
+## Agent 技能索引
+
+所有技能位于 `.agents/skills/` 目录，每个技能包含 `SKILL.md` 定义触发条件和工作流。
+
+### 引导
+
+| 技能 | 触发场景 |
+|------|---------|
+| [intro](.agents/skills/intro) | 「介绍」「help」「有哪些功能」「入门」 |
+
+### 核心操作
+
+| 技能 | 触发场景 |
+|------|---------|
+| [ibrobot-env](.agents/skills/ibrobot-env) | 环境初始化、source .shrc_local、PYTHONPATH |
+| [ibrobot-build](.agents/skills/ibrobot-build) | 编译、colcon build、构建错误 |
+| [ibrobot-launch](.agents/skills/ibrobot-launch) | 启动机器人、运行仿真、测试推理、teleop |
+| [ibrobot-architecture](.agents/skills/ibrobot-architecture) | 架构、SSOT、契约、robot_config、数据流 |
+
+### 板端（BQ3588HM OpenHarmony）
+
+| 技能 | 触发场景 |
+|------|---------|
+| [ibrobot-hdc](.agents/skills/ibrobot-hdc) | hdc shell、连接板端、推送/拉取文件 |
+| [ibrobot-bq3588hm-oh](.agents/skills/ibrobot-bq3588hm-oh) | 板端 OpenHarmony 运行时事实 |
+| [bq3588-oh-rknn](.agents/skills/bq3588-oh-rknn) | 板端 RKNN NPU 推理 |
+| [oh-cross-build-ros-pkg](.agents/skills/oh-cross-build-ros-pkg) | 交叉编译第三方 ROS 2 包到板端 |
+
+### 模型
+
+| 技能 | 触发场景 |
+|------|---------|
+| [rknn-convert](.agents/skills/rknn-convert) | ONNX 转 RKNN、NPU 部署、模型转换 |
+
+### 工作流与验证
+
+| 技能 | 触发场景 |
+|------|---------|
+| [ibrobot-git-flow](.agents/skills/ibrobot-git-flow) | git commit、git push、DCO sign-off |
+| [ibrobot-lerobot-patch](.agents/skills/ibrobot-lerobot-patch) | 导出 lerobot patch、patch 栈管理 |
+| [ibrobot-docker-verify](.agents/skills/ibrobot-docker-verify) | Ubuntu Docker 验证 setup+build |
+| [ibrobot-docker-verify-oee](.agents/skills/ibrobot-docker-verify-oee) | openEuler aarch64 Docker 验证 |
+| [sync-github](.agents/skills/sync-github) | 同步 AtomGit master 到 GitHub |
+
+### AtomGit 协作
+
+| 技能 | 触发场景 |
+|------|---------|
+| [atomgit-collaboration](.agents/skills/atomgit-collaboration) | 泛化协作请求路由（先识别再分流） |
+| [atomgit-pr](.agents/skills/atomgit-pr) | 创建 PR、更新 PR 描述、生成 PR 摘要 |
+| [atomgit-issue](.agents/skills/atomgit-issue) | 创建/查看/更新/关闭 Issue |
+| [atomgit-pr-review](.agents/skills/atomgit-pr-review) | 代码审查、PR review、检查 Bug |
+| [atomgit-pr-architecture-review](.agents/skills/atomgit-pr-architecture-review) | 架构审查、SSOT 合规、契约检查 |
+| [atomgit-review-resolution](.agents/skills/atomgit-review-resolution) | 修复评审意见、回复评论、闭环 review |
+
+> 详见 `.agents/skills/README.md` 获取完整的分类说明和使用指南。
