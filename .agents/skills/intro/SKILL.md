@@ -20,11 +20,32 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | **ibrobot-launch** | 启动机器人节点、仿真环境、推理测试或遥操作调试 |
 | **ibrobot-build** | 编译整个工作空间或指定 package（`colcon build`） |
 | **ibrobot-env** | 初始化运行环境，加载 `.shrc_local`、设置 `ROS_DOMAIN_ID` |
-| **ibrobot-bq3588hm-oh** | 管理贝启 BQ3588HM 开发板上的 OpenHarmony 运行时、ROS 环境与 Python 3.12 事实 |
-| **ibrobot-hdc** | 连接 BQ3588HM 开发板，执行 hdc shell / file send / file recv 等板端操作 |
-| **rknn-convert** | 将 ONNX 模型转换为 RKNN，并明确主 venv 导出 ONNX、`.venv-rknn` 转 RKNN 的分层流程 |
-| **bq3588-oh-rknn** | 在 BQ3588HM OpenHarmony 板端拉起 RKNN cloud inference，封装 `cloud_inference.launch.py` 的运行环境 |
 | **ibrobot-architecture** | 理解 SSOT 架构设计、配置规范与数据流 |
+
+### 🔌 板端（BQ3588HM OpenHarmony）
+
+| Skill | 一句话描述 |
+| :--- | :--- |
+| **ibrobot-hdc** | 连接 BQ3588HM 开发板，执行 hdc shell / file send / file recv 等板端操作 |
+| **ibrobot-bq3588hm-oh** | 管理贝启 BQ3588HM 开发板上的 OpenHarmony 运行时、ROS 环境与 Python 3.12 事实 |
+| **bq3588-oh-rknn** | 在 BQ3588HM OpenHarmony 板端拉起 RKNN cloud inference，封装 `cloud_inference.launch.py` 的运行环境 |
+| **oh-cross-build-ros-pkg** | 将第三方 ROS 2 包（如 usb_cam）交叉编译移植到 BQ3588HM OpenHarmony 板 |
+
+### 🧠 模型
+
+| Skill | 一句话描述 |
+| :--- | :--- |
+| **rknn-convert** | 将 ONNX 模型转换为 RKNN，并明确主 venv 导出 ONNX、`.venv-rknn` 转 RKNN 的分层流程 |
+
+### 🚀 工作流与验证
+
+| Skill | 一句话描述 |
+| :--- | :--- |
+| **ibrobot-git-flow** | 规范提交代码，确保符合 openEuler DCO/Commit 规范，push 后自动同步 PR 描述 |
+| **ibrobot-lerobot-patch** | 将 `libs/lerobot` 的本地改动导出为受管 patch，并同步 `series.txt` / `manifest.yaml` / 测试夹具 |
+| **ibrobot-docker-verify** | 在干净 Ubuntu 22.04 Docker 容器中端到端验证 setup.sh + build.sh |
+| **ibrobot-docker-verify-oee** | 在 openEuler Embedded (aarch64) Docker 容器中端到端验证 setup.sh + build.sh |
+| **sync-github** | 将 AtomGit master 分支同步推送到 GitHub |
 
 ### 🔍 代码协作
 
@@ -41,13 +62,6 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | :--- | :--- |
 | **atomgit-pr** | 创建、读取或更新合并请求（PR），自动生成/同步描述 |
 | **atomgit-issue** | 创建、读取或管理 Issue，报告 Bug、提出建议 |
-
-### 🚀 工作流
-
-| Skill | 一句话描述 |
-| :--- | :--- |
-| **ibrobot-lerobot-patch** | 将 `libs/lerobot` 的本地改动导出为受管 patch，并同步 `series.txt` / `manifest.yaml` / 测试夹具 |
-| **ibrobot-git-flow** | 规范提交代码，确保符合 openEuler DCO/Commit 规范 |
 
 ---
 
@@ -68,11 +82,15 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 连接 BQ3588HM 并推送文件         → ibrobot-hdc
 把 ONNX 转成 RKNN               → rknn-convert
 在 BQ3588HM 上启动 RKNN 推理     → bq3588-oh-rknn
+把 usb_cam 移植到板端            → oh-cross-build-ros-pkg
 启动机器人仿真                  → ibrobot-launch
 初始化环境                      → ibrobot-env
 提交代码                        → ibrobot-git-flow
 把 libs/lerobot 的改动做成 patch  → ibrobot-lerobot-patch
 导出 lerobot patch 并更新 series  → ibrobot-lerobot-patch
+Docker 验证一下 setup 和 build   → ibrobot-docker-verify
+验证 openEuler 构建              → ibrobot-docker-verify-oee
+同步到 GitHub                   → sync-github
 检查架构合规性                  → atomgit-pr-architecture-review
 解释系统架构                    → ibrobot-architecture
 有哪些功能 / help / 入门       → intro (本技能)
