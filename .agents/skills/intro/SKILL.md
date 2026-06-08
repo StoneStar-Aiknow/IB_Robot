@@ -30,6 +30,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | **ibrobot-bq3588hm-oh** | 管理贝启 BQ3588HM 开发板上的 OpenHarmony 运行时、ROS 环境与 Python 3.12 事实 |
 | **bq3588-oh-rknn** | 在 BQ3588HM OpenHarmony 板端拉起 RKNN cloud inference，封装 `cloud_inference.launch.py` 的运行环境 |
 | **oh-cross-build-ros-pkg** | 将第三方 ROS 2 包（如 usb_cam）交叉编译移植到 BQ3588HM OpenHarmony 板 |
+| **oh-rebuild-kernel** | 重新编译并刷入 BQ3588HM 内核 (boot_linux.img)，启用 USB ACM 等驱动 |
 
 ### 🧠 模型
 
@@ -83,6 +84,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 把 ONNX 转成 RKNN               → rknn-convert
 在 BQ3588HM 上启动 RKNN 推理     → bq3588-oh-rknn
 把 usb_cam 移植到板端            → oh-cross-build-ros-pkg
+重新编译板端内核                 → oh-rebuild-kernel
 启动机器人仿真                  → ibrobot-launch
 初始化环境                      → ibrobot-env
 提交代码                        → ibrobot-git-flow

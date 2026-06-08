@@ -119,6 +119,7 @@ source .shrc_local
 | [ibrobot-bq3588hm-oh](.agents/skills/ibrobot-bq3588hm-oh) | 板端 OpenHarmony 运行时事实 |
 | [bq3588-oh-rknn](.agents/skills/bq3588-oh-rknn) | 板端 RKNN NPU 推理 |
 | [oh-cross-build-ros-pkg](.agents/skills/oh-cross-build-ros-pkg) | 交叉编译第三方 ROS 2 包到板端 |
+| [oh-rebuild-kernel](.agents/skills/oh-rebuild-kernel) | 重新编译并刷入 BQ3588HM 内核 |
 
 ### 模型
 
