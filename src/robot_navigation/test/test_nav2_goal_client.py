@@ -9,12 +9,14 @@ Uses unittest.mock to replace ActionClient and ServiceClient.
 
 import json
 import math
+import threading
 import time
 from unittest.mock import MagicMock
 
 import pytest
 import rclpy
 from action_msgs.msg import GoalStatus
+from rclpy.executors import SingleThreadedExecutor
 from std_msgs.msg import String
 
 from robot_navigation.nav2_goal_client import Nav2GoalClient
@@ -26,16 +28,12 @@ _orig = {}
 
 
 @pytest.fixture(scope="module")
-def rclpy_init():
+def node_env():
+    """Module-scoped Nav2GoalClient with background executor."""
     rclpy.init()
-    yield
-    rclpy.shutdown()
-
-
-@pytest.fixture(scope="module")
-def node(rclpy_init):
-    """Module-scoped Nav2GoalClient with test topic subscriptions."""
+    executor = SingleThreadedExecutor()
     n = Nav2GoalClient()
+    executor.add_node(n)
 
     # Save originals before any test can mock them
     _orig["send_goal_async"] = n.nav_to_pose_client.send_goal_async
@@ -48,8 +46,21 @@ def node(rclpy_init):
     n.voice_sub = n.create_subscription(String, "/test/keyword_matched", n.voice_command_callback, 10)
     n.nav_stop_sub = n.create_subscription(String, "/test/nav_stop", n.stop_callback, 10)
 
-    yield n
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+    time.sleep(0.3)
+
+    yield {"node": n, "executor": executor}
+
+    executor.shutdown()
+    spin_thread.join(timeout=5.0)
     n.destroy_node()
+    rclpy.shutdown()
+
+
+@pytest.fixture(scope="module")
+def node(node_env):
+    return node_env["node"]
 
 
 @pytest.fixture
@@ -109,24 +120,30 @@ def _make_result_future(status):
 def _publish_and_collect(node, topic, msg_type, text, pub_topic="/test/keyword_matched", timeout=1.0):
     """Publish text on pub_topic, return first msg received on topic."""
     received = []
-    sub = node.create_subscription(msg_type, topic, lambda m: received.append(m), 10)
-    pub = node.create_publisher(String, pub_topic, 10)
+    event = threading.Event()
 
-    deadline = node.get_clock().now() + rclpy.duration.Duration(seconds=0.3)
-    while node.get_clock().now() < deadline:
-        rclpy.spin_once(node, timeout_sec=0.05)
+    sub = node.create_subscription(msg_type, topic, lambda m: (received.append(m), event.set()), 10)
+    pub = node.create_publisher(String, pub_topic, 10)
+    time.sleep(0.2)  # let pub/sub connect
 
     msg = String()
     msg.data = text
     pub.publish(msg)
 
-    deadline = node.get_clock().now() + rclpy.duration.Duration(seconds=timeout)
-    while not received and node.get_clock().now() < deadline:
-        rclpy.spin_once(node, timeout_sec=0.05)
-
+    event.wait(timeout=timeout)
     node.destroy_subscription(sub)
     node.destroy_publisher(pub)
     return received[-1] if received else None
+
+
+def _wait_for_callback(node, predicate, timeout=1.0):
+    """Wait until predicate(node) is True, polling at 50ms intervals."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate(node):
+            return True
+        time.sleep(0.05)
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -489,8 +506,7 @@ class TestEndToEnd:
                 }
             ),
         )
-        for _ in range(10):
-            rclpy.spin_once(node, timeout_sec=0.05)
+        _wait_for_callback(node, lambda n: n.nav_to_pose_client.send_goal_async.call_count >= 1)
         node.nav_to_pose_client.send_goal_async.assert_called_once()
 
     def test_action_via_topic(self, node, reset_state):
@@ -507,8 +523,7 @@ class TestEndToEnd:
                 }
             ),
         )
-        for _ in range(10):
-            rclpy.spin_once(node, timeout_sec=0.05)
+        _wait_for_callback(node, lambda n: n.current_task_description == "Pick blue")
         assert node.current_task_description == "Pick blue"
 
     def test_stop_via_topic_when_navigating(self, node, reset_state):
@@ -521,8 +536,7 @@ class TestEndToEnd:
             "stop",
             pub_topic="/test/nav_stop",
         )
-        for _ in range(10):
-            rclpy.spin_once(node, timeout_sec=0.05)
+        _wait_for_callback(node, lambda n: n._cancel_navigation.call_count >= 1)
         node._cancel_navigation.assert_called()
 
     def test_stop_via_topic_when_idle(self, node, reset_state):
@@ -535,8 +549,7 @@ class TestEndToEnd:
             "stop",
             pub_topic="/test/nav_stop",
         )
-        for _ in range(10):
-            rclpy.spin_once(node, timeout_sec=0.05)
+        time.sleep(0.5)
         node._cancel_navigation.assert_not_called()
 
     def test_multiple_commands_sequence(self, node, reset_state):
