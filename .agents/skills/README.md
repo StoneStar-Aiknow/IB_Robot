@@ -13,6 +13,7 @@
 | [ibrobot-hdc](./ibrobot-hdc) | 板端 | 连接 BQ3588HM 开发板，执行 HDC shell / file send / file recv。 |
 | [ibrobot-bq3588hm-oh](./ibrobot-bq3588hm-oh) | 板端 | 记录 BQ3588HM 板上的 OpenHarmony ROS / Python / RKNN 运行时事实。 |
 | [bq3588-oh-rknn](./bq3588-oh-rknn) | 板端 | 在 BQ3588HM 上拉起 `cloud_inference.launch.py` 的 RKNN 推理路径。 |
+| [oh-build-ibrobot](./oh-build-ibrobot) | 板端 | 使用 `build_ibrobot_oh_custom.sh` 主机侧交叉编译并打包 IB_Robot 自有 OpenHarmony 运行时。 |
 | [rknn-convert](./rknn-convert) | 模型 | 将 ONNX 转成 RKNN，并维护主 `venv` 导出 ONNX、`.venv-rknn` 转 RKNN 的流程边界。 |
 | [ibrobot-architecture](./ibrobot-architecture) | 知识 | 理解 SSOT 模式、修改 `robot_config`、解释数据流或契约设计。 |
 | [ibrobot-lerobot-patch](./ibrobot-lerobot-patch) | 工作流 | 将 `libs/lerobot` 的本地改动导出为 `third_party/patches/lerobot/<tag>/*.patch`，并通过辅助脚本同步 `series/manifest/test`。 |
@@ -45,6 +46,7 @@
 - **板端连接 ([ibrobot-hdc](./ibrobot-hdc))**: 统一封装 BQ3588HM 的 HDC over TCP 访问与文件传输。
 - **板端事实 ([ibrobot-bq3588hm-oh](./ibrobot-bq3588hm-oh))**: 汇总 BQ3588HM 板上的 OpenHarmony、ROS、Python、RKNN 运行时事实。
 - **板端 RKNN 运行 ([bq3588-oh-rknn](./bq3588-oh-rknn))**: 专门处理 `cloud_inference.launch.py device:=rknn` 的板端环境叠加与启动。
+- **OH 主机侧构建 ([oh-build-ibrobot](./oh-build-ibrobot))**: 通过 `build_ibrobot_oh_custom.sh` 交叉编译 `ibrobot_msgs,tensormsg,robot_config,inference_service`，并强制确认 `series.openharmony-5.1.0-musl.txt` 真正进入板端 runtime 产物。
 - **RKNN 转换 ([rknn-convert](./rknn-convert))**: 明确 ONNX 导出与 RKNN 转换的边界，避免主 `venv` 与 `.venv-rknn` 污染。
 - **架构顾问 ([ibrobot-architecture](./ibrobot-architecture))**: 充当项目的架构师，解答一切关于设计模式和配置规范的问题。
 - **LeRobot 补丁纳管 ([ibrobot-lerobot-patch](./ibrobot-lerobot-patch))**: 把 `libs/lerobot` 的本地改动回收为受管 patch 栈，而不是直接提交子模块 gitlink。

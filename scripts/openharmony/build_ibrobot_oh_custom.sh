@@ -187,14 +187,19 @@ ensure_workspace_links() {
 ensure_lerobot_submodule() {
     local lerobot_dir="${IB_ROBOT_ROOT}/libs/lerobot"
 
-    if [[ -d "${lerobot_dir}/.git" || -f "${lerobot_dir}/.git" ]] && [[ -d "${lerobot_dir}/src" ]]; then
+    if git -C "${lerobot_dir}" rev-parse --git-dir >/dev/null 2>&1 && [[ -d "${lerobot_dir}/src" ]]; then
+        return
+    fi
+
+    if ! git -C "${IB_ROBOT_ROOT}" rev-parse --git-dir >/dev/null 2>&1; then
+        log_warn "${IB_ROBOT_ROOT} is not a git checkout; skipping local libs/lerobot submodule init." >&2
         return
     fi
 
     log_info "Initializing libs/lerobot submodule for OpenHarmony runtime staging..."
     git -C "${IB_ROBOT_ROOT}" submodule update --init --recursive libs/lerobot
 
-    if [[ ! -d "${lerobot_dir}/src" ]]; then
+    if ! git -C "${lerobot_dir}" rev-parse --git-dir >/dev/null 2>&1 || [[ ! -d "${lerobot_dir}/src" ]]; then
         log_error "LeRobot source tree still missing after submodule init: ${lerobot_dir}/src"
         exit 1
     fi
@@ -218,6 +223,11 @@ resolve_openharmony_lerobot_patch_stack() {
     LEROBOT_OH_PATCH_DIR="${IB_ROBOT_ROOT}/third_party/patches/lerobot/${active_tag}"
     LEROBOT_OH_PATCH_SERIES="${LEROBOT_OH_PATCH_DIR}/series.openharmony-5.1.0-musl.txt"
     LEROBOT_OH_PATCH_MANIFEST="${LEROBOT_OH_PATCH_DIR}/manifest.yaml"
+    LEROBOT_OH_UPSTREAM_REPO="$(awk '
+        /^upstream:/ { in_upstream=1; next }
+        in_upstream && /^[^[:space:]]/ { in_upstream=0 }
+        in_upstream && $1 == "repo:" { print $2; exit }
+    ' "${LEROBOT_OH_PATCH_MANIFEST}" 2>/dev/null || true)"
     LEROBOT_OH_BASE_COMMIT="$(awk '
         /^lerobot_commit_range:/ { in_range=1; next }
         in_range && /^[^[:space:]]/ { in_range=0 }
@@ -232,6 +242,27 @@ resolve_openharmony_lerobot_patch_stack() {
         log_error "Could not resolve lerobot base commit from ${LEROBOT_OH_PATCH_MANIFEST}"
         exit 1
     fi
+    if [[ -z "${LEROBOT_OH_UPSTREAM_REPO}" && -f "${IB_ROBOT_ROOT}/.gitmodules" ]]; then
+        LEROBOT_OH_UPSTREAM_REPO="$(git config -f "${IB_ROBOT_ROOT}/.gitmodules" --get submodule.libs/lerobot.url || true)"
+    fi
+    if [[ -z "${LEROBOT_OH_UPSTREAM_REPO}" ]]; then
+        log_error "Could not resolve lerobot upstream repo from ${LEROBOT_OH_PATCH_MANIFEST} or .gitmodules"
+        exit 1
+    fi
+}
+
+resolve_openharmony_lerobot_repo_source() {
+    local lerobot_dir="${IB_ROBOT_ROOT}/libs/lerobot"
+
+    ensure_lerobot_submodule
+
+    if git -C "${lerobot_dir}" rev-parse --git-dir >/dev/null 2>&1 && [[ -d "${lerobot_dir}/src" ]]; then
+        printf '%s\n' "${lerobot_dir}"
+        return
+    fi
+
+    log_info "Using upstream lerobot repo for OpenHarmony runtime staging: ${LEROBOT_OH_UPSTREAM_REPO}" >&2
+    printf '%s\n' "${LEROBOT_OH_UPSTREAM_REPO}"
 }
 
 verify_openharmony_lerobot_runtime_patch() {
@@ -265,19 +296,23 @@ verify_openharmony_lerobot_runtime_patch() {
 prepare_openharmony_lerobot_runtime_src() {
     local stage_root="${OH_CUSTOM_ROOT}/.lerobot_openharmony_runtime"
     local repo_dir="${stage_root}/repo"
-    local lerobot_dir="${IB_ROBOT_ROOT}/libs/lerobot"
+    local lerobot_repo_source=""
     local git_user_name="${IBR_LEROBOT_GIT_USER_NAME:-IB Robot Setup}"
     local git_user_email="${IBR_LEROBOT_GIT_USER_EMAIL:-ibrobot@example.invalid}"
     local patch_file=""
 
-    ensure_lerobot_submodule
     resolve_openharmony_lerobot_patch_stack
+    lerobot_repo_source="$(resolve_openharmony_lerobot_repo_source)"
 
     rm -rf "${stage_root}"
     ensure_dir "${stage_root}"
 
     log_info "Preparing OpenHarmony-patched LeRobot runtime staging tree..." >&2
-    git clone --local --no-checkout "${lerobot_dir}" "${repo_dir}" >/dev/null
+    if [[ -d "${lerobot_repo_source}" ]]; then
+        git clone --local --no-checkout "${lerobot_repo_source}" "${repo_dir}" >/dev/null
+    else
+        git clone --no-checkout "${lerobot_repo_source}" "${repo_dir}" >/dev/null
+    fi
     git -C "${repo_dir}" checkout --detach "${LEROBOT_OH_BASE_COMMIT}" >/dev/null
 
     while IFS= read -r patch_file; do
