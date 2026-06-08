@@ -28,24 +28,37 @@ run_sudo() {
 
 run_privileged_with_live_output() {
     local msg="$1"
+    local command_status
+    local errexit_enabled=false
     shift
     log_info "${msg}"
     if [[ "${VERBOSE:-0}" == "1" ]]; then
         run_sudo "$@"
     else
-        # We still show progress, but normally apt output is quieted
-        run_sudo "$@" >/dev/null 2>&1
+        [[ $- == *e* ]] && errexit_enabled=true
+        set +e
+        run_sudo "$@" 2>&1 | grep -vE "^[[:space:]]*$"
+        command_status=${PIPESTATUS[0]}
+        ${errexit_enabled} && set -e
+        return "${command_status}"
     fi
 }
 
 run_with_live_output() {
     local msg="$1"
+    local command_status
+    local errexit_enabled=false
     shift
     log_info "${msg}"
     if [[ "${VERBOSE:-0}" == "1" ]]; then
         "$@"
     else
-        "$@" >/dev/null 2>&1
+        [[ $- == *e* ]] && errexit_enabled=true
+        set +e
+        "$@" 2>&1 | grep -vE "^[[:space:]]*$"
+        command_status=${PIPESTATUS[0]}
+        ${errexit_enabled} && set -e
+        return "${command_status}"
     fi
 }
 
