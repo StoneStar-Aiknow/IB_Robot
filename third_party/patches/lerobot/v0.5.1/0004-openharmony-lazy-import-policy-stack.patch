@@ -4,13 +4,14 @@ Date: Fri, 24 Apr 2026 16:49:41 +0800
 Subject: [PATCH] openharmony: lazy-load inference-time policy imports
 
 ---
- src/lerobot/optim/optimizers.py    |  39 +++++++--
- src/lerobot/optim/schedulers.py    |  10 ++-
- src/lerobot/policies/__init__.py   |  40 ++++++---
- src/lerobot/policies/factory.py    | 133 ++++++++++++++---------------
- src/lerobot/policies/pretrained.py |   3 +-
- src/lerobot/policies/utils.py      |   3 +-
- 6 files changed, 136 insertions(+), 92 deletions(-)
+ src/lerobot/optim/optimizers.py           |  39 +++++++--
+ src/lerobot/optim/schedulers.py           |  10 ++-
+ src/lerobot/policies/__init__.py          |  40 ++++++---
+ src/lerobot/policies/factory.py           | 133 ++++++++++++++---------------
+ src/lerobot/policies/pretrained.py        |   3 +-
+ src/lerobot/policies/utils.py             |   3 +-
+ src/lerobot/processor/normalize_processor.py |   6 ++-
+ 7 files changed, 144 insertions(+), 94 deletions(-)
 
 diff --git a/src/lerobot/optim/optimizers.py b/src/lerobot/optim/optimizers.py
 index e2e3d893..ac2ce171 100644
@@ -501,5 +502,33 @@ index 82ab5100..635286c4 100644
      # Extracts the correct keys from the incoming raw observation
      observation = build_dataset_frame(ds_features, observation, prefix=OBS_STR)
 
---
+diff --git a/src/lerobot/processor/normalize_processor.py b/src/lerobot/processor/normalize_processor.py
+index 8a7a1176a..65b948fd7 100644
+--- a/src/lerobot/processor/normalize_processor.py
++++ b/src/lerobot/processor/normalize_processor.py
+@@ -19,19 +19,21 @@ from __future__ import annotations
+ 
+ from copy import deepcopy
+ from dataclasses import dataclass, field
+-from typing import Any
++from typing import TYPE_CHECKING, Any
+ 
+ import torch
+ from torch import Tensor
+ 
+ from lerobot.configs.types import FeatureType, NormalizationMode, PipelineFeatureType, PolicyFeature
+-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+ from lerobot.types import EnvTransition, PolicyAction, TransitionKey
+ from lerobot.utils.constants import ACTION
+ 
+ from .converters import from_tensor_to_numpy, to_tensor
+ from .pipeline import PolicyProcessorPipeline, ProcessorStep, ProcessorStepRegistry, RobotObservation
+ 
++if TYPE_CHECKING:
++    from lerobot.datasets.lerobot_dataset import LeRobotDataset
++
+ 
+ @dataclass
+ class _NormalizationMixin:
+-- 
 2.34.1

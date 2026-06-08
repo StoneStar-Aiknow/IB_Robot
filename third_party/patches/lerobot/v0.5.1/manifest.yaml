@@ -96,6 +96,8 @@ patches:
     purpose:
       - Defer policy, dataset, env, and processor imports that are not required
         for inference-time policy loading.
+      - Keep `lerobot.processor.normalize_processor` importable on OpenHarmony
+        inference runtimes by guarding `LeRobotDataset` behind TYPE_CHECKING.
       - Keep the OpenHarmony board on upstream Python 3.12 while trimming
         board-side dependency pressure.
     applies_to:
