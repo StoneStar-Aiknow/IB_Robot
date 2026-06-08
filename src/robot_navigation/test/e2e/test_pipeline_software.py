@@ -101,10 +101,15 @@ def pipeline(rclpy_init):
     voice.keywords_json = KEYWORDS_JSON
     voice.keywords = voice._load_keywords()
     voice.destinations = json.loads(DESTINATIONS_JSON)
-    # Re-wire publishers/subscribers to isolated e2e topics
+    # Re-wire publishers/subscribers to isolated e2e topics. The production
+    # defaults may receive residual board traffic on a shared ROS domain.
+    voice.destroy_publisher(voice.keyword_pub)
+    voice.destroy_publisher(voice.nav_stop_pub)
+    voice.destroy_subscription(voice.sub)
+    voice.destroy_subscription(voice.keyword_sub)
     voice.keyword_pub = voice.create_publisher(String, "/e2e/keyword_matched", 10)
     voice.nav_stop_pub = voice.create_publisher(String, "/e2e/nav_stop", 10)
-    voice.create_subscription(String, "/e2e/voice_command", voice._text_callback, 10)
+    voice.sub = voice.create_subscription(String, "/e2e/voice_command", voice._text_callback, 10)
     # Cancel hotword timer (no voice_asr_node in test env)
     if voice._hotword_timer is not None:
         voice.destroy_timer(voice._hotword_timer)
@@ -113,6 +118,8 @@ def pipeline(rclpy_init):
 
     # 2. nav2_goal_client: subscribe on e2e topics
     goal_client = Nav2GoalClient()
+    goal_client.destroy_subscription(goal_client.voice_sub)
+    goal_client.destroy_subscription(goal_client.nav_stop_sub)
     goal_client.voice_sub = goal_client.create_subscription(
         String, "/e2e/keyword_matched", goal_client.voice_command_callback, 10
     )
@@ -159,6 +166,16 @@ def _wait_for_nav_complete(gc, timeout=MOCK_NAV_DELAY + 5.0):
     deadline = time.monotonic() + timeout
     while gc.is_navigating and time.monotonic() < deadline:
         time.sleep(0.1)
+
+
+def _wait_until(predicate, timeout=2.0, interval=0.05):
+    """Wait until predicate() returns True."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
 
 
 @pytest.fixture
@@ -386,11 +403,13 @@ class TestOdometryIntegration:
         js.name = ["7", "8", "9"]
         js.velocity = wheel_speeds
         js_pub.publish(js)
-        time.sleep(0.1)
+        assert _wait_until(lambda: bridge.wheel_feedback is not None, timeout=2.0)
 
         # Trigger control_loop to process joint_states and update odom
         bridge.control_loop()
         time.sleep(0.1)
+        bridge.control_loop()
+        assert _wait_until(lambda: len(odom_msgs) >= 1, timeout=2.0)
 
         # Verify odom was published
         assert len(odom_msgs) >= 1
@@ -446,16 +465,20 @@ class TestRapidDestinations:
         msg1 = String()
         msg1.data = "去a点"
         pub.publish(msg1)
-        time.sleep(0.3)  # short gap (nav is still in_progress due to 5s delay)
+        mock_nav = pipeline["mock_nav"]
+        assert _wait_until(lambda: len(mock_nav.received_goals) >= 1, timeout=2.0)
+        with mock_nav._lock:
+            goals_after_first = len(mock_nav.received_goals)
 
         msg2 = String()
         msg2.data = "去b点"
         pub.publish(msg2)
         time.sleep(1.0)
 
-        mock_nav = pipeline["mock_nav"]
         with mock_nav._lock:
-            assert len(mock_nav.received_goals) == 1, "Second destination should be blocked while navigating"
+            assert len(mock_nav.received_goals) == goals_after_first, (
+                "Second destination should be blocked while navigating"
+            )
         # Verify it's point_a (first destination)
         goal = mock_nav.received_goals[0]
         assert goal.pose.pose.position.y == pytest.approx(0.2)  # point_a y
