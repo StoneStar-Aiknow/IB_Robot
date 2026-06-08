@@ -120,7 +120,7 @@ run_fixture "openeuler-embedded-24.03 / py3.11" \
 # OpenHarmony 5.1.0 / Python 3.12 — must drop the down-grade and NPU detection
 # patches, then keep only the board runtime lazy-import patch.
 run_fixture "openharmony-5.1.0 / py3.12" \
-    "0004-openharmony-lazy-import-policy-stack.patch" \
+    "0004-openharmony-lazy-import-policy-stack.patch,0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch" \
     IBR_HOST_PYTHON_VERSION=3.12 \
     IBR_LEROBOT_PROFILES=core,openharmony \
     --
