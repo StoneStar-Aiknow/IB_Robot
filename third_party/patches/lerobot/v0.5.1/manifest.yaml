@@ -96,6 +96,8 @@ patches:
     purpose:
       - Defer policy, dataset, env, and processor imports that are not required
         for inference-time policy loading.
+      - Keep `lerobot.processor.normalize_processor` importable on OpenHarmony
+        inference runtimes by guarding `LeRobotDataset` behind TYPE_CHECKING.
       - Keep the OpenHarmony board on upstream Python 3.12 while trimming
         board-side dependency pressure.
     applies_to:
@@ -111,7 +113,7 @@ patches:
       - Port legacy PR #13 foundations for adaptive sample weighting onto the upstream v0.5.1 training stack.
       - Provide the training-loop prerequisites used by knowledge-distillation training.
     applies_to:
-      profiles: [master-parity-candidates, ros, hardware, dev, openeuler, inference, training, distillation]
+      profiles: [master-parity-candidates, ros, hardware, dev, openeuler, openharmony, inference, training, distillation]
   - file: 0010-weighted-training.patch
     purpose:
       - Restore weighted-training and quantization-constraint changes extracted from the legacy lerobot_ros2 branch.
@@ -123,7 +125,7 @@ patches:
       - Add legacy knowledge-distillation config fields for PI05 compatibility.
       - Keep the patch independent from the OM runtime migration patches.
     applies_to:
-      profiles: [master-parity-candidates, ros, hardware, dev, openeuler, inference, training, distillation]
+      profiles: [master-parity-candidates, ros, hardware, dev, openeuler, openharmony, inference, training, distillation]
   - file: 0012-mt-act-model.patch
     purpose:
       - Restore the mt_act policy family as a dedicated model patch.

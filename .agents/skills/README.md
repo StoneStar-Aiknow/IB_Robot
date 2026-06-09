@@ -13,6 +13,7 @@
 | [ibrobot-hdc](./ibrobot-hdc) | 板端 | 连接 BQ3588HM 开发板，执行 HDC shell / file send / file recv。 |
 | [ibrobot-bq3588hm-oh](./ibrobot-bq3588hm-oh) | 板端 | 记录 BQ3588HM 板上的 OpenHarmony ROS / Python / RKNN 运行时事实。 |
 | [bq3588-oh-rknn](./bq3588-oh-rknn) | 板端 | 在 BQ3588HM 上拉起 `cloud_inference.launch.py` 的 RKNN 推理路径。 |
+| [oh-build-ibrobot](./oh-build-ibrobot) | 板端 | 使用 `build_ibrobot_oh_custom.sh` 主机侧交叉编译并打包 IB_Robot 自有 OpenHarmony 运行时。 |
 | [rknn-convert](./rknn-convert) | 模型 | 将 ONNX 转成 RKNN，并维护主 `venv` 导出 ONNX、`.venv-rknn` 转 RKNN 的流程边界。 |
 | [ibrobot-architecture](./ibrobot-architecture) | 知识 | 理解 SSOT 模式、修改 `robot_config`、解释数据流或契约设计。 |
 | [ibrobot-lerobot-patch](./ibrobot-lerobot-patch) | 工作流 | 将 `libs/lerobot` 的本地改动导出为 `third_party/patches/lerobot/<tag>/*.patch`，并通过辅助脚本同步 `series/manifest/test`。 |
@@ -20,6 +21,7 @@
 | [ibrobot-docker-verify](./ibrobot-docker-verify) | 验证 | 在干净 Ubuntu 22.04 Docker 容器中端到端验证 setup.sh + build.sh。 |
 | [ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee) | 验证 | 在 openEuler Embedded (aarch64) Docker 容器中端到端验证 setup.sh + build.sh。 |
 | [oh-cross-build-ros-pkg](./oh-cross-build-ros-pkg) | 板端 | 为 BQ3588HM OpenHarmony 板交叉编译移植第三方 ROS 2 包（如 usb_cam）。 |
+| [oh-rebuild-kernel](./oh-rebuild-kernel) | 板端 | 重新编译并刷入 BQ3588HM OpenHarmony 内核 (boot_linux.img)，启用 USB ACM 等驱动。 |
 | [atomgit-collaboration](./atomgit-collaboration) | AtomGit | 拦截泛化的 PR / Issue / review / comment 请求，并路由到具体 AtomGit skill。 |
 | [atomgit-pr](./atomgit-pr) | AtomGit | 管理 PR 生命周期：创建、读取上下文、更新标题/描述、生成摘要。 |
 | [atomgit-issue](./atomgit-issue) | AtomGit | 管理 Issue 生命周期：创建、读取详情、更新内容、关闭/重开。 |
@@ -44,6 +46,7 @@
 - **板端连接 ([ibrobot-hdc](./ibrobot-hdc))**: 统一封装 BQ3588HM 的 HDC over TCP 访问与文件传输。
 - **板端事实 ([ibrobot-bq3588hm-oh](./ibrobot-bq3588hm-oh))**: 汇总 BQ3588HM 板上的 OpenHarmony、ROS、Python、RKNN 运行时事实。
 - **板端 RKNN 运行 ([bq3588-oh-rknn](./bq3588-oh-rknn))**: 专门处理 `cloud_inference.launch.py device:=rknn` 的板端环境叠加与启动。
+- **OH 主机侧构建 ([oh-build-ibrobot](./oh-build-ibrobot))**: 通过 `build_ibrobot_oh_custom.sh` 交叉编译 `ibrobot_msgs,tensormsg,robot_config,inference_service`，并强制确认 `series.openharmony-5.1.0-musl.txt` 真正进入板端 runtime 产物。
 - **RKNN 转换 ([rknn-convert](./rknn-convert))**: 明确 ONNX 导出与 RKNN 转换的边界，避免主 `venv` 与 `.venv-rknn` 污染。
 - **架构顾问 ([ibrobot-architecture](./ibrobot-architecture))**: 充当项目的架构师，解答一切关于设计模式和配置规范的问题。
 - **LeRobot 补丁纳管 ([ibrobot-lerobot-patch](./ibrobot-lerobot-patch))**: 把 `libs/lerobot` 的本地改动回收为受管 patch 栈，而不是直接提交子模块 gitlink。
@@ -51,6 +54,7 @@
 - **容器验证 ([ibrobot-docker-verify](./ibrobot-docker-verify))**: 在全新 Ubuntu 22.04 Docker 容器中运行 setup.sh 和 build.sh 的完整端到端验证，确保修改不会破坏首次安装体验。
 - **openEuler 容器验证 ([ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee))**: 在 openEuler Embedded aarch64 Docker 容器（qemu-user 模拟 chroot）中端到端验证 setup.sh + build.sh，以 root 用户模拟真实开发板操作环境。
 - **OH 交叉编译移植 ([oh-cross-build-ros-pkg](./oh-cross-build-ros-pkg))**: 将第三方 ROS 2 包（如 usb_cam）通过 Docker 交叉编译工具链移植到 BQ3588HM OpenHarmony 板，覆盖克隆、编译、部署、板端验证和 launch 集成全流程。
+- **OH 内核重编 ([oh-rebuild-kernel](./oh-rebuild-kernel))**: 重新编译并刷入 BQ3588HM 的 Linux 内核 (boot_linux.img)，用于启用 USB ACM（SO-101 机械臂）、游戏手柄等内核驱动。
 
 ### 🌐 AtomGit 自动化工具
 这些技能通过集成 AtomGit API，实现了 PR / Issue 生命周期和代码审查的自动化。

@@ -21,6 +21,46 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+
+def _ensure_lerobot_policy_registry(policy_type: str | None = None) -> None:
+    """Import policy config modules so draccus choice registry is populated.
+
+    Board-side runtime may load ``PreTrainedConfig`` without having imported the
+    concrete policy config modules first. In that case, ``type: act`` in
+    ``config.json`` fails to decode because the registry entry was never
+    registered. Keep this lazy and config-only to avoid importing heavy modeling
+    dependencies during startup.
+    """
+
+    import importlib
+
+    modules_by_type = {
+        "act": "lerobot.policies.act.configuration_act",
+        "diffusion": "lerobot.policies.diffusion.configuration_diffusion",
+        "groot": "lerobot.policies.groot.configuration_groot",
+        "multi_task_dit": "lerobot.policies.multi_task_dit.configuration_multi_task_dit",
+        "pi0": "lerobot.policies.pi0.configuration_pi0",
+        "pi05": "lerobot.policies.pi05.configuration_pi05",
+        "sac": "lerobot.policies.sac.configuration_sac",
+        "sarm": "lerobot.policies.sarm.configuration_sarm",
+        "smolvla": "lerobot.policies.smolvla.configuration_smolvla",
+        "tdmpc": "lerobot.policies.tdmpc.configuration_tdmpc",
+        "vqbet": "lerobot.policies.vqbet.configuration_vqbet",
+        "wall_x": "lerobot.policies.wall_x.configuration_wall_x",
+        "xvla": "lerobot.policies.xvla.configuration_xvla",
+    }
+    if policy_type is not None and policy_type in modules_by_type:
+        modules = (modules_by_type[policy_type],)
+    else:
+        modules = tuple(modules_by_type.values())
+    for module in modules:
+        try:
+            importlib.import_module(module)
+        except ModuleNotFoundError:
+            # Some policy families are optional in trimmed deployments.
+            continue
+
+
 # Keys that IB-Robot writes into ``config.json`` but are not part of the
 # upstream lerobot policy dataclasses.  Keep this list conservative; anything
 # upstream may eventually adopt should be removed from here.
@@ -168,6 +208,19 @@ def load_pretrained_policy_config(
     ``config.json`` already matches the runtime contract.
     """
     from lerobot.configs.policies import PreTrainedConfig
+
+    policy_type = None
+    src_cfg = Path(policy_path) / "config.json"
+    if src_cfg.is_file():
+        try:
+            raw = _read_json_object(src_cfg)
+            raw_type = raw.get("type")
+            if raw_type is not None:
+                policy_type = str(raw_type)
+        except (OSError, ValueError, json.JSONDecodeError):
+            policy_type = None
+
+    _ensure_lerobot_policy_registry(policy_type)
 
     with materialize_runtime_policy_path(policy_path, runtime_device) as runtime_path:
         return PreTrainedConfig.from_pretrained(runtime_path)
