@@ -55,6 +55,7 @@ class LeRobotPostprocessor(PostprocessorBase):
         _, self._postprocessor = make_pre_post_processors(
             policy_cfg=self._policy_config,
             pretrained_path=policy_path,
+            preprocessor_overrides={"device_processor": {"device": str(device)}},
             postprocessor_overrides={"device_processor": {"device": str(device)}},
         )
 
