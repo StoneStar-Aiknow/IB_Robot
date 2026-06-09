@@ -2,11 +2,9 @@ import os
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
-from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import Command, LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 from nav2_common.launch import RewrittenYaml
 
@@ -14,9 +12,7 @@ from nav2_common.launch import RewrittenYaml
 def generate_launch_description():
     # Get directories
     pkg_dir = FindPackageShare(package="robot_navigation").find("robot_navigation")
-    lekiwi_description_dir = FindPackageShare(package="lekiwi_description").find("lekiwi_description")
     nav2_bringup_dir = FindPackageShare(package="nav2_bringup").find("nav2_bringup")
-    default_model_path = os.path.join(lekiwi_description_dir, "urdf", "lekiwi_assembled.urdf.xacro")
 
     # Launch configurations
     use_sim_time = LaunchConfiguration("use_sim_time")
@@ -40,56 +36,8 @@ def generate_launch_description():
         convert_types=True,
     )
 
-    # ==================== Robot Specific Nodes ====================
-    # Joint State Publisher
-    joint_state_publisher_node = Node(
-        package="joint_state_publisher",
-        executable="joint_state_publisher",
-        name="joint_state_publisher",
-        parameters=[
-            {
-                "robot_description": ParameterValue(Command(["xacro ", default_model_path]), value_type=str),
-            }
-        ],
-    )
-    # Robot State Publisher
-    robot_state_publisher_node = Node(
-        package="robot_state_publisher",
-        executable="robot_state_publisher",
-        name="robot_state_publisher",
-        parameters=[
-            {
-                "robot_description": ParameterValue(Command(["xacro ", default_model_path]), value_type=str),
-            }
-        ],
-    )
-
-    # ==================== RViz2 ====================
-    rviz_node = Node(
-        package="rviz2",
-        executable="rviz2",
-        name="rviz2",
-        arguments=["-d", os.path.join(pkg_dir, "config", "config.rviz")],
-        parameters=[{"use_sim_time": use_sim_time}],
-        output="screen",
-    )
-
-    # ==================== Nav2 Goal Client ====================
-    nav2_goal_client_node = Node(
-        package="robot_navigation",
-        executable="nav2_goal_client",
-        name="nav2_goal_client",
-        parameters=[
-            {
-                "use_sim_time": use_sim_time,
-            }
-        ],
-        output="screen",
-    )
-
     localization_nodes = [
         Node(
-            condition=IfCondition(PythonExpression(["not ", use_composition])),
             package="nav2_map_server",
             executable="map_server",
             name="map_server",
@@ -101,7 +49,6 @@ def generate_launch_description():
             remappings=[("/tf", "tf"), ("/tf_static", "tf_static")],
         ),
         Node(
-            condition=IfCondition(PythonExpression(["not ", use_composition])),
             package="nav2_lifecycle_manager",
             executable="lifecycle_manager",
             name="lifecycle_manager_localization",
@@ -150,14 +97,7 @@ def generate_launch_description():
             DeclareLaunchArgument("use_respawn", default_value="False"),
             DeclareLaunchArgument("log_level", default_value="info"),
             stdout_linebuf_envvar,
-            # Robot specific nodes
-            robot_state_publisher_node,
-            joint_state_publisher_node,
             *localization_nodes,
             navigation_bringup,
-            # Nav2 Goal Client (with voice control)
-            nav2_goal_client_node,
-            # RViz2
-            rviz_node,
         ]
     )
