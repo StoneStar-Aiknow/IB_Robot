@@ -324,6 +324,57 @@ from dataset_tools.camera_isp.color_search import (
 
 测试：`test/test_camera_isp_color_search.py`（16 个用例，覆盖 ΔE2000、聚类、匈牙利、settle、driver fallback、device caps 裁剪）。
 
+### 6. lerobot_action_gap_repair - 数据集 action 间隙修复工具
+
+用于分析 LeRobot 数据集中 action 各维度的值分布与非活跃间隙，并可将短间隙用相邻活跃值填充（桥接）。
+
+典型应用场景：遥操作录制时，控制信号可能出现短暂掉零（gripper 或关节值瞬间归零），这些间隙会影响训练质量。该工具先分析间隙分布，再将符合条件的短间隙填充为正常值。
+
+**两种工作模式**：
+
+1. **分析模式**（仅传 `--src-root`）：扫描数据集，输出各维度的值分布和间隙统计。
+2. **修复模式**（附加 `--gap-threshold`）：在分析基础上，将短于阈值的非活跃间隙填充为相邻活跃值，输出到新数据集目录。
+
+**基本用法**：
+
+```bash
+# 分析模式：查看各 action 维度的值分布和间隙
+lerobot_action_gap_repair --src-root /path/to/dataset
+
+# 修复模式：填充长度 ≤ 1 的非活跃间隙
+lerobot_action_gap_repair \
+    --src-root /path/to/dataset \
+    --dst-root /path/to/dataset_bridged \
+    --gap-threshold 1 \
+    --process-indices 6 8 \
+    --target-values 0.1 30.0
+```
+
+**参数说明**：
+
+| 参数 | 必填 | 默认值 | 说明 |
+|------|------|--------|------|
+| `--src-root` | 是 | — | 源 LeRobot 数据集目录 |
+| `--dst-root` | 修复模式必填 | — | 修复后数据集输出目录 |
+| `--analyze-indices` | 否 | `6 7 8` | 分析模式检查的 action 维度索引 |
+| `--process-indices` | 修复模式必填 | — | 需要修复的 action 维度索引 |
+| `--target-values` | 修复模式必填 | — | 各 `process-indices` 对应的目标填充值 |
+| `--gap-threshold` | 修复模式必填 | — | 间隙长度 ≤ 该值时才修复 |
+| `--inactive-value` | 否 | `0.0` | 被视为"非活跃"的值 |
+| `--repo-id` | 否 | 数据集目录名 | 用于 stats 重算的 repo_id |
+| `--skip-recompute-stats` | 否 | `false` | 跳过 `meta/stats.json` 重算 |
+
+**输出**：
+
+- 分析模式：终端输出各维度的值计数和间隙计数
+- 修复模式：在 `--dst-root` 生成完整的新数据集（先拷贝再修改），修复后自动重算 `meta/stats.json`
+
+**特性**：
+
+- 支持跨 parquet 文件边界的 episode 级间隙追踪
+- 修复前先校验参数合法性，避免创建不完整的输出目录
+- `--skip-recompute-stats` 可在无 lerobot 环境时使用
+
 ## 数据流
 
 ```

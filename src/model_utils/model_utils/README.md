@@ -8,7 +8,7 @@ model_utils 提供了一组用于 LeRobot 策略模型导出与验证的工具�
 | `export_onnx_3403.py` | 专为 Ascend 3403 硬件导出 ONNX 模型 |
 | `export_onnx_rknn.py` | 专为 RK3588 NPU 导出 ONNX 模型，并可一键转换为 RKNN 格式 |
 | `loss_compare.py` | 跨平台模型推理精度对比验证 |
-| `inspect_frame_inference.py` | 脱机逐帧/区间策略推理检查；需要 `policy-path`、`dataset-root` 和帧选择参数 |
+| `frame_inspect` | 脱机逐帧/区间策略推理检查；需要 `policy-path`、`dataset-root` 和帧选择参数 |
 
 ---
 
@@ -293,3 +293,96 @@ python loss_compare.py \
     --target_path=targets.json \
     --noise-dir=noise_files/
 ```
+
+---
+
+## frame_inspect
+
+> **脱机逐帧/区间策略推理检查工具。**
+>
+> 加载训练好的策略模型，对数据集中的单帧或帧区间进行离线推理，输出模型预测值与真实标签的逐维度对比，用于模型行为调试和精度分析。
+
+### 工作模式
+
+1. **单帧模式**：指定 `--global-index` 或 `--episode-index` + `--frame-index`，对单帧推理并输出对比 JSON、summary.txt 和帧图像。
+2. **区间模式**：指定 `--episode-index` + `--frame-index start:end`，对连续帧区间逐帧推理，输出对比 CSV/JSON 和视频片段。
+
+### 用法
+
+#### 单帧推理（按全局索引）
+
+```shell
+frame_inspect \
+    --policy-path path/to/pretrained_model \
+    --dataset-repo-id my_dataset \
+    --dataset-root path/to/dataset \
+    --output-dir path/to/output \
+    --global-index 42
+```
+
+#### 单帧推理（按 episode + frame）
+
+```shell
+frame_inspect \
+    --policy-path path/to/pretrained_model \
+    --dataset-repo-id my_dataset \
+    --dataset-root path/to/dataset \
+    --output-dir path/to/output \
+    --episode-index 0 \
+    --frame-index 15
+```
+
+#### 区间推理
+
+```shell
+frame_inspect \
+    --policy-path path/to/pretrained_model \
+    --dataset-repo-id my_dataset \
+    --dataset-root path/to/dataset \
+    --output-dir path/to/output \
+    --episode-index 0 \
+    --frame-index 10:30
+```
+
+### 参数
+
+| 参数 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `--policy-path` | ✅ | — | 策略模型目录路径 |
+| `--dataset-repo-id` | ✅ | — | 数据集 repo_id |
+| `--dataset-root` | ✅ | — | 数据集根目录路径 |
+| `--output-dir` | ✅ | — | 输出目录 |
+| `--global-index` | 单帧模式 | — | 数据集全局帧索引 |
+| `--episode-index` | 单帧/区间模式 | — | Episode 索引 |
+| `--frame-index` | 单帧/区间模式 | — | 帧索引（整数或 `start:end` 格式） |
+| `--stats-dataset-repo-id` | ❌ | 同 `dataset-repo-id` | 训练时所用数据集的 repo_id（用于加载归一化统计） |
+| `--stats-dataset-root` | ❌ | 同 `dataset-root` | 训练时所用数据集的路径 |
+| `--device` | ❌ | 模型配置中的设备 | 推理设备（`cpu`、`cuda`） |
+| `--use-imagenet-stats` / `--no-use-imagenet-stats` | ❌ | `--use-imagenet-stats` | 是否对图像使用 ImageNet 归一化统计 |
+| `--reset-policy` / `--no-reset-policy` | ❌ | `--reset-policy` | 每帧推理前是否重置策略状态 |
+
+### 输出文件
+
+**单帧模式**：
+
+```text
+output_dir/
+├── {camera_name}_frame.png     # 输入帧图像
+├── comparison.json             # 预测值 vs 标签的逐维度对比
+└── summary.txt                 # 制表符分隔的摘要
+```
+
+**区间模式**：
+
+```text
+output_dir/
+├── {camera_name}_clip.mp4      # 输入帧视频片段
+├── comparison.csv              # 所有帧的逐维度对比（CSV 格式）
+└── comparison.json             # 区间汇总元数据
+```
+
+### 特性
+
+- 兼容 dict 和 tuple 两种数据集样本格式
+- 自动处理 `observation.current` / `observation.state` 键名差异，缺失时回退并发出警告
+- 支持跨数据集归一化（通过 `--stats-dataset-*` 使用训练时的统计信息）
