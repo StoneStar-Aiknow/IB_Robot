@@ -10,19 +10,15 @@
 # EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
-"""Export PI05 VLM to ONNX and validate, mirroring pi0/convert_verify_onnx_vlm structure."""
+"""Export PI05 VLM to ONNX and emit the Ascend OM manifest entry."""
 
 from __future__ import annotations
 
 import argparse
 import logging
-import os
-import time
 from pathlib import Path
 
-import numpy as np
 import onnx
-import onnxruntime as ort
 import torch
 import torch.onnx
 
@@ -42,6 +38,7 @@ from model_utils.pi05_export.ascend_export_patches import (
     sanitize_nan_initializers,
 )
 from model_utils.pi05_export.modeling_pi05_vlm import PI05VLMPolicy
+from model_utils.pi05_export.om_manifest import upsert_pi05_om_manifest
 
 LOGGER = logging.getLogger(__name__)
 
@@ -89,61 +86,6 @@ def _parse_device(device: str) -> torch.device:
             return torch.device("cpu")
 
     return parsed
-
-
-def _abs_diff_metrics(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
-    diff = np.abs(a - b)
-    if diff.size == 0:
-        return 0.0, 0.0
-    return float(np.max(diff)), float(np.mean(diff))
-
-
-def _cosine_similarity_stats(a: np.ndarray, b: np.ndarray) -> tuple[float, float, float]:
-    """Cosine stats per batch (flattened non-batch dims)."""
-    a = np.asarray(a)
-    b = np.asarray(b)
-    if a.shape != b.shape:
-        raise ValueError(f"Shape mismatch for cosine similarity: {a.shape} vs {b.shape}")
-
-    if a.ndim == 0:
-        a = a.reshape(1)
-        b = b.reshape(1)
-
-    if a.ndim == 1:
-        a2 = a.reshape(1, -1)
-        b2 = b.reshape(1, -1)
-    else:
-        a2 = a.reshape(a.shape[0], -1)
-        b2 = b.reshape(b.shape[0], -1)
-
-    dot = np.sum(a2 * b2, axis=1)
-    na = np.linalg.norm(a2, axis=1)
-    nb = np.linalg.norm(b2, axis=1)
-    denom = na * nb
-    eps = 1e-12
-    cos = dot / np.maximum(denom, eps)
-
-    return float(np.min(cos)), float(np.max(cos)), float(np.mean(cos))
-
-
-def _run_onnxruntime_cpu(onnx_path: Path, inputs: dict[str, np.ndarray]) -> tuple[list[np.ndarray], float]:
-    options = ort.SessionOptions()
-    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
-    os.environ.setdefault("ORT_SEED", "42")
-
-    session = ort.InferenceSession(
-        str(onnx_path),
-        sess_options=options,
-        providers=["CPUExecutionProvider"],
-    )
-
-    valid_inputs = {i.name for i in session.get_inputs()}
-    feed = {k: v for k, v in inputs.items() if k in valid_inputs}
-
-    t0 = time.perf_counter()
-    outputs = session.run(None, feed)
-    dt = time.perf_counter() - t0
-    return [np.asarray(output) for output in outputs], float(dt)
 
 
 def _move_policy_to_device(policy: torch.nn.Module, device: torch.device) -> torch.nn.Module:
@@ -434,7 +376,7 @@ def save_runtime_tensors(
     """Run PyTorch inference and persist KV-cache / prefix masks.
 
     These ``.pth`` files are consumed by the action-expert export script,
-    so they must be generated regardless of ``--skip-verify``.
+    so they are always generated as part of the VLM export.
 
     Returns:
         ``(past_kv_tensor, prefix_pad_masks)`` on the original device.
@@ -457,56 +399,6 @@ def save_runtime_tensors(
         tuple(pytorch_prefix_mask.shape),
     )
     return pytorch_past_kv, pytorch_prefix_mask
-
-
-def validate_onnx(
-    *,
-    pytorch_past_kv: torch.Tensor,
-    pytorch_prefix_mask: torch.Tensor,
-    observation: dict,
-    onnx_output_path: Path,
-    seed: int,
-) -> None:
-    dummy_keys = list(observation.keys())
-    observation_values = [observation[k] for k in dummy_keys]
-
-    # ONNXRuntime
-    onnx_inputs = {}
-    for name, val in zip(dummy_keys, observation_values, strict=False):
-        if isinstance(val, torch.Tensor):
-            arr = val.cpu().numpy()
-            if val.dtype == torch.bool:
-                arr = arr.astype(bool)
-            onnx_inputs[name] = arr
-        else:
-            onnx_inputs[name] = val
-
-    os.environ["ORT_SEED"] = str(int(seed))
-    onnx_outputs, elapsed = _run_onnxruntime_cpu(onnx_output_path, onnx_inputs)
-    onnx_past_kv = np.asarray(onnx_outputs[0])
-    onnx_prefix_mask = np.asarray(onnx_outputs[1])
-
-    pyt_np = pytorch_past_kv.detach().cpu().numpy()
-    pref_np = pytorch_prefix_mask.detach().cpu().numpy()
-
-    max_diff, mean_diff = _abs_diff_metrics(pyt_np.astype(np.float32), onnx_past_kv.astype(np.float32))
-    cos_min, cos_max, cos_mean = _cosine_similarity_stats(pyt_np.astype(np.float32), onnx_past_kv.astype(np.float32))
-
-    LOGGER.info("ONNX inference time (CPU): %.6f sec", elapsed)
-    LOGGER.info("past_kv_tensor shape: torch=%s onnx=%s", tuple(pyt_np.shape), tuple(onnx_past_kv.shape))
-    LOGGER.info("Max abs diff: %.6g", max_diff)
-    LOGGER.info("Mean abs diff: %.6g", mean_diff)
-    LOGGER.info("Cosine similarity (min/max/mean): %.6f / %.6f / %.6f", cos_min, cos_max, cos_mean)
-
-    # prefix_pad_masks diff (bool safe)
-    if np.issubdtype(pref_np.dtype, np.bool_) or np.issubdtype(onnx_prefix_mask.dtype, np.bool_):
-        pref_num = pref_np.astype(np.int8)
-        onnx_pref_num = onnx_prefix_mask.astype(np.int8)
-        LOGGER.info("prefix_pad_masks max diff: %.6g", float(np.abs(pref_num - onnx_pref_num).max()))
-        LOGGER.info("prefix_pad_masks mismatches: %d", int((pref_num != onnx_pref_num).sum()))
-    else:
-        LOGGER.info("prefix_pad_masks max diff: %.6g", float(np.abs(pref_np - onnx_prefix_mask).max()))
-        LOGGER.info("prefix_pad_masks mean diff: %.6g", float(np.abs(pref_np - onnx_prefix_mask).mean()))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -554,11 +446,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=["fp16", "fp32", "auto"],
         default="fp16",
         help="Export precision: fp16 (default, model.half()), fp32 (full precision), "
-        "or auto (preserve original mixed bf16+fp32 weights). "
-        "NOTE: auto produces bf16 tensors that ORT CPU cannot run — "
-        "verification will be skipped automatically.",
+        "or auto (preserve original mixed bf16+fp32 weights).",
     )
-    p.add_argument("--skip-verify", action="store_true", help="Skip ONNX vs PyTorch output comparison.")
+    p.add_argument(
+        "--om-manifest-dir",
+        type=str,
+        default=None,
+        help="Directory to write config.om.json (default: pretrained policy path).",
+    )
+    p.add_argument(
+        "--om-path",
+        type=str,
+        default=None,
+        help="Predicted VLM .om artifact path recorded in the manifest (default: <manifest-dir>/vlm.om).",
+    )
+    p.add_argument("--skip-om-manifest", action="store_true", help="Do not write/update config.om.json.")
     p.add_argument("--log-level", type=str, default="INFO", help="Logging level")
     p.add_argument("--local-files-only", action="store_true", default=True, help="Load policy without network")
     return p
@@ -608,9 +510,7 @@ def main() -> int:
         # Preserve original mixed precision (typically bf16 + fp32).
         LOGGER.info("Export dtype: auto — keeping original model weights unchanged")
         LOGGER.warning(
-            "auto mode produces bf16 tensors; ORT CPU verification will be "
-            "skipped (ORT CPU lacks bf16 kernel support). ATC on Ascend "
-            "310/310P may also fail — use 910 series for bf16 OM conversion."
+            "auto mode produces bf16 tensors; ATC on Ascend 310/310P may fail — use 910 series for bf16 OM conversion."
         )
     else:
         # Normalize to float32 first — pretrained models may contain bfloat16
@@ -671,28 +571,18 @@ def main() -> int:
     LOGGER.info("ONNX export finished")
 
     # Always save runtime tensors — action-expert export depends on them.
-    pytorch_past_kv, pytorch_prefix_mask = save_runtime_tensors(
+    save_runtime_tensors(
         wrapper=wrapper,
         observation=observation,
         runtime_save_dir=runtime_save_dir,
         seed=int(args.seed),
     )
 
-    skip_verify = args.skip_verify or export_dtype == "auto"
-    if export_dtype == "auto" and not args.skip_verify:
-        LOGGER.info("Auto-skipping ORT verification (bf16 not supported by ORT CPU)")
-    if use_npu_ops and not skip_verify:
-        LOGGER.info("Auto-skipping ORT verification (NPURotaryMul has no ORT CPU kernel)")
-        skip_verify = True
-    if not skip_verify:
-        LOGGER.info("Validating ONNX output vs PyTorch (CPU ORT)...")
-        validate_onnx(
-            pytorch_past_kv=pytorch_past_kv,
-            pytorch_prefix_mask=pytorch_prefix_mask,
-            observation=observation,
-            onnx_output_path=onnx_output_path,
-            seed=int(args.seed),
-        )
+    if not args.skip_om_manifest:
+        manifest_dir = args.om_manifest_dir if args.om_manifest_dir is not None else policy_path
+        om_path = args.om_path if args.om_path is not None else "vlm.om"
+        manifest_path = upsert_pi05_om_manifest(manifest_dir, "vlm", om_path)
+        LOGGER.info("Updated OM manifest (vlm) at %s", manifest_path)
 
     return 0
 
