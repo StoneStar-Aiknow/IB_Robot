@@ -929,3 +929,975 @@ def _patch_gemma_fused_qkv() -> list[tuple[Any, str, Any]]:
     return undo_log
 
 
+def _patch_gemma_flash_attention_npu() -> list[tuple[Any, str, Any]]:
+    """Route attention through ``torch_npu.npu_prompt_flash_attention``.
+
+    This swaps the module-level ``eager_attention_forward`` (the
+    ``attention_interface`` resolved at call time by both the stock and the
+    fused-qkv :func:`_patch_gemma_fused_qkv` forward) for a single
+    NPU-affine fused-attention operator.  The exported ONNX then contains
+    one ``npu::NPUPromptFlashAttention`` node per layer instead of the
+    ``MatMul → Add(mask) → Softmax → MatMul`` subgraph, fusing the whole
+    score/softmax/context computation into one on-device kernel.
+
+    Composition with fused qkv
+    ---------------------------
+    The fused-qkv forward produces ``q/k/v`` already split (GQA, *not*
+    repeated) in ``(B, N, S, D)`` / ``(B, Nkv, S, D)`` layout and hands them
+    straight to this interface — so the fused projection feeds flash
+    attention directly: no ``repeat_kv`` expand, no score-matrix
+    materialisation, no intermediate q/k/v re-layout.  This is the pairing
+    that makes the standalone qkv ``Split`` worthwhile (it no longer needs to
+    land three contiguous buffers for an eager MatMul; flash attention
+    consumes the split slices directly).
+
+    Math equivalence vs eager
+    -------------------------
+    * **scale** — passed through as ``scale_value`` (Gemma's ``self.scaling``,
+      already ``head_dim**-0.5`` or ``query_pre_attn_scalar**-0.5``).
+    * **mask** — HF hands ``eager_attention_forward`` an *additive* float
+      mask (``0`` to attend, ``finfo.min`` to mask).  npu prompt-flash takes
+      a *boolean* ``atten_mask`` where **True == masked** (set to ``-inf``
+      internally).  So ``atten_mask = attention_mask < 0`` reproduces the
+      exact same masking (every masked slot is a large negative additive,
+      every attended slot is ``0``).
+    * **GQA** — key/value keep ``num_key_value_heads`` heads; the operator
+      broadcasts them across query heads internally, matching ``repeat_kv``.
+
+    Output layout
+    -------------
+    ``input_layout="BNSD"`` ⇒ the operator returns ``(B, N, S, D)``; eager's
+    contract is ``(B, S, N, D)`` (it transposes before returning), so we
+    ``transpose(1, 2)`` to match.  The caller then ``reshape(*input_shape,
+    -1)`` and applies ``o_proj`` unchanged.
+
+    Custom single-output symbolic
+    -----------------------------
+    torch_npu's own ``npu_prompt_flash_attention`` ONNX wrapper is unusable
+    here: its ``symbolic`` references an undefined ``self`` and passes the
+    scalar params as positional graph *inputs*.  As with
+    :func:`_patch_gemma_ada_rmsnorm_npu`, we declare our own autograd
+    Function whose ``forward`` calls the real runtime op (correct tracing on
+    device) and whose ``symbolic`` emits a clean single-output
+    ``npu::NPUPromptFlashAttention`` node carrying the scalar params as
+    attributes.  ATC matches the op by op_type after domain stripping.
+
+    Requires a working ``torch_npu`` on the export host (guaranteed on an NPU
+    device).  If unavailable the patch is skipped and attention keeps the
+    eager implementation.  ORT CPU has no ``NPUPromptFlashAttention`` kernel,
+    so ONNX-vs-PyTorch verification must be skipped when this patch is active.
+    """
+    import importlib
+
+    undo_log: list[tuple[Any, str, Any]] = []
+
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError as exc:
+        LOGGER.warning(
+            "npu flash-attention patch requested but torch_npu is unavailable "
+            "(%s); skipping — attention keeps the eager implementation",
+            exc,
+        )
+        return undo_log
+
+    import torch as _torch
+
+    # Single-output custom symbolic (see docstring — torch_npu's own wrapper
+    # is broken).  forward runs the real fused kernel; symbolic emits one
+    # npu::NPUPromptFlashAttention node with the scalar params as attributes.
+    class _NpuPromptFlashAttn(_torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, query, key, value, atten_mask, num_heads, num_kv_heads, scale_value):
+            # Call the raw aten op directly. ``import torch_npu.onnx`` (done by
+            # the npu rope patch) REPLACES the python-level
+            # ``torch_npu.npu_prompt_flash_attention`` with a broken ONNX
+            # wrapper (extra ``self`` arg, all-positional), so we must NOT go
+            # through it. The underlying aten op is untouched and takes the
+            # native keyword schema. The op name varies by torch_npu build
+            # (``npu_prompt_flash_attention`` vs ``prompt_flash_attention``),
+            # so resolve whichever exists.
+            _op = getattr(
+                _torch.ops.npu,
+                "npu_prompt_flash_attention",
+                getattr(_torch.ops.npu, "prompt_flash_attention", None),
+            )
+            # 310P's PromptFlashAttention does NOT support a non-null pse_shift
+            # (runtime tiling fails: "not support 310P when pse is not null"),
+            # so we never pass one — q/k/v + atten_mask only.
+            return _op(
+                query,
+                key,
+                value,
+                atten_mask=atten_mask,
+                num_heads=num_heads,
+                num_key_value_heads=num_kv_heads,
+                input_layout="BNSD",
+                scale_value=scale_value,
+                pre_tokens=65535,
+                next_tokens=65535,
+            )
+
+        @staticmethod
+        def symbolic(g, query, key, value, atten_mask, num_heads, num_kv_heads, scale_value):
+            # Emit the node in the "npu" DOMAIN.  ATC's onnx plugin registers
+            # NPUPromptFlashAttention under BOTH ai.onnx::11-16,19 AND npu::1.
+            # The ai.onnx (default-domain) parser EXPANDS the node into a
+            # subgraph and FORCES a real pse_shift anchor at input index 3 —
+            # which 310P's kernel then rejects at runtime ("not support 310P
+            # when pse is not null").  The npu::1 parser uses a tolerant
+            # ParseParams that accepts q/k/v/atten_mask with NO pse_shift (this
+            # is the path the golden reference export uses).  ATC permits the
+            # npu-domain node alongside default-domain RoPE/RMSNorm as long as
+            # opset_import stays a SINGLE entry (the convert script keeps only
+            # the default ai.onnx opset and does NOT strip this node's domain).
+            return g.op(
+                "npu::NPUPromptFlashAttention",
+                query,
+                key,
+                value,
+                atten_mask,
+                num_heads_i=num_heads,
+                num_key_value_heads_i=num_kv_heads,
+                scale_value_f=scale_value,
+                input_layout_s="BNSD",
+                pre_tokens_i=65535,
+                next_tokens_i=65535,
+            )
+
+    def _flash_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        scaling,
+        dropout=0.0,  # noqa: ARG001 — flash kernel has no train-time dropout here
+        _fa=_NpuPromptFlashAttn,
+        **kwargs,
+    ):
+        # query: (B, N, S, D); key/value: (B, Nkv, S, D) — GQA, *not* repeated.
+        # Head counts MUST be Python ints (they become ONNX node *attributes*);
+        # reading them from query.shape[1] yields a traced Tensor (a Gather op)
+        # which i_() rejects.  Pull the static values from the module/config.
+        num_heads = int(getattr(module, "num_heads", None) or module.config.num_attention_heads)
+        num_kv_heads = int(getattr(module, "num_key_value_heads", None) or module.config.num_key_value_heads)
+        seq_len = query.shape[2]
+
+        if attention_mask is None:
+            raise ValueError(
+                "npu flash-attention patch requires an attention mask; PI05 VLM/AE always supply a causal mask"
+            )
+        # HF additive float mask (0 = attend, finfo.min = mask) -> bool mask
+        # where True == masked, which is npu prompt-flash's convention.
+        atten_mask = attention_mask < 0
+
+        # PromptFlashAttention rejects a non-NULL atten_mask when the sequence
+        # length is not 16-aligned ("attention mask must be NULL, when Qs,Kvs
+        # is unAlign").  PI05's VLM prefix (e.g. 712 tokens) is unaligned, so
+        # pad q/k/v + mask up to the next multiple of 16, then slice the real
+        # rows back out.  Padded KEY columns are masked (True) so real queries
+        # ignore them; padded QUERY rows are discarded after the kernel.
+        align = 16
+        pad = (align - seq_len % align) % align
+        if pad:
+            # q/k/v are (B, H, S, D): pad the seq dim (-2) at the end.
+            query = torch.nn.functional.pad(query, (0, 0, 0, pad))
+            key = torch.nn.functional.pad(key, (0, 0, 0, pad))
+            value = torch.nn.functional.pad(value, (0, 0, 0, pad))
+            # mask is (B, 1, Sq, Skv): pad both query rows and key columns;
+            # padded entries are masked (True).
+            atten_mask = torch.nn.functional.pad(atten_mask, (0, pad, 0, pad), value=True)
+
+        attn_output = _fa.apply(
+            query.contiguous(),
+            key.contiguous(),
+            value.contiguous(),
+            atten_mask,
+            num_heads,
+            num_kv_heads,
+            float(scaling),
+        )
+
+        if pad:
+            # drop the padded query rows -> back to the real seq length.
+            attn_output = attn_output[:, :, :seq_len, :]
+
+        # BNSD (B, N, S, D) -> eager's contract (B, S, N, D)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        return attn_output, None
+
+    _module_paths = [
+        "transformers.models.gemma.modeling_gemma",
+        "transformers.models.gemma2.modeling_gemma2",
+    ]
+
+    for mod_path in _module_paths:
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:
+            continue
+
+        orig = getattr(mod, "eager_attention_forward", None)
+        if orig is None:
+            continue
+
+        mod.eager_attention_forward = _flash_attention_forward
+        undo_log.append((mod, "eager_attention_forward", orig))
+        LOGGER.info(
+            "Patched %s.eager_attention_forward (torch_npu.npu_prompt_flash_attention -> NPUPromptFlashAttention)",
+            mod_path,
+        )
+
+    return undo_log
+
+
+# ---------------------------------------------------------------------------
+# Post-export ONNX sanitization
+# ---------------------------------------------------------------------------
+
+
+def normalize_slice_for_atc(model) -> None:
+    """Normalize Slice nodes to the form ATC's StridedSliceD can compile.
+
+    Empirically ATC's ``StridedSliceD`` chokes on the combination
+    ``axes=<positive int>`` + explicit ``steps=1`` input that the
+    TorchScript ONNX exporter emits for ``x[..., a:b]`` (non-dynamo path,
+    opset 14).  The dynamo exporter (opset 18) instead emits
+    ``axes=[-1]`` and **omits** the steps input, and that form compiles
+    fine — see the AE OM build for a working example.
+
+    This pass rewrites every Slice node so it matches the AE form:
+
+    1. Drop the 5th input (``steps``) when its initializer is all 1s.
+    2. Convert positive ``axes`` initializer entries to negative
+       (``axis - rank(data)``) using shape info from value_info / inputs
+       / outputs.
+
+    Both transformations are semantics-preserving.  Step 1 alone is
+    usually enough to unblock ATC; step 2 is a belt-and-suspenders fix
+    that also makes the graph diff cleanly against the AE export.
+    """
+    import os
+    import tempfile
+
+    import numpy as np
+    import onnx
+    from onnx import numpy_helper, shape_inference
+
+    # ---- Step 1: build rank map -----------------------------------------
+    # In-memory shape_inference fails on >2GB models ("Failed to serialize
+    # proto").  Try the on-disk variant first; fall back to a lightweight
+    # forward rank-propagation pass if even that fails.
+    rank_map: dict[str, int] = {}
+
+    def _ranks_from_value_info(vi_list):
+        out = {}
+        for vi in vi_list:
+            tt = vi.type.tensor_type
+            if tt.HasField("shape"):
+                out[vi.name] = len(tt.shape.dim)
+        return out
+
+    # seed from declared inputs/outputs (always available)
+    rank_map.update(_ranks_from_value_info(model.graph.input))
+    rank_map.update(_ranks_from_value_info(model.graph.output))
+    rank_map.update(_ranks_from_value_info(model.graph.value_info))
+    # initializers carry shape directly
+    for ini in model.graph.initializer:
+        rank_map[ini.name] = len(ini.dims)
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp_in = os.path.join(td, "in.onnx")
+            tmp_out = os.path.join(td, "out.onnx")
+            # Save without external data so the file is self-contained for
+            # shape inference; tensors stay in raw_data already.
+            onnx.save(
+                model,
+                tmp_in,
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                location="in.onnx.data",
+                size_threshold=1024,
+            )
+            # WARNING: onnx.save(save_as_external_data=True) MUTATES the
+            # model in place — every large initializer's raw_data is
+            # cleared and replaced with an external_data reference into
+            # the temp directory.  When the TemporaryDirectory exits the
+            # data files are deleted, leaving the caller's model proto
+            # pointing at nothing (downstream onnx.save would write empty
+            # tensors).  Re-load the bytes back into raw_data and strip
+            # the external_data refs to restore self-containment.
+            from onnx.external_data_helper import load_external_data_for_model
+
+            load_external_data_for_model(model, td)
+            for tensor in model.graph.initializer:
+                if tensor.HasField("data_location"):
+                    tensor.ClearField("data_location")
+                del tensor.external_data[:]
+
+            shape_inference.infer_shapes_path(tmp_in, tmp_out, strict_mode=False)
+            inferred = onnx.load(tmp_out, load_external_data=False)
+            rank_map.update(_ranks_from_value_info(inferred.graph.value_info))
+            LOGGER.info(
+                "normalize_slice_for_atc: shape inference (path) added %d ranks",
+                len(inferred.graph.value_info),
+            )
+    except Exception as exc:
+        LOGGER.warning(
+            "normalize_slice_for_atc: infer_shapes_path failed (%s); falling back to forward rank propagation",
+            exc,
+        )
+
+    # ---- Step 2: constant lookup ----------------------------------------
+    init_map = {ini.name: ini for ini in model.graph.initializer}
+    const_node_map: dict[str, Any] = {}
+    for node in model.graph.node:
+        if node.op_type != "Constant" or not node.output:
+            continue
+        for attr in node.attribute:
+            if attr.name == "value" and attr.t.ByteSize() > 0:
+                const_node_map[node.output[0]] = attr.t
+                break
+
+    def _const_array(name):
+        ini = init_map.get(name) or const_node_map.get(name)
+        if ini is None:
+            return None
+        try:
+            return numpy_helper.to_array(ini)
+        except Exception:
+            return None
+
+    # ---- Step 3: forward-propagate ranks (handles ops infer_shapes missed)
+    # Most ops preserve input rank; a few mutate it.  We do a single pass
+    # in topological order (ONNX graphs are stored topologically already).
+    def _infer_node_output_rank(node):
+        op = node.op_type
+        in_ranks = [rank_map.get(n) for n in node.input]
+        first = next((r for r in in_ranks if r is not None), None)
+
+        if op == "Transpose":
+            for attr in node.attribute:
+                if attr.name == "perm":
+                    return len(attr.ints)
+            return first
+        if op in ("Reshape", "Expand"):
+            arr = _const_array(node.input[1]) if len(node.input) >= 2 else None
+            return int(arr.size) if arr is not None else None
+        if op in ("Unsqueeze",):
+            axes_arr = _const_array(node.input[1]) if len(node.input) >= 2 else None
+            n_axes = (
+                int(axes_arr.size)
+                if axes_arr is not None
+                else sum(len(a.ints) for a in node.attribute if a.name == "axes")
+            )
+            return (first or 0) + n_axes if first is not None else None
+        if op in ("Squeeze",):
+            axes_arr = _const_array(node.input[1]) if len(node.input) >= 2 else None
+            n_axes = (
+                int(axes_arr.size)
+                if axes_arr is not None
+                else sum(len(a.ints) for a in node.attribute if a.name == "axes")
+            )
+            return max(0, (first or 0) - n_axes) if first is not None else None
+        if op == "Gather":
+            # rank = data_rank + indices_rank - 1
+            d, i = in_ranks[0], in_ranks[1] if len(in_ranks) > 1 else None
+            return (d + i - 1) if d is not None and i is not None else None
+        if op == "Concat":
+            return first
+        if op == "MatMul":
+            a, b = in_ranks[0], in_ranks[1] if len(in_ranks) > 1 else None
+            if a is None or b is None:
+                return None
+            return max(a, b)
+        if op == "Where":
+            return max((r for r in in_ranks if r is not None), default=None)
+        if op == "Shape":
+            return 1
+        if op in ("Constant",):
+            for attr in node.attribute:
+                if attr.name == "value":
+                    return len(attr.t.dims)
+            return None
+        # Default: most elementwise / unary ops preserve rank of first input
+        return first
+
+    for node in model.graph.node:
+        for out in node.output:
+            if out and out not in rank_map:
+                r = _infer_node_output_rank(node)
+                if r is not None:
+                    rank_map[out] = r
+
+    # ---- Step 4: rewrite Slice nodes ------------------------------------
+    dropped_steps = 0
+    flipped_axes = 0
+    total_slices = 0
+    skipped_no_axes_const = 0
+    skipped_no_rank = 0
+    for node in model.graph.node:
+        if node.op_type != "Slice":
+            continue
+        total_slices += 1
+
+        # 1) drop trivial steps=[1,1,...]
+        if len(node.input) >= 5 and node.input[4]:
+            steps_arr = _const_array(node.input[4])
+            if steps_arr is not None and np.all(steps_arr == 1):
+                while len(node.input) > 4:
+                    node.input.pop()
+                dropped_steps += 1
+
+        # 2) flip positive axes -> negative
+        if len(node.input) >= 4 and node.input[3]:
+            axes_name = node.input[3]
+            axes_arr = _const_array(axes_name)
+            data_rank = rank_map.get(node.input[0])
+            if axes_arr is None:
+                skipped_no_axes_const += 1
+                continue
+            if data_rank is None:
+                skipped_no_rank += 1
+                continue
+            if np.any(axes_arr >= 0):
+                new_axes = np.where(axes_arr >= 0, axes_arr - data_rank, axes_arr).astype(axes_arr.dtype)
+                new_name = f"_atc_axes_{node.name}".replace("/", "_")
+                model.graph.initializer.append(numpy_helper.from_array(new_axes, name=new_name))
+                node.input[3] = new_name
+                flipped_axes += 1
+
+    LOGGER.info(
+        "normalize_slice_for_atc: %d Slice node(s) | dropped %d steps | "
+        "flipped %d axes | skipped %d (no axes const) + %d (no rank)",
+        total_slices,
+        dropped_steps,
+        flipped_axes,
+        skipped_no_axes_const,
+        skipped_no_rank,
+    )
+
+
+def rewrite_slice_pairs_to_split(model) -> None:
+    """Replace rotate_half-style Slice pairs with a single Split node.
+
+    Pattern matched (per data input + axis):
+
+        Slice(data, starts=[0],   ends=[K],  axes=[a])  -> first_half
+        Slice(data, starts=[K],   ends=[N],  axes=[a])  -> second_half
+
+    where N is the data's size on axis ``a`` (or "very large" sentinel
+    like INT_MAX, which the exporter uses for ``x[..., K:]``).  Both
+    Slices must have all-constant inputs and steps==1 (or absent).
+
+    They are replaced with::
+
+        Split(data, sizes=[K, N-K], axis=a) -> first_half, second_half
+
+    which lowers to ``SplitVD`` on Ascend and bypasses the buggy
+    ``StridedSliceD`` kernel entirely.
+
+    No-op for any Slice that doesn't match the pattern.  Idempotent.
+    """
+    import os
+    import tempfile
+
+    import numpy as np
+    import onnx
+    from onnx import helper, numpy_helper, shape_inference
+
+    INT_SENTINEL = 2_147_483_640  # exporter writes 2^63-1 / INT_MAX-ish for "to end"
+
+    # --- Resolve shapes (size on each axis), reusing the path-based trick ---
+    shape_map: dict[str, list[int]] = {}
+
+    def _shapes_from_value_info(vi_list):
+        out = {}
+        for vi in vi_list:
+            tt = vi.type.tensor_type
+            if tt.HasField("shape"):
+                out[vi.name] = [d.dim_value if d.dim_value > 0 else -1 for d in tt.shape.dim]
+        return out
+
+    shape_map.update(_shapes_from_value_info(model.graph.input))
+    shape_map.update(_shapes_from_value_info(model.graph.output))
+    shape_map.update(_shapes_from_value_info(model.graph.value_info))
+    for ini in model.graph.initializer:
+        shape_map[ini.name] = list(ini.dims)
+
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            tmp_in = os.path.join(td, "in.onnx")
+            tmp_out = os.path.join(td, "out.onnx")
+            onnx.save(
+                model,
+                tmp_in,
+                save_as_external_data=True,
+                all_tensors_to_one_file=True,
+                location="in.onnx.data",
+                size_threshold=1024,
+            )
+            from onnx.external_data_helper import load_external_data_for_model
+
+            load_external_data_for_model(model, td)
+            for tensor in model.graph.initializer:
+                if tensor.HasField("data_location"):
+                    tensor.ClearField("data_location")
+                del tensor.external_data[:]
+            shape_inference.infer_shapes_path(tmp_in, tmp_out, strict_mode=False)
+            inferred = onnx.load(tmp_out, load_external_data=False)
+            shape_map.update(_shapes_from_value_info(inferred.graph.value_info))
+    except Exception as exc:
+        LOGGER.warning(
+            "rewrite_slice_pairs_to_split: shape inference failed (%s); may miss some pairs",
+            exc,
+        )
+
+    # --- Constant lookup (initializer + Constant nodes) ---
+    init_map = {ini.name: ini for ini in model.graph.initializer}
+    const_node_map: dict[str, Any] = {}
+    for node in model.graph.node:
+        if node.op_type != "Constant" or not node.output:
+            continue
+        for attr in node.attribute:
+            if attr.name == "value" and attr.t.ByteSize() > 0:
+                const_node_map[node.output[0]] = attr.t
+                break
+
+    def _const_array(name):
+        ini = init_map.get(name) or const_node_map.get(name)
+        if ini is None:
+            return None
+        try:
+            return numpy_helper.to_array(ini)
+        except Exception:
+            return None
+
+    # --- Collect candidate Slices (all-constant, single-axis, step=1) ---
+    # Each entry: (idx_in_node_list, node, data, axis_int, start_int, end_int)
+    candidates: list[tuple[int, Any, str, int, int, int]] = []
+    skipped_inputs = 0
+    skipped_non_const = 0
+    skipped_steps = 0
+    total_slice_seen = 0
+    for idx, node in enumerate(model.graph.node):
+        if node.op_type != "Slice":
+            continue
+        total_slice_seen += 1
+        if len(node.input) < 3:
+            skipped_inputs += 1
+            continue
+        starts = _const_array(node.input[1])
+        ends = _const_array(node.input[2])
+        axes = _const_array(node.input[3]) if len(node.input) >= 4 else None
+        steps = _const_array(node.input[4]) if len(node.input) >= 5 else None
+        if starts is None or ends is None or axes is None or starts.size != 1 or ends.size != 1 or axes.size != 1:
+            skipped_non_const += 1
+            continue
+        if steps is not None and not np.all(steps == 1):
+            skipped_steps += 1
+            continue
+        candidates.append(
+            (
+                idx,
+                node,
+                node.input[0],
+                int(axes[0]),
+                int(starts[0]),
+                int(ends[0]),
+            )
+        )
+
+    LOGGER.info(
+        "rewrite_slice_pairs_to_split: %d Slice seen | %d candidates | "
+        "skipped %d (few inputs) + %d (non-const) + %d (steps!=1)",
+        total_slice_seen,
+        len(candidates),
+        skipped_inputs,
+        skipped_non_const,
+        skipped_steps,
+    )
+
+    # --- Group by (data, axis) and find rotate_half pairs ---
+    groups: dict[tuple[str, int], list] = {}
+    for c in candidates:
+        groups.setdefault((c[2], c[3]), []).append(c)
+
+    new_nodes: list[Any] = []
+    new_initializers: list[Any] = []
+    nodes_to_remove: set[int] = set()
+    pairs_replaced = 0
+
+    for (data, axis), entries in groups.items():
+        if len(entries) < 2:
+            continue
+        data_shape = shape_map.get(data)
+        if data_shape is None:
+            continue
+        # Normalize axis to non-negative for indexing the shape
+        pos_axis = axis if axis >= 0 else axis + len(data_shape)
+        if not (0 <= pos_axis < len(data_shape)):
+            continue
+        axis_size = data_shape[pos_axis]
+        if axis_size <= 0:
+            continue
+
+        # Find a "first half" (start=0, end=K) and matching "second half"
+        # (start=K, end=N or sentinel).
+        firsts = [e for e in entries if e[4] == 0 and 0 < e[5] < axis_size]
+        seconds_by_start = {}
+        for e in entries:
+            end_val = e[5]
+            # Treat huge ends as axis_size
+            if end_val >= INT_SENTINEL or end_val == axis_size or end_val == -1:
+                seconds_by_start.setdefault(e[4], []).append(e)
+            elif end_val < 0 and (axis_size + end_val) > e[4]:
+                # negative end like -1 ... handle as axis_size + end
+                seconds_by_start.setdefault(e[4], []).append(e)
+
+        for first in firsts:
+            K = first[5]
+            partners = seconds_by_start.get(K)
+            if not partners:
+                continue
+            second = partners[0]
+
+            split_sizes = np.array([K, axis_size - K], dtype=np.int64)
+            sizes_name = f"_atc_split_sizes_pair_{first[1].name}".replace("/", "_")
+            new_initializers.append(numpy_helper.from_array(split_sizes, name=sizes_name))
+            split_node = helper.make_node(
+                "Split",
+                inputs=[data, sizes_name],
+                outputs=[first[1].output[0], second[1].output[0]],
+                name=f"_atc_split_pair_{first[1].name}".replace("/", "_"),
+                axis=axis,  # ONNX Split accepts negative axis since opset 13
+            )
+            # Insert at position of the first Slice so topology stays valid
+            new_nodes.append((min(first[0], second[0]), split_node))
+            nodes_to_remove.add(first[0])
+            nodes_to_remove.add(second[0])
+            pairs_replaced += 1
+
+    if pairs_replaced == 0:
+        LOGGER.info("rewrite_slice_pairs_to_split: no rotate_half pairs found")
+        return
+
+    # --- Apply changes: rebuild node list ---
+    insertions: dict[int, list] = {}
+    for pos, n in new_nodes:
+        insertions.setdefault(pos, []).append(n)
+
+    rebuilt = []
+    for i, node in enumerate(model.graph.node):
+        if i in insertions:
+            rebuilt.extend(insertions[i])
+        if i not in nodes_to_remove:
+            rebuilt.append(node)
+
+    del model.graph.node[:]
+    model.graph.node.extend(rebuilt)
+    model.graph.initializer.extend(new_initializers)
+
+    LOGGER.info(
+        "rewrite_slice_pairs_to_split: replaced %d Slice pair(s) with Split node(s)",
+        pairs_replaced,
+    )
+
+
+def sanitize_nan_initializers(model) -> None:
+    """Replace NaN values in float16/float32 initializers with zero.
+
+    The torch dynamo ONNX exporter (``torch.onnx.export(dynamo=True)``)
+    occasionally produces a handful of corrupted float16 weight values
+    (e.g. raw bits ``0x7d00``) that are valid NaN bit patterns.  These
+    NaN weights silently propagate through MatMul/Add nodes at inference
+    time and corrupt all downstream activations.
+
+    This function scans every initializer and zeroes out NaN elements.
+    Typically only 1–8 values out of hundreds of millions are affected.
+    """
+    import numpy as np
+    import onnx
+
+    _DTYPE_MAP = {
+        onnx.TensorProto.FLOAT16: np.float16,
+        onnx.TensorProto.FLOAT: np.float32,
+        onnx.TensorProto.DOUBLE: np.float64,
+    }
+    total_fixed = 0
+    for tensor in model.graph.initializer:
+        np_dtype = _DTYPE_MAP.get(tensor.data_type)
+        if np_dtype is None:
+            continue
+        arr = np.frombuffer(tensor.raw_data, dtype=np_dtype)
+        nan_mask = np.isnan(arr)
+        n_nan = int(nan_mask.sum())
+        if n_nan == 0:
+            continue
+        LOGGER.warning(
+            "Initializer %s (%s, %s elems): %d NaN value(s) replaced with 0",
+            tensor.name,
+            np_dtype.__name__,
+            arr.size,
+            n_nan,
+        )
+        arr = arr.copy()
+        arr[nan_mask] = 0
+        tensor.raw_data = arr.tobytes()
+        total_fixed += n_nan
+    if total_fixed:
+        LOGGER.info("Sanitized %d total NaN value(s) across initializers", total_fixed)
+
+
+def downgrade_split_for_atc(model) -> None:
+    """Convert opset-18 ``Split`` nodes to opset-13 compatible format.
+
+    In opset 18 the ``Split`` operator uses a ``num_outputs`` **attribute**
+    and has only one input (the data tensor).  Ascend ATC does not support
+    this form and fails with::
+
+        Current num_outputs not surpport
+
+    ORT (with opset 18) requires either ``num_outputs`` or an explicit
+    ``split`` input — so we cannot simply delete the attribute.
+
+    This function rewrites every affected ``Split`` node in-place:
+
+    1. Reads the split-axis dimension size from the graph's shape info.
+    2. Creates an explicit ``split`` sizes initializer (e.g. ``[128, 128]``).
+    3. Wires it as the 2nd input to the ``Split`` node.
+    4. Removes the ``num_outputs`` attribute.
+
+    This satisfies both ORT (has ``split`` input) and ATC (no ``num_outputs``).
+    """
+    import numpy as np
+    from onnx import numpy_helper
+
+    # --- Build a name → shape map from value_info, inputs, outputs ---
+    shape_map: dict[str, list[int]] = {}
+    for vi in list(model.graph.value_info) + list(model.graph.input) + list(model.graph.output):
+        tt = vi.type.tensor_type
+        if tt.HasField("shape"):
+            dims = [d.dim_value if d.dim_value > 0 else -1 for d in tt.shape.dim]
+            shape_map[vi.name] = dims
+
+    fixed = 0
+    for node in model.graph.node:
+        if node.op_type != "Split":
+            continue
+
+        # Only touch nodes that carry the opset-18 num_outputs attribute
+        num_outputs_val = None
+        num_outputs_idx = None
+        axis_val = 0
+        for idx, attr in enumerate(node.attribute):
+            if attr.name == "num_outputs":
+                num_outputs_val = attr.i
+                num_outputs_idx = idx
+            elif attr.name == "axis":
+                axis_val = attr.i
+
+        if num_outputs_val is None:
+            continue  # already opset-13 style
+
+        if len(node.input) >= 2 and node.input[1]:
+            continue  # already has a split-sizes input
+
+        # Resolve the split-axis dimension size
+        input_shape = shape_map.get(node.input[0])
+        if input_shape is None or axis_val >= len(input_shape) or input_shape[axis_val] <= 0:
+            LOGGER.warning(
+                "Split node %s: cannot determine dim size on axis %d — skipping",
+                node.name,
+                axis_val,
+            )
+            continue
+
+        dim_size = input_shape[axis_val]
+        chunk = dim_size // num_outputs_val
+        sizes = np.array([chunk] * num_outputs_val, dtype=np.int64)
+
+        # Create initializer and wire as 2nd input
+        split_name = f"_atc_split_sizes_{node.name}"
+        model.graph.initializer.append(numpy_helper.from_array(sizes, name=split_name))
+        if len(node.input) < 2:
+            node.input.append(split_name)
+        else:
+            node.input[1] = split_name
+
+        # Remove num_outputs attribute
+        del node.attribute[num_outputs_idx]
+        fixed += 1
+
+    if fixed:
+        LOGGER.info(
+            "Downgraded %d Split node(s) from opset-18 to opset-13 format for ATC",
+            fixed,
+        )
+
+
+def downgrade_ir_version(model, *, max_ir_version: int = 9) -> None:
+    """Cap the ONNX IR version so older runtimes can load the model.
+
+    ``torch.onnx.dynamo_export`` with recent ONNX packages may produce
+    IR version 10, but ORT ≤ 1.18 only supports up to IR version 9.
+    This simply clamps the field without changing any graph semantics.
+    """
+    if model.ir_version > max_ir_version:
+        LOGGER.info(
+            "Downgrading ONNX IR version %d → %d",
+            model.ir_version,
+            max_ir_version,
+        )
+        model.ir_version = max_ir_version
+
+
+# ---------------------------------------------------------------------------
+# Patch registry — add new entries here
+# ---------------------------------------------------------------------------
+
+_PATCH_REGISTRY: list[tuple[str, Any]] = [
+    # (human-readable label, callable that returns undo_log)
+    # NOTE: rotate_half is no longer patched — the new reshape-based
+    # apply_rotary_pos_emb bypasses rotate_half entirely (no Slice/Split
+    # in the RoPE subgraph), which is what lets us keep
+    # TransdataTransposeTransdataFusionPass on without ATC mis-compiling.
+    ("AdaRMSNorm (fp32→model_dtype)", _patch_gemma_ada_rmsnorm),
+    ("apply_rotary_pos_emb (reshape-based, no Slice/Split)", _patch_gemma_rotary_pos_emb),
+    ("eager_attention (value→query dtype)", _patch_gemma_eager_attention),
+]
+
+
+def _build_patch_registry(
+    use_npu_ops: bool, *, fp16_softmax: bool = False, mqa_broadcast: bool = False
+) -> list[tuple[str, Any]]:
+    """Return the active patch registry for the requested export mode.
+
+    When ``use_npu_ops`` is set (i.e. exporting on an NPU device), the
+    ORT-runnable reshape-based RoPE patch is swapped for the
+    :func:`_patch_gemma_rotary_pos_emb_npu` variant that routes RoPE through
+    the real ``torch_npu.npu_rotary_mul`` fused operator (emitted as an
+    ``NPURotaryMul`` ONNX node).  Future NPU-affine optimizations
+    (flash-attention, layernorm, qkv fusion) gate on this same flag.
+
+    ``fp16_softmax`` / ``mqa_broadcast`` are action-expert-only attention
+    optimisations threaded into :func:`_patch_gemma_eager_attention`; they
+    default off so the VLM export (host-side fp32 prefix mask) is unchanged.
+    """
+    rope_patch = (
+        ("apply_rotary_pos_emb (torch_npu.npu_rotary_mul)", _patch_gemma_rotary_pos_emb_npu)
+        if use_npu_ops
+        else ("apply_rotary_pos_emb (reshape-based, no Slice/Split)", _patch_gemma_rotary_pos_emb)
+    )
+    rmsnorm_patch = (
+        ("GemmaRMSNorm (torch_npu.npu_rms_norm)", _patch_gemma_ada_rmsnorm_npu)
+        if use_npu_ops
+        else ("AdaRMSNorm (fp32→model_dtype)", _patch_gemma_ada_rmsnorm)
+    )
+    # On NPU, the whole attention (score/mask/softmax/context) would ideally
+    # collapse into a single npu_prompt_flash_attention kernel.  HOWEVER, flash
+    # attention is DISABLED: it is fundamentally incompatible with 310P + ATC
+    # (see "NPU 算子替换总结.md" — the default-domain PromptFlashAttention parser
+    # forces a pse_shift input that 310P rejects, the npu domain cannot coexist
+    # with default-domain standard ops under ATC's single-opset_import rule, and
+    # a mask-less FA would corrupt PI05's always-padded prefix attention).  So on
+    # NPU we keep the same ORT-runnable eager path (with the value→query dtype
+    # fix) used off NPU; only RoPE + RMSNorm are routed to npu fused operators.
+    attention_patch = (
+        # ("flash attention (torch_npu.npu_prompt_flash_attention)", _patch_gemma_flash_attention_npu)
+        # if use_npu_ops
+        # else ("eager_attention (value→query dtype)", _patch_gemma_eager_attention)
+        (
+            "eager_attention (value→query dtype"
+            + (", mqa_broadcast" if mqa_broadcast else "")
+            + (", fp16_softmax" if fp16_softmax else "")
+            + ")",
+            functools.partial(
+                _patch_gemma_eager_attention,
+                fp16_softmax=fp16_softmax,
+                mqa_broadcast=mqa_broadcast,
+            ),
+        )
+    )
+    # gelu_pytorch_tanh (Gemma text MLP + SigLIP vision MLP) decomposes into a
+    # Mul/Add/Tanh elementwise chain at opset <= 18 — the single largest "glue"
+    # cost in the VLM profile, unfused by ATC's GeluFusionPass.  On NPU, route
+    # it to the fused NPUFastGelu kernel (default-domain registered at opset
+    # 11-18, like RoPE/RMSNorm; NPUGeluV2 is npu-domain-only and thus unusable).
+    # NOTE: FastGelu is a sigmoid-style approximation (NOT the exact tanh form),
+    # so this introduces a small bounded error (max ≈2.1e-2) — validate action
+    # accuracy end-to-end before relying on it.  Off NPU there is no fused-gelu
+    # kernel for ORT, so keep the decomposition.
+    registry = [
+        rmsnorm_patch,
+        rope_patch,
+        attention_patch,
+        # qkv fusion DISABLED: standalone it is a slight pessimisation (ATC
+        # already fuses the q/k/v MatMuls; the extra Split adds launch cost on
+        # the short-seq action expert).  It only pays off when PAIRED with flash
+        # attention (which consumes the split q/k/v directly) — and FA is
+        # disabled on 310P (see above), so qkv fusion has no upside here.
+        # ("fused qkv projection", _patch_gemma_fused_qkv),
+    ]
+    if use_npu_ops:
+        registry.append(("gelu_pytorch_tanh (torch_npu.fast_gelu -> NPUFastGelu)", _patch_pytorch_gelu_tanh_npu))
+    return registry
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+@contextmanager
+def ascend_onnx_export_patches(use_npu_ops: bool = False, *, fp16_softmax: bool = False, mqa_broadcast: bool = False):
+    """Context manager that applies **all** registered Ascend patches.
+
+    Patches are applied on ``__enter__`` and reverted on ``__exit__``,
+    regardless of whether an exception occurred.
+
+    Args:
+        use_npu_ops: When ``True`` (export on an NPU device), route RoPE
+            through the ``torch_npu.npu_rotary_mul`` fused operator (emitted
+            as an ``NPURotaryMul`` ONNX node) instead of the ORT-runnable
+            reshape-based form.  The resulting graph requires an ATC
+            custom-op plugin and cannot be verified with ORT CPU.  Future
+            NPU-affine optimizations gate on this same flag.
+        fp16_softmax: Action-expert only.  Keep the attention score matrix
+            and softmax in fp16 (no fp32 upcast Cast).  Requires a fp16-safe
+            additive mask sentinel.  Leave ``False`` for the VLM export.
+        mqa_broadcast: Action-expert only.  Skip the ``repeat_kv`` Expand for
+            multi-query layers and rely on matmul broadcasting instead.
+
+    Example::
+
+        with ascend_onnx_export_patches():
+            torch.onnx.export(model, ...)
+    """
+    all_undo: list[tuple[Any, str, Any]] = []
+    applied: list[str] = []
+
+    for label, patch_fn in _build_patch_registry(use_npu_ops, fp16_softmax=fp16_softmax, mqa_broadcast=mqa_broadcast):
+        try:
+            undo = patch_fn()
+            all_undo.extend(undo)
+            if undo:
+                applied.append(label)
+        except Exception as exc:
+            LOGGER.warning("Failed to apply patch '%s': %s", label, exc)
+
+    if applied:
+        LOGGER.info("Ascend export patches active: %s", ", ".join(applied))
+    else:
+        LOGGER.info("No Ascend export patches applied")
+
+    try:
+        yield
+    finally:
+        # Restore in reverse order
+        for mod, attr, orig in reversed(all_undo):
+            setattr(mod, attr, orig)
+        if all_undo:
+            LOGGER.info("Reverted %d Ascend export patch(es)", len(all_undo))
