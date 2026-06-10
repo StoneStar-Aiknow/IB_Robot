@@ -620,3 +620,563 @@ def verify_actions(
 # ---------------------------------------------------------------------------
 
 
+@torch.no_grad()
+def verify_onnx_actions(
+    full_policy,
+    batch: dict[str, Tensor],
+    vlm_onnx_path: str,
+    ae_onnx_path: str,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compare full model (PyTorch) vs split ONNX (VLM ONNX + N × AE ONNX).
+
+    The VLM ONNX model produces ``past_kv_tensor`` + ``prefix_pad_masks``.
+    The AE ONNX model is called *N* times in a denoising loop; each call
+    performs a single Euler step and returns the updated ``x_t``.
+
+    Returns a tuple of:
+        ``(full_actions_np, onnx_actions_np,
+           full_kv_np, onnx_kv_np,
+           full_masks_np, onnx_masks_np)``.
+
+    The ``*_kv_np`` / ``*_masks_np`` pair lets callers directly diff the
+    full-PT-VLM KV cache against the VLM ONNX KV cache (i.e. measure the
+    PT→ONNX export error in isolation, without it being entangled with
+    the AE denoising path).
+    """
+    import onnxruntime as ort
+    from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
+
+    from model_utils.pi05_export.modeling_pi05_vlm import flatten_kv, make_att_2d_masks
+
+    config = full_policy.config
+    device = next(full_policy.parameters()).device
+    bsize = next(v.shape[0] for v in batch.values() if isinstance(v, Tensor))
+    num_steps = config.num_inference_steps
+
+    # --- Generate shared noise (float32, same seed) ---
+    torch.manual_seed(seed)
+    noise = torch.normal(
+        mean=0.0,
+        std=1.0,
+        size=(bsize, config.chunk_size, config.max_action_dim),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    # ========== Full model (PyTorch) ==========
+    LOGGER.info("Running full model sample_actions (PyTorch) …")
+    images_full, img_masks_full = full_policy._preprocess_images(batch)
+    tokens_full = batch[OBS_LANGUAGE_TOKENS]
+    masks_full = batch[OBS_LANGUAGE_ATTENTION_MASK]
+
+    # --- Also extract the full model's prefix KV cache for direct
+    #     comparison against the VLM ONNX output (computed below). This
+    #     mirrors verify_kv_cache() but reuses the full PyTorch model as
+    #     the baseline (no PT split model needed).
+    full_model = full_policy.model
+    prefix_embs, prefix_pad_masks_full, prefix_att_masks = full_model.embed_prefix(
+        images_full, img_masks_full, tokens_full, masks_full
+    )
+    prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks_full, prefix_att_masks)
+    prefix_position_ids = torch.cumsum(prefix_pad_masks_full, dim=1) - 1
+    prefix_att_2d_masks_4d = full_model._prepare_attention_masks_4d(prefix_att_2d_masks)
+    full_model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+    _, past_kv_full = full_model.paligemma_with_expert.forward(
+        attention_mask=prefix_att_2d_masks_4d,
+        position_ids=prefix_position_ids,
+        past_key_values=None,
+        inputs_embeds=[prefix_embs, None],
+        use_cache=True,
+    )
+    full_kv_tensor = flatten_kv(past_kv_full)
+    full_kv_np = full_kv_tensor.cpu().float().numpy()
+    full_masks_np = prefix_pad_masks_full.cpu().numpy()
+
+    t0 = time.perf_counter()
+    full_actions = full_policy.model.sample_actions(
+        images_full,
+        img_masks_full,
+        tokens_full,
+        masks_full,
+        noise=noise.clone(),
+        num_steps=num_steps,
+    )
+    t_full = time.perf_counter() - t0
+    LOGGER.info("Full model PyTorch inference: %.4f sec", t_full)
+
+    original_action_dim = config.output_features[ACTION].shape[0]
+    full_actions = full_actions[:, :, :original_action_dim]
+
+    # ========== ONNX split: VLM ONNX + N × AE ONNX ==========
+    LOGGER.info("Running ONNX split (VLM + %d × AE) …", num_steps)
+
+    # --- Step 1: VLM ONNX inference ---
+    vlm_options = ort.SessionOptions()
+    vlm_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+    os.environ.setdefault("ORT_SEED", "42")
+
+    # Pick ORT providers from --device (mirrors the torch device).
+    # CPU is always appended as a fallback so unsupported ops still run.
+    if device.type == "cuda":
+        ort_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    else:
+        ort_providers = ["CPUExecutionProvider"]
+    LOGGER.info("  ORT providers (from --device=%s): %s", device, ort_providers)
+
+    vlm_session = ort.InferenceSession(
+        str(vlm_onnx_path),
+        sess_options=vlm_options,
+        providers=ort_providers,
+    )
+    vlm_valid = {inp.name for inp in vlm_session.get_inputs()}
+    LOGGER.info("  VLM ONNX inputs: %s", sorted(vlm_valid))
+    vlm_feed = _build_vlm_onnx_feed(batch, vlm_valid)
+
+    # Stage C — Plan A: build prefix_att_2d_masks_4d on host if the
+    # ONNX model expects it (post-Plan-A exports moved this constant
+    # out of the graph to avoid ATC fp16 corruption).
+    if "prefix_att_2d_masks_4d" in vlm_valid and "prefix_att_2d_masks_4d" not in vlm_feed:
+        from inference_service.core.ascend_om.pi05.prefix_mask_utils import build_prefix_att_2d_masks_4d_np
+
+        lang_masks_np = batch[OBS_LANGUAGE_ATTENTION_MASK].cpu().numpy().astype(bool)
+        num_cameras = len([k for k in batch if k.startswith("observation.images.")])
+
+        # Determine prefix_seq_len from the ONNX input metadata
+        prefix_meta = next(inp for inp in vlm_session.get_inputs() if inp.name == "prefix_att_2d_masks_4d")
+        prefix_seq_len = prefix_meta.shape[-1]  # (B, 1, S, S)
+        LOGGER.info("  Building prefix_att_2d_masks_4d: num_cameras=%d, prefix_seq_len=%s", num_cameras, prefix_seq_len)
+
+        prefix_mask = build_prefix_att_2d_masks_4d_np(
+            num_cameras=num_cameras,
+            lang_masks=lang_masks_np,
+            prefix_seq_len=int(prefix_seq_len),
+        )
+        vlm_feed["prefix_att_2d_masks_4d"] = prefix_mask.astype(np.float32)
+
+    LOGGER.info("  VLM ONNX feed keys: %s", sorted(vlm_feed.keys()))
+
+    # Default: original numpy path (unchanged for fp16/fp32 models).
+    # Fallback: bf16-aware OrtValue + DLPack path — numpy can't represent
+    # bfloat16, so we route through torch (which supports bf16 natively).
+    vlm_use_ortvalue = _has_bf16_io(vlm_session)
+    if vlm_use_ortvalue:
+        LOGGER.info("  VLM ONNX has bf16 IO — using OrtValue + DLPack bridge")
+
+    # Target device for OrtValue placement (only used in the bf16 path).
+    ort_target_device = "cuda" if device.type == "cuda" else "cpu"
+    ort_target_device_id = device.index or 0
+
+    t0 = time.perf_counter()
+    if vlm_use_ortvalue:
+        ort_inputs: dict[str, Any] = {}
+        for name, arr in vlm_feed.items():
+            ort_inputs[name] = ort.OrtValue.ortvalue_from_numpy(arr, ort_target_device, ort_target_device_id)
+        ort_outputs = vlm_session.run_with_ort_values(None, ort_inputs)
+        # Convert outputs to fp32 numpy via torch (bf16 safe).
+        vlm_outputs = [_ort_value_to_fp32_numpy(ov) for ov in ort_outputs]
+    else:
+        vlm_outputs = vlm_session.run(None, vlm_feed)
+    t_vlm = time.perf_counter() - t0
+    LOGGER.info("  VLM ONNX: %.4f sec", t_vlm)
+
+    past_kv_np = np.asarray(vlm_outputs[0])  # past_kv_tensor
+    prefix_masks_np = np.asarray(vlm_outputs[1])  # prefix_pad_masks
+    LOGGER.info(
+        "  VLM ONNX out — past_kv: %s %s, masks: %s %s",
+        past_kv_np.shape,
+        past_kv_np.dtype,
+        prefix_masks_np.shape,
+        prefix_masks_np.dtype,
+    )
+
+    # --- Step 2: AE ONNX denoising loop ---
+    ae_session = ort.InferenceSession(
+        str(ae_onnx_path),
+        providers=ort_providers,
+    )
+    ae_valid = {inp.name for inp in ae_session.get_inputs()}
+    LOGGER.info("  AE ONNX inputs: %s", sorted(ae_valid))
+
+    # Auto-detect float dtype from the AE ONNX model's "noise" input.
+    # fp16 / fp32 → original numpy loop (unchanged behavior).
+    # bf16        → fallback torch + DLPack loop (numpy lacks bfloat16).
+    _onnx_type_map = {"tensor(float16)": np.float16, "tensor(float)": np.float32}
+    _onnx_to_torch = {
+        "tensor(float16)": torch.float16,
+        "tensor(float)": torch.float32,
+        "tensor(bfloat16)": torch.bfloat16,
+    }
+    ae_input_meta = {inp.name: inp for inp in ae_session.get_inputs()}
+    ae_noise_type = ae_input_meta["noise"].type if "noise" in ae_input_meta else "tensor(float16)"
+    ae_use_ortvalue = _has_bf16_io(ae_session) or ae_noise_type == "tensor(bfloat16)"
+
+    # Per-input torch dtype map (auto mode may produce mixed bf16/fp32 inputs:
+    # past_kv_tensor=bf16 from gemma expert, noise/time=fp32 from projection layers).
+    def _ae_dtype(name: str, default: torch.dtype) -> torch.dtype:
+        meta = ae_input_meta.get(name)
+        if meta is None:
+            return default
+        return _onnx_to_torch.get(meta.type, default)
+
+    if ae_use_ortvalue:
+        torch_dtype = _onnx_to_torch.get(ae_noise_type, torch.bfloat16)
+        ae_dtypes = {
+            "noise": _ae_dtype("noise", torch_dtype),
+            "past_kv_tensor": _ae_dtype("past_kv_tensor", torch_dtype),
+            "time": _ae_dtype("time", torch_dtype),
+        }
+        LOGGER.info(
+            "  AE ONNX has bf16 IO — using OrtValue + DLPack bridge (per-input dtypes: %s)",
+            {k: str(v) for k, v in ae_dtypes.items()},
+        )
+    else:
+        onnx_float_dtype = _onnx_type_map.get(ae_noise_type, np.float16)
+        LOGGER.info("  AE ONNX float dtype (auto-detected): %s", onnx_float_dtype)
+
+    t0 = time.perf_counter()
+    step_count = 0
+
+    if ae_use_ortvalue:
+        # bf16 fallback path: keep state as torch tensors on the AE device,
+        # feed via DLPack. This avoids any numpy bf16 conversion.
+        ae_torch_device = (
+            torch.device(f"cuda:{ort_target_device_id}") if ort_target_device == "cuda" else torch.device("cpu")
+        )
+
+        x_t_t = noise.to(device=ae_torch_device, dtype=ae_dtypes["noise"]).contiguous()
+        past_kv_t = (
+            torch.from_numpy(past_kv_np).to(device=ae_torch_device, dtype=ae_dtypes["past_kv_tensor"]).contiguous()
+        )
+        prefix_masks_t = torch.from_numpy(prefix_masks_np.astype(bool)).to(ae_torch_device).contiguous()
+
+        dt_py = -1.0 / num_steps
+        time_val_py = 1.0
+
+        while time_val_py >= -dt_py / 2:
+            time_t = torch.full((bsize,), time_val_py, dtype=ae_dtypes["time"], device=ae_torch_device)
+            ae_feed_ov = {
+                "past_kv_tensor": _torch_to_ort_value(past_kv_t),
+                "prefix_pad_masks": _torch_to_ort_value(prefix_masks_t),
+                "time": _torch_to_ort_value(time_t),
+                "noise": _torch_to_ort_value(x_t_t),
+            }
+            ae_feed_ov = {k: v for k, v in ae_feed_ov.items() if k in ae_valid}
+
+            ae_outputs = ae_session.run_with_ort_values(None, ae_feed_ov)
+            x_t_t = _ort_value_to_torch(ae_outputs[0]).to(dtype=ae_dtypes["noise"]).contiguous()
+
+            time_val_py = time_val_py + dt_py
+            step_count += 1
+
+        if x_t_t.dtype == torch.bfloat16:
+            x_t_t = x_t_t.float()
+        x_t_np = x_t_t.detach().cpu().numpy()
+    else:
+        # Original numpy path — unchanged behavior for fp16 / fp32 models.
+        x_t_np = noise.cpu().numpy().astype(onnx_float_dtype)
+        past_kv_cast = past_kv_np.astype(onnx_float_dtype)
+        prefix_masks_bool = prefix_masks_np.astype(bool)
+
+        dt = onnx_float_dtype(-1.0 / num_steps)
+        time_val = onnx_float_dtype(1.0)
+
+        while time_val >= -dt / 2:
+            time_arr = np.full((bsize,), time_val, dtype=onnx_float_dtype)
+            ae_feed = {
+                "past_kv_tensor": past_kv_cast,
+                "prefix_pad_masks": prefix_masks_bool,
+                "time": time_arr,
+                "noise": x_t_np,
+            }
+            # Filter by valid input names
+            ae_feed = {k: v for k, v in ae_feed.items() if k in ae_valid}
+
+            ae_outputs = ae_session.run(None, ae_feed)
+            x_t_np = np.asarray(ae_outputs[0])  # x_t after single Euler step
+
+            time_val = time_val + dt
+            step_count += 1
+
+    t_ae = time.perf_counter() - t0
+    LOGGER.info("  AE ONNX denoising (%d steps): %.4f sec", step_count, t_ae)
+    LOGGER.info("  ONNX total: %.4f sec", t_vlm + t_ae)
+
+    onnx_actions = x_t_np[:, :, :original_action_dim]
+
+    full_np = full_actions.cpu().float().numpy()
+    onnx_np = onnx_actions.astype(np.float32)
+
+    # Cast VLM ONNX KV / masks to float32 / bool-as-int for reporting
+    onnx_kv_np = past_kv_np.astype(np.float32)
+    onnx_masks_np = prefix_masks_np.astype(full_masks_np.dtype)
+
+    return full_np, onnx_np, full_kv_np, onnx_kv_np, full_masks_np, onnx_masks_np
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Verify PI05 split (VLM + AE) equivalence against the monolithic model.")
+    p.add_argument(
+        "--pretrained-policy-path",
+        type=str,
+        required=True,
+        help="Path to the pretrained PI05 checkpoint (shared by all three models).",
+    )
+    p.add_argument("--device", type=str, default="cpu", help="Torch device (cpu, cuda:0, …)")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for dummy inputs and noise.")
+    p.add_argument("--batch-size", type=int, default=1, help="Batch size for dummy inputs.")
+    p.add_argument(
+        "--batch-path",
+        type=str,
+        default=None,
+        help="Optional path to real batches JSON (loss_compare format). "
+        "If provided, --batch-size and --seed (for input generation) are ignored.",
+    )
+    p.add_argument("--max-batches", type=int, default=None, help="Max number of batches to test (for real batches).")
+    p.add_argument(
+        "--skip-kv-check",
+        action="store_true",
+        help="Skip the KV-cache equivalence check (only compare final actions).",
+    )
+    p.add_argument(
+        "--vlm-onnx-path",
+        type=str,
+        default=None,
+        help="Path to the exported VLM ONNX model. "
+        "When both --vlm-onnx-path and --ae-onnx-path are given, "
+        "only the ONNX-vs-full-PyTorch comparison is performed "
+        "(the PyTorch split check is skipped).",
+    )
+    p.add_argument(
+        "--ae-onnx-path",
+        type=str,
+        default=None,
+        help="Path to the exported Action Expert ONNX model. Must be provided together with --vlm-onnx-path.",
+    )
+    p.add_argument(
+        "--skip-onnx-check",
+        action="store_true",
+        help="Skip ONNX verification even when ONNX paths are provided.",
+    )
+    p.add_argument(
+        "--key-map",
+        type=str,
+        nargs="*",
+        default=None,
+        metavar="SRC=DST",
+        help="Remap batch keys for real batches. Each entry is SRC=DST, e.g. "
+        "'observation.images.top_view=observation.images.top' "
+        "'observation.images.hand_view=observation.images.wrist'. "
+        "Keys not listed are kept unchanged.",
+    )
+    p.add_argument(
+        "--task",
+        type=str,
+        default="",
+        help="Task description string for prompt generation when using "
+        "real batches (e.g. 'pick up the cup'). Defaults to empty.",
+    )
+    p.add_argument("--log-level", type=str, default="INFO")
+    p.add_argument("--local-files-only", action="store_true", default=True)
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        format="%(levelname)s: %(message)s",
+    )
+    # Ensure root logger is also configured
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
+
+    device = torch.device(args.device)
+    policy_path = args.pretrained_policy_path
+
+    # Determine whether ONNX verification should run
+    run_onnx = not args.skip_onnx_check and args.vlm_onnx_path is not None and args.ae_onnx_path is not None
+    if run_onnx:
+        vlm_onnx = Path(args.vlm_onnx_path)
+        ae_onnx = Path(args.ae_onnx_path)
+        if not vlm_onnx.exists():
+            LOGGER.error("VLM ONNX model not found: %s", vlm_onnx)
+            return 1
+        if not ae_onnx.exists():
+            LOGGER.error("AE ONNX model not found: %s", ae_onnx)
+            return 1
+        LOGGER.info("ONNX verification ENABLED — VLM: %s, AE: %s", vlm_onnx, ae_onnx)
+    elif args.vlm_onnx_path or args.ae_onnx_path:
+        LOGGER.warning("Both --vlm-onnx-path and --ae-onnx-path must be provided for ONNX verification. Skipping.")
+
+    # Load models — when ONNX verification is active we only need the full
+    # model (PyTorch) as the baseline; the split PyTorch models are skipped.
+    full_policy = load_full_model(policy_path, device, local_files_only=args.local_files_only)
+    if not run_onnx:
+        vlm_policy = load_vlm_model(policy_path, device, local_files_only=args.local_files_only)
+        ae_policy = load_ae_model(policy_path, device, local_files_only=args.local_files_only)
+
+    # Parse key-map
+    key_map: dict[str, str] = {}
+    if args.key_map:
+        for entry in args.key_map:
+            if "=" not in entry:
+                LOGGER.error("Invalid --key-map entry (expected SRC=DST): %s", entry)
+                return 1
+            src, dst = entry.split("=", 1)
+            key_map[src] = dst
+
+    # Prepare batches
+    if args.batch_path is not None:
+        raw_batches = load_real_batches_raw(args.batch_path)
+        if key_map:
+            raw_batches = remap_batch_keys(raw_batches, key_map)
+        if args.max_batches is not None:
+            raw_batches = raw_batches[: args.max_batches]
+        # Run the full preprocessing pipeline (same as loss_compare.py):
+        # numpy → tensor, image normalisation, state normalisation,
+        # prompt generation, tokenisation → observation.language.tokens
+        batches = preprocess_real_batches(
+            raw_batches,
+            policy_path,
+            full_policy,
+            device,
+            task=args.task,
+        )
+    else:
+        batch = make_dummy_batch(full_policy.config, device, seed=args.seed, batch_size=args.batch_size)
+        batches = [batch]
+
+    all_action_max_diffs = []
+    all_action_cos_means = []
+    all_onnx_max_diffs: list[float] = []
+    all_onnx_cos_means: list[float] = []
+
+    for i, batch in enumerate(batches):
+        LOGGER.info("=" * 60)
+        LOGGER.info("Batch %d / %d", i + 1, len(batches))
+        LOGGER.info("=" * 60)
+
+        if run_onnx:
+            # --- ONNX equivalence check (ONNX split vs full PyTorch) ---
+            (
+                full_actions_onnx,
+                onnx_actions,
+                full_kv_onnx,
+                onnx_kv,
+                full_masks_onnx,
+                onnx_masks,
+            ) = verify_onnx_actions(
+                full_policy,
+                batch,
+                args.vlm_onnx_path,
+                args.ae_onnx_path,
+                seed=args.seed + i,
+            )
+
+            # KV cache: full PyTorch VLM vs VLM ONNX (isolates PT→ONNX
+            # export error from the AE denoising path).
+            if not args.skip_kv_check:
+                report("KV cache (full PT vs VLM ONNX)", full_kv_onnx, onnx_kv)
+                report_kv_per_layer("KV cache (full PT vs VLM ONNX)", full_kv_onnx, onnx_kv)
+                mask_match = np.array_equal(full_masks_onnx, onnx_masks)
+                LOGGER.info("[prefix_pad_masks] full PT vs VLM ONNX exact match: %s", mask_match)
+                if not mask_match:
+                    diff_count = int((full_masks_onnx != onnx_masks).sum())
+                    LOGGER.warning("[prefix_pad_masks] %d element(s) differ!", diff_count)
+
+            report("Actions (ONNX split)", full_actions_onnx, onnx_actions)
+
+            max_d_onnx, _ = abs_diff_metrics(full_actions_onnx, onnx_actions)
+            _, _, cos_mean_onnx = cosine_similarity_stats(full_actions_onnx, onnx_actions)
+            all_onnx_max_diffs.append(max_d_onnx)
+            all_onnx_cos_means.append(cos_mean_onnx)
+        else:
+            # --- KV cache check ---
+            if not args.skip_kv_check:
+                full_kv, vlm_kv, full_masks, vlm_masks = verify_kv_cache(full_policy, vlm_policy, batch)
+                report("KV cache", full_kv, vlm_kv)
+
+                mask_match = np.array_equal(full_masks, vlm_masks)
+                LOGGER.info("[prefix_pad_masks] exact match: %s", mask_match)
+                if not mask_match:
+                    diff_count = int((full_masks != vlm_masks).sum())
+                    LOGGER.warning("[prefix_pad_masks] %d element(s) differ!", diff_count)
+
+            # --- Action equivalence check (PyTorch split vs full) ---
+            full_actions, split_actions = verify_actions(
+                full_policy,
+                vlm_policy,
+                ae_policy,
+                batch,
+                seed=args.seed + i,
+            )
+            report("Actions (PyTorch split)", full_actions, split_actions)
+
+            max_d, _ = abs_diff_metrics(full_actions, split_actions)
+            _, _, cos_mean = cosine_similarity_stats(full_actions, split_actions)
+            all_action_max_diffs.append(max_d)
+            all_action_cos_means.append(cos_mean)
+
+    # --- Summary ---
+    LOGGER.info("=" * 60)
+    LOGGER.info("SUMMARY over %d batch(es)", len(batches))
+    LOGGER.info("=" * 60)
+
+    if all_action_cos_means:
+        LOGGER.info("--- PyTorch split (VLM + AE) vs full model ---")
+        LOGGER.info(
+            "Action max abs diff  — min: %.6g, max: %.6g, mean: %.6g",
+            min(all_action_max_diffs),
+            max(all_action_max_diffs),
+            sum(all_action_max_diffs) / len(all_action_max_diffs),
+        )
+        LOGGER.info(
+            "Action cosine mean   — min: %.6f, max: %.6f, mean: %.6f",
+            min(all_action_cos_means),
+            max(all_action_cos_means),
+            sum(all_action_cos_means) / len(all_action_cos_means),
+        )
+
+    if all_onnx_cos_means:
+        LOGGER.info("--- ONNX split (VLM ONNX + AE ONNX) vs full model ---")
+        LOGGER.info(
+            "ONNX max abs diff    — min: %.6g, max: %.6g, mean: %.6g",
+            min(all_onnx_max_diffs),
+            max(all_onnx_max_diffs),
+            sum(all_onnx_max_diffs) / len(all_onnx_max_diffs),
+        )
+        LOGGER.info(
+            "ONNX cosine mean     — min: %.6f, max: %.6f, mean: %.6f",
+            min(all_onnx_cos_means),
+            max(all_onnx_cos_means),
+            sum(all_onnx_cos_means) / len(all_onnx_cos_means),
+        )
+
+    # Pass/fail heuristic — use worst cosine across all checks
+    all_cos = all_action_cos_means + all_onnx_cos_means
+    worst_cos = min(all_cos)
+    if all_onnx_cos_means and (not all_action_cos_means or min(all_onnx_cos_means) <= worst_cos):
+        check_label = "ONNX split"
+    else:
+        check_label = "PyTorch split"
+
+    if worst_cos >= 0.9999:
+        LOGGER.info("✅ PASS — models are numerically equivalent (cosine ≥ 0.9999)")
+        return 0
+    elif worst_cos >= 0.999:
+        LOGGER.warning("⚠️  MARGINAL — cosine ≥ 0.999 but < 0.9999 (%s), likely dtype differences", check_label)
+        return 0
+    else:
+        LOGGER.error("❌ FAIL — cosine < 0.999 (%s), models are NOT equivalent", check_label)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
