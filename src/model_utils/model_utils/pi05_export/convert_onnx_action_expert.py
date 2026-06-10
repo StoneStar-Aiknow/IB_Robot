@@ -10,7 +10,7 @@
 # EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
-"""Export PI05 Action Expert to ONNX and verify ONNXRuntime vs PyTorch outputs.
+"""Export PI05 Action Expert to ONNX and emit the Ascend OM manifest entry.
 
 The Action Expert takes KV cache (from the VLM part) + time + noise,
 and performs a single Euler denoising step to produce actions.
@@ -25,9 +25,7 @@ import argparse
 import logging
 from pathlib import Path
 
-import numpy as np
 import onnx
-import onnxruntime as ort
 import torch
 import torch.onnx
 
@@ -47,6 +45,7 @@ from model_utils.pi05_export.ascend_export_patches import (
     sanitize_nan_initializers,
 )
 from model_utils.pi05_export.modeling_pi05_action_expert import PI05ActionExpertPolicy
+from model_utils.pi05_export.om_manifest import upsert_pi05_om_manifest
 
 LOGGER = logging.getLogger(__name__)
 
@@ -176,7 +175,7 @@ def _clean_onnx_domains(onnx_path: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export PI05 Action Expert to ONNX and verify outputs.")
+    parser = argparse.ArgumentParser(description="Export PI05 Action Expert to ONNX.")
     parser.add_argument(
         "--pretrained-policy-path",
         type=str,
@@ -238,11 +237,22 @@ def parse_args() -> argparse.Namespace:
         default="fp16",
         help="Export precision: fp16 (default, model.half()), fp32 (full precision), "
         "or auto (preserve original mixed bf16+fp32 weights). "
-        "Must match the dtype used for VLM export. "
-        "NOTE: auto produces bf16 tensors that ORT CPU cannot run — "
-        "verification will be skipped automatically.",
+        "Must match the dtype used for VLM export.",
     )
-    parser.add_argument("--skip-verify", action="store_true", help="Skip ONNX vs PyTorch output comparison.")
+    parser.add_argument(
+        "--om-manifest-dir",
+        type=str,
+        default=None,
+        help="Directory to write config.om.json (default: pretrained policy path).",
+    )
+    parser.add_argument(
+        "--om-path",
+        type=str,
+        default=None,
+        help="Predicted action_expert .om artifact path recorded in the manifest "
+        "(default: <manifest-dir>/action_expert.om).",
+    )
+    parser.add_argument("--skip-om-manifest", action="store_true", help="Do not write/update config.om.json.")
     parser.add_argument(
         "--mqa-broadcast",
         action=argparse.BooleanOptionalAction,
@@ -260,26 +270,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level")
     parser.add_argument("--local-files-only", action="store_true", default=True, help="Load policy without network")
     return parser.parse_args()
-
-
-def cosine_stats_last_dim(a: np.ndarray, b: np.ndarray, eps: float = 1e-12) -> tuple[float, float, float]:
-    """Compute cosine similarity per vector (flatten leading dims, last dim as vector).
-
-    Returns (min, max, mean).
-    """
-    if a.shape != b.shape:
-        raise ValueError(f"Cosine similarity requires same shape, got {a.shape} vs {b.shape}")
-    if a.ndim == 0:
-        raise ValueError("Cosine similarity requires at least 1D tensors")
-    vec_dim = int(a.shape[-1])
-    if vec_dim <= 0:
-        raise ValueError(f"Invalid last-dim for cosine similarity: {a.shape}")
-
-    a2 = a.reshape(-1, vec_dim).astype(np.float32, copy=False)
-    b2 = b.reshape(-1, vec_dim).astype(np.float32, copy=False)
-    denom = np.maximum(np.linalg.norm(a2, axis=1) * np.linalg.norm(b2, axis=1), eps)
-    cos = (a2 * b2).sum(axis=1) / denom
-    return float(cos.min()), float(cos.max()), float(cos.mean())
 
 
 def build_inputs(
@@ -425,9 +415,7 @@ def main() -> int:
             time_dtype,
         )
         LOGGER.warning(
-            "auto mode produces bf16 tensors; ORT CPU verification will be "
-            "skipped (ORT CPU lacks bf16 kernel support). ATC on Ascend "
-            "310/310P may also fail — use 910 series for bf16 OM conversion."
+            "auto mode produces bf16 tensors; ATC on Ascend 310/310P may fail — use 910 series for bf16 OM conversion."
         )
     else:
         float_dtype = torch.float16 if export_dtype == "fp16" else torch.float32
@@ -519,56 +507,12 @@ def main() -> int:
     _clean_onnx_domains(onnx_output_path)
     LOGGER.info("ONNX export finished")
 
-    skip_verify = args.skip_verify or export_dtype == "auto"
-    if export_dtype == "auto" and not args.skip_verify:
-        LOGGER.info("Auto-skipping ORT verification (bf16 not supported by ORT CPU)")
-    if use_npu_ops and not skip_verify:
-        LOGGER.info("Auto-skipping ORT verification (NPURotaryMul has no ORT CPU kernel)")
-        skip_verify = True
-    if skip_verify:
-        LOGGER.info("Skip verification as requested.")
-        return 0
+    if not args.skip_om_manifest:
+        manifest_dir = args.om_manifest_dir if args.om_manifest_dir is not None else args.pretrained_policy_path
+        om_path = args.om_path if args.om_path is not None else "action_expert.om"
+        manifest_path = upsert_pi05_om_manifest(manifest_dir, "action_expert", om_path)
+        LOGGER.info("Updated OM manifest (action_expert) at %s", manifest_path)
 
-    LOGGER.info("Validating ONNX model output vs PyTorch...")
-    onnx_wrapper.eval()
-    with torch.no_grad():
-        pytorch_output = onnx_wrapper(*observation_values)
-
-    ort_session = ort.InferenceSession(str(onnx_output_path))
-    valid_input_names = {inp.name for inp in ort_session.get_inputs()}
-
-    onnx_inputs = {}
-    for name, value in zip(dummy_keys, observation_values, strict=False):
-        if name not in valid_input_names:
-            continue
-        if isinstance(value, torch.Tensor):
-            np_val = value.cpu().numpy()
-            if value.dtype == torch.bool:
-                np_val = np_val.astype(bool)
-            onnx_inputs[name] = np_val
-        else:
-            onnx_inputs[name] = value
-
-    LOGGER.info("onnx_inputs keys: %s", list(onnx_inputs.keys()))
-    onnx_outputs = ort_session.run(None, onnx_inputs)
-    onnx_output = onnx_outputs[0]
-    LOGGER.info("onnx output shape: %s", onnx_output.shape)
-
-    pytorch_np = pytorch_output.cpu().numpy()
-    max_diff = np.abs(pytorch_np.astype(np.float32) - onnx_output.astype(np.float32)).max()
-    mean_diff = np.abs(pytorch_np.astype(np.float32) - onnx_output.astype(np.float32)).mean()
-    cos_min, cos_max, cos_mean = cosine_stats_last_dim(pytorch_np.astype(np.float32), onnx_output.astype(np.float32))
-
-    LOGGER.info("PyTorch output shape: %s", pytorch_output.shape)
-    LOGGER.info("ONNX output shape: %s", onnx_output.shape)
-    LOGGER.info("Max abs diff: %s", max_diff)
-    LOGGER.info("Mean abs diff: %s", mean_diff)
-    LOGGER.info(
-        "Cosine similarity (last dim) min/max/mean: %.4f / %.4f / %.4f",
-        cos_min,
-        cos_max,
-        cos_mean,
-    )
     return 0
 
 
