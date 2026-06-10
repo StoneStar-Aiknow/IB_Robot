@@ -53,7 +53,7 @@ robot:
       fps: 30
       pixel_format: bgr8
       enable_pointcloud: false
-      align_depth: false
+      align_depth: true
       enable_sync: true
       frame_id: camera_link
       optical_frame_id: camera_color_optical_frame
@@ -77,13 +77,18 @@ robot:
       rtabmap:
         database_path: "$(env HOME)/.ros/ibrobot/maps/rtabmap.db"
         localization: false
+        visual_odometry: false
         frame_id: camera_link
         odom_frame_id: odom
+        odom_topic: /odom
         rgb_topic: /camera/realsense/image_raw
         depth_topic: /camera/realsense/depth/image_rect_raw
         camera_info_topic: /camera/realsense/camera_info
         approx_sync: true
         queue_size: 20
+        qos_image: 2
+        qos_camera_info: 2
+        qos_odom: 2
         rtabmap_args: "--delete_db_on_start --Mem/InitWMWithAllNodes true --Mem/IncrementalMemory true --Mem/PermanentMemory false --Mem/STMSize 8"
         log_level: info
       ekf:

@@ -144,6 +144,9 @@ robot:
         camera_info_topic: /camera/realsense/camera_info
         approx_sync: true
         queue_size: 20
+        qos_image: 2
+        qos_camera_info: 2
+        qos_odom: 2
         rtabmap_args: "--Mem/InitWMWithAllNodes true --Mem/IncrementalMemory false --Mem/PermanentMemory true --Mem/STMSize 8 --Reg/Force3DoF true"
         log_level: error
       depth_to_laserscan:

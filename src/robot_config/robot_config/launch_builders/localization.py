@@ -62,6 +62,9 @@ def generate_localization_nodes(
             "rtabmap_args",
             "approx_sync",
             "queue_size",
+            "qos_image",
+            "qos_camera_info",
+            "qos_odom",
             "log_level",
         ]:
             val = rtabmap_config.get(key)
