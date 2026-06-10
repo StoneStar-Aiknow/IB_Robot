@@ -127,9 +127,18 @@ navigation:
 - 自动启动相关组件（控制器、相机、TF、定位等）
 - 支持 `control_mode` 切换不同运行模式
 
-### 4. D455 RTAB-Map 建图
+### 3. 部署模式
 
-建图入口使用独立的 `lekiwi_mapping.yaml`，避免污染 `lekiwi_navi.yaml` 的“已有地图导航/定位评估”语义。启动链路仍由 `robot_config` 读取 YAML 作为单一数据源，包含 base-only ros2_control、D455、TF、RTAB-Map mapping 和 `/cmd_vel` 底盘桥接。
+LeKiwi 建图和导航支持两种部署模式：
+
+1. 开发板主运行模式：除 RViz 外，`robot_config`、RealSense、ros2_control、RTAB-Map、Nav2 和底盘桥接等节点都运行在 openEuler 开发板；Ubuntu PC 只运行 RViz，通过相同 `ROS_DOMAIN_ID` 观察开发板上的 ROS 图。
+2. Ubuntu 单机模式：所有节点都运行在 Ubuntu PC，用于本机调试、算法验证或没有开发板参与的联调。
+
+两种模式使用相同的 `robot_config` 配置入口和 `robot_navigation` RViz 预设。跨机器部署时，需要确保开发板和 PC 网络互通，并使用相同的 ROS 2 域配置。
+
+### 4. RealSense RTAB-Map 建图
+
+建图入口使用独立的 `lekiwi_mapping.yaml`，避免污染 `lekiwi_navi.yaml` 的“已有地图导航/定位评估”语义。启动链路仍由 `robot_config` 读取 YAML 作为单一数据源，包含 base-only ros2_control、RealSense、TF、RTAB-Map mapping 和 `/cmd_vel` 底盘桥接。
 
 注意：`lekiwi_mapping.yaml` 只负责启动建图主链，并监听 `/cmd_vel`。它不会自动拉起键盘遥操节点，因此建图时需要由用户在另一个终端单独启动 `teleop_twist_keyboard` 或其他 `/cmd_vel` 发布端。
 
@@ -221,12 +230,13 @@ ros2 launch robot_navigation lekiwi_navigation_rviz.launch.py
 ros2 launch robot_navigation lekiwi_mapping_rviz.launch.py rviz_config:=/path/to/custom.rviz
 ```
 
-### 5. 直接启动（备选方案）
+### 5. robot_navigation 启动入口
 
-如果不使用 `robot_config`，可以直接启动 `robot_navigation` 的 launch 文件：
+推荐仍通过 `robot_config` 启动完整机器人链路。`robot_navigation` 中的 launch 文件只负责导航子系统或 PC 侧可视化预设，不再单独拉起 robot_state_publisher、RViz 或 nav2_goal_client 等支撑节点。
 
 ```bash
-# 完整启动 (Nav2 + robot_state_publisher + nav2_goal_client + RViz)
+# Nav2 子系统入口：map_server + Nav2 navigation_launch.py
+# 通常由 robot_config 根据 lekiwi_navi.yaml 间接包含
 ros2 launch robot_navigation nav2_bringup.launch.py
 
 # PC 端打开建图观察 RViz 预设
@@ -241,9 +251,16 @@ ros2 launch robot_navigation nav2_bringup.launch.py map:=/path/to/rtabmap.yaml
 # 仅语音控制
 ros2 run robot_navigation voice_control
 
-# EKF + RTAB-Map + RealSense
+# Legacy/debug-only EKF + RTAB-Map entry. For full LeKiwi bringup, use robot_config.
 ros2 launch robot_navigation ekf_rtabmap_launch.py
 ```
+
+直接启动 `nav2_bringup.launch.py` 时，调用方需要确保以下节点已经由 `robot_config` 或其他入口启动：
+
+1. `robot_state_publisher` 和 `/tf_static`
+2. ros2_control、controller spawner 与 `/joint_states`
+3. `/odom`、`map -> odom` 或等价定位链路
+4. 需要时单独启动 `nav2_goal_client`、语音节点和 RViz
 
 ### 6. 单独运行节点
 
@@ -380,7 +397,7 @@ ros2 run robot_navigation save_rtabmap_map
 RTAB-Map 以定位模式运行（`localization: true`），通过视觉 SLAM 发布 `map → odom` TF。
 
 关键参数：
-- `frame_id: realsense_link` — 相机坐标系
+- `frame_id: camera_link` — RTAB-Map 使用的相机坐标系，由 `robot_config` 的 RealSense adapter 和 TF 配置提供
 - `approx_sync: true` — RGB 和 Depth 近似同步
 - `--Reg/Force3DoF true` — 强制 2D 模式，防止相机倾斜导致的 pitch/yaw 偏差（对 2D 全向轮机器人至关重要）
 - `--Mem/InitWMWithAllNodes true` — 初始化时加载所有节点
@@ -393,7 +410,7 @@ RTAB-Map 以定位模式运行（`localization: true`），通过视觉 SLAM 发
 
 | 组件 | 关键参数 |
 |------|---------|
-| **AMCL** | OmniMotionModel（全向轮），500-2000 粒子，`tf_broadcast: false`（避免与 RTAB-Map 冲突），`odom_frame_id: "odom"` |
+| **Localization** | 不启动 AMCL；RTAB-Map 使用保存地图发布 `map → odom`，EKF 发布 `odom → base_link` |
 | **Controller** | DWB 局部规划器，20Hz，max vel 0.26 m/s，max theta 1.0 rad/s，goal tolerance xy: 0.05 / yaw: 0.1 |
 | **Local costmap** | 3×3m 滚动窗口，0.05m 分辨率，robot radius 0.22m，`/scan` 话题，`transform_tolerance: 3.0` |
 | **Global costmap** | Static + Obstacle + Inflation 层，`transform_tolerance: 3.0` |
@@ -430,8 +447,10 @@ RTAB-Map 以定位模式运行（`localization: true`），通过视觉 SLAM 发
 
 | 文件 | 启动内容 |
 |------|---------|
-| `nav2_bringup.launch.py` | Nav2 栈 + robot_state_publisher + nav2_goal_client + RViz2 |
-| `ekf_rtabmap_launch.py` | RTAB-Map + EKF 融合（RealSense 由 peripherals 启动） |
+| `nav2_bringup.launch.py` | Nav2 子系统：map_server + Nav2 navigation_launch.py |
+| `ekf_rtabmap_launch.py` | Legacy/debug-only RTAB-Map + EKF 入口；正式 LeKiwi 实机链路由 `robot_config` 启动 |
+| `lekiwi_mapping_rviz.launch.py` | PC 端建图观察 RViz 预设 |
+| `lekiwi_navigation_rviz.launch.py` | PC 端导航观察 RViz 预设 |
 
 ## 目录结构
 
@@ -443,8 +462,10 @@ robot_navigation/
 │   ├── config.rviz                # RViz2 可视化配置
 │   └── nav2_params.yaml           # Nav2 完整参数栈
 ├── launch/
-│   ├── nav2_bringup.launch.py     # Nav2 + 状态发布 + GoalClient + RViz
-│   └── ekf_rtabmap_launch.py      # EKF + RTAB-Map
+│   ├── nav2_bringup.launch.py     # Nav2 子系统入口
+│   ├── ekf_rtabmap_launch.py      # Legacy/debug-only EKF + RTAB-Map
+│   ├── lekiwi_mapping_rviz.launch.py
+│   └── lekiwi_navigation_rviz.launch.py
 ├── robot_navigation/
 │   ├── voice_control.py           # 语音关键词匹配 + 导航桥接
 │   ├── nav2_goal_client.py        # Nav2 Action 客户端 + 评估触发
@@ -496,9 +517,10 @@ robot_navigation/
    ros2 run tf2_ros tf2_echo map odom  # 检查是否有非零 pitch/roll
    ```
 
-3. **AMCL 与 RTAB-Map TF 冲突**: 两者同时广播 `map → odom` 会导致 TF 跳变
+3. **全局定位 TF 冲突**: 多个节点同时广播 `map → odom` 会导致 TF 跳变。正式 LeKiwi 实机链路不启动 AMCL，由 RTAB-Map 负责 `map → odom`
    ```bash
-   ros2 param get /amcl tf_broadcast  # 应返回 "false"
+   ros2 run tf2_ros tf2_echo map odom
+   ros2 topic echo /rtabmap/info
    ```
 
 4. **EKF 订阅了不存在的话题**: EKF 无法更新会导致 TF 停滞
