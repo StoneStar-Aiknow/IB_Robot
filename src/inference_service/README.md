@@ -119,6 +119,24 @@ record_cli (model_inference) -> /action_dispatcher/reset -> /act_inference_node/
 
 ### 启动命令
 
+#### 场景零：离线 rosbag 策略评估的最小推理节点
+
+当只想评估 policy backend 精度，而不希望启动相机、`action_dispatch`、ros2_control、控制器或真实硬件时，使用 `eval_inference.launch.py` 只启动 `lerobot_policy_node`：
+
+```bash
+ros2 launch inference_service eval_inference.launch.py \
+    robot_config_path:=src/robot_config/config/robots/so101_single_arm.yaml \
+    policy_path:=/path/to/pretrained_model \
+    device:=cpu \
+    use_header_time:=true
+```
+
+这个 launch 只负责提供 `DispatchInfer` Action Server 和 policy 推理运行时。它不会自己读取 rosbag，也不会发布观测数据；观测回放与结果记录由 `dataset_tools policy_eval capture` 完成。
+
+`use_header_time:=true` 是 rosbag frame-gated replay 的推荐配置。它让 `lerobot_policy_node` 把 replay 出来的消息 header stamp 写入 `StreamBuffer`，从而可以和 `DispatchInfer` goal 中的历史 timestamp 对齐。
+
+典型配套命令见 `src/dataset_tools/README.md` 的 `policy_eval` 小节。
+
 #### 场景一：跨机器分布式部署（推荐生产用法）
 
 两台机器必须设置**相同的 `ROS_DOMAIN_ID`** 且在同一局域网内。

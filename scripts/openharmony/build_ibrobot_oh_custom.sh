@@ -48,7 +48,7 @@ OH_CUSTOM_HUMBLE_TAR_GLOB="${OH_CUSTOM_HUMBLE_TAR_GLOB:-}"
 USE_SUDO=0
 DRY_RUN=0
 PULL_IMAGE=1
-declare -a PACKAGES=("ibrobot_msgs" "tensormsg" "robot_config" "inference_service")
+declare -a PACKAGES=("ibrobot_msgs" "tensormsg" "robot_config" "inference_service" "dataset_tools")
 declare -a COLCON_ARGS=()
 declare -a CMAKE_ARGS=()
 
@@ -438,8 +438,8 @@ export PYTHONHOME="\${SKH_ROOT}"
 export PATH="\${SKH_ROOT}/bin:\$PATH"
 export HOME="\${ROS_HOME_ROOT}"
 export ROS_LOG_DIR="\${ROS_LOG_ROOT}"
-export PYTHONPATH="\${SKH_ROOT}/lib/python3.12/site-packages:\${SKH_ROOT}/usr/lib/python3.12/site-packages:/sys_prod/robot/out/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/lerobot/src:${OH_CUSTOM_PREFIX}/inference_service/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/robot_config/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/tensormsg/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib/python3.12/site-packages:${OH_BOARD_ROS_PREFIX}/lib/python3.12/site-packages:/data/out/lib/python3.12/site-packages:/data/out/lib\${PYTHONPATH:+:\$PYTHONPATH}"
-export LD_LIBRARY_PATH="\${SKH_ROOT}/lib:\${SKH_ROOT}/lib/python3.12/site-packages/torchaudio/lib:${OH_CUSTOM_PREFIX}/inference_service/lib:${OH_CUSTOM_PREFIX}/robot_config/lib:${OH_CUSTOM_PREFIX}/tensormsg/lib:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib:${OH_BOARD_ROS_PREFIX}/lib:/data/out/lib:/usr/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+export PYTHONPATH="\${SKH_ROOT}/lib/python3.12/site-packages:\${SKH_ROOT}/usr/lib/python3.12/site-packages:/sys_prod/robot/out/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/lerobot/src:${OH_CUSTOM_PREFIX}/dataset_tools/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/inference_service/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/robot_config/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/tensormsg/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib/python3.12/site-packages:${OH_BOARD_ROS_PREFIX}/lib/python3.12/site-packages:/data/out/lib/python3.12/site-packages:/data/out/lib\${PYTHONPATH:+:\$PYTHONPATH}"
+export LD_LIBRARY_PATH="\${SKH_ROOT}/lib:\${SKH_ROOT}/lib/python3.12/site-packages/torchaudio/lib:${OH_CUSTOM_PREFIX}/dataset_tools/lib:${OH_CUSTOM_PREFIX}/inference_service/lib:${OH_CUSTOM_PREFIX}/robot_config/lib:${OH_CUSTOM_PREFIX}/tensormsg/lib:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib:${OH_BOARD_ROS_PREFIX}/lib:/data/out/lib:/usr/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 export LD_PRELOAD="\${SKH_ROOT}/lib/libpython3.12.so.1.0:\${SKH_ROOT}/lib/libomp.so\${LD_PRELOAD:+:\$LD_PRELOAD}"
 
 exec "\${SKH_ROOT}/bin/python3" -m ${module_name} "\$@"
@@ -449,6 +449,7 @@ EOF
     done <<'EOF'
 lib/inference_service/lerobot_policy_node|inference_service.lerobot_policy_node
 lib/inference_service/pure_inference_node|inference_service.pure_inference_node
+lib/dataset_tools/policy_eval|dataset_tools.policy_eval
 EOF
 }
 

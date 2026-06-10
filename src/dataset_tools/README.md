@@ -215,7 +215,63 @@ output_dataset/
 通常不需要直接运行，由 `robot.launch.py` 根据 `record_mode:=episodic` 参数自动加载。
 录制结果会写到 `<bag_base_dir>/<dataset_name>/episodes/episode_XXXXXX/`，并在 dataset 根目录生成 `dataset.yaml`。
 
-### 4. camera_alignment - 基于 ArUco 的相机对齐工具
+### 4. policy_eval - rosbag policy replay evaluation
+
+`policy_eval` 用于离线比较不同推理后端在同一批 rosbag 观测上的 action chunk 输出。MVP 只支持 ROS bag 输入，不执行动作，不启动 `action_dispatch`、ros2_control、控制器或硬件驱动。
+
+推荐拓扑是先启动最小化推理节点，再运行 frame-gated replay client：
+
+| 命令 | 所属包 | 职责 |
+|------|--------|------|
+| `ros2 launch inference_service eval_inference.launch.py ...` | `inference_service` | 启动一个最小 `lerobot_policy_node`，提供 `DispatchInfer` Action Server 和 policy backend。它不读取 rosbag、不发布观测、不记录结果。 |
+| `ros2 run dataset_tools policy_eval capture ...` | `dataset_tools` | 读取 rosbag，按 contract 逐帧发布 observation topics，调用 `DispatchInfer`，并把 action chunk/latency/diagnostics 写入 prediction JSON。 |
+
+```bash
+ros2 launch inference_service eval_inference.launch.py \
+    robot_config_path:=src/robot_config/config/robots/so101_single_arm.yaml \
+    policy_path:=/path/to/pretrained_model \
+    device:=cpu \
+    use_header_time:=true
+
+ros2 run dataset_tools policy_eval capture \
+    --bag-dir ~/rosbag/episodes/so101_single_arm/episode_000001 \
+    --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
+    --policy-path /path/to/pretrained_model \
+    --backend-name cpu \
+    --out /tmp/cpu_predictions.json \
+    --frame-limit 100
+```
+
+对另一个后端重复 capture 后比较：
+
+```bash
+ros2 run dataset_tools policy_eval compare \
+    --reference /tmp/cpu_predictions.json \
+    --candidate /tmp/rknn_predictions.json \
+    --out /tmp/cpu_vs_rknn_metrics.json
+```
+
+`compare` 默认会在指标 JSON 旁生成 PNG 折线图，便于人工复核 backend 差异：
+
+- `*_error_lines.png`：每帧 MAE、max error，以及每个 action 维度的误差曲线。
+- `*_raw_action_overview.png`：所有 action 维度的 reference/candidate 原始 action 曲线总览。
+- `*_action_dim_N_raw.png`：每个 action 维度单独一张 reference/candidate 原始 action 曲线。
+
+可以用 `--plot-dir /tmp/policy_eval_plots` 指定目录，用 `--no-plots` 关闭绘图。原始 action 曲线默认绘制 action chunk 的第 0 个 step，可用 `--plot-action-step` 调整。
+
+关键语义：
+
+- replay client 会从 rosbag 读取 contract observation topics，逐帧 publish 原始 ROS 消息，然后用同一 timestamp 调用 `lerobot_policy_node` 的 `DispatchInfer` action server。
+- `--policy-path` 推荐与 `eval_inference.launch.py policy_path:=...` 使用同一个模型目录；它会读取 `config.json.input_features`，让 replay 只要求模型实际订阅的 observation topics，避免完整 robot contract 中未使用的相机（例如 `front`）导致误报缺失。
+- 默认要求 `lerobot_policy_node use_header_time:=true`，避免历史 bag timestamp 与 receive-time `StreamBuffer` timestamp 混用。
+- 多后端比较采用串行运行方式；每个 backend 单独启动一次 policy node，并将 prediction JSON 作为比较输入。
+- 默认 `policy_state_mode=continuous`，保留同一 backend run 内的 policy runtime state；`--policy-state-mode per_frame_reset` 只用于显式诊断，会在每帧前调用 `~/reset_policy_state`。
+- prediction JSON 会记录 contract fingerprint、timestamp policy、frame stride、backend 名称、calibration 静态检查结果、每帧 action chunk、latency 和 replay stream diagnostics。
+- `--compare-labels` 只在 rosbag 中存在 contract action topics 时启用，用于额外比较录制 action label；backend 正确性比较仍以 reference backend 输出为主。
+
+Non-goals：LeRobot parquet/video dataset replay、并行多 backend 节点、temporal ensemble/action dispatch 评估、sim-in-the-loop 评估和 VLA prompt 评估。
+
+### 5. camera_alignment - 基于 ArUco 的相机对齐工具
 
 用于在数据采集或复现前对齐摄像头视角。`--camera-source` 同时支持真机视频设备和仿真 ROS 2 image topic：
 
