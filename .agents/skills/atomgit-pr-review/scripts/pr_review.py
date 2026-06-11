@@ -7,16 +7,14 @@ AtomGit PR Review Workflow
 3. --auto: 自动审查（调用LLM）- CI 使用，需要配置 LLM
 """
 
-import os
-import sys
-import json
 import argparse
-from pathlib import Path
+import json
+import sys
 from datetime import datetime
-from typing import List, Dict, Optional
+from pathlib import Path
 
 from atomgit_sdk import AtomGitClient, CodeIssue, resolve_atomgit_context
-from atomgit_sdk.utils import calculate_diff_position, add_line_numbers
+from atomgit_sdk.utils import add_line_numbers, calculate_diff_position
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
@@ -60,18 +58,15 @@ class CodeReviewer:
 
                 changed_files.append(file_data)
 
-        inline_comment_count = sum(
-            1 for comment in comments if comment.get("path") or comment.get("diff_file")
-        )
-        unresolved_comment_count = sum(
-            1 for comment in comments if not comment.get("resolved_at")
-        )
+        inline_comment_count = sum(1 for comment in comments if comment.get("path") or comment.get("diff_file"))
+        unresolved_comment_count = sum(1 for comment in comments if not comment.get("resolved_at"))
 
         return {
             "fetch_time": datetime.now().isoformat(),
             "pr": {
                 "number": pr.get("number"),
                 "title": pr.get("title"),
+                "description": pr.get("body") or pr.get("description") or pr.get("content") or "",
                 "author": pr.get("user", {}).get("login"),
                 "state": pr.get("state"),
                 "branch": f"{pr.get('head', {}).get('ref')} → {pr.get('base', {}).get('ref')}",
@@ -98,9 +93,9 @@ class CodeReviewer:
             "comments": comments,
         }
 
-    def load_issues_from_json(self, json_path: str) -> List[CodeIssue]:
+    def load_issues_from_json(self, json_path: str) -> list[CodeIssue]:
         """从 JSON 文件加载问题"""
-        with open(json_path, "r", encoding="utf-8") as f:
+        with open(json_path, encoding="utf-8") as f:
             data = json.load(f)
 
         issues = []
@@ -114,9 +109,7 @@ class CodeReviewer:
                 title=item.get("title", ""),
                 description=item.get("description", ""),
                 context_code=item.get("contextCode") or item.get("context_code"),
-                fix_code=item.get("fix", {}).get("code")
-                if isinstance(item.get("fix"), dict)
-                else item.get("fix_code"),
+                fix_code=item.get("fix", {}).get("code") if isinstance(item.get("fix"), dict) else item.get("fix_code"),
                 fix_explanation=item.get("fix", {}).get("explanation")
                 if isinstance(item.get("fix"), dict)
                 else item.get("fix_explanation"),
@@ -125,7 +118,7 @@ class CodeReviewer:
 
         return issues
 
-    def submit_issues(self, pr_number: int, issues: List[CodeIssue]) -> Dict:
+    def submit_issues(self, pr_number: int, issues: list[CodeIssue]) -> dict:
         """提交问题到 PR"""
         pr = self.client.get_pull_request(pr_number)
         diffs = self.client.get_pr_diff(pr_number)
@@ -148,7 +141,7 @@ class CodeReviewer:
 
         summary = self.formatter.format_summary(issues, pr_number, pr.get("title", ""))
         self.client.submit_pr_comment(pr_number, summary)
-        print(f"✅ 已提交摘要评论\n")
+        print("✅ 已提交摘要评论\n")
 
         if comments:
             results = self.client.submit_batch_comments(pr_number, comments)
@@ -188,7 +181,7 @@ def mode_extract_info(args, reviewer: CodeReviewer):
         json.dump(pr_info, f, indent=2, ensure_ascii=False)
 
     print(f"\n✅ 已保存到: {output_file}")
-    print(f"\n📊 变更摘要:")
+    print("\n📊 变更摘要:")
     print(f"   标题: {pr_info['pr']['title']}")
     print(f"   作者: {pr_info['pr']['author']}")
     print(f"   分支: {pr_info['pr']['branch']}")
@@ -204,9 +197,7 @@ def mode_extract_info(args, reviewer: CodeReviewer):
     print("  2. 结合 changed_files、commits 和 comments 生成 issues.json")
     print("  3. ⚠️ 将审查结果以用户可读的格式展示给用户确认")
     print("  4. 用户确认后，运行提交命令")
-    print(
-        f"\n     python3 pr_review.py --pr {args.pr} --submit-review issues.json --ai-model <your-model-name>"
-    )
+    print(f"\n     python3 pr_review.py --pr {args.pr} --submit-review issues.json --ai-model <your-model-name>")
 
 
 def mode_submit_review(args, reviewer: CodeReviewer):
@@ -230,10 +221,10 @@ def mode_submit_review(args, reviewer: CodeReviewer):
 
     result = reviewer.submit_issues(args.pr, issues)
 
-    print(f"\n" + "=" * 60)
-    print(f"✅ 审查完成")
+    print("\n" + "=" * 60)
+    print("✅ 审查完成")
     print("=" * 60 + "\n")
-    print(f"📊 统计:")
+    print("📊 统计:")
     print(f"   总问题数: {result['total_issues']}")
     print(f"   提交评论数: {result['submitted_comments']}")
     print(f"\n🔗 PR 链接: {reviewer.client.get_pr_url(args.pr)}\n")
@@ -267,7 +258,7 @@ def mode_auto(args, client: AtomGitClient, reviewer: CodeReviewer, config: dict)
         llm_model=args.llm_model,
     )
 
-    print(f"\n📝 获取 PR 文件变更...")
+    print("\n📝 获取 PR 文件变更...")
     files = client.get_pr_files(args.pr)
 
     all_issues = []
@@ -294,13 +285,13 @@ def mode_auto(args, client: AtomGitClient, reviewer: CodeReviewer, config: dict)
                 print(f"  ✓ 发现 {len(issues)} 个问题")
                 all_issues.extend(issues)
             else:
-                print(f"  ✓ 未发现问题")
+                print("  ✓ 未发现问题")
 
         except Exception as e:
             print(f"  ✗ 审查失败: {e}")
 
     if args.dry_run:
-        print(f"\n" + "=" * 60)
+        print("\n" + "=" * 60)
         print("⚠️  Dry run 模式，未提交评论")
         print("=" * 60)
         print(f"\n发现 {len(all_issues)} 个问题：")
@@ -312,13 +303,11 @@ def mode_auto(args, client: AtomGitClient, reviewer: CodeReviewer, config: dict)
         print(f"\n📦 提交 {len(all_issues)} 个审查结果...")
         result = reviewer.submit_issues(args.pr, all_issues)
 
-        print(f"\n" + "=" * 60)
+        print("\n" + "=" * 60)
         print("✅ 审查完成")
         print("=" * 60)
-        print(f"\n📊 统计:")
-        print(
-            f"   审查文件: {len([f for f in files if f['filename'].endswith('.py')])} 个"
-        )
+        print("\n📊 统计:")
+        print(f"   审查文件: {len([f for f in files if f['filename'].endswith('.py')])} 个")
         print(f"   发现问题: {result['total_issues']} 个")
         print(f"   提交评论: {result['submitted_comments']} 条")
     else:
@@ -326,7 +315,7 @@ def mode_auto(args, client: AtomGitClient, reviewer: CodeReviewer, config: dict)
         summary = reviewer.formatter.format_summary([], args.pr, pr.get("title", ""))
         client.submit_pr_comment(args.pr, summary)
 
-        print(f"\n" + "=" * 60)
+        print("\n" + "=" * 60)
         print("✅ 审查完成 - 未发现问题")
         print("=" * 60)
 
@@ -353,21 +342,13 @@ def main():
         metavar="JSON_FILE",
         help="模式2: 提交审查结果（AI Agent 使用）",
     )
-    mode_group.add_argument(
-        "--auto", action="store_true", help="模式3: 自动审查（CI 使用，需要 LLM 配置）"
-    )
+    mode_group.add_argument("--auto", action="store_true", help="模式3: 自动审查（CI 使用，需要 LLM 配置）")
 
-    parser.add_argument(
-        "--config", type=str, default="config.json", help="配置文件路径"
-    )
+    parser.add_argument("--config", type=str, default="config.json", help="配置文件路径")
     parser.add_argument("--owner", type=str, help="目标仓库 owner，覆盖 config.json")
     parser.add_argument("--repo", type=str, help="目标仓库 repo，覆盖 config.json")
-    parser.add_argument(
-        "--url", type=str, help="PR 链接，用于自动解析 owner/repo/PR 编号"
-    )
-    parser.add_argument(
-        "--output-dir", type=str, default="./tmp", help="输出目录 (默认: ./tmp)"
-    )
+    parser.add_argument("--url", type=str, help="PR 链接，用于自动解析 owner/repo/PR 编号")
+    parser.add_argument("--output-dir", type=str, default="./tmp", help="输出目录 (默认: ./tmp)")
     parser.add_argument(
         "--no-comments",
         action="store_true",
@@ -410,7 +391,7 @@ def main():
     print("=" * 60)
 
     try:
-        with open(args.config, "r", encoding="utf-8") as f:
+        with open(args.config, encoding="utf-8") as f:
             config = json.load(f)
     except FileNotFoundError:
         print(f"\n❌ 配置文件不存在: {args.config}")
@@ -420,9 +401,7 @@ def main():
         sys.exit(1)
 
     try:
-        sdk_config, parsed_url = resolve_atomgit_context(
-            args.config, owner=args.owner, repo=args.repo, url=args.url
-        )
+        sdk_config, parsed_url = resolve_atomgit_context(args.config, owner=args.owner, repo=args.repo, url=args.url)
     except Exception as e:
         print(f"\n❌ 解析仓库上下文失败: {e}")
         sys.exit(1)
@@ -434,9 +413,7 @@ def main():
         sys.exit(1)
 
     client = AtomGitClient(sdk_config)
-    formatter = CommentFormatter(
-        confidence_threshold=args.threshold, ai_model=args.ai_model
-    )
+    formatter = CommentFormatter(confidence_threshold=args.threshold, ai_model=args.ai_model)
     reviewer = CodeReviewer(client, formatter)
 
     print(f"\n📋 PR: #{args.pr}")

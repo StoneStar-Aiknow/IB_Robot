@@ -31,15 +31,17 @@ license: MIT
 
 ### 2. 依赖 / setup / build 变更的 Verification 强制门禁
 
-- 如果 PR 修改了 `package.xml`（尤其是新增/删除/调整 `exec_depend`、`build_depend`、`depend`、`test_depend` 等依赖声明），或修改了 setup/build 流程相关文件（如 `scripts/setup.sh`、`scripts/build.sh`、`scripts/setup/platforms/*.sh`、`scripts/setup/verify_env.sh`、`scripts/install_ros.sh`、`CMakeLists.txt`、`setup.py`、`pyproject.toml` 等），则 **PR 描述中的 Verification 不再是可选项，而是必填项**。
+- 如果 PR 修改了 ROS 包的 `package.xml` 依赖声明（尤其是新增/删除/调整 `exec_depend`、`build_depend`、`depend`、`test_depend` 等），或修改了全局 setup/build 流程相关文件（如 `scripts/setup.sh`、`scripts/build.sh`、`scripts/setup/platforms/*.sh`、`scripts/setup/verify_env.sh`、`scripts/install_ros.sh`、顶层 `CMakeLists.txt`、顶层 `pyproject.toml` 等），则 **PR 描述中的 Verification 不再是可选项，而是必填项**。
+- ROS 包内的 `setup.py` 普通改动（例如 console entry point、Python package metadata 或 Python-only `install_requires` 调整）不单独触发双平台 `setup.sh + build.sh` Verification 门禁；只有同一 PR 还修改了 `package.xml` 依赖声明或全局 setup/build 流程文件时才触发。
 - 该 Verification 必须体现**真实执行过的验证**，并明确写出：
   - **Scenario**：在哪类干净环境中验证
   - **Method**：如何执行 setup 和 build
   - **Result**：setup / build 是否成功、是否有关键限制或失败点
-- 对此类 PR，review 过程中**必须调用**：
-  - `ibrobot-docker-verify`：在全新 Ubuntu 22.04 Docker 中完整验证 `setup.sh` + `build.sh`
-  - `ibrobot-docker-verify-oee`：在全新 openEuler Embedded Docker 中完整验证 `setup.sh` + `build.sh`
-- 如果缺少任一平台验证，或只给出命令但没有结果，或验证没有覆盖 setup/build 两个阶段，都应视为**阻塞性 review 问题**。
+- 对此类 PR，review 过程中应检查 **PR 描述中的 Verification 是否由开发者提供**，且必须同时覆盖：
+  - Ubuntu 22.04 纯净 Docker 环境中的 `setup.sh + build.sh` 完整验证
+  - openEuler Embedded 纯净 Docker 环境中的 `setup.sh + build.sh` 完整验证
+- 审查者不应代替开发者运行 `ibrobot-docker-verify` 或 `ibrobot-docker-verify-oee` 来补齐 PR 描述；只有当用户明确要求“帮我实际验证/跑 Docker 验证”时，才调用对应验证 skill。
+- 如果 PR 描述缺少任一平台验证说明，或只给出命令但没有结果，或验证没有覆盖 setup/build 两个阶段，都应视为**阻塞性 review 问题**。
 
 ## ⚠️ 环境准备
 
