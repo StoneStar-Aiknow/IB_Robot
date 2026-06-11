@@ -32,8 +32,8 @@ class TeleopNode(Node):
     4. Publishes commands to robot controllers
 
     Publishers:
-        - /arm_position_controller/commands (Float64MultiArray)
-        - /gripper_position_controller/commands (Float64MultiArray)
+        - arm_command_topic (Float64MultiArray, default /arm_position_controller/commands)
+        - gripper_command_topic (Float64MultiArray, default /gripper_position_controller/commands)
         - /diagnostics (DiagnosticArray)
 
     Subscribers:
@@ -43,6 +43,8 @@ class TeleopNode(Node):
         - control_frequency (double): Control loop frequency in Hz (default: 50.0)
         - device_config (dict): Teleoperation device configuration
         - joint_limits (dict): Joint limits for safety filter
+        - arm_command_topic (string): Arm controller command topic
+        - gripper_command_topic (string): Gripper controller command topic
     """
 
     def __init__(self):
@@ -56,12 +58,17 @@ class TeleopNode(Node):
         self.declare_parameter('arm_joint_names', ['1', '2', '3', '4', '5'])
         self.declare_parameter('gripper_joint_names', ['6'])
 
+        self.declare_parameter('arm_command_topic', '/arm_position_controller/commands')
+        self.declare_parameter('gripper_command_topic', '/gripper_position_controller/commands')
+
         # Get parameters
         self.control_frequency = self.get_parameter('control_frequency').value
         device_config_str = self.get_parameter('device_config').value
         joint_limits_str = self.get_parameter('joint_limits').value
         self.arm_joint_names = self.get_parameter('arm_joint_names').value
         self.gripper_joint_names = self.get_parameter('gripper_joint_names').value
+        self.arm_command_topic = self.get_parameter('arm_command_topic').value
+        self.gripper_command_topic = self.get_parameter('gripper_command_topic').value
 
         # Parse JSON parameters if provided as strings
         import json
@@ -91,13 +98,13 @@ class TeleopNode(Node):
         # Publishers
         self.arm_cmd_pub = self.create_publisher(
             Float64MultiArray,
-            '/arm_position_controller/commands',
+            self.arm_command_topic,
             10
         )
 
         self.gripper_cmd_pub = self.create_publisher(
             Float64MultiArray,
-            '/gripper_position_controller/commands',
+            self.gripper_command_topic,
             10
         )
 

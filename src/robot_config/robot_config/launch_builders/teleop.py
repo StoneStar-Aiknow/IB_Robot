@@ -61,6 +61,17 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
         logger.info("Teleoperation not enabled, skipping")
         return nodes
 
+    active_device_names = teleop_config.get('active_devices')
+    if active_device_names:
+        device_configs = {device.get('name'): device for device in teleop_config.get('devices', [])}
+        for active_device_name in active_device_names:
+            device_config = device_configs.get(active_device_name)
+            if not device_config:
+                logger.error(f"Active device '{active_device_name}' not found")
+                continue
+            nodes.extend(_generate_device_nodes(robot_config, device_config, robot_description_dict))
+        return nodes
+
     # Get active device
     active_device_name = teleop_config.get('active_device', '')
     if not active_device_name:
@@ -78,14 +89,22 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
         logger.error(f"Active device '{active_device_name}' not found")
         return nodes
 
+    return _generate_device_nodes(robot_config, device_config, robot_description_dict)
+
+
+def _generate_device_nodes(robot_config: dict, device_config: dict, robot_description_dict: dict = None) -> List[Node]:
+    nodes = []
+    teleop_config = robot_config.get('teleoperation', {})
+
     # Get joint limits from safety config
-    safety_config = teleop_config.get('safety', {})
+    safety_config = teleop_config.get('safety', robot_config.get('safety', {}))
     joint_limits = safety_config.get('joint_limits', {})
 
     # Get joint names from robot config
     joints_config = robot_config.get('joints', {})
-    arm_joint_names = joints_config.get('arm', [])
-    gripper_joint_names = joints_config.get('gripper', [])
+    target_config = device_config.get('target', {})
+    arm_joint_names = target_config.get('arm_joint_names', joints_config.get('arm', []))
+    gripper_joint_names = target_config.get('gripper_joint_names', joints_config.get('gripper', []))
 
     # Build device config for node parameter
     device_param = {
@@ -132,7 +151,7 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
     # Add any extra device-specific parameters
     known_keys = {
         'name', 'type', 'port', 'calib_file', 'joint_mapping', 'phone_config',
-        'group_name', 'base_link_name', 'ee_frame_name', 'target_frame_name', 'ik_timeout',
+        'group_name', 'base_link_name', 'ee_frame_name', 'target_frame_name', 'ik_timeout', 'target',
     }
     for key, value in device_config.items():
         if key not in known_keys:
@@ -181,10 +200,14 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
         device_param_json = json.dumps(device_param_ext)
         control_frequency = 50.0
 
+    node_name = 'robot_teleop_node'
+    if device_config.get('name'):
+        node_name = f"robot_teleop_{re.sub(r'[^A-Za-z0-9_]+', '_', device_config['name']).strip('_')}"
+
     teleop_node = Node(
         package='robot_teleop',
         executable='teleop_node',
-        name='robot_teleop_node',
+        name=node_name,
         output='screen',
         env=env,
         parameters=[{
@@ -193,11 +216,15 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
             'joint_limits':        joint_limits_json,
             'arm_joint_names':     arm_joint_names,
             'gripper_joint_names': gripper_joint_names,
+            'arm_command_topic': target_config.get('arm_command_topic', '/arm_position_controller/commands'),
+            'gripper_command_topic': target_config.get(
+                'gripper_command_topic', '/gripper_position_controller/commands'
+            ),
         }],
     )
     nodes.append(teleop_node)
     logger.info(
-        f"Generated teleop_node for device: {active_device_name} "
+        f"Generated teleop_node for device: {device_config.get('name', '')} "
         f"(type: {device_type})"
     )
 
@@ -352,42 +379,43 @@ def validate_teleop_config(teleop_config: Dict[str, Any]) -> List[str]:
     if not teleop_config.get('enabled', False):
         return errors  # Not enabled, skip validation
 
-    # Check active device
-    active_device = teleop_config.get('active_device')
-    if not active_device:
-        errors.append("active_device must be specified when teleoperation is enabled")
-        return errors
-
-    # Check devices list
     devices = teleop_config.get('devices', [])
     if not devices:
         errors.append("devices list is empty")
         return errors
 
-    # Find active device in list
-    device_found = False
-    for device in devices:
-        if device.get('name') == active_device:
-            device_found = True
+    active_devices = teleop_config.get('active_devices')
+    active_device = teleop_config.get('active_device')
+    if active_devices:
+        if not isinstance(active_devices, list):
+            errors.append("active_devices must be a list when specified")
+            return errors
+        active_device_names = active_devices
+    elif active_device:
+        active_device_names = [active_device]
+    else:
+        errors.append("active_device or active_devices must be specified when teleoperation is enabled")
+        return errors
 
-            # Validate device type
-            if not device.get('type'):
-                errors.append(f"Device '{active_device}': missing 'type' field")
+    devices_by_name = {device.get('name'): device for device in devices}
+    for active_device_name in active_device_names:
+        device = devices_by_name.get(active_device_name)
+        if not device:
+            errors.append(f"active device '{active_device_name}' not found in devices list")
+            continue
 
-            # Type-specific validation
-            if device.get('type') == 'leader_arm':
-                if not device.get('port'):
-                    errors.append(f"Device '{active_device}': leader_arm requires 'port' field")
+        # Validate device type
+        if not device.get('type'):
+            errors.append(f"Device '{active_device_name}': missing 'type' field")
 
-            if device.get('type') == 'phone':
-                phone_config = device.get('phone_config', {})
-                if not phone_config:
-                    errors.append(f"Device '{active_device}': phone requires 'phone_config' field")
+        # Type-specific validation
+        if device.get('type') == 'leader_arm' and not device.get('port'):
+            errors.append(f"Device '{active_device_name}': leader_arm requires 'port' field")
 
-            break
-
-    if not device_found:
-        errors.append(f"active_device '{active_device}' not found in devices list")
+        if device.get('type') == 'phone':
+            phone_config = device.get('phone_config', {})
+            if not phone_config:
+                errors.append(f"Device '{active_device_name}': phone requires 'phone_config' field")
 
     # Validate safety config
     safety = teleop_config.get('safety', {})

@@ -37,8 +37,8 @@ graph TB
     end
 
     subgraph Output["输出层 Output Layer"]
-        ARM["/arm_position_controller/commands<br/><small>Float64MultiArray</small>"]
-        GRIP["/gripper_position_controller/commands<br/><small>Float64MultiArray</small>"]
+        ARM["arm_command_topic<br/><small>default: /arm_position_controller/commands</small>"]
+        GRIP["gripper_command_topic<br/><small>default: /gripper_position_controller/commands</small>"]
         DIAG["/diagnostics<br/><small>DiagnosticArray @ 1Hz</small>"]
         SERVO["MoveIt2 Servo<br/><small>Cartesian 模式专用</small>"]
     end
@@ -185,6 +185,8 @@ def control_loop_callback(self):
 | `joint_limits` | string (JSON) | — | 关节限位，由 `robot_config` 注入 |
 | `arm_joint_names` | string[] | `["1","2","3","4","5"]` | 手臂关节名称列表 |
 | `gripper_joint_names` | string[] | `["6"]` | 夹爪关节名称列表 |
+| `arm_command_topic` | string | `/arm_position_controller/commands` | 手臂 position controller 命令 topic，可由 `robot_config` 为左右臂分别覆盖 |
+| `gripper_command_topic` | string | `/gripper_position_controller/commands` | 夹爪 controller 命令 topic，可由 `robot_config` 为左右臂分别覆盖 |
 
 **诊断**: 每 50 个控制周期（约 1 Hz）发布循环时间指数移动平均值，超过 5ms 发出警告。
 
@@ -347,8 +349,8 @@ if (delta > 0 and lead < -0.01) or (delta < 0 and lead > 0.01):
 
 | 话题 | 消息类型 | 频率 | 说明 |
 |---|---|---|---|
-| `/arm_position_controller/commands` | `Float64MultiArray` | 50 Hz | 手臂关节目标位置 (rad) |
-| `/gripper_position_controller/commands` | `Float64MultiArray` | 50 Hz | 夹爪目标位置 |
+| `arm_command_topic`（默认 `/arm_position_controller/commands`） | `Float64MultiArray` | 50 Hz | 手臂关节目标位置 (rad)，可由 `robot_config` 覆盖 |
+| `gripper_command_topic`（默认 `/gripper_position_controller/commands`） | `Float64MultiArray` | 50 Hz | 夹爪目标位置，可由 `robot_config` 覆盖 |
 | `/diagnostics` | `DiagnosticArray` | 1 Hz | 控制循环延迟统计 |
 
 **TeleopNode 订阅**:
@@ -580,18 +582,29 @@ ros2 launch robot_teleop teleop_device.launch.py \
 ```yaml
 robot:
   teleoperation:
-    enabled: bool           # 启用遥操作 (默认: true)
-    active_device: string   # 激活的设备名称，须与 devices[].name 匹配
+    enabled: bool             # 启用遥操作 (默认: true)
+    active_device: string     # 单设备模式：激活一个设备，须与 devices[].name 匹配
+    active_devices: string[]  # 多设备模式：同时激活多个设备，例如双臂 leader
 
     devices:
-      - name: string        # 唯一设备名称
-        type: string        # leader_arm | xbox_controller | vr_controller | phone
-        ...                 # 设备特定参数 (见下)
+      - name: string          # 唯一设备名称
+        type: string          # leader_arm | xbox_controller | vr_controller | phone
+        target:               # 可选：覆盖该设备控制的关节组和输出话题
+          arm_joint_names: string[]
+          gripper_joint_names: string[]
+          arm_command_topic: string
+          gripper_command_topic: string
+        ...                   # 设备特定参数 (见下)
 
     safety:
-      joint_limits: dict    # 每关节 {min, max} (rad)，由 SafetyFilter 强制执行
-      estop_topic: string   # 急停话题 (默认: /emergency_stop)
+      joint_limits: dict      # 每关节 {min, max} (rad)，由 SafetyFilter 强制执行
+      estop_topic: string     # 急停话题 (默认: /emergency_stop)
 ```
+
+`active_device` 用于单输入设备；`active_devices` 用于双臂等多输入场景，
+`robot_config` 会按名称为每个设备分别启动一个 `teleop_node`。每个设备的
+`target` 用于把该输入设备映射到独立的 arm/gripper 关节和控制器话题；未配置
+`target` 时回退到机器人级 `joints.arm` / `joints.gripper` 以及默认命令话题。
 
 ### 设备特定参数
 
@@ -649,10 +662,12 @@ robot:
 
 ### 验证规则
 
-1. `teleoperation.enabled: true` 时必须指定 `active_device`
+1. `teleoperation.enabled: true` 时必须指定 `active_device` 或 `active_devices`
 2. `active_device` 须能在 `devices[]` 中找到对应 `name`
-3. `leader_arm` 必须填写 `port`；`calib_file` 若配置则文件必须存在
-4. `joint_limits` 中每个条目须同时含 `min` 和 `max`，且 `min < max`
+3. `active_devices` 必须是名称列表，且每个名称都能在 `devices[]` 中找到
+4. `leader_arm` 必须填写 `port`；`calib_file` 若配置则文件必须存在
+5. `target.arm_joint_names` / `target.gripper_joint_names` 与对应 command topic 应成组配置
+6. `joint_limits` 中每个条目须同时含 `min` 和 `max`，且 `min < max`
 
 ---
 
@@ -765,7 +780,7 @@ ros2 control list_controllers | grep gripper
 
 **遥操作节点未启动**
 1. 检查 YAML 中 `teleoperation.enabled: true`
-2. 检查 `active_device` 与 `devices[].name` 是否匹配
+2. 检查 `active_device` 或 `active_devices[]` 与 `devices[].name` 是否匹配
 3. 检查设备 `type` 是否已在 `DEVICE_MAP` 中注册
 
 ---

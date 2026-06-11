@@ -294,8 +294,6 @@ def get_recording_topics(robot_config: dict) -> list[str]:
 
     # Always record joint states for ros2_control-backed robots.
     _append("/joint_states")
-    _append("/arm_position_controller/commands")
-    _append("/gripper_position_controller/commands")
 
     # Record contract-defined observations/actions first.
     contract = robot_config.get("contract", {})
