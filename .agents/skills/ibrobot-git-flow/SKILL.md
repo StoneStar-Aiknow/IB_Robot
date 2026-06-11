@@ -58,6 +58,12 @@ Must strictly follow this structure with exactly one blank line between sections
   - `origin`: Personal fork (for pushing code).
   - `upstream`: Main project repo (for submitting Pull Requests).
 
+### 3. Verification Gate for Dependency / Setup Changes
+
+- If the staged changes modify a ROS package `package.xml` dependency declaration (`depend`, `exec_depend`, `build_depend`, `test_depend`, etc.), or global setup/build workflow files such as `scripts/setup.sh`, `scripts/build.sh`, `scripts/setup/platforms/*.sh`, `scripts/setup/verify_env.sh`, `scripts/install_ros.sh`, top-level `CMakeLists.txt`, or top-level `pyproject.toml`, the eventual PR description must include real Ubuntu 22.04 and openEuler Embedded Docker `setup.sh + build.sh` verification results.
+- ROS package-local `setup.py` changes do **not** by themselves trigger this dual-platform setup/build gate. Examples that do not trigger it alone: console entry points, Python package metadata, or Python-only `install_requires` edits.
+- When the gate is triggered during commit preparation, explicitly remind the user before committing/pushing that dual-platform verification is required for the PR. If the user asks or authorizes the agent to run it, call `ibrobot-docker-verify` and `ibrobot-docker-verify-oee` before updating the PR description. If the user does not authorize running verification, do not fabricate results; record that verification is still required for PR submission.
+
 ## Execution Steps
 
 ### Status Determination
@@ -71,6 +77,7 @@ If user explicitly requests **local commit only** (e.g., "commit to local", "onl
 1. Help user draft commit message (Title, Body, Footer) following specifications above.
 2. **Validate**: Check title length, format, blank lines, and Chinese characters.
 3. **Confirm staging scope**: Show the user which files will be committed, explicitly noting any excluded files (especially `libs/lerobot`).
+4. **Check verification gate**: Inspect the staged file list for ROS package `package.xml` dependency changes or global setup/build workflow changes. If triggered, remind the user that Ubuntu + openEuler dual-platform Docker verification is required before the PR can be considered ready.
 
 ### Phase 3: Execute Commit and Push
 
@@ -98,7 +105,8 @@ For root repository:
    - **If an existing PR is found**: The PR description is now stale. You **must** synchronize it:
      1. Run `python3 pr_management.py --pr <NUM> --fetch-info` to get full PR context (all commits + diff).
      2. Analyze all commits in the PR and regenerate a complete PR description (Chinese by default) covering all changes.
-     3. Write the updated `description.json` and run `python3 pr_management.py --pr <NUM> --update-pr description.json`.
+     3. If the PR context triggers the verification gate, include the user's provided dual-platform verification results, or run `ibrobot-docker-verify` and `ibrobot-docker-verify-oee` only after explicit user authorization.
+     4. Write the updated `description.json` and run `python3 pr_management.py --pr <NUM> --update-pr description.json`.
    - **If no existing PR**: Generate AtomGit PR link: `https://atomgit.com/<username>/IB_Robot/merge_requests/new?source_branch=<current-branch>` and compose PR description from commit message body.
 
 For submodule `libs/lerobot` (only when user explicitly asks):

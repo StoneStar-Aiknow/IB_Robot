@@ -68,7 +68,8 @@ Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler
         *   必须写清楚 **Scenario（什么场景下验证）**、**Method（如何验证，可含命令）**、**Result（验证结果是什么）**。
         *   禁止把 `git diff`、`git status`、文件列表这类仅用于查看变更的命令当作 Verification。
         *   对纯文档、注释、gitignore、纯元数据等**不涉及运行时行为**的提交，可以省略 Verification，而不是生硬补一个无意义小节。
-        *   如果 PR 修改了 `package.xml` 的依赖声明，或修改了 setup/build 流程相关文件（如 `scripts/setup.sh`、`scripts/build.sh`、`scripts/setup/platforms/*.sh`、`scripts/setup/verify_env.sh`、`scripts/install_ros.sh`、`CMakeLists.txt`、`setup.py`、`pyproject.toml` 等），则 Verification **必须提供**，且必须包含基于 `ibrobot-docker-verify` 与 `ibrobot-docker-verify-oee` 的双平台纯净 Docker `setup.sh + build.sh` 完整验证结果。
+        *   如果 PR 修改了 ROS 包的 `package.xml` 依赖声明，或修改了全局 setup/build 流程相关文件（如 `scripts/setup.sh`、`scripts/build.sh`、`scripts/setup/platforms/*.sh`、`scripts/setup/verify_env.sh`、`scripts/install_ros.sh`、顶层 `CMakeLists.txt`、顶层 `pyproject.toml` 等），则 Verification **必须提供**，且必须包含基于 `ibrobot-docker-verify` 与 `ibrobot-docker-verify-oee` 的双平台纯净 Docker `setup.sh + build.sh` 完整验证结果。ROS 包内的 `setup.py` 普通改动（例如 console entry point、Python package metadata 或 Python-only `install_requires` 调整）不单独触发该双平台门禁；只有同一 PR 还修改了 `package.xml` 依赖声明或全局 setup/build 流程文件时才触发。
+        *   触发上述门禁时，Agent 在创建或更新 PR 描述前必须明确提醒用户：需要提供 Ubuntu 22.04 与 openEuler Embedded 两个平台的真实验证结果。若用户已经提供结果，将其整理进 Verification；若用户要求或授权 Agent 代为验证，则先调用 `ibrobot-docker-verify` 与 `ibrobot-docker-verify-oee` 实际执行双平台验证，再把结果写入 PR 描述；若既没有用户提供结果也没有授权执行验证，不得伪造 Verification，应暂停并询问用户下一步。
 
 ```bash
 # 1. 获取变更信息（仅用于分析变更，不可直接当作 Verification）
@@ -78,7 +79,8 @@ git diff upstream/master..HEAD
 # 根据 commit 内容选择合适章节；仅在做过真实验证时包含 Verification。
 # Mermaid 仅用于能显著提升理解的复杂流程或架构变更。
 # 如果变更影响用户使用方式，要判断并同步 README / 使用文档。
-# 如果变更触发依赖或 setup/build 门禁，必须补齐 Ubuntu + openEuler 双平台 Docker Verification。
+# 如果 ROS 包 package.xml 依赖声明或全局 setup/build 流程变更触发门禁，必须先提醒用户提供 Ubuntu + openEuler 双平台 Docker Verification；
+# 用户授权代跑时，先执行 ibrobot-docker-verify 与 ibrobot-docker-verify-oee，再写入真实结果。
 
 # 3. 创建 PR
 python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --title "feat(scope): technical summary" --description-file pr_description.md
@@ -186,7 +188,7 @@ PR 描述通常应包含与本次提交最相关的内容，而不是固定模�
 - **验证结果（可选）**：仅在存在真实验证时写清场景、方法与结果
 
 对于纯文档、注释、`.gitignore`、说明文字等不涉及运行时行为的 PR，可以不写 Verification。
-但若变更涉及 `package.xml` 依赖声明或 setup/build 流程，Verification 为**必填**，且必须覆盖 Ubuntu 与 openEuler 纯净 Docker 的 `setup.sh + build.sh` 完整验证。
+但若变更涉及 ROS 包 `package.xml` 依赖声明或全局 setup/build 流程，Verification 为**必填**，且必须覆盖 Ubuntu 与 openEuler 纯净 Docker 的 `setup.sh + build.sh` 完整验证。ROS 包内 `setup.py` 普通改动不单独触发该门禁。Agent 必须提醒用户提供这两类验证结果；用户授权代跑时才调用 `ibrobot-docker-verify` 和 `ibrobot-docker-verify-oee` 自动执行验证并写入真实结果。
 
 ## 注意事项
 
