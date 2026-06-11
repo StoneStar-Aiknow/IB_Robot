@@ -34,7 +34,15 @@ experience without requiring real hardware.
 
 ## Prerequisites
 
-- Docker installed and the current user has permission to run containers.
+- Docker CLI installed on the host. If `docker` is missing, stop and ask the
+  user to install Docker before verification:
+  ```bash
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker CLI is not installed. Install Docker on the host, then rerun verification."
+    exit 1
+  fi
+  ```
+- The current user has permission to run containers.
 - The IB-Robot workspace has uncommitted or committed changes to validate.
 - Network access to Aliyun apt mirror, TUNA ROS 2 repo, Huawei pip mirror,
   and `gitcode.com` / `atomgit.com` for lerobot submodule fetch.
@@ -48,6 +56,18 @@ experience without requiring real hardware.
 | Workspace      | `/home/testuser/IB_Robot`    |
 
 ## Procedure
+
+### Phase 0 — Check Host Docker CLI
+
+> Run this on the host before any Docker operation. Do not continue if the
+> `docker` command is unavailable.
+
+```bash
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker CLI is not installed. Install Docker on the host, then rerun verification."
+  exit 1
+fi
+```
 
 ### Phase 1 — Create and Provision Container
 
