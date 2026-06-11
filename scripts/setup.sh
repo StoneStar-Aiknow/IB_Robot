@@ -439,7 +439,10 @@ platform_install_rosdeps() {
         --rosdistro=humble \
         -y -r \
         "${skip_args[@]}"; then
-        log_warn "rosdep install encountered errors. Some packages may be missing or require manual installation."
+        log_error "rosdep install encountered errors. Some packages may be missing or require manual installation."
+        log_error "Re-run with VERBOSE=1 for full output, or install missing packages manually."
+        log_error "Fix the reported dependency issues and re-run ./scripts/setup.sh."
+        SYSTEM_DEPS_STATUS="rosdep-errors"
     fi
 
     platform_post_install_rosdeps
@@ -498,7 +501,9 @@ install_system_deps() {
     ensure_colcon
     ensure_rosdep
     platform_install_rosdeps
-    SYSTEM_DEPS_STATUS="done"
+    if [[ "${SYSTEM_DEPS_STATUS}" != "rosdep-errors" ]]; then
+        SYSTEM_DEPS_STATUS="done"
+    fi
 }
 
 verify_setup() {
@@ -545,6 +550,10 @@ main() {
     install_system_deps
     if [[ "${SYSTEM_DEPS_STATUS}" == "done" ]]; then
         log_done "System ROS dependencies installed"
+    elif [[ "${SYSTEM_DEPS_STATUS}" == "rosdep-errors" ]]; then
+        log_error "System dependency installation had errors — see messages above."
+        log_error "Fix the reported issues and re-run ./scripts/setup.sh."
+        exit 1
     fi
     set_stage "configuring python environment"
     setup_python_venv

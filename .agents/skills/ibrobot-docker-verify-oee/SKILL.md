@@ -1,6 +1,6 @@
 ---
 name: ibrobot-docker-verify-oee
-description: "在 openEuler Embedded (aarch64) Docker 容器中端到端验证 setup.sh + build.sh。容器通过 chroot /root/openeuler_rootfs 进入 qemu-user 模拟的 arm64 环境，以 root 用户操作。Use when user wants to 'openEuler Docker 验证', 'oee container test', 'openEuler 容器测试', '验证 openEuler setup', 'aarch64 验证', or after modifying openEuler platform scripts to ensure changes work on emulated arm64 environment."
+description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setup.sh + build.sh。Use when the user explicitly asks for openEuler/OEE Docker verification, or when author-side PR creation/update workflows trigger the dependency/setup verification gate. Do not use automatically during PR review; review should check developer-provided Verification in the PR description."
 ---
 
 # IB-Robot openEuler Embedded Docker Verification Skill
@@ -15,17 +15,57 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中端到端验证 s
 
 ## When to Use
 
-- 修改了 `scripts/setup/platforms/openeuler-embedded-24.03.sh` 后
-- 修改了 `scripts/setup.sh` 中影响 dnf/rosdep 的逻辑后
-- 修改了 `scripts/setup/lerobot_patches.sh` 后
-- 用户要求 "openEuler Docker 验证" / "oee container test"
-- PR 合入前需要双平台验证时
+- 用户明确要求 "openEuler Docker 验证" / "oee container test" / "实际验证 openEuler setup/build"。
+- 作者侧创建/更新 PR 流程（`atomgit-pr` 或 `ibrobot-git-flow`）触发依赖/setup 验证门禁，需要真实结果写入 PR 描述。
+- 当前任务是验证本地对 `scripts/setup/platforms/openeuler-embedded-24.03.sh`、`scripts/setup.sh`、`scripts/setup/lerobot_patches.sh` 或 dnf/rosdep 相关逻辑的修改。
+- 不要仅因为 PR review 触发本 skill。
+
+## Review Boundary
+
+- PR review 过程中，禁止因为 PR 修改了 `package.xml`、`setup.py`、setup 脚本或 build 文件就自动运行本 skill。
+- 用户要求“review 这个 PR / 检查这个 PR 有没有问题”不等于授权运行 openEuler Docker 验证。
+- review 默认只检查 PR 描述中开发者声明的 openEuler Embedded Verification。如果缺少或不完整，应作为阻塞性 review 问题要求开发者补充。
+- 只有当用户在当前请求中明确要求 agent 实际执行 openEuler / 双平台 Docker setup/build 验证时，才运行本 skill。
 
 ## Prerequisites
 
-- Docker 已安装且当前用户有运行容器的权限
-- Docker 镜像可从华为 SWR 拉取：
-  `docker pull swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest`
+- 宿主机已安装 Docker CLI。若 `docker` 命令不存在，停止验证并要求用户先安装 Docker：
+  ```bash
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker CLI is not installed. Install Docker on the host, then rerun verification."
+    exit 1
+  fi
+  ```
+- 宿主机已安装 openEuler aarch64 验证所需的 qemu-user-static。只做检查，不自动安装；缺失时提醒用户在宿主机执行 apt 安装：
+  ```bash
+  missing_pkgs=()
+  for pkg in qemu-user-static; do
+    if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+      missing_pkgs+=("$pkg")
+    fi
+  done
+  if [ "${#missing_pkgs[@]}" -gt 0 ]; then
+    echo "Missing host packages: ${missing_pkgs[*]}"
+    echo "Install them on the host with: sudo apt update && sudo apt install -y ${missing_pkgs[*]}"
+    exit 1
+  fi
+  ```
+- 当前用户有运行容器的权限
+- **必须先检查验证镜像**，不能假设开发者本机已有该镜像；若本地不存在，或本地镜像创建时间距本次验证超过 30 天，则重新拉取：
+  ```bash
+  IMAGE=swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest
+  CREATED=$(docker image inspect "$IMAGE" --format '{{.Created}}' 2>/dev/null || true)
+  if [ -z "$CREATED" ]; then
+    docker pull "$IMAGE"
+  else
+    NOW=$(date +%s)
+    CREATED_TS=$(date -d "$CREATED" +%s)
+    AGE_DAYS=$(( (NOW - CREATED_TS) / 86400 ))
+    if [ "$AGE_DAYS" -gt 30 ]; then
+      docker pull "$IMAGE"
+    fi
+  fi
+  ```
 - 网络：可访问 `repo.openeuler.org`、`eur.openeuler.openatom.cn`、
   `eulermaker.compass-ci.openeuler.openatom.cn`、华为 pip 镜像、`gitcode.com`
 - IB-Robot workspace 中有待验证的修改
@@ -67,13 +107,61 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中端到端验证 s
 
 ## Procedure
 
-### Phase 1 — Start Container and Fix chroot Environment
+### Phase 0 — Check Host Prerequisites
+
+> **只允许在宿主机执行本节检查命令。** 本节只检查 `docker` 命令和宿主机 apt 包，
+> 不执行 chroot、不挂载 rootfs、不进入 aarch64 环境。
 
 ```bash
-# 1.1 Pull the image
-docker pull swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest
+if ! command -v docker >/dev/null 2>&1; then
+  echo "Docker CLI is not installed. Install Docker on the host, then rerun verification."
+  exit 1
+fi
 
-# 1.2 Start detached container (--entrypoint override to keep container alive)
+missing_pkgs=()
+for pkg in qemu-user-static; do
+  if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
+    missing_pkgs+=("$pkg")
+  fi
+done
+
+if [ "${#missing_pkgs[@]}" -gt 0 ]; then
+  echo "Missing host packages: ${missing_pkgs[*]}"
+  echo "Install them on the host with: sudo apt update && sudo apt install -y ${missing_pkgs[*]}"
+  exit 1
+fi
+```
+
+### Phase 1 — Ensure Required Image Is Fresh
+
+> **必须执行。** openEuler Embedded 验证不使用本地默认镜像名，也不假设镜像已预装。
+> 如果本地没有镜像，或镜像创建时间距本次验证超过 30 天，需要先从 SWR 重新拉取。
+> 通过 `date` 获取当前时间，通过 `docker image inspect --format '{{.Created}}'` 获取本地镜像创建时间。
+
+```bash
+IMAGE=swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest
+CREATED=$(docker image inspect "$IMAGE" --format '{{.Created}}' 2>/dev/null || true)
+
+if [ -z "$CREATED" ]; then
+  echo "Image not found locally, pulling: $IMAGE"
+  docker pull "$IMAGE"
+else
+  NOW=$(date +%s)
+  CREATED_TS=$(date -d "$CREATED" +%s)
+  AGE_DAYS=$(( (NOW - CREATED_TS) / 86400 ))
+  if [ "$AGE_DAYS" -gt 30 ]; then
+    echo "Image is ${AGE_DAYS} days old, refreshing: $IMAGE"
+    docker pull "$IMAGE"
+  else
+    echo "Using local image created ${AGE_DAYS} days ago: $IMAGE"
+  fi
+fi
+```
+
+### Phase 2 — Start Container and Fix chroot Environment
+
+```bash
+# 2.1 Start detached container (--entrypoint override to keep container alive)
 #     NOTE: The image's default entrypoint /bin/bash -l triggers auto-chroot
 #     via .bashrc on interactive login. For detached mode we override to
 #     keep the container running, then manually chroot as needed.
@@ -82,23 +170,23 @@ docker run -d --name verify-oee --privileged \
   swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest \
   -c "sleep infinity"
 
-# 1.3 Verify aarch64 emulation
+# 2.2 Verify aarch64 emulation
 docker exec verify-oee chroot /root/openeuler_rootfs uname -m
 # Expected: aarch64
 
-# 1.4 Fix DNS (rootfs has no /etc/resolv.conf)
+# 2.3 Fix DNS (rootfs has no /etc/resolv.conf)
 docker exec verify-oee bash -c \
   'rm -f /root/openeuler_rootfs/etc/resolv.conf && cp /etc/resolv.conf /root/openeuler_rootfs/etc/resolv.conf'
 
-# 1.5 Fix /var/log (symlink target missing in rootfs)
+# 2.4 Fix /var/log (symlink target missing in rootfs)
 docker exec verify-oee bash -c \
   'mkdir -p /root/openeuler_rootfs/var/volatile/log'
 
-# 1.6 Mount /proc and /sys for chroot compatibility
+# 2.5 Mount /proc and /sys for chroot compatibility
 docker exec verify-oee bash -c \
   'mount -t proc proc /root/openeuler_rootfs/proc 2>/dev/null; mount --bind /sys /root/openeuler_rootfs/sys 2>/dev/null'
 
-# 1.7 Fix git safe.directory for UID mismatch after docker cp
+# 2.6 Fix git safe.directory for UID mismatch after docker cp
 docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs git config --global --add safe.directory /root/IB_Robot
    chroot /root/openeuler_rootfs git config --global --add safe.directory /root/IB_Robot/libs/lerobot'
@@ -114,7 +202,11 @@ docker exec verify-oee bash -c \
 `exec chroot /root/openeuler_rootfs /bin/bash`。`docker exec` 命令在容器宿主空间
 执行，必须手动 `chroot /root/openeuler_rootfs` 才能进入 arm64 环境。
 
-### Phase 2 — Inspect chroot Environment
+**Host safety rule:** 任何 `chroot /root/openeuler_rootfs`、`mount /root/openeuler_rootfs/...`、
+qemu/rootfs 相关命令都必须包在 `docker exec verify-oee ...` 里执行。不要在宿主机直接
+执行这些命令，也不要把宿主机 chroot 到 aarch64 rootfs；这样可能破坏本地环境。
+
+### Phase 3 — Inspect chroot Environment
 
 ```bash
 docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
@@ -131,7 +223,7 @@ docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
 容器镜像应包含：git、python3、dnf + 两个 openEuler ROS repo 配置。
 ROS 2 安装由 setup.sh 通过 `install_ros.sh` 自动完成，无需手动干预。
 
-### Phase 3 — Prepare Workspace
+### Phase 4 — Prepare Workspace
 
 提供两种方式，根据场景选择：
 
@@ -140,10 +232,10 @@ ROS 2 安装由 setup.sh 通过 `install_ros.sh` 自动完成，无需手动干�
 > 用于验证本地未提交的改动。`docker cp` 拷入当前项目目录，可直接验证修改效果。
 
 ```bash
-# 3.1 Copy current workspace into rootfs
+# 4.1 Copy current workspace into rootfs
 docker cp <project_root> verify-oee:/root/openeuler_rootfs/root/IB_Robot
 
-# 3.2 Remove stale artifacts (host paths are wrong in container)
+# 4.2 Remove stale artifacts (host paths are wrong in container)
 docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs /bin/bash -c "rm -rf /root/IB_Robot/{venv,build,install,log}"'
 ```
@@ -154,18 +246,18 @@ docker exec verify-oee bash -c \
 > git 命令请用绝对路径 `/usr/bin/git`。
 
 ```bash
-# 3.1 Clone the branch inside chroot
+# 4.1 Clone the branch inside chroot
 docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs /bin/bash -c "
     cd /root && /usr/bin/git clone -b <branch> <repo_url> /root/IB_Robot
   "'
 
-# 3.2 Remove stale artifacts (if any)
+# 4.2 Remove stale artifacts (if any)
 docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs /bin/bash -c "rm -rf /root/IB_Robot/{venv,build,install,log}"'
 ```
 
-### Phase 4 — Run setup.sh
+### Phase 5 — Run setup.sh
 
 ```bash
 docker exec -d verify-oee bash -c \
@@ -186,7 +278,7 @@ Wait until the log ends with:
 Setup complete! Run ./scripts/build.sh to build the workspace.
 ```
 
-### Phase 5 — Run build.sh
+### Phase 6 — Run build.sh
 
 ```bash
 docker exec -d verify-oee bash -c \
@@ -206,7 +298,7 @@ Wait until:
 Build complete. Source with: source install/setup.sh
 ```
 
-### Phase 6 — Inspect and Clean Up
+### Phase 7 — Inspect and Clean Up
 
 ```bash
 # Check results
@@ -256,10 +348,10 @@ docker exec -d verify-oee bash -c \
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Couldn't resolve host name` | rootfs missing `/etc/resolv.conf` | Phase 1.3 copies from host container |
-| `Config error: File exists: /var/log` | `/var/log` symlink target missing | Phase 1.4 creates `/var/volatile/log` |
-| `/dev/stdout: No such file or directory` | `/proc` not mounted in chroot | Phase 1.5 mounts proc/sys |
-| `dubious ownership in repository` | UID mismatch after `docker cp` | Phase 1.7 adds `safe.directory` |
+| `Couldn't resolve host name` | rootfs missing `/etc/resolv.conf` | Phase 2.3 copies from host container |
+| `Config error: File exists: /var/log` | `/var/log` symlink target missing | Phase 2.4 creates `/var/volatile/log` |
+| `/dev/stdout: No such file or directory` | `/proc` not mounted in chroot | Phase 2.5 mounts proc/sys |
+| `dubious ownership in repository` | UID mismatch after `docker cp` | Phase 2.6 adds `safe.directory` |
 | `gpg.errors.GPGMEError` during `rosdep install` | qemu-aarch64 emulation bug with Python `gpg` | setup.sh 自动禁用 `gpgcheck` |
 | `git-lfs was not found` post-checkout hook | No git-lfs in rootfs | `lerobot_patches.sh` auto-removes hook when git-lfs missing |
 | `ERROR: file:///root/IB_Robot/libs/lerobot does not appear to be a Python project` | Copied a linked worktree or an uninitialized submodule tree into the container, then ran setup without `--skip-submodules` | Use a standalone clone and run `git submodule update --init --recursive` before `docker cp` |

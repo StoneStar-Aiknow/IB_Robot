@@ -8,7 +8,7 @@
 #   ./scripts/build.sh --list-mixins      # Show available mixins
 #   ./scripts/build.sh --packages-select tensormsg  # Build specific package
 #
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="${WORKSPACE:-$(dirname "${SCRIPT_DIR}")}"
@@ -233,7 +233,15 @@ require_setup_environment
 # ============================================================================
 # ROS 2 Environment
 # ============================================================================
+if [[ ! -f /opt/ros/humble/setup.sh ]]; then
+    log_error "ROS 2 Humble is not installed at /opt/ros/humble/."
+    exit 1
+fi
+# ROS 2 setup.sh uses unbound variables internally (e.g. AMENT_TRACE_SETUP_FILES);
+# temporarily disable nounset to avoid false failures.
+set +u
 source /opt/ros/humble/setup.sh
+set -u
 
 # Clean build: remove stale dirs BEFORE sourcing to prevent overlay chain leaks.
 # Without this, install/setup.sh (which may chain to stale overlays like a
@@ -244,7 +252,11 @@ if ${CLEAN_BUILD}; then
 fi
 
 if ! ${CLEAN_BUILD}; then
-    [[ -f "${WORKSPACE}/install/setup.sh" ]] && source "${WORKSPACE}/install/setup.sh"
+    if [[ -f "${WORKSPACE}/install/setup.sh" ]]; then
+        set +u
+        source "${WORKSPACE}/install/setup.sh"
+        set -u
+    fi
 fi
 
 # ============================================================================

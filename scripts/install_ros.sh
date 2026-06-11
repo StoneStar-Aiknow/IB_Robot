@@ -254,7 +254,7 @@ install_ubuntu_ros() {
         return 1
     fi
 
-    if ! curl -fsSL "$ROS_GPG_KEY" -o /tmp/ros.asc 2>/dev/null; then
+    if ! curl -fsSL "$ROS_GPG_KEY" -o /tmp/ros.asc; then
         log_error "Failed to download ROS 2 GPG key from $ROS_GPG_KEY"
         log_error "Please check your internet connection"
         return 1
@@ -385,7 +385,9 @@ install_openeuler_ros_packages() {
     for pkg in "${ros_packages[@]}"; do
         log_info "Installing $pkg..."
         if ! run_sudo dnf install -y --nogpgcheck "$pkg"; then
-            log_warn "Failed to install $pkg (may not be available in repo)"
+            log_error "Failed to install $pkg — this is a required core package."
+            log_error "Check your repository configuration and network connectivity."
+            return 1
         else
             log_info "Successfully installed $pkg"
         fi
