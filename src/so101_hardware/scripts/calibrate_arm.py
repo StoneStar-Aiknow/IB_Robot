@@ -47,13 +47,15 @@ ARM_CONFIGS = {
 
 
 class UnifiedCalibrator(Node):
-    def __init__(self, arm_type: str, port: str):
+    def __init__(self, arm_type: str, port: str, calib_path_override: str = None):
         super().__init__(f"so101_{arm_type}_calibrator")
         self.arm_type = arm_type
         self.port = port
         
         config = ARM_CONFIGS[arm_type]
-        self.calib_path = config["calib_path"]
+        self.calib_path = (
+            pathlib.Path(calib_path_override).expanduser() if calib_path_override else config["calib_path"]
+        )
         self.joints_config = config["joints"]
 
     def run(self):
@@ -102,6 +104,8 @@ def main():
                         help="Which arm to calibrate (default: follower)")
     parser.add_argument("--port", type=str, default=None,
                         help="Serial port (default: /dev/ttyACM0 for follower, /dev/ttyACM1 for leader)")
+    parser.add_argument("--calib-file", type=str, default=None,
+                        help="Custom path for the calibration JSON file (overrides default)")
 
     args = parser.parse_args()
 
@@ -109,7 +113,7 @@ def main():
     port = args.port if args.port else ARM_CONFIGS[args.arm]["default_port"]
 
     rclpy.init()
-    calibrator = UnifiedCalibrator(args.arm, port)
+    calibrator = UnifiedCalibrator(args.arm, port, args.calib_file)
     try:
         calibrator.run()
     except KeyboardInterrupt:
