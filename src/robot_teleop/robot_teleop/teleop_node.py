@@ -5,20 +5,19 @@ This node bridges teleoperation devices to robot controllers,
 providing zero-latency control with safety filtering.
 """
 
-import time
-from typing import Dict, Optional
 import threading
+import time
 
 import rclpy
-from rclpy.node import Node
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from std_msgs.msg import Float64MultiArray
-from sensor_msgs.msg import JointState
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+from std_msgs.msg import Float64MultiArray
 
+from .base_teleop import BaseTeleopDevice
 from .device_factory import device_factory
 from .safety_filter import SafetyFilter
-from .base_teleop import BaseTeleopDevice
 
 
 class TeleopNode(Node):
@@ -49,34 +48,37 @@ class TeleopNode(Node):
 
     def __init__(self):
         """Initialize teleop node."""
-        super().__init__('robot_teleop_node')
+        super().__init__("robot_teleop_node")
 
         # Declare parameters
-        self.declare_parameter('control_frequency', 50.0)
-        self.declare_parameter('device_config', '')
-        self.declare_parameter('joint_limits', '')
-        self.declare_parameter('arm_joint_names', ['1', '2', '3', '4', '5'])
-        self.declare_parameter('gripper_joint_names', ['6'])
+        self.declare_parameter("control_frequency", 50.0)
+        self.declare_parameter("device_config", "")
+        self.declare_parameter("joint_limits", "")
+        self.declare_parameter("arm_joint_names", ["1", "2", "3", "4", "5"])
+        self.declare_parameter("gripper_joint_names", ["6"])
 
-        self.declare_parameter('arm_command_topic', '/arm_position_controller/commands')
-        self.declare_parameter('gripper_command_topic', '/gripper_position_controller/commands')
+        self.declare_parameter("arm_command_topic", "/arm_position_controller/commands")
+        self.declare_parameter("gripper_command_topic", "/gripper_position_controller/commands")
 
         # Get parameters
-        self.control_frequency = self.get_parameter('control_frequency').value
-        device_config_str = self.get_parameter('device_config').value
-        joint_limits_str = self.get_parameter('joint_limits').value
-        self.arm_joint_names = self.get_parameter('arm_joint_names').value
-        self.gripper_joint_names = self.get_parameter('gripper_joint_names').value
-        self.arm_command_topic = self.get_parameter('arm_command_topic').value
-        self.gripper_command_topic = self.get_parameter('gripper_command_topic').value
+        self.control_frequency = self.get_parameter("control_frequency").value
+        device_config_str = self.get_parameter("device_config").value
+        joint_limits_str = self.get_parameter("joint_limits").value
+        self.arm_joint_names = self.get_parameter("arm_joint_names").value
+        self.gripper_joint_names = self.get_parameter("gripper_joint_names").value
+        self.arm_command_topic = self.get_parameter("arm_command_topic").value
+        self.gripper_command_topic = self.get_parameter("gripper_command_topic").value
 
         # Parse JSON parameters if provided as strings
         import json
-        device_config = json.loads(device_config_str) if isinstance(device_config_str, str) and device_config_str else {}
+
+        device_config = (
+            json.loads(device_config_str) if isinstance(device_config_str, str) and device_config_str else {}
+        )
         joint_limits = json.loads(joint_limits_str) if isinstance(joint_limits_str, str) and joint_limits_str else {}
 
         # Initialize device
-        self.device: Optional[BaseTeleopDevice] = None
+        self.device: BaseTeleopDevice | None = None
         self._device_lock = threading.Lock()
 
         try:
@@ -96,39 +98,25 @@ class TeleopNode(Node):
         self.safety_filter = SafetyFilter(joint_limits)
 
         # Publishers
-        self.arm_cmd_pub = self.create_publisher(
-            Float64MultiArray,
-            self.arm_command_topic,
-            10
-        )
+        self.arm_cmd_pub = self.create_publisher(Float64MultiArray, self.arm_command_topic, 10)
 
-        self.gripper_cmd_pub = self.create_publisher(
-            Float64MultiArray,
-            self.gripper_command_topic,
-            10
-        )
+        self.gripper_cmd_pub = self.create_publisher(Float64MultiArray, self.gripper_command_topic, 10)
 
-        self.diag_pub = self.create_publisher(
-            DiagnosticArray,
-            '/diagnostics',
-            10
-        )
+        self.diag_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
 
         # Emergency stop
         self.estop_active = False
         self.estop_sub = self.create_subscription(
             JointState,  # Using JointState as placeholder for Bool
-            '/emergency_stop',
+            "/emergency_stop",
             self.estop_callback,
-            10
+            10,
         )
 
         # Control loop timer
         timer_period = 1.0 / self.control_frequency  # seconds
         self.timer = self.create_timer(
-            timer_period,
-            self.control_loop_callback,
-            callback_group=MutuallyExclusiveCallbackGroup()
+            timer_period, self.control_loop_callback, callback_group=MutuallyExclusiveCallbackGroup()
         )
 
         # Diagnostics
@@ -137,9 +125,7 @@ class TeleopNode(Node):
         self.avg_loop_time = 0.0
         self.max_loop_time = 0.0
 
-        self.get_logger().info(
-            f"TeleopNode initialized at {self.control_frequency} Hz"
-        )
+        self.get_logger().info(f"TeleopNode initialized at {self.control_frequency} Hz")
 
     def control_loop_callback(self):
         """
@@ -177,8 +163,7 @@ class TeleopNode(Node):
             arm_msg.data = [safe_targets[name] for name in self.arm_joint_names]
             self.arm_cmd_pub.publish(arm_msg)
 
-        if self.gripper_joint_names and \
-                all(name in safe_targets for name in self.gripper_joint_names):
+        if self.gripper_joint_names and all(name in safe_targets for name in self.gripper_joint_names):
             gripper_msg = Float64MultiArray()
             gripper_msg.data = [safe_targets[name] for name in self.gripper_joint_names]
             self.gripper_cmd_pub.publish(gripper_msg)
@@ -216,16 +201,14 @@ class TeleopNode(Node):
             status = DiagnosticStatus()
             status.name = "robot_teleop"
             status.level = DiagnosticStatus.OK if self.avg_loop_time < 0.005 else DiagnosticStatus.WARN
-            status.message = f"Loop time: avg={self.avg_loop_time*1000:.2f}ms, max={self.max_loop_time*1000:.2f}ms"
+            status.message = f"Loop time: avg={self.avg_loop_time * 1000:.2f}ms, max={self.max_loop_time * 1000:.2f}ms"
 
             diag_msg.status.append(status)
             self.diag_pub.publish(diag_msg)
 
             # Log warning if latency high
             if self.avg_loop_time > 0.005:  # 5ms threshold
-                self.get_logger().warn(
-                    f"High latency detected: {self.avg_loop_time*1000:.2f}ms > 5ms"
-                )
+                self.get_logger().warn(f"High latency detected: {self.avg_loop_time * 1000:.2f}ms > 5ms")
 
     def destroy_node(self):
         """Clean up resources on node shutdown."""
@@ -253,6 +236,7 @@ def main(args=None):
         pass
     except Exception as e:
         import logging
+
         logger = logging.getLogger(__name__)
         logger.error(f"TeleopNode failed: {e}")
         raise
