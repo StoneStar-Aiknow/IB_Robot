@@ -40,8 +40,9 @@ license: MIT
 - 对此类 PR，review 过程中应检查 **PR 描述中的 Verification 是否由开发者提供**，且必须同时覆盖：
   - Ubuntu 22.04 纯净 Docker 环境中的 `setup.sh + build.sh` 完整验证
   - openEuler Embedded 纯净 Docker 环境中的 `setup.sh + build.sh` 完整验证
-- 审查者不应代替开发者运行 `ibrobot-docker-verify` 或 `ibrobot-docker-verify-oee` 来补齐 PR 描述；只有当用户明确要求“帮我实际验证/跑 Docker 验证”时，才调用对应验证 skill。
-- 如果 PR 描述缺少任一平台验证说明，或只给出命令但没有结果，或验证没有覆盖 setup/build 两个阶段，都应视为**阻塞性 review 问题**。
+- **review 默认只检查 PR 描述中由开发者声明的验证结果，禁止自动执行双平台 Docker 验证。**
+- “review / 审查 / 帮我看看 PR”本身不等于授权执行验证。禁止审查者代替开发者运行 `ibrobot-docker-verify` 或 `ibrobot-docker-verify-oee` 来补齐 PR 描述；只有当用户在当前请求中明确要求 agent 实际执行验证（例如“你来跑一下 Ubuntu/openEuler Docker 验证”“帮我实际验证 setup/build”）时，才调用对应验证 skill。
+- 如果 PR 描述缺少任一平台验证说明，或只给出命令但没有结果，或验证没有覆盖 setup/build 两个阶段，都应视为**阻塞性 review 问题**，要求开发者补充。
 
 ## ⚠️ 环境准备
 
@@ -155,7 +156,7 @@ python3 pr_review.py --pr 123
 - **不需要** `git fetch` 或 `git diff`
 - **不需要** 切换分支或修改本地代码
 - 直接读取 JSON 文件中的 `changed_files`、`commits` 和 `comments` 进行审查即可
-- 审查时要结合变更文件判断是否需要 README / 文档联动，以及是否触发双平台 Docker Verification 门禁
+- 审查时要结合变更文件判断是否需要 README / 文档联动，以及是否触发双平台 Docker Verification 门禁；触发门禁时默认只检查 PR 描述里的开发者验证声明，除非用户明确要求 agent 实际执行验证，否则不得调用 docker verification skills
 - 如果需要“回复某一条已有 review 意见”而不是提交新的审查结果，请切换到 `atomgit-review-resolution`，使用 `--reply-comment <comment_id>`；不要在本 skill 中伪造普通 PR 级评论。
 
 ### 提交审查结果
@@ -243,7 +244,7 @@ python3 pr_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_issues.json 
 - `atomgit-pr`: 创建 PR、同步标题/描述、获取 PR 管理上下文；**不负责**通用 review 判定
 - `atomgit-review-resolution`: 处理检视意见
 - `atomgit-pr-architecture-review`: 架构审查
-- `ibrobot-docker-verify`: Ubuntu 22.04 纯净容器 setup/build 验证
-- `ibrobot-docker-verify-oee`: openEuler Embedded 纯净容器 setup/build 验证
+- `ibrobot-docker-verify`: Ubuntu 22.04 纯净容器 setup/build 验证；review 默认不得调用，除非用户明确要求 agent 实际执行验证
+- `ibrobot-docker-verify-oee`: openEuler Embedded 纯净容器 setup/build 验证；review 默认不得调用，除非用户明确要求 agent 实际执行验证
 
 > **注意**: `atomgit-pr-architecture-review` 仍然是 **IB_Robot 专用** 的架构规范审查，不会随着本 skill 一起泛化到其他仓库。

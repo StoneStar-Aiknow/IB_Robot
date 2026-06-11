@@ -1,6 +1,6 @@
 ---
 name: ibrobot-docker-verify-oee
-description: "在 openEuler Embedded (aarch64) Docker 容器中端到端验证 setup.sh + build.sh。容器通过 chroot /root/openeuler_rootfs 进入 qemu-user 模拟的 arm64 环境，以 root 用户操作。Use when user wants to 'openEuler Docker 验证', 'oee container test', 'openEuler 容器测试', '验证 openEuler setup', 'aarch64 验证', or after modifying openEuler platform scripts to ensure changes work on emulated arm64 environment."
+description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setup.sh + build.sh。Use when the user explicitly asks for openEuler/OEE Docker verification, or when author-side PR creation/update workflows trigger the dependency/setup verification gate. Do not use automatically during PR review; review should check developer-provided Verification in the PR description."
 ---
 
 # IB-Robot openEuler Embedded Docker Verification Skill
@@ -15,17 +15,36 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中端到端验证 s
 
 ## When to Use
 
-- 修改了 `scripts/setup/platforms/openeuler-embedded-24.03.sh` 后
-- 修改了 `scripts/setup.sh` 中影响 dnf/rosdep 的逻辑后
-- 修改了 `scripts/setup/lerobot_patches.sh` 后
-- 用户要求 "openEuler Docker 验证" / "oee container test"
-- PR 合入前需要双平台验证时
+- 用户明确要求 "openEuler Docker 验证" / "oee container test" / "实际验证 openEuler setup/build"。
+- 作者侧创建/更新 PR 流程（`atomgit-pr` 或 `ibrobot-git-flow`）触发依赖/setup 验证门禁，需要真实结果写入 PR 描述。
+- 当前任务是验证本地对 `scripts/setup/platforms/openeuler-embedded-24.03.sh`、`scripts/setup.sh`、`scripts/setup/lerobot_patches.sh` 或 dnf/rosdep 相关逻辑的修改。
+- 不要仅因为 PR review 触发本 skill。
+
+## Review Boundary
+
+- PR review 过程中，禁止因为 PR 修改了 `package.xml`、`setup.py`、setup 脚本或 build 文件就自动运行本 skill。
+- 用户要求“review 这个 PR / 检查这个 PR 有没有问题”不等于授权运行 openEuler Docker 验证。
+- review 默认只检查 PR 描述中开发者声明的 openEuler Embedded Verification。如果缺少或不完整，应作为阻塞性 review 问题要求开发者补充。
+- 只有当用户在当前请求中明确要求 agent 实际执行 openEuler / 双平台 Docker setup/build 验证时，才运行本 skill。
 
 ## Prerequisites
 
 - Docker 已安装且当前用户有运行容器的权限
-- Docker 镜像可从华为 SWR 拉取：
-  `docker pull swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest`
+- **必须先检查验证镜像**，不能假设开发者本机已有该镜像；若本地不存在，或本地镜像创建时间距本次验证超过 30 天，则重新拉取：
+  ```bash
+  IMAGE=swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest
+  CREATED=$(docker image inspect "$IMAGE" --format '{{.Created}}' 2>/dev/null || true)
+  if [ -z "$CREATED" ]; then
+    docker pull "$IMAGE"
+  else
+    NOW=$(date +%s)
+    CREATED_TS=$(date -d "$CREATED" +%s)
+    AGE_DAYS=$(( (NOW - CREATED_TS) / 86400 ))
+    if [ "$AGE_DAYS" -gt 30 ]; then
+      docker pull "$IMAGE"
+    fi
+  fi
+  ```
 - 网络：可访问 `repo.openeuler.org`、`eur.openeuler.openatom.cn`、
   `eulermaker.compass-ci.openeuler.openatom.cn`、华为 pip 镜像、`gitcode.com`
 - IB-Robot workspace 中有待验证的修改
@@ -67,13 +86,36 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中端到端验证 s
 
 ## Procedure
 
+### Phase 0 — Ensure Required Image Is Fresh
+
+> **必须执行。** openEuler Embedded 验证不使用本地默认镜像名，也不假设镜像已预装。
+> 如果本地没有镜像，或镜像创建时间距本次验证超过 30 天，需要先从 SWR 重新拉取。
+> 通过 `date` 获取当前时间，通过 `docker image inspect --format '{{.Created}}'` 获取本地镜像创建时间。
+
+```bash
+IMAGE=swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest
+CREATED=$(docker image inspect "$IMAGE" --format '{{.Created}}' 2>/dev/null || true)
+
+if [ -z "$CREATED" ]; then
+  echo "Image not found locally, pulling: $IMAGE"
+  docker pull "$IMAGE"
+else
+  NOW=$(date +%s)
+  CREATED_TS=$(date -d "$CREATED" +%s)
+  AGE_DAYS=$(( (NOW - CREATED_TS) / 86400 ))
+  if [ "$AGE_DAYS" -gt 30 ]; then
+    echo "Image is ${AGE_DAYS} days old, refreshing: $IMAGE"
+    docker pull "$IMAGE"
+  else
+    echo "Using local image created ${AGE_DAYS} days ago: $IMAGE"
+  fi
+fi
+```
+
 ### Phase 1 — Start Container and Fix chroot Environment
 
 ```bash
-# 1.1 Pull the image
-docker pull swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest
-
-# 1.2 Start detached container (--entrypoint override to keep container alive)
+# 1.1 Start detached container (--entrypoint override to keep container alive)
 #     NOTE: The image's default entrypoint /bin/bash -l triggers auto-chroot
 #     via .bashrc on interactive login. For detached mode we override to
 #     keep the container running, then manually chroot as needed.
@@ -82,23 +124,23 @@ docker run -d --name verify-oee --privileged \
   swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest \
   -c "sleep infinity"
 
-# 1.3 Verify aarch64 emulation
+# 1.2 Verify aarch64 emulation
 docker exec verify-oee chroot /root/openeuler_rootfs uname -m
 # Expected: aarch64
 
-# 1.4 Fix DNS (rootfs has no /etc/resolv.conf)
+# 1.3 Fix DNS (rootfs has no /etc/resolv.conf)
 docker exec verify-oee bash -c \
   'rm -f /root/openeuler_rootfs/etc/resolv.conf && cp /etc/resolv.conf /root/openeuler_rootfs/etc/resolv.conf'
 
-# 1.5 Fix /var/log (symlink target missing in rootfs)
+# 1.4 Fix /var/log (symlink target missing in rootfs)
 docker exec verify-oee bash -c \
   'mkdir -p /root/openeuler_rootfs/var/volatile/log'
 
-# 1.6 Mount /proc and /sys for chroot compatibility
+# 1.5 Mount /proc and /sys for chroot compatibility
 docker exec verify-oee bash -c \
   'mount -t proc proc /root/openeuler_rootfs/proc 2>/dev/null; mount --bind /sys /root/openeuler_rootfs/sys 2>/dev/null'
 
-# 1.7 Fix git safe.directory for UID mismatch after docker cp
+# 1.6 Fix git safe.directory for UID mismatch after docker cp
 docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs git config --global --add safe.directory /root/IB_Robot
    chroot /root/openeuler_rootfs git config --global --add safe.directory /root/IB_Robot/libs/lerobot'

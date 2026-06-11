@@ -1,6 +1,6 @@
 ---
 name: ibrobot-docker-verify
-description: "Validate setup.sh + build.sh in a clean Ubuntu 22.04 Docker container. Use when user wants to 'docker verify', 'container test', 'validate setup', 'Docker 验证', '容器测试', '验证 setup', or after modifying setup.sh / platform scripts / verify_env.sh to ensure changes work on a fresh system."
+description: "Execute setup.sh + build.sh in a clean Ubuntu 22.04 Docker container. Use when the user explicitly asks for Docker/setup/build verification, or when author-side PR creation/update workflows trigger the dependency/setup verification gate. Do not use automatically during PR review; review should check developer-provided Verification in the PR description."
 ---
 
 # IB-Robot Docker Verification Skill
@@ -11,11 +11,26 @@ experience without requiring real hardware.
 
 ## When to Use
 
-- After modifying `scripts/setup.sh`, `scripts/setup/platforms/*.sh`,
-  `scripts/setup/verify_env.sh`, or `scripts/install_ros.sh`.
-- After changes that affect pip/apt dependency resolution.
-- Before merging PRs that touch the install/build pipeline.
-- User explicitly requests "Docker 验证" / "container test".
+- User explicitly requests "Docker 验证" / "container test" / "实际验证 setup/build".
+- An author-side PR creation/update workflow (`atomgit-pr` or `ibrobot-git-flow`)
+  triggers the dependency/setup verification gate and needs real results for the
+  PR description.
+- The current task is to validate local changes to `scripts/setup.sh`,
+  `scripts/setup/platforms/*.sh`, `scripts/setup/verify_env.sh`,
+  `scripts/install_ros.sh`, or pip/apt dependency resolution.
+- Do not infer this skill from PR review alone.
+
+## Review Boundary
+
+- During PR review, do **not** run this skill automatically just because a PR
+  touches `package.xml`, `setup.py`, setup scripts, or build files.
+- A user asking "review this PR" or "check whether this PR is OK" is not an
+  explicit request to run Docker verification.
+- PR review should inspect the developer-provided Verification section in the
+  PR description. If required Ubuntu verification is missing or incomplete,
+  raise a blocking review issue asking the developer to provide it.
+- Only run this skill in a review session when the user explicitly asks the
+  agent to perform the actual Ubuntu Docker setup/build verification.
 
 ## Prerequisites
 
