@@ -70,7 +70,7 @@ colcon build --packages-select lekiwi_hardware
 source install/setup.bash
 ```
 
-> 构建时会自动通过 CMake FetchContent 从 GitHub 拉取 [Feetech SDK](https://github.com/ftservo/FTServo_Linux.git)。
+> 构建时会自动通过 CMake FetchContent 从 Gitee 拉取 [Feetech SDK](https://gitee.com/ftservo/FTServo_Linux.git)。
 
 ### 2. 运行单元测试
 
@@ -81,7 +81,7 @@ colcon test-result --verbose
 
 包含 55 个 gtest 用例，覆盖坐标转换、符号位解码、回零偏移编码及往返一致性（见 `test/test_lekiwi_conversions.cpp`）。
 
-> 构建时会自动通过 CMake FetchContent 从 GitHub 拉取 [Feetech SDK](https://github.com/ftservo/FTServo_Linux.git)。
+> 构建时会自动通过 CMake FetchContent 从 Gitee 拉取 [Feetech SDK](https://gitee.com/ftservo/FTServo_Linux.git)。
 
 ### 2. 串口权限
 
@@ -252,7 +252,7 @@ ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_nav
 
 | 库 | 来源 | 用途 |
 |----|------|------|
-| Feetech SDK (FTServo_Linux) | GitHub FetchContent | SMS_STS 串口通信协议 |
+| Feetech SDK (FTServo_Linux) | Gitee FetchContent | SMS_STS 串口通信协议 |
 
 ## 常见问题
 
