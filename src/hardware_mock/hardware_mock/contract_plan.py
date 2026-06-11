@@ -212,6 +212,19 @@ def build_plan(robot: dict[str, Any]) -> MockPlan:
                     joint_names=list(joint_ids),
                 )
             )
+        elif msg_type == "ibrobot_msgs/msg/JointCurrent":
+            _validate_joint_rate(key, joint_state_rate_hz, align, skip_rate_check)
+            obs_specs.append(
+                ObservationSpec(
+                    key=key,
+                    topic=topic,
+                    msg_type=msg_type,
+                    rate_hz=joint_state_rate_hz,
+                    qos=qos,
+                    kind="joint_current",
+                    joint_names=list(joint_ids),
+                )
+            )
         else:  # pragma: no cover - guarded by ensure_publish_supported
             raise ValueError(f"unsupported observation type '{msg_type}'")
 

@@ -635,12 +635,15 @@ class RerunViewer(Node):
         - ``sensor_msgs/msg/JointState``: extracts ``position`` by joint name
         - ``std_msgs/msg/Float64MultiArray``: extracts ``data`` by index
         - ``sensor_msgs/msg/JointState`` with ``position.N`` selectors
+        - ``ibrobot_msgs/msg/JointCurrent`` with ``current.N`` selectors
         """
         if not names:
             return None
 
         if ros_type == "sensor_msgs/msg/JointState":
             return self._extract_joint_state(msg, names)
+        elif ros_type == "ibrobot_msgs/msg/JointCurrent":
+            return self._extract_joint_current(msg, names)
         elif "Float64MultiArray" in ros_type or "Float32MultiArray" in ros_type:
             return self._extract_multi_array(msg, names)
         else:
@@ -688,6 +691,22 @@ class RerunViewer(Node):
                         values.append(0.0)
                 else:
                     values.append(0.0)
+
+        return values if values else None
+
+    def _extract_joint_current(self, msg: Any, names: list[str]) -> list[float] | None:
+        """Extract values from JointCurrent using ``current.<name>`` selectors."""
+        values: list[float] = []
+        joint_names = list(getattr(msg, "name", []))
+        currents = list(getattr(msg, "current", []))
+
+        for sel_name in names:
+            key = sel_name.split(".", 1)[1] if sel_name.startswith("current.") else sel_name
+            if key in joint_names:
+                idx = joint_names.index(key)
+                values.append(float(currents[idx]) if idx < len(currents) else float("nan"))
+            else:
+                values.append(float("nan"))
 
         return values if values else None
 

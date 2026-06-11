@@ -14,6 +14,7 @@ from typing import Any
 SUPPORTED_PUBLISH_TYPES = (
     "sensor_msgs/msg/Image",
     "sensor_msgs/msg/JointState",
+    "ibrobot_msgs/msg/JointCurrent",
 )
 
 SUPPORTED_SUBSCRIBE_TYPES = ("std_msgs/msg/Float64MultiArray",)

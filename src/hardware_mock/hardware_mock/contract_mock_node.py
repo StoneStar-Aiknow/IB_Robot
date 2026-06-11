@@ -28,6 +28,7 @@ from rclpy.qos import (
     QoSProfile,
     ReliabilityPolicy,
 )
+from ibrobot_msgs.msg import JointCurrent
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Float64MultiArray
 
@@ -84,6 +85,7 @@ class ContractMockNode(Node):
 
         self._image_publishers: list = []
         self._joint_state_publishers: list = []
+        self._joint_current_publishers: list = []
         self._image_timers: list = []
         self._joint_state_timer = None
         self._action_subs: list = []
@@ -115,6 +117,11 @@ class ContractMockNode(Node):
                 # there is only one such topic in the contract.
                 self._joint_state_timer = self.create_timer(
                     period, lambda o=obs, p=pub: self._publish_joint_state(o, p)
+                )
+            elif obs.kind == "joint_current":
+                self._joint_current_publishers.append((obs, pub))
+                self.create_timer(
+                    period, lambda o=obs, p=pub: self._publish_joint_current(o, p)
                 )
 
     def _setup_subscribers(self) -> None:
@@ -159,6 +166,13 @@ class ContractMockNode(Node):
         msg.effort = [0.0] * len(msg.name)
         pub.publish(msg)
 
+    def _publish_joint_current(self, obs: ObservationSpec, pub) -> None:
+        msg = JointCurrent()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.name = list(obs.joint_names)
+        msg.current = [0.0] * len(msg.name)
+        pub.publish(msg)
+
     def _on_action(self, act: ActionSpec, msg: Float64MultiArray) -> None:
         data: list[float] = list(msg.data)
         expected = len(act.index_to_joint_index)
@@ -175,10 +189,12 @@ class ContractMockNode(Node):
         except (IndexError, ValueError) as exc:
             self.get_logger().error(f"action '{act.key}' rejected: {exc}")
             return
-        # Closed loop: republish joint_state immediately so consumers see the
-        # update without waiting for the next periodic tick.
+        # Closed loop: republish joint_state and joint_current immediately so
+        # consumers see the update without waiting for the next periodic tick.
         for obs, pub in self._joint_state_publishers:
             self._publish_joint_state(obs, pub)
+        for obs, pub in self._joint_current_publishers:
+            self._publish_joint_current(obs, pub)
 
 
 def main(args=None) -> None:

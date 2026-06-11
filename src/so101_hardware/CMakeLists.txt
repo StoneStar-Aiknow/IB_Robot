@@ -17,6 +17,7 @@ find_package(hardware_interface REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
+find_package(ibrobot_msgs REQUIRED)
 find_package(nlohmann_json REQUIRED)
 
 # ===== Fetch Feetech SDK via CMake =====
@@ -57,6 +58,7 @@ ament_target_dependencies(so101_hardware_interface
   pluginlib
   rclcpp
   rclcpp_lifecycle
+  ibrobot_msgs
 )
 
 # Pluginlib export
@@ -94,7 +96,7 @@ if(BUILD_TESTING)
   ament_add_gtest(test_so101_hardware test/test_so101_hardware.cpp)
   if(TARGET test_so101_hardware)
     target_link_libraries(test_so101_hardware so101_hardware_interface)
-    ament_target_dependencies(test_so101_hardware rclcpp hardware_interface)
+    ament_target_dependencies(test_so101_hardware rclcpp hardware_interface ibrobot_msgs)
   endif()
 
   ament_add_pytest_test(test_calibration_py test/test_calibration.py)
@@ -118,6 +120,6 @@ install(DIRECTORY include/
 
 ament_export_include_directories(include)
 ament_export_libraries(so101_hardware_interface ftservo_sdk)
-ament_export_dependencies(hardware_interface pluginlib rclcpp rclcpp_lifecycle)
+ament_export_dependencies(hardware_interface pluginlib rclcpp rclcpp_lifecycle ibrobot_msgs)
 
 ament_package()

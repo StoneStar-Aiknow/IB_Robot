@@ -36,6 +36,7 @@
                 <param name="initial_value">0.0</param>
             </command_interface>
             <state_interface name="position" />
+            <state_interface name="velocity" />
             <param name="id">1</param>
         </joint>
 
@@ -46,6 +47,7 @@
                 <param name="initial_value">0.0</param>
             </command_interface>
             <state_interface name="position" />
+            <state_interface name="velocity" />
             <param name="id">2</param>
         </joint>
 
@@ -56,6 +58,7 @@
                 <param name="initial_value">0.0</param>
             </command_interface>
             <state_interface name="position" />
+            <state_interface name="velocity" />
             <param name="id">3</param>
         </joint>
 
@@ -66,6 +69,7 @@
                 <param name="initial_value">0.0</param>
             </command_interface>
             <state_interface name="position" />
+            <state_interface name="velocity" />
             <param name="id">4</param>
         </joint>
         <joint name="5">
@@ -75,6 +79,7 @@
                 <param name="initial_value">0.0</param>
             </command_interface>
             <state_interface name="position" />
+            <state_interface name="velocity" />
             <param name="id">5</param>
         </joint>
 
@@ -85,6 +90,7 @@
                 <param name="initial_value">0.0</param>
             </command_interface>
             <state_interface name="position" />
+            <state_interface name="velocity" />
             <param name="id">6</param>
         </joint>
     </ros2_control>

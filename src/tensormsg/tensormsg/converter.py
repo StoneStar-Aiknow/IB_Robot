@@ -109,6 +109,28 @@ def _decode_via_names(msg, names: list[str]) -> np.ndarray:
     return np.asarray(out, dtype=np.float32)
 
 
+def _decode_name_value_fields(
+    msg: Any, names: list[str], value_field: str, prefix: str
+) -> np.ndarray:
+    values: list[float] = []
+    msg_names = list(getattr(msg, "name", []))
+    msg_values = list(getattr(msg, value_field, []))
+
+    for selector in names:
+        key = selector.split(".", 1)[1] if selector.startswith(f"{prefix}.") else selector
+        if key not in msg_names:
+            values.append(float("nan"))
+            continue
+
+        idx = msg_names.index(key)
+        if idx < len(msg_values):
+            values.append(float(msg_values[idx]))
+        else:
+            values.append(float("nan"))
+
+    return np.asarray(values, dtype=np.float32)
+
+
 def _fill_variant_from_tensor(variant_msg, vec: Tensor):
     if vec.dtype == torch.bool:
         variant_msg.type = "bool_array"
@@ -292,6 +314,13 @@ def _dec_joint_state(msg, spec):
     if spec and hasattr(spec, "names") and spec.names:
         return _decode_via_names(msg, spec.names)
     return np.asarray(msg.position, dtype=np.float32)
+
+
+@register_decoder("ibrobot_msgs/msg/JointCurrent")
+def _dec_joint_current(msg, spec):
+    if spec and hasattr(spec, "names") and spec.names:
+        return _decode_name_value_fields(msg, spec.names, "current", "current")
+    return np.asarray(msg.current, dtype=np.float32)
 
 
 @register_encoder("sensor_msgs/msg/JointState")

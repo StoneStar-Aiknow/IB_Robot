@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+from ibrobot_msgs.msg import JointCurrent
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
@@ -44,6 +45,7 @@ except ImportError:  # create stub
 from lerobot.motors.feetech.feetech import FeetechMotorsBus, OperatingMode
 from lerobot.motors import Motor, MotorNormMode, MotorCalibration
 from so101_hardware.calibration.interactive import load_calibration
+from so101_hardware.motor_current import read_motor_currents
 
 PORT_DEFAULT = "/dev/ttyACM0"
 
@@ -88,6 +90,7 @@ class MotorBridge(Node):
 
         # Publishers / Subscribers
         self.joint_states_pub = self.create_publisher(JointState, "so101_follower/joint_states", 10)
+        self.joint_currents_pub = self.create_publisher(JointCurrent, "/so101_follower/joint_currents", 10)
         self.joint_commands_sub = self.create_subscription(
             JointState,
             "so101_follower/joint_commands",
@@ -285,6 +288,18 @@ class MotorBridge(Node):
         except Exception as exc:
             self.get_logger().warn(f"sync_read failed: {exc}")
             return
+        if not raw_positions or len(raw_positions) != len(self.joint_names):
+            self.get_logger().warn(
+                f"sync_read incomplete: {len(raw_positions) if raw_positions else 0}/{len(self.joint_names)}",
+                throttle_duration_sec=5.0,
+            )
+            return
+        currents = read_motor_currents(
+            self.bus,
+            self.joint_names,
+            self.get_logger(),
+            "current sync_read failed",
+        )
 
         # Publish current joint states
         js = JointState()
@@ -298,6 +313,12 @@ class MotorBridge(Node):
             for n, raw in raw_positions.items()
         ]
         self.joint_states_pub.publish(js)
+
+        current_msg = JointCurrent()
+        current_msg.header.stamp = js.header.stamp
+        current_msg.name = list(js.name)
+        current_msg.current = [currents.get(n, 0.0) for n in current_msg.name]
+        self.joint_currents_pub.publish(current_msg)
 
     def _do_write(self):
         if self._home_offsets is None:

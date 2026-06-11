@@ -8,6 +8,35 @@
 
 namespace so101_hardware
 {
+namespace
+{
+
+constexpr u8 FEEDBACK_START_ADDR = SMS_STS_PRESENT_POSITION_L;
+constexpr u8 FEEDBACK_READ_LEN = SMS_STS_PRESENT_CURRENT_H - SMS_STS_PRESENT_POSITION_L + 1;
+constexpr u32 FEEDBACK_READ_TIMEOUT_MS = 20;
+constexpr double CURRENT_RAW_TO_AMPERE = 0.0065;
+
+struct FeedbackSample
+{
+  int position;
+  int speed;
+  int current;
+};
+
+FeedbackSample parse_feedback_packet(SMS_STS & sms_sts)
+{
+  FeedbackSample sample;
+  // syncReadPacketRx() must have just populated the SDK packet/index buffers.
+  sample.position = sms_sts.syncReadRxPacketToWrod();
+  // syncReadRxPacketToWrod(15) decodes 15-bit signed values per Feetech SDK
+  // convention; the SDK handles sign extension internally.
+  sample.speed = sms_sts.syncReadRxPacketToWrod(15);
+  sms_sts.syncReadRxPacketIndex = SMS_STS_PRESENT_CURRENT_L - FEEDBACK_START_ADDR;
+  sample.current = sms_sts.syncReadRxPacketToWrod(15);
+  return sample;
+}
+
+}  // namespace
 
 hardware_interface::CallbackReturn SO101SystemHardware::on_init(
   const hardware_interface::HardwareInfo & info)
@@ -21,6 +50,7 @@ hardware_interface::CallbackReturn SO101SystemHardware::on_init(
 
   hw_positions_.resize(info_.joints.size(), 0.0);
   hw_velocities_.resize(info_.joints.size(), 0.0);
+  hw_currents_.resize(info_.joints.size(), 0.0);
   hw_commands_.resize(info_.joints.size(), 0.0);
   motor_ids_.resize(info_.joints.size());
   target_positions_.resize(info_.joints.size(), 0);
@@ -176,19 +206,22 @@ hardware_interface::CallbackReturn SO101SystemHardware::on_activate(
     usleep(2000);
   }
 
-  // 2. Initialize sync read buffer (Reduced timeout to 10ms for stability)
-  sms_sts_.syncReadBegin(motor_ids_.size(), 2, 10);
+  // 2. Initialize sync read buffer for the extended position/speed/current frame.
+  sms_sts_.syncReadBegin(motor_ids_.size(), FEEDBACK_READ_LEN, FEEDBACK_READ_TIMEOUT_MS);
+  current_node_ = rclcpp::Node::make_shared("so101_joint_current_publisher");
+  current_pub_ = current_node_->create_publisher<ibrobot_msgs::msg::JointCurrent>("/so101_follower/joint_currents", 10);
 
   // Initial sync
-  if (sms_sts_.syncReadPacketTx(motor_ids_.data(), motor_ids_.size(), 56, 2) > 0)
+  if (sms_sts_.syncReadPacketTx(motor_ids_.data(), motor_ids_.size(), FEEDBACK_START_ADDR, FEEDBACK_READ_LEN) > 0)
   {
     for (size_t i = 0; i < motor_ids_.size(); i++)
     {
       u8 id = motor_ids_[i];
-      u8 data[2];
-      if (sms_sts_.syncReadPacketRx(id, data) == 2)
+      u8 data[FEEDBACK_READ_LEN];
+      if (sms_sts_.syncReadPacketRx(id, data) == FEEDBACK_READ_LEN)
       {
-        s16 pos = (data[1] << 8) | data[0];
+        const auto feedback = parse_feedback_packet(sms_sts_);
+        int pos = feedback.position;
         double rad = (static_cast<double>(pos) - 2048.0) / TICKS_PER_RAD;
         
         // Use reset position if specified, otherwise stay at current position
@@ -200,9 +233,12 @@ hardware_interface::CallbackReturn SO101SystemHardware::on_activate(
           RCLCPP_DEBUG(rclcpp::get_logger("SO101SystemHardware"), "Initial Sync ID %d: RAW=%d -> RAD=%.4f", id, pos, rad);
         }
         hw_positions_[i] = rad;
+        hw_velocities_[i] = static_cast<double>(feedback.speed) / TICKS_PER_RAD;
+        hw_currents_[i] = static_cast<double>(feedback.current) * CURRENT_RAW_TO_AMPERE;
       }
     }
   }
+  publish_currents(current_node_->get_clock()->now());
 
   RCLCPP_INFO(rclcpp::get_logger("SO101SystemHardware"), "Activated! Control loop running.");
   return hardware_interface::CallbackReturn::SUCCESS;
@@ -219,15 +255,18 @@ hardware_interface::CallbackReturn SO101SystemHardware::on_deactivate(
   usleep(100000);
   sms_sts_.syncReadEnd();
   sms_sts_.end();
+  current_pub_.reset();
+  current_node_.reset();
   return hardware_interface::CallbackReturn::SUCCESS;
 }
 
 hardware_interface::return_type SO101SystemHardware::read(
-  const rclcpp::Time &, const rclcpp::Duration &)
+  const rclcpp::Time & time, const rclcpp::Duration &)
 {
   static rclcpp::Clock steady_clock(RCL_STEADY_TIME);
 
-  int read_len = sms_sts_.syncReadPacketTx(motor_ids_.data(), motor_ids_.size(), 56, 2);
+  int read_len = sms_sts_.syncReadPacketTx(
+    motor_ids_.data(), motor_ids_.size(), FEEDBACK_START_ADDR, FEEDBACK_READ_LEN);
   if (read_len <= 0) {
     RCLCPP_WARN_THROTTLE(rclcpp::get_logger("SO101SystemHardware"), steady_clock, 500, "SyncRead PacketTx FAILED");
     return hardware_interface::return_type::OK;
@@ -237,14 +276,36 @@ hardware_interface::return_type SO101SystemHardware::read(
 
   for (size_t i = 0; i < motor_ids_.size(); i++)
   {
-    u8 data[2];
-    if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) == 2)
+    u8 data[FEEDBACK_READ_LEN];
+    if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) == FEEDBACK_READ_LEN)
     {
-      s16 pos = (data[1] << 8) | data[0];
-      hw_positions_[i] = (static_cast<double>(pos) - 2048.0) / TICKS_PER_RAD;
+      const auto feedback = parse_feedback_packet(sms_sts_);
+
+      hw_positions_[i] = (static_cast<double>(feedback.position) - 2048.0) / TICKS_PER_RAD;
+      hw_velocities_[i] = static_cast<double>(feedback.speed) / TICKS_PER_RAD;
+      hw_currents_[i] = static_cast<double>(feedback.current) * CURRENT_RAW_TO_AMPERE;
     }
   }
+  publish_currents(time);
   return hardware_interface::return_type::OK;
+}
+
+void SO101SystemHardware::publish_currents(const rclcpp::Time & stamp)
+{
+  if (!current_pub_) {
+    return;
+  }
+
+  ibrobot_msgs::msg::JointCurrent msg;
+  msg.header.stamp = stamp;
+  msg.name.reserve(info_.joints.size());
+  msg.current.reserve(hw_currents_.size());
+  for (size_t i = 0; i < info_.joints.size(); i++)
+  {
+    msg.name.push_back(info_.joints[i].name);
+    msg.current.push_back(hw_currents_[i]);
+  }
+  current_pub_->publish(msg);
 }
 
 hardware_interface::return_type SO101SystemHardware::write(

@@ -114,6 +114,11 @@ robot:
         peripheral: top  # 引用上面的相机
         image:
           resize: [480, 640]
+      - key: observation.current
+        topic: /so101_follower/joint_currents
+        type: ibrobot_msgs/msg/JointCurrent
+        selector:
+          names: ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"]
 ```
 
 ## 控制模式配置

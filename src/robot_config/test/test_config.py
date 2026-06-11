@@ -105,6 +105,22 @@ def test_dict_contract_builder_matches_typed_contract_shape():
     assert dict_contract.tasks == typed_contract.tasks
 
 
+def test_so101_single_arm_contract_includes_motor_current_observation():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+
+    if not config_path.exists():
+        pytest.skip(f"Config file not found: {config_path}")
+
+    contract = build_contract_from_robot_config_dict(load_robot_config_dict(config_path))
+    current_obs = next(obs for obs in contract.observations if obs.key == "observation.current")
+
+    assert current_obs.topic == "/so101_follower/joint_currents"
+    assert current_obs.type == "ibrobot_msgs/msg/JointCurrent"
+    assert current_obs.selector == {
+        "names": ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"]
+    }
+
+
 def test_dict_contract_builder_uses_camera_defaults_for_missing_resize():
     contract = build_contract_from_robot_config_dict(
         {

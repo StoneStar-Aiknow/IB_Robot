@@ -1,24 +1,24 @@
 from setuptools import find_packages, setup
 
-package_name = 'model_utils'
+package_name = "model_utils"
 
 setup(
     name=package_name,
-    version='0.0.0',
-    packages=find_packages(exclude=['test']),
+    version="0.0.0",
+    packages=find_packages(exclude=["test"]),
     data_files=[
-        ('share/ament_index/resource_index/packages',
-            ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
+        ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
+        ("share/" + package_name, ["package.xml"]),
     ],
-    install_requires=['setuptools', 'onnx', 'onnxsim', 'torch', 'tqdm'],
+    install_requires=["setuptools", "onnx", "onnxsim", "torch", "torchvision", "tqdm", "Pillow"],
     zip_safe=True,
-    maintainer='lwh',
-    maintainer_email='liuweihong8@huawei.com',
-    description='Model utilities for exporting and comparing ONNX models',
-    license='Apache-2.0',
+    maintainer="lwh",
+    maintainer_email="liuweihong8@huawei.com",
+    description="Model utilities for exporting and comparing ONNX models",
+    license="Apache-2.0",
     entry_points={
-        'console_scripts': [
+        "console_scripts": [
+            "frame_inspect = model_utils.frame_inspect:main",
         ],
     },
 )

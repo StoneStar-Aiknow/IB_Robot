@@ -27,6 +27,9 @@ DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
 DEFAULT_LEADER_PUBLISH_RATE = 50.0  # Hz
 DEFAULT_CONTROL_RATE = 100.0  # Hz
 
+# STS3215 Present_Current raw unit conversion: 1 LSB = 6.5 mA.
+CURRENT_RAW_TO_AMPERE = 0.0065
+
 # Default motor configurations
 DEFAULT_MOTOR_CONFIGS: Dict[str, Dict] = {
     "1": {"model": "sts3215", "mode": "RANGE_M100_100"},
