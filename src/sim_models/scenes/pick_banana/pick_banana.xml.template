@@ -7,12 +7,13 @@
                             is stripped so the file works standalone in MuJoCo Viewer.
       {{MESHES_DIR}}      — absolute path to this scene's meshes/ directory.
 
-    Object parameters (positions, scales, physics) match so101_full_scene.xml exactly.
+    Object parameters (lighting, banana scale, contact/friction) are independently
+    tuned for the pick_banana workflow and may differ from so101_full_scene.xml.
   -->
   <include file="{{ROBOT_XML_PATH}}"/>
 
   <visual>
-    <headlight diffuse="0.15 0.15 0.15" ambient="0.6 0.6 0.6" specular="0.0 0.0 0.0"/>
+    <headlight diffuse="0.14 0.14 0.14" ambient="0.425 0.425 0.425" specular="0.0 0.0 0.0"/>
     <quality shadowsize="2048"/>
     <rgba haze="0.15 0.25 0.35 1.0"/>
     <global azimuth="160" elevation="-20"/>
@@ -26,8 +27,8 @@
              width="300" height="300"/>
     <material name="groundplane" texture="groundplane" texuniform="true"
               texrepeat="5 5" reflectance="0.2"/>
-    <material name="mat_bluetable" specular="0.05" shininess="0.01"/>
-    <material name="mat_plate" specular="0.1" shininess="0.02"/>
+    <material name="mat_bluetable" specular="0.04" shininess="0.01"/>
+    <material name="mat_plate" specular="0.02" shininess="0.003"/>
     <mesh name="bluetable_mesh"    file="{{MESHES_DIR}}/bluetable.obj"      scale="0.156 0.156 0.156"/>
     <mesh name="green_curten_mesh" file="{{MESHES_DIR}}/greencurten_mj.obj" scale="0.15 0.15 0.15"/>
     <mesh name="plate_mesh"        file="{{MESHES_DIR}}/plate.obj"              scale="0.09539 0.09539 0.09539"/>
@@ -42,35 +43,35 @@
     <mesh name="plate_col_5" file="{{MESHES_DIR}}/plate_col_5.stl" scale="1 1 1"/>
     <mesh name="plate_col_6" file="{{MESHES_DIR}}/plate_col_6.stl" scale="1 1 1"/>
     <mesh name="plate_col_7" file="{{MESHES_DIR}}/plate_col_7.stl" scale="1 1 1"/>
-    <mesh name="banana_mesh"       file="{{MESHES_DIR}}/banana_g.obj"         scale="1 1 1"/>
+    <mesh name="banana_mesh"       file="{{MESHES_DIR}}/banana_g.obj"         scale="0.9 0.9 0.9"/>
     <!-- CoACD convex decomposition: 4 convex hulls approximating the C-shaped banana.
          Generated offline with CoACD (threshold=0.04, max_convex_hull=6). -->
-    <mesh name="banana_col_0" file="{{MESHES_DIR}}/banana_col_0.stl" scale="1 1 1"/>
-    <mesh name="banana_col_1" file="{{MESHES_DIR}}/banana_col_1.stl" scale="1 1 1"/>
-    <mesh name="banana_col_2" file="{{MESHES_DIR}}/banana_col_2.stl" scale="1 1 1"/>
-    <mesh name="banana_col_3" file="{{MESHES_DIR}}/banana_col_3.stl" scale="1 1 1"/>
+    <mesh name="banana_col_0" file="{{MESHES_DIR}}/banana_col_0.stl" scale="0.9 0.9 0.9"/>
+    <mesh name="banana_col_1" file="{{MESHES_DIR}}/banana_col_1.stl" scale="0.9 0.9 0.9"/>
+    <mesh name="banana_col_2" file="{{MESHES_DIR}}/banana_col_2.stl" scale="0.9 0.9 0.9"/>
+    <mesh name="banana_col_3" file="{{MESHES_DIR}}/banana_col_3.stl" scale="0.9 0.9 0.9"/>
   </asset>
 
   <default>
     <!--
       banana_col: contact parameters shared by all 4 CoACD hull pieces.
       Change friction here to update all pieces at once.
-      friction="50.0 1.0 0.05": 50.0=sliding, 1.0=torsional, 0.05=rolling.
-      Effective gripper-banana sliding = min(banana_col.F=50.0, gripper_col.F=10.0) = 10.0;
-      gripper_col is the bottleneck — raise gripper_col.F in so101.xml.template to increase grip.
+      friction="1.0 1.0 0.05": 1.0=sliding, 1.0=torsional, 0.05=rolling.
+      Effective gripper-banana sliding = min(banana_col.F=1.0, gripper_col.F=10.0) = 1.0;
+      banana_col is the bottleneck, keeping accidental teleop contact from sticking.
       solref="0.006 1": slightly softer than gripper (0.004) → cushions impact impulse.
       margin/gap: contact generated 1 mm early; force-free zone 1→0.5 mm.
     -->
     <default class="banana_col">
       <geom contype="1" conaffinity="1" group="0" rgba="0 0 0 0" type="mesh"
-            friction="50.0 1.0 0.05" condim="4"
+            friction="1.0 1.0 0.05" condim="4"
             solimp="0.99 0.999 0.005 0.5 2" solref="0.006 1"
             margin="0.001" gap="0.0005"/>
     </default>
   </default>
 
   <worldbody>
-    <light pos="1.0 1.0 3.5" dir="-0.2 -0.2 -1.0" directional="true" diffuse="0.4 0.4 0.4"/>
+    <light pos="1.0 1.0 3.5" dir="-0.2 -0.2 -1.0" directional="true" castshadow="false" diffuse="0.32 0.32 0.32"/>
     <geom name="floor" size="0 0 0.05" pos="0 0 -0.411" type="plane" material="groundplane"/>
     <!--
       table_surface: effectively rigid (solref="0.004 1", tighter than banana's 0.006).
@@ -82,7 +83,7 @@
           solimp="0.99 0.999 0.001 0.5 2" solref="0.004 1"/>
 
     <body name="bluetable" pos="0.000000 0.000000 -0.321000" euler="1.570796 0.000000 0.000000">
-      <geom type="mesh" mesh="bluetable_mesh" rgba="0.2000 0.3000 0.6500 1.0000"
+      <geom type="mesh" mesh="bluetable_mesh" rgba="0.1700 0.3100 0.6400 1.0000"
             contype="0" conaffinity="0" group="1" material="mat_bluetable"/>
     </body>
 
@@ -105,7 +106,7 @@
            Thin-disk approximation: r=0.094m, m=0.2kg. -->
       <inertial pos="0 -0.007 0" mass="0.2"
                 diaginertia="0.000447 0.000884 0.000447"/>
-      <geom type="mesh" mesh="plate_mesh" rgba="0.9200 0.9000 0.8500 1.0000"
+      <geom type="mesh" mesh="plate_mesh" rgba="0.8300 1.0000 0.9200 1.0000"
             contype="0" conaffinity="0" group="1" material="mat_plate"
             friction="1.0 0.01 0.001" condim="4" mass="0"
             solimp="0.99 0.999 0.0005 0.5 2" solref="0.004 2"/>
@@ -149,19 +150,20 @@
           gravcomp="0">
       <!--
         banana_g.obj: z-up mesh, no rotation needed (euler="0 0 0").
-        BBox: x:-0.1021..+0.0729, y:-0.0615..+0.0347, z:0.0002..0.0350 (17.5cm long).
+        Meshes are scaled to 0.9 to match the physical banana used for capture.
+        BBox after scale: approximately 15.8cm long.
         spawn z=0.05: drops under gravity onto table_surface at z=0.
         mass=0.03 kg (30g hollow foam plastic banana).
         damping=0.001: minimal viscous damping; preserves free rotation without contact-induced lock.
       -->
       <joint name="banana_free" type="free" damping="0.001"/>
-      <geom type="mesh" mesh="banana_mesh" rgba="0.9600  0.8500 0.1000 1.0000"
+      <geom type="mesh" mesh="banana_mesh" rgba="0.9300 1.0000 0.1900 1.0000"
             contype="0" conaffinity="0" group="1" mass="0"/>
       <!-- CoACD convex decomposition: 4 convex hulls covering the C-shaped banana.
            Mass distributed by volume fraction (total 0.03 kg = 30g).
            friction: see <default class="banana_col"> above — change there, not per-geom.
-           Effective gripper-banana sliding = min(banana_col.F=50.0, gripper_col.F=10.0) = 10.0.
-           Against table/plate: sliding=min(banana_col.F=50.0, table_default=1.0) = 1.0.
+           Effective gripper-banana sliding = min(banana_col.F=1.0, gripper_col.F=10.0) = 1.0.
+           Against table/plate: sliding=min(banana_col.F=1.0, table/plate.F=1.0) = 1.0.
            solimp/solref: solref=0.006 slightly softer than gripper to cushion impact.
            margin=0.001 gap=0.0005: contact constraint generated 1mm early (solver warm-start);
            force-free zone from 1mm to 0.5mm, force onset from 0.5mm → smooth landing. -->

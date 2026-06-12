@@ -50,6 +50,7 @@ setup(
     entry_points={
         "console_scripts": [
             "sim_camera_adjuster = sim_models.sim_camera_adjuster:main",
+            "pick_banana_task_node = sim_models.tasks.pick_banana:main",
         ],
     },
 )
