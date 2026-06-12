@@ -122,7 +122,6 @@ from robot_config.launch_builders.tracing import (
     DEFAULT_TRACE_SESSION_NAME,
     generate_tracing_actions,
 )
-from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
 from robot_config.loader import load_robot_config_dict
 from robot_config.logger_utils import get_colored_logger
 
@@ -530,6 +529,8 @@ def launch_setup(context, *args, **kwargs):
         logger.info("use_mock=true: skipping voice ASR nodes (out of mock scope)")
     else:
         try:
+            from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
+
             voice_asr_nodes = generate_voice_asr_nodes(robot_config)
             actions.extend(voice_asr_nodes)
             if voice_asr_nodes:

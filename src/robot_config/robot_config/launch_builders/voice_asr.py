@@ -7,17 +7,34 @@ from launch_ros.actions import Node
 
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import resolve_ros_path
-from voice_asr_service.defaults import VOICE_ASR_DEFAULTS
-from voice_asr_service.model_manager import (
-    STREAMING_ZH_BUNDLE,
-    default_model_root,
-    infer_model_bundle,
-    infer_model_bundle_from_path_hint,
-)
 
 logger = get_colored_logger("robot_config.voice_asr")
 _VOICE_ASR_REPO_ROOT = Path(__file__).resolve().parents[4]
 _VOICE_ASR_REALTIME_MODES = {"continuous", "wake_word"}
+_VOICE_ASR_MISSING_ERROR = "voice_asr.enabled=true requires the voice_asr_service package to be installed"
+
+
+def _load_voice_asr_service():
+    try:
+        from voice_asr_service.defaults import VOICE_ASR_DEFAULTS
+        from voice_asr_service.model_manager import (
+            STREAMING_ZH_BUNDLE,
+            default_model_root,
+            infer_model_bundle,
+            infer_model_bundle_from_path_hint,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.startswith("voice_asr_service"):
+            raise ModuleNotFoundError(_VOICE_ASR_MISSING_ERROR) from exc
+        raise
+
+    return (
+        VOICE_ASR_DEFAULTS,
+        STREAMING_ZH_BUNDLE,
+        default_model_root,
+        infer_model_bundle,
+        infer_model_bundle_from_path_hint,
+    )
 
 
 def default_voice_asr_model_path(
@@ -25,6 +42,7 @@ def default_voice_asr_model_path(
     active_mode: str = "manual",
     language: str = "zh",
 ) -> str:
+    _, _, default_model_root, infer_model_bundle, _ = _load_voice_asr_service()
     bundle = infer_model_bundle(
         model_path="",
         model_type=model_type,
@@ -70,15 +88,13 @@ def _voice_asr_tokens_path(model_path: str, tokens_path: str) -> Path:
 
 def _voice_asr_has_streaming_artifacts(model_path: str) -> bool:
     model_dir = _voice_asr_model_dir(model_path)
-    return all(
-        any(model_dir.glob(pattern))
-        for pattern in ("encoder*.onnx", "decoder*.onnx", "joiner*.onnx")
-    )
+    return all(any(model_dir.glob(pattern)) for pattern in ("encoder*.onnx", "decoder*.onnx", "joiner*.onnx"))
 
 
 def _voice_asr_has_streaming_hint(model_path: str) -> bool:
+    _, streaming_zh_bundle, _, _, infer_model_bundle_from_path_hint = _load_voice_asr_service()
     hinted_bundle = infer_model_bundle_from_path_hint(model_path)
-    return hinted_bundle is not None and hinted_bundle.profile == STREAMING_ZH_BUNDLE.profile
+    return hinted_bundle is not None and hinted_bundle.profile == streaming_zh_bundle.profile
 
 
 def validate_voice_asr_model_config(
@@ -108,9 +124,7 @@ def validate_voice_asr_model_config(
 
     onnx_files = _voice_asr_onnx_files(model_path)
     if not onnx_files:
-        errors.append(
-            f"Voice ASR model path does not contain any .onnx files: {resolved_model_path}"
-        )
+        errors.append(f"Voice ASR model path does not contain any .onnx files: {resolved_model_path}")
 
     resolved_tokens_path = _voice_asr_tokens_path(model_path, tokens_path)
     if not resolved_tokens_path.exists():
@@ -118,8 +132,7 @@ def validate_voice_asr_model_config(
 
     needs_streaming_layout = require_streaming or model_type == "streaming"
     if needs_streaming_layout and not (
-        _voice_asr_has_streaming_artifacts(model_path)
-        or _voice_asr_has_streaming_hint(model_path)
+        _voice_asr_has_streaming_artifacts(model_path) or _voice_asr_has_streaming_hint(model_path)
     ):
         errors.append(
             "Voice ASR realtime streaming requires either encoder/decoder/joiner ONNX files "
@@ -136,9 +149,11 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
         logger.info("Voice ASR disabled, skipping")
         return []
 
+    voice_asr_defaults, _, _, _, _ = _load_voice_asr_service()
+
     model_path = voice_asr_config.get("model_path", "")
     tokens_path = voice_asr_config.get("tokens_path", "")
-    auto_download_model = voice_asr_config.get("auto_download_model", VOICE_ASR_DEFAULTS["auto_download_model"])
+    auto_download_model = voice_asr_config.get("auto_download_model", voice_asr_defaults["auto_download_model"])
 
     if not model_path and auto_download_model:
         model_path = default_voice_asr_model_path(
@@ -167,27 +182,27 @@ def generate_voice_asr_nodes(robot_config: dict[str, Any]) -> list[Node]:
     node_params = {
         "auto_download_model": auto_download_model,
         "active_mode": active_mode,
-        "language": voice_asr_config.get("language", VOICE_ASR_DEFAULTS["language"]),
+        "language": voice_asr_config.get("language", voice_asr_defaults["language"]),
         "model_path": resolved_model_path,
         "tokens_path": resolved_tokens_path,
-        "provider": voice_asr_config.get("provider", VOICE_ASR_DEFAULTS["provider"]),
-        "model_type": voice_asr_config.get("model_type", VOICE_ASR_DEFAULTS["model_type"]),
+        "provider": voice_asr_config.get("provider", voice_asr_defaults["provider"]),
+        "model_type": voice_asr_config.get("model_type", voice_asr_defaults["model_type"]),
         "max_recording_duration": voice_asr_config.get(
-            "max_recording_duration", VOICE_ASR_DEFAULTS["max_recording_duration"]
+            "max_recording_duration", voice_asr_defaults["max_recording_duration"]
         ),
-        "vad_sensitivity": voice_asr_config.get("vad_sensitivity", VOICE_ASR_DEFAULTS["vad_sensitivity"]),
+        "vad_sensitivity": voice_asr_config.get("vad_sensitivity", voice_asr_defaults["vad_sensitivity"]),
         "realtime_pre_roll_seconds": voice_asr_config.get(
-            "realtime_pre_roll_seconds", VOICE_ASR_DEFAULTS["realtime_pre_roll_seconds"]
+            "realtime_pre_roll_seconds", voice_asr_defaults["realtime_pre_roll_seconds"]
         ),
-        "publish_partial": voice_asr_config.get("publish_partial", VOICE_ASR_DEFAULTS["publish_partial"]),
-        "output_topic": voice_asr_config.get("output_topic", VOICE_ASR_DEFAULTS["output_topic"]),
-        "sample_rate": voice_asr_config.get("sample_rate", VOICE_ASR_DEFAULTS["sample_rate"]),
-        "chunk_size": voice_asr_config.get("chunk_size", VOICE_ASR_DEFAULTS["chunk_size"]),
-        "buffer_seconds": voice_asr_config.get("buffer_seconds", VOICE_ASR_DEFAULTS["buffer_seconds"]),
-        "device_index": voice_asr_config.get("device_index", VOICE_ASR_DEFAULTS["device_index"]),
-        "device_name": voice_asr_config.get("device_name", VOICE_ASR_DEFAULTS["device_name"]),
+        "publish_partial": voice_asr_config.get("publish_partial", voice_asr_defaults["publish_partial"]),
+        "output_topic": voice_asr_config.get("output_topic", voice_asr_defaults["output_topic"]),
+        "sample_rate": voice_asr_config.get("sample_rate", voice_asr_defaults["sample_rate"]),
+        "chunk_size": voice_asr_config.get("chunk_size", voice_asr_defaults["chunk_size"]),
+        "buffer_seconds": voice_asr_config.get("buffer_seconds", voice_asr_defaults["buffer_seconds"]),
+        "device_index": voice_asr_config.get("device_index", voice_asr_defaults["device_index"]),
+        "device_name": voice_asr_config.get("device_name", voice_asr_defaults["device_name"]),
         "exit_on_init_failure": voice_asr_config.get(
-            "exit_on_init_failure", VOICE_ASR_DEFAULTS["exit_on_init_failure"]
+            "exit_on_init_failure", voice_asr_defaults["exit_on_init_failure"]
         ),
     }
 

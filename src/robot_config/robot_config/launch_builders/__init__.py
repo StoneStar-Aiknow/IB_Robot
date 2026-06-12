@@ -32,7 +32,15 @@ from robot_config.launch_builders.perception import (
     generate_virtual_camera_relays,
 )
 from robot_config.launch_builders.simulation import generate_gazebo_nodes
-from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
+
+
+def __getattr__(name: str):
+    if name == "generate_voice_asr_nodes":
+        from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
+
+        return generate_voice_asr_nodes
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # Description
