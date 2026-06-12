@@ -30,6 +30,7 @@
   <exec_depend>cv_bridge</exec_depend>
   <depend>voice_asr_service</depend>
   <exec_depend>embodied_agent</exec_depend>
+  <exec_depend>embodied_common</exec_depend>
   <exec_depend>skill_library</exec_depend>
   <exec_depend>safety_guard</exec_depend>
   <exec_depend>vlm_task_planner</exec_depend>
