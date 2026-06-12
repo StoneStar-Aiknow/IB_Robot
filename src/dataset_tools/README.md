@@ -329,12 +329,9 @@ ros2 run dataset_tools camera_isp_calibrator \
 **保存生效**：保存后下次 `robot.launch.py` 启动时，`perception.py` 会自动
 读取 override 并覆盖 YAML 默认值；删除 JSON 即可回退。
 
-详细算法说明：见 `临时/camera_isp_plan.md` §Phase 2。
-
 #### 5.1 统一 K/C/Sat 色彩搜索（实验性，独立模块）
 
-模块 `dataset_tools/camera_isp/color_search.py` 实现了
-`临时/camera_isp_unified_color_search_plan.md` v4 的统一搜索路径，
+模块 `dataset_tools/camera_isp/color_search.py` 实现了统一 K/C/Sat 搜索路径，
 **与既有 4 阶段流水线（曝光/增益/亮度/锐度）并行存在，不修改任何曝光相关代码**。
 旧 `solver` / `hw_pipeline` 全部保留作为初值估计器与失败回退。
 

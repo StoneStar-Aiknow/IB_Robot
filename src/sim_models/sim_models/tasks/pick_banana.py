@@ -63,8 +63,8 @@ class ShadowSim:
         self._lock = threading.Lock()
         self._running = True
         self._dt = float(self._model.opt.timestep)
-        t = threading.Thread(target=self._loop, daemon=True)
-        t.start()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
     def reset_to_keyframe(self, name: str) -> bool:
         kid = _mujoco.mj_name2id(self._model, _mujoco.mjtObj.mjOBJ_KEY, name)
@@ -94,6 +94,7 @@ class ShadowSim:
 
     def shutdown(self) -> None:
         self._running = False
+        self._thread.join(timeout=1.0)
 
     def _loop(self) -> None:
         while self._running:
@@ -215,6 +216,7 @@ class PickBananaTask(SceneTask):
     def evaluate(self, duration_s: float = 30.0) -> EvalResult:
         t0 = time.monotonic()
         banana_final = [0.0, 0.0, 0.0]
+        start_dist_xy: float | None = None
 
         while (time.monotonic() - t0) < duration_s:
             if self._shadow is not None:
@@ -222,6 +224,8 @@ class PickBananaTask(SceneTask):
                 if pos is not None:
                     banana_final = pos.tolist()
                     dist_xy = float(np.linalg.norm(pos[:2] - _PLATE_XY))
+                    if start_dist_xy is None:
+                        start_dist_xy = dist_xy
                     if pos[2] < _FELL_OFF_Z or dist_xy > _FLEW_OUT_RADIUS_M:
                         return EvalResult(
                             success=False,
@@ -229,10 +233,10 @@ class PickBananaTask(SceneTask):
                             banana_final_pos=banana_final,
                             duration_s=time.monotonic() - t0,
                         )
-                    if dist_xy < _SUCCESS_RADIUS_M:
+                    if start_dist_xy >= _SUCCESS_RADIUS_M and dist_xy < _SUCCESS_RADIUS_M:
                         return EvalResult(
                             success=True,
-                            reason="contact",
+                            reason="placed_on_plate",
                             banana_final_pos=banana_final,
                             duration_s=time.monotonic() - t0,
                         )
@@ -307,60 +311,64 @@ class PickBananaTask(SceneTask):
     # ── AutoTest loop ─────────────────────────────────────────────────────────
 
     def _run_autotest(self) -> None:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = self._eval_root / timestamp
-        run_dir.mkdir(parents=True, exist_ok=True)
-        results_path = run_dir / "results.jsonl"
-        summary_path = run_dir / "summary.yaml"
-
         log = self._node.get_logger()
-        log.info(f"AutoTest: saving to {run_dir}")
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            run_dir = self._eval_root / timestamp
+            run_dir.mkdir(parents=True, exist_ok=True)
+            results_path = run_dir / "results.jsonl"
+            summary_path = run_dir / "summary.yaml"
 
-        passed = 0
-        total = self._n_keyframes
+            log.info(f"AutoTest: saving to {run_dir}")
 
-        with results_path.open("w") as fh:
-            for i in range(total):
-                # Clean episode: pause → reposition (no snap) → settle → resume.
-                ok, _ = self._clean_world_reset(randomize=True, resume=True, settle_s=1.5)
-                if not ok:
-                    log.warning(f"AutoTest {i}: random_set failed, skipping")
-                    continue
+            passed = 0
+            total = self._n_keyframes
 
-                result = self.evaluate(duration_s=30.0)
-                if result.success:
-                    passed += 1
+            with results_path.open("w") as fh:
+                for i in range(total):
+                    # Clean episode: pause → reposition (no snap) → settle → resume.
+                    ok, _ = self._clean_world_reset(randomize=True, resume=True, settle_s=1.5)
+                    if not ok:
+                        log.warning(f"AutoTest {i}: random_set failed, skipping")
+                        continue
 
-                record = {
-                    "idx": i,
-                    "keyframe": f"random_{self._kf_idx:03d}",
-                    "success": result.success,
-                    "reason": result.reason,
-                    "banana_final_pos": result.banana_final_pos,
-                    "duration_s": round(result.duration_s, 2),
-                }
-                fh.write(json.dumps(record) + "\n")
-                fh.flush()
+                    result = self.evaluate(duration_s=30.0)
+                    if result.success:
+                        passed += 1
 
-                sym = "✓" if result.success else "✗"
-                log.info(f"AutoTest {i + 1}/{total} {sym} {result.reason} ({result.duration_s:.1f}s)")
+                    record = {
+                        "idx": i,
+                        "keyframe": f"random_{self._kf_idx:03d}",
+                        "success": result.success,
+                        "reason": result.reason,
+                        "banana_final_pos": result.banana_final_pos,
+                        "duration_s": round(result.duration_s, 2),
+                    }
+                    fh.write(json.dumps(record) + "\n")
+                    fh.flush()
 
-        # Leave the robot idle after the batch completes.
-        self._call_service_sync(self._disp_stop, Trigger.Request(), "dispatcher/stop")
+                    sym = "✓" if result.success else "✗"
+                    log.info(f"AutoTest {i + 1}/{total} {sym} {result.reason} ({result.duration_s:.1f}s)")
 
-        rate = passed / total if total > 0 else 0.0
-        summary_path.write_text(
-            f"scene: pick_banana\n"
-            f'date: "{datetime.now().isoformat()}"\n'
-            f"total: {total}\n"
-            f"passed: {passed}\n"
-            f"failed: {total - passed}\n"
-            f"success_rate: {rate:.3f}\n"
-        )
-        log.info(f"AutoTest complete: {passed}/{total} ({rate:.1%})")
+            # Leave the robot idle after the batch completes.
+            self._call_service_sync(self._disp_stop, Trigger.Request(), "dispatcher/stop")
 
-        with self._autotest_lock:
-            self._autotest_running = False
+            rate = passed / total if total > 0 else 0.0
+            summary_path.write_text(
+                f"scene: pick_banana\n"
+                f'date: "{datetime.now().isoformat()}"\n'
+                f"total: {total}\n"
+                f"passed: {passed}\n"
+                f"failed: {total - passed}\n"
+                f"success_rate: {rate:.3f}\n"
+            )
+            log.info(f"AutoTest complete: {passed}/{total} ({rate:.1%})")
+        except Exception as exc:  # noqa: BLE001
+            log.error(f"AutoTest failed: {exc!r}")
+            self._call_service_sync(self._disp_stop, Trigger.Request(), "dispatcher/stop")
+        finally:
+            with self._autotest_lock:
+                self._autotest_running = False
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

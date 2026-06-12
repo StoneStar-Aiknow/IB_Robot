@@ -23,9 +23,10 @@
       MuJoCo eulerseq="XYZ": same formula → angles can be copied directly from URDF.
 
     MuJoCo camera direction convention:
-      MuJoCo cameras look in -Z of their frame.
-      YAML transform stores Gazebo/URDF convention (camera looks in +Z).
-      mujoco_adapter applies: mj_roll = yaml_roll + pi  (converting +Z to -Z)
+      MuJoCo cameras look in -Z of their frame. Cameras are injected by
+      mujoco_adapter from YAML peripherals: real Gazebo overrides are converted
+      with gazebo_rpy_to_mujoco_rpy(), while built-in MuJoCo presets are already
+      stored in MuJoCo-native convention.
   -->
 
   <compiler
@@ -60,7 +61,7 @@
        Mesh assets (STL files from robot_description package)
        ================================================================ -->
   <asset>
-    <material name="mat_robot" specular="0.25" shininess="0.1"/>
+    <material name="mat_robot" specular="0.10" shininess="0.03"/>
     <mesh name="base_motor_holder"  file="base_motor_holder_so101_v1.stl"  />
     <mesh name="base_so101"         file="base_so101_v2.stl"                />
     <mesh name="sts3215"            file="sts3215_03a_v1.stl"               />
@@ -100,7 +101,7 @@
        ================================================================ -->
   <default>
     <default class="visual">
-      <geom contype="0" conaffinity="0" group="1" rgba="1.0 0.5 0.0 1"
+      <geom contype="0" conaffinity="0" group="1" rgba="0.86 0.60 0.17 1"
             material="mat_robot" />
     </default>
     <default class="collision">
@@ -281,9 +282,12 @@
                   URDF joint "6": origin xyz="0.0202 0.0188 -0.0234"
                                    rpy="1.5708 0 0"
                   axis xyz="0 0 1"
+                  MuJoCo-only calibration: euler Y offset (+0.209440 rad ≈ +12°)
+                  compensates for gripper finger asymmetry observed in pick_banana
+                  contact experiments; intentionally differs from URDF rpy="1.5708 0 0".
                 -->
                 <body name="jaw" pos="0.0202 0.0188 -0.0234"
-                      euler="1.5708 0 0">
+                      euler="1.5708 0.209440 0.000001">
                   <joint name="6" type="hinge" axis="0 0 1"
                          range="0.0 1.0" damping="1.5"
                          armature="0.028" frictionloss="0.052" />

@@ -598,18 +598,6 @@ contract:
 
 当契约加载时，将自动包含外设定义中的相机元数据。
 
-
-旧的 `robot_interface` 包直接使用 LeRobot 的 Robot 类。本包替换为：
-
-1. **ROS2 层无 LeRobot 依赖**：直接使用 ros2_control
-2. **ros2_control 原生**：标准 ROS2 硬件接口
-3. **现有 ROS2 相机驱动**：使用 `usb_cam` 和 `realsense2_camera` 包
-4. **单一 YAML 配置**：所有硬件在一个地方定义
-
-`robot_interface` 的两个示例配置已手动迁移到：
-- `config/robots/so101_single_arm.yaml`（来自 `single_arm_banana.yaml`）
-- `config/robots/so101_dual_arm.yaml`（来自 `dual_arms_pencil.yaml`）
-
 ## 故障排除
 
 ### 相机无法打开
@@ -669,6 +657,27 @@ rosdep install --from-paths src --ignore-src -y
 该命令会自动安装 `ros-humble-mujoco-ros2-control` 及其传递依赖
 （`mujoco_ros2_control_msgs`、`mujoco_ros2_control_plugins`、`mujoco_vendor`）。
 不再需要手动初始化 git submodule。
+
+### 仿真推理控制面板
+
+在 MuJoCo 仿真推理调试时，推荐使用仓库根目录下的
+`scripts/model_infer_panel.py`，提供 Start/Stop 推理、随机场景、AutoTest
+全量评估等控制能力：
+
+```bash
+python3 scripts/model_infer_panel.py
+# 浏览器访问 http://<robot-ip>:8766
+```
+
+相机图像可视化请使用已有的 Rerun 链路：
+
+```bash
+ros2 launch robot_config robot.launch.py \
+  robot_config:=so101_single_arm \
+  control_mode:=model_inference \
+  use_sim:=true \
+  record_visualizer:=rerun
+```
 
 ## 参考资料
 

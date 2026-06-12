@@ -412,7 +412,7 @@ def launch_setup(context, *args, **kwargs):
 
             # Scene task node for randomisation and AutoTest evaluation
             scene_name = robot_config.get("simulation", {}).get("scene", "")
-            if scene_name == "pick_banana":
+            if sim_platform == "mujoco" and scene_name == "pick_banana":
                 from launch_ros.actions import Node as LaunchNode  # noqa: PLC0415
 
                 actions.append(

@@ -443,8 +443,8 @@ control_modes:
 |---------|------|-------------|
 | `~/reset` | `std_srvs/Empty` | Reset queue and state; also best-effort calls `inference_reset_service` to reset inference-side policy state |
 | `~/toggle_smoothing` | `std_srvs/Empty` | Toggle smoothing on/off |
-| `~/start_evaluate` | `std_srvs/Trigger` | Start execution (only when navigation_mode=true) |
-| `~/stop_evaluate` | `std_srvs/Trigger` | Stop execution and stop base (only when navigation_mode=true) |
+| `~/start_evaluate` | `std_srvs/Trigger` | Resume dispatcher execution |
+| `~/stop_evaluate` | `std_srvs/Trigger` | Pause dispatcher execution; also stop the base when `navigation_mode=true` |
 | `~/get_status` | `std_srvs/Trigger` | Get running status (running/stopped) |
 
 ### Communication with ros2_control

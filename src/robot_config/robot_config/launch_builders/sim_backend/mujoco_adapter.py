@@ -85,9 +85,18 @@ class MujocoAdapter(SimBackendAdapter):
         remappings = self._build_camera_remappings(peripherals)
 
         # 7. Build node parameters (mujoco_model_path now in URDF, not a node param)
+        # Derive camera_publish_rate from YAML peripherals fps so it stays in sync
+        # with the contract instead of being an independent simulation-level SSOT.
+        camera_fps_values = [
+            float(p.get("fps"))
+            for p in robot_config.get("peripherals", [])
+            if p.get("type") == "camera" and p.get("driver") == "opencv" and p.get("fps") is not None
+        ]
+        camera_publish_rate = min(camera_fps_values) if camera_fps_values else 5.0
         params = [
             robot_desc_params,
             {"use_sim_time": True},
+            {"camera_publish_rate": camera_publish_rate},
         ]
         if controllers_cfg and Path(controllers_cfg).exists():
             params.append(controllers_cfg)
@@ -98,6 +107,7 @@ class MujocoAdapter(SimBackendAdapter):
         if mujoco_plugin_path:
             additional_env["MUJOCO_PLUGIN_PATH"] = mujoco_plugin_path
             logger.info(f"MUJOCO_PLUGIN_PATH={mujoco_plugin_path}")
+        logger.info(f"MuJoCo camera_publish_rate={camera_publish_rate} Hz")
 
         mujoco_node = Node(
             package="mujoco_ros2_control",
@@ -155,9 +165,10 @@ class MujocoAdapter(SimBackendAdapter):
         3. Write to /tmp/so101_mujoco.xml and return the path.
 
         Camera convention:
-            YAML stores Gazebo/URDF pose (camera looks in +Z).
-            MuJoCo cameras look in -Z → mj_roll = yaml_roll + pi.
-            pitch and yaw are used unchanged.
+            If a real Gazebo override exists, convert its Gazebo camera frame
+            into MuJoCo convention with gazebo_rpy_to_mujoco_rpy(). Otherwise,
+            use the MuJoCo-native preset directly. Plain YAML transform values
+            are treated as already matching the target backend convention.
         """
         from ament_index_python.packages import get_package_share_directory
 

@@ -353,7 +353,7 @@
 
 	<!-- Joint from gripper to jaw -->
 	<joint name="6" type="revolute">
-		<origin xyz="0.0202 0.0188 -0.0234" rpy="1.5708 -5.14108e-17 -1.38655e-14" />
+		<origin xyz="0.0202 0.0188 -0.0234" rpy="1.5708 0.209440 0.000001" />
 		<parent link="gripper" />
 		<child link="jaw" />
 		<axis xyz="0 0 1" />

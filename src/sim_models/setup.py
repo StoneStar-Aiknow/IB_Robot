@@ -43,8 +43,8 @@ setup(
     ],
     install_requires=["setuptools"],
     zip_safe=True,
-    maintainer="zll",
-    maintainer_email="zll@example.com",
+    maintainer="IB Robot Contributors",
+    maintainer_email="ib-robot@openeuler.org",
     description="Scene assets and scene compiler for IB-Robot simulation",
     license="Apache-2.0",
     entry_points={

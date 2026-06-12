@@ -436,8 +436,8 @@ control_modes:
 |------|------|------|
 | `~/reset` | `std_srvs/Empty` | 重置队列和状态；同时 best-effort 调用 `inference_reset_service` 重置推理侧 policy 状态 |
 | `~/toggle_smoothing` | `std_srvs/Empty` | 切换平滑开关 |
-| `~/start_evaluate` | `std_srvs/Trigger` | 开始执行（仅 navigation_mode=true 时有效） |
-| `~/stop_evaluate` | `std_srvs/Trigger` | 停止执行并停止底盘（仅 navigation_mode=true 时有效） |
+| `~/start_evaluate` | `std_srvs/Trigger` | 恢复 dispatcher 执行 |
+| `~/stop_evaluate` | `std_srvs/Trigger` | 暂停 dispatcher 执行；`navigation_mode=true` 时额外停止底盘 |
 | `~/get_status` | `std_srvs/Trigger` | 获取运行状态（running/stopped） |
 
 ### 与 ros2_control 通信
