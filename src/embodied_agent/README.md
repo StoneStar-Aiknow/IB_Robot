@@ -104,8 +104,9 @@ ros2 launch robot_config robot.launch.py \
 
 | 输入意图 | 规划结果 |
 | --- | --- |
-| `观察桌面` / `看看桌面` / `观察场景` | `inspect_scene` |
-| `回到home` / `回原位` / `回安全位` | `recover_safe_pose` |
+| `观察点` / `观察位置` / `观察桌面` / `看看桌面` / `观察场景` | `inspect_scene` |
+| `原位` / `原点` / `回到home` / `回原位` / `回安全位` | `recover_safe_pose` |
+| `零点` / `零位` / `回零点` / `到零点` | `recover_zero_pose` |
 | `抓取目标物并放到右侧托盘` | `pick_named_target` -> `place_named_pose` |
 | `夹爪往前/后/左/右/上/下一点` | `move_relative_ee` |
 | 仅包含抓取类词汇（抓 / 拿 / 取） | `pick_named_target` |
@@ -244,6 +245,20 @@ ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前�
 这类命令会被规划成单技能：
 
 - `move_relative_ee`
+
+当前还支持直接移动到配置好的 named pose：
+
+```bash
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '原位'}"
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '观察点'}"
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '零点'}"
+```
+
+这三类命令分别会被规划成：
+
+- `recover_safe_pose`
+- `inspect_scene`
+- `recover_zero_pose`
 
 方向语义由执行层按 `robot.embodied.execution.relative_motion_reference_frame=base`
 和 `relative_motion_direction_mapping` 解释，规划层只保留

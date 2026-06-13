@@ -107,10 +107,16 @@
 | 字段 | 说明 |
 | --- | --- |
 | `task_id` | 任务 ID |
-| `primitive_name` | 原子动作名（`move_to_named_pose` / `move_relative_ee` / `open_gripper` / `close_gripper`） |
+| `primitive_name` | 原子动作名（`move_to_named_pose` / `move_relative_ee` / `move_to_joint_positions` / `move_through_joint_positions` / `open_gripper` / `close_gripper`） |
 | `pose_name` | 命名位姿（`move_to_named_pose` 使用） |
 | `relative_dx/dy/dz` | 相对增量（`move_relative_ee` 使用，单位米） |
 | `gripper_position` | 夹爪目标开合量（`[0.0, 1.0]`） |
+| `joint_names` | 关节名列表，joint primitive 使用 |
+| `joint_positions` | 单个关节目标位置，`move_to_joint_positions` 使用 |
+| `primitive_duration_sec` | 单点关节轨迹持续时间 |
+| `joint_waypoints` | 扁平化关节路点序列，按 `joint_names` 顺序展开 |
+| `joint_waypoint_count` | `joint_waypoints` 中包含的路点数量 |
+| `waypoint_duration_sec` | 相邻关节路点的时间间隔 |
 | `timeout_sec` | primitive 超时时间 |
 
 ### `ExecuteTaskPlan.action`
@@ -162,7 +168,15 @@ Episode 录制控制接口，由 `dataset_tools` 的录制服务提供。
 | --- | --- |
 | `primitive_name` | 原子动作名 |
 | `pose_name` | 命名位姿名 |
+| `relative_dx/dy/dz` | 相对位移增量 |
+| `target_x/y/z` | 执行层解析出的目标末端位置 |
 | `gripper_position` | 夹爪目标开合量 |
+| `joint_names` | 关节名列表，joint primitive 使用 |
+| `joint_positions` | 单个关节目标位置 |
+| `primitive_duration_sec` | 单点关节轨迹持续时间 |
+| `joint_waypoints` | 扁平化关节路点序列 |
+| `joint_waypoint_count` | 关节路点数量 |
+| `waypoint_duration_sec` | 相邻关节路点的时间间隔 |
 
 **响应**
 
