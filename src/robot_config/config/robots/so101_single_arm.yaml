@@ -172,6 +172,22 @@ robot:
     validate_primitive_service: /embodied/validate_primitive
     default_target_name: demo_object
     default_place_name: tray_right
+    entry:
+      forward_unmatched_to_planner: true
+      reject_invalid_only: true
+      direct_skill_whitelist:
+        - recover_safe_pose
+        - open_gripper_skill
+        - close_gripper_skill
+        - rotate_gripper_cw
+        - rotate_gripper_ccw
+        - gripper_point_down
+        - move_relative_ee
+        - dance_basic
+      planner_route_keywords:
+        grasp: ["抓", "夹", "拿", "取"]
+        grounding: ["那个", "这个", "左边", "右边", "前面", "后面", "红色", "蓝色", "黄色"]
+        scene_query: ["看看", "找", "在哪里", "哪个"]
     timeouts:
       task_budget_sec: 180.0
       scene_freshness_sec: 0.5
@@ -367,6 +383,71 @@ robot:
         primitive_sequence:
           - primitive_name: rotate_gripper_ccw
             motion_distance_from_request: true
+      dance_basic:
+        primitive_sequence:
+          - primitive_name: move_through_joint_positions
+            trajectory_template:
+              type: wave_dance_v1
+              waypoint_duration_sec: 0.05
+              active_waypoint_count: 120
+              repeat_count: 3
+              zero_hold_count: 4
+              base_pose:
+                "1": 0.02
+                "2": 0.54
+                "3": -0.82
+                "4": -0.18
+                "5": 0.02
+              joints:
+                "1":
+                  terms:
+                    - amplitude: 0
+                      harmonic: 1
+                      phase: 1.2
+                "2":
+                  terms:
+                    - amplitude: 0.3
+                      harmonic: 1
+                      phase: 0.0
+                    - amplitude: 0.03
+                      harmonic: 2
+                      phase: 1.5707963267948966
+                "3":
+                  terms:
+                    - amplitude: 0.3
+                      harmonic: 1
+                      phase: 0.0
+                    - amplitude: 0.06
+                      harmonic: 2
+                      phase: 1.5707963267948966
+                "4":
+                  terms:
+                    - amplitude: -0.8
+                      harmonic: 1
+                      phase: 0.45
+                    - amplitude: -0.05
+                      harmonic: 2
+                      phase: 1.8
+                "5":
+                  terms:
+                    - amplitude: 0.5
+                      harmonic: 1
+                      phase: 1.8
+              workspace_limits:
+                model: so101_arm_v1
+                points:
+                  joint3:
+                    z: [0.04, 0.55]
+                  upper_arm_mid:
+                    z: [0.03, 0.55]
+                  forearm_mid:
+                    z: [0.025, 0.55]
+                  wrist_mid:
+                    z: [0.025, 0.55]
+                  ee:
+                    x: [-0.32, 0.25]
+                    y: [-0.42, 0.00]
+                    z: [0.05, 0.55]
     named_targets:
       demo_object:
         observe_pose: demo_observe

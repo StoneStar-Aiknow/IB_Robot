@@ -18,6 +18,7 @@ from robot_config.config import (
     Ros2ControlConfig,
     VoiceASRConfig,
 )
+from robot_config.generators.skill_trajectories import expand_trajectory_template
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 from .utils import resolve_calibration_paths_from_config, resolve_ros_path
@@ -52,6 +53,38 @@ def _load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
     return resolved_config_path, robot_data
 
 
+def _normalize_skill_templates(skill_templates: dict[str, Any]) -> dict[str, Any]:
+    resolved_templates = copy.deepcopy(skill_templates)
+    for template in resolved_templates.values():
+        primitive_sequence = template.get("primitive_sequence")
+        if not isinstance(primitive_sequence, list):
+            continue
+        for step in primitive_sequence:
+            if not isinstance(step, dict):
+                continue
+            trajectory_template = step.get("trajectory_template")
+            if not trajectory_template:
+                continue
+            if not isinstance(trajectory_template, dict):
+                raise ValueError("trajectory_template must be a mapping")
+            step["joint_waypoints"] = expand_trajectory_template(trajectory_template)
+            step["waypoint_duration_sec"] = float(
+                trajectory_template.get("waypoint_duration_sec", step.get("waypoint_duration_sec", 0.0))
+            )
+            del step["trajectory_template"]
+    return resolved_templates
+
+
+def _normalize_embodied_config(robot_config: dict[str, Any]) -> dict[str, Any]:
+    embodied = robot_config.get("embodied")
+    if not isinstance(embodied, dict):
+        return robot_config
+    skill_templates = embodied.get("skill_templates")
+    if isinstance(skill_templates, dict) and skill_templates:
+        embodied["skill_templates"] = _normalize_skill_templates(skill_templates)
+    return robot_config
+
+
 def load_robot_config_dict(config_path: str | Path) -> dict[str, Any]:
     """Load robot configuration as a complete dict.
 
@@ -61,6 +94,7 @@ def load_robot_config_dict(config_path: str | Path) -> dict[str, Any]:
     """
     resolved_config_path, robot_data = _load_robot_section(config_path)
     robot_config = copy.deepcopy(robot_data)
+    robot_config = _normalize_embodied_config(robot_config)
     robot_config["_config_path"] = str(resolved_config_path)
     return robot_config
 

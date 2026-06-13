@@ -5,12 +5,15 @@ import time
 import uuid
 
 import rclpy
+from builtin_interfaces.msg import Duration
+from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Pose, PoseStamped
 from rclpy.action import ActionClient, ActionServer, CancelResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 from ibrobot_msgs.action import ExecuteTaskPlan, PrimitiveCommand, SkillCommand
 from ibrobot_msgs.msg import TaskStep
@@ -18,6 +21,41 @@ from ibrobot_msgs.srv import ValidatePrimitive, ValidateSkill
 from skill_library.resolver import PrimitiveSpec, load_json_mapping, resolve_skill_primitives
 
 EE_POSITION_TOLERANCE_M = 0.02
+
+
+def _duration_from_seconds(seconds: float) -> Duration:
+    sec = int(seconds)
+    nanosec = int(round((seconds - sec) * 1_000_000_000))
+    if nanosec >= 1_000_000_000:
+        sec += 1
+        nanosec -= 1_000_000_000
+    return Duration(sec=sec, nanosec=nanosec)
+
+
+def _build_joint_trajectory_goal(
+    joint_names: list[str],
+    joint_waypoints: list[list[float]],
+    waypoint_duration_sec: float,
+) -> FollowJointTrajectory.Goal:
+    goal_msg = FollowJointTrajectory.Goal()
+    goal_msg.trajectory = JointTrajectory()
+    goal_msg.trajectory.joint_names = list(joint_names)
+
+    for index, waypoint in enumerate(joint_waypoints, start=1):
+        point = JointTrajectoryPoint()
+        point.positions = [float(position) for position in waypoint]
+        point.time_from_start = _duration_from_seconds(float(waypoint_duration_sec) * index)
+        goal_msg.trajectory.points.append(point)
+    return goal_msg
+
+
+def _load_json_list(raw_value: str) -> list[str]:
+    if not raw_value:
+        return []
+    parsed = load_json_mapping(f'{{"items": {raw_value}}}').get("items", [])
+    if not isinstance(parsed, list):
+        raise ValueError("expected JSON list")
+    return [str(item) for item in parsed]
 
 
 class SkillExecutorNode(Node):
@@ -38,6 +76,9 @@ class SkillExecutorNode(Node):
         self.declare_parameter("gripper_settle_sec", 1.5)
         self.declare_parameter("gripper_open_position", 1.0)
         self.declare_parameter("gripper_closed_position", 0.0)
+        self.declare_parameter("arm_joint_names_json", "[]")
+        self.declare_parameter("joint_limits_json", "{}")
+        self.declare_parameter("arm_trajectory_action_name", "/arm_trajectory_controller/follow_joint_trajectory")
         self.declare_parameter("task_executor_action_name", "/task_executor/execute_task_plan")
         self.declare_parameter("ee_pose_topic", "/robot_status/ee_pose")
         self.declare_parameter("joint_state_topic", "/joint_states")
@@ -66,6 +107,15 @@ class SkillExecutorNode(Node):
         self._gripper_settle_sec = self.get_parameter("gripper_settle_sec").get_parameter_value().double_value
         self._gripper_open = self.get_parameter("gripper_open_position").get_parameter_value().double_value
         self._gripper_closed = self.get_parameter("gripper_closed_position").get_parameter_value().double_value
+        self._arm_joint_names = _load_json_list(
+            self.get_parameter("arm_joint_names_json").get_parameter_value().string_value
+        )
+        self._joint_limits = load_json_mapping(
+            self.get_parameter("joint_limits_json").get_parameter_value().string_value
+        )
+        self._arm_trajectory_action_name = (
+            self.get_parameter("arm_trajectory_action_name").get_parameter_value().string_value
+        )
         self._task_executor_action_name = (
             self.get_parameter("task_executor_action_name").get_parameter_value().string_value
         )
@@ -79,6 +129,12 @@ class SkillExecutorNode(Node):
         self._pose_publisher = self.create_publisher(Pose, "/cmd_pose", 10)
         self._task_executor_client = ActionClient(
             self, ExecuteTaskPlan, self._task_executor_action_name, callback_group=callback_group
+        )
+        self._arm_trajectory_client = ActionClient(
+            self,
+            FollowJointTrajectory,
+            self._arm_trajectory_action_name,
+            callback_group=callback_group,
         )
         self.create_subscription(
             PoseStamped,
@@ -220,6 +276,12 @@ class SkillExecutorNode(Node):
         relative_dy: float = 0.0,
         relative_dz: float = 0.0,
         target_pose: Pose | None = None,
+        joint_names: list[str] | None = None,
+        joint_positions: list[float] | None = None,
+        joint_waypoints: list[float] | None = None,
+        joint_waypoint_count: int = 0,
+        primitive_duration_sec: float = 0.0,
+        waypoint_duration_sec: float = 0.0,
     ) -> tuple[bool, str]:
         if not self._validate_primitive_client.wait_for_service(timeout_sec=self._rpc_timeout):
             return False, "validate_primitive service unavailable"
@@ -239,6 +301,12 @@ class SkillExecutorNode(Node):
             request.target_y = 0.0
             request.target_z = 0.0
         request.gripper_position = float(gripper_position)
+        request.joint_names = list(joint_names or [])
+        request.joint_positions = [float(position) for position in (joint_positions or [])]
+        request.joint_waypoints = [float(position) for position in (joint_waypoints or [])]
+        request.joint_waypoint_count = int(joint_waypoint_count)
+        request.primitive_duration_sec = float(primitive_duration_sec)
+        request.waypoint_duration_sec = float(waypoint_duration_sec)
         future = self._validate_primitive_client.call_async(request)
         if not self._wait_for_future(future, timeout_sec=self._rpc_timeout):
             return False, "validate_primitive timeout"
@@ -246,6 +314,14 @@ class SkillExecutorNode(Node):
         if response is None:
             return False, "validate_primitive returned no response"
         return response.allowed, response.reason
+
+    def _current_joint_positions(self) -> dict[str, float]:
+        if self._latest_joint_state is None:
+            return {}
+        return {
+            str(name): float(position)
+            for name, position in zip(self._latest_joint_state.name, self._latest_joint_state.position, strict=False)
+        }
 
     def _pose_from_name(self, pose_name: str) -> Pose:
         pose_cfg = self._named_poses[pose_name]
@@ -290,7 +366,7 @@ class SkillExecutorNode(Node):
                 result.success = False
                 result.error_code = "CURRENT_EE_POSE_UNAVAILABLE"
                 result.message = "current ee pose is unavailable for relative motion"
-                result.executed_pose_name = ""
+                result.pose_name = ""
                 goal_handle.abort()
                 return result
 
@@ -302,12 +378,18 @@ class SkillExecutorNode(Node):
             relative_dy=goal.relative_dy,
             relative_dz=goal.relative_dz,
             target_pose=target_pose,
+            joint_names=list(goal.joint_names),
+            joint_positions=list(goal.joint_positions),
+            joint_waypoints=list(goal.joint_waypoints),
+            joint_waypoint_count=goal.joint_waypoint_count,
+            primitive_duration_sec=goal.primitive_duration_sec,
+            waypoint_duration_sec=goal.waypoint_duration_sec,
         )
         if not allowed:
             result.success = False
             result.error_code = "SAFETY_REJECTED"
             result.message = reason
-            result.executed_pose_name = goal.pose_name
+            result.pose_name = goal.pose_name
             goal_handle.abort()
             return result
 
@@ -316,7 +398,52 @@ class SkillExecutorNode(Node):
         feedback.detail = f"primitive={goal.primitive_name}"
         goal_handle.publish_feedback(feedback)
 
-        if goal.primitive_name in {"move_to_named_pose", "move_relative_ee"}:
+        if goal.primitive_name == "move_to_joint_positions":
+            move_timeout = float(goal.timeout_sec if goal.timeout_sec > 0.0 else 30.0)
+            ok, err_msg = self._exec_arm_joint_trajectory(
+                goal_handle,
+                list(goal.joint_names),
+                list(goal.joint_positions),
+                goal.task_id,
+                move_timeout,
+                float(goal.primitive_duration_sec),
+            )
+            if not ok:
+                result.success = False
+                result.error_code = "PRIMITIVE_ARM_FAILED"
+                result.message = err_msg
+                result.pose_name = ""
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                else:
+                    goal_handle.abort()
+                return result
+        elif goal.primitive_name == "move_through_joint_positions":
+            move_timeout = float(goal.timeout_sec if goal.timeout_sec > 0.0 else 30.0)
+            joint_count = len(goal.joint_names)
+            waypoints = [
+                list(goal.joint_waypoints[index : index + joint_count])
+                for index in range(0, len(goal.joint_waypoints), joint_count)
+            ]
+            ok, err_msg = self._exec_arm_joint_waypoint_trajectory(
+                goal_handle,
+                list(goal.joint_names),
+                waypoints,
+                goal.task_id,
+                move_timeout,
+                float(goal.waypoint_duration_sec),
+            )
+            if not ok:
+                result.success = False
+                result.error_code = "PRIMITIVE_ARM_FAILED"
+                result.message = err_msg
+                result.pose_name = ""
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                else:
+                    goal_handle.abort()
+                return result
+        elif goal.primitive_name in {"move_to_named_pose", "move_relative_ee"}:
             if goal.primitive_name == "move_to_named_pose":
                 try:
                     pose = self._pose_from_name(goal.pose_name)
@@ -324,7 +451,7 @@ class SkillExecutorNode(Node):
                     result.success = False
                     result.error_code = "UNKNOWN_POSE"
                     result.message = f"unknown named pose: {goal.pose_name!r}"
-                    result.executed_pose_name = goal.pose_name
+                    result.pose_name = goal.pose_name
                     goal_handle.abort()
                     return result
             else:
@@ -344,7 +471,7 @@ class SkillExecutorNode(Node):
                 result.success = False
                 result.error_code = "PRIMITIVE_ARM_FAILED"
                 result.message = err_msg
-                result.executed_pose_name = goal.pose_name
+                result.pose_name = goal.pose_name
                 if goal_handle.is_cancel_requested:
                     goal_handle.canceled()
                 else:
@@ -355,7 +482,7 @@ class SkillExecutorNode(Node):
                 result.success = False
                 result.error_code = "CURRENT_EE_POSE_UNAVAILABLE"
                 result.message = "current ee pose is unavailable for gripper rotation"
-                result.executed_pose_name = ""
+                result.pose_name = ""
                 goal_handle.abort()
                 return result
             move_timeout = float(goal.timeout_sec if goal.timeout_sec > 0.0 else 30.0)
@@ -366,7 +493,7 @@ class SkillExecutorNode(Node):
                 result.success = False
                 result.error_code = "PRIMITIVE_ARM_FAILED"
                 result.message = err_msg
-                result.executed_pose_name = ""
+                result.pose_name = ""
                 if goal_handle.is_cancel_requested:
                     goal_handle.canceled()
                 else:
@@ -381,13 +508,13 @@ class SkillExecutorNode(Node):
                 result.success = False
                 result.error_code = "PRIMITIVE_GRIPPER_FAILED"
                 result.message = err_msg
-                result.executed_pose_name = goal.pose_name
+                result.pose_name = goal.pose_name
                 goal_handle.abort()
                 return result
         result.success = True
         result.error_code = ""
         result.message = f"primitive completed: {goal.primitive_name}"
-        result.executed_pose_name = goal.pose_name
+        result.pose_name = goal.pose_name
         goal_handle.succeed()
         return result
 
@@ -503,6 +630,117 @@ class SkillExecutorNode(Node):
             return False, f"arm motion failed: {result.message}"
         return True, ""
 
+    def _exec_arm_joint_trajectory(
+        self,
+        goal_handle,
+        joint_names: list[str],
+        joint_positions: list[float],
+        task_id: str,
+        timeout_sec: float,
+        duration_sec: float,
+    ) -> tuple[bool, str]:
+        if not self._arm_trajectory_client.wait_for_server(timeout_sec=2.0):
+            msg = f"arm trajectory action server not available: {self._arm_trajectory_action_name}"
+            self.get_logger().warning(f"[embodied-debug] {msg}")
+            return False, msg
+
+        goal_msg = _build_joint_trajectory_goal(
+            list(joint_names),
+            [[float(position) for position in joint_positions]],
+            max(0.1, float(duration_sec)),
+        )
+
+        if self._debug:
+            self.get_logger().info(
+                "[embodied-debug] primitive arm joint trajectory "
+                f"task_id={task_id} joints={joint_names} positions={joint_positions}"
+            )
+
+        send_future = self._arm_trajectory_client.send_goal_async(goal_msg)
+        accept_timeout = 5.0
+        deadline = time.monotonic() + accept_timeout
+        while not send_future.done():
+            if goal_handle.is_cancel_requested:
+                return False, "cancelled while sending arm trajectory goal"
+            if time.monotonic() > deadline:
+                return False, "timeout waiting for arm trajectory goal acceptance"
+            time.sleep(0.05)
+
+        gh = send_future.result()
+        if not gh.accepted:
+            return False, "arm trajectory goal rejected"
+
+        result_future = gh.get_result_async()
+        deadline = time.monotonic() + timeout_sec
+        while not result_future.done():
+            if goal_handle.is_cancel_requested:
+                gh.cancel_goal_async()
+                return False, "cancelled during arm joint trajectory execution"
+            if time.monotonic() > deadline:
+                gh.cancel_goal_async()
+                return False, "timeout waiting for arm joint trajectory execution"
+            time.sleep(0.05)
+
+        result = result_future.result()
+        if result is None or result.result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
+            error_code = result.result.error_code if result is not None else "unknown"
+            return False, f"arm trajectory execution failed: {error_code}"
+        return True, ""
+
+    def _exec_arm_joint_waypoint_trajectory(
+        self,
+        goal_handle,
+        joint_names: list[str],
+        joint_waypoints: list[list[float]],
+        task_id: str,
+        timeout_sec: float,
+        waypoint_duration_sec: float,
+    ) -> tuple[bool, str]:
+        if not self._arm_trajectory_client.wait_for_server(timeout_sec=2.0):
+            msg = f"arm trajectory action server not available: {self._arm_trajectory_action_name}"
+            self.get_logger().warning(f"[embodied-debug] {msg}")
+            return False, msg
+
+        goal_msg = _build_joint_trajectory_goal(joint_names, joint_waypoints, waypoint_duration_sec)
+
+        if self._debug:
+            self.get_logger().info(
+                "[embodied-debug] primitive arm joint waypoint trajectory "
+                f"task_id={task_id} joints={joint_names} waypoints={len(joint_waypoints)} "
+                f"waypoint_duration={waypoint_duration_sec:.3f}"
+            )
+
+        send_future = self._arm_trajectory_client.send_goal_async(goal_msg)
+        accept_timeout = 5.0
+        deadline = time.monotonic() + accept_timeout
+        while not send_future.done():
+            if goal_handle.is_cancel_requested:
+                return False, "cancelled while sending arm trajectory goal"
+            if time.monotonic() > deadline:
+                return False, "timeout waiting for arm trajectory goal acceptance"
+            time.sleep(0.05)
+
+        gh = send_future.result()
+        if not gh.accepted:
+            return False, "arm trajectory goal rejected"
+
+        result_future = gh.get_result_async()
+        deadline = time.monotonic() + timeout_sec
+        while not result_future.done():
+            if goal_handle.is_cancel_requested:
+                gh.cancel_goal_async()
+                return False, "cancelled during arm joint waypoint trajectory execution"
+            if time.monotonic() > deadline:
+                gh.cancel_goal_async()
+                return False, "timeout waiting for arm joint waypoint trajectory execution"
+            time.sleep(0.05)
+
+        result = result_future.result()
+        if result is None or result.result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
+            error_code = result.result.error_code if result is not None else "unknown"
+            return False, f"arm trajectory execution failed: {error_code}"
+        return True, ""
+
     def _exec_gripper_via_task_dispatch(
         self, goal_handle, primitive_name: str, gripper_position: float, task_id: str
     ) -> tuple[bool, str]:
@@ -585,6 +823,8 @@ class SkillExecutorNode(Node):
                 self._gripper_closed,
                 self._skill_templates,
                 self._relative_motion_direction_mapping,
+                current_joint_positions=self._current_joint_positions(),
+                arm_joint_names=self._arm_joint_names,
             )
         except Exception as exc:
             return self._abort_skill(result, goal_handle, [], "SKILL_RESOLUTION_FAILED", str(exc))
@@ -635,6 +875,8 @@ class SkillExecutorNode(Node):
             feedback = SkillCommand.Feedback()
             feedback.state = "executing"
             feedback.detail = f"{primitive_name}:{pose_name or gripper_position}"
+            if primitive_name in {"move_to_joint_positions", "move_through_joint_positions"}:
+                feedback.detail = f"{primitive_name}:{','.join(primitive.joint_names)}"
             goal_handle.publish_feedback(feedback)
 
             primitive_goal = PrimitiveCommand.Goal()
@@ -645,6 +887,14 @@ class SkillExecutorNode(Node):
             primitive_goal.relative_dy = float(primitive.relative_dy)
             primitive_goal.relative_dz = float(primitive.relative_dz)
             primitive_goal.gripper_position = float(gripper_position)
+            primitive_goal.joint_names = list(primitive.joint_names)
+            primitive_goal.joint_positions = [float(position) for position in primitive.joint_positions]
+            primitive_goal.joint_waypoints = [
+                float(position) for waypoint in primitive.joint_waypoints for position in waypoint
+            ]
+            primitive_goal.joint_waypoint_count = len(primitive.joint_waypoints)
+            primitive_goal.primitive_duration_sec = float(primitive.duration_sec)
+            primitive_goal.waypoint_duration_sec = float(primitive.waypoint_duration_sec)
             primitive_goal.timeout_sec = remaining_timeout if remaining_timeout is not None else 0.0
 
             send_goal_future = self._primitive_client.send_goal_async(primitive_goal)
@@ -706,6 +956,15 @@ class SkillExecutorNode(Node):
                     f"{primitive_name}:{primitive.relative_dx:.3f},"
                     f"{primitive.relative_dy:.3f},{primitive.relative_dz:.3f}"
                 )
+            if primitive_name == "move_to_joint_positions":
+                primitive_label = f"{primitive_name}:" + ",".join(
+                    f"{joint_name}={joint_position:.3f}"
+                    for joint_name, joint_position in zip(
+                        primitive.joint_names, primitive.joint_positions, strict=False
+                    )
+                )
+            if primitive_name == "move_through_joint_positions":
+                primitive_label = f"{primitive_name}:{len(primitive.joint_waypoints)} waypoints"
             executed_primitives.append(primitive_label)
 
         result.success = True

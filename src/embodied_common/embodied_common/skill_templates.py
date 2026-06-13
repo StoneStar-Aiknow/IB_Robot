@@ -8,6 +8,8 @@ from typing import Any
 SUPPORTED_PRIMITIVES = {
     "move_to_named_pose",
     "move_relative_ee",
+    "move_to_joint_positions",
+    "move_through_joint_positions",
     "open_gripper",
     "close_gripper",
     "rotate_gripper_cw",

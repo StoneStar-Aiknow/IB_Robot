@@ -41,6 +41,34 @@ def validate_pose_within_workspace(pose: dict[str, Any], workspace: dict[str, An
     return validate_xyz_within_workspace(float(x), float(y), float(z), workspace)
 
 
+def _validate_joint_targets(
+    joint_positions: dict[str, Any],
+    arm_joint_names: list[str] | None,
+    joint_limits: dict[str, Any] | None,
+    label: str,
+) -> tuple[bool, str]:
+    resolved_arm_joint_names = list(arm_joint_names or [])
+    if resolved_arm_joint_names:
+        unknown_joint_names = sorted(set(joint_positions) - set(resolved_arm_joint_names))
+        if unknown_joint_names:
+            return False, f"unknown arm joints in {label}: {', '.join(unknown_joint_names)}"
+
+    resolved_joint_limits = joint_limits or {}
+    if resolved_arm_joint_names and resolved_joint_limits:
+        missing_joint_limits = sorted(joint for joint in resolved_arm_joint_names if joint not in resolved_joint_limits)
+        if missing_joint_limits:
+            return False, f"missing joint limits for arm joints: {', '.join(missing_joint_limits)}"
+        for joint_name, joint_position in joint_positions.items():
+            limits = resolved_joint_limits[joint_name]
+            min_position = float(limits["min"])
+            max_position = float(limits["max"])
+            position = float(joint_position)
+            if position < min_position or position > max_position:
+                return False, f"joint target outside limits for {joint_name}: {position}"
+
+    return True, ""
+
+
 def validate_skill_request(
     skill_name: str,
     target_name: str,
@@ -50,6 +78,8 @@ def validate_skill_request(
     named_poses: dict[str, Any],
     named_targets: dict[str, Any],
     skill_templates: dict[str, Any] | None = None,
+    arm_joint_names: list[str] | None = None,
+    joint_limits: dict[str, Any] | None = None,
 ) -> tuple[bool, str]:
     templates = get_skill_templates(skill_templates)
     template = templates.get(skill_name)
@@ -111,6 +141,45 @@ def validate_skill_request(
             if resolved_direction and resolved_distance == 0.0:
                 return False, "motion_distance must be greater than zero"
 
+        if primitive_name == "move_to_joint_positions":
+            joint_position_offsets = step.get("joint_position_offsets", {})
+            joint_position_targets = step.get("joint_positions", {})
+            has_offsets = bool(joint_position_offsets)
+            has_targets = bool(joint_position_targets)
+            if has_offsets and has_targets:
+                return False, "move_to_joint_positions cannot define both joint_position_offsets and joint_positions"
+            if not has_offsets and not has_targets:
+                return False, "move_to_joint_positions requires joint_position_offsets or joint_positions"
+            joint_map = joint_position_targets if has_targets else joint_position_offsets
+            if not isinstance(joint_map, dict):
+                return False, "joint target map must be an object"
+            allowed, reason = _validate_joint_targets(joint_map, arm_joint_names, joint_limits, "joint target")
+            if not allowed:
+                return allowed, reason
+            if float(step.get("duration_sec", 0.0) or 0.0) < 0.0:
+                return False, "duration_sec must be non-negative"
+
+        if primitive_name == "move_through_joint_positions":
+            raw_waypoints = step.get("joint_waypoints", [])
+            if not isinstance(raw_waypoints, list) or not raw_waypoints:
+                return False, "move_through_joint_positions requires joint_waypoints"
+            if float(step.get("waypoint_duration_sec", 0.0) or 0.0) <= 0.0:
+                return False, "waypoint_duration_sec must be greater than zero"
+            for waypoint_index, waypoint in enumerate(raw_waypoints):
+                if not isinstance(waypoint, dict):
+                    return False, f"joint waypoint {waypoint_index} must be an object"
+                joint_positions = waypoint.get("joint_positions", {})
+                if not isinstance(joint_positions, dict) or not joint_positions:
+                    return False, f"joint waypoint {waypoint_index} must define joint_positions"
+                allowed, reason = _validate_joint_targets(
+                    joint_positions,
+                    arm_joint_names,
+                    joint_limits,
+                    f"joint waypoint {waypoint_index}",
+                )
+                if not allowed:
+                    return allowed, reason
+
     return True, ""
 
 
@@ -126,10 +195,20 @@ def validate_primitive_request(
     gripper_position: float,
     named_poses: dict[str, Any],
     workspace: dict[str, Any],
+    joint_names: list[str] | None = None,
+    joint_positions: list[float] | None = None,
+    joint_waypoints: list[float] | None = None,
+    joint_waypoint_count: int = 0,
+    arm_joint_names: list[str] | None = None,
+    joint_limits: dict[str, Any] | None = None,
+    primitive_duration_sec: float = 0.0,
+    waypoint_duration_sec: float = 0.0,
 ) -> tuple[bool, str]:
     if primitive_name not in {
         "move_to_named_pose",
         "move_relative_ee",
+        "move_to_joint_positions",
+        "move_through_joint_positions",
         "open_gripper",
         "close_gripper",
         "rotate_gripper_cw",
@@ -145,6 +224,43 @@ def validate_primitive_request(
 
     if primitive_name == "move_relative_ee":
         return validate_xyz_within_workspace(target_x, target_y, target_z, workspace)
+
+    if primitive_name == "move_to_joint_positions":
+        resolved_joint_names = list(joint_names or [])
+        resolved_joint_positions = [float(position) for position in (joint_positions or [])]
+        if not resolved_joint_names:
+            return False, "joint_names are required for move_to_joint_positions"
+        if len(resolved_joint_names) != len(resolved_joint_positions):
+            return False, "joint_names and joint_positions must have the same length"
+        if float(primitive_duration_sec or 0.4) <= 0.0:
+            return False, "primitive_duration_sec must be greater than zero"
+        if arm_joint_names and resolved_joint_names != list(arm_joint_names):
+            return False, "joint target primitive must command the full arm joint list in configured order"
+        joint_map = dict(zip(resolved_joint_names, resolved_joint_positions, strict=False))
+        return _validate_joint_targets(joint_map, arm_joint_names, joint_limits, "joint target")
+
+    if primitive_name == "move_through_joint_positions":
+        resolved_joint_names = list(joint_names or [])
+        resolved_joint_waypoints = [float(position) for position in (joint_waypoints or [])]
+        resolved_waypoint_count = int(joint_waypoint_count or 0)
+        if not resolved_joint_names:
+            return False, "joint_names are required for move_through_joint_positions"
+        if resolved_waypoint_count <= 0:
+            return False, "joint_waypoint_count must be greater than zero"
+        if len(resolved_joint_waypoints) != len(resolved_joint_names) * resolved_waypoint_count:
+            return False, "joint_waypoints length must equal joint_names length times joint_waypoint_count"
+        if float(waypoint_duration_sec or 0.0) <= 0.0:
+            return False, "waypoint_duration_sec must be greater than zero"
+        if arm_joint_names and resolved_joint_names != list(arm_joint_names):
+            return False, "joint waypoint primitive must command the full arm joint list in configured order"
+        for waypoint_index in range(resolved_waypoint_count):
+            start = waypoint_index * len(resolved_joint_names)
+            waypoint_positions = resolved_joint_waypoints[start : start + len(resolved_joint_names)]
+            joint_map = dict(zip(resolved_joint_names, waypoint_positions, strict=False))
+            allowed, reason = _validate_joint_targets(joint_map, arm_joint_names, joint_limits, "joint waypoint")
+            if not allowed:
+                return allowed, reason
+        return True, ""
 
     if gripper_position < 0.0 or gripper_position > 1.0:
         return False, "gripper_position must be in [0.0, 1.0]"

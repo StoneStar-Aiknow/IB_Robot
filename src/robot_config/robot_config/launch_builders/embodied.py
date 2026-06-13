@@ -25,10 +25,13 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
         )
 
     execution = embodied_config.get("execution", {})
+    entry = embodied_config.get("entry", {})
     named_poses = embodied_config.get("named_poses", {})
     named_targets = embodied_config.get("named_targets", {})
     skill_templates = embodied_config.get("skill_templates", {})
     safety = embodied_config.get("safety", {})
+    joint_config = robot_config.get("joints", {})
+    teleoperation = robot_config.get("teleoperation", {})
     planner = embodied_config.get("planner", {})
     perception = embodied_config.get("perception", {})
     planner_mode = str(planner.get("mode", "rule")).lower()
@@ -62,6 +65,8 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
         "named_targets_json": json.dumps(named_targets),
         "skill_templates_json": json.dumps(skill_templates),
         "workspace_json": json.dumps(safety.get("workspace", {})),
+        "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
+        "joint_limits_json": json.dumps(teleoperation.get("safety", {}).get("joint_limits", {})),
         "default_target_name": embodied_config.get("default_target_name", "demo_object"),
         "default_place_name": embodied_config.get("default_place_name", "tray_right"),
         "skill_action_name": embodied_config.get("skill_action_name", "/embodied/execute_skill"),
@@ -221,6 +226,33 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
                     "default_place_name": embodied_config.get("default_place_name", "tray_right"),
                     "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
                     "default_task_timeout_sec": timeout_policy["task_budget_sec"],
+                    "forward_unmatched_to_planner": entry.get("forward_unmatched_to_planner", True),
+                    "reject_invalid_only": entry.get("reject_invalid_only", True),
+                    "direct_skill_whitelist_json": json.dumps(
+                        entry.get(
+                            "direct_skill_whitelist",
+                            [
+                                "recover_safe_pose",
+                                "open_gripper_skill",
+                                "close_gripper_skill",
+                                "rotate_gripper_cw",
+                                "rotate_gripper_ccw",
+                                "gripper_point_down",
+                                "move_relative_ee",
+                                "dance_basic",
+                            ],
+                        )
+                    ),
+                    "planner_route_keywords_json": json.dumps(
+                        entry.get(
+                            "planner_route_keywords",
+                            {
+                                "grasp": ["抓", "夹", "拿", "取"],
+                                "grounding": ["那个", "这个", "左边", "右边", "前面", "后面", "红色", "蓝色", "黄色"],
+                                "scene_query": ["看看", "找", "在哪里", "哪个"],
+                            },
+                        )
+                    ),
                 }
             ],
         ),

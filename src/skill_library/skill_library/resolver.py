@@ -1,6 +1,6 @@
 """Helpers for resolving skills, targets, and named poses."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from embodied_common.json_utils import load_json_mapping
@@ -17,6 +17,11 @@ class PrimitiveSpec:
     relative_dx: float = 0.0
     relative_dy: float = 0.0
     relative_dz: float = 0.0
+    joint_names: list[str] = field(default_factory=list)
+    joint_positions: list[float] = field(default_factory=list)
+    joint_waypoints: list[list[float]] = field(default_factory=list)
+    duration_sec: float = 0.0
+    waypoint_duration_sec: float = 0.0
 
 
 def direction_to_delta(
@@ -79,6 +84,8 @@ def resolve_skill_primitives(
     closed_position: float,
     skill_templates: dict[str, Any] | None = None,
     direction_mapping: dict[str, Any] | None = None,
+    current_joint_positions: dict[str, float] | None = None,
+    arm_joint_names: list[str] | None = None,
 ) -> list[PrimitiveSpec]:
     templates = get_skill_templates(skill_templates)
     template = templates.get(skill_name)
@@ -155,6 +162,124 @@ def resolve_skill_primitives(
                 PrimitiveSpec(
                     primitive_name=primitive_name,
                     relative_dz=resolved_angle,  # angle in degrees
+                )
+            )
+            continue
+
+        if primitive_name == "move_to_joint_positions":
+            resolved_arm_joint_names = list(arm_joint_names or [])
+            if not resolved_arm_joint_names:
+                raise ValueError("arm_joint_names are required for move_to_joint_positions")
+            joint_position_offsets = step.get("joint_position_offsets", {})
+            joint_position_targets = step.get("joint_positions", {})
+            has_offsets = bool(joint_position_offsets)
+            has_absolute_targets = bool(joint_position_targets)
+            if has_offsets and has_absolute_targets:
+                raise ValueError(
+                    f"skill template '{skill_name}' move_to_joint_positions step cannot define both "
+                    "joint_position_offsets and joint_positions"
+                )
+            if not has_offsets and not has_absolute_targets:
+                raise ValueError(
+                    f"skill template '{skill_name}' move_to_joint_positions step must define "
+                    "joint_position_offsets or joint_positions"
+                )
+
+            if has_absolute_targets:
+                if not isinstance(joint_position_targets, dict):
+                    raise ValueError(
+                        f"skill template '{skill_name}' move_to_joint_positions step joint_positions must be an object"
+                    )
+                unknown_joint_names = sorted(set(joint_position_targets) - set(resolved_arm_joint_names))
+                if unknown_joint_names:
+                    raise KeyError(
+                        f"skill template '{skill_name}' references unknown arm joints: {', '.join(unknown_joint_names)}"
+                    )
+                joint_positions = [
+                    round(float(joint_position_targets.get(joint_name, 0.0) or 0.0), 6)
+                    for joint_name in resolved_arm_joint_names
+                ]
+            else:
+                if not isinstance(joint_position_offsets, dict):
+                    raise ValueError(
+                        f"skill template '{skill_name}' move_to_joint_positions step joint_position_offsets must be an object"
+                    )
+                if current_joint_positions is None:
+                    raise KeyError("current_joint_positions are required for move_to_joint_positions offsets")
+                unknown_joint_names = sorted(set(joint_position_offsets) - set(resolved_arm_joint_names))
+                if unknown_joint_names:
+                    raise KeyError(
+                        f"skill template '{skill_name}' references unknown arm joints: {', '.join(unknown_joint_names)}"
+                    )
+                joint_positions = []
+                for joint_name in resolved_arm_joint_names:
+                    if joint_name not in current_joint_positions:
+                        raise KeyError(f"current joint position unavailable: {joint_name}")
+                    base_position = float(current_joint_positions[joint_name])
+                    joint_offset = float(joint_position_offsets.get(joint_name, 0.0) or 0.0)
+                    joint_positions.append(round(base_position + joint_offset, 6))
+
+            duration_sec = float(step.get("duration_sec", 0.4))
+            if duration_sec < 0.0:
+                raise ValueError(f"skill template '{skill_name}' move_to_joint_positions duration must be >= 0")
+            primitives.append(
+                PrimitiveSpec(
+                    primitive_name="move_to_joint_positions",
+                    joint_names=resolved_arm_joint_names,
+                    joint_positions=joint_positions,
+                    duration_sec=duration_sec,
+                )
+            )
+            continue
+
+        if primitive_name == "move_through_joint_positions":
+            resolved_arm_joint_names = list(arm_joint_names or [])
+            if not resolved_arm_joint_names:
+                raise ValueError("arm_joint_names are required for move_through_joint_positions")
+
+            raw_waypoints = step.get("joint_waypoints", [])
+            if not isinstance(raw_waypoints, list) or not raw_waypoints:
+                raise ValueError(
+                    f"skill template '{skill_name}' move_through_joint_positions step must define joint_waypoints"
+                )
+
+            joint_waypoints: list[list[float]] = []
+            for waypoint_index, waypoint in enumerate(raw_waypoints):
+                if not isinstance(waypoint, dict):
+                    raise ValueError(
+                        f"skill template '{skill_name}' move_through_joint_positions waypoint "
+                        f"{waypoint_index} must be an object"
+                    )
+                joint_position_targets = waypoint.get("joint_positions", {})
+                if not isinstance(joint_position_targets, dict) or not joint_position_targets:
+                    raise ValueError(
+                        f"skill template '{skill_name}' move_through_joint_positions waypoint "
+                        f"{waypoint_index} must define joint_positions"
+                    )
+                unknown_joint_names = sorted(set(joint_position_targets) - set(resolved_arm_joint_names))
+                if unknown_joint_names:
+                    raise KeyError(
+                        f"skill template '{skill_name}' references unknown arm joints: "
+                        + ", ".join(unknown_joint_names)
+                    )
+                joint_waypoints.append(
+                    [
+                        round(float(joint_position_targets.get(joint_name, 0.0) or 0.0), 6)
+                        for joint_name in resolved_arm_joint_names
+                    ]
+                )
+
+            waypoint_duration_sec = float(step.get("waypoint_duration_sec", 0.08))
+            if waypoint_duration_sec <= 0.0:
+                raise ValueError(
+                    f"skill template '{skill_name}' move_through_joint_positions waypoint_duration_sec must be > 0"
+                )
+            primitives.append(
+                PrimitiveSpec(
+                    primitive_name="move_through_joint_positions",
+                    joint_names=resolved_arm_joint_names,
+                    joint_waypoints=joint_waypoints,
+                    waypoint_duration_sec=waypoint_duration_sec,
                 )
             )
             continue

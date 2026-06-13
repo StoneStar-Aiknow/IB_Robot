@@ -7,6 +7,12 @@ float32 target_x
 float32 target_y
 float32 target_z
 float32 gripper_position
+string[] joint_names
+float32[] joint_positions
+float32 primitive_duration_sec
+float32[] joint_waypoints
+uint32 joint_waypoint_count
+float32 waypoint_duration_sec
 ---
 bool allowed
 string reason
