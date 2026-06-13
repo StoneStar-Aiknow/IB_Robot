@@ -155,13 +155,24 @@ robot:
 
   teleoperation:
     enabled: true
+    # 单设备使用 active_device；双臂等多输入设备使用 active_devices。
     active_device: "so101_leader"
+    # active_devices: ["left_leader", "right_leader"]
     devices:
       - name: "so101_leader"
         type: "leader_arm"
         port: "/dev/ttyUSB0"
         calib_file: "$(env HOME)/.calibrate/so101_leader_calibrate.json"
+        target:
+          arm_joint_names: ["1", "2", "3", "4", "5"]
+          gripper_joint_names: ["6"]
+          arm_command_topic: "/arm_position_controller/commands"
+          gripper_command_topic: "/gripper_position_controller/commands"
 ```
+
+多设备遥操作时，`active_devices` 按名称选择 `devices` 中的多个输入设备。每个
+设备可通过 `target` 指定要控制的关节组和控制器命令话题；未指定时回退到机器人级
+`joints.arm` / `joints.gripper` 以及默认单臂控制器话题。
 
 **启动命令：**
 ```bash

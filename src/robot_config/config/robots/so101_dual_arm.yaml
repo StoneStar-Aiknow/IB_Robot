@@ -1,117 +1,207 @@
 # SO-101 Dual Arm Robot Configuration
-# This configuration defines the complete hardware setup for dual SO-101 arms
-# (e.g., ALOHA setup) with cameras for bimanual manipulation.
+# Dual hardware instances defined in single URDF (Multi-Hardware Standard)
+# Uses generic 'xacro_args' to map physical ports to URDF args (port_1, port_2)
 
 robot:
   name: so101_dual_arm
   type: so101_dual
-  robot_type: aloha  # For LeRobot dataset metadata
-
-  # ros2_control configuration
-  ros2_control:
-    hardware_plugin: so101_hardware/SO101SystemHardware
-    # For dual arms, you'll need separate hardware plugins or a unified one
-    # This example assumes a single plugin managing both arms
-    port: /dev/ttyACM0
-    calib_file: $(env HOME)/.calibrate/so101_dual_calibrate.json
-    urdf_path: $(find robot_description)/urdf/lerobot/so101/so101_dual.urdf.xacro
+  robot_type: aloha
 
   # Unified joint definitions
   joints:
-    left_arm:
-      - "left_1"
-      - "left_2"
-      - "left_3"
-      - "left_4"
-      - "left_5"
-    right_arm:
-      - "right_1"
-      - "right_2"
-      - "right_3"
-      - "right_4"
-      - "right_5"
+    left_arm: ["joint1_left", "joint2_left", "joint3_left", "joint4_left", "joint5_left"]
+    left_gripper: ["joint6_left"]
+    right_arm: ["joint1_right", "joint2_right", "joint3_right", "joint4_right", "joint5_right"]
+    right_gripper: ["joint6_right"]
+    # Provide standard keys expected by loader.py
+    arm: ["joint1_left", "joint2_left", "joint3_left", "joint4_left", "joint5_left"]
+    gripper: ["joint6_left"]
+    all: ["joint1_left", "joint2_left", "joint3_left", "joint4_left", "joint5_left", "joint6_left", "joint1_right", "joint2_right", "joint3_right", "joint4_right", "joint5_right", "joint6_right"]
 
-  # MoveIt configuration (for left arm as primary)
-  moveit:
-    arm_group_name: left_arm
-    base_link: base
-    ee_link: left_gripper
-    shoulder_link: left_shoulder
+  default_control_mode: "teleop"
 
-  # Peripheral devices (cameras, microphones, etc.)
+  control_modes:
+    teleop:
+      description: "Bimanual teleoperation mode"
+      controllers:
+        - arm_position_controller_left
+        - gripper_position_controller_left
+        - arm_position_controller_right
+        - gripper_position_controller_right
+        - joint_state_broadcaster
+      inference:
+        enabled: false
+        force_disable: true
+      executor:
+        type: topic
+        mode: teleop
+        queue_size: 100
+        control_frequency: 50.0
+
+    model_inference:
+      description: "Bimanual inference mode"
+      controllers:
+        - arm_position_controller_left
+        - gripper_position_controller_left
+        - arm_position_controller_right
+        - gripper_position_controller_right
+        - joint_state_broadcaster
+      inference:
+        enabled: true
+        model: so101_act
+      executor:
+        type: topic
+        mode: model_inference
+
+  # Single ros2_control entry for Multi-Hardware
+  ros2_control:
+    hardware_plugin: so101_hardware/SO101SystemHardware
+    urdf_path: $(find robot_description)/urdf/lerobot/so101/so101_dual.urdf.xacro
+    controllers_config: $(find so101_hardware)/config/so101_dual_controllers.yaml
+
+    # Generic mapping: inject these directly into URDF xacro args
+    xacro_args:
+      port_1: /dev/ttyACM0
+      calib_file_1: $(env HOME)/.calibrate/so101_follower_left_calibrate.json
+      port_2: /dev/ttyACM1
+      calib_file_2: $(env HOME)/.calibrate/so101_follower_right_calibrate.json
+
+    controllers:
+      - arm_position_controller_left
+      - gripper_position_controller_left
+      - arm_position_controller_right
+      - gripper_position_controller_right
+      - joint_state_broadcaster
+
+  # Teleoperation (Bimanual Leader)
+  teleoperation:
+    enabled: true
+    active_devices:
+      - "left_leader"
+      - "right_leader"
+    devices:
+      - name: "left_leader"
+        type: "leader_arm"
+        port: "/dev/ttyACM2"
+        calib_file: "$(env HOME)/.calibrate/so101_leader_left_calibrate.json"
+        joint_mapping:
+          "1": "joint1_left"
+          "2": "joint2_left"
+          "3": "joint3_left"
+          "4": "joint4_left"
+          "5": "joint5_left"
+          "6": "joint6_left"
+        target:
+          arm_joint_names: ["joint1_left", "joint2_left", "joint3_left", "joint4_left", "joint5_left"]
+          gripper_joint_names: ["joint6_left"]
+          arm_command_topic: "/arm_position_controller_left/commands"
+          gripper_command_topic: "/gripper_position_controller_left/commands"
+      - name: "right_leader"
+        type: "leader_arm"
+        port: "/dev/ttyACM3"
+        calib_file: "$(env HOME)/.calibrate/so101_leader_right_calibrate.json"
+        joint_mapping:
+          "1": "joint1_right"
+          "2": "joint2_right"
+          "3": "joint3_right"
+          "4": "joint4_right"
+          "5": "joint5_right"
+          "6": "joint6_right"
+        target:
+          arm_joint_names: ["joint1_right", "joint2_right", "joint3_right", "joint4_right", "joint5_right"]
+          gripper_joint_names: ["joint6_right"]
+          arm_command_topic: "/arm_position_controller_right/commands"
+          gripper_command_topic: "/gripper_position_controller_right/commands"
+
+  # Peripheral devices (cameras)
   peripherals:
-    # Top-down view camera
     - type: camera
       name: top
       driver: opencv
-      index: 0
-      width: 640
-      height: 480
-      fps: 30
-      pixel_format: bgr8
+      index: 2
+      width: 320
+      height: 240
+      fps: 60
+      pixel_format: mjpeg2rgb
       frame_id: camera_top_frame
       optical_frame_id: camera_top_optical_frame
+      use_default_transform: false
       transform:
         parent_frame: base_link
         x: 0.0
         y: 0.0
-        z: 0.5
+        z: 0.0
         roll: 0.0
         pitch: 0.0
         yaw: 0.0
-
-    # Left wrist camera
+      fovy: 0
     - type: camera
       name: left_wrist
       driver: opencv
-      index: 2
-      width: 640
-      height: 480
+      index: 0
+      width: 320
+      height: 240
       fps: 60
-      pixel_format: bgr8
+      pixel_format: mjpeg2rgb
       frame_id: camera_left_wrist_frame
       optical_frame_id: camera_left_wrist_optical_frame
+      use_default_transform: false
       transform:
-        parent_frame: left_wrist_link
+        parent_frame: gripper_left
         x: 0.0
         y: 0.0
         z: 0.0
         roll: 0.0
         pitch: 0.0
         yaw: 0.0
-
-    # Right wrist camera
+      fovy: 0
     - type: camera
       name: right_wrist
       driver: opencv
       index: 4
-      width: 640
-      height: 480
+      width: 320
+      height: 240
       fps: 60
-      pixel_format: bgr8
+      pixel_format: mjpeg2rgb
       frame_id: camera_right_wrist_frame
       optical_frame_id: camera_right_wrist_optical_frame
+      use_default_transform: false
       transform:
-        parent_frame: right_wrist_link
+        parent_frame: gripper_right
         x: 0.0
         y: 0.0
         z: 0.0
         roll: 0.0
         pitch: 0.0
         yaw: 0.0
+      fovy: 0
 
-  # IB-Robot contract integration
+  safety:
+    joint_limits:
+      "joint1_left":  {"min": -2.0693, "max": 2.0709}
+      "joint2_left":  {"min": -1.92,   "max": 1.92}
+      "joint3_left":  {"min": -1.6813, "max": 1.6828}
+      "joint4_left":  {"min": -1.65806, "max": 1.65806}
+      "joint5_left":  {"min": -2.9115, "max": 2.9115}
+      "joint6_left":  {"min": 0.0,     "max": 1.0}
+      "joint1_right": {"min": -2.0693, "max": 2.0709}
+      "joint2_right": {"min": -1.92,   "max": 1.92}
+      "joint3_right": {"min": -1.6813, "max": 1.6828}
+      "joint4_right": {"min": -1.65806, "max": 1.65806}
+      "joint5_right": {"min": -2.9115, "max": 2.9115}
+      "joint6_right": {"min": 0.0,     "max": 1.0}
+
+  # Contract: defines observation-action interface for recording & inference
   contract:
-    base_contract: $(find robot_config)/config/contracts/act_grab_pan.yaml
     rate_hz: 20
-    max_duration_s: 90.0
-
+    max_duration_s: 120.0
     observations:
       - key: observation.images.top
-        topic: /camera/top
+        topic: /camera/top/image_raw
+        type: sensor_msgs/msg/Image
         peripheral: top
         image:
-          resize: [480, 640]
+          resize: [240, 320]
         align:
           strategy: hold
           stamp: header
@@ -120,12 +210,12 @@ robot:
           reliability: best_effort
           history: keep_last
           depth: 10
-
       - key: observation.images.left_wrist
-        topic: /camera/left_wrist
+        topic: /camera/left_wrist/image_raw
+        type: sensor_msgs/msg/Image
         peripheral: left_wrist
         image:
-          resize: [480, 640]
+          resize: [240, 320]
         align:
           strategy: hold
           stamp: header
@@ -134,12 +224,12 @@ robot:
           reliability: best_effort
           history: keep_last
           depth: 10
-
       - key: observation.images.right_wrist
-        topic: /camera/right_wrist
+        topic: /camera/right_wrist/image_raw
+        type: sensor_msgs/msg/Image
         peripheral: right_wrist
         image:
-          resize: [480, 640]
+          resize: [240, 320]
         align:
           strategy: hold
           stamp: header
@@ -148,25 +238,23 @@ robot:
           reliability: best_effort
           history: keep_last
           depth: 10
-
       - key: observation.state
         topic: /joint_states
+        type: sensor_msgs/msg/JointState
         selector:
           names:
-            # Left arm (leader)
-            - position.leader_arm:shoulder_pan
-            - position.leader_arm:shoulder_lift
-            - position.leader_arm:elbow_flex
-            - position.leader_arm:wrist_flex
-            - position.leader_arm:wrist_roll
-            - position.leader_arm:gripper
-            # Right arm (follower)
-            - position.follower_arm:shoulder_pan
-            - position.follower_arm:shoulder_lift
-            - position.follower_arm:elbow_flex
-            - position.follower_arm:wrist_flex
-            - position.follower_arm:wrist_roll
-            - position.follower_arm:gripper
+            - "position.joint1_left"
+            - "position.joint2_left"
+            - "position.joint3_left"
+            - "position.joint4_left"
+            - "position.joint5_left"
+            - "position.joint6_left"
+            - "position.joint1_right"
+            - "position.joint2_right"
+            - "position.joint3_right"
+            - "position.joint4_right"
+            - "position.joint5_right"
+            - "position.joint6_right"
         align:
           strategy: hold
           stamp: header
@@ -175,28 +263,70 @@ robot:
           reliability: best_effort
           history: keep_last
           depth: 50
-
     actions:
       - key: action
         selector:
           names:
-            # Left arm (leader)
-            - position.leader_arm:shoulder_pan
-            - position.leader_arm:shoulder_lift
-            - position.leader_arm:elbow_flex
-            - position.leader_arm:wrist_flex
-            - position.leader_arm:wrist_roll
-            - position.leader_arm:gripper
-            # Right arm (follower)
-            - position.follower_arm:shoulder_pan
-            - position.follower_arm:shoulder_lift
-            - position.follower_arm:elbow_flex
-            - position.follower_arm:wrist_flex
-            - position.follower_arm:wrist_roll
-            - position.follower_arm:gripper
+            - "action.0"   # joint1_left
+            - "action.1"   # joint2_left
+            - "action.2"   # joint3_left
+            - "action.3"   # joint4_left
+            - "action.4"   # joint5_left
         publish:
-          topic: /joint_commands
-          type: sensor_msgs/msg/JointState
+          topic: /arm_position_controller_left/commands
+          type: std_msgs/msg/Float64MultiArray
+          layout: flat
+          qos:
+            reliability: best_effort
+            history: keep_last
+            depth: 10
+          strategy:
+            mode: nearest
+            tolerance_ms: 500
+        safety_behavior: hold
+      - key: action
+        selector:
+          names:
+            - "action.5"   # joint6_left
+        publish:
+          topic: /gripper_position_controller_left/commands
+          type: std_msgs/msg/Float64MultiArray
+          layout: flat
+          qos:
+            reliability: best_effort
+            history: keep_last
+            depth: 10
+          strategy:
+            mode: nearest
+            tolerance_ms: 500
+        safety_behavior: hold
+      - key: action
+        selector:
+          names:
+            - "action.6"   # joint1_right
+            - "action.7"   # joint2_right
+            - "action.8"   # joint3_right
+            - "action.9"   # joint4_right
+            - "action.10"  # joint5_right
+        publish:
+          topic: /arm_position_controller_right/commands
+          type: std_msgs/msg/Float64MultiArray
+          layout: flat
+          qos:
+            reliability: best_effort
+            history: keep_last
+            depth: 10
+          strategy:
+            mode: nearest
+            tolerance_ms: 500
+        safety_behavior: hold
+      - key: action
+        selector:
+          names:
+            - "action.11"  # joint6_right
+        publish:
+          topic: /gripper_position_controller_right/commands
+          type: std_msgs/msg/Float64MultiArray
           layout: flat
           qos:
             reliability: best_effort
@@ -207,5 +337,6 @@ robot:
             tolerance_ms: 500
         safety_behavior: hold
 
-    recording:
-      storage: mcap
+  recording:
+    bag_base_dir: "~/rosbag/episodes"
+    storage: mcap

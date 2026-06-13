@@ -46,6 +46,18 @@ def _get_model_spawn_offset(robot_config: dict) -> tuple[float, float, float]:
     )
 
 
+def _stringify_xacro_value(value) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, dict | list):
+        return json.dumps(value)
+    if isinstance(value, str):
+        return resolve_ros_path(value)
+    return str(value)
+
+
 def _build_cameras_urdf_from_yaml(
     peripherals: list,
     platform: str = "gazebo",
@@ -256,14 +268,12 @@ def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: s
         # literal single-quoted string '{"1":0.0}' and fail to parse it.
         "reset_positions": reset_positions_json,
     }
-    custom_xacro_mappings = ros2_control_config.get("xacro_mappings", {})
-    for key, value in custom_xacro_mappings.items():
-        if isinstance(value, bool):
-            xacro_mappings[str(key)] = "true" if value else "false"
-        elif isinstance(value, dict | list):
-            xacro_mappings[str(key)] = json.dumps(value)
-        elif value is not None:
-            xacro_mappings[str(key)] = str(value)
+
+    for source_key in ("xacro_args", "xacro_mappings"):
+        for key, value in ros2_control_config.get(source_key, {}).items():
+            xacro_value = _stringify_xacro_value(value)
+            if xacro_value is not None:
+                xacro_mappings[str(key)] = xacro_value
 
     if "serial_port" not in xacro_mappings and port:
         xacro_mappings["serial_port"] = str(port)

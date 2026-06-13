@@ -3,19 +3,18 @@
 
 import argparse
 import pathlib
+
 import rclpy
-from rclpy.node import Node
-from lerobot.motors.feetech import FeetechMotorsBus
 from lerobot.motors import Motor, MotorNormMode
-from so101_hardware.calibration.interactive import run_interactive_calibration, save_calibration
+from lerobot.motors.feetech import FeetechMotorsBus
+from rclpy.node import Node
+
 from so101_hardware.calibration.constants import (
+    DEFAULT_SERIAL_PORT,
     FOLLOWER_CALIB_FILE,
     LEADER_CALIB_FILE,
-    DEFAULT_SERIAL_PORT,
-    MOTOR_IDS,
-    JOINT_NAMES,
 )
-
+from so101_hardware.calibration.interactive import run_interactive_calibration, save_calibration
 
 # Arm-specific configurations
 ARM_CONFIGS = {
@@ -29,7 +28,7 @@ ARM_CONFIGS = {
             "4": {"id": 4, "model": "sts3215", "mode": MotorNormMode.RANGE_M100_100},
             "5": {"id": 5, "model": "sts3215", "mode": MotorNormMode.RANGE_M100_100},
             "6": {"id": 6, "model": "sts3215", "mode": MotorNormMode.RANGE_0_100},
-        }
+        },
     },
     "leader": {
         "calib_path": LEADER_CALIB_FILE,
@@ -41,29 +40,28 @@ ARM_CONFIGS = {
             "4": {"id": 4, "model": "sts3215", "mode": MotorNormMode.RANGE_M100_100},
             "5": {"id": 5, "model": "sts3215", "mode": MotorNormMode.RANGE_M100_100},
             "6": {"id": 6, "model": "sts3215", "mode": MotorNormMode.RANGE_0_100},
-        }
-    }
+        },
+    },
 }
 
 
 class UnifiedCalibrator(Node):
-    def __init__(self, arm_type: str, port: str):
+    def __init__(self, arm_type: str, port: str, calib_path_override: str = None):
         super().__init__(f"so101_{arm_type}_calibrator")
         self.arm_type = arm_type
         self.port = port
-        
+
         config = ARM_CONFIGS[arm_type]
-        self.calib_path = config["calib_path"]
+        self.calib_path = (
+            pathlib.Path(calib_path_override).expanduser() if calib_path_override else config["calib_path"]
+        )
         self.joints_config = config["joints"]
 
     def run(self):
         self.get_logger().info(f"Starting calibration for {self.arm_type.upper()} arm on {self.port}")
 
         # Build motor objects
-        motors = {
-            name: Motor(cfg["id"], cfg["model"], cfg["mode"])
-            for name, cfg in self.joints_config.items()
-        }
+        motors = {name: Motor(cfg["id"], cfg["model"], cfg["mode"]) for name, cfg in self.joints_config.items()}
         joint_names = list(self.joints_config.keys())
 
         # Connect to bus
@@ -98,10 +96,18 @@ class UnifiedCalibrator(Node):
 
 def main():
     parser = argparse.ArgumentParser(description="Calibrate SO-101 Leader or Follower arm")
-    parser.add_argument("--arm", choices=["leader", "follower"], default="follower",
-                        help="Which arm to calibrate (default: follower)")
-    parser.add_argument("--port", type=str, default=None,
-                        help="Serial port (default: /dev/ttyACM0 for follower, /dev/ttyACM1 for leader)")
+    parser.add_argument(
+        "--arm", choices=["leader", "follower"], default="follower", help="Which arm to calibrate (default: follower)"
+    )
+    parser.add_argument(
+        "--port",
+        type=str,
+        default=None,
+        help="Serial port (default: /dev/ttyACM0 for follower, /dev/ttyACM1 for leader)",
+    )
+    parser.add_argument(
+        "--calib-file", type=str, default=None, help="Custom path for the calibration JSON file (overrides default)"
+    )
 
     args = parser.parse_args()
 
@@ -109,7 +115,7 @@ def main():
     port = args.port if args.port else ARM_CONFIGS[args.arm]["default_port"]
 
     rclpy.init()
-    calibrator = UnifiedCalibrator(args.arm, port)
+    calibrator = UnifiedCalibrator(args.arm, port, args.calib_file)
     try:
         calibrator.run()
     except KeyboardInterrupt:
