@@ -435,12 +435,13 @@ def validate_config(config: RobotConfig) -> list[str]:
             "open_gripper_skill",
             "close_gripper_skill",
             "recover_safe_pose",
+            "recover_zero_pose",
             "move_relative_ee",
             "gripper_point_down",
             "rotate_gripper_cw",
             "rotate_gripper_ccw",
         }
-        required_pose_names = {"home", "observe_table", config.embodied.default_place_name}
+        required_pose_names = {"home", "observe_table", "zero", config.embodied.default_place_name}
         missing_pose_names = sorted(p for p in required_pose_names if p not in config.embodied.named_poses)
         if missing_pose_names:
             errors.append("embodied.named_poses is missing required pose(s): " + ", ".join(missing_pose_names))

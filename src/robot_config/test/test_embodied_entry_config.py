@@ -41,3 +41,22 @@ def test_loaded_embodied_skill_templates_include_dance_basic(config_name):
     assert primitive_sequence
     assert primitive_sequence[0]["primitive_name"] == "move_through_joint_positions"
     assert primitive_sequence[0]["joint_waypoints"]
+
+
+@pytest.mark.parametrize(
+    ("skill_name", "pose_name"),
+    [
+        ("recover_safe_pose", "home"),
+        ("inspect_scene", "observe_table"),
+        ("recover_zero_pose", "zero"),
+    ],
+)
+def test_embodied_named_pose_skills_map_to_configured_poses(skill_name, pose_name):
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config = load_robot_config_dict(config_path)
+    skill_templates = config["embodied"]["skill_templates"]
+
+    assert pose_name in config["embodied"]["named_poses"]
+    assert skill_templates[skill_name]["primitive_sequence"] == [
+        {"primitive_name": "move_to_named_pose", "pose_name": pose_name}
+    ]

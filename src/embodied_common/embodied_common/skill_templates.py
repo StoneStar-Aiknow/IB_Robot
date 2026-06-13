@@ -19,6 +19,7 @@ SUPPORTED_PRIMITIVES = {
 DEFAULT_SKILL_TEMPLATES: dict[str, dict[str, Any]] = {
     "inspect_scene": {"primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}]},
     "recover_safe_pose": {"primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "home"}]},
+    "recover_zero_pose": {"primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "zero"}]},
     "observe_target_area": {
         "primitive_sequence": [{"primitive_name": "move_to_named_pose", "target_pose_key": "observe_pose"}]
     },

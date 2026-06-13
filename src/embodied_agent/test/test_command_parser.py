@@ -19,6 +19,20 @@ def test_parse_observe_command():
     assert plan.skill_sequence == ["inspect_scene"]
 
 
+@pytest.mark.parametrize(
+    ("text", "task_type", "skill_name"),
+    [
+        ("原位", "recover_safe_pose", "recover_safe_pose"),
+        ("观察点", "observe_scene", "inspect_scene"),
+        ("零点", "recover_zero_pose", "recover_zero_pose"),
+    ],
+)
+def test_parse_named_pose_keywords(text, task_type, skill_name):
+    plan = parse_text_command(text)
+    assert plan.task_type == task_type
+    assert plan.skill_sequence == [skill_name]
+
+
 def test_parse_target_observe_command():
     plan = parse_text_command("观察香蕉")
     assert plan.task_type == "observe_target_area"

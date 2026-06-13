@@ -177,6 +177,7 @@ robot:
       reject_invalid_only: true
       direct_skill_whitelist:
         - recover_safe_pose
+        - recover_zero_pose
         - open_gripper_skill
         - close_gripper_skill
         - rotate_gripper_cw
@@ -230,6 +231,7 @@ robot:
           - place_named_pose
           - release_at_named_pose
           - recover_safe_pose
+          - recover_zero_pose
           - move_relative_ee
           - open_gripper_skill
           - close_gripper_skill
@@ -284,43 +286,28 @@ robot:
         y: [-0.32, 0.25]
         z: [0.02, 0.40]
     named_poses:
-      gripper_down:
-        position: {x: 0.22, y: 0.00, z: 0.20}
-        orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
       home:
-        position: {x: 0.22, y: 0.00, z: 0.26}
-        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
+        position: {x: 0.020030733201442157, y: -0.11809839488683391, z: 0.13887055751050842}
+        orientation: {x: -0.26790866048257905, y: -0.2622185975709204, z: -0.6525133891660432, w: 0.6585534402654153}
       observe_table:
-        position: {x: 0.28, y: 0.00, z: 0.24}
-        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
-      tray_right:
-        position: {x: 0.24, y: -0.16, z: 0.18}
-        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
-      demo_pregrasp:
-        position: {x: 0.28, y: 0.00, z: 0.14}
-        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
-      demo_observe:
-        position: {x: 0.25, y: 0.00, z: 0.26}
-        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
-      demo_hover:
-        position: {x: 0.30, y: 0.00, z: 0.13}
-        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
-      demo_grasp:
-        position: {x: 0.30, y: 0.00, z: 0.08}
-        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
-      demo_lift:
-        position: {x: 0.28, y: 0.00, z: 0.22}
-        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
-      demo_retreat:
-        position: {x: 0.22, y: 0.00, z: 0.20}
-        orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}
+        position: {x: 0.02160863957360322, y: -0.1310933191355222, z: 0.33769602460194537}
+        orientation: {x: -0.35328551634048977, y: -0.32020226597268203, z: -0.5842845082802226, w: 0.6567126207053827}
+      zero:
+        position: {x: 0.0210077843415008, y: -0.278950111258735, z: 0.24858389783148477}
+        orientation: {x: -0.4740206645801369, y: -0.4668084047044082, z: -0.523033090590171, w: 0.532757645647648}
     skill_templates:
       inspect_scene:
-        primitive_sequence: []
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: observe_table
       recover_safe_pose:
         primitive_sequence:
           - primitive_name: move_to_named_pose
             pose_name: home
+      recover_zero_pose:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: zero
       observe_target_area:
         primitive_sequence:
           - primitive_name: move_to_named_pose

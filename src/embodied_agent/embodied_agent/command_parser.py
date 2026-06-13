@@ -67,7 +67,9 @@ def parse_text_command(
             message="empty command",
         )
 
-    if _contains_any(normalized, ["观察桌面", "看看桌面", "查看桌面", "扫描桌面", "观察场景", "看看场景"]):
+    if _contains_any(
+        normalized, ["观察点", "观察位置", "观察桌面", "看看桌面", "查看桌面", "扫描桌面", "观察场景", "看看场景"]
+    ):
         return PlannedTask(
             task_type="observe_scene",
             target_name="",
@@ -87,7 +89,7 @@ def parse_text_command(
             skill_sequence=["observe_target_area"],
         )
 
-    if _contains_any(normalized, ["回到home", "回原位", "回安全位", "回安全位置", "返回home"]):
+    if _contains_any(normalized, ["原位", "原点", "回到home", "回原位", "回安全位", "回安全位置", "返回home"]):
         return PlannedTask(
             task_type="recover_safe_pose",
             target_name="",
@@ -95,6 +97,16 @@ def parse_text_command(
             motion_direction="",
             motion_distance=0.0,
             skill_sequence=["recover_safe_pose"],
+        )
+
+    if _contains_any(normalized, ["零点", "零位", "回零点", "到零点"]):
+        return PlannedTask(
+            task_type="recover_zero_pose",
+            target_name="",
+            place_name="",
+            motion_direction="",
+            motion_distance=0.0,
+            skill_sequence=["recover_zero_pose"],
         )
 
     if _contains_any(normalized, ["打开夹爪", "张开夹爪", "展开夹爪", "夹爪打开", "夹爪张开", "开爪"]):
