@@ -9,7 +9,6 @@ from rclpy.action import ActionClient
 
 from embodied_agent.base_node import BaseTaskNode
 from embodied_agent.task_context import ensure_timeout_context, remaining_task_budget_sec
-from embodied_common.base_node import BaseTaskNode
 from ibrobot_msgs.action import SkillCommand
 from ibrobot_msgs.msg import TaskCommand, TaskStatus
 
