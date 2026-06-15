@@ -160,8 +160,9 @@ setup_os_variables() {
         PACKAGE_MANAGER="apt"
         ROS_DISTRO="humble"
         # Ubuntu uses official ROS 2 repository
-        ROS_REPO_URL="http://packages.ros.org/ros2/ubuntu"
-        ROS_GPG_KEY="https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc"
+        ROS_REPO_URL="${ROS_REPO_URL:-http://packages.ros.org/ros2/ubuntu}"
+        ROS_GPG_KEY="${ROS_GPG_KEY:-https://raw.githubusercontent.com/ros/rosdistro/master/ros.asc}"
+        ROS_GPG_KEY_MIRROR="https://mirrors.tuna.tsinghua.edu.cn/rosdistro/ros.asc"
     elif [[ "$OS_ID" == "openeuler" ]]; then
         PACKAGE_MANAGER="dnf"
         ROS_DISTRO="humble"
@@ -255,9 +256,14 @@ install_ubuntu_ros() {
     fi
 
     if ! curl -fsSL "$ROS_GPG_KEY" -o /tmp/ros.asc; then
-        log_error "Failed to download ROS 2 GPG key from $ROS_GPG_KEY"
-        log_error "Please check your internet connection"
-        return 1
+        log_warn "Failed to download ROS 2 GPG key from $ROS_GPG_KEY, trying TUNA mirror..."
+        if ! curl -fsSL "$ROS_GPG_KEY_MIRROR" -o /tmp/ros.asc; then
+            log_error "Failed to download ROS 2 GPG key from both primary and mirror"
+            log_error "Primary:  $ROS_GPG_KEY"
+            log_error "Mirror:   $ROS_GPG_KEY_MIRROR"
+            log_error "Please check your internet connection"
+            return 1
+        fi
     fi
 
     if ! run_sudo mv /tmp/ros.asc /etc/apt/keyrings/ros.asc &>/dev/null; then

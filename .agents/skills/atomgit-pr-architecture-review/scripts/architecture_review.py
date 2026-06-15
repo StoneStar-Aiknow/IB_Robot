@@ -95,6 +95,7 @@ class ArchitectureReviewer:
             "pr": {
                 "number": pr.get("number"),
                 "title": pr.get("title"),
+                "body": pr.get("body") or "",
                 "author": pr.get("user", {}).get("login"),
                 "branch": f"{pr.get('head', {}).get('ref')} → {pr.get('base', {}).get('ref')}",
                 "head_sha": head_sha,
