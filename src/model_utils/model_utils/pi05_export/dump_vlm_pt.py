@@ -168,8 +168,26 @@ def dump(
         np.save(out_path / "vlm_in_lang_tokens.npy", tok_np)
         np.save(out_path / "vlm_in_lang_masks.npy", msk_np)
 
-        # PI05 prefix sequence length: 256 image-patches × num_cameras + 200 lang
-        prefix_seq_len = 256 * len(img_keys) + 200
+        # Derive the prefix sequence length from the checkpoint config and the
+        # actual tokenized language mask instead of hardcoding constants, so a
+        # checkpoint with a different image resolution / patch size or language
+        # length still dumps a mask that matches what the model/OM consume.
+        # image tokens per camera = (image_size / patch_size) ** 2 (SigLIP).
+        vision_cfg = getattr(policy.config, "vision_config", None) or getattr(
+            getattr(policy, "config", None), "vlm_config", None
+        )
+        image_tokens_per_camera = 256
+        try:
+            image_size = int(vision_cfg.image_size)
+            patch_size = int(vision_cfg.patch_size)
+            image_tokens_per_camera = (image_size // patch_size) ** 2
+        except (AttributeError, TypeError, ValueError):
+            LOGGER.warning(
+                "Could not derive image tokens from vision config; falling back to %d per camera",
+                image_tokens_per_camera,
+            )
+        lang_seq_len = int(msk_np.shape[1])
+        prefix_seq_len = image_tokens_per_camera * len(img_keys) + lang_seq_len
         prefix_mask = build_prefix_att_2d_masks_4d_np(
             num_cameras=len(img_keys),
             lang_masks=msk_np,

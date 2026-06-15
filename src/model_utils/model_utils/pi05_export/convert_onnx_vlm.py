@@ -579,7 +579,17 @@ def main() -> int:
     )
 
     if not args.skip_om_manifest:
-        manifest_dir = args.om_manifest_dir if args.om_manifest_dir is not None else policy_path
+        if args.om_manifest_dir is not None:
+            manifest_dir = Path(args.om_manifest_dir).expanduser().resolve()
+        else:
+            local_policy_path = Path(policy_path).expanduser()
+            if not local_policy_path.is_dir():
+                raise ValueError(
+                    "--om-manifest-dir is required when --pretrained-policy-path is not a local "
+                    f"policy directory (got {policy_path!r}); otherwise the manifest would be "
+                    "written to a wrong location relative to the current working directory"
+                )
+            manifest_dir = local_policy_path.resolve()
         om_path = args.om_path if args.om_path is not None else "vlm.om"
         manifest_path = upsert_pi05_om_manifest(manifest_dir, "vlm", om_path)
         LOGGER.info("Updated OM manifest (vlm) at %s", manifest_path)

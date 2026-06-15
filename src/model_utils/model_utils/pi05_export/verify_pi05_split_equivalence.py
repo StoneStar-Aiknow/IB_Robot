@@ -977,9 +977,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--task",
         type=str,
-        default="",
-        help="Task description string for prompt generation when using "
-        "real batches (e.g. 'pick up the cup'). Defaults to empty.",
+        required=True,
+        help="Natural-language task prompt used by the deployed policy for "
+        "prompt generation (e.g. 'pick up the cup'). Pass the same text as the "
+        "robot contract.default_task so verification matches deployment "
+        "conditioning instead of an empty prompt.",
     )
     p.add_argument("--log-level", type=str, default="INFO")
     p.add_argument("--local-files-only", action="store_true", default=True)

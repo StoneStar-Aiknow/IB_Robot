@@ -302,15 +302,32 @@ def build_inputs(
     past_kv_tensor = torch.load(past_kv_path, map_location=device)
     prefix_pad_masks = torch.load(prefix_pad_masks_path, map_location=device)
 
+    # The saved VLM tensors carry the batch dimension produced during VLM
+    # export. Reuse it as the authoritative batch size so we never mix a
+    # batch-N cache with batch-M time/noise inputs (which would either fail to
+    # trace or bake a wrong shape assumption into the exported ONNX graph).
+    actual_batch = int(past_kv_tensor.shape[0])
+    if int(prefix_pad_masks.shape[0]) != actual_batch:
+        raise ValueError(
+            "past_kv_tensor and prefix_pad_masks have mismatched batch sizes "
+            f"({actual_batch} vs {int(prefix_pad_masks.shape[0])}); re-run the VLM export to "
+            "regenerate consistent runtime tensors"
+        )
+    if actual_batch != batch_size:
+        raise ValueError(
+            f"--batch-size={batch_size} does not match the saved VLM tensors batch={actual_batch}; "
+            "pass --batch-size matching the VLM export or re-run the VLM export with the desired batch"
+        )
+
     # Cast KV cache to the target dtype (it inherits dtype from VLM export)
     past_kv_tensor = past_kv_tensor.to(_dtype_for("past_kv_tensor"))
 
     # Time: start from 1.0 for the first denoising step
     time = torch.tensor(1.0, dtype=_dtype_for("time"), device=device)
-    time = time.view(1).repeat(batch_size)
+    time = time.view(1).repeat(actual_batch)
 
     # Noise: zero noise for deterministic inference (matches pi05 sample_noise)
-    noise = torch.zeros((batch_size, chunk_size, max_action_dim), dtype=_dtype_for("noise"), device=device)
+    noise = torch.zeros((actual_batch, chunk_size, max_action_dim), dtype=_dtype_for("noise"), device=device)
 
     observation = {
         "past_kv_tensor": past_kv_tensor,
@@ -508,7 +525,17 @@ def main() -> int:
     LOGGER.info("ONNX export finished")
 
     if not args.skip_om_manifest:
-        manifest_dir = args.om_manifest_dir if args.om_manifest_dir is not None else args.pretrained_policy_path
+        if args.om_manifest_dir is not None:
+            manifest_dir = Path(args.om_manifest_dir).expanduser().resolve()
+        else:
+            local_policy_path = Path(args.pretrained_policy_path).expanduser()
+            if not local_policy_path.is_dir():
+                raise ValueError(
+                    "--om-manifest-dir is required when --pretrained-policy-path is not a local "
+                    f"policy directory (got {args.pretrained_policy_path!r}); otherwise the manifest "
+                    "would be written to a wrong location relative to the current working directory"
+                )
+            manifest_dir = local_policy_path.resolve()
         om_path = args.om_path if args.om_path is not None else "action_expert.om"
         manifest_path = upsert_pi05_om_manifest(manifest_dir, "action_expert", om_path)
         LOGGER.info("Updated OM manifest (action_expert) at %s", manifest_path)

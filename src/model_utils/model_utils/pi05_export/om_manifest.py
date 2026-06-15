@@ -57,7 +57,7 @@ def upsert_pi05_om_manifest(manifest_dir: str | Path, role: str, om_path: str | 
     directory.mkdir(parents=True, exist_ok=True)
     manifest_path = directory / OM_MANIFEST_BASENAME
 
-    artifacts: dict[str, str] = {}
+    artifacts: dict[str, object] = {}
     if manifest_path.is_file():
         with manifest_path.open(encoding="utf-8") as f:
             existing = json.load(f)
@@ -73,7 +73,11 @@ def upsert_pi05_om_manifest(manifest_dir: str | Path, role: str, om_path: str | 
             )
         raw_artifacts = existing.get("artifacts")
         if isinstance(raw_artifacts, dict):
-            artifacts = {str(k): str(v) for k, v in raw_artifacts.items()}
+            # Preserve the original JSON shape of other roles' artifacts. The
+            # runtime loader accepts both a bare path string and an object form
+            # ({"path": ...}), so coercing values to str() would corrupt object
+            # entries into literal "{'path': ...}" strings.
+            artifacts = {str(k): v for k, v in raw_artifacts.items()}
 
     om_path = Path(om_path).expanduser()
     if not om_path.is_absolute():

@@ -9,6 +9,7 @@ model_utils 提供了一组用于 LeRobot 策略模型导出与验证的工具�
 | `export_onnx_rknn.py` | 专为 RK3588 NPU 导出 ONNX 模型，并可一键转换为 RKNN 格式 |
 | `loss_compare.py` | 跨平台模型推理精度对比验证 |
 | `frame_inspect` | 脱机逐帧/区间策略推理检查；需要 `policy-path`、`dataset-root` 和帧选择参数 |
+| `pi05_export/` | PI05 策略的 Ascend OM 拆分导出工具链（VLM + Action Expert 两段式导出与诊断），详见下文 |
 
 ---
 
@@ -386,3 +387,50 @@ output_dir/
 - 兼容 dict 和 tuple 两种数据集样本格式
 - 自动处理 `observation.current` / `observation.state` 键名差异，缺失时回退并发出警告
 - 支持跨数据集归一化（通过 `--stats-dataset-*` 使用训练时的统计信息）
+
+---
+
+## pi05_export（PI05 Ascend OM 拆分导出工具链）
+
+> **注意**：以下为简要说明，后续会补充更详细的端到端文档。
+
+PI05 策略与单体 ACT 模型不同，导出时被拆分为 **VLM 预填充** 与 **Action Expert 去噪** 两个独立的
+ONNX/OM artifact，分两步导出，并共同写入策略目录下的 `config.om.json`（供 `device:=ascend_om`
+运行时按 `vlm -> action_expert` 顺序加载）。相关脚本位于 `model_utils/pi05_export/` 子包，统一以
+`python -m model_utils.pi05_export.<脚本名>` 方式调用。
+
+### 导出脚本
+
+| 脚本 | 用途 |
+| --- | --- |
+| `convert_onnx_vlm` | 导出 VLM 段 ONNX，并将 `vlm` 条目写入 `config.om.json`；同时保存供 Action Expert 使用的运行期张量（`past_kv_tensor`、`prefix_pad_masks`） |
+| `convert_onnx_action_expert` | 读取 VLM 导出保存的运行期张量，导出 Action Expert 段 ONNX，并将 `action_expert` 条目写入 `config.om.json` |
+
+### 验证与诊断脚本
+
+| 脚本 | 用途 |
+| --- | --- |
+| `verify_pi05_split_equivalence` | 校验拆分导出（VLM + Action Expert）与原始整体 PI05 策略的等价性；使用真实 batch 时需通过 `--task` 指定与部署一致的任务提示 |
+| `dump_vlm_pt` | 在 PyTorch 侧 dump VLM 输入/输出张量，用于 PT/ORT/OM 三方逐张量对比 |
+| `dump_vlm_ort` | 在 ONNX Runtime 侧 dump VLM 张量（当前固定使用 CPUExecutionProvider，仅适用于 CPU 兼容的 ONNX 图） |
+| `dump_ae_pt` | 在 PyTorch 侧 dump Action Expert 输入/输出张量 |
+
+### 推荐工作流
+
+```shell
+# 1. 导出 VLM 段（同时生成 Action Expert 所需运行期张量与 config.om.json 的 vlm 条目）
+python -m model_utils.pi05_export.convert_onnx_vlm \
+    --pretrained-policy-path path/to/pretrained_model
+
+# 2. 导出 Action Expert 段（复用步骤 1 保存的运行期张量，补全 config.om.json）
+python -m model_utils.pi05_export.convert_onnx_action_expert \
+    --pretrained-policy-path path/to/pretrained_model
+
+# 3.（可选）验证拆分导出与原始策略的等价性
+python -m model_utils.pi05_export.verify_pi05_split_equivalence \
+    --pretrained-policy-path path/to/pretrained_model \
+    --task 'pick up the cup'
+```
+
+> 当 `--pretrained-policy-path` 传入的是 HuggingFace Hub repo id 而非本地目录时，需显式指定
+> `--om-manifest-dir`，以确保 `config.om.json` 写入真实的本地策略目录而非当前工作目录。
