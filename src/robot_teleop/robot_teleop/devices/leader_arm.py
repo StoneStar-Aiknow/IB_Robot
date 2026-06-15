@@ -5,12 +5,10 @@ Implements teleoperation via SO-101 leader arm hardware,
 reading joint positions from serial port and applying calibration.
 """
 
-import json
-import math
-import time
-from pathlib import Path
-from typing import Dict, Optional, Any
 import logging
+import math
+from pathlib import Path
+from typing import Any
 
 from ..base_teleop import BaseTeleopDevice
 
@@ -52,8 +50,8 @@ class LeaderArmDevice(BaseTeleopDevice):
 
     def connect(self) -> bool:
         try:
-            from lerobot.motors.feetech import FeetechMotorsBus
             from lerobot.motors import Motor, MotorNormMode
+            from lerobot.motors.feetech import FeetechMotorsBus
 
             motors = {}
             for joint_name, joint_info in self.joints.items():
@@ -61,7 +59,7 @@ class LeaderArmDevice(BaseTeleopDevice):
                 motors[joint_name] = Motor(
                     id=joint_info["id"],
                     model=joint_info["model"],
-                    norm_mode=norm_mode
+                    norm_mode=norm_mode,
                 )
 
             self.motors_bus = FeetechMotorsBus(port=self.port, motors=motors)
@@ -87,9 +85,9 @@ class LeaderArmDevice(BaseTeleopDevice):
         except Exception as e:
             self.logger.error(f"Failed to connect leader arm: {e}")
             self._is_connected = False
-            raise ConnectionError(f"Cannot connect to leader arm on {self.port}: {e}")
+            raise ConnectionError(f"Cannot connect to leader arm on {self.port}: {e}") from e
 
-    def get_joint_targets(self) -> Dict[str, float]:
+    def get_joint_targets(self) -> dict[str, float]:
         if not self._is_connected or self.motors_bus is None:
             return {}
 
@@ -130,8 +128,9 @@ class LeaderArmDevice(BaseTeleopDevice):
                 self.motors_bus = None
                 self._is_connected = False
 
-    def _load_calibration(self) -> Dict[str, Any]:
+    def _load_calibration(self) -> dict[str, Any]:
         from so101_hardware.calibration.interactive import load_calibration as load_calib_so101
+
         return load_calib_so101(self.calib_file, self.joint_names, self.logger)
 
     def _map_joint(self, leader_joint: str) -> str:
