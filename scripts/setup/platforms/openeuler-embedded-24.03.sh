@@ -45,7 +45,11 @@ ensure_openeuler_volatile_dirs() {
 
 platform_install_colcon() {
     if command -v pip3 &> /dev/null; then
-        pip3 install colcon-common-extensions --quiet
+        local pip_args=(--quiet)
+        if [[ -n "${SETUP_PIP_INDEX_URL:-}" ]]; then
+            pip_args+=(--index-url "${SETUP_PIP_INDEX_URL}" --trusted-host "${SETUP_PIP_TRUSTED_HOST}")
+        fi
+        pip3 install colcon-common-extensions "${pip_args[@]}"
     else
         log_error "pip3 not found, cannot install colcon."
         exit 1
