@@ -26,6 +26,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/TaskStatus.msg"
   "msg/SceneAnalysisRequest.msg"
   "msg/SceneAnalysisResult.msg"
+  "msg/SceneObject.msg"
+  "msg/SceneObservation.msg"
   "msg/AttentionWeights.msg"
   "msg/JointCurrent.msg"
   "action/RecordEpisode.action"

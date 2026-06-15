@@ -31,7 +31,7 @@ def test_prompt_builder_includes_task_and_image():
             "scene_summary": "桌面上能看到香蕉",
             "visible_objects": ["香蕉", "机械臂"],
         },
-        allowed_skills=["pick_named_target", "place_named_pose"],
+        allowed_skills=["inspect_scene", "recover_safe_pose"],
         named_poses={"tray_right": {}},
         named_targets={"demo_object": {}},
         workspace={"x": [0.0, 0.5]},
@@ -42,6 +42,7 @@ def test_prompt_builder_includes_task_and_image():
     assert "抓取目标物并放到右侧托盘" in messages[1]["content"][0]["text"]
     assert "scene_understanding" in messages[1]["content"][0]["text"]
     assert "required_missing_skills" in messages[1]["content"][0]["text"]
+    assert "Object grounding, picking, placing" in messages[0]["content"][0]["text"]
     assert messages[1]["content"][1]["type"] == "image_url"
     assert messages[1]["content"][2]["type"] == "image_url"
     assert "rgbd_context" in messages[1]["content"][0]["text"]

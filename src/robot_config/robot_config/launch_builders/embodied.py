@@ -25,7 +25,6 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
         )
 
     execution = embodied_config.get("execution", {})
-    entry = embodied_config.get("entry", {})
     named_poses = embodied_config.get("named_poses", {})
     named_targets = embodied_config.get("named_targets", {})
     skill_templates = embodied_config.get("skill_templates", {})
@@ -46,16 +45,14 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
         "allowed_skills",
         [
             "inspect_scene",
-            "observe_target_area",
-            "approach_named_target",
-            "hover_named_target",
-            "pick_named_target",
-            "lift_named_target",
-            "retreat_from_target",
-            "place_named_pose",
-            "release_at_named_pose",
             "recover_safe_pose",
+            "recover_zero_pose",
             "move_relative_ee",
+            "open_gripper_skill",
+            "close_gripper_skill",
+            "rotate_gripper_cw",
+            "rotate_gripper_ccw",
+            "dance_basic",
         ],
     )
 
@@ -165,6 +162,7 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
                     "text_input_topic": perception.get("text_input_topic", "/embodied/perception_text"),
                     "result_topic": perception.get("result_topic", "/embodied/perception_result"),
                     "summary_topic": perception.get("summary_topic", "/embodied/perception_summary"),
+                    "observation_topic": perception.get("observation_topic", "/embodied/perception_observation"),
                     "default_session_id": perception.get("default_session_id", "default"),
                     "primary_camera_topic": perception_scene_sources.get(
                         "primary_camera_topic", "/camera/top/image_raw"
@@ -189,6 +187,8 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
                     "api_max_image_width": perception_vlm_api.get("max_image_width", 320),
                     "api_jpeg_quality": perception_vlm_api.get("jpeg_quality", 70),
                     "max_history_turns": perception_conversation.get("max_history_turns", 4),
+                    "max_concurrent_requests": perception.get("max_concurrent_requests", 1),
+                    "min_object_confidence": perception.get("min_object_confidence", 0.0),
                 }
             ],
         )
@@ -226,33 +226,6 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
                     "default_place_name": embodied_config.get("default_place_name", "tray_right"),
                     "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
                     "default_task_timeout_sec": timeout_policy["task_budget_sec"],
-                    "forward_unmatched_to_planner": entry.get("forward_unmatched_to_planner", True),
-                    "reject_invalid_only": entry.get("reject_invalid_only", True),
-                    "direct_skill_whitelist_json": json.dumps(
-                        entry.get(
-                            "direct_skill_whitelist",
-                            [
-                                "recover_safe_pose",
-                                "open_gripper_skill",
-                                "close_gripper_skill",
-                                "rotate_gripper_cw",
-                                "rotate_gripper_ccw",
-                                "gripper_point_down",
-                                "move_relative_ee",
-                                "dance_basic",
-                            ],
-                        )
-                    ),
-                    "planner_route_keywords_json": json.dumps(
-                        entry.get(
-                            "planner_route_keywords",
-                            {
-                                "grasp": ["抓", "夹", "拿", "取"],
-                                "grounding": ["那个", "这个", "左边", "右边", "前面", "后面", "红色", "蓝色", "黄色"],
-                                "scene_query": ["看看", "找", "在哪里", "哪个"],
-                            },
-                        )
-                    ),
                 }
             ],
         ),

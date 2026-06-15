@@ -26,7 +26,7 @@ def _decode_launch_json_string(raw_value: str):
     return json.loads(normalized)
 
 
-def test_task_entry_direct_skill_whitelist_defaults_include_relative_motion_and_dance():
+def test_task_entry_launch_params_do_not_include_unused_routing_config():
     robot_config = {
         "embodied": {
             "enabled": True,
@@ -53,9 +53,10 @@ def test_task_entry_direct_skill_whitelist_defaults_include_relative_motion_and_
                     normalized_value = normalized_value.text
                 params[normalized_key] = normalized_value
 
-    direct_whitelist = json.loads(params["direct_skill_whitelist_json"].strip().strip("'"))
-    assert "move_relative_ee" in direct_whitelist
-    assert "dance_basic" in direct_whitelist
+    assert "forward_unmatched_to_planner" not in params
+    assert "reject_invalid_only" not in params
+    assert "direct_skill_whitelist_json" not in params
+    assert "planner_route_keywords_json" not in params
 
 
 @pytest.mark.parametrize("config_name", ["so101_single_arm"])

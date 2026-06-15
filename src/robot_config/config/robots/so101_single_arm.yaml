@@ -172,23 +172,6 @@ robot:
     validate_primitive_service: /embodied/validate_primitive
     default_target_name: demo_object
     default_place_name: tray_right
-    entry:
-      forward_unmatched_to_planner: true
-      reject_invalid_only: true
-      direct_skill_whitelist:
-        - recover_safe_pose
-        - recover_zero_pose
-        - open_gripper_skill
-        - close_gripper_skill
-        - rotate_gripper_cw
-        - rotate_gripper_ccw
-        - gripper_point_down
-        - move_relative_ee
-        - dance_basic
-      planner_route_keywords:
-        grasp: ["抓", "夹", "拿", "取"]
-        grounding: ["那个", "这个", "左边", "右边", "前面", "后面", "红色", "蓝色", "黄色"]
-        scene_query: ["看看", "找", "在哪里", "哪个"]
     timeouts:
       task_budget_sec: 180.0
       scene_freshness_sec: 0.5
@@ -222,22 +205,14 @@ robot:
         min_confidence: 0.70
         allowed_skills:
           - inspect_scene
-          - observe_target_area
-          - approach_named_target
-          - hover_named_target
-          - pick_named_target
-          - lift_named_target
-          - retreat_from_target
-          - place_named_pose
-          - release_at_named_pose
           - recover_safe_pose
           - recover_zero_pose
           - move_relative_ee
           - open_gripper_skill
           - close_gripper_skill
-          - gripper_point_down
           - rotate_gripper_cw
           - rotate_gripper_ccw
+          - dance_basic
     perception:
       enabled: false
       request_topic: /embodied/perception_request
@@ -308,45 +283,6 @@ robot:
         primitive_sequence:
           - primitive_name: move_to_named_pose
             pose_name: zero
-      observe_target_area:
-        primitive_sequence:
-          - primitive_name: move_to_named_pose
-            target_pose_key: observe_pose
-      approach_named_target:
-        primitive_sequence:
-          - primitive_name: move_to_named_pose
-            target_pose_key: pregrasp_pose
-      hover_named_target:
-        primitive_sequence:
-          - primitive_name: move_to_named_pose
-            target_pose_key: hover_pose
-      pick_named_target:
-        primitive_sequence:
-          - primitive_name: move_to_named_pose
-            target_pose_key: pregrasp_pose
-          - primitive_name: move_to_named_pose
-            target_pose_key: grasp_pose
-          - primitive_name: close_gripper
-          - primitive_name: move_to_named_pose
-            target_pose_key: lift_pose
-      lift_named_target:
-        primitive_sequence:
-          - primitive_name: move_to_named_pose
-            target_pose_key: lift_pose
-      retreat_from_target:
-        primitive_sequence:
-          - primitive_name: move_to_named_pose
-            target_pose_key: retreat_pose
-      place_named_pose:
-        primitive_sequence:
-          - primitive_name: move_to_named_pose
-            place_name_from_request: true
-          - primitive_name: open_gripper
-      release_at_named_pose:
-        primitive_sequence:
-          - primitive_name: move_to_named_pose
-            place_name_from_request: true
-          - primitive_name: open_gripper
       move_relative_ee:
         primitive_sequence:
           - primitive_name: move_relative_ee
@@ -358,10 +294,6 @@ robot:
       close_gripper_skill:
         primitive_sequence:
           - primitive_name: close_gripper
-      gripper_point_down:
-        primitive_sequence:
-          - primitive_name: move_to_named_pose
-            pose_name: gripper_down
       rotate_gripper_cw:
         primitive_sequence:
           - primitive_name: rotate_gripper_cw
@@ -435,22 +367,6 @@ robot:
                     x: [-0.32, 0.25]
                     y: [-0.42, 0.00]
                     z: [0.05, 0.55]
-    named_targets:
-      demo_object:
-        observe_pose: demo_observe
-        pregrasp_pose: demo_pregrasp
-        hover_pose: demo_hover
-        grasp_pose: demo_grasp
-        lift_pose: demo_lift
-        retreat_pose: demo_retreat
-      banana:
-        observe_pose: demo_observe
-        pregrasp_pose: demo_pregrasp
-        hover_pose: demo_hover
-        grasp_pose: demo_grasp
-        lift_pose: demo_lift
-        retreat_pose: demo_retreat
-
   # ros2_control configuration
   ros2_control:
     hardware_plugin: so101_hardware/SO101SystemHardware

@@ -588,8 +588,8 @@ def test_voice_asr_runtime_defaults_match_robot_config_defaults():
     assert config_defaults.exit_on_init_failure == VOICE_ASR_DEFAULTS["exit_on_init_failure"]
 
 
-def test_validate_embodied_requires_referenced_poses():
-    """Embodied targets must reference defined poses when enabled."""
+def test_validate_embodied_ignores_disabled_named_target_poses():
+    """Disabled target-grasp config must not be required for the basic embodied pipeline."""
     config = RobotConfig(
         name="test_robot",
         type="so101",
@@ -604,6 +604,7 @@ def test_validate_embodied_requires_referenced_poses():
             named_poses={
                 "home": {"position": {"x": 0.2, "y": 0.0, "z": 0.2}},
                 "observe_table": {"position": {"x": 0.3, "y": 0.0, "z": 0.25}},
+                "zero": {"position": {"x": 0.1, "y": 0.0, "z": 0.2}},
                 "tray_right": {"position": {"x": 0.2, "y": -0.15, "z": 0.18}},
             },
             named_targets={
@@ -618,7 +619,7 @@ def test_validate_embodied_requires_referenced_poses():
     )
 
     errors = validate_config(config)
-    assert any("missing_pregrasp" in error for error in errors)
+    assert not any("missing_pregrasp" in error for error in errors)
 
 
 def test_validate_embodied_relative_motion_direction_mapping():
@@ -910,4 +911,4 @@ def test_validate_embodied_skill_template_pose_keys():
     )
 
     errors = validate_config(config)
-    assert any("hover_pose is required" in error for error in errors)
+    assert any("unsupported skill key: hover_named_target" in error for error in errors)

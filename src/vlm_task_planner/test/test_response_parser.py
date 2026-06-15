@@ -1,30 +1,50 @@
+import pytest
+
 from vlm_task_planner.response_parser import parse_planner_response
 
 
-def test_parse_response_with_pick_and_place():
+def test_parse_response_with_relative_motion():
     plan = parse_planner_response(
         """
         {
-          "intent": "pick_and_place",
+          "intent": "relative_motion",
           "skill_sequence": [
-            {"skill_name": "pick_named_target", "args": {"target_name": "demo_object"}},
-            {"skill_name": "place_named_pose", "args": {"place_name": "tray_right"}}
+            {"skill_name": "move_relative_ee", "args": {"motion_direction": "forward", "motion_distance": 0.03}}
           ],
           "confidence": 0.91,
-          "scene_summary": "target visible on the table"
+          "scene_summary": "safe small motion"
         }
         """,
-        allowed_skills=["pick_named_target", "place_named_pose"],
+        allowed_skills=["move_relative_ee"],
         default_target_name="demo_object",
         default_place_name="tray_right",
         default_relative_motion_step_m=0.03,
     )
-    assert plan.task_type == "pick_and_place"
-    assert plan.target_name == "demo_object"
-    assert plan.place_name == "tray_right"
-    assert plan.skill_sequence == ["pick_named_target", "place_named_pose"]
+    assert plan.task_type == "relative_motion"
+    assert plan.motion_direction == "forward"
+    assert plan.motion_distance == 0.03
+    assert plan.skill_sequence == ["move_relative_ee"]
     assert plan.required_missing_skills == []
     assert plan.confidence == 0.91
+
+
+def test_parse_response_rejects_disabled_pick_skill_even_if_allowed():
+    with pytest.raises(ValueError, match="disabled skill"):
+        parse_planner_response(
+            """
+            {
+              "intent": "pick_only",
+              "skill_sequence": [
+                {"skill_name": "pick_named_target", "args": {"target_name": "demo_object"}}
+              ],
+              "confidence": 0.91
+            }
+            """,
+            allowed_skills=["pick_named_target"],
+            default_target_name="demo_object",
+            default_place_name="tray_right",
+            default_relative_motion_step_m=0.03,
+        )
 
 
 def test_parse_response_rejects_unknown_skill():
@@ -54,7 +74,7 @@ def test_parse_response_supports_missing_required_skills():
           "scene_summary": "看到了香蕉但缺少精确抓取定位"
         }
         """,
-        allowed_skills=["pick_named_target", "place_named_pose"],
+        allowed_skills=["inspect_scene"],
         default_target_name="demo_object",
         default_place_name="tray_right",
         default_relative_motion_step_m=0.03,

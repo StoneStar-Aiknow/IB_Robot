@@ -10,23 +10,6 @@ from robot_config.loader import load_robot_config_dict
     "config_name",
     ["so101_single_arm"],
 )
-def test_embodied_entry_direct_skill_whitelist_includes_move_and_dance(config_name):
-    config_path = Path(__file__).parent.parent / "config" / "robots" / f"{config_name}.yaml"
-
-    if not config_path.exists():
-        pytest.skip(f"Config file not found: {config_path}")
-
-    raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))["robot"]
-    direct_skills = raw_config["embodied"]["entry"]["direct_skill_whitelist"]
-
-    assert "move_relative_ee" in direct_skills
-    assert "dance_basic" in direct_skills
-
-
-@pytest.mark.parametrize(
-    "config_name",
-    ["so101_single_arm"],
-)
 def test_loaded_embodied_skill_templates_include_dance_basic(config_name):
     config_path = Path(__file__).parent.parent / "config" / "robots" / f"{config_name}.yaml"
 
@@ -41,6 +24,24 @@ def test_loaded_embodied_skill_templates_include_dance_basic(config_name):
     assert primitive_sequence
     assert primitive_sequence[0]["primitive_name"] == "move_through_joint_positions"
     assert primitive_sequence[0]["joint_waypoints"]
+
+
+def test_embodied_config_does_not_expose_unused_entry_routing():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))["robot"]
+
+    assert "entry" not in raw_config["embodied"]
+
+
+def test_embodied_config_keeps_only_supported_direct_skills():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config = load_robot_config_dict(config_path)
+    skill_templates = config["embodied"]["skill_templates"]
+
+    assert "dance_basic" in skill_templates
+    assert "pick_named_target" not in skill_templates
+    assert "place_named_pose" not in skill_templates
+    assert "observe_target_area" not in skill_templates
 
 
 @pytest.mark.parametrize(

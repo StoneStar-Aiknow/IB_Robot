@@ -664,7 +664,72 @@ export ROS_LOCALHOST_ONLY=1
 export DISPLAY=:1
 ```
 
-***
+---
+
+## 更新日志
+
+### 2025-06-15：感知系统增强 + 未实现技能清理
+
+#### 感知服务（perception_service）重大升级
+
+**新增 2D 物体检测 + 3D 坐标接地能力**，感知服务从"场景描述"升级为"物体级感知"：
+
+- **新增 `object_parser.py`**：解析 VLM 返回的物体级 grounding 结果（label、bbox、confidence），支持 `0-1000` 归一化坐标系到实际像素坐标的自动缩放
+- **新增 `grounding_3d.py`**：将 2D bbox 结合 RGB-D 深度图反投影为相机坐标系 3D 位置（中位深度估计 + 越界过滤）
+- **新增 ROS 消息类型**：
+  - `SceneObject.msg`：单物体检测结果（label、bbox、3D pose、confidence）
+  - `SceneObservation.msg`：完整场景观测（多物体列表 + 场景摘要 + 风险评估）
+- **新增 `perception_observation` topic**：发布结构化 `SceneObservation` 消息，供下游 planner / executor 消费
+- **prompt_builder 升级**：在 VLM prompt 中增加 `objects` 字段请求，要求返回 bbox 坐标；删除重复的 `append_images` 定义
+- **并发安全增强**：会话历史加线程锁（`_history_lock`），新增 `max_concurrent_requests` 信号量限制
+- **最小置信度过滤**：新增 `min_object_confidence` 参数，自动过滤低置信度物体
+
+**实际 VLM 验证通过**（使用 `glm-4.5v` 模型）：
+
+| 物体 | 2D bbox | 3D 位置 (m) | 置信度 |
+|---|---|---|---|
+| 草莓 | [355, 15, 548, 254] | (0.039, -0.036, 0.196) | 0.85 |
+| 白色长方体 | [204, 0, 481, 273] | (0.004, -0.029, 0.165) | 0.85 |
+| 黑色小方块 | [179, 373, 266, 443] | (-0.030, 0.046, 0.172) | 0.60 |
+| 电线 | [0, 313, 179, 479] | (-0.064, 0.040, 0.162) | 0.60 |
+
+> ⚠️ `glm-4.7` 不支持图像输入，感知节点请使用 `glm-4.5v` 作为视觉模型。
+
+#### 未实现技能清理（死代码移除）
+
+移除了 8 个依赖物理抓取流水线但尚未实现的技能及其全部关联代码（模板、配置、解析器、命令路由）：
+
+| 移除的技能 | 说明 |
+|---|---|
+| `pick_named_target` | 未对接实际抓取 pipeline |
+| `place_named_pose` | 同上 |
+| `observe_target_area` | 无实际感知闭环 |
+| `approach_named_target` | 无目标定位能力 |
+| `hover_named_target` | 同上 |
+| `lift_named_target` | 同上 |
+| `retreat_from_target` | 同上 |
+| `release_at_named_pose` | 同上 |
+
+**涉及变更的模块**：
+- `embodied_agent/command_parser.py`：删除硬编码的目标名解析和上述技能的文本路由
+- `embodied_common/skill_templates.py`：删除 8 个技能的模板定义
+- `vlm_task_planner/prompt_builder.py`：在 system prompt 中声明抓取/放置类技能已禁用
+- `vlm_task_planner/response_parser.py`：新增 `DISABLED_SKILLS` 集合，planner 若选中被禁用技能则报错
+- `robot_config/config/robots/so101_single_arm.yaml`：删除 `entry` 路由配置、`named_targets` 定义、被移除技能的 `allowed_skills` 和 `skill_templates`
+- `robot_config/robot_config/loader.py`：精简配置校验逻辑，移除 `target_pose_key` / `place_name_from_request` 等间接引用
+- `robot_config/robot_config/launch_builders/embodied.py`：移除 entry 参数注入
+
+#### 夹爪执行路径规划器（gripper_path.py）
+
+新增 `vlm_task_planner/gripper_path.py` 模块：根据任务描述和命名目标，生成夹爪执行路径（坐标接地 + 可达性检查），参考 Code as Policies + SayCan 模式设计。已集成到 `vlm_task_planner_node` 的 plan context 中。
+
+#### 测试
+
+- 新增 `test_object_parser.py`、`test_grounding_3d_fixture.py`、`test_perception_node_observation.py`、`test_realsense_rgbd_fixture.py`
+- 更新 `test_response_parser.py`、`test_prompt_builder.py`、`test_command_parser.py` 适配技能清理
+- **全部 16 项测试通过**，ruff lint 通过，3 个 ROS 包构建成功
+
+---
 
 **维护者**: IB-Robot Team\
 **使用指导**: <https://pages.openeuler.openatom.cn/embedded/docs/build/html/master/features/embodied_ai/index.html>\

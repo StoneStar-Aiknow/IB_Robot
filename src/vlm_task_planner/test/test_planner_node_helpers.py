@@ -17,10 +17,10 @@ def test_load_allowed_skills_empty_returns_empty_list():
 
 
 def test_load_allowed_skills_parses_array():
-    raw = json.dumps(["pick_named_target", "place_named_pose"])
+    raw = json.dumps(["inspect_scene", "dance_basic"])
     assert VLMTaskPlannerNode._load_allowed_skills(raw) == [
-        "pick_named_target",
-        "place_named_pose",
+        "inspect_scene",
+        "dance_basic",
     ]
 
 

@@ -16,18 +16,6 @@ def _sanitize_user_text(text: str) -> str:
         text = text[:_MAX_USER_TEXT_LEN]
     return text
 
-def append_images(content: list[dict[str, Any]], scene_snapshot: dict[str, Any]) -> None:
-    """Append image_url content blocks from a scene snapshot to a content list."""
-    images = scene_snapshot.get("images", [])
-    if isinstance(images, list) and images:
-        for item in images:
-            image_data_url = str(item.get("image_data_url", "")).strip()
-            if image_data_url:
-                content.append({"type": "image_url", "image_url": {"url": image_data_url}})
-    else:
-        image_data_url = scene_snapshot.get("image_data_url", "")
-        if image_data_url:
-            content.append({"type": "image_url", "image_url": {"url": image_data_url}})
 
 def append_images(content: list[dict[str, Any]], scene_snapshot: dict[str, Any]) -> None:
     """Append image_url content blocks from a scene snapshot to a content list."""
@@ -137,6 +125,10 @@ def build_scene_analysis_messages(
         "Return JSON only, in Chinese.\n"
         "The JSON object must contain fields: "
         "scene_summary, visible_objects, robot_state_summary, ee_pose_interpretation, risks, confidence.\n"
+        "When the visible object location is useful, also include optional field objects. "
+        "objects must be an array of objects with fields: label, bbox_2d, confidence, attributes. "
+        "bbox_2d must be [x1, y1, x2, y2] in primary image pixel coordinates. "
+        "Only output bbox_2d when you can localize the object from the image; do not guess.\n"
         "visible_objects and risks must be arrays of strings.\n"
         "Do not output code fences.\n"
     )
@@ -172,7 +164,8 @@ def build_scene_analysis_messages(
         "如果提供了多路图像，请联合利用 primary 和 wrist 视角判断；如果提供了 RGB-D 摘要，请把深度/空间信息用于距离、"
         "遮挡、可达性和风险判断，但不要虚构未给出的几何细节。\n"
         "输出 JSON 字段：scene_summary, visible_objects, robot_state_summary, "
-        "ee_pose_interpretation, risks, confidence。\n"
+        "ee_pose_interpretation, risks, confidence。若能定位物体，请额外输出 objects，"
+        "每个 object 包含 label、bbox_2d、confidence、attributes。bbox_2d 使用 primary 图像像素坐标 [x1,y1,x2,y2]。\n"
         f"当前输入:\n{snapshot_text}"
     )
     user_content: list[dict[str, Any]] = [{"type": "text", "text": user_text_block}]

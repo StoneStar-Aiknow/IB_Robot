@@ -30,14 +30,14 @@ def build_chat_messages(
         "Decompose the task into the smallest reasonable sequence of allowed skills.\n"
         "If the task requires capabilities that are not present in the allowed skill list, "
         "do not invent a workaround. Return an empty skill_sequence and list them in required_missing_skills.\n"
+        "Object grounding, picking, placing, lifting, target approach, target hover, and target retreat are disabled "
+        "until the physical grasping pipeline is implemented. For those requests, return an empty skill_sequence "
+        "and list the missing capability.\n"
         "If the camera image or state is insufficient, lower confidence or choose a conservative plan.\n"
         "The skill_sequence field must be a list of objects with skill_name and args.\n"
-        "target_name must be chosen from named_targets when a pick skill is used.\n"
-        "place_name must be chosen from named_poses when a place skill is used.\n"
         "IMPORTANT: When the user is asking a pure scene description or observation question "
         "(e.g. 'what do you see', 'describe the scene', 'what is in front of you'), "
-        "you MUST use inspect_scene and MUST NOT use observe_target_area or any skill that moves the arm. "
-        "observe_target_area is only for pre-manipulation positioning, not for answering questions.\n"
+        "you MUST use inspect_scene and MUST NOT use target manipulation skills.\n"
     )
 
     task_text = _sanitize_user_text(task_text)

@@ -424,41 +424,19 @@ def validate_config(config: RobotConfig) -> list[str]:
         valid_planner_modes = {"rule", "vlm_api", "hybrid"}
         valid_skills = {
             "inspect_scene",
-            "observe_target_area",
-            "approach_named_target",
-            "hover_named_target",
-            "pick_named_target",
-            "lift_named_target",
-            "retreat_from_target",
-            "place_named_pose",
-            "release_at_named_pose",
             "open_gripper_skill",
             "close_gripper_skill",
             "recover_safe_pose",
             "recover_zero_pose",
             "move_relative_ee",
-            "gripper_point_down",
             "rotate_gripper_cw",
             "rotate_gripper_ccw",
+            "dance_basic",
         }
-        required_pose_names = {"home", "observe_table", "zero", config.embodied.default_place_name}
+        required_pose_names = {"home", "observe_table", "zero"}
         missing_pose_names = sorted(p for p in required_pose_names if p not in config.embodied.named_poses)
         if missing_pose_names:
             errors.append("embodied.named_poses is missing required pose(s): " + ", ".join(missing_pose_names))
-
-        if config.embodied.default_target_name not in config.embodied.named_targets:
-            errors.append(
-                f"embodied.default_target_name '{config.embodied.default_target_name}' "
-                "must exist in embodied.named_targets"
-            )
-
-        for target_name, target_cfg in config.embodied.named_targets.items():
-            for pose_key in ("observe_pose", "pregrasp_pose", "hover_pose", "grasp_pose", "lift_pose", "retreat_pose"):
-                pose_name = target_cfg.get(pose_key)
-                if pose_name and pose_name not in config.embodied.named_poses:
-                    errors.append(
-                        f"embodied.named_targets.{target_name}.{pose_key} references undefined pose '{pose_name}'"
-                    )
 
         skill_templates = config.embodied.skill_templates or {}
         supported_primitives = {
@@ -468,6 +446,8 @@ def validate_config(config: RobotConfig) -> list[str]:
             "close_gripper",
             "rotate_gripper_cw",
             "rotate_gripper_ccw",
+            "move_to_joint_positions",
+            "move_through_joint_positions",
         }
         for skill_name, template in skill_templates.items():
             if skill_name not in valid_skills:
@@ -492,29 +472,12 @@ def validate_config(config: RobotConfig) -> list[str]:
                     continue
                 if primitive_name == "move_to_named_pose":
                     pose_name = str(step.get("pose_name", "")).strip()
-                    target_pose_key = str(step.get("target_pose_key", "")).strip()
-                    place_from_request = bool(step.get("place_name_from_request", False))
-                    reference_count = int(bool(pose_name)) + int(bool(target_pose_key)) + int(place_from_request)
-                    if reference_count != 1:
+                    if not pose_name:
                         errors.append(
-                            f"embodied.skill_templates.{skill_name} move_to_named_pose step must define exactly one "
-                            "of pose_name, target_pose_key, or place_name_from_request"
+                            f"embodied.skill_templates.{skill_name} move_to_named_pose step must define pose_name"
                         )
                     if pose_name and pose_name not in config.embodied.named_poses:
                         errors.append(f"embodied.skill_templates.{skill_name} references undefined pose '{pose_name}'")
-                    if target_pose_key:
-                        for target_name, target_cfg in config.embodied.named_targets.items():
-                            resolved_pose_name = str(target_cfg.get(target_pose_key, "")).strip()
-                            if not resolved_pose_name:
-                                errors.append(
-                                    f"embodied.named_targets.{target_name}.{target_pose_key} is required by "
-                                    f"skill template '{skill_name}'"
-                                )
-                            elif resolved_pose_name not in config.embodied.named_poses:
-                                errors.append(
-                                    f"embodied.skill_templates.{skill_name} references undefined pose "
-                                    f"'{resolved_pose_name}' via target '{target_name}.{target_pose_key}'"
-                                )
                 if primitive_name == "move_relative_ee":
                     literal_direction = str(step.get("motion_direction", "")).strip()
                     if (

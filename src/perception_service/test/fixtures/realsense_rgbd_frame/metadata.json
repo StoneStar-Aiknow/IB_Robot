@@ -1,0 +1,29 @@
+{
+  "format_version": 1,
+  "captured_unix_time": 1781526434.2585995,
+  "topics": {
+    "color": "/camera/camera/color/image_raw",
+    "depth": "/camera/camera/aligned_depth_to_color/image_raw",
+    "camera_info": "/camera/camera/color/camera_info"
+  },
+  "color": {
+    "file": "color.png",
+    "encoding": "rgb8",
+    "height": 480,
+    "width": 640,
+    "frame_id": "camera_color_optical_frame"
+  },
+  "depth": {
+    "file": "depth.png",
+    "meters_file": "depth_meters.npy",
+    "encoding": "16UC1",
+    "dtype": "uint16",
+    "height": 480,
+    "width": 640,
+    "frame_id": "camera_color_optical_frame",
+    "valid_ratio": 0.2630305989583333
+  },
+  "camera_info": {
+    "file": "camera_info.json"
+  }
+}

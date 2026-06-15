@@ -11,10 +11,15 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from ibrobot_msgs.msg import SceneAnalysisRequest, SceneAnalysisResult
+from ibrobot_msgs.msg import SceneAnalysisRequest, SceneAnalysisResult, SceneObject, SceneObservation
 from perception_service.api_client import VLMAPIClient
+from perception_service.object_parser import attributes_to_json, parse_grounded_objects
 from perception_service.prompt_builder import build_scene_analysis_messages
-from perception_service.response_parser import SceneAnalysis, parse_scene_analysis_response
+from perception_service.response_parser import (
+    SceneAnalysis,
+    parse_scene_analysis_payload,
+    parse_scene_analysis_response,
+)
 from perception_service.scene_snapshot import SceneSnapshotBuffer
 
 
@@ -27,6 +32,7 @@ class PerceptionServiceNode(Node):
         self.declare_parameter("text_input_topic", "/embodied/perception_text")
         self.declare_parameter("result_topic", "/embodied/perception_result")
         self.declare_parameter("summary_topic", "/embodied/perception_summary")
+        self.declare_parameter("observation_topic", "/embodied/perception_observation")
         self.declare_parameter("default_session_id", "default")
         self.declare_parameter("primary_camera_topic", "/camera/top/image_raw")
         self.declare_parameter("wrist_camera_topic", "/camera/wrist/image_raw")
@@ -49,12 +55,15 @@ class PerceptionServiceNode(Node):
         self.declare_parameter("api_max_image_width", 320)
         self.declare_parameter("api_jpeg_quality", 70)
         self.declare_parameter("max_history_turns", 4)
+        self.declare_parameter("max_concurrent_requests", 1)
+        self.declare_parameter("min_object_confidence", 0.0)
         self.declare_parameter("debug_tracing", False)
 
         self._request_topic = self.get_parameter("request_topic").get_parameter_value().string_value
         self._text_input_topic = self.get_parameter("text_input_topic").get_parameter_value().string_value
         self._result_topic = self.get_parameter("result_topic").get_parameter_value().string_value
         self._summary_topic = self.get_parameter("summary_topic").get_parameter_value().string_value
+        self._observation_topic = self.get_parameter("observation_topic").get_parameter_value().string_value
         self._default_session_id = self.get_parameter("default_session_id").get_parameter_value().string_value
         self._max_scene_age_sec = self.get_parameter("max_scene_age_sec").get_parameter_value().double_value
         self._require_depth = self.get_parameter("require_depth").get_parameter_value().bool_value
@@ -62,7 +71,10 @@ class PerceptionServiceNode(Node):
         self._api_max_image_width = self.get_parameter("api_max_image_width").get_parameter_value().integer_value
         self._api_jpeg_quality = self.get_parameter("api_jpeg_quality").get_parameter_value().integer_value
         self._max_history_turns = self.get_parameter("max_history_turns").get_parameter_value().integer_value
+        self._min_object_confidence = self.get_parameter("min_object_confidence").get_parameter_value().double_value
         self._debug = self.get_parameter("debug_tracing").get_parameter_value().bool_value
+        max_concurrent_requests = self.get_parameter("max_concurrent_requests").get_parameter_value().integer_value
+        self._request_semaphore = threading.Semaphore(max(1, int(max_concurrent_requests)))
 
         self._scene_buffer = SceneSnapshotBuffer.from_node(self)
         self._api_client = VLMAPIClient(
@@ -75,9 +87,11 @@ class PerceptionServiceNode(Node):
 
         self._result_publisher = self.create_publisher(SceneAnalysisResult, self._result_topic, 10)
         self._summary_publisher = self.create_publisher(String, self._summary_topic, 10)
+        self._observation_publisher = self.create_publisher(SceneObservation, self._observation_topic, 10)
         self.create_subscription(SceneAnalysisRequest, self._request_topic, self._handle_request_cb, 10)
         self.create_subscription(String, self._text_input_topic, self._handle_text_input, 10)
         self._conversation_history: dict[str, list[dict[str, str]]] = {}
+        self._history_lock = threading.Lock()
         self._max_history_sessions: int = 32
 
         self.get_logger().info(
@@ -102,26 +116,30 @@ class PerceptionServiceNode(Node):
         return loaded
 
     def _session_history(self, session_id: str) -> list[dict[str, str]]:
-        if session_id not in self._conversation_history:
-            if len(self._conversation_history) >= self._max_history_sessions:
-                oldest = next(iter(self._conversation_history))
-                del self._conversation_history[oldest]
-            self._conversation_history[session_id] = []
-        return self._conversation_history[session_id]
+        with self._history_lock:
+            if session_id not in self._conversation_history:
+                if len(self._conversation_history) >= self._max_history_sessions:
+                    oldest = next(iter(self._conversation_history))
+                    del self._conversation_history[oldest]
+                self._conversation_history[session_id] = []
+            return list(self._conversation_history[session_id])
 
     def _remember_turn(self, session_id: str, user_text: str, analysis: SceneAnalysis) -> None:
-        history = self._session_history(session_id)
-        if user_text.strip():
-            history.append({"role": "user", "text": user_text.strip()})
-        assistant_text = (
-            f"场景摘要：{analysis.scene_summary}\n"
-            f"机械臂状态：{analysis.robot_state_summary}\n"
-            f"风险：{'; '.join(analysis.risks) if analysis.risks else '无明显风险'}"
-        ).strip()
-        history.append({"role": "assistant", "text": assistant_text})
-        keep_items = max(0, self._max_history_turns * 2)
-        if keep_items:
-            del history[:-keep_items]
+        with self._history_lock:
+            if session_id not in self._conversation_history:
+                self._conversation_history[session_id] = []
+            history = self._conversation_history[session_id]
+            if user_text.strip():
+                history.append({"role": "user", "text": user_text.strip()})
+            assistant_text = (
+                f"场景摘要：{analysis.scene_summary}\n"
+                f"机械臂状态：{analysis.robot_state_summary}\n"
+                f"风险：{'; '.join(analysis.risks) if analysis.risks else '无明显风险'}"
+            ).strip()
+            history.append({"role": "assistant", "text": assistant_text})
+            keep_items = max(0, self._max_history_turns * 2)
+            if keep_items:
+                del history[:-keep_items]
 
     def _publish_result(
         self,
@@ -131,6 +149,7 @@ class PerceptionServiceNode(Node):
         analysis: SceneAnalysis | None = None,
         raw_response: str = "",
         error_code: str = "",
+        scene_snapshot: dict[str, Any] | None = None,
     ) -> None:
         result = SceneAnalysisResult()
         result.request_id = request.request_id
@@ -147,6 +166,15 @@ class PerceptionServiceNode(Node):
         result.error_code = error_code
         result.message = message
         self._result_publisher.publish(result)
+        self._publish_observation(
+            request=request,
+            success=success,
+            message=message,
+            analysis=analysis,
+            raw_response=raw_response,
+            error_code=error_code,
+            scene_snapshot=scene_snapshot,
+        )
 
         if success and analysis:
             summary = String()
@@ -159,7 +187,61 @@ class PerceptionServiceNode(Node):
                 error_text = f"{error_code}: {message}"
             self.get_logger().warning(error_text)
 
-    def _analyze(self, request: SceneAnalysisRequest) -> tuple[SceneAnalysis, str]:
+    def _publish_observation(
+        self,
+        request: SceneAnalysisRequest,
+        success: bool,
+        message: str,
+        analysis: SceneAnalysis | None,
+        raw_response: str,
+        error_code: str,
+        scene_snapshot: dict[str, Any] | None,
+    ) -> None:
+        observation = SceneObservation()
+        observation.header.stamp = self.get_clock().now().to_msg()
+        observation.request_id = request.request_id
+        observation.source = request.source
+        observation.session_id = request.session_id
+        observation.success = success
+        observation.error_code = error_code
+        observation.message = message
+        observation.scene_summary = analysis.scene_summary if analysis else ""
+        observation.risks = analysis.risks if analysis else []
+        observation.confidence = float(analysis.confidence if analysis else 0.0)
+        observation.raw_response = raw_response
+
+        if success and raw_response and scene_snapshot:
+            try:
+                payload = parse_scene_analysis_payload(raw_response)
+                primary_view = scene_snapshot.get("camera_views", {}).get("primary", {})
+                camera_info = primary_view.get("camera_info", {})
+                image_width = camera_info.get("width") if isinstance(camera_info, dict) else None
+                image_height = camera_info.get("height") if isinstance(camera_info, dict) else None
+                objects = parse_grounded_objects(
+                    payload,
+                    image_width=int(image_width) if image_width else None,
+                    image_height=int(image_height) if image_height else None,
+                    min_confidence=self._min_object_confidence,
+                )
+                for index, grounded in enumerate(objects):
+                    obj = SceneObject()
+                    obj.object_id = f"{request.request_id}:{index}"
+                    obj.label = grounded.label
+                    obj.confidence = float(grounded.confidence)
+                    x1, y1, x2, y2 = grounded.bbox_xyxy
+                    obj.bbox_x = int(x1)
+                    obj.bbox_y = int(y1)
+                    obj.bbox_width = int(x2 - x1)
+                    obj.bbox_height = int(y2 - y1)
+                    obj.source = grounded.source
+                    obj.attributes_json = attributes_to_json(grounded.attributes)
+                    observation.objects.append(obj)
+            except Exception as exc:
+                self.get_logger().warning(f"failed to parse grounded objects: {exc}")
+
+        self._observation_publisher.publish(observation)
+
+    def _analyze(self, request: SceneAnalysisRequest) -> tuple[SceneAnalysis, str, dict[str, Any]]:
         user_context = self._load_context_json(request.context_json)
         scene_snapshot = self._scene_buffer.build_snapshot(
             max_scene_age_sec=self._max_scene_age_sec,
@@ -191,7 +273,7 @@ class PerceptionServiceNode(Node):
                 "[embodied-debug] perception_service api_response "
                 f"request_id={request.request_id} preview={raw_content[:240]!r}"
             )
-        return parse_scene_analysis_response(raw_content), raw_content
+        return parse_scene_analysis_response(raw_content), raw_content, scene_snapshot
 
     def _handle_text_input(self, msg: String) -> None:
         request = SceneAnalysisRequest()
@@ -224,7 +306,18 @@ class PerceptionServiceNode(Node):
         self.get_logger().info(f"用户询问: {request.user_text}")
 
         try:
-            analysis, raw_response = self._analyze(request)
+            if not self._request_semaphore.acquire(blocking=False):
+                self._publish_result(
+                    request,
+                    success=False,
+                    message="too many concurrent perception requests",
+                    error_code="PERCEPTION_BUSY",
+                )
+                return
+            try:
+                analysis, raw_response, scene_snapshot = self._analyze(request)
+            finally:
+                self._request_semaphore.release()
         except json.JSONDecodeError as exc:
             self._publish_result(
                 request,
@@ -249,6 +342,7 @@ class PerceptionServiceNode(Node):
             message="scene analysis completed",
             analysis=analysis,
             raw_response=raw_response,
+            scene_snapshot=scene_snapshot,
         )
 
 

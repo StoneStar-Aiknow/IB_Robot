@@ -19,7 +19,7 @@ class SceneAnalysis:
 
 
 def parse_scene_analysis_response(raw_text: str) -> SceneAnalysis:
-    payload = json.loads(extract_json_blob(raw_text, "scene analysis response"))
+    payload = parse_scene_analysis_payload(raw_text)
     confidence = parse_confidence(payload.get("confidence", 0.0))
 
     return SceneAnalysis(
@@ -30,3 +30,10 @@ def parse_scene_analysis_response(raw_text: str) -> SceneAnalysis:
         risks=string_list(payload.get("risks"), "risks"),
         confidence=confidence,
     )
+
+
+def parse_scene_analysis_payload(raw_text: str) -> dict:
+    payload = json.loads(extract_json_blob(raw_text, "scene analysis response"))
+    if not isinstance(payload, dict):
+        raise ValueError("scene analysis response must be a JSON object")
+    return payload

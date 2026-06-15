@@ -1,0 +1,33 @@
+{
+  "raw_response": "\n{\"scene_summary\": \"场景为木质桌面环境，可见一个红色草莓、白色立方体、小型三角形物体及黑色方形物体。\", \"visible_objects\": [\"草莓\", \"白色立方体\", \"小型三角形物体\", \"黑色方形物体\"], \"robot_state_summary\": \"无可用机械臂关节状态及末端执行器姿态信息\", \"ee_pose_interpretation\": \"无可用末端执行器姿态信息\", \"risks\": [], \"confidence\": \"高\", \"objects\": [{\"label\": \"草莓\", \"bbox_2d\": [554, 31, 856, 529], \"confidence\": 0.95, \"attributes\": \"红色，表面有纹理\"}, {\"label\": \"白色立方体\", \"bbox_2d\": [318, 0, 752, 568], \"confidence\": 0.9, \"attributes\": \"白色，立方体形状\"}, {\"label\": \"小型三角形物体\", \"bbox_2d\": [143, 508, 231, 725], \"confidence\": 0.85, \"attributes\": \"银色，三角形\"}, {\"label\": \"黑色方形物体\", \"bbox_2d\": [279, 779, 420, 922], \"confidence\": 0.9, \"attributes\": \"黑色，方形\"}]}",
+  "objects": [
+    {
+      "label": "草莓",
+      "bbox_2d": [
+        554,
+        31,
+        639,
+        479
+      ],
+      "confidence": 0.95,
+      "attributes": {
+        "raw_attributes": "红色，表面有纹理",
+        "object_index": 0
+      }
+    },
+    {
+      "label": "白色立方体",
+      "bbox_2d": [
+        318,
+        0,
+        639,
+        479
+      ],
+      "confidence": 0.9,
+      "attributes": {
+        "raw_attributes": "白色，立方体形状",
+        "object_index": 1
+      }
+    }
+  ]
+}
