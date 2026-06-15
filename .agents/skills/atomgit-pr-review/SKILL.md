@@ -66,6 +66,8 @@ cat ./tmp/ib_robot_pr_123_info.json
 cat ./tmp/ib_robot_pr_123_issues.json
 ```
 
+**PR 正文**（AI 声明、Verification 等）在 `.pr.body` 字段。
+
 ### 大文件处理技巧
 
 当 PR 包含大量文件时，JSON 文件可能很大。使用 `jq` 提取特定文件信息：
@@ -130,6 +132,7 @@ python3 pr_review.py --pr 123
   "pr": {
     "number": 123,
     "title": "...",
+    "body": "...",
     "author": "...",
     "branch": "feature → main",
     "stats": {

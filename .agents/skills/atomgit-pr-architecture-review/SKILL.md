@@ -35,6 +35,8 @@ cat ./tmp/ib_robot_pr_123_arch_info.json
 cat ./tmp/ib_robot_pr_123_arch_issues.json
 ```
 
+**PR 正文**（AI 声明、Verification 等）在 `.pr.body` 字段。
+
 ## 快速使用
 
 ```bash

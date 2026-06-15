@@ -66,7 +66,7 @@ class CodeReviewer:
             "pr": {
                 "number": pr.get("number"),
                 "title": pr.get("title"),
-                "description": pr.get("body") or pr.get("description") or pr.get("content") or "",
+                "body": pr.get("body") or "",
                 "author": pr.get("user", {}).get("login"),
                 "state": pr.get("state"),
                 "branch": f"{pr.get('head', {}).get('ref')} → {pr.get('base', {}).get('ref')}",
