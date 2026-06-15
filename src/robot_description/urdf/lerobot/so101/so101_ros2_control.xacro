@@ -9,6 +9,7 @@
          MuJoCo: description.py passes "mujoco_ros2_control/MujocoSystemInterface" when platform=mujoco. -->
     <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
     <xacro:arg name="mujoco_model" default=""/>
+    <xacro:arg name="camera_publish_rate" default=""/>
 
     <ros2_control name="RobotSystem" type="system">
         <xacro:if value="$(arg use_sim)">
@@ -16,6 +17,9 @@
                 <plugin>$(arg sim_plugin)</plugin>
                 <xacro:if value="${'$(arg mujoco_model)' != ''}">
                     <param name="mujoco_model">$(arg mujoco_model)</param>
+                </xacro:if>
+                <xacro:if value="${'$(arg camera_publish_rate)' != ''}">
+                    <param name="camera_publish_rate">$(arg camera_publish_rate)</param>
                 </xacro:if>
             </hardware>
         </xacro:if>

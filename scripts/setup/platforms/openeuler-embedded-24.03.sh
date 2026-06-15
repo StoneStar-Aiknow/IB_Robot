@@ -128,7 +128,7 @@ platform_pre_install_rosdeps() {
 }
 
 platform_get_extra_skip_keys() {
-    echo "lttng-tools nlohmann-json-dev python3-opencv python3-aiortc gz_ros2_control ros_gz_sim ros_gz_bridge mujoco_ros2_control python3-scipy robot_localization"
+    echo "lttng-tools nlohmann-json-dev python3-opencv python3-aiortc gz_ros2_control ros_gz_sim ros_gz_bridge mujoco_ros2_control mujoco_ros2_control_msgs python3-scipy robot_localization"
 }
 
 platform_post_install_rosdeps() {

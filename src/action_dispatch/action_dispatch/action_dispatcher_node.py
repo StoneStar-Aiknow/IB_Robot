@@ -59,13 +59,14 @@ class ActionDispatcherNode(Node):
         self.declare_parameter("queue_size", 100)
         self.declare_parameter("watermark_threshold", 20)
         self.declare_parameter("control_frequency", 100.0)
-        self.declare_parameter(
-            "inference_action_server", "/act_inference_node/DispatchInfer"
-        )
-        self.declare_parameter(
-            "inference_reset_service", "/act_inference_node/reset_policy_state"
-        )
+        self.declare_parameter("inference_action_server", "/act_inference_node/DispatchInfer")
+        self.declare_parameter("inference_reset_service", "/act_inference_node/reset_policy_state")
         self.declare_parameter("policy_reset_timeout_sec", 2.0)
+        # Safety net: if an inference goal never completes (server hiccup, dropped
+        # response, or a goal abandoned across a stop/start), abandon it after this
+        # many seconds so the control loop can request a fresh one instead of
+        # wedging forever with _inference_in_progress stuck True.
+        self.declare_parameter("inference_timeout_sec", 10.0)
         self.declare_parameter("robot_config_path", "")
         self.declare_parameter("joint_state_topic", "/joint_states")
         self.declare_parameter("navigation_mode", False)
@@ -97,9 +98,9 @@ class ActionDispatcherNode(Node):
         self._inflight_request_id = ""
         self._policy_reset_in_progress = False
         self._policy_reset_started_at = 0.0
-        self._policy_reset_timeout_s = float(
-            self.get_parameter("policy_reset_timeout_sec").value
-        )
+        self._policy_reset_timeout_s = float(self.get_parameter("policy_reset_timeout_sec").value)
+        self._inference_started_at = 0.0
+        self._inference_timeout_s = float(self.get_parameter("inference_timeout_sec").value)
         self._request_generation = 0
         # In navigation mode, start in stopped state; otherwise run immediately.
         self._is_running = not self._navigation_mode
@@ -156,9 +157,7 @@ class ActionDispatcherNode(Node):
             raise RuntimeError("Failed to initialize TopicExecutor")
 
         # 6. Communication
-        self._infer_client = rclpy.action.ActionClient(
-            self, DispatchInfer, self._server_name
-        )
+        self._infer_client = rclpy.action.ActionClient(self, DispatchInfer, self._server_name)
         self._policy_reset_client = self.create_client(
             Trigger,
             self.get_parameter("inference_reset_service").value,
@@ -185,7 +184,7 @@ class ActionDispatcherNode(Node):
         self._reset_srv = self.create_service(Empty, "~/reset", self._reset_cb)
         self._toggle_smoothing_srv = self.create_service(Empty, "~/toggle_smoothing", self._toggle_smoothing_cb)
 
-        # Navigation mode services (only useful when navigation_mode=True)
+        # Control services — usable in any mode (nav or sim inference).
         self._start_nav_srv = self.create_service(Trigger, "~/start_evaluate", self._start_nav_cb)
         self._stop_nav_srv = self.create_service(Trigger, "~/stop_evaluate", self._stop_nav_cb)
         self._get_status_srv = self.create_service(Trigger, "~/get_status", self._get_status_cb)
@@ -209,6 +208,7 @@ class ActionDispatcherNode(Node):
         self._active_request_id = ""
         self._actions_executed_from_active_request = 0
         self._last_queue_refill_monotonic_ns = 0
+        self._last_stall_log_ns = time.monotonic_ns()
 
     def _joint_cb(self, msg):
         """Optional: could use current state for safety or initialization."""
@@ -225,18 +225,31 @@ class ActionDispatcherNode(Node):
             return
 
         self._expire_policy_reset_if_needed()
+        self._expire_inference_if_needed()
 
         q_size = self._get_plan_length()
         self._queue_size_pub.publish(Int32(data=q_size))
         self._smoothing_enabled_pub.publish(Bool(data=self._smoothing_enabled))
 
         # A. Trigger Inference if queue is low
-        if (
-            q_size <= self._watermark
-            and not self._inference_in_progress
-            and not self._policy_reset_in_progress
-        ):
+        if q_size <= self._watermark and not self._inference_in_progress and not self._policy_reset_in_progress:
             self._request_inference()
+
+        # Diagnostic: surface a running-but-not-dispatching loop (stays quiet in
+        # normal operation; only fires when the queue stays empty for >2s).
+        if q_size == 0:
+            now_ns = time.monotonic_ns()
+            stalled_ms = (
+                (now_ns - self._last_queue_refill_monotonic_ns) / 1e6 if self._last_queue_refill_monotonic_ns else 1e9
+            )
+            if stalled_ms > 2000.0 and (now_ns - self._last_stall_log_ns) / 1e6 > 2000.0:
+                self._last_stall_log_ns = now_ns
+                self.get_logger().warn(
+                    f"[diag] running but queue empty: in_progress={self._inference_in_progress} "
+                    f"policy_reset={self._policy_reset_in_progress} "
+                    f"server_ready={self._infer_client.server_is_ready()} "
+                    f"watermark={self._watermark} gen={self._request_generation}"
+                )
 
         # B. Get Action
         action = None
@@ -319,6 +332,7 @@ class ActionDispatcherNode(Node):
             return
 
         self._inference_in_progress = True
+        self._inference_started_at = time.monotonic()
         self._plan_length_at_inference_start = self._get_plan_length()
         self._current_request_id = uuid.uuid4().hex[:8]
         self._inflight_request_id = self._current_request_id
@@ -341,16 +355,15 @@ class ActionDispatcherNode(Node):
         send_goal_future = self._infer_client.send_goal_async(goal)
         request_generation = self._request_generation
         send_goal_future.add_done_callback(
-            lambda future, req_id=self._current_request_id, gen=request_generation:
-                self._goal_response_cb(future, req_id, gen)
+            lambda future, req_id=self._current_request_id, gen=request_generation: self._goal_response_cb(
+                future, req_id, gen
+            )
         )
 
     def _goal_response_cb(self, future, request_id: str, request_generation: int):
         if request_generation != self._request_generation:
             self._complete_inflight_request(request_id)
-            self.get_logger().debug(
-                f"Ignoring stale inference goal response: {request_id}"
-            )
+            self.get_logger().debug(f"Ignoring stale inference goal response: {request_id}")
             return
         goal_handle = future.result()
         if not goal_handle.accepted:
@@ -360,16 +373,13 @@ class ActionDispatcherNode(Node):
 
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(
-            lambda future, req_id=request_id, gen=request_generation:
-                self._result_cb(future, req_id, gen)
+            lambda future, req_id=request_id, gen=request_generation: self._result_cb(future, req_id, gen)
         )
 
     def _result_cb(self, future, request_id: str, request_generation: int):
         if request_generation != self._request_generation:
             self._complete_inflight_request(request_id)
-            self.get_logger().debug(
-                f"Ignoring stale inference result: {request_id}"
-            )
+            self.get_logger().debug(f"Ignoring stale inference result: {request_id}")
             return
         self._complete_inflight_request(request_id)
         result = future.result().result
@@ -482,6 +492,7 @@ class ActionDispatcherNode(Node):
         self._request_generation += 1
         self._inference_in_progress = False
         self._inflight_request_id = ""
+        self._inference_started_at = 0.0
         self._request_policy_reset()
         self._plan_length_at_inference_start = 0
         self._last_action = None
@@ -496,6 +507,32 @@ class ActionDispatcherNode(Node):
             return
         self._inference_in_progress = False
         self._inflight_request_id = ""
+        self._inference_started_at = 0.0
+
+    def _expire_inference_if_needed(self):
+        """Abandon a stuck inference request so the dispatcher can self-recover.
+
+        Without this, a single inference goal that never returns (server hiccup,
+        a goal abandoned during a stop/start, or a lost response) leaves
+        ``_inference_in_progress`` True forever and the control loop stops
+        requesting new inferences — the dispatcher goes silent.
+        """
+        if not self._inference_in_progress:
+            return
+        if self._inference_started_at <= 0.0:
+            return
+        if time.monotonic() - self._inference_started_at <= self._inference_timeout_s:
+            return
+        self.get_logger().warn(
+            f"Inference request '{self._inflight_request_id}' timed out after "
+            f"{self._inference_timeout_s:.1f}s; abandoning to recover dispatch loop"
+        )
+        # Invalidate the stuck goal's eventual response, then clear the flag so
+        # the next control loop tick issues a fresh inference request.
+        self._request_generation += 1
+        self._inference_in_progress = False
+        self._inflight_request_id = ""
+        self._inference_started_at = 0.0
 
     def _expire_policy_reset_if_needed(self):
         if not self._policy_reset_in_progress:
@@ -506,9 +543,7 @@ class ActionDispatcherNode(Node):
             return
         self._policy_reset_in_progress = False
         self._policy_reset_started_at = 0.0
-        self.get_logger().warn(
-            "Policy reset timed out; continuing with dispatcher reset complete"
-        )
+        self.get_logger().warn("Policy reset timed out; continuing with dispatcher reset complete")
 
     def _request_policy_reset(self):
         """Reset policy-local runtime state for a new episode boundary."""
@@ -519,9 +554,7 @@ class ActionDispatcherNode(Node):
             return
 
         if not self._policy_reset_client.wait_for_service(timeout_sec=0.2):
-            self.get_logger().warn(
-                f"Policy reset service unavailable: {service_name}"
-            )
+            self.get_logger().warn(f"Policy reset service unavailable: {service_name}")
             self._policy_reset_in_progress = False
             self._policy_reset_started_at = 0.0
             return
@@ -545,9 +578,7 @@ class ActionDispatcherNode(Node):
                 self.get_logger().warn("Policy reset returned no response")
                 return
             if not result.success:
-                self.get_logger().warn(
-                    f"Policy reset failed: {result.message}"
-                )
+                self.get_logger().warn(f"Policy reset failed: {result.message}")
                 return
             self.get_logger().info("Policy runtime state reset")
         except Exception as e:
@@ -583,40 +614,43 @@ class ActionDispatcherNode(Node):
                 break
 
     def _start_nav_cb(self, request, response):
-        """Start evaluate service callback."""
-        if not self._navigation_mode:
-            response.success = False
-            response.message = "Navigation mode is not enabled"
-            return response
+        """Start or resume dispatcher evaluation (idempotent clean restart).
 
-        if self._is_running:
-            response.success = False
-            response.message = "Evaluate is already running"
-            return response
-
+        In model_inference mode the dispatcher auto-runs, so a control panel
+        cannot rely on a strict not-running precondition. Treat start as
+        "ensure a fresh inference cycle is running": invalidate any in-flight
+        request and clear the flags that could otherwise wedge the control loop,
+        so inference reliably resumes whether or not it was already running.
+        """
+        was_running = self._is_running
+        self._request_generation += 1
+        self._inference_in_progress = False
+        self._inflight_request_id = ""
+        self._inference_started_at = 0.0
+        self._policy_reset_in_progress = False
+        self._policy_reset_started_at = 0.0
         self._is_running = True
-        self.get_logger().info("Evaluate started")
         response.success = True
-        response.message = "Evaluate started"
+        response.message = "Evaluate resumed" if was_running else "Evaluate started"
+        self.get_logger().info(response.message)
         return response
 
     def _stop_nav_cb(self, request, response):
-        """Stop evaluate service callback."""
-        if not self._navigation_mode:
-            response.success = False
-            response.message = "Navigation mode is not enabled"
-            return response
+        """Stop or pause dispatcher evaluation (idempotent).
 
-        if not self._is_running:
-            response.success = False
-            response.message = "Evaluate is already stopped"
-            return response
-
+        Always succeeds and clears any in-flight inference so a later start is
+        never blocked by a goal that completes (or hangs) after we stopped.
+        """
+        was_running = self._is_running
         self._is_running = False
-        self._stop_base()
-        self.get_logger().info("Evaluate stopped")
+        self._inference_in_progress = False
+        self._inflight_request_id = ""
+        self._inference_started_at = 0.0
+        if self._navigation_mode:
+            self._stop_base()
         response.success = True
-        response.message = "Evaluate stopped"
+        response.message = "Evaluate stopped" if was_running else "Evaluate already stopped"
+        self.get_logger().info(response.message)
         return response
 
     def _get_status_cb(self, request, response):

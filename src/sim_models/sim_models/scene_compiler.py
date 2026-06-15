@@ -28,8 +28,10 @@ Public API
 """
 
 import logging
+import math
 from pathlib import Path
 
+import numpy as np
 import yaml
 from ament_index_python.packages import get_package_share_directory
 
@@ -52,6 +54,85 @@ _SDF_MESH_NAMES: frozenset[str] = frozenset(
         "moving_jaw",  # moving jaw finger
     }
 )
+
+
+def _inject_random_keyframes(xml_content: str, layout: dict) -> str:
+    """Inject pre-generated random banana placement keyframes into MJCF XML.
+
+    Generates a grid_cols × grid_rows × yaw_steps keyframe grid, naming each
+    ``random_KKK``.  Uses the mujoco Python API to resolve qpos addresses by
+    joint name so the arm/banana/plate ordering is inferred from the model, not
+    hardcoded.  If mujoco is unavailable or the model cannot compile, returns
+    xml_content unchanged.
+    """
+    try:
+        import mujoco  # noqa: PLC0415
+    except ImportError:
+        logging.warning("mujoco not available; skipping keyframe injection")
+        return xml_content
+
+    rand = layout.get("randomization", {})
+    banana_cfg = rand.get("banana", {})
+    if not banana_cfg:
+        return xml_content
+
+    x_min, x_max = banana_cfg.get("x_range", [-0.03, 0.10])
+    y_min, y_max = banana_cfg.get("y_range", [-0.02, 0.10])
+    z_spawn = float(banana_cfg.get("z_spawn", 0.05))
+    grid_cols = int(banana_cfg.get("grid_cols", 5))
+    grid_rows = int(banana_cfg.get("grid_rows", 7))
+    yaw_steps = int(banana_cfg.get("yaw_steps", 6))
+    arm_joint_names = rand.get("arm_joint_names", [])
+    arm_rest_qpos = rand.get("arm_rest_qpos", [])
+
+    try:
+        spec = mujoco.MjSpec.from_string(xml_content)
+        model = spec.compile()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Keyframe injection: model compile failed (%s); skipping", exc)
+        return xml_content
+
+    data = mujoco.MjData(model)
+
+    def _adr(name: str) -> int:
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        return int(model.jnt_qposadr[jid]) if jid >= 0 else -1
+
+    banana_adr = _adr("banana_free")
+    if banana_adr < 0:
+        logging.warning("banana_free joint not found in model; skipping keyframe injection")
+        return xml_content
+
+    xs = np.linspace(x_min, x_max, grid_cols)
+    ys = np.linspace(y_min, y_max, grid_rows)
+    yaws = [2.0 * math.pi * i / yaw_steps for i in range(yaw_steps)]
+
+    lines = ["  <keyframe>"]
+    idx = 0
+    for x in xs:
+        for y in ys:
+            for yaw in yaws:
+                qpos = data.qpos.copy()
+                for jname, qval in zip(arm_joint_names, arm_rest_qpos, strict=False):
+                    adr = _adr(jname)
+                    if adr >= 0:
+                        qpos[adr] = float(qval)
+                # banana_free freejoint: [tx, ty, tz, qw, qx, qy, qz]
+                qpos[banana_adr : banana_adr + 7] = [
+                    float(x),
+                    float(y),
+                    z_spawn,
+                    math.cos(yaw / 2),
+                    0.0,
+                    0.0,
+                    math.sin(yaw / 2),
+                ]
+                qstr = " ".join(f"{v:.6f}" for v in qpos)
+                lines.append(f'    <key name="random_{idx:03d}" qpos="{qstr}"/>')
+                idx += 1
+    lines.append("  </keyframe>")
+
+    return xml_content.replace("</mujoco>", "\n".join(lines) + "\n</mujoco>")
 
 
 def get_scene_file(scene_name: str, platform: str) -> Path:
@@ -136,6 +217,12 @@ def get_mujoco_scene_path(scene_name: str, robot_xml_path: str = "") -> Path:
     else:
         # Remove the robot <include> line so the file is self-contained.
         content = "\n".join(line for line in content.splitlines() if _ROBOT_XML_PLACEHOLDER not in line)
+
+    # Inject random keyframes from layout.yaml randomization config
+    _layout = get_scene_layout(scene_name)
+    if _layout.get("randomization"):
+        content = _inject_random_keyframes(content, _layout)
+
     xml_out = Path(f"/tmp/sim_models_{scene_name}.xml")
     xml_out.write_text(content)
 

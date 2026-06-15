@@ -286,6 +286,9 @@ def generate_robot_description(robot_config: dict, use_sim, mujoco_model_path: s
             xacro_mappings["sim_plugin"] = "mujoco_ros2_control/MujocoSystemInterface"
             if mujoco_model_path:
                 xacro_mappings["mujoco_model"] = mujoco_model_path
+            camera_publish_rate = robot_config.get("simulation", {}).get("camera_publish_rate")
+            if camera_publish_rate is not None:
+                xacro_mappings["camera_publish_rate"] = str(camera_publish_rate)
         # Gazebo: xacro default="gz_ros2_control/GazeboSimSystem" — no explicit mapping needed
         controllers_config = ros2_control_config.get("controllers_config")
         if controllers_config:

@@ -1,9 +1,11 @@
 """Unit tests for launch readiness helpers."""
 
+import builtins
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from launch import LaunchContext
 from launch.actions import RegisterEventHandler
 from launch_ros.actions import Node
@@ -29,6 +31,17 @@ assert _LAUNCH_SPEC is not None
 assert _LAUNCH_SPEC.loader is not None
 robot_launch = importlib.util.module_from_spec(_LAUNCH_SPEC)
 _LAUNCH_SPEC.loader.exec_module(robot_launch)
+
+
+def _block_voice_asr_service_import(monkeypatch):
+    real_import = builtins.__import__
+
+    def blocked_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.startswith("voice_asr_service"):
+            raise ModuleNotFoundError(f"No module named '{name}'", name=name)
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
 
 
 def _text(substitutions):
@@ -88,6 +101,38 @@ def test_start_actions_handler_snapshots_action_list():
     returned_actions = handler(SimpleNamespace(returncode=0), None)
 
     assert returned_actions == ["first"]
+
+
+def test_robot_launch_loads_without_voice_asr_service_when_asr_disabled(monkeypatch):
+    _block_voice_asr_service_import(monkeypatch)
+    launch_spec = importlib.util.spec_from_file_location("robot_launch_without_voice_asr", _LAUNCH_PATH)
+    assert launch_spec is not None
+    assert launch_spec.loader is not None
+    launch_module = importlib.util.module_from_spec(launch_spec)
+
+    launch_spec.loader.exec_module(launch_module)
+
+    assert launch_module.generate_launch_description() is not None
+
+
+def test_voice_asr_builder_skips_missing_package_when_disabled(monkeypatch):
+    _block_voice_asr_service_import(monkeypatch)
+    from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
+
+    nodes = generate_voice_asr_nodes({"voice_asr": {"enabled": False}})
+
+    assert nodes == []
+
+
+def test_voice_asr_builder_reports_missing_package_when_enabled(monkeypatch):
+    _block_voice_asr_service_import(monkeypatch)
+    from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
+
+    with pytest.raises(
+        ModuleNotFoundError,
+        match="voice_asr.enabled=true requires the voice_asr_service package to be installed",
+    ):
+        generate_voice_asr_nodes({"voice_asr": {"enabled": True}})
 
 
 def test_controller_startup_timeout_comes_from_yaml_mapping():
@@ -303,9 +348,7 @@ def test_generate_inference_node_uses_policy_path_only_for_rknn(monkeypatch, tmp
 
 
 def test_attention_viz_request_uses_robot_config_only():
-    enabled, mode, _viz_config = _attention_viz_request(
-        {"attention_viz": {"enabled": False, "mode": "file"}}
-    )
+    enabled, mode, _viz_config = _attention_viz_request({"attention_viz": {"enabled": False, "mode": "file"}})
 
     assert enabled is False
     assert mode == "file"

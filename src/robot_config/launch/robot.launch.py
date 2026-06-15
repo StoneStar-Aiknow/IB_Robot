@@ -122,7 +122,6 @@ from robot_config.launch_builders.tracing import (
     DEFAULT_TRACE_SESSION_NAME,
     generate_tracing_actions,
 )
-from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
 from robot_config.loader import load_robot_config_dict
 from robot_config.logger_utils import get_colored_logger
 
@@ -409,6 +408,22 @@ def launch_setup(context, *args, **kwargs):
             sim_nodes += sim_adapter.spawn_peripheral_bridges(robot_config.get("peripherals", []))
             actions.extend(sim_nodes)
             logger.info(f"Added {len(sim_nodes)} simulation nodes ({sim_platform})")
+
+            # Scene task node for randomisation and AutoTest evaluation
+            scene_name = robot_config.get("simulation", {}).get("scene", "")
+            if sim_platform == "mujoco" and scene_name == "pick_banana":
+                from launch_ros.actions import Node as LaunchNode  # noqa: PLC0415
+
+                actions.append(
+                    LaunchNode(
+                        package="sim_models",
+                        executable="pick_banana_task_node",
+                        name="pick_banana_task_node",
+                        parameters=[{"use_sim_time": True}],
+                        output="screen",
+                    )
+                )
+                logger.info("Added pick_banana_task_node")
         except NotImplementedError:
             logger.warning(
                 f"sim platform '{sim_platform}' not implemented yet, "
@@ -514,6 +529,8 @@ def launch_setup(context, *args, **kwargs):
         logger.info("use_mock=true: skipping voice ASR nodes (out of mock scope)")
     else:
         try:
+            from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
+
             voice_asr_nodes = generate_voice_asr_nodes(robot_config)
             actions.extend(voice_asr_nodes)
             if voice_asr_nodes:

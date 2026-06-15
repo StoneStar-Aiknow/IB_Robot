@@ -288,6 +288,17 @@ ${CLEAN_BUILD} && CLEAN_ARGS+=("--cmake-clean-cache")
 THIS_ARGS=()
 ${BUILD_THIS} && THIS_ARGS+=("--paths" "$(pwd)")
 
+# Platform-specific package skips
+PLATFORM_ARGS=()
+if [[ "${IBR_BUILD_INCLUDE_SIM_MODELS_ON_OPENEULER:-0}" != "1" && -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    if [[ "${ID:-}" == "openeuler" ]]; then
+        log_info "openEuler detected: skipping sim_models (MuJoCo simulation runs on Ubuntu only)."
+        PLATFORM_ARGS+=("--packages-skip" "sim_models")
+    fi
+fi
+
 echo "════════════════════════════════════════════════════════════════════"
 echo "Building with mixin(s): ${MIXINS[*]}"
 echo "════════════════════════════════════════════════════════════════════"
@@ -307,6 +318,7 @@ PYTHONNOUSERSITE=1 python3 -m colcon build \
     "${MIXIN_ARGS[@]}" \
     "${CLEAN_ARGS[@]}" \
     "${THIS_ARGS[@]}" \
+    "${PLATFORM_ARGS[@]}" \
     "${EXTRA_ARGS[@]}"
 
 echo ""

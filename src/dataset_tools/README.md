@@ -103,10 +103,51 @@ Enter prompt text to start recording. (Press Enter to reuse: 'get')
 Type 'q' or 'quit' to exit.
 ========================================================
 Prompt > get        # 输入任务描述开始录制
-[INFO] 🔴 RECORDING STARTED. (Press Enter to stop early)
-[INFO] ✅ RECORDING SAVED: Wrote 1894 messages to /path/to/episode
+[INFO] 🔴 RECORDING STARTED.
+Controls while recording:
+  Enter       stop and review
+  d + Enter   stop, discard, then return to Prompt
+  r + Enter   stop, discard, then retry same prompt
+
+# 按 Enter 后，当前 episode 会先完成落盘，再进入确认界面：
+========================================
+Episode stopped and finalized.
+Dataset: <bag_base_dir>/<dataset_name>
+Episode: <bag_base_dir>/<dataset_name>/episodes/episode_000001
+Messages written: 1894
+Prompt: get
+
+[s] save / [d] discard / [r] discard and retry / [q] quit and keep
+Choice [s] >       # 直接回车保存；d 删除；r 删除并用同一 prompt 重录；q 保存并退出
+✅ KEPT episode_000001
+📁 <bag_base_dir>/<dataset_name>/episodes/episode_000001
 Prompt > q          # 退出
 ```
+
+录制中的快捷键：
+
+| 输入 | 行为 |
+|---|---|
+| Enter | 停止当前 episode 并进入确认界面 |
+| `d` + Enter | 停止、删除当前 episode，然后回到 Prompt |
+| `r` + Enter | 停止、删除当前 episode，然后用同一 prompt 立即重录 |
+
+确认界面中的快捷键：
+
+| 输入 | 行为 |
+|---|---|
+| Enter / `s` | 保存当前 episode |
+| `d` | 删除当前 episode |
+| `r` | 删除当前 episode，并用同一 prompt 重录 |
+| `q` | 保存当前 episode 并退出 |
+
+`record_cli` 会在启动时显示 dataset 根目录，并在每个 episode 完成后显示具体 episode 目录。录制结果位于：
+
+```text
+<bag_base_dir>/<dataset_name>/episodes/episode_XXXXXX/
+```
+
+当前交互假设一个 `episode_recorder` server 同时由一个操作者使用。
 
 `record_cli` 默认按 `control_mode:=teleop` 工作，不触发推理侧 reset。录制模型推理过程时，将客户端控制模式设为 `model_inference`：
 
@@ -288,12 +329,9 @@ ros2 run dataset_tools camera_isp_calibrator \
 **保存生效**：保存后下次 `robot.launch.py` 启动时，`perception.py` 会自动
 读取 override 并覆盖 YAML 默认值；删除 JSON 即可回退。
 
-详细算法说明：见 `临时/camera_isp_plan.md` §Phase 2。
-
 #### 5.1 统一 K/C/Sat 色彩搜索（实验性，独立模块）
 
-模块 `dataset_tools/camera_isp/color_search.py` 实现了
-`临时/camera_isp_unified_color_search_plan.md` v4 的统一搜索路径，
+模块 `dataset_tools/camera_isp/color_search.py` 实现了统一 K/C/Sat 搜索路径，
 **与既有 4 阶段流水线（曝光/增益/亮度/锐度）并行存在，不修改任何曝光相关代码**。
 旧 `solver` / `hw_pipeline` 全部保留作为初值估计器与失败回退。
 

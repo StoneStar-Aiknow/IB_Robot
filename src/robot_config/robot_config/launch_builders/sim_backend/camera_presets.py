@@ -6,8 +6,9 @@ instead of using the (zeroed-out) values in the YAML.
 
 Two mount categories:
   "wrist" — gripper-mounted palm-plate camera, follows the end-effector.
+  "top"   — calibrated workspace overview camera fixed in the world.
   "base"  — generic workspace camera fixed on the robot base body.
-             Used by any camera whose name is NOT "wrist" (top, front, etc.).
+             Used by any camera without a dedicated preset (front, etc.).
 
 Convention:
   Values are stored in each platform's native coordinate convention:
@@ -21,13 +22,23 @@ PRESETS = {
     "gazebo": {
         "wrist": {
             "parent_frame": "gripper",
-            "x": 0.002,
-            "y": 0.061,
-            "z": -0.025,
-            "roll": -1.5708,
-            "pitch": 1.1708,
-            "yaw": -1.5708,
-            "fovy": 65,
+            "x": 0.002265,
+            "y": 0.073023,
+            "z": -0.016289,
+            "roll": -1.512475,
+            "pitch": 1.079239,
+            "yaw": -1.541112,
+            "fovy": 46,
+        },
+        "top": {
+            "parent_frame": "world",
+            "x": 0.0419,
+            "y": 0.1123,
+            "z": 0.6136,
+            "roll": 0.057596,
+            "pitch": 1.518436,
+            "yaw": -1.518436,
+            "fovy": 47,
         },
         "base": {
             "parent_frame": "base",
@@ -43,13 +54,23 @@ PRESETS = {
     "mujoco": {
         "wrist": {
             "parent_frame": "gripper",
-            "x": 0.002,
-            "y": 0.061,
-            "z": -0.025,
-            "roll": 0.0,
-            "pitch": -0.4,
-            "yaw": -1.5708,
-            "fovy": 65,
+            "x": 0.002265,
+            "y": 0.073023,
+            "z": -0.016289,
+            "roll": 0.031197,
+            "pitch": -0.490648,
+            "yaw": -1.607245,
+            "fovy": 46,
+        },
+        "top": {
+            "parent_frame": "world",
+            "x": 0.0419,
+            "y": 0.1123,
+            "z": 0.6136,
+            "roll": 0.052274,
+            "pitch": 0.003013,
+            "yaw": 3.136436,
+            "fovy": 47,
         },
         "base": {
             "parent_frame": "base",
@@ -71,7 +92,8 @@ def get_preset(platform: str, camera_name: str) -> dict | None:
     Args:
         platform: "gazebo" or "mujoco".
         camera_name: The ``name`` field from the YAML peripheral entry.
-                     "wrist" → wrist preset; anything else → base preset.
+                     Dedicated entries (e.g. "wrist", "top") are used when
+                     present; otherwise the generic "base" preset is returned.
 
     Returns:
         A dict with keys (parent_frame, x, y, z, roll, pitch, yaw, fovy),
@@ -80,9 +102,7 @@ def get_preset(platform: str, camera_name: str) -> dict | None:
     platform_presets = PRESETS.get(platform)
     if not platform_presets:
         return None
-    if camera_name == "wrist":
-        return platform_presets.get("wrist")
-    return platform_presets.get("base")
+    return platform_presets.get(camera_name) or platform_presets.get("base")
 
 
 # ---------------------------------------------------------------------------

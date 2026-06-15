@@ -1,5 +1,4 @@
 #!/usr/bin/python3
-# -*- coding: utf-8 -*-
 """
 Episode Recorder (ROS 2): stream-to-bag writer with action control.
 
@@ -69,16 +68,19 @@ Notes
 
 from __future__ import annotations
 
+import json
+import re
+import shutil
 import threading
 import time
 import traceback
-from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 import rclpy
+import rosbag2_py
 import yaml
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -91,12 +93,9 @@ from rclpy.timer import Timer
 from rosidl_runtime_py.utilities import get_message
 from std_srvs.srv import Trigger
 
-import rosbag2_py
-
 from ibrobot_msgs.action import RecordEpisode
 from robot_config.contract_utils import contract_fingerprint, qos_profile_from_dict
 from robot_config.utils import build_lerobot_conversion_metadata
-
 
 # ------------------------------ Constants ------------------------------
 
@@ -113,12 +112,7 @@ DEFAULT_DATASET_NAME = "dataset"
 
 def _utc_now_iso() -> str:
     """Return current UTC timestamp in RFC3339 format."""
-    return (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _sanitize_dataset_name(value: str) -> str:
@@ -183,9 +177,9 @@ class WriterState:
         Per-topic counters for observability and debugging.
     """
 
-    writer: Optional[rosbag2_py.SequentialWriter] = None
+    writer: rosbag2_py.SequentialWriter | None = None
     writer_lock: threading.Lock = field(default_factory=threading.Lock)
-    counts: Dict[str, _TopicCounter] = field(default_factory=dict)
+    counts: dict[str, _TopicCounter] = field(default_factory=dict)
 
 
 def _normalize_max_cache_size(value: int) -> int:
@@ -194,10 +188,10 @@ def _normalize_max_cache_size(value: int) -> int:
 
 
 def _topic_counter_diagnostics(
-    counts: Dict[str, _TopicCounter],
-) -> List[Tuple[str, int, int, float]]:
+    counts: dict[str, _TopicCounter],
+) -> list[tuple[str, int, int, float]]:
     """Summarize per-topic recorder counts as (topic, seen, written, drop_ratio)."""
-    rows: List[Tuple[str, int, int, float]] = []
+    rows: list[tuple[str, int, int, float]] = []
     for topic in sorted(counts.keys()):
         counter = counts[topic]
         seen = int(counter.seen)
@@ -260,49 +254,33 @@ class EpisodeRecorderServer(Node):
         self._bag_base.mkdir(parents=True, exist_ok=True)
 
         # Load contract from robot_config_path (Single Source of Truth)
-        robot_config_path = (
-            self.get_parameter("robot_config_path").get_parameter_value().string_value
-        )
+        robot_config_path = self.get_parameter("robot_config_path").get_parameter_value().string_value
         if robot_config_path:
             from robot_config.loader import (
-                load_robot_config_dict,
                 build_contract_from_robot_config_dict,
+                load_robot_config_dict,
             )
 
             self._robot_config_path = Path(robot_config_path).expanduser().resolve()
             robot_config = load_robot_config_dict(str(self._robot_config_path))
             self._contract = build_contract_from_robot_config_dict(robot_config)
         else:
-            raise RuntimeError(
-                "The 'robot_config_path' parameter is required."
-            )
+            raise RuntimeError("The 'robot_config_path' parameter is required.")
 
-        dataset_name_param = (
-            self.get_parameter("dataset_name").get_parameter_value().string_value
-        )
+        dataset_name_param = self.get_parameter("dataset_name").get_parameter_value().string_value
         fallback_dataset_name = (
-            dataset_name_param
-            or getattr(self._contract, "robot_type", "")
-            or self._robot_config_path.stem
+            dataset_name_param or getattr(self._contract, "robot_type", "") or self._robot_config_path.stem
         )
         self._dataset_name = _sanitize_dataset_name(fallback_dataset_name)
-        self._control_mode = (
-            self.get_parameter("control_mode").get_parameter_value().string_value
-        )
-        self._default_task = (
-            self.get_parameter("default_task").get_parameter_value().string_value
-        )
-        self._task_family = (
-            self.get_parameter("task_family").get_parameter_value().string_value
-        )
-        self._lerobot_norm_mode = (
-            self.get_parameter("lerobot_norm_mode").get_parameter_value().string_value
-        )
+        self._control_mode = self.get_parameter("control_mode").get_parameter_value().string_value
+        self._default_task = self.get_parameter("default_task").get_parameter_value().string_value
+        self._task_family = self.get_parameter("task_family").get_parameter_value().string_value
+        self._lerobot_norm_mode = self.get_parameter("lerobot_norm_mode").get_parameter_value().string_value
         self._joint_names = [j for j in self.get_parameter("joint_names").get_parameter_value().string_array_value if j]
-        self._gripper_joints = [j for j in self.get_parameter("gripper_joints").get_parameter_value().string_array_value if j]
-        self._calibration_file = (
-            self.get_parameter("calibration_file").get_parameter_value().string_value
-        )
+        self._gripper_joints = [
+            j for j in self.get_parameter("gripper_joints").get_parameter_value().string_array_value if j
+        ]
+        self._calibration_file = self.get_parameter("calibration_file").get_parameter_value().string_value
         self._dataset_root = self._bag_base / self._dataset_name
         self._episodes_dir = self._dataset_root / "episodes"
         self._dataset_metadata_path = self._dataset_root / "dataset.yaml"
@@ -313,7 +291,7 @@ class EpisodeRecorderServer(Node):
             self._contract_fingerprint = contract_fingerprint(self._contract)
         except Exception:
             self._contract_fingerprint = ""
-        self._lerobot_conversion_meta: Dict[str, Any] = {}
+        self._lerobot_conversion_meta: dict[str, Any] = {}
         if self._joint_names and self._lerobot_norm_mode:
             try:
                 self._lerobot_conversion_meta = build_lerobot_conversion_metadata(
@@ -323,23 +301,15 @@ class EpisodeRecorderServer(Node):
                     norm_mode=self._lerobot_norm_mode,
                 )
             except (FileNotFoundError, KeyError, OSError, ValueError) as exc:
-                self.get_logger().warning(
-                    f"Failed to build LeRobot conversion metadata: {exc!r}"
-                )
+                self.get_logger().warning(f"Failed to build LeRobot conversion metadata: {exc!r}")
 
         self._storage_preset_profile = (
-            self.get_parameter("storage_preset_profile")
-            .get_parameter_value()
-            .string_value
-            or ""
+            self.get_parameter("storage_preset_profile").get_parameter_value().string_value or ""
         )
         self._max_cache_size = _normalize_max_cache_size(
             self.get_parameter("max_cache_size").get_parameter_value().integer_value
         )
-        self._storage_config_uri = (
-            self.get_parameter("storage_config_uri").get_parameter_value().string_value
-            or ""
-        )
+        self._storage_config_uri = self.get_parameter("storage_config_uri").get_parameter_value().string_value or ""
 
         self._ensure_dataset_metadata()
 
@@ -353,7 +323,7 @@ class EpisodeRecorderServer(Node):
         obs = self._contract.observations or []
         tks = self._contract.tasks or []
         acts = self._contract.actions or []
-        self._topics: list[Tuple[str, str, Dict]] = []
+        self._topics: list[tuple[str, str, dict]] = []
         self._topics += [(o.topic, o.type, o.qos or {}) for o in obs]
         self._topics += [(t.topic, t.type, t.qos or {}) for t in tks]
         self._topics += [(a.publish_topic, a.type, a.publish_qos or {}) for a in acts]
@@ -392,21 +362,40 @@ class EpisodeRecorderServer(Node):
             callback_group=self._cbg,
         )
 
+        # Last-episode inspection/deletion services for the interactive CLI.
+        self._last_episode_service = self.create_service(
+            Trigger,
+            "record_episode/get_last_episode",
+            self._last_episode_service_cb,
+            callback_group=self._cbg,
+        )
+        self._delete_last_service = self.create_service(
+            Trigger,
+            "record_episode/delete_last",
+            self._delete_last_service_cb,
+            callback_group=self._cbg,
+        )
+
         # ROS timers for episode lifecycle/feedback (created per-episode)
-        self._timeout_timer: Optional[Timer] = None
-        self._feedback_timer: Optional[Timer] = None
+        self._timeout_timer: Timer | None = None
+        self._feedback_timer: Timer | None = None
         # Used only as a latch (set from timer/cancel/error)
         self._episode_done_evt = threading.Event()
+
+        # Last episode finalized by this recorder instance.  The delete service
+        # uses this state instead of inferring a target from filesystem order,
+        # so it only removes an episode produced by the active recorder session.
+        self._last_episode_dir: Path | None = None
+        self._last_episode_index: int | None = None
+        self._last_episode_messages: int = 0
+        self._last_episode_prompt: str = ""
 
         # Shutdown hook
         self.context.on_shutdown(self._shutdown_cb)
 
+        self.get_logger().info(f"Loaded contract from robot_config: {self._robot_config_path}")
         self.get_logger().info(
-            f"Loaded contract from robot_config: {self._robot_config_path}"
-        )
-        self.get_logger().info(
-            f"Recorder ready with contract '{self._contract.name}' "
-            f"→ dataset root: {self._dataset_root}"
+            f"Recorder ready with contract '{self._contract.name}' → dataset root: {self._dataset_root}"
         )
         self.get_logger().info(
             f"Recorder storage tuning: max_cache_size={self._max_cache_size} bytes, "
@@ -444,15 +433,11 @@ class EpisodeRecorderServer(Node):
         if not self._flags.is_recording or goal_handle is not self._current_goal_handle:
             self.get_logger().warning("Rejecting cancel: not recording/active")
             return CancelResponse.REJECT
-        self.get_logger().info(
-            "Action cancel requested - transitioning to CANCELING state"
-        )
+        self.get_logger().info("Action cancel requested - transitioning to CANCELING state")
         # The actual transition to CANCELING happens in execute_callback when is_cancel_requested is checked
         return CancelResponse.ACCEPT
 
-    def _cancel_service_cb(
-        self, _req: Trigger.Request, resp: Trigger.Response
-    ) -> Trigger.Response:
+    def _cancel_service_cb(self, _req: Trigger.Request, resp: Trigger.Response) -> Trigger.Response:
         """Cancel via service: mirror action cancel semantics (best-effort)."""
         self.get_logger().info("Cancel service called")
         self._flags.stop_requested = True
@@ -461,16 +446,85 @@ class EpisodeRecorderServer(Node):
         resp.message = "Recording cancelled"
         return resp
 
-    def _info_service_cb(
-        self, _req: Trigger.Request, resp: Trigger.Response
-    ) -> Trigger.Response:
+    def _info_service_cb(self, _req: Trigger.Request, resp: Trigger.Response) -> Trigger.Response:
         """Return current dataset path and episode count as JSON."""
-        import json
         resp.success = True
-        resp.message = json.dumps({
-            "path": str(self._dataset_root),
-            "episodes": len(self._episode_dirs())
-        })
+        resp.message = json.dumps({"path": str(self._dataset_root), "episodes": len(self._episode_dirs())})
+        return resp
+
+    def _last_episode_service_cb(self, _req: Trigger.Request, resp: Trigger.Response) -> Trigger.Response:
+        """Return the last episode finalized by this recorder instance as JSON."""
+        if self._last_episode_dir is None or self._last_episode_index is None:
+            resp.success = False
+            resp.message = "No finalized episode is available"
+            return resp
+
+        resp.success = True
+        resp.message = json.dumps(
+            {
+                "dataset_root": str(self._dataset_root),
+                "episode_dir": str(self._last_episode_dir),
+                "episode_name": self._last_episode_dir.name,
+                "episode_index": int(self._last_episode_index),
+                "messages": int(self._last_episode_messages),
+                "prompt": self._last_episode_prompt,
+            }
+        )
+        return resp
+
+    def _delete_last_service_cb(self, _req: Trigger.Request, resp: Trigger.Response) -> Trigger.Response:
+        """Delete the last episode finalized by this recorder instance."""
+        if self._flags.is_recording:
+            resp.success = False
+            resp.message = "Cannot delete while recording"
+            return resp
+        if self._last_episode_dir is None or self._last_episode_index is None:
+            resp.success = False
+            resp.message = "No finalized episode is available to delete"
+            return resp
+
+        episode_dir = self._last_episode_dir
+        try:
+            episode_resolved = episode_dir.resolve()
+            episodes_root = self._episodes_dir.resolve()
+        except OSError as exc:
+            resp.success = False
+            resp.message = f"Failed to resolve episode path: {exc!r}"
+            return resp
+
+        if not episode_resolved.is_relative_to(episodes_root):
+            resp.success = False
+            resp.message = f"Refusing to delete outside episodes directory: {episode_resolved}"
+            return resp
+        if not episode_resolved.name.startswith(EPISODE_DIR_PREFIX):
+            resp.success = False
+            resp.message = f"Refusing to delete non-episode directory: {episode_resolved.name}"
+            return resp
+        if not episode_resolved.exists() or not episode_resolved.is_dir():
+            resp.success = False
+            resp.message = f"Episode directory is not available: {episode_resolved}"
+            return resp
+
+        try:
+            shutil.rmtree(episode_resolved)
+            self._last_episode_dir = None
+            self._last_episode_index = None
+            self._last_episode_messages = 0
+            self._last_episode_prompt = ""
+            self._write_dataset_metadata()
+        except OSError as exc:
+            resp.success = False
+            resp.message = f"Failed to delete episode: {exc!r}"
+            return resp
+
+        resp.success = True
+        resp.message = json.dumps(
+            {
+                "deleted": True,
+                "episode_dir": str(episode_resolved),
+                "dataset_root": str(self._dataset_root),
+            }
+        )
         return resp
 
     def _shutdown_cb(self) -> None:
@@ -501,16 +555,12 @@ class EpisodeRecorderServer(Node):
             try:
                 self._current_goal_handle.abort()
             except Exception as exc:  # pragma: no cover (best-effort)
-                self.get_logger().warning(
-                    f"Failed to abort goal during shutdown: {exc!r}"
-                )
+                self.get_logger().warning(f"Failed to abort goal during shutdown: {exc!r}")
         self._flags.is_recording = False
 
     # ---------- rosbag2 helpers ----------
 
-    def _open_writer(
-        self, bag_uri: str, storage_id: str
-    ) -> rosbag2_py.SequentialWriter:
+    def _open_writer(self, bag_uri: str, storage_id: str) -> rosbag2_py.SequentialWriter:
         """Open a rosbag2 writer with conservative defaults and optional presets.
 
         Parameters
@@ -546,13 +596,11 @@ class EpisodeRecorderServer(Node):
 
     def _register_topic(self, topic: str, type_str: str) -> None:
         """Register a topic with the active writer (idempotent per writer)."""
-        meta = rosbag2_py.TopicMetadata(
-            name=topic, type=type_str, serialization_format="cdr"
-        )
+        meta = rosbag2_py.TopicMetadata(name=topic, type=type_str, serialization_format="cdr")
         assert self._ws.writer is not None
         self._ws.writer.create_topic(meta)
 
-    def _make_sub(self, topic: str, type_str: str, qos_dict: Dict) -> Any:
+    def _make_sub(self, topic: str, type_str: str, qos_dict: dict) -> Any:
         """Create a subscription that writes each message when the writer is open.
 
         The callback:
@@ -575,11 +623,7 @@ class EpisodeRecorderServer(Node):
             with self._ws.writer_lock:
                 writer = self._ws.writer
 
-            if (
-                not self._flags.is_recording
-                or writer is None
-                or self._flags.shutting_down
-            ):
+            if not self._flags.is_recording or writer is None or self._flags.shutting_down:
                 return  # not recording or shutting down
 
             # Timestamp: always use arrival time
@@ -595,15 +639,11 @@ class EpisodeRecorderServer(Node):
             except (RuntimeError, OSError, ValueError) as exc:
                 # Signal fatal; execute loop will finalize
                 self._flags.fatal_error = True
-                self.get_logger().error(
-                    f"Write failed on {_topic}: {exc!r}\n{traceback.format_exc()}"
-                )
+                self.get_logger().error(f"Write failed on {_topic}: {exc!r}\n{traceback.format_exc()}")
                 self._flags.stop_requested = True
                 self._episode_done_evt.set()
 
-        return self.create_subscription(
-            msg_cls, topic, cb, qos, callback_group=self._cbg, raw=True
-        )
+        return self.create_subscription(msg_cls, topic, cb, qos, callback_group=self._cbg, raw=True)
 
     # ---------- per-episode helpers ----------
 
@@ -641,9 +681,7 @@ class EpisodeRecorderServer(Node):
             except Exception as exc:  # client may vanish mid-episode
                 self.get_logger().warning(f"Feedback publish failed: {exc!r}")
 
-        self._feedback_timer = self.create_timer(
-            FEEDBACK_PERIOD_S, _tick, callback_group=self._cbg
-        )
+        self._feedback_timer = self.create_timer(FEEDBACK_PERIOD_S, _tick, callback_group=self._cbg)
 
     def _start_timeout_timer(self, max_duration_s: float) -> None:
         """Create a one-shot timer that stops the episode when it fires."""
@@ -661,11 +699,9 @@ class EpisodeRecorderServer(Node):
             if self._timeout_timer is not None:
                 self._timeout_timer.cancel()
 
-        self._timeout_timer = self.create_timer(
-            float(max_duration_s), _on_timeout, callback_group=self._cbg
-        )
+        self._timeout_timer = self.create_timer(float(max_duration_s), _on_timeout, callback_group=self._cbg)
 
-    def _read_dataset_metadata(self) -> Dict[str, Any]:
+    def _read_dataset_metadata(self) -> dict[str, Any]:
         """Read dataset metadata if present, otherwise return an empty dict."""
         if not self._dataset_metadata_path.exists():
             return {}
@@ -676,17 +712,13 @@ class EpisodeRecorderServer(Node):
         except (OSError, yaml.YAMLError):
             return {}
 
-    def _episode_dirs(self) -> List[Path]:
+    def _episode_dirs(self) -> list[Path]:
         """Return existing episode directories under the active dataset."""
         if not self._episodes_dir.exists():
             self._episodes_dir.mkdir(parents=True, exist_ok=True)
-        return sorted(
-            p
-            for p in self._episodes_dir.iterdir()
-            if p.is_dir() and p.name.startswith(EPISODE_DIR_PREFIX)
-        )
+        return sorted(p for p in self._episodes_dir.iterdir() if p.is_dir() and p.name.startswith(EPISODE_DIR_PREFIX))
 
-    def _write_dataset_metadata(self, total_episodes: Optional[int] = None) -> None:
+    def _write_dataset_metadata(self, total_episodes: int | None = None) -> None:
         """Create or refresh dataset metadata stored at dataset root."""
         meta = self._read_dataset_metadata()
         if total_episodes is None:
@@ -701,9 +733,7 @@ class EpisodeRecorderServer(Node):
         meta.setdefault("contract_name", getattr(self._contract, "name", ""))
         meta.setdefault(
             "storage_id",
-            (self._contract.recording.get("storage") or "mcap")
-            if self._contract.recording
-            else "mcap",
+            (self._contract.recording.get("storage") or "mcap") if self._contract.recording else "mcap",
         )
         meta.setdefault("episodes_dir", "episodes")
         meta.setdefault("created_at", now_iso)
@@ -717,14 +747,8 @@ class EpisodeRecorderServer(Node):
             meta.setdefault("contract_fingerprint", self._contract_fingerprint)
         if self._lerobot_conversion_meta:
             lerobot_meta = meta.get("lerobot") if isinstance(meta.get("lerobot"), dict) else {}
-            conversions = (
-                lerobot_meta.get("conversions")
-                if isinstance(lerobot_meta.get("conversions"), dict)
-                else {}
-            )
-            conversion_fp = str(
-                self._lerobot_conversion_meta.get("conversion_fingerprint", "")
-            )
+            conversions = lerobot_meta.get("conversions") if isinstance(lerobot_meta.get("conversions"), dict) else {}
+            conversion_fp = str(self._lerobot_conversion_meta.get("conversion_fingerprint", ""))
             if conversion_fp:
                 conversions[conversion_fp] = dict(self._lerobot_conversion_meta)
                 lerobot_meta["default_conversion_fingerprint"] = conversion_fp
@@ -740,7 +764,7 @@ class EpisodeRecorderServer(Node):
         """Ensure the dataset root metadata exists before recording starts."""
         self._write_dataset_metadata()
 
-    def _next_episode_dir(self) -> Tuple[int, Path]:
+    def _next_episode_dir(self) -> tuple[int, Path]:
         """Generate the next monotonic episode directory under the dataset root.
 
         Returns
@@ -758,10 +782,7 @@ class EpisodeRecorderServer(Node):
         bag_dir = self._episodes_dir / f"{EPISODE_DIR_PREFIX}{next_index:0{EPISODE_DIR_WIDTH}d}"
         while bag_dir.exists():
             next_index += 1
-            bag_dir = (
-                self._episodes_dir
-                / f"{EPISODE_DIR_PREFIX}{next_index:0{EPISODE_DIR_WIDTH}d}"
-            )
+            bag_dir = self._episodes_dir / f"{EPISODE_DIR_PREFIX}{next_index:0{EPISODE_DIR_WIDTH}d}"
         return next_index, bag_dir
 
     def _finalize_episode(self, bag_dir: Path, prompt: str, episode_index: int) -> None:
@@ -786,10 +807,7 @@ class EpisodeRecorderServer(Node):
 
         for topic, seen, written, drop_ratio in _topic_counter_diagnostics(self._ws.counts):
             level = self.get_logger().warning if drop_ratio > 0.2 else self.get_logger().info
-            level(
-                f"Recorder topic stats: {topic} seen={seen} written={written} "
-                f"drop_ratio={drop_ratio:.1%}"
-            )
+            level(f"Recorder topic stats: {topic} seen={seen} written={written} drop_ratio={drop_ratio:.1%}")
 
         # Cancel timers (do NOT destroy — the executor may still reference the
         # handles; destroying from within a callback causes InvalidHandle).
@@ -824,15 +842,19 @@ class EpisodeRecorderServer(Node):
         self._flags.is_recording = True
         self._flags.fatal_error = False
         self._flags.stop_requested = False
+        # A new goal invalidates the previous episode as a destructive target.
+        # The Trigger-based delete service cannot accept an explicit episode id,
+        # so keeping the old target around during a failed new recording could
+        # let a discard/retry command delete the previous good episode.
+        self._last_episode_dir = None
+        self._last_episode_index = None
+        self._last_episode_messages = 0
+        self._last_episode_prompt = ""
         for k in list(self._ws.counts.keys()):
             self._ws.counts[k] = _TopicCounter()  # reset per-episode counters
 
         prompt = getattr(goal_handle.request, "prompt", "") or ""
-        storage = (
-            (self._contract.recording.get("storage") or "mcap")
-            if self._contract.recording
-            else "mcap"
-        )
+        storage = (self._contract.recording.get("storage") or "mcap") if self._contract.recording else "mcap"
         max_s = float(getattr(self._contract, "max_duration_s", 300.0))
 
         # Unique episode dir under the active dataset root.
@@ -862,11 +884,7 @@ class EpisodeRecorderServer(Node):
         self._start_timeout_timer(max_s)
 
         # Main execution loop - check for cancel requests and wait for completion
-        while (
-            self._flags.is_recording
-            and not self._flags.fatal_error
-            and not self._flags.stop_requested
-        ):
+        while self._flags.is_recording and not self._flags.fatal_error and not self._flags.stop_requested:
             if goal_handle.is_cancel_requested:
                 # Transition to CANCELING state
                 self._flags.stop_requested = True
@@ -879,6 +897,11 @@ class EpisodeRecorderServer(Node):
         was_fatal_error = self._flags.fatal_error
         was_stop_requested = self._flags.stop_requested or goal_handle.is_cancel_requested
         self._finalize_episode(bag_dir, prompt, episode_index)
+        if not was_fatal_error:
+            self._last_episode_dir = bag_dir
+            self._last_episode_index = episode_index
+            self._last_episode_messages = total_written
+            self._last_episode_prompt = prompt
         self._current_goal_handle = None
 
         # Emit terminal transition exactly once, after cleanup
@@ -893,12 +916,8 @@ class EpisodeRecorderServer(Node):
             return RecordEpisode.Result(success=True, message="Stopped early (Saved)")
         else:
             goal_handle.succeed()
-            self.get_logger().info(
-                f"Episode complete: wrote {total_written} messages to {bag_dir}"
-            )
-            return RecordEpisode.Result(
-                success=True, message=f"Wrote {total_written} messages to {bag_dir}"
-            )
+            self.get_logger().info(f"Episode complete: wrote {total_written} messages to {bag_dir}")
+            return RecordEpisode.Result(success=True, message=f"Wrote {total_written} messages to {bag_dir}")
 
     # ---------- metadata ----------
 
@@ -943,13 +962,9 @@ class EpisodeRecorderServer(Node):
                 if self._lerobot_conversion_meta:
                     if self._lerobot_norm_mode:
                         custom["ibrobot.lerobot_norm_mode"] = self._lerobot_norm_mode
-                    conversion_fp = self._lerobot_conversion_meta.get(
-                        "conversion_fingerprint", ""
-                    )
+                    conversion_fp = self._lerobot_conversion_meta.get("conversion_fingerprint", "")
                     if conversion_fp:
-                        custom["ibrobot.lerobot_conversion_fingerprint"] = str(
-                            conversion_fp
-                        )
+                        custom["ibrobot.lerobot_conversion_fingerprint"] = str(conversion_fp)
                 info["custom_data"] = custom
                 meta["rosbag2_bagfile_information"] = info
                 with meta_path.open("w", encoding="utf-8") as f:
