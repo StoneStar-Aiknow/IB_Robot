@@ -28,6 +28,7 @@ try:
 except ImportError:
     torch_npu = None
 
+from model_utils.pi05_export._cli_ui import setup_logging
 from model_utils.pi05_export.ascend_export_patches import (
     ascend_onnx_export_patches,
     downgrade_ir_version,
@@ -41,17 +42,18 @@ from model_utils.pi05_export.om_manifest import upsert_pi05_om_manifest
 LOGGER = logging.getLogger(__name__)
 
 
-def _build_onnx_config_suffix(opset: int, dynamo: bool, constant_folding: bool, dtype: str = "fp16") -> str:
+def _build_onnx_config_suffix(opset: int, dynamo: bool, dtype: str = "fp16", device: str = "cpu") -> str:
     """Build config suffix for ONNX filename.
 
-    Example: _op14_dyn_cf_fp16
-    Abbreviations: op=opset, dyn/nodyn=dynamo, cf/nocf=constant_folding, fp16/fp32=dtype
+    Example: _op17_nodyn_fp16_cpu
+    Abbreviations: op=opset, dyn/nodyn=dynamo, fp16/fp32=dtype, trailing=export device.
+    Constant folding is always on by default and therefore not encoded in the name.
     """
     parts = [
         f"op{opset}",
         "dyn" if dynamo else "nodyn",
-        "cf" if constant_folding else "nocf",
         dtype,
+        device,
     ]
     return "_" + "_".join(parts)
 
@@ -406,7 +408,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--output-dir", type=str, default="outputs/onnx", help="Directory for auto-generated output filename"
     )
-    p.add_argument("--opset", type=int, default=14, help="ONNX opset version (default: 14)")
+    p.add_argument("--opset", type=int, default=17, help="ONNX opset version (default: 17)")
     p.add_argument("--device", type=str, default="cpu", help="Torch device, e.g. cpu or cuda:0")
     p.add_argument("--batch-size", type=int, default=1, help="Batch size for dummy inputs.")
     p.add_argument("--seed", type=int, default=42, help="Seed for dummy inputs and ORT")
@@ -466,40 +468,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_arg_parser().parse_args()
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(levelname)s: %(message)s",
-    )
-
-    # Ensure console logging is visible even if other libraries configured logging earlier.
-    root = logging.getLogger()
-    lvl = getattr(logging, args.log_level.upper(), logging.INFO)
-    root.setLevel(lvl)
-    # Ensure there is at least one StreamHandler with the requested level
-    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
-        sh = logging.StreamHandler()
-        sh.setLevel(lvl)
-        sh.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-        root.addHandler(sh)
-    else:
-        for h in root.handlers:
-            h.setLevel(lvl)
+    setup_logging(args.log_level)
 
     policy_path = args.pretrained_policy_path
     export_dtype = args.dtype  # "fp16" or "fp32"
     # torch dynamo exporter 忽略 opset_version 参数, 固定使用 opset 18
     actual_opset = 18 if args.dynamo else args.opset
-    suffix = _build_onnx_config_suffix(actual_opset, args.dynamo, args.constant_folding, export_dtype)
-    if args.output is not None:
-        base_path = _normalize_path(args.output)
-    else:
-        base_path = _normalize_path(str(Path(args.output_dir) / "pi05-vlm.onnx"))
-    onnx_output_path = base_path.with_name(base_path.stem + suffix + ".onnx")
     runtime_save_dir = _normalize_path(args.runtime_save_dir)
     device = _parse_device(args.device)
     # NPU-affine fused ops (RoPE, etc.) are used automatically when exporting
     # on an NPU device; cpu/cuda exports keep the ORT-runnable fallbacks.
     use_npu_ops = device.type == "npu"
+
+    suffix = _build_onnx_config_suffix(actual_opset, args.dynamo, export_dtype, device.type)
+    if args.output is not None:
+        base_path = _normalize_path(args.output)
+    else:
+        base_path = _normalize_path(str(Path(args.output_dir) / "pi05-vlm.onnx"))
+    onnx_output_path = base_path.with_name(base_path.stem + suffix + ".onnx")
 
     LOGGER.info("Loading PI05VLMPolicy from %s", policy_path)
     policy = PI05VLMPolicy.from_pretrained(policy_path, local_files_only=bool(args.local_files_only), strict=False)

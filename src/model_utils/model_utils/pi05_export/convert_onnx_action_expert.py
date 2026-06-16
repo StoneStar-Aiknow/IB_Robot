@@ -36,6 +36,7 @@ except ImportError:
     torch_npu = None
 
 
+from model_utils.pi05_export._cli_ui import setup_logging
 from model_utils.pi05_export.ascend_export_patches import (
     ascend_onnx_export_patches,
     downgrade_ir_version,
@@ -48,17 +49,18 @@ from model_utils.pi05_export.om_manifest import upsert_pi05_om_manifest
 LOGGER = logging.getLogger(__name__)
 
 
-def _build_onnx_config_suffix(opset: int, dynamo: bool, constant_folding: bool, dtype: str = "fp16") -> str:
+def _build_onnx_config_suffix(opset: int, dynamo: bool, dtype: str = "fp16", device: str = "cpu") -> str:
     """Build config suffix for ONNX filename.
 
-    Example: _op14_nodyn_cf_fp16
-    Abbreviations: op=opset, dyn/nodyn=dynamo, cf/nocf=constant_folding, fp16/fp32=dtype
+    Example: _op17_nodyn_fp16_cpu
+    Abbreviations: op=opset, dyn/nodyn=dynamo, fp16/fp32=dtype, trailing=export device.
+    Constant folding is always on by default and therefore not encoded in the name.
     """
     parts = [
         f"op{opset}",
         "dyn" if dynamo else "nodyn",
-        "cf" if constant_folding else "nocf",
         dtype,
+        device,
     ]
     return "_" + "_".join(parts)
 
@@ -189,7 +191,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir", type=str, default="outputs/onnx", help="Directory for auto-generated output filename"
     )
-    parser.add_argument("--opset", type=int, default=14, help="ONNX opset version (default: 14)")
+    parser.add_argument("--opset", type=int, default=17, help="ONNX opset version (default: 17)")
     parser.add_argument(
         "--past-kv-path",
         type=str,
@@ -375,24 +377,7 @@ class ONNXWrapper(torch.nn.Module):
 
 def main() -> int:
     args = parse_args()
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(levelname)s: %(message)s",
-    )
-
-    # Ensure console logging is visible even if other libraries configured logging earlier.
-    root = logging.getLogger()
-    lvl = getattr(logging, args.log_level.upper(), logging.INFO)
-    root.setLevel(lvl)
-    # Ensure there is at least one StreamHandler with the requested level
-    if not any(isinstance(h, logging.StreamHandler) for h in root.handlers):
-        sh = logging.StreamHandler()
-        sh.setLevel(lvl)
-        sh.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
-        root.addHandler(sh)
-    else:
-        for h in root.handlers:
-            h.setLevel(lvl)
+    setup_logging(args.log_level)
 
     device = args.device
     # NPU-affine fused ops (RoPE, etc.) are used automatically when exporting
@@ -479,7 +464,9 @@ def main() -> int:
 
     # torch dynamo exporter 忽略 opset_version 参数, 固定使用 opset 18
     actual_opset = 18 if args.dynamo else args.opset
-    suffix = _build_onnx_config_suffix(actual_opset, args.dynamo, args.constant_folding, export_dtype)
+    # Normalize the device string to its bare type (cpu / cuda / npu) for the filename tag.
+    device_tag = torch.device(device).type
+    suffix = _build_onnx_config_suffix(actual_opset, args.dynamo, export_dtype, device_tag)
     if args.output is not None:
         base_path = Path(args.output).expanduser().resolve()
     else:
@@ -518,7 +505,7 @@ def main() -> int:
             tuple(observation_values),
             str(onnx_output_path),
             opset_version=actual_opset,
-            verbose=True,
+            verbose=False,
             input_names=dummy_keys,
             output_names=["action"],
             do_constant_folding=bool(args.constant_folding),

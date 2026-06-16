@@ -9,7 +9,7 @@ model_utils 提供了一组用于 LeRobot 策略模型导出与验证的工具�
 | `export_onnx_rknn.py` | 专为 RK3588 NPU 导出 ONNX 模型，并可一键转换为 RKNN 格式 |
 | `loss_compare.py` | 跨平台模型推理精度对比验证 |
 | `frame_inspect` | 脱机逐帧/区间策略推理检查；需要 `policy-path`、`dataset-root` 和帧选择参数 |
-| `pi05_export/` | PI05 策略的 Ascend OM 拆分导出工具链（VLM + Action Expert 两段式导出与诊断），详见下文 |
+| `pi05_export/` | PI05 策略的 Ascend OM 拆分导出工具链（VLM + Action Expert 两段式导出、ATC 转 OM、量化与验证），提供 `python -m model_utils.pi05_export` 一条命令端到端入口，详见下文 |
 
 ---
 
@@ -392,45 +392,191 @@ output_dir/
 
 ## pi05_export（PI05 Ascend OM 拆分导出工具链）
 
-> **注意**：以下为简要说明，后续会补充更详细的端到端文档。
+PI05 策略与单体 ACT 模型不同，导出时被拆分为 **VLM 预填充** 与 **Action Expert（AE）去噪** 两个
+独立的 ONNX/OM artifact，并共同写入策略目录下的 `config.om.json`（供 `device:=ascend_om` 运行时
+按 `vlm -> action_expert` 顺序加载）。相关脚本位于 `model_utils/pi05_export/` 子包。
 
-PI05 策略与单体 ACT 模型不同，导出时被拆分为 **VLM 预填充** 与 **Action Expert 去噪** 两个独立的
-ONNX/OM artifact，分两步导出，并共同写入策略目录下的 `config.om.json`（供 `device:=ascend_om`
-运行时按 `vlm -> action_expert` 顺序加载）。相关脚本位于 `model_utils/pi05_export/` 子包，统一以
-`python -m model_utils.pi05_export.<脚本名>` 方式调用。
+> **TL;DR**：日常只需记住**一条命令**。在装有 CANN（`atc`）的 Ascend 机器上执行：
+>
+> ```shell
+> python -m model_utils.pi05_export \
+>     --policy-path path/to/pretrained_model \
+>     --soc-version Ascend310P3
+> ```
+>
+> 它会按 `VLM 导出 → AE 导出 → ATC 转 OM` 自动串起整条链路，生成两个 `.om` 与 `config.om.json`。
 
-### 导出脚本
+### 一条命令的端到端流程（推荐）
 
-| 脚本 | 用途 |
-| --- | --- |
-| `convert_onnx_vlm` | 导出 VLM 段 ONNX，并将 `vlm` 条目写入 `config.om.json`；同时保存供 Action Expert 使用的运行期张量（`past_kv_tensor`、`prefix_pad_masks`） |
-| `convert_onnx_action_expert` | 读取 VLM 导出保存的运行期张量，导出 Action Expert 段 ONNX，并将 `action_expert` 条目写入 `config.om.json` |
-
-### 验证与诊断脚本
-
-| 脚本 | 用途 |
-| --- | --- |
-| `verify_pi05_split_equivalence` | 校验拆分导出（VLM + Action Expert）与原始整体 PI05 策略的等价性；使用真实 batch 时需通过 `--task` 指定与部署一致的任务提示 |
-| `dump_vlm_pt` | 在 PyTorch 侧 dump VLM 输入/输出张量，用于 PT/ORT/OM 三方逐张量对比 |
-| `dump_vlm_ort` | 在 ONNX Runtime 侧 dump VLM 张量（当前固定使用 CPUExecutionProvider，仅适用于 CPU 兼容的 ONNX 图） |
-| `dump_ae_pt` | 在 PyTorch 侧 dump Action Expert 输入/输出张量 |
-
-### 推荐工作流
+`python -m model_utils.pi05_export` 是整个工具链的统一入口，自动编排各阶段并在阶段间正确
+传递文件，你无需记忆多个模块路径，也无需手写 `atc` 命令。
 
 ```shell
-# 1. 导出 VLM 段（同时生成 Action Expert 所需运行期张量与 config.om.json 的 vlm 条目）
+# 仅导出 ONNX（不转 OM；适合在 GPU/CPU 机器上先把 ONNX 准备好）
+python -m model_utils.pi05_export \
+    --policy-path path/to/pretrained_model
+
+# 导出 ONNX 并转 OM（在 Ascend 机器上一步到位）
+python -m model_utils.pi05_export \
+    --policy-path path/to/pretrained_model \
+    --soc-version Ascend310P3
+
+# 导出 + 转 OM + 等价性验证
+python -m model_utils.pi05_export \
+    --policy-path path/to/pretrained_model \
+    --soc-version Ascend310P3 \
+    --verify --task 'pick up the cup'
+```
+
+#### 参数
+
+| 参数 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `--policy-path` | ✅ | — | 本地 PI05 策略目录（含 config + 权重） |
+| `--dtype` | ❌ | `fp16` | 导出精度，**同时应用于 VLM 与 AE 两段**（`fp16` / `fp32` / `auto`） |
+| `--soc-version` | ❌ | `None` | 给定时追加 ATC→OM 编译（如 `Ascend310P3`，见下文「查看芯片版本号」） |
+| `--verify` | ❌ | `false` | 结尾运行拆分 vs 整体等价性验证（需同时给 `--task`） |
+| `--task` | ❌ | `None` | `--verify` 所需的任务提示，须与部署 `default_task` 一致 |
+| `--device` | ❌ | `cpu` | 导出/验证设备（`cpu` / `cuda:0` / `npu`），会体现在 ONNX 文件名中 |
+| `--output-dir` | ❌ | `outputs/onnx` | 导出 ONNX 的目录 |
+| `--runtime-save-dir` | ❌ | `runtime_save` | VLM→AE 中转张量目录（保留以便排查） |
+| `--force` | ❌ | `false` | 即使产物已存在也强制重建每个阶段 |
+
+#### 特性
+
+- **可断点续跑**：每个阶段的产物路径会被提前预测；若文件已存在则跳过（`▷ skip`）。
+  某阶段失败中断后，**重跑同一条命令即从断点继续**（已完成的自动跳过），需要重建则加 `--force`。
+- **保留中间产物**：流程不删除任何中间文件，导出的 ONNX、`runtime_save/*.pth`、`config.om.json`
+  都保留在盘上，便于检查或局部重跑。
+- **实时反馈**：各阶段以子进程运行并透出 stdout/stderr，导出与 ATC 编译进度实时可见，每个阶段
+  带 `▶ 开始 / ✓ 完成（耗时） / ✗ 失败` 横幅，不会让人误以为卡住。
+- **统一日志风格**：全工具链统一为 `HH:MM:SS LEVEL message`，结尾打印结构化结果块。
+
+#### 日志样例
+
+成功跑通（`--policy-path ... --soc-version Ascend310P3`）的末尾结果块：
+
+```text
+HH:MM:SS INFO ────────────────────────────────────────
+HH:MM:SS INFO PI05 export pipeline complete
+HH:MM:SS INFO ────────────────────────────────────────
+HH:MM:SS INFO   VLM ONNX           : outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx
+HH:MM:SS INFO   Action Expert ONNX : outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx
+HH:MM:SS INFO   VLM OM             : path/to/pretrained_model/vlm.om
+HH:MM:SS INFO   Action Expert OM   : path/to/pretrained_model/action_expert.om
+HH:MM:SS INFO   OM manifest        : path/to/pretrained_model/config.om.json
+HH:MM:SS INFO ────────────────────────────────────────
+HH:MM:SS INFO   ✅ DONE
+HH:MM:SS INFO ────────────────────────────────────────
+```
+
+断点续跑（前两步已完成）：
+
+```text
+HH:MM:SS INFO ▷ [1/3] VLM export — skip (exists: outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx)
+HH:MM:SS INFO ▷ [2/3] Action Expert export — skip (exists: outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx)
+HH:MM:SS INFO ▶ [3/3] ATC → OM compile …
+```
+
+#### 导出 ONNX 的文件命名
+
+自动生成的 ONNX 文件名编码了关键导出配置，便于区分不同配置的产物：
+
+```text
+pi05-vlm_op17_nodyn_fp16_cpu.onnx
+         │    │     │    └─ 导出设备：cpu / cuda / npu
+         │    │     └────── 精度：fp16 / fp32
+         │    └──────────── 是否使用 dynamo 导出：nodyn / dyn
+         └───────────────── ONNX opset 版本（默认 17）
+```
+
+> 说明：常量折叠（constant folding）默认开启，故不再编码进文件名。`dynamo` 模式会忽略 `--opset`
+> 并固定使用 opset 18。
+
+---
+
+### 分步调用（高级 / 调试）
+
+统一入口内部按顺序调用下列子脚本；需要单独运行某一步时也可直接调用。
+
+#### 导出脚本
+
+| 脚本 | 用途 |
+| --- | --- |
+| `convert_onnx_vlm` | 导出 VLM 段 ONNX，写入 `config.om.json` 的 `vlm` 条目；同时保存供 AE 使用的运行期张量（`past_kv_tensor`、`prefix_pad_masks`） |
+| `convert_onnx_action_expert` | 读取 VLM 导出的运行期张量，导出 AE 段 ONNX，写入 `config.om.json` 的 `action_expert` 条目 |
+| `convert_om` | 调用 `atc` 将已导出的 VLM / AE ONNX 编译为 `.om`，`--input_shape` 从 ONNX 静态形状**自动推导**，并补全 `config.om.json` |
+
+```shell
+# 1. 导出 VLM 段
 python -m model_utils.pi05_export.convert_onnx_vlm \
     --pretrained-policy-path path/to/pretrained_model
 
-# 2. 导出 Action Expert 段（复用步骤 1 保存的运行期张量，补全 config.om.json）
+# 2. 导出 AE 段（复用步骤 1 的运行期张量）
 python -m model_utils.pi05_export.convert_onnx_action_expert \
     --pretrained-policy-path path/to/pretrained_model
 
-# 3.（可选）验证拆分导出与原始策略的等价性
+# 3. ATC 转 OM（在 Ascend 机器上；可只传其中一个 --vlm-onnx / --ae-onnx 单独转换）
+python -m model_utils.pi05_export.convert_om \
+    --pretrained-policy-path path/to/pretrained_model \
+    --soc-version Ascend310P3 \
+    --vlm-onnx outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx \
+    --ae-onnx  outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx
+```
+
+> 当 `--pretrained-policy-path` 传入的是 HuggingFace Hub repo id 而非本地目录时，需在
+> `convert_onnx_vlm` / `convert_onnx_action_expert` / `convert_om` 显式指定 `--om-manifest-dir`，
+> 以确保 `config.om.json` 写入真实的本地策略目录而非当前工作目录。
+
+#### 量化（W8A8 PTQ，可选）
+
+将 ONNX 量化为 W8A8 以降低显存带宽压力。**必须提供真实标定数据**（用随机数据标定会得到不可用的模型）。
+
+| 脚本 | 用途 |
+| --- | --- |
+| `quant.quantize_vlm` | 对 VLM（gemma_2b）ONNX 做 msModelSlim W8A8 量化 |
+| `quant.quantize_ae` | 对 AE（gemma_300m）ONNX 做 W8A8 量化（10 步去噪，量化收益被放大约 10×） |
+| `quant.inventory_quant_nodes` | 列出可量化节点清单，辅助决定哪些节点保留 fp16 |
+
+```shell
+# 先列出可量化节点（决定 fp16 豁免）
+python -m model_utils.pi05_export.quant.quantize_vlm \
+    --onnx-path outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx --list-nodes
+
+# 量化 VLM（需真实 batch 标定）
+python -m model_utils.pi05_export.quant.quantize_vlm \
+    --onnx-path   outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx \
+    --output-path outputs/onnx/pi05-vlm_w8a8.onnx \
+    --policy-path path/to/pretrained_model \
+    --batch-path  path/to/batches.json \
+    --num-calib   16 \
+    --task 'pick up the cup'
+
+# 量化 AE（标定输入为 VLM 导出 / dump_ae_pt 产出的张量）
+python -m model_utils.pi05_export.quant.quantize_ae \
+    --onnx-path   outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx \
+    --output-path outputs/onnx/pi05-ae_w8a8.onnx \
+    --calib-dir   path/to/ae_calib_dumps \
+    --num-calib   16
+```
+
+> 量化得到的是 ONNX；随后仍需用 `convert_om` 将量化后的 ONNX 编译为 `.om`。
+
+#### 验证与诊断脚本
+
+| 脚本 | 用途 |
+| --- | --- |
+| `verify_pi05_split_equivalence` | 校验拆分导出（VLM + AE）与原始整体 PI05 策略的等价性；使用真实 batch 时需通过 `--task` 指定与部署一致的任务提示。给定 `--vlm-onnx-path` + `--ae-onnx-path` 时仅对比「整体 PyTorch vs ONNX 拆分」 |
+| `dump_vlm_pt` | 在 PyTorch 侧 dump VLM 输入/输出张量，用于 PT/ORT/OM 三方逐张量对比 |
+| `dump_vlm_ort` | 在 ONNX Runtime（CPU）侧 dump VLM 张量，定位 PT→ONNX 导出误差 |
+| `dump_ae_pt` | 在 PyTorch 侧 dump AE 的完整 Euler 去噪轨迹，定位逐步发散点 |
+
+```shell
+# 验证（cosine ≥ 0.9999 → ✅ PASS；0.999 ≤ cosine < 0.9999 → ⚠️ MARGINAL；否则 ❌ FAIL）
 python -m model_utils.pi05_export.verify_pi05_split_equivalence \
     --pretrained-policy-path path/to/pretrained_model \
+    --vlm-onnx-path outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx \
+    --ae-onnx-path  outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx \
     --task 'pick up the cup'
 ```
 
-> 当 `--pretrained-policy-path` 传入的是 HuggingFace Hub repo id 而非本地目录时，需显式指定
-> `--om-manifest-dir`，以确保 `config.om.json` 写入真实的本地策略目录而非当前工作目录。

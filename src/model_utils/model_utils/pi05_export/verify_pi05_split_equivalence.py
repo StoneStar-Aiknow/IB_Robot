@@ -989,13 +989,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = build_parser().parse_args()
 
-    logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
-        format="%(levelname)s: %(message)s",
-    )
-    # Ensure root logger is also configured
-    root = logging.getLogger()
-    root.setLevel(getattr(logging, args.log_level.upper(), logging.INFO))
+    from model_utils.pi05_export._cli_ui import setup_logging
+
+    setup_logging(args.log_level)
 
     device = torch.device(args.device)
     policy_path = args.pretrained_policy_path
