@@ -50,6 +50,7 @@ class CalibrationStatus:
     status: str
     path: str = ""
     message: str = ""
+    paths: tuple[str, ...] = ()
 
 
 @dataclass
@@ -311,10 +312,20 @@ def inspect_calibration(robot_config: dict[str, Any]) -> CalibrationStatus:
 
     resolved_paths = [str(Path(path).expanduser()) for path in paths]
     missing_paths = [path for path in resolved_paths if not Path(path).exists()]
-    joined_paths = ",".join(resolved_paths)
+    primary_path = resolved_paths[0] if resolved_paths else ""
     if not missing_paths:
-        return CalibrationStatus(status="available", path=joined_paths, message="calibration file exists")
-    return CalibrationStatus(status="missing", path=joined_paths, message="calibration file does not exist")
+        return CalibrationStatus(
+            status="available",
+            path=primary_path,
+            message="calibration files exist",
+            paths=tuple(resolved_paths),
+        )
+    return CalibrationStatus(
+        status="missing",
+        path=primary_path,
+        message=f"missing calibration files: {','.join(missing_paths)}",
+        paths=tuple(resolved_paths),
+    )
 
 
 def action_from_variants(action_chunk: Any) -> list[Any] | None:
