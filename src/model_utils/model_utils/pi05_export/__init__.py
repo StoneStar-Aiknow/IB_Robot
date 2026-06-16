@@ -1,3 +1,5 @@
+# Copyright (c) 2026, HUAWEI CORPORATION.  All rights reserved.
+# Licensed under the Mulan PSL v2.
 """PI05 ONNX-export, monkey-patch and dump tooling for Ascend OM deployment.
 
 This subpackage hosts the offline tools used to split the lerobot PI05 policy into

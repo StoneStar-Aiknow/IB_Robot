@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-# Copyright (c) 2026 Syslong Technology Co., Ltd. All Rights Reserved.
+# Copyright (c) 2026, HUAWEI CORPORATION.  All rights reserved.
 # Licensed under the Mulan PSL v2.
 """msModelSlim W8A8 PTQ for the PI05 **Action Expert** (gemma_300m) ONNX.
 

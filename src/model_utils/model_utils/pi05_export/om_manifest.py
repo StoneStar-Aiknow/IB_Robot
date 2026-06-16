@@ -1,3 +1,5 @@
+# Copyright (c) 2026, HUAWEI CORPORATION.  All rights reserved.
+# Licensed under the Mulan PSL v2.
 """Writer for the PI05 Ascend OM manifest (``config.om.json``).
 
 The IB-Robot inference runtime loads compiled PI05 policies through a

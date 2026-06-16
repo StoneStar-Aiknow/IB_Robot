@@ -1,7 +1,5 @@
 #!/usr/bin/env python
-# Copyright (c) 2025 Syslong Technology Co., Ltd. All Rights Reserved.
-# Copyright (c) 2025 Shanghai Jiao Tong University
-# Copyright (c) 2025, HUAWEI CORPORATION.  All rights reserved.
+# Copyright (c) 2026, HUAWEI CORPORATION.  All rights reserved.
 #
 # Licensed under the Mulan PSL v2.
 # You may obtain a copy of the License at:

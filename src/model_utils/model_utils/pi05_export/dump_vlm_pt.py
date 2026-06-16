@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Syslong Technology Co., Ltd. All Rights Reserved.
+# Copyright (c) 2026, HUAWEI CORPORATION.  All rights reserved.
 # Licensed under the Mulan PSL v2.
 """Dump PyTorch VLM outputs for a single batch.
 
