@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -595,6 +596,84 @@ def build_joint_conversion_table_from_calibration(
             else:
                 span = 200.0
                 offset = -100.0
+
+        table.append((rad_min, rad_max, span, offset))
+
+    return table
+
+
+def _joint_limits_from_urdf(root: ET.Element, joint_name: str) -> tuple[float, float]:
+    """Resolve lower/upper position limits (radians) for one joint from URDF XML.
+
+    Looks first at ``<joint><limit lower=... upper=.../></joint>`` and falls
+    back to the ``ros2_control`` command-interface ``min``/``max`` params when
+    the joint is not declared as a plain URDF joint (typical for grippers).
+    """
+    for joint in root.findall(".//joint"):
+        if joint.get("name") != joint_name:
+            continue
+
+        limit = joint.find("limit")
+        if limit is not None and limit.get("lower") is not None and limit.get("upper") is not None:
+            return float(limit.get("lower")), float(limit.get("upper"))
+
+    for joint in root.findall(".//ros2_control/joint"):
+        if joint.get("name") != joint_name:
+            continue
+
+        command = joint.find("./command_interface[@name='position']")
+        if command is None:
+            continue
+
+        params = {param.get("name"): param.text for param in command.findall("param")}
+        if params.get("min") is not None and params.get("max") is not None:
+            return float(params["min"]), float(params["max"])
+
+    raise KeyError(f"Joint '{joint_name}' missing lower/upper limits in URDF")
+
+
+def build_joint_conversion_table_from_urdf(
+    urdf_xml: str,
+    joint_names: list[str],
+    gripper_joints: list[str] | None = None,
+    norm_mode: str = NORM_MODE_RANGE,
+) -> list[JointConversionEntry]:
+    """Build a conversion table from URDF joint limits (sim mode).
+
+    Sister function of :func:`build_joint_conversion_table_from_calibration`.
+    Used in simulation where there is no physical calibration file: the URDF
+    joint ``limit`` (or the ``ros2_control`` command-interface min/max)
+    provides the runtime position range in radians.
+
+    The output contract is identical to
+    :func:`build_joint_conversion_table_from_calibration`, so callers can use
+    either table transparently. In ``degrees`` mode the radian range is scaled
+    by ``_MODEL_RESOLUTION / (_MODEL_RESOLUTION - 1)`` (= 4096/4095) so the
+    resulting ``span`` matches the tick-based formula used on real hardware.
+    This keeps sim-trained and real-deployed models numerically aligned.
+    """
+    mode = normalize_lerobot_norm_mode(norm_mode)
+    if mode == NORM_MODE_NONE:
+        return []
+
+    root = ET.fromstring(urdf_xml)
+    gripper_joint_set = {str(name) for name in (gripper_joints or [])}
+    table: list[JointConversionEntry] = []
+
+    for joint_name in [str(name) for name in joint_names]:
+        rad_min, rad_max = _joint_limits_from_urdf(root, joint_name)
+        if rad_max <= rad_min:
+            raise ValueError(f"Joint '{joint_name}' has invalid URDF limits: lower={rad_min}, upper={rad_max}")
+
+        if joint_name in gripper_joint_set:
+            span = 100.0
+            offset = 0.0
+        elif mode == NORM_MODE_DEGREES:
+            span = math.degrees(rad_max - rad_min) * _MODEL_RESOLUTION / (_MODEL_RESOLUTION - 1)
+            offset = -span / 2.0
+        else:
+            span = 200.0
+            offset = -100.0
 
         table.append((rad_min, rad_max, span, offset))
 

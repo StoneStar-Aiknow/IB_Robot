@@ -246,6 +246,8 @@ robot:
 弧度命令之间的转换方式。`range_m100_100` 使用机械臂 `[-100,100]`、
 夹爪 `[0,100]`；`degrees` 对机械臂关节使用 centered degrees，但
 `joints.gripper` 中的夹爪关节仍保持 `[0,100]` 开合语义。
+真机模式从 `ros2_control.calib_file` 读取舵机校准范围；`use_sim:=true`
+仿真模式不依赖该校准文件，而是从生成后的 URDF 关节 `limit` 读取弧度范围。
 
 LeRobot 转换 metadata 中的标定来源字段保持稳定契约：
 

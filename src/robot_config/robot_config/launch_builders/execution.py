@@ -190,10 +190,7 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
 
     robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:
-        raise ValueError(
-            "robot_config dict is missing '_config_path'. "
-            "Ensure loader.py injects this correctly."
-        )
+        raise ValueError("robot_config dict is missing '_config_path'. Ensure loader.py injects this correctly.")
 
     model_name = inference_config["model"]
     models = robot_config.get("models", {})
@@ -217,10 +214,13 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
         use_sim,
         env=env,
     )
-    publish_attention = parse_bool(
-        inference_config.get("publish_attention", False),
-        default=False,
-    ) or attention_viz_node is not None
+    publish_attention = (
+        parse_bool(
+            inference_config.get("publish_attention", False),
+            default=False,
+        )
+        or attention_viz_node is not None
+    )
     viz_config = inference_config.get("attention_viz", {}) or {}
     interactive_masking = parse_bool(
         viz_config.get("interactive_masking", False),
@@ -246,6 +246,7 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
         ),
         "passive_mode": True,
         "device": model_config.get("device", "auto"),
+        "use_sim": is_sim,
         "use_sim_time": is_sim,
         "node_name": INFERENCE_NODE_NAME,
         "execution_mode": execution_mode,
@@ -306,13 +307,9 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
     attention_viz_requested, _, _ = _attention_viz_request(inference_config)
     viz_config = inference_config.get("attention_viz", {}) or {}
     if attention_viz_requested:
-        logger.warning(
-            "Attention visualization sidecar is only launched in monolithic mode."
-        )
+        logger.warning("Attention visualization sidecar is only launched in monolithic mode.")
     if parse_bool(viz_config.get("interactive_masking", False), default=False):
-        logger.warning(
-            "Interactive attention masking is only supported in monolithic mode."
-        )
+        logger.warning("Interactive attention masking is only supported in monolithic mode.")
 
     logger.info("========== Generating Inference Nodes (Distributed) ==========")
     logger.info(f"Control mode: {control_mode}")
@@ -321,10 +318,7 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
 
     robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:
-        raise ValueError(
-            "robot_config dict is missing '_config_path'. "
-            "Ensure loader.py injects this correctly."
-        )
+        raise ValueError("robot_config dict is missing '_config_path'. Ensure loader.py injects this correctly.")
 
     model_name = inference_config["model"]
     models = robot_config.get("models", {})
@@ -365,6 +359,7 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
         ),
         "passive_mode": True,
         "device": model_config.get("device", "auto"),
+        "use_sim": is_sim,
         "use_sim_time": is_sim,
         "node_name": INFERENCE_NODE_NAME,
         "execution_mode": "distributed",
@@ -484,9 +479,7 @@ def generate_action_dispatcher_node(robot_config, control_mode, use_sim=False):
                 "robot_config_path": str(robot_config_path),
                 "inference_action_server": action_server,
                 "inference_reset_service": inference_reset_service,
-                "policy_reset_timeout_sec": executor_config.get(
-                    "policy_reset_timeout_sec", 2.0
-                ),
+                "policy_reset_timeout_sec": executor_config.get("policy_reset_timeout_sec", 2.0),
                 "inference_prompt": "",
                 "navigation_mode": executor_config.get("navigation_mode", False),
                 "use_sim_time": is_sim,
