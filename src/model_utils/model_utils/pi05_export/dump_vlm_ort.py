@@ -76,7 +76,7 @@ def dump(
     import onnxruntime as ort
 
     # Lazy imports — heavy deps.
-    from inference_service.core.ascend_om.pi05.prefix_mask_utils import (
+    from model_utils.pi05_export.prefix_mask_utils import (
         build_prefix_att_2d_masks_4d_np,
     )
     from model_utils.pi05_export.verify_pi05_split_equivalence import (

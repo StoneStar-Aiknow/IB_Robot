@@ -735,7 +735,7 @@ def verify_onnx_actions(
     # ONNX model expects it (post-Plan-A exports moved this constant
     # out of the graph to avoid ATC fp16 corruption).
     if "prefix_att_2d_masks_4d" in vlm_valid and "prefix_att_2d_masks_4d" not in vlm_feed:
-        from inference_service.core.ascend_om.pi05.prefix_mask_utils import build_prefix_att_2d_masks_4d_np
+        from model_utils.pi05_export.prefix_mask_utils import build_prefix_att_2d_masks_4d_np
 
         lang_masks_np = batch[OBS_LANGUAGE_ATTENTION_MASK].cpu().numpy().astype(bool)
         num_cameras = len([k for k in batch if k.startswith("observation.images.")])

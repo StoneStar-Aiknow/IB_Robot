@@ -151,7 +151,7 @@ def dump(
     # OM/ONNX graph (resize+normalize happens inside the graph).
     # ------------------------------------------------------------------
     try:
-        from inference_service.core.ascend_om.pi05.prefix_mask_utils import (
+        from model_utils.pi05_export.prefix_mask_utils import (
             build_prefix_att_2d_masks_4d_np,
         )
 
