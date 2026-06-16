@@ -247,6 +247,13 @@ robot:
 夹爪 `[0,100]`；`degrees` 对机械臂关节使用 centered degrees，但
 `joints.gripper` 中的夹爪关节仍保持 `[0,100]` 开合语义。
 
+LeRobot 转换 metadata 中的标定来源字段保持稳定契约：
+
+- `calibration_source`：兼容旧消费者的单字符串字段，始终取第一个解析到的标定文件路径。
+- `calibration_sources`：完整的多标定文件路径列表，多标定源场景应优先读取该字段。
+
+当机器人通过 `ros2_control.calib_file` 配置单个标定文件时，这两个字段都指向同一来源；当机器人通过 `ros2_control.xacro_args.calib_file_1`、`calib_file_2` 等按编号配置多个标定文件时，不需要额外合并标定文件，`calibration_source` 仍保持首个路径，完整有序列表写入 `calibration_sources`。
+
 **命令接口：**
 ```bash
 # 机械臂位置命令
