@@ -55,6 +55,8 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/setup/common.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/setup/openeuler_ros_repo.sh"
 
 
 
@@ -336,31 +338,11 @@ install_openeuler_ros() {
 
     log_info "Installing ROS 2 ${ROS_DISTRO} on openEuler..."
 
-    # Create ROS.repo with dynamic architecture
-    log_info "Creating ROS repository configuration..."
-    run_sudo bash -c "cat << 'EOF' > /etc/yum.repos.d/openEulerROS.repo
-[openEuler-Embedded-ROS-humble]
-name=openEuler-Embedded-ROS-humble
-baseurl=https://eur.openeuler.openatom.cn/results/openEuler_Embedded/IB_Robot-ROS_humble-release_1/openeuler-24.03_LTS-\$basearch/
-skip_if_unavailable=True
-enabled=1
-gpgcheck=0
-priority=1
-
-[openEulerROS-humble]
-name=openEulerROS-humble
-baseurl=https://eulermaker.compass-ci.openeuler.openatom.cn/api/ems1/repositories/ROS-SIG-Multi-Version_ros-humble_openEuler-24.03-LTS-TEST4/openEuler%3A24.03-LTS/\$basearch/
-enabled=1
-gpgcheck=0
-priority=2
-EOF"
-
-    if [[ ! -f /etc/yum.repos.d/openEulerROS.repo ]]; then
-        log_error "Failed to create /etc/yum.repos.d/openEulerROS.repo"
+    # Create / verify ROS repository configuration
+    if ! ensure_openeuler_ros_repo; then
+        log_error "Failed to configure ROS repository."
         return 1
     fi
-
-    log_info "ROS repository configuration created successfully"
 
     # Update package cache
     log_info "Updating dnf package cache..."
