@@ -306,11 +306,18 @@ def build_inputs(
     # export. Reuse it as the authoritative batch size so we never mix a
     # batch-N cache with batch-M time/noise inputs (which would either fail to
     # trace or bake a wrong shape assumption into the exported ONNX graph).
-    actual_batch = int(past_kv_tensor.shape[0])
-    if int(prefix_pad_masks.shape[0]) != actual_batch:
+    #
+    # Tensor layouts (see the VLM export wrapper output):
+    #   past_kv_tensor   : (num_layers, 2, batch, num_kv_heads, seq, head_dim)
+    #   prefix_pad_masks : (batch, seq)
+    # so the batch axis is index 2 for the KV cache and index 0 for the mask.
+    PAST_KV_BATCH_AXIS = 2
+    actual_batch = int(prefix_pad_masks.shape[0])
+    past_kv_batch = int(past_kv_tensor.shape[PAST_KV_BATCH_AXIS])
+    if past_kv_batch != actual_batch:
         raise ValueError(
             "past_kv_tensor and prefix_pad_masks have mismatched batch sizes "
-            f"({actual_batch} vs {int(prefix_pad_masks.shape[0])}); re-run the VLM export to "
+            f"({past_kv_batch} vs {actual_batch}); re-run the VLM export to "
             "regenerate consistent runtime tensors"
         )
     if actual_batch != batch_size:
