@@ -13,6 +13,7 @@ The `robot_teleop` package provides a unified teleoperation interface for IB-Rob
 - ✅ Configuration-driven via `robot_config`
 - ✅ Automatic rosbag recording support
 - ✅ Deep integration with `robot_config` launch system
+- ✅ Cartesian control via `velocity_servo` or `safe_servo`
 
 ## Architecture Design
 
@@ -54,6 +55,25 @@ graph TB
 ```
 
 ### Class Inheritance and Dependencies
+
+### Cartesian Backend Selection
+
+Cartesian mode is selected from the `robot_config` SSOT YAML, not from device code:
+
+```yaml
+teleoperation:
+    cartesian:
+        solver: safe_servo  # safe_servo | velocity_servo
+```
+
+| Solver | Downstream node | Use case |
+|---|---|---|
+| `safe_servo` | `so101_safe_servo_node.py` | Robust Cartesian teleop for low-cost SO101 servos with sag/error; publishes only after `/start` succeeds and the IK result keeps wrist joints near the pending wrist targets |
+| `velocity_servo` | MoveIt Servo `servo_node_main` | Standard Jacobian velocity servo |
+
+The earlier experimental standalone position-IK backend has been removed; teleop now supports only `safe_servo` and `velocity_servo`.
+
+Backend input contract: devices send linear commands in the base frame and angular commands in the tool frame. `velocity_servo` converts tool angular velocity to base internally; `safe_servo` uses tool-frame angular velocity directly for wrist integration. Phone and Xbox both receive Cartesian speed knobs from the `robot_config` SSOT.
 
 #### Class Inheritance Diagram
 
@@ -329,7 +349,7 @@ graph LR
 
 **File**: `devices/xbox_controller.py`
 
-**Control Strategy**: Incremental Control + Cartesian Servo
+**Control Strategy**: Incremental Control + Cartesian backend
 
 **Supported Modes**:
 1. **Joint Mode**: 
@@ -338,9 +358,9 @@ graph LR
    - Reverse-snap prevents jumping
 
 2. **Cartesian Mode**:
-   - Control via MoveIt2 Servo
+    - Control via selected Cartesian backend (`safe_servo` or `velocity_servo`)
    - Controller axis → Linear/angular velocity
-   - Real-time trajectory planning
+    - Returns only the gripper target to avoid arm command conflicts
 
 **Key Features**:
 - ✅ Deadman button (Press A to enable)

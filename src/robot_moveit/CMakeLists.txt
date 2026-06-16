@@ -18,7 +18,9 @@ install(
 )
 
 install(
-  PROGRAMS scripts/moveit_gateway.py
+  PROGRAMS
+    scripts/moveit_gateway.py
+    scripts/so101_safe_servo_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

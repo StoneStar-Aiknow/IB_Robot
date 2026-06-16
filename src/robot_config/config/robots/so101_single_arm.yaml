@@ -59,6 +59,7 @@ robot:
     base_link: base
     ee_link: gripper
     shoulder_link: shoulder
+    so101_safe_servo_config_path: package://robot_moveit/config/so101_safe_servo.yaml
 
   # Control mode management
   default_control_mode: "model_inference"
@@ -609,6 +610,21 @@ robot:
   teleoperation:
     enabled: true
     active_device: "so101_leader" # You can switch between "so101_leader" and "xbox_controller" and "phone_teleop"
+
+    # Cartesian solver used when gamepad / phone is in cartesian mode.
+    # Options (default: safe_servo):
+    #   safe_servo     - robust servo replacement for low-cost arms with sag/error
+    #                    (linear position IK + direct wrist control) [DEFAULT]
+    #   velocity_servo - MoveIt Servo real-time Jacobian tracking
+    #                    (no extra nodes, but freezes near singularities)
+    cartesian:
+      solver: safe_servo
+      # Speed knobs — unitless 0.0 ~ 1.0 fractions.
+      # 1.0 = preset physical maximum (1.0 m/s linear, 6.0 rad/s angular).
+      safe_servo:
+        linear_speed: 0.3   # 0.0~1.0
+        angular_speed: 0.7  # 0.0~1.0
+
     devices:
       - name: "so101_leader"
         type: "leader_arm"

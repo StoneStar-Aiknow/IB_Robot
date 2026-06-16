@@ -2,7 +2,16 @@
 
 ## 概述
 
-`moveit_gateway` 是 IB-Robot 项目中的核心运动控制节点，充当高层控制接口与底层 MoveIt2 运动规划框架之间的网关。该节点专门针对 SO101 5自由度机械臂设计，解决了 5DOF 机械臂在逆运动学（IK）求解中的特殊约束问题。
+`robot_moveit` 是 IB-Robot 的 MoveIt2 集成包，负责运动规划、MoveIt Servo 配置，以及 SO101 的 Safe Servo 节点。包内保留两个运行入口：
+
+| 入口 | 用途 | 主要接口 |
+|---|---|---|
+| `moveit_gateway.py` | 任务级绝对位姿规划，供 `task_dispatch`、AI policy 或外部节点下发目标位姿 | `/cmd_pose`、`/moveit_gateway/move_to_pose`、`/robot_status/ee_pose` |
+| `so101_safe_servo_node.py` | 遥操作 Cartesian 后端，面向低成本舵机误差大、MoveIt Servo 易冻结的 SO101 场景 | `/so101_safe_servo_node/linear_cmd_base`、`/so101_safe_servo_node/angular_cmd_tool`、`/so101_safe_servo_node/start` |
+
+`moveit_gateway` 专门针对 SO101 5自由度机械臂设计，解决 5DOF 机械臂在任务级逆运动学（IK）求解中的特殊约束问题。`so101_safe_servo_node.py` 不是任务规划入口，而是遥操作用的 robust servo 替代后端：线速度通过 MoveIt `compute_ik` 求解位置，腕部 pitch/roll 直接积分，从而绕开廉价舵机误差和奇异点附近的速度伺服冻结问题。
+
+早期实验性的独立位置 IK 遥操作节点已移除；当前遥操作只维护 `safe_servo` 与 `velocity_servo` 两种模式。
 
 ## 推荐启动场景
 
@@ -37,6 +46,21 @@ ros2 launch robot_config robot.launch.py \
 
 两种场景都通过 `/cmd_pose` 发送位姿命令，通过 `/robot_status/ee_pose` 观察末端位姿反馈。
 
+### 遥操作 Safe Servo 后端
+
+`safe_servo` 由 `robot_config` 的 SSOT YAML 选择：
+
+```yaml
+teleoperation:
+  cartesian:
+    solver: safe_servo
+    safe_servo:
+      linear_speed: 0.3
+      angular_speed: 0.7
+```
+
+启动 `control_mode:=teleop`、active device 为 Xbox/Phone 且 solver 为 `safe_servo` 时，`robot_config` 会自动启用 MoveIt（关闭 RViz display）并启动 `so101_safe_servo_node.py`。Leader-arm teleop 不创建 Cartesian backend，因此不会因为全局 solver 配置而自动拉起 MoveIt。该节点读取 `config/so101_safe_servo.yaml`，订阅 split linear/angular 命令，输出到 `/arm_position_controller/commands`。
+
 ## 主要功能
 
 ### 1. 位姿控制 (Pose Control)
@@ -51,6 +75,13 @@ ros2 launch robot_config robot.launch.py \
 ### 3. 关节状态同步
 - **订阅话题**: `/joint_states` (sensor_msgs/JointState)
 - **功能**: 同步当前关节状态，作为 IK 求解的起始状态
+
+### 4. SO101 Safe Servo
+- **配置文件**: `config/so101_safe_servo.yaml`
+- **输入话题**: `/so101_safe_servo_node/linear_cmd_base`、`/so101_safe_servo_node/angular_cmd_tool`
+- **服务**: `/so101_safe_servo_node/start`、`/so101_safe_servo_node/stop`
+- **输出话题**: `/arm_position_controller/commands`
+- **功能**: gripper 位置目标通过 MoveIt position-only IK 跟随，腕部 pitch/roll 由限速积分器生成 pending target；默认发布 90% direct wrist + 10% IK wrist 的混合结果，可在 `config/so101_safe_servo.yaml` 调整 `wrist_ik_blend`
 
 ## 5DOF 机械臂的特殊处理
 

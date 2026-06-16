@@ -7,7 +7,7 @@ command_in_type: "unitless" # Controls whether twist input is unitless (normaliz
 # Scale factors
 scale:
   linear: 1.0 # Max linear speed (m/s) if unitless, or scale factor
-  rotational: 1.0 # Max angular speed (rad/s) if unitless, or scale factor
+  rotational: 3.0 # Max angular speed (rad/s) if unitless, or scale factor
   joint: 1.0 # Scale for joint jogging (if used)
 
 # Frames and Group
@@ -34,6 +34,10 @@ incoming_command_timeout: 0.1 # Timeout for safety stop if commands stop
 # Safety and Singularities
 check_collisions: true # Enable collision checking
 collision_check_rate: 10.0 # Frequency of collision checks
-lower_singularity_threshold: 250.0 # Lower limit for proximity to singularities
-hard_stop_singularity_threshold: 500.0 # Threshold to stop motion near singularity
+lower_singularity_threshold: 250.0 # Start scaling down near singularity
+hard_stop_singularity_threshold: 500.0 # Block commands that push deeper into singularity
+# Allow full-speed escape when the commanded motion would move AWAY from the
+# singularity (increasing the smallest Jacobian singular value). Without this,
+# the arm is permanently locked once it enters the danger zone.
+leaving_singularity_velocity_scale: 1.0
 joint_limit_margin: 0.01 # Buffer distance from joint limits (radians)

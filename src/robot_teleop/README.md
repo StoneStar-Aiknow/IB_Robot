@@ -10,7 +10,7 @@
 - ✅ 具备关节限位裁剪的安全过滤层
 - ✅ 通过 `robot_config` YAML 驱动的全量配置
 - ✅ 支持示教臂、Xbox 手柄、VR 控制器、手机四类设备
-- ✅ Cartesian 模式设备通过 MoveIt2 Servo 实时驱动
+- ✅ Cartesian 模式设备通过 `velocity_servo` 或 `safe_servo` 后端实时驱动
 
 ---
 
@@ -40,7 +40,7 @@ graph TB
         ARM["arm_command_topic<br/><small>default: /arm_position_controller/commands</small>"]
         GRIP["gripper_command_topic<br/><small>default: /gripper_position_controller/commands</small>"]
         DIAG["/diagnostics<br/><small>DiagnosticArray @ 1Hz</small>"]
-        SERVO["MoveIt2 Servo<br/><small>Cartesian 模式专用</small>"]
+        SERVO["Cartesian Backend<br/><small>velocity_servo / safe_servo</small>"]
     end
 
     LA --> Base
@@ -63,7 +63,24 @@ graph TB
     style Output fill:#e1ffe1
 ```
 
-> **设计关键**: Cartesian 模式设备（Xbox Cartesian、VR、Phone）直接驱动 MoveIt2 Servo，并在 `get_joint_targets()` 中**仅返回夹爪键**，TeleopNode 检测到手臂关节键缺失时自动跳过手臂发布，避免与 Servo 冲突。
+> **设计关键**: Cartesian 模式设备（Xbox Cartesian、VR、Phone）通过 `robot_teleop.cartesian_backend` 驱动下游 Cartesian 后端，并在 `get_joint_targets()` 中**仅返回夹爪键**。TeleopNode 检测到手臂关节键缺失时自动跳过手臂发布，避免与 Cartesian 后端争用 `/arm_position_controller/commands`。
+
+### Cartesian 后端选择
+
+Cartesian 后端由 `robot_config` 的 SSOT YAML 配置，不在设备代码中硬编码：
+
+```yaml
+teleoperation:
+  cartesian:
+    solver: safe_servo  # safe_servo | velocity_servo
+```
+
+| Solver | 下游节点 | 适用场景 | 输出 |
+|---|---|---|---|
+| `safe_servo` | `so101_safe_servo_node.py` | 低成本舵机误差大、重力下垂明显、Servo 接近奇异点冻结时 | gripper 位置走 MoveIt position-only IK，腕部 pitch/roll 直接积分；仅在 `/start` 成功且 IK 返回的腕关节与 pending target 一致时发布 |
+| `velocity_servo` | MoveIt Servo `servo_node_main` | 标准 Jacobian 速度伺服，适合误差较小、需要连续速度跟随的场景 | MoveIt Servo 内部求解并发布关节命令 |
+
+早期实验性的独立位置 IK 后端已移除；当前遥操作只维护 `safe_servo` 与 `velocity_servo` 两种模式。
 
 ### 类继承关系图
 
@@ -244,14 +261,14 @@ def control_loop_callback(self):
 
 ### 2. XboxTeleopDevice — Xbox 手柄
 
-**文件**: `devices/xbox_controller.py` | **控制策略**: 增量积分 + MoveIt2 Servo
+**文件**: `devices/xbox_controller.py` | **控制策略**: 增量积分 + Cartesian backend
 
 **工作模式**:
 
 | 模式 | 触发 | 控制方式 | get_joint_targets() 返回 |
 |---|---|---|---|
 | 关节模式 (默认) | 上电 / LB 长按切换 | 摇杆轴 → 关节增量积分 | 6 轴关节目标 |
-| 笛卡尔模式 | LB 长按切换 | 摇杆轴 → MoveIt2 Servo TwistStamped | 仅夹爪键 |
+| 笛卡尔模式 | LB 长按切换 | 摇杆轴 → Cartesian backend (`safe_servo` / `velocity_servo`) | 仅夹爪键 |
 
 **按键映射**:
 
@@ -277,7 +294,7 @@ if (delta > 0 and lead < -0.01) or (delta < 0 and lead > 0.01):
 
 ### 3. VRControllerDevice — VR 控制器
 
-**文件**: `devices/vr_controller.py` | **控制策略**: 差分 6-DoF 位姿 → MoveIt2 Servo
+**文件**: `devices/vr_controller.py` | **控制策略**: 差分 6-DoF 位姿 → Cartesian backend
 
 **传输**: TCP 服务端，默认监听 `0.0.0.0:8888`，接受来自 Unity XR 伴侣应用的 JSON 数据包。
 
@@ -305,7 +322,7 @@ if (delta > 0 and lead < -0.01) or (delta < 0 and lead > 0.01):
 - 分别限幅至 `max_ee_step_m` 和 `max_angular_step_rad`
 - 扳机上升沿重新锚定，防止跳跃
 - 夹爪: button_a 关闭 (+vel)，button_b 打开 (-vel)，速度积分
-- 完全握紧 (`grip_value ≥ 1.0`) 触发 Go-Home 模式，所有关节在 0.05 rad 内稳定 0.5s 后重新启用 Servo
+- 完全握紧 (`grip_value ≥ 1.0`) 触发 Go-Home 模式，所有关节在 0.05 rad 内稳定 0.5s 后重新启用 Cartesian 后端
 
 **配置示例**:
 ```yaml
@@ -322,7 +339,7 @@ if (delta > 0 and lead < -0.01) or (delta < 0 and lead > 0.01):
 
 ### 4. PhoneDevice — 手机遥操作
 
-**文件**: `phone/phone_device.py` | **控制策略**: 差分 6-DoF 位姿 → MoveIt2 Servo
+**文件**: `phone/phone_device.py` | **控制策略**: 差分 6-DoF 位姿 → Cartesian backend
 
 支持两种后端，统一封装在 `PhoneDevice` 中：
 
@@ -332,8 +349,10 @@ if (delta > 0 and lead < -0.01) or (delta < 0 and lead > 0.01):
 | `AndroidPhone` | Android | WebXR + WebSocket | 触屏移动事件 | `reservedButtonA/B` | 两键同按 |
 
 **控制流程** (与 VRControllerDevice 相同):
-- 相机偏移补正 → 差分位姿 → MoveIt2 Servo → 限幅 → 发送
-- Go-Home → 关节位置控制 → 关节误差 < 0.05 rad 稳定后重新启用 Servo
+- 相机偏移补正 → 差分位姿 → 限幅 → Cartesian backend → 发送
+- Phone 与 Xbox 共同遵守 backend 输入契约：linear 为 base-frame，angular 为 tool-frame；`velocity_servo` 在 backend 内转换为 base-frame，`safe_servo` 直接使用 tool-frame angular 积分腕关节
+- Phone 会读取 `control_params.cartesian_linear_speed/cartesian_angular_speed`，与 Xbox 共享 `teleoperation.cartesian.safe_servo` 注入的速度配置
+- Go-Home → 关节位置控制 → 关节误差 < 0.05 rad 稳定后重新启用 Cartesian 后端
 
 **关键参数** (`phone/config_phone.py`):
 
@@ -490,9 +509,10 @@ ros2 launch robot_config robot.launch.py \
 ros2 control list_controllers
 # 期望: arm_position_controller[active], gripper_position_controller[active]
 
-# 2. 确认 MoveIt2 Servo 正在运行（VR/Phone 必须）
-ros2 service list | grep servo
-# 期望: /servo_node/switch_command_type 等服务存在
+# 2. 确认所选 Cartesian 后端正在运行（Xbox Cartesian / VR / Phone 必须）
+ros2 service list | grep -E 'servo_node|so101_safe_servo_node'
+# safe_servo: /so101_safe_servo_node/start 与 /so101_safe_servo_node/stop
+# velocity_servo: /servo_node/start_servo 等 MoveIt Servo 服务
 
 # 3. 监控控制诊断
 ros2 topic echo /diagnostics
@@ -766,12 +786,14 @@ ros2 topic echo /diagnostics | grep loop_time
 3. 确认 WebSocket 端口未被防火墙拦截
 4. 在 Chrome DevTools Console 查看 WebXR 错误日志
 
-**末端执行器不跟随手机/VR 移动（Servo 无响应）**
+**末端执行器不跟随手机/VR 移动（Cartesian 后端无响应）**
 ```bash
-# 确认 MoveIt2 Servo 已启动
-ros2 service list | grep servo
-# 手动激活 Servo
+# 确认后端服务已启动
+ros2 service list | grep -E 'servo_node|so101_safe_servo_node'
+# velocity_servo 可手动激活 Servo
 ros2 service call /servo_node/start_servo std_srvs/srv/Trigger
+# safe_servo 可手动激活 Safe Servo
+ros2 service call /so101_safe_servo_node/start std_srvs/srv/Trigger
 ```
 
 **夹爪不响应**

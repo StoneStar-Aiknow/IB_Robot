@@ -13,8 +13,10 @@ from typing import Any
 
 import numpy as np
 from scipy.spatial.transform import Rotation
+from tf2_ros import Buffer, TransformListener
 
 from ..base_teleop import BaseTeleopDevice
+from ..cartesian_backend import make_cartesian_backend
 from .config_phone import PhoneConfig, PhoneOS
 
 logger = logging.getLogger(__name__)
@@ -399,7 +401,7 @@ class PhoneDevice(BaseTeleopDevice):
         self._control_dt = 1.0 / config.get("control_frequency", 30.0)
 
     def connect(self) -> bool:
-        """Connect to phone hardware and initialise MoveIt Servo client."""
+        """Connect to phone hardware and initialise Cartesian backend."""
         if self._node is None:
             self.logger.error("PhoneDevice requires a ROS node reference (node=None)")
             return False
@@ -415,11 +417,28 @@ class PhoneDevice(BaseTeleopDevice):
             if not self._phone_impl.connect():
                 return False
 
-            from pymoveit2.moveit2_servo import MoveIt2Servo
+            base_link = self._config.get("base_link_name", "base")
+            solver = self._config.get("cartesian_solver", "velocity_servo")
+            tool_frame = self._config.get("tool_frame", "gripper")
+            control_params = self._config.get("control_params", {}) or {}
+            linear_speed = float(control_params.get("cartesian_linear_speed", 1.0))
+            angular_speed = float(control_params.get("cartesian_angular_speed", 1.0))
 
-            frame_id = self._config.get("base_link_name", "base")
-            self.servo_client = MoveIt2Servo(
-                node=self._node, frame_id=frame_id, linear_speed=1.0, angular_speed=1.0, enable_at_init=False
+            self._tf_buffer = Buffer()
+            self._tf_listener = TransformListener(self._tf_buffer, self._node)
+
+            self.servo_client = make_cartesian_backend(
+                solver=solver,
+                node=self._node,
+                tf_buffer=self._tf_buffer,
+                base_link=base_link,
+                tool_frame=tool_frame,
+                linear_speed=linear_speed,
+                angular_speed=angular_speed,
+            )
+            self.logger.info(
+                f"PhoneDevice: cartesian solver={solver}, tool_frame={tool_frame}, "
+                f"base={base_link}, linear_speed={linear_speed}, angular_speed={angular_speed}"
             )
 
             from sensor_msgs.msg import JointState
@@ -597,10 +616,11 @@ class PhoneDevice(BaseTeleopDevice):
         if norm > self.phone_config.max_ee_step_m and norm > 0:
             linear = linear * (self.phone_config.max_ee_step_m / norm)
 
-        # Differential rotation → angular displacement in base frame.
-        # delta_rot is in body frame (phone frame); rotate it to base frame
-        # so MoveIt Servo receives axis directions in the fixed robot coordinate system.
-        angular = rot.apply(delta_rot.as_rotvec())
+        # Differential rotation stays in the device/tool semantic frame.
+        # Cartesian backends own any required frame conversion; velocity_servo
+        # converts tool->base internally, while safe_servo integrates tool-frame
+        # angular commands directly into J4/J5.
+        angular = delta_rot.as_rotvec()
 
         # Clamp to max single-step angular magnitude
         angular_norm = float(np.linalg.norm(angular))

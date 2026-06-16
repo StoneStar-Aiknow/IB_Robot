@@ -14,10 +14,10 @@ from typing import Any
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from sensor_msgs.msg import JointState, Joy
-
-from pymoveit2.moveit2_servo import MoveIt2Servo
+from tf2_ros import Buffer, TransformListener
 
 from ..base_teleop import BaseTeleopDevice
+from ..cartesian_backend import make_cartesian_backend
 
 
 class XboxTeleopDevice(BaseTeleopDevice):
@@ -37,6 +37,12 @@ class XboxTeleopDevice(BaseTeleopDevice):
         self.gripper_joint_names = config.get("gripper_joint_names", ["6"])
         self.arm_joint_names = config.get("arm_joint_names", ["1", "2", "3", "4", "5"])
         self.joint_limits = config.get("joint_limits", {})
+
+        # Injected by robot_config.launch_builders.teleop based on
+        # robot.teleoperation.cartesian.{solver,tool_frame} SSOT fields.
+        self.cartesian_solver = config.get("cartesian_solver", "velocity_servo")
+        self.tool_frame = config.get("tool_frame", "gripper")
+        self.base_link = config.get("base_link_name", "base")
 
         # 3. Mappings
         mapping_name = config.get("mapping_config", "xbox_mapping")
@@ -108,11 +114,11 @@ Controls:        [A] to ENABLE, [B] to DISABLE
   - D-Pad Left/Right: Joint 5"""
         else:
             mode_help = """CARTESIAN MODE (MoveIt Servo):
-  - Left Stick U/D:  Linear X (Forward/Backward)
-  - Left Stick L/R:  Linear Y (Left/Right)
+  - Left Stick L/R:  Linear X (Left/Right)
+  - Left Stick U/D:  Linear Y (Forward/Backward)
   - Right Stick U/D: Linear Z (Up/Down)
-  - Right Stick L/R: Angular Z (Yaw / Rotation)
-  - D-Pad Left/Right: Angular Y (Pitch / Tilt)"""
+  - Right Stick L/R: Angular Y (Pitch / Tilt)
+  - D-Pad Left/Right: Angular Z (Wrist Roll)"""
 
         banner = f"""
 ================================================================================
@@ -156,12 +162,22 @@ CONTROLS:
             self._joint_state_sub = self._node.create_subscription(
                 JointState, "/joint_states", self._joint_state_callback, 10
             )
-            self.servo_client = MoveIt2Servo(
+
+            # TF buffer for tool_frame angular-velocity conversion.
+            self._tf_buffer = Buffer()
+            self._tf_listener = TransformListener(self._tf_buffer, self._node)
+
+            self.servo_client = make_cartesian_backend(
+                solver=self.cartesian_solver,
                 node=self._node,
-                frame_id="base",
+                tf_buffer=self._tf_buffer,
+                base_link=self.base_link,
+                tool_frame=self.tool_frame,
                 linear_speed=self.cartesian_linear_speed,
                 angular_speed=self.cartesian_angular_speed,
-                enable_at_init=False,
+            )
+            self.logger.info(
+                f"XboxTeleopDevice: cartesian solver={self.cartesian_solver}, tool_frame={self.tool_frame}"
             )
             self._is_connected = True
             self._print_usage(level="compact")
@@ -253,7 +269,7 @@ CONTROLS:
                 return val if abs(val) > self.deadzone else 0.0
             return 0.0
 
-        linear = (get_val("linear_x", 1), get_val("linear_y", 0), get_val("linear_z", 4))
+        linear = (get_val("linear_x", 1), -get_val("linear_y", 0), get_val("linear_z", 4))
         angular = (0.0, get_val("angular_y", 6), get_val("angular_z", 3))
         self.servo_client.servo(linear=linear, angular=angular)
 

@@ -15,11 +15,11 @@ axis_mapping:
     "4": 4           # Right Stick Y -> Joint 4
     "5": 6           # D-pad X -> Joint 5
   cartesian_mode:
-    linear_x: 1      # Left Stick Y (Forward/Backward)
-    linear_y: 0      # Left Stick X (Left/Right)
+    linear_x: 0      # Left Stick X (Left/Right)
+    linear_y: 1      # Left Stick Y (Forward/Backward)
     linear_z: 4      # Right Stick Y (Up/Down)
-    angular_y: 6     # D-pad X (Pitch)
-    angular_z: 3     # Right Stick X (Yaw)
+    angular_y: 3     # Right Stick X (Pitch/Tilt)
+    angular_z: 6     # D-pad X (Yaw)
   gripper:
     open: 5          # RT
     close: 2         # LT

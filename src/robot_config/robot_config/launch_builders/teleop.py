@@ -9,6 +9,7 @@ import os
 import re
 from pathlib import Path
 
+from ament_index_python.packages import get_package_share_directory
 from launch_ros.actions import Node
 
 from robot_config.logger_utils import get_colored_logger
@@ -172,6 +173,37 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
         if moveit_key in device_config:
             device_param[moveit_key] = device_config[moveit_key]
 
+    # ----- Cartesian solver selection -----
+    # SSOT lives in robot.teleoperation.cartesian.{solver,tool_frame}.
+    # Default is 'safe_servo' for low-cost arms with noticeable servo error.
+    cart_cfg = teleop_config.get("cartesian", {}) or {}
+    cart_solver = cart_cfg.get("solver", "safe_servo")
+    if cart_solver not in ("velocity_servo", "safe_servo"):
+        raise ValueError(
+            f"teleoperation.cartesian.solver must be 'velocity_servo', or 'safe_servo', got {cart_solver!r}"
+        )
+    moveit_cfg = robot_config.get("moveit", {}) or {}
+    cart_tool_frame = (
+        cart_cfg.get("tool_frame") or device_config.get("ee_frame_name") or moveit_cfg.get("ee_link") or "gripper"
+    )
+    _validate_tool_frame(cart_tool_frame, robot_config)
+    device_param["cartesian_solver"] = cart_solver
+    device_param["tool_frame"] = cart_tool_frame
+    device_param["base_link_name"] = device_param.get("base_link_name", moveit_cfg.get("base_link", "base"))
+
+    # When solver=safe_servo, route device-side speed knobs from the safe_servo
+    # config block.
+    if cart_solver == "safe_servo":
+        safe_cfg = cart_cfg.get("safe_servo", {}) or {}
+        safe_linear_speed = safe_cfg.get("linear_speed", 0.3)
+        safe_angular_speed = safe_cfg.get("angular_speed", 0.7)
+        cp = device_param.setdefault("control_params", {})
+        cp["cartesian_linear_speed"] = safe_linear_speed
+        cp["cartesian_angular_speed"] = safe_angular_speed
+        logger.info(f"safe_servo speed override: linear={safe_linear_speed} (0~1), angular={safe_angular_speed} (0~1)")
+
+    logger.info(f"Cartesian solver={cart_solver}, tool_frame={cart_tool_frame}")
+
     device_type = device_config.get("type", "")
 
     control_frequency = device_config.get("control_frequency", 50.0)
@@ -256,11 +288,17 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
         nodes.append(joy_node)
         logger.info(f"Added joy_node for input device: {input_dev}")
 
-    # Add MoveIt Servo node for Xbox controller and phone (both use Cartesian Servo control)
+    # Add MoveIt Servo or Safe Servo node for Xbox controller and phone.
+    # Selection is driven by robot.teleoperation.cartesian.solver.
     if device_config.get("type") in ("xbox_controller", "phone"):
-        servo_node = _create_servo_node(robot_config, device_config, robot_description_dict)
-        nodes.append(servo_node)
-        logger.info("Generated servo_node for Cartesian control")
+        if cart_solver == "velocity_servo":
+            servo_node = _create_servo_node(robot_config, device_config, robot_description_dict)
+            nodes.append(servo_node)
+            logger.info("Generated servo_node for Cartesian velocity_servo control")
+        elif cart_solver == "safe_servo":
+            safe_node = _create_so101_safe_servo_node(robot_config, device_config, robot_description_dict)
+            nodes.append(safe_node)
+            logger.info("Generated so101_safe_servo_node for SO101 robust Cartesian control")
 
     return nodes
 
@@ -370,6 +408,102 @@ def _create_servo_node(robot_config: dict, device_config: dict, robot_descriptio
         ],
     )
     return servo_node
+
+
+# ---------------------------------------------------------------------------
+# Cartesian helpers: tool_frame validation + safe_servo launcher
+# ---------------------------------------------------------------------------
+
+
+class ConfigError(ValueError):
+    """Raised when the SSOT YAML is internally inconsistent."""
+
+
+def _validate_tool_frame(tool_frame: str, robot_config: dict) -> None:
+    """Confirm ``tool_frame`` resolves at launch time.
+
+    Accepts: the configured ``base_link``, any virtual frame declared under
+    ``kinematics.frames``, or anything the user typed (URDF links are not
+    enumerated here — they are confirmed when the Servo node first runs).
+    The strict check is intentionally narrow: we hard-fail on the obvious
+    mistake of referencing a virtual frame name that was never declared.
+    """
+    from robot_config.launch_builders.virtual_frames import (
+        collect_virtual_frame_names,
+    )
+
+    if not tool_frame:
+        raise ConfigError("tool_frame is empty")
+    moveit_cfg = robot_config.get("moveit", {}) or {}
+    base_link = moveit_cfg.get("base_link", "base")
+    if tool_frame == base_link:
+        return
+    if tool_frame == moveit_cfg.get("ee_link"):
+        return
+    virtual = collect_virtual_frame_names((robot_config.get("kinematics", {}) or {}).get("frames"))
+    # If user references a virtual frame, it must exist.
+    if tool_frame in virtual:
+        return
+    # Otherwise we assume the user supplied a URDF link name; warn but allow,
+    # since runtime TF will be the final authority (and the Servo node
+    # will fail-fast with a clear log if the link doesn't exist).
+    logger.warning(
+        f"tool_frame={tool_frame!r} is neither base_link, ee_link, nor a declared "
+        f"virtual frame; assuming it is a URDF link. Runtime TF will validate."
+    )
+
+
+def _create_so101_safe_servo_node(
+    robot_config: dict,
+    device_config: dict,
+    robot_description_dict: dict = None,
+) -> Node:
+    """Launch ``so101_safe_servo_node``.
+
+    Loads the solver YAML from ``moveit.so101_safe_servo_config_path`` and
+    appends arm joint names from ``robot.joints.arm`` so the node knows
+    the controller output order.
+    """
+    import yaml as _yaml
+
+    moveit_cfg = robot_config.get("moveit", {}) or {}
+    yaml_ref = moveit_cfg.get("so101_safe_servo_config_path")
+    if not yaml_ref:
+        raise ConfigError(
+            "solver=safe_servo requires moveit.so101_safe_servo_config_path "
+            "(e.g. package://robot_moveit/config/so101_safe_servo.yaml)"
+        )
+    if yaml_ref.startswith("package://"):
+        rest = yaml_ref[len("package://") :]
+        pkg_name, _, rel = rest.partition("/")
+        yaml_path = os.path.join(get_package_share_directory(pkg_name), rel)
+    else:
+        yaml_path = resolve_ros_path(yaml_ref)
+    with open(yaml_path) as f:
+        params = _yaml.safe_load(f) or {}
+
+    joints_cfg = robot_config.get("joints", {}) or {}
+    arm_joint_names = joints_cfg.get("arm", [])
+    if not arm_joint_names:
+        raise ConfigError(
+            "solver=safe_servo requires robot.joints.arm to list the arm "
+            "joint names (used to order the position command output)"
+        )
+    params["arm_joint_names"] = arm_joint_names
+
+    # The node needs robot_description so MoveIt's compute_ik can resolve
+    # the configured ik_link_name and collision model.
+    extra = {}
+    if robot_description_dict:
+        extra.update(robot_description_dict)
+
+    return Node(
+        package="robot_moveit",
+        executable="so101_safe_servo_node.py",
+        name="so101_safe_servo_node",
+        output="screen",
+        parameters=[params, extra],
+    )
 
 
 def validate_teleop_config(teleop_config: dict[str, object]) -> list[str]:
