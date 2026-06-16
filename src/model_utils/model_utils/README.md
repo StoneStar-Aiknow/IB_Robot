@@ -297,6 +297,8 @@ python export_onnx_hmm.py \
 > **跨平台模型推理精度对比工具。**
 >
 > 用于验证模型在不同平台（如 GPU PyTorch 推理 vs NPU OM 推理）上的输出一致性。支持生成基准推理结果和计算 L1 Loss。
+>
+> **注意**：该脚本现已统一通过 IB-Robot 的 `inference_service.InferenceCoordinator` 加载模型，因此既支持原生 LeRobot torch 模型，也支持 ib robot 中编译好的离线模型（昇腾 OM、3403、RKNN）。后端由 `--device` 参数自动选择，无需修改脚本。pi05 等 VLA 模型在 torch 与 OM 两种后端下都可直接对比。
 
 ### 工作流程
 
@@ -330,14 +332,17 @@ python loss_compare.py \
 
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `--policy_path` | ✅ | — | LeRobot 训练出来的策略模型目录路径 |
+| `--policy_path` | ✅ | — | LeRobot 训练出来的策略模型目录路径（torch 与 OM 共用同一目录，OM 需含 `config.om.json`） |
 | `--batch_path` | ✅ | — | 输入 batch 的 JSON 文件路径 |
 | `--target_path` | ✅ | — | 基准推理输出的 JSON 文件路径（生成或读取） |
-| `--policy_type` | ❌ | `act` | 策略模型类型（支持 `act`、`pi05`） |
-| `--device` | ❌ | `cpu` | 推理设备（如 `cpu`、`cuda`） |
+| `--policy_type` | ❌ | `act` | 策略类型提示（实际类型由加载的策略/manifest 自动检测，仅作回退） |
+| `--device` | ❌ | `cpu` | 推理后端：原生 torch 用 `cpu`/`cuda`/`npu`；ib robot 离线模型用 `ascend_om`（含 pi05 OM）、`ascend_om_3403`、`rknn` |
+| `--model_dtype` | ❌ | `native` | 仅对 torch 后端生效：将模型转为 `fp16`/`bf16`/`fp32`（编译后端使用其固定 dtype，忽略此参数） |
 | `--generate-target` | ❌ | `false` | 指定后进入基准数据生成模式 |
 | `--seed` | ❌ | `42` | 随机种子，用于固定扩散/flow-matching 噪声以保证可复现性 |
+| `--task` | ❌ | `""` | VLA 策略（PI0/PI05/SmolVLA）的自然语言任务提示词，会被路由进 LeRobot 预处理器的 complementary_data 并 tokenize。生成基准与计算损失两端必须一致，否则对比无意义 |
 | `--noise-dir` | ❌ | `None` | 噪声文件目录，用于跨机器精度对比（Scheme C） |
+| `--raw-target-path` | ❌ | `None` | 归一化空间（后处理前）动作的导出/读取路径，用于区分模型漂移与反归一化放大 |
 
 ### 噪声文件传递（Scheme C）
 
@@ -366,6 +371,62 @@ python loss_compare.py \
     --target_path=targets.json \
     --noise-dir=noise_files/
 ```
+
+### pi05 OM 离线模型对比示例
+
+pi05 在 GPU 上用 torch 生成基准，在昇腾上用 OM 离线模型对比（`--device=ascend_om`）。
+由于 flow-matching ODE 对噪声敏感，跨平台对比务必配合 `--noise-dir` 传递相同噪声：
+
+```shell
+# 步骤 1：GPU torch 端生成基准 + 噪声 + 归一化空间基准
+python loss_compare.py \
+    --policy_path=path/to/pi05_model \
+    --policy_type=pi05 \
+    --device=cuda \
+    --batch_path=batches.json \
+    --target_path=targets.json \
+    --raw-target-path=raw_targets.json \
+    --noise-dir=noise_files/ \
+    --generate-target
+
+# 步骤 2：昇腾 OM 端计算精度损失（policy_path 目录需含 config.om.json 与 OM 文件）
+python loss_compare.py \
+    --policy_path=path/to/pi05_model \
+    --policy_type=pi05 \
+    --device=ascend_om \
+    --batch_path=batches.json \
+    --target_path=targets.json \
+    --raw-target-path=raw_targets.json \
+    --noise-dir=noise_files/
+```
+
+### OM 后端使用须知
+
+`--device=ascend_om` 时，`policy_path` 目录除了 LeRobot 策略元数据（`config.json`、
+`policy_preprocessor.json`、`policy_postprocessor.json` 及对应 safetensors）之外，还必须包含一个
+**`config.om.json`** manifest，描述 OM 离线模型的 artifact。pi05（VLM + Action Expert 双 OM）的 manifest 形如：
+
+```json
+{
+  "schema_version": 1,
+  "policy_type": "pi05",
+  "backend": "ascend_om",
+  "artifacts": {
+    "vlm": "vlm.om",
+    "action_expert": "ae.om"
+  },
+  "execution": ["vlm", "action_expert"]
+}
+```
+
+- `artifacts` 里的路径相对于 manifest 所在目录（可用 `artifact_dir` 指定子目录）；务必与目录下真实存在的 `.om` 文件名一致。
+- ACT 单 OM 模型的 manifest 见 `export_onnx_atc.py` 一节（`"artifacts": {"policy": "model.om"}`）。
+- pi05 等 VLA 模型需通过 `--task` 提供任务提示词（默认空串）；该提示词必须与生成基准时一致。
+- OM 端会自动读取并 strip 掉 `config.json` 中 IB-Robot 特有的键
+  （`is_ascend_om_enabled` / `om_vlm_model_path` / `om_action_expert_model_path` 等），无需手动清理。
+
+> **自洽性自检**：在同一台板子上先用 `--generate-target` 生成 OM 基准（含 `--noise-dir`），再用相同噪声跑 compute-loss，应得到 `L1 = 0.000000`、`Cosine = 1.000000`（归一化空间同理）。这可用于在跨平台对比前确认整条 pre/infer/post 流水线确定且可复现。
+
 
 ---
 
