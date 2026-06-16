@@ -31,6 +31,10 @@ robot:
       - "5"
     gripper:
       - "6"
+    base:
+      - "7"
+      - "8"
+      - "9"
     all: ["1", "2", "3", "4", "5", "6"]
 
   # Control mode management
@@ -118,30 +122,40 @@ robot:
     enabled: true
 
     robot_description:
-      urdf_path: $(find robot_description)/urdf/lerobot/lekiwi/lekiwi.urdf.xacro
+      urdf_path: $(find lekiwi_description)/urdf/lekiwi_assembled.urdf.xacro
 
     nav2_bringup:
       enabled: true
-      map_file: "~/workspace/map/rtabmap.yaml"
+      map_file: "$(env HOME)/.ros/ibrobot/maps/rtabmap.yaml"
       params_file: ""
 
     ekf_rtabmap:
       enabled: true
       rtabmap:
-        database_path: "~/workspace/map/rtabmap.db"
+        database_path: "$(env HOME)/.ros/ibrobot/maps/rtabmap.db"
         localization: true
-        frame_id: realsense_link
+        visual_odometry: false
+        frame_id: camera_link
         odom_frame_id: odom
-        # RealSense 通过 peripherals 启动，RGB 话题已重映射
-        rgb_topic: /camera/realsense_camera/color/image_raw
-        depth_topic: /camera/realsense_camera/aligned_depth_to_color/image_raw
-        camera_info_topic: /camera/realsense_camera/color/camera_info
+        odom_topic: /odometry/filtered
+        # RealSense driver topics are adapted in perception.py to the stable contract.
+        rgb_topic: /camera/realsense/image_raw
+        depth_topic: /camera/realsense/depth/image_rect_raw
+        camera_info_topic: /camera/realsense/camera_info
         approx_sync: true
         queue_size: 20
-        rtabmap_args: "--Mem/InitWMWithAllNodes true --Mem/IncrementalMemory true --Mem/PermanentMemory false --Mem/STMSize 8 --Reg/Force3DoF true"
+        qos_image: 2
+        qos_camera_info: 2
+        qos_odom: 2
+        rtabmap_args: "--Mem/InitWMWithAllNodes true --Mem/IncrementalMemory false --Mem/PermanentMemory true --Mem/STMSize 8 --Reg/Force3DoF true"
         log_level: error
+      depth_to_laserscan:
+        enabled: true
+        output_frame: camera_link
+        depth_topic: /camera/realsense/depth/image_rect_raw
+        depth_camera_info_topic: /camera/realsense/camera_info
       ekf:
-        config_file: ""
+        config_file: "$(find robot_config)/config/lekiwi/navigation/ekf_minimal.yaml"
 
     cmd_vel_bridge:
       enabled: true
@@ -179,7 +193,7 @@ robot:
           theta: 0.0
 
     rviz:
-      enabled: true
+      enabled: false
       config_file: ""
 
   simulation:
@@ -266,6 +280,7 @@ robot:
     - type: camera
       name: realsense
       driver: realsense
+      driver_camera_name: realsense_camera
       serial_number: ""
       width: 640
       height: 480
@@ -274,8 +289,8 @@ robot:
       enable_pointcloud: false
       align_depth: true
       enable_sync: true
-      frame_id: realsense_link
-      optical_frame_id: realsense_color_optical_frame
+      frame_id: camera_link
+      optical_frame_id: camera_color_optical_frame
       transform:
         parent_frame: base_link
         x: 0.0

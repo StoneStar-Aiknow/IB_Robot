@@ -44,6 +44,8 @@ setup(
             "cmd_vel_bridge_node = robot_navigation.cmd_vel_bridge_node:main",
             # Voice Control (bridges voice_asr_service to nav2_goal_client)
             "voice_control = robot_navigation.voice_control:main",
+            # Save RTAB-Map occupancy grid through nav2_map_server
+            "save_rtabmap_map = robot_navigation.save_rtabmap_map:main",
         ],
     },
 )

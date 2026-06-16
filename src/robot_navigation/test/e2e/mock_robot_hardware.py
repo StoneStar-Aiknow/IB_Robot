@@ -3,7 +3,7 @@
 Lightweight robot simulator that:
   - Subscribes /cmd_vel (Twist)
   - Integrates pose (x, y, theta) at 20Hz
-  - Publishes /odom (Odometry) + TF (odom -> base_link)
+  - Publishes /odom (Odometry) + TF (map -> odom, odom -> base_link)
   - Publishes /scan (LaserScan, all max-range for open space)
   - Publishes /joint_states (via FK inverse of cmd_vel)
 
@@ -43,6 +43,7 @@ class MockRobotHardware(Node):
         self.declare_parameter("scan_angle_max", math.pi)
         self.declare_parameter("scan_angle_increment", math.pi / 180.0)
         self.declare_parameter("odom_frame", "odom")
+        self.declare_parameter("global_frame", "map")
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("publish_rate", 20.0)
 
@@ -53,6 +54,7 @@ class MockRobotHardware(Node):
         self.scan_angle_max = self.get_parameter("scan_angle_max").value
         self.scan_angle_increment = self.get_parameter("scan_angle_increment").value
         self.odom_frame = self.get_parameter("odom_frame").value
+        self.global_frame = self.get_parameter("global_frame").value
         self.base_frame = self.get_parameter("base_frame").value
         publish_rate = self.get_parameter("publish_rate").value
 
@@ -149,7 +151,14 @@ class MockRobotHardware(Node):
         self.odom_pub.publish(odom)
 
     def _publish_tf(self, stamp):
-        """Publish odom -> base_link TF."""
+        """Publish mock localization and odometry TFs."""
+        map_to_odom = TransformStamped()
+        map_to_odom.header.stamp = stamp
+        map_to_odom.header.frame_id = self.global_frame
+        map_to_odom.child_frame_id = self.odom_frame
+        map_to_odom.transform.rotation.w = 1.0
+        self.tf_broadcaster.sendTransform(map_to_odom)
+
         t = TransformStamped()
         t.header.stamp = stamp
         t.header.frame_id = self.odom_frame

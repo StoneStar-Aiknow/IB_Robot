@@ -19,6 +19,7 @@ import signal
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 import pytest
 import rclpy
@@ -41,6 +42,7 @@ BASE_RADIUS = 0.125
 MAX_RADPS = 4.602
 
 NAV2_STARTUP_TIMEOUT = 60
+NAV_TEST_PROFILE_ENV = "NAV_TEST_PROFILE"
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -48,9 +50,12 @@ NAV2_STARTUP_TIMEOUT = 60
 
 def _find_test_config():
     """Find test config files — search both source tree and install tree."""
+    profile = _select_nav2_test_profile()
+    params_filename = "nav2_params_test_minimal.yaml" if profile == "minimal" else "nav2_params_test.yaml"
+
     src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     config_dir = os.path.join(src_dir, "config", "test")
-    nav2_params = os.path.join(config_dir, "nav2_params_test.yaml")
+    nav2_params = os.path.join(config_dir, params_filename)
     test_map_yaml = os.path.join(config_dir, "test_map.yaml")
     if os.path.isfile(nav2_params) and os.path.isfile(test_map_yaml):
         return nav2_params, test_map_yaml
@@ -59,13 +64,44 @@ def _find_test_config():
 
         share_dir = get_package_share_directory("robot_navigation")
         config_dir = os.path.join(share_dir, "config", "test")
-        nav2_params = os.path.join(config_dir, "nav2_params_test.yaml")
+        nav2_params = os.path.join(config_dir, params_filename)
         test_map_yaml = os.path.join(config_dir, "test_map.yaml")
         if os.path.isfile(nav2_params) and os.path.isfile(test_map_yaml):
             return nav2_params, test_map_yaml
     except Exception:
         pass
     return None, None
+
+
+def _is_openeuler():
+    try:
+        with open("/etc/os-release") as os_release:
+            return any(line.strip().lower() == "id=openeuler" for line in os_release)
+    except OSError:
+        return False
+
+
+def _select_nav2_test_profile():
+    requested = os.environ.get(NAV_TEST_PROFILE_ENV, "").strip().lower()
+    if requested:
+        if requested not in {"full", "minimal"}:
+            pytest.skip(f"Unsupported {NAV_TEST_PROFILE_ENV}={requested!r}; expected 'full' or 'minimal'")
+        if requested == "full" and _is_openeuler():
+            print(
+                "[robot_navigation] Warning: full Nav2 E2E profile enables obstacle/voxel costmap layers "
+                "that are known to be unstable on openEuler. If this test fails during costmap activation, "
+                f"rerun with {NAV_TEST_PROFILE_ENV}=minimal."
+            )
+        return requested
+
+    if _is_openeuler():
+        print(
+            "[robot_navigation] openEuler detected; using minimal Nav2 E2E profile. "
+            f"Set {NAV_TEST_PROFILE_ENV}=full to run obstacle/voxel costmap coverage explicitly."
+        )
+        return "minimal"
+
+    return "full"
 
 
 def _wait_for_nav2(goal_client_node, timeout=NAV2_STARTUP_TIMEOUT):
@@ -134,7 +170,7 @@ def nav2_env():
 
     Order:
     1. Init rclpy + start MockRobotHardware (publishes /odom, /scan, TF)
-    2. Launch Nav2 subprocess
+    2. Launch no-AMCL Nav2 subprocesses
     3. Wait for Nav2 ready
     4. Create goal_client
     """
@@ -154,28 +190,61 @@ def nav2_env():
     spin_thread.start()
     time.sleep(1.0)
 
-    # ── Step 2: Launch Nav2 bringup ──
-    cmd = [
+    # ── Step 2: Launch no-AMCL Nav2 stack ──
+    map_cmd = [
+        "ros2",
+        "run",
+        "nav2_map_server",
+        "map_server",
+        "--ros-args",
+        "-p",
+        "use_sim_time:=False",
+        "-p",
+        f"yaml_filename:={test_map_yaml}",
+    ]
+    lifecycle_cmd = [
+        "ros2",
+        "run",
+        "nav2_lifecycle_manager",
+        "lifecycle_manager",
+        "--ros-args",
+        "-p",
+        "use_sim_time:=False",
+        "-p",
+        "autostart:=True",
+        "-p",
+        "node_names:=['map_server']",
+    ]
+    navigation_cmd = [
         "ros2",
         "launch",
         "nav2_bringup",
-        "bringup_launch.py",
+        "navigation_launch.py",
         "use_composition:=False",
         "use_sim_time:=False",
         "autostart:=True",
+        "use_respawn:=False",
+        "container_name:=nav2_container",
         f"params_file:={nav2_params}",
-        f"map:={test_map_yaml}",
     ]
-    nav2_proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        env=os.environ.copy(),
-        preexec_fn=os.setsid,
-    )
+    nav2_procs = []
+    nav2_log_stack = contextlib.ExitStack()
+    for name, cmd in (("map", map_cmd), ("lifecycle", lifecycle_cmd), ("navigation", navigation_cmd)):
+        log_file = nav2_log_stack.enter_context(Path(f"/tmp/robot_navigation_e2e_{name}.log").open("w"))  # noqa: SIM115
+        nav2_procs.append(
+            subprocess.Popen(
+                cmd,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env=os.environ.copy(),
+                preexec_fn=os.setsid,
+            )
+        )
 
     # ── Step 3: goal_client (shares executor with mock_robot) ──
     goal_client = Nav2GoalClient()
+    goal_client.destroy_subscription(goal_client.voice_sub)
+    goal_client.destroy_subscription(goal_client.nav_stop_sub)
     goal_client.voice_sub = goal_client.create_subscription(
         String, "/e2e/keyword_matched", goal_client.voice_command_callback, 10
     )
@@ -187,15 +256,17 @@ def nav2_env():
     if not nav2_ready:
         executor.shutdown()
         spin_thread.join(timeout=5.0)
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(nav2_proc.pid), signal.SIGKILL)
+        for proc in nav2_procs:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        nav2_log_stack.close()
         mock_robot.destroy_node()
         goal_client.destroy_node()
         mock_eval.destroy()
         rclpy.shutdown()
         pytest.skip("Nav2 stack did not become ready in time")
 
-    # Extra settle for AMCL localization + costmap initialization
+    # Extra settle for map_server, mock map->odom localization, and costmap initialization.
     time.sleep(5.0)
 
     yield {
@@ -210,11 +281,17 @@ def nav2_env():
     spin_thread.join(timeout=5.0)
 
     try:
-        os.killpg(os.getpgid(nav2_proc.pid), signal.SIGINT)
-        nav2_proc.wait(timeout=10)
-    except (subprocess.TimeoutExpired, ProcessLookupError):
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(os.getpgid(nav2_proc.pid), signal.SIGKILL)
+        for proc in reversed(nav2_procs):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+        for proc in reversed(nav2_procs):
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=10)
+    finally:
+        for proc in reversed(nav2_procs):
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        nav2_log_stack.close()
 
     mock_robot.destroy_node()
     goal_client.destroy_node()
@@ -479,13 +556,19 @@ class TestOdometryConsistency:
     """TC2.5: /odom and TF from MockRobotHardware are consistent."""
 
     def test_odometry_and_tf(self, nav2_env, reset_nav2_env):
-        mock_robot = nav2_env["mock_robot"]
         gc = nav2_env["goal_client"]
 
-        # Collect /odom from MockRobotHardware (subscribe on mock_robot itself)
+        # Subscribe from a different node than the publisher to avoid DDS
+        # loopback differences across RMW implementations.
         odom_msgs = []
-        odom_sub = mock_robot.create_subscription(Odometry, "/odom", lambda m: odom_msgs.append(m), 10)
-        time.sleep(1.0)
+        odom_received = threading.Event()
+
+        def _odom_callback(msg):
+            odom_msgs.append(msg)
+            odom_received.set()
+
+        odom_sub = gc.create_subscription(Odometry, "/odom", _odom_callback, 10)
+        odom_received.wait(timeout=5.0)
 
         assert len(odom_msgs) >= 1, "Should receive odom messages from MockRobotHardware"
         odom = odom_msgs[-1]
@@ -517,4 +600,4 @@ class TestOdometryConsistency:
         assert tf.header.frame_id == "odom"
         assert tf.child_frame_id == "base_link"
 
-        mock_robot.destroy_subscription(odom_sub)
+        gc.destroy_subscription(odom_sub)

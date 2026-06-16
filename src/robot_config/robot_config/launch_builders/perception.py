@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import os
 
+from ament_index_python.packages import get_package_share_directory
+from launch.actions import IncludeLaunchDescription
+from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
 from robot_config.launch_builders.camera_isp_overrides import load_isp_override
@@ -144,51 +147,102 @@ def generate_camera_nodes(robot_config, use_sim=False):
             )
 
         elif driver == "realsense":
-            # Use realsense2_camera package
+            # Use rs_launch.py to match the board-validated RealSense startup path.
             w = periph.get("width", 640)
             h = periph.get("height", 480)
             fps = periph.get("fps", 30)
+            driver_camera_name = periph.get("driver_camera_name", f"{name}_camera")
+            driver_topic_prefix = periph.get("driver_topic_prefix", f"/camera/{driver_camera_name}")
+            frame_id = periph.get("frame_id", f"{driver_camera_name}_link")
+            align_depth = periph.get("align_depth", False)
             streams = periph.get("streams") or (
                 ["color"]
-                + (["depth"] if periph.get("align_depth", False) else [])
+                + (["depth"] if periph.get("enable_depth", True) else [])
                 + (["pointcloud"] if periph.get("enable_pointcloud", False) else [])
             )
-            params = {
-                "use_sim_time": is_sim,
-                "camera_name": name,
+            align_depth = align_depth and "depth" in streams
+            launch_args = {
+                "camera_namespace": "camera",
+                "camera_name": driver_camera_name,
+                "base_frame_id": frame_id,
+                "tf_prefix": "",
+                "publish_tf": "true",
+                "enable_depth": str("depth" in streams).lower(),
                 "rgb_camera.color_profile": f"{w}x{h}x{fps}",
-                "color_format": periph.get("pixel_format", "bgr8").upper(),
-                "camera_frame_id": periph.get("frame_id", f"camera_{name}_frame"),
-                "align_depth.enable": "depth" in streams,
-                "pointcloud.enable": "pointcloud" in streams,
-                "pointcloud.stream_filter": 2 if "pointcloud" in streams else 0,
-                "pointcloud.ordered_pc": False,
-                "enable_sync": periph.get("enable_sync", True),
+                "depth_module.depth_profile": f"{w}x{h}x{fps}",
+                "align_depth.enable": str(align_depth).lower(),
+                "pointcloud.enable": str("pointcloud" in streams).lower(),
+                "pointcloud.stream_filter": "2" if "pointcloud" in streams else "0",
+                "pointcloud.ordered_pc": "false",
+                "enable_sync": str(periph.get("enable_sync", True)).lower(),
+                "initial_reset": str(periph.get("initial_reset", True)).lower(),
+                "enable_gyro": "false",
+                "enable_accel": "false",
+                "unite_imu_method": "0",
             }
 
             if "depth_width" in periph:
-                params["depth_width"] = periph["depth_width"]
-                params["depth_height"] = periph["depth_height"]
-            if "depth_fps" in periph:
-                params["depth_fps"] = periph["depth_fps"]
+                depth_w = periph["depth_width"]
+                depth_h = periph["depth_height"]
+                depth_fps = periph.get("depth_fps", fps)
+                launch_args["depth_module.depth_profile"] = f"{depth_w}x{depth_h}x{depth_fps}"
             if "serial_number" in periph:
-                params["serial_no"] = str(periph["serial_number"])
+                launch_args["serial_no"] = str(periph["serial_number"])
 
-            logger.info(f"  RealSense params: {params}")
+            logger.info(f"  RealSense launch args: {launch_args}")
+
+            realsense_launch_dir = get_package_share_directory("realsense2_camera")
 
             nodes.append(
-                Node(
-                    package="realsense2_camera",
-                    executable="realsense2_camera_node",
-                    name=f"{name}_camera",
-                    parameters=[params],
-                    remappings=[
-                        (f"/camera/{name}/color/image_raw", f"/camera/{name}/image_raw"),
-                        (f"/camera/{name}/color/camera_info", f"/camera/{name}/camera_info"),
-                    ],
-                    output="screen",
+                IncludeLaunchDescription(
+                    PythonLaunchDescriptionSource(os.path.join(realsense_launch_dir, "launch", "rs_launch.py")),
+                    launch_arguments=launch_args.items(),
                 )
             )
+
+            # Keep a stable camera contract for downstream consumers while
+            # isolating RealSense driver topic naming differences here.
+            depth_source_topic = (
+                f"{driver_topic_prefix}/aligned_depth_to_color/image_raw"
+                if align_depth
+                else f"{driver_topic_prefix}/depth/image_rect_raw"
+            )
+            relay_topics = [
+                (
+                    f"{driver_topic_prefix}/color/image_raw",
+                    f"/camera/{name}/image_raw",
+                    f"{name}_color_image_relay",
+                    "sensor_msgs/msg/Image",
+                    periph.get("optical_frame_id"),
+                ),
+                (
+                    f"{driver_topic_prefix}/color/camera_info",
+                    f"/camera/{name}/camera_info",
+                    f"{name}_camera_info_relay",
+                    "sensor_msgs/msg/CameraInfo",
+                    periph.get("optical_frame_id"),
+                ),
+                (
+                    depth_source_topic,
+                    f"/camera/{name}/depth/image_rect_raw",
+                    f"{name}_depth_image_relay",
+                    "sensor_msgs/msg/Image",
+                    periph.get("optical_frame_id"),
+                ),
+            ]
+            for source_topic, target_topic, relay_name, message_type, target_frame_id in relay_topics:
+                relay_args = [source_topic, target_topic, message_type]
+                if target_frame_id:
+                    relay_args.append(target_frame_id)
+                nodes.append(
+                    Node(
+                        package="robot_config",
+                        executable="topic_relay",
+                        name=relay_name,
+                        arguments=relay_args,
+                        output="screen",
+                    )
+                )
 
     return nodes
 
@@ -411,11 +465,53 @@ def generate_tf_nodes(robot_config, use_sim=False):
         )
 
         # Optical frame TF (standard rotation for camera sensors)
-        # Skip for RealSense: driver publishes its own optical frame TF internally
+        # For RealSense, keep the driver link bridge and also publish the contract
+        # optical frame when one is declared in YAML so downstream consumers using
+        # the normalized frame_id stay connected even if the driver keeps its own
+        # native optical frame names.
         if periph.get("driver") == "realsense":
-            logger.info(
-                f"  Skipping optical frame TF for RealSense (driver publishes {frame_id} -> {optical_frame_id})"
-            )
+            driver_camera_name = periph.get("driver_camera_name", f"{name}_camera")
+            driver_frame_id = f"{driver_camera_name}_link"
+            if frame_id != driver_frame_id:
+                nodes.append(
+                    Node(
+                        package="tf2_ros",
+                        executable="static_transform_publisher",
+                        name=f"static_tf_{name}_driver_bridge",
+                        arguments=[
+                            "0",
+                            "0",
+                            "0",
+                            "0",
+                            "0",
+                            "0",
+                            frame_id,
+                            driver_frame_id,
+                        ],
+                        output="screen",
+                    )
+                )
+            if optical_frame_id:
+                nodes.append(
+                    Node(
+                        package="tf2_ros",
+                        executable="static_transform_publisher",
+                        name=f"static_tf_{name}_optical",
+                        arguments=[
+                            "0",
+                            "0",
+                            "0",
+                            "-0.5",
+                            "0.5",
+                            "-0.5",
+                            "0.5",
+                            frame_id,
+                            optical_frame_id,
+                        ],
+                        output="screen",
+                    )
+                )
+                logger.info(f"  Added RealSense optical frame compatibility TF: {frame_id} -> {optical_frame_id}")
         elif periph.get("type") == "camera" and optical_frame_id:
             nodes.append(
                 Node(

@@ -1,0 +1,122 @@
+robot:
+  name: lekiwi_mapping
+  type: lekiwi
+  robot_type: lekiwi
+
+  joints:
+    base:
+      - "7"
+      - "8"
+      - "9"
+    all: ["7", "8", "9"]
+
+  default_control_mode: "teleop"
+
+  control_modes:
+    teleop:
+      description: "Base-only teleoperation mode for D455 RTAB-Map mapping"
+      description_cn: "用于 D455 RTAB-Map 建图的仅底盘遥操作模式"
+      controllers:
+        - joint_state_broadcaster
+        - base_velocity_controller
+      inference:
+        enabled: false
+        force_disable: true
+      executor:
+        type: topic
+        mode: teleop
+        queue_size: 100
+        control_frequency: 50.0
+
+  simulation:
+    platform: gazebo
+    scene: null
+
+  ros2_control:
+    hardware_plugin: lekiwi_hardware/LeKiwiSystemHardware
+    port: /dev/ttyACM0
+    velocity_joints: ["7", "8", "9"]
+    base_vel_max_rad: 4.602
+    urdf_path: $(find lekiwi_description)/urdf/lekiwi_assembled.urdf.xacro
+    controllers_config: $(find lekiwi_hardware)/config/lekiwi_base_controllers.yaml
+    xacro_mappings:
+      base_only: true
+
+  peripherals:
+    - type: camera
+      name: realsense
+      driver: realsense
+      driver_camera_name: realsense_camera
+      serial_number: ""
+      width: 848
+      height: 480
+      fps: 30
+      pixel_format: bgr8
+      enable_pointcloud: false
+      align_depth: true
+      enable_sync: true
+      frame_id: camera_link
+      optical_frame_id: camera_color_optical_frame
+      transform:
+        parent_frame: base_link
+        x: 0.0
+        y: 0.0
+        z: 0.3
+        roll: 0.0
+        pitch: 0.0
+        yaw: 0.0
+
+  navigation:
+    enabled: true
+
+    nav2_bringup:
+      enabled: false
+
+    ekf_rtabmap:
+      enabled: true
+      rtabmap:
+        database_path: "$(env HOME)/.ros/ibrobot/maps/rtabmap.db"
+        localization: false
+        visual_odometry: false
+        frame_id: camera_link
+        odom_frame_id: odom
+        odom_topic: /odom
+        rgb_topic: /camera/realsense/image_raw
+        depth_topic: /camera/realsense/depth/image_rect_raw
+        camera_info_topic: /camera/realsense/camera_info
+        approx_sync: true
+        queue_size: 20
+        qos_image: 2
+        qos_camera_info: 2
+        qos_odom: 2
+        rtabmap_args: "--delete_db_on_start --Mem/InitWMWithAllNodes true --Mem/IncrementalMemory true --Mem/PermanentMemory false --Mem/STMSize 8"
+        log_level: info
+      ekf:
+        enabled: false
+        config_file: ""
+
+    cmd_vel_bridge:
+      enabled: true
+      wheel_radius: 0.05
+      base_radius: 0.125
+      max_radps: 4.602
+      odom_frame: odom
+      base_frame: base_link
+      publish_tf: true
+      control_frequency: 50.0
+      cmd_timeout: 0.5
+      cmd_vel_topic: /cmd_vel
+      joint_states_topic: /joint_states
+      odom_topic: /odom
+
+    robot_navigation:
+      enabled: false
+
+    funasr:
+      host: "127.0.0.1"
+      port: "10095"
+      mode: "2pass"
+      hotword_msg: ""
+
+    rviz:
+      enabled: false

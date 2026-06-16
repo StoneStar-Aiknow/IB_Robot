@@ -11,6 +11,7 @@
   <xacro:arg name="use_sim" default="false"/>
   <xacro:arg name="port" default="/dev/ttyACM0"/>
   <xacro:arg name="calib_file" default=""/>
+  <xacro:arg name="base_only" default="false"/>
   <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
   <xacro:arg name="mujoco_model" default=""/>
 
@@ -18,8 +19,10 @@
   <xacro:include filename="$(find lekiwi_description)/urdf/base.common.xacro"/>
   <xacro:include filename="$(find lekiwi_description)/urdf/base.control.xacro"/>
 
-  <!-- SO101 arm (joints "1"-"6", links: world->base->shoulder->...->jaw) -->
-  <xacro:include filename="$(find robot_description)/urdf/lerobot/so101/so101_base.xacro"/>
+  <xacro:unless value="$(arg base_only)">
+    <!-- SO101 arm (joints "1"-"6", links: world->base->shoulder->...->jaw) -->
+    <xacro:include filename="$(find robot_description)/urdf/lerobot/so101/so101_base.xacro"/>
+  </xacro:unless>
 
   <!-- ============================================ -->
   <!-- Materials                                    -->
@@ -150,14 +153,16 @@
     <limit effort="${max_torque_nm}" velocity="${max_velocity_rads}"/>
   </joint>
 
-  <!-- ============================================ -->
-  <!-- Arm Mounting: base_link -> world (arm base)  -->
-  <!-- ============================================ -->
-  <joint name="base_to_arm" type="fixed">
-    <parent link="base_link"/>
-    <child link="world"/>
-    <origin xyz="0.06 -0.02 0.02" rpy="0 0 1.5708"/>
-  </joint>
+  <xacro:unless value="$(arg base_only)">
+    <!-- ============================================ -->
+    <!-- Arm Mounting: base_link -> world (arm base)  -->
+    <!-- ============================================ -->
+    <joint name="base_to_arm" type="fixed">
+      <parent link="base_link"/>
+      <child link="world"/>
+      <origin xyz="0.06 -0.02 0.02" rpy="0 0 1.5708"/>
+    </joint>
+  </xacro:unless>
 
   <!-- ============================================ -->
   <!-- ros2_control                                 -->
@@ -180,66 +185,68 @@
       </hardware>
     </xacro:unless>
 
-    <!-- ===== Arm joints 1-6: position control ===== -->
-    <joint name="1">
-      <command_interface name="position">
-        <param name="min">-3.14159</param>
-        <param name="max">3.14159</param>
-      </command_interface>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <param name="id">1</param>
-    </joint>
+    <xacro:unless value="$(arg base_only)">
+      <!-- ===== Arm joints 1-6: position control ===== -->
+      <joint name="1">
+        <command_interface name="position">
+          <param name="min">-3.14159</param>
+          <param name="max">3.14159</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+        <param name="id">1</param>
+      </joint>
 
-    <joint name="2">
-      <command_interface name="position">
-        <param name="min">-3.14159</param>
-        <param name="max">3.14159</param>
-      </command_interface>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <param name="id">2</param>
-    </joint>
+      <joint name="2">
+        <command_interface name="position">
+          <param name="min">-3.14159</param>
+          <param name="max">3.14159</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+        <param name="id">2</param>
+      </joint>
 
-    <joint name="3">
-      <command_interface name="position">
-        <param name="min">-3.14159</param>
-        <param name="max">3.14159</param>
-      </command_interface>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <param name="id">3</param>
-    </joint>
+      <joint name="3">
+        <command_interface name="position">
+          <param name="min">-3.14159</param>
+          <param name="max">3.14159</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+        <param name="id">3</param>
+      </joint>
 
-    <joint name="4">
-      <command_interface name="position">
-        <param name="min">-3.14159</param>
-        <param name="max">3.14159</param>
-      </command_interface>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <param name="id">4</param>
-    </joint>
+      <joint name="4">
+        <command_interface name="position">
+          <param name="min">-3.14159</param>
+          <param name="max">3.14159</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+        <param name="id">4</param>
+      </joint>
 
-    <joint name="5">
-      <command_interface name="position">
-        <param name="min">-3.14159</param>
-        <param name="max">3.14159</param>
-      </command_interface>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <param name="id">5</param>
-    </joint>
+      <joint name="5">
+        <command_interface name="position">
+          <param name="min">-3.14159</param>
+          <param name="max">3.14159</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+        <param name="id">5</param>
+      </joint>
 
-    <joint name="6">
-      <command_interface name="position">
-        <param name="min">0.0</param>
-        <param name="max">1.0</param>
-      </command_interface>
-      <state_interface name="position"/>
-      <state_interface name="velocity"/>
-      <param name="id">6</param>
-    </joint>
+      <joint name="6">
+        <command_interface name="position">
+          <param name="min">0.0</param>
+          <param name="max">1.0</param>
+        </command_interface>
+        <state_interface name="position"/>
+        <state_interface name="velocity"/>
+        <param name="id">6</param>
+      </joint>
+    </xacro:unless>
 
     <!-- ===== Base joints 7-9: velocity control ===== -->
     <joint name="7">

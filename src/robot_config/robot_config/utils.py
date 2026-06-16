@@ -9,14 +9,14 @@ This module contains common utility functions used across the robot_config packa
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
-import sys
-import yaml
-import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
+
+import yaml
 from ament_index_python.packages import get_package_share_directory
 
 logger = logging.getLogger(__name__)
@@ -46,7 +46,7 @@ def resolve_ros_path(path):
         return path
 
     # Resolve $(find package)
-    find_pattern = re.compile(r'\$\(find\s+(\w+)\)')
+    find_pattern = re.compile(r"\$\(find\s+(\w+)\)")
     for match in find_pattern.finditer(path):
         pkg_name = match.group(1)
         try:
@@ -56,7 +56,7 @@ def resolve_ros_path(path):
             logger.warning(f"Could not find package '{pkg_name}': {e}")
 
     # Resolve $(env VAR)
-    env_pattern = re.compile(r'\$\(env\s+(\w+)\)')
+    env_pattern = re.compile(r"\$\(env\s+(\w+)\)")
     for match in env_pattern.finditer(path):
         var_name = match.group(1)
         var_value = os.environ.get(var_name, "")
@@ -65,6 +65,27 @@ def resolve_ros_path(path):
             logger.info(f"WARNING: Environment variable '{var_name}' is not set or empty")
 
     return path
+
+
+def prepare_writable_file_path(path):
+    """Resolve a file path and ensure its parent directory exists.
+
+    This is intended for output paths that will be created by downstream tools,
+    such as RTAB-Map databases or exported artifacts.
+
+    Args:
+        path: File path that may contain ROS-style substitutions.
+
+    Returns:
+        Resolved path string. Returns original path if it's None or empty.
+    """
+    resolved_path = resolve_ros_path(path)
+    if not resolved_path:
+        return resolved_path
+
+    parent_dir = Path(resolved_path).expanduser().parent
+    parent_dir.mkdir(parents=True, exist_ok=True)
+    return resolved_path
 
 
 def parse_bool(value, default=False):
@@ -105,11 +126,11 @@ def parse_bool(value, default=False):
     str_value = str(value).strip().lower()
 
     # Check for true-like values
-    if str_value in ('true', '1', 'yes', 'on'):
+    if str_value in ("true", "1", "yes", "on"):
         return True
 
     # Check for false-like values
-    if str_value in ('false', '0', 'no', 'off', ''):
+    if str_value in ("false", "0", "no", "off", ""):
         return False
 
     # Unknown value, return default
@@ -140,11 +161,14 @@ def validate_joint_config(robot_config):
 
     expected_arm_joints = set(joints_config.get("arm", []))
     expected_gripper_joints = set(joints_config.get("gripper", []))
+    expected_base_joints = set(joints_config.get("base", []))
     expected_all_joints = set(joints_config.get("all", []))
+    expected_broadcaster_joints = expected_all_joints | expected_base_joints
 
-    logger.info(f"Canonical joints from robot_config:")
+    logger.info("Canonical joints from robot_config:")
     logger.info(f"  arm: {sorted(expected_arm_joints)}")
     logger.info(f"  gripper: {sorted(expected_gripper_joints)}")
+    logger.info(f"  base: {sorted(expected_base_joints)}")
     logger.info(f"  all: {sorted(expected_all_joints)}")
 
     # Load controllers configuration
@@ -163,7 +187,7 @@ def validate_joint_config(robot_config):
 
     # Load controllers YAML
     try:
-        with open(controllers_config_path, 'r') as f:
+        with open(controllers_config_path) as f:
             controllers_yaml = yaml.safe_load(f)
     except Exception as e:
         logger.error(f"Failed to load controllers config: {e}")
@@ -180,7 +204,7 @@ def validate_joint_config(robot_config):
             logger.error("[robot_config] ERROR: arm_position_controller joints mismatch!")
             validation_passed = False
         else:
-            logger.info(f"✓ arm_position_controller joints match")
+            logger.info("✓ arm_position_controller joints match")
         controllers_checked += 1
 
     # Check gripper_position_controller
@@ -191,18 +215,18 @@ def validate_joint_config(robot_config):
             logger.error("[robot_config] ERROR: gripper_position_controller joints mismatch!")
             validation_passed = False
         else:
-            logger.info(f"✓ gripper_position_controller joints match")
+            logger.info("✓ gripper_position_controller joints match")
         controllers_checked += 1
 
     # Check joint_state_broadcaster
     jsb_ctrl = controllers_yaml.get("joint_state_broadcaster", {}).get("ros__parameters", {})
     if jsb_ctrl:
         ctrl_joints = set(jsb_ctrl.get("joints", []))
-        if ctrl_joints != expected_all_joints:
+        if ctrl_joints != expected_broadcaster_joints:
             logger.error("[robot_config] ERROR: joint_state_broadcaster joints mismatch!")
             validation_passed = False
         else:
-            logger.info(f"✓ joint_state_broadcaster joints match")
+            logger.info("✓ joint_state_broadcaster joints match")
         controllers_checked += 1
 
     logger.info(f"Validated {controllers_checked} controller configurations")
@@ -235,19 +259,19 @@ def prepare_lerobot_env():
 # ---------------------------------------------------------------------------
 
 # Each entry: (rad_min, rad_max, pct_span, pct_offset)
-JointConversionEntry = Tuple[float, float, float, float]
-CalibrationSnapshot = Dict[str, Dict[str, Any]]
+JointConversionEntry = tuple[float, float, float, float]
+CalibrationSnapshot = dict[str, dict[str, Any]]
 
 _TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
 
 
 # Supported LeRobot motor normalization modes.
 # Keep in sync with the YAML ``lerobot_norm_mode`` option.
-NORM_MODE_RANGE = "range_m100_100"   # arm [-100,+100], gripper [0,100]
-NORM_MODE_DEGREES = "degrees"         # arm centred degrees, gripper [0,100]
-NORM_MODE_NONE = "none"               # pass-through (no conversion)
+NORM_MODE_RANGE = "range_m100_100"  # arm [-100,+100], gripper [0,100]
+NORM_MODE_DEGREES = "degrees"  # arm centred degrees, gripper [0,100]
+NORM_MODE_NONE = "none"  # pass-through (no conversion)
 
-_MODEL_RESOLUTION = 4096              # Feetech STS3215 12-bit encoder
+_MODEL_RESOLUTION = 4096  # Feetech STS3215 12-bit encoder
 _CALIBRATION_SNAPSHOT_FIELDS = (
     "id",
     "model",
@@ -269,7 +293,7 @@ def normalize_lerobot_norm_mode(norm_mode: str) -> str:
     return mode
 
 
-def resolve_joint_names_from_config(robot_config: Dict[str, Any]) -> List[str]:
+def resolve_joint_names_from_config(robot_config: dict[str, Any]) -> list[str]:
     """Resolve ordered joint names from raw robot_config YAML content."""
     ros2_control = robot_config.get("ros2_control", {}) or {}
     joints_cfg = robot_config.get("joints", {}) or {}
@@ -277,7 +301,7 @@ def resolve_joint_names_from_config(robot_config: Dict[str, Any]) -> List[str]:
     return [str(name) for name in joint_names]
 
 
-def resolve_gripper_joints_from_config(robot_config: Dict[str, Any]) -> List[str]:
+def resolve_gripper_joints_from_config(robot_config: dict[str, Any]) -> list[str]:
     """Resolve gripper joint names from raw robot_config YAML content."""
     ros2_control = robot_config.get("ros2_control", {}) or {}
     joints_cfg = robot_config.get("joints", {}) or {}
@@ -285,7 +309,7 @@ def resolve_gripper_joints_from_config(robot_config: Dict[str, Any]) -> List[str
     return [str(name) for name in gripper_joints]
 
 
-def resolve_calibration_path_from_config(robot_config: Dict[str, Any]) -> str:
+def resolve_calibration_path_from_config(robot_config: dict[str, Any]) -> str:
     """Resolve the ros2_control calibration file path from raw robot_config."""
     ros2_control = robot_config.get("ros2_control", {}) or {}
     calib_file = str(ros2_control.get("calib_file", "") or "")
@@ -293,8 +317,8 @@ def resolve_calibration_path_from_config(robot_config: Dict[str, Any]) -> str:
 
 
 def resolve_lerobot_norm_mode(
-    robot_config: Dict[str, Any],
-    preferred_control_mode: Optional[str] = None,
+    robot_config: dict[str, Any],
+    preferred_control_mode: str | None = None,
 ) -> str:
     """Resolve the LeRobot normalization mode from robot_config semantics."""
     recording_cfg = robot_config.get("recording", {}) or {}
@@ -304,7 +328,7 @@ def resolve_lerobot_norm_mode(
 
     control_modes = robot_config.get("control_modes", {}) or {}
     models = robot_config.get("models", {}) or {}
-    mode_candidates: List[str] = []
+    mode_candidates: list[str] = []
     for mode_name in (
         preferred_control_mode,
         robot_config.get("default_control_mode"),
@@ -328,7 +352,7 @@ def resolve_lerobot_norm_mode(
     return NORM_MODE_RANGE
 
 
-def load_calibration_data(calib_file: str) -> Dict[str, Any]:
+def load_calibration_data(calib_file: str) -> dict[str, Any]:
     """Load a calibration JSON file from disk."""
     resolved_path = resolve_ros_path(calib_file)
     if not resolved_path:
@@ -346,8 +370,8 @@ def load_calibration_data(calib_file: str) -> Dict[str, Any]:
 
 
 def extract_calibration_snapshot(
-    calibration: Dict[str, Any],
-    joint_names: List[str],
+    calibration: dict[str, Any],
+    joint_names: list[str],
 ) -> CalibrationSnapshot:
     """Extract a canonical calibration snapshot for the selected joints."""
     snapshot: CalibrationSnapshot = {}
@@ -359,7 +383,7 @@ def extract_calibration_snapshot(
         if not isinstance(entry, dict):
             raise ValueError(f"Calibration entry for joint '{joint_name}' must be an object")
 
-        joint_snapshot: Dict[str, Any] = {}
+        joint_snapshot: dict[str, Any] = {}
         for field in _CALIBRATION_SNAPSHOT_FIELDS:
             if field not in entry:
                 continue
@@ -369,9 +393,7 @@ def extract_calibration_snapshot(
                 joint_snapshot[field] = int(entry[field])
 
         if "range_min" not in joint_snapshot or "range_max" not in joint_snapshot:
-            raise KeyError(
-                f"Calibration entry for joint '{joint_name}' must contain range_min/range_max"
-            )
+            raise KeyError(f"Calibration entry for joint '{joint_name}' must contain range_min/range_max")
         joint_snapshot.setdefault("drive_mode", 0)
         snapshot[joint_name] = joint_snapshot
 
@@ -380,8 +402,8 @@ def extract_calibration_snapshot(
 
 def lerobot_conversion_fingerprint(
     calibration: CalibrationSnapshot,
-    joint_names: List[str],
-    gripper_joints: Optional[List[str]] = None,
+    joint_names: list[str],
+    gripper_joints: list[str] | None = None,
     norm_mode: str = NORM_MODE_RANGE,
 ) -> str:
     """Compute a stable fingerprint for LeRobot conversion semantics."""
@@ -389,7 +411,7 @@ def lerobot_conversion_fingerprint(
     ordered_joints = [str(name) for name in joint_names]
     ordered_gripper_joints = [str(name) for name in (gripper_joints or [])]
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "norm_mode": mode,
         "joint_names": ordered_joints,
         "gripper_joints": ordered_gripper_joints,
@@ -398,12 +420,10 @@ def lerobot_conversion_fingerprint(
 
     for joint_name in ordered_joints:
         entry = calibration.get(joint_name, {})
-        joint_payload: Dict[str, int] = {}
+        joint_payload: dict[str, int] = {}
         if mode != NORM_MODE_NONE:
             if "range_min" not in entry or "range_max" not in entry:
-                raise KeyError(
-                    f"Calibration snapshot for joint '{joint_name}' must contain range_min/range_max"
-                )
+                raise KeyError(f"Calibration snapshot for joint '{joint_name}' must contain range_min/range_max")
             joint_payload["range_min"] = int(entry["range_min"])
             joint_payload["range_max"] = int(entry["range_max"])
             joint_payload["drive_mode"] = int(entry.get("drive_mode", 0))
@@ -415,16 +435,16 @@ def lerobot_conversion_fingerprint(
 
 def build_lerobot_conversion_metadata(
     calib_file: str,
-    joint_names: List[str],
-    gripper_joints: Optional[List[str]] = None,
+    joint_names: list[str],
+    gripper_joints: list[str] | None = None,
     norm_mode: str = NORM_MODE_RANGE,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build a dataset-storable snapshot of LeRobot conversion semantics."""
     mode = normalize_lerobot_norm_mode(norm_mode)
     ordered_joints = [str(name) for name in joint_names]
     ordered_gripper_joints = [str(name) for name in (gripper_joints or [])]
 
-    metadata: Dict[str, Any] = {
+    metadata: dict[str, Any] = {
         "norm_mode": mode,
         "joint_names": ordered_joints,
         "gripper_joints": ordered_gripper_joints,
@@ -454,11 +474,11 @@ def build_lerobot_conversion_metadata(
 
 
 def build_joint_conversion_table_from_calibration(
-    calibration: Dict[str, Any],
-    joint_names: List[str],
-    gripper_joints: Optional[List[str]] = None,
+    calibration: dict[str, Any],
+    joint_names: list[str],
+    gripper_joints: list[str] | None = None,
     norm_mode: str = NORM_MODE_RANGE,
-) -> List[JointConversionEntry]:
+) -> list[JointConversionEntry]:
     """Build a conversion table from calibration content already in memory."""
     mode = normalize_lerobot_norm_mode(norm_mode)
     if mode == NORM_MODE_NONE:
@@ -466,7 +486,7 @@ def build_joint_conversion_table_from_calibration(
 
     ordered_joints = [str(name) for name in joint_names]
     gripper_joint_set = {str(name) for name in (gripper_joints or [])}
-    table: List[JointConversionEntry] = []
+    table: list[JointConversionEntry] = []
 
     for joint_name in ordered_joints:
         if joint_name not in calibration:
@@ -507,10 +527,10 @@ def build_joint_conversion_table_from_calibration(
 
 def build_joint_conversion_table(
     calib_file: str,
-    joint_names: List[str],
-    gripper_joints: Optional[List[str]] = None,
+    joint_names: list[str],
+    gripper_joints: list[str] | None = None,
     norm_mode: str = NORM_MODE_RANGE,
-) -> List[JointConversionEntry]:
+) -> list[JointConversionEntry]:
     """Build per-joint ``(rad_min, rad_max, lerobot_span, lerobot_offset)``.
 
     The C++ hardware layer converts  ticks ↔ radians  using a fixed formula::

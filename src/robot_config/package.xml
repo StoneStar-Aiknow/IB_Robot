@@ -20,6 +20,8 @@
   <exec_depend>usb_cam</exec_depend>
   <exec_depend>camera_ros</exec_depend>
   <exec_depend>realsense2_camera</exec_depend>
+  <exec_depend>rtabmap_launch</exec_depend>
+  <exec_depend>depthimage_to_laserscan</exec_depend>
   <exec_depend>ldlidar_ros2</exec_depend>
   <exec_depend>joy</exec_depend>
   <exec_depend>joy_teleop</exec_depend>
@@ -43,6 +45,10 @@
 
   <!-- TF -->
   <exec_depend>tf2_ros</exec_depend>
+
+  <!-- Navigation bringup -->
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>robot_navigation</exec_depend>
 
   <!-- Tracing -->
   <exec_depend>tracetools</exec_depend>

@@ -43,6 +43,7 @@ POSITION_TOLERANCE = 0.25  # 25cm tolerance for Gazebo physics simulation
 GAZEBO_STARTUP_TIMEOUT = 120  # seconds — Gazebo + spawn + controllers + Nav2
 NAV2_SETTLE_TIME = 10  # seconds — let Nav2 stack settle after startup
 NAV_GOAL_TIMEOUT = 90  # seconds — per-goal navigation timeout (Gazebo physics is slow)
+NAV_TEST_PROFILE_ENV = "NAV_TEST_PROFILE"
 
 SPAWN_X = -1.5
 SPAWN_Y = -1.5
@@ -65,6 +66,37 @@ def _check_gazebo_available():
         except (FileNotFoundError, subprocess.TimeoutExpired):
             continue
     return False
+
+
+def _is_openeuler():
+    try:
+        with open("/etc/os-release") as os_release:
+            return any(line.strip().lower() == "id=openeuler" for line in os_release)
+    except OSError:
+        return False
+
+
+def _select_nav2_test_profile():
+    requested = os.environ.get(NAV_TEST_PROFILE_ENV, "").strip().lower()
+    if requested:
+        if requested not in {"full", "minimal"}:
+            pytest.skip(f"Unsupported {NAV_TEST_PROFILE_ENV}={requested!r}; expected 'full' or 'minimal'")
+        if requested == "full" and _is_openeuler():
+            print(
+                "[robot_navigation] Warning: full test profile enables Gazebo Layer 3 simulation, "
+                "which is not part of the openEuler minimal E2E profile. If Gazebo fails on openEuler, "
+                f"rerun with {NAV_TEST_PROFILE_ENV}=minimal."
+            )
+        return requested
+
+    if _is_openeuler():
+        print(
+            "[robot_navigation] openEuler detected; skipping Gazebo Layer 3 simulation in minimal profile. "
+            f"Set {NAV_TEST_PROFILE_ENV}=full to run Gazebo explicitly."
+        )
+        return "minimal"
+
+    return "full"
 
 
 def _wait_for_nav2(goal_client_node, timeout=GAZEBO_STARTUP_TIMEOUT):
@@ -153,6 +185,12 @@ def _collect_cmd_vel(node, topic="/cmd_vel", duration=3.0):
 @pytest.fixture(scope="module")
 def gazebo_env():
     """Layer 3 environment: Gazebo + Nav2 + in-process goal_client."""
+    if _select_nav2_test_profile() == "minimal":
+        pytest.skip(
+            "Gazebo Layer 3 simulation is disabled by the minimal E2E profile; "
+            f"set {NAV_TEST_PROFILE_ENV}=full to run it."
+        )
+
     if not _check_gazebo_available():
         pytest.skip("Gazebo not available — skipping Layer 3 tests")
 

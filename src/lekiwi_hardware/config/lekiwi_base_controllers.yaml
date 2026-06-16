@@ -1,0 +1,28 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 100
+
+    base_velocity_controller:
+      type: velocity_controllers/JointGroupVelocityController
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+joint_state_broadcaster:
+  ros__parameters:
+    joints:
+      - "7"
+      - "8"
+      - "9"
+    publish_rate: 100.0
+
+base_velocity_controller:
+  ros__parameters:
+    joints:
+      - "7"
+      - "8"
+      - "9"
+    command_interfaces:
+      - velocity
+    state_interfaces:
+      - velocity

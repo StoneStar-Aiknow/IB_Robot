@@ -11,6 +11,7 @@ from launch.actions import IncludeLaunchDescription
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 
 from robot_config.logger_utils import get_colored_logger
+from robot_config.utils import resolve_ros_path
 
 logger = get_colored_logger("robot_config.nav2")
 
@@ -35,22 +36,25 @@ def generate_nav2_nodes(
         return nodes
 
     try:
-        nav2_bringup_dir = get_package_share_directory("nav2_bringup")
-        nav2_launch_file = os.path.join(nav2_bringup_dir, "launch", "bringup_launch.py")
+        robot_navigation_share = get_package_share_directory("robot_navigation")
+        nav2_launch_file = os.path.join(robot_navigation_share, "launch", "nav2_bringup.launch.py")
 
         # Resolve map file
         map_file = nav2_config.get("map_file", "")
         if not map_file:
-            map_file = "~/workspace/map/rtabmap.yaml"
+            map_file = os.path.expanduser("~/.ros/ibrobot/maps/rtabmap.yaml")
+        else:
+            map_file = resolve_ros_path(map_file)
 
         # Resolve params file
         params_file = nav2_config.get("params_file", "")
         if not params_file:
             try:
-                robot_navigation_share = get_package_share_directory("robot_navigation")
                 params_file = os.path.join(robot_navigation_share, "config", "nav2_params.yaml")
             except Exception:
                 params_file = ""
+        else:
+            params_file = resolve_ros_path(params_file)
 
         launch_args = {
             "use_sim_time": str(use_sim).lower(),

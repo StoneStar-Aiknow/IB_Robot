@@ -14,6 +14,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch_ros.actions import Node
 
 from robot_config.logger_utils import get_colored_logger
+from robot_config.utils import prepare_writable_file_path, resolve_ros_path
 
 logger = get_colored_logger("robot_config.localization")
 
@@ -46,6 +47,7 @@ def generate_localization_nodes(
         rtabmap_args = {
             "use_sim_time": "false",
             "localization": str(rtabmap_config.get("localization", True)).lower(),
+            "rtabmap_viz": "false",
         }
         for key in [
             "rgb_topic",
@@ -54,13 +56,21 @@ def generate_localization_nodes(
             "database_path",
             "frame_id",
             "odom_frame_id",
+            "odom_topic",
+            "visual_odometry",
+            "odom_args",
             "rtabmap_args",
             "approx_sync",
             "queue_size",
+            "qos_image",
+            "qos_camera_info",
+            "qos_odom",
             "log_level",
         ]:
             val = rtabmap_config.get(key)
             if val is not None:
+                if key == "database_path":
+                    val = prepare_writable_file_path(val)
                 rtabmap_args[key] = str(val)
 
         nodes.append(
@@ -71,9 +81,47 @@ def generate_localization_nodes(
         )
         logger.info(f"Added RTAB-Map launch (localization: {rtabmap_args.get('localization')})")
 
+        # Depth-to-laserscan
+        dtl_config = ekf_rtabmap_config.get("depth_to_laserscan", {})
+        if dtl_config.get("enabled", False):
+            dtl_params = {
+                "scan_height": dtl_config.get("scan_height", 10),
+                "scan_time": dtl_config.get("scan_time", 0.033),
+                "range_min": dtl_config.get("range_min", 0.0),
+                "range_max": dtl_config.get("range_max", 10.0),
+                "output_frame": dtl_config.get("output_frame", "camera_link"),
+            }
+            depth_topic = dtl_config.get("depth_topic", "/camera/realsense/depth/image_rect_raw")
+            depth_camera_info_topic = dtl_config.get(
+                "depth_camera_info_topic",
+                "/camera/realsense/camera_info",
+            )
+            nodes.append(
+                Node(
+                    package="depthimage_to_laserscan",
+                    executable="depthimage_to_laserscan_node",
+                    name="depth_to_laserscan",
+                    output="screen",
+                    parameters=[dtl_params],
+                    remappings=[
+                        ("depth", depth_topic),
+                        ("depth_camera_info", depth_camera_info_topic),
+                        ("scan", "/scan"),
+                    ],
+                )
+            )
+            logger.info("Added depthimage_to_laserscan node")
+
         # EKF node
         ekf_node_config = ekf_rtabmap_config.get("ekf", {})
+        if not ekf_node_config.get("enabled", True):
+            logger.info("EKF disabled by config")
+            logger.info("RTAB-Map stack enabled")
+            return nodes
+
         ekf_config_file = ekf_node_config.get("config_file", "")
+        if ekf_config_file:
+            ekf_config_file = resolve_ros_path(ekf_config_file)
         if not ekf_config_file:
             try:
                 robot_navigation_share = get_package_share_directory("robot_navigation")
@@ -96,6 +144,7 @@ def generate_localization_nodes(
         logger.info("EKF + RTAB-Map stack enabled")
 
     except Exception as e:
-        logger.warning(f"Could not add EKF+RTAB-Map nodes: {e}")
+        logger.error(f"Failed to add required EKF+RTAB-Map nodes: {e}")
+        raise
 
     return nodes

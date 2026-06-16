@@ -21,6 +21,7 @@ ros2_control 和外设的统一机器人配置系统。
 - **TF 发布**：自动发布相机坐标系变换
 - **标定支持**：标准 ROS2 camera_info_manager 集成
 - **tensormsg 集成**：契约通过名称引用外设
+- **RealSense contract relay**：在 `robot_config` 内部将驱动原生 topic 收口到统一 `/camera/{name}/...` 接口
 
 ## 架构
 
@@ -33,6 +34,7 @@ robot_config YAML（单一数据源）
         ├───► 相机驱动（现有 ROS2 包）
         │       ├───► usb_cam（USB 相机）
         │       └───► realsense2_camera（RealSense D400）
+        │               └───► topic_relay（统一 contract topic）
         │
         └───► tensormsg 契约（ML I/O）
                 └───► PolicyBridge / EpisodeRecorder
