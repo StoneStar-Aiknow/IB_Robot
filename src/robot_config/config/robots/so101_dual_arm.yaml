@@ -49,16 +49,29 @@ robot:
       inference:
         enabled: true
         model: so101_act
+        # Local/edge host: distributed mode publishes preprocessed batches to
+        # cloud_inference_topic and subscribes to cloud_result_topic.
+        # Board/cloud host: cloud_inference.launch.py must use matching topics
+        # (defaults are /preprocessed/batch and /inference/action, or pass the
+        # equivalent launch parameters if overriding them on the board).
+        execution_mode: distributed
+        cloud_inference_topic: /preprocessed/batch
+        cloud_result_topic: /inference/action
+        # Local/edge host timeout while waiting for board inference results; keep
+        # this above the board model latency plus network jitter.
+        request_timeout: 10.0
       executor:
         type: topic
         mode: model_inference
+        control_frequency: 30.0
+        watermark_threshold: 40
+        min_queue_size: 0
 
   # Single ros2_control entry for Multi-Hardware
   ros2_control:
     hardware_plugin: so101_hardware/SO101SystemHardware
     urdf_path: $(find robot_description)/urdf/lerobot/so101/so101_dual.urdf.xacro
     controllers_config: $(find so101_hardware)/config/so101_dual_controllers.yaml
-
     # Generic mapping: inject these directly into URDF xacro args
     xacro_args:
       port_1: /dev/ttyACM0
@@ -210,7 +223,7 @@ robot:
           reliability: best_effort
           history: keep_last
           depth: 10
-      - key: observation.images.left_wrist
+      - key: observation.images.left
         topic: /camera/left_wrist/image_raw
         type: sensor_msgs/msg/Image
         peripheral: left_wrist
@@ -224,7 +237,7 @@ robot:
           reliability: best_effort
           history: keep_last
           depth: 10
-      - key: observation.images.right_wrist
+      - key: observation.images.right
         topic: /camera/right_wrist/image_raw
         type: sensor_msgs/msg/Image
         peripheral: right_wrist
@@ -336,6 +349,17 @@ robot:
             mode: nearest
             tolerance_ms: 500
         safety_behavior: hold
+
+  models:
+    so101_act:
+      # Local/edge host: keep this as a repo-relative LeRobot policy path so
+      # robot.launch.py can read model metadata while distributed inference runs.
+      # Board/cloud host: pass the board model directory to cloud inference, e.g.
+      # ros2 launch inference_service cloud_inference.launch.py policy_path:=<board-model-dir> device:=ascend_om
+      path: ./models/dual_arm/pretrained_model
+      policy_type: act
+      device: cpu
+      lerobot_norm_mode: range_m100_100
 
   recording:
     bag_base_dir: "~/rosbag/episodes"
