@@ -140,6 +140,12 @@ class PI05OMModel:
         # 创建 datasets 和 buffers
         self._setup_datasets()
 
+        # 预分配可复用的 AE 输出 D2H host buffer: 避免在 10 步降噪循环里每步反复
+        # malloc_host / free_host (pinned host 内存分配/释放有开销). AE 输出尺寸固定.
+        self._ae_d2h_host_size = self.ae_output_data[0]["size"]
+        self._ae_d2h_host_buffer, ret = acl.rt.malloc_host(self._ae_d2h_host_size)
+        self._check_ret(ret, "Failed to pre-allocate reusable AE D2H host buffer")
+
         # 验证 buffer 大小匹配
         self._validate_buffer_sizes()
 
@@ -508,22 +514,17 @@ class PI05OMModel:
 
             # D2H: x_t (AE 的 sample_actions 内部已执行 Euler step,
             #       输出直接是更新后的 x_t, 不是 v_t)
-            buffer_host, ret = acl.rt.malloc_host(self.ae_output_data[0]["size"])
-            self._check_ret(ret, "Failed to malloc host buffer for AE D2H")
             ret = acl.rt.memcpy(
-                buffer_host,
-                self.ae_output_data[0]["size"],
+                self._ae_d2h_host_buffer,
+                self._ae_d2h_host_size,
                 self.ae_output_data[0]["buffer"],
                 self.ae_output_data[0]["size"],
                 ACL_MEMCPY_DEVICE_TO_HOST,
             )
             self._check_ret(ret, "Failed to D2H AE output")
 
-            bytes_out = acl.util.ptr_to_bytes(buffer_host, self.ae_output_data[0]["size"])
-            x_t = np.frombuffer(bytes_out, dtype=fdtype).reshape(*noise_shape)
-
-            ret = acl.rt.free_host(buffer_host)
-            self._check_ret(ret, "Failed to free host buffer")
+            bytes_out = acl.util.ptr_to_bytes(self._ae_d2h_host_buffer, self._ae_d2h_host_size)
+            x_t = np.frombuffer(bytes_out, dtype=fdtype).reshape(*noise_shape).copy()
 
             if _DEBUG:
                 logger(f"  [denoise step={step_idx:02d}] x_t_out: {_tensor_stats(x_t)}")
@@ -700,6 +701,12 @@ class PI05OMModel:
                     acl.destroy_data_buffer(item["data"])
                     acl.rt.free(item["buffer"])
             acl.mdl.destroy_dataset(self.ae_output_dataset)
+
+            # 预分配的可复用 AE D2H host buffer
+            host_buf = getattr(self, "_ae_d2h_host_buffer", None)
+            if host_buf is not None:
+                acl.rt.free_host(host_buf)
+                self._ae_d2h_host_buffer = None
 
             # 卸载模型
             acl.mdl.destroy_desc(self.vlm_model_desc)
