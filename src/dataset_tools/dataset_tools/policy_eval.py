@@ -27,7 +27,7 @@ from dataset_tools.policy_eval_compare import (
 )
 from robot_config.contract_utils import SpecView, contract_fingerprint, iter_specs, stamp_from_header_ns
 from robot_config.loader import build_contract_from_robot_config_dict, load_robot_config_dict
-from robot_config.utils import resolve_calibration_path_from_config
+from robot_config.utils import resolve_calibration_paths_from_config
 
 NS_PER_SEC = 1_000_000_000
 HISTORICAL_TIMESTAMP_POLICIES = {"contract", "header", "bag", "receive"}
@@ -283,7 +283,7 @@ def build_replay_frames(
                 )
             )
 
-        label_parts: list[np.ndarray] = []
+        label_parts: list[Any] = []
         for key, record in (action_streams or {}).items():
             idx = action_indices[key][frame_index]
             if idx is not None and record.decoded_values:
@@ -303,15 +303,18 @@ def build_replay_frames(
 
 def inspect_calibration(robot_config: dict[str, Any]) -> CalibrationStatus:
     try:
-        path = resolve_calibration_path_from_config(robot_config)
+        paths = resolve_calibration_paths_from_config(robot_config)
     except Exception as exc:
         return CalibrationStatus(status="unknown", message=f"failed to resolve calibration path: {exc}")
-    if not path:
-        return CalibrationStatus(status="pass_through_risk", message="robot_config has no ros2_control.calib_file")
-    resolved = str(Path(path).expanduser())
-    if Path(resolved).exists():
-        return CalibrationStatus(status="available", path=resolved, message="calibration file exists")
-    return CalibrationStatus(status="missing", path=resolved, message="calibration file does not exist")
+    if not paths:
+        return CalibrationStatus(status="pass_through_risk", message="robot_config has no calibration files")
+
+    resolved_paths = [str(Path(path).expanduser()) for path in paths]
+    missing_paths = [path for path in resolved_paths if not Path(path).exists()]
+    joined_paths = ",".join(resolved_paths)
+    if not missing_paths:
+        return CalibrationStatus(status="available", path=joined_paths, message="calibration file exists")
+    return CalibrationStatus(status="missing", path=joined_paths, message="calibration file does not exist")
 
 
 def action_from_variants(action_chunk: Any) -> list[Any] | None:
@@ -523,7 +526,8 @@ def _run_capture(args: argparse.Namespace) -> None:
             if reset_client is not None:
                 future = reset_client.call_async(Trigger.Request())
                 rclpy.spin_until_future_complete(node, future, timeout_sec=args.request_timeout_sec)
-                if not future.done() or not future.result().success:
+                reset_result = future.result() if future.done() else None
+                if reset_result is None or not reset_result.success:
                     records.append(
                         PredictionRecord(
                             frame_index=frame.frame_index,
@@ -553,7 +557,8 @@ def _run_capture(args: argparse.Namespace) -> None:
             goal.inference_id = inference_id
             send_future = action_client.send_goal_async(goal)
             rclpy.spin_until_future_complete(node, send_future, timeout_sec=args.request_timeout_sec)
-            if not send_future.done() or send_future.result() is None or not send_future.result().accepted:
+            goal_handle = send_future.result() if send_future.done() else None
+            if goal_handle is None or not goal_handle.accepted:
                 record = PredictionRecord(
                     frame_index=frame.frame_index,
                     sample_timestamp_ns=frame.sample_timestamp_ns,
@@ -565,9 +570,10 @@ def _run_capture(args: argparse.Namespace) -> None:
                     diagnostics={"streams": [asdict(item) for item in frame.diagnostics]},
                 )
             else:
-                result_future = send_future.result().get_result_async()
+                result_future = goal_handle.get_result_async()
                 rclpy.spin_until_future_complete(node, result_future, timeout_sec=args.request_timeout_sec)
-                if not result_future.done() or result_future.result() is None:
+                result_response = result_future.result() if result_future.done() else None
+                if result_response is None:
                     record = PredictionRecord(
                         frame_index=frame.frame_index,
                         sample_timestamp_ns=frame.sample_timestamp_ns,
@@ -579,7 +585,7 @@ def _run_capture(args: argparse.Namespace) -> None:
                         diagnostics={"streams": [asdict(item) for item in frame.diagnostics]},
                     )
                 else:
-                    result = result_future.result().result
+                    result = result_response.result
                     record = PredictionRecord(
                         frame_index=frame.frame_index,
                         sample_timestamp_ns=frame.sample_timestamp_ns,
