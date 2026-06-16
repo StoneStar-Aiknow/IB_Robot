@@ -31,7 +31,10 @@ platform_prepare_host() {
         ffmpeg-devel \
         libvpx \
         libvpx-devel \
-        nlohmann-json-devel
+        nlohmann-json-devel \
+        yaml-cpp \
+        yaml-cpp-devel
+
 }
 
 ensure_openeuler_ca_certificates() {
@@ -84,16 +87,45 @@ ensure_openeuler_builtin_repos() {
 }
 
 ensure_openeuler_extras_repo() {
-    local extras_repo_url
+    local extras_repo_file extras_repo_url
     extras_repo_url="https://repo.oepkgs.net/openeuler/rpm/openEuler-24.03-LTS/extras/$(uname -m)"
+    extras_repo_file=$(openeuler_extras_repo_file "${extras_repo_url}")
 
-    if dnf repolist --enabled | awk '$1 == "extras" { found = 1 } END { exit found ? 0 : 1 }'; then
+    if [[ -n "${extras_repo_file}" ]]; then
         log_info "openEuler extras repo already configured."
+    else
+        log_info "Adding openEuler extras repo required for python3-lttngust..."
+        run_sudo dnf config-manager --add-repo "${extras_repo_url}"
+        extras_repo_file=$(openeuler_extras_repo_file "${extras_repo_url}")
+    fi
+
+    if [[ -z "${extras_repo_file}" ]]; then
+        log_error "Failed to locate the generated openEuler extras repo file."
+        exit 1
+    fi
+
+    ensure_openeuler_extras_repo_excludes "${extras_repo_file}"
+}
+
+openeuler_extras_repo_file() {
+    local extras_repo_url="$1"
+
+    grep -rlF "baseurl=${extras_repo_url}" /etc/yum.repos.d 2>/dev/null | sed -n '1p' || true
+}
+
+ensure_openeuler_extras_repo_excludes() {
+    local repo_file="$1"
+
+    if grep -Eq '^exclude=([[:space:]]|[^[:space:]]+[[:space:]])*yaml-cpp\*([[:space:]]|$)' "${repo_file}"; then
         return 0
     fi
 
-    log_info "Adding openEuler extras repo required for python3-lttngust..."
-    run_sudo dnf config-manager --add-repo "${extras_repo_url}"
+    log_info "Excluding yaml-cpp from openEuler extras repo to preserve the ROS 2 ABI package."
+    if grep -q '^exclude=' "${repo_file}"; then
+        run_sudo sed -i '/^exclude=/ s/$/ yaml-cpp*/' "${repo_file}"
+    else
+        printf '\nexclude=yaml-cpp*\n' | run_sudo tee -a "${repo_file}" >/dev/null
+    fi
 }
 
 ensure_openeuler_gpg_key() {

@@ -270,7 +270,7 @@ preview_system_packages() {
             echo "python3-colcon-common-extensions python3-venv python3-pip"
             ;;
         openeuler-embedded-24.03)
-            echo "gcc-c++ vim-enhanced ffmpeg-devel libvpx libvpx-devel nlohmann-json-devel python3-virtualenv python3-pip python3-devel"
+            echo "gcc-c++ vim-enhanced ffmpeg-devel libvpx libvpx-devel nlohmann-json-devel yaml-cpp yaml-cpp-devel python3-virtualenv python3-pip python3-devel"
             ;;
         *)
             echo ""

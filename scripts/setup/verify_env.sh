@@ -138,6 +138,22 @@ verify_pygraphviz() {
     return 0
 }
 
+verify_openeuler_yaml_cpp_abi() {
+    case "${SETUP_PLATFORM_ID}" in
+        openeuler-embedded-24.03)
+            log_info "Verifying openEuler yaml-cpp ABI..."
+
+            if [[ ! -e /usr/lib64/libyaml-cpp.so.0.7 ]]; then
+                log_error "Verification failed: missing /usr/lib64/libyaml-cpp.so.0.7."
+                log_error "Re-run ./scripts/setup.sh to install yaml-cpp and yaml-cpp-devel."
+                return 1
+            fi
+            ;;
+    esac
+
+    return 0
+}
+
 verify_tracing() {
     local venv_python="${VENV_PYTHON}"
     local ros_setup="${SETUP_ROS_SETUP_PATH}"
@@ -242,6 +258,7 @@ verify_env() {
     verify_numpy_compat || return 1
     verify_lerobot || return 1
     verify_pygraphviz || return 1
+    verify_openeuler_yaml_cpp_abi || return 1
     verify_tracing || return 1
 
     log_done "Verified ROS, rosdep, colcon, lerobot, and NumPy compatibility"
