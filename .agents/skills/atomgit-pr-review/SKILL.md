@@ -44,6 +44,18 @@ license: MIT
 - “review / 审查 / 帮我看看 PR”本身不等于授权执行验证。禁止审查者代替开发者运行 `ibrobot-docker-verify` 或 `ibrobot-docker-verify-oee` 来补齐 PR 描述；只有当用户在当前请求中明确要求 agent 实际执行验证（例如“你来跑一下 Ubuntu/openEuler Docker 验证”“帮我实际验证 setup/build”）时，才调用对应验证 skill。
 - 如果 PR 描述缺少任一平台验证说明，或只给出命令但没有结果，或验证没有覆盖 setup/build 两个阶段，都应视为**阻塞性 review 问题**，要求开发者补充。
 
+### 3. 禁止本地重复执行 pre-commit 已覆盖的检查
+
+- IB_Robot 的 `.pre-commit-config.yaml` 已把 `ruff --fix` 与 `ruff-format` 作为强制 pre-commit hook，且 `.git/hooks/pre-commit` 随仓库安装；开发者 `git commit` 时必然已通过 ruff 校验，**PR 上线代码不会再有 `ruff check` / `ruff format` 报错**。
+- 因此 review 时**禁止**在本地做以下动作（属于重复劳动，浪费上下文且无新增信息）：
+  - `git apply` / `git checkout` / `git diff` 拼接 PR diff 后跑 `ruff check` / `ruff format --check` / `pyright` / `mypy` / `py_compile` 等 lint / format / typecheck 命令
+  - 切到 PR 分支跑 `colcon build` 来"验证"代码能否编译——这属于开发者侧 Verification 范畴，由 §2 门禁管理
+- 替代做法：
+  - **信任 PR 描述中开发者声明的 ruff / py_compile / build 结果**，除非描述缺失且 PR 触发 §2 门禁
+  - 如怀疑某行有 lint / 类型 / 风格问题，**直接在 inline 评论中指出并附修复建议**，由开发者在下一次提交时让 pre-commit 自动修复，不要在本地复跑
+  - 静态阅读 diff 与本仓库源码（`Read` / `Grep` / `Glob`）始终允许且推荐——这是判断架构/逻辑/命名问题的正常手段
+- **例外**：用户在当前请求中明确要求“你帮我跑一下 ruff / typecheck / build 看看”时才执行相应命令；“review 这个 PR”“帮我看看这个 PR”本身**不构成**授权。
+
 ## ⚠️ 环境准备
 
 **必须先加载环境变量**：

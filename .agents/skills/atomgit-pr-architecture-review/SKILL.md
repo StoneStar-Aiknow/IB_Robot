@@ -56,6 +56,16 @@ python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_ar
 - **步骤4必须指定 `--ai-model` 参数**，使用你的真实模型名称（如 `claude-sonnet-4`、`gpt-4`、`gemini-pro`）
 - 文件名格式：`./tmp/{repo}_pr_{number}_arch_issues.json`
 
+## ⚠️ 禁止本地重复执行 pre-commit 已覆盖的检查
+
+- IB_Robot 的 `.pre-commit-config.yaml` 已把 `ruff --fix` 与 `ruff-format` 作为强制 pre-commit hook，且 `.git/hooks/pre-commit` 随仓库安装；开发者提交时必然已通过 ruff 校验，**PR 上线代码不会再有 `ruff check` / `ruff format` 报错**。
+- 架构审查关注的是 SSOT / 契约 / 控制流 / 包职责 / README 一致性，这些**全部可以通过静态阅读 diff 与本仓库源码（`Read` / `Grep` / `Glob`）判断**，不需要执行任何命令。
+- 因此 review 时**禁止**在本地做以下动作：
+  - `git apply` / `git checkout` / `git diff` 拼接 PR diff 后跑 `ruff check` / `ruff format --check` / `pyright` / `mypy` / `py_compile`
+  - 切到 PR 分支跑 `colcon build` 来“验证”代码能否编译——验证属于开发者侧 Verification，由代码 review skill 的门禁条款管理
+- 如怀疑某行存在风格 / 类型 / 命名问题，**直接在 inline 评论中指出并附修复建议**，由开发者在下一次提交时让 pre-commit 自动修复，不要在本地复跑。
+- **例外**：用户在当前请求中明确要求“你帮我跑一下 ruff / typecheck / build 看看”时才执行相应命令；“架构审查这个 PR”“review 架构合规”本身**不构成**授权。
+
 ## 架构审查支柱
 
 此工具会检查以下 IB_Robot 架构支柱：
