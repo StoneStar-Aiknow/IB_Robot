@@ -1,0 +1,50 @@
+From 9f899fce36e1d0e00b86499115b01d4dc7025d23 Mon Sep 17 00:00:00 2001
+From: yidahao <haoyida@huawei.com>
+Date: Wed, 17 Jun 2026 20:57:27 +0800
+Subject: [PATCH] fix(pi05): pad state to max_state_dim before prompt
+ discretization
+
+Pi05PrepareStateTokenizerProcessorStep discretized the raw state vector
+directly and embedded it into the PaliGemma prompt. When the robot state
+has fewer dims than max_state_dim (e.g. 6 vs 32), the prompt encoded only
+the real dims, producing a different token sequence than the model was
+trained/exported with (which pads to max_state_dim first).
+
+This caused a large action drift on the Ascend OM PI05 path: the VLM
+received a shorter, wrong prompt, so its KV cache and the downstream
+action expert output diverged from the PyTorch reference (observed L1 ~7
+vs ~0.9 after the fix, cosine 0.95 -> 0.999).
+
+Restore the pad_vector(state, max_state_dim) call so the discretized
+state always spans max_state_dim, matching the export-time prompt.
+
+Signed-off-by: yidahao <haoyida@huawei.com>
+---
+ src/lerobot/policies/pi05/processor_pi05.py | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/lerobot/policies/pi05/processor_pi05.py b/src/lerobot/policies/pi05/processor_pi05.py
+index cb616af87..6b7587396 100644
+--- a/src/lerobot/policies/pi05/processor_pi05.py
++++ b/src/lerobot/policies/pi05/processor_pi05.py
+@@ -23,6 +23,7 @@ import torch
+ 
+ from lerobot.configs.types import PipelineFeatureType, PolicyFeature
+ from lerobot.policies.pi05.configuration_pi05 import PI05Config
++from lerobot.policies.pi05.modeling_pi05 import pad_vector
+ from lerobot.processor import (
+     AbsoluteActionsProcessorStep,
+     AddBatchDimensionProcessorStep,
+@@ -69,6 +70,9 @@ class Pi05PrepareStateTokenizerProcessorStep(ProcessorStep):
+         # TODO: check if this necessary
+         state = deepcopy(state)
+ 
++        # Pad state to max_state_dim before discretization (required for prompt consistency)
++        state = pad_vector(state, self.max_state_dim)
++
+         # State should already be normalized to [-1, 1] by the NormalizerProcessorStep that runs before this step
+         # Discretize into 256 bins (see openpi `PaligemmaTokenizer.tokenize()`)
+         state_np = state.cpu().numpy()
+-- 
+2.34.1
+
