@@ -5,10 +5,8 @@ AtomGit Issue Management Tool
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
-from typing import Optional, List
 
 # Add libs/atomgit_sdk/src to PYTHONPATH
 sdk_path = Path(__file__).parents[4] / "libs" / "atomgit_sdk" / "src"
@@ -22,9 +20,7 @@ except ImportError:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Manage AtomGit issues across create, fetch, update, and close flows"
-    )
+    parser = argparse.ArgumentParser(description="Manage AtomGit issues across create, fetch, update, and close flows")
     parser.add_argument("--title", help="Issue title")
     parser.add_argument("--body", help="Issue body")
     parser.add_argument("--labels", help="Comma-separated labels")
@@ -32,6 +28,10 @@ def parse_args():
     parser.add_argument("--issue", type=int, help="Issue number for update or fetch")
     parser.add_argument("--state", choices=["open", "closed"], help="Issue state for update")
     parser.add_argument("--fetch-info", action="store_true", help="Fetch issue info to JSON")
+    parser.add_argument(
+        "--comment",
+        help="Post a comment (or a community slash command like '/kind bug') on an existing issue",
+    )
     parser.add_argument(
         "--no-comments",
         action="store_true",
@@ -52,9 +52,7 @@ def main():
 
     # Load configuration
     try:
-        config, parsed_url = resolve_atomgit_context(
-            args.config, owner=args.owner, repo=args.repo, url=args.url
-        )
+        config, parsed_url = resolve_atomgit_context(args.config, owner=args.owner, repo=args.repo, url=args.url)
         client = AtomGitClient(config)
         service = IssueService(client)
     except Exception as e:
@@ -79,48 +77,63 @@ def main():
             issue_data = service.get_issue(args.issue)
             if not args.no_comments:
                 issue_data["comments_detail"] = service.get_issue_comments(args.issue)
-            
+
             output_dir = Path(args.output_dir)
             output_dir.mkdir(exist_ok=True)
             repo_name = config.repo.lower().replace("-", "_")
             output_file = output_dir / f"{repo_name}_issue_{args.issue}_context.json"
-            
+
             with open(output_file, "w", encoding="utf-8") as f:
                 json.dump(issue_data, f, indent=2, ensure_ascii=False)
-            
+
             print(f"Successfully saved issue info to {output_file}")
             if not args.no_comments:
-                print(
-                    f"Included {len(issue_data.get('comments_detail', []))} issue comments"
-                )
+                print(f"Included {len(issue_data.get('comments_detail', []))} issue comments")
             return
         except Exception as e:
             print(f"Error fetching issue info: {e}")
             sys.exit(1)
 
-    # 2. Update issue mode
-    if args.issue:
+    # 2. Comment mode (post a comment or community slash command on an existing issue)
+    if args.comment is not None:
+        if not args.issue:
+            print("Error: --issue <number> is required for --comment")
+            sys.exit(1)
+        print(f"Commenting on issue #{args.issue}...")
+        if args.dry_run:
+            print(f"[DRY RUN] Comment: {args.comment}")
+            return
+        try:
+            service.submit_issue_comment(args.issue, args.comment)
+            print(f"Successfully commented on issue #{args.issue}")
+            print(f"URL: {service.get_issue_url(args.issue)}")
+            return
+        except Exception as e:
+            print(f"Error commenting on issue: {e}")
+            sys.exit(1)
+
+    # 3. Update issue mode
+    if args.issue and args.comment is None:
         print(f"Updating issue #{args.issue}...")
-        
+
         labels = args.labels.split(",") if args.labels else None
         assignees = args.assignees.split(",") if args.assignees else None
-        
+
         if args.dry_run:
             print("[DRY RUN] Plan to update issue:")
-            if args.title: print(f"  Title: {args.title}")
-            if args.state: print(f"  State: {args.state}")
-            if labels: print(f"  Labels: {labels}")
-            if assignees: print(f"  Assignees: {assignees}")
+            if args.title:
+                print(f"  Title: {args.title}")
+            if args.state:
+                print(f"  State: {args.state}")
+            if labels:
+                print(f"  Labels: {labels}")
+            if assignees:
+                print(f"  Assignees: {assignees}")
             return
 
         try:
             result = service.update_issue(
-                args.issue,
-                title=args.title,
-                body=args.body,
-                state=args.state,
-                labels=labels,
-                assignees=assignees
+                args.issue, title=args.title, body=args.body, state=args.state, labels=labels, assignees=assignees
             )
             print(f"Successfully updated issue #{args.issue}")
             print(f"URL: {service.get_issue_url(args.issue)}")
@@ -135,24 +148,21 @@ def main():
         sys.exit(1)
 
     print(f"Creating new issue: {args.title}...")
-    
+
     labels = args.labels.split(",") if args.labels else None
     assignees = args.assignees.split(",") if args.assignees else None
 
     if args.dry_run:
         print("[DRY RUN] Plan to create issue:")
         print(f"  Title: {args.title}")
-        if labels: print(f"  Labels: {labels}")
-        if assignees: print(f"  Assignees: {assignees}")
+        if labels:
+            print(f"  Labels: {labels}")
+        if assignees:
+            print(f"  Assignees: {assignees}")
         return
 
     try:
-        result = service.create_issue(
-            title=args.title,
-            body=args.body or "",
-            labels=labels,
-            assignees=assignees
-        )
+        result = service.create_issue(title=args.title, body=args.body or "", labels=labels, assignees=assignees)
         issue_number = result.get("number")
         print(f"Successfully created issue #{issue_number}")
         print(f"URL: {service.get_issue_url(issue_number)}")
