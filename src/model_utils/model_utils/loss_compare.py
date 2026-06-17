@@ -1,4 +1,3 @@
-import argparse
 import contextlib
 import json
 import os
@@ -418,80 +417,38 @@ class LossUtils:
             print(f"raw (normalized) target saved at {raw_target_path}")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Model Loss Comparison")
-    parser.add_argument("--batch_path", type=str, required=True, help="Path to input batches json file")
-    parser.add_argument("--target_path", type=str, required=True, help="Path to save target json file")
-    parser.add_argument("--policy_path", type=str, required=True, help="Path to pretrained policy model directory")
-    parser.add_argument(
-        "--policy_type",
-        type=str,
-        default="act",
-        help="Hint for the policy model type (e.g. act, pi05). The actual type "
-        "is auto-detected from the loaded policy/manifest; this is only a "
-        "fallback for reporting.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cpu",
-        help="Inference backend. Native torch: 'cpu', 'cuda', 'npu'. "
-        "Compiled (IB-Robot offline) models: 'ascend_om' (OM, incl. pi05), "
-        "'ascend_om_3403', 'rknn'. The InferenceCoordinator selects the "
-        "matching wrapper automatically.",
-    )
-    parser.add_argument(
-        "--model_dtype",
-        type=str,
-        default="native",
-        choices=["native", "fp16", "bf16", "fp32"],
-        help="Cast the *torch* model to this dtype before forward (ignored for "
-        "compiled OM/RKNN backends). 'native' (default) keeps the checkpoint "
-        "dtype (BF16 for PI05). Use 'fp16' for apples-to-apples comparison "
-        "with OM/ORT deployment.",
-    )
-    parser.add_argument(
-        "--generate-target", action="store_true", help="Reading batches and generating target json file"
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for deterministic inference (fixes diffusion noise).",
-    )
-    parser.add_argument(
-        "--task",
-        type=str,
-        default="",
-        help="Natural-language task prompt for VLA policies (PI0/PI05/SmolVLA). "
-        "Routed into the LeRobot preprocessor's complementary_data and "
-        "tokenized. Defaults to an empty string (matches historical "
-        "loss_compare behavior). Must match the prompt used to generate the "
-        "target for an apples-to-apples comparison.",
-    )
-    parser.add_argument(
-        "--noise-dir",
-        type=str,
-        default=None,
-        help="Directory for noise file transfer (Scheme C). "
-        "generate-target: saves noise_{NNNN}.npy files here. "
-        "compute-loss: loads noise files from here to ensure identical "
-        "noise across GPU (PyTorch) and NPU (OM) machines.",
-    )
-    parser.add_argument(
-        "--raw-target-path",
-        type=str,
-        default=None,
-        help="Optional path to dump/read normalized-space (pre-postprocessor) "
-        "actions. generate-target: writes raw target JSON next to the "
-        "regular target. compute-loss: reads it and prints an extra L1 / "
-        "Cosine table in normalized action space — useful for separating "
-        "real model drift from unnormalization scale-up.",
-    )
-    return parser.parse_args()
+def main():
+    # All argument ergonomics (profile / wizard / --exp-dir derivation /
+    # remember-last) live in loss_compare_cli so this entry point stays thin
+    # and LossUtils itself is unchanged.  Every historical explicit flag still
+    # works and overrides whatever a profile/derivation would supply.
+    try:
+        from model_utils import loss_compare_cli
+    except ImportError:
+        # Running as a standalone script (e.g. ``python loss_compare.py`` from a
+        # data directory) — import the sibling file next to this one.
+        import importlib.util
+        import os
+        import sys
+
+        _cli_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "loss_compare_cli.py")
+        _spec = importlib.util.spec_from_file_location("loss_compare_cli", _cli_path)
+        loss_compare_cli = importlib.util.module_from_spec(_spec)
+        # Register before exec so dataclasses (which look the module up in
+        # sys.modules during class creation) resolve correctly.
+        sys.modules["loss_compare_cli"] = loss_compare_cli
+        _spec.loader.exec_module(loss_compare_cli)
+
+    resolved = loss_compare_cli.resolve()
+    loss_compare_cli.print_effective(resolved)
+
+    loss_utils = LossUtils(resolved.args)
+    loss_utils.run()
+
+    # Persist this run's effective params as ``_last`` (replaces a separate
+    # "remember last args" cache).  Only after a successful run.
+    loss_compare_cli.write_last(resolved)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    loss_utils = LossUtils(args)
-    loss_utils.run()
+    main()

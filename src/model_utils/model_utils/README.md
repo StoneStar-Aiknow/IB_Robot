@@ -300,6 +300,93 @@ python export_onnx_hmm.py \
 >
 > **注意**：该脚本现已统一通过 IB-Robot 的 `inference_service.InferenceCoordinator` 加载模型，因此既支持原生 LeRobot torch 模型，也支持 ib robot 中编译好的离线模型（昇腾 OM、3403、RKNN）。后端由 `--device` 参数自动选择，无需修改脚本。pi05 等 VLA 模型在 torch 与 OM 两种后端下都可直接对比。
 
+### 快速开始（推荐）
+
+为缓解「参数繁琐、路径长、含义易忘」三个痛点，loss_compare 提供 **交互向导 + profile 配置 + 派生路径 + 记住上次** 四件套。常用参数只需配置一次，之后一行命令即可复用。
+
+> 旧的完整显式命令（见下方「高级用法（完整参数）」）**完全保持可用**，向后兼容；下面这套只是更省心的入口。
+
+**第一次使用：交互向导**
+
+直接不带参数运行（或加 `--init`），向导会逐项提示**含义 + 样例 + 默认值**，回车即用默认，结尾可把这组参数存成一个 profile：
+
+```shell
+python loss_compare.py          # 无配置时自动进入向导
+python loss_compare.py --init   # 任何时候强制重新进向导
+```
+
+**日常使用：profile + 实验目录**
+
+```shell
+# 引用 profile，只需再给一个实验目录；target/raw/noise 自动派生
+python loss_compare.py --profile pi05-om --exp-dir /root/.../0612
+
+# 临时覆盖某个参数（命令行优先级最高）
+python loss_compare.py --profile pi05-om --exp-dir /root/.../0612 --device cuda
+```
+
+**派生路径约定**：`--exp-dir <DIR>` 会自动派生三条长路径，无需再分别手填：
+
+| 派生项 | 路径 |
+| --- | --- |
+| `--target_path` | `<DIR>/target.json` |
+| `--raw-target-path` | `<DIR>/target_raw.json` |
+| `--noise-dir` | `<DIR>/noises/` |
+
+显式传同名参数会覆盖对应派生值。`--generate-target` 时若派生/目标文件已存在，会**报错拒绝覆盖**，需更换 `--exp-dir` 或显式加 `--force`（防止误覆盖基准）。
+
+**记住上次**：每次成功运行后，最终生效参数会自动写入配置文件的 `_last` 段。下次不指定 `--profile` 时即自动复用上次参数（启动时会打印每个参数的来源）：
+
+```shell
+python loss_compare.py --exp-dir /root/.../0613   # 其余参数沿用上次
+```
+
+**其他配置命令**：
+
+```shell
+python loss_compare.py --list-profiles            # 列出已有 profile
+python loss_compare.py ... --save-as pi05-torch   # 把当前参数另存为 profile
+python loss_compare.py --config /path/to.yaml ... # 指定配置文件
+```
+
+#### 配置文件
+
+默认位置 `~/.config/model_utils/loss_compare.yaml`（可用 `--config` 或环境变量 `LOSS_COMPARE_CONFIG` 覆盖），三个段：
+
+```yaml
+# 所有 profile 共享的默认值
+defaults:
+  policy_type: pi05
+  seed: 42
+  batch_path: /root/.../batches_480_640_first_batch.json
+
+# 命名 profile（常用参数组）
+profiles:
+  pi05-om:                       # 昇腾 OM 后端
+    device: ascend_om
+    policy_path: /root/.../019200/
+  pi05-torch:                    # GPU torch 基准
+    device: cuda
+    policy_path: /root/.../019200/
+
+# 由脚本自动回写，等价「记住上次」；不要手动维护
+_last:
+  profile: pi05-om
+  device: ascend_om
+  policy_path: /root/.../019200/
+  exp_dir: /root/.../0612
+```
+
+参数优先级（高 → 低）：**命令行 > `--profile` > `defaults` > `_last`（仅未指定 profile 时）> 内置默认**。
+
+> 提示：`_last` 与 profile 里**不会**保存派生出来的 `target/raw/noise` 绝对路径（只存 `exp_dir`），这样以后换 `--exp-dir` 才能正确重新派生。
+
+---
+
+## 高级用法（完整参数）
+
+以下为不依赖 profile/向导的完整显式用法，适用于自动化/CI 或非标准目录布局。
+
 ### 工作流程
 
 1. **生成基准数据**（`--generate-target`）：在 GPU/CPU 上使用 PyTorch 模型对输入 batch 进行推理，将输出保存为 JSON 文件作为基准。
@@ -332,17 +419,21 @@ python loss_compare.py \
 
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `--policy_path` | ✅ | — | LeRobot 训练出来的策略模型目录路径（torch 与 OM 共用同一目录，OM 需含 `config.om.json`） |
-| `--batch_path` | ✅ | — | 输入 batch 的 JSON 文件路径 |
-| `--target_path` | ✅ | — | 基准推理输出的 JSON 文件路径（生成或读取） |
+| `--policy_path` | ✅ | — | LeRobot 训练出来的策略模型目录路径（torch 与 OM 共用同一目录，OM 需含 `config.om.json`）。可由 profile 提供 |
+| `--batch_path` | ✅ | — | 输入 batch 的 JSON 文件路径。可由 profile/defaults 提供 |
+| `--target_path` | ✅* | — | 基准推理输出的 JSON 文件路径（生成或读取）。*可由 `--exp-dir` 派生为 `<DIR>/target.json` |
+| `--exp-dir` | ❌ | `None` | 实验目录：自动派生 `target.json`/`target_raw.json`/`noises/`，免去分别手填三条长路径 |
 | `--policy_type` | ❌ | `act` | 策略类型提示（实际类型由加载的策略/manifest 自动检测，仅作回退） |
 | `--device` | ❌ | `cpu` | 推理后端：原生 torch 用 `cpu`/`cuda`/`npu`；ib robot 离线模型用 `ascend_om`（含 pi05 OM）、`ascend_om_3403`、`rknn` |
 | `--model_dtype` | ❌ | `native` | 仅对 torch 后端生效：将模型转为 `fp16`/`bf16`/`fp32`（编译后端使用其固定 dtype，忽略此参数） |
 | `--generate-target` | ❌ | `false` | 指定后进入基准数据生成模式 |
+| `--force` | ❌ | `false` | generate-target 时允许覆盖已存在的派生/目标文件（默认拒绝覆盖，防误删基准） |
 | `--seed` | ❌ | `42` | 随机种子，用于固定扩散/flow-matching 噪声以保证可复现性 |
 | `--task` | ❌ | `""` | VLA 策略（PI0/PI05/SmolVLA）的自然语言任务提示词，会被路由进 LeRobot 预处理器的 complementary_data 并 tokenize。生成基准与计算损失两端必须一致，否则对比无意义 |
-| `--noise-dir` | ❌ | `None` | 噪声文件目录，用于跨机器精度对比（Scheme C） |
-| `--raw-target-path` | ❌ | `None` | 归一化空间（后处理前）动作的导出/读取路径，用于区分模型漂移与反归一化放大 |
+| `--noise-dir` | ❌ | `None` | 噪声文件目录，用于跨机器精度对比（Scheme C）。可由 `--exp-dir` 派生为 `<DIR>/noises/` |
+| `--raw-target-path` | ❌ | `None` | 归一化空间（后处理前）动作的导出/读取路径，用于区分模型漂移与反归一化放大。可由 `--exp-dir` 派生为 `<DIR>/target_raw.json` |
+
+> 配置/向导相关：`--config`（配置文件路径）、`--profile`（引用 profile）、`--save-as`（另存为 profile）、`--init`（强制向导）、`--list-profiles`（列出 profile）。详见上方「快速开始」。
 
 ### 噪声文件传递（Scheme C）
 
