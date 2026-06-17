@@ -84,6 +84,7 @@ classDiagram
         -motors_bus: FeetechMotorsBus
         -calibration: dict
         -joint_mapping: dict
+        -gripper_joints: set
         -port: str
         +connect() bool
         +get_joint_targets() Dict
@@ -226,12 +227,15 @@ def control_loop_callback(self):
 ```
 串口读取 (4096 步/圈)
   → 校准偏移 (写入固件，raw 2048 = 物理零位)
-  → 位置转换: rad = (raw - 2048.0) × 2π/4096
+  → 按关节角色转换目标单位
+      ├─ 手臂关节: rad = (raw - 2048.0) × 2π/4096
+      └─ 夹爪关节: 根据 calibration range 归一化为 0.0~1.0 opening ratio
   → 关节映射 (leader → follower，可自定义)
-  → get_joint_targets() 返回 6 轴弧度值
+  → get_joint_targets() 返回 arm radians 与 gripper opening ratio
 ```
 
 **关节范围**: 关节 1-5 归一化到 -100~100（对应 -π~π 附近），关节 6（夹爪）0~100。
+`gripper_joint_names` 由 `robot_config` 的 teleop launch builder 注入到 `device_config`，与 TeleopNode 顶层参数共享同一份配置来源；夹爪 calibration 缺失或 range 退化时跳过该夹爪目标，不回退为 radians。
 
 **关键特性**:
 - ✅ 零延迟 (直接读取编码器，< 2ms/周期)

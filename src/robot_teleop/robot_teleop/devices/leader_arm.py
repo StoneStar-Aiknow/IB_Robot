@@ -29,6 +29,7 @@ class LeaderArmDevice(BaseTeleopDevice):
         calib_str = config.get("calib_file", "")
         self.calib_file = Path(calib_str).expanduser() if calib_str else None
         self.joint_mapping = config.get("joint_mapping", {})
+        self.gripper_joints = set(config.get("gripper_joint_names", ["6"]))
 
         # Physical constants (4096 steps per 360 degrees)
         self.rad_per_step = (2 * math.pi) / 4096.0
@@ -55,7 +56,9 @@ class LeaderArmDevice(BaseTeleopDevice):
 
             motors = {}
             for joint_name, joint_info in self.joints.items():
-                norm_mode = MotorNormMode.RANGE_0_100 if joint_name == "6" else MotorNormMode.RANGE_M100_100
+                norm_mode = (
+                    MotorNormMode.RANGE_0_100 if self._is_gripper_joint(joint_name) else MotorNormMode.RANGE_M100_100
+                )
                 motors[joint_name] = Motor(
                     id=joint_info["id"],
                     model=joint_info["model"],
@@ -102,14 +105,21 @@ class LeaderArmDevice(BaseTeleopDevice):
                     continue
 
                 raw = raw_positions[name]
-
-                # EXACTLY matching so101_hardware.cpp logic:
-                # rad = (raw - 2048.0) * rad_per_step
-                position_rad = (raw - 2048.0) * self.rad_per_step
-
-                # Map to follower joint name
                 follower_joint = self._map_joint(name)
-                joint_targets[follower_joint] = position_rad
+
+                if self._is_gripper_joint(name):
+                    gripper_target = self._normalize_gripper_target(name, raw)
+                    if gripper_target is None:
+                        self.logger.warning(
+                            f"Gripper joint '{name}' calibration unavailable or degenerate; "
+                            "skipping publish to avoid bad radians target"
+                        )
+                        continue
+                    joint_targets[follower_joint] = gripper_target
+                else:
+                    # EXACTLY matching so101_hardware.cpp logic:
+                    # rad = (raw - 2048.0) * rad_per_step
+                    joint_targets[follower_joint] = (raw - 2048.0) * self.rad_per_step
 
             return joint_targets
 
@@ -132,6 +142,24 @@ class LeaderArmDevice(BaseTeleopDevice):
         from so101_hardware.calibration.interactive import load_calibration as load_calib_so101
 
         return load_calib_so101(self.calib_file, self.joint_names, self.logger)
+
+    def _normalize_gripper_target(self, joint_name: str, raw: float) -> float | None:
+        if not self.calibration or joint_name not in self.calibration:
+            return None
+
+        calib = self.calibration[joint_name]
+        range_min = calib.range_min
+        range_max = calib.range_max
+        if range_max == range_min:
+            return None
+
+        bounded = min(range_max, max(range_min, raw))
+        norm = (bounded - range_min) / (range_max - range_min)
+        return 1.0 - norm if calib.drive_mode else norm
+
+    def _is_gripper_joint(self, leader_joint: str) -> bool:
+        mapped_joint = self._map_joint(leader_joint)
+        return leader_joint in self.gripper_joints or mapped_joint in self.gripper_joints
 
     def _map_joint(self, leader_joint: str) -> str:
         return self.joint_mapping.get(leader_joint, leader_joint)
