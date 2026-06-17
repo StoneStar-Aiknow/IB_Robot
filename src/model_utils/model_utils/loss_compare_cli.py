@@ -40,6 +40,16 @@ DERIVED_TARGET = "target.json"
 DERIVED_RAW_TARGET = "target_raw.json"
 DERIVED_NOISE_DIR = "noises"
 
+# Provenance labels (shown by print_effective so the user knows where each
+# value came from).  Kept as constants because some control flow checks them.
+SRC_CLI = "cli"
+SRC_PROFILE = "profile"  # used as f"{SRC_PROFILE}:{name}"
+SRC_DEFAULTS = "defaults"
+SRC_LAST = "last"
+SRC_BUILTIN = "builtin"
+SRC_WIZARD = "wizard"
+SRC_DERIVED = "derived(exp-dir)"
+
 
 @dataclass
 class Param:
@@ -66,9 +76,9 @@ class Param:
     def help_text(self) -> str:
         parts = [self.meaning]
         if self.choices:
-            parts.append(f"可选: {', '.join(self.choices)}")
+            parts.append(f"choices: {', '.join(self.choices)}")
         if self.example:
-            parts.append(f"样例: {self.example}")
+            parts.append(f"e.g. {self.example}")
         if self.help_extra:
             parts.append(self.help_extra)
         return " | ".join(parts)
@@ -81,15 +91,16 @@ PARAMS: list[Param] = [
     Param(
         dest="policy_type",
         cli="--policy_type",
-        meaning="模型类型 (会自动检测, 仅作回退)",
+        meaning="Policy model type (auto-detected from config; this is a fallback hint)",
         example="pi05",
         default="act",
         choices=["act", "pi05"],
+        in_wizard=False,  # auto-detected, no need to ask user
     ),
     Param(
         dest="device",
         cli="--device",
-        meaning="推理后端: cpu/cuda/npu=torch, ascend_om=昇腾OM离线模型",
+        meaning="Inference backend: cpu/cuda/npu for torch, ascend_om for OM offline models",
         example="ascend_om",
         default="cpu",
         choices=["cpu", "cuda", "npu", "ascend_om", "ascend_om_3403", "rknn"],
@@ -97,34 +108,31 @@ PARAMS: list[Param] = [
     Param(
         dest="policy_path",
         cli="--policy_path",
-        meaning="策略模型目录 (含 config.json; OM 还需 config.om.json + .om)",
-        example="/root/.../pi05/019200/",
+        meaning="Policy model directory: must contain config.json (+ config.om.json and .om files for OM)",
         required_for_run=True,
     ),
     Param(
         dest="exp_dir",
         cli="--exp-dir",
-        meaning="实验目录: target/raw/noise 自动派生到此 (target.json/target_raw.json/noises/)",
-        example="/root/.../loss_compute_batches/0612",
+        meaning="Experiment directory: auto-derives target.json / target_raw.json / noises/ to avoid typing 3 long paths",
     ),
     Param(
         dest="batch_path",
         cli="--batch_path",
-        meaning="输入 batch JSON 文件",
-        example="/root/.../batches_480_640_first_batch.json",
+        meaning="Input batch JSON file path",
         required_for_run=True,
     ),
     Param(
         dest="task",
         cli="--task",
-        meaning="VLA 策略 (pi05) 的自然语言任务提示词, 两端须一致",
+        meaning="Natural language task prompt for VLA policies (pi05). Must match between generate-target and compute-loss",
         example='"pick up the cube"',
         default="",
     ),
     Param(
         dest="model_dtype",
         cli="--model_dtype",
-        meaning="仅 torch 后端: 强制模型 dtype (编译后端忽略)",
+        meaning="Torch backend only: cast model dtype (compiled backends use their fixed dtype)",
         example="native",
         default="native",
         choices=["native", "fp16", "bf16", "fp32"],
@@ -133,7 +141,7 @@ PARAMS: list[Param] = [
     Param(
         dest="seed",
         cli="--seed",
-        meaning="随机种子, 固定扩散/flow-matching 噪声",
+        meaning="Random seed for reproducible diffusion/flow-matching noise",
         example="42",
         default=42,
         type=int,
@@ -143,28 +151,28 @@ PARAMS: list[Param] = [
     Param(
         dest="target_path",
         cli="--target_path",
-        meaning="基准输出 JSON (默认由 --exp-dir 派生)",
+        meaning="Baseline inference output JSON (normally derived from --exp-dir)",
         example="<exp-dir>/target.json",
         in_wizard=False,
     ),
     Param(
         dest="raw_target_path",
         cli="--raw-target-path",
-        meaning="归一化空间(后处理前)动作 JSON (默认由 --exp-dir 派生)",
+        meaning="Normalized-space (pre-postprocessor) action JSON (normally derived from --exp-dir)",
         example="<exp-dir>/target_raw.json",
         in_wizard=False,
     ),
     Param(
         dest="noise_dir",
         cli="--noise-dir",
-        meaning="噪声文件目录, 跨机器确定性对比 (默认由 --exp-dir 派生)",
+        meaning="Noise file directory for cross-machine deterministic comparison (normally derived from --exp-dir)",
         example="<exp-dir>/noises/",
         in_wizard=False,
     ),
     Param(
         dest="generate_target",
         cli="--generate-target",
-        meaning="进入基准数据生成模式 (否则为计算损失模式)",
+        meaning="Enter generate-target mode (else compute-loss mode)",
         default=False,
         is_flag=True,
         in_wizard=False,
@@ -204,7 +212,7 @@ def load_config(path: str) -> dict[str, Any]:
     with open(path, encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):
-        raise ValueError(f"配置文件格式错误 (期望 mapping): {path}")
+        raise ValueError(f"Invalid config file (expected a mapping): {path}")
     return data
 
 
@@ -224,7 +232,7 @@ def _clean_run_params(values: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Model Loss Comparison — 支持 profile / 向导 / 派生路径 (详见 README)",
+        description="Model Loss Comparison — profile / wizard / derived-path support (see README)",
         formatter_class=argparse.RawTextHelpFormatter,
     )
 
@@ -241,18 +249,22 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument(p.cli, **kwargs)
 
     # --- meta flags (not part of run params) ---
-    meta = parser.add_argument_group("配置 / profile / 向导")
+    meta = parser.add_argument_group("Config / profile / wizard")
     meta.add_argument(
-        "--config", default=None, help=f"配置文件路径 (默认 {DEFAULT_CONFIG_PATH}, 或环境变量 {CONFIG_ENV})"
+        "--config", default=None, help=f"Config file path (default {DEFAULT_CONFIG_PATH}, or env var {CONFIG_ENV})"
     )
-    meta.add_argument("--profile", default=None, help="使用命名 profile 的参数组")
-    meta.add_argument("--save-as", dest="save_as", default=None, help="把本次最终参数另存为指定名字的 profile")
-    meta.add_argument("--init", action="store_true", help="强制进入交互向导 (首次设置)")
-    meta.add_argument("--list-profiles", dest="list_profiles", action="store_true", help="列出已有 profile 后退出")
+    meta.add_argument("--profile", default=None, help="Use a named profile parameter group")
+    meta.add_argument(
+        "--save-as", dest="save_as", default=None, help="Save this run's effective params as a named profile"
+    )
+    meta.add_argument("--init", action="store_true", help="Force interactive wizard (first-time setup)")
+    meta.add_argument(
+        "--list-profiles", dest="list_profiles", action="store_true", help="List available profiles and exit"
+    )
     meta.add_argument(
         "--force",
         action="store_true",
-        help="generate-target 时允许覆盖已存在的派生/目标文件 (防误覆盖基准)",
+        help="Allow overwriting existing derived/target files during generate-target (prevents baseline clobber)",
     )
     return parser
 
@@ -273,7 +285,7 @@ def apply_exp_dir_derivation(values: dict[str, Any], sources: dict[str, str]) ->
     for dest, derived in derivations.items():
         if values.get(dest) is None:
             values[dest] = derived
-            sources[dest] = "派生(exp-dir)"
+            sources[dest] = SRC_DERIVED
 
 
 def check_overwrite_guard(values: dict[str, Any], force: bool) -> None:
@@ -287,13 +299,13 @@ def check_overwrite_guard(values: dict[str, Any], force: bool) -> None:
             clashes.append(path)
     noise_dir = values.get("noise_dir")
     if noise_dir and os.path.isdir(noise_dir) and os.listdir(noise_dir):
-        clashes.append(noise_dir + "/ (非空)")
+        clashes.append(noise_dir + "/ (non-empty)")
     if clashes:
         listing = "\n  - ".join(clashes)
         raise SystemExit(
-            "拒绝覆盖已存在的基准文件 (generate-target):\n  - "
+            "Refusing to overwrite existing baseline files (generate-target mode):\n  - "
             f"{listing}\n"
-            "请更换 --exp-dir 指向新目录, 或显式加 --force 覆盖。"
+            "Change --exp-dir to a new directory, or add --force to overwrite."
         )
 
 
@@ -303,20 +315,20 @@ def check_overwrite_guard(values: dict[str, Any], force: bool) -> None:
 def _prompt(param: Param, current_default: Any) -> Any:
     default_repr = "" if current_default in (None, "") else str(current_default)
     print(f"\n{param.dest}  ({param.cli})")
-    print(f"  含义: {param.meaning}")
+    print(f"  {param.meaning}")
     if param.choices:
-        print(f"  可选: {', '.join(param.choices)}")
+        print(f"  choices: {', '.join(param.choices)}")
     if param.example:
-        print(f"  样例: {param.example}")
+        print(f"  e.g. {param.example}")
     suffix = f" [{default_repr}]" if default_repr else ""
-    raw = input(f"  › 输入{suffix}: ").strip()
+    raw = input(f"  › {suffix}: ").strip()
     if raw == "":
         return current_default
     if param.type is int:
         try:
             return int(raw)
         except ValueError:
-            print("  (无法解析为整数, 使用默认值)")
+            print("  (cannot parse as int, using default)")
             return current_default
     return raw
 
@@ -324,8 +336,9 @@ def _prompt(param: Param, current_default: Any) -> Any:
 def run_wizard(seed_values: dict[str, Any]) -> dict[str, Any]:
     """Prompt each wizard param; return collected run params."""
     print("=" * 60)
-    print(" loss_compare 交互式设置向导")
-    print(" 回车=使用默认值 (方括号内); 默认值取自上次/profile")
+    print(" loss_compare interactive setup wizard")
+    print(" Press Enter to use default (shown in brackets)")
+    print(" Defaults are taken from last run or profile")
     print("=" * 60)
     collected: dict[str, Any] = {}
     for p in PARAMS:
@@ -335,20 +348,20 @@ def run_wizard(seed_values: dict[str, Any]) -> dict[str, Any]:
         collected[p.dest] = _prompt(p, cur)
 
     # generate-target is a flow choice, ask explicitly (not a normal param).
-    gen = input("\n生成基准模式? (生成基准=y / 计算损失=N) [N]: ").strip().lower()
+    gen = input("\nGenerate baseline mode? (generate=y / compute-loss=N) [N]: ").strip().lower()
     collected["generate_target"] = gen in ("y", "yes")
     return _clean_run_params(collected)
 
 
 def maybe_save_profile(config: dict[str, Any], config_path: str, run_params: dict[str, Any]) -> None:
-    ans = input("\n保存为 profile 以便复用? (y/N): ").strip().lower()
+    ans = input("\nSave as profile for reuse? (y/N): ").strip().lower()
     if ans not in ("y", "yes"):
         return
-    name = input("profile 名字 [default]: ").strip() or "default"
+    name = input("Profile name [default]: ").strip() or "default"
     config.setdefault("profiles", {})[name] = _strip_for_persist(_clean_run_params(run_params))
     save_config(config_path, config)
-    print(f"✓ 已保存 profile '{name}' 到 {config_path}")
-    print(f"  下次可直接运行: loss_compare --profile {name} --exp-dir <目录>")
+    print(f"✓ Profile '{name}' saved to {config_path}")
+    print(f"  Next time run: loss_compare --profile {name} --exp-dir <dir>")
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +377,7 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
     if ns.list_profiles:
         profiles = config.get("profiles", {})
         if not profiles:
-            print(f"(无 profile) 配置文件: {config_path}")
+            print(f"(no profiles) config: {config_path}")
         else:
             print(f"profiles in {config_path}:")
             for name, vals in profiles.items():
@@ -392,16 +405,16 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
         seed = {**defaults, **last}
         run_params = run_wizard(seed)
         for k in run_params:
-            sources[k] = "向导"
+            sources[k] = SRC_WIZARD
         maybe_save_profile(config, config_path, run_params)
         merged = {**defaults, **run_params}
         for k in defaults:
-            sources.setdefault(k, "defaults")
+            sources.setdefault(k, SRC_DEFAULTS)
     else:
         profile_values: dict[str, Any] = {}
         if ns.profile:
             if ns.profile not in profiles:
-                raise SystemExit(f"未找到 profile '{ns.profile}' (配置: {config_path}). 用 --list-profiles 查看。")
+                raise SystemExit(f"Profile '{ns.profile}' not found (config: {config_path}). Use --list-profiles.")
             profile_values = _clean_run_params(profiles[ns.profile])
 
         # Precedence: builtin < _last(only w/o profile) < defaults < profile < CLI
@@ -410,21 +423,21 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
         for p in PARAMS:
             if p.default is not None:
                 merged[p.dest] = p.default
-                sources[p.dest] = "内置默认"
+                sources[p.dest] = SRC_BUILTIN
         # _last only applies when no explicit profile chosen
         if not ns.profile:
             for k, v in last.items():
                 merged[k] = v
-                sources[k] = "上次(_last)"
+                sources[k] = SRC_LAST
         for k, v in defaults.items():
             merged[k] = v
-            sources[k] = "defaults"
+            sources[k] = SRC_DEFAULTS
         for k, v in profile_values.items():
             merged[k] = v
-            sources[k] = f"profile:{ns.profile}"
+            sources[k] = f"{SRC_PROFILE}:{ns.profile}"
         for k, v in cli_given.items():
             merged[k] = v
-            sources[k] = "命令行"
+            sources[k] = SRC_CLI
 
     # Derive target/raw/noise from exp-dir (unless explicitly set).
     apply_exp_dir_derivation(merged, sources)
@@ -433,10 +446,12 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
     missing = [p.cli for p in PARAMS if p.required_for_run and not merged.get(p.dest)]
     # target_path is required to run but may be derived; check post-derivation.
     if not merged.get("target_path"):
-        missing.append("--target_path 或 --exp-dir")
+        missing.append("--target_path or --exp-dir")
     if missing:
         raise SystemExit(
-            "缺少必要参数: " + ", ".join(missing) + "\n提示: 用 --exp-dir 简化, 或 --init 走向导, 或 --profile 复用。"
+            "Missing required params: "
+            + ", ".join(missing)
+            + "\nTip: use --exp-dir to simplify, --init for the wizard, or --profile to reuse."
         )
 
     # Overwrite guard for generate-target.
@@ -456,7 +471,7 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
     if ns.save_as:
         config.setdefault("profiles", {})[ns.save_as] = _strip_for_persist(_clean_run_params(vars(final)))
         save_config(config_path, config)
-        print(f"✓ 已保存 profile '{ns.save_as}' 到 {config_path}")
+        print(f"✓ Profile '{ns.save_as}' saved to {config_path}")
 
     return ResolvedConfig(args=final, sources=sources, config_path=config_path, profile=ns.profile)
 
@@ -464,7 +479,7 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
 def print_effective(resolved: ResolvedConfig) -> None:
     args = resolved.args
     src = resolved.sources
-    print("[loss_compare] 生效参数 (来源):")
+    print("[loss_compare] effective params (source):")
     order = [
         "device",
         "policy_type",
@@ -483,8 +498,8 @@ def print_effective(resolved: ResolvedConfig) -> None:
         val = getattr(args, dest, None)
         if val in (None, ""):
             continue
-        origin = src.get(dest, "内置默认")
-        arrow = "  → " if origin.startswith("派生") else "  "
+        origin = src.get(dest, SRC_BUILTIN)
+        arrow = "  → " if origin.startswith("derived") else "  "
         print(f"{arrow}{dest:16s}= {val}   ({origin})")
     print(f"  config: {resolved.config_path}")
 
@@ -522,4 +537,4 @@ def write_last(resolved: ResolvedConfig) -> None:
     try:
         save_config(resolved.config_path, config)
     except OSError as exc:
-        print(f"(警告) 无法写入 _last: {exc}")
+        print(f"(warning) failed to write _last: {exc}")
