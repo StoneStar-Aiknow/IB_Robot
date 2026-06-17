@@ -2,6 +2,7 @@
 
 import builtins
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -352,6 +353,38 @@ def test_attention_viz_request_uses_robot_config_only():
 
     assert enabled is False
     assert mode == "file"
+
+
+def test_generate_teleop_nodes_injects_target_joint_names_into_device_config():
+    nodes = generate_teleop_nodes(
+        {
+            "joints": {
+                "arm": ["1", "2", "3", "4", "5"],
+                "gripper": ["6"],
+            },
+            "teleoperation": {
+                "enabled": True,
+                "active_device": "left_leader",
+                "devices": [
+                    {
+                        "name": "left_leader",
+                        "type": "leader_arm",
+                        "port": "/dev/ttyACM0",
+                        "target": {
+                            "arm_joint_names": ["joint1_left", "joint2_left"],
+                            "gripper_joint_names": ["joint6_left"],
+                        },
+                    }
+                ],
+            },
+        }
+    )
+
+    params = _node_parameters(nodes[0])
+    device_config = json.loads(params["device_config"].strip("'"))
+
+    assert device_config["arm_joint_names"] == ["joint1_left", "joint2_left"]
+    assert device_config["gripper_joint_names"] == ["joint6_left"]
 
 
 def test_generate_joy_teleop_nodes_for_mobile_base():

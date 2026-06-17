@@ -139,6 +139,9 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
     if "joint_mapping" in device_config:
         device_param["joint_mapping"] = device_config["joint_mapping"]
 
+    device_param["arm_joint_names"] = arm_joint_names
+    device_param["gripper_joint_names"] = gripper_joint_names
+
     # Add joint limits for proper scaling
     if joint_limits:
         device_param["joint_limits"] = joint_limits
@@ -197,8 +200,6 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
         device_param_ext = dict(device_param)
         device_param_ext.update(
             {
-                "arm_joint_names": arm_joint_names,
-                "gripper_joint_names": gripper_joint_names,
                 "home_joint_positions": home_positions_list,
                 "base_link_name": base_link_name,
                 "control_frequency": 50.0,
