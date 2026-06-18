@@ -1,19 +1,13 @@
-"""VLM API client re-export for the planner package.
-
-The implementation lives in ``perception_service.api_client`` so that the
-HTTP/payload/auth/timeout logic is owned by exactly one module.
-``vlm_task_planner`` only needs an alias named :meth:`plan` to keep the
-planner-side vocabulary ("plan a skill sequence") explicit.
-"""
+"""VLM API client wrapper for the planner package."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from perception_service.api_client import VLMAPIClient as _PerceptionVLMAPIClient
+from embodied_common.vlm_api_client import VLMAPIClient as _SharedVLMAPIClient
 
 
-class VLMAPIClient(_PerceptionVLMAPIClient):
+class VLMAPIClient(_SharedVLMAPIClient):
     """Thin alias that exposes ``plan`` as a synonym for ``analyze``."""
 
     def plan(

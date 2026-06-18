@@ -127,10 +127,14 @@ Task / Skill request
 当前只允许以下技能：
 
 - `inspect_scene`
-- `pick_named_target`
-- `place_named_pose`
+- `open_gripper_skill`
+- `close_gripper_skill`
 - `recover_safe_pose`
+- `recover_zero_pose`
 - `move_relative_ee`
+- `rotate_gripper_cw`
+- `rotate_gripper_ccw`
+- `dance_basic`
 
 除此之外一律拒绝。
 
@@ -142,8 +146,8 @@ Task / Skill request
 | --- | --- |
 | `inspect_scene` | 必须存在 `observe_table` 命名位姿 |
 | `recover_safe_pose` | 必须存在 `home` 命名位姿 |
-| `pick_named_target` | `target_name` 必须存在于 `named_targets` |
-| `place_named_pose` | `place_name` 必须存在于 `named_poses` |
+| `recover_zero_pose` | 必须存在 `zero` 命名位姿 |
+| 其他技能 | 必须存在于 `skill_templates` 白名单配置中 |
 
 ### 原子动作白名单
 
@@ -155,6 +159,8 @@ Task / Skill request
 - `move_through_joint_positions`
 - `open_gripper`
 - `close_gripper`
+- `rotate_gripper_cw`
+- `rotate_gripper_ccw`
 
 ### 原子动作边界检查
 
@@ -232,7 +238,7 @@ ros2 service list | grep embodied
 
 ```bash
 ros2 service call /embodied/validate_skill ibrobot_msgs/srv/ValidateSkill \
-  "{skill_name: pick_named_target, target_name: demo_object, place_name: ''}"
+  "{skill_name: inspect_scene, target_name: '', place_name: ''}"
 ```
 
 ## 8. 当前限制

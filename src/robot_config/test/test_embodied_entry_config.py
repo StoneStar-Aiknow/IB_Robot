@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from robot_config.loader import load_robot_config_dict
+from robot_config.loader import load_robot_config, load_robot_config_dict, validate_config
 
 
 @pytest.mark.parametrize(
@@ -61,3 +61,13 @@ def test_embodied_named_pose_skills_map_to_configured_poses(skill_name, pose_nam
     assert skill_templates[skill_name]["primitive_sequence"] == [
         {"primitive_name": "move_to_named_pose", "pose_name": pose_name}
     ]
+
+
+def test_enabled_embodied_config_uses_configured_default_place_pose():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config = load_robot_config(config_path)
+
+    config.embodied.enabled = True
+
+    assert validate_config(config) == []
+    assert config.embodied.default_place_name in config.embodied.named_poses

@@ -4,7 +4,7 @@
   <name>robot_config</name>
   <version>0.0.1</version>
   <description>Unified robot configuration system for ros2_control and peripherals</description>
-  <maintainer email="your@email.com">Your Name</maintainer>
+  <maintainer email="liuweihong8@huawei.com">liuweihong</maintainer>
   <license>Apache-2.0</license>
 
   <depend>rclpy</depend>
@@ -15,6 +15,7 @@
   <depend>rclcpp_components</depend>
   <depend>rosgraph_msgs</depend>
   <depend>controller_manager_msgs</depend>
+  <depend>embodied_common</depend>
 
   <!-- Camera drivers (executed, not linked) -->
   <exec_depend>usb_cam</exec_depend>
@@ -29,12 +30,6 @@
   <exec_depend>omni_wheel_controller</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
   <depend>voice_asr_service</depend>
-  <exec_depend>embodied_agent</exec_depend>
-  <exec_depend>embodied_common</exec_depend>
-  <exec_depend>skill_library</exec_depend>
-  <exec_depend>safety_guard</exec_depend>
-  <exec_depend>vlm_task_planner</exec_depend>
-  <exec_depend>perception_service</exec_depend>
 
   <!-- ros2_control -->
   <exec_depend>ros2_control</exec_depend>

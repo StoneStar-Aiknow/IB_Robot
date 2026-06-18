@@ -13,8 +13,6 @@
   <depend>cv_bridge</depend>
   <depend>ibrobot_msgs</depend>
   <depend>embodied_common</depend>
-  <depend>embodied_agent</depend>
-  <depend>perception_service</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

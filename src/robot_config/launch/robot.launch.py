@@ -104,7 +104,6 @@ from launch_ros.actions import Node
 
 # Import node generators from launch_builders modules
 from robot_config.launch_builders.control import generate_ros2_control_nodes
-from robot_config.launch_builders.embodied import generate_embodied_nodes
 from robot_config.launch_builders.execution import generate_execution_nodes
 from robot_config.launch_builders.hardware_mock import (
     mock_mode_skips_subsystem,
@@ -646,18 +645,12 @@ def launch_setup(context, *args, **kwargs):
         logger.info("Continuing without MoveIt...")
 
     # ========== 10.5 Generate Embodied Minimal-Closure Nodes ==========
-    try:
-        embodied_nodes = generate_embodied_nodes(robot_config, active_control_mode)
-        if embodied_nodes:
-            if controller_ready_waiter is not None:
-                logger.info("Deferring embodied nodes until required controllers are active...")
-                controller_dependent_actions.extend(embodied_nodes)
-            else:
-                actions.extend(embodied_nodes)
-            logger.info(f"Prepared {len(embodied_nodes)} embodied node(s)")
-    except Exception as e:
-        logger.error(f"generating embodied nodes: {e}")
-        raise
+    if robot_config.get("embodied", {}).get("enabled", False):
+        logger.warning(
+            "robot_config no longer launches embodied runtime nodes directly. "
+            "Use the dedicated embodied bringup launch entry to start "
+            "the base robot launch plus embodied runtime nodes."
+        )
 
     # ========== 11.5 Generate Task Executor Node ==========
     try:

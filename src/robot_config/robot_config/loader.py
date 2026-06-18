@@ -7,6 +7,8 @@ from typing import Any
 
 import yaml
 
+from embodied_common.skill_templates import SUPPORTED_PRIMITIVES, SUPPORTED_SKILLS
+from embodied_common.trajectory_templates import expand_trajectory_template
 from robot_config.config import (
     CameraConfig,
     ContractAction,
@@ -18,7 +20,6 @@ from robot_config.config import (
     Ros2ControlConfig,
     VoiceASRConfig,
 )
-from robot_config.generators.skill_trajectories import expand_trajectory_template
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 from .utils import resolve_calibration_paths_from_config, resolve_ros_path
@@ -365,6 +366,60 @@ def _robot_config_to_validation_dict(config: RobotConfig) -> dict[str, Any]:
     return {"ros2_control": params}
 
 
+def _validate_vlm_scene_sources(
+    errors: list[str],
+    section_path: str,
+    scene_sources: dict[str, Any],
+    required_reason: str,
+) -> None:
+    if not scene_sources.get("primary_camera_topic"):
+        errors.append(f"{section_path}.scene_sources.primary_camera_topic is required when {required_reason}")
+    if bool(scene_sources.get("require_depth", False)) and not (
+        scene_sources.get("primary_aligned_depth_topic") or scene_sources.get("wrist_aligned_depth_topic")
+    ):
+        errors.append(f"{section_path}.scene_sources.require_depth=true requires at least one aligned depth topic")
+    if bool(scene_sources.get("require_pointcloud", False)) and not (
+        scene_sources.get("primary_pointcloud_topic") or scene_sources.get("wrist_pointcloud_topic")
+    ):
+        errors.append(f"{section_path}.scene_sources.require_pointcloud=true requires at least one pointcloud topic")
+
+
+def _validate_vlm_api_config(
+    errors: list[str],
+    section_path: str,
+    vlm_api: dict[str, Any],
+    valid_providers: set[str],
+    required_reason: str,
+) -> None:
+    provider = str(vlm_api.get("provider", "")).strip()
+    if not provider:
+        errors.append(f"{section_path}.vlm_api.provider is required when {required_reason}")
+    elif provider not in valid_providers:
+        errors.append(f"{section_path}.vlm_api.provider must be one of: " + ", ".join(sorted(valid_providers)))
+    if not vlm_api.get("model"):
+        errors.append(f"{section_path}.vlm_api.model is required when {required_reason}")
+    if provider == "kimicode" and not str(vlm_api.get("api_key_env", "")).strip():
+        errors.append(f"{section_path}.vlm_api.api_key_env is required when {required_reason}")
+    if not vlm_api.get("base_url"):
+        errors.append(f"{section_path}.vlm_api.base_url is required when {required_reason}")
+
+
+def _validate_vlm_runtime_config(
+    errors: list[str],
+    section_path: str,
+    config: dict[str, Any],
+    timeout_policy: dict[str, Any],
+    valid_providers: set[str],
+    required_reason: str,
+) -> None:
+    _validate_vlm_scene_sources(errors, section_path, config.get("scene_sources", {}), required_reason)
+    if float(timeout_policy.get("scene_freshness_sec", 0.0)) <= 0.0:
+        errors.append("embodied.timeouts.scene_freshness_sec must be greater than zero")
+    _validate_vlm_api_config(errors, section_path, config.get("vlm_api", {}), valid_providers, required_reason)
+    if float(timeout_policy.get("model_idle_timeout_sec", 0.0)) <= 0.0:
+        errors.append("embodied.timeouts.model_idle_timeout_sec must be greater than zero")
+
+
 def validate_config(config: RobotConfig) -> list[str]:
     """Validate robot configuration.
 
@@ -422,33 +477,18 @@ def validate_config(config: RobotConfig) -> list[str]:
     if config.embodied.enabled:
         valid_directions = {"forward", "backward", "left", "right", "up", "down"}
         valid_planner_modes = {"rule", "vlm_api", "hybrid"}
-        valid_skills = {
-            "inspect_scene",
-            "open_gripper_skill",
-            "close_gripper_skill",
-            "recover_safe_pose",
-            "recover_zero_pose",
-            "move_relative_ee",
-            "rotate_gripper_cw",
-            "rotate_gripper_ccw",
-            "dance_basic",
-        }
+        valid_skills = SUPPORTED_SKILLS
         required_pose_names = {"home", "observe_table", "zero"}
         missing_pose_names = sorted(p for p in required_pose_names if p not in config.embodied.named_poses)
         if missing_pose_names:
             errors.append("embodied.named_poses is missing required pose(s): " + ", ".join(missing_pose_names))
+        if config.embodied.default_place_name and config.embodied.default_place_name not in config.embodied.named_poses:
+            errors.append(
+                f"embodied.default_place_name references undefined pose: {config.embodied.default_place_name}"
+            )
 
+        supported_primitives = SUPPORTED_PRIMITIVES
         skill_templates = config.embodied.skill_templates or {}
-        supported_primitives = {
-            "move_to_named_pose",
-            "move_relative_ee",
-            "open_gripper",
-            "close_gripper",
-            "rotate_gripper_cw",
-            "rotate_gripper_ccw",
-            "move_to_joint_positions",
-            "move_through_joint_positions",
-        }
         for skill_name, template in skill_templates.items():
             if skill_name not in valid_skills:
                 errors.append(f"embodied.skill_templates contains unsupported skill key: {skill_name}")
@@ -561,42 +601,15 @@ def validate_config(config: RobotConfig) -> list[str]:
         if planner_mode not in valid_planner_modes:
             errors.append("embodied.planner.mode must be one of: " + ", ".join(sorted(valid_planner_modes)))
 
-        scene_sources = planner.get("scene_sources", {})
         if planner_mode in {"vlm_api", "hybrid"}:
-            if not scene_sources.get("primary_camera_topic"):
-                errors.append(
-                    "embodied.planner.scene_sources.primary_camera_topic is required when planner.mode uses VLM"
-                )
-            if float(timeout_policy.get("scene_freshness_sec", 0.0)) <= 0.0:
-                errors.append("embodied.timeouts.scene_freshness_sec must be greater than zero")
-            if bool(scene_sources.get("require_depth", False)) and not (
-                scene_sources.get("primary_aligned_depth_topic") or scene_sources.get("wrist_aligned_depth_topic")
-            ):
-                errors.append(
-                    "embodied.planner.scene_sources.require_depth=true requires at least one aligned depth topic"
-                )
-            if bool(scene_sources.get("require_pointcloud", False)) and not (
-                scene_sources.get("primary_pointcloud_topic") or scene_sources.get("wrist_pointcloud_topic")
-            ):
-                errors.append(
-                    "embodied.planner.scene_sources.require_pointcloud=true requires at least one pointcloud topic"
-                )
-            vlm_api = planner.get("vlm_api", {})
-            planner_provider = str(vlm_api.get("provider", "")).strip()
-            if not planner_provider:
-                errors.append("embodied.planner.vlm_api.provider is required when planner.mode uses VLM")
-            elif planner_provider not in valid_vlm_api_providers:
-                errors.append(
-                    "embodied.planner.vlm_api.provider must be one of: " + ", ".join(sorted(valid_vlm_api_providers))
-                )
-            if not vlm_api.get("model"):
-                errors.append("embodied.planner.vlm_api.model is required when planner.mode uses VLM")
-            if planner_provider == "kimicode" and not str(vlm_api.get("api_key_env", "")).strip():
-                errors.append("embodied.planner.vlm_api.api_key_env is required when planner.mode uses VLM")
-            if not vlm_api.get("base_url"):
-                errors.append("embodied.planner.vlm_api.base_url is required when planner.mode uses VLM")
-            if float(timeout_policy.get("model_idle_timeout_sec", 0.0)) <= 0.0:
-                errors.append("embodied.timeouts.model_idle_timeout_sec must be greater than zero")
+            _validate_vlm_runtime_config(
+                errors,
+                "embodied.planner",
+                planner,
+                timeout_policy,
+                valid_vlm_api_providers,
+                "planner.mode uses VLM",
+            )
 
         planning_policy = planner.get("planning_policy", {})
         allowed_skills = planning_policy.get("allowed_skills", [])
@@ -623,41 +636,14 @@ def validate_config(config: RobotConfig) -> list[str]:
                 errors.append("embodied.perception.request_topic is required when perception is enabled")
             if not str(perception.get("result_topic", "")).strip():
                 errors.append("embodied.perception.result_topic is required when perception is enabled")
-            p_sources = perception.get("scene_sources", {})
-            if not p_sources.get("primary_camera_topic"):
-                errors.append(
-                    "embodied.perception.scene_sources.primary_camera_topic is required when perception is enabled"
-                )
-            if float(timeout_policy.get("scene_freshness_sec", 0.0)) <= 0.0:
-                errors.append("embodied.timeouts.scene_freshness_sec must be greater than zero")
-            if bool(p_sources.get("require_depth", False)) and not (
-                p_sources.get("primary_aligned_depth_topic") or p_sources.get("wrist_aligned_depth_topic")
-            ):
-                errors.append(
-                    "embodied.perception.scene_sources.require_depth=true requires at least one aligned depth topic"
-                )
-            if bool(p_sources.get("require_pointcloud", False)) and not (
-                p_sources.get("primary_pointcloud_topic") or p_sources.get("wrist_pointcloud_topic")
-            ):
-                errors.append(
-                    "embodied.perception.scene_sources.require_pointcloud=true requires at least one pointcloud topic"
-                )
-            p_vlm_api = perception.get("vlm_api", {})
-            p_provider = str(p_vlm_api.get("provider", "")).strip()
-            if not p_provider:
-                errors.append("embodied.perception.vlm_api.provider is required when perception is enabled")
-            elif p_provider not in valid_vlm_api_providers:
-                errors.append(
-                    "embodied.perception.vlm_api.provider must be one of: " + ", ".join(sorted(valid_vlm_api_providers))
-                )
-            if not p_vlm_api.get("model"):
-                errors.append("embodied.perception.vlm_api.model is required when perception is enabled")
-            if p_provider == "kimicode" and not str(p_vlm_api.get("api_key_env", "")).strip():
-                errors.append("embodied.perception.vlm_api.api_key_env is required when perception is enabled")
-            if not p_vlm_api.get("base_url"):
-                errors.append("embodied.perception.vlm_api.base_url is required when perception is enabled")
-            if float(timeout_policy.get("model_idle_timeout_sec", 0.0)) <= 0.0:
-                errors.append("embodied.timeouts.model_idle_timeout_sec must be greater than zero")
+            _validate_vlm_runtime_config(
+                errors,
+                "embodied.perception",
+                perception,
+                timeout_policy,
+                valid_vlm_api_providers,
+                "perception is enabled",
+            )
 
         if float(timeout_policy.get("task_budget_sec", 0.0)) <= 0.0:
             errors.append("embodied.timeouts.task_budget_sec must be greater than zero")

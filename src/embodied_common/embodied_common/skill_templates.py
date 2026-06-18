@@ -39,6 +39,7 @@ DEFAULT_SKILL_TEMPLATES: dict[str, dict[str, Any]] = {
     },
 }
 
+SUPPORTED_SKILLS = set(DEFAULT_SKILL_TEMPLATES.keys()).union({"dance_basic"})
 DEFAULT_ALLOWED_SKILLS = list(DEFAULT_SKILL_TEMPLATES.keys())
 
 

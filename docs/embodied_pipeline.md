@@ -131,19 +131,21 @@ ASR 文本
 
 **职责**：中文自然语言 → `PlannedTask`（含 `skill_sequence`）的规则映射。
 
-**支持的指令类型**（17 类）：
+**当前支持的指令类型**：
 
 | 指令示例 | task_type | skill_sequence |
 |---|---|---|
-| 抓香蕉放右边 | pick_and_place | `["pick_named_target", "place_named_pose"]` |
-| 抓香蕉 | pick_only | `["pick_named_target"]` |
 | 打开夹爪 / 开爪 | open_gripper | `["open_gripper_skill"]` |
 | 关闭夹爪 / 夹紧 | close_gripper | `["close_gripper_skill"]` |
 | 往前一点 | relative_motion | `["move_relative_ee"]` |
 | 回到 home | recover_safe_pose | `["recover_safe_pose"]` |
+| 到零点 | recover_zero_pose | `["recover_zero_pose"]` |
 | 观察桌面 | observe_scene | `["inspect_scene"]` |
 | 顺时针旋转 45 度 | rotate_gripper_cw | `["rotate_gripper_cw"]` |
+| 逆时针旋转 45 度 | rotate_gripper_ccw | `["rotate_gripper_ccw"]` |
 | ... | ... | ... |
+
+抓取、放置和目标物操作类文本当前会被显式拒绝；物体 grounding、pick/place、hover/retreat 等能力需等待后续物理抓取链路接入。
 
 ---
 
@@ -153,8 +155,8 @@ ASR 文本
 
 **规划模式**（`planner_mode` 参数）：
 - `hybrid`（默认）：先尝试 VLM，confidence < 0.7 或失败则 fallback 规则
-- `vlm_only`：强制 VLM，失败则拒绝
-- `rule_only`：仅规则规划（不调用 API）
+- `vlm_api`：使用 VLM 规划
+- `rule`：仅规则规划（不调用 API）
 
 **关键流程**：
 ```
@@ -164,7 +166,7 @@ SceneSnapshotBuffer 采集场景快照（front + wrist 相机 + ee_pose + joint_
     ↓
 build_chat_messages() 构建多模态 Prompt
     ↓
-VLMAPIClient.chat() → KimiCode API
+    VLMAPIClient.analyze()/plan() → KimiCode 或 OpenAI-compatible API
     ↓
 parse_planner_response() 解析 JSON 响应
     ↓
@@ -291,21 +293,18 @@ for each primitive:
 
 ## 四、Skill 模板系统
 
-技能通过 JSON 模板定义，默认内置 12 个技能：
+技能通过 `robot.embodied.skill_templates` 定义，当前最小闭环默认包含以下技能：
 
 ```
 inspect_scene          → [move_to_named_pose(observe_table)]
 recover_safe_pose      → [move_to_named_pose(home)]
-pick_named_target      → [pregrasp → grasp → close_gripper → lift]
-place_named_pose       → [move_to_named_pose(place) → open_gripper]
+recover_zero_pose      → [move_to_named_pose(zero)]
 open_gripper_skill     → [open_gripper]
 close_gripper_skill    → [close_gripper]
 move_relative_ee       → [move_relative_ee(from_request)]
-approach_named_target  → [move_to_named_pose(pregrasp_pose)]
-hover_named_target     → [move_to_named_pose(hover_pose)]
-lift_named_target      → [move_to_named_pose(lift_pose)]
-retreat_from_target    → [move_to_named_pose(retreat_pose)]
-release_at_named_pose  → [move_to_named_pose(place) → open_gripper]
+rotate_gripper_cw      → [rotate_gripper_cw]
+rotate_gripper_ccw     → [rotate_gripper_ccw]
+dance_basic            → [move_through_joint_positions]
 ```
 
 可通过 `skill_templates_json` 参数覆盖或扩展。
@@ -319,47 +318,47 @@ release_at_named_pose  → [move_to_named_pose(place) → open_gripper]
 ```yaml
 embodied:
   enabled: false          # 主开关，true 时启动全部具身节点
-  vlm_api:
-    provider: kimicode
-    api_key_env: KIMICODE_API_KEY
-    base_url: https://api.kimi.com/coding/v1
-    model: kimi-latest
-    timeout_sec: 120.0
+  planner:
+    mode: hybrid
+    vlm_api:
+      provider: kimicode
+      api_key_env: KIMICODE_API_KEY
+      base_url: https://api.kimi.com/coding/v1
+      model: kimi-latest
 ```
 
 启动命令：
 ```bash
 export KIMICODE_API_KEY=your_key_here
-ros2 launch robot_config embodied_pipeline.launch.py
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
+  robot_config:=so101_single_arm \
+  control_mode:=moveit_planning \
+  use_sim:=true
 ```
 
 ---
 
 ## 六、典型执行链路示例
 
-### 场景：语音说"帮我把香蕉放到右边托盘"
+### 场景：语音说"夹爪往前一点"
 
 ```
-1. ASR → /voice_command: "帮我把香蕉放到右边托盘"
+1. ASR → /voice_command: "夹爪往前一点"
 2. task_entry_node:
-   - parse_text_command() → 命中 pick_and_place
+   - parse_text_command() → 命中 relative_motion
    - 直接发布 /embodied/planned_task
-   - skill_sequence = ["pick_named_target", "place_named_pose"]
-   - target_name = "banana", place_name = "tray_right"
+   - skill_sequence = ["move_relative_ee"]
+   - motion_direction = "forward"
 
 3. task_executor_node:
-   - 技能1: pick_named_target
+   - 技能: move_relative_ee
      → SkillCommand → skill_executor
-     → validate_skill → safety_guard ✓
-     → primitives: pregrasp → grasp → close_gripper → lift
-     → 每步 validate_primitive → safety_guard ✓
-     → 发布 /cmd_pose（×3）+ 夹爪控制
-   - 技能2: place_named_pose
-     → SkillCommand → skill_executor
-     → primitives: move_to tray_right → open_gripper
-     → 发布 /cmd_pose + 夹爪控制
+     → validate_skill → safety_guard
+     → primitive: move_relative_ee
+     → validate_primitive → safety_guard
+     → 发布 /cmd_pose
 
-4. 状态流: planned → executing(pick) → executing(place) → completed
+4. 状态流: planned → executing(move_relative_ee) → completed
    → 发布到 /embodied/task_status
 ```
 
@@ -377,5 +376,5 @@ ros2 launch robot_config embodied_pipeline.launch.py
    - VLMAPIClient → KimiCode API
    - 解析响应 → 发布 /embodied/planned_task
 
-4. task_executor_node → skill_executor_node → 执行动作序列
+4. task_executor_node → skill_executor_node → 执行 `inspect_scene` 或保守拒绝/降级
 ```

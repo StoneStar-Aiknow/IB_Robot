@@ -15,7 +15,7 @@
 
 | 控制方式 | 入口 | 适合场景 |
 | --- | --- | --- |
-| 自然语言任务 | `/voice_command` | 直接说“把香蕉夹起来”“把夹爪移动到香蕉上方” |
+| 自然语言任务 | `/voice_command` | 当前规则入口支持观察、回位、夹爪开合、相对移动和夹爪旋转 |
 | 技能级控制 | `/embodied/execute_skill` | 明确指定技能名，做稳定、可控的动作编排 |
 | primitive 级控制 | `/embodied/execute_primitive` | 直接控制命名位姿、相对位移、关节轨迹、夹爪开合 |
 
@@ -34,19 +34,23 @@
 
 ## 2. 当前支持的技能
 
-当前技能由 `robot_config` 中的 `skill_templates` 统一配置，默认支持：
+当前技能由 `robot_config` 中的 `skill_templates` 统一配置。技能 action 层可解析
+模板化技能；自然语言规则入口当前只会生成最小闭环动作，抓取/放置/目标物操作会被
+显式拒绝，等待后续 VLM 或物理抓取链路补齐。
+
+默认支持：
 
 | 技能名 | 作用 | 典型输入 |
 | --- | --- | --- |
 | `inspect_scene` | 移动到观察位看桌面 | “观察桌面” |
-| `observe_target_area` | 移动到目标观察位 | “观察香蕉” |
+| `observe_target_area` | 移动到目标观察位 | 显式 SkillCommand / VLM 路径 |
 | `approach_named_target` | 接近目标预抓取位 | “靠近香蕉” |
 | `hover_named_target` | 移动到目标上方悬停位 | “移动到香蕉上方” |
-| `pick_named_target` | 预抓取 -> 抓取 -> 闭合夹爪 -> 抬起 | “把香蕉夹起来” |
-| `lift_named_target` | 把已抓取目标抬起 | “把香蕉抬起来” |
+| `pick_named_target` | 预抓取 -> 抓取 -> 闭合夹爪 -> 抬起 | 显式 SkillCommand / VLM 路径 |
+| `lift_named_target` | 把已抓取目标抬起 | 显式 SkillCommand / VLM 路径 |
 | `retreat_from_target` | 从目标位置后撤 | “从香蕉旁边后撤” |
-| `place_named_pose` | 移动到放置位并张开夹爪 | “放到右侧托盘” |
-| `release_at_named_pose` | 移动到指定放置位并释放 | “在右侧托盘松开夹爪” |
+| `place_named_pose` | 移动到放置位并张开夹爪 | 显式 SkillCommand / VLM 路径 |
+| `release_at_named_pose` | 移动到指定放置位并释放 | 显式 SkillCommand / VLM 路径 |
 | `recover_safe_pose` | 回到安全位 / home 位 | “回原位” |
 | `recover_zero_pose` | 回到 zero 位 | “零点” |
 | `move_relative_ee` | 末端沿 base 坐标系相对移动 | “夹爪往前一点” |
@@ -116,16 +120,6 @@ ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '把夹爪往�
 | `看看桌面` | 移动到桌面观察位 | `inspect_scene` |
 | `查看桌面` | 移动到桌面观察位 | `inspect_scene` |
 | `观察场景` | 移动到桌面观察位 | `inspect_scene` |
-| `观察香蕉` | 移动到香蕉观察位 | `observe_target_area` |
-| `看看香蕉` | 移动到香蕉观察位 | `observe_target_area` |
-| `查看香蕉` | 移动到香蕉观察位 | `observe_target_area` |
-| `把夹爪移动到香蕉的上面` | 移动到香蕉上方悬停位 | `hover_named_target` |
-| `把夹爪往靠近香蕉的方向移动` | 接近香蕉预抓取位 | `approach_named_target` |
-| `把香蕉夹起来` | 执行抓取并抬起 | `pick_named_target` |
-| `把香蕉抬起来` | 抬起目标 | `lift_named_target` |
-| `从香蕉旁边后撤` | 从目标区域撤回 | `retreat_from_target` |
-| `把香蕉放到右侧托盘` | 移动到托盘并释放 | `place_named_pose` |
-| `在右侧托盘松开夹爪` | 在托盘位置松开夹爪 | `release_at_named_pose` |
 | `夹爪往前一点` | 末端向前相对移动一步 | `move_relative_ee` |
 | `夹爪往左一点` | 末端向左相对移动一步 | `move_relative_ee` |
 | `夹爪往上一点` | 末端向上相对移动一步 | `move_relative_ee` |
@@ -140,17 +134,6 @@ ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '把夹爪往�
 扫描桌面
 观察场景
 看看场景
-观察香蕉
-看看香蕉
-查看香蕉
-观察目标区域
-看看目标区域
-把夹爪移动到香蕉的上面
-把夹爪往靠近香蕉的方向移动
-把香蕉抬起来
-从香蕉旁边后撤
-把香蕉放到右侧托盘
-在右侧托盘松开夹爪
 夹爪往前一点
 夹爪往左一点
 夹爪往上一点
@@ -161,13 +144,10 @@ ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '把夹爪往�
 
 ```bash
 source .shrc_local && export ROS_DOMAIN_ID=42 && \
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '观察香蕉'}"
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
 
 source .shrc_local && export ROS_DOMAIN_ID=42 && \
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '把夹爪移动到香蕉的上面'}"
-
-source .shrc_local && export ROS_DOMAIN_ID=42 && \
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '把香蕉放到右侧托盘'}"
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '回原位'}"
 ```
 
 ### 5.2 直接发技能 action

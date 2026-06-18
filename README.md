@@ -442,7 +442,7 @@ bag 目录组织、`dataset.yaml` 元信息和更多转换参数，详见 `src/d
 | `record` | 是否启用录制流水线 | `false` |
 | `record_mode` | 录制模式（`continuous` / `episodic`） | `continuous` |
 | `record_visualizer` | 录制可视化器（`none` / `rerun`） | `none` |
-| `with_embodied` | 强制启用/禁用具身 AI 流水线（空则按 YAML `robot.embodied.enabled` 决定） | 空 |
+| `with_embodied` | 基础 `robot_config` launch 中保留的兼容覆盖；完整具身链路请使用 `embodied_bringup` | 空 |
 | `auto_start_controllers` | 是否在启动后自动激活控制器 | `true` |
 
 ***
@@ -466,11 +466,10 @@ IB-Robot 内置了一条完整的**具身 AI 执行链路**，以自然语言（
 ### 启动具身流水线
 
 ```bash
-ros2 launch robot_config robot.launch.py \
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
     robot_config:=so101_single_arm \
     control_mode:=moveit_planning \
     use_sim:=true \
-    with_embodied:=true \
     moveit_display:=false
 ```
 
@@ -482,9 +481,6 @@ ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '当前摄像�
 
 # 相对移动
 ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
-
-# 抓取任务
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '抓取目标物并放到右侧托盘'}"
 
 # 回安全位
 ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '回原位'}"

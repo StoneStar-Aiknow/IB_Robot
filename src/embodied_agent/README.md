@@ -41,15 +41,14 @@
 ```bash
 cd ~/IB_Robot
 source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.sh && \
-ros2 launch robot_config robot.launch.py \
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
   robot_config:=so101_single_arm \
   control_mode:=moveit_planning \
   use_sim:=true \
-  with_embodied:=true \
   moveit_display:=false
 ```
 
-其中 `with_embodied:=true` 会临时覆盖：
+`embodied_bringup` 会读取同一份 `robot_config` YAML，并临时覆盖：
 
 - `robot.embodied.enabled=true`
 
@@ -91,7 +90,7 @@ ros2 launch robot_config robot.launch.py \
 | `planned_output_topic` | `/embodied/planned_task` | 规则直达输出 |
 | `status_topic` | `/embodied/task_status` | 规则直达时的任务状态输出 |
 | `default_target_name` | `demo_object` | 规则直达时使用的默认命名目标 |
-| `default_place_name` | `tray_right` | 规则直达时使用的默认放置位姿 |
+| `default_place_name` | `home` | 保留参数；当前规则规划不会生成放置技能 |
 | `default_relative_motion_step_m` | `0.03` | “一点”默认映射步长（米） |
 | `default_task_timeout_sec` | `180.0` | 单个任务的端到端总超时预算 |
 | `debug_tracing` | `false` | 是否打印调试日志 |
@@ -107,15 +106,16 @@ ros2 launch robot_config robot.launch.py \
 | `观察点` / `观察位置` / `观察桌面` / `看看桌面` / `观察场景` | `inspect_scene` |
 | `原位` / `原点` / `回到home` / `回原位` / `回安全位` | `recover_safe_pose` |
 | `零点` / `零位` / `回零点` / `到零点` | `recover_zero_pose` |
-| `抓取目标物并放到右侧托盘` | `pick_named_target` -> `place_named_pose` |
 | `夹爪往前/后/左/右/上/下一点` | `move_relative_ee` |
-| 仅包含抓取类词汇（抓 / 拿 / 取） | `pick_named_target` |
-| 仅包含放置类词汇（放） | `place_named_pose` |
+| `打开夹爪` / `开爪` | `open_gripper_skill` |
+| `关闭夹爪` / `夹紧` | `close_gripper_skill` |
+| `顺时针旋转 45 度` | `rotate_gripper_cw` |
+| `逆时针旋转 45 度` | `rotate_gripper_ccw` |
 
 ### 当前约束
 
 - 这是**规则规划器**，不是通用大模型 Planner。
-- 目标物和放置位当前会映射到 YAML 中的默认命名目标与命名位姿。
+- 抓取、放置和目标物操作类文本当前会被显式拒绝，不会映射为 pick/place 技能。
 - 不支持的文本会直接拒绝，并在 `/embodied/task_status` 发布 `rejected`。
 
 ### 当前接口
@@ -134,7 +134,7 @@ ros2 launch robot_config robot.launch.py \
 | `output_topic` | `/embodied/planned_task` | 规划输出 |
 | `status_topic` | `/embodied/task_status` | 任务状态输出 |
 | `default_target_name` | `demo_object` | 默认命名目标 |
-| `default_place_name` | `tray_right` | 默认放置位姿 |
+| `default_place_name` | `home` | 保留参数；当前规则规划不会生成放置技能 |
 | `default_relative_motion_step_m` | `0.03` | “一点”默认映射步长（米） |
 | `debug_tracing` | `false` | 是否打印规划调试日志 |
 
@@ -225,7 +225,7 @@ ros2 launch robot_config robot.launch.py \
 当前已经验证通过的仿真命令路径：
 
 ```bash
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '抓取目标物并放到右侧托盘'}"
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
 ```
 
 可以观测到：
@@ -236,15 +236,15 @@ ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '抓取目标�
 4. 技能 action 被依次调用
 5. 最终 `TaskStatus.state=completed`
 
-当前也支持相对位移类命令，例如：
+当前也支持夹爪开合类命令，例如：
 
 ```bash
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '打开夹爪'}"
 ```
 
 这类命令会被规划成单技能：
 
-- `move_relative_ee`
+- `open_gripper_skill`
 
 当前还支持直接移动到配置好的 named pose：
 

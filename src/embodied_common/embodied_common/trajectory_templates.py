@@ -1,15 +1,17 @@
-"""Skill trajectory generators for config-driven motion templates."""
+"""Trajectory template expansion for config-driven embodied skills."""
 
 from __future__ import annotations
 
 import math
+import os
+import re
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree as ET
 
-from robot_config.utils import resolve_ros_path
+from ament_index_python.packages import get_package_share_directory
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,22 @@ class ArmKinematicModel:
 MODEL_URDF_PATHS = {
     "so101_arm_v1": "$(find robot_description)/urdf/lerobot/so101/so101_base.xacro",
 }
+
+
+def _resolve_ros_path(path: str) -> str:
+    """Resolve the small subset of ROS substitutions used by trajectory templates."""
+
+    find_pattern = re.compile(r"\$\(find\s+(\w+)\)")
+    for match in find_pattern.finditer(path):
+        pkg_name = match.group(1)
+        path = path.replace(f"$(find {pkg_name})", get_package_share_directory(pkg_name))
+
+    env_pattern = re.compile(r"\$\(env\s+(\w+)\)")
+    for match in env_pattern.finditer(path):
+        var_name = match.group(1)
+        path = path.replace(f"$(env {var_name})", os.environ.get(var_name, ""))
+
+    return path
 
 
 def _as_float(value: Any, field_name: str) -> float:
@@ -149,7 +167,7 @@ def load_kinematic_model(model_name: str) -> ArmKinematicModel:
     if model_name not in MODEL_URDF_PATHS:
         raise ValueError(f"Unsupported workspace model: {model_name}")
 
-    urdf_path = Path(resolve_ros_path(MODEL_URDF_PATHS[model_name]))
+    urdf_path = Path(_resolve_ros_path(MODEL_URDF_PATHS[model_name]))
     root = ET.parse(urdf_path).getroot()
 
     joints: list[JointKinematics] = []

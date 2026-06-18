@@ -32,6 +32,13 @@ ignore = [
 [tool.ruff.lint.isort]
 known-first-party = [
     "robot_config",
+    "embodied_agent",
+    "embodied_common",
+    "embodied_bringup",
+    "perception_service",
+    "safety_guard",
+    "skill_library",
+    "vlm_task_planner",
     "robot_mcp",
     "action_dispatch",
     "inference_service",

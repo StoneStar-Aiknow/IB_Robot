@@ -6,7 +6,7 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
-from perception_service.prompt_builder import _sanitize_user_text, append_images
+from embodied_common.vlm_prompt_builder import append_images, sanitize_user_text
 
 
 def build_chat_messages(
@@ -40,7 +40,7 @@ def build_chat_messages(
         "you MUST use inspect_scene and MUST NOT use target manipulation skills.\n"
     )
 
-    task_text = _sanitize_user_text(task_text)
+    task_text = sanitize_user_text(task_text)
     snapshot_text = json.dumps(
         {
             "task_text": task_text,

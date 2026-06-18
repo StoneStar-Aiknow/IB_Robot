@@ -1,6 +1,6 @@
 """Fallback planner that reuses the existing rule-based parser."""
 
-from embodied_agent.command_parser import parse_text_command
+from embodied_common.command_parser import parse_text_command
 from vlm_task_planner.response_parser import PlannerResult
 
 

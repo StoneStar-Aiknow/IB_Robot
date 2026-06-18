@@ -20,7 +20,6 @@ from robot_config.launch_builders.hardware_mock import (
     generate_hardware_mock_nodes,
     mock_mode_skips_subsystem,
 )
-from robot_config.launch_builders.embodied import generate_embodied_nodes
 from robot_config.launch_builders.moveit import generate_moveit_nodes
 from robot_config.launch_builders.navigation import (
     generate_navigation_nodes,
@@ -65,6 +64,4 @@ __all__ = [
     # Hardware mock
     "generate_hardware_mock_nodes",
     "mock_mode_skips_subsystem",
-    # Embodied
-    "generate_embodied_nodes",
 ]

@@ -538,7 +538,7 @@ ros2 launch robot_config robot.launch.py control_mode:=model_inference with_infe
 | `use_sim` | Use Gazebo simulation mode | `false` |
 | `control_mode` | Override default mode (`model_inference` / `moveit_planning` / `teleop`) | From YAML |
 | `with_inference`| Force enable/disable inference service | Auto-detect |
-| `with_embodied` | Force enable/disable embodied AI pipeline (empty = follow YAML `robot.embodied.enabled`) | Empty |
+| `with_embodied` | Compatibility override in the base `robot_config` launch; use `embodied_bringup` for the full embodied runtime | Empty |
 | `with_moveit`   | Force enable/disable MoveIt core | Auto-detect |
 | `moveit_display`| Launch MoveIt RViz interface | `true` |
 | `auto_start_controllers` | Automatically activate controllers on start | `true` |
@@ -564,11 +564,10 @@ IB-Robot includes a complete **embodied AI execution pipeline** that accepts nat
 ### Launching the Embodied Pipeline
 
 ```bash
-ros2 launch robot_config robot.launch.py \
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
     robot_config:=so101_single_arm \
     control_mode:=moveit_planning \
     use_sim:=true \
-    with_embodied:=true \
     moveit_display:=false
 ```
 
@@ -580,9 +579,6 @@ ros2 topic pub --once /voice_command std_msgs/msg/String "{data: 'What can you s
 
 # Relative motion
 ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
-
-# Pick-and-place task
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '抓取目标物并放到右侧托盘'}"
 
 # Return to home pose
 ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '回原位'}"

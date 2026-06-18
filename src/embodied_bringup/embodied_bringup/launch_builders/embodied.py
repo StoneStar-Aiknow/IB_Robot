@@ -8,7 +8,7 @@ from launch_ros.actions import Node
 from robot_config.logger_utils import get_colored_logger
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
-logger = get_colored_logger("robot_config.embodied")
+logger = get_colored_logger("embodied_bringup")
 
 
 def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: str) -> list[Node]:
@@ -65,7 +65,7 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
         "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
         "joint_limits_json": json.dumps(teleoperation.get("safety", {}).get("joint_limits", {})),
         "default_target_name": embodied_config.get("default_target_name", "demo_object"),
-        "default_place_name": embodied_config.get("default_place_name", "tray_right"),
+        "default_place_name": embodied_config.get("default_place_name", "home"),
         "skill_action_name": embodied_config.get("skill_action_name", "/embodied/execute_skill"),
         "primitive_action_name": embodied_config.get("primitive_action_name", "/embodied/execute_primitive"),
         "validate_skill_service": embodied_config.get("validate_skill_service", "/embodied/validate_skill"),
@@ -93,7 +93,7 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
                 "output_topic": embodied_config.get("planned_task_topic", "/embodied/planned_task"),
                 "status_topic": embodied_config.get("status_topic", "/embodied/task_status"),
                 "default_target_name": embodied_config.get("default_target_name", "demo_object"),
-                "default_place_name": embodied_config.get("default_place_name", "tray_right"),
+                "default_place_name": embodied_config.get("default_place_name", "home"),
                 "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
             }
         ],
@@ -111,7 +111,7 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
                     "output_topic": embodied_config.get("planned_task_topic", "/embodied/planned_task"),
                     "status_topic": embodied_config.get("status_topic", "/embodied/task_status"),
                     "default_target_name": embodied_config.get("default_target_name", "demo_object"),
-                    "default_place_name": embodied_config.get("default_place_name", "tray_right"),
+                    "default_place_name": embodied_config.get("default_place_name", "home"),
                     "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
                     "named_poses_json": json.dumps(named_poses),
                     "named_targets_json": json.dumps(named_targets),
@@ -223,7 +223,7 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
                     "planned_output_topic": embodied_config.get("planned_task_topic", "/embodied/planned_task"),
                     "status_topic": embodied_config.get("status_topic", "/embodied/task_status"),
                     "default_target_name": embodied_config.get("default_target_name", "demo_object"),
-                    "default_place_name": embodied_config.get("default_place_name", "tray_right"),
+                    "default_place_name": embodied_config.get("default_place_name", "home"),
                     "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
                     "default_task_timeout_sec": timeout_policy["task_budget_sec"],
                 }

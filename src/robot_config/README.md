@@ -322,8 +322,9 @@ ros2 launch robot_config robot.launch.py \
 
 ### 具身 AI 流水线（Embodied AI Pipeline）
 
-`robot_config` 通过 `robot.embodied` 字段统一管理具身 AI 链路的所有配置，并由
-`robot_config/launch_builders/embodied.py` 生成各具身节点。
+`robot_config` 通过 `robot.embodied` 字段统一管理具身 AI 链路配置，但不直接启动
+具身业务节点。完整运行时由 `embodied_bringup` 消费同一份 YAML 并编排下游节点，
+以保持依赖方向为 `embodied_bringup -> robot_config`。
 
 **前提条件**：具身流水线当前只在 `moveit_planning` 控制模式下可用。
 
@@ -331,14 +332,13 @@ ros2 launch robot_config robot.launch.py \
 
 | Launch 参数 | 作用 |
 | --- | --- |
-| `with_embodied` | 临时覆盖 `robot.embodied.enabled`，设为 `true` 时强制启动具身链路 |
+| `with_embodied` | 在 `robot_config` 基础 launch 中仅保留兼容覆盖；完整具身链路请使用 `embodied_bringup` |
 
 ```bash
-ros2 launch robot_config robot.launch.py \
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
   robot_config:=so101_single_arm \
   control_mode:=moveit_planning \
   use_sim:=true \
-  with_embodied:=true \
   moveit_display:=false
 ```
 
@@ -346,7 +346,7 @@ ros2 launch robot_config robot.launch.py \
 
 ```yaml
 embodied:
-  enabled: false              # 默认关闭；通过 with_embodied:=true 临时开启
+  enabled: false              # 默认关闭；通过 embodied_bringup launch 临时开启
   debug_tracing: true
 
   timeouts:
