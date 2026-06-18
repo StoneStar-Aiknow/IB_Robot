@@ -70,13 +70,7 @@ class LossUtils:
         print("-" * 32)
         avg_l1 = sum(arr_l1) / len(arr_l1)
         avg_cos = sum(arr_cos) / len(arr_cos)
-        if self.args.policy_type == "pi05":
-            # PI05's flow-matching ODE is chaotic; per-sample cosine is
-            # not a meaningful aggregate. See pi05_dist_metrics.py for the
-            # replacement (Wasserstein + first-frame cosine).
-            print(f"{'Avg':>6} {avg_l1:>12.6f} {'(see dist eval)':>15}")
-        else:
-            print(f"{'Avg':>6} {avg_l1:>12.6f} {avg_cos:>12.6f}")
+        print(f"{'Avg':>6} {avg_l1:>12.6f} {avg_cos:>12.6f}")
 
         # ------------------------------------------------------------------
         # Independent sanity check: compare in *normalized* (pre-postprocessor)
@@ -125,13 +119,10 @@ class LossUtils:
                     for i in range(len(arr_raw_l1)):
                         print(f"{i:>6} {arr_raw_l1[i]:>12.6f} {arr_raw_cos[i]:>12.6f}")
                     print("-" * 32)
-                    if self.args.policy_type == "pi05":
-                        print(f"{'Avg':>6} {sum(arr_raw_l1) / len(arr_raw_l1):>12.6f} {'(see dist eval)':>15}")
-                    else:
-                        print(
-                            f"{'Avg':>6} {sum(arr_raw_l1) / len(arr_raw_l1):>12.6f} "
-                            f"{sum(arr_raw_cos) / len(arr_raw_cos):>12.6f}"
-                        )
+                    print(
+                        f"{'Avg':>6} {sum(arr_raw_l1) / len(arr_raw_l1):>12.6f} "
+                        f"{sum(arr_raw_cos) / len(arr_raw_cos):>12.6f}"
+                    )
         elif raw_preds is not None and raw_targets_path and not os.path.exists(raw_targets_path):
             print(
                 f"\nNOTE: raw target file not found at {raw_targets_path}; "
