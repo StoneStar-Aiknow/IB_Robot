@@ -32,6 +32,7 @@ ignore = [
 [tool.ruff.lint.isort]
 known-first-party = [
     "robot_config",
+    "robot_mcp",
     "action_dispatch",
     "inference_service",
     "dataset_tools",
