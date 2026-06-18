@@ -16,6 +16,7 @@ from dataset_tools.policy_eval import (  # noqa: E402
     compare_prediction_documents,
     default_plot_dir,
     filter_observations_by_input_features,
+    inspect_calibration,
     load_required_input_features,
     make_eval_ticks,
     missing_topics,
@@ -78,6 +79,37 @@ def test_filter_observations_by_input_features_skips_unused_contract_topics():
     )
 
     assert [spec.topic for spec in filtered] == ["/joint_states", "/camera/top/image_raw"]
+
+
+def test_inspect_calibration_accepts_multiple_existing_files(tmp_path):
+    left = tmp_path / "left.json"
+    right = tmp_path / "right.json"
+    left.write_text("{}", encoding="utf-8")
+    right.write_text("{}", encoding="utf-8")
+
+    status = inspect_calibration(
+        {"ros2_control": {"xacro_args": {"calib_file_1": str(left), "calib_file_2": str(right)}}}
+    )
+
+    assert status.status == "available"
+    assert status.path == str(left)
+    assert status.paths == (str(left), str(right))
+    assert status.message == "calibration files exist"
+
+
+def test_inspect_calibration_reports_missing_files(tmp_path):
+    left = tmp_path / "left.json"
+    right = tmp_path / "right.json"
+    left.write_text("{}", encoding="utf-8")
+
+    status = inspect_calibration(
+        {"ros2_control": {"xacro_args": {"calib_file_1": str(left), "calib_file_2": str(right)}}}
+    )
+
+    assert status.status == "missing"
+    assert status.path == str(left)
+    assert status.paths == (str(left), str(right))
+    assert status.message == f"missing calibration files: {right}"
 
 
 def test_make_eval_ticks_applies_stride_and_limit():

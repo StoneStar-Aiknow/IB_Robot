@@ -261,6 +261,7 @@ def prepare_lerobot_env():
 # Each entry: (rad_min, rad_max, pct_span, pct_offset)
 JointConversionEntry = tuple[float, float, float, float]
 CalibrationSnapshot = dict[str, dict[str, Any]]
+CalibrationSource = str | list[str] | tuple[str, ...]
 
 _TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
 
@@ -301,19 +302,53 @@ def resolve_joint_names_from_config(robot_config: dict[str, Any]) -> list[str]:
     return [str(name) for name in joint_names]
 
 
+def _dedupe_strings(values: list[Any]) -> list[str]:
+    """Return non-empty string values in first-seen order."""
+    seen = set()
+    result: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
 def resolve_gripper_joints_from_config(robot_config: dict[str, Any]) -> list[str]:
     """Resolve gripper joint names from raw robot_config YAML content."""
     ros2_control = robot_config.get("ros2_control", {}) or {}
     joints_cfg = robot_config.get("joints", {}) or {}
-    gripper_joints = ros2_control.get("gripper_joints") or joints_cfg.get("gripper") or []
-    return [str(name) for name in gripper_joints]
+    explicit = ros2_control.get("gripper_joints")
+    if explicit:
+        return _dedupe_strings(list(explicit))
+
+    gripper_joints = list(joints_cfg.get("gripper") or [])
+    gripper_joints.extend(joints_cfg.get("left_gripper") or [])
+    gripper_joints.extend(joints_cfg.get("right_gripper") or [])
+    return _dedupe_strings(gripper_joints)
+
+
+def resolve_calibration_paths_from_config(robot_config: dict[str, Any]) -> list[str]:
+    """Resolve calibration file path list from raw robot_config."""
+    ros2_control = robot_config.get("ros2_control", {}) or {}
+    calib_file = str(ros2_control.get("calib_file", "") or "").strip()
+    if calib_file:
+        return [resolve_ros_path(calib_file)]
+
+    xacro_args = ros2_control.get("xacro_args", {}) or {}
+    numbered_calib_files = []
+    for key, value in xacro_args.items():
+        match = re.fullmatch(r"calib_file_(\d+)", str(key))
+        if match:
+            numbered_calib_files.append((int(match.group(1)), value))
+    numbered_calib_files.sort(key=lambda item: item[0])
+    calib_files = _dedupe_strings([value for _, value in numbered_calib_files])
+    return [resolve_ros_path(path) for path in calib_files]
 
 
 def resolve_calibration_path_from_config(robot_config: dict[str, Any]) -> str:
-    """Resolve the ros2_control calibration file path from raw robot_config."""
-    ros2_control = robot_config.get("ros2_control", {}) or {}
-    calib_file = str(ros2_control.get("calib_file", "") or "")
-    return resolve_ros_path(calib_file) if calib_file else ""
+    """Resolve calibration file path(s) as a path-separator encoded string."""
+    return os.pathsep.join(resolve_calibration_paths_from_config(robot_config))
 
 
 def resolve_lerobot_norm_mode(
@@ -352,12 +387,17 @@ def resolve_lerobot_norm_mode(
     return NORM_MODE_RANGE
 
 
-def load_calibration_data(calib_file: str) -> dict[str, Any]:
-    """Load a calibration JSON file from disk."""
-    resolved_path = resolve_ros_path(calib_file)
-    if not resolved_path:
-        raise FileNotFoundError("Calibration file path is empty")
+def _normalize_calibration_sources(calib_file: CalibrationSource) -> list[str]:
+    if isinstance(calib_file, list | tuple):
+        return [resolve_ros_path(str(path)) for path in calib_file if str(path or "").strip()]
+    text = str(calib_file or "").strip()
+    if not text:
+        return []
+    parts = [part for part in text.split(os.pathsep) if part]
+    return [resolve_ros_path(part) for part in parts]
 
+
+def _load_single_calibration_file(resolved_path: str) -> dict[str, Any]:
     calib_path = Path(resolved_path).expanduser().resolve()
     if not calib_path.exists():
         raise FileNotFoundError(f"Calibration file not found: {calib_path}")
@@ -367,6 +407,40 @@ def load_calibration_data(calib_file: str) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"Calibration file must contain a JSON object: {calib_path}")
     return data
+
+
+_CALIBRATION_JOINT_COUNT = 6
+
+
+def _namespace_numeric_calibration_keys(
+    calibration: dict[str, Any],
+    suffix: str,
+) -> dict[str, Any]:
+    namespaced = dict(calibration)
+    for index in range(1, _CALIBRATION_JOINT_COUNT + 1):
+        key = str(index)
+        if key in calibration:
+            namespaced[f"joint{index}_{suffix}"] = calibration[key]
+    return namespaced
+
+
+def load_calibration_data(calib_file: CalibrationSource) -> dict[str, Any]:
+    """Load one or more calibration JSON files from disk."""
+    resolved_paths = _normalize_calibration_sources(calib_file)
+    if not resolved_paths:
+        raise FileNotFoundError("Calibration file path is empty")
+
+    if len(resolved_paths) == 1:
+        return _load_single_calibration_file(resolved_paths[0])
+
+    merged: dict[str, Any] = {}
+    suffixes = ("left", "right")
+    for index, resolved_path in enumerate(resolved_paths):
+        data = _load_single_calibration_file(resolved_path)
+        if index < len(suffixes):
+            data = _namespace_numeric_calibration_keys(data, suffixes[index])
+        merged.update(data)
+    return merged
 
 
 def extract_calibration_snapshot(
@@ -434,7 +508,7 @@ def lerobot_conversion_fingerprint(
 
 
 def build_lerobot_conversion_metadata(
-    calib_file: str,
+    calib_file: CalibrationSource,
     joint_names: list[str],
     gripper_joints: list[str] | None = None,
     norm_mode: str = NORM_MODE_RANGE,
@@ -459,10 +533,12 @@ def build_lerobot_conversion_metadata(
         )
         return metadata
 
-    calibration_source = resolve_ros_path(calib_file)
-    calibration = load_calibration_data(calibration_source)
+    calibration_sources = _normalize_calibration_sources(calib_file)
+    calibration = load_calibration_data(calibration_sources)
     snapshot = extract_calibration_snapshot(calibration, ordered_joints)
-    metadata["calibration_source"] = str(Path(calibration_source).expanduser().resolve())
+    resolved_sources = [str(Path(source).expanduser().resolve()) for source in calibration_sources]
+    metadata["calibration_source"] = resolved_sources[0] if resolved_sources else ""
+    metadata["calibration_sources"] = resolved_sources
     metadata["calibration"] = snapshot
     metadata["conversion_fingerprint"] = lerobot_conversion_fingerprint(
         calibration=snapshot,
@@ -526,7 +602,7 @@ def build_joint_conversion_table_from_calibration(
 
 
 def build_joint_conversion_table(
-    calib_file: str,
+    calib_file: CalibrationSource,
     joint_names: list[str],
     gripper_joints: list[str] | None = None,
     norm_mode: str = NORM_MODE_RANGE,
@@ -554,8 +630,8 @@ def build_joint_conversion_table(
 
     Parameters
     ----------
-    calib_file : str
-        Path to the calibration JSON produced by ``calibrate_arm``.
+    calib_file : str | list[str]
+        Path(s) to calibration JSON produced by ``calibrate_arm``.
     joint_names : list[str]
         Ordered joint identifiers (e.g. ``["1","2",…,"6"]``).
     gripper_joints : list[str] | None
