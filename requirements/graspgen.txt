@@ -1,0 +1,39 @@
+# Optional dependencies for src/grasp_service.
+# Install with:
+#   ./scripts/setup.sh --with-grasp
+#
+# GraspGen itself is installed by scripts/setup/python_venv.sh from a pinned
+# editable VCS source using --no-deps so it does not overwrite the workspace's
+# Torch/NumPy versions. Keep this file to runtime dependencies that are not
+# already managed by the base IB-Robot environment.
+
+h5py
+hydra-core
+matplotlib
+meshcat
+webdataset
+scikit-learn
+scipy
+tensorboard
+trimesh==4.5.3
+transformers
+tensordict
+diffusers>=0.11.1,<0.36.0
+timm>=1.0.15,<2.0.0
+huggingface-hub>=0.25.2,<1.0
+PyOpenGL==3.1.5
+addict
+spconv-cu120
+yapf==0.40.1
+tensorboardx
+sharedarray
+torch-scatter
+yourdfpy==0.0.56
+imageio
+pyrender
+scene-synthesizer[recommend]
+pytest
+viser
+pyzmq
+msgpack
+msgpack-numpy
