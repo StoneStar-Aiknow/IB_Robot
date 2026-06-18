@@ -5,6 +5,9 @@
 # Usage:
 #   ./scripts/setup.sh                               # Interactive mode
 #   ./scripts/setup.sh --yes                         # Auto-yes mode
+#   ./scripts/setup.sh --skip-submodules             # Keep current submodule state
+#   ./scripts/setup.sh --with-perception             # Install SAM2/Grounding-DINO deps
+#   ./scripts/setup.sh --with-grasp                  # Install GraspGen deps
 #   ./scripts/setup.sh --skip-verify                 # Skip final ROS/Python verification
 #   ./scripts/setup.sh --platform <id>               # Override detected platform
 #   ./scripts/setup.sh --help                        # Show help
@@ -48,6 +51,8 @@ SUDO_AUTH_READY=false
 PLATFORM_OVERRIDE=""
 
 SKIP_VERIFY=false
+INSTALL_DETECTION_DEPS="${IBR_SETUP_WITH_DETECTION:-${IBR_SETUP_WITH_PERCEPTION:-false}}"
+INSTALL_GRASP_DEPS="${IBR_SETUP_WITH_GRASP:-false}"
 CURRENT_STAGE="initializing"
 SYSTEM_DEPS_STATUS="pending"
 PYTHON_ENV_STATUS="pending"
@@ -187,6 +192,14 @@ Options:
   -y, --yes              Auto-confirm prompts using defaults
       --sudo             Force sudo for privileged operations
       --no-sudo          Never use sudo
+      --skip-submodules  Skip submodule initialization/update
+      --with-perception  Install optional SAM2/Grounding-DINO dependencies
+                         for perception_service
+      --with-detection   Alias for --with-perception
+      --with-grasp       Install optional GraspGen dependencies for
+                         manipulation_service from pinned pip VCS sources.
+                         Requires CUDA toolkit and CUDA_HOME/nvcc for
+                         GraspGen pointnet2_ops.
 
       --skip-verify      Skip final ROS/Python verification
       --platform ID      Override platform detection
@@ -209,6 +222,9 @@ parse_args() {
             --yes|-y) AUTO_YES=true ;;
             --no-sudo) USE_SUDO=false ;;
             --sudo) USE_SUDO=true ;;
+            --skip-submodules) SKIP_SUBMODULES=true ;;
+            --with-detection|--with-detection-deps|--with-perception|--with-perception-deps) INSTALL_DETECTION_DEPS=true ;;
+            --with-grasp|--with-graspgen|--with-grasp-deps) INSTALL_GRASP_DEPS=true ;;
 
             --skip-verify) SKIP_VERIFY=true ;;
             --platform)
