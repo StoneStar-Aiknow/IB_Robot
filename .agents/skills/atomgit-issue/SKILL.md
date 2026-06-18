@@ -36,16 +36,47 @@ git remote -v
 
 脚本会自动从环境变量或 `git remote` 中推断，也可以通过参数指定。
 
+## 🏷️ 标签规范（openEuler 社区预定义，必读）
+
+IB_Robot 沿用 [openEuler 社区标签约定](https://atomgit.com/openeuler/community/blob/master/zh/sig-infrastructure/label.md)。创建 / 分类 Issue 时**只能**从下列预定义标签中选取，**严禁**自造 `bug`、`feature`、`enhancement` 等裸名标签——仓库里不存在这些标签，SDK 的 `_validate_labels_exist` 会直接报 `Unknown labels`。
+
+允许的标签词表：
+
+- **Kind**（类型，`kind/<x>`）：`api-change`、`bug`、`cleanup`、`design`、`documentation`、`failing-test`、`feature`、`enhancement`
+- **Priority**（优先级，`priority/<x>`）：`high`、`medium`、`low`
+- **平台 / 社区默认**：`help-wanted`（寻求帮助）、`invalid`（无效的 PR/Issue）、`question`（此 Issue 为一个问题）、`newcomer`（第一次在社区提 PR/Issue）
+
+> 命名注意：类型标签是 `kind/bug`、`kind/feature`，**不是**裸的 `bug`/`feature`。
+
+### ⚠️ 应用方式
+
+这些标签在 IB_Robot 仓库**默认不存在**，且当前 `ATOMGIT_TOKEN` 没有直接写标签的权限（`create-repo-labels` 返回 `403`）。因此：
+
+- **不要**用 `issue_management.py --labels kind/bug,...` 直接打 `kind/*`、`priority/*` 标签（会校验失败）。
+- **正确做法**：先创建 Issue（不带 labels），再用 **slash command 评论**让 openEuler 社区机器人打标签：
+
+```bash
+# 创建 Issue（不打标签）
+python3 issue_management.py --title "[Bug] xxx" --body "..."
+
+# 用斜杠命令让机器人添加 kind/*/priority/* 标签（机器人会自动建标并打上）
+python3 issue_management.py --issue <N> --comment "/kind bug"
+python3 issue_management.py --issue <N> --comment "/priority high"
+# 移除：/remove-kind bug、/remove-priority high
+```
+
+- 平台默认标签（`help-wanted`/`invalid`/`question`/`newcomer`）若仓库未预置，需仓库 admin 在 Settings → Labels 中先创建，再由 slash 命令或网页端添加。
+
 ## 快速使用
 
 ### 创建 Issue
 
 ```bash
-# 提交一个简单的 Issue
+# 提交一个简单的 Issue（标签请通过下方 slash 命令添加，不要在这里直接传 kind/*）
 python3 issue_management.py --title "发现一个 Bug" --body "在执行 build.sh 时报错..."
 
-# 指定标签和指派人
-python3 issue_management.py --title "功能建议: 增加单元测试" --body "为了提高代码质量..." --labels enhancement,bug --assignees BreezeWu
+# 创建后用社区 slash 命令打标签（机器人会添加 kind/bug）
+python3 issue_management.py --issue <N> --comment "/kind bug"
 
 # 跨仓库：直接指定 owner/repo
 python3 issue_management.py --owner some-org --repo some-repo --title "[Bug] xxx"
@@ -75,8 +106,9 @@ python3 issue_management.py --issue 123 --fetch-info --no-comments
 **参数**:
 - `--title`: Issue 标题（创建时**必需**）
 - `--body`: Issue 描述
-- `--labels`: 标签列表，逗号分隔（如: bug,high-priority）
+- `--labels`: 标签列表，逗号分隔（仅限仓库已存在的标签；`kind/*`、`priority/*` 见「标签规范」，用 slash 命令添加）
 - `--assignees`: 指派人列表，逗号分隔
+- `--comment`: 在已有 Issue 下发表评论或社区斜杠命令（如 `/kind bug`）
 - `--issue`: Issue 编号（用于更新或获取信息，可由 `--url` 自动解析）
 - `--state`: Issue 状态（open 或 closed，用于更新）
 - `--fetch-info`: 提取 Issue 详情到 JSON 文件
@@ -99,4 +131,4 @@ python3 issue_management.py --issue 123 --title "已修正: 编译错误" --body
 
 1. **环境配置**: 确保 `ATOMGIT_TOKEN` 已正确配置在环境变量中。
 2. **Issue 规范**: 建议在标题中使用清晰的前缀，如 `[Bug]`, `[Feature]`, `[Task]` 等。
-3. **标签管理**: 使用仓库已有的标签，或者在提交时创建清晰的新标签。
+3. **标签管理**: 只使用 openEuler 社区预定义标签（见上方「标签规范」）。`kind/*`、`priority/*` 通过 `/kind`、`/priority` 斜杠命令（评论）由社区机器人添加，**不要**自造裸名标签（`bug`/`feature` 等）或在 `--labels` 里传不存在的标签。

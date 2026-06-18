@@ -7,6 +7,11 @@ platform_lerobot_profiles() {
     echo "core,ros,hardware,openeuler"
 }
 
+# Source shared openEuler ROS repo management (SSOT for openEulerROS.repo).
+# Also sourced by scripts/install_ros.sh, so repo content lives in one place.
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/setup/openeuler_ros_repo.sh"
+
 platform_prepare_host() {
     log_warn "openEuler detected. Setting ROS_OS_OVERRIDE=rhel:8 for rosdep compatibility."
     export ROS_OS_OVERRIDE=rhel:8
@@ -15,6 +20,8 @@ platform_prepare_host() {
     ensure_openeuler_builtin_repos
     ensure_openeuler_ca_certificates
     ensure_openeuler_extras_repo
+    ensure_openeuler_ros_repo
+    warn_openeuler_duplicate_ros_repos
     ensure_openeuler_gpg_key
 
     log_info "Installing openEuler host packages required by the workspace..."
@@ -128,6 +135,15 @@ platform_pre_install_rosdeps() {
         if ! grep -q '^\s*gpgcheck\s*=\s*0' /etc/dnf/dnf.conf; then
             run_sudo sed -i '/^\[main\]/a gpgcheck=0' /etc/dnf/dnf.conf
         fi
+    fi
+
+    # Refresh metadata so that newly-restored ROS repos are visible to
+    # rosdep before it resolves ros-humble-* keys into dnf transactions.
+    log_info "Refreshing dnf metadata (ensures ROS repos are visible to rosdep)..."
+    run_sudo dnf clean all || log_warn "dnf clean all failed, continuing..."
+    if ! run_sudo dnf makecache; then
+        log_warn "dnf makecache encountered errors — some repos may be unreachable."
+        log_warn "Continuing; rosdep will report unresolved keys if a repo is truly broken."
     fi
 }
 
