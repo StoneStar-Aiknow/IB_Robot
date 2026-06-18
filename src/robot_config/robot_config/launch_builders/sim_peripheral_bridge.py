@@ -12,6 +12,7 @@ Why bridge_node instead of parameter_bridge + remappings=:
 Topic naming contract (output ROS topics):
   /camera/{name}/image_raw
   /camera/{name}/camera_info
+  /camera/{name}/aligned_depth_to_color/image_raw  (when depth is enabled)
 where {name} is YAML peripherals[].name (e.g. "top", "wrist").
 
 This contract matches real hardware: perception.py remaps both
@@ -36,27 +37,24 @@ Why parent_frame, not frame_id:
   Using frame_id in the bridge path subscribes to a nonexistent Gz topic.
 """
 
-import os
 import yaml
-
 from launch_ros.actions import Node
+
+from robot_config.peripherals.camera import camera_dict_requests_depth
 
 
 def _build_camera_bridge_entries(periph: dict, model_name: str, world_name: str) -> list:
-    """Return 2 bridge config dicts for one camera peripheral (image + camera_info).
+    """Return bridge config dicts for one camera peripheral.
 
     Uses parent_frame as the Gazebo link name because Ignition Gazebo 6 merges
     fixed-joint child links (frame_id) into the parent link.
     """
     name = periph["name"]
-    # Ignition Gazebo 6 merges the camera link (frame_id) into its parent.
-    # The sensor entity path is under the parent link, not the camera frame.
-    link_name = periph.get("transform", {}).get("parent_frame", "base")
     sensor_name = f"{name}_camera"
 
     gz_base = f"/{sensor_name}"
 
-    return [
+    entries = [
         {
             "ros_topic_name": f"/camera/{name}/image_raw",
             "gz_topic_name": f"{gz_base}/image",
@@ -74,6 +72,18 @@ def _build_camera_bridge_entries(periph: dict, model_name: str, world_name: str)
             "lazy": False,
         },
     ]
+    if camera_dict_requests_depth(periph):
+        entries.append(
+            {
+                "ros_topic_name": f"/camera/{name}/aligned_depth_to_color/image_raw",
+                "gz_topic_name": f"{gz_base}/depth_image",
+                "ros_type_name": "sensor_msgs/msg/Image",
+                "gz_type_name": "gz.msgs.Image",
+                "direction": "GZ_TO_ROS",
+                "lazy": False,
+            }
+        )
+    return entries
 
 
 def _build_lidar_bridge_entries(
@@ -149,6 +159,8 @@ def generate_peripheral_sim_bridges(
     Topic naming contract (output ROS topics):
       /camera/{name}/image_raw
       /camera/{name}/camera_info
+      /camera/{name}/aligned_depth_to_color/image_raw when the camera requests
+      depth via streams, align_depth, enable_depth, or enable_pointcloud.
     where {name} is YAML peripherals[].name.
 
     Args:

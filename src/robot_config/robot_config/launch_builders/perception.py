@@ -205,6 +205,11 @@ def generate_camera_nodes(robot_config, use_sim=False):
                 if align_depth
                 else f"{driver_topic_prefix}/depth/image_rect_raw"
             )
+            depth_camera_info_source_topic = (
+                f"{driver_topic_prefix}/aligned_depth_to_color/camera_info"
+                if align_depth
+                else f"{driver_topic_prefix}/depth/camera_info"
+            )
             relay_topics = [
                 (
                     f"{driver_topic_prefix}/color/image_raw",
@@ -225,6 +230,20 @@ def generate_camera_nodes(robot_config, use_sim=False):
                     f"/camera/{name}/depth/image_rect_raw",
                     f"{name}_depth_image_relay",
                     "sensor_msgs/msg/Image",
+                    periph.get("optical_frame_id"),
+                ),
+                (
+                    depth_source_topic,
+                    f"/camera/{name}/aligned_depth_to_color/image_raw",
+                    f"{name}_aligned_depth_image_relay",
+                    "sensor_msgs/msg/Image",
+                    periph.get("optical_frame_id"),
+                ),
+                (
+                    depth_camera_info_source_topic,
+                    f"/camera/{name}/aligned_depth_to_color/camera_info",
+                    f"{name}_aligned_depth_camera_info_relay",
+                    "sensor_msgs/msg/CameraInfo",
                     periph.get("optical_frame_id"),
                 ),
             ]
