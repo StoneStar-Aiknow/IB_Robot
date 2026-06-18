@@ -87,6 +87,18 @@ python3 review_resolution.py --pr 123 --reply-comment 456 --reply-file ./tmp/rep
 
 `visible` 适合需要额外补一条页面可见评论的场景；常规 review 跟进默认应使用 threaded。
 
+### 审查者复查闭环（开发者已修复 review 意见后）
+
+本 skill 默认面向**被审查者**（修复别人提的 review 意见）。但审查者一方也有闭环需求：开发者按意见更新代码后，审查者需要复查最新提交、确认修复，并把可标记的意见标记为已解决。推荐流程：
+
+1. 用 `atomgit-pr-review` 的 `pr_review.py --pr N` 重新提取最新 PR 上下文，逐条核对开发者是否真的修复了每条意见（看最新 diff 与测试是否同步更新）。
+2. 用 `review_resolution.py --pr N --include-self-comments` 抓取**自己之前提交的**未解决评论——审查者要闭环的正是自己提的意见，而脚本默认会过滤当前用户的评论，**必须加 `--include-self-comments`**。
+3. 对每条已确认修复的意见：
+   - 先用 `--reply-comment <id> --reply-file <回复文件> --reply-mode threaded` 在原线程下回复确认（正文明确写出「已修复并复查确认通过，标记为已解决」）。
+   - 若该条是 `diff_comment`（行内评论），再追加 `--resolve-comment <id> --resolved true` 标记已解决。
+   - 若该条是 `pr_comment`（PR 级评论），**跳过 resolve**（会 400 失败，见下一节限制说明），回复确认即视为闭环。
+4. 若存在顶层摘要评论，可单独回复一条「本次 review 的 N 条意见均已修复确认、全部闭环」作为整体收尾。
+
 ### 修改某条 review discussion 的解决状态
 
 ```bash
@@ -98,6 +110,20 @@ python3 review_resolution.py --pr 123 --resolve-discussion abcdef --resolved fal
 ```
 
 脚本使用官方文档中的 `PUT /api/v5/repos/:owner/:repo/pulls/:number/comments/:discussion_id` 接口修改解决状态。
+
+#### ⚠️ resolve 仅对 inline diff comment 有效
+
+该接口**只能切换绑定到具体代码行的行内评论（`diff_comment` / DiffNote）的 resolved 状态**。对以下类型调用 `--resolve-comment` / `--resolve-discussion` 会返回 **HTTP 400**，无法标记：
+
+- PR 级 review 评论（`comment_type == "pr_comment"`），例如 `atomgit-pr-architecture-review` 提交的架构审查评论，或 `atomgit-pr-review` 提交的顶层摘要评论；
+- 普通 PR 顶层评论。
+
+闭环时的判断规则（基于 `unresolved_comments.json` 的 `comment_type` 字段）：
+
+- `diff_comment` → 回复确认后，用 `--resolve-comment --resolved true` 标记已解决。
+- `pr_comment` → **只能**通过 `--reply-comment` 回复确认修复来实现实质闭环，**不要**对其调用 `--resolve-comment`。
+
+只要回复正文明确写出「已修复并复查确认通过」，即使平台未切换 resolved 标记，对作者而言该意见也已闭环。
 
 **重要**: 
 - 在步骤3，你必须将修复方案展示给人类确认后再提交

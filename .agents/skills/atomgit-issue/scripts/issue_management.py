@@ -23,8 +23,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Manage AtomGit issues across create, fetch, update, and close flows")
     parser.add_argument("--title", help="Issue title")
     parser.add_argument("--body", help="Issue body")
-    parser.add_argument("--labels", help="Comma-separated labels")
-    parser.add_argument("--assignees", help="Comma-separated assignees")
     parser.add_argument("--issue", type=int, help="Issue number for update or fetch")
     parser.add_argument("--state", choices=["open", "closed"], help="Issue state for update")
     parser.add_argument("--fetch-info", action="store_true", help="Fetch issue info to JSON")
@@ -116,25 +114,16 @@ def main():
     if args.issue and args.comment is None:
         print(f"Updating issue #{args.issue}...")
 
-        labels = args.labels.split(",") if args.labels else None
-        assignees = args.assignees.split(",") if args.assignees else None
-
         if args.dry_run:
             print("[DRY RUN] Plan to update issue:")
             if args.title:
                 print(f"  Title: {args.title}")
             if args.state:
                 print(f"  State: {args.state}")
-            if labels:
-                print(f"  Labels: {labels}")
-            if assignees:
-                print(f"  Assignees: {assignees}")
             return
 
         try:
-            result = service.update_issue(
-                args.issue, title=args.title, body=args.body, state=args.state, labels=labels, assignees=assignees
-            )
+            result = service.update_issue(args.issue, title=args.title, body=args.body, state=args.state)
             print(f"Successfully updated issue #{args.issue}")
             print(f"URL: {service.get_issue_url(args.issue)}")
             return
@@ -149,20 +138,13 @@ def main():
 
     print(f"Creating new issue: {args.title}...")
 
-    labels = args.labels.split(",") if args.labels else None
-    assignees = args.assignees.split(",") if args.assignees else None
-
     if args.dry_run:
         print("[DRY RUN] Plan to create issue:")
         print(f"  Title: {args.title}")
-        if labels:
-            print(f"  Labels: {labels}")
-        if assignees:
-            print(f"  Assignees: {assignees}")
         return
 
     try:
-        result = service.create_issue(title=args.title, body=args.body or "", labels=labels, assignees=assignees)
+        result = service.create_issue(title=args.title, body=args.body or "")
         issue_number = result.get("number")
         print(f"Successfully created issue #{issue_number}")
         print(f"URL: {service.get_issue_url(issue_number)}")
