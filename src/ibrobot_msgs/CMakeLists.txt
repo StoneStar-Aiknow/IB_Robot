@@ -15,6 +15,7 @@ find_package(action_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
 
 # Generate interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
@@ -30,6 +31,10 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SceneObservation.msg"
   "msg/AttentionWeights.msg"
   "msg/JointCurrent.msg"
+  "msg/Detection2D.msg"
+  "msg/DetectionArray.msg"
+  "msg/GraspCandidate.msg"
+  "msg/GraspCandidateArray.msg"
   "action/RecordEpisode.action"
   "action/RunPolicy.action"
   "action/DispatchInfer.action"
@@ -41,7 +46,9 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/MoveToPose.srv"
   "srv/ValidateSkill.srv"
   "srv/ValidatePrimitive.srv"
-  DEPENDENCIES std_msgs action_msgs builtin_interfaces geometry_msgs
+  "srv/DetectSegment.srv"
+  "srv/PlanGrasp.srv"
+  DEPENDENCIES std_msgs action_msgs builtin_interfaces geometry_msgs sensor_msgs
 )
 
 if(BUILD_TESTING)
