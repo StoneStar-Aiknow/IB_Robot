@@ -34,12 +34,6 @@ submodule_update_block_reason() {
 }
 
 update_submodules() {
-    if [[ "${SKIP_SUBMODULES}" == true ]]; then
-        log_info "Skipping submodule initialization/update (--skip-submodules)."
-        log_skipped "Git submodules"
-        return 0
-    fi
-
     log_info "Synchronizing submodule URLs..."
     git submodule sync --recursive >/dev/null
 

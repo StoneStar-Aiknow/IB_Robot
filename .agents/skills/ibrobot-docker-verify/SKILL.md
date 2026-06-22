@@ -170,7 +170,7 @@ docker exec -d \
   -w /home/testuser/IB_Robot \
   verify-ubuntu2204 \
   bash -c 'DEBIAN_FRONTEND=noninteractive \
-    bash scripts/setup.sh --yes --skip-submodules \
+    bash scripts/setup.sh --yes \
     > /tmp/setup.log 2>&1'
 ```
 
@@ -246,7 +246,7 @@ docker exec -d -u testuser -e HOME=/home/testuser \
   -w /home/testuser/IB_Robot \
   verify-ubuntu2204 \
   bash -c 'DEBIAN_FRONTEND=noninteractive \
-    bash scripts/setup.sh --yes --skip-submodules \
+    bash scripts/setup.sh --yes \
     > /tmp/setup.log 2>&1'
 ```
 
