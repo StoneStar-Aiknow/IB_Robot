@@ -1,12 +1,4 @@
-"""Relay /cmd_vel to /base_controller/cmd_vel_unstamped.
-
-Nav2 publishes stamped Twist on /cmd_vel, but OmniWheelController
-with use_stamped_vel: false expects unstamped Twist. This node
-bridges the two by subscribing to /cmd_vel and republishing.
-
-Usage:
-    ros2 run robot_navigation cmd_vel_relay
-"""
+"""Relay /cmd_vel to /base_controller/cmd_vel_unstamped for Gazebo E2E tests."""
 
 import rclpy
 from geometry_msgs.msg import Twist
@@ -26,9 +18,11 @@ class CmdVelRelay(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = CmdVelRelay()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

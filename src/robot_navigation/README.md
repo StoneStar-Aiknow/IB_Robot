@@ -476,12 +476,11 @@ robot_navigation/
 │   ├── test_nav2_goal_client.py   # Nav2 Goal 客户端 pytest 测试
 │   └── e2e/
 │       ├── mock_servers.py        # Mock Trigger/Action 服务
-│       ├── mock_robot_hardware.py # Mock ros2_control HardwareInterface
-│       ├── test_pipeline_software.py   # Layer 2: 软件闭环 E2E（无物理仿真）
-│       ├── test_pipeline_nav2.py       # Layer 2: Nav2 集成 E2E（mock hardware）
-│       └── test_pipeline_simulation.py # Layer 3: Gazebo 物理 E2E（3 用例，~4 min）
+│       └── test_pipeline_software.py   # 软件闭环 E2E（无物理仿真）
 └── README.md
 ```
+
+完整机器人启动链路下的导航仿真测试由 `robot_config` 维护。
 
 ## 依赖
 

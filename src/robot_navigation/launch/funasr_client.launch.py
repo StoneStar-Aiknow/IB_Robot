@@ -71,13 +71,6 @@ def generate_launch_description():
     pkg_dir = get_package_share_directory("robot_navigation")
     default_keywords_file = os.path.join(pkg_dir, "config", "keywords.json")
 
-    # Default robot config file from robot_config package
-    try:
-        robot_config_dir = get_package_share_directory("robot_config")
-        default_robot_config_file = os.path.join(robot_config_dir, "config", "robots", "lekiwi_navi.yaml")
-    except Exception:
-        default_robot_config_file = ""
-
     # Declare launch arguments
     host_arg = DeclareLaunchArgument("host", default_value="127.0.0.1", description="FunASR server host")
     port_arg = DeclareLaunchArgument("port", default_value="10095", description="FunASR server port")
@@ -93,7 +86,7 @@ def generate_launch_description():
     )
     robot_config_arg = DeclareLaunchArgument(
         "robot_config_file",
-        default_value=default_robot_config_file,
+        default_value="",
         description="Path to robot config YAML file for destinations",
     )
 

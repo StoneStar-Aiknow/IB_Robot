@@ -13,7 +13,7 @@
   <!-- Arguments -->
   <xacro:arg name="use_sim" default="true"/>
   <xacro:arg name="sim_plugin" default="gz_ros2_control/GazeboSimSystem"/>
-  <xacro:arg name="gz_ros2_control_parameters_file" default="$(find robot_config)/config/lekiwi/lekiwi_sim_controllers.yaml"/>
+  <xacro:arg name="gz_ros2_control_parameters_file" default="$(find lekiwi_hardware)/config/lekiwi_sim_controllers.yaml"/>
   <xacro:arg name="serial_port"  default="${serial_port}"/>
   <xacro:arg name="use_mock"     default="${use_mock}"/>
   <xacro:arg name="i2c_bus"     default="${imu_i2c_bus}"/>

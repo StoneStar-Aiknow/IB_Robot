@@ -16,12 +16,10 @@ setup(
         # Config files
         ("share/" + package_name + "/config", glob("config/*.yaml") + glob("config/*.json")),
         ("share/" + package_name + "/config/nav2", glob("config/nav2/*.yaml")),
-        # Test config files (map + nav2 params for E2E tests)
-        ("share/" + package_name + "/config/test", glob("config/test/*.yaml") + glob("config/test/*.pgm")),
-        # Simulation config files (Layer 3 E2E tests)
+        # Shared test resources used by robot_config navigation simulation tests
+        ("share/" + package_name + "/config/test", glob("config/test/*.world")),
+        # Simulation map resources
         ("share/" + package_name + "/config/maps", glob("config/maps/*.yaml") + glob("config/maps/*.pgm")),
-        # Test node scripts (E2E only)
-        ("share/" + package_name + "/test/e2e", glob("test/e2e/gt_odom_node.py") + glob("test/e2e/cmd_vel_relay.py")),
         # RViz config
         ("share/" + package_name + "/config", glob("config/*.rviz")),
     ],
