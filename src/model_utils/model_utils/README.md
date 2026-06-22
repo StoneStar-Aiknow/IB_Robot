@@ -641,7 +641,8 @@ PI05 策略与单体 ACT 模型不同，导出时被拆分为 **VLM 预填充** 
 **第一次使用：交互向导**
 
 直接不带参数运行（或加 `--init`），向导（英文）会逐项提示**含义 + 默认值 + 样例**，回车即用默认，
-结尾可把这组参数存成一个 profile。`--verify` 作为流程开关在向导中单独询问；选择验证时再追问 `--task`：
+结尾可把这组稳定参数存成一个 profile。向导只保存稳定参数；做什么（量化 / 验证 / 只重做某段）由
+运行时的 `--steps` 决定，不写进 profile：
 
 ```shell
 python -m model_utils.pi05_export          # 无配置时自动进入向导
@@ -710,19 +711,34 @@ _last:
 参数优先级（高 → 低）：**命令行 > `--profile` > `defaults` > `_last`（仅未指定 profile 时）> 内置默认**。
 
 > 提示：`_last` 与 profile 里**不会**保存派生出来的 `output_dir/runtime_save_dir`（只存 `exp_dir`），
-> 这样以后换 `--exp-dir` 才能正确重新派生；`verify` 作为临时流程开关也不会被持久化。
+> 这样以后换 `--exp-dir` 才能正确重新派生；`--steps` 作为临时流程开关也不会被持久化。
 
 ### 一条命令的端到端流程（推荐）
 
-`python -m model_utils.pi05_export` 是整个工具链的统一入口，自动编排各阶段并在阶段间正确
+`python -m model_utils.pi05_export` 是整个工具链的统一入口，自动编排各步骤并在步骤间正确
 传递文件，你无需记忆多个模块路径，也无需手写 `atc` 命令。
 
-```shell
-# 仅导出 ONNX（不转 OM；适合在 GPU/CPU 机器上先把 ONNX 准备好）
-python -m model_utils.pi05_export \
-    --policy-path path/to/pretrained_model
+**做什么由 `--steps` 显式决定**（逗号分隔的步骤列表）。可用步骤：
 
-# 导出 ONNX 并转 OM（在 Ascend 机器上一步到位）
+| step | 含义 | 产物 | 依赖（参数 / 上游产物） |
+| --- | --- | --- | --- |
+| `vlm_onnx` | 导出 VLM（gemma_2b）ONNX | `pi05-vlm*.onnx` | — |
+| `ae_onnx` | 导出 Action Expert（gemma_300m）ONNX | `pi05-action_expert*.onnx` | `vlm_onnx`（需 `runtime_save` 中转张量） |
+| `vlm_quant` | VLM ONNX W8A8 量化 | `pi05-vlm*_w8a8.onnx` | `--batch-path` + `vlm_onnx`；若 `vlm_onnx` 是 NPU 图，会自动复用/生成 donor ONNX |
+| `ae_quant` | Action Expert ONNX W8A8 量化 | `pi05-action_expert*_w8a8.onnx` | `--calib-dir`（默认 `runtime_save`）+ `ae_onnx`；若 `ae_onnx` 是 NPU 图，会自动复用/生成 donor ONNX |
+| `vlm_om` | VLM ONNX → OM（ATC，量化过则自动吃 `*_w8a8`） | `vlm.om`（+manifest） | `--soc-version` + `vlm_onnx` |
+| `ae_om` | Action Expert ONNX → OM（同上） | `action_expert.om`（+manifest） | `--soc-version` + `ae_onnx` |
+| `verify` | 拆分 vs 整体等价性验证 | — | `--task` + `vlm_onnx`,`ae_onnx` |
+
+**默认 `--steps`** = `vlm_onnx,ae_onnx,vlm_om,ae_om`（导出两段 ONNX + 编译两段 OM）。量化与验证是**显式选项**，需在 `--steps` 中点名。
+
+```shell
+# 仅导出两段 ONNX（不转 OM；适合在 GPU/CPU 机器上先把 ONNX 准备好）
+python -m model_utils.pi05_export \
+    --policy-path path/to/pretrained_model \
+    --steps vlm_onnx,ae_onnx
+
+# 默认：导出两段 ONNX 并编译两段 OM（在 Ascend 机器上一步到位）
 python -m model_utils.pi05_export \
     --policy-path path/to/pretrained_model \
     --soc-version Ascend310P3
@@ -731,58 +747,76 @@ python -m model_utils.pi05_export \
 python -m model_utils.pi05_export \
     --policy-path path/to/pretrained_model \
     --soc-version Ascend310P3 \
-    --verify --task 'pick up the cup'
+    --steps vlm_onnx,ae_onnx,vlm_om,ae_om,verify --task 'pick up the cup'
 
 # 导出 + W8A8 量化（两段）+ 转 OM（量化产物自动喂给 ATC）
 python -m model_utils.pi05_export \
     --policy-path path/to/pretrained_model \
     --soc-version Ascend310P3 \
-    --quantize --batch-path path/to/batches.json
+    --steps vlm_onnx,ae_onnx,vlm_quant,ae_quant,vlm_om,ae_om \
+    --batch-path path/to/batches.json
 ```
 
-> **继续量化（复用已有 profile）**：若此前已导出（并存成 profile），只需复用该 profile 再加
-> `--quantize*` 即可「续跑」量化——导出阶段因产物已存在自动跳过，仅运行量化与 ATC：
+> **场景 1：已导出 ONNX+OM，现在想开始量化**。复用已有 profile，只跑量化 + 重编 OM。若已有 ONNX 是
+> `*_npu.onnx`，pipeline 会自动查找同目录 `*_cpu.onnx` donor；donor 已存在则复用，不存在则用
+> `--donor-device`（默认 `cpu`）主动生成，并在日志中明确说明：
 >
 > ```shell
-> python -m model_utils.pi05_export --profile p310 --quantize --batch-path path/to/batches.json
+> python -m model_utils.pi05_export --profile p310 \
+>     --steps vlm_quant,ae_quant,vlm_om,ae_om \
+>     --batch-path path/to/batches.json
 > ```
+>
+> **场景 2：调参后只重导某一段并重编它的 OM**（另一段完全不动）：
+>
+> ```shell
+> # 只重导 VLM ONNX 并重编 vlm.om（AE 不受影响）
+> python -m model_utils.pi05_export --profile p310 --steps vlm_onnx,vlm_om
+> ```
+>
+> 关键规则：**列在 `--steps` 里的步骤一定会执行**（即使产物已存在也会重建）；某步骤的上游产物
+> 若既不在 `--steps`、盘上也没有，会**报错并提示把对应 step 加进 `--steps`**（不会偷偷补跑）。
 
 #### 参数
 
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
 | `--policy-path` | ✅ | — | 本地 PI05 策略目录（含 config + 权重）。可由 profile 提供 |
+| `--steps` | ❌ | `vlm_onnx,ae_onnx,vlm_om,ae_om` | 要执行的步骤列表（见上表）。列出的步骤总会执行 |
 | `--exp-dir` | ❌ | `None` | 实验目录：自动派生 `onnx/`/`runtime_save/`，免去分别手填两条长路径 |
 | `--dtype` | ❌ | `fp16` | 导出精度，**同时应用于 VLM 与 AE 两段**（`fp16` / `fp32` / `auto`） |
-| `--soc-version` | ❌ | `None` | 给定时追加 ATC→OM 编译（如 `Ascend310P3`，见下文「查看芯片版本号」） |
-| `--quantize` | ❌ | `false` | W8A8 量化**两段**（等价于同时给 `--quantize-vlm --quantize-ae`，需 `--batch-path`） |
-| `--quantize-vlm` | ❌ | `false` | 仅量化 VLM（gemma_2b），**需 `--batch-path` 提供真实标定** |
-| `--quantize-ae` | ❌ | `false` | 仅量化 Action Expert（gemma_300m），默认用 `--runtime-save-dir` 作单样本标定 |
-| `--batch-path` | 量化 VLM 必填 | `None` | 真实标定 batch JSON（**随机数据会量化出不可用模型**）。可由 profile 提供 |
-| `--calib-dir` | ❌ | `=--runtime-save-dir` | AE 标定样本目录（含 `past_kv_tensor.*` + `prefix_pad_masks.*`） |
+| `--soc-version` | ❌ | `None` | `vlm_om` / `ae_om` 步骤所需的目标芯片（如 `Ascend310P3`，见下文「查看芯片版本号」） |
+| `--batch-path` | `vlm_quant` 必填 | `None` | 真实标定 batch JSON（**随机数据会量化出不可用模型**）。可由 profile 提供 |
+| `--donor-device` | ❌ | `cpu` | 量化 NPU ONNX 时，若 donor ONNX 不存在，用该设备自动导出 ORT-runnable donor（不要设为 `npu`） |
+| `--calib-dir` | ❌ | `=--runtime-save-dir` | `ae_quant` 标定样本目录（含 `past_kv_tensor.*` + `prefix_pad_masks.*`） |
 | `--num-calib` | ❌ | `16` | 标定样本数量（`<=0` 表示全部） |
 | `--amp-num` | ❌ | `0` | msModelSlim 自动混合精度的 fp16 回退层数（精度安全阀） |
-| `--verify` | ❌ | `false` | 结尾运行拆分 vs 整体等价性验证（需同时给 `--task`） |
-| `--task` | ❌ | `None` | `--verify` 所需的任务提示，须与部署 `default_task` 一致 |
+| `--task` | `verify` 必填 | `None` | `verify` 步骤所需的任务提示，须与部署 `default_task` 一致 |
 | `--device` | ❌ | `cpu` | 导出/验证设备（`cpu` / `cuda:0` / `npu`），会体现在 ONNX 文件名中 |
 | `--output-dir` | ❌ | `outputs/onnx` | 导出 ONNX 的目录。可由 `--exp-dir` 派生为 `<DIR>/onnx/` |
 | `--runtime-save-dir` | ❌ | `runtime_save` | VLM→AE 中转张量目录。可由 `--exp-dir` 派生为 `<DIR>/runtime_save/` |
-| `--force` | ❌ | `false` | 即使产物已存在也强制重建每个阶段 |
 
 > 配置/向导相关：`--config`（配置文件路径）、`--profile`（引用 profile）、`--save-as`（另存为 profile）、`--init`（强制向导）、`--list-profiles`（列出 profile）。详见上方「快速开始」。
 >
-> 量化说明：量化默认**关闭**。开启某段量化后，会在 fp16 ONNX 旁产出 `*_w8a8.onnx`，并由 ATC 自动改用
-> 该量化产物编译为 `.om`（未量化的段仍用 fp16 ONNX）。`--quantize*` 作为临时流程开关**不写入** `_last`/profile，
-> 而 `--batch-path` / `--calib-dir` / `--num-calib` / `--amp-num` 会随 profile 复用。量化阶段同样可断点续跑
-> （`*_w8a8.onnx` 已存在则跳过）。
+> 量化说明：量化默认**不执行**（不在默认 `--steps` 内）。在 `--steps` 中加入 `vlm_quant`/`ae_quant`
+> 即开启对应段量化，会在 fp16 ONNX 旁产出 `*_w8a8.onnx`；同一次若也选了 `vlm_om`/`ae_om`，ATC 会
+> **自动改用该 `*_w8a8.onnx`** 编译（未量化的段仍用 fp16 ONNX）。如果当前部署 ONNX 文件名是
+> `*_npu.onnx`，量化会走 Route A：用 ORT-runnable donor 做校准/量化，再把 int8 Linear graft 回 NPU 图；
+> donor 图按 `--donor-device` 推导文件名（默认 `*_cpu.onnx`），存在则复用，缺失则自动导出。`--steps` 是
+> 临时流程开关**不写入** `_last`/profile；而 `--batch-path` / `--donor-device` / `--calib-dir` /
+> `--num-calib` / `--amp-num` 会随 profile 复用。
 
 #### 特性
 
-- **可断点续跑**：每个阶段的产物路径会被提前预测；若文件已存在则跳过（`▷ skip`）。
-  某阶段失败中断后，**重跑同一条命令即从断点继续**（已完成的自动跳过），需要重建则加 `--force`。
+- **显式步骤、产物可复用**：`--steps` 里列出的步骤一定执行（已存在的产物会被重建）；未列出但被依赖的
+  上游产物必须已在盘上，否则报错提示补 step。借此可只重做某一段（如 `--steps vlm_onnx,vlm_om`）。
+- **依赖前置校验**：选了某步骤但缺其所需参数（如 `vlm_om` 缺 `--soc-version`、`vlm_quant` 缺
+  `--batch-path`、`verify` 缺 `--task`）会在开跑前**精确报错并提示要补的参数**，不会跑到一半才失败。
+- **量化 donor 前置校验**：当量化 `*_npu.onnx` 时，开跑前会判断 donor 是否存在、能否自动生成；AE donor
+  生成所需的 `runtime_save/past_kv_tensor.pth` 和 `prefix_pad_masks.pth` 缺失时会提前报错并提示补充路径。
 - **保留中间产物**：流程不删除任何中间文件，导出的 ONNX、`runtime_save/*.pth`、`config.om.json`
   都保留在盘上，便于检查或局部重跑。
-- **实时反馈**：各阶段以子进程运行并透出 stdout/stderr，导出与 ATC 编译进度实时可见，每个阶段
+- **实时反馈**：各步骤以子进程运行并透出 stdout/stderr，导出与 ATC 编译进度实时可见，每步
   带 `▶ 开始 / ✓ 完成（耗时） / ✗ 失败` 横幅，不会让人误以为卡住。
 - **统一日志风格**：全工具链统一为 `HH:MM:SS LEVEL message`，结尾打印结构化结果块。
 
@@ -804,12 +838,11 @@ HH:MM:SS INFO   ✅ DONE
 HH:MM:SS INFO ────────────────────────────────────────
 ```
 
-断点续跑（前两步已完成）：
+只重做某一段（`--steps vlm_onnx,vlm_om`，AE 不动）：
 
 ```text
-HH:MM:SS INFO ▷ [1/3] VLM export — skip (exists: outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx)
-HH:MM:SS INFO ▷ [2/3] Action Expert export — skip (exists: outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx)
-HH:MM:SS INFO ▶ [3/3] ATC → OM compile …
+HH:MM:SS INFO ▶ [1/2] VLM ONNX export …
+HH:MM:SS INFO ▶ [2/2] ATC → OM compile (VLM) …
 ```
 
 #### 导出 ONNX 的文件命名
@@ -866,8 +899,8 @@ python -m model_utils.pi05_export.convert_om \
 
 #### 量化（W8A8 PTQ，可选）
 
-> 多数情况下无需手动调用本节脚本——统一入口的 `--quantize` / `--quantize-vlm` / `--quantize-ae`
-> 已自动编排量化并把量化产物接入 ATC（见上方「参数」）。下面是需要单独运行或精调时的底层用法。
+> 多数情况下无需手动调用本节脚本——统一入口在 `--steps` 中加入 `vlm_quant` / `ae_quant`
+> 即自动编排量化并把量化产物接入 ATC（见上方「一条命令的端到端流程」）。下面是需要单独运行或精调时的底层用法。
 
 将 ONNX 量化为 W8A8 以降低显存带宽压力。**必须提供真实标定数据**（用随机数据标定会得到不可用的模型）。
 
@@ -918,4 +951,3 @@ python -m model_utils.pi05_export.verify_pi05_split_equivalence \
     --ae-onnx-path  outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx \
     --task 'pick up the cup'
 ```
-

@@ -62,6 +62,65 @@ SRC_WIZARD = "wizard"
 SRC_DERIVED = "derived(exp-dir)"
 
 
+# ---------------------------------------------------------------------------
+# Pipeline step registry — single source of truth for the legal --steps values.
+#
+# Each step declares the params it needs (so a missing one tells the user
+# exactly what to add) and the upstream steps whose artifacts it consumes (so
+# a missing artifact that is neither requested nor on disk is a clear error).
+# Adding a new step here automatically extends --help, validation, and (with a
+# matching runner in __main__.py) execution — nothing else hard-codes the list.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class StepSpec:
+    name: str
+    summary: str  # one-liner shown in --help
+    param_deps: tuple[str, ...] = ()  # required Param dests (e.g. "soc_version")
+    step_deps: tuple[str, ...] = ()  # upstream steps whose product is consumed
+
+
+STEPS: list[StepSpec] = [
+    StepSpec("vlm_onnx", "Export the VLM (gemma_2b) to ONNX"),
+    StepSpec(
+        "ae_onnx",
+        "Export the Action Expert (gemma_300m) to ONNX",
+        step_deps=("vlm_onnx",),  # needs the VLM->AE handoff tensors
+    ),
+    StepSpec(
+        "vlm_quant",
+        "Quantize the VLM ONNX to W8A8 (needs --batch-path)",
+        param_deps=("batch_path",),
+        step_deps=("vlm_onnx",),
+    ),
+    StepSpec(
+        "ae_quant",
+        "Quantize the Action Expert ONNX to W8A8 (calib defaults to runtime_save)",
+        step_deps=("ae_onnx",),
+    ),
+    StepSpec(
+        "vlm_om",
+        "Compile the VLM ONNX to OM via ATC (auto-uses *_w8a8 if vlm_quant ran)",
+        param_deps=("soc_version",),
+        step_deps=("vlm_onnx",),
+    ),
+    StepSpec(
+        "ae_om",
+        "Compile the Action Expert ONNX to OM via ATC (auto-uses *_w8a8 if ae_quant ran)",
+        param_deps=("soc_version",),
+        step_deps=("ae_onnx",),
+    ),
+    StepSpec(
+        "verify",
+        "Run split-vs-monolithic equivalence verification (needs --task)",
+        param_deps=("task",),
+        step_deps=("vlm_onnx", "ae_onnx"),
+    ),
+]
+STEPS_BY_NAME = {s.name: s for s in STEPS}
+STEP_NAMES = [s.name for s in STEPS]
+DEFAULT_STEPS = ["vlm_onnx", "ae_onnx", "vlm_om", "ae_om"]
+
+
 @dataclass
 class Param:
     """Single source of truth for one CLI/config field.
@@ -121,7 +180,7 @@ PARAMS: list[Param] = [
     Param(
         dest="soc_version",
         cli="--soc-version",
-        meaning="Target Ascend SoC; when given, ATC->OM compile runs too (see `npu-smi info`)",
+        meaning="Target Ascend SoC; required by the vlm_om / ae_om steps (see `npu-smi info`)",
         example="Ascend310P3",
     ),
     Param(
@@ -134,7 +193,7 @@ PARAMS: list[Param] = [
     Param(
         dest="task",
         cli="--task",
-        meaning="Task prompt required by --verify; must match the deployment default_task",
+        meaning="Task prompt required by the 'verify' step; must match the deployment default_task",
         example='"pick up the cup"',
     ),
     # The two paths below are normally derived from --exp-dir; kept as explicit
@@ -160,35 +219,37 @@ PARAMS: list[Param] = [
         default="INFO",
         in_wizard=False,
     ),
-    # ---- W8A8 quantization (optional; off by default) ----
+    # ---- Pipeline step selection (what to actually run) ----
+    # The legal values and their meaning come from the STEPS registry above, so
+    # the help text lists them dynamically and stays in sync.
     Param(
-        dest="quantize",
-        cli="--quantize",
-        meaning="Quantize BOTH segments to W8A8 (shorthand for --quantize-vlm --quantize-ae; needs --batch-path)",
-        default=False,
-        is_flag=True,
+        dest="steps",
+        cli="--steps",
+        meaning=(
+            "Comma-separated pipeline steps to run (a step listed here is ALWAYS run, "
+            "even if its output exists; steps pulled in only as a dependency are skipped "
+            "when their product already exists). "
+            "Available: " + "; ".join(f"{s.name} = {s.summary}" for s in STEPS) + ". "
+            f"Default: {','.join(DEFAULT_STEPS)}"
+        ),
+        example=",".join(DEFAULT_STEPS),
+        default=",".join(DEFAULT_STEPS),
         in_wizard=False,
     ),
-    Param(
-        dest="quantize_vlm",
-        cli="--quantize-vlm",
-        meaning="Quantize the VLM (gemma_2b) ONNX to W8A8 (needs --batch-path for real calibration)",
-        default=False,
-        is_flag=True,
-        in_wizard=False,
-    ),
-    Param(
-        dest="quantize_ae",
-        cli="--quantize-ae",
-        meaning="Quantize the Action Expert (gemma_300m) ONNX to W8A8",
-        default=False,
-        is_flag=True,
-        in_wizard=False,
-    ),
+    # ---- Quantization knobs (the *parameters*; whether to quantize is decided
+    # by putting vlm_quant / ae_quant in --steps, not by a separate flag) ----
     Param(
         dest="batch_path",
         cli="--batch-path",
-        meaning="Real calibration batches JSON (REQUIRED for VLM quantization; random data yields a garbage model)",
+        meaning="Real calibration batches JSON (REQUIRED for vlm_quant; random data yields a garbage model)",
+        in_wizard=False,
+    ),
+    Param(
+        dest="donor_device",
+        cli="--donor-device",
+        meaning="Torch device used to auto-export ORT-runnable donor ONNX when quantizing an NPU ONNX",
+        example="cpu",
+        default="cpu",
         in_wizard=False,
     ),
     Param(
@@ -213,14 +274,6 @@ PARAMS: list[Param] = [
         type=int,
         in_wizard=False,
     ),
-    Param(
-        dest="verify",
-        cli="--verify",
-        meaning="Run split-vs-monolithic equivalence verification at the end (needs --task)",
-        default=False,
-        is_flag=True,
-        in_wizard=False,  # asked explicitly in the wizard as a flow choice
-    ),
 ]
 
 PARAMS_BY_DEST = {p.dest: p for p in PARAMS}
@@ -233,7 +286,6 @@ _META_KEYS = {
     "save_as",
     "init",
     "list_profiles",
-    "force",
 }
 
 
@@ -271,6 +323,58 @@ def _clean_run_params(values: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in values.items() if k in PARAMS_BY_DEST and k not in _META_KEYS and v is not None}
 
 
+def parse_steps(raw: str | None) -> list[str]:
+    """Parse the ``--steps`` string into an ordered, de-duplicated step list.
+
+    Validates every name against the STEPS registry and raises a SystemExit
+    that lists the legal values when an unknown step is given. Returns the
+    steps in *registry order* (not the order typed) so execution always follows
+    the natural dependency order regardless of how the user listed them.
+    """
+    if not raw:
+        return list(DEFAULT_STEPS)
+    requested = [tok.strip() for tok in raw.split(",") if tok.strip()]
+    unknown = [s for s in requested if s not in STEPS_BY_NAME]
+    if unknown:
+        raise SystemExit(
+            f"Unknown --steps value(s): {', '.join(unknown)}.\n"
+            f"Legal steps: {', '.join(STEP_NAMES)}.\n"
+            f"Tip: omit --steps to run the default ({','.join(DEFAULT_STEPS)})."
+        )
+    chosen = set(requested)
+    return [name for name in STEP_NAMES if name in chosen]
+
+
+# Human-friendly hints for the params a step can require, so the error tells the
+# user exactly what to add (and why) rather than just the dest name.
+_PARAM_DEP_HINTS: dict[str, str] = {
+    "soc_version": "--soc-version <SoC> (target Ascend SoC, e.g. Ascend310P3; see `npu-smi info`)",
+    "batch_path": "--batch-path <batches.json> (REAL calibration batches; random data yields a garbage model)",
+    "task": "--task '<prompt>' (the deployment task prompt, must match default_task)",
+}
+
+
+def _validate_step_param_deps(chosen_steps: list[str], merged: dict[str, Any]) -> None:
+    """Raise a precise SystemExit if a chosen step is missing a required param.
+
+    Each message names the offending step and the exact flag to add, so a
+    profile that omits e.g. ``soc_version`` produces an actionable error instead
+    of a confusing skip or a late ATC failure.
+    """
+    problems: list[str] = []
+    for name in chosen_steps:
+        for dep in STEPS_BY_NAME[name].param_deps:
+            if not merged.get(dep):
+                hint = _PARAM_DEP_HINTS.get(dep, f"--{dep.replace('_', '-')}")
+                problems.append(f"  ✗ step '{name}' needs {hint}")
+    if problems:
+        raise SystemExit(
+            "Missing parameters for the requested --steps:\n"
+            + "\n".join(problems)
+            + "\nTip: pass the flag(s) above, add them to your profile, or drop the step from --steps."
+        )
+
+
 # ---------------------------------------------------------------------------
 # argparse construction (help text comes from the param table)
 # ---------------------------------------------------------------------------
@@ -305,11 +409,6 @@ def build_parser() -> argparse.ArgumentParser:
     meta.add_argument("--init", action="store_true", help="Force interactive wizard (first-time setup)")
     meta.add_argument(
         "--list-profiles", dest="list_profiles", action="store_true", help="List available profiles and exit"
-    )
-    meta.add_argument(
-        "--force",
-        action="store_true",
-        help="Rebuild every stage even if its output already exists",
     )
     return parser
 
@@ -375,12 +474,8 @@ def run_wizard(seed_values: dict[str, Any]) -> dict[str, Any]:
         cur = seed_values.get(p.dest, p.default)
         collected[p.dest] = _prompt(p, cur)
 
-    # --verify is a flow choice, ask explicitly (not a normal param).
-    ver = input("\nRun equivalence verification at the end? (verify=y / N) [N]: ").strip().lower()
-    collected["verify"] = ver in ("y", "yes")
-    # The verify task prompt only matters when verification is enabled.
-    if collected["verify"] and not collected.get("task"):
-        collected["task"] = _prompt(PARAMS_BY_DEST["task"], seed_values.get("task"))
+    # Steps are a transient per-run choice (what to do this time), not a stored
+    # preference — the wizard saves stable params only; pass --steps at run time.
     return _clean_run_params(collected)
 
 
@@ -478,13 +573,9 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
     # Derive output_dir / runtime_save_dir from exp-dir (unless explicitly set).
     apply_exp_dir_derivation(merged, sources)
 
-    # --quantize is shorthand: expand it into per-segment flags so the rest of
-    # the pipeline only ever inspects quantize_vlm / quantize_ae.
-    if merged.get("quantize"):
-        for dest in ("quantize_vlm", "quantize_ae"):
-            if not merged.get(dest):
-                merged[dest] = True
-                sources[dest] = sources.get("quantize", SRC_CLI)
+    # Parse + normalize the requested pipeline steps (registry order).
+    chosen_steps = parse_steps(merged.get("steps"))
+    merged["steps"] = ",".join(chosen_steps)
 
     # Validate required-for-run params.
     missing = [p.cli for p in PARAMS if p.required_for_run and not merged.get(p.dest)]
@@ -494,18 +585,10 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
             + ", ".join(missing)
             + "\nTip: use --init for the wizard, or --profile to reuse a saved param group."
         )
-    # --verify needs a task prompt; check post-merge so profile/wizard can supply it.
-    if merged.get("verify") and not merged.get("task"):
-        raise SystemExit(
-            "--verify requires --task (the deployment task prompt)."
-            "\nTip: pass --task '<prompt>', or drop --verify to skip verification."
-        )
-    # VLM W8A8 calibration needs a real batch (random data => garbage model).
-    if merged.get("quantize_vlm") and not merged.get("batch_path"):
-        raise SystemExit(
-            "--quantize-vlm requires --batch-path (real calibration batches; random data yields a garbage model)."
-            "\nTip: pass --batch-path <batches.json>, or drop --quantize-vlm."
-        )
+    # Per-step parameter dependencies: a chosen step whose required param is
+    # absent gets a precise "add this flag" message (covers profiles that omit
+    # soc_version / batch_path / task).
+    _validate_step_param_deps(chosen_steps, merged)
 
     # Build final namespace with all PARAMS present (fill remaining with builtin).
     final = argparse.Namespace()
@@ -515,7 +598,6 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
     final.config = config_path
     final.profile = ns.profile
     final.save_as = ns.save_as
-    final.force = ns.force
 
     # Optional explicit save-as.
     if ns.save_as:
@@ -538,13 +620,12 @@ def print_effective(resolved: ResolvedConfig) -> None:
         "dtype",
         "device",
         "soc_version",
-        "quantize_vlm",
-        "quantize_ae",
+        "steps",
         "batch_path",
+        "donor_device",
         "calib_dir",
         "num_calib",
         "amp_num",
-        "verify",
         "task",
         "log_level",
     ]
@@ -560,9 +641,10 @@ def print_effective(resolved: ResolvedConfig) -> None:
 
 # Run params that are transient per-invocation flow switches — useful to pass
 # on the CLI but meaningless (and surprising) to persist into _last/profiles.
-# Quant flow flags belong here too: "I quantized last time" must not silently
-# re-trigger quantization (and its --batch-path requirement) on a later run.
-_TRANSIENT_KEYS = {"verify", "quantize", "quantize_vlm", "quantize_ae"}
+# ``steps`` belongs here: "I quantized / verified last time" (by listing those
+# steps) must not silently re-trigger them — and their --batch-path / --task
+# requirements — on a later plain export run.
+_TRANSIENT_KEYS = {"steps"}
 
 
 def _strip_for_persist(run_params: dict[str, Any]) -> dict[str, Any]:
