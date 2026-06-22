@@ -19,6 +19,7 @@ setup(
     entry_points={
         "console_scripts": [
             "frame_inspect = model_utils.frame_inspect:main",
+            "pi05-export = model_utils.pi05_export.__main__:console_main",
         ],
     },
 )

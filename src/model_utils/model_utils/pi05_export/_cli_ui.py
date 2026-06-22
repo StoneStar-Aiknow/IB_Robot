@@ -39,6 +39,28 @@ _LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 _DATE_FORMAT = "%H:%M:%S"
 
 
+def build_onnx_suffix(*, opset: int = 17, dynamo: bool = False, dtype: str = "fp16", device: str = "cpu") -> str:
+    """Build the config suffix encoded into auto-generated ONNX filenames.
+
+    Single source of truth for the filename convention, shared by both export
+    scripts (VLM / Action Expert) and the pipeline orchestrator so the predicted
+    skip/resume paths can never drift from what the exporters actually write.
+
+    Example: ``_op17_nodyn_fp16_cpu``. Abbreviations: ``op``=opset,
+    ``dyn``/``nodyn``=dynamo, ``fp16``/``fp32``=dtype, trailing=export device.
+    The dynamo exporter ignores ``opset`` and is fixed to 18 (mirrored here);
+    constant folding is always on and therefore not encoded in the name.
+    """
+    actual_opset = 18 if dynamo else opset
+    parts = [
+        f"op{actual_opset}",
+        "dyn" if dynamo else "nodyn",
+        dtype,
+        device,
+    ]
+    return "_" + "_".join(parts)
+
+
 def setup_logging(level: str = "INFO") -> None:
     """Configure root logging once, with the toolchain's unified format.
 

@@ -150,10 +150,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
+        "--policy-path",
         "--pretrained-policy-path",
+        dest="pretrained_policy_path",
         type=str,
         required=True,
-        help="Local PI05 policy directory (where config.om.json is written).",
+        help="Local PI05 policy directory (where config.om.json is written). Alias: --pretrained-policy-path.",
     )
     p.add_argument(
         "--soc-version",

@@ -39,34 +39,15 @@ Design notes
 
 from __future__ import annotations
 
-import argparse
 import logging
 import subprocess
 import sys
 from pathlib import Path
 
-from model_utils.pi05_export._cli_ui import Stage, print_summary, setup_logging
+from model_utils.pi05_export import _cli
+from model_utils.pi05_export._cli_ui import Stage, build_onnx_suffix, print_summary, setup_logging
 
 LOGGER = logging.getLogger("pi05_export.pipeline")
-
-
-def _onnx_suffix(*, opset: int = 17, dynamo: bool = False, dtype: str = "fp16", device: str = "cpu") -> str:
-    """Mirror the stage scripts' ``_build_onnx_config_suffix`` exactly.
-
-    Kept in sync with convert_onnx_vlm / convert_onnx_action_expert so we can
-    predict their auto-generated output filenames for skip/resume + downstream
-    wiring. dynamo export ignores opset and is fixed to 18 (same as the scripts);
-    constant folding is always on and not encoded; the trailing tag is the bare
-    export device type (cpu / cuda / npu).
-    """
-    actual_opset = 18 if dynamo else opset
-    parts = [
-        f"op{actual_opset}",
-        "dyn" if dynamo else "nodyn",
-        dtype,
-        device,
-    ]
-    return "_" + "_".join(parts)
 
 
 def _run_module(module: str, cli_args: list[str]) -> None:
@@ -81,82 +62,26 @@ def _run_module(module: str, cli_args: list[str]) -> None:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(
-        prog="python -m model_utils.pi05_export",
-        description="One-command PI05 export pipeline: ONNX → (OM) → (verify).",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    p.add_argument(
-        "--policy-path",
-        type=str,
-        required=True,
-        help="Local PI05 policy directory (config + weights).",
-    )
-    p.add_argument(
-        "--dtype",
-        type=str,
-        choices=["fp16", "fp32", "auto"],
-        default="fp16",
-        help="Export precision; applied consistently to BOTH segments.",
-    )
-    p.add_argument(
-        "--output-dir",
-        type=str,
-        default="outputs/onnx",
-        help="Directory for the exported ONNX files.",
-    )
-    p.add_argument(
-        "--runtime-save-dir",
-        type=str,
-        default="runtime_save",
-        help="Directory for the VLM→AE handoff tensors (kept for inspection).",
-    )
-    p.add_argument(
-        "--soc-version",
-        type=str,
-        default=None,
-        help="Ascend SoC (e.g. Ascend310P3). When given, ATC→OM compile runs too.",
-    )
-    p.add_argument(
-        "--verify",
-        action="store_true",
-        help="Run split-vs-monolithic equivalence verification at the end.",
-    )
-    p.add_argument(
-        "--task",
-        type=str,
-        default=None,
-        help="Task prompt for --verify (must match deployment default_task).",
-    )
-    p.add_argument(
-        "--device",
-        type=str,
-        default="cpu",
-        help="Torch device for export / verification (cpu, cuda:0, …).",
-    )
-    p.add_argument(
-        "--force",
-        action="store_true",
-        help="Rebuild every stage even if its output already exists.",
-    )
-    p.add_argument("--log-level", type=str, default="INFO", help="Logging level.")
-    args = p.parse_args()
+    # All argument ergonomics (profile / wizard / --exp-dir derivation /
+    # remember-last) live in _cli so this entry point stays focused on stage
+    # orchestration. Every historical explicit flag still works and overrides
+    # whatever a profile/derivation would supply.
+    resolved = _cli.resolve()
+    args = resolved.args
 
     setup_logging(args.log_level)
+    _cli.print_effective(resolved)
 
     policy_path = Path(args.policy_path).expanduser()
     if not policy_path.is_dir():
         LOGGER.error("--policy-path %s is not a local directory.", policy_path)
-        return 1
-    if args.verify and not args.task:
-        LOGGER.error("--verify requires --task (the deployment task prompt).")
         return 1
 
     output_dir = Path(args.output_dir).expanduser()
     runtime_save_dir = Path(args.runtime_save_dir).expanduser()
     # Bare device type (cpu / cuda / npu) is part of the exported filename.
     device_tag = args.device.split(":", 1)[0]
-    suffix = _onnx_suffix(dtype=args.dtype, device=device_tag)
+    suffix = build_onnx_suffix(dtype=args.dtype, device=device_tag)
     vlm_onnx = output_dir / f"pi05-vlm{suffix}.onnx"
     ae_onnx = output_dir / f"pi05-action_expert{suffix}.onnx"
 
@@ -271,10 +196,19 @@ def main() -> int:
 
     print_summary("PI05 export pipeline complete", summary, status="✅ DONE")
     LOGGER.info("Intermediate products kept under %s and %s", output_dir, runtime_save_dir)
+
+    # Persist this run's effective params as ``_last`` (remember-last). Only
+    # after a successful pipeline so a failed run never poisons the cache.
+    _cli.write_last(resolved)
     return 0
 
 
-if __name__ == "__main__":
+def console_main() -> None:
+    """Entry point for the ``pi05-export`` console script.
+
+    Wraps :func:`main` with the same friendly CalledProcessError handling the
+    ``python -m`` invocation gets, then exits with the stage return code.
+    """
     try:
         raise SystemExit(main())
     except subprocess.CalledProcessError as exc:
@@ -284,3 +218,7 @@ if __name__ == "__main__":
             exc.returncode,
         )
         raise SystemExit(exc.returncode) from exc
+
+
+if __name__ == "__main__":
+    console_main()

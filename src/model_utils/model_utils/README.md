@@ -630,6 +630,88 @@ PI05 策略与单体 ACT 模型不同，导出时被拆分为 **VLM 预填充** 
 >
 > 它会按 `VLM 导出 → AE 导出 → ATC 转 OM` 自动串起整条链路，生成两个 `.om` 与 `config.om.json`。
 
+### 快速开始（推荐）
+
+为缓解「参数繁琐、路径长、含义易忘」三个痛点，pi05 导出入口与 `loss_compare` 一致，提供
+**交互向导 + profile 配置 + 派生路径 + 记住上次** 四件套。常用参数只需配置一次，之后一行命令即可复用。
+
+> 下面这套显式命令（见「一条命令的端到端流程」）**完全保持可用**，向后兼容；这只是更省心的入口。
+> 安装后还可用 `pi05-export` 控制台命令替代 `python -m model_utils.pi05_export`。
+
+**第一次使用：交互向导**
+
+直接不带参数运行（或加 `--init`），向导（英文）会逐项提示**含义 + 默认值 + 样例**，回车即用默认，
+结尾可把这组参数存成一个 profile。`--verify` 作为流程开关在向导中单独询问；选择验证时再追问 `--task`：
+
+```shell
+python -m model_utils.pi05_export          # 无配置时自动进入向导
+python -m model_utils.pi05_export --init   # 任何时候强制重新进向导
+```
+
+**日常使用：profile + 实验目录**
+
+```shell
+# 引用 profile，只需再给一个实验目录；onnx/ 与 runtime_save/ 自动派生
+python -m model_utils.pi05_export --profile p310 --exp-dir /root/.../0612
+
+# 临时覆盖某个参数（命令行优先级最高）
+python -m model_utils.pi05_export --profile p310 --exp-dir /root/.../0612 --dtype fp32
+```
+
+**派生路径约定**：`--exp-dir <DIR>` 会自动派生两条长路径，无需再分别手填：
+
+| 派生项 | 路径 |
+| --- | --- |
+| `--output-dir` | `<DIR>/onnx/` |
+| `--runtime-save-dir` | `<DIR>/runtime_save/` |
+
+显式传同名参数会覆盖对应派生值。OM 与 `config.om.json` 仍写入 `--policy-path` 目录（运行时
+`device:=ascend_om` 约定），**不**随 `--exp-dir` 派生。
+
+**记住上次**：每次成功运行后，最终生效参数会自动写入配置文件的 `_last` 段。下次不指定 `--profile`
+时即自动复用上次参数（启动时会打印每个参数的来源）：
+
+```shell
+python -m model_utils.pi05_export --exp-dir /root/.../0613   # 其余参数沿用上次
+```
+
+**其他配置命令**：
+
+```shell
+python -m model_utils.pi05_export --list-profiles            # 列出已有 profile
+python -m model_utils.pi05_export ... --save-as p310         # 把当前参数另存为 profile
+python -m model_utils.pi05_export --config /path/to.yaml ... # 指定配置文件
+```
+
+#### 配置文件
+
+默认位置 `~/.config/model_utils/pi05_export.yaml`（可用 `--config` 或环境变量 `PI05_EXPORT_CONFIG`
+覆盖），三个段：
+
+```yaml
+# 所有 profile 共享的默认值
+defaults:
+  dtype: fp16
+
+# 命名 profile（常用参数组）
+profiles:
+  p310:                          # 昇腾 310P 一步到位
+    policy_path: /root/.../pretrained_model
+    soc_version: Ascend310P3
+
+# 由脚本自动回写，等价「记住上次」；不要手动维护
+_last:
+  profile: p310
+  policy_path: /root/.../pretrained_model
+  soc_version: Ascend310P3
+  exp_dir: /root/.../0612
+```
+
+参数优先级（高 → 低）：**命令行 > `--profile` > `defaults` > `_last`（仅未指定 profile 时）> 内置默认**。
+
+> 提示：`_last` 与 profile 里**不会**保存派生出来的 `output_dir/runtime_save_dir`（只存 `exp_dir`），
+> 这样以后换 `--exp-dir` 才能正确重新派生；`verify` 作为临时流程开关也不会被持久化。
+
 ### 一条命令的端到端流程（推荐）
 
 `python -m model_utils.pi05_export` 是整个工具链的统一入口，自动编排各阶段并在阶段间正确
@@ -656,15 +738,18 @@ python -m model_utils.pi05_export \
 
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `--policy-path` | ✅ | — | 本地 PI05 策略目录（含 config + 权重） |
+| `--policy-path` | ✅ | — | 本地 PI05 策略目录（含 config + 权重）。可由 profile 提供 |
+| `--exp-dir` | ❌ | `None` | 实验目录：自动派生 `onnx/`/`runtime_save/`，免去分别手填两条长路径 |
 | `--dtype` | ❌ | `fp16` | 导出精度，**同时应用于 VLM 与 AE 两段**（`fp16` / `fp32` / `auto`） |
 | `--soc-version` | ❌ | `None` | 给定时追加 ATC→OM 编译（如 `Ascend310P3`，见下文「查看芯片版本号」） |
 | `--verify` | ❌ | `false` | 结尾运行拆分 vs 整体等价性验证（需同时给 `--task`） |
 | `--task` | ❌ | `None` | `--verify` 所需的任务提示，须与部署 `default_task` 一致 |
 | `--device` | ❌ | `cpu` | 导出/验证设备（`cpu` / `cuda:0` / `npu`），会体现在 ONNX 文件名中 |
-| `--output-dir` | ❌ | `outputs/onnx` | 导出 ONNX 的目录 |
-| `--runtime-save-dir` | ❌ | `runtime_save` | VLM→AE 中转张量目录（保留以便排查） |
+| `--output-dir` | ❌ | `outputs/onnx` | 导出 ONNX 的目录。可由 `--exp-dir` 派生为 `<DIR>/onnx/` |
+| `--runtime-save-dir` | ❌ | `runtime_save` | VLM→AE 中转张量目录。可由 `--exp-dir` 派生为 `<DIR>/runtime_save/` |
 | `--force` | ❌ | `false` | 即使产物已存在也强制重建每个阶段 |
+
+> 配置/向导相关：`--config`（配置文件路径）、`--profile`（引用 profile）、`--save-as`（另存为 profile）、`--init`（强制向导）、`--list-profiles`（列出 profile）。详见上方「快速开始」。
 
 #### 特性
 
@@ -724,6 +809,8 @@ pi05-vlm_op17_nodyn_fp16_cpu.onnx
 统一入口内部按顺序调用下列子脚本；需要单独运行某一步时也可直接调用。
 
 #### 导出脚本
+
+> 三个子脚本的策略目录参数统一为 `--policy-path`（旧名 `--pretrained-policy-path` 作为别名保留，向后兼容）。
 
 | 脚本 | 用途 |
 | --- | --- |

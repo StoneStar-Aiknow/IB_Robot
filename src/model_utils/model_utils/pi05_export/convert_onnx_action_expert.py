@@ -36,7 +36,7 @@ except ImportError:
     torch_npu = None
 
 
-from model_utils.pi05_export._cli_ui import setup_logging
+from model_utils.pi05_export._cli_ui import build_onnx_suffix, setup_logging
 from model_utils.pi05_export.ascend_export_patches import (
     ascend_onnx_export_patches,
     downgrade_ir_version,
@@ -50,19 +50,13 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _build_onnx_config_suffix(opset: int, dynamo: bool, dtype: str = "fp16", device: str = "cpu") -> str:
-    """Build config suffix for ONNX filename.
+    """Deprecated thin wrapper kept for backward compatibility.
 
-    Example: _op17_nodyn_fp16_cpu
-    Abbreviations: op=opset, dyn/nodyn=dynamo, fp16/fp32=dtype, trailing=export device.
-    Constant folding is always on by default and therefore not encoded in the name.
+    The filename convention now lives in one place (``_cli_ui.build_onnx_suffix``)
+    so the pipeline orchestrator's predicted skip/resume paths can never drift
+    from what this exporter writes.
     """
-    parts = [
-        f"op{opset}",
-        "dyn" if dynamo else "nodyn",
-        dtype,
-        device,
-    ]
-    return "_" + "_".join(parts)
+    return build_onnx_suffix(opset=opset, dynamo=dynamo, dtype=dtype, device=device)
 
 
 def _iter_graph_tensors(model_proto):
@@ -177,10 +171,12 @@ def _clean_onnx_domains(onnx_path: Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export PI05 Action Expert to ONNX.")
     parser.add_argument(
+        "--policy-path",
         "--pretrained-policy-path",
+        dest="pretrained_policy_path",
         type=str,
         required=True,
-        help="Path to the pretrained PI05 policy (contains config/model).",
+        help="Path to the pretrained PI05 policy (contains config/model). Alias: --pretrained-policy-path.",
     )
     parser.add_argument(
         "--output",
