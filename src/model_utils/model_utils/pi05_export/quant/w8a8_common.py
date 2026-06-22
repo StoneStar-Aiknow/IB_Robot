@@ -915,12 +915,21 @@ def transplant_int8_into_npu_graph(donor_onnx: Path, npu_onnx: Path, output_onnx
 
         a_npu = m_npu.input[0]
         out_npu = m_npu.output[0]
-        # Conv keeps its bias inside the node → copy every initializer input;
-        # MatMul/Gemm carry only the int8 weight (bias is the dropped int32 Add).
-        if compute.op_type == "Conv":
-            donor_param_inputs = [i for i in compute.input[1:]]
-        else:
-            donor_param_inputs = [compute.input[1]]
+        # Which donor initializers to transplant alongside the int8 weight:
+        #   * Conv — bias (if any) is folded inside the node → copy every param.
+        #   * biased MatMul — msModelSlim emits a separate int32 bias-Add that we
+        #     bypass above, so compute.input is just [quant_out, weight]; the NPU
+        #     graph's own fp16 Add re-applies the bias.
+        #   * biased Gemm — msModelSlim folds the int32 bias *inside* the int8 Gemm
+        #     as a third input (compute.input = [quant_out, weight, bias]) with NO
+        #     separate Add. That is the canonical fused-bias int8 kernel
+        #     (int8_matmul + int32_bias accumulate, then AscendDequant scales), so
+        #     we KEEP the bias to reproduce it exactly — and must copy the
+        #     bias_quantized initializer too, else the transplanted Gemm references
+        #     a tensor that is never declared and the final topo-sort fails.
+        # In every case donor_param_inputs lists the initializer inputs we both keep
+        # on the transplanted node and copy into the NPU graph.
+        donor_param_inputs = list(compute.input[1:])
         deq_scale = deq.input[1]
 
         # Shared-AscendQuant consistency: q/k/v must resolve to one activation.
@@ -941,7 +950,10 @@ def transplant_int8_into_npu_graph(donor_onnx: Path, npu_onnx: Path, output_onnx
             new_nodes.append(q2)
             emitted_quant.add(quant.name)
 
-        # int8 compute node: keep donor inputs (quant output + int8 params) / output.
+        # int8 compute node: copy the donor node verbatim. Its inputs are the
+        # quant output + the int8 params (weight, and for a fused-bias Gemm the
+        # int32 bias) — all of which we copy into the NPU graph below, so no input
+        # dangles.
         m2 = onnx.NodeProto()
         m2.CopyFrom(compute)
         new_nodes.append(m2)
