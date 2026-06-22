@@ -732,7 +732,20 @@ python -m model_utils.pi05_export \
     --policy-path path/to/pretrained_model \
     --soc-version Ascend310P3 \
     --verify --task 'pick up the cup'
+
+# 导出 + W8A8 量化（两段）+ 转 OM（量化产物自动喂给 ATC）
+python -m model_utils.pi05_export \
+    --policy-path path/to/pretrained_model \
+    --soc-version Ascend310P3 \
+    --quantize --batch-path path/to/batches.json
 ```
+
+> **继续量化（复用已有 profile）**：若此前已导出（并存成 profile），只需复用该 profile 再加
+> `--quantize*` 即可「续跑」量化——导出阶段因产物已存在自动跳过，仅运行量化与 ATC：
+>
+> ```shell
+> python -m model_utils.pi05_export --profile p310 --quantize --batch-path path/to/batches.json
+> ```
 
 #### 参数
 
@@ -742,6 +755,13 @@ python -m model_utils.pi05_export \
 | `--exp-dir` | ❌ | `None` | 实验目录：自动派生 `onnx/`/`runtime_save/`，免去分别手填两条长路径 |
 | `--dtype` | ❌ | `fp16` | 导出精度，**同时应用于 VLM 与 AE 两段**（`fp16` / `fp32` / `auto`） |
 | `--soc-version` | ❌ | `None` | 给定时追加 ATC→OM 编译（如 `Ascend310P3`，见下文「查看芯片版本号」） |
+| `--quantize` | ❌ | `false` | W8A8 量化**两段**（等价于同时给 `--quantize-vlm --quantize-ae`，需 `--batch-path`） |
+| `--quantize-vlm` | ❌ | `false` | 仅量化 VLM（gemma_2b），**需 `--batch-path` 提供真实标定** |
+| `--quantize-ae` | ❌ | `false` | 仅量化 Action Expert（gemma_300m），默认用 `--runtime-save-dir` 作单样本标定 |
+| `--batch-path` | 量化 VLM 必填 | `None` | 真实标定 batch JSON（**随机数据会量化出不可用模型**）。可由 profile 提供 |
+| `--calib-dir` | ❌ | `=--runtime-save-dir` | AE 标定样本目录（含 `past_kv_tensor.*` + `prefix_pad_masks.*`） |
+| `--num-calib` | ❌ | `16` | 标定样本数量（`<=0` 表示全部） |
+| `--amp-num` | ❌ | `0` | msModelSlim 自动混合精度的 fp16 回退层数（精度安全阀） |
 | `--verify` | ❌ | `false` | 结尾运行拆分 vs 整体等价性验证（需同时给 `--task`） |
 | `--task` | ❌ | `None` | `--verify` 所需的任务提示，须与部署 `default_task` 一致 |
 | `--device` | ❌ | `cpu` | 导出/验证设备（`cpu` / `cuda:0` / `npu`），会体现在 ONNX 文件名中 |
@@ -750,6 +770,11 @@ python -m model_utils.pi05_export \
 | `--force` | ❌ | `false` | 即使产物已存在也强制重建每个阶段 |
 
 > 配置/向导相关：`--config`（配置文件路径）、`--profile`（引用 profile）、`--save-as`（另存为 profile）、`--init`（强制向导）、`--list-profiles`（列出 profile）。详见上方「快速开始」。
+>
+> 量化说明：量化默认**关闭**。开启某段量化后，会在 fp16 ONNX 旁产出 `*_w8a8.onnx`，并由 ATC 自动改用
+> 该量化产物编译为 `.om`（未量化的段仍用 fp16 ONNX）。`--quantize*` 作为临时流程开关**不写入** `_last`/profile，
+> 而 `--batch-path` / `--calib-dir` / `--num-calib` / `--amp-num` 会随 profile 复用。量化阶段同样可断点续跑
+> （`*_w8a8.onnx` 已存在则跳过）。
 
 #### 特性
 
@@ -840,6 +865,9 @@ python -m model_utils.pi05_export.convert_om \
 > 以确保 `config.om.json` 写入真实的本地策略目录而非当前工作目录。
 
 #### 量化（W8A8 PTQ，可选）
+
+> 多数情况下无需手动调用本节脚本——统一入口的 `--quantize` / `--quantize-vlm` / `--quantize-ae`
+> 已自动编排量化并把量化产物接入 ATC（见上方「参数」）。下面是需要单独运行或精调时的底层用法。
 
 将 ONNX 量化为 W8A8 以降低显存带宽压力。**必须提供真实标定数据**（用随机数据标定会得到不可用的模型）。
 

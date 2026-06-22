@@ -192,6 +192,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Extra raw argument forwarded to atc (repeatable), e.g. --atc-arg=--precision_mode=allow_fp32_to_fp16.",
     )
     p.add_argument("--log-level", type=str, default="INFO", help="Logging level.")
+    p.add_argument(
+        "--no-summary",
+        action="store_true",
+        help="Suppress the final result block (used when an orchestrator prints its own summary).",
+    )
     return p
 
 
@@ -251,7 +256,8 @@ def main() -> int:
     rows = [(role, path) for role, path in produced]
     if not args.skip_om_manifest:
         rows.append(("manifest", str(manifest_dir / "config.om.json")))
-    print_summary("PI05 OM conversion complete", rows, status="✅ DONE")
+    if not args.no_summary:
+        print_summary("PI05 OM conversion complete", rows, status="✅ DONE")
     return 0
 
 

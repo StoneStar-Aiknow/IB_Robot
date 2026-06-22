@@ -17,8 +17,16 @@ keep ``--dtype`` consistent across two exports, or hand-write the ATC command:
 
     1. VLM ONNX export       (convert_onnx_vlm)
     2. Action Expert export  (convert_onnx_action_expert)
-    3. ATC → OM compile      (convert_om)           [only with --soc-version]
+    2a. VLM W8A8 quantize    (quant.quantize_vlm)     [only with --quantize-vlm]
+    2b. AE W8A8 quantize     (quant.quantize_ae)      [only with --quantize-ae]
+    3. ATC → OM compile      (convert_om)             [only with --soc-version]
     4. Equivalence verify    (verify_pi05_split_equivalence)  [only with --verify]
+
+Quantization is off by default. When a segment is quantized, ATC compiles its
+``*_w8a8.onnx`` instead of the fp16 ONNX. Because every stage is resumable, a
+user who already exported (e.g. via a saved profile) can "continue" into
+quantization simply by re-running with ``--profile <name> --quantize`` — the
+export stages skip (artifacts exist) and only the quant + ATC stages run.
 
 Design notes
 ------------
@@ -85,8 +93,26 @@ def main() -> int:
     vlm_onnx = output_dir / f"pi05-vlm{suffix}.onnx"
     ae_onnx = output_dir / f"pi05-action_expert{suffix}.onnx"
 
+    # W8A8 quantization (optional). Each quantized segment produces a new
+    # ``*_w8a8.onnx`` next to the fp16 ONNX, which ATC then compiles instead.
+    quant_vlm = bool(args.quantize_vlm)
+    quant_ae = bool(args.quantize_ae)
+    vlm_w8a8 = vlm_onnx.with_name(vlm_onnx.stem + "_w8a8.onnx")
+    ae_w8a8 = ae_onnx.with_name(ae_onnx.stem + "_w8a8.onnx")
+    # ATC consumes the quantized graph for any segment that was quantized.
+    vlm_atc_onnx = vlm_w8a8 if quant_vlm else vlm_onnx
+    ae_atc_onnx = ae_w8a8 if quant_ae else ae_onnx
+    # AE calibration samples default to the VLM->AE handoff tensors.
+    calib_dir = Path(args.calib_dir).expanduser() if args.calib_dir else runtime_save_dir
+
     # Count stages for the [i/total] progress prefix.
-    total = 2 + (1 if args.soc_version else 0) + (1 if args.verify else 0)
+    total = (
+        2
+        + (1 if quant_vlm else 0)
+        + (1 if quant_ae else 0)
+        + (1 if args.soc_version else 0)
+        + (1 if args.verify else 0)
+    )
     step = 0
 
     summary: list[tuple[str, str]] = []
@@ -143,6 +169,63 @@ def main() -> int:
             )
     summary.append(("Action Expert ONNX", str(ae_onnx)))
 
+    # ---- Stage 2a: VLM W8A8 quantization (optional) ----
+    if quant_vlm:
+        step += 1
+        if vlm_w8a8.is_file() and not args.force:
+            LOGGER.info("▷ [%d/%d] VLM quantize — skip (exists: %s)", step, total, vlm_w8a8)
+        else:
+            with Stage("VLM W8A8 quantize", index=step, total=total):
+                _run_module(
+                    "model_utils.pi05_export.quant.quantize_vlm",
+                    [
+                        "--onnx-path",
+                        str(vlm_onnx),
+                        "--output-path",
+                        str(vlm_w8a8),
+                        "--policy-path",
+                        str(policy_path),
+                        "--batch-path",
+                        str(Path(args.batch_path).expanduser()),
+                        "--num-calib",
+                        str(args.num_calib),
+                        "--amp-num",
+                        str(args.amp_num),
+                        "--device",
+                        args.device,
+                        *(["--task", args.task] if args.task else []),
+                        "--log-level",
+                        args.log_level,
+                    ],
+                )
+        summary.append(("VLM ONNX (W8A8)", str(vlm_w8a8)))
+
+    # ---- Stage 2b: Action Expert W8A8 quantization (optional) ----
+    if quant_ae:
+        step += 1
+        if ae_w8a8.is_file() and not args.force:
+            LOGGER.info("▷ [%d/%d] Action Expert quantize — skip (exists: %s)", step, total, ae_w8a8)
+        else:
+            with Stage("Action Expert W8A8 quantize", index=step, total=total):
+                _run_module(
+                    "model_utils.pi05_export.quant.quantize_ae",
+                    [
+                        "--onnx-path",
+                        str(ae_onnx),
+                        "--output-path",
+                        str(ae_w8a8),
+                        "--calib-dir",
+                        str(calib_dir),
+                        "--num-calib",
+                        str(args.num_calib),
+                        "--amp-num",
+                        str(args.amp_num),
+                        "--log-level",
+                        args.log_level,
+                    ],
+                )
+        summary.append(("Action Expert ONNX (W8A8)", str(ae_w8a8)))
+
     # ---- Stage 3: ATC → OM (optional) ----
     if args.soc_version:
         step += 1
@@ -160,9 +243,10 @@ def main() -> int:
                         "--soc-version",
                         args.soc_version,
                         "--vlm-onnx",
-                        str(vlm_onnx),
+                        str(vlm_atc_onnx),
                         "--ae-onnx",
-                        str(ae_onnx),
+                        str(ae_atc_onnx),
+                        "--no-summary",
                         "--log-level",
                         args.log_level,
                     ],

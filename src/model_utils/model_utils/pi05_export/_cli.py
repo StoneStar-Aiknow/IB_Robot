@@ -160,6 +160,59 @@ PARAMS: list[Param] = [
         default="INFO",
         in_wizard=False,
     ),
+    # ---- W8A8 quantization (optional; off by default) ----
+    Param(
+        dest="quantize",
+        cli="--quantize",
+        meaning="Quantize BOTH segments to W8A8 (shorthand for --quantize-vlm --quantize-ae; needs --batch-path)",
+        default=False,
+        is_flag=True,
+        in_wizard=False,
+    ),
+    Param(
+        dest="quantize_vlm",
+        cli="--quantize-vlm",
+        meaning="Quantize the VLM (gemma_2b) ONNX to W8A8 (needs --batch-path for real calibration)",
+        default=False,
+        is_flag=True,
+        in_wizard=False,
+    ),
+    Param(
+        dest="quantize_ae",
+        cli="--quantize-ae",
+        meaning="Quantize the Action Expert (gemma_300m) ONNX to W8A8",
+        default=False,
+        is_flag=True,
+        in_wizard=False,
+    ),
+    Param(
+        dest="batch_path",
+        cli="--batch-path",
+        meaning="Real calibration batches JSON (REQUIRED for VLM quantization; random data yields a garbage model)",
+        in_wizard=False,
+    ),
+    Param(
+        dest="calib_dir",
+        cli="--calib-dir",
+        meaning="AE calibration sample dir (past_kv_tensor.* + prefix_pad_masks.*); defaults to --runtime-save-dir",
+        in_wizard=False,
+    ),
+    Param(
+        dest="num_calib",
+        cli="--num-calib",
+        meaning="Number of calibration samples to use (<=0 = all)",
+        default=16,
+        type=int,
+        in_wizard=False,
+    ),
+    Param(
+        dest="amp_num",
+        cli="--amp-num",
+        meaning="msModelSlim auto-mixed-precision fp16 fallback layer count (accuracy safety valve)",
+        default=0,
+        type=int,
+        in_wizard=False,
+    ),
     Param(
         dest="verify",
         cli="--verify",
@@ -425,6 +478,14 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
     # Derive output_dir / runtime_save_dir from exp-dir (unless explicitly set).
     apply_exp_dir_derivation(merged, sources)
 
+    # --quantize is shorthand: expand it into per-segment flags so the rest of
+    # the pipeline only ever inspects quantize_vlm / quantize_ae.
+    if merged.get("quantize"):
+        for dest in ("quantize_vlm", "quantize_ae"):
+            if not merged.get(dest):
+                merged[dest] = True
+                sources[dest] = sources.get("quantize", SRC_CLI)
+
     # Validate required-for-run params.
     missing = [p.cli for p in PARAMS if p.required_for_run and not merged.get(p.dest)]
     if missing:
@@ -438,6 +499,12 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
         raise SystemExit(
             "--verify requires --task (the deployment task prompt)."
             "\nTip: pass --task '<prompt>', or drop --verify to skip verification."
+        )
+    # VLM W8A8 calibration needs a real batch (random data => garbage model).
+    if merged.get("quantize_vlm") and not merged.get("batch_path"):
+        raise SystemExit(
+            "--quantize-vlm requires --batch-path (real calibration batches; random data yields a garbage model)."
+            "\nTip: pass --batch-path <batches.json>, or drop --quantize-vlm."
         )
 
     # Build final namespace with all PARAMS present (fill remaining with builtin).
@@ -471,13 +538,19 @@ def print_effective(resolved: ResolvedConfig) -> None:
         "dtype",
         "device",
         "soc_version",
+        "quantize_vlm",
+        "quantize_ae",
+        "batch_path",
+        "calib_dir",
+        "num_calib",
+        "amp_num",
         "verify",
         "task",
         "log_level",
     ]
     for dest in order:
         val = getattr(args, dest, None)
-        if val in (None, ""):
+        if val in (None, "", False):
             continue
         origin = src.get(dest, SRC_BUILTIN)
         arrow = "  → " if origin.startswith("derived") else "  "
@@ -487,7 +560,9 @@ def print_effective(resolved: ResolvedConfig) -> None:
 
 # Run params that are transient per-invocation flow switches — useful to pass
 # on the CLI but meaningless (and surprising) to persist into _last/profiles.
-_TRANSIENT_KEYS = {"verify"}
+# Quant flow flags belong here too: "I quantized last time" must not silently
+# re-trigger quantization (and its --batch-path requirement) on a later run.
+_TRANSIENT_KEYS = {"verify", "quantize", "quantize_vlm", "quantize_ae"}
 
 
 def _strip_for_persist(run_params: dict[str, Any]) -> dict[str, Any]:
