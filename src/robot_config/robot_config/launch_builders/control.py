@@ -17,7 +17,12 @@ from launch_ros.actions import Node
 
 from robot_config.launch_builders.description import generate_robot_description
 from robot_config.logger_utils import get_colored_logger
-from robot_config.utils import parse_bool, resolve_ros_path, validate_joint_config
+from robot_config.utils import (
+    parse_bool,
+    resolve_calibration_paths_from_config,
+    resolve_ros_path,
+    validate_joint_config,
+)
 
 logger = get_colored_logger("robot_config.control")
 
@@ -89,15 +94,20 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers="t
 
     logger.info("Creating ros2_control nodes")
 
-    # Pre-flight check: calibration file must exist for real hardware
+    # Pre-flight check: calibration files must exist for real hardware.
     if not is_sim:
-        calib_file_raw = ros2_control_config.get("calib_file", "")
-        if calib_file_raw:
-            calib_file_resolved = resolve_ros_path(calib_file_raw)
+        try:
+            calibration_paths = resolve_calibration_paths_from_config(robot_config)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid ros2_control calibration configuration: {exc}") from exc
+        if not calibration_paths:
+            logger.warning(
+                "No calibration files configured for real hardware mode; calibrated joint conversion is unavailable"
+            )
+        for calib_file_resolved in calibration_paths:
             if not Path(calib_file_resolved).exists():
                 logger.error("Calibration file not found!")
                 logger.error(f"  Resolved path: {calib_file_resolved}")
-                logger.error(f"  Raw path:      {calib_file_raw}")
                 logger.error(f"  HOME=$HOME -> {os.environ.get('HOME', '(unset)')}")
                 logger.error("")
                 logger.error("  Please run calibration first:")
