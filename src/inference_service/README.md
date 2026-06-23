@@ -69,6 +69,20 @@ control_modes:
       model: so101_act
 ```
 
+### LeRobot 动作单位转换标定
+
+`lerobot_policy_node.py` 的 rad↔LeRobot 单位转换直接读取 `robot_config` 中的
+ros2_control 标定来源。单臂旧配置使用 `ros2_control.calib_file` 并映射到
+`arm` namespace；双臂或更多来源使用
+`ros2_control.xacro_args.calib_file_<namespace>`，例如 `calib_file_left`、
+`calib_file_right`、`calib_file_front` 或 `calib_file_1`。后缀即 LeRobot joint namespace，
+允许字母、数字和下划线；建议优先使用 `left`、`right`、`front` 这类语义名称，
+便于和 `joint_names`、数据集 metadata 及策略特征对齐。`calib_file` 不能与 namespace 后缀标定来源
+混用，否则硬件/xacro 和推理转换可能读取不同标定源。
+
+重复 namespace 或缺失标定文件会在 launch/config 校验或节点初始化时失败，
+而不是静默禁用转换。
+
 ### 注意力可视化
 
 推理节点支持节点化注意力可视化：

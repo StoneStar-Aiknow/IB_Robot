@@ -43,6 +43,21 @@ src/robot_config/config/robots/so101_single_arm.yaml
 
 SO101 配置中的 `observation.current` 从 `/so101_follower/joint_currents` 的 `ibrobot_msgs/msg/JointCurrent.current` 字段解码，selector 使用 `current.*`，单位为安培。历史数据集缺少 `observation.current` 时，frame_detector 会跳过 critical frame 检测，并让 freeze frame 检测退化为仅使用速度判断。
 
+LeRobot 单位转换的标定来源同样来自 `robot_config`。单臂旧配置使用
+`ros2_control.calib_file`；双臂或更多来源使用
+`ros2_control.xacro_args.calib_file_<namespace>`，例如 `calib_file_left`、
+`calib_file_right`、`calib_file_front` 或 `calib_file_1`。后缀即 LeRobot joint namespace，
+允许字母、数字和下划线；建议优先使用 `left`、`right`、`front` 这类语义名称，
+便于和 `joint_names`、数据集 metadata 及策略特征对齐。`calib_file` 不能与
+namespace 后缀标定来源混用。
+
+Episode 录制会在 dataset metadata 中保存 LeRobot conversion snapshot。
+`bag_to_lerobot` 转换旧 dataset 时按以下顺序恢复转换表：已有 dataset metadata
+中的 calibration snapshot、从 `robot_config` 解析出的 named calibration sources、
+最后才是 legacy `calibration_file` pathsep 字符串。`policy_eval` 的静态
+calibration 检查也复用同一解析规则，因此重复 namespace 或混用 legacy/new schema
+会在评估报告中暴露为配置问题。
+
 ## 工具
 
 ### 1. record_cli - 交互式录制客户端
