@@ -8,17 +8,16 @@ This module handles:
 URDF building (xacro processing + camera injection) is in description.py.
 """
 
-
 import os
 import tempfile
 from pathlib import Path
 
 import yaml
-from robot_config.logger_utils import get_colored_logger
 from launch_ros.actions import Node
 
-from robot_config.utils import resolve_ros_path, parse_bool, validate_joint_config
 from robot_config.launch_builders.description import generate_robot_description
+from robot_config.logger_utils import get_colored_logger
+from robot_config.utils import parse_bool, resolve_ros_path, validate_joint_config
 
 logger = get_colored_logger("robot_config.control")
 
@@ -42,28 +41,28 @@ def generate_controller_spawners(controller_names, use_sim=True, controller_mana
     timeout = 60 if is_sim else 10
     switch_timeout = 30 if is_sim else 5
 
-    return [Node(
-        package="controller_manager",
-        executable="spawner",
-        name=f"spawner_{controller_names[0]}_group",
-        parameters=[
-            {"use_sim_time": is_sim}
-        ],
-        arguments=[
-            *controller_names,
-            "--controller-manager",
-            controller_manager_name,
-            "--controller-manager-timeout",
-            str(timeout),
-            "--switch-timeout",
-            str(switch_timeout),
-            "--activate-as-group",
-        ],
-        output="screen",
-    )]
+    return [
+        Node(
+            package="controller_manager",
+            executable="spawner",
+            name=f"spawner_{controller_names[0]}_group",
+            parameters=[{"use_sim_time": is_sim}],
+            arguments=[
+                *controller_names,
+                "--controller-manager",
+                controller_manager_name,
+                "--controller-manager-timeout",
+                str(timeout),
+                "--switch-timeout",
+                str(switch_timeout),
+                "--activate-as-group",
+            ],
+            output="screen",
+        )
+    ]
 
 
-def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='true'):
+def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers="true"):
     """Generate ros2_control nodes from configuration.
 
     Args:
@@ -99,15 +98,11 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
                 logger.error("Calibration file not found!")
                 logger.error(f"  Resolved path: {calib_file_resolved}")
                 logger.error(f"  Raw path:      {calib_file_raw}")
-                logger.error(
-                    f"  HOME=$HOME -> {os.environ.get('HOME', '(unset)')}"
-                )
+                logger.error(f"  HOME=$HOME -> {os.environ.get('HOME', '(unset)')}")
                 logger.error("")
                 logger.error("  Please run calibration first:")
                 calib_port = ros2_control_config.get("port", "/dev/ttyACM0")
-                logger.error(
-                    "    ros2 run so101_hardware calibrate_arm --arm follower --port " + calib_port
-                )
+                logger.error("    ros2 run so101_hardware calibrate_arm --arm follower --port " + calib_port)
                 raise RuntimeError(
                     f"Calibration file not found: {calib_file_resolved}. "
                     f"Run: ros2 run so101_hardware calibrate_arm --arm follower --port " + calib_port
@@ -124,12 +119,14 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
     robot_description_str, robot_description = _desc_result
 
     # Robot State Publisher
-    nodes.append(Node(
-        package='robot_state_publisher',
-        executable='robot_state_publisher',
-        output='screen',
-        parameters=[robot_description],
-    ))
+    nodes.append(
+        Node(
+            package="robot_state_publisher",
+            executable="robot_state_publisher",
+            output="screen",
+            parameters=[robot_description],
+        )
+    )
 
     # Get control mode configuration
     control_mode_name = robot_config.get("default_control_mode", "model_inference")
@@ -176,29 +173,36 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
             # Using a file with the correct key avoids the mismatch WITHOUT
             # setting name= on the Node (which would add a global __node
             # remapping that breaks child controller nodes).
-            cm_params_file = tempfile.NamedTemporaryFile(
-                mode='w', suffix='.yaml', delete=False,
-                prefix='cm_robot_desc_',
-            )
-            yaml.dump(
-                {'controller_manager': {'ros__parameters': {
-                    'robot_description': robot_description_str,
-                }}},
-                cm_params_file,
-                default_flow_style=False,
-            )
-            cm_params_file.close()
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".yaml",
+                delete=False,
+                prefix="cm_robot_desc_",
+            ) as cm_params_file:
+                yaml.dump(
+                    {
+                        "controller_manager": {
+                            "ros__parameters": {
+                                "robot_description": robot_description_str,
+                            }
+                        }
+                    },
+                    cm_params_file,
+                    default_flow_style=False,
+                )
             logger.info(f"Controller manager params: {cm_params_file.name}")
 
-            nodes.append(Node(
-                package="controller_manager",
-                executable="ros2_control_node",
-                parameters=[cm_params_file.name, controllers_config],
-                remappings=[
-                    ("~/robot_description", "/robot_description"),
-                ],
-                output="screen",
-            ))
+            nodes.append(
+                Node(
+                    package="controller_manager",
+                    executable="ros2_control_node",
+                    parameters=[cm_params_file.name, controllers_config],
+                    remappings=[
+                        ("~/robot_description", "/robot_description"),
+                    ],
+                    output="screen",
+                )
+            )
 
             if is_auto_start and controller_names:
                 spawners = generate_controller_spawners(controller_names, use_sim=False)
@@ -213,9 +217,6 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers='t
 
         if is_auto_start and controller_names:
             deferred_sim_spawners = generate_controller_spawners(controller_names, use_sim=True)
-            logger.info(
-                f"Deferring {len(deferred_sim_spawners)} controller spawners "
-                "(handled by caller)"
-            )
+            logger.info(f"Deferring {len(deferred_sim_spawners)} controller spawners (handled by caller)")
 
     return nodes, controller_names, deferred_sim_spawners, robot_description
