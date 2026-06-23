@@ -75,9 +75,9 @@ robot:
     # Generic mapping: inject these directly into URDF xacro args
     xacro_args:
       port_1: /dev/ttyACM0
-      calib_file_1: $(env HOME)/.calibrate/so101_follower_left_calibrate.json
+      calib_file_left: $(env HOME)/.calibrate/so101_follower_left_calibrate.json
       port_2: /dev/ttyACM1
-      calib_file_2: $(env HOME)/.calibrate/so101_follower_right_calibrate.json
+      calib_file_right: $(env HOME)/.calibrate/so101_follower_right_calibrate.json
 
     controllers:
       - arm_position_controller_left

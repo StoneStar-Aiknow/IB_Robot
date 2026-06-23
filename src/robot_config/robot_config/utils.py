@@ -14,6 +14,7 @@ import math
 import os
 import re
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -262,7 +263,17 @@ def prepare_lerobot_env():
 # Each entry: (rad_min, rad_max, pct_span, pct_offset)
 JointConversionEntry = tuple[float, float, float, float]
 CalibrationSnapshot = dict[str, dict[str, Any]]
-CalibrationSource = str | list[str] | tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CalibrationSourceSpec:
+    """Resolved calibration file with the namespace needed for numeric keys."""
+
+    resolved_path: str
+    namespace: str
+
+
+CalibrationSource = str | os.PathLike[str] | CalibrationSourceSpec | dict[str, Any] | list[Any] | tuple[Any, ...]
 
 _TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
 
@@ -329,26 +340,98 @@ def resolve_gripper_joints_from_config(robot_config: dict[str, Any]) -> list[str
     return _dedupe_strings(gripper_joints)
 
 
-def resolve_calibration_paths_from_config(robot_config: dict[str, Any]) -> list[str]:
-    """Resolve calibration file path list from raw robot_config."""
+def _make_calibration_source_spec(
+    path: Any,
+    namespace: Any,
+) -> CalibrationSourceSpec:
+    resolved_path = resolve_ros_path(str(path or "").strip())
+    if not resolved_path:
+        raise ValueError("Calibration source path must be non-empty")
+
+    namespace_text = str(namespace or "").strip()
+    if not namespace_text:
+        raise ValueError("Calibration source namespace must be non-empty")
+
+    return CalibrationSourceSpec(
+        resolved_path=resolved_path,
+        namespace=namespace_text,
+    )
+
+
+def _coerce_calibration_source_spec(value: Any) -> CalibrationSourceSpec:
+    if isinstance(value, CalibrationSourceSpec):
+        return value
+    if isinstance(value, dict):
+        raw_path = value.get("resolved_path") or value.get("path") or value.get("file")
+        return _make_calibration_source_spec(
+            path=raw_path,
+            namespace=value.get("namespace"),
+        )
+    raise TypeError(f"Unsupported calibration source spec: {value!r}")
+
+
+def _is_calibration_source_spec(value: Any) -> bool:
+    if isinstance(value, CalibrationSourceSpec):
+        return True
+    return (
+        isinstance(value, dict)
+        and bool(value.get("namespace"))
+        and bool(value.get("resolved_path") or value.get("path") or value.get("file"))
+    )
+
+
+def _validate_calibration_source_namespaces(specs: list[CalibrationSourceSpec]) -> list[CalibrationSourceSpec]:
+    seen: set[str] = set()
+    for spec in specs:
+        if spec.namespace in seen:
+            raise ValueError(f"Duplicate calibration source namespace: {spec.namespace}")
+        seen.add(spec.namespace)
+    return specs
+
+
+def resolve_calibration_source_specs_from_config(robot_config: dict[str, Any]) -> list[CalibrationSourceSpec]:
+    """Resolve calibration source specs from raw robot_config.
+
+    ``ros2_control.calib_file`` is the legacy single-arm source and maps to
+    ``arm``.  Multi-source configs use namespace-suffixed
+    ``ros2_control.xacro_args.calib_file_<namespace>`` keys, for example
+    ``calib_file_left``, ``calib_file_right``, and ``calib_file_1``.
+    """
     ros2_control = robot_config.get("ros2_control", {}) or {}
     calib_file = str(ros2_control.get("calib_file", "") or "").strip()
-    if calib_file:
-        return [resolve_ros_path(calib_file)]
 
     xacro_args = ros2_control.get("xacro_args", {}) or {}
-    numbered_calib_files = []
+    named_calib_files: list[tuple[str, Any]] = []
     for key, value in xacro_args.items():
-        match = re.fullmatch(r"calib_file_(\d+)", str(key))
-        if match:
-            numbered_calib_files.append((int(match.group(1)), value))
-    numbered_calib_files.sort(key=lambda item: item[0])
-    calib_files = _dedupe_strings([value for _, value in numbered_calib_files])
-    return [resolve_ros_path(path) for path in calib_files]
+        match = re.fullmatch(r"calib_file_([A-Za-z0-9_]+)", str(key))
+        if match and str(value or "").strip():
+            named_calib_files.append((match.group(1), value))
+    named_calib_files.sort(key=lambda item: item[0])
+
+    if calib_file and named_calib_files:
+        raise ValueError(
+            "ros2_control.calib_file cannot be combined with ros2_control.xacro_args.calib_file_<namespace>"
+        )
+    if calib_file:
+        return [_make_calibration_source_spec(calib_file, "arm")]
+
+    specs: list[CalibrationSourceSpec] = []
+    for namespace, path in named_calib_files:
+        specs.append(_make_calibration_source_spec(path, namespace))
+    return _validate_calibration_source_namespaces(specs)
+
+
+def resolve_calibration_paths_from_config(robot_config: dict[str, Any]) -> list[str]:
+    """Resolve calibration file path list from raw robot_config."""
+    return [spec.resolved_path for spec in resolve_calibration_source_specs_from_config(robot_config)]
 
 
 def resolve_calibration_path_from_config(robot_config: dict[str, Any]) -> str:
-    """Resolve calibration file path(s) as a path-separator encoded string."""
+    """Resolve calibration file path(s) as a legacy pathsep string.
+
+    Path strings lose explicit source namespaces; runtime conversion callers
+    should prefer ``resolve_calibration_source_specs_from_config``.
+    """
     return os.pathsep.join(resolve_calibration_paths_from_config(robot_config))
 
 
@@ -388,7 +471,7 @@ def resolve_lerobot_norm_mode(
     return NORM_MODE_RANGE
 
 
-def _normalize_calibration_sources(calib_file: CalibrationSource) -> list[str]:
+def _normalize_legacy_calibration_paths(calib_file: CalibrationSource) -> list[str]:
     if isinstance(calib_file, list | tuple):
         return [resolve_ros_path(str(path)) for path in calib_file if str(path or "").strip()]
     text = str(calib_file or "").strip()
@@ -396,6 +479,36 @@ def _normalize_calibration_sources(calib_file: CalibrationSource) -> list[str]:
         return []
     parts = [part for part in text.split(os.pathsep) if part]
     return [resolve_ros_path(part) for part in parts]
+
+
+def _normalize_explicit_calibration_source_specs(calib_file: CalibrationSource) -> list[CalibrationSourceSpec]:
+    if _is_calibration_source_spec(calib_file):
+        return [_coerce_calibration_source_spec(calib_file)]
+    if isinstance(calib_file, list | tuple) and all(_is_calibration_source_spec(source) for source in calib_file):
+        return _validate_calibration_source_namespaces(
+            [_coerce_calibration_source_spec(source) for source in calib_file]
+        )
+    return []
+
+
+def _normalize_legacy_calibration_source_specs(calib_file: CalibrationSource) -> list[CalibrationSourceSpec]:
+    resolved_paths = _normalize_legacy_calibration_paths(calib_file)
+    if len(resolved_paths) > 2:
+        raise ValueError(
+            "Legacy calibration path inputs support at most two calibration sources; "
+            "use explicit calibration source specs with namespace for more sources"
+        )
+    namespaces = ("arm",) if len(resolved_paths) == 1 else ("left", "right")
+    return [_make_calibration_source_spec(path, namespaces[index]) for index, path in enumerate(resolved_paths)]
+
+
+def _normalize_calibration_source_specs(calib_file: CalibrationSource) -> list[CalibrationSourceSpec]:
+    explicit_specs = _normalize_explicit_calibration_source_specs(calib_file)
+    if explicit_specs:
+        return explicit_specs
+    if isinstance(calib_file, list | tuple) and any(_is_calibration_source_spec(source) for source in calib_file):
+        raise TypeError("Calibration source list must not mix explicit specs with legacy path strings")
+    return _normalize_legacy_calibration_source_specs(calib_file)
 
 
 def _load_single_calibration_file(resolved_path: str) -> dict[str, Any]:
@@ -410,38 +523,50 @@ def _load_single_calibration_file(resolved_path: str) -> dict[str, Any]:
     return data
 
 
-_CALIBRATION_JOINT_COUNT = 6
-
-
 def _namespace_numeric_calibration_keys(
     calibration: dict[str, Any],
-    suffix: str,
+    namespace: str,
 ) -> dict[str, Any]:
-    namespaced = dict(calibration)
-    for index in range(1, _CALIBRATION_JOINT_COUNT + 1):
-        key = str(index)
-        if key in calibration:
-            namespaced[f"joint{index}_{suffix}"] = calibration[key]
+    namespaced: dict[str, Any] = {}
+    numeric_items: list[tuple[int, str, Any]] = []
+    for key, value in calibration.items():
+        if str(key).isdigit():
+            numeric_items.append((int(str(key)), str(key), value))
+        else:
+            namespaced[str(key)] = value
+
+    for index, key, value in sorted(numeric_items, key=lambda item: item[0]):
+        namespaced_key = f"joint{index}_{namespace}"
+        if namespaced_key in namespaced:
+            raise ValueError(f"Calibration key collision while namespacing numeric key '{key}' as '{namespaced_key}'")
+        namespaced[namespaced_key] = value
     return namespaced
 
 
+def _merge_calibration_data(merged: dict[str, Any], data: dict[str, Any], resolved_path: str) -> None:
+    for key, value in data.items():
+        if key in merged:
+            raise ValueError(f"Calibration key collision for '{key}' while loading {resolved_path}")
+        merged[key] = value
+
+
 def load_calibration_data(calib_file: CalibrationSource) -> dict[str, Any]:
-    """Load one or more calibration JSON files from disk."""
-    resolved_paths = _normalize_calibration_sources(calib_file)
-    if not resolved_paths:
-        raise FileNotFoundError("Calibration file path is empty")
+    """Load one or more calibration JSON files from disk.
 
-    if len(resolved_paths) == 1:
-        return _load_single_calibration_file(resolved_paths[0])
+    Spec inputs preserve explicit namespaces. Plain strings remain legacy mode
+    and infer namespaces from the number of pathsep-separated files.
+    """
+    return _load_calibration_data_from_specs(_normalize_calibration_source_specs(calib_file))
 
-    merged: dict[str, Any] = {}
-    suffixes = ("left", "right")
-    for index, resolved_path in enumerate(resolved_paths):
-        data = _load_single_calibration_file(resolved_path)
-        if index < len(suffixes):
-            data = _namespace_numeric_calibration_keys(data, suffixes[index])
-        merged.update(data)
-    return merged
+
+def _resolve_calibration_key(calibration: dict[str, Any], joint_name: str) -> str:
+    if joint_name in calibration:
+        return joint_name
+    if joint_name.isdigit() and str(int(joint_name)) == joint_name:
+        arm_key = f"joint{int(joint_name)}_arm"
+        if arm_key in calibration:
+            return arm_key
+    raise KeyError(f"Joint '{joint_name}' missing from calibration data")
 
 
 def extract_calibration_snapshot(
@@ -451,10 +576,8 @@ def extract_calibration_snapshot(
     """Extract a canonical calibration snapshot for the selected joints."""
     snapshot: CalibrationSnapshot = {}
     for joint_name in [str(name) for name in joint_names]:
-        if joint_name not in calibration:
-            raise KeyError(f"Joint '{joint_name}' missing from calibration data")
-
-        entry = calibration[joint_name]
+        calibration_key = _resolve_calibration_key(calibration, joint_name)
+        entry = calibration[calibration_key]
         if not isinstance(entry, dict):
             raise ValueError(f"Calibration entry for joint '{joint_name}' must be an object")
 
@@ -508,6 +631,19 @@ def lerobot_conversion_fingerprint(
     return hashlib.sha256(json_str.encode("utf-8")).hexdigest()[:16]
 
 
+def _load_calibration_data_from_specs(specs: list[CalibrationSourceSpec]) -> dict[str, Any]:
+    """Load calibration data from already-normalized source specs."""
+    if not specs:
+        raise FileNotFoundError("Calibration file path is empty")
+
+    merged: dict[str, Any] = {}
+    for spec in specs:
+        data = _load_single_calibration_file(spec.resolved_path)
+        data = _namespace_numeric_calibration_keys(data, spec.namespace)
+        _merge_calibration_data(merged, data, spec.resolved_path)
+    return merged
+
+
 def build_lerobot_conversion_metadata(
     calib_file: CalibrationSource,
     joint_names: list[str],
@@ -534,10 +670,10 @@ def build_lerobot_conversion_metadata(
         )
         return metadata
 
-    calibration_sources = _normalize_calibration_sources(calib_file)
-    calibration = load_calibration_data(calibration_sources)
+    calibration_specs = _normalize_calibration_source_specs(calib_file)
+    calibration = _load_calibration_data_from_specs(calibration_specs)
     snapshot = extract_calibration_snapshot(calibration, ordered_joints)
-    resolved_sources = [str(Path(source).expanduser().resolve()) for source in calibration_sources]
+    resolved_sources = [str(Path(spec.resolved_path).expanduser().resolve()) for spec in calibration_specs]
     metadata["calibration_source"] = resolved_sources[0] if resolved_sources else ""
     metadata["calibration_sources"] = resolved_sources
     metadata["calibration"] = snapshot
@@ -566,10 +702,8 @@ def build_joint_conversion_table_from_calibration(
     table: list[JointConversionEntry] = []
 
     for joint_name in ordered_joints:
-        if joint_name not in calibration:
-            raise KeyError(f"Joint '{joint_name}' missing from calibration data")
-
-        entry = calibration[joint_name]
+        calibration_key = _resolve_calibration_key(calibration, joint_name)
+        entry = calibration[calibration_key]
         if not isinstance(entry, dict):
             raise ValueError(f"Calibration entry for joint '{joint_name}' must be an object")
 
@@ -709,8 +843,9 @@ def build_joint_conversion_table(
 
     Parameters
     ----------
-    calib_file : str | list[str]
-        Path(s) to calibration JSON produced by ``calibrate_arm``.
+    calib_file : CalibrationSource
+        Explicit specs or legacy path input. Specs preserve namespaces; path
+        strings infer namespaces from file count for compatibility.
     joint_names : list[str]
         Ordered joint identifiers (e.g. ``["1","2",…,"6"]``).
     gripper_joints : list[str] | None
