@@ -137,15 +137,13 @@ patches:
       - Keep the logging hooks separate from the weighted-training and quantization helpers.
     applies_to:
       profiles: [master-parity-candidates, dev, training, distillation]
-  - file: 0015-fix-pi05-pad-state-to-max_state_dim-before-prompt-di.patch
+  - file: 0015-python310-disable-groot-config-generated-init.patch
     purpose:
-      - Restore PI05 state padding to max_state_dim before the prompt is discretized and tokenized.
-      - Upstream lerobot intentionally REMOVED this padding in the transformers v5 bump (commit f0d2b37be, PR #2964/#2967, "fix(pi): remove state padding before tokenization"); v0.5.1 therefore tokenizes only the real state dims (e.g. 6) instead of the padded 32.
-      - Our deployed PI05 OM models were exported in the lerobot 0.4.1 era, which padded state to max_state_dim. Running them under the un-padded v0.5.1 processor feeds the VLM a shorter, wrong prompt (31 vs 135 tokens), diverging the KV cache and action output (observed OM L1 ~7 / cosine 0.95 vs ~0.9 / 0.999 after the fix).
-      - COMPATIBILITY NOTE — this patch assumes the OM/compiled PI05 model expects a 32-dim padded state prompt. If a PI05 model is RE-TRAINED or RE-EXPORTED with the v0.5.1 PyTorch policy (un-padded state), this patch must be DROPPED or made conditional, otherwise it would re-introduce the mismatch in the opposite direction.
-      - Upstream's motivation for removing the pad is efficiency/flexibility: a shorter prompt lowers VLM self-attention cost (O(N^2) on token count) and avoids hard-coding a 32-dim state across robots with different real state sizes.
+      - Disable the generated dataclass initializer for GR00TN15Config so Python 3.10 does not reject its init=False fields after default fields.
+      - Keep lerobot.policies importable on Python 3.10 when unrelated policies such as PI05 are loaded through the factory.
     applies_to:
-      profiles: [core, ros, hardware, inference, openharmony, dev, openeuler, ascend]
+      python_max: "<3.11"
+      profiles: [core, ros, hardware, dev, openeuler, inference]
 
 notes:
   - Schema v2 contract — each patch declares applicability via independent
@@ -183,6 +181,8 @@ notes:
   - Patch 0014 is part of the default Ubuntu training series so KD runs emit
     TensorBoard scalars without pulling in the weighted-training and
     quantization helpers from patch 0010.
+  - Patch 0015 is a Python 3.10 import-compatibility patch for Groot. It is
+    intentionally not applied on Python 3.11+ hosts.
   - The reference_submodule_commit records the current local development
     result, but repeated git-am application will produce different commit
     hashes unless committer identity and dates are reproduced exactly.
