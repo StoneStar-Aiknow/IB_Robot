@@ -110,7 +110,7 @@ from robot_config.utils import (
     build_joint_conversion_table,
     build_joint_conversion_table_from_calibration,
     normalize_lerobot_norm_mode,
-    resolve_calibration_path_from_config,
+    resolve_calibration_source_specs_from_config,
     resolve_gripper_joints_from_config,
     resolve_lerobot_norm_mode,
 )
@@ -202,10 +202,19 @@ def _resolve_fallback_conversion_config(robot_config_path: Path) -> dict[str, An
     except Exception as exc:
         print(f"[WARN] Failed to load robot_config from {robot_config_path}: {exc}")
         return {}
+    try:
+        calibration_source_specs = resolve_calibration_source_specs_from_config(robot_config)
+        calibration_file = os.pathsep.join(spec.resolved_path for spec in calibration_source_specs)
+    except (TypeError, ValueError) as exc:
+        print(f"[WARN] Failed to resolve calibration sources from {robot_config_path}: {exc}")
+        calibration_source_specs = []
+        calibration_file = ""
+
     return {
         "norm_mode": resolve_lerobot_norm_mode(robot_config),
         "gripper_joints": resolve_gripper_joints_from_config(robot_config),
-        "calibration_file": resolve_calibration_path_from_config(robot_config),
+        "calibration_source_specs": calibration_source_specs,
+        "calibration_file": calibration_file,
     }
 
 
@@ -232,6 +241,15 @@ def _build_feature_conversion_table(
                 norm_mode=norm_mode,
             )
         raise ValueError("Dataset conversion metadata is missing calibration snapshot")
+
+    calibration_source_specs = fallback_config.get("calibration_source_specs") or []
+    if calibration_source_specs:
+        return build_joint_conversion_table(
+            calib_file=calibration_source_specs,
+            joint_names=ordered_names,
+            gripper_joints=fallback_config.get("gripper_joints"),
+            norm_mode=str(fallback_config.get("norm_mode", "")),
+        )
 
     calib_file = str(fallback_config.get("calibration_file", "") or "")
     if not calib_file:

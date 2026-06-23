@@ -88,7 +88,7 @@ def test_inspect_calibration_accepts_multiple_existing_files(tmp_path):
     right.write_text("{}", encoding="utf-8")
 
     status = inspect_calibration(
-        {"ros2_control": {"xacro_args": {"calib_file_1": str(left), "calib_file_2": str(right)}}}
+        {"ros2_control": {"xacro_args": {"calib_file_left": str(left), "calib_file_right": str(right)}}}
     )
 
     assert status.status == "available"
@@ -103,7 +103,7 @@ def test_inspect_calibration_reports_missing_files(tmp_path):
     left.write_text("{}", encoding="utf-8")
 
     status = inspect_calibration(
-        {"ros2_control": {"xacro_args": {"calib_file_1": str(left), "calib_file_2": str(right)}}}
+        {"ros2_control": {"xacro_args": {"calib_file_left": str(left), "calib_file_right": str(right)}}}
     )
 
     assert status.status == "missing"
