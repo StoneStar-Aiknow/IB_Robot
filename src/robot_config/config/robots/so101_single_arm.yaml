@@ -55,21 +55,18 @@ robot:
   # MoveIt configuration
   # ============================================
   moveit:
-    # End-effector / tip frame selection (SSOT).
-    #   gripper -> arm_group_name: arm     (default, byte-for-byte unchanged)
-    #   tcp     -> arm_group_name: arm_tcp (virtual Tool Center Point ~9cm down
-    #              the finger line; pure -Y translation, same orientation as
-    #              gripper. Rotations pivot about the tool point instead of the
-    #              wrist.) The TCP geometry lives only in the URDF/xacro
-    #              (tcp_offset_y, default -0.09) -- never duplicated here.
-    # NOTE: arm_group_name and ee_link must stay consistent (both gripper or
-    #       both tcp); see SRDF groups 'arm' / 'arm_tcp'.
-    arm_group_name: arm_tcp #arm_tcp #arm
+    # End-effector selection for MoveIt and Cartesian teleop.
+    # Default keeps the upstream gripper-origin path:
+    #   arm_group_name: arm
+    #   ee_link: gripper
+    # To target the jaw-center TCP instead, switch both lines to:
+    #   arm_group_name: arm_tcp
+    #   ee_link: tcp
+    arm_group_name: arm
     base_link: base
-    ee_link:  tcp #tcp #gripper
+    ee_link: gripper
     shoulder_link: shoulder
-    so101_safe_servo_config_path: package://robot_moveit/config/so101_safe_servo.yaml
-    so101_placo_servo_config_path: package://robot_moveit/config/so101_placo_servo.yaml
+    so101_placo_servo_config_path: $(find robot_moveit)/config/so101_placo_servo.yaml
 
   # Control mode management
   default_control_mode: "model_inference"
@@ -619,31 +616,22 @@ robot:
   # ============================================
   teleoperation:
     enabled: true
-    active_device: "xbox_controller" # Xbox 手柄控制 /dev/ttyACM0 上的 SO-101 从臂；可切回 "so101_leader" 或 "phone_teleop"
+    active_device: "so101_leader" # You can switch between "so101_leader" and "xbox_controller" and "phone_teleop"
 
     # Cartesian solver used when gamepad / phone is in cartesian mode.
-    # Options (default: safe_servo):
-    #   safe_servo     - robust servo replacement for low-cost arms with sag/error
-    #                    (linear position IK + direct wrist control) [DEFAULT]
-    #   servo          - MoveIt Servo real-time Jacobian tracking
-    #                    (alias: velocity_servo; no extra nodes, freezes near singularities)
-    #   placo_servo    - in-process Placo QP differential IK (true Cartesian
-    #                    posture, latched reference; targets "extreme smoothness")
+    # Options:
+    #   placo_servo  - SO-101 default, command-side Placo differential IK.
+    #   moveit_servo - MoveIt Servo comparison path. Simulation works; Humble
+    #                  real-hardware anti-drift handling is tracked separately.
     cartesian:
       solver: placo_servo
-      # Speed knobs — unitless 0.0 ~ 1.0 fractions.
-      # 1.0 = preset physical maximum (1.0 m/s linear, 6.0 rad/s angular).
-      safe_servo:
-        linear_speed: 0.3   # 0.0~1.0
-        angular_speed: 0.7  # 0.0~1.0
+      # tool_frame defaults to moveit.ee_link, so arm/gripper and arm_tcp/tcp
+      # remain a single SSOT. Set tool_frame only to override the angular
+      # velocity reference frame.
+      # Placo-only speed knobs, as fractions of the backend physical maximum.
       placo_servo:
-        # placo_servo feeds a TRUE Cartesian QP on a 5-DOF (under-actuated)
-        # arm: angular is a real SO(3) EE velocity, not a wrist jog. The full
-        # 1.0=6.0 rad/s preset is far too aggressive here (an unreachable
-        # high-speed orientation goal makes the QP thrash every joint). Keep
-        # angular low and linear modest until bench tuning (§7.6).
-        linear_speed: 0.17   # 0.0~1.0  -> 0.15 m/s at full stick
-        angular_speed: 0.2   # 0.0~1.0  -> 0.6 rad/s at full stick
+        linear_speed: 0.17   # 0.0~1.0
+        angular_speed: 0.2   # 0.0~1.0
 
     devices:
       - name: "so101_leader"

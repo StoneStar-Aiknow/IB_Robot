@@ -4,7 +4,7 @@ Minimal serial-to-controller bridge for zero-latency teleoperation.
 
 ## Overview
 
-The `robot_teleop` package provides a unified teleoperation interface for IB-Robot, supporting multiple teleoperation devices (leader arms, phones, gamepads, VR controllers) through a device abstraction layer.
+The `robot_teleop` package provides a unified teleoperation interface for IB-Robot, with built-in support for leader arms, phones, and gamepads through a device abstraction layer.
 
 **Key Features:**
 - ✅ Zero-latency control (< 5ms end-to-end)
@@ -13,7 +13,7 @@ The `robot_teleop` package provides a unified teleoperation interface for IB-Rob
 - ✅ Configuration-driven via `robot_config`
 - ✅ Automatic rosbag recording support
 - ✅ Deep integration with `robot_config` launch system
-- ✅ Cartesian control via `velocity_servo` or `safe_servo`
+- ✅ Cartesian control via `placo_servo` or `moveit_servo`
 
 ## Architecture Design
 
@@ -24,7 +24,8 @@ graph TB
     subgraph Input["Input Layer"]
         LA[Leader Arm<br/>Serial]
         XB[Xbox Controller<br/>/joy topic]
-        VR[VR Controller<br/>Future]
+        CUSTOM[Custom Device<br/>register_device()]
+        PH[Phone<br/>iOS HEBI / Android WebXR]
     end
     
     subgraph Device["Device Abstraction Layer"]
@@ -38,15 +39,19 @@ graph TB
     
     subgraph Output["Output Layer"]
         ROS[ROS 2 Controller Interface<br/><small>/arm_position_controller/commands<br/>/gripper_position_controller/commands<br/>/diagnostics</small>]
+        SERVO[Cartesian Backend<br/><small>placo_servo / moveit_servo</small>]
     end
     
     LA --> Base
     XB --> Base
-    VR -.-> Base
-    
+    CUSTOM -.-> Base
+    PH -.-> Base
+
     Base --> Node
     Node --> Filter
     Filter --> ROS
+    XB -.->|"Cartesian mode"| SERVO
+    PH -.->|"Differential pose"| SERVO
     
     style Input fill:#e1f5ff
     style Device fill:#fff4e1
@@ -63,17 +68,17 @@ Cartesian mode is selected from the `robot_config` SSOT YAML, not from device co
 ```yaml
 teleoperation:
     cartesian:
-        solver: safe_servo  # safe_servo | velocity_servo
+        solver: placo_servo  # placo_servo | moveit_servo
 ```
 
 | Solver | Downstream node | Use case |
 |---|---|---|
-| `safe_servo` | `so101_safe_servo_node.py` | Robust Cartesian teleop for low-cost SO101 servos with sag/error; publishes only after `/start` succeeds and the IK result keeps wrist joints near the pending wrist targets |
-| `velocity_servo` | MoveIt Servo `servo_node_main` | Standard Jacobian velocity servo |
+| `placo_servo` | `so101_placo_servo_node.py` | SO101 Cartesian teleop using in-process Placo QP differential IK with command-side references to avoid hardware sag ratchets |
+| `moveit_servo` | MoveIt Servo `servo_node_main` | Generic MoveIt Servo comparison and experiments |
 
-The earlier experimental standalone position-IK backend has been removed; teleop now supports only `safe_servo` and `velocity_servo`.
+SO101 defaults to `placo_servo`; MoveIt Servo remains available as a generic comparison path.
 
-Backend input contract: devices send linear commands in the base frame and angular commands in the tool frame. `velocity_servo` converts tool angular velocity to base internally; `safe_servo` uses tool-frame angular velocity directly for wrist integration. Phone and Xbox both receive Cartesian speed knobs from the `robot_config` SSOT.
+Backend input contract: devices send linear commands in the base frame and angular commands in the tool frame. `placo_servo` and `moveit_servo` convert tool angular velocity to the base frame internally. Phone and Xbox both receive Cartesian speed knobs from the `robot_config` SSOT.
 
 #### Class Inheritance Diagram
 
@@ -101,7 +106,7 @@ classDiagram
     }
     
     class XboxTeleopDevice {
-        -servo_client: MoveIt2Servo
+        -_cartesian_backend: CartesianBackend
         -_latest_joy: Joy
         -_state_lock: Lock
         -_mode: str
@@ -109,20 +114,25 @@ classDiagram
         +get_joint_targets() Dict
         +disconnect()
     }
-    
-    class VRControllerDevice {
-        <<Future>>
-        -ik_solver: IKSolver
-        -pose_tracker: PoseTracker
+
+    class PhoneDevice {
+        -_backend: BasePhone
+        -_calib_pos: ndarray
+        -_calib_rot_inv: Rotation
+        +connect() bool
+        +get_joint_targets() Dict
+        +disconnect()
     }
-    
+
     BaseTeleopDevice <|-- LeaderArmDevice : inherits
     BaseTeleopDevice <|-- XboxTeleopDevice : inherits
-    BaseTeleopDevice <|-- VRControllerDevice : inherits
-    
+    BaseTeleopDevice <|-- PhoneDevice : inherits
+
     LeaderArmDevice ..> FeetechMotorsBus : serial communication
     XboxTeleopDevice ..> Joy : /joy topic
-    VRControllerDevice ..> VRHardware : VR SDK
+    XboxTeleopDevice ..> CartesianBackend : Cartesian mode
+    PhoneDevice ..> IOSPhone : HEBI SDK
+    PhoneDevice ..> AndroidPhone : WebXR WS
 ```
 
 ### Core Design Patterns
@@ -138,6 +148,7 @@ classDiagram
 DEVICE_MAP = {
     "leader_arm": LeaderArmDevice,
     "xbox_controller": XboxTeleopDevice,
+    "phone": PhoneDevice,
 }
 
 # Factory function
@@ -277,10 +288,11 @@ class BaseTeleopDevice(ABC):
 DEVICE_MAP = {
     "leader_arm": LeaderArmDevice,
     "xbox_controller": XboxTeleopDevice,
+    "phone": PhoneDevice,
 }
 
 # Runtime device registration
-register_device("vr_controller", VRControllerDevice)
+register_device("custom_device", CustomDevice)
 ```
 
 #### 5. ConfigLoader (Configuration Loader)
@@ -358,7 +370,7 @@ graph LR
    - Reverse-snap prevents jumping
 
 2. **Cartesian Mode**:
-    - Control via selected Cartesian backend (`safe_servo` or `velocity_servo`)
+    - Control via selected Cartesian backend (`placo_servo` or `moveit_servo`)
    - Controller axis → Linear/angular velocity
     - Returns only the gripper target to avoid arm command conflicts
 
@@ -583,7 +595,7 @@ robot:
 
     devices:
       - name: string                 # Unique device name
-        type: string                 # Device type (leader_arm, xbox_controller, vr_device)
+        type: string                 # Device type (leader_arm, xbox_controller, phone; custom via register_device)
         ...device-specific params... # Additional parameters
 
     safety:
@@ -655,12 +667,13 @@ devices:
 - [LT]: Close gripper
 - [RT]: Open gripper
 
-#### 3. vr_controller (Future)
+#### 3. Custom Cartesian devices
 
 ```yaml
-- name: "vr_controller"
-  type: "vr_device"
-  ... TBD ...
+- name: "custom_cartesian_device"
+  type: "custom"  # Register with device_factory.register_device().
+  # Custom devices can provide differential Cartesian commands through the
+  # selected backend.
 ```
 
 ### Validation Rules
@@ -673,7 +686,7 @@ devices:
 2. **Device-specific requirements:**
    - `leader_arm` devices require `port` field
    - `xbox_controller` requires `/joy` topic subscription
-   - `vr_device` requires IK solver integration
+   - Cartesian devices require a configured `teleoperation.cartesian.solver`
 
 3. **Safety requirements:**
    - `joint_limits` should cover all joints in `robot.joints.all`

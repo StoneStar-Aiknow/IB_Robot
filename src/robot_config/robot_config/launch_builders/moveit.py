@@ -25,9 +25,10 @@ def generate_moveit_nodes(robot_config, control_mode, use_sim=False, display=Tru
         control_mode: Active control mode
         use_sim: Simulation mode flag
         display: Whether to launch RViz visualization
-        force: When True, skip the ``'moveit' in control_mode`` guard. Used to
-            launch MoveIt for ``teleop`` mode when ``safe_servo`` needs the
-            move_group compute_ik service.
+        force: When True, skip the ``'moveit' in control_mode`` guard. Used
+            when callers explicitly request MoveIt for a non-MoveIt control
+            mode, such as a Cartesian backend that needs ``move_group``
+            services.
 
     Returns:
         List of launch actions for MoveIt 2

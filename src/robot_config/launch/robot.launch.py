@@ -508,19 +508,6 @@ def launch_setup(context, *args, **kwargs):
             actions.extend(tf_nodes)
             logger.info(f"Added {len(tf_nodes)} TF nodes")
 
-            # User-defined virtual tool frames (kinematics.frames YAML section)
-            # Published as static_transform_publisher; sim & real both publish.
-            from robot_config.launch_builders.virtual_frames import (
-                generate_virtual_frame_nodes,
-            )
-
-            vframe_nodes = generate_virtual_frame_nodes(
-                robot_config.get("kinematics", {}).get("frames"),
-                use_sim=use_sim,
-            )
-            actions.extend(vframe_nodes)
-            if vframe_nodes:
-                logger.info(f"Added {len(vframe_nodes)} virtual tool-frame TF nodes")
         except Exception as e:
             logger.error(f"generating perception nodes: {e}")
             raise
@@ -634,34 +621,8 @@ def launch_setup(context, *args, **kwargs):
         with_moveit_str = context.launch_configurations.get("with_moveit", "")
         moveit_display = parse_bool(context.launch_configurations.get("moveit_display", "true"), default=True)
 
-        # safe_servo needs MoveIt's move_group service for compute_ik, but only
-        # when the active teleop device actually creates a Cartesian backend.
-        teleop_cfg = robot_config.get("teleoperation", {}) or {}
-        active_device_name = teleop_cfg.get("active_device", "")
-        active_device_cfg = next(
-            (device for device in teleop_cfg.get("devices", []) if device.get("name") == active_device_name),
-            {},
-        )
-        active_device_type = active_device_cfg.get("type", "")
-        cart_solver = (teleop_cfg.get("cartesian", {}) or {}).get("solver", "safe_servo")
-        active_device_uses_cartesian = active_device_type in ("xbox_controller", "phone")
-        moveit_forced_by_safe_servo = (
-            active_control_mode == "teleop"
-            and cart_solver == "safe_servo"
-            and active_device_uses_cartesian
-            and with_moveit_str == ""
-        )
-
         if with_moveit_str != "":
             with_moveit = parse_bool(with_moveit_str, default=False)
-        elif moveit_forced_by_safe_servo:
-            with_moveit = True
-            moveit_display = False
-            logger.info(
-                f"{cart_solver} solver selected for active device "
-                f"{active_device_name} ({active_device_type}): "
-                "auto-enabling MoveIt (display=False)"
-            )
         else:
             with_moveit = "moveit" in active_control_mode.lower()
 
@@ -675,12 +636,12 @@ def launch_setup(context, *args, **kwargs):
                 active_control_mode,
                 node_use_sim_time,
                 moveit_display,
-                # Force MoveIt launch when safe_servo auto-enabled it OR when
-                # the user explicitly set with_moveit:=true.  Without this,
+                # Force MoveIt launch when the user explicitly set
+                # with_moveit:=true. Without this,
                 # with_moveit:=true + control_mode=teleop would call
                 # generate_moveit_nodes(force=False) which tests
                 # 'moveit' in 'teleop' → False → returns [], starting nothing.
-                force=moveit_forced_by_safe_servo or parse_bool(with_moveit_str, default=False),
+                force=parse_bool(with_moveit_str, default=False),
             )
 
             if controller_ready_waiter is not None:

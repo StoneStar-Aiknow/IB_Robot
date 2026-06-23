@@ -9,24 +9,20 @@ lerobot/model/kinematics.py``) solving *posture* — ``RobotWrapper`` +
 
 * **Radian-native.** lerobot's public API is in *degrees*; IB-Robot's
   ``/joint_states`` and ``/arm_position_controller/commands`` are in
-  *radians*. This wrapper takes and returns radians, avoiding the silent
-  unit bug called out in the implementation plan (§7.3-1).
+  *radians*. This wrapper takes and returns radians end to end.
 * **IB-Robot URDF.** The SO-101 description lives as ``so101.urdf.xacro``
   (``$(find robot_description)/urdf/lerobot/so101/so101.urdf.xacro``). Placo
   needs plain URDF, so callers either pass an already-expanded URDF path or
-  use :func:`expand_so101_xacro` to render one in-memory at runtime
-  (§7.3-3, decided: runtime in-memory expansion, no committed artifact).
-* **Target frame ``gripper``.** Matches ``moveit.ee_link`` /
-  ``so101_safe_servo`` ``ik_link_name`` (§7.3-2). NOT lerobot's default
-  ``gripper_frame_link``.
+  use :func:`expand_so101_xacro` to render one in-memory at runtime.
+* **Target frame ``gripper`` or ``tcp``.** Matches ``moveit.ee_link`` in the
+  robot SSOT. NOT lerobot's default ``gripper_frame_link``.
 * **Explicit joint order.** The arm joints are ``["1".."5"]``; joint ``6``
-  is the gripper and is excluded from Cartesian IK (§7.3-4). Output is
+  is the gripper and is excluded from Cartesian IK. Output is
   ordered to match ``arm_joint_names`` so it can be written straight to
   ``/arm_position_controller/commands``.
 
 The wrapper has **no ROS runtime dependency** beyond the optional xacro
-expansion helper, so it can be exercised by the offline parity/round-trip
-test (Slice 1A) without a live robot.
+expansion helper, so it can be exercised by unit tests without a live robot.
 """
 
 from __future__ import annotations
@@ -42,12 +38,12 @@ import numpy as np
 # requires a sourced ROS workspace.
 _SO101_XACRO_REL = "urdf/lerobot/so101/so101.urdf.xacro"
 
-# IB-Robot conventions (SSOT: so101_single_arm.yaml / so101_safe_servo.yaml).
+# IB-Robot conventions (SSOT: so101_single_arm.yaml / so101_placo_servo.yaml).
 DEFAULT_TARGET_FRAME = "gripper"
 DEFAULT_ARM_JOINT_NAMES: tuple[str, ...] = ("1", "2", "3", "4", "5")
 
 # lerobot's "position hard, orientation best-effort" weights for the
-# under-actuated 5-DOF arm (kinematics.py defaults). Starting point per §7.6-6.
+# under-actuated 5-DOF arm (kinematics.py defaults).
 DEFAULT_POSITION_WEIGHT = 1.0
 DEFAULT_ORIENTATION_WEIGHT = 0.01
 
@@ -90,6 +86,24 @@ def _write_temp_urdf(urdf_xml: str) -> str:
     with os.fdopen(fd, "w") as f:
         f.write(urdf_xml)
     return path
+
+
+def _as_joint_vector(values: np.ndarray | list[float], joint_names: list[str]) -> np.ndarray:
+    vector = np.asarray(values, dtype=np.float64)
+    if vector.shape != (len(joint_names),):
+        raise ValueError(
+            f"Joint vector length mismatch: expected {len(joint_names)} values "
+            f"for {joint_names}, got shape {vector.shape}"
+        )
+    return vector
+
+
+def _cleanup_temp_urdf(owner) -> None:
+    if getattr(owner, "_owns_temp_urdf", False) and getattr(owner, "_temp_urdf_path", None):
+        with contextlib.suppress(OSError):
+            os.unlink(owner._temp_urdf_path)
+        owner._temp_urdf_path = None
+        owner._owns_temp_urdf = False
 
 
 class SO101PlacoKinematics:
@@ -146,10 +160,17 @@ class SO101PlacoKinematics:
         self.tip_task = self.solver.add_frame_task(self.target_frame, np.eye(4))
 
     def __del__(self) -> None:
-        # Best-effort cleanup of the materialised temp URDF.
-        if getattr(self, "_owns_temp_urdf", False) and self._temp_urdf_path:
-            with contextlib.suppress(OSError):
-                os.unlink(self._temp_urdf_path)
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Remove any materialised temporary URDF owned by this solver."""
+        _cleanup_temp_urdf(self)
 
     # ------------------------------------------------------------------ FK
     def forward_kinematics(self, q_rad: np.ndarray | list[float]) -> np.ndarray:
@@ -162,8 +183,8 @@ class SO101PlacoKinematics:
         Returns:
             4x4 homogeneous transform of ``target_frame`` in the base frame.
         """
-        q = np.asarray(q_rad, dtype=np.float64)
-        for name, value in zip(self.arm_joint_names, q, strict=False):
+        q = _as_joint_vector(q_rad, self.arm_joint_names)
+        for name, value in zip(self.arm_joint_names, q, strict=True):
             self.robot.set_joint(name, float(value))
         self.robot.update_kinematics()
         return np.asarray(self.robot.get_T_world_frame(self.target_frame), dtype=np.float64)
@@ -187,17 +208,16 @@ class SO101PlacoKinematics:
             target_pose: Desired 4x4 base-frame pose of ``target_frame``.
             position_weight: Soft-task position weight.
             orientation_weight: Soft-task orientation weight (small for the
-                under-actuated SO-101; see §7.6-6). Pass ``0.0`` for a
-                position-only solve: the QP then minimises position error
-                alone and orientation is left fully free (the SO-101
-                under-actuated "solve position only, like lerobot" mode).
+                under-actuated SO-101). Pass ``0.0`` for a position-only solve:
+                the QP then minimises position error alone and orientation is
+                left fully free.
 
         Returns:
             Arm joint positions in **radians**, ordered to match
             ``arm_joint_names``.
         """
-        q = np.asarray(q_current_rad, dtype=np.float64)
-        for name, value in zip(self.arm_joint_names, q, strict=False):
+        q = _as_joint_vector(q_current_rad, self.arm_joint_names)
+        for name, value in zip(self.arm_joint_names, q, strict=True):
             self.robot.set_joint(name, float(value))
 
         self.tip_task.T_world_frame = np.asarray(target_pose, dtype=np.float64)
@@ -212,8 +232,7 @@ class SO101PlacoKinematics:
         )
 
 
-# Differential-IK defaults (velocity-level Jacobian + QP servo). These are the
-# Phase 1 "position-only" knobs; orientation is added in Phase 2.
+# Differential-IK defaults (velocity-level Jacobian + QP servo).
 DEFAULT_DIFFIK_DAMPING = 1e-3  # regularization weight (DLS-like smooth yield)
 DEFAULT_CONTROL_PERIOD = 0.02  # s (50 Hz) — solver.dt for the velocity step
 # Per-joint velocity ceiling (rad/s) for the QP velocity-limit constraint. The
@@ -227,16 +246,16 @@ DEFAULT_DIFFIK_ORIENTATION_WEIGHT = 0.01
 class SO101PlacoDiffIK:
     """Radian-native Placo **differential** (velocity-level) IK for SO-101.
 
-    This is the Jacobian + QP Cartesian servo core (Phase 1: position only).
-    Unlike :class:`SO101PlacoKinematics` — which sets an *absolute* pose
+    This is the Jacobian + QP Cartesian servo core. Unlike
+    :class:`SO101PlacoKinematics` — which sets an *absolute* pose
     ``FrameTask`` and re-solves it globally (``solve(True)``), branch-flipping
     several radians when the absolute goal nears/leaves the reachable set — this
     class solves a **velocity** step per tick:
 
-    * **``PositionTask`` only.** Constrains the 3-DOF target-frame position; no
-      orientation goal is ever built, so orientation is genuinely free (not
-      "held"). This is the true "ignore orientation" the under-actuated 5-DOF
-      arm needs.
+    * **Position primary, orientation optional.** The position task constrains
+      the 3-DOF target-frame position. A low-weight orientation task can be
+      added for angular teleop without making full 6D pose tracking mandatory
+      on the under-actuated 5-DOF arm.
     * **Velocity goal, not accumulated absolute target.** Each :meth:`step`
       seeds from the *measured* joints (closed-loop) and asks the QP to move the
       EE by ``v * dt`` from where it currently is. There is no growing absolute
@@ -254,10 +273,10 @@ class SO101PlacoDiffIK:
     *same* code path serves both ``gripper`` and ``tcp``. tcp is a *fixed* child
     of gripper (pure 95 mm translation, identity rotation); Placo's
     ``frame_jacobian(target_frame)`` propagates that lever arm exactly, so tcp
-    needs **no special case** (validated in cc-plans/placo-diffik-servo).
+    needs **no special case**.
 
-    Offline-only (no ROS runtime beyond the optional xacro helper), so the
-    Phase-0/1 tests exercise it without a live robot.
+    Offline-only (no ROS runtime beyond the optional xacro helper), so tests can
+    exercise it without a live robot.
     """
 
     def __init__(
@@ -289,8 +308,8 @@ class SO101PlacoDiffIK:
                 URDF velocity limits (10 rad/s on the SO-101, too fast for hand
                 teleop).
             orientation_weight: Optional soft orientation-task weight. ``0.0``
-                keeps Phase-1 position-only behaviour; a small positive value
-                enables Phase-2 low-priority Cartesian orientation tracking.
+                keeps position-only behaviour; a small positive value enables
+                low-priority Cartesian orientation tracking.
         """
         import placo  # local import: heavy native lib
 
@@ -346,12 +365,21 @@ class SO101PlacoDiffIK:
         self.solver.dt = self.control_period
 
     def __del__(self) -> None:
-        if getattr(self, "_owns_temp_urdf", False) and self._temp_urdf_path:
-            with contextlib.suppress(OSError):
-                os.unlink(self._temp_urdf_path)
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Remove any materialised temporary URDF owned by this solver."""
+        _cleanup_temp_urdf(self)
 
     def _seed(self, q_rad: np.ndarray) -> None:
-        for name, value in zip(self.arm_joint_names, q_rad, strict=False):
+        q = _as_joint_vector(q_rad, self.arm_joint_names)
+        for name, value in zip(self.arm_joint_names, q, strict=True):
             self.robot.set_joint(name, float(value))
         self.robot.update_kinematics()
 
@@ -376,14 +404,10 @@ class SO101PlacoDiffIK:
     ) -> np.ndarray:
         """One QP step toward an **absolute** base-frame target position.
 
-        This is the gravity-safe sibling of :meth:`step`. Instead of asking the
-        QP to move ``v*dt`` *from the (possibly sagging) measured pose*, the
-        caller supplies an absolute command-side reference position. The QP is
-        still seeded from the measured joints (closed-loop, collision-truthful),
-        but the target is the externally maintained reference — so when the arm
-        sags under gravity and ``measured`` drifts away from the reference, the
-        QP actively pulls the joints back toward the held Cartesian point rather
-        than welding in the sag.
+        The caller supplies an absolute command-side reference position. In the
+        servo hot path, the QP is seeded from the last command rather than the
+        latest measured joints so hardware sag or servo lag is not accepted as a
+        new target.
 
         The per-tick joint motion is still bounded by the in-QP velocity limit,
         so a large reference error cannot snap the arm; it converges over a few
@@ -391,8 +415,7 @@ class SO101PlacoDiffIK:
         only motion the QP produces is the small correction that cancels sag.
 
         Args:
-            q_seed_rad: Current measured arm joints (rad), ordered by
-                ``arm_joint_names`` (the closed-loop seed).
+            q_seed_rad: Seed arm joints (rad), ordered by ``arm_joint_names``.
             target_position: Absolute desired base-frame position (3-vector) of
                 ``target_frame`` — the command-side reference, advanced by the
                 caller with ``ref += v*dt`` only while there is user input.
@@ -441,23 +464,21 @@ class SO101PlacoDiffIK:
 
     def step(
         self,
-        q_measured_rad: np.ndarray | list[float],
+        q_seed_rad: np.ndarray | list[float],
         v_base: np.ndarray | list[float],
         dt: float | None = None,
     ) -> np.ndarray:
         """One velocity-level differential-IK step.
 
-        Seeds from the measured joints (closed-loop), asks the QP to move the
-        target frame by ``v_base * dt`` from its current position, and returns
-        the integrated next joint positions. Joint and velocity limits are
-        enforced *inside* the QP, so the output never violates them and the
-        unreachable velocity component is gracefully projected away.
+        Seeds from ``q_seed_rad``, asks the QP to move the target frame by
+        ``v_base * dt`` from the seeded position, and returns the integrated next
+        joint positions. Joint and velocity limits are enforced *inside* the QP,
+        so the output never violates them and the unreachable velocity component
+        is gracefully projected away.
 
         Args:
-            q_measured_rad: Current measured arm joints (rad), ordered by
-                ``arm_joint_names`` (the closed-loop seed).
-            v_base: Desired EE linear velocity in the base frame (m/s). Phase 1
-                is position-only, so this is a 3-vector; angular is ignored.
+            q_seed_rad: Seed arm joints (rad), ordered by ``arm_joint_names``.
+            v_base: Desired EE linear velocity in the base frame (m/s).
             dt: Control period (s) for this step; defaults to
                 ``control_period``.
 
@@ -465,7 +486,7 @@ class SO101PlacoDiffIK:
             Next arm joint positions (rad), ordered by ``arm_joint_names``.
         """
         step_dt = self.control_period if dt is None else float(dt)
-        self._seed(np.asarray(q_measured_rad, dtype=np.float64))
+        self._seed(np.asarray(q_seed_rad, dtype=np.float64))
 
         p_cur = np.asarray(self.robot.get_T_world_frame(self.target_frame), dtype=np.float64)[:3, 3]
         self.pos_task.target_world = p_cur + np.asarray(v_base, dtype=np.float64) * step_dt

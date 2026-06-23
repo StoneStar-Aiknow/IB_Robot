@@ -20,7 +20,6 @@ install(
 install(
   PROGRAMS
     scripts/moveit_gateway.py
-    scripts/so101_safe_servo_node.py
     scripts/so101_placo_servo_node.py
   DESTINATION lib/${PROJECT_NAME}
 )

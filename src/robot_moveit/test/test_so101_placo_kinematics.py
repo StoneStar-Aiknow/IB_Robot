@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""Slice 1A offline tests for the radian-native SO-101 Placo wrapper.
+"""Offline tests for the radian-native SO-101 Placo wrapper.
 
 These tests are **offline** (no ROS runtime, no real robot) and validate
 that :class:`SO101PlacoKinematics` is correctly adapted to IB-Robot
 conventions, using the IB-Robot URDF (NOT lerobot's). They confirm the
-items most likely to silently break a Placo integration (impl plan §7.3):
+items most likely to silently break a Placo integration:
 radian units, joint order (``1..5``), target frame (``gripper``) and the
 xacro→urdf expansion.
 
 Because the wrapper uses the *IB-Robot* URDF while lerobot's
 ``RobotKinematics`` ships its own URDF/SRDF, a numeric joint-by-joint parity
 against lerobot is **not** meaningful (different models → different IK). So
-instead of the original cross-library numeric parity, Slice 1A validates:
+instead of cross-library numeric parity, these tests validate:
 
 1. **FK→IK→FK round-trip self-consistency** on the IB-Robot URDF — the
    authoritative correctness check under our constraint of using our own URDF.
@@ -342,15 +342,15 @@ def test_position_only_beats_weighted_orientation_on_position(
 
 
 # --------------------------------------------------------------------------
-# 7. Differential-IK (Jacobian + QP velocity-level servo, Phase 1)
+# Differential-IK (Jacobian + QP velocity-level servo)
 # --------------------------------------------------------------------------
 #
 # These validate the NEW servo core (SO101PlacoDiffIK): a velocity step per tick
 # that solves Δq with a PositionTask + hard joint/velocity limits, instead of
 # re-solving an absolute pose (which branch-flips at the reachable edge). The
-# acceptance is the Phase 0 proof made into regression tests: the previously
-# branch-flipping directions (gripper -y, tcp +y) must now be smooth, and the
-# arm must yield (not snap) at the reachable boundary, for BOTH control points.
+# regression target is the previously branch-flipping directions (gripper -y,
+# tcp +y): they must now be smooth, and the arm must yield (not snap) at the
+# reachable boundary for both control points.
 
 _DIFFIK_STEP_M = 0.004  # 4 mm/tick (config-equivalent)
 _DIFFIK_DT = 0.02  # 50 Hz

@@ -6,8 +6,7 @@ caller's perspective this behaves *exactly* like the sibling backends::
     backend.servo(linear=(vx, vy, vz), angular=(wx, wy, wz))
 
 so the upstream device code in :mod:`robot_teleop.devices.xbox_controller`
-and :mod:`robot_teleop.phone.phone_device` is solver-agnostic (C7: the Xbox
-interaction logic is untouched — only the backend implementation swaps).
+and :mod:`robot_teleop.phone.phone_device` stays solver-agnostic.
 
 Internally the backend publishes the twist to two **private** topics consumed
 by ``so101_placo_servo_node``:
@@ -19,12 +18,9 @@ by ``so101_placo_servo_node``:
   ``frame_id = base_link``, carries ``angular`` **converted tool→base** via
   :class:`ToolAngularAdapter`.
 
-This tool→base conversion is the key difference from
-:class:`SO101SafeServoBackend`: ``placo_servo`` controls a **true Cartesian
-orientation** (the QP frame task expects a base-frame angular velocity), so
-the raw tool-frame stick angular MUST be rotated into the base frame — exactly
-like :class:`VelocityServoBackend` does for MoveIt Servo. ``safe_servo`` keeps
-the raw tool-frame angular because it integrates it directly into wrist joints.
+``placo_servo`` controls a true Cartesian orientation: the QP orientation task
+expects a base-frame angular velocity, so the raw tool-frame stick angular must
+be rotated into the base frame before publishing.
 """
 
 from __future__ import annotations
@@ -44,9 +40,7 @@ _DEFAULT_ANGULAR_TOPIC = "/so101_placo_servo_node/angular_cmd_base"
 _DEFAULT_START_SRV = "/so101_placo_servo_node/start"
 _DEFAULT_STOP_SRV = "/so101_placo_servo_node/stop"
 
-# Physical max speeds that map to a user scale value of 1.0. Kept consistent
-# with SO101SafeServoBackend so benchmarking the two solvers uses the same
-# input scaling.
+# Physical max speeds that map to a user scale value of 1.0.
 _MAX_LINEAR_SPEED_MPS: float = 1.0  # 1.0 m/s at scale=1.0
 _MAX_ANGULAR_SPEED_RPS: float = 6.0  # 6.0 rad/s at scale=1.0
 
@@ -100,9 +94,9 @@ class PlacoServoBackend(CartesianBackend):
                 "so101_placo_servo_node start service not ready; will retry every 0.5 s",
             )
             self._schedule_start_retry()
-            return False
+            return self._requested_enabled
         self._send_start_request()
-        return self._active_enabled
+        return self._requested_enabled
 
     def _schedule_start_retry(self) -> None:
         if self._start_retry_timer is not None:

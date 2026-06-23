@@ -1,4 +1,4 @@
-"""Velocity Servo backend — wraps :class:`pymoveit2.MoveIt2Servo`.
+"""MoveIt Servo backend — wraps :class:`pymoveit2.MoveIt2Servo`.
 
 Functional behaviour identical to the previous direct ``MoveIt2Servo`` usage
 in ``xbox_controller.py`` / ``phone_device.py``. The only added concern is
@@ -16,7 +16,7 @@ from .frame_adapter import ToolAngularAdapter
 Vec3 = tuple[float, float, float]
 
 
-class VelocityServoBackend(CartesianBackend):
+class MoveItServoBackend(CartesianBackend):
     def __init__(
         self,
         node,

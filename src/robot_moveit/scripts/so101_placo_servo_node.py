@@ -2,16 +2,11 @@
 """SO101 Placo Servo node.
 
 In-process Placo QP differential-IK Cartesian teleop backend for the SO-101
-5-DOF arm. This is the ``placo_servo`` solver, added *alongside* (never
-replacing) ``servo`` (MoveIt Servo) and ``safe_servo`` (position-IK + wrist
-jog). Selection is driven solely by
+5-DOF arm. ``placo_servo`` is the SO-101 Cartesian teleop solver selected by
 ``robot.teleoperation.cartesian.solver == 'placo_servo'``.
 
-Why an independent node (impl plan §7.3-6, decision A):
+Why an independent node:
 
-* **Symmetric to ``so101_safe_servo_node``** — same launch shape, topics and
-  start/stop services, so benchmarking is apples-to-apples and the device-side
-  :class:`PlacoServoBackend` mirrors :class:`SO101SafeServoBackend`.
 * **Does not block the 50 Hz teleop loop** — Placo IK runs on this node's own
   timer, isolated from ``teleop_node``'s 5 ms latency budget.
 
@@ -25,11 +20,10 @@ Design (Jacobian + QP velocity-level differential IK, see
   5-DOF position-only QP makes the nullspace drift. Measured joints initialise
   enable/reset only; the command path sends the same ideal trajectory to
   hardware that simulation computes.
-* **Position-only (Phase 1).** A Placo ``PositionTask`` constrains the 3-DOF
-  target position; no orientation goal is built, so orientation is genuinely
-  free for the under-actuated 5-DOF arm. The angular twist channel is dropped.
-  (Phase 2 will reintroduce orientation as a lower-priority task.)
-* **Hard limits in the QP (§1.5-A).** Joint + velocity limits are enforced
+* **Position primary, orientation soft.** A Placo ``PositionTask`` constrains
+  target position and an optional low-weight ``OrientationTask`` follows angular
+  joystick input without letting orientation dominate the under-actuated arm.
+* **Hard limits in the QP.** Joint + velocity limits are enforced
   inside the QP (``enable_joint_limits`` / ``enable_velocity_limits``), so the
   unreachable velocity component is projected onto the feasible set (correct
   energy decomposition) and the arm yields at the reachable edge. In Cartesian
@@ -44,9 +38,8 @@ Design (Jacobian + QP velocity-level differential IK, see
   Placo's frame Jacobian propagates the 95 mm lever arm exactly — no special
   case.
 
-Smoothness (§7.6): a fixed-rate timer (default 50 Hz), in-QP velocity limit as
-the real speed ceiling, and an optional first-order low-pass on the joint
-command.
+Smoothness: a fixed-rate timer (default 50 Hz), in-QP velocity limit as the real
+speed ceiling, and an optional first-order low-pass on the joint command.
 """
 
 from __future__ import annotations
@@ -76,6 +69,19 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 from so101_placo_kinematics import SO101PlacoDiffIK  # noqa: E402
+
+
+def _require_placo(logger) -> None:
+    try:
+        import placo  # noqa: F401
+    except ImportError as exc:
+        logger.fatal(
+            "placo is required for solver=placo_servo. Run ./scripts/setup.sh "
+            "to install LeRobot with the kinematics extra, or install the "
+            "matching LeRobot extra manually with: python3 -m pip install -e "
+            "'libs/lerobot[kinematics]'"
+        )
+        raise RuntimeError("placo is required for solver=placo_servo") from exc
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -114,18 +120,15 @@ class SO101PlacoServoNode(Node):
         self.declare_parameter("ik_link_name", "gripper")  # target frame in URDF
         self.declare_parameter("arm_joint_names", ["1", "2", "3", "4", "5"])
 
-        # Position-only mode (Phase 1): the orientation channel is ignored
-        # entirely — the QP carries only a PositionTask and the angular twist is
-        # dropped. This is the "solve position only, fully free orientation"
-        # mode for the under-actuated 5-DOF arm. (Phase 2 reintroduces
-        # orientation as a lower-priority task.)
-        self.declare_parameter("position_only", True)
+        # Set true only for diagnostics. Normal SO-101 Cartesian teleop uses
+        # position primary + a low-weight orientation task.
+        self.declare_parameter("position_only", False)
 
         # Differential-IK damping: regularization weight giving DLS-like smooth
         # yielding at singularities / reachable boundaries.
         self.declare_parameter("diffik_damping", 1e-3)
 
-        # Phase 2 orientation tracking: small soft weight, lower than position.
+        # Orientation tracking: small soft weight, lower than position.
         # Ignored when position_only=true.
         self.declare_parameter("orientation_weight", 0.01)
 
@@ -134,20 +137,11 @@ class SO101PlacoServoNode(Node):
         # teleop); this is the real speed ceiling of the servo.
         self.declare_parameter("max_joint_speed", 2.0)
 
-        # Smoothness knob (§7.6): optional first-order low-pass on q_des. The
+        # Smoothness knob: optional first-order low-pass on q_des. The
         # real speed ceiling is the in-QP velocity limit, not a per-tick clip.
         self.declare_parameter("output_lowpass_alpha", 0.0)  # 0 = off; (0,1] = on
 
-        # Per-tick diagnostic log (gravity-sag / drift hunt). When > 0, the
-        # control tick logs measured joints, last command, input velocity, the
-        # solved q_des and the measured-vs-last-command drift at this throttle
-        # period (s). 0 = off. This is the "stand in control mode, press
-        # nothing" probe: on hardware measured may drift from last_cmd under
-        # load, but q_des should stay on the command-side trajectory instead of
-        # following the sag.
-        self.declare_parameter("debug_tick_log_period_s", 0.0)
-
-        # Arm joint limits (rad) — self-owned safety (§1.5-A). Required: the
+        # Arm joint limits (rad) — self-owned safety. Required: the
         # node refuses to start without them so a misconfig fails loudly.
         # dynamic_typing avoids the "declare name only" deprecation while still
         # treating absence as "not set" (validated below).
@@ -157,7 +151,7 @@ class SO101PlacoServoNode(Node):
         self.declare_parameter("joint_limits_lower", descriptor=_dyn)
         self.declare_parameter("joint_limits_upper", descriptor=_dyn)
 
-        # Topics & services (symmetric to safe_servo).
+        # Topics & services consumed by PlacoServoBackend.
         self.declare_parameter("linear_cmd_topic", "/so101_placo_servo_node/linear_cmd_base")
         self.declare_parameter("angular_cmd_topic", "/so101_placo_servo_node/angular_cmd_base")
         self.declare_parameter("start_service", "/so101_placo_servo_node/start")
@@ -183,7 +177,6 @@ class SO101PlacoServoNode(Node):
         self.orientation_weight = float(self.get_parameter("orientation_weight").value)
         self.max_joint_speed = float(self.get_parameter("max_joint_speed").value)
         self.output_lowpass_alpha = _clamp(float(self.get_parameter("output_lowpass_alpha").value), 0.0, 1.0)
-        self.debug_tick_log_period_s = float(self.get_parameter("debug_tick_log_period_s").value)
 
         def _opt_param(name):
             try:
@@ -218,6 +211,7 @@ class SO101PlacoServoNode(Node):
         urdf_path = self.get_parameter("urdf_path").value or None
 
         # ---- Placo differential-IK (in-process, radian-native, IB-Robot URDF) ----
+        _require_placo(self.get_logger())
         self.diffik = SO101PlacoDiffIK(
             urdf_path=urdf_path,
             target_frame=self.ik_link_name,
@@ -248,7 +242,7 @@ class SO101PlacoServoNode(Node):
         self._latest_js: JointState | None = None
         self._last_input_time: float = 0.0
 
-        # ---- diagnostics counters (lightweight tap, §2.5 decision C) ----
+        # ---- diagnostics counters ----
         self._recovery_count: int = 0
         self._dropped_frame_count: int = 0
         self._solve_count: int = 0
@@ -265,7 +259,7 @@ class SO101PlacoServoNode(Node):
         self.create_service(Trigger, self.start_srv_name, self._on_start_srv, callback_group=self.cb_group)
         self.create_service(Trigger, self.stop_srv_name, self._on_stop_srv, callback_group=self.cb_group)
 
-        # ---- timer (fixed-rate solve+publish for smoothness, §7.6-1) ----
+        # ---- timer (fixed-rate solve+publish for smoothness) ----
         self.create_timer(self.control_period, self._on_control_tick, callback_group=self.cb_group)
 
         self.get_logger().info(
@@ -274,8 +268,7 @@ class SO101PlacoServoNode(Node):
             f"diffik(damping={self.diffik_damping}, max_speed={self.max_joint_speed}rad/s, "
             f"orientation_weight={0.0 if self.position_only else self.orientation_weight}) "
             f"{'POSITION-ONLY ' if self.position_only else ''}"
-            f"lowpass={self.output_lowpass_alpha} "
-            f"debug_tick_log={self.debug_tick_log_period_s}s"
+            f"lowpass={self.output_lowpass_alpha}"
         )
 
     # ------------------------------------------------------------------ subs
@@ -370,9 +363,9 @@ class SO101PlacoServoNode(Node):
             v = np.array([lv.x, lv.y, lv.z], dtype=np.float64)
 
         # --- angular velocity (base frame, rad/s) ---
-        # Phase 2: integrate a command-side orientation reference. The backend
-        # has already converted tool-frame stick semantics into base-frame
-        # angular velocity for placo_servo.
+        # Integrate a command-side orientation reference. The backend has
+        # already converted tool-frame stick semantics into base-frame angular
+        # velocity for placo_servo.
         if (
             self.position_only
             or idle
@@ -432,38 +425,15 @@ class SO101PlacoServoNode(Node):
             self._recovery_count += 1
             return
 
-        # === Defense-in-depth joint-limit clamp (§1.5-A) ===
+        # === Defense-in-depth joint-limit clamp ===
         # The QP already enforces limits; this is a redundant guard because the
         # Cartesian arm chain bypasses TeleopNode's SafetyFilter.
         q_des = np.clip(q_des, self.joint_lo, self.joint_hi)
 
-        # === Optional output low-pass for de-jitter (§7.6-4) ===
+        # === Optional output low-pass for de-jitter ===
         if self.output_lowpass_alpha > 0.0 and self._last_cmd is not None:
             a = self.output_lowpass_alpha
             q_des = a * q_des + (1.0 - a) * self._last_cmd
-
-        # === Per-tick diagnostic (gravity-sag / drift hunt) ===
-        # With v≈0 a healthy hold may still show measured≠last_cmd on a real
-        # arm (servo lag / gravity), but q_des should stay on the command-side
-        # trajectory rather than following measured. Watch `drift` to quantify
-        # hardware lag and `p_err` to see measured EE error from the held ref.
-        if self.debug_tick_log_period_s > 0.0:
-            with np.printoptions(precision=4, suppress=True):
-                drift = q_measured - self._last_cmd if self._last_cmd is not None else np.zeros_like(q_measured)
-                p_meas = self.diffik.ee_position(q_measured)
-                p_err = (p_meas - self._p_ref) if self._p_ref is not None else np.zeros(3)
-                self.get_logger().info(
-                    f"[tick] v={np.round(v, 4).tolist()} "
-                    f"measured={np.round(q_measured, 4).tolist()} "
-                    f"seed={np.round(q_cmd_seed, 4).tolist()} "
-                    f"last_cmd={np.round(self._last_cmd, 4).tolist() if self._last_cmd is not None else None} "
-                    f"q_des={np.round(q_des, 4).tolist()} "
-                    f"drift(meas-cmd)={np.round(drift, 4).tolist()} "
-                    f"p_ref={np.round(self._p_ref, 4).tolist() if self._p_ref is not None else None} "
-                    f"p_err(meas-ref)={np.round(p_err, 4).tolist()} "
-                    f"w={np.round(w, 4).tolist()}",
-                    throttle_duration_sec=self.debug_tick_log_period_s,
-                )
 
         out = Float64MultiArray()
         out.data = [float(x) for x in q_des]
@@ -495,12 +465,17 @@ class SO101PlacoServoNode(Node):
         tf_s = tr.header.stamp.sec + tr.header.stamp.nanosec * 1e-9
         return (now_s - tf_s) <= self.tf_stale_threshold_s
 
+    def destroy_node(self) -> bool:
+        if hasattr(self, "diffik"):
+            self.diffik.close()
+        return super().destroy_node()
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)
     node = SO101PlacoServoNode()
-    # SingleThreadedExecutor mirrors so101_safe_servo_node: all callbacks are
-    # short (<5 ms) and the solve tick must never overlap itself.
+    # All callbacks are short (<5 ms) and the solve tick must never overlap
+    # itself.
     executor = SingleThreadedExecutor()
     executor.add_node(node)
     try:

@@ -12,7 +12,7 @@ class CartesianBackend(ABC):
 
     @abstractmethod
     def enable(self) -> bool:
-        """Enable downstream solver. Returns ``True`` on success."""
+        """Request downstream solver enable. Returns ``True`` if accepted."""
 
     @abstractmethod
     def disable(self) -> bool:

@@ -362,7 +362,7 @@ class PhoneDevice(BaseTeleopDevice):
 
     Supports iOS (via HEBI Mobile I/O) and Android (via WebXR).
 
-    Parses sensor data from the phone, drives MoveIt Servo for arm Cartesian
+    Parses sensor data from the phone, drives the selected Cartesian backend for arm
     control via servo_client.servo(), and returns only the gripper target to
     TeleopNode for direct publishing.
 
@@ -418,7 +418,7 @@ class PhoneDevice(BaseTeleopDevice):
                 return False
 
             base_link = self._config.get("base_link_name", "base")
-            solver = self._config.get("cartesian_solver", "velocity_servo")
+            solver = self._config.get("cartesian_solver", "placo_servo")
             tool_frame = self._config.get("tool_frame", "gripper")
             control_params = self._config.get("control_params", {}) or {}
             linear_speed = float(control_params.get("cartesian_linear_speed", 1.0))
@@ -458,7 +458,7 @@ class PhoneDevice(BaseTeleopDevice):
 
     def get_joint_targets(self) -> dict[str, float]:
         """
-        Drive MoveIt Servo for arm Cartesian control; return gripper target.
+        Drive the selected Cartesian backend for arm control; return gripper target.
 
         During go_home: returns full arm+gripper targets for joint-position
         control and re-enables Servo once arm reaches home position.
@@ -500,7 +500,7 @@ class PhoneDevice(BaseTeleopDevice):
                 current_joints, first_state_rcvd, self._node.get_clock().now().nanoseconds * 1e-9
             )
 
-        # Cartesian control: normalize displacement to [-1, 1] for MoveIt Servo unitless mode.
+        # Cartesian control: normalize displacement to [-1, 1] for backend unitless mode.
         # cmd.linear is already clamped to max_ee_step_m, so dividing gives values in [-1, 1].
         max_lin = self.phone_config.max_ee_step_m
         max_ang = self.phone_config.max_angular_step_rad
@@ -617,9 +617,7 @@ class PhoneDevice(BaseTeleopDevice):
             linear = linear * (self.phone_config.max_ee_step_m / norm)
 
         # Differential rotation stays in the device/tool semantic frame.
-        # Cartesian backends own any required frame conversion; velocity_servo
-        # converts tool->base internally, while safe_servo integrates tool-frame
-        # angular commands directly into J4/J5.
+        # The Cartesian backend owns any required tool->base conversion.
         angular = delta_rot.as_rotvec()
 
         # Clamp to max single-step angular magnitude

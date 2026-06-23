@@ -40,7 +40,7 @@ class XboxTeleopDevice(BaseTeleopDevice):
 
         # Injected by robot_config.launch_builders.teleop based on
         # robot.teleoperation.cartesian.{solver,tool_frame} SSOT fields.
-        self.cartesian_solver = config.get("cartesian_solver", "velocity_servo")
+        self.cartesian_solver = config.get("cartesian_solver", "placo_servo")
         self.tool_frame = config.get("tool_frame", "gripper")
         self.base_link = config.get("base_link_name", "base")
 
@@ -113,7 +113,7 @@ Controls:        [A] to ENABLE, [B] to DISABLE
   - Right Stick U/D: Joint 4
   - D-Pad Left/Right: Joint 5"""
         else:
-            mode_help = """CARTESIAN MODE (MoveIt Servo):
+            mode_help = """CARTESIAN MODE (Cartesian Backend):
   - Left Stick L/R:  Linear X (Left/Right)
   - Left Stick U/D:  Linear Y (Forward/Backward)
   - Right Stick U/D: Linear Z (Up/Down)
@@ -269,6 +269,10 @@ CONTROLS:
                 return val if abs(val) > self.deadzone else 0.0
             return 0.0
 
+        # Linux /joy reports left-stick Y as negative when pushed up. Normalize
+        # it here so Xbox Cartesian controls match the SO-101 operator
+        # intuition: left stick X = left/right, left stick Y = forward/backward.
+        # This device mapping convention is shared by all Cartesian backends.
         linear = (get_val("linear_x", 1), -get_val("linear_y", 0), get_val("linear_z", 4))
         angular = (0.0, get_val("angular_y", 6), get_val("angular_z", 3))
         self.servo_client.servo(linear=linear, angular=angular)
