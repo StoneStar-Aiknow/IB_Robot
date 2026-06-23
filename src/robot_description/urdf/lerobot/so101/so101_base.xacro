@@ -8,6 +8,17 @@
 
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro">
 
+	<!--
+	  TCP (Tool Center Point) offset along the gripper finger extension.
+	  The SO-101 fingers extend along the gripper link's -Z axis (the jaw tip
+	  delta from the gripper origin is dominantly -Z), so a point on this line
+	  sits out at the jaws. Default 0.09 m places the TCP between the two jaw
+	  faces (single source of truth for the TCP geometry).
+	  A small -X offset re-centers the TCP onto the jaw mid-line.
+	-->
+	<xacro:arg name="tcp_offset_x" default="-0.005" />
+	<xacro:arg name="tcp_offset_z" default="-0.095" />
+
 	<!-- Links -->
 	<link name="world" />
 
@@ -350,6 +361,32 @@
 			</geometry>
 		</collision>
 	</link>
+
+	<!-- Link tcp (virtual Tool Center Point) -->
+	<!--
+	  Pure translation along gripper -Z (finger extension line); orientation
+	  identical to the gripper link (no relative rotation). Carries only a tiny
+	  visual marker (a small sphere) for RViz debugging, no collision geometry,
+	  so it never affects planning or collision checking.
+	-->
+	<material name="tcp_marker">
+		<color rgba="0.1 0.9 0.2 0.9" />
+	</material>
+	<link name="tcp">
+		<visual>
+			<origin xyz="0 0 0" rpy="0 0 0" />
+			<geometry>
+				<sphere radius="0.008" />
+			</geometry>
+			<material name="tcp_marker" />
+		</visual>
+	</link>
+
+	<joint name="gripper_to_tcp" type="fixed">
+		<origin xyz="$(arg tcp_offset_x) 0 $(arg tcp_offset_z)" rpy="0 0 0" />
+		<parent link="gripper" />
+		<child link="tcp" />
+	</joint>
 
 	<!-- Joint from gripper to jaw -->
 	<joint name="6" type="revolute">

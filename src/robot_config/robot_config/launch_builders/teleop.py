@@ -178,10 +178,15 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
     # Default is 'safe_servo' for low-cost arms with noticeable servo error.
     cart_cfg = teleop_config.get("cartesian", {}) or {}
     cart_solver = cart_cfg.get("solver", "safe_servo")
-    if cart_solver not in ("velocity_servo", "safe_servo"):
+    # Accept the recommended names plus the legacy alias (C1: never break old
+    # configs). 'velocity_servo' is normalised to 'servo' before dispatch.
+    if cart_solver not in ("servo", "velocity_servo", "safe_servo", "placo_servo"):
         raise ValueError(
-            f"teleoperation.cartesian.solver must be 'velocity_servo', or 'safe_servo', got {cart_solver!r}"
+            "teleoperation.cartesian.solver must be 'servo' (alias 'velocity_servo'), "
+            f"'safe_servo', or 'placo_servo', got {cart_solver!r}"
         )
+    if cart_solver == "velocity_servo":
+        cart_solver = "servo"
     moveit_cfg = robot_config.get("moveit", {}) or {}
     cart_tool_frame = (
         cart_cfg.get("tool_frame") or device_config.get("ee_frame_name") or moveit_cfg.get("ee_link") or "gripper"
@@ -201,6 +206,19 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
         cp["cartesian_linear_speed"] = safe_linear_speed
         cp["cartesian_angular_speed"] = safe_angular_speed
         logger.info(f"safe_servo speed override: linear={safe_linear_speed} (0~1), angular={safe_angular_speed} (0~1)")
+
+    # When solver=placo_servo, route device-side speed knobs from the
+    # placo_servo config block (same 0~1 unitless scale as safe_servo).
+    if cart_solver == "placo_servo":
+        placo_cfg = cart_cfg.get("placo_servo", {}) or {}
+        placo_linear_speed = placo_cfg.get("linear_speed", 0.3)
+        placo_angular_speed = placo_cfg.get("angular_speed", 0.7)
+        cp = device_param.setdefault("control_params", {})
+        cp["cartesian_linear_speed"] = placo_linear_speed
+        cp["cartesian_angular_speed"] = placo_angular_speed
+        logger.info(
+            f"placo_servo speed override: linear={placo_linear_speed} (0~1), angular={placo_angular_speed} (0~1)"
+        )
 
     logger.info(f"Cartesian solver={cart_solver}, tool_frame={cart_tool_frame}")
 
@@ -291,14 +309,18 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
     # Add MoveIt Servo or Safe Servo node for Xbox controller and phone.
     # Selection is driven by robot.teleoperation.cartesian.solver.
     if device_config.get("type") in ("xbox_controller", "phone"):
-        if cart_solver == "velocity_servo":
+        if cart_solver == "servo":
             servo_node = _create_servo_node(robot_config, device_config, robot_description_dict)
             nodes.append(servo_node)
-            logger.info("Generated servo_node for Cartesian velocity_servo control")
+            logger.info("Generated servo_node for Cartesian servo (MoveIt Servo) control")
         elif cart_solver == "safe_servo":
             safe_node = _create_so101_safe_servo_node(robot_config, device_config, robot_description_dict)
             nodes.append(safe_node)
             logger.info("Generated so101_safe_servo_node for SO101 robust Cartesian control")
+        elif cart_solver == "placo_servo":
+            placo_node = _create_so101_placo_servo_node(robot_config, device_config, robot_description_dict)
+            nodes.append(placo_node)
+            logger.info("Generated so101_placo_servo_node for SO101 Placo QP Cartesian control")
 
     return nodes
 
@@ -501,6 +523,68 @@ def _create_so101_safe_servo_node(
         package="robot_moveit",
         executable="so101_safe_servo_node.py",
         name="so101_safe_servo_node",
+        output="screen",
+        parameters=[params, extra],
+    )
+
+
+def _create_so101_placo_servo_node(
+    robot_config: dict,
+    device_config: dict,  # noqa: ARG001 — kept for signature parity with siblings
+    robot_description_dict: dict = None,
+) -> Node:
+    """Launch ``so101_placo_servo_node``.
+
+    Loads the solver YAML from ``moveit.so101_placo_servo_config_path`` and
+    appends arm joint names from ``robot.joints.arm`` so the node knows the
+    controller output order. Mirrors ``_create_so101_safe_servo_node``.
+    """
+    import yaml as _yaml
+
+    moveit_cfg = robot_config.get("moveit", {}) or {}
+    yaml_ref = moveit_cfg.get("so101_placo_servo_config_path")
+    if not yaml_ref:
+        raise ConfigError(
+            "solver=placo_servo requires moveit.so101_placo_servo_config_path "
+            "(e.g. package://robot_moveit/config/so101_placo_servo.yaml)"
+        )
+    if yaml_ref.startswith("package://"):
+        rest = yaml_ref[len("package://") :]
+        pkg_name, _, rel = rest.partition("/")
+        yaml_path = os.path.join(get_package_share_directory(pkg_name), rel)
+    else:
+        yaml_path = resolve_ros_path(yaml_ref)
+    with open(yaml_path) as f:
+        params = _yaml.safe_load(f) or {}
+
+    joints_cfg = robot_config.get("joints", {}) or {}
+    arm_joint_names = joints_cfg.get("arm", [])
+    if not arm_joint_names:
+        raise ConfigError(
+            "solver=placo_servo requires robot.joints.arm to list the arm "
+            "joint names (used to order the position command output)"
+        )
+    params["arm_joint_names"] = arm_joint_names
+
+    # Drop-in TCP support: the IK tip frame is the SSOT moveit.ee_link
+    # (gripper | tcp). Inject it so selecting tcp re-targets placo's frame
+    # task without editing the solver YAML. Defaults to the YAML value (gripper)
+    # when ee_link is absent, so the gripper path is byte-for-byte unchanged.
+    ee_link = moveit_cfg.get("ee_link")
+    if ee_link:
+        params["ik_link_name"] = ee_link
+
+    # The node expands the so101 xacro in-memory at runtime via the
+    # robot_description package share dir, so robot_description_dict is not
+    # required for kinematics; it is still forwarded for parity / use_sim_time.
+    extra = {}
+    if robot_description_dict:
+        extra.update(robot_description_dict)
+
+    return Node(
+        package="robot_moveit",
+        executable="so101_placo_servo_node.py",
+        name="so101_placo_servo_node",
         output="screen",
         parameters=[params, extra],
     )

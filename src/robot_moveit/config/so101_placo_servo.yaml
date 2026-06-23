@@ -1,0 +1,99 @@
+# SO-101 Placo Servo configuration.
+#
+# Loaded by so101_placo_servo_node when
+#   robot.teleoperation.cartesian.solver == 'placo_servo'.
+# All keys correspond to ROS 2 parameter names declared in
+# scripts/so101_placo_servo_node.py — keep names in sync.
+#
+# Design philosophy (Jacobian + QP velocity-level differential IK, adapted to
+# ROS 2 + radian-native + IB-Robot URDF; see cc-plans/placo-diffik-servo):
+#   - In-process Placo QP differential IK (no compute_ik service round-trip).
+#   - Command-side reference, not measured-pose ratchet: the node advances a
+#     virtual EE reference by v*dt and seeds the QP from the last published
+#     command. Hardware /joint_states initialise enable/reset and feed
+#     diagnostics, but are not the hot-path IK seed; real servos sag/lag under
+#     gravity and feeding that lag into a 5-DOF position-only QP lets the
+#     nullspace drift (J4 snapping on hardware while simulation stays correct).
+#   - position_only (Phase 1): a Placo PositionTask constrains only the 3-DOF
+#     position; no orientation goal is built, so orientation is genuinely free
+#     for the under-actuated 5-DOF arm. (Phase 2 reintroduces orientation as a
+#     lower-priority task.)
+#   - Joint + velocity limits are HARD QP constraints (enable_joint_limits /
+#     enable_velocity_limits): the unreachable velocity component is projected
+#     onto the feasible set (correct energy decomposition) and the arm yields
+#     at the reachable edge. No workspace box / per-tick clip needed.
+#   - Self-owned joint-limit clamp: in Cartesian mode the arm command chain
+#     bypasses TeleopNode's SafetyFilter, so the node also clamps outputs as
+#     defense in depth.
+
+# --- planning targets ----------------------------------------------------
+planning_frame: base
+ik_link_name: gripper            # target frame in the URDF (== moveit.ee_link).
+                                 # Overridden by teleop.py to moveit.ee_link, so
+                                 # selecting ee_link: tcp re-targets the placo
+                                 # PositionTask to the virtual TCP automatically
+                                 # (tcp is a fixed child of gripper; the frame
+                                 # Jacobian carries the 95mm lever arm exactly,
+                                 # no special case). arm_joint_names is injected
+                                 # by teleop.py.
+
+# --- differential-IK mode -------------------------------------------------
+# position_only=false enables Phase 2: position remains the primary task, and a
+# low-weight soft OrientationTask is added so angular joystick input can steer
+# the EE attitude without letting orientation dominate the under-actuated arm.
+position_only: false
+
+# orientation_weight: soft task weight for OrientationTask. Keep small: SO-101
+# has 5 DOF, so full 6D pose tracking is over-constrained. This is only a
+# first-pass "release angular DOFs" knob for bench testing.
+orientation_weight: 0.01
+
+# diffik_damping: regularization weight giving DLS-like smooth yielding through
+# singularities / reachable boundaries. Larger = smoother but less crisp
+# tracking; smaller = crisper but more sensitive near singularities.
+diffik_damping: 0.001
+
+# max_joint_speed: per-joint velocity ceiling (rad/s) for the QP velocity-limit
+# constraint and the REAL speed ceiling of the servo. The SO-101 URDF declares
+# 10 rad/s which is far too fast for hand teleop; 2.0 rad/s gives a smooth,
+# controllable response while still letting the arm yield gracefully at the
+# reachable edge.
+max_joint_speed: 2.0
+
+# --- smoothness / safety -------------------------------------------------
+# The real speed ceiling is the in-QP velocity limit (enable_velocity_limits),
+# NOT a per-tick position clip. output_lowpass is an optional de-jitter filter
+# on the published joint command.
+output_lowpass_alpha: 0.0        # 0 = off; (0,1] enables first-order LP on q_des.
+                                 # Start at 0; only raise if jitter remains.
+
+# debug_tick_log_period_s: per-tick diagnostic log throttle (s). 0 = off.
+# Set to e.g. 0.5 to print, twice a second, the control tick's input velocity,
+# measured joints, command-side seed, last command, solved q_des, and measured
+# drift from the command. On hardware measured may differ from last_cmd under
+# load, but q_des should stay on the command-side trajectory instead of
+# following that sag.
+debug_tick_log_period_s: 0.0
+
+# --- self-owned joint limits (rad) ---------------------------------------
+# Must match the URDF link limits for joints 1..5 (so101_base xacro).
+# The node refuses to start if these keys are absent.
+joint_limits_lower: [-2.0693, -1.92, -1.6813, -1.65806, -2.9115]
+joint_limits_upper: [2.0709, 1.92, 1.6828, 1.65806, 2.9115]
+
+# --- topics & services (symmetric to safe_servo) -------------------------
+# NOTE: angular is in the BASE frame here (PlacoServoBackend applies the
+# tool->base ToolAngularAdapter before publishing), because placo controls a
+# true Cartesian orientation — unlike safe_servo which integrates raw
+# tool-frame angular directly into wrist joints.
+linear_cmd_topic: /so101_placo_servo_node/linear_cmd_base
+angular_cmd_topic: /so101_placo_servo_node/angular_cmd_base
+start_service: /so101_placo_servo_node/start
+stop_service: /so101_placo_servo_node/stop
+command_out_topic: /arm_position_controller/commands
+
+# --- timing --------------------------------------------------------------
+control_period: 0.02             # 50 Hz solve/publish tick
+incoming_command_timeout: 0.5    # >500 ms without input → hold (zero twist)
+target_reset_timeout_s: 2.0      # >2 s idle → force zero twist; does NOT re-latch p_ref
+tf_stale_threshold_s: 0.2

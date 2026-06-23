@@ -21,6 +21,16 @@ install(
   PROGRAMS
     scripts/moveit_gateway.py
     scripts/so101_safe_servo_node.py
+    scripts/so101_placo_servo_node.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# Pure-Python helper module imported by so101_placo_servo_node.py at runtime.
+# Installed (not as a PROGRAM) so it sits next to the node in lib/<pkg> and is
+# importable via the node's sys.path insertion.
+install(
+  FILES
+    scripts/so101_placo_kinematics.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

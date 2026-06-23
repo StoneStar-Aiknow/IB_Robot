@@ -13,3 +13,13 @@ arm:
   orientation_vs_position_weight: 0.5
 
   position_only_ik: true   # False: j4/j5 can still be optimised toward tp.R
+
+# arm_tcp: identical solver config to 'arm', but for the group whose tip is the
+# virtual TCP link. Selected when moveit.ee_link == "tcp". The 'arm' block above
+# is left untouched so selecting "gripper" stays byte-for-byte identical.
+arm_tcp:
+  kinematics_solver: lma_kinematics_plugin/LMAKinematicsPlugin
+  kinematics_solver_timeout: 1.0
+  kinematics_solver_attempts: 3
+  orientation_vs_position_weight: 0.5
+  position_only_ik: true
