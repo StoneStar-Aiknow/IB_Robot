@@ -26,6 +26,7 @@ FetchContent_Declare(
   ftservo_sdk_external
   GIT_REPOSITORY https://gitee.com/ftservo/FTServo_Linux.git
   GIT_TAG        main
+  GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(ftservo_sdk_external)
 

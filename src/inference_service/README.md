@@ -204,6 +204,21 @@ ros2 launch inference_service cloud_inference.launch.py \
 同时要求实际的 RKNN 模型文件随 policy 一起纳管到 `policy_path` 目录内，
 默认文件名为 `model.rknn`。
 
+`lerobot_policy_node` 会根据 `lerobot_norm_mode` 在 LeRobot 归一化单位与
+`ros2_control` 弧度之间转换。真机模式使用 `robot_config` 中的
+`ros2_control.calib_file`；`use_sim:=true` 仿真模式使用生成后的 URDF 关节
+`limit`，因此不需要真实机械臂校准 JSON。
+
+注意 `use_sim` 与 ROS 2 内置的 `use_sim_time` 不是一回事：
+
+- `use_sim_time` 只控制时钟源（是否使用 `/clock` 话题），回放 rosbag 时也会
+  被置为 `true`，但不代表当前运行在物理仿真器中；
+- `use_sim` 才决定 `lerobot_policy_node` 是否走仿真分支（URDF limit 转换表、
+  跳过真实校准文件）。
+
+因此在 Gazebo / MuJoCo 中运行推理时，两者都需要设为 `true`（`robot.launch.py`
+会统一注入，通常无需手动指定）。
+
 ### 编译模型后端的 Wrapper 设计
 
 无论使用 PyTorch、Ascend OM 还是 RKNN，`inference_service` 对上层暴露的统一入口始终是

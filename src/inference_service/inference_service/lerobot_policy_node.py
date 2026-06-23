@@ -27,7 +27,8 @@ This node provides ROS 2 integration for LeRobot policies with two execution mod
 ROS Interface Compatibility (MUST NOT CHANGE):
 - Action: ibrobot_msgs/action/DispatchInfer
 - Parameters: name, node_name, model_type, repo_id, checkpoint,
-              contract_path, device, frequency, use_header_time,
+              robot_config_path, lerobot_norm_mode, use_sim,
+              device, frequency, use_header_time,
               execution_mode, request_timeout, cloud_inference_topic,
               cloud_result_topic, publish_attention, attention_viz_topic,
               attention_interactive_masking, attention_mask_save_dir
@@ -78,6 +79,8 @@ from robot_config.contract_utils import (
 from robot_config.tracing_utils import create_trace_logger
 from robot_config.utils import (
     build_joint_conversion_table,
+    build_joint_conversion_table_from_urdf,
+    parse_bool,
     resolve_calibration_path_from_config,
     resolve_gripper_joints_from_config,
     resolve_joint_names_from_config,
@@ -133,6 +136,7 @@ class _NodeConfig:
     checkpoint: str | None = None
     robot_config_path: str | None = None
     lerobot_norm_mode: str = "range_m100_100"
+    use_sim: bool = False
     device: str = "auto"
     frequency: float = 10.0
     use_header_time: bool = True
@@ -286,12 +290,31 @@ class LeRobotPolicyNode(Node):
         if self._default_task:
             self.get_logger().info(f"Default task prompt: {self._default_task!r}")
 
-        # Build joint conversion table from calibration file
+        # Build joint conversion table from the runtime position limits.
+        # Hardware uses calibrated servo ranges; simulation uses URDF limits.
         calib_file = resolve_calibration_path_from_config(robot_cfg)
         joint_names = resolve_joint_names_from_config(robot_cfg)
         gripper_joints = resolve_gripper_joints_from_config(robot_cfg) or ["6"]
         norm_mode = self._config.lerobot_norm_mode
-        if calib_file and joint_names:
+        is_sim = parse_bool(self._config.use_sim, default=False)
+        if is_sim and joint_names:
+            from robot_config.launch_builders.description import generate_robot_description
+
+            description = generate_robot_description(robot_cfg, True)
+            if description is None:
+                raise RuntimeError("Failed to generate robot_description for simulated joint conversion")
+            robot_description, _ = description
+            self._joint_rad_limits = build_joint_conversion_table_from_urdf(
+                robot_description,
+                joint_names,
+                gripper_joints,
+                norm_mode=norm_mode,
+            )
+            self.get_logger().info(
+                f"Loaded simulated joint conversion table from URDF limits "
+                f"(mode={norm_mode}): {len(self._joint_rad_limits)} joints"
+            )
+        elif calib_file and joint_names:
             self._joint_rad_limits = build_joint_conversion_table(
                 calib_file,
                 joint_names,
@@ -302,6 +325,11 @@ class LeRobotPolicyNode(Node):
                 f"Loaded joint conversion table (mode={norm_mode}): {len(self._joint_rad_limits)} joints"
             )
 
+        else:
+            self._joint_rad_limits = []
+            self.get_logger().warn("Missing calib_file or joint_names; rad↔pct conversion disabled")
+
+        if joint_names:
             # Append base velocity normalization entries using physical units (rad/s).
             # The raw steps ↔ physical unit conversion is handled by lekiwi_hardware.
             # Here we only need the physical range for LeRobot [-100, +100] mapping.
@@ -316,9 +344,6 @@ class LeRobotPolicyNode(Node):
                     f"Appended {len(velocity_joints)} velocity joints "
                     f"(max_rad/s={base_vel_max_rad}) → total {len(self._joint_rad_limits)} entries"
                 )
-        else:
-            self._joint_rad_limits = []
-            self.get_logger().warn("Missing calib_file or joint_names; rad↔pct conversion disabled")
 
         # Get all observation specs from contract
         all_obs_specs = [s for s in iter_specs(self._contract) if not s.is_action]
@@ -688,8 +713,8 @@ class LeRobotPolicyNode(Node):
     # Observation path (input):  rad  →  _rad_to_lerobot  →  model
     # Action path     (output):  model  →  _lerobot_to_rad  →  rad
     #
-    # _joint_rad_limits is populated at runtime from the calibration JSON
-    # in _load_contract() via build_joint_conversion_table().
+    # _joint_rad_limits is populated at runtime from hardware calibration
+    # or, in simulation, from URDF joint limits.
 
     def _rad_to_lerobot(self, state: np.ndarray) -> np.ndarray:
         """Convert radians to LeRobot units (observation input path)."""
@@ -1269,6 +1294,7 @@ def main() -> None:
             "checkpoint",
             "robot_config_path",
             "lerobot_norm_mode",
+            "use_sim",
             "device",
             "frequency",
             "use_header_time",
@@ -1301,6 +1327,8 @@ def main() -> None:
                 default = ""
             elif p == "lerobot_norm_mode":
                 default = "range_m100_100"
+            elif p == "use_sim":
+                default = False
             elif p == "device":
                 default = "auto"
             elif p == "frequency":
@@ -1326,6 +1354,7 @@ def main() -> None:
         }
         config["device"] = temp_node.get_parameter("device").value
         config["lerobot_norm_mode"] = temp_node.get_parameter("lerobot_norm_mode").value
+        config["use_sim"] = temp_node.get_parameter("use_sim").value
         config["frequency"] = temp_node.get_parameter("frequency").value
         config["use_header_time"] = temp_node.get_parameter("use_header_time").value
         config["execution_mode"] = temp_node.get_parameter("execution_mode").value

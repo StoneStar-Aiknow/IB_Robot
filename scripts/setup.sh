@@ -5,8 +5,6 @@
 # Usage:
 #   ./scripts/setup.sh                               # Interactive mode
 #   ./scripts/setup.sh --yes                         # Auto-yes mode
-#   ./scripts/setup.sh --skip-submodules             # Keep current submodule state
-
 #   ./scripts/setup.sh --skip-verify                 # Skip final ROS/Python verification
 #   ./scripts/setup.sh --platform <id>               # Override detected platform
 #   ./scripts/setup.sh --help                        # Show help
@@ -48,7 +46,6 @@ SETUP_DISK_FREE_SUMMARY="unknown"
 SETUP_ROS_SUMMARY="unknown"
 SUDO_AUTH_READY=false
 PLATFORM_OVERRIDE=""
-SKIP_SUBMODULES=false
 
 SKIP_VERIFY=false
 CURRENT_STAGE="initializing"
@@ -190,7 +187,6 @@ Options:
   -y, --yes              Auto-confirm prompts using defaults
       --sudo             Force sudo for privileged operations
       --no-sudo          Never use sudo
-      --skip-submodules  Skip submodule initialization/update
 
       --skip-verify      Skip final ROS/Python verification
       --platform ID      Override platform detection
@@ -213,7 +209,6 @@ parse_args() {
             --yes|-y) AUTO_YES=true ;;
             --no-sudo) USE_SUDO=false ;;
             --sudo) USE_SUDO=true ;;
-            --skip-submodules) SKIP_SUBMODULES=true ;;
 
             --skip-verify) SKIP_VERIFY=true ;;
             --platform)
