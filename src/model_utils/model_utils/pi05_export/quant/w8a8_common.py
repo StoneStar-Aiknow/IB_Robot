@@ -829,10 +829,10 @@ def transplant_int8_into_npu_graph(donor_onnx: Path, npu_onnx: Path, output_onnx
 
         A_npu → Q'(copy, in=A_npu) → M'(copy) → D'(copy, out=out_npu)
 
-    The fp16 MatMul (and its now-unused fp16 weight) are removed; the int8
-    weight + uint64 deq_scale initializers are copied over.
+    The fp16 MatMul/Gemm/Conv (and its now-unused fp16 params) is removed; the
+    donor's int8 params + uint64 deq_scale initializers are copied over.
 
-    Three donor structures are handled (full-quantization runs hit all of them):
+    Four donor structures are handled (full-quantization runs hit all of them):
 
     * **Bias-less MatMul/Gemm** (the Gemma trunk q/k/v/o/gate/up/down): the
       classic ``AscendQuant → MatMul → AscendDequant`` triplet above.
@@ -845,6 +845,9 @@ def transplant_int8_into_npu_graph(donor_onnx: Path, npu_onnx: Path, output_onnx
       fp16 MatMul output), so the NPU graph's existing downstream fp16 bias-``Add``
       re-applies the bias. Bias therefore stays in fp16 (negligible cost) and the
       NPU graph's Add + bias initializer are left untouched.
+    * **Gemm with folded bias** (AE ``time_mlp`` / AdaRMSNorm dense):
+      ``AscendQuant → Gemm(int8 weight, int32 bias) → AscendDequant``. The int32
+      bias lives inside the Gemm, so it must be copied with the int8 weight.
     * **Conv** (the SigLIP ``patch_embedding``): ``AscendQuant → Conv(int8 weight
       [+ bias]) → AscendDequant``. The bias (if any) lives *inside* the Conv node, so
       the dequant input is the Conv directly; we transplant the Conv with *all* its
@@ -885,8 +888,8 @@ def transplant_int8_into_npu_graph(donor_onnx: Path, npu_onnx: Path, output_onnx
         if deq.op_type != "AscendDequant":
             continue
         # The dequant input is either the compute node directly (bias-less
-        # MatMul/Gemm, or Conv with its bias folded inside) or an int32 bias-Add
-        # that msModelSlim moved in front of the dequant for biased MatMul/Gemm.
+        # MatMul/Gemm, folded-bias Gemm, Conv) or an int32 bias-Add that
+        # msModelSlim moved in front of the dequant for biased MatMul.
         src = donor_producer.get(deq.input[0])
         if src is None:
             unmatched.append((deq.name, f"AscendDequant input {deq.input[0]!r} has no producer"))
@@ -959,8 +962,8 @@ def transplant_int8_into_npu_graph(donor_onnx: Path, npu_onnx: Path, output_onnx
         new_nodes.append(m2)
 
         # AscendDequant: feed it straight from the int8 compute output (bypassing
-        # the dropped int32 bias-Add) and rewire its output to the NPU downstream
-        # tensor. For biased MatMul/Gemm the NPU graph's own fp16 Add re-adds bias.
+        # a separate int32 bias-Add when present) and rewire its output to the NPU
+        # downstream tensor.
         d2 = onnx.NodeProto()
         d2.CopyFrom(deq)
         del d2.input[:]

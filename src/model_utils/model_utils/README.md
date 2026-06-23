@@ -726,8 +726,8 @@ _last:
 | `ae_onnx` | 导出 Action Expert（gemma_300m）ONNX | `pi05-action_expert*.onnx` | `vlm_onnx`（需 `runtime_save` 中转张量） |
 | `vlm_quant` | VLM ONNX W8A8 量化 | `pi05-vlm*_w8a8.onnx` | `--batch-path` + `vlm_onnx`；若 `vlm_onnx` 是 NPU 图，会自动复用/生成 donor ONNX |
 | `ae_quant` | Action Expert ONNX W8A8 量化 | `pi05-action_expert*_w8a8.onnx` | `--calib-dir`（默认 `runtime_save`）+ `ae_onnx`；若 `ae_onnx` 是 NPU 图，会自动复用/生成 donor ONNX |
-| `vlm_om` | VLM ONNX → OM（ATC，量化过则自动吃 `*_w8a8`） | `vlm.om`（+manifest） | `--soc-version` + `vlm_onnx` |
-| `ae_om` | Action Expert ONNX → OM（同上） | `action_expert.om`（+manifest） | `--soc-version` + `ae_onnx` |
+| `vlm_om` | VLM ONNX → OM（ATC，量化过则自动吃 `*_w8a8`） | `vlm.om` / `vlm_w8a8.om`（+manifest） | `--soc-version` + `vlm_onnx` |
+| `ae_om` | Action Expert ONNX → OM（同上） | `action_expert.om` / `action_expert_w8a8.om`（+manifest） | `--soc-version` + `ae_onnx` |
 | `verify` | 拆分 vs 整体等价性验证 | — | `--task` + `vlm_onnx`,`ae_onnx` |
 
 **默认 `--steps`** = `vlm_onnx,ae_onnx,vlm_om,ae_om`（导出两段 ONNX + 编译两段 OM）。量化与验证是**显式选项**，需在 `--steps` 中点名。
@@ -800,11 +800,16 @@ python -m model_utils.pi05_export \
 >
 > 量化说明：量化默认**不执行**（不在默认 `--steps` 内）。在 `--steps` 中加入 `vlm_quant`/`ae_quant`
 > 即开启对应段量化，会在 fp16 ONNX 旁产出 `*_w8a8.onnx`；同一次若也选了 `vlm_om`/`ae_om`，ATC 会
-> **自动改用该 `*_w8a8.onnx`** 编译（未量化的段仍用 fp16 ONNX）。如果当前部署 ONNX 文件名是
+> **自动改用该 `*_w8a8.onnx`** 编译，并输出 `vlm_w8a8.om` / `action_expert_w8a8.om`，不会覆盖普通
+> `vlm.om` / `action_expert.om`（未量化的段仍用 fp16 ONNX 和普通 OM 名）。如果当前部署 ONNX 文件名是
 > `*_npu.onnx`，量化会走 Route A：用 ORT-runnable donor 做校准/量化，再把 int8 Linear graft 回 NPU 图；
 > donor 图按 `--donor-device` 推导文件名（默认 `*_cpu.onnx`），存在则复用，缺失则自动导出。`--steps` 是
 > 临时流程开关**不写入** `_last`/profile；而 `--batch-path` / `--donor-device` / `--calib-dir` /
 > `--num-calib` / `--amp-num` 会随 profile 复用。
+>
+> ATC 说明：默认不传 `--input_shape`，并自动加 `--precision_mode_v2=origin`。如某版 CANN 需要显式
+> shape，可单独运行 `convert_om` 并传 `--input-shape auto`；如需覆盖精度模式，用 `--atc-arg` 显式传
+> `--precision_mode_v2=...`。
 
 #### 特性
 
@@ -874,7 +879,7 @@ pi05-vlm_op17_nodyn_fp16_cpu.onnx
 | --- | --- |
 | `convert_onnx_vlm` | 导出 VLM 段 ONNX，写入 `config.om.json` 的 `vlm` 条目；同时保存供 AE 使用的运行期张量（`past_kv_tensor`、`prefix_pad_masks`） |
 | `convert_onnx_action_expert` | 读取 VLM 导出的运行期张量，导出 AE 段 ONNX，写入 `config.om.json` 的 `action_expert` 条目 |
-| `convert_om` | 调用 `atc` 将已导出的 VLM / AE ONNX 编译为 `.om`，`--input_shape` 从 ONNX 静态形状**自动推导**，并补全 `config.om.json` |
+| `convert_om` | 调用 `atc` 将已导出的 VLM / AE ONNX 编译为 `.om`，默认不传 `--input_shape`、默认加 `--precision_mode_v2=origin`，并补全 `config.om.json` |
 
 ```shell
 # 1. 导出 VLM 段
@@ -892,6 +897,9 @@ python -m model_utils.pi05_export.convert_om \
     --vlm-onnx outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx \
     --ae-onnx  outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx
 ```
+
+> `convert_om` 默认省略 `--input_shape`；需要时可加 `--input-shape auto` 从 ONNX 静态输入推导。若输入
+> ONNX 文件名以 `_w8a8.onnx` 结尾，默认 OM 文件名自动加 `_w8a8` 后缀。
 
 > 当 `--pretrained-policy-path` 传入的是 HuggingFace Hub repo id 而非本地目录时，需在
 > `convert_onnx_vlm` / `convert_onnx_action_expert` / `convert_om` 显式指定 `--om-manifest-dir`，
