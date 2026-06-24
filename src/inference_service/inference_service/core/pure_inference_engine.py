@@ -250,7 +250,18 @@ class LeRobotPolicyWrapper(PolicyWrapper):
     def infer(self, batch: dict[str, Tensor]) -> Tensor:
         with torch.no_grad():
             if self._use_action_chunking:
-                action = self._policy.predict_action_chunk(batch)
+                kwargs = {}
+                if self._policy_type == "pi05" and "_noise" in batch:
+                    noise = batch["_noise"]
+                    try:
+                        param = next(self._policy.model.parameters())
+                        model_dtype = param.dtype
+                        model_device = param.device
+                    except (StopIteration, AttributeError):
+                        model_dtype = noise.dtype
+                        model_device = noise.device
+                    kwargs["noise"] = noise.to(device=model_device, dtype=model_dtype)
+                action = self._policy.predict_action_chunk(batch, **kwargs)
                 return action.squeeze(0)
             else:
                 action = self._policy.select_action(batch)

@@ -346,28 +346,86 @@ class LossUtils:
     def _inject_noise(self, batch, noise):
         """Wire deterministic noise into whichever backend is active.
 
-        - torch LeRobot policy: ``policy._external_noise`` is consumed by
-          ``sample_noise()`` during ``predict_action_chunk``.
+        - torch LeRobot PI05: ``batch["_noise"]`` is forwarded by
+          ``LeRobotPolicyWrapper.infer`` as ``predict_action_chunk(..., noise=...)``.
         - compiled OM PI05: ``batch["_noise"]`` is read by
           ``PI05CompiledAdapter.prepare_inputs``.
         """
         if noise is None:
             return batch
 
-        raw_policy = self.coordinator.raw_policy
-        if raw_policy is not None:
-            # Match the action_expert weight dtype, otherwise action_in_proj
-            # fails with "mat1 and mat2 must have the same dtype".
-            try:
-                model_dtype = next(raw_policy.model.parameters()).dtype
-            except (StopIteration, AttributeError):
-                model_dtype = torch.float32
-            raw_policy._external_noise = noise.to(device=self.coordinator.device, dtype=model_dtype)
-        else:
-            # Compiled backend reads noise straight from the batch dict.
-            batch = dict(batch)
-            batch["_noise"] = noise
+        batch = dict(batch)
+        batch["_noise"] = noise
         return batch
+
+    def _infer_raw(self, preprocessed_batch, noise):
+        """Run preprocess-already-done batch through inject+infer, return the
+        raw (pre-postprocessor) action on CPU.  Used by the noise self-check."""
+        b = self._inject_noise(dict(preprocessed_batch), noise)
+        if self.coordinator.raw_policy is not None and hasattr(self.coordinator.raw_policy, "_action_queue"):
+            self.coordinator.raw_policy._action_queue.clear()
+        with torch.inference_mode():
+            r = self.coordinator.infer_only(b)
+        return r.action.detach().cpu().float()
+
+    def _assert_noise_effective(self, batch0):
+        """One-shot self-check (PI05 + fixed noise only): prove the injected
+        noise actually drives the flow-matching ODE and is deterministic.
+
+        Why this exists: the noise transport path differs by lerobot build —
+        some consume ``policy._external_noise`` (back-door), others accept a
+        ``predict_action_chunk(..., noise=)`` kwarg.  If loss_compare's
+        injection mechanism does not match the lerobot actually imported (e.g.
+        the ``.shrc_local`` ``libs/lerobot`` ignores ``_external_noise``), the
+        noise is *silently dropped* and ``sample_actions`` samples its own RNG
+        noise — producing targets that are NOT reproducible on the 310p OM,
+        with no error raised.  This converts that silent failure into a hard
+        abort *before* a bad target is written.
+
+        Method (3 forwards on batch 0):
+          A1, A2 with noise=zeros, B with noise=3*ones.
+          - determinism: A1 == A2 (else RNG leak / dropout active / eval off)
+          - effectiveness: A1 != B (else noise is being ignored)
+        """
+        if self.args.policy_type != "pi05" or not self.args.noise_dir:
+            return  # no fixed-noise requirement -> nothing to guarantee
+
+        shape = self._pi05_noise_shape()
+        if shape is None:
+            print("  noise self-check skipped (cannot infer PI05 noise shape on this backend)")
+            return
+
+        nA = torch.zeros(shape, dtype=torch.float32)
+        nB = torch.full(shape, 3.0, dtype=torch.float32)
+
+        b = self.coordinator.preprocess_only(dict(batch0))
+        oA1 = self._infer_raw(b, nA)
+        oB = self._infer_raw(b, nB)
+        oA2 = self._infer_raw(b, nA)
+
+        deterministic = torch.allclose(oA1, oA2, atol=1e-5)
+        effective = not torch.allclose(oA1, oB, atol=1e-4)
+        d_AB = (oA1 - oB).abs().mean().item()
+        d_AA = (oA1 - oA2).abs().mean().item()
+
+        if not deterministic:
+            raise RuntimeError(
+                "Noise self-check FAILED (non-deterministic): replaying the same "
+                f"noise gave different outputs (mean|A1-A2|={d_AA:.3e}). Likely an "
+                "RNG leak or active dropout — ensure policy.eval() ran. Refusing "
+                "to generate non-reproducible targets."
+            )
+        if not effective:
+            raise RuntimeError(
+                "Noise self-check FAILED (no effect): two very different noises "
+                f"produced ~identical outputs (mean|A-B|={d_AB:.3e}). The injected "
+                "noise is being IGNORED — loss_compare's injection path does not "
+                "match the imported lerobot (e.g. it sets policy._external_noise "
+                "but this lerobot's predict_action_chunk only honors a noise= "
+                "kwarg, or vice-versa). Generated targets would NOT be "
+                "reproducible on the 310p OM. Aborting before writing a bad target."
+            )
+        print(f"  ✓ noise self-check passed (deterministic mean|A1-A2|={d_AA:.2e}, effective mean|A-B|={d_AB:.2e})")
 
     def forward(self, batches):
         raw_preds: list[torch.Tensor] = []
@@ -418,6 +476,13 @@ class LossUtils:
             print(f"  noise files will be saved to: {self.args.noise_dir}")
 
         batches = self.load_batches_as_tensors()
+
+        # Guard: before producing any target, prove the fixed noise is actually
+        # consumed by this backend (PI05 + --noise-dir).  A silent noise-drop
+        # here would yield targets the 310p OM can never match.
+        if batches:
+            self._assert_noise_effective(batches[0])
+
         outputs = self.forward(batches)
 
         print(f"saving output json: length={len(outputs)}")
