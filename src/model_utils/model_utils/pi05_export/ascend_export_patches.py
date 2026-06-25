@@ -135,7 +135,7 @@ def _patch_rotate_half() -> list[tuple[Any, str, Any]]:
 
 
 def _patch_gemma_ada_rmsnorm() -> list[tuple[Any, str, Any]]:
-    """Patch GemmaRMSNorm.forward so AdaRMSNorm uses model_dtype, not fp32.
+    """Patch PiGemmaRMSNorm.forward so AdaRMSNorm uses model_dtype, not fp32.
 
     Original::
 
@@ -151,22 +151,14 @@ def _patch_gemma_ada_rmsnorm() -> list[tuple[Any, str, Any]]:
 
     undo_log: list[tuple[Any, str, Any]] = []
 
-    _module_paths = [
-        "transformers.models.gemma.modeling_gemma",
-        "transformers.models.gemma2.modeling_gemma2",
-    ]
+    # Patch PiGemmaRMSNorm in our adapter module
+    try:
+        from model_utils.pi05_export.pi_gemma import PiGemmaRMSNorm
 
-    for mod_path in _module_paths:
-        try:
-            import importlib
-
-            mod = importlib.import_module(mod_path)
-        except ImportError:
-            continue
-
-        cls = getattr(mod, "GemmaRMSNorm", None)
-        if cls is None:
-            continue
+        cls = PiGemmaRMSNorm
+    except ImportError:
+        LOGGER.warning("PiGemmaRMSNorm not found; skipping AdaRMSNorm patch")
+        return undo_log
 
         orig_forward = cls.forward
 
@@ -198,7 +190,7 @@ def _patch_gemma_ada_rmsnorm() -> list[tuple[Any, str, Any]]:
 
         cls.forward = _patched_forward
         undo_log.append((cls, "forward", orig_forward))
-        LOGGER.info("Patched %s.GemmaRMSNorm.forward (AdaRMSNorm fp32→model_dtype)", mod_path)
+        LOGGER.info("Patched PiGemmaRMSNorm.forward (AdaRMSNorm fp32→model_dtype)")
 
     return undo_log
 
@@ -401,7 +393,7 @@ def _patch_gemma_rotary_pos_emb_npu() -> list[tuple[Any, str, Any]]:
 
 
 def _patch_gemma_ada_rmsnorm_npu() -> list[tuple[Any, str, Any]]:
-    """Route GemmaRMSNorm through ``torch_npu.npu_rms_norm`` (NPURmsNorm node).
+    """Route PiGemmaRMSNorm through ``torch_npu.npu_rms_norm`` (NPURmsNorm node).
 
     This is the NPU-affine variant of :func:`_patch_gemma_ada_rmsnorm`.  The
     RMSNorm *core* (``x / rms(x) * gamma``) is replaced by the real fused
@@ -448,8 +440,6 @@ def _patch_gemma_ada_rmsnorm_npu() -> list[tuple[Any, str, Any]]:
         )
         return undo_log
 
-    import importlib
-
     import torch as _torch
 
     # Single-output custom symbolic.
@@ -470,20 +460,14 @@ def _patch_gemma_ada_rmsnorm_npu() -> list[tuple[Any, str, Any]]:
         def symbolic(g, x, gamma, epsilon):
             return g.op("npu::NPURmsNorm", x, gamma, epsilon_f=epsilon)
 
-    _module_paths = [
-        "transformers.models.gemma.modeling_gemma",
-        "transformers.models.gemma2.modeling_gemma2",
-    ]
+    # Patch PiGemmaRMSNorm in our adapter module
+    try:
+        from model_utils.pi05_export.pi_gemma import PiGemmaRMSNorm
 
-    for mod_path in _module_paths:
-        try:
-            mod = importlib.import_module(mod_path)
-        except ImportError:
-            continue
-
-        cls = getattr(mod, "GemmaRMSNorm", None)
-        if cls is None:
-            continue
+        cls = PiGemmaRMSNorm
+    except ImportError:
+        LOGGER.warning("PiGemmaRMSNorm not found; skipping NPU RMSNorm patch")
+        return undo_log
 
         orig_forward = cls.forward
 
@@ -518,10 +502,7 @@ def _patch_gemma_ada_rmsnorm_npu() -> list[tuple[Any, str, Any]]:
 
         cls.forward = _patched_forward
         undo_log.append((cls, "forward", orig_forward))
-        LOGGER.info(
-            "Patched %s.GemmaRMSNorm.forward (torch_npu.npu_rms_norm -> NPURmsNorm)",
-            mod_path,
-        )
+        LOGGER.info("Patched PiGemmaRMSNorm.forward (torch_npu.npu_rms_norm -> NPURmsNorm)")
 
     return undo_log
 
@@ -738,14 +719,23 @@ def _patch_gemma_eager_attention(
                     # maps it to StridedSliceD which ATC cannot compile.
                     # For PI05 the mask is already (B,1,S,S) matching key_len,
                     # so the slice is a no-op — use the mask directly.
+
+                    # Slice mask to key_len (no-op for VLM where mask==key_len,
+                    # required for AE where key_len < full context length).
+                    key_len = key_states.shape[2]
+                    mask = attention_mask[:, :, :, :key_len]
+                    # MQA broadcast: expand attention_mask to match attn_weights head dim
+                    if mqa_broadcast and key.shape[1] == 1 and mask.shape[1] == 1:
+                        mask = mask.expand(-1, query.shape[1], -1, -1)
+
                     if fp16_softmax:
                         # Keep the Add in the score (fp16) dtype so no fp32 Cast
                         # is inserted around the (B,H,Sq,Sk) score matrix. The
                         # mask must already use a fp16-safe sentinel
                         # (finfo(fp16).min); -2.38e38 would overflow to -inf.
-                        attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
+                        attn_weights = attn_weights + mask.to(attn_weights.dtype)
                     else:
-                        attn_weights = attn_weights + attention_mask
+                        attn_weights = attn_weights + mask
 
                 if fp16_softmax:
                     attn_weights = nn.functional.softmax(attn_weights, dim=-1).to(query.dtype)

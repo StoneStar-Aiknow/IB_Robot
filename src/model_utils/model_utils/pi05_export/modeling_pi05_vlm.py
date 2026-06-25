@@ -41,12 +41,10 @@ if TYPE_CHECKING or _transformers_available:
     from transformers.models.auto import CONFIG_MAPPING
     from transformers.models.gemma import modeling_gemma
     from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
-    from transformers.models.paligemma.modeling_paligemma import PaliGemmaForConditionalGeneration
 else:
     CONFIG_MAPPING = None
     modeling_gemma = None
     GemmaForCausalLM = None
-    PaliGemmaForConditionalGeneration = None
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
@@ -56,6 +54,8 @@ from lerobot.utils.constants import (
     OBS_LANGUAGE_TOKENS,
     OPENPI_ATTENTION_MASK_VALUE,
 )
+
+from model_utils.pi05_export.pi_gemma import PaliGemmaForConditionalGenerationWithPiGemma
 
 
 # LoRA Implementation
@@ -138,11 +138,10 @@ def flatten_kv(past_key_values):
         from transformers.cache_utils import DynamicCache
 
         if isinstance(past_key_values, DynamicCache):
-            # DynamicCache 有 key_cache 和 value_cache 属性
-            # 它们是 list[Tensor]，每个 tensor shape = (B, H, S, D)
-            # 参考 cache_utils.py 中的 _flatten_dynamic_cache 函数
-            key_cache = past_key_values.key_cache  # list of (B, H, S, D)
-            value_cache = past_key_values.value_cache  # list of (B, H, S, D)
+            # TF5.3: DynamicCache is iterable, yields (key, value, None) tuples
+            kv_list = list(past_key_values)
+            key_cache = [kv[0] for kv in kv_list]  # list of (B, H, S, D)
+            value_cache = [kv[1] for kv in kv_list]  # list of (B, H, S, D)
             keys = torch.stack(key_cache, dim=0)  # (L, B, H, S, D)
             values = torch.stack(value_cache, dim=0)  # (L, B, H, S, D)
             flat = torch.stack([keys, values], dim=1)  # (L, 2, B, H, S, D)
@@ -188,9 +187,9 @@ def unflatten_kv(flat_tensor):
         from transformers.cache_utils import DynamicCache
 
         dyn = DynamicCache()
-        # DynamicCache.key_cache and .value_cache are lists of tensors
-        dyn.key_cache = [keys[i] for i in range(num_layers)]
-        dyn.value_cache = [values[i] for i in range(num_layers)]
+        # TF5.3: use update() to add key-value pairs per layer
+        for i in range(num_layers):
+            dyn.update(keys[i], values[i], layer_idx=i)
         return dyn
     except Exception:
         # Fallback: return the old list-of-dicts format
@@ -465,7 +464,7 @@ class PaliGemmaWithExpertModel(
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
 
-        self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
+        self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config=vlm_config_hf)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
@@ -493,7 +492,7 @@ class PaliGemmaWithExpertModel(
 
         # Apply LoRA to PaliGemma language model
         paligemma_layers = self._apply_lora_to_model(
-            self.paligemma.language_model, lora_r, lora_alpha, lora_dropout, target_modules
+            self.paligemma.model.language_model, lora_r, lora_alpha, lora_dropout, target_modules
         )
         total_lora_layers += paligemma_layers
 
@@ -545,10 +544,14 @@ class PaliGemmaWithExpertModel(
                 param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor):
-        return self.paligemma.model.get_image_features(image)
+        # TF5.3: get_image_features returns BaseModelOutputWithPooling, use pooler_output
+        # and multiply back by hidden_size**0.5 to restore pre-v5 scale
+        image_output = self.paligemma.model.get_image_features(image)
+        hidden_size = self.paligemma.config.text_config.hidden_size
+        return image_output.pooler_output * (hidden_size**0.5)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
-        return self.paligemma.language_model.embed_tokens(tokens)
+        return self.paligemma.model.language_model.embed_tokens(tokens)
 
     def forward(
         self,
@@ -564,7 +567,7 @@ class PaliGemmaWithExpertModel(
             adarms_cond = [None, None]
 
         # In VLM mode, we only run the prefix (paligemma language model)
-        prefix_output = self.paligemma.language_model.forward(
+        prefix_output = self.paligemma.model.language_model.forward(
             inputs_embeds=inputs_embeds[0],
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -615,29 +618,19 @@ class PI05VLMPytorch(nn.Module):
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
-        msg = """An incorrect transformer version is used, please create an issue on https://github.com/huggingface/lerobot/issues"""
-
-        try:
-            from transformers.models.siglip import check
-
-            if not check.check_whether_transformers_replace_is_installed_correctly():
-                raise ValueError(msg)
-        except ImportError:
-            raise ValueError(msg) from None
-
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
+        self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = True
+        self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = True
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
         logging.info("Enabled gradient checkpointing for PI05VLMPytorch model")
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
+        self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = False
+        self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
         logging.info("Disabled gradient checkpointing for PI05VLMPytorch model")
 
@@ -738,7 +731,7 @@ class PI05VLMPytorch(nn.Module):
             prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
             prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
 
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
