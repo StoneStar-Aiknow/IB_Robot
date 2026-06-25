@@ -5,17 +5,19 @@ a ROS or Gazebo runtime environment.
 """
 
 import pytest
+
 from robot_config.launch_builders.sim_backend import (
-    get_sim_backend,
     SimBackendAdapter,
+    get_sim_backend,
 )
 from robot_config.launch_builders.sim_backend.gazebo_adapter import GazeboAdapter
+from robot_config.launch_builders.sim_backend.mock_adapter import MockAdapter
 from robot_config.launch_builders.sim_backend.mujoco_adapter import MujocoAdapter
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Registry tests (unchanged from T2)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def test_registry_gazebo():
     """get_sim_backend('gazebo') returns a GazeboAdapter instance."""
@@ -31,6 +33,13 @@ def test_registry_mujoco():
     assert isinstance(adapter, SimBackendAdapter)
 
 
+def test_registry_mock():
+    """get_sim_backend('mock') returns a MockAdapter instance."""
+    adapter = get_sim_backend("mock")
+    assert isinstance(adapter, MockAdapter)
+    assert isinstance(adapter, SimBackendAdapter)
+
+
 def test_registry_unknown_raises():
     """get_sim_backend with an unknown name raises ValueError."""
     with pytest.raises(ValueError, match="Unknown sim platform"):
@@ -38,21 +47,17 @@ def test_registry_unknown_raises():
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MuJoCo stub tests (updated: spawn_peripheral_bridges now returns [], not raises)
+# MuJoCo no-op tests
 # ──────────────────────────────────────────────────────────────────────────────
 
-def test_mujoco_stubs_raise_not_implemented():
-    """Unimplemented MuJoCo methods raise NotImplementedError (T6 stubs)."""
+
+def test_mujoco_noop_methods_return_empty():
+    """MuJoCo no-op adapter methods return empty launch action lists."""
     adapter = get_sim_backend("mujoco")
-    with pytest.raises(NotImplementedError):
-        adapter.start_backend({})
-    with pytest.raises(NotImplementedError):
-        adapter.load_scene("fake.xml")
-    with pytest.raises(NotImplementedError):
-        adapter.ensure_controller_manager({})
-    with pytest.raises(NotImplementedError):
-        adapter.update_object_pose("box", None)
-    # NOTE: spawn_peripheral_bridges is NOT a stub anymore (T3) — see test below.
+
+    assert adapter.load_scene("fake.xml") == []
+    assert adapter.ensure_controller_manager({}) == []
+    assert adapter.update_object_pose("box", None) is None
 
 
 def test_mujoco_spawn_peripheral_bridges_returns_empty():
@@ -65,9 +70,11 @@ def test_mujoco_spawn_peripheral_bridges_returns_empty():
     result = adapter.spawn_peripheral_bridges([])
     assert result == []
     # Also works with non-empty peripherals list
-    result = adapter.spawn_peripheral_bridges([
-        {"type": "camera", "name": "top", "frame_id": "camera_top_frame"},
-    ])
+    result = adapter.spawn_peripheral_bridges(
+        [
+            {"type": "camera", "name": "top", "frame_id": "camera_top_frame"},
+        ]
+    )
     assert result == []
 
 
@@ -75,12 +82,14 @@ def test_mujoco_spawn_peripheral_bridges_returns_empty():
 # sim_peripheral_bridge tests (T3)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def test_sim_peripheral_bridge_camera_count():
     """generate_peripheral_sim_bridges returns 1 bridge_node for any camera config."""
+    from launch_ros.actions import Node
+
     from robot_config.launch_builders.sim_peripheral_bridge import (
         generate_peripheral_sim_bridges,
     )
-    from launch_ros.actions import Node
 
     peripherals = [
         {"type": "camera", "name": "top", "frame_id": "camera_top_frame"},
@@ -95,8 +104,9 @@ def test_sim_peripheral_bridge_multi_camera():
     from robot_config.launch_builders.sim_peripheral_bridge import (
         generate_peripheral_sim_bridges,
     )
+
     peripherals = [
-        {"type": "camera", "name": "top",   "frame_id": "camera_top_frame"},
+        {"type": "camera", "name": "top", "frame_id": "camera_top_frame"},
         {"type": "camera", "name": "wrist", "frame_id": "camera_wrist_frame"},
         {"type": "camera", "name": "front", "frame_id": "camera_front_link"},
     ]
@@ -106,10 +116,11 @@ def test_sim_peripheral_bridge_multi_camera():
 
 def test_sim_peripheral_bridge_lidar_and_imu_supported():
     """LiDAR + IMU peripherals share one bridge_node in Gazebo."""
+    from launch_ros.actions import Node
+
     from robot_config.launch_builders.sim_peripheral_bridge import (
         generate_peripheral_sim_bridges,
     )
-    from launch_ros.actions import Node
 
     peripherals = [
         {"type": "lidar", "name": "main_lidar", "params": {"laser_scan_topic_name": "/scan"}},
@@ -120,14 +131,25 @@ def test_sim_peripheral_bridge_lidar_and_imu_supported():
     assert isinstance(nodes[0], Node)
 
 
+def test_mock_start_backend_reuses_contract_mock():
+    """Mock backend starts hardware_mock directly and has no spawn node."""
+    from launch_ros.actions import Node
+
+    adapter = get_sim_backend("mock")
+    actions, create_node = adapter.start_backend({"_config_path": "/tmp/robot.yaml"})
+
+    assert create_node is None
+    assert len(actions) == 1
+    assert isinstance(actions[0], Node)
+    assert actions[0].node_package == "hardware_mock"
+
+
 def test_gazebo_start_backend_returns_create_node():
     """GazeboAdapter.start_backend returns (actions, ros_gz_sim create Node)."""
     from launch_ros.actions import Node
 
     adapter = get_sim_backend("gazebo")
-    actions, create_node = adapter.start_backend(
-        {"name": "test_robot", "gazebo_world_name": "demo"}
-    )
+    actions, create_node = adapter.start_backend({"name": "test_robot", "gazebo_world_name": "demo"})
     assert isinstance(actions, list)
     assert len(actions) >= 1
     assert isinstance(create_node, Node)

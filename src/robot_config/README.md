@@ -496,6 +496,9 @@ ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm
 # 启动仿真
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true
 
+# 契约级 mock 仿真：将 YAML 的 simulation.platform 设为 mock 后使用同一入口
+ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true control_mode:=model_inference
+
 # MoveIt 规划模式（带 RViz）
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=moveit_planning use_sim:=true
 

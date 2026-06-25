@@ -1,8 +1,9 @@
 """Standalone launch for hardware_mock (debugging only).
 
 Most users should invoke this via robot_config's robot.launch.py with
-``use_mock:=true`` so the rest of the stack (inference, action_dispatch,
-recording) is wired up. This launch file only spawns the mock node.
+``use_sim:=true`` and ``simulation.platform: mock`` so the rest of the stack
+(inference, action_dispatch, recording) is wired up. This launch file only
+spawns the mock node.
 """
 
 from pathlib import Path

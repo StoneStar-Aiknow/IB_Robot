@@ -36,10 +36,17 @@ IB-Robot 的标准流程是：
 
 ## 2. 快速使用 (TL;DR)
 
+统一仿真入口（推荐用于 distributed inference 调试流）：
+
+```yaml
+simulation:
+  platform: mock
+```
+
 ```bash
 ros2 launch robot_config robot.launch.py \
     robot_config:=so101_single_arm \
-    use_mock:=true \
+    use_sim:=true \
     control_mode:=model_inference
 ```
 
@@ -73,7 +80,7 @@ ros2 topic pub --once /action/arm std_msgs/msg/Float64MultiArray \
 
 ### 3.1 与 `robot.launch.py` 的集成
 
-`use_mock` 是顶层开关，**与 `use_sim` 互斥**。启用后会：
+`simulation.platform: mock` 走统一 `use_sim:=true` 仿真后端注册表。启用后会：
 
 | 子系统 | 行为 |
 | --- | --- |
@@ -212,13 +219,13 @@ PYTHONPATH=src/hardware_mock python3 -m pytest src/hardware_mock/test -q
    └──────────────────────────────────────────────────────────────────┘
 ```
 
-### 4.3 启动时序 (`use_mock:=true`)
+### 4.3 启动时序 (`simulation.platform: mock`)
 
 ```
 robot.launch.py
    │
-   ├─ 解析 use_mock=true ──► 校验互斥 (use_sim)
-   │                       └► 强制 control_mode=model_inference
+   ├─ 解析 use_sim=true + simulation.platform=mock
+   │                       └► 校验 control_mode=model_inference
    │                       └► auto_start_controllers=false
    │
    ├─ [跳过] ros2_control / cameras / lidar / nav / voice_asr / TF
@@ -269,4 +276,3 @@ src/hardware_mock/
     ├── test_image_sources.py
     └── test_contract_plan.py
 ```
-

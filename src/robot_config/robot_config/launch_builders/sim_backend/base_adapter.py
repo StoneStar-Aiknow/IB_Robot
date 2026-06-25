@@ -1,6 +1,6 @@
 """Abstract base class for simulation backend adapters.
 
-IB-Robot supports multiple simulation backends (Gazebo, MuJoCo) selectable
+IB-Robot supports multiple simulation backends (Gazebo, MuJoCo, mock) selectable
 via the 'simulation.platform' field in the robot YAML configuration.
 
 Each backend must implement all five methods. Methods that are not applicable
@@ -12,11 +12,12 @@ Architecture:
         └── get_sim_backend(platform)          # factory in __init__.py
                 └── SimBackendAdapter          # this abstract class
                         ├── GazeboAdapter      # ros_gz_bridge, Gazebo launch
-                        └── MujocoAdapter      # mujoco_ros2_control (T6)
+                        ├── MujocoAdapter      # mujoco_ros2_control (T6)
+                        └── MockAdapter        # contract_mock topic backend
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Tuple
+from typing import Any
 
 
 class SimBackendAdapter(ABC):
@@ -27,7 +28,7 @@ class SimBackendAdapter(ABC):
     """
 
     @abstractmethod
-    def start_backend(self, robot_config: dict) -> Tuple[list, Any]:
+    def start_backend(self, robot_config: dict) -> tuple[list, Any]:
         """Launch the simulator process and core infrastructure.
 
         Includes: simulator server + GUI, entity spawning, clock bridge,

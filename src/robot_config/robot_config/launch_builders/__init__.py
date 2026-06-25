@@ -19,7 +19,6 @@ from robot_config.launch_builders.description import (
 from robot_config.launch_builders.hardware_mock import (
     generate_hardware_mock_nodes,
     mock_mode_skips_subsystem,
-    validate_mock_mode,
 )
 from robot_config.launch_builders.moveit import generate_moveit_nodes
 from robot_config.launch_builders.navigation import (
@@ -65,5 +64,4 @@ __all__ = [
     # Hardware mock
     "generate_hardware_mock_nodes",
     "mock_mode_skips_subsystem",
-    "validate_mock_mode",
 ]

@@ -268,7 +268,7 @@ robot:
   # Simulation Configuration
   # ============================================
   simulation:
-    platform: gazebo        # "gazebo" | "mujoco"
+    platform: gazebo        # "gazebo" | "mujoco" | "mock"
     scene: pick_banana      # null = 不加载场景；pick_banana = 香蕉抓取场景
     robot_spawn:            # Robot spawn pose owned by robot_config SSOT
       x: 0.0

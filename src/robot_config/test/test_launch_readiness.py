@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 from launch import LaunchContext
 from launch.actions import RegisterEventHandler
 from launch_ros.actions import Node
@@ -263,6 +264,39 @@ def test_launch_setup_enables_navigation_when_requested():
     ]
 
     assert len(nav_nodes) == 1
+
+
+def test_launch_setup_uses_mock_sim_backend_without_controllers(tmp_path):
+    src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
+    robot_config = load_robot_config_dict(src_config_path)
+    robot_config.pop("_config_path", None)
+    robot_config["simulation"]["platform"] = "mock"
+
+    config_path = tmp_path / "so101_mock.yaml"
+    config_path.write_text(yaml.safe_dump({"robot": robot_config}, sort_keys=False), encoding="utf-8")
+
+    context = LaunchContext()
+    context.launch_configurations["robot_config"] = "so101_single_arm"
+    context.launch_configurations["config_path"] = str(config_path)
+    context.launch_configurations["use_sim"] = "true"
+    context.launch_configurations["auto_start_controllers"] = "true"
+    context.launch_configurations["control_mode"] = "model_inference"
+    context.launch_configurations["with_navigation"] = "false"
+
+    actions = robot_launch.launch_setup(context)
+    node_packages = [action.node_package for action in actions if isinstance(action, Node)]
+
+    assert node_packages.count("hardware_mock") == 1
+    assert "controller_manager" not in node_packages
+    assert "ros_gz_sim" not in node_packages
+
+    timed_nodes = [
+        action
+        for action in actions
+        if isinstance(action, Node) and action.node_package in {"inference_service", "action_dispatch"}
+    ]
+    assert len(timed_nodes) == 2
+    assert all(_node_parameters(node)["use_sim_time"] is False for node in timed_nodes)
 
 
 def test_launch_loader_preserves_config_path_for_runtime_consumers():
