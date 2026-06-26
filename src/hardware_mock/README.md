@@ -38,15 +38,11 @@ IB-Robot 的标准流程是：
 
 统一仿真入口（推荐用于 distributed inference 调试流）：
 
-```yaml
-simulation:
-  platform: mock
-```
-
 ```bash
 ros2 launch robot_config robot.launch.py \
     robot_config:=so101_single_arm \
     use_sim:=true \
+    sim_platform:=mock \
     control_mode:=model_inference
 ```
 
@@ -224,7 +220,7 @@ PYTHONPATH=src/hardware_mock python3 -m pytest src/hardware_mock/test -q
 ```
 robot.launch.py
    │
-   ├─ 解析 use_sim=true + simulation.platform=mock
+   ├─ 解析 use_sim=true + sim_platform=mock（或 YAML simulation.platform=mock）
    │                       └► 校验 control_mode=model_inference
    │                       └► auto_start_controllers=false
    │

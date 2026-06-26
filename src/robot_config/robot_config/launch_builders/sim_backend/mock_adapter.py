@@ -5,6 +5,8 @@ same backend registry as Gazebo and MuJoCo while reusing hardware_mock's
 contract-level ROS topic surface.
 """
 
+from typing import Any
+
 from robot_config.launch_builders.hardware_mock import generate_hardware_mock_nodes
 from robot_config.logger_utils import get_colored_logger
 
@@ -16,13 +18,20 @@ logger = get_colored_logger("robot_config.sim_backend.mock")
 class MockAdapter(SimBackendAdapter):
     """Contract-only backend backed by hardware_mock.contract_mock."""
 
-    def start_backend(self, robot_config: dict) -> tuple:
+    def start_backend(self, robot_config: dict) -> tuple[list, Any]:
         """Start contract_mock and return no simulator spawn node."""
         logger.info("Starting hardware_mock contract backend")
+        scene_name = robot_config.get("simulation", {}).get("scene")
+        if scene_name:
+            self.load_scene(str(scene_name))
         return generate_hardware_mock_nodes(robot_config), None
 
     def load_scene(self, scene_file_path: str) -> list:
         """Scenes are outside contract mock scope."""
+        logger.warning(
+            f"simulation.scene='{scene_file_path}' is ignored by mock backend; "
+            "contract mock does not model scene objects"
+        )
         return []
 
     def ensure_controller_manager(self, robot_config: dict) -> list:

@@ -8,6 +8,7 @@ import pytest
 
 from robot_config.launch_builders.sim_backend import (
     SimBackendAdapter,
+    get_backend_caps,
     get_sim_backend,
 )
 from robot_config.launch_builders.sim_backend.gazebo_adapter import GazeboAdapter
@@ -44,6 +45,11 @@ def test_registry_unknown_raises():
     """get_sim_backend with an unknown name raises ValueError."""
     with pytest.raises(ValueError, match="Unknown sim platform"):
         get_sim_backend("webots")
+
+
+def test_backend_caps_mock():
+    """Mock declares that it has no /clock and no ros2_control manager."""
+    assert get_backend_caps("mock") == {"provides_clock": False, "needs_ros2_control": False}
 
 
 # ──────────────────────────────────────────────────────────────────────────────

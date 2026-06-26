@@ -270,7 +270,6 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(tmp_path):
     src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
     robot_config = load_robot_config_dict(src_config_path)
     robot_config.pop("_config_path", None)
-    robot_config["simulation"]["platform"] = "mock"
 
     config_path = tmp_path / "so101_mock.yaml"
     config_path.write_text(yaml.safe_dump({"robot": robot_config}, sort_keys=False), encoding="utf-8")
@@ -279,6 +278,7 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(tmp_path):
     context.launch_configurations["robot_config"] = "so101_single_arm"
     context.launch_configurations["config_path"] = str(config_path)
     context.launch_configurations["use_sim"] = "true"
+    context.launch_configurations["sim_platform"] = "mock"
     context.launch_configurations["auto_start_controllers"] = "true"
     context.launch_configurations["control_mode"] = "model_inference"
     context.launch_configurations["with_navigation"] = "false"
