@@ -200,7 +200,14 @@ def make_eval_ticks(
         raise ValueError(f"contract rate_hz must be positive, got {rate_hz}")
     stride = max(1, int(frame_stride))
     step_ns = int(NS_PER_SEC / float(rate_hz))
-    start_ns = int(min(ts.min() for ts in valid))
+    # Start ticks at the *latest* first-message timestamp across streams so every
+    # stream has at least one message at or before the first tick. Using the
+    # earliest first-message timestamp (min) would place ticks before some
+    # streams have any data; with header-stamp policies this happens whenever
+    # sensors have different capture-to-publish latencies (e.g. USB cameras
+    # whose header stamp predates the bag receive time by hundreds of ms while
+    # joint states are near-instant), yielding empty samples for the early frames.
+    start_ns = int(max(ts.min() for ts in valid))
     end_ns = int(max(ts.max() for ts in valid))
     ticks = list(range(start_ns, end_ns + 1, step_ns))
     selected = ticks[::stride]
