@@ -263,6 +263,17 @@ def _to_numpy_float32(value: Any) -> np.ndarray:
     return np.ascontiguousarray(np.asarray(value, dtype=np.float32))
 
 
+def _to_nhwc(value: np.ndarray) -> np.ndarray:
+    """Convert a 4-D NCHW (1,C,H,W) array to NHWC (1,H,W,C).
+
+    RKNN models embed an NHWC layout; RKNNLite expects 4-D image inputs already in
+    NHWC. Non-image inputs (e.g. state vectors) are returned unchanged.
+    """
+    if isinstance(value, np.ndarray) and value.ndim == 4:
+        return np.ascontiguousarray(np.transpose(value, (0, 2, 3, 1)))
+    return value
+
+
 def _to_numpy_int64(value: Any) -> np.ndarray:
     if isinstance(value, Tensor):
         value = value.detach().cpu().numpy()
@@ -688,7 +699,16 @@ class RKNNRuntimeSession:
     def execute(self, inputs: list[np.ndarray]) -> list[np.ndarray]:
         if self._rknn is None:
             raise RuntimeError("RKNNRuntimeSession is not loaded")
-        outputs = self._rknn.inference(inputs=inputs)
+        # RKNN models embed an NHWC layout, so RKNNLite expects 4-D image inputs
+        # in NHWC (1,H,W,C). The adapter layer (ACTCompiledAdapter) produces a
+        # backend-agnostic NCHW (1,C,H,W) layout shared with the Ascend OM
+        # backends; the NHWC conversion is RKNN-specific, so it lives here in
+        # the RKNN session rather than in the shared adapter. Without it,
+        # RKNNLite silently rearranges the buffer the wrong way (treating
+        # C/H/W as H/W/C), corrupting image channels and yielding garbage
+        # actions while the simulator stays unaffected.
+        rknn_inputs = [_to_nhwc(arr) for arr in inputs]
+        outputs = self._rknn.inference(inputs=rknn_inputs)
         if outputs is None or len(outputs) == 0:
             raise RuntimeError("RKNN inference returned no outputs")
         return list(outputs)
