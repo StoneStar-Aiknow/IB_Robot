@@ -173,9 +173,9 @@ def unflatten_kv(flat_tensor):
         from transformers.cache_utils import DynamicCache
 
         dyn = DynamicCache()
-        # DynamicCache.key_cache and .value_cache are lists of tensors
-        dyn.key_cache = [keys[i] for i in range(num_layers)]
-        dyn.value_cache = [values[i] for i in range(num_layers)]
+        # TF5.3: use update() to add key-value pairs per layer
+        for i in range(num_layers):
+            dyn.update(keys[i], values[i], layer_idx=i)
         return dyn
     except Exception:
         # Fallback: return the old list-of-dicts format
