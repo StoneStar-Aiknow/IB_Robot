@@ -99,15 +99,27 @@ STEPS: list[StepSpec] = [
     ),
     StepSpec(
         "vlm_om",
-        "Compile the VLM ONNX to OM via ATC (auto-uses *_w8a8 if vlm_quant ran)",
+        "Compile the VLM FP16 ONNX to OM via ATC",
         param_deps=("soc_version",),
         step_deps=("vlm_onnx",),
     ),
     StepSpec(
         "ae_om",
-        "Compile the Action Expert ONNX to OM via ATC (auto-uses *_w8a8 if ae_quant ran)",
+        "Compile the Action Expert FP16 ONNX to OM via ATC",
         param_deps=("soc_version",),
         step_deps=("ae_onnx",),
+    ),
+    StepSpec(
+        "vlm_quant_om",
+        "Compile the VLM W8A8 ONNX to OM via ATC",
+        param_deps=("soc_version",),
+        step_deps=("vlm_quant",),
+    ),
+    StepSpec(
+        "ae_quant_om",
+        "Compile the Action Expert W8A8 ONNX to OM via ATC",
+        param_deps=("soc_version",),
+        step_deps=("ae_quant",),
     ),
     StepSpec(
         "verify",
@@ -180,7 +192,7 @@ PARAMS: list[Param] = [
     Param(
         dest="soc_version",
         cli="--soc-version",
-        meaning="Target Ascend SoC; required by the vlm_om / ae_om steps (see `npu-smi info`)",
+        meaning="Target Ascend SoC; required by the *_om steps (see `npu-smi info`)",
         example="Ascend310P3",
     ),
     Param(

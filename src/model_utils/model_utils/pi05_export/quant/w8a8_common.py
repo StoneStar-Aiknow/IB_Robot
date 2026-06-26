@@ -673,6 +673,12 @@ def run_msmodelslim_w8a8(
     else:
         donor_onnx = output_onnx
 
+    for stale in (donor_onnx, donor_onnx.with_name(donor_onnx.name + ".data")):
+        try:  # noqa: SIM105
+            stale.unlink()
+        except FileNotFoundError:
+            pass
+
     run_quantize(str(quant_input), str(donor_onnx), quant_config)
     LOGGER.info("W8A8 donor ONNX written to %s", donor_onnx)
 

@@ -24,6 +24,8 @@ available steps are:
     ae_quant   Quantize the Action Expert ONNX to W8A8 (calib = runtime_save)
     vlm_om     Compile the VLM ONNX to OM via ATC      (needs --soc-version)
     ae_om      Compile the Action Expert ONNX to OM    (needs --soc-version)
+    vlm_quant_om  Compile the VLM W8A8 ONNX to OM      (needs --soc-version)
+    ae_quant_om   Compile the AE W8A8 ONNX to OM       (needs --soc-version)
     verify     Split-vs-monolithic equivalence check   (needs --task)
 
 Default ``--steps`` = ``vlm_onnx,ae_onnx,vlm_om,ae_om`` (export both segments
@@ -40,8 +42,7 @@ Step semantics
   step needs an artifact that is neither in --steps nor on disk, the run stops
   with a precise "add this step" message rather than silently doing the wrong
   thing (no implicit upstream steps are added).
-* When a segment is quantized (``*_quant`` in --steps), that segment's ``*_om``
-  step automatically compiles the ``*_w8a8.onnx`` instead of the fp16 ONNX.
+* ``*_om`` compiles the FP16 ONNX. Use ``*_quant_om`` to compile W8A8 ONNX.
 
 Design notes
 ------------
@@ -97,15 +98,10 @@ class Ctx:
     ae_w8a8: Path
     vlm_om: Path
     ae_om: Path
+    vlm_quant_om: Path
+    ae_quant_om: Path
     calib_dir: Path
     chosen: set[str]  # steps explicitly requested in --steps
-
-    def vlm_atc_onnx(self) -> Path:
-        """ONNX that vlm_om should compile: the W8A8 graph iff vlm was quantized."""
-        return self.vlm_w8a8 if "vlm_quant" in self.chosen else self.vlm_onnx
-
-    def ae_atc_onnx(self) -> Path:
-        return self.ae_w8a8 if "ae_quant" in self.chosen else self.ae_onnx
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +117,8 @@ def _product(ctx: Ctx, step: str) -> Path | None:
         "ae_quant": ctx.ae_w8a8,
         "vlm_om": ctx.vlm_om,
         "ae_om": ctx.ae_om,
+        "vlm_quant_om": ctx.vlm_quant_om,
+        "ae_quant_om": ctx.ae_quant_om,
         "verify": None,
     }[step]
 
@@ -192,6 +190,13 @@ def _run_ae_donor_onnx(ctx: Ctx) -> None:
     )
 
 
+def _run_donor_onnx(ctx: Ctx, *, role: str) -> None:
+    if role == "vlm":
+        _run_vlm_donor_onnx(ctx)
+    else:
+        _run_ae_donor_onnx(ctx)
+
+
 def _quant_inputs(ctx: Ctx, *, role: str) -> tuple[Path, Path | None]:
     """Return (donor_onnx, npu_onnx) for quantization, generating donor if needed."""
     deploy_onnx = ctx.vlm_onnx if role == "vlm" else ctx.ae_onnx
@@ -200,19 +205,25 @@ def _quant_inputs(ctx: Ctx, *, role: str) -> tuple[Path, Path | None]:
 
     if _is_npu_onnx(deploy_onnx):
         LOGGER.info("%s quant: deployment ONNX is NPU graph: %s", role_label, deploy_onnx)
-        if donor_onnx.is_file():
+        refresh_donor = f"{role}_onnx" in ctx.chosen
+        if donor_onnx.is_file() and not refresh_donor:
             LOGGER.info("%s quant: reusing donor ONNX: %s", role_label, donor_onnx)
         else:
-            LOGGER.info(
-                "%s quant: donor ONNX missing; generating with --donor-device %s: %s",
-                role_label,
-                ctx.args.donor_device,
-                donor_onnx,
-            )
-            if role == "vlm":
-                _run_vlm_donor_onnx(ctx)
+            if refresh_donor:
+                LOGGER.info(
+                    "%s quant: regenerating donor ONNX because %s_onnx is in --steps: %s",
+                    role_label,
+                    role,
+                    donor_onnx,
+                )
             else:
-                _run_ae_donor_onnx(ctx)
+                LOGGER.info(
+                    "%s quant: donor ONNX missing; generating with --donor-device %s: %s",
+                    role_label,
+                    ctx.args.donor_device,
+                    donor_onnx,
+                )
+            _run_donor_onnx(ctx, role=role)
             if not donor_onnx.is_file():
                 raise RuntimeError(f"{role_label} donor ONNX was not produced: {donor_onnx}")
         LOGGER.info("%s quant: Route A enabled (donor -> NPU graph graft).", role_label)
@@ -322,8 +333,13 @@ def _run_ae_quant(ctx: Ctx) -> None:
     )
 
 
-def _run_vlm_om(ctx: Ctx) -> None:
+def _run_om(ctx: Ctx, *, role: str, onnx_path: Path, om_path: Path) -> None:
     a = ctx.args
+    role_args = (
+        ["--vlm-onnx", str(onnx_path), "--vlm-om", str(om_path)]
+        if role == "vlm"
+        else ["--ae-onnx", str(onnx_path), "--ae-om", str(om_path)]
+    )
     _run_module(
         "model_utils.pi05_export.convert_om",
         [
@@ -331,35 +347,28 @@ def _run_vlm_om(ctx: Ctx) -> None:
             str(ctx.policy_path),
             "--soc-version",
             a.soc_version,
-            "--vlm-onnx",
-            str(ctx.vlm_atc_onnx()),
-            "--vlm-om",
-            str(ctx.vlm_om),
+            *role_args,
             "--no-summary",
             "--log-level",
             a.log_level,
         ],
     )
+
+
+def _run_vlm_om(ctx: Ctx) -> None:
+    _run_om(ctx, role="vlm", onnx_path=ctx.vlm_onnx, om_path=ctx.vlm_om)
 
 
 def _run_ae_om(ctx: Ctx) -> None:
-    a = ctx.args
-    _run_module(
-        "model_utils.pi05_export.convert_om",
-        [
-            "--pretrained-policy-path",
-            str(ctx.policy_path),
-            "--soc-version",
-            a.soc_version,
-            "--ae-onnx",
-            str(ctx.ae_atc_onnx()),
-            "--ae-om",
-            str(ctx.ae_om),
-            "--no-summary",
-            "--log-level",
-            a.log_level,
-        ],
-    )
+    _run_om(ctx, role="ae", onnx_path=ctx.ae_onnx, om_path=ctx.ae_om)
+
+
+def _run_vlm_quant_om(ctx: Ctx) -> None:
+    _run_om(ctx, role="vlm", onnx_path=ctx.vlm_w8a8, om_path=ctx.vlm_quant_om)
+
+
+def _run_ae_quant_om(ctx: Ctx) -> None:
+    _run_om(ctx, role="ae", onnx_path=ctx.ae_w8a8, om_path=ctx.ae_quant_om)
 
 
 def _run_verify(ctx: Ctx) -> None:
@@ -390,6 +399,8 @@ _RUNNERS = {
     "ae_quant": _run_ae_quant,
     "vlm_om": _run_vlm_om,
     "ae_om": _run_ae_om,
+    "vlm_quant_om": _run_vlm_quant_om,
+    "ae_quant_om": _run_ae_quant_om,
     "verify": _run_verify,
 }
 
@@ -401,6 +412,8 @@ _TITLES = {
     "ae_quant": "Action Expert W8A8 quantize",
     "vlm_om": "ATC → OM compile (VLM)",
     "ae_om": "ATC → OM compile (Action Expert)",
+    "vlm_quant_om": "ATC → OM compile (VLM W8A8)",
+    "ae_quant_om": "ATC → OM compile (Action Expert W8A8)",
     "verify": "Equivalence verification",
 }
 
@@ -452,7 +465,8 @@ def _validate_quant_preflight(ctx: Ctx, chosen: list[str]) -> None:
             return
 
         LOGGER.info("%s quant preflight: deployment ONNX is NPU graph: %s", role_label, deploy)
-        if donor.is_file():
+        refresh_donor = f"{role}_onnx" in chosen
+        if donor.is_file() and not refresh_donor:
             LOGGER.info("%s quant preflight: donor ONNX exists and will be reused: %s", role_label, donor)
             return
 
@@ -490,12 +504,20 @@ def _validate_quant_preflight(ctx: Ctx, chosen: list[str]) -> None:
                     )
                     return
 
-        LOGGER.info(
-            "%s quant preflight: donor ONNX missing; it will be generated with --donor-device %s: %s",
-            role_label,
-            ctx.args.donor_device,
-            donor,
-        )
+        if refresh_donor:
+            LOGGER.info(
+                "%s quant preflight: donor ONNX will be regenerated because %s_onnx is in --steps: %s",
+                role_label,
+                role,
+                donor,
+            )
+        else:
+            LOGGER.info(
+                "%s quant preflight: donor ONNX missing; it will be generated with --donor-device %s: %s",
+                role_label,
+                ctx.args.donor_device,
+                donor,
+            )
 
     if "vlm_quant" in chosen:
         check("vlm", ctx.vlm_onnx, ctx.vlm_donor_onnx)
@@ -530,8 +552,6 @@ def main() -> int:
     ae_w8a8 = ae_onnx.with_name(ae_onnx.stem + "_w8a8.onnx")
 
     chosen = _cli.parse_steps(args.steps)  # registry order, validated in resolve()
-    vlm_atc_onnx = vlm_w8a8 if "vlm_quant" in chosen else vlm_onnx
-    ae_atc_onnx = ae_w8a8 if "ae_quant" in chosen else ae_onnx
     ctx = Ctx(
         args=args,
         policy_path=policy_path,
@@ -543,8 +563,10 @@ def main() -> int:
         ae_donor_onnx=output_dir / f"pi05-action_expert{donor_suffix}.onnx",
         vlm_w8a8=vlm_w8a8,
         ae_w8a8=ae_w8a8,
-        vlm_om=policy_path / vlm_atc_onnx.with_suffix(".om").name,
-        ae_om=policy_path / ae_atc_onnx.with_suffix(".om").name,
+        vlm_om=policy_path / vlm_onnx.with_suffix(".om").name,
+        ae_om=policy_path / ae_onnx.with_suffix(".om").name,
+        vlm_quant_om=policy_path / vlm_w8a8.with_suffix(".om").name,
+        ae_quant_om=policy_path / ae_w8a8.with_suffix(".om").name,
         calib_dir=(Path(args.calib_dir).expanduser() if args.calib_dir else runtime_save_dir),
         chosen=set(chosen),
     )
@@ -603,6 +625,12 @@ def _append_summary(summary: list[tuple[str, str]], ctx: Ctx, step: str) -> None
         summary.append(("OM manifest", str(ctx.policy_path / "config.om.json")))
     elif step == "ae_om":
         summary.append(("Action Expert OM", str(ctx.ae_om)))
+        summary.append(("OM manifest", str(ctx.policy_path / "config.om.json")))
+    elif step == "vlm_quant_om":
+        summary.append(("VLM OM (W8A8)", str(ctx.vlm_quant_om)))
+        summary.append(("OM manifest", str(ctx.policy_path / "config.om.json")))
+    elif step == "ae_quant_om":
+        summary.append(("Action Expert OM (W8A8)", str(ctx.ae_quant_om)))
         summary.append(("OM manifest", str(ctx.policy_path / "config.om.json")))
     elif step == "verify":
         summary.append(("Verification", "✅ see log above"))
