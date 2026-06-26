@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -10,12 +11,14 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from dataset_tools.bag_to_lerobot import (  # noqa: E402
+    _build_feature_conversion_table,
     _clean_float_array,
     _dataset_feature_names_for_spec,
     _estimate_stream_rate_hz,
     _resolve_video_codec,
     _selected_indices_for_ticks,
 )
+from robot_config.utils import resolve_calibration_source_specs_from_config  # noqa: E402
 
 
 def test_resolve_video_codec_prefers_h264_in_auto_mode(monkeypatch):
@@ -98,3 +101,48 @@ def test_clean_float_array_silent_for_current(caplog):
     with caplog.at_level("WARNING"):
         _clean_float_array([1.0, np.nan, 2.0], np.float32, feature_name="observation.current")
     assert not any("non-finite" in rec.message for rec in caplog.records if rec.levelno >= 30)
+
+
+def test_fallback_conversion_table_prefers_explicit_source_specs_over_legacy_pathsep(tmp_path):
+    front = tmp_path / "front.json"
+    left = tmp_path / "left.json"
+    right = tmp_path / "right.json"
+    legacy = tmp_path / "legacy.json"
+    for index, path in enumerate((front, left, right, legacy), start=1):
+        path.write_text(json.dumps({"1": {"range_min": 1000 + index, "range_max": 3000 + index}}))
+
+    specs = resolve_calibration_source_specs_from_config(
+        {
+            "ros2_control": {
+                "xacro_args": {
+                    "calib_file_front": str(front),
+                    "calib_file_left": str(left),
+                    "calib_file_right": str(right),
+                }
+            }
+        }
+    )
+
+    table = _build_feature_conversion_table(
+        feature_names=["joint1_front", "joint1_left", "joint1_right"],
+        conversion_meta={},
+        fallback_config={
+            "norm_mode": "range_m100_100",
+            "gripper_joints": [],
+            "calibration_source_specs": specs,
+            "calibration_file": str(legacy),
+        },
+    )
+
+    assert len(table) == 3
+    front_rad_min, front_rad_max, *_ = table[0]
+    left_rad_min, left_rad_max, *_ = table[1]
+    right_rad_min, right_rad_max, *_ = table[2]
+
+    ticks_per_rad = 4096.0 / (2.0 * np.pi)
+    assert front_rad_min == (1001 - 2048.0) / ticks_per_rad
+    assert front_rad_max == (3001 - 2048.0) / ticks_per_rad
+    assert left_rad_min == (1002 - 2048.0) / ticks_per_rad
+    assert left_rad_max == (3002 - 2048.0) / ticks_per_rad
+    assert right_rad_min == (1003 - 2048.0) / ticks_per_rad
+    assert right_rad_max == (3003 - 2048.0) / ticks_per_rad

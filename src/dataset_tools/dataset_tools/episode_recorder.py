@@ -95,7 +95,7 @@ from std_srvs.srv import Trigger
 
 from ibrobot_msgs.action import RecordEpisode
 from robot_config.contract_utils import contract_fingerprint, qos_profile_from_dict
-from robot_config.utils import build_lerobot_conversion_metadata
+from robot_config.utils import build_lerobot_conversion_metadata, resolve_calibration_source_specs_from_config
 
 # ------------------------------ Constants ------------------------------
 
@@ -243,7 +243,6 @@ class EpisodeRecorderServer(Node):
         self.declare_parameter("lerobot_norm_mode", "")
         self.declare_parameter("joint_names", [""])
         self.declare_parameter("gripper_joints", [""])
-        self.declare_parameter("calibration_file", "")
         # Storage tuning (kept optional & conservative by default)
         self.declare_parameter("max_cache_size", DEFAULT_MAX_CACHE_SIZE)
         self.declare_parameter("storage_preset_profile", "")  # e.g., "zstd_fast"
@@ -280,7 +279,6 @@ class EpisodeRecorderServer(Node):
         self._gripper_joints = [
             j for j in self.get_parameter("gripper_joints").get_parameter_value().string_array_value if j
         ]
-        self._calibration_file = self.get_parameter("calibration_file").get_parameter_value().string_value
         self._dataset_root = self._bag_base / self._dataset_name
         self._episodes_dir = self._dataset_root / "episodes"
         self._dataset_metadata_path = self._dataset_root / "dataset.yaml"
@@ -294,14 +292,23 @@ class EpisodeRecorderServer(Node):
         self._lerobot_conversion_meta: dict[str, Any] = {}
         if self._joint_names and self._lerobot_norm_mode:
             try:
-                self._lerobot_conversion_meta = build_lerobot_conversion_metadata(
-                    calib_file=self._calibration_file,
-                    joint_names=self._joint_names,
-                    gripper_joints=self._gripper_joints,
-                    norm_mode=self._lerobot_norm_mode,
-                )
-            except (FileNotFoundError, KeyError, OSError, ValueError) as exc:
-                self.get_logger().warning(f"Failed to build LeRobot conversion metadata: {exc!r}")
+                calibration_source_specs = resolve_calibration_source_specs_from_config(robot_config)
+            except (TypeError, ValueError) as exc:
+                calibration_source_specs = []
+                self.get_logger().warning(f"Failed to resolve calibration sources from robot_config: {exc!r}")
+
+            if not calibration_source_specs:
+                self.get_logger().warning("No calibration source available for LeRobot conversion metadata")
+            else:
+                try:
+                    self._lerobot_conversion_meta = build_lerobot_conversion_metadata(
+                        calib_file=calibration_source_specs,
+                        joint_names=self._joint_names,
+                        gripper_joints=self._gripper_joints,
+                        norm_mode=self._lerobot_norm_mode,
+                    )
+                except (FileNotFoundError, KeyError, OSError, ValueError) as exc:
+                    self.get_logger().warning(f"Failed to build LeRobot conversion metadata: {exc!r}")
 
         self._storage_preset_profile = (
             self.get_parameter("storage_preset_profile").get_parameter_value().string_value or ""

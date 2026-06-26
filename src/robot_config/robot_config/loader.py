@@ -18,7 +18,7 @@ from robot_config.config import (
     VoiceASRConfig,
 )
 
-from .utils import resolve_ros_path
+from .utils import resolve_calibration_paths_from_config, resolve_ros_path
 
 logger = logging.getLogger(__name__)
 
@@ -282,6 +282,11 @@ def build_contract_from_robot_config_dict(robot_config: dict[str, Any]):
     return _build(robot_config)
 
 
+def _robot_config_to_validation_dict(config: RobotConfig) -> dict[str, Any]:
+    params = dict(config.ros2_control.params)
+    return {"ros2_control": params}
+
+
 def validate_config(config: RobotConfig) -> list[str]:
     """Validate robot configuration.
 
@@ -294,11 +299,14 @@ def validate_config(config: RobotConfig) -> list[str]:
     if not config.ros2_control.hardware_plugin:
         errors.append("ros2_control.hardware_plugin is required")
 
-    # Check calib_file exists if specified
-    if "calib_file" in config.ros2_control.params:
-        calib_file = config.ros2_control.params["calib_file"]
-        if calib_file and not Path(calib_file).exists():
-            errors.append(f"Calibration file not found: {calib_file}")
+    try:
+        calibration_paths = resolve_calibration_paths_from_config(_robot_config_to_validation_dict(config))
+    except (TypeError, ValueError) as exc:
+        errors.append(f"Invalid ros2_control calibration configuration: {exc}")
+    else:
+        for calib_file in calibration_paths:
+            if calib_file and not Path(calib_file).exists():
+                errors.append(f"Calibration file not found: {calib_file}")
 
     # Validate peripherals
     peripheral_names = set()
@@ -327,9 +335,8 @@ def validate_config(config: RobotConfig) -> list[str]:
 
     # Validate contract-peripheral references
     for obs in config.contract.observations:
-        if obs.peripheral:
-            if obs.peripheral not in peripheral_names:
-                errors.append(f"Observation '{obs.key}' references undefined peripheral: {obs.peripheral}")
+        if obs.peripheral and obs.peripheral not in peripheral_names:
+            errors.append(f"Observation '{obs.key}' references undefined peripheral: {obs.peripheral}")
 
     if config.voice_asr.enabled and not config.voice_asr.model_path and not config.voice_asr.auto_download_model:
         errors.append("voice_asr.model_path is required when voice_asr.enabled is true")

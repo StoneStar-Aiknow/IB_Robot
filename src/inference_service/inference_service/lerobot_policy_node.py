@@ -81,7 +81,7 @@ from robot_config.utils import (
     build_joint_conversion_table,
     build_joint_conversion_table_from_urdf,
     parse_bool,
-    resolve_calibration_path_from_config,
+    resolve_calibration_source_specs_from_config,
     resolve_gripper_joints_from_config,
     resolve_joint_names_from_config,
 )
@@ -292,7 +292,7 @@ class LeRobotPolicyNode(Node):
 
         # Build joint conversion table from the runtime position limits.
         # Hardware uses calibrated servo ranges; simulation uses URDF limits.
-        calib_file = resolve_calibration_path_from_config(robot_cfg)
+        calibration_sources = resolve_calibration_source_specs_from_config(robot_cfg)
         joint_names = resolve_joint_names_from_config(robot_cfg)
         gripper_joints = resolve_gripper_joints_from_config(robot_cfg) or ["6"]
         norm_mode = self._config.lerobot_norm_mode
@@ -314,9 +314,9 @@ class LeRobotPolicyNode(Node):
                 f"Loaded simulated joint conversion table from URDF limits "
                 f"(mode={norm_mode}): {len(self._joint_rad_limits)} joints"
             )
-        elif calib_file and joint_names:
+        elif calibration_sources and joint_names:
             self._joint_rad_limits = build_joint_conversion_table(
-                calib_file,
+                calibration_sources,
                 joint_names,
                 gripper_joints,
                 norm_mode=norm_mode,
@@ -324,10 +324,9 @@ class LeRobotPolicyNode(Node):
             self.get_logger().info(
                 f"Loaded joint conversion table (mode={norm_mode}): {len(self._joint_rad_limits)} joints"
             )
-
         else:
             self._joint_rad_limits = []
-            self.get_logger().warn("Missing calib_file or joint_names; rad↔pct conversion disabled")
+            self.get_logger().warn("Missing calibration files or joint_names; rad↔pct conversion disabled")
 
         if joint_names:
             # Append base velocity normalization entries using physical units (rad/s).

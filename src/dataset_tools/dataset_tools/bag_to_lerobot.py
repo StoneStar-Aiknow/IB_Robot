@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 ROS 2 bag → LeRobot v3.0 exporter.
 
@@ -77,44 +76,44 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
-import yaml
-
 import rosbag2_py
-from rclpy.serialization import deserialize_message
-from rosidl_runtime_py.utilities import get_message
+import yaml
 
 # ---- LeRobot
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from rclpy.serialization import deserialize_message
+from rosidl_runtime_py.utilities import get_message
+
+# Import decoders to register them
+import tensormsg.converter  # noqa: F401
 
 # ---- Shared core (ONLY these two)
 from robot_config.contract_utils import (
-    iter_specs,
-    feature_from_spec,
-    contract_fingerprint,
     Contract,
-)
-from robot_config.contract_utils import (
+    contract_fingerprint,
     decode_value,
+    feature_from_spec,
+    iter_specs,
     resample,
     stamp_from_header_ns,
+)
+from robot_config.contract_utils import (
     zero_pad as make_zero_pad,
 )
 from robot_config.utils import (
     build_joint_conversion_table,
     build_joint_conversion_table_from_calibration,
     normalize_lerobot_norm_mode,
-    resolve_calibration_path_from_config,
+    resolve_calibration_source_specs_from_config,
     resolve_gripper_joints_from_config,
     resolve_lerobot_norm_mode,
 )
-
-# Import decoders to register them
-import tensormsg.converter  # noqa: F401
 
 # ---------------------------------------------------------------------------
 
@@ -137,14 +136,14 @@ class _Stream:
 
     spec: Any
     ros_type: str
-    ts: List[int]
-    val: List[Any]
+    ts: list[int]
+    val: list[Any]
 
 
 # ---------------------------------------------------------------------------
 
 
-def _read_yaml(p: Path) -> Dict[str, Any]:
+def _read_yaml(p: Path) -> dict[str, Any]:
     """Read a YAML file if it exists; return {} on absence/parse failures."""
     if not p.exists():
         print(f"[WARN] {p} does not exist")
@@ -153,7 +152,7 @@ def _read_yaml(p: Path) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def _dataset_metadata_for_bag(bag_dir: Path) -> Dict[str, Any]:
+def _dataset_metadata_for_bag(bag_dir: Path) -> dict[str, Any]:
     """Load dataset metadata when the bag lives under <dataset_root>/episodes/."""
     if bag_dir.parent.name != "episodes":
         return {}
@@ -164,9 +163,9 @@ def _dataset_metadata_for_bag(bag_dir: Path) -> Dict[str, Any]:
 
 
 def _lerobot_metadata_entry(
-    dataset_meta: Dict[str, Any],
-    bag_info: Dict[str, Any],
-) -> Tuple[str, Dict[str, Any]]:
+    dataset_meta: dict[str, Any],
+    bag_info: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
     """Resolve the active LeRobot conversion metadata for one bag."""
     if not isinstance(dataset_meta, dict):
         return "", {}
@@ -194,7 +193,7 @@ def _lerobot_metadata_entry(
     return fingerprint, conversion_meta
 
 
-def _resolve_fallback_conversion_config(robot_config_path: Path) -> Dict[str, Any]:
+def _resolve_fallback_conversion_config(robot_config_path: Path) -> dict[str, Any]:
     """Resolve conversion inputs directly from robot_config for older datasets."""
     from robot_config.loader import load_robot_config_dict
 
@@ -203,18 +202,27 @@ def _resolve_fallback_conversion_config(robot_config_path: Path) -> Dict[str, An
     except Exception as exc:
         print(f"[WARN] Failed to load robot_config from {robot_config_path}: {exc}")
         return {}
+    try:
+        calibration_source_specs = resolve_calibration_source_specs_from_config(robot_config)
+        calibration_file = os.pathsep.join(spec.resolved_path for spec in calibration_source_specs)
+    except (TypeError, ValueError) as exc:
+        print(f"[WARN] Failed to resolve calibration sources from {robot_config_path}: {exc}")
+        calibration_source_specs = []
+        calibration_file = ""
+
     return {
         "norm_mode": resolve_lerobot_norm_mode(robot_config),
         "gripper_joints": resolve_gripper_joints_from_config(robot_config),
-        "calibration_file": resolve_calibration_path_from_config(robot_config),
+        "calibration_source_specs": calibration_source_specs,
+        "calibration_file": calibration_file,
     }
 
 
 def _build_feature_conversion_table(
-    feature_names: List[str],
-    conversion_meta: Dict[str, Any],
-    fallback_config: Dict[str, Any],
-) -> List[Tuple[float, float, float, float]]:
+    feature_names: list[str],
+    conversion_meta: dict[str, Any],
+    fallback_config: dict[str, Any],
+) -> list[tuple[float, float, float, float]]:
     """Build a per-feature conversion table in the feature's declared joint order."""
     ordered_names = [str(name) for name in feature_names]
     if not ordered_names:
@@ -234,6 +242,15 @@ def _build_feature_conversion_table(
             )
         raise ValueError("Dataset conversion metadata is missing calibration snapshot")
 
+    calibration_source_specs = fallback_config.get("calibration_source_specs") or []
+    if calibration_source_specs:
+        return build_joint_conversion_table(
+            calib_file=calibration_source_specs,
+            joint_names=ordered_names,
+            gripper_joints=fallback_config.get("gripper_joints"),
+            norm_mode=str(fallback_config.get("norm_mode", "")),
+        )
+
     calib_file = str(fallback_config.get("calibration_file", "") or "")
     if not calib_file:
         return []
@@ -245,7 +262,7 @@ def _build_feature_conversion_table(
     )
 
 
-def _rad_to_lerobot(values: np.ndarray, table: List[Tuple[float, float, float, float]]) -> np.ndarray:
+def _rad_to_lerobot(values: np.ndarray, table: list[tuple[float, float, float, float]]) -> np.ndarray:
     """Convert a flat radian vector into LeRobot units using a conversion table."""
     arr = np.asarray(values, dtype=np.float32).reshape(-1)
     if not table:
@@ -284,12 +301,12 @@ def _clean_float_array(
     return arr
 
 
-def _dataset_feature_names_for_spec(spec: Any) -> List[str]:
+def _dataset_feature_names_for_spec(spec: Any) -> list[str]:
     """Return metadata names for a decoded contract spec."""
     return [str(name) for name in getattr(spec, "names", [])]
 
 
-def _topic_type_map(reader: rosbag2_py.SequentialReader) -> Dict[str, str]:
+def _topic_type_map(reader: rosbag2_py.SequentialReader) -> dict[str, str]:
     """Build a `{topic: type}` map from a rosbag2 reader."""
     return {t.name: t.type for t in reader.get_all_topics_and_types()}
 
@@ -313,7 +330,7 @@ def _resolve_video_codec(requested_codec: str) -> str:
     return "libsvtav1"
 
 
-def _estimate_stream_rate_hz(ts_ns: List[int]) -> float:
+def _estimate_stream_rate_hz(ts_ns: list[int]) -> float:
     """Estimate stream frequency from monotonically increasing nanosecond stamps."""
     if len(ts_ns) < 2:
         return 0.0
@@ -372,7 +389,7 @@ def _selected_indices_for_ticks(
 
 
 def _log_image_stream_diagnostics(
-    streams: Dict[str, _Stream],
+    streams: dict[str, _Stream],
     ticks_ns: np.ndarray,
     step_ns: int,
     target_fps: int,
@@ -413,8 +430,8 @@ def _log_image_stream_diagnostics(
 
 def _plan_streams(
     specs: Iterable[Any],
-    tmap: Dict[str, str],
-) -> Tuple[Dict[str, _Stream], Dict[str, List[str]]]:
+    tmap: dict[str, str],
+) -> tuple[dict[str, _Stream], dict[str, list[str]]]:
     """Plan `_Stream` buffers for contract specs and build a topic dispatch index.
 
     Parameters
@@ -436,8 +453,8 @@ def _plan_streams(
     RuntimeError
         If none of the contract topics exist in the bag.
     """
-    streams: Dict[str, _Stream] = {}
-    by_topic: Dict[str, List[str]] = {}
+    streams: dict[str, _Stream] = {}
+    by_topic: dict[str, list[str]] = {}
     for sv in specs:
         if sv.topic not in tmap:
             # Derive a human-readable kind for logging without assuming SpecView internals.
@@ -447,21 +464,19 @@ def _plan_streams(
                 kind = "task"
             else:
                 kind = "observation"
-            print(
-                f"[WARN] Missing {kind} '{getattr(sv, 'key', '?')}' topic in bag: {sv.topic}"
-            )
+            print(f"[WARN] Missing {kind} '{getattr(sv, 'key', '?')}' topic in bag: {sv.topic}")
             continue
         rt = sv.ros_type or tmap[sv.topic]
 
         # Create unique key for multiple observation.state specs and action specs
         if sv.key == "observation.state":
             # Remove leading underscore from topic replacement
-            topic_suffix = sv.topic.replace('/', '_').lstrip('_')
+            topic_suffix = sv.topic.replace("/", "_").lstrip("_")
             unique_key = f"{sv.key}_{topic_suffix}" if topic_suffix else sv.key
         elif sv.is_action:
             # For action specs, we need to check if there are multiple specs with the same key
             # This will be handled later in the consolidation logic
-            topic_suffix = sv.topic.replace('/', '_').lstrip('_')
+            topic_suffix = sv.topic.replace("/", "_").lstrip("_")
             unique_key = f"{sv.key}_{topic_suffix}" if topic_suffix else sv.key
         else:
             unique_key = sv.key
@@ -480,13 +495,13 @@ def _load_contract_from_robot_config(robot_config_path: Path) -> Contract:
     """Load contract from robot_config.yaml (Single Source of Truth)."""
     print(f"[bag_to_lerobot] Loading contract from robot_config: {robot_config_path}")
     from robot_config.loader import (
-        load_robot_config_dict,
         build_contract_from_robot_config_dict,
+        load_robot_config_dict,
     )
 
     robot_config = load_robot_config_dict(str(robot_config_path))
     contract = build_contract_from_robot_config_dict(robot_config)
-    
+
     print(f"[bag_to_lerobot]   Observations: {len(contract.observations)}")
     for obs in contract.observations:
         print(f"[bag_to_lerobot]     - {obs.key} <- {obs.topic}")
@@ -498,7 +513,7 @@ def _load_contract_from_robot_config(robot_config_path: Path) -> Contract:
 
 
 def export_bags_to_lerobot(
-    bag_dirs: List[Path],
+    bag_dirs: list[Path],
     robot_config_path: Path,
     out_root: Path = Path("output"),
     repo_id: str = "rosbag_v30",
@@ -559,10 +574,10 @@ def export_bags_to_lerobot(
     specs = list(iter_specs(contract))
 
     # Features (also detect first image key as anchor)
-    features: Dict[str, Dict[str, Any]] = {}
-    primary_image_key: Optional[str] = None
+    features: dict[str, dict[str, Any]] = {}
+    primary_image_key: str | None = None
     state_specs = []  # Track multiple observation.state specs
-    action_specs_by_key: Dict[str, List[Any]] = {}  # Track multiple action specs by key
+    action_specs_by_key: dict[str, list[Any]] = {}  # Track multiple action specs by key
     pc_keys: set = set()  # PointCloud2 keys routed to side-car (not into LeRobot features)
 
     for sv in specs:
@@ -590,9 +605,7 @@ def export_bags_to_lerobot(
 
         # Ensure task.* specs are treated as per-frame strings even if the
         # underlying helper doesn't special-case them yet.
-        if str(k).startswith(
-            "task."
-        ):  # TODO: why is this special-cased? Shouldn't this be handled in constract_utils?
+        if str(k).startswith("task."):  # TODO: why is this special-cased? Shouldn't this be handled in constract_utils?
             # Normalize to a simple scalar string field.
             features[k] = {"dtype": "string", "shape": [1]}
         else:
@@ -615,11 +628,7 @@ def export_bags_to_lerobot(
             all_names.extend(sv.names)
             total_shape += len(sv.names)
 
-        features["observation.state"] = {
-            "dtype": "float32",
-            "shape": (total_shape,),
-            "names": all_names
-        }
+        features["observation.state"] = {"dtype": "float32", "shape": (total_shape,), "names": all_names}
 
     # Consolidate multiple action specs with the same key into a single feature
     for action_key, action_specs in action_specs_by_key.items():
@@ -631,11 +640,7 @@ def export_bags_to_lerobot(
                 all_names.extend(sv.names)
                 total_shape += len(sv.names)
 
-            features[action_key] = {
-                "dtype": "float32",
-                "shape": (total_shape,),
-                "names": all_names
-            }
+            features[action_key] = {"dtype": "float32", "shape": (total_shape,), "names": all_names}
         else:
             # Single spec - use it as-is
             sv = action_specs[0]
@@ -674,26 +679,18 @@ def export_bags_to_lerobot(
         video_files_size_in_mb=video_mb,
     )
 
-
     # Precompute zero pads + shapes for fast frame assembly.
     zero_pad_map = {k: make_zero_pad(ft) for k, ft in features.items()}
-    write_keys = [
-        k
-        for k, ft in features.items()
-        if ft["dtype"] in ("video", "image", "float32", "float64", "string")
-    ]
-    shapes = {k: tuple(features[k]["shape"]) for k in write_keys}
-    state_feature_names = [
-        str(name) for name in features.get("observation.state", {}).get("names", [])
-    ]
+    write_keys = [k for k, ft in features.items() if ft["dtype"] in ("video", "image", "float32", "float64", "string")]
+    state_feature_names = [str(name) for name in features.get("observation.state", {}).get("names", [])]
     action_feature_names = {
         action_key: [str(name) for name in features[action_key].get("names", [])]
         for action_key in action_specs_by_key
         if action_key in features
     }
-    conversion_table_cache: Dict[
-        Tuple[str, Tuple[str, ...]],
-        List[Tuple[float, float, float, float]],
+    conversion_table_cache: dict[
+        tuple[str, tuple[str, ...]],
+        list[tuple[float, float, float, float]],
     ] = {}
 
     # Episodes
@@ -701,9 +698,7 @@ def export_bags_to_lerobot(
         print(f"[Episode {epi_idx}] {bag_dir}")
 
         # Per-episode point cloud buffer (one entry per key)
-        pc_buf: Dict[str, Dict[str, list]] = {
-            k: {"xyz": [], "rgb": [], "ts": []} for k in pc_keys
-        }
+        pc_buf: dict[str, dict[str, list]] = {k: {"xyz": [], "rgb": [], "ts": []} for k in pc_keys}
 
         try:
             meta = _read_yaml(bag_dir / "metadata.yaml")
@@ -719,11 +714,7 @@ def export_bags_to_lerobot(
             if isinstance(cd, dict):
                 prompt = cd.get("lerobot.operator_prompt", prompt) or prompt
             if not prompt and isinstance(dataset_meta, dict):
-                prompt = str(
-                    dataset_meta.get("default_task")
-                    or dataset_meta.get("task")
-                    or prompt
-                )
+                prompt = str(dataset_meta.get("default_task") or dataset_meta.get("task") or prompt)
 
             # Reader
             reader = rosbag2_py.SequentialReader()
@@ -747,7 +738,7 @@ def export_bags_to_lerobot(
         # Create consolidated observation.state stream if we have multiple state specs
         if state_specs:
             # Find all observation.state streams
-            state_streams = [k for k in streams.keys() if k == "observation.state"]
+            state_streams = [k for k in streams if k == "observation.state"]
             if len(state_streams) > 1:
                 # Create a consolidated stream that will concatenate the data
                 # We'll handle this in the frame processing
@@ -790,19 +781,11 @@ def export_bags_to_lerobot(
             raise RuntimeError(f"No usable messages in {bag_dir} (none decoded).")
 
         # Choose anchor + duration
-        valid_ts = [
-            np.asarray(st.ts, dtype=np.int64) for st in streams.values() if st.ts
-        ]
+        valid_ts = [np.asarray(st.ts, dtype=np.int64) for st in streams.values() if st.ts]
         if not valid_ts:
             raise RuntimeError(f"No usable messages in {bag_dir} (no timestamps).")
-        if (
-            primary_image_key
-            and streams.get(primary_image_key)
-            and streams[primary_image_key].ts
-        ):
-            start_ns = int(
-                np.asarray(streams[primary_image_key].ts, dtype=np.int64).min()
-            )
+        if primary_image_key and streams.get(primary_image_key) and streams[primary_image_key].ts:
+            start_ns = int(np.asarray(streams[primary_image_key].ts, dtype=np.int64).min())
         else:
             start_ns = int(min(ts.min() for ts in valid_ts))
 
@@ -815,9 +798,7 @@ def export_bags_to_lerobot(
             print("Using duration from metadata")
         else:
             dur_ns = observed_dur_ns
-            print(
-                "Metadata duration disagrees with observed duration. Using observed duration"
-            )
+            print("Metadata duration disagrees with observed duration. Using observed duration")
 
         # Ticks
         n_ticks = int(dur_ns // step_ns) + 1
@@ -830,20 +811,17 @@ def export_bags_to_lerobot(
             target_fps=fps,
         )
 
-
         # Resample onto ticks
-        resampled: Dict[str, List[Any]] = {}
+        resampled: dict[str, list[Any]] = {}
         for key, st in streams.items():
             if not st.ts:
                 resampled[key] = [None] * n_ticks
                 continue
             ts = np.asarray(st.ts, dtype=np.int64)
             pol = st.spec.resample_policy
-            resampled[key] = resample(
-                pol, ts, st.val, ticks_ns, step_ns, st.spec.asof_tol_ms
-            )
+            resampled[key] = resample(pol, ts, st.val, ticks_ns, step_ns, st.spec.asof_tol_ms)
 
-        state_conversion_table: List[Tuple[float, float, float, float]] = []
+        state_conversion_table: list[tuple[float, float, float, float]] = []
         if state_feature_names:
             cache_key = (conversion_fp or "robot_config", tuple(state_feature_names))
             if cache_key not in conversion_table_cache:
@@ -854,14 +832,11 @@ def export_bags_to_lerobot(
                         fallback_config=fallback_conversion_config,
                     )
                 except (FileNotFoundError, KeyError, ValueError) as exc:
-                    print(
-                        f"[WARN] Failed to build observation.state conversion table for "
-                        f"{bag_dir}: {exc}"
-                    )
+                    print(f"[WARN] Failed to build observation.state conversion table for {bag_dir}: {exc}")
                     conversion_table_cache[cache_key] = []
             state_conversion_table = conversion_table_cache[cache_key]
 
-        action_conversion_tables: Dict[str, List[Tuple[float, float, float, float]]] = {}
+        action_conversion_tables: dict[str, list[tuple[float, float, float, float]]] = {}
         for action_key, feature_names in action_feature_names.items():
             cache_key = (conversion_fp or "robot_config", tuple(feature_names))
             if cache_key not in conversion_table_cache:
@@ -872,23 +847,20 @@ def export_bags_to_lerobot(
                         fallback_config=fallback_conversion_config,
                     )
                 except (FileNotFoundError, KeyError, ValueError) as exc:
-                    print(
-                        f"[WARN] Failed to build {action_key} conversion table for "
-                        f"{bag_dir}: {exc}"
-                    )
+                    print(f"[WARN] Failed to build {action_key} conversion table for {bag_dir}: {exc}")
                     conversion_table_cache[cache_key] = []
             action_conversion_tables[action_key] = conversion_table_cache[cache_key]
 
         # Write frames
         for i in range(n_ticks):
-            frame: Dict[str, Any] = {}
+            frame: dict[str, Any] = {}
 
             # Handle consolidated observation.state by concatenating multiple state streams first
             if "observation.state" in features and state_specs:
                 # Concatenate all observation.state values from different topics
                 state_values = []
                 for sv in state_specs:
-                    topic_suffix = sv.topic.replace('/', '_').lstrip('_')
+                    topic_suffix = sv.topic.replace("/", "_").lstrip("_")
                     unique_key = f"{sv.key}_{topic_suffix}" if topic_suffix else sv.key
                     stream_val = resampled.get(unique_key, [None] * n_ticks)[i]
                     if stream_val is not None:
@@ -906,9 +878,7 @@ def export_bags_to_lerobot(
                         ]
                         concatenated_state = fixed
                     if state_conversion_table:
-                        concatenated_state = _rad_to_lerobot(
-                            concatenated_state, state_conversion_table
-                        )
+                        concatenated_state = _rad_to_lerobot(concatenated_state, state_conversion_table)
                     frame["observation.state"] = concatenated_state
                 else:
                     # Use zero padding if no state values available
@@ -920,7 +890,7 @@ def export_bags_to_lerobot(
                     # Concatenate all action values from different topics
                     action_values = []
                     for sv in action_specs:
-                        topic_suffix = sv.topic.replace('/', '_').lstrip('_')
+                        topic_suffix = sv.topic.replace("/", "_").lstrip("_")
                         unique_key = f"{sv.key}_{topic_suffix}" if topic_suffix else sv.key
                         stream_val = resampled.get(unique_key, [None] * n_ticks)[i]
                         if stream_val is not None:
@@ -935,15 +905,13 @@ def export_bags_to_lerobot(
                         exp = int(features[action_key]["shape"][0])
                         if concatenated_action.shape[0] != exp:
                             fixed = np.zeros((exp,), dtype=np.float32)
-                            fixed[: min(exp, concatenated_action.shape[0])] = (
-                                concatenated_action[: min(exp, concatenated_action.shape[0])]
-                            )
+                            fixed[: min(exp, concatenated_action.shape[0])] = concatenated_action[
+                                : min(exp, concatenated_action.shape[0])
+                            ]
                             concatenated_action = fixed
                         conversion_table = action_conversion_tables.get(action_key, [])
                         if conversion_table:
-                            concatenated_action = _rad_to_lerobot(
-                                concatenated_action, conversion_table
-                            )
+                            concatenated_action = _rad_to_lerobot(concatenated_action, conversion_table)
 
                         frame[action_key] = concatenated_action
                     else:
@@ -1049,25 +1017,38 @@ def export_bags_to_lerobot(
                 timestamps_ns=np.array(buf["ts"], dtype=np.int64),
                 episode_index=np.int32(epi_idx),
             )
-            print(f"  → pointclouds/{pc_key}/chunk-{chunk_idx:03d}/episode_{epi_idx:06d}.npz  (M={len(xyz_cat)}, T={len(buf['ts'])})")
-
+            print(
+                f"  → pointclouds/{pc_key}/chunk-{chunk_idx:03d}/episode_{epi_idx:06d}.npz  (M={len(xyz_cat)}, T={len(buf['ts'])})"
+            )
 
     # Write pointclouds/meta.json (side-car format descriptor)
     if pc_keys:
         import json as _json
-        (out_root / "pointclouds" / "meta.json").write_text(_json.dumps({
-            "format": "csr",
-            "description": "Unorganized PointCloud2, variable N per frame, CSR format",
-            "pointcloud_keys": sorted(pc_keys),
-            "fields": {
-                "xyz":           {"shape": "(M,3)",  "dtype": "float32", "unit": "meters"},
-                "rgb":           {"shape": "(M,3)",  "dtype": "uint8",   "range": "0-255"},
-                "offsets":       {"shape": "(T+1,)", "dtype": "int64",
-                                  "note": "frame i -> xyz[offsets[i]:offsets[i+1]]"},
-                "timestamps_ns": {"shape": "(T,)",   "dtype": "int64",
-                                  "note": "align with parquet timestamp column (ns)"},
-            },
-        }, indent=2))
+
+        (out_root / "pointclouds" / "meta.json").write_text(
+            _json.dumps(
+                {
+                    "format": "csr",
+                    "description": "Unorganized PointCloud2, variable N per frame, CSR format",
+                    "pointcloud_keys": sorted(pc_keys),
+                    "fields": {
+                        "xyz": {"shape": "(M,3)", "dtype": "float32", "unit": "meters"},
+                        "rgb": {"shape": "(M,3)", "dtype": "uint8", "range": "0-255"},
+                        "offsets": {
+                            "shape": "(T+1,)",
+                            "dtype": "int64",
+                            "note": "frame i -> xyz[offsets[i]:offsets[i+1]]",
+                        },
+                        "timestamps_ns": {
+                            "shape": "(T,)",
+                            "dtype": "int64",
+                            "note": "align with parquet timestamp column (ns)",
+                        },
+                    },
+                },
+                indent=2,
+            )
+        )
 
     print(f"\n[OK] Dataset root: {ds.root.resolve()}")
     if use_videos:
@@ -1075,9 +1056,7 @@ def export_bags_to_lerobot(
     else:
         print("  - images/*/*.png")
     print("  - data/chunk-*/file-*.parquet")
-    print(
-        "  - meta/info.json, meta/tasks.parquet, meta/stats.json, meta/episodes/*/*.parquet"
-    )
+    print("  - meta/info.json, meta/tasks.parquet, meta/stats.json, meta/episodes/*/*.parquet")
     if pc_keys:
         print("  - pointclouds/<pc_key>/chunk-*/episode_*.npz  (CSR format)")
         print("  - pointclouds/meta.json")
@@ -1111,13 +1090,9 @@ Example:
     )
     ap.add_argument("--out", required=True, help="Output dataset root")
     ap.add_argument("--repo-id", default="rosbag_v30", help="repo_id metadata")
-    ap.add_argument(
-        "--no-videos", action="store_true", help="Store images instead of videos"
-    )
+    ap.add_argument("--no-videos", action="store_true", help="Store images instead of videos")
     ap.add_argument("--image-threads", type=int, default=4, help="Image writer threads")
-    ap.add_argument(
-        "--image-processes", type=int, default=0, help="Image writer processes"
-    )
+    ap.add_argument("--image-processes", type=int, default=0, help="Image writer processes")
     ap.add_argument("--chunk-size", type=int, default=1000)
     ap.add_argument("--data-mb", type=int, default=100)
     ap.add_argument("--video-mb", type=int, default=500)
@@ -1152,17 +1127,11 @@ def main() -> None:
     else:
         session_dir = Path(args.bags_dir)
         if (session_dir / "dataset.yaml").exists() and (session_dir / "episodes").is_dir():
-            print(
-                f"[bag_to_lerobot] Using dataset root {session_dir} "
-                f"→ scanning {session_dir / 'episodes'}"
-            )
+            print(f"[bag_to_lerobot] Using dataset root {session_dir} → scanning {session_dir / 'episodes'}")
             session_dir = session_dir / "episodes"
 
         # Auto-discover: find all subdirectories that contain metadata.yaml
-        bag_dirs = sorted(
-            p for p in session_dir.iterdir()
-            if p.is_dir() and (p / "metadata.yaml").exists()
-        )
+        bag_dirs = sorted(p for p in session_dir.iterdir() if p.is_dir() and (p / "metadata.yaml").exists())
         if not bag_dirs:
             raise SystemExit(f"No valid bags found in {session_dir}")
         print(f"[bag_to_lerobot] Found {len(bag_dirs)} bags in {session_dir}:")

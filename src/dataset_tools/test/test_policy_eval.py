@@ -88,7 +88,7 @@ def test_inspect_calibration_accepts_multiple_existing_files(tmp_path):
     right.write_text("{}", encoding="utf-8")
 
     status = inspect_calibration(
-        {"ros2_control": {"xacro_args": {"calib_file_1": str(left), "calib_file_2": str(right)}}}
+        {"ros2_control": {"xacro_args": {"calib_file_left": str(left), "calib_file_right": str(right)}}}
     )
 
     assert status.status == "available"
@@ -103,7 +103,7 @@ def test_inspect_calibration_reports_missing_files(tmp_path):
     left.write_text("{}", encoding="utf-8")
 
     status = inspect_calibration(
-        {"ros2_control": {"xacro_args": {"calib_file_1": str(left), "calib_file_2": str(right)}}}
+        {"ros2_control": {"xacro_args": {"calib_file_left": str(left), "calib_file_right": str(right)}}}
     )
 
     assert status.status == "missing"
@@ -116,6 +116,18 @@ def test_make_eval_ticks_applies_stride_and_limit():
     ticks = make_eval_ticks([[0, 100_000_000, 200_000_000, 300_000_000]], 10.0, frame_limit=2, frame_stride=2)
 
     assert ticks == [0, 200_000_000]
+
+
+def test_make_eval_ticks_starts_when_all_streams_have_data():
+    # Two streams whose first message timestamps differ by 100 ms (e.g. a USB
+    # camera whose header stamp predates joint-state bag time). Ticks must start
+    # at the *latest* first-message time so every stream has data at tick 0.
+    stream_a = [0, 100_000_000, 200_000_000, 300_000_000]  # starts at 0
+    stream_b = [100_000_000, 200_000_000, 300_000_000, 400_000_000]  # starts at 100ms
+    ticks = make_eval_ticks([stream_a, stream_b], 10.0)
+
+    assert ticks[0] == 100_000_000
+    assert all(t >= 100_000_000 for t in ticks)
 
 
 def test_selected_indices_for_asof_honors_tolerance():
