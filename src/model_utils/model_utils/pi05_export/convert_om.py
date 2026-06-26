@@ -91,10 +91,7 @@ def _has_atc_arg(extra_args: list[str], name: str) -> bool:
 
 
 def _default_om_output(manifest_dir: Path, role: str, onnx_path: Path) -> Path:
-    base = "vlm" if role == "vlm" else "action_expert"
-    if onnx_path.stem.endswith("_w8a8"):
-        base += "_w8a8"
-    return manifest_dir / f"{base}.om"
+    return manifest_dir / onnx_path.with_suffix(".om").name
 
 
 def _run_atc(
@@ -199,13 +196,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--vlm-om",
         type=str,
         default=None,
-        help="Output VLM .om path (default: <policy-path>/vlm.om, or vlm_w8a8.om for *_w8a8.onnx).",
+        help="Output VLM .om path (default: <policy-path>/<vlm-onnx-basename>.om).",
     )
     p.add_argument(
         "--ae-om",
         type=str,
         default=None,
-        help="Output Action Expert .om path (default: <policy-path>/action_expert.om, or action_expert_w8a8.om for *_w8a8.onnx).",
+        help="Output Action Expert .om path (default: <policy-path>/<ae-onnx-basename>.om).",
     )
     p.add_argument(
         "--om-manifest-dir",

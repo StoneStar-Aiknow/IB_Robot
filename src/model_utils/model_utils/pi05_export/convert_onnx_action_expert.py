@@ -245,8 +245,7 @@ def parse_args() -> argparse.Namespace:
         "--om-path",
         type=str,
         default=None,
-        help="Predicted action_expert .om artifact path recorded in the manifest "
-        "(default: <manifest-dir>/action_expert.om).",
+        help="Predicted action_expert .om artifact path recorded in the manifest (default: <onnx-basename>.om).",
     )
     parser.add_argument("--skip-om-manifest", action="store_true", help="Do not write/update config.om.json.")
     parser.add_argument(
@@ -524,7 +523,7 @@ def main() -> int:
                     "would be written to a wrong location relative to the current working directory"
                 )
             manifest_dir = local_policy_path.resolve()
-        om_path = args.om_path if args.om_path is not None else "action_expert.om"
+        om_path = args.om_path if args.om_path is not None else onnx_output_path.with_suffix(".om").name
         manifest_path = upsert_pi05_om_manifest(manifest_dir, "action_expert", om_path)
         LOGGER.info("Updated OM manifest (action_expert) at %s", manifest_path)
 

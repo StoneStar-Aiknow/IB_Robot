@@ -459,7 +459,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--om-path",
         type=str,
         default=None,
-        help="Predicted VLM .om artifact path recorded in the manifest (default: <manifest-dir>/vlm.om).",
+        help="Predicted VLM .om artifact path recorded in the manifest (default: <onnx-basename>.om).",
     )
     p.add_argument("--skip-om-manifest", action="store_true", help="Do not write/update config.om.json.")
     p.add_argument("--log-level", type=str, default="INFO", help="Logging level")
@@ -575,7 +575,7 @@ def main() -> int:
                     "written to a wrong location relative to the current working directory"
                 )
             manifest_dir = local_policy_path.resolve()
-        om_path = args.om_path if args.om_path is not None else "vlm.om"
+        om_path = args.om_path if args.om_path is not None else onnx_output_path.with_suffix(".om").name
         manifest_path = upsert_pi05_om_manifest(manifest_dir, "vlm", om_path)
         LOGGER.info("Updated OM manifest (vlm) at %s", manifest_path)
 

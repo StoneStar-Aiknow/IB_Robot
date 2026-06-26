@@ -526,8 +526,12 @@ def main() -> int:
     donor_suffix = build_onnx_suffix(dtype=args.dtype, device=donor_device_tag)
     vlm_onnx = output_dir / f"pi05-vlm{suffix}.onnx"
     ae_onnx = output_dir / f"pi05-action_expert{suffix}.onnx"
+    vlm_w8a8 = vlm_onnx.with_name(vlm_onnx.stem + "_w8a8.onnx")
+    ae_w8a8 = ae_onnx.with_name(ae_onnx.stem + "_w8a8.onnx")
 
     chosen = _cli.parse_steps(args.steps)  # registry order, validated in resolve()
+    vlm_atc_onnx = vlm_w8a8 if "vlm_quant" in chosen else vlm_onnx
+    ae_atc_onnx = ae_w8a8 if "ae_quant" in chosen else ae_onnx
     ctx = Ctx(
         args=args,
         policy_path=policy_path,
@@ -537,10 +541,10 @@ def main() -> int:
         ae_onnx=ae_onnx,
         vlm_donor_onnx=output_dir / f"pi05-vlm{donor_suffix}.onnx",
         ae_donor_onnx=output_dir / f"pi05-action_expert{donor_suffix}.onnx",
-        vlm_w8a8=vlm_onnx.with_name(vlm_onnx.stem + "_w8a8.onnx"),
-        ae_w8a8=ae_onnx.with_name(ae_onnx.stem + "_w8a8.onnx"),
-        vlm_om=policy_path / ("vlm_w8a8.om" if "vlm_quant" in chosen else "vlm.om"),
-        ae_om=policy_path / ("action_expert_w8a8.om" if "ae_quant" in chosen else "action_expert.om"),
+        vlm_w8a8=vlm_w8a8,
+        ae_w8a8=ae_w8a8,
+        vlm_om=policy_path / vlm_atc_onnx.with_suffix(".om").name,
+        ae_om=policy_path / ae_atc_onnx.with_suffix(".om").name,
         calib_dir=(Path(args.calib_dir).expanduser() if args.calib_dir else runtime_save_dir),
         chosen=set(chosen),
     )
