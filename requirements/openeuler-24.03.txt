@@ -2,3 +2,4 @@ aiortc
 onnx
 onnxruntime
 pygraphviz
+atomgit_sdk
