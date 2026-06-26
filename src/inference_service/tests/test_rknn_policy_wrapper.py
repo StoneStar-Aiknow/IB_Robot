@@ -39,11 +39,13 @@ def test_rknn_wrapper_preserves_input_feature_order(tmp_path, monkeypatch):
     captured: dict[str, object] = {}
 
     class FakeRKNNLite:
+        NPU_CORE_ALL = 0
+
         def load_rknn(self, path):
             captured["model_path"] = path
             return 0
 
-        def init_runtime(self, target=None):
+        def init_runtime(self, target=None, core_mask=None):
             captured["target"] = target
             return 0
 
@@ -75,9 +77,11 @@ def test_rknn_wrapper_preserves_input_feature_order(tmp_path, monkeypatch):
     inputs = captured["inputs"]
     assert isinstance(inputs, list)
     assert len(inputs) == 3
-    assert inputs[0].shape == (1, 3, 4, 5)
+    # RKNN models use NHWC layout; image inputs are converted from NCHW (1,3,4,5)
+    # to NHWC (1,4,5,3) before inference, state vectors are passed through unchanged.
+    assert inputs[0].shape == (1, 4, 5, 3)
     assert inputs[1].shape == (1, 6)
-    assert inputs[2].shape == (1, 3, 4, 5)
+    assert inputs[2].shape == (1, 4, 5, 3)
     assert float(inputs[0][0, 0, 0, 0]) == 1.0
     assert float(inputs[1][0, 0]) == 2.0
     assert float(inputs[2][0, 0, 0, 0]) == 3.0
