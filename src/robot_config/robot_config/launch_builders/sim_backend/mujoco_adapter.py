@@ -32,6 +32,9 @@ logger = get_colored_logger("robot_config.sim_backend.mujoco")
 class MujocoAdapter(SimBackendAdapter):
     """MuJoCo simulation backend using mujoco_ros2_control."""
 
+    provides_clock = True
+    needs_ros2_control = True
+
     def start_backend(self, robot_config: dict) -> tuple:
         """Launch the mujoco_ros2_control node (simulator + controller_manager).
 

@@ -28,6 +28,9 @@ Usage:
     # Basic simulation
     ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true
 
+    # Contract mock simulation
+    ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true sim_platform:=mock control_mode:=model_inference
+
     # Model inference mode (auto-detected)
     ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true control_mode:=model_inference
 
@@ -69,7 +72,8 @@ Usage:
 Launch Arguments:
     robot_config: Robot configuration name (default: test_cam)
     config_path: Optional full path to robot config file
-    use_sim: Use simulation mode (default: false)
+    use_sim: Use simulation mode (default: false). Backend comes from robot YAML simulation.platform (gazebo/mujoco/mock)
+    sim_platform: Optional CLI override for robot YAML simulation.platform
     auto_start_controllers: Automatically spawn controllers (default: true, set to false for debugging)
     control_mode: Override control mode from YAML (teleop, model_inference, moveit_planning, etc.). If empty, uses default_control_mode from config file
     with_inference: Enable inference pipeline. If empty, auto-detects from control mode config
@@ -102,9 +106,8 @@ from launch_ros.actions import Node
 from robot_config.launch_builders.control import generate_ros2_control_nodes
 from robot_config.launch_builders.execution import generate_execution_nodes
 from robot_config.launch_builders.hardware_mock import (
-    generate_hardware_mock_nodes,
     mock_mode_skips_subsystem,
-    validate_mock_mode,
+    validate_mock_control_mode,
 )
 from robot_config.launch_builders.navigation import generate_navigation_nodes
 from robot_config.launch_builders.perception import (
@@ -116,7 +119,7 @@ from robot_config.launch_builders.recording import (
     generate_recording_nodes,
     generate_rerun_viewer_node,
 )
-from robot_config.launch_builders.sim_backend import get_sim_backend
+from robot_config.launch_builders.sim_backend import get_backend_caps, get_sim_backend
 from robot_config.launch_builders.teleop import generate_teleop_nodes
 from robot_config.launch_builders.tracing import (
     DEFAULT_TRACE_SESSION_NAME,
@@ -271,27 +274,18 @@ def launch_setup(context, *args, **kwargs):
     robot_config_name = context.launch_configurations.get("robot_config", "test_cam")
     config_path_override = context.launch_configurations.get("config_path", "")
     use_sim_str = context.launch_configurations.get("use_sim", "false")
-    use_mock_str = context.launch_configurations.get("use_mock", "false")
+    sim_platform_override = context.launch_configurations.get("sim_platform", "").strip().lower()
     auto_start_controllers = context.launch_configurations.get("auto_start_controllers", "true")
     control_mode_override = context.launch_configurations.get("control_mode", "")
     voice_asr_auto_start_str = context.launch_configurations.get("voice_asr_auto_start", "")
 
-    # Normalize use_sim / use_mock to booleans.
     use_sim = parse_bool(use_sim_str, default=False)
-    use_mock = parse_bool(use_mock_str, default=False)
-    # Mutex check lives in the hardware_mock builder so all mock-mode rules
-    # stay in one place; control_mode invariant is enforced later, once the
-    # active mode has been resolved from CLI override + config defaults.
-    validate_mock_mode(use_mock=use_mock, use_sim=use_sim)
-    if use_mock:
-        # Mock pipeline has no controller_manager to spawn into.
-        auto_start_controllers = "false"
 
     logger.info("========== Launch Parameters ==========")
     logger.info(f"robot_config: {robot_config_name}")
     logger.info(f"config_path: {config_path_override if config_path_override else '(none)'}")
     logger.info(f"use_sim: {use_sim} (from '{use_sim_str}')")
-    logger.info(f"use_mock: {use_mock} (from '{use_mock_str}')")
+    logger.info(f"sim_platform: {sim_platform_override if sim_platform_override else '(from config)'}")
     logger.info(f"auto_start_controllers: {auto_start_controllers}")
     logger.info(f"control_mode: {control_mode_override if control_mode_override else '(from config)'}")
     logger.info(f"voice_asr_auto_start: {voice_asr_auto_start_str}")
@@ -313,6 +307,19 @@ def launch_setup(context, *args, **kwargs):
             robot_config_share = str(Path(__file__).parent.parent)
         robot_config["_config_path"] = str(Path(robot_config_share) / "config" / "robots" / f"{robot_config_name}.yaml")
 
+    sim_platform = str(robot_config.get("simulation", {}).get("platform", "gazebo")).lower()
+    if sim_platform_override:
+        logger.info(f"CLI override: simulation.platform={sim_platform_override} (was {sim_platform})")
+        sim_platform = sim_platform_override
+        robot_config.setdefault("simulation", {})["platform"] = sim_platform
+    backend_caps = get_backend_caps(sim_platform) if use_sim else {"provides_clock": False, "needs_ros2_control": True}
+    mock_backend_active = use_sim and sim_platform == "mock"
+    node_use_sim_time = use_sim and backend_caps["provides_clock"]
+    sim_backend_needs_ros2_control = (not use_sim) or backend_caps["needs_ros2_control"]
+    if use_sim and not backend_caps["needs_ros2_control"]:
+        auto_start_controllers = "false"
+        logger.info(f"simulation.platform={sim_platform}: backend does not use ros2_control")
+
     # ========== 3. Apply control mode override ==========
     if control_mode_override:
         robot_config["default_control_mode"] = control_mode_override
@@ -329,6 +336,8 @@ def launch_setup(context, *args, **kwargs):
 
     active_control_mode = robot_config.get("default_control_mode", "model_inference")
     logger.info(f"Active control mode: {active_control_mode}")
+    if mock_backend_active:
+        validate_mock_control_mode(active_control_mode)
 
     _apply_voice_asr_cli_overrides(context, robot_config)
     voice_asr_config = robot_config.get("voice_asr", {})
@@ -372,11 +381,8 @@ def launch_setup(context, *args, **kwargs):
     deferred_sim_spawners = []
     controller_names = []
     robot_description = {}
-    if use_mock:
-        # Validate the resolved control mode against the mock builder's
-        # supported set, then short-circuit the control subsystem.
-        validate_mock_mode(use_mock=use_mock, use_sim=use_sim, active_control_mode=active_control_mode)
-        logger.info("use_mock=true: skipping ros2_control / controller spawners")
+    if not sim_backend_needs_ros2_control:
+        logger.info(f"simulation.platform={sim_platform}: skipping ros2_control / controller spawners")
     else:
         try:
             control_nodes, controller_names, deferred_sim_spawners, robot_description = generate_ros2_control_nodes(
@@ -400,7 +406,6 @@ def launch_setup(context, *args, **kwargs):
     gz_create_entity = None
     if use_sim:
         logger.info("========== Generating Simulation Nodes ==========")
-        sim_platform = robot_config.get("simulation", {}).get("platform", "gazebo")
         logger.info(f"Sim platform: {sim_platform}")
         try:
             sim_adapter = get_sim_backend(sim_platform)
@@ -458,11 +463,9 @@ def launch_setup(context, *args, **kwargs):
 
     # ========== 6. Generate Perception Nodes ==========
     logger.info("========== Generating Perception Nodes ==========")
-    if mock_mode_skips_subsystem(use_mock, "perception"):
-        logger.info("use_mock=true: skipping camera / lidar / virtual-relay / TF nodes")
-        mock_nodes = generate_hardware_mock_nodes(robot_config)
-        actions.extend(mock_nodes)
-        logger.info(f"Added {len(mock_nodes)} hardware_mock node(s)")
+    if mock_mode_skips_subsystem(mock_backend_active, "perception"):
+        logger.info("hardware_mock active: skipping camera / lidar / virtual-relay / TF nodes")
+        logger.info("simulation.platform=mock: contract_mock started by simulation backend")
     else:
         try:
             # Camera nodes (Physical drivers)
@@ -525,8 +528,8 @@ def launch_setup(context, *args, **kwargs):
 
     # ========== 8. Generate Voice ASR Nodes ==========
     logger.info("========== Checking Voice ASR ==========")
-    if mock_mode_skips_subsystem(use_mock, "voice_asr"):
-        logger.info("use_mock=true: skipping voice ASR nodes (out of mock scope)")
+    if mock_mode_skips_subsystem(mock_backend_active, "voice_asr"):
+        logger.info("hardware_mock active: skipping voice ASR nodes (out of mock scope)")
     else:
         try:
             from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
@@ -541,8 +544,8 @@ def launch_setup(context, *args, **kwargs):
 
     # ========== 9. Generate Navigation Nodes ==========
     logger.info("========== Checking Navigation ==========")
-    if mock_mode_skips_subsystem(use_mock, "navigation"):
-        logger.info("use_mock=true: skipping navigation nodes (out of mock scope)")
+    if mock_mode_skips_subsystem(mock_backend_active, "navigation"):
+        logger.info("hardware_mock active: skipping navigation nodes (out of mock scope)")
     else:
         try:
             with_navigation_str = context.launch_configurations.get("with_navigation", "")
@@ -557,7 +560,7 @@ def launch_setup(context, *args, **kwargs):
             if with_navigation:
                 navigation_nodes = generate_navigation_nodes(
                     robot_config,
-                    use_sim=use_sim,
+                    use_sim=node_use_sim_time,
                     navigation_mode=navigation_mode,
                     force_enable=True,
                 )
@@ -578,7 +581,11 @@ def launch_setup(context, *args, **kwargs):
     try:
         if with_inference:
             execution_nodes = generate_execution_nodes(
-                robot_config, active_control_mode, use_sim, cloud_local=cloud_local
+                robot_config,
+                active_control_mode,
+                use_sim,
+                cloud_local=cloud_local,
+                use_sim_time=node_use_sim_time,
             )
             if controller_ready_waiter is not None:
                 logger.info("Deferring execution nodes until required controllers are active...")
@@ -608,7 +615,7 @@ def launch_setup(context, *args, **kwargs):
         if with_moveit:
             from robot_config.launch_builders.moveit import generate_moveit_nodes
 
-            moveit_nodes = generate_moveit_nodes(robot_config, active_control_mode, use_sim, moveit_display)
+            moveit_nodes = generate_moveit_nodes(robot_config, active_control_mode, node_use_sim_time, moveit_display)
 
             if controller_ready_waiter is not None:
                 logger.info("Deferring MoveIt nodes until required controllers are active...")
@@ -627,7 +634,7 @@ def launch_setup(context, *args, **kwargs):
         if with_moveit:
             from robot_config.launch_builders.task_execution import generate_task_executor_node
 
-            task_node = generate_task_executor_node(robot_config, active_control_mode, use_sim)
+            task_node = generate_task_executor_node(robot_config, active_control_mode, node_use_sim_time)
             if task_node is not None:
                 if controller_ready_waiter is not None:
                     controller_dependent_actions.append(task_node)
@@ -722,15 +729,12 @@ def generate_launch_description():
             DeclareLaunchArgument(
                 "use_sim",
                 default_value="false",
-                description="Use simulation mode (skip camera nodes)",
+                description="Use simulation mode; backend comes from robot YAML simulation.platform",
             ),
             DeclareLaunchArgument(
-                "use_mock",
-                default_value="false",
-                description=(
-                    "Run with hardware_mock contract_mock instead of real hardware / Gazebo. "
-                    "Only valid with control_mode=model_inference. Mutually exclusive with use_sim."
-                ),
+                "sim_platform",
+                default_value="",
+                description="Override simulation.platform from YAML (gazebo, mujoco, or mock). Empty uses YAML.",
             ),
             DeclareLaunchArgument(
                 "auto_start_controllers",

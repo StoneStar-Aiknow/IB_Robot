@@ -5,6 +5,7 @@ Usage:
 
     adapter = get_sim_backend("gazebo")      # GazeboAdapter instance
     adapter = get_sim_backend("mujoco")      # MujocoAdapter instance (T6)
+    adapter = get_sim_backend("mock")        # MockAdapter instance
 
 The platform string comes from robot_config['simulation']['platform'] in
 the robot YAML (e.g., so101_single_arm.yaml).
@@ -12,21 +13,39 @@ the robot YAML (e.g., so101_single_arm.yaml).
 
 from .base_adapter import SimBackendAdapter
 from .gazebo_adapter import GazeboAdapter
+from .mock_adapter import MockAdapter
 from .mujoco_adapter import MujocoAdapter
 
-__all__ = ["SimBackendAdapter", "GazeboAdapter", "MujocoAdapter", "get_sim_backend"]
+__all__ = ["SimBackendAdapter", "GazeboAdapter", "MockAdapter", "MujocoAdapter", "get_backend_caps", "get_sim_backend"]
 
 _BACKEND_REGISTRY: dict[str, type[SimBackendAdapter]] = {
     "gazebo": GazeboAdapter,
+    "mock": MockAdapter,
     "mujoco": MujocoAdapter,
 }
+
+
+def get_backend_caps(platform: str) -> dict[str, bool]:
+    """Return backend capabilities used before backend actions are built."""
+    cls = _BACKEND_REGISTRY.get(platform)
+    if cls is None:
+        available = list(_BACKEND_REGISTRY.keys())
+        raise ValueError(
+            f"Unknown sim platform: '{platform}'. "
+            f"Available platforms: {available}. "
+            f"Check simulation.platform in your robot YAML."
+        )
+    return {
+        "provides_clock": bool(cls.provides_clock),
+        "needs_ros2_control": bool(cls.needs_ros2_control),
+    }
 
 
 def get_sim_backend(platform: str) -> SimBackendAdapter:
     """Instantiate a simulation backend adapter by platform name.
 
     Args:
-        platform: Backend identifier, e.g. 'gazebo' or 'mujoco'.
+        platform: Backend identifier, e.g. 'gazebo', 'mujoco', or 'mock'.
                   Must match a key in _BACKEND_REGISTRY.
 
     Returns:

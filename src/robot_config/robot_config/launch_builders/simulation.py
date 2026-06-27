@@ -2,7 +2,8 @@
 
 The actual simulation logic lives in sim_backend/:
   sim_backend/gazebo_adapter.py  — Gazebo Ignition implementation
-  sim_backend/mujoco_adapter.py  — MuJoCo stub (T6)
+  sim_backend/mujoco_adapter.py  — MuJoCo implementation
+  sim_backend/mock_adapter.py    — hardware_mock contract backend
 
 robot.launch.py uses get_sim_backend() directly, reading
 'simulation.platform' from the robot YAML.
