@@ -160,37 +160,37 @@ def _patch_gemma_ada_rmsnorm() -> list[tuple[Any, str, Any]]:
         LOGGER.warning("PiGemmaRMSNorm not found; skipping AdaRMSNorm patch")
         return undo_log
 
-        orig_forward = cls.forward
+    orig_forward = cls.forward
 
-        def _patched_forward(self, x, cond=None, _orig=orig_forward):
-            import torch as _torch
+    def _patched_forward(self, x, cond=None, _orig=orig_forward):
+        import torch as _torch
 
-            dtype = x.dtype
-            normed_inputs = self._norm(x)
+        dtype = x.dtype
+        normed_inputs = self._norm(x)
 
-            if cond is None or self.dense is None:
-                # regular RMSNorm — keep original fp32 weight multiply
-                normed_inputs = normed_inputs * (1.0 + self.weight.float())
-                return normed_inputs.to(dtype), None
+        if cond is None or self.dense is None:
+            # regular RMSNorm — keep original fp32 weight multiply
+            normed_inputs = normed_inputs * (1.0 + self.weight.float())
+            return normed_inputs.to(dtype), None
 
-            # adaptive RMSNorm
-            if cond.shape[-1] != self.cond_dim:
-                raise ValueError(f"Expected cond dimension {self.cond_dim}, got {cond.shape[-1]}")
-            modulation = self.dense(cond)
-            if len(x.shape) == 3:
-                modulation = modulation.unsqueeze(1)
+        # adaptive RMSNorm
+        if cond.shape[-1] != self.cond_dim:
+            raise ValueError(f"Expected cond dimension {self.cond_dim}, got {cond.shape[-1]}")
+        modulation = self.dense(cond)
+        if len(x.shape) == 3:
+            modulation = modulation.unsqueeze(1)
 
-            scale, shift, gate = _torch.chunk(modulation, 3, dim=-1)
+        scale, shift, gate = _torch.chunk(modulation, 3, dim=-1)
 
-            # KEY CHANGE: use model_dtype instead of float32
-            model_dtype = self.dense.weight.dtype
-            normed_inputs = normed_inputs * (1 + scale.to(model_dtype)) + shift.to(model_dtype)
+        # KEY CHANGE: use model_dtype instead of float32
+        model_dtype = self.dense.weight.dtype
+        normed_inputs = normed_inputs * (1 + scale.to(model_dtype)) + shift.to(model_dtype)
 
-            return normed_inputs.to(dtype), gate.to(dtype)
+        return normed_inputs.to(dtype), gate.to(dtype)
 
-        cls.forward = _patched_forward
-        undo_log.append((cls, "forward", orig_forward))
-        LOGGER.info("Patched PiGemmaRMSNorm.forward (AdaRMSNorm fp32→model_dtype)")
+    cls.forward = _patched_forward
+    undo_log.append((cls, "forward", orig_forward))
+    LOGGER.info("Patched PiGemmaRMSNorm.forward (AdaRMSNorm fp32→model_dtype)")
 
     return undo_log
 
@@ -469,40 +469,40 @@ def _patch_gemma_ada_rmsnorm_npu() -> list[tuple[Any, str, Any]]:
         LOGGER.warning("PiGemmaRMSNorm not found; skipping NPU RMSNorm patch")
         return undo_log
 
-        orig_forward = cls.forward
+    orig_forward = cls.forward
 
-        def _patched_forward(self, x, cond=None, _rms=_NpuRmsNormSingle):
-            import torch as _torch
+    def _patched_forward(self, x, cond=None, _rms=_NpuRmsNormSingle):
+        import torch as _torch
 
-            dtype = x.dtype
+        dtype = x.dtype
 
-            if cond is None or self.dense is None:
-                # regular RMSNorm — fold (1 + weight) into the fused gamma.
-                gamma = (1.0 + self.weight.float()).to(dtype)
-                normed = _rms.apply(x, gamma, self.eps)
-                return normed.to(dtype), None
+        if cond is None or self.dense is None:
+            # regular RMSNorm — fold (1 + weight) into the fused gamma.
+            gamma = (1.0 + self.weight.float()).to(dtype)
+            normed = _rms.apply(x, gamma, self.eps)
+            return normed.to(dtype), None
 
-            # adaptive RMSNorm — fuse the core, keep scale/shift/gate separate.
-            if cond.shape[-1] != self.cond_dim:
-                raise ValueError(f"Expected cond dimension {self.cond_dim}, got {cond.shape[-1]}")
+        # adaptive RMSNorm — fuse the core, keep scale/shift/gate separate.
+        if cond.shape[-1] != self.cond_dim:
+            raise ValueError(f"Expected cond dimension {self.cond_dim}, got {cond.shape[-1]}")
 
-            ones = _torch.ones(self.dim, dtype=dtype, device=x.device)
-            normed_inputs = _rms.apply(x, ones, self.eps)
+        ones = _torch.ones(self.dim, dtype=dtype, device=x.device)
+        normed_inputs = _rms.apply(x, ones, self.eps)
 
-            modulation = self.dense(cond)
-            if len(x.shape) == 3:
-                modulation = modulation.unsqueeze(1)
+        modulation = self.dense(cond)
+        if len(x.shape) == 3:
+            modulation = modulation.unsqueeze(1)
 
-            scale, shift, gate = _torch.chunk(modulation, 3, dim=-1)
+        scale, shift, gate = _torch.chunk(modulation, 3, dim=-1)
 
-            model_dtype = self.dense.weight.dtype
-            normed_inputs = normed_inputs * (1 + scale.to(model_dtype)) + shift.to(model_dtype)
+        model_dtype = self.dense.weight.dtype
+        normed_inputs = normed_inputs * (1 + scale.to(model_dtype)) + shift.to(model_dtype)
 
-            return normed_inputs.to(dtype), gate.to(dtype)
+        return normed_inputs.to(dtype), gate.to(dtype)
 
-        cls.forward = _patched_forward
-        undo_log.append((cls, "forward", orig_forward))
-        LOGGER.info("Patched PiGemmaRMSNorm.forward (torch_npu.npu_rms_norm -> NPURmsNorm)")
+    cls.forward = _patched_forward
+    undo_log.append((cls, "forward", orig_forward))
+    LOGGER.info("Patched PiGemmaRMSNorm.forward (torch_npu.npu_rms_norm -> NPURmsNorm)")
 
     return undo_log
 
@@ -714,28 +714,24 @@ def _patch_gemma_eager_attention(
                 attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
 
                 if attention_mask is not None:
-                    # NOTE: original code slices ``attention_mask[:, :, :, :key_len]``
-                    # which produces a dynamic Slice op.  Non-dynamo export
-                    # maps it to StridedSliceD which ATC cannot compile.
-                    # For PI05 the mask is already (B,1,S,S) matching key_len,
-                    # so the slice is a no-op — use the mask directly.
-
-                    # Slice mask to key_len (no-op for VLM where mask==key_len,
-                    # required for AE where key_len < full context length).
-                    key_len = key_states.shape[2]
-                    mask = attention_mask[:, :, :, :key_len]
-                    # MQA broadcast: expand attention_mask to match attn_weights head dim
-                    if mqa_broadcast and key.shape[1] == 1 and mask.shape[1] == 1:
-                        mask = mask.expand(-1, query.shape[1], -1, -1)
-
+                    # PI05 builds the additive mask to exactly (B, 1, Sq, key_len)
+                    # in modeling_pi05_*._prepare_attention_masks_4d, so it already
+                    # matches attn_weights' (B, H, Sq, key_len): the singleton head
+                    # dim broadcasts on the Add, and attention_mask.shape[-1] already
+                    # equals key_states.shape[2].  Do NOT slice to key_len or expand
+                    # the head dim here — both are numerical no-ops, but each emits a
+                    # per-layer Slice + Expand (plus the -1-aware
+                    # Equal/ConstantOfShape/Where shape subgraph) that ATC keeps as
+                    # real ops, materialising a full (B, H, Sq, key_len) mask in every
+                    # one of the 18 expert layers (~0.4ms/inference regression).
                     if fp16_softmax:
                         # Keep the Add in the score (fp16) dtype so no fp32 Cast
                         # is inserted around the (B,H,Sq,Sk) score matrix. The
                         # mask must already use a fp16-safe sentinel
                         # (finfo(fp16).min); -2.38e38 would overflow to -inf.
-                        attn_weights = attn_weights + mask.to(attn_weights.dtype)
+                        attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
                     else:
-                        attn_weights = attn_weights + mask
+                        attn_weights = attn_weights + attention_mask
 
                 if fp16_softmax:
                     attn_weights = nn.functional.softmax(attn_weights, dim=-1).to(query.dtype)
