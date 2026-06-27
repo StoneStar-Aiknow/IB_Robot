@@ -48,7 +48,19 @@ OH_CUSTOM_HUMBLE_TAR_GLOB="${OH_CUSTOM_HUMBLE_TAR_GLOB:-}"
 USE_SUDO=0
 DRY_RUN=0
 PULL_IMAGE=1
-declare -a PACKAGES=("ibrobot_msgs" "tensormsg" "robot_config" "inference_service" "dataset_tools")
+declare -a PACKAGES=(
+    "ibrobot_msgs"
+    "tensormsg"
+    "robot_config"
+    "inference_service"
+    "dataset_tools"
+    "hardware_mock"
+    "action_dispatch"
+    "so101_hardware"
+    "task_dispatch"
+    "robot_moveit"
+    "robot_description"
+)
 declare -a COLCON_ARGS=()
 declare -a CMAKE_ARGS=()
 
@@ -508,9 +520,10 @@ ensure_sysdeps_overlay() {
     local sysdeps_tar=""
     local stage_dir="${OH_CUSTOM_ROOT}/.sysdeps_overlay"
 
-    if [[ -f "${sysroot_usr}/include/python3.12/Python.h" && \
-          -f "${sysroot_usr}/lib/libpython3.12.so" && \
-          -f "${sysroot_usr}/lib/libsframe.a" ]]; then
+    # Check if already overlayed (tinyxml2 is a good canary — it's in sysdeps but not in the base SDK)
+    if [[ -f "${sysroot_usr}/include/tinyxml2.h" && \
+          -f "${sysroot_usr}/lib/libtinyxml2.so" && \
+          -f "${sysroot_usr}/lib/libssl.so" ]]; then
         return
     fi
 
@@ -522,25 +535,25 @@ ensure_sysdeps_overlay() {
         exit 1
     fi
 
-    log_info "Overlaying Python/sframe sysdeps from $(basename "${sysdeps_tar}") into the SDK sysroot..."
+    log_info "Overlaying full sysdeps from $(basename "${sysdeps_tar}") into the SDK sysroot..."
     rm -rf "${stage_dir}"
     mkdir -p "${stage_dir}" "${sysroot_usr}/include" "${sysroot_usr}/lib"
-    tar -xzf "${sysdeps_tar}" -C "${stage_dir}" \
-        out/include/python3.12 \
-        out/include/sframe.h \
-        out/include/sframe-api.h \
-        out/lib/libpython3.12.so \
-        out/lib/libpython3.12.so.1.0 \
-        out/lib/libsframe.a \
-        out/lib/libsframe.la
-    cp -a "${stage_dir}/out/include/python3.12" "${sysroot_usr}/include/"
-    cp -a "${stage_dir}/out/include/sframe.h" "${stage_dir}/out/include/sframe-api.h" "${sysroot_usr}/include/"
-    cp -a "${stage_dir}/out/lib/libpython3.12.so" \
-          "${stage_dir}/out/lib/libpython3.12.so.1.0" \
-          "${stage_dir}/out/lib/libsframe.a" \
-          "${stage_dir}/out/lib/libsframe.la" \
-          "${sysroot_usr}/lib/"
+
+    # The sysdeps tarball has two layouts:
+    #   Full layout:  out/include/...  out/lib/...
+    #   Extract layout: include/...  lib/...  (already stripped)
+    # Detect layout and extract everything
+    if tar tzf "${sysdeps_tar}" 2>/dev/null | grep -q "^out/"; then
+        tar -xzf "${sysdeps_tar}" -C "${stage_dir}" out/include out/lib
+        cp -a "${stage_dir}/out/include/"* "${sysroot_usr}/include/"
+        cp -a "${stage_dir}/out/lib/"* "${sysroot_usr}/lib/"
+    else
+        tar -xzf "${sysdeps_tar}" -C "${stage_dir}" include lib
+        cp -a "${stage_dir}/include/"* "${sysroot_usr}/include/"
+        cp -a "${stage_dir}/lib/"* "${sysroot_usr}/lib/"
+    fi
     rm -rf "${stage_dir}"
+    log_info "  Done. Key libraries: $(ls "${sysroot_usr}/lib/"lib{tinyxml2,ssl,crypto,z,python3.12}*.so 2>/dev/null | wc -l) files"
 }
 
 prepare_root_layout() {
