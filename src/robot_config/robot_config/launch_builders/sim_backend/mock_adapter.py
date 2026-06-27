@@ -18,6 +18,9 @@ logger = get_colored_logger("robot_config.sim_backend.mock")
 class MockAdapter(SimBackendAdapter):
     """Contract-only backend backed by hardware_mock.contract_mock."""
 
+    provides_clock = False
+    needs_ros2_control = False
+
     def start_backend(self, robot_config: dict) -> tuple[list, Any]:
         """Start contract_mock and return no simulator spawn node."""
         logger.info("Starting hardware_mock contract backend")

@@ -581,7 +581,11 @@ def launch_setup(context, *args, **kwargs):
     try:
         if with_inference:
             execution_nodes = generate_execution_nodes(
-                robot_config, active_control_mode, node_use_sim_time, cloud_local=cloud_local
+                robot_config,
+                active_control_mode,
+                use_sim,
+                cloud_local=cloud_local,
+                use_sim_time=node_use_sim_time,
             )
             if controller_ready_waiter is not None:
                 logger.info("Deferring execution nodes until required controllers are active...")

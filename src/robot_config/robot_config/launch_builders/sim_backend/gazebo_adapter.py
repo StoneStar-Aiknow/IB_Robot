@@ -54,6 +54,9 @@ class GazeboAdapter(SimBackendAdapter):
     - Camera image and camera_info bridges per peripheral
     """
 
+    provides_clock = True
+    needs_ros2_control = True
+
     def start_backend(self, robot_config: dict) -> tuple:
         """Launch Gazebo and core infrastructure.
 

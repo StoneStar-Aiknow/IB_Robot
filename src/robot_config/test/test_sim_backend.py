@@ -50,6 +50,8 @@ def test_registry_unknown_raises():
 def test_backend_caps_mock():
     """Mock declares that it has no /clock and no ros2_control manager."""
     assert get_backend_caps("mock") == {"provides_clock": False, "needs_ros2_control": False}
+    assert MockAdapter.provides_clock is False
+    assert MockAdapter.needs_ros2_control is False
 
 
 # ──────────────────────────────────────────────────────────────────────────────

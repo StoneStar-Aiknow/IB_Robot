@@ -298,6 +298,9 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(tmp_path):
     assert len(timed_nodes) == 2
     assert all(_node_parameters(node)["use_sim_time"] is False for node in timed_nodes)
 
+    inference_nodes = [node for node in timed_nodes if node.node_package == "inference_service"]
+    assert _node_parameters(inference_nodes[0])["use_sim"] is True
+
 
 def test_launch_loader_preserves_config_path_for_runtime_consumers():
     robot_config = robot_launch.load_robot_config("lekiwi")

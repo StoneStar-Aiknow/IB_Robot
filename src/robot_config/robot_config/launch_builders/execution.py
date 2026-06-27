@@ -24,6 +24,13 @@ logger = get_colored_logger("robot_config.execution")
 INFERENCE_NODE_NAME = "act_inference_node"
 
 
+def _resolve_use_sim_time(use_sim, use_sim_time=None) -> bool:
+    """Default ROS time source to the simulation flag unless explicitly split."""
+    if use_sim_time is None:
+        use_sim_time = use_sim
+    return parse_bool(use_sim_time, default=False)
+
+
 def _workspace_root() -> Path:
     return Path(os.environ.get("WORKSPACE") or Path(__file__).resolve().parents[4]).resolve()
 
@@ -69,9 +76,9 @@ def _attention_viz_request(inference_config):
     return enabled, mode, viz_config
 
 
-def _generate_attention_viz_node(inference_config, use_sim=False, env=None):
+def _generate_attention_viz_node(inference_config, use_sim_time=False, env=None):
     """Generate the optional attention visualization sidecar node."""
-    is_sim = parse_bool(use_sim, default=False)
+    use_sim_clock = parse_bool(use_sim_time, default=False)
     enabled, mode, viz_config = _attention_viz_request(inference_config)
     if not enabled:
         return None
@@ -102,7 +109,7 @@ def _generate_attention_viz_node(inference_config, use_sim=False, env=None):
             "heatmap_topic_prefix",
             "/visualization/heatmap",
         ),
-        "use_sim_time": is_sim,
+        "use_sim_time": use_sim_clock,
     }
 
     logger.info("✓ Attention visualization sidecar configured")
@@ -120,7 +127,7 @@ def _generate_attention_viz_node(inference_config, use_sim=False, env=None):
     )
 
 
-def generate_inference_node(robot_config, control_mode, use_sim=False, cloud_local=False):
+def generate_inference_node(robot_config, control_mode, use_sim=False, cloud_local=False, use_sim_time=None):
     """Generate inference service node with auto-synthesized contract.
 
     This function:
@@ -133,6 +140,7 @@ def generate_inference_node(robot_config, control_mode, use_sim=False, cloud_loc
         control_mode: Active control mode
         use_sim: Simulation mode flag
         cloud_local: In distributed mode, also launch cloud node locally
+        use_sim_time: Optional ROS clock flag. Defaults to use_sim.
 
     Returns:
         Node action for inference service, or None if not enabled
@@ -160,14 +168,16 @@ def generate_inference_node(robot_config, control_mode, use_sim=False, cloud_loc
             control_mode,
             use_sim,
             cloud_local=cloud_local,
+            use_sim_time=use_sim_time,
         )
 
-    return generate_monolithic_inference_node(robot_config, control_mode, use_sim)
+    return generate_monolithic_inference_node(robot_config, control_mode, use_sim, use_sim_time=use_sim_time)
 
 
-def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False):
+def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False, use_sim_time=None):
     """Generate monolithic (self-contained) inference node."""
     is_sim = parse_bool(use_sim, default=False)
+    use_sim_clock = _resolve_use_sim_time(use_sim, use_sim_time)
 
     control_modes = robot_config.get("control_modes", {})
     mode_config = control_modes[control_mode]
@@ -211,7 +221,7 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
 
     attention_viz_node = _generate_attention_viz_node(
         inference_config,
-        use_sim,
+        use_sim_clock,
         env=env,
     )
     publish_attention = (
@@ -247,7 +257,7 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
         "passive_mode": True,
         "device": model_config.get("device", "auto"),
         "use_sim": is_sim,
-        "use_sim_time": is_sim,
+        "use_sim_time": use_sim_clock,
         "node_name": INFERENCE_NODE_NAME,
         "execution_mode": execution_mode,
         "request_timeout": request_timeout,
@@ -270,7 +280,9 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
     return inference_node
 
 
-def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=False, cloud_local=False):
+def generate_distributed_inference_nodes(
+    robot_config, control_mode, use_sim=False, cloud_local=False, use_sim_time=None
+):
     """Generate distributed inference nodes.
 
     By default only the edge proxy node is generated here. The cloud
@@ -285,11 +297,13 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
         control_mode: Active control mode
         use_sim: Simulation mode flag
         cloud_local: If True, also launch cloud node locally (single-machine test)
+        use_sim_time: Optional ROS clock flag. Defaults to use_sim.
 
     Returns:
         List of Node actions
     """
     is_sim = parse_bool(use_sim, default=False)
+    use_sim_clock = _resolve_use_sim_time(use_sim, use_sim_time)
 
     control_modes = robot_config.get("control_modes", {})
     mode_config = control_modes[control_mode]
@@ -360,7 +374,7 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
         "passive_mode": True,
         "device": model_config.get("device", "auto"),
         "use_sim": is_sim,
-        "use_sim_time": is_sim,
+        "use_sim_time": use_sim_clock,
         "node_name": INFERENCE_NODE_NAME,
         "execution_mode": "distributed",
         "request_timeout": request_timeout,
@@ -388,7 +402,7 @@ def generate_distributed_inference_nodes(robot_config, control_mode, use_sim=Fal
             "input_topic": cloud_inference_topic,
             "output_topic": cloud_result_topic,
             "device": model_config.get("device", "auto"),
-            "use_sim_time": is_sim,
+            "use_sim_time": use_sim_clock,
         }
 
         cloud_node = Node(
@@ -547,7 +561,9 @@ def generate_robot_evaluate_node(robot_config, control_mode, use_sim=False):
     return robot_evaluate_node
 
 
-def generate_execution_nodes(robot_config, control_mode="model_inference", use_sim=False, cloud_local=False):
+def generate_execution_nodes(
+    robot_config, control_mode="model_inference", use_sim=False, cloud_local=False, use_sim_time=None
+):
     """Generate all execution nodes (inference + dispatcher).
 
     This is the main entry point for execution system generation.
@@ -559,6 +575,7 @@ def generate_execution_nodes(robot_config, control_mode="model_inference", use_s
         control_mode: Active control mode (defaults to robot's default_control_mode)
         use_sim: Simulation mode flag
         cloud_local: In distributed mode, also launch cloud node locally
+        use_sim_time: Optional ROS clock flag. Defaults to use_sim.
 
     Returns:
         List of Node actions for execution system
@@ -569,7 +586,13 @@ def generate_execution_nodes(robot_config, control_mode="model_inference", use_s
         control_mode = robot_config.get("default_control_mode", "model_inference")
 
     try:
-        inference_result = generate_inference_node(robot_config, control_mode, use_sim, cloud_local=cloud_local)
+        inference_result = generate_inference_node(
+            robot_config,
+            control_mode,
+            use_sim,
+            cloud_local=cloud_local,
+            use_sim_time=use_sim_time,
+        )
         if inference_result:
             if isinstance(inference_result, list):
                 nodes.extend(inference_result)
@@ -580,7 +603,11 @@ def generate_execution_nodes(robot_config, control_mode="model_inference", use_s
 
     try:
         # Use unified action dispatcher (navigation_mode is set via executor config).
-        dispatcher_node = generate_action_dispatcher_node(robot_config, control_mode, use_sim)
+        dispatcher_node = generate_action_dispatcher_node(
+            robot_config,
+            control_mode,
+            _resolve_use_sim_time(use_sim, use_sim_time),
+        )
         nodes.append(dispatcher_node)
     except Exception as e:
         logger.error(f"generating dispatcher node: {e}")

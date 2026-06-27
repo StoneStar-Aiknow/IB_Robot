@@ -27,6 +27,9 @@ class SimBackendAdapter(ABC):
     to the main launch description by robot.launch.py.
     """
 
+    provides_clock: bool = True
+    needs_ros2_control: bool = True
+
     @abstractmethod
     def start_backend(self, robot_config: dict) -> tuple[list, Any]:
         """Launch the simulator process and core infrastructure.

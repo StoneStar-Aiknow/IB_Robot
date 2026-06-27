@@ -24,24 +24,21 @@ _BACKEND_REGISTRY: dict[str, type[SimBackendAdapter]] = {
     "mujoco": MujocoAdapter,
 }
 
-_BACKEND_CAPS: dict[str, dict[str, bool]] = {
-    "gazebo": {"provides_clock": True, "needs_ros2_control": True},
-    "mock": {"provides_clock": False, "needs_ros2_control": False},
-    "mujoco": {"provides_clock": True, "needs_ros2_control": True},
-}
-
 
 def get_backend_caps(platform: str) -> dict[str, bool]:
     """Return backend capabilities used before backend actions are built."""
-    caps = _BACKEND_CAPS.get(platform)
-    if caps is None:
-        available = list(_BACKEND_CAPS.keys())
+    cls = _BACKEND_REGISTRY.get(platform)
+    if cls is None:
+        available = list(_BACKEND_REGISTRY.keys())
         raise ValueError(
             f"Unknown sim platform: '{platform}'. "
             f"Available platforms: {available}. "
             f"Check simulation.platform in your robot YAML."
         )
-    return dict(caps)
+    return {
+        "provides_clock": bool(cls.provides_clock),
+        "needs_ros2_control": bool(cls.needs_ros2_control),
+    }
 
 
 def get_sim_backend(platform: str) -> SimBackendAdapter:
