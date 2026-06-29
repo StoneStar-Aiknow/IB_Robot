@@ -115,6 +115,22 @@ ros2 launch inference_service cloud_inference.launch.py \
 `["policy", "worker"]`. Preprocessing, postprocessing, ROS topics, and
 distributed transport remain the existing `inference_service` pipeline.
 
+The `ascend_om_3403` worker must support `--model <om_path>`. Legacy `SVP_*`
+environment variables are no longer passed to the worker, so stale shell state
+cannot select a different model or layout. Use `config.om.json` instead:
+
+| Legacy environment variable | Replacement |
+| --- | --- |
+| `SVP_MODEL_PATH` | `config.om.json` `artifacts.policy` |
+| `SVP_WORKER_EXECUTABLE` / `SVP_CPP_EXECUTABLE` | `config.om.json` `artifacts.worker` |
+| `SVP_IMAGE_HEIGHT` / `SVP_IMAGE_WIDTH` | derived from `config.json` `input_features.<image_key>.shape` (optional `backend_config.image_height`/`image_width` override) |
+| `SVP_PERF_LOG` / `SVP_PERF_LOG_EVERY` | `config.om.json` `backend_config.perf_enabled` / `backend_config.perf_log_every` |
+| `SVP_WORKER_GRACEFUL_CLOSE_TIMEOUT` / `SVP_WORKER_FORCE_CLOSE` | `config.om.json` `backend_config.graceful_close_timeout` / `backend_config.force_close` |
+
+The action dimension still comes from LeRobot `config.json`
+`output_features.action.shape`. Worker output index, layout, and legacy stride
+belong to the compiled artifact sidecar under `config.om.json` `backend_config`.
+
 For RK3588 / OpenHarmony boards running RKNN Lite, switch the cloud node to:
 
 ```bash
@@ -137,7 +153,9 @@ internal `CompiledPolicyWrapper` facade:
 - `ACTCompiledAdapter` and `PI05CompiledAdapter` read `type`, `input_features`,
   and `output_features` from `config.json` and own model-family input ordering,
   image/language inputs, action chunk decoding, `policy_type`, and chunk-size
-  semantics.
+  semantics. For SD3403 ACT, it consumes the direct worker action tensor, such
+  as output index 1 with shape `(1, chunk_size, action_dim)`. The SD3403 worker
+  already packs only the logical action dims, with no stride padding.
 - `OMRuntimeSession`, `PI05OMRuntimeSession`, `SD3403RuntimeSession`, and
   `RKNNRuntimeSession` own backend artifact resolution, runtime loading,
   execution, and resource cleanup.
@@ -170,6 +188,42 @@ serial pipeline through `execution`:
   "execution": ["vlm", "action_expert"]
 }
 ```
+
+SD3403 worker backends can also declare worker IO bindings and runtime options
+in `backend_config`:
+
+```json
+{
+  "schema_version": 1,
+  "policy_type": "act",
+  "backend": "ascend_om_3403",
+  "artifact_dir": "om",
+  "artifacts": {
+    "policy": "act.om",
+    "worker": "main"
+  },
+  "execution": ["policy", "worker"],
+  "backend_config": {
+    "action_output": {"index": 1, "layout": "direct"},
+    "perf_enabled": false,
+    "perf_log_every": 1,
+    "graceful_close_timeout": 5.0,
+    "force_close": true
+  }
+}
+```
+
+`backend_config` is backend-private. `action_output` describes the direct action
+output layout returned by the worker — the SD3403 worker already packs only the
+logical action dims (e.g. `(1, 100, 6)`), with no stride padding.
+
+> [!note] Image resolution is derived from `config.json`, not `backend_config`
+> Image height/width is the model's input contract, recorded in `config.json`
+> `input_features.<image_key>.shape` (e.g. `[3, 480, 640]`) and baked into the OM
+> via ATC `--input_shape`. The runtime derives resize targets from that shape, so
+> it does not need to be redeclared in `backend_config`. To override (e.g. for
+> debugging) you may still set `image_height`/`image_width` in `backend_config`,
+> but `input_features` takes precedence.
 
 Single-OM ACT policies use `artifacts.policy` with `execution: ["policy"]`. OM
 artifacts are no longer read from LeRobot `config.json`, environment variables,
