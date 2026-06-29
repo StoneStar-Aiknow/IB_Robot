@@ -183,7 +183,6 @@ def _compiled_backend_config(config: dict[str, Any]) -> dict[str, Any]:
     return _as_optional_dict(config.get(COMPILED_BACKEND_CONFIG_KEY), COMPILED_BACKEND_CONFIG_KEY)
 
 
-
 def _attach_compiled_backend_config(path: str, backend: str, config: dict[str, Any]) -> dict[str, Any]:
     if normalize_backend_name(backend) != "ascend_om_3403":
         return config

@@ -140,12 +140,32 @@ def test_act_decodes_om_action_chunk():
     assert action.shape == (2, 6)
 
 
-def test_act_decodes_sd3403_crop_and_updates_chunk_size():
+def test_act_decodes_sd3403_direct_action_shape():
     adapter = ACTCompiledAdapter.from_config(_act_config(chunk_size=1), "ascend_om_3403")
-    action = adapter.decode_outputs([np.arange(16, dtype=np.float32)], torch.device("cpu"))
+    action = adapter.decode_outputs([np.zeros((1, 100, 6), dtype=np.float32)], torch.device("cpu"))
+
+    assert action.shape == (100, 6)
+    assert adapter.get_chunk_size() == 100
+
+
+def test_act_decodes_sd3403_direct_action_updates_chunk_size():
+    adapter = ACTCompiledAdapter.from_config(_act_config(chunk_size=1), "ascend_om_3403")
+    action = adapter.decode_outputs([np.zeros((1, 2, 6), dtype=np.float32)], torch.device("cpu"))
 
     assert action.shape == (2, 6)
     assert adapter.get_chunk_size() == 2
+
+
+def test_act_decodes_sd3403_direct_action_from_readonly_buffer():
+    adapter = ACTCompiledAdapter.from_config(_act_config(chunk_size=1), "ascend_om_3403")
+    source = np.frombuffer(np.zeros((1, 100, 6), dtype=np.float32).tobytes(), dtype=np.float32).reshape(1, 100, 6)
+
+    assert not source.flags.writeable
+
+    action = adapter.decode_outputs([source], torch.device("cpu"))
+
+    assert action.shape == (100, 6)
+    assert action.data_ptr() != source.__array_interface__["data"][0]
 
 
 def test_pi05_adapter_prepares_runtime_inputs_and_slices_padding():
@@ -189,6 +209,36 @@ def test_compiled_wrapper_reports_metadata_and_runtime_device(tmp_path):
     assert wrapper.policy_type == "act"
     assert wrapper.backend_type == "rknn"
     assert wrapper.uses_action_chunking is True
+
+
+def test_compiled_wrapper_passes_backend_config_to_sd3403_adapter(tmp_path):
+    _write_policy(
+        tmp_path,
+        _act_config(
+            input_features={"observation.state": {"shape": [3]}},
+        ),
+    )
+    _write_manifest(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "policy_type": "act",
+            "backend": "ascend_om_3403",
+            "artifacts": {"policy": "act.om", "worker": "main"},
+            "execution": ["policy", "worker"],
+            "backend_config": {
+                "action_output": {"index": 1, "layout": "direct"},
+            },
+        },
+    )
+    runtime = FakeRuntimeSession(output=np.zeros((1, 2, 6), dtype=np.float32))
+    wrapper = CompiledPolicyWrapper("ascend_om_3403", runtime_session=runtime)
+
+    wrapper.load(str(tmp_path), torch.device("cpu"))
+    action = wrapper.infer({"observation.state": torch.ones(3)})
+
+    assert action.shape == (2, 6)
+    assert runtime.loaded[1]["_compiled_backend_config"]["action_output"]["index"] == 1
 
 
 def test_compiled_wrapper_requires_config_json(tmp_path):
@@ -235,6 +285,71 @@ def test_manifest_resolves_single_om_policy_role(tmp_path):
     manifest = load_compiled_manifest(str(tmp_path), "ascend_om", "act")
 
     assert resolve_om_model_path(str(tmp_path), _act_config(), manifest) == model.resolve()
+    assert manifest.backend_config == {}
+
+
+def test_manifest_parses_backend_config(tmp_path):
+    model = tmp_path / "act.om"
+    worker = tmp_path / "main"
+    model.write_bytes(b"om")
+    worker.write_bytes(b"")
+    _write_manifest(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "policy_type": "act",
+            "backend": "ascend_om_3403",
+            "artifacts": {"policy": "act.om", "worker": "main"},
+            "execution": ["policy", "worker"],
+            "backend_config": {
+                "action_output": {"index": 1, "layout": "direct"},
+            },
+        },
+    )
+
+    manifest = load_compiled_manifest(str(tmp_path), "ascend_om_3403", "act")
+
+    assert manifest.backend_config["action_output"]["index"] == 1
+
+
+def test_manifest_rejects_non_object_backend_config(tmp_path):
+    model = tmp_path / "act.om"
+    worker = tmp_path / "main"
+    model.write_bytes(b"om")
+    worker.write_bytes(b"")
+    _write_manifest(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "policy_type": "act",
+            "backend": "ascend_om_3403",
+            "artifacts": {"policy": "act.om", "worker": "main"},
+            "backend_config": ["invalid"],
+        },
+    )
+
+    with pytest.raises(ValueError, match="backend_config must be a JSON object"):
+        load_compiled_manifest(str(tmp_path), "ascend_om_3403", "act")
+
+
+def test_manifest_rejects_unknown_sd3403_output_layout(tmp_path):
+    model = tmp_path / "act.om"
+    worker = tmp_path / "main"
+    model.write_bytes(b"om")
+    worker.write_bytes(b"")
+    _write_manifest(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "policy_type": "act",
+            "backend": "ascend_om_3403",
+            "artifacts": {"policy": "act.om", "worker": "main"},
+            "backend_config": {"action_output": {"index": 1, "layout": "packed"}},
+        },
+    )
+
+    with pytest.raises(ValueError, match="backend_config.action_output.layout"):
+        load_compiled_manifest(str(tmp_path), "ascend_om_3403", "act")
 
 
 def test_manifest_resolves_pi05_roles_and_execution(tmp_path):
@@ -362,3 +477,206 @@ def test_sd3403_runtime_uses_worker_public_array_api():
 
     assert session._worker.inputs is inputs
     assert outputs[0].shape == (16,)
+
+
+def test_sd3403_runtime_passes_config_to_worker(monkeypatch, tmp_path):
+    model = tmp_path / "om" / "act.om"
+    worker = tmp_path / "om" / "main"
+    model.parent.mkdir()
+    model.write_bytes(b"om")
+    worker.write_bytes(b"")
+    worker.chmod(0o755)
+    _write_manifest(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "policy_type": "act",
+            "backend": "ascend_om_3403",
+            "artifact_dir": "om",
+            "artifacts": {"policy": "act.om", "worker": "main"},
+            "execution": ["policy", "worker"],
+            "backend_config": {
+                "action_output": {"index": 3, "layout": "direct"},
+                "image_height": 360,
+                "image_width": 640,
+                "perf_enabled": False,
+                "perf_log_every": 5,
+                "graceful_close_timeout": 2.5,
+                "force_close": False,
+            },
+        },
+    )
+    config = _act_config(
+        output_features={"action": {"shape": [9]}},
+    )
+    calls = {}
+
+    class FakePolicy:
+        def __init__(self, worker_path, model_path, **kwargs):
+            calls["worker_path"] = worker_path
+            calls["model_path"] = model_path
+            calls["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        "inference_service.core.ascend_om.ACTWrapper_3403.ACT3403Policy",
+        FakePolicy,
+    )
+
+    session = SD3403RuntimeSession()
+    session.load(str(tmp_path), config, torch.device("cpu"))
+
+    assert calls["worker_path"] == str(worker.resolve())
+    assert calls["model_path"] == str(model.resolve())
+    assert calls["kwargs"]["action_dim"] == 9
+    assert calls["kwargs"]["action_output_index"] == 3
+    assert calls["kwargs"]["image_height"] == 360
+    assert calls["kwargs"]["image_width"] == 640
+    assert calls["kwargs"]["perf_enabled"] is False
+    assert calls["kwargs"]["perf_log_every"] == 5
+    assert calls["kwargs"]["graceful_close_timeout"] == 2.5
+    assert calls["kwargs"]["force_close"] is False
+
+
+def test_sd3403_runtime_keeps_legacy_config_fallback(monkeypatch, tmp_path):
+    model = tmp_path / "om" / "act.om"
+    worker = tmp_path / "om" / "main"
+    model.parent.mkdir()
+    model.write_bytes(b"om")
+    worker.write_bytes(b"")
+    worker.chmod(0o755)
+    _write_manifest(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "policy_type": "act",
+            "backend": "ascend_om_3403",
+            "artifact_dir": "om",
+            "artifacts": {"policy": "act.om", "worker": "main"},
+            "execution": ["policy", "worker"],
+        },
+    )
+    config = _act_config(
+        output_features={"action": {"shape": [7]}},
+        sd3403_action_output_index=4,
+        sd3403_image_height=300,
+        sd3403_image_width=500,
+        sd3403_perf_enabled=False,
+        sd3403_perf_log_every=4,
+        sd3403_graceful_close_timeout=1.5,
+        sd3403_force_close=False,
+    )
+    calls = {}
+
+    class FakePolicy:
+        def __init__(self, worker_path, model_path, **kwargs):
+            del worker_path, model_path
+            calls["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        "inference_service.core.ascend_om.ACTWrapper_3403.ACT3403Policy",
+        FakePolicy,
+    )
+
+    session = SD3403RuntimeSession()
+    session.load(str(tmp_path), config, torch.device("cpu"))
+
+    assert calls["kwargs"]["action_dim"] == 7
+    assert calls["kwargs"]["action_output_index"] == 4
+    assert calls["kwargs"]["image_height"] == 300
+    assert calls["kwargs"]["image_width"] == 500
+    assert calls["kwargs"]["perf_enabled"] is False
+    assert calls["kwargs"]["perf_log_every"] == 4
+    assert calls["kwargs"]["graceful_close_timeout"] == 1.5
+    assert calls["kwargs"]["force_close"] is False
+
+
+def test_sd3403_runtime_image_dims_from_input_features(monkeypatch, tmp_path):
+    """Image height/width must be derived from config.json input_features.<image>.shape,
+    taking precedence over any backend_config.image_height/image_width override."""
+    model = tmp_path / "om" / "act.om"
+    worker = tmp_path / "om" / "main"
+    model.parent.mkdir()
+    model.write_bytes(b"om")
+    worker.write_bytes(b"")
+    worker.chmod(0o755)
+    _write_manifest(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "policy_type": "act",
+            "backend": "ascend_om_3403",
+            "artifact_dir": "om",
+            "artifacts": {"policy": "act.om", "worker": "main"},
+            "execution": ["policy", "worker"],
+            # backend_config sets a DIFFERENT resolution; input_features must win.
+            "backend_config": {"image_height": 240, "image_width": 320},
+        },
+    )
+    config = _act_config(
+        input_features={
+            "observation.state": {"shape": [6]},
+            "observation.images.top": {"shape": [3, 480, 640]},
+            "observation.images.wrist": {"shape": [3, 480, 640]},
+        },
+    )
+    calls = {}
+
+    class FakePolicy:
+        def __init__(self, worker_path, model_path, **kwargs):
+            del worker_path, model_path
+            calls["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        "inference_service.core.ascend_om.ACTWrapper_3403.ACT3403Policy",
+        FakePolicy,
+    )
+
+    session = SD3403RuntimeSession()
+    session.load(str(tmp_path), config, torch.device("cpu"))
+
+    # Derived from input_features shape [3, 480, 640], NOT backend_config 240x320.
+    assert calls["kwargs"]["image_height"] == 480
+    assert calls["kwargs"]["image_width"] == 640
+
+
+def test_sd3403_runtime_accepts_flat_backend_config_aliases(monkeypatch, tmp_path):
+    model = tmp_path / "om" / "act.om"
+    worker = tmp_path / "om" / "main"
+    model.parent.mkdir()
+    model.write_bytes(b"om")
+    worker.write_bytes(b"")
+    worker.chmod(0o755)
+    _write_manifest(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "policy_type": "act",
+            "backend": "ascend_om_3403",
+            "artifact_dir": "om",
+            "artifacts": {"policy": "act.om", "worker": "main"},
+            "execution": ["policy", "worker"],
+            "backend_config": {
+                "action_output_index": 5,
+            },
+        },
+    )
+    config = _act_config(
+        output_features={"action": {"shape": [7]}},
+        sd3403_action_output_index=3,
+    )
+    calls = {}
+
+    class FakePolicy:
+        def __init__(self, worker_path, model_path, **kwargs):
+            del worker_path, model_path
+            calls["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        "inference_service.core.ascend_om.ACTWrapper_3403.ACT3403Policy",
+        FakePolicy,
+    )
+
+    session = SD3403RuntimeSession()
+    session.load(str(tmp_path), config, torch.device("cpu"))
+
+    assert calls["kwargs"]["action_output_index"] == 5
