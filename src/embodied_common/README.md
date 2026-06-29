@@ -56,7 +56,9 @@ ibrobot_msgs / rclpy
 
 `DEFAULT_SKILL_TEMPLATES` 是最小闭环的默认 fallback，不是最终机器人级 SSOT。
 
-后续如果 `robot_config` 增加 `embodied` 配置段和 launch builder，应优先由 launch 从机器人 YAML 注入：
+当前 `robot_config` 已提供 `embodied` 配置段，机器人级 skill templates、命名位姿、
+命名目标、workspace 边界和感知相机 topic 均由 `robot_config` YAML 作为单一事实来源
+管理。运行时由 `embodied_bringup` 从该 YAML 读取并注入到下游具身节点参数：
 
 - skill templates
 - named poses
@@ -64,4 +66,5 @@ ibrobot_msgs / rclpy
 - workspace limits
 - perception camera topics
 
-在完成该集成前，`embodied_common` 只提供安全可运行的默认值，保证独立节点调试时不会因为缺少 launch 注入而完全不可用。
+`embodied_common` 只提供安全可运行的默认值，保证独立节点调试时不会因为缺少 launch
+注入而完全不可用；一旦通过 `embodied_bringup` 启动，YAML 注入值会覆盖默认值。

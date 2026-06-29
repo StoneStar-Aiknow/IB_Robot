@@ -320,6 +320,95 @@ ros2 launch robot_config robot.launch.py \
 `voice_asr_service` 的包级默认值与 `robot_config` 中的 `VoiceASRConfig` 默认值保持同步；
 具体机器人仍应以 `config/robots/<robot>.yaml` 中的 `robot.voice_asr` 为准。
 
+### 具身 AI 流水线（Embodied AI Pipeline）
+
+`robot_config` 通过 `robot.embodied` 字段统一管理具身 AI 链路配置，但不直接启动
+具身业务节点。完整运行时由 `embodied_bringup` 消费同一份 YAML 并编排下游节点，
+以保持依赖方向为 `embodied_bringup -> robot_config`。
+
+**前提条件**：具身流水线当前只在 `moveit_planning` 控制模式下可用。
+
+#### 启动参数
+
+| Launch 参数 | 作用 |
+| --- | --- |
+| `with_embodied` | 在 `robot_config` 基础 launch 中仅保留兼容覆盖；完整具身链路请使用 `embodied_bringup` |
+
+```bash
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
+  robot_config:=so101_single_arm \
+  control_mode:=moveit_planning \
+  use_sim:=true \
+  moveit_display:=false
+```
+
+#### YAML 配置结构
+
+```yaml
+embodied:
+  enabled: false              # 默认关闭；通过 embodied_bringup launch 临时开启
+  debug_tracing: true
+
+  timeouts:
+    task_budget_sec: 180.0         # 任务端到端总预算
+    scene_freshness_sec: 0.5       # 图像/深度新鲜度门槛
+    model_idle_timeout_sec: 120.0  # 大模型输出空闲超时
+    rpc_timeout_sec: 5.0           # action/server/service 统一 RPC 超时
+    gripper_settle_sec: 1.5        # 夹爪稳定等待时间
+
+  planner:
+    mode: vlm_api             # rule / vlm_api / hybrid
+    scene_sources:
+      primary_camera_topic: /camera/front_camera/color/image_raw
+      primary_camera_info_topic: /camera/front_camera/color/camera_info
+      primary_aligned_depth_topic: /camera/front_camera/aligned_depth_to_color/image_raw
+      primary_pointcloud_topic: /camera/front_camera/depth/color/points
+      ee_pose_topic: /robot_status/ee_pose
+      joint_state_topic: /joint_states
+      require_depth: true
+      require_pointcloud: false
+    vlm_api:
+      provider: openai_compatible
+      base_url: http://localhost:8000/v1
+      model: Qwen3.5-9B
+      api_key_env: ""
+
+  execution:
+    relative_motion_reference_frame: base
+    relative_motion_step_m: 0.03
+    relative_motion_direction_mapping:
+      forward:  [1, 0, 0]
+      backward: [-1, 0, 0]
+      left:     [0, 1, 0]
+      right:    [0, -1, 0]
+      up:       [0, 0, 1]
+      down:     [0, 0, -1]
+
+  safety:
+    workspace:
+      x: [-0.05, 0.45]
+      y: [-0.35, 0.35]
+      z: [0.05, 0.55]
+
+  named_poses:
+    home:           {position: {x: 0.15, y: 0.0, z: 0.30}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+    observe_table:  {position: {x: 0.20, y: 0.0, z: 0.35}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+
+  named_targets:
+    demo_object:
+      observe_pose:  {position: {x: 0.25, y: 0.0, z: 0.26}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+      pregrasp_pose: {position: {x: 0.25, y: 0.0, z: 0.16}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+      grasp_pose:    {position: {x: 0.25, y: 0.0, z: 0.10}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+      lift_pose:     {position: {x: 0.25, y: 0.0, z: 0.25}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+```
+
+更多具身节点说明，详见各子包 README：
+- [`embodied_agent`](../embodied_agent/README.md)
+- [`vlm_task_planner`](../vlm_task_planner/README.md)
+- [`perception_service`](../perception_service/README.md)
+- [`skill_library`](../skill_library/README.md)
+- [`safety_guard`](../safety_guard/README.md)
+
 #### 2. moveit_planning 模式（轨迹规划控制）
 
 **适用于：** 基于规划的模型（VoxPoser、VLM、目标条件化）

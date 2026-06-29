@@ -5,12 +5,24 @@ from embodied_agent.task_context import load_task_context
 from embodied_agent.task_entry_node import build_direct_planned_task
 
 
-def test_parse_pick_and_place_command():
-    plan = parse_text_command("抓取目标物并放到右侧托盘")
-    assert plan.task_type == "pick_and_place"
-    assert plan.target_name == "demo_object"
-    assert plan.place_name == "tray_right"
-    assert plan.skill_sequence == ["pick_named_target", "place_named_pose"]
+@pytest.mark.parametrize(
+    "text",
+    [
+        "抓取目标物并放到右侧托盘",
+        "抓香蕉",
+        "观察香蕉",
+        "把夹爪移动到香蕉的上面",
+        "把夹爪往靠近香蕉的方向移动",
+        "把香蕉抬起来",
+        "从香蕉旁边后撤",
+        "在右侧托盘松开夹爪",
+        "放到右侧托盘",
+    ],
+)
+def test_parse_target_and_grasp_commands_are_disabled(text):
+    plan = parse_text_command(text)
+    assert plan.task_type == "unknown"
+    assert not plan.skill_sequence
 
 
 def test_parse_observe_command():
@@ -19,11 +31,18 @@ def test_parse_observe_command():
     assert plan.skill_sequence == ["inspect_scene"]
 
 
-def test_parse_target_observe_command():
-    plan = parse_text_command("观察香蕉")
-    assert plan.task_type == "observe_target_area"
-    assert plan.target_name == "banana"
-    assert plan.skill_sequence == ["observe_target_area"]
+@pytest.mark.parametrize(
+    ("text", "task_type", "skill_name"),
+    [
+        ("原位", "recover_safe_pose", "recover_safe_pose"),
+        ("观察点", "observe_scene", "inspect_scene"),
+        ("零点", "recover_zero_pose", "recover_zero_pose"),
+    ],
+)
+def test_parse_named_pose_keywords(text, task_type, skill_name):
+    plan = parse_text_command(text)
+    assert plan.task_type == task_type
+    assert plan.skill_sequence == [skill_name]
 
 
 @pytest.mark.parametrize(
@@ -78,34 +97,18 @@ def test_parse_unknown_command():
     assert not plan.skill_sequence
 
 
-@pytest.mark.parametrize(
-    ("text", "task_type", "skill_name"),
-    [
-        ("把夹爪移动到香蕉的上面", "hover_named_target", "hover_named_target"),
-        ("把夹爪往靠近香蕉的方向移动", "approach_named_target", "approach_named_target"),
-        ("把香蕉抬起来", "lift_named_target", "lift_named_target"),
-        ("从香蕉旁边后撤", "retreat_from_target", "retreat_from_target"),
-        ("在右侧托盘松开夹爪", "release_at_named_pose", "release_at_named_pose"),
-    ],
-)
-def test_parse_basic_operation_commands(text, task_type, skill_name):
-    plan = parse_text_command(text)
-    assert plan.task_type == task_type
-    assert plan.skill_sequence == [skill_name]
-
-
 def test_build_direct_planned_task_keeps_skill_sequence_in_context():
-    plan = parse_text_command("把夹爪移动到香蕉的上面")
+    plan = parse_text_command("回原位")
     task = build_direct_planned_task(
         task_id="task-demo",
         source="voice_asr",
-        raw_command="把夹爪移动到香蕉的上面",
+        raw_command="回原位",
         plan=plan,
         timeout_sec=30.0,
     )
     assert task.task_id == "task-demo"
-    assert task.task_type == "hover_named_target"
-    assert task.target_name == "banana"
+    assert task.task_type == "recover_safe_pose"
+    assert task.target_name == ""
     context = load_task_context(task.context_json)
-    assert context["skill_sequence"] == ["hover_named_target"]
+    assert context["skill_sequence"] == ["recover_safe_pose"]
     assert context["timeout_context"]["task_timeout_sec"] == 30.0

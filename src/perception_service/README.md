@@ -22,10 +22,10 @@
 如果启用了 RealSense / RGB-D，则当前链路也支持：
 
 ```text
-/camera/front/image_raw
-  + /camera/front/camera_info
-  + /camera/front/aligned_depth_to_color/image_raw
-  + /camera/front/depth/color/points
+/camera/front_camera/color/image_raw
+  + /camera/front_camera/color/camera_info
+  + /camera/front_camera/aligned_depth_to_color/image_raw
+  + /camera/front_camera/depth/color/points
   + /joint_states
   + /robot_status/ee_pose
   -> perception_service_node

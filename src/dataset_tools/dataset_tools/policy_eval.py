@@ -620,6 +620,15 @@ def _run_capture(args: argparse.Namespace) -> None:
             records.append(record)
             if not record.success and args.failure_policy == "stop":
                 break
+            if (len(records) % 50) == 0 or len(records) == 1:
+                total = len(frames)
+                pct = 100.0 * len(records) / total if total else 0.0
+                latency_str = f" latency={record.inference_latency_ms:.0f}ms" if record.inference_latency_ms else ""
+                print(
+                    f"  [{len(records)}/{total}] {pct:.0f}% "
+                    f"frame={record.frame_index} status={record.status}{latency_str}",
+                    flush=True,
+                )
     finally:
         node.destroy_node()
         rclpy.shutdown()

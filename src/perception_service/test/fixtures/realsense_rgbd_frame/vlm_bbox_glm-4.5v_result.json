@@ -1,0 +1,73 @@
+{
+  "raw_response": "\n{\"scene_summary\": \"场景为木质桌面环境，桌面上分布着多个物体，包括一颗红色仿真草莓、一个白色长方体、一个黑色小方块及一根电线，机械臂末端（橙色部件）靠近草莓区域。\", \"visible_objects\": [\"草莓\", \"白色长方体\", \"黑色小方块\", \"电线\"], \"robot_state_summary\": \"未提供关节状态与末端执行器（EE）具体姿态数据，从视觉信息推测机械臂末端处于接近草莓的操作位姿附近。\", \"ee_pose_interpretation\": \"机械臂末端（橙色部件）靠近草莓，呈现潜在操作姿态，但缺乏深度信息难以精准判断操作可行性。\", \"risks\": [\"物体稳定性未知（如草莓是否易滑动）\"], \"confidence\": \"中等（物体视觉特征明确，但缺乏深度与力学信息支撑完整风险评估）\", \"objects\": [{\"label\": \"草莓\", \"bbox_2d\": [554, 31, 856, 529], \"confidence\": \"高\", \"attributes\": [\"红色\", \"仿真\"]}, {\"label\": \"白色长方体\", \"bbox_2d\": [318, 0, 752, 568], \"confidence\": \"高\", \"attributes\": [\"白色\", \"立方体\"]}, {\"label\": \"黑色小方块\", \"bbox_2d\": [279, 777, 416, 922], \"confidence\": \"中\", \"attributes\": [\"黑色\", \"方形\"]}, {\"label\": \"电线\", \"bbox_2d\": [0, 652, 279, 997], \"confidence\": \"中\", \"attributes\": [\"黑色\", \"柔性\"]}]}",
+  "objects": [
+    {
+      "label": "草莓",
+      "bbox_2d": [
+        355,
+        15,
+        548,
+        254
+      ],
+      "confidence": 0.85,
+      "attributes": {
+        "raw_attributes": [
+          "红色",
+          "仿真"
+        ],
+        "object_index": 0
+      }
+    },
+    {
+      "label": "白色长方体",
+      "bbox_2d": [
+        204,
+        0,
+        481,
+        273
+      ],
+      "confidence": 0.85,
+      "attributes": {
+        "raw_attributes": [
+          "白色",
+          "立方体"
+        ],
+        "object_index": 1
+      }
+    },
+    {
+      "label": "黑色小方块",
+      "bbox_2d": [
+        179,
+        373,
+        266,
+        443
+      ],
+      "confidence": 0.6,
+      "attributes": {
+        "raw_attributes": [
+          "黑色",
+          "方形"
+        ],
+        "object_index": 2
+      }
+    },
+    {
+      "label": "电线",
+      "bbox_2d": [
+        0,
+        313,
+        179,
+        479
+      ],
+      "confidence": 0.6,
+      "attributes": {
+        "raw_attributes": [
+          "黑色",
+          "柔性"
+        ],
+        "object_index": 3
+      }
+    }
+  ]
+}

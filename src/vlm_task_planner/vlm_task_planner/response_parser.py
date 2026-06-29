@@ -9,6 +9,17 @@ from typing import Any
 
 from embodied_common.json_utils import extract_json_blob, parse_confidence, string_list
 
+DISABLED_SKILLS = {
+    "observe_target_area",
+    "approach_named_target",
+    "hover_named_target",
+    "pick_named_target",
+    "lift_named_target",
+    "retreat_from_target",
+    "place_named_pose",
+    "release_at_named_pose",
+}
+
 
 @dataclass
 class PlannerResult:
@@ -28,28 +39,10 @@ class PlannerResult:
 def _infer_task_type(skill_sequence: Sequence[str]) -> str:
     if list(skill_sequence) == ["inspect_scene"]:
         return "observe_scene"
-    if list(skill_sequence) == ["observe_target_area"]:
-        return "observe_target_area"
-    if list(skill_sequence) == ["approach_named_target"]:
-        return "approach_named_target"
-    if list(skill_sequence) == ["hover_named_target"]:
-        return "hover_named_target"
     if list(skill_sequence) == ["recover_safe_pose"]:
         return "recover_safe_pose"
-    if list(skill_sequence) == ["pick_named_target"]:
-        return "pick_only"
-    if list(skill_sequence) == ["lift_named_target"]:
-        return "lift_named_target"
-    if list(skill_sequence) == ["retreat_from_target"]:
-        return "retreat_from_target"
-    if list(skill_sequence) == ["place_named_pose"]:
-        return "place_only"
-    if list(skill_sequence) == ["release_at_named_pose"]:
-        return "release_at_named_pose"
     if list(skill_sequence) == ["move_relative_ee"]:
         return "relative_motion"
-    if "pick_named_target" in skill_sequence and "place_named_pose" in skill_sequence:
-        return "pick_and_place"
     return "planned_task"
 
 
@@ -94,51 +87,18 @@ def parse_planner_response(
 
         if not skill_name:
             raise ValueError("planner skill entry is missing skill_name")
+        if skill_name in DISABLED_SKILLS:
+            raise ValueError(f"planner selected disabled skill: {skill_name}")
         if skill_name not in allowed_skill_set:
             raise ValueError(f"planner selected unsupported skill: {skill_name}")
 
         skill_sequence.append(skill_name)
-        if (
-            skill_name
-            in {
-                "observe_target_area",
-                "approach_named_target",
-                "hover_named_target",
-                "pick_named_target",
-                "lift_named_target",
-                "retreat_from_target",
-            }
-            and not target_name
-        ):
-            target_name = str(args.get("target_name", default_target_name))
-        if skill_name in {"place_named_pose", "release_at_named_pose"} and not place_name:
-            place_name = str(args.get("place_name", default_place_name))
         if skill_name == "move_relative_ee":
             if not motion_direction:
                 motion_direction = str(args.get("motion_direction", ""))
             if motion_distance <= 0.0:
                 motion_distance = float(args.get("motion_distance", default_relative_motion_step_m))
 
-    if (
-        any(
-            skill_name in skill_sequence
-            for skill_name in (
-                "observe_target_area",
-                "approach_named_target",
-                "hover_named_target",
-                "pick_named_target",
-                "lift_named_target",
-                "retreat_from_target",
-            )
-        )
-        and not target_name
-    ):
-        target_name = default_target_name
-    if (
-        any(skill_name in skill_sequence for skill_name in ("place_named_pose", "release_at_named_pose"))
-        and not place_name
-    ):
-        place_name = default_place_name
     if "move_relative_ee" in skill_sequence and motion_distance <= 0.0:
         motion_distance = default_relative_motion_step_m
 

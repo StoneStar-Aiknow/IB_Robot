@@ -52,6 +52,7 @@ import torch
 from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.logging import LogLevel
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
 from std_srvs.srv import Trigger
@@ -766,6 +767,16 @@ class LeRobotPolicyNode(Node):
                 action_np = result.action.detach().cpu().numpy() if torch.is_tensor(result.action) else result.action
                 action_rad = torch.from_numpy(self._lerobot_to_rad(action_np)).float()
 
+            if self.get_logger().is_enabled_for(LogLevel.DEBUG):
+                _state_arr = np.asarray(obs_frame.get("observation.state", np.zeros(6))).flatten()
+                _act_arr = action_rad.detach().cpu().numpy() if torch.is_tensor(action_rad) else np.asarray(action_rad)
+                _s = _state_arr[:6]
+                _a0 = _act_arr[0, :6] if _act_arr.ndim >= 2 else _act_arr[:6]
+                self.get_logger().debug(
+                    f"dispatch_infer: obs_state(lerobot)=[{', '.join(f'{v:.2f}' for v in _s)}] "
+                    f"action_step0(rad)=[{', '.join(f'{v:.3f}' for v in _a0)}]",
+                )
+
             publish_start = time.perf_counter()
             action_msg = self._create_action_msg(action_rad)
             self._action_pub.publish(action_msg)
@@ -804,6 +815,12 @@ class LeRobotPolicyNode(Node):
                     f"(pre={result.preprocess_latency_ms:.1f}ms, "
                     f"inf={result.inference_latency_ms:.1f}ms, "
                     f"post={result.postprocess_latency_ms:.1f}ms)"
+                )
+            elif self._inference_count % 50 == 0:
+                self.get_logger().info(
+                    f"Inference #{self._inference_count}: "
+                    f"total={result.total_latency_ms:.1f}ms "
+                    f"(inf={result.inference_latency_ms:.1f}ms)"
                 )
 
             self.get_logger().debug(

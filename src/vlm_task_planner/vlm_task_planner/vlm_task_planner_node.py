@@ -10,10 +10,10 @@ import rclpy
 
 from embodied_common.base_node import BaseTaskNode
 from embodied_common.json_utils import load_json_list, load_json_mapping
+from embodied_common.scene_analysis import SceneAnalysis, parse_scene_analysis_response
 from embodied_common.skill_templates import DEFAULT_ALLOWED_SKILLS
+from embodied_common.vlm_prompt_builder import build_scene_analysis_messages
 from ibrobot_msgs.msg import TaskCommand, TaskStatus
-from perception_service.prompt_builder import build_scene_analysis_messages
-from perception_service.response_parser import SceneAnalysis, parse_scene_analysis_response
 from vlm_task_planner.api_client import VLMAPIClient
 from vlm_task_planner.planner_fallback import fallback_plan_from_text
 from vlm_task_planner.prompt_builder import build_chat_messages

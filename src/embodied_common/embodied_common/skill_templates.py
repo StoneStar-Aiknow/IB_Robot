@@ -8,6 +8,8 @@ from typing import Any
 SUPPORTED_PRIMITIVES = {
     "move_to_named_pose",
     "move_relative_ee",
+    "move_to_joint_positions",
+    "move_through_joint_positions",
     "open_gripper",
     "close_gripper",
     "rotate_gripper_cw",
@@ -17,41 +19,7 @@ SUPPORTED_PRIMITIVES = {
 DEFAULT_SKILL_TEMPLATES: dict[str, dict[str, Any]] = {
     "inspect_scene": {"primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}]},
     "recover_safe_pose": {"primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "home"}]},
-    "observe_target_area": {
-        "primitive_sequence": [{"primitive_name": "move_to_named_pose", "target_pose_key": "observe_pose"}]
-    },
-    "approach_named_target": {
-        "primitive_sequence": [{"primitive_name": "move_to_named_pose", "target_pose_key": "pregrasp_pose"}]
-    },
-    "hover_named_target": {
-        "primitive_sequence": [{"primitive_name": "move_to_named_pose", "target_pose_key": "hover_pose"}]
-    },
-    "pick_named_target": {
-        "primitive_sequence": [
-            {"primitive_name": "move_to_named_pose", "target_pose_key": "pregrasp_pose"},
-            {"primitive_name": "move_to_named_pose", "target_pose_key": "grasp_pose"},
-            {"primitive_name": "close_gripper"},
-            {"primitive_name": "move_to_named_pose", "target_pose_key": "lift_pose"},
-        ]
-    },
-    "lift_named_target": {
-        "primitive_sequence": [{"primitive_name": "move_to_named_pose", "target_pose_key": "lift_pose"}]
-    },
-    "retreat_from_target": {
-        "primitive_sequence": [{"primitive_name": "move_to_named_pose", "target_pose_key": "retreat_pose"}]
-    },
-    "place_named_pose": {
-        "primitive_sequence": [
-            {"primitive_name": "move_to_named_pose", "place_name_from_request": True},
-            {"primitive_name": "open_gripper"},
-        ]
-    },
-    "release_at_named_pose": {
-        "primitive_sequence": [
-            {"primitive_name": "move_to_named_pose", "place_name_from_request": True},
-            {"primitive_name": "open_gripper"},
-        ]
-    },
+    "recover_zero_pose": {"primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "zero"}]},
     "open_gripper_skill": {"primitive_sequence": [{"primitive_name": "open_gripper"}]},
     "close_gripper_skill": {"primitive_sequence": [{"primitive_name": "close_gripper"}]},
     "move_relative_ee": {
@@ -71,6 +39,7 @@ DEFAULT_SKILL_TEMPLATES: dict[str, dict[str, Any]] = {
     },
 }
 
+SUPPORTED_SKILLS = set(DEFAULT_SKILL_TEMPLATES.keys()).union({"dance_basic"})
 DEFAULT_ALLOWED_SKILLS = list(DEFAULT_SKILL_TEMPLATES.keys())
 
 

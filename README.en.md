@@ -81,7 +81,7 @@ IB_Robot/                           # Main Workspace
 │   ├── action_dispatch/            # Unified action dispatcher (Dual-mode)
 │   ├── task_dispatch/              # Task scheduling and dispatch service
 │   ├── tensormsg/                  # LeRobot ↔ ROS 2 protocol conversion hub
-│   ├── ibrobot_msgs/               # Unified system interfaces (Message/Action)
+│   ├── ibrobot_msgs/               # Unified system interfaces (Message/Action/Service)
 │   ├── dataset_tools/              # Dataset collection & conversion (Episode Recorder)
 │   ├── robot_teleop/               # Teleoperation (Leader Arm/Xbox controller)
 │   ├── robot_description/          # Unified URDF/SRDF/MJCF model descriptions
@@ -99,7 +99,13 @@ IB_Robot/                           # Main Workspace
 │   ├── model_utils/                # Model utility library
 │   ├── attention_viz/              # Attention visualization tool
 │   ├── voice_asr_service/          # Voice recognition service
-│   └── workflows/                  # CI/CD configuration
+│   ├── workflows/                  # CI/CD configuration
+│   │
+│   ├── embodied_agent/             # Embodied AI task entry & orchestration (task_entry / planner / executor)
+│   ├── vlm_task_planner/           # VLM vision-language task planner (scene understanding + skill planning)
+│   ├── perception_service/         # Continuous scene understanding service (RGB-D / multi-view)
+│   ├── skill_library/              # Skill execution layer (skill → primitive → MoveIt)
+│   └── safety_guard/               # Explicit safety validation layer (allowlist + workspace bounds)
 │
 ├── docs/                           # Detailed architecture docs and dev guides
 │   ├── pictures/                   # Architecture diagrams and demo GIFs
@@ -478,6 +484,148 @@ export ATOMGIT_TOKEN="your_token_here"
 ### Supported Agents
 
 All clients compatible with the Agent Skills standard will automatically scan `.agents/skills/`. See [agentskills.io](https://agentskills.io).
+
+---
+
+## Running Guide
+
+All operations are triggered via the unified entry point in the `robot_config` package.
+
+### Basic Simulation (Auto-start model inference control)
+
+```bash
+ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true
+```
+
+### Basic Simulation (No inference, controllers only)
+
+```bash
+ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true with_inference:=false
+```
+
+### MoveIt Planning Mode (Auto-detect, with RViz)
+
+```bash
+ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=moveit_planning use_sim:=true
+```
+
+### MoveIt Headless Mode (No RViz)
+
+```bash
+ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=moveit_planning use_sim:=true moveit_display:=false
+```
+
+### Real Hardware Execution
+
+```bash
+ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=false
+```
+
+### Manual Override (Advanced Debugging)
+
+```bash
+ros2 launch robot_config robot.launch.py control_mode:=model_inference with_inference:=true use_sim:=true
+```
+
+---
+
+## Parameter Description
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `robot_config` | Robot config name (matches YAML in `config/robots/`) | `so101_single_arm` |
+| `config_path` | Absolute path to config file (overrides `robot_config`) | Empty |
+| `use_sim` | Use Gazebo simulation mode | `false` |
+| `control_mode` | Override default mode (`model_inference` / `moveit_planning` / `teleop`) | From YAML |
+| `with_inference`| Force enable/disable inference service | Auto-detect |
+| `with_embodied` | Compatibility override in the base `robot_config` launch; use `embodied_bringup` for the full embodied runtime | Empty |
+| `with_moveit`   | Force enable/disable MoveIt core | Auto-detect |
+| `moveit_display`| Launch MoveIt RViz interface | `true` |
+| `auto_start_controllers` | Automatically activate controllers on start | `true` |
+
+---
+
+## Embodied AI Pipeline
+
+IB-Robot includes a complete **embodied AI execution pipeline** that accepts natural language input (or `/voice_command` topic), performs VLM-based scene understanding and skill planning, and drives MoveIt 2 to execute real robot motions. This pipeline is available in `moveit_planning` control mode.
+
+### Pipeline Architecture
+
+```text
+/voice_command
+  → task_entry_node         # Task entry: rule-based fast-path first
+  → vlm_task_planner_node   # VLM vision-language task planning (scene understanding + skill selection)
+  → task_executor_node      # Skill sequence orchestration
+  → skill_executor_node     # Skill → primitive decomposition
+  → safety_guard_node       # Safety validation (allowlist + workspace bounds)
+  → moveit_gateway          # MoveIt 2 motion planning & execution
+```
+
+### Launching the Embodied Pipeline
+
+```bash
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=moveit_planning \
+    use_sim:=true \
+    moveit_display:=false
+```
+
+### Sending Natural Language Commands
+
+```bash
+# Scene understanding (pure visual analysis — no arm motion)
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: 'What can you see in the camera?'}"
+
+# Relative motion
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
+
+# Return to home pose
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '回原位'}"
+```
+
+### VLM Configuration
+
+The embodied pipeline defaults to a local OpenAI-compatible service (e.g., vLLM / Ollama):
+
+```yaml
+embodied:
+  planner:
+    mode: vlm_api          # rule / vlm_api / hybrid
+    vlm_api:
+      provider: openai_compatible
+      base_url: http://localhost:8000/v1
+      model: Qwen3.5-9B
+      api_key_env: ""      # no key needed for local services
+```
+
+For further details, see:
+- [`src/embodied_agent/README.md`](src/embodied_agent/README.md) — task entry & orchestration
+- [`src/vlm_task_planner/README.md`](src/vlm_task_planner/README.md) — VLM planner
+- [`src/perception_service/README.md`](src/perception_service/README.md) — scene perception service
+- [`src/skill_library/README.md`](src/skill_library/README.md) — skill execution layer
+- [`src/safety_guard/README.md`](src/safety_guard/README.md) — safety validation layer
+
+---
+
+## Troubleshooting
+
+### 1. Residual Controllers
+
+If controllers fail to start or ports are busy, run the cleanup script:
+
+```bash
+./scripts/cleanup_ros.sh
+```
+
+### 2. Shared Memory (SHM) Errors
+
+If you see `RTPS_TRANSPORT_SHM Error`, try cleaning the cache:
+
+```bash
+sudo rm -rf /dev/shm/fastrtps_*
+export ROS_LOCALHOST_ONLY=1
+```
 
 ---
 

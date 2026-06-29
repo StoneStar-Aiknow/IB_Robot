@@ -1,0 +1,57 @@
+{
+  "raw_response": "```json\n{\n  \"scene_summary\": \"一个木制桌面上有一个白色盒子，盒子上放着一个红色的草莓状物体和一个绿色的叶子，旁边有一根黑色的电线和一个黑色的小方块。\",\n  \"visible_objects\": [\n    \"红色草莓状物体\",\n    \"绿色叶子\",\n    \"黑色电线\",\n    \"黑色小方块\"\n  ],\n  \"robot_state_summary\": \"机器人目前没有在视野内。\",\n  \"ee_pose_interpretation\": \"末端执行器（EE）的位置和姿态无法确定。\",\n  \"risks\": [\n    \"物体可能不稳定，容易掉落\",\n    \"电线可能缠绕或阻碍机器人运动\"\n  ],\n  \"confidence\": 0.8,\n  \"objects\": [\n    {\n      \"label\": \"红色草莓状物体\",\n      \"bbox_2d\": [100, 200, 300, 400],\n      \"confidence\": 0.9,\n      \"attributes\": {}\n    },\n    {\n      \"label\": \"绿色叶子\",\n      \"bbox_2d\": [150, 250, 200, 300],\n      \"confidence\": 0.7,\n      \"attributes\": {}\n    },\n    {\n      \"label\": \"黑色电线\",\n      \"bbox_2d\": [50, 350, 100, 450],\n      \"confidence\": 0.8,\n      \"attributes\": {}\n    },\n    {\n      \"label\": \"黑色小方块\",\n      \"bbox_2d\": [300, 400, 350, 450],\n      \"confidence\": 0.6,\n      \"attributes\": {}\n    }\n  ]\n}\n```\n",
+  "objects": [
+    {
+      "label": "红色草莓状物体",
+      "bbox_2d": [
+        100,
+        200,
+        300,
+        400
+      ],
+      "confidence": 0.9,
+      "attributes": {
+        "object_index": 0
+      }
+    },
+    {
+      "label": "绿色叶子",
+      "bbox_2d": [
+        150,
+        250,
+        200,
+        300
+      ],
+      "confidence": 0.7,
+      "attributes": {
+        "object_index": 1
+      }
+    },
+    {
+      "label": "黑色电线",
+      "bbox_2d": [
+        50,
+        350,
+        100,
+        450
+      ],
+      "confidence": 0.8,
+      "attributes": {
+        "object_index": 2
+      }
+    },
+    {
+      "label": "黑色小方块",
+      "bbox_2d": [
+        300,
+        400,
+        350,
+        450
+      ],
+      "confidence": 0.6,
+      "attributes": {
+        "object_index": 3
+      }
+    }
+  ]
+}

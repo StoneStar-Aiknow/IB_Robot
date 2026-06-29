@@ -80,7 +80,7 @@ IB_Robot/                           # 主工作空间 (本仓库)
 │   ├── action_dispatch/            # 统一动作执行器 (双模支持)
 │   ├── task_dispatch/              # 任务调度与分发服务
 │   ├── tensormsg/                  # LeRobot ↔ ROS 2 协议转换枢纽
-│   ├── ibrobot_msgs/               # 系统统一接口定义 (Message/Action)
+│   ├── ibrobot_msgs/               # 系统统一接口定义 (Message/Action/Service)
 │   ├── dataset_tools/              # 数据集采集与转换工具 (Episode Recorder)
 │   ├── robot_teleop/               # 遥操作控制 (Leader Arm/Xbox 手柄)
 │   ├── robot_description/          # 统一机器人 URDF/SRDF/MJCF 模型描述
@@ -98,7 +98,13 @@ IB_Robot/                           # 主工作空间 (本仓库)
 │   ├── model_utils/                # 模型工具库
 │   ├── attention_viz/              # 注意力可视化工具
 │   ├── voice_asr_service/          # 语音识别服务
-│   └── workflows/                  # CI/CD 配置
+│   ├── workflows/                  # CI/CD 配置
+│   │
+│   ├── embodied_agent/             # 具身 AI 任务入口与编排 (task_entry / planner / executor)
+│   ├── vlm_task_planner/           # VLM 视觉语言任务规划器 (多模态场景理解 + 技能规划)
+│   ├── perception_service/         # 连续场景理解服务 (RGB-D / 多视角感知)
+│   ├── skill_library/              # 技能执行层 (skill → primitive → MoveIt)
+│   └── safety_guard/               # 显式安全校验层 (白名单 + 工作空间边界)
 │
 ├── docs/                           # 深度架构文档与开发指南
 │   ├── pictures/                   # 架构图与演示 GIF
@@ -436,7 +442,71 @@ bag 目录组织、`dataset.yaml` 元信息和更多转换参数，详见 `src/d
 | `record` | 是否启用录制流水线 | `false` |
 | `record_mode` | 录制模式（`continuous` / `episodic`） | `continuous` |
 | `record_visualizer` | 录制可视化器（`none` / `rerun`） | `none` |
+| `with_embodied` | 基础 `robot_config` launch 中保留的兼容覆盖；完整具身链路请使用 `embodied_bringup` | 空 |
 | `auto_start_controllers` | 是否在启动后自动激活控制器 | `true` |
+
+***
+
+## 四、具身 AI 流水线
+
+IB-Robot 内置了一条完整的**具身 AI 执行链路**，以自然语言（或 `/voice_command` 话题）为入口，经 VLM 视觉语言理解和技能规划后，驱动 MoveIt 2 执行真实动作。该链路在 `moveit_planning` 控制模式下可用。
+
+### 链路结构
+
+```text
+/voice_command
+  → task_entry_node         # 任务入口，优先规则直达
+  → vlm_task_planner_node   # VLM 视觉语言任务规划（场景理解 + 技能选择）
+  → task_executor_node      # 技能序列编排
+  → skill_executor_node     # 技能 → primitive 分解
+  → safety_guard_node       # 安全校验（白名单 + 工作空间边界）
+  → moveit_gateway          # MoveIt 2 运动规划执行
+```
+
+### 启动具身流水线
+
+```bash
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=moveit_planning \
+    use_sim:=true \
+    moveit_display:=false
+```
+
+### 发送自然语言命令
+
+```bash
+# 场景理解（纯视觉分析，不触发机械臂移动）
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '当前摄像头中可以看到什么'}"
+
+# 相对移动
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
+
+# 回安全位
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '回原位'}"
+```
+
+### VLM 配置
+
+具身链路默认对接本地 OpenAI-compatible 服务（如 vLLM / Ollama）：
+
+```yaml
+embodied:
+  planner:
+    mode: vlm_api          # rule / vlm_api / hybrid
+    vlm_api:
+      provider: openai_compatible
+      base_url: http://localhost:8000/v1
+      model: Qwen3.5-9B
+      api_key_env: ""      # 本地服务无需 key
+```
+
+更多配置说明见：
+- [`src/embodied_agent/README.md`](src/embodied_agent/README.md) — 任务入口与编排
+- [`src/vlm_task_planner/README.md`](src/vlm_task_planner/README.md) — VLM 规划器
+- [`src/perception_service/README.md`](src/perception_service/README.md) — 场景感知服务
+- [`src/skill_library/README.md`](src/skill_library/README.md) — 技能执行层
+- [`src/safety_guard/README.md`](src/safety_guard/README.md) — 安全校验层
 
 ***
 
@@ -590,7 +660,72 @@ export ROS_LOCALHOST_ONLY=1
 export DISPLAY=:1
 ```
 
-***
+---
+
+## 更新日志
+
+### 2025-06-15：感知系统增强 + 未实现技能清理
+
+#### 感知服务（perception_service）重大升级
+
+**新增 2D 物体检测 + 3D 坐标接地能力**，感知服务从"场景描述"升级为"物体级感知"：
+
+- **新增 `object_parser.py`**：解析 VLM 返回的物体级 grounding 结果（label、bbox、confidence），支持 `0-1000` 归一化坐标系到实际像素坐标的自动缩放
+- **新增 `grounding_3d.py`**：将 2D bbox 结合 RGB-D 深度图反投影为相机坐标系 3D 位置（中位深度估计 + 越界过滤）
+- **新增 ROS 消息类型**：
+  - `SceneObject.msg`：单物体检测结果（label、bbox、3D pose、confidence）
+  - `SceneObservation.msg`：完整场景观测（多物体列表 + 场景摘要 + 风险评估）
+- **新增 `perception_observation` topic**：发布结构化 `SceneObservation` 消息，供下游 planner / executor 消费
+- **prompt_builder 升级**：在 VLM prompt 中增加 `objects` 字段请求，要求返回 bbox 坐标；删除重复的 `append_images` 定义
+- **并发安全增强**：会话历史加线程锁（`_history_lock`），新增 `max_concurrent_requests` 信号量限制
+- **最小置信度过滤**：新增 `min_object_confidence` 参数，自动过滤低置信度物体
+
+**实际 VLM 验证通过**（使用 `glm-4.5v` 模型）：
+
+| 物体 | 2D bbox | 3D 位置 (m) | 置信度 |
+|---|---|---|---|
+| 草莓 | [355, 15, 548, 254] | (0.039, -0.036, 0.196) | 0.85 |
+| 白色长方体 | [204, 0, 481, 273] | (0.004, -0.029, 0.165) | 0.85 |
+| 黑色小方块 | [179, 373, 266, 443] | (-0.030, 0.046, 0.172) | 0.60 |
+| 电线 | [0, 313, 179, 479] | (-0.064, 0.040, 0.162) | 0.60 |
+
+> ⚠️ `glm-4.7` 不支持图像输入，感知节点请使用 `glm-4.5v` 作为视觉模型。
+
+#### 未实现技能清理（死代码移除）
+
+移除了 8 个依赖物理抓取流水线但尚未实现的技能及其全部关联代码（模板、配置、解析器、命令路由）：
+
+| 移除的技能 | 说明 |
+|---|---|
+| `pick_named_target` | 未对接实际抓取 pipeline |
+| `place_named_pose` | 同上 |
+| `observe_target_area` | 无实际感知闭环 |
+| `approach_named_target` | 无目标定位能力 |
+| `hover_named_target` | 同上 |
+| `lift_named_target` | 同上 |
+| `retreat_from_target` | 同上 |
+| `release_at_named_pose` | 同上 |
+
+**涉及变更的模块**：
+- `embodied_agent/command_parser.py`：删除硬编码的目标名解析和上述技能的文本路由
+- `embodied_common/skill_templates.py`：删除 8 个技能的模板定义
+- `vlm_task_planner/prompt_builder.py`：在 system prompt 中声明抓取/放置类技能已禁用
+- `vlm_task_planner/response_parser.py`：新增 `DISABLED_SKILLS` 集合，planner 若选中被禁用技能则报错
+- `robot_config/config/robots/so101_single_arm.yaml`：删除 `entry` 路由配置、`named_targets` 定义、被移除技能的 `allowed_skills` 和 `skill_templates`
+- `robot_config/robot_config/loader.py`：精简配置校验逻辑，移除 `target_pose_key` / `place_name_from_request` 等间接引用
+- `robot_config/robot_config/launch_builders/embodied.py`：移除 entry 参数注入
+
+#### 夹爪执行路径规划器（gripper_path.py）
+
+新增 `vlm_task_planner/gripper_path.py` 模块：根据任务描述和命名目标，生成夹爪执行路径（坐标接地 + 可达性检查），参考 Code as Policies + SayCan 模式设计。已集成到 `vlm_task_planner_node` 的 plan context 中。
+
+#### 测试
+
+- 新增 `test_object_parser.py`、`test_grounding_3d_fixture.py`、`test_perception_node_observation.py`、`test_realsense_rgbd_fixture.py`
+- 更新 `test_response_parser.py`、`test_prompt_builder.py`、`test_command_parser.py` 适配技能清理
+- **全部 16 项测试通过**，ruff lint 通过，3 个 ROS 包构建成功
+
+---
 
 **维护者**: IB-Robot Team\
 **使用指导**: <https://pages.openeuler.openatom.cn/embedded/docs/build/html/master/features/embodied_ai/index.html>\

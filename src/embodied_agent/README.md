@@ -34,31 +34,25 @@
 - 安全校验由 `safety_guard` 负责。
 - 技能和原子动作执行由 `skill_library` 负责。
 
-## 2. 当前启动方式
+## 2. 推荐启动方式
 
-当前 PR 只提供具身管线节点和 ROS 接口，不新增 `robot_config` 的统一 launch 参数。
-因此不要使用尚未实现的 `with_embodied` launch 参数；如需联调，应在完成构建后按节点分别启动。
-
-示例：
+建议通过统一 launch 启动，而不是手工分别起节点：
 
 ```bash
-cd /home/lwh/code/IB_Robot
-source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.sh
-
-ros2 run safety_guard safety_guard_node
-ros2 run skill_library skill_executor_node
-ros2 run embodied_agent task_planner_node
-ros2 run embodied_agent task_executor_node
-ros2 run embodied_agent task_entry_node
+cd ~/IB_Robot
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.sh && \
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
+  robot_config:=so101_single_arm \
+  control_mode:=moveit_planning \
+  use_sim:=true \
+  moveit_display:=false
 ```
 
-如果需要 VLM 规划，可另外启动：
+`embodied_bringup` 会读取同一份 `robot_config` YAML，并临时覆盖：
 
-```bash
-ros2 run vlm_task_planner vlm_task_planner_node
-```
+- `robot.embodied.enabled=true`
 
-后续若要接入 `robot_config` SSOT，应在单独 PR 中新增 embodied launch builder，并从机器人配置注入相机、技能模板、命名位姿和工作空间等参数。
+默认 YAML 中该能力仍是关闭的。
 
 ## 3. task_entry_node
 
@@ -96,7 +90,7 @@ ros2 run vlm_task_planner vlm_task_planner_node
 | `planned_output_topic` | `/embodied/planned_task` | 规则直达输出 |
 | `status_topic` | `/embodied/task_status` | 规则直达时的任务状态输出 |
 | `default_target_name` | `demo_object` | 规则直达时使用的默认命名目标 |
-| `default_place_name` | `tray_right` | 规则直达时使用的默认放置位姿 |
+| `default_place_name` | `home` | 保留参数；当前规则规划不会生成放置技能 |
 | `default_relative_motion_step_m` | `0.03` | “一点”默认映射步长（米） |
 | `default_task_timeout_sec` | `180.0` | 单个任务的端到端总超时预算 |
 | `debug_tracing` | `false` | 是否打印调试日志 |
@@ -109,17 +103,19 @@ ros2 run vlm_task_planner vlm_task_planner_node
 
 | 输入意图 | 规划结果 |
 | --- | --- |
-| `观察桌面` / `看看桌面` / `观察场景` | `inspect_scene` |
-| `回到home` / `回原位` / `回安全位` | `recover_safe_pose` |
-| `抓取目标物并放到右侧托盘` | `pick_named_target` -> `place_named_pose` |
+| `观察点` / `观察位置` / `观察桌面` / `看看桌面` / `观察场景` | `inspect_scene` |
+| `原位` / `原点` / `回到home` / `回原位` / `回安全位` | `recover_safe_pose` |
+| `零点` / `零位` / `回零点` / `到零点` | `recover_zero_pose` |
 | `夹爪往前/后/左/右/上/下一点` | `move_relative_ee` |
-| 仅包含抓取类词汇（抓 / 拿 / 取） | `pick_named_target` |
-| 仅包含放置类词汇（放） | `place_named_pose` |
+| `打开夹爪` / `开爪` | `open_gripper_skill` |
+| `关闭夹爪` / `夹紧` | `close_gripper_skill` |
+| `顺时针旋转 45 度` | `rotate_gripper_cw` |
+| `逆时针旋转 45 度` | `rotate_gripper_ccw` |
 
 ### 当前约束
 
 - 这是**规则规划器**，不是通用大模型 Planner。
-- 目标物和放置位当前会映射到 YAML 中的默认命名目标与命名位姿。
+- 抓取、放置和目标物操作类文本当前会被显式拒绝，不会映射为 pick/place 技能。
 - 不支持的文本会直接拒绝，并在 `/embodied/task_status` 发布 `rejected`。
 
 ### 当前接口
@@ -138,7 +134,7 @@ ros2 run vlm_task_planner vlm_task_planner_node
 | `output_topic` | `/embodied/planned_task` | 规划输出 |
 | `status_topic` | `/embodied/task_status` | 任务状态输出 |
 | `default_target_name` | `demo_object` | 默认命名目标 |
-| `default_place_name` | `tray_right` | 默认放置位姿 |
+| `default_place_name` | `home` | 保留参数；当前规则规划不会生成放置技能 |
 | `default_relative_motion_step_m` | `0.03` | “一点”默认映射步长（米） |
 | `debug_tracing` | `false` | 是否打印规划调试日志 |
 
@@ -229,7 +225,7 @@ ros2 run vlm_task_planner vlm_task_planner_node
 当前已经验证通过的仿真命令路径：
 
 ```bash
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '抓取目标物并放到右侧托盘'}"
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
 ```
 
 可以观测到：
@@ -240,15 +236,29 @@ ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '抓取目标�
 4. 技能 action 被依次调用
 5. 最终 `TaskStatus.state=completed`
 
-当前也支持相对位移类命令，例如：
+当前也支持夹爪开合类命令，例如：
 
 ```bash
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '打开夹爪'}"
 ```
 
 这类命令会被规划成单技能：
 
-- `move_relative_ee`
+- `open_gripper_skill`
+
+当前还支持直接移动到配置好的 named pose：
+
+```bash
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '原位'}"
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '观察点'}"
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '零点'}"
+```
+
+这三类命令分别会被规划成：
+
+- `recover_safe_pose`
+- `inspect_scene`
+- `recover_zero_pose`
 
 方向语义由执行层按 `robot.embodied.execution.relative_motion_reference_frame=base`
 和 `relative_motion_direction_mapping` 解释，规划层只保留

@@ -7,7 +7,7 @@
 
 | 节点 | 控制台入口 | 主要职责 |
 | --- | --- | --- |
-| `skill_executor_node` | `skill_executor_node = skill_library.skill_executor_node:main` | 提供技能 action、primitive action，并把技能执行到 `/cmd_pose` 和夹爪控制接口 |
+| `skill_executor_node` | `skill_executor_node = skill_library.skill_executor_node:main` | 提供技能 action、primitive action，并把技能执行到 `/cmd_pose`、手臂轨迹 action 和夹爪控制接口 |
 
 ## 1. 现在可以如何控制机械臂
 
@@ -15,9 +15,9 @@
 
 | 控制方式 | 入口 | 适合场景 |
 | --- | --- | --- |
-| 自然语言任务 | `/voice_command` | 直接说“把香蕉夹起来”“把夹爪移动到香蕉上方” |
+| 自然语言任务 | `/voice_command` | 当前规则入口支持观察、回位、夹爪开合、相对移动和夹爪旋转 |
 | 技能级控制 | `/embodied/execute_skill` | 明确指定技能名，做稳定、可控的动作编排 |
-| primitive 级控制 | `/embodied/execute_primitive` | 直接控制命名位姿、相对位移、夹爪开合 |
+| primitive 级控制 | `/embodied/execute_primitive` | 直接控制命名位姿、相对位移、关节轨迹、夹爪开合 |
 
 整体链路如下：
 
@@ -29,25 +29,30 @@
   -> /embodied/execute_skill
   -> skill_executor_node
   -> /embodied/execute_primitive
-  -> /cmd_pose or /gripper_position_controller/commands
+  -> /cmd_pose or /arm_trajectory_controller/follow_joint_trajectory or /gripper_position_controller/commands
 ```
 
 ## 2. 当前支持的技能
 
-当前技能由 `robot_config` 中的 `skill_templates` 统一配置，默认支持：
+当前技能由 `robot_config` 中的 `skill_templates` 统一配置。技能 action 层可解析
+模板化技能；自然语言规则入口当前只会生成最小闭环动作，抓取/放置/目标物操作会被
+显式拒绝，等待后续 VLM 或物理抓取链路补齐。
+
+默认支持：
 
 | 技能名 | 作用 | 典型输入 |
 | --- | --- | --- |
 | `inspect_scene` | 移动到观察位看桌面 | “观察桌面” |
-| `observe_target_area` | 移动到目标观察位 | “观察香蕉” |
+| `observe_target_area` | 移动到目标观察位 | 显式 SkillCommand / VLM 路径 |
 | `approach_named_target` | 接近目标预抓取位 | “靠近香蕉” |
 | `hover_named_target` | 移动到目标上方悬停位 | “移动到香蕉上方” |
-| `pick_named_target` | 预抓取 -> 抓取 -> 闭合夹爪 -> 抬起 | “把香蕉夹起来” |
-| `lift_named_target` | 把已抓取目标抬起 | “把香蕉抬起来” |
+| `pick_named_target` | 预抓取 -> 抓取 -> 闭合夹爪 -> 抬起 | 显式 SkillCommand / VLM 路径 |
+| `lift_named_target` | 把已抓取目标抬起 | 显式 SkillCommand / VLM 路径 |
 | `retreat_from_target` | 从目标位置后撤 | “从香蕉旁边后撤” |
-| `place_named_pose` | 移动到放置位并张开夹爪 | “放到右侧托盘” |
-| `release_at_named_pose` | 移动到指定放置位并释放 | “在右侧托盘松开夹爪” |
+| `place_named_pose` | 移动到放置位并张开夹爪 | 显式 SkillCommand / VLM 路径 |
+| `release_at_named_pose` | 移动到指定放置位并释放 | 显式 SkillCommand / VLM 路径 |
 | `recover_safe_pose` | 回到安全位 / home 位 | “回原位” |
+| `recover_zero_pose` | 回到 zero 位 | “零点” |
 | `move_relative_ee` | 末端沿 base 坐标系相对移动 | “夹爪往前一点” |
 | `open_gripper_skill` | 单独张开夹爪 | 上层显式下发 |
 | `close_gripper_skill` | 单独闭合夹爪 | 上层显式下发 |
@@ -60,6 +65,8 @@
 | --- | --- |
 | `move_to_named_pose` | 移动到命名位姿 |
 | `move_relative_ee` | 相对当前末端位姿做笛卡尔增量移动 |
+| `move_to_joint_positions` | 按完整手臂关节顺序移动到单个关节目标 |
+| `move_through_joint_positions` | 按完整手臂关节顺序执行多路点关节轨迹 |
 | `open_gripper` | 张开夹爪 |
 | `close_gripper` | 闭合夹爪 |
 
@@ -77,6 +84,7 @@
 | 技能 | primitive 序列 |
 | --- | --- |
 | `inspect_scene` | `move_to_named_pose(observe_table)` |
+| `recover_zero_pose` | `move_to_named_pose(zero)` |
 | `observe_target_area` | `move_to_named_pose(target.observe_pose)` |
 | `approach_named_target` | `move_to_named_pose(target.pregrasp_pose)` |
 | `hover_named_target` | `move_to_named_pose(target.hover_pose)` |
@@ -84,6 +92,7 @@
 | `retreat_from_target` | `move_to_named_pose(target.retreat_pose)` |
 | `place_named_pose` | `move_to_named_pose(place_name)` -> `open_gripper` |
 | `move_relative_ee` | `move_relative_ee(direction, distance)` |
+| `dance_basic` | `move_through_joint_positions(joint_waypoints)` |
 
 ## 5. 直接控制机械臂的几种用法
 
@@ -111,16 +120,6 @@ ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '把夹爪往�
 | `看看桌面` | 移动到桌面观察位 | `inspect_scene` |
 | `查看桌面` | 移动到桌面观察位 | `inspect_scene` |
 | `观察场景` | 移动到桌面观察位 | `inspect_scene` |
-| `观察香蕉` | 移动到香蕉观察位 | `observe_target_area` |
-| `看看香蕉` | 移动到香蕉观察位 | `observe_target_area` |
-| `查看香蕉` | 移动到香蕉观察位 | `observe_target_area` |
-| `把夹爪移动到香蕉的上面` | 移动到香蕉上方悬停位 | `hover_named_target` |
-| `把夹爪往靠近香蕉的方向移动` | 接近香蕉预抓取位 | `approach_named_target` |
-| `把香蕉夹起来` | 执行抓取并抬起 | `pick_named_target` |
-| `把香蕉抬起来` | 抬起目标 | `lift_named_target` |
-| `从香蕉旁边后撤` | 从目标区域撤回 | `retreat_from_target` |
-| `把香蕉放到右侧托盘` | 移动到托盘并释放 | `place_named_pose` |
-| `在右侧托盘松开夹爪` | 在托盘位置松开夹爪 | `release_at_named_pose` |
 | `夹爪往前一点` | 末端向前相对移动一步 | `move_relative_ee` |
 | `夹爪往左一点` | 末端向左相对移动一步 | `move_relative_ee` |
 | `夹爪往上一点` | 末端向上相对移动一步 | `move_relative_ee` |
@@ -135,17 +134,6 @@ ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '把夹爪往�
 扫描桌面
 观察场景
 看看场景
-观察香蕉
-看看香蕉
-查看香蕉
-观察目标区域
-看看目标区域
-把夹爪移动到香蕉的上面
-把夹爪往靠近香蕉的方向移动
-把香蕉抬起来
-从香蕉旁边后撤
-把香蕉放到右侧托盘
-在右侧托盘松开夹爪
 夹爪往前一点
 夹爪往左一点
 夹爪往上一点
@@ -156,13 +144,10 @@ ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '把夹爪往�
 
 ```bash
 source .shrc_local && export ROS_DOMAIN_ID=42 && \
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '观察香蕉'}"
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
 
 source .shrc_local && export ROS_DOMAIN_ID=42 && \
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '把夹爪移动到香蕉的上面'}"
-
-source .shrc_local && export ROS_DOMAIN_ID=42 && \
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '把香蕉放到右侧托盘'}"
+ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '回原位'}"
 ```
 
 ### 5.2 直接发技能 action
@@ -278,6 +263,27 @@ ros2 action send_goal /embodied/execute_primitive ibrobot_msgs/action/PrimitiveC
 }'
 ```
 
+例如直接执行一段关节路点轨迹：
+
+```bash
+source .shrc_local && export ROS_DOMAIN_ID=42 && \
+ros2 action send_goal /embodied/execute_primitive ibrobot_msgs/action/PrimitiveCommand \
+'{
+  task_id: "demo-joint-waypoints",
+  primitive_name: "move_through_joint_positions",
+  pose_name: "",
+  relative_dx: 0.0,
+  relative_dy: 0.0,
+  relative_dz: 0.0,
+  gripper_position: 0.0,
+  joint_names: ["1", "2", "3", "4", "5"],
+  joint_waypoints: [0.02, 0.54, -0.82, -0.18, 0.02],
+  joint_waypoint_count: 1,
+  waypoint_duration_sec: 0.5,
+  timeout_sec: 10.0
+}'
+```
+
 ## 6. primitive 如何桥接到底层
 
 ### 位姿控制
@@ -297,6 +303,19 @@ ros2 action send_goal /embodied/execute_primitive ibrobot_msgs/action/PrimitiveC
 消息类型：
 
 - `std_msgs/msg/Float64MultiArray`
+
+### 手臂关节轨迹控制
+
+`move_to_joint_positions` / `move_through_joint_positions` 最终都会发送 action 到：
+
+- `/arm_trajectory_controller/follow_joint_trajectory`
+
+消息类型：
+
+- `control_msgs/action/FollowJointTrajectory`
+
+关节名顺序来自 `robot_config` 注入的 `arm_joint_names_json`，关节限位由
+`joint_limits_json` 传给安全层校验。
 
 ## 7. 相对移动语义
 
@@ -350,6 +369,9 @@ ros2 action send_goal /embodied/execute_primitive ibrobot_msgs/action/PrimitiveC
 | `gripper_settle_sec` | `1.5` | gripper primitive 的稳定等待时间 |
 | `gripper_open_position` | `1.0` | 张开值 |
 | `gripper_closed_position` | `0.0` | 闭合值 |
+| `arm_joint_names_json` | `[]` | 手臂关节名顺序 |
+| `joint_limits_json` | `{}` | 关节限位配置 |
+| `arm_trajectory_action_name` | `/arm_trajectory_controller/follow_joint_trajectory` | 手臂轨迹 action 名 |
 | `task_executor_action_name` | `/task_executor/execute_task_plan` | task_dispatch 执行动作名 |
 | `ee_pose_topic` | `/robot_status/ee_pose` | 末端位姿反馈 topic |
 | `joint_state_topic` | `/joint_states` | 关节状态反馈 topic |
@@ -359,6 +381,7 @@ ros2 action send_goal /embodied/execute_primitive ibrobot_msgs/action/PrimitiveC
 
 - `move_to_named_pose` / `move_relative_ee` 现在会等待 `/robot_status/ee_pose` 收敛到目标附近，而不是只做固定 sleep
 - gripper primitive 仍使用 `gripper_settle_sec` 作为稳定等待时间
+- joint primitive 要求命令完整手臂关节列表，并依赖安全层做关节限位检查
 - 技能集合仍是有限白名单，不支持任意自由组合动作
 - 命名目标依赖 `robot_config` 里预先配置好的 `observe_pose / pregrasp_pose / hover_pose / grasp_pose / lift_pose / retreat_pose`
 - 复杂抓取仍未加入视觉伺服、力反馈、碰撞后自恢复或在线重规划

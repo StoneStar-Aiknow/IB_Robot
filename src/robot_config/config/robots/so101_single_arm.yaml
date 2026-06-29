@@ -159,6 +159,214 @@ robot:
     device_name: ""
     exit_on_init_failure: true
 
+  embodied:
+    enabled: false
+    debug_tracing: true
+    task_input_topic: /voice_command
+    task_command_topic: /embodied/task_command
+    planned_task_topic: /embodied/planned_task
+    status_topic: /embodied/task_status
+    skill_action_name: /embodied/execute_skill
+    primitive_action_name: /embodied/execute_primitive
+    validate_skill_service: /embodied/validate_skill
+    validate_primitive_service: /embodied/validate_primitive
+    default_target_name: demo_object
+    default_place_name: home
+    timeouts:
+      task_budget_sec: 180.0
+      scene_freshness_sec: 0.5
+      model_idle_timeout_sec: 120.0
+      rpc_timeout_sec: 5.0
+      gripper_settle_sec: 1.5
+    planner:
+      mode: hybrid  # rule | vlm_api | hybrid
+      scene_sources:
+        primary_camera_topic: /camera/front_camera/color/image_raw
+        primary_camera_info_topic: /camera/front_camera/color/camera_info
+        primary_aligned_depth_topic: /camera/front_camera/aligned_depth_to_color/image_raw
+        primary_pointcloud_topic: /camera/front_camera/depth/color/points
+        wrist_camera_topic: ""
+        wrist_camera_info_topic: ""
+        wrist_aligned_depth_topic: ""
+        wrist_pointcloud_topic: ""
+        ee_pose_topic: /robot_status/ee_pose
+        joint_state_topic: /joint_states
+        require_depth: false  # 仿真环境无深度流，仅用 RGB
+        require_pointcloud: false
+      vlm_api:
+        provider: kimicode
+        base_url: https://api.kimi.com/coding/v1
+        api_key_env: KIMICODE_API_KEY
+        model: kimi-latest
+        max_image_width: 640
+        jpeg_quality: 80
+      planning_policy:
+        fallback_to_rule_planner: true
+        min_confidence: 0.70
+        allowed_skills:
+          - inspect_scene
+          - recover_safe_pose
+          - recover_zero_pose
+          - move_relative_ee
+          - open_gripper_skill
+          - close_gripper_skill
+          - rotate_gripper_cw
+          - rotate_gripper_ccw
+          - dance_basic
+    perception:
+      enabled: false
+      request_topic: /embodied/perception_request
+      text_input_topic: /embodied/perception_text
+      result_topic: /embodied/perception_result
+      summary_topic: /embodied/perception_summary
+      default_session_id: default
+      scene_sources:
+        primary_camera_topic: /camera/front_camera/color/image_raw
+        primary_camera_info_topic: /camera/front_camera/color/camera_info
+        primary_aligned_depth_topic: /camera/front_camera/aligned_depth_to_color/image_raw
+        primary_pointcloud_topic: /camera/front_camera/depth/color/points
+        wrist_camera_topic: ""
+        wrist_camera_info_topic: ""
+        wrist_aligned_depth_topic: ""
+        wrist_pointcloud_topic: ""
+        ee_pose_topic: /robot_status/ee_pose
+        joint_state_topic: /joint_states
+        require_depth: false  # 仿真环境无深度流，仅用 RGB
+        require_pointcloud: false
+      vlm_api:
+        provider: openai_compatible
+        base_url: http://localhost:8000/v1
+        api_key_env: ""
+        model: Qwen3.5-9B
+        max_image_width: 320
+        jpeg_quality: 70
+      conversation:
+        max_history_turns: 4
+    execution:
+      relative_motion_step_m: 0.03
+      relative_motion_reference_frame: base
+      relative_motion_direction_mapping:
+        forward: [0.0, -1.0, 0.0]
+        backward: [0.0, 1.0, 0.0]
+        left: [1.0, 0.0, 0.0]
+        right: [-1.0, 0.0, 0.0]
+        up: [0.0, 0.0, 1.0]
+        down: [0.0, 0.0, -1.0]
+      gripper_open_position: 1.0
+      gripper_closed_position: 0.15
+      task_executor_action_name: /task_executor/execute_task_plan
+    safety:
+      workspace:
+        x: [-0.32, 0.25]
+        y: [-0.42, 0.00]
+        z: [0.05, 0.55]
+    named_poses:
+      home:
+        position: {x: 0.020030733201442157, y: -0.11809839488683391, z: 0.13887055751050842}
+        orientation: {x: -0.26790866048257905, y: -0.2622185975709204, z: -0.6525133891660432, w: 0.6585534402654153}
+      observe_table:
+        position: {x: 0.02160863957360322, y: -0.1310933191355222, z: 0.33769602460194537}
+        orientation: {x: -0.35328551634048977, y: -0.32020226597268203, z: -0.5842845082802226, w: 0.6567126207053827}
+      zero:
+        position: {x: 0.0210077843415008, y: -0.278950111258735, z: 0.24858389783148477}
+        orientation: {x: -0.4740206645801369, y: -0.4668084047044082, z: -0.523033090590171, w: 0.532757645647648}
+    skill_templates:
+      inspect_scene:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: observe_table
+      recover_safe_pose:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: home
+      recover_zero_pose:
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: zero
+      move_relative_ee:
+        primitive_sequence:
+          - primitive_name: move_relative_ee
+            motion_direction_from_request: true
+            motion_distance_from_request: true
+      open_gripper_skill:
+        primitive_sequence:
+          - primitive_name: open_gripper
+      close_gripper_skill:
+        primitive_sequence:
+          - primitive_name: close_gripper
+      rotate_gripper_cw:
+        primitive_sequence:
+          - primitive_name: rotate_gripper_cw
+            motion_distance_from_request: true
+      rotate_gripper_ccw:
+        primitive_sequence:
+          - primitive_name: rotate_gripper_ccw
+            motion_distance_from_request: true
+      dance_basic:
+        primitive_sequence:
+          - primitive_name: move_through_joint_positions
+            trajectory_template:
+              type: wave_dance_v1
+              waypoint_duration_sec: 0.05
+              active_waypoint_count: 120
+              repeat_count: 3
+              zero_hold_count: 4
+              base_pose:
+                "1": 0.02
+                "2": 0.54
+                "3": -0.82
+                "4": -0.18
+                "5": 0.02
+              joints:
+                "1":
+                  terms:
+                    - amplitude: 0
+                      harmonic: 1
+                      phase: 1.2
+                "2":
+                  terms:
+                    - amplitude: 0.3
+                      harmonic: 1
+                      phase: 0.0
+                    - amplitude: 0.03
+                      harmonic: 2
+                      phase: 1.5707963267948966
+                "3":
+                  terms:
+                    - amplitude: 0.3
+                      harmonic: 1
+                      phase: 0.0
+                    - amplitude: 0.06
+                      harmonic: 2
+                      phase: 1.5707963267948966
+                "4":
+                  terms:
+                    - amplitude: -0.8
+                      harmonic: 1
+                      phase: 0.45
+                    - amplitude: -0.05
+                      harmonic: 2
+                      phase: 1.8
+                "5":
+                  terms:
+                    - amplitude: 0.5
+                      harmonic: 1
+                      phase: 1.8
+              workspace_limits:
+                model: so101_arm_v1
+                points:
+                  joint3:
+                    z: [0.04, 0.55]
+                  upper_arm_mid:
+                    z: [0.03, 0.55]
+                  forearm_mid:
+                    z: [0.025, 0.55]
+                  wrist_mid:
+                    z: [0.025, 0.55]
+                  ee:
+                    x: [-0.32, 0.25]
+                    y: [-0.42, 0.00]
+                    z: [0.05, 0.55]
   # ros2_control configuration
   ros2_control:
     hardware_plugin: so101_hardware/SO101SystemHardware

@@ -22,6 +22,8 @@ class SafetyGuardNode(Node):
         self.declare_parameter("named_targets_json", "{}")
         self.declare_parameter("skill_templates_json", "{}")
         self.declare_parameter("workspace_json", "{}")
+        self.declare_parameter("arm_joint_names_json", "[]")
+        self.declare_parameter("joint_limits_json", "{}")
         self.declare_parameter("debug_tracing", False)
 
         self._validate_skill_service = self.get_parameter("validate_skill_service").get_parameter_value().string_value
@@ -36,6 +38,15 @@ class SafetyGuardNode(Node):
             self.get_parameter("skill_templates_json").get_parameter_value().string_value
         )
         self._workspace = load_json_mapping(self.get_parameter("workspace_json").get_parameter_value().string_value)
+        arm_joint_names = load_json_mapping(
+            '{"items": ' + self.get_parameter("arm_joint_names_json").get_parameter_value().string_value + "}"
+        ).get("items", [])
+        self._arm_joint_names = (
+            [str(joint_name) for joint_name in arm_joint_names] if isinstance(arm_joint_names, list) else []
+        )
+        self._joint_limits = load_json_mapping(
+            self.get_parameter("joint_limits_json").get_parameter_value().string_value
+        )
         self._debug = self.get_parameter("debug_tracing").get_parameter_value().bool_value
 
         self.create_service(ValidateSkill, self._validate_skill_service, self._handle_validate_skill)
@@ -58,6 +69,8 @@ class SafetyGuardNode(Node):
                 self._named_poses,
                 self._named_targets,
                 self._skill_templates,
+                self._arm_joint_names,
+                self._joint_limits,
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in skill validation: {exc}")
@@ -87,6 +100,14 @@ class SafetyGuardNode(Node):
                 request.gripper_position,
                 self._named_poses,
                 self._workspace,
+                list(request.joint_names),
+                list(request.joint_positions),
+                list(request.joint_waypoints),
+                request.joint_waypoint_count,
+                self._arm_joint_names,
+                self._joint_limits,
+                request.primitive_duration_sec,
+                request.waypoint_duration_sec,
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in primitive validation: {exc}")

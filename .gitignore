@@ -25,3 +25,10 @@ __pycache__/
 .opencode
 .swarm
 openspec
+
+# Temp/opencode artifacts
+.omo/
+.superpowers/
+.worktrees/
+get-docker.sh
+docs/superpowers/
