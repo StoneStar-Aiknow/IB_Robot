@@ -22,22 +22,23 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | **ibrobot-env** | 初始化运行环境，加载 `.shrc_local`、设置 `ROS_DOMAIN_ID` |
 | **ibrobot-architecture** | 理解 SSOT 架构设计、配置规范与数据流 |
 
-### 🔌 板端（BQ3588HM OpenHarmony）
+### 🔌 板端（OpenHarmony）
 
 | Skill | 一句话描述 |
 | :--- | :--- |
-| **ibrobot-hdc** | 连接 BQ3588HM 开发板，执行 hdc shell / file send / file recv 等板端操作 |
-| **ibrobot-bq3588hm-oh** | 管理贝启 BQ3588HM 开发板上的 OpenHarmony 运行时、ROS 环境与 Python 3.12 事实 |
-| **bq3588-oh-rknn** | 在 BQ3588HM OpenHarmony 板端拉起 RKNN cloud inference，封装 `cloud_inference.launch.py` 的运行环境 |
-| **oh-build-ibrobot** | 用 `build_ibrobot_oh_custom.sh` 主机侧交叉编译 IB_Robot 自有 OpenHarmony 包，并确认 lerobot OH patch 真正进入产物 |
-| **oh-cross-build-ros-pkg** | 将第三方 ROS 2 包（如 usb_cam）交叉编译移植到 BQ3588HM OpenHarmony 板 |
-| **oh-rebuild-kernel** | 重新编译并刷入 BQ3588HM 内核 (boot_linux.img)，启用 USB ACM 等驱动 |
+| **oh-constraints** | OpenHarmony 板端运行时约束（toybox/musl/只读 rootfs/无 systemd），板端操作前必读 |
+| **oh-access** | 连接 OpenHarmony 开发板，执行 hdc shell / file send / file recv、SSH 配置 |
+| **oh-build-roboframe** | 用 `build_roboframe_oh.sh` 主机侧交叉编译 IB_Robot 自有 OpenHarmony 包，并确认 lerobot OH patch 真正进入产物 |
+| **oh-cross-build-ros-pkg** | 将第三方 ROS 2 包（如 usb_cam）交叉编译移植到 OpenHarmony 板 |
+| **ohloha-build-pkg** | 用 `tools_ohloha_pkgs` / `builder.sh` 交叉编译第三方包（bash、zsh、vim 等）到 OpenHarmony 板端 |
+| **oh-rebuild-kernel** | 重新编译并刷入 OpenHarmony 内核 (boot_linux.img)，启用 USB ACM 等驱动 |
 
 ### 🧠 模型
 
 | Skill | 一句话描述 |
 | :--- | :--- |
 | **rknn-convert** | 将 ONNX 模型转换为 RKNN，并明确主 venv 导出 ONNX、`.venv-rknn` 转 RKNN 的分层流程 |
+| **hmm-convert** | 将 ACT / PI05 模型转后摩 HMM（xh2 NPU），涵盖 xhquant PTQ、tcim 编译与 PI05 6 模块拆分流程 |
 
 ### 🚀 工作流与验证
 
@@ -80,13 +81,15 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 帮我提交一个 Issue              → atomgit-issue
 修复 PR 里的评审意见            → atomgit-review-resolution
 编译一下项目                    → ibrobot-build
-看看 BQ3588HM 板子上的 OH 环境   → ibrobot-bq3588hm-oh
-连接 BQ3588HM 并推送文件         → ibrobot-hdc
-编译 OpenHarmony 板端 IB_Robot     → oh-build-ibrobot
-用 build_ibrobot_oh_custom.sh 构建 → oh-build-ibrobot
+板端写脚本/部署前看约束         → oh-constraints
+看看板子上的 OH 环境    → oh-constraints
+连接板端并推送文件              → oh-access
+编译 OpenHarmony 板端 IB_Robot     → oh-build-roboframe
+用 build_roboframe_oh.sh 构建 → oh-build-roboframe
 把 ONNX 转成 RKNN               → rknn-convert
-在 BQ3588HM 上启动 RKNN 推理     → bq3588-oh-rknn
+把 ACT/PI05 转成后摩 HMM         → hmm-convert
 把 usb_cam 移植到板端            → oh-cross-build-ros-pkg
+编译 bash/zsh/vim 到板端         → ohloha-build-pkg
 重新编译板端内核                 → oh-rebuild-kernel
 启动机器人仿真                  → ibrobot-launch
 初始化环境                      → ibrobot-env

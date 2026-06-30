@@ -1,11 +1,11 @@
 ---
 name: oh-rebuild-kernel
-description: "Rebuild and flash the Linux kernel (boot_linux.img) for the Bearkey BQ3588HM OpenHarmony board. Use when user needs to 'rebuild kernel', 'compile kernel', 'flash boot_linux', 'enable USB_ACM', 'enable USB_SERIAL_CH341', 'add kernel module', '内核编译', '刷入内核', '重新编译内核', 'kernel config', 'defconfig', or modify kernel configuration for the BQ3588HM board."
+description: "Rebuild and flash the Linux kernel (boot_linux.img) for OpenHarmony RK3588 board. Use when user needs to 'rebuild kernel', 'compile kernel', 'flash boot_linux', 'enable USB_ACM', 'enable USB_SERIAL_CH341', 'add kernel module', '内核编译', '刷入内核', '重新编译内核', 'kernel config', 'defconfig', or modify kernel configuration. Triggers for 'BQ3588HM', 'RoboPi'."
 ---
 
-# Rebuild BQ3588HM OpenHarmony Kernel
+# Rebuild OpenHarmony Kernel
 
-Rebuild the Linux kernel `boot_linux.img` for the Bearkey BQ3588HM OpenHarmony board to add/enable kernel drivers (e.g., USB ACM, USB serial, joystick).
+Rebuild the Linux kernel `boot_linux.img` for the OpenHarmony RK3588 board to add/enable kernel drivers (e.g., USB ACM, USB serial, joystick).
 
 ## When to Use This Skill
 
@@ -20,7 +20,7 @@ Rebuild the Linux kernel `boot_linux.img` for the Bearkey BQ3588HM OpenHarmony b
 - BQ3588HM board with OpenHarmony EmbodiedAI 1.0.1
 - OpenHarmony source code downloaded to `/data/oh_build` on the board (or accessible build environment)
 - SSH or HDC shell access to the board
-- `sudo` password: `admin`
+- `sudo` password: `<sudo_password>` (ask the user if unknown)
 
 ## Verified Kernel Config Additions
 
@@ -137,10 +137,9 @@ zcat /proc/config.gz 2>/dev/null | grep USB_ACM
 - OH source version: OpenHarmony EmbodiedAI 1.0.1
 - Build command: `./build.sh -p bq3588 --ccache`
 - Build output: `out/bq3588/packages/phone/images/boot_linux.img`
-- `sudo` password: `admin`
+- `sudo` password: `<sudo_password>` (ask the user if unknown)
 
 ## Related Skills
 
-- `ibrobot-hdc`: File transfer to/from board
-- `ibrobot-bq3588hm-oh`: Board runtime facts
-- `bq3588-oh-rknn`: Running RKNN inference on board
+- `oh-access`: File transfer to/from board
+- `oh-constraints`: Board runtime facts and constraints

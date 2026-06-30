@@ -111,22 +111,23 @@ source .shrc_local
 | [ibrobot-launch](.agents/skills/ibrobot-launch) | 启动机器人、运行仿真、测试推理、teleop |
 | [ibrobot-architecture](.agents/skills/ibrobot-architecture) | 架构、SSOT、契约、robot_config、数据流 |
 
-### 板端（BQ3588HM OpenHarmony）
+### 板端（OpenHarmony）
 
 | 技能 | 触发场景 |
 |------|---------|
-| [ibrobot-hdc](.agents/skills/ibrobot-hdc) | hdc shell、连接板端、推送/拉取文件 |
-| [ibrobot-bq3588hm-oh](.agents/skills/ibrobot-bq3588hm-oh) | 板端 OpenHarmony 运行时事实 |
-| [bq3588-oh-rknn](.agents/skills/bq3588-oh-rknn) | 板端 RKNN NPU 推理 |
-| [oh-build-ibrobot](.agents/skills/oh-build-ibrobot) | 主机侧交叉编译 IB_Robot 自有 OpenHarmony 包 |
+| [oh-constraints](.agents/skills/oh-constraints) | OpenHarmony 板端运行时约束（toybox/musl/只读 rootfs/无 systemd），板端操作前必读 |
+| [oh-access](.agents/skills/oh-access) | HDC/SSH 连接板端、推送/拉取文件、SSH 配置 |
+| [oh-build-roboframe](.agents/skills/oh-build-roboframe) | 主机侧交叉编译 RoboFrame 发布包（`build_roboframe_oh.sh`） |
 | [oh-cross-build-ros-pkg](.agents/skills/oh-cross-build-ros-pkg) | 交叉编译第三方 ROS 2 包到板端 |
-| [oh-rebuild-kernel](.agents/skills/oh-rebuild-kernel) | 重新编译并刷入 BQ3588HM 内核 |
+| [ohloha-build-pkg](.agents/skills/ohloha-build-pkg) | 用 tools_ohloha_pkgs 交叉编译第三方包（bash/zsh/vim 等）到板端 |
+| [oh-rebuild-kernel](.agents/skills/oh-rebuild-kernel) | 重新编译并刷入 OpenHarmony 内核 |
 
 ### 模型
 
 | 技能 | 触发场景 |
 |------|---------|
 | [rknn-convert](.agents/skills/rknn-convert) | ONNX 转 RKNN、NPU 部署、模型转换 |
+| [hmm-convert](.agents/skills/hmm-convert) | ACT/PI05 转后摩 HMM、xh2 编译、tcim、xhquant、LQ50/M50 |
 
 ### 工作流与验证
 

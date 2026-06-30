@@ -198,7 +198,6 @@ For detailed sub-module documentation, see:
 | Document | Description |
 | :--- | :--- |
 | [`src/inference_service/README.md`](src/inference_service/README.md) | Inference service architecture, single-host/distributed deployment, and NPU/GPU cloud node launch |
-| [`docs/OpenHarmony_thirdparty_pytorch_validation.md`](docs/OpenHarmony_thirdparty_pytorch_validation.md) | OpenHarmony board `thirdparty_pytorch` / `skh-run` setup, deployment, and validation progress |
 | [`src/robot_moveit/README.md`](src/robot_moveit/README.md) | MoveIt planning control, `/cmd_pose` usage, and headless launch |
 | [`src/dataset_tools/README.md`](src/dataset_tools/README.md) | Episodic recording, `record_cli` usage, and `bag_to_lerobot` dataset conversion |
 
@@ -335,10 +334,7 @@ ros2 topic hz /inference/action
 
 #### 3. OpenHarmony Board as Compute Side (RK3588)
 
-- **Host-side build entry**: Use `scripts/openharmony/build_ibrobot_oh_custom.sh`. The script prepares the OpenHarmony cross-compilation directory and applies `series.openharmony-5.1-musl.txt` patches to `lerobot` during packaging.
-- **Board-side PyTorch runtime**: Uses `thirdparty_pytorch`'s `test/skh-run.tar.gz`, deployed to `/data/local/skh-run`. IB_Robot's OpenHarmony inference node uses this runtime at the process level without polluting `/data/out/bin/ros2`.
-- **Offline weights**: The ACT policy uses `resnet18` + `ResNet18_Weights.IMAGENET1K_V1`. If the board has no internet, pre-place `resnet18-f37072fd.pth` in `/root/.cache/torch/hub/checkpoints/`.
-- **Current status**: BQ3588HM CPU inference verified; NPU inference pipeline is in progress.
+For the complete OpenHarmony board guide (build, deploy, RKNN inference, kernel, SSH), see **[README.OpenHarmony.md](README.OpenHarmony.md)**.
 
 ### IV. Dataset Recording
 

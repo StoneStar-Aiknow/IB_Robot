@@ -1,6 +1,6 @@
 ---
 name: ibrobot-build
-description: "Handles the specialized build and environment setup process. Use when user needs to 'build', 'compile', 'colcon build', 'build specific package', '编译', '构建', '解决编译错误', 'fix build errors', 'cb', 'cbp', or needs to refresh the workspace state after code changes. Triggers for 'compile code', '怎么编译', '项目构建', or build infrastructure issues."
+description: "colcon build for IB_Robot (Ubuntu / openEuler Embedded). Use when user needs to 'build', 'compile', 'colcon build', 'build specific package', '编译', '构建', '解决编译错误', 'fix build errors', 'cb', 'cbp', or needs to refresh the workspace state after code changes. NOT for OpenHarmony cross-builds — use oh-build-roboframe skill instead."
 ---
 
 # IB-Robot Build & Environment Skill
@@ -127,44 +127,6 @@ source .shrc_local && colcon build --symlink-install --merge-install --cmake-arg
 source .shrc_local && colcon build --symlink-install --merge-install --packages-select robot_config
 ```
 
-## OpenHarmony Host-Side Cross-Build Prerequisites
-
-When the task is specifically about:
-
-- `scripts/openharmony/build_ibrobot_oh_custom.sh`
-- OpenHarmony host-side cross-builds
-- `OH_ROOT`, `OH_DOWNLOAD_ROOT`, `OH_CUSTOM_ROOT`
-
-follow these additional rules.
-
-### These variables are host-side only
-
-The following variables are for the **Ubuntu host build layout**, not for the board runtime:
-
-- `OH_ROOT`
-- `OH_DOWNLOAD_ROOT`
-- `OH_CUSTOM_ROOT`
-
-The authoritative repo doc is:
-
-- `docs/BQ3588HM_OpenHarmony_ROS.md`
-  - **第 2 节：统一放到一个外部目录：推荐的主机目录布局**
-  - **第 4 节：`build_ibrobot_oh_custom.sh` 里的变量到底对应什么**
-
-### If `OH_ROOT` / `OH_DOWNLOAD_ROOT` / `OH_CUSTOM_ROOT` are missing
-
-Do **not** guess undocumented host paths.
-
-Instead, stop and ask the user to do one of:
-
-1. prepare and provide `OH_ROOT` according to `docs/BQ3588HM_OpenHarmony_ROS.md`
-2. provide explicit `--root`, `--sdk-tar`, `--sysdeps-tar`, and `--humble-tar` paths
-
-If the user also lacks a working `hdc`, point them to:
-
-- `docs/BQ3588HM_board_usage.md` → **第一阶段：HDC 调试工具准备**
-- `docs/BQ3588HM_OpenHarmony_ROS.md` → **1.4 OpenHarmony ROS SDK**
-
 ## Environment Setup Details
 
 ### What .shrc_local Does
@@ -286,31 +248,6 @@ source .shrc_local && colcon build --symlink-install --merge-install --packages-
 **Solution**: Source setup in same command:
 ```bash
 source .shrc_local && colcon build --symlink-install --merge-install --packages-select robot_config && source install/setup.zsh && python3 -c "import lerobot; print('OK')"
-```
-
-### Issue: `OH_ROOT` / `OH_DOWNLOAD_ROOT` / `OH_CUSTOM_ROOT` not set for OpenHarmony builds
-
-**Root Cause**: the host-side OpenHarmony cross-build layout has not been prepared yet
-
-**Solution**: follow:
-
-- `docs/BQ3588HM_OpenHarmony_ROS.md` → **第 2 节** and **第 4 节**
-
-Then either:
-
-```bash
-export OH_ROOT="<your-unified-oh-root>"
-./scripts/openharmony/build_ibrobot_oh_custom.sh --oh-root "$OH_ROOT" ...
-```
-
-or provide explicit tarball paths:
-
-```bash
-./scripts/openharmony/build_ibrobot_oh_custom.sh \
-  --root <custom_build_root> \
-  --sdk-tar <ohos-sdk-18-linux-aarch64-*.tar.gz> \
-  --sysdeps-tar <ohos-*-sysdeps-*.tar.gz> \
-  --humble-tar <ohos-humble-build-aarch64-*.tar.gz> ...
 ```
 
 ## Package-Specific Build Notes

@@ -39,7 +39,6 @@ def generate_camera_nodes(robot_config, use_sim=False):
         return []
 
     nodes = []
-    usb_cam_env = _openharmony_usb_cam_env()
 
     peripherals = robot_config.get("peripherals", [])
     logger.info(f"Generating nodes for {len(peripherals)} peripherals (use_sim={is_sim})")
@@ -117,7 +116,6 @@ def generate_camera_nodes(robot_config, use_sim=False):
                         ("camera_info", f"/camera/{name}/camera_info"),
                     ],
                     output="screen",
-                    additional_env=usb_cam_env,
                 )
             )
 
@@ -245,58 +243,6 @@ def generate_camera_nodes(robot_config, use_sim=False):
                 )
 
     return nodes
-
-
-def _openharmony_usb_cam_env():
-    """Return usb_cam process env fixes for the OpenHarmony board runtime."""
-    if not _is_openharmony_runtime():
-        return {}
-
-    ib_install = os.environ.get("IBROBOT_INSTALL_PREFIX", "/data/ibrobot/install")
-    ohos_ros_root = os.environ.get("OHOS_ROS2_ROOT", "/data")
-    ohos_sysdeps = os.environ.get("OHOS_ROS2_SYSDEPS", f"{ohos_ros_root}/out")
-    ros_install = f"{ohos_ros_root}/install"
-    python_home = os.environ.get("PYTHONHOME", "/data/local/skh-run/usr")
-
-    lib_paths = [
-        f"{ib_install}/usb_cam/lib",
-        f"{ib_install}/ibrobot_msgs/lib",
-        f"{ib_install}/robot_config/lib",
-        f"{ros_install}/lib",
-        f"{ohos_sysdeps}/lib",
-        f"{python_home}/lib",
-        "/vendor/lib64",
-    ]
-    existing_ld = os.environ.get("LD_LIBRARY_PATH")
-    if existing_ld:
-        lib_paths.extend(existing_ld.split(":"))
-
-    preload = ":".join(lib for lib in os.environ.get("LD_PRELOAD", "").split(":") if lib and "libpython" not in lib)
-    if not preload:
-        preload = f"{python_home}/lib/libomp.so"
-
-    ament_prefixes = [
-        f"{ib_install}/usb_cam",
-        f"{ib_install}/robot_config",
-        f"{ib_install}/ibrobot_msgs",
-        f"{ib_install}/so101_hardware",
-        f"{ib_install}/robot_description",
-        ros_install,
-    ]
-    existing_ament = os.environ.get("AMENT_PREFIX_PATH")
-    if existing_ament:
-        ament_prefixes.extend(existing_ament.split(":"))
-
-    env = {
-        "LD_LIBRARY_PATH": ":".join(dict.fromkeys(p for p in lib_paths if p)),
-        "LD_PRELOAD": preload,
-        "RMW_IMPLEMENTATION": os.environ.get("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp"),
-        "AMENT_PREFIX_PATH": ":".join(dict.fromkeys(p for p in ament_prefixes if p)),
-        "HOME": os.environ.get("HOME", "/root"),
-    }
-    if "ROS_DOMAIN_ID" in os.environ:
-        env["ROS_DOMAIN_ID"] = os.environ["ROS_DOMAIN_ID"]
-    return env
 
 
 def _is_openharmony_runtime() -> bool:

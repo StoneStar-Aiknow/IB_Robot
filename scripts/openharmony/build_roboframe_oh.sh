@@ -36,7 +36,7 @@ OH_CUSTOM_TOOLCHAIN_ROOT="${OH_CUSTOM_TOOLCHAIN_ROOT:-}"
 OH_CUSTOM_SDK_TAR_GLOB="${OH_CUSTOM_SDK_TAR_GLOB:-}"
 OH_CUSTOM_IMAGE="${OH_CUSTOM_IMAGE:-voxelsky/ohos-ros-humble-builder:v0.1.5}"
 OH_CUSTOM_CONTAINER_NAME="${OH_CUSTOM_CONTAINER_NAME:-ibrobot-oh-build}"
-OH_CUSTOM_PREFIX="${OH_CUSTOM_PREFIX:-/data/ibrobot/install}"
+OH_CUSTOM_PREFIX="${OH_CUSTOM_PREFIX:-/data/roboframe/install}"
 OH_BOARD_ROS_PREFIX="${OH_BOARD_ROS_PREFIX:-/data/install}"
 OH_BOARD_TORCH_RUNTIME_ROOT="${OH_BOARD_TORCH_RUNTIME_ROOT:-/data/local/skh-run}"
 OH_CUSTOM_CPU="${OH_CUSTOM_CPU:-aarch64}"
@@ -66,10 +66,10 @@ declare -a CMAKE_ARGS=()
 
 usage() {
     cat <<'EOF'
-Usage: scripts/openharmony/build_ibrobot_oh_custom.sh [options]
+Usage: scripts/openharmony/build_roboframe_oh.sh [options]
 
 Prepare and run the official OpenHarmony ROS custom-package cross-build for the
-minimum IB_Robot inference workspace.
+RoboFrame (IB_Robot) inference workspace.
 
 Options:
   --oh-root <dir>          Unified external OpenHarmony root (recommended)
@@ -83,7 +83,7 @@ Options:
                            (default: <OH_ROOT>/downloads/sysdeps/ohos-*-sysdeps-*.tar.gz)
   --humble-tar <path>      OH ROS 2 Humble runtime tarball
                            (default: <OH_ROOT>/downloads/runtime/ohos-humble-build-aarch64-*.tar.gz)
-  --custom-prefix <path>   Final on-device install prefix (default: /data/ibrobot/install)
+  --custom-prefix <path>   Final on-device install prefix (default: /data/roboframe/install)
   --cpu <arch>             Target OHOS CPU (default: aarch64)
   --image <image>          Builder image (default: voxelsky/ohos-ros-humble-builder:v0.1.5)
   --container-name <name>  Container name (default: ibrobot-oh-build)

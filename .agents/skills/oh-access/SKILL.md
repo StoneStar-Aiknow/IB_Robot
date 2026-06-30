@@ -1,14 +1,14 @@
 ---
-name: ibrobot-hdc
-description: "Handles stable OpenHarmony HDC-over-TCP access to the Bearkey BQ3588HM board. Use when user wants to 'hdc shell', 'connect board', 'send file to OH', 'pull file from OH', 'OpenHarmony device', 'BQ3588HM', '网络调试', '推送文件', '拉取文件', or run commands on the flashed board."
+name: oh-access
+description: "Handles OpenHarmony board access via HDC (always available) and SSH (configurable). Use when user wants to 'hdc shell', 'connect board', 'send file to OH', 'pull file from OH', 'OpenHarmony device', 'BQ3588HM', 'RoboPi', '网络调试', '推送文件', '拉取文件', 'SSH 配置', 'setup_sshd', or run commands on the board. HDC is the built-in debug transport; SSH needs setup via scripts/setup_sshd.sh."
 ---
 
-# IB-Robot OpenHarmony HDC Skill
+# OpenHarmony 板端访问 Skill (HDC + SSH)
 
 This skill standardizes all host-to-board interactions through the local SDK `hdc` binary and a
 user-provided board target.
 
-For board-local runtime facts such as ROS bootstrap, Python 3.12 availability, or the read-only-root workaround around `ros2ohos.env`, use `ibrobot-bq3588hm-oh`.
+For board-local runtime facts such as ROS bootstrap, Python 3.12 availability, or the read-only-root workaround around `robooh_1.0.1.env`, use `oh-constraints`.
 
 ## Required Connection Inputs
 
@@ -40,8 +40,7 @@ If `command -v hdc` fails:
 
 When asking the user, point them to these repo docs:
 
-- `docs/BQ3588HM_board_usage.md` → **第一阶段：HDC 调试工具准备**
-- `docs/BQ3588HM_OpenHarmony_ROS.md` → **1.4 OpenHarmony ROS SDK**
+- `docs/OpenHarmony_EmbodiedAI_Board_Setup.md` → **第一阶段：HDC 调试工具准备**
 
 These two docs explain where the OpenHarmony SDK comes from, where to extract the `hdc`
 binary from on the host, and how to export the `toolchains` directory into `PATH`.
@@ -155,9 +154,9 @@ If USB is available and TCP is not ready yet, use it to enable TCP mode or opera
 "$HDC_BIN" tconn "$HDC_TARGET"
 ```
 
-## Board-Specific Notes
+## Board Notes
 
-- Current board: Bearkey BQ3588HM
+- Current board: any OpenHarmony EmbodiedAI 1.0.1 board (BQ3588HM, RoboPi, etc.)
 - Current target: user-provided TCP target such as `<board-ip>:8710`, or a direct USB HDC session
 - Current local SDK tool: `hdc` from `$PATH`
 - Verified remote paths of interest: `/data`, `/system`, `/vendor`
