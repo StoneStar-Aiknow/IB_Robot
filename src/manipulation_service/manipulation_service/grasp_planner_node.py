@@ -661,7 +661,7 @@ def _render_debug_previews(
     )
 
     if metadata["status"] == "failed":
-        logger.warn(f"Failed to render grasp debug previews: {metadata['errors']}")
+        logger.warning(f"Failed to render grasp debug previews: {metadata['errors']}")
     else:
         logger.info(f"Rendered grasp debug previews in {out_dir}")
 
