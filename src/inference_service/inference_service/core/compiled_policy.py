@@ -25,6 +25,20 @@ SD3403_OUTPUT_LAYOUTS = {"direct", "strided"}
 # input_features. The first one with a usable [C,H,W] shape wins.
 _SD3403_IMAGE_FEATURE_KEYS = ("observation.images.top", "observation.images.wrist")
 
+# Per-backend compiled manifest filenames. The OM backend keeps the historical
+# ``config.om.json``; the Houmo HMM backend uses ``config.hmm.json``.
+_MANIFEST_BASENAMES: dict[str, str] = {
+    "ascend_om": "config.om.json",
+    "ascend_om_3403": "config.om.json",
+    "hmm": "config.hmm.json",
+}
+
+
+def manifest_basename_for_backend(backend: str) -> str:
+    """Return the compiled-manifest filename expected for a backend."""
+    normalized = normalize_backend_name(backend)
+    return _MANIFEST_BASENAMES.get(normalized, COMPILED_MANIFEST_BASENAME)
+
 
 @dataclass(frozen=True)
 class CompiledManifest:
@@ -207,12 +221,12 @@ def _policy_config_path(path: str) -> Path | None:
     return None
 
 
-def _manifest_config_path(path: str) -> Path | None:
+def _manifest_config_path(path: str, basename: str = COMPILED_MANIFEST_BASENAME) -> Path | None:
     candidate = Path(path).expanduser()
-    if candidate.is_file() and candidate.name == COMPILED_MANIFEST_BASENAME:
+    if candidate.is_file() and candidate.name == basename:
         return candidate
     if candidate.is_dir():
-        manifest_path = candidate / COMPILED_MANIFEST_BASENAME
+        manifest_path = candidate / basename
         if manifest_path.is_file():
             return manifest_path
     return None
@@ -256,11 +270,10 @@ def _resolve_manifest_artifact_path(base_dir: Path, value: Any, role: str) -> Pa
 
 
 def load_compiled_manifest(path: str, backend: str, policy_type: str | None = None) -> CompiledManifest | None:
-    manifest_path = _manifest_config_path(path)
+    basename = manifest_basename_for_backend(backend)
+    manifest_path = _manifest_config_path(path, basename)
     if manifest_path is None:
-        raise FileNotFoundError(
-            f"Compiled backend {backend} requires {COMPILED_MANIFEST_BASENAME} under policy_path {path}"
-        )
+        raise FileNotFoundError(f"Compiled backend {backend} requires {basename} under policy_path {path}")
     data = _read_json_object(manifest_path)
     manifest_backend = str(data.get("backend", "")).lower().strip()
     if manifest_backend and normalize_backend_name(manifest_backend) != normalize_backend_name(backend):
@@ -519,6 +532,10 @@ class _PI05ConfigView:
         self.chunk_size = _chunk_size_from_config(config)
         self.max_action_dim = int(config.get("max_action_dim", 32))
         self.num_inference_steps = int(config.get("num_inference_steps", 10))
+        # SmolVLA's denoise loop uses ``num_steps`` (flow-matching steps).
+        self.num_steps = int(config.get("num_steps", self.num_inference_steps))
+        self.min_period = float(config.get("min_period", 0.004))
+        self.max_period = float(config.get("max_period", 4.0))
         self.image_features = _ordered_pi05_image_features(config)
 
 
@@ -646,8 +663,9 @@ class PI05CompiledAdapter:
             raise ValueError(f"Compiled backend {backend} policy config is missing required type metadata")
         if policy_type != "pi05":
             raise ValueError(f"Compiled backend {backend} does not support policy type {policy_type!r}")
-        if normalize_backend_name(backend) != "ascend_om":
-            raise ValueError(f"Compiled backend {backend} does not support PI05 OM policy")
+        normalized_backend = normalize_backend_name(backend)
+        if normalized_backend not in ("ascend_om", "hmm"):
+            raise ValueError(f"Compiled backend {backend} does not support PI05 policy")
         return cls(config, backend)
 
     @property
@@ -697,9 +715,85 @@ class PI05CompiledAdapter:
         return action
 
 
+class SmolVLACompiledAdapter:
+    """Input/output adapter for SmolVLA on the Houmo HMM backend.
+
+    SmolVLA shares PI05's observation contract (per-camera images + language
+    tokens/masks + optional noise) and its compiled HMM model returns a single
+    ``[chunk_size, action_dim]`` action tensor, so the plumbing mirrors
+    :class:`PI05CompiledAdapter`.
+    """
+
+    def __init__(self, config: dict[str, Any], backend: str):
+        self._config = config
+        self._backend = backend
+        self._chunk_size = _chunk_size_from_config(config)
+        self._max_action_dim = int(config.get("max_action_dim", 32))
+        self._action_dim = _real_action_dim_from_config(config, self._max_action_dim)
+        self._image_features = _ordered_pi05_image_features(config)
+
+    @classmethod
+    def from_config(cls, config: dict[str, Any], backend: str) -> SmolVLACompiledAdapter:
+        policy_type = str(config.get("type", "")).lower().strip()
+        if not policy_type:
+            raise ValueError(f"Compiled backend {backend} policy config is missing required type metadata")
+        if policy_type != "smolvla":
+            raise ValueError(f"Compiled backend {backend} does not support policy type {policy_type!r}")
+        if normalize_backend_name(backend) != "hmm":
+            raise ValueError(f"Compiled backend {backend} does not support SmolVLA policy")
+        return cls(config, backend)
+
+    @property
+    def policy_type(self) -> str:
+        return "smolvla"
+
+    @property
+    def uses_action_chunking(self) -> bool:
+        return True
+
+    def get_chunk_size(self) -> int:
+        return self._chunk_size
+
+    def prepare_inputs(self, batch: dict[str, Tensor]) -> PI05RuntimeInputs:
+        images: list[np.ndarray] = []
+        for key in self._image_features:
+            if key not in batch:
+                raise KeyError(f"Missing SmolVLA image tensor for {self._backend}: {key}")
+            images.append(_to_numpy_float32(batch[key]))
+        if not images:
+            raise ValueError("SmolVLA compiled policy config must define at least one VISUAL input feature")
+
+        tokens = batch.get("observation.language.tokens", batch.get("lang_tokens"))
+        masks = batch.get("observation.language.attention_mask", batch.get("lang_masks"))
+        if tokens is None or masks is None:
+            raise KeyError("Missing SmolVLA language tokens or attention masks")
+
+        return PI05RuntimeInputs(
+            images=images,
+            tokens=_to_numpy_int64(tokens),
+            masks=_to_numpy_bool(masks),
+            noise=_to_numpy_optional(batch.get("_noise")),
+        )
+
+    def decode_outputs(self, raw: Any, device: torch.device) -> Tensor:
+        if isinstance(raw, list):
+            if not raw:
+                raise RuntimeError(f"Compiled backend {self._backend} returned no outputs")
+            raw = raw[0]
+        if raw is None:
+            raise RuntimeError(f"Compiled backend {self._backend} returned no outputs")
+        if getattr(raw, "shape", None) is not None and raw.shape[-1] > self._action_dim:
+            raw = raw[..., : self._action_dim]
+        action = _as_action_tensor(raw, device)
+        if action.ndim >= 2:
+            self._chunk_size = int(action.shape[-2])
+        return action
+
+
 ADAPTER_REGISTRY: dict[str, type[CompiledModelAdapter]] = {
     "act": ACTCompiledAdapter,
     "pi05": PI05CompiledAdapter,
+    "smolvla": SmolVLACompiledAdapter,
 }
 
 
@@ -942,6 +1036,169 @@ class RKNNRuntimeSession:
             self._rknn = None
 
 
+def resolve_hmm_model_path(path: str, config: dict[str, Any] | None = None) -> Path:
+    """Resolve the compiled Houmo ``.hmm`` artifact for the single-module ACT HMM backend.
+
+    Priority: ``config.hmm.json`` manifest ``policy`` role > env override >
+    directory conventions (``model.hmm``, ``<dir>.hmm``, any ``*.hmm``).
+    """
+    del config
+    env_path = os.environ.get("HMM_MODEL_PATH", "").strip()
+    raw_path = Path(path).expanduser()
+    candidates: list[Path] = []
+
+    if env_path:
+        candidates.append(Path(env_path).expanduser())
+
+    if raw_path.is_file() and raw_path.suffix == ".hmm":
+        candidates.append(raw_path)
+    if raw_path.is_dir():
+        candidates.extend([raw_path / "model.hmm", raw_path / f"{raw_path.name}.hmm"])
+        candidates.extend(sorted(raw_path.glob("*.hmm")))
+
+    checked: list[str] = []
+    for candidate in candidates:
+        candidate = candidate.expanduser()
+        checked.append(str(candidate))
+        if candidate.is_file() and candidate.suffix == ".hmm":
+            return candidate.resolve()
+    raise FileNotFoundError("HMM model file not found under policy_path. Checked: " + ", ".join(checked))
+
+
+class HMMRuntimeSession:
+    """Runtime session for the Houmo HMM (LQ50 / M50 xh2) backend.
+
+    Dispatches by ``policy_type``:
+
+    - ``act``: single compiled ``.hmm`` module via ``tcim_lite.runtime`` with the
+      same ``list[np.ndarray]`` I/O contract as ``RKNNRuntimeSession`` (shares
+      ``ACTCompiledAdapter``).
+    - ``pi05`` / ``smolvla``: multi-module orchestrator (``PI05HMMModel`` /
+      ``SmolVLAHMMModel``) that drives ``tcim_lite.runtime`` and runs the denoise
+      loop on the host, with KV-cache handoff by device-pointer sharing.
+    """
+
+    def __init__(self) -> None:
+        self._mode: str | None = None
+        # ACT single-module path
+        self._module: Any = None
+        self._input_names: list[str] = []
+        # pi05 / smolvla multi-module path
+        self._model: Any = None
+
+    def load(self, policy_path: str, config: dict[str, Any], device: torch.device) -> None:
+        del device
+        policy_type = str(config.get("type", "")).lower().strip()
+
+        if policy_type == "act":
+            model_path = resolve_hmm_model_path(policy_path)
+            import tcim_lite as tcim  # type: ignore[import-not-found]
+
+            self._module = tcim.runtime.load(str(model_path))
+            self._input_names = [self._module.get_input_name(i) for i in range(self._module.get_num_inputs())]
+            self._mode = "act"
+            return
+
+        manifest = load_compiled_manifest(policy_path, "hmm", policy_type)
+        if manifest is None:
+            raise FileNotFoundError(f"HMM backend requires config.hmm.json under policy_path {policy_path}")
+
+        if policy_type == "pi05":
+            manifest.require_execution(["vision", "prefill", "decode", "time_mlp", "action_in_proj", "action_out_proj"])
+            from inference_service.core.hmm.pi05.PI05HMMModel import PI05HMMModel
+
+            self._model = PI05HMMModel(
+                vision_path=str(manifest.require_artifact("vision", suffix=".hmm")),
+                prefill_path=str(manifest.require_artifact("prefill", suffix=".hmm")),
+                decode_path=str(manifest.require_artifact("decode", suffix=".hmm")),
+                time_mlp_path=str(manifest.require_artifact("time_mlp", suffix=".hmm")),
+                action_in_proj_path=str(manifest.require_artifact("action_in_proj", suffix=".hmm")),
+                action_out_proj_path=str(manifest.require_artifact("action_out_proj", suffix=".hmm")),
+                embedding_path=str(manifest.require_artifact("embedding")),
+                config=_PI05ConfigView(config),
+            )
+            self._mode = "pi05"
+        elif policy_type == "smolvla":
+            manifest.require_execution(["vision", "prefill", "action"])
+            from inference_service.core.hmm.smolvla.SmolVLAHMMModel import SmolVLAHMMModel
+
+            self._model = SmolVLAHMMModel(
+                vision_path=str(manifest.require_artifact("vision", suffix=".hmm")),
+                prefill_path=str(manifest.require_artifact("prefill", suffix=".hmm")),
+                action_path=str(manifest.require_artifact("action", suffix=".hmm")),
+                embedding_path=str(manifest.require_artifact("embedding")),
+                config=_PI05ConfigView(config),
+            )
+            self._mode = "smolvla"
+        else:
+            raise ValueError(f"HMM backend does not support policy type {policy_type!r}")
+
+    def execute(self, inputs: list[np.ndarray] | PI05RuntimeInputs) -> list[np.ndarray] | Tensor:
+        if self._mode is None:
+            raise RuntimeError("HMMRuntimeSession is not loaded")
+
+        if self._mode == "act":
+            return self._execute_act(inputs)  # type: ignore[arg-type]
+        return self._execute_multi(inputs)  # type: ignore[arg-type]
+
+    def _execute_act(self, inputs: list[np.ndarray]) -> list[np.ndarray]:
+        if self._module is None:
+            raise RuntimeError("HMMRuntimeSession is not loaded")
+        if len(inputs) != len(self._input_names):
+            raise RuntimeError(f"HMMRuntimeSession expected {len(self._input_names)} inputs, got {len(inputs)}")
+        for name, data in zip(self._input_names, inputs, strict=False):
+            self._module.set_input(name, data)
+        self._module.run()
+        self._module.sync()
+
+        outputs: list[np.ndarray] = []
+        for i in range(self._module.get_num_outputs()):
+            name = self._module.get_output_name(i)
+            output = self._module.get_output(name)
+            cast = getattr(output, "astype", None)
+            if callable(cast):
+                output = cast(np.float32)
+            to_numpy = getattr(output, "numpy", None)
+            if callable(to_numpy):
+                output = to_numpy()
+            outputs.append(np.ascontiguousarray(np.asarray(output, dtype=np.float32)))
+        if not outputs:
+            raise RuntimeError("HMM inference returned no outputs")
+        return outputs
+
+    def _execute_multi(self, inputs: PI05RuntimeInputs) -> Tensor:
+        if self._model is None:
+            raise RuntimeError("HMMRuntimeSession is not loaded")
+        if not isinstance(inputs, PI05RuntimeInputs):
+            raise TypeError("HMMRuntimeSession (multi-module) expects PI05RuntimeInputs")
+        from inference_service.core.hmm.pi05.PI05HMMModel import (
+            build_prefix_att_2d_masks_4d_np,
+        )
+
+        prefix_mask = build_prefix_att_2d_masks_4d_np(
+            num_cameras=len(inputs.images),
+            lang_masks=inputs.masks,
+            prefix_seq_len=self._model.prefix_seq_len,
+        )
+        return self._model.forward(
+            inputs.images,
+            torch.as_tensor(inputs.tokens),
+            torch.as_tensor(inputs.masks),
+            prefix_mask,
+            noise=inputs.noise,
+        )
+
+    def release(self) -> None:
+        if self._model is not None:
+            close = getattr(self._model, "close", None)
+            if callable(close):
+                close()
+            self._model = None
+        self._module = None
+        self._input_names = []
+        self._mode = None
+
+
 def create_runtime_session(backend: str, config: dict[str, Any] | None = None) -> RuntimeSession:
     normalized = normalize_backend_name(backend)
     if normalized == "ascend_om":
@@ -953,6 +1210,8 @@ def create_runtime_session(backend: str, config: dict[str, Any] | None = None) -
         return SD3403RuntimeSession()
     if normalized == "rknn":
         return RKNNRuntimeSession()
+    if normalized == "hmm":
+        return HMMRuntimeSession()
     raise ValueError(f"Unsupported compiled inference backend: {backend}")
 
 

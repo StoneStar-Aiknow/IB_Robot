@@ -61,6 +61,14 @@ _LAZY_EXPORTS = {
         "inference_service.core.rknn",
         "create_rknn_policy_wrapper",
     ),
+    "HMMPolicyWrapper": (
+        "inference_service.core.hmm",
+        "HMMPolicyWrapper",
+    ),
+    "create_hmm_policy_wrapper": (
+        "inference_service.core.hmm",
+        "create_hmm_policy_wrapper",
+    ),
 }
 
 
@@ -85,6 +93,8 @@ __all__ = [
     "resolve_om_model_path",
     "RKNNPolicyWrapper",
     "create_rknn_policy_wrapper",
+    "HMMPolicyWrapper",
+    "create_hmm_policy_wrapper",
     "TensorPreprocessor",
     "PreprocessorBase",
     "MockPreprocessor",
