@@ -96,8 +96,8 @@ if [[ -d "${EXTRAS_DIR}" ]]; then
         tar xzf "${tar_file}" -C "${PKG_ROOT}/pysite" 2>/dev/null || true
         log_info "  Extracted $(basename "${tar_file}")"
     done
-    whl_file="${EXTRAS_DIR}/rknn_toolkit_lite2.whl"
-    if [[ -f "${whl_file}" ]]; then
+    whl_file=$(ls "${EXTRAS_DIR}"/rknn_toolkit_lite2*.whl 2>/dev/null | head -1)
+    if [[ -n "${whl_file}" && -f "${whl_file}" ]]; then
         python3 -c "
 import zipfile, os, glob
 with zipfile.ZipFile('${whl_file}') as zf:
@@ -107,7 +107,7 @@ for d in ['api', 'api/npu_config', 'utils']:
     for f in glob.glob(pattern):
         os.rename(f, f.replace('linux-gnu.so', 'linux-ohos.so'))
 " 2>/dev/null || true
-        log_info "  Extracted rknn_toolkit_lite2.whl (+ .so renamed)"
+        log_info "  Extracted $(basename "${whl_file}") (+ .so renamed)"
     fi
 else
     log_info "  No extras directory at ${EXTRAS_DIR}, skipping"
