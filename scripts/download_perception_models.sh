@@ -1,12 +1,12 @@
 #!/bin/bash
-# download_detection_models.sh - Download detection model assets
-# Downloads SAM2, Grounding-DINO, and the BERT text encoder used by detection_service.
+# download_perception_models.sh - Download perception model assets
+# Downloads SAM2, Grounding-DINO, and the BERT text encoder used by perception_service.
 #
 # Usage:
-#   ./scripts/download_detection_models.sh              # Download all
-#   ./scripts/download_detection_models.sh --sam-only   # Download SAM2 only
-#   ./scripts/download_detection_models.sh --gdino-only # Download Grounding-DINO only
-#   ./scripts/download_detection_models.sh --target /custom/path  # Custom target directory
+#   ./scripts/download_perception_models.sh              # Download all
+#   ./scripts/download_perception_models.sh --sam-only   # Download SAM2 only
+#   ./scripts/download_perception_models.sh --gdino-only # Download Grounding-DINO only
+#   ./scripts/download_perception_models.sh --target /custom/path  # Custom target directory
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,10 +38,10 @@ fi
 
 usage() {
     cat <<'EOF'
-Download detection model assets for IB-Robot.
+Download perception model assets for IB-Robot.
 
 Usage:
-  ./scripts/download_detection_models.sh [OPTIONS]
+  ./scripts/download_perception_models.sh [OPTIONS]
 
 Options:
   --sam-only       Download SAM2 model only
@@ -116,7 +116,7 @@ try:
 except ModuleNotFoundError as exc:
     raise SystemExit(
         "Error: huggingface_hub is required to download bert-base-uncased. "
-        "Install detection dependencies first with ./scripts/setup.sh --with-detection."
+        "Install perception dependencies first with ./scripts/setup.sh --with-perception."
     ) from exc
 
 repo_id = sys.argv[1]

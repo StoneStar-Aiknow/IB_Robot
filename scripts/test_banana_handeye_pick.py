@@ -72,7 +72,11 @@ def parse_args() -> argparse.Namespace:
         help="Centroid mode only: minimum valid depth points inside the mask",
     )
     parser.add_argument(
-        "--grasp-service", default="/grasp_planner/plan_grasp", help="PlanGrasp service name for GraspGen candidates"
+        "--manipulation-service",
+        "--grasp-service",
+        dest="manipulation_service",
+        default="/grasp_planner/plan_grasp",
+        help="PlanGrasp service name for GraspGen candidates",
     )
     parser.add_argument("--grasp-threshold", type=float, default=0.50, help="GraspGen discriminator threshold")
     parser.add_argument(
@@ -234,7 +238,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--contact-realign-max-iterations",
         type=int,
-        default=2,
+        default=4,
         help="Maximum correction moves after the first descent to reduce actual contact error",
     )
 
@@ -855,7 +859,7 @@ class BananaHandeyePickClient(Node):
         super().__init__("banana_handeye_pick_test")
         self.args = args
         self.detect_client = self.create_client(DetectSegment, args.detect_service)
-        self.grasp_client = self.create_client(PlanGrasp, args.grasp_service)
+        self.grasp_client = self.create_client(PlanGrasp, args.manipulation_service)
         self.task_client = ActionClient(self, ExecuteTaskPlan, args.task_action)
         self.ik_client = self.create_client(GetPositionIK, args.ik_service) if args.ik_filter else None
         self.tf_buffer = tf2_ros.Buffer()
@@ -985,7 +989,7 @@ class BananaHandeyePickClient(Node):
             and self.args.target_source == "graspgen"
             and not self.grasp_client.wait_for_service(timeout_sec=self.args.ready_timeout_s)
         ):
-            raise RuntimeError(f"GraspGen service is not available: {self.args.grasp_service}")
+            raise RuntimeError(f"Manipulation service is not available: {self.args.manipulation_service}")
         if (
             needs_perception
             and needs_detection
@@ -1979,7 +1983,7 @@ def main() -> None:
         print(
             f"CONFIG observe=({args.observe_x:.4f},{args.observe_y:.4f},{args.observe_z:.4f}) "
             f"prompt={args.prompt} target_source={args.target_source} handeye={args.handeye_json} "
-            f"grasp_service={args.grasp_service} tcp=({args.tcp_x:.4f},{args.tcp_y:.4f},{args.tcp_z:.4f})",
+            f"manipulation_service={args.manipulation_service} tcp=({args.tcp_x:.4f},{args.tcp_y:.4f},{args.tcp_z:.4f})",
             flush=True,
         )
         node.check_handeye_quality()

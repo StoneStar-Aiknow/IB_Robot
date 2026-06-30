@@ -185,6 +185,19 @@ def _debug_output_enabled(mode: str) -> bool:
     return mode in {_DEBUG_OUTPUT_DIAGNOSTIC, _DEBUG_OUTPUT_FULL}
 
 
+def _candidate_debug_record(index: int, candidate) -> dict:
+    return {
+        "index": index,
+        "confidence": round(float(candidate.confidence), 6),
+        "collision_free": bool(candidate.collision_free),
+        "target_width_m": round(float(candidate.target_width_m), 6),
+        "target_width_quality": round(float(candidate.target_width_quality), 3),
+        "width_axis_camera": [round(float(v), 6) for v in candidate.width_axis_camera],
+        "position_xyz": [round(float(v), 6) for v in candidate.pose_4x4[:3, 3]],
+        "pose_4x4_rowmajor": candidate.pose_4x4.flatten().tolist(),
+    }
+
+
 def _points_from_pixels(depth_m, ys, xs, fx, fy, cx, cy):
     zs = depth_m[ys, xs]
     x3d = (xs - cx) * zs / fx
@@ -565,9 +578,15 @@ def _render_debug_previews(
     interactive_max_points: int,
     interactive_show_scene: bool,
     logger,
+    file_prefix: str = "grasp",
 ):
+    preview_name = f"{file_prefix}_preview.png"
+    labeled_preview_name = f"{file_prefix}_preview_labeled.png"
+    interactive_name = f"{file_prefix}_preview.html"
+    metadata_name = f"{file_prefix}_preview_meta.json"
     metadata = {
         "status": "ok",
+        "file_prefix": file_prefix,
         "show_scene": show_scene,
         "render_labels": render_labels,
         "render_interactive": render_interactive,
@@ -588,13 +607,13 @@ def _render_debug_previews(
             colors,
             candidates,
             gripper_name,
-            out_dir / "grasp_preview.png",
+            out_dir / preview_name,
             max_grasps,
             width,
             height,
             False,
         )
-        metadata["images"].append("grasp_preview.png")
+        metadata["images"].append(preview_name)
     except Exception as exc:
         metadata["errors"].append(f"preview: {exc}")
 
@@ -605,13 +624,13 @@ def _render_debug_previews(
                 colors,
                 candidates,
                 gripper_name,
-                out_dir / "grasp_preview_labeled.png",
+                out_dir / labeled_preview_name,
                 max_grasps,
                 width,
                 height,
                 True,
             )
-            metadata["images"].append("grasp_preview_labeled.png")
+            metadata["images"].append(labeled_preview_name)
         except Exception as exc:
             metadata["errors"].append(f"labeled_preview: {exc}")
 
@@ -624,19 +643,19 @@ def _render_debug_previews(
                 scene_colors,
                 candidates,
                 gripper_name,
-                out_dir / "grasp_preview.html",
+                out_dir / interactive_name,
                 max_grasps,
                 interactive_max_points,
                 interactive_show_scene,
             )
-            metadata["interactive"].append("grasp_preview.html")
+            metadata["interactive"].append(interactive_name)
         except Exception as exc:
             metadata["errors"].append(f"interactive_preview: {exc}")
 
     if metadata["errors"]:
         metadata["status"] = "partial" if metadata["images"] else "failed"
 
-    (out_dir / "grasp_preview_meta.json").write_text(
+    (out_dir / metadata_name).write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
@@ -657,8 +676,8 @@ class GraspPlannerNode(Node):
         self.declare_parameter("device", "cuda")
         self.declare_parameter("gripper_config", "graspgen_robotiq_2f_140.yml")
         self.declare_parameter("model_dir", "")
-        self.declare_parameter("depth_topic", "/camera/front/aligned_depth_to_color/image_raw")
-        self.declare_parameter("camera_info_topic", "/camera/front/camera_info")
+        self.declare_parameter("depth_topic", "/camera/wrist/aligned_depth_to_color/image_raw")
+        self.declare_parameter("camera_info_topic", "/camera/wrist/aligned_depth_to_color/camera_info")
         self.declare_parameter("detect_service", "/grounded_sam2/detect_and_segment")
         self.declare_parameter("grasp_threshold", 0.5)
         self.declare_parameter("num_grasps", 2000)
@@ -722,7 +741,7 @@ class GraspPlannerNode(Node):
             device=device,
             collision_gripper=collision_gripper,
         )
-        self.get_logger().info("GraspGen models loaded.")
+        self.get_logger().info(f"GraspGen models loaded (collision_gripper={self._wrapper.collision_gripper_name}).")
 
         cb_group = ReentrantCallbackGroup()
         detect_cb_group = ReentrantCallbackGroup()
@@ -790,18 +809,10 @@ class GraspPlannerNode(Node):
         if depth_frame is None or info_frame is None:
             return None
         if depth_age is not None and depth_age > max_age_ns:
-            self.get_logger().warn(
-                "No synchronized depth frame: age %.3fs > %.3fs",
-                depth_age / 1e9,
-                max_age_ns / 1e9,
-            )
+            self.get_logger().warn(f"No synchronized depth frame: age {depth_age / 1e9:.3f}s > {max_age_ns / 1e9:.3f}s")
             return None
         if info_age is not None and info_age > max_age_ns:
-            self.get_logger().warn(
-                "No synchronized CameraInfo: age %.3fs > %.3fs",
-                info_age / 1e9,
-                max_age_ns / 1e9,
-            )
+            self.get_logger().warn(f"No synchronized CameraInfo: age {info_age / 1e9:.3f}s > {max_age_ns / 1e9:.3f}s")
             return None
         return depth_frame, info_frame.msg
 
@@ -969,18 +980,7 @@ class GraspPlannerNode(Node):
             "grasps": [],
         }
         for i, g in enumerate(candidates):
-            result["grasps"].append(
-                {
-                    "index": i,
-                    "confidence": round(float(g.confidence), 6),
-                    "collision_free": bool(g.collision_free),
-                    "target_width_m": round(float(g.target_width_m), 6),
-                    "target_width_quality": round(float(g.target_width_quality), 3),
-                    "width_axis_camera": [round(float(v), 6) for v in g.width_axis_camera],
-                    "position_xyz": [round(float(v), 6) for v in g.pose_4x4[:3, 3]],
-                    "pose_4x4_rowmajor": g.pose_4x4.flatten().tolist(),
-                }
-            )
+            result["grasps"].append(_candidate_debug_record(i, g))
 
         if output_mode == _DEBUG_OUTPUT_DIAGNOSTIC:
             (out_dir / "grasp_result.json").write_text(
@@ -1022,7 +1022,6 @@ class GraspPlannerNode(Node):
             "interactive_preview": "grasp_preview.html",
             "metadata": "grasp_preview_meta.json",
         }
-
         (out_dir / "grasp_result.json").write_text(
             json.dumps(result, indent=2, ensure_ascii=False),
             encoding="utf-8",
@@ -1071,6 +1070,7 @@ class GraspPlannerNode(Node):
                     "interactive_max_points": interactive_max_points,
                     "interactive_show_scene": interactive_show_scene,
                     "logger": self.get_logger(),
+                    "file_prefix": "grasp",
                 },
                 name="grasp-debug-render",
                 daemon=True,

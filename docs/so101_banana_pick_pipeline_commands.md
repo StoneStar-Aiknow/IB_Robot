@@ -6,14 +6,15 @@
 
 - 机器人配置：`so101_handeye_realsense_only`
 - 运行时配置路径：`/tmp/so101_handeye_realsense_grasp.yaml`
+- ROS 通信域：本工作区使用 `ROS_DOMAIN_ID=218`，终端 A/B/C/D/E 必须一致。
 - 运行时配置中的从动臂端口：`/dev/ttyACM1`
 - 主臂端口：通常为 `/dev/ttyACM0`，但必须以实际 USB 枚举为准
 - 腕部 RealSense 话题（`so101_handeye_realsense_only` 的实际 remap）：
   - RGB：`/camera/wrist/image_raw`
   - 对齐深度图：`/camera/wrist/aligned_depth_to_color/image_raw`
   - CameraInfo：`/camera/wrist/aligned_depth_to_color/camera_info`
-- 实时网页预览脚本：`scripts/camera_topic_viewer.py`
-- 检测包：`detection_service`
+- RealSense 观察工具：RViz Image Display
+- 感知包：`perception_service`
 - 检测服务：`/grounded_sam2/detect_and_segment`
 - GraspGen 抓取服务：`/grasp_planner/plan_grasp`
 - 抓取脚本：`scripts/test_banana_handeye_pick.py`
@@ -25,21 +26,22 @@
 
 `--with-grasp` 会编译 GraspGen 的 CUDA `pointnet2_ops` 扩展，运行前必须已安装
 CUDA toolkit，并确保 `CUDA_HOME` 指向包含 `bin/nvcc` 的 CUDA 根目录。CPU-only
-环境只能先运行 `--with-detection` 验证检测依赖。
+环境只能先运行 `--with-perception` 验证检测依赖。
 
 ```bash
-cd ~/IB_Robot && ./scripts/setup.sh --with-detection --with-grasp
-cd ~/IB_Robot && ./scripts/download_detection_models.sh
+cd ~/IB_Robot && ./scripts/setup.sh --with-perception --with-grasp
+cd ~/IB_Robot && ./scripts/download_perception_models.sh
 ```
 
 修改代码或首次运行前，先构建相关包：
 
 ```bash
 cd ~/IB_Robot && source .shrc_local && colcon build --symlink-install --merge-install --packages-select \
-  ibrobot_msgs detection_service grasp_service robot_config dataset_tools
+  ibrobot_msgs perception_service manipulation_service robot_config dataset_tools
 ```
 
-不要在 Bash 中 source `install/setup.zsh`，请使用 `.shrc_local`。
+Bash 中不要 source `install/setup.zsh`。常规命令先 source `.shrc_local`；需要确保
+当前 shell 刷新到最新 colcon overlay 时，再追加 `source install/setup.bash`。
 
 重要：真机启动必须传 `config_path:=/tmp/so101_handeye_realsense_grasp.yaml`。
 如果只传 `robot_config:=so101_handeye_realsense_only`，launch 会加载仓库内默认 YAML；
@@ -71,15 +73,17 @@ GRASPGEN_EE_ALIGNMENT graspgen_contact=(0.0000,0.0000,0.1950) target_contact=(0.
 在之前的启动被中断或机器人不再响应时使用。
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && \
   pkill -f "ros2 launch robot_config robot.launch.py"; \
   pkill -f move_group; \
   pkill -f moveit_gateway.py; \
   pkill -f task_executor_node; \
   pkill -f ros2_control_node; \
   pkill -f realsense2_camera_node; \
+  pkill -f "wrist_.*_relay"; \
   pkill -f robot_state_publisher; \
   pkill -f static_transform_publisher; \
+  pkill -f rviz2; \
   ros2 daemon stop
 ```
 
@@ -88,7 +92,7 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && \
 action server：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 action info /move_action
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 action info /move_action
 ```
 
 如果旧的 Grounded-SAM2 节点残留，也需停止：
@@ -101,7 +105,7 @@ pkill -f grasp_planner_node
 ## 1. 终端 A：启动机器人、RealSense、控制器、MoveIt
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 launch robot_config robot.launch.py \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 launch robot_config robot.launch.py \
   robot_config:=so101_handeye_realsense_only \
   config_path:=/tmp/so101_handeye_realsense_grasp.yaml \
   control_mode:=moveit_planning \
@@ -132,7 +136,7 @@ TaskExecutor ready
 ## 2. 终端 B：启动 Grounded-SAM2 检测服务
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 run detection_service grounded_sam2_node --ros-args \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 run perception_service grounded_sam2_node --ros-args \
   -p rgb_topic:=/camera/wrist/image_raw \
   -p depth_topic:=/camera/wrist/aligned_depth_to_color/image_raw \
   -p camera_info_topic:=/camera/wrist/aligned_depth_to_color/camera_info
@@ -149,7 +153,7 @@ GroundedSAM2Node ready
 测试管线默认使用 GraspGen 的 6-DOF 抓取候选，不再直接使用 mask 质心作为抓取点。
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 run grasp_service grasp_planner_node --ros-args \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 run manipulation_service grasp_planner_node --ros-args \
   -p depth_topic:=/camera/wrist/aligned_depth_to_color/image_raw \
   -p camera_info_topic:=/camera/wrist/aligned_depth_to_color/camera_info \
   -p detect_service:=/grounded_sam2/detect_and_segment \
@@ -162,6 +166,8 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 run grasp
   -p tabletop_clearance:=0.002 \
   -p tabletop_pregrasp_distance:=0.08 \
   -p adaptive_tabletop_clearance_max:=0.002 \
+  -p sync_max_age_sec:=0.8 \
+  -p input_buffer_size:=90 \
   -p num_grasps:=5000 \
   -p topk_num_grasps:=1000
 ```
@@ -181,54 +187,46 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 run grasp
 GraspPlannerNode ready
 ```
 
-## 4. 终端 D：启动 RealSense 实时网页预览（抓取时保持运行）
+## 4. 终端 D：用 RViz 实时观察 RealSense（抓取时保持运行）
 
 在终端 A/B/C 都正常后启动这个终端，并在后续 `--detect-only` 或完整抓取期间保持运行。
-该脚本只订阅 RGB 图像并输出 MJPEG 网页，不会发送机器人控制命令。
+RViz 只订阅图像和 TF，不会发送机器人控制命令。`ROS_DOMAIN_ID` 必须与终端 A/B/C
+保持一致。
 
-优先查看与检测服务相同的 RealSense RGB topic：
-
-```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && python3 scripts/camera_topic_viewer.py \
-  --topic /camera/wrist/image_raw \
-  --mode mjpeg \
-  --host 0.0.0.0 \
-  --port 8765
-```
-
-在机器人主机本机浏览器打开：
-
-```text
-http://127.0.0.1:8765
-```
-
-如果从另一台电脑浏览，打开：
-
-```text
-http://<机器人主机IP>:8765
-```
-
-如果 `8765` 端口被占用，把命令中的 `--port 8765` 改成 `--port 8766`。
-
-如果网页打开但黑屏或不刷新，先确认当前 RealSense RGB topic：
+启动 RViz：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic list | grep -E 'wrist|color/image_raw|image_raw'
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && rviz2
+```
+
+RViz 打开后按以下方式查看图像：
+
+- 左下角 `Add` -> `By display type` -> `rviz_default_plugins/Image`。
+- 将 Image display 的 `Topic` 设为 `/camera/wrist/image_raw`。
+- 将 Image display 的 `Reliability Policy` 设为 `Best Effort`。
+- 需要查看对齐深度时，再添加一个 Image display，`Topic` 设为
+  `/camera/wrist/aligned_depth_to_color/image_raw`，同样使用 `Best Effort`。
+
+如果 RViz 的 Image 显示黑屏或不刷新，先确认当前 RealSense RGB topic：
+
+```bash
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic list | grep -E 'wrist|color/image_raw|image_raw'
 ```
 
 正常抓取推荐继续使用 `/camera/wrist/image_raw`。当前 `so101_handeye_realsense_only`
 会把 RealSense RGB raw 重映射到该 topic；不要使用 `/camera/camera/color/image_raw`
 或 `/camera/wrist_camera/color/image_raw` 作为本流程的默认 RGB 输入。
 
-注意：抓取调试时，网页预览、Grounded-SAM2 的 `rgb_topic`、抓取脚本的 `--rgb-topic`
-应尽量使用同一个 RGB topic。这样浏览器里看到的画面就是检测和 GraspGen 实际使用的画面。
+注意：抓取调试时，RViz Image display、Grounded-SAM2 的 `rgb_topic`、抓取脚本的
+`--rgb-topic` 应尽量使用同一个 RGB topic。这样 RViz 里看到的画面就是检测和
+GraspGen 实际使用的画面。
 
 ## 5. 终端 E：运行状态检查
 
 检查控制器：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 control list_controllers
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 control list_controllers
 ```
 
 预期状态：
@@ -242,20 +240,20 @@ gripper_trajectory_controller active
 检查关节状态：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic echo /joint_states --once
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic echo /joint_states --once
 ```
 
 检查动作服务：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 action list | grep -E 'execute_task_plan|follow_joint_trajectory|move_action'
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 action list | grep -E 'execute_task_plan|follow_joint_trajectory|move_action'
 ```
 
 检查 MoveIt action server 数量。必须只有一个 `/move_group` server；如果出现两个，
 先回到第 0 步清理残留节点，否则会出现实际轨迹执行成功但客户端收到 `STATUS_ABORTED`：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 action info /move_action
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 action info /move_action
 ```
 
 预期：
@@ -271,27 +269,27 @@ Action servers: 1
 检查腕部相机 topic 有发布者：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic info /camera/wrist/image_raw
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic info /camera/wrist/aligned_depth_to_color/image_raw
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic info /camera/wrist/aligned_depth_to_color/camera_info
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic info /camera/wrist/image_raw
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic info /camera/wrist/aligned_depth_to_color/image_raw
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic info /camera/wrist/aligned_depth_to_color/camera_info
 ```
 
 检查检测服务：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 service list | grep /grounded_sam2/detect_and_segment
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service list | grep /grounded_sam2/detect_and_segment
 ```
 
 检查 GraspGen 抓取服务：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 service list | grep /grasp_planner/plan_grasp
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service list | grep /grasp_planner/plan_grasp
 ```
 
 检查 IK 服务：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 service list | grep /compute_ik
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service list | grep /compute_ik
 ```
 
 ## 6. 终端 E：仅移动到观测姿态
@@ -301,7 +299,7 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 service l
 推荐使用的观测姿态（调参阶段使用）：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && python3 scripts/test_banana_handeye_pick.py \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && python3 scripts/test_banana_handeye_pick.py \
   --prompt banana \
   --observe-only \
   --handeye-source robot-config \
@@ -314,7 +312,7 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && python3 script
 备选的更高观测姿态：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && python3 scripts/test_banana_handeye_pick.py \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && python3 scripts/test_banana_handeye_pick.py \
   --prompt banana \
   --observe-only \
   --handeye-source robot-config \
@@ -329,14 +327,14 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && python3 script
 直接调用服务：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 service call /grounded_sam2/detect_and_segment ibrobot_msgs/srv/DetectSegment \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service call /grounded_sam2/detect_and_segment ibrobot_msgs/srv/DetectSegment \
   "{text_prompt: 'banana', confidence_threshold: 0.1}"
 ```
 
 保存一帧可视化快照：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 run detection_service grounded_sam2_snapshot \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 run perception_service grounded_sam2_snapshot \
   --prompt banana \
   --confidence-threshold 0.1 \
   --rgb-topic /camera/wrist/image_raw \
@@ -348,7 +346,7 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 run detec
 直接调用 GraspGen 服务，确认能返回抓取候选：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 service call /grasp_planner/plan_grasp ibrobot_msgs/srv/PlanGrasp \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service call /grasp_planner/plan_grasp ibrobot_msgs/srv/PlanGrasp \
   "{text_prompt: 'banana', confidence_threshold: 0.1, grasp_threshold: 0.5, debug_output_mode: 'diagnostic'}"
 ```
 
@@ -358,10 +356,10 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 service c
 ## 8. 终端 E：运行仅规划流水线
 
 此步骤会移动到观测姿态、调用 GraspGen 生成抓取候选、将候选抓取位姿变换到基座坐标系、检查 IK，然后在抓取前退出。
-执行时保持第 4 步网页预览终端运行，用浏览器确认香蕉在画面中且运动后没有离开视野。
+执行时保持第 4 步 RViz 终端运行，确认香蕉在画面中且运动后没有离开视野。
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && python3 scripts/test_banana_handeye_pick.py \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && python3 scripts/test_banana_handeye_pick.py \
   --prompt banana \
   --detect-only \
   --handeye-source robot-config \
@@ -369,9 +367,9 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && python3 script
   --debug-output-mode diagnostic \
   --target-offset-z -0.008 \
   --min-contact-z -0.0101 \
-  --observe-x 0.08 \
-  --observe-y -0.23 \
-  --observe-z 0.25
+  --observe-x 0.10 \
+  --observe-y -0.16 \
+  --observe-z 0.22
 ```
 
 预期最后一行输出：
@@ -407,24 +405,25 @@ FLOW_RESULT success=True
 ## 9. 终端 E：运行完整抓取流水线
 
 仅在 `--detect-only` 结果正常后执行。
-执行期间保持第 4 步网页预览终端运行，用浏览器实时观察 RealSense RGB 画面。
+执行期间保持第 4 步 RViz 终端运行，实时观察 RealSense RGB 画面。
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && python3 scripts/test_banana_handeye_pick.py \
-  --prompt banana \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && python3 scripts/test_banana_handeye_pick.py \
   --handeye-source robot-config \
   --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
   --debug-output-mode full \
   --confidence-threshold 0.3 \
   --grasp-threshold 0.2 \
-  --min-grasp-confidence 0.60 \
+  --min-grasp-confidence 0.0 \
   --graspgen-centroid-confidence-window 0.06 \
   --graspgen-topdown-weight 0.35 \
+  --graspgen-topdown-min-z -0.25 \
   --target-offset-z -0.008 \
-  --min-contact-z -0.0101 \
+  --min-contact-z -0.019 \
   --observe-x 0.10 \
   --observe-y -0.16 \
-  --observe-z 0.25
+  --observe-z 0.22  \
+  --prompt strawberry
 ```
 
 注意：`tabletop_filter_mode`、`adaptive_tabletop_*` 是 `grasp_planner_node` 的 ROS 参数，
@@ -510,17 +509,17 @@ GraspGen 置信度与候选数量：
 如果 `grasp_planner_node` 已经在运行，用参数服务动态切换：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
   ros2 param set /grasp_planner tabletop_filter_mode adaptive
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
   ros2 param set /grasp_planner adaptive_tabletop_clearance_max 0.002
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
   ros2 param set /grasp_planner adaptive_tabletop_clearance_min 0.001
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
   ros2 param set /grasp_planner adaptive_tabletop_pregrasp_min 0.02
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
   ros2 param set /grasp_planner adaptive_tabletop_auto_tune true
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
   ros2 param set /grasp_planner adaptive_tabletop_retry_clearances '0.002,0.001'
 ```
 
@@ -553,7 +552,8 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && source install
 重点诊断字段：`tabletop_filter_mode`、`tabletop_low_profile`、`tabletop_relaxed`、
 `tabletop_object_height_m`、`tabletop_clearance_used_m`、
 `tabletop_pregrasp_distance_used_m`、`tabletop_best_candidate_clearance_m`、
-`tabletop_auto_tuned`、`tabletop_auto_tune_attempts`、`tabletop_auto_tune_reason`。
+`tabletop_auto_tuned`、`tabletop_auto_tune_attempts`、
+`tabletop_auto_tune_reason`。
 
 按请求控制 GraspGen 调试输出：
 
@@ -655,9 +655,9 @@ SO101 指尖最末端约在 `gripper.z=-0.105`，但香蕉抓取更适合用指�
 旧的 `--so101-contact-*` 仍是兼容别名，但新配置和脚本逻辑都使用 target-gripper 命名。
 只有确认整体存在固定基座坐标偏差时，再调 `--target-offset-*`。
 
-当前 `grasp_service` 会为每个 GraspGen 候选自动估算机器人无关的目标宽度：
+当前 `manipulation_service` 会为每个 GraspGen 候选自动估算机器人无关的目标宽度：
 `target_width_m` 是分割点云沿 GraspGen 源夹爪闭合轴投影后的宽度，不需要用户手动估算目标宽度。
-目标夹爪补偿不写在 `grasp_service` 中，而是由执行脚本读取 runtime
+目标夹爪补偿不写在 `manipulation_service` 中，而是由执行脚本读取 runtime
 `robot_config` 里的 `grasp_execution.target_gripper` 几何参数后，在 source-gripper 到
 target-gripper adapter 中按候选动态补偿。SO101 只是其中一个 target-gripper 配置实例。
 
@@ -747,7 +747,7 @@ effective_center = fixed_finger_contact_ee + closing_axis_ee * 0.5 * (target_wid
 - 检查：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 service list | grep grounded_sam2
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service list | grep grounded_sam2
 ```
 
 `GraspGen service is not available`（GraspGen 服务不可用）：
@@ -756,8 +756,36 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 service l
 - 检查：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 service list | grep /grasp_planner/plan_grasp
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service list | grep /grasp_planner/plan_grasp
 ```
+
+`No synchronized depth/CameraInfo for detection frame`（深度/内参时间戳不同步）：
+
+- 先检查是否有重复残留节点。若 `ros2 node list` 提示节点重名，或看到多个
+  `wrist_*_relay` / `rviz`，执行第 0 步清理后按 218 重新启动终端 A/B/C/D。
+- 确认 Grounded-SAM2、GraspGen 和 RViz 都使用同一组 topic：
+  `/camera/wrist/image_raw`、`/camera/wrist/aligned_depth_to_color/image_raw`、
+  `/camera/wrist/aligned_depth_to_color/camera_info`。
+- 如果 `ros2 topic info /camera/wrist/aligned_depth_to_color/image_raw` 或
+  `/camera/wrist/aligned_depth_to_color/camera_info` 返回 `Unknown topic`，
+  说明不是同步窗口太小，而是 RealSense 深度流或 relay 没有发布。此时先重启终端 A
+  的 RealSense 链路，并确认启动日志中没有连续的
+  `Frames didn't arrived within 5 seconds`；不要继续增大 `sync_max_age_sec`。
+- 检查三路输入是否都有新数据：
+
+```bash
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
+  ros2 topic echo /camera/wrist/image_raw --once --field header --qos-reliability best_effort
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
+  ros2 topic echo /camera/wrist/aligned_depth_to_color/image_raw --once --field header --qos-reliability best_effort
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
+  ros2 topic echo /camera/wrist/aligned_depth_to_color/camera_info --once --field header --qos-reliability best_effort
+```
+
+- 如果 GraspGen 日志显示类似 `age 0.400s > 0.200s`，说明深度帧和检测 mask 的时间戳差
+  超过默认 `sync_max_age_sec=0.20`。第 3 步已把 GraspGen 节点设置为
+  `sync_max_age_sec:=0.8`、`input_buffer_size:=90`，适配 RealSense/relay 的稳定延迟。
+  如果仍失败，优先检查相机帧率、USB 带宽和重复节点，而不是继续放宽同步阈值。
 
 `GraspGen returned zero candidates`（没有抓取候选）：
 
@@ -775,8 +803,8 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 service l
 - 检查：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 control list_controllers
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic echo /joint_states --once
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 control list_controllers
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic echo /joint_states --once
 ```
 
 `MoveIt reported unsuccessful` / `STATUS_ABORTED`，但日志里控制器显示轨迹已完成：
@@ -792,7 +820,7 @@ Action 'move_action' was unsuccessful: STATUS_ABORTED.
 - 检查：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 action info /move_action
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 action info /move_action
 ```
 
 - 如果 `Action servers` 下出现两个 `/move_group`，执行第 0 步清理残留节点，然后只启动一个终端 A。
@@ -807,6 +835,11 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 action in
 - 手眼标定质量差，请重新执行
   `docs/so101_handeye_calibration_commands.md`（可调低 `--max-reprojection` 以排除更多低质量样本）。
 - 脚本会打印 `HANDEYE_QUALITY`，如果显示 `status=bad`，请勿信任抓取结果。
+- 如果显示 `HANDEYE_QUALITY status=unknown source=robot-config reason=no_validation_metrics`，
+  只表示 runtime YAML 中没有保存标定质量指标，不表示手眼外参缺失。外参仍来自
+  `/tmp/so101_handeye_realsense_grasp.yaml` 的 `peripherals[name=wrist].transform`。
+  需要查看质量指标时，检查最近一次标定生成的 `outputs/handeye/wrist_handeye_new.json`
+  或重新执行手眼标定。
 - 如果 `--detect-only` 中 `contact_base.z` 或 `target_ee_grasp.z` 已经低于桌面，
   说明规划输入目标本身已经在桌面下方，不是 MoveIt 执行偏差。
 - 如果 `/tmp/so101_handeye_realsense_grasp.yaml` 与本地生成的 hand-eye JSON 报告

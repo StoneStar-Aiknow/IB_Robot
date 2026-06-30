@@ -180,7 +180,9 @@ platform_pre_install_rosdeps() {
 }
 
 platform_get_extra_skip_keys() {
-    echo "lttng-tools nlohmann-json-dev python3-opencv python3-aiortc gz_ros2_control ros_gz_sim ros_gz_bridge mujoco_ros2_control mujoco_ros2_control_msgs python3-scipy robot_localization"
+    # Keep optional perception/manipulation dependencies out of the openEuler
+    # setup path. The corresponding ROS packages are skipped in build.sh.
+    echo "lttng-tools nlohmann-json-dev python3-opencv python3-aiortc gz_ros2_control ros_gz_sim ros_gz_bridge mujoco_ros2_control mujoco_ros2_control_msgs python3-scipy robot_localization sam2 groundingdino grounding-dino graspgen spconv-cu120 torch-scatter pointnet2_ops"
 }
 
 platform_post_install_rosdeps() {

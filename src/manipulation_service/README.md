@@ -1,6 +1,6 @@
-# grasp_service
+# manipulation_service
 
-`grasp_service` 提供基于 GraspGen 的 6-DOF 抓取规划能力。该包负责 ROS 2
+`manipulation_service` 提供基于 GraspGen 的 6-DOF 抓取规划能力。该包负责 ROS 2
 服务封装、深度图和 mask 转换、GraspGen 调用、抓取结果发布，以及在线/离线
 调试产物导出；不负责目标检测、机器人控制、MoveIt 执行、策略推理或数据集转换。
 
@@ -9,7 +9,7 @@
 节点/工具：
 
 - `grasp_planner_node`：在线抓取规划节点。订阅对齐深度和 CameraInfo，
-  调用 `detection_service` 获取目标 mask，运行 pip 安装的 GraspGen，提供
+  调用 `perception_service` 获取目标 mask，运行 pip 安装的 GraspGen，提供
   `~/plan_grasp` 服务，并发布 `~/grasps`。
 - `test_graspgen.py`：离线 GraspGen 调试脚本。读取 `grounded_sam2_snapshot`
   生成的数据目录，直接运行 GraspGen，并保存 PLY、JSON 和可选 Open3D 视图。
@@ -24,12 +24,12 @@ ROS 接口：
 `GraspCandidate` 只包含机器人无关的抓取候选信息。除了 GraspGen 位姿、置信度和碰撞标记，
 节点还会基于分割目标点云估算每个候选沿源夹爪闭合轴方向的 `target_width_m`、
 `target_width_quality` 和 `width_axis_camera`。这些字段用于下游机器人执行层做自己的夹爪几何适配；
-`grasp_service` 不读取任何 SO101 配置，也不输出 SO101 专用 offset。
+`manipulation_service` 不读取任何 SO101 配置，也不输出 SO101 专用 offset。
 
-默认在线话题遵循 `robot_config` 的 front RGB-D camera 约定：
+默认在线话题遵循 SO101 wrist RealSense 抓取流水线约定：
 
-- 对齐深度：`/camera/front/aligned_depth_to_color/image_raw`
-- CameraInfo：`/camera/front/camera_info`
+- 对齐深度：`/camera/wrist/aligned_depth_to_color/image_raw`
+- CameraInfo：`/camera/wrist/aligned_depth_to_color/camera_info`
 - 检测服务：`/grounded_sam2/detect_and_segment`
 
 RealSense 顶置相机调试时常用的话题为：
@@ -39,7 +39,7 @@ RealSense 顶置相机调试时常用的话题为：
 
 ## 环境与依赖
 
-当前路径使用 pip 安装的 GraspGen：`grasp_service` 在同一 Python 进程中导入
+当前路径使用 pip 安装的 GraspGen：`manipulation_service` 在同一 Python 进程中导入
 `grasp_gen`，并用 CUDA 执行推理。GraspGen 不再放在 `libs/` 下；安装脚本会把
 固定上游源码作为 editable pip 依赖放到 workspace venv 的 `src/` 缓存中。
 
@@ -48,7 +48,7 @@ RealSense 顶置相机调试时常用的话题为：
 - 当前环境可用 CUDA PyTorch；上游 `GraspGenSampler` 内部会把模型和点云移到 CUDA。
 - 已通过 `./scripts/setup.sh --with-grasp` 安装 `grasp_gen` 和 `pointnet2_ops`。
 - GraspGen 模型文件在 `models/grasp/`，或通过 `GRASPGEN_MODEL_DIR` 指定。
-- 已构建 `grasp_service` 和 `ibrobot_msgs`。
+- 已构建 `manipulation_service` 和 `ibrobot_msgs`。
 
 所有 ROS 调试命令都应在仓库根目录运行，并在同一条命令里完成环境初始化：
 
@@ -59,24 +59,27 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && <r
 修改代码或首次运行前，先构建接口和本包：
 
 ```bash
-source .shrc_local && colcon build --symlink-install --merge-install --packages-select ibrobot_msgs grasp_service
+source .shrc_local && colcon build --symlink-install --merge-install --packages-select ibrobot_msgs manipulation_service
 ```
 
 ## 调试 grasp_planner_node
 
 ### 1. 单独运行在线 GraspGen 抓取节点
 
-运行前需先启动相机和 `detection_service` 的 `grounded_sam2_node`。使用默认
-front camera 话题：
+运行前需先启动相机和 `perception_service` 的 `grounded_sam2_node`。默认使用
+SO101 wrist camera 话题：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ros2 run grasp_service grasp_planner_node
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ros2 run manipulation_service grasp_planner_node
 ```
+
+默认使用 GraspGen Robotiq 2F-140 作为 source gripper 生成候选，并用同一 source
+gripper collision mesh 执行普通场景碰撞过滤和桌面 clearance 过滤。
 
 使用 RealSense 顶置相机，并开启调试输出：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ros2 run grasp_service grasp_planner_node --ros-args \
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ros2 run manipulation_service grasp_planner_node --ros-args \
   -p depth_topic:=/camera/camera/aligned_depth_to_color/image_raw \
   -p camera_info_topic:=/camera/camera/color/camera_info \
   -p save_debug_outputs:=true \
@@ -99,7 +102,7 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 如果目标只是确认 GraspGen 是否能产生候选，可临时关闭几何过滤：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ros2 run grasp_service grasp_planner_node --ros-args \
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ros2 run manipulation_service grasp_planner_node --ros-args \
   -p depth_topic:=/camera/camera/aligned_depth_to_color/image_raw \
   -p camera_info_topic:=/camera/camera/color/camera_info \
   -p save_debug_outputs:=true \
@@ -135,9 +138,9 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 - `grasps.grasps[*].confidence`：GraspGen 置信度。
 - `grasps.grasps[*].collision_free`：当前过滤配置下是否认为无碰撞。
 
-`grasp_service` 返回的是机器人无关的 GraspGen 候选，排序主要来自 GraspGen
-置信度和几何过滤结果。目标机器人专用的 top-down 偏好、目标夹爪宽度补偿、
-IK/workspace 过滤和接触点重对齐属于执行层后处理，当前由
+`manipulation_service` 返回的是机器人无关的 GraspGen 候选，排序主要来自 GraspGen
+置信度和几何过滤结果。目标机器人专用的目标夹爪宽度补偿、IK/workspace 过滤和
+接触点重对齐属于执行层后处理，当前由
 `scripts/test_banana_handeye_pick.py` 完成。该脚本从
 `robot_config.robot.grasp_execution` 读取 `target_gripper` 和 `execution_scoring`，
 因此 GraspGen 不需要绑定 SO101；新增机器人只需要在自己的 robot_config 中定义目标夹爪几何和评分权重。
@@ -201,13 +204,15 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 - `enable_tabletop_filter`：启用桌面平面过滤，默认 `true`。
 - `require_tabletop_filter`：找不到可接受桌面平面时返回空结果，默认 `true`。
 - `tabletop_clearance`：夹爪 mesh 到桌面的最小距离，默认 `0.003` 米。
-- `tabletop_pregrasp_distance`：沿 GraspGen `-Z` approach 方向后退检查距离，默认 `0.08` 米。
+- `tabletop_pregrasp_distance`：沿 GraspGen/source gripper approach 轴后退检查距离，默认 `0.08` 米。
 - `tabletop_pregrasp_steps`：pre-grasp 到 final grasp 中间检查步数，默认 `5`。
 - `tabletop_ransac_threshold`：桌面 RANSAC 内点距离阈值，默认 `0.006` 米。
 - `tabletop_min_inlier_ratio`：接受桌面平面的最小内点比例，默认 `0.15`。
 - `tabletop_filter_mode`：桌面过滤模式，默认 `strict`。`adaptive` 会对草莓等低矮目标
   按目标高度自适应降低 clearance 和 pre-grasp 检查距离；`soft` 在低矮目标严格过滤为
   空时，允许保留不低于 hard floor 的风险最低候选，并在诊断中标记 `tabletop_relaxed`。
+  桌面过滤始终对 final pose 到 pre-grasp path 的所有采样点取最小 clearance，并以该
+  最小值作为硬过滤条件。
 - `adaptive_tabletop_low_profile_height`：低矮目标高度阈值，默认 `0.035` 米。
 - `adaptive_tabletop_clearance_min` / `adaptive_tabletop_clearance_max`：自适应 clearance
   下限/上限，默认 `0.001` / `0.002` 米。
@@ -226,7 +231,7 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 抓取草莓等贴桌低矮目标时，推荐先用 `adaptive` 模式，不要直接关闭桌面过滤：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ros2 run grasp_service grasp_planner_node --ros-args \
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ros2 run manipulation_service grasp_planner_node --ros-args \
   -p tabletop_filter_mode:=adaptive \
   -p adaptive_tabletop_low_profile_height:=0.035 \
   -p adaptive_tabletop_clearance_min:=0.001 \
@@ -236,7 +241,7 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 
 `adaptive_tabletop_auto_tune` 默认开启。若首轮 adaptive 因低矮贴桌目标被过滤为空，节点会在
 `tabletop_best_candidate_clearance_m` 未明显低于桌面的前提下，自动尝试更小 clearance 和更短
-pre-grasp sweep，并在诊断中记录 `tabletop_auto_tuned`、`tabletop_auto_tune_attempts` 和
+pre-grasp path，并在诊断中记录 `tabletop_auto_tuned`、`tabletop_auto_tune_attempts` 和
 `tabletop_auto_tune_reason`。
 
 如果 auto-tune 后仍把所有候选过滤为空，可临时使用 `soft` 做真机前诊断。此时必须检查
@@ -306,14 +311,14 @@ PNG/HTML 渲染在后台 daemon thread 中执行；service response 不等待图
 基础命令：
 
 ```bash
-source .shrc_local && python3 src/grasp_service/test_graspgen.py \
+source .shrc_local && python3 src/manipulation_service/test_graspgen.py \
   --data-dir outputs/grounded_sam2/<timestamp>_banana
 ```
 
 显示交互式 Open3D 视图和分数标签：
 
 ```bash
-source .shrc_local && python3 src/grasp_service/test_graspgen.py \
+source .shrc_local && python3 src/manipulation_service/test_graspgen.py \
   --data-dir outputs/grounded_sam2/<timestamp>_banana \
   --show \
   --show-scores
@@ -322,7 +327,7 @@ source .shrc_local && python3 src/grasp_service/test_graspgen.py \
 只验证 GraspGen 候选生成，临时关闭桌面过滤：
 
 ```bash
-source .shrc_local && python3 src/grasp_service/test_graspgen.py \
+source .shrc_local && python3 src/manipulation_service/test_graspgen.py \
   --data-dir outputs/grounded_sam2/<timestamp>_banana \
   --no-enable-tabletop-filter \
   --no-require-tabletop-filter
@@ -366,7 +371,7 @@ source .shrc_local && python3 src/grasp_service/test_graspgen.py \
 - `grasp_preview.png`：离线预览截图。
 
 注意：离线预览中的编号仍是 GraspGen 服务返回顺序，不包含 SO101 执行脚本里的
-top-down 重排、动态宽度补偿或 IK/workspace 过滤结果。若要确认最终会抓哪个候选，
+接触点质心重排、动态宽度补偿或 IK/workspace 过滤结果。若要确认最终会抓哪个候选，
 以 `scripts/test_banana_handeye_pick.py --detect-only` 输出的 `GRASPGEN_RANK` 和
 `GRASPGEN_CANDIDATE_ACCEPT` 日志为准。
 
@@ -374,7 +379,7 @@ top-down 重排、动态宽度补偿或 IK/workspace 过滤结果。若要确认
 
 ### 只调 perception，不调 GraspGen
 
-在 `detection_service` 中运行 `grounded_sam2_node` 和 `grounded_sam2_snapshot`，
+在 `perception_service` 中运行 `grounded_sam2_node` 和 `grounded_sam2_snapshot`，
 确认 `overlay.png`、mask 和点云正确后，再进入本包调 GraspGen。
 
 ### 只调 GraspGen，不启动 ROS service
@@ -385,7 +390,7 @@ ROS topic 同步、service timeout 和在线 perception 的影响。
 ### 调完整在线链路
 
 1. 启动相机。
-2. 启动 `detection_service` 的 `grounded_sam2_node`。
+2. 启动 `perception_service` 的 `grounded_sam2_node`。
 3. 启动 `grasp_planner_node`，建议先开启 `save_debug_outputs`。
 4. 调用 `/grasp_planner/plan_grasp`。
 5. 查看输出目录中的 `grasp_preview_labeled.png` 和 `grasp_preview.html`。
@@ -406,11 +411,10 @@ ROS topic 同步、service timeout 和在线 perception 的影响。
 - `failure_stage: collision_filter`：所有候选被场景碰撞过滤，临时关闭
   `enable_collision_filter` 可确认模型是否本身有候选；同时检查 `scene_cloud.ply`
   是否包含过多目标附近噪点。
-- `failure_stage: tabletop_filter`：查看 `tabletop_best_inlier_ratio`、
-  `tabletop_failure_reason`、`tabletop_filter`、`tabletop_auto_tuned` 和
-  `tabletop_auto_tune_reason`。检查 `scene_cloud.ply` 是否包含桌面，必要时调整
-  `tabletop_ransac_threshold`、`tabletop_min_inlier_ratio`、`tabletop_clearance` 或
-  `tabletop_pregrasp_distance`。
+- `failure_stage: tabletop_filter`：查看 `tabletop_best_inlier_ratio`、`tabletop_failure_reason`、
+  `tabletop_filter`、`tabletop_auto_tuned`、`tabletop_auto_tune_reason`、
+  `scene_cloud.ply` 是否包含桌面，必要时调整 `tabletop_ransac_threshold`、
+  `tabletop_min_inlier_ratio`、`tabletop_clearance` 或 `tabletop_pregrasp_distance`。
 - HTML/PNG 未立刻出现：预览在后台线程生成，等待几秒后查看
   `grasp_preview_meta.json`。
 - `ModuleNotFoundError`：未执行 `source .shrc_local`，或 GraspGen 依赖未安装。

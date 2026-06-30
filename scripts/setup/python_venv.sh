@@ -117,7 +117,7 @@ PY
     log_error "--with-grasp requires a CUDA toolkit before installing GraspGen pointnet2_ops."
     log_error "Set CUDA_HOME to a CUDA toolkit root with bin/nvcc, or install a matching toolkit"
     log_error "such as /usr/local/cuda-${torch_cuda_version:-<torch-cuda-version>}."
-    log_error "Use --with-detection without --with-grasp on CPU-only setup verification hosts."
+    log_error "Use --with-perception without --with-grasp on CPU-only setup verification hosts."
     return 1
 }
 
@@ -148,9 +148,9 @@ PY
 )}"
     if [[ -n "${pyg_find_links}" ]]; then
         run_cmd "${pip_runner[@]}" --find-links "${pyg_find_links}" \
-            -r "${WORKSPACE}/requirements/graspgen.txt" --quiet
+            -r "${WORKSPACE}/requirements/manipulation.txt" --quiet
     else
-        run_cmd "${pip_runner[@]}" -r "${WORKSPACE}/requirements/graspgen.txt" --quiet
+        run_cmd "${pip_runner[@]}" -r "${WORKSPACE}/requirements/manipulation.txt" --quiet
     fi
 
     # Upstream GraspGen expects top-level config/ and assets/ to be present next
@@ -270,19 +270,23 @@ setup_python_venv() {
         install_lerobot_editable "${VENV_PYTHON}" -m pip
     fi
 
-    # Optional detection dependencies (SAM2, Grounding-DINO).
+    # Optional perception dependencies (SAM2, Grounding-DINO).
     # These are intentionally installed from package metadata rather than
     # vendored under libs/, keeping IB-Robot's source tree focused on ROS
     # integration code and package-local contracts.
-    if [[ "${INSTALL_DETECTION_DEPS:-false}" == true ]]; then
-        log_info "Installing optional detection dependencies (SAM2, Grounding-DINO)..."
+    if [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
+        log_warn "Skipping optional perception dependencies on openEuler; SAM2/Grounding-DINO are validated on Ubuntu only."
+    elif [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true ]]; then
+        log_info "Installing optional perception dependencies (SAM2, Grounding-DINO)..."
         run_cmd env SAM2_BUILD_CUDA="${SAM2_BUILD_CUDA:-0}" SAM2_BUILD_ALLOW_ERRORS=1 \
-            "${pip_install[@]}" --no-build-isolation -r "${WORKSPACE}/requirements/detection.txt" --quiet
+            "${pip_install[@]}" --no-build-isolation -r "${WORKSPACE}/requirements/perception.txt" --quiet
     else
-        log_info "Skipping optional detection dependencies. Re-run setup with --with-detection if needed."
+        log_info "Skipping optional perception dependencies. Re-run setup with --with-perception if needed."
     fi
 
-    if [[ "${INSTALL_GRASP_DEPS:-false}" == true ]]; then
+    if [[ "${INSTALL_GRASP_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
+        log_warn "Skipping optional grasp dependencies on openEuler; GraspGen CUDA extensions are validated on Ubuntu only."
+    elif [[ "${INSTALL_GRASP_DEPS:-false}" == true ]]; then
         log_info "Installing optional grasp dependencies (GraspGen)..."
         install_graspgen_pip "${VENV_PYTHON}" -m pip install
     else

@@ -45,7 +45,6 @@ robot:
       confidence_weight: 1.0
       contact_distance_weight: 1.0
       contact_distance_scale_m: 0.06
-      topdown_weight: 0.70
     target_gripper:
       type: asymmetric_single_moving_jaw
       ee_frame: gripper

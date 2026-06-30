@@ -51,7 +51,7 @@ SUDO_AUTH_READY=false
 PLATFORM_OVERRIDE=""
 
 SKIP_VERIFY=false
-INSTALL_DETECTION_DEPS="${IBR_SETUP_WITH_DETECTION:-${IBR_SETUP_WITH_PERCEPTION:-false}}"
+INSTALL_PERCEPTION_DEPS="${IBR_SETUP_WITH_PERCEPTION:-false}"
 INSTALL_GRASP_DEPS="${IBR_SETUP_WITH_GRASP:-false}"
 CURRENT_STAGE="initializing"
 SYSTEM_DEPS_STATUS="pending"
@@ -223,7 +223,7 @@ parse_args() {
             --no-sudo) USE_SUDO=false ;;
             --sudo) USE_SUDO=true ;;
             --skip-submodules) SKIP_SUBMODULES=true ;;
-            --with-detection|--with-detection-deps|--with-perception|--with-perception-deps) INSTALL_DETECTION_DEPS=true ;;
+            --with-perception|--with-perception-deps) INSTALL_PERCEPTION_DEPS=true ;;
             --with-grasp|--with-graspgen|--with-grasp-deps) INSTALL_GRASP_DEPS=true ;;
 
             --skip-verify) SKIP_VERIFY=true ;;

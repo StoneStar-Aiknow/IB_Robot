@@ -290,12 +290,24 @@ ${BUILD_THIS} && THIS_ARGS+=("--paths" "$(pwd)")
 
 # Platform-specific package skips
 PLATFORM_ARGS=()
-if [[ "${IBR_BUILD_INCLUDE_SIM_MODELS_ON_OPENEULER:-0}" != "1" && -f /etc/os-release ]]; then
+if [[ -f /etc/os-release ]]; then
     # shellcheck disable=SC1091
     source /etc/os-release
-    if [[ "${ID:-}" == "openeuler" ]]; then
-        log_info "openEuler detected: skipping sim_models (MuJoCo simulation runs on Ubuntu only)."
-        PLATFORM_ARGS+=("--packages-skip" "sim_models")
+    if [[ "${ID,,}" == "openeuler" ]]; then
+        OPENEULER_SKIP_PACKAGES=()
+        if [[ "${IBR_BUILD_INCLUDE_SIM_MODELS_ON_OPENEULER:-0}" != "1" ]]; then
+            OPENEULER_SKIP_PACKAGES+=("sim_models")
+        fi
+        if [[ "${IBR_BUILD_INCLUDE_PERCEPTION_SERVICE_ON_OPENEULER:-0}" != "1" ]]; then
+            OPENEULER_SKIP_PACKAGES+=("perception_service" "vlm_task_planner")
+        fi
+        if [[ "${IBR_BUILD_INCLUDE_MANIPULATION_SERVICE_ON_OPENEULER:-0}" != "1" ]]; then
+            OPENEULER_SKIP_PACKAGES+=("manipulation_service")
+        fi
+        if [[ ${#OPENEULER_SKIP_PACKAGES[@]} -gt 0 ]]; then
+            log_info "openEuler detected: skipping Ubuntu/CUDA-only packages: ${OPENEULER_SKIP_PACKAGES[*]}."
+            PLATFORM_ARGS+=("--packages-skip" "${OPENEULER_SKIP_PACKAGES[@]}")
+        fi
     fi
 fi
 

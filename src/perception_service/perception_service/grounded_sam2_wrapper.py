@@ -13,9 +13,9 @@ try:
     from torchvision.ops import box_convert
 except ModuleNotFoundError as exc:
     raise ModuleNotFoundError(
-        "detection_service optional dependencies are missing. Install them with "
-        "`./scripts/setup.sh --with-detection` or "
-        "`python3 -m pip install -r requirements/detection.txt`."
+        "Grounding-DINO/SAM2 perception dependencies are missing. Install them with "
+        "`./scripts/setup.sh --with-perception` or "
+        "`python3 -m pip install -r requirements/perception.txt`."
     ) from exc
 
 logger = logging.getLogger(__name__)
@@ -147,12 +147,12 @@ class GroundedSAM2Wrapper:
             (gdino_ckpt, "GDINO checkpoint"),
         ]:
             if not os.path.exists(p):
-                raise FileNotFoundError(f"{label} not found: {p}\nRun: ./scripts/download_detection_models.sh")
+                raise FileNotFoundError(f"{label} not found: {p}\nRun: ./scripts/download_perception_models.sh")
 
         text_encoder_path = Path(text_encoder_type)
         if text_encoder_path.is_absolute() and not text_encoder_path.exists():
             raise FileNotFoundError(
-                f"GDINO text encoder not found: {text_encoder_path}\nRun: ./scripts/download_detection_models.sh"
+                f"GDINO text encoder not found: {text_encoder_path}\nRun: ./scripts/download_perception_models.sh"
             )
 
         logger.info("Loading SAM2 config %s with checkpoint %s", sam_cfg, sam_ckpt)
@@ -191,7 +191,7 @@ class GroundedSAM2Wrapper:
             model = build_model(args)
         except OSError as exc:
             raise RuntimeError(
-                "Grounding-DINO text encoder assets could not be loaded. Run: ./scripts/download_detection_models.sh"
+                "Grounding-DINO text encoder assets could not be loaded. Run: ./scripts/download_perception_models.sh"
             ) from exc
 
         checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
@@ -292,6 +292,7 @@ class GroundedSAM2Wrapper:
 
             depth_m = depth_image.astype(np.float64) / depth_scale
             depth_m[depth_m > depth_trunc] = 0
+
             depth_masked = depth_m * mask
 
             valid = depth_masked > 0

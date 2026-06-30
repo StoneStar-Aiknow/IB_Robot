@@ -11,7 +11,7 @@ try:
     import torch
 except ModuleNotFoundError as exc:
     raise ModuleNotFoundError(
-        "grasp_service optional dependencies are missing. Ensure IB-Robot "
+        "manipulation_service optional dependencies are missing. Ensure IB-Robot "
         "GraspGen pip dependencies are installed with "
         "`./scripts/setup.sh --with-grasp`."
     ) from exc
@@ -23,6 +23,7 @@ _LOCAL_BACKEND_REQUIRES_CUDA = (
     "GraspGen local backend requires CUDA. The upstream GraspGenSampler "
     "moves the model and point cloud tensors to CUDA internally."
 )
+_DEFAULT_MAX_INFERENCE_GRASPS_PER_BATCH = 1000
 
 
 def _cuda_status() -> str:
@@ -299,6 +300,26 @@ def _align_mask_to_depth(segmentation_mask: np.ndarray, depth_m: np.ndarray, dia
     return cv2.resize(mask.astype(np.uint8), (depth_m.shape[1], depth_m.shape[0]), interpolation=cv2.INTER_NEAREST)
 
 
+def _downsample_points(points: np.ndarray, max_points: int, seed: int = 0) -> np.ndarray:
+    if max_points <= 0 or len(points) <= max_points:
+        return points
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(points), max_points, replace=False)
+    return points[np.sort(idx)]
+
+
+def _graspgen_inference_batches(total_grasps: int, max_batch_size: int) -> list[int]:
+    total = max(1, int(total_grasps))
+    batch = max(1, int(max_batch_size))
+    batches = []
+    remaining = total
+    while remaining > 0:
+        current = min(batch, remaining)
+        batches.append(current)
+        remaining -= current
+    return batches
+
+
 def _populate_depth_mask_diagnostics(mask: np.ndarray, depth_m: np.ndarray, diag: GraspDiagnostic) -> None:
     mask_bool = mask > 0
     valid_depth = np.isfinite(depth_m) & (depth_m > 0)
@@ -345,6 +366,7 @@ class GraspGenWrapper:
         logger.info("Loading GraspGen config from %s", gripper_cfg_path)
         self._cfg = load_grasp_cfg(str(gripper_cfg_path))
         self._gripper_name = self._cfg.data.gripper_name
+        self._inference_point_count = int(getattr(self._cfg.data, "num_points", 2048))
 
         logger.info("Initializing GraspGenSampler on %s ...", self.device)
         self._sampler = GraspGenSampler(self._cfg)
@@ -496,9 +518,17 @@ class GraspGenWrapper:
             logger.warning(diag.failure_reason)
             return [], diag
 
-        grasps, confidences = _GS.run_inference(
-            object_pc_clean,
-            self._sampler,
+        object_pc_inference = _downsample_points(object_pc_clean, self._inference_point_count)
+        if len(object_pc_inference) < len(object_pc_clean):
+            logger.info(
+                "Object PC downsampled for GraspGen inference: %d -> %d points",
+                len(object_pc_clean),
+                len(object_pc_inference),
+            )
+
+        grasps, confidences = self._run_batched_inference(
+            _GS,
+            object_pc_inference,
             grasp_threshold=grasp_threshold,
             num_grasps=num_grasps,
             topk_num_grasps=topk_num_grasps,
@@ -688,8 +718,11 @@ class GraspGenWrapper:
                     relaxed_mask = clearances >= adaptive_tabletop_hard_floor
                     if relaxed_mask.any():
                         diag.tabletop_relaxed = True
-                        filtered_grasps = grasps_final[relaxed_mask]
-                        filtered_confidences = confidences_final[relaxed_mask]
+                        relaxed_indices = np.flatnonzero(relaxed_mask)
+                        order = np.lexsort((-confidences_final[relaxed_indices], -clearances[relaxed_indices]))
+                        relaxed_indices = relaxed_indices[order]
+                        filtered_grasps = grasps_final[relaxed_indices]
+                        filtered_confidences = confidences_final[relaxed_indices]
                         logger.warning(
                             "Tabletop soft fallback accepted %d/%d low-profile grasps "
                             "(hard_floor=%.3fm, best_clearance=%.3fm)",
@@ -736,6 +769,68 @@ class GraspGenWrapper:
 
         results.sort(key=lambda g: g.confidence, reverse=True)
         return results, diag
+
+    def _run_batched_inference(
+        self,
+        grasp_server_cls,
+        object_pc: np.ndarray,
+        *,
+        grasp_threshold: float,
+        num_grasps: int,
+        topk_num_grasps: int,
+        min_grasps: int,
+        max_tries: int,
+    ):
+        batches = _graspgen_inference_batches(num_grasps, _DEFAULT_MAX_INFERENCE_GRASPS_PER_BATCH)
+        if len(batches) > 1:
+            logger.info(
+                "Running GraspGen inference in %d batches: total=%d max_batch=%d",
+                len(batches),
+                num_grasps,
+                _DEFAULT_MAX_INFERENCE_GRASPS_PER_BATCH,
+            )
+
+        all_grasps = []
+        all_confidences = []
+        for index, batch_size in enumerate(batches, start=1):
+            per_batch_topk = -1
+            if grasp_threshold == -1.0 and topk_num_grasps > 0:
+                per_batch_topk = min(topk_num_grasps, batch_size)
+
+            grasps, confidences = grasp_server_cls.run_inference(
+                object_pc,
+                self._sampler,
+                grasp_threshold=grasp_threshold,
+                num_grasps=batch_size,
+                topk_num_grasps=per_batch_topk,
+                min_grasps=min_grasps,
+                max_tries=max_tries,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            if len(grasps) == 0:
+                logger.info("GraspGen batch %d/%d returned zero grasps", index, len(batches))
+                continue
+            all_grasps.append(grasps)
+            all_confidences.append(confidences)
+            logger.info(
+                "GraspGen batch %d/%d accepted %d grasps, total accepted=%d",
+                index,
+                len(batches),
+                len(grasps),
+                sum(len(g) for g in all_grasps),
+            )
+
+        if not all_grasps:
+            return torch.tensor([], device="cuda"), torch.tensor([], device="cuda")
+
+        grasps = torch.cat(all_grasps, dim=0)
+        confidences = torch.cat(all_confidences, dim=0)
+        if topk_num_grasps > 0 and len(grasps) > topk_num_grasps:
+            order = torch.argsort(confidences, descending=True)[:topk_num_grasps]
+            grasps = grasps[order]
+            confidences = confidences[order]
+        return grasps, confidences
 
     @property
     def gripper_name(self) -> str:

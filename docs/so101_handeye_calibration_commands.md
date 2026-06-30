@@ -39,13 +39,30 @@
 仅在之前的启动被中断、ROS 图中存在残留节点时使用。
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && (pkill -f "ros2 launch robot_config robot.launch.py" || true; pkill -f move_group || true; pkill -f moveit_gateway.py || true; pkill -f task_executor_node || true; pkill -f ros2_control_node || true; pkill -f realsense2_camera_node || true; pkill -f robot_state_publisher || true; pkill -f static_transform_publisher || true; pkill -f teleop_node || true; ros2 daemon stop)
+cd ~/IB_Robot && \
+  source .shrc_local && \
+  export ROS_DOMAIN_ID=218 && \
+  (pkill -f "ros2 launch robot_config robot.launch.py" || true; \
+   pkill -f move_group || true; \
+   pkill -f moveit_gateway.py || true; \
+   pkill -f task_executor_node || true; \
+   pkill -f ros2_control_node || true; \
+   pkill -f realsense2_camera_node || true; \
+   pkill -f robot_state_publisher || true; \
+   pkill -f static_transform_publisher || true; \
+   pkill -f teleop_node || true; \
+   ros2 daemon stop)
 ```
 
 ## 1. 检查眼在手（Eye-In-Hand）前置条件
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && python3 scripts/check_handeye_preconditions.py --robot-config /tmp/so101_handeye_realsense_grasp.yaml --camera-name wrist
+cd ~/IB_Robot && \
+  source .shrc_local && \
+  export ROS_DOMAIN_ID=218 && \
+  python3 scripts/check_handeye_preconditions.py \
+    --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
+    --camera-name wrist
 ```
 
 预期：前置检查通过，确认腕部/夹爪安装相机的配置正确。
@@ -53,6 +70,10 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && python3 script
 ## 2. 终端 A：启动遥操作设备（主臂）
 
 将主臂连接到 USB 端口，用于遥操作控制从动臂移动到不同标定姿态。
+如果当前已经按抓取流程启动过 `control_mode:=moveit_planning`，需要先执行第 0 步清理，
+否则第 3 步会看到 `arm_trajectory_controller` / `gripper_trajectory_controller`
+仍处于 active。手眼标定采样需要 teleop 的 position controller：
+`arm_position_controller` / `gripper_position_controller`。
 当前 `robot.launch.py` 不支持 `teleop_auto_config` 或 `teleop_leader_port` 启动参数；
 `control_mode:=teleop` 只读取 runtime YAML 中的 `robot.teleoperation`。启动终端 A 前，
 先把 runtime YAML 中的主臂配置显式打开。
@@ -61,11 +82,23 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && python3 script
 `robot.ros2_control.port` 指向的从动臂串口相同：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && python3 scripts/configure_so101_handeye_teleop.py --robot-config /tmp/so101_handeye_realsense_grasp.yaml --leader-port /dev/ttyACM0
+cd ~/IB_Robot && \
+  source .shrc_local && \
+  python3 scripts/configure_so101_handeye_teleop.py \
+    --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
+    --leader-port /dev/ttyACM0
 ```
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 launch robot_config robot.launch.py robot_config:=so101_handeye_realsense_only config_path:=/tmp/so101_handeye_realsense_grasp.yaml control_mode:=teleop use_sim:=false moveit_display:=false
+cd ~/IB_Robot && \
+  source .shrc_local && \
+  export ROS_DOMAIN_ID=218 && \
+  ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_handeye_realsense_only \
+    config_path:=/tmp/so101_handeye_realsense_grasp.yaml \
+    control_mode:=teleop \
+    use_sim:=false \
+    moveit_display:=false
 ```
 
 如果启动日志出现 `WARNING: Teleop mode requested but teleoperation config not found`
@@ -80,11 +113,14 @@ Controllers are active
 ```
 
 确认遥操作已就绪：握住主臂，缓慢移动从动臂应跟随运动。
+如果终端 A 持续打印 `Joint '<n>' clipped ...`，说明 leader 目标超出了 follower
+安全限位。轻微且偶发的裁剪可以先把主臂摆回中位；如果持续裁剪，不要开始第 5 步采样，
+先重新摆正主臂或检查 leader 校准/关节 wrap 状态。
 
 ## 3. 终端 B：验证运行状态
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 control list_controllers
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 control list_controllers
 ```
 
 预期的控制器状态：
@@ -98,63 +134,72 @@ gripper_position_controller active
 检查关节状态：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic echo /joint_states --once
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic echo /joint_states --once
 ```
 
 检查腕部相机：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic list | grep -E '/camera/.*/(image_raw|camera_info|aligned_depth_to_color)'
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic list | grep -E '/camera/.*/(image_raw|camera_info|aligned_depth_to_color)'
 ```
 
 检查脚本使用的 RealSense 话题是否存在：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic info /camera/wrist/image_raw
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic info /camera/wrist/image_raw
 ```
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic info /camera/wrist/aligned_depth_to_color/camera_info
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic info /camera/wrist/aligned_depth_to_color/camera_info
 ```
 
 读取一帧真实图像，确认 topic 能收到数据：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic echo /camera/wrist/image_raw --once
+cd ~/IB_Robot && \
+  source .shrc_local && \
+  export ROS_DOMAIN_ID=218 && \
+  ros2 topic echo /camera/wrist/image_raw \
+    --qos-reliability best_effort \
+    --once
 ```
 
-## 4. 终端 C：在网页中实时查看腕部相机
+RealSense 图像 topic 使用 best-effort QoS。若省略 `--qos-reliability best_effort`，
+`ros2 topic echo` 可能出现 reliability 不兼容，表现为 topic 有 publisher 但收不到图像。
 
-启动 RealSense 后，通过网页实时查看图像，确认标定板完整、清晰、曝光正常，并且移动主臂时画面确实随腕部相机变化。
+## 4. 终端 C：用 RViz 实时查看腕部相机
+
+启动 RealSense 后，通过 RViz 实时查看图像，确认标定板完整、清晰、曝光正常，并且移动主臂时画面确实随腕部相机变化。
 
 优先使用当前 robot_config 重映射后的 RGB topic：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && python3 scripts/camera_topic_viewer.py --topic /camera/wrist/image_raw --mode mjpeg --host 0.0.0.0 --port 8765
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && rviz2
 ```
 
-启动后打开浏览器访问：
+RViz 打开后按以下方式查看图像：
 
-```text
-http://127.0.0.1:8765
-```
+1. 点击左下角 `Add`。
+2. 选择 `By display type` -> `Image`。
+3. 在新建的 `Image` display 中把 `Topic` 设为 `/camera/wrist/image_raw`。
+4. 确认画面稳定刷新，标定板完整、清晰、曝光正常。
 
-如果在另一台电脑浏览，使用：
+如果 Topic 下拉里没有 `/camera/wrist/image_raw`，可以直接在 `Topic` 输入框手动输入该
+topic 并按回车。若仍不刷新，把 Image display 的 QoS `Reliability` 改为
+`Best Effort`。临时观察底层 RealSense raw 图像时，也可以输入
+`/camera/wrist_camera/color/image_raw`；但正式标定命令仍使用
+`/camera/wrist/image_raw`。
 
-```text
-http://<机器人主机IP>:8765
-```
-
-如果网页打开但一直黑屏或不刷新，先确认当前 ROS 图中实际发布的图像 topic：
+如果 RViz 的 Image 显示黑屏或不刷新，先确认当前 ROS 图中实际发布的图像 topic：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic list | grep -E 'color/image_raw|image_raw'
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic list | grep -E 'color/image_raw|image_raw'
 ```
 
 当前 `so101_handeye_realsense_only` 应使用 `/camera/wrist/image_raw`。不要把
 `/camera/camera/color/image_raw` 或 `/camera/wrist_camera/color/image_raw` 作为本流程默认输入。
 
-重要：网页观察、`handeye_calibrator --image-topic` 必须使用同一个 RGB topic；
+重要：RViz Image 显示、`handeye_calibrator --image-topic` 必须使用同一个 RGB topic；
 `--camera-info-topic` 使用 `/camera/wrist/aligned_depth_to_color/camera_info`，该 topic
 包含与对齐深度图一致的有效相机内参。
 
@@ -175,7 +220,7 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic lis
 
 整个标定过程中保持 ChArUco 标定板固定不动。通过主臂遥操作将机械臂移动到新姿态，松手等待稳定后在本终端按回车采样。
 
-如果第 4 步网页能看到 `/camera/wrist/image_raw` 的真实画面，使用默认命令：
+如果第 4 步 RViz 能看到 `/camera/wrist/image_raw` 的真实画面，使用默认命令：
 
 下面命令匹配仓库提供的标定板
 `outputs/calibration/charuco_A4_6x4_18mm_13mm_DICT_5X5_100_300dpi.png`：
@@ -184,7 +229,30 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 topic lis
 `--marker-length` 和 `--dictionary` 改成实物板的真实参数；参数不一致会导致几十像素级重投影误差。
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 run dataset_tools handeye_calibrator --image-topic /camera/wrist/image_raw --camera-info-topic /camera/wrist/aligned_depth_to_color/camera_info --base-frame base --ee-frame gripper --dictionary DICT_5X5_100 --squares-x 6 --squares-y 4 --square-length 0.018 --marker-length 0.013 --samples 35 --min-samples 20 --min-corners 10 --max-reprojection 1.0 --method park --output-json outputs/handeye/wrist_handeye_new.json --robot-config /tmp/so101_handeye_realsense_grasp.yaml --camera-name wrist --max-translation-std 0.01 --max-rotation-rms 2.0 --max-reprojection-mean 1.0
+cd ~/IB_Robot && \
+  source .shrc_local && \
+  export ROS_DOMAIN_ID=218 && \
+  python3 scripts/handeye_calibrator.py \
+    --image-topic /camera/wrist/image_raw \
+    --camera-info-topic /camera/wrist/aligned_depth_to_color/camera_info \
+    --base-frame base \
+    --ee-frame gripper \
+    --dictionary DICT_5X5_100 \
+    --squares-x 6 \
+    --squares-y 4 \
+    --square-length 0.018 \
+    --marker-length 0.013 \
+    --samples 35 \
+    --min-samples 20 \
+    --min-corners 10 \
+    --max-reprojection 1.0 \
+    --method park \
+    --output-json outputs/handeye/wrist_handeye_new.json \
+    --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
+    --camera-name wrist \
+    --max-translation-std 0.01 \
+    --max-rotation-rms 2.0 \
+    --max-reprojection-mean 1.0
 ```
 
 参数说明：

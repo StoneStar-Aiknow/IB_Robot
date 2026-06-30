@@ -46,9 +46,9 @@ class GroundedSAM2Node(Node):
         self.declare_parameter("gdino_checkpoint", "groundingdino_swint_ogc.pth")
         self.declare_parameter("gdino_text_encoder", "bert-base-uncased")
         self.declare_parameter("model_dir", "")
-        self.declare_parameter("rgb_topic", "/camera/front/image_raw")
-        self.declare_parameter("depth_topic", "/camera/front/aligned_depth_to_color/image_raw")
-        self.declare_parameter("camera_info_topic", "/camera/front/camera_info")
+        self.declare_parameter("rgb_topic", "/camera/wrist/image_raw")
+        self.declare_parameter("depth_topic", "/camera/wrist/aligned_depth_to_color/image_raw")
+        self.declare_parameter("camera_info_topic", "/camera/wrist/aligned_depth_to_color/camera_info")
         self.declare_parameter("box_threshold", 0.35)
         self.declare_parameter("text_threshold", 0.25)
 

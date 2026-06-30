@@ -525,17 +525,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--rgb-topic",
-        default="/camera/front/image_raw",
+        default="/camera/wrist/image_raw",
         help="RGB topic to save as input.png",
     )
     parser.add_argument(
         "--depth-topic",
-        default="/camera/front/aligned_depth_to_color/image_raw",
+        default="/camera/wrist/aligned_depth_to_color/image_raw",
         help="Aligned depth topic used for point cloud export",
     )
     parser.add_argument(
         "--camera-info-topic",
-        default="/camera/front/camera_info",
+        default="/camera/wrist/aligned_depth_to_color/camera_info",
         help="CameraInfo topic matching the RGB/aligned-depth frame",
     )
     parser.add_argument(

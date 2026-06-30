@@ -23,7 +23,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from grasp_service.graspgen_wrapper import GraspGenWrapper
+from manipulation_service.graspgen_wrapper import GraspGenWrapper
 
 _LEGACY_INTRINSICS = (614.0, 614.0, 320.0, 240.0)
 
@@ -420,7 +420,10 @@ def test_with_existing_data(
 
     print("\n--- Initializing GraspGenWrapper ---")
     _print_cuda_preflight()
-    wrapper = GraspGenWrapper(device="cuda", collision_gripper=collision_gripper)
+    wrapper = GraspGenWrapper(
+        device="cuda",
+        collision_gripper=collision_gripper,
+    )
     print(f"Model gripper: {wrapper.gripper_name}")
     if collision_gripper:
         print(f"Collision/viz gripper: {wrapper.collision_gripper_name}")
