@@ -1,16 +1,14 @@
-# BQ3588HM OpenHarmony Node.js 与 OpenClaw Gateway 部署记录
+# OpenHarmony EmbodiedAI 1.0.1 Node.js 与 OpenClaw Gateway 部署记录
 
-本文记录在 Bearkey BQ3588HM OpenHarmony RK3588 开发板上部署 Node.js v22.19.0，并在其基础上离线部署完整 OpenClaw Gateway 的实际操作过程。目标是让其他开发者或 AI agent 可以沿着同一路径继续复现、排障或扩展。
+本文记录在 RoboPi 和 BQ3588HM 开发板（运行 [OpenHarmony EmbodiedAI 1.0.1](https://gitcode.com/org/openharmony-robot/discussions/4) 系统，RK3588 芯片 aarch64/musl）上部署 Node.js v22.19.0，并在其基础上离线部署完整 OpenClaw Gateway 的实际操作过程。目标是让其他开发者或 AI agent 可以沿着同一路径继续复现、排障或扩展。
 
 ## 1. 目标与最终状态
 
 ### 1.1 目标
 
-在 BQ3588HM OpenHarmony 板端完成：
-
-- 交叉编译 Node.js v22.19.0 arm64/musl 版本。
+- 在开发机 Ubuntu 22.04 上交叉编译 Node.js v22.19.0 arm64/musl 版本。
 - 将 Node.js、npm、npx、corepack 部署到板端。
-- 在板端部署完整 OpenClaw Gateway，而不是仅部署 RosClaw 插件。
+- 在板端部署完整 OpenClaw Gateway。
 - 启动 Gateway 并确认其进入 `ready` 状态。
 
 ### 1.2 最终板端状态
@@ -49,14 +47,13 @@ openclaw gateway run \
 
 ### 2.1 主机环境
 
-本次实际使用的主机路径：
+主机环境变量(以下为示例,需替换为本机实际值)：
 
 ```sh
-IB_Robot=/home/xqw/Research/IB_Robot
-HDC_BIN=/home/xqw/Research/oh_sdk/toolchains/hdc
-HDC_TARGET=192.168.136.111:8710
-OHOS_SDK_TARBALL=/home/xqw/Research/oh_sdk/ohos-ros-sdk-build/20260115/ohos-sdk-18-linux-x86_64-20260115.tar.gz
-WORKDIR=/tmp/opencode
+HDC_BIN=<hdc_bin_path>                  # 例: /opt/oh_sdk/toolchains/hdc
+HDC_TARGET=<board_ip>:<hdc_port>        # 例: 192.168.1.100:8710
+OHOS_SDK_TARBALL=<ohos_sdk_tarball>     # 例: /path/to/ohos-sdk-18-linux-x86_64.tar.gz
+WORKDIR=/tmp/oh-build                   # 主机侧构建工作目录,可自定义
 ```
 
 主机需要：
@@ -67,7 +64,7 @@ WORKDIR=/tmp/opencode
 - `make`
 - `tar`
 - `npm`
-- 足够磁盘空间，实际中 `/tmp/opencode/ohos-ndk/18/native` 提取后约 2.9 GB，Node.js 源码与构建产物还会占用更多空间。
+- 足够磁盘空间，实际中 `/tmp/oh-build/ohos-ndk/18/native` 提取后约 2.9 GB，Node.js 源码与构建产物还会占用更多空间。
 
 检查命令：
 
@@ -82,8 +79,8 @@ nproc
 使用 HDC TCP 连接：
 
 ```sh
-HDC_BIN=/home/xqw/Research/oh_sdk/toolchains/hdc
-HDC_TARGET=192.168.136.111:8710
+HDC_BIN=<hdc_bin_path>
+HDC_TARGET=<board_ip>:<hdc_port>
 
 "$HDC_BIN" tconn "$HDC_TARGET"
 "$HDC_BIN" list targets
@@ -106,14 +103,14 @@ HDC_TARGET=192.168.136.111:8710
 先确认板端架构和当前是否已有 Node.js：
 
 ```sh
-HDC_BIN=/home/xqw/Research/oh_sdk/toolchains/hdc
-HDC_TARGET=192.168.136.111:8710
+HDC_BIN=<hdc_bin_path>
+HDC_TARGET=<board_ip>:<hdc_port>
 
 "$HDC_BIN" -t "$HDC_TARGET" shell '
 uname -a
 which node 2>/dev/null || true
 which npm 2>/dev/null || true
-ls /data/local/skh-run/bin/node 2>/dev/null || true
+ls /data/roboframe/pysite/bin/node 2>/dev/null || true
 ls /system/bin/node 2>/dev/null || true
 ls /lib/ld-musl-aarch64.so.1 2>/dev/null || true
 ls /system/lib64/libc++_shared.so 2>/dev/null || true
@@ -129,9 +126,39 @@ ls /system/lib64/libc++_shared.so 2>/dev/null || true
 
 ## 3. 交叉编译方案概述
 
-Node.js v22.19.0 的交叉编译核心思路：
+Node.js v22.19.0 源码地址：`https://nodejs.org/dist/v22.19.0/node-v22.19.0.tar.gz`，目标三元组 `aarch64-linux-ohos`（musl）。
 
-- Node.js v22.19.0 源码地址：`https://nodejs.org/dist/v22.19.0/node-v22.19.0.tar.gz`
+交叉编译有两种方案，推荐优先使用 lycium 一键编译：
+
+- **推荐：lycium 一键编译**（§3.1）——OpenHarmony 社区集成框架，一条命令产出 arm64 产物，已封装本文档手动方案中遇到的 CRC32/AES intrinsic、`libatomic`/`getservbyport_r` 缺失等问题。
+- **手动交叉编译**（§3.2、§4–5）——自行提取 NDK、配置 configure、处理 stub。仅当 lycium 不可用或需要对编译过程有更细粒度控制时使用。
+
+### 3.1 推荐方案：lycium 一键编译
+
+OpenHarmony 社区提供的集成编译框架 `ttyd_openharmony`，可以一键编译 Node.js：
+
+```sh
+sudo apt update
+sudo apt install gcc-12 g++-12
+
+git clone https://gitee.com/OpenHarmony_rk_equipment_transplantation/ttyd_openharmony.git
+cd ttyd_openharmony/lycium
+
+# 设置 OpenHarmony NDK 环境变量
+export OHOS_SDK=<your-ohos-sdk-path>
+
+# 编译 nodejs v22.19.0 arm64-v8a 版本
+./build.sh nodejs_22_19_0
+```
+
+编译产物在 `ttyd_openharmony/lycium/usr/nodejs_22_19_0` 目录下。
+
+> 注：本文档的详细步骤（§4–5）记录的是手动方案；lycium 方案由社区维护，建议先用 lycium 验证，遇到问题再参考 §3.2 及 §4–5 回退手动方案。
+
+### 3.2 手动交叉编译
+
+手动方案的核心思路：
+
 - 主机编译 Node.js 22 需要 `gcc-12` 和 `g++-12`（用于编译构建期辅助工具）。
 - 使用 OpenHarmony NDK 工具链交叉编译，目标三元组为 `aarch64-linux-ohos`。
 - 配置时使用：
@@ -153,27 +180,7 @@ Node.js 上游已有 OpenHarmony 相关 PR（在 `--dest-os` 中添加 `openharm
 https://github.com/nodejs/node/commit/215587feca
 ```
 
-### 3.1 替代方案：lycium 一键编译
-
-除了本文档详细记录的手动交叉编译方式外，OpenHarmony 社区还提供了一个集成编译框架 `ttyd_openharmony`，可以一键编译 Node.js：
-
-```sh
-sudo apt update
-sudo apt install gcc-12 g++-12
-
-git clone https://gitee.com/OpenHarmony_rk_equipment_transplantation/ttyd_openharmony.git
-cd ttyd_openharmony/lycium
-
-# 设置 OpenHarmony NDK 环境变量
-export OHOS_SDK=<your-ohos-sdk-path>
-
-# 编译 nodejs v22.19.0 arm64-v8a 版本
-./build.sh nodejs_22_19_0
-```
-
-编译产物在 `ttyd_openharmony/lycium/usr/nodejs_22_19_0` 目录下。
-
-该方案适合快速验证；如果需要对编译过程有更细粒度的控制（如处理 CRC32/AES intrinsic、`libatomic`/`getservbyport_r` 缺失等问题），建议使用本文档的手动交叉编译方式。
+手动方案的关键坑（缺 C++ 头文件、CRC32/AES intrinsic、`-latomic`/`getservbyport_r`）见 §5.5，详细步骤见 §4–5。
 
 ## 4. 提取 OpenHarmony NDK
 
@@ -182,13 +189,13 @@ export OHOS_SDK=<your-ohos-sdk-path>
 本次使用：
 
 ```sh
-/home/xqw/Research/oh_sdk/ohos-ros-sdk-build/20260115/ohos-sdk-18-linux-x86_64-20260115.tar.gz
+<ohos_sdk_tarball>
 ```
 
 检查 tarball 中是否包含 NDK：
 
 ```sh
-tar tzf /home/xqw/Research/oh_sdk/ohos-ros-sdk-build/20260115/ohos-sdk-18-linux-x86_64-20260115.tar.gz \
+tar tzf <ohos_sdk_tarball> \
   | grep -E '18/native/llvm/bin/clang$|18/native/llvm/bin/llvm-ar$'
 ```
 
@@ -201,29 +208,29 @@ tar tzf /home/xqw/Research/oh_sdk/ohos-ros-sdk-build/20260115/ohos-sdk-18-linux-
 
 ### 4.2 提取必要目录
 
-提取到 `/tmp/opencode/ohos-ndk`：
+提取到 `/tmp/oh-build/ohos-ndk`：
 
 ```sh
-mkdir -p /tmp/opencode/ohos-ndk
+mkdir -p /tmp/oh-build/ohos-ndk
 
-tar xzf /home/xqw/Research/oh_sdk/ohos-ros-sdk-build/20260115/ohos-sdk-18-linux-x86_64-20260115.tar.gz \
-  -C /tmp/opencode/ohos-ndk \
+tar xzf <ohos_sdk_tarball> \
+  -C /tmp/oh-build/ohos-ndk \
   '18/native/llvm/bin/'
 
-tar xzf /home/xqw/Research/oh_sdk/ohos-ros-sdk-build/20260115/ohos-sdk-18-linux-x86_64-20260115.tar.gz \
-  -C /tmp/opencode/ohos-ndk \
+tar xzf <ohos_sdk_tarball> \
+  -C /tmp/oh-build/ohos-ndk \
   '18/native/llvm/lib/'
 
-tar xzf /home/xqw/Research/oh_sdk/ohos-ros-sdk-build/20260115/ohos-sdk-18-linux-x86_64-20260115.tar.gz \
-  -C /tmp/opencode/ohos-ndk \
+tar xzf <ohos_sdk_tarball> \
+  -C /tmp/oh-build/ohos-ndk \
   '18/native/llvm/include/'
 
-tar xzf /home/xqw/Research/oh_sdk/ohos-ros-sdk-build/20260115/ohos-sdk-18-linux-x86_64-20260115.tar.gz \
-  -C /tmp/opencode/ohos-ndk \
+tar xzf <ohos_sdk_tarball> \
+  -C /tmp/oh-build/ohos-ndk \
   '18/native/sysroot/usr/include/'
 
-tar xzf /home/xqw/Research/oh_sdk/ohos-ros-sdk-build/20260115/ohos-sdk-18-linux-x86_64-20260115.tar.gz \
-  -C /tmp/opencode/ohos-ndk \
+tar xzf <ohos_sdk_tarball> \
+  -C /tmp/oh-build/ohos-ndk \
   '18/native/sysroot/usr/lib/aarch64-linux-ohos/'
 ```
 
@@ -238,12 +245,12 @@ fatal error: 'version' file not found
 检查提取结果：
 
 ```sh
-ls /tmp/opencode/ohos-ndk/18/native/llvm/bin/clang
-ls /tmp/opencode/ohos-ndk/18/native/llvm/bin/clang++
-ls /tmp/opencode/ohos-ndk/18/native/llvm/include/c++/v1/string
-ls /tmp/opencode/ohos-ndk/18/native/sysroot/usr/include/stdio.h
-ls /tmp/opencode/ohos-ndk/18/native/sysroot/usr/lib/aarch64-linux-ohos/libc.so
-du -sh /tmp/opencode/ohos-ndk/18/native
+ls /tmp/oh-build/ohos-ndk/18/native/llvm/bin/clang
+ls /tmp/oh-build/ohos-ndk/18/native/llvm/bin/clang++
+ls /tmp/oh-build/ohos-ndk/18/native/llvm/include/c++/v1/string
+ls /tmp/oh-build/ohos-ndk/18/native/sysroot/usr/include/stdio.h
+ls /tmp/oh-build/ohos-ndk/18/native/sysroot/usr/lib/aarch64-linux-ohos/libc.so
+du -sh /tmp/oh-build/ohos-ndk/18/native
 ```
 
 本次提取后的 `18/native` 约 2.9 GB。
@@ -254,16 +261,16 @@ du -sh /tmp/opencode/ohos-ndk/18/native
 
 ```sh
 bash -c '
-OHOS_SDK=/tmp/opencode/ohos-ndk/18/native
+OHOS_SDK=/tmp/oh-build/ohos-ndk/18/native
 CC="${OHOS_SDK}/llvm/bin/clang --target=aarch64-linux-ohos --sysroot=${OHOS_SDK}/sysroot"
 
-cat > /tmp/opencode/test_hello.c << EOF
+cat > /tmp/oh-build/test_hello.c << EOF
 #include <stdio.h>
 int main() { printf("hello ohos aarch64\\n"); return 0; }
 EOF
 
-$CC -fPIC -D__MUSL__=1 -o /tmp/opencode/test_hello /tmp/opencode/test_hello.c
-file /tmp/opencode/test_hello
+$CC -fPIC -D__MUSL__=1 -o /tmp/oh-build/test_hello /tmp/oh-build/test_hello.c
+file /tmp/oh-build/test_hello
 '
 ```
 
@@ -278,17 +285,17 @@ interpreter /lib/ld-musl-aarch64.so.1
 
 ```sh
 bash -c '
-OHOS_SDK=/tmp/opencode/ohos-ndk/18/native
+OHOS_SDK=/tmp/oh-build/ohos-ndk/18/native
 CXX="${OHOS_SDK}/llvm/bin/clang++ --target=aarch64-linux-ohos --sysroot=${OHOS_SDK}/sysroot"
 
-cat > /tmp/opencode/test_cxx.cpp << EOF
+cat > /tmp/oh-build/test_cxx.cpp << EOF
 #include <string>
 #include <atomic>
 int main() { std::string s = "ok"; return 0; }
 EOF
 
-$CXX -fPIC -D__MUSL__=1 -std=gnu++20 -o /tmp/opencode/test_cxx /tmp/opencode/test_cxx.cpp
-file /tmp/opencode/test_cxx
+$CXX -fPIC -D__MUSL__=1 -std=gnu++20 -o /tmp/oh-build/test_cxx /tmp/oh-build/test_cxx.cpp
+file /tmp/oh-build/test_cxx
 '
 ```
 
@@ -297,7 +304,7 @@ file /tmp/opencode/test_cxx
 ### 5.1 下载源码
 
 ```sh
-cd /tmp/opencode
+cd /tmp/oh-build
 
 if [ ! -f node-v22.19.0.tar.gz ]; then
   wget https://nodejs.org/dist/v22.19.0/node-v22.19.0.tar.gz
@@ -311,9 +318,9 @@ tar xzf node-v22.19.0.tar.gz
 环境变量：
 
 ```sh
-OHOS_SDK=/tmp/opencode/ohos-ndk/18/native
-NODE_SRC=/tmp/opencode/node-v22.19.0
-INSTALL_DIR=/tmp/opencode/nodejs-ohos-install
+OHOS_SDK=/tmp/oh-build/ohos-ndk/18/native
+NODE_SRC=/tmp/oh-build/node-v22.19.0
+INSTALL_DIR=/tmp/oh-build/nodejs-ohos-install
 JOBS=$(nproc)
 
 export CC_host="gcc-12"
@@ -354,7 +361,7 @@ cd "$NODE_SRC"
   --cross-compiling \
   --openssl-no-asm \
   --prefix="$INSTALL_DIR" \
-  > /tmp/opencode/nodejs-configure.log 2>&1
+  > /tmp/oh-build/nodejs-configure.log 2>&1
 ```
 
 ### 5.3 创建缺失库与缺失符号 stub
@@ -369,9 +376,9 @@ ld.lld: error: undefined symbol: getservbyport_r
 创建 `getservbyport_r` stub：
 
 ```sh
-mkdir -p /tmp/opencode/stubs
+mkdir -p /tmp/oh-build/stubs
 
-cat > /tmp/opencode/stubs/getservbyport_r.c << 'EOF'
+cat > /tmp/oh-build/stubs/getservbyport_r.c << 'EOF'
 #include <netdb.h>
 #include <string.h>
 #include <errno.h>
@@ -395,16 +402,16 @@ EOF
 
 ```sh
 bash -c '
-OHOS_SDK=/tmp/opencode/ohos-ndk/18/native
+OHOS_SDK=/tmp/oh-build/ohos-ndk/18/native
 CC="${OHOS_SDK}/llvm/bin/clang --target=aarch64-linux-ohos --sysroot=${OHOS_SDK}/sysroot"
 AR="${OHOS_SDK}/llvm/bin/llvm-ar"
 LIB_DIR="${OHOS_SDK}/sysroot/usr/lib/aarch64-linux-ohos"
 
-echo "" > /tmp/opencode/empty.c
-$CC -fPIC -D__MUSL__=1 -c /tmp/opencode/empty.c -o /tmp/opencode/empty.o
-$CC -fPIC -D__MUSL__=1 -c /tmp/opencode/stubs/getservbyport_r.c -o /tmp/opencode/stubs/getservbyport_r.o
+echo "" > /tmp/oh-build/empty.c
+$CC -fPIC -D__MUSL__=1 -c /tmp/oh-build/empty.c -o /tmp/oh-build/empty.o
+$CC -fPIC -D__MUSL__=1 -c /tmp/oh-build/stubs/getservbyport_r.c -o /tmp/oh-build/stubs/getservbyport_r.o
 
-$AR rcs "${LIB_DIR}/libatomic.a" /tmp/opencode/stubs/getservbyport_r.o /tmp/opencode/empty.o
+$AR rcs "${LIB_DIR}/libatomic.a" /tmp/oh-build/stubs/getservbyport_r.o /tmp/oh-build/empty.o
 "${OHOS_SDK}/llvm/bin/llvm-nm" "${LIB_DIR}/libatomic.a" | grep getservbyport
 '
 ```
@@ -424,9 +431,9 @@ T getservbyport_r
 
 ```sh
 bash -c '
-OHOS_SDK=/tmp/opencode/ohos-ndk/18/native
-NODE_SRC=/tmp/opencode/node-v22.19.0
-INSTALL_DIR=/tmp/opencode/nodejs-ohos-install
+OHOS_SDK=/tmp/oh-build/ohos-ndk/18/native
+NODE_SRC=/tmp/oh-build/node-v22.19.0
+INSTALL_DIR=/tmp/oh-build/nodejs-ohos-install
 JOBS=$(nproc)
 
 export CC_host="gcc-12"
@@ -457,20 +464,20 @@ rm -rf out/
   --cross-compiling \
   --openssl-no-asm \
   --prefix="$INSTALL_DIR" \
-  > /tmp/opencode/nodejs-configure.log 2>&1
+  > /tmp/oh-build/nodejs-configure.log 2>&1
 
-make -j"$JOBS" > /tmp/opencode/nodejs-build.log 2>&1
-make install > /tmp/opencode/nodejs-install.log 2>&1
+make -j"$JOBS" > /tmp/oh-build/nodejs-build.log 2>&1
+make install > /tmp/oh-build/nodejs-install.log 2>&1
 '
 ```
 
 安装树检查：
 
 ```sh
-ls -la /tmp/opencode/nodejs-ohos-install
-ls /tmp/opencode/nodejs-ohos-install/bin
-file /tmp/opencode/nodejs-ohos-install/bin/node
-du -sh /tmp/opencode/nodejs-ohos-install
+ls -la /tmp/oh-build/nodejs-ohos-install
+ls /tmp/oh-build/nodejs-ohos-install/bin
+file /tmp/oh-build/nodejs-ohos-install/bin/node
+du -sh /tmp/oh-build/nodejs-ohos-install
 ```
 
 本次结果：
@@ -565,10 +572,10 @@ ld.lld: error: undefined symbol: getservbyport_r
 ### 6.1 strip 与打包
 
 ```sh
-/tmp/opencode/ohos-ndk/18/native/llvm/bin/llvm-strip \
-  /tmp/opencode/nodejs-ohos-install/bin/node
+/tmp/oh-build/ohos-ndk/18/native/llvm/bin/llvm-strip \
+  /tmp/oh-build/nodejs-ohos-install/bin/node
 
-cd /tmp/opencode
+cd /tmp/oh-build
 tar czf nodejs-ohos-v22.19.0.tar.gz nodejs-ohos-install/
 ls -lh nodejs-ohos-v22.19.0.tar.gz
 ```
@@ -578,11 +585,11 @@ ls -lh nodejs-ohos-v22.19.0.tar.gz
 ### 6.2 推送并解压
 
 ```sh
-HDC_BIN=/home/xqw/Research/oh_sdk/toolchains/hdc
-HDC_TARGET=192.168.136.111:8710
+HDC_BIN=<hdc_bin_path>
+HDC_TARGET=<board_ip>:<hdc_port>
 
 "$HDC_BIN" -t "$HDC_TARGET" file send \
-  /tmp/opencode/nodejs-ohos-v22.19.0.tar.gz \
+  /tmp/oh-build/nodejs-ohos-v22.19.0.tar.gz \
   /data/local/nodejs-ohos-v22.19.0.tar.gz
 
 "$HDC_BIN" -t "$HDC_TARGET" shell '
@@ -602,7 +609,7 @@ Node.js install 生成的 `npm` / `npx` 默认是符号链接，目标 JS 文件
 #!/usr/bin/env node
 ```
 
-但 BQ3588HM OpenHarmony 板端没有 `/usr/bin/env`，只有 `/bin/env` 或 `/system/bin/env`。因此直接执行 `npm` 会出现：
+但 OpenHarmony EmbodiedAI 1.0.1 板端没有 `/usr/bin/env`，只有 `/bin/env` 或 `/system/bin/env`。因此直接执行 `npm` 会出现：
 
 ```text
 /bin/sh: /data/local/nodejs/bin/npm: No such file or directory
@@ -611,8 +618,8 @@ Node.js install 生成的 `npm` / `npx` 默认是符号链接，目标 JS 文件
 解决方式：删除 symlink，替换为使用绝对 Node 路径的 shell wrapper。
 
 ```sh
-HDC_BIN=/home/xqw/Research/oh_sdk/toolchains/hdc
-HDC_TARGET=192.168.136.111:8710
+HDC_BIN=<hdc_bin_path>
+HDC_TARGET=<board_ip>:<hdc_port>
 
 "$HDC_BIN" -t "$HDC_TARGET" shell '
 NODE_HOME=/data/local/nodejs
@@ -743,11 +750,11 @@ npm view openclaw version dist.tarball bin engines dependencies optionalDependen
 因为板端无外网，所以在主机上生成目标平台安装前缀：
 
 ```sh
-rm -rf /tmp/opencode/openclaw-board-prefix
-mkdir -p /tmp/opencode/openclaw-board-prefix
+rm -rf /tmp/oh-build/openclaw-board-prefix
+mkdir -p /tmp/oh-build/openclaw-board-prefix
 
 npm install -g \
-  --prefix /tmp/opencode/openclaw-board-prefix \
+  --prefix /tmp/oh-build/openclaw-board-prefix \
   openclaw@2026.6.8 \
   --omit=dev \
   --os=linux \
@@ -764,9 +771,9 @@ added 294 packages
 检查：
 
 ```sh
-ls -la /tmp/opencode/openclaw-board-prefix/bin
-du -sh /tmp/opencode/openclaw-board-prefix
-node /tmp/opencode/openclaw-board-prefix/lib/node_modules/openclaw/openclaw.mjs --version
+ls -la /tmp/oh-build/openclaw-board-prefix/bin
+du -sh /tmp/oh-build/openclaw-board-prefix
+node /tmp/oh-build/openclaw-board-prefix/lib/node_modules/openclaw/openclaw.mjs --version
 ```
 
 本次结果：
@@ -780,7 +787,7 @@ OpenClaw 2026.6.8 (844f405)
 ### 7.3 检查 native 依赖是否包含 arm64 产物
 
 ```sh
-find /tmp/opencode/openclaw-board-prefix -name '*.node' -o -type f -perm -111 \
+find /tmp/oh-build/openclaw-board-prefix -name '*.node' -o -type f -perm -111 \
   | while read p; do file "$p"; done \
   | head -80
 ```
@@ -800,19 +807,19 @@ sqlite-vec-linux-arm64
 ### 8.1 打包和推送
 
 ```sh
-cd /tmp/opencode
-tar czf /tmp/opencode/openclaw-board-prefix.tar.gz -C /tmp/opencode openclaw-board-prefix
-ls -lh /tmp/opencode/openclaw-board-prefix.tar.gz
+cd /tmp/oh-build
+tar czf /tmp/oh-build/openclaw-board-prefix.tar.gz -C /tmp/oh-build openclaw-board-prefix
+ls -lh /tmp/oh-build/openclaw-board-prefix.tar.gz
 ```
 
 推送并解压：
 
 ```sh
-HDC_BIN=/home/xqw/Research/oh_sdk/toolchains/hdc
-HDC_TARGET=192.168.136.111:8710
+HDC_BIN=<hdc_bin_path>
+HDC_TARGET=<board_ip>:<hdc_port>
 
 "$HDC_BIN" -t "$HDC_TARGET" file send \
-  /tmp/opencode/openclaw-board-prefix.tar.gz \
+  /tmp/oh-build/openclaw-board-prefix.tar.gz \
   /data/local/openclaw-board-prefix.tar.gz
 
 "$HDC_BIN" -t "$HDC_TARGET" shell '
@@ -849,7 +856,7 @@ openclaw -> ../lib/node_modules/openclaw/openclaw.mjs
 
 ```sh
 "$HDC_BIN" -t "$HDC_TARGET" file send \
-  /tmp/opencode/openclaw-board-prefix/lib/node_modules/openclaw/openclaw.mjs \
+  /tmp/oh-build/openclaw-board-prefix/lib/node_modules/openclaw/openclaw.mjs \
   /data/local/openclaw/lib/node_modules/openclaw/openclaw.mjs
 ```
 
@@ -1120,13 +1127,7 @@ chmod 755 \
 
 ### 10.4 脚本适配注意事项
 
-OpenHarmony 板端缺少部分常见 Linux 工具。本次遇到：
-
-- `awk` 不存在。
-- `getprop` 不存在。
-- `ps -ef` 中 OpenClaw 进程名显示为 `openclaw`，不显示完整 `node ... openclaw.mjs gateway ...` 命令。
-
-因此脚本最后避免使用 `awk`，也不再用模糊 `ps | grep openclaw.mjs gateway` 作为唯一判断，而是用 pidfile + port 检测。
+OpenHarmony 板端的 shell/工具约束（toybox 缺 `awk`/`getprop`、`ps` 进程名不完整、无 `/usr/bin/env`、musl libc、只读根文件系统、无 systemd、`LD_PRELOAD` 干扰等）统一汇总于 `oh-constraints` skill，编写板端脚本前必读。本文脚本即遵循该约束：避免 `awk`，用 pidfile + port 检测替代 `ps | grep`。
 
 ## 11. 从 loopback 切换到 LAN 访问
 
@@ -1180,19 +1181,21 @@ export OPENCLAW_GATEWAY_TOKEN='<replace-with-strong-token>'
 
 ## 13. 快速复现清单
 
+> **提示**: 若已有预编译产物(`nodejs-ohos-v22.19.0.tar.gz` + `openclaw-board-prefix.tar.gz`),可直接跳到本节末尾的「板端」部分,省略主机侧编译(第 1–6 步)。预编译产物建议持久保存到非 `/tmp` 目录(如与 IB_Robot 同级的 `oh_board_artifacts/`),避免重启后 `/tmp` 清空需重新编译。
+
 主机侧：
 
 ```sh
 # 1. 提取 OHOS NDK
-mkdir -p /tmp/opencode/ohos-ndk
-tar xzf $OHOS_SDK_TARBALL -C /tmp/opencode/ohos-ndk '18/native/llvm/bin/'
-tar xzf $OHOS_SDK_TARBALL -C /tmp/opencode/ohos-ndk '18/native/llvm/lib/'
-tar xzf $OHOS_SDK_TARBALL -C /tmp/opencode/ohos-ndk '18/native/llvm/include/'
-tar xzf $OHOS_SDK_TARBALL -C /tmp/opencode/ohos-ndk '18/native/sysroot/usr/include/'
-tar xzf $OHOS_SDK_TARBALL -C /tmp/opencode/ohos-ndk '18/native/sysroot/usr/lib/aarch64-linux-ohos/'
+mkdir -p /tmp/oh-build/ohos-ndk
+tar xzf $OHOS_SDK_TARBALL -C /tmp/oh-build/ohos-ndk '18/native/llvm/bin/'
+tar xzf $OHOS_SDK_TARBALL -C /tmp/oh-build/ohos-ndk '18/native/llvm/lib/'
+tar xzf $OHOS_SDK_TARBALL -C /tmp/oh-build/ohos-ndk '18/native/llvm/include/'
+tar xzf $OHOS_SDK_TARBALL -C /tmp/oh-build/ohos-ndk '18/native/sysroot/usr/include/'
+tar xzf $OHOS_SDK_TARBALL -C /tmp/oh-build/ohos-ndk '18/native/sysroot/usr/lib/aarch64-linux-ohos/'
 
 # 2. 下载 Node.js
-cd /tmp/opencode
+cd /tmp/oh-build
 wget https://nodejs.org/dist/v22.19.0/node-v22.19.0.tar.gz
 tar xzf node-v22.19.0.tar.gz
 
@@ -1203,14 +1206,14 @@ tar xzf node-v22.19.0.tar.gz
 # 参考第 5.4 节
 
 # 5. 打包 Node.js
-/tmp/opencode/ohos-ndk/18/native/llvm/bin/llvm-strip /tmp/opencode/nodejs-ohos-install/bin/node
-tar czf /tmp/opencode/nodejs-ohos-v22.19.0.tar.gz -C /tmp/opencode nodejs-ohos-install
+/tmp/oh-build/ohos-ndk/18/native/llvm/bin/llvm-strip /tmp/oh-build/nodejs-ohos-install/bin/node
+tar czf /tmp/oh-build/nodejs-ohos-v22.19.0.tar.gz -C /tmp/oh-build nodejs-ohos-install
 
 # 6. 主机侧准备 OpenClaw 离线包
-rm -rf /tmp/opencode/openclaw-board-prefix
-mkdir -p /tmp/opencode/openclaw-board-prefix
-npm install -g --prefix /tmp/opencode/openclaw-board-prefix openclaw@2026.6.8 --omit=dev --os=linux --cpu=arm64 --libc=musl
-tar czf /tmp/opencode/openclaw-board-prefix.tar.gz -C /tmp/opencode openclaw-board-prefix
+rm -rf /tmp/oh-build/openclaw-board-prefix
+mkdir -p /tmp/oh-build/openclaw-board-prefix
+npm install -g --prefix /tmp/oh-build/openclaw-board-prefix openclaw@2026.6.8 --omit=dev --os=linux --cpu=arm64 --libc=musl
+tar czf /tmp/oh-build/openclaw-board-prefix.tar.gz -C /tmp/oh-build openclaw-board-prefix
 ```
 
 板端：
@@ -1373,42 +1376,7 @@ cp -rf share /usr/
 | 重启后保持 | 是（/data 持久化） | 取决于镜像是否包含 |
 | 适合场景 | 开发调试、快速验证 | 生产部署、出厂镜像 |
 
-## 15. 其他二进制工具部署
-
-原始参考文档中还提到了以下工具可以按类似方式部署到 OpenHarmony 板端：
-
-| 工具 | 用途 | 部署方式 |
-|------|------|---------|
-| `tcpdump` | 网络抓包分析 | 交叉编译或使用 OpenHarmony 预编译版本 |
-| `ffmpeg` | 音视频处理 | 参考 thirdparty_pytorch 中的 FFmpeg SDK 扩展层 |
-| `v4l2-ctl` | V4L2 视频设备控制 | 交叉编译 v4l-utils |
-
-这些工具的交叉编译不在本文档范围内，但部署方式与 Node.js 类似：交叉编译得到 aarch64 ELF 二进制后，推送到板端 `/data/local` 或通过 `device_tools` 集成到系统镜像。
-
-## 16. 在 toybox 中增加 vi 命令
-
-OpenHarmony 使用 `toybox` 作为默认的工具箱。如果需要 `vi` 编辑器，可以通过 patch toybox 源码实现。
-
-toybox `vi` patch 文件：`81e39c5.diff.zip`
-
-使用方式：
-
-```sh
-# 获取 toybox 源码
-git clone https://gitee.com/openharmony/third_party_toybox.git
-cd third_party_toybox
-
-# 应用 vi 补丁
-unzip 81e39c5.diff.zip
-git apply 81e39c5.diff
-
-# 重新编译 toybox 并推送到板端
-# 具体编译方式取决于 OpenHarmony 版本和构建系统
-```
-
-应用补丁后，`vi` 命令将出现在 toybox 的命令列表中。
-
-## 17. 参考链接
+## 15. 参考链接
 
 ### Node.js 交叉编译
 
@@ -1419,16 +1387,10 @@ git apply 81e39c5.diff
 ### OpenHarmony SDK
 
 - OpenHarmony NDK 下载：`https://www.openharmony.cn/maincontribution/harmonyos-sdk`
-- BQ3588HM 板端使用文档：`docs/BQ3588HM_board_usage.md`
-- BQ3588HM OpenHarmony ROS 文档：`docs/BQ3588HM_OpenHarmony_ROS.md`
+- 板端烧录与调试文档：`docs/OpenHarmony_EmbodiedAI_Board_Setup.md`
 
 ### OpenClaw
 
 - OpenClaw 官方仓库：`https://github.com/openclaw/openclaw`
 - OpenClaw 文档：`https://docs.openclaw.ai`
 - OpenClaw 快速入门：`https://docs.openclaw.ai/start/getting-started`
-
-### 其他
-
-- PyYAML 官方仓库：`https://github.com/yaml/pyyaml`
-- toybox 项目：`https://github.com/landley/toybox`

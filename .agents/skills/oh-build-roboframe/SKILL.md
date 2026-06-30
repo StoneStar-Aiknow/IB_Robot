@@ -1,15 +1,15 @@
 ---
-name: oh-build-ibrobot
-description: "Host-side OpenHarmony cross-build for IB_Robot packages on BQ3588HM. Use when user mentions `build_ibrobot_oh_custom.sh`, `OH_ROOT`, `OpenHarmony build`, `OH host build`, `编译板端 IB_Robot`, `交叉编译 inference_service`, `robot_config OpenHarmony`, `series.openharmony-5.1.0-musl.txt`, or needs the official host-side build pipeline for `ibrobot_msgs,tensormsg,robot_config,inference_service`."
+name: oh-build-roboframe
+description: "Host-side OpenHarmony cross-build for RoboFrame release package. Use when user mentions `build_roboframe_oh.sh`, `OH_ROOT`, `OpenHarmony build`, `OH host build`, `编译板端 RoboFrame`, `交叉编译 inference_service`, `robot_config OpenHarmony`, `series.openharmony-5.1.0-musl.txt`, or needs the official host-side build pipeline. Triggers for 'BQ3588HM', 'RoboPi'."
 ---
 
-# OpenHarmony Host-Side Build for IB_Robot
+# OpenHarmony Host-Side Build for RoboFrame
 
-Use this skill for the official Ubuntu host-side cross-build of IB_Robot's own OpenHarmony packages.
+Use this skill for the official Ubuntu host-side cross-build of the RoboFrame release package (IB_Robot ROS 2 packages for OpenHarmony).
 
 This skill is for:
 
-- `scripts/openharmony/build_ibrobot_oh_custom.sh`
+- `scripts/openharmony/build_roboframe_oh.sh`
 - `ibrobot_msgs`
 - `tensormsg`
 - `robot_config`
@@ -26,7 +26,7 @@ Do not use this skill for:
 Use instead:
 
 - `oh-cross-build-ros-pkg` for third-party ROS 2 packages
-- `ibrobot-hdc` for board transfer / shell
+- `oh-access` for board transfer / shell
 - `oh-rebuild-kernel` for kernel work
 - `rknn-convert` for ONNX -> RKNN
 
@@ -34,8 +34,7 @@ Use instead:
 
 Always treat these as authoritative:
 
-- `scripts/openharmony/build_ibrobot_oh_custom.sh`
-- `docs/BQ3588HM_OpenHarmony_ROS.md`
+- `scripts/openharmony/build_roboframe_oh.sh`
 - `README.md` OpenHarmony section
 
 The board runtime bundle must be produced by the official script, not by manually copying files into `install/`.
@@ -43,7 +42,7 @@ The board runtime bundle must be produced by the official script, not by manuall
 ## Non-Negotiable Rules
 
 1. Never hand-copy `libs/lerobot/src` into the OH install tree.
-2. Always use `scripts/openharmony/build_ibrobot_oh_custom.sh` as the build entry.
+2. Always use `scripts/openharmony/build_roboframe_oh.sh` as the build entry.
 3. The final runtime bundle must include the OpenHarmony lerobot patch stack from:
    `third_party/patches/lerobot/<active_tag>/series.openharmony-5.1.0-musl.txt`
 4. Fail closed if the staged `install/lerobot/src` is not the lazy-import version.
@@ -62,9 +61,9 @@ Do not guess alternate host layouts. If `OH_ROOT` is missing, ask the user or us
 Run from a temporary working copy when requested, but keep `OH_ROOT` pointed at the shared host build root:
 
 ```bash
-OH_ROOT="/home/xqw/Research/bq3588_oh_ws" \
-./scripts/openharmony/build_ibrobot_oh_custom.sh \
-  --oh-root "/home/xqw/Research/bq3588_oh_ws" \
+OH_ROOT="<oh_build_root>" \
+./scripts/openharmony/build_roboframe_oh.sh \
+  --oh-root "<oh_build_root>" \
   --packages ibrobot_msgs,tensormsg,robot_config,inference_service
 ```
 
@@ -120,7 +119,7 @@ fatal: not a git repository ... .git/modules/libs/lerobot
 
 Correct action:
 
-- fix `build_ibrobot_oh_custom.sh` so runtime staging can fall back to upstream clone
+- fix `build_roboframe_oh.sh` so runtime staging can fall back to upstream clone
 - re-run the official build
 - do not manually inject `lerobot/src`
 
@@ -147,7 +146,6 @@ Correct action:
 After this skill finishes a valid host build, the next normal step is:
 
 1. package the generated `install/`
-2. deploy it to `/data/ibrobot/install` on the board
-3. validate `LeRobotPreprocessor` / `LeRobotPostprocessor`
+2. deploy it to `/data/roboframe/install` on the board
 
 Board deployment itself is not the responsibility of this skill; use normal shell/HDC operations after the build succeeds.

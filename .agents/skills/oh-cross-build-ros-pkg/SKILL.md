@@ -1,11 +1,11 @@
 ---
 name: oh-cross-build-ros-pkg
-description: "Cross-compile third-party ROS 2 packages for OpenHarmony aarch64 (BQ3588HM). Use when user needs to 'cross-compile ROS package', 'port ROS package to OH', 'build ROS for OpenHarmony', '移植ROS包', '交叉编译ROS', 'OH aarch64 build', 'usb_cam board', 'deploy ROS package to board', 'third-party ROS package'. Triggers for cross-compiling any ROS 2 Humble package for the Bearkey BQ3588HM OpenHarmony board."
+description: "Cross-compile third-party ROS 2 packages for OpenHarmony aarch64. Use when user needs to 'cross-compile ROS package', 'port ROS package to OH', 'build ROS for OpenHarmony', '移植ROS包', '交叉编译ROS', 'OH aarch64 build', 'usb_cam board', 'deploy ROS package to board', 'third-party ROS package'. Triggers for 'BQ3588HM', 'RoboPi'."
 ---
 
 # Cross-Build Third-Party ROS 2 Packages for OpenHarmony
 
-Port and deploy third-party ROS 2 packages (e.g., `usb_cam`, `camera_ros`, `nav2` etc.) to the BQ3588HM OpenHarmony board using the Docker-based cross-compilation toolchain.
+Port and deploy third-party ROS 2 packages (e.g., `usb_cam`, `camera_ros`, `nav2` etc.) to the OpenHarmony board using the Docker-based cross-compilation toolchain.
 
 ## When to Use This Skill
 
@@ -15,9 +15,9 @@ Port and deploy third-party ROS 2 packages (e.g., `usb_cam`, `camera_ros`, `nav2
 - Package exists as a standard ROS 2 Humble package on GitHub / rosdistro
 
 Do NOT use for:
-- Building IB_Robot's own packages (`inference_service`, `robot_config`, etc.) — use `ibrobot-build` or `build_ibrobot_oh_custom.sh`
-- Board connectivity — use `ibrobot-hdc`
-- Running inference — use `bq3588-oh-rknn`
+- Building RoboFrame's own packages (`inference_service`, `robot_config`, etc.) — use `oh-build-roboframe` skill
+- Board connectivity — use `oh-access`
+- Running RKNN inference — see docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md
 
 ## Architecture Overview
 
@@ -42,20 +42,20 @@ These must exist before starting (one-time setup, likely already done):
 
 | Component | Path on Host | Purpose |
 |-----------|-------------|---------|
-| OH build root | `~/Research/bq3588_oh_ws/custom_build_root/` | Contains all build artifacts |
+| OH build root | `<oh_build_root>/custom_build_root/` | Contains all build artifacts |
 | OH ROS 2 Humble runtime | `<build_root>/install/` | Cross-compilation sysroot |
 | OHOS SDK | `<build_root>/ohos-robot-toolchain/18/native/` | Compiler + sysroot |
 | Docker builder image | `voxelsky/ohos-ros-humble-builder:v0.1.5` | Build environment |
-| HDC access to board | `hdc -t 192.168.136.111:8710` | Deployment transport |
+| HDC access to board | `hdc -t <board_ip>:8710` | Deployment transport |
 
 Board-side prerequisites:
 
 | Component | Board Path | Purpose |
 |-----------|-----------|---------|
-| OH ROS 2 runtime | `/data/install` + `/data/out` | Base ROS 2 libraries |
-| ROS env script | `/data/ros2ohos.env` | Environment setup |
-| IB Robot install | `/data/ibrobot/install` | IB Robot packages |
-| `setup.sh` chain | `/data/ibrobot/install/setup.sh` | Package discovery |
+| OH ROS 2 runtime | `/sys_prod/robot/install` + `/sys_prod/robot/out` | Base ROS 2 libraries |
+| ROS env script | `/data/roboframe/scripts/robooh_1.0.1.env` | Environment setup |
+| IB Robot install | `/data/roboframe/install` | IB Robot packages |
+| `setup.sh` chain | `/data/roboframe/install/setup.sh` | Package discovery |
 
 ## Step-by-Step Workflow
 
@@ -76,7 +76,7 @@ grep -E "<build_depend>|<exec_depend>|<depend>" <pkg>/package.xml
 - Packages needing Qt/GTK GUI
 - Packages with hard dependency on glibc (OH uses musl)
 
-**Library dependency checklist** — if the package needs a library beyond what's in `/data/out/lib/` and `/data/install/lib/`, you must also cross-compile that library first.
+**Library dependency checklist** — if the package needs a library beyond what's in `/sys_prod/robot/out/lib/` and `/sys_prod/robot/install/lib/`, you must also cross-compile that library first.
 
 Common pre-installed libraries on the board:
 - `libavcodec`, `libavformat`, `libswscale` (ffmpeg)
@@ -102,7 +102,7 @@ git clone --depth 1 -b main https://github.com/ros-drivers/usb_cam.git ${OH_WS_S
 Use the OH builder Docker image to cross-compile:
 
 ```bash
-OH_CUSTOM_ROOT=<build_root>  # e.g., ~/Research/bq3588_oh_ws/custom_build_root
+OH_CUSTOM_ROOT=<build_root>  # e.g., <oh_build_root>/custom_build_root
 OH_IMAGE=voxelsky/ohos-ros-humble-builder:v0.1.5
 PACKAGE=<package_name>  # e.g., usb_cam
 
@@ -119,14 +119,14 @@ export OHOS_CPU=aarch64
 export OHOS_SDK=/mnt/ohos/tmp/ohos-robot-toolchain/18
 build-ros-humble --custom \
     --wd /mnt/ohos/tmp/ibrobot_oh_ws \
-    --custom-prefix /data/ibrobot/install \
+    --custom-prefix /data/roboframe/install \
     --colcon-args --packages-select ${PACKAGE}
 "
 ```
 
 **Key flags**:
 - `--custom`: Uses the OHOS SDK cross-compilation mode
-- `--custom-prefix /data/ibrobot/install`: Sets the install prefix to match board deployment path
+- `--custom-prefix /data/roboframe/install`: Sets the install prefix to match board deployment path
 - `--packages-select`: Only builds the target package(s) + their dependencies in the workspace
 
 ### Step 4: Fix Ownership (if needed)
@@ -152,17 +152,17 @@ file ${OH_CUSTOM_ROOT}/ibrobot_oh_ws/install/${PACKAGE}/lib/*/$(basename ${PACKA
 ### Step 6: Deploy to Board
 
 ```bash
-hdc file send ${OH_CUSTOM_ROOT}/ibrobot_oh_ws/install/${PACKAGE} /data/ibrobot/install/${PACKAGE}
+hdc file send ${OH_CUSTOM_ROOT}/ibrobot_oh_ws/install/${PACKAGE} /data/roboframe/install/${PACKAGE}
 ```
 
 ### Step 7: Verify on Board
 
 ```bash
 # Check package discovery
-hdc shell 'source /data/ros2ohos.env && source /data/ibrobot/install/setup.sh && ros2 pkg prefix ${PACKAGE}'
+hdc shell 'source /data/roboframe/scripts/robooh_1.0.1.env && source /data/roboframe/install/setup.sh && ros2 pkg prefix ${PACKAGE}'
 
 # Test run (use CycloneDDS!)
-hdc shell 'source /data/ros2ohos.env && source /data/ibrobot/install/setup.sh && \
+hdc shell 'source /data/roboframe/scripts/robooh_1.0.1.env && source /data/roboframe/install/setup.sh && \
     export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp && \
     timeout 10 ros2 run ${PACKAGE} <executable> --ros-args <params>'
 ```
@@ -177,7 +177,7 @@ Common runtime problems and fixes:
 |---------|-------|-----|
 | `No executable found` | Binary not marked executable or PATH issue | `chmod +x` the binary; use full path |
 | `Assertion failed: ... cast_or_create_topic` | Using `rmw_fastrtps_cpp` | Set `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` |
-| `cannot open shared object` | Missing library | Check with `ldd`; deploy missing lib to `/data/out/lib/` |
+| `cannot open shared object` | Missing library | Check with `ldd`; deploy missing lib to `/sys_prod/robot/out/lib/` |
 | `Cannot open device` | Permission denied on `/dev/videoX` | `chmod 666 /dev/videoX` |
 | Parameter not taking effect | ROS 2 parameter name mismatch | Check `declare_parameter()` names in source |
 
@@ -220,28 +220,66 @@ Add the package to the appropriate launch builder:
 
 | Package | Source | Version | Binary | Board Path | Status |
 |---------|--------|---------|--------|-----------|--------|
-| usb_cam | ros-drivers/usb_cam | main (0b1c9d7) | `usb_cam_node_exe` (aarch64/musl) | `/data/ibrobot/install/usb_cam/` | Verified 30 FPS @ 640x480 MJPEG |
+| usb_cam | ros-drivers/usb_cam | main (0b1c9d7) | `usb_cam_node_exe` (aarch64/musl) | `/data/roboframe/install/usb_cam/` | Verified 30 FPS @ 640x480 MJPEG |
 | | | | | | |
+
+> **注意**：OpenHarmony EmbodiedAI 1.0.1 系统已内置 `usb_cam`（位于 `/sys_prod/robot/install`）。通常无需单独交叉编译，除非需要特定版本。
+
+## Special Case: `ros2_control` / `controller_manager`
+
+SO-101 真机依赖 `ros2_control_node` + `controller_manager` + spawner。OpenHarmony musl 环境下有一个必须确认的关键补丁。
+
+### 源码来源
+
+```text
+https://gitcode.com/openharmony-robot/ros_ros2_control
+tag OpenHarmony-Embodied-v1.0.1-Release (commit c742704)
+```
+
+包含 `ros2_control`、`controller_manager`、`realtime_tools` 等包（版本 2.53.0）。该 fork 已包含 `realtime_tools` 的 `__OHOS__` 平台适配（跳过 `mlockall`、thread affinity 等 glibc-only 路径）。
+
+### controller_manager mutex 补丁（关键）
+
+`controller_manager/src/controller_manager.cpp` 的 `switch_controller()` 中，`std::defer_lock` 在 musl 上会导致 `condition_variable::wait_for` 不稳定，必须改为直接加锁：
+
+```diff
+-  std::unique_lock<std::mutex> switch_params_guard(switch_params_.mutex, std::defer_lock);
++  std::unique_lock<std::mutex> switch_params_guard(switch_params_.mutex);
+```
+
+RoboFrame 发布包的 `install.sh` 会通过 patched `.so` 覆盖机制自动应用此修复（`/data/roboframe/install/patches/lib/`）。
+
+### 验证
+
+正常 launch 日志应包含：
+
+```text
+[ros2_control_node]: Successful initialization of hardware 'RobotSystem'
+[spawner_joint_state_broadcaster_group]: Loaded joint_state_broadcaster
+[spawner_joint_state_broadcaster_group]: Configured and activated all the parsed controllers list
+```
+
+如果 spawner 崩溃或卡在 switch controller，说明 `controller_manager` 未包含 mutex 补丁。
 
 ## Reference: Build Environment Variables
 
 ```bash
 # Default values (override via CLI flags or environment)
-OH_CUSTOM_ROOT=~/Research/bq3588_oh_ws/custom_build_root
+OH_CUSTOM_ROOT=<oh_build_root>/custom_build_root
 OH_CUSTOM_WS=${OH_CUSTOM_ROOT}/ibrobot_oh_ws
 OH_CUSTOM_SRC=${OH_CUSTOM_WS}/src
 OH_CUSTOM_TOOLCHAIN_ROOT=${OH_CUSTOM_ROOT}/ohos-robot-toolchain
 OH_CUSTOM_IMAGE=voxelsky/ohos-ros-humble-builder:v0.1.5
-OH_CUSTOM_PREFIX=/data/ibrobot/install       # on-device install prefix
-OH_BOARD_ROS_PREFIX=/data/install            # on-device ROS 2 Humble prefix
+OH_CUSTOM_PREFIX=/data/roboframe/install       # on-device install prefix
+OH_BOARD_ROS_PREFIX=/sys_prod/robot/install            # on-device ROS 2 Humble prefix
 ```
 
 ## Reference: Board Environment
 
 ```bash
 # Always source these two on the board before any ROS command
-source /data/ros2ohos.env
-source /data/ibrobot/install/setup.sh
+source /data/roboframe/scripts/robooh_1.0.1.env
+source /data/roboframe/install/setup.sh
 
 # Always set DDS implementation
 export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp

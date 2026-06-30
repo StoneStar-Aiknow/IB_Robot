@@ -6,6 +6,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 BUILD_INSTALL=""
 SKH_TAR=""
+PATCHES_DIR=""
 OUTPUT=""
 VERSION="1.0.0-$(date +%Y%m%d)"
 STAGE_DIR=""
@@ -20,7 +21,7 @@ Usage: $(basename "$0") [options]
 Pack a RoboFrame release tarball for RoboPi (RoboOH 1.0.1).
 
 Options:
-  --build-install <dir>   Colcon install tree from build_ibrobot_oh_custom.sh
+  --build-install <dir>   Colcon install tree from build_roboframe_oh.sh
   --skh-run <tarball>     Path to thirdparty_pytorch test/skh-run.tar.gz
   --patches-dir <dir>     Directory of patched .so files (e.g. libcontroller_manager.so)
   --output <path>         Output .tar.gz path (default: roboframe-robopi-<ver>.tar.gz)
@@ -144,13 +145,17 @@ for name in "${SYSLIB_NAMES[@]}"; do
 done
 
 # [3.5] Copy patched .so files (e.g. libcontroller_manager.so with defer_lock fix)
-if [[ -n "${PATCHES_DIR}" && -d "${PATCHES_DIR}" ]]; then
+# Use default patches directory if not specified
+if [ -z "${PATCHES_DIR}" ]; then
+    PATCHES_DIR="${REPO_ROOT}/third_party/patches/oh"
+fi
+if [ -n "${PATCHES_DIR}" ] && [ -d "${PATCHES_DIR}" ]; then
     log_info "Copying patched .so files from ${PATCHES_DIR}..."
     mkdir -p "${PKG_ROOT}/install/patches/lib"
     cp -a "${PATCHES_DIR}"/*.so* "${PKG_ROOT}/install/patches/lib/" 2>/dev/null || true
-    log_info "  $(ls "${PKG_ROOT}/install/patches/lib/" 2>/dev/null | wc -l) files copied"
+    log_info "  $(ls -1 "${PKG_ROOT}/install/patches/lib/"*.so* 2>/dev/null | wc -l) patched .so files copied"
 else
-    log_info "No patches directory specified, skipping (ros2_control crash fix will be missing)"
+    log_info "WARNING: patches directory not found (${PATCHES_DIR:-unset}), ros2_control crash fix will be missing"
 fi
 
 # [4] Copy env script
@@ -219,6 +224,16 @@ WRAP_EOF
         printf 'exec /sys_prod/robot/out/bin/python3 -m %s "$@"\n' "${module}" >> "${script_path}"
         chmod +x "${script_path}"
     done
+done
+
+# [5.5] Fix shebang for all Python entry scripts (launch subprocess needs absolute python path)
+log_info "Fixing Python entry script shebangs..."
+find "${PKG_ROOT}/install" -type f -executable 2>/dev/null | while read -r script; do
+    if head -1 "$script" 2>/dev/null | grep -q "^#!/usr/bin/env python"; then
+        head -1 "$script" | grep -qE '^#!/usr/bin/env python3?$' && \
+            sed -i '1s|^#!/usr/bin/env python3\?$|#!/sys_prod/robot/out/bin/python3|' "$script" && \
+            log_info "  fixed: $(echo "$script" | sed "s|${PKG_ROOT}/||")"
+    fi
 done
 
 # [6] Generate install.sh

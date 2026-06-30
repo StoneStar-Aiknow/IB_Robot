@@ -247,10 +247,10 @@ On RK3588 (e.g., BQ3588HM board), use one of:
 1. **rknn-toolkit-lite2** (Python): `pip install rknn-toolkit-lite2`
 2. **rknn_runtime** (C API): Link against `librknnrt.so`
 
-For the verified BQ3588HM OpenHarmony workflow in this repo, the board side is already modeled by:
+For the verified OpenHarmony workflow in this repo, the board side is already modeled by:
 
-- `ibrobot-bq3588hm-oh` for runtime facts and prerequisites
-- `bq3588-oh-rknn` for the full deployment and launch overlay
+- `oh-constraints` for board runtime facts and constraints
+- [RKNN 推理指南](../../docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md) for launch and troubleshooting
 
 Inference example (Python, on board):
 ```python
@@ -320,4 +320,4 @@ Invoke this skill when:
 Do NOT invoke for:
 - Training models (use lerobot skill)
 - ONNX export (use onnx export workflow)
-- Board connectivity issues (use ibrobot-hdc)
+- Board connectivity issues (use oh-access)

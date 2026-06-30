@@ -31,7 +31,7 @@ platform_prepare_host() {
     log_warn "OpenHarmony musl platform detected."
     log_warn "This setup path validates the board runtime only; it does not bootstrap a local build workspace."
     log_warn "Local colcon/venv/rosdep setup is skipped because OpenHarmony artifacts must be cross-built on the host."
-    log_warn "Use scripts/openharmony/build_ibrobot_oh_custom.sh on the host for deployable builds."
+    log_warn "Use scripts/openharmony/build_roboframe_oh.sh on the host for deployable builds."
     log_warn "If you want OpenHarmony support through QEMU on the Ubuntu host, see docs/openharmony_qemu.md."
 }
 
