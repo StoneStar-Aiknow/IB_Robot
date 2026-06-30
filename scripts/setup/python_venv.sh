@@ -85,14 +85,17 @@ install_lerobot_editable() {
 
     check_lerobot_ros_numpy_compat
 
-    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot"
+    # [smolvla,pi] extras pull in transformers-dep + smolvla-specific deps
+    # (num2words, accelerate, safetensors) so PI05/SmolVLA policies load
+    # without manual pip installs. See libs/lerobot/pyproject.toml.
+    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot[smolvla,pi]"
 }
 
 setup_python_venv() {
     if ! platform_supports_local_workspace_build; then
         log_info "Skipping workspace venv setup on ${SETUP_PLATFORM_ID}."
         log_info "Use the board ROS runtime directly after sourcing $(platform_ros_setup_path)."
-        log_info "Cross-build IB_Robot artifacts on the host with scripts/openharmony/build_ibrobot_oh_custom.sh."
+        log_info "Cross-build RoboFrame (IB_Robot) OpenHarmony artifacts on the host with scripts/openharmony/build_roboframe_oh.sh."
         PYTHON_ENV_STATUS="skipped"
         log_skipped "Workspace Python virtual environment"
         return 0
