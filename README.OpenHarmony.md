@@ -81,7 +81,7 @@ RoboFrame 构建从感知、决策到执行的端到端闭环：
 │  Host (Ubuntu 22.04 x86_64)                             │
 │                                                         │
 │  Docker: voxelsky/ohos-ros-humble-builder:v0.1.5       │
-│    build_ibrobot_oh_custom.sh → 11 个 aarch64/musl 包   │
+│    build_roboframe_oh.sh → 11 个 aarch64/musl 包   │
 │  pack_roboframe_release.sh → roboframe-robopi-*.tar.gz  │
 │                                                         │
 │  ONNX ── rknn-toolkit2 ──► *.rknn (float16, NPU)        │
@@ -185,7 +185,7 @@ hdc -t <board-ip>:8710 shell 'cd /data && tar -zxpvf ohos-humble-build-*.tar.gz 
 ```bash
 export OH_ROOT="<your-oh-root>"
 
-./scripts/openharmony/build_ibrobot_oh_custom.sh \
+./scripts/openharmony/build_roboframe_oh.sh \
   --oh-root "$OH_ROOT"
 ```
 
@@ -229,7 +229,7 @@ scp roboframe-robopi-*.tar.gz root@<board-ip>:/data/local/tmp/
 ssh root@<board-ip> 'cd /data/local/tmp && tar xzf roboframe-robopi-*.tar.gz && cd roboframe-ohos && sh install.sh'
 ```
 
-`install.sh` 执行 4 步：复制 install → 复制 pysite → 安装 syslib → 部署环境脚本 + `/data/out` 软链接。
+`install.sh` 执行 4 步：复制 install → 复制 pysite → 安装 syslib → 部署环境脚本 + `/sys_prod/robot/out` 软链接。
 
 ### 4.6 验证
 
@@ -293,7 +293,7 @@ Goal finished with status: SUCCEEDED
 
 ### 5.4 全链路闭环（真实硬件）
 
-真实 SO-101 机械臂闭环需要额外的 USB 相机驱动和内核配置，详见 [高级部署指南](docs/RoboPi_Advanced_Setup.md#全链路闭环)。
+真实 SO-101 机械臂闭环需要额外的 USB 相机驱动和内核配置，详见 [RKNN 推理指南](docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md) §5。
 
 ### 5.5 性能数据
 
@@ -312,22 +312,24 @@ Goal finished with status: SUCCEEDED
 | `URLError: download.pytorch.org` | 板端无外网，torchvision 下载 ResNet18 权重 | 在有网主机下载 `resnet18-f37072fd.pth`，推送到板端 `/root/.cache/torch/hub/checkpoints/` 和 `/data/local/tmp/ros_home/.cache/torch/hub/checkpoints/` |
 | `Can not find dynamic library on RK3588!` | rknnlite 硬编码搜索 `/usr/lib/librknnrt.so` | `ln -sf /vendor/lib64/librknnrt.so /usr/lib/librknnrt.so` |
 | `Assertion failed: cast_or_create_topic` | 使用了 `rmw_fastrtps_cpp`（旧版 OH） | `export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` |
-| `/dev/ttyACM0` 不存在 | 内核缺少 `CONFIG_USB_ACM` | 重新编译内核，见[高级部署指南](docs/RoboPi_Advanced_Setup.md#内核驱动编译) |
+| `/dev/ttyACM0` 不存在 | 内核缺少 `CONFIG_USB_ACM` | 重新编译内核，见 `oh-rebuild-kernel` skill |
 | 推理节点 SIGSEGV | `LD_PRELOAD` 未设置 | 确认 `source robooh_1.0.1.env` 已执行 |
 | `ModuleNotFoundError: 'rknnlite.xxx'` | `.so` 后缀不匹配 | 重命名 `-gnu.so` → `-ohos.so` |
 | `RKNN model file not found` | YAML 中 path 为相对路径 | 使用绝对路径 |
 
-> 更多问题与高级配置见 [高级部署指南](docs/RoboPi_Advanced_Setup.md)。
+> 更多问题与高级配置见各专项 skill（`oh-rebuild-kernel`、`oh-cross-build-ros-pkg`）与 [RKNN 推理指南](docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md)。
 
 ## 七、相关文档与生态
 
 ### 详细文档
 
-| 文档 | 内容 |
+| 文档 / Skill | 内容 |
 | --- | --- |
-| [高级部署指南](docs/RoboPi_Advanced_Setup.md) | 第三方 ROS 包交叉编译、内核驱动编译、旧版 skh-run 环境叠加（已废弃）、RKNN 详细配置、全链路闭环 |
-| [BQ3588HM 板端使用](docs/BQ3588HM_board_usage.md) | BQ3588HM 板卡使用指南 |
-| [Node.js + OpenClaw Gateway](docs/BQ3588HM_OpenHarmony_NodeJS_OpenClaw_Gateway.md) | 板端 Node.js 部署与 OpenClaw 社交控制 |
+| [板端烧录与调试](docs/OpenHarmony_EmbodiedAI_Board_Setup.md) | 开发板烧录、HDC 工具准备、TCP 调试、SSH 配置 |
+| [RKNN NPU 推理](docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md) | ONNX→RKNN 转换、推理验证、单板全链路闭环 |
+| [Node.js + OpenClaw Gateway](docs/OpenHarmony_EmbodiedAI_NodeJS_OpenClaw_Gateway.md) | 板端 Node.js 部署与 OpenClaw 社交控制 |
+| [`oh-cross-build-ros-pkg`](.agents/skills/oh-cross-build-ros-pkg/SKILL.md) | 第三方 ROS 2 包交叉编译（含 ros2_control 补丁说明） |
+| [`oh-build-roboframe`](.agents/skills/oh-build-roboframe/SKILL.md) | RoboFrame 发布包构建（`build_roboframe_oh.sh`） |
 
 ### 官方资源
 

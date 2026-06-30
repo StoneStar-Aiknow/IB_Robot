@@ -196,7 +196,6 @@ export ROS_DOMAIN_ID=<0-232之间的唯一数字>
 | 文档 | 简短说明 |
 | :--- | :--- |
 | [`src/inference_service/README.md`](src/inference_service/README.md) | 推理服务架构、单机/分布式部署与 NPU/GPU Cloud 节点启动方式 |
-| [`docs/OpenHarmony_thirdparty_pytorch_validation.md`](docs/OpenHarmony_thirdparty_pytorch_validation.md) | OpenHarmony 板端 `thirdparty_pytorch` / `skh-run` 获取、部署、运行流程，以及当前验证进度与已知限制 |
 | [`src/robot_moveit/README.md`](src/robot_moveit/README.md) | MoveIt Planning 控制、`/cmd_pose` 用法与 headless 启动方式 |
 | [`src/dataset_tools/README.md`](src/dataset_tools/README.md) | episodic 录制、`record_cli` 用法与 `bag_to_lerobot` 数据集转换流程 |
 
@@ -333,10 +332,7 @@ ros2 topic hz /inference/action
 
 #### 3. OpenHarmony 板端作为算力侧（RK3588）
 
-- **主机侧构建入口**：使用 `scripts/openharmony/build_ibrobot_oh_custom.sh`。脚本会自动准备 OpenHarmony 交叉编译目录，并在打包板端 runtime 时对 `lerobot` 显式应用 `series.openharmony-5.1.0-musl.txt`，确保 lazy-import 等 OpenHarmony 专用 patch 真正进入部署产物。
-- **板端 PyTorch runtime**：使用 `thirdparty_pytorch` 提供的 `test/skh-run.tar.gz`，部署到 `/data/local/skh-run`；IB_Robot 的 OpenHarmony inference 节点会在节点进程级切到这套 runtime，而不会污染 `/data/out/bin/ros2`。
-- **离线权重注意事项**：当前验证使用的 ACT policy 配置了 `resnet18` + `ResNet18_Weights.IMAGENET1K_V1`。如果板端无外网，请预置 `resnet18-f37072fd.pth` 到 `/root/.cache/torch/hub/checkpoints/`。
-- **当前验证结论**：BQ3588HM 板端已完成 CPU 推理验证；NPU 推理链路正在继续打通中。
+OpenHarmony 板端的完整指南（构建、部署、RKNN 推理、内核、SSH 配置等）详见 **[README.OpenHarmony.md](README.OpenHarmony.md)**。
 
 ### 四、数据集录制场景
 
