@@ -292,6 +292,15 @@ class GroundedSAM2Wrapper:
 
             depth_m = depth_image.astype(np.float64) / depth_scale
             depth_m[depth_m > depth_trunc] = 0
+            if mask.shape != depth_image.shape[:2]:
+                mask = (
+                    cv2.resize(
+                        mask.astype(np.uint8),
+                        (depth_image.shape[1], depth_image.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    > 0
+                )
 
             depth_masked = depth_m * mask
 
