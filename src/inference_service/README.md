@@ -205,6 +205,22 @@ ros2 launch inference_service cloud_inference.launch.py \
 并要求 `execution` 为 `["policy", "worker"]`。两种模式的前/后处理、ROS 话题与
 分布式通信仍沿用 `inference_service` 的现有管线。
 
+`ascend_om_3403` 的 worker 二进制必须升级到支持命令行参数
+`--model <om_path>` 的版本。旧的 `SVP_*` 环境变量不会再传给 worker，避免外部
+shell 残留状态影响模型选择。迁移方式如下：
+
+| 旧环境变量 | 替代配置 |
+| --- | --- |
+| `SVP_MODEL_PATH` | `config.om.json` 的 `artifacts.policy` |
+| `SVP_WORKER_EXECUTABLE` / `SVP_CPP_EXECUTABLE` | `config.om.json` 的 `artifacts.worker` |
+| `SVP_IMAGE_HEIGHT` / `SVP_IMAGE_WIDTH` | 从 `config.json` 的 `input_features.<image_key>.shape` 推导（可选 `backend_config.image_height`/`image_width` 覆盖） |
+| `SVP_PERF_LOG` / `SVP_PERF_LOG_EVERY` | `config.om.json` 的 `backend_config.perf_enabled` / `backend_config.perf_log_every` |
+| `SVP_WORKER_GRACEFUL_CLOSE_TIMEOUT` / `SVP_WORKER_FORCE_CLOSE` | `config.om.json` 的 `backend_config.graceful_close_timeout` / `backend_config.force_close` |
+
+若 worker 的 action 输出索引不是默认的 `1`，可在
+`config.om.json` 的 `backend_config.action_output.index` 中设置；action 维度仍由
+`config.json` 的 `output_features.action.shape` 推导。
+
 如果 Cloud 节点运行在 RK3588 / OpenHarmony 板端并使用 RKNN Lite，可直接切换为：
 
 ```bash
@@ -315,8 +331,11 @@ CompiledPolicyWrapper (PolicyWrapper)
 - `SD3403RuntimeSession` 包装 `ACT3403Policy`，后者管理一个常驻 C++ worker 子进程。
 - 通过自定义二进制协议（`PROTOCOL_MAGIC=0x53565031`）把输入写入 worker 的 `stdin`，
   worker 在板卡侧执行 OM 推理后通过 `stdout` 回传结果。
-- `ACTCompiledAdapter` 负责输入准备和 SD3403 特有的输出 reshape（按 `sd3403_action_stride`
-  裁剪到 `action_dim`）。
+- `ACTCompiledAdapter` 负责输入准备和 SD3403 输出解码：接受 worker 返回的直接
+  action tensor（例如 output index 1，shape `(1, chunk_size, action_dim)`）。SD3403
+  worker 已只打包逻辑 action 维度，不再有 stride padding。`action_dim` 来自
+  `config.json` 的 `output_features.action.shape`，worker 输出 index / layout 等编译产物
+  IO 绑定由 `config.om.json` 的 `backend_config` 承载。
 
 ##### RKNN 路径
 
@@ -355,6 +374,40 @@ CompiledPolicyWrapper (PolicyWrapper)
   "execution": ["policy"]
 }
 ```
+
+SD3403 worker 后端还可以在 `backend_config` 中声明 worker IO 绑定和运行时选项：
+
+```json
+{
+  "schema_version": 1,
+  "policy_type": "act",
+  "backend": "ascend_om_3403",
+  "artifact_dir": "om",
+  "artifacts": {
+    "policy": "act.om",
+    "worker": "main"
+  },
+  "execution": ["policy", "worker"],
+  "backend_config": {
+    "action_output": {"index": 1, "layout": "direct"},
+    "perf_enabled": false,
+    "perf_log_every": 1,
+    "graceful_close_timeout": 5.0,
+    "force_close": true
+  }
+}
+```
+
+`backend_config` 是后端私有字段。`action_output` 描述当前 worker 直接返回的
+action 输出布局——SD3403 worker 已只打包逻辑 action 维度（如 `(1, 100, 6)`），
+不再有 stride padding。
+
+> [!note] 图片分辨率从 `config.json` 派生，不在 `backend_config` 配置
+> 图片的 height/width 是模型的输入契约，记录在 `config.json` 的
+> `input_features.<image_key>.shape`（如 `[3, 480, 640]`），并经 ATC
+> `--input_shape` 固化进 OM。运行时从该 shape 派生 resize 目标，无需在
+> `backend_config` 重复声明。若确需覆盖（如调试），仍可在 `backend_config`
+> 设 `image_height`/`image_width`，但其优先级低于 `input_features`。
 
 各后端要求的 artifact 角色：
 

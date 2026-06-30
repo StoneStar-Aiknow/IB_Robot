@@ -12,15 +12,25 @@ import torch.nn.functional as functional
 from torch import Tensor
 
 from inference_service.core._policy_config import override_runtime_policy_device
+from inference_service.core.ascend_om._sd3403_action import decode_sd3403_action_array
 from inference_service.core.pure_inference_engine import PolicyWrapper
 
 COMPILED_MANIFEST_BASENAME = "config.om.json"
+COMPILED_BACKEND_CONFIG_KEY = "_compiled_backend_config"
+DEFAULT_SD3403_ACTION_OUTPUT_INDEX = 1
+DEFAULT_SD3403_PERF_ENABLED = False
+DEFAULT_SD3403_PERF_LOG_EVERY = 1
+SD3403_OUTPUT_LAYOUTS = {"direct", "strided"}
+# Image keys consulted (in order) when deriving resize dims from config.json
+# input_features. The first one with a usable [C,H,W] shape wins.
+_SD3403_IMAGE_FEATURE_KEYS = ("observation.images.top", "observation.images.wrist")
 
 
 @dataclass(frozen=True)
 class CompiledManifest:
     artifacts: dict[str, Path]
     execution: list[str]
+    backend_config: dict[str, Any]
 
     def require_artifact(self, role: str, *, suffix: str | None = None) -> Path:
         try:
@@ -68,6 +78,122 @@ class RuntimeSession(Protocol):
 
 def normalize_backend_name(device: str) -> str:
     return str(device).lower().strip().replace("-", "_")
+
+
+def _config_bool(config: dict[str, Any], key: str, default: bool) -> bool:
+    value = config.get(key, default)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        raise ValueError(f"{key} must be a boolean value, got {value!r}")
+    return bool(value)
+
+
+def _as_optional_dict(value: Any, key: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{key} must be a JSON object, got {type(value).__name__}")
+    return value
+
+
+def _validate_sd3403_output_layouts(backend_config: dict[str, Any]) -> None:
+    for section in ("action_output",):
+        section_config = _as_optional_dict(backend_config.get(section), f"backend_config.{section}")
+        if "layout" not in section_config:
+            continue
+        layout = str(section_config["layout"]).lower().strip()
+        if layout not in SD3403_OUTPUT_LAYOUTS:
+            allowed = ", ".join(sorted(SD3403_OUTPUT_LAYOUTS))
+            raise ValueError(f"backend_config.{section}.layout must be one of {allowed}, got {layout!r}")
+
+
+def _config_value(config: dict[str, Any], key: str, default: Any) -> Any:
+    return config.get(key, default)
+
+
+def _config_int(config: dict[str, Any], key: str, default: int) -> int:
+    return int(_config_value(config, key, default))
+
+
+def _config_float(config: dict[str, Any], key: str, default: float) -> float:
+    return float(_config_value(config, key, default))
+
+
+def _sd3403_backend_int(
+    backend_config: dict[str, Any],
+    legacy_config: dict[str, Any],
+    *,
+    key: str,
+    legacy_key: str,
+    default: int,
+    section: str | None = None,
+    flat_key: str | None = None,
+    top_key: str | None = None,
+) -> int:
+    """Resolve an int from ``backend_config`` with sectioned, flat and legacy fallbacks.
+
+    Lookup order: ``backend_config[section][key]`` -> ``backend_config[flat_key]``
+    -> ``backend_config[top_key]`` -> legacy config. ``top_key`` defaults to
+    ``key``; callers whose section key is generic (e.g. ``"index"``) pass a
+    distinct ``top_key`` so a stray top-level entry cannot be matched by accident.
+    """
+    if section:
+        section_config = _as_optional_dict(backend_config.get(section), f"backend_config.{section}")
+        if key in section_config:
+            return int(section_config[key])
+    if flat_key is not None and flat_key in backend_config:
+        return int(backend_config[flat_key])
+    effective_top_key = top_key if top_key is not None else key
+    if effective_top_key in backend_config:
+        return int(backend_config[effective_top_key])
+    return _config_int(legacy_config, legacy_key, default)
+
+
+def _sd3403_backend_float(
+    backend_config: dict[str, Any],
+    legacy_config: dict[str, Any],
+    *,
+    key: str,
+    legacy_key: str,
+    default: float,
+) -> float:
+    if key in backend_config:
+        return float(backend_config[key])
+    return _config_float(legacy_config, legacy_key, default)
+
+
+def _sd3403_backend_bool(
+    backend_config: dict[str, Any],
+    legacy_config: dict[str, Any],
+    *,
+    key: str,
+    legacy_key: str,
+    default: bool,
+) -> bool:
+    if key in backend_config:
+        return _config_bool(backend_config, key, default)
+    return _config_bool(legacy_config, legacy_key, default)
+
+
+def _compiled_backend_config(config: dict[str, Any]) -> dict[str, Any]:
+    return _as_optional_dict(config.get(COMPILED_BACKEND_CONFIG_KEY), COMPILED_BACKEND_CONFIG_KEY)
+
+
+def _attach_compiled_backend_config(path: str, backend: str, config: dict[str, Any]) -> dict[str, Any]:
+    if normalize_backend_name(backend) != "ascend_om_3403":
+        return config
+
+    manifest = load_compiled_manifest(path, backend, str(config.get("type", "")).lower().strip())
+    if not manifest.backend_config:
+        return config
+
+    merged = dict(config)
+    merged[COMPILED_BACKEND_CONFIG_KEY] = manifest.backend_config
+    return merged
 
 
 def _policy_config_path(path: str) -> Path | None:
@@ -169,7 +295,11 @@ def load_compiled_manifest(path: str, backend: str, policy_type: str | None = No
         execution = [str(role) for role in raw_execution]
     else:
         raise ValueError(f"Compiled manifest execution must be a list of artifact roles: {manifest_path}")
-    return CompiledManifest(artifacts=artifacts, execution=execution)
+
+    backend_config = _as_optional_dict(data.get("backend_config"), "backend_config")
+    if normalize_backend_name(backend) == "ascend_om_3403":
+        _validate_sd3403_output_layouts(backend_config)
+    return CompiledManifest(artifacts=artifacts, execution=execution, backend_config=dict(backend_config))
 
 
 def _shape_from_feature(feature: Any) -> list[int]:
@@ -223,6 +353,58 @@ def _action_dim_from_config(config: dict[str, Any]) -> int:
     if action_shape:
         return int(action_shape[-1])
     return 6
+
+
+def _image_hw_from_config(config: dict[str, Any]) -> tuple[int, int] | None:
+    """Derive image (height, width) from config.json input_features.
+
+    The authoritative image resolution lives in
+    ``input_features.<image_key>.shape`` (e.g. ``[3, 480, 640]``), matching the
+    ONNX/OM model input contract. Returns ``None`` when no image feature carries
+    a usable ``[C, H, W]`` shape, so callers can fall back to an explicit
+    backend_config override or trust the incoming tensor as-is.
+    """
+    input_features = config.get("input_features") or {}
+    if not isinstance(input_features, dict):
+        return None
+    for key in _SD3403_IMAGE_FEATURE_KEYS:
+        feature_shape = _shape_from_feature(input_features.get(key))
+        if len(feature_shape) >= 3:
+            return int(feature_shape[-2]), int(feature_shape[-1])
+    return None
+
+
+# Default graceful close timeout for the SD3403 worker subprocess (seconds).
+# Mirrors ACTWrapper_3403.DEFAULT_GRACEFUL_CLOSE_TIMEOUT to avoid a cross-module
+# import; both must stay in sync.
+DEFAULT_GRACEFUL_CLOSE_TIMEOUT = 5.0
+
+
+def _resolve_sd3403_image_hw(
+    backend_config: dict[str, Any],
+    legacy_config: dict[str, Any],
+    dim_key: str,
+    legacy_key: str,
+) -> int | None:
+    """Resolve one image dimension (height/width) for the SD3403 worker.
+
+    Priority:
+      1. config.json input_features.<image>.shape (the model's input contract).
+      2. backend_config / legacy config explicit override (backward compatible).
+      3. None -> worker trusts the incoming tensor size as-is.
+
+    ``dim_key`` is ``"image_height"`` or ``"image_width"``; the matching
+    input_features axis is selected from the resolved (h, w) pair.
+    """
+    hw = _image_hw_from_config(legacy_config)
+    if hw is not None:
+        return hw[0] if dim_key == "image_height" else hw[1]
+    if dim_key in backend_config:
+        return int(backend_config[dim_key])
+    value = legacy_config.get(legacy_key)
+    if value is not None:
+        return int(value)
+    return None
 
 
 def _real_action_dim_from_config(config: dict[str, Any], fallback: int) -> int:
@@ -406,11 +588,10 @@ class ACTCompiledAdapter:
         feature_shape = _shape_from_feature(self._input_features.get(key))
         if len(feature_shape) >= 3:
             return int(feature_shape[-2]), int(feature_shape[-1])
-        if self._backend == "ascend_om_3403":
-            return (
-                int(os.environ.get("SVP_IMAGE_HEIGHT", "240")),
-                int(os.environ.get("SVP_IMAGE_WIDTH", "320")),
-            )
+        # No resolvable target dims: trust the incoming tensor size as-is.
+        # Image resolution is the model's input contract (config.json
+        # input_features.<key>.shape, baked into the OM via ATC --input_shape),
+        # not a sidecar-only value, so we do not fall back to a hardcoded size.
         return None
 
     def decode_outputs(self, raw: list[np.ndarray], device: torch.device) -> Tensor:
@@ -438,13 +619,9 @@ class ACTCompiledAdapter:
         return _as_action_tensor(action, device)
 
     def _decode_sd3403_output(self, output: Any, device: torch.device) -> Tensor:
-        flat = np.asarray(output, dtype=np.float32).reshape(-1)
-        stride = int(self._config.get("sd3403_action_stride") or os.environ.get("SVP_ACTION_STRIDE", "8"))
-        if flat.size % stride != 0:
-            raise RuntimeError(f"unexpected action tensor size={flat.size}, not divisible by {stride}")
-        action = flat.reshape(-1, stride)[:, : self._action_dim]
-        self._chunk_size = int(action.shape[0])
-        return torch.from_numpy(np.ascontiguousarray(action)).to(device)
+        action = decode_sd3403_action_array(output, self._action_dim)
+        self._chunk_size = int(action.shape[-2])
+        return _as_action_tensor(action, device)
 
     def _decode_first_action_output(self, output: Any, device: torch.device) -> Tensor:
         action = np.asarray(output, dtype=np.float32)
@@ -663,7 +840,53 @@ class SD3403RuntimeSession:
             raise FileNotFoundError(f"Compiled artifact 'worker' is not executable: {worker_path}")
         from inference_service.core.ascend_om.ACTWrapper_3403 import ACT3403Policy
 
-        self._worker = ACT3403Policy(str(worker_path), str(model_path))
+        action_dim = _action_dim_from_config(config)
+        backend_config = manifest.backend_config
+        self._worker = ACT3403Policy(
+            str(worker_path),
+            str(model_path),
+            action_dim=action_dim,
+            action_output_index=_sd3403_backend_int(
+                backend_config,
+                config,
+                key="index",
+                legacy_key="sd3403_action_output_index",
+                default=DEFAULT_SD3403_ACTION_OUTPUT_INDEX,
+                section="action_output",
+                flat_key="action_output_index",
+                top_key="action_output_index",
+            ),
+            image_height=_resolve_sd3403_image_hw(backend_config, config, "image_height", "sd3403_image_height"),
+            image_width=_resolve_sd3403_image_hw(backend_config, config, "image_width", "sd3403_image_width"),
+            perf_enabled=_sd3403_backend_bool(
+                backend_config,
+                config,
+                key="perf_enabled",
+                legacy_key="sd3403_perf_enabled",
+                default=DEFAULT_SD3403_PERF_ENABLED,
+            ),
+            perf_log_every=_sd3403_backend_int(
+                backend_config,
+                config,
+                key="perf_log_every",
+                legacy_key="sd3403_perf_log_every",
+                default=DEFAULT_SD3403_PERF_LOG_EVERY,
+            ),
+            graceful_close_timeout=_sd3403_backend_float(
+                backend_config,
+                config,
+                key="graceful_close_timeout",
+                legacy_key="sd3403_graceful_close_timeout",
+                default=DEFAULT_GRACEFUL_CLOSE_TIMEOUT,
+            ),
+            force_close=_sd3403_backend_bool(
+                backend_config,
+                config,
+                key="force_close",
+                legacy_key="sd3403_force_close",
+                default=True,
+            ),
+        )
 
     def execute(self, inputs: list[np.ndarray]) -> list[np.ndarray]:
         if self._worker is None:
@@ -743,6 +966,7 @@ class CompiledPolicyWrapper(PolicyWrapper):
     def load(self, path: str, device: torch.device) -> None:
         self._device = device
         config = load_compiled_policy_config(path, self._backend, runtime_device=device)
+        config = _attach_compiled_backend_config(path, self._backend, config)
         self._adapter = create_compiled_model_adapter(config, self._backend)
         if self._runtime_session is None:
             self._runtime_session = create_runtime_session(self._backend, config)
