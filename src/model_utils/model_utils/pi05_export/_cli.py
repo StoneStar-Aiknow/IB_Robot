@@ -23,10 +23,10 @@ two tools share one mental model:
   args" cache).
 - **Merge precedence** (high -> low):
   ``CLI > --profile > defaults > _last (only when no --profile) > builtin``.
-- **Derived paths**: a single ``--exp-dir`` expands to ``onnx/`` (ONNX output)
-  and ``runtime_save/`` (VLM->AE handoff tensors) so the two long paths collapse
-  into one directory. OM artifacts + ``config.om.json`` still live next to the
-  policy (the ``device:=ascend_om`` runtime contract), so they are NOT derived.
+- **Derived paths**: a single ``--exp-dir`` expands to ``onnx/`` (ONNX output),
+  ``runtime_save/`` (VLM->AE handoff tensors), and ``om/`` (compiled artifacts)
+  so the long paths collapse into one directory. ``config.om.json`` is still
+  written next to the policy, and points to the compiled OM paths.
 - **Wizard**: on first use (no config / no _last) or ``--init`` it prompts each
   field with its meaning + example + default, then offers to save a profile.
 
@@ -50,6 +50,7 @@ DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/model_utils/pi05_export.yaml
 # Derived sub-directories under --exp-dir.
 DERIVED_ONNX_DIR = "onnx"
 DERIVED_RUNTIME_DIR = "runtime_save"
+DERIVED_OM_DIR = "om"
 
 # Provenance labels (shown by print_effective so the user knows where each
 # value came from). Kept as constants because some control flow checks them.
@@ -174,13 +175,13 @@ PARAMS: list[Param] = [
     Param(
         dest="policy_path",
         cli="--policy-path",
-        meaning="Local PI05 policy directory (config + weights); also where OM + config.om.json are written",
+        meaning="Local PI05 policy directory (config + weights); config.om.json is written here",
         required_for_run=True,
     ),
     Param(
         dest="exp_dir",
         cli="--exp-dir",
-        meaning="Experiment directory: auto-derives onnx/ and runtime_save/ to avoid typing 2 long paths",
+        meaning="Experiment directory: auto-derives onnx/, runtime_save/, and om/ to avoid typing long paths",
     ),
     Param(
         dest="dtype",
@@ -231,6 +232,13 @@ PARAMS: list[Param] = [
         cli="--runtime-save-dir",
         meaning="Directory for the VLM->AE handoff tensors (normally derived from --exp-dir)",
         default="runtime_save",
+        in_wizard=False,
+    ),
+    Param(
+        dest="om_dir",
+        cli="--om-dir",
+        meaning="Directory for compiled OM artifacts (normally derived from --exp-dir)",
+        default="outputs/om",
         in_wizard=False,
     ),
     Param(
@@ -441,9 +449,9 @@ def build_parser() -> argparse.ArgumentParser:
 # Derivation
 # ---------------------------------------------------------------------------
 def apply_exp_dir_derivation(values: dict[str, Any], sources: dict[str, str]) -> None:
-    """Fill output_dir / runtime_save_dir from exp_dir unless explicitly provided.
+    """Fill output_dir / runtime_save_dir / om_dir from exp_dir unless explicitly provided.
 
-    These two params carry builtin defaults, so "explicitly provided" means a
+    These params carry builtin defaults, so "explicitly provided" means a
     source stronger than builtin (CLI / profile / defaults / last). Derivation
     therefore overrides only the builtin fallback, never a user-chosen value.
     """
@@ -453,6 +461,7 @@ def apply_exp_dir_derivation(values: dict[str, Any], sources: dict[str, str]) ->
     derivations = {
         "output_dir": os.path.join(exp_dir, DERIVED_ONNX_DIR),
         "runtime_save_dir": os.path.join(exp_dir, DERIVED_RUNTIME_DIR),
+        "om_dir": os.path.join(exp_dir, DERIVED_OM_DIR),
     }
     for dest, derived in derivations.items():
         if values.get(dest) is None or sources.get(dest) == SRC_BUILTIN:
@@ -641,8 +650,10 @@ def print_effective(resolved: ResolvedConfig) -> None:
         "exp_dir",
         "output_dir",
         "runtime_save_dir",
+        "om_dir",
         "dtype",
         "device",
+        "fast_gelu",
         "soc_version",
         "steps",
         "batch_path",
@@ -675,7 +686,7 @@ def _strip_for_persist(run_params: dict[str, Any]) -> dict[str, Any]:
     """Prepare run params for writing into ``_last``/profiles.
 
     Drops:
-    - derived ``output_dir`` / ``runtime_save_dir`` when an ``exp_dir`` exists
+    - derived ``output_dir`` / ``runtime_save_dir`` / ``om_dir`` when an ``exp_dir`` exists
       (they are *computed*, so persisting them would make a later ``--exp-dir``
       change silently ineffective);
     - transient flow flags such as ``verify`` (remembering "I verified last
@@ -684,7 +695,7 @@ def _strip_for_persist(run_params: dict[str, Any]) -> dict[str, Any]:
     """
     out = {k: v for k, v in run_params.items() if k not in _TRANSIENT_KEYS}
     if out.get("exp_dir"):
-        for k in ("output_dir", "runtime_save_dir"):
+        for k in ("output_dir", "runtime_save_dir", "om_dir"):
             out.pop(k, None)
     return out
 

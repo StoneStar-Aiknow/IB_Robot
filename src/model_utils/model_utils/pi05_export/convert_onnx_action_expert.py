@@ -249,20 +249,6 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-om-manifest", action="store_true", help="Do not write/update config.om.json.")
     parser.add_argument(
-        "--mqa-broadcast",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Skip repeat_kv Expand for multi-query attention and rely on matmul "
-        "broadcasting instead (default: True). Mathematically identical.",
-    )
-    parser.add_argument(
-        "--fp16-softmax",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Keep the attention score matrix and softmax in fp16 (no fp32 upcast) "
-        "for fp16 export. Uses a fp16-safe mask sentinel (default: True).",
-    )
-    parser.add_argument(
         "--fast-gelu",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -394,6 +380,7 @@ def main() -> int:
         args.pretrained_policy_path, local_files_only=bool(args.local_files_only), strict=False
     )
     export_dtype = args.dtype  # "fp16", "fp32", or "auto"
+    softmax_in_model_dtype = export_dtype != "fp32"
     if export_dtype == "auto":
         # Preserve original mixed precision (typically bf16 for the gemma
         # expert + fp32 for action/time projection layers). Build a per-input
@@ -496,11 +483,15 @@ def main() -> int:
         args.dynamo,
         args.constant_folding,
     )
+    LOGGER.info(
+        "  attention export: mqa_broadcast=True, softmax_dtype=%s",
+        "model" if softmax_in_model_dtype else "fp32",
+    )
     # Apply Ascend ATC compatibility patches during ONNX export
     with ascend_onnx_export_patches(
         use_npu_ops=use_npu_ops,
-        fp16_softmax=bool(args.fp16_softmax),
-        mqa_broadcast=bool(args.mqa_broadcast),
+        fp16_softmax=softmax_in_model_dtype,
+        mqa_broadcast=True,
         fast_gelu=bool(args.fast_gelu),
     ):
         torch.onnx.export(

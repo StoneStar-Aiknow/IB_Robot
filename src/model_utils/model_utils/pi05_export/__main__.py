@@ -47,8 +47,8 @@ Step semantics
 Design notes
 ------------
 * **Intermediate products are preserved.** Nothing is deleted between stages;
-  the ONNX files, ``runtime_save/*.pth`` and ``config.om.json`` all remain on
-  disk for inspection or a partial re-run.
+  the ONNX files, compiled OM files, ``runtime_save/*.pth`` and
+  ``config.om.json`` all remain on disk for inspection or a partial re-run.
 * **Live feedback.** Stages run as child processes with inherited stdout/stderr,
   so the user sees real progress (export logs, ATC compile output).
 * **Minimal surface.** All argument ergonomics (profile / wizard / --exp-dir
@@ -90,6 +90,7 @@ class Ctx:
     policy_path: Path
     output_dir: Path
     runtime_save_dir: Path
+    om_dir: Path
     vlm_onnx: Path
     ae_onnx: Path
     vlm_donor_onnx: Path
@@ -161,6 +162,7 @@ def _run_vlm_donor_onnx(ctx: Ctx) -> None:
             a.dtype,
             "--device",
             a.donor_device,
+            "--skip-om-manifest",
             "--log-level",
             a.log_level,
         ],
@@ -184,6 +186,7 @@ def _run_ae_donor_onnx(ctx: Ctx) -> None:
             a.dtype,
             "--device",
             a.donor_device,
+            "--skip-om-manifest",
             "--log-level",
             a.log_level,
         ],
@@ -254,6 +257,10 @@ def _run_vlm_onnx(ctx: Ctx) -> None:
             "--device",
             a.device,
             *(["--fast-gelu"] if a.fast_gelu else []),
+            "--om-manifest-dir",
+            str(ctx.policy_path),
+            "--om-path",
+            str(ctx.vlm_om),
             "--log-level",
             a.log_level,
         ],
@@ -278,6 +285,10 @@ def _run_ae_onnx(ctx: Ctx) -> None:
             "--device",
             a.device,
             *(["--fast-gelu"] if a.fast_gelu else []),
+            "--om-manifest-dir",
+            str(ctx.policy_path),
+            "--om-path",
+            str(ctx.ae_om),
             "--log-level",
             a.log_level,
         ],
@@ -544,6 +555,7 @@ def main() -> int:
 
     output_dir = Path(args.output_dir).expanduser()
     runtime_save_dir = Path(args.runtime_save_dir).expanduser()
+    om_dir = Path(args.om_dir).expanduser().resolve()
     device_tag = args.device.split(":", 1)[0]
     suffix = build_onnx_suffix(dtype=args.dtype, device=device_tag)
     donor_device_tag = args.donor_device.split(":", 1)[0]
@@ -559,16 +571,17 @@ def main() -> int:
         policy_path=policy_path,
         output_dir=output_dir,
         runtime_save_dir=runtime_save_dir,
+        om_dir=om_dir,
         vlm_onnx=vlm_onnx,
         ae_onnx=ae_onnx,
         vlm_donor_onnx=output_dir / f"pi05-vlm{donor_suffix}.onnx",
         ae_donor_onnx=output_dir / f"pi05-action_expert{donor_suffix}.onnx",
         vlm_w8a8=vlm_w8a8,
         ae_w8a8=ae_w8a8,
-        vlm_om=policy_path / vlm_onnx.with_suffix(".om").name,
-        ae_om=policy_path / ae_onnx.with_suffix(".om").name,
-        vlm_quant_om=policy_path / vlm_w8a8.with_suffix(".om").name,
-        ae_quant_om=policy_path / ae_w8a8.with_suffix(".om").name,
+        vlm_om=om_dir / vlm_onnx.with_suffix(".om").name,
+        ae_om=om_dir / ae_onnx.with_suffix(".om").name,
+        vlm_quant_om=om_dir / vlm_w8a8.with_suffix(".om").name,
+        ae_quant_om=om_dir / ae_w8a8.with_suffix(".om").name,
         calib_dir=(Path(args.calib_dir).expanduser() if args.calib_dir else runtime_save_dir),
         chosen=set(chosen),
     )
@@ -595,7 +608,7 @@ def main() -> int:
         _append_summary(summary, ctx, name)
 
     print_summary("PI05 export pipeline complete", _dedup(summary), status="✅ DONE")
-    LOGGER.info("Intermediate products kept under %s and %s", output_dir, runtime_save_dir)
+    LOGGER.info("Intermediate products kept under %s, %s, and %s", output_dir, runtime_save_dir, om_dir)
 
     _cli.write_last(resolved)
     return 0

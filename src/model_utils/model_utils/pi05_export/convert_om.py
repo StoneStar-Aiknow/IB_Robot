@@ -265,12 +265,18 @@ def main() -> int:
     jobs: list[tuple[str, Path, Path]] = []
     if args.vlm_onnx:
         vlm_onnx = Path(args.vlm_onnx).expanduser()
-        vlm_om = Path(args.vlm_om).expanduser() if args.vlm_om else _default_om_output(manifest_dir, "vlm", vlm_onnx)
+        vlm_om = (
+            Path(args.vlm_om).expanduser().resolve()
+            if args.vlm_om
+            else _default_om_output(manifest_dir, "vlm", vlm_onnx)
+        )
         jobs.append(("vlm", vlm_onnx, vlm_om))
     if args.ae_onnx:
         ae_onnx = Path(args.ae_onnx).expanduser()
         ae_om = (
-            Path(args.ae_om).expanduser() if args.ae_om else _default_om_output(manifest_dir, "action_expert", ae_onnx)
+            Path(args.ae_om).expanduser().resolve()
+            if args.ae_om
+            else _default_om_output(manifest_dir, "action_expert", ae_onnx)
         )
         jobs.append(("action_expert", ae_onnx, ae_om))
 
