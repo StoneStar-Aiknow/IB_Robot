@@ -12,7 +12,7 @@ def generate_launch_description():
     device_arg = DeclareLaunchArgument(
         "device",
         default_value="auto",
-        description="Device to run inference on (cuda, cpu, npu, ascend_om, ascend_om_3403, auto)",
+        description="Device to run inference on (cuda, cpu, npu, ascend_om, ascend_om_3403, rknn, hmm, auto)",
     )
 
     input_topic_arg = DeclareLaunchArgument(
@@ -42,6 +42,4 @@ def generate_launch_description():
         ],
     )
 
-    return LaunchDescription(
-        [policy_path_arg, device_arg, input_topic_arg, output_topic_arg, cloud_node]
-    )
+    return LaunchDescription([policy_path_arg, device_arg, input_topic_arg, output_topic_arg, cloud_node])

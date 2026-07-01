@@ -4,12 +4,28 @@ This module provides helper functions to launch existing ROS2 camera drivers
 (usb_cam, realsense2_camera) based on camera configuration.
 """
 
-from typing import Dict, Any, List, Tuple
+from typing import Any
 
 from robot_config.config import CameraConfig
+from robot_config.utils import parse_bool
 
 
-def get_usb_cam_params(config: CameraConfig) -> Dict[str, Any]:
+def camera_dict_requests_depth(config: dict[str, Any]) -> bool:
+    """Return True when a YAML camera peripheral requests a depth-capable stream."""
+    streams = config.get("streams") or []
+    if isinstance(streams, str):
+        streams = [streams]
+    stream_names = {str(stream).strip().lower() for stream in streams}
+    return (
+        "depth" in stream_names
+        or "pointcloud" in stream_names
+        or parse_bool(config.get("align_depth", False), default=False)
+        or parse_bool(config.get("enable_depth", False), default=False)
+        or parse_bool(config.get("enable_pointcloud", False), default=False)
+    )
+
+
+def get_usb_cam_params(config: CameraConfig) -> dict[str, Any]:
     """Get parameters for usb_cam node.
 
     Args:
@@ -40,7 +56,7 @@ def get_usb_cam_params(config: CameraConfig) -> Dict[str, Any]:
     return params
 
 
-def get_realsense_params(config: CameraConfig) -> Dict[str, Any]:
+def get_realsense_params(config: CameraConfig) -> dict[str, Any]:
     """Get parameters for realsense2_camera node.
 
     Args:
@@ -75,7 +91,7 @@ def get_realsense_params(config: CameraConfig) -> Dict[str, Any]:
     return params
 
 
-def get_static_transforms(config: CameraConfig) -> List[Tuple[str, str, Dict[str, float]]]:
+def get_static_transforms(config: CameraConfig) -> list[tuple[str, str, dict[str, float]]]:
     """Generate static transform publishers for camera frames.
 
     Args:
@@ -88,23 +104,24 @@ def get_static_transforms(config: CameraConfig) -> List[Tuple[str, str, Dict[str
 
     # Camera frame (if transform is specified)
     if config.transform:
-        transforms.append((
-            "base_link",  # TODO: Make parent configurable
-            config.frame_id,
-            config.transform,
-        ))
+        transforms.append(
+            (
+                "base_link",  # TODO: Make parent configurable
+                config.frame_id,
+                config.transform,
+            )
+        )
 
     # Optical frame transform (standard ROS2 convention)
     if config.optical_frame_id:
         # Standard optical frame rotation: -90° around X, -90° around Y
-        optical_transform = {
-            "x": 0.0, "y": 0.0, "z": 0.0,
-            "roll": -1.5708, "pitch": -1.5708, "yaw": 0.0
-        }
-        transforms.append((
-            config.frame_id,
-            config.optical_frame_id,
-            optical_transform,
-        ))
+        optical_transform = {"x": 0.0, "y": 0.0, "z": 0.0, "roll": -1.5708, "pitch": -1.5708, "yaw": 0.0}
+        transforms.append(
+            (
+                config.frame_id,
+                config.optical_frame_id,
+                optical_transform,
+            )
+        )
 
     return transforms

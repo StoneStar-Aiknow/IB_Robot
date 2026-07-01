@@ -16,6 +16,7 @@ from pathlib import Path
 import xacro as _xacro_lib
 
 from robot_config.logger_utils import get_colored_logger
+from robot_config.peripherals.camera import camera_dict_requests_depth
 from robot_config.utils import parse_bool, resolve_ros_path
 
 logger = get_colored_logger("robot_config.description")
@@ -70,8 +71,10 @@ def _build_cameras_urdf_from_yaml(
       → robot_state_publisher TF 帧名与图像消息 header.frame_id 一致
     - Gazebo sensor 名 = {name}_camera（如 top_camera）
       → 与 sim_peripheral_bridge.py sensor_name 约定一致
-    - Gazebo topic     = {name}_camera/image
+    - Gazebo color topic = {name}_camera/image
       → Ignition Gazebo 发布于 /{name}_camera/image，由 bridge 桥接
+    - Depth-enabled cameras use rgbd_camera and also publish
+      /{name}_camera/depth_image for aligned depth bridging.
 
     固定相机（parent_frame=world/base）和随臂相机（parent_frame=gripper）
     生成逻辑完全相同，区别仅在于 parent link 的值。
@@ -132,6 +135,9 @@ def _build_cameras_urdf_from_yaml(
         height = periph.get("height", 480)
         fps = periph.get("fps", 30)
         sensor_name = f"{name}_camera"
+        has_depth = camera_dict_requests_depth(periph)
+        sensor_type = "rgbd_camera" if has_depth else "camera"
+        topic_name = sensor_name if has_depth else f"{sensor_name}/image"
 
         # fovy (vertical, degrees) → horizontal_fov (radians)
         fovy_rad = math.radians(cam_fovy)
@@ -152,7 +158,7 @@ def _build_cameras_urdf_from_yaml(
         <origin xyz="{x} {y} {z}" rpy="{roll} {pitch} {yaw}"/>
     </joint>
     <gazebo reference="{frame_id}">
-        <sensor type="camera" name="{sensor_name}">
+        <sensor type="{sensor_type}" name="{sensor_name}">
             <update_rate>{fps}</update_rate>
             <camera>
                 <horizontal_fov>{hfov_rad:.4f}</horizontal_fov>
@@ -165,7 +171,7 @@ def _build_cameras_urdf_from_yaml(
             </camera>
             <always_on>true</always_on>
             <visualize>true</visualize>
-            <topic>{sensor_name}/image</topic>
+            <topic>{topic_name}</topic>
         </sensor>
     </gazebo>""")
     return "\n".join(parts)

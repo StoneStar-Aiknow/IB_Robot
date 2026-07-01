@@ -7,6 +7,7 @@ model_utils 提供了一组用于 LeRobot 策略模型导出与验证的工具�
 | `export_onnx_atc.py` | 导出 ONNX 模型并通过 ATC 转换为 OM 格式（通用 Ascend 硬件） |
 | `export_onnx_3403.py` | 专为 Ascend 3403 硬件导出 ONNX 模型 |
 | `export_onnx_rknn.py` | 专为 RK3588 NPU 导出 ONNX 模型，并可一键转换为 RKNN 格式 |
+| `export_onnx_hmm.py` | 专为后摩 HMM（LQ50 / M50 xh2）导出 ONNX 模型，并可一键 PTQ + 编译为 `.hmm` 格式 |
 | `loss_compare.py` | 跨平台模型推理精度对比验证 |
 | `frame_inspect` | 脱机逐帧/区间策略推理检查；需要 `policy-path`、`dataset-root` 和帧选择参数 |
 | `pi05_export/` | PI05 策略的 Ascend OM 拆分导出工具链（VLM + Action Expert 两段式导出、ATC 转 OM、量化与验证），提供 `python -m model_utils.pi05_export` 一条命令端到端入口，详见下文 |
@@ -217,6 +218,77 @@ python export_onnx_rknn.py \
 
 导出的 ONNX 文件为 `act_ros2_rknn.onnx`。若启用 `--convert_rknn`，默认还会在同一
 `policy_path` 目录下生成 `model.rknn`，供 `device:=rknn` 直接按 `policy_path` 加载。
+
+---
+
+## export_onnx_hmm.py
+
+> **专为后摩 HMM（LQ50 / M50 xh2）导出 ONNX 模型的工具。**
+>
+> 复用 RKNN 导出的 action-only ONNX 图（仅输出 `action`、constant folding、onnxsim 简化、opset 13），
+> 并可选一键调用后摩大道工具链完成「PTQ 量化 + 编译」生成 `.hmm`，供 `device:=hmm` 加载。
+
+### HMM 转换两阶段流程
+
+`--convert_hmm` 会串联后摩大道工具链的两个阶段（与官方 `houmo-examples` 一致）：
+
+1. **PTQ 量化（ONNX -> HMONNX）**：通过 `xhquant.api.convert_onnx_to_hmonnx`，使用
+   `QuantScheme(target_device=DeviceType.XH2a, quant_type=w8a8h1_sefp)` 将 ONNX 量化为 HMONNX 中间格式。
+2. **编译（HMONNX -> `.hmm`）**：通过 `tcim.build_from_hmonnx`，针对 `xh2` 目标编译为板端 `.hmm`。
+
+> 转换阶段要求主机已安装后摩大道工具链（`xhquant`、`tcim`）。未安装时会跳过转换并给出提示，
+> 此时仍会产出可复用的 `act_ros2_hmm.onnx`。
+
+### 用法
+
+```shell
+# 仅导出 ONNX（需要 source .shrc_local 环境下运行，依赖 lerobot + torch）
+python export_onnx_hmm.py \
+    --policy_path={策略模型目录路径}
+
+# 导出 ONNX 并一键 PTQ + 编译为 HMM（需主机已安装 xhquant + tcim）
+python export_onnx_hmm.py \
+    --policy_path={策略模型目录路径} \
+    --convert_hmm
+```
+
+### 参数
+
+| 参数 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `--policy_path` | ✅ | — | LeRobot 训练出来的策略模型目录路径（与 `--onnx` 二选一） |
+| `--onnx` | ✅ | — | 已有 ONNX 模型路径，仅做 strip + simplify（与 `--policy_path` 二选一） |
+| `--output` | ❌ | 自动 `_hmm` 后缀 | ONNX 输出路径 |
+| `--device` | ❌ | `cpu` | 导出时使用的设备（`cpu` 或 `cuda`） |
+| `--convert_hmm` | ❌ | `false` | 导出后自动 PTQ + 编译为 `.hmm` |
+| `--hmm_output` | ❌ | `policy_path/model.hmm` | HMM 输出路径 |
+| `--hmm_model_name` | ❌ | 目录名 | HMM 制品名称 |
+| `--hmm_target` | ❌ | `xh2` | 后摩目标平台（LQ50 / M50 为 `xh2`） |
+| `--hmm_ncore` | ❌ | `2` | 编译使用的核数 |
+| `--hmm_opt_level` | ❌ | `O2` | 编译优化级别 |
+| `--hmm_quant_type` | ❌ | `w8a8h1_sefp` | PTQ 量化类型（传给 `QuantScheme`） |
+
+### 示例
+
+```shell
+# 仅导出 HMM 专用 ONNX
+python export_onnx_hmm.py \
+    --policy_path=path/to/pretrained_model
+
+# 导出 + w8a8 量化 + 编译（推荐用于 ACT 模型）
+python export_onnx_hmm.py \
+    --policy_path=path/to/pretrained_model \
+    --convert_hmm
+
+# 使用已有 ONNX 直接 PTQ + 编译
+python export_onnx_hmm.py \
+    --onnx=path/to/act_ros2_hmm.onnx \
+    --convert_hmm
+```
+
+导出的 ONNX 文件为 `act_ros2_hmm.onnx`。若启用 `--convert_hmm`，默认还会在同一
+`policy_path` 目录下生成 `model.hmm` 与 `config.hmm.json`（编译制品清单），供 `device:=hmm`
+直接按 `policy_path` 加载。
 
 ---
 

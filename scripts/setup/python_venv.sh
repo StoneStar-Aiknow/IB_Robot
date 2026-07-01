@@ -85,14 +85,17 @@ install_lerobot_editable() {
 
     check_lerobot_ros_numpy_compat
 
-    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot"
+    # [smolvla,pi] extras pull in transformers-dep + smolvla-specific deps
+    # (num2words, accelerate, safetensors) so PI05/SmolVLA policies load
+    # without manual pip installs. See libs/lerobot/pyproject.toml.
+    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot[smolvla,pi]"
 }
 
 setup_python_venv() {
     if ! platform_supports_local_workspace_build; then
         log_info "Skipping workspace venv setup on ${SETUP_PLATFORM_ID}."
         log_info "Use the board ROS runtime directly after sourcing $(platform_ros_setup_path)."
-        log_info "Cross-build IB_Robot artifacts on the host with scripts/openharmony/build_ibrobot_oh_custom.sh."
+        log_info "Cross-build RoboFrame (IB_Robot) OpenHarmony artifacts on the host with scripts/openharmony/build_roboframe_oh.sh."
         PYTHON_ENV_STATUS="skipped"
         log_skipped "Workspace Python virtual environment"
         return 0
@@ -126,6 +129,7 @@ setup_python_venv() {
     else
         log_info "Virtual environment already exists at ${venv_path}."
     fi
+    touch "${venv_path}/COLCON_IGNORE"
 
     # Activate the virtual environment and install dependencies
     log_info "Configuring Python environment and dependencies..."
@@ -147,6 +151,9 @@ setup_python_venv() {
     fi
 
     local pip_install=("${VENV_PYTHON}" -m pip install)
+    local installed_perception_deps=false
+    local installed_grasp_deps=false
+    local ros_abi_constraints="${venv_path}/ros_abi_constraints.txt"
 
     # Upgrade pip
     run_cmd "${VENV_PYTHON}" -m pip install --upgrade pip --quiet
@@ -282,8 +289,81 @@ PY
     # Force NumPy/OpenCV back to ROS 2 Humble ABI-compatible versions.
     # The lerobot installation brings in numpy 2.x. We unconditionally overwrite it
     # here to ensure ROS packages (cv_bridge, image_transport, etc.) do not trigger binary incompatibility errors at runtime.
+    # Only install the headless OpenCV wheel by default; keep opencv-python in
+    # the constraints file below so optional dependencies cannot pull 4.12+ and
+    # force NumPy 2.x back into the ROS environment.
     log_info "Pinning NumPy 1.26.4 + opencv-python-headless<4.12 (ROS 2 Humble ABI)..."
-    run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" "opencv-python-headless<4.12" --quiet
+    run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" \
+        "opencv-python-headless<4.12" --quiet
+
+    cat > "${ros_abi_constraints}" <<'EOF'
+numpy==1.26.4
+opencv-python<4.12
+opencv-python-headless<4.12
+EOF
+
+    # Optional perception and manipulation dependencies are installed after the
+    # core dependency set and ABI pins so later setup steps cannot overwrite them.
+    if [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
+        log_warn "Skipping optional perception dependencies on openEuler; SAM2/Grounding-DINO are validated on Ubuntu only."
+    elif [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true ]]; then
+        log_info "Installing optional perception dependencies (SAM2, Grounding-DINO)..."
+        run_cmd env SAM2_BUILD_CUDA="${SAM2_BUILD_CUDA:-0}" SAM2_BUILD_ALLOW_ERRORS=1 \
+            "${pip_install[@]}" --no-build-isolation --constraint "${ros_abi_constraints}" \
+            -r "${WORKSPACE}/requirements/perception.txt" --quiet
+        installed_perception_deps=true
+    else
+        log_info "Skipping optional perception dependencies. Re-run setup with --with-perception if needed."
+    fi
+
+    if [[ "${INSTALL_GRASP_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
+        log_warn "Skipping optional grasp dependencies on openEuler; GraspGen CUDA extensions are validated on Ubuntu only."
+    elif [[ "${INSTALL_GRASP_DEPS:-false}" == true ]]; then
+        log_info "Installing optional grasp dependencies (GraspGen)..."
+        # shellcheck disable=SC1091
+        source "${SCRIPT_DIR}/setup/install_graspgen_pip.sh"
+        export ROS_ABI_CONSTRAINTS="${ros_abi_constraints}"
+        install_graspgen_pip "${VENV_PYTHON}" -m pip install
+        installed_grasp_deps=true
+    else
+        log_info "Skipping optional grasp dependencies. Re-run setup with --with-grasp if needed."
+    fi
+
+    # Optional perception/grasp dependencies can pull OpenCV wheels whose latest
+    # releases require NumPy 2.x. Re-apply the final ROS 2 ABI pin before smoke tests.
+    log_info "Re-applying NumPy/OpenCV ROS 2 ABI pins after optional dependencies..."
+    run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" \
+        "opencv-python-headless<4.12" --quiet
+
+    log_info "Running Python dependency smoke tests..."
+    PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
+import cv2
+import numpy
+
+if not numpy.__version__.startswith("1.26"):
+    raise SystemExit(f"Expected NumPy 1.26.x after setup, got {numpy.__version__}")
+print(f"NumPy/OpenCV smoke test passed: numpy={numpy.__version__}, cv2={cv2.__version__}")
+PY
+    if [[ "${installed_perception_deps}" == true ]]; then
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
+import importlib.util
+
+missing = [name for name in ("groundingdino", "sam2") if importlib.util.find_spec(name) is None]
+if missing:
+    raise SystemExit(f"Missing perception modules after optional install: {', '.join(missing)}")
+print("Perception optional dependencies smoke test passed")
+PY
+    fi
+    if [[ "${installed_grasp_deps}" == true ]]; then
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
+import importlib.util
+
+if importlib.util.find_spec("grasp_gen") is None:
+    raise SystemExit("Missing grasp_gen after optional GraspGen install")
+print("GraspGen optional dependencies smoke test passed")
+PY
+    fi
+
     local commit_msg_hook
     commit_msg_hook="$(git rev-parse --git-path hooks/commit-msg 2>/dev/null || true)"
     if [[ -f "${commit_msg_hook}" ]] && grep -qi "gitlint" "${commit_msg_hook}"; then

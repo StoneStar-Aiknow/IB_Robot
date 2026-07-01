@@ -8,6 +8,7 @@
 2. 接收用户的连续文本提问或结构化请求
 3. 将图像、机器人状态、用户补充信息一起发给大模型理解
 4. 发布结构化理解结果和简短文本摘要
+5. 可选运行 Grounding-DINO + SAM2 开放词汇检测与分割节点
 
 ## 1. 典型链路
 
@@ -157,3 +158,28 @@ embodied:
 ```
 
 如果希望统一走仓内推荐的 `/camera/front/...` 命名，应通过 `robot_config` launch 或显式 remap 做标准化。
+
+## 7. Grounded-SAM2 检测分割
+
+`grounded_sam2_node` 和 `grounded_sam2_snapshot` 已并入 `perception_service`，作为感知包中的开放词汇检测/分割能力。
+抓取流水线默认使用腕部相机 topic：
+
+- RGB：`/camera/wrist/image_raw`
+- 对齐深度：`/camera/wrist/aligned_depth_to_color/image_raw`
+- CameraInfo：`/camera/wrist/aligned_depth_to_color/camera_info`
+
+首次使用前安装可选依赖并下载模型：
+
+```bash
+./scripts/setup.sh --with-perception
+./scripts/download_perception_models.sh
+```
+
+构建并运行在线节点：
+
+```bash
+source .shrc_local && colcon build --symlink-install --merge-install --packages-select ibrobot_msgs perception_service
+source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 run perception_service grounded_sam2_node
+```
+
+该节点提供 `ibrobot_msgs/srv/DetectSegment`，并发布 `ibrobot_msgs/msg/DetectionArray`，供下游 `manipulation_service` 抓取规划消费。

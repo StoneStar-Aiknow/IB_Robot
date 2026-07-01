@@ -1,0 +1,31 @@
+# Optional dependencies for src/manipulation_service.
+# Install with:
+#   ./scripts/setup.sh --with-grasp
+#
+# GraspGen itself is installed by scripts/setup/python_venv.sh from a pinned
+# editable VCS source using --no-deps so it does not overwrite the workspace's
+# Torch/NumPy versions. Keep this file to runtime dependencies that are not
+# already managed by the base IB-Robot environment.
+
+h5py
+hydra-core
+meshcat
+webdataset
+scikit-learn
+trimesh==4.5.3
+tensordict
+timm>=1.0.15,<2.0.0
+PyOpenGL==3.1.5
+addict
+spconv-cu120
+yapf==0.40.1
+tensorboardx
+sharedarray
+torch-scatter
+yourdfpy==0.0.56
+pyrender
+scene-synthesizer[recommend]
+viser
+pyzmq
+msgpack
+msgpack-numpy

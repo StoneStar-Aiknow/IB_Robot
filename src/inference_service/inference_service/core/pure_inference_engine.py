@@ -39,6 +39,7 @@ def resolve_device(device: str = "auto") -> torch.device:
             - "npu" or "npu:N": Ascend NPU (if available)
             - "ascend_om" or "ascend_om_3403": Ascend OM hardware backend
             - "rknn": Rockchip RKNN NPU backend (RK3588 etc.)
+            - "hmm": Houmo HMM backend (LQ50 / M50 xh2)
 
     Returns:
         torch.device instance
@@ -80,7 +81,7 @@ def resolve_device(device: str = "auto") -> torch.device:
     if r == "cpu":
         return torch.device("cpu")
 
-    if r in ("ascend_om", "ascend_om_3403", "rknn"):
+    if r in ("ascend_om", "ascend_om_3403", "rknn", "hmm"):
         return torch.device("cpu")
 
     if r.startswith("npu"):
@@ -337,6 +338,10 @@ class PureInferenceEngine:
             from inference_service.core.rknn import create_rknn_policy_wrapper
 
             self._wrapper = create_rknn_policy_wrapper(device_name)
+        elif device_name == "hmm":
+            from inference_service.core.hmm import create_hmm_policy_wrapper
+
+            self._wrapper = create_hmm_policy_wrapper(device_name)
         else:
             self._wrapper = LeRobotPolicyWrapper()
         self._wrapper.load(path, self._device)

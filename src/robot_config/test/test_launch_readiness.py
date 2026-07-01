@@ -22,6 +22,7 @@ from robot_config.launch_builders.execution import (
     generate_inference_node,
 )
 from robot_config.launch_builders.navigation import generate_navigation_nodes
+from robot_config.launch_builders.perception import generate_camera_nodes
 from robot_config.launch_builders.sim_backend import get_sim_backend
 from robot_config.launch_builders.teleop import generate_teleop_nodes
 from robot_config.loader import load_robot_config_dict
@@ -62,6 +63,13 @@ def _node_parameters(node):
     return parsed
 
 
+def _node_remappings(node):
+    remappings = []
+    for src, dst in node._Node__remappings:
+        remappings.append((_text(src), _text(dst)))
+    return remappings
+
+
 def test_missing_inactive_controllers_returns_only_non_active():
     controllers = [
         SimpleNamespace(name="joint_state_broadcaster", state="active"),
@@ -89,6 +97,60 @@ def test_generate_controller_spawners_groups_activation():
     assert "--controller-manager" in cmd_text
     assert "controller_manager" in cmd_text
     assert "--activate-as-group" in cmd_text
+
+
+def _relay_targets(nodes):
+    """Collect (source_topic, target_topic) pairs from robot_config topic_relay nodes."""
+    pairs = []
+    for node in nodes:
+        if getattr(node, "_Node__package", None) != "robot_config":
+            continue
+        args = getattr(node, "_Node__arguments", None) or []
+        if len(args) >= 2:
+            pairs.append((_text(args[0]), _text(args[1])))
+    return pairs
+
+
+def test_realsense_camera_topics_are_remapped_to_robot_config_contract_names():
+    nodes = generate_camera_nodes(
+        {
+            "peripherals": [
+                {
+                    "type": "camera",
+                    "name": "wrist",
+                    "driver": "realsense",
+                    "width": 640,
+                    "height": 480,
+                    "fps": 30,
+                    "align_depth": True,
+                    "enable_pointcloud": True,
+                }
+            ]
+        },
+        use_sim=False,
+    )
+
+    relay_pairs = _relay_targets(nodes)
+    assert (
+        "/camera/wrist_camera/color/image_raw",
+        "/camera/wrist/image_raw",
+    ) in relay_pairs
+    assert (
+        "/camera/wrist_camera/color/camera_info",
+        "/camera/wrist/camera_info",
+    ) in relay_pairs
+    assert (
+        "/camera/wrist_camera/aligned_depth_to_color/image_raw",
+        "/camera/wrist/depth/image_rect_raw",
+    ) in relay_pairs
+    assert (
+        "/camera/wrist_camera/aligned_depth_to_color/image_raw",
+        "/camera/wrist/aligned_depth_to_color/image_raw",
+    ) in relay_pairs
+    assert (
+        "/camera/wrist_camera/aligned_depth_to_color/camera_info",
+        "/camera/wrist/aligned_depth_to_color/camera_info",
+    ) in relay_pairs
 
 
 def test_start_actions_handler_snapshots_action_list():

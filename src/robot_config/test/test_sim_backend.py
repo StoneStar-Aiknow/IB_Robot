@@ -4,7 +4,10 @@ Tests cover both Gazebo and MuJoCo backends without requiring
 a ROS or Gazebo runtime environment.
 """
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 from robot_config.launch_builders.sim_backend import (
     SimBackendAdapter,
@@ -120,6 +123,33 @@ def test_sim_peripheral_bridge_multi_camera():
     ]
     nodes = generate_peripheral_sim_bridges(peripherals, model_name="test_robot")
     assert len(nodes) == 1  # single bridge_node handles all 3 cameras (6 topics in YAML)
+
+
+def test_sim_peripheral_bridge_depth_camera_entries():
+    """Depth-enabled cameras add an aligned-depth bridge entry."""
+    from robot_config.launch_builders.sim_peripheral_bridge import (
+        generate_peripheral_sim_bridges,
+    )
+
+    peripherals = [
+        {
+            "type": "camera",
+            "name": "front",
+            "frame_id": "camera_front_link",
+            "align_depth": True,
+        },
+    ]
+    nodes = generate_peripheral_sim_bridges(peripherals, model_name="test_robot")
+    assert len(nodes) == 1
+
+    bridge_config = yaml.safe_load(Path("/tmp/ros_gz_camera_bridge.yaml").read_text())
+    ros_topics = {entry["ros_topic_name"] for entry in bridge_config}
+    gz_topics = {entry["gz_topic_name"] for entry in bridge_config}
+
+    assert "/camera/front/image_raw" in ros_topics
+    assert "/camera/front/camera_info" in ros_topics
+    assert "/camera/front/aligned_depth_to_color/image_raw" in ros_topics
+    assert "/front_camera/depth_image" in gz_topics
 
 
 def test_sim_peripheral_bridge_lidar_and_imu_supported():

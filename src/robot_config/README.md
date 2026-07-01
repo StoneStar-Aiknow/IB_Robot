@@ -278,6 +278,13 @@ robot:
 
 从磁盘加载 SO-101 数字关节标定时，`robot_config` 会按每个来源的 key 后缀转换为内部命名空间键，例如 `"1"` 到 `"6"` 映射为 `joint1_arm` 到 `joint6_arm`、`jointN_left` / `jointN_right` 或 `jointN_1`。`calib_file_<namespace>` 支持任意数量的唯一命名空间；如果合并后的标定键冲突，加载会直接报错。`calib_file_1` 的 namespace 就是 `1`，不会额外推断为 `left` 或 `right`。
 
+LeRobot 转换 metadata 中的标定来源字段保持稳定契约：
+
+- `calibration_source`：兼容旧消费者的单字符串字段，始终取第一个解析到的标定文件路径。
+- `calibration_sources`：完整的多标定文件路径列表，多标定源场景应优先读取该字段。
+
+当机器人通过 `ros2_control.calib_file` 配置单个标定文件时，这两个字段都指向同一来源；当机器人通过 `ros2_control.xacro_args.calib_file_1`、`calib_file_2` 等按编号配置多个标定文件时，不需要额外合并标定文件，`calibration_source` 仍保持首个路径，完整有序列表写入 `calibration_sources`。
+
 **命令接口：**
 ```bash
 # 机械臂位置命令

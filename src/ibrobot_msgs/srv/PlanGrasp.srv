@@ -1,0 +1,28 @@
+# Request
+string text_prompt
+float32 confidence_threshold
+float32 grasp_threshold
+
+# Per-request debug output mode.
+# Empty/default: follow the node save_debug_outputs parameter.
+# none: write no files.
+# diagnostic: write only grasp_result.json with diagnostics and grasps.
+# full: write grasp_result.json plus point clouds, gripper outputs, and previews.
+string debug_output_mode
+---
+# Response
+GraspCandidateArray grasps
+float32 inference_time_ms
+bool success
+string message
+
+# Directory used for this request's debug files. Empty when no files were written.
+string debug_output_dir
+
+# Diagnostic breakdown for successful and failed planning requests.
+# Entries are stable "key: value" strings. Common keys include failure_stage,
+# failure_reason, detection_status, detection_confidence, mask_pixel_count,
+# valid_depth_in_mask_count, valid_depth_ratio_in_mask, object_point_count,
+# raw_grasp_count, collision_filter, tabletop_plane_found,
+# tabletop_best_inlier_ratio, tabletop_filter, and final_grasp_count.
+string[] diagnostic_details

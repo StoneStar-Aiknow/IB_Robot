@@ -69,6 +69,9 @@ _IBROBOT_ONLY_KEYS: frozenset[str] = frozenset(
         # RKNN backend hints
         "is_rknn_enabled",
         "rknn_model_path",
+        # HMM (Houmo LQ50 / M50 xh2) backend hints
+        "is_hmm_enabled",
+        "hmm_model_path",
     }
 )
 
