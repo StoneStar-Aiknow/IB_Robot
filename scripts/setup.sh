@@ -5,7 +5,6 @@
 # Usage:
 #   ./scripts/setup.sh                               # Interactive mode
 #   ./scripts/setup.sh --yes                         # Auto-yes mode
-#   ./scripts/setup.sh --skip-submodules             # Keep current submodule state
 #   ./scripts/setup.sh --with-perception             # Install SAM2/Grounding-DINO deps
 #   ./scripts/setup.sh --with-grasp                  # Install GraspGen deps
 #   ./scripts/setup.sh --skip-verify                 # Skip final ROS/Python verification
@@ -78,6 +77,8 @@ export PYTHONNOUSERSITE=1
 # `resolution-too-deep`. Instead, we let lerobot install whatever NumPy/
 # OpenCV it wants, and AFTERWARDS force-reinstall numpy==1.26.4 +
 # opencv-python-headless<4.12 to restore ROS 2 Humble ABI compatibility.
+# Optional dependency installs use constraints that also cap opencv-python<4.12
+# if a third-party package pulls the GUI wheel transitively.
 # This produces a few cosmetic dependency-resolver warnings during install,
 # which are harmless because we never call the numpy-2-only APIs in the
 # affected packages from the ROS pipeline.
@@ -192,7 +193,6 @@ Options:
   -y, --yes              Auto-confirm prompts using defaults
       --sudo             Force sudo for privileged operations
       --no-sudo          Never use sudo
-      --skip-submodules  Skip submodule initialization/update
       --with-perception  Install optional SAM2/Grounding-DINO dependencies
                          for perception_service
       --with-detection   Alias for --with-perception
@@ -222,7 +222,6 @@ parse_args() {
             --yes|-y) AUTO_YES=true ;;
             --no-sudo) USE_SUDO=false ;;
             --sudo) USE_SUDO=true ;;
-            --skip-submodules) SKIP_SUBMODULES=true ;;
             --with-perception|--with-perception-deps) INSTALL_PERCEPTION_DEPS=true ;;
             --with-grasp|--with-graspgen|--with-grasp-deps) INSTALL_GRASP_DEPS=true ;;
 

@@ -286,9 +286,12 @@ PY
     # Force NumPy/OpenCV back to ROS 2 Humble ABI-compatible versions.
     # The lerobot installation brings in numpy 2.x. We unconditionally overwrite it
     # here to ensure ROS packages (cv_bridge, image_transport, etc.) do not trigger binary incompatibility errors at runtime.
+    # Only install the headless OpenCV wheel by default; keep opencv-python in
+    # the constraints file below so optional dependencies cannot pull 4.12+ and
+    # force NumPy 2.x back into the ROS environment.
     log_info "Pinning NumPy 1.26.4 + opencv-python-headless<4.12 (ROS 2 Humble ABI)..."
     run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" \
-        "opencv-python<4.12" "opencv-python-headless<4.12" --quiet
+        "opencv-python-headless<4.12" --quiet
 
     cat > "${ros_abi_constraints}" <<'EOF'
 numpy==1.26.4
@@ -327,7 +330,7 @@ EOF
     # releases require NumPy 2.x. Re-apply the final ROS 2 ABI pin before smoke tests.
     log_info "Re-applying NumPy/OpenCV ROS 2 ABI pins after optional dependencies..."
     run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" \
-        "opencv-python<4.12" "opencv-python-headless<4.12" --quiet
+        "opencv-python-headless<4.12" --quiet
 
     log_info "Running Python dependency smoke tests..."
     PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
