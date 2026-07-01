@@ -88,95 +88,6 @@ install_lerobot_editable() {
     "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot"
 }
 
-check_graspgen_cuda_toolkit() {
-    local torch_cuda_version cuda_home_candidate cuda_home="${CUDA_HOME:-}" nvcc_path
-
-    torch_cuda_version="$("${VENV_PYTHON}" - <<'PY' 2>/dev/null || true
-import torch
-print(torch.version.cuda or "")
-PY
-)"
-
-    if [[ -n "${cuda_home}" && -x "${cuda_home}/bin/nvcc" ]]; then
-        return 0
-    fi
-
-    if [[ -n "${torch_cuda_version}" ]]; then
-        cuda_home_candidate="/usr/local/cuda-${torch_cuda_version}"
-        if [[ -x "${cuda_home_candidate}/bin/nvcc" ]]; then
-            return 0
-        fi
-    fi
-
-    nvcc_path="$(command -v nvcc 2>/dev/null || true)"
-    if [[ -n "${nvcc_path}" ]]; then
-        export CUDA_HOME="$(cd "$(dirname "${nvcc_path}")/.." && pwd)"
-        return 0
-    fi
-
-    log_error "--with-grasp requires a CUDA toolkit before installing GraspGen pointnet2_ops."
-    log_error "Set CUDA_HOME to a CUDA toolkit root with bin/nvcc, or install a matching toolkit"
-    log_error "such as /usr/local/cuda-${torch_cuda_version:-<torch-cuda-version>}."
-    log_error "Use --with-perception without --with-grasp on CPU-only setup verification hosts."
-    return 1
-}
-
-install_graspgen_pip() {
-    local pip_runner=("$@")
-    local graspgen_ref="${GRASPGEN_GIT_REF:-a56d518f3b76ea2a432b5b838b3c68027d29be49}"
-    local graspgen_repo="${GRASPGEN_GIT_URL:-https://github.com/NVlabs/GraspGen.git}"
-    local graspgen_src="${WORKSPACE}/venv/src"
-    local pointnet_url="git+${graspgen_repo}@${graspgen_ref}#subdirectory=pointnet2_ops"
-    local torch_cuda_version cuda_home_candidate cuda_env=()
-    local pyg_find_links
-
-    check_graspgen_cuda_toolkit || exit 1
-
-    log_info "Installing GraspGen runtime dependencies..."
-    pyg_find_links="${GRASPGEN_PYG_FIND_LINKS:-$("${VENV_PYTHON}" - <<'PY' 2>/dev/null || true
-import torch
-
-version = torch.__version__.split("+", 1)[0].split(".")
-torch_tag = f"{version[0]}.{version[1]}.0"
-cuda_version = torch.version.cuda
-if cuda_version:
-    cuda_tag = "cu" + cuda_version.replace(".", "")
-else:
-    cuda_tag = "cpu"
-print(f"https://data.pyg.org/whl/torch-{torch_tag}+{cuda_tag}.html")
-PY
-)}"
-    if [[ -n "${pyg_find_links}" ]]; then
-        run_cmd "${pip_runner[@]}" --find-links "${pyg_find_links}" \
-            -r "${WORKSPACE}/requirements/manipulation.txt" --quiet
-    else
-        run_cmd "${pip_runner[@]}" -r "${WORKSPACE}/requirements/manipulation.txt" --quiet
-    fi
-
-    # Upstream GraspGen expects top-level config/ and assets/ to be present next
-    # to grasp_gen/. Editable VCS install keeps that source tree under venv/src
-    # while avoiding a vendored copy under IB-Robot libs/.
-    log_info "Installing GraspGen from pinned upstream source (${graspgen_ref})..."
-    run_cmd "${pip_runner[@]}" --src "${graspgen_src}" --no-build-isolation --no-deps \
-        -e "git+${graspgen_repo}@${graspgen_ref}#egg=grasp_gen" --quiet
-
-    # GraspGen's CUDA PointNet2 extension is a sibling package in upstream.
-    # Keep it as a pip-installed package as well, rather than importing from libs/.
-    log_info "Installing GraspGen PointNet2 CUDA extension..."
-    torch_cuda_version="$("${VENV_PYTHON}" - <<'PY' 2>/dev/null || true
-import torch
-print(torch.version.cuda or "")
-PY
-)"
-    cuda_home_candidate="/usr/local/cuda-${torch_cuda_version}"
-    if [[ -n "${torch_cuda_version}" && -x "${cuda_home_candidate}/bin/nvcc" ]]; then
-        cuda_env=(CUDA_HOME="${cuda_home_candidate}" PATH="${cuda_home_candidate}/bin:${PATH}")
-        log_info "Using CUDA toolkit ${cuda_home_candidate} for pointnet2_ops build."
-    fi
-    run_cmd env "${cuda_env[@]}" TORCH_CUDA_ARCH_LIST="${GRASPGEN_TORCH_CUDA_ARCH_LIST:-8.6}" \
-        "${pip_runner[@]}" --no-build-isolation --no-deps "${pointnet_url}" --quiet
-}
-
 setup_python_venv() {
     if ! platform_supports_local_workspace_build; then
         log_info "Skipping workspace venv setup on ${SETUP_PLATFORM_ID}."
@@ -237,6 +148,9 @@ setup_python_venv() {
     fi
 
     local pip_install=("${VENV_PYTHON}" -m pip install)
+    local installed_perception_deps=false
+    local installed_grasp_deps=false
+    local ros_abi_constraints="${venv_path}/ros_abi_constraints.txt"
 
     # Upgrade pip
     run_cmd "${VENV_PYTHON}" -m pip install --upgrade pip --quiet
@@ -268,29 +182,6 @@ setup_python_venv() {
     if [[ -d "${lerobot_dir}" ]]; then
         log_info "Installing LeRobot in editable mode..."
         install_lerobot_editable "${VENV_PYTHON}" -m pip
-    fi
-
-    # Optional perception dependencies (SAM2, Grounding-DINO).
-    # These are intentionally installed from package metadata rather than
-    # vendored under libs/, keeping IB-Robot's source tree focused on ROS
-    # integration code and package-local contracts.
-    if [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
-        log_warn "Skipping optional perception dependencies on openEuler; SAM2/Grounding-DINO are validated on Ubuntu only."
-    elif [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true ]]; then
-        log_info "Installing optional perception dependencies (SAM2, Grounding-DINO)..."
-        run_cmd env SAM2_BUILD_CUDA="${SAM2_BUILD_CUDA:-0}" SAM2_BUILD_ALLOW_ERRORS=1 \
-            "${pip_install[@]}" --no-build-isolation -r "${WORKSPACE}/requirements/perception.txt" --quiet
-    else
-        log_info "Skipping optional perception dependencies. Re-run setup with --with-perception if needed."
-    fi
-
-    if [[ "${INSTALL_GRASP_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
-        log_warn "Skipping optional grasp dependencies on openEuler; GraspGen CUDA extensions are validated on Ubuntu only."
-    elif [[ "${INSTALL_GRASP_DEPS:-false}" == true ]]; then
-        log_info "Installing optional grasp dependencies (GraspGen)..."
-        install_graspgen_pip "${VENV_PYTHON}" -m pip install
-    else
-        log_info "Skipping optional grasp dependencies. Re-run setup with --with-grasp if needed."
     fi
 
     # Install base Python dependencies
@@ -396,7 +287,77 @@ PY
     # The lerobot installation brings in numpy 2.x. We unconditionally overwrite it
     # here to ensure ROS packages (cv_bridge, image_transport, etc.) do not trigger binary incompatibility errors at runtime.
     log_info "Pinning NumPy 1.26.4 + opencv-python-headless<4.12 (ROS 2 Humble ABI)..."
-    run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" "opencv-python-headless<4.12" --quiet
+    run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" \
+        "opencv-python<4.12" "opencv-python-headless<4.12" --quiet
+
+    cat > "${ros_abi_constraints}" <<'EOF'
+numpy==1.26.4
+opencv-python<4.12
+opencv-python-headless<4.12
+EOF
+
+    # Optional perception and manipulation dependencies are installed after the
+    # core dependency set and ABI pins so later setup steps cannot overwrite them.
+    if [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
+        log_warn "Skipping optional perception dependencies on openEuler; SAM2/Grounding-DINO are validated on Ubuntu only."
+    elif [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true ]]; then
+        log_info "Installing optional perception dependencies (SAM2, Grounding-DINO)..."
+        run_cmd env SAM2_BUILD_CUDA="${SAM2_BUILD_CUDA:-0}" SAM2_BUILD_ALLOW_ERRORS=1 \
+            "${pip_install[@]}" --no-build-isolation --constraint "${ros_abi_constraints}" \
+            -r "${WORKSPACE}/requirements/perception.txt" --quiet
+        installed_perception_deps=true
+    else
+        log_info "Skipping optional perception dependencies. Re-run setup with --with-perception if needed."
+    fi
+
+    if [[ "${INSTALL_GRASP_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
+        log_warn "Skipping optional grasp dependencies on openEuler; GraspGen CUDA extensions are validated on Ubuntu only."
+    elif [[ "${INSTALL_GRASP_DEPS:-false}" == true ]]; then
+        log_info "Installing optional grasp dependencies (GraspGen)..."
+        # shellcheck disable=SC1091
+        source "${SCRIPT_DIR}/setup/install_graspgen_pip.sh"
+        export ROS_ABI_CONSTRAINTS="${ros_abi_constraints}"
+        install_graspgen_pip "${VENV_PYTHON}" -m pip install
+        installed_grasp_deps=true
+    else
+        log_info "Skipping optional grasp dependencies. Re-run setup with --with-grasp if needed."
+    fi
+
+    # Optional perception/grasp dependencies can pull OpenCV wheels whose latest
+    # releases require NumPy 2.x. Re-apply the final ROS 2 ABI pin before smoke tests.
+    log_info "Re-applying NumPy/OpenCV ROS 2 ABI pins after optional dependencies..."
+    run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" \
+        "opencv-python<4.12" "opencv-python-headless<4.12" --quiet
+
+    log_info "Running Python dependency smoke tests..."
+    PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
+import cv2
+import numpy
+
+if not numpy.__version__.startswith("1.26"):
+    raise SystemExit(f"Expected NumPy 1.26.x after setup, got {numpy.__version__}")
+print(f"NumPy/OpenCV smoke test passed: numpy={numpy.__version__}, cv2={cv2.__version__}")
+PY
+    if [[ "${installed_perception_deps}" == true ]]; then
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
+import importlib.util
+
+missing = [name for name in ("groundingdino", "sam2") if importlib.util.find_spec(name) is None]
+if missing:
+    raise SystemExit(f"Missing perception modules after optional install: {', '.join(missing)}")
+print("Perception optional dependencies smoke test passed")
+PY
+    fi
+    if [[ "${installed_grasp_deps}" == true ]]; then
+        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
+import importlib.util
+
+if importlib.util.find_spec("grasp_gen") is None:
+    raise SystemExit("Missing grasp_gen after optional GraspGen install")
+print("GraspGen optional dependencies smoke test passed")
+PY
+    fi
+
     local commit_msg_hook
     commit_msg_hook="$(git rev-parse --git-path hooks/commit-msg 2>/dev/null || true)"
     if [[ -f "${commit_msg_hook}" ]] && grep -qi "gitlint" "${commit_msg_hook}"; then
