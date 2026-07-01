@@ -408,11 +408,8 @@ class PaliGemmaWithExpertModel(
                 param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor):
-        # TF5.3: get_image_features returns BaseModelOutputWithPooling, use pooler_output
-        # and multiply back by hidden_size**0.5 to restore pre-v5 scale
-        image_output = self.paligemma.model.get_image_features(image)
-        hidden_size = self.paligemma.config.text_config.hidden_size
-        return image_output.pooler_output * (hidden_size**0.5)
+        image_outputs = self.paligemma.model.vision_tower(image, return_dict=True)
+        return self.paligemma.model.multi_modal_projector(image_outputs.last_hidden_state)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.model.language_model.embed_tokens(tokens)

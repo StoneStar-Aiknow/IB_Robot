@@ -262,6 +262,13 @@ def parse_args() -> argparse.Namespace:
         help="Keep the attention score matrix and softmax in fp16 (no fp32 upcast) "
         "for fp16 export. Uses a fp16-safe mask sentinel (default: True).",
     )
+    parser.add_argument(
+        "--fast-gelu",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use Ascend NPUFastGelu for gelu_pytorch_tanh during NPU export (default: False). "
+        "This is faster but not numerically identical to PyTorch tanh GELU.",
+    )
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level")
     parser.add_argument("--local-files-only", action="store_true", default=True, help="Load policy without network")
     return parser.parse_args()
@@ -494,6 +501,7 @@ def main() -> int:
         use_npu_ops=use_npu_ops,
         fp16_softmax=bool(args.fp16_softmax),
         mqa_broadcast=bool(args.mqa_broadcast),
+        fast_gelu=bool(args.fast_gelu),
     ):
         torch.onnx.export(
             onnx_wrapper,

@@ -150,6 +150,7 @@ class Param:
     type: Callable[[str], Any] = str
     choices: list[str] | None = None
     is_flag: bool = False  # store_true style
+    bool_optional: bool = False  # --foo / --no-foo style
     required_for_run: bool = False  # must be present (post-merge) to run
     in_wizard: bool = True
     help_extra: str = ""
@@ -201,6 +202,14 @@ PARAMS: list[Param] = [
         meaning="Torch device for export / verification; the bare type is encoded in the ONNX filename",
         example="cpu",
         default="cpu",
+    ),
+    Param(
+        dest="fast_gelu",
+        cli="--fast-gelu",
+        meaning="Use Ascend NPUFastGelu for gelu_pytorch_tanh during NPU export; faster but approximate",
+        default=False,
+        bool_optional=True,
+        in_wizard=False,
     ),
     Param(
         dest="task",
@@ -399,7 +408,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     for p in PARAMS:
         kwargs: dict[str, Any] = {"dest": p.dest, "help": p.help_text}
-        if p.is_flag:
+        if p.bool_optional:
+            kwargs["action"] = argparse.BooleanOptionalAction
+            kwargs["default"] = None  # None => "not given on CLI"
+        elif p.is_flag:
             kwargs["action"] = "store_true"
             kwargs["default"] = None  # None => "not given on CLI"
         else:

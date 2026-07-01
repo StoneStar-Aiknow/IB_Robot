@@ -197,6 +197,7 @@ def export_onnx(
     dynamo: bool = True,
     constant_folding: bool = True,
     use_npu_ops: bool = False,
+    fast_gelu: bool = False,
 ) -> None:
     onnx_output_path.parent.mkdir(parents=True, exist_ok=True)
     dummy_keys = list(observation.keys())
@@ -209,7 +210,7 @@ def export_onnx(
     wrapper.policy.eval()
     # 注意: dynamo=True 时 opset_version 参数会被忽略, 实际固定使用 opset 18
     # Apply Ascend ATC compatibility patches during ONNX export
-    with ascend_onnx_export_patches(use_npu_ops=use_npu_ops):
+    with ascend_onnx_export_patches(use_npu_ops=use_npu_ops, fast_gelu=fast_gelu):
         torch.onnx.export(
             wrapper,
             tuple(observation_values),
@@ -425,8 +426,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs=2,
         metavar=("H", "W"),
         default=None,
-        help="Override image resolution (H W) for ALL cameras. "
-        "If omitted, each camera's resolution is read from the model config.",
+        help="Override VLM input image resolution (H W) for ALL cameras. "
+        "If omitted, config.image_resolution is used and the runtime host-resizes raw camera frames.",
     )
     p.add_argument("--runtime-save-dir", type=str, default="runtime_save", help="Where to dump runtime tensors")
     p.add_argument(
@@ -462,6 +463,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Predicted VLM .om artifact path recorded in the manifest (default: <onnx-basename>.om).",
     )
     p.add_argument("--skip-om-manifest", action="store_true", help="Do not write/update config.om.json.")
+    p.add_argument(
+        "--fast-gelu",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use Ascend NPUFastGelu for gelu_pytorch_tanh during NPU export (default: False). "
+        "This is faster but not numerically identical to PyTorch tanh GELU.",
+    )
     p.add_argument("--log-level", type=str, default="INFO", help="Logging level")
     p.add_argument("--local-files-only", action="store_true", default=True, help="Load policy without network")
     return p
@@ -516,7 +524,6 @@ def main() -> int:
     for cam_key, (ch, cw) in cameras.items():
         LOGGER.info("  %s : %dx%d", cam_key, ch, cw)
 
-    # 允许用户通过 --image-resolution H W 统一覆盖所有相机分辨率
     if args.image_resolution is not None:
         override_h, override_w = args.image_resolution
         LOGGER.info(
@@ -525,6 +532,17 @@ def main() -> int:
             override_w,
         )
         cameras = {k: (override_h, override_w) for k in cameras}
+    else:
+        # Keep image resize out of the Ascend OM graph. ATC's Resize output is
+        # close in isolation but gets amplified by the VLM into large KV drift.
+        target_h, target_w = policy.config.image_resolution
+        if any((h, w) != (target_h, target_w) for h, w in cameras.values()):
+            LOGGER.info(
+                "Using config.image_resolution %dx%d for VLM inputs; raw camera frames are resized on host",
+                target_h,
+                target_w,
+            )
+        cameras = {k: (int(target_h), int(target_w)) for k in cameras}
 
     observation = _prepare_base_tensors(
         device, int(args.batch_size), int(args.lang_tokens_len), int(args.seed), cameras
@@ -552,6 +570,7 @@ def main() -> int:
         dynamo=bool(args.dynamo),
         constant_folding=bool(args.constant_folding),
         use_npu_ops=use_npu_ops,
+        fast_gelu=bool(args.fast_gelu),
     )
     LOGGER.info("ONNX export finished")
 

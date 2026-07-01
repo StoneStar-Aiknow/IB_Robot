@@ -15,6 +15,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from inference_service.pi05_image_preprocess import resize_with_pad_nchw_numpy
+
 try:
     import acl
 except ImportError:  # pragma: no cover - only available on Ascend runtime hosts
@@ -327,6 +329,27 @@ class PI05OMModel:
                 raise ValueError(f"Buffer size mismatch at index {i}: VLM output={vlm_size}, AE input={ae_size}")
         logger("Buffer size validation passed")
 
+    def _prepare_vlm_images(self, images: list[np.ndarray]) -> list[np.ndarray]:
+        """Match host image tensors to the VLM OM image input descriptors."""
+        prepared: list[np.ndarray] = []
+        for i, image in enumerate(images):
+            arr = np.ascontiguousarray(image, dtype=np.float32)
+            try:
+                dims = acl.mdl.get_input_dims(self.vlm_model_desc, i)[0]["dims"]
+            except Exception as exc:
+                raise RuntimeError(f"Failed to query VLM image input[{i}] dims: {exc}") from exc
+
+            if len(dims) >= 4:
+                target_hw = (int(dims[-2]), int(dims[-1]))
+                if tuple(arr.shape[-2:]) != target_hw:
+                    original_shape = arr.shape
+                    arr = resize_with_pad_nchw_numpy(arr, *target_hw)
+                    if _DEBUG:
+                        logger(f"  resized image[{i}] {original_shape} -> {arr.shape} for VLM input descriptor")
+
+            prepared.append(arr)
+        return prepared
+
     def _ensure_context(self) -> None:
         """Bind this model's ACL context to the current thread on first use.
 
@@ -360,7 +383,8 @@ class PI05OMModel:
                     顺序必须与 VLM ONNX/OM 的输入顺序一致.
             tokens: 语言 token IDs [B, seq_len], int64
             masks: 注意力 mask [B, seq_len], bool
-            prefix_att_2d_masks_4d: (B, 1, S, S) fp32 additive mask.
+            prefix_att_2d_masks_4d: (B, 1, S, S) additive mask. It is cast
+                to the dtype declared by the VLM OM input descriptor.
             noise: 可选的初始噪声 [B, chunk_size, max_action_dim].
                    不传则随机生成.
 
@@ -369,6 +393,7 @@ class PI05OMModel:
         """
         batch_size = tokens.shape[0]
         self._ensure_context()
+        images = self._prepare_vlm_images(images)
         if _DEBUG:
             logger(f"--- forward() begin (batch_size={batch_size}) ---")
             logger(
@@ -390,8 +415,11 @@ class PI05OMModel:
 
         # === Step 1: VLM H2D 传输 ===
         # VLM inputs (Plan A order): [image_0, ..., tokens, masks, prefix_att_2d_masks_4d]
-        prefix_mask_fp32 = np.ascontiguousarray(prefix_att_2d_masks_4d, dtype=np.float32)
-        vlm_inputs = [*images, tokens, masks, prefix_mask_fp32]
+        prefix_input_idx = len(self.vlm_input_data) - 1
+        prefix_dtype_code = acl.mdl.get_input_data_type(self.vlm_model_desc, prefix_input_idx)
+        prefix_dtype = _ACL_DTYPE_TO_NP.get(prefix_dtype_code, np.float32)
+        prefix_mask = np.ascontiguousarray(prefix_att_2d_masks_4d, dtype=prefix_dtype)
+        vlm_inputs = [*images, tokens, masks, prefix_mask]
 
         if _DUMP_VLM_DIR is not None and not getattr(self, "_vlm_in_dumped", False):
             try:
@@ -402,7 +430,7 @@ class PI05OMModel:
                 np.save(os.path.join(_DUMP_VLM_DIR, "vlm_in_lang_masks.npy"), masks)
                 np.save(
                     os.path.join(_DUMP_VLM_DIR, "vlm_in_prefix_mask_4d.npy"),
-                    prefix_mask_fp32,
+                    prefix_mask,
                 )
                 self._vlm_in_dumped = True
                 logger(

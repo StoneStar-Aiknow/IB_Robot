@@ -77,6 +77,8 @@ def dump(
 ) -> None:
     """Run PT VLM on one batch and save outputs as .npy."""
     # Lazy imports — these pull in heavy deps (transformers, etc.)
+    from lerobot.configs.policies import PreTrainedConfig
+
     from model_utils.pi05_export.modeling_pi05_vlm import PI05VLMPolicy
     from model_utils.pi05_export.verify_pi05_split_equivalence import (
         load_real_batches_raw,
@@ -89,7 +91,10 @@ def dump(
 
     device = torch.device(device_str)
     LOGGER.info("Loading PI05VLMPolicy from %s on %s …", policy_path, device)
-    policy = PI05VLMPolicy.from_pretrained(policy_path, local_files_only=False, strict=False)
+    config = PreTrainedConfig.from_pretrained(pretrained_name_or_path=policy_path, local_files_only=False)
+    if hasattr(config, "device"):
+        config.device = device_str
+    policy = PI05VLMPolicy.from_pretrained(policy_path, config=config, local_files_only=False, strict=False)
     policy.to(device)
 
     # Optional dtype cast — defaults to whatever the checkpoint provides

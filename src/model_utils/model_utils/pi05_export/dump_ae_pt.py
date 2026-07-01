@@ -81,6 +81,8 @@ def dump(
     with PI05OMModel's per-step dump (set ``PI05_OM_DUMP_AE`` on the NPU
     side).
     """
+    from lerobot.configs.policies import PreTrainedConfig
+
     from model_utils.pi05_export.modeling_pi05_action_expert import (
         PI05ActionExpertPolicy,
     )
@@ -91,8 +93,12 @@ def dump(
     device = torch.device(device_str)
 
     LOGGER.info("Loading PI05ActionExpertPolicy from %s …", policy_path)
+    config = PreTrainedConfig.from_pretrained(pretrained_name_or_path=policy_path, local_files_only=False)
+    if hasattr(config, "device"):
+        config.device = device_str
     policy = PI05ActionExpertPolicy.from_pretrained(
         policy_path,
+        config=config,
         local_files_only=False,
         strict=False,
     )

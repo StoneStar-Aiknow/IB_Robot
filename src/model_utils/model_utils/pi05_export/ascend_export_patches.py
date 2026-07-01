@@ -1755,7 +1755,11 @@ _PATCH_REGISTRY: list[tuple[str, Any]] = [
 
 
 def _build_patch_registry(
-    use_npu_ops: bool, *, fp16_softmax: bool = False, mqa_broadcast: bool = False
+    use_npu_ops: bool,
+    *,
+    fp16_softmax: bool = False,
+    mqa_broadcast: bool = False,
+    fast_gelu: bool = False,
 ) -> list[tuple[str, Any]]:
     """Return the active patch registry for the requested export mode.
 
@@ -1769,6 +1773,10 @@ def _build_patch_registry(
     ``fp16_softmax`` / ``mqa_broadcast`` are action-expert-only attention
     optimisations threaded into :func:`_patch_gemma_eager_attention`; they
     default off so the VLM export (host-side fp32 prefix mask) is unchanged.
+
+    ``fast_gelu`` routes gelu_pytorch_tanh through Ascend NPUFastGelu.  It is
+    faster but numerically different from the tanh GELU used by PyTorch, so it
+    defaults off and must be enabled explicitly after end-to-end validation.
     """
     rope_patch = (
         ("apply_rotary_pos_emb (torch_npu.npu_rotary_mul)", _patch_gemma_rotary_pos_emb_npu)
@@ -1825,7 +1833,7 @@ def _build_patch_registry(
         # disabled on 310P (see above), so qkv fusion has no upside here.
         # ("fused qkv projection", _patch_gemma_fused_qkv),
     ]
-    if use_npu_ops:
+    if use_npu_ops and fast_gelu:
         registry.append(("gelu_pytorch_tanh (torch_npu.fast_gelu -> NPUFastGelu)", _patch_pytorch_gelu_tanh_npu))
     return registry
 
@@ -1836,7 +1844,13 @@ def _build_patch_registry(
 
 
 @contextmanager
-def ascend_onnx_export_patches(use_npu_ops: bool = False, *, fp16_softmax: bool = False, mqa_broadcast: bool = False):
+def ascend_onnx_export_patches(
+    use_npu_ops: bool = False,
+    *,
+    fp16_softmax: bool = False,
+    mqa_broadcast: bool = False,
+    fast_gelu: bool = False,
+):
     """Context manager that applies **all** registered Ascend patches.
 
     Patches are applied on ``__enter__`` and reverted on ``__exit__``,
@@ -1854,6 +1868,8 @@ def ascend_onnx_export_patches(use_npu_ops: bool = False, *, fp16_softmax: bool 
             additive mask sentinel.  Leave ``False`` for the VLM export.
         mqa_broadcast: Action-expert only.  Skip the ``repeat_kv`` Expand for
             multi-query layers and rely on matmul broadcasting instead.
+        fast_gelu: Route gelu_pytorch_tanh to NPUFastGelu. Disabled by default
+            because it is an approximation and can degrade PI05 action accuracy.
 
     Example::
 
@@ -1863,7 +1879,12 @@ def ascend_onnx_export_patches(use_npu_ops: bool = False, *, fp16_softmax: bool 
     all_undo: list[tuple[Any, str, Any]] = []
     applied: list[str] = []
 
-    for label, patch_fn in _build_patch_registry(use_npu_ops, fp16_softmax=fp16_softmax, mqa_broadcast=mqa_broadcast):
+    for label, patch_fn in _build_patch_registry(
+        use_npu_ops,
+        fp16_softmax=fp16_softmax,
+        mqa_broadcast=mqa_broadcast,
+        fast_gelu=fast_gelu,
+    ):
         try:
             undo = patch_fn()
             all_undo.extend(undo)
