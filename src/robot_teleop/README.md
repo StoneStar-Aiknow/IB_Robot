@@ -2,15 +2,15 @@
 
 [English](./README.en.md) | 简体中文
 
-`robot_teleop` 是 IB-Robot 的**人机遥操作子系统**，提供统一的设备抽象层，支持四种遥操作输入设备，并以 50 Hz 的控制频率将操作者意图映射为机器人关节/末端执行器命令。
+`robot_teleop` 是 IB-Robot 的**人机遥操作子系统**，提供统一的设备抽象层，并以 50 Hz 的控制频率将操作者意图映射为机器人关节/末端执行器命令。
 
 **核心特性:**
 - ✅ 零延迟控制 (端到端 < 5ms)
 - ✅ 基于工厂模式的设备抽象，支持运行时扩展
 - ✅ 具备关节限位裁剪的安全过滤层
 - ✅ 通过 `robot_config` YAML 驱动的全量配置
-- ✅ 支持示教臂、Xbox 手柄、VR 控制器、手机四类设备
-- ✅ Cartesian 模式设备通过 MoveIt2 Servo 实时驱动
+- ✅ 内置支持示教臂、Xbox 手柄、手机三类设备，可通过注册机制扩展新设备
+- ✅ Cartesian 模式设备通过 `placo_servo` 或 `moveit_servo` 后端实时驱动
 
 ---
 
@@ -23,7 +23,7 @@ graph TB
     subgraph Input["输入层 Input Layer"]
         LA["Leader Arm<br/>Feetech 串口"]
         XB["Xbox 手柄<br/>/joy topic"]
-        VR["VR Controller<br/>TCP JSON :8888"]
+        CUSTOM["Custom Device<br/>register_device()"]
         PH["Phone<br/>iOS HEBI / Android WebXR"]
     end
 
@@ -40,12 +40,12 @@ graph TB
         ARM["arm_command_topic<br/><small>default: /arm_position_controller/commands</small>"]
         GRIP["gripper_command_topic<br/><small>default: /gripper_position_controller/commands</small>"]
         DIAG["/diagnostics<br/><small>DiagnosticArray @ 1Hz</small>"]
-        SERVO["MoveIt2 Servo<br/><small>Cartesian 模式专用</small>"]
+        SERVO["Cartesian Backend<br/><small>placo_servo / moveit_servo</small>"]
     end
 
     LA --> Base
     XB --> Base
-    VR --> Base
+    CUSTOM -.-> Base
     PH --> Base
 
     Base --> Node
@@ -54,7 +54,6 @@ graph TB
     Filter --> GRIP
     Filter --> DIAG
     XB -.->|"Cartesian 模式"| SERVO
-    VR -.->|"差分位姿"| SERVO
     PH -.->|"差分位姿"| SERVO
 
     style Input fill:#e1f5ff
@@ -63,7 +62,24 @@ graph TB
     style Output fill:#e1ffe1
 ```
 
-> **设计关键**: Cartesian 模式设备（Xbox Cartesian、VR、Phone）直接驱动 MoveIt2 Servo，并在 `get_joint_targets()` 中**仅返回夹爪键**，TeleopNode 检测到手臂关节键缺失时自动跳过手臂发布，避免与 Servo 冲突。
+> **设计关键**: Cartesian 模式设备（Xbox Cartesian、Phone）通过 `robot_teleop.cartesian_backend` 驱动下游 Cartesian 后端，并在 `get_joint_targets()` 中**仅返回夹爪键**。TeleopNode 检测到手臂关节键缺失时自动跳过手臂发布，避免与 Cartesian 后端争用 `/arm_position_controller/commands`。
+
+### Cartesian 后端选择
+
+Cartesian 后端由 `robot_config` 的 SSOT YAML 配置，不在设备代码中硬编码：
+
+```yaml
+teleoperation:
+  cartesian:
+    solver: placo_servo  # placo_servo | moveit_servo
+```
+
+| Solver | 下游节点 | 适用场景 | 输出 |
+|---|---|---|---|
+| `placo_servo` | `so101_placo_servo_node.py` | SO101 Xbox/Phone Cartesian 遥操作 | Placo QP 微分 IK 输出位置命令；位置优先、姿态低权重跟随；命令侧 seed/reference 避免真机下垂棘轮 |
+| `moveit_servo` | MoveIt Servo `servo_node_main` | 通用 MoveIt Servo 对照/实验 | MoveIt Servo 内部求解并发布关节命令 |
+
+SO101 默认使用 `placo_servo`；MoveIt Servo 作为通用对照路径保留。
 
 ### 类继承关系图
 
@@ -92,20 +108,10 @@ classDiagram
     }
 
     class XboxTeleopDevice {
-        -servo_client: MoveIt2Servo
+        -_cartesian_backend: CartesianBackend
         -_latest_joy: Joy
         -_state_lock: Lock
         -_mode: str
-        +connect() bool
-        +get_joint_targets() Dict
-        +disconnect()
-    }
-
-    class VRControllerDevice {
-        -_server_sock: socket
-        -_calib_pos: ndarray
-        -_calib_rot_inv: Rotation
-        -_tcp_thread: Thread
         +connect() bool
         +get_joint_targets() Dict
         +disconnect()
@@ -122,12 +128,11 @@ classDiagram
 
     BaseTeleopDevice <|-- LeaderArmDevice : "继承"
     BaseTeleopDevice <|-- XboxTeleopDevice : "继承"
-    BaseTeleopDevice <|-- VRControllerDevice : "继承"
     BaseTeleopDevice <|-- PhoneDevice : "继承"
 
     LeaderArmDevice ..> FeetechMotorsBus : "串口通信"
     XboxTeleopDevice ..> Joy : "/joy topic"
-    VRControllerDevice ..> UnityXRSender : "TCP JSON"
+    XboxTeleopDevice ..> CartesianBackend : "Cartesian 模式"
     PhoneDevice ..> IOSPhone : "HEBI SDK"
     PhoneDevice ..> AndroidPhone : "WebXR WS"
 ```
@@ -142,7 +147,6 @@ classDiagram
 DEVICE_MAP = {
     "leader_arm":      LeaderArmDevice,
     "xbox_controller": XboxTeleopDevice,
-    "vr_controller":   VRControllerDevice,
     "phone":           PhoneDevice,
 }
 
@@ -244,14 +248,14 @@ def control_loop_callback(self):
 
 ### 2. XboxTeleopDevice — Xbox 手柄
 
-**文件**: `devices/xbox_controller.py` | **控制策略**: 增量积分 + MoveIt2 Servo
+**文件**: `devices/xbox_controller.py` | **控制策略**: 增量积分 + Cartesian backend
 
 **工作模式**:
 
 | 模式 | 触发 | 控制方式 | get_joint_targets() 返回 |
 |---|---|---|---|
 | 关节模式 (默认) | 上电 / LB 长按切换 | 摇杆轴 → 关节增量积分 | 6 轴关节目标 |
-| 笛卡尔模式 | LB 长按切换 | 摇杆轴 → MoveIt2 Servo TwistStamped | 仅夹爪键 |
+| 笛卡尔模式 | LB 长按切换 | 摇杆轴 → Cartesian backend (`placo_servo` / `moveit_servo`) | 仅夹爪键 |
 
 **按键映射**:
 
@@ -275,54 +279,9 @@ if (delta > 0 and lead < -0.01) or (delta < 0 and lead > 0.01):
 
 **引导限制**: 命令位置超前实际位置不得超过 ±0.5 rad，防止失控。
 
-### 3. VRControllerDevice — VR 控制器
+### 3. PhoneDevice — 手机遥操作
 
-**文件**: `devices/vr_controller.py` | **控制策略**: 差分 6-DoF 位姿 → MoveIt2 Servo
-
-**传输**: TCP 服务端，默认监听 `0.0.0.0:8888`，接受来自 Unity XR 伴侣应用的 JSON 数据包。
-
-**JSON 数据包格式**:
-```json
-{
-  "position":   [x, y, z],
-  "rotation":   [x, y, z, w],
-  "grip_value": 0.0,
-  "button_a":   false,
-  "button_b":   false,
-  "enabled":    true
-}
-```
-
-**坐标系转换**: Unity (Y-up, Z-toward-user) → ROS (Z-up, X-forward)，通过固定旋转矩阵 `_R_UNITY_TO_ROS` 实现。
-
-**标定流程** (阻塞在 `connect()` 中完成):
-1. 将 VR 控制器持于参考姿态
-2. 按下扳机键，记录 `_calib_pos` 和 `_calib_rot_inv`
-3. 后续所有位姿均为相对于标定参考姿态的增量
-
-**控制细节**:
-- 每个控制周期计算 delta 位置 + delta 旋转 (旋转向量形式)
-- 分别限幅至 `max_ee_step_m` 和 `max_angular_step_rad`
-- 扳机上升沿重新锚定，防止跳跃
-- 夹爪: button_a 关闭 (+vel)，button_b 打开 (-vel)，速度积分
-- 完全握紧 (`grip_value ≥ 1.0`) 触发 Go-Home 模式，所有关节在 0.05 rad 内稳定 0.5s 后重新启用 Servo
-
-**配置示例**:
-```yaml
-- name: "vr_ctrl"
-  type: "vr_controller"
-  host: "0.0.0.0"
-  port: 8888
-  max_ee_step_m: 0.05
-  max_angular_step_rad: 0.1
-  gripper_speed_factor: 20.0
-```
-
-**Unity 伴侣**: `unity_vr_client/Unity_XR_VR_Sender.cs`，50 Hz 发送，自动断线重连，内置 VR 内 UI 叠加层用于调试。
-
-### 4. PhoneDevice — 手机遥操作
-
-**文件**: `phone/phone_device.py` | **控制策略**: 差分 6-DoF 位姿 → MoveIt2 Servo
+**文件**: `phone/phone_device.py` | **控制策略**: 差分 6-DoF 位姿 → Cartesian backend
 
 支持两种后端，统一封装在 `PhoneDevice` 中：
 
@@ -331,9 +290,11 @@ if (delta > 0 and lead < -0.01) or (delta < 0 and lead > 0.01):
 | `IOSPhone` | iOS | HEBI Mobile I/O + ARKit | 按 B1 | 模拟滑块 `a3` | 按 `b2` |
 | `AndroidPhone` | Android | WebXR + WebSocket | 触屏移动事件 | `reservedButtonA/B` | 两键同按 |
 
-**控制流程** (与 VRControllerDevice 相同):
-- 相机偏移补正 → 差分位姿 → MoveIt2 Servo → 限幅 → 发送
-- Go-Home → 关节位置控制 → 关节误差 < 0.05 rad 稳定后重新启用 Servo
+**控制流程**:
+- 相机偏移补正 → 差分位姿 → 限幅 → Cartesian backend → 发送
+- Phone 与 Xbox 共同遵守 backend 输入契约：linear 为 base-frame，angular 为 tool-frame；`placo_servo` / `moveit_servo` 在 backend 内转换 angular 到 base-frame
+- Phone 会读取 `control_params.cartesian_linear_speed/cartesian_angular_speed`，与 Xbox 共享 `teleoperation.cartesian.placo_servo` 注入的速度配置
+- Go-Home → 关节位置控制 → 关节误差 < 0.05 rad 稳定后重新启用 Cartesian 后端
 
 **关键参数** (`phone/config_phone.py`):
 
@@ -366,60 +327,6 @@ if (delta > 0 and lead < -0.01) or (delta < 0 and lead > 0.01):
 ---
 
 ## 快速上手 (Quick Start)
-
-### VR 控制器 (5 分钟)
-
-**前提**: Unity XR 头显与机器人在同一局域网，防火墙放行 TCP 8888。
-
-**1. 配置 robot_config YAML**
-
-```yaml
-robot:
-  teleoperation:
-    enabled: true
-    active_device: "vr_ctrl"
-    devices:
-      - name: "vr_ctrl"
-        type: "vr_controller"
-        host: "0.0.0.0"
-        port: 8888
-        max_ee_step_m: 0.05
-        max_angular_step_rad: 0.1
-        gripper_speed_factor: 20.0
-```
-
-**2. 启动遥操作节点**
-
-```bash
-ros2 launch robot_config robot.launch.py \
-    robot_config:=<your_robot> \
-    control_mode:=teleop \
-    use_sim:=false
-```
-
-**3. 在 Unity 中填写机器人 IP 和端口**
-
-打开 `Unity_XR_VR_Sender.cs` Inspector，设置 `Host` 为机器人 IP，`Port` 为 `8888`，进入 Play 模式。
-
-**4. 标定控制器**
-
-节点启动后会阻塞等待标定：
-1. 将 VR 手柄置于自然参考姿态（手臂自然下垂）
-2. **按下扳机键**，听到标定完成提示后松开
-3. 之后手柄的所有位移/旋转均相对于该基准姿态
-
-**5. 开始操作**
-
-| 动作 | 效果 |
-|---|---|
-| 移动手柄 | 末端执行器跟随移动 |
-| 旋转手柄 | 末端执行器跟随旋转 |
-| button_a | 夹爪关闭 |
-| button_b | 夹爪打开 |
-| 完全握紧扳机 (`grip_value ≥ 1.0`) | Go-Home（机械臂归零位） |
-| 松开扳机后扳机上升沿 | 重新锚定当前位姿（防跳跃） |
-
----
 
 ### 手机遥操作 (5 分钟)
 
@@ -490,9 +397,9 @@ ros2 launch robot_config robot.launch.py \
 ros2 control list_controllers
 # 期望: arm_position_controller[active], gripper_position_controller[active]
 
-# 2. 确认 MoveIt2 Servo 正在运行（VR/Phone 必须）
-ros2 service list | grep servo
-# 期望: /servo_node/switch_command_type 等服务存在
+# 2. 确认 Placo Cartesian 后端正在运行（Xbox Cartesian / Phone 必须）
+ros2 service list | grep so101_placo_servo_node
+# /so101_placo_servo_node/start 与 /so101_placo_servo_node/stop
 
 # 3. 监控控制诊断
 ros2 topic echo /diagnostics
@@ -503,7 +410,7 @@ ros2 topic echo /diagnostics
 
 1. **首次启动时**保持手动急停准备，确认末端执行器响应方向正确
 2. **标定姿态**应与实际操作起点接近，避免大幅跳跃
-3. VR/Phone **最大步长**（`max_ee_step_m: 0.05`）是安全上限，建议首次调试设置为 `0.02`
+3. Phone **最大步长**（`max_ee_step_m: 0.05`）是安全上限，建议首次调试设置为 `0.02`
 4. 操作时保持手柄/手机运动**平滑缓慢**，急剧抖动会被限幅截断
 5. 遇到异常立即发布急停: `ros2 topic pub /emergency_stop sensor_msgs/msg/JointState '{}'`
 
@@ -592,7 +499,7 @@ robot:
 
     devices:
       - name: string          # 唯一设备名称
-        type: string          # leader_arm | xbox_controller | vr_controller | phone
+        type: string          # 内置: leader_arm | xbox_controller | phone；扩展类型需注册
         target:               # 可选：覆盖该设备控制的关节组和输出话题
           arm_joint_names: string[]
           gripper_joint_names: string[]
@@ -638,17 +545,12 @@ robot:
     gripper_jog_speed: 8.0
 ```
 
-#### vr_controller
+#### custom device
 
 ```yaml
-- name: "vr_ctrl"
-  type: "vr_controller"
-  host: "0.0.0.0"
-  port: 8888
-  max_ee_step_m: 0.05
-  max_angular_step_rad: 0.1
-  gripper_speed_factor: 20.0
-  gripper_range: [0.0, 1.0]
+- name: "custom_cartesian_device"
+  type: "custom_device"  # 先通过 device_factory.register_device() 注册
+  # 自定义设备可在实现中接入选定 Cartesian backend。
 ```
 
 #### phone
@@ -695,7 +597,7 @@ robot:
 | 端到端延迟 (设备读取 → 话题发布) | < 5ms |
 | 串口通信 (LeaderArm) | < 2ms/周期 |
 | 安全过滤 | < 0.5ms/周期 |
-| TCP 接收延迟 (VR/Phone) | < 1ms/周期 |
+| TCP/WebSocket 接收延迟 (Phone/自定义设备) | < 1ms/周期 |
 
 ---
 
@@ -736,25 +638,6 @@ sudo chmod 666 /dev/ttyACM1
 sudo usermod -a -G dialout $USER
 ```
 
-**VR 控制器无法连接**
-1. 确认 Unity `Unity_XR_VR_Sender.cs` 中 IP 和端口与配置一致 (默认 8888)
-2. 检查防火墙是否放行 TCP 8888 端口
-3. 确认机器人与 VR 头显在同一网段
-4. 在机器人端运行 `ss -tlnp | grep 8888` 确认端口已监听
-5. 在头显端运行 `ping <robot_ip>` 确认网络可达
-
-**VR 标定后末端大幅跳跃**
-- 原因: 标定时手柄姿态与操作起始姿态差异过大
-- 解决: 重新标定（完全握紧扳机触发 Go-Home，关节归零稳定后再触发扳机上升沿重新锚定）
-- 临时: 降低 `max_ee_step_m` 至 `0.01` 限制每帧移动幅度
-
-**VR 控制延迟或卡顿**
-```bash
-# 监控控制循环延迟
-ros2 topic echo /diagnostics | grep loop_time
-# loop_time_ms > 5ms 说明节点负载过高，检查同机其他进程
-```
-
 **手机 (iOS) 无法连接 HEBI**
 1. 确认 HEBI Mobile I/O App 已登录且家庭组与机器人匹配
 2. 检查 `phone_os: "ios"` 配置正确
@@ -766,12 +649,12 @@ ros2 topic echo /diagnostics | grep loop_time
 3. 确认 WebSocket 端口未被防火墙拦截
 4. 在 Chrome DevTools Console 查看 WebXR 错误日志
 
-**末端执行器不跟随手机/VR 移动（Servo 无响应）**
+**末端执行器不跟随手机移动（Cartesian 后端无响应）**
 ```bash
-# 确认 MoveIt2 Servo 已启动
-ros2 service list | grep servo
-# 手动激活 Servo
-ros2 service call /servo_node/start_servo std_srvs/srv/Trigger
+# 确认后端服务已启动
+ros2 service list | grep so101_placo_servo_node
+# 可手动激活 Placo Servo
+ros2 service call /so101_placo_servo_node/start std_srvs/srv/Trigger
 ```
 
 **夹爪不响应**
@@ -803,14 +686,11 @@ src/robot_teleop/
 │   ├── devices/
 │   │   ├── __init__.py
 │   │   ├── leader_arm.py         # SO-101 示教臂 (Feetech 串口)
-│   │   ├── vr_controller.py      # VR 控制器 (TCP JSON)
 │   │   └── xbox_controller.py    # Xbox 手柄 (/joy topic)
 │   └── phone/
 │       ├── __init__.py
 │       ├── config_phone.py       # 手机设备配置数据类
 │       └── phone_device.py       # iOS/Android 手机遥操作
-├── unity_vr_client/
-│   └── Unity_XR_VR_Sender.cs    # Unity XR 伴侣应用 (C#)
 ├── launch/
 │   └── teleop_device.launch.py  # 独立测试启动文件
 ├── package.xml

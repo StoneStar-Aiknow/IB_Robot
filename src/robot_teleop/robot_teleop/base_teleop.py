@@ -8,7 +8,6 @@ TeleopNode can work with any device implementing this interface.
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Dict
 
 
 class BaseTeleopDevice(ABC):
@@ -77,7 +76,7 @@ class BaseTeleopDevice(ABC):
         pass
 
     @abstractmethod
-    def get_joint_targets(self) -> Dict[str, float]:
+    def get_joint_targets(self) -> dict[str, float]:
         """
         Read current joint targets from the teleoperation device.
 
@@ -88,7 +87,7 @@ class BaseTeleopDevice(ABC):
 
         Device-specific behaviour:
         - Leader Arm: Direct joint mapping from serial readings (returns all joints)
-        - Phone: Drives MoveIt Servo for arm Cartesian control; returns only
+        - Phone: Drives the selected Cartesian backend for arm control; returns only
           gripper target (arm keys absent → TeleopNode skips arm publisher)
 
         Returns:

@@ -507,6 +507,7 @@ def launch_setup(context, *args, **kwargs):
             tf_nodes = generate_tf_nodes(robot_config, use_sim)
             actions.extend(tf_nodes)
             logger.info(f"Added {len(tf_nodes)} TF nodes")
+
         except Exception as e:
             logger.error(f"generating perception nodes: {e}")
             raise
@@ -630,7 +631,18 @@ def launch_setup(context, *args, **kwargs):
         if with_moveit:
             from robot_config.launch_builders.moveit import generate_moveit_nodes
 
-            moveit_nodes = generate_moveit_nodes(robot_config, active_control_mode, node_use_sim_time, moveit_display)
+            moveit_nodes = generate_moveit_nodes(
+                robot_config,
+                active_control_mode,
+                node_use_sim_time,
+                moveit_display,
+                # Force MoveIt launch when the user explicitly set
+                # with_moveit:=true. Without this,
+                # with_moveit:=true + control_mode=teleop would call
+                # generate_moveit_nodes(force=False) which tests
+                # 'moveit' in 'teleop' → False → returns [], starting nothing.
+                force=parse_bool(with_moveit_str, default=False),
+            )
 
             if controller_ready_waiter is not None:
                 logger.info("Deferring MoveIt nodes until required controllers are active...")

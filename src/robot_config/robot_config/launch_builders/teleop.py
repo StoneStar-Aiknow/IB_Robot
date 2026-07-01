@@ -172,6 +172,37 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
         if moveit_key in device_config:
             device_param[moveit_key] = device_config[moveit_key]
 
+    # ----- Cartesian solver selection -----
+    # Cartesian solver selection lives in robot.teleoperation.cartesian.solver.
+    # The default tool frame follows robot.moveit.ee_link so arm/gripper and
+    # arm_tcp/tcp remain a single MoveIt-owned SSOT; cartesian.tool_frame is
+    # only an explicit override.
+    cart_cfg = teleop_config.get("cartesian", {}) or {}
+    cart_solver = cart_cfg.get("solver", "placo_servo")
+    if cart_solver not in ("moveit_servo", "placo_servo"):
+        raise ValueError(f"teleoperation.cartesian.solver must be 'moveit_servo' or 'placo_servo', got {cart_solver!r}")
+    moveit_cfg = robot_config.get("moveit", {}) or {}
+    cart_tool_frame = (
+        cart_cfg.get("tool_frame") or device_config.get("ee_frame_name") or moveit_cfg.get("ee_link") or "gripper"
+    )
+    _validate_tool_frame(cart_tool_frame, robot_config)
+    device_param["cartesian_solver"] = cart_solver
+    device_param["tool_frame"] = cart_tool_frame
+    device_param["base_link_name"] = device_param.get("base_link_name", moveit_cfg.get("base_link", "base"))
+
+    if cart_solver == "placo_servo":
+        placo_cfg = cart_cfg.get("placo_servo", {}) or {}
+        placo_linear_speed = placo_cfg.get("linear_speed", 0.3)
+        placo_angular_speed = placo_cfg.get("angular_speed", 0.7)
+        cp = device_param.setdefault("control_params", {})
+        cp["cartesian_linear_speed"] = placo_linear_speed
+        cp["cartesian_angular_speed"] = placo_angular_speed
+        logger.info(
+            f"placo_servo speed override: linear={placo_linear_speed} (0~1), angular={placo_angular_speed} (0~1)"
+        )
+
+    logger.info(f"Cartesian solver={cart_solver}, tool_frame={cart_tool_frame}")
+
     device_type = device_config.get("type", "")
 
     control_frequency = device_config.get("control_frequency", 50.0)
@@ -256,11 +287,16 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
         nodes.append(joy_node)
         logger.info(f"Added joy_node for input device: {input_dev}")
 
-    # Add MoveIt Servo node for Xbox controller and phone (both use Cartesian Servo control)
+    # Add the selected Cartesian backend node for Xbox controller and phone.
     if device_config.get("type") in ("xbox_controller", "phone"):
-        servo_node = _create_servo_node(robot_config, device_config, robot_description_dict)
-        nodes.append(servo_node)
-        logger.info("Generated servo_node for Cartesian control")
+        if cart_solver == "moveit_servo":
+            servo_node = _create_servo_node(robot_config, device_config, robot_description_dict)
+            nodes.append(servo_node)
+            logger.info("Generated servo_node for Cartesian servo (MoveIt Servo) control")
+        elif cart_solver == "placo_servo":
+            placo_node = _create_so101_placo_servo_node(robot_config, device_config, robot_description_dict)
+            nodes.append(placo_node)
+            logger.info("Generated so101_placo_servo_node for SO101 Placo QP Cartesian control")
 
     return nodes
 
@@ -370,6 +406,95 @@ def _create_servo_node(robot_config: dict, device_config: dict, robot_descriptio
         ],
     )
     return servo_node
+
+
+# ---------------------------------------------------------------------------
+# Cartesian helpers: tool_frame validation + placo_servo launcher
+# ---------------------------------------------------------------------------
+
+
+class ConfigError(ValueError):
+    """Raised when the SSOT YAML is internally inconsistent."""
+
+
+def _validate_tool_frame(tool_frame: str, robot_config: dict) -> None:
+    """Confirm ``tool_frame`` resolves at launch time.
+
+    Accepts the configured ``base_link`` / ``ee_link`` and otherwise lets URDF
+    links through to runtime TF validation. Launch-time code does not enumerate
+    URDF links, so the Servo node is the final authority for custom link names.
+    """
+    if not tool_frame:
+        raise ConfigError("tool_frame is empty")
+    moveit_cfg = robot_config.get("moveit", {}) or {}
+    base_link = moveit_cfg.get("base_link", "base")
+    if tool_frame == base_link:
+        return
+    if tool_frame == moveit_cfg.get("ee_link"):
+        return
+    # Assume the user supplied a URDF link name; runtime TF will validate it
+    # and the Servo node will fail fast if the link does not exist.
+    logger.warning(
+        f"tool_frame={tool_frame!r} is neither base_link nor ee_link; "
+        f"assuming it is a URDF link. Runtime TF will validate."
+    )
+
+
+def _create_so101_placo_servo_node(
+    robot_config: dict,
+    device_config: dict,  # noqa: ARG001 — kept for signature parity with siblings
+    robot_description_dict: dict = None,
+) -> Node:
+    """Launch ``so101_placo_servo_node``.
+
+    Loads the solver YAML from ``moveit.so101_placo_servo_config_path`` and
+    appends arm joint names from ``robot.joints.arm`` so the node knows the
+    controller output order.
+    """
+    import yaml as _yaml
+
+    moveit_cfg = robot_config.get("moveit", {}) or {}
+    yaml_ref = moveit_cfg.get("so101_placo_servo_config_path")
+    if not yaml_ref:
+        raise ConfigError(
+            "solver=placo_servo requires moveit.so101_placo_servo_config_path "
+            "(e.g. $(find robot_moveit)/config/so101_placo_servo.yaml)"
+        )
+    yaml_path = resolve_ros_path(yaml_ref)
+    with open(yaml_path) as f:
+        params = _yaml.safe_load(f) or {}
+
+    joints_cfg = robot_config.get("joints", {}) or {}
+    arm_joint_names = joints_cfg.get("arm", [])
+    if not arm_joint_names:
+        raise ConfigError(
+            "solver=placo_servo requires robot.joints.arm to list the arm "
+            "joint names (used to order the position command output)"
+        )
+    params["arm_joint_names"] = arm_joint_names
+
+    # Drop-in TCP support: the IK tip frame is the SSOT moveit.ee_link
+    # (gripper | tcp). Inject it so selecting tcp re-targets placo's frame
+    # task without editing the solver YAML. Defaults to the YAML value (gripper)
+    # when ee_link is absent, so the gripper path is byte-for-byte unchanged.
+    ee_link = moveit_cfg.get("ee_link")
+    if ee_link:
+        params["ik_link_name"] = ee_link
+
+    # The node expands the so101 xacro in-memory at runtime via the
+    # robot_description package share dir, so robot_description_dict is not
+    # required for kinematics; it is still forwarded for parity / use_sim_time.
+    extra = {}
+    if robot_description_dict:
+        extra.update(robot_description_dict)
+
+    return Node(
+        package="robot_moveit",
+        executable="so101_placo_servo_node.py",
+        name="so101_placo_servo_node",
+        output="screen",
+        parameters=[params, extra],
+    )
 
 
 def validate_teleop_config(teleop_config: dict[str, object]) -> list[str]:

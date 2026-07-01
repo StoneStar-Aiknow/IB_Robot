@@ -85,10 +85,9 @@ install_lerobot_editable() {
 
     check_lerobot_ros_numpy_compat
 
-    # [smolvla,pi] extras pull in transformers-dep + smolvla-specific deps
-    # (num2words, accelerate, safetensors) so PI05/SmolVLA policies load
-    # without manual pip installs. See libs/lerobot/pyproject.toml.
-    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot[smolvla,pi]"
+    # [smolvla,pi] extras pull in policy-specific deps; kinematics pulls in
+    # placo for SO-101 Placo Cartesian teleop. See libs/lerobot/pyproject.toml.
+    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot[smolvla,pi,kinematics]"
 }
 
 setup_python_venv() {
@@ -183,7 +182,7 @@ setup_python_venv() {
     # (rerun-sdk, opencv, datasets, etc.) resolves under numpy>=2. A hard constraint
     # causes pip to fail with resolution-too-deep. We allow numpy 2.x here, then force-reinstall 1.26.4 + opencv<4.12 at the end.
     if [[ -d "${lerobot_dir}" ]]; then
-        log_info "Installing LeRobot in editable mode..."
+        log_info "Installing LeRobot in editable mode with kinematics extra..."
         install_lerobot_editable "${VENV_PYTHON}" -m pip
     fi
 

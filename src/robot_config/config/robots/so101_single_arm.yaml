@@ -55,10 +55,18 @@ robot:
   # MoveIt configuration
   # ============================================
   moveit:
+    # End-effector selection for MoveIt and Cartesian teleop.
+    # Default keeps the upstream gripper-origin path:
+    #   arm_group_name: arm
+    #   ee_link: gripper
+    # To target the jaw-center TCP instead, switch both lines to:
+    #   arm_group_name: arm_tcp
+    #   ee_link: tcp
     arm_group_name: arm
     base_link: base
     ee_link: gripper
     shoulder_link: shoulder
+    so101_placo_servo_config_path: $(find robot_moveit)/config/so101_placo_servo.yaml
 
   # Control mode management
   default_control_mode: "model_inference"
@@ -609,6 +617,22 @@ robot:
   teleoperation:
     enabled: true
     active_device: "so101_leader" # You can switch between "so101_leader" and "xbox_controller" and "phone_teleop"
+
+    # Cartesian solver used when gamepad / phone is in cartesian mode.
+    # Options:
+    #   placo_servo  - SO-101 default, command-side Placo differential IK.
+    #   moveit_servo - MoveIt Servo comparison path. Simulation works; Humble
+    #                  real-hardware anti-drift handling is tracked separately.
+    cartesian:
+      solver: placo_servo
+      # tool_frame defaults to moveit.ee_link, so arm/gripper and arm_tcp/tcp
+      # remain a single SSOT. Set tool_frame only to override the angular
+      # velocity reference frame.
+      # Placo-only speed knobs, as fractions of the backend physical maximum.
+      placo_servo:
+        linear_speed: 0.17   # 0.0~1.0
+        angular_speed: 0.2   # 0.0~1.0
+
     devices:
       - name: "so101_leader"
         type: "leader_arm"
