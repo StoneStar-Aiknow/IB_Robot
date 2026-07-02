@@ -23,6 +23,9 @@
 | [oh-cross-build-ros-pkg](./oh-cross-build-ros-pkg) | 板端 | 为 OpenHarmony 板交叉编译移植第三方 ROS 2 包（如 usb_cam）。 |
 | [ohloha-build-pkg](./ohloha-build-pkg) | 板端 | 用 `tools_ohloha_pkgs` / `builder.sh` 交叉编译第三方包（bash、zsh、vim、ncurses 等）到 OpenHarmony 板端。 |
 | [oh-rebuild-kernel](./oh-rebuild-kernel) | 板端 | 重新编译并刷入 OpenHarmony 内核 (boot_linux.img)，启用 USB ACM 等驱动。 |
+| [deepwiki-config](./deepwiki-config) | 文档 | 根据 DeepWiki 目录结构生成 `deepwiki_processor.py` 所需的 `doc_config.json`。 |
+| [deepwiki-translator](./deepwiki-translator) | 文档 | 按 config-first 流程将 DeepWiki 英文 Markdown 翻译为中文文档。 |
+| [mermaid-syntax-validation](./mermaid-syntax-validation) | 文档 | 检查、修复并浏览器验证 Markdown/Sphinx Mermaid 图语法，确保发布 HTML
 | [atomgit-collaboration](./atomgit-collaboration) | AtomGit | 拦截泛化的 PR / Issue / review / comment 请求，并路由到具体 AtomGit skill。 |
 | [atomgit-pr](./atomgit-pr) | AtomGit | 管理 PR 生命周期：创建、读取上下文、更新标题/描述、生成摘要。 |
 | [atomgit-issue](./atomgit-issue) | AtomGit | 管理 Issue 生命周期：创建、读取详情、更新内容、关闭/重开。 |
@@ -56,6 +59,13 @@
 - **openEuler 容器验证 ([ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee))**: 在 openEuler Embedded aarch64 Docker 容器（qemu-user 模拟 chroot）中端到端验证 setup.sh + build.sh，以 root 用户模拟真实开发板操作环境。
 - **OH 交叉编译移植 ([oh-cross-build-ros-pkg](./oh-cross-build-ros-pkg))**: 将第三方 ROS 2 包（如 usb_cam）通过 Docker 交叉编译工具链移植到 OpenHarmony 板，覆盖克隆、编译、部署、板端验证和 launch 集成全流程。
 - **OH 内核重编 ([oh-rebuild-kernel](./oh-rebuild-kernel))**: 重新编译并刷入 OpenHarmony 板的 Linux 内核 (boot_linux.img)，用于启用 USB ACM（SO-101 机械臂）、游戏手柄等内核驱动。
+
+### 📚 DeepWiki 文档工具
+这些技能用于生成 DeepWiki 处理配置，并把 DeepWiki 输出文档本地化为中文。
+
+- **配置生成 ([deepwiki-config](./deepwiki-config))**: 从 DeepWiki 目录结构生成 `doc_config.json`，保持 `deepwiki_processor.py` 可识别的层级与标签。
+- **中文翻译 ([deepwiki-translator](./deepwiki-translator))**: 先本地化配置标题，再翻译 Markdown 页面，确保 H1、链接、文件名和处理器规则一致。
+- **Mermaid 语法验证 ([mermaid-syntax-validation](./mermaid-syntax-validation))**: 对 Markdown/Sphinx 文档中的 Mermaid 图执行语法风险扫描、最小修复、Sphinx 构建和浏览器端渲染验证。
 
 ### 🌐 AtomGit 自动化工具
 这些技能通过集成 AtomGit API，实现了 PR / Issue 生命周期和代码审查的自动化。

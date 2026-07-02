@@ -1,122 +1,226 @@
 {
     "id_to_label": {
         "1": "overview",
-        "2": "getting_started", "2.1": "environment_setup", "2.2": "building_the_project",
-        "3": "core_concepts", "3.1": "single_source_of_truth_pattern", "3.2": "contract_system", "3.3": "control_mode_architecture",
+        "2": "getting_started",
+        "2.1": "environment_setup",
+        "2.2": "building_the_project",
+        "3": "core_concepts",
+        "3.1": "single_source_of_truth_pattern",
+        "3.2": "contract_system",
+        "3.3": "control_mode_architecture",
         "4": "architecture",
-        "5": "configuration", "5.1": "robot_configuration_files", "5.2": "contract_definition", "5.3": "peripheral_configuration", "5.4": "launch_system", "5.5": "configuration_validation",
+        "5": "configuration",
+        "5.1": "robot_configuration_files",
+        "5.2": "contract_definition",
+        "5.3": "peripheral_configuration",
+        "5.4": "launch_system",
+        "5.5": "configuration_validation",
         "6": "protocol",
-        "7": "inference", "7.1": "inference_architecture", "7.2": "monolithic_execution_mode", "7.3": "distributed_execution_mode", "7.4": "policy_nodes",
-        "8": "action_dispatch", "8.1": "action_dispatcher_node", "8.2": "temporal_smoothing", "8.3": "topic_and_action_executors",
-        "9": "data_pipeline", "9.1": "teleoperation_and_data_collection", "9.2": "episode_recording", "9.3": "dataset_conversion_bag_to_lerobot", "9.4": "training_integration", "9.5": "deployment_feedback_loop",
-        "10": "motion_planning", "10.1": "moveitgateway_node", "10.2": "5dof_kinematic_constraints", "10.3": "moveit_launch_configuration",
-        "11": "hardware", "11.1": "ros2_control_configuration", "11.2": "hardware_plugins",
-        "12": "package_reference",
-        "13": "development", "13.1": "vs_code_configuration", "13.2": "build_system_and_mixins", "13.3": "debugging_and_testing"
+        "7": "inference",
+        "7.1": "inference_architecture",
+        "7.2": "monolithic_execution_mode",
+        "7.3": "distributed_execution_mode",
+        "7.4": "policy_nodes",
+        "7.5": "model_export_validation",
+        "7.6": "attention_visualization",
+        "8": "action_dispatch",
+        "8.1": "action_dispatcher_node",
+        "8.2": "temporal_smoothing",
+        "8.3": "topic_and_action_executors",
+        "9": "data_pipeline",
+        "9.1": "teleoperation_and_data_collection",
+        "9.2": "episode_recording",
+        "9.3": "dataset_conversion_bag_to_lerobot",
+        "9.4": "training_integration",
+        "9.5": "deployment_feedback_loop",
+        "9.6": "camera_tools",
+        "10": "motion_planning",
+        "10.1": "moveitgateway_node",
+        "10.2": "5dof_kinematic_constraints",
+        "10.3": "moveit_launch_configuration",
+        "10.4": "task_dispatch",
+        "11": "hardware",
+        "11.1": "ros2_control_configuration",
+        "11.2": "hardware_plugins",
+        "11.3": "simulation_backends",
+        "11.4": "lekiwi_mobile_manipulator",
+        "11.5": "navigation_stack",
+        "12": "extended_capabilities",
+        "12.1": "voice_asr_service",
+        "12.2": "social_control_ai_agent_integration",
+        "12.3": "performance_tracing",
+        "13": "package_reference",
+        "14": "development",
+        "14.1": "vs_code_configuration",
+        "14.2": "build_system_and_mixins",
+        "14.3": "debugging_and_testing",
+        "14.4": "atomgit_sdk_ci_automation",
+        "15": "glossary"
     },
     "title_to_label": {
-        "IB-Robot Overview": "overview", "Getting Started": "getting_started",
-        "Environment Setup": "environment_setup", "Building the Project": "building_the_project",
-        "Core Concepts": "core_concepts", "Single Source of Truth Pattern": "single_source_of_truth_pattern",
-        "Contract System": "contract_system", "Control Mode Architecture": "control_mode_architecture",
-        "System Architecture": "architecture", "Configuration System (robot_config)": "configuration",
-        "Robot Configuration Files": "robot_configuration_files", "Contract Definition": "contract_definition",
-        "Peripheral Configuration": "peripheral_configuration", "Launch System": "launch_system",
-        "Configuration Validation": "configuration_validation", "Protocol Conversion (tensormsg)": "protocol",
-        "Inference Pipeline": "inference", "Inference Architecture": "inference_architecture",
-        "Monolithic Execution Mode": "monolithic_execution_mode", "Distributed Execution Mode": "distributed_execution_mode",
-        "Policy Nodes": "policy_nodes", "Action Dispatch": "action_dispatch",
-        "Action Dispatcher Node": "action_dispatcher_node", "Temporal Smoothing": "temporal_smoothing",
-        "Topic and Action Executors": "topic_and_action_executors", "Data Pipeline": "data_pipeline",
-        "Teleoperation and Data Collection": "teleoperation_and_data_collection", "Episode Recording": "episode_recording",
-        "Dataset Conversion (bag_to_lerobot)": "dataset_conversion_bag_to_lerobot", "Training Integration": "training_integration",
-        "Deployment Feedback Loop": "deployment_feedback_loop", "Motion Planning (MoveIt)": "motion_planning",
-        "MoveItGateway Node": "moveitgateway_node", "5DOF Kinematic Constraints": "5dof_kinematic_constraints",
-        "MoveIt Launch Configuration": "moveit_launch_configuration", "Hardware Integration": "hardware",
-        "ros2_control Configuration": "ros2_control_configuration", "Hardware Plugins": "hardware_plugins",
-        "Package Reference": "package_reference", "Development Guide": "development",
-        "VS Code Configuration": "vs_code_configuration", "Build System and Mixins": "build_system_and_mixins",
-        "Debugging and Testing": "debugging_and_testing"
+        "IB-Robot Overview": "overview",
+        "Getting Started": "getting_started",
+        "Environment Setup": "environment_setup",
+        "Building the Project": "building_the_project",
+        "Core Concepts": "core_concepts",
+        "Single Source of Truth Pattern": "single_source_of_truth_pattern",
+        "Contract System": "contract_system",
+        "Control Mode Architecture": "control_mode_architecture",
+        "System Architecture": "architecture",
+        "Configuration System (robot_config)": "configuration",
+        "Robot Configuration Files": "robot_configuration_files",
+        "Contract Definition": "contract_definition",
+        "Peripheral Configuration": "peripheral_configuration",
+        "Launch System": "launch_system",
+        "Configuration Validation": "configuration_validation",
+        "Protocol Conversion (tensormsg)": "protocol",
+        "Inference Pipeline": "inference",
+        "Inference Architecture": "inference_architecture",
+        "Monolithic Execution Mode": "monolithic_execution_mode",
+        "Distributed Execution Mode": "distributed_execution_mode",
+        "Policy Nodes": "policy_nodes",
+        "Model Export and Validation (model_utils)": "model_export_validation",
+        "Attention Visualization (attention_viz)": "attention_visualization",
+        "Action Dispatch": "action_dispatch",
+        "Action Dispatcher Node": "action_dispatcher_node",
+        "Temporal Smoothing": "temporal_smoothing",
+        "Topic and Action Executors": "topic_and_action_executors",
+        "Data Pipeline": "data_pipeline",
+        "Teleoperation and Data Collection": "teleoperation_and_data_collection",
+        "Episode Recording": "episode_recording",
+        "Dataset Conversion (bag_to_lerobot)": "dataset_conversion_bag_to_lerobot",
+        "Training Integration": "training_integration",
+        "Deployment Feedback Loop": "deployment_feedback_loop",
+        "Camera Tools (Alignment and ISP Calibration)": "camera_tools",
+        "Motion Planning (MoveIt)": "motion_planning",
+        "MoveItGateway Node": "moveitgateway_node",
+        "5DOF Kinematic Constraints": "5dof_kinematic_constraints",
+        "MoveIt Launch Configuration": "moveit_launch_configuration",
+        "Task Dispatch (task_dispatch)": "task_dispatch",
+        "Hardware Integration": "hardware",
+        "ros2_control Configuration": "ros2_control_configuration",
+        "Hardware Plugins": "hardware_plugins",
+        "Simulation Backends": "simulation_backends",
+        "LeKiwi Mobile Manipulator": "lekiwi_mobile_manipulator",
+        "Navigation Stack (robot_navigation)": "navigation_stack",
+        "Extended Capabilities": "extended_capabilities",
+        "Voice ASR Service": "voice_asr_service",
+        "Social Control and AI Agent Integration": "social_control_ai_agent_integration",
+        "Performance Tracing": "performance_tracing",
+        "Package Reference": "package_reference",
+        "Development Guide": "development",
+        "VS Code Configuration": "vs_code_configuration",
+        "Build System and Mixins": "build_system_and_mixins",
+        "Debugging and Testing": "debugging_and_testing",
+        "AtomGit SDK and CI Automation": "atomgit_sdk_ci_automation",
+        "Glossary": "glossary"
     },
     "hierarchy": {
-        "overview.rst": {"title": "IB-Robot Overview"},
+        "overview.md": {
+            "title": "IB-Robot Overview"
+        },
         "getting_started": {
             "title": "Getting Started",
             "subs": {
-                "environment_setup.rst": "Environment Setup",
-                "building_the_project.rst": "Building the Project"
+                "environment_setup.md": "Environment Setup",
+                "building_the_project.md": "Building the Project"
             }
         },
         "core_concepts": {
             "title": "Core Concepts",
             "subs": {
-                "single_source_of_truth_pattern.rst": "Single Source of Truth Pattern",
-                "contract_system.rst": "Contract System",
-                "control_mode_architecture.rst": "Control Mode Architecture"
+                "single_source_of_truth_pattern.md": "Single Source of Truth Pattern",
+                "contract_system.md": "Contract System",
+                "control_mode_architecture.md": "Control Mode Architecture"
             }
         },
-        "architecture.rst": {"title": "System Architecture"},
+        "architecture.md": {
+            "title": "System Architecture"
+        },
         "configuration": {
             "title": "Configuration System (robot_config)",
             "subs": {
-                "robot_configuration_files.rst": "Robot Configuration Files",
-                "contract_definition.rst": "Contract Definition",
-                "peripheral_configuration.rst": "Peripheral Configuration",
-                "launch_system.rst": "Launch System",
-                "configuration_validation.rst": "Configuration Validation"
+                "robot_configuration_files.md": "Robot Configuration Files",
+                "contract_definition.md": "Contract Definition",
+                "peripheral_configuration.md": "Peripheral Configuration",
+                "launch_system.md": "Launch System",
+                "configuration_validation.md": "Configuration Validation"
             }
         },
-        "protocol.rst": {"title": "Protocol Conversion (tensormsg)"},
+        "protocol.md": {
+            "title": "Protocol Conversion (tensormsg)"
+        },
         "inference": {
             "title": "Inference Pipeline",
             "subs": {
-                "inference_architecture.rst": "Inference Architecture",
-                "monolithic_execution_mode.rst": "Monolithic Execution Mode",
-                "distributed_execution_mode.rst": "Distributed Execution Mode",
-                "policy_nodes.rst": "Policy Nodes"
+                "inference_architecture.md": "Inference Architecture",
+                "monolithic_execution_mode.md": "Monolithic Execution Mode",
+                "distributed_execution_mode.md": "Distributed Execution Mode",
+                "policy_nodes.md": "Policy Nodes",
+                "model_export_validation.md": "Model Export and Validation (model_utils)",
+                "attention_visualization.md": "Attention Visualization (attention_viz)"
             }
         },
         "action_dispatch": {
             "title": "Action Dispatch",
             "subs": {
-                "action_dispatcher_node.rst": "Action Dispatcher Node",
-                "temporal_smoothing.rst": "Temporal Smoothing",
-                "topic_and_action_executors.rst": "Topic and Action Executors"
+                "action_dispatcher_node.md": "Action Dispatcher Node",
+                "temporal_smoothing.md": "Temporal Smoothing",
+                "topic_and_action_executors.md": "Topic and Action Executors"
             }
         },
         "data_pipeline": {
             "title": "Data Pipeline",
             "subs": {
-                "teleoperation_and_data_collection.rst": "Teleoperation and Data Collection",
-                "episode_recording.rst": "Episode Recording",
-                "dataset_conversion_bag_to_lerobot.rst": "Dataset Conversion (bag_to_lerobot)",
-                "training_integration.rst": "Training Integration",
-                "deployment_feedback_loop.rst": "Deployment Feedback Loop"
+                "teleoperation_and_data_collection.md": "Teleoperation and Data Collection",
+                "episode_recording.md": "Episode Recording",
+                "dataset_conversion_bag_to_lerobot.md": "Dataset Conversion (bag_to_lerobot)",
+                "training_integration.md": "Training Integration",
+                "deployment_feedback_loop.md": "Deployment Feedback Loop",
+                "camera_tools.md": "Camera Tools (Alignment and ISP Calibration)"
             }
         },
         "motion_planning": {
             "title": "Motion Planning (MoveIt)",
             "subs": {
-                "moveitgateway_node.rst": "MoveItGateway Node",
-                "5dof_kinematic_constraints.rst": "5DOF Kinematic Constraints",
-                "moveit_launch_configuration.rst": "MoveIt Launch Configuration"
+                "moveitgateway_node.md": "MoveItGateway Node",
+                "5dof_kinematic_constraints.md": "5DOF Kinematic Constraints",
+                "moveit_launch_configuration.md": "MoveIt Launch Configuration",
+                "task_dispatch.md": "Task Dispatch (task_dispatch)"
             }
         },
         "hardware": {
             "title": "Hardware Integration",
             "subs": {
-                "ros2_control_configuration.rst": "ros2_control Configuration",
-                "hardware_plugins.rst": "Hardware Plugins"
+                "ros2_control_configuration.md": "ros2_control Configuration",
+                "hardware_plugins.md": "Hardware Plugins",
+                "simulation_backends.md": "Simulation Backends",
+                "lekiwi_mobile_manipulator.md": "LeKiwi Mobile Manipulator",
+                "navigation_stack.md": "Navigation Stack (robot_navigation)"
             }
         },
-        "package_reference.rst": {"title": "Package Reference"},
+        "extended_capabilities": {
+            "title": "Extended Capabilities",
+            "subs": {
+                "voice_asr_service.md": "Voice ASR Service",
+                "social_control_ai_agent_integration.md": "Social Control and AI Agent Integration",
+                "performance_tracing.md": "Performance Tracing"
+            }
+        },
+        "package_reference.md": {
+            "title": "Package Reference"
+        },
         "development": {
             "title": "Development Guide",
             "subs": {
-                "vs_code_configuration.rst": "VS Code Configuration",
-                "build_system_and_mixins.rst": "Build System and Mixins",
-                "debugging_and_testing.rst": "Debugging and Testing"
+                "vs_code_configuration.md": "VS Code Configuration",
+                "build_system_and_mixins.md": "Build System and Mixins",
+                "debugging_and_testing.md": "Debugging and Testing",
+                "atomgit_sdk_ci_automation.md": "AtomGit SDK and CI Automation"
             }
+        },
+        "glossary.md": {
+            "title": "Glossary"
         }
     }
 }

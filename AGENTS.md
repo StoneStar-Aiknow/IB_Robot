@@ -139,6 +139,14 @@ source .shrc_local
 | [ibrobot-docker-verify-oee](.agents/skills/ibrobot-docker-verify-oee) | openEuler aarch64 Docker 验证 |
 | [sync-github](.agents/skills/sync-github) | 同步 AtomGit master 到 GitHub |
 
+### 文档工具
+
+| 技能 | 触发场景 |
+|------|---------|
+| [deepwiki-config](.agents/skills/deepwiki-config) | 生成 DeepWiki `doc_config.json` 配置 |
+| [deepwiki-translator](.agents/skills/deepwiki-translator) | DeepWiki Markdown 中文翻译、配置标题本地化 |
+| [mermaid-syntax-validation](.agents/skills/mermaid-syntax-validation) | Mermaid 图语法检查、修复与渲染验证 |
+
 ### AtomGit 协作
 
 | 技能 | 触发场景 |

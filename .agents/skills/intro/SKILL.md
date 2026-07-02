@@ -50,6 +50,14 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | **ibrobot-docker-verify-oee** | 在 openEuler Embedded (aarch64) Docker 容器中端到端验证 setup.sh + build.sh |
 | **sync-github** | 将 AtomGit master 分支同步推送到 GitHub |
 
+### 📚 文档工具
+
+| Skill | 一句话描述 |
+| :--- | :--- |
+| **deepwiki-config** | 根据 DeepWiki 目录结构生成 `deepwiki_processor.py` 所需的 `doc_config.json` |
+| **deepwiki-translator** | 按 config-first 流程将 DeepWiki 英文 Markdown 翻译为中文文档 |
+| **mermaid-syntax-validation** | 检查、修复并验证 Markdown/Sphinx 文档中的 Mermaid 图语法 |
+
 ### 🔍 代码协作
 
 | Skill | 一句话描述 |
@@ -99,6 +107,9 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 Docker 验证一下 setup 和 build   → ibrobot-docker-verify
 验证 openEuler 构建              → ibrobot-docker-verify-oee
 同步到 GitHub                   → sync-github
+生成 DeepWiki 配置               → deepwiki-config
+翻译 DeepWiki 文档               → deepwiki-translator
+检查 Mermaid 图语法              → mermaid-syntax-validation
 检查架构合规性                  → atomgit-pr-architecture-review
 解释系统架构                    → ibrobot-architecture
 有哪些功能 / help / 入门       → intro (本技能)
