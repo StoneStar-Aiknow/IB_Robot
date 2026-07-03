@@ -52,7 +52,7 @@ import torch
 from diagnostic_msgs.msg import DiagnosticStatus, KeyValue
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.logging import LogLevel
+from rclpy.logging import LoggingSeverity
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
 from std_srvs.srv import Trigger
@@ -149,6 +149,7 @@ class _NodeConfig:
     attention_viz_topic: str = "/attention/weights"
     attention_interactive_masking: bool = False
     attention_mask_save_dir: str = "gui_interactions"
+    default_task: str = ""
 
 
 class LeRobotPolicyNode(Node):
@@ -287,7 +288,7 @@ class LeRobotPolicyNode(Node):
         # into obs_frame as the ``task`` key so lerobot's preprocessor pipeline
         # (PaliGemma tokenizer step) can produce
         # ``observation.language.tokens``/``attention_mask``.
-        self._default_task = str(robot_cfg.get("contract", {}).get("default_task", "")).strip()
+        self._default_task = self._config.default_task.strip()
         if self._default_task:
             self.get_logger().info(f"Default task prompt: {self._default_task!r}")
 
@@ -767,7 +768,7 @@ class LeRobotPolicyNode(Node):
                 action_np = result.action.detach().cpu().numpy() if torch.is_tensor(result.action) else result.action
                 action_rad = torch.from_numpy(self._lerobot_to_rad(action_np)).float()
 
-            if self.get_logger().is_enabled_for(LogLevel.DEBUG):
+            if self.get_logger().is_enabled_for(LoggingSeverity.DEBUG):
                 _state_arr = np.asarray(obs_frame.get("observation.state", np.zeros(6))).flatten()
                 _act_arr = action_rad.detach().cpu().numpy() if torch.is_tensor(action_rad) else np.asarray(action_rad)
                 _s = _state_arr[:6]

@@ -108,6 +108,7 @@ robot:
         # execution_mode: "distributed"
         model: so101_act
         action_server: /inference/dispatch
+        default_task: ""  # VLA policies (SmolVLA/PI05) require a task prompt
         publish_attention: false
         attention_viz_topic: /attention/weights
         attention_viz:

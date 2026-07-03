@@ -391,6 +391,15 @@ def launch_setup(context, *args, **kwargs):
         inf_cfg["execution_mode"] = execution_mode_override
         logger.info(f"CLI override: execution_mode={execution_mode_override}")
 
+    # CLI override for default_task (VLA policies)
+    default_task_override = context.launch_configurations.get("default_task", "")
+    if default_task_override:
+        control_modes = robot_config.get("control_modes", {})
+        mode_cfg = control_modes.get(active_control_mode, {})
+        inf_cfg = mode_cfg.get("inference", {})
+        inf_cfg["default_task"] = default_task_override
+        logger.info(f"CLI override: default_task={default_task_override!r}")
+
     # ========== 4. Generate Control System Nodes ==========
     logger.info("========== Generating Control Nodes ==========")
     deferred_sim_spawners = []
@@ -810,6 +819,11 @@ def generate_launch_description():
                 "execution_mode",
                 default_value="monolithic",
                 description="Override inference execution mode from YAML ('monolithic' or 'distributed'). If empty, uses value from robot config YAML.",
+            ),
+            DeclareLaunchArgument(
+                "default_task",
+                default_value="",
+                description="Override the language instruction for VLA policies (SmolVLA/PI05). If empty, uses inference.default_task from YAML.",
             ),
             DeclareLaunchArgument(
                 "with_moveit",
