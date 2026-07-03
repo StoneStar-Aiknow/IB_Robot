@@ -14,8 +14,10 @@ import math
 import os
 import signal
 import subprocess
+import tempfile
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -43,6 +45,12 @@ POINT_A_X = 1.0
 POINT_A_Y = 1.0
 POINT_B_X = -1.0
 POINT_B_Y = 1.0
+
+
+@dataclass
+class ManagedProcess:
+    proc: subprocess.Popen
+    log_file: object
 
 
 class NavigationProbe(Node):
@@ -170,7 +178,8 @@ def _get_odom_position(node: Node, topic="/odom", timeout=5.0):
     return odom.pose.pose.position
 
 
-def _terminate_process(proc: subprocess.Popen, timeout=15):
+def _terminate_process(managed: ManagedProcess, timeout=15):
+    proc = managed.proc
     with contextlib.suppress(ProcessLookupError):
         os.killpg(os.getpgid(proc.pid), signal.SIGINT)
     try:
@@ -179,16 +188,21 @@ def _terminate_process(proc: subprocess.Popen, timeout=15):
         with contextlib.suppress(ProcessLookupError):
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         proc.wait(timeout=5)
+    finally:
+        managed.log_file.close()
 
 
-def _start_process(cmd, env):
-    return subprocess.Popen(
+def _start_process(cmd, env, log_dir: Path, name: str):
+    # Keep the file open until the process exits so subprocess can stream logs.
+    log_file = open(log_dir / f"{name}.log", "w", encoding="utf-8")  # noqa: SIM115
+    proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
         env=env,
         preexec_fn=os.setsid,
     )
+    return ManagedProcess(proc=proc, log_file=log_file)
 
 
 @pytest.fixture(scope="module")
@@ -212,6 +226,8 @@ def gazebo_env():
     config_path = os.path.join(robot_config_share, "test", "config", "lekiwi_navi_sim.yaml")
     robot_launch = os.path.join(robot_config_share, "launch", "robot.launch.py")
     e2e_dir = Path(robot_config_share) / "test" / "e2e"
+    log_dir = Path(tempfile.mkdtemp(prefix="robot_config_nav_sim_"))
+    print(f"[robot_config] navigation simulation logs: {log_dir}")
 
     robot_proc = _start_process(
         [
@@ -228,6 +244,8 @@ def gazebo_env():
             "control_mode:=base_navigation",
         ],
         env,
+        log_dir,
+        "robot_launch",
     )
     odom_bridge_proc = _start_process(
         [
@@ -238,6 +256,8 @@ def gazebo_env():
             "/model/lekiwi/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry",
         ],
         env,
+        log_dir,
+        "odom_bridge",
     )
     gt_odom_proc = _start_process(
         [
@@ -250,8 +270,10 @@ def gazebo_env():
             f"spawn_y:={SPAWN_Y}",
         ],
         env,
+        log_dir,
+        "gt_odom_node",
     )
-    cmd_vel_relay_proc = _start_process(["python3", str(e2e_dir / "cmd_vel_relay.py")], env)
+    cmd_vel_relay_proc = _start_process(["python3", str(e2e_dir / "cmd_vel_relay.py")], env, log_dir, "cmd_vel_relay")
 
     probe = NavigationProbe()
     executor.add_node(probe)
