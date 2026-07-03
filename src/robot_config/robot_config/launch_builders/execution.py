@@ -49,6 +49,12 @@ def _resolve_inference_binding(model_config):
     if str(model_config.get("device", "")).strip().lower().replace("-", "_") != "rknn":
         return str(model_path), env
 
+    # Multi-module RKNN models (e.g. SmolVLA) use a config.rknn.json manifest
+    # to declare artifact paths; the runtime session resolves them at load time.
+    # Skip single-file lookup when a manifest is present.
+    if model_path.is_dir() and (model_path / "config.rknn.json").is_file():
+        return str(model_path), env
+
     rknn_candidates = []
     if model_path.is_file() and model_path.suffix == ".rknn":
         rknn_candidates.append(model_path)
@@ -263,6 +269,7 @@ def generate_monolithic_inference_node(robot_config, control_mode, use_sim=False
         "request_timeout": request_timeout,
         "cloud_inference_topic": cloud_inference_topic,
         "cloud_result_topic": cloud_result_topic,
+        "default_task": inference_config.get("default_task", ""),
     }
 
     inference_node = Node(
@@ -380,6 +387,7 @@ def generate_distributed_inference_nodes(
         "request_timeout": request_timeout,
         "cloud_inference_topic": cloud_inference_topic,
         "cloud_result_topic": cloud_result_topic,
+        "default_task": inference_config.get("default_task", ""),
     }
 
     edge_node = Node(
