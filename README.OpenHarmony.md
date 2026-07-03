@@ -81,7 +81,7 @@ RoboFrame 构建从感知、决策到执行的端到端闭环：
 │  Host (Ubuntu 22.04 x86_64)                             │
 │                                                         │
 │  Docker: voxelsky/ohos-ros-humble-builder:v0.1.5       │
-│    build_roboframe_oh.sh → 11 个 aarch64/musl 包   │
+│    build_roboframe_oh.sh → 13 个 aarch64/musl 包   │
 │  pack_roboframe_release.sh → roboframe-robopi-*.tar.gz  │
 │                                                         │
 │  ONNX ── rknn-toolkit2 ──► *.rknn (float16, NPU)        │
@@ -92,8 +92,8 @@ RoboFrame 构建从感知、决策到执行的端到端闭环：
 │  Board (RK3588, RoboOH 1.0.1, musl)                     │
 │                                                         │
 │  /data/roboframe/                                       │
-│    ├── install/     ← 11 个 RoboFrame ROS 包 + lerobot  │
-│    ├── pysite/      ← Python 依赖 (torch, numpy, ...)    │
+│    ├── install/     ← 13 个 RoboFrame ROS 包 + lerobot  │
+│    ├── pysite/      ← Python 依赖 (lerobot_deps 发布)    │
 │    └── scripts/robooh_1.0.1.env                         │
 │                                                         │
 │  /sys_prod/robot/out/   ← 系统 ROS + sysdeps (预装)     │
@@ -164,7 +164,7 @@ hdc -t <board-ip>:8710 shell 'cd /data && tar -zxpvf ohos-humble-build-*.tar.gz 
   - `ohos-sdk-18-linux-aarch64-*.tar.gz`（OHOS SDK）
   - `ohos-*-sysdeps-*.tar.gz`（系统依赖）
   - `ohos-humble-build-aarch64-*.tar.gz`（ROS 2 运行时）
-- [`thirdparty_pytorch`](https://gitcode.com/openharmony-robot/thirdparty_pytorch) 仓库的 `test/skh-run.tar.gz`（PyTorch + Python 依赖预编译包）
+- Python 依赖（pysite）由 [lerobot_deps](https://atomgit.com/openharmony-robot/lerobot_deps) 仓库发布，直接下载 release 包即可，无需手动构建
 
 ### 4.2 主机目录布局
 
@@ -189,16 +189,16 @@ export OH_ROOT="<your-oh-root>"
   --oh-root "$OH_ROOT"
 ```
 
-默认编译以下 11 个包（覆盖推理 + 控制 + 仿真全链路）：
+默认编译以下 13 个包（覆盖推理 + 控制 + 仿真全链路）：
 
 | 类别 | 包 |
 | --- | --- |
 | 消息 | `ibrobot_msgs` `tensormsg` |
-| 配置 | `robot_config` |
+| 配置 | `robot_config` `robot_description` |
 | 推理 | `inference_service` `dataset_tools` |
 | 控制 | `action_dispatch` `task_dispatch` `robot_moveit` |
 | 硬件 | `so101_hardware` `hardware_mock` |
-| 描述 | `robot_description` |
+| 其他 | `embodied_common` `voice_asr_service` |
 
 > 脚本自动处理：SDK 解压、sysdeps overlay（tinyxml2/openssl/libz 等 1200+ 库整体提取到 sysroot）、lerobot patch 应用、wrapper 脚本生成。如需增减包，用 `--packages pkg1,pkg2,...` 覆盖。
 
@@ -214,22 +214,41 @@ export OH_ROOT="<your-oh-root>"
 
 ```text
 roboframe-ohos/
-├── install/              # 11 个 ROS 包 + lerobot(patched) + wrapper 入口
-├── pysite/               # Python 依赖 (torch/numpy/PIL/draccus/... ~1GB)
-├── syslib/               # C 原生库 (libc++/libomp/libjpeg/libintl)
+├── install/              # 13 个 ROS 包 + lerobot(patched) + wrapper 入口
 ├── scripts/
-│   └── robooh_1.0.1.env  # 统一环境脚本
+│   ├── robooh_1.0.1.env  # 统一环境脚本 (PYTHONPATH / LD_PRELOAD)
+│   └── setup_sshd.sh     # SSH 服务配置脚本
 └── install.sh            # 一键部署
 ```
+
+> Python 依赖（pysite，含 torch/transformers/tokenizers/regex 等 ~200MB）由
+> [lerobot_deps](https://atomgit.com/openharmony-robot/lerobot_deps) 仓库独立发布，
+> 需单独下载部署。
 
 ### 4.5 部署到板端
 
 ```bash
+# 1. 下载 RoboFrame 发布包（install + scripts）
 scp roboframe-robopi-*.tar.gz root@<board-ip>:/data/local/tmp/
 ssh root@<board-ip> 'cd /data/local/tmp && tar xzf roboframe-robopi-*.tar.gz && cd roboframe-ohos && sh install.sh'
+
+# 2. 下载 Python 依赖包（pysite）并部署
+curl -L -o roboframe-deps.tar.gz \
+    https://atomgit.com/openharmony-robot/lerobot_deps/releases/download/v1.0.0/roboframe-deps-1.0.0-robopi-20260703.tar.gz
+scp roboframe-deps.tar.gz root@<board-ip>:/data/roboframe/
+ssh root@<board-ip> 'cd /data/roboframe && tar xzf roboframe-deps.tar.gz'
 ```
 
-`install.sh` 执行 4 步：复制 install → 复制 pysite → 安装 syslib → 部署环境脚本 + `/sys_prod/robot/out` 软链接。
+部署完成后板端目录结构：
+
+```text
+/data/roboframe/
+├── install/     ← 13 个 RoboFrame ROS 包 + lerobot
+├── pysite/      ← Python 依赖 (torch/numpy/transformers/tokenizers/regex ~200MB)
+└── scripts/
+    ├── robooh_1.0.1.env
+    └── setup_sshd.sh
+```
 
 ### 4.6 验证
 
@@ -238,8 +257,10 @@ ssh root@<board-ip>
 source /data/roboframe/scripts/robooh_1.0.1.env
 
 ros2 pkg list | grep -E 'inference_service|hardware_mock|so101_hardware'
-python3 -c "import torch; print(torch.__version__)"
-python3 -c "import rknnlite; print('RKNN OK')"
+python3 -c "import torch; print('torch', torch.__version__)"
+python3 -c "import transformers; print('transformers', transformers.__version__)"
+python3 -c "import tokenizers; print('tokenizers', tokenizers.__version__)"
+python3 -c "from rknnlite.api import RKNNLite; print('RKNN OK')"
 ```
 
 ## 五、启动推理与验证
