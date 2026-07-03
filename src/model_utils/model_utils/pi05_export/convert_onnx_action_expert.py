@@ -523,8 +523,19 @@ def main() -> int:
                 )
             manifest_dir = local_policy_path.resolve()
         om_path = args.om_path if args.om_path is not None else onnx_output_path.with_suffix(".om").name
-        manifest_path = upsert_pi05_om_manifest(manifest_dir, "action_expert", om_path)
-        LOGGER.info("Updated OM manifest (action_expert) at %s", manifest_path)
+        resolved_om_path = Path(om_path).expanduser()
+        if not resolved_om_path.is_absolute():
+            resolved_om_path = manifest_dir / resolved_om_path
+        if resolved_om_path.is_file():
+            manifest_path = upsert_pi05_om_manifest(manifest_dir, "action_expert", om_path)
+            LOGGER.info("Updated OM manifest (action_expert) at %s", manifest_path)
+        else:
+            LOGGER.info(
+                "Skipping OM manifest update (action_expert): OM artifact %s does not exist yet; "
+                "the compiled runtime manifest is written by the OM compile step "
+                "(convert_om) once ATC produces the .om file.",
+                resolved_om_path,
+            )
 
     return 0
 

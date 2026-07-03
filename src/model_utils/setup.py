@@ -10,7 +10,7 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
     ],
-    install_requires=["setuptools", "onnx", "onnxsim", "torch", "torchvision", "tqdm", "Pillow"],
+    install_requires=["setuptools", "onnx", "onnxsim", "torch", "torchvision", "tqdm", "Pillow", "PyYAML"],
     zip_safe=True,
     maintainer="lwh",
     maintainer_email="liuweihong8@huawei.com",

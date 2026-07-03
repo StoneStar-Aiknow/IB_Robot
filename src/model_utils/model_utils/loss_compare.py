@@ -328,20 +328,44 @@ class LossUtils:
 
     def _pi05_noise_shape(self):
         """(1, chunk_size, max_action_dim) inferred from whatever config the
-        backend exposes (torch policy config or compiled config view)."""
+        backend exposes (torch policy config or the on-disk policy config.json)."""
         raw_policy = self.coordinator.raw_policy
         cfg = getattr(raw_policy, "config", None)
         if cfg is not None and hasattr(cfg, "chunk_size") and hasattr(cfg, "max_action_dim"):
             return (1, int(cfg.chunk_size), int(cfg.max_action_dim))
-        # Compiled backend: fall back to the engine-reported chunk size and the
-        # PI05 default max_action_dim (32).  ``--noise-dir`` cross-machine flows
-        # generate noise on the torch side anyway, so this branch is mostly a
-        # safety net for OM-side regeneration.
+        # Compiled backend (e.g. Ascend OM): raw_policy exposes no torch config.
+        # ``chunk_size`` / ``max_action_dim`` are part of the policy config
+        # contract, so read them from the on-disk policy config.json instead of
+        # assuming PI05 defaults (which silently break non-default policies).
+        disk_cfg = self._load_policy_config_json()
         chunk = self.coordinator.chunk_size or 0
-        if chunk <= 0:
-            print("  WARN: cannot infer PI05 noise shape on this backend; skipping noise injection")
+        if chunk <= 0 and disk_cfg is not None and disk_cfg.get("chunk_size"):
+            chunk = int(disk_cfg["chunk_size"])
+        max_action_dim = None
+        if disk_cfg is not None and disk_cfg.get("max_action_dim") is not None:
+            max_action_dim = int(disk_cfg["max_action_dim"])
+        if chunk <= 0 or max_action_dim is None:
+            print(
+                "  WARN: cannot infer PI05 noise shape on this backend "
+                "(missing chunk_size/max_action_dim in policy config.json); skipping noise injection"
+            )
             return None
-        return (1, int(chunk), 32)
+        return (1, int(chunk), max_action_dim)
+
+    def _load_policy_config_json(self):
+        """Best-effort read of the policy ``config.json`` for shape metadata."""
+        policy_path = getattr(self.args, "policy_path", None)
+        if not policy_path:
+            return None
+        config_path = os.path.join(policy_path, "config.json")
+        if not os.path.isfile(config_path):
+            return None
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            return None
+        return cfg if isinstance(cfg, dict) else None
 
     def _inject_noise(self, batch, noise):
         """Wire deterministic noise into whichever backend is active.

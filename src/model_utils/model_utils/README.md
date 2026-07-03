@@ -659,15 +659,17 @@ python -m model_utils.pi05_export --profile p310 --exp-dir /root/.../0612
 python -m model_utils.pi05_export --profile p310 --exp-dir /root/.../0612 --dtype fp32
 ```
 
-**派生路径约定**：`--exp-dir <DIR>` 会自动派生两条长路径，无需再分别手填：
+**派生路径约定**：`--exp-dir <DIR>` 会自动派生三条长路径，无需再分别手填：
 
 | 派生项 | 路径 |
 | --- | --- |
 | `--output-dir` | `<DIR>/onnx/` |
 | `--runtime-save-dir` | `<DIR>/runtime_save/` |
+| `--om-dir` | `<DIR>/om/` |
 
-显式传同名参数会覆盖对应派生值。OM 与 `config.om.json` 仍写入 `--policy-path` 目录（运行时
-`device:=ascend_om` 约定），**不**随 `--exp-dir` 派生。
+显式传同名参数会覆盖对应派生值。OM 文件写入 `--om-dir`（默认 `<DIR>/om/`）；只有
+`config.om.json` 仍写入 `--policy-path` 目录并指向实际 OM 路径（运行时 `device:=ascend_om`
+约定），**不**随 `--exp-dir` 派生。
 
 **记住上次**：每次成功运行后，最终生效参数会自动写入配置文件的 `_last` 段。下次不指定 `--profile`
 时即自动复用上次参数（启动时会打印每个参数的来源）：
@@ -710,7 +712,7 @@ _last:
 
 参数优先级（高 → 低）：**命令行 > `--profile` > `defaults` > `_last`（仅未指定 profile 时）> 内置默认**。
 
-> 提示：`_last` 与 profile 里**不会**保存派生出来的 `output_dir/runtime_save_dir`（只存 `exp_dir`），
+> 提示：`_last` 与 profile 里**不会**保存派生出来的 `output_dir/runtime_save_dir/om_dir`（只存 `exp_dir`），
 > 这样以后换 `--exp-dir` 才能正确重新派生；`--steps` 作为临时流程开关也不会被持久化。
 
 ### 一条命令的端到端流程（推荐）
@@ -726,11 +728,13 @@ _last:
 | `ae_onnx` | 导出 Action Expert（gemma_300m）ONNX | `pi05-action_expert*.onnx` | `vlm_onnx`（需 `runtime_save` 中转张量） |
 | `vlm_quant` | VLM ONNX W8A8 量化 | `pi05-vlm*_w8a8.onnx` | `--batch-path` + `vlm_onnx`；若 `vlm_onnx` 是 NPU 图，会自动复用/生成 donor ONNX |
 | `ae_quant` | Action Expert ONNX W8A8 量化 | `pi05-action_expert*_w8a8.onnx` | `--calib-dir`（默认 `runtime_save`）+ `ae_onnx`；若 `ae_onnx` 是 NPU 图，会自动复用/生成 donor ONNX |
-| `vlm_om` | VLM ONNX → OM（ATC，量化过则自动吃 `*_w8a8`） | `vlm.om` / `vlm_w8a8.om`（+manifest） | `--soc-version` + `vlm_onnx` |
-| `ae_om` | Action Expert ONNX → OM（同上） | `action_expert.om` / `action_expert_w8a8.om`（+manifest） | `--soc-version` + `ae_onnx` |
+| `vlm_om` | VLM FP16 ONNX → OM（ATC） | `vlm.om`（+manifest） | `--soc-version` + `vlm_onnx` |
+| `ae_om` | Action Expert FP16 ONNX → OM（ATC） | `action_expert.om`（+manifest） | `--soc-version` + `ae_onnx` |
+| `vlm_quant_om` | VLM W8A8 ONNX → OM（ATC） | `vlm_w8a8.om`（+manifest） | `--soc-version` + `vlm_quant` |
+| `ae_quant_om` | Action Expert W8A8 ONNX → OM（ATC） | `action_expert_w8a8.om`（+manifest） | `--soc-version` + `ae_quant` |
 | `verify` | 拆分 vs 整体等价性验证 | — | `--task` + `vlm_onnx`,`ae_onnx` |
 
-**默认 `--steps`** = `vlm_onnx,ae_onnx,vlm_om,ae_om`（导出两段 ONNX + 编译两段 OM）。量化与验证是**显式选项**，需在 `--steps` 中点名。
+**默认 `--steps`** = `vlm_onnx,ae_onnx,vlm_om,ae_om`（导出两段 ONNX + 编译两段 FP16 OM）。量化与验证是**显式选项**，需在 `--steps` 中点名；W8A8 OM 由专用的 `vlm_quant_om` / `ae_quant_om` 步骤编译，不会覆盖普通 `vlm_om` / `ae_om`。
 
 ```shell
 # 仅导出两段 ONNX（不转 OM；适合在 GPU/CPU 机器上先把 ONNX 准备好）
@@ -749,21 +753,21 @@ python -m model_utils.pi05_export \
     --soc-version Ascend310P3 \
     --steps vlm_onnx,ae_onnx,vlm_om,ae_om,verify --task 'pick up the cup'
 
-# 导出 + W8A8 量化（两段）+ 转 OM（量化产物自动喂给 ATC）
+# 导出 + W8A8 量化（两段）+ 编译量化 OM（用专用的量化 OM 步骤）
 python -m model_utils.pi05_export \
     --policy-path path/to/pretrained_model \
     --soc-version Ascend310P3 \
-    --steps vlm_onnx,ae_onnx,vlm_quant,ae_quant,vlm_om,ae_om \
+    --steps vlm_onnx,ae_onnx,vlm_quant,ae_quant,vlm_quant_om,ae_quant_om \
     --batch-path path/to/batches.json
 ```
 
-> **场景 1：已导出 ONNX+OM，现在想开始量化**。复用已有 profile，只跑量化 + 重编 OM。若已有 ONNX 是
+> **场景 1：已导出 ONNX+OM，现在想开始量化**。复用已有 profile，只跑量化 + 编译量化 OM。若已有 ONNX 是
 > `*_npu.onnx`，pipeline 会自动查找同目录 `*_cpu.onnx` donor；donor 已存在则复用，不存在则用
 > `--donor-device`（默认 `cpu`）主动生成，并在日志中明确说明：
 >
 > ```shell
 > python -m model_utils.pi05_export --profile p310 \
->     --steps vlm_quant,ae_quant,vlm_om,ae_om \
+>     --steps vlm_quant,ae_quant,vlm_quant_om,ae_quant_om \
 >     --batch-path path/to/batches.json
 > ```
 >
@@ -783,9 +787,9 @@ python -m model_utils.pi05_export \
 | --- | --- | --- | --- |
 | `--policy-path` | ✅ | — | 本地 PI05 策略目录（含 config + 权重）。可由 profile 提供 |
 | `--steps` | ❌ | `vlm_onnx,ae_onnx,vlm_om,ae_om` | 要执行的步骤列表（见上表）。列出的步骤总会执行 |
-| `--exp-dir` | ❌ | `None` | 实验目录：自动派生 `onnx/`/`runtime_save/`，免去分别手填两条长路径 |
+| `--exp-dir` | ❌ | `None` | 实验目录：自动派生 `onnx/`/`runtime_save/`/`om/`，免去分别手填三条长路径 |
 | `--dtype` | ❌ | `fp16` | 导出精度，**同时应用于 VLM 与 AE 两段**（`fp16` / `fp32` / `auto`） |
-| `--soc-version` | ❌ | `None` | `vlm_om` / `ae_om` 步骤所需的目标芯片（如 `Ascend310P3`，见下文「查看芯片版本号」） |
+| `--soc-version` | ❌ | `None` | `vlm_om` / `ae_om` / `vlm_quant_om` / `ae_quant_om` 步骤所需的目标芯片（如 `Ascend310P3`，见下文「查看芯片版本号」） |
 | `--batch-path` | `vlm_quant` 必填 | `None` | 真实标定 batch JSON（**随机数据会量化出不可用模型**）。可由 profile 提供 |
 | `--donor-device` | ❌ | `cpu` | 量化 NPU ONNX 时，若 donor ONNX 不存在，用该设备自动导出 ORT-runnable donor（不要设为 `npu`） |
 | `--calib-dir` | ❌ | `=--runtime-save-dir` | `ae_quant` 标定样本目录（含 `past_kv_tensor.*` + `prefix_pad_masks.*`） |
@@ -795,13 +799,14 @@ python -m model_utils.pi05_export \
 | `--device` | ❌ | `cpu` | 导出/验证设备（`cpu` / `cuda:0` / `npu`），会体现在 ONNX 文件名中 |
 | `--output-dir` | ❌ | `outputs/onnx` | 导出 ONNX 的目录。可由 `--exp-dir` 派生为 `<DIR>/onnx/` |
 | `--runtime-save-dir` | ❌ | `runtime_save` | VLM→AE 中转张量目录。可由 `--exp-dir` 派生为 `<DIR>/runtime_save/` |
+| `--om-dir` | ❌ | `outputs/om` | 编译出的 OM 产物目录。可由 `--exp-dir` 派生为 `<DIR>/om/`；`config.om.json` 仍写入 `--policy-path` |
 
 > 配置/向导相关：`--config`（配置文件路径）、`--profile`（引用 profile）、`--save-as`（另存为 profile）、`--init`（强制向导）、`--list-profiles`（列出 profile）。详见上方「快速开始」。
 >
 > 量化说明：量化默认**不执行**（不在默认 `--steps` 内）。在 `--steps` 中加入 `vlm_quant`/`ae_quant`
-> 即开启对应段量化，会在 fp16 ONNX 旁产出 `*_w8a8.onnx`；同一次若也选了 `vlm_om`/`ae_om`，ATC 会
-> **自动改用该 `*_w8a8.onnx`** 编译，并输出 `vlm_w8a8.om` / `action_expert_w8a8.om`，不会覆盖普通
-> `vlm.om` / `action_expert.om`（未量化的段仍用 fp16 ONNX 和普通 OM 名）。如果当前部署 ONNX 文件名是
+> 即开启对应段量化，会在 fp16 ONNX 旁产出 `*_w8a8.onnx`；要把量化产物编译成 OM，需显式加入专用的
+> `vlm_quant_om`/`ae_quant_om` 步骤，输出 `vlm_w8a8.om` / `action_expert_w8a8.om`，不会覆盖普通
+> `vlm_om`/`ae_om` 编出的 `vlm.om` / `action_expert.om`（普通 OM 步骤始终编译 fp16 ONNX）。如果当前部署 ONNX 文件名是
 > `*_npu.onnx`，量化会走 Route A：用 ORT-runnable donor 做校准/量化，再把 int8 Linear graft 回 NPU 图；
 > donor 图按 `--donor-device` 推导文件名（默认 `*_cpu.onnx`），存在则复用，缺失则自动导出。`--steps` 是
 > 临时流程开关**不写入** `_last`/profile；而 `--batch-path` / `--donor-device` / `--calib-dir` /
