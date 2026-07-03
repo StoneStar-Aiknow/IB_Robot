@@ -114,11 +114,10 @@ class SmolVLARKNNModel:
         img_masks: list[np.ndarray],
         tokens: Tensor,
         masks: Tensor,
-        state: Tensor | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         embs: list[np.ndarray] = []
         pad_masks: list[np.ndarray] = []
-        for img, img_mask in zip(images, img_masks, strict=False):
+        for img, img_mask in zip(images, img_masks, strict=True):
             img_emb = self.embed_image(img)
             bsize, num_img_embs = img_emb.shape[:2]
             img_emb = img_emb * math.sqrt(img_emb.shape[-1])
@@ -169,9 +168,11 @@ class SmolVLARKNNModel:
     ) -> np.ndarray:
         outputs = self.action_rknn.inference(
             inputs=[
-                np.ascontiguousarray(past_kv_tensor.astype(_TARGET_DTYPE)),
+                # past_kv_tensor is dtype-locked by _flatten_kv; copy=False
+                # avoids per-step array copy in the denoise hot loop.
+                np.ascontiguousarray(past_kv_tensor.astype(_TARGET_DTYPE, copy=False)),
                 np.ascontiguousarray(prefix_pad_masks),
-                np.ascontiguousarray(time.astype(np.float32)),
+                np.ascontiguousarray(time.astype(np.float32, copy=False)),
                 np.ascontiguousarray(noise.astype(_TARGET_DTYPE)),
             ]
         )

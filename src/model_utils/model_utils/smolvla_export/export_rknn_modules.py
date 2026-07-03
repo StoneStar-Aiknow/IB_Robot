@@ -371,9 +371,20 @@ def export_all(args):
         "timestep": list(timestep.shape),
         "prefix_pad_masks": list(prefix_pad_masks.shape),
     }
-    for name, tensor in zip(action_names_in[3:], flat_cache, strict=False):
+    for name, tensor in zip(action_names_in[3:], flat_cache, strict=True):
         action_shapes[name] = list(tensor.shape)
     simplify_onnx(action_onnx, action_simp, action_shapes)
+
+    # Runtime artifact paths (relative to manifest dir). The .rknn files are
+    # produced by the subsequent convert_to_rknn.py step; the embedding is
+    # already saved above. load_compiled_manifest requires this map and
+    # SmolVLARKNNRuntimeSession.load resolves each via require_artifact.
+    rknn_artifacts = {
+        "vision": "onnx/smolvla_vision.rknn",
+        "prefill": "onnx/smolvla_prefill.rknn",
+        "action": "onnx/smolvla_action.rknn",
+        "embedding": "token_embedding.pt",
+    }
 
     # ── Meta info + config.rknn.json ──
     meta = {
@@ -392,6 +403,19 @@ def export_all(args):
         "chunk_size": chunk_size,
         "max_action_dim": max_action_dim,
         "cache_shape_per_tensor": cache_shape,
+        # Runtime artifact map consumed by load_compiled_manifest. Roles must
+        # match SmolVLARKNNRuntimeSession.load's require_artifact calls.
+        "artifacts": rknn_artifacts,
+        # Architecture params read by SmolVLARKNNRuntimeSession.load and merged
+        # into the _PI05ConfigView so SmolVLARKNNModel picks up real values
+        # instead of getattr fallback defaults.
+        "backend_config": {
+            "num_layers": num_layers,
+            "prefix_length": prefix_length,
+            "prefix_hidden_size": prefix_hidden_size,
+            "num_key_value_heads": num_kv_heads,
+            "head_dim": head_dim,
+        },
         "modules": {
             "vision": {
                 "onnx": "onnx/smolvla_vision_simp.onnx",

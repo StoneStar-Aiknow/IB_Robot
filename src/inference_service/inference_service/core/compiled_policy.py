@@ -538,6 +538,15 @@ class _PI05ConfigView:
         self.min_period = float(config.get("min_period", 0.004))
         self.max_period = float(config.get("max_period", 4.0))
         self.image_features = _ordered_pi05_image_features(config)
+        # SmolVLA RKNN/HMM architecture params. Not present in the PI05 policy
+        # config dict; SmolVLARKNNRuntimeSession.load merges them here from
+        # the compiled manifest's backend_config so SmolVLARKNNModel reads the
+        # real values via getattr instead of falling back to hardcoded
+        # defaults (which silently corrupt KV-cache shapes for non-256M
+        # SmolVLA variants). PI05 backends never read these attributes.
+        self.num_layers = int(config.get("num_layers", 16))
+        self.prefix_length = int(config.get("prefix_length", 177))
+        self.prefix_hidden_size = int(config.get("prefix_hidden_size", 960))
 
 
 class ACTCompiledAdapter:
@@ -1061,12 +1070,17 @@ class SmolVLARKNNRuntimeSession:
         embedding_path = manifest.require_artifact("embedding")
         from inference_service.core.rknn.smolvla.SmolVLARKNNModel import SmolVLARKNNModel
 
+        # Merge manifest backend_config (num_layers / prefix_length /
+        # prefix_hidden_size / ...) over the policy config so _PI05ConfigView
+        # exposes the real VLM architecture params to SmolVLARKNNModel instead
+        # of the getattr fallback defaults (see _PI05ConfigView docstring).
+        merged_config = {**config, **manifest.backend_config}
         self._model = SmolVLARKNNModel(
             vision_path=str(vision_path),
             prefill_path=str(prefill_path),
             action_path=str(action_path),
             embedding_path=str(embedding_path),
-            config=_PI05ConfigView(config),
+            config=_PI05ConfigView(merged_config),
         )
 
     def execute(self, inputs: Any) -> Tensor:

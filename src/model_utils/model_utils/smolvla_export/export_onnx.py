@@ -222,23 +222,6 @@ def build_vlm_dummy_inputs(config, device, seed=42):
     return img_top, img_wrist, lang_tokens, lang_masks, state
 
 
-def build_expert_dummy_inputs(vlm_wrapper, vlm_inputs, config, device, seed=42):
-    torch.manual_seed(seed)
-    bsz = 1
-    with torch.no_grad():
-        past_kv, prefix_masks = vlm_wrapper(*vlm_inputs)
-
-    time = torch.tensor([1.0], device=device, dtype=torch.float32)
-    noise = torch.randn(bsz, config.chunk_size, config.max_action_dim, device=device, dtype=torch.float32)
-    return past_kv, prefix_masks, time, noise
-
-
-def pad_vector(vector, new_dim):
-    if vector.shape[-1] >= new_dim:
-        return vector
-    return F.pad(vector, (0, new_dim - vector.shape[-1]))
-
-
 def export_vlm_onnx(wrapper, dummy_inputs, output_path, opset=17, dynamo=False):
     LOGGER.info(f"Exporting VLM ONNX to {output_path} (dynamo={dynamo})")
     wrapper.eval()
