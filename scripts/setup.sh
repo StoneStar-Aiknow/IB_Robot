@@ -8,6 +8,7 @@
 #   ./scripts/setup.sh --with-perception             # Install SAM2/Grounding-DINO deps
 #   ./scripts/setup.sh --with-grasp                  # Install GraspGen deps
 #   ./scripts/setup.sh --skip-verify                 # Skip final ROS/Python verification
+#   ./scripts/setup.sh --only-patch                  # Only apply LeRobot patches
 #   ./scripts/setup.sh --platform <id>               # Override detected platform
 #   ./scripts/setup.sh --help                        # Show help
 #
@@ -50,6 +51,7 @@ SUDO_AUTH_READY=false
 PLATFORM_OVERRIDE=""
 
 SKIP_VERIFY=false
+ONLY_PATCH=${ONLY_PATCH:-false}
 INSTALL_PERCEPTION_DEPS="${IBR_SETUP_WITH_PERCEPTION:-false}"
 INSTALL_GRASP_DEPS="${IBR_SETUP_WITH_GRASP:-false}"
 CURRENT_STAGE="initializing"
@@ -202,6 +204,10 @@ Options:
                          GraspGen pointnet2_ops.
 
       --skip-verify      Skip final ROS/Python verification
+      --only-patch       Skip dependency/venv setup and verification; only
+                         apply the managed LeRobot patch stack. Use
+                         IBR_LEROBOT_FORCE_REBUILD=1 to rebuild from the
+                         recorded upstream base.
       --platform ID      Override platform detection
       --lerobot-profiles CSV
                          Override lerobot patch profile selection
@@ -226,6 +232,7 @@ parse_args() {
             --with-grasp|--with-graspgen|--with-grasp-deps) INSTALL_GRASP_DEPS=true ;;
 
             --skip-verify) SKIP_VERIFY=true ;;
+            --only-patch) ONLY_PATCH=true ;;
             --platform)
                 shift
                 if [[ $# -eq 0 ]]; then
@@ -554,21 +561,25 @@ main() {
     # Update submodules
     set_stage "syncing submodules"
     update_submodules
-    
-    # Install dependencies
-    set_stage "installing system dependencies"
-    install_system_deps
-    if [[ "${SYSTEM_DEPS_STATUS}" == "done" ]]; then
-        log_done "System ROS dependencies installed"
-    elif [[ "${SYSTEM_DEPS_STATUS}" == "rosdep-errors" ]]; then
-        log_error "System dependency installation had errors — see messages above."
-        log_error "Fix the reported issues and re-run ./scripts/setup.sh."
-        exit 1
-    fi
-    set_stage "configuring python environment"
-    setup_python_venv
-    if [[ "${PYTHON_ENV_STATUS}" == "done" ]]; then
-        log_done "Python environment configured"
+
+    if [[ "${ONLY_PATCH}" != true ]]; then
+        # Install dependencies
+        set_stage "installing system dependencies"
+        install_system_deps
+        if [[ "${SYSTEM_DEPS_STATUS}" == "done" ]]; then
+            log_done "System ROS dependencies installed"
+        elif [[ "${SYSTEM_DEPS_STATUS}" == "rosdep-errors" ]]; then
+            log_error "System dependency installation had errors — see messages above."
+            log_error "Fix the reported issues and re-run ./scripts/setup.sh."
+            exit 1
+        fi
+        set_stage "configuring python environment"
+        setup_python_venv
+        if [[ "${PYTHON_ENV_STATUS}" == "done" ]]; then
+            log_done "Python environment configured"
+        fi
+    else
+        log_info "Only applying LeRobot patch stack (--only-patch); skipping dependency and venv setup."
     fi
 
     if platform_supports_local_workspace_build; then
@@ -583,8 +594,12 @@ main() {
         log_info "Skipping LeRobot patch stack checks on runtime-only platform ${SETUP_PLATFORM_ID}."
     fi
 
-    set_stage "verifying environment"
-    verify_setup
+    if [[ "${ONLY_PATCH}" != true ]]; then
+        set_stage "verifying environment"
+        verify_setup
+    else
+        log_skipped "ROS/Python verification"
+    fi
 
     echo ""
     echo -e "${YELLOW}============================================================${NC}"
@@ -595,7 +610,10 @@ main() {
     done
     echo ""
     local completion_message="Setup complete! Run ./scripts/build.sh to build the workspace."
-    if ! platform_supports_local_workspace_build; then
+    if [[ "${ONLY_PATCH}" == true ]]; then
+        completion_message="LeRobot patch stack check complete."
+    fi
+    if [[ "${ONLY_PATCH}" != true ]] && ! platform_supports_local_workspace_build; then
         completion_message="Setup complete! OpenHarmony runtime verified; cross-build deployables on the host."
     fi
     echo -e "\033[1;32m[INFO] ${completion_message}${NC}"
