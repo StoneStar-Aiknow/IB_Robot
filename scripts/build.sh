@@ -308,6 +308,9 @@ if [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
     if [[ "${IBR_BUILD_INCLUDE_MANIPULATION_SERVICE_ON_OPENEULER:-0}" != "1" ]]; then
         OPENEULER_SKIP_PACKAGES+=("manipulation_service")
     fi
+    if [[ "${IBR_BUILD_INCLUDE_EMBODIED_BRINGUP_ON_OPENEULER:-0}" != "1" ]]; then
+        OPENEULER_SKIP_PACKAGES+=("embodied_bringup")
+    fi
     if [[ ${#OPENEULER_SKIP_PACKAGES[@]} -gt 0 ]]; then
         log_info "openEuler detected: skipping Ubuntu/CUDA-only packages: ${OPENEULER_SKIP_PACKAGES[*]}."
         PLATFORM_ARGS+=("--packages-skip" "${OPENEULER_SKIP_PACKAGES[@]}")
