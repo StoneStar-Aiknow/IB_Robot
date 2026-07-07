@@ -197,3 +197,22 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 run perception_service gro
 ```
 
 该节点提供 `ibrobot_msgs/srv/DetectSegment`，并发布 `ibrobot_msgs/msg/DetectionArray`，供下游 `manipulation_service` 抓取规划消费。
+
+### 检测结果质心
+
+每个 `Detection2D` 携带两种 3D 质心（相机光学系，单位 m）：
+
+| 字段 | 计算方式 | 适用场景 |
+|------|---------|---------|
+| `centroid_xyz` | mask 内可见表面点云的**算术平均** | 快速估计、小扁平物体 |
+| `volume_centroid_xyz` | 点云**凸包体积质心**（四面体分解 + 体积加权） | 凸形物体的物理中心近似 |
+| `volume_m3` | 凸包体积 | 物体尺寸估计 |
+
+**差异**：`centroid_xyz` 只反映相机能看到的正面，深度方向偏前；`volume_centroid_xyz` 把凸包"虚构背面"补回，质心沿夹爪 −Z 方向后移约 7~12 mm（取决于物体厚度），更接近真实物理中心。
+
+**已知局限**：
+- 弯曲物体（banana）：凸包质心可能侧向偏出物体轮廓（投影法 ~47% 落在 mask 外）
+- 小圆物体（strawberry）：凸包背面空腔大，质心离实际表面 11~15 mm
+- 凸形物体（marker、cucumber）：两种质心差异小，体积质心可靠
+
+若需更准确的体积质心，应使用多视角点云融合补全背面，再做网格体积积分。

@@ -36,6 +36,47 @@ _DEFAULT_MODEL_DIR = _WORKSPACE_ROOT / "models" / "perception"
 _GDINO_CONFIG_DIR = Path(__file__).resolve().parent / "config" / "gdino"
 
 
+def volume_centroid_hull(points: np.ndarray) -> tuple[np.ndarray, float]:
+    """Volume centroid of the convex hull enclosing ``points``.
+
+    Decomposes the hull into tetrahedra (one per triangular face joined to an
+    interior anchor) and integrates the volume-weighted centroid using the
+    divergence theorem. Returns ``(centroid_xyz, volume_m3)``. Falls back to the
+    surface mean when the points are degenerate (fewer than 4, coplanar, or
+    ``scipy`` unavailable).
+    """
+    if points.shape[0] < 4:
+        return points.mean(axis=0) if points.shape[0] > 0 else np.zeros(3), 0.0
+    try:
+        from scipy.spatial import ConvexHull
+    except ModuleNotFoundError:
+        return points.mean(axis=0), 0.0
+
+    try:
+        hull = ConvexHull(points)
+    except Exception:  # QhullError on coplanar/degenerate input
+        return points.mean(axis=0), 0.0
+
+    anchor = points[hull.vertices].mean(axis=0)
+    total_v = 0.0
+    total_vc = np.zeros(3)
+    for simplex in hull.simplices:
+        a, b, c = points[simplex] - anchor
+        # Use the absolute geometric volume of each tetrahedron as weight.
+        # scipy's hull simplices do NOT guarantee consistent outward-facing
+        # normals, so the signed volume can flip sign per face; using abs
+        # yields the correct non-overlapping tetrahedron partition for an
+        # interior anchor and avoids the centroid drifting outside the hull.
+        v = abs(float(np.dot(a, np.cross(b, c)) / 6.0))
+        tet_centroid = (anchor + points[simplex].sum(axis=0)) / 4.0
+        total_v += v
+        total_vc += v * tet_centroid
+
+    if total_v < 1e-12:
+        return points.mean(axis=0), 0.0
+    return total_vc / total_v, total_v
+
+
 def _resolve_model_path(path_str: str, model_dir: Path) -> Path:
     p = Path(path_str).expanduser()
     if p.is_absolute():
@@ -114,6 +155,12 @@ class Detection:
     bbox_xyxy: np.ndarray
     mask: np.ndarray
     centroid_xyz: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    # Volume centroid of the convex hull enclosing the object's 3D points.
+    # Unlike centroid_xyz (visible-surface mean), this approximates the
+    # filled-volume center by integrating the convex hull, which is closer to
+    # the physical center of mass for convex objects.
+    volume_centroid_xyz: np.ndarray = field(default_factory=lambda: np.zeros(3))
+    volume_m3: float = 0.0
     point_count: int = 0
 
 
@@ -314,14 +361,38 @@ class GroundedSAM2Wrapper:
             ys, xs = np.where(valid)
             zs = depth_masked[valid]
 
-            mean_x = np.mean(xs)
-            mean_y = np.mean(ys)
-            mean_z = np.mean(zs)
+            # Reject depth outliers before centroiding. At close range the mask may
+            # include gripper fingers or background pixels whose depth differs from
+            # the target by hundreds of mm; keeping them corrupts the centroid.
+            median_z = float(np.median(zs))
+            mad_z = float(np.median(np.abs(zs - median_z)))
+            # 1.4826*MAD approximates a std; clamp with an absolute floor so a very
+            # tight cluster does not reject every point due to sensor quantization.
+            z_tol = max(3.0 * 1.4826 * mad_z, 0.02)
+            inliers = np.abs(zs - median_z) <= z_tol
+            if inliers.sum() >= max(10, int(0.2 * zs.size)):
+                xs, ys, zs = xs[inliers], ys[inliers], zs[inliers]
 
-            x3d = (mean_x - cx) * mean_z / fx
-            y3d = (mean_y - cy) * mean_z / fy
-            z3d = mean_z
+            det.point_count = int(zs.size)
+
+            # Back-project each pixel to 3D first, THEN average. Averaging pixel
+            # coordinates and depth independently (mean_x * mean_z) is only valid
+            # when depth is uniform across the mask and diverges badly otherwise.
+            xs3d = (xs - cx) * zs / fx
+            ys3d = (ys - cy) * zs / fy
+
+            x3d = float(np.mean(xs3d))
+            y3d = float(np.mean(ys3d))
+            z3d = float(np.mean(zs))
 
             det.centroid_xyz = np.array([x3d, y3d, z3d], dtype=np.float64)
+
+            # Convex-hull volume centroid: integrates the filled volume enclosing
+            # the object's 3D points. Closer to the physical center of mass than
+            # the visible-surface mean above, especially for convex objects.
+            pts3d = np.stack([xs3d, ys3d, zs], axis=1)
+            vol_c, vol = volume_centroid_hull(pts3d)
+            det.volume_centroid_xyz = vol_c
+            det.volume_m3 = vol
 
         return detections

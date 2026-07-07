@@ -191,6 +191,12 @@ class GroundedSAM2Node(Node):
                 y=float(det.centroid_xyz[1]),
                 z=float(det.centroid_xyz[2]),
             )
+            dm.volume_centroid_xyz = Point(
+                x=float(det.volume_centroid_xyz[0]),
+                y=float(det.volume_centroid_xyz[1]),
+                z=float(det.volume_centroid_xyz[2]),
+            )
+            dm.volume_m3 = float(det.volume_m3)
             dm.point_count = det.point_count
             det_msgs.append(dm)
 

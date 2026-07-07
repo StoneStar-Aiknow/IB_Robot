@@ -264,6 +264,10 @@ def build_pointcloud_outputs(
         meta["pointcloud"] = cloud_file
         meta["pointcloud_points"] = int(cloud.shape[0])
 
+        # Embed a downsampled point cloud for the interactive 3D centroid plot.
+        preview = cloud if cloud.shape[0] <= 2000 else cloud[np.linspace(0, cloud.shape[0] - 1, 2000, dtype=np.int64)]
+        meta["cloud_preview"] = np.round(preview[:, :6].astype(np.float64), 4).tolist()
+
     return cloud_meta
 
 
@@ -316,6 +320,12 @@ def build_visualizations(
                     float(det.centroid_xyz.y),
                     float(det.centroid_xyz.z),
                 ],
+                "volume_centroid_xyz": [
+                    float(det.volume_centroid_xyz.x),
+                    float(det.volume_centroid_xyz.y),
+                    float(det.volume_centroid_xyz.z),
+                ],
+                "volume_m3": float(det.volume_m3),
                 "point_count": int(det.point_count),
                 "mask": mask_file,
             }
@@ -339,6 +349,8 @@ def write_index_html(run_dir: Path, metadata: dict) -> None:
         pointcloud_cell = ""
         if det.get("pointcloud"):
             pointcloud_cell = f'<a href="{html.escape(det["pointcloud"])}">{html.escape(det["pointcloud"])}</a>'
+        surf = [round(v, 3) for v in det["centroid_xyz"]]
+        vol = [round(v, 3) for v in det["volume_centroid_xyz"]]
         rows.append(
             "<tr>"
             f"<td>{det['index']}</td>"
@@ -346,12 +358,15 @@ def write_index_html(run_dir: Path, metadata: dict) -> None:
             f"<td>{det['confidence']:.3f}</td>"
             f"<td>{html.escape(str([round(v, 1) for v in det['bbox_xyxy']]))}</td>"
             f"<td>{det['point_count']}</td>"
+            f"<td><code>{surf}</code></td>"
+            f"<td><code>{vol}</code></td>"
+            f"<td>{det['volume_m3'] * 1e6:.2f}</td>"
             f'<td><a href="{html.escape(det["mask"])}">{html.escape(det["mask"])}</a></td>'
             f"<td>{pointcloud_cell}</td>"
             "</tr>"
         )
 
-    rows_html = "\n".join(rows) or '<tr><td colspan="7">No detections</td></tr>'
+    rows_html = "\n".join(rows) or '<tr><td colspan="10">No detections</td></tr>'
     pointcloud_html = "<p>Point cloud export disabled or unavailable.</p>"
     pointcloud = metadata.get("pointcloud", {})
     if pointcloud.get("enabled"):
@@ -367,18 +382,49 @@ def write_index_html(run_dir: Path, metadata: dict) -> None:
         )
     elif pointcloud.get("reason"):
         pointcloud_html = f"<p>{html.escape(pointcloud['reason'])}</p>"
+
+    # Build 3D plot containers: one per detection with an embedded cloud preview.
+    plot_containers = []
+    plot_data = []
+    for det in metadata["detections"]:
+        preview = det.get("cloud_preview") or []
+        if len(preview) == 0:
+            continue
+        pid = f"plot-{det['index']}"
+        plot_containers.append(
+            f"<h3>#{det['index']} {html.escape(det['label'])} "
+            f'<span class="vol">{det["volume_m3"] * 1e6:.1f} cm³</span></h3>'
+            f'<div id="{pid}" class="cloud-plot"></div>'
+        )
+        plot_data.append(
+            {
+                "id": pid,
+                "pts": preview,
+                "surface": det["centroid_xyz"],
+                "volume": det["volume_centroid_xyz"],
+            }
+        )
+    plot_containers_html = "\n".join(plot_containers) or "<p>No point clouds available for 3D plot.</p>"
+    plot_data_json = json.dumps(plot_data)
+
     page = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <title>Grounded-SAM2 Snapshot</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
     body {{ font-family: sans-serif; margin: 24px; color: #222; }}
     img {{ max-width: 100%; border: 1px solid #ddd; }}
     table {{ border-collapse: collapse; margin-top: 16px; }}
-    th, td {{ border: 1px solid #ddd; padding: 6px 10px; }}
+    th, td {{ border: 1px solid #ddd; padding: 6px 10px; white-space: nowrap; }}
     th {{ background: #f4f4f4; }}
     code {{ background: #f4f4f4; padding: 2px 4px; }}
+    .cloud-plot {{ width: 100%; height: 480px; border: 1px solid #ddd; margin: 8px 0 24px; }}
+    .vol {{ color: #d62728; font-size: 0.9em; }}
+    .legend {{ margin: 12px 0; }}
+    .legend span {{ display: inline-block; margin-right: 18px; }}
+    .dot {{ display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }}
   </style>
 </head>
 <body>
@@ -394,15 +440,70 @@ def write_index_html(run_dir: Path, metadata: dict) -> None:
   <img src="overlay.png" alt="Segmentation overlay">
   <h2>Point Cloud</h2>
   {pointcloud_html}
+  <h2>3D Centroids</h2>
+  <p class="legend">
+    <span><span class="dot" style="background:#1f77b4"></span>Point cloud (RGB)</span>
+    <span><span class="dot" style="background:#ff7f0e"></span>Surface centroid (visible-surface mean)</span>
+    <span><span class="dot" style="background:#d62728"></span>Volume centroid (convex-hull center)</span>
+  </p>
+  {plot_containers_html}
   <h2>Detections</h2>
   <table>
     <thead>
-      <tr><th>#</th><th>Label</th><th>Confidence</th><th>BBox xyxy</th><th>Points</th><th>Mask</th><th>Point Cloud</th></tr>
+      <tr><th>#</th><th>Label</th><th>Confidence</th><th>BBox xyxy</th><th>Points</th><th>Surface centroid</th><th>Volume centroid</th><th>Volume (cm³)</th><th>Mask</th><th>Point Cloud</th></tr>
     </thead>
     <tbody>
       {rows_html}
     </tbody>
   </table>
+  <script>
+    const PLOT_DATA = {plot_data_json};
+    document.addEventListener('DOMContentLoaded', function () {{
+      PLOT_DATA.forEach(function (d) {{
+        const xs = [], ys = [], zs = [], colors = [];
+        d.pts.forEach(function (p) {{
+          xs.push(p[0]); ys.push(p[1]); zs.push(p[2]);
+          colors.push('rgb(' + (p[3]|0) + ',' + (p[4]|0) + ',' + (p[5]|0) + ')');
+        }});
+        const traces = [
+          {{
+            type: 'scatter3d', mode: 'markers', name: 'cloud',
+            x: xs, y: ys, z: zs,
+            marker: {{ size: 2, color: colors, opacity: 0.55 }}
+          }},
+          {{
+            type: 'scatter3d', mode: 'markers+text', name: 'surface',
+            x: [d.surface[0]], y: [d.surface[1]], z: [d.surface[2]],
+            marker: {{ size: 9, color: '#ff7f0e', symbol: 'x', line: {{ width: 2 }} }},
+            text: ['surface'], textposition: 'top center', textfont: {{ size: 12, color: '#ff7f0e' }}
+          }},
+          {{
+            type: 'scatter3d', mode: 'markers+text', name: 'volume',
+            x: [d.volume[0]], y: [d.volume[1]], z: [d.volume[2]],
+            marker: {{ size: 9, color: '#d62728', symbol: 'cross', line: {{ width: 2 }} }},
+            text: ['volume'], textposition: 'bottom center', textfont: {{ size: 12, color: '#d62728' }}
+          }},
+          {{
+            type: 'scatter3d', mode: 'lines', name: 'Δ',
+            x: [d.surface[0], d.volume[0]],
+            y: [d.surface[1], d.volume[1]],
+            z: [d.surface[2], d.volume[2]],
+            line: {{ color: '#333', width: 4, dash: 'dash' }}, opacity: 0.7
+          }}
+        ];
+        const layout = {{
+          margin: {{ l: 0, r: 0, b: 0, t: 0 }},
+          scene: {{
+            aspectmode: 'data',
+            xaxis: {{ title: 'X' }}, yaxis: {{ title: 'Y' }}, zaxis: {{ title: 'Z (depth)' }},
+            camera: {{ eye: {{ x: -1.6, y: -1.6, z: 0.9 }} }}
+          }},
+          showlegend: true, legend: {{ x: 0, y: 1 }}
+        }};
+        Plotly.newPlot(d.id, traces, layout, {{ responsive: true }});
+      }});
+    }});
+  </script>
 </body>
 </html>
 """
@@ -685,11 +786,13 @@ def run(args: argparse.Namespace) -> int:
         for det in detections:
             bbox = [round(v, 1) for v in det["bbox_xyxy"]]
             centroid = [round(v, 3) for v in det["centroid_xyz"]]
+            vol_centroid = [round(v, 3) for v in det["volume_centroid_xyz"]]
             pointcloud_file = det.get("pointcloud", "")
             print(
                 f"detection[{det['index']}]: label={det['label']!r} "
                 f"conf={det['confidence']:.3f} bbox={bbox} "
                 f"points={det['point_count']} centroid={centroid} "
+                f"vol_centroid={vol_centroid} vol={det['volume_m3'] * 1e6:.2f}cm³ "
                 f"cloud={pointcloud_file}"
             )
 
