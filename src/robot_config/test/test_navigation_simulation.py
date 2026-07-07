@@ -195,13 +195,17 @@ def _terminate_process(managed: ManagedProcess, timeout=15):
 def _start_process(cmd, env, log_dir: Path, name: str):
     # Keep the file open until the process exits so subprocess can stream logs.
     log_file = open(log_dir / f"{name}.log", "w", encoding="utf-8")  # noqa: SIM115
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        env=env,
-        preexec_fn=os.setsid,
-    )
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env=env,
+            preexec_fn=os.setsid,
+        )
+    except Exception:
+        log_file.close()
+        raise
     return ManagedProcess(proc=proc, log_file=log_file)
 
 
@@ -229,51 +233,65 @@ def gazebo_env():
     log_dir = Path(tempfile.mkdtemp(prefix="robot_config_nav_sim_"))
     print(f"[robot_config] navigation simulation logs: {log_dir}")
 
-    robot_proc = _start_process(
-        [
-            "ros2",
-            "launch",
-            robot_launch,
-            f"config_path:={config_path}",
-            "use_sim:=true",
-            "with_navigation:=true",
-            "with_inference:=false",
-            "with_moveit:=false",
-            "voice_asr_auto_start:=false",
-            "auto_start_controllers:=true",
-            "control_mode:=base_navigation",
-        ],
-        env,
-        log_dir,
-        "robot_launch",
-    )
-    odom_bridge_proc = _start_process(
-        [
-            "ros2",
-            "run",
-            "ros_gz_bridge",
-            "parameter_bridge",
-            "/model/lekiwi/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry",
-        ],
-        env,
-        log_dir,
-        "odom_bridge",
-    )
-    gt_odom_proc = _start_process(
-        [
-            "python3",
-            str(e2e_dir / "gt_odom_node.py"),
-            "--ros-args",
-            "-p",
-            f"spawn_x:={SPAWN_X}",
-            "-p",
-            f"spawn_y:={SPAWN_Y}",
-        ],
-        env,
-        log_dir,
-        "gt_odom_node",
-    )
-    cmd_vel_relay_proc = _start_process(["python3", str(e2e_dir / "cmd_vel_relay.py")], env, log_dir, "cmd_vel_relay")
+    started = []
+    try:
+        robot_proc = _start_process(
+            [
+                "ros2",
+                "launch",
+                robot_launch,
+                f"config_path:={config_path}",
+                "use_sim:=true",
+                "with_navigation:=true",
+                "with_inference:=false",
+                "with_moveit:=false",
+                "voice_asr_auto_start:=false",
+                "auto_start_controllers:=true",
+                "control_mode:=base_navigation",
+            ],
+            env,
+            log_dir,
+            "robot_launch",
+        )
+        started.append(robot_proc)
+        odom_bridge_proc = _start_process(
+            [
+                "ros2",
+                "run",
+                "ros_gz_bridge",
+                "parameter_bridge",
+                "/model/lekiwi/odometry@nav_msgs/msg/Odometry[gz.msgs.Odometry",
+            ],
+            env,
+            log_dir,
+            "odom_bridge",
+        )
+        started.append(odom_bridge_proc)
+        gt_odom_proc = _start_process(
+            [
+                "python3",
+                str(e2e_dir / "gt_odom_node.py"),
+                "--ros-args",
+                "-p",
+                f"spawn_x:={SPAWN_X}",
+                "-p",
+                f"spawn_y:={SPAWN_Y}",
+            ],
+            env,
+            log_dir,
+            "gt_odom_node",
+        )
+        started.append(gt_odom_proc)
+        cmd_vel_relay_proc = _start_process(
+            ["python3", str(e2e_dir / "cmd_vel_relay.py")], env, log_dir, "cmd_vel_relay"
+        )
+        started.append(cmd_vel_relay_proc)
+    except Exception:
+        for proc in reversed(started):
+            _terminate_process(proc, timeout=5)
+        executor.shutdown()
+        rclpy.shutdown()
+        raise
 
     probe = NavigationProbe()
     executor.add_node(probe)
@@ -343,6 +361,7 @@ def reset_gazebo_env(gazebo_env):
 class TestNavigationSimulation:
     def test_navigate_with_voice_and_obstacle(self, gazebo_env, reset_gazebo_env):
         probe = gazebo_env["probe"]
+        mock_stop = gazebo_env["mock_stop"]
 
         cmd_vel_msgs = []
         cmd_sub = probe.create_subscription(
@@ -387,6 +406,17 @@ class TestNavigationSimulation:
             pytest.fail("Voice command should trigger non-zero cmd_vel")
 
         probe.destroy_subscription(voice_cmd_sub)
+        with mock_stop._lock:
+            stop_call_count = len(mock_stop.calls)
+        stop_msg = String()
+        stop_msg.data = "停止"
+        pub.publish(stop_msg)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            with mock_stop._lock:
+                if len(mock_stop.calls) > stop_call_count:
+                    break
+            time.sleep(0.05)
         probe.destroy_publisher(pub)
 
     def test_stop_zeros_cmd_vel(self, gazebo_env, reset_gazebo_env):
