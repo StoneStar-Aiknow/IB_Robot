@@ -632,7 +632,7 @@ def _patch_pytorch_gelu_tanh_npu() -> list[tuple[Any, str, Any]]:
 
 
 def _patch_gemma_eager_attention(
-    *, fp16_softmax: bool = False, mqa_broadcast: bool = False
+    *, softmax_in_model_dtype: bool = False, mqa_broadcast: bool = False
 ) -> list[tuple[Any, str, Any]]:
     """Cast value_states to query dtype in eager_attention_forward.
 
@@ -658,11 +658,12 @@ def _patch_gemma_eager_attention(
       mathematically identical and only changes when the singleton K/V head can
       broadcast (``num_kv_heads == 1``); GQA layers fall back to ``repeat_kv``.
 
-    * ``fp16_softmax`` — keep the score matrix / softmax in the query dtype
-      (fp16) instead of upcasting to fp32, removing the per-layer fp32 ``Cast``
+    * ``softmax_in_model_dtype`` — keep the score matrix / softmax in the query
+      dtype instead of upcasting to fp32, removing the per-layer fp32 ``Cast``
       around the (B, H, Sq, Sk) score matrix and halving the softmax cost.
-      Requires the additive mask to be fp16-safe (``finfo(fp16).min``); the mask
-      is cast to the score dtype here so a fully-masked row stays finite.
+      Requires the additive mask to use a sentinel representable by the score
+      dtype; the mask is cast to the score dtype here so a fully-masked row
+      stays finite.
     """
     import importlib
 
@@ -724,16 +725,15 @@ def _patch_gemma_eager_attention(
                     # Equal/ConstantOfShape/Where shape subgraph) that ATC keeps as
                     # real ops, materialising a full (B, H, Sq, key_len) mask in every
                     # one of the 18 expert layers (~0.4ms/inference regression).
-                    if fp16_softmax:
-                        # Keep the Add in the score (fp16) dtype so no fp32 Cast
-                        # is inserted around the (B,H,Sq,Sk) score matrix. The
-                        # mask must already use a fp16-safe sentinel
-                        # (finfo(fp16).min); -2.38e38 would overflow to -inf.
+                    if softmax_in_model_dtype:
+                        # Keep the Add in the score dtype so no fp32 Cast is
+                        # inserted around the (B,H,Sq,Sk) score matrix. The mask
+                        # must already use a score-dtype-safe sentinel.
                         attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
                     else:
                         attn_weights = attn_weights + attention_mask
 
-                if fp16_softmax:
+                if softmax_in_model_dtype:
                     attn_weights = nn.functional.softmax(attn_weights, dim=-1).to(query.dtype)
                 else:
                     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
@@ -750,10 +750,10 @@ def _patch_gemma_eager_attention(
         mod.eager_attention_forward = patched
         undo_log.append((mod, "eager_attention_forward", orig))
         LOGGER.info(
-            "Patched %s.eager_attention_forward (value→query dtype, mqa_broadcast=%s, fp16_softmax=%s)",
+            "Patched %s.eager_attention_forward (value→query dtype, mqa_broadcast=%s, softmax_in_model_dtype=%s)",
             mod_path,
             mqa_broadcast,
-            fp16_softmax,
+            softmax_in_model_dtype,
         )
 
     return undo_log
@@ -1757,7 +1757,7 @@ _PATCH_REGISTRY: list[tuple[str, Any]] = [
 def _build_patch_registry(
     use_npu_ops: bool,
     *,
-    fp16_softmax: bool = False,
+    softmax_in_model_dtype: bool = False,
     mqa_broadcast: bool = False,
     fast_gelu: bool = False,
 ) -> list[tuple[str, Any]]:
@@ -1770,9 +1770,9 @@ def _build_patch_registry(
     ``NPURotaryMul`` ONNX node).  Future NPU-affine optimizations
     (flash-attention, layernorm, qkv fusion) gate on this same flag.
 
-    ``fp16_softmax`` / ``mqa_broadcast`` are action-expert-only attention
-    optimisations threaded into :func:`_patch_gemma_eager_attention`; they
-    default off so the VLM export (host-side fp32 prefix mask) is unchanged.
+    ``softmax_in_model_dtype`` / ``mqa_broadcast`` are action-expert-only
+    attention optimisations threaded into :func:`_patch_gemma_eager_attention`;
+    they default off so the VLM export (host-side fp32 prefix mask) is unchanged.
 
     ``fast_gelu`` routes gelu_pytorch_tanh through Ascend NPUFastGelu.  It is
     faster but numerically different from the tanh GELU used by PyTorch, so it
@@ -1804,11 +1804,11 @@ def _build_patch_registry(
         (
             "eager_attention (value→query dtype"
             + (", mqa_broadcast" if mqa_broadcast else "")
-            + (", fp16_softmax" if fp16_softmax else "")
+            + (", softmax_in_model_dtype" if softmax_in_model_dtype else "")
             + ")",
             functools.partial(
                 _patch_gemma_eager_attention,
-                fp16_softmax=fp16_softmax,
+                softmax_in_model_dtype=softmax_in_model_dtype,
                 mqa_broadcast=mqa_broadcast,
             ),
         )
@@ -1847,7 +1847,7 @@ def _build_patch_registry(
 def ascend_onnx_export_patches(
     use_npu_ops: bool = False,
     *,
-    fp16_softmax: bool = False,
+    softmax_in_model_dtype: bool = False,
     mqa_broadcast: bool = False,
     fast_gelu: bool = False,
 ):
@@ -1863,9 +1863,10 @@ def ascend_onnx_export_patches(
             reshape-based form.  The resulting graph requires an ATC
             custom-op plugin and cannot be verified with ORT CPU.  Future
             NPU-affine optimizations gate on this same flag.
-        fp16_softmax: Action-expert only.  Keep the attention score matrix
-            and softmax in fp16 (no fp32 upcast Cast).  Requires a fp16-safe
-            additive mask sentinel.  Leave ``False`` for the VLM export.
+        softmax_in_model_dtype: Action-expert only.  Keep the attention score
+            matrix and softmax in query/model dtype (no fp32 upcast Cast).
+            Requires an additive mask sentinel representable by that dtype.
+            Leave ``False`` for the VLM export.
         mqa_broadcast: Action-expert only.  Skip the ``repeat_kv`` Expand for
             multi-query layers and rely on matmul broadcasting instead.
         fast_gelu: Route gelu_pytorch_tanh to NPUFastGelu. Disabled by default
@@ -1881,7 +1882,7 @@ def ascend_onnx_export_patches(
 
     for label, patch_fn in _build_patch_registry(
         use_npu_ops,
-        fp16_softmax=fp16_softmax,
+        softmax_in_model_dtype=softmax_in_model_dtype,
         mqa_broadcast=mqa_broadcast,
         fast_gelu=fast_gelu,
     ):

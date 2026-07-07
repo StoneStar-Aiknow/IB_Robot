@@ -72,12 +72,6 @@ _IBROBOT_ONLY_KEYS: frozenset[str] = frozenset(
         # HMM (Houmo LQ50 / M50 xh2) backend hints
         "is_hmm_enabled",
         "hmm_model_path",
-        # Ascend OM backend hints (written into config.json by the OM export
-        # tooling; not part of the upstream lerobot policy dataclasses).
-        "is_ascend_om_enabled",
-        "om_vlm_model_path",
-        "om_action_expert_model_path",
-        "om_model_path",
     }
 )
 

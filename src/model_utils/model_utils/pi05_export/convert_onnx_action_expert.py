@@ -490,7 +490,7 @@ def main() -> int:
     # Apply Ascend ATC compatibility patches during ONNX export
     with ascend_onnx_export_patches(
         use_npu_ops=use_npu_ops,
-        fp16_softmax=softmax_in_model_dtype,
+        softmax_in_model_dtype=softmax_in_model_dtype,
         mqa_broadcast=True,
         fast_gelu=bool(args.fast_gelu),
     ):
