@@ -123,6 +123,21 @@ robot:
           names: ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"]
 ```
 
+## Grasp execution target gripper
+
+真机抓取配置可在 robot YAML 的 `robot.grasp_execution.target_gripper` 下声明目标夹爪几何。
+SO101 单动爪使用 `fixed_finger_contact_ee` 作为固定指侧参考点，`closing_axis_ee` 表示从固定指
+指向目标宽度中心的方向。执行脚本会根据 GraspGen 候选的 `target_width_m` 计算有效接触中心：
+
+```text
+effective_center = fixed_finger_contact_ee
+                 + closing_axis_ee * 0.5 * (target_width_m + width_clearance_m)
+                 + closing_axis_ee * fixed_finger_margin_m
+```
+
+`fixed_finger_margin_m` 是额外远离固定指的安全距离，用于降低固定指先碰物体边缘或上表面的风险；
+当前 SO101 RealSense 抓取配置默认使用 `0.003 m`。
+
 ## 控制模式配置
 
 robot_config 包支持双控制模式，以满足不同 AI 模型的需求：

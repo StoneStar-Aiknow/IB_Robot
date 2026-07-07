@@ -50,12 +50,14 @@ robot:
     target_gripper:
       type: asymmetric_single_moving_jaw
       ee_frame: gripper
-      # Chosen so fallback_width_m + width_clearance_m keeps the old effective
-      # contact center near [0.005, 0.0, -0.075].
-      fixed_finger_contact_ee: [-0.014, 0.0, -0.075]
+      # Aligned to the finger step contact region described in the GraspGen/SO101
+      # runtime notes; fallback width keeps the effective center near z=-0.080.
+      fixed_finger_contact_ee: [-0.014, 0.0, -0.080]
       # Vector from the fixed finger contact point toward the target width center.
       # It must align with the GraspGen source gripper width axis after source_to_ee_rpy.
       closing_axis_ee: [1.0, 0.0, 0.0]
+      # Extra offset away from the fixed finger to reduce edge/top-first contact.
+      fixed_finger_margin_m: 0.003
       width_clearance_m: 0.003
       min_width_m: 0.008
       max_width_m: 0.080
