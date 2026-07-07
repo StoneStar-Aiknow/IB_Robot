@@ -17,7 +17,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 logger = logging.getLogger(__name__)
-_VALID_TABLETOP_FILTER_MODES = {"strict", "adaptive", "soft"}
+_VALID_TABLETOP_FILTER_MODES = {"strict", "adaptive", "soft", "diagnostic"}
 
 _LOCAL_BACKEND_REQUIRES_CUDA = (
     "GraspGen local backend requires CUDA. The upstream GraspGenSampler "
@@ -67,6 +67,14 @@ class GraspDiagnostic:
     valid_depth_pixel_count: int = 0
     valid_depth_in_mask_count: int = 0
     valid_depth_ratio_in_mask: float = 0.0
+    object_cloud_completion_enabled: bool = False
+    object_cloud_completion_mode: str = "none"
+    object_point_count_raw: int = 0
+    object_point_count_completed: int = 0
+    object_completion_added_count: int = 0
+    object_prismatic_extrude_enabled: bool = False
+    object_prismatic_extrude_added_count: int = 0
+    object_point_count_graspgen_input: int = 0
     object_point_count: int = 0
     scene_point_count: int = 0
     raw_grasp_count: int = 0
@@ -332,6 +340,292 @@ def _populate_depth_mask_diagnostics(mask: np.ndarray, depth_m: np.ndarray, diag
         diag.valid_depth_ratio_in_mask = diag.valid_depth_in_mask_count / diag.mask_pixel_count
 
 
+def _points_from_pixels(
+    depth_m: np.ndarray,
+    ys: np.ndarray,
+    xs: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+):
+    zs = depth_m[ys, xs]
+    x3d = (xs - cx) * zs / fx
+    y3d = (ys - cy) * zs / fy
+    return np.stack([x3d, y3d, zs], axis=-1).astype(np.float32)
+
+
+def complete_object_cloud_from_mask_depth(
+    depth_m: np.ndarray,
+    segmentation_mask: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    *,
+    max_added_points: int = 5000,
+    kernel_size: int = 5,
+    min_neighbors: int = 6,
+) -> np.ndarray:
+    """Fill small target-mask depth holes using local depth."""
+    if max_added_points <= 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    import cv2
+
+    mask = segmentation_mask > 0
+    valid = np.isfinite(depth_m) & (depth_m > 0) & mask
+    holes = mask & ~valid
+    if not holes.any():
+        return np.empty((0, 3), dtype=np.float32)
+
+    if not valid.any():
+        return np.empty((0, 3), dtype=np.float32)
+
+    k = max(3, int(kernel_size))
+    if k % 2 == 0:
+        k += 1
+    kernel = np.ones((k, k), dtype=np.float32)
+    valid_f = valid.astype(np.float32)
+    depth_sum = cv2.filter2D((depth_m * valid_f).astype(np.float32), -1, kernel, borderType=cv2.BORDER_CONSTANT)
+    neighbor_count = cv2.filter2D(valid_f, -1, kernel, borderType=cv2.BORDER_CONSTANT)
+
+    fill = holes & (neighbor_count >= float(min_neighbors))
+    ys, xs = np.where(fill)
+    if len(ys) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    if len(ys) > max_added_points:
+        keep = np.linspace(0, len(ys) - 1, max_added_points, dtype=np.int64)
+        ys = ys[keep]
+        xs = xs[keep]
+
+    completed_depth = depth_m.copy()
+    completed_depth[ys, xs] = depth_sum[ys, xs] / neighbor_count[ys, xs]
+    return _points_from_pixels(completed_depth, ys, xs, fx, fy, cx, cy)
+
+
+def complete_object_cloud_prismatic_extrude(
+    object_points: np.ndarray,
+    scene_points: np.ndarray | None,
+    *,
+    max_added_points: int = 8000,
+    num_layers: int = 8,
+    max_object_height_m: float = 0.10,
+    ransac_distance_threshold: float = 0.006,
+    ransac_min_inlier_ratio: float = 0.15,
+    boundary_bins: int = 144,
+    boundary_quantile: float = 0.96,
+    min_height_m: float = 0.003,
+    seed: int = 0,
+) -> np.ndarray:
+    """Connect the visible surface silhouette to the table as a hollow shell."""
+    pts = np.asarray(object_points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 20:
+        return np.empty((0, 3), dtype=np.float32)
+    finite = pts[np.isfinite(pts).all(axis=1)]
+    if len(finite) < 20:
+        return np.empty((0, 3), dtype=np.float32)
+    if scene_points is None:
+        return np.empty((0, 3), dtype=np.float32)
+
+    scene = np.asarray(scene_points, dtype=np.float64)
+    scene = scene[np.isfinite(scene).all(axis=1)]
+    if len(scene) < 100:
+        return np.empty((0, 3), dtype=np.float32)
+
+    fit = fit_table_plane_ransac(
+        scene,
+        positive_reference=finite.mean(axis=0),
+        distance_threshold=float(ransac_distance_threshold),
+        min_inlier_ratio=float(ransac_min_inlier_ratio),
+        seed=seed,
+    )
+    if fit.plane is None:
+        return np.empty((0, 3), dtype=np.float32)
+
+    normal = np.asarray(fit.plane.normal, dtype=np.float64)
+    normal_norm = float(np.linalg.norm(normal))
+    if normal_norm <= 1e-9:
+        return np.empty((0, 3), dtype=np.float32)
+    normal = normal / normal_norm
+    d = float(fit.plane.d)
+
+    if np.median(finite @ normal + d) < 0.0:
+        normal = -normal
+        d = -d
+
+    # Build tangent basis
+    ref = np.array([1.0, 0.0, 0.0]) if abs(normal[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    t1 = ref - normal * np.dot(ref, normal)
+    t1 = t1 / np.linalg.norm(t1)
+    t2 = np.cross(normal, t1)
+
+    signed = finite @ normal + d
+    height_cap = float(max_object_height_m)
+    finite = finite[(signed >= float(min_height_m)) & (signed <= height_cap)]
+    signed = finite @ normal + d
+    if len(finite) < 20:
+        return np.empty((0, 3), dtype=np.float32)
+
+    tan_pts = np.column_stack([finite @ t1, finite @ t2])
+    centroid_tan = np.median(tan_pts, axis=0)
+    relative = tan_pts - centroid_tan
+    angles = np.arctan2(relative[:, 1], relative[:, 0])
+    radii = np.linalg.norm(relative, axis=1)
+
+    n_bins = max(16, int(boundary_bins))
+    quantile = min(max(float(boundary_quantile), 0.5), 1.0)
+    bin_edges = np.linspace(-np.pi, np.pi, n_bins + 1)
+    boundary_points = []
+    boundary_angles = []
+    for i in range(n_bins):
+        mask = (angles >= bin_edges[i]) & (angles < bin_edges[i + 1])
+        if not mask.any():
+            continue
+        local_indices = np.flatnonzero(mask)
+        threshold = np.quantile(radii[mask], quantile)
+        shell_indices = local_indices[radii[mask] >= threshold]
+        if len(shell_indices) == 0:
+            shell_indices = local_indices[[int(np.argmax(radii[mask]))]]
+        weights = radii[shell_indices]
+        if float(weights.sum()) <= 1e-9:
+            top_point = finite[shell_indices].mean(axis=0)
+        else:
+            top_point = np.average(finite[shell_indices], axis=0, weights=weights)
+        boundary_points.append(top_point)
+        boundary_angles.append(float((bin_edges[i] + bin_edges[i + 1]) * 0.5))
+
+    if len(boundary_points) < 5:
+        return np.empty((0, 3), dtype=np.float32)
+    order = np.argsort(boundary_angles)
+    boundary_pts = np.asarray(boundary_points, dtype=np.float64)[order]
+    boundary_signed = np.maximum(boundary_pts @ normal + d, float(min_height_m))
+    projected_pts = boundary_pts - boundary_signed[:, None] * normal
+
+    layers = max(2, int(num_layers))
+    vertical_fractions = np.linspace(0.0, 1.0, layers + 2)[1:]
+    wall_parts = []
+    for i in range(len(boundary_pts)):
+        j = (i + 1) % len(boundary_pts)
+        top_a = boundary_pts[i]
+        top_b = boundary_pts[j]
+        foot_a = projected_pts[i]
+        foot_b = projected_pts[j]
+        edge_len = float(np.linalg.norm(foot_b - foot_a))
+        edge_samples = max(3, int(np.ceil(edge_len / 0.0025)))
+        for edge_frac in np.linspace(0.0, 1.0, edge_samples, endpoint=False):
+            top = (1.0 - edge_frac) * top_a + edge_frac * top_b
+            foot = (1.0 - edge_frac) * foot_a + edge_frac * foot_b
+            for vertical_frac in vertical_fractions:
+                wall_parts.append((1.0 - vertical_frac) * top + vertical_frac * foot)
+
+    if not wall_parts:
+        return np.empty((0, 3), dtype=np.float32)
+
+    wall_pts = np.asarray(wall_parts, dtype=np.float64)
+    max_points = int(max_added_points)
+    if max_points > 0 and len(wall_pts) > max_points:
+        _ = seed
+        idx = np.linspace(0, len(wall_pts) - 1, max_points, dtype=np.int64)
+        wall_pts = wall_pts[idx]
+
+    return wall_pts.astype(np.float32, copy=False)
+
+
+def complete_scene_cloud_table_holes(
+    scene_points: np.ndarray,
+    *,
+    footprint_points: np.ndarray | None = None,
+    max_added_points: int = 8000,
+    grid_size: float = 0.005,
+    plane_distance_threshold: float = 0.02,
+    ransac_distance_threshold: float = 0.008,
+    ransac_min_inlier_ratio: float = 0.10,
+    seed: int = 0,
+) -> np.ndarray:
+    """Fill ALL discontinuous/missing areas on the table surface.
+
+    Fits the table plane from scene points via RANSAC, projects table-near
+    points onto a 2D tangent-space grid, then fills every empty cell within
+    the table's occupied region with a point on the plane. This covers:
+    - Object occlusion (table hidden under the object)
+    - Sensor depth holes (reflective/dark surfaces)
+    - Edge discontinuities
+    Returns points in the same frame as ``scene_points``.
+    """
+
+    pts = np.asarray(scene_points, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 100:
+        return np.empty((0, 3), dtype=np.float32)
+
+    fit = fit_table_plane_ransac(
+        pts,
+        distance_threshold=float(ransac_distance_threshold),
+        min_inlier_ratio=float(ransac_min_inlier_ratio),
+        seed=seed,
+    )
+    if fit.plane is None:
+        return np.empty((0, 3), dtype=np.float32)
+
+    normal = np.asarray(fit.plane.normal, dtype=np.float64)
+    norm = float(np.linalg.norm(normal))
+    if norm <= 1e-9:
+        return np.empty((0, 3), dtype=np.float32)
+    normal = normal / norm
+    d = float(fit.plane.d)
+    if normal[2] > 0:
+        normal = -normal
+        d = -d
+
+    # Select points near the table plane
+    signed = pts @ normal + d
+    on_table = pts[np.abs(signed) < float(plane_distance_threshold)]
+    if len(on_table) < 50:
+        return np.empty((0, 3), dtype=np.float32)
+
+    # Build tangent basis on the table plane
+    ref = np.array([1.0, 0.0, 0.0]) if abs(normal[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    t1 = ref - normal * np.dot(ref, normal)
+    t1 = t1 / np.linalg.norm(t1)
+    t2 = np.cross(normal, t1)
+
+    # Project ALL table-near points onto tangent space
+    u = on_table @ t1
+    v = on_table @ t2
+    u_min, u_max = float(u.min()), float(u.max())
+    v_min, v_max = float(v.min()), float(v.max())
+    u_span, v_span = u_max - u_min, v_max - v_min
+    if u_span < 0.02 or v_span < 0.02:
+        return np.empty((0, 3), dtype=np.float32)
+
+    # Build occupancy grid from ALL table points
+    u_bins = max(2, int(u_span / float(grid_size)))
+    v_bins = max(2, int(v_span / float(grid_size)))
+    grid = np.zeros((u_bins, v_bins), dtype=bool)
+    ui = np.clip(((u - u_min) / float(grid_size)).astype(int), 0, u_bins - 1)
+    vi = np.clip(((v - v_min) / float(grid_size)).astype(int), 0, v_bins - 1)
+    grid[ui, vi] = True
+
+    # Fill ALL empty cells within the table's bounding region — not just
+    # enclosed holes. This covers object occlusion, sensor gaps, edge
+    # discontinuities, and any connected-to-boundary missing areas.
+    hole_u, hole_v = np.where(~grid)
+    if len(hole_u) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+
+    if len(hole_u) > int(max_added_points):
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(len(hole_u), int(max_added_points), replace=False)
+        hole_u, hole_v = hole_u[idx], hole_v[idx]
+
+    # Generate 3D points on the plane at all hole positions
+    u_pts = u_min + (hole_u + 0.5) * float(grid_size)
+    v_pts = v_min + (hole_v + 0.5) * float(grid_size)
+    origin = -d * normal
+    pts_3d = origin[None, :] + u_pts[:, None] * t1[None, :] + v_pts[:, None] * t2[None, :]
+    return pts_3d.astype(np.float32, copy=False)
+
+
 class GraspGenWrapper:
     def __init__(
         self,
@@ -434,6 +728,14 @@ class GraspGenWrapper:
         target_width_percentile_high: float = 95.0,
         target_width_min_m: float = 0.005,
         target_width_max_m: float = 0.14,
+        enable_object_cloud_completion: bool = False,
+        object_cloud_completion_mode: str = "none",
+        object_cloud_completion_max_points: int = 5000,
+        object_cloud_completion_kernel_size: int = 5,
+        object_cloud_completion_min_neighbors: int = 6,
+        enable_object_cloud_prismatic_extrude: bool = False,
+        object_cloud_prismatic_extrude_max_points: int = 8000,
+        object_cloud_prismatic_extrude_layers: int = 8,
     ) -> tuple[list[GraspCandidate], GraspDiagnostic]:
         from grasp_gen.grasp_server import GraspGenSampler as _GS
         from grasp_gen.utils.point_cloud_utils import (
@@ -443,6 +745,15 @@ class GraspGenWrapper:
         )
 
         diag = GraspDiagnostic()
+        completion_mode = object_cloud_completion_mode.strip().lower()
+        if completion_mode not in {"none", "mask_depth_inpaint"}:
+            raise ValueError(
+                f"invalid object_cloud_completion_mode {object_cloud_completion_mode!r}; "
+                "expected one of ['none', 'mask_depth_inpaint']"
+            )
+        completion_enabled = bool(enable_object_cloud_completion and completion_mode == "mask_depth_inpaint")
+        diag.object_cloud_completion_enabled = completion_enabled
+        diag.object_cloud_completion_mode = completion_mode if completion_enabled else "none"
         mode = tabletop_filter_mode.strip().lower()
         if mode not in _VALID_TABLETOP_FILTER_MODES:
             raise ValueError(
@@ -492,6 +803,7 @@ class GraspGenWrapper:
         )
 
         diag.object_point_count = len(object_pc)
+        diag.object_point_count_raw = len(object_pc)
         diag.scene_point_count = len(scene_pc) if scene_pc is not None else 0
         logger.info("Point clouds: scene=%d, object=%d", diag.scene_point_count, diag.object_point_count)
 
@@ -504,11 +816,73 @@ class GraspGenWrapper:
             logger.warning(diag.failure_reason)
             return [], diag
 
-        object_pc_tensor = torch.from_numpy(object_pc).float()
+        if completion_enabled:
+            completed_points = complete_object_cloud_from_mask_depth(
+                depth_m,
+                mask_for_pc,
+                fx,
+                fy,
+                cx,
+                cy,
+                max_added_points=int(object_cloud_completion_max_points),
+                kernel_size=int(object_cloud_completion_kernel_size),
+                min_neighbors=int(object_cloud_completion_min_neighbors),
+            )
+            if len(completed_points):
+                object_pc = np.vstack([object_pc, completed_points.astype(object_pc.dtype, copy=False)])
+            diag.object_completion_added_count = int(len(completed_points))
+            diag.object_point_count_completed = int(len(object_pc))
+            diag.object_point_count = int(len(object_pc))
+            logger.info(
+                "Object PC completion: mode=%s raw=%d depth_added=%d completed=%d",
+                completion_mode,
+                diag.object_point_count_raw,
+                len(completed_points),
+                diag.object_point_count_completed,
+            )
+        else:
+            diag.object_point_count_completed = int(len(object_pc))
+
+        diag.object_prismatic_extrude_enabled = bool(enable_object_cloud_prismatic_extrude)
+        object_pc_shell = object_pc
+        if enable_object_cloud_prismatic_extrude and scene_pc is not None and len(scene_pc) > 0:
+            prismatic_points = complete_object_cloud_prismatic_extrude(
+                object_pc,
+                scene_pc,
+                max_added_points=int(object_cloud_prismatic_extrude_max_points),
+                num_layers=int(object_cloud_prismatic_extrude_layers),
+            )
+            if len(prismatic_points):
+                object_pc = np.vstack([object_pc, prismatic_points.astype(object_pc.dtype, copy=False)])
+            diag.object_prismatic_extrude_added_count = int(len(prismatic_points))
+            diag.object_point_count_completed = int(len(object_pc))
+            object_pc_shell = object_pc
+            logger.info(
+                "Object PC prismatic extrude: added=%d completed=%d",
+                len(prismatic_points),
+                diag.object_point_count_completed,
+            )
+
+        # Fill holes in the table surface itself (scene cloud completion).
+        if scene_pc is not None and len(scene_pc) > 0:
+            scene_hole_pts = complete_scene_cloud_table_holes(
+                scene_pc,
+                footprint_points=object_pc,
+                max_added_points=int(object_cloud_prismatic_extrude_max_points),
+            )
+            if len(scene_hole_pts):
+                scene_pc = np.vstack([scene_pc, scene_hole_pts.astype(scene_pc.dtype, copy=False)])
+                logger.info("Scene cloud table-hole fill: added=%d total=%d", len(scene_hole_pts), len(scene_pc))
+
+        # GraspGen gets a hollow surface shell: visible object points, optional
+        # mask-depth surface inpaint, and silhouette side walls to the table. We
+        # never add interior volume samples.
+        object_pc_tensor = torch.from_numpy(object_pc_shell).float()
         pc_filtered, _ = point_cloud_outlier_removal(object_pc_tensor)
         object_pc_clean = pc_filtered.numpy()
         diag.object_point_count = len(object_pc_clean)
-        logger.info("Object PC after outlier removal: %d points", len(object_pc_clean))
+        diag.object_point_count_graspgen_input = len(object_pc_clean)
+        logger.info("Object PC for GraspGen inference (hollow shell): %d points", len(object_pc_clean))
 
         if len(object_pc_clean) < 20:
             diag.failure_stage = "point_cloud"
@@ -731,9 +1105,19 @@ class GraspGenWrapper:
                             adaptive_tabletop_hard_floor,
                             diag.tabletop_best_candidate_clearance_m,
                         )
-                grasps_final = filtered_grasps
-                confidences_final = filtered_confidences
-                diag.tabletop_filter_after = len(grasps_final)
+                if mode == "diagnostic":
+                    diag.tabletop_relaxed = len(filtered_grasps) < len(grasps_final)
+                    diag.tabletop_filter_after = len(grasps_final)
+                    logger.info(
+                        "Tabletop diagnostic mode: kept %d grasps while %d/%d passed Robotiq tabletop clearance",
+                        len(grasps_final),
+                        len(filtered_grasps),
+                        diag.tabletop_filter_before,
+                    )
+                else:
+                    grasps_final = filtered_grasps
+                    confidences_final = filtered_confidences
+                    diag.tabletop_filter_after = len(grasps_final)
                 if diag.tabletop_filter_after == 0 and diag.tabletop_filter_before > 0:
                     diag.failure_stage = "tabletop_filter"
                     diag.failure_reason = (

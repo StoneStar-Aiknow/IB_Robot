@@ -1,6 +1,10 @@
 import numpy as np
 
-from manipulation_service.graspgen_wrapper import GraspGenWrapper, TablePlane
+from manipulation_service.graspgen_wrapper import _VALID_TABLETOP_FILTER_MODES, GraspGenWrapper, TablePlane
+
+
+def test_tabletop_filter_modes_include_diagnostic():
+    assert "diagnostic" in _VALID_TABLETOP_FILTER_MODES
 
 
 def test_tabletop_pregrasp_sweep_uses_source_mesh_and_pr200_axis():

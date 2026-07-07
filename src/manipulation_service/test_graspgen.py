@@ -667,9 +667,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--tabletop-filter-mode",
-        choices=("strict", "adaptive", "soft"),
+        choices=("strict", "adaptive", "soft", "diagnostic"),
         default="strict",
-        help="Tabletop filtering mode: strict keeps fixed thresholds; adaptive relaxes low-profile objects; soft also keeps near-safe fallback grasps.",
+        help=(
+            "Tabletop filtering mode: strict keeps fixed thresholds; adaptive relaxes low-profile objects; "
+            "soft also keeps near-safe fallback grasps; diagnostic records Robotiq tabletop clearance "
+            "without filtering candidates."
+        ),
     )
     parser.add_argument("--adaptive-tabletop-low-profile-height", type=float, default=0.035)
     parser.add_argument("--adaptive-tabletop-clearance-min", type=float, default=0.001)
