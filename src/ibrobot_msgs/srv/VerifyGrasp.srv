@@ -1,0 +1,26 @@
+# Verify whether the latest executed grasp is holding an object.
+#
+# This service is intended for post-close or post-lift verification. The
+# verifier samples its configured sensor topics at service time and returns a
+# fused result. A wrist camera occlusion is diagnostic evidence, not a hard
+# failure.
+
+string task_id
+string text_prompt
+GraspCandidate grasp
+
+# Optional planner-side target width. Use 0.0 when unavailable.
+float32 expected_target_width_m
+
+# Optional delay before sampling post-grasp sensors.
+float32 post_grasp_wait_s
+---
+uint8 STATUS_FAILED=0
+uint8 STATUS_SUCCESS=1
+uint8 STATUS_UNCERTAIN=2
+
+bool success
+uint8 status
+float32 confidence
+string message
+string[] evidence
