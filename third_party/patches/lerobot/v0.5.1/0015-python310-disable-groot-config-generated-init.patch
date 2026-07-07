@@ -1,0 +1,24 @@
+From 3e36f43e32ff4ba3ce4a5981ca80b3b30dda671d Mon Sep 17 00:00:00 2001
+From: IB Robot Setup <ibrobot@example.invalid>
+Date: Tue, 23 Jun 2026 10:48:02 +0800
+Subject: [PATCH] python310: disable groot config generated init
+
+---
+ src/lerobot/policies/groot/groot_n1.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/lerobot/policies/groot/groot_n1.py b/src/lerobot/policies/groot/groot_n1.py
+index 06ff5a04..ac40ac8a 100644
+--- a/src/lerobot/policies/groot/groot_n1.py
++++ b/src/lerobot/policies/groot/groot_n1.py
+@@ -173,7 +173,7 @@ N_COLOR_CHANNELS = 3
+ 
+ 
+ # config
+-@dataclass
++@dataclass(init=False)
+ class GR00TN15Config(PretrainedConfig):
+     model_type = "gr00t_n1_5"
+     backbone_cfg: dict = field(init=False, metadata={"help": "Backbone configuration."})
+-- 
+2.43.0

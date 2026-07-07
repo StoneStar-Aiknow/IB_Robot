@@ -102,7 +102,7 @@ echo "== lerobot_filter_series regression harness =="
 # Ubuntu 22.04 / Python 3.10 — keeps the default compatibility series plus
 # the KD training prerequisites and distillation patch.
 run_fixture "ubuntu-22.04 / py3.10 / desktop profile" \
-    "0001-python-compat-syntax-and-metadata.patch,0002-python-compat-min-version-3.10.patch,0003-python-compat-typing-unpack.patch,0005-compat-add-npu-device-detection.patch,0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0014-training-logs.patch" \
+    "0001-python-compat-syntax-and-metadata.patch,0002-python-compat-min-version-3.10.patch,0003-python-compat-typing-unpack.patch,0005-compat-add-npu-device-detection.patch,0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0014-training-logs.patch,0015-python310-disable-groot-config-generated-init.patch" \
     IBR_HOST_PYTHON_VERSION=3.10 \
     IBR_LEROBOT_PROFILES=core,ros,hardware,dev,training,distillation \
     --
@@ -158,7 +158,7 @@ run_negative "malformed manifest exits 1" 1 \
 # HEAD matching commit_range.min must succeed and produce the same default
 # series as the baseline ubuntu fixture above.
 run_fixture "tag-binding / head_commit==range.min keeps default series" \
-    "0001-python-compat-syntax-and-metadata.patch,0002-python-compat-min-version-3.10.patch,0003-python-compat-typing-unpack.patch,0005-compat-add-npu-device-detection.patch,0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0014-training-logs.patch" \
+    "0001-python-compat-syntax-and-metadata.patch,0002-python-compat-min-version-3.10.patch,0003-python-compat-typing-unpack.patch,0005-compat-add-npu-device-detection.patch,0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0014-training-logs.patch,0015-python310-disable-groot-config-generated-init.patch" \
     IBR_HOST_PYTHON_VERSION=3.10 \
     IBR_LEROBOT_PROFILES=core,ros,hardware,dev,training,distillation \
     -- \

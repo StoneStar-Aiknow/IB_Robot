@@ -40,13 +40,9 @@ from torch import Tensor, nn
 if TYPE_CHECKING or _transformers_available:
     from transformers.models.auto import CONFIG_MAPPING
     from transformers.models.gemma import modeling_gemma
-    from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
-    from transformers.models.paligemma.modeling_paligemma import PaliGemmaForConditionalGeneration
 else:
     CONFIG_MAPPING = None
     modeling_gemma = None
-    GemmaForCausalLM = None
-    PaliGemmaForConditionalGeneration = None
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
@@ -54,6 +50,8 @@ from lerobot.policies.pretrained import PreTrainedPolicy, T
 from lerobot.utils.constants import (
     ACTION,
 )
+
+from model_utils.pi05_export.pi_gemma import PaliGemmaForConditionalGenerationWithPiGemma, PiGemmaForCausalLM
 
 
 # LoRA Implementation
@@ -175,9 +173,9 @@ def unflatten_kv(flat_tensor):
         from transformers.cache_utils import DynamicCache
 
         dyn = DynamicCache()
-        # DynamicCache.key_cache and .value_cache are lists of tensors
-        dyn.key_cache = [keys[i] for i in range(num_layers)]
-        dyn.value_cache = [values[i] for i in range(num_layers)]
+        # TF5.3: use update() to add key-value pairs per layer
+        for i in range(num_layers):
+            dyn.update(keys[i], values[i], layer_idx=i)
         return dyn
     except Exception:
         # Fallback: return the old list-of-dicts format
@@ -330,8 +328,8 @@ class PaliGemmaWithExpertModel(
             adarms_cond_dim=action_expert_config.width if use_adarms[1] else None,
         )
 
-        self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
-        self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
+        self.paligemma = PaliGemmaForConditionalGenerationWithPiGemma(config=vlm_config_hf)
+        self.gemma_expert = PiGemmaForCausalLM(config=action_expert_config_hf)
         self.gemma_expert.model.embed_tokens = None
 
         # Store LoRA configuration
@@ -358,7 +356,7 @@ class PaliGemmaWithExpertModel(
 
         # Apply LoRA to PaliGemma language model
         paligemma_layers = self._apply_lora_to_model(
-            self.paligemma.language_model, lora_r, lora_alpha, lora_dropout, target_modules
+            self.paligemma.model.language_model, lora_r, lora_alpha, lora_dropout, target_modules
         )
         total_lora_layers += paligemma_layers
 
@@ -410,10 +408,11 @@ class PaliGemmaWithExpertModel(
                 param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor):
-        return self.paligemma.model.get_image_features(image)
+        image_outputs = self.paligemma.model.vision_tower(image, return_dict=True)
+        return self.paligemma.model.multi_modal_projector(image_outputs.last_hidden_state)
 
     def embed_language_tokens(self, tokens: torch.Tensor):
-        return self.paligemma.language_model.embed_tokens(tokens)
+        return self.paligemma.model.language_model.embed_tokens(tokens)
 
     def forward(
         self,
@@ -478,29 +477,19 @@ class PI05ActionExpertPytorch(nn.Module):
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
-        msg = """An incorrect transformer version is used, please create an issue on https://github.com/huggingface/lerobot/issues"""
-
-        try:
-            from transformers.models.siglip import check
-
-            if not check.check_whether_transformers_replace_is_installed_correctly():
-                raise ValueError(msg)
-        except ImportError:
-            raise ValueError(msg) from None
-
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
+        self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = True
+        self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = True
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
         logging.info("Enabled gradient checkpointing for PI05ActionExpertPytorch model")
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
+        self.paligemma_with_expert.paligemma.model.language_model.gradient_checkpointing = False
+        self.paligemma_with_expert.paligemma.model.vision_tower.gradient_checkpointing = False
         self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
         logging.info("Disabled gradient checkpointing for PI05ActionExpertPytorch model")
 

@@ -67,33 +67,73 @@ Nav2 使用静态地图与 RTAB-Map 提供的 `map → odom` 定位结果，不�
 | `cmd_vel_bridge_node` | cmd_vel → ros2_control 桥接 + 里程计发布 | `robot_navigation.cmd_vel_bridge_node` |
 | `save_rtabmap_map` | 保存 RTAB-Map OccupancyGrid 地图 | `robot_navigation.save_rtabmap_map` |
 
-## 快速开始
+## 使用入口
 
-### 1. 编译
+先按目的选择入口；完整机器人链路统一由 `robot_config` 启动，`robot_navigation` 只保留导航子系统、节点和 PC 端 RViz 预设。
 
-```bash
-cd ~/workspace/IB_Robot
-colcon build --packages-select robot_navigation robot_config
-source install/setup.bash
-```
+| 你要做什么 | 看哪一节 | 推荐命令入口 |
+|---|---|---|
+| 复刻建图与导航环境 | [环境复刻](#环境复刻) | `robot_config:=lekiwi_mapping` / `robot_config:=lekiwi_navi` |
+| 跑本包测试 | [测试验证](#测试验证) | `colcon test --packages-select robot_navigation` |
+| 验证完整 Gazebo/Nav2 仿真 | [测试验证](#测试验证) | `NAV_TEST_PROFILE=full colcon test --packages-select robot_config ...` |
+| 实机建图 | [建图流程](#建图流程) | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_mapping` |
+| 实机导航 | [导航流程](#导航流程) | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=teleop` |
+| PC 端观察 | [PC 端 RViz 观察](#pc-端-rviz-观察) | `lekiwi_mapping_rviz.launch.py` / `lekiwi_navigation_rviz.launch.py` |
+| 单独调试导航节点 | [底层调试入口](#底层调试入口) | `ros2 run robot_navigation ...` |
 
-### 2. 通过 robot_config 启动（推荐）
+`robot_config` 的优势：YAML 单一数据源，自动启动控制器、相机、TF、定位、Nav2 和导航节点，并通过 `control_mode` 切换运行模式。
 
-`robot_config` 集成了导航功能，通过 YAML 配置文件统一管理所有参数。以 `lekiwi_navi` 机器人为例：
+## 环境复刻
 
-```bash
-# 设置 ROS_DOMAIN_ID（避免与其他 ROS2 系统冲突）
-export ROS_DOMAIN_ID=<your_id>
+### 1. 运行环境选择
 
-# 遥操
-ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=teleop
+LeKiwi 建图和导航支持两类运行方式：
 
-# 导航评估模式（带推理）
-ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=navi
+| 模式 | ROS 节点运行位置 | Ubuntu PC 角色 | 适用场景 |
+|---|---|---|---|
+| openEuler 开发板主运行 | 资源较充足的开发板 | SSH + RViz 远程观察 | 实机复刻、板端验证 |
+| Ubuntu 单机运行 | Ubuntu PC / 笔记本 | 运行所有节点 + RViz | 本机调试、算法验证、没有开发板的联调 |
 
-```
+跨机器部署时，开发板和 PC 必须网络互通，并使用相同的 `ROS_DOMAIN_ID`。openEuler 方案下 Ubuntu 仍然是必需的观察端；Ubuntu 方案下 Ubuntu 是运行端。
 
-**配置示例** (`lekiwi_navi.yaml`):
+典型组合：
+
+| 组合 | ROS 节点跑在 | Ubuntu 角色 | 网络连接 | 设备接入 | 小车能否自由跑 |
+|---|---|---|---|---|---|
+| A | openEuler @ 开发板 | SSH + RViz | 网线接 Ubuntu PC | RealSense/底盘接开发板 | 否，小车在脚边 |
+| B | openEuler @ 开发板 | SSH + RViz | 网线接 Ubuntu 笔记本 | RealSense/底盘接开发板 | 是，笔记本跟着小车 |
+| C | openEuler @ 开发板 | SSH + RViz | WiFi | RealSense/底盘接开发板 | 是，PC 不动 |
+| D | Ubuntu @ 笔记本 | 运行 + RViz | 无跨机通信 | RealSense/底盘接笔记本 | 是，笔记本跟着小车 |
+| E | Ubuntu @ PC | 运行 + RViz | 无跨机通信 | RealSense/底盘接 PC | 否，小车在脚边 |
+
+推荐先用组合 A 验证主链路：网线稳定，小车在脚边，小范围完成建图、保存地图、加载地图和导航。需要小车真正自由跑时，再切到 B/C/D。
+
+### 2. 终端环境
+
+每个新终端都需要先加载 ROS 和工作区环境。具体加载方式参考 IB Robot 仓主目录下的 README，并确保开发板和 PC 使用相同的 `ROS_DOMAIN_ID`，例如 `<your_id>`。
+
+### 3. 编译
+
+编译方式参考 IB Robot 仓主目录下的 README。本文件只说明导航相关入口、测试和排查方法，不重复维护完整工作区编译命令。
+
+### 4. 硬件与网络注意事项
+
+- 使用 RealSense 深度相机时，必须接 USB 3.0 蓝口，不建议使用长 USB 延长线；深度流数据量大，USB 2.0 或长线容易导致掉帧、重枚举或无图像。
+- 底盘控制链默认走 `/dev/ttyACM0`，插拔顺序变化时可能变成 `/dev/ttyACM1`。
+- 推荐计算侧和执行侧分开供电：开发板 + USB 外设一套电源，底盘/机械臂电机一套电源，避免电机瞬时电流导致板子重启或 RealSense 掉线。
+- 完整导航链路会同时运行 RealSense、RTAB-Map、ros2_control、Nav2 和相关桥接节点，对 CPU 与内存资源要求较高；建议使用具备较高算力和较大内存资源的开发板，资源水平至少接近中高端边缘计算板，才能更稳定地跑完整链路。
+- WiFi 下如果 SSH/DDS 卡顿，优先确认两端 `ROS_DOMAIN_ID` 一致，再检查 DDS 实现、网卡绑定、单播 peers、路由器频段和 RealSense 带宽配置。
+
+### 5. robot_config 入口
+
+| 入口 YAML | 用途 | 启动命令 |
+|---|---|---|
+| `lekiwi_mapping.yaml` | base-only 建图：底盘 + RealSense + RTAB-Map mapping + cmd_vel_bridge | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_mapping` |
+| `lekiwi_navi.yaml` | 完整导航：加载静态地图 + Nav2 + RTAB-Map localization + EKF + cmd_vel_bridge | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=teleop` |
+
+建图和导航使用独立配置文件。`lekiwi_mapping` 只负责建图主链；`lekiwi_navi` 消费保存好的地图做定位与导航。
+
+`lekiwi_navi.yaml` 中导航相关配置形态如下：
 
 ```yaml
 navigation:
@@ -122,41 +162,25 @@ navigation:
     enabled: true
 ```
 
-**优势**:
-- YAML 单一数据源，统一配置管理
-- 自动启动相关组件（控制器、相机、TF、定位等）
-- 支持 `control_mode` 切换不同运行模式
+## 建图流程
 
-### 3. 部署模式
+建图入口使用 `lekiwi_mapping.yaml`，链路包含 base-only ros2_control、RealSense、TF、RTAB-Map mapping 和 `/cmd_vel` 底盘桥接。它不会自动启动键盘遥控，需要另一个终端发布 `/cmd_vel`。
 
-LeKiwi 建图和导航支持两种部署模式：
-
-1. 开发板主运行模式：除 RViz 外，`robot_config`、RealSense、ros2_control、RTAB-Map、Nav2 和底盘桥接等节点都运行在 openEuler 开发板；Ubuntu PC 只运行 RViz，通过相同 `ROS_DOMAIN_ID` 观察开发板上的 ROS 图。
-2. Ubuntu 单机模式：所有节点都运行在 Ubuntu PC，用于本机调试、算法验证或没有开发板参与的联调。
-
-两种模式使用相同的 `robot_config` 配置入口和 `robot_navigation` RViz 预设。跨机器部署时，需要确保开发板和 PC 网络互通，并使用相同的 ROS 2 域配置。
-
-### 4. RealSense RTAB-Map 建图
-
-建图入口使用独立的 `lekiwi_mapping.yaml`，避免污染 `lekiwi_navi.yaml` 的“已有地图导航/定位评估”语义。启动链路仍由 `robot_config` 读取 YAML 作为单一数据源，包含 base-only ros2_control、RealSense、TF、RTAB-Map mapping 和 `/cmd_vel` 底盘桥接。
-
-注意：`lekiwi_mapping.yaml` 只负责启动建图主链，并监听 `/cmd_vel`。它不会自动拉起键盘遥操节点，因此建图时需要由用户在另一个终端单独启动 `teleop_twist_keyboard` 或其他 `/cmd_vel` 发布端。
+终端 A 启动建图主链：
 
 ```bash
-export ROS_DOMAIN_ID=<your_id>
 ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_mapping
 ```
 
-另一个终端启动键盘遥操：
+终端 B 启动键盘遥控：
 
 ```bash
-export ROS_DOMAIN_ID=<your_id>
 ros2 run teleop_twist_keyboard teleop_twist_keyboard
 ```
 
-`teleop_twist_keyboard` 默认发布到 `/cmd_vel`，会被 `lekiwi_mapping.yaml` 中的 `navigation.cmd_vel_bridge.cmd_vel_topic: /cmd_vel` 消费。
+`teleop_twist_keyboard` 默认发布到 `/cmd_vel`，会被 `lekiwi_mapping.yaml` 中的 `navigation.cmd_vel_bridge.cmd_vel_topic: /cmd_vel` 消费。常用键位：`i` 前进、`,` 后退、`j` 左转、`l` 右转、`k` 停止；`w/x/e/c/q/z` 是速度倍率调整键。
 
-建图过程中用键盘遥操或其他 `/cmd_vel` 发布端驱动车辆覆盖场景。确认 `/rtabmap/map` 已持续发布后，在另一个终端保存地图：
+终端 C 保存地图：
 
 ```bash
 ros2 run robot_navigation save_rtabmap_map -f ~/.ros/ibrobot/maps/rtabmap
@@ -168,76 +192,131 @@ ros2 run robot_navigation save_rtabmap_map -f ~/.ros/ibrobot/maps/rtabmap
 ros2 run nav2_map_server map_saver_cli -t /rtabmap/map -f ~/.ros/ibrobot/maps/rtabmap
 ```
 
-输出文件为 `~/.ros/ibrobot/maps/rtabmap.yaml` 和 `~/.ros/ibrobot/maps/rtabmap.pgm`。后续导航使用 `lekiwi_navi.yaml` 中的 `navigation.nav2_bringup.map_file: "$(env HOME)/.ros/ibrobot/maps/rtabmap.yaml"` 加载该地图。
+输出约定：
 
-建议最少使用三个终端：
-
-1. 开发板终端 A：`lekiwi_mapping` 主链
-2. 开发板终端 B：`teleop_twist_keyboard`
-3. 开发板或 PC 终端 C：`save_rtabmap_map`
-
-如果需要 PC 侧在线观察，再额外开一个 PC 终端运行下面的 RViz 预设。
-
-### 4.1 PC 端远程 RViz 观察
-
-如果开发板上已经启动了 `lekiwi_mapping` 或 `lekiwi_navi`，PC 端不需要在板端本地打开 `RViz`。只要 PC 与开发板网络互通，并且使用相同的 `ROS_DOMAIN_ID`，就可以在 PC 上直接观察远端 topic。
-
-先在 PC 上加载环境：
-
-```bash
-export ROS_DOMAIN_ID=88
-source /opt/ros/humble/setup.bash
+```text
+~/.ros/ibrobot/maps/rtabmap.yaml     # Nav2 map_server 加载
+~/.ros/ibrobot/maps/rtabmap.pgm      # 占据栅格图像
+~/.ros/ibrobot/maps/rtabmap.db       # RTAB-Map localization 复用
 ```
 
-如果 PC 本地也有同一份工作区，并且希望直接使用工作区里的 `robot_navigation` launch/config，再额外 source 该工作区 overlay。
+后续导航默认从 `lekiwi_navi.yaml` 的 `navigation.nav2_bringup.map_file: "$(env HOME)/.ros/ibrobot/maps/rtabmap.yaml"` 加载地图。
 
-建议先检查是否已经能看到远端 ROS 图：
+## 导航流程
+
+启动导航主链：
+
+```bash
+ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=teleop
+```
+
+RViz 启动后，使用 `2D Goal Pose` 或 `Nav2 Goal` 在地图上点击目标。Nav2 会规划全局路径并通过 `/cmd_vel` 驱动底盘，局部规划器会根据代价地图避障。
+
+如果需要导航评估模式并联动推理链：
+
+```bash
+ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=navi
+```
+
+## PC 端 RViz 观察
+
+开发板上已经启动 `lekiwi_mapping` 或 `lekiwi_navi` 后，PC 端不需要在板端本地打开 RViz。只要网络互通且 `ROS_DOMAIN_ID` 一致，PC 可以直接观察远端 ROS 图。
+
+PC 端同样需要先加载 ROS 和工作区环境，具体方式参考 IB Robot 仓主目录下的 README。如果 PC 本地也有同一份工作区，并希望使用工作区里的 launch/config，再 source 该 overlay。两端 `ROS_DOMAIN_ID` 必须一致，例如 `<your_id>`。
+
+先确认能看到远端 ROS 图：
 
 ```bash
 ros2 topic list
 ros2 topic echo /tf
 ```
 
-建图观察预设：
+建图观察：
 
 ```bash
 ros2 launch robot_navigation lekiwi_mapping_rviz.launch.py
 ```
 
-该预设会直接打开：
+该预设打开 `TF`、`RobotModel`、`/rtabmap/map`、`/rtabmap/cloud_map`。
 
-1. `TF`
-2. `RobotModel`
-3. `/rtabmap/map`
-4. `/rtabmap/cloud_map`
-
-导航观察预设：
+导航观察：
 
 ```bash
 ros2 launch robot_navigation lekiwi_navigation_rviz.launch.py
 ```
 
-该预设会直接打开：
+该预设打开 `TF`、`RobotModel`、`/map`、`/plan`。
 
-1. `TF`
-2. `RobotModel`
-3. `/map`
-4. `/plan`
-
-如果需要换成自定义 RViz 配置文件，也可以覆盖参数：
+自定义 RViz 配置：
 
 ```bash
 ros2 launch robot_navigation lekiwi_mapping_rviz.launch.py rviz_config:=/path/to/custom.rviz
 ```
 
-### 5. robot_navigation 启动入口
+## 单点验证
 
-推荐仍通过 `robot_config` 启动完整机器人链路。`robot_navigation` 中的 launch 文件只负责导航子系统或 PC 侧可视化预设，不再单独拉起 robot_state_publisher、RViz 或 nav2_goal_client 等支撑节点。
+如果一键 `robot_config` 入口因相机型号、内核版本、DDS 或 TF 问题失败，先按下面顺序做单点验证。
+
+### 1. RealSense standalone 出流
+
+```bash
+ros2 launch realsense2_camera rs_launch.py
+```
+
+RealSense 的 profile、分辨率、帧率、同步和深度对齐参数可以根据具体设备、算力和场景按需修改与调优。单点验证时重点确认彩色图、深度图和 camera_info 等基础话题能够稳定发布，并且 TF 与时间戳能被下游 RTAB-Map 正常消费。
+
+### 2. 静态 TF
+
+```bash
+ros2 run tf2_ros static_transform_publisher \
+  0 0 0.3 0 0 0 base_link camera_link
+```
+
+这只用于单点验证 RTAB-Map。正式建图/导航时，`robot_config` 会按 `lekiwi_*.yaml` 中 `peripherals.realsense.transform` 自动发布。
+
+### 3. RTAB-Map 消费 RGBD
+
+```bash
+ros2 launch rtabmap_launch rtabmap.launch.py \
+  rgb_topic:=/camera/camera/color/image_raw \
+  depth_topic:=/camera/camera/depth/image_rect_raw \
+  camera_info_topic:=/camera/camera/color/camera_info \
+  frame_id:=camera_link \
+  approx_sync:=true \
+  queue_size:=20 \
+  rtabmap_viz:=false \
+  rviz:=false \
+  database_path:=/tmp/rtabmap_true_$(date +%Y%m%d_%H%M%S).db \
+  rtabmap_args:="--Mem/InitWMWithAllNodes true --Mem/IncrementalMemory true --Mem/PermanentMemory false --Mem/STMSize 8"
+```
+
+判断 RTAB-Map 真的吃到数据：日志出现 `Odom: quality=...`，`rtabmap` 主节点 `Rate=1.00s`。如果一直 `Did not receive data since 5 seconds!`，先检查 topic 名和 TF。`approx_sync=false` 可作为板端 fallback，但默认配置仍保留 `true`。
+
+### 4. 测试卫生
+
+每轮前检查真实进程、ROS graph 和 graph cache，避免残留进程污染：
+
+```bash
+ps -ef | grep -E 'realsense2_camera_node|rtabmap|rgbd_odometry|static_transform_publisher' | grep -v grep
+ros2 node list
+ros2 topic list
+ros2 daemon stop
+ros2 daemon start
+```
+
+旧 `/tmp/rtabmap.db` 可能引入脏库错误。每轮单点验证用新的 `database_path:=/tmp/rtabmap_..._$(date ...).db`。测板端频率时先关闭 `rqt_image_view` 等 PC 侧 viewer，避免外部订阅者影响测量。
+
+## 底层调试入口
+
+本节用于排查 `robot_config` 完整链路之外的导航子系统问题，例如单独确认 Nav2 子系统、RViz 预设或某个 `robot_navigation` 节点是否可运行。正常建图和导航仍优先使用前文的 `robot_config` 入口。
 
 ```bash
 # Nav2 子系统入口：map_server + Nav2 navigation_launch.py
 # 通常由 robot_config 根据 lekiwi_navi.yaml 间接包含
 ros2 launch robot_navigation nav2_bringup.launch.py
+
+# 指定地图
+ros2 launch robot_navigation nav2_bringup.launch.py map:=/path/to/rtabmap.yaml
 
 # PC 端打开建图观察 RViz 预设
 ros2 launch robot_navigation lekiwi_mapping_rviz.launch.py
@@ -245,11 +324,11 @@ ros2 launch robot_navigation lekiwi_mapping_rviz.launch.py
 # PC 端打开导航观察 RViz 预设
 ros2 launch robot_navigation lekiwi_navigation_rviz.launch.py
 
-# 指定地图
-ros2 launch robot_navigation nav2_bringup.launch.py map:=/path/to/rtabmap.yaml
-
-# 仅语音控制
+# 单独运行节点
 ros2 run robot_navigation voice_control
+ros2 run robot_navigation nav2_goal_client
+ros2 run robot_navigation cmd_vel_bridge_node
+ros2 run robot_navigation save_rtabmap_map
 
 # Legacy/debug-only EKF + RTAB-Map entry. For full LeKiwi bringup, use robot_config.
 ros2 launch robot_navigation ekf_rtabmap_launch.py
@@ -262,13 +341,52 @@ ros2 launch robot_navigation ekf_rtabmap_launch.py
 3. `/odom`、`map -> odom` 或等价定位链路
 4. 需要时单独启动 `nav2_goal_client`、语音节点和 RViz
 
-### 6. 单独运行节点
+## 测试验证
+
+`colcon test` 用于单点验证某个包或模块的功能，便于把 `robot_navigation` 的 standalone 测试和 `robot_config` 维护的完整仿真测试分开执行。
+
+### 1. 通用编译
 
 ```bash
-ros2 run robot_navigation voice_control
-ros2 run robot_navigation nav2_goal_client
-ros2 run robot_navigation cmd_vel_bridge_node
-ros2 run robot_navigation save_rtabmap_map
+colcon build --packages-up-to robot_config robot_navigation --base-paths src --packages-skip sim_models
+```
+
+### 2. robot_navigation standalone 测试
+
+这些测试不启动完整机器人、Gazebo 或 Nav2 bringup，适合 Ubuntu 和 openEuler 都执行。
+
+```bash
+colcon test --packages-select robot_navigation --base-paths src --event-handlers console_direct+
+```
+
+预期结果：`robot_navigation` 单元测试与软件闭环 E2E 通过。
+
+### 3. robot_config minimal 测试
+
+openEuler、无 Gazebo 或无桌面环境跑 minimal profile。该 profile 会显式跳过 Gazebo/Nav2 完整仿真，只验证测试发现和 skip 策略。
+
+```bash
+NAV_TEST_PROFILE=minimal colcon test --packages-select robot_config --base-paths src --event-handlers console_direct+ --pytest-args -k test_navigation_simulation
+```
+
+预期结果：`robot_config` navigation simulation 测试 `3 skipped`，skip 原因为 minimal profile 禁用 Gazebo 仿真。
+
+### 4. robot_config full 仿真测试
+
+Ubuntu 且已安装 Gazebo/ros_gz 时运行 full profile。该测试由 `robot_config` 维护，启动 Gazebo、ros2_control、控制器、Nav2、`robot_navigation` 节点和测试辅助节点。
+
+```bash
+NAV_TEST_PROFILE=full colcon test --packages-select robot_config --base-paths src --event-handlers console_direct+ --pytest-args -k test_navigation_simulation
+```
+
+预期结果：3 个 Gazebo/Nav2 导航 E2E 通过。测试进程会打印临时日志目录，例如 `/tmp/robot_config_nav_sim_xxx`，其中包含 `robot_launch.log`、`odom_bridge.log`、`gt_odom_node.log` 和 `cmd_vel_relay.log`。
+
+### 5. Gazebo GUI 可视化测试
+
+GUI 不是必跑项，只用于 Ubuntu 桌面环境人工观察 Gazebo 窗口。pytest 仍会自动发送导航目标，Gazebo 窗口只负责可视化。
+
+```bash
+SIM_GUI=1 NAV_TEST_PROFILE=full colcon test --packages-select robot_config --base-paths src --event-handlers console_direct+ --pytest-args -k test_navigation_simulation
 ```
 
 ## ROS 接口
@@ -476,12 +594,11 @@ robot_navigation/
 │   ├── test_nav2_goal_client.py   # Nav2 Goal 客户端 pytest 测试
 │   └── e2e/
 │       ├── mock_servers.py        # Mock Trigger/Action 服务
-│       ├── mock_robot_hardware.py # Mock ros2_control HardwareInterface
-│       ├── test_pipeline_software.py   # Layer 2: 软件闭环 E2E（无物理仿真）
-│       ├── test_pipeline_nav2.py       # Layer 2: Nav2 集成 E2E（mock hardware）
-│       └── test_pipeline_simulation.py # Layer 3: Gazebo 物理 E2E（3 用例，~4 min）
+│       └── test_pipeline_software.py   # 软件闭环 E2E（无物理仿真）
 └── README.md
 ```
+
+完整机器人启动链路下的导航仿真测试由 `robot_config` 维护。
 
 ## 依赖
 

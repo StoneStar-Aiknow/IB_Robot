@@ -31,6 +31,7 @@ _MANIFEST_BASENAMES: dict[str, str] = {
     "ascend_om": "config.om.json",
     "ascend_om_3403": "config.om.json",
     "hmm": "config.hmm.json",
+    "rknn": "config.rknn.json",
 }
 
 
@@ -497,7 +498,7 @@ def _as_action_tensor(output: Any, device: torch.device) -> Tensor:
 
 
 @dataclass
-class PI05RuntimeInputs:
+class VLARuntimeInputs:
     images: list[np.ndarray]
     tokens: np.ndarray
     masks: np.ndarray
@@ -537,6 +538,15 @@ class _PI05ConfigView:
         self.min_period = float(config.get("min_period", 0.004))
         self.max_period = float(config.get("max_period", 4.0))
         self.image_features = _ordered_pi05_image_features(config)
+        # SmolVLA RKNN/HMM architecture params. Not present in the PI05 policy
+        # config dict; SmolVLARKNNRuntimeSession.load merges them here from
+        # the compiled manifest's backend_config so SmolVLARKNNModel reads the
+        # real values via getattr instead of falling back to hardcoded
+        # defaults (which silently corrupt KV-cache shapes for non-256M
+        # SmolVLA variants). PI05 backends never read these attributes.
+        self.num_layers = int(config.get("num_layers", 16))
+        self.prefix_length = int(config.get("prefix_length", 177))
+        self.prefix_hidden_size = int(config.get("prefix_hidden_size", 960))
 
 
 class ACTCompiledAdapter:
@@ -679,7 +689,7 @@ class PI05CompiledAdapter:
     def get_chunk_size(self) -> int:
         return self._chunk_size
 
-    def prepare_inputs(self, batch: dict[str, Tensor]) -> PI05RuntimeInputs:
+    def prepare_inputs(self, batch: dict[str, Tensor]) -> VLARuntimeInputs:
         images: list[np.ndarray] = []
         for key in self._image_features:
             if key not in batch:
@@ -693,7 +703,7 @@ class PI05CompiledAdapter:
         if tokens is None or masks is None:
             raise KeyError("Missing PI05 language tokens or attention masks")
 
-        return PI05RuntimeInputs(
+        return VLARuntimeInputs(
             images=images,
             tokens=_to_numpy_int64(tokens),
             masks=_to_numpy_bool(masks),
@@ -739,7 +749,7 @@ class SmolVLACompiledAdapter:
             raise ValueError(f"Compiled backend {backend} policy config is missing required type metadata")
         if policy_type != "smolvla":
             raise ValueError(f"Compiled backend {backend} does not support policy type {policy_type!r}")
-        if normalize_backend_name(backend) != "hmm":
+        if normalize_backend_name(backend) not in ("hmm", "rknn"):
             raise ValueError(f"Compiled backend {backend} does not support SmolVLA policy")
         return cls(config, backend)
 
@@ -754,7 +764,7 @@ class SmolVLACompiledAdapter:
     def get_chunk_size(self) -> int:
         return self._chunk_size
 
-    def prepare_inputs(self, batch: dict[str, Tensor]) -> PI05RuntimeInputs:
+    def prepare_inputs(self, batch: dict[str, Tensor]) -> VLARuntimeInputs:
         images: list[np.ndarray] = []
         for key in self._image_features:
             if key not in batch:
@@ -768,7 +778,7 @@ class SmolVLACompiledAdapter:
         if tokens is None or masks is None:
             raise KeyError("Missing SmolVLA language tokens or attention masks")
 
-        return PI05RuntimeInputs(
+        return VLARuntimeInputs(
             images=images,
             tokens=_to_numpy_int64(tokens),
             masks=_to_numpy_bool(masks),
@@ -890,11 +900,11 @@ class PI05OMRuntimeSession:
 
         self._model = PI05OMModel(str(vlm_path), str(action_expert_path), _PI05ConfigView(config))
 
-    def execute(self, inputs: PI05RuntimeInputs) -> Tensor:
+    def execute(self, inputs: VLARuntimeInputs) -> Tensor:
         if self._model is None:
             raise RuntimeError("PI05OMRuntimeSession is not loaded")
-        if not isinstance(inputs, PI05RuntimeInputs):
-            raise TypeError("PI05OMRuntimeSession expects PI05RuntimeInputs")
+        if not isinstance(inputs, VLARuntimeInputs):
+            raise TypeError("PI05OMRuntimeSession expects VLARuntimeInputs")
         from inference_service.core.ascend_om.pi05.prefix_mask_utils import (
             build_prefix_att_2d_masks_4d_np,
         )
@@ -1036,6 +1046,63 @@ class RKNNRuntimeSession:
             self._rknn = None
 
 
+class SmolVLARKNNRuntimeSession:
+    """Runtime session for the 3-module SmolVLA RKNN pipeline (vision/prefill/action).
+
+    Loads ``config.rknn.json`` manifest, creates a ``SmolVLARKNNModel``
+    orchestrator, and delegates ``execute`` to the model's ``forward`` method.
+    The denoise loop runs on host CPU; each step calls the action NPU module.
+    """
+
+    def __init__(self) -> None:
+        self._model: Any = None
+
+    def load(self, policy_path: str, config: dict[str, Any], device: torch.device) -> None:
+        del device
+        policy_type = str(config.get("type", "")).lower().strip()
+        if policy_type != "smolvla":
+            raise ValueError(f"SmolVLARKNNRuntimeSession does not support policy type {policy_type!r}")
+        manifest = load_compiled_manifest(policy_path, "rknn", policy_type)
+        manifest.require_execution(["vision", "prefill", "action"])
+        vision_path = manifest.require_artifact("vision", suffix=".rknn")
+        prefill_path = manifest.require_artifact("prefill", suffix=".rknn")
+        action_path = manifest.require_artifact("action", suffix=".rknn")
+        embedding_path = manifest.require_artifact("embedding")
+        from inference_service.core.rknn.smolvla.SmolVLARKNNModel import SmolVLARKNNModel
+
+        # Merge manifest backend_config (num_layers / prefix_length /
+        # prefix_hidden_size / ...) over the policy config so _PI05ConfigView
+        # exposes the real VLM architecture params to SmolVLARKNNModel instead
+        # of the getattr fallback defaults (see _PI05ConfigView docstring).
+        merged_config = {**config, **manifest.backend_config}
+        self._model = SmolVLARKNNModel(
+            vision_path=str(vision_path),
+            prefill_path=str(prefill_path),
+            action_path=str(action_path),
+            embedding_path=str(embedding_path),
+            config=_PI05ConfigView(merged_config),
+        )
+
+    def execute(self, inputs: Any) -> Tensor:
+        if self._model is None:
+            raise RuntimeError("SmolVLARKNNRuntimeSession is not loaded")
+        if not isinstance(inputs, VLARuntimeInputs):
+            raise TypeError("SmolVLARKNNRuntimeSession expects VLARuntimeInputs")
+        return self._model.forward(
+            inputs.images,
+            torch.as_tensor(inputs.tokens),
+            torch.as_tensor(inputs.masks),
+            noise=torch.as_tensor(inputs.noise) if inputs.noise is not None else None,
+        )
+
+    def release(self) -> None:
+        if self._model is not None:
+            close = getattr(self._model, "close", None)
+            if callable(close):
+                close()
+            self._model = None
+
+
 def resolve_hmm_model_path(path: str, config: dict[str, Any] | None = None) -> Path:
     """Resolve the compiled Houmo ``.hmm`` artifact for the single-module ACT HMM backend.
 
@@ -1133,7 +1200,7 @@ class HMMRuntimeSession:
         else:
             raise ValueError(f"HMM backend does not support policy type {policy_type!r}")
 
-    def execute(self, inputs: list[np.ndarray] | PI05RuntimeInputs) -> list[np.ndarray] | Tensor:
+    def execute(self, inputs: list[np.ndarray] | VLARuntimeInputs) -> list[np.ndarray] | Tensor:
         if self._mode is None:
             raise RuntimeError("HMMRuntimeSession is not loaded")
 
@@ -1166,11 +1233,11 @@ class HMMRuntimeSession:
             raise RuntimeError("HMM inference returned no outputs")
         return outputs
 
-    def _execute_multi(self, inputs: PI05RuntimeInputs) -> Tensor:
+    def _execute_multi(self, inputs: VLARuntimeInputs) -> Tensor:
         if self._model is None:
             raise RuntimeError("HMMRuntimeSession is not loaded")
-        if not isinstance(inputs, PI05RuntimeInputs):
-            raise TypeError("HMMRuntimeSession (multi-module) expects PI05RuntimeInputs")
+        if not isinstance(inputs, VLARuntimeInputs):
+            raise TypeError("HMMRuntimeSession (multi-module) expects VLARuntimeInputs")
         from inference_service.core.hmm.pi05.PI05HMMModel import (
             build_prefix_att_2d_masks_4d_np,
         )
@@ -1209,6 +1276,9 @@ def create_runtime_session(backend: str, config: dict[str, Any] | None = None) -
     if normalized == "ascend_om_3403":
         return SD3403RuntimeSession()
     if normalized == "rknn":
+        policy_type = str((config or {}).get("type", "")).lower().strip()
+        if policy_type == "smolvla":
+            return SmolVLARKNNRuntimeSession()
         return RKNNRuntimeSession()
     if normalized == "hmm":
         return HMMRuntimeSession()

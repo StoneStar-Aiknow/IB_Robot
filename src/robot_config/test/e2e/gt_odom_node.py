@@ -1,16 +1,4 @@
-"""Ground truth odometry relay node for Gazebo simulation.
-
-Subscribes to the Gazebo OdometryPublisher plugin output (world-frame pose),
-subtracts the spawn offset, and republishes as standard ROS /odom topic
-and odom→base_footprint TF.
-
-This avoids the 3x Y-axis drift from wheel odometry in DART physics,
-which does not simulate omni wheel lateral slip accurately.
-
-Usage:
-    ros2 run robot_navigation gt_odom_node --ros-args
-        -p spawn_x:=-1.5 -p spawn_y:=-1.5
-"""
+"""Ground-truth odometry relay for robot_config navigation simulation tests."""
 
 import rclpy
 from geometry_msgs.msg import TransformStamped
@@ -22,7 +10,6 @@ from tf2_ros import TransformBroadcaster
 class GtOdomNode(Node):
     def __init__(self):
         super().__init__("gt_odom_node")
-
         self.declare_parameter("spawn_x", -1.5)
         self.declare_parameter("spawn_y", -1.5)
         self.spawn_x = self.get_parameter("spawn_x").value
@@ -44,23 +31,25 @@ class GtOdomNode(Node):
         odom.twist = msg.twist
         self.pub.publish(odom)
 
-        t = TransformStamped()
-        t.header.stamp = msg.header.stamp
-        t.header.frame_id = "odom"
-        t.child_frame_id = "base_footprint"
-        t.transform.translation.x = odom.pose.pose.position.x
-        t.transform.translation.y = odom.pose.pose.position.y
-        t.transform.translation.z = 0.0
-        t.transform.rotation = msg.pose.pose.orientation
-        self.br.sendTransform(t)
+        transform = TransformStamped()
+        transform.header.stamp = msg.header.stamp
+        transform.header.frame_id = "odom"
+        transform.child_frame_id = "base_footprint"
+        transform.transform.translation.x = odom.pose.pose.position.x
+        transform.transform.translation.y = odom.pose.pose.position.y
+        transform.transform.translation.z = 0.0
+        transform.transform.rotation = msg.pose.pose.orientation
+        self.br.sendTransform(transform)
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = GtOdomNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

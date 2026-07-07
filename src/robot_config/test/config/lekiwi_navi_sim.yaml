@@ -1,0 +1,105 @@
+robot:
+  name: lekiwi
+  type: lekiwi
+  robot_type: lekiwi
+
+  gazebo_world_name: nav_test
+  world_file: $(find robot_navigation)/config/test/nav_test.world
+  initial_pose_x: -1.5
+  initial_pose_y: -1.5
+  initial_pose_z: 0.01
+
+  joints:
+    base:
+      - left_wheel_joint
+      - back_wheel_joint
+      - right_wheel_joint
+    all:
+      - left_wheel_joint
+      - back_wheel_joint
+      - right_wheel_joint
+
+  default_control_mode: base_navigation
+  controller_startup_timeout:
+    sim: 120.0
+    hardware: 30.0
+
+  control_modes:
+    base_navigation:
+      description: "LeKiwi navigation simulation E2E test"
+      controllers:
+        - joint_state_broadcaster
+        - base_controller
+      sim_controllers:
+        - joint_state_broadcaster
+        - base_controller
+      inference:
+        enabled: false
+      executor:
+        type: topic
+        mode: base_navigation
+
+  voice_asr:
+    enabled: false
+
+  simulation:
+    platform: gazebo
+
+  ros2_control:
+    hardware_plugin: lekiwi_hardware/LeKiwiSystemHardware
+    port: /dev/null
+    urdf_path: $(find lekiwi_description)/urdf/lekiwi_sim.urdf.xacro
+    controllers_config: $(find lekiwi_hardware)/config/lekiwi_sim_controllers.yaml
+    xacro_mappings:
+      serial_port: /dev/null
+      use_mock: true
+      i2c_bus: 1
+      i2c_addr: 28
+      axis_remap: P1
+      sensor_mode: NDOF
+
+  peripherals: []
+
+  navigation:
+    enabled: true
+    static_tfs:
+      - name: map_to_odom
+        parent_frame: map
+        child_frame: odom
+        translation: [-1.5, -1.5, 0.0]
+        rotation: [0.0, 0.0, 0.0]
+
+    nav2_bringup:
+      enabled: true
+      map_file: $(find robot_navigation)/config/maps/sim_map.yaml
+      params_file: $(find robot_navigation)/config/nav2_sim_params.yaml
+
+    ekf_rtabmap:
+      enabled: false
+
+    cmd_vel_bridge:
+      enabled: false
+
+    robot_navigation:
+      enabled: true
+      enable_voice_control: true
+      keywords_file: ""
+      global_frame: map
+      enable_feedback: true
+      trigger_evaluation: false
+      destinations:
+        point_a:
+          x: 1.0
+          y: 1.0
+          theta: 0.0
+        point_b:
+          x: -1.0
+          y: 1.0
+          theta: 0.0
+        origin:
+          x: -1.5
+          y: -1.5
+          theta: 0.0
+
+    rviz:
+      enabled: false

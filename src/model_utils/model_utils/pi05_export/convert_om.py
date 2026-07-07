@@ -12,13 +12,13 @@
 
 This is the missing piece that puts PI05 on par with the single-OM ACT flow
 (``export_onnx_atc.py``): it wraps the ``atc`` compiler so users no longer have
-to hand-write the command, manually keep the ``--input_shape`` in sync with the
-exported graph, or remember to update ``config.om.json`` so the runtime can find
-the artifacts.
+to hand-write the command or remember to update ``config.om.json`` so the runtime
+can find the artifacts.
 
-The ``--input_shape`` argument is derived **automatically** from each ONNX
-graph's static input shapes (the PI05 exporter bakes in fixed shapes), so the
-command line stays short. Each successful conversion upserts its role
+By default, ATC is invoked without ``--input_shape`` and with
+``--precision_mode_v2=origin``. If a board/toolkit needs an explicit shape,
+``--input-shape auto`` derives it from each ONNX graph's static inputs. Each
+successful conversion upserts its role
 (``vlm`` / ``action_expert``) into ``config.om.json`` via
 :func:`om_manifest.upsert_pi05_om_manifest`.
 
@@ -85,14 +85,28 @@ def _derive_input_shape(onnx_path: Path) -> str:
     return ";".join(parts)
 
 
-def _run_atc(onnx_path: Path, om_output: Path, soc_version: str, *, extra_args: list[str]) -> bool:
+def _has_atc_arg(extra_args: list[str], name: str) -> bool:
+    """Return True when raw ATC args already include ``--<name>``."""
+    return any((token := arg.lstrip("-")) == name or token.startswith(f"{name}=") for arg in extra_args)
+
+
+def _default_om_output(manifest_dir: Path, role: str, onnx_path: Path) -> Path:
+    return manifest_dir / onnx_path.with_suffix(".om").name
+
+
+def _run_atc(
+    onnx_path: Path,
+    om_output: Path,
+    soc_version: str,
+    *,
+    extra_args: list[str],
+    input_shape_mode: str,
+) -> bool:
     """Invoke ``atc`` to compile a single ONNX to an OM. Returns success flag.
 
     ``atc`` appends ``.om`` itself, so ``--output`` is the path without suffix.
     The subprocess inherits stdout/stderr so the user sees ATC progress live.
     """
-    input_shape = _derive_input_shape(onnx_path)
-    LOGGER.info("  input_shape (auto): %s", input_shape)
     output_stem = str(om_output.with_suffix(""))
     om_output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -102,9 +116,21 @@ def _run_atc(onnx_path: Path, om_output: Path, soc_version: str, *, extra_args: 
         f"--soc_version={soc_version}",
         f"--model={onnx_path}",
         f"--output={output_stem}",
-        f"--input_shape={input_shape}",
-        *extra_args,
     ]
+    has_input_shape_arg = _has_atc_arg(extra_args, "input_shape")
+    if input_shape_mode == "auto" and not has_input_shape_arg:
+        input_shape = _derive_input_shape(onnx_path)
+        LOGGER.info("  input_shape (auto): %s", input_shape)
+        command.append(f"--input_shape={input_shape}")
+    elif has_input_shape_arg:
+        LOGGER.info("  input_shape: provided via --atc-arg")
+    else:
+        LOGGER.info("  input_shape: omitted")
+
+    if not _has_atc_arg(extra_args, "precision_mode_v2"):
+        command.append("--precision_mode_v2=origin")
+    command.extend(extra_args)
+
     LOGGER.info("  $ %s", " ".join(command))
     # nosec B603 — command is built from validated paths / args, not shell.
     return subprocess.run(command, check=False).returncode == 0
@@ -119,6 +145,7 @@ def convert_role(
     manifest_dir: Path,
     skip_manifest: bool,
     extra_args: list[str],
+    input_shape_mode: str,
     index: int,
     total: int,
 ) -> Path:
@@ -131,7 +158,7 @@ def convert_role(
         raise FileNotFoundError(f"{role} ONNX not found: {onnx_path}")
 
     with Stage(f"ATC compile {role}", index=index, total=total):
-        ok = _run_atc(onnx_path, om_output, soc_version, extra_args=extra_args)
+        ok = _run_atc(onnx_path, om_output, soc_version, extra_args=extra_args, input_shape_mode=input_shape_mode)
         if not ok:
             raise RuntimeError(f"ATC failed for {role} ({onnx_path.name}); see ATC log above")
         if not om_output.is_file():
@@ -150,10 +177,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
+        "--policy-path",
         "--pretrained-policy-path",
+        dest="pretrained_policy_path",
         type=str,
         required=True,
-        help="Local PI05 policy directory (where config.om.json is written).",
+        help="Local PI05 policy directory (where config.om.json is written). Alias: --pretrained-policy-path.",
     )
     p.add_argument(
         "--soc-version",
@@ -167,13 +196,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--vlm-om",
         type=str,
         default=None,
-        help="Output VLM .om path (default: <policy-path>/vlm.om).",
+        help="Output VLM .om path (default: <policy-path>/<vlm-onnx-basename>.om).",
     )
     p.add_argument(
         "--ae-om",
         type=str,
         default=None,
-        help="Output Action Expert .om path (default: <policy-path>/action_expert.om).",
+        help="Output Action Expert .om path (default: <policy-path>/<ae-onnx-basename>.om).",
     )
     p.add_argument(
         "--om-manifest-dir",
@@ -183,13 +212,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--skip-om-manifest", action="store_true", help="Do not write/update config.om.json.")
     p.add_argument(
+        "--input-shape",
+        choices=("none", "auto"),
+        default="none",
+        help="ATC --input_shape handling: omit by default, or derive from static ONNX graph inputs.",
+    )
+    p.add_argument(
         "--atc-arg",
         action="append",
         default=None,
         metavar="ARG",
-        help="Extra raw argument forwarded to atc (repeatable), e.g. --atc-arg=--precision_mode=allow_fp32_to_fp16.",
+        help="Extra raw argument forwarded to atc (repeatable). Default adds --precision_mode_v2=origin unless overridden.",
     )
     p.add_argument("--log-level", type=str, default="INFO", help="Logging level.")
+    p.add_argument(
+        "--no-summary",
+        action="store_true",
+        help="Suppress the final result block (used when an orchestrator prints its own summary).",
+    )
     return p
 
 
@@ -224,11 +264,21 @@ def main() -> int:
 
     jobs: list[tuple[str, Path, Path]] = []
     if args.vlm_onnx:
-        vlm_om = Path(args.vlm_om).expanduser() if args.vlm_om else manifest_dir / "vlm.om"
-        jobs.append(("vlm", Path(args.vlm_onnx).expanduser(), vlm_om))
+        vlm_onnx = Path(args.vlm_onnx).expanduser()
+        vlm_om = (
+            Path(args.vlm_om).expanduser().resolve()
+            if args.vlm_om
+            else _default_om_output(manifest_dir, "vlm", vlm_onnx)
+        )
+        jobs.append(("vlm", vlm_onnx, vlm_om))
     if args.ae_onnx:
-        ae_om = Path(args.ae_om).expanduser() if args.ae_om else manifest_dir / "action_expert.om"
-        jobs.append(("action_expert", Path(args.ae_onnx).expanduser(), ae_om))
+        ae_onnx = Path(args.ae_onnx).expanduser()
+        ae_om = (
+            Path(args.ae_om).expanduser().resolve()
+            if args.ae_om
+            else _default_om_output(manifest_dir, "action_expert", ae_onnx)
+        )
+        jobs.append(("action_expert", ae_onnx, ae_om))
 
     produced: list[tuple[str, str]] = []
     total = len(jobs)
@@ -241,6 +291,7 @@ def main() -> int:
             manifest_dir=manifest_dir,
             skip_manifest=args.skip_om_manifest,
             extra_args=extra_args,
+            input_shape_mode=args.input_shape,
             index=i,
             total=total,
         )
@@ -249,7 +300,8 @@ def main() -> int:
     rows = [(role, path) for role, path in produced]
     if not args.skip_om_manifest:
         rows.append(("manifest", str(manifest_dir / "config.om.json")))
-    print_summary("PI05 OM conversion complete", rows, status="✅ DONE")
+    if not args.no_summary:
+        print_summary("PI05 OM conversion complete", rows, status="✅ DONE")
     return 0
 
 

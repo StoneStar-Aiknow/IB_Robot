@@ -489,7 +489,7 @@ def verify_kv_cache(
     prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
     prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
     prefix_att_2d_masks_4d = full_model._prepare_attention_masks_4d(prefix_att_2d_masks)
-    full_model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+    full_model.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"
 
     _, past_kv_full = full_model.paligemma_with_expert.forward(
         attention_mask=prefix_att_2d_masks_4d,
@@ -679,7 +679,7 @@ def verify_onnx_actions(
     prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks_full, prefix_att_masks)
     prefix_position_ids = torch.cumsum(prefix_pad_masks_full, dim=1) - 1
     prefix_att_2d_masks_4d = full_model._prepare_attention_masks_4d(prefix_att_2d_masks)
-    full_model.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"
+    full_model.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"
     _, past_kv_full = full_model.paligemma_with_expert.forward(
         attention_mask=prefix_att_2d_masks_4d,
         position_ids=prefix_position_ids,

@@ -11,6 +11,8 @@
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>inference_service</depend>
+  <depend>python3-yaml</depend>
 
   <test_depend>python3-pytest</test_depend>
 

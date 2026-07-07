@@ -28,7 +28,7 @@ try:
 except ImportError:
     torch_npu = None
 
-from model_utils.pi05_export._cli_ui import setup_logging
+from model_utils.pi05_export._cli_ui import build_onnx_suffix, setup_logging
 from model_utils.pi05_export.ascend_export_patches import (
     ascend_onnx_export_patches,
     downgrade_ir_version,
@@ -43,19 +43,13 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _build_onnx_config_suffix(opset: int, dynamo: bool, dtype: str = "fp16", device: str = "cpu") -> str:
-    """Build config suffix for ONNX filename.
+    """Deprecated thin wrapper kept for backward compatibility.
 
-    Example: _op17_nodyn_fp16_cpu
-    Abbreviations: op=opset, dyn/nodyn=dynamo, fp16/fp32=dtype, trailing=export device.
-    Constant folding is always on by default and therefore not encoded in the name.
+    The filename convention now lives in one place (``_cli_ui.build_onnx_suffix``)
+    so the pipeline orchestrator's predicted skip/resume paths can never drift
+    from what this exporter writes.
     """
-    parts = [
-        f"op{opset}",
-        "dyn" if dynamo else "nodyn",
-        dtype,
-        device,
-    ]
-    return "_" + "_".join(parts)
+    return build_onnx_suffix(opset=opset, dynamo=dynamo, dtype=dtype, device=device)
 
 
 # -----------------
@@ -203,6 +197,7 @@ def export_onnx(
     dynamo: bool = True,
     constant_folding: bool = True,
     use_npu_ops: bool = False,
+    fast_gelu: bool = False,
 ) -> None:
     onnx_output_path.parent.mkdir(parents=True, exist_ok=True)
     dummy_keys = list(observation.keys())
@@ -215,7 +210,7 @@ def export_onnx(
     wrapper.policy.eval()
     # 注意: dynamo=True 时 opset_version 参数会被忽略, 实际固定使用 opset 18
     # Apply Ascend ATC compatibility patches during ONNX export
-    with ascend_onnx_export_patches(use_npu_ops=use_npu_ops):
+    with ascend_onnx_export_patches(use_npu_ops=use_npu_ops, fast_gelu=fast_gelu):
         torch.onnx.export(
             wrapper,
             tuple(observation_values),
@@ -403,7 +398,14 @@ def save_runtime_tensors(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Export PI05 VLM to ONNX and optionally validate.")
-    p.add_argument("--pretrained-policy-path", type=str, required=True, help="Path or repo with config+weights")
+    p.add_argument(
+        "--policy-path",
+        "--pretrained-policy-path",
+        dest="pretrained_policy_path",
+        type=str,
+        required=True,
+        help="Path or repo with config+weights (alias: --pretrained-policy-path)",
+    )
     p.add_argument("--output", type=str, default=None, help="Output ONNX file path (auto-generated if omitted).")
     p.add_argument(
         "--output-dir", type=str, default="outputs/onnx", help="Directory for auto-generated output filename"
@@ -424,8 +426,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         nargs=2,
         metavar=("H", "W"),
         default=None,
-        help="Override image resolution (H W) for ALL cameras. "
-        "If omitted, each camera's resolution is read from the model config.",
+        help="Override VLM input image resolution (H W) for ALL cameras. "
+        "If omitted, config.image_resolution is used and the runtime host-resizes raw camera frames.",
     )
     p.add_argument("--runtime-save-dir", type=str, default="runtime_save", help="Where to dump runtime tensors")
     p.add_argument(
@@ -458,9 +460,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--om-path",
         type=str,
         default=None,
-        help="Predicted VLM .om artifact path recorded in the manifest (default: <manifest-dir>/vlm.om).",
+        help="Predicted VLM .om artifact path recorded in the manifest (default: <onnx-basename>.om).",
     )
     p.add_argument("--skip-om-manifest", action="store_true", help="Do not write/update config.om.json.")
+    p.add_argument(
+        "--fast-gelu",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use Ascend NPUFastGelu for gelu_pytorch_tanh during NPU export (default: False). "
+        "This is faster but not numerically identical to PyTorch tanh GELU.",
+    )
     p.add_argument("--log-level", type=str, default="INFO", help="Logging level")
     p.add_argument("--local-files-only", action="store_true", default=True, help="Load policy without network")
     return p
@@ -515,7 +524,6 @@ def main() -> int:
     for cam_key, (ch, cw) in cameras.items():
         LOGGER.info("  %s : %dx%d", cam_key, ch, cw)
 
-    # 允许用户通过 --image-resolution H W 统一覆盖所有相机分辨率
     if args.image_resolution is not None:
         override_h, override_w = args.image_resolution
         LOGGER.info(
@@ -524,6 +532,17 @@ def main() -> int:
             override_w,
         )
         cameras = {k: (override_h, override_w) for k in cameras}
+    else:
+        # Keep image resize out of the Ascend OM graph. ATC's Resize output is
+        # close in isolation but gets amplified by the VLM into large KV drift.
+        target_h, target_w = policy.config.image_resolution
+        if any((h, w) != (target_h, target_w) for h, w in cameras.values()):
+            LOGGER.info(
+                "Using config.image_resolution %dx%d for VLM inputs; raw camera frames are resized on host",
+                target_h,
+                target_w,
+            )
+        cameras = {k: (int(target_h), int(target_w)) for k in cameras}
 
     observation = _prepare_base_tensors(
         device, int(args.batch_size), int(args.lang_tokens_len), int(args.seed), cameras
@@ -551,6 +570,7 @@ def main() -> int:
         dynamo=bool(args.dynamo),
         constant_folding=bool(args.constant_folding),
         use_npu_ops=use_npu_ops,
+        fast_gelu=bool(args.fast_gelu),
     )
     LOGGER.info("ONNX export finished")
 
@@ -574,9 +594,20 @@ def main() -> int:
                     "written to a wrong location relative to the current working directory"
                 )
             manifest_dir = local_policy_path.resolve()
-        om_path = args.om_path if args.om_path is not None else "vlm.om"
-        manifest_path = upsert_pi05_om_manifest(manifest_dir, "vlm", om_path)
-        LOGGER.info("Updated OM manifest (vlm) at %s", manifest_path)
+        om_path = args.om_path if args.om_path is not None else onnx_output_path.with_suffix(".om").name
+        resolved_om_path = Path(om_path).expanduser()
+        if not resolved_om_path.is_absolute():
+            resolved_om_path = manifest_dir / resolved_om_path
+        if resolved_om_path.is_file():
+            manifest_path = upsert_pi05_om_manifest(manifest_dir, "vlm", om_path)
+            LOGGER.info("Updated OM manifest (vlm) at %s", manifest_path)
+        else:
+            LOGGER.info(
+                "Skipping OM manifest update (vlm): OM artifact %s does not exist yet; "
+                "the compiled runtime manifest is written by the OM compile step "
+                "(convert_om) once ATC produces the .om file.",
+                resolved_om_path,
+            )
 
     return 0
 

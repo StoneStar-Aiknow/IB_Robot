@@ -36,7 +36,7 @@ except ImportError:
     torch_npu = None
 
 
-from model_utils.pi05_export._cli_ui import setup_logging
+from model_utils.pi05_export._cli_ui import build_onnx_suffix, setup_logging
 from model_utils.pi05_export.ascend_export_patches import (
     ascend_onnx_export_patches,
     downgrade_ir_version,
@@ -50,19 +50,13 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _build_onnx_config_suffix(opset: int, dynamo: bool, dtype: str = "fp16", device: str = "cpu") -> str:
-    """Build config suffix for ONNX filename.
+    """Deprecated thin wrapper kept for backward compatibility.
 
-    Example: _op17_nodyn_fp16_cpu
-    Abbreviations: op=opset, dyn/nodyn=dynamo, fp16/fp32=dtype, trailing=export device.
-    Constant folding is always on by default and therefore not encoded in the name.
+    The filename convention now lives in one place (``_cli_ui.build_onnx_suffix``)
+    so the pipeline orchestrator's predicted skip/resume paths can never drift
+    from what this exporter writes.
     """
-    parts = [
-        f"op{opset}",
-        "dyn" if dynamo else "nodyn",
-        dtype,
-        device,
-    ]
-    return "_" + "_".join(parts)
+    return build_onnx_suffix(opset=opset, dynamo=dynamo, dtype=dtype, device=device)
 
 
 def _iter_graph_tensors(model_proto):
@@ -177,10 +171,12 @@ def _clean_onnx_domains(onnx_path: Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export PI05 Action Expert to ONNX.")
     parser.add_argument(
+        "--policy-path",
         "--pretrained-policy-path",
+        dest="pretrained_policy_path",
         type=str,
         required=True,
-        help="Path to the pretrained PI05 policy (contains config/model).",
+        help="Path to the pretrained PI05 policy (contains config/model). Alias: --pretrained-policy-path.",
     )
     parser.add_argument(
         "--output",
@@ -249,23 +245,15 @@ def parse_args() -> argparse.Namespace:
         "--om-path",
         type=str,
         default=None,
-        help="Predicted action_expert .om artifact path recorded in the manifest "
-        "(default: <manifest-dir>/action_expert.om).",
+        help="Predicted action_expert .om artifact path recorded in the manifest (default: <onnx-basename>.om).",
     )
     parser.add_argument("--skip-om-manifest", action="store_true", help="Do not write/update config.om.json.")
     parser.add_argument(
-        "--mqa-broadcast",
+        "--fast-gelu",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Skip repeat_kv Expand for multi-query attention and rely on matmul "
-        "broadcasting instead (default: True). Mathematically identical.",
-    )
-    parser.add_argument(
-        "--fp16-softmax",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Keep the attention score matrix and softmax in fp16 (no fp32 upcast) "
-        "for fp16 export. Uses a fp16-safe mask sentinel (default: True).",
+        default=False,
+        help="Use Ascend NPUFastGelu for gelu_pytorch_tanh during NPU export (default: False). "
+        "This is faster but not numerically identical to PyTorch tanh GELU.",
     )
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level")
     parser.add_argument("--local-files-only", action="store_true", default=True, help="Load policy without network")
@@ -392,6 +380,7 @@ def main() -> int:
         args.pretrained_policy_path, local_files_only=bool(args.local_files_only), strict=False
     )
     export_dtype = args.dtype  # "fp16", "fp32", or "auto"
+    softmax_in_model_dtype = export_dtype != "fp32"
     if export_dtype == "auto":
         # Preserve original mixed precision (typically bf16 for the gemma
         # expert + fp32 for action/time projection layers). Build a per-input
@@ -494,11 +483,16 @@ def main() -> int:
         args.dynamo,
         args.constant_folding,
     )
+    LOGGER.info(
+        "  attention export: mqa_broadcast=True, softmax_dtype=%s",
+        "model" if softmax_in_model_dtype else "fp32",
+    )
     # Apply Ascend ATC compatibility patches during ONNX export
     with ascend_onnx_export_patches(
         use_npu_ops=use_npu_ops,
-        fp16_softmax=bool(args.fp16_softmax),
-        mqa_broadcast=bool(args.mqa_broadcast),
+        softmax_in_model_dtype=softmax_in_model_dtype,
+        mqa_broadcast=True,
+        fast_gelu=bool(args.fast_gelu),
     ):
         torch.onnx.export(
             onnx_wrapper,
@@ -528,9 +522,20 @@ def main() -> int:
                     "would be written to a wrong location relative to the current working directory"
                 )
             manifest_dir = local_policy_path.resolve()
-        om_path = args.om_path if args.om_path is not None else "action_expert.om"
-        manifest_path = upsert_pi05_om_manifest(manifest_dir, "action_expert", om_path)
-        LOGGER.info("Updated OM manifest (action_expert) at %s", manifest_path)
+        om_path = args.om_path if args.om_path is not None else onnx_output_path.with_suffix(".om").name
+        resolved_om_path = Path(om_path).expanduser()
+        if not resolved_om_path.is_absolute():
+            resolved_om_path = manifest_dir / resolved_om_path
+        if resolved_om_path.is_file():
+            manifest_path = upsert_pi05_om_manifest(manifest_dir, "action_expert", om_path)
+            LOGGER.info("Updated OM manifest (action_expert) at %s", manifest_path)
+        else:
+            LOGGER.info(
+                "Skipping OM manifest update (action_expert): OM artifact %s does not exist yet; "
+                "the compiled runtime manifest is written by the OM compile step "
+                "(convert_om) once ATC produces the .om file.",
+                resolved_om_path,
+            )
 
     return 0
 

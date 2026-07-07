@@ -13,8 +13,8 @@ from inference_service.core.compiled_policy import (
     OMRuntimeSession,
     PI05CompiledAdapter,
     PI05OMRuntimeSession,
-    PI05RuntimeInputs,
     SD3403RuntimeSession,
+    VLARuntimeInputs,
     create_compiled_model_adapter,
     create_runtime_session,
     load_compiled_manifest,
@@ -180,7 +180,7 @@ def test_pi05_adapter_prepares_runtime_inputs_and_slices_padding():
         }
     )
 
-    assert isinstance(inputs, PI05RuntimeInputs)
+    assert isinstance(inputs, VLARuntimeInputs)
     assert inputs.images[0].shape == (1, 3, 224, 224)
     assert inputs.tokens.dtype == np.int64
     assert inputs.masks.dtype == np.bool_
@@ -441,7 +441,7 @@ def test_pi05_runtime_builds_prefix_mask_and_forwards():
 
     session = PI05OMRuntimeSession()
     session._model = FakeModel()
-    inputs = PI05RuntimeInputs(
+    inputs = VLARuntimeInputs(
         images=[np.ones((1, 3, 224, 224), dtype=np.float32)],
         tokens=np.ones((1, 48), dtype=np.int64),
         masks=np.ones((1, 48), dtype=np.bool_),

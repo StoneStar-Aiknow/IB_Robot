@@ -1,23 +1,31 @@
-import argparse
+from __future__ import annotations
+
 import contextlib
 import json
 import os
 import time
-from contextlib import nullcontext
 
-import numpy as np
-import torch
-from lerobot.policies.factory import make_pre_post_processors
-from lerobot.policies.utils import prepare_observation_for_inference
-from lerobot.utils.control_utils import predict_action
-from lerobot.utils.utils import get_safe_torch_device
-from tqdm import tqdm
+# Heavy imports (numpy, torch, tqdm, inference_service) are deferred to main()
+# after CLI argument resolution so that --list-profiles / --help / wizard-only
+# invocations remain fast (< 100ms).  LossUtils references these as module
+# globals; they are assigned by _import_heavy_deps() before LossUtils is
+# instantiated.
+np = None  # type: ignore
+torch = None  # type: ignore
+tqdm = None  # type: ignore
+InferenceCoordinator = None  # type: ignore
 
 
 class LossUtils:
     def __init__(self, args):
         self.args = args
-        self.policy = self.prepare_policy()
+        self.coordinator = self.prepare_policy()
+        # ``policy_type`` is reported by the engine after loading.  The CLI
+        # ``--policy_type`` is kept only as a hint / fallback for backends that
+        # cannot self-report (it must still match what the coordinator detects).
+        detected = (self.coordinator.policy_type or "").lower()
+        if detected:
+            self.args.policy_type = detected
 
     def run(self):
         if self.args.generate_target:
@@ -62,21 +70,16 @@ class LossUtils:
         print("-" * 32)
         avg_l1 = sum(arr_l1) / len(arr_l1)
         avg_cos = sum(arr_cos) / len(arr_cos)
-        if self.args.policy_type == "pi05":
-            # PI05's flow-matching ODE is chaotic; per-sample cosine is
-            # not a meaningful aggregate. See pi05_dist_metrics.py for the
-            # replacement (Wasserstein + first-frame cosine).
-            print(f"{'Avg':>6} {avg_l1:>12.6f} {'(see dist eval)':>15}")
-        else:
-            print(f"{'Avg':>6} {avg_l1:>12.6f} {avg_cos:>12.6f}")
+        print(f"{'Avg':>6} {avg_l1:>12.6f} {avg_cos:>12.6f}")
 
         # ------------------------------------------------------------------
         # Independent sanity check: compare in *normalized* (pre-postprocessor)
-        # action space.  ``self._raw_preds`` was populated by the postprocessor
-        # hook in ``forward()``.  This isolates the model's true output error
-        # from any unnormalization scale-up — useful for diagnosing whether a
-        # large unnormalized L1 is real model drift or just dataset stats
-        # blowing the number up.
+        # action space.  ``self._raw_preds`` was populated by ``forward()`` by
+        # capturing the engine output *before* the postprocessor unnormalizes
+        # it.  This isolates the model's true output error from any
+        # unnormalization scale-up — useful for diagnosing whether a large
+        # unnormalized L1 is real model drift or just dataset stats blowing the
+        # number up.
         # ------------------------------------------------------------------
         raw_preds = getattr(self, "_raw_preds", None)
         raw_targets_path = getattr(self.args, "raw_target_path", None)
@@ -97,8 +100,8 @@ class LossUtils:
                 arr_raw_l1 = []
                 arr_raw_cos = []
                 for i in range(len(raw_targets)):
-                    rp = raw_preds[i].detach().cpu().float()
-                    rt = raw_targets[i].float()
+                    rp = self._squeeze_leading(raw_preds[i].detach().cpu().float())
+                    rt = self._squeeze_leading(raw_targets[i].float())
                     if rp.shape != rt.shape:
                         print(f"WARN: raw shape mismatch on batch {i}: pred={tuple(rp.shape)} target={tuple(rt.shape)}")
                         continue
@@ -116,13 +119,10 @@ class LossUtils:
                     for i in range(len(arr_raw_l1)):
                         print(f"{i:>6} {arr_raw_l1[i]:>12.6f} {arr_raw_cos[i]:>12.6f}")
                     print("-" * 32)
-                    if self.args.policy_type == "pi05":
-                        print(f"{'Avg':>6} {sum(arr_raw_l1) / len(arr_raw_l1):>12.6f} {'(see dist eval)':>15}")
-                    else:
-                        print(
-                            f"{'Avg':>6} {sum(arr_raw_l1) / len(arr_raw_l1):>12.6f} "
-                            f"{sum(arr_raw_cos) / len(arr_raw_cos):>12.6f}"
-                        )
+                    print(
+                        f"{'Avg':>6} {sum(arr_raw_l1) / len(arr_raw_l1):>12.6f} "
+                        f"{sum(arr_raw_cos) / len(arr_raw_cos):>12.6f}"
+                    )
         elif raw_preds is not None and raw_targets_path and not os.path.exists(raw_targets_path):
             print(
                 f"\nNOTE: raw target file not found at {raw_targets_path}; "
@@ -176,55 +176,63 @@ class LossUtils:
             )
 
     def prepare_policy(self):
-        if self.args.policy_type == "act":
-            from lerobot.policies.act.modeling_act import ACTPolicy
+        # The InferenceCoordinator picks the backend from ``--device``:
+        #   cuda/cpu/npu  -> native LeRobot torch policy (LeRobotPolicyWrapper)
+        #   ascend_om     -> compiled OM offline model (CompiledPolicyWrapper)
+        #   ascend_om_3403/rknn -> their respective compiled wrappers
+        # All of them expose the same pre/infer/post pipeline, so loss_compare
+        # no longer depends on the raw LeRobot policy object.
+        coordinator = InferenceCoordinator(
+            policy_path=self.args.policy_path,
+            device=self.args.device,
+        )
 
-            policy_path = self.args.policy_path
-            policy = ACTPolicy.from_pretrained(policy_path)
-        elif self.args.policy_type == "pi05":
-            from lerobot.policies.pi05.modeling_pi05 import PI05Policy
-
-            policy_path = self.args.policy_path
-            policy = PI05Policy.from_pretrained(policy_path)
-        else:
-            raise NotImplementedError(f"Policy type {self.args.policy_type} not implemented")
-
-        # Optional dtype cast — defaults to whatever the checkpoint provides
-        # (BF16 for PI05).  Use ``--model_dtype fp16`` to match the OM/ORT
-        # deployment dtype and isolate BF16↔FP16 conversion error from any
-        # real ONNX-export error.
+        # Optional dtype cast — only meaningful for the torch backend (the
+        # compiled OM/RKNN models carry their own fixed dtype).  Use
+        # ``--model_dtype fp16`` to match the OM/ORT deployment dtype and
+        # isolate BF16<->FP16 conversion error from any real export error.
         model_dtype = getattr(self.args, "model_dtype", "native")
-        if model_dtype == "fp16":
-            policy.model = policy.model.half()
-            print("  Cast policy.model to float16")
-        elif model_dtype == "bf16":
-            policy.model = policy.model.bfloat16()
-            print("  Cast policy.model to bfloat16")
-        elif model_dtype == "fp32":
-            policy.model = policy.model.float()
-            print("  Cast policy.model to float32")
+        raw_policy = coordinator.raw_policy
+        if raw_policy is not None and hasattr(raw_policy, "model"):
+            if model_dtype == "fp16":
+                raw_policy.model = raw_policy.model.half()
+                print("  Cast policy.model to float16")
+            elif model_dtype == "bf16":
+                raw_policy.model = raw_policy.model.bfloat16()
+                print("  Cast policy.model to bfloat16")
+            elif model_dtype == "fp32":
+                raw_policy.model = raw_policy.model.float()
+                print("  Cast policy.model to float32")
+            elif model_dtype != "native":
+                raise ValueError(f"unknown --model_dtype: {model_dtype}")
+
+            # CRITICAL: switch to eval mode.  Without this, LoRA's default
+            # dropout=0.1 stays active and randomises every forward pass
+            # (independent of seed) — the resulting KV jitter feeds into
+            # PI05's flow-matching ODE which is chaotic, so the 10-step
+            # trajectory diverges to ~zero correlation with the OM's
+            # deterministic output (observed: raw cos ~= -0.04).
+            with contextlib.suppress(Exception):
+                raw_policy.eval()
+
+            try:
+                sample_param = next(raw_policy.model.parameters())
+                print(f"  Running PT policy in dtype={sample_param.dtype}")
+            except (StopIteration, AttributeError):
+                pass
         elif model_dtype != "native":
-            raise ValueError(f"unknown --model_dtype: {model_dtype}")
+            print(
+                f"  NOTE: --model_dtype={model_dtype} ignored for backend "
+                f"'{coordinator.backend_type or self.args.device}' "
+                f"(compiled models use their own fixed dtype)."
+            )
 
-        # Log actual running dtype for clarity.
-        try:
-            sample_param = next(policy.model.parameters())
-            print(f"  Running PT policy in dtype={sample_param.dtype}")
-        except (StopIteration, AttributeError):
-            pass
-
-        # CRITICAL: switch to eval mode.  Without this, LoRA's default
-        # dropout=0.1 stays active and randomises every forward pass
-        # (independent of seed) — the resulting KV jitter feeds into
-        # PI05's flow-matching ODE which is chaotic, so the 10-step
-        # trajectory diverges to ~zero correlation with the OM's
-        # deterministic output (observed: raw cos ≈ -0.04).
-        # ``predict_action_chunk`` deliberately does NOT call self.eval()
-        # (would break ONNX export on 310p), so the caller MUST do it.
-        policy.eval()
-
-        print(f"model loaded: {policy_path}")
-        return policy
+        print(
+            f"model loaded: {self.args.policy_path} "
+            f"(policy_type={coordinator.policy_type}, "
+            f"backend={coordinator.backend_type or 'torch'})"
+        )
+        return coordinator
 
     def load_batches_as_tensors(self):
         with open(self.args.batch_path, encoding="utf-8") as f:
@@ -236,109 +244,250 @@ class LossUtils:
                 if "side_view" in k:
                     continue
                 elif k == "observation.images.hand_view":
-                    processed_batch["observation.images.wrist"] = np.array(v).astype(np.float32)
+                    processed_batch["observation.images.wrist"] = self._prepare_image(v)
                 elif k == "observation.images.top_view":
-                    processed_batch["observation.images.top"] = np.array(v).astype(np.float32)
+                    processed_batch["observation.images.top"] = self._prepare_image(v)
+                elif "image" in k:
+                    processed_batch[k] = self._prepare_image(v)
+                elif isinstance(v, str):
+                    # Keep natural-language task prompts intact for VLA policies
+                    # (PI0/PI05/SmolVLA): the preprocessor tokenizes them.
+                    processed_batch[k] = v
                 else:
                     processed_batch[k] = np.array(v).astype(np.float32)
+            # VLA policies (PI0/PI05/SmolVLA) require a natural-language task
+            # prompt in the observation frame; the LeRobot preprocessor routes
+            # ``task`` into complementary_data and tokenizes it.  Default to an
+            # empty string to match the historical loss_compare behavior
+            # (``prepare_observation_for_inference`` set task="" when none was
+            # given); override with ``--task``.
+            if "task" not in processed_batch:
+                processed_batch["task"] = self.args.task
             processed_batches.append(processed_batch)
         return processed_batches
 
-    def forward(self, batches):
-        preprocessor, postprocessor = make_pre_post_processors(
-            policy_cfg=self.policy, pretrained_path=self.args.policy_path
-        )
+    @staticmethod
+    def _prepare_image(value) -> np.ndarray:
+        """Normalize a JSON image to float32 [0, 1], HWC kept.
 
-        # ------------------------------------------------------------------
-        # Capture raw (pre-postprocessor) action by wrapping postprocessor.
-        # The postprocessor takes the policy's raw normalized action and
-        # un-normalizes it; by intercepting its input we get the model's
-        # actual output without any dataset-stats scale-up.
-        # ------------------------------------------------------------------
-        raw_preds: list[torch.Tensor] = []
-        original_postprocessor = postprocessor
+        The batch JSON stores images as HWC with [0, 255] pixel values (but
+        encoded as float, not uint8).  The historical loss_compare path used
+        ``prepare_observation_for_inference`` which *unconditionally* divided
+        images by 255.  The current ``TensorPreprocessor`` only auto-divides
+        when the numpy dtype is an *integer*, so a float [0, 255] image would
+        slip through un-normalized and blow up the model input (observed: L1
+        jumping from ~1 to ~16).  Normalize here to match the historical
+        behavior, but stay idempotent if the data already happens to be [0, 1].
+        """
+        arr = np.array(value, dtype=np.float32)
+        if arr.size and float(arr.max()) > 1.0:
+            arr = arr / 255.0
+        return arr
 
-        def _wrapped_postprocessor(action, *args, **kwargs):
-            # Be defensive — never break the inference pipeline because
-            # of a diagnostic hook.
-            with contextlib.suppress(Exception):
-                raw_preds.append(action.detach().cpu().clone())
-            return original_postprocessor(action, *args, **kwargs)
+    @staticmethod
+    def _squeeze_leading(t: torch.Tensor) -> torch.Tensor:
+        """Drop a leading singleton batch dim so a ``(1, T, D)`` tensor and a
+        ``(T, D)`` tensor compare equal.
 
-        postprocessor = _wrapped_postprocessor
+        Targets generated by the historical pipeline stored raw (normalized)
+        actions as ``(1, T, D)`` (it hooked the postprocessor input, i.e. the
+        full chunk), whereas the current pipeline stores ``(T, D)``.  Squeezing
+        here lets a freshly-run compute-loss compare against an older raw
+        baseline without spurious shape-mismatch warnings.
+        """
+        if t.ndim >= 3 and t.shape[0] == 1:
+            return t.squeeze(0)
+        return t
 
-        device = get_safe_torch_device(self.policy.config.device)
-        # Resolve model dtype once — noise has to match the action_expert
-        # weight dtype, otherwise action_in_proj fails with
-        # ``mat1 and mat2 must have the same dtype``.
+    def _resolve_noise(self, batch_idx: int):
+        """Generate/load deterministic noise for PI05 flow-matching.
+
+        Returns a CPU fp32 tensor of shape (1, chunk_size, max_action_dim) or
+        ``None`` when noise control is not requested/available.
+        """
+        if self.args.policy_type != "pi05":
+            return None
+
+        # Per-batch seed keeps diffusion/flow-matching noise deterministic
+        # across runs even without --noise-dir.
+        torch.manual_seed(self.args.seed + batch_idx)
+
+        if not self.args.noise_dir:
+            return None
+
+        noise_path = os.path.join(self.args.noise_dir, f"noise_{batch_idx:04d}.npy")
+        if self.args.generate_target:
+            noise_shape = self._pi05_noise_shape()
+            if noise_shape is None:
+                return None
+            noise = torch.normal(mean=0.0, std=1.0, size=noise_shape, dtype=torch.float32)
+            os.makedirs(self.args.noise_dir, exist_ok=True)
+            np.save(noise_path, noise.numpy())
+            return noise
+        return torch.from_numpy(np.load(noise_path)).float()
+
+    def _pi05_noise_shape(self):
+        """(1, chunk_size, max_action_dim) inferred from whatever config the
+        backend exposes (torch policy config or the on-disk policy config.json)."""
+        raw_policy = self.coordinator.raw_policy
+        cfg = getattr(raw_policy, "config", None)
+        if cfg is not None and hasattr(cfg, "chunk_size") and hasattr(cfg, "max_action_dim"):
+            return (1, int(cfg.chunk_size), int(cfg.max_action_dim))
+        # Compiled backend (e.g. Ascend OM): raw_policy exposes no torch config.
+        # ``chunk_size`` / ``max_action_dim`` are part of the policy config
+        # contract, so read them from the on-disk policy config.json instead of
+        # assuming PI05 defaults (which silently break non-default policies).
+        disk_cfg = self._load_policy_config_json()
+        chunk = self.coordinator.chunk_size or 0
+        if chunk <= 0 and disk_cfg is not None and disk_cfg.get("chunk_size"):
+            chunk = int(disk_cfg["chunk_size"])
+        max_action_dim = None
+        if disk_cfg is not None and disk_cfg.get("max_action_dim") is not None:
+            max_action_dim = int(disk_cfg["max_action_dim"])
+        if chunk <= 0 or max_action_dim is None:
+            print(
+                "  WARN: cannot infer PI05 noise shape on this backend "
+                "(missing chunk_size/max_action_dim in policy config.json); skipping noise injection"
+            )
+            return None
+        return (1, int(chunk), max_action_dim)
+
+    def _load_policy_config_json(self):
+        """Best-effort read of the policy ``config.json`` for shape metadata."""
+        policy_path = getattr(self.args, "policy_path", None)
+        if not policy_path:
+            return None
+        config_path = os.path.join(policy_path, "config.json")
+        if not os.path.isfile(config_path):
+            return None
         try:
-            model_dtype = next(self.policy.model.parameters()).dtype
-        except (StopIteration, AttributeError):
-            model_dtype = torch.float32
+            with open(config_path, encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            return None
+        return cfg if isinstance(cfg, dict) else None
+
+    def _inject_noise(self, batch, noise):
+        """Wire deterministic noise into whichever backend is active.
+
+        - torch LeRobot PI05: ``batch["_noise"]`` is forwarded by
+          ``LeRobotPolicyWrapper.infer`` as ``predict_action_chunk(..., noise=...)``.
+        - compiled OM PI05: ``batch["_noise"]`` is read by
+          ``PI05CompiledAdapter.prepare_inputs``.
+        """
+        if noise is None:
+            return batch
+
+        batch = dict(batch)
+        batch["_noise"] = noise
+        return batch
+
+    def _infer_raw(self, preprocessed_batch, noise):
+        """Run preprocess-already-done batch through inject+infer, return the
+        raw (pre-postprocessor) action on CPU.  Used by the noise self-check."""
+        b = self._inject_noise(dict(preprocessed_batch), noise)
+        if self.coordinator.raw_policy is not None and hasattr(self.coordinator.raw_policy, "_action_queue"):
+            self.coordinator.raw_policy._action_queue.clear()
+        with torch.inference_mode():
+            r = self.coordinator.infer_only(b)
+        return r.action.detach().cpu().float()
+
+    def _assert_noise_effective(self, batch0):
+        """One-shot self-check (PI05 + fixed noise only): prove the injected
+        noise actually drives the flow-matching ODE and is deterministic.
+
+        Why this exists: the noise transport path differs by lerobot build —
+        some consume ``policy._external_noise`` (back-door), others accept a
+        ``predict_action_chunk(..., noise=)`` kwarg.  If loss_compare's
+        injection mechanism does not match the lerobot actually imported (e.g.
+        the ``.shrc_local`` ``libs/lerobot`` ignores ``_external_noise``), the
+        noise is *silently dropped* and ``sample_actions`` samples its own RNG
+        noise — producing targets that are NOT reproducible on the 310p OM,
+        with no error raised.  This converts that silent failure into a hard
+        abort *before* a bad target is written.
+
+        Method (3 forwards on batch 0):
+          A1, A2 with noise=zeros, B with noise=3*ones.
+          - determinism: A1 == A2 (else RNG leak / dropout active / eval off)
+          - effectiveness: A1 != B (else noise is being ignored)
+        """
+        if self.args.policy_type != "pi05" or not self.args.noise_dir:
+            return  # no fixed-noise requirement -> nothing to guarantee
+
+        shape = self._pi05_noise_shape()
+        if shape is None:
+            print("  noise self-check skipped (cannot infer PI05 noise shape on this backend)")
+            return
+
+        nA = torch.zeros(shape, dtype=torch.float32)
+        nB = torch.full(shape, 3.0, dtype=torch.float32)
+
+        b = self.coordinator.preprocess_only(dict(batch0))
+        oA1 = self._infer_raw(b, nA)
+        oB = self._infer_raw(b, nB)
+        oA2 = self._infer_raw(b, nA)
+
+        deterministic = torch.allclose(oA1, oA2, atol=1e-5)
+        effective = not torch.allclose(oA1, oB, atol=1e-4)
+        d_AB = (oA1 - oB).abs().mean().item()
+        d_AA = (oA1 - oA2).abs().mean().item()
+
+        if not deterministic:
+            raise RuntimeError(
+                "Noise self-check FAILED (non-deterministic): replaying the same "
+                f"noise gave different outputs (mean|A1-A2|={d_AA:.3e}). Likely an "
+                "RNG leak or active dropout — ensure policy.eval() ran. Refusing "
+                "to generate non-reproducible targets."
+            )
+        if not effective:
+            raise RuntimeError(
+                "Noise self-check FAILED (no effect): two very different noises "
+                f"produced ~identical outputs (mean|A-B|={d_AB:.3e}). The injected "
+                "noise is being IGNORED — loss_compare's injection path does not "
+                "match the imported lerobot (e.g. it sets policy._external_noise "
+                "but this lerobot's predict_action_chunk only honors a noise= "
+                "kwarg, or vice-versa). Generated targets would NOT be "
+                "reproducible on the 310p OM. Aborting before writing a bad target."
+            )
+        print(f"  ✓ noise self-check passed (deterministic mean|A1-A2|={d_AA:.2e}, effective mean|A-B|={d_AB:.2e})")
+
+    def forward(self, batches):
+        raw_preds: list[torch.Tensor] = []
         outputs = []
+
         for i in tqdm(range(len(batches)), desc="forwarding"):
             # IMPORTANT: loss_compare treats each JSON batch as an independent
-            # sample, but PI05Policy.select_action() keeps an internal
-            # ``_action_queue`` across calls to serve multi-step chunks. If we
-            # don't reset that queue here, batch i may consume leftover actions
-            # produced from batch i-1's observation, which contaminates the
-            # comparison and can make later batches look progressively worse.
-            if hasattr(self.policy, "_action_queue"):
-                self.policy._action_queue.clear()
-            # Fix random seed per batch so that diffusion/flow-matching noise is
-            # deterministic across runs.  Without this, PI05's sample_noise()
-            # generates different Gaussian noise each time → different actions.
-            torch.manual_seed(self.args.seed + i)
+            # sample, but the torch PI05Policy.select_action() keeps an internal
+            # ``_action_queue`` across calls. Reset it so batch i never consumes
+            # leftover actions from batch i-1.  (No-op for compiled backends,
+            # which are stateless.)
+            raw_policy = self.coordinator.raw_policy
+            if raw_policy is not None and hasattr(raw_policy, "_action_queue"):
+                raw_policy._action_queue.clear()
 
-            # --- Scheme C: file-based noise transfer for cross-machine comparison ---
-            # When --noise-dir is specified:
-            #   generate-target (GPU): generate noise → save .npy → inject into policy
-            #   compute-loss   (NPU): load .npy → inject into policy → OM uses same noise
-            if self.args.noise_dir:
-                noise_path = os.path.join(self.args.noise_dir, f"noise_{i:04d}.npy")
-                if self.args.generate_target:
-                    cfg = self.policy.config
-                    noise_shape = (1, cfg.chunk_size, cfg.max_action_dim)
-                    noise = torch.normal(mean=0.0, std=1.0, size=noise_shape, dtype=torch.float32)
-                    os.makedirs(self.args.noise_dir, exist_ok=True)
-                    np.save(noise_path, noise.numpy())
-                else:
-                    noise = torch.from_numpy(np.load(noise_path)).float()
-                # Cast noise to model dtype so action_in_proj matmul matches
-                # (noise files stay fp32 on disk for portability across runs
-                # with different model dtypes).
-                self.policy._external_noise = noise.to(device=device, dtype=model_dtype)
+            noise = self._resolve_noise(i)
 
-            if self.args.policy_type == "pi05":
-                # --- PI05: bypass action queue and grab the *full* chunk ---
-                # ``predict_action`` returns only the first frame of the chunk
-                # (queue.popleft()).  For distributional evaluation we want
-                # the entire (1, T, D) chunk so Method A (Wasserstein) has
-                # N*T samples per dim and Method C can pick chunk[:, 0, :]
-                # explicitly.  We call the same low-level steps as
-                # ``predict_action`` but invoke ``predict_action_chunk``
-                # instead of ``select_action``.
-                use_amp = self.policy.config.use_amp
-                with (
-                    torch.inference_mode(),
-                    torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
-                ):
-                    obs = prepare_observation_for_inference(dict(batches[i]), device, None, None)
-                    obs = preprocessor(obs)
-                    chunk = self.policy.predict_action_chunk(obs)  # (1, T, D)
-                    output = postprocessor(chunk)  # (1, T, D)
-                # Strip leading batch dim (== 1) for storage symmetry with
-                # the act path which returns (D,) after predict_action.
-                output = output.squeeze(0).detach().cpu()  # (T, D)
-            else:
-                output = predict_action(
-                    observation=batches[i],
-                    policy=self.policy,
-                    device=device,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    use_amp=self.policy.config.use_amp,
-                )
+            # Run the pipeline stage-by-stage so we can capture the raw
+            # (pre-postprocessor / normalized-space) action for every backend
+            # uniformly — the OM/RKNN wrappers have no Python postprocessor hook
+            # we could intercept, so we split pre/infer/post explicitly here.
+            batch = self.coordinator.preprocess_only(dict(batches[i]))
+            batch = self._inject_noise(batch, noise)
+
+            with torch.inference_mode():
+                infer_result = self.coordinator.infer_only(batch)
+
+            raw_action = infer_result.action
+            with contextlib.suppress(Exception):
+                raw_preds.append(raw_action.detach().cpu().clone())
+
+            output = self.coordinator.postprocess_only(raw_action)
+            # Normalize storage shape: drop a leading singleton batch dim so
+            # ACT returns (T, D) / (D,) and PI05 returns (T, D), matching the
+            # original loss_compare conventions.
+            output = output.detach().cpu()
+            if output.ndim >= 3 and output.shape[0] == 1:
+                output = output.squeeze(0)
             outputs.append(output)
 
         # Stash raw preds for compute_loss / generate_target to use.
@@ -351,6 +500,13 @@ class LossUtils:
             print(f"  noise files will be saved to: {self.args.noise_dir}")
 
         batches = self.load_batches_as_tensors()
+
+        # Guard: before producing any target, prove the fixed noise is actually
+        # consumed by this backend (PI05 + --noise-dir).  A silent noise-drop
+        # here would yield targets the 310p OM can never match.
+        if batches:
+            self._assert_noise_effective(batches[0])
+
         outputs = self.forward(batches)
 
         print(f"saving output json: length={len(outputs)}")
@@ -376,56 +532,63 @@ class LossUtils:
             print(f"raw (normalized) target saved at {raw_target_path}")
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Model Loss Comparison")
-    parser.add_argument("--batch_path", type=str, required=True, help="Path to input batches json file")
-    parser.add_argument("--target_path", type=str, required=True, help="Path to save target json file")
-    parser.add_argument("--policy_path", type=str, required=True, help="Path to pretrained policy model directory")
-    parser.add_argument(
-        "--policy_type", type=str, default="act", help="Type of policy model (e.g. act, diffuser, ddpg)"
-    )
-    parser.add_argument(
-        "--model_dtype",
-        type=str,
-        default="native",
-        choices=["native", "fp16", "bf16", "fp32"],
-        help="Cast PT model to this dtype before forward. "
-        "'native' (default) keeps the checkpoint dtype "
-        "(BF16 for PI05). Use 'fp16' for apples-to-apples "
-        "comparison with OM/ORT deployment.",
-    )
-    parser.add_argument(
-        "--generate-target", action="store_true", help="Reading batches and generating target json file"
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-        help="Random seed for deterministic inference (fixes diffusion noise).",
-    )
-    parser.add_argument(
-        "--noise-dir",
-        type=str,
-        default=None,
-        help="Directory for noise file transfer (Scheme C). "
-        "generate-target: saves noise_{NNNN}.npy files here. "
-        "compute-loss: loads noise files from here to ensure identical "
-        "noise across GPU (PyTorch) and NPU (OM) machines.",
-    )
-    parser.add_argument(
-        "--raw-target-path",
-        type=str,
-        default=None,
-        help="Optional path to dump/read normalized-space (pre-postprocessor) "
-        "actions. generate-target: writes raw target JSON next to the "
-        "regular target. compute-loss: reads it and prints an extra L1 / "
-        "Cosine table in normalized action space — useful for separating "
-        "real model drift from unnormalization scale-up.",
-    )
-    return parser.parse_args()
+def _import_heavy_deps():
+    """Lazy-load numpy, torch, tqdm, inference_service.
+
+    These libraries take seconds to import (torch especially). Defer until
+    after CLI argument resolution so --list-profiles / --help / wizard-only
+    invocations stay fast.  Assign to module globals so LossUtils (defined at
+    module level) can reference them as before.
+    """
+    global np, torch, tqdm, InferenceCoordinator
+    import numpy as _np
+    import torch as _torch
+    from tqdm import tqdm as _tqdm
+
+    from inference_service.core import InferenceCoordinator as _Coord
+
+    np = _np
+    torch = _torch
+    tqdm = _tqdm
+    InferenceCoordinator = _Coord
+
+
+def main():
+    # All argument ergonomics (profile / wizard / --exp-dir derivation /
+    # remember-last) live in loss_compare_cli so this entry point stays thin
+    # and LossUtils itself is unchanged.  Every historical explicit flag still
+    # works and overrides whatever a profile/derivation would supply.
+    try:
+        from model_utils import loss_compare_cli
+    except ImportError:
+        # Running as a standalone script (e.g. ``python loss_compare.py`` from a
+        # data directory) — import the sibling file next to this one.
+        import importlib.util
+        import os
+        import sys
+
+        _cli_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "loss_compare_cli.py")
+        _spec = importlib.util.spec_from_file_location("loss_compare_cli", _cli_path)
+        loss_compare_cli = importlib.util.module_from_spec(_spec)
+        # Register before exec so dataclasses (which look the module up in
+        # sys.modules during class creation) resolve correctly.
+        sys.modules["loss_compare_cli"] = loss_compare_cli
+        _spec.loader.exec_module(loss_compare_cli)
+
+    resolved = loss_compare_cli.resolve()
+    loss_compare_cli.print_effective(resolved)
+
+    # Lazy-load torch/numpy/tqdm/coordinator only after resolve() returns;
+    # --list-profiles / --help / wizard-save exits in resolve() before this.
+    _import_heavy_deps()
+
+    loss_utils = LossUtils(resolved.args)
+    loss_utils.run()
+
+    # Persist this run's effective params as ``_last`` (replaces a separate
+    # "remember last args" cache).  Only after a successful run.
+    loss_compare_cli.write_last(resolved)
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    loss_utils = LossUtils(args)
-    loss_utils.run()
+    main()

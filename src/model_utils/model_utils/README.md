@@ -297,6 +297,95 @@ python export_onnx_hmm.py \
 > **跨平台模型推理精度对比工具。**
 >
 > 用于验证模型在不同平台（如 GPU PyTorch 推理 vs NPU OM 推理）上的输出一致性。支持生成基准推理结果和计算 L1 Loss。
+>
+> **注意**：该脚本现已统一通过 IB-Robot 的 `inference_service.InferenceCoordinator` 加载模型，因此既支持原生 LeRobot torch 模型，也支持 ib robot 中编译好的离线模型（昇腾 OM、3403、RKNN）。后端由 `--device` 参数自动选择，无需修改脚本。pi05 等 VLA 模型在 torch 与 OM 两种后端下都可直接对比。
+
+### 快速开始（推荐）
+
+为缓解「参数繁琐、路径长、含义易忘」三个痛点，loss_compare 提供 **交互向导 + profile 配置 + 派生路径 + 记住上次** 四件套。常用参数只需配置一次，之后一行命令即可复用。
+
+> 旧的完整显式命令（见下方「高级用法（完整参数）」）**完全保持可用**，向后兼容；下面这套只是更省心的入口。
+
+**第一次使用：交互向导**
+
+直接不带参数运行（或加 `--init`），向导（英文）会逐项提示**含义 + 默认值**（目录类参数不显示样例路径，只描述内容/命名要求；非目录参数会给出样例），回车即用默认，结尾可把这组参数存成一个 profile。`policy_type` 会自动检测，不在向导中询问：
+
+```shell
+python loss_compare.py          # 无配置时自动进入向导
+python loss_compare.py --init   # 任何时候强制重新进向导
+```
+
+**日常使用：profile + 实验目录**
+
+```shell
+# 引用 profile，只需再给一个实验目录；target/raw/noise 自动派生
+python loss_compare.py --profile pi05-om --exp-dir /root/.../0612
+
+# 临时覆盖某个参数（命令行优先级最高）
+python loss_compare.py --profile pi05-om --exp-dir /root/.../0612 --device cuda
+```
+
+**派生路径约定**：`--exp-dir <DIR>` 会自动派生三条长路径，无需再分别手填：
+
+| 派生项 | 路径 |
+| --- | --- |
+| `--target_path` | `<DIR>/target.json` |
+| `--raw-target-path` | `<DIR>/target_raw.json` |
+| `--noise-dir` | `<DIR>/noises/` |
+
+显式传同名参数会覆盖对应派生值。`--generate-target` 时若派生/目标文件已存在，会**报错拒绝覆盖**，需更换 `--exp-dir` 或显式加 `--force`（防止误覆盖基准）。
+
+**记住上次**：每次成功运行后，最终生效参数会自动写入配置文件的 `_last` 段。下次不指定 `--profile` 时即自动复用上次参数（启动时会打印每个参数的来源）：
+
+```shell
+python loss_compare.py --exp-dir /root/.../0613   # 其余参数沿用上次
+```
+
+**其他配置命令**：
+
+```shell
+python loss_compare.py --list-profiles            # 列出已有 profile
+python loss_compare.py ... --save-as pi05-torch   # 把当前参数另存为 profile
+python loss_compare.py --config /path/to.yaml ... # 指定配置文件
+```
+
+#### 配置文件
+
+默认位置 `~/.config/model_utils/loss_compare.yaml`（可用 `--config` 或环境变量 `LOSS_COMPARE_CONFIG` 覆盖），三个段：
+
+```yaml
+# 所有 profile 共享的默认值
+defaults:
+  policy_type: pi05
+  seed: 42
+  batch_path: /root/.../batches_480_640_first_batch.json
+
+# 命名 profile（常用参数组）
+profiles:
+  pi05-om:                       # 昇腾 OM 后端
+    device: ascend_om
+    policy_path: /root/.../019200/
+  pi05-torch:                    # GPU torch 基准
+    device: cuda
+    policy_path: /root/.../019200/
+
+# 由脚本自动回写，等价「记住上次」；不要手动维护
+_last:
+  profile: pi05-om
+  device: ascend_om
+  policy_path: /root/.../019200/
+  exp_dir: /root/.../0612
+```
+
+参数优先级（高 → 低）：**命令行 > `--profile` > `defaults` > `_last`（仅未指定 profile 时）> 内置默认**。
+
+> 提示：`_last` 与 profile 里**不会**保存派生出来的 `target/raw/noise` 绝对路径（只存 `exp_dir`），这样以后换 `--exp-dir` 才能正确重新派生。
+
+---
+
+## 高级用法（完整参数）
+
+以下为不依赖 profile/向导的完整显式用法，适用于自动化/CI 或非标准目录布局。
 
 ### 工作流程
 
@@ -330,14 +419,21 @@ python loss_compare.py \
 
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `--policy_path` | ✅ | — | LeRobot 训练出来的策略模型目录路径 |
-| `--batch_path` | ✅ | — | 输入 batch 的 JSON 文件路径 |
-| `--target_path` | ✅ | — | 基准推理输出的 JSON 文件路径（生成或读取） |
-| `--policy_type` | ❌ | `act` | 策略模型类型（支持 `act`、`pi05`） |
-| `--device` | ❌ | `cpu` | 推理设备（如 `cpu`、`cuda`） |
+| `--policy_path` | ✅ | — | LeRobot 训练出来的策略模型目录路径（torch 与 OM 共用同一目录，OM 需含 `config.om.json`）。可由 profile 提供 |
+| `--batch_path` | ✅ | — | 输入 batch 的 JSON 文件路径。可由 profile/defaults 提供 |
+| `--target_path` | ✅* | — | 基准推理输出的 JSON 文件路径（生成或读取）。*可由 `--exp-dir` 派生为 `<DIR>/target.json` |
+| `--exp-dir` | ❌ | `None` | 实验目录：自动派生 `target.json`/`target_raw.json`/`noises/`，免去分别手填三条长路径 |
+| `--policy_type` | ❌ | `act` | 策略类型提示（实际类型由加载的策略/manifest 自动检测，仅作回退） |
+| `--device` | ❌ | `cpu` | 推理后端：原生 torch 用 `cpu`/`cuda`/`npu`；ib robot 离线模型用 `ascend_om`（含 pi05 OM）、`ascend_om_3403`、`rknn` |
+| `--model_dtype` | ❌ | `native` | 仅对 torch 后端生效：将模型转为 `fp16`/`bf16`/`fp32`（编译后端使用其固定 dtype，忽略此参数） |
 | `--generate-target` | ❌ | `false` | 指定后进入基准数据生成模式 |
+| `--force` | ❌ | `false` | generate-target 时允许覆盖已存在的派生/目标文件（默认拒绝覆盖，防误删基准） |
 | `--seed` | ❌ | `42` | 随机种子，用于固定扩散/flow-matching 噪声以保证可复现性 |
-| `--noise-dir` | ❌ | `None` | 噪声文件目录，用于跨机器精度对比（Scheme C） |
+| `--task` | ❌ | `""` | VLA 策略（PI0/PI05/SmolVLA）的自然语言任务提示词，会被路由进 LeRobot 预处理器的 complementary_data 并 tokenize。生成基准与计算损失两端必须一致，否则对比无意义 |
+| `--noise-dir` | ❌ | `None` | 噪声文件目录，用于跨机器精度对比（Scheme C）。可由 `--exp-dir` 派生为 `<DIR>/noises/` |
+| `--raw-target-path` | ❌ | `None` | 归一化空间（后处理前）动作的导出/读取路径，用于区分模型漂移与反归一化放大。可由 `--exp-dir` 派生为 `<DIR>/target_raw.json` |
+
+> 配置/向导相关：`--config`（配置文件路径）、`--profile`（引用 profile）、`--save-as`（另存为 profile）、`--init`（强制向导）、`--list-profiles`（列出 profile）。详见上方「快速开始」。
 
 ### 噪声文件传递（Scheme C）
 
@@ -366,6 +462,62 @@ python loss_compare.py \
     --target_path=targets.json \
     --noise-dir=noise_files/
 ```
+
+### pi05 OM 离线模型对比示例
+
+pi05 在 GPU 上用 torch 生成基准，在昇腾上用 OM 离线模型对比（`--device=ascend_om`）。
+由于 flow-matching ODE 对噪声敏感，跨平台对比务必配合 `--noise-dir` 传递相同噪声：
+
+```shell
+# 步骤 1：GPU torch 端生成基准 + 噪声 + 归一化空间基准
+python loss_compare.py \
+    --policy_path=path/to/pi05_model \
+    --policy_type=pi05 \
+    --device=cuda \
+    --batch_path=batches.json \
+    --target_path=targets.json \
+    --raw-target-path=raw_targets.json \
+    --noise-dir=noise_files/ \
+    --generate-target
+
+# 步骤 2：昇腾 OM 端计算精度损失（policy_path 目录需含 config.om.json 与 OM 文件）
+python loss_compare.py \
+    --policy_path=path/to/pi05_model \
+    --policy_type=pi05 \
+    --device=ascend_om \
+    --batch_path=batches.json \
+    --target_path=targets.json \
+    --raw-target-path=raw_targets.json \
+    --noise-dir=noise_files/
+```
+
+### OM 后端使用须知
+
+`--device=ascend_om` 时，`policy_path` 目录除了 LeRobot 策略元数据（`config.json`、
+`policy_preprocessor.json`、`policy_postprocessor.json` 及对应 safetensors）之外，还必须包含一个
+**`config.om.json`** manifest，描述 OM 离线模型的 artifact。pi05（VLM + Action Expert 双 OM）的 manifest 形如：
+
+```json
+{
+  "schema_version": 1,
+  "policy_type": "pi05",
+  "backend": "ascend_om",
+  "artifacts": {
+    "vlm": "vlm.om",
+    "action_expert": "ae.om"
+  },
+  "execution": ["vlm", "action_expert"]
+}
+```
+
+- `artifacts` 里的路径相对于 manifest 所在目录（可用 `artifact_dir` 指定子目录）；务必与目录下真实存在的 `.om` 文件名一致。
+- ACT 单 OM 模型的 manifest 见 `export_onnx_atc.py` 一节（`"artifacts": {"policy": "model.om"}`）。
+- pi05 等 VLA 模型需通过 `--task` 提供任务提示词（默认空串）；该提示词必须与生成基准时一致。
+- OM 端会自动读取并 strip 掉 `config.json` 中 IB-Robot 特有的键
+  （`is_ascend_om_enabled` / `om_vlm_model_path` / `om_action_expert_model_path` 等），无需手动清理。
+
+> **自洽性自检**：在同一台板子上先用 `--generate-target` 生成 OM 基准（含 `--noise-dir`），再用相同噪声跑 compute-loss，应得到 `L1 = 0.000000`、`Cosine = 1.000000`（归一化空间同理）。这可用于在跨平台对比前确认整条 pre/infer/post 流水线确定且可复现。
+
 
 ---
 
@@ -478,17 +630,119 @@ PI05 策略与单体 ACT 模型不同，导出时被拆分为 **VLM 预填充** 
 >
 > 它会按 `VLM 导出 → AE 导出 → ATC 转 OM` 自动串起整条链路，生成两个 `.om` 与 `config.om.json`。
 
-### 一条命令的端到端流程（推荐）
+### 快速开始（推荐）
 
-`python -m model_utils.pi05_export` 是整个工具链的统一入口，自动编排各阶段并在阶段间正确
-传递文件，你无需记忆多个模块路径，也无需手写 `atc` 命令。
+为缓解「参数繁琐、路径长、含义易忘」三个痛点，pi05 导出入口与 `loss_compare` 一致，提供
+**交互向导 + profile 配置 + 派生路径 + 记住上次** 四件套。常用参数只需配置一次，之后一行命令即可复用。
+
+> 下面这套显式命令（见「一条命令的端到端流程」）**完全保持可用**，向后兼容；这只是更省心的入口。
+> 安装后还可用 `pi05-export` 控制台命令替代 `python -m model_utils.pi05_export`。
+
+**第一次使用：交互向导**
+
+直接不带参数运行（或加 `--init`），向导（英文）会逐项提示**含义 + 默认值 + 样例**，回车即用默认，
+结尾可把这组稳定参数存成一个 profile。向导只保存稳定参数；做什么（量化 / 验证 / 只重做某段）由
+运行时的 `--steps` 决定，不写进 profile：
 
 ```shell
-# 仅导出 ONNX（不转 OM；适合在 GPU/CPU 机器上先把 ONNX 准备好）
-python -m model_utils.pi05_export \
-    --policy-path path/to/pretrained_model
+python -m model_utils.pi05_export          # 无配置时自动进入向导
+python -m model_utils.pi05_export --init   # 任何时候强制重新进向导
+```
 
-# 导出 ONNX 并转 OM（在 Ascend 机器上一步到位）
+**日常使用：profile + 实验目录**
+
+```shell
+# 引用 profile，只需再给一个实验目录；onnx/ 与 runtime_save/ 自动派生
+python -m model_utils.pi05_export --profile p310 --exp-dir /root/.../0612
+
+# 临时覆盖某个参数（命令行优先级最高）
+python -m model_utils.pi05_export --profile p310 --exp-dir /root/.../0612 --dtype fp32
+```
+
+**派生路径约定**：`--exp-dir <DIR>` 会自动派生三条长路径，无需再分别手填：
+
+| 派生项 | 路径 |
+| --- | --- |
+| `--output-dir` | `<DIR>/onnx/` |
+| `--runtime-save-dir` | `<DIR>/runtime_save/` |
+| `--om-dir` | `<DIR>/om/` |
+
+显式传同名参数会覆盖对应派生值。OM 文件写入 `--om-dir`（默认 `<DIR>/om/`）；只有
+`config.om.json` 仍写入 `--policy-path` 目录并指向实际 OM 路径（运行时 `device:=ascend_om`
+约定），**不**随 `--exp-dir` 派生。
+
+**记住上次**：每次成功运行后，最终生效参数会自动写入配置文件的 `_last` 段。下次不指定 `--profile`
+时即自动复用上次参数（启动时会打印每个参数的来源）：
+
+```shell
+python -m model_utils.pi05_export --exp-dir /root/.../0613   # 其余参数沿用上次
+```
+
+**其他配置命令**：
+
+```shell
+python -m model_utils.pi05_export --list-profiles            # 列出已有 profile
+python -m model_utils.pi05_export ... --save-as p310         # 把当前参数另存为 profile
+python -m model_utils.pi05_export --config /path/to.yaml ... # 指定配置文件
+```
+
+#### 配置文件
+
+默认位置 `~/.config/model_utils/pi05_export.yaml`（可用 `--config` 或环境变量 `PI05_EXPORT_CONFIG`
+覆盖），三个段：
+
+```yaml
+# 所有 profile 共享的默认值
+defaults:
+  dtype: fp16
+
+# 命名 profile（常用参数组）
+profiles:
+  p310:                          # 昇腾 310P 一步到位
+    policy_path: /root/.../pretrained_model
+    soc_version: Ascend310P3
+
+# 由脚本自动回写，等价「记住上次」；不要手动维护
+_last:
+  profile: p310
+  policy_path: /root/.../pretrained_model
+  soc_version: Ascend310P3
+  exp_dir: /root/.../0612
+```
+
+参数优先级（高 → 低）：**命令行 > `--profile` > `defaults` > `_last`（仅未指定 profile 时）> 内置默认**。
+
+> 提示：`_last` 与 profile 里**不会**保存派生出来的 `output_dir/runtime_save_dir/om_dir`（只存 `exp_dir`），
+> 这样以后换 `--exp-dir` 才能正确重新派生；`--steps` 作为临时流程开关也不会被持久化。
+
+### 一条命令的端到端流程（推荐）
+
+`python -m model_utils.pi05_export` 是整个工具链的统一入口，自动编排各步骤并在步骤间正确
+传递文件，你无需记忆多个模块路径，也无需手写 `atc` 命令。
+
+**做什么由 `--steps` 显式决定**（逗号分隔的步骤列表）。可用步骤：
+
+| step | 含义 | 产物 | 依赖（参数 / 上游产物） |
+| --- | --- | --- | --- |
+| `vlm_onnx` | 导出 VLM（gemma_2b）ONNX | `pi05-vlm*.onnx` | — |
+| `ae_onnx` | 导出 Action Expert（gemma_300m）ONNX | `pi05-action_expert*.onnx` | `vlm_onnx`（需 `runtime_save` 中转张量） |
+| `vlm_quant` | VLM ONNX W8A8 量化 | `pi05-vlm*_w8a8.onnx` | `--batch-path` + `vlm_onnx`；若 `vlm_onnx` 是 NPU 图，会自动复用/生成 donor ONNX |
+| `ae_quant` | Action Expert ONNX W8A8 量化 | `pi05-action_expert*_w8a8.onnx` | `--calib-dir`（默认 `runtime_save`）+ `ae_onnx`；若 `ae_onnx` 是 NPU 图，会自动复用/生成 donor ONNX |
+| `vlm_om` | VLM FP16 ONNX → OM（ATC） | `vlm.om`（+manifest） | `--soc-version` + `vlm_onnx` |
+| `ae_om` | Action Expert FP16 ONNX → OM（ATC） | `action_expert.om`（+manifest） | `--soc-version` + `ae_onnx` |
+| `vlm_quant_om` | VLM W8A8 ONNX → OM（ATC） | `vlm_w8a8.om`（+manifest） | `--soc-version` + `vlm_quant` |
+| `ae_quant_om` | Action Expert W8A8 ONNX → OM（ATC） | `action_expert_w8a8.om`（+manifest） | `--soc-version` + `ae_quant` |
+| `verify` | 拆分 vs 整体等价性验证 | — | `--task` + `vlm_onnx`,`ae_onnx` |
+
+**默认 `--steps`** = `vlm_onnx,ae_onnx,vlm_om,ae_om`（导出两段 ONNX + 编译两段 FP16 OM）。量化与验证是**显式选项**，需在 `--steps` 中点名；W8A8 OM 由专用的 `vlm_quant_om` / `ae_quant_om` 步骤编译，不会覆盖普通 `vlm_om` / `ae_om`。
+
+```shell
+# 仅导出两段 ONNX（不转 OM；适合在 GPU/CPU 机器上先把 ONNX 准备好）
+python -m model_utils.pi05_export \
+    --policy-path path/to/pretrained_model \
+    --steps vlm_onnx,ae_onnx
+
+# 默认：导出两段 ONNX 并编译两段 OM（在 Ascend 机器上一步到位）
 python -m model_utils.pi05_export \
     --policy-path path/to/pretrained_model \
     --soc-version Ascend310P3
@@ -497,30 +751,82 @@ python -m model_utils.pi05_export \
 python -m model_utils.pi05_export \
     --policy-path path/to/pretrained_model \
     --soc-version Ascend310P3 \
-    --verify --task 'pick up the cup'
+    --steps vlm_onnx,ae_onnx,vlm_om,ae_om,verify --task 'pick up the cup'
+
+# 导出 + W8A8 量化（两段）+ 编译量化 OM（用专用的量化 OM 步骤）
+python -m model_utils.pi05_export \
+    --policy-path path/to/pretrained_model \
+    --soc-version Ascend310P3 \
+    --steps vlm_onnx,ae_onnx,vlm_quant,ae_quant,vlm_quant_om,ae_quant_om \
+    --batch-path path/to/batches.json
 ```
+
+> **场景 1：已导出 ONNX+OM，现在想开始量化**。复用已有 profile，只跑量化 + 编译量化 OM。若已有 ONNX 是
+> `*_npu.onnx`，pipeline 会自动查找同目录 `*_cpu.onnx` donor；donor 已存在则复用，不存在则用
+> `--donor-device`（默认 `cpu`）主动生成，并在日志中明确说明：
+>
+> ```shell
+> python -m model_utils.pi05_export --profile p310 \
+>     --steps vlm_quant,ae_quant,vlm_quant_om,ae_quant_om \
+>     --batch-path path/to/batches.json
+> ```
+>
+> **场景 2：调参后只重导某一段并重编它的 OM**（另一段完全不动）：
+>
+> ```shell
+> # 只重导 VLM ONNX 并重编 vlm.om（AE 不受影响）
+> python -m model_utils.pi05_export --profile p310 --steps vlm_onnx,vlm_om
+> ```
+>
+> 关键规则：**列在 `--steps` 里的步骤一定会执行**（即使产物已存在也会重建）；某步骤的上游产物
+> 若既不在 `--steps`、盘上也没有，会**报错并提示把对应 step 加进 `--steps`**（不会偷偷补跑）。
 
 #### 参数
 
 | 参数 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `--policy-path` | ✅ | — | 本地 PI05 策略目录（含 config + 权重） |
+| `--policy-path` | ✅ | — | 本地 PI05 策略目录（含 config + 权重）。可由 profile 提供 |
+| `--steps` | ❌ | `vlm_onnx,ae_onnx,vlm_om,ae_om` | 要执行的步骤列表（见上表）。列出的步骤总会执行 |
+| `--exp-dir` | ❌ | `None` | 实验目录：自动派生 `onnx/`/`runtime_save/`/`om/`，免去分别手填三条长路径 |
 | `--dtype` | ❌ | `fp16` | 导出精度，**同时应用于 VLM 与 AE 两段**（`fp16` / `fp32` / `auto`） |
-| `--soc-version` | ❌ | `None` | 给定时追加 ATC→OM 编译（如 `Ascend310P3`，见下文「查看芯片版本号」） |
-| `--verify` | ❌ | `false` | 结尾运行拆分 vs 整体等价性验证（需同时给 `--task`） |
-| `--task` | ❌ | `None` | `--verify` 所需的任务提示，须与部署 `default_task` 一致 |
+| `--soc-version` | ❌ | `None` | `vlm_om` / `ae_om` / `vlm_quant_om` / `ae_quant_om` 步骤所需的目标芯片（如 `Ascend310P3`，见下文「查看芯片版本号」） |
+| `--batch-path` | `vlm_quant` 必填 | `None` | 真实标定 batch JSON（**随机数据会量化出不可用模型**）。可由 profile 提供 |
+| `--donor-device` | ❌ | `cpu` | 量化 NPU ONNX 时，若 donor ONNX 不存在，用该设备自动导出 ORT-runnable donor（不要设为 `npu`） |
+| `--calib-dir` | ❌ | `=--runtime-save-dir` | `ae_quant` 标定样本目录（含 `past_kv_tensor.*` + `prefix_pad_masks.*`） |
+| `--num-calib` | ❌ | `16` | 标定样本数量（`<=0` 表示全部） |
+| `--amp-num` | ❌ | `0` | msModelSlim 自动混合精度的 fp16 回退层数（精度安全阀） |
+| `--task` | `verify` 必填 | `None` | `verify` 步骤所需的任务提示，须与部署 `default_task` 一致 |
 | `--device` | ❌ | `cpu` | 导出/验证设备（`cpu` / `cuda:0` / `npu`），会体现在 ONNX 文件名中 |
-| `--output-dir` | ❌ | `outputs/onnx` | 导出 ONNX 的目录 |
-| `--runtime-save-dir` | ❌ | `runtime_save` | VLM→AE 中转张量目录（保留以便排查） |
-| `--force` | ❌ | `false` | 即使产物已存在也强制重建每个阶段 |
+| `--output-dir` | ❌ | `outputs/onnx` | 导出 ONNX 的目录。可由 `--exp-dir` 派生为 `<DIR>/onnx/` |
+| `--runtime-save-dir` | ❌ | `runtime_save` | VLM→AE 中转张量目录。可由 `--exp-dir` 派生为 `<DIR>/runtime_save/` |
+| `--om-dir` | ❌ | `outputs/om` | 编译出的 OM 产物目录。可由 `--exp-dir` 派生为 `<DIR>/om/`；`config.om.json` 仍写入 `--policy-path` |
+
+> 配置/向导相关：`--config`（配置文件路径）、`--profile`（引用 profile）、`--save-as`（另存为 profile）、`--init`（强制向导）、`--list-profiles`（列出 profile）。详见上方「快速开始」。
+>
+> 量化说明：量化默认**不执行**（不在默认 `--steps` 内）。在 `--steps` 中加入 `vlm_quant`/`ae_quant`
+> 即开启对应段量化，会在 fp16 ONNX 旁产出 `*_w8a8.onnx`；要把量化产物编译成 OM，需显式加入专用的
+> `vlm_quant_om`/`ae_quant_om` 步骤，输出 `vlm_w8a8.om` / `action_expert_w8a8.om`，不会覆盖普通
+> `vlm_om`/`ae_om` 编出的 `vlm.om` / `action_expert.om`（普通 OM 步骤始终编译 fp16 ONNX）。如果当前部署 ONNX 文件名是
+> `*_npu.onnx`，量化会走 Route A：用 ORT-runnable donor 做校准/量化，再把 int8 Linear graft 回 NPU 图；
+> donor 图按 `--donor-device` 推导文件名（默认 `*_cpu.onnx`），存在则复用，缺失则自动导出。`--steps` 是
+> 临时流程开关**不写入** `_last`/profile；而 `--batch-path` / `--donor-device` / `--calib-dir` /
+> `--num-calib` / `--amp-num` 会随 profile 复用。
+>
+> ATC 说明：默认不传 `--input_shape`，并自动加 `--precision_mode_v2=origin`。如某版 CANN 需要显式
+> shape，可单独运行 `convert_om` 并传 `--input-shape auto`；如需覆盖精度模式，用 `--atc-arg` 显式传
+> `--precision_mode_v2=...`。
 
 #### 特性
 
-- **可断点续跑**：每个阶段的产物路径会被提前预测；若文件已存在则跳过（`▷ skip`）。
-  某阶段失败中断后，**重跑同一条命令即从断点继续**（已完成的自动跳过），需要重建则加 `--force`。
+- **显式步骤、产物可复用**：`--steps` 里列出的步骤一定执行（已存在的产物会被重建）；未列出但被依赖的
+  上游产物必须已在盘上，否则报错提示补 step。借此可只重做某一段（如 `--steps vlm_onnx,vlm_om`）。
+- **依赖前置校验**：选了某步骤但缺其所需参数（如 `vlm_om` 缺 `--soc-version`、`vlm_quant` 缺
+  `--batch-path`、`verify` 缺 `--task`）会在开跑前**精确报错并提示要补的参数**，不会跑到一半才失败。
+- **量化 donor 前置校验**：当量化 `*_npu.onnx` 时，开跑前会判断 donor 是否存在、能否自动生成；AE donor
+  生成所需的 `runtime_save/past_kv_tensor.pth` 和 `prefix_pad_masks.pth` 缺失时会提前报错并提示补充路径。
 - **保留中间产物**：流程不删除任何中间文件，导出的 ONNX、`runtime_save/*.pth`、`config.om.json`
   都保留在盘上，便于检查或局部重跑。
-- **实时反馈**：各阶段以子进程运行并透出 stdout/stderr，导出与 ATC 编译进度实时可见，每个阶段
+- **实时反馈**：各步骤以子进程运行并透出 stdout/stderr，导出与 ATC 编译进度实时可见，每步
   带 `▶ 开始 / ✓ 完成（耗时） / ✗ 失败` 横幅，不会让人误以为卡住。
 - **统一日志风格**：全工具链统一为 `HH:MM:SS LEVEL message`，结尾打印结构化结果块。
 
@@ -542,12 +848,11 @@ HH:MM:SS INFO   ✅ DONE
 HH:MM:SS INFO ────────────────────────────────────────
 ```
 
-断点续跑（前两步已完成）：
+只重做某一段（`--steps vlm_onnx,vlm_om`，AE 不动）：
 
 ```text
-HH:MM:SS INFO ▷ [1/3] VLM export — skip (exists: outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx)
-HH:MM:SS INFO ▷ [2/3] Action Expert export — skip (exists: outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx)
-HH:MM:SS INFO ▶ [3/3] ATC → OM compile …
+HH:MM:SS INFO ▶ [1/2] VLM ONNX export …
+HH:MM:SS INFO ▶ [2/2] ATC → OM compile (VLM) …
 ```
 
 #### 导出 ONNX 的文件命名
@@ -573,11 +878,13 @@ pi05-vlm_op17_nodyn_fp16_cpu.onnx
 
 #### 导出脚本
 
+> 三个子脚本的策略目录参数统一为 `--policy-path`（旧名 `--pretrained-policy-path` 作为别名保留，向后兼容）。
+
 | 脚本 | 用途 |
 | --- | --- |
 | `convert_onnx_vlm` | 导出 VLM 段 ONNX，写入 `config.om.json` 的 `vlm` 条目；同时保存供 AE 使用的运行期张量（`past_kv_tensor`、`prefix_pad_masks`） |
 | `convert_onnx_action_expert` | 读取 VLM 导出的运行期张量，导出 AE 段 ONNX，写入 `config.om.json` 的 `action_expert` 条目 |
-| `convert_om` | 调用 `atc` 将已导出的 VLM / AE ONNX 编译为 `.om`，`--input_shape` 从 ONNX 静态形状**自动推导**，并补全 `config.om.json` |
+| `convert_om` | 调用 `atc` 将已导出的 VLM / AE ONNX 编译为 `.om`，默认不传 `--input_shape`、默认加 `--precision_mode_v2=origin`，并补全 `config.om.json` |
 
 ```shell
 # 1. 导出 VLM 段
@@ -596,11 +903,17 @@ python -m model_utils.pi05_export.convert_om \
     --ae-onnx  outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx
 ```
 
+> `convert_om` 默认省略 `--input_shape`；需要时可加 `--input-shape auto` 从 ONNX 静态输入推导。若输入
+> ONNX 文件名以 `_w8a8.onnx` 结尾，默认 OM 文件名自动加 `_w8a8` 后缀。
+
 > 当 `--pretrained-policy-path` 传入的是 HuggingFace Hub repo id 而非本地目录时，需在
 > `convert_onnx_vlm` / `convert_onnx_action_expert` / `convert_om` 显式指定 `--om-manifest-dir`，
 > 以确保 `config.om.json` 写入真实的本地策略目录而非当前工作目录。
 
 #### 量化（W8A8 PTQ，可选）
+
+> 多数情况下无需手动调用本节脚本——统一入口在 `--steps` 中加入 `vlm_quant` / `ae_quant`
+> 即自动编排量化并把量化产物接入 ATC（见上方「一条命令的端到端流程」）。下面是需要单独运行或精调时的底层用法。
 
 将 ONNX 量化为 W8A8 以降低显存带宽压力。**必须提供真实标定数据**（用随机数据标定会得到不可用的模型）。
 
@@ -651,4 +964,3 @@ python -m model_utils.pi05_export.verify_pi05_split_equivalence \
     --ae-onnx-path  outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx \
     --task 'pick up the cup'
 ```
-

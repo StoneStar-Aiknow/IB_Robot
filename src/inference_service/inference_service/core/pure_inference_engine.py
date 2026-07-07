@@ -250,7 +250,18 @@ class LeRobotPolicyWrapper(PolicyWrapper):
     def infer(self, batch: dict[str, Tensor]) -> Tensor:
         with torch.no_grad():
             if self._use_action_chunking:
-                action = self._policy.predict_action_chunk(batch)
+                kwargs = {}
+                if self._policy_type == "pi05" and "_noise" in batch:
+                    noise = batch["_noise"]
+                    try:
+                        param = next(self._policy.model.parameters())
+                        model_dtype = param.dtype
+                        model_device = param.device
+                    except (StopIteration, AttributeError):
+                        model_dtype = noise.dtype
+                        model_device = noise.device
+                    kwargs["noise"] = noise.to(device=model_device, dtype=model_dtype)
+                action = self._policy.predict_action_chunk(batch, **kwargs)
                 return action.squeeze(0)
             else:
                 action = self._policy.select_action(batch)
@@ -406,7 +417,21 @@ class PureInferenceEngine:
             else:
                 tensor = torch.as_tensor(value)
 
-            if tensor.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+            # Integer batch values are coerced to float32 (the model expects
+            # float inputs for images/state). Language token IDs are the lone
+            # exception: nn.Embedding requires Long/Int indices, so casting them
+            # to float crashes the VLA embedding lookup. Leave token/mask
+            # tensors at their original integer/bool dtype.
+            is_language_key = any(
+                marker in key for marker in ("language.tokens", "language.attention_mask", "lang_tokens", "lang_masks")
+            )
+            if not is_language_key and tensor.dtype in (
+                torch.uint8,
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+            ):
                 tensor = tensor.to(dtype=torch.float32)
 
             result[key] = tensor.to(self._device)

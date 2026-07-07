@@ -135,7 +135,7 @@ def _patch_rotate_half() -> list[tuple[Any, str, Any]]:
 
 
 def _patch_gemma_ada_rmsnorm() -> list[tuple[Any, str, Any]]:
-    """Patch GemmaRMSNorm.forward so AdaRMSNorm uses model_dtype, not fp32.
+    """Patch PiGemmaRMSNorm.forward so AdaRMSNorm uses model_dtype, not fp32.
 
     Original::
 
@@ -151,54 +151,46 @@ def _patch_gemma_ada_rmsnorm() -> list[tuple[Any, str, Any]]:
 
     undo_log: list[tuple[Any, str, Any]] = []
 
-    _module_paths = [
-        "transformers.models.gemma.modeling_gemma",
-        "transformers.models.gemma2.modeling_gemma2",
-    ]
+    # Patch PiGemmaRMSNorm in our adapter module
+    try:
+        from model_utils.pi05_export.pi_gemma import PiGemmaRMSNorm
 
-    for mod_path in _module_paths:
-        try:
-            import importlib
+        cls = PiGemmaRMSNorm
+    except ImportError:
+        LOGGER.warning("PiGemmaRMSNorm not found; skipping AdaRMSNorm patch")
+        return undo_log
 
-            mod = importlib.import_module(mod_path)
-        except ImportError:
-            continue
+    orig_forward = cls.forward
 
-        cls = getattr(mod, "GemmaRMSNorm", None)
-        if cls is None:
-            continue
+    def _patched_forward(self, x, cond=None, _orig=orig_forward):
+        import torch as _torch
 
-        orig_forward = cls.forward
+        dtype = x.dtype
+        normed_inputs = self._norm(x)
 
-        def _patched_forward(self, x, cond=None, _orig=orig_forward):
-            import torch as _torch
+        if cond is None or self.dense is None:
+            # regular RMSNorm — keep original fp32 weight multiply
+            normed_inputs = normed_inputs * (1.0 + self.weight.float())
+            return normed_inputs.to(dtype), None
 
-            dtype = x.dtype
-            normed_inputs = self._norm(x)
+        # adaptive RMSNorm
+        if cond.shape[-1] != self.cond_dim:
+            raise ValueError(f"Expected cond dimension {self.cond_dim}, got {cond.shape[-1]}")
+        modulation = self.dense(cond)
+        if len(x.shape) == 3:
+            modulation = modulation.unsqueeze(1)
 
-            if cond is None or self.dense is None:
-                # regular RMSNorm — keep original fp32 weight multiply
-                normed_inputs = normed_inputs * (1.0 + self.weight.float())
-                return normed_inputs.to(dtype), None
+        scale, shift, gate = _torch.chunk(modulation, 3, dim=-1)
 
-            # adaptive RMSNorm
-            if cond.shape[-1] != self.cond_dim:
-                raise ValueError(f"Expected cond dimension {self.cond_dim}, got {cond.shape[-1]}")
-            modulation = self.dense(cond)
-            if len(x.shape) == 3:
-                modulation = modulation.unsqueeze(1)
+        # KEY CHANGE: use model_dtype instead of float32
+        model_dtype = self.dense.weight.dtype
+        normed_inputs = normed_inputs * (1 + scale.to(model_dtype)) + shift.to(model_dtype)
 
-            scale, shift, gate = _torch.chunk(modulation, 3, dim=-1)
+        return normed_inputs.to(dtype), gate.to(dtype)
 
-            # KEY CHANGE: use model_dtype instead of float32
-            model_dtype = self.dense.weight.dtype
-            normed_inputs = normed_inputs * (1 + scale.to(model_dtype)) + shift.to(model_dtype)
-
-            return normed_inputs.to(dtype), gate.to(dtype)
-
-        cls.forward = _patched_forward
-        undo_log.append((cls, "forward", orig_forward))
-        LOGGER.info("Patched %s.GemmaRMSNorm.forward (AdaRMSNorm fp32→model_dtype)", mod_path)
+    cls.forward = _patched_forward
+    undo_log.append((cls, "forward", orig_forward))
+    LOGGER.info("Patched PiGemmaRMSNorm.forward (AdaRMSNorm fp32→model_dtype)")
 
     return undo_log
 
@@ -401,7 +393,7 @@ def _patch_gemma_rotary_pos_emb_npu() -> list[tuple[Any, str, Any]]:
 
 
 def _patch_gemma_ada_rmsnorm_npu() -> list[tuple[Any, str, Any]]:
-    """Route GemmaRMSNorm through ``torch_npu.npu_rms_norm`` (NPURmsNorm node).
+    """Route PiGemmaRMSNorm through ``torch_npu.npu_rms_norm`` (NPURmsNorm node).
 
     This is the NPU-affine variant of :func:`_patch_gemma_ada_rmsnorm`.  The
     RMSNorm *core* (``x / rms(x) * gamma``) is replaced by the real fused
@@ -448,8 +440,6 @@ def _patch_gemma_ada_rmsnorm_npu() -> list[tuple[Any, str, Any]]:
         )
         return undo_log
 
-    import importlib
-
     import torch as _torch
 
     # Single-output custom symbolic.
@@ -470,58 +460,49 @@ def _patch_gemma_ada_rmsnorm_npu() -> list[tuple[Any, str, Any]]:
         def symbolic(g, x, gamma, epsilon):
             return g.op("npu::NPURmsNorm", x, gamma, epsilon_f=epsilon)
 
-    _module_paths = [
-        "transformers.models.gemma.modeling_gemma",
-        "transformers.models.gemma2.modeling_gemma2",
-    ]
+    # Patch PiGemmaRMSNorm in our adapter module
+    try:
+        from model_utils.pi05_export.pi_gemma import PiGemmaRMSNorm
 
-    for mod_path in _module_paths:
-        try:
-            mod = importlib.import_module(mod_path)
-        except ImportError:
-            continue
+        cls = PiGemmaRMSNorm
+    except ImportError:
+        LOGGER.warning("PiGemmaRMSNorm not found; skipping NPU RMSNorm patch")
+        return undo_log
 
-        cls = getattr(mod, "GemmaRMSNorm", None)
-        if cls is None:
-            continue
+    orig_forward = cls.forward
 
-        orig_forward = cls.forward
+    def _patched_forward(self, x, cond=None, _rms=_NpuRmsNormSingle):
+        import torch as _torch
 
-        def _patched_forward(self, x, cond=None, _rms=_NpuRmsNormSingle):
-            import torch as _torch
+        dtype = x.dtype
 
-            dtype = x.dtype
+        if cond is None or self.dense is None:
+            # regular RMSNorm — fold (1 + weight) into the fused gamma.
+            gamma = (1.0 + self.weight.float()).to(dtype)
+            normed = _rms.apply(x, gamma, self.eps)
+            return normed.to(dtype), None
 
-            if cond is None or self.dense is None:
-                # regular RMSNorm — fold (1 + weight) into the fused gamma.
-                gamma = (1.0 + self.weight.float()).to(dtype)
-                normed = _rms.apply(x, gamma, self.eps)
-                return normed.to(dtype), None
+        # adaptive RMSNorm — fuse the core, keep scale/shift/gate separate.
+        if cond.shape[-1] != self.cond_dim:
+            raise ValueError(f"Expected cond dimension {self.cond_dim}, got {cond.shape[-1]}")
 
-            # adaptive RMSNorm — fuse the core, keep scale/shift/gate separate.
-            if cond.shape[-1] != self.cond_dim:
-                raise ValueError(f"Expected cond dimension {self.cond_dim}, got {cond.shape[-1]}")
+        ones = _torch.ones(self.dim, dtype=dtype, device=x.device)
+        normed_inputs = _rms.apply(x, ones, self.eps)
 
-            ones = _torch.ones(self.dim, dtype=dtype, device=x.device)
-            normed_inputs = _rms.apply(x, ones, self.eps)
+        modulation = self.dense(cond)
+        if len(x.shape) == 3:
+            modulation = modulation.unsqueeze(1)
 
-            modulation = self.dense(cond)
-            if len(x.shape) == 3:
-                modulation = modulation.unsqueeze(1)
+        scale, shift, gate = _torch.chunk(modulation, 3, dim=-1)
 
-            scale, shift, gate = _torch.chunk(modulation, 3, dim=-1)
+        model_dtype = self.dense.weight.dtype
+        normed_inputs = normed_inputs * (1 + scale.to(model_dtype)) + shift.to(model_dtype)
 
-            model_dtype = self.dense.weight.dtype
-            normed_inputs = normed_inputs * (1 + scale.to(model_dtype)) + shift.to(model_dtype)
+        return normed_inputs.to(dtype), gate.to(dtype)
 
-            return normed_inputs.to(dtype), gate.to(dtype)
-
-        cls.forward = _patched_forward
-        undo_log.append((cls, "forward", orig_forward))
-        LOGGER.info(
-            "Patched %s.GemmaRMSNorm.forward (torch_npu.npu_rms_norm -> NPURmsNorm)",
-            mod_path,
-        )
+    cls.forward = _patched_forward
+    undo_log.append((cls, "forward", orig_forward))
+    LOGGER.info("Patched PiGemmaRMSNorm.forward (torch_npu.npu_rms_norm -> NPURmsNorm)")
 
     return undo_log
 
@@ -651,7 +632,7 @@ def _patch_pytorch_gelu_tanh_npu() -> list[tuple[Any, str, Any]]:
 
 
 def _patch_gemma_eager_attention(
-    *, fp16_softmax: bool = False, mqa_broadcast: bool = False
+    *, softmax_in_model_dtype: bool = False, mqa_broadcast: bool = False
 ) -> list[tuple[Any, str, Any]]:
     """Cast value_states to query dtype in eager_attention_forward.
 
@@ -677,11 +658,12 @@ def _patch_gemma_eager_attention(
       mathematically identical and only changes when the singleton K/V head can
       broadcast (``num_kv_heads == 1``); GQA layers fall back to ``repeat_kv``.
 
-    * ``fp16_softmax`` — keep the score matrix / softmax in the query dtype
-      (fp16) instead of upcasting to fp32, removing the per-layer fp32 ``Cast``
+    * ``softmax_in_model_dtype`` — keep the score matrix / softmax in the query
+      dtype instead of upcasting to fp32, removing the per-layer fp32 ``Cast``
       around the (B, H, Sq, Sk) score matrix and halving the softmax cost.
-      Requires the additive mask to be fp16-safe (``finfo(fp16).min``); the mask
-      is cast to the score dtype here so a fully-masked row stays finite.
+      Requires the additive mask to use a sentinel representable by the score
+      dtype; the mask is cast to the score dtype here so a fully-masked row
+      stays finite.
     """
     import importlib
 
@@ -733,21 +715,25 @@ def _patch_gemma_eager_attention(
                 attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
 
                 if attention_mask is not None:
-                    # NOTE: original code slices ``attention_mask[:, :, :, :key_len]``
-                    # which produces a dynamic Slice op.  Non-dynamo export
-                    # maps it to StridedSliceD which ATC cannot compile.
-                    # For PI05 the mask is already (B,1,S,S) matching key_len,
-                    # so the slice is a no-op — use the mask directly.
-                    if fp16_softmax:
-                        # Keep the Add in the score (fp16) dtype so no fp32 Cast
-                        # is inserted around the (B,H,Sq,Sk) score matrix. The
-                        # mask must already use a fp16-safe sentinel
-                        # (finfo(fp16).min); -2.38e38 would overflow to -inf.
+                    # PI05 builds the additive mask to exactly (B, 1, Sq, key_len)
+                    # in modeling_pi05_*._prepare_attention_masks_4d, so it already
+                    # matches attn_weights' (B, H, Sq, key_len): the singleton head
+                    # dim broadcasts on the Add, and attention_mask.shape[-1] already
+                    # equals key_states.shape[2].  Do NOT slice to key_len or expand
+                    # the head dim here — both are numerical no-ops, but each emits a
+                    # per-layer Slice + Expand (plus the -1-aware
+                    # Equal/ConstantOfShape/Where shape subgraph) that ATC keeps as
+                    # real ops, materialising a full (B, H, Sq, key_len) mask in every
+                    # one of the 18 expert layers (~0.4ms/inference regression).
+                    if softmax_in_model_dtype:
+                        # Keep the Add in the score dtype so no fp32 Cast is
+                        # inserted around the (B,H,Sq,Sk) score matrix. The mask
+                        # must already use a score-dtype-safe sentinel.
                         attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
                     else:
                         attn_weights = attn_weights + attention_mask
 
-                if fp16_softmax:
+                if softmax_in_model_dtype:
                     attn_weights = nn.functional.softmax(attn_weights, dim=-1).to(query.dtype)
                 else:
                     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
@@ -764,10 +750,10 @@ def _patch_gemma_eager_attention(
         mod.eager_attention_forward = patched
         undo_log.append((mod, "eager_attention_forward", orig))
         LOGGER.info(
-            "Patched %s.eager_attention_forward (value→query dtype, mqa_broadcast=%s, fp16_softmax=%s)",
+            "Patched %s.eager_attention_forward (value→query dtype, mqa_broadcast=%s, softmax_in_model_dtype=%s)",
             mod_path,
             mqa_broadcast,
-            fp16_softmax,
+            softmax_in_model_dtype,
         )
 
     return undo_log
@@ -1769,7 +1755,11 @@ _PATCH_REGISTRY: list[tuple[str, Any]] = [
 
 
 def _build_patch_registry(
-    use_npu_ops: bool, *, fp16_softmax: bool = False, mqa_broadcast: bool = False
+    use_npu_ops: bool,
+    *,
+    softmax_in_model_dtype: bool = False,
+    mqa_broadcast: bool = False,
+    fast_gelu: bool = False,
 ) -> list[tuple[str, Any]]:
     """Return the active patch registry for the requested export mode.
 
@@ -1780,9 +1770,13 @@ def _build_patch_registry(
     ``NPURotaryMul`` ONNX node).  Future NPU-affine optimizations
     (flash-attention, layernorm, qkv fusion) gate on this same flag.
 
-    ``fp16_softmax`` / ``mqa_broadcast`` are action-expert-only attention
-    optimisations threaded into :func:`_patch_gemma_eager_attention`; they
-    default off so the VLM export (host-side fp32 prefix mask) is unchanged.
+    ``softmax_in_model_dtype`` / ``mqa_broadcast`` are action-expert-only
+    attention optimisations threaded into :func:`_patch_gemma_eager_attention`;
+    they default off so the VLM export (host-side fp32 prefix mask) is unchanged.
+
+    ``fast_gelu`` routes gelu_pytorch_tanh through Ascend NPUFastGelu.  It is
+    faster but numerically different from the tanh GELU used by PyTorch, so it
+    defaults off and must be enabled explicitly after end-to-end validation.
     """
     rope_patch = (
         ("apply_rotary_pos_emb (torch_npu.npu_rotary_mul)", _patch_gemma_rotary_pos_emb_npu)
@@ -1810,11 +1804,11 @@ def _build_patch_registry(
         (
             "eager_attention (value→query dtype"
             + (", mqa_broadcast" if mqa_broadcast else "")
-            + (", fp16_softmax" if fp16_softmax else "")
+            + (", softmax_in_model_dtype" if softmax_in_model_dtype else "")
             + ")",
             functools.partial(
                 _patch_gemma_eager_attention,
-                fp16_softmax=fp16_softmax,
+                softmax_in_model_dtype=softmax_in_model_dtype,
                 mqa_broadcast=mqa_broadcast,
             ),
         )
@@ -1839,7 +1833,7 @@ def _build_patch_registry(
         # disabled on 310P (see above), so qkv fusion has no upside here.
         # ("fused qkv projection", _patch_gemma_fused_qkv),
     ]
-    if use_npu_ops:
+    if use_npu_ops and fast_gelu:
         registry.append(("gelu_pytorch_tanh (torch_npu.fast_gelu -> NPUFastGelu)", _patch_pytorch_gelu_tanh_npu))
     return registry
 
@@ -1850,7 +1844,13 @@ def _build_patch_registry(
 
 
 @contextmanager
-def ascend_onnx_export_patches(use_npu_ops: bool = False, *, fp16_softmax: bool = False, mqa_broadcast: bool = False):
+def ascend_onnx_export_patches(
+    use_npu_ops: bool = False,
+    *,
+    softmax_in_model_dtype: bool = False,
+    mqa_broadcast: bool = False,
+    fast_gelu: bool = False,
+):
     """Context manager that applies **all** registered Ascend patches.
 
     Patches are applied on ``__enter__`` and reverted on ``__exit__``,
@@ -1863,11 +1863,14 @@ def ascend_onnx_export_patches(use_npu_ops: bool = False, *, fp16_softmax: bool 
             reshape-based form.  The resulting graph requires an ATC
             custom-op plugin and cannot be verified with ORT CPU.  Future
             NPU-affine optimizations gate on this same flag.
-        fp16_softmax: Action-expert only.  Keep the attention score matrix
-            and softmax in fp16 (no fp32 upcast Cast).  Requires a fp16-safe
-            additive mask sentinel.  Leave ``False`` for the VLM export.
+        softmax_in_model_dtype: Action-expert only.  Keep the attention score
+            matrix and softmax in query/model dtype (no fp32 upcast Cast).
+            Requires an additive mask sentinel representable by that dtype.
+            Leave ``False`` for the VLM export.
         mqa_broadcast: Action-expert only.  Skip the ``repeat_kv`` Expand for
             multi-query layers and rely on matmul broadcasting instead.
+        fast_gelu: Route gelu_pytorch_tanh to NPUFastGelu. Disabled by default
+            because it is an approximation and can degrade PI05 action accuracy.
 
     Example::
 
@@ -1877,7 +1880,12 @@ def ascend_onnx_export_patches(use_npu_ops: bool = False, *, fp16_softmax: bool 
     all_undo: list[tuple[Any, str, Any]] = []
     applied: list[str] = []
 
-    for label, patch_fn in _build_patch_registry(use_npu_ops, fp16_softmax=fp16_softmax, mqa_broadcast=mqa_broadcast):
+    for label, patch_fn in _build_patch_registry(
+        use_npu_ops,
+        softmax_in_model_dtype=softmax_in_model_dtype,
+        mqa_broadcast=mqa_broadcast,
+        fast_gelu=fast_gelu,
+    ):
         try:
             undo = patch_fn()
             all_undo.extend(undo)
