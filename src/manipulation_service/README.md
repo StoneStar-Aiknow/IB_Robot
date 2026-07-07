@@ -1,8 +1,9 @@
 # manipulation_service
 
-`manipulation_service` 提供基于 GraspGen 的 6-DOF 抓取规划能力。该包负责 ROS 2
-服务封装、深度图和 mask 转换、GraspGen 调用、抓取结果发布，以及在线/离线
-调试产物导出；不负责目标检测、机器人控制、MoveIt 执行、策略推理或数据集转换。
+`manipulation_service` 提供基于 GraspGen 的 6-DOF 抓取规划能力，以及抓取后成功/失败
+验证服务。该包负责 ROS 2 服务封装、深度图和 mask 转换、GraspGen 调用、抓取结果发布、
+抓取证据融合，以及在线/离线调试产物导出；不负责目标检测、机器人控制、MoveIt 执行、
+策略推理或数据集转换。
 
 ## 入口与接口
 
@@ -11,12 +12,17 @@
 - `grasp_planner_node`：在线抓取规划节点。订阅对齐深度和 CameraInfo，
   调用 `perception_service` 获取目标 mask，运行 pip 安装的 GraspGen，提供
   `~/plan_grasp` 服务，并发布 `~/grasps`。
+- `grasp_verifier_node`：抓取后验证节点。订阅 `/joint_states`、
+  `/so101_follower/joint_currents` 和腕部深度图，提供 `~/verify_grasp` 服务，
+  融合夹爪残余开度、夹爪电流和腕部 RealSense 可见性判断抓取是否成功。腕部相机抓后可能因
+  夹爪/手腕自遮挡、目标离开视野、深度缺失、反光或 lift 后视角变化而不可靠；此时视觉结果
+  只作为诊断/弱证据，不会单独判失败。
 - `test_graspgen.py`：离线 GraspGen 调试脚本。读取 `grounded_sam2_snapshot`
   生成的数据目录，直接运行 GraspGen，并保存 PLY、JSON 和可选 Open3D 视图。
 
 ROS 接口：
 
-- 服务：`ibrobot_msgs/srv/PlanGrasp`
+- 服务：`ibrobot_msgs/srv/PlanGrasp`、`ibrobot_msgs/srv/VerifyGrasp`
 - 话题：`ibrobot_msgs/msg/GraspCandidateArray`
 - 单个抓取结果：`ibrobot_msgs/msg/GraspCandidate`
 - 感知依赖：`ibrobot_msgs/srv/DetectSegment`
@@ -170,6 +176,51 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 
 该话题发布最近一次服务调用的抓取结果，便于检查 frame_id、pose matrix 和置信度。
 
+## 调试 grasp_verifier_node
+
+`grasp_verifier_node` 面向抓取动作完成后的验证。典型调用时机是夹爪闭合并抬升/保持之后；
+它不移动机器人，只读取最新传感器状态并返回 `SUCCESS`、`FAILED` 或 `UNCERTAIN`。
+
+启动节点：
+
+```bash
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ros2 run manipulation_service grasp_verifier_node
+```
+
+SO101 默认假设夹爪关节 `6` 的 `0.0` 为闭合、`1.0` 为打开。如果使用其他机器人或话题，可覆盖参数：
+
+```bash
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ros2 run manipulation_service grasp_verifier_node --ros-args \
+  -p gripper_joint:=6 \
+  -p joint_state_topic:=/joint_states \
+  -p joint_current_topic:=/so101_follower/joint_currents \
+  -p wrist_depth_topic:=/camera/wrist/aligned_depth_to_color/image_raw \
+  -p gripper_closed_position:=0.0 \
+  -p gripper_contact_min_opening:=0.08 \
+  -p current_contact_threshold_a:=0.08
+```
+
+调用服务：
+
+```bash
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ros2 service call /grasp_verifier/verify_grasp ibrobot_msgs/srv/VerifyGrasp "{task_id: 'pick_001', text_prompt: 'banana', expected_target_width_m: 0.035, post_grasp_wait_s: 0.2}"
+```
+
+响应字段：
+
+- `success` / `status`：`success=true` 只对应 `STATUS_SUCCESS`；`STATUS_UNCERTAIN` 表示证据不足，不等同失败。
+- `confidence`：当前状态判断的置信度。
+- `message`：融合判断摘要。
+- `evidence`：稳定的 `key: value` 诊断行，包括夹爪开度、电流、腕部深度有效比例和遮挡状态。
+
+**触发方式与边界**：`verify_grasp` 是被动 ROS 2 服务，抓取执行完成后不会自动触发。当前
+需人工或上层 orchestrator 主动调用；`test_banana_handeye_pick.py`、`task_executor`、
+`action_dispatch` 均未集成 verify client。每次调用独立采样当前传感器状态，不追踪抓取
+历史。将验证接入执行脚本 / task_executor 的自动闭环是后续工作。
+
+当前第一版只做后验状态融合，不做外部 RGBD 目标跟踪。推荐在抓取闭合后先小幅抬升并保持
+`0.5-1.0s` 再调用验证服务；如果返回 `UNCERTAIN`，上层流程应重观察或进入保守放置/重试策略。
+
 ## grasp_planner_node 参数说明
 
 模型和输入：
@@ -187,6 +238,18 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 - `grasp_threshold`：GraspGen discriminator 阈值，默认 `0.5`。
 - `num_grasps`：每轮生成的候选数量，默认 `800`。
 - `topk_num_grasps`：每轮保留的 top-K 候选，默认 `50`。
+- `enable_object_cloud_completion`：启用目标点云补全，默认 `true`。当前在目标 mask
+  内对局部 depth hole 做邻域均值补点，并可配合 prismatic side extrude 生成连接桌面的
+  空心表面壳；不会向物体内部填充实心体积点。
+- `object_cloud_completion_mode`：补全模式，默认 `mask_depth_inpaint`；关闭补全时等价于 `none`。
+- `object_cloud_completion_max_points`：单次最多新增目标点数量，默认 `5000`。
+- `object_cloud_completion_kernel_size`：补点邻域窗口，默认 `5` 像素。
+- `object_cloud_completion_min_neighbors`：补点所需的最少有效邻居数，默认 `6`。
+- `enable_object_cloud_prismatic_extrude`：把目标外轮廓沿桌面法线补成空心侧墙，默认
+  `true`。这层会进入 `object_cloud_graspgen_input.ply`，也是实际送给 GraspGen 的
+  空心点云输入。
+- `object_cloud_prismatic_extrude_max_points`：侧墙补点上限，默认 `8000`。
+- `object_cloud_prismatic_extrude_layers`：外轮廓到桌面之间的采样层数，默认 `8`。
 
 输入同步：
 
@@ -198,6 +261,10 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 - `enable_collision_filter`：启用 GraspGen 碰撞过滤，默认 `true`。
 - `collision_threshold`：碰撞距离阈值，单位米，默认 `0.005`。
 - `collision_gripper`：碰撞检测和可视化用 gripper 名称；空字符串表示沿用模型 gripper。
+
+SO101 adapter 等目标执行器与 GraspGen 源夹爪不一致时，不要把源夹爪 collision filter
+作为 hard gate；启动节点时显式设置 `enable_collision_filter:=false`，并在执行侧使用目标夹爪
+自己的 tabletop/height/IK guard。
 
 桌面过滤：
 
@@ -244,9 +311,17 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 pre-grasp path，并在诊断中记录 `tabletop_auto_tuned`、`tabletop_auto_tune_attempts` 和
 `tabletop_auto_tune_reason`。
 
-如果 auto-tune 后仍把所有候选过滤为空，可临时使用 `soft` 做真机前诊断。此时必须检查
-`grasp_result.json` 中 `tabletop_relaxed`、`tabletop_best_candidate_clearance_m`、
-`tabletop_auto_tune_reason` 和预览图，确认夹爪没有明显穿桌：
+如果 Robotiq 源夹爪 tabletop gate 疑似误杀 SO101 adapter 后可执行的候选，可使用
+`diagnostic` 模式做真机前诊断。该模式仍拟合桌面并记录每个候选的 tabletop clearance
+统计，但不使用 Robotiq mesh 一票否决候选：
+
+```bash
+-p tabletop_filter_mode:=diagnostic
+```
+
+如果仍希望保留一个近桌安全下限，可临时使用 `soft`。此时必须检查 `grasp_result.json`
+中 `tabletop_relaxed`、`tabletop_best_candidate_clearance_m`、`tabletop_auto_tune_reason`
+和预览图，确认夹爪没有明显穿桌：
 
 ```bash
 -p tabletop_filter_mode:=soft -p adaptive_tabletop_hard_floor:=-0.002
@@ -288,13 +363,18 @@ pre-grasp path，并在诊断中记录 `tabletop_auto_tuned`、`tabletop_auto_tu
 
 - `grasp_result.json`：prompt、阈值、相机内参、诊断字段、每个 grasp 的 pose、
   confidence 和点云元数据；即使最终抓取数量为 `0` 也会记录诊断。
-- `object_cloud.ply`：目标 mask 对应点云。
-- `scene_cloud.ply`：非目标场景点云，用于碰撞上下文。
+- `object_cloud.ply`：补全后的目标点云壳，保留兼容旧调试工具。
+- `object_cloud_raw.ply`：启用目标点云补全时额外写出，表示补全前目标点云。
+- `object_cloud_completed.ply`：启用目标点云补全时额外写出，表示补全后目标点云壳。
+- `object_cloud_graspgen_input.ply`：实际送入 GraspGen 的空心表面壳；包含 raw object、
+  mask-depth inpaint 和 prismatic side wall，不包含物体内部实心采样点。
+- `scene_cloud.ply`：非目标场景点云，用于碰撞上下文；桌面补点也会写在这里。
+- 颜色约定：绿色为 raw object，橙色 `(255, 170, 0)` 为 mask-depth inpaint，青色
+  `(0, 200, 255)` 为 prismatic side wall 或桌面补点。
 - `grasp_cloud.ply`：目标 + 场景点云。
 - `grasp_grippers.ply`：top grasp 的夹爪 collision mesh。
 - `grasp_lines.ply`：top grasp 的夹爪控制点线框。
-- `grasp_preview.png`：headless 2D 投影预览，夹爪颜色表示 confidence。
-- `grasp_preview_labeled.png`：带 grasp index、confidence 和 depth 标签的 PNG。
+- `grasp_preview_labeled.png`：headless 2D 投影预览，带 grasp index、confidence 和 depth 标签。
 - `grasp_preview.html`：自包含交互式 3D 视图，包含 object/scene 点云、
   confidence 着色夹爪线框和 grasp pose hover 信息。
 - `grasp_preview_meta.json`：预览渲染状态、采样点数和错误信息。
@@ -355,7 +435,8 @@ source .shrc_local && python3 src/manipulation_service/test_graspgen.py \
 - `--tabletop-pregrasp-steps`：pre-grasp sweep 检查步数，默认 `5`。
 - `--tabletop-ransac-threshold`：桌面平面 RANSAC 阈值，默认 `0.006` 米。
 - `--tabletop-min-inlier-ratio`：接受桌面平面的最小内点比例，默认 `0.15`。
-- `--tabletop-filter-mode`：`strict` / `adaptive` / `soft`，用于验证低矮目标的自适应桌面过滤。
+- `--tabletop-filter-mode`：`strict` / `adaptive` / `soft` / `diagnostic`，用于验证低矮目标的自适应桌面过滤；
+  `diagnostic` 只记录 Robotiq tabletop clearance，不过滤候选。
 - `--adaptive-tabletop-*`：与在线节点同名的自适应桌面过滤参数。
 - `--adaptive-tabletop-auto-tune` / `--no-adaptive-tabletop-auto-tune`：打开/关闭 adaptive retry。
 - `--adaptive-tabletop-retry-clearances`：离线 auto-tune retry clearance 列表，例如 `0.002,0.001`。
