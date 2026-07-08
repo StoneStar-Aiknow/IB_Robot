@@ -160,6 +160,24 @@ source .shrc_local && export ROS_DOMAIN_ID=218 && rviz2
 
 ## 3. 启动后检查
 
+运行时抓取几何配置：
+
+```bash
+grep -A16 "target_gripper:" /tmp/so101_handeye_realsense_grasp.yaml
+```
+
+应确认内容等价于：
+
+```text
+fixed_finger_contact_ee: [-0.014, 0.0, -0.080]
+fixed_finger_margin_m: 0.003
+fixed_finger_margin_max_m: 0.008
+fixed_finger_margin_width_ref_m: 0.035
+fixed_finger_margin_width_gain: 0.25
+```
+
+`fixed_finger_contact_ee.z` 是 SO101 夹爪坐标系里的固定指接触深度，不是 base-Z 下压量。完整抓取日志里应看到 `TARGET_WIDTH_COMP` 和 `width_comp=...fixed_finger_margin...`，说明动态固定指 margin 已从 runtime config 生效。
+
 控制器：
 
 ```bash
@@ -306,7 +324,9 @@ source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && p
 ```text
 TASK_RESULT success=True ...
 GRASPGEN_CANDIDATE_ACCEPT ...
-TASK_SEND id=banana_graspgen_pick steps=7 ...
+TASK_SEND id=banana_graspgen_pick_approach ...
+TASK_SEND id=banana_graspgen_pick_pregrasp_realign ...
+TASK_SEND id=banana_graspgen_pick_grasp ...
 FLOW_RESULT success=True
 ```
 
@@ -315,6 +335,16 @@ FLOW_RESULT success=True
 - `pick_pose_diagnostics.json`：实际位姿误差和接触点 residual。
 - `execution_candidates.json`：最终 selected 候选和被拒原因。
 - `grasp_preview_so101_execution.html`：执行侧 3D 预览。
+
+关键日志解释：
+
+- `CONTACT_REALIGN phase=approach`：approach 高位接触点对齐。
+- `PREGRASP_REALIGN`：按物体最高点加 `--pregrasp-realign-clearance` 计算最后安全对齐高度。
+- `CONTACT_REALIGN phase=pregrasp`：pregrasp 高位接触点对齐。
+- `PREGRASP_REALIGN_APPLY ... ignored_z_delta=...`：只把 pregrasp 的 XY 修正应用到最终下降，Z 修正被忽略，避免最终夹持被安全高度 realign 抬高。
+- `CONTACT_REALIGN_CHECK phase=grasp`：低位只检查 residual，不再横向 realign。
+
+如果固定指在目标前侧，仍可能出现固定指先碰边导致漏抓。此时不要只继续增大 `fixed_finger_margin_max_m`，还要在 `grasp_preview_so101_execution.html` 里检查 selected 候选的 SO101 mesh 方向，优先选择活动指能把目标扫回夹口的候选。
 
 ## 8. 抓取后验证
 
@@ -429,4 +459,3 @@ source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service list | grep /gras
 - 先看 `HANDEYE_QUALITY` 和 runtime YAML 中 wrist 相机 transform。
 - 确认命令使用 `--handeye-source robot-config --robot-config /tmp/so101_handeye_realsense_grasp.yaml`。
 - 若 `GRASPGEN_EE_ALIGNMENT` 没出现，说明脚本或环境不是当前版本。
-
