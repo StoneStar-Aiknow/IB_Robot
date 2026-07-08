@@ -1,6 +1,10 @@
 import numpy as np
 
-from manipulation_service.graspgen_wrapper import complete_object_cloud_prismatic_extrude
+from manipulation_service.graspgen_wrapper import (
+    TablePlane,
+    complete_object_cloud_prismatic_extrude,
+    complete_scene_cloud_table_holes,
+)
 
 
 def test_prismatic_extrude_reaches_tilted_table_without_filling_interior():
@@ -42,3 +46,36 @@ def test_prismatic_extrude_reaches_tilted_table_without_filling_interior():
 
     tangent_dist = np.linalg.norm(completed[:, :2] - center, axis=1)
     assert np.quantile(tangent_dist, 0.05) > 0.018
+
+
+def test_table_hole_fill_is_limited_to_object_footprint():
+    xs = np.linspace(-0.20, 0.20, 81)
+    ys = np.linspace(-0.16, 0.16, 65)
+    xx, yy = np.meshgrid(xs, ys)
+    scene = np.column_stack([xx.ravel(), yy.ravel(), np.zeros(xx.size)])
+
+    center_hole = np.linalg.norm(scene[:, :2], axis=1) < 0.035
+    far_hole = np.linalg.norm(scene[:, :2] - np.array([0.15, 0.10]), axis=1) < 0.035
+    scene = scene[~(center_hole | far_hole)]
+
+    theta = np.linspace(0.0, 2.0 * np.pi, 120, endpoint=False)
+    footprint = np.column_stack(
+        [
+            0.025 * np.cos(theta),
+            0.018 * np.sin(theta),
+            np.full_like(theta, 0.025),
+        ]
+    )
+
+    completed = complete_scene_cloud_table_holes(
+        scene,
+        footprint_points=footprint,
+        table_plane=TablePlane(normal=np.array([0.0, 0.0, 1.0]), d=0.0, inlier_ratio=1.0),
+        grid_size=0.005,
+        footprint_dilation_cells=3,
+        max_added_points=2000,
+    )
+
+    assert len(completed) > 100
+    assert np.linalg.norm(completed[:, :2], axis=1).max() < 0.065
+    assert np.linalg.norm(completed[:, :2] - np.array([0.15, 0.10]), axis=1).min() > 0.08

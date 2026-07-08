@@ -4,6 +4,7 @@ from manipulation_service.grasp_verification import (
     STATUS_UNCERTAIN,
     DepthVisibilityStats,
     GraspVerificationInput,
+    GraspVerificationWeights,
     evaluate_grasp,
 )
 
@@ -64,3 +65,11 @@ def test_wrist_occlusion_alone_does_not_make_grasp_fail():
     assert result.status == STATUS_UNCERTAIN
     assert result.success is False
     assert any("wrist_occlusion" in item for item in result.evidence)
+
+
+def test_custom_weights_can_raise_success_threshold():
+    weights = GraspVerificationWeights(success_threshold=0.95)
+    result = evaluate_grasp(_input(), weights=weights)
+
+    assert result.status == STATUS_UNCERTAIN
+    assert result.success is False

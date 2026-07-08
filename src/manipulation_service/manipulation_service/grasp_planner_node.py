@@ -25,9 +25,6 @@ from ibrobot_msgs.srv import DetectSegment, PlanGrasp
 from .graspgen_wrapper import (
     GraspDiagnostic,
     GraspGenWrapper,
-    complete_object_cloud_from_mask_depth,
-    complete_object_cloud_prismatic_extrude,
-    complete_scene_cloud_table_holes,
 )
 
 _DEBUG_OUTPUT_DEFAULT = "default"
@@ -249,6 +246,34 @@ def _build_debug_point_clouds(depth_m, mask, fx, fy, cx, cy):
     all_pts = np.vstack([object_pts, scene_pts]).astype(np.float32)
     all_colors = np.vstack([object_colors, scene_colors]).astype(np.uint8)
     return scene_pts, scene_colors, object_pts, object_colors, all_pts, all_colors
+
+
+def _debug_points_or_fallback(points: np.ndarray | None, fallback: np.ndarray) -> np.ndarray:
+    if points is None:
+        return fallback.astype(np.float32, copy=False)
+    arr = np.asarray(points, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        return fallback.astype(np.float32, copy=False)
+    return arr
+
+
+def _object_stage_colors(total: int, raw_count: int, inpaint_count: int) -> np.ndarray:
+    colors = np.tile(np.array([[0, 255, 0]], dtype=np.uint8), (max(0, int(total)), 1))
+    raw_end = min(max(0, int(raw_count)), len(colors))
+    inpaint_end = min(raw_end + max(0, int(inpaint_count)), len(colors))
+    if inpaint_end > raw_end:
+        colors[raw_end:inpaint_end] = np.array([255, 170, 0], dtype=np.uint8)
+    if inpaint_end < len(colors):
+        colors[inpaint_end:] = np.array([0, 200, 255], dtype=np.uint8)
+    return colors
+
+
+def _scene_stage_colors(total: int, raw_count: int) -> np.ndarray:
+    colors = np.tile(np.array([[180, 180, 180]], dtype=np.uint8), (max(0, int(total)), 1))
+    raw_end = min(max(0, int(raw_count)), len(colors))
+    if raw_end < len(colors):
+        colors[raw_end:] = np.array([168, 85, 247], dtype=np.uint8)
+    return colors
 
 
 def _save_ply(pts, colors, out_path: Path):
@@ -1011,77 +1036,22 @@ class GraspPlannerNode(Node):
             depth_m, binary_mask, fx, fy, cx, cy
         )
 
-        object_raw_pts = object_pts
-        object_raw_colors = object_colors
-        object_graspgen_input_pts = object_pts
-        object_graspgen_input_colors = object_colors
-        if (
-            diagnostic.object_cloud_completion_enabled
-            and diagnostic.object_cloud_completion_mode == "mask_depth_inpaint"
-        ):
-            max_completion_points = int(
-                self.get_parameter("object_cloud_completion_max_points").get_parameter_value().integer_value
-            )
-            added_pts = complete_object_cloud_from_mask_depth(
-                depth_m,
-                binary_mask,
-                fx,
-                fy,
-                cx,
-                cy,
-                max_added_points=max_completion_points,
-                kernel_size=int(
-                    self.get_parameter("object_cloud_completion_kernel_size").get_parameter_value().integer_value
-                ),
-                min_neighbors=int(
-                    self.get_parameter("object_cloud_completion_min_neighbors").get_parameter_value().integer_value
-                ),
-            )
-            if len(added_pts):
-                added_colors = np.tile(np.array([[255, 170, 0]], dtype=np.uint8), (len(added_pts), 1))
-                object_pts = np.vstack([object_pts, added_pts.astype(object_pts.dtype, copy=False)]).astype(np.float32)
-                object_colors = np.vstack([object_colors, added_colors]).astype(np.uint8)
-        object_graspgen_input_pts = object_pts
-        object_graspgen_input_colors = object_colors
-        if (
-            self.get_parameter("enable_object_cloud_prismatic_extrude").get_parameter_value().bool_value
-            and len(scene_pts) > 0
-        ):
-            prismatic_pts = complete_object_cloud_prismatic_extrude(
-                object_pts,
-                scene_pts,
-                max_added_points=int(
-                    self.get_parameter("object_cloud_prismatic_extrude_max_points").get_parameter_value().integer_value
-                ),
-                num_layers=int(
-                    self.get_parameter("object_cloud_prismatic_extrude_layers").get_parameter_value().integer_value
-                ),
-            )
-            if len(prismatic_pts):
-                added_colors = np.tile(np.array([[0, 200, 255]], dtype=np.uint8), (len(prismatic_pts), 1))
-                object_pts = np.vstack([object_pts, prismatic_pts.astype(object_pts.dtype, copy=False)]).astype(
-                    np.float32
-                )
-                object_colors = np.vstack([object_colors, added_colors]).astype(np.uint8)
-        object_graspgen_input_pts = object_pts
-        object_graspgen_input_colors = object_colors
-
-        # Fill table surface holes (object occlusion + sensor gaps)
-        if len(scene_pts) > 0:
-            scene_hole_pts = complete_scene_cloud_table_holes(
-                scene_pts,
-                footprint_points=object_pts,
-                max_added_points=int(
-                    self.get_parameter("object_cloud_prismatic_extrude_max_points").get_parameter_value().integer_value
-                ),
-            )
-            if len(scene_hole_pts):
-                scene_hole_colors = np.tile(np.array([[0, 200, 255]], dtype=np.uint8), (len(scene_hole_pts), 1))
-                scene_pts = np.vstack([scene_pts, scene_hole_pts.astype(scene_pts.dtype, copy=False)]).astype(
-                    np.float32
-                )
-                scene_colors = np.vstack([scene_colors, scene_hole_colors]).astype(np.uint8)
-                self.get_logger().info(f"Scene table-hole fill: added={len(scene_hole_pts)} total={len(scene_pts)}")
+        object_raw_pts = _debug_points_or_fallback(diagnostic.object_pc_raw, object_pts)
+        object_raw_colors = np.tile(np.array([[0, 255, 0]], dtype=np.uint8), (len(object_raw_pts), 1))
+        object_pts = _debug_points_or_fallback(diagnostic.object_pc_after_completion, object_raw_pts)
+        object_colors = _object_stage_colors(
+            len(object_pts),
+            diagnostic.object_point_count_raw,
+            diagnostic.object_completion_added_count,
+        )
+        object_graspgen_input_pts = _debug_points_or_fallback(diagnostic.object_pc_inference_input, object_pts)
+        object_graspgen_input_colors = np.tile(
+            np.array([[0, 200, 255]], dtype=np.uint8),
+            (len(object_graspgen_input_pts), 1),
+        )
+        scene_pts_raw_count = len(scene_pts)
+        scene_pts = _debug_points_or_fallback(diagnostic.scene_pc_after_completion, scene_pts)
+        scene_colors = _scene_stage_colors(len(scene_pts), scene_pts_raw_count)
 
         all_pts = np.vstack([object_pts, scene_pts]).astype(np.float32)
         all_colors = np.vstack([object_colors, scene_colors]).astype(np.uint8)

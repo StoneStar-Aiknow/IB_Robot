@@ -35,6 +35,22 @@ class GraspVerificationInput:
 
 
 @dataclass(frozen=True)
+class GraspVerificationWeights:
+    """Tunable evidence weights and decision thresholds."""
+
+    gripper_contact_success: float = 0.55
+    gripper_contact_failure: float = 0.45
+    gripper_residual_success: float = 0.18
+    gripper_residual_failure: float = 0.12
+    current_contact_success: float = 0.35
+    current_contact_failure: float = 0.20
+    wrist_occlusion_success: float = 0.10
+    success_threshold: float = 0.65
+    failure_threshold: float = 0.55
+    margin_threshold: float = 0.20
+
+
+@dataclass(frozen=True)
 class GraspVerificationResult:
     """Fused grasp-verification result."""
 
@@ -49,14 +65,19 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
-def evaluate_grasp(input_data: GraspVerificationInput) -> GraspVerificationResult:
+def evaluate_grasp(
+    input_data: GraspVerificationInput,
+    weights: GraspVerificationWeights | None = None,
+) -> GraspVerificationResult:
     """Fuse gripper, current, and wrist visibility evidence.
 
-    Wrist camera occlusion is intentionally not a hard failure. Large objects can
-    block a wrist-mounted RealSense precisely when the grasp is good, so occlusion
-    is only weak positive/diagnostic evidence.
+    Wrist camera occlusion is intentionally not a hard failure. By default it is
+    treated as weak positive evidence (+0.10 success) because large objects can
+    block a wrist-mounted RealSense precisely when the grasp is good. Set
+    ``wrist_occlusion_success`` to 0.0 to make it diagnostic-only.
     """
 
+    w = weights or GraspVerificationWeights()
     success_score = 0.0
     failure_score = 0.0
     evidence: list[str] = []
@@ -73,14 +94,14 @@ def evaluate_grasp(input_data: GraspVerificationInput) -> GraspVerificationResul
             f"value={input_data.gripper_position:.4f} opening_from_closed={opening_from_closed:.4f}"
         )
         if opening_from_closed >= input_data.gripper_contact_min_opening:
-            success_score += 0.55
+            success_score += w.gripper_contact_success
             evidence.append("gripper_contact: stopped before fully closing")
         elif opening_from_closed <= input_data.gripper_no_contact_max_opening:
-            failure_score += 0.45
+            failure_score += w.gripper_contact_failure
             evidence.append("gripper_contact: fully closed or near closed")
         else:
-            success_score += 0.18
-            failure_score += 0.12
+            success_score += w.gripper_residual_success
+            failure_score += w.gripper_residual_failure
             evidence.append("gripper_contact: small residual opening")
 
     if input_data.gripper_current_abs_a is None:
@@ -91,10 +112,10 @@ def evaluate_grasp(input_data: GraspVerificationInput) -> GraspVerificationResul
             f"threshold={input_data.current_contact_threshold_a:.4f}"
         )
         if input_data.gripper_current_abs_a >= input_data.current_contact_threshold_a:
-            success_score += 0.35
+            success_score += w.current_contact_success
             evidence.append("current_contact: contact/load current detected")
         else:
-            failure_score += 0.20
+            failure_score += w.current_contact_failure
             evidence.append("current_contact: below contact threshold")
 
     if input_data.wrist_depth is None:
@@ -110,8 +131,11 @@ def evaluate_grasp(input_data: GraspVerificationInput) -> GraspVerificationResul
             f"occluded={stats.occluded}"
         )
         if stats.occluded:
-            success_score += 0.10
-            evidence.append("wrist_occlusion: ignored as failure because large grasped objects can block wrist view")
+            success_score += w.wrist_occlusion_success
+            evidence.append(
+                "wrist_occlusion: weak positive evidence "
+                f"(+{w.wrist_occlusion_success:.2f} success); large grasped objects can block wrist view"
+            )
 
     if success_score == 0.0 and failure_score == 0.0:
         return GraspVerificationResult(
@@ -123,7 +147,7 @@ def evaluate_grasp(input_data: GraspVerificationInput) -> GraspVerificationResul
         )
 
     margin = success_score - failure_score
-    if success_score >= 0.65 and margin >= 0.20:
+    if success_score >= w.success_threshold and margin >= w.margin_threshold:
         confidence = _clamp01(success_score)
         return GraspVerificationResult(
             status=STATUS_SUCCESS,
@@ -133,7 +157,7 @@ def evaluate_grasp(input_data: GraspVerificationInput) -> GraspVerificationResul
             evidence=evidence,
         )
 
-    if failure_score >= 0.55 and -margin >= 0.20:
+    if failure_score >= w.failure_threshold and -margin >= w.margin_threshold:
         confidence = _clamp01(failure_score)
         return GraspVerificationResult(
             status=STATUS_FAILED,

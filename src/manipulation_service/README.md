@@ -200,6 +200,10 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
   -p current_contact_threshold_a:=0.08
 ```
 
+`gripper_joint` 默认值为 SO101 的 `6`。其他机器人必须显式覆盖该参数；如果主动设为空，
+节点不会再自动猜测夹爪关节，响应 `message` 会标出夹爪证据已禁用，返回结果通常只能依赖
+腕部深度证据并趋向 `STATUS_UNCERTAIN`。
+
 调用服务：
 
 ```bash
@@ -220,6 +224,14 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 
 当前第一版只做后验状态融合，不做外部 RGBD 目标跟踪。推荐在抓取闭合后先小幅抬升并保持
 `0.5-1.0s` 再调用验证服务；如果返回 `UNCERTAIN`，上层流程应重观察或进入保守放置/重试策略。
+
+评分权重和阈值可通过 ROS 参数调节，默认行为保持保守融合：
+
+- `score_gripper_contact_success` / `score_gripper_contact_failure`：夹爪残余开度对成功/失败的权重。
+- `score_gripper_residual_success` / `score_gripper_residual_failure`：残余开度处于中间区间时的双向弱证据。
+- `score_current_contact_success` / `score_current_contact_failure`：夹爪电流高于/低于接触阈值的权重。
+- `score_wrist_occlusion_success`：腕部深度遮挡的弱正向权重；设为 `0.0` 可改为纯诊断。
+- `score_success_threshold` / `score_failure_threshold` / `score_margin_threshold`：最终状态判定阈值。
 
 ## grasp_planner_node 参数说明
 
@@ -246,8 +258,8 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 - `object_cloud_completion_kernel_size`：补点邻域窗口，默认 `5` 像素。
 - `object_cloud_completion_min_neighbors`：补点所需的最少有效邻居数，默认 `6`。
 - `enable_object_cloud_prismatic_extrude`：把目标外轮廓沿桌面法线补成空心侧墙，默认
-  `true`。这层会进入 `object_cloud_graspgen_input.ply`，也是实际送给 GraspGen 的
-  空心点云输入。
+  `true`。这层会进入补全后的中间点云；实际送给 GraspGen 的输入还会经过 outlier
+  removal 和下采样，并写入 `object_cloud_graspgen_input.ply`。
 - `object_cloud_prismatic_extrude_max_points`：侧墙补点上限，默认 `8000`。
 - `object_cloud_prismatic_extrude_layers`：外轮廓到桌面之间的采样层数，默认 `8`。
 
@@ -365,12 +377,13 @@ pre-grasp path，并在诊断中记录 `tabletop_auto_tuned`、`tabletop_auto_tu
   confidence 和点云元数据；即使最终抓取数量为 `0` 也会记录诊断。
 - `object_cloud.ply`：补全后的目标点云壳，保留兼容旧调试工具。
 - `object_cloud_raw.ply`：启用目标点云补全时额外写出，表示补全前目标点云。
-- `object_cloud_completed.ply`：启用目标点云补全时额外写出，表示补全后目标点云壳。
-- `object_cloud_graspgen_input.ply`：实际送入 GraspGen 的空心表面壳；包含 raw object、
-  mask-depth inpaint 和 prismatic side wall，不包含物体内部实心采样点。
+- `object_cloud_completed.ply`：启用目标点云补全时额外写出，表示补全后、outlier
+  removal 和下采样前的目标点云壳。
+- `object_cloud_graspgen_input.ply`：实际送入 GraspGen 的空心表面壳；已完成 outlier
+  removal 和下采样，不包含物体内部实心采样点。
 - `scene_cloud.ply`：非目标场景点云，用于碰撞上下文；桌面补点也会写在这里。
 - 颜色约定：绿色为 raw object，橙色 `(255, 170, 0)` 为 mask-depth inpaint，青色
-  `(0, 200, 255)` 为 prismatic side wall 或桌面补点。
+  `(0, 200, 255)` 为目标 prismatic side wall，紫色 `(168, 85, 247)` 为桌面补点。
 - `grasp_cloud.ply`：目标 + 场景点云。
 - `grasp_grippers.ply`：top grasp 的夹爪 collision mesh。
 - `grasp_lines.ply`：top grasp 的夹爪控制点线框。

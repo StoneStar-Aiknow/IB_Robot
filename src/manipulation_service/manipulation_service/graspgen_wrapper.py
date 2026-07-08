@@ -75,6 +75,10 @@ class GraspDiagnostic:
     object_prismatic_extrude_enabled: bool = False
     object_prismatic_extrude_added_count: int = 0
     object_point_count_graspgen_input: int = 0
+    object_pc_raw: np.ndarray | None = None
+    object_pc_after_completion: np.ndarray | None = None
+    object_pc_inference_input: np.ndarray | None = None
+    scene_pc_after_completion: np.ndarray | None = None
     object_point_count: int = 0
     scene_point_count: int = 0
     raw_grasp_count: int = 0
@@ -355,6 +359,25 @@ def _points_from_pixels(
     return np.stack([x3d, y3d, zs], axis=-1).astype(np.float32)
 
 
+def _dilate_bool_grid(mask: np.ndarray, iterations: int) -> np.ndarray:
+    iterations = max(0, int(iterations))
+    out = np.asarray(mask, dtype=bool).copy()
+    for _ in range(iterations):
+        src = out.copy()
+        expanded = src.copy()
+        for du in (-1, 0, 1):
+            for dv in (-1, 0, 1):
+                if du == 0 and dv == 0:
+                    continue
+                src_u = slice(max(0, -du), src.shape[0] - max(0, du))
+                dst_u = slice(max(0, du), src.shape[0] - max(0, -du))
+                src_v = slice(max(0, -dv), src.shape[1] - max(0, dv))
+                dst_v = slice(max(0, dv), src.shape[1] - max(0, -dv))
+                expanded[dst_u, dst_v] |= src[src_u, src_v]
+        out = expanded
+    return out
+
+
 def complete_object_cloud_from_mask_depth(
     depth_m: np.ndarray,
     segmentation_mask: np.ndarray,
@@ -408,6 +431,7 @@ def complete_object_cloud_prismatic_extrude(
     object_points: np.ndarray,
     scene_points: np.ndarray | None,
     *,
+    table_plane: TablePlane | None = None,
     max_added_points: int = 8000,
     num_layers: int = 8,
     max_object_height_m: float = 0.10,
@@ -425,30 +449,32 @@ def complete_object_cloud_prismatic_extrude(
     finite = pts[np.isfinite(pts).all(axis=1)]
     if len(finite) < 20:
         return np.empty((0, 3), dtype=np.float32)
-    if scene_points is None:
-        return np.empty((0, 3), dtype=np.float32)
+    if table_plane is None:
+        if scene_points is None:
+            return np.empty((0, 3), dtype=np.float32)
 
-    scene = np.asarray(scene_points, dtype=np.float64)
-    scene = scene[np.isfinite(scene).all(axis=1)]
-    if len(scene) < 100:
-        return np.empty((0, 3), dtype=np.float32)
+        scene = np.asarray(scene_points, dtype=np.float64)
+        scene = scene[np.isfinite(scene).all(axis=1)]
+        if len(scene) < 100:
+            return np.empty((0, 3), dtype=np.float32)
 
-    fit = fit_table_plane_ransac(
-        scene,
-        positive_reference=finite.mean(axis=0),
-        distance_threshold=float(ransac_distance_threshold),
-        min_inlier_ratio=float(ransac_min_inlier_ratio),
-        seed=seed,
-    )
-    if fit.plane is None:
-        return np.empty((0, 3), dtype=np.float32)
+        fit = fit_table_plane_ransac(
+            scene,
+            positive_reference=finite.mean(axis=0),
+            distance_threshold=float(ransac_distance_threshold),
+            min_inlier_ratio=float(ransac_min_inlier_ratio),
+            seed=seed,
+        )
+        if fit.plane is None:
+            return np.empty((0, 3), dtype=np.float32)
+        table_plane = fit.plane
 
-    normal = np.asarray(fit.plane.normal, dtype=np.float64)
+    normal = np.asarray(table_plane.normal, dtype=np.float64)
     normal_norm = float(np.linalg.norm(normal))
     if normal_norm <= 1e-9:
         return np.empty((0, 3), dtype=np.float32)
     normal = normal / normal_norm
-    d = float(fit.plane.d)
+    d = float(table_plane.d)
 
     if np.median(finite @ normal + d) < 0.0:
         normal = -normal
@@ -536,21 +562,22 @@ def complete_scene_cloud_table_holes(
     scene_points: np.ndarray,
     *,
     footprint_points: np.ndarray | None = None,
+    table_plane: TablePlane | None = None,
     max_added_points: int = 8000,
     grid_size: float = 0.005,
+    footprint_dilation_cells: int = 3,
     plane_distance_threshold: float = 0.02,
     ransac_distance_threshold: float = 0.008,
     ransac_min_inlier_ratio: float = 0.10,
     seed: int = 0,
 ) -> np.ndarray:
-    """Fill ALL discontinuous/missing areas on the table surface.
+    """Fill table discontinuities around the target footprint.
 
-    Fits the table plane from scene points via RANSAC, projects table-near
-    points onto a 2D tangent-space grid, then fills every empty cell within
-    the table's occupied region with a point on the plane. This covers:
+    Fits the table plane from scene points via RANSAC unless ``table_plane`` is
+    provided, projects table-near points onto a 2D tangent-space grid, then
+    fills empty cells inside the target footprint. This covers:
     - Object occlusion (table hidden under the object)
     - Sensor depth holes (reflective/dark surfaces)
-    - Edge discontinuities
     Returns points in the same frame as ``scene_points``.
     """
 
@@ -558,21 +585,23 @@ def complete_scene_cloud_table_holes(
     if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) < 100:
         return np.empty((0, 3), dtype=np.float32)
 
-    fit = fit_table_plane_ransac(
-        pts,
-        distance_threshold=float(ransac_distance_threshold),
-        min_inlier_ratio=float(ransac_min_inlier_ratio),
-        seed=seed,
-    )
-    if fit.plane is None:
-        return np.empty((0, 3), dtype=np.float32)
+    if table_plane is None:
+        fit = fit_table_plane_ransac(
+            pts,
+            distance_threshold=float(ransac_distance_threshold),
+            min_inlier_ratio=float(ransac_min_inlier_ratio),
+            seed=seed,
+        )
+        if fit.plane is None:
+            return np.empty((0, 3), dtype=np.float32)
+        table_plane = fit.plane
 
-    normal = np.asarray(fit.plane.normal, dtype=np.float64)
+    normal = np.asarray(table_plane.normal, dtype=np.float64)
     norm = float(np.linalg.norm(normal))
     if norm <= 1e-9:
         return np.empty((0, 3), dtype=np.float32)
     normal = normal / norm
-    d = float(fit.plane.d)
+    d = float(table_plane.d)
     if normal[2] > 0:
         normal = -normal
         d = -d
@@ -606,10 +635,32 @@ def complete_scene_cloud_table_holes(
     vi = np.clip(((v - v_min) / float(grid_size)).astype(int), 0, v_bins - 1)
     grid[ui, vi] = True
 
-    # Fill ALL empty cells within the table's bounding region — not just
-    # enclosed holes. This covers object occlusion, sensor gaps, edge
-    # discontinuities, and any connected-to-boundary missing areas.
-    hole_u, hole_v = np.where(~grid)
+    fill_mask = ~grid
+    if footprint_points is not None:
+        fp = np.asarray(footprint_points, dtype=np.float64)
+        if fp.ndim != 2 or fp.shape[1] != 3:
+            return np.empty((0, 3), dtype=np.float32)
+        fp = fp[np.isfinite(fp).all(axis=1)]
+        if len(fp) == 0:
+            return np.empty((0, 3), dtype=np.float32)
+
+        fp_u = fp @ t1
+        fp_v = fp @ t2
+        fp_in_bounds = (fp_u >= u_min) & (fp_u <= u_max) & (fp_v >= v_min) & (fp_v <= v_max)
+        if not fp_in_bounds.any():
+            return np.empty((0, 3), dtype=np.float32)
+
+        fp_ui = np.clip(((fp_u[fp_in_bounds] - u_min) / float(grid_size)).astype(int), 0, u_bins - 1)
+        fp_vi = np.clip(((fp_v[fp_in_bounds] - v_min) / float(grid_size)).astype(int), 0, v_bins - 1)
+        footprint_grid = np.zeros_like(grid)
+        footprint_grid[fp_ui, fp_vi] = True
+        footprint_grid = _dilate_bool_grid(footprint_grid, int(footprint_dilation_cells))
+        # With a target footprint, generate a dense local table patch instead
+        # of only filling empty cells. The dense patch gives execution/debug
+        # views enough context while staying bounded to the object area.
+        fill_mask = footprint_grid
+
+    hole_u, hole_v = np.where(fill_mask)
     if len(hole_u) == 0:
         return np.empty((0, 3), dtype=np.float32)
 
@@ -805,6 +856,7 @@ class GraspGenWrapper:
         diag.object_point_count = len(object_pc)
         diag.object_point_count_raw = len(object_pc)
         diag.scene_point_count = len(scene_pc) if scene_pc is not None else 0
+        diag.object_pc_raw = object_pc.astype(np.float32, copy=True)
         logger.info("Point clouds: scene=%d, object=%d", diag.scene_point_count, diag.object_point_count)
 
         if len(object_pc) == 0:
@@ -815,6 +867,17 @@ class GraspGenWrapper:
             )
             logger.warning(diag.failure_reason)
             return [], diag
+
+        shared_table_fit = TablePlaneFit(None)
+        if scene_pc is not None and len(scene_pc) > 0:
+            shared_min_inlier_ratio = min(float(tabletop_min_inlier_ratio), 0.10)
+            shared_table_fit = fit_table_plane_ransac(
+                scene_pc,
+                positive_reference=object_pc.mean(axis=0),
+                distance_threshold=float(tabletop_ransac_threshold),
+                min_inlier_ratio=shared_min_inlier_ratio,
+            )
+        shared_table = shared_table_fit.plane
 
         if completion_enabled:
             completed_points = complete_object_cloud_from_mask_depth(
@@ -849,6 +912,7 @@ class GraspGenWrapper:
             prismatic_points = complete_object_cloud_prismatic_extrude(
                 object_pc,
                 scene_pc,
+                table_plane=shared_table,
                 max_added_points=int(object_cloud_prismatic_extrude_max_points),
                 num_layers=int(object_cloud_prismatic_extrude_layers),
             )
@@ -862,17 +926,21 @@ class GraspGenWrapper:
                 len(prismatic_points),
                 diag.object_point_count_completed,
             )
+        diag.object_pc_after_completion = object_pc_shell.astype(np.float32, copy=True)
 
         # Fill holes in the table surface itself (scene cloud completion).
         if scene_pc is not None and len(scene_pc) > 0:
             scene_hole_pts = complete_scene_cloud_table_holes(
                 scene_pc,
                 footprint_points=object_pc,
+                table_plane=shared_table,
                 max_added_points=int(object_cloud_prismatic_extrude_max_points),
             )
             if len(scene_hole_pts):
                 scene_pc = np.vstack([scene_pc, scene_hole_pts.astype(scene_pc.dtype, copy=False)])
                 logger.info("Scene cloud table-hole fill: added=%d total=%d", len(scene_hole_pts), len(scene_pc))
+            diag.scene_point_count = int(len(scene_pc))
+            diag.scene_pc_after_completion = scene_pc.astype(np.float32, copy=True)
 
         # GraspGen gets a hollow surface shell: visible object points, optional
         # mask-depth surface inpaint, and silhouette side walls to the table. We
@@ -881,7 +949,6 @@ class GraspGenWrapper:
         pc_filtered, _ = point_cloud_outlier_removal(object_pc_tensor)
         object_pc_clean = pc_filtered.numpy()
         diag.object_point_count = len(object_pc_clean)
-        diag.object_point_count_graspgen_input = len(object_pc_clean)
         logger.info("Object PC for GraspGen inference (hollow shell): %d points", len(object_pc_clean))
 
         if len(object_pc_clean) < 20:
@@ -893,6 +960,8 @@ class GraspGenWrapper:
             return [], diag
 
         object_pc_inference = _downsample_points(object_pc_clean, self._inference_point_count)
+        diag.object_point_count_graspgen_input = len(object_pc_inference)
+        diag.object_pc_inference_input = object_pc_inference.astype(np.float32, copy=True)
         if len(object_pc_inference) < len(object_pc_clean):
             logger.info(
                 "Object PC downsampled for GraspGen inference: %d -> %d points",
@@ -979,12 +1048,16 @@ class GraspGenWrapper:
                     return [], diag
                 table = None
             else:
-                fit = fit_table_plane_ransac(
-                    scene_pc,
-                    positive_reference=object_pc_clean.mean(axis=0),
-                    distance_threshold=tabletop_ransac_threshold,
-                    min_inlier_ratio=tabletop_min_inlier_ratio,
-                )
+                fit = shared_table_fit
+                if fit.plane is not None and fit.best_inlier_ratio < float(tabletop_min_inlier_ratio):
+                    fit = TablePlaneFit(
+                        None,
+                        best_inlier_ratio=fit.best_inlier_ratio,
+                        failure_reason=(
+                            f"best inlier ratio {fit.best_inlier_ratio:.3f} < "
+                            f"minimum {float(tabletop_min_inlier_ratio):.3f}"
+                        ),
+                    )
                 table = fit.plane
                 diag.tabletop_best_inlier_ratio = fit.best_inlier_ratio
                 diag.tabletop_failure_reason = fit.failure_reason

@@ -21,6 +21,7 @@ from ibrobot_msgs.srv import VerifyGrasp
 from .grasp_verification import (
     DepthVisibilityStats,
     GraspVerificationInput,
+    GraspVerificationWeights,
     evaluate_grasp,
 )
 
@@ -103,7 +104,7 @@ class GraspVerifierNode(Node):
         self.declare_parameter("wrist_depth_topic", "/camera/wrist/aligned_depth_to_color/image_raw")
         self.declare_parameter(
             "gripper_joint",
-            "",
+            "6",
             descriptor=ParameterDescriptor(dynamic_typing=True),
         )
         self.declare_parameter("max_sample_age_s", 2.0)
@@ -116,6 +117,16 @@ class GraspVerifierNode(Node):
         self.declare_parameter("wrist_min_valid_depth_fraction", 0.25)
         self.declare_parameter("wrist_near_depth_m", 0.12)
         self.declare_parameter("wrist_max_near_fraction", 0.70)
+        self.declare_parameter("score_gripper_contact_success", 0.55)
+        self.declare_parameter("score_gripper_contact_failure", 0.45)
+        self.declare_parameter("score_gripper_residual_success", 0.18)
+        self.declare_parameter("score_gripper_residual_failure", 0.12)
+        self.declare_parameter("score_current_contact_success", 0.35)
+        self.declare_parameter("score_current_contact_failure", 0.20)
+        self.declare_parameter("score_wrist_occlusion_success", 0.10)
+        self.declare_parameter("score_success_threshold", 0.65)
+        self.declare_parameter("score_failure_threshold", 0.55)
+        self.declare_parameter("score_margin_threshold", 0.20)
 
         self._lock = threading.Lock()
         self._latest_joint_state: TimedSample | None = None
@@ -186,21 +197,37 @@ class GraspVerifierNode(Node):
         if wait_s > 0.0:
             time.sleep(wait_s)
 
-        input_data = self._build_input(expected_target_width_m=float(request.expected_target_width_m))
-        result = evaluate_grasp(input_data)
+        input_data, gripper_joint_note = self._build_input(
+            expected_target_width_m=float(request.expected_target_width_m)
+        )
+        result = evaluate_grasp(input_data, weights=self._verification_weights())
 
         response.success = bool(result.success)
         response.status = int(result.status)
         response.confidence = float(result.confidence)
-        response.message = result.message
+        response.message = f"[{gripper_joint_note}] {result.message}" if gripper_joint_note else result.message
         response.evidence = result.evidence
         self.get_logger().info(
             f"VerifyGrasp task_id={request.task_id!r} prompt={request.text_prompt!r}: "
-            f"status={result.status} confidence={result.confidence:.2f} message={result.message}"
+            f"status={result.status} confidence={result.confidence:.2f} message={response.message}"
         )
         return response
 
-    def _build_input(self, *, expected_target_width_m: float) -> GraspVerificationInput:
+    def _verification_weights(self) -> GraspVerificationWeights:
+        return GraspVerificationWeights(
+            gripper_contact_success=float(self.get_parameter("score_gripper_contact_success").value),
+            gripper_contact_failure=float(self.get_parameter("score_gripper_contact_failure").value),
+            gripper_residual_success=float(self.get_parameter("score_gripper_residual_success").value),
+            gripper_residual_failure=float(self.get_parameter("score_gripper_residual_failure").value),
+            current_contact_success=float(self.get_parameter("score_current_contact_success").value),
+            current_contact_failure=float(self.get_parameter("score_current_contact_failure").value),
+            wrist_occlusion_success=float(self.get_parameter("score_wrist_occlusion_success").value),
+            success_threshold=float(self.get_parameter("score_success_threshold").value),
+            failure_threshold=float(self.get_parameter("score_failure_threshold").value),
+            margin_threshold=float(self.get_parameter("score_margin_threshold").value),
+        )
+
+    def _build_input(self, *, expected_target_width_m: float) -> tuple[GraspVerificationInput, str]:
         now_ns = self._now_ns()
         max_age_ns = int(float(self.get_parameter("max_sample_age_s").value) * 1_000_000_000)
         with self._lock:
@@ -213,19 +240,26 @@ class GraspVerifierNode(Node):
         wrist_depth = self._fresh_value(wrist_depth_sample, now_ns, max_age_ns)
 
         gripper_joint = str(self.get_parameter("gripper_joint").value).strip()
+        gripper_joint_note = ""
         if not gripper_joint:
-            gripper_joint = self._infer_gripper_joint(joint_state, current)
+            gripper_joint_note = "gripper_joint parameter is empty; gripper joint evidence disabled"
+            self.get_logger().error(
+                "gripper_joint parameter is empty; VerifyGrasp will not use gripper position/current evidence."
+            )
 
-        return GraspVerificationInput(
-            gripper_position=self._extract_named_value(joint_state, gripper_joint, "position"),
-            gripper_closed_position=float(self.get_parameter("gripper_closed_position").value),
-            gripper_contact_min_opening=float(self.get_parameter("gripper_contact_min_opening").value),
-            gripper_no_contact_max_opening=float(self.get_parameter("gripper_no_contact_max_opening").value),
-            gripper_joint=gripper_joint,
-            gripper_current_abs_a=self._extract_abs_current(current, gripper_joint),
-            current_contact_threshold_a=float(self.get_parameter("current_contact_threshold_a").value),
-            wrist_depth=wrist_depth,
-            expected_target_width_m=expected_target_width_m,
+        return (
+            GraspVerificationInput(
+                gripper_position=self._extract_named_value(joint_state, gripper_joint, "position"),
+                gripper_closed_position=float(self.get_parameter("gripper_closed_position").value),
+                gripper_contact_min_opening=float(self.get_parameter("gripper_contact_min_opening").value),
+                gripper_no_contact_max_opening=float(self.get_parameter("gripper_no_contact_max_opening").value),
+                gripper_joint=gripper_joint,
+                gripper_current_abs_a=self._extract_abs_current(current, gripper_joint),
+                current_contact_threshold_a=float(self.get_parameter("current_contact_threshold_a").value),
+                wrist_depth=wrist_depth,
+                expected_target_width_m=expected_target_width_m,
+            ),
+            gripper_joint_note,
         )
 
     @staticmethod
@@ -233,20 +267,6 @@ class GraspVerifierNode(Node):
         if sample is None or now_ns - sample.received_ns > max_age_ns:
             return None
         return sample.value
-
-    @staticmethod
-    def _infer_gripper_joint(joint_state: JointState | None, current: JointCurrent | None) -> str:
-        candidate_names: list[str] = []
-        if joint_state is not None:
-            candidate_names.extend(joint_state.name)
-        if current is not None:
-            candidate_names.extend(current.name)
-        if "6" in candidate_names:
-            return "6"
-        for name in candidate_names:
-            if "gripper" in name.lower():
-                return name
-        return candidate_names[-1] if candidate_names else ""
 
     @staticmethod
     def _extract_named_value(msg: JointState | None, joint_name: str, field_name: str) -> float | None:
