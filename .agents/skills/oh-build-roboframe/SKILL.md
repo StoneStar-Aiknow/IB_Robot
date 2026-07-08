@@ -63,8 +63,23 @@ Run from a temporary working copy when requested, but keep `OH_ROOT` pointed at 
 ```bash
 OH_ROOT="<oh_build_root>" \
 ./scripts/openharmony/build_roboframe_oh.sh \
-  --oh-root "<oh_build_root>" \
-  --packages ibrobot_msgs,tensormsg,robot_config,inference_service
+  --oh-root "<oh_build_root>"
+```
+
+**Do NOT pass `--packages` to manually reduce the package list.** The default
+`PACKAGES` array in `build_roboframe_oh.sh` is the authoritative complete list —
+it includes all transitive dependencies (`embodied_common`, `voice_asr_service`)
+and runtime-required data packages (`robot_description`, `robot_moveit`).
+Excluding packages causes runtime `ModuleNotFoundError` / `package not found`
+errors on the board. If a package fails to build, fix the root cause (e.g.
+stale build cache) rather than excluding it from the list.
+
+If a clean build is needed (stale cache after prefix changes), remove the
+build and install directories first:
+
+```bash
+docker run --rm -v "<oh_build_root>/custom_build_root/ibrobot_oh_ws:/ws" \
+  alpine sh -c 'rm -rf /ws/build /ws/install'
 ```
 
 ## Expected Successful Runtime-Staging Signals
@@ -140,6 +155,51 @@ Correct action:
 - rebuild with the official script
 - verify patched `install/lerobot/src`
 - redeploy the rebuilt `install/` tree
+
+### Case 3: stale build cache after install prefix change
+
+Symptom:
+
+```text
+The build time path "/data/ibrobot/install/controller_manager_msgs" doesn't exist.
+Either source a script for a different shell or set the environment variable
+"COLCON_CURRENT_PREFIX" explicitly.
+```
+
+Likely cause:
+
+- A previous build used a different `--custom-prefix` (e.g. `/data/ibrobot/install`),
+  and the stale `colcon_command_prefix_build.sh` in `build/` still references the
+  old path. Subsequent builds inherit the stale prefix and fail.
+
+Correct action:
+
+- remove `build/` and `install/` directories (they are Docker-owned, use the
+  alpine container pattern from the Canonical Build Command section)
+- re-run the official build with the default package list
+- **do NOT** exclude the failing package from `--packages` — the package itself
+  is fine, only the cache is stale
+
+### Case 4: missing package at runtime after deploy
+
+Symptom:
+
+```text
+ModuleNotFoundError: No module named 'embodied_common'
+package 'robot_description' not found, searching: [...]
+```
+
+Likely cause:
+
+- The build used a manually reduced `--packages` list that omitted a transitive
+  dependency (`embodied_common`, `voice_asr_service`) or a runtime data package
+  (`robot_description`, `robot_moveit`).
+
+Correct action:
+
+- rebuild with the default `PACKAGES` list (do not pass `--packages`)
+- the default list in `build_roboframe_oh.sh` is authoritative and includes
+  all required packages
 
 ## Deployment Handoff
 
