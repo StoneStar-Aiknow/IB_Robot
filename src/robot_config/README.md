@@ -130,13 +130,21 @@ SO101 单动爪使用 `fixed_finger_contact_ee` 作为固定指侧参考点，`c
 指向目标宽度中心的方向。执行脚本会根据 GraspGen 候选的 `target_width_m` 计算有效接触中心：
 
 ```text
+dynamic_fixed_finger_margin_m = min(
+    fixed_finger_margin_max_m,
+    fixed_finger_margin_m
+        + max(0, fixed_finger_margin_width_ref_m - target_width_m)
+        * fixed_finger_margin_width_gain,
+)
+
 effective_center = fixed_finger_contact_ee
                  + closing_axis_ee * 0.5 * (target_width_m + width_clearance_m)
-                 + closing_axis_ee * fixed_finger_margin_m
+                 + closing_axis_ee * dynamic_fixed_finger_margin_m
 ```
 
-`fixed_finger_margin_m` 是额外远离固定指的安全距离，用于降低固定指先碰物体边缘或上表面的风险；
-当前 SO101 RealSense 抓取配置默认使用 `0.003 m`。
+`fixed_finger_margin_m` 是额外远离固定指的基础安全距离，用于降低固定指先碰物体边缘或上表面的风险。
+当前 SO101 RealSense 抓取配置默认基础值为 `0.003 m`；目标窄于 `fixed_finger_margin_width_ref_m=0.035 m`
+时按 `fixed_finger_margin_width_gain=0.25` 增加安全余量，并由 `fixed_finger_margin_max_m=0.008 m` 封顶。
 
 ## 控制模式配置
 
