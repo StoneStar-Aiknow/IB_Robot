@@ -56,15 +56,11 @@ license: MIT
   - 静态阅读 diff 与本仓库源码（`Read` / `Grep` / `Glob`）始终允许且推荐——这是判断架构/逻辑/命名问题的正常手段
 - **例外**：用户在当前请求中明确要求“你帮我跑一下 ruff / typecheck / build 看看”时才执行相应命令；“review 这个 PR”“帮我看看这个 PR”本身**不构成**授权。
 
-## ⚠️ 环境准备
+## ⚠️ 依赖准备
 
-**必须先加载环境变量**：
-
-```bash
-source .shrc_local
-```
-
-此命令会将 `libs/atomgit_sdk/src` 添加到 PYTHONPATH，使 skill 能够导入 atomgit_sdk 模块。
+本 skill 依赖 PyPI 包 `atomgit-sdk`，其 Python 导入模块名为 `atomgit_sdk`。
+仓库默认通过 `requirements/*.txt` 安装；如果当前环境未安装，请先运行
+`./scripts/setup.sh`，或在当前 Python 环境中安装 `atomgit-sdk`。
 
 ## ⚠️ 文件读取说明
 

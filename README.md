@@ -72,8 +72,7 @@ IB_Robot/                           # 主工作空间 (本仓库)
 │   └── skills/                     # AI Agent 技能库 (详见 .agents/skills/README.md)
 │
 ├── libs/                           # 外部依赖库
-│   ├── lerobot/                    # [子模块] LeRobot 训练框架
-│   └── atomgit_sdk/                # AtomGit API SDK
+│   └── lerobot/                    # [子模块] LeRobot 训练框架
 │
 ├── src/                            # 核心源码包集合
 │   ├── robot_config/               # 系统总控、规格定义与启动入口

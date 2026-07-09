@@ -73,8 +73,7 @@ IB_Robot/                           # Main Workspace
 │   └── skills/                     # AI Agent skills (see .agents/skills/README.md)
 │
 ├── libs/                           # External dependencies
-│   ├── lerobot/                    # [Submodule] LeRobot training framework
-│   └── atomgit_sdk/                # AtomGit API SDK
+│   └── lerobot/                    # [Submodule] LeRobot training framework
 │
 ├── src/                            # Core source packages
 │   ├── robot_config/               # System master control, specs, and launch entry

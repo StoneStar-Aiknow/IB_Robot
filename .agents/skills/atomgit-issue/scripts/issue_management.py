@@ -8,14 +8,13 @@ import json
 import sys
 from pathlib import Path
 
-# Add libs/atomgit_sdk/src to PYTHONPATH
-sdk_path = Path(__file__).parents[4] / "libs" / "atomgit_sdk" / "src"
-sys.path.append(str(sdk_path))
-
 try:
     from atomgit_sdk import AtomGitClient, IssueService, resolve_atomgit_context
 except ImportError:
-    print("Error: AtomGit SDK not found. Please run 'source .shrc_local' first.")
+    print(
+        "Error: AtomGit SDK not found. Please install project requirements by running setup.sh, "
+        "or install atomgit-sdk in the active environment."
+    )
     sys.exit(1)
 
 

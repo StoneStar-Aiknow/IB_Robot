@@ -17,16 +17,11 @@ license: MIT
 - `--owner` / `--repo`: 显式覆盖 `config.json` 中的仓库
 - `--url`: 从 AtomGit / GitCode 的仓库或 PR 链接自动解析 `owner/repo`
 
-## ⚠️ 环境准备
+## ⚠️ 依赖准备
 
-**重要**: 在使用此 skill 前，必须先加载环境配置：
-
-```bash
-source .shrc_local
-```
-
-这将把 `libs/atomgit_sdk/src` 添加到 PYTHONPATH
-使 skill 能够导入 AtomGit SDK。
+本 skill 依赖 PyPI 包 `atomgit-sdk`，其 Python 导入模块名为 `atomgit_sdk`。
+仓库默认通过 `requirements/*.txt` 安装；如果当前环境未安装，请先运行
+`./scripts/setup.sh`，或在当前 Python 环境中安装 `atomgit-sdk`。
 
 ## ⚠️ 获取 Fork Owner（必需）
 
