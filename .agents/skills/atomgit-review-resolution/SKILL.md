@@ -15,16 +15,11 @@ license: MIT
 - `--owner` / `--repo`: 显式覆盖 `config.json` 中的仓库
 - `--url`: 从 AtomGit / GitCode 的 PR 链接自动解析 `owner/repo/pr_number`
 
-## ⚠️ 环境准备
+## ⚠️ 依赖准备
 
-**重要**: 在使用此 skill 前，必须先加载环境配置：
-
-```bash
-source .shrc_local
-```
-
-这将把 `libs/atomgit_sdk/src` 添加到 PYTHONPATH
-使 skill 能够导入 AtomGit SDK。
+本 skill 依赖 PyPI 包 `atomgit-sdk`，其 Python 导入模块名为 `atomgit_sdk`。
+仓库默认通过 `requirements/*.txt` 安装；如果当前环境未安装，请先运行
+`./scripts/setup.sh`，或在当前 Python 环境中安装 `atomgit-sdk`。
 
 ## ⚠️ 文件读取说明
 
@@ -192,7 +187,7 @@ python3 review_resolution.py --pr 123 --apply-fixes ./tmp/ib_robot_pr_123_fix_re
 
 ## SDK / API 设计决策
 
-保留 `libs/atomgit_sdk` 作为唯一 AtomGit API 抽象层；skill 脚本只做工作流编排，不直接散落 HTTP 请求。原因：
+保留 PyPI 包 `atomgit-sdk` 提供的 `atomgit_sdk` 导入模块作为唯一 AtomGit API 抽象层；skill 脚本只做工作流编排，不直接散落 HTTP 请求。原因：
 
 1. 单条 review 回复、解决状态、评论编辑/删除等能力会被多个 skill 复用，放在 SDK 中更稳定。
 2. 官方 API 文档目前主要提供 endpoint 标题、HTTP 方法和路径；SDK 已沉淀为 `APICatalog`，常用协作 API 提供 typed wrapper，长尾 API 可通过 `client.call_api(...)` 或 `APICatalog.from_docs()` 使用。

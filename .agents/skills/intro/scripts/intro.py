@@ -74,7 +74,10 @@ def check_open_prs_with_comments() -> dict:
         from atomgit_sdk.config import AtomGitConfig
         from atomgit_sdk.client import AtomGitClient
     except ImportError:
-        result["error"] = "atomgit_sdk not in PYTHONPATH (请先 source .shrc_local)"
+        result["error"] = (
+            "无法导入 Python 模块 atomgit_sdk；请先运行 ./scripts/setup.sh，"
+            "或在当前 Python 环境安装 PyPI 包 atomgit-sdk"
+        )
         return result
 
     try:

@@ -23,8 +23,7 @@ IB_Robot/
 │   ├── tensormsg/          # TensorMsg 协议
 │   └── ...
 ├── libs/
-│   ├── lerobot/            # LeRobot 子模块（patch 管理，禁止直接提交）
-│   └── atomgit_sdk/        # AtomGit API SDK
+│   └── lerobot/            # LeRobot 子模块（patch 管理，禁止直接提交）
 ├── scripts/
 │   ├── setup.sh            # 一键环境搭建
 │   ├── build.sh            # 构建脚本
