@@ -55,9 +55,9 @@ robot:
       # It must align with the GraspGen source gripper width axis after source_to_ee_rpy.
       closing_axis_ee: [1.0, 0.0, 0.0]
       # Extra offset away from the fixed finger to reduce edge/top-first contact.
-      fixed_finger_margin_m: 0.003
+      fixed_finger_margin_m: 0.006
       # Narrow targets need more fixed-finger clearance because the fixed jaw cannot sweep the object back.
-      fixed_finger_margin_max_m: 0.008
+      fixed_finger_margin_max_m: 0.012
       fixed_finger_margin_width_ref_m: 0.035
       fixed_finger_margin_width_gain: 0.25
       width_clearance_m: 0.003
