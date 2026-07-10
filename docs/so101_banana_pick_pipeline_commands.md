@@ -37,7 +37,7 @@ cd ~/IB_Robot
 构建相关包：
 
 ```bash
-source .shrc_local && colcon build --symlink-install --merge-install --packages-select \
+cd ~/IB_Robot && source .shrc_local && colcon build --symlink-install --merge-install --packages-select \
   ibrobot_msgs perception_service manipulation_service robot_config dataset_tools
 ```
 
@@ -46,7 +46,7 @@ source .shrc_local && colcon build --symlink-install --merge-install --packages-
 上次启动被中断、机器人不响应、MoveIt action server 重复时执行：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && \
   pkill -f "ros2 launch robot_config robot.launch.py"; \
   pkill -f move_group; \
   pkill -f moveit_gateway.py; \
@@ -66,7 +66,7 @@ source .shrc_local && export ROS_DOMAIN_ID=218 && \
 ### 终端 A：机器人 + RealSense + MoveIt
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 launch robot_config robot.launch.py \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 launch robot_config robot.launch.py \
   robot_config:=so101_handeye_realsense_only \
   config_path:=/tmp/so101_handeye_realsense_grasp.yaml \
   control_mode:=moveit_planning \
@@ -85,7 +85,7 @@ TaskExecutor ready
 ### 终端 B：Grounded-SAM2
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 run perception_service grounded_sam2_node --ros-args \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 run perception_service grounded_sam2_node --ros-args \
   -p rgb_topic:=/camera/wrist/image_raw \
   -p depth_topic:=/camera/wrist/aligned_depth_to_color/image_raw \
   -p camera_info_topic:=/camera/wrist/aligned_depth_to_color/camera_info
@@ -100,7 +100,7 @@ GroundedSAM2Node ready
 ### 终端 C：GraspGen
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 run manipulation_service grasp_planner_node --ros-args \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 run manipulation_service grasp_planner_node --ros-args \
   -p depth_topic:=/camera/wrist/aligned_depth_to_color/image_raw \
   -p camera_info_topic:=/camera/wrist/aligned_depth_to_color/camera_info \
   -p detect_service:=/grounded_sam2/detect_and_segment \
@@ -134,10 +134,10 @@ GraspPlannerNode ready
 
 说明：`-p ...` 是 `grasp_planner_node` 参数，只能放在本命令后面，不要追加到 Python 抓取脚本后。
 
-### 终端 C2：抓取验证，可选
+### 终端 C2：抓取验证，完整抓取必需
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && ros2 run manipulation_service grasp_verifier_node --ros-args \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && ros2 run manipulation_service grasp_verifier_node --ros-args \
   -p gripper_joint:=6 \
   -p joint_state_topic:=/joint_states \
   -p joint_current_topic:=/so101_follower/joint_currents \
@@ -149,11 +149,12 @@ source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && r
 ```
 
 腕部相机被大目标遮挡时不会单独判失败，只记录诊断证据。
+完整抓取默认使用 `--grasp-verification required`，若本服务未启动，脚本会在任何抓取动作前退出。
 
 ### 终端 D：RViz，可选
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && rviz2
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && rviz2
 ```
 
 添加 `Image` display，topic 选 `/camera/wrist/image_raw`，Reliability 设为 `Best Effort`。
@@ -170,8 +171,8 @@ grep -A16 "target_gripper:" /tmp/so101_handeye_realsense_grasp.yaml
 
 ```text
 fixed_finger_contact_ee: [-0.014, 0.0, -0.080]
-fixed_finger_margin_m: 0.003
-fixed_finger_margin_max_m: 0.008
+fixed_finger_margin_m: 0.006
+fixed_finger_margin_max_m: 0.012
 fixed_finger_margin_width_ref_m: 0.035
 fixed_finger_margin_width_gain: 0.25
 ```
@@ -181,7 +182,7 @@ fixed_finger_margin_width_gain: 0.25
 控制器：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 control list_controllers
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 control list_controllers
 ```
 
 应看到：
@@ -195,8 +196,8 @@ gripper_trajectory_controller active
 服务和 action：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service list | grep -E 'detect_and_segment|plan_grasp|compute_ik'
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 action info /move_action
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service list | grep -E 'detect_and_segment|plan_grasp|compute_ik|compute_fk|move_to_configuration|verify_grasp'
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 action info /move_action
 ```
 
 `/move_action` 必须只有一个 `/move_group` action server。若有多个，回到第 1 步清理。
@@ -204,15 +205,15 @@ source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 action info /move_action
 相机：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic info /camera/wrist/image_raw
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic info /camera/wrist/aligned_depth_to_color/image_raw
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic info /camera/wrist/aligned_depth_to_color/camera_info
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic info /camera/wrist/image_raw
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic info /camera/wrist/aligned_depth_to_color/image_raw
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic info /camera/wrist/aligned_depth_to_color/camera_info
 ```
 
 ## 4. 只移动到观测姿态
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && python3 scripts/test_banana_handeye_pick.py \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && python3 scripts/test_banana_handeye_pick.py \
   --prompt banana \
   --observe-only \
   --handeye-source robot-config \
@@ -227,21 +228,21 @@ source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && p
 检测：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service call /grounded_sam2/detect_and_segment ibrobot_msgs/srv/DetectSegment \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service call /grounded_sam2/detect_and_segment ibrobot_msgs/srv/DetectSegment \
   "{text_prompt: 'banana', confidence_threshold: 0.1}"
 ```
 
 抓取规划：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service call /grasp_planner/plan_grasp ibrobot_msgs/srv/PlanGrasp \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service call /grasp_planner/plan_grasp ibrobot_msgs/srv/PlanGrasp \
   "{text_prompt: 'banana', confidence_threshold: 0.1, grasp_threshold: 0.5, debug_output_mode: 'diagnostic'}"
 ```
 
 需要保存一帧检测快照时：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 run perception_service grounded_sam2_snapshot \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 run perception_service grounded_sam2_snapshot \
   --prompt banana \
   --confidence-threshold 0.1 \
   --rgb-topic /camera/wrist/image_raw \
@@ -255,16 +256,18 @@ source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 run perception_service gr
 会移动到观测姿态、检测、规划、做 IK/执行侧筛选，抓取前退出。
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && python3 scripts/test_banana_handeye_pick.py \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && python3 scripts/test_banana_handeye_pick.py \
   --prompt banana \
   --detect-only \
   --handeye-source robot-config \
   --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
   --debug-output-mode full \
   --execution-debug-preview \
+  --centroid-source volume \
   --task-goal-timeout-s 60.0 \
   --so101-tabletop-filter \
-  --so101-tabletop-clearance -0.020 \
+  --so101-tabletop-clearance 0.000 \
+  --ik-fk-contact-max-xz-error 0.020 \
   --target-offset-z 0.000 \
   --min-contact-z -0.045 \
   --observe-x 0.10 \
@@ -288,35 +291,61 @@ FLOW_RESULT success=True
 - `grasp_preview_so101_execution.svg`
 - `grasp_preview_execution_stages.svg`
 
+detect-only 选中的记录使用 `reason: selected_detect_only`，不能把它误认为已经执行过真实抓取。
+
 如果出现 `height_guard_failed`、`so101_tabletop_failed`，或候选明显在桌面下，不要继续完整抓取。
+
+`--so101-tabletop-filter` 依赖 `scene_cloud.ply` 拟合桌面。执行脚本在该开关开启时会自动把
+PlanGrasp 请求提升为 `debug_output_mode=full`；如果仍拿不到 SO101 tabletop clearance，候选会
+fail closed 并以 `so101_tabletop_failed` 拒绝，不会静默放行。
+
+同时检查终端日志中的：
+
+- `DETECTION ... surface_xyz=... volume_xyz=...`：当前默认使用 `volume_xyz` 做候选重排和主目标点。
+- `GRASPGEN_RANK ... centroid_camera=...`：应对应 `--centroid-source volume` 的体积质心。
+- `grasp_preview_so101_execution.html`：同时显示主质心和备选质心；如果 surface/volume 分离明显，优先看体积质心是否落在 SO101 两指通道内。
 
 ## 7. 完整抓取
 
 只在第 6 步正常后执行。
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && python3 scripts/test_banana_handeye_pick.py \
-  --prompt banana \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && python3 scripts/test_banana_handeye_pick.py \
   --handeye-source robot-config \
   --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
   --debug-output-mode full \
   --execution-debug-preview \
   --pick-diagnostics \
+  --no-pick-diagnostics-detect \
+  --grasp-verification required \
+  --recover-after-close-failure \
+  --grasp-verification-probe-lift-height 0.030 \
+  --grasp-verification-probe-lift-speed 0.020 \
   --task-goal-timeout-s 60.0 \
   --so101-tabletop-filter \
   --so101-tabletop-clearance -0.020 \
   --confidence-threshold 0.3 \
   --grasp-threshold 0.2 \
   --min-grasp-confidence 0.0 \
+  --centroid-source volume \
   --graspgen-centroid-confidence-window 0.06 \
   --graspgen-topdown-weight 0.35 \
   --graspgen-topdown-min-z -0.25 \
+  --ik-fk-contact-compensation \
+  --ik-fk-contact-tolerance 0.003 \
+  --ik-fk-contact-max-iterations 6 \
+  --ik-fk-contact-max-correction 0.030 \
+  --ik-fk-contact-max-xz-error 0.020 \
+  --max-execution-attempts 1 \
+  --final-lift 0.050 \
+  --lift-speed 0.020 \
   --contact-realign-tolerance 0.008 \
   --target-offset-z 0.000 \
   --min-contact-z -0.045 \
   --observe-x 0.10 \
   --observe-y -0.16 \
-  --observe-z 0.22
+  --observe-z 0.22  \
+  --prompt banana 
 ```
 
 通过标志：
@@ -326,13 +355,18 @@ TASK_RESULT success=True ...
 GRASPGEN_CANDIDATE_ACCEPT ...
 TASK_SEND id=banana_graspgen_pick_approach ...
 TASK_SEND id=banana_graspgen_pick_pregrasp_realign ...
-TASK_SEND id=banana_graspgen_pick_grasp ...
+MOVE_CONFIGURATION_RESULT label=descend_to_ik_fk_compensated_grasp success=True ...
+GRASP_VERIFY label=close success=True status=success ...
+TASK_SEND id=banana_graspgen_pick_probe_lift ...
+GRASP_VERIFY label=probe_lift success=True status=success ...
+GRASP_VERIFY label=lift success=True status=success ...
 FLOW_RESULT success=True
 ```
 
 执行后重点看同目录的：
 
 - `pick_pose_diagnostics.json`：实际位姿误差和接触点 residual。
+- `grasp_verification.json`：close、3 cm probe lift 和最终 lift 的夹爪位置、电流及融合判定。
 - `execution_candidates.json`：最终 selected 候选和被拒原因。
 - `grasp_preview_so101_execution.html`：执行侧 3D 预览。
 
@@ -342,16 +376,36 @@ FLOW_RESULT success=True
 - `PREGRASP_REALIGN`：按物体最高点加 `--pregrasp-realign-clearance` 计算最后安全对齐高度。
 - `CONTACT_REALIGN phase=pregrasp`：pregrasp 高位接触点对齐。
 - `PREGRASP_REALIGN_APPLY ... ignored_z_delta=...`：只把 pregrasp 的 XY 修正应用到最终下降，Z 修正被忽略，避免最终夹持被安全高度 realign 抬高。
-- `CONTACT_REALIGN_CHECK phase=grasp`：低位只检查 residual，不再横向 realign。
+- `CONTACT_REALIGN_CHECK phase=grasp`：低位只检查 residual，不再横向 realign、回撤或 abort。
+- `IK_FK_CONTACT_COMP`：最终下降前使用 IK 关节解做 FK，按预测接触点的 base-X/Y residual 迭代修正命令。
+- `IK_FK_CANDIDATE`：候选 IK 解的完整接触点误差；`z_error` 是 X/Y 补偿无法消除的误差，超过上限时候选会在执行前被拒绝。
+- `IK_FK_CANDIDATE_RANK`：在所有保护检查通过后，按无法补偿的 `z_error` 从小到大排列执行顺序。
+- `IK_FK_GEOMETRY_CHECK`：用候选实际 IK 解的 FK 姿态重新检查夹爪网格和桌面间隙，detect-only 阶段也会执行。
+- `MOVE_CONFIGURATION_RESULT`：通过 MoveIt 执行补偿时使用的同一组 IK 关节角，避免网关重新求解。
+- `action=log_only_realign_threshold_exceeded` / `action=log_only_abort_threshold_exceeded`：说明 residual 超过对应日志阈值，但仍继续 close；这是现场策略，避免肉眼可抓位置被阈值误判后反复 retry。
 
 如果固定指在目标前侧，仍可能出现固定指先碰边导致漏抓。此时不要只继续增大 `fixed_finger_margin_max_m`，还要在 `grasp_preview_so101_execution.html` 里检查 selected 候选的 SO101 mesh 方向，优先选择活动指能把目标扫回夹口的候选。
 
+漏抓排查时不要漏看体积质心：`volume_xyz` 代表目标主体位置，比可见表面 `surface_xyz` 更适合判断物体是否在两指通道内。若 contact residual 看起来不大，但 `volume_xyz` 已经在固定指外侧或夹口外，仍会出现固定指先碰、活动指扫不回的漏抓。
+
 ## 8. 抓取后验证
 
-当前是手动调用，抓取脚本不会自动触发。建议完整抓取 lift 后保持 `0.5-1.0s` 再调用：
+完整抓取脚本会自动在三个阶段调用验证服务：
+
+- `close`：闭合后、任何抬升前确认已经夹住；失败或不确定时保持夹爪闭合，先垂直撤回到
+  pregrasp 高度，再打开夹爪并返回观察位。可用 `--no-recover-after-close-failure` 恢复旧的原位停止行为。
+- `probe_lift`：以 `0.02` 速度抬升 `3 cm`，在低高度检查是否立即滑脱。
+- `lift`：监督式验证仅抬升到 `5 cm`，确认目标仍在夹爪中；验证通过后再单独设计转运轨迹。
+
+任一阶段返回 `STATUS_FAILED(0)` 或 `STATUS_UNCERTAIN(2)` 时，`required` 策略都会输出
+`FLOW_RESULT success=False`，不会再把动作执行完成当成抓取成功。`optional` 仅允许在服务完全不可用时跳过；
+服务一旦返回明确结果，失败或不确定仍会使流程失败。close 恢复只把机械臂带回可重新规划的安全观察位，
+不会把本轮失败改成成功；`probe_lift` / `lift` 验证失败仍停在对应抬升位置。
+
+需要单独检查当前夹持状态时，也可以手动调用：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
   ros2 service call /grasp_verifier/verify_grasp ibrobot_msgs/srv/VerifyGrasp \
   "{task_id: 'pick_001', text_prompt: 'banana', expected_target_width_m: 0.035, post_grasp_wait_s: 0.2}"
 ```
@@ -362,7 +416,12 @@ source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
 - `STATUS_FAILED(0)`：融合证据倾向没抓住。
 - `STATUS_UNCERTAIN(2)`：证据不足；重观察或保守重试，不要直接当失败。
 
-`evidence` 中重点看 `gripper_position`、`gripper_current_abs_a`、`wrist_visibility`。
+`evidence` 中重点看 `gripper_position`、`gripper_current_abs_a`、`wrist_visibility`。脚本会同时把完整结果写入
+`grasp_verification.json`，并在 selected candidate 下保存 `grasp_verification` 记录。
+
+默认关闭 `--pick-diagnostics-detect`。夹爪贴近目标后腕部视野严重遮挡，重新分割会增加 close-to-lift 延迟，
+并可能产生错误质心。显式启用时，距离实际接触点超过
+`--pick-diagnostics-max-target-contact-distance` 的检测只记录为 `plausible: false`，不会覆盖抓取前可信目标。
 
 ## 9. 常用调参
 
@@ -372,10 +431,26 @@ source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
 --target-offset-x 0.00 --target-offset-y 0.00 --target-offset-z 0.00
 ```
 
-当前现场常用桌面/高度保护：
+最终抓取 X/Y 方向受 5-DOF 姿态误差影响时，优先使用动态 IK/FK 接触点补偿，而不是直接写死
+`target-offset-x` / `target-offset-y`：
 
 ```bash
---min-contact-z -0.045 --so101-tabletop-clearance -0.020
+--ik-fk-contact-compensation \
+--ik-fk-contact-tolerance 0.003 \
+--ik-fk-contact-max-iterations 6 \
+--ik-fk-contact-max-correction 0.030 \
+--ik-fk-contact-max-xz-error 0.020
+```
+
+补偿同时调整 base-X 和 base-Y，Z 不补偿。若预测需要超过最大 X/Y 修正量，或未补偿的 Z 误差超过
+`--ik-fk-contact-max-xz-error`，候选会被拒绝；执行最终下降时会通过
+`/moveit_gateway/move_to_configuration` 使用同一组 IK 关节解。候选筛选和最终下降前都会基于该
+IK 解的 FK 姿态重新检查 SO101 网格桌面间隙。
+
+监督式真实抓取使用的桌面/高度保护：
+
+```bash
+--min-contact-z -0.045 --so101-tabletop-clearance 0.000
 ```
 
 GraspGen 候选：
@@ -384,10 +459,14 @@ GraspGen 候选：
 --grasp-threshold 0.5 --min-grasp-confidence 0.0 --max-candidates 80
 ```
 
+`--max-candidates` 是 IK/FK 检查预算。脚本会先对 GraspGen 返回的全部候选做质心、top-down 和
+置信度重排，再截取前 80 个；不会再把低于原始置信度前 80、但几何更合适的候选提前丢掉。
+
 Top-down 偏好：
 
 ```bash
 --graspgen-rank-by-centroid \
+--centroid-source volume \
 --graspgen-topdown-weight 0.35 \
 --graspgen-topdown-min-z -0.25
 ```
@@ -418,18 +497,21 @@ Top-down 偏好：
 --debug-output-mode full        # 写点云、预览和执行侧诊断
 ```
 
+启用 `--so101-tabletop-filter` 时，即使传入 `none` / `diagnostic` / `default`，脚本也会强制请求
+`full`，因为 SO101 执行侧 tabletop sweep 需要 `scene_cloud.ply`。
+
 ## 10. 常见问题
 
 `Detect service is not available`：启动终端 B，检查：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service list | grep grounded_sam2
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service list | grep grounded_sam2
 ```
 
 `GraspGen service is not available`：启动终端 C，检查：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service list | grep /grasp_planner/plan_grasp
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service list | grep /grasp_planner/plan_grasp
 ```
 
 `No synchronized depth/CameraInfo for detection frame`：
