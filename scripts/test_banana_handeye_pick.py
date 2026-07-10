@@ -26,6 +26,7 @@ import math
 import struct
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -33,15 +34,17 @@ import rclpy
 import tf2_ros
 import yaml
 from geometry_msgs.msg import Pose
-from moveit_msgs.srv import GetPositionIK
+from grasp_contact_compensation import ContactPrediction, compensate_contact_xy
+from moveit_msgs.srv import GetPositionFK, GetPositionIK
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.time import Time
 from scipy.spatial.transform import Rotation as R
+from sensor_msgs.msg import JointState
 
 from ibrobot_msgs.action import ExecuteTaskPlan
 from ibrobot_msgs.msg import Detection2D, TaskStep
-from ibrobot_msgs.srv import DetectSegment, PlanGrasp
+from ibrobot_msgs.srv import DetectSegment, MoveToConfiguration, PlanGrasp, VerifyGrasp
 
 
 def parse_args() -> argparse.Namespace:
@@ -271,13 +274,19 @@ def parse_args() -> argparse.Namespace:
         "--grasp-residual-realign-xy-error",
         type=float,
         default=0.010,
-        help="Retract to pregrasp and realign once if low-height contact XY residual exceeds this; <=0 disables it",
+        help=(
+            "Logging threshold for low-height contact XY residual. "
+            "No retract or low-height realign is executed; <=0 disables this log annotation."
+        ),
     )
     parser.add_argument(
         "--grasp-residual-abort-xy-error",
         type=float,
         default=0.030,
-        help="Abort and retract only if low-height contact XY residual exceeds this hard safety limit; <=0 disables it",
+        help=(
+            "Logging threshold for large low-height contact XY residual. "
+            "No abort or retract is executed; <=0 disables this log annotation."
+        ),
     )
     parser.add_argument(
         "--max-execution-attempts",
@@ -289,7 +298,7 @@ def parse_args() -> argparse.Namespace:
         "--retry-after-grasp-residual",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Try another candidate after low-height contact residual abort; default stops after the safety retract",
+        help="Legacy option retained for compatibility; grasp residual checks are logging-only and do not trigger retry.",
     )
 
     parser.add_argument("--observe-x", type=float, default=-0.25, help="Observation gripper target x in base frame")
@@ -313,14 +322,61 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pick-diagnostics-detect",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Re-run target detection at the grasp pose to measure strawberry-to-gripper residual",
+        default=False,
+        help="Re-run target detection at the grasp pose; disabled by default because close-range masks are unreliable",
     )
     parser.add_argument(
         "--pick-diagnostics-settle-s",
         type=float,
         default=0.25,
         help="Settling time before sampling pick diagnostic TF/detection",
+    )
+    parser.add_argument(
+        "--pick-diagnostics-max-target-contact-distance",
+        type=float,
+        default=0.08,
+        help="Do not replace the trusted target when a close-range diagnostic detection is farther from contact",
+    )
+    parser.add_argument(
+        "--grasp-verification",
+        choices=("required", "optional", "disabled"),
+        default="required",
+        help="Post-close/lift verification policy; optional skips only when the verifier service is unavailable",
+    )
+    parser.add_argument(
+        "--grasp-verification-service",
+        default="/grasp_verifier/verify_grasp",
+        help="VerifyGrasp service used to confirm object retention",
+    )
+    parser.add_argument(
+        "--grasp-verification-timeout-s",
+        type=float,
+        default=5.0,
+        help="Timeout for each post-grasp verification call",
+    )
+    parser.add_argument(
+        "--grasp-verification-wait-s",
+        type=float,
+        default=0.1,
+        help="Additional verifier-side settling delay before each sensor sample",
+    )
+    parser.add_argument(
+        "--grasp-verification-probe-lift-height",
+        type=float,
+        default=0.03,
+        help="Height of the slow retention-check lift before the final lift; <=0 disables the probe",
+    )
+    parser.add_argument(
+        "--grasp-verification-probe-lift-speed",
+        type=float,
+        default=0.02,
+        help="Velocity scaling for the retention-check probe lift",
+    )
+    parser.add_argument(
+        "--recover-after-close-failure",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Retract closed to pregrasp, open, and return to the observation pose after close verification fails",
     )
 
     parser.add_argument(
@@ -493,6 +549,12 @@ def parse_args() -> argparse.Namespace:
         help="Filter sampled candidates with MoveIt compute_ik before executing",
     )
     parser.add_argument("--ik-service", default="/compute_ik", help="MoveIt GetPositionIK service name")
+    parser.add_argument("--fk-service", default="/compute_fk", help="MoveIt GetPositionFK service name")
+    parser.add_argument(
+        "--move-configuration-service",
+        default="/moveit_gateway/move_to_configuration",
+        help="MoveIt gateway service used to execute the exact IK solution",
+    )
     parser.add_argument("--ik-group", default="arm", help="MoveIt group name used for IK filtering")
     parser.add_argument("--ik-timeout-s", type=float, default=0.20, help="Per-candidate IK timeout inside MoveIt")
     parser.add_argument(
@@ -510,6 +572,36 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Send GraspGen orientation to MoveIt execution so contact compensation matches the commanded gripper pose",
+    )
+    parser.add_argument(
+        "--ik-fk-contact-compensation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use IK then FK to iteratively compensate final grasp contact error along base-frame X and Y",
+    )
+    parser.add_argument(
+        "--ik-fk-contact-tolerance",
+        type=float,
+        default=0.003,
+        help="Maximum predicted base-frame X/Y contact residual after IK/FK compensation",
+    )
+    parser.add_argument(
+        "--ik-fk-contact-max-iterations",
+        type=int,
+        default=3,
+        help="Maximum base-frame X/Y correction updates after the initial IK/FK prediction",
+    )
+    parser.add_argument(
+        "--ik-fk-contact-max-correction",
+        type=float,
+        default=0.030,
+        help="Maximum absolute base-frame X/Y command correction allowed for one grasp",
+    )
+    parser.add_argument(
+        "--ik-fk-contact-max-xz-error",
+        type=float,
+        default=0.020,
+        help="Maximum IK/FK-predicted contact error along the uncorrected base-frame Z axis",
     )
     parser.add_argument(
         "--require-grasp-ik",
@@ -944,6 +1036,13 @@ def quat_delta_deg(
     return math.degrees(float(delta.magnitude()))
 
 
+@dataclass(frozen=True)
+class IKFKContactPayload:
+    joint_state: JointState
+    ee_xyz: tuple[float, float, float]
+    ee_quat_xyzw: tuple[float, float, float, float]
+
+
 def _load_robot_camera_transform(config_path: Path, camera_name: str, ee_frame: str) -> tuple[np.ndarray, dict]:
     payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     robot = payload.get("robot")
@@ -996,12 +1095,28 @@ class BananaHandeyePickClient(Node):
         self.detect_client = self.create_client(DetectSegment, args.detect_service)
         self.grasp_client = self.create_client(PlanGrasp, args.manipulation_service)
         self.task_client = ActionClient(self, ExecuteTaskPlan, args.task_action)
-        self.ik_client = self.create_client(GetPositionIK, args.ik_service) if args.ik_filter else None
+        self.use_grasp_verification = args.grasp_verification != "disabled"
+        self.verify_grasp_client = (
+            self.create_client(VerifyGrasp, args.grasp_verification_service) if self.use_grasp_verification else None
+        )
+        self.use_ik_fk_contact_compensation = bool(args.ik_fk_contact_compensation and args.target_source == "graspgen")
+        needs_ik_services = args.ik_filter or self.use_ik_fk_contact_compensation
+        self.ik_client = self.create_client(GetPositionIK, args.ik_service) if needs_ik_services else None
+        self.fk_client = (
+            self.create_client(GetPositionFK, args.fk_service) if self.use_ik_fk_contact_compensation else None
+        )
+        self.move_configuration_client = (
+            self.create_client(MoveToConfiguration, args.move_configuration_service)
+            if self.use_ik_fk_contact_compensation
+            else None
+        )
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.handeye_data, self.handeye_matrix = self._load_handeye(args)
         self.selected_target_contact_ee: tuple[float, float, float] | None = None
         self.selected_plan_contact_base: tuple[float, float, float] | None = None
+        self.selected_target_width_m = 0.0
+        self.current_grasp_verified = False
         self.current_execution_candidate_index: int | None = None
         self.observed_target_base: tuple[float, float, float] | None = None
         self.observed_target_base_alt: tuple[float, float, float] | None = None
@@ -1010,6 +1125,7 @@ class BananaHandeyePickClient(Node):
         self.last_graspgen_debug_output_dir: Path | None = None
         self.execution_debug_records: list[dict[str, object]] = []
         self.pick_diagnostic_records: list[dict[str, object]] = []
+        self.grasp_verification_records: list[dict[str, object]] = []
         self.last_t_base_camera: np.ndarray | None = None
         self._so101_table_plane: tuple[np.ndarray, float, float] | None = None
         self._so101_table_plane_checked = False
@@ -1143,14 +1259,41 @@ class BananaHandeyePickClient(Node):
         needs_task_action = not self.args.skip_observe or not self.args.detect_only
         if needs_task_action and not self.task_client.wait_for_server(timeout_sec=self.args.ready_timeout_s):
             raise RuntimeError(f"Task action is not available: {self.args.task_action}")
+        needs_verifier = not self.args.detect_only and not self.args.observe_only and self.use_grasp_verification
+        if needs_verifier and self.verify_grasp_client is not None:
+            verifier_ready = self.verify_grasp_client.wait_for_service(timeout_sec=self.args.ready_timeout_s)
+            if not verifier_ready and self.args.grasp_verification == "required":
+                raise RuntimeError(
+                    f"Grasp verification service is not available: {self.args.grasp_verification_service}"
+                )
+            if not verifier_ready:
+                print(
+                    f"GRASP_VERIFY_READY available=False policy={self.args.grasp_verification} "
+                    f"service={self.args.grasp_verification_service}",
+                    flush=True,
+                )
+        if (
+            not self.args.detect_only
+            and not self.args.observe_only
+            and self.use_ik_fk_contact_compensation
+            and self.move_configuration_client is not None
+            and not self.move_configuration_client.wait_for_service(timeout_sec=self.args.ready_timeout_s)
+        ):
+            raise RuntimeError(f"Move configuration service is not available: {self.args.move_configuration_service}")
 
     def wait_ik_ready(self) -> None:
         if (
-            self.args.ik_filter
+            (self.args.ik_filter or self.use_ik_fk_contact_compensation)
             and self.ik_client is not None
             and not self.ik_client.wait_for_service(timeout_sec=self.args.ik_wait_timeout_s)
         ):
             raise RuntimeError(f"IK service is not available: {self.args.ik_service}")
+        if (
+            self.use_ik_fk_contact_compensation
+            and self.fk_client is not None
+            and not self.fk_client.wait_for_service(timeout_sec=self.args.ik_wait_timeout_s)
+        ):
+            raise RuntimeError(f"FK service is not available: {self.args.fk_service}")
 
     def run_task(self, task_id: str, description: str, steps: list[TaskStep], timeout_s: float | None = None) -> bool:
         goal = ExecuteTaskPlan.Goal()
@@ -1181,6 +1324,112 @@ class BananaHandeyePickClient(Node):
         )
         return bool(result.success)
 
+    def run_joint_configuration(self, label: str, joint_state: JointState, velocity_scaling: float) -> bool:
+        client = self.move_configuration_client
+        if client is None:
+            raise RuntimeError("Move configuration client is disabled")
+        if not client.service_is_ready() and not client.wait_for_service(timeout_sec=self.args.ready_timeout_s):
+            raise RuntimeError(f"Move configuration service is not available: {self.args.move_configuration_service}")
+
+        request = MoveToConfiguration.Request()
+        request.target_joint_state = joint_state
+        request.velocity_scaling = float(velocity_scaling)
+        print(
+            f"MOVE_CONFIGURATION_SEND label={label} joints={list(joint_state.name)} "
+            f"positions={[round(float(value), 6) for value in joint_state.position]}",
+            flush=True,
+        )
+        future = client.call_async(request)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=self.args.task_timeout_s)
+        if not future.done():
+            raise RuntimeError(f"Timed out waiting for move configuration: {label}")
+        response = future.result()
+        if response is None:
+            raise RuntimeError(f"Move configuration returned no response: {label}")
+        print(
+            f"MOVE_CONFIGURATION_RESULT label={label} success={response.success} "
+            f"duration={response.execution_time_s:.2f}s msg={response.message}",
+            flush=True,
+        )
+        return bool(response.success)
+
+    def verify_grasp_retention(self, label: str) -> None:
+        if not self.use_grasp_verification:
+            return
+
+        client = self.verify_grasp_client
+        if client is None or not client.service_is_ready():
+            if self.args.grasp_verification == "optional":
+                print(
+                    f"GRASP_VERIFY label={label} skipped=True reason=service_unavailable "
+                    f"service={self.args.grasp_verification_service}",
+                    flush=True,
+                )
+                return
+            raise PickExecutionError(
+                f"Grasp verification service is unavailable: {self.args.grasp_verification_service}",
+                phase=f"verify_{label}",
+                retryable=False,
+            )
+
+        request = VerifyGrasp.Request()
+        request.task_id = f"banana_pick_{self.current_execution_candidate_index}_{label}"
+        request.text_prompt = self.args.prompt
+        request.expected_target_width_m = float(self.selected_target_width_m)
+        request.post_grasp_wait_s = max(0.0, float(self.args.grasp_verification_wait_s))
+
+        future = client.call_async(request)
+        timeout_s = max(0.1, float(self.args.grasp_verification_timeout_s)) + request.post_grasp_wait_s
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_s)
+        if not future.done() or future.result() is None:
+            if self.args.grasp_verification == "optional":
+                print(f"GRASP_VERIFY label={label} skipped=True reason=timeout", flush=True)
+                return
+            raise PickExecutionError(
+                f"Grasp verification timed out after {timeout_s:.1f}s",
+                phase=f"verify_{label}",
+                retryable=False,
+            )
+
+        response = future.result()
+        status = int(response.status)
+        status_name = {0: "failed", 1: "success", 2: "uncertain"}.get(status, f"unknown_{status}")
+        record = {
+            "label": label,
+            "success": bool(response.success),
+            "status": status,
+            "status_name": status_name,
+            "confidence": round(float(response.confidence), 6),
+            "message": response.message,
+            "expected_target_width_m": round(float(self.selected_target_width_m), 6),
+            "evidence": list(response.evidence),
+        }
+        if self.current_execution_candidate_index is not None:
+            record["candidate_index"] = int(self.current_execution_candidate_index)
+        self.grasp_verification_records.append(record)
+        selected_record = (
+            self._execution_record_for_index(self.current_execution_candidate_index)
+            if self.current_execution_candidate_index is not None
+            else None
+        )
+        if selected_record is not None:
+            selected_record.setdefault("grasp_verification", []).append(record)
+        print(
+            f"GRASP_VERIFY label={label} success={response.success} status={status_name} "
+            f"confidence={response.confidence:.2f} msg={response.message}",
+            flush=True,
+        )
+        for evidence in response.evidence:
+            print(f"GRASP_VERIFY_EVIDENCE label={label} value={evidence}", flush=True)
+        if not response.success or status != 1:
+            raise PickExecutionError(
+                f"Grasp retention verification {status_name}: {response.message}",
+                phase=f"verify_{label}",
+                retryable=False,
+            )
+        if label == "lift":
+            self.current_grasp_verified = True
+
     @staticmethod
     def _feedback_cb(feedback_msg) -> None:
         feedback = feedback_msg.feedback
@@ -1205,6 +1454,65 @@ class BananaHandeyePickClient(Node):
         )
         if not ok:
             raise RuntimeError("Failed to move to observation pose")
+
+    def recover_after_close_failure(
+        self,
+        *,
+        task_id: str,
+        task_desc: str,
+        grasp: tuple[float, float, float],
+        pregrasp: tuple[float, float, float],
+        quat_xyzw: tuple[float, float, float, float] | None,
+    ) -> None:
+        retreat = (grasp[0], grasp[1], max(grasp[2], pregrasp[2]))
+        candidate = self.current_execution_candidate_index
+        recovery_id = f"{task_id}_recover_close_{candidate if candidate is not None else 'unknown'}"
+        print(
+            f"CLOSE_FAILURE_RECOVERY stage=retreat gripper=closed target={fmt_xyz(retreat)}",
+            flush=True,
+        )
+        ok = self.run_task(
+            f"{recovery_id}_retreat",
+            f"{task_desc}: retract closed gripper after failed close verification",
+            [make_move_step("retreat_closed_gripper_to_pregrasp", retreat, self.args.lift_speed, quat_xyzw)],
+        )
+        if not ok:
+            raise PickExecutionError(
+                "Close-failure recovery could not retract to pregrasp",
+                phase="recover_close_retreat",
+                retryable=False,
+            )
+
+        reset_steps = [
+            make_gripper_step("open_gripper_after_safe_retreat", 1.0),
+            make_wait_step("settle_open_gripper_after_recovery", self.args.open_settle_s),
+        ]
+        recovery_target = "pregrasp"
+        if not self.args.skip_observe:
+            observe = (self.args.observe_x, self.args.observe_y, self.args.observe_z)
+            reset_steps.extend(
+                [
+                    make_move_step("return_to_observation_pose", observe, self.args.observe_speed),
+                    make_wait_step("settle_recovery_observation_image", self.args.observe_settle_s),
+                ]
+            )
+            recovery_target = "observe"
+        ok = self.run_task(
+            f"{recovery_id}_reset",
+            f"{task_desc}: reset after failed close verification",
+            reset_steps,
+            timeout_s=90.0,
+        )
+        if not ok:
+            raise PickExecutionError(
+                "Close-failure recovery could not open and return to the observation pose",
+                phase="recover_close_reset",
+                retryable=False,
+            )
+        print(
+            f"CLOSE_FAILURE_RECOVERY success=True final={recovery_target} gripper=open",
+            flush=True,
+        )
 
     def lookup_base_to_gripper(self):
         deadline = time.monotonic() + self.args.tf_timeout_s
@@ -1268,7 +1576,15 @@ class BananaHandeyePickClient(Node):
         request.text_prompt = self.args.prompt
         request.confidence_threshold = self.args.confidence_threshold
         request.grasp_threshold = self.args.grasp_threshold
-        request.debug_output_mode = debug_output_mode or self.args.debug_output_mode
+        output_mode = debug_output_mode or self.args.debug_output_mode
+        if self.args.so101_tabletop_filter and output_mode != "full":
+            print(
+                "SO101_TABLETOP_FILTER forcing_graspgen_debug_output_mode=full "
+                f"previous={output_mode!r} reason=filter_requires_scene_cloud",
+                flush=True,
+            )
+            output_mode = "full"
+        request.debug_output_mode = output_mode
 
         print(
             f"GRASPGEN_SEND prompt={self.args.prompt} detect_threshold={self.args.confidence_threshold} "
@@ -1390,6 +1706,13 @@ class BananaHandeyePickClient(Node):
         so101_tabletop_clearance_m: float | None = None,
         adapter_xyz: Iterable[float] | None = None,
         width_reason: str = "",
+        ik_fk_predicted_contact: Iterable[float] | None = None,
+        ik_fk_contact_error: Iterable[float] | None = None,
+        ik_fk_contact_residual_x: float | None = None,
+        ik_fk_contact_residual_y: float | None = None,
+        ik_fk_contact_z_error: float | None = None,
+        ik_fk_predicted_grasp_mesh_min_z: float | None = None,
+        ik_fk_predicted_tabletop_clearance_m: float | None = None,
         selected: bool = False,
     ) -> None:
         record: dict[str, object] = {
@@ -1422,6 +1745,20 @@ class BananaHandeyePickClient(Node):
             contact_tuple = None
         if width_reason:
             record["width_reason"] = width_reason
+        if ik_fk_predicted_contact is not None:
+            record["ik_fk_predicted_contact_base"] = _json_xyz(ik_fk_predicted_contact)
+        if ik_fk_contact_error is not None:
+            record["ik_fk_contact_error_base"] = _json_xyz(ik_fk_contact_error)
+        if ik_fk_contact_residual_x is not None:
+            record["ik_fk_contact_residual_x"] = round(float(ik_fk_contact_residual_x), 6)
+        if ik_fk_contact_residual_y is not None:
+            record["ik_fk_contact_residual_y"] = round(float(ik_fk_contact_residual_y), 6)
+        if ik_fk_contact_z_error is not None:
+            record["ik_fk_contact_z_error"] = round(float(ik_fk_contact_z_error), 6)
+        if ik_fk_predicted_grasp_mesh_min_z is not None:
+            record["ik_fk_predicted_grasp_mesh_min_z"] = round(float(ik_fk_predicted_grasp_mesh_min_z), 6)
+        if ik_fk_predicted_tabletop_clearance_m is not None:
+            record["ik_fk_predicted_tabletop_clearance_m"] = round(float(ik_fk_predicted_tabletop_clearance_m), 6)
         if approach is not None:
             record["approach"] = _json_xyz(approach)
         if grasp is not None:
@@ -1445,7 +1782,7 @@ class BananaHandeyePickClient(Node):
                 record["lift_contact_base"] = _json_xyz(self._contact_for_pose(lift, quat, contact_tuple))
         self.execution_debug_records.append(record)
 
-    def _write_execution_debug_outputs(self) -> None:
+    def _write_execution_debug_outputs(self, *, render_previews: bool = True) -> None:
         if not self.args.execution_debug_preview or not self.execution_debug_records:
             return
         out_dir = self.last_graspgen_debug_output_dir
@@ -1478,6 +1815,18 @@ class BananaHandeyePickClient(Node):
                     json.dumps(pick_payload, indent=2, ensure_ascii=False),
                     encoding="utf-8",
                 )
+            if self.grasp_verification_records:
+                verification_payload = {
+                    "service": self.args.grasp_verification_service,
+                    "policy": self.args.grasp_verification,
+                    "records": self.grasp_verification_records,
+                }
+                (out_dir / "grasp_verification.json").write_text(
+                    json.dumps(verification_payload, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            if not render_previews:
+                return
             self._render_execution_debug_preview_svg(out_dir / "grasp_preview_so101_execution.svg")
             self._render_execution_debug_preview_html(out_dir / "grasp_preview_so101_execution.html")
             self._render_execution_stage_overlay_svg(out_dir / "grasp_preview_execution_stages.svg")
@@ -2199,7 +2548,13 @@ class BananaHandeyePickClient(Node):
             scene_pts_camera = scene_raw_xyz
         scene_pts = self._transform_cloud(self.last_t_base_camera, scene_pts_camera)
         table_completion_pts = self._transform_cloud(self.last_t_base_camera, table_completion_camera)
-        selected_record = next((record for record in self.execution_debug_records if record.get("selected")), None)
+        selected_records = [record for record in self.execution_debug_records if record.get("selected")]
+        selected_record = selected_records[-1] if selected_records else None
+        if selected_record is None and self.current_execution_candidate_index is not None:
+            failed_record = self._execution_record_for_index(self.current_execution_candidate_index)
+            if failed_record is not None and failed_record.get("stage") == "execution_failed":
+                selected_record = failed_record
+        display_records = [selected_record] if selected_record is not None else []
         selected_gripper_meshes: list[tuple[str, str, list[tuple[str, np.ndarray, np.ndarray]]]] = []
         selected_gripper_lines: list[tuple[str, str, list[np.ndarray]]] = []
         pick_records = [record for record in self.pick_diagnostic_records if isinstance(record, dict)]
@@ -2239,7 +2594,7 @@ class BananaHandeyePickClient(Node):
             roi_parts.append(graspgen_input_pts)
         if len(table_completion_pts):
             roi_parts.append(table_completion_pts)
-        for record in self.execution_debug_records:
+        for record in display_records:
             for key in (
                 "start_contact_base",
                 "approach_contact_base",
@@ -2392,7 +2747,7 @@ class BananaHandeyePickClient(Node):
             "confidence_rejected": "#64748b",
             "collision_rejected": "#92400e",
         }
-        for record in self.execution_debug_records:
+        for record in display_records:
             stage = "selected" if record.get("selected") else str(record.get("stage", ""))
             color = stage_colors.get(stage, "#94a3b8")
             points = []
@@ -2614,12 +2969,10 @@ class BananaHandeyePickClient(Node):
         # A visible vertical (mostly z) segment here is the real "gripper stops above
         # the object" error the operator observes on the robot.
         grasp_contact = None
-        for record in self.execution_debug_records:
-            if record.get("selected"):
-                value = record.get("grasp_contact_base")
-                if isinstance(value, list) and len(value) == 3:
-                    grasp_contact = [float(v) for v in value]
-                break
+        if selected_record is not None:
+            value = selected_record.get("grasp_contact_base")
+            if isinstance(value, list) and len(value) == 3:
+                grasp_contact = [float(v) for v in value]
         if reference_target is not None and grasp_contact is not None:
             gap = np.asarray(reference_target, dtype=np.float64) - np.asarray(grasp_contact, dtype=np.float64)
             gap_norm = float(np.linalg.norm(gap))
@@ -3008,12 +3361,18 @@ class BananaHandeyePickClient(Node):
         self.last_t_base_camera = t_base_gripper_start @ np.array(self.handeye_matrix, dtype=np.float64)
         candidates = self.request_graspgen_candidates(base_to_gripper_tf)
         self.execution_debug_records = []
+        ranked_candidates = self.rank_graspgen_candidates(candidates, base_to_gripper_tf)
         max_candidates = int(self.args.max_candidates)
-        max_count = len(candidates) if max_candidates <= 0 else min(len(candidates), max(1, max_candidates))
-        ranked_candidates = self.rank_graspgen_candidates(candidates[:max_count], base_to_gripper_tf)
+        if max_candidates > 0:
+            ranked_candidates = ranked_candidates[:max_candidates]
+        max_count = len(ranked_candidates)
         print(
             f"GRASPGEN_CANDIDATE_TOTAL n={len(candidates)} tested={max_count} ik_filter={self.args.ik_filter} "
-            f"ik_check_orientation={self.args.ik_check_orientation}",
+            f"ik_check_orientation={self.args.ik_check_orientation} "
+            f"ik_fk_contact_compensation={self.use_ik_fk_contact_compensation} "
+            f"ik_fk_xy_tolerance={self.args.ik_fk_contact_tolerance:.4f} "
+            f"ik_fk_xy_max_correction={self.args.ik_fk_contact_max_correction:.4f} "
+            f"ik_fk_z_max_error={self.args.ik_fk_contact_max_xz_error:.4f}",
             flush=True,
         )
         print(
@@ -3194,6 +3553,34 @@ class BananaHandeyePickClient(Node):
                     flush=True,
                 )
                 continue
+            if self.args.so101_tabletop_filter and so101_tabletop_clearance is None:
+                reason = "so101_tabletop_clearance unavailable while SO101 tabletop filter is enabled"
+                self._record_execution_candidate(
+                    index=index,
+                    confidence=confidence,
+                    stage="collision_rejected",
+                    reason=reason,
+                    collision_free=bool(candidate.collision_free),
+                    topdown_score=topdown_score,
+                    centroid_dist_camera=centroid_dist_camera,
+                    approach=approach,
+                    grasp=grasp,
+                    lift=lift,
+                    quat=quat,
+                    target_contact=target_contact,
+                    target_width_m=width,
+                    target_width_quality=width_quality,
+                    grasp_mesh_min_z=grasp_mesh_min_z,
+                    so101_tabletop_clearance_m=so101_tabletop_clearance,
+                    adapter_xyz=adapter_xyz,
+                    width_reason=width_reason,
+                )
+                print(
+                    f"GRASPGEN_CANDIDATE_REJECT idx={index} grasp={fmt_xyz(grasp)} "
+                    f"reason=so101_tabletop_failed {reason}",
+                    flush=True,
+                )
+                continue
             if so101_tabletop_clearance is not None and so101_tabletop_clearance < float(
                 self.args.so101_tabletop_clearance
             ):
@@ -3229,17 +3616,27 @@ class BananaHandeyePickClient(Node):
                 continue
 
             checks = [("approach", approach)]
-            if self.args.require_grasp_ik:
+            if self.args.require_grasp_ik or self.use_ik_fk_contact_compensation:
                 checks.append(("grasp", grasp))
             if self.args.require_lift_ik:
                 checks.append(("lift", lift))
 
             failed = False
             failed_reason = ""
+            ik_fk_predicted_contact = None
+            ik_fk_contact_error = None
+            ik_fk_contact_residual_x = None
+            ik_fk_contact_residual_y = None
+            ik_fk_contact_z_error = None
+            ik_fk_predicted_grasp_mesh_min_z = None
+            ik_fk_predicted_tabletop_clearance = None
             for label, xyz in checks:
-                ik_quat = quat if self.args.ik_check_orientation else None
-                ik_ok, code = self.check_ik(f"graspgen_{index}_{label}", xyz, ik_quat)
-                if not ik_ok:
+                needs_solution = self.args.ik_filter or (self.use_ik_fk_contact_compensation and label == "grasp")
+                if not needs_solution:
+                    continue
+                ik_quat = quat if self.args.ik_check_orientation or label == "grasp" else None
+                solution, code = self.solve_ik(f"graspgen_{index}_{label}", xyz, ik_quat)
+                if solution is None:
                     failed_reason = f"ik_failed_{label} code={code}"
                     print(
                         f"GRASPGEN_CANDIDATE_REJECT idx={index} grasp={fmt_xyz(grasp)} "
@@ -3248,6 +3645,56 @@ class BananaHandeyePickClient(Node):
                     )
                     failed = True
                     break
+                if self.use_ik_fk_contact_compensation and label == "grasp":
+                    try:
+                        ee_xyz, ee_quat = self.compute_fk(f"graspgen_{index}_{label}", solution)
+                    except RuntimeError as exc:
+                        failed_reason = f"ik_fk_failed_{label} {exc}"
+                        failed = True
+                        break
+                    ik_fk_predicted_contact = self._contact_for_pose(ee_xyz, ee_quat, target_contact)
+                    ik_fk_contact_error, ik_fk_contact_z_error, failed_reason = self.ik_fk_contact_guard(
+                        execution_contact,
+                        ik_fk_predicted_contact,
+                    )
+                    ik_fk_contact_residual_x = ik_fk_contact_error[0]
+                    ik_fk_contact_residual_y = ik_fk_contact_error[1]
+                    payload = IKFKContactPayload(
+                        joint_state=solution,
+                        ee_xyz=ee_xyz,
+                        ee_quat_xyzw=ee_quat,
+                    )
+                    if not failed_reason:
+                        try:
+                            (
+                                ik_fk_predicted_grasp_mesh_min_z,
+                                ik_fk_predicted_tabletop_clearance,
+                            ) = self.validate_ik_fk_grasp_geometry(
+                                payload,
+                                width=width,
+                                label=f"candidate_{index}",
+                            )
+                        except RuntimeError as exc:
+                            failed_reason = f"ik_fk_geometry_failed_{label} {exc}"
+                    clearance_text = (
+                        "n/a"
+                        if ik_fk_predicted_tabletop_clearance is None
+                        else f"{ik_fk_predicted_tabletop_clearance:.4f}"
+                    )
+                    print(
+                        f"IK_FK_CANDIDATE idx={index} target={fmt_xyz(execution_contact)} "
+                        f"predicted={fmt_xyz(ik_fk_predicted_contact)} "
+                        f"error={fmt_xyz(ik_fk_contact_error)} z_error={ik_fk_contact_z_error:.4f} "
+                        f"predicted_tabletop_clearance={clearance_text}",
+                        flush=True,
+                    )
+                    if failed_reason:
+                        print(
+                            f"GRASPGEN_CANDIDATE_REJECT idx={index} grasp={fmt_xyz(grasp)} reason={failed_reason}",
+                            flush=True,
+                        )
+                        failed = True
+                        break
             if failed:
                 self._record_execution_candidate(
                     index=index,
@@ -3268,6 +3715,13 @@ class BananaHandeyePickClient(Node):
                     so101_tabletop_clearance_m=so101_tabletop_clearance,
                     adapter_xyz=adapter_xyz,
                     width_reason=width_reason,
+                    ik_fk_predicted_contact=ik_fk_predicted_contact,
+                    ik_fk_contact_error=ik_fk_contact_error,
+                    ik_fk_contact_residual_x=ik_fk_contact_residual_x,
+                    ik_fk_contact_residual_y=ik_fk_contact_residual_y,
+                    ik_fk_contact_z_error=ik_fk_contact_z_error,
+                    ik_fk_predicted_grasp_mesh_min_z=ik_fk_predicted_grasp_mesh_min_z,
+                    ik_fk_predicted_tabletop_clearance_m=ik_fk_predicted_tabletop_clearance,
                 )
                 continue
 
@@ -3298,6 +3752,13 @@ class BananaHandeyePickClient(Node):
                 so101_tabletop_clearance_m=so101_tabletop_clearance,
                 adapter_xyz=adapter_xyz,
                 width_reason=width_reason,
+                ik_fk_predicted_contact=ik_fk_predicted_contact,
+                ik_fk_contact_error=ik_fk_contact_error,
+                ik_fk_contact_residual_x=ik_fk_contact_residual_x,
+                ik_fk_contact_residual_y=ik_fk_contact_residual_y,
+                ik_fk_contact_z_error=ik_fk_contact_z_error,
+                ik_fk_predicted_grasp_mesh_min_z=ik_fk_predicted_grasp_mesh_min_z,
+                ik_fk_predicted_tabletop_clearance_m=ik_fk_predicted_tabletop_clearance,
                 selected=False,
             )
             accepted.append(
@@ -3309,11 +3770,34 @@ class BananaHandeyePickClient(Node):
                     "quat": quat,
                     "radius": radius,
                     "target_contact": tuple(float(v) for v in target_contact),
-                    "plan_contact": contact,
+                    "target_width_m": width,
+                    "plan_contact": execution_contact,
+                    "ik_fk_predicted_contact": ik_fk_predicted_contact,
+                    "ik_fk_contact_error": ik_fk_contact_error,
+                    "ik_fk_contact_residual_x": ik_fk_contact_residual_x,
+                    "ik_fk_contact_residual_y": ik_fk_contact_residual_y,
+                    "ik_fk_contact_z_error": ik_fk_contact_z_error,
                 }
             )
 
-        self._write_execution_debug_outputs()
+        if self.use_ik_fk_contact_compensation and accepted:
+            accepted.sort(
+                key=lambda item: (
+                    float(item["ik_fk_contact_z_error"]),
+                    math.hypot(
+                        float(item["ik_fk_contact_residual_x"]),
+                        float(item["ik_fk_contact_residual_y"]),
+                    ),
+                )
+            )
+            order = ",".join(
+                f"{int(item['index'])}:z={float(item['ik_fk_contact_z_error']):.4f}"
+                f"/dxy={math.hypot(float(item['ik_fk_contact_residual_x']), float(item['ik_fk_contact_residual_y'])):.4f}"
+                for item in accepted
+            )
+            print(f"IK_FK_CANDIDATE_RANK order={order}", flush=True)
+
+        self._write_execution_debug_outputs(render_previews=False)
         if accepted:
             return accepted
         raise RuntimeError("No GraspGen candidate passed workspace, height, and IK filters")
@@ -3338,6 +3822,7 @@ class BananaHandeyePickClient(Node):
         )
         self.selected_target_contact_ee = tuple(float(v) for v in candidate["target_contact"])
         self.selected_plan_contact_base = tuple(float(v) for v in candidate["plan_contact"])
+        self.selected_target_width_m = float(candidate.get("target_width_m", 0.0))
         self.current_execution_candidate_index = index
         return (
             candidate["approach"],
@@ -3452,14 +3937,15 @@ class BananaHandeyePickClient(Node):
         nanosec = int((seconds - sec) * 1_000_000_000)
         return sec, nanosec
 
-    def check_ik(
+    def solve_ik(
         self,
         label: str,
         xyz: tuple[float, float, float],
         quat_xyzw: tuple[float, float, float, float] | None = None,
-    ) -> tuple[bool, int]:
-        if not self.args.ik_filter or self.ik_client is None:
-            return True, 1
+        start_joint_state: JointState | None = None,
+    ) -> tuple[JointState | None, int]:
+        if self.ik_client is None:
+            return None, -1
 
         request = GetPositionIK.Request()
         request.ik_request.group_name = self.args.ik_group
@@ -3467,6 +3953,8 @@ class BananaHandeyePickClient(Node):
         request.ik_request.pose_stamped.header.frame_id = self.args.base_frame
         request.ik_request.pose_stamped.pose = make_pose(*xyz, quat_xyzw)
         request.ik_request.avoid_collisions = bool(self.args.ik_avoid_collisions)
+        if start_joint_state is not None:
+            request.ik_request.robot_state.joint_state = start_joint_state
         sec, nanosec = self._ik_timeout_duration()
         request.ik_request.timeout.sec = sec
         request.ik_request.timeout.nanosec = nanosec
@@ -3478,9 +3966,12 @@ class BananaHandeyePickClient(Node):
                 f"IK_RESULT label={label} xyz={fmt_xyz(xyz)} quat={fmt_quat(quat_xyzw or (0.0, 0.0, 0.0, 1.0))} ok=False code=timeout",
                 flush=True,
             )
-            return False, -6
+            return None, -6
 
         response = future.result()
+        if response is None:
+            print(f"IK_RESULT label={label} xyz={fmt_xyz(xyz)} ok=False code=no_response", flush=True)
+            return None, -1
         code = int(response.error_code.val)
         ok = code == 1
         print(
@@ -3488,7 +3979,146 @@ class BananaHandeyePickClient(Node):
             f"quat={fmt_quat(quat_xyzw or (0.0, 0.0, 0.0, 1.0))} ok={ok} code={code}",
             flush=True,
         )
-        return ok, code
+        return (response.solution.joint_state if ok else None), code
+
+    def check_ik(
+        self,
+        label: str,
+        xyz: tuple[float, float, float],
+        quat_xyzw: tuple[float, float, float, float] | None = None,
+    ) -> tuple[bool, int]:
+        if not self.args.ik_filter:
+            return True, 1
+        solution, code = self.solve_ik(label, xyz, quat_xyzw)
+        return solution is not None, code
+
+    def compute_fk(
+        self,
+        label: str,
+        joint_state: JointState,
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
+        client = self.fk_client
+        if client is None:
+            raise RuntimeError("FK client is disabled")
+
+        request = GetPositionFK.Request()
+        request.header.frame_id = self.args.base_frame
+        request.fk_link_names = [self.args.ee_frame]
+        request.robot_state.joint_state = joint_state
+        future = client.call_async(request)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=max(1.0, self.args.ik_timeout_s + 1.0))
+        if not future.done():
+            raise RuntimeError(f"FK timed out for {label}")
+        response = future.result()
+        if response is None:
+            raise RuntimeError(f"FK returned no response for {label}")
+        code = int(response.error_code.val)
+        if code != 1 or not response.pose_stamped:
+            raise RuntimeError(f"FK failed for {label}: code={code}")
+
+        pose = response.pose_stamped[0].pose
+        xyz = (float(pose.position.x), float(pose.position.y), float(pose.position.z))
+        quat = (
+            float(pose.orientation.x),
+            float(pose.orientation.y),
+            float(pose.orientation.z),
+            float(pose.orientation.w),
+        )
+        print(f"FK_RESULT label={label} xyz={fmt_xyz(xyz)} quat={fmt_quat(quat)}", flush=True)
+        return xyz, quat
+
+    def predict_contact_from_ik(
+        self,
+        label: str,
+        command_xyz: tuple[float, float, float],
+        quat_xyzw: tuple[float, float, float, float],
+        contact_ee: tuple[float, float, float],
+        start_joint_state: JointState | None = None,
+    ) -> ContactPrediction[IKFKContactPayload]:
+        joint_state, code = self.solve_ik(label, command_xyz, quat_xyzw, start_joint_state)
+        if joint_state is None:
+            raise RuntimeError(f"IK failed for {label}: code={code}")
+        ee_xyz, ee_quat = self.compute_fk(label, joint_state)
+        predicted_contact = self._contact_for_pose(ee_xyz, ee_quat, contact_ee)
+        return ContactPrediction(
+            contact_base=predicted_contact,
+            payload=IKFKContactPayload(
+                joint_state=joint_state,
+                ee_xyz=ee_xyz,
+                ee_quat_xyzw=ee_quat,
+            ),
+        )
+
+    def compensate_contact_xy_with_ik_fk(
+        self,
+        label: str,
+        command_xyz: tuple[float, float, float],
+        quat_xyzw: tuple[float, float, float, float],
+        target_contact_base: tuple[float, float, float],
+        contact_ee: tuple[float, float, float],
+    ):
+        def predict(
+            xyz: tuple[float, float, float],
+            previous_payload: IKFKContactPayload | None,
+        ) -> ContactPrediction[IKFKContactPayload]:
+            return self.predict_contact_from_ik(
+                label,
+                xyz,
+                quat_xyzw,
+                contact_ee,
+                previous_payload.joint_state if previous_payload is not None else None,
+            )
+
+        result = compensate_contact_xy(
+            command_xyz,
+            target_contact_base,
+            predict,
+            tolerance_m=self.args.ik_fk_contact_tolerance,
+            max_iterations=self.args.ik_fk_contact_max_iterations,
+            max_correction_m=self.args.ik_fk_contact_max_correction,
+        )
+        predicted_contact = result.prediction.contact_base
+        full_error = sub_xyz(target_contact_base, predicted_contact)
+        z_error = abs(full_error[2])
+        print(
+            f"IK_FK_CONTACT_COMP label={label} converged={result.converged} reason={result.reason} "
+            f"solves={result.solve_count} initial_x_error={result.initial_residual_x:.4f} "
+            f"initial_y_error={result.initial_residual_y:.4f} "
+            f"correction_x={result.correction_x:.4f} correction_y={result.correction_y:.4f} "
+            f"residual_x={result.residual_x:.4f} residual_y={result.residual_y:.4f} "
+            f"target={fmt_xyz(target_contact_base)} predicted={fmt_xyz(predicted_contact)} "
+            f"full_error={fmt_xyz(full_error)} z_error={z_error:.4f} command={fmt_xyz(result.command_xyz)}",
+            flush=True,
+        )
+        return result
+
+    def ik_fk_contact_guard(
+        self,
+        target_contact_base: tuple[float, float, float],
+        predicted_contact_base: tuple[float, float, float],
+    ) -> tuple[tuple[float, float, float], float, str]:
+        error = sub_xyz(target_contact_base, predicted_contact_base)
+        z_error = abs(error[2])
+        max_correction = float(self.args.ik_fk_contact_max_correction)
+        if abs(error[0]) > max_correction or abs(error[1]) > max_correction:
+            return (
+                error,
+                z_error,
+                f"ik_fk_contact_xy_residual x={error[0]:.4f} y={error[1]:.4f} exceeds {max_correction:.4f}",
+            )
+        if z_error > float(self.args.ik_fk_contact_max_xz_error):
+            return (
+                error,
+                z_error,
+                f"ik_fk_contact_z_error {z_error:.4f} exceeds {float(self.args.ik_fk_contact_max_xz_error):.4f}",
+            )
+        if not self.args.allow_out_of_workspace and predicted_contact_base[2] < float(self.args.min_contact_z):
+            return (
+                error,
+                z_error,
+                f"ik_fk_predicted_contact_z {predicted_contact_base[2]:.4f} < {float(self.args.min_contact_z):.4f}",
+            )
+        return error, z_error, ""
 
     def _xy_offsets(self) -> list[tuple[float, float]]:
         radius = max(0.0, float(self.args.sample_xy_radius))
@@ -3708,10 +4338,12 @@ class BananaHandeyePickClient(Node):
         self,
         grasp: tuple[float, float, float],
         quat_xyzw: tuple[float, float, float, float] | None,
+        planned_contact_base: tuple[float, float, float] | None = None,
     ) -> None:
         if quat_xyzw is None:
             return
-        planned_contact_base = self.planned_contact_for_pose(grasp, quat_xyzw)
+        if planned_contact_base is None:
+            planned_contact_base = self.planned_contact_for_pose(grasp, quat_xyzw)
         self.current_plan_contact_base = planned_contact_base
         self.realign_target_contact_base_by_phase["grasp"] = planned_contact_base
         _, correction, error_norm = self.correction_for_contact_alignment(grasp, planned_contact_base)
@@ -3719,8 +4351,12 @@ class BananaHandeyePickClient(Node):
         warn_xy = max(0.0, float(self.args.grasp_realign_max_xy_error))
         realign_xy = float(self.args.grasp_residual_realign_xy_error)
         abort_xy = float(self.args.grasp_residual_abort_xy_error)
-        action = "continue_without_low_height_xy_realign"
-        if warn_xy > 0.0 and xy_error > warn_xy:
+        action = "log_only_continue_without_low_height_xy_realign"
+        if abort_xy > 0.0 and xy_error > abort_xy:
+            action = "log_only_abort_threshold_exceeded"
+        elif realign_xy > 0.0 and xy_error > realign_xy:
+            action = "log_only_realign_threshold_exceeded"
+        elif warn_xy > 0.0 and xy_error > warn_xy:
             action = "warn_continue"
         print(
             f"CONTACT_REALIGN_CHECK phase=grasp error={fmt_xyz(correction)} "
@@ -3774,6 +4410,75 @@ class BananaHandeyePickClient(Node):
             selected["lift"] = _json_xyz(lift)
             if contact_tuple is not None and quat is not None:
                 selected["lift_contact_base"] = _json_xyz(self._contact_for_pose(lift, quat, contact_tuple))
+
+    def update_selected_ik_fk_compensation(
+        self,
+        result,
+        target_contact_base: tuple[float, float, float],
+        predicted_mesh_min_z: float | None,
+        predicted_tabletop_clearance: float | None,
+    ) -> None:
+        selected = next((record for record in self.execution_debug_records if record.get("selected")), None)
+        if selected is None:
+            return
+        payload = result.prediction.payload
+        compensation_record: dict[str, object] = {
+            "converged": bool(result.converged),
+            "reason": result.reason,
+            "solve_count": int(result.solve_count),
+            "initial_residual_x": round(float(result.initial_residual_x), 6),
+            "initial_residual_y": round(float(result.initial_residual_y), 6),
+            "correction_x": round(float(result.correction_x), 6),
+            "correction_y": round(float(result.correction_y), 6),
+            "residual_x": round(float(result.residual_x), 6),
+            "residual_y": round(float(result.residual_y), 6),
+            "target_contact_base": _json_xyz(target_contact_base),
+            "command_grasp": _json_xyz(result.command_xyz),
+            "predicted_gripper_base": _json_xyz(payload.ee_xyz),
+            "predicted_gripper_quat_xyzw": _json_quat(payload.ee_quat_xyzw),
+            "predicted_contact_base": _json_xyz(result.prediction.contact_base),
+            "joint_names": [str(name) for name in payload.joint_state.name],
+            "joint_positions": [round(float(value), 6) for value in payload.joint_state.position],
+        }
+        if predicted_mesh_min_z is not None:
+            compensation_record["predicted_mesh_min_z"] = round(float(predicted_mesh_min_z), 6)
+        if predicted_tabletop_clearance is not None:
+            compensation_record["predicted_tabletop_clearance_m"] = round(float(predicted_tabletop_clearance), 6)
+        selected["ik_fk_compensation"] = compensation_record
+
+    def validate_ik_fk_grasp_geometry(
+        self,
+        payload: IKFKContactPayload,
+        *,
+        width: float | None = None,
+        label: str = "final",
+    ) -> tuple[float | None, float | None]:
+        if width is None:
+            selected = next((record for record in self.execution_debug_records if record.get("selected")), None)
+            width_value = selected.get("target_width_m") if selected is not None else None
+            width = float(width_value) if isinstance(width_value, int | float) else None
+        mesh_min_z = self._so101_gripper_mesh_min_z(payload.ee_xyz, payload.ee_quat_xyzw, width)
+        tabletop_clearance = self._so101_tabletop_clearance(
+            payload.ee_xyz,
+            payload.ee_xyz,
+            payload.ee_quat_xyzw,
+            width,
+        )
+        clearance_text = "n/a" if tabletop_clearance is None else f"{tabletop_clearance:.4f}"
+        mesh_min_z_text = "n/a" if mesh_min_z is None else f"{mesh_min_z:.4f}"
+        print(
+            f"IK_FK_GEOMETRY_CHECK label={label} mesh_min_z={mesh_min_z_text} tabletop_clearance={clearance_text}",
+            flush=True,
+        )
+        if self.args.so101_tabletop_filter:
+            if tabletop_clearance is None:
+                raise RuntimeError("SO101 tabletop clearance is unavailable for the IK/FK-predicted grasp")
+            if tabletop_clearance < float(self.args.so101_tabletop_clearance):
+                raise RuntimeError(
+                    f"IK/FK-predicted SO101 tabletop clearance {tabletop_clearance:.4f} "
+                    f"< {float(self.args.so101_tabletop_clearance):.4f}"
+                )
+        return mesh_min_z, tabletop_clearance
 
     def realign_contact(
         self,
@@ -3926,20 +4631,26 @@ class BananaHandeyePickClient(Node):
 
         target_minus_gripper = sub_xyz(target_base, actual_xyz)
         target_minus_contact = sub_xyz(target_base, actual_contact)
-        self.observed_target_base = target_base
+        target_minus_contact_norm = norm_xyz(target_minus_contact)
+        plausibility_limit = max(0.0, float(self.args.pick_diagnostics_max_target_contact_distance))
+        plausible = plausibility_limit <= 0.0 or target_minus_contact_norm <= plausibility_limit
+        if plausible:
+            self.observed_target_base = target_base
         record["target_detection"] = {
             "success": True,
+            "plausible": plausible,
             "target_base": _json_xyz(target_base),
             "target_minus_gripper": _json_xyz(target_minus_gripper),
             "target_minus_gripper_norm": round(norm_xyz(target_minus_gripper), 6),
             "target_minus_contact": _json_xyz(target_minus_contact),
-            "target_minus_contact_norm": round(norm_xyz(target_minus_contact), 6),
+            "target_minus_contact_norm": round(target_minus_contact_norm, 6),
+            "max_target_contact_distance": round(plausibility_limit, 6),
         }
         self.pick_diagnostic_records.append(record)
         print(
-            f"PICK_DIAG_TARGET label={label} success=True target_base={fmt_xyz(target_base)} "
+            f"PICK_DIAG_TARGET label={label} success=True plausible={plausible} target_base={fmt_xyz(target_base)} "
             f"target_minus_gripper={fmt_xyz(target_minus_gripper)} gripper_norm={norm_xyz(target_minus_gripper):.4f} "
-            f"target_minus_contact={fmt_xyz(target_minus_contact)} contact_norm={norm_xyz(target_minus_contact):.4f}",
+            f"target_minus_contact={fmt_xyz(target_minus_contact)} contact_norm={target_minus_contact_norm:.4f}",
             flush=True,
         )
 
@@ -3962,7 +4673,12 @@ class BananaHandeyePickClient(Node):
                 flush=True,
             )
 
-        if self.args.pick_diagnostics or self.args.contact_realign:
+        if (
+            self.args.pick_diagnostics
+            or self.args.contact_realign
+            or self.use_ik_fk_contact_compensation
+            or self.use_grasp_verification
+        ):
             task_id = "banana_graspgen_pick" if self.args.target_source == "graspgen" else "banana_tcp_compensated_pick"
             task_desc = (
                 "pick target with GraspGen 6-DOF pose"
@@ -4024,15 +4740,97 @@ class BananaHandeyePickClient(Node):
                 detect_target=False,
             )
 
-            ok = self.run_task(
-                f"{task_id}_grasp",
-                f"{task_desc}: grasp",
-                [make_move_step("descend_to_graspgen_pose_no_realign", grasp, self.args.descend_speed, move_quat)],
-            )
+            grasp_diagnostic_xyz = grasp
+            grasp_diagnostic_quat = move_quat
+            planned_grasp_contact = None
+            if self.use_ik_fk_contact_compensation and move_quat is not None:
+                if self.selected_plan_contact_base is None or self.selected_target_contact_ee is None:
+                    raise PickExecutionError(
+                        "IK/FK contact compensation is missing the selected target contact",
+                        phase="grasp_compensation",
+                        retryable=True,
+                    )
+                planned_grasp_contact = self.selected_plan_contact_base
+                try:
+                    result = self.compensate_contact_xy_with_ik_fk(
+                        f"graspgen_{self.current_execution_candidate_index}_final",
+                        grasp,
+                        move_quat,
+                        planned_grasp_contact,
+                        self.selected_target_contact_ee,
+                    )
+                except RuntimeError as exc:
+                    raise PickExecutionError(
+                        f"IK/FK contact compensation solver failed: {exc}",
+                        phase="grasp_compensation",
+                        retryable=True,
+                    ) from exc
+                if not result.converged:
+                    raise PickExecutionError(
+                        f"IK/FK contact compensation failed: {result.reason}, "
+                        f"residual_x={result.residual_x:.4f} residual_y={result.residual_y:.4f}",
+                        phase="grasp_compensation",
+                        retryable=True,
+                    )
+
+                _, _, contact_guard_reason = self.ik_fk_contact_guard(
+                    planned_grasp_contact,
+                    result.prediction.contact_base,
+                )
+                if contact_guard_reason:
+                    raise PickExecutionError(
+                        f"IK/FK compensated contact rejected: {contact_guard_reason}",
+                        phase="grasp_compensation",
+                        retryable=True,
+                    )
+
+                lift = (lift[0] + result.correction_x, lift[1] + result.correction_y, lift[2])
+                grasp = result.command_xyz
+                payload = result.prediction.payload
+                try:
+                    predicted_mesh_min_z, predicted_tabletop_clearance = self.validate_ik_fk_grasp_geometry(payload)
+                except RuntimeError as exc:
+                    raise PickExecutionError(
+                        f"IK/FK grasp geometry rejected: {exc}",
+                        phase="grasp_compensation",
+                        retryable=True,
+                    ) from exc
+                grasp_diagnostic_xyz = payload.ee_xyz
+                grasp_diagnostic_quat = payload.ee_quat_xyzw
+                self.realign_target_contact_base_by_phase["grasp"] = planned_grasp_contact
+                self.current_plan_contact_base = planned_grasp_contact
+                self.update_selected_execution_pose(grasp=grasp, lift=lift, quat_xyzw=move_quat)
+                self.update_selected_ik_fk_compensation(
+                    result,
+                    planned_grasp_contact,
+                    predicted_mesh_min_z,
+                    predicted_tabletop_clearance,
+                )
+                self._write_execution_debug_outputs(render_previews=False)
+                ok = self.run_joint_configuration(
+                    "descend_to_ik_fk_compensated_grasp",
+                    payload.joint_state,
+                    self.args.descend_speed,
+                )
+            else:
+                ok = self.run_task(
+                    f"{task_id}_grasp",
+                    f"{task_desc}: grasp",
+                    [make_move_step("descend_to_graspgen_pose_no_realign", grasp, self.args.descend_speed, move_quat)],
+                )
             if not ok:
                 raise PickExecutionError("Pick task failed during grasp", phase="grasp", retryable=True)
-            self.log_grasp_contact_residual(grasp, move_quat)
-            self.sample_pick_diagnostics("grasp", grasp, commanded_quat_xyzw=move_quat, detect_target=True)
+            self.log_grasp_contact_residual(
+                grasp_diagnostic_xyz,
+                grasp_diagnostic_quat,
+                planned_contact_base=planned_grasp_contact,
+            )
+            self.sample_pick_diagnostics(
+                "grasp",
+                grasp_diagnostic_xyz,
+                commanded_quat_xyzw=grasp_diagnostic_quat,
+                detect_target=True,
+            )
 
             ok = self.run_task(
                 f"{task_id}_close",
@@ -4044,12 +4842,55 @@ class BananaHandeyePickClient(Node):
             )
             if not ok:
                 raise PickExecutionError("Pick task failed during close", phase="close", retryable=False)
+            try:
+                self.verify_grasp_retention("close")
+            except PickExecutionError:
+                if self.args.recover_after_close_failure:
+                    self.recover_after_close_failure(
+                        task_id=task_id,
+                        task_desc=task_desc,
+                        grasp=grasp,
+                        pregrasp=pregrasp,
+                        quat_xyzw=move_quat,
+                    )
+                else:
+                    print("CLOSE_FAILURE_RECOVERY enabled=False", flush=True)
+                raise
             self.sample_pick_diagnostics(
                 "close",
-                grasp,
-                commanded_quat_xyzw=move_quat,
+                grasp_diagnostic_xyz,
+                commanded_quat_xyzw=grasp_diagnostic_quat,
                 detect_target=True,
             )
+
+            probe_height = max(0.0, float(self.args.grasp_verification_probe_lift_height))
+            probe_lift = None
+            if self.use_grasp_verification and probe_height > 0.0 and lift[2] > grasp[2] + 1e-6:
+                probe_z = min(lift[2], grasp[2] + probe_height)
+                if probe_z < lift[2] - 1e-6:
+                    probe_lift = (lift[0], lift[1], probe_z)
+            if probe_lift is not None:
+                ok = self.run_task(
+                    f"{task_id}_probe_lift",
+                    f"{task_desc}: slow retention-check lift",
+                    [
+                        make_move_step(
+                            "probe_lift_target",
+                            probe_lift,
+                            self.args.grasp_verification_probe_lift_speed,
+                            move_quat,
+                        )
+                    ],
+                )
+                if not ok:
+                    raise PickExecutionError("Pick task failed during probe lift", phase="probe_lift", retryable=False)
+                self.verify_grasp_retention("probe_lift")
+                self.sample_pick_diagnostics(
+                    "probe_lift",
+                    probe_lift,
+                    commanded_quat_xyzw=move_quat,
+                    detect_target=False,
+                )
 
             ok = self.run_task(
                 f"{task_id}_lift",
@@ -4058,6 +4899,7 @@ class BananaHandeyePickClient(Node):
             )
             if not ok:
                 raise PickExecutionError("Pick task failed during lift", phase="lift", retryable=False)
+            self.verify_grasp_retention("lift")
             self.sample_pick_diagnostics(
                 "lift",
                 lift,
@@ -4099,6 +4941,8 @@ class BananaHandeyePickClient(Node):
             self.current_execution_candidate_index = index
             self.selected_target_contact_ee = tuple(float(v) for v in candidate["target_contact"])
             self.selected_plan_contact_base = tuple(float(v) for v in candidate["plan_contact"])
+            self.selected_target_width_m = float(candidate.get("target_width_m", 0.0))
+            self.current_grasp_verified = False
             self.realign_target_contact_base_by_phase = {}
             self.mark_execution_candidate_attempt(
                 index,
@@ -4106,7 +4950,7 @@ class BananaHandeyePickClient(Node):
                 stage="selected",
                 reason=f"execution_attempt_{attempt}",
             )
-            self._write_execution_debug_outputs()
+            self._write_execution_debug_outputs(render_previews=False)
             print(
                 f"GRASPGEN_EXECUTION_ATTEMPT attempt={attempt} idx={index} "
                 f"approach={fmt_xyz(candidate['approach'])} grasp={fmt_xyz(candidate['grasp'])}",
@@ -4123,13 +4967,21 @@ class BananaHandeyePickClient(Node):
                     index,
                     selected=True,
                     stage="selected",
-                    reason=f"executed_successfully_attempt_{attempt}",
+                    reason=(
+                        "selected_detect_only"
+                        if self.args.detect_only
+                        else (
+                            f"grasp_verified_successfully_attempt_{attempt}"
+                            if self.current_grasp_verified
+                            else f"motion_completed_without_verification_attempt_{attempt}"
+                        )
+                    ),
                 )
                 return
             except PickExecutionError as exc:
                 last_error = exc
                 self.mark_execution_candidate_failed(index, exc.phase, str(exc))
-                self._write_execution_debug_outputs()
+                self._write_execution_debug_outputs(render_previews=False)
                 residual_retry_disabled = exc.phase == "grasp_residual" and not self.args.retry_after_grasp_residual
                 has_next_candidate = attempt < len(attempt_candidates)
                 will_retry = bool(exc.retryable and not residual_retry_disabled and has_next_candidate)
