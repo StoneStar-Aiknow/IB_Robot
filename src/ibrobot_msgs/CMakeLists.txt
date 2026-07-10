@@ -43,6 +43,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/PrimitiveCommand.action"
   "srv/RecognizeFile.srv"
   "srv/SetHotwords.srv"
+  "srv/MoveToConfiguration.srv"
   "srv/MoveToPose.srv"
   "srv/ValidateSkill.srv"
   "srv/ValidatePrimitive.srv"

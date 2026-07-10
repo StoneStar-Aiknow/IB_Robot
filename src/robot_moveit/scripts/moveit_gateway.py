@@ -11,6 +11,7 @@ ROS Interfaces:
         /moveit_gateway/motion_status (std_msgs/String) — "idle" | "executing" | "succeeded" | "failed"
     Services:
         /moveit_gateway/move_to_pose (ibrobot_msgs/MoveToPose) — synchronous move (blocks until done)
+        /moveit_gateway/move_to_configuration (ibrobot_msgs/MoveToConfiguration) — execute a validated IK solution
 """
 
 import math
@@ -28,11 +29,11 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Header, String
 
 try:
-    from ibrobot_msgs.srv import MoveToPose
+    from ibrobot_msgs.srv import MoveToConfiguration, MoveToPose
 
-    _HAS_MOVE_TO_POSE_SRV = True
+    _HAS_MOVE_SERVICES = True
 except ImportError:
-    _HAS_MOVE_TO_POSE_SRV = False
+    _HAS_MOVE_SERVICES = False
 
 # TF2 and MoveIt 2 imports
 import tf2_ros
@@ -107,7 +108,7 @@ class MoveItGateway(Node):
         self._motion_status = "idle"
 
         # 7. MoveToPose service (synchronous move, used by task_dispatch)
-        if _HAS_MOVE_TO_POSE_SRV:
+        if _HAS_MOVE_SERVICES:
             self.move_to_pose_srv = self.create_service(
                 MoveToPose,
                 "/moveit_gateway/move_to_pose",
@@ -115,9 +116,16 @@ class MoveItGateway(Node):
                 callback_group=self.callback_group,
             )
             self.get_logger().info("MoveToPose service registered")
+            self.move_to_configuration_srv = self.create_service(
+                MoveToConfiguration,
+                "/moveit_gateway/move_to_configuration",
+                self._move_to_configuration_service_cb,
+                callback_group=self.callback_group,
+            )
+            self.get_logger().info("MoveToConfiguration service registered")
         else:
             self.get_logger().warn(
-                "ibrobot_msgs.srv.MoveToPose not available — service disabled (rebuild ibrobot_msgs to enable)"
+                "ibrobot_msgs motion services not available — services disabled (rebuild ibrobot_msgs to enable)"
             )
 
         self.timer = self.create_timer(0.1, self.publish_ee_pose, callback_group=self.callback_group)
@@ -534,48 +542,15 @@ class MoveItGateway(Node):
             f"[Service] MoveToPose request: ({target.position.x:.3f}, {target.position.y:.3f}, {target.position.z:.3f})"
         )
         self._publish_motion_status("executing")
+        if self.moveit2 is not None:
+            self.moveit2.motion_suceeded = False
 
         try:
             # Apply the same 5-DOF orientation strategies as cmd_pose_callback
             success = self._move_with_strategies(target.position, target.orientation)
             if success:
-                # Poll execution state instead of calling wait_until_executed(),
-                # which uses rclpy.spin_once() and deadlocks under MultiThreadedExecutor.
-                is_executing_attr = "_MoveIt2__is_executing"
-                is_requested_attr = "_MoveIt2__is_motion_requested"
-
-                # Phase 1: Wait for motion to actually start (goal accepted)
-                start_timeout = 5.0
-                t_start = time.time()
-                while time.time() - t_start < start_timeout:
-                    if getattr(self.moveit2, is_executing_attr, False):
-                        break
-                    if not getattr(self.moveit2, is_requested_attr, False):
-                        break
-                    time.sleep(0.05)
-
-                # Phase 2: Wait for motion to complete
-                exec_timeout = 30.0
-                t_exec = time.time()
-                while time.time() - t_exec < exec_timeout:
-                    if not getattr(self.moveit2, is_executing_attr, False):
-                        break
-                    time.sleep(0.1)
-
-                total_exec = time.time() - t_start
-                if total_exec >= exec_timeout:
-                    self.get_logger().warn(f"[Service] MoveToPose execution timed out after {total_exec:.1f}s")
-                    response.success = False
-                    response.message = f"Execution timed out after {total_exec:.1f}s"
-                    self._publish_motion_status("failed")
-                elif self.moveit2.motion_suceeded:
-                    response.success = True
-                    response.message = "Motion completed"
-                    self._publish_motion_status("succeeded")
-                else:
-                    response.success = False
-                    response.message = "Motion execution failed (MoveIt reported unsuccessful)"
-                    self._publish_motion_status("failed")
+                response.success, response.message = self._wait_for_motion_completion("MoveToPose")
+                self._publish_motion_status("succeeded" if response.success else "failed")
             else:
                 response.success = False
                 response.message = "IK/planning failed"
@@ -595,6 +570,114 @@ class MoveItGateway(Node):
             f"[Service] MoveToPose result: success={response.success}, time={response.execution_time_s:.1f}s"
         )
         return response
+
+    def _move_to_configuration_service_cb(self, request, response):
+        """Plan and execute a caller-provided IK solution without re-solving IK."""
+        t0 = time.time()
+        self._publish_motion_status("executing")
+        previous_velocity = None
+        if self.moveit2 is not None:
+            self.moveit2.motion_suceeded = False
+
+        try:
+            target = request.target_joint_state
+            if len(target.name) != len(target.position):
+                raise ValueError(
+                    f"target_joint_state name/position length mismatch: {len(target.name)} != {len(target.position)}"
+                )
+            if len(set(target.name)) != len(target.name):
+                raise ValueError("target_joint_state contains duplicate joint names")
+            positions_by_name = {
+                str(name): float(position) for name, position in zip(target.name, target.position, strict=False)
+            }
+            missing = [name for name in self.joint_names if name not in positions_by_name]
+            if missing:
+                raise ValueError(f"target_joint_state is missing arm joints: {missing}")
+
+            joint_positions = [positions_by_name[name] for name in self.joint_names]
+            if not all(math.isfinite(position) for position in joint_positions):
+                raise ValueError("target_joint_state contains non-finite positions")
+
+            velocity_scaling = float(request.velocity_scaling)
+            if not math.isfinite(velocity_scaling) or not 0.0 <= velocity_scaling <= 1.0:
+                raise ValueError("velocity_scaling must be finite and within [0.0, 1.0]")
+            if self.moveit2 is not None and velocity_scaling > 0.0:
+                previous_velocity = self.moveit2.max_velocity
+                self.moveit2.max_velocity = max(velocity_scaling, 0.001)
+
+            self.get_logger().info(
+                f"[Service] MoveToConfiguration request: joints={self.joint_names} positions={joint_positions}"
+            )
+            success = self.move_to_joint(joint_positions)
+            if success:
+                response.success, response.message = self._wait_for_motion_completion("MoveToConfiguration")
+            else:
+                response.success = False
+                response.message = "Joint planning failed"
+
+            self._publish_motion_status("succeeded" if response.success else "failed")
+        except Exception as e:
+            response.success = False
+            response.message = f"Exception: {e}"
+            self.get_logger().error(f"[Service] MoveToConfiguration exception: {e}")
+            self._publish_motion_status("failed")
+        finally:
+            if self.moveit2 is not None and previous_velocity is not None:
+                self.moveit2.max_velocity = previous_velocity
+
+        response.execution_time_s = time.time() - t0
+        time.sleep(0.3)
+        self._publish_motion_status("idle")
+        self.get_logger().info(
+            f"[Service] MoveToConfiguration result: success={response.success}, time={response.execution_time_s:.1f}s"
+        )
+        return response
+
+    def _wait_for_motion_completion(self, service_name: str) -> tuple[bool, str]:
+        """Wait for the asynchronous MoveIt action started by a service callback."""
+        moveit2 = self.moveit2
+        if moveit2 is None:
+            return False, "MoveIt2 engine not ready"
+
+        is_executing_attr = "_MoveIt2__is_executing"
+        is_requested_attr = "_MoveIt2__is_motion_requested"
+
+        start_timeout = 5.0
+        t_start = time.time()
+        request_observed = False
+        while time.time() - t_start < start_timeout:
+            is_executing = getattr(moveit2, is_executing_attr, False)
+            is_requested = getattr(moveit2, is_requested_attr, False)
+            request_observed = request_observed or is_requested or is_executing
+            if is_executing:
+                break
+            if not is_requested:
+                break
+            time.sleep(0.05)
+
+        if getattr(moveit2, is_requested_attr, False) and not getattr(moveit2, is_executing_attr, False):
+            return False, f"Motion request did not start within {start_timeout:.1f}s"
+        if not request_observed and not moveit2.motion_suceeded:
+            return False, "Motion request was not started"
+
+        exec_timeout = 30.0
+        t_exec = time.time()
+        while time.time() - t_exec < exec_timeout:
+            if not getattr(moveit2, is_executing_attr, False):
+                break
+            time.sleep(0.1)
+
+        execution_time = time.time() - t_exec
+        if getattr(moveit2, is_executing_attr, False):
+            moveit2.cancel_execution()
+            self.get_logger().warn(f"[Service] {service_name} execution timed out after {execution_time:.1f}s")
+            return False, f"Execution timed out after {execution_time:.1f}s"
+        if moveit2.motion_suceeded:
+            error_code = moveit2.get_last_execution_error_code()
+            if error_code is not None and int(error_code.val) != 1:
+                return False, f"Motion execution failed with MoveIt error code {int(error_code.val)}"
+            return True, "Motion completed"
+        return False, "Motion execution failed (MoveIt reported unsuccessful)"
 
     def solve_and_move(self, target_pose, orientation_tolerance=None):
         """
