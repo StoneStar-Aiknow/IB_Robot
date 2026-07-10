@@ -117,6 +117,9 @@ def _diagnostic_to_lines(diag: GraspDiagnostic, *, detection_confidence: float |
             f"object_prismatic_extrude_enabled: {diag.object_prismatic_extrude_enabled}",
             f"object_prismatic_extrude_added_count: {diag.object_prismatic_extrude_added_count}",
             f"object_point_count_graspgen_input: {diag.object_point_count_graspgen_input}",
+            f"scene_cloud_table_holes_enabled: {diag.scene_cloud_table_holes_enabled}",
+            f"scene_point_count_raw: {diag.scene_point_count_raw}",
+            f"scene_table_hole_added_count: {diag.scene_table_hole_added_count}",
             f"object_point_count: {diag.object_point_count}",
             f"scene_point_count: {diag.scene_point_count}",
             f"raw_grasp_count: {diag.raw_grasp_count}",
@@ -161,6 +164,9 @@ def _diagnostic_to_dict(diag: GraspDiagnostic, *, detection_confidence: float | 
         "object_prismatic_extrude_enabled": bool(diag.object_prismatic_extrude_enabled),
         "object_prismatic_extrude_added_count": int(diag.object_prismatic_extrude_added_count),
         "object_point_count_graspgen_input": int(diag.object_point_count_graspgen_input),
+        "scene_cloud_table_holes_enabled": bool(diag.scene_cloud_table_holes_enabled),
+        "scene_point_count_raw": int(diag.scene_point_count_raw),
+        "scene_table_hole_added_count": int(diag.scene_table_hole_added_count),
         "object_point_count": int(diag.object_point_count),
         "scene_point_count": int(diag.scene_point_count),
         "raw_grasp_count": int(diag.raw_grasp_count),
@@ -748,6 +754,8 @@ class GraspPlannerNode(Node):
         self.declare_parameter("enable_object_cloud_prismatic_extrude", True)
         self.declare_parameter("object_cloud_prismatic_extrude_max_points", 8000)
         self.declare_parameter("object_cloud_prismatic_extrude_layers", 8)
+        self.declare_parameter("enable_scene_cloud_table_holes", True)
+        self.declare_parameter("scene_cloud_table_holes_max_points", 8000)
         self.declare_parameter("input_buffer_size", 30)
         self.declare_parameter("sync_max_age_sec", 0.20)
         self.declare_parameter("save_debug_outputs", False)
@@ -1049,7 +1057,7 @@ class GraspPlannerNode(Node):
             np.array([[0, 200, 255]], dtype=np.uint8),
             (len(object_graspgen_input_pts), 1),
         )
-        scene_pts_raw_count = len(scene_pts)
+        scene_pts_raw_count = int(diagnostic.scene_point_count_raw) or len(scene_pts)
         scene_pts = _debug_points_or_fallback(diagnostic.scene_pc_after_completion, scene_pts)
         scene_colors = _scene_stage_colors(len(scene_pts), scene_pts_raw_count)
 
@@ -1318,6 +1326,12 @@ class GraspPlannerNode(Node):
                 ),
                 object_cloud_prismatic_extrude_layers=int(
                     self.get_parameter("object_cloud_prismatic_extrude_layers").get_parameter_value().integer_value
+                ),
+                enable_scene_cloud_table_holes=self.get_parameter("enable_scene_cloud_table_holes")
+                .get_parameter_value()
+                .bool_value,
+                scene_cloud_table_holes_max_points=int(
+                    self.get_parameter("scene_cloud_table_holes_max_points").get_parameter_value().integer_value
                 ),
             )
         except Exception as exc:

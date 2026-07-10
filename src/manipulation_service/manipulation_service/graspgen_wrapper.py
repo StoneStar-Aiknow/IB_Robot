@@ -78,6 +78,9 @@ class GraspDiagnostic:
     object_pc_raw: np.ndarray | None = None
     object_pc_after_completion: np.ndarray | None = None
     object_pc_inference_input: np.ndarray | None = None
+    scene_cloud_table_holes_enabled: bool = False
+    scene_point_count_raw: int = 0
+    scene_table_hole_added_count: int = 0
     scene_pc_after_completion: np.ndarray | None = None
     object_point_count: int = 0
     scene_point_count: int = 0
@@ -571,13 +574,19 @@ def complete_scene_cloud_table_holes(
     ransac_min_inlier_ratio: float = 0.10,
     seed: int = 0,
 ) -> np.ndarray:
-    """Fill table discontinuities around the target footprint.
+    """Generate table points around the target footprint.
 
     Fits the table plane from scene points via RANSAC unless ``table_plane`` is
     provided, projects table-near points onto a 2D tangent-space grid, then
-    fills empty cells inside the target footprint. This covers:
+    fills empty cells when no footprint is provided. With ``footprint_points``,
+    it intentionally emits a dense local table patch inside the dilated target
+    footprint, not only empty cells. These generated patch points may be added
+    to the scene cloud and used by collision/tabletop filters.
+
+    This covers:
     - Object occlusion (table hidden under the object)
     - Sensor depth holes (reflective/dark surfaces)
+    - Local execution/debug table context near the target footprint
     Returns points in the same frame as ``scene_points``.
     """
 
@@ -787,6 +796,8 @@ class GraspGenWrapper:
         enable_object_cloud_prismatic_extrude: bool = False,
         object_cloud_prismatic_extrude_max_points: int = 8000,
         object_cloud_prismatic_extrude_layers: int = 8,
+        enable_scene_cloud_table_holes: bool = False,
+        scene_cloud_table_holes_max_points: int = 8000,
     ) -> tuple[list[GraspCandidate], GraspDiagnostic]:
         from grasp_gen.grasp_server import GraspGenSampler as _GS
         from grasp_gen.utils.point_cloud_utils import (
@@ -856,6 +867,7 @@ class GraspGenWrapper:
         diag.object_point_count = len(object_pc)
         diag.object_point_count_raw = len(object_pc)
         diag.scene_point_count = len(scene_pc) if scene_pc is not None else 0
+        diag.scene_point_count_raw = diag.scene_point_count
         diag.object_pc_raw = object_pc.astype(np.float32, copy=True)
         logger.info("Point clouds: scene=%d, object=%d", diag.scene_point_count, diag.object_point_count)
 
@@ -928,17 +940,20 @@ class GraspGenWrapper:
             )
         diag.object_pc_after_completion = object_pc_shell.astype(np.float32, copy=True)
 
-        # Fill holes in the table surface itself (scene cloud completion).
+        # Optionally generate a local dense table patch around the target footprint.
+        diag.scene_cloud_table_holes_enabled = bool(enable_scene_cloud_table_holes)
         if scene_pc is not None and len(scene_pc) > 0:
-            scene_hole_pts = complete_scene_cloud_table_holes(
-                scene_pc,
-                footprint_points=object_pc,
-                table_plane=shared_table,
-                max_added_points=int(object_cloud_prismatic_extrude_max_points),
-            )
-            if len(scene_hole_pts):
-                scene_pc = np.vstack([scene_pc, scene_hole_pts.astype(scene_pc.dtype, copy=False)])
-                logger.info("Scene cloud table-hole fill: added=%d total=%d", len(scene_hole_pts), len(scene_pc))
+            if enable_scene_cloud_table_holes:
+                scene_hole_pts = complete_scene_cloud_table_holes(
+                    scene_pc,
+                    footprint_points=object_pc,
+                    table_plane=shared_table,
+                    max_added_points=int(scene_cloud_table_holes_max_points),
+                )
+                if len(scene_hole_pts):
+                    scene_pc = np.vstack([scene_pc, scene_hole_pts.astype(scene_pc.dtype, copy=False)])
+                    logger.info("Scene cloud table patch: added=%d total=%d", len(scene_hole_pts), len(scene_pc))
+                diag.scene_table_hole_added_count = int(len(scene_hole_pts))
             diag.scene_point_count = int(len(scene_pc))
             diag.scene_pc_after_completion = scene_pc.astype(np.float32, copy=True)
 

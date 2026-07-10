@@ -197,9 +197,12 @@ class GraspVerifierNode(Node):
         if wait_s > 0.0:
             time.sleep(wait_s)
 
-        input_data, gripper_joint_note = self._build_input(
-            expected_target_width_m=float(request.expected_target_width_m)
-        )
+        expected_target_width_m = float(request.expected_target_width_m)
+        grasp_target_width_m = float(getattr(request.grasp, "target_width_m", 0.0))
+        if expected_target_width_m <= 0.0 and grasp_target_width_m > 0.0:
+            expected_target_width_m = grasp_target_width_m
+
+        input_data, gripper_joint_note = self._build_input(expected_target_width_m=expected_target_width_m)
         result = evaluate_grasp(input_data, weights=self._verification_weights())
 
         response.success = bool(result.success)
@@ -299,7 +302,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

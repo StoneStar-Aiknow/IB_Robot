@@ -58,6 +58,36 @@
 | `objects_json` | `string` | 检测到的物体列表（JSON） |
 | `error_message` | `string` | 失败时的错误信息 |
 
+### `Detection2D.msg`
+
+二维检测、mask 和由深度反投影得到的 3D 目标几何信息。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `header` | `std_msgs/Header` | 目标检测所在相机坐标系和时间戳 |
+| `label` | `string` | 检测类别或文本 prompt 匹配标签 |
+| `confidence` | `float32` | 检测置信度 |
+| `bbox` | `float32[4]` | 像素坐标 `[x_min, y_min, x_max, y_max]` |
+| `mask` | `sensor_msgs/Image` | `mono8` 二值分割 mask，与输入图像同尺寸 |
+| `centroid_xyz` | `geometry_msgs/Point` | mask 内有效深度点的可见表面均值，单位米 |
+| `volume_centroid_xyz` | `geometry_msgs/Point` | 凸包体积质心，退化或 SciPy 不可用时回退到 `centroid_xyz` 语义 |
+| `volume_m3` | `float32` | 凸包体积，`0.0` 表示点数不足、几何退化或无法计算体积质心 |
+| `point_count` | `int32` | mask 内有效深度点数量 |
+
+### `GraspCandidate.msg`
+
+机器人无关的抓取候选，用于 manipulation service 与执行脚本之间传递 GraspGen 结果。
+
+| 字段 | 说明 |
+| --- | --- |
+| `header` | 候选所在相机坐标系和时间戳 |
+| `pose_matrix` | 4x4 row-major 抓取位姿矩阵 |
+| `confidence` | GraspGen 候选置信度 |
+| `collision_free` | GraspGen source gripper 碰撞过滤结果 |
+| `target_width_m` | 从目标点云估计的抓取方向宽度，`0.0` 表示不可用 |
+| `target_width_quality` | 宽度估计质量，范围通常为 `0.0` 到 `1.0` |
+| `width_axis_camera` | 宽度估计轴在相机坐标系下的单位方向 |
+
 ### `RobotStatus.msg`
 
 机器人当前状态汇报，包含末端位姿、关节状态和控制模式信息。
@@ -139,6 +169,54 @@ Episode 录制控制接口，由 `dataset_tools` 的录制服务提供。
 
 ## 3. 服务定义（srv/）
 
+### `PlanGrasp.srv`
+
+GraspGen 抓取规划服务，通常由 `grasp_planner_node` 提供，路径 `/grasp_planner/plan_grasp`。
+
+**请求**
+
+| 字段 | 说明 |
+| --- | --- |
+| `text_prompt` | 目标文本 prompt，传给检测/分割服务 |
+| `confidence_threshold` | 检测置信度阈值 |
+| `grasp_threshold` | GraspGen discriminator 阈值 |
+| `debug_output_mode` | `default`/空字符串沿用节点参数，`none` 不写文件，`diagnostic` 只写 JSON，`full` 写 JSON、PLY 和预览 |
+
+**响应**
+
+| 字段 | 说明 |
+| --- | --- |
+| `grasps` | 抓取候选数组，候选位姿位于相机坐标系 |
+| `inference_time_ms` | 规划耗时，单位毫秒 |
+| `success` | 是否成功生成可用候选 |
+| `message` | 失败原因或成功摘要 |
+| `debug_output_dir` | 本次请求写出的调试目录；未写文件时为空 |
+| `diagnostic_details` | 稳定的 `key: value` 诊断行，包含 mask/depth、补全、collision/tabletop 等统计 |
+
+### `VerifyGrasp.srv`
+
+抓取后验证服务，通常由 `grasp_verifier_node` 提供。验证器在服务调用时采样当前传感器，融合夹爪位置、电流和腕部深度可见性证据。
+
+**请求**
+
+| 字段 | 说明 |
+| --- | --- |
+| `task_id` | 上层任务 ID，仅用于日志和编排关联 |
+| `text_prompt` | 目标文本，仅用于日志和编排关联 |
+| `grasp` | 规划候选；当前实现不做完整候选级几何验证，但会把 `grasp.target_width_m` 作为宽度 fallback |
+| `expected_target_width_m` | planner 侧目标宽度；`0.0` 时回退到 `grasp.target_width_m` |
+| `post_grasp_wait_s` | 采样前等待时间；`0.0` 时使用节点默认参数 |
+
+**响应**
+
+| 字段 | 说明 |
+| --- | --- |
+| `success` | 是否判定抓取成功 |
+| `status` | `STATUS_FAILED` / `STATUS_SUCCESS` / `STATUS_UNCERTAIN` |
+| `confidence` | 融合证据置信度 |
+| `message` | 判定摘要，可能包含 gripper joint 配置提示 |
+| `evidence` | 每条传感器证据和打分依据 |
+
 ### `ValidateSkill.srv`
 
 技能安全校验服务，路径 `/embodied/validate_skill`，由 `safety_guard_node` 提供。
@@ -188,6 +266,12 @@ Episode 录制控制接口，由 `dataset_tools` 的录制服务提供。
 ### `MoveToPose.srv`
 
 MoveIt 位姿移动服务，路径由 `moveit_gateway` 提供。
+
+### `MoveToConfiguration.srv`
+
+MoveIt 关节目标移动服务，路径为 `/moveit_gateway/move_to_configuration`。调用方传入已经通过
+IK/FK 验证的 `sensor_msgs/JointState`，网关直接规划到同一组机械臂关节角，不会再次求解 IK。
+该接口用于保证基于 FK 计算的动态 TCP/接触点补偿在执行时保持有效。
 
 ### `RecognizeFile.srv`
 

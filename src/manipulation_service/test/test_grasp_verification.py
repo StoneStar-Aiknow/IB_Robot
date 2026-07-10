@@ -48,6 +48,16 @@ def test_failed_when_gripper_fully_closes_and_current_is_low():
     assert result.confidence >= 0.6
 
 
+def test_failed_after_object_slips_out_during_lift():
+    result = evaluate_grasp(_input(gripper_position=0.0031, gripper_current_abs_a=0.0))
+
+    assert result.status == STATUS_FAILED
+    assert result.success is False
+    assert "score=0.65" in result.message
+    assert "gripper_contact: fully closed or near closed" in result.evidence
+    assert "current_contact: below contact threshold" in result.evidence
+
+
 def test_wrist_occlusion_alone_does_not_make_grasp_fail():
     result = evaluate_grasp(
         _input(

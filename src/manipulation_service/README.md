@@ -151,6 +151,10 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 `robot_config.robot.grasp_execution` 读取 `target_gripper` 和 `execution_scoring`，
 因此 GraspGen 不需要绑定 SO101；新增机器人只需要在自己的 robot_config 中定义目标夹爪几何和评分权重。
 
+SO101 执行侧 tabletop sweep 需要 `scene_cloud.ply`。`scripts/test_banana_handeye_pick.py`
+在 `--so101-tabletop-filter` 开启时会自动把单次 PlanGrasp 请求提升到 `debug_output_mode=full`；
+如果仍无法获得 tabletop clearance，候选会 fail closed 并被拒绝。
+
 常见 `diagnostic_details` 字段：
 
 - `failure_stage` / `failure_reason`：失败阶段和具体原因；成功时通常不存在。
@@ -159,6 +163,8 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 - `valid_depth_in_mask_count` / `valid_depth_ratio_in_mask`：目标 mask 内有效深度点数和比例；
   为 `0` 时通常是 RGB/depth 未对齐、目标深度空洞、深度编码或尺度异常。
 - `object_point_count` / `scene_point_count`：传入 GraspGen/过滤器的目标和场景点数。
+- `scene_cloud_table_holes_enabled` / `scene_table_hole_added_count`：是否启用目标 footprint
+  附近的 scene dense table patch，以及加入 scene/collision/tabletop filter 的补点数量。
 - `raw_grasp_count`：GraspGen 原始候选数量；为 `0` 表示模型未产生候选，
   可尝试降低 `grasp_threshold` 或检查目标几何是否适合当前夹爪。
 - `collision_filter`：碰撞过滤后/前的候选数量，例如 `0/80` 表示所有候选碰撞。
@@ -178,7 +184,7 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 
 ## 调试 grasp_verifier_node
 
-`grasp_verifier_node` 面向抓取动作完成后的验证。典型调用时机是夹爪闭合并抬升/保持之后；
+`grasp_verifier_node` 面向抓取保持状态验证。典型调用时机是夹爪闭合后和抬升/保持之后；
 它不移动机器人，只读取最新传感器状态并返回 `SUCCESS`、`FAILED` 或 `UNCERTAIN`。
 
 启动节点：
@@ -217,13 +223,13 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 - `message`：融合判断摘要。
 - `evidence`：稳定的 `key: value` 诊断行，包括夹爪开度、电流、腕部深度有效比例和遮挡状态。
 
-**触发方式与边界**：`verify_grasp` 是被动 ROS 2 服务，抓取执行完成后不会自动触发。当前
-需人工或上层 orchestrator 主动调用；`test_banana_handeye_pick.py`、`task_executor`、
-`action_dispatch` 均未集成 verify client。每次调用独立采样当前传感器状态，不追踪抓取
-历史。将验证接入执行脚本 / task_executor 的自动闭环是后续工作。
+**触发方式与边界**：`verify_grasp` 是被动 ROS 2 服务，仍需调用方主动触发。
+`test_banana_handeye_pick.py` 默认使用 `--grasp-verification required`，会在 close、低速 3 cm
+probe lift 和最终 lift 后自动调用；`task_executor`、`action_dispatch` 尚未集成 verify client。
+每次调用独立采样当前传感器状态，不追踪抓取历史。
 
-当前第一版只做后验状态融合，不做外部 RGBD 目标跟踪。推荐在抓取闭合后先小幅抬升并保持
-`0.5-1.0s` 再调用验证服务；如果返回 `UNCERTAIN`，上层流程应重观察或进入保守放置/重试策略。
+当前版本只做后验状态融合，不做外部 RGBD 目标跟踪。返回 `UNCERTAIN` 时，required 策略会保守停止；
+其他上层流程也应重观察或进入保守放置/重试策略，不能把它当作成功。
 
 评分权重和阈值可通过 ROS 参数调节，默认行为保持保守融合：
 
@@ -262,6 +268,10 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
   removal 和下采样，并写入 `object_cloud_graspgen_input.ply`。
 - `object_cloud_prismatic_extrude_max_points`：侧墙补点上限，默认 `8000`。
 - `object_cloud_prismatic_extrude_layers`：外轮廓到桌面之间的采样层数，默认 `8`。
+- `enable_scene_cloud_table_holes`：启用目标 footprint 附近的 scene table dense patch，默认
+  `true`（在线节点显式 opt-in；底层 wrapper 默认关闭以保持旧调用方行为）。这些生成点会进入
+  scene cloud，并参与 collision/tabletop filter 和 debug 可视化。
+- `scene_cloud_table_holes_max_points`：scene table dense patch 补点上限，默认 `8000`。
 
 输入同步：
 
@@ -381,7 +391,9 @@ pre-grasp path，并在诊断中记录 `tabletop_auto_tuned`、`tabletop_auto_tu
   removal 和下采样前的目标点云壳。
 - `object_cloud_graspgen_input.ply`：实际送入 GraspGen 的空心表面壳；已完成 outlier
   removal 和下采样，不包含物体内部实心采样点。
-- `scene_cloud.ply`：非目标场景点云，用于碰撞上下文；桌面补点也会写在这里。
+- `scene_cloud.ply`：非目标场景点云，用于碰撞上下文；启用 `enable_scene_cloud_table_holes`
+  时，目标 footprint 附近的 dense local table patch 也会写在这里，并进入后续 collision/tabletop
+  filter。
 - 颜色约定：绿色为 raw object，橙色 `(255, 170, 0)` 为 mask-depth inpaint，青色
   `(0, 200, 255)` 为目标 prismatic side wall，紫色 `(168, 85, 247)` 为桌面补点。
 - `grasp_cloud.ply`：目标 + 场景点云。
@@ -453,6 +465,9 @@ source .shrc_local && python3 src/manipulation_service/test_graspgen.py \
 - `--adaptive-tabletop-*`：与在线节点同名的自适应桌面过滤参数。
 - `--adaptive-tabletop-auto-tune` / `--no-adaptive-tabletop-auto-tune`：打开/关闭 adaptive retry。
 - `--adaptive-tabletop-retry-clearances`：离线 auto-tune retry clearance 列表，例如 `0.002,0.001`。
+- `--enable-scene-cloud-table-holes` / `--no-enable-scene-cloud-table-holes`：离线显式打开/关闭
+  目标 footprint 附近的 scene dense table patch；默认关闭以复现 wrapper 旧行为。
+- `--scene-cloud-table-holes-max-points`：离线 scene dense table patch 最大补点数。
 - `--fx --fy --cx --cy`：手动指定相机内参；仅旧数据目录缺少 CameraInfo 时需要。
 
 输出目录为 `<data-dir>/graspgen_output/`，包含：
