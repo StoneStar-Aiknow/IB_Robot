@@ -21,6 +21,17 @@ from embodied_common.depth_context import (
     summarize_pointcloud_metadata,
 )
 
+# Generic snapshot input keys a request may declare via ``required_inputs``.
+# A request that omits ``required_inputs`` keeps the historical strict behavior
+# (primary image + EE pose + joint state all required); a request that names a
+# subset only blocks on those inputs, letting pure-vision requests succeed with
+# EE pose / joint state offline. Unknown keys are ignored by callers.
+PRIMARY_IMAGE_INPUT = "primary_image"
+EE_POSE_INPUT = "ee_pose"
+JOINT_STATE_INPUT = "joint_state"
+KNOWN_REQUIRED_INPUTS = frozenset({PRIMARY_IMAGE_INPUT, EE_POSE_INPUT, JOINT_STATE_INPUT})
+_DEFAULT_REQUIRED_INPUTS = KNOWN_REQUIRED_INPUTS
+
 
 @dataclass
 class _CameraViewState:
@@ -323,9 +334,15 @@ class SceneSnapshotBuffer:
         jpeg_quality: int,
         require_depth: bool = False,
         require_pointcloud: bool = False,
+        required_inputs: set[str] | None = None,
     ) -> dict[str, Any]:
         now = time.monotonic()
         errors = []
+
+        # None => historical strict behavior (all inputs required); an explicit
+        # set only blocks on the named inputs, so a pure-vision request can
+        # succeed with EE pose / joint state offline.
+        effective_inputs = _DEFAULT_REQUIRED_INPUTS if required_inputs is None else required_inputs
 
         primary_view, primary_issues = self._build_view_snapshot(
             self._views["primary"],
@@ -333,7 +350,7 @@ class SceneSnapshotBuffer:
             max_scene_age_sec=max_scene_age_sec,
             max_image_width=max_image_width,
             jpeg_quality=jpeg_quality,
-            required_image=True,
+            required_image=PRIMARY_IMAGE_INPUT in effective_inputs,
         )
         wrist_view, wrist_issues = self._build_view_snapshot(
             self._views["wrist"],
@@ -357,15 +374,17 @@ class SceneSnapshotBuffer:
             message = primary_view["pointcloud_summary"].get("message", "pointcloud unavailable")
             errors.append(message)
 
-        if self._latest_ee_pose is None:
-            errors.append("ee pose unavailable")
-        elif now - self._latest_ee_pose_time > max_scene_age_sec:
-            errors.append(f"ee pose is stale: {now - self._latest_ee_pose_time:.3f}s")
+        if EE_POSE_INPUT in effective_inputs:
+            if self._latest_ee_pose is None:
+                errors.append("ee pose unavailable")
+            elif now - self._latest_ee_pose_time > max_scene_age_sec:
+                errors.append(f"ee pose is stale: {now - self._latest_ee_pose_time:.3f}s")
 
-        if self._latest_joint_state is None:
-            errors.append("joint state unavailable")
-        elif now - self._latest_joint_state_time > max_scene_age_sec:
-            errors.append(f"joint state is stale: {now - self._latest_joint_state_time:.3f}s")
+        if JOINT_STATE_INPUT in effective_inputs:
+            if self._latest_joint_state is None:
+                errors.append("joint state unavailable")
+            elif now - self._latest_joint_state_time > max_scene_age_sec:
+                errors.append(f"joint state is stale: {now - self._latest_joint_state_time:.3f}s")
 
         images = []
         for view in (primary_view, wrist_view):

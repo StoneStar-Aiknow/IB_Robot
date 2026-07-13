@@ -1,9 +1,13 @@
 from pathlib import Path
 
 import pytest
-import yaml
 
-from robot_config.loader import load_robot_config, load_robot_config_dict, validate_config
+from robot_config.loader import (
+    load_robot_config,
+    load_robot_config_dict,
+    validate_config,
+    validate_embodied_launch_dict,
+)
 
 
 @pytest.mark.parametrize(
@@ -26,11 +30,77 @@ def test_loaded_embodied_skill_templates_include_dance_basic(config_name):
     assert primitive_sequence[0]["joint_waypoints"]
 
 
-def test_embodied_config_does_not_expose_unused_entry_routing():
+def test_embodied_entry_visual_games_typed():
+    """entry.visual_games must survive the typed loader (SSOT), not be dropped."""
     config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
-    raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))["robot"]
+    config = load_robot_config(config_path)
 
-    assert "entry" not in raw_config["embodied"]
+    games = config.embodied.entry["visual_games"]
+    sorting_hat = games["sorting_hat"]
+    assert "enabled" in sorting_hat
+    assert sorting_hat["trigger_aliases"]
+
+
+def test_enabled_game_requires_perception_enabled():
+    """An enabled visual game with perception disabled must fail validation."""
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config = load_robot_config(config_path)
+
+    config.embodied.enabled = True
+    config.embodied.perception = {**config.embodied.perception, "enabled": False}
+    config.embodied.entry = {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}}
+
+    errors = validate_config(config)
+    assert any("visual_games" in error for error in errors)
+
+
+def test_disabled_games_do_not_require_perception():
+    """All games disabled: perception may stay off without a validation error."""
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config = load_robot_config(config_path)
+
+    config.embodied.enabled = True
+    config.embodied.perception = {**config.embodied.perception, "enabled": False}
+    config.embodied.entry = {"visual_games": {"sorting_hat": {"enabled": False, "trigger_aliases": ["分院帽"]}}}
+
+    errors = validate_config(config)
+    assert not any("visual_games" in error for error in errors)
+
+
+def test_launch_dict_enabled_game_without_perception_is_rejected():
+    """The raw-dict launch gate rejects a game enabled + perception disabled."""
+    config = {
+        "embodied": {
+            "enabled": True,
+            "perception": {"enabled": False},
+            "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
+        }
+    }
+    errors = validate_embodied_launch_dict(config)
+    assert any("visual_games" in error for error in errors)
+
+
+def test_launch_dict_enabled_game_with_perception_is_ok():
+    config = {
+        "embodied": {
+            "enabled": True,
+            "perception": {"enabled": True},
+            "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
+        }
+    }
+    assert validate_embodied_launch_dict(config) == []
+
+
+def test_launch_dict_skips_when_embodied_disabled():
+    """A disabled embodied stack is never gated on game/perception consistency."""
+    config = {
+        "embodied": {
+            "enabled": False,
+            "perception": {"enabled": False},
+            "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
+        }
+    }
+    assert validate_embodied_launch_dict(config) == []
 
 
 def test_embodied_config_keeps_only_supported_direct_skills():

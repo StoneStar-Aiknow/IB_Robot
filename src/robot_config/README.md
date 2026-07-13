@@ -380,6 +380,12 @@ embodied:
       model: Qwen3.5-9B
       api_key_env: ""
 
+  entry:
+    visual_games:
+      sorting_hat:
+        enabled: false        # 趣味视觉游戏默认关闭
+        trigger_aliases: [分院帽, 奔月帽, 风月帽, 分月帽]
+
   execution:
     relative_motion_reference_frame: base
     relative_motion_step_m: 0.03
@@ -408,6 +414,10 @@ embodied:
       grasp_pose:    {position: {x: 0.25, y: 0.0, z: 0.10}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
       lift_pose:     {position: {x: 0.25, y: 0.0, z: 0.25}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
 ```
+
+`embodied.entry.visual_games` 声明入口层视觉趣味游戏（如分院帽）的触发别名与开关；
+camera/VLM/timeout 仍由 `embodied.perception` 统一管理。`validate_config()` 强制一致性：
+任一游戏 `enabled=true` 而 `embodied.perception.enabled=false` 时返回错误，配置阶段即拦截。
 
 更多具身节点说明，详见各子包 README：
 - [`embodied_agent`](../embodied_agent/README.md)

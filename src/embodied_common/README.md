@@ -51,6 +51,20 @@ ibrobot_msgs / rclpy
 - `embodied_common.skill_templates.DEFAULT_SKILL_TEMPLATES`
 - `embodied_common.skill_templates.DEFAULT_ALLOWED_SKILLS`
 - `embodied_common.skill_templates.get_skill_templates`
+- `embodied_common.rgbd_snapshot.KNOWN_REQUIRED_INPUTS`
+- `embodied_common.rgbd_snapshot.RGBDSnapshotBuffer.build_snapshot`
+
+## 输入前置条件（required_inputs）
+
+`build_snapshot(required_inputs=...)` 提供通用的输入门控，供上层按每条请求声明"哪些输入缺失才阻塞"：
+
+- 允许键为 `KNOWN_REQUIRED_INPUTS`（`primary_image` / `ee_pose` / `joint_state`）。
+- 传入 `None`（默认）、缺失、或畸形值（非列表、空列表、列表内含非字符串项）时，回退到严格默认——
+  primary_image + ee_pose + joint_state 全部要求在线。
+- 传入合法子集时只门控该子集，未知/畸形键被安全忽略（不抛异常），使纯视觉请求可在 EE pose /
+  joint state 离线时成功。
+
+该词表业务中立，不含任何具体游戏/任务特判。
 
 ## 与 SSOT 的关系
 

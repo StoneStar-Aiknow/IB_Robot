@@ -251,6 +251,14 @@ robot:
         jpeg_quality: 70
       conversation:
         max_history_turns: 4
+    entry:
+      # 入口层视觉趣味游戏策略：拥有"何时触发、问什么"；camera/VLM/timeout 仍由
+      # embodied.perception 唯一管理，此处不重复。命中触发词后 task_entry_node
+      # 构造 SceneAnalysisRequest 发给 perception_service，并立即返回。
+      visual_games:
+        sorting_hat:
+          enabled: false  # 趣味游戏默认关；现场启用需同时置 perception.enabled: true
+          trigger_aliases: [分院帽, 奔月帽, 风月帽, 分月帽]
     execution:
       relative_motion_step_m: 0.03
       relative_motion_reference_frame: base

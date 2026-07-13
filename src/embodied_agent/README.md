@@ -18,6 +18,7 @@
 ```text
 /voice_command
   -> task_entry_node
+  -> 命中视觉互动触发词(如"分院帽"): /embodied/perception_request -> perception_service_node -> /embodied/perception_result (立即返回，不进 planner/executor)
   -> 规则可直达: /embodied/planned_task -> task_executor_node
   -> 规则未命中: /embodied/task_command -> task_planner_node / vlm_task_planner_node
   -> /embodied/planned_task
@@ -62,9 +63,16 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 
 1. 订阅文本命令。
 2. 为每条命令生成唯一 `task_id`。
-3. 先用现有规则解析器判断是否能直接映射到技能序列。
-4. 能直接映射时，直接发布到 `/embodied/planned_task`。
-5. 规则未命中时，再封装成 `ibrobot_msgs/msg/TaskCommand` 发布到规划阶段。
+3. **先匹配视觉趣味游戏触发词**（如"分院帽"，别名与开关来自 `embodied.entry.visual_games`）。命中即构造 `SceneAnalysisRequest` 发到 `/embodied/perception_request` 交给 `perception_service_node`，并**立即返回**——一句语音只属于一个业务域，不会同时触发趣味 VLM 和机器人任务规划。
+4. 未命中游戏时，用现有规则解析器判断是否能直接映射到技能序列。
+5. 能直接映射时，直接发布到 `/embodied/planned_task`。
+6. 规则未命中时，再封装成 `ibrobot_msgs/msg/TaskCommand` 发布到规划阶段。
+
+说明：
+
+- 视觉游戏结果以 `/embodied/perception_result` 上的 `SceneAnalysisResult` 为准，通过 `source=game.<name>`（如 `game.sorting_hat`）识别业务类型，`scene_summary` 保存最终结果（分院帽为四学院之一），失败时带 `error_code`/`message`。
+- 启用某游戏需**同时**置 `embodied.perception.enabled: true` 与 `embodied.entry.visual_games.<name>.enabled: true`；否则请求会打到无人消费的 topic，`task_entry_node` 会记 ERROR 并丢弃请求（配置层 `validate_config` 也会拒绝该不一致配置）。
+- **输入前置条件（通用 `required_inputs`）**：请求在 `context_json.required_inputs` 里声明它真正需要的输入，perception 据此判定哪些缺失才阻塞。分院帽只声明 `primary_image`，因此即便 EE pose / joint state 离线（MoveIt 未起、控制器重启、独立跑 perception）也能成功，只要主相机图像可用。未声明 `required_inputs` 的普通感知请求维持严格默认：要求主图 + EE pose + joint state 全部在线，否则返回 `SCENE_ANALYSIS_FAILED`。
 
 说明：
 
@@ -77,6 +85,7 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 | 方向 | 话题 | 类型 | 说明 |
 | --- | --- | --- | --- |
 | 订阅 | `/voice_command` | `std_msgs/msg/String` | 当前默认文本输入入口 |
+| 发布 | `/embodied/perception_request` | `ibrobot_msgs/msg/SceneAnalysisRequest` | 命中视觉游戏触发词后发给 perception |
 | 发布 | `/embodied/planned_task` | `ibrobot_msgs/msg/TaskCommand` | 规则直达命中后的已规划任务 |
 | 发布 | `/embodied/task_command` | `ibrobot_msgs/msg/TaskCommand` | 规则未命中的任务封装，交给 planner/VLM |
 | 发布 | `/embodied/task_status` | `ibrobot_msgs/msg/TaskStatus` | 规则直达命中时补发 `planned` 状态 |
@@ -93,6 +102,9 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 | `default_place_name` | `home` | 保留参数；当前规则规划不会生成放置技能 |
 | `default_relative_motion_step_m` | `0.03` | “一点”默认映射步长（米） |
 | `default_task_timeout_sec` | `180.0` | 单个任务的端到端总超时预算 |
+| `perception_request_topic` | `/embodied/perception_request` | 视觉互动请求输出（复用 perception 请求 topic） |
+| `perception_enabled` | `false` | perception 是否启用；用于互动启用一致性校验 |
+| `entry_visual_games_json` | `{}` | 入口视觉趣味游戏策略（开关 + 触发别名），来自 `embodied.entry.visual_games` |
 | `debug_tracing` | `false` | 是否打印调试日志 |
 
 ## 4. task_planner_node

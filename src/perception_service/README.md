@@ -67,6 +67,20 @@ ros2 topic pub --once /embodied/perception_request ibrobot_msgs/msg/SceneAnalysi
   "{request_id: 'req-1', source: 'cli', session_id: 'demo', user_text: '判断红色物体是否适合抓取', context_json: '{\"focus_object\":\"red_block\",\"goal\":\"graspability\"}', timeout_sec: 120.0}"
 ```
 
+### 视觉趣味游戏请求（分院帽等）
+
+`perception_service_node` 作为通用视觉分析运行时，不感知具体游戏业务。入口层
+（`embodied_agent/task_entry_node`）命中"分院帽"等触发词后，会构造一条带角色 prompt 的
+`SceneAnalysisRequest`（`source=game.<name>`，如 `game.sorting_hat`）发到本节点。
+本节点按普通 scene-analysis 请求处理：抓场景 → 调 VLM → 发 `SceneAnalysisResult`。结果消费方
+通过 `source` 识别业务类型，`scene_summary` 保存最终结果，失败时以 `error_code`/`message` 表达。
+请求 `context_json.required_inputs` 声明该请求真正需要的输入（`primary_image` / `ee_pose` /
+`joint_state`），本节点据此判定哪些缺失才阻塞：分院帽只声明 `primary_image`，故 EE pose / joint
+state 离线时仍可成功；未声明或畸形的 `required_inputs` 维持严格默认（三者全需在线）。
+`context_json.response_contract` 声明输出契约；当前支持 `kind=enum`，在发布成功结果前校验指定字段
+（如 `scene_summary`）严格属于 `allowed_values`。契约声明畸形、`kind` 缺失/不受支持或字段值越界时，
+本节点发布 `success=false`、`error_code=INVALID_RESPONSE_CONTRACT`，并保留 `raw_response` 便于诊断。
+
 ## 3. 主要输出
 
 | topic | 类型 | 说明 |
