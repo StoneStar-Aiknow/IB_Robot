@@ -19,7 +19,18 @@ import numpy as np
 
 _SILERO_VAD_V4_STATE_SHAPE = (2, 1, 64)
 _SILERO_VAD_V5_STATE_SHAPE = (2, 1, 128)
+# 当前 Voice ASR 集成链路使用 16kHz、每帧 512 个样本。
+# Silero v5 ONNX 在该配置下还需把上一帧末尾 64 个 context 样本拼到当前帧前，
+# 组成 [context | chunk] 后执行推理，否则语音概率会失真为底噪值。
+_VOICE_ASR_SAMPLE_RATE = 16000
+_VOICE_ASR_FRAME_SIZE = 512
+_SILERO_VAD_V5_CONTEXT_SIZE = 64
+
 _MIN_ENERGY_GATE = 1e-4
+
+
+class VADConfigurationError(ValueError):
+    """VAD 配置与当前 Voice ASR 音频链路不一致。"""
 
 
 class VADState(Enum):
@@ -72,6 +83,8 @@ class VADModule:
         self._onnx_state_h: np.ndarray | None = None
         self._onnx_state_c: np.ndarray | None = None
         self._onnx_state: np.ndarray | None = None
+        # v5 context：跨帧传递，初始为零，推理后更新为本帧末尾 context 样本
+        self._onnx_v5_context: np.ndarray | None = None
 
         self._noise_floor: float = 0.0
         self._noise_samples: int = 0
@@ -103,6 +116,25 @@ class VADModule:
                 warn(message)
                 return
         print(message)
+
+    def _validate_v5_pipeline_contract(self) -> None:
+        """校验当前 Voice ASR 链路使用的 v5 ONNX 输入配置。
+
+        当前链路配置错误必须由调用方感知，不能作为模型加载技术故障
+        静默降级到其他 VAD 后端。
+        """
+        if self.config.sample_rate != _VOICE_ASR_SAMPLE_RATE:
+            raise VADConfigurationError(
+                "Current Voice ASR pipeline expects "
+                f"sample_rate={_VOICE_ASR_SAMPLE_RATE} for the Silero VAD v5 ONNX backend, "
+                f"got sample_rate={self.config.sample_rate}"
+            )
+        if self.config.frame_size != _VOICE_ASR_FRAME_SIZE:
+            raise VADConfigurationError(
+                "Current Voice ASR pipeline expects "
+                f"frame_size={_VOICE_ASR_FRAME_SIZE} for the Silero VAD v5 ONNX backend, "
+                f"got frame_size={self.config.frame_size}"
+            )
 
     def initialize(self, model_path: str | None = None) -> bool:
         """初始化 VAD 模型"""
@@ -152,9 +184,17 @@ class VADModule:
                         # silero_vad_v5.onnx exposes a single recurrent state tensor
                         # shaped as (layers=2, batch=1, hidden=128).
                         self._onnx_state = np.zeros(_SILERO_VAD_V5_STATE_SHAPE, dtype=np.float32)
+                        # 当前 Voice ASR 链路配置错误必须直接抛给调用方，
+                        # 不能被下方 except 当作模型加载技术故障而降级到其他后端。
+                        self._validate_v5_pipeline_contract()
+                        # v5 context 初始化为零，推理时帧前拼接并跨帧更新。
+                        self._onnx_v5_context = np.zeros(_SILERO_VAD_V5_CONTEXT_SIZE, dtype=np.float32)
                         self._model_loaded = True
                         self._model_backend = "onnx_v5"
                         return True
+                except VADConfigurationError:
+                    # 当前链路配置错误穿透降级逻辑，直接抛给调用方。
+                    raise
                 except Exception as e:
                     self._warn(f"Warning: Failed to load local ONNX VAD model from {onnx_model_path}: {e}")
 
@@ -172,6 +212,9 @@ class VADModule:
             self._model_backend = "torch_hub"
             return True
 
+        except VADConfigurationError:
+            # 当前链路配置错误穿透，不降级到 energy 后端。
+            raise
         except Exception as e:
             self._warn(f"Warning: Failed to load silero-vad: {e}")
             self._warn("Falling back to energy-based VAD")
@@ -241,11 +284,22 @@ class VADModule:
 
     def _get_onnx_speech_probability(self, audio_frame: np.ndarray) -> float:
         """ONNX 后端语音概率检测"""
+        if self._model_backend == "onnx_v5":
+            # 当前链路配置校验在 try 之外，避免配置错误静默降级到能量检测。
+            self._validate_v5_pipeline_contract()
+            if len(audio_frame) != _VOICE_ASR_FRAME_SIZE:
+                raise VADConfigurationError(
+                    "Current Voice ASR pipeline expects "
+                    f"{_VOICE_ASR_FRAME_SIZE} samples per frame for the Silero VAD v5 ONNX backend, "
+                    f"got {len(audio_frame)}"
+                )
+
         try:
-            if len(audio_frame) < 512:
-                audio_frame = np.pad(audio_frame, (0, 512 - len(audio_frame)))
-            if len(audio_frame) > 512:
-                audio_frame = audio_frame[:512]
+            if self._model_backend != "onnx_v5":
+                if len(audio_frame) < 512:
+                    audio_frame = np.pad(audio_frame, (0, 512 - len(audio_frame)))
+                if len(audio_frame) > 512:
+                    audio_frame = audio_frame[:512]
 
             frame = np.asarray(audio_frame, dtype=np.float32).reshape(1, -1)
 
@@ -264,19 +318,35 @@ class VADModule:
             if self._model_backend == "onnx_v5":
                 if self._onnx_state is None:
                     self._onnx_state = np.zeros(_SILERO_VAD_V5_STATE_SHAPE, dtype=np.float32)
+                if self._onnx_v5_context is None:
+                    # context 缺失时重建为零；采样率不可变，无需检测变化。
+                    self._onnx_state = np.zeros(_SILERO_VAD_V5_STATE_SHAPE, dtype=np.float32)
+                    self._onnx_v5_context = np.zeros(_SILERO_VAD_V5_CONTEXT_SIZE, dtype=np.float32)
+                # v5 关键：帧前拼上一帧末尾 context 样本，组成 [context | chunk]
+                # 否则模型缺少上下文锚点，语音概率会失真为底噪值
+                audio_frame_v5 = audio_frame.astype(np.float32, copy=False)
+                x = np.concatenate([self._onnx_v5_context, audio_frame_v5])
+                v5_frame = x.reshape(1, -1)
                 prob, new_state = self._onnx_session.run(
                     None,
                     {
-                        "input": frame,
+                        "input": v5_frame,
                         "state": self._onnx_state,
                         "sr": np.array(self.config.sample_rate, dtype=np.int64),
                     },
                 )
                 self._onnx_state = new_state
+                # 更新 context：取本帧末尾 context 样本，供下一帧拼接
+                self._onnx_v5_context = audio_frame_v5[-_SILERO_VAD_V5_CONTEXT_SIZE:].astype(np.float32, copy=True)
                 return float(prob[0][0])
-        except Exception:
-            pass
-        return self._get_energy_fallback_probability(audio_frame)
+        except Exception as exc:
+            if self._model_backend == "onnx_v5":
+                # v5 跨帧 state/context 必须保持连续；当前帧推理失败后，
+                # 下一次重试从干净状态开始，避免复用缺失一帧的历史。
+                self._warn(f"Silero VAD v5 inference failed; resetting state: {exc}")
+                self._onnx_state = np.zeros(_SILERO_VAD_V5_STATE_SHAPE, dtype=np.float32)
+                self._onnx_v5_context = np.zeros(_SILERO_VAD_V5_CONTEXT_SIZE, dtype=np.float32)
+            return self._get_energy_fallback_probability(audio_frame)
 
     def _get_torch_speech_probability(self, audio_frame: np.ndarray) -> float:
         """Torch 后端语音概率检测"""
@@ -475,6 +545,8 @@ class VADModule:
             self._onnx_state_c = np.zeros(_SILERO_VAD_V4_STATE_SHAPE, dtype=np.float32)
         elif self._model_backend == "onnx_v5":
             self._onnx_state = np.zeros(_SILERO_VAD_V5_STATE_SHAPE, dtype=np.float32)
+            # v5 context 随状态一起复位，避免跨段串扰。
+            self._onnx_v5_context = np.zeros(_SILERO_VAD_V5_CONTEXT_SIZE, dtype=np.float32)
 
     def set_sensitivity(self, sensitivity: float):
         """

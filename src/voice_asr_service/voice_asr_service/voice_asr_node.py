@@ -31,6 +31,8 @@ _AUDIO_STALL_TIMEOUT_SECONDS = 2.0
 _AUDIO_RESTART_MIN_INTERVAL_SECONDS = 5.0
 _STATUS_HEARTBEAT_INTERVAL_SECONDS = 1.0
 _MAX_STREAMING_PREROLL_SECONDS = 0.5
+_VOICE_ASR_SUPPORTED_SAMPLE_RATE = 16000
+_VOICE_ASR_SUPPORTED_CHUNK_SIZE = 512
 
 
 @dataclass
@@ -71,6 +73,8 @@ class VoiceASRNode(Node):
 
     def _asr_not_ready_message(self) -> str:
         """Build a stable error message for ASR calls made before init succeeded."""
+        if self._pipeline_init_error:
+            return f"ASR pipeline is not ready: {self._pipeline_init_error}"
         if self._asr_init_error:
             return f"ASR is not ready: {self._asr_init_error}"
         return f"ASR is not ready (state={self._asr.state.value})"
@@ -91,7 +95,7 @@ class VoiceASRNode(Node):
 
     def _ensure_asr_ready(self, response=None, operation: str = "ASR request") -> bool:
         """Guard ASR entrypoints so failed initialization cannot crash the node."""
-        if self._asr.is_ready:
+        if self._pipeline_init_error is None and self._asr.is_ready:
             return True
 
         message = f"{operation} rejected. {self._asr_not_ready_message()}"
@@ -99,6 +103,26 @@ class VoiceASRNode(Node):
         if response is not None:
             self._fail_response(response, message)
         return False
+
+    def _validate_voice_audio_contract(self) -> None:
+        """Validate system-level audio contract before wiring ASR/VAD modules."""
+        if self._sample_rate != _VOICE_ASR_SUPPORTED_SAMPLE_RATE:
+            raise ValueError(
+                "Current Voice ASR pipeline supports only "
+                f"sample_rate={_VOICE_ASR_SUPPORTED_SAMPLE_RATE}, got {self._sample_rate}"
+            )
+        if self._chunk_size != _VOICE_ASR_SUPPORTED_CHUNK_SIZE:
+            raise ValueError(
+                "Current Voice ASR pipeline supports only "
+                f"chunk_size={_VOICE_ASR_SUPPORTED_CHUNK_SIZE}, got {self._chunk_size}"
+            )
+
+    def _validate_asr_audio_sample_rate(self) -> None:
+        """Ensure the initialized ASR model uses the same time base as captured audio."""
+        if self._asr.sample_rate != self._sample_rate:
+            raise ValueError(
+                f"ASR model expects {self._asr.sample_rate} Hz, but Voice ASR audio input uses {self._sample_rate} Hz"
+            )
 
     def _ensure_realtime_asr_supported(self, response=None, operation: str = "Realtime ASR request") -> bool:
         """Realtime microphone recognition requires a streaming-capable model."""
@@ -224,8 +248,12 @@ class VoiceASRNode(Node):
 
         self._asr = ASRInferenceModule()
         self._asr_init_error: str | None = None
+        self._pipeline_init_error: str | None = None
 
         try:
+            # sample_rate/chunk_size 是完整 Voice ASR 链路的硬契约；
+            # 在模型装配前拒绝无效组合，避免后续 VAD/ASR 以不同时间基准运行。
+            self._validate_voice_audio_contract()
             resolved_assets = resolve_model_assets(
                 model_path=self._model_path,
                 tokens_path=self._tokens_path,
@@ -251,6 +279,8 @@ class VoiceASRNode(Node):
                 language=self._language,
                 model_type=self._model_type,
             )
+            # ASR 模型采样率只有初始化 recognizer 后才能确定；必须与音频输入一致。
+            self._validate_asr_audio_sample_rate()
             self._vad.initialize()
             model_type_str = "streaming" if self._asr.is_streaming() else "offline"
             self.get_logger().info(f"ASR model loaded: {self._model_path} (type: {model_type_str})")
@@ -264,10 +294,13 @@ class VoiceASRNode(Node):
                     "microphone realtime recognition still requires a streaming model."
                 )
         except Exception as e:
+            self._pipeline_init_error = str(e)
             self._asr_init_error = str(e)
-            self.get_logger().error(f"Failed to load ASR model: {e}")
+            self.get_logger().error(f"Failed to initialize Voice ASR pipeline: {e}")
             if self._exit_on_init_failure:
-                raise RuntimeError(f"ASR initialization failed and exit_on_init_failure is true: {e}") from e
+                raise RuntimeError(
+                    f"Voice ASR pipeline initialization failed and exit_on_init_failure is true: {e}"
+                ) from e
 
         self._recognition_lock = threading.Lock()
         self._recording_start_time: float | None = None
@@ -518,6 +551,9 @@ class VoiceASRNode(Node):
 
     def _on_set_hotwords(self, request, response):
         """设置热词服务回调"""
+        if not self._ensure_asr_ready(response, operation="set_hotwords"):
+            return response
+
         try:
             hotwords = {}
             if request.hotwords:

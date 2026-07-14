@@ -266,11 +266,14 @@ models/voice_asr/
 | --- | --- | --- |
 | `vad_sensitivity` | `0.6` | VAD 灵敏度 |
 | `realtime_pre_roll_seconds` | `0.5` | 识别启动时补回的实时缓存时长，用于减少句首丢字 |
-| `sample_rate` | `16000` | 运行时音频采样率 |
-| `chunk_size` | `512` | 每个音频块的帧数 |
+| `sample_rate` | `16000` | 当前完整 Voice ASR 链路仅支持 16000 Hz；其他值属于无效配置，节点会拒绝初始化 |
+| `chunk_size` | `512` | 当前完整 Voice ASR 链路仅支持 512 样本帧；其他值属于无效配置，节点会拒绝初始化 |
 | `buffer_seconds` | `5.0` | 音频环形缓冲区时长 |
 | `device_index` | `-1` | 显式音频设备索引；`-1` 表示默认设备 |
 | `device_name` | `""` | 优先按设备名匹配，失败后回退到索引 |
+
+当前 16kHz/512 是实时麦克风、文件识别、VAD 后端和 ASR 模型共同遵守的系统级硬限制；
+Silero v5 ONNX 后端会在 512 样本音频帧前额外拼接 64 个内部 context 样本，该 context 由 VAD 内部跨帧维护，不应配置到 `chunk_size` 中。
 
 ## 10. 状态机
 
