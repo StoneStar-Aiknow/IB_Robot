@@ -598,7 +598,7 @@ robot:
   # ============================================
   teleoperation:
     enabled: true
-    active_device: "so101_leader" # You can switch between "so101_leader" and "xbox_controller" and "phone_teleop"
+    active_device: "so101_leader" # You can switch between "so101_leader", "xbox_controller", "phone_teleop", and "vr_teleop"
 
     # Cartesian solver used when gamepad / phone is in cartesian mode.
     # Options:
@@ -646,6 +646,53 @@ robot:
           cartesian_linear_speed: 1.0
           cartesian_angular_speed: 1.0
           long_press_duration: 0.5
+      # VR teleop server. output_profile=so101 drives the placo cartesian
+      # servo; the VR node converts tool-frame angular → base via
+      # ToolAngularAdapter and the launch builder spawns so101_placo_servo_node
+      # alongside. Downstream placo topics/services use their defaults, so only
+      # tuning knobs are listed here. VR client connects to <host>:<port> (TCP).
+      - name: "vr_teleop"
+        type: "vr_teleop"
+        control_frequency: 50.0
+        vr_config:
+          output_profile: "so101"     # so101 | humanoid
+          controller_side: "right"    # left | right
+          # Security model: trusted LAN only. Listening on 0.0.0.0 is
+          # intentional so users can connect arbitrary VR headsets or other
+          # network devices without fixing their client IP in this config.
+          # This TCP control channel is unauthenticated: do NOT expose port
+          # 8889 through public port forwarding, untrusted Wi-Fi, or an
+          # untrusted VPN. The stale/disconnect watchdog remains mandatory.
+          host: "0.0.0.0"
+          port: 8889
+          # Input mode: "pose" = absolute EE pose passthrough (1:1 hand tracking,
+          # stop=stop, no drift); "velocity" = differential twist (placo
+          # integrates). Pose mode drives BOTH the VR node and the placo servo.
+          so101_input_mode: "pose"
+          # Hand→EE position gain (pose mode). SO-101 reach (~24cm) vs
+          # comfortable single-arm range (~60cm) suggests ~0.4, but 0.7 gives a
+          # less tiring feel (smaller hand travel reaches the target). Tune for
+          # finer/coarser feel.
+          position_scale: 0.7
+          # Rotation gate (pose mode). false = hand attitude drives the EE
+          # (default; VR +X/+Y wrist rotation maps to EE roll/pitch, validated on
+          # sim). true = hold the clutch-baseline attitude and teleop position
+          # only. NOTE: SO-101 is 5-DOF, so EE yaw about base +Z is NOT
+          # reproducible regardless of this setting (placo pins 3 position DOF +
+          # a soft 2-DOF orientation follow) — a kinematic limit, not a bug.
+          so101_position_only: false
+          # Stale-frame watchdog (s). If the VR client stays TCP-connected but
+          # stops sending frames, the last frame would otherwise be republished
+          # forever and the arm would keep tracking a dead target. When the
+          # newest frame is older than this, drop the clutch and call placo's
+          # stop service on the edge. ~0.2s = 10 missed frames at 50Hz.
+          so101_command_stale_s: 0.2
+          linear_speed_scale: 1.0
+          angular_speed_scale: 1.0
+          linear_deadzone: 0.005
+          angular_deadzone: 0.05
+          so101_gripper_open: 1.0
+          so101_gripper_closed: 0.0
     safety:
       joint_limits:
         "1": {"min": -2.0693, "max": 2.0709}

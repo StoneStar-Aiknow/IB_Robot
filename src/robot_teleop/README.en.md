@@ -14,6 +14,7 @@ The `robot_teleop` package provides a unified teleoperation interface for IB-Rob
 - ✅ Automatic rosbag recording support
 - ✅ Deep integration with `robot_config` launch system
 - ✅ Cartesian control via `placo_servo` or `moveit_servo`
+- ✅ VR teleop ships as a **standalone TCP node** (`vr_teleop`) that bypasses the `TeleopNode` device abstraction and `SafetyFilter`. It intentionally listens on `0.0.0.0:8889` so VR headsets and other user network devices can connect without fixed client addresses. The TCP control channel is **unauthenticated** and is supported only on a trusted lab/home LAN: do not expose it through public port forwarding, untrusted Wi-Fi, or an untrusted VPN. Keep the disconnect/stale-frame deadman enabled. See the "VR Teleoperation" section below for the protocol, clutch semantics, and the base-frame rotation contract.
 
 ## Architecture Design
 
@@ -394,6 +395,58 @@ lead = prev_cmd - actual
 if (delta > 0 and lead < -0.01) or (delta < 0 and lead > 0.01):
     prev_cmd = actual  # Snap
 ```
+
+### VR Teleoperation
+
+> **Architecture note**: VR teleop does **not** pass through the `TeleopNode` / `BaseTeleopDevice` device abstraction, nor through `SafetyFilter`. It is a standalone ROS 2 node `vr_teleop` (`robot_teleop/vr_teleop.py`) that runs its own TCP server to receive controller data from a Unity XR app and publishes commands directly to the downstream controllers / Cartesian servo node. The factory / strategy / template-method architecture described above does not apply to it.
+
+**Data path**: Unity XR app → TCP (newline-delimited JSON) → `vr_teleop` node → coordinate transform / clutch → downstream topics.
+
+**Output profile** (`output_profile` parameter):
+
+| Profile | Downstream | Description |
+|---|---|---|
+| `so101` | `so101_placo_servo_node` | Single-arm Placo Cartesian servo. When `so101_input_mode=pose`, publishes a **clutch-relative pose delta** to `pose_cmd_base` (position is a relative displacement, orientation a relative rotation delta; placo composes them onto its own latched EE baseline — 1:1 hand tracking, stop-on-release, zero drift). When `velocity`, publishes a tool-frame differential twist |
+| `humanoid` | `/humanoid_teleop/*` | Dual-arm differential velocity, published as `Vector3Stamped` to the per-arm linear/angular topics |
+
+**Clutch semantics (pose mode)**: on the trigger (`enabled`) rising edge the hand baseline is latched; position is `(hand - clutch) * position_scale` (base frame) and attitude is the base-frame relative delta `R_current * R_clutch^-1` (with `so101_position_only=true`, attitude publishes identity and only position is teleoperated). Releasing the trigger clears the baseline and placo holds the last reference pose; pressing again re-grips from the new hand pose. Pressing **B** (secondary) calls placo's home service to return to home. Home is asynchronous (the service returns before the arm arrives), so **the moment the home request is dispatched** the node enters the **homing gate** — pose input is suspended and re-gripping is only allowed **after the trigger is released AND `so101_home_settle_s` (default 2s, sized to cover a typical homing travel) has elapsed**. The settle timer starts from the **confirmed successful async home response** (not from dispatch), so a slow service round-trip cannot shorten the wait window; the gate stays latched until the response is confirmed (it never lifts before the arm has even begun homing). A single release is not enough: a quick release-then-press mid-transit would re-latch placo's baseline onto the still-moving arm and overwrite the home target; because the gate holds until release *and* enough travel time has passed, a mid-transit re-press just holds still. (There is no arrival feedback, so this is a conservative time bound, not a measurement.) If the home service is not ready or is rejected (dispatch failure or a failed async response), the gate is **not** entered — pose input keeps working normally and the arm is not frozen in place.
+
+> **Stale-frame watchdog (closed-loop deadman)**: if the client TCP stays connected but stalls without sending frames, the server would just re-send `_latest` forever. To prevent this, the receive side records each frame's arrival time with `time.monotonic()`; once the newest frame is older than `so101_command_stale_s` (default 0.2s) it is treated as no-data: the clutch is cleared and placo's `stop` service is called. Merely stopping publishing is not enough — placo latches the last reference and keeps driving toward that target.
+>
+> **stop must be closed-loop**: an early implementation called `stop` once on the stall **edge**; if that request happened to hit a not-ready/rejected/errored service, the software already believed the arm was "stopped" while placo kept tracking. It now uses a latch `_so101_stop_pending` meaning "the stop request has not yet succeeded": while true, the watchdog keeps retrying stop every stall cycle (when data has recovered but it is still pending, the 0.5s `_ensure_so101_started` timer retries as a backstop), and **all enable entry points** (auto-start, trigger re-calibration, B-button home, and the three async success callbacks) are blocked by it; it clears only on a confirmed stop response. This way no failed stop can leave the arm in the "thinks it stopped, actually moving" state.
+>
+> **Recovery semantics (deliberate re-grip, not auto-resume)**: a stall sets `_so101_stalled` (for **both** pose and velocity modes). After the stream recovers, **if the user is still holding the trigger the arm does not auto-resume** — `_so101_stalled` is cleared only by a **trigger release** (and it must be a real release with live controller data; a `ctrl is None` disconnect does not count). Pose mode clears it in the release path; velocity mode clears it in the release branch of `_control_so101` (`not ctrl.enabled` with the controller online). While the stall persists, velocity mode publishes zero velocity even if the trigger is held — it does not feed `_compute_velocities` — avoiding a large velocity spike on the first recovery frame. Only the next **press** takes the rising edge: re-latch the baseline, re-grip. That is, "recovery ⇒ the user deliberately re-grips", not "recovery ⇒ auto-takeover", so the arm does not lurch when the user is not ready during stream jitter.
+
+> **Late-frame overwrite protection (placo-side pose gate)**: clearing the `_latest_pose` cache is not enough to stop "an old Pose that was already queued in DDS when the stop/home service ran, and only delivered afterward" — there is no cross-entity ordering guarantee between the pose topic and the services. The placo node uses an `_accept_pose_commands` gate: `stop`/`home` close the gate and drop the cache, and **only `start` re-opens it after re-latching the baseline**; while closed, `_on_pose` drops the message. Key point: **the gate stays closed after home** — a single-threaded executor only guarantees no Pose is interleaved *during* the home callback, and cannot distinguish "a frame that arrives after the callback returns" as an old queued frame vs. a new one; re-opening at the end of home would let an old Pose (enqueued before home ran, delivered after) be accepted and add the stale displacement back onto the home baseline. So the gate is re-opened only by the next `start` (which re-latches the clutch baseline first), and any Pose accepted after that is measured against the new home, not the old grip. The node runs a single-threaded executor with a single `MutuallyExclusiveCallbackGroup`, so the service callbacks and `_on_pose` are serialized and the gate's close/open is atomic w.r.t. `_on_pose`, fully closing the `home + old offset` reappearance.
+
+> **Coordinate contract**: the pose-mode rotation delta is defined in the **base frame** (same frame as the position delta). The production formulas live in the ROS-agnostic pure-function module `vr_rotation.py` (`compute_base_rotation_delta` computes `R_current * R_clutch^-1`, `remap_base_rotation` does the base-frame-aligned similarity transform), and the placo side left-multiplies `rel_R @ ee0_R`. `test/test_vr_teleop_rotation.py` calls these two production functions directly (no more copying the formula into the test, no more `sys.modules` stubbing). The base-alignment matrix `R_ROBOT_BASE_FROM_VR_BASE` maps VR +X/+Y wrist rotations to EE roll/pitch (axes and signs verified usable in sim). **5-DOF limitation**: the SO-101 has only 5 revolute joints and cannot independently realize all 6 Cartesian DOF — placo constrains the 3 positions with a hard PositionTask and follows attitude with a low-weight (0.01) soft OrientationTask, leaving ~2 reachable attitude DOF. **EE yaw about base +Z cannot be reproduced** (a hand yaw about the vertical axis barely drives the EE), which is an inherent kinematic limitation of the arm, not a calibration error. Set `so101_position_only=true` when only pure translation is needed or a fixed wrist attitude is desired.
+
+**TCP protocol**: newline-delimited JSON, one frame per line. Fields include `timestamp`, `left_controller`/`right_controller` (each with `position`, `rotation` (quaternion), `grip_value`, `trigger_value`, `enabled`, `secondaryButton`, etc.), `headset`, and `config_mode`. Malformed packets are dropped without killing the receive thread; a receive buffer that exceeds 1 MiB without a newline is cleared. See [VR Teleoperation Wire Protocol](VR_TELEOP_PROTOCOL.md) for the application-facing field, unit, coordinate, button, and compatibility contract.
+
+**Key parameters**:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `host` | `0.0.0.0` | TCP listen address |
+| `port` | 8889 | TCP port |
+| `output_profile` | `humanoid` | `humanoid` or `so101` |
+| `controller_side` | `right` | which controller the so101 profile uses |
+| `so101_input_mode` | `velocity` | `velocity` or `pose` (VR relative-pose passthrough) |
+| `position_scale` | 0.4 | pose-mode hand→EE position gain |
+| `so101_position_only` | `false` | pose-mode rotation gate. When `true`, locks the clutch-baseline attitude and teleoperates position only (ΔR publishes identity); for pure-translation or fixed-wrist scenarios. Default `false` (attitude on): VR +X/+Y wrist rotations map to EE roll/pitch; subject to the 5-DOF limit, EE yaw about base +Z cannot be reproduced |
+| `so101_command_stale_s` | 0.2 | stale-frame watchdog. When the client stays connected but stops sending frames past this value, it is treated as no-data: clear the clutch, latch stop intent, and call placo `stop`; if the service is not ready, errors, or is rejected, keep retrying until a success response, so the arm does not keep tracking a frozen old target |
+| `so101_home_settle_s` | 2.0 | homing-gate conservative time. Home is async (the service returns first, the arm arrives later), so after a trigger release the user must wait this long before re-gripping, preventing a mid-transit re-press from re-latching the baseline onto a half-way pose and overwriting home. There is no arrival feedback, so it is a time bound; size it to a typical homing travel |
+| `control_frequency` | 50.0 | control frequency. Declared at the **device layer** (peer of `vr_config`, consistent with other teleop devices); `vr_config.control_frequency` may override it |
+
+> ⚠️ **Security model (trusted LAN)**: the `0.0.0.0:8889` listen is kept by default so a user's VR headset, phone, or other network device can connect directly even when its IP is not fixed. This TCP control channel is **unauthenticated**, so it may only be used on a trusted lab/home LAN; do not set up public port forwarding on the router, and never expose it to the public internet, untrusted Wi-Fi, or an untrusted VPN. This node does not pass through `SafetyFilter` — joint limits are enforced by the downstream `so101_placo_servo_node` QP constraints — and the disconnect/stale-frame deadman must stay enabled.
+
+**VR node downstream topics / services** (so101 profile, pose mode):
+
+| Name | Type | Direction | Description |
+|---|---|---|---|
+| `/so101_placo_servo_node/pose_cmd_base` | `PoseStamped` | publish | **clutch-relative pose delta** (base frame): `position` is a relative displacement, `orientation` a relative rotation delta; composed by placo onto its latched EE baseline `_ee0_p/_ee0_R`, **not** an absolute EE pose |
+| `so101_gripper_topic` (default `/gripper_position_controller/commands`) | `Float64MultiArray` | publish | gripper target position |
+| `/so101_placo_servo_node/start` `/stop` `/home` | `Trigger` | service call | enable / re-latch the clutch baseline, disable, home |
 
 ### Performance Optimization
 

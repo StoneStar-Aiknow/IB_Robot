@@ -210,6 +210,16 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
     if device_type == "joy_teleop":
         return _create_joy_teleop_nodes(device_config)
 
+    if device_type == "vr_teleop":
+        return _generate_vr_teleop_nodes(
+            robot_config,
+            device_config,
+            robot_description_dict,
+            cart_solver=cart_solver,
+            base_link_name=device_param["base_link_name"],
+            tool_frame=cart_tool_frame,
+        )
+
     # Prepare lerobot environment
     env = prepare_lerobot_env()
 
@@ -339,6 +349,142 @@ def _create_joy_teleop_nodes(device_config: dict) -> list[Node]:
     return nodes
 
 
+def _generate_vr_teleop_nodes(
+    robot_config: dict,
+    device_config: dict,
+    robot_description_dict: dict = None,
+    *,
+    cart_solver: str = "placo_servo",
+    base_link_name: str = "base",
+    tool_frame: str = "gripper",
+) -> list[Node]:
+    """Launch the standalone VR teleop server + (for so101) the placo servo.
+
+    The VR server (``vr_teleop``) is a self-contained rclpy node — it
+    does NOT go through ``teleop_node`` / device_factory. Its so101 output
+    profile drives the placo cartesian servo, so downstream topic/service names
+    default to ``so101_placo_servo_node`` and this builder also spawns that
+    servo node when ``output_profile == 'so101'``.
+    """
+    nodes = []
+    vr_cfg = device_config.get("vr_config", {}) or {}
+    output_profile = str(vr_cfg.get("output_profile", "humanoid"))
+    # so101 input mode: "velocity" (differential twist → placo integrates) or
+    # "pose" (absolute EE pose passthrough → placo sets its reference). This
+    # single source of truth in vr_config drives BOTH the VR node and the placo
+    # servo node (the placo node's input_mode is overridden below to match).
+    so101_input_mode = str(vr_cfg.get("so101_input_mode", "velocity"))
+    so101_pose_topic = vr_cfg.get("so101_pose_topic", "/so101_placo_servo_node/pose_cmd_base")
+
+    env = prepare_lerobot_env()
+
+    # control_frequency is declared at the device layer (sibling of vr_config)
+    # to match every other teleop device; accept it there as the default and
+    # still allow a vr_config override. Reading only vr_config.control_frequency
+    # silently ignored the device-layer value.
+    control_frequency = float(
+        vr_cfg.get("control_frequency", device_config.get("control_frequency", 50.0))
+    )
+
+    # Resolve the placo start/stop/home service names ONCE (with defaults) so
+    # both the VR node and the placo node below are wired to the same names.
+    # A user override of any of these in vr_config must reach BOTH sides.
+    so101_start_service = vr_cfg.get(
+        "so101_start_service", "/so101_placo_servo_node/start"
+    )
+    so101_stop_service = vr_cfg.get(
+        "so101_stop_service", "/so101_placo_servo_node/stop"
+    )
+    so101_home_service = vr_cfg.get(
+        "so101_home_service", "/so101_placo_servo_node/home"
+    )
+
+    # Downstream placo wiring (overridable via vr_config). base/tool frames come
+    # from the shared cartesian SSOT so the tool→base angular conversion inside
+    # the VR node uses the same frames as the xbox/phone placo path.
+    vr_params = {
+        "host": vr_cfg.get("host", "0.0.0.0"),
+        "port": int(vr_cfg.get("port", 8889)),
+        "control_frequency": control_frequency,
+        "output_profile": output_profile,
+        "controller_side": vr_cfg.get("controller_side", "right"),
+        "base_link_name": vr_cfg.get("base_link_name", base_link_name),
+        "tool_frame": vr_cfg.get("tool_frame", tool_frame),
+        "so101_linear_topic": vr_cfg.get(
+            "so101_linear_topic", "/so101_placo_servo_node/linear_cmd_base"
+        ),
+        "so101_angular_topic": vr_cfg.get(
+            "so101_angular_topic", "/so101_placo_servo_node/angular_cmd_base"
+        ),
+        "so101_gripper_topic": vr_cfg.get(
+            "so101_gripper_topic", "/gripper_position_controller/commands"
+        ),
+        "so101_start_service": so101_start_service,
+        "so101_stop_service": so101_stop_service,
+        "so101_home_service": so101_home_service,
+        "so101_input_mode": so101_input_mode,
+        "so101_pose_topic": so101_pose_topic,
+    }
+    # Forward any remaining tuning knobs verbatim (speed scales, deadzones,
+    # gripper open/closed, tf_stale_threshold_s, position_scale, etc.).
+    _passthrough = {
+        "linear_speed_scale",
+        "angular_speed_scale",
+        "max_linear_speed",
+        "max_angular_speed",
+        "velocity_ema_alpha",
+        "linear_deadzone",
+        "angular_deadzone",
+        "so101_gripper_open",
+        "so101_gripper_closed",
+        "tf_stale_threshold_s",
+        "position_scale",
+        "so101_position_only",
+        "so101_command_stale_s",
+        "so101_home_settle_s",
+    }
+    for key in _passthrough:
+        if key in vr_cfg:
+            vr_params[key] = vr_cfg[key]
+
+    nodes.append(
+        Node(
+            package="robot_teleop",
+            executable="vr_teleop",
+            name="vr_teleop",
+            output="screen",
+            env=env,
+            parameters=[vr_params],
+        )
+    )
+    logger.info(f"Generated vr_teleop (output_profile={output_profile})")
+
+    # so101 profile drives the cartesian servo; spawn placo alongside.
+    if output_profile == "so101":
+        if cart_solver != "placo_servo":
+            raise ValueError(
+                "vr_teleop output_profile=so101 requires cartesian.solver="
+                f"'placo_servo', got {cart_solver!r}"
+            )
+        placo_node = _create_so101_placo_servo_node(
+            robot_config,
+            device_config,
+            robot_description_dict,
+            input_mode=so101_input_mode,
+            pose_cmd_topic=so101_pose_topic,
+            start_service=so101_start_service,
+            stop_service=so101_stop_service,
+            home_service=so101_home_service,
+        )
+        nodes.append(placo_node)
+        logger.info(
+            f"Generated so101_placo_servo_node for VR so101 Cartesian control "
+            f"(input_mode={so101_input_mode})"
+        )
+
+    return nodes
+
+
 def _create_servo_node(robot_config: dict, device_config: dict, robot_description_dict: dict = None) -> Node:
     """Create MoveIt Servo node."""
     import yaml
@@ -444,6 +590,12 @@ def _create_so101_placo_servo_node(
     robot_config: dict,
     device_config: dict,  # noqa: ARG001 — kept for signature parity with siblings
     robot_description_dict: dict = None,
+    *,
+    input_mode: str = None,
+    pose_cmd_topic: str = None,
+    start_service: str = None,
+    stop_service: str = None,
+    home_service: str = None,
 ) -> Node:
     """Launch ``so101_placo_servo_node``.
 
@@ -480,6 +632,42 @@ def _create_so101_placo_servo_node(
     ee_link = moveit_cfg.get("ee_link")
     if ee_link:
         params["ik_link_name"] = ee_link
+
+    # VR pose passthrough: when the caller (VR builder) selects pose mode, override
+    # the servo node's input_mode and pose topic to match vr_config — single
+    # source of truth. Left as the YAML default ("velocity") for xbox/phone.
+    if input_mode is not None:
+        params["input_mode"] = input_mode
+    if pose_cmd_topic is not None:
+        params["pose_cmd_topic"] = pose_cmd_topic
+
+    # Service names MUST match whatever the VR node was told to call. The VR
+    # builder resolves these from vr_config (with the same defaults) and passes
+    # them here so a user override of so101_start/stop/home_service re-targets
+    # BOTH nodes. Forwarding only to the VR node (as before) left placo serving
+    # the default names while VR called the overridden ones — the handshake and
+    # the deadman stop would silently miss.
+    if start_service is not None:
+        params["start_service"] = start_service
+    if stop_service is not None:
+        params["stop_service"] = stop_service
+    if home_service is not None:
+        params["home_service"] = home_service
+
+    # Home pose for the B-button go-home service: inject the EE pose from
+    # embodied.named_poses.home (base frame). The placo node drives the EE here
+    # smoothly when its home service is called. Absent/malformed => left as the
+    # YAML default (zeros), which the node treats as "home disabled".
+    named_poses = ((robot_config.get("embodied", {}) or {}).get("named_poses", {}) or {})
+    home_pose = named_poses.get("home", {}) or {}
+    hp = home_pose.get("position") or {}
+    ho = home_pose.get("orientation") or {}
+    if hp and ho:
+        params["home_position"] = [float(hp.get("x", 0.0)), float(hp.get("y", 0.0)), float(hp.get("z", 0.0))]
+        params["home_orientation"] = [
+            float(ho.get("x", 0.0)), float(ho.get("y", 0.0)),
+            float(ho.get("z", 0.0)), float(ho.get("w", 1.0)),
+        ]
 
     # The node expands the so101 xacro in-memory at runtime via the
     # robot_description package share dir, so robot_description_dict is not

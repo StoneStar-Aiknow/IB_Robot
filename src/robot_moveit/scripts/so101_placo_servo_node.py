@@ -51,7 +51,7 @@ import time
 import numpy as np
 import rclpy
 import tf2_ros
-from geometry_msgs.msg import Vector3Stamped
+from geometry_msgs.msg import PoseStamped, Vector3Stamped
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
@@ -106,6 +106,26 @@ def _rotation_delta(rotvec: np.ndarray) -> np.ndarray:
     return np.eye(3) + np.sin(theta) * k + (1.0 - np.cos(theta)) * (k @ k)
 
 
+def _quat_to_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
+    """Rotation matrix (3x3) from a quaternion (x, y, z, w).
+
+    Normalises defensively; a zero/degenerate quaternion falls back to identity
+    so a malformed pose command cannot inject NaNs into the QP.
+    """
+    n = float(np.sqrt(x * x + y * y + z * z + w * w))
+    if n < 1e-12:
+        return np.eye(3)
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
 class SO101PlacoServoNode(Node):
     """In-process Placo QP differential-IK Cartesian servo for SO-101."""
 
@@ -151,11 +171,30 @@ class SO101PlacoServoNode(Node):
         self.declare_parameter("joint_limits_lower", descriptor=_dyn)
         self.declare_parameter("joint_limits_upper", descriptor=_dyn)
 
+        # Input mode. "velocity" (default): integrate a base-frame twist into
+        # the command reference (xbox/phone path). "pose": consume a relative
+        # clutch pose delta in the base frame (VR passthrough) — the command
+        # reference is SET (not integrated), so a held hand pose holds the arm
+        # with zero drift. PoseStamped.position is added to the measured EE
+        # position latched at enable (ee0); orientation is a base-frame rotation
+        # delta that left-multiplies the latched EE attitude. Clutch baseline
+        # (ee0) and FK live here, not on the VR node.
+        self.declare_parameter("input_mode", "velocity")
+        self.declare_parameter("pose_cmd_topic", "/so101_placo_servo_node/pose_cmd_base")
+
         # Topics & services consumed by PlacoServoBackend.
         self.declare_parameter("linear_cmd_topic", "/so101_placo_servo_node/linear_cmd_base")
         self.declare_parameter("angular_cmd_topic", "/so101_placo_servo_node/angular_cmd_base")
         self.declare_parameter("start_service", "/so101_placo_servo_node/start")
         self.declare_parameter("stop_service", "/so101_placo_servo_node/stop")
+        self.declare_parameter("home_service", "/so101_placo_servo_node/home")
+        # Home EE pose (base frame): position xyz + orientation quaternion xyzw.
+        # Injected from the robot config's named_poses.home by teleop.py. When
+        # the home service is called, _p_ref/_r_ref (and the clutch baseline
+        # ee0) are set to this pose so the QP drives the EE smoothly to home
+        # without dropping enable. Zeros => home disabled (service rejects).
+        self.declare_parameter("home_position", [0.0, 0.0, 0.0])
+        self.declare_parameter("home_orientation", [0.0, 0.0, 0.0, 1.0])
         self.declare_parameter("command_out_topic", "/arm_position_controller/commands")
 
         # Timing.
@@ -201,8 +240,22 @@ class SO101PlacoServoNode(Node):
 
         self.linear_topic = self.get_parameter("linear_cmd_topic").value
         self.angular_topic = self.get_parameter("angular_cmd_topic").value
+        self.pose_topic = self.get_parameter("pose_cmd_topic").value
+        self.input_mode = str(self.get_parameter("input_mode").value).lower()
+        if self.input_mode not in ("velocity", "pose"):
+            raise RuntimeError(f"input_mode must be 'velocity' or 'pose', got {self.input_mode!r}")
         self.start_srv_name = self.get_parameter("start_service").value
         self.stop_srv_name = self.get_parameter("stop_service").value
+        self.home_srv_name = self.get_parameter("home_service").value
+        home_pos = list(self.get_parameter("home_position").value)
+        home_quat = list(self.get_parameter("home_orientation").value)
+        # Precompute the home EE pose (base frame). Enabled only when a non-zero
+        # position was injected; otherwise the home service is a no-op reject.
+        self._home_p = np.array(home_pos, dtype=np.float64) if len(home_pos) == 3 else None
+        self._home_R = (
+            _quat_to_matrix(home_quat[0], home_quat[1], home_quat[2], home_quat[3]) if len(home_quat) == 4 else None
+        )
+        self._home_enabled = self._home_p is not None and bool(np.any(self._home_p))
         self.cmd_out_topic = self.get_parameter("command_out_topic").value
         self.control_period = float(self.get_parameter("control_period").value)
         self.input_timeout = float(self.get_parameter("incoming_command_timeout").value)
@@ -239,6 +292,22 @@ class SO101PlacoServoNode(Node):
         self._latest_linear_stamp: float = 0.0
         self._latest_angular: Vector3Stamped | None = None
         self._latest_angular_stamp: float = 0.0
+        # Pose-mode input: the latest pose command carries a RELATIVE clutch
+        # increment in the base frame. ``position`` is added to the EE position
+        # latched at enable; ``orientation`` is a base-frame rotation delta that
+        # left-multiplies the EE attitude latched at enable.
+        self._latest_pose = None  # PoseStamped | None
+        self._latest_pose_stamp: float = 0.0
+        # Gate for pose-topic acceptance. stop/home close it and only the next
+        # start re-opens it. A pose message that was already in the DDS queue when
+        # a home/stop service call ran therefore cannot land in _on_pose afterward
+        # and revive a stale relative displacement onto the freshly-latched
+        # baseline. The pose topic and service have no cross-entity ordering
+        # guarantee, so clearing _latest_pose alone does not cover an in-flight
+        # message; this gate does.
+        self._accept_pose_commands: bool = False
+        self._ee0_p: np.ndarray | None = None  # measured EE position at enable (base, m)
+        self._ee0_R: np.ndarray | None = None  # measured EE rotation at enable (base, 3x3)
         self._latest_js: JointState | None = None
         self._last_input_time: float = 0.0
 
@@ -252,18 +321,25 @@ class SO101PlacoServoNode(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # ---- ROS I/O ----
+        # Velocity-mode inputs (xbox/phone). Always subscribed so a mode switch
+        # via param reconfigure does not require re-wiring; ignored in pose mode.
         self.create_subscription(Vector3Stamped, self.linear_topic, self._on_linear, 10, callback_group=self.cb_group)
         self.create_subscription(Vector3Stamped, self.angular_topic, self._on_angular, 10, callback_group=self.cb_group)
+        # Pose-mode input (VR passthrough). Only subscribed in pose mode.
+        if self.input_mode == "pose":
+            self.create_subscription(PoseStamped, self.pose_topic, self._on_pose, 10, callback_group=self.cb_group)
         self.create_subscription(JointState, "/joint_states", self._on_joint_state, 10, callback_group=self.cb_group)
         self.cmd_pub = self.create_publisher(Float64MultiArray, self.cmd_out_topic, 10)
         self.create_service(Trigger, self.start_srv_name, self._on_start_srv, callback_group=self.cb_group)
         self.create_service(Trigger, self.stop_srv_name, self._on_stop_srv, callback_group=self.cb_group)
+        self.create_service(Trigger, self.home_srv_name, self._on_home_srv, callback_group=self.cb_group)
 
         # ---- timer (fixed-rate solve+publish for smoothness) ----
         self.create_timer(self.control_period, self._on_control_tick, callback_group=self.cb_group)
 
         self.get_logger().info(
             f"so101_placo_servo_node up: frame={self.planning_frame} ik_link={self.ik_link_name} "
+            f"mode={self.input_mode} "
             f"joints={self.arm_joint_names} rate={1.0 / self.control_period:.0f}Hz "
             f"diffik(damping={self.diffik_damping}, max_speed={self.max_joint_speed}rad/s, "
             f"orientation_weight={0.0 if self.position_only else self.orientation_weight}) "
@@ -282,6 +358,17 @@ class SO101PlacoServoNode(Node):
         self._latest_angular_stamp = self._now()
         self._last_input_time = self._latest_angular_stamp
 
+    def _on_pose(self, msg: PoseStamped) -> None:
+        # Reject pose commands while the gate is closed (between a stop/home and
+        # the next start re-latch). This drops any message that was already
+        # queued in DDS when the service ran, which would otherwise overwrite the
+        # freshly-latched baseline with a stale relative displacement.
+        if not self._accept_pose_commands:
+            return
+        self._latest_pose = msg
+        self._latest_pose_stamp = self._now()
+        self._last_input_time = self._latest_pose_stamp
+
     def _on_joint_state(self, msg: JointState) -> None:
         self._latest_js = msg
 
@@ -299,9 +386,27 @@ class SO101PlacoServoNode(Node):
             return resp
         self._p_ref = self.diffik.ee_position(q)
         self._r_ref = self.diffik.ee_rotation(q)
+        # Clutch baseline for pose mode: incoming relative displacements are
+        # added to this measured EE position latched at enable, and relative
+        # rotations are composed onto this measured EE attitude.
+        self._ee0_p = self._p_ref.copy()
+        self._ee0_R = self._r_ref.copy()
         self._last_cmd = q.copy()
+        # Clear any stale pose command from the previous grip cycle. On trigger
+        # release the VR node stops publishing (arm holds), so _latest_pose is
+        # frozen at the last relative displacement of the PREVIOUS grip. Without
+        # this reset, re-enabling (re-grip) would add that stale displacement
+        # onto the freshly-latched _ee0_p before the first new pose arrives,
+        # jerking the arm hard — especially after moving the hand between grips
+        # (e.g. shifting seat/headset). Dropping it forces pose_stale=True until
+        # a fresh command lands, so the arm holds the new baseline.
+        self._latest_pose = None
+        self._latest_pose_stamp = self._now()
         self._enabled = True
         self._last_input_time = self._now()
+        # Open the pose gate LAST: drop the stale cache, then accept fresh
+        # commands. Any pose queued before this instant was rejected by the gate.
+        self._accept_pose_commands = True
         resp.success = True
         resp.message = "so101_placo_servo_node enabled"
         self.get_logger().info(resp.message)
@@ -309,11 +414,66 @@ class SO101PlacoServoNode(Node):
 
     def _on_stop_srv(self, _req, resp: Trigger.Response) -> Trigger.Response:
         self._enabled = False
+        # Close the pose gate so no queued/late pose message revives a target
+        # while disabled; the next start re-opens it after re-latching.
+        self._accept_pose_commands = False
         self._p_ref = None
         self._r_ref = None
+        self._ee0_p = None
+        self._ee0_R = None
         self._last_cmd = None
         resp.success = True
         resp.message = "so101_placo_servo_node disabled"
+        self.get_logger().info(resp.message)
+        return resp
+
+    def _on_home_srv(self, _req, resp: Trigger.Response) -> Trigger.Response:
+        # Drive the EE to the configured home pose without dropping enable: set
+        # the command reference (and clutch baseline) to home. The QP moves the
+        # arm there smoothly over subsequent ticks (bounded by joint/vel limits).
+        if not self._home_enabled or self._home_R is None:
+            resp.success = False
+            resp.message = "home refused: no home pose configured"
+            self.get_logger().error(resp.message)
+            return resp
+        if not self._enabled:
+            # Need a measured seed so the QP has a valid starting point.
+            q = self._measured_arm_joints()
+            if q is None:
+                resp.success = False
+                resp.message = "home refused: no /joint_states seed available yet"
+                self.get_logger().error(resp.message)
+                return resp
+            self._last_cmd = q.copy()
+            self._enabled = True
+        self._p_ref = self._home_p.copy()
+        self._r_ref = self._home_R.copy()
+        # Re-latch clutch baseline to home so a later trigger press re-grips from
+        # home without the arm jumping.
+        self._ee0_p = self._p_ref.copy()
+        self._ee0_R = self._r_ref.copy()
+        # Drop any pose command cached from before this home request. In pose
+        # mode the hot path (see _on_control_tick) recomputes _p_ref as
+        # _ee0_p + _latest_pose.position every fresh tick. If the trigger is
+        # still held and the hand has moved, _latest_pose still carries the
+        # previous grip's displacement; leaving it would make the very next tick
+        # target home + that displacement instead of home. Same reset _on_start_srv
+        # does; forces pose_stale=True until a fresh command lands, so the arm
+        # holds at home until the user re-grips.
+        self._latest_pose = None
+        self._latest_pose_stamp = self._now()
+        self._last_input_time = self._now()
+        # Keep the pose gate CLOSED after home. A single-threaded executor only
+        # guarantees no pose is interleaved DURING this callback — it cannot tell
+        # a pose that arrives just AFTER the callback returns from a stale one
+        # still queued in DDS from before home ran. Re-opening here would let such
+        # a late stale frame land in _on_pose and re-apply the previous grip's
+        # displacement onto the home baseline. The gate is re-opened only by the
+        # next _on_start_srv, which re-latches the clutch baseline first, so any
+        # pose accepted after that is measured against home, not the old grip.
+        self._accept_pose_commands = False
+        resp.success = True
+        resp.message = "so101_placo_servo_node moving to home"
         self.get_logger().info(resp.message)
         return resp
 
@@ -353,54 +513,93 @@ class SO101PlacoServoNode(Node):
             return
         q_cmd_seed = self._last_cmd.copy() if self._last_cmd is not None else q_measured.copy()
 
-        # --- linear velocity (base frame, m/s) ---
-        # Hold to zero when input is stale or after a long idle.
         idle = (now - self._last_input_time) > self.target_reset_timeout
-        if idle or self._latest_linear is None or (now - self._latest_linear_stamp) > self.input_timeout:
-            v = np.zeros(3)
-        else:
-            lv = self._latest_linear.vector
-            v = np.array([lv.x, lv.y, lv.z], dtype=np.float64)
 
-        # --- angular velocity (base frame, rad/s) ---
-        # Integrate a command-side orientation reference. The backend has
-        # already converted tool-frame stick semantics into base-frame angular
-        # velocity for placo_servo.
-        if (
-            self.position_only
-            or idle
-            or self._latest_angular is None
-            or (now - self._latest_angular_stamp) > self.input_timeout
-        ):
-            w = np.zeros(3)
+        if self.input_mode == "pose":
+            # === Pose passthrough (VR) ===
+            # The command reference is SET from a relative clutch command, not
+            # integrated. Incoming PoseStamped.position is a relative EE
+            # displacement (hand delta * scale) added to the clutch baseline
+            # (_ee0_p, the measured EE latched at enable). Its orientation is a
+            # base-frame rotation delta that left-multiplies the latched EE
+            # attitude. Because the reference is set (not accumulated), a held
+            # hand pose holds the arm with zero drift and a stopped hand stops the
+            # arm immediately — no residual integration.
+            pose_stale = self._latest_pose is None or (now - self._latest_pose_stamp) > self.input_timeout
+            if self._p_ref is None or self._ee0_p is None or self._ee0_R is None:
+                self._p_ref = self.diffik.ee_position(q_measured)
+                self._r_ref = self.diffik.ee_rotation(q_measured)
+                self._ee0_p = self._p_ref.copy()
+                self._ee0_R = self._r_ref.copy()
+                q_cmd_seed = q_measured.copy()
+            elif not pose_stale:
+                # Fresh pose command: position is a relative displacement added
+                # to the clutch baseline; orientation is a relative rotation
+                # composed onto the baseline EE attitude. rel_R comes from VR as
+                # an increment in the BASE frame (same frame as the position
+                # delta: ΔR_base = R_current * R_clutch^-1), so it must
+                # LEFT-multiply: r_ref = rel_R @ ee0_R. Using ee0_R @ rel_R would
+                # treat rel_R as a tool/body-frame increment, which couples a
+                # single-axis wrist turn into a compound EE motion. At the press
+                # instant rel_R = identity so the arm holds. The VR node
+                # (vr_teleop._control_so101_pose) produces rel_R under exactly
+                # this base-frame contract.
+                p = self._latest_pose.pose.position
+                q_ = self._latest_pose.pose.orientation
+                self._p_ref = self._ee0_p + np.array([p.x, p.y, p.z], dtype=np.float64)
+                if not self.position_only:
+                    rel_R = _quat_to_matrix(q_.x, q_.y, q_.z, q_.w)
+                    self._r_ref = rel_R @ self._ee0_R
+            # else: stale/idle -> hold last _p_ref/_r_ref unchanged (arm holds).
         else:
-            av = self._latest_angular.vector
-            w = np.array([av.x, av.y, av.z], dtype=np.float64)
+            # === Velocity integration (xbox/phone) ===
+            # --- linear velocity (base frame, m/s) ---
+            # Hold to zero when input is stale or after a long idle.
+            if idle or self._latest_linear is None or (now - self._latest_linear_stamp) > self.input_timeout:
+                v = np.zeros(3)
+            else:
+                lv = self._latest_linear.vector
+                v = np.array([lv.x, lv.y, lv.z], dtype=np.float64)
 
-        # === Command-side reference (the gravity-ratchet fix) ===
-        # _p_ref is the EE position the arm is commanded to hold. It is advanced
-        # by v*dt ONLY when the user commands motion; a zero hold leaves it
-        # fixed. On a real arm the measured joints sag under gravity, so the
-        # measured EE drifts away from _p_ref — and because the QP targets the
-        # FIXED _p_ref (not "v*dt from the sagging measured pose"), it actively
-        # corrects the sag instead of welding it in (the hardware bug).
-        #
-        # Do NOT re-snap _p_ref just because the sticks are idle: that would
-        # reintroduce the hardware gravity ratchet after target_reset_timeout
-        # (the reference would repeatedly accept the sagging measured pose).
-        # Re-snap only when the reference is missing (startup/recovery); use the
-        # stop/start service if a human physically moved or blocked the arm and
-        # wants to accept the new pose as the command baseline.
-        if self._p_ref is None:
-            self._p_ref = self.diffik.ee_position(q_measured)
-            self._r_ref = self.diffik.ee_rotation(q_measured)
-            q_cmd_seed = q_measured.copy()
-        else:
-            self._p_ref = self._p_ref + v * dt
-            if not self.position_only:
-                if self._r_ref is None:
-                    self._r_ref = self.diffik.ee_rotation(q_measured)
-                self._r_ref = _rotation_delta(w * dt) @ self._r_ref
+            # --- angular velocity (base frame, rad/s) ---
+            # Integrate a command-side orientation reference. The backend has
+            # already converted tool-frame stick semantics into base-frame angular
+            # velocity for placo_servo.
+            if (
+                self.position_only
+                or idle
+                or self._latest_angular is None
+                or (now - self._latest_angular_stamp) > self.input_timeout
+            ):
+                w = np.zeros(3)
+            else:
+                av = self._latest_angular.vector
+                w = np.array([av.x, av.y, av.z], dtype=np.float64)
+
+            # === Command-side reference (the gravity-ratchet fix) ===
+            # _p_ref is the EE position the arm is commanded to hold. It is advanced
+            # by v*dt ONLY when the user commands motion; a zero hold leaves it
+            # fixed. On a real arm the measured joints sag under gravity, so the
+            # measured EE drifts away from _p_ref — and because the QP targets the
+            # FIXED _p_ref (not "v*dt from the sagging measured pose"), it actively
+            # corrects the sag instead of welding it in (the hardware bug).
+            #
+            # Do NOT re-snap _p_ref just because the sticks are idle: that would
+            # reintroduce the hardware gravity ratchet after target_reset_timeout
+            # (the reference would repeatedly accept the sagging measured pose).
+            # Re-snap only when the reference is missing (startup/recovery); use the
+            # stop/start service if a human physically moved or blocked the arm and
+            # wants to accept the new pose as the command baseline.
+            if self._p_ref is None:
+                self._p_ref = self.diffik.ee_position(q_measured)
+                self._r_ref = self.diffik.ee_rotation(q_measured)
+                q_cmd_seed = q_measured.copy()
+            else:
+                self._p_ref = self._p_ref + v * dt
+                if not self.position_only:
+                    if self._r_ref is None:
+                        self._r_ref = self.diffik.ee_rotation(q_measured)
+                    self._r_ref = _rotation_delta(w * dt) @ self._r_ref
 
         # === QP step toward the absolute reference (Jacobian + QP) ===
         # Seeded from the command-side joints; target is the command-side _p_ref.
