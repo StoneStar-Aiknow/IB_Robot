@@ -114,18 +114,26 @@ class ASRInferenceModule:
 
             if self._model_type == ModelType.STREAMING:
                 recognizer = self._create_streaming_recognizer(model_path, tokens_path, provider)
-                sample_rate = recognizer.config.feat_config.sampling_rate
             else:
                 recognizer = self._create_offline_recognizer(model_path, tokens_path, provider)
-                sample_rate = 16000
 
             if recognizer is None:
                 raise RuntimeError(
                     "Recognizer factory returned None. Check model_path, tokens_path, and provider settings."
                 )
 
+            # 流式和离线模型都必须从 recognizer 配置读取真实采样率，
+            # 不能用默认值代替，否则节点层无法验证完整音频链路契约。
+            feat_config = getattr(getattr(recognizer, "config", None), "feat_config", None)
+            sample_rate = getattr(feat_config, "sampling_rate", None)
+            if sample_rate is None:
+                raise RuntimeError(
+                    "Unable to determine ASR model sampling rate; "
+                    "the Voice ASR audio pipeline contract cannot be verified"
+                )
+
             self._recognizer = recognizer
-            self._sample_rate = sample_rate
+            self._sample_rate = int(sample_rate)
             self.state = ASRState.READY
             return True
 
