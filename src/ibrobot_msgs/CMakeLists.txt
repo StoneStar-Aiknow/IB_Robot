@@ -43,11 +43,13 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/PrimitiveCommand.action"
   "srv/RecognizeFile.srv"
   "srv/SetHotwords.srv"
+  "srv/MoveToConfiguration.srv"
   "srv/MoveToPose.srv"
   "srv/ValidateSkill.srv"
   "srv/ValidatePrimitive.srv"
   "srv/DetectSegment.srv"
   "srv/PlanGrasp.srv"
+  "srv/VerifyGrasp.srv"
   DEPENDENCIES std_msgs action_msgs builtin_interfaces geometry_msgs sensor_msgs
 )
 

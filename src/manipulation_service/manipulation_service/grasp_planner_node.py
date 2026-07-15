@@ -22,7 +22,10 @@ from std_msgs.msg import Header
 from ibrobot_msgs.msg import GraspCandidate, GraspCandidateArray
 from ibrobot_msgs.srv import DetectSegment, PlanGrasp
 
-from .graspgen_wrapper import GraspDiagnostic, GraspGenWrapper
+from .graspgen_wrapper import (
+    GraspDiagnostic,
+    GraspGenWrapper,
+)
 
 _DEBUG_OUTPUT_DEFAULT = "default"
 _DEBUG_OUTPUT_NONE = "none"
@@ -106,6 +109,17 @@ def _diagnostic_to_lines(diag: GraspDiagnostic, *, detection_confidence: float |
             f"valid_depth_pixel_count: {diag.valid_depth_pixel_count}",
             f"valid_depth_in_mask_count: {diag.valid_depth_in_mask_count}",
             f"valid_depth_ratio_in_mask: {diag.valid_depth_ratio_in_mask:.3f}",
+            f"object_cloud_completion_enabled: {diag.object_cloud_completion_enabled}",
+            f"object_cloud_completion_mode: {diag.object_cloud_completion_mode}",
+            f"object_point_count_raw: {diag.object_point_count_raw}",
+            f"object_point_count_completed: {diag.object_point_count_completed}",
+            f"object_completion_added_count: {diag.object_completion_added_count}",
+            f"object_prismatic_extrude_enabled: {diag.object_prismatic_extrude_enabled}",
+            f"object_prismatic_extrude_added_count: {diag.object_prismatic_extrude_added_count}",
+            f"object_point_count_graspgen_input: {diag.object_point_count_graspgen_input}",
+            f"scene_cloud_table_holes_enabled: {diag.scene_cloud_table_holes_enabled}",
+            f"scene_point_count_raw: {diag.scene_point_count_raw}",
+            f"scene_table_hole_added_count: {diag.scene_table_hole_added_count}",
             f"object_point_count: {diag.object_point_count}",
             f"scene_point_count: {diag.scene_point_count}",
             f"raw_grasp_count: {diag.raw_grasp_count}",
@@ -142,6 +156,17 @@ def _diagnostic_to_dict(diag: GraspDiagnostic, *, detection_confidence: float | 
         "valid_depth_pixel_count": int(diag.valid_depth_pixel_count),
         "valid_depth_in_mask_count": int(diag.valid_depth_in_mask_count),
         "valid_depth_ratio_in_mask": float(diag.valid_depth_ratio_in_mask),
+        "object_cloud_completion_enabled": bool(diag.object_cloud_completion_enabled),
+        "object_cloud_completion_mode": diag.object_cloud_completion_mode,
+        "object_point_count_raw": int(diag.object_point_count_raw),
+        "object_point_count_completed": int(diag.object_point_count_completed),
+        "object_completion_added_count": int(diag.object_completion_added_count),
+        "object_prismatic_extrude_enabled": bool(diag.object_prismatic_extrude_enabled),
+        "object_prismatic_extrude_added_count": int(diag.object_prismatic_extrude_added_count),
+        "object_point_count_graspgen_input": int(diag.object_point_count_graspgen_input),
+        "scene_cloud_table_holes_enabled": bool(diag.scene_cloud_table_holes_enabled),
+        "scene_point_count_raw": int(diag.scene_point_count_raw),
+        "scene_table_hole_added_count": int(diag.scene_table_hole_added_count),
         "object_point_count": int(diag.object_point_count),
         "scene_point_count": int(diag.scene_point_count),
         "raw_grasp_count": int(diag.raw_grasp_count),
@@ -227,6 +252,34 @@ def _build_debug_point_clouds(depth_m, mask, fx, fy, cx, cy):
     all_pts = np.vstack([object_pts, scene_pts]).astype(np.float32)
     all_colors = np.vstack([object_colors, scene_colors]).astype(np.uint8)
     return scene_pts, scene_colors, object_pts, object_colors, all_pts, all_colors
+
+
+def _debug_points_or_fallback(points: np.ndarray | None, fallback: np.ndarray) -> np.ndarray:
+    if points is None:
+        return fallback.astype(np.float32, copy=False)
+    arr = np.asarray(points, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] != 3:
+        return fallback.astype(np.float32, copy=False)
+    return arr
+
+
+def _object_stage_colors(total: int, raw_count: int, inpaint_count: int) -> np.ndarray:
+    colors = np.tile(np.array([[0, 255, 0]], dtype=np.uint8), (max(0, int(total)), 1))
+    raw_end = min(max(0, int(raw_count)), len(colors))
+    inpaint_end = min(raw_end + max(0, int(inpaint_count)), len(colors))
+    if inpaint_end > raw_end:
+        colors[raw_end:inpaint_end] = np.array([255, 170, 0], dtype=np.uint8)
+    if inpaint_end < len(colors):
+        colors[inpaint_end:] = np.array([0, 200, 255], dtype=np.uint8)
+    return colors
+
+
+def _scene_stage_colors(total: int, raw_count: int) -> np.ndarray:
+    colors = np.tile(np.array([[180, 180, 180]], dtype=np.uint8), (max(0, int(total)), 1))
+    raw_end = min(max(0, int(raw_count)), len(colors))
+    if raw_end < len(colors):
+        colors[raw_end:] = np.array([168, 85, 247], dtype=np.uint8)
+    return colors
 
 
 def _save_ply(pts, colors, out_path: Path):
@@ -580,7 +633,6 @@ def _render_debug_previews(
     logger,
     file_prefix: str = "grasp",
 ):
-    preview_name = f"{file_prefix}_preview.png"
     labeled_preview_name = f"{file_prefix}_preview_labeled.png"
     interactive_name = f"{file_prefix}_preview.html"
     metadata_name = f"{file_prefix}_preview_meta.json"
@@ -600,22 +652,6 @@ def _render_debug_previews(
         "interactive": [],
         "errors": [],
     }
-
-    try:
-        _save_labeled_preview(
-            pts,
-            colors,
-            candidates,
-            gripper_name,
-            out_dir / preview_name,
-            max_grasps,
-            width,
-            height,
-            False,
-        )
-        metadata["images"].append(preview_name)
-    except Exception as exc:
-        metadata["errors"].append(f"preview: {exc}")
 
     if render_labels:
         try:
@@ -710,6 +746,16 @@ class GraspPlannerNode(Node):
         self.declare_parameter("target_width_percentile_high", 95.0)
         self.declare_parameter("target_width_min_m", 0.005)
         self.declare_parameter("target_width_max_m", 0.14)
+        self.declare_parameter("enable_object_cloud_completion", True)
+        self.declare_parameter("object_cloud_completion_mode", "mask_depth_inpaint")
+        self.declare_parameter("object_cloud_completion_max_points", 5000)
+        self.declare_parameter("object_cloud_completion_kernel_size", 5)
+        self.declare_parameter("object_cloud_completion_min_neighbors", 6)
+        self.declare_parameter("enable_object_cloud_prismatic_extrude", True)
+        self.declare_parameter("object_cloud_prismatic_extrude_max_points", 8000)
+        self.declare_parameter("object_cloud_prismatic_extrude_layers", 8)
+        self.declare_parameter("enable_scene_cloud_table_holes", True)
+        self.declare_parameter("scene_cloud_table_holes_max_points", 8000)
         self.declare_parameter("input_buffer_size", 30)
         self.declare_parameter("sync_max_age_sec", 0.20)
         self.declare_parameter("save_debug_outputs", False)
@@ -998,7 +1044,33 @@ class GraspPlannerNode(Node):
             depth_m, binary_mask, fx, fy, cx, cy
         )
 
+        object_raw_pts = _debug_points_or_fallback(diagnostic.object_pc_raw, object_pts)
+        object_raw_colors = np.tile(np.array([[0, 255, 0]], dtype=np.uint8), (len(object_raw_pts), 1))
+        object_pts = _debug_points_or_fallback(diagnostic.object_pc_after_completion, object_raw_pts)
+        object_colors = _object_stage_colors(
+            len(object_pts),
+            diagnostic.object_point_count_raw,
+            diagnostic.object_completion_added_count,
+        )
+        object_graspgen_input_pts = _debug_points_or_fallback(diagnostic.object_pc_inference_input, object_pts)
+        object_graspgen_input_colors = np.tile(
+            np.array([[0, 200, 255]], dtype=np.uint8),
+            (len(object_graspgen_input_pts), 1),
+        )
+        scene_pts_raw_count = int(diagnostic.scene_point_count_raw) or len(scene_pts)
+        scene_pts = _debug_points_or_fallback(diagnostic.scene_pc_after_completion, scene_pts)
+        scene_colors = _scene_stage_colors(len(scene_pts), scene_pts_raw_count)
+
+        all_pts = np.vstack([object_pts, scene_pts]).astype(np.float32)
+        all_colors = np.vstack([object_colors, scene_colors]).astype(np.uint8)
+
         _save_ply(object_pts, object_colors, out_dir / "object_cloud.ply")
+        if diagnostic.object_cloud_completion_enabled or diagnostic.object_prismatic_extrude_enabled:
+            _save_ply(object_raw_pts, object_raw_colors, out_dir / "object_cloud_raw.ply")
+            _save_ply(object_pts, object_colors, out_dir / "object_cloud_completed.ply")
+            _save_ply(
+                object_graspgen_input_pts, object_graspgen_input_colors, out_dir / "object_cloud_graspgen_input.ply"
+            )
         _save_ply(scene_pts, scene_colors, out_dir / "scene_cloud.ply")
         _save_ply(all_pts, all_colors, out_dir / "grasp_cloud.ply")
 
@@ -1010,14 +1082,24 @@ class GraspPlannerNode(Node):
         render_enabled = self.get_parameter("debug_render_preview").get_parameter_value().bool_value
         result["pointcloud"] = {
             "object_cloud": "object_cloud.ply",
+            "object_cloud_raw": "object_cloud_raw.ply"
+            if diagnostic.object_cloud_completion_enabled or diagnostic.object_prismatic_extrude_enabled
+            else None,
+            "object_cloud_completed": "object_cloud_completed.ply"
+            if diagnostic.object_cloud_completion_enabled or diagnostic.object_prismatic_extrude_enabled
+            else None,
+            "object_cloud_graspgen_input": "object_cloud_graspgen_input.ply"
+            if diagnostic.object_cloud_completion_enabled or diagnostic.object_prismatic_extrude_enabled
+            else None,
             "scene_cloud": "scene_cloud.ply",
             "grasp_cloud": "grasp_cloud.ply",
             "object_points": len(object_pts),
+            "object_points_raw": len(object_raw_pts),
+            "object_points_graspgen_input": len(object_graspgen_input_pts),
             "scene_points": len(scene_pts),
         }
         result["render"] = {
             "scheduled": bool(render_enabled),
-            "preview": "grasp_preview.png",
             "labeled_preview": "grasp_preview_labeled.png",
             "interactive_preview": "grasp_preview.html",
             "metadata": "grasp_preview_meta.json",
@@ -1221,6 +1303,36 @@ class GraspPlannerNode(Node):
                 .double_value,
                 target_width_min_m=self.get_parameter("target_width_min_m").get_parameter_value().double_value,
                 target_width_max_m=self.get_parameter("target_width_max_m").get_parameter_value().double_value,
+                enable_object_cloud_completion=self.get_parameter("enable_object_cloud_completion")
+                .get_parameter_value()
+                .bool_value,
+                object_cloud_completion_mode=self.get_parameter("object_cloud_completion_mode")
+                .get_parameter_value()
+                .string_value,
+                object_cloud_completion_max_points=int(
+                    self.get_parameter("object_cloud_completion_max_points").get_parameter_value().integer_value
+                ),
+                object_cloud_completion_kernel_size=int(
+                    self.get_parameter("object_cloud_completion_kernel_size").get_parameter_value().integer_value
+                ),
+                object_cloud_completion_min_neighbors=int(
+                    self.get_parameter("object_cloud_completion_min_neighbors").get_parameter_value().integer_value
+                ),
+                enable_object_cloud_prismatic_extrude=self.get_parameter("enable_object_cloud_prismatic_extrude")
+                .get_parameter_value()
+                .bool_value,
+                object_cloud_prismatic_extrude_max_points=int(
+                    self.get_parameter("object_cloud_prismatic_extrude_max_points").get_parameter_value().integer_value
+                ),
+                object_cloud_prismatic_extrude_layers=int(
+                    self.get_parameter("object_cloud_prismatic_extrude_layers").get_parameter_value().integer_value
+                ),
+                enable_scene_cloud_table_holes=self.get_parameter("enable_scene_cloud_table_holes")
+                .get_parameter_value()
+                .bool_value,
+                scene_cloud_table_holes_max_points=int(
+                    self.get_parameter("scene_cloud_table_holes_max_points").get_parameter_value().integer_value
+                ),
             )
         except Exception as exc:
             self.get_logger().error(f"GraspGen error: {exc}")

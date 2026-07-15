@@ -259,6 +259,7 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
     direction_mapping = execution.get("relative_motion_direction_mapping", {})
     planner = data.get("planner", {})
     perception = data.get("perception", {})
+    entry = data.get("entry", {})
     timeout_policy = resolve_embodied_timeout_policy(data)
 
     return EmbodiedConfig(
@@ -283,6 +284,7 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         relative_motion_direction_mapping=direction_mapping,
         planner=planner,
         perception=perception,
+        entry=entry,
         gripper_open_position=execution.get("gripper_open_position", 1.0),
         gripper_closed_position=execution.get("gripper_closed_position", 0.0),
         skill_templates=data.get("skill_templates", {}),
@@ -418,6 +420,52 @@ def _validate_vlm_runtime_config(
     _validate_vlm_api_config(errors, section_path, config.get("vlm_api", {}), valid_providers, required_reason)
     if float(timeout_policy.get("model_idle_timeout_sec", 0.0)) <= 0.0:
         errors.append("embodied.timeouts.model_idle_timeout_sec must be greater than zero")
+
+
+def validate_visual_games_consistency(entry: dict[str, Any], perception: dict[str, Any]) -> list[str]:
+    """Check the visual-games <-> perception enable consistency rule.
+
+    Any enabled ``embodied.entry.visual_games.<name>`` routes its trigger to
+    ``perception_service``; if perception is disabled the request lands on a
+    topic nobody consumes. This is the single source of truth for that rule,
+    shared by both the typed :func:`validate_config` and the raw-dict launch
+    entry :func:`validate_embodied_launch_dict`.
+    """
+    errors: list[str] = []
+    games = entry.get("visual_games", {})
+    if isinstance(games, dict):
+        enabled_games = [
+            name for name, policy in games.items() if isinstance(policy, dict) and policy.get("enabled", False)
+        ]
+        if enabled_games and not perception.get("enabled", False):
+            errors.append(
+                "embodied.entry.visual_games requires "
+                "embodied.perception.enabled: true when any game is enabled "
+                f"({enabled_games})"
+            )
+    return errors
+
+
+def validate_embodied_launch_dict(config: dict[str, Any]) -> list[str]:
+    """Validate the embodied consistency rules a launch consumer must honor.
+
+    Launch files (e.g. ``embodied_pipeline.launch.py``) load a raw config dict
+    via :func:`load_robot_config_dict` and apply ``with_perception`` / game
+    overrides before generating nodes. They cannot cheaply build a typed
+    :class:`RobotConfig`, so this is the canonical raw-dict gate they call after
+    applying overrides. It intentionally covers only the launch-relevant
+    game/perception consistency (the full typed validation needs a
+    ``RobotConfig``) and reuses :func:`validate_visual_games_consistency` so the
+    rule stays single-sourced.
+
+    Returns a list of error strings (empty when the config is launchable).
+    """
+    embodied = config.get("embodied", {})
+    if not isinstance(embodied, dict) or not embodied.get("enabled", False):
+        return []
+    entry = embodied.get("entry", {}) or {}
+    perception = embodied.get("perception", {}) or {}
+    return validate_visual_games_consistency(entry, perception)
 
 
 def validate_config(config: RobotConfig) -> list[str]:
@@ -644,6 +692,8 @@ def validate_config(config: RobotConfig) -> list[str]:
                 valid_vlm_api_providers,
                 "perception is enabled",
             )
+
+        errors.extend(validate_visual_games_consistency(config.embodied.entry or {}, perception))
 
         if float(timeout_policy.get("task_budget_sec", 0.0)) <= 0.0:
             errors.append("embodied.timeouts.task_budget_sec must be greater than zero")

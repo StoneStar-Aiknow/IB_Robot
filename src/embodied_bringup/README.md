@@ -73,3 +73,8 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 - 当前具身闭环要求 `control_mode:=moveit_planning` 或名称中包含 `moveit` 的兼容控制模式。
 - 自然语言规则入口只支持观察、回位、夹爪开合、相对移动和夹爪旋转等最小闭环动作。
 - 抓取、放置、目标物操作当前不由规则入口直接生成；应通过后续 VLM/显式技能链路完善。
+- 视觉趣味游戏（分院帽等）由 `task_entry_node` 路由到 `perception_service`：触发别名与开关来自
+  `embodied.entry.visual_games`，camera/VLM/timeout 仍由 `embodied.perception` 唯一管理。
+  启用某游戏需**同时**置 `embodied.perception.enabled: true` 与该游戏的 `enabled: true`；若 launch
+  override（如 `with_perception:=false`）造成不一致，`embodied_pipeline.launch.py` 会在生成节点前 fail-fast
+  拒绝启动，避免生成不一致的运行时节点图。

@@ -80,3 +80,72 @@ def test_generate_embodied_nodes_passes_arm_joint_metadata(config_name):
 
     assert _decode_launch_json_string(params["arm_joint_names_json"]) == ["1", "2", "3", "4", "5"]
     assert set(_decode_launch_json_string(params["joint_limits_json"]).keys()) >= {"1", "2", "3", "4", "5"}
+
+
+def test_no_interaction_skills_node_is_generated():
+    robot_config = {
+        "embodied": {
+            "enabled": True,
+            "execution": {},
+            "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
+            "planner": {},
+            "perception": {"enabled": True},
+        }
+    }
+
+    nodes = generate_embodied_nodes(robot_config, active_control_mode="moveit_planning")
+
+    node_names = [vars(node)["_Node__node_name"] for node in nodes]
+    assert "interaction_skills_node" not in node_names
+
+    task_entry = next(node for node in nodes if vars(node)["_Node__node_name"] == "task_entry_node")
+    params = _normalize_launch_param_mapping(task_entry._Node__parameters[0])
+    assert "perception_request_topic" in params
+    assert "entry_visual_games_json" in params
+    games = _decode_launch_json_string(params["entry_visual_games_json"])
+    assert games["sorting_hat"]["enabled"] is True
+    assert params["perception_enabled"] is True
+
+
+class _FakeLaunchContext:
+    def __init__(self, launch_configurations):
+        self.launch_configurations = launch_configurations
+
+
+def _load_launch_module():
+    """Load the ``.launch.py`` file by path (not an importable package module)."""
+    import importlib.util
+
+    launch_path = Path(__file__).parents[1] / "launch" / "embodied_pipeline.launch.py"
+    spec = importlib.util.spec_from_file_location("embodied_pipeline_launch", launch_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_launch_setup_aborts_when_game_enabled_but_perception_disabled():
+    """with_perception:=false while a game is enabled must fail the launch, not
+    start a node graph that routes the game to a dead topic. The validation gate
+    runs before any base-launch include, so this raises without needing ROS
+    share dirs."""
+    module = _load_launch_module()
+
+    fake_config = {
+        "embodied": {
+            "enabled": True,
+            "perception": {"enabled": True},
+            "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
+        }
+    }
+    module._load_config = lambda *args, **kwargs: fake_config
+
+    context = _FakeLaunchContext(
+        {
+            "robot_config": "so101_single_arm",
+            "with_embodied": "true",
+            "with_perception": "false",
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="visual_games"):
+        module.launch_setup(context)

@@ -155,11 +155,23 @@ def _build_gripper_lines(transform, gripper_name):
 
 
 def _save_json(candidates, elapsed, out_path, gripper_name, diagnostic):
+    diagnostic_data = asdict(diagnostic)
+    for key in (
+        "object_pc_raw",
+        "object_pc_after_completion",
+        "object_pc_inference_input",
+        "scene_pc_after_completion",
+    ):
+        value = diagnostic_data.pop(key, None)
+        if value is not None:
+            diagnostic_data[f"{key}_shape"] = list(value.shape)
+            diagnostic_data[f"{key}_dtype"] = str(value.dtype)
+
     results = {
         "gripper": gripper_name,
         "inference_time_s": round(elapsed, 3),
         "num_grasps": len(candidates),
-        "diagnostic": asdict(diagnostic),
+        "diagnostic": diagnostic_data,
         "grasps": [],
     }
     for i, g in enumerate(candidates):
@@ -376,6 +388,8 @@ def test_with_existing_data(
     adaptive_tabletop_retry_clearances: str = "0.002,0.001",
     adaptive_tabletop_retry_pregrasp_height_ratio: float = 1.5,
     adaptive_tabletop_retry_hard_floor: float = -0.003,
+    enable_scene_cloud_table_holes: bool = False,
+    scene_cloud_table_holes_max_points: int = 8000,
     fx: float | None = None,
     fy: float | None = None,
     cx: float | None = None,
@@ -462,6 +476,8 @@ def test_with_existing_data(
         adaptive_tabletop_retry_clearances=_parse_float_csv(adaptive_tabletop_retry_clearances),
         adaptive_tabletop_retry_pregrasp_height_ratio=adaptive_tabletop_retry_pregrasp_height_ratio,
         adaptive_tabletop_retry_hard_floor=adaptive_tabletop_retry_hard_floor,
+        enable_scene_cloud_table_holes=enable_scene_cloud_table_holes,
+        scene_cloud_table_holes_max_points=scene_cloud_table_holes_max_points,
     )
 
     elapsed = time.time() - t0
@@ -667,9 +683,13 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--tabletop-filter-mode",
-        choices=("strict", "adaptive", "soft"),
+        choices=("strict", "adaptive", "soft", "diagnostic"),
         default="strict",
-        help="Tabletop filtering mode: strict keeps fixed thresholds; adaptive relaxes low-profile objects; soft also keeps near-safe fallback grasps.",
+        help=(
+            "Tabletop filtering mode: strict keeps fixed thresholds; adaptive relaxes low-profile objects; "
+            "soft also keeps near-safe fallback grasps; diagnostic records Robotiq tabletop clearance "
+            "without filtering candidates."
+        ),
     )
     parser.add_argument("--adaptive-tabletop-low-profile-height", type=float, default=0.035)
     parser.add_argument("--adaptive-tabletop-clearance-min", type=float, default=0.001)
@@ -691,6 +711,18 @@ if __name__ == "__main__":
     )
     parser.add_argument("--adaptive-tabletop-retry-pregrasp-height-ratio", type=float, default=1.5)
     parser.add_argument("--adaptive-tabletop-retry-hard-floor", type=float, default=-0.003)
+    parser.add_argument(
+        "--enable-scene-cloud-table-holes",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable scene table dense local patch generation for offline collision/tabletop testing (default: False).",
+    )
+    parser.add_argument(
+        "--scene-cloud-table-holes-max-points",
+        type=int,
+        default=8000,
+        help="Maximum generated scene table patch points when enabled (default: 8000).",
+    )
     parser.add_argument("--fx", type=float, default=None, help="Camera focal length fx")
     parser.add_argument("--fy", type=float, default=None, help="Camera focal length fy")
     parser.add_argument("--cx", type=float, default=None, help="Camera principal point cx")
@@ -730,6 +762,8 @@ if __name__ == "__main__":
         adaptive_tabletop_retry_clearances=args.adaptive_tabletop_retry_clearances,
         adaptive_tabletop_retry_pregrasp_height_ratio=args.adaptive_tabletop_retry_pregrasp_height_ratio,
         adaptive_tabletop_retry_hard_floor=args.adaptive_tabletop_retry_hard_floor,
+        enable_scene_cloud_table_holes=args.enable_scene_cloud_table_holes,
+        scene_cloud_table_holes_max_points=args.scene_cloud_table_holes_max_points,
         fx=args.fx,
         fy=args.fy,
         cx=args.cx,

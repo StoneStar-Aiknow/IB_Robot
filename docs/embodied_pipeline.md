@@ -13,6 +13,7 @@ flowchart TD
     ASR["ASR 语音识别<br/>/voice_command<br/>(std_msgs/String)"]
 
     subgraph task_entry["task_entry_node<br/>(embodied_agent)"]
+        TE_GAME{"命中视觉游戏触发词?<br/>(如 分院帽)"}
         TE_PARSE["parse_text_command()<br/>规则匹配中文指令"]
         TE_DIRECT{"命中规则?"}
     end
@@ -53,9 +54,14 @@ flowchart TD
     ROBOT["机械臂驱动层<br/>/cmd_pose<br/>/joint_states<br/>/robot_status/ee_pose"]
 
     ASR -->|"/voice_command"| task_entry
+    TE_GAME -->|"命中: 发 SceneAnalysisRequest 后立即返回<br/>source=game.&lt;name&gt;"| PERC_REQ["/embodied/perception_request"]
+    TE_GAME -->|"未命中"| TE_PARSE
     TE_PARSE --> TE_DIRECT
     TE_DIRECT -->|"有 skill_sequence"| PLANNED_DIRECT["/embodied/planned_task"]
     TE_DIRECT -->|"无 skill_sequence"| UNPLANNED["/embodied/task_command"]
+
+    PERC_REQ --> perception
+    perception -->|"/embodied/perception_result<br/>(游戏结果，不进 planner/executor)"| GAME_RESULT["视觉游戏结果消费者"]
 
     UNPLANNED --> vlm_planner
     UNPLANNED --> task_planner
@@ -93,7 +99,7 @@ flowchart TD
 
 | 节点 | 包 | 订阅 | 发布 | Service（server） | Action（server） | Action（client） |
 |---|---|---|---|---|---|---|
-| `task_entry_node` | embodied_agent | `/voice_command` | `/embodied/task_command`<br/>`/embodied/planned_task`<br/>`/embodied/task_status` | — | — | — |
+| `task_entry_node` | embodied_agent | `/voice_command` | `/embodied/task_command`<br/>`/embodied/planned_task`<br/>`/embodied/perception_request`<br/>`/embodied/task_status` | — | — | — |
 | `task_planner_node` | embodied_agent | `/embodied/task_command` | `/embodied/planned_task`<br/>`/embodied/task_status` | — | — | — |
 | `vlm_task_planner_node` | vlm_task_planner | `/embodied/task_command`<br/>camera topics<br/>ee_pose / joint_states | `/embodied/planned_task`<br/>`/embodied/task_status` | — | — | — |
 | `task_executor_node` | embodied_agent | `/embodied/planned_task` | `/embodied/task_status` | — | — | `/embodied/execute_skill` (SkillCommand) |
@@ -107,11 +113,15 @@ flowchart TD
 
 ### 3.1 task_entry_node — 指令入口
 
-**职责**：将 ASR 文本转化为带上下文的 `TaskCommand`，并决定走"直接规划"还是"VLM/规则规划"路径。
+**职责**：将 ASR 文本转化为带上下文的 `TaskCommand`，并决定走"视觉趣味游戏""直接规划"还是"VLM/规则规划"路径。
 
 **核心逻辑**：
 ```
 ASR 文本
+    ↓  先匹配视觉趣味游戏触发词（如"分院帽"，别名/开关来自 embodied.entry.visual_games）
+命中游戏? ──是──> build_game_request() 构造 SceneAnalysisRequest（source=game.<name>）
+    │                 → 发布 /embodied/perception_request → 立即返回
+   否                 （一句语音只属于一个业务域，命中后不进 planner/executor）
     ↓  parse_text_command()
 命中规则? ──是──> 构建 PlannedTask → 发布 /embodied/planned_task（跳过规划层）
     │
@@ -120,8 +130,12 @@ ASR 文本
 构建 raw TaskCommand → 发布 /embodied/task_command（交给规划层处理）
 ```
 
+> **视觉游戏预匹配优先级最高**：`parse_text_command()` 之前先执行 `match_game()`。命中即把请求转成 `SceneAnalysisRequest` 发给 `perception_service_node` 并**立即返回**，绝不再进入 planner/executor，避免同一句语音既触发趣味 VLM 又触发机器人任务规划。启用某游戏需**同时**置 `embodied.perception.enabled: true`，否则 `validate_config` / launch 配置层会拒绝该不一致配置。
+
 **关键参数**：
 - `input_topic`：默认 `/voice_command`
+- `perception_request_topic`：默认 `/embodied/perception_request`（视觉游戏命中后的出口）
+- `entry_visual_games_json`：视觉游戏别名与开关（来自 `embodied.entry.visual_games` SSOT）
 - `default_task_timeout_sec`：任务最大超时（默认 180s）
 - `default_target_name` / `default_place_name`：缺省目标/放置点
 
@@ -289,6 +303,8 @@ for each primitive:
 - `risks`：当前风险评估
 - `confidence`：置信度 [0.0, 1.0]
 
+**请求契约校验**：请求可在 `context_json` 中声明 `required_inputs`（据此判定哪些输入缺失才阻塞）与 `response_contract`（对结果字段的约束）。当前支持 `kind=enum`：解析完成后、发布结果前校验指定字段（如 `scene_summary`）严格属于 `allowed_values`，否则发布 `success=false`、`error_code=INVALID_RESPONSE_CONTRACT` 并保留 `raw_response` 便于诊断。视觉游戏（分院帽）依赖此机制保证 `scene_summary` 必为四学院之一。
+
 ---
 
 ## 四、Skill 模板系统
@@ -378,3 +394,29 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 
 4. task_executor_node → skill_executor_node → 执行 `inspect_scene` 或保守拒绝/降级
 ```
+
+### 场景：语音说"分院帽"（视觉趣味游戏路径）
+
+```
+1. ASR → /voice_command: "分院帽"
+2. task_entry_node:
+   - match_game() 在 parse_text_command() 之前先匹配 → 命中 sorting_hat
+   - build_game_request() 构造 SceneAnalysisRequest:
+       source = "game.sorting_hat"
+       user_text = 分院帽角色 Prompt
+       context_json = { required_inputs: ["primary_image"],
+                        response_contract: { field: scene_summary,
+                                             kind: enum,
+                                             allowed_values: 四学院 } }
+   - 发布 /embodied/perception_request → 立即返回（不进 planner/executor）
+
+3. perception_service_node:
+   - 按 required_inputs 只要求主相机图像（EE pose / joint state 离线也可成功）
+   - VLMAPIClient 场景理解 → 解析 scene_summary
+   - 执行 response_contract 校验：scene_summary 必须严格等于四学院之一
+       通过 → 发布 /embodied/perception_result (success=true)
+       不通过 → success=false, error_code=INVALID_RESPONSE_CONTRACT（保留 raw_response）
+
+4. 视觉游戏结果消费者按 source=game.sorting_hat 识别业务类型，读取 scene_summary（四学院之一）
+```
+

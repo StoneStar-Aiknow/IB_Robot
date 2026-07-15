@@ -11,6 +11,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
+from embodied_common.rgbd_snapshot import KNOWN_REQUIRED_INPUTS
 from ibrobot_msgs.msg import SceneAnalysisRequest, SceneAnalysisResult, SceneObject, SceneObservation
 from perception_service.api_client import VLMAPIClient
 from perception_service.object_parser import attributes_to_json, parse_grounded_objects
@@ -114,6 +115,61 @@ class PerceptionServiceNode(Node):
         if not isinstance(loaded, dict):
             raise ValueError("context_json must decode to a JSON object")
         return loaded
+
+    def _resolve_required_inputs(self, user_context: dict[str, Any]) -> set[str] | None:
+        """Resolve a request's ``required_inputs`` into a snapshot-gate set.
+
+        A non-empty list of known input keys means the request only blocks on
+        those inputs — letting a pure-vision request (e.g. a visual game) succeed
+        with EE pose / joint state offline. Missing / empty / malformed yields
+        ``None``, which keeps ``build_snapshot`` at its historical strict default
+        (primary image + EE pose + joint state all required). Unknown keys are
+        ignored so the runtime stays business-agnostic.
+        """
+        declared = user_context.get("required_inputs")
+        if not isinstance(declared, list) or not declared:
+            return None
+        resolved = {item for item in declared if isinstance(item, str) and item in KNOWN_REQUIRED_INPUTS}
+        if self._debug:
+            unknown = [item for item in declared if not isinstance(item, str) or item not in KNOWN_REQUIRED_INPUTS]
+            if unknown:
+                self.get_logger().debug(f"[embodied-debug] ignoring unknown required_inputs: {unknown}")
+        return resolved or None
+
+    @staticmethod
+    def _check_response_contract(user_context: dict[str, Any], analysis: SceneAnalysis) -> str | None:
+        """Enforce a request's optional ``response_contract`` against the parsed result.
+
+        A request may declare, in ``context_json``, that a result field must take one
+        of a fixed set of values — e.g. a visual game requiring ``scene_summary`` to be
+        exactly one of four houses. The generic parser cannot know that, so the check
+        lives here, between parsing and publishing.
+
+        Absence of the ``response_contract`` key means there is no contract to
+        enforce. If the key is present, the declaration itself must be valid:
+        malformed values, missing ``kind``, and unsupported kinds are contract
+        errors. Only ``kind == "enum"`` is supported today.
+        """
+        if "response_contract" not in user_context:
+            return None
+        contract = user_context.get("response_contract")
+        if not isinstance(contract, dict):
+            return "response_contract must be a JSON object"
+        kind = contract.get("kind")
+        if kind != "enum":
+            return f"unsupported response_contract.kind: {kind!r}"
+        field = contract.get("field")
+        if not isinstance(field, str) or not field:
+            return "response_contract.field must be a non-empty string"
+        allowed = contract.get("allowed_values")
+        if not isinstance(allowed, list) or not allowed:
+            return "response_contract.allowed_values must be a non-empty list"
+        if not hasattr(analysis, field):
+            return f"response_contract references unknown result field: {field!r}"
+        value = getattr(analysis, field)
+        if not isinstance(value, str) or value not in allowed:
+            return f"result field {field!r}={value!r} is not one of the allowed values {allowed}"
+        return None
 
     def _session_history(self, session_id: str) -> list[dict[str, str]]:
         with self._history_lock:
@@ -241,7 +297,7 @@ class PerceptionServiceNode(Node):
 
         self._observation_publisher.publish(observation)
 
-    def _analyze(self, request: SceneAnalysisRequest) -> tuple[SceneAnalysis, str, dict[str, Any]]:
+    def _analyze(self, request: SceneAnalysisRequest) -> tuple[SceneAnalysis, str, dict[str, Any], dict[str, Any]]:
         user_context = self._load_context_json(request.context_json)
         scene_snapshot = self._scene_buffer.build_snapshot(
             max_scene_age_sec=self._max_scene_age_sec,
@@ -249,6 +305,7 @@ class PerceptionServiceNode(Node):
             jpeg_quality=self._api_jpeg_quality,
             require_depth=self._require_depth,
             require_pointcloud=self._require_pointcloud,
+            required_inputs=self._resolve_required_inputs(user_context),
         )
         if self._debug:
             self.get_logger().debug(
@@ -273,7 +330,7 @@ class PerceptionServiceNode(Node):
                 "[embodied-debug] perception_service api_response "
                 f"request_id={request.request_id} preview={raw_content[:240]!r}"
             )
-        return parse_scene_analysis_response(raw_content), raw_content, scene_snapshot
+        return parse_scene_analysis_response(raw_content), raw_content, scene_snapshot, user_context
 
     def _handle_text_input(self, msg: String) -> None:
         request = SceneAnalysisRequest()
@@ -315,7 +372,7 @@ class PerceptionServiceNode(Node):
                 )
                 return
             try:
-                analysis, raw_response, scene_snapshot = self._analyze(request)
+                analysis, raw_response, scene_snapshot, user_context = self._analyze(request)
             finally:
                 self._request_semaphore.release()
         except json.JSONDecodeError as exc:
@@ -332,6 +389,17 @@ class PerceptionServiceNode(Node):
                 success=False,
                 message=f"scene analysis failed: {exc}",
                 error_code="SCENE_ANALYSIS_FAILED",
+            )
+            return
+
+        contract_error = self._check_response_contract(user_context, analysis)
+        if contract_error is not None:
+            self._publish_result(
+                request,
+                success=False,
+                message=contract_error,
+                error_code="INVALID_RESPONSE_CONTRACT",
+                raw_response=raw_response,
             )
             return
 

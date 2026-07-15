@@ -40,6 +40,7 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
     perception_scene_sources = perception.get("scene_sources", {})
     perception_vlm_api = perception.get("vlm_api", {})
     perception_conversation = perception.get("conversation", {})
+    entry = embodied_config.get("entry", {})
     timeout_policy = resolve_embodied_timeout_policy(embodied_config)
     allowed_skills = planning_policy.get(
         "allowed_skills",
@@ -226,6 +227,9 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
                     "default_place_name": embodied_config.get("default_place_name", "home"),
                     "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
                     "default_task_timeout_sec": timeout_policy["task_budget_sec"],
+                    "perception_request_topic": perception.get("request_topic", "/embodied/perception_request"),
+                    "perception_enabled": perception.get("enabled", False),
+                    "entry_visual_games_json": json.dumps(entry.get("visual_games", {})),
                 }
             ],
         ),

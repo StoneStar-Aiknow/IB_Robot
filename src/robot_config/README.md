@@ -123,6 +123,29 @@ robot:
           names: ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"]
 ```
 
+## Grasp execution target gripper
+
+真机抓取配置可在 robot YAML 的 `robot.grasp_execution.target_gripper` 下声明目标夹爪几何。
+SO101 单动爪使用 `fixed_finger_contact_ee` 作为固定指侧参考点，`closing_axis_ee` 表示从固定指
+指向目标宽度中心的方向。执行脚本会根据 GraspGen 候选的 `target_width_m` 计算有效接触中心：
+
+```text
+dynamic_fixed_finger_margin_m = min(
+    fixed_finger_margin_max_m,
+    fixed_finger_margin_m
+        + max(0, fixed_finger_margin_width_ref_m - target_width_m)
+        * fixed_finger_margin_width_gain,
+)
+
+effective_center = fixed_finger_contact_ee
+                 + closing_axis_ee * 0.5 * (target_width_m + width_clearance_m)
+                 + closing_axis_ee * dynamic_fixed_finger_margin_m
+```
+
+`fixed_finger_margin_m` 是额外远离固定指的基础安全距离，用于降低固定指先碰物体边缘或上表面的风险。
+当前 SO101 RealSense 抓取配置默认基础值为 `0.006 m`；目标窄于 `fixed_finger_margin_width_ref_m=0.035 m`
+时按 `fixed_finger_margin_width_gain=0.25` 增加安全余量，并由 `fixed_finger_margin_max_m=0.012 m` 封顶。
+
 ## 控制模式配置
 
 robot_config 包支持双控制模式，以满足不同 AI 模型的需求：
@@ -380,6 +403,12 @@ embodied:
       model: Qwen3.5-9B
       api_key_env: ""
 
+  entry:
+    visual_games:
+      sorting_hat:
+        enabled: false        # 趣味视觉游戏默认关闭
+        trigger_aliases: [分院帽, 奔月帽, 风月帽, 分月帽]
+
   execution:
     relative_motion_reference_frame: base
     relative_motion_step_m: 0.03
@@ -408,6 +437,10 @@ embodied:
       grasp_pose:    {position: {x: 0.25, y: 0.0, z: 0.10}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
       lift_pose:     {position: {x: 0.25, y: 0.0, z: 0.25}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
 ```
+
+`embodied.entry.visual_games` 声明入口层视觉趣味游戏（如分院帽）的触发别名与开关；
+camera/VLM/timeout 仍由 `embodied.perception` 统一管理。`validate_config()` 强制一致性：
+任一游戏 `enabled=true` 而 `embodied.perception.enabled=false` 时返回错误，配置阶段即拦截。
 
 更多具身节点说明，详见各子包 README：
 - [`embodied_agent`](../embodied_agent/README.md)

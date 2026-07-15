@@ -6,7 +6,7 @@
 
 | 入口 | 用途 | 主要接口 |
 |---|---|---|
-| `moveit_gateway.py` | 任务级绝对位姿规划，供 `task_dispatch`、AI policy 或外部节点下发目标位姿 | `/cmd_pose`、`/moveit_gateway/move_to_pose`、`/robot_status/ee_pose` |
+| `moveit_gateway.py` | 任务级绝对位姿与已验证关节目标规划，供 `task_dispatch`、抓取执行脚本或外部节点调用 | `/cmd_pose`、`/moveit_gateway/move_to_pose`、`/moveit_gateway/move_to_configuration`、`/robot_status/ee_pose` |
 | `so101_placo_servo_node.py` | SO101 遥操作 Cartesian 后端，使用 Placo QP 微分 IK 实现位置优先、姿态软跟踪 | `/so101_placo_servo_node/linear_cmd_base`、`/so101_placo_servo_node/angular_cmd_base`、`/so101_placo_servo_node/start` |
 
 `moveit_gateway` 专门针对 SO101 5自由度机械臂设计，解决 5DOF 机械臂在任务级逆运动学（IK）求解中的特殊约束问题。`so101_placo_servo_node.py` 不是任务规划入口，而是遥操作用的 Placo QP 后端：节点维护命令侧位置/姿态参考，使用命令侧关节种子求解，避免真机重力下垂和舵机滞后污染 IK 零空间。
@@ -357,6 +357,16 @@ moveit_simple_controller_manager:
 | 话题名 | 消息类型 | 频率 | 说明 |
 |--------|----------|------|------|
 | /robot_status/ee_pose | geometry_msgs/PoseStamped | 10Hz | 末端执行器位姿 |
+
+### 服务
+
+| 服务名 | 类型 | 说明 |
+|--------|------|------|
+| `/moveit_gateway/move_to_pose` | `ibrobot_msgs/srv/MoveToPose` | 由网关求解 IK，再规划并执行目标位姿 |
+| `/moveit_gateway/move_to_configuration` | `ibrobot_msgs/srv/MoveToConfiguration` | 规划并执行调用方提供的已验证 IK 关节解，不重复求解 IK |
+
+`move_to_configuration` 主要用于 5-DOF 抓取接触点补偿。调用方先执行 IK，再对该关节解做 FK，
+根据预测指尖位置修正目标；最终必须执行同一组关节角，否则重新求解 IK 可能改变末端姿态并使补偿失效。
 
 ## 使用示例
 

@@ -8,7 +8,7 @@ from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, Opaq
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 
 from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
-from robot_config.loader import load_robot_config_dict
+from robot_config.loader import load_robot_config_dict, validate_embodied_launch_dict
 from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool
 
@@ -47,6 +47,15 @@ def launch_setup(context, *_args, **_kwargs):
     if with_perception_str != "":
         perception_config = embodied_config.setdefault("perception", {})
         perception_config["enabled"] = parse_bool(with_perception_str, default=False)
+
+    # Fail fast on inconsistent launch overrides (e.g. a visual game enabled while
+    # with_perception:=false) instead of starting a node graph that routes to a
+    # dead topic. Reuses the same rules as robot_config.validate_config.
+    launch_errors = validate_embodied_launch_dict(config)
+    if launch_errors:
+        for error in launch_errors:
+            logger.error(f"Invalid embodied launch configuration: {error}")
+        raise RuntimeError("embodied launch configuration is inconsistent: " + "; ".join(launch_errors))
 
     active_control_mode = config.get("default_control_mode", "moveit_planning")
     base_launch_path = Path(get_package_share_directory("robot_config")) / "launch" / "robot.launch.py"

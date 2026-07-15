@@ -1,0 +1,12 @@
+# MoveToConfiguration.srv - Synchronous MoveIt joint-configuration motion.
+#
+# Served by moveit_gateway for callers that already computed and validated an
+# IK solution. The gateway plans to these exact arm joints instead of solving
+# IK again, so an IK -> FK contact-point correction remains valid at execution.
+
+sensor_msgs/JointState target_joint_state
+float64 velocity_scaling          # 0.0 = use default, otherwise 0.0-1.0
+---
+bool success
+string message
+float64 execution_time_s

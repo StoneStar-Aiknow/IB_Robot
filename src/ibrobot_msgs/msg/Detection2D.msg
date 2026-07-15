@@ -12,5 +12,13 @@ sensor_msgs/Image mask
 # 3D centroid in camera optical frame (meters)
 geometry_msgs/Point centroid_xyz
 
+# Volume centroid of the convex hull enclosing the object's 3D points (meters).
+# Approximates the filled-volume center of mass; closer to the physical center
+# than centroid_xyz (visible-surface mean) for convex objects.
+geometry_msgs/Point volume_centroid_xyz
+
+# Convex hull volume (m^3) of the object's 3D points
+float32 volume_m3
+
 # Number of valid points in the masked region
 int32 point_count
