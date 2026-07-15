@@ -15,6 +15,7 @@ ROS Interfaces:
 """
 
 import math
+import threading
 import time
 
 import numpy as np
@@ -38,7 +39,7 @@ except ImportError:
 # TF2 and MoveIt 2 imports
 import tf2_ros
 
-from pymoveit2 import MoveIt2
+from pymoveit2 import MoveIt2, MoveIt2State
 
 
 class MoveItGateway(Node):
@@ -54,12 +55,21 @@ class MoveItGateway(Node):
         self.declare_parameter("ee_link")
         self.declare_parameter("joint_names")
         self.declare_parameter("shoulder_link")
+        self.declare_parameter("motion_start_timeout_s", 5.0)
+        self.declare_parameter("motion_execution_timeout_s", 30.0)
+        self.declare_parameter("motion_cancel_timeout_s", 5.0)
+        self.declare_parameter("motion_status_hold_s", 0.3)
 
         self.group_name = self.get_parameter("arm_group_name").value
         self.base_link = self.get_parameter("base_link").value
         self.ee_link = self.get_parameter("ee_link").value
         self.joint_names = self.get_parameter("joint_names").value
         self.shoulder_link = self.get_parameter("shoulder_link").value
+        self._motion_start_timeout_s = max(float(self.get_parameter("motion_start_timeout_s").value), 0.0)
+        self._motion_execution_timeout_s = max(float(self.get_parameter("motion_execution_timeout_s").value), 0.0)
+        self._motion_cancel_timeout_s = max(float(self.get_parameter("motion_cancel_timeout_s").value), 0.0)
+        self._motion_status_hold_s = max(float(self.get_parameter("motion_status_hold_s").value), 0.0)
+        self._initialize_motion_coordinator()
 
         self.latest_joint_state = None
         self.get_logger().info("Initializing MoveIt Gateway for SO101...")
@@ -77,6 +87,7 @@ class MoveItGateway(Node):
                 base_link_name=self.base_link,
                 end_effector_name=self.ee_link,
                 use_move_group_action=True,
+                ignore_new_calls_while_executing=True,
                 callback_group=self.callback_group,
             )
             self.get_logger().info("MoveIt2 interface connected")
@@ -129,6 +140,11 @@ class MoveItGateway(Node):
             )
 
         self.timer = self.create_timer(0.1, self.publish_ee_pose, callback_group=self.callback_group)
+        self.motion_watchdog_timer = self.create_timer(
+            0.1,
+            self._motion_watchdog_callback,
+            callback_group=self.callback_group,
+        )
 
         self.get_logger().info("MoveIt Gateway fully initialized")
 
@@ -366,6 +382,12 @@ class MoveItGateway(Node):
             self.get_logger().debug(f"Joint state updated: {list(msg.name)} = {[f'{p:.3f}' for p in msg.position]}")
 
     def cmd_pose_callback(self, msg):
+        token = self._claim_motion("cmd_pose")
+        if token is None:
+            self.get_logger().warning("MoveIt gateway is busy; dropping /cmd_pose command")
+            return
+
+        self._prepare_motion(token)
         self.get_logger().info(f"Target Pose: x={msg.position.x:.3f}, y={msg.position.y:.3f}, z={msg.position.z:.3f}")
         # 计算并输出目标位置在shoulder坐标系中的Z轴坐标
         try:
@@ -416,7 +438,15 @@ class MoveItGateway(Node):
         except Exception as e:
             self.get_logger().warning(f"Failed to transform to shoulder frame: {e}")
 
-        self._move_with_strategies(msg.position, msg.orientation)
+        try:
+            if self._move_with_strategies(msg.position, msg.orientation):
+                self._defer_motion_completion(token, forced_result=None)
+            elif self._ensure_motion_stopped(token, "cmd_pose"):
+                self._finalize_motion(token, success=False)
+        except Exception as e:
+            self.get_logger().error(f"/cmd_pose motion failed: {e}")
+            if self._ensure_motion_stopped(token, "cmd_pose"):
+                self._finalize_motion(token, success=False)
 
     def _move_with_strategies(self, position, orientation_msg) -> bool:
         """尝试多种 5-DOF 姿态策略 + 分层容差，直到 IK 成功。
@@ -523,6 +553,147 @@ class MoveItGateway(Node):
         except Exception:
             pass
 
+    def _initialize_motion_coordinator(self):
+        """Initialize gateway-level ownership for the shared MoveIt2 instance."""
+        self._motion_lock = threading.Lock()
+        self._motion_token_counter = 0
+        self._active_motion_token = None
+        self._active_motion_owner = None
+        self._active_motion_previous_velocity = None
+        self._active_motion_deferred = False
+        self._active_motion_forced_result = None
+        self._active_motion_finalizing = False
+
+    def _claim_motion(self, owner: str) -> int | None:
+        """Atomically claim the shared MoveIt2 execution state."""
+        with self._motion_lock:
+            if self._active_motion_token is not None:
+                return None
+
+            self._motion_token_counter += 1
+            token = self._motion_token_counter
+            self._active_motion_token = token
+            self._active_motion_owner = owner
+            self._active_motion_previous_velocity = None
+            self._active_motion_deferred = False
+            self._active_motion_forced_result = None
+            self._active_motion_finalizing = False
+            return token
+
+    def _owns_motion(self, token: int) -> bool:
+        with self._motion_lock:
+            return self._active_motion_token == token
+
+    def _prepare_motion(self, token: int) -> bool:
+        """Reset per-motion MoveIt state after ownership has been acquired."""
+        if not self._owns_motion(token):
+            return False
+        if self.moveit2 is not None:
+            self.moveit2.motion_suceeded = False
+        self._publish_motion_status("executing")
+        return True
+
+    def _set_motion_velocity(self, token: int, velocity_scaling: float) -> bool:
+        """Apply a temporary velocity while retaining it for token-safe cleanup."""
+        with self._motion_lock:
+            if self._active_motion_token != token or self.moveit2 is None:
+                return False
+            self._active_motion_previous_velocity = self.moveit2.max_velocity
+            self.moveit2.max_velocity = max(velocity_scaling, 0.001)
+            return True
+
+    def _query_moveit_state(self) -> MoveIt2State | None:
+        if self.moveit2 is None:
+            return MoveIt2State.IDLE
+        try:
+            return self.moveit2.query_state()
+        except Exception as e:
+            self.get_logger().error(f"Failed to query MoveIt2 state: {e}")
+            return None
+
+    def _motion_execution_succeeded(self) -> bool:
+        if self.moveit2 is None or not self.moveit2.motion_suceeded:
+            return False
+        error_code = self.moveit2.get_last_execution_error_code()
+        return error_code is None or int(error_code.val) == 1
+
+    def _defer_motion_completion(self, token: int, forced_result: bool | None) -> bool:
+        """Keep the token busy until the watchdog observes a terminal MoveIt state."""
+        with self._motion_lock:
+            if self._active_motion_token != token or self._active_motion_finalizing:
+                return False
+            self._active_motion_deferred = True
+            self._active_motion_forced_result = forced_result
+            return True
+
+    def _finalize_motion(self, token: int, success: bool) -> bool:
+        """Restore shared state and release ownership only after MoveIt is idle."""
+        if self._query_moveit_state() != MoveIt2State.IDLE:
+            self._defer_motion_completion(token, forced_result=success)
+            return False
+
+        with self._motion_lock:
+            if self._active_motion_token != token or self._active_motion_finalizing:
+                return False
+            self._active_motion_finalizing = True
+            previous_velocity = self._active_motion_previous_velocity
+
+        if self.moveit2 is not None and previous_velocity is not None:
+            self.moveit2.max_velocity = previous_velocity
+
+        self._publish_motion_status("succeeded" if success else "failed")
+        if self._motion_status_hold_s > 0.0:
+            time.sleep(self._motion_status_hold_s)
+
+        with self._motion_lock:
+            if self._active_motion_token != token:
+                return False
+            # Publish idle before releasing the token so a new owner cannot have
+            # its executing status overwritten by this completion path.
+            self._publish_motion_status("idle")
+            self._active_motion_token = None
+            self._active_motion_owner = None
+            self._active_motion_previous_velocity = None
+            self._active_motion_deferred = False
+            self._active_motion_forced_result = None
+            self._active_motion_finalizing = False
+        return True
+
+    def _ensure_motion_stopped(self, token: int, context: str) -> bool:
+        """Cancel an active request and wait briefly for MoveIt to become idle."""
+        deadline = time.monotonic() + self._motion_cancel_timeout_s
+        cancel_sent = False
+
+        while self._owns_motion(token):
+            state = self._query_moveit_state()
+            if state == MoveIt2State.IDLE:
+                return True
+            if state == MoveIt2State.EXECUTING and not cancel_sent:
+                self.moveit2.cancel_execution()
+                cancel_sent = True
+            if state is None or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+
+        self.get_logger().error(
+            f"{context} did not reach MoveIt2 IDLE within {self._motion_cancel_timeout_s:.1f}s; gateway remains busy"
+        )
+        self._defer_motion_completion(token, forced_result=False)
+        return False
+
+    def _motion_watchdog_callback(self):
+        """Finalize asynchronous or timed-out motion after MoveIt becomes idle."""
+        with self._motion_lock:
+            if self._active_motion_token is None or not self._active_motion_deferred or self._active_motion_finalizing:
+                return
+            token = self._active_motion_token
+            forced_result = self._active_motion_forced_result
+
+        if self._query_moveit_state() != MoveIt2State.IDLE:
+            return
+        success = self._motion_execution_succeeded() if forced_result is None else forced_result
+        self._finalize_motion(token, success=success)
+
     def _publish_motion_status(self, status: str):
         """Publish motion status for external observers (task_dispatch, etc.)."""
         self._motion_status = status
@@ -536,36 +707,41 @@ class MoveItGateway(Node):
         Performs the full IK + plan + execute pipeline and blocks until
         motion completes (or fails/times out).
         """
-        t0 = time.time()
+        t0 = time.monotonic()
+        token = self._claim_motion("MoveToPose")
+        if token is None:
+            response.success = False
+            response.message = "MoveIt gateway is busy"
+            response.execution_time_s = time.monotonic() - t0
+            return response
+
         target = request.target_pose
         self.get_logger().info(
             f"[Service] MoveToPose request: ({target.position.x:.3f}, {target.position.y:.3f}, {target.position.z:.3f})"
         )
-        self._publish_motion_status("executing")
-        if self.moveit2 is not None:
-            self.moveit2.motion_suceeded = False
+        self._prepare_motion(token)
+        terminal_confirmed = True
 
         try:
             # Apply the same 5-DOF orientation strategies as cmd_pose_callback
             success = self._move_with_strategies(target.position, target.orientation)
             if success:
-                response.success, response.message = self._wait_for_motion_completion("MoveToPose")
-                self._publish_motion_status("succeeded" if response.success else "failed")
+                response.success, response.message, terminal_confirmed = self._wait_for_motion_completion(
+                    token, "MoveToPose"
+                )
             else:
                 response.success = False
                 response.message = "IK/planning failed"
-                self._publish_motion_status("failed")
+                terminal_confirmed = self._ensure_motion_stopped(token, "MoveToPose planning failure")
         except Exception as e:
             response.success = False
             response.message = f"Exception: {e}"
             self.get_logger().error(f"[Service] MoveToPose exception: {e}")
-            self._publish_motion_status("failed")
+            terminal_confirmed = self._ensure_motion_stopped(token, "MoveToPose exception")
 
-        response.execution_time_s = time.time() - t0
-        # Brief hold so external observers (e.g., task_dispatch) can read
-        # succeeded/failed before the status transitions back to idle.
-        time.sleep(0.3)
-        self._publish_motion_status("idle")
+        response.execution_time_s = time.monotonic() - t0
+        if terminal_confirmed:
+            self._finalize_motion(token, success=response.success)
         self.get_logger().info(
             f"[Service] MoveToPose result: success={response.success}, time={response.execution_time_s:.1f}s"
         )
@@ -573,11 +749,16 @@ class MoveItGateway(Node):
 
     def _move_to_configuration_service_cb(self, request, response):
         """Plan and execute a caller-provided IK solution without re-solving IK."""
-        t0 = time.time()
-        self._publish_motion_status("executing")
-        previous_velocity = None
-        if self.moveit2 is not None:
-            self.moveit2.motion_suceeded = False
+        t0 = time.monotonic()
+        token = self._claim_motion("MoveToConfiguration")
+        if token is None:
+            response.success = False
+            response.message = "MoveIt gateway is busy"
+            response.execution_time_s = time.monotonic() - t0
+            return response
+
+        self._prepare_motion(token)
+        terminal_confirmed = True
 
         try:
             target = request.target_joint_state
@@ -602,82 +783,88 @@ class MoveItGateway(Node):
             if not math.isfinite(velocity_scaling) or not 0.0 <= velocity_scaling <= 1.0:
                 raise ValueError("velocity_scaling must be finite and within [0.0, 1.0]")
             if self.moveit2 is not None and velocity_scaling > 0.0:
-                previous_velocity = self.moveit2.max_velocity
-                self.moveit2.max_velocity = max(velocity_scaling, 0.001)
+                self._set_motion_velocity(token, velocity_scaling)
 
             self.get_logger().info(
                 f"[Service] MoveToConfiguration request: joints={self.joint_names} positions={joint_positions}"
             )
             success = self.move_to_joint(joint_positions)
             if success:
-                response.success, response.message = self._wait_for_motion_completion("MoveToConfiguration")
+                response.success, response.message, terminal_confirmed = self._wait_for_motion_completion(
+                    token, "MoveToConfiguration"
+                )
             else:
                 response.success = False
                 response.message = "Joint planning failed"
-
-            self._publish_motion_status("succeeded" if response.success else "failed")
+                terminal_confirmed = self._ensure_motion_stopped(token, "MoveToConfiguration planning failure")
         except Exception as e:
             response.success = False
             response.message = f"Exception: {e}"
             self.get_logger().error(f"[Service] MoveToConfiguration exception: {e}")
-            self._publish_motion_status("failed")
-        finally:
-            if self.moveit2 is not None and previous_velocity is not None:
-                self.moveit2.max_velocity = previous_velocity
+            terminal_confirmed = self._ensure_motion_stopped(token, "MoveToConfiguration exception")
 
-        response.execution_time_s = time.time() - t0
-        time.sleep(0.3)
-        self._publish_motion_status("idle")
+        response.execution_time_s = time.monotonic() - t0
+        if terminal_confirmed:
+            self._finalize_motion(token, success=response.success)
         self.get_logger().info(
             f"[Service] MoveToConfiguration result: success={response.success}, time={response.execution_time_s:.1f}s"
         )
         return response
 
-    def _wait_for_motion_completion(self, service_name: str) -> tuple[bool, str]:
+    def _wait_for_motion_completion(self, token: int, service_name: str) -> tuple[bool, str, bool]:
         """Wait for the asynchronous MoveIt action started by a service callback."""
         moveit2 = self.moveit2
         if moveit2 is None:
-            return False, "MoveIt2 engine not ready"
+            return False, "MoveIt2 engine not ready", True
 
-        is_executing_attr = "_MoveIt2__is_executing"
-        is_requested_attr = "_MoveIt2__is_motion_requested"
-
-        start_timeout = 5.0
-        t_start = time.time()
-        request_observed = False
-        while time.time() - t_start < start_timeout:
-            is_executing = getattr(moveit2, is_executing_attr, False)
-            is_requested = getattr(moveit2, is_requested_attr, False)
-            request_observed = request_observed or is_requested or is_executing
-            if is_executing:
-                break
-            if not is_requested:
-                break
+        start_deadline = time.monotonic() + self._motion_start_timeout_s
+        state = self._query_moveit_state()
+        while state == MoveIt2State.REQUESTING and time.monotonic() < start_deadline:
             time.sleep(0.05)
+            state = self._query_moveit_state()
 
-        if getattr(moveit2, is_requested_attr, False) and not getattr(moveit2, is_executing_attr, False):
-            return False, f"Motion request did not start within {start_timeout:.1f}s"
-        if not request_observed and not moveit2.motion_suceeded:
-            return False, "Motion request was not started"
+        if state == MoveIt2State.REQUESTING:
+            self._defer_motion_completion(token, forced_result=False)
+            return (
+                False,
+                f"Motion request did not start within {self._motion_start_timeout_s:.1f}s; gateway remains busy",
+                False,
+            )
+        if state is None:
+            self._defer_motion_completion(token, forced_result=False)
+            return False, "Unable to confirm MoveIt2 state; gateway remains busy", False
+        if state == MoveIt2State.IDLE:
+            if self._motion_execution_succeeded():
+                return True, "Motion completed", True
+            return False, "Motion execution failed (MoveIt reported unsuccessful)", True
 
-        exec_timeout = 30.0
-        t_exec = time.time()
-        while time.time() - t_exec < exec_timeout:
-            if not getattr(moveit2, is_executing_attr, False):
-                break
+        exec_started = time.monotonic()
+        exec_deadline = exec_started + self._motion_execution_timeout_s
+        while state == MoveIt2State.EXECUTING and time.monotonic() < exec_deadline:
             time.sleep(0.1)
+            state = self._query_moveit_state()
 
-        execution_time = time.time() - t_exec
-        if getattr(moveit2, is_executing_attr, False):
-            moveit2.cancel_execution()
+        execution_time = time.monotonic() - exec_started
+        if state == MoveIt2State.EXECUTING:
             self.get_logger().warn(f"[Service] {service_name} execution timed out after {execution_time:.1f}s")
-            return False, f"Execution timed out after {execution_time:.1f}s"
-        if moveit2.motion_suceeded:
-            error_code = moveit2.get_last_execution_error_code()
-            if error_code is not None and int(error_code.val) != 1:
-                return False, f"Motion execution failed with MoveIt error code {int(error_code.val)}"
-            return True, "Motion completed"
-        return False, "Motion execution failed (MoveIt reported unsuccessful)"
+            cancellation_confirmed = self._ensure_motion_stopped(token, f"{service_name} cancellation")
+            if cancellation_confirmed:
+                return False, f"Execution timed out after {execution_time:.1f}s and was cancelled", True
+            return (
+                False,
+                f"Execution timed out after {execution_time:.1f}s; cancellation is still pending",
+                False,
+            )
+        if state == MoveIt2State.REQUESTING or state is None:
+            self._defer_motion_completion(token, forced_result=False)
+            return False, "MoveIt2 did not reach a terminal state; gateway remains busy", False
+        if self._motion_execution_succeeded():
+            return True, "Motion completed", True
+
+        error_code = moveit2.get_last_execution_error_code()
+        if error_code is not None and int(error_code.val) != 1:
+            return False, f"Motion execution failed with MoveIt error code {int(error_code.val)}", True
+        return False, "Motion execution failed (MoveIt reported unsuccessful)", True
 
     def solve_and_move(self, target_pose, orientation_tolerance=None):
         """
@@ -774,10 +961,10 @@ class MoveItGateway(Node):
 
             # 2. Wait for the future safely in a MultiThreadedExecutor environment
             # Since the executor is running in parallel, it will fulfill the future.
-            start_wait = time.time()
+            start_wait = time.monotonic()
             while not future.done():
                 time.sleep(0.01)
-                if time.time() - start_wait > 5.0:
+                if time.monotonic() - start_wait > 5.0:
                     self.get_logger().error("IK Service Timeout")
                     return False
 
@@ -791,8 +978,7 @@ class MoveItGateway(Node):
                         joint_positions.append(float(ik_solution.position[idx]))
 
                 self.get_logger().info(f"IK Success: {joint_positions}")
-                self.move_to_joint(joint_positions)
-                return True
+                return self.move_to_joint(joint_positions)
             else:
                 self.get_logger().warning("IK Solver failed: No valid solution")
                 # 检查IK求解器是否支持Constraints
@@ -813,7 +999,8 @@ class MoveItGateway(Node):
         try:
             self.moveit2.clear_goal_constraints()
             self.moveit2.move_to_configuration(joint_positions)
-            return True
+            state = self._query_moveit_state()
+            return state in (MoveIt2State.REQUESTING, MoveIt2State.EXECUTING) or self._motion_execution_succeeded()
         except Exception as e:
             self.get_logger().error(f"Move error: {e}")
             return False
