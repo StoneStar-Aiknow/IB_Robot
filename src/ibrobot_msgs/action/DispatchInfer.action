@@ -4,6 +4,7 @@
 builtin_interfaces/Time obs_timestamp  # Request observations at this timestamp
 string prompt                            # Optional task prompt
 string inference_id                      # Unique request ID (UUID4)
+builtin_interfaces/Time deadline         # Absolute UTC deadline; zero uses pipeline timeout
 ---
 # Result: Action chunk from model
 VariantsList action_chunk               # Action sequence from model
@@ -11,6 +12,11 @@ int32 chunk_size                        # Number of actions returned
 bool success                            # Inference success
 string message                          # Error message if failed
 float64 inference_latency_ms            # Time from goal receipt to result
+string pipeline_id
+string request_id
+string deployment_fingerprint
+float64 backend_latency_ms
+InferenceError error
 ---
 # Feedback: Progress updates
 float32 progress                        # Inference progress (0.0-1.0)

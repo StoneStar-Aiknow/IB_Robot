@@ -7,17 +7,24 @@ from robot_config.config import (
     RobotConfig,
     Ros2ControlConfig,
 )
-from robot_config.loader import (
-    build_contract_from_robot_config_dict,
-    load_robot_config,
-    load_robot_config_dict,
-    validate_config,
+from robot_config.inference_config import (
+    ControlModeInferenceConfig,
+    InferenceConfigError,
+    InferencePipelineConfig,
+    InferenceTransportConfig,
+    parse_inference_config,
 )
 
-# Import utilities
-from robot_config.utils import parse_bool, resolve_ros_path
-
 _LAZY_EXPORTS = {
+    "build_contract_from_robot_config_dict": (
+        "robot_config.loader",
+        "build_contract_from_robot_config_dict",
+    ),
+    "load_robot_config": ("robot_config.loader", "load_robot_config"),
+    "load_robot_config_dict": ("robot_config.loader", "load_robot_config_dict"),
+    "validate_config": ("robot_config.loader", "validate_config"),
+    "parse_bool": ("robot_config.utils", "parse_bool"),
+    "resolve_ros_path": ("robot_config.utils", "resolve_ros_path"),
     "generate_ros2_control_nodes": (
         "robot_config.launch_builders",
         "generate_ros2_control_nodes",
@@ -67,6 +74,11 @@ __all__ = [
     "load_robot_config_dict",
     "build_contract_from_robot_config_dict",
     "validate_config",
+    "ControlModeInferenceConfig",
+    "InferenceConfigError",
+    "InferencePipelineConfig",
+    "InferenceTransportConfig",
+    "parse_inference_config",
     # Launch builders
     "generate_ros2_control_nodes",
     "generate_camera_nodes",

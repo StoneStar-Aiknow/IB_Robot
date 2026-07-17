@@ -31,7 +31,7 @@ setup(
         ("share/" + package_name + "/test/config", glob("test/config/*.yaml")),
     ]
     + _package_data_files("config"),
-    install_requires=["setuptools", "pyyaml"],
+    install_requires=["setuptools", "pyyaml", "inference_manifest"],
     zip_safe=True,
     maintainer="xqw",
     maintainer_email="wuxiaoqiang.rtos@huawei.com",
