@@ -1,966 +1,422 @@
 # Model Utils
 
-model_utils 提供了一组用于 LeRobot 策略模型导出与验证的工具脚本，包含以下工具：
+`model_utils` 提供 IB-Robot 模型导出、compiled artifact 打包、精度对比和数据集帧检查工具。
+所有部署工具使用统一的 `inference_manifest.json`，并通过共享 writer 生成 artifact hashes、
+bundle digest、execution roles 和 runtime tensor bindings。
 
-| 脚本 | 用途 |
-| --- | --- |
-| `export_onnx_atc.py` | 导出 ONNX 模型并通过 ATC 转换为 OM 格式（通用 Ascend 硬件） |
-| `export_onnx_3403.py` | 专为 Ascend 3403 硬件导出 ONNX 模型 |
-| `export_onnx_rknn.py` | 专为 RK3588 NPU 导出 ONNX 模型，并可一键转换为 RKNN 格式 |
-| `export_onnx_hmm.py` | 专为后摩 HMM（LQ50 / M50 xh2）导出 ONNX 模型，并可一键 PTQ + 编译为 `.hmm` 格式 |
-| `loss_compare.py` | 跨平台模型推理精度对比验证 |
-| `frame_inspect` | 脱机逐帧/区间策略推理检查；需要 `policy-path`、`dataset-root` 和帧选择参数 |
-| `pi05_export/` | PI05 策略的 Ascend OM 拆分导出工具链（VLM + Action Expert 两段式导出、ATC 转 OM、量化与验证），提供 `python -m model_utils.pi05_export` 一条命令端到端入口，详见下文 |
+## 统一 Bundle 规则
 
----
-
-## 模型文件说明
-
-使用 LeRobot 训练出来的策略模型目录下应包含如下文件：
-
-```
-config.json
-model.safetensors
-policy_postprocessor.json
-policy_postprocessor_step_0_unnormalizer_processor.safetensors
-policy_preprocessor.json
-policy_preprocessor_step_3_normalizer_processor.safetensors
-train_config.json
-```
-
-其中 `model.safetensors` 是模型权重文件。例如模型文件位于 `path/to/pretrained_model/model.safetensors`，则传参时应使用 `path/to/pretrained_model`。
-
----
-
-## export_onnx_atc.py
-
-> **通用 Ascend 硬件的模型导出工具。**
->
-> 该脚本会先将模型导出为 ONNX 格式，然后自动调用 ATC 工具将其转换为 OM 格式，适用于通用的 Ascend 硬件（如 310P3 等）。ATC 成功后会在策略模型目录写入 `config.om.json`，供 `device:=ascend_om` 运行时按 manifest 加载。
-
-### 用法
-
-```shell
-python export_onnx_atc.py \
-    --pretrained_model={策略模型目录路径} \
-    --soc_version={Ascend 芯片版本号} \
-    --onnx_model_path={ONNX 模型导出路径} \
-    --om_model_path={OM 模型导出路径}
-```
-
-### 参数
-
-| 参数 | 必填 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `--pretrained_model` | ✅ | — | LeRobot 训练出来的策略模型目录路径 |
-| `--soc_version` | ✅ | — | 目标 Ascend 芯片版本号（如 `Ascend310P3`） |
-| `--onnx_model_path` | ❌ | `{pretrained_model}/model.onnx` | ONNX 模型导出路径 |
-| `--om_model_path` | ❌ | `{pretrained_model}/model.om` | OM 模型导出路径 |
-| `--skip_onnx_export` | ❌ | `false` | 跳过 PyTorch -> ONNX 导出，直接将已有 ONNX 转为 OM |
-
-### 输出文件
-
-默认会生成：
+可部署策略目录必须包含 LeRobot 语义文件和唯一的 manifest：
 
 ```text
-{pretrained_model}/model.onnx
-{pretrained_model}/model.om
-{pretrained_model}/config.om.json
+policy_bundle/
+├── config.json
+├── model.safetensors                         # Torch deployment 按需存在
+├── policy_preprocessor.json
+├── policy_preprocessor_step_*.safetensors
+├── policy_postprocessor.json
+├── policy_postprocessor_step_*.safetensors
+├── tokenizer/                                # PI0.5 / SmolVLA 按需存在
+├── artifacts/<backend>/<deployment>/...
+└── inference_manifest.json
 ```
 
-`config.om.json` 是 compiled runtime 的 sidecar manifest。ACT 单 OM 模型的内容形如：
+`config.json` 和 processor 文件由 LeRobot 拥有，工具只读。不要向其中写入 backend flags 或
+artifact paths。运行时只从命名 deployment 选择后端，不扫描目录、不猜测文件名、不用环境
+变量覆盖 artifact。
 
-```json
-{
-  "schema_version": 1,
-  "policy_type": "act",
-  "backend": "ascend_om",
-  "artifacts": {"policy": "model.om"},
-  "execution": ["policy"]
-}
+Exporter / packager 负责：
+
+1. 读取 compiler/runtime ABI。
+2. 为每个 runtime tensor 生成 semantic、name/index、dtype、shape 和 image layout binding。
+3. 将运行时 artifact 固化到 `artifacts/<backend>/<deployment>/`。
+4. 计算 artifact 与 bundle 文件 SHA-256。
+5. 计算 canonical bundle digest 并写入 `inference_manifest.json`。
+6. 使用生产 strict loader 验证生成结果。
+
+不要手工编辑 manifest hashes 或 bindings。
+
+导出器默认把可重建的 ONNX、compiler output 和 ABI metadata 放在
+`<bundle>/model_utils_work/<backend>/`。最终 manifest 只引用打包到
+`artifacts/<backend>/<deployment>/` 的运行时 artifact。ABI JSON 用于生成 bindings，属于
+构建输入或编译器输出，不是运行时 artifact；参数帮助中的 `ABI input` / `ABI output` 明确其方向。
+
+## 环境
+
+项目和 ROS 命令前加载：
+
+```bash
+source .shrc_local
 ```
 
-运行推理时仍以策略模型目录作为 `policy_path`；`config.json` 保存 LeRobot 策略元数据，`config.om.json` 保存 compiled runtime artifact 信息。已有 ONNX 的输入名与尺寸必须与 `config.json` 匹配。
+RKNN Toolkit 与主环境依赖可能冲突，使用独立 `.venv-rknn`。Ascend 工具需要可用的 `atc`
+和 CANN 环境。HMM 工具需要 TCIM 产物和对应 `model.json` ABI。
 
-### 查看芯片版本号
+## LeRobot Torch CPU / GPU
 
-可通过 `npu-smi info` 命令查看 Ascend 芯片型号：
+标准 LeRobot `save_pretrained()` 策略目录可直接生成原生 Torch deployment：
 
-```shell
-$ npu-smi info
-+--------------------------------------------------------------------------------------------------------+
-| npu-smi 25.2.3                                   Version: 25.2.3                                       |
-+-------------------------------+-----------------+------------------------------------------------------+
-| NPU     Name                  | Health          | Power(W)     Temp(C)           Hugepages-Usage(page) |
-| Chip    Device                | Bus-Id          | AICore(%)    Memory-Usage(MB)                        |
-+===============================+=================+======================================================+
-| 224     310P3                 | OK              | NA           71                0     / 0             |
-| 0       0                     | 0000:04:00.0    | 0            1263 / 44280                            |
-+===============================+=================+======================================================+
+```bash
+source .shrc_local
+
+ros2 run model_utils package-torch-deployment \
+    --bundle-root /path/to/policy_bundle
 ```
 
-如上所示芯片名称为 `310P3`，则对应参数为 `Ascend310P3`。
+默认在同一个 `inference_manifest.json` 中生成 `torch-cpu` 和 `torch-cuda`。Torch deployment
+不需要 compiled artifact、runtime tensor bindings、execution roles 或 device links，只声明
+`backend: torch` 和目标 device。工具仍会自动发现策略 processor/tokenizer/VLM 本地资产，
+校验 `model.safetensors`，计算文件 SHA-256 与 bundle digest，并用生产 loader 验证最终结果。
 
-### 示例
+只生成 CPU deployment 或使用自定义名称前缀：
 
-```shell
-python export_onnx_atc.py \
-    --pretrained_model=path/to/pretrained_model \
-    --soc_version=Ascend310P3
+```bash
+ros2 run model_utils package-torch-deployment \
+    --bundle-root /path/to/policy_bundle \
+    --devices cpu \
+    --deployment-prefix native
 ```
 
-若 ONNX 已存在，可只执行 ATC 转换并生成 `config.om.json`：
+上述命令生成 `native-cpu`。`--devices` 也支持 `cuda`、`mps` 和 `npu`；生成 manifest
+不要求当前主机具备对应设备，实际加载 deployment 时 runtime 才检查设备可用性。
 
-```shell
-python export_onnx_atc.py \
-    --pretrained_model=path/to/pretrained_model \
-    --soc_version=Ascend310P3 \
-    --onnx_model_path=path/to/pretrained_model/act_ros2.onnx \
-    --om_model_path=path/to/pretrained_model/model.om \
+## ACT Ascend Export
+
+`export_onnx_atc.py` 导出 ACT ONNX、调用 ATC 生成 OM，并将 OM 打包为 `ascend`
+deployment。最终打包必须提供 compiler/runtime introspected ABI JSON：
+
+```bash
+source .shrc_local
+
+python3 src/model_utils/model_utils/export_onnx_atc.py \
+    --pretrained_model /path/to/act_bundle \
+    --soc_version Ascend310P3 \
+    --om_abi_path /path/to/compiler-introspection/model.om.abi.json \
+    --deployment ascend_310p3
+```
+
+未显式指定输出时，ONNX 和 ATC OM 工作产物写入
+`<bundle>/model_utils_work/ascend/`；最终 OM 自动复制到
+`artifacts/ascend/<deployment>/`。`--om_abi_path` 是已有的 compiler/runtime introspection
+JSON 输入，ATC 命令本身不生成该文件。
+
+若 ONNX 已存在：
+
+```bash
+python3 src/model_utils/model_utils/export_onnx_atc.py \
+    --pretrained_model /path/to/act_bundle \
+    --soc_version Ascend310P3 \
+    --onnx_model_path /path/to/act.onnx \
+    --om_model_path /tmp/act.om \
+    --om_abi_path /tmp/act.om.abi.json \
+    --deployment ascend_310p3 \
     --skip_onnx_export
 ```
 
----
+ABI input names必须与 ACT 实际消费的 `observation.state` 和
+`observation.images.*` 顺序一致，output 必须是唯一的 `action`。生成的 deployment backend
+为 `ascend`，target runtime 为 `acl`。
 
-## export_onnx_3403.py
+## ACT Hisilicon SD3403
 
-> **专为 Ascend 3403 硬件保留的 ONNX 导出工具。**
->
-> 由于 3403 的 ATC 转换流程需要单独处理，该脚本 **仅负责导出 ONNX 模型**，不包含 ATC/OM 转换步骤。
+`export_onnx_hisilicon.py` 负责导出 vendor toolchain 使用的 ACT ONNX。其 `--device` 仅表示
+执行 Torch export 的主机设备，不是运行时 backend selector：
 
-### 用法
+```bash
+source .shrc_local
 
-```shell
-python export_onnx_3403.py \
-    --policy_path={策略模型目录路径} \
-    --policy_type={策略类型} \
-    --device={推理设备}
+python3 src/model_utils/model_utils/export_onnx_hisilicon.py \
+    --policy_path /path/to/act_bundle \
+    --policy_type act \
+    --device cpu \
+    --bundle_output /path/to/compiled_bundle
 ```
 
-### 参数
+Vendor toolchain 生成 SD3403 OM、worker executable 和 ABI JSON 后，使用通用 packager 完成
+deployment：
 
-| 参数 | 必填 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `--policy_path` | ✅ | — | LeRobot 训练出来的策略模型目录路径 |
-| `--policy_type` | ❌ | `act` | 策略模型类型（目前支持 `act`） |
-| `--device` | ❌ | `cpu` | 推理设备（如 `cpu`、`cuda`） |
-
-### 示例
-
-```shell
-python export_onnx_3403.py \
-    --policy_path=path/to/pretrained_model \
-    --policy_type=act \
-    --device=cpu
+```bash
+ros2 run model_utils package-compiled-deployment \
+    --bundle-root /path/to/compiled_bundle \
+    --deployment sd3403 \
+    --backend hisilicon \
+    --target-soc sd3403 \
+    --target-runtime hisilicon-worker \
+    --spec /path/to/hisilicon-package-spec.json
 ```
 
-导出的 ONNX 文件将保存在 `policy_path` 目录下，包括原始模型 `act_ros2.onnx` 和简化后的 `act_ros2_simplified.onnx`。
+Hisilicon deployment 必须包含：
 
----
+- `execution: ["policy"]`
+- `policy` artifact，format `om`
+- 可执行的 `worker` artifact，format `executable`
+- `policy` role 的完整 inputs/outputs bindings
 
-## export_onnx_rknn.py
+Hisilicon ONNX 默认写入 `<policy_bundle>/model_utils_work/hisilicon/`。
 
-> **专为 RK3588 NPU 导出 ONNX 模型的工具。**
->
-> 与 3403 导出相比，RKNN 版本只输出 `action`（去除中间 tensor），启用 constant folding，并可选一键转换为 `.rknn` 格式。
+## ACT RKNN
 
-### RKNN 专用优化
+### 创建 Toolkit 环境
 
-- **仅输出 `action`**：去除 3403 导出中附带的 2 个中间输出，减小模型体积和推理开销
-- **constant folding**：启用常量折叠优化计算图
-- **onnxsim 简化**：进一步精简计算图
-- **opset 13**：rknn-toolkit2 对 opset 13 兼容性最好
-
-### 用法
-
-```shell
-# 仅导出 ONNX（需要 source .shrc_local 环境下运行，依赖 lerobot + torch）
-python export_onnx_rknn.py \
-    --policy_path={策略模型目录路径}
-
-# 导出 ONNX 并一键转换为 RKNN
-python export_onnx_rknn.py \
-    --policy_path={策略模型目录路径} \
-    --convert_rknn
+```bash
+python3 -m venv .venv-rknn
+. .venv-rknn/bin/activate
+python -m pip install rknn-toolkit2 onnx onnxruntime
 ```
 
-### 参数
+### 从 Checkpoint 导出并转换
 
-| 参数 | 必填 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `--policy_path` | ✅ | — | LeRobot 训练出来的策略模型目录路径 |
-| `--policy_type` | ❌ | `act` | 策略模型类型（目前支持 `act`） |
-| `--device` | ❌ | `cpu` | 导出时使用的设备（`cpu` 或 `cuda`） |
-| `--convert_rknn` | ❌ | `false` | 导出后自动转换为 RKNN 格式 |
-| `--rknn_mode` | ❌ | `float16` | RKNN 转换模式（`float16`/`int8`/`hybrid`） |
-| `--rknn_output` | ❌ | `policy_path/model.rknn` | RKNN 输出路径 |
-| `--rknn_venv_python` | ❌ | 自动检测 `.venv-rknn/bin/python` | RKNN 专用 Python 解释器路径 |
+```bash
+source .shrc_local
 
-### 示例
-
-```shell
-# 仅导出 RKNN 专用 ONNX
-python export_onnx_rknn.py \
-    --policy_path=path/to/pretrained_model
-
-# 导出 + float16 RKNN 转换（推荐用于 ACT 模型）
-python export_onnx_rknn.py \
-    --policy_path=path/to/pretrained_model \
+python3 src/model_utils/model_utils/export_onnx_rknn.py \
+    --policy_path /path/to/act_bundle \
     --convert_rknn \
-    --rknn_mode=float16
+    --rknn_output /tmp/act.rknn \
+    --rknn_abi_output /tmp/act.rknn.abi.json \
+    --rknn_mode float16 \
+    --rknn_venv_python "$WORKSPACE/.venv-rknn/bin/python" \
+    --deployment rk3588
+```
 
-# 导出 + int8 量化 RKNN 转换（适用于 CNN 模型）
-python export_onnx_rknn.py \
-    --policy_path=path/to/pretrained_model \
+### 从已有 ONNX 转换
+
+```bash
+python3 src/model_utils/model_utils/export_onnx_rknn.py \
+    --onnx /path/to/act.onnx \
+    --bundle_root /path/to/act_bundle \
     --convert_rknn \
-    --rknn_mode=int8
+    --rknn_output /tmp/act.rknn \
+    --rknn_abi_output /tmp/act.rknn.abi.json \
+    --rknn_mode float16 \
+    --rknn_venv_python "$WORKSPACE/.venv-rknn/bin/python" \
+    --deployment rk3588
 ```
 
-导出的 ONNX 文件为 `act_ros2_rknn.onnx`。若启用 `--convert_rknn`，默认还会在同一
-`policy_path` 目录下生成 `model.rknn`，供 `device:=rknn` 直接按 `policy_path` 加载。
+`--output` 是优化后 ONNX 路径；最终 RKNN 路径使用 `--rknn_output`。Compiler 必须生成
+`--rknn_abi_output`，否则 exporter 不会写入 deployment。图像 layout 由 ABI 显式声明，
+runtime 只对 `NHWC` image bindings 转换布局。
 
----
+从 checkpoint 导出时，工作产物默认写入 `<bundle>/model_utils_work/rknn/`；最终 RKNN
+自动复制到 `artifacts/rknn/<deployment>/`。`--rknn_abi_output` 是 converter 生成的输出。
 
-## export_onnx_hmm.py
+完整板端流程见 `docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md`。
 
-> **专为后摩 HMM（LQ50 / M50 xh2）导出 ONNX 模型的工具。**
->
-> 复用 RKNN 导出的 action-only ONNX 图（仅输出 `action`、constant folding、onnxsim 简化、opset 13），
-> 并可选一键调用后摩大道工具链完成「PTQ 量化 + 编译」生成 `.hmm`，供 `device:=hmm` 加载。
+## PI0.5 Ascend Split Export
 
-### HMM 转换两阶段流程
+`pi05-export` 将 PI0.5 拆分为 VLM 和 Action Expert，并可完成 ONNX、量化、OM 编译与等价性
+验证。默认步骤为 `vlm_onnx,ae_onnx,vlm_om,ae_om`：
 
-`--convert_hmm` 会串联后摩大道工具链的两个阶段（与官方 `houmo-examples` 一致）：
+```bash
+source .shrc_local
 
-1. **PTQ 量化（ONNX -> HMONNX）**：通过 `xhquant.api.convert_onnx_to_hmonnx`，使用
-   `QuantScheme(target_device=DeviceType.XH2a, quant_type=w8a8h1_sefp)` 将 ONNX 量化为 HMONNX 中间格式。
-2. **编译（HMONNX -> `.hmm`）**：通过 `tcim.build_from_hmonnx`，针对 `xh2` 目标编译为板端 `.hmm`。
-
-> 转换阶段要求主机已安装后摩大道工具链（`xhquant`、`tcim`）。未安装时会跳过转换并给出提示，
-> 此时仍会产出可复用的 `act_ros2_hmm.onnx`。
-
-### 用法
-
-```shell
-# 仅导出 ONNX（需要 source .shrc_local 环境下运行，依赖 lerobot + torch）
-python export_onnx_hmm.py \
-    --policy_path={策略模型目录路径}
-
-# 导出 ONNX 并一键 PTQ + 编译为 HMM（需主机已安装 xhquant + tcim）
-python export_onnx_hmm.py \
-    --policy_path={策略模型目录路径} \
-    --convert_hmm
+ros2 run model_utils pi05-export \
+    --policy-path /path/to/pi05_bundle \
+    --exp-dir /path/to/pi05_export_run \
+    --soc-version Ascend310P3 \
+    --device cpu \
+    --dtype fp16
 ```
 
-### 参数
+这里的 `--device` 仅是 Torch export/verification device。OM 完成后工具在 policy bundle 中
+更新名为 `ascend` 的 unified deployment，并写入 VLM/Action Expert artifacts、bindings 和
+device-pointer links。
 
-| 参数 | 必填 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `--policy_path` | ✅ | — | LeRobot 训练出来的策略模型目录路径（与 `--onnx` 二选一） |
-| `--onnx` | ✅ | — | 已有 ONNX 模型路径，仅做 strip + simplify（与 `--policy_path` 二选一） |
-| `--output` | ❌ | 自动 `_hmm` 后缀 | ONNX 输出路径 |
-| `--device` | ❌ | `cpu` | 导出时使用的设备（`cpu` 或 `cuda`） |
-| `--convert_hmm` | ❌ | `false` | 导出后自动 PTQ + 编译为 `.hmm` |
-| `--hmm_output` | ❌ | `policy_path/model.hmm` | HMM 输出路径 |
-| `--hmm_model_name` | ❌ | 目录名 | HMM 制品名称 |
-| `--hmm_target` | ❌ | `xh2` | 后摩目标平台（LQ50 / M50 为 `xh2`） |
-| `--hmm_ncore` | ❌ | `2` | 编译使用的核数 |
-| `--hmm_opt_level` | ❌ | `O2` | 编译优化级别 |
-| `--hmm_quant_type` | ❌ | `w8a8h1_sefp` | PTQ 量化类型（传给 `QuantScheme`） |
+选择步骤：
 
-### 示例
+```bash
+# 只导出 ONNX
+ros2 run model_utils pi05-export \
+    --policy-path /path/to/pi05_bundle \
+    --exp-dir /path/to/run \
+    --steps vlm_onnx,ae_onnx
 
-```shell
-# 仅导出 HMM 专用 ONNX
-python export_onnx_hmm.py \
-    --policy_path=path/to/pretrained_model
-
-# 导出 + w8a8 量化 + 编译（推荐用于 ACT 模型）
-python export_onnx_hmm.py \
-    --policy_path=path/to/pretrained_model \
-    --convert_hmm
-
-# 使用已有 ONNX 直接 PTQ + 编译
-python export_onnx_hmm.py \
-    --onnx=path/to/act_ros2_hmm.onnx \
-    --convert_hmm
+# 导出、编译并验证
+ros2 run model_utils pi05-export \
+    --policy-path /path/to/pi05_bundle \
+    --exp-dir /path/to/run \
+    --soc-version Ascend310P3 \
+    --task "pick up the cup" \
+    --steps vlm_onnx,ae_onnx,vlm_om,ae_om,verify
 ```
 
-导出的 ONNX 文件为 `act_ros2_hmm.onnx`。若启用 `--convert_hmm`，默认还会在同一
-`policy_path` 目录下生成 `model.hmm` 与 `config.hmm.json`（编译制品清单），供 `device:=hmm`
-直接按 `policy_path` 加载。
+需要直接调用 OM compiler wrapper 时：
 
----
-
-## loss_compare.py
-
-> **跨平台模型推理精度对比工具。**
->
-> 用于验证模型在不同平台（如 GPU PyTorch 推理 vs NPU OM 推理）上的输出一致性。支持生成基准推理结果和计算 L1 Loss。
->
-> **注意**：该脚本现已统一通过 IB-Robot 的 `inference_service.InferenceCoordinator` 加载模型，因此既支持原生 LeRobot torch 模型，也支持 ib robot 中编译好的离线模型（昇腾 OM、3403、RKNN）。后端由 `--device` 参数自动选择，无需修改脚本。pi05 等 VLA 模型在 torch 与 OM 两种后端下都可直接对比。
-
-### 快速开始（推荐）
-
-为缓解「参数繁琐、路径长、含义易忘」三个痛点，loss_compare 提供 **交互向导 + profile 配置 + 派生路径 + 记住上次** 四件套。常用参数只需配置一次，之后一行命令即可复用。
-
-> 旧的完整显式命令（见下方「高级用法（完整参数）」）**完全保持可用**，向后兼容；下面这套只是更省心的入口。
-
-**第一次使用：交互向导**
-
-直接不带参数运行（或加 `--init`），向导（英文）会逐项提示**含义 + 默认值**（目录类参数不显示样例路径，只描述内容/命名要求；非目录参数会给出样例），回车即用默认，结尾可把这组参数存成一个 profile。`policy_type` 会自动检测，不在向导中询问：
-
-```shell
-python loss_compare.py          # 无配置时自动进入向导
-python loss_compare.py --init   # 任何时候强制重新进向导
+```bash
+python3 -m model_utils.pi05_export.convert_om \
+    --pretrained-policy-path /path/to/pi05_bundle \
+    --soc-version Ascend310P3 \
+    --vlm-onnx /path/to/vlm.onnx \
+    --ae-onnx /path/to/action_expert.onnx \
+    --vlm-abi /path/to/vlm.om.abi.json \
+    --ae-abi /path/to/action_expert.om.abi.json \
+    --deployment ascend
 ```
 
-**日常使用：profile + 实验目录**
+运行 `python3 -m model_utils.pi05_export.convert_om --help` 查看当前参数名称和可选的
+`--input-shape` / `--atc-arg` 配置。
 
-```shell
-# 引用 profile，只需再给一个实验目录；target/raw/noise 自动派生
-python loss_compare.py --profile pi05-om --exp-dir /root/.../0612
+## HMM Packaging
 
-# 临时覆盖某个参数（命令行优先级最高）
-python loss_compare.py --profile pi05-om --exp-dir /root/.../0612 --device cuda
+HMM 只支持 PI0.5 与 SmolVLA，不支持 ACT。TCIM 编译完成后准备一个只包含路径和 target
+选择的 JSON spec，然后执行：
+
+```bash
+source .shrc_local
+
+ros2 run model_utils package-hmm-deployment \
+    --bundle-root /path/to/policy_bundle \
+    --deployment lq50 \
+    --target-soc lq50 \
+    --target-runtime tcim-lite \
+    --spec /path/to/hmm-package-spec.json
 ```
 
-**派生路径约定**：`--exp-dir <DIR>` 会自动派生三条长路径，无需再分别手填：
+Packager 读取各 TCIM `model.json` ABI，生成 execution、bindings、device links、SHA-256 和
+bundle digest。SmolVLA 还要求 `state_projection.pt`。详细 spec 和转换流程见
+`docs/Houmo_HMM_Conversion.md`。
 
-| 派生项 | 路径 |
-| --- | --- |
-| `--target_path` | `<DIR>/target.json` |
-| `--raw-target-path` | `<DIR>/target_raw.json` |
-| `--noise-dir` | `<DIR>/noises/` |
+## 通用 Compiled Deployment Packager
 
-显式传同名参数会覆盖对应派生值。`--generate-target` 时若派生/目标文件已存在，会**报错拒绝覆盖**，需更换 `--exp-dir` 或显式加 `--force`（防止误覆盖基准）。
+Ascend、Hisilicon、RKNN 或 HMM 的 vendor compiler 已经产出 artifact 和 ABI 时，可使用：
 
-**记住上次**：每次成功运行后，最终生效参数会自动写入配置文件的 `_last` 段。下次不指定 `--profile` 时即自动复用上次参数（启动时会打印每个参数的来源）：
-
-```shell
-python loss_compare.py --exp-dir /root/.../0613   # 其余参数沿用上次
+```bash
+ros2 run model_utils package-compiled-deployment \
+    --bundle-root /path/to/policy_bundle \
+    --deployment <name> \
+    --backend <ascend|hisilicon|rknn|hmm> \
+    --target-soc <soc> \
+    --target-runtime <runtime> \
+    --spec /path/to/package-spec.json
 ```
 
-**其他配置命令**：
-
-```shell
-python loss_compare.py --list-profiles            # 列出已有 profile
-python loss_compare.py ... --save-as pi05-torch   # 把当前参数另存为 profile
-python loss_compare.py --config /path/to.yaml ... # 指定配置文件
-```
-
-#### 配置文件
-
-默认位置 `~/.config/model_utils/loss_compare.yaml`（可用 `--config` 或环境变量 `LOSS_COMPARE_CONFIG` 覆盖），三个段：
-
-```yaml
-# 所有 profile 共享的默认值
-defaults:
-  policy_type: pi05
-  seed: 42
-  batch_path: /root/.../batches_480_640_first_batch.json
-
-# 命名 profile（常用参数组）
-profiles:
-  pi05-om:                       # 昇腾 OM 后端
-    device: ascend_om
-    policy_path: /root/.../019200/
-  pi05-torch:                    # GPU torch 基准
-    device: cuda
-    policy_path: /root/.../019200/
-
-# 由脚本自动回写，等价「记住上次」；不要手动维护
-_last:
-  profile: pi05-om
-  device: ascend_om
-  policy_path: /root/.../019200/
-  exp_dir: /root/.../0612
-```
-
-参数优先级（高 → 低）：**命令行 > `--profile` > `defaults` > `_last`（仅未指定 profile 时）> 内置默认**。
-
-> 提示：`_last` 与 profile 里**不会**保存派生出来的 `target/raw/noise` 绝对路径（只存 `exp_dir`），这样以后换 `--exp-dir` 才能正确重新派生。
-
----
-
-## 高级用法（完整参数）
-
-以下为不依赖 profile/向导的完整显式用法，适用于自动化/CI 或非标准目录布局。
-
-### 工作流程
-
-1. **生成基准数据**（`--generate-target`）：在 GPU/CPU 上使用 PyTorch 模型对输入 batch 进行推理，将输出保存为 JSON 文件作为基准。
-2. **计算精度损失**：在目标平台上使用模型对相同 batch 进行推理，将结果与基准数据逐条对比，计算 L1 Loss。
-
-### 用法
-
-#### 生成基准数据
-
-```shell
-python loss_compare.py \
-    --policy_path={策略模型目录路径} \
-    --policy_type={策略类型} \
-    --batch_path={输入 batch JSON 文件路径} \
-    --target_path={基准输出 JSON 文件保存路径} \
-    --generate-target
-```
-
-#### 计算精度损失
-
-```shell
-python loss_compare.py \
-    --policy_path={策略模型目录路径} \
-    --policy_type={策略类型} \
-    --batch_path={输入 batch JSON 文件路径} \
-    --target_path={基准输出 JSON 文件路径}
-```
-
-### 参数
-
-| 参数 | 必填 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `--policy_path` | ✅ | — | LeRobot 训练出来的策略模型目录路径（torch 与 OM 共用同一目录，OM 需含 `config.om.json`）。可由 profile 提供 |
-| `--batch_path` | ✅ | — | 输入 batch 的 JSON 文件路径。可由 profile/defaults 提供 |
-| `--target_path` | ✅* | — | 基准推理输出的 JSON 文件路径（生成或读取）。*可由 `--exp-dir` 派生为 `<DIR>/target.json` |
-| `--exp-dir` | ❌ | `None` | 实验目录：自动派生 `target.json`/`target_raw.json`/`noises/`，免去分别手填三条长路径 |
-| `--policy_type` | ❌ | `act` | 策略类型提示（实际类型由加载的策略/manifest 自动检测，仅作回退） |
-| `--device` | ❌ | `cpu` | 推理后端：原生 torch 用 `cpu`/`cuda`/`npu`；ib robot 离线模型用 `ascend_om`（含 pi05 OM）、`ascend_om_3403`、`rknn` |
-| `--model_dtype` | ❌ | `native` | 仅对 torch 后端生效：将模型转为 `fp16`/`bf16`/`fp32`（编译后端使用其固定 dtype，忽略此参数） |
-| `--generate-target` | ❌ | `false` | 指定后进入基准数据生成模式 |
-| `--force` | ❌ | `false` | generate-target 时允许覆盖已存在的派生/目标文件（默认拒绝覆盖，防误删基准） |
-| `--seed` | ❌ | `42` | 随机种子，用于固定扩散/flow-matching 噪声以保证可复现性 |
-| `--task` | ❌ | `""` | VLA 策略（PI0/PI05/SmolVLA）的自然语言任务提示词，会被路由进 LeRobot 预处理器的 complementary_data 并 tokenize。生成基准与计算损失两端必须一致，否则对比无意义 |
-| `--noise-dir` | ❌ | `None` | 噪声文件目录，用于跨机器精度对比（Scheme C）。可由 `--exp-dir` 派生为 `<DIR>/noises/` |
-| `--raw-target-path` | ❌ | `None` | 归一化空间（后处理前）动作的导出/读取路径，用于区分模型漂移与反归一化放大。可由 `--exp-dir` 派生为 `<DIR>/target_raw.json` |
-
-> 配置/向导相关：`--config`（配置文件路径）、`--profile`（引用 profile）、`--save-as`（另存为 profile）、`--init`（强制向导）、`--list-profiles`（列出 profile）。详见上方「快速开始」。
-
-### 噪声文件传递（Scheme C）
-
-当使用 `--noise-dir` 参数时，可实现跨机器（如 GPU 与 NPU）的确定性推理对比：
-
-- **生成基准时（GPU 端）**：自动生成噪声文件 `noise_NNNN.npy` 并保存到指定目录
-- **计算损失时（NPU 端）**：从指定目录加载噪声文件，确保两端使用完全相同的噪声
-
-### 示例
-
-```shell
-# 步骤 1：在 GPU 机器上生成基准数据和噪声文件
-python loss_compare.py \
-    --policy_path=path/to/pretrained_model \
-    --policy_type=act \
-    --batch_path=batches.json \
-    --target_path=targets.json \
-    --noise-dir=noise_files/ \
-    --generate-target
-
-# 步骤 2：在 NPU 机器上计算精度损失
-python loss_compare.py \
-    --policy_path=path/to/pretrained_model \
-    --policy_type=act \
-    --batch_path=batches.json \
-    --target_path=targets.json \
-    --noise-dir=noise_files/
-```
-
-### pi05 OM 离线模型对比示例
-
-pi05 在 GPU 上用 torch 生成基准，在昇腾上用 OM 离线模型对比（`--device=ascend_om`）。
-由于 flow-matching ODE 对噪声敏感，跨平台对比务必配合 `--noise-dir` 传递相同噪声：
-
-```shell
-# 步骤 1：GPU torch 端生成基准 + 噪声 + 归一化空间基准
-python loss_compare.py \
-    --policy_path=path/to/pi05_model \
-    --policy_type=pi05 \
-    --device=cuda \
-    --batch_path=batches.json \
-    --target_path=targets.json \
-    --raw-target-path=raw_targets.json \
-    --noise-dir=noise_files/ \
-    --generate-target
-
-# 步骤 2：昇腾 OM 端计算精度损失（policy_path 目录需含 config.om.json 与 OM 文件）
-python loss_compare.py \
-    --policy_path=path/to/pi05_model \
-    --policy_type=pi05 \
-    --device=ascend_om \
-    --batch_path=batches.json \
-    --target_path=targets.json \
-    --raw-target-path=raw_targets.json \
-    --noise-dir=noise_files/
-```
-
-### OM 后端使用须知
-
-`--device=ascend_om` 时，`policy_path` 目录除了 LeRobot 策略元数据（`config.json`、
-`policy_preprocessor.json`、`policy_postprocessor.json` 及对应 safetensors）之外，还必须包含一个
-**`config.om.json`** manifest，描述 OM 离线模型的 artifact。pi05（VLM + Action Expert 双 OM）的 manifest 形如：
+Spec 顶层字段：
 
 ```json
 {
-  "schema_version": 1,
-  "policy_type": "pi05",
-  "backend": "ascend_om",
-  "artifacts": {
-    "vlm": "vlm.om",
-    "action_expert": "ae.om"
+  "execution": ["policy"],
+  "roles": {
+    "policy": {
+      "artifact": "./model.rknn",
+      "format": "rknn",
+      "abi": "./model.rknn.abi.json",
+      "abi_format": "runtime",
+      "input_semantics": {
+        "state": "observation.state"
+      },
+      "output_semantics": {
+        "actions": "action"
+      },
+      "image_layouts": {}
+    }
   },
-  "execution": ["vlm", "action_expert"]
+  "artifacts": {},
+  "device_links": []
 }
 ```
 
-- `artifacts` 里的路径相对于 manifest 所在目录（可用 `artifact_dir` 指定子目录）；务必与目录下真实存在的 `.om` 文件名一致。
-- ACT 单 OM 模型的 manifest 见 `export_onnx_atc.py` 一节（`"artifacts": {"policy": "model.om"}`）。
-- pi05 等 VLA 模型需通过 `--task` 提供任务提示词（默认空串）；该提示词必须与生成基准时一致。
-- OM 端会自动读取并 strip 掉 `config.json` 中 IB-Robot 特有的键
-  （`is_ascend_om_enabled` / `om_vlm_model_path` / `om_action_expert_model_path` 等），无需手动清理。
+每个 execution role 必须有 artifact、ABI、完整 input semantic mapping 和 output semantic
+mapping。`abi_format` 为 `runtime` 或 `tcim`。
 
-> **自洽性自检**：在同一台板子上先用 `--generate-target` 生成 OM 基准（含 `--noise-dir`），再用相同噪声跑 compute-loss，应得到 `L1 = 0.000000`、`Cosine = 1.000000`（归一化空间同理）。这可用于在跨平台对比前确认整条 pre/infer/post 流水线确定且可复现。
+## loss_compare
 
+`loss_compare.py` 使用 `PureInferenceEngine` 和命名 deployment 比较同一 batch 在不同 runtime
+上的输出。它不接受 runtime backend `--device`；选择 bundle deployment 使用
+`--deployment`。
 
----
+### 生成基准
+
+```bash
+source .shrc_local
+
+python3 src/model_utils/model_utils/loss_compare.py \
+    --policy_path /path/to/policy_bundle \
+    --deployment cuda \
+    --batch_path /path/to/batches.json \
+    --exp-dir /path/to/experiment \
+    --generate-target
+```
+
+`--exp-dir` 自动派生：
+
+```text
+target.json
+target_raw.json
+noises/
+```
+
+PI0.5/SmolVLA 的 external noise 会保存到 `noises/`，使不同机器和 deployment 使用相同
+随机输入。
+
+### 比较 Compiled Deployment
+
+```bash
+python3 src/model_utils/model_utils/loss_compare.py \
+    --policy_path /path/to/policy_bundle \
+    --deployment ascend \
+    --batch_path /path/to/batches.json \
+    --exp-dir /path/to/experiment
+```
+
+可用 `--model_dtype native|fp16|bf16|fp32` 请求 Torch model dtype；不支持该 runtime option
+的 deployment 会拒绝启动。`loss_compare` 每个独立 sample 前重置 engine，并同时比较最终
+postprocessed action 和可选 raw action。
+
+配置文件默认位于 `~/.config/model_utils/loss_compare.yaml`。优先级为 CLI、profile、
+defaults、last、builtin。查看全部参数：
+
+```bash
+python3 src/model_utils/model_utils/loss_compare.py --help
+```
 
 ## frame_inspect
 
-> **脱机逐帧/区间策略推理检查工具。**
->
-> 加载训练好的策略模型，对数据集中的单帧或帧区间进行离线推理，输出模型预测值与真实标签的逐维度对比，用于模型行为调试和精度分析。
+`frame_inspect` 从 LeRobot dataset 选择一个 frame 或 frame range，运行原生 policy，并导出
+预测、label、delta、图像和汇总文件。
 
-### 工作模式
+```bash
+source .shrc_local
 
-1. **单帧模式**：指定 `--global-index` 或 `--episode-index` + `--frame-index`，对单帧推理并输出对比 JSON、summary.txt 和帧图像。
-2. **区间模式**：指定 `--episode-index` + `--frame-index start:end`，对连续帧区间逐帧推理，输出对比 CSV/JSON 和视频片段。
-
-### 用法
-
-#### 单帧推理（按全局索引）
-
-```shell
-frame_inspect \
-    --policy-path path/to/pretrained_model \
-    --dataset-repo-id my_dataset \
-    --dataset-root path/to/dataset \
-    --output-dir path/to/output \
-    --global-index 42
-```
-
-#### 单帧推理（按 episode + frame）
-
-```shell
-frame_inspect \
-    --policy-path path/to/pretrained_model \
-    --dataset-repo-id my_dataset \
-    --dataset-root path/to/dataset \
-    --output-dir path/to/output \
+ros2 run model_utils frame_inspect \
+    --policy-path /path/to/policy \
+    --dataset-repo-id organization/dataset \
+    --dataset-root /path/to/dataset_root \
+    --output-dir /tmp/frame_inspect \
     --episode-index 0 \
-    --frame-index 15
+    --frame-index 10 \
+    --device cpu
 ```
 
-#### 区间推理
+这里的 `--device` 是离线 Torch policy device，不是 unified runtime backend selector。区间示例
+使用 `--frame-index 10:30`；也可以使用 `--global-index` 选择全局 frame。
 
-```shell
-frame_inspect \
-    --policy-path path/to/pretrained_model \
-    --dataset-repo-id my_dataset \
-    --dataset-root path/to/dataset \
-    --output-dir path/to/output \
-    --episode-index 0 \
-    --frame-index 10:30
+## Manifest 验证与排障
+
+验证一个 deployment：
+
+```bash
+source .shrc_local
+PYTHONPATH=src/inference_manifest \
+python3 -c "from inference_manifest import load_inference_manifest; print(load_inference_manifest('/path/to/policy_bundle', 'cpu').fingerprint)"
 ```
 
-### 参数
+常见错误：
 
-| 参数 | 必填 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `--policy-path` | ✅ | — | 策略模型目录路径 |
-| `--dataset-repo-id` | ✅ | — | 数据集 repo_id |
-| `--dataset-root` | ✅ | — | 数据集根目录路径 |
-| `--output-dir` | ✅ | — | 输出目录 |
-| `--global-index` | 单帧模式 | — | 数据集全局帧索引 |
-| `--episode-index` | 单帧/区间模式 | — | Episode 索引 |
-| `--frame-index` | 单帧/区间模式 | — | 帧索引（整数或 `start:end` 格式） |
-| `--stats-dataset-repo-id` | ❌ | 同 `dataset-repo-id` | 训练时所用数据集的 repo_id（用于加载归一化统计） |
-| `--stats-dataset-root` | ❌ | 同 `dataset-root` | 训练时所用数据集的路径 |
-| `--device` | ❌ | 模型配置中的设备 | 推理设备（`cpu`、`cuda`） |
-| `--use-imagenet-stats` / `--no-use-imagenet-stats` | ❌ | `--use-imagenet-stats` | 是否对图像使用 ImageNet 归一化统计 |
-| `--reset-policy` / `--no-reset-policy` | ❌ | `--reset-policy` | 每帧推理前是否重置策略状态 |
-
-### 输出文件
-
-**单帧模式**：
-
-```text
-output_dir/
-├── {camera_name}_frame.png     # 输入帧图像
-├── comparison.json             # 预测值 vs 标签的逐维度对比
-└── summary.txt                 # 制表符分隔的摘要
-```
-
-**区间模式**：
-
-```text
-output_dir/
-├── {camera_name}_clip.mp4      # 输入帧视频片段
-├── comparison.csv              # 所有帧的逐维度对比（CSV 格式）
-└── comparison.json             # 区间汇总元数据
-```
-
-### 特性
-
-- 兼容 dict 和 tuple 两种数据集样本格式
-- 自动处理 `observation.current` / `observation.state` 键名差异，缺失时回退并发出警告
-- 支持跨数据集归一化（通过 `--stats-dataset-*` 使用训练时的统计信息）
-
----
-
-## pi05_export（PI05 Ascend OM 拆分导出工具链）
-
-PI05 策略与单体 ACT 模型不同，导出时被拆分为 **VLM 预填充** 与 **Action Expert（AE）去噪** 两个
-独立的 ONNX/OM artifact，并共同写入策略目录下的 `config.om.json`（供 `device:=ascend_om` 运行时
-按 `vlm -> action_expert` 顺序加载）。相关脚本位于 `model_utils/pi05_export/` 子包。
-
-> **TL;DR**：日常只需记住**一条命令**。在装有 CANN（`atc`）的 Ascend 机器上执行：
->
-> ```shell
-> python -m model_utils.pi05_export \
->     --policy-path path/to/pretrained_model \
->     --soc-version Ascend310P3
-> ```
->
-> 它会按 `VLM 导出 → AE 导出 → ATC 转 OM` 自动串起整条链路，生成两个 `.om` 与 `config.om.json`。
-
-### 快速开始（推荐）
-
-为缓解「参数繁琐、路径长、含义易忘」三个痛点，pi05 导出入口与 `loss_compare` 一致，提供
-**交互向导 + profile 配置 + 派生路径 + 记住上次** 四件套。常用参数只需配置一次，之后一行命令即可复用。
-
-> 下面这套显式命令（见「一条命令的端到端流程」）**完全保持可用**，向后兼容；这只是更省心的入口。
-> 安装后还可用 `pi05-export` 控制台命令替代 `python -m model_utils.pi05_export`。
-
-**第一次使用：交互向导**
-
-直接不带参数运行（或加 `--init`），向导（英文）会逐项提示**含义 + 默认值 + 样例**，回车即用默认，
-结尾可把这组稳定参数存成一个 profile。向导只保存稳定参数；做什么（量化 / 验证 / 只重做某段）由
-运行时的 `--steps` 决定，不写进 profile：
-
-```shell
-python -m model_utils.pi05_export          # 无配置时自动进入向导
-python -m model_utils.pi05_export --init   # 任何时候强制重新进向导
-```
-
-**日常使用：profile + 实验目录**
-
-```shell
-# 引用 profile，只需再给一个实验目录；onnx/ 与 runtime_save/ 自动派生
-python -m model_utils.pi05_export --profile p310 --exp-dir /root/.../0612
-
-# 临时覆盖某个参数（命令行优先级最高）
-python -m model_utils.pi05_export --profile p310 --exp-dir /root/.../0612 --dtype fp32
-```
-
-**派生路径约定**：`--exp-dir <DIR>` 会自动派生三条长路径，无需再分别手填：
-
-| 派生项 | 路径 |
+| 错误 | 处理 |
 | --- | --- |
-| `--output-dir` | `<DIR>/onnx/` |
-| `--runtime-save-dir` | `<DIR>/runtime_save/` |
-| `--om-dir` | `<DIR>/om/` |
+| deployment 不存在 | 使用 manifest 中实际的 deployment 名称或重新运行 exporter |
+| `SHA-256 mismatch` | artifact 或 semantic file 已改变；重新运行 owning exporter |
+| `Bundle digest mismatch` | 重新生成完整 manifest，不要手改 digest |
+| missing semantic dependency | 将 processor/tokenizer dependency vendored 到 bundle 后重新打包 |
+| binding name/shape/layout mismatch | 用 compiler/runtime 实际 ABI 重新生成 bindings |
+| unsupported policy/backend pair | 使用 registry 支持矩阵中的组合 |
 
-显式传同名参数会覆盖对应派生值。OM 文件写入 `--om-dir`（默认 `<DIR>/om/`）；只有
-`config.om.json` 仍写入 `--policy-path` 目录并指向实际 OM 路径（运行时 `device:=ascend_om`
-约定），**不**随 `--exp-dir` 派生。
+初始支持矩阵：
 
-**记住上次**：每次成功运行后，最终生效参数会自动写入配置文件的 `_last` 段。下次不指定 `--profile`
-时即自动复用上次参数（启动时会打印每个参数的来源）：
+| Policy family | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |
+| --- | --- | --- | --- | --- | --- |
+| ACT | 支持 | 支持 | 支持 | 支持 | 不支持 |
+| PI0.5 | 支持 | 支持 | 不支持 | 不支持 | 支持 |
+| SmolVLA | 支持 | 不支持 | 不支持 | 支持 | 支持 |
 
-```shell
-python -m model_utils.pi05_export --exp-dir /root/.../0613   # 其余参数沿用上次
-```
-
-**其他配置命令**：
-
-```shell
-python -m model_utils.pi05_export --list-profiles            # 列出已有 profile
-python -m model_utils.pi05_export ... --save-as p310         # 把当前参数另存为 profile
-python -m model_utils.pi05_export --config /path/to.yaml ... # 指定配置文件
-```
-
-#### 配置文件
-
-默认位置 `~/.config/model_utils/pi05_export.yaml`（可用 `--config` 或环境变量 `PI05_EXPORT_CONFIG`
-覆盖），三个段：
-
-```yaml
-# 所有 profile 共享的默认值
-defaults:
-  dtype: fp16
-
-# 命名 profile（常用参数组）
-profiles:
-  p310:                          # 昇腾 310P 一步到位
-    policy_path: /root/.../pretrained_model
-    soc_version: Ascend310P3
-
-# 由脚本自动回写，等价「记住上次」；不要手动维护
-_last:
-  profile: p310
-  policy_path: /root/.../pretrained_model
-  soc_version: Ascend310P3
-  exp_dir: /root/.../0612
-```
-
-参数优先级（高 → 低）：**命令行 > `--profile` > `defaults` > `_last`（仅未指定 profile 时）> 内置默认**。
-
-> 提示：`_last` 与 profile 里**不会**保存派生出来的 `output_dir/runtime_save_dir/om_dir`（只存 `exp_dir`），
-> 这样以后换 `--exp-dir` 才能正确重新派生；`--steps` 作为临时流程开关也不会被持久化。
-
-### 一条命令的端到端流程（推荐）
-
-`python -m model_utils.pi05_export` 是整个工具链的统一入口，自动编排各步骤并在步骤间正确
-传递文件，你无需记忆多个模块路径，也无需手写 `atc` 命令。
-
-**做什么由 `--steps` 显式决定**（逗号分隔的步骤列表）。可用步骤：
-
-| step | 含义 | 产物 | 依赖（参数 / 上游产物） |
-| --- | --- | --- | --- |
-| `vlm_onnx` | 导出 VLM（gemma_2b）ONNX | `pi05-vlm*.onnx` | — |
-| `ae_onnx` | 导出 Action Expert（gemma_300m）ONNX | `pi05-action_expert*.onnx` | `vlm_onnx`（需 `runtime_save` 中转张量） |
-| `vlm_quant` | VLM ONNX W8A8 量化 | `pi05-vlm*_w8a8.onnx` | `--batch-path` + `vlm_onnx`；若 `vlm_onnx` 是 NPU 图，会自动复用/生成 donor ONNX |
-| `ae_quant` | Action Expert ONNX W8A8 量化 | `pi05-action_expert*_w8a8.onnx` | `--calib-dir`（默认 `runtime_save`）+ `ae_onnx`；若 `ae_onnx` 是 NPU 图，会自动复用/生成 donor ONNX |
-| `vlm_om` | VLM FP16 ONNX → OM（ATC） | `vlm.om`（+manifest） | `--soc-version` + `vlm_onnx` |
-| `ae_om` | Action Expert FP16 ONNX → OM（ATC） | `action_expert.om`（+manifest） | `--soc-version` + `ae_onnx` |
-| `vlm_quant_om` | VLM W8A8 ONNX → OM（ATC） | `vlm_w8a8.om`（+manifest） | `--soc-version` + `vlm_quant` |
-| `ae_quant_om` | Action Expert W8A8 ONNX → OM（ATC） | `action_expert_w8a8.om`（+manifest） | `--soc-version` + `ae_quant` |
-| `verify` | 拆分 vs 整体等价性验证 | — | `--task` + `vlm_onnx`,`ae_onnx` |
-
-**默认 `--steps`** = `vlm_onnx,ae_onnx,vlm_om,ae_om`（导出两段 ONNX + 编译两段 FP16 OM）。量化与验证是**显式选项**，需在 `--steps` 中点名；W8A8 OM 由专用的 `vlm_quant_om` / `ae_quant_om` 步骤编译，不会覆盖普通 `vlm_om` / `ae_om`。
-
-```shell
-# 仅导出两段 ONNX（不转 OM；适合在 GPU/CPU 机器上先把 ONNX 准备好）
-python -m model_utils.pi05_export \
-    --policy-path path/to/pretrained_model \
-    --steps vlm_onnx,ae_onnx
-
-# 默认：导出两段 ONNX 并编译两段 OM（在 Ascend 机器上一步到位）
-python -m model_utils.pi05_export \
-    --policy-path path/to/pretrained_model \
-    --soc-version Ascend310P3
-
-# 导出 + 转 OM + 等价性验证
-python -m model_utils.pi05_export \
-    --policy-path path/to/pretrained_model \
-    --soc-version Ascend310P3 \
-    --steps vlm_onnx,ae_onnx,vlm_om,ae_om,verify --task 'pick up the cup'
-
-# 导出 + W8A8 量化（两段）+ 编译量化 OM（用专用的量化 OM 步骤）
-python -m model_utils.pi05_export \
-    --policy-path path/to/pretrained_model \
-    --soc-version Ascend310P3 \
-    --steps vlm_onnx,ae_onnx,vlm_quant,ae_quant,vlm_quant_om,ae_quant_om \
-    --batch-path path/to/batches.json
-```
-
-> **场景 1：已导出 ONNX+OM，现在想开始量化**。复用已有 profile，只跑量化 + 编译量化 OM。若已有 ONNX 是
-> `*_npu.onnx`，pipeline 会自动查找同目录 `*_cpu.onnx` donor；donor 已存在则复用，不存在则用
-> `--donor-device`（默认 `cpu`）主动生成，并在日志中明确说明：
->
-> ```shell
-> python -m model_utils.pi05_export --profile p310 \
->     --steps vlm_quant,ae_quant,vlm_quant_om,ae_quant_om \
->     --batch-path path/to/batches.json
-> ```
->
-> **场景 2：调参后只重导某一段并重编它的 OM**（另一段完全不动）：
->
-> ```shell
-> # 只重导 VLM ONNX 并重编 vlm.om（AE 不受影响）
-> python -m model_utils.pi05_export --profile p310 --steps vlm_onnx,vlm_om
-> ```
->
-> 关键规则：**列在 `--steps` 里的步骤一定会执行**（即使产物已存在也会重建）；某步骤的上游产物
-> 若既不在 `--steps`、盘上也没有，会**报错并提示把对应 step 加进 `--steps`**（不会偷偷补跑）。
-
-#### 参数
-
-| 参数 | 必填 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `--policy-path` | ✅ | — | 本地 PI05 策略目录（含 config + 权重）。可由 profile 提供 |
-| `--steps` | ❌ | `vlm_onnx,ae_onnx,vlm_om,ae_om` | 要执行的步骤列表（见上表）。列出的步骤总会执行 |
-| `--exp-dir` | ❌ | `None` | 实验目录：自动派生 `onnx/`/`runtime_save/`/`om/`，免去分别手填三条长路径 |
-| `--dtype` | ❌ | `fp16` | 导出精度，**同时应用于 VLM 与 AE 两段**（`fp16` / `fp32` / `auto`） |
-| `--soc-version` | ❌ | `None` | `vlm_om` / `ae_om` / `vlm_quant_om` / `ae_quant_om` 步骤所需的目标芯片（如 `Ascend310P3`，见下文「查看芯片版本号」） |
-| `--batch-path` | `vlm_quant` 必填 | `None` | 真实标定 batch JSON（**随机数据会量化出不可用模型**）。可由 profile 提供 |
-| `--donor-device` | ❌ | `cpu` | 量化 NPU ONNX 时，若 donor ONNX 不存在，用该设备自动导出 ORT-runnable donor（不要设为 `npu`） |
-| `--calib-dir` | ❌ | `=--runtime-save-dir` | `ae_quant` 标定样本目录（含 `past_kv_tensor.*` + `prefix_pad_masks.*`） |
-| `--num-calib` | ❌ | `16` | 标定样本数量（`<=0` 表示全部） |
-| `--amp-num` | ❌ | `0` | msModelSlim 自动混合精度的 fp16 回退层数（精度安全阀） |
-| `--task` | `verify` 必填 | `None` | `verify` 步骤所需的任务提示，须与部署 `default_task` 一致 |
-| `--device` | ❌ | `cpu` | 导出/验证设备（`cpu` / `cuda:0` / `npu`），会体现在 ONNX 文件名中 |
-| `--output-dir` | ❌ | `outputs/onnx` | 导出 ONNX 的目录。可由 `--exp-dir` 派生为 `<DIR>/onnx/` |
-| `--runtime-save-dir` | ❌ | `runtime_save` | VLM→AE 中转张量目录。可由 `--exp-dir` 派生为 `<DIR>/runtime_save/` |
-| `--om-dir` | ❌ | `outputs/om` | 编译出的 OM 产物目录。可由 `--exp-dir` 派生为 `<DIR>/om/`；`config.om.json` 仍写入 `--policy-path` |
-
-> 配置/向导相关：`--config`（配置文件路径）、`--profile`（引用 profile）、`--save-as`（另存为 profile）、`--init`（强制向导）、`--list-profiles`（列出 profile）。详见上方「快速开始」。
->
-> 量化说明：量化默认**不执行**（不在默认 `--steps` 内）。在 `--steps` 中加入 `vlm_quant`/`ae_quant`
-> 即开启对应段量化，会在 fp16 ONNX 旁产出 `*_w8a8.onnx`；要把量化产物编译成 OM，需显式加入专用的
-> `vlm_quant_om`/`ae_quant_om` 步骤，输出 `vlm_w8a8.om` / `action_expert_w8a8.om`，不会覆盖普通
-> `vlm_om`/`ae_om` 编出的 `vlm.om` / `action_expert.om`（普通 OM 步骤始终编译 fp16 ONNX）。如果当前部署 ONNX 文件名是
-> `*_npu.onnx`，量化会走 Route A：用 ORT-runnable donor 做校准/量化，再把 int8 Linear graft 回 NPU 图；
-> donor 图按 `--donor-device` 推导文件名（默认 `*_cpu.onnx`），存在则复用，缺失则自动导出。`--steps` 是
-> 临时流程开关**不写入** `_last`/profile；而 `--batch-path` / `--donor-device` / `--calib-dir` /
-> `--num-calib` / `--amp-num` 会随 profile 复用。
->
-> ATC 说明：默认不传 `--input_shape`，并自动加 `--precision_mode_v2=origin`。如某版 CANN 需要显式
-> shape，可单独运行 `convert_om` 并传 `--input-shape auto`；如需覆盖精度模式，用 `--atc-arg` 显式传
-> `--precision_mode_v2=...`。
-
-#### 特性
-
-- **显式步骤、产物可复用**：`--steps` 里列出的步骤一定执行（已存在的产物会被重建）；未列出但被依赖的
-  上游产物必须已在盘上，否则报错提示补 step。借此可只重做某一段（如 `--steps vlm_onnx,vlm_om`）。
-- **依赖前置校验**：选了某步骤但缺其所需参数（如 `vlm_om` 缺 `--soc-version`、`vlm_quant` 缺
-  `--batch-path`、`verify` 缺 `--task`）会在开跑前**精确报错并提示要补的参数**，不会跑到一半才失败。
-- **量化 donor 前置校验**：当量化 `*_npu.onnx` 时，开跑前会判断 donor 是否存在、能否自动生成；AE donor
-  生成所需的 `runtime_save/past_kv_tensor.pth` 和 `prefix_pad_masks.pth` 缺失时会提前报错并提示补充路径。
-- **保留中间产物**：流程不删除任何中间文件，导出的 ONNX、`runtime_save/*.pth`、`config.om.json`
-  都保留在盘上，便于检查或局部重跑。
-- **实时反馈**：各步骤以子进程运行并透出 stdout/stderr，导出与 ATC 编译进度实时可见，每步
-  带 `▶ 开始 / ✓ 完成（耗时） / ✗ 失败` 横幅，不会让人误以为卡住。
-- **统一日志风格**：全工具链统一为 `HH:MM:SS LEVEL message`，结尾打印结构化结果块。
-
-#### 日志样例
-
-成功跑通（`--policy-path ... --soc-version Ascend310P3`）的末尾结果块：
-
-```text
-HH:MM:SS INFO ────────────────────────────────────────
-HH:MM:SS INFO PI05 export pipeline complete
-HH:MM:SS INFO ────────────────────────────────────────
-HH:MM:SS INFO   VLM ONNX           : outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx
-HH:MM:SS INFO   Action Expert ONNX : outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx
-HH:MM:SS INFO   VLM OM             : path/to/pretrained_model/vlm.om
-HH:MM:SS INFO   Action Expert OM   : path/to/pretrained_model/action_expert.om
-HH:MM:SS INFO   OM manifest        : path/to/pretrained_model/config.om.json
-HH:MM:SS INFO ────────────────────────────────────────
-HH:MM:SS INFO   ✅ DONE
-HH:MM:SS INFO ────────────────────────────────────────
-```
-
-只重做某一段（`--steps vlm_onnx,vlm_om`，AE 不动）：
-
-```text
-HH:MM:SS INFO ▶ [1/2] VLM ONNX export …
-HH:MM:SS INFO ▶ [2/2] ATC → OM compile (VLM) …
-```
-
-#### 导出 ONNX 的文件命名
-
-自动生成的 ONNX 文件名编码了关键导出配置，便于区分不同配置的产物：
-
-```text
-pi05-vlm_op17_nodyn_fp16_cpu.onnx
-         │    │     │    └─ 导出设备：cpu / cuda / npu
-         │    │     └────── 精度：fp16 / fp32
-         │    └──────────── 是否使用 dynamo 导出：nodyn / dyn
-         └───────────────── ONNX opset 版本（默认 17）
-```
-
-> 说明：常量折叠（constant folding）默认开启，故不再编码进文件名。`dynamo` 模式会忽略 `--opset`
-> 并固定使用 opset 18。
-
----
-
-### 分步调用（高级 / 调试）
-
-统一入口内部按顺序调用下列子脚本；需要单独运行某一步时也可直接调用。
-
-#### 导出脚本
-
-> 三个子脚本的策略目录参数统一为 `--policy-path`（旧名 `--pretrained-policy-path` 作为别名保留，向后兼容）。
-
-| 脚本 | 用途 |
-| --- | --- |
-| `convert_onnx_vlm` | 导出 VLM 段 ONNX，写入 `config.om.json` 的 `vlm` 条目；同时保存供 AE 使用的运行期张量（`past_kv_tensor`、`prefix_pad_masks`） |
-| `convert_onnx_action_expert` | 读取 VLM 导出的运行期张量，导出 AE 段 ONNX，写入 `config.om.json` 的 `action_expert` 条目 |
-| `convert_om` | 调用 `atc` 将已导出的 VLM / AE ONNX 编译为 `.om`，默认不传 `--input_shape`、默认加 `--precision_mode_v2=origin`，并补全 `config.om.json` |
-
-```shell
-# 1. 导出 VLM 段
-python -m model_utils.pi05_export.convert_onnx_vlm \
-    --pretrained-policy-path path/to/pretrained_model
-
-# 2. 导出 AE 段（复用步骤 1 的运行期张量）
-python -m model_utils.pi05_export.convert_onnx_action_expert \
-    --pretrained-policy-path path/to/pretrained_model
-
-# 3. ATC 转 OM（在 Ascend 机器上；可只传其中一个 --vlm-onnx / --ae-onnx 单独转换）
-python -m model_utils.pi05_export.convert_om \
-    --pretrained-policy-path path/to/pretrained_model \
-    --soc-version Ascend310P3 \
-    --vlm-onnx outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx \
-    --ae-onnx  outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx
-```
-
-> `convert_om` 默认省略 `--input_shape`；需要时可加 `--input-shape auto` 从 ONNX 静态输入推导。若输入
-> ONNX 文件名以 `_w8a8.onnx` 结尾，默认 OM 文件名自动加 `_w8a8` 后缀。
-
-> 当 `--pretrained-policy-path` 传入的是 HuggingFace Hub repo id 而非本地目录时，需在
-> `convert_onnx_vlm` / `convert_onnx_action_expert` / `convert_om` 显式指定 `--om-manifest-dir`，
-> 以确保 `config.om.json` 写入真实的本地策略目录而非当前工作目录。
-
-#### 量化（W8A8 PTQ，可选）
-
-> 多数情况下无需手动调用本节脚本——统一入口在 `--steps` 中加入 `vlm_quant` / `ae_quant`
-> 即自动编排量化并把量化产物接入 ATC（见上方「一条命令的端到端流程」）。下面是需要单独运行或精调时的底层用法。
-
-将 ONNX 量化为 W8A8 以降低显存带宽压力。**必须提供真实标定数据**（用随机数据标定会得到不可用的模型）。
-
-| 脚本 | 用途 |
-| --- | --- |
-| `quant.quantize_vlm` | 对 VLM（gemma_2b）ONNX 做 msModelSlim W8A8 量化 |
-| `quant.quantize_ae` | 对 AE（gemma_300m）ONNX 做 W8A8 量化（10 步去噪，量化收益被放大约 10×） |
-| `quant.inventory_quant_nodes` | 列出可量化节点清单，辅助决定哪些节点保留 fp16 |
-
-```shell
-# 先列出可量化节点（决定 fp16 豁免）
-python -m model_utils.pi05_export.quant.quantize_vlm \
-    --onnx-path outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx --list-nodes
-
-# 量化 VLM（需真实 batch 标定）
-python -m model_utils.pi05_export.quant.quantize_vlm \
-    --onnx-path   outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx \
-    --output-path outputs/onnx/pi05-vlm_w8a8.onnx \
-    --policy-path path/to/pretrained_model \
-    --batch-path  path/to/batches.json \
-    --num-calib   16 \
-    --task 'pick up the cup'
-
-# 量化 AE（标定输入为 VLM 导出 / dump_ae_pt 产出的张量）
-python -m model_utils.pi05_export.quant.quantize_ae \
-    --onnx-path   outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx \
-    --output-path outputs/onnx/pi05-ae_w8a8.onnx \
-    --calib-dir   path/to/ae_calib_dumps \
-    --num-calib   16
-```
-
-> 量化得到的是 ONNX；随后仍需用 `convert_om` 将量化后的 ONNX 编译为 `.om`。
-
-#### 验证与诊断脚本
-
-| 脚本 | 用途 |
-| --- | --- |
-| `verify_pi05_split_equivalence` | 校验拆分导出（VLM + AE）与原始整体 PI05 策略的等价性；使用真实 batch 时需通过 `--task` 指定与部署一致的任务提示。给定 `--vlm-onnx-path` + `--ae-onnx-path` 时仅对比「整体 PyTorch vs ONNX 拆分」 |
-| `dump_vlm_pt` | 在 PyTorch 侧 dump VLM 输入/输出张量，用于 PT/ORT/OM 三方逐张量对比 |
-| `dump_vlm_ort` | 在 ONNX Runtime（CPU）侧 dump VLM 张量，定位 PT→ONNX 导出误差 |
-| `dump_ae_pt` | 在 PyTorch 侧 dump AE 的完整 Euler 去噪轨迹，定位逐步发散点 |
-
-```shell
-# 验证（cosine ≥ 0.9999 → ✅ PASS；0.999 ≤ cosine < 0.9999 → ⚠️ MARGINAL；否则 ❌ FAIL）
-python -m model_utils.pi05_export.verify_pi05_split_equivalence \
-    --pretrained-policy-path path/to/pretrained_model \
-    --vlm-onnx-path outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx \
-    --ae-onnx-path  outputs/onnx/pi05-action_expert_op17_nodyn_fp16_cpu.onnx \
-    --task 'pick up the cup'
-```
+更完整的运行时架构、digest 算法和 pipeline 配置见 `src/inference_service/README.md`。

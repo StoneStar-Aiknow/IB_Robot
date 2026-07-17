@@ -36,15 +36,16 @@ ssh root@<board-ip> 'cd /data/local/tmp && tar xzf roboframe-robopi-*.tar.gz && 
 
 # ② 加载环境
 ssh root@<board-ip>
-source /data/roboframe/scripts/robooh_1.0.1.env
+. /data/roboframe/scripts/robooh_1.0.1.env
 export ROS_DOMAIN_ID=51
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
 # ③ 启动推理
 ros2 launch hardware_mock hardware_mock.launch.py robot_config:=so101_single_arm &
 ros2 launch inference_service eval_inference.launch.py \
-    device:=rknn \
-    policy_path:=/data/models/502000_rknn/pretrained_model \
+    model_path:=/data/models/502000_rknn/pretrained_model \
+    deployment:=rknn \
+    pipeline_id:=policy \
     robot_config_path:=/data/roboframe/install/robot_config/share/robot_config/config/robots/so101_single_arm.yaml
 ```
 
@@ -70,7 +71,7 @@ RoboFrame 构建从感知、决策到执行的端到端闭环：
 
 1. **感知**：ROS 2 Driver 接入多路相机 / 雷达 / 麦克风；支持 VR 手柄、Xbox 控制器遥操作采集
 2. **协议转换 (tensormsg)**：`ros_msg` ↔ `tensor` 双向转换，合约机制保证类型安全
-3. **推理 (inference_service)**：支持 ACT / Diffusion Policy / Pi0.5 等 VLA 模型，自动检测后端
+3. **推理 (inference_service)**：通过 bundle 内唯一的 `inference_manifest.json` 和命名 deployment 选择 Torch、RKNN 等后端
 4. **动作执行 (action_dispatch)**：Action Chunking 调度 / MoveIt 2 轨迹执行，统一 `RobotStatus` 汇报
 5. **配置中心 (robot_config)**：单一 YAML 驱动关节、控制器、传感器外参，一键切换仿真 / 实机
 
@@ -254,7 +255,7 @@ ssh root@<board-ip> 'cd /data/roboframe && tar xzf roboframe-deps.tar.gz'
 
 ```bash
 ssh root@<board-ip>
-source /data/roboframe/scripts/robooh_1.0.1.env
+. /data/roboframe/scripts/robooh_1.0.1.env
 
 ros2 pkg list | grep -E 'inference_service|hardware_mock|so101_hardware'
 python3 -c "import torch; print('torch', torch.__version__)"
@@ -268,7 +269,7 @@ python3 -c "from rknnlite.api import RKNNLite; print('RKNN OK')"
 ### 5.1 RKNN NPU 推理
 
 ```bash
-source /data/roboframe/scripts/robooh_1.0.1.env
+. /data/roboframe/scripts/robooh_1.0.1.env
 export ROS_DOMAIN_ID=51
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
@@ -277,30 +278,36 @@ ros2 launch hardware_mock hardware_mock.launch.py robot_config:=so101_single_arm
 
 # 启动 RKNN 推理
 ros2 launch inference_service eval_inference.launch.py \
-    device:=rknn \
-    policy_path:=/data/models/502000_rknn/pretrained_model \
+    model_path:=/data/models/502000_rknn/pretrained_model \
+    deployment:=rknn \
+    pipeline_id:=policy \
     robot_config_path:=/data/roboframe/install/robot_config/share/robot_config/config/robots/so101_single_arm.yaml
 ```
 
+`/data/models/502000_rknn/pretrained_model` 必须是完整 policy bundle，至少包含
+`config.json`、processor 文件、`inference_manifest.json` 和 manifest 声明的 RKNN artifact。
+`rknn` 是该 manifest 中的 deployment 名称；运行时不会扫描目录寻找 `*.rknn`。
+
 ### 5.2 CPU 推理
 
-将 `device:=rknn` 改为 `device:=cpu`，模型路径指向 CPU 版本的 ACT 模型：
+将 deployment 改为 bundle 中的 Torch CPU deployment 名称，例如 `cpu`：
 
 ```bash
 ros2 launch inference_service eval_inference.launch.py \
-    device:=cpu \
-    policy_path:=/data/models/502000/pretrained_model \
+    model_path:=/data/models/502000/pretrained_model \
+    deployment:=cpu \
+    pipeline_id:=policy \
     robot_config_path:=/data/roboframe/install/robot_config/share/robot_config/config/robots/so101_single_arm.yaml
 ```
 
 ### 5.3 触发推理
 
-推理节点暴露 `/lerobot_policy_node/DispatchInfer` ROS 2 Action，发送 goal 即可触发一次推理：
+默认 `policy` pipeline 暴露 `/inference/policy/dispatch` ROS 2 Action，发送 goal 即可触发一次推理：
 
 ```bash
-ros2 action send_goal /lerobot_policy_node/DispatchInfer \
+ros2 action send_goal /inference/policy/dispatch \
     ibrobot_msgs/action/DispatchInfer \
-    "{obs_timestamp: {sec: 0, nanosec: 0}, prompt: '', inference_id: 'test-001'}"
+    "{obs_timestamp: {sec: 0, nanosec: 0}, prompt: '', inference_id: 'test-001', deadline: {sec: 0, nanosec: 0}}"
 ```
 
 期望输出：
@@ -336,7 +343,8 @@ Goal finished with status: SUCCEEDED
 | `/dev/ttyACM0` 不存在 | 内核缺少 `CONFIG_USB_ACM` | 重新编译内核，见 `oh-rebuild-kernel` skill |
 | 推理节点 SIGSEGV | `LD_PRELOAD` 未设置 | 确认 `source robooh_1.0.1.env` 已执行 |
 | `ModuleNotFoundError: 'rknnlite.xxx'` | `.so` 后缀不匹配 | 重命名 `-gnu.so` → `-ohos.so` |
-| `RKNN model file not found` | YAML 中 path 为相对路径 | 使用绝对路径 |
+| `Deployment 'rknn' is not present` | manifest 中没有同名 deployment | 查看 `inference_manifest.json` 并使用实际 deployment 名称，或重新运行 exporter |
+| `SHA-256 mismatch` / `Bundle digest mismatch` | bundle 或 artifact 在打包后被修改 | 重新运行 RKNN exporter；不要手工修改 manifest hash |
 
 > 更多问题与高级配置见各专项 skill（`oh-rebuild-kernel`、`oh-cross-build-ros-pkg`）与 [RKNN 推理指南](docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md)。
 

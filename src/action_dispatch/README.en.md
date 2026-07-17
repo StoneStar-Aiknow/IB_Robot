@@ -176,8 +176,8 @@ ros2 run action_dispatch action_dispatcher_node
 | `queue_size` | int | 100 | Maximum action queue length |
 | `watermark_threshold` | int | 20 | Watermark threshold to trigger inference |
 | `control_frequency` | double | 100.0 | Control frequency (Hz) |
-| `inference_action_server` | string | `/act_inference_node/DispatchInfer` | Inference service Action name |
-| `inference_reset_service` | string | `/act_inference_node/reset_policy_state` | Inference-side policy reset service; called best-effort during reset |
+| `inference_action_server` | string | `/inference/policy/dispatch` | Named-pipeline inference action; robot_config overrides it from `executor.inference_pipeline` |
+| `inference_reset_service` | string | `/inference/policy/reset` | Named-pipeline reset service; called best-effort during reset |
 | `policy_reset_timeout_sec` | double | 2.0 | Max wait time for inference-side policy reset completion |
 | `contract_path` | string | `''` | Contract file path |
 | `joint_state_topic` | string | `/joint_states` | Joint state topic |
@@ -421,7 +421,7 @@ control_modes:
 
 | Direction | Topic/Action | Message Type | Description |
 |-----------|--------------|--------------|-------------|
-| Request | `/act_inference_node/DispatchInfer` | `ibrobot_msgs/action/DispatchInfer` | Send inference request |
+| Request | `/inference/policy/dispatch` | `ibrobot_msgs/action/DispatchInfer` | Send a request to the default `policy` pipeline; robot_config may override the endpoint |
 | Response | `result.action_chunk` | `ibrobot_msgs/msg/VariantsList` | Receive action chunk (Tensor) |
 
 ### Published Topics

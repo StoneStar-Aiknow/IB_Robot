@@ -1,288 +1,410 @@
-# Inference Service
+# inference_service
 
-`inference_service` is the core AI execution package for IB-Robot. It provides a standardized framework for running end-to-end Machine Learning policies (like ACT, pi0, etc.) on physical robots with strict temporal alignment and zero-copy latency optimizations.
+`inference_service` is IB-Robot's unified inference runtime. It selects one policy bundle, one named deployment,
+and one stable pipeline ID, then runs that pipeline through Torch, Ascend, Hisilicon, RKNN, or HMM in either
+monolithic or distributed edge/cloud mode.
 
-## Architecture: Composition over Inheritance
+There is no compatibility layer for the removed runtime architecture. A backend is not selected with a launch
+`device` argument. The runtime does not load per-backend sidecar manifests, scan directories for conventional
+artifact names, or use environment variables to override artifacts.
 
-The inference pipeline is decoupled into three pure-Python core components (`inference_service.core`):
-1. **TensorPreprocessor**: Converts raw ROS 2 sensor data (images, joint states) into normalized PyTorch Tensors.
-2. **PureInferenceEngine**: A completely stateless, ROS-agnostic GPU execution engine.
-3. **TensorPostprocessor**: Denormalizes output action tensors back into physical control commands.
+## Core Concepts
 
-By separating the core math from the ROS 2 transport layer, this package supports two distinct deployment modes, toggleable via a single YAML parameter.
+### Policy Bundle
 
----
+Every deployable policy directory contains the LeRobot semantic files and exactly one
+`inference_manifest.json`:
 
-## 🚀 Execution Modes
-
-### Mode A: Monolithic (Single-Machine Zero-Copy)
-**Best for**: Robots equipped with high-performance onboard GPUs (e.g., RTX 4060).
-
-In this mode, `lerobot_policy_node.py` instantiates an `InferenceCoordinator` that chains the Preprocessor, Engine, and Postprocessor together.
-* **Data Flow**: Sensor data stays entirely within the RAM/VRAM of the single process. Tensors are passed by reference.
-* **Performance**: Absolute lowest latency. Zero serialization/deserialization overhead.
-* **Config**: `execution_mode: "monolithic"`
-
-### Mode B: Device-Edge-Cloud Synergy (Distributed)
-**Best for**: Lightweight robots (Device) running on low-power CPUs (e.g., Raspberry Pi) paired with a high-end computation node (Edge) or tower server (Cloud) over a LAN.
-
-To preserve compatibility with the pull-based `action_dispatch` system without clogging the network with 30fps video streams, the Device node acts as an **Asynchronous Proxy**.
-1. **Device Node (`lerobot_policy_node.py`)**: Receives the action goal, reads the cameras *on-demand*, runs the **Preprocessor** on CPU, and publishes the lightweight Tensor batch to `/preprocessed/batch`. The action callback is then suspended using an asynchronous `threading.Event`.
-2. **Edge/Cloud Node (`pure_inference_node.py`)**: Subscribes to the batch, crunches the numbers on the GPU using `PureInferenceEngine`, and returns the raw action to `/inference/action`.
-3. **Device Node**: Wakes up, runs the **Postprocessor**, and completes the Action sequence.
-
-* **Performance**: Achieves "Compute Offloading" perfectly. The Device only sends the exact frames needed for inference (e.g., 20Hz), saving massive network bandwidth.
-* **Config**: `execution_mode: "distributed"`
-
-```
-Device Machine (Robot / Sim)               GPU Machine (Edge/Cloud)
-┌──────────────────────────────┐          ┌──────────────────────────┐
-│  action_dispatcher_node      │          │                          │
-│       ↓                      │          │  pure_inference_node     │
-│  lerobot_policy_node (Proxy) │          │  ├─ Subscribe            │
-│  ├─ TensorPreprocessor (CPU) │          │  │  /preprocessed/batch  │
-│  ├─ threading.Event          │          │  ├─ PureInferenceEngine  │
-│  └─ TensorPostprocessor(CPU) │          │  │  (GPU)                │
-│       ↓ Pub        ↑ Sub     │          │  └─ Publish              │
-│  /preprocessed  /inference   │          │     /inference/action    │
-│  /batch         /action      │          │                          │
-└──────────┬──────────┬────────┘          └───────┬──────────┬───────┘
-           │          │      LAN (same ROS_DOMAIN_ID)        │          │
-           └──────────┴──────────────────────────┴──────────┘
+```text
+policy_bundle/
+├── config.json
+├── model.safetensors                         # when required by a Torch deployment
+├── policy_preprocessor.json
+├── policy_preprocessor_step_*.safetensors
+├── policy_postprocessor.json
+├── policy_postprocessor_step_*.safetensors
+├── tokenizer/                                # when required by PI0.5 or SmolVLA
+├── artifacts/
+│   ├── ascend/<deployment>/...
+│   ├── hisilicon/<deployment>/...
+│   ├── rknn/<deployment>/...
+│   └── hmm/<deployment>/...
+└── inference_manifest.json
 ```
 
----
+LeRobot owns `config.json`, processor JSON, processor state, tokenizer assets, and native weights. IB-Robot reads
+those files without adding fields, removing fields, rewriting devices, or materializing a temporary policy
+directory. All deployment metadata belongs in `inference_manifest.json`.
 
-## ⚙️ Configuration & Usage
+### Deployment
 
-The execution mode is controlled seamlessly via your `robot_config` YAML files. You do not need to change launch files to switch modes on the device.
+One manifest may declare multiple named deployments for the same policy, such as `cpu`, `cuda`, `rk3588`,
+`ascend_310p3`, or `lq50`. A pipeline selects a deployment name, not a backend name.
 
-```yaml
-# src/robot_config/config/robots/your_robot.yaml
-control_modes:
-  model_inference:
-    inference:
-      enabled: true
-      execution_mode: "distributed"  # Or "monolithic"
-      model: so101_act
-```
-
-### Launching
-
-#### Scenario 1: Cross-Machine Distributed Deployment (Recommended for Production)
-
-Both machines must share the **same `ROS_DOMAIN_ID`** and be on the same LAN.
-
-**Step 1 — On the Robot (Device)**:
-
-The Device launches only the Edge proxy node (pre/post-processing), without loading GPU models:
-```bash
-export ROS_DOMAIN_ID=<your_domain_id>
-ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
-    control_mode:=model_inference \
-    execution_mode:=distributed \
-    use_sim:=true   # For simulation; omit for real hardware
-```
-
-**Step 2 — On the GPU Server (Edge/Cloud)**:
-
-```bash
-export ROS_DOMAIN_ID=<same_domain_id_as_device>
-ros2 launch inference_service cloud_inference.launch.py \
-    policy_path:=/path/to/models/pretrained_model \
-    device:=cuda
-```
-
-For models exported through the ATC/SVP toolchain, `inference_service` can own
-the OM wrappers migrated from the original LeRobot patches:
-
-```bash
-# Generic Ascend ACL .om backend
-ros2 launch inference_service cloud_inference.launch.py \
-    policy_path:=/path/to/pretrained_model \
-    device:=ascend_om
-
-# SD3403 worker binary protocol backend
-ros2 launch inference_service cloud_inference.launch.py \
-    policy_path:=/path/to/pretrained_model \
-    device:=ascend_om_3403
-```
-
-`device:=ascend_om` resolves the single OM model from `artifacts.policy` in
-`policy_path/config.om.json`. `device:=ascend_om_3403` requires both
-`artifacts.policy` and `artifacts.worker`, with `execution` set to
-`["policy", "worker"]`. Preprocessing, postprocessing, ROS topics, and
-distributed transport remain the existing `inference_service` pipeline.
-
-The `ascend_om_3403` worker must support `--model <om_path>`. Legacy `SVP_*`
-environment variables are no longer passed to the worker, so stale shell state
-cannot select a different model or layout. Use `config.om.json` instead:
-
-| Legacy environment variable | Replacement |
-| --- | --- |
-| `SVP_MODEL_PATH` | `config.om.json` `artifacts.policy` |
-| `SVP_WORKER_EXECUTABLE` / `SVP_CPP_EXECUTABLE` | `config.om.json` `artifacts.worker` |
-| `SVP_IMAGE_HEIGHT` / `SVP_IMAGE_WIDTH` | derived from `config.json` `input_features.<image_key>.shape` (optional `backend_config.image_height`/`image_width` override) |
-| `SVP_PERF_LOG` / `SVP_PERF_LOG_EVERY` | `config.om.json` `backend_config.perf_enabled` / `backend_config.perf_log_every` |
-| `SVP_WORKER_GRACEFUL_CLOSE_TIMEOUT` / `SVP_WORKER_FORCE_CLOSE` | `config.om.json` `backend_config.graceful_close_timeout` / `backend_config.force_close` |
-
-The action dimension still comes from LeRobot `config.json`
-`output_features.action.shape`. Worker output index, layout, and legacy stride
-belong to the compiled artifact sidecar under `config.om.json` `backend_config`.
-
-For RK3588 / OpenHarmony boards running RKNN Lite, switch the cloud node to:
-
-```bash
-export ROS_DOMAIN_ID=<same_domain_id_as_device>
-ros2 launch inference_service cloud_inference.launch.py \
-    policy_path:=/path/to/models/pretrained_model \
-    device:=rknn
-```
-
-`device:=rknn` still uses the LeRobot metadata under `policy_path/config.json`
-for preprocessing and postprocessing, while expecting the actual RKNN artifact to
-live inside `policy_path`, using `model.rknn` as the default filename.
-
-### Compiled Model Backend Boundaries
-
-`PureInferenceEngine` still depends only on the common `PolicyWrapper` interface.
-For `device:=ascend_om`, `device:=ascend_om_3403`, and `device:=rknn`, it uses an
-internal `CompiledPolicyWrapper` facade:
-
-- `ACTCompiledAdapter` and `PI05CompiledAdapter` read `type`, `input_features`,
-  and `output_features` from `config.json` and own model-family input ordering,
-  image/language inputs, action chunk decoding, `policy_type`, and chunk-size
-  semantics. For SD3403 ACT, it consumes the direct worker action tensor, such
-  as output index 1 with shape `(1, chunk_size, action_dim)`. The SD3403 worker
-  already packs only the logical action dims, with no stride padding.
-- `OMRuntimeSession`, `PI05OMRuntimeSession`, `SD3403RuntimeSession`, and
-  `RKNNRuntimeSession` own backend artifact resolution, runtime loading,
-  execution, and resource cleanup.
-- `policy_type` identifies the model family, such as `act`; `backend_type`
-  identifies the runtime backend, such as `ascend_om`, `ascend_om_3403`, or
-  `rknn`.
-
-The runtime device comes from launch/ROS parameters. If the LeRobot-exported
-`config.json` still records the training device, such as `"device": "cuda"`,
-`inference_service` overrides that field in a local temporary config copy with
-the current runtime tensor device (CPU for compiled OM/RKNN backends). The
-source model directory is not modified, and training-device metadata does not
-constrain backend selection.
-
-Compiled conversion tools should emit a separate `config.om.json` next to the
-LeRobot `config.json` so compiled runtime metadata does not pollute the LeRobot
-schema. The sidecar uses a role-to-path artifact map and can declare a generic
-serial pipeline through `execution`:
+A Torch deployment directly declares its runtime device:
 
 ```json
 {
-  "schema_version": 1,
-  "policy_type": "pi05",
-  "backend": "ascend_om",
-  "artifact_dir": "om",
-  "artifacts": {
-    "vlm": "vlm.om",
-    "action_expert": "action_expert.om"
-  },
-  "execution": ["vlm", "action_expert"]
+  "backend": "torch",
+  "device": "cpu"
 }
 ```
 
-SD3403 worker backends can also declare worker IO bindings and runtime options
-in `backend_config`:
+A compiled deployment declares its target, artifacts, execution order, and complete runtime ABI bindings:
 
 ```json
 {
-  "schema_version": 1,
-  "policy_type": "act",
-  "backend": "ascend_om_3403",
-  "artifact_dir": "om",
-  "artifacts": {
-    "policy": "act.om",
-    "worker": "main"
+  "backend": "rknn",
+  "target": {
+    "soc": "rk3588",
+    "runtime": "rknn-lite2"
   },
-  "execution": ["policy", "worker"],
-  "backend_config": {
-    "action_output": {"index": 1, "layout": "direct"},
-    "perf_enabled": false,
-    "perf_log_every": 1,
-    "graceful_close_timeout": 5.0,
-    "force_close": true
+  "artifacts": {
+    "policy": {
+      "path": "artifacts/rknn/rk3588/policy.rknn",
+      "format": "rknn",
+      "sha256": "<64 lowercase hex>"
+    }
+  },
+  "execution": ["policy"],
+  "bindings": {
+    "policy": {
+      "inputs": [
+        {
+          "semantic": "observation.state",
+          "runtime_name": "observation.state",
+          "index": 0,
+          "dtype": "float32",
+          "shape": [1, 6]
+        },
+        {
+          "semantic": "observation.images.top",
+          "runtime_name": "observation.images.top",
+          "index": 1,
+          "dtype": "float32",
+          "shape": [1, 480, 640, 3],
+          "layout": "NHWC"
+        }
+      ],
+      "outputs": [
+        {
+          "semantic": "action",
+          "runtime_name": "action",
+          "index": 0,
+          "dtype": "float32",
+          "shape": [1, 100, 6]
+        }
+      ]
+    }
   }
 }
 ```
 
-`backend_config` is backend-private. `action_output` describes the direct action
-output layout returned by the worker — the SD3403 worker already packs only the
-logical action dims (e.g. `(1, 100, 6)`), with no stride padding.
+Every role in `execution` must have an artifact and a non-empty binding group. Image bindings must explicitly
+declare `NCHW` or `NHWC`; non-image tensors are never transposed from rank alone. Multi-module deployments use
+matching `internal.*` semantics or `device_links` that declare producer, consumer, device-pointer ownership, and
+inference lifetime.
 
-> [!note] Image resolution is derived from `config.json`, not `backend_config`
-> Image height/width is the model's input contract, recorded in `config.json`
-> `input_features.<image_key>.shape` (e.g. `[3, 480, 640]`) and baked into the OM
-> via ATC `--input_shape`. The runtime derives resize targets from that shape, so
-> it does not need to be redeclared in `backend_config`. To override (e.g. for
-> debugging) you may still set `image_height`/`image_width` in `backend_config`,
-> but `input_features` takes precedence.
+### Pipeline
 
-Single-OM ACT policies use `artifacts.policy` with `execution: ["policy"]`. OM
-artifacts are no longer read from LeRobot `config.json`, environment variables,
-or directory guesses; conversion tools must generate `config.om.json`.
+The pipeline ID is the stable model-instance and ROS-routing identity. It must match
+`^[a-z][a-z0-9_]{0,62}$`. Each pipeline independently owns:
 
-Compiled backend dependencies remain lazily loaded. Ascend ACL, PI05 OM, the
-SD3403 worker stack, and RKNNLite are imported only when the matching backend is
-loaded. ROS topics, preprocessing, postprocessing, and launch arguments stay
-unchanged.
+- its policy bundle and named deployment
+- its LeRobot preprocessor and postprocessor
+- its policy codec and binding execution plan
+- its backend instance, admission state, and lifecycle
+- its action, reset, health, action-output, and distributed transport endpoints
 
-#### Scenario 2: Single-Machine Debug (Development)
+Default endpoints:
 
-Run both Edge + Cloud nodes on one machine by adding `cloud_local:=true`:
+| Interface | Default |
+| --- | --- |
+| local node | `inference_<pipeline_id>` |
+| cloud node | `inference_<pipeline_id>_cloud` |
+| action server | `/inference/<pipeline_id>/dispatch` |
+| reset service | `/inference/<pipeline_id>/reset` |
+| health topic | `/inference/<pipeline_id>/health` |
+| action output | `/actions/<pipeline_id>` |
+| distributed request | `/inference/<pipeline_id>/request` |
+| distributed result | `/inference/<pipeline_id>/result` |
+| distributed heartbeat | `/inference/<pipeline_id>/heartbeat` |
+
+## Robot Configuration
+
+Inference is configured directly under `control_modes.<mode>.inference.pipelines`:
+
+```yaml
+control_modes:
+  model_inference:
+    inference:
+      enabled: true
+      pipelines:
+        policy:
+          model_path: models/so101_act
+          deployment: rk3588
+          execution_mode: monolithic
+          request_timeout: 5.0
+          default_task: pick up the banana
+          runtime_options: {}
+```
+
+A relative `model_path` is resolved only against the `WORKSPACE` environment variable. If `WORKSPACE` is unset,
+configuration fails without falling back to the current directory, YAML directory, or source tree. Source the
+project environment before project or ROS commands:
+
+```bash
+source .shrc_local
+```
+
+Multiple models are multiple pipelines, not a generic `concurrency` value:
+
+```yaml
+pipelines:
+  action_policy:
+    model_path: models/so101_act
+    deployment: rk3588
+    execution_mode: monolithic
+  auxiliary_policy:
+    model_path: models/auxiliary_smolvla
+    deployment: cpu
+    execution_mode: monolithic
+```
+
+YAML remains the default configuration source. For development, override one explicitly named pipeline:
 
 ```bash
 ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
+    config_path:=/absolute/path/to/robot.yaml \
     control_mode:=model_inference \
-    execution_mode:=distributed \
-    use_sim:=true \
-    cloud_local:=true
+    inference_pipeline:=policy \
+    inference_execution_mode:=distributed
 ```
 
-### Verifying Distributed Mode
+An empty `inference_execution_mode` preserves YAML configuration. A non-empty override requires
+`inference_pipeline`, preventing accidental global changes in multi-pipeline configurations.
+
+Each pipeline may override endpoints in a typed `transport` mapping. Node names, actions, services, and topics
+must remain unique across pipelines. A monolithic pipeline cannot configure cloud-node, request, result, or
+heartbeat overrides.
+
+## Execution Modes
+
+### Monolithic
+
+`pipeline_policy_node` executes the complete path in one process:
+
+```text
+ROS observations
+  -> contract adapter
+  -> LeRobot preprocessor
+  -> semantic batch
+  -> native policy or policy codec + bindings
+  -> selected backend
+  -> semantic action
+  -> LeRobot postprocessor
+  -> DispatchInfer result and action topic
+```
+
+Normal robot startup creates pipelines from robot YAML through the `robot_config` launch builder. To evaluate one
+pipeline directly:
 
 ```bash
-# 1. Confirm both inference nodes are online
-ros2 node list | grep -E 'act_inference|pure_inference'
-# Expected:
-#   /act_inference_node      ← Edge (pre/post-processing)
-#   /pure_inference           ← Cloud (GPU inference)
-
-# 2. Confirm distributed topics exist
-ros2 topic list | grep -E 'preprocessed|inference/action'
-# Expected:
-#   /preprocessed/batch      ← Edge → Cloud
-#   /inference/action         ← Cloud → Edge
-
-# 3. Monitor inference frequency
-ros2 topic hz /inference/action
+source .shrc_local
+ros2 launch inference_service eval_inference.launch.py \
+    robot_config_path:="$WORKSPACE/src/robot_config/config/robots/so101_single_arm.yaml" \
+    model_path:="$WORKSPACE/models/ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515" \
+    deployment:=cpu \
+    pipeline_id:=policy \
+    action_server:=/inference/policy/dispatch \
+    reset_service:=/inference/policy/reset
 ```
 
-### Logging Reference
+Trigger one request:
 
-After launch, each node prints key lifecycle messages for quick status diagnosis:
-
-| Node | Example Log | Meaning |
-|------|-------------|---------|
-| `pure_inference` | `Waiting for preprocessed batches from edge node...` | Cloud node ready, waiting for Edge data |
-| `pure_inference` | `✓ First inference completed: latency=XXms` | First inference succeeded, end-to-end link confirmed |
-| `pure_inference` | `[stats] count=XX, avg=XXms, last=XXms` | Performance stats every 5 seconds |
-| `act_inference_node` | `✓ First inference complete (distributed): total=XXms` | Edge node completed full inference round-trip |
-| `action_dispatcher` | `✓ First inference received: chunk=XX, latency=XXms` | Dispatcher received first executable actions |
-| `action_dispatcher` | `[stats] inferences=XX, avg_latency=XXms, queue=XX, hold=XX` | Dispatch stats every 5s; `hold` = times queue exhausted and last frame held |
-
----
-
-## 🧪 Testing
-Because the core components are isolated from ROS, they can be validated entirely offline:
 ```bash
-pytest src/inference_service/tests/
+ros2 action send_goal /inference/policy/dispatch \
+    ibrobot_msgs/action/DispatchInfer \
+    "{obs_timestamp: {sec: 0, nanosec: 0}, prompt: '', inference_id: 'test-001'}"
 ```
+
+### Distributed
+
+For a distributed pipeline, the edge `pipeline_policy_node` retains the observation adapter, processors, and
+postprocessor. The cloud `pure_inference_node` owns the selected backend. Before tensors can be sent, both sides
+must match:
+
+- pipeline ID
+- manifest schema version
+- bundle digest
+- deployment name
+- selected deployment fingerprint
+- policy input/output summary
+- cloud backend `READY` state
+
+Cloud example:
+
+```bash
+source .shrc_local
+ros2 launch inference_service cloud_inference.launch.py \
+    pipeline_id:=policy \
+    model_path:=/absolute/path/to/policy_bundle \
+    deployment:=cuda
+```
+
+To debug a distributed edge process directly:
+
+```bash
+ros2 launch inference_service eval_inference.launch.py \
+    robot_config_path:=/absolute/path/to/robot.yaml \
+    model_path:=/absolute/path/to/policy_bundle \
+    deployment:=cuda \
+    pipeline_id:=policy \
+    inference_execution_mode:=distributed
+```
+
+To start edge and cloud together on one host, replacing the old implicit local-cloud switch:
+
+```bash
+ros2 launch inference_service local_distributed_inference.launch.py \
+    robot_config_path:=/absolute/path/to/robot.yaml \
+    model_path:=/absolute/path/to/policy_bundle \
+    deployment:=cuda \
+    pipeline_id:=policy
+```
+
+The edge can be created from robot YAML with `execution_mode: distributed` or through the explicit launch
+override above. A successful handshake binds a unique
+session ID and generation. Heartbeat expiry, cloud restart, fingerprint change, or a backend leaving `READY`
+immediately revokes readiness, rejects new requests, and fails in-flight requests with a structured unavailable
+error. Responses from old sessions are discarded, and recovery requires a new handshake.
+
+## Backends And Support Matrix
+
+The only canonical backend names are:
+
+| Backend | Responsibility |
+| --- | --- |
+| `torch` | native LeRobot on `cpu`, `cuda`, `mps`, or `npu` |
+| `ascend` | Ascend ACL execution of OM artifacts |
+| `hisilicon` | Hisilicon worker runtime, initially targeting SoC `sd3403` |
+| `rknn` | RKNNLite execution of RKNN artifacts |
+| `hmm` | Houmo TCIM execution of HMM multi-module artifacts |
+
+The initial support matrix is normative and enforced at startup:
+
+| Policy family | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |
+| --- | --- | --- | --- | --- | --- |
+| ACT | supported | supported | supported | supported | unsupported |
+| PI0.5 | supported | supported | unsupported | unsupported | supported |
+| SmolVLA | supported | unsupported | unsupported | supported | supported |
+
+Optional SDKs are imported lazily. Importing the inference core does not require ACL, RKNNLite, TCIM, torch NPU,
+or Hisilicon worker dependencies. A missing dependency fails only when its deployment is selected.
+
+## Lifecycle, Health, And Capabilities
+
+Backend states are `CREATED`, `LOADING`, `READY`, `DEGRADED`, `RECOVERING`, `FAILED`, `CLOSING`, and
+`CLOSED`. Only `READY` admits requests. `close()` is idempotent, and partial startup failure releases every
+already-created context, model handle, device buffer, or worker.
+
+Pipeline states are `CREATED`, `LOADING`, `HANDSHAKING`, `READY`, `RESETTING`, `DEGRADED`, `FAILED`,
+`CLOSING`, and `CLOSED`. Reset blocks new admission. `CLOSING` and `CLOSED` are terminal.
+
+Backend capabilities report:
+
+- whether the backend is stateful, resettable, and thread-safe
+- maximum in-flight requests per instance
+- support for multiple instances
+- shared resource-domain identity and limit
+- attention and cancellation support
+
+Defaults are conservative and serialized. A backend may declare higher concurrency only after conformance tests
+prove overlapping calls, output isolation, failure isolation, and deterministic cleanup. Different pipelines have
+independent admission state, but a shared accelerator resource domain may still serialize them.
+
+## Manifest Integrity
+
+Startup performs strict JSON/schema validation, deployment selection, path-safety validation, bundle-file
+SHA-256 verification, bundle-digest verification, LeRobot metadata loading, compiled-artifact SHA-256 verification,
+and binding compatibility checks before creating a backend runtime.
+
+`bundle.digest` is calculated as follows:
+
+1. Normalize every `bundle.files` path to a unique bundle-relative POSIX path.
+2. Sort `{\"path\": ..., \"sha256\": ...}` entries by path.
+3. Serialize the array as UTF-8 JSON without insignificant whitespace and with keys ordered `path`, `sha256`.
+4. Calculate SHA-256 over the serialized bytes.
+
+The selected deployment fingerprint is SHA-256 over this canonical object:
+
+```json
+{
+  "schema_version": 1,
+  "bundle_digest": "...",
+  "deployment_name": "rk3588",
+  "deployment": {}
+}
+```
+
+Paths cannot be absolute, use parent traversal, escape the bundle root through symlinks, or collide after
+normalization.
+
+### Integrity Failures
+
+Do not edit hashes manually when startup reports:
+
+- `SHA-256 mismatch`
+- `Bundle digest mismatch`
+- missing or unexpected LeRobot semantic files
+- an execution role missing an artifact or bindings
+- runtime ABI incompatible with LeRobot feature shapes
+
+Rerun the exporter or packaging workflow that owns the artifact. Exporters copy artifacts, read compiler/runtime
+ABI metadata, generate bindings, calculate all SHA-256 values, update the bundle digest, and validate the result
+through the production loader.
+
+## Exporter Entry Points
+
+Generic compiled artifact packaging:
+
+```bash
+ros2 run model_utils package-compiled-deployment \
+    --bundle-root /path/to/policy_bundle \
+    --deployment rk3588 \
+    --backend rknn \
+    --target-soc rk3588 \
+    --target-runtime rknn-lite2 \
+    --spec /path/to/compiler-package-spec.json
+```
+
+For PI0.5 and SmolVLA HMM packaging:
+
+```bash
+ros2 run model_utils package-hmm-deployment --help
+```
+
+ACT Ascend, ACT RKNN, Hisilicon, and policy-specific multi-module exporters live in `model_utils`. Every tool must
+finish through the shared `inference_manifest` writer. Artifact paths, bindings, and digests are exporter-owned,
+not hand-maintained configuration.
+
+## Verification
+
+When running from source, prefer source package paths and disable unrelated external pytest plugins:
+
+```bash
+source .shrc_local
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+PYTHONPATH=src/inference_manifest:src/inference_service \
+pytest -q src/inference_service/tests
+```
+
+Check that removed identifiers have not re-entered active source, configuration, or tests:
+
+```bash
+source .shrc_local
+python scripts/check_inference_legacy_identifiers.py
+```
+
+Run Ruff only on Python files changed by the current work. Always source `.shrc_local` before project or ROS
+commands.

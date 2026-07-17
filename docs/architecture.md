@@ -302,7 +302,11 @@ ros2 launch robot_config robot.launch.py \
 
 ### 3. 运行 AI 推理策略
 ```bash
-ros2 run tensormsg policy_runner --ros-args -p policy_path:=/path/to/model.pt
+ros2 launch inference_service eval_inference.launch.py \
+    robot_config_path:=/absolute/path/to/robot.yaml \
+    model_path:=/absolute/path/to/policy_bundle \
+    deployment:=cpu \
+    pipeline_id:=policy
 ```
 
 ---

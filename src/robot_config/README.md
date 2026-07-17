@@ -176,7 +176,6 @@ robot:
         - gripper_position_controller
       inference:
         enabled: false
-        force_disable: true
 
   teleoperation:
     enabled: true
@@ -252,20 +251,28 @@ robot:
         - gripper_position_controller
       inference:
         enabled: true
-        execution_mode: "distributed" # 或 "monolithic" (单机零拷贝)
-        model: so101_act
-        attention_viz:
-          enabled: false
-          mode: file
-          interactive_masking: false
-          mask_save_dir: gui_interactions
+        pipelines:
+          policy:
+            model_path: models/ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515
+            deployment: cpu
+            execution_mode: monolithic # 或 distributed
+            request_timeout: 5.0
+            default_task: ""
+            runtime_options: {}
+      executor:
+        type: topic
+        mode: model_inference
+        inference_pipeline: policy
+        queue_size: 100
+        watermark_threshold: 50
+        control_frequency: 20.0
 ```
 
 **启动的控制器：**
 - `arm_position_controller` (JointGroupPositionController)
 - `gripper_position_controller` (ForwardCommandController)
 
-模型配置中的 `lerobot_norm_mode` 决定 LeRobot 动作/观测与 `ros2_control`
+机器人 recording 配置中的 `lerobot_norm_mode` 决定 LeRobot 动作/观测与 `ros2_control`
 弧度命令之间的转换方式。`range_m100_100` 使用机械臂 `[-100,100]`、
 夹爪 `[0,100]`；`degrees` 对机械臂关节使用 centered degrees，但
 `joints.gripper` 中的夹爪关节仍保持 `[0,100]` 开合语义。
@@ -634,17 +641,21 @@ ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_
 # MoveIt 模式无 RViz（headless）
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=moveit_planning use_sim:=true moveit_display:=false
 
-# 分布式推理 — 单机调试（Edge + Cloud 同时启动）
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=model_inference execution_mode:=distributed use_sim:=true cloud_local:=true
+# 分布式推理 — 单机调试（YAML 中 policy pipeline 必须为 distributed）
+# 终端 1：Edge
+ros2 launch robot_config robot.launch.py config_path:=/absolute/path/to/so101_single_arm_distributed.yaml control_mode:=model_inference use_sim:=true
+# 终端 2：Cloud
+ros2 launch inference_service cloud_inference.launch.py pipeline_id:=policy model_path:=/absolute/path/to/policy_bundle deployment:=cpu
 
 # 分布式推理 — 跨机器部署（端侧仅启动 Edge，Cloud 在算力机器上单独启动）
 # 端侧：
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=model_inference execution_mode:=distributed use_sim:=true
+ros2 launch robot_config robot.launch.py config_path:=/absolute/path/to/so101_single_arm_distributed.yaml control_mode:=model_inference use_sim:=true
 # 算力机器（需设置相同 ROS_DOMAIN_ID）：
-# ros2 launch inference_service cloud_inference.launch.py policy_path:=/path/to/model device:=cuda
-# 端侧开发板 Ascend NPU：
-# ros2 launch inference_service cloud_inference.launch.py policy_path:=/path/to/model device:=npu
+# ros2 launch inference_service cloud_inference.launch.py pipeline_id:=policy model_path:=/absolute/path/to/policy_bundle deployment:=cuda
 ```
+
+相对 `model_path` 只相对于绝对路径环境变量 `WORKSPACE` 解析。Pipeline ID 决定默认 Action、
+reset、health 和分布式 topic；多个 pipeline 时 `executor.inference_pipeline` 必须明确选择一个。
 
 ### 验证配置
 

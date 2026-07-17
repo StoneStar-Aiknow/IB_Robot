@@ -238,20 +238,21 @@ output_dataset/
 
 | 命令 | 所属包 | 职责 |
 |------|--------|------|
-| `ros2 launch inference_service eval_inference.launch.py ...` | `inference_service` | 启动一个最小 `lerobot_policy_node`，提供 `DispatchInfer` Action Server 和 policy backend。它不读取 rosbag、不发布观测、不记录结果。 |
+| `ros2 launch inference_service eval_inference.launch.py ...` | `inference_service` | 启动一个最小 `pipeline_policy_node`，加载命名 deployment，并提供 pipeline-scoped `DispatchInfer` Action Server。它不读取 rosbag、不发布观测、不记录结果。 |
 | `ros2 run dataset_tools policy_eval capture ...` | `dataset_tools` | 读取 rosbag，按 contract 逐帧发布 observation topics，调用 `DispatchInfer`，并把 action chunk/latency/diagnostics 写入 prediction JSON。 |
 
 ```bash
 ros2 launch inference_service eval_inference.launch.py \
     robot_config_path:=src/robot_config/config/robots/so101_single_arm.yaml \
-    policy_path:=/path/to/pretrained_model \
-    device:=cpu \
-    use_header_time:=true
+    model_path:=/path/to/policy_bundle \
+    deployment:=cpu \
+    pipeline_id:=policy
 
 ros2 run dataset_tools policy_eval capture \
     --bag-dir ~/rosbag/episodes/so101_single_arm/episode_000001 \
     --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
-    --policy-path /path/to/pretrained_model \
+    --policy-path /path/to/policy_bundle \
+    --pipeline-id policy \
     --backend-name cpu \
     --out /tmp/cpu_predictions.json \
     --frame-limit 100
@@ -276,11 +277,11 @@ ros2 run dataset_tools policy_eval compare \
 
 关键语义：
 
-- replay client 会从 rosbag 读取 contract observation topics，逐帧 publish 原始 ROS 消息，然后用同一 timestamp 调用 `lerobot_policy_node` 的 `DispatchInfer` action server。
-- `--policy-path` 推荐与 `eval_inference.launch.py policy_path:=...` 使用同一个模型目录；它会读取 `config.json.input_features`，让 replay 只要求模型实际订阅的 observation topics，避免完整 robot contract 中未使用的相机（例如 `front`）导致误报缺失。
-- 默认要求 `lerobot_policy_node use_header_time:=true`，避免历史 bag timestamp 与 receive-time `StreamBuffer` timestamp 混用。
-- 多后端比较采用串行运行方式；每个 backend 单独启动一次 policy node，并将 prediction JSON 作为比较输入。
-- 默认 `policy_state_mode=continuous`，保留同一 backend run 内的 policy runtime state；`--policy-state-mode per_frame_reset` 只用于显式诊断，会在每帧前调用 `~/reset_policy_state`。
+- replay client 会从 rosbag 读取 contract observation topics，逐帧 publish 原始 ROS 消息，然后用同一 timestamp 调用 `/inference/<pipeline_id>/dispatch`。
+- `--policy-path` 推荐与 `eval_inference.launch.py model_path:=...` 使用同一个 bundle；该参数只读取 `config.json.input_features` 以过滤未被模型使用的 contract observations。
+- 历史 replay 只接受 `--timestamp-policy header` 或 `contract`，且所有选中 observation 必须在 contract 中声明 `stamp_src: header`。ROS 消息重新发布后无法可靠重建 bag/receive timestamp。
+- 多 deployment 比较采用串行运行方式；每次启动一个 deployment，并将 prediction JSON 作为比较输入。
+- 默认 `policy_state_mode=continuous`，保留同一次 run 内的 policy runtime state；`--policy-state-mode per_frame_reset` 只用于显式诊断，会在每帧前调用 `/inference/<pipeline_id>/reset`。
 - prediction JSON 会记录 contract fingerprint、timestamp policy、frame stride、backend 名称、calibration 静态检查结果、每帧 action chunk、latency 和 replay stream diagnostics。
 - `--compare-labels` 只在 rosbag 中存在 contract action topics 时启用，用于额外比较录制 action label；backend 正确性比较仍以 reference backend 输出为主。
 
@@ -499,11 +500,11 @@ lerobot_action_gap_repair \
                               │
           ┌───────────────────┼───────────────────┐
           ▼                   ▼                   ▼
-   ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-   │  录制服务    │     │  数据转换    │     │  推理服务    │
-   │ episode_    │     │ bag_to_     │     │ lerobot_    │
-   │ recorder    │     │ lerobot     │     │ policy_node │
-   └─────────────┘     └─────────────┘     └─────────────┘
+   ┌─────────────┐     ┌─────────────┐     ┌─────────────────┐
+   │  录制服务    │     │  数据转换    │     │    推理服务      │
+   │ episode_    │     │ bag_to_     │     │ pipeline_policy │
+   │ recorder    │     │ lerobot     │     │ node            │
+   └─────────────┘     └─────────────┘     └─────────────────┘
           │                   │                   │
           ▼                   ▼                   ▼
    ROS 2 Bag          LeRobot Dataset      Model Inference

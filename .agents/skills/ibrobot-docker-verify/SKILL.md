@@ -78,7 +78,8 @@ the bootstrap variant documented below, based on plain `ubuntu:22.04`.
 
 ### 允许事项
 
-- **配置 OS 镜像源**：允许在容器创建阶段配置 apt 镜像源（如 Aliyun），这属于容器环境初始化。
+- **配置 apt 镜像源**：允许在容器创建阶段将 Ubuntu 源切换到 Aliyun、
+  ROS 2 源切换到 TUNA。这属于容器环境初始化。
 - **创建用户和权限**：允许创建 `testuser`、配置 `NOPASSWD` sudo。
 - **配置 locale 和时区**。
 - **通过环境变量传递镜像 URL**：允许通过 `PIP_INDEX_URL`、`ROS_GPG_KEY` 等环境变量让脚本使用镜像源。这不是"手动安装"，而是让脚本的 `${VAR:-default}` 机制正确工作。
@@ -158,11 +159,32 @@ docker run -d --name "${CONTAINER}" \
   -e DEBIAN_FRONTEND=noninteractive \
   "${IMAGE}" -c 'sleep infinity'
 
-# 2.2 Configure the OS mirror and install container bootstrap tools only.
+# 2.2 Configure domestic Ubuntu and ROS 2 mirrors before the first apt update,
+# then install container bootstrap tools only. The ROS desktop-full image uses
+# a deb822 ros2.sources file, while older images may use a traditional .list.
 docker exec "${CONTAINER}" bash -c '
   sed -i "s|http://archive.ubuntu.com|http://mirrors.aliyun.com|g;
           s|http://security.ubuntu.com|http://mirrors.aliyun.com|g" \
     /etc/apt/sources.list &&
+  if [ -f /etc/apt/sources.list.d/ros2.sources ]; then
+    sed -i \
+      "s|http://packages.ros.org/ros2/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu|g;
+       s|https://packages.ros.org/ros2/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu|g;
+       s|^Types: deb deb-src$|Types: deb|" \
+      /etc/apt/sources.list.d/ros2.sources
+  fi &&
+  if [ -f /etc/apt/sources.list.d/ros2.list ]; then
+    sed -i \
+      "s|http://packages.ros.org/ros2/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu|g;
+       s|https://packages.ros.org/ros2/ubuntu|https://mirrors.tuna.tsinghua.edu.cn/ros2/ubuntu|g;
+       /^deb-src /d" \
+      /etc/apt/sources.list.d/ros2.list
+  fi &&
+  if grep -R -E "(archive|security).ubuntu.com|packages.ros.org/ros2/ubuntu" \
+      /etc/apt/sources.list /etc/apt/sources.list.d 2>/dev/null; then
+    echo "Official Ubuntu or ROS 2 apt source remains after mirror configuration" >&2
+    exit 1
+  fi &&
   apt-get update -qq &&
   apt-get install -y -qq \
     sudo git git-lfs locales python3 curl \
@@ -416,6 +438,8 @@ docker exec -u testuser -e HOME=/home/testuser \
 | `error loading sources list: Permission denied` | `write_rosdep_sources_list` wrote file as 600 root | Now does `chmod 644` after writing |
 | `rosdep update` times out | `ROSDISTRO_INDEX_URL` not passed to platform script | Platform scripts now pass `env ROSDISTRO_INDEX_URL=...` |
 | pip downloads from pypi.org at ~10 KB/s | No pip mirror configured in container | `ensure_workspace_venv` writes `${VENV_PATH}/pip.conf` |
+| rosdep installs from `packages.ros.org` at ~10 KB/s | The ROS desktop-full image keeps its deb822 `ros2.sources` file | Phase 2 switches both `.sources` and `.list` ROS entries to TUNA before `apt-get update` |
+| TUNA ROS source index returns 404 | TUNA serves binary ROS packages but not the `deb-src` index | Phase 2 changes deb822 `Types` to `deb` and removes traditional `deb-src` entries |
 | `Permission denied: ~/.cache/pre-commit` | Bind mount caused Docker to create the home cache parent as root | Mount pip at `/var/cache/ibrobot-pip`, not below `~/.cache` |
 | `The build time path ... doesn't exist` | Copied or iterative source retained host-specific venv/build paths | Remove `venv build install log`, then rerun setup from the selected source |
 | `git: command not found` mid-setup | `install_ros.sh` apt install may remove git | Phase 1 already installed git; re-run `apt-get install -y git git-lfs` if needed |

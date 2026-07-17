@@ -1,323 +1,302 @@
 ---
 name: rknn-convert
-description: "Convert ONNX models to RKNN format for RK3588 NPU deployment. Use when user needs to 'convert model', 'rknn', 'RK3588', 'NPU deploy', '模型转换', 'rknn转换', 'convert to rknn', 'onnx to rknn', 'deploy to rk3588', 'NPU 推理'. Triggers for model conversion, RKNN format, Rockchip NPU deployment."
+description: "Convert ACT or SmolVLA models to RKNN deployments for RK3588. Use when users mention 'rknn', 'RK3588', 'rknn-toolkit2', 'convert to rknn', 'RKNN deployment', '模型转换', 'rknn转换', or 'NPU 推理'. Covers isolated ONNX-to-RKNN compilation, compiler ABI metadata, unified inference_manifest.json packaging, and named pipeline configuration."
 ---
 
 # RKNN Model Conversion Skill
 
-Convert ONNX models to RKNN format for RK3588 NPU deployment using rknn-toolkit2.
+Compile ACT or SmolVLA ONNX graphs with `rknn-toolkit2`, then package the compiler outputs as a
+strict IB-Robot RKNN deployment for RK3588.
 
-## Critical Workflow Split
+## Supported Matrix
 
-For LeRobot `pretrained_model/` checkpoints, the verified workflow is **two-stage**:
+| Policy | RKNN support | Graph |
+|--------|--------------|-------|
+| ACT | Supported | Single `policy` RKNN artifact |
+| SmolVLA | Supported | `vision -> embedding -> prefill -> action` |
+| PI0.5 | Unsupported | Use `torch`, `ascend`, or `hmm` |
 
-1. **Main venv exports ONNX** from `pretrained_model`
-2. **`.venv-rknn` converts ONNX -> RKNN**
+The deployable result is not a standalone `.rknn` file. It is a LeRobot policy bundle containing
+compiler ABI metadata, packaged artifacts, and one named deployment in the bundle's only
+`inference_manifest.json`.
 
-Do **not** try to force the entire `pretrained_model -> RKNN` pipeline to stay inside `.venv-rknn`.
-The exporter depends on the main workspace environment (`lerobot`, `.shrc_local`, workspace Python packages),
-while RKNN conversion must stay isolated in `.venv-rknn`.
+Never restore or recommend `config.rknn.json`, `RKNN_MODEL_PATH`, directory scanning, backend-valued
+`device`, or a per-backend manifest filename.
 
-### Quick Decision Table
+## Required Workflow
+
+1. Export ONNX from the original LeRobot bundle in the main workspace environment.
+2. Compile ONNX to RKNN in the isolated `.venv-rknn` environment.
+3. Preserve the compiler-emitted `*.rknn.abi.json`; it is the source of runtime tensor names,
+   indices, dtypes, shapes, and image layouts.
+4. Package the RKNN artifacts and ABI bindings into the original bundle.
+5. Write or update the named deployment in `<bundle-root>/inference_manifest.json`.
+6. Configure a named inference pipeline that selects that deployment.
+7. Validate the strict manifest loader and, when available, the RK3588 runtime.
+
+The exporter or packager owns artifact copies, bindings, SHA-256 values, bundle digest, and strict
+loader verification. Do not hand-edit generated hashes or tensor bindings.
+
+## Environment Split
+
+`rknn-toolkit2` requires `torch<=2.4.0` and `numpy<=1.26.4`, which conflicts with the main LeRobot
+environment. Keep model export and RKNN compilation separate.
 
 | Task | Environment |
 |------|-------------|
-| Export `pretrained_model` -> ONNX | main workspace `venv` via `source .shrc_local` |
-| Convert ONNX -> RKNN | dedicated `.venv-rknn` only |
-| Run board inference | board runtime (`rknnlite` + `skh-run`), not host venv |
+| Export LeRobot checkpoint to ONNX | Main workspace after `source .shrc_local` |
+| Compile ONNX to RKNN | Dedicated `.venv-rknn` in a clean shell |
+| Package or validate a deployment | Main workspace after `source .shrc_local` |
+| Run board inference | Board runtime using `rknnlite` or `librknnrt.so` |
 
-## Environment
+Do not install `rknn-toolkit2` into the main venv. Do not source `.shrc_local` before invoking the
+`.venv-rknn` compiler step in the same shell.
 
-**IMPORTANT**: rknn-toolkit2 requires `torch<=2.4.0` and `numpy<=1.26.4`, which conflicts with lerobot's requirements (`torch>=2.7`, `numpy>=2.0`).
-
-- **MUST NOT** install rknn-toolkit2 into the main venv
-- **MUST** use the dedicated `.venv-rknn` for ONNX -> RKNN conversion
-- **MUST NOT** `source .shrc_local` before running the conversion step in `.venv-rknn`, or the shell will activate the main `venv` and defeat isolation
-
-### Dedicated venv
-
-- Path: `<project_root>/.venv-rknn/`
-- Python interpreter: `<project_root>/.venv-rknn/bin/python`
-- Contains: `rknn-toolkit2`, `onnx`, `onnxruntime`, `torch==2.4.0`, `numpy==1.26.4`
-
-#### How to activate `.venv-rknn`
-
-If an interactive shell is preferred, activate it explicitly:
+### Create The Dedicated Environment
 
 ```bash
-cd <project_root>
-source .venv-rknn/bin/activate
-python -V
-pip list | grep -E 'rknn-toolkit2|onnx|onnxruntime'
-```
-
-When automation must avoid inheriting the main workspace environment, prefer calling the interpreter directly:
-
-```bash
-cd <project_root>
-./.venv-rknn/bin/python <script.py> ...
-```
-
-Do **not** activate `.venv-rknn` after `source .shrc_local` in the same shell and assume everything is clean.
-For conversion, the safe pattern is still a clean shell plus direct interpreter invocation.
-
-#### Create venv (one-time setup)
-
-```bash
-cd <project_root>
 python3 -m venv .venv-rknn
 .venv-rknn/bin/pip install rknn-toolkit2 onnx onnxruntime
 ```
 
-#### Auto-creation
+The repository conversion helper patches the `onnx.mapping` compatibility break used by
+`rknn-toolkit2==2.3.2` with newer ONNX releases.
 
-If `.venv-rknn` does not exist when conversion is requested, the agent **MUST** create it first:
+## ACT Workflow
+
+The ACT exporter can orchestrate the complete split workflow. Run it from the main workspace and
+point it at the isolated compiler interpreter:
 
 ```bash
-cd <project_root>
-python3 -m venv .venv-rknn && .venv-rknn/bin/pip install rknn-toolkit2 onnx onnxruntime
+source .shrc_local
+python3 src/model_utils/model_utils/export_onnx_rknn.py \
+    --policy_path models/<act_bundle> \
+    --convert_rknn \
+    --rknn_venv_python "$PWD/.venv-rknn/bin/python" \
+    --rknn_mode float16 \
+    --deployment rknn_rk3588
 ```
 
-### onnx.mapping compatibility patch
+The exporter writes intermediate files below `<bundle>/model_utils_work/rknn`, requires the RKNN
+compiler to emit `<model>.rknn.abi.json`, copies the final artifact under the bundle's managed
+artifact directory, and calls `upsert_deployment()` to update `inference_manifest.json`.
 
-rknn-toolkit2 2.3.2 uses `onnx.mapping.TENSOR_TYPE_TO_NP_TYPE` and `onnx.mapping.NP_TYPE_TO_TENSOR_TYPE`, which were removed in onnx>=1.16. The conversion script includes a monkey-patch at import time.
-
-## Verified Split Workflow for `pretrained_model`
-
-### Step A: Export ONNX in the main workspace venv
-
-This step needs `lerobot` and the workspace environment, so it must run in the main venv:
+For an existing ONNX graph, retain the original policy bundle for semantic validation:
 
 ```bash
-cd <project_root>
-source .shrc_local && python3 src/model_utils/model_utils/export_onnx_rknn.py \
-    --policy_path models/502000/pretrained_model
+source .shrc_local
+python3 src/model_utils/model_utils/export_onnx_rknn.py \
+    --onnx /path/to/model.onnx \
+    --bundle_root models/<act_bundle> \
+    --convert_rknn \
+    --rknn_venv_python "$PWD/.venv-rknn/bin/python" \
+    --rknn_mode float16 \
+    --deployment rknn_rk3588
 ```
 
-This produces:
+`--onnx --convert_rknn` without `--bundle_root` is invalid because the packager must compare the
+compiler ABI against the policy's semantic inputs and output.
 
-- `models/502000/pretrained_model/act_ros2_rknn.onnx`
+### Low-Level ACT Compilation
 
-### Step B: Convert ONNX to RKNN in `.venv-rknn`
-
-This step must stay isolated from the main venv:
+Use the low-level helper only when compilation must be run independently. Run it in a clean shell:
 
 ```bash
-cd <project_root>
 env -i HOME="$HOME" PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
-    PYTHONPATH="$PWD/libs/lerobot/src:$PWD/src" PYTHONNOUSERSITE=1 \
-    ./.venv-rknn/bin/python .agents/skills/rknn-convert/convert_to_rknn.py \
-    --onnx models/502000/pretrained_model/act_ros2_rknn.onnx \
-    --output models/502000/pretrained_model/model.rknn \
+    PYTHONNOUSERSITE=1 \
+    "$PWD/.venv-rknn/bin/python" .agents/skills/rknn-convert/convert_to_rknn.py \
+    --onnx /path/to/model.onnx \
+    --output /path/to/model.rknn \
+    --abi-output /path/to/model.rknn.abi.json \
     --mode float16
 ```
 
-This produces:
+The `.rknn` and matching ABI JSON are both required. Use the high-level exporter afterward or a
+complete `package-compiled-deployment` spec; do not deploy the raw artifact alone.
 
-- `models/502000/pretrained_model/model.rknn`
+## SmolVLA Workflow
 
-### Relationship to the main venv
+SmolVLA uses three compiled modules plus host-side token embedding and state projection artifacts.
 
-- main `venv`: owns `lerobot`, `.shrc_local`, workspace Python dependencies, ONNX export
-- `.venv-rknn`: owns `rknn-toolkit2` and ONNX -> RKNN conversion only
-- neither venv should be used as a substitute for the other
-
-If the user says "export RKNN from a checkpoint", interpret that as:
-
-1. main `venv` exports ONNX
-2. `.venv-rknn` converts that ONNX to RKNN
-
-### Verified Result for Current ACT Model
-
-On the current `models/502000/pretrained_model` checkpoint, the verified output is:
-
-- ONNX: `act_ros2_rknn.onnx` (~221 MB)
-- RKNN: `model.rknn` (~121 MB)
-- Output shape: `(1, 100, 6)`
-
-## Conversion Script
-
-The main script is at: `<project_root>/.agents/skills/rknn-convert/convert_to_rknn.py`
-
-### Usage
+### Export ONNX Modules
 
 ```bash
-# Always use the dedicated venv python
-VENV_PYTHON="<project_root>/.venv-rknn/bin/python"
-
-# Option 1: float16 (recommended for Transformer/ACT models)
-$VENV_PYTHON <project_root>/.agents/skills/rknn-convert/convert_to_rknn.py \
-    --onnx <onnx_model_path> \
-    --output <output_rknn_path> \
-    --mode float16
-
-# Option 2: int8 quantization (smaller model, faster, but may lose accuracy)
-$VENV_PYTHON <project_root>/.agents/skills/rknn-convert/convert_to_rknn.py \
-    --onnx <onnx_model_path> \
-    --output <output_rknn_path> \
-    --mode int8
-
-# Option 3: hybrid quantization (auto mix float16 + int8)
-$VENV_PYTHON <project_root>/.agents/skills/rknn-convert/convert_to_rknn.py \
-    --onnx <onnx_model_path> \
-    --output <output_rknn_path> \
-    --mode hybrid
+source .shrc_local
+python3 src/model_utils/model_utils/smolvla_export/export_rknn_modules.py \
+    --model_path models/<smolvla_bundle> \
+    --output_dir models/<smolvla_bundle>
 ```
 
-### Conversion Modes
+Compile the generated vision, prefill, and action ONNX files with the isolated helper. Each RKNN
+must retain its matching compiler ABI JSON.
 
-| Mode | Size | Speed | Accuracy | Use Case |
-|------|------|-------|----------|----------|
-| `float16` | ~50% of onnx | Good | Best | Transformer/ACT models (recommended) |
-| `int8` | ~25% of onnx | Best | May degrade | CNN models with calibration data |
-| `hybrid` | Varies | Good | Balanced | When int8 loses accuracy on some layers |
-
-### Supported Platforms
-
-- RK3588 (primary target, 6 TOPS NPU)
-- RK3576, RK3566/RK3568, RK3562, RV1103/RV1106
-
-## Agent Workflow
-
-When user requests RKNN conversion:
-
-### Step 1: Identify Source Model
-
-Find the ONNX model in the project:
-```bash
-find <project_root>/models -name "*.onnx" -type f
-```
-
-If the source is a LeRobot `pretrained_model/` directory instead of an ONNX file, first export ONNX in the main workspace venv:
+### Package Existing Compiler Outputs
 
 ```bash
-cd <project_root>
-source .shrc_local && python3 src/model_utils/model_utils/export_onnx_rknn.py \
-    --policy_path <pretrained_model_dir>
+source .shrc_local
+python3 src/model_utils/model_utils/smolvla_export/export_rknn_modules.py \
+    --model_path models/<smolvla_bundle> \
+    --output_dir models/<smolvla_bundle> \
+    --package_only \
+    --deployment rknn_rk3588 \
+    --target_soc rk3588 \
+    --target_runtime rknn-lite2
 ```
 
-### Step 2: Inspect Model Structure
+By default, package-only mode expects these files below `<output_dir>/onnx`:
+
+- `smolvla_vision.rknn` and `smolvla_vision.rknn.abi.json`
+- `smolvla_prefill.rknn` and `smolvla_prefill.rknn.abi.json`
+- `smolvla_action.rknn` and `smolvla_action.rknn.abi.json`
+
+Use `--vision_rknn`, `--vision_abi`, `--prefill_rknn`, `--prefill_abi`, `--action_rknn`, and
+`--action_abi` when compiler outputs are elsewhere. The packager also requires `token_embedding.pt`,
+`state_projection.pt`, and the original LeRobot metadata in the bundle.
+
+## Generic Packaging
+
+`package-compiled-deployment` is available when vendor compilation is separate from the policy
+exporter. Its JSON spec must define execution order, artifact formats, compiler ABI files, semantic
+bindings, and image layouts. For an ACT RKNN deployment, use one `policy` role with format `rknn`,
+runtime ABI format, semantic inputs matching `config.json`, and output semantic `action`.
 
 ```bash
-<project_root>/.venv-rknn/bin/python -c "
-import onnx
-model = onnx.load('<onnx_path>')
-print('Inputs:')
-for inp in model.graph.input:
-    print(f'  {inp.name}: {[d.dim_value for d in inp.type.tensor_type.shape.dim]}')
-print('Outputs:')
-for out in model.graph.output:
-    print(f'  {out.name}: {[d.dim_value for d in out.type.tensor_type.shape.dim]}')
-print(f'Opset: {model.opset_import[0].version}')
-"
+source .shrc_local
+package-compiled-deployment \
+    --bundle-root models/<policy_bundle> \
+    --deployment rknn_rk3588 \
+    --backend rknn \
+    --target-soc rk3588 \
+    --target-runtime rknn-lite2 \
+    --spec /path/to/rknn-package-spec.json
 ```
 
-### Step 3: Choose Conversion Mode
+Success means `<bundle-root>/inference_manifest.json` was written and accepted by the production
+strict loader.
 
-- **ACT / Transformer models**: Use `float16` (preserves accuracy)
-- **CNN models** (ResNet, YOLO, etc.): Use `int8` with calibration data
-- **Mixed architecture**: Use `hybrid`
+## Conversion Modes
 
-### Step 4: Run Conversion
+| Mode | Accuracy | Typical use |
+|------|----------|-------------|
+| `float16` | Highest | ACT and Transformer-based models; default recommendation |
+| `int8` | Calibration-dependent | CNN-heavy models with representative calibration data |
+| `hybrid` | Mixed | Graphs where full INT8 causes unacceptable loss |
+
+Do not choose INT8 only for file size. Validate representative outputs against the source model.
+
+## Named Pipeline Configuration
+
+```yaml
+control_modes:
+  model_inference:
+    inference:
+      enabled: true
+      pipelines:
+        policy:
+          model_path: models/<policy_bundle>
+          deployment: rknn_rk3588
+          execution_mode: monolithic
+          request_timeout: 10.0
+          default_task: "pick up the object"
+    executor:
+      type: topic
+      mode: model_inference
+      inference_pipeline: policy
+```
+
+Do not configure a global model table, backend-valued `device`, or a per-backend manifest path.
+
+## Validation
+
+Run focused tests after changing RKNN export, packaging, or this workflow:
 
 ```bash
-<project_root>/.venv-rknn/bin/python <project_root>/.agents/skills/rknn-convert/convert_to_rknn.py \
-    --onnx <onnx_path> \
-    --output <output_path> \
-    --mode <mode>
+source .shrc_local
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+PYTHONPATH="$PWD/src/inference_manifest:$PWD/src/inference_service:$PWD/src/model_utils:$PYTHONPATH" \
+pytest -q \
+    src/model_utils/test/test_export_onnx_rknn.py \
+    src/model_utils/test/test_smolvla_rknn_export.py \
+    src/inference_service/tests/test_rknn_backend.py \
+    src/inference_service/tests/test_backend_contract.py
 ```
 
-### Step 5: Verify Output
+Before board deployment, load the generated deployment through the strict manifest loader and
+confirm that every artifact hash, tensor index, dtype, shape, and image layout matches the exact
+compiler output.
 
-```bash
-ls -lh <output_path>.rknn
-```
+## Board Deployment
 
-## Current Converted Models
+Read `oh-constraints` before OpenHarmony board work, then use the repository RKNN inference guide.
+The board consumes the packaged bundle and selected deployment, not an arbitrary `.rknn` path.
 
-| Model | Source | Output | Mode | Size |
-|-------|--------|--------|------|------|
-| ACT policy (502000, legacy) | `models/502000/act_ros2_simplified.onnx` | `models/502000/act_ros2_simplified.rknn` | float16 | ~115MB |
-| ACT policy (`pretrained_model`, current) | `models/502000/pretrained_model/act_ros2_rknn.onnx` | `models/502000/pretrained_model/model.rknn` | float16 | ~121MB |
+Runtime options include:
 
-## Board-Side Deployment
+- `rknn-toolkit-lite2` / `rknnlite` for Python runtimes
+- `librknnrt.so` for native runtimes
 
-On RK3588 (e.g., BQ3588HM board), use one of:
-
-1. **rknn-toolkit-lite2** (Python): `pip install rknn-toolkit-lite2`
-2. **rknn_runtime** (C API): Link against `librknnrt.so`
-
-For the verified OpenHarmony workflow in this repo, the board side is already modeled by:
-
-- `oh-constraints` for board runtime facts and constraints
-- [RKNN 推理指南](../../docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md) for launch and troubleshooting
-
-Inference example (Python, on board):
-```python
-from rknnlite.api import RKNNLite
-rknn = RKNNLite()
-rknn.load_rknn('model.rknn')
-rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2_3)
-outputs = rknn.inference(inputs=[state, hand_img, top_img])
-rknn.release()
-```
+Reference: `docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md`.
 
 ## Troubleshooting
 
-### Issue: `onnx.mapping` AttributeError
-**Cause**: onnx>=1.16 removed `onnx.mapping` module
-**Fix**: Script includes monkey-patch. If missing, add:
-```python
-import onnx, types, sys
-if not hasattr(onnx, "mapping"):
-    _t2np = {k: v.np_dtype for k, v in onnx._mapping.TENSOR_TYPE_MAP.items()}
-    _np2t = {v: k for k, v in _t2np.items()}
-    _m = types.ModuleType("onnx.mapping")
-    _m.TENSOR_TYPE_TO_NP_TYPE = _t2np
-    _m.NP_TYPE_TO_TENSOR_TYPE = _np2t
-    onnx.mapping = _m
-    sys.modules["onnx.mapping"] = _m
-```
+### RKNN ABI JSON is missing
 
-### Issue: torch version conflict with lerobot
-**Cause**: rknn-toolkit2 requires `torch<=2.4.0`, lerobot requires `torch>=2.7`
-**Fix**: Always use `.venv-rknn` for conversion, never the main venv
+The artifact is not packageable. Re-run the repository conversion helper or compiler integration
+that emits `*.rknn.abi.json`; do not infer tensor metadata from ONNX or `config.json` alone.
 
-### Issue: Export step fails inside `.venv-rknn`
-**Cause**: The LeRobot exporter needs the main workspace environment, not the conversion-only `.venv-rknn`
-**Fix**: Split the workflow:
+### Runtime inputs do not match policy inputs
 
-1. main venv exports ONNX
-2. `.venv-rknn` converts ONNX to RKNN
+Use the ABI emitted for the exact RKNN file. ACT inputs must match the ordered semantic runtime
+inputs from `config.json`; unrelated feature keys are not valid model inputs.
 
-### Issue: Conversion step accidentally imports the main `venv`
-**Cause**: Running `source .shrc_local` before the conversion step activates the workspace `venv`
-**Fix**: For the conversion step, run `.venv-rknn` in a clean shell (for example with `env -i ...`) and only provide minimal `PYTHONPATH`
+### Image layout is absent or invalid
 
-### Issue: BQ3588HM inference reports the wrong number of inputs
-**Cause**: The verified `pretrained_model` export currently exposes **3 inputs**:
+Every image input in the RKNN ABI must declare `NCHW` or `NHWC`. Fix the compiler ABI export rather
+than adding a guessed layout to the manifest.
 
-- `observation.state`
-- `observation.images.top`
-- `observation.images.wrist`
+### Manifest hash mismatch
 
-`observation.current` from `config.json` is not part of the exported RKNN input list.
+Rerun the exporter or packager after replacing an artifact. Do not edit artifact SHA-256 or bundle
+digest values manually.
 
-**Fix**: Validate ONNX input order before board testing and feed exactly the exported inputs.
+### Torch or NumPy version conflict
 
-### Issue: NPU ops not supported
-**Cause**: Some Transformer ops may fall back to CPU on RK3588
-**Fix**: Check rknn build logs for "CPU" fallback warnings. Use `float16` mode which has better op coverage.
+The compiler ran in the main LeRobot environment. Use `.venv-rknn` only for ONNX-to-RKNN conversion
+and return to the sourced main workspace for packaging and validation.
 
-## When to Use This Skill
+### `onnx.mapping` AttributeError
 
-Invoke this skill when:
-- Converting ONNX models to RKNN format
-- Deploying models to RK3588 NPU
-- Checking NPU compatibility of models
-- Questions about rknn-toolkit2 usage
+Use `.agents/skills/rknn-convert/convert_to_rknn.py`, which carries the compatibility patch required
+by `rknn-toolkit2==2.3.2`.
 
-Do NOT invoke for:
-- Training models (use lerobot skill)
-- ONNX export (use onnx export workflow)
-- Board connectivity issues (use oh-access)
+### Unsupported NPU operators
+
+Inspect RKNN build logs for CPU fallback or unsupported operators. Prefer `float16` for ACT and
+Transformer graphs, then validate numerical outputs and target latency on RK3588.
+
+## References
+
+- `.agents/skills/rknn-convert/convert_to_rknn.py`
+- `src/model_utils/model_utils/export_onnx_rknn.py`
+- `src/model_utils/model_utils/smolvla_export/export_rknn_modules.py`
+- `src/model_utils/model_utils/package_compiled_deployment.py`
+- `src/model_utils/model_utils/inference_manifest_export.py`
+- `src/model_utils/test/test_export_onnx_rknn.py`
+- `src/model_utils/test/test_smolvla_rknn_export.py`
+- `src/inference_service/tests/test_rknn_backend.py`
+
+## When To Use This Skill
+
+Use for:
+
+- ACT or SmolVLA ONNX-to-RKNN compilation
+- RK3588 and `rknn-toolkit2` compatibility troubleshooting
+- RKNN compiler ABI generation and validation
+- Unified RKNN deployment packaging and named pipeline configuration
+
+Do not use for:
+
+- PI0.5 deployment; use `torch`, `ascend`, or `hmm`
+- Ascend OM conversion; use the Ascend exporter workflow
+- Hisilicon SD3403 conversion; use the Hisilicon exporter and generic compiled packager
+- General OpenHarmony board operations; read `oh-constraints` and use the relevant board skill
