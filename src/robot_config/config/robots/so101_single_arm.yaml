@@ -18,26 +18,6 @@ robot:
     libgl_always_software: true
 
   # ============================================
-  # Model Library (新增)
-  # ============================================
-  models:
-    so101_act:
-      path: ./models/502000/pretrained_model
-      policy_type: act
-      # LeRobot motor normalization mode used during training.
-      # Determines how rad ↔ LeRobot units are converted:
-      #   range_m100_100 : arm [-100,+100], gripper [0,100]  (LeRobot default)
-      #   degrees        : arm centered degrees; gripper keeps [0,100]
-      #   none           : no conversion (pass-through, units already match)
-      lerobot_norm_mode: range_m100_100
-
-    so101_act_rknn:
-      path: ./models/502000/pretrained_model
-      policy_type: act
-      device: rknn
-      lerobot_norm_mode: range_m100_100
-
-  # ============================================
   # Unified joint definitions (Single Source of Truth)
   # ============================================
   joints:
@@ -85,7 +65,6 @@ robot:
         - gripper_position_controller
       inference:
         enabled: false
-        force_disable: true  # Explicitly disable inference in teleop mode
       executor:
         type: topic
         mode: teleop
@@ -105,26 +84,20 @@ robot:
       # ============================================
       inference:
         enabled: true
-        # execution_mode: "distributed"
-        model: so101_act
-        action_server: /inference/dispatch
-        default_task: ""  # VLA policies (SmolVLA/PI05) require a task prompt
-        publish_attention: false
-        attention_viz_topic: /attention/weights
-        attention_viz:
-          enabled: false
-          mode: file
-          save_dir: attention_visualizations
-          update_frequency: 10.0
-          headless: false
-          interactive_masking: false
-          mask_save_dir: gui_interactions
+        pipelines:
+          policy:
+            model_path: models/ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515
+            deployment: cpu
+            execution_mode: monolithic
+            request_timeout: 120.0
+            default_task: "pick up the banana"
       # ============================================
       # Executor configuration
       # ============================================
       executor:
         type: topic  # topic | action
         mode: model_inference
+        inference_pipeline: policy
         queue_size: 100
         # Keep about 2.5s of buffered actions so ~1.5s distributed RKNN latency
         # still leaves margin before the dispatcher falls back to hold.

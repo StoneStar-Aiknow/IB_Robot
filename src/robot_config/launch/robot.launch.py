@@ -55,15 +55,6 @@ Usage:
     # Override auto-detection
     ros2 launch robot_config robot.launch.py control_mode:=model_inference with_inference:=true use_sim:=true
 
-    # Distributed inference (two machines, set same ROS_DOMAIN_ID on both):
-    #   Machine A (sim/robot): launch edge node only
-    ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true control_mode:=model_inference execution_mode:=distributed
-    #   Machine B (GPU): launch cloud inference node
-    ros2 launch inference_service cloud_inference.launch.py policy_path:=/path/to/model device:=cuda
-
-    # Distributed inference (single-machine testing):
-    ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true control_mode:=model_inference execution_mode:=distributed cloud_local:=true
-
 **Cleanup**: If you encounter "Controller already loaded" errors, run:
 ```bash
 ./scripts/cleanup_ros.sh
@@ -77,8 +68,8 @@ Launch Arguments:
     auto_start_controllers: Automatically spawn controllers (default: true, set to false for debugging)
     control_mode: Override control mode from YAML (teleop, model_inference, moveit_planning, etc.). If empty, uses default_control_mode from config file
     with_inference: Enable inference pipeline. If empty, auto-detects from control mode config
-    cloud_local: In distributed mode, also launch cloud node locally (default: false)
-    execution_mode: Override execution mode from YAML ('monolithic' or 'distributed'). If empty, uses YAML value
+    inference_pipeline: Pipeline ID targeted by inference launch overrides
+    inference_execution_mode: Override the targeted pipeline mode (monolithic or distributed)
     with_moveit: Enable MoveIt motion planning. If empty, auto-detects from control mode name
     moveit_display: Launch RViz for MoveIt visualization (default: true, only used if MoveIt is enabled)
     with_navigation: Enable navigation pipeline. If empty, uses robot.navigation.enabled from config
@@ -190,6 +181,33 @@ def _apply_voice_asr_cli_overrides(context, robot_config: dict) -> None:
         voice_asr_config["realtime_pre_roll_seconds"] = float(pre_roll_override)
 
     robot_config["voice_asr"] = voice_asr_config
+
+
+def _apply_inference_cli_overrides(context, robot_config: dict, control_mode: str) -> None:
+    """Apply an explicit execution-mode override to one named inference pipeline."""
+    execution_mode = context.launch_configurations.get("inference_execution_mode", "").strip().lower()
+    pipeline_id = context.launch_configurations.get("inference_pipeline", "").strip()
+    if not execution_mode:
+        if pipeline_id:
+            raise ValueError("inference_pipeline requires inference_execution_mode")
+        return
+    if execution_mode not in {"monolithic", "distributed"}:
+        raise ValueError("inference_execution_mode must be 'monolithic' or 'distributed'")
+    if not pipeline_id:
+        raise ValueError("inference_execution_mode requires inference_pipeline")
+
+    inference = robot_config.get("control_modes", {}).get(control_mode, {}).get("inference", {})
+    pipelines = inference.get("pipelines", {})
+    if pipeline_id not in pipelines:
+        raise ValueError(
+            f"inference_pipeline selects unknown pipeline {pipeline_id!r}; available pipelines: {list(pipelines)}"
+        )
+    previous = pipelines[pipeline_id].get("execution_mode")
+    pipelines[pipeline_id]["execution_mode"] = execution_mode
+    logger.info(
+        f"CLI override: control_modes.{control_mode}.inference.pipelines.{pipeline_id}."
+        f"execution_mode={execution_mode} (was {previous})"
+    )
 
 
 def _start_actions_on_success(start_actions, success_message: str, failure_reason: str):
@@ -351,6 +369,7 @@ def launch_setup(context, *args, **kwargs):
 
     active_control_mode = robot_config.get("default_control_mode", "model_inference")
     logger.info(f"Active control mode: {active_control_mode}")
+    _apply_inference_cli_overrides(context, robot_config, active_control_mode)
     if mock_backend_active:
         validate_mock_control_mode(active_control_mode)
 
@@ -377,28 +396,6 @@ def launch_setup(context, *args, **kwargs):
         logger.info("Teleop mode: forcing with_inference=False")
 
     logger.info(f"Final with_inference={with_inference}")
-
-    # Determine cloud_local flag for distributed mode
-    cloud_local_str = context.launch_configurations.get("cloud_local", "false")
-    cloud_local = parse_bool(cloud_local_str, default=False)
-
-    # CLI override for execution_mode (overrides YAML if provided)
-    execution_mode_override = context.launch_configurations.get("execution_mode", "")
-    if execution_mode_override:
-        control_modes = robot_config.get("control_modes", {})
-        mode_cfg = control_modes.get(active_control_mode, {})
-        inf_cfg = mode_cfg.get("inference", {})
-        inf_cfg["execution_mode"] = execution_mode_override
-        logger.info(f"CLI override: execution_mode={execution_mode_override}")
-
-    # CLI override for default_task (VLA policies)
-    default_task_override = context.launch_configurations.get("default_task", "")
-    if default_task_override:
-        control_modes = robot_config.get("control_modes", {})
-        mode_cfg = control_modes.get(active_control_mode, {})
-        inf_cfg = mode_cfg.get("inference", {})
-        inf_cfg["default_task"] = default_task_override
-        logger.info(f"CLI override: default_task={default_task_override!r}")
 
     # ========== 4. Generate Control System Nodes ==========
     logger.info("========== Generating Control Nodes ==========")
@@ -609,7 +606,6 @@ def launch_setup(context, *args, **kwargs):
                 robot_config,
                 active_control_mode,
                 use_sim,
-                cloud_local=cloud_local,
                 use_sim_time=node_use_sim_time,
             )
             if controller_ready_waiter is not None:
@@ -811,19 +807,14 @@ def generate_launch_description():
                 description="Enable full execution pipeline (inference + dispatcher). If empty, auto-detects from control mode config",
             ),
             DeclareLaunchArgument(
-                "cloud_local",
-                default_value="false",
-                description="In distributed mode, also launch the cloud inference node locally (for single-machine testing). Default: false (cloud node runs on separate GPU machine)",
-            ),
-            DeclareLaunchArgument(
-                "execution_mode",
-                default_value="monolithic",
-                description="Override inference execution mode from YAML ('monolithic' or 'distributed'). If empty, uses value from robot config YAML.",
-            ),
-            DeclareLaunchArgument(
-                "default_task",
+                "inference_pipeline",
                 default_value="",
-                description="Override the language instruction for VLA policies (SmolVLA/PI05). If empty, uses inference.default_task from YAML.",
+                description="Pipeline ID targeted by inference launch overrides.",
+            ),
+            DeclareLaunchArgument(
+                "inference_execution_mode",
+                default_value="",
+                description="Override the targeted pipeline mode: monolithic or distributed. Empty uses YAML.",
             ),
             DeclareLaunchArgument(
                 "with_moveit",

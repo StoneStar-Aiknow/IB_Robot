@@ -17,18 +17,6 @@ robot:
   robot_type: so_101  # For LeRobot dataset metadata
 
   # ============================================
-  # Model Library
-  # ============================================
-  models:
-    so101_act:
-      path: /home/xqw/Research/IB_Robot/models/502000/pretrained_model
-      policy_type: act
-      # Normalization parameters (optional, for future use)
-      normalization:
-        action_scale: [0.0314, 0.0314, 0.0314, 0.0314, 0.0314, 0.0008]
-        action_offset: [0.0, 0.0, 0.0, 0.0, 0.0, 0.04]
-
-  # ============================================
   # Unified joint definitions (Single Source of Truth)
   # ============================================
   joints:
@@ -65,7 +53,6 @@ robot:
         - gripper_position_controller
       inference:
         enabled: false
-        force_disable: true  # Explicitly disable inference in teleop mode
       executor:
         type: topic
         mode: teleop
@@ -82,11 +69,16 @@ robot:
         - gripper_position_controller
       inference:
         enabled: true
-        model: so101_act
-        action_server: /inference/dispatch
+        pipelines:
+          policy:
+            model_path: models/so101_single_arm_rgbd/pretrained_model
+            deployment: cpu
+            execution_mode: monolithic
+            request_timeout: 5.0
       executor:
         type: topic  # topic | action
         mode: model_inference
+        inference_pipeline: policy
         queue_size: 100
         control_frequency: 50.0
 

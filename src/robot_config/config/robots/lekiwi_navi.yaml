@@ -11,15 +11,6 @@ robot:
   robot_type: lekiwi  # For LeRobot dataset metadata
 
   # ============================================
-  # Model Library
-  # ============================================
-  models:
-    lekiwi_act:
-      path: models/act/pretrained_model
-      policy_type: act
-      lerobot_norm_mode: range_m100_100
-
-  # ============================================
   # Unified joint definitions (Single Source of Truth)
   # ============================================
   joints:
@@ -51,7 +42,6 @@ robot:
         - base_velocity_controller
       inference:
         enabled: false
-        force_disable: true
       executor:
         type: topic
         mode: teleop
@@ -67,15 +57,19 @@ robot:
         - base_velocity_controller
       inference:
         enabled: true
-        execution_mode: "distributed"
-        model: lekiwi_act
-        action_server: /inference/dispatch
+        pipelines:
+          navigation_policy:
+            model_path: models/act/pretrained_model
+            deployment: cpu
+            execution_mode: distributed
+            request_timeout: 5.0
       # ============================================
       # Executor configuration
       # ============================================
       executor:
         type: topic  # topic | action
         mode: model_inference
+        inference_pipeline: navigation_policy
         queue_size: 100
         watermark_threshold: 0
         control_frequency: 30.0
@@ -90,12 +84,16 @@ robot:
         - base_velocity_controller
       inference:
         enabled: true
-        execution_mode: "distributed"
-        model: lekiwi_act
-        action_server: /inference/dispatch
+        pipelines:
+          navigation_policy:
+            model_path: models/act/pretrained_model
+            deployment: cpu
+            execution_mode: distributed
+            request_timeout: 5.0
       executor:
         type: topic
         mode: navi
+        inference_pipeline: navigation_policy
         dispatcher: action_dispatch    # unified action dispatcher
         navigation_mode: true          # enable navigation mode (explicit start/stop + base control)
         watermark_threshold: 20
