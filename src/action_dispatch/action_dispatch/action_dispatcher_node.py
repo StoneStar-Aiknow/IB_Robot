@@ -59,8 +59,9 @@ class ActionDispatcherNode(Node):
         self.declare_parameter("queue_size", 100)
         self.declare_parameter("watermark_threshold", 20)
         self.declare_parameter("control_frequency", 100.0)
-        self.declare_parameter("inference_action_server", "/act_inference_node/DispatchInfer")
-        self.declare_parameter("inference_reset_service", "/act_inference_node/reset_policy_state")
+        self.declare_parameter("inference_action_server", "/inference/policy/dispatch")
+        self.declare_parameter("inference_reset_service", "/inference/policy/reset")
+        self.declare_parameter("inference_prompt", "")
         self.declare_parameter("policy_reset_timeout_sec", 2.0)
         # Safety net: if an inference goal never completes (server hiccup, dropped
         # response, or a goal abandoned across a stop/start), abandon it after this
@@ -339,6 +340,7 @@ class ActionDispatcherNode(Node):
 
         goal = DispatchInfer.Goal()
         goal.obs_timestamp = self.get_clock().now().to_msg()
+        goal.prompt = self.get_parameter("inference_prompt").value
         goal.inference_id = self._current_request_id
 
         _trace.info(
