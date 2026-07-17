@@ -12,6 +12,8 @@ from launch import LaunchContext
 from launch.actions import RegisterEventHandler
 from launch_ros.actions import Node
 
+from inference_manifest import BundleFile, canonical_bundle_digest, sha256_file
+from robot_config.inference_config import InferenceConfigError
 from robot_config.launch_builders import tracing as tracing_builder
 from robot_config.launch_builders.control import (
     generate_controller_spawners,
@@ -19,6 +21,8 @@ from robot_config.launch_builders.control import (
 )
 from robot_config.launch_builders.execution import (
     _attention_viz_request,
+    generate_action_dispatcher_node,
+    generate_execution_nodes,
     generate_inference_node,
 )
 from robot_config.launch_builders.navigation import generate_navigation_nodes
@@ -52,14 +56,22 @@ def _text(substitutions):
 
 
 def _node_parameters(node):
+    def decode_parameter(value):
+        if not isinstance(value, tuple):
+            return value
+        if all(isinstance(item, list) for item in value):
+            return [decode_parameter(tuple(item)) for item in value]
+        text = _text(value)
+        try:
+            return yaml.safe_load(text)
+        except yaml.YAMLError:
+            return text.strip()
+
     raw = node._Node__parameters[0]
     parsed = {}
     for key, value in raw.items():
         name = _text(key)
-        if isinstance(value, tuple):
-            parsed[name] = _text(value).strip()
-        else:
-            parsed[name] = value
+        parsed[name] = decode_parameter(value)
     return parsed
 
 
@@ -68,6 +80,57 @@ def _node_remappings(node):
     for src, dst in node._Node__remappings:
         remappings.append((_text(src), _text(dst)))
     return remappings
+
+
+def _write_json(path, value):
+    path.write_text(json.dumps(value, indent=2), encoding="utf-8")
+
+
+def _create_inference_bundle(root, deployments=None):
+    root.mkdir(parents=True)
+    _write_json(
+        root / "config.json",
+        {
+            "type": "act",
+            "input_features": {"observation.state": {"type": "STATE", "shape": [6]}},
+            "output_features": {"action": {"type": "ACTION", "shape": [6]}},
+        },
+    )
+    _write_json(root / "policy_preprocessor.json", {"name": "pre", "steps": []})
+    _write_json(root / "policy_postprocessor.json", {"name": "post", "steps": []})
+    (root / "model.safetensors").write_bytes(b"test-weights")
+    paths = ("config.json", "model.safetensors", "policy_postprocessor.json", "policy_preprocessor.json")
+    entries = [BundleFile(path=path, sha256=sha256_file(root / path)) for path in paths]
+    _write_json(
+        root / "inference_manifest.json",
+        {
+            "schema_version": 1,
+            "bundle": {
+                "name": root.name,
+                "files": [entry.model_dump(mode="json") for entry in entries],
+                "digest": {"algorithm": "sha256", "value": canonical_bundle_digest(entries)},
+            },
+            "deployments": deployments or {"cpu": {"backend": "torch", "device": "cpu"}},
+        },
+    )
+    return root
+
+
+def _inference_robot_config(config_path, pipelines, *, selection=None):
+    executor = {"type": "topic", "mode": "model_inference"}
+    if selection is not None:
+        executor["inference_pipeline"] = selection
+    return {
+        "_config_path": str(config_path),
+        "name": "test_robot",
+        "joints": {"all": ["1", "2", "3", "4", "5", "6"]},
+        "control_modes": {
+            "model_inference": {
+                "inference": {"enabled": True, "pipelines": pipelines},
+                "executor": executor,
+            }
+        },
+    }
 
 
 def test_missing_inactive_controllers_returns_only_non_active():
@@ -371,80 +434,196 @@ def test_launch_loader_preserves_config_path_for_runtime_consumers():
     assert robot_config["_config_path"].endswith("config/robots/lekiwi.yaml")
 
 
-def test_generate_inference_node_binds_shared_rknn_resources(monkeypatch, tmp_path):
-    workspace = tmp_path
-    model_dir = workspace / "models" / "502000" / "pretrained_model"
-    model_dir.mkdir(parents=True, exist_ok=True)
-    model_file = model_dir / "model.rknn"
-    model_file.write_bytes(b"rknn")
-
-    monkeypatch.setenv("WORKSPACE", str(workspace))
-
-    try:
-        node = generate_inference_node(
-            {
-                "_config_path": "/tmp/so101_single_arm.yaml",
-                "models": {
-                    "so101_act_rknn": {
-                        "path": "./models/502000/pretrained_model",
-                        "policy_type": "act",
-                        "device": "rknn",
+def test_inference_execution_mode_cli_override_targets_one_pipeline():
+    robot_config = {
+        "control_modes": {
+            "model_inference": {
+                "inference": {
+                    "pipelines": {
+                        "primary": {"execution_mode": "monolithic"},
+                        "backup": {"execution_mode": "monolithic"},
                     }
-                },
-                "control_modes": {
-                    "model_inference": {
-                        "inference": {
-                            "enabled": True,
-                            "model": "so101_act_rknn",
-                        }
-                    }
-                },
-            },
-            "model_inference",
-        )
+                }
+            }
+        }
+    }
+    context = LaunchContext()
+    context.launch_configurations["inference_pipeline"] = "backup"
+    context.launch_configurations["inference_execution_mode"] = "distributed"
 
-        params = _node_parameters(node)
+    robot_launch._apply_inference_cli_overrides(context, robot_config, "model_inference")
 
-        assert str(model_dir.resolve()) in params["checkpoint"]
-        assert "rknn" in str(params["device"])
-    finally:
-        model_file.unlink(missing_ok=True)
+    pipelines = robot_config["control_modes"]["model_inference"]["inference"]["pipelines"]
+    assert pipelines["primary"]["execution_mode"] == "monolithic"
+    assert pipelines["backup"]["execution_mode"] == "distributed"
 
 
-def test_generate_inference_node_uses_policy_path_only_for_rknn(monkeypatch, tmp_path):
-    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+def test_inference_execution_mode_cli_override_requires_pipeline():
+    context = LaunchContext()
+    context.launch_configurations["inference_execution_mode"] = "distributed"
 
-    model_dir = tmp_path / "models" / "502000" / "pretrained_model"
-    model_dir.mkdir(parents=True)
-    (model_dir / "model.rknn").write_bytes(b"rknn")
+    with pytest.raises(ValueError, match="requires inference_pipeline"):
+        robot_launch._apply_inference_cli_overrides(context, {}, "model_inference")
 
-    node = generate_inference_node(
+
+def test_inference_execution_mode_cli_override_rejects_unknown_pipeline():
+    robot_config = {
+        "control_modes": {"model_inference": {"inference": {"pipelines": {"policy": {"execution_mode": "monolithic"}}}}}
+    }
+    context = LaunchContext()
+    context.launch_configurations["inference_pipeline"] = "missing"
+    context.launch_configurations["inference_execution_mode"] = "distributed"
+
+    with pytest.raises(ValueError, match="unknown pipeline"):
+        robot_launch._apply_inference_cli_overrides(context, robot_config, "model_inference")
+
+
+def test_generate_one_pipeline_node_uses_only_unified_parameters(tmp_path):
+    bundle = _create_inference_bundle(tmp_path / "bundle")
+    robot_config = _inference_robot_config(
+        tmp_path / "robot.yaml",
         {
-            "_config_path": "/tmp/so101_single_arm.yaml",
-            "models": {
-                "so101_act_rknn": {
-                    "path": "./models/502000/pretrained_model",
-                    "policy_type": "act",
-                    "device": "rknn",
-                }
-            },
-            "control_modes": {
-                "model_inference": {
-                    "inference": {
-                        "enabled": True,
-                        "model": "so101_act_rknn",
-                    }
-                }
-            },
+            "policy": {
+                "model_path": str(bundle),
+                "deployment": "cpu",
+                "execution_mode": "monolithic",
+                "request_timeout": 2.5,
+                "default_task": "pick banana",
+                "runtime_options": {"perf_enabled": True, "perf_log_every": 3},
+                "transport": {
+                    "action_server": "/custom/dispatch",
+                    "reset_service": "/custom/reset",
+                    "health_topic": "/custom/health",
+                    "action_topic": "/custom/actions",
+                },
+            }
         },
-        "model_inference",
     )
 
-    params = _node_parameters(node)
+    nodes = generate_inference_node(robot_config, "model_inference")
 
-    assert str(model_dir) in params["checkpoint"]
-    assert node.env is not None
-    assert all(_text(key) != "RKNN_MODEL_PATH" for key, _value in node.env)
+    assert len(nodes) == 1
+    assert nodes[0].node_executable == "pipeline_policy_node"
+    params = _node_parameters(nodes[0])
+    assert params["pipeline_id"] == "policy"
+    assert params["model_path"] == str(bundle.resolve())
+    assert params["deployment"] == "cpu"
+    assert params["request_timeout"] == 2.5
+    assert params["default_task"] == "pick banana"
+    assert json.loads(params["runtime_options_json"]) == {"perf_enabled": True, "perf_log_every": 3}
+    assert params["action_server"] == "/custom/dispatch"
+    assert params["reset_service"] == "/custom/reset"
+    assert params["health_topic"] == "/custom/health"
+    assert params["action_topic"] == "/custom/actions"
+    for legacy_field in ("checkpoint", "model", "models", "device", "policy_path"):
+        assert legacy_field not in params
+
+
+def test_generate_two_pipeline_nodes_and_route_dispatcher_to_selected_pipeline(tmp_path):
+    first = _create_inference_bundle(tmp_path / "first")
+    second = _create_inference_bundle(tmp_path / "second")
+    pipelines = {
+        "primary": {"model_path": str(first), "deployment": "cpu", "execution_mode": "monolithic"},
+        "backup": {
+            "model_path": str(second),
+            "deployment": "cpu",
+            "execution_mode": "monolithic",
+            "transport": {
+                "action_server": "/backup/dispatch",
+                "reset_service": "/backup/reset",
+            },
+        },
+    }
+    robot_config = _inference_robot_config(tmp_path / "robot.yaml", pipelines, selection="backup")
+
+    nodes = generate_execution_nodes(robot_config, "model_inference")
+
+    inference_nodes = [node for node in nodes if node.node_package == "inference_service"]
+    assert [node.node_executable for node in inference_nodes] == ["pipeline_policy_node", "pipeline_policy_node"]
+    dispatcher = next(node for node in nodes if node.node_package == "action_dispatch")
+    params = _node_parameters(dispatcher)
+    assert params["inference_action_server"] == "/backup/dispatch"
+    assert params["inference_reset_service"] == "/backup/reset"
+
+
+def test_multiple_pipelines_require_explicit_executor_selection(tmp_path):
+    bundle = _create_inference_bundle(tmp_path / "bundle")
+    pipelines = {
+        "first": {"model_path": str(bundle), "deployment": "cpu", "execution_mode": "monolithic"},
+        "second": {"model_path": str(bundle), "deployment": "cpu", "execution_mode": "monolithic"},
+    }
+    robot_config = _inference_robot_config(tmp_path / "robot.yaml", pipelines)
+
+    with pytest.raises(InferenceConfigError, match="executor.inference_pipeline"):
+        generate_action_dispatcher_node(robot_config, "model_inference")
+
+
+def test_launch_generation_rejects_invalid_deployment(tmp_path):
+    bundle = _create_inference_bundle(tmp_path / "bundle")
+    robot_config = _inference_robot_config(
+        tmp_path / "robot.yaml",
+        {"policy": {"model_path": str(bundle), "deployment": "missing", "execution_mode": "monolithic"}},
+    )
+
+    with pytest.raises(InferenceConfigError, match="Deployment 'missing'"):
+        generate_inference_node(robot_config, "model_inference")
+
+
+def test_launch_generation_emits_distributed_edge_with_transport_parameters(tmp_path):
+    bundle = _create_inference_bundle(tmp_path / "bundle")
+    robot_config = _inference_robot_config(
+        tmp_path / "robot.yaml",
+        {"edge": {"model_path": str(bundle), "deployment": "cpu", "execution_mode": "distributed"}},
+    )
+
+    nodes = generate_inference_node(robot_config, "model_inference")
+
+    assert len(nodes) == 1
+    assert nodes[0].node_executable == "pipeline_policy_node"
+    params = _node_parameters(nodes[0])
+    assert params["execution_mode"] == "distributed"
+    assert params["request_topic"] == "/inference/edge/request"
+    assert params["result_topic"] == "/inference/edge/result"
+    assert params["heartbeat_topic"] == "/inference/edge/heartbeat"
+
+
+def test_launch_generation_supports_mixed_execution_modes(tmp_path):
+    bundle = _create_inference_bundle(tmp_path / "bundle")
+    robot_config = _inference_robot_config(
+        tmp_path / "robot.yaml",
+        {
+            "local": {"model_path": str(bundle), "deployment": "cpu", "execution_mode": "monolithic"},
+            "edge": {"model_path": str(bundle), "deployment": "cpu", "execution_mode": "distributed"},
+        },
+        selection="local",
+    )
+
+    nodes = generate_execution_nodes(robot_config, "model_inference")
+
+    inference_nodes = [node for node in nodes if node.node_package == "inference_service"]
+    assert len(inference_nodes) == 2
+    modes = [_node_parameters(node)["execution_mode"] for node in inference_nodes]
+    assert modes == ["monolithic", "distributed"]
+
+
+def test_launch_generation_rejects_pipeline_endpoint_conflicts(tmp_path):
+    bundle = _create_inference_bundle(tmp_path / "bundle")
+    robot_config = _inference_robot_config(
+        tmp_path / "robot.yaml",
+        {
+            "first": {"model_path": str(bundle), "deployment": "cpu", "execution_mode": "monolithic"},
+            "second": {
+                "model_path": str(bundle),
+                "deployment": "cpu",
+                "execution_mode": "monolithic",
+                "transport": {"action_server": "/inference/first/dispatch"},
+            },
+        },
+        selection="first",
+    )
+
+    with pytest.raises(InferenceConfigError, match="endpoint conflict"):
+        generate_inference_node(robot_config, "model_inference")
 
 
 def test_attention_viz_request_uses_robot_config_only():

@@ -1,0 +1,15 @@
+{
+  "type": "act",
+  "n_obs_steps": 1,
+  "input_features": {
+    "observation.state": {"type": "STATE", "shape": [6]},
+    "observation.images.top": {"type": "VISUAL", "shape": [3, 480, 640]},
+    "observation.images.wrist": {"type": "VISUAL", "shape": [3, 480, 640]}
+  },
+  "output_features": {
+    "action": {"type": "ACTION", "shape": [6]}
+  },
+  "device": "cuda",
+  "chunk_size": 100,
+  "n_action_steps": 100
+}
