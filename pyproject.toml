@@ -41,6 +41,7 @@ known-first-party = [
     "vlm_task_planner",
     "robot_mcp",
     "action_dispatch",
+    "inference_manifest",
     "inference_service",
     "dataset_tools",
     "robot_teleop",
