@@ -5,13 +5,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 BUILD_INSTALL=""
+DEPS_ARCHIVE=""
 SKH_TAR=""
 PATCHES_DIR=""
+PYSITE_EXTRAS_DIR=""
 OUTPUT=""
 VERSION="1.0.0-$(date +%Y%m%d)"
 STAGE_DIR=""
 
 log_info()  { printf "[INFO]  %s\n" "$*" >&2; }
+log_warn()  { printf "[WARN]  %s\n" "$*" >&2; }
 log_error() { printf "[ERROR] %s\n" "$*" >&2; }
 
 usage() {
@@ -22,8 +25,10 @@ Pack a RoboFrame release tarball for RoboPi (RoboOH 1.0.1).
 
 Options:
   --build-install <dir>   Colcon install tree from build_roboframe_oh.sh
-  --skh-run <tarball>     Path to thirdparty_pytorch test/skh-run.tar.gz
+  --deps-archive <file>   Published roboframe-deps archive containing pysite/
+  --skh-run <tarball>     Legacy skh-run archive and optional syslib source
   --patches-dir <dir>     Directory of patched .so files (e.g. libcontroller_manager.so)
+  --pysite-extras <dir>   OpenHarmony-compatible Python archives and wheels
   --output <path>         Output .tar.gz path (default: roboframe-robopi-<ver>.tar.gz)
   --version <ver>         Release version string (default: 1.0.0-YYYYMMDD)
   -h, --help              Show this help
@@ -33,8 +38,10 @@ EOF
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --build-install) BUILD_INSTALL="$2"; shift 2 ;;
+        --deps-archive)  DEPS_ARCHIVE="$2"; shift 2 ;;
         --skh-run)       SKH_TAR="$2"; shift 2 ;;
         --patches-dir)   PATCHES_DIR="$2"; shift 2 ;;
+        --pysite-extras) PYSITE_EXTRAS_DIR="$2"; shift 2 ;;
         --output)        OUTPUT="$2"; shift 2 ;;
         --version)       VERSION="$2"; shift 2 ;;
         -h|--help)       usage; exit 0 ;;
@@ -44,8 +51,12 @@ done
 
 [[ -z "${BUILD_INSTALL}" ]] && { log_error "--build-install required"; usage; exit 1; }
 [[ -d "${BUILD_INSTALL}" ]] || { log_error "Not a directory: ${BUILD_INSTALL}"; exit 1; }
-[[ -z "${SKH_TAR}" ]] && SKH_TAR="${REPO_ROOT}/../thirdparty_pytorch/test/skh-run.tar.gz"
-[[ -f "${SKH_TAR}" ]] || { log_error "skh-run.tar.gz not found: ${SKH_TAR}"; exit 1; }
+if [[ -n "${DEPS_ARCHIVE}" ]]; then
+    [[ -f "${DEPS_ARCHIVE}" ]] || { log_error "Dependencies archive not found: ${DEPS_ARCHIVE}"; exit 1; }
+else
+    [[ -z "${SKH_TAR}" ]] && SKH_TAR="${REPO_ROOT}/../thirdparty_pytorch/test/skh-run.tar.gz"
+    [[ -f "${SKH_TAR}" ]] || { log_error "skh-run.tar.gz not found: ${SKH_TAR}"; exit 1; }
+fi
 [[ -z "${OUTPUT}" ]] && OUTPUT="${PWD}/roboframe-robopi-${VERSION}.tar.gz"
 
 STAGE_DIR="$(mktemp -d)"
@@ -73,13 +84,20 @@ for f in setup.sh setup.bash setup.zsh setup.ps1 local_setup.sh local_setup.bash
     [[ -f "${BUILD_INSTALL}/${f}" ]] && cp -a "${BUILD_INSTALL}/${f}" "${PKG_ROOT}/install/${f}"
 done
 
-# [2] Extract pysite from skh-run.tar.gz
-log_info "Extracting pysite from skh-run..."
-tar xzf "${SKH_TAR}" -C "${STAGE_DIR}" \
-    "skh-run/usr/lib/python3.12/site-packages" 2>/dev/null || true
-if [[ -d "${STAGE_DIR}/skh-run/usr/lib/python3.12/site-packages" ]]; then
+# [2] Extract the base pysite
+if [[ -n "${DEPS_ARCHIVE}" ]]; then
+    log_info "Extracting pysite from $(basename "${DEPS_ARCHIVE}")..."
+    tar xzf "${DEPS_ARCHIVE}" -C "${STAGE_DIR}" ./pysite
     rm -rf "${PKG_ROOT}/pysite"
-    mv "${STAGE_DIR}/skh-run/usr/lib/python3.12/site-packages" "${PKG_ROOT}/pysite"
+    mv "${STAGE_DIR}/pysite" "${PKG_ROOT}/pysite"
+else
+    log_info "Extracting pysite from skh-run..."
+    tar xzf "${SKH_TAR}" -C "${STAGE_DIR}" \
+        "skh-run/usr/lib/python3.12/site-packages" 2>/dev/null || true
+    if [[ -d "${STAGE_DIR}/skh-run/usr/lib/python3.12/site-packages" ]]; then
+        rm -rf "${PKG_ROOT}/pysite"
+        mv "${STAGE_DIR}/skh-run/usr/lib/python3.12/site-packages" "${PKG_ROOT}/pysite"
+    fi
 fi
 
 if [[ ! -d "${PKG_ROOT}/pysite/torch" ]]; then
@@ -87,31 +105,44 @@ if [[ ! -d "${PKG_ROOT}/pysite/torch" ]]; then
     exit 1
 fi
 
-# [2.5] Extract pysite extras (rknnlite, huggingface_hub, ruamel, mergedeep, typing_inspect)
+# [2.5] Overlay extra OpenHarmony-compatible Python packages
 log_info "Extracting pysite extras..."
-EXTRAS_DIR="${REPO_ROOT}/third_party/pysite-extras"
+EXTRAS_DIR="${PYSITE_EXTRAS_DIR:-${REPO_ROOT}/third_party/pysite-extras}"
 if [[ -d "${EXTRAS_DIR}" ]]; then
     for tar_file in "${EXTRAS_DIR}"/*.tar.gz; do
         [[ -f "${tar_file}" ]] || continue
         tar xzf "${tar_file}" -C "${PKG_ROOT}/pysite" 2>/dev/null || true
         log_info "  Extracted $(basename "${tar_file}")"
     done
-    whl_file=$(ls "${EXTRAS_DIR}"/rknn_toolkit_lite2*.whl 2>/dev/null | head -1)
-    if [[ -n "${whl_file}" && -f "${whl_file}" ]]; then
-        python3 -c "
-import zipfile, os, glob
-with zipfile.ZipFile('${whl_file}') as zf:
-    zf.extractall('${PKG_ROOT}/pysite')
-for d in ['api', 'api/npu_config', 'utils']:
-    pattern = os.path.join('${PKG_ROOT}/pysite', 'rknnlite', d, '*.cpython-312-aarch64-linux-gnu.so')
-    for f in glob.glob(pattern):
-        os.rename(f, f.replace('linux-gnu.so', 'linux-ohos.so'))
-" 2>/dev/null || true
+    for whl_file in "${EXTRAS_DIR}"/*.whl; do
+        [[ -f "${whl_file}" ]] || continue
+        python3 -m zipfile -e "${whl_file}" "${PKG_ROOT}/pysite"
         log_info "  Extracted $(basename "${whl_file}") (+ .so renamed)"
-    fi
+    done
+    while IFS= read -r so_file; do
+        mv "${so_file}" "${so_file%linux-musl.so}linux-ohos.so"
+    done < <(find "${PKG_ROOT}/pysite" -type f -name '*.cpython-312-aarch64-linux-musl.so')
+    while IFS= read -r so_file; do
+        mv "${so_file}" "${so_file%linux-gnu.so}linux-ohos.so"
+    done < <(find "${PKG_ROOT}/pysite" -type f -name '*.cpython-312-aarch64-linux-gnu.so')
 else
-    log_info "  No extras directory at ${EXTRAS_DIR}, skipping"
+    log_warn "No extras directory at ${EXTRAS_DIR}"
 fi
+
+declare -a REQUIRED_PYSITE_ENTRIES=(
+    "huggingface_hub"
+    "jsonschema"
+    "rpds"
+    "rknnlite"
+    "ruamel"
+)
+for entry in "${REQUIRED_PYSITE_ENTRIES[@]}"; do
+    if [[ ! -e "${PKG_ROOT}/pysite/${entry}" ]]; then
+        log_error "Required Python package missing from release: ${entry}"
+        log_error "Add its OpenHarmony-compatible archive or wheel to ${EXTRAS_DIR}"
+        exit 1
+    fi
+done
 
 # [2.6] Copy pymoveit2 from source (pure Python, not installed by colcon)
 PYMOVEIT2_SRC="${REPO_ROOT}/src/pymoveit2/pymoveit2"
@@ -122,8 +153,8 @@ else
     log_warn "pymoveit2 source not found at ${PYMOVEIT2_SRC}, moveit_gateway will fail"
 fi
 
-# [3] Extract syslib from skh-run.tar.gz
-log_info "Extracting syslib..."
+# [3] Extract optional syslib from legacy skh-run.tar.gz
+[[ -n "${SKH_TAR}" ]] && log_info "Extracting syslib..."
 declare -a SYSLIB_NAMES=(
     "skh-run/usr/lib/libc++.so.1"
     "skh-run/usr/lib/libc++.so.1.0"
@@ -139,7 +170,7 @@ declare -a SYSLIB_NAMES=(
     "skh-run/usr/lib/libintl.so.8.4.0"
 )
 for name in "${SYSLIB_NAMES[@]}"; do
-    if tar xzf "${SKH_TAR}" -C "${STAGE_DIR}" "${name}" 2>/dev/null; then
+    if [[ -n "${SKH_TAR}" ]] && tar xzf "${SKH_TAR}" -C "${STAGE_DIR}" "${name}" 2>/dev/null; then
         mv "${STAGE_DIR}/${name}" "${PKG_ROOT}/syslib/"
     fi
 done
@@ -169,7 +200,7 @@ cp "${REPO_ROOT}/scripts/setup_sshd.sh" "${PKG_ROOT}/scripts/"
 log_info "Rewriting wrapper scripts..."
 
 declare -A WRAPPERS=(
-    ["lib/inference_service/lerobot_policy_node"]="inference_service.lerobot_policy_node"
+    ["lib/inference_service/pipeline_policy_node"]="inference_service.pipeline_policy_node"
     ["lib/inference_service/pure_inference_node"]="inference_service.pure_inference_node"
     ["lib/dataset_tools/policy_eval"]="dataset_tools.policy_eval"
 )
@@ -184,9 +215,11 @@ for rel_path in "${!WRAPPERS[@]}"; do
 #!/system/bin/sh
 export LD_PRELOAD=/sys_prod/robot/out/lib/libpython3.12.so.1.0
 
-RF_LIB=/sys_prod/robot/out/lib:/sys_prod/robot/install/lib:\
+RF_LIB=/data/roboframe/pysite/rpds_py.libs:\
+/sys_prod/robot/out/lib:/sys_prod/robot/install/lib:\
 /data/roboframe/install/ibrobot_msgs/lib:\
 /data/roboframe/install/tensormsg/lib:\
+/data/roboframe/install/embodied_common/lib:\
 /data/roboframe/install/robot_config/lib:\
 /data/roboframe/install/inference_service/lib:\
 /data/roboframe/install/hardware_mock/lib:\
@@ -202,6 +235,8 @@ PY_PATH=/data/roboframe/pysite:\
 /data/roboframe/install/lerobot/src:\
 /data/roboframe/install/ibrobot_msgs/lib/python3.12/site-packages:\
 /data/roboframe/install/tensormsg/lib/python3.12/site-packages:\
+/data/roboframe/install/embodied_common/lib/python3.12/site-packages:\
+/data/roboframe/install/inference_manifest/lib/python3.12/site-packages:\
 /data/roboframe/install/robot_config/lib/python3.12/site-packages:\
 /data/roboframe/install/inference_service/lib/python3.12/site-packages:\
 /data/roboframe/install/hardware_mock/lib/python3.12/site-packages:\
@@ -215,7 +250,7 @@ PY_PATH=/data/roboframe/pysite:\
 /sys_prod/robot/install/lib/python3.12/site-packages
 export PYTHONPATH="${PY_PATH}${PYTHONPATH:+:$PYTHONPATH}"
 
-export AMENT_PREFIX_PATH="/sys_prod/robot/install:/data/roboframe/install${AMENT_PREFIX_PATH:+:$AMENT_PREFIX_PATH}"
+export AMENT_PREFIX_PATH="/sys_prod/robot/install:/data/roboframe/install:/data/roboframe/install/embodied_common:/data/roboframe/install/inference_manifest${AMENT_PREFIX_PATH:+:$AMENT_PREFIX_PATH}"
 export ROS_DISTRO=humble
 export ROS_VERSION=2
 export ROS_PYTHON_VERSION=3

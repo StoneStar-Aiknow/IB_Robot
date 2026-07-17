@@ -52,6 +52,7 @@ declare -a PACKAGES=(
     "tensormsg"
     "embodied_common"
     "voice_asr_service"
+    "inference_manifest"
     "robot_config"
     "robot_description"
     "inference_service"
@@ -446,7 +447,7 @@ mkdir -p "\${ROS_HOME_ROOT}" "\${ROS_LOG_ROOT}" >/dev/null 2>&1 || true
 
 export HOME="\${ROS_HOME_ROOT}"
 export ROS_LOG_DIR="\${ROS_LOG_ROOT}"
-export PYTHONPATH="\${ROBOFRAME_ROOT}/pysite:${OH_CUSTOM_PREFIX}/lerobot/src:${OH_CUSTOM_PREFIX}/dataset_tools/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/inference_service/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/robot_config/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/tensormsg/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib/python3.12/site-packages:${OH_BOARD_ROS_PREFIX}/lib/python3.12/site-packages:/sys_prod/robot/out/lib/python3.12/site-packages:/sys_prod/robot/install/lib/python3.12/site-packages\${PYTHONPATH:+:\$PYTHONPATH}"
+export PYTHONPATH="\${ROBOFRAME_ROOT}/pysite:${OH_CUSTOM_PREFIX}/lerobot/src:${OH_CUSTOM_PREFIX}/dataset_tools/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/inference_manifest/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/inference_service/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/robot_config/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/tensormsg/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib/python3.12/site-packages:${OH_BOARD_ROS_PREFIX}/lib/python3.12/site-packages:/sys_prod/robot/out/lib/python3.12/site-packages:/sys_prod/robot/install/lib/python3.12/site-packages\${PYTHONPATH:+:\$PYTHONPATH}"
 export LD_LIBRARY_PATH="${OH_CUSTOM_PREFIX}/dataset_tools/lib:${OH_CUSTOM_PREFIX}/inference_service/lib:${OH_CUSTOM_PREFIX}/robot_config/lib:${OH_CUSTOM_PREFIX}/tensormsg/lib:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib:${OH_BOARD_ROS_PREFIX}/lib:/sys_prod/robot/out/lib:/sys_prod/robot/install/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 export LD_PRELOAD="/sys_prod/robot/out/lib/libpython3.12.so.1.0\${LD_PRELOAD:+:\$LD_PRELOAD}"
 
@@ -455,7 +456,7 @@ EOF
             chmod +x "${script_path}"
         done
     done <<'EOF'
-lib/inference_service/lerobot_policy_node|inference_service.lerobot_policy_node
+lib/inference_service/pipeline_policy_node|inference_service.pipeline_policy_node
 lib/inference_service/pure_inference_node|inference_service.pure_inference_node
 lib/dataset_tools/policy_eval|dataset_tools.policy_eval
 EOF

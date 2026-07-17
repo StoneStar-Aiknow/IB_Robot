@@ -34,7 +34,7 @@ profiles:
   openharmony: OpenHarmony 5.x device targets.
   ascend: Hosts with Huawei Ascend NPUs.
   om: Hosts running Ascend OM-format model artefacts.
-  "3403": Hisilicon SD3403 boards using the dedicated OM ACT wrapper.
+  hisilicon: Hisilicon boards using the manifest-driven worker backend.
   inference: Inference-only deployments (no training requirements).
   training: Hosts that run policy training, including weighted-training tweaks.
   distillation: Hosts that perform knowledge distillation across policies.
