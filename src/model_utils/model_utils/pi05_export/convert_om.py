@@ -12,15 +12,12 @@
 
 This is the missing piece that puts PI05 on par with the single-OM ACT flow
 (``export_onnx_atc.py``): it wraps the ``atc`` compiler so users no longer have
-to hand-write the command or remember to update ``config.om.json`` so the runtime
-can find the artifacts.
+to hand-write the command or construct the unified deployment manifest.
 
 By default, ATC is invoked without ``--input_shape`` and with
 ``--precision_mode_v2=origin``. If a board/toolkit needs an explicit shape,
-``--input-shape auto`` derives it from each ONNX graph's static inputs. Each
-successful conversion upserts its role
-(``vlm`` / ``action_expert``) into ``config.om.json`` via
-:func:`om_manifest.upsert_pi05_om_manifest`.
+``--input-shape auto`` derives it from each ONNX graph's static inputs. The
+manifest is finalized only when both roles and both ONNX ABIs are available.
 
 Examples
 --------
@@ -37,7 +34,8 @@ Convert only the VLM (e.g. after re-exporting just that segment)::
     python -m model_utils.pi05_export.convert_om \\
         --pretrained-policy-path /path/to/pi05_ckpt \\
         --soc-version Ascend310P3 \\
-        --vlm-onnx outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx
+        --vlm-onnx outputs/onnx/pi05-vlm_op17_nodyn_fp16_cpu.onnx \\
+        --skip-manifest
 """
 
 from __future__ import annotations
@@ -48,8 +46,15 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from inference_manifest import DeviceLink
+from model_utils.inference_manifest_export import (
+    artifact_bindings,
+    compiled_deployment,
+    package_deployment_artifact,
+    read_runtime_abi,
+    upsert_deployment,
+)
 from model_utils.pi05_export._cli_ui import Stage, print_summary, setup_logging
-from model_utils.pi05_export.om_manifest import upsert_pi05_om_manifest
 
 LOGGER = logging.getLogger("pi05_export.convert_om")
 
@@ -90,8 +95,8 @@ def _has_atc_arg(extra_args: list[str], name: str) -> bool:
     return any((token := arg.lstrip("-")) == name or token.startswith(f"{name}=") for arg in extra_args)
 
 
-def _default_om_output(manifest_dir: Path, role: str, onnx_path: Path) -> Path:
-    return manifest_dir / onnx_path.with_suffix(".om").name
+def _default_om_output(manifest_dir: Path, role: str) -> Path:
+    return manifest_dir / "model_utils_work" / "ascend" / "pi05" / f"{role}.om"
 
 
 def _run_atc(
@@ -142,14 +147,12 @@ def convert_role(
     onnx_path: Path,
     om_output: Path,
     soc_version: str,
-    manifest_dir: Path,
-    skip_manifest: bool,
     extra_args: list[str],
     input_shape_mode: str,
     index: int,
     total: int,
 ) -> Path:
-    """Compile one role's ONNX to OM and (optionally) upsert the manifest.
+    """Compile one role's ONNX to OM.
 
     Returns the produced ``.om`` path. Raises on ATC failure so the orchestrator
     can stop while leaving any already-produced artifacts in place (resumable).
@@ -164,11 +167,91 @@ def convert_role(
         if not om_output.is_file():
             raise RuntimeError(f"ATC reported success but {om_output} was not produced")
 
-    if not skip_manifest:
-        manifest_path = upsert_pi05_om_manifest(manifest_dir, role, om_output)
-        LOGGER.info("  manifest updated (%s) → %s", role, manifest_path)
-
     return om_output
+
+
+def write_pi05_ascend_deployment(
+    bundle_root: Path,
+    deployment_name: str,
+    soc_version: str,
+    vlm_abi_path: Path,
+    vlm_om: Path,
+    action_abi_path: Path,
+    action_om: Path,
+) -> Path:
+    """Write one complete PI0.5 Ascend deployment from compiled runtime ABIs."""
+
+    vlm_abi = read_runtime_abi(vlm_abi_path)
+    action_abi = read_runtime_abi(action_abi_path)
+    vlm_input_semantics = {
+        tensor.name: (
+            "observation.language.tokens"
+            if tensor.name in {"lang_tokens", "observation.language.tokens"}
+            else "observation.language.attention_mask"
+            if tensor.name in {"lang_masks", "observation.language.attention_mask"}
+            else tensor.name
+        )
+        for tensor in vlm_abi.inputs
+    }
+    vlm_bindings = artifact_bindings(
+        vlm_abi,
+        input_semantics=vlm_input_semantics,
+        output_semantics={
+            "past_kv_tensor": "internal.past_kv",
+            "prefix_pad_masks": "internal.prefix_pad_masks",
+        },
+        image_layouts={
+            semantic: "NCHW" for semantic in vlm_input_semantics.values() if semantic.startswith("observation.images.")
+        },
+    )
+    action_bindings = artifact_bindings(
+        action_abi,
+        input_semantics={
+            "past_kv_tensor": "internal.past_kv",
+            "prefix_pad_masks": "internal.prefix_pad_masks",
+            "time": "time",
+            "noise": "noise",
+        },
+        output_semantics={"action": "action"},
+    )
+    links = tuple(
+        DeviceLink(
+            semantic=semantic,
+            producer="vlm",
+            consumer="action_expert",
+            transport="device_pointer",
+            owner="producer",
+            lifetime="inference",
+        )
+        for semantic in ("internal.past_kv", "internal.prefix_pad_masks")
+    )
+    packaged_vlm = package_deployment_artifact(
+        bundle_root,
+        vlm_om,
+        backend="ascend",
+        deployment_name=deployment_name,
+        role="vlm",
+        force_copy=True,
+    )
+    packaged_action = package_deployment_artifact(
+        bundle_root,
+        action_om,
+        backend="ascend",
+        deployment_name=deployment_name,
+        role="action_expert",
+        force_copy=True,
+    )
+    deployment = compiled_deployment(
+        bundle_root,
+        backend="ascend",
+        target_soc=soc_version,
+        target_runtime="acl",
+        artifacts={"vlm": (packaged_vlm, "om"), "action_expert": (packaged_action, "om")},
+        execution=("vlm", "action_expert"),
+        bindings={"vlm": vlm_bindings, "action_expert": action_bindings},
+        device_links=links,
+    )
+    return upsert_deployment(bundle_root, deployment_name, deployment).manifest_path
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -182,7 +265,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="pretrained_policy_path",
         type=str,
         required=True,
-        help="Local PI05 policy directory (where config.om.json is written). Alias: --pretrained-policy-path.",
+        help="Local PI05 policy bundle directory. Alias: --pretrained-policy-path.",
     )
     p.add_argument(
         "--soc-version",
@@ -196,21 +279,39 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--vlm-om",
         type=str,
         default=None,
-        help="Output VLM .om path (default: <policy-path>/<vlm-onnx-basename>.om).",
+        help="ATC VLM OM work output (default: <bundle>/model_utils_work/ascend/pi05/vlm.om).",
     )
     p.add_argument(
         "--ae-om",
         type=str,
         default=None,
-        help="Output Action Expert .om path (default: <policy-path>/<ae-onnx-basename>.om).",
+        help="ATC Action Expert OM work output (default: <bundle>/model_utils_work/ascend/pi05/action_expert.om).",
     )
     p.add_argument(
-        "--om-manifest-dir",
+        "--vlm-abi",
         type=str,
         default=None,
-        help="Directory for config.om.json (default: pretrained policy path).",
+        help="Existing compiler/runtime-introspected VLM OM ABI JSON input (default: <vlm-om>.abi.json).",
     )
-    p.add_argument("--skip-om-manifest", action="store_true", help="Do not write/update config.om.json.")
+    p.add_argument(
+        "--ae-abi",
+        type=str,
+        default=None,
+        help="Existing compiler/runtime-introspected Action Expert OM ABI JSON input (default: <ae-om>.abi.json).",
+    )
+    p.add_argument(
+        "--bundle-root",
+        type=str,
+        default=None,
+        help="Policy bundle root for inference_manifest.json (default: pretrained policy path).",
+    )
+    p.add_argument("--skip-manifest", action="store_true", help="Do not finalize inference_manifest.json.")
+    p.add_argument(
+        "--manifest-only",
+        action="store_true",
+        help="Skip ATC and finalize the manifest from existing ONNX and OM artifacts.",
+    )
+    p.add_argument("--deployment", default="ascend", help="Unified manifest deployment name.")
     p.add_argument(
         "--input-shape",
         choices=("none", "auto"),
@@ -241,7 +342,7 @@ def main() -> int:
         LOGGER.error("Nothing to do: pass --vlm-onnx and/or --ae-onnx.")
         return 1
 
-    if shutil.which("atc") is None:
+    if not args.manifest_only and shutil.which("atc") is None:
         LOGGER.error(
             "`atc` not found on PATH. Run this on an Ascend host with the CANN "
             "toolkit installed (and `source` the CANN environment)."
@@ -249,12 +350,12 @@ def main() -> int:
         return 1
 
     policy_path = Path(args.pretrained_policy_path).expanduser()
-    if args.om_manifest_dir is not None:
-        manifest_dir = Path(args.om_manifest_dir).expanduser().resolve()
+    if args.bundle_root is not None:
+        manifest_dir = Path(args.bundle_root).expanduser().resolve()
     else:
         if not policy_path.is_dir():
             LOGGER.error(
-                "--pretrained-policy-path %s is not a local directory; pass --om-manifest-dir explicitly.",
+                "--pretrained-policy-path %s is not a local directory; pass --bundle-root explicitly.",
                 policy_path,
             )
             return 1
@@ -265,41 +366,59 @@ def main() -> int:
     jobs: list[tuple[str, Path, Path]] = []
     if args.vlm_onnx:
         vlm_onnx = Path(args.vlm_onnx).expanduser()
-        vlm_om = (
-            Path(args.vlm_om).expanduser().resolve()
-            if args.vlm_om
-            else _default_om_output(manifest_dir, "vlm", vlm_onnx)
-        )
+        vlm_om = Path(args.vlm_om).expanduser().resolve() if args.vlm_om else _default_om_output(manifest_dir, "vlm")
         jobs.append(("vlm", vlm_onnx, vlm_om))
     if args.ae_onnx:
         ae_onnx = Path(args.ae_onnx).expanduser()
         ae_om = (
-            Path(args.ae_om).expanduser().resolve()
-            if args.ae_om
-            else _default_om_output(manifest_dir, "action_expert", ae_onnx)
+            Path(args.ae_om).expanduser().resolve() if args.ae_om else _default_om_output(manifest_dir, "action_expert")
         )
         jobs.append(("action_expert", ae_onnx, ae_om))
 
     produced: list[tuple[str, str]] = []
     total = len(jobs)
     for i, (role, onnx_path, om_output) in enumerate(jobs, start=1):
-        om_path = convert_role(
-            role=role,
-            onnx_path=onnx_path,
-            om_output=om_output,
-            soc_version=args.soc_version,
-            manifest_dir=manifest_dir,
-            skip_manifest=args.skip_om_manifest,
-            extra_args=extra_args,
-            input_shape_mode=args.input_shape,
-            index=i,
-            total=total,
-        )
+        if args.manifest_only:
+            if not onnx_path.is_file():
+                raise FileNotFoundError(f"{role} ONNX not found: {onnx_path}")
+            if not om_output.is_file():
+                raise FileNotFoundError(f"{role} OM not found: {om_output}")
+            om_path = om_output
+        else:
+            om_path = convert_role(
+                role=role,
+                onnx_path=onnx_path,
+                om_output=om_output,
+                soc_version=args.soc_version,
+                extra_args=extra_args,
+                input_shape_mode=args.input_shape,
+                index=i,
+                total=total,
+            )
         produced.append((role, str(om_path)))
 
+    if not args.skip_manifest:
+        if not args.vlm_onnx or not args.ae_onnx:
+            LOGGER.error("Unified PI0.5 manifest finalization requires both --vlm-onnx and --ae-onnx.")
+            return 1
+        vlm_om = next(Path(path) for role, path in produced if role == "vlm")
+        action_om = next(Path(path) for role, path in produced if role == "action_expert")
+        vlm_abi = Path(args.vlm_abi).expanduser() if args.vlm_abi else Path(f"{vlm_om}.abi.json")
+        action_abi = Path(args.ae_abi).expanduser() if args.ae_abi else Path(f"{action_om}.abi.json")
+        manifest_path = write_pi05_ascend_deployment(
+            manifest_dir,
+            args.deployment,
+            args.soc_version,
+            vlm_abi,
+            vlm_om,
+            action_abi,
+            action_om,
+        )
+        LOGGER.info("  unified manifest → %s", manifest_path)
+
     rows = [(role, path) for role, path in produced]
-    if not args.skip_om_manifest:
-        rows.append(("manifest", str(manifest_dir / "config.om.json")))
+    if not args.skip_manifest:
+        rows.append(("manifest", str(manifest_dir / "inference_manifest.json")))
     if not args.no_summary:
         print_summary("PI05 OM conversion complete", rows, status="✅ DONE")
     return 0

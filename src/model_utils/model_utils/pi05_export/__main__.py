@@ -47,8 +47,8 @@ Step semantics
 Design notes
 ------------
 * **Intermediate products are preserved.** Nothing is deleted between stages;
-  the ONNX files, compiled OM files, ``runtime_save/*.pth`` and
-  ``config.om.json`` all remain on disk for inspection or a partial re-run.
+  the ONNX files, compiled OM files, ``runtime_save/*.pth`` and unified manifest
+  all remain on disk for inspection or a partial re-run.
 * **Live feedback.** Stages run as child processes with inherited stdout/stderr,
   so the user sees real progress (export logs, ATC compile output).
 * **Minimal surface.** All argument ergonomics (profile / wizard / --exp-dir
@@ -162,7 +162,6 @@ def _run_vlm_donor_onnx(ctx: Ctx) -> None:
             a.dtype,
             "--device",
             a.donor_device,
-            "--skip-om-manifest",
             "--log-level",
             a.log_level,
         ],
@@ -186,7 +185,6 @@ def _run_ae_donor_onnx(ctx: Ctx) -> None:
             a.dtype,
             "--device",
             a.donor_device,
-            "--skip-om-manifest",
             "--log-level",
             a.log_level,
         ],
@@ -257,10 +255,6 @@ def _run_vlm_onnx(ctx: Ctx) -> None:
             "--device",
             a.device,
             *(["--fast-gelu"] if a.fast_gelu else []),
-            "--om-manifest-dir",
-            str(ctx.policy_path),
-            "--om-path",
-            str(ctx.vlm_om),
             "--log-level",
             a.log_level,
         ],
@@ -285,10 +279,6 @@ def _run_ae_onnx(ctx: Ctx) -> None:
             "--device",
             a.device,
             *(["--fast-gelu"] if a.fast_gelu else []),
-            "--om-manifest-dir",
-            str(ctx.policy_path),
-            "--om-path",
-            str(ctx.ae_om),
             "--log-level",
             a.log_level,
         ],
@@ -361,6 +351,7 @@ def _run_om(ctx: Ctx, *, role: str, onnx_path: Path, om_path: Path) -> None:
             "--soc-version",
             a.soc_version,
             *role_args,
+            "--skip-manifest",
             "--no-summary",
             "--log-level",
             a.log_level,
@@ -607,6 +598,51 @@ def main() -> int:
             _RUNNERS[name](ctx)
         _append_summary(summary, ctx, name)
 
+    if {"vlm_om", "ae_om"}.issubset(ctx.chosen):
+        _run_module(
+            "model_utils.pi05_export.convert_om",
+            [
+                "--pretrained-policy-path",
+                str(ctx.policy_path),
+                "--soc-version",
+                args.soc_version,
+                "--vlm-onnx",
+                str(ctx.vlm_onnx),
+                "--vlm-om",
+                str(ctx.vlm_om),
+                "--ae-onnx",
+                str(ctx.ae_onnx),
+                "--ae-om",
+                str(ctx.ae_om),
+                "--manifest-only",
+                "--no-summary",
+                "--log-level",
+                args.log_level,
+            ],
+        )
+    elif {"vlm_quant_om", "ae_quant_om"}.issubset(ctx.chosen):
+        _run_module(
+            "model_utils.pi05_export.convert_om",
+            [
+                "--pretrained-policy-path",
+                str(ctx.policy_path),
+                "--soc-version",
+                args.soc_version,
+                "--vlm-onnx",
+                str(ctx.vlm_w8a8),
+                "--vlm-om",
+                str(ctx.vlm_quant_om),
+                "--ae-onnx",
+                str(ctx.ae_w8a8),
+                "--ae-om",
+                str(ctx.ae_quant_om),
+                "--manifest-only",
+                "--no-summary",
+                "--log-level",
+                args.log_level,
+            ],
+        )
+
     print_summary("PI05 export pipeline complete", _dedup(summary), status="✅ DONE")
     LOGGER.info("Intermediate products kept under %s, %s, and %s", output_dir, runtime_save_dir, om_dir)
 
@@ -637,16 +673,16 @@ def _append_summary(summary: list[tuple[str, str]], ctx: Ctx, step: str) -> None
         summary.append(("Action Expert ONNX (W8A8)", str(ctx.ae_w8a8)))
     elif step == "vlm_om":
         summary.append(("VLM OM", str(ctx.vlm_om)))
-        summary.append(("OM manifest", str(ctx.policy_path / "config.om.json")))
+        summary.append(("Inference manifest", str(ctx.policy_path / "inference_manifest.json")))
     elif step == "ae_om":
         summary.append(("Action Expert OM", str(ctx.ae_om)))
-        summary.append(("OM manifest", str(ctx.policy_path / "config.om.json")))
+        summary.append(("Inference manifest", str(ctx.policy_path / "inference_manifest.json")))
     elif step == "vlm_quant_om":
         summary.append(("VLM OM (W8A8)", str(ctx.vlm_quant_om)))
-        summary.append(("OM manifest", str(ctx.policy_path / "config.om.json")))
+        summary.append(("Inference manifest", str(ctx.policy_path / "inference_manifest.json")))
     elif step == "ae_quant_om":
         summary.append(("Action Expert OM (W8A8)", str(ctx.ae_quant_om)))
-        summary.append(("OM manifest", str(ctx.policy_path / "config.om.json")))
+        summary.append(("Inference manifest", str(ctx.policy_path / "inference_manifest.json")))
     elif step == "verify":
         summary.append(("Verification", "✅ see log above"))
 

@@ -13,12 +13,8 @@ constant was extracted from the ONNX graph to avoid ATC fp16 corruption
 of the ``-2.38e38`` masking value).
 
 .. note::
-   This is an intentional copy of
-   ``inference_service.core.ascend_om.pi05.prefix_mask_utils`` kept
-   inside ``model_utils`` so the offline export/diagnostic tooling does
-   not have to ``exec_depend`` on the runtime ``inference_service``
-   package. The function is a stable ~70-line pure-numpy algorithm; the
-   duplication buys full decoupling of the two sibling packages.
+   This utility is owned by ``model_utils`` so offline export and diagnostic
+   tooling does not depend on the runtime ``inference_service`` package.
 """
 
 from __future__ import annotations

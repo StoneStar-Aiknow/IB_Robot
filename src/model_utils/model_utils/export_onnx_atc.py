@@ -3,15 +3,32 @@ import json
 import subprocess
 from pathlib import Path
 
-OM_MANIFEST_BASENAME = "config.om.json"
+from model_utils.export_paths import ensure_output_parent, export_work_dir
+from model_utils.inference_manifest_export import (
+    artifact_bindings,
+    compiled_deployment,
+    package_deployment_artifact,
+    read_runtime_abi,
+    upsert_deployment,
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_model", type=str, required=True, help="The path of pretrained model")
     parser.add_argument("--soc_version", type=str, required=True, help="The Ascend soc version")
-    parser.add_argument("--onnx_model_path", type=str, default=None, help="The path to store onnx model")
-    parser.add_argument("--om_model_path", type=str, default=None, help="The path to store om model")
+    parser.add_argument(
+        "--work_dir", type=str, default=None, help="Build work directory (default: <bundle>/model_utils_work/ascend)"
+    )
+    parser.add_argument("--onnx_model_path", type=str, default=None, help="ONNX work output path")
+    parser.add_argument("--om_model_path", type=str, default=None, help="ATC OM work output path")
+    parser.add_argument("--deployment", type=str, default="ascend", help="Unified manifest deployment name")
+    parser.add_argument(
+        "--om_abi_path",
+        type=str,
+        default=None,
+        help="Existing compiler/runtime-introspected OM ABI JSON input (default: <om_model_path>.abi.json)",
+    )
     parser.add_argument(
         "--skip_onnx_export",
         action="store_true",
@@ -24,10 +41,15 @@ def parse_args():
     om_model_path = args.om_model_path
     soc_version = args.soc_version
 
+    work_dir = export_work_dir(pretrained_model_path, "ascend", args.work_dir)
     if onnx_model_path is None:
-        onnx_model_path = pretrained_model_path + "/model.onnx"
+        onnx_model_path = str(work_dir / "model.onnx")
     if om_model_path is None:
-        om_model_path = pretrained_model_path + "/model.om"
+        om_model_path = str(work_dir / "model.om")
+    ensure_output_parent(onnx_model_path)
+    ensure_output_parent(om_model_path)
+    if args.om_abi_path is None:
+        args.om_abi_path = f"{om_model_path}.abi.json"
 
     config_path = pretrained_model_path + "/config.json"
     with open(config_path) as f:
@@ -40,42 +62,65 @@ def parse_args():
         om_model_path,
         soc_version,
         args.skip_onnx_export,
+        args.om_abi_path,
+        args.deployment,
     )
 
 
-def _relative_or_absolute_path(path: Path, base_dir: Path) -> str:
-    try:
-        return path.resolve().relative_to(base_dir.resolve()).as_posix()
-    except ValueError:
-        return str(path)
-
-
-def write_om_manifest(pretrained_model_path, config, om_model_path):
+def write_ascend_deployment(
+    pretrained_model_path,
+    config,
+    onnx_model_path,
+    om_model_path,
+    soc_version,
+    abi_path=None,
+    deployment_name="ascend",
+):
     policy_type = str(config.get("type", "")).lower().strip()
     if not policy_type:
         raise ValueError("config.json is missing required policy type metadata")
     if policy_type != "act":
         raise ValueError(f"Policy {policy_type} is not supported currently.")
 
-    policy_dir = Path(pretrained_model_path).expanduser()
-    if not policy_dir.is_absolute():
-        policy_dir = (Path.cwd() / policy_dir).resolve()
-    om_path = Path(om_model_path).expanduser()
-    if not om_path.is_absolute():
-        om_path = (Path.cwd() / om_path).resolve()
-
-    manifest_path = policy_dir / OM_MANIFEST_BASENAME
-    manifest = {
-        "schema_version": 1,
-        "policy_type": policy_type,
-        "backend": "ascend_om",
-        "artifacts": {"policy": _relative_or_absolute_path(om_path, policy_dir)},
-        "execution": ["policy"],
-    }
-    with manifest_path.open("w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-        f.write("\n")
-    return manifest_path
+    policy_dir = Path(pretrained_model_path).expanduser().resolve(strict=True)
+    runtime_inputs = [
+        key
+        for key in config.get("input_features", {})
+        if key == "observation.state" or key.startswith("observation.images.")
+    ]
+    if abi_path is None:
+        raise ValueError("Ascend deployment packaging requires compiler/runtime ABI JSON")
+    abi = read_runtime_abi(abi_path)
+    input_names = [tensor.name for tensor in abi.inputs]
+    if input_names != runtime_inputs:
+        raise ValueError(f"ACT OM runtime inputs {input_names} do not match policy runtime inputs {runtime_inputs}")
+    output_names = [tensor.name for tensor in abi.outputs]
+    if len(output_names) != 1:
+        raise ValueError("ACT OM runtime must expose exactly one output")
+    bindings = artifact_bindings(
+        abi,
+        input_semantics={name: name for name in runtime_inputs},
+        output_semantics={output_names[0]: "action"},
+        image_layouts={name: "NCHW" for name in runtime_inputs if name.startswith("observation.images.")},
+    )
+    packaged_om = package_deployment_artifact(
+        policy_dir,
+        om_model_path,
+        backend="ascend",
+        deployment_name=deployment_name,
+        role="policy",
+        force_copy=True,
+    )
+    deployment = compiled_deployment(
+        policy_dir,
+        backend="ascend",
+        target_soc=soc_version,
+        target_runtime="acl",
+        artifacts={"policy": (packaged_om, "om")},
+        execution=("policy",),
+        bindings={"policy": bindings},
+    )
+    return upsert_deployment(policy_dir, deployment_name, deployment).manifest_path
 
 
 def _act_input_shape(config):
@@ -139,8 +184,17 @@ def export_act_model(pretrained_model_path, config, onnx_model_path, om_model_pa
     act_policy.model = act_policy.model.to("cpu")
     act_policy.model.eval()
 
+    class ACTONNXWrapper(torch.nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+
+        def forward(self, batch):
+            output = self.model(batch)
+            return output[0] if isinstance(output, tuple) else output
+
     torch.onnx.export(
-        act_policy.model,
+        ACTONNXWrapper(act_policy.model),
         (act_batch,),
         onnx_model_path,
         input_names=input_names,
@@ -160,6 +214,8 @@ if __name__ == "__main__":
         om_model_path,
         soc_version,
         skip_onnx_export,
+        om_abi_path,
+        deployment_name,
     ) = parse_args()
     policy_type = config["type"]
 
@@ -169,6 +225,14 @@ if __name__ == "__main__":
                 raise ValueError("convert_onnx_to_om failed")
         elif not export_act_model(pretrained_model_path, config, onnx_model_path, om_model_path, soc_version):
             raise ValueError("export_act_model failed")
-        write_om_manifest(pretrained_model_path, config, om_model_path)
+        write_ascend_deployment(
+            pretrained_model_path,
+            config,
+            onnx_model_path,
+            om_model_path,
+            soc_version,
+            om_abi_path,
+            deployment_name,
+        )
     else:
         raise ValueError(f"Policy {policy_type} is not supported currently.")

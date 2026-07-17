@@ -25,13 +25,12 @@ two tools share one mental model:
   ``CLI > --profile > defaults > _last (only when no --profile) > builtin``.
 - **Derived paths**: a single ``--exp-dir`` expands to ``onnx/`` (ONNX output),
   ``runtime_save/`` (VLM->AE handoff tensors), and ``om/`` (compiled artifacts)
-  so the long paths collapse into one directory. ``config.om.json`` is still
+  so the long paths collapse into one directory. ``inference_manifest.json`` is still
   written next to the policy, and points to the compiled OM paths.
 - **Wizard**: on first use (no config / no _last) or ``--init`` it prompts each
   field with its meaning + example + default, then offers to save a profile.
 
-Backward compatible: every historical explicit flag still works and overrides
-whatever a profile/derivation would supply.
+Explicit flags override values supplied by profiles or derived paths.
 """
 
 from __future__ import annotations
@@ -175,7 +174,7 @@ PARAMS: list[Param] = [
     Param(
         dest="policy_path",
         cli="--policy-path",
-        meaning="Local PI05 policy directory (config + weights); config.om.json is written here",
+        meaning="Local PI05 policy bundle (config + processors); inference_manifest.json is written here",
         required_for_run=True,
     ),
     Param(
@@ -219,7 +218,7 @@ PARAMS: list[Param] = [
         example='"pick up the cup"',
     ),
     # The two paths below are normally derived from --exp-dir; kept as explicit
-    # overrides for backward compatibility / non-standard layouts.
+    # overrides for non-standard layouts.
     Param(
         dest="output_dir",
         cli="--output-dir",

@@ -44,7 +44,6 @@ from model_utils.pi05_export.ascend_export_patches import (
     sanitize_nan_initializers,
 )
 from model_utils.pi05_export.modeling_pi05_action_expert import PI05ActionExpertPolicy
-from model_utils.pi05_export.om_manifest import upsert_pi05_om_manifest
 
 LOGGER = logging.getLogger(__name__)
 
@@ -235,19 +234,6 @@ def parse_args() -> argparse.Namespace:
         "or auto (preserve original mixed bf16+fp32 weights). "
         "Must match the dtype used for VLM export.",
     )
-    parser.add_argument(
-        "--om-manifest-dir",
-        type=str,
-        default=None,
-        help="Directory to write config.om.json (default: pretrained policy path).",
-    )
-    parser.add_argument(
-        "--om-path",
-        type=str,
-        default=None,
-        help="Predicted action_expert .om artifact path recorded in the manifest (default: <onnx-basename>.om).",
-    )
-    parser.add_argument("--skip-om-manifest", action="store_true", help="Do not write/update config.om.json.")
     parser.add_argument(
         "--fast-gelu",
         action=argparse.BooleanOptionalAction,
@@ -509,33 +495,6 @@ def main() -> int:
 
     _clean_onnx_domains(onnx_output_path)
     LOGGER.info("ONNX export finished")
-
-    if not args.skip_om_manifest:
-        if args.om_manifest_dir is not None:
-            manifest_dir = Path(args.om_manifest_dir).expanduser().resolve()
-        else:
-            local_policy_path = Path(args.pretrained_policy_path).expanduser()
-            if not local_policy_path.is_dir():
-                raise ValueError(
-                    "--om-manifest-dir is required when --pretrained-policy-path is not a local "
-                    f"policy directory (got {args.pretrained_policy_path!r}); otherwise the manifest "
-                    "would be written to a wrong location relative to the current working directory"
-                )
-            manifest_dir = local_policy_path.resolve()
-        om_path = args.om_path if args.om_path is not None else onnx_output_path.with_suffix(".om").name
-        resolved_om_path = Path(om_path).expanduser()
-        if not resolved_om_path.is_absolute():
-            resolved_om_path = manifest_dir / resolved_om_path
-        if resolved_om_path.is_file():
-            manifest_path = upsert_pi05_om_manifest(manifest_dir, "action_expert", om_path)
-            LOGGER.info("Updated OM manifest (action_expert) at %s", manifest_path)
-        else:
-            LOGGER.info(
-                "Skipping OM manifest update (action_expert): OM artifact %s does not exist yet; "
-                "the compiled runtime manifest is written by the OM compile step "
-                "(convert_om) once ATC produces the .om file.",
-                resolved_om_path,
-            )
 
     return 0
 
