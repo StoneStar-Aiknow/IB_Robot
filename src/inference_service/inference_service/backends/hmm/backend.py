@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from inference_manifest import ArtifactBindings, CompiledDeployment, TensorBinding
+from inference_manifest.json_utils import load_json_strict
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
 from inference_service.backends.lifecycle import LifecycleBackend, PartialLoadRollback
 from inference_service.backends.types import BackendCapabilities, BackendResult, InferenceRequest, RuntimeContext
@@ -848,3 +849,483 @@ class HMMBackend(LifecycleBackend):
                 code="invalid_policy_config",
             )
         return value
+
+    @classmethod
+    def _validate_pi05_plan(
+        cls,
+        deployment: CompiledDeployment,
+        policy_config: Mapping[str, object],
+        embedding: _EmbeddingWeights,
+    ) -> None:
+        suffix = ("embedding", "prefill", "action_in_proj", "time_mlp", "decode", "action_out_proj")
+        vision_roles = deployment.execution[: -len(suffix)]
+        if (
+            not vision_roles
+            or deployment.execution[-len(suffix) :] != suffix
+            or any(role != "vision" and not role.startswith("vision_") for role in vision_roles)
+        ):
+            raise BackendLoadError(
+                "HMM PI0.5 requires vision role(s) followed by embedding, prefill, action_in_proj, "
+                "time_mlp, decode, and action_out_proj",
+                code="invalid_execution_plan",
+            )
+        for key in ("chunk_size", "max_action_dim", "num_inference_steps"):
+            cls._require_positive_config(policy_config, key, "PI0.5")
+        if embedding.token_weight.ndim != 2:
+            raise BackendLoadError("HMM PI0.5 token embedding must be rank 2", code="invalid_embedding")
+        input_links = [link for link in deployment.device_links if link.producer_binding == "input"]
+        if not input_links or any(link.producer != "prefill" or link.consumer != "decode" for link in input_links):
+            raise BackendLoadError(
+                "HMM PI0.5 requires prefill input to decode input device links",
+                code="invalid_device_links",
+            )
+        if any(link.producer_binding != "input" for link in deployment.device_links):
+            raise BackendLoadError("HMM PI0.5 supports only input-sourced cache links", code="invalid_device_links")
+        noise = cls._binding_for_semantics(
+            deployment.bindings["action_in_proj"].inputs,
+            _NOISE_SEMANTICS,
+            "noise",
+        )
+        action = cls._binding_for_semantics(
+            deployment.bindings["action_out_proj"].outputs,
+            {"action"},
+            "action output",
+        )
+        expected = (1, int(policy_config["chunk_size"]), int(policy_config["max_action_dim"]))
+        if noise.shape != expected or action.shape != expected:
+            raise BackendLoadError(
+                f"HMM PI0.5 noise and action bindings must use shape {expected}",
+                code="invalid_bindings",
+            )
+        cls._validate_vision_embedding_bindings(deployment, vision_roles)
+
+    @classmethod
+    def _validate_smolvla_plan(
+        cls,
+        deployment: CompiledDeployment,
+        policy_config: Mapping[str, object],
+        embedding: _EmbeddingWeights,
+    ) -> None:
+        suffix = ("embedding", "prefill", "action")
+        vision_roles = deployment.execution[: -len(suffix)]
+        if (
+            not vision_roles
+            or deployment.execution[-len(suffix) :] != suffix
+            or any(role != "vision" and not role.startswith("vision_") for role in vision_roles)
+        ):
+            raise BackendLoadError(
+                "HMM SmolVLA requires vision role(s) followed by embedding, prefill, and action",
+                code="invalid_execution_plan",
+            )
+        for key in ("chunk_size", "max_state_dim", "max_action_dim", "num_steps"):
+            cls._require_positive_config(policy_config, key, "SmolVLA")
+        if policy_config.get("add_image_special_tokens", False) is not False:
+            raise BackendLoadError(
+                "HMM SmolVLA does not support add_image_special_tokens=true",
+                code="unsupported_policy_config",
+            )
+        if embedding.state_weight is None or embedding.state_bias is None:
+            raise BackendLoadError("HMM SmolVLA requires state projection weights", code="invalid_embedding")
+        state_binding = cls._binding_for_semantics(
+            deployment.bindings["embedding"].inputs,
+            {"observation.state"},
+            "state",
+        )
+        hidden_size = embedding.token_weight.shape[1]
+        if embedding.state_weight.shape != (hidden_size, state_binding.shape[-1]):
+            raise BackendLoadError(
+                "HMM SmolVLA state projection shape is incompatible with the embedding binding",
+                code="invalid_embedding",
+            )
+        if embedding.state_bias.shape != (hidden_size,):
+            raise BackendLoadError("HMM SmolVLA state projection bias has invalid shape", code="invalid_embedding")
+        if not deployment.device_links or any(
+            link.producer != "prefill" or link.consumer != "action" or link.producer_binding != "output"
+            for link in deployment.device_links
+        ):
+            raise BackendLoadError(
+                "HMM SmolVLA requires prefill output to action input device links",
+                code="invalid_device_links",
+            )
+        noise = cls._binding_for_semantics(deployment.bindings["action"].inputs, _NOISE_SEMANTICS, "noise")
+        action = cls._binding_for_semantics(deployment.bindings["action"].outputs, {"action"}, "action output")
+        expected = (1, int(policy_config["chunk_size"]), int(policy_config["max_action_dim"]))
+        if noise.shape != expected or action.shape != expected:
+            raise BackendLoadError(
+                f"HMM SmolVLA noise and action bindings must use shape {expected}",
+                code="invalid_bindings",
+            )
+        cls._validate_vision_embedding_bindings(deployment, vision_roles)
+
+    @classmethod
+    def _validate_vision_embedding_bindings(
+        cls,
+        deployment: CompiledDeployment,
+        vision_roles: Sequence[str],
+    ) -> None:
+        image_outputs: list[str] = []
+        for role in vision_roles:
+            bindings = deployment.bindings[role]
+            if len(bindings.inputs) != 1 or len(bindings.outputs) != 1:
+                raise BackendLoadError(
+                    f"HMM vision role {role!r} requires exactly one input and one output",
+                    code="invalid_bindings",
+                )
+            if not cls._is_image_semantic(bindings.inputs[0].semantic) or not bindings.outputs[0].semantic.startswith(
+                "internal.image_embedding."
+            ):
+                raise BackendLoadError(
+                    f"HMM vision role {role!r} must map one image to one internal image embedding",
+                    code="invalid_bindings",
+                )
+            image_outputs.append(bindings.outputs[0].semantic)
+        embedding_images = [
+            binding.semantic
+            for binding in deployment.bindings["embedding"].inputs
+            if binding.semantic.startswith("internal.image_embedding.")
+        ]
+        if image_outputs != embedding_images:
+            raise BackendLoadError(
+                "HMM embedding image inputs must match vision execution order",
+                code="invalid_bindings",
+            )
+
+    def _load_policy_artifacts(self, context: RuntimeContext) -> _EmbeddingWeights:
+        embedding_path = self._require_artifact(context, "embedding")
+        embedding_artifact = context.deployment.artifacts["embedding"]
+        if embedding_artifact.format not in {"pt", "pytorch"}:
+            raise BackendLoadError(
+                "HMM embedding artifact must use format 'pt' or 'pytorch'",
+                code="invalid_artifact_format",
+            )
+        token_state = self._load_torch_mapping(embedding_path, "embedding")
+        token_weight = token_state.get("token_embedding.weight", token_state.get("weight"))
+        if token_weight is None:
+            raise BackendLoadError("HMM embedding artifact does not contain token weights", code="invalid_embedding")
+        if context.policy.policy_type != "smolvla":
+            return _EmbeddingWeights(token_weight=self._to_numpy_weight(token_weight, embedding_path, "weight"))
+
+        try:
+            projection_artifact = context.deployment.artifacts["state_projection"]
+        except KeyError as exc:
+            raise BackendLoadError(
+                "HMM SmolVLA requires a manifest-declared state_projection artifact",
+                code="missing_artifact_role",
+            ) from exc
+        if projection_artifact.format not in {"pt", "pytorch"}:
+            raise BackendLoadError(
+                "HMM state_projection artifact must use format 'pt' or 'pytorch'",
+                code="invalid_artifact_format",
+            )
+        projection_path = self._require_artifact(context, "state_projection")
+        projection_state = self._load_torch_mapping(projection_path, "state_projection")
+        state_weight = projection_state.get("state_proj.weight", projection_state.get("weight"))
+        state_bias = projection_state.get("state_proj.bias", projection_state.get("bias"))
+        if state_weight is None or state_bias is None:
+            raise BackendLoadError(
+                "HMM state_projection artifact must contain weight and bias",
+                code="invalid_embedding",
+            )
+        return _EmbeddingWeights(
+            token_weight=self._to_numpy_weight(token_weight, embedding_path, "weight"),
+            state_weight=self._to_numpy_weight(state_weight, projection_path, "weight"),
+            state_bias=self._to_numpy_weight(state_bias, projection_path, "bias"),
+        )
+
+    @staticmethod
+    def _load_torch_mapping(path: Path, description: str) -> Mapping[str, object]:
+        try:
+            torch = importlib.import_module("torch")
+        except (ImportError, OSError) as exc:
+            raise BackendLoadError(
+                f"HMM {description} requires PyTorch to load {path}: {exc}",
+                code="missing_dependency",
+            ) from exc
+        try:
+            value = torch.load(path, map_location="cpu", weights_only=True)
+        except Exception as exc:
+            raise BackendLoadError(
+                f"Unable to load HMM {description} artifact {path}: {exc}", code="invalid_embedding"
+            ) from exc
+        if not isinstance(value, Mapping):
+            raise BackendLoadError(
+                f"HMM {description} artifact must contain a tensor mapping", code="invalid_embedding"
+            )
+        return value
+
+    @staticmethod
+    def _to_numpy_weight(value: object, path: Path, name: str) -> np.ndarray:
+        detach = getattr(value, "detach", None)
+        if callable(detach):
+            value = detach()
+        cpu = getattr(value, "cpu", None)
+        if callable(cpu):
+            value = cpu()
+        if str(getattr(value, "dtype", "")) == "torch.bfloat16":
+            value = value.float()
+        to_numpy = getattr(value, "numpy", None)
+        if callable(to_numpy):
+            value = to_numpy()
+        try:
+            return np.ascontiguousarray(np.asarray(value, dtype=np.float32))
+        except (TypeError, ValueError) as exc:
+            raise BackendLoadError(
+                f"HMM artifact {path} contains invalid tensor {name!r}",
+                code="invalid_embedding",
+            ) from exc
+
+    @staticmethod
+    def _request_execution(request: InferenceRequest) -> tuple[ExecutionPlan, Mapping[str, BoundInputs]]:
+        plan = request.inputs.get("execution_plan")
+        role_inputs = request.inputs.get("role_inputs")
+        if not isinstance(plan, ExecutionPlan):
+            raise BackendInferenceError("HMMBackend request is missing execution_plan", code="invalid_request")
+        if not isinstance(role_inputs, Mapping):
+            raise BackendInferenceError("HMMBackend request is missing role_inputs", code="invalid_request")
+        for role in plan.role_names:
+            if not isinstance(role_inputs.get(role), BoundInputs):
+                raise BackendInferenceError(
+                    f"HMMBackend role {role!r} inputs are not bound tensors",
+                    code="invalid_request",
+                )
+        return plan, role_inputs
+
+    @staticmethod
+    def _bound_semantics(inputs: BoundInputs) -> dict[str, np.ndarray]:
+        return {tensor.semantic: tensor.value for tensor in inputs.tensors}
+
+    @staticmethod
+    def _output_value(outputs: Mapping[object, np.ndarray], binding: TensorBinding) -> np.ndarray:
+        if binding.runtime_name is not None and binding.runtime_name in outputs:
+            return outputs[binding.runtime_name]
+        if binding.index is not None and int(binding.index) in outputs:
+            return outputs[int(binding.index)]
+        raise BackendInferenceError(
+            f"HMM runtime did not return output {binding.semantic!r}",
+            code="missing_runtime_output",
+        )
+
+    @staticmethod
+    def _replace_output(
+        outputs: Mapping[object, np.ndarray],
+        binding: TensorBinding,
+        value: np.ndarray,
+    ) -> dict[object, np.ndarray]:
+        result = dict(outputs)
+        if binding.index is not None:
+            result[int(binding.index)] = value
+        if binding.runtime_name is not None:
+            result[binding.runtime_name] = value
+        return result
+
+    @staticmethod
+    def _raw_action(outputs: object, plan: ExecutionPlan) -> np.ndarray:
+        action_role = next(
+            role for role in plan.roles if any(binding.semantic == "action" for binding in role.bindings.outputs)
+        )
+        binding = next(binding for binding in action_role.bindings.outputs if binding.semantic == "action")
+        role_outputs = (
+            outputs[action_role.name] if isinstance(outputs, Mapping) and action_role.name in outputs else outputs
+        )
+        if not isinstance(role_outputs, Mapping):
+            raise BackendInferenceError("HMM runtime did not return bound action outputs", code="missing_action_output")
+        return HMMBackend._output_value(role_outputs, binding)
+
+    @staticmethod
+    def _chunk_size(action: np.ndarray) -> int:
+        if action.ndim < 2 or action.shape[-2] < 1:
+            raise BackendInferenceError(
+                f"HMM action output has invalid shape {action.shape}",
+                code="invalid_action_shape",
+            )
+        return int(action.shape[-2])
+
+    @staticmethod
+    def _binding_for_semantics(
+        bindings: Sequence[TensorBinding],
+        semantics: set[str] | frozenset[str],
+        description: str,
+    ) -> TensorBinding:
+        matches = [binding for binding in bindings if binding.semantic in semantics]
+        if len(matches) != 1:
+            raise BackendLoadError(
+                f"HMM deployment requires exactly one {description} binding",
+                code="invalid_bindings",
+            )
+        return matches[0]
+
+    @staticmethod
+    def _binding_for_semantic(
+        bindings: Sequence[TensorBinding],
+        semantic: str,
+        description: str,
+    ) -> TensorBinding:
+        return HMMBackend._binding_for_semantics(bindings, {semantic}, description)
+
+    @staticmethod
+    def _static_shape(binding: TensorBinding) -> tuple[int, ...]:
+        if any(dimension < 1 for dimension in binding.shape):
+            raise BackendInferenceError(
+                f"HMM runtime-generated input {binding.semantic!r} requires a static shape, got {binding.shape}",
+                code="dynamic_runtime_input",
+            )
+        return binding.shape
+
+    @staticmethod
+    def _convert_runtime_value(
+        binding: TensorBinding,
+        value: object,
+        role: str,
+        direction: str,
+    ) -> np.ndarray:
+        try:
+            converted = np.ascontiguousarray(np.asarray(value, dtype=HMMModule._numpy_dtype(binding.dtype)))
+        except (TypeError, ValueError) as exc:
+            raise BackendInferenceError(
+                f"HMM role {role!r} {direction} {binding.semantic!r} cannot convert to {binding.dtype}",
+                code=f"runtime_{direction}_dtype_mismatch",
+            ) from exc
+        if not HMMModule._compatible_shape(binding.shape, converted.shape):
+            raise BackendInferenceError(
+                f"HMM role {role!r} {direction} {binding.semantic!r} shape {converted.shape} "
+                f"does not match manifest shape {binding.shape}",
+                code=f"runtime_{direction}_shape_mismatch",
+            )
+        return converted
+
+    @staticmethod
+    def _pad_axis_one(value: np.ndarray, shape: tuple[int, ...], pad_value: object) -> np.ndarray:
+        if len(shape) != value.ndim or shape[0] not in {-1, value.shape[0]}:
+            raise BackendInferenceError(
+                f"HMM prefix tensor shape {value.shape} is incompatible with manifest shape {shape}",
+                code="invalid_prefix_shape",
+            )
+        target_length = shape[1]
+        if target_length < value.shape[1] or any(
+            expected != -1 and expected != actual for expected, actual in zip(shape[2:], value.shape[2:], strict=True)
+        ):
+            raise BackendInferenceError(
+                f"HMM prefix tensor shape {value.shape} is incompatible with manifest shape {shape}",
+                code="invalid_prefix_shape",
+            )
+        if target_length == value.shape[1]:
+            return value
+        pad_shape = list(value.shape)
+        pad_shape[1] = target_length - value.shape[1]
+        return np.concatenate((value, np.full(pad_shape, pad_value, dtype=value.dtype)), axis=1)
+
+    @staticmethod
+    def _to_additive_attention(mask: np.ndarray, dtype: str) -> np.ndarray:
+        target_dtype = HMMModule._numpy_dtype(dtype)
+        minimum = np.finfo(target_dtype).min
+        return np.where(mask, 0.0, minimum).astype(target_dtype)
+
+    @staticmethod
+    def _validate_token_ids(tokens: np.ndarray, vocabulary_size: int) -> None:
+        if tokens.min(initial=0) < 0 or tokens.max(initial=0) >= vocabulary_size:
+            raise BackendInferenceError("HMM token id is outside the embedding table", code="invalid_token_id")
+
+    @staticmethod
+    def _is_image_semantic(semantic: str) -> bool:
+        return (
+            semantic == "observation.image"
+            or semantic.startswith("observation.image.")
+            or semantic.startswith("observation.images.")
+        )
+
+    @staticmethod
+    def _require_positive_config(config: Mapping[str, object], key: str, policy: str) -> None:
+        value = config.get(key)
+        if type(value) is not int or value < 1:
+            raise BackendLoadError(
+                f"HMM {policy} requires positive integer {key!r} in LeRobot config",
+                code="invalid_policy_config",
+            )
+
+    @staticmethod
+    def _require_artifact(context: RuntimeContext, role: str) -> Path:
+        try:
+            path = context.resolved_artifacts[role]
+        except KeyError as exc:
+            raise BackendLoadError(
+                f"HMM deployment is missing artifact role {role!r}", code="missing_artifact_role"
+            ) from exc
+        if not path.is_file():
+            raise BackendLoadError(f"HMM artifact {role!r} is not a regular file: {path}", code="invalid_artifact")
+        return path
+
+    @staticmethod
+    def _load_policy_config(path: Path) -> dict[str, object]:
+        try:
+            value = load_json_strict(path)
+        except Exception as exc:
+            raise BackendLoadError(
+                f"Unable to read LeRobot config {path}: {exc}", code="invalid_policy_config"
+            ) from exc
+        if not isinstance(value, dict):
+            raise BackendLoadError(f"LeRobot config must be an object: {path}", code="invalid_policy_config")
+        return value
+
+    @staticmethod
+    def _create_weight_manager(runtime: object, device_id: int) -> object | None:
+        constructor = getattr(runtime, "WeightManager", None)
+        if not callable(constructor):
+            return None
+        try:
+            return constructor(device=device_id)
+        except Exception as exc:
+            raise BackendLoadError(
+                f"Unable to create TCIM WeightManager for device {device_id}: {exc}",
+                code="runtime_load_failed",
+            ) from exc
+
+    @staticmethod
+    def _create_option(runtime: object, weight_manager: object | None) -> object | None:
+        constructor = getattr(runtime, "Option", None)
+        if weight_manager is None or not callable(constructor):
+            return None
+        return constructor(weight_manager)
+
+    @staticmethod
+    def _release_resource(resource: object | None) -> None:
+        if resource is None:
+            return
+        for method_name in ("release", "close", "destroy"):
+            method = getattr(resource, method_name, None)
+            if callable(method):
+                method()
+                return
+
+    @staticmethod
+    def _validate_runtime_options(options: Mapping[str, object]) -> dict[str, object]:
+        unknown = sorted(set(options) - _ALLOWED_RUNTIME_OPTIONS)
+        if unknown:
+            raise BackendLoadError(f"unknown HMM runtime options: {unknown}", code="invalid_runtime_options")
+        device_id = options.get("device_id", 0)
+        if type(device_id) is not int or device_id < 0:
+            raise BackendLoadError("HMM device_id must be a non-negative integer", code="invalid_runtime_options")
+        random_seed = options.get("random_seed")
+        if random_seed is not None and type(random_seed) is not int:
+            raise BackendLoadError("HMM random_seed must be an integer or null", code="invalid_runtime_options")
+        return {"device_id": device_id, "random_seed": random_seed}
+
+    @staticmethod
+    def _import_tcim_runtime() -> object:
+        try:
+            module = importlib.import_module("tcim_lite")
+            return module.runtime
+        except (ImportError, OSError, AttributeError) as exc:
+            raise BackendLoadError(
+                f"TCIM dependency 'tcim_lite.runtime' is unavailable: {exc}",
+                code="missing_dependency",
+            ) from exc
+
+
+def create_backend(context: RuntimeContext) -> HMMBackend:
+    """Lazy registry factory for Houmo TCIM execution."""
+
+    deployment = context.deployment
+    if not isinstance(deployment, CompiledDeployment) or deployment.backend != "hmm":
+        raise BackendLoadError("HMMBackend requires a compiled hmm deployment", code="invalid_deployment")
+    options = HMMBackend._validate_runtime_options(context.runtime_options)
+    return HMMBackend(int(options["device_id"]))
