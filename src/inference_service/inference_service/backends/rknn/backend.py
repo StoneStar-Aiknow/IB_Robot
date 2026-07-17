@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import math
 import time
 from collections.abc import Callable, Mapping
@@ -11,6 +12,7 @@ from pathlib import Path
 import numpy as np
 
 from inference_manifest import ArtifactBindings, CompiledDeployment, TensorBinding
+from inference_manifest.json_utils import load_json_strict
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
 from inference_service.backends.lifecycle import LifecycleBackend, PartialLoadRollback
 from inference_service.backends.types import BackendCapabilities, BackendResult, InferenceRequest, RuntimeContext
@@ -682,3 +684,404 @@ class RKNNBackend(LifecycleBackend):
         pad_shape[1] = target_length - value.shape[1]
         padding = np.full(pad_shape, pad_value, dtype=value.dtype)
         return np.concatenate((value, padding), axis=1)
+
+    @classmethod
+    def _validate_smolvla_plan(
+        cls,
+        deployment: CompiledDeployment,
+        embedding: _SmolVLAEmbedding,
+        policy_config: Mapping[str, object],
+    ) -> None:
+        if deployment.device_links:
+            raise BackendLoadError(
+                "RKNNLite does not support manifest device-pointer links; declare host-visible internal bindings",
+                code="unsupported_device_links",
+            )
+        for key in ("chunk_size", "max_action_dim", "num_steps"):
+            value = policy_config.get(key)
+            if type(value) is not int or value < 1:
+                raise BackendLoadError(
+                    f"RKNN SmolVLA requires positive integer {key!r} in LeRobot config",
+                    code="invalid_policy_config",
+                )
+        if policy_config.get("add_image_special_tokens", False) is not False:
+            raise BackendLoadError(
+                "RKNN SmolVLA does not support add_image_special_tokens=true",
+                code="unsupported_policy_config",
+            )
+        if policy_config.get("empty_cameras", 0) != 0:
+            raise BackendLoadError(
+                "RKNN SmolVLA requires empty_cameras=0",
+                code="unsupported_policy_config",
+            )
+
+        vision_roles = deployment.execution[:-3]
+        embedding_bindings = deployment.bindings["embedding"]
+        image_inputs = [
+            binding for binding in embedding_bindings.inputs if binding.semantic.startswith("internal.image_embedding.")
+        ]
+        if len(image_inputs) != len(vision_roles):
+            raise BackendLoadError(
+                "RKNN SmolVLA embedding role must consume one internal.image_embedding.* tensor per vision role",
+                code="invalid_bindings",
+            )
+        image_semantics: list[str] = []
+        for role in vision_roles:
+            role_bindings = deployment.bindings[role]
+            if len(role_bindings.inputs) != 1 or len(role_bindings.outputs) != 1:
+                raise BackendLoadError(
+                    f"RKNN SmolVLA vision role {role!r} requires exactly one input and one output binding",
+                    code="invalid_bindings",
+                )
+            image_input = role_bindings.inputs[0]
+            image_output = role_bindings.outputs[0]
+            if not cls._is_image_semantic(image_input.semantic) or not image_output.semantic.startswith(
+                "internal.image_embedding."
+            ):
+                raise BackendLoadError(
+                    f"RKNN SmolVLA vision role {role!r} must map one image semantic to one image embedding",
+                    code="invalid_bindings",
+                )
+            image_semantics.append(image_output.semantic)
+        if tuple(image_semantics) != tuple(binding.semantic for binding in image_inputs):
+            raise BackendLoadError(
+                "RKNN SmolVLA image embedding input order must match manifest vision execution order",
+                code="invalid_bindings",
+            )
+
+        cls._binding_for_semantics(
+            embedding_bindings.inputs,
+            {"observation.language.tokens"},
+            "language tokens",
+        )
+        cls._binding_for_semantics(
+            embedding_bindings.inputs,
+            {"observation.language.attention_mask"},
+            "language mask",
+        )
+        state_binding = cls._binding_for_semantics(
+            embedding_bindings.inputs,
+            {"observation.state"},
+            "state",
+        )
+        prefix_embeddings = cls._binding_for_semantics(
+            embedding_bindings.outputs,
+            {"internal.prefix_embeddings"},
+            "prefix embeddings",
+        )
+        prefix_pad_masks = cls._binding_for_semantics(
+            embedding_bindings.outputs,
+            {"internal.prefix_pad_masks"},
+            "prefix pad masks",
+        )
+        attention_mask = cls._binding_for_semantics(
+            embedding_bindings.outputs,
+            {"internal.attention_mask"},
+            "attention mask",
+        )
+        position_ids = cls._binding_for_semantics(
+            embedding_bindings.outputs,
+            {"internal.position_ids"},
+            "position ids",
+        )
+        if embedding.token_weight.ndim != 2:
+            raise BackendLoadError(
+                f"RKNN SmolVLA token embedding weight must be rank 2, got {embedding.token_weight.shape}",
+                code="invalid_embedding",
+            )
+        hidden_size = embedding.token_weight.shape[1]
+        state_dim = state_binding.shape[-1]
+        if state_dim < 1 or embedding.state_weight.shape != (hidden_size, state_dim):
+            raise BackendLoadError(
+                f"RKNN SmolVLA state projection shape {embedding.state_weight.shape} must be "
+                f"({hidden_size}, {state_dim})",
+                code="invalid_embedding",
+            )
+        if embedding.state_bias.shape != (hidden_size,):
+            raise BackendLoadError(
+                f"RKNN SmolVLA state projection bias shape {embedding.state_bias.shape} must be ({hidden_size},)",
+                code="invalid_embedding",
+            )
+        if len(prefix_embeddings.shape) != 3 or prefix_embeddings.shape[-1] != hidden_size:
+            raise BackendLoadError(
+                "RKNN SmolVLA prefix embedding binding is incompatible with the embedding hidden size",
+                code="invalid_bindings",
+            )
+        prefix_length = prefix_embeddings.shape[1]
+        if (
+            prefix_length < 1
+            or prefix_pad_masks.shape != (prefix_embeddings.shape[0], prefix_length)
+            or attention_mask.shape != (prefix_embeddings.shape[0], prefix_length, prefix_length)
+            or position_ids.shape != (prefix_embeddings.shape[0], prefix_length)
+        ):
+            raise BackendLoadError(
+                "RKNN SmolVLA prefix mask and position bindings must use one consistent static prefix length",
+                code="invalid_bindings",
+            )
+
+        prefill_bindings = deployment.bindings["prefill"]
+        required_prefill_inputs = (
+            "internal.prefix_embeddings",
+            "internal.attention_mask",
+            "internal.position_ids",
+        )
+        if tuple(binding.semantic for binding in prefill_bindings.inputs) != required_prefill_inputs:
+            raise BackendLoadError(
+                f"RKNN SmolVLA prefill inputs must be ordered as {list(required_prefill_inputs)}",
+                code="invalid_bindings",
+            )
+        cache_semantics = tuple(binding.semantic for binding in prefill_bindings.outputs)
+        if not cache_semantics or any(not semantic.startswith("internal.past_") for semantic in cache_semantics):
+            raise BackendLoadError(
+                "RKNN SmolVLA prefill outputs must declare internal.past_* cache semantics",
+                code="invalid_bindings",
+            )
+
+        action_bindings = deployment.bindings["action"]
+        noise_binding = cls._binding_for_semantics(action_bindings.inputs, _NOISE_SEMANTICS, "noise")
+        cls._binding_for_semantics(action_bindings.inputs, _TIME_SEMANTICS, "time")
+        cls._binding_for_semantics(
+            action_bindings.inputs,
+            {"internal.prefix_pad_masks"},
+            "prefix pad masks",
+        )
+        action_binding = cls._binding_for_semantics(action_bindings.outputs, {"action"}, "action output")
+        action_internal_semantics = tuple(
+            binding.semantic
+            for binding in action_bindings.inputs
+            if binding.semantic.startswith("internal.") and binding.semantic != "internal.prefix_pad_masks"
+        )
+        if action_internal_semantics != cache_semantics:
+            raise BackendLoadError(
+                "RKNN SmolVLA action cache inputs must match prefill outputs in order",
+                code="invalid_bindings",
+            )
+        chunk_size = int(policy_config["chunk_size"])
+        max_action_dim = int(policy_config["max_action_dim"])
+        expected_action_shape = (1, chunk_size, max_action_dim)
+        if noise_binding.shape != expected_action_shape or action_binding.shape != expected_action_shape:
+            raise BackendLoadError(
+                f"RKNN SmolVLA noise and action bindings must use shape {expected_action_shape}",
+                code="invalid_bindings",
+            )
+
+    @staticmethod
+    def _validate_act_plan(deployment: CompiledDeployment) -> None:
+        if deployment.device_links:
+            raise BackendLoadError("RKNN ACT does not support device links", code="unsupported_device_links")
+        bindings = deployment.bindings["policy"]
+        if any(binding.index is None for binding in (*bindings.inputs, *bindings.outputs)):
+            raise BackendLoadError("RKNN ACT bindings require explicit runtime indices", code="invalid_bindings")
+
+    @staticmethod
+    def _session_load_order(deployment: CompiledDeployment, policy_type: str) -> tuple[str, ...]:
+        roles = tuple(role for role in deployment.execution if role != "embedding")
+        if policy_type != "smolvla":
+            return roles
+        vision_roles = tuple(role for role in roles if role == "vision" or role.startswith("vision_"))
+        return ("prefill", *vision_roles, "action")
+
+    @staticmethod
+    def _session_cache_key(deployment: CompiledDeployment, role: str) -> tuple[object, ...]:
+        artifact = deployment.artifacts[role]
+        bindings = deployment.bindings[role]
+        return (
+            artifact.sha256,
+            tuple(
+                (binding.runtime_name, binding.index, binding.dtype, binding.shape, binding.layout)
+                for binding in bindings.inputs
+            ),
+            tuple(
+                (binding.runtime_name, binding.index, binding.dtype, binding.shape, binding.layout)
+                for binding in bindings.outputs
+            ),
+        )
+
+    @staticmethod
+    def _binding_for_semantics(
+        bindings: tuple[TensorBinding, ...], semantics: set[str] | frozenset[str], description: str
+    ) -> TensorBinding:
+        matches = [binding for binding in bindings if binding.semantic in semantics]
+        if len(matches) != 1 or matches[0].index is None:
+            raise BackendLoadError(
+                f"RKNN deployment requires exactly one indexed {description} binding",
+                code="invalid_bindings",
+            )
+        return matches[0]
+
+    @staticmethod
+    def _static_shape(binding: TensorBinding) -> tuple[int, ...]:
+        if any(dimension < 1 for dimension in binding.shape):
+            raise BackendInferenceError(
+                f"RKNN runtime-generated input {binding.semantic!r} requires a static shape, got {binding.shape}",
+                code="dynamic_runtime_input",
+            )
+        return binding.shape
+
+    @staticmethod
+    def _require_artifact(context: RuntimeContext, role: str) -> Path:
+        try:
+            path = context.resolved_artifacts[role]
+        except KeyError as exc:
+            raise BackendLoadError(
+                f"RKNN deployment is missing artifact role {role!r}", code="missing_artifact_role"
+            ) from exc
+        if not path.is_file():
+            raise BackendLoadError(f"RKNN artifact {role!r} is not a regular file: {path}", code="invalid_artifact")
+        return path
+
+    @staticmethod
+    def _load_policy_config(path: Path) -> dict[str, object]:
+        try:
+            value = load_json_strict(path)
+        except Exception as exc:
+            raise BackendLoadError(
+                f"Unable to read LeRobot config {path}: {exc}", code="invalid_policy_config"
+            ) from exc
+        if not isinstance(value, dict):
+            raise BackendLoadError(f"LeRobot config must be an object: {path}", code="invalid_policy_config")
+        return value
+
+    @staticmethod
+    def _load_embedding(embedding_path: Path, state_projection_path: Path) -> _SmolVLAEmbedding:
+        try:
+            torch = importlib.import_module("torch")
+        except (ImportError, OSError) as exc:
+            raise BackendLoadError(
+                f"RKNN SmolVLA embedding requires PyTorch to load {embedding_path}: {exc}",
+                code="missing_dependency",
+            ) from exc
+        try:
+            embedding_state = torch.load(embedding_path, map_location="cpu", weights_only=True)
+            projection_state = torch.load(state_projection_path, map_location="cpu", weights_only=True)
+        except Exception as exc:
+            raise BackendLoadError(
+                f"Unable to load RKNN embedding artifacts {embedding_path} and {state_projection_path}: {exc}",
+                code="invalid_embedding",
+            ) from exc
+        if not isinstance(embedding_state, Mapping) or not isinstance(projection_state, Mapping):
+            raise BackendLoadError(
+                "RKNN SmolVLA embedding and state_projection artifacts must contain tensor mappings",
+                code="invalid_embedding",
+            )
+        token_weight = embedding_state.get("token_embedding.weight", embedding_state.get("weight"))
+        state_weight = projection_state.get("state_proj.weight", projection_state.get("weight"))
+        state_bias = projection_state.get("state_proj.bias", projection_state.get("bias"))
+        if token_weight is None or state_weight is None or state_bias is None:
+            raise BackendLoadError(
+                "RKNN embedding artifacts must contain token_embedding.weight and state projection weight/bias",
+                code="invalid_embedding",
+            )
+        return _SmolVLAEmbedding(
+            token_weight=RKNNBackend._to_numpy_weight(token_weight, embedding_path, "token_embedding.weight"),
+            state_weight=RKNNBackend._to_numpy_weight(state_weight, state_projection_path, "state_proj.weight"),
+            state_bias=RKNNBackend._to_numpy_weight(state_bias, state_projection_path, "state_proj.bias"),
+        )
+
+    @staticmethod
+    def _to_numpy_weight(value: object, path: Path, name: str) -> np.ndarray:
+        detach = getattr(value, "detach", None)
+        if callable(detach):
+            value = detach()
+        cpu = getattr(value, "cpu", None)
+        if callable(cpu):
+            value = cpu()
+        numpy = getattr(value, "numpy", None)
+        if callable(numpy):
+            value = numpy()
+        try:
+            return np.ascontiguousarray(np.asarray(value, dtype=np.float32))
+        except (TypeError, ValueError) as exc:
+            raise BackendLoadError(
+                f"RKNN embedding artifact {path} contains invalid tensor {name!r}",
+                code="invalid_embedding",
+            ) from exc
+
+    @staticmethod
+    def _is_image_semantic(semantic: str) -> bool:
+        return (
+            semantic == "observation.image"
+            or semantic.startswith("observation.image.")
+            or semantic.startswith("observation.images.")
+        )
+
+    @staticmethod
+    def _numpy_dtype(dtype: str) -> np.dtype:
+        if dtype != "bfloat16":
+            return np.dtype(dtype)
+        try:
+            return np.dtype(dtype)
+        except TypeError:
+            try:
+                extension = importlib.import_module("ml_dtypes")
+            except ImportError as exc:
+                raise BackendLoadError(
+                    "RKNN bfloat16 bindings require NumPy bfloat16 support or ml_dtypes",
+                    code="unsupported_runtime_dtype",
+                ) from exc
+            return np.dtype(extension.bfloat16)
+
+    @staticmethod
+    def _validate_runtime_options(options: Mapping[str, object]) -> dict[str, object]:
+        unknown = sorted(set(options) - _ALLOWED_RUNTIME_OPTIONS)
+        if unknown:
+            raise BackendLoadError(f"unknown RKNN runtime options: {unknown}", code="invalid_runtime_options")
+        target = options.get("target")
+        if target is not None and (type(target) is not str or not target.strip()):
+            raise BackendLoadError("RKNN target must be a non-empty string or null", code="invalid_runtime_options")
+        core_mask = options.get("core_mask", "all")
+        if type(core_mask) not in {str, int} or (type(core_mask) is int and core_mask < 0):
+            raise BackendLoadError(
+                "RKNN core_mask must be a non-negative integer or supported string name",
+                code="invalid_runtime_options",
+            )
+        if type(core_mask) is str and core_mask.lower() not in {"all", "auto", "0", "1", "2"}:
+            raise BackendLoadError(f"unsupported RKNN core_mask {core_mask!r}", code="invalid_runtime_options")
+        random_seed = options.get("random_seed")
+        if random_seed is not None and type(random_seed) is not int:
+            raise BackendLoadError("RKNN random_seed must be an integer or null", code="invalid_runtime_options")
+        return {"target": target, "core_mask": core_mask, "random_seed": random_seed}
+
+    @staticmethod
+    def _resolve_core_mask(rknn_type: type, value: object) -> int:
+        if type(value) is int:
+            return value
+        names = {
+            "all": "NPU_CORE_ALL",
+            "auto": "NPU_CORE_AUTO",
+            "0": "NPU_CORE_0",
+            "1": "NPU_CORE_1",
+            "2": "NPU_CORE_2",
+        }
+        try:
+            attribute = names[str(value).lower()]
+        except KeyError as exc:
+            raise BackendLoadError(f"unsupported RKNN core_mask {value!r}", code="invalid_runtime_options") from exc
+        try:
+            return int(getattr(rknn_type, attribute))
+        except AttributeError as exc:
+            raise BackendLoadError(
+                f"installed RKNNLite does not expose {attribute}",
+                code="incompatible_dependency",
+            ) from exc
+
+    @staticmethod
+    def _import_rknn_type() -> type:
+        try:
+            module = importlib.import_module("rknnlite.api")
+            return module.RKNNLite
+        except (ImportError, OSError, AttributeError) as exc:
+            raise BackendLoadError(
+                f"RKNNLite dependency 'rknnlite.api.RKNNLite' is unavailable: {exc}",
+                code="missing_dependency",
+            ) from exc
+
+
+def create_backend(context: RuntimeContext) -> RKNNBackend:
+    """Lazy registry factory for RKNNLite execution."""
+
+    deployment = context.deployment
+    if not isinstance(deployment, CompiledDeployment) or deployment.backend != "rknn":
+        raise BackendLoadError("RKNNBackend requires a compiled rknn deployment", code="invalid_deployment")
+    RKNNBackend._validate_runtime_options(context.runtime_options)
+    return RKNNBackend()
