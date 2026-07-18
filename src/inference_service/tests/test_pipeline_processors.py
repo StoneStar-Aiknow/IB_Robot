@@ -41,7 +41,7 @@ def test_local_tokenizer_reference_is_resolved_against_bundle(monkeypatch, tmp_p
         captured.update(kwargs)
         return (lambda inputs: inputs), (lambda action: action)
 
-    factory._get_builtin_policy_config_class = resolve_policy_config
+    factory.get_policy_config_class = resolve_policy_config
     factory.make_pre_post_processors = make_processors
     monkeypatch.setitem(sys.modules, policies.__name__, policies)
     monkeypatch.setitem(sys.modules, factory.__name__, factory)

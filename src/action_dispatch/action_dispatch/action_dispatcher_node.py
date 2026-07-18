@@ -40,6 +40,19 @@ from .topic_executor import TopicExecutor
 _trace = create_trace_logger("ib_trace.dispatch")
 
 
+def _normalize_action_chunk(action_chunk):
+    """Return an action chunk shaped as (steps, action_dim)."""
+    action_chunk_tensor = action_chunk if hasattr(action_chunk, "detach") else torch.from_numpy(action_chunk)
+    action_chunk_np = action_chunk_tensor.detach().cpu().numpy() if hasattr(action_chunk, "detach") else action_chunk
+    if action_chunk_np.ndim == 3 and action_chunk_np.shape[0] == 1:
+        action_chunk_np = action_chunk_np[0]
+        action_chunk_tensor = action_chunk_tensor[0]
+    if action_chunk_np.ndim == 1:
+        action_chunk_np = action_chunk_np.reshape(1, -1)
+        action_chunk_tensor = action_chunk_tensor.reshape(1, -1)
+    return action_chunk_tensor, action_chunk_np
+
+
 class ActionDispatcherNode(Node):
     """
     Simplified action dispatcher.
@@ -416,20 +429,7 @@ class ActionDispatcherNode(Node):
             decode_ms,
         )
         if "action" in batch:
-            action_chunk = batch["action"]
-
-            # Convert to Numpy if it's a Torch Tensor
-            if hasattr(action_chunk, "detach"):
-                action_chunk_tensor = action_chunk
-                action_chunk_np = action_chunk.detach().cpu().numpy()
-            else:
-                action_chunk_tensor = torch.from_numpy(action_chunk)
-                action_chunk_np = action_chunk
-
-            # Reshape to (N, action_dim)
-            if action_chunk_np.ndim == 1:
-                action_chunk_np = action_chunk_np.reshape(1, -1)
-                action_chunk_tensor = action_chunk_tensor.reshape(1, -1)
+            action_chunk_tensor, action_chunk_np = _normalize_action_chunk(batch["action"])
 
             # Calculate actions executed during inference
             current_plan_length = self._get_plan_length()

@@ -124,6 +124,10 @@ class TorchBackend(LifecycleBackend):
         )
 
         bundle_path = str(context.validated_manifest.bundle_root)
+        policy_type = context.policy.policy_type
+        policy_config_resolver = getattr(factory_module, "get_policy_config_class", None)
+        if callable(policy_config_resolver):
+            policy_config_resolver(policy_type)
         policy_config = pretrained_config_type.from_pretrained(bundle_path, local_files_only=True)
         try:
             policy_config.device = deployment.device
@@ -153,7 +157,6 @@ class TorchBackend(LifecycleBackend):
                     "loaded LeRobot policy config does not permit in-memory VLM asset resolution",
                     code="incompatible_policy_config",
                 ) from exc
-        policy_type = context.policy.policy_type
         policy_class = get_policy_class(policy_type)
         policy = policy_class.from_pretrained(
             bundle_path,

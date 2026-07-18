@@ -163,6 +163,7 @@ def generate_action_dispatcher_node(robot_config: dict, control_mode: str, use_s
                 "robot_config_path": str(robot_config_path),
                 "inference_action_server": pipeline.transport.action_server,
                 "inference_reset_service": pipeline.transport.reset_service,
+                "inference_timeout_sec": pipeline.request_timeout,
                 "policy_reset_timeout_sec": executor_config.get("policy_reset_timeout_sec", 2.0),
                 "inference_prompt": executor_config.get("inference_prompt", ""),
                 "navigation_mode": executor_config.get("navigation_mode", False),

@@ -544,6 +544,7 @@ def test_generate_two_pipeline_nodes_and_route_dispatcher_to_selected_pipeline(t
     params = _node_parameters(dispatcher)
     assert params["inference_action_server"] == "/backup/dispatch"
     assert params["inference_reset_service"] == "/backup/reset"
+    assert params["inference_timeout_sec"] == 5.0
 
 
 def test_multiple_pipelines_require_explicit_executor_selection(tmp_path):

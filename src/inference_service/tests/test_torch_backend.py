@@ -136,6 +136,11 @@ def _install_fake_lerobot(monkeypatch, torch_module, calls, *, attention: bool =
         calls["policy_type"] = policy_type
         return FakePolicy
 
+    def get_policy_config_class(policy_type):
+        calls["config_policy_type"] = policy_type
+        calls["config_resolved_before_load"] = "config_path" not in calls
+        return FakeConfig
+
     def make_pre_post_processors(*, policy_cfg, pretrained_path, **kwargs):
         calls["processor_config"] = policy_cfg
         calls["processor_path"] = pretrained_path
@@ -153,6 +158,7 @@ def _install_fake_lerobot(monkeypatch, torch_module, calls, *, attention: bool =
 
     policies_config_module.PreTrainedConfig = FakeConfig
     factory_module.get_policy_class = get_policy_class
+    factory_module.get_policy_config_class = get_policy_config_class
     factory_module.make_pre_post_processors = make_pre_post_processors
     monkeypatch.setitem(sys.modules, "lerobot", lerobot_module)
     monkeypatch.setitem(sys.modules, "lerobot.configs", configs_module)
@@ -189,6 +195,8 @@ def test_torch_backend_loads_original_bundle_and_preserves_native_inference_cont
     assert calls["persisted_device"] == "cuda"
     assert calls["runtime_device"] == "cpu"
     assert calls["policy_type"] == "pi05"
+    assert calls["config_policy_type"] == "pi05"
+    assert calls["config_resolved_before_load"] is True
     assert calls["policy_kwargs"]["config"] is calls["processor_config"]
     assert calls["policy_kwargs"]["local_files_only"] is True
     assert config_path.read_bytes() == original_config
