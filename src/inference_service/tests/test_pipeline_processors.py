@@ -34,14 +34,10 @@ def test_local_tokenizer_reference_is_resolved_against_bundle(monkeypatch, tmp_p
     policies.PreTrainedConfig = FakeConfig
     factory = ModuleType("lerobot.policies.factory")
 
-    def resolve_policy_config(policy_type):
-        captured["resolved_policy_type"] = policy_type
-
     def make_processors(**kwargs):
         captured.update(kwargs)
         return (lambda inputs: inputs), (lambda action: action)
 
-    factory.get_policy_config_class = resolve_policy_config
     factory.make_pre_post_processors = make_processors
     monkeypatch.setitem(sys.modules, policies.__name__, policies)
     monkeypatch.setitem(sys.modules, factory.__name__, factory)
@@ -51,7 +47,6 @@ def test_local_tokenizer_reference_is_resolved_against_bundle(monkeypatch, tmp_p
 
     assert captured["config_path"] == str(bundle.resolve())
     assert captured["local_files_only"] is True
-    assert captured["resolved_policy_type"] == "smolvla"
     assert captured["preprocessor_overrides"] == {
         "device_processor": {"device": "cpu"},
         "tokenizer_processor": {"tokenizer_name": str((bundle / "tokenizer").resolve())},

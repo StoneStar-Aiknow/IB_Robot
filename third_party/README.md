@@ -49,7 +49,6 @@ third_party/
 例如：
 
 - `0001-python-compat-syntax-and-metadata.patch`
-- `0004-openharmony-lazy-import-policy-stack.patch`
 - `0005-compat-add-npu-device-detection.patch`
 - `0011-knowledge-distillation.patch`
 
@@ -70,12 +69,6 @@ third_party/
 - `0003`：为 Python 3.10 回补 `typing.Unpack` 兼容层。
 
 这类 patch 解决的是“能否安装、能否解释执行”的问题，不直接增加业务功能。
-
-#### 平台运行时补丁
-
-- `0004`：为 OpenHarmony 板端推理路径做 lazy import，减少板端运行时依赖压力。
-
-这类 patch 面向特定平台运行时，重点是裁剪不必要的训练期或数据集依赖。
 
 #### 设备能力补丁
 

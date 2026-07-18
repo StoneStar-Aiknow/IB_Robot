@@ -84,12 +84,17 @@ for f in setup.sh setup.bash setup.zsh setup.ps1 local_setup.sh local_setup.bash
     [[ -f "${BUILD_INSTALL}/${f}" ]] && cp -a "${BUILD_INSTALL}/${f}" "${PKG_ROOT}/install/${f}"
 done
 
-# [2] Extract the base pysite
+# [2] Extract the base pysite and dependency syslib
 if [[ -n "${DEPS_ARCHIVE}" ]]; then
-    log_info "Extracting pysite from $(basename "${DEPS_ARCHIVE}")..."
+    log_info "Extracting pysite and syslib from $(basename "${DEPS_ARCHIVE}")..."
     tar xzf "${DEPS_ARCHIVE}" -C "${STAGE_DIR}" ./pysite
     rm -rf "${PKG_ROOT}/pysite"
     mv "${STAGE_DIR}/pysite" "${PKG_ROOT}/pysite"
+    if tar tzf "${DEPS_ARCHIVE}" ./syslib >/dev/null 2>&1; then
+        tar xzf "${DEPS_ARCHIVE}" -C "${STAGE_DIR}" ./syslib
+        cp -a "${STAGE_DIR}/syslib/." "${PKG_ROOT}/syslib/"
+        rm -rf "${STAGE_DIR}/syslib"
+    fi
 else
     log_info "Extracting pysite from skh-run..."
     tar xzf "${SKH_TAR}" -C "${STAGE_DIR}" \
@@ -215,7 +220,8 @@ for rel_path in "${!WRAPPERS[@]}"; do
 #!/system/bin/sh
 export LD_PRELOAD=/sys_prod/robot/out/lib/libpython3.12.so.1.0
 
-RF_LIB=/data/roboframe/pysite/rpds_py.libs:\
+RF_LIB=/data/roboframe/syslib:\
+/data/roboframe/pysite/rpds_py.libs:\
 /sys_prod/robot/out/lib:/sys_prod/robot/install/lib:\
 /data/roboframe/install/ibrobot_msgs/lib:\
 /data/roboframe/install/tensormsg/lib:\
@@ -303,9 +309,10 @@ printf '[4/5] Installing system native libs + patches...\n'
 mount -o remount,rw / 2>/dev/null || true
 mount -o remount,rw /sys_prod 2>/dev/null || true
 
-# Install syslib (libc++, libomp, libjpeg, libintl, etc.)
-cp -a "${DIR}/syslib/"*.so* "${SYS_LIB}/" 2>/dev/null || true
-[ -f "${DIR}/syslib/libiomp5.so" ] && cp "${DIR}/syslib/libiomp5.so" "${SYS_LIB}/"
+# Keep dependency libraries under /data so the release remains self-contained.
+rm -rf "${DEST}/syslib"
+mkdir -p "${DEST}/syslib"
+cp -a "${DIR}/syslib/." "${DEST}/syslib/"
 
 # Create /lib/libintl.so.8 symlink (musl LD_PRELOAD doesn't use LD_LIBRARY_PATH)
 if [ ! -e /lib/libintl.so.8 ]; then

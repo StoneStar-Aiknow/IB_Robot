@@ -40,9 +40,6 @@ class _ProcessorPair:
 
             validated_manifest = context.validated_manifest if isinstance(context, RuntimeContext) else context
             bundle_path = str(validated_manifest.bundle_root)
-            policy_config_resolver = getattr(factory_module, "get_policy_config_class", None)
-            if callable(policy_config_resolver):
-                policy_config_resolver(validated_manifest.policy.policy_type)
             policy_config = pretrained_config_type.from_pretrained(bundle_path, local_files_only=True)
             try:
                 policy_config.device = "cpu"

@@ -125,9 +125,6 @@ class TorchBackend(LifecycleBackend):
 
         bundle_path = str(context.validated_manifest.bundle_root)
         policy_type = context.policy.policy_type
-        policy_config_resolver = getattr(factory_module, "get_policy_config_class", None)
-        if callable(policy_config_resolver):
-            policy_config_resolver(policy_type)
         policy_config = pretrained_config_type.from_pretrained(bundle_path, local_files_only=True)
         try:
             policy_config.device = deployment.device
