@@ -63,8 +63,9 @@ class TensorMsgConverter:
             variant_msg = get_message("ibrobot_msgs/msg/Variant")()
             variant_msg.key = key
 
-            if isinstance(value, Tensor):
-                _fill_variant_from_tensor(variant_msg, value)
+            if isinstance(value, Tensor | np.ndarray):
+                tensor = value if isinstance(value, Tensor) else torch.from_numpy(value)
+                _fill_variant_from_tensor(variant_msg, tensor)
             elif isinstance(value, list) and all(isinstance(x, str) for x in value):
                 variant_msg.type = "string_array"
                 variant_msg.string_array = value
@@ -109,9 +110,7 @@ def _decode_via_names(msg, names: list[str]) -> np.ndarray:
     return np.asarray(out, dtype=np.float32)
 
 
-def _decode_name_value_fields(
-    msg: Any, names: list[str], value_field: str, prefix: str
-) -> np.ndarray:
+def _decode_name_value_fields(msg: Any, names: list[str], value_field: str, prefix: str) -> np.ndarray:
     values: list[float] = []
     msg_names = list(getattr(msg, "name", []))
     msg_values = list(getattr(msg, value_field, []))
@@ -242,7 +241,7 @@ def _dec_image(msg, spec):
         if resize_hw:
             hwc = nearest_resize_any(hwc, int(resize_hw[0]), int(resize_hw[1]))
         hwc_normalized = np.where(np.isfinite(hwc), np.clip(hwc, 0, 50) / 50, hwc)
-        return np.repeat(hwc_normalized, 3, axis=-1).astype(np.float32)
+        return np.ascontiguousarray(np.transpose(np.repeat(hwc_normalized, 3, axis=-1), (2, 0, 1)), dtype=np.float32)
 
     elif enc in ("16uc1", "mono16"):
         data16 = raw.view(np.uint16)
@@ -255,7 +254,7 @@ def _dec_image(msg, spec):
         if resize_hw:
             hwc = nearest_resize_any(hwc, int(resize_hw[0]), int(resize_hw[1]))
         hwc_normalized = np.where(np.isfinite(hwc), np.clip(hwc, 0, 10) / 10, hwc)
-        return np.repeat(hwc_normalized, 3, axis=-1).astype(np.float32)
+        return np.ascontiguousarray(np.transpose(np.repeat(hwc_normalized, 3, axis=-1), (2, 0, 1)), dtype=np.float32)
 
     # Color handling
     if enc in ("rgb8", "bgr8", "8uc3"):
@@ -306,7 +305,7 @@ def _dec_image(msg, spec):
     if resize_hw:
         hwc_rgb = nearest_resize_rgb(hwc_rgb, int(resize_hw[0]), int(resize_hw[1]))
 
-    return hwc_rgb.astype(np.float32) / 255.0
+    return np.ascontiguousarray(np.transpose(hwc_rgb, (2, 0, 1)), dtype=np.float32) / 255.0
 
 
 @register_decoder("sensor_msgs/msg/JointState")

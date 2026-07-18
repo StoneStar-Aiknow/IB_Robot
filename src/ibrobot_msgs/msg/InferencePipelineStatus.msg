@@ -1,0 +1,20 @@
+uint8 ROLE_EDGE=1
+uint8 ROLE_CLOUD=2
+
+std_msgs/Header header
+uint32 protocol_version
+uint8 role
+string pipeline_id
+uint32 manifest_schema_version
+string bundle_digest
+string deployment_name
+string deployment_fingerprint
+InferencePolicySummary policy_summary
+uint64 sequence
+string session_id
+uint64 session_generation
+bool ready
+string runtime_state
+bool reset_supported
+bool cancellation_supported
+InferenceError error

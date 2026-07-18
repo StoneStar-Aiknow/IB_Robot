@@ -291,7 +291,7 @@ def test_read_rosbag_streams_keeps_duplicate_action_specs_separate(monkeypatch):
     monkeypatch.setitem(sys.modules, "rclpy.serialization", fake_serialization)
     monkeypatch.setitem(sys.modules, "rosidl_runtime_py.utilities", fake_utilities)
     monkeypatch.setattr(
-        "robot_config.contract_utils.decode_value",
+        "dataset_tools.policy_eval._decode_contract_value",
         lambda _ros_type, msg, _spec: [1.0, 2.0] if msg == "arm-msg" else [3.0],
     )
 
@@ -317,9 +317,24 @@ def test_read_rosbag_streams_keeps_duplicate_action_specs_separate(monkeypatch):
     assert frames[0].label_action == [1.0, 2.0, 3.0]
 
 
-def test_timestamp_compatibility_rejects_receive_time_policy_node():
-    with pytest.raises(ValueError, match="use_header_time=true"):
-        validate_timestamp_compatibility("header", False)
+def test_timestamp_compatibility_rejects_non_header_contract_streams():
+    with pytest.raises(ValueError, match="stamp_src='header'"):
+        validate_timestamp_compatibility("header", [_Spec("/joint_states")])
+
+
+def test_timestamp_compatibility_accepts_header_stamped_streams():
+    spec = _Spec("/camera/top")
+    spec.stamp_src = "header"
+
+    validate_timestamp_compatibility("contract", [spec])
+
+
+def test_timestamp_compatibility_rejects_bag_timestamp_replay():
+    spec = _Spec("/camera/top")
+    spec.stamp_src = "header"
+
+    with pytest.raises(ValueError, match="bag/receive timestamps"):
+        validate_timestamp_compatibility("bag", [spec])
 
 
 def test_compare_prediction_documents_reports_metrics():

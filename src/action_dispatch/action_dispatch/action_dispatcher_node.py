@@ -40,6 +40,19 @@ from .topic_executor import TopicExecutor
 _trace = create_trace_logger("ib_trace.dispatch")
 
 
+def _normalize_action_chunk(action_chunk):
+    """Return an action chunk shaped as (steps, action_dim)."""
+    action_chunk_tensor = action_chunk if hasattr(action_chunk, "detach") else torch.from_numpy(action_chunk)
+    action_chunk_np = action_chunk_tensor.detach().cpu().numpy() if hasattr(action_chunk, "detach") else action_chunk
+    if action_chunk_np.ndim == 3 and action_chunk_np.shape[0] == 1:
+        action_chunk_np = action_chunk_np[0]
+        action_chunk_tensor = action_chunk_tensor[0]
+    if action_chunk_np.ndim == 1:
+        action_chunk_np = action_chunk_np.reshape(1, -1)
+        action_chunk_tensor = action_chunk_tensor.reshape(1, -1)
+    return action_chunk_tensor, action_chunk_np
+
+
 class ActionDispatcherNode(Node):
     """
     Simplified action dispatcher.
@@ -59,8 +72,9 @@ class ActionDispatcherNode(Node):
         self.declare_parameter("queue_size", 100)
         self.declare_parameter("watermark_threshold", 20)
         self.declare_parameter("control_frequency", 100.0)
-        self.declare_parameter("inference_action_server", "/act_inference_node/DispatchInfer")
-        self.declare_parameter("inference_reset_service", "/act_inference_node/reset_policy_state")
+        self.declare_parameter("inference_action_server", "/inference/policy/dispatch")
+        self.declare_parameter("inference_reset_service", "/inference/policy/reset")
+        self.declare_parameter("inference_prompt", "")
         self.declare_parameter("policy_reset_timeout_sec", 2.0)
         # Safety net: if an inference goal never completes (server hiccup, dropped
         # response, or a goal abandoned across a stop/start), abandon it after this
@@ -339,6 +353,7 @@ class ActionDispatcherNode(Node):
 
         goal = DispatchInfer.Goal()
         goal.obs_timestamp = self.get_clock().now().to_msg()
+        goal.prompt = self.get_parameter("inference_prompt").value
         goal.inference_id = self._current_request_id
 
         _trace.info(
@@ -414,20 +429,7 @@ class ActionDispatcherNode(Node):
             decode_ms,
         )
         if "action" in batch:
-            action_chunk = batch["action"]
-
-            # Convert to Numpy if it's a Torch Tensor
-            if hasattr(action_chunk, "detach"):
-                action_chunk_tensor = action_chunk
-                action_chunk_np = action_chunk.detach().cpu().numpy()
-            else:
-                action_chunk_tensor = torch.from_numpy(action_chunk)
-                action_chunk_np = action_chunk
-
-            # Reshape to (N, action_dim)
-            if action_chunk_np.ndim == 1:
-                action_chunk_np = action_chunk_np.reshape(1, -1)
-                action_chunk_tensor = action_chunk_tensor.reshape(1, -1)
+            action_chunk_tensor, action_chunk_np = _normalize_action_chunk(batch["action"])
 
             # Calculate actions executed during inference
             current_plan_length = self._get_plan_length()

@@ -45,7 +45,8 @@ The board runtime bundle must be produced by the official script, not by manuall
 2. Always use `scripts/openharmony/build_roboframe_oh.sh` as the build entry.
 3. The final runtime bundle must include the OpenHarmony lerobot patch stack from:
    `third_party/patches/lerobot/<active_tag>/series.openharmony-5.1.0-musl.txt`
-4. Fail closed if the staged `install/lerobot/src` is not the lazy-import version.
+4. Fail closed if the staged `install/lerobot/src` is missing upstream policy
+   config or processor registration imports.
 5. Prefer building from a `/tmp` working copy when the user wants to keep the main tree untouched, but rely on the script's own fallback clone logic for `libs/lerobot` runtime staging.
 
 ## Required Host Inputs
@@ -88,7 +89,8 @@ The build output must include all of the following:
 
 - `Post-processing OpenHarmony runtime bundle...`
 - `Preparing OpenHarmony-patched LeRobot runtime staging tree...`
-- `Applying OpenHarmony lerobot runtime patch 0004-openharmony-lazy-import-policy-stack.patch...`
+- `Applying OpenHarmony lerobot runtime patch 0009-adaptive-weight-prerequisites.patch...`
+- `Applying OpenHarmony lerobot runtime patch 0011-knowledge-distillation.patch...`
 
 If these lines are missing, the build is not complete.
 
@@ -100,13 +102,13 @@ Check these files:
 
 - `install/lerobot/src/lerobot/policies/__init__.py`
 - `install/lerobot/src/lerobot/policies/factory.py`
-- `install/lerobot/src/lerobot/optim/optimizers.py`
+- `install/lerobot/src/lerobot/policies/pi05/__init__.py`
 
-They must show lazy-import behavior, for example:
+They must preserve upstream registration behavior, for example:
 
-- `_LAZY_EXPORTS` in `policies/__init__.py`
-- `_get_builtin_policy_config_class` in `policies/factory.py`
-- no top-level `from lerobot.datasets...` eager import path in `optimizers.py`
+- `PI0FastConfig` is imported by `policies/__init__.py`
+- `SmolVLANewLineProcessor` is imported by `policies/__init__.py`
+- `processor_pi05` is imported by `policies/pi05/__init__.py`
 
 If these checks fail, stop and fix the build pipeline. Do not patch board files by hand.
 
@@ -148,12 +150,13 @@ Symptoms include:
 
 Likely cause:
 
-- OpenHarmony lazy-import patch did not enter the deployed runtime tree
+- The dependencies archive is incomplete or the staged upstream LeRobot tree
+  is inconsistent
 
 Correct action:
 
 - rebuild with the official script
-- verify patched `install/lerobot/src`
+- verify staged `install/lerobot/src`
 - redeploy the rebuilt `install/` tree
 
 ### Case 3: stale build cache after install prefix change

@@ -175,8 +175,8 @@ ros2 run action_dispatch action_dispatcher_node
 | `queue_size` | int | 100 | 动作队列最大长度 |
 | `watermark_threshold` | int | 20 | 触发推理的水位线阈值 |
 | `control_frequency` | double | 100.0 | 控制频率 (Hz) |
-| `inference_action_server` | string | `/act_inference_node/DispatchInfer` | 推理服务 Action 名称 |
-| `inference_reset_service` | string | `/act_inference_node/reset_policy_state` | 推理侧 policy 重置服务名；reset 时 best-effort 调用 |
+| `inference_action_server` | string | `/inference/policy/dispatch` | 命名 pipeline 的推理 Action；robot_config 会按 `executor.inference_pipeline` 覆盖 |
+| `inference_reset_service` | string | `/inference/policy/reset` | 命名 pipeline 的 reset 服务；reset 时 best-effort 调用 |
 | `policy_reset_timeout_sec` | double | 2.0 | 等待推理侧 policy 重置完成的最长时间 |
 | `contract_path` | string | `''` | Contract 文件路径 |
 | `joint_state_topic` | string | `/joint_states` | 关节状态话题 |
@@ -414,7 +414,7 @@ control_modes:
 
 | 方向 | 话题/Action | 消息类型 | 说明 |
 |------|-------------|----------|------|
-| 请求 | `/act_inference_node/DispatchInfer` | `ibrobot_msgs/action/DispatchInfer` | 发送推理请求 |
+| 请求 | `/inference/policy/dispatch` | `ibrobot_msgs/action/DispatchInfer` | 向默认 `policy` pipeline 发送推理请求；实际 endpoint 可由 robot_config 覆盖 |
 | 响应 | `result.action_chunk` | `ibrobot_msgs/msg/VariantsList` | 接收动作块 (Tensor) |
 
 ### 发布话题

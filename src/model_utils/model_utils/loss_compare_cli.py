@@ -18,8 +18,7 @@ moving all the *ergonomics* here:
 - **Wizard**: on first use (no config / no _last) or ``--init`` it prompts each
   field with its meaning + example + default, then offers to save a profile.
 
-Backward compatible: every historical explicit flag still works and overrides
-whatever a profile/derivation would supply.
+Inference selection uses a named deployment from ``inference_manifest.json``.
 """
 
 from __future__ import annotations
@@ -89,26 +88,16 @@ class Param:
 # ---------------------------------------------------------------------------
 PARAMS: list[Param] = [
     Param(
-        dest="policy_type",
-        cli="--policy_type",
-        meaning="Policy model type (auto-detected from config; this is a fallback hint)",
-        example="pi05",
-        default="act",
-        choices=["act", "pi05"],
-        in_wizard=False,  # auto-detected, no need to ask user
-    ),
-    Param(
-        dest="device",
-        cli="--device",
-        meaning="Inference backend: cpu/cuda/npu for torch, ascend_om for OM offline models",
-        example="ascend_om",
+        dest="deployment",
+        cli="--deployment",
+        meaning="Named deployment from the policy bundle inference_manifest.json",
+        example="ascend",
         default="cpu",
-        choices=["cpu", "cuda", "npu", "ascend_om", "ascend_om_3403", "rknn"],
     ),
     Param(
         dest="policy_path",
         cli="--policy_path",
-        meaning="Policy model directory: must contain config.json (+ config.om.json and .om files for OM)",
+        meaning="Policy bundle directory: must contain config.json and inference_manifest.json for compiled runtimes",
         required_for_run=True,
     ),
     Param(
@@ -132,7 +121,7 @@ PARAMS: list[Param] = [
     Param(
         dest="model_dtype",
         cli="--model_dtype",
-        meaning="Torch backend only: cast model dtype (compiled backends use their fixed dtype)",
+        meaning="Optional model dtype requested from the selected deployment; unsupported deployments reject it",
         example="native",
         default="native",
         choices=["native", "fp16", "bf16", "fp32"],
@@ -147,7 +136,7 @@ PARAMS: list[Param] = [
         type=int,
     ),
     # The three long paths below are normally derived from --exp-dir; kept as
-    # explicit overrides for backward compatibility / non-standard layouts.
+    # explicit overrides for non-standard layouts.
     Param(
         dest="target_path",
         cli="--target_path",
@@ -481,8 +470,7 @@ def print_effective(resolved: ResolvedConfig) -> None:
     src = resolved.sources
     print("[loss_compare] effective params (source):")
     order = [
-        "device",
-        "policy_type",
+        "deployment",
         "policy_path",
         "exp_dir",
         "target_path",

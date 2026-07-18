@@ -540,7 +540,6 @@ robot:
         - gripper_position_controller
       inference:
         enabled: false
-        force_disable: true
 
   teleoperation:
     enabled: true

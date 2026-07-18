@@ -18,7 +18,7 @@ import argparse
 import json
 import os
 import random
-import shutil
+import re
 import sys
 from pathlib import Path
 
@@ -27,6 +27,17 @@ import onnx
 import torch
 import torch.nn as nn
 from onnxsim import simplify
+
+from model_utils.inference_manifest_export import (
+    RuntimeABI,
+    RuntimeTensor,
+    artifact_bindings,
+    compiled_deployment,
+    copy_policy_metadata_bundle,
+    package_deployment_artifact,
+    read_runtime_abi,
+    upsert_deployment,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_LEROBOT_SRC = REPO_ROOT / "libs" / "lerobot" / "src"
@@ -250,6 +261,247 @@ def simplify_onnx(onnx_file, simplified_file, input_shapes):
     onnx.save(model_simplified, str(simplified_file))
 
 
+def write_smolvla_rknn_deployment(
+    bundle_root: str | Path,
+    config: dict,
+    *,
+    vision_rknn: str | Path,
+    vision_abi_path: str | Path,
+    prefill_rknn: str | Path,
+    prefill_abi_path: str | Path,
+    action_rknn: str | Path,
+    action_abi_path: str | Path,
+    embedding_path: str | Path,
+    state_projection_path: str | Path,
+    deployment_name: str = "rknn",
+    target_soc: str = "rk3588",
+    target_runtime: str = "rknn-lite2",
+) -> Path:
+    """Package compiler-introspected SmolVLA RKNN modules into the unified manifest."""
+
+    if str(config.get("type", "")).lower() != "smolvla":
+        raise ValueError("SmolVLA RKNN packaging requires policy type 'smolvla'")
+    cameras = [
+        semantic
+        for semantic, feature in config.get("input_features", {}).items()
+        if isinstance(feature, dict) and str(feature.get("type", "")).upper() == "VISUAL"
+    ]
+    if not cameras:
+        raise ValueError("SmolVLA RKNN packaging requires at least one VISUAL input feature")
+
+    vision_abi = read_runtime_abi(vision_abi_path)
+    prefill_abi = read_runtime_abi(prefill_abi_path)
+    action_abi = read_runtime_abi(action_abi_path)
+    _validate_smolvla_rknn_abis(config, cameras, vision_abi, prefill_abi, action_abi)
+
+    root = Path(bundle_root).expanduser().resolve(strict=True)
+    execution: list[str] = []
+    artifacts: dict[str, tuple[Path, str]] = {}
+    bindings = {}
+    image_semantics: list[str] = []
+    for camera in cameras:
+        role = _vision_role(camera)
+        image_semantic = f"internal.image_embedding.{role.removeprefix('vision_')}"
+        execution.append(role)
+        image_semantics.append(image_semantic)
+        artifacts[role] = (
+            package_deployment_artifact(
+                root,
+                vision_rknn,
+                backend="rknn",
+                deployment_name=deployment_name,
+                role=role,
+                force_copy=True,
+            ),
+            "rknn",
+        )
+        bindings[role] = artifact_bindings(
+            vision_abi,
+            input_semantics={vision_abi.inputs[0].name: camera},
+            output_semantics={vision_abi.outputs[0].name: image_semantic},
+        )
+
+    embedding_artifact = package_deployment_artifact(
+        root,
+        embedding_path,
+        backend="rknn",
+        deployment_name=deployment_name,
+        role="embedding",
+    )
+    state_projection_artifact = package_deployment_artifact(
+        root,
+        state_projection_path,
+        backend="rknn",
+        deployment_name=deployment_name,
+        role="state_projection",
+    )
+    prefill_artifact = package_deployment_artifact(
+        root,
+        prefill_rknn,
+        backend="rknn",
+        deployment_name=deployment_name,
+        role="prefill",
+    )
+    action_artifact = package_deployment_artifact(
+        root,
+        action_rknn,
+        backend="rknn",
+        deployment_name=deployment_name,
+        role="action",
+    )
+    artifacts.update(
+        {
+            "embedding": (embedding_artifact, "pt"),
+            "prefill": (prefill_artifact, "rknn"),
+            "action": (action_artifact, "rknn"),
+            "state_projection": (state_projection_artifact, "pt"),
+        }
+    )
+
+    prefix_embeddings, attention_mask, position_ids = prefill_abi.inputs
+    noise, time_value, prefix_pad_masks, *action_cache_inputs = action_abi.inputs
+    embedding_abi = RuntimeABI(
+        inputs=tuple(
+            RuntimeTensor(f"image_{index}", index, vision_abi.outputs[0].dtype, vision_abi.outputs[0].shape)
+            for index in range(len(cameras))
+        )
+        + (
+            RuntimeTensor("tokens", len(cameras), "int64", (1, int(config["tokenizer_max_length"]))),
+            RuntimeTensor(
+                "language_mask",
+                len(cameras) + 1,
+                "bool",
+                (1, int(config["tokenizer_max_length"])),
+            ),
+            RuntimeTensor("state", len(cameras) + 2, "float32", (1, int(config["max_state_dim"]))),
+        ),
+        outputs=(
+            RuntimeTensor("prefix_embeddings", 0, prefix_embeddings.dtype, prefix_embeddings.shape),
+            RuntimeTensor("prefix_pad_masks", 1, prefix_pad_masks.dtype, prefix_pad_masks.shape),
+            RuntimeTensor("attention_mask", 2, attention_mask.dtype, attention_mask.shape),
+            RuntimeTensor("position_ids", 3, position_ids.dtype, position_ids.shape),
+        ),
+    )
+    embedding_input_semantics = {f"image_{index}": semantic for index, semantic in enumerate(image_semantics)}
+    embedding_input_semantics.update(
+        {
+            "tokens": "observation.language.tokens",
+            "language_mask": "observation.language.attention_mask",
+            "state": "observation.state",
+        }
+    )
+    bindings["embedding"] = artifact_bindings(
+        embedding_abi,
+        input_semantics=embedding_input_semantics,
+        output_semantics={
+            "prefix_embeddings": "internal.prefix_embeddings",
+            "prefix_pad_masks": "internal.prefix_pad_masks",
+            "attention_mask": "internal.attention_mask",
+            "position_ids": "internal.position_ids",
+        },
+    )
+    cache_semantics = {_cache_name(tensor.name): _cache_semantic(tensor.name) for tensor in prefill_abi.outputs}
+    bindings["prefill"] = artifact_bindings(
+        prefill_abi,
+        input_semantics={
+            prefix_embeddings.name: "internal.prefix_embeddings",
+            attention_mask.name: "internal.attention_mask",
+            position_ids.name: "internal.position_ids",
+        },
+        output_semantics=cache_semantics,
+    )
+    action_input_semantics = {
+        noise.name: "noise",
+        time_value.name: "time",
+        prefix_pad_masks.name: "internal.prefix_pad_masks",
+    }
+    action_input_semantics.update(
+        {_cache_name(tensor.name): _cache_semantic(tensor.name) for tensor in action_cache_inputs}
+    )
+    bindings["action"] = artifact_bindings(
+        action_abi,
+        input_semantics=action_input_semantics,
+        output_semantics={action_abi.outputs[0].name: "action"},
+    )
+    execution.extend(("embedding", "prefill", "action"))
+    deployment = compiled_deployment(
+        root,
+        backend="rknn",
+        target_soc=target_soc,
+        target_runtime=target_runtime,
+        artifacts=artifacts,
+        execution=execution,
+        bindings=bindings,
+    )
+    return upsert_deployment(root, deployment_name, deployment).manifest_path
+
+
+def _validate_smolvla_rknn_abis(
+    config: dict,
+    cameras: list[str],
+    vision_abi: RuntimeABI,
+    prefill_abi: RuntimeABI,
+    action_abi: RuntimeABI,
+) -> None:
+    if len(vision_abi.inputs) != 1 or len(vision_abi.outputs) != 1:
+        raise ValueError("SmolVLA vision RKNN ABI requires exactly one input and one output")
+    if vision_abi.inputs[0].layout not in {"NCHW", "NHWC"}:
+        raise ValueError("SmolVLA vision RKNN ABI must declare NCHW or NHWC input layout")
+    if tuple(tensor.name for tensor in prefill_abi.inputs) != ("prefix_embs", "attention_mask", "position_ids"):
+        raise ValueError("SmolVLA prefill RKNN ABI inputs must be prefix_embs, attention_mask, position_ids")
+    for key in ("tokenizer_max_length", "max_state_dim", "chunk_size", "max_action_dim"):
+        value = config.get(key)
+        if type(value) is not int or value < 1:
+            raise ValueError(f"SmolVLA config requires positive integer {key!r}")
+    cache_names = tuple(tensor.name for tensor in prefill_abi.outputs)
+    if not cache_names or cache_names != tuple(build_cache_output_names(len(cache_names) // 2)):
+        raise ValueError("SmolVLA prefill RKNN ABI must expose interleaved past_key_N/past_value_N outputs")
+    expected_action_inputs = ("x_t", "timestep", "prefix_pad_masks", *cache_names)
+    action_inputs = tuple(tensor.name for tensor in action_abi.inputs)
+    if action_inputs != expected_action_inputs:
+        if action_inputs[:1] == ("past_kv_tensor",):
+            raise ValueError(
+                "Legacy flattened-KV SmolVLA action RKNN is unsupported; rebuild the segmented action model"
+            )
+        raise ValueError(f"SmolVLA action RKNN ABI inputs must be {list(expected_action_inputs)}")
+    if len(action_abi.outputs) != 1 or action_abi.outputs[0].name != "v_t":
+        raise ValueError("SmolVLA action RKNN ABI must expose exactly one output named 'v_t'")
+
+    image_tokens = vision_abi.outputs[0].shape[1]
+    hidden_size = vision_abi.outputs[0].shape[-1]
+    tokenizer_length = int(config["tokenizer_max_length"])
+    expected_prefix = len(cameras) * image_tokens + tokenizer_length + 1
+    if prefill_abi.inputs[0].shape != (1, expected_prefix, hidden_size):
+        raise ValueError(
+            f"SmolVLA prefill prefix ABI must be (1, {expected_prefix}, {hidden_size}), "
+            f"got {prefill_abi.inputs[0].shape}"
+        )
+    if action_abi.inputs[2].shape != (1, expected_prefix):
+        raise ValueError(f"SmolVLA action prefix_pad_masks ABI must be (1, {expected_prefix})")
+    expected_action = (1, int(config["chunk_size"]), int(config["max_action_dim"]))
+    if action_abi.inputs[0].shape != expected_action or action_abi.outputs[0].shape != expected_action:
+        raise ValueError(f"SmolVLA noise and action RKNN ABI must use shape {expected_action}")
+
+
+def _vision_role(camera_semantic: str) -> str:
+    suffix = camera_semantic.removeprefix("observation.images.")
+    normalized = re.sub(r"[^A-Za-z0-9_.-]+", "_", suffix).strip("_.-")
+    if not normalized:
+        raise ValueError(f"Cannot derive a vision role from camera semantic {camera_semantic!r}")
+    return f"vision_{normalized}"
+
+
+def _cache_name(name: str) -> str:
+    if not re.fullmatch(r"past_(?:key|value)_\d+", name):
+        raise ValueError(f"Invalid SmolVLA cache tensor name {name!r}")
+    return name
+
+
+def _cache_semantic(name: str) -> str:
+    prefix, kind, index = name.split("_", 2)
+    return f"internal.{prefix}_{kind}.{index}"
+
+
 # ── Main export ────────────────────────────────────────────────────────────
 
 
@@ -264,7 +516,6 @@ def export_all(args):
     config = flow_model.config
 
     image_h, image_w = args.image_height, args.image_width
-    prefix_length = args.prefix_length
     chunk_size = config.chunk_size
     max_action_dim = config.max_action_dim
     num_layers = vlm_with_expert.num_vlm_layers
@@ -274,7 +525,6 @@ def export_all(args):
     head_dim = text_config.head_dim
 
     print(f"Device: {device}, dtype: {export_dtype}")
-    print(f"Image: {image_h}x{image_w}, prefix_length: {prefix_length}")
     print(f"num_layers: {num_layers}, kv_heads: {num_kv_heads}, head_dim: {head_dim}")
     print(f"chunk_size: {chunk_size}, max_action_dim: {max_action_dim}")
 
@@ -293,10 +543,25 @@ def export_all(args):
         image_embeddings = vision_model(dummy_pixel)
     print(f"  image_embeddings shape: {image_embeddings.shape}")
     n_image_tokens = image_embeddings.shape[1]
+    camera_count = len(config.image_features)
+    derived_prefix_length = camera_count * n_image_tokens + config.tokenizer_max_length + 1
+    prefix_length = args.prefix_length if args.prefix_length is not None else derived_prefix_length
+    if prefix_length != derived_prefix_length:
+        raise ValueError(
+            f"--prefix_length={prefix_length} does not match camera/token ABI-derived length {derived_prefix_length}"
+        )
+    print(f"Image: {image_h}x{image_w}, prefix_length: {prefix_length}")
 
     vision_onnx = onnx_dir / "smolvla_vision.onnx"
     vision_simp = onnx_dir / "smolvla_vision_simp.onnx"
-    export_onnx(vision_model, dummy_pixel, vision_onnx, ["pixel_values"], ["image_embeddings"])
+    export_onnx(
+        vision_model,
+        dummy_pixel,
+        vision_onnx,
+        ["pixel_values"],
+        ["image_embeddings"],
+        opset=args.opset,
+    )
     simplify_onnx(vision_onnx, vision_simp, {"pixel_values": [1, 3, image_h, image_w]})
 
     # ── Token embedding (CPU) ──
@@ -308,6 +573,13 @@ def export_all(args):
         emb_file,
     )
     print(f"  Saved: {emb_file}")
+
+    state_projection_file = out_dir / "state_projection.pt"
+    torch.save(
+        {k: v.detach().cpu() for k, v in flow_model.state_proj.state_dict().items()},
+        state_projection_file,
+    )
+    print(f"  Saved: {state_projection_file}")
 
     # ── Prefill ──
     print("\n=== Prefill module ===")
@@ -334,6 +606,7 @@ def export_all(args):
         prefill_onnx,
         prefill_names_in,
         prefill_names_out,
+        opset=args.opset,
     )
     simplify_onnx(
         prefill_onnx,
@@ -365,6 +638,7 @@ def export_all(args):
         action_onnx,
         action_names_in,
         ["v_t"],
+        opset=args.opset,
     )
     action_shapes = {
         "x_t": list(x_t.shape),
@@ -375,22 +649,11 @@ def export_all(args):
         action_shapes[name] = list(tensor.shape)
     simplify_onnx(action_onnx, action_simp, action_shapes)
 
-    # Runtime artifact paths (relative to manifest dir). The .rknn files are
-    # produced by the subsequent convert_to_rknn.py step; the embedding is
-    # already saved above. load_compiled_manifest requires this map and
-    # SmolVLARKNNRuntimeSession.load resolves each via require_artifact.
-    rknn_artifacts = {
-        "vision": "onnx/smolvla_vision.rknn",
-        "prefill": "onnx/smolvla_prefill.rknn",
-        "action": "onnx/smolvla_action.rknn",
-        "embedding": "token_embedding.pt",
-    }
-
-    # ── Meta info + config.rknn.json ──
+    # ── Export metadata (not a runtime manifest) ──
     meta = {
+        "schema_version": 1,
         "policy_type": "smolvla",
-        "backend": "rknn",
-        "execution": ["vision", "prefill", "action"],
+        "kind": "smolvla-rknn-export-metadata",
         "model_path": args.model_path,
         "image_height": image_h,
         "image_width": image_w,
@@ -403,19 +666,6 @@ def export_all(args):
         "chunk_size": chunk_size,
         "max_action_dim": max_action_dim,
         "cache_shape_per_tensor": cache_shape,
-        # Runtime artifact map consumed by load_compiled_manifest. Roles must
-        # match SmolVLARKNNRuntimeSession.load's require_artifact calls.
-        "artifacts": rknn_artifacts,
-        # Architecture params read by SmolVLARKNNRuntimeSession.load and merged
-        # into the _PI05ConfigView so SmolVLARKNNModel picks up real values
-        # instead of getattr fallback defaults.
-        "backend_config": {
-            "num_layers": num_layers,
-            "prefix_length": prefix_length,
-            "prefix_hidden_size": prefix_hidden_size,
-            "num_key_value_heads": num_kv_heads,
-            "head_dim": head_dim,
-        },
         "modules": {
             "vision": {
                 "onnx": "onnx/smolvla_vision_simp.onnx",
@@ -441,6 +691,7 @@ def export_all(args):
             },
         },
         "embedding": "token_embedding.pt",
+        "state_projection": "state_projection.pt",
         "notes": [
             "3-module RKNN split mirroring HMM architecture.",
             "vision: pixel_values → image_embeddings (NPU)",
@@ -450,19 +701,18 @@ def export_all(args):
             "Denoise loop (num_steps=10) runs on host CPU, calling action NPU each step.",
         ],
     }
-    meta_file = out_dir / "config.rknn.json"
+    meta_file = out_dir / "smolvla_rknn_export.json"
     with open(meta_file, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2, ensure_ascii=False)
     print(f"\n=== Meta info saved: {meta_file} ===")
 
-    # Copy config.json for inference_service
-    src_config = Path(args.model_path) / "config.json"
-    if src_config.exists():
-        shutil.copyfile(src_config, out_dir / "config.json")
+    copied = copy_policy_metadata_bundle(args.model_path, out_dir)
+    print(f"  Copied {len(copied)} required LeRobot semantic files")
 
     print(f"\nDone! Output: {out_dir}")
     print(f"  ONNX files: {onnx_dir}")
     print(f"  Token embedding: {emb_file}")
+    print(f"  State projection: {state_projection_file}")
     print(f"  Config: {meta_file}")
     print("\nNext: convert each ONNX to RKNN:")
     print("  .venv-rknn/bin/python .agents/skills/rknn-convert/convert_to_rknn.py \\")
@@ -471,6 +721,31 @@ def export_all(args):
     print(f"    --onnx {onnx_dir}/smolvla_prefill_simp.onnx --output {onnx_dir}/smolvla_prefill.rknn --mode float16")
     print("  .venv-rknn/bin/python .agents/skills/rknn-convert/convert_to_rknn.py \\")
     print(f"    --onnx {onnx_dir}/smolvla_action_simp.onnx --output {onnx_dir}/smolvla_action.rknn --mode float16")
+    print("Then package the compiler-emitted *.abi.json files with package-compiled-deployment.")
+
+
+def _package_existing(args) -> None:
+    out_dir = Path(args.output_dir).expanduser().resolve()
+    copy_policy_metadata_bundle(args.model_path, out_dir)
+    with (out_dir / "config.json").open(encoding="utf-8") as stream:
+        config = json.load(stream)
+    onnx_dir = out_dir / "onnx"
+    manifest_path = write_smolvla_rknn_deployment(
+        out_dir,
+        config,
+        vision_rknn=args.vision_rknn or onnx_dir / "smolvla_vision.rknn",
+        vision_abi_path=args.vision_abi or onnx_dir / "smolvla_vision.rknn.abi.json",
+        prefill_rknn=args.prefill_rknn or onnx_dir / "smolvla_prefill.rknn",
+        prefill_abi_path=args.prefill_abi or onnx_dir / "smolvla_prefill.rknn.abi.json",
+        action_rknn=args.action_rknn or onnx_dir / "smolvla_action.rknn",
+        action_abi_path=args.action_abi or onnx_dir / "smolvla_action.rknn.abi.json",
+        embedding_path=out_dir / "token_embedding.pt",
+        state_projection_path=out_dir / "state_projection.pt",
+        deployment_name=args.deployment,
+        target_soc=args.target_soc,
+        target_runtime=args.target_runtime,
+    )
+    print(f"Unified manifest: {manifest_path}")
 
 
 if __name__ == "__main__":
@@ -481,7 +756,21 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--image_height", type=int, default=512)
     parser.add_argument("--image_width", type=int, default=512)
-    parser.add_argument("--prefix_length", type=int, default=177, help="Prefix sequence length")
+    parser.add_argument("--prefix_length", type=int, default=None, help="Prefix sequence length (default: derive)")
     parser.add_argument("--opset", type=int, default=17)
     parser.add_argument("--seed", type=int, default=42)
-    export_all(parser.parse_args())
+    parser.add_argument("--package_only", action="store_true", help="Package existing RKNN compiler outputs only")
+    parser.add_argument("--deployment", default="rknn", help="Unified manifest deployment name")
+    parser.add_argument("--target_soc", default="rk3588")
+    parser.add_argument("--target_runtime", default="rknn-lite2")
+    parser.add_argument("--vision_rknn", default=None)
+    parser.add_argument("--vision_abi", default=None)
+    parser.add_argument("--prefill_rknn", default=None)
+    parser.add_argument("--prefill_abi", default=None)
+    parser.add_argument("--action_rknn", default=None)
+    parser.add_argument("--action_abi", default=None)
+    parsed = parser.parse_args()
+    if parsed.package_only:
+        _package_existing(parsed)
+    else:
+        export_all(parsed)

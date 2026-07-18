@@ -25,7 +25,7 @@ class RecordCLI(Node):
         super().__init__("record_cli")
 
         self.declare_parameter("dispatcher_reset_service", "/action_dispatcher/reset")
-        self.declare_parameter("policy_reset_service", "/act_inference_node/reset_policy_state")
+        self.declare_parameter("policy_reset_service", "/inference/policy/reset")
         self.declare_parameter("reset_timeout_sec", 2.0)
         self.declare_parameter("control_mode", "teleop")
         self.declare_parameter("reset_before_episode", "auto")

@@ -1,0 +1,284 @@
+"""Typed, hardware-independent models for unified inference manifests."""
+
+from __future__ import annotations
+
+import re
+from typing import Annotated, Literal, TypeAlias
+
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
+
+from inference_manifest.paths import normalize_bundle_path
+
+_ROLE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+_DEPLOYMENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def _validate_sha256(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError("must be a lowercase 64-character SHA-256 digest")
+    return value
+
+
+def _validate_role(value: str) -> str:
+    if not _ROLE_PATTERN.fullmatch(value):
+        raise ValueError("must start with a letter and contain only letters, digits, '.', '_', or '-'")
+    return value
+
+
+def _validate_shape(value: tuple[int, ...]) -> tuple[int, ...]:
+    if not value:
+        raise ValueError("must contain at least one dimension")
+    if any(dimension == 0 or dimension < -1 for dimension in value):
+        raise ValueError("dimensions must be positive integers or -1 for dynamic dimensions")
+    return value
+
+
+def _is_image_semantic(semantic: str) -> bool:
+    return (
+        semantic == "observation.image"
+        or semantic.startswith("observation.image.")
+        or semantic.startswith("observation.images.")
+    )
+
+
+StrictString: TypeAlias = Annotated[str, StringConstraints(strict=True, min_length=1)]
+BundlePath: TypeAlias = Annotated[
+    str,
+    StringConstraints(strict=True, min_length=1),
+    AfterValidator(normalize_bundle_path),
+]
+Sha256: TypeAlias = Annotated[
+    str,
+    StringConstraints(strict=True, min_length=64, max_length=64),
+    AfterValidator(_validate_sha256),
+]
+ExecutionRole: TypeAlias = Annotated[
+    str,
+    StringConstraints(strict=True, min_length=1),
+    AfterValidator(_validate_role),
+]
+TensorShape: TypeAlias = Annotated[tuple[int, ...], AfterValidator(_validate_shape)]
+TensorDType: TypeAlias = Literal[
+    "bool",
+    "uint8",
+    "int8",
+    "int16",
+    "int32",
+    "int64",
+    "float16",
+    "bfloat16",
+    "float32",
+    "float64",
+]
+
+
+class StrictFrozenModel(BaseModel):
+    """Base class that rejects coercion and unknown fields."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+class Digest(StrictFrozenModel):
+    algorithm: Literal["sha256"]
+    value: Sha256
+
+
+class BundleFile(StrictFrozenModel):
+    path: BundlePath
+    sha256: Sha256
+
+
+class ManifestBundle(StrictFrozenModel):
+    name: StrictString
+    files: tuple[BundleFile, ...] = Field(min_length=1)
+    digest: Digest
+
+    @model_validator(mode="after")
+    def validate_unique_paths(self) -> ManifestBundle:
+        paths = [entry.path for entry in self.files]
+        if len(paths) != len(set(paths)):
+            raise ValueError("bundle.files contains duplicate paths")
+        return self
+
+
+class DeploymentTarget(StrictFrozenModel):
+    soc: StrictString
+    runtime: StrictString
+
+
+class DeploymentArtifact(StrictFrozenModel):
+    path: BundlePath
+    format: StrictString
+    sha256: Sha256
+
+
+class TensorBinding(StrictFrozenModel):
+    semantic: StrictString
+    runtime_name: StrictString | None = None
+    index: int | None = Field(default=None, ge=0)
+    dtype: TensorDType
+    shape: TensorShape
+    layout: Literal["NCHW", "NHWC"] | None = None
+
+    @model_validator(mode="after")
+    def validate_runtime_slot_and_layout(self) -> TensorBinding:
+        if self.runtime_name is None and self.index is None:
+            raise ValueError("a tensor binding requires runtime_name, index, or both")
+        if _is_image_semantic(self.semantic):
+            if self.layout is None:
+                raise ValueError(f"image semantic {self.semantic!r} requires NCHW or NHWC layout")
+        elif self.layout is not None:
+            raise ValueError(f"non-image semantic {self.semantic!r} must omit layout")
+        return self
+
+
+class ArtifactBindings(StrictFrozenModel):
+    inputs: tuple[TensorBinding, ...] = Field(min_length=1)
+    outputs: tuple[TensorBinding, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique_slots(self) -> ArtifactBindings:
+        for direction, bindings in (("inputs", self.inputs), ("outputs", self.outputs)):
+            semantics = [binding.semantic for binding in bindings]
+            if len(semantics) != len(set(semantics)):
+                raise ValueError(f"{direction} contains duplicate semantic bindings")
+
+            runtime_names = [binding.runtime_name for binding in bindings if binding.runtime_name is not None]
+            if len(runtime_names) != len(set(runtime_names)):
+                raise ValueError(f"{direction} contains duplicate runtime_name values")
+
+            indices = [binding.index for binding in bindings if binding.index is not None]
+            if len(indices) != len(set(indices)):
+                raise ValueError(f"{direction} contains duplicate runtime indices")
+            if indices and len(indices) != len(bindings):
+                raise ValueError(f"{direction} must declare indices for every binding or omit them from every binding")
+            if direction == "inputs" and indices and sorted(indices) != list(range(len(indices))):
+                raise ValueError(f"{direction} runtime indices must be contiguous and start at zero")
+        return self
+
+
+class DeviceLink(StrictFrozenModel):
+    semantic: Annotated[str, StringConstraints(strict=True, pattern=r"^internal\.[A-Za-z0-9_.-]+$")]
+    producer: ExecutionRole
+    consumer: ExecutionRole
+    producer_binding: Literal["output", "input"] = "output"
+    transport: Literal["device_pointer"]
+    owner: Literal["producer", "consumer"]
+    lifetime: Literal["inference"] = "inference"
+
+    @model_validator(mode="after")
+    def validate_input_source_ownership(self) -> DeviceLink:
+        if self.producer_binding == "input" and self.owner != "producer":
+            raise ValueError("input-sourced device links require owner='producer'")
+        return self
+
+
+class TorchDeployment(StrictFrozenModel):
+    backend: Literal["torch"]
+    device: Literal["cpu", "cuda", "mps", "npu"]
+
+
+class CompiledDeployment(StrictFrozenModel):
+    backend: Literal["ascend", "hisilicon", "rknn", "hmm"]
+    target: DeploymentTarget
+    artifacts: dict[ExecutionRole, DeploymentArtifact] = Field(min_length=1)
+    execution: tuple[ExecutionRole, ...] = Field(min_length=1)
+    bindings: dict[ExecutionRole, ArtifactBindings] = Field(min_length=1)
+    device_links: tuple[DeviceLink, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_execution_graph(self) -> CompiledDeployment:
+        if len(self.execution) != len(set(self.execution)):
+            raise ValueError("execution contains duplicate roles")
+
+        execution_roles = set(self.execution)
+        artifact_roles = set(self.artifacts)
+        binding_roles = set(self.bindings)
+        if not execution_roles.issubset(artifact_roles):
+            raise ValueError(
+                f"artifact roles must contain every execution role (missing={sorted(execution_roles - artifact_roles)})"
+            )
+        if binding_roles != execution_roles:
+            raise ValueError(
+                "binding roles must exactly match execution roles "
+                f"(missing={sorted(execution_roles - binding_roles)}, unexpected={sorted(binding_roles - execution_roles)})"
+            )
+
+        artifact_paths = [artifact.path for artifact in self.artifacts.values()]
+        if len(artifact_paths) != len(set(artifact_paths)):
+            raise ValueError("compiled deployment contains duplicate artifact paths")
+
+        role_positions = {role: index for index, role in enumerate(self.execution)}
+        produced_internal: dict[str, str] = {}
+        for role in self.execution:
+            for binding in self.bindings[role].outputs:
+                if binding.semantic.startswith("internal."):
+                    produced_internal[binding.semantic] = role
+
+        linked_inputs = {(link.consumer, link.semantic) for link in self.device_links}
+        linked_source_inputs = {
+            (link.producer, link.semantic) for link in self.device_links if link.producer_binding == "input"
+        }
+        input_sourced_semantics = {link.semantic for link in self.device_links if link.producer_binding == "input"}
+        ambiguous_semantics = sorted(input_sourced_semantics & set(produced_internal))
+        if ambiguous_semantics:
+            raise ValueError(
+                f"input-sourced device links cannot share semantics with internal outputs: {ambiguous_semantics}"
+            )
+        for role in self.execution:
+            for binding in self.bindings[role].inputs:
+                if not binding.semantic.startswith("internal."):
+                    continue
+                producer = produced_internal.get(binding.semantic)
+                endpoint = (role, binding.semantic)
+                if producer is None and endpoint not in linked_inputs and endpoint not in linked_source_inputs:
+                    raise ValueError(f"internal input {binding.semantic!r} for role {role!r} has no declared producer")
+                if producer is not None and role_positions[producer] >= role_positions[role]:
+                    raise ValueError(
+                        f"internal input {binding.semantic!r} must be produced before role {role!r} executes"
+                    )
+
+        for link in self.device_links:
+            if link.producer not in execution_roles or link.consumer not in execution_roles:
+                raise ValueError(f"device link {link.semantic!r} references an unknown execution role")
+            if role_positions[link.producer] >= role_positions[link.consumer]:
+                raise ValueError(f"device link {link.semantic!r} producer must execute before its consumer")
+            producer_bindings = (
+                self.bindings[link.producer].inputs
+                if link.producer_binding == "input"
+                else self.bindings[link.producer].outputs
+            )
+            producer_semantics = {binding.semantic for binding in producer_bindings}
+            consumer_inputs = {binding.semantic for binding in self.bindings[link.consumer].inputs}
+            if link.semantic not in producer_semantics or link.semantic not in consumer_inputs:
+                raise ValueError(
+                    f"device link {link.semantic!r} must match producer {link.producer_binding} "
+                    "and consumer input bindings"
+                )
+
+        if not any(binding.semantic == "action" for role in self.execution for binding in self.bindings[role].outputs):
+            raise ValueError("compiled deployment must declare an action output binding")
+        return self
+
+
+Deployment: TypeAlias = Annotated[TorchDeployment | CompiledDeployment, Field(discriminator="backend")]
+
+
+class InferenceManifest(StrictFrozenModel):
+    schema_version: Literal[1]
+    bundle: ManifestBundle
+    deployments: dict[str, Deployment] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_deployment_names(self) -> InferenceManifest:
+        invalid = [name for name in self.deployments if not _DEPLOYMENT_PATTERN.fullmatch(name)]
+        if invalid:
+            raise ValueError(f"invalid deployment names: {sorted(invalid)}")
+        return self

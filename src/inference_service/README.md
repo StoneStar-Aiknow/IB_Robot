@@ -1,548 +1,424 @@
-# Inference Service (推理服务)
+# inference_service
 
-[English](./README.en.md) | 简体中文
+`inference_service` 是 IB-Robot 的统一推理运行时。它以一个策略 bundle、一个命名
+deployment 和一个稳定的 pipeline ID 为输入，统一承载 Torch、Ascend、Hisilicon、
+RKNN 与 HMM 后端，并支持单体和边云分布式执行。
 
-`inference_service` 是 IB-Robot 具身智能系统的核心 AI 执行引擎包。它为物理机器人的端到端机器学习策略（如 ACT, pi0 等）提供了一个标准化的运行框架，重点优化了高频控制下的**时间轴对齐**与**零拷贝延迟**。
+运行时从策略 bundle 中唯一的 `inference_manifest.json` 读取命名 deployment、artifact、
+执行顺序和 runtime ABI bindings。Launch 和 robot YAML 通过 deployment 名称选择运行配置。
 
-## 架构：组合优于继承 (Composition over Inheritance)
+## 核心概念
 
-整个推理管线被极致解耦为三个没有任何 ROS 依赖的纯 Python 核心组件（位于 `inference_service.core` 目录下）：
-1. **TensorPreprocessor (前处理)**：负责将 ROS 2 订阅到的多模态传感器裸数据（相机图像、关节状态等）裁剪、归一化为标准的 PyTorch Tensors。
-2. **PureInferenceEngine (纯推理引擎)**：一个绝对无状态、无 ROS 依赖的 GPU 算法执行引擎。
-3. **TensorPostprocessor (后处理)**：将网络输出的动作 Tensors 反归一化为机器人底层可以直接执行的物理控制指令。
+### 策略 Bundle
 
-通过将纯粹的数学运算与 ROS 2 的通信层剥离，本功能包得以通过一个简单的 YAML 参数，支持两种完全不同的工业级部署模式。
-
----
-
-## 🚀 部署模式 (Execution Modes)
-
-### 模式 A：单机零拷贝模式 (Monolithic)
-**适用场景**：机器人本体搭载了诸如 RTX 4060 等高性能板载 GPU。
-
-在此模式下，端侧的 `lerobot_policy_node.py` 会实例化一个 `InferenceCoordinator`，在内部将前处理、推理、后处理三者串联。
-* **数据流向**：传感器数据完全留在单个进程的内存/显存（RAM/VRAM）中，张量全程通过指针引用传递。
-* **性能优势**：实现绝对意义上的**最低延迟**，彻底消除了跨进程的序列化/反序列化（Serialization）开销。
-* **YAML 配置**：`execution_mode: "monolithic"`
-
-### 模式 B：端-边-云分布式协同模式 (Device-Edge/Cloud Distributed)
-**适用场景**：轻量级机器人（端侧）仅搭载了算力薄弱的 CPU（如树莓派、工控机），而庞大的多模态大模型运行在同一局域网下的高性能计算节点（边端）或云端服务器上。
-
-为了保持对上层 `action_dispatch`（拉取式分发器）的兼容，同时**防止高帧率的视频流塞满局域网带宽**，端侧节点在此时会化身为一个**异步代理 (Asynchronous Proxy)**。
-1. **端侧 (`lerobot_policy_node.py`)**：收到 Action Goal 后，按需抓取本地相机画面，在 CPU 上执行**前处理**，随后将轻量化的张量打包发往 `/preprocessed/batch` 话题。它会利用 `threading.Event` 将当前协程挂起，不占用额外资源。
-2. **边/云端 (`pure_inference_node.py`)**：这是一个独立的节点，它订阅张量，死磕 GPU 算力进行推理，并将结果立刻发回 `/inference/action`。
-3. **端侧**：监听到边/云端回传的结果，被瞬间唤醒，执行**后处理**闭环，最后将最终的物理指令提交给分发器。
-
-* **性能优势**：完美的“算力卸载（Compute Offloading）”。端侧只有在需要推理的那一刻（例如 20Hz 下每 50ms 一次）才发送关键帧，极大地节约了网络带宽，且对上层应用完全透明。
-* **YAML 配置**：`execution_mode: "distributed"`
-
-```
-端侧机器 (Robot / Sim)                    算力机器 (GPU Server)
-┌──────────────────────────────┐          ┌──────────────────────────┐
-│  action_dispatcher_node      │          │                          │
-│       ↓                      │          │  pure_inference_node     │
-│  lerobot_policy_node (Proxy) │          │  ├─ Subscribe            │
-│  ├─ TensorPreprocessor (CPU) │          │  │  /preprocessed/batch  │
-│  ├─ threading.Event          │          │  ├─ PureInferenceEngine  │
-│  └─ TensorPostprocessor(CPU) │          │  │  (GPU)                │
-│       ↓ Pub        ↑ Sub     │          │  └─ Publish              │
-│  /preprocessed  /inference   │          │     /inference/action    │
-│  /batch         /action      │          │                          │
-└──────────┬──────────┬────────┘          └───────┬──────────┬───────┘
-           │          │      LAN (同一 ROS_DOMAIN_ID)        │          │
-           └──────────┴──────────────────────────┴──────────┘
-```
-
----
-
-## ⚙️ 配置与启动 (Configuration & Usage)
-
-两种模式的切换极其丝滑，您完全不需要修改 Launch 启动文件，一切均由 `robot_config` 包中的 YAML 配置文件决定。
-
-```yaml
-# 位于: src/robot_config/config/robots/your_robot.yaml
-control_modes:
-  model_inference:
-    inference:
-      enabled: true
-      execution_mode: "distributed"  # 切换为 "monolithic" 即可秒切单机版
-      model: so101_act
-```
-
-### LeRobot 动作单位转换标定
-
-`lerobot_policy_node.py` 的 rad↔LeRobot 单位转换直接读取 `robot_config` 中的
-ros2_control 标定来源。单臂旧配置使用 `ros2_control.calib_file` 并映射到
-`arm` namespace；双臂或更多来源使用
-`ros2_control.xacro_args.calib_file_<namespace>`，例如 `calib_file_left`、
-`calib_file_right`、`calib_file_front` 或 `calib_file_1`。后缀即 LeRobot joint namespace，
-允许字母、数字和下划线；建议优先使用 `left`、`right`、`front` 这类语义名称，
-便于和 `joint_names`、数据集 metadata 及策略特征对齐。`calib_file` 不能与 namespace 后缀标定来源
-混用，否则硬件/xacro 和推理转换可能读取不同标定源。
-
-重复 namespace 或缺失标定文件会在 launch/config 校验或节点初始化时失败，
-而不是静默禁用转换。
-
-### 注意力可视化
-
-推理节点支持节点化注意力可视化：
-
-| 方式 | 适用模式 | 说明 | 详细文档 |
-|------|---------|------|---------|
-| 节点化可视化（推荐） | Monolithic | 通过 ROS 话题发布注意力权重，由独立 `attention_viz` 节点渲染热力图 | [attention_viz 文档](../attention_viz/README.md) |
-
-#### 节点化可视化参数
-
-```yaml
-control_modes:
-  model_inference:
-    inference:
-      attention_viz_topic: /attention/weights
-      attention_viz:
-        enabled: true
-        mode: file
-        save_dir: /tmp/attention_viz
-        interactive_masking: false
-        mask_save_dir: /tmp/attention_masks
-```
-
-`attention_viz.enabled` 会自动启用 `publish_attention` 并拉起独立可视化节点。`attention_viz.interactive_masking` 会在首个 action chunk 前弹出 mask 绘制窗口，将用户标记区域转换为 ACT transformer mask。可视化和交互式 mask 只在 `execution_mode: monolithic` 下生效；分布式模式下会在启动时输出警告。
-
-### 重置推理运行时状态
-
-推理节点提供显式状态重置服务，用于在 episode 切换时清理 policy 内部状态和 attention hook 缓存：
-
-```bash
-ros2 service call /act_inference_node/reset_policy_state std_srvs/srv/Trigger "{}"
-```
-
-重置范围：
-
-| 组件 | 重置内容 |
-|------|---------|
-| Policy | 内部 queue、action chunk 和 episode 状态 |
-| Attention Hook | 已缓存的注意力权重和交互式 attention mask |
-
-`action_dispatcher` 在收到 reset 请求时会触发推理侧重置；`record_cli` 仅在 `control_mode:=model_inference` 或显式 `reset_before_episode:=true` 时调用该 reset 链路：
+每个可部署策略目录必须同时包含 LeRobot 语义文件和唯一的
+`inference_manifest.json`：
 
 ```text
-record_cli (model_inference) -> /action_dispatcher/reset -> /act_inference_node/reset_policy_state
+policy_bundle/
+├── config.json
+├── model.safetensors                         # Torch deployment 需要时存在
+├── policy_preprocessor.json
+├── policy_preprocessor_step_*.safetensors
+├── policy_postprocessor.json
+├── policy_postprocessor_step_*.safetensors
+├── tokenizer/                                # PI0.5 / SmolVLA 按需存在
+├── artifacts/
+│   ├── ascend/<deployment>/...
+│   ├── hisilicon/<deployment>/...
+│   ├── rknn/<deployment>/...
+│   └── hmm/<deployment>/...
+└── inference_manifest.json
 ```
 
-其中，`action_dispatcher` 的 reset 服务会先清理自身动作队列，再 best-effort 调用推理侧 reset 服务。若推理节点不在线，dispatcher reset 仍会完成自身状态清理。
+LeRobot 拥有 `config.json`、processor JSON、processor state、tokenizer 和原生权重。
+IB-Robot 只读这些文件，不会添加字段、删字段、重写 device 或创建临时策略目录。
+部署信息只属于 `inference_manifest.json`。
 
-### 启动命令
+### Deployment
 
-#### 场景零：离线 rosbag 策略评估的最小推理节点
+一个 manifest 可以为同一策略声明多个命名 deployment，例如 `cpu`、`cuda`、
+`rk3588`、`ascend_310p3` 或 `lq50`。Pipeline 选择的是 deployment 名称，而不是后端名。
 
-当只想评估 policy backend 精度，而不希望启动相机、`action_dispatch`、ros2_control、控制器或真实硬件时，使用 `eval_inference.launch.py` 只启动 `lerobot_policy_node`：
-
-```bash
-ros2 launch inference_service eval_inference.launch.py \
-    robot_config_path:=src/robot_config/config/robots/so101_single_arm.yaml \
-    policy_path:=/path/to/pretrained_model \
-    device:=cpu \
-    use_header_time:=true
-```
-
-这个 launch 只负责提供 `DispatchInfer` Action Server 和 policy 推理运行时。它不会自己读取 rosbag，也不会发布观测数据；观测回放与结果记录由 `dataset_tools policy_eval capture` 完成。
-
-`use_header_time:=true` 是 rosbag frame-gated replay 的推荐配置。它让 `lerobot_policy_node` 把 replay 出来的消息 header stamp 写入 `StreamBuffer`，从而可以和 `DispatchInfer` goal 中的历史 timestamp 对齐。
-
-典型配套命令见 `src/dataset_tools/README.md` 的 `policy_eval` 小节。
-
-#### 场景一：跨机器分布式部署（推荐生产用法）
-
-两台机器必须设置**相同的 `ROS_DOMAIN_ID`** 且在同一局域网内。
-
-**步骤 1 — 在机器人本体（端侧 Device）上**：
-
-端侧只启动 Edge 代理节点（前/后处理），不加载 GPU 模型：
-```bash
-export ROS_DOMAIN_ID=<你的域ID>
-ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
-    control_mode:=model_inference \
-    execution_mode:=distributed \
-    use_sim:=true   # 仿真模式；真机去掉此参数
-```
-
-**步骤 2 — 在算力服务器（边端/云端 Edge/Cloud）上**：
-
-```bash
-export ROS_DOMAIN_ID=<与你的端侧一致的域ID>
-ros2 launch inference_service cloud_inference.launch.py \
-    policy_path:=/path/to/models/pretrained_model \
-    device:=cuda
-```
-
-如果 Cloud 节点运行在端侧开发板（openEuler / OpenHarmony）上的 Ascend NPU，可直接切换为：
-
-```bash
-export ROS_DOMAIN_ID=<与你的端侧一致的域ID>
-ros2 launch inference_service cloud_inference.launch.py \
-    policy_path:=/path/to/models/pretrained_model \
-    device:=npu
-```
-
-如果模型已经通过 ATC/SVP 工具链导出为 Ascend OM，可直接让
-`inference_service` 承载从原 LeRobot 补丁迁移过来的 OM wrapper：
-
-```bash
-# 通用 Ascend ACL .om 推理后端
-ros2 launch inference_service cloud_inference.launch.py \
-    policy_path:=/path/to/pretrained_model \
-    device:=ascend_om
-
-# SD3403 worker 二进制协议后端
-ros2 launch inference_service cloud_inference.launch.py \
-    policy_path:=/path/to/pretrained_model \
-    device:=ascend_om_3403
-```
-
-`device:=ascend_om` 会从 `policy_path/config.om.json` 的 `artifacts.policy` 解析
-单 OM 模型。`device:=ascend_om_3403` 需要 `artifacts.policy` 和 `artifacts.worker`，
-并要求 `execution` 为 `["policy", "worker"]`。两种模式的前/后处理、ROS 话题与
-分布式通信仍沿用 `inference_service` 的现有管线。
-
-`ascend_om_3403` 的 worker 二进制必须升级到支持命令行参数
-`--model <om_path>` 的版本。旧的 `SVP_*` 环境变量不会再传给 worker，避免外部
-shell 残留状态影响模型选择。迁移方式如下：
-
-| 旧环境变量 | 替代配置 |
-| --- | --- |
-| `SVP_MODEL_PATH` | `config.om.json` 的 `artifacts.policy` |
-| `SVP_WORKER_EXECUTABLE` / `SVP_CPP_EXECUTABLE` | `config.om.json` 的 `artifacts.worker` |
-| `SVP_IMAGE_HEIGHT` / `SVP_IMAGE_WIDTH` | 从 `config.json` 的 `input_features.<image_key>.shape` 推导（可选 `backend_config.image_height`/`image_width` 覆盖） |
-| `SVP_PERF_LOG` / `SVP_PERF_LOG_EVERY` | `config.om.json` 的 `backend_config.perf_enabled` / `backend_config.perf_log_every` |
-| `SVP_WORKER_GRACEFUL_CLOSE_TIMEOUT` / `SVP_WORKER_FORCE_CLOSE` | `config.om.json` 的 `backend_config.graceful_close_timeout` / `backend_config.force_close` |
-
-若 worker 的 action 输出索引不是默认的 `1`，可在
-`config.om.json` 的 `backend_config.action_output.index` 中设置；action 维度仍由
-`config.json` 的 `output_features.action.shape` 推导。
-
-如果 Cloud 节点运行在 RK3588 / OpenHarmony 板端并使用 RKNN Lite，可直接切换为：
-
-```bash
-export ROS_DOMAIN_ID=<与你的端侧一致的域ID>
-ros2 launch inference_service cloud_inference.launch.py \
-    policy_path:=/path/to/models/pretrained_model \
-    device:=rknn
-```
-
-`device:=rknn` 会继续复用 `policy_path/config.json` 中的 LeRobot 配置用于前后处理，
-同时要求实际的 RKNN 模型文件随 policy 一起纳管到 `policy_path` 目录内，
-默认文件名为 `model.rknn`。
-
-`lerobot_policy_node` 会根据 `lerobot_norm_mode` 在 LeRobot 归一化单位与
-`ros2_control` 弧度之间转换。真机模式使用 `robot_config` 中的
-`ros2_control.calib_file`；`use_sim:=true` 仿真模式使用生成后的 URDF 关节
-`limit`，因此不需要真实机械臂校准 JSON。
-
-注意 `use_sim` 与 ROS 2 内置的 `use_sim_time` 不是一回事：
-
-- `use_sim_time` 只控制时钟源（是否使用 `/clock` 话题），回放 rosbag 时也会
-  被置为 `true`，但不代表当前运行在物理仿真器中；
-- `use_sim` 才决定 `lerobot_policy_node` 是否走仿真分支（URDF limit 转换表、
-  跳过真实校准文件）。
-
-因此在 Gazebo / MuJoCo 中运行推理时，两者都需要设为 `true`（`robot.launch.py`
-会统一注入，通常无需手动指定）。
-
-### 编译模型后端的 Wrapper 设计
-
-无论使用 PyTorch、Ascend OM 还是 RKNN，`inference_service` 对上层暴露的统一入口始终是
-`PureInferenceEngine`。它内部通过 `PolicyWrapper` 抽象屏蔽不同运行时后端的差异，统一接口为：
-
-1. `load(path, device)`：加载模型与运行时资源。
-2. `infer(batch)`：对一批已经完成前处理的 Tensor 执行推理。
-3. `get_chunk_size()`：返回动作 chunk 大小。
-4. `policy_type`：返回当前策略类型标识（如 `"act"`、`"pi05"`）。
-5. `backend_type`：返回运行时后端标识（如 `"cuda"`、`"ascend_om"`、`"rknn"`）。
-6. `uses_action_chunking`：当前策略是否使用 action chunk 输出。
-
-这意味着：
-
-1. 前处理和后处理组件不需要感知底层是 PyTorch、ACL 还是 RKNN Lite。
-2. 分布式与单机模式只改变部署位置，不改变 wrapper 设计。
-3. 真正的后端差异被收敛到 `PolicyWrapper` 的实现中。
-
-#### PyTorch 路径：LeRobotPolicyWrapper
-
-常规 `device:=cuda/cpu/npu` 路径使用 `LeRobotPolicyWrapper`。
-
-它的工作方式最接近上游 LeRobot：
-
-1. 从 `policy_path/config.json` 识别 `type`。
-2. 通过 `lerobot.policies.factory.get_policy_class()` 获取对应策略类。
-3. 调用 `from_pretrained(path)` 加载权重。
-4. 根据策略类型调用 `predict_action_chunk()` 或 `select_action()`。
-
-在这条路径里，策略对象本身保留了输入输出语义，因此 wrapper 只是一个很薄的适配层。
-
-#### 编译模型路径：CompiledPolicyWrapper + Adapter + RuntimeSession
-
-`device:=ascend_om`、`device:=ascend_om_3403` 和 `device:=rknn` 均走编译模型路径。
-它们共享同一个 `CompiledPolicyWrapper` 基类，通过 **组合模式** 将后端差异拆解为两个正交维度：
-
-```
-CompiledPolicyWrapper (PolicyWrapper)
-  ├── CompiledModelAdapter (Protocol)  ← 模型语义适配：输入准备、输出解码
-  └── RuntimeSession (Protocol)        ← 硬件运行时：加载、执行、释放
-```
-
-- **CompiledModelAdapter** 负责把 `dict[str, Tensor]` 转为后端可消费的输入格式，
-  并把原始输出恢复为动作 Tensor。当前实现包括 `ACTCompiledAdapter`（ACT 家族）和
-  `PI05CompiledAdapter`（Pi0.5），通过 `ADAPTER_REGISTRY` 按 `config.json` 的 `type` 字段派发。
-- **RuntimeSession** 只负责硬件 artifact 的加载、执行与资源释放。当前实现包括
-  `OMRuntimeSession`（通用 ACL OM）、`PI05OMRuntimeSession`（Pi0.5 VLM+AE 联合推理）、
-  `SD3403RuntimeSession`（SD3403 板卡 worker）和 `RKNNRuntimeSession`（RKNN Lite），
-  通过 `create_runtime_session()` 按 backend 名称和模型类型派发。
-
-推理流程统一为三步：`adapter.prepare_inputs(batch)` → `session.execute(inputs)` →
-`adapter.decode_outputs(outputs, device)`。
-
-外层门面类只负责传入 backend 名称：
-
-| 门面类 | backend | Adapter | RuntimeSession |
-|--------|---------|---------|----------------|
-| `AscendOMPolicyWrapper` | `ascend_om` | ACT: `ACTCompiledAdapter` / PI0.5: `PI05CompiledAdapter` | ACT: `OMRuntimeSession` / PI0.5: `PI05OMRuntimeSession` |
-| `AscendOM3403PolicyWrapper` | `ascend_om_3403` | `ACTCompiledAdapter` | `SD3403RuntimeSession` |
-| `AscendOMPi05PolicyWrapper` | `ascend_om` (Pi0.5) | `PI05CompiledAdapter` | `PI05OMRuntimeSession` |
-| `RKNNPolicyWrapper` | `rknn` | `ACTCompiledAdapter` | `RKNNRuntimeSession` |
-
-##### Ascend OM 路径
-
-`device:=ascend_om` 下，实际执行的不再是 Python 中的 LeRobot policy 对象，
-而是编译后的 `.om` 图。因此 OM 路径需要显式补回"模型语义层"：
-
-- **ACT OM**：`ACTCompiledAdapter` 从 `config.json` 读取 `input_features`、`chunk_size`、
-  `action_dim` 等元数据，负责输入顺序整理和输出 reshape。
-  `OMRuntimeSession` 包装底层的 `OMmodel`（Ascend ACL runtime，包括
-  `acl.init()`、`acl.mdl.load_from_file()`、Host/Device memcpy 与 `acl.mdl.execute()`）。
-- **Pi0.5 OM**：`PI05CompiledAdapter` 处理 VLM 输入（图像 + token + mask）和动作输出。
-  `PI05OMRuntimeSession` 包装底层的 `PI05OMModel`，后者加载 VLM 和 Action Expert
-  两个 OM 模型，通过零拷贝 buffer 共享实现联合推理，并执行多步 denoising 循环。
-
-##### Ascend OM SD3403 路径
-
-`device:=ascend_om_3403` 使用 `ACTCompiledAdapter` + `SD3403RuntimeSession`：
-
-- `SD3403RuntimeSession` 包装 `ACT3403Policy`，后者管理一个常驻 C++ worker 子进程。
-- 通过自定义二进制协议（`PROTOCOL_MAGIC=0x53565031`）把输入写入 worker 的 `stdin`，
-  worker 在板卡侧执行 OM 推理后通过 `stdout` 回传结果。
-- `ACTCompiledAdapter` 负责输入准备和 SD3403 输出解码：接受 worker 返回的直接
-  action tensor（例如 output index 1，shape `(1, chunk_size, action_dim)`）。SD3403
-  worker 已只打包逻辑 action 维度，不再有 stride padding。`action_dim` 来自
-  `config.json` 的 `output_features.action.shape`，worker 输出 index / layout 等编译产物
-  IO 绑定由 `config.om.json` 的 `backend_config` 承载。
-
-##### RKNN 路径
-
-`device:=rknn` 使用 `RKNNPolicyWrapper(CompiledPolicyWrapper)`。
-
-与 OM 路径类似使用 `ACTCompiledAdapter` + `RKNNRuntimeSession` 组合，但运行时更薄——
-相当一部分"模型特定性"已经在导出阶段（`export_onnx_rknn.py`）固化：
-
-1. 导出脚本直接从 `ACTPolicy` 导出 ONNX，用 `ACTONNXWrapper` 固定输入/输出接口，
-   剥离多余输出，仅保留 `action` 输出。
-2. `config.json` 中保留了 `input_features`、`chunk_size` 等元数据供运行时解释。
-3. `RKNNRuntimeSession` 调用 `rknnlite.api.RKNNLite` 的 `load_rknn()` / `init_runtime()` /
-   `inference()` 执行推理。
-4. `ACTCompiledAdapter` 按 `input_features` 顺序从 batch 中抽取输入，将 Tensor 转为
-   `numpy.float32`，并将输出恢复为动作 Tensor。
-
-#### 编译产物配置：config.om.json
-
-运行时设备以 launch/ROS 参数为准。若 LeRobot 导出的 `config.json` 内含
-训练时设备记录（例如 `"device": "cuda"`），`inference_service` 会在本地临时
-配置副本中将其覆盖为当前 runtime tensor device（OM/RKNN 等编译后端为 CPU），
-不会修改原始模型目录，也不会让训练设备约束推理后端选择。
-
-编译后端推荐在模型目录内生成独立的 `config.om.json` manifest，避免污染 LeRobot 原生
-`config.json`。该文件描述后端 artifact 的路径和执行顺序：
+Torch deployment 直接声明运行设备：
 
 ```json
 {
-  "schema_version": 1,
-  "policy_type": "act",
-  "backend": "ascend_om",
-  "artifact_dir": "om",
-  "artifacts": {
-    "policy": "act.om"
-  },
-  "execution": ["policy"]
+  "backend": "torch",
+  "device": "cpu"
 }
 ```
 
-SD3403 worker 后端还可以在 `backend_config` 中声明 worker IO 绑定和运行时选项：
+编译 deployment 声明 target、artifact、执行顺序和完整 runtime ABI bindings：
 
 ```json
 {
-  "schema_version": 1,
-  "policy_type": "act",
-  "backend": "ascend_om_3403",
-  "artifact_dir": "om",
-  "artifacts": {
-    "policy": "act.om",
-    "worker": "main"
+  "backend": "rknn",
+  "target": {
+    "soc": "rk3588",
+    "runtime": "rknn-lite2"
   },
-  "execution": ["policy", "worker"],
-  "backend_config": {
-    "action_output": {"index": 1, "layout": "direct"},
-    "perf_enabled": false,
-    "perf_log_every": 1,
-    "graceful_close_timeout": 5.0,
-    "force_close": true
+  "artifacts": {
+    "policy": {
+      "path": "artifacts/rknn/rk3588/policy.rknn",
+      "format": "rknn",
+      "sha256": "<64 lowercase hex>"
+    }
+  },
+  "execution": ["policy"],
+  "bindings": {
+    "policy": {
+      "inputs": [
+        {
+          "semantic": "observation.state",
+          "runtime_name": "observation.state",
+          "index": 0,
+          "dtype": "float32",
+          "shape": [1, 6]
+        },
+        {
+          "semantic": "observation.images.top",
+          "runtime_name": "observation.images.top",
+          "index": 1,
+          "dtype": "float32",
+          "shape": [1, 480, 640, 3],
+          "layout": "NHWC"
+        }
+      ],
+      "outputs": [
+        {
+          "semantic": "action",
+          "runtime_name": "action",
+          "index": 0,
+          "dtype": "float32",
+          "shape": [1, 100, 6]
+        }
+      ]
+    }
   }
 }
 ```
 
-`backend_config` 是后端私有字段。`action_output` 描述当前 worker 直接返回的
-action 输出布局——SD3403 worker 已只打包逻辑 action 维度（如 `(1, 100, 6)`），
-不再有 stride padding。
+`execution` 中的每个角色都必须同时存在 artifact 和非空 binding group。图像 binding
+必须显式声明 `NCHW` 或 `NHWC`；非图像 tensor 不得仅根据 rank 自动转置。多模块模型
+使用匹配的 `internal.*` semantic，或使用 `device_links` 声明 producer、consumer、
+device-pointer ownership 和 inference lifetime。
 
-> [!note] 图片分辨率从 `config.json` 派生，不在 `backend_config` 配置
-> 图片的 height/width 是模型的输入契约，记录在 `config.json` 的
-> `input_features.<image_key>.shape`（如 `[3, 480, 640]`），并经 ATC
-> `--input_shape` 固化进 OM。运行时从该 shape 派生 resize 目标，无需在
-> `backend_config` 重复声明。若确需覆盖（如调试），仍可在 `backend_config`
-> 设 `image_height`/`image_width`，但其优先级低于 `input_features`。
+### Pipeline
 
-各后端要求的 artifact 角色：
+Pipeline ID 是模型实例和 ROS 路由的稳定标识，必须匹配
+`^[a-z][a-z0-9_]{0,62}$`。每个 pipeline 独立拥有：
 
-| 后端 | artifacts 键 | execution |
-|------|-------------|-----------|
-| `ascend_om` (ACT) | `policy`（单 `.om` 文件） | `["policy"]` |
-| `ascend_om_3403` | `policy`（`.om`）+ `worker`（可执行二进制） | `["policy", "worker"]` |
-| `ascend_om` (Pi0.5) | `vlm` + `action_expert`（各 `.om`） | `["vlm", "action_expert"]` |
-| `rknn` | 从 `policy_path` 自动搜索 `model.rknn` 或 `*.rknn` | — |
+- 策略 bundle 和命名 deployment
+- LeRobot preprocessor / postprocessor
+- policy codec 与 binding execution plan
+- 后端实例、准入状态和生命周期
+- Action、reset、health、action output 和分布式 transport endpoints
 
-`artifact_dir` 指定 artifact 的基础目录（相对于 manifest 文件解析）。`artifacts` 中
-的值可以是字符串路径或 `{"path": "..."}` 对象。`execution` 显式声明通用串行 pipeline
-的执行顺序。OM artifact 不再从 LeRobot `config.json`、环境变量或目录猜测读取；
-转换工具必须生成 `config.om.json`。
+默认 endpoint：
 
-#### 继承体系总览
+| 接口 | 默认值 |
+| --- | --- |
+| 本地节点 | `inference_<pipeline_id>` |
+| 云端节点 | `inference_<pipeline_id>_cloud` |
+| Action server | `/inference/<pipeline_id>/dispatch` |
+| Reset service | `/inference/<pipeline_id>/reset` |
+| Health topic | `/inference/<pipeline_id>/health` |
+| Action output | `/actions/<pipeline_id>` |
+| 分布式 request | `/inference/<pipeline_id>/request` |
+| 分布式 result | `/inference/<pipeline_id>/result` |
+| 分布式 heartbeat | `/inference/<pipeline_id>/heartbeat` |
 
-```text
-PolicyWrapper (ABC)
-├── LeRobotPolicyWrapper          ← PyTorch / LeRobot 原生路径
-└── CompiledPolicyWrapper         ← 所有编译后端的统一基类
-      │   组合: CompiledModelAdapter + RuntimeSession
-      ├── AscendOMPolicyWrapper       backend=ascend_om (ACT / Pi0.5)
-      ├── AscendOM3403PolicyWrapper   backend=ascend_om_3403
-      ├── AscendOMPi05PolicyWrapper   backend=ascend_om (Pi0.5 门面)
-      └── RKNNPolicyWrapper           backend=rknn
+## Robot 配置
 
-CompiledModelAdapter (Protocol)
-├── ACTCompiledAdapter             ← ACT 家族输入/输出语义适配
-└── PI05CompiledAdapter            ← Pi0.5 VLM + Action Expert 适配
+推理直接配置在 `control_modes.<mode>.inference.pipelines` 下：
 
-RuntimeSession (Protocol)
-├── OMRuntimeSession               ← 包装 OMmodel (Ascend ACL)
-├── PI05OMRuntimeSession           ← 包装 PI05OMModel (VLM+AE 零拷贝联合推理)
-├── SD3403RuntimeSession           ← 包装 ACT3403Policy (板卡 worker 二进制协议)
-└── RKNNRuntimeSession             ← 包装 RKNNLite (RK3588 NPU)
+```yaml
+control_modes:
+  model_inference:
+    inference:
+      enabled: true
+      pipelines:
+        policy:
+          model_path: models/so101_act
+          deployment: rk3588
+          execution_mode: monolithic
+          request_timeout: 5.0
+          default_task: pick up the banana
+          runtime_options: {}
 ```
 
-### 编译后端 vs PyTorch 推理流程对比
+相对 `model_path` 只相对于环境变量 `WORKSPACE` 解析。`WORKSPACE` 未设置时会失败，
+不会回退到当前目录、YAML 目录或源码目录。执行项目命令前应先运行：
 
-各路径的前处理与后处理保持一致，差异集中在中间的模型执行层。
-
-#### PyTorch 推理
-
-```text
-Preprocessor -> Tensor batch -> LeRobotPolicyWrapper -> LeRobot policy object
-           -> Action Tensor -> Postprocessor
+```bash
+source .shrc_local
 ```
 
-特点：
+多模型通过多个独立 pipeline 配置：
 
-1. 输入输出全程都是 `torch.Tensor`。
-2. 策略对象自己知道输入输出语义。
-3. 不需要 wrapper 手动管理运行时 buffer 与显式 memcpy。
-
-#### 编译后端推理（Ascend OM / SD3403 / RKNN）
-
-```text
-Preprocessor -> Tensor batch -> CompiledPolicyWrapper
-           -> Adapter.prepare_inputs() -> RuntimeSession.execute() -> Adapter.decode_outputs()
-           -> Action Tensor -> Postprocessor
+```yaml
+pipelines:
+  action_policy:
+    model_path: models/so101_act
+    deployment: rk3588
+    execution_mode: monolithic
+  auxiliary_policy:
+    model_path: models/auxiliary_smolvla
+    deployment: cpu
+    execution_mode: monolithic
 ```
 
-特点：
-
-1. 运行时执行的是编译产物（`.om` 图 / worker 进程 / `.rknn` 模型），不是 Python policy 对象。
-2. Adapter 负责输入顺序整理、输出 shape 恢复与 chunk 语义。
-3. RuntimeSession 负责硬件加载、执行和资源释放。
-4. 通用 ACL 路径需要显式执行 Host/Device 内存拷贝。
-5. SD3403 路径通过 Python 与 worker 的二进制 IPC 协议通信。
-6. Pi0.5 路径通过 VLM 和 Action Expert 的零拷贝 buffer 共享实现联合推理。
-7. RKNN 路径的输出语义已在导出阶段固定，运行时恢复逻辑较薄。
-
-### 设计总结
-
-可以把三类后端理解为同一条推理管线中的不同"中间执行器"：
-
-1. PyTorch 路径最原生，依赖完整的 LeRobot policy 类。
-2. RKNN 路径把大量模型特定性前移到导出阶段，运行时 wrapper 更轻。
-3. Ascend OM 路径的 runtime 更底层，因此需要在运行时显式补一层模型语义适配。
-4. 所有编译后端共享 `CompiledPolicyWrapper` 的 Adapter + Session 组合模式，
-   新增后端只需实现 `CompiledModelAdapter` 和 `RuntimeSession` 两个 Protocol。
-
-这也是为什么 `inference_service` 选择通过 `PolicyWrapper` 统一抽象，而不是把不同后端
-的逻辑直接散落到 `lerobot_policy_node.py` 或 ROS 节点实现中。
-
-#### 场景二：单机调试（开发测试用）
-
-在一台机器上同时运行 Edge + Cloud 节点，添加 `cloud_local:=true`：
+YAML 是默认配置来源。开发调试时可只覆盖一个明确指定的 pipeline：
 
 ```bash
 ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
+    config_path:=/absolute/path/to/robot.yaml \
     control_mode:=model_inference \
-    execution_mode:=distributed \
-    use_sim:=true \
-    cloud_local:=true
+    inference_pipeline:=policy \
+    inference_execution_mode:=distributed
 ```
 
-### 验证分布式模式
+`inference_execution_mode` 为空时完全使用 YAML；非空时必须同时提供
+`inference_pipeline`，避免多 pipeline 配置被全局误覆盖。
+
+可以在每个 pipeline 的 `transport` mapping 中覆盖 endpoint。不同 pipeline 的节点名、
+Action、service 和 topic 必须唯一。Monolithic pipeline 不允许配置 cloud node、request、
+result 或 heartbeat overrides。
+
+## 执行模式
+
+### Monolithic
+
+`pipeline_policy_node` 在一个进程内执行：
+
+```text
+ROS observations
+  -> contract adapter
+  -> LeRobot preprocessor
+  -> semantic batch
+  -> native policy or policy codec + bindings
+  -> selected deployment backend
+  -> semantic action
+  -> LeRobot postprocessor
+  -> DispatchInfer result and /actions/<pipeline_id>
+```
+
+完整机器人启动通常由 `robot_config` launch builder 根据 YAML 创建 pipeline。仅评估一个
+pipeline 时可直接使用：
 
 ```bash
-# 1. 确认两个推理节点均在线
-ros2 node list | grep -E 'act_inference|pure_inference'
-# 预期输出：
-#   /act_inference_node      ← Edge（前/后处理）
-#   /pure_inference           ← Cloud（GPU 推理）
-
-# 2. 确认分布式话题存在
-ros2 topic list | grep -E 'preprocessed|inference/action'
-# 预期输出：
-#   /preprocessed/batch      ← Edge → Cloud
-#   /inference/action         ← Cloud → Edge
-
-# 3. 观察推理频率
-ros2 topic hz /inference/action
+source .shrc_local
+ros2 launch inference_service eval_inference.launch.py \
+    robot_config_path:="$WORKSPACE/src/robot_config/config/robots/so101_single_arm.yaml" \
+    model_path:="$WORKSPACE/models/ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515" \
+    deployment:=cpu \
+    pipeline_id:=policy \
+    action_server:=/inference/policy/dispatch \
+    reset_service:=/inference/policy/reset
 ```
 
-### 日志说明
+触发一次推理：
 
-系统启动后，各节点会依次打印以下关键日志行，便于快速判断状态：
-
-| 节点 | 日志示例 | 含义 |
-|------|---------|------|
-| `pure_inference` | `Waiting for preprocessed batches from edge node...` | Cloud 节点就绪，等待 Edge 发送数据 |
-| `pure_inference` | `✓ First inference completed: latency=XXms` | 首次推理成功，确认端到端链路通畅 |
-| `pure_inference` | `[stats] count=XX, avg=XXms, last=XXms` | 每 5 秒输出一次性能统计 |
-| `act_inference_node` | `✓ First inference complete (distributed): total=XXms` | Edge 节点首次完成完整推理闭环 |
-| `action_dispatcher` | `✓ First inference received: chunk=XX, latency=XXms` | 分发器首次收到可执行动作 |
-| `action_dispatcher` | `[stats] inferences=XX, avg_latency=XXms, queue=XX, hold=XX` | 每 5 秒输出分发统计；`hold` 表示队列耗尽后保持末帧的次数 |
-
----
-
-## 🧪 脱机测试 (Testing)
-由于核心组件已经实现了零 ROS 依赖，模型工程师可以直接在没有任何 ROS 环境的机器上，使用 `pytest` 秒级验证张量维度的正确性：
 ```bash
-pytest src/inference_service/tests/
+ros2 action send_goal /inference/policy/dispatch \
+    ibrobot_msgs/action/DispatchInfer \
+    "{obs_timestamp: {sec: 0, nanosec: 0}, prompt: '', inference_id: 'test-001'}"
 ```
+
+### Distributed
+
+分布式 pipeline 在 edge 的 `pipeline_policy_node` 中保留 observation adapter、processor 和
+postprocessor，在 cloud 的 `pure_inference_node` 中加载 selected backend。两端在发送 tensor
+前必须匹配：
+
+```text
+Robot / Edge host                              Compute / Cloud host
+┌──────────────────────────────────┐           ┌──────────────────────────────────┐
+│ action_dispatch                  │           │ inference_<pipeline_id>_cloud    │
+│       │ DispatchInfer            │           │ pure_inference_node              │
+│       v                          │           │                                  │
+│ inference_<pipeline_id>          │           │ selected deployment and backend  │
+│ pipeline_policy_node             │           │                                  │
+│ ├─ observation contract adapter  │           │                                  │
+│ ├─ LeRobot preprocessor          │           │                                  │
+│ └─ LeRobot postprocessor         │           │                                  │
+│       │ request      ▲ result     │           │       ▲ request      │ result    │
+└───────┼──────────────┼────────────┘           └───────┼──────────────┼───────────┘
+        │              │                                │              │
+        └──────────────┴──────── ROS 2 transport ───────┴──────────────┘
+          /inference/<pipeline_id>/request
+          /inference/<pipeline_id>/result
+          /inference/<pipeline_id>/heartbeat
+```
+
+每个 pipeline 使用独立的 request、result 和 heartbeat endpoint；两端使用相同的 pipeline
+ID、bundle 和 deployment 身份信息。
+
+- pipeline ID
+- manifest schema version
+- bundle digest
+- deployment name
+- selected deployment fingerprint
+- policy input/output summary
+- cloud backend `READY` state
+
+Cloud 示例：
+
+```bash
+source .shrc_local
+ros2 launch inference_service cloud_inference.launch.py \
+    pipeline_id:=policy \
+    model_path:=/absolute/path/to/policy_bundle \
+    deployment:=cuda
+```
+
+单独调试 distributed Edge 时也可直接使用：
+
+```bash
+ros2 launch inference_service eval_inference.launch.py \
+    robot_config_path:=/absolute/path/to/robot.yaml \
+    model_path:=/absolute/path/to/policy_bundle \
+    deployment:=cuda \
+    pipeline_id:=policy \
+    inference_execution_mode:=distributed
+```
+
+本机同时启动 Edge 和 Cloud：
+
+```bash
+ros2 launch inference_service local_distributed_inference.launch.py \
+    robot_config_path:=/absolute/path/to/robot.yaml \
+    model_path:=/absolute/path/to/policy_bundle \
+    deployment:=cuda \
+    pipeline_id:=policy
+```
+
+Edge 可由 robot YAML 中 `execution_mode: distributed` 创建，也可由上述显式 launch override
+创建。成功握手后会绑定唯一 session ID 和 generation。Heartbeat 超时、cloud 重启、
+fingerprint 改变或 backend 离开 `READY` 都会立即撤销 readiness、拒绝新请求，并使
+in-flight request 返回结构化 unavailable 错误。不属于当前 session ID 和 generation 的
+response 会被丢弃，连接恢复后必须重新握手。
+
+## 后端与支持矩阵
+
+Canonical backend 只有以下五个：
+
+| Backend | 用途 |
+| --- | --- |
+| `torch` | 原生 LeRobot，device 为 `cpu`、`cuda`、`mps` 或 `npu` |
+| `ascend` | Ascend ACL 执行 OM artifact |
+| `hisilicon` | 面向 `sd3403` target SoC 的 Hisilicon worker runtime |
+| `rknn` | RKNNLite 执行 RKNN artifact |
+| `hmm` | Houmo TCIM 执行 HMM 多模块 artifact |
+
+以下支持矩阵在启动时强制校验，不在表中的组合会被拒绝：
+
+| Policy family | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |
+| --- | --- | --- | --- | --- | --- |
+| ACT | 支持 | 支持 | 支持 | 支持 | 不支持 |
+| PI0.5 | 支持 | 支持 | 不支持 | 不支持 | 支持 |
+| SmolVLA | 支持 | 不支持 | 不支持 | 支持 | 支持 |
+
+可选 SDK 延迟导入。仅导入 `inference_service` 不要求 ACL、RKNNLite、TCIM、torch NPU 或
+Hisilicon worker dependency；只有选择相应 deployment 时才检查依赖。
+
+## 生命周期、健康与能力
+
+Backend 状态包括 `CREATED`、`LOADING`、`READY`、`DEGRADED`、`RECOVERING`、
+`FAILED`、`CLOSING` 和 `CLOSED`。只有 `READY` 接受请求。`close()` 必须幂等，部分加载
+失败也必须释放已经创建的 context、model handle、device buffer 或 worker。
+
+Pipeline 状态包括 `CREATED`、`LOADING`、`HANDSHAKING`、`READY`、`RESETTING`、
+`DEGRADED`、`FAILED`、`CLOSING` 和 `CLOSED`。Reset 期间阻止新请求；`CLOSING` 和
+`CLOSED` 是终态。
+
+Backend capabilities 决定：
+
+- 是否 stateful、resettable、thread-safe
+- 单实例最大 in-flight 请求数
+- 是否支持多个实例
+- 是否存在共享 resource domain 及其总限制
+- 是否支持 attention 和 cancellation
+
+默认采用保守串行限制。只有 conformance tests 证明重叠调用、输出隔离、故障隔离和确定性
+清理后，backend 才能声明更高并发。不同 pipeline 有独立准入状态，但共享 accelerator
+resource domain 时仍可能被后端串行化。
+
+## Manifest 完整性
+
+启动顺序是：严格 JSON/schema 校验，deployment 选择，路径安全校验，bundle 文件 SHA-256，
+bundle digest，LeRobot metadata，compiled artifact SHA-256，binding compatibility，最后才创建
+backend runtime。
+
+`bundle.digest` 算法：
+
+1. 将每个 `bundle.files` path 规范化为唯一的 bundle-relative POSIX path。
+2. 按 path 排序 `{\"path\": ..., \"sha256\": ...}` entries。
+3. 使用 UTF-8 JSON、无多余空白、key 顺序为 `path`、`sha256` 序列化整个数组。
+4. 对序列化 bytes 计算 SHA-256。
+
+Selected deployment fingerprint 对以下 canonical object 计算 SHA-256：
+
+```json
+{
+  "schema_version": 1,
+  "bundle_digest": "...",
+  "deployment_name": "rk3588",
+  "deployment": {}
+}
+```
+
+路径不能是绝对路径、不能包含 parent traversal、不能通过 symlink 逃逸 bundle root，规范化
+后也不能重复。
+
+### 完整性错误处理
+
+遇到以下错误时不要手工改 hash：
+
+- `SHA-256 mismatch`
+- `Bundle digest mismatch`
+- missing or unexpected LeRobot semantic files
+- execution role 缺少 artifact 或 bindings
+- runtime ABI 与 LeRobot feature shape 不匹配
+
+应重新运行拥有该 artifact 的 exporter 或 packaging workflow。Exporter 负责复制 artifact、
+读取 compiler/runtime ABI、生成 bindings、计算所有 SHA-256、更新 bundle digest，并通过生产
+loader 重新验证 manifest。
+
+## Exporter 入口
+
+通用 compiled artifact packaging：
+
+```bash
+ros2 run model_utils package-compiled-deployment \
+    --bundle-root /path/to/policy_bundle \
+    --deployment rk3588 \
+    --backend rknn \
+    --target-soc rk3588 \
+    --target-runtime rknn-lite2 \
+    --spec /path/to/compiler-package-spec.json
+```
+
+PI0.5 / SmolVLA HMM 使用：
+
+```bash
+ros2 run model_utils package-hmm-deployment --help
+```
+
+ACT Ascend、ACT RKNN、Hisilicon 和 policy-specific multi-module exporters 位于
+`model_utils`。所有工具最终必须调用 shared `inference_manifest` writer；不要手工维护
+artifact path、binding 或 digest。
+
+## 验证
+
+从源码运行测试时优先使用 source package path，并禁用外部 pytest plugins：
+
+```bash
+source .shrc_local
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+PYTHONPATH=src/inference_manifest:src/inference_service \
+pytest -q src/inference_service/tests
+```
+
+只对本次修改的 Python 文件执行 Ruff。项目或 ROS 命令前必须先加载 `.shrc_local`。

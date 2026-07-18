@@ -21,6 +21,12 @@ find_package(sensor_msgs REQUIRED)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Variant.msg"
   "msg/VariantsList.msg"
+  "msg/InferenceError.msg"
+  "msg/InferenceFeatureSummary.msg"
+  "msg/InferencePolicySummary.msg"
+  "msg/InferencePipelineStatus.msg"
+  "msg/DistributedInferenceRequest.msg"
+  "msg/DistributedInferenceResult.msg"
   "msg/RobotStatus.msg"
   "msg/TaskStep.msg"
   "msg/TaskCommand.msg"

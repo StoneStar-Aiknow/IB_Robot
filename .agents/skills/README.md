@@ -14,7 +14,7 @@
 | [oh-access](./oh-access) | 板端 | 连接 OpenHarmony 开发板，执行 HDC shell / file send / file recv。 |
 | [oh-build-roboframe](./oh-build-roboframe) | 板端 | 使用 `build_roboframe_oh.sh` 主机侧交叉编译并打包 IB_Robot 自有 OpenHarmony 运行时。 |
 | [rknn-convert](./rknn-convert) | 模型 | 将 ONNX 转成 RKNN，并维护主 `venv` 导出 ONNX、`.venv-rknn` 转 RKNN 的流程边界。 |
-| [hmm-convert](./hmm-convert) | 模型 | 将 ACT / PI05 模型转后摩 HMM 格式（xh2 NPU），涵盖 ACT 单模块和 PI05 6 模块拆分的完整流程、manifest 格式和 troubleshooting。 |
+| [hmm-convert](./hmm-convert) | 模型 | 将 PI0.5 / SmolVLA 编译产物打包为后摩 HMM deployment（xh2 NPU），生成统一 manifest；ACT HMM 不支持。 |
 | [ibrobot-architecture](./ibrobot-architecture) | 知识 | 理解 SSOT 模式、修改 `robot_config`、解释数据流或契约设计。 |
 | [ibrobot-lerobot-patch](./ibrobot-lerobot-patch) | 工作流 | 将 `libs/lerobot` 的本地改动导出为 `third_party/patches/lerobot/<tag>/*.patch`，并通过辅助脚本同步 `series/manifest/test`。 |
 | [ibrobot-git-flow](./ibrobot-git-flow) | 工作流 | 提交代码、推送至个人仓库、确保符合 openEuler DCO/Commit 规范。 |
@@ -51,7 +51,7 @@
 - **板端连接 ([oh-access](./oh-access))**: 统一封装 OpenHarmony 板的 HDC over TCP 访问与文件传输。
 - **OH 主机侧构建 ([oh-build-roboframe](./oh-build-roboframe))**: 通过 `build_roboframe_oh.sh` 交叉编译 `ibrobot_msgs,tensormsg,robot_config,inference_service`，并强制确认 `series.openharmony-5.1.0-musl.txt` 真正进入板端 runtime 产物。
 - **RKNN 转换 ([rknn-convert](./rknn-convert))**: 明确 ONNX 导出与 RKNN 转换的边界，避免主 `venv` 与 `.venv-rknn` 污染。
-- **HMM 转换 ([hmm-convert](./hmm-convert))**: 将 ACT / PI05 模型转后摩 HMM（xh2 NPU），涵盖 xhquant PTQ、tcim 编译、config.hmm.json manifest 格式与 PI05 6 模块拆分流程。
+- **HMM 转换 ([hmm-convert](./hmm-convert))**: 将 PI0.5 / SmolVLA 的 xhquant/tcim 编译产物通过 `package-hmm-deployment` 纳入统一 `inference_manifest.json`；ACT HMM 不支持。
 - **架构顾问 ([ibrobot-architecture](./ibrobot-architecture))**: 充当项目的架构师，解答一切关于设计模式和配置规范的问题。
 - **LeRobot 补丁纳管 ([ibrobot-lerobot-patch](./ibrobot-lerobot-patch))**: 把 `libs/lerobot` 的本地改动回收为受管 patch 栈，而不是直接提交子模块 gitlink。
 - **工程规范 ([ibrobot-git-flow](./ibrobot-git-flow))**: 自动化执行开源社区繁琐的提交规范校验。

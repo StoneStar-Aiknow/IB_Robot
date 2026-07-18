@@ -3,8 +3,8 @@
 
 This module keeps Level 1 policy evaluation on the live ROS boundary:
 recorded ROS messages are republished to contract observation topics, then the
-existing ``lerobot_policy_node`` ``DispatchInfer`` action server is called for
-the same timestamp. The pure helpers are intentionally separate from the ROS
+selected unified pipeline ``DispatchInfer`` action server is called for the
+same timestamp. The pure helpers are intentionally separate from the ROS
 client so validation and metrics can be tested without a running graph.
 """
 
@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 
@@ -25,12 +25,19 @@ from dataset_tools.policy_eval_compare import (
     default_plot_dir,
     write_compare_plots,
 )
-from robot_config.contract_utils import SpecView, contract_fingerprint, iter_specs, stamp_from_header_ns
-from robot_config.loader import build_contract_from_robot_config_dict, load_robot_config_dict
-from robot_config.utils import resolve_calibration_paths_from_config
 
 NS_PER_SEC = 1_000_000_000
-HISTORICAL_TIMESTAMP_POLICIES = {"contract", "header", "bag", "receive"}
+HISTORICAL_TIMESTAMP_POLICIES = {"contract", "header"}
+
+
+class SpecView(Protocol):
+    key: str
+    topic: str
+    ros_type: str
+    is_action: bool
+    resample_policy: str
+    asof_tol_ms: int
+    stamp_src: str
 
 
 @dataclass(frozen=True)
@@ -117,6 +124,9 @@ def filter_observations_by_input_features(
 
 
 def load_contract_context(robot_config_path: str | Path, policy_path: str | Path | None = None) -> ContractContext:
+    from robot_config.contract_utils import contract_fingerprint, iter_specs
+    from robot_config.loader import build_contract_from_robot_config_dict, load_robot_config_dict
+
     robot_config = load_robot_config_dict(robot_config_path)
     contract = build_contract_from_robot_config_dict(robot_config)
     specs = list(iter_specs(contract))
@@ -151,11 +161,17 @@ def validate_required_topics(specs: list[SpecView], topic_types: dict[str, str])
         raise ValueError("rosbag is missing required contract topics: " + ", ".join(missing))
 
 
-def validate_timestamp_compatibility(timestamp_policy: str, policy_use_header_time: bool) -> None:
-    if timestamp_policy in HISTORICAL_TIMESTAMP_POLICIES and not policy_use_header_time:
+def validate_timestamp_compatibility(timestamp_policy: str, observations: list[SpecView]) -> None:
+    if timestamp_policy not in HISTORICAL_TIMESTAMP_POLICIES:
         raise ValueError(
-            "historical rosbag timestamp replay requires lerobot_policy_node use_header_time=true; "
-            "receive-time sampling would not match DispatchInfer goal timestamps"
+            "unified pipeline replay supports timestamp_policy 'header' or 'contract'; "
+            "bag/receive timestamps cannot be reconstructed after ROS message republication"
+        )
+    non_header = sorted({spec.topic for spec in observations if spec.stamp_src != "header"})
+    if non_header:
+        raise ValueError(
+            "historical replay requires every selected observation to use contract stamp_src='header'; "
+            f"receive-time streams cannot match historical DispatchInfer timestamps: {non_header}"
         )
 
 
@@ -173,15 +189,24 @@ def stream_key_for_spec(spec: SpecView, key_counts: dict[str, int]) -> str:
     return spec.key
 
 
+def _stamp_from_header_ns(msg: Any) -> int | None:
+    try:
+        stamp = msg.header.stamp
+        timestamp_ns = int(stamp.sec) * NS_PER_SEC + int(stamp.nanosec)
+        return timestamp_ns or None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def select_message_timestamp_ns(msg: Any, bag_timestamp_ns: int, spec: SpecView, timestamp_policy: str) -> int:
     policy = timestamp_policy.lower()
     if policy in {"bag", "receive"}:
         return int(bag_timestamp_ns)
     if policy == "header":
-        return int(stamp_from_header_ns(msg) or bag_timestamp_ns)
+        return int(_stamp_from_header_ns(msg) or bag_timestamp_ns)
     if policy == "contract":
         if spec.stamp_src == "header":
-            return int(stamp_from_header_ns(msg) or bag_timestamp_ns)
+            return int(_stamp_from_header_ns(msg) or bag_timestamp_ns)
         return int(bag_timestamp_ns)
     raise ValueError(f"unsupported timestamp policy: {timestamp_policy}")
 
@@ -311,6 +336,8 @@ def build_replay_frames(
 
 def inspect_calibration(robot_config: dict[str, Any]) -> CalibrationStatus:
     try:
+        from robot_config.utils import resolve_calibration_paths_from_config
+
         paths = resolve_calibration_paths_from_config(robot_config)
     except Exception as exc:
         return CalibrationStatus(status="unknown", message=f"failed to resolve calibration path: {exc}")
@@ -401,6 +428,12 @@ def load_prediction_file(path: str | Path) -> dict[str, Any]:
     return json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
 
 
+def _decode_contract_value(ros_type: str, msg: Any, spec: SpecView) -> Any:
+    from robot_config.contract_utils import decode_value
+
+    return decode_value(ros_type, msg, spec)
+
+
 def read_rosbag_streams(
     bag_dir: str | Path,
     context: ContractContext,
@@ -413,8 +446,6 @@ def read_rosbag_streams(
         import rosbag2_py
         from rclpy.serialization import deserialize_message
         from rosidl_runtime_py.utilities import get_message
-
-        from robot_config.contract_utils import decode_value
     except ImportError as exc:
         raise RuntimeError("rosbag replay requires ROS 2 Python packages") from exc
 
@@ -430,7 +461,7 @@ def read_rosbag_streams(
         if context.policy_path is None:
             raise ValueError(
                 f"{exc}. If the policy uses only a subset of contract observations, pass --policy-path so "
-                "policy_eval can apply the same config.json input_features filtering as lerobot_policy_node."
+                "policy_eval can apply the same config.json input_features filtering as the unified pipeline node."
             ) from exc
         raise
     if include_actions:
@@ -470,7 +501,7 @@ def read_rosbag_streams(
             ts_ns = select_message_timestamp_ns(msg, int(bag_ns), spec, timestamp_policy)
             record = action_streams[stream_key_for_spec(spec, action_key_counts)]
             record.timestamps_ns.append(ts_ns)
-            record.decoded_values.append(decode_value(spec.ros_type, msg, spec))
+            record.decoded_values.append(_decode_contract_value(spec.ros_type, msg, spec))
     return topic_types, obs_streams, action_streams
 
 
@@ -495,8 +526,8 @@ def _run_capture(args: argparse.Namespace) -> None:
     except ImportError as exc:
         raise RuntimeError("policy evaluation capture requires ROS 2 Python packages") from exc
 
-    validate_timestamp_compatibility(args.timestamp_policy, args.policy_use_header_time)
     context = load_contract_context(args.robot_config, args.policy_path)
+    validate_timestamp_compatibility(args.timestamp_policy, context.observations)
     calibration = inspect_calibration(context.robot_config)
     _, obs_streams, action_streams = read_rosbag_streams(
         args.bag_dir,
@@ -696,13 +727,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     capture.add_argument("--out", required=True, help="Prediction JSON output path")
     capture.add_argument("--backend-name", default="policy", help="Backend label stored in prediction metadata")
-    capture.add_argument(
-        "--action-name", default="/lerobot_policy_node/DispatchInfer", help="DispatchInfer action name"
-    )
-    capture.add_argument("--reset-service", default="/lerobot_policy_node/reset_policy_state")
+    capture.add_argument("--pipeline-id", default="policy", help="Named inference pipeline used for default endpoints")
+    capture.add_argument("--action-name", default="", help="DispatchInfer action name override")
+    capture.add_argument("--reset-service", default="", help="Pipeline reset service override")
     capture.add_argument("--storage-id", default="mcap")
     capture.add_argument("--timestamp-policy", choices=["contract", "header", "bag", "receive"], default="header")
-    capture.add_argument("--policy-use-header-time", action=argparse.BooleanOptionalAction, default=True)
     capture.add_argument("--frame-limit", type=int, default=None)
     capture.add_argument("--frame-stride", type=int, default=1)
     capture.add_argument("--settle-sec", type=float, default=0.05)
@@ -747,6 +776,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "capture":
+        if not args.action_name:
+            args.action_name = f"/inference/{args.pipeline_id}/dispatch"
+        if not args.reset_service:
+            args.reset_service = f"/inference/{args.pipeline_id}/reset"
     args.func(args)
 
 

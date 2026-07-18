@@ -11,6 +11,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -77,7 +78,42 @@ def generate_random_calibration(dataset_path, onnx_path, num_samples=20):
     return dataset_path
 
 
-def convert(onnx_path, output_path, mode, dataset=None, verify=False):
+def _extract_compiled_runtime_abi(rknn):
+    metadata = getattr(rknn.rknn_base, "inputs_meta", None)
+    attrs = metadata.get("attrs") if isinstance(metadata, dict) else None
+    if not isinstance(attrs, dict) or not attrs:
+        raise RuntimeError("RKNN Toolkit did not expose compiler-resolved tensor metadata")
+
+    def collect(is_output):
+        tensors = []
+        for name, value in attrs.items():
+            if not isinstance(value, dict) or bool(value.get("is_output", False)) != is_output:
+                continue
+            index = value.get("idx")
+            dtype = value.get("dtype")
+            shape = value.get("shape")
+            layout = value.get("layout")
+            if type(index) is not int or not isinstance(dtype, str) or not isinstance(shape, list) or not shape:
+                raise RuntimeError(f"RKNN tensor metadata is incomplete for {name!r}: {value!r}")
+            item = {"name": name, "index": index, "dtype": dtype, "shape": shape}
+            if len(shape) == 4 and isinstance(layout, str):
+                item["layout"] = layout.upper()
+            tensors.append(item)
+        tensors.sort(key=lambda item: item["index"])
+        indices = [item["index"] for item in tensors]
+        if len(indices) != len(set(indices)):
+            raise RuntimeError("RKNN tensor metadata contains duplicate indices")
+        if not is_output and indices != list(range(len(tensors))):
+            raise RuntimeError("RKNN input tensor metadata indices are not contiguous from zero")
+        return tensors
+
+    abi = {"inputs": collect(False), "outputs": collect(True)}
+    if not abi["inputs"] or not abi["outputs"]:
+        raise RuntimeError("RKNN compiler metadata contains no runtime inputs or outputs")
+    return abi
+
+
+def convert(onnx_path, output_path, mode, dataset=None, verify=False, abi_output=None):
     from rknn.api import RKNN
 
     inspect_onnx(onnx_path)
@@ -147,12 +183,26 @@ def convert(onnx_path, output_path, mode, dataset=None, verify=False):
         print("Build failed!")
         return -1
 
+    try:
+        abi = _extract_compiled_runtime_abi(rknn)
+    except RuntimeError as exc:
+        print(f"Runtime ABI introspection failed: {exc}")
+        rknn.release()
+        return -1
+
     print(f"--> Exporting RKNN model to {output_path}")
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     ret = rknn.export_rknn(output_path)
     if ret != 0:
         print("Export failed!")
         return -1
+
+    abi_path = abi_output or f"{output_path}.abi.json"
+    os.makedirs(os.path.dirname(abi_path) or ".", exist_ok=True)
+    with open(abi_path, "w", encoding="utf-8") as f:
+        json.dump(abi, f, indent=2)
+        f.write("\n")
+    print(f"Runtime ABI: {abi_path}")
 
     rknn.release()
 
@@ -216,13 +266,18 @@ def main():
     )
     parser.add_argument("--dataset", default=None, help="Calibration dataset file (int8/hybrid)")
     parser.add_argument("--verify", action="store_true", help="Verify accuracy after conversion")
+    parser.add_argument(
+        "--abi-output",
+        default=None,
+        help="Output compiler-resolved ABI JSON (default: <output>.abi.json)",
+    )
     args = parser.parse_args()
 
     if not os.path.exists(args.onnx):
         print(f"ERROR: ONNX model not found: {args.onnx}")
         sys.exit(1)
 
-    ret = convert(args.onnx, args.output, args.mode, args.dataset, args.verify)
+    ret = convert(args.onnx, args.output, args.mode, args.dataset, args.verify, args.abi_output)
     sys.exit(ret if ret else 0)
 
 

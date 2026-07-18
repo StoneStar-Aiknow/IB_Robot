@@ -10,8 +10,9 @@
 两端通过 ROS 2 topic 通信：
 
 ```text
-本机 act_inference_node -> /preprocessed/batch -> 板端 pure_inference_cloud
-本机 act_inference_node <- /inference/action     <- 板端 pure_inference_cloud
+本机 inference_bimanual_policy -> /inference/bimanual_policy/request -> 板端 inference_bimanual_policy_cloud
+本机 inference_bimanual_policy <- /inference/bimanual_policy/result  <- 板端 inference_bimanual_policy_cloud
+两端                           <-> /inference/bimanual_policy/heartbeat
 ```
 
 ## 机械臂校准
@@ -120,21 +121,24 @@ src/robot_config/config/robots/so101_dual_arm.yaml
 
 ### 分布式推理入口
 
-`control_modes.model_inference.inference` 描述本机/edge 侧如何连接板端推理服务：
+`control_modes.model_inference.inference.pipelines` 描述本机/edge 侧如何连接板端推理服务。以下片段
+位于 robot YAML 的 `robot:` 下：
 
 ```yaml
 control_modes:
   model_inference:
     inference:
       enabled: true
-      model: so101_act
-      execution_mode: distributed
-      cloud_inference_topic: /preprocessed/batch
-      cloud_result_topic: /inference/action
-      request_timeout: 10.0
+      pipelines:
+        bimanual_policy:
+          model_path: /absolute/path/to/dual_arm_policy_bundle
+          deployment: ascend_board
+          execution_mode: distributed
+          request_timeout: 10.0
     executor:
       type: topic
       mode: model_inference
+      inference_pipeline: bimanual_policy
       control_frequency: 30.0
       watermark_threshold: 40
       min_queue_size: 0
@@ -144,30 +148,38 @@ control_modes:
 
 | 字段 | 本机/edge 侧含义 | 板端/cloud 侧要求 |
 |------|------------------|-------------------|
-| `execution_mode` | 必须为 `distributed`，本机只做前/后处理并通过 topic 调用板端推理 | 板端不读这份 robot YAML，启动 `cloud_inference.launch.py` 即可 |
-| `cloud_inference_topic` | 本机发布预处理 batch 的 topic | 板端订阅 topic 必须一致，默认 `/preprocessed/batch` |
-| `cloud_result_topic` | 本机订阅动作结果的 topic | 板端发布 topic 必须一致，默认 `/inference/action` |
+| `model_path` | 本机可访问的 unified policy bundle；相对路径仅相对绝对 `WORKSPACE` 解析 | 板端通过 launch 的 `model_path` 指向同一 bundle identity |
+| `deployment` | `inference_manifest.json` 中的命名 deployment | 板端必须选择相同 deployment name 和 fingerprint |
+| `execution_mode` | 必须为 `distributed`，本机只做前/后处理并通过 pipeline topics 调用板端 | 板端不读这份 robot YAML，启动 `cloud_inference.launch.py` 即可 |
 | `request_timeout` | 本机等待板端推理结果的超时时间 | 应高于板端模型耗时和网络抖动 |
+| `inference_pipeline` | Action Dispatcher 选择的 pipeline ID | Cloud launch 的 `pipeline_id` 必须相同 |
 | `control_frequency` | 本机 action dispatcher 播放动作频率 | 不影响板端模型推理速度 |
 | `watermark_threshold` | 本机开始播放前缓存的动作队列水位 | 应覆盖端到端延迟，例如 30 Hz 下 `40` 约为 1.33 秒缓存 |
 | `min_queue_size` | 播放时允许的最小队列水位 | 双臂实机验证中可设为 `0`，避免高延迟下长期 hold |
 
-如果修改 topic 名称，必须本机 YAML 和板端 launch 参数同时修改。
+默认 request、result 和 heartbeat topic 由 pipeline ID 派生。如需修改，在 YAML 的 pipeline 下使用
+`transport.request_topic`、`transport.result_topic` 和 `transport.heartbeat_topic`，并在板端 launch 中
+传入同名参数。
 
-### 本机模型配置
+### Policy Bundle
 
-`models.so101_act` 是本机/edge 侧读取模型 metadata 的位置。即使推理在板端执行，本机仍需要读取 LeRobot 配置、统计信息和输入输出 contract：
+本机和板端都以一个 `inference_manifest.json` 描述 deployment。即使 compiled artifact 只部署在板端，
+edge 侧也必须能读取相同的 manifest 以及 LeRobot-owned metadata/processors，以建立输入输出契约、
+预处理、后处理和 deployment fingerprint：
 
-```yaml
-models:
-  so101_act:
-    path: ./models/dual_arm/pretrained_model
-    policy_type: act
-    device: cpu
-    lerobot_norm_mode: range_m100_100
+```text
+dual_arm_policy_bundle/
+├── config.json
+├── policy_preprocessor.json
+├── policy_postprocessor.json
+├── inference_manifest.json
+└── artifacts/
 ```
 
-建议本机使用仓库相对路径，避免把个人绝对路径写进 YAML。该路径必须在本机/edge host 上存在，并至少包含策略 metadata（例如 `config.json` 和统计信息），因为 edge 侧需要读取输入输出契约和归一化配置。板端模型目录不在这里配置，而是在板端启动命令里通过 `policy_path:=...` 指定。
+不要在 LeRobot `config.json` 中添加 backend flag 或 artifact path。Bundle 必须由对应 exporter/package
+workflow 生成，并通过 strict manifest loader 校验。当前仓库未包含
+`models/dual_arm/pretrained_model/inference_manifest.json`，因此使用 checked-in 双臂配置启动
+`model_inference` 前，必须先生成 bundle，并把 YAML 的 `model_path`、`deployment` 更新为实际值。
 
 ### 观测 contract
 
@@ -194,7 +206,9 @@ contract:
 
 ```bash
 export IB_ROBOT_WS=<IB_Robot 工作区路径>
-export BOARD_MODEL_DIR=<板端模型目录>
+export EDGE_CONFIG=<本机绝对 robot YAML 路径>
+export BOARD_MODEL_DIR=<板端 unified policy bundle 目录>
+export DEPLOYMENT=<manifest 中的命名 deployment>
 export ROS_DOMAIN_ID=<domain-id>
 export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
@@ -212,19 +226,16 @@ export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
 ros2 launch inference_service cloud_inference.launch.py \
-  policy_path:=$BOARD_MODEL_DIR \
-  device:=ascend_om
+  pipeline_id:=bimanual_policy \
+  model_path:=$BOARD_MODEL_DIR \
+  deployment:=$DEPLOYMENT
 ```
 
-如果板端使用其他推理后端，替换 `device` 即可。例如 CPU 后端：
+切换 runtime 时不能传 backend-valued `device`。应先用 exporter 在同一个 manifest 中生成另一个命名
+deployment，再让 edge YAML 和 cloud launch 同时选择该 deployment。
 
-```bash
-ros2 launch inference_service cloud_inference.launch.py \
-  policy_path:=$BOARD_MODEL_DIR \
-  device:=cpu
-```
-
-如需覆盖分布式 topic，板端使用 `input_topic:=...` 和 `output_topic:=...`，并且必须和本机 YAML 的 `cloud_inference_topic` / `cloud_result_topic` 保持一致。默认 topic 通常无需显式传参。
+如需覆盖分布式 topic，板端使用 `request_topic:=...`、`result_topic:=...` 和
+`heartbeat_topic:=...`，并且必须和本机 YAML 的 pipeline transport 保持一致。
 
 ### 本机启动机器人和 edge 推理代理
 
@@ -238,9 +249,8 @@ export ROS_LOCALHOST_ONLY=0
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
 ros2 launch robot_config robot.launch.py \
-  robot_config:=so101_dual_arm \
+  config_path:=$EDGE_CONFIG \
   control_mode:=model_inference \
-  execution_mode:=distributed \
   use_sim:=false
 ```
 
@@ -248,10 +258,12 @@ ros2 launch robot_config robot.launch.py \
 
 ### 板端显示 ready，但没有推理
 
-检查本机是否已经启动 `robot.launch.py`。如果本机没启动，`/preprocessed/batch` 通常只有板端 subscriber，没有 publisher。
+检查本机是否已经启动 `robot.launch.py`，以及 handshake 是否达到 READY：
 
 ```bash
-ros2 topic info /preprocessed/batch
+ros2 topic info /inference/bimanual_policy/request
+ros2 topic info /inference/bimanual_policy/result
+ros2 topic echo --once /inference/bimanual_policy/heartbeat
 ```
 
 ### 本机看不到板端节点
@@ -295,7 +307,7 @@ observation.state
 # 本机
 pkill -f robot.launch.py
 pkill -f action_dispatcher
-pkill -f act_inference_node
+pkill -f pipeline_policy_node
 
 # 板端
 pkill -f pure_inference_node

@@ -16,6 +16,7 @@
   <depend>rosgraph_msgs</depend>
   <depend>controller_manager_msgs</depend>
   <depend>embodied_common</depend>
+  <depend>inference_manifest</depend>
 
   <!-- Camera drivers (executed, not linked) -->
   <exec_depend>usb_cam</exec_depend>

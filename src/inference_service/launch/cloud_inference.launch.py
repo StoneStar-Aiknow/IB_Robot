@@ -5,41 +5,47 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description():
-    policy_path_arg = DeclareLaunchArgument(
-        "policy_path", description="Absolute path to the pretrained policy model directory"
-    )
-
-    device_arg = DeclareLaunchArgument(
-        "device",
-        default_value="auto",
-        description="Device to run inference on (cuda, cpu, npu, ascend_om, ascend_om_3403, rknn, hmm, auto)",
-    )
-
-    input_topic_arg = DeclareLaunchArgument(
-        "input_topic",
-        default_value="/preprocessed/batch",
-        description="Topic to subscribe for preprocessed batches from Edge",
-    )
-
-    output_topic_arg = DeclareLaunchArgument(
-        "output_topic", default_value="/inference/action", description="Topic to publish inference results back to Edge"
-    )
-
+    arguments = [
+        DeclareLaunchArgument("pipeline_id", default_value="policy"),
+        DeclareLaunchArgument("model_path", description="Absolute path to the unified policy bundle"),
+        DeclareLaunchArgument("deployment", description="Named deployment from inference_manifest.json"),
+        DeclareLaunchArgument("request_timeout", default_value="5.0"),
+        DeclareLaunchArgument("runtime_options_json", default_value="{}"),
+        DeclareLaunchArgument(
+            "node_name",
+            default_value=["inference_", LaunchConfiguration("pipeline_id"), "_cloud"],
+        ),
+        DeclareLaunchArgument(
+            "request_topic",
+            default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/request"],
+        ),
+        DeclareLaunchArgument(
+            "result_topic",
+            default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/result"],
+        ),
+        DeclareLaunchArgument(
+            "heartbeat_topic",
+            default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/heartbeat"],
+        ),
+    ]
     cloud_node = Node(
         package="inference_service",
         executable="pure_inference_node",
-        name="pure_inference_cloud",
+        name=LaunchConfiguration("node_name"),
         output="screen",
         parameters=[
             {
-                "policy_path": LaunchConfiguration("policy_path"),
-                "device": LaunchConfiguration("device"),
-                "input_topic": LaunchConfiguration("input_topic"),
-                "output_topic": LaunchConfiguration("output_topic"),
-                # In a real cloud environment without simulation, use_sim_time should default to false
+                "pipeline_id": LaunchConfiguration("pipeline_id"),
+                "model_path": LaunchConfiguration("model_path"),
+                "deployment": LaunchConfiguration("deployment"),
+                "request_timeout": LaunchConfiguration("request_timeout"),
+                "runtime_options_json": LaunchConfiguration("runtime_options_json"),
+                "node_name": LaunchConfiguration("node_name"),
+                "request_topic": LaunchConfiguration("request_topic"),
+                "result_topic": LaunchConfiguration("result_topic"),
+                "heartbeat_topic": LaunchConfiguration("heartbeat_topic"),
                 "use_sim_time": False,
             }
         ],
     )
-
-    return LaunchDescription([policy_path_arg, device_arg, input_topic_arg, output_topic_arg, cloud_node])
+    return LaunchDescription([*arguments, cloud_node])

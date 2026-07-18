@@ -1,0 +1,20 @@
+uint8 OP_UNKNOWN=0
+uint8 OP_INFER=1
+uint8 OP_RESET=2
+uint8 OP_CANCEL=3
+
+uint32 protocol_version
+uint8 operation
+string pipeline_id
+string request_id
+string target_request_id
+string session_id
+uint64 session_generation
+string deployment_fingerprint
+bool success
+InferenceError error
+VariantsList action_chunk
+uint32 actual_chunk_size
+float64 backend_latency_ms
+bool backend_ready
+string backend_state
