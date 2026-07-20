@@ -37,6 +37,7 @@ class FakeRKNNEnvironment:
         self.load_order: list[str] = []
         self.init_calls: list[tuple[str, str | None, int]] = []
         self.inference_inputs: dict[str, list[tuple[np.ndarray, ...]]] = {}
+        self.inference_formats: dict[str, list[str | None]] = {}
         self.release_calls: list[str | None] = []
         self.instances: list[object] = []
 
@@ -65,10 +66,11 @@ class FakeRKNNEnvironment:
                 owner.init_calls.append((self.path, target, core_mask))
                 return 1 if self.path in owner.fail_init_paths else 0
 
-            def inference(self, *, inputs: list[np.ndarray]):
+            def inference(self, *, inputs: list[np.ndarray], data_format: str | None = None):
                 assert self.path is not None
                 copied = tuple(np.array(value, copy=True) for value in inputs)
                 owner.inference_inputs.setdefault(self.path, []).append(copied)
+                owner.inference_formats.setdefault(self.path, []).append(data_format)
                 callback = owner.model_specs[self.path].callback
                 return callback(copied)
 
@@ -440,6 +442,7 @@ def test_rknn_act_pipeline_uses_only_manifest_artifact_and_nhwc_binding(tmp_path
     assert result.actual_chunk_size == 4
     assert environment.load_order == [model_path]
     assert environment.init_calls == [(model_path, "rk3588", 1)]
+    assert environment.inference_formats[model_path] == ["nhwc"]
     assert backend.health().state is BackendState.READY
     pipeline.close()
     pipeline.close()
@@ -506,6 +509,9 @@ def test_rknn_smolvla_loads_prefill_first_reuses_vision_and_runs_host_links(tmp_
     np.testing.assert_array_equal(result.action, np.full((1, 2, 6), -1.0, dtype=np.float32))
     assert result.actual_chunk_size == 2
     assert environment.load_order == [paths["prefill"], paths["vision_top"], paths["action"]]
+    assert environment.inference_formats[paths["vision_top"]] == ["nhwc", "nhwc"]
+    assert environment.inference_formats[paths["prefill"]] == [None]
+    assert environment.inference_formats[paths["action"]] == [None, None]
     assert len(environment.inference_inputs[paths["vision_top"]]) == 2
     assert observed_times == [1.0, 0.5]
     assert len(observed_prefix) == 1

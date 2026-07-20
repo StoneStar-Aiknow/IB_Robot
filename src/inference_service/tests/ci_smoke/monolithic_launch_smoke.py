@@ -12,7 +12,12 @@ from launch_ros.actions import Node
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from smoke_support import assert_successful_action, prepare_smoke_runtime, send_inference
+from smoke_support import (
+    assert_successful_action,
+    prepare_smoke_runtime,
+    publish_required_observations,
+    send_inference_when_observations_ready,
+)
 
 
 def _pipeline_node(runtime, pipeline_id: str) -> Node:
@@ -59,12 +64,20 @@ class TestMonolithicLaunch(unittest.TestCase):
     def test_two_cpu_pipelines_accept_requests(self) -> None:
         rclpy.init()
         node = rclpy.create_node("inference_monolithic_smoke_client")
+        stop_observations = None
         try:
-            primary = send_inference(node, "/inference/primary/dispatch", "primary-request")
-            secondary = send_inference(node, "/inference/secondary/dispatch", "secondary-request")
-            assert_successful_action(self, primary, "primary", "primary-request")
-            assert_successful_action(self, secondary, "secondary", "secondary-request")
+            stop_observations = publish_required_observations(node, expected_subscriptions=2)
+            primary, primary_request_id = send_inference_when_observations_ready(
+                node, "/inference/primary/dispatch", "primary-request"
+            )
+            secondary, secondary_request_id = send_inference_when_observations_ready(
+                node, "/inference/secondary/dispatch", "secondary-request"
+            )
+            assert_successful_action(self, primary, "primary", primary_request_id)
+            assert_successful_action(self, secondary, "secondary", secondary_request_id)
         finally:
+            if stop_observations is not None:
+                stop_observations()
             node.destroy_node()
             rclpy.shutdown()
 

@@ -12,6 +12,7 @@ import numpy as np
 import rclpy
 from diagnostic_msgs.msg import DiagnosticStatus
 from rclpy.action import ActionClient
+from sensor_msgs.msg import Image, JointState
 
 from ibrobot_msgs.action import DispatchInfer
 from inference_manifest import BundleFile, canonical_bundle_digest, sha256_file
@@ -160,6 +161,73 @@ def send_inference(node, action_name: str, request_id: str, *, timeout: float = 
         return wrapped_result.result
     finally:
         client.destroy()
+
+
+def send_inference_when_observations_ready(node, action_name: str, request_id: str, *, timeout: float = 20.0):
+    deadline = time.monotonic() + timeout
+    attempt = 0
+    while True:
+        current_request_id = request_id if attempt == 0 else f"{request_id}-{attempt}"
+        result = send_inference(
+            node,
+            action_name,
+            current_request_id,
+            timeout=max(0.1, deadline - time.monotonic()),
+        )
+        if result.success or result.error.code != "observation_not_ready":
+            return result, current_request_id
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"observations did not become ready for {action_name!r}")
+        attempt += 1
+        rclpy.spin_once(node, timeout_sec=0.1)
+
+
+def publish_required_observations(node, *, expected_subscriptions: int, timeout: float = 10.0):
+    joint_publisher = node.create_publisher(JointState, "/ci_smoke/joint_states", 10)
+    image_publisher = node.create_publisher(Image, "/ci_smoke/camera/top", 10)
+
+    def publish() -> None:
+        stamp = node.get_clock().now().to_msg()
+        joints = JointState()
+        joints.header.stamp = stamp
+        joints.name = [f"joint_{index}" for index in range(6)]
+        joints.position = [0.0] * 6
+        image = Image()
+        image.header.stamp = stamp
+        image.height = 16
+        image.width = 24
+        image.encoding = "rgb8"
+        image.step = 24 * 3
+        image.data = bytes(16 * 24 * 3)
+        joint_publisher.publish(joints)
+        image_publisher.publish(image)
+
+    timer = node.create_timer(0.05, publish)
+
+    def stop() -> None:
+        node.destroy_timer(timer)
+        node.destroy_publisher(image_publisher)
+        node.destroy_publisher(joint_publisher)
+
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if (
+                joint_publisher.get_subscription_count() >= expected_subscriptions
+                and image_publisher.get_subscription_count() >= expected_subscriptions
+            ):
+                break
+            rclpy.spin_once(node, timeout_sec=0.1)
+        else:
+            raise AssertionError("inference observation subscriptions did not become available")
+
+        for _ in range(3):
+            publish()
+            rclpy.spin_once(node, timeout_sec=0.1)
+        return stop
+    except Exception:
+        stop()
+        raise
 
 
 def assert_successful_action(test_case, result, pipeline_id: str, request_id: str) -> None:

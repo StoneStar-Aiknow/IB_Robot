@@ -71,17 +71,35 @@ class _ProcessorPair:
             )
 
     def preprocess(self, inputs: Mapping[str, object]) -> Mapping[str, object]:
-        if self._preprocessor is None:
-            raise PipelineConfigurationError("LeRobot preprocessor is not loaded", code="processor_not_loaded")
-        return self._preprocessor(dict(inputs))
+        with self._lock:
+            if self._preprocessor is None:
+                raise PipelineConfigurationError("LeRobot preprocessor is not loaded", code="processor_not_loaded")
+            return self._preprocessor(dict(inputs))
 
     def postprocess(self, action: object) -> object:
-        if self._postprocessor is None:
-            raise PipelineConfigurationError("LeRobot postprocessor is not loaded", code="processor_not_loaded")
-        torch_module = importlib.import_module("torch")
-        if not torch_module.is_tensor(action):
-            action = torch_module.as_tensor(action)
-        return self._postprocessor(action)
+        with self._lock:
+            if self._postprocessor is None:
+                raise PipelineConfigurationError("LeRobot postprocessor is not loaded", code="processor_not_loaded")
+            torch_module = importlib.import_module("torch")
+            if not torch_module.is_tensor(action):
+                action = torch_module.as_tensor(action)
+            return self._postprocessor(action)
+
+    def reset(self) -> None:
+        with self._lock:
+            if self._preprocessor is None or self._postprocessor is None:
+                raise PipelineConfigurationError("LeRobot processor pair is not loaded", code="processor_not_loaded")
+            reset_error: Exception | None = None
+            for processor in (self._preprocessor, self._postprocessor):
+                reset = getattr(processor, "reset", None)
+                if callable(reset):
+                    try:
+                        reset()
+                    except Exception as exc:
+                        if reset_error is None:
+                            reset_error = exc
+            if reset_error is not None:
+                raise reset_error
 
     def close(self) -> None:
         with self._lock:
@@ -101,6 +119,9 @@ class _PreprocessorView:
 
     def __call__(self, inputs: Mapping[str, object]) -> Mapping[str, object]:
         return self._pair.preprocess(inputs)
+
+    def reset(self) -> None:
+        self._pair.reset()
 
     def close(self) -> None:
         self._pair.close()

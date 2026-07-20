@@ -33,9 +33,19 @@ class _SmolVLAEmbedding:
 class RKNNSession:
     """One RKNNLite module initialized from one manifest execution role."""
 
-    def __init__(self, rknn_type: type, role: str, path: Path, *, target: str | None, core_mask: int) -> None:
+    def __init__(
+        self,
+        rknn_type: type,
+        role: str,
+        path: Path,
+        *,
+        target: str | None,
+        core_mask: int,
+        data_format: str | None,
+    ) -> None:
         self.role = role
         self._runtime = rknn_type()
+        self._data_format = data_format
         self._closed = False
         try:
             ret = self._runtime.load_rknn(str(path))
@@ -55,7 +65,7 @@ class RKNNSession:
             ordered = inputs.ordered_values
         else:
             ordered = tuple(inputs[index] for index in sorted(inputs))
-        outputs = self._runtime.inference(inputs=list(ordered))
+        outputs = self._runtime.inference(inputs=list(ordered), data_format=self._data_format)
         if outputs is None or len(outputs) == 0:
             raise BackendInferenceError(f"RKNN role {self.role!r} returned no outputs", code="missing_runtime_output")
         return {index: np.asarray(output) for index, output in enumerate(outputs)}
@@ -175,6 +185,7 @@ class RKNNBackend(LifecycleBackend):
                     self._require_artifact(context, role),
                     target=options["target"],
                     core_mask=core_mask,
+                    data_format=self._runtime_data_format(deployment.bindings[role]),
                 )
                 sessions[role] = session
                 shared_sessions[cache_key] = session
@@ -896,6 +907,20 @@ class RKNNBackend(LifecycleBackend):
                 for binding in bindings.outputs
             ),
         )
+
+    @staticmethod
+    def _runtime_data_format(bindings: ArtifactBindings) -> str | None:
+        layouts = {
+            binding.layout.lower()
+            for binding in bindings.inputs
+            if binding.semantic.startswith(("observation.image", "observation.images.")) and binding.layout is not None
+        }
+        if len(layouts) > 1:
+            raise BackendLoadError(
+                f"RKNN role uses mixed image layouts {sorted(layouts)}; RKNNLite accepts one data_format per call",
+                code="invalid_bindings",
+            )
+        return next(iter(layouts), None)
 
     @staticmethod
     def _binding_for_semantics(

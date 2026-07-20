@@ -183,6 +183,26 @@ arm `[-100,100]` and gripper `[0,100]`; `degrees` uses centered degrees for
 arm joints while joints listed in `joints.gripper` keep `[0,100]` open/close
 semantics.
 
+Observation `align` settings serve both offline data processing and live inference, but their time limits have
+different meanings:
+
+- `tol_ms`: timestamp alignment tolerance for `strategy: asof`, used by both offline resampling and live sampling;
+  values less than or equal to `0` fall back to `hold`. `hold` and `drop` do not use it.
+- `max_age_ms`: maximum sample age accepted by live inference, measured from the node's local receipt clock so it
+  cannot be bypassed by rewinding a request timestamp. Missing samples and histories containing only future-dated
+  samples are always rejected; values greater than `0` also reject stale samples. These cases return
+  `observation_not_ready` instead of running the model with zero padding.
+
+```yaml
+contract:
+  observations:
+    - key: observation.images.top
+      align:
+        strategy: hold
+        tol_ms: 1500
+        max_age_ms: 500
+```
+
 **Command interface:**
 ```bash
 # Arm position commands

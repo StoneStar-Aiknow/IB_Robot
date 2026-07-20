@@ -3,6 +3,7 @@
 from inference_service.backends.admission import BackendAdmission, ResourceDomainAdmissions
 from inference_service.backends.errors import (
     BackendAdmissionError,
+    BackendCancellationError,
     BackendCapabilityError,
     BackendCompatibilityError,
     BackendError,
@@ -39,6 +40,7 @@ __all__ = [
     "BackendAdmissionError",
     "BackendAdmissionEvidence",
     "BackendCapabilities",
+    "BackendCancellationError",
     "BackendCapabilityError",
     "BackendCompatibilityError",
     "BackendDescriptor",

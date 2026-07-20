@@ -27,7 +27,9 @@ from inference_service.distributed.ros_protocol import (
     status_from_message,
     status_to_message,
 )
+from inference_service.distributed.runtime import EdgeProcessorRuntime
 from inference_service.pipeline import PipelineState
+from inference_service.pipeline_policy_node import PipelinePolicyNode, _RoundTripProgress
 from tests.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
 
 
@@ -82,10 +84,10 @@ class _MockCloudRuntime:
             backend_latency_ms=3.25,
         )
 
-    def reset(self) -> None:
+    def reset(self, deadline=None) -> None:
         self.reset_calls += 1
 
-    def cancel(self, request_id: str) -> None:
+    def cancel(self, request_id: str, deadline=None) -> None:
         self.canceled_request_ids.append(request_id)
 
     def close(self) -> None:
@@ -371,3 +373,126 @@ def test_ros_transport_cloud_startup_dependency_error_is_immediate(tmp_path):
 
     assert not result.success
     assert result.error == startup_error
+
+
+def test_edge_session_failure_is_terminal_and_invalidates_pending_requests(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+    runtime = _MockCloudRuntime()
+    transport = _RosTransportHarness(identity, runtime)
+    transport.start()
+    transport.edge.prepare_request(Operation.INFER, "pending")
+    failure = StructuredError(code="processor_reset_failed", message="edge reset failed", stage="reset")
+
+    update = transport.edge.fail(failure)
+    observed = transport.exchange_status()
+
+    assert update.invalidated_request_ids == ("pending",)
+    assert update.error == failure
+    assert observed.error == failure
+    assert transport.edge.state is PipelineState.FAILED
+    assert not transport.edge.ready
+
+
+def test_edge_processor_runtime_blocks_inference_after_reset_failure():
+    runtime = EdgeProcessorRuntime.__new__(EdgeProcessorRuntime)
+    runtime._loaded = True
+    runtime._reset_error = None
+    runtime._default_task = None
+
+    def fail_reset():
+        raise RuntimeError("processor reset failed")
+
+    runtime._preprocessor = SimpleNamespace(reset=fail_reset)
+
+    with pytest.raises(RuntimeError, match="processor reset failed"):
+        runtime.reset()
+    with pytest.raises(RuntimeError, match="unavailable after reset failure"):
+        runtime.preprocess({"observation.state": np.zeros((1, 6), dtype=np.float32)})
+
+
+def test_edge_processor_runtime_deadline_after_successful_reset_does_not_poison_runtime():
+    runtime = EdgeProcessorRuntime.__new__(EdgeProcessorRuntime)
+    runtime._loaded = True
+    runtime._reset_error = None
+    runtime._default_task = None
+    runtime._preprocessor = SimpleNamespace(
+        reset=lambda: None,
+        __call__=lambda values: values,
+    )
+
+    with pytest.raises(TimeoutError, match="deadline expired"):
+        runtime.reset(datetime.now(timezone.utc) - timedelta(seconds=1))
+
+    assert runtime._reset_error is None
+
+
+def test_distributed_reset_failure_before_edge_reset_is_not_terminal():
+    edge_runtime = SimpleNamespace(reset_calls=0)
+    edge_runtime.reset = lambda: setattr(edge_runtime, "reset_calls", edge_runtime.reset_calls + 1)
+    node = SimpleNamespace(
+        _config=SimpleNamespace(pipeline_id="policy", request_timeout=0.1),
+        _require_edge_session=lambda: SimpleNamespace(reset_supported=True),
+        _round_trip=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("cloud reset failed")),
+        _require_edge_runtime=lambda: edge_runtime,
+    )
+
+    error, terminal = PipelinePolicyNode._reset_distributed_pipeline(node)
+
+    assert str(error) == "cloud reset failed"
+    assert terminal is False
+    assert edge_runtime.reset_calls == 0
+
+
+def test_distributed_reset_unknown_outcome_is_terminal_after_request_publication():
+    edge_runtime = SimpleNamespace(reset_calls=0)
+
+    def fail_round_trip(*_args, **kwargs):
+        kwargs["progress"].published = True
+        raise RuntimeError("reset result timed out")
+
+    node = SimpleNamespace(
+        _config=SimpleNamespace(pipeline_id="policy", request_timeout=0.1),
+        _require_edge_session=lambda: SimpleNamespace(reset_supported=True),
+        _round_trip=fail_round_trip,
+        _require_edge_runtime=lambda: edge_runtime,
+    )
+
+    error, terminal = PipelinePolicyNode._reset_distributed_pipeline(node)
+
+    assert str(error) == "reset result timed out"
+    assert terminal is True
+
+
+def test_distributed_reset_definitive_ready_failure_is_recoverable():
+    def fail_round_trip(*_args, **kwargs):
+        progress: _RoundTripProgress = kwargs["progress"]
+        progress.published = True
+        progress.response_received = True
+        progress.backend_ready = True
+        raise RuntimeError("reset rejected")
+
+    node = SimpleNamespace(
+        _config=SimpleNamespace(pipeline_id="policy", request_timeout=0.1),
+        _require_edge_session=lambda: SimpleNamespace(reset_supported=True),
+        _round_trip=fail_round_trip,
+    )
+
+    error, terminal = PipelinePolicyNode._reset_distributed_pipeline(node)
+
+    assert str(error) == "reset rejected"
+    assert terminal is False
+
+
+def test_distributed_edge_reset_failure_after_cloud_success_is_terminal():
+    edge_runtime = SimpleNamespace(reset=lambda _deadline: (_ for _ in ()).throw(RuntimeError("edge reset failed")))
+    node = SimpleNamespace(
+        _config=SimpleNamespace(pipeline_id="policy", request_timeout=0.1),
+        _require_edge_session=lambda: SimpleNamespace(reset_supported=True),
+        _round_trip=lambda *_args, **_kwargs: None,
+        _require_edge_runtime=lambda: edge_runtime,
+    )
+
+    error, terminal = PipelinePolicyNode._reset_distributed_pipeline(node)
+
+    assert str(error) == "edge reset failed"
+    assert terminal is True

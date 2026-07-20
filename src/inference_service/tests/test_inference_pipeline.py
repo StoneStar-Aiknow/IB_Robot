@@ -11,7 +11,9 @@ import pytest
 
 from inference_manifest import load_inference_manifest
 from inference_service.backends import (
+    BackendAdmissionError,
     BackendAdmissionEvidence,
+    BackendCancellationError,
     BackendCapabilities,
     BackendInferenceError,
     BackendResult,
@@ -106,6 +108,7 @@ class RecordingProcessor:
         self.trace = trace
         self.load_calls = 0
         self.close_calls = 0
+        self.reset_calls = 0
         self.calls: list[dict[str, object]] = []
 
     def load(self, context: RuntimeContext) -> None:
@@ -117,6 +120,9 @@ class RecordingProcessor:
         recorded = dict(inputs)
         self.calls.append(recorded)
         return recorded
+
+    def reset(self) -> None:
+        self.reset_calls += 1
 
     def close(self) -> None:
         self.close_calls += 1
@@ -131,6 +137,7 @@ class RecordingPostprocessor:
         self.offset = offset
         self.load_calls = 0
         self.close_calls = 0
+        self.reset_calls = 0
         self.calls: list[object] = []
 
     def load(self, context: RuntimeContext) -> None:
@@ -141,6 +148,9 @@ class RecordingPostprocessor:
     def __call__(self, action: object) -> object:
         self.calls.append(action)
         return np.asarray(action) + self.offset
+
+    def reset(self) -> None:
+        self.reset_calls += 1
 
     def close(self) -> None:
         self.close_calls += 1
@@ -163,6 +173,7 @@ class MockBackend(LifecycleBackend):
         self.load_calls = 0
         self.close_calls = 0
         self.reset_calls = 0
+        self.cancel_calls: list[str] = []
         self.requests: list[InferenceRequest] = []
         self.result_factory: Callable[[InferenceRequest], BackendResult] = lambda request: BackendResult(
             action=np.full((1, 2, 6), float(np.asarray(request.inputs["observation.state"])[0, 0])),
@@ -212,6 +223,9 @@ class MockBackend(LifecycleBackend):
         self.reset_started.set()
         if not self.reset_release.wait(timeout=2):
             raise RuntimeError("mock reset release timed out")
+
+    def _cancel(self, request_id: str) -> None:
+        self.cancel_calls.append(request_id)
 
     def _close(self) -> None:
         self.close_calls += 1
@@ -507,6 +521,143 @@ def test_targeted_reset_only_resets_selected_pipeline(tmp_path):
     manager.close()
 
 
+def test_pipeline_reset_resets_backend_and_processors(tmp_path):
+    capabilities = BackendCapabilities(resettable=True, stateful=True)
+    backend = MockBackend("reset-policy", capabilities=capabilities, domains=ResourceDomainAdmissions())
+    preprocessor = RecordingProcessor("preprocessor")
+    postprocessor = RecordingPostprocessor("postprocessor")
+    pipeline, _ = _native_pipeline(
+        tmp_path / "bundle",
+        "policy",
+        backend=backend,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+    )
+    pipeline.load()
+
+    pipeline.reset()
+
+    assert backend.reset_calls == 1
+    assert preprocessor.reset_calls == 1
+    assert postprocessor.reset_calls == 1
+    pipeline.close()
+
+
+def test_processor_reset_failure_leaves_pipeline_failed(tmp_path):
+    class FailingResetProcessor(RecordingProcessor):
+        def reset(self) -> None:
+            raise RuntimeError("processor reset failed")
+
+    capabilities = BackendCapabilities(resettable=True, stateful=True)
+    backend = MockBackend("reset-policy", capabilities=capabilities, domains=ResourceDomainAdmissions())
+    pipeline, _ = _native_pipeline(
+        tmp_path / "bundle",
+        "policy",
+        backend=backend,
+        preprocessor=FailingResetProcessor("preprocessor"),
+        postprocessor=RecordingPostprocessor("postprocessor"),
+    )
+    pipeline.load()
+
+    with pytest.raises(RuntimeError, match="processor reset failed"):
+        pipeline.reset()
+
+    assert pipeline.state is PipelineState.FAILED
+    pipeline.close()
+
+
+def test_stateful_non_resettable_backend_rejects_reset_without_mutating_processors(tmp_path):
+    capabilities = BackendCapabilities(resettable=False, stateful=True)
+    backend = MockBackend("stateful", capabilities=capabilities, domains=ResourceDomainAdmissions())
+    preprocessor = RecordingProcessor("preprocessor")
+    postprocessor = RecordingPostprocessor("postprocessor")
+    pipeline, _ = _native_pipeline(
+        tmp_path / "bundle",
+        "policy",
+        backend=backend,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+    )
+    pipeline.load()
+
+    with pytest.raises(PipelineLifecycleError) as error:
+        pipeline.reset()
+
+    assert error.value.code == "reset_unsupported"
+    assert backend.reset_calls == 0
+    assert preprocessor.reset_calls == 0
+    assert postprocessor.reset_calls == 0
+    assert pipeline.state is PipelineState.READY
+    pipeline.close()
+
+
+def test_backend_reset_admission_timeout_preserves_ready_state_and_processors(tmp_path):
+    class AdmissionTimeoutBackend(MockBackend):
+        def reset(self, deadline=None) -> None:
+            raise BackendAdmissionError("reset admission timed out", code="deadline_exceeded")
+
+    capabilities = BackendCapabilities(resettable=True, stateful=True)
+    backend = AdmissionTimeoutBackend("reset-policy", capabilities=capabilities, domains=ResourceDomainAdmissions())
+    preprocessor = RecordingProcessor("preprocessor")
+    postprocessor = RecordingPostprocessor("postprocessor")
+    pipeline, _ = _native_pipeline(
+        tmp_path / "bundle",
+        "policy",
+        backend=backend,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+    )
+    pipeline.load()
+
+    with pytest.raises(BackendAdmissionError, match="reset admission timed out"):
+        pipeline.reset()
+
+    assert pipeline.state is PipelineState.READY
+    assert preprocessor.reset_calls == 0
+    assert postprocessor.reset_calls == 0
+    pipeline.close()
+
+
+def test_backend_reset_expired_before_execution_does_not_fail_backend(tmp_path):
+    capabilities = BackendCapabilities(resettable=True, stateful=True)
+    backend = MockBackend("reset-policy", capabilities=capabilities, domains=ResourceDomainAdmissions())
+    pipeline, _ = _native_pipeline(tmp_path / "bundle", "policy", backend=backend)
+    pipeline.load()
+
+    with pytest.raises(BackendAdmissionError):
+        backend.reset(deadline=datetime.now(timezone.utc) - timedelta(seconds=1))
+
+    assert backend.health().state is BackendState.READY
+    assert backend.reset_calls == 0
+    pipeline.close()
+
+
+def test_deadline_after_backend_reset_before_processor_reset_fails_pipeline(tmp_path):
+    class LateReturningBackend(MockBackend):
+        def reset(self, deadline=None) -> None:
+            self.reset_calls += 1
+            time.sleep(0.02)
+
+    capabilities = BackendCapabilities(resettable=True, stateful=True)
+    backend = LateReturningBackend("reset-policy", capabilities=capabilities, domains=ResourceDomainAdmissions())
+    preprocessor = RecordingProcessor("preprocessor")
+    pipeline, _ = _native_pipeline(
+        tmp_path / "bundle",
+        "policy",
+        backend=backend,
+        preprocessor=preprocessor,
+    )
+    pipeline.load()
+
+    with pytest.raises(PipelineTimeoutError):
+        pipeline.reset(deadline=datetime.now(timezone.utc) + timedelta(milliseconds=5))
+
+    assert backend.health().ready
+    assert preprocessor.reset_calls == 0
+    assert pipeline.state is PipelineState.FAILED
+    pipeline.close()
+
+
 def test_resetting_pipeline_does_not_change_other_pipeline_state_or_admission(tmp_path):
     capabilities = BackendCapabilities(resettable=True, stateful=True)
     first_backend = MockBackend("reset-first", capabilities=capabilities, domains=ResourceDomainAdmissions())
@@ -575,6 +726,146 @@ def test_pipeline_revalidates_postprocessed_action(tmp_path):
     pipeline.close()
 
 
+@pytest.mark.parametrize("failure_stage", ["backend_output", "postprocessor", "postprocessor_output"])
+def test_stateful_backend_completion_followed_by_processing_failure_fails_pipeline(tmp_path, failure_stage):
+    backend = MockBackend(
+        "stateful-processing-failure",
+        capabilities=BackendCapabilities(resettable=True, stateful=True),
+    )
+    postprocessor = None
+    if failure_stage == "backend_output":
+        backend.result_factory = lambda request: _unsafe_backend_result(np.zeros((1, 2, 5)), 2)
+    elif failure_stage == "postprocessor":
+
+        def postprocessor(action: object) -> object:
+            raise RuntimeError("postprocessor failed")
+    else:
+
+        def postprocessor(action: object) -> object:
+            return np.zeros((1, 2, 5), dtype=np.float32)
+
+    pipeline, _ = _native_pipeline(
+        tmp_path / "bundle",
+        "policy",
+        backend=backend,
+        postprocessor=postprocessor,  # type: ignore[arg-type]
+    )
+    pipeline.load()
+
+    with pytest.raises((PipelineValidationError, RuntimeError)):
+        pipeline.infer(_request())
+
+    assert pipeline.state is PipelineState.FAILED
+    with pytest.raises(PipelineNotReadyError):
+        pipeline.infer(_request("after-processing-failure"))
+    pipeline.close()
+
+
+@pytest.mark.parametrize("failure_stage", ["decode", "raw_snapshot"])
+def test_stateful_backend_completion_followed_by_internal_processing_failure_fails_pipeline(
+    tmp_path, monkeypatch, failure_stage
+):
+    backend = MockBackend(
+        "stateful-internal-failure",
+        capabilities=BackendCapabilities(resettable=True, stateful=True),
+    )
+    pipeline, _ = _native_pipeline(tmp_path / "bundle", "policy", backend=backend)
+    pipeline.load()
+    if failure_stage == "decode":
+        monkeypatch.setattr(
+            pipeline,
+            "_decode_backend_action",
+            lambda result: (_ for _ in ()).throw(RuntimeError("decode failed")),
+        )
+        capture_raw_action = False
+    else:
+        monkeypatch.setattr(
+            "inference_service.pipeline.runtime._snapshot_action",
+            lambda action: (_ for _ in ()).throw(RuntimeError("snapshot failed")),
+        )
+        capture_raw_action = True
+
+    expected_message = "decode failed" if failure_stage == "decode" else "snapshot failed"
+    with pytest.raises(RuntimeError, match=expected_message):
+        pipeline.infer(_request(), capture_raw_action=capture_raw_action)
+
+    assert pipeline.state is PipelineState.FAILED
+    pipeline.close()
+
+
+def test_concurrent_result_is_discarded_after_another_request_fails_pipeline(tmp_path):
+    second_in_postprocessor = threading.Event()
+    release_second = threading.Event()
+
+    def postprocessor(action: object) -> object:
+        value = float(np.asarray(action).reshape(-1)[0])
+        if value == 2.0:
+            second_in_postprocessor.set()
+            if not release_second.wait(timeout=2):
+                raise RuntimeError("second postprocessor release timed out")
+            return action
+        if not second_in_postprocessor.wait(timeout=2):
+            raise RuntimeError("second request did not reach postprocessor")
+        raise RuntimeError("first postprocessor failed")
+
+    backend = MockBackend(
+        "stateful-concurrent-processing",
+        capabilities=BackendCapabilities(resettable=True, stateful=True),
+        domains=ResourceDomainAdmissions(),
+    )
+    pipeline, _ = _native_pipeline(
+        tmp_path / "bundle",
+        "policy",
+        backend=backend,
+        postprocessor=postprocessor,  # type: ignore[arg-type]
+    )
+    pipeline.load()
+
+    second_thread, second_results, second_errors = _thread_call(lambda: pipeline.infer(_request("second", value=2.0)))
+    assert second_in_postprocessor.wait(timeout=2)
+    first_thread, _, first_errors = _thread_call(lambda: pipeline.infer(_request("first", value=1.0)))
+    first_thread.join(timeout=2)
+    assert isinstance(first_errors[0], RuntimeError)
+    assert pipeline.state is PipelineState.FAILED
+
+    release_second.set()
+    second_thread.join(timeout=2)
+
+    assert second_results == []
+    assert len(second_errors) == 1
+    assert isinstance(second_errors[0], PipelineNotReadyError)
+    pipeline.close()
+
+
+def test_stateful_protocol_backend_exception_fails_closed_even_if_health_stays_ready(tmp_path):
+    class MisreportingBackend:
+        name = "misreporting"
+        capabilities = BackendCapabilities(resettable=False, stateful=True)
+
+        def load(self, context: RuntimeContext) -> None:
+            return None
+
+        def infer(self, request: InferenceRequest) -> BackendResult:
+            raise RuntimeError("state mutated before failure")
+
+        def health(self):
+            from inference_service.backends import BackendHealth
+
+            return BackendHealth(state=BackendState.READY, ready=True)
+
+        def close(self) -> None:
+            return None
+
+    pipeline = InferencePipeline("policy", _context(tmp_path / "bundle"), MisreportingBackend())
+    pipeline.load()
+
+    with pytest.raises(RuntimeError, match="state mutated before failure"):
+        pipeline.infer(_request())
+
+    assert pipeline.state is PipelineState.FAILED
+    pipeline.close()
+
+
 def test_request_prompt_overrides_pipeline_default_task(tmp_path):
     preprocessor = RecordingProcessor("preprocessor")
     pipeline, backend = _native_pipeline(
@@ -621,6 +912,39 @@ def test_uncancellable_backend_overrun_finishes_synchronously_and_discards_late_
     assert error.value.details["timeout_mode"] == "cooperative_deadline_no_detached_threads"
     assert backend.active_infer == 0
     assert pipeline.state is PipelineState.READY
+    pipeline.close()
+
+
+def test_stateful_backend_overrun_fails_pipeline_after_discarding_result(tmp_path):
+    backend = MockBackend(
+        "mock-policy",
+        capabilities=BackendCapabilities(resettable=True, stateful=True),
+    )
+    pipeline, backend = _native_pipeline(
+        tmp_path / "bundle",
+        "policy",
+        backend=backend,
+        request_timeout=0.01,
+    )
+
+    def slow_result(request: InferenceRequest) -> BackendResult:
+        time.sleep(0.03)
+        return BackendResult(
+            action=np.zeros((1, 2, 6), dtype=np.float32),
+            actual_chunk_size=2,
+            backend_latency_ms=30.0,
+        )
+
+    backend.result_factory = slow_result
+    pipeline.load()
+
+    with pytest.raises(PipelineTimeoutError) as error:
+        pipeline.infer(_request())
+
+    assert error.value.details["backend_completed"] is True
+    assert pipeline.state is PipelineState.FAILED
+    with pytest.raises(PipelineNotReadyError):
+        pipeline.infer(_request("after-timeout"))
     pipeline.close()
 
 
@@ -811,6 +1135,70 @@ def test_backend_inference_failure_moves_pipeline_to_failed(tmp_path):
         pipeline.infer(_request())
 
     assert pipeline.state is PipelineState.FAILED
+    pipeline.close()
+
+
+def test_late_stateful_cancel_moves_pipeline_to_failed(tmp_path):
+    class LateCancelBackend(MockBackend):
+        def _cancel(self, request_id: str) -> None:
+            super()._cancel(request_id)
+            time.sleep(0.02)
+
+    backend = LateCancelBackend(
+        "late-cancel",
+        capabilities=BackendCapabilities(resettable=True, stateful=True, supports_cancellation=True),
+        domains=ResourceDomainAdmissions(),
+    )
+    pipeline, _ = _native_pipeline(tmp_path / "bundle", "policy", backend=backend)
+    pipeline.load()
+
+    with pytest.raises(BackendCancellationError, match="deadline expired during execution") as error:
+        pipeline.cancel("request", deadline=datetime.now(timezone.utc) + timedelta(milliseconds=5))
+
+    assert error.value.operation_started is True
+    assert backend.cancel_calls == ["request"]
+    assert pipeline.state is PipelineState.FAILED
+    pipeline.close()
+
+
+def test_stateful_cancel_exception_moves_backend_and_pipeline_to_failed(tmp_path):
+    class FailingCancelBackend(MockBackend):
+        def _cancel(self, request_id: str) -> None:
+            super()._cancel(request_id)
+            raise RuntimeError("cancel acknowledgement lost")
+
+    backend = FailingCancelBackend(
+        "failing-cancel",
+        capabilities=BackendCapabilities(resettable=True, stateful=True, supports_cancellation=True),
+    )
+    pipeline, _ = _native_pipeline(tmp_path / "bundle", "policy", backend=backend)
+    pipeline.load()
+
+    with pytest.raises(BackendCancellationError, match="outcome is unknown") as error:
+        pipeline.cancel("request")
+
+    assert error.value.operation_started is True
+    assert error.value.outcome_known is False
+    assert backend.health().state is BackendState.FAILED
+    assert pipeline.state is PipelineState.FAILED
+    pipeline.close()
+
+
+def test_stateful_cancel_expired_before_execution_keeps_pipeline_ready(tmp_path):
+    backend = MockBackend(
+        "expired-cancel",
+        capabilities=BackendCapabilities(resettable=True, stateful=True, supports_cancellation=True),
+        domains=ResourceDomainAdmissions(),
+    )
+    pipeline, _ = _native_pipeline(tmp_path / "bundle", "policy", backend=backend)
+    pipeline.load()
+
+    with pytest.raises(BackendAdmissionError, match="deadline expired before execution") as error:
+        pipeline.cancel("request", deadline=datetime.now(timezone.utc) - timedelta(seconds=1))
+
+    assert error.value.operation_started is False
+    assert backend.cancel_calls == []
+    assert pipeline.state is PipelineState.READY
     pipeline.close()
 
 

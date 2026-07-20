@@ -279,6 +279,24 @@ robot:
 真机模式从 `ros2_control.calib_file` 读取舵机校准范围；`use_sim:=true`
 仿真模式不依赖该校准文件，而是从生成后的 URDF 关节 `limit` 读取弧度范围。
 
+Observation 的 `align` 配置同时服务离线数据和在线推理，但两个时间阈值含义不同：
+
+- `tol_ms`：`strategy: asof` 的时间对齐容差，离线录制/转换和在线采样都会使用；
+  值小于等于 `0` 时退化为 `hold`。`hold` 和 `drop` 不使用该值。
+- `max_age_ms`：在线推理允许复用的最大样本年龄，基于节点本地接收时钟计算，不能通过
+  回拨推理请求时间戳绕过。缺失或只有未来时间戳的样本始终会
+  被拒绝；大于 `0` 时还会拒绝超龄样本。以上情况都返回 `observation_not_ready`，而不是补零运行模型。
+
+```yaml
+contract:
+  observations:
+    - key: observation.images.top
+      align:
+        strategy: hold
+        tol_ms: 1500
+        max_age_ms: 500
+```
+
 LeRobot 转换 metadata 中的标定来源字段保持稳定契约。这里的
 `calibration_source` / `calibration_sources` 是数据集 metadata 输出字段，
 不是 `ros2_control` YAML 输入 schema：

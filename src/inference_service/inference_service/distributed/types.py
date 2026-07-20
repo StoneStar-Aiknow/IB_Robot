@@ -239,6 +239,10 @@ def structured_error_from_exception(exc: Exception, stage: str) -> StructuredErr
     capability = getattr(exc, "capability", None)
     if capability is not None:
         details = {**details, "capability": capability}
+    for field_name in ("operation_started", "outcome_known"):
+        value = getattr(exc, field_name, None)
+        if isinstance(value, bool):
+            details = {**details, field_name: value}
     return StructuredError(
         code=str(getattr(exc, "code", "operation_failed")),
         message=str(exc) or type(exc).__name__,

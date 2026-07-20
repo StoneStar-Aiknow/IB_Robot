@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timezone
 
 from inference_manifest import CompiledDeployment, ValidatedManifest
 from inference_service.backends import (
@@ -42,6 +42,7 @@ class EdgeProcessorRuntime:
         self._default_task = default_task
         self._preprocessor, self._postprocessor = create_lerobot_processor_views()
         self._loaded = False
+        self._reset_error: Exception | None = None
 
     def load(self) -> None:
         if self._loaded:
@@ -51,8 +52,7 @@ class EdgeProcessorRuntime:
         self._loaded = True
 
     def preprocess(self, inputs: Mapping[str, object], *, prompt: str | None = None) -> Mapping[str, object]:
-        if not self._loaded:
-            raise RuntimeError("edge processors are not loaded")
+        self._require_ready()
         values = dict(inputs)
         selected_prompt = prompt if prompt is not None else self._default_task
         if selected_prompt is not None:
@@ -63,8 +63,7 @@ class EdgeProcessorRuntime:
         return result
 
     def postprocess(self, action: object, *, actual_chunk_size: int) -> object:
-        if not self._loaded:
-            raise RuntimeError("edge processors are not loaded")
+        self._require_ready()
         result = self._postprocessor(action)
         validate_action_output(
             result,
@@ -75,10 +74,29 @@ class EdgeProcessorRuntime:
         )
         return result
 
+    def reset(self, deadline: datetime | None = None) -> None:
+        self._require_ready()
+        try:
+            self._preprocessor.reset()
+        except Exception as exc:
+            self._reset_error = exc
+            raise
+        if deadline is not None and datetime.now(timezone.utc) >= deadline:
+            raise TimeoutError("edge processor reset deadline expired")
+
     def close(self) -> None:
         self._postprocessor.close()
         self._preprocessor.close()
         self._loaded = False
+        self._reset_error = None
+
+    def _require_ready(self) -> None:
+        if not self._loaded:
+            raise RuntimeError("edge processors are not loaded")
+        if self._reset_error is not None:
+            raise RuntimeError(
+                f"edge processors are unavailable after reset failure: {self._reset_error}"
+            ) from self._reset_error
 
 
 class CloudBackendRuntime:
@@ -126,11 +144,11 @@ class CloudBackendRuntime:
             InferenceRequest(request_id=request_id, inputs=inputs, prompt=prompt, deadline=deadline),
         )
 
-    def reset(self) -> None:
-        self._manager.reset(self.pipeline_id)
+    def reset(self, deadline: datetime | None = None) -> None:
+        self._manager.reset(self.pipeline_id, deadline)
 
-    def cancel(self, request_id: str) -> None:
-        self._manager.cancel(self.pipeline_id, request_id)
+    def cancel(self, request_id: str, deadline: datetime | None = None) -> None:
+        self._manager.cancel(self.pipeline_id, request_id, deadline)
 
     def health(self):
         return self._manager.health(self.pipeline_id)

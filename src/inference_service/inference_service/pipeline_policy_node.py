@@ -6,7 +6,8 @@ import json
 import threading
 import time
 import traceback
-from dataclasses import dataclass
+from bisect import bisect_left, bisect_right
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -51,13 +52,10 @@ from inference_service.distributed.ros_protocol import (
 from inference_service.pipeline import InferencePipelineManager, create_pipeline_manager
 from robot_config.contract_utils import (
     SpecView,
-    StreamBuffer,
     decode_value,
-    feature_from_spec,
     iter_specs,
     qos_profile_from_dict,
     stamp_from_header_ns,
-    zero_pad,
 )
 from robot_config.utils import (
     build_joint_conversion_table,
@@ -94,7 +92,10 @@ class PipelineNodeConfig:
 @dataclass
 class _SubState:
     spec: SpecView
-    buffer: StreamBuffer
+    max_age_ns: int
+    step_ns: int
+    history_window_ns: int
+    history: list[tuple[int, int, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -106,6 +107,43 @@ class _PendingOperation:
     deployment_fingerprint: str = ""
     result: DistributedResult | None = None
     error: StructuredError | None = None
+
+
+@dataclass
+class _RoundTripProgress:
+    published: bool = False
+    response_received: bool = False
+    response_success: bool = False
+    backend_ready: bool = False
+
+
+class ObservationNotReadyError(RuntimeError):
+    code = "observation_not_ready"
+    recoverable = True
+    stage = "observation"
+
+    def __init__(self, observations: list[dict[str, object]]) -> None:
+        summary = ", ".join(f"{item['key']} ({item['topic']}): {item['reason']}" for item in observations)
+        super().__init__(f"required policy observations are not ready: {summary}")
+        self.details = {"observations": observations}
+
+
+class PipelineBusyError(RuntimeError):
+    code = "pipeline_busy"
+    recoverable = True
+    stage = "admission"
+
+
+class RequestCanceledError(RuntimeError):
+    code = "request_canceled"
+    recoverable = True
+    stage = "cancel"
+
+
+class DeadlineExceededError(RuntimeError):
+    code = "deadline_exceeded"
+    recoverable = True
+    stage = "deadline"
 
 
 class PipelinePolicyNode(Node):
@@ -128,15 +166,23 @@ class PipelinePolicyNode(Node):
         self._frequency = 10.0
         self._obs_specs: list[SpecView] = []
         self._state_specs: list[SpecView] = []
-        self._obs_zero: dict[str, np.ndarray] = {}
         self._subs: dict[str, _SubState] = {}
         self._joint_rad_limits: list[tuple[float, float, float, float]] = []
         self._last_inference_time: float | None = None
         self._inference_count = 0
         self._last_error = ""
         self._remote_state = "unavailable"
+        self._operation_lock = threading.Lock()
+        self._reset_pending = threading.Event()
+        self._observation_lock = threading.RLock()
+        self._observation_epoch = 0
+        self._observation_reset_cutoff_ns = 0
         self._pending_lock = threading.RLock()
         self._pending: dict[str, _PendingOperation] = {}
+        self._goal_state_lock = threading.Lock()
+        self._cancel_requested_goals: set[int] = set()
+        self._cancel_confirmed_goals: set[int] = set()
+        self._completed_goals: set[int] = set()
         self._goal_request_ids: dict[int, str] = {}
 
         self._load_contract(config.robot_config_path)
@@ -205,11 +251,12 @@ class PipelinePolicyNode(Node):
                 MutuallyExclusiveCallbackGroup() if config.execution_mode == "monolithic" else ReentrantCallbackGroup()
             ),
         )
+        self._reset_callback_group = MutuallyExclusiveCallbackGroup()
         self._reset_server = self.create_service(
             Trigger,
             config.reset_service,
             self._reset_callback,
-            callback_group=ReentrantCallbackGroup(),
+            callback_group=self._reset_callback_group,
         )
         self._health_timer = self.create_timer(1.0, self._publish_health)
         self.get_logger().info(
@@ -278,9 +325,22 @@ class PipelinePolicyNode(Node):
         from rosidl_runtime_py.utilities import get_message
 
         for spec in self._obs_specs:
-            _, metadata, _ = feature_from_spec(spec, use_videos=False)
             key = self._subscription_key(spec)
-            self._obs_zero[key] = zero_pad(metadata)
+            max_age_ms = int(spec.max_age_ms)
+            step_ns = int(1e9 / self._frequency)
+            asof_tolerance_ns = max(0, int(getattr(spec, "asof_tol_ms", 0))) * 1_000_000
+            policy = str(getattr(spec, "resample_policy", "hold")).lower()
+            alignment_window_ns = asof_tolerance_ns if policy == "asof" else step_ns if policy == "drop" else 0
+            self._subs[key] = _SubState(
+                spec=spec,
+                max_age_ns=max_age_ms * 1_000_000,
+                step_ns=step_ns,
+                history_window_ns=max(
+                    step_ns * 2,
+                    max_age_ms * 1_000_000 + step_ns,
+                    alignment_window_ns + step_ns,
+                ),
+            )
             message_type = get_message(spec.ros_type)
             qos = qos_profile_from_dict(self._topic_to_qos.get(spec.topic, {})) or QoSProfile(depth=10)
             self.create_subscription(
@@ -290,14 +350,6 @@ class PipelinePolicyNode(Node):
                 qos,
                 callback_group=ReentrantCallbackGroup(),
             )
-            self._subs[key] = _SubState(
-                spec=spec,
-                buffer=StreamBuffer(
-                    policy=getattr(spec, "resample_policy", "hold"),
-                    step_ns=int(1e9 / self._frequency),
-                    tol_ns=int(max(0, getattr(spec, "asof_tol_ms", 0)) * 1_000_000),
-                ),
-            )
 
     def _subscription_key(self, spec: SpecView) -> str:
         if spec.key == "observation.state" and len(self._state_specs) > 1:
@@ -305,28 +357,180 @@ class PipelinePolicyNode(Node):
         return spec.key
 
     def _observation_callback(self, message: object, spec: SpecView) -> None:
+        with self._observation_lock:
+            epoch = self._observation_epoch
         receive_time = self.get_clock().now().nanoseconds
         timestamp = stamp_from_header_ns(message) if spec.stamp_src == "header" else None
-        value = decode_value(spec.ros_type, message, spec)
-        if value is not None:
-            self._subs[self._subscription_key(spec)].buffer.push(int(timestamp or receive_time), value)
+        with self._observation_lock:
+            if epoch != self._observation_epoch:
+                return
+            reset_cutoff_ns = self._observation_reset_cutoff_ns
+            if reset_cutoff_ns > 0 and receive_time < reset_cutoff_ns:
+                self._observation_reset_cutoff_ns = 0
+                reset_cutoff_ns = 0
+            if timestamp is not None and timestamp <= reset_cutoff_ns:
+                return
+            PipelinePolicyNode._store_observation_locked(
+                self, self._subscription_key(spec), epoch, int(timestamp or receive_time), receive_time, message
+            )
+
+    def _store_observation(
+        self,
+        key: str,
+        epoch: int,
+        timestamp_ns: int,
+        value: object,
+        *,
+        receive_time_ns: int | None = None,
+    ) -> bool:
+        with self._observation_lock:
+            return PipelinePolicyNode._store_observation_locked(
+                self,
+                key,
+                epoch,
+                timestamp_ns,
+                receive_time_ns if receive_time_ns is not None else timestamp_ns,
+                value,
+            )
+
+    @staticmethod
+    def _store_observation_locked(
+        node: object, key: str, epoch: int, timestamp_ns: int, receive_time_ns: int, value: object
+    ) -> bool:
+        if epoch != node._observation_epoch:
+            return False
+        state = node._subs[key]
+        if timestamp_ns > receive_time_ns + state.history_window_ns:
+            return False
+        history = state.history
+        index = bisect_right([item[0] for item in history], timestamp_ns)
+        item = (timestamp_ns, receive_time_ns, value)
+        if index > 0 and history[index - 1][0] == timestamp_ns:
+            history[index - 1] = item
+        else:
+            history.insert(index, item)
+        cutoff_ns = min(history[-1][0], receive_time_ns) - state.history_window_ns
+        del history[: bisect_left([item[0] for item in history], cutoff_ns)]
+        return True
+
+    @staticmethod
+    def _sample_observation(
+        state: _SubState, sample_time_ns: int, now_ns: int | None = None
+    ) -> tuple[Any | None, dict[str, object] | None]:
+        spec = state.spec
+        if not state.history:
+            return None, {
+                "key": spec.key,
+                "topic": spec.topic,
+                "reason": "missing",
+                "sample_timestamp_ns": sample_time_ns,
+            }
+
+        index = bisect_right([item[0] for item in state.history], sample_time_ns) - 1
+        if index < 0:
+            timestamp_ns = state.history[0][0]
+            return None, {
+                "key": spec.key,
+                "topic": spec.topic,
+                "reason": "newer_than_request",
+                "sample_timestamp_ns": sample_time_ns,
+                "first_timestamp_ns": timestamp_ns,
+                "age_ms": (sample_time_ns - timestamp_ns) / 1_000_000,
+            }
+
+        timestamp_ns, receive_time_ns, value = state.history[index]
+        age_ns = sample_time_ns - timestamp_ns
+        policy = str(getattr(spec, "resample_policy", "hold")).lower()
+        if policy == "asof":
+            alignment_tolerance_ns = max(0, int(getattr(spec, "asof_tol_ms", 0))) * 1_000_000
+            if alignment_tolerance_ns > 0 and age_ns > alignment_tolerance_ns:
+                return None, {
+                    "key": spec.key,
+                    "topic": spec.topic,
+                    "reason": "stale",
+                    "constraint": "asof",
+                    "sample_timestamp_ns": sample_time_ns,
+                    "last_timestamp_ns": timestamp_ns,
+                    "age_ms": age_ns / 1_000_000,
+                    "tolerance_ms": alignment_tolerance_ns / 1_000_000,
+                }
+        elif policy == "drop":
+            if age_ns >= state.step_ns:
+                return None, {
+                    "key": spec.key,
+                    "topic": spec.topic,
+                    "reason": "stale",
+                    "constraint": "drop",
+                    "sample_timestamp_ns": sample_time_ns,
+                    "last_timestamp_ns": timestamp_ns,
+                    "age_ms": age_ns / 1_000_000,
+                    "tolerance_ms": state.step_ns / 1_000_000,
+                }
+        elif policy != "hold":
+            return None, {
+                "key": spec.key,
+                "topic": spec.topic,
+                "reason": "unsupported_alignment_strategy",
+                "strategy": policy,
+            }
+
+        live_age_ns = max(0, (now_ns if now_ns is not None else sample_time_ns) - receive_time_ns)
+        if value is None or (state.max_age_ns > 0 and live_age_ns > state.max_age_ns):
+            return None, {
+                "key": spec.key,
+                "topic": spec.topic,
+                "reason": "stale",
+                "constraint": "max_age",
+                "sample_timestamp_ns": sample_time_ns,
+                "last_timestamp_ns": timestamp_ns,
+                "age_ms": live_age_ns / 1_000_000,
+                "tolerance_ms": state.max_age_ns / 1_000_000,
+            }
+        return value, None
 
     def _sample_observations(self, sample_time_ns: int) -> dict[str, Any]:
+        selected: dict[str, object] = {}
+        issues: list[dict[str, object]] = []
+        now_ns = self.get_clock().now().nanoseconds if hasattr(self, "get_clock") else sample_time_ns
+        with self._observation_lock:
+            for key, state in self._subs.items():
+                value, issue = self._sample_observation(state, sample_time_ns, now_ns)
+                if issue is not None:
+                    issues.append(issue)
+                selected[key] = value
+
+        if issues:
+            raise ObservationNotReadyError(issues)
+
+        sampled: dict[str, Any] = {}
+        decode_issues: list[dict[str, object]] = []
+        for key, message in selected.items():
+            state = self._subs[key]
+            value = decode_value(state.spec.ros_type, message, state.spec)
+            if value is None:
+                decode_issues.append({"key": state.spec.key, "topic": state.spec.topic, "reason": "decode_failed"})
+            sampled[key] = value
+        if decode_issues:
+            raise ObservationNotReadyError(decode_issues)
+
         observations: dict[str, Any] = {}
         if len(self._state_specs) > 1:
-            state_parts = []
-            for spec in self._state_specs:
-                key = self._subscription_key(spec)
-                value = self._subs[key].buffer.sample(sample_time_ns)
-                state_parts.append(value if value is not None else self._obs_zero[key])
+            state_parts = [sampled[self._subscription_key(spec)] for spec in self._state_specs]
             observations["observation.state"] = np.concatenate(state_parts)
 
-        for key, state in self._subs.items():
+        for key, value in sampled.items():
             if key.startswith("observation.state_") and len(self._state_specs) > 1:
                 continue
-            value = state.buffer.sample(sample_time_ns)
-            observations[key] = value if value is not None else self._obs_zero[key]
+            observations[key] = value
         return observations
+
+    def _clear_observation_buffers(self, reset_time_ns: int | None = None) -> None:
+        with self._observation_lock:
+            self._observation_epoch += 1
+            if reset_time_ns is not None:
+                self._observation_reset_cutoff_ns = max(self._observation_reset_cutoff_ns, reset_time_ns)
+            for state in self._subs.values():
+                state.history.clear()
 
     def _rad_to_lerobot(self, state: np.ndarray) -> np.ndarray:
         if not self._joint_rad_limits:
@@ -370,75 +574,34 @@ class PipelinePolicyNode(Node):
         total_start = time.perf_counter()
 
         try:
-            observations = self._sample_observations(sample_time)
-            if "observation.state" in observations:
-                observations["observation.state"] = self._rad_to_lerobot(observations["observation.state"])
-            observations = self._to_policy_inputs(observations)
-            deadline = self._goal_deadline(request.deadline)
-            if self._config.execution_mode == "monolithic":
-                result = self._require_manager().infer(
-                    self._config.pipeline_id,
-                    InferenceRequest(
-                        request_id=request_id,
-                        inputs=observations,
-                        prompt=request.prompt if request.prompt else None,
-                        deadline=deadline,
-                    ),
-                )
-                raw_action = result.action
-                chunk_size = result.actual_chunk_size
-                backend_latency_ms = result.backend_latency_ms
-                total_latency_ms = result.total_latency_ms
-            else:
-                edge_runtime = self._require_edge_runtime()
-                canonical_inputs = edge_runtime.preprocess(
-                    observations,
-                    prompt=request.prompt if request.prompt else None,
-                )
-                distributed_result = self._round_trip(
-                    Operation.INFER,
-                    request_id,
-                    inputs=dict(canonical_inputs),
-                    prompt=request.prompt if request.prompt else None,
-                    deadline=deadline or datetime.now(timezone.utc) + timedelta(seconds=self._config.request_timeout),
-                    goal_handle=goal_handle,
-                )
-                raw_action = edge_runtime.postprocess(
-                    distributed_result.action,
-                    actual_chunk_size=distributed_result.actual_chunk_size,
-                )
-                chunk_size = distributed_result.actual_chunk_size
-                backend_latency_ms = distributed_result.backend_latency_ms
-                total_latency_ms = (time.perf_counter() - total_start) * 1000.0
-
-            action = self._lerobot_to_rad(raw_action)
-            action_message = TensorMsgConverter.to_variant({"action": action})
-            self._action_pub.publish(action_message)
-
-            response = DispatchInfer.Result()
-            response.action_chunk = action_message
-            response.chunk_size = chunk_size
-            response.success = True
-            response.message = "OK"
-            response.inference_latency_ms = total_latency_ms
-            response.pipeline_id = self._config.pipeline_id
-            response.request_id = request_id
-            response.deployment_fingerprint = self._manifest.fingerprint
-            response.backend_latency_ms = backend_latency_ms
-            response.error = error_to_message(None)
-            goal_handle.succeed()
-            self._last_inference_time = time.time()
-            self._inference_count += 1
-            self._last_error = ""
-            return response
+            if self._goal_cancel_requested(goal_handle):
+                raise RequestCanceledError(f"inference request {request_id!r} was canceled before admission")
+            self._acquire_operation()
+            try:
+                if self._goal_cancel_requested(goal_handle):
+                    raise RequestCanceledError(f"inference request {request_id!r} was canceled before execution")
+                return self._execute_inference_request(goal_handle, request, request_id, sample_time, total_start)
+            finally:
+                self._operation_lock.release()
         except Exception as exc:
             self._last_error = str(exc)
-            self.get_logger().error(f"pipeline inference failed: {exc}\n{traceback.format_exc()}")
+            if bool(getattr(exc, "recoverable", False)):
+                self.get_logger().warning(str(exc), throttle_duration_sec=1.0)
+            else:
+                self.get_logger().error(f"pipeline inference failed: {exc}\n{traceback.format_exc()}")
             error = (
                 exc.error
                 if isinstance(exc, DistributedProtocolError)
-                else structured_error_from_exception(exc, "pipeline")
+                else structured_error_from_exception(exc, str(getattr(exc, "stage", "pipeline")))
             )
+            if self._goal_cancel_confirmed(goal_handle) and error.code != "request_canceled":
+                error = StructuredError(
+                    code="request_canceled",
+                    message=f"inference request {request_id!r} was canceled; remote cancellation status: {exc}",
+                    stage="cancel",
+                    recoverable=True,
+                    details={"cause_code": error.code, "cause_message": error.message},
+                )
             response = DispatchInfer.Result()
             response.action_chunk = VariantsList()
             response.chunk_size = 0
@@ -450,30 +613,255 @@ class PipelinePolicyNode(Node):
             response.deployment_fingerprint = self._manifest.fingerprint
             response.backend_latency_ms = 0.0
             response.error = error_to_message(error)
-            if error.code == "request_canceled" and goal_handle.is_cancel_requested:
-                goal_handle.canceled()
+            if error.code == "request_canceled":
+                self._finish_canceled_goal(goal_handle)
             else:
                 goal_handle.abort()
             return response
         finally:
+            with self._goal_state_lock:
+                self._cancel_requested_goals.discard(id(goal_handle))
+                self._cancel_confirmed_goals.discard(id(goal_handle))
+                self._completed_goals.discard(id(goal_handle))
             self._goal_request_ids.pop(id(goal_handle), None)
 
-    def _reset_callback(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
-        try:
-            if self._config.execution_mode == "monolithic":
-                self._require_manager().reset(self._config.pipeline_id)
-            else:
-                request_id = f"{self._config.pipeline_id}-reset-{time.monotonic_ns()}"
-                self._round_trip(Operation.RESET, request_id)
-        except Exception as exc:
-            response.success = False
-            response.message = str(exc)
-            self._last_error = str(exc)
+    def _acquire_operation(self) -> None:
+        if self._reset_pending.is_set():
+            raise PipelineBusyError(f"pipeline {self._config.pipeline_id!r} is waiting to reset")
+        if not self._operation_lock.acquire(blocking=False):
+            raise PipelineBusyError(f"pipeline {self._config.pipeline_id!r} is already processing another operation")
+        if self._reset_pending.is_set():
+            self._operation_lock.release()
+            raise PipelineBusyError(f"pipeline {self._config.pipeline_id!r} is waiting to reset")
+
+    def _goal_cancel_requested(self, goal_handle: object) -> bool:
+        return bool(goal_handle.is_cancel_requested)
+
+    def _goal_cancel_confirmed(self, goal_handle: object) -> bool:
+        with self._goal_state_lock:
+            return id(goal_handle) in self._cancel_confirmed_goals
+
+    def _mark_goal_cancel_confirmed(self, goal_handle: object) -> None:
+        with self._goal_state_lock:
+            self._cancel_confirmed_goals.add(id(goal_handle))
+
+    def _finish_canceled_goal(self, goal_handle: object) -> None:
+        deadline = time.monotonic() + min(0.1, self._config.request_timeout)
+        while not goal_handle.is_cancel_requested and time.monotonic() < deadline:
+            time.sleep(0.001)
+        if goal_handle.is_cancel_requested:
+            goal_handle.canceled()
         else:
-            response.success = True
-            response.message = f"pipeline {self._config.pipeline_id} reset"
-            self._last_error = ""
+            goal_handle.abort()
+
+    def _commit_action(
+        self,
+        goal_handle: object,
+        request_id: str,
+        raw_action: object,
+        deadline: datetime | None = None,
+    ) -> VariantsList:
+        action = self._lerobot_to_rad(raw_action)
+        action_message = TensorMsgConverter.to_variant({"action": action})
+        with self._goal_state_lock:
+            if deadline is not None and datetime.now(timezone.utc) >= deadline:
+                expired = True
+                canceled = False
+            elif id(goal_handle) in self._cancel_requested_goals or goal_handle.is_cancel_requested:
+                expired = False
+                canceled = True
+            else:
+                expired = False
+                canceled = False
+                self._action_pub.publish(action_message)
+                goal_handle.succeed()
+                self._completed_goals.add(id(goal_handle))
+        if expired:
+            raise DeadlineExceededError(f"inference request {request_id!r} expired before action publication")
+        if canceled:
+            self._fail_distributed_after_late_cancel(request_id)
+            raise RequestCanceledError(f"inference request {request_id!r} was canceled before action publication")
+        return action_message
+
+    def _fail_distributed_after_late_cancel(self, request_id: str) -> None:
+        if self._config.execution_mode != "distributed":
+            return
+        error = StructuredError(
+            code="cancellation_after_remote_completion",
+            message=f"inference request {request_id!r} was canceled after remote execution completed",
+            stage="cancel",
+            details={"request_id": request_id},
+        )
+        update = self._require_edge_session().fail(error)
+        self._complete_invalidated(update.invalidated_request_ids, update.error)
+
+    def _execute_inference_request(
+        self,
+        goal_handle: object,
+        request: object,
+        request_id: str,
+        sample_time: int,
+        total_start: float,
+    ) -> DispatchInfer.Result:
+        deadline = self._goal_deadline(request.deadline)
+        if deadline is None:
+            deadline = datetime.now(timezone.utc) + timedelta(seconds=self._config.request_timeout)
+        self._raise_if_deadline_expired(deadline, request_id)
+        observations = self._sample_observations(sample_time)
+        self._raise_if_deadline_expired(deadline, request_id)
+        if "observation.state" in observations:
+            observations["observation.state"] = self._rad_to_lerobot(observations["observation.state"])
+        observations = self._to_policy_inputs(observations)
+        if self._config.execution_mode == "monolithic":
+            result = self._require_manager().infer(
+                self._config.pipeline_id,
+                InferenceRequest(
+                    request_id=request_id,
+                    inputs=observations,
+                    prompt=request.prompt if request.prompt else None,
+                    deadline=deadline,
+                ),
+            )
+            raw_action = result.action
+            chunk_size = result.actual_chunk_size
+            backend_latency_ms = result.backend_latency_ms
+            total_latency_ms = result.total_latency_ms
+        else:
+            edge_runtime = self._require_edge_runtime()
+            try:
+                canonical_inputs = edge_runtime.preprocess(
+                    observations,
+                    prompt=request.prompt if request.prompt else None,
+                )
+                self._raise_if_deadline_expired(deadline, request_id)
+                distributed_result = self._round_trip(
+                    Operation.INFER,
+                    request_id,
+                    inputs=dict(canonical_inputs),
+                    prompt=request.prompt if request.prompt else None,
+                    deadline=deadline,
+                    goal_handle=goal_handle,
+                )
+                self._raise_if_deadline_expired(deadline, request_id)
+                if self._goal_cancel_requested(goal_handle):
+                    self._fail_distributed_after_late_cancel(request_id)
+                    raise RequestCanceledError(f"inference request {request_id!r} was canceled before postprocessing")
+                raw_action = edge_runtime.postprocess(
+                    distributed_result.action,
+                    actual_chunk_size=distributed_result.actual_chunk_size,
+                )
+                self._raise_if_deadline_expired(deadline, request_id)
+                chunk_size = distributed_result.actual_chunk_size
+                backend_latency_ms = distributed_result.backend_latency_ms
+                total_latency_ms = (time.perf_counter() - total_start) * 1000.0
+            except Exception as exc:
+                self._fail_distributed_after_deadline(request_id, exc)
+                raise
+
+        try:
+            action_message = self._commit_action(goal_handle, request_id, raw_action, deadline)
+        except Exception as exc:
+            self._fail_distributed_after_deadline(request_id, exc)
+            raise
+
+        response = DispatchInfer.Result()
+        response.action_chunk = action_message
+        response.chunk_size = chunk_size
+        response.success = True
+        response.message = "OK"
+        response.inference_latency_ms = total_latency_ms
+        response.pipeline_id = self._config.pipeline_id
+        response.request_id = request_id
+        response.deployment_fingerprint = self._manifest.fingerprint
+        response.backend_latency_ms = backend_latency_ms
+        response.error = error_to_message(None)
+        self._last_inference_time = time.time()
+        self._inference_count += 1
+        self._last_error = ""
         return response
+
+    def _reset_callback(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=self._config.request_timeout)
+        self._reset_pending.set()
+        acquired = self._operation_lock.acquire(
+            timeout=max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
+        )
+        if not acquired:
+            self._reset_pending.clear()
+            response.success = False
+            response.message = f"pipeline {self._config.pipeline_id!r} reset timed out waiting for active operation"
+            self._last_error = response.message
+            return response
+        try:
+            reset_error: Exception | None = None
+            terminal_reset_failure = False
+            clear_observations = False
+            if self._config.execution_mode == "monolithic":
+                try:
+                    self._require_manager().reset(self._config.pipeline_id, deadline)
+                except Exception as exc:
+                    reset_error = exc
+                    clear_observations = not self._require_manager().health(self._config.pipeline_id).ready
+                else:
+                    clear_observations = True
+            else:
+                reset_error, terminal_reset_failure = self._reset_distributed_pipeline(deadline)
+                clear_observations = reset_error is None or terminal_reset_failure
+            if clear_observations:
+                self._clear_observation_buffers(self.get_clock().now().nanoseconds)
+
+            if reset_error is not None:
+                if terminal_reset_failure:
+                    error = (
+                        reset_error.error
+                        if isinstance(reset_error, DistributedProtocolError)
+                        else structured_error_from_exception(reset_error, "reset")
+                    )
+                    update = self._require_edge_session().fail(error)
+                    self._complete_invalidated(update.invalidated_request_ids, update.error)
+                response.success = False
+                response.message = str(reset_error)
+                self._last_error = str(reset_error)
+            else:
+                response.success = True
+                response.message = f"pipeline {self._config.pipeline_id} reset"
+                self._last_error = ""
+            return response
+        finally:
+            self._reset_pending.clear()
+            self._operation_lock.release()
+
+    def _reset_distributed_pipeline(self, deadline: datetime | None = None) -> tuple[Exception | None, bool]:
+        if not self._require_edge_session().reset_supported:
+            return (
+                DistributedProtocolError(
+                    StructuredError(
+                        code="unsupported_capability",
+                        message="cloud pipeline does not support reset",
+                        stage="reset",
+                    )
+                ),
+                False,
+            )
+
+        deadline = deadline or datetime.now(timezone.utc) + timedelta(seconds=self._config.request_timeout)
+        request_id = f"{self._config.pipeline_id}-reset-{time.monotonic_ns()}"
+        progress = _RoundTripProgress()
+        try:
+            self._round_trip(
+                Operation.RESET,
+                request_id,
+                deadline=deadline,
+                progress=progress,
+            )
+        except Exception as exc:
+            terminal = progress.published and (not progress.response_received or not progress.backend_ready)
+            return exc, terminal
+        try:
+            self._require_edge_runtime().reset(deadline)
+        except Exception as exc:
+            return exc, True
+        return None, False
 
     def _publish_health(self) -> None:
         try:
@@ -518,7 +906,7 @@ class PipelinePolicyNode(Node):
         health = DiagnosticStatus()
         health.level = level
         health.name = f"inference/{self._config.pipeline_id}"
-        health.message = self._last_error or message
+        health.message = message if level == DiagnosticStatus.ERROR else self._last_error or message
         health.hardware_id = self._manifest.fingerprint
         health.values = [KeyValue(key=str(key), value=str(value)) for key, value in values.items()]
         self._health_pub.publish(health)
@@ -577,14 +965,14 @@ class PipelinePolicyNode(Node):
         if update.error is not None and update.error.code == "stale_response":
             self.get_logger().warning(update.error.message)
             return
-        if update.error is not None and result.request_id not in self._pending:
-            self.get_logger().warning(update.error.message)
-            return
         with self._pending_lock:
             pending = self._pending.get(result.request_id)
             if pending is not None:
-                pending.result = result
-                pending.error = result.error
+                if update.error is not None:
+                    pending.error = update.error
+                else:
+                    pending.result = result
+                    pending.error = result.error
                 pending.event.set()
             if update.canceled_request_id:
                 canceled = self._pending.get(update.canceled_request_id)
@@ -607,6 +995,7 @@ class PipelinePolicyNode(Node):
         deadline: datetime | None = None,
         target_request_id: str = "",
         goal_handle: object | None = None,
+        progress: _RoundTripProgress | None = None,
     ) -> DistributedResult:
         pending = _PendingOperation(event=threading.Event(), operation=operation)
         with self._pending_lock:
@@ -623,6 +1012,8 @@ class PipelinePolicyNode(Node):
                     pending.session_generation = current.session_generation
                     pending.deployment_fingerprint = current.deployment_fingerprint
                 self._request_pub.publish(request_to_message(current))
+                if progress is not None:
+                    progress.published = True
 
             request = self._require_edge_session().dispatch_request(
                 operation,
@@ -642,9 +1033,33 @@ class PipelinePolicyNode(Node):
                             stage="transport",
                         )
                     )
-                if goal_handle is not None and goal_handle.is_cancel_requested and not cancel_sent:
+                if goal_handle is not None and self._goal_cancel_requested(goal_handle) and not cancel_sent:
                     cancel_sent = True
-                    self._route_cancel(request.request_id)
+                    try:
+                        self._route_cancel(request.request_id)
+                    except Exception as exc:
+                        error = StructuredError(
+                            code="cancellation_outcome_unknown",
+                            message=f"remote cancellation outcome is unknown: {exc}",
+                            stage="cancel",
+                            details={"request_id": request.request_id},
+                        )
+                        update = self._require_edge_session().fail(error)
+                        self._complete_invalidated(update.invalidated_request_ids, update.error)
+                        raise DistributedProtocolError(error) from exc
+                    self._mark_goal_cancel_confirmed(goal_handle)
+            if request.deadline is not None and datetime.now(timezone.utc) >= request.deadline:
+                raise DistributedProtocolError(
+                    StructuredError(
+                        code="deadline_exceeded",
+                        message=f"distributed request {request.request_id!r} timed out",
+                        stage="transport",
+                    )
+                )
+            if pending.result is not None and progress is not None:
+                progress.response_received = True
+                progress.response_success = pending.result.success
+                progress.backend_ready = pending.result.backend_ready
             if pending.error is not None:
                 raise DistributedProtocolError(pending.error)
             if pending.result is None:
@@ -686,11 +1101,16 @@ class PipelinePolicyNode(Node):
             Operation.CANCEL,
             request_id,
             target_request_id=target_request_id,
+            deadline=datetime.now(timezone.utc) + timedelta(seconds=self._config.request_timeout),
         )
 
-    def _cancel_callback(self, _goal_handle: object):
+    def _cancel_callback(self, goal_handle: object):
         if self._config.execution_mode == "distributed" and self._require_edge_session().cancellation_supported:
-            return rclpy.action.CancelResponse.ACCEPT
+            with self._goal_state_lock:
+                if id(goal_handle) in self._completed_goals:
+                    return rclpy.action.CancelResponse.REJECT
+                self._cancel_requested_goals.add(id(goal_handle))
+                return rclpy.action.CancelResponse.ACCEPT
         return rclpy.action.CancelResponse.REJECT
 
     def _complete_invalidated(
@@ -720,6 +1140,28 @@ class PipelinePolicyNode(Node):
         if seconds == 0 and nanoseconds == 0:
             return None
         return datetime.fromtimestamp(seconds + nanoseconds / 1_000_000_000, tz=timezone.utc)
+
+    @staticmethod
+    def _raise_if_deadline_expired(deadline: datetime, request_id: str) -> None:
+        if datetime.now(timezone.utc) >= deadline:
+            raise DeadlineExceededError(f"inference request {request_id!r} exceeded its deadline")
+
+    def _fail_distributed_after_deadline(self, request_id: str, exc: Exception) -> None:
+        if self._config.execution_mode != "distributed":
+            return
+        error = (
+            exc.error if isinstance(exc, DistributedProtocolError) else structured_error_from_exception(exc, "deadline")
+        )
+        if error.code != "deadline_exceeded":
+            return
+        failure = StructuredError(
+            code="deadline_exceeded",
+            message=f"distributed inference {request_id!r} exceeded its deadline after edge processing began",
+            stage="deadline",
+            details={"request_id": request_id, "cause": error.message},
+        )
+        update = self._require_edge_session().fail(failure)
+        self._complete_invalidated(update.invalidated_request_ids, update.error)
 
     def _require_manager(self) -> InferencePipelineManager:
         if self._manager is None:

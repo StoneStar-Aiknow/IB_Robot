@@ -5,11 +5,14 @@ from __future__ import annotations
 import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
 
 from inference_service.backends.admission import BackendAdmission, ResourceDomainAdmissions
 from inference_service.backends.errors import (
+    BackendAdmissionError,
+    BackendCancellationError,
     BackendCapabilityError,
     BackendError,
     BackendInferenceError,
@@ -88,6 +91,7 @@ class LifecycleBackend(ABC):
         self._failure_count = 0
         self._loading = False
         self._active_operations = 0
+        self._control_lock = threading.Lock()
         self._admission = BackendAdmission(name, capabilities, domains=domains)
 
     @property
@@ -185,31 +189,31 @@ class LifecycleBackend(ABC):
                     self._active_operations -= 1
                     self._condition.notify_all()
 
-    def reset(self) -> None:
+    def reset(self, deadline: datetime | None = None) -> None:
         if not self.capabilities.resettable:
             raise BackendCapabilityError(
                 f"backend {self.name!r} does not support reset",
                 capability="reset",
             )
-        self._require_ready("reset")
-        with self._admission.exclusive():
+        with self._admission.exclusive(deadline), self._control_operation("reset", deadline):
             with self._condition:
                 self._require_ready_locked("reset")
-                self._active_operations += 1
+            reset_started = False
             try:
+                self._raise_if_deadline_expired(deadline, "backend reset deadline expired before execution")
+                reset_started = True
                 self._reset()
+                self._raise_if_deadline_expired(deadline, "backend reset deadline expired during execution")
             except Exception as exc:
+                if not reset_started:
+                    raise
                 error = self._inference_error(exc, code="reset_failed")
                 self._handle_runtime_failure(error)
                 if error is exc:
                     raise
                 raise error from exc
-            finally:
-                with self._condition:
-                    self._active_operations -= 1
-                    self._condition.notify_all()
 
-    def cancel(self, request_id: str) -> None:
+    def cancel(self, request_id: str, deadline: datetime | None = None) -> None:
         if not self.capabilities.supports_cancellation:
             raise BackendCapabilityError(
                 f"backend {self.name!r} does not support cancellation",
@@ -217,8 +221,71 @@ class LifecycleBackend(ABC):
             )
         if not request_id:
             raise BackendCapabilityError("cancellation requires a request ID", capability="cancellation")
-        self._require_ready("cancel")
-        self._cancel(request_id)
+        with self._control_operation("cancel", deadline):
+            self._raise_if_deadline_expired(deadline, "backend cancellation deadline expired before execution")
+            try:
+                self._cancel(request_id)
+            except BackendAdmissionError as exc:
+                if not exc.operation_started:
+                    raise
+                error = BackendCancellationError(
+                    str(exc),
+                    code=exc.code,
+                    operation_started=True,
+                    outcome_known=False,
+                )
+                if self.capabilities.stateful:
+                    self._handle_runtime_failure(error)
+                raise error from exc
+            except BackendCancellationError as error:
+                if self.capabilities.stateful and error.operation_started and not error.outcome_known:
+                    self._handle_runtime_failure(error)
+                raise
+            except Exception as exc:
+                error = BackendCancellationError(
+                    f"backend {self.name!r} cancellation outcome is unknown: {exc}",
+                    operation_started=True,
+                    outcome_known=False,
+                )
+                if self.capabilities.stateful:
+                    self._handle_runtime_failure(error)
+                raise error from exc
+            if deadline is not None and datetime.now(timezone.utc) >= deadline:
+                error = BackendCancellationError(
+                    "backend cancellation deadline expired during execution",
+                    code="deadline_exceeded",
+                    operation_started=True,
+                    outcome_known=False,
+                )
+                if self.capabilities.stateful:
+                    self._handle_runtime_failure(error)
+                raise error
+
+    @contextmanager
+    def _control_operation(self, operation: str, deadline: datetime | None):
+        timeout = None
+        if deadline is not None:
+            now = datetime.now(deadline.tzinfo) if deadline.tzinfo is not None else datetime.now()
+            timeout = max(0.0, (deadline - now).total_seconds())
+        acquired = self._control_lock.acquire() if timeout is None else self._control_lock.acquire(timeout=timeout)
+        if not acquired:
+            raise BackendAdmissionError(
+                f"backend {operation} deadline expired waiting for control admission",
+                code="deadline_exceeded",
+            )
+        registered = False
+        try:
+            with self._condition:
+                self._require_ready_locked(operation)
+                self._active_operations += 1
+                registered = True
+            yield
+        finally:
+            if registered:
+                with self._condition:
+                    self._active_operations -= 1
+                    self._condition.notify_all()
+            self._control_lock.release()
 
     def health(self) -> BackendHealth:
         with self._condition:
@@ -365,6 +432,14 @@ class LifecycleBackend(ABC):
     def _require_ready_locked(self, operation: str) -> None:
         if self._state is not BackendState.READY:
             raise BackendNotReadyError(f"backend {self.name!r} cannot {operation} while state is {self._state.value}")
+
+    @staticmethod
+    def _raise_if_deadline_expired(deadline: datetime | None, message: str) -> None:
+        if deadline is None:
+            return
+        now = datetime.now(deadline.tzinfo) if deadline.tzinfo is not None else datetime.now()
+        if now >= deadline:
+            raise BackendAdmissionError(message, code="deadline_exceeded")
 
     def _load_error(self, exc: Exception, rollback_errors: tuple[Exception, ...]) -> BackendError:
         suffix = ""

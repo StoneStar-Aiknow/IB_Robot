@@ -6,6 +6,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -55,7 +56,7 @@ class EdgeSession:
         self._last_cloud_sequence = 0
         self._retired_sessions: set[tuple[str, int]] = set()
         self._last_heartbeat = 0.0
-        self._pending: dict[str, Operation] = {}
+        self._pending: dict[str, tuple[Operation, str]] = {}
         self._reset_supported = False
         self._cancellation_supported = False
         self._last_error: StructuredError | None = None
@@ -107,6 +108,8 @@ class EdgeSession:
 
     def observe_cloud(self, status: PipelineStatus, *, now: float | None = None) -> SessionUpdate:
         with self._lock:
+            if self._state.state is PipelineState.FAILED:
+                return SessionUpdate(error=self._last_error)
             if status.role is not PeerRole.CLOUD:
                 return self._invalidate_locked(
                     StructuredError(
@@ -259,6 +262,16 @@ class EdgeSession:
                     stage="routing",
                 )
             )
+        if operation is Operation.CANCEL:
+            target = self._pending.get(target_request_id)
+            if target is None or target[0] is not Operation.INFER:
+                raise DistributedProtocolError(
+                    StructuredError(
+                        code="invalid_cancel_target",
+                        message=f"cancellation target {target_request_id!r} is not a pending inference",
+                        stage="routing",
+                    )
+                )
         if deadline is not None:
             if deadline.tzinfo is None:
                 raise DistributedProtocolError(
@@ -288,12 +301,14 @@ class EdgeSession:
             deadline=deadline,
             target_request_id=target_request_id,
         )
-        self._pending[request_id] = operation
+        self._pending[request_id] = (operation, target_request_id)
         return request
 
     def accept_result(self, result: DistributedResult) -> SessionUpdate:
         with self._lock:
-            expected_operation = self._pending.get(result.request_id)
+            expected = self._pending.get(result.request_id)
+            expected_operation = expected[0] if expected is not None else None
+            expected_target = expected[1] if expected is not None else ""
             if (
                 result.pipeline_id != self.identity.pipeline_id
                 or result.deployment_fingerprint != self.identity.deployment_fingerprint
@@ -304,6 +319,7 @@ class EdgeSession:
                     result.operation is not expected_operation
                     and not (result.operation is Operation.UNKNOWN and not result.success)
                 )
+                or (expected_operation is Operation.CANCEL and result.target_request_id != expected_target)
             ):
                 return SessionUpdate(
                     error=StructuredError(
@@ -315,7 +331,17 @@ class EdgeSession:
                 )
             del self._pending[result.request_id]
             canceled = ""
-            if result.operation is Operation.CANCEL and result.success and result.target_request_id in self._pending:
+            if result.operation is Operation.CANCEL and result.success:
+                target = self._pending.get(result.target_request_id)
+                if target is None or target[0] is not Operation.INFER:
+                    return SessionUpdate(
+                        error=StructuredError(
+                            code="cancellation_unconfirmed",
+                            message=f"cancellation target {result.target_request_id!r} is no longer pending",
+                            stage="routing",
+                            recoverable=True,
+                        )
+                    )
                 del self._pending[result.target_request_id]
                 canceled = result.target_request_id
             if not result.backend_ready:
@@ -349,6 +375,13 @@ class EdgeSession:
             self._state.transition(PipelineState.CLOSED)
             return pending
 
+    def fail(self, error: StructuredError) -> SessionUpdate:
+        with self._lock:
+            update = self._invalidate_locked(error)
+            if self._state.state is not PipelineState.FAILED and self._state.can_transition(PipelineState.FAILED):
+                self._state.transition(PipelineState.FAILED)
+            return update
+
     def _invalidate_locked(self, error: StructuredError) -> SessionUpdate:
         invalidated = tuple(sorted(self._pending))
         self._pending.clear()
@@ -371,6 +404,8 @@ class CloudSession:
     def __init__(self, identity: PipelineIdentity) -> None:
         self.identity = identity
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
+        self._rollover_lock = threading.Lock()
         self._sequence = 0
         self._generation = 0
         self._session_id = ""
@@ -378,16 +413,46 @@ class CloudSession:
         self._edge_acknowledged = False
         self._last_edge_sequence = 0
         self._seen_request_ids: set[str] = set()
+        self._active_operations = 0
+        self._accepting_requests = False
+        self._rollover_required = False
+        self._rollover_epoch = 0
         self._last_error: StructuredError | None = None
 
-    def observe_edge(self, status: PipelineStatus, *, backend_ready: bool) -> StructuredError | None:
-        with self._lock:
+    def observe_edge(
+        self,
+        status: PipelineStatus,
+        *,
+        backend_ready: bool,
+        rollover_barrier: Callable[[], StructuredError | None] | None = None,
+    ) -> StructuredError | None:
+        with self._rollover_lock:
+            return self._observe_edge(status, backend_ready=backend_ready, rollover_barrier=rollover_barrier)
+
+    def _observe_edge(
+        self,
+        status: PipelineStatus,
+        *,
+        backend_ready: bool,
+        rollover_barrier: Callable[[], StructuredError | None] | None,
+    ) -> StructuredError | None:
+        requires_rollover_barrier = False
+        rollover_epoch = 0
+        with self._condition:
             if status.role is not PeerRole.EDGE:
                 return self._reject_locked("unexpected_peer_role", "cloud received a non-edge distributed status")
             mismatch = identity_error(self.identity, status.identity)
             if mismatch is not None:
                 self._invalidate_locked(mismatch)
                 return mismatch
+            if status.runtime_state == PipelineState.FAILED.value:
+                error = status.error or StructuredError(
+                    code="remote_edge_failed",
+                    message="edge pipeline entered FAILED state",
+                    stage="readiness",
+                )
+                self._invalidate_locked(error)
+                return error
             restarted = status.sequence <= self._last_edge_sequence
             self._last_edge_sequence = status.sequence
             self._last_edge_status = status
@@ -410,10 +475,32 @@ class CloudSession:
                 and (self._edge_acknowledged or status.error is not None)
             )
             if not self._session_id or restarted or session_mismatch or dropped_acknowledgement:
+                if self._session_id:
+                    self._rollover_required = True
+                requires_rollover_barrier = self._rollover_required
+                self._accepting_requests = False
+                self._condition.wait_for(lambda: self._active_operations == 0)
+                if requires_rollover_barrier:
+                    self._rollover_epoch += 1
+                    rollover_epoch = self._rollover_epoch
+
+        if requires_rollover_barrier and rollover_barrier is not None:
+            error = rollover_barrier()
+            if error is not None:
+                with self._condition:
+                    self._invalidate_locked(error)
+                return error
+
+        with self._condition:
+            if requires_rollover_barrier and rollover_epoch != self._rollover_epoch:
+                return self._last_error
+            if not self._session_id or restarted or session_mismatch or dropped_acknowledgement:
                 self._generation += 1
                 self._session_id = uuid.uuid4().hex
                 self._edge_acknowledged = False
                 self._seen_request_ids.clear()
+                self._accepting_requests = True
+                self._rollover_required = False
             elif status.session_id == self._session_id and status.session_generation == self._generation:
                 self._edge_acknowledged = True
             self._last_error = None
@@ -444,7 +531,7 @@ class CloudSession:
                 sequence=self._sequence,
                 session_id=self._session_id,
                 session_generation=self._generation if self._session_id else 0,
-                ready=backend_ready and bool(self._session_id),
+                ready=backend_ready and bool(self._session_id) and self._accepting_requests,
                 runtime_state=backend_state,
                 reset_supported=reset_supported,
                 cancellation_supported=cancellation_supported,
@@ -453,47 +540,63 @@ class CloudSession:
 
     def validate_request(self, request: DistributedRequest) -> None:
         with self._lock:
-            checks = (
-                (
-                    request.pipeline_id == self.identity.pipeline_id,
-                    "pipeline_not_found",
-                    "pipeline ID is not configured",
-                ),
-                (
-                    request.deployment_fingerprint == self.identity.deployment_fingerprint,
-                    "deployment_fingerprint_mismatch",
-                    "deployment fingerprint mismatch",
-                ),
-                (request.session_id == self._session_id, "session_mismatch", "session ID mismatch"),
-                (
-                    request.session_generation == self._generation,
-                    "session_generation_mismatch",
-                    "session generation mismatch",
-                ),
-                (bool(self._session_id), "not_ready", "no live cloud handshake session"),
+            self._validate_request_locked(request)
+
+    @contextmanager
+    def operation(self, request: DistributedRequest):
+        with self._condition:
+            self._validate_request_locked(request)
+            self._active_operations += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active_operations -= 1
+                self._condition.notify_all()
+
+    def _validate_request_locked(self, request: DistributedRequest) -> None:
+        checks = (
+            (
+                request.pipeline_id == self.identity.pipeline_id,
+                "pipeline_not_found",
+                "pipeline ID is not configured",
+            ),
+            (
+                request.deployment_fingerprint == self.identity.deployment_fingerprint,
+                "deployment_fingerprint_mismatch",
+                "deployment fingerprint mismatch",
+            ),
+            (request.session_id == self._session_id, "session_mismatch", "session ID mismatch"),
+            (
+                request.session_generation == self._generation,
+                "session_generation_mismatch",
+                "session generation mismatch",
+            ),
+            (bool(self._session_id), "not_ready", "no live cloud handshake session"),
+            (self._accepting_requests, "session_draining", "cloud session is draining active operations"),
+        )
+        for valid, code, message in checks:
+            if not valid:
+                raise DistributedProtocolError(
+                    StructuredError(code=code, message=message, stage="routing", recoverable=True)
+                )
+        if request.deadline is not None and datetime.now(timezone.utc) >= request.deadline.astimezone(timezone.utc):
+            raise DistributedProtocolError(
+                StructuredError(
+                    code="deadline_exceeded",
+                    message="distributed request deadline expired before cloud execution",
+                    stage="admission",
+                )
             )
-            for valid, code, message in checks:
-                if not valid:
-                    raise DistributedProtocolError(
-                        StructuredError(code=code, message=message, stage="routing", recoverable=True)
-                    )
-            if request.deadline is not None and datetime.now(timezone.utc) >= request.deadline.astimezone(timezone.utc):
-                raise DistributedProtocolError(
-                    StructuredError(
-                        code="deadline_exceeded",
-                        message="distributed request deadline expired before cloud execution",
-                        stage="admission",
-                    )
+        if request.request_id in self._seen_request_ids:
+            raise DistributedProtocolError(
+                StructuredError(
+                    code="duplicate_request_id",
+                    message=f"distributed request {request.request_id!r} was already admitted",
+                    stage="routing",
                 )
-            if request.request_id in self._seen_request_ids:
-                raise DistributedProtocolError(
-                    StructuredError(
-                        code="duplicate_request_id",
-                        message=f"distributed request {request.request_id!r} was already admitted",
-                        stage="routing",
-                    )
-                )
-            self._seen_request_ids.add(request.request_id)
+            )
+        self._seen_request_ids.add(request.request_id)
 
     def invalidate(self, error: StructuredError) -> None:
         with self._lock:
@@ -505,6 +608,10 @@ class CloudSession:
         return error
 
     def _invalidate_locked(self, error: StructuredError) -> None:
+        if self._session_id:
+            self._rollover_required = True
+        self._rollover_epoch += 1
+        self._accepting_requests = False
         self._session_id = ""
         self._edge_acknowledged = False
         self._seen_request_ids.clear()

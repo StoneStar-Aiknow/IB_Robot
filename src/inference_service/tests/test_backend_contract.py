@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 
@@ -15,6 +16,7 @@ from inference_service.backends import (
     BACKEND_REGISTRY,
     BackendAdmissionError,
     BackendAdmissionEvidence,
+    BackendCancellationError,
     BackendCapabilities,
     BackendCapabilityError,
     BackendCompatibilityError,
@@ -58,6 +60,10 @@ class FakeBackend(LifecycleBackend):
         self.recovery_started = threading.Event()
         self.recovery_release = threading.Event()
         self.recovery_release.set()
+        self.cancel_started = threading.Event()
+        self.cancel_release = threading.Event()
+        self.cancel_release.set()
+        self.cancel_errors: list[Exception] = []
         self.fail_load = False
         self.fail_recovery = False
         self.infer_errors: list[Exception] = []
@@ -124,6 +130,13 @@ class FakeBackend(LifecycleBackend):
             raise RuntimeError("timed out waiting to continue fake recovery")
         if self.fail_recovery:
             raise RuntimeError("fake recovery failure")
+
+    def _cancel(self, request_id: str) -> None:
+        self.cancel_started.set()
+        if not self.cancel_release.wait(timeout=2):
+            raise RuntimeError("timed out waiting to continue fake cancellation")
+        if self.cancel_errors:
+            raise self.cancel_errors.pop(0)
 
     def _close(self) -> None:
         self.close_calls += 1
@@ -330,6 +343,126 @@ def test_reset_is_capability_gated_and_supported_reset_runs(tmp_path):
     supported.reset()
     assert supported.reset_calls == 1
     supported.close()
+
+
+def test_cancel_can_overlap_inference_but_serializes_with_reset(tmp_path):
+    class BlockingControlBackend(FakeBackend):
+        def __init__(self):
+            super().__init__(
+                capabilities=BackendCapabilities(resettable=True, stateful=True, supports_cancellation=True),
+                domains=ResourceDomainAdmissions(),
+            )
+            self.reset_started = threading.Event()
+
+        def _reset(self) -> None:
+            self.reset_started.set()
+            super()._reset()
+
+    backend = BlockingControlBackend()
+    backend.load(_make_context(tmp_path / "bundle"))
+    backend.infer_release.clear()
+    backend.cancel_release.clear()
+
+    infer_thread, _, infer_errors = _thread_call(lambda: backend.infer(_request("target")))
+    assert backend.wait_for_infer_entries(1)
+    cancel_thread, _, cancel_errors = _thread_call(lambda: backend.cancel("target"))
+    assert backend.cancel_started.wait(timeout=2)
+    reset_thread, _, reset_errors = _thread_call(backend.reset)
+    time.sleep(0.05)
+    assert not backend.reset_started.is_set()
+
+    backend.cancel_release.set()
+    cancel_thread.join(timeout=2)
+    backend.infer_release.set()
+    infer_thread.join(timeout=2)
+    assert backend.reset_started.wait(timeout=2)
+    reset_thread.join(timeout=2)
+
+    assert infer_errors == []
+    assert cancel_errors == []
+    assert reset_errors == []
+    backend.close()
+
+
+def test_close_waits_for_active_cancel_before_releasing_resources(tmp_path):
+    backend = FakeBackend(
+        capabilities=BackendCapabilities(resettable=True, stateful=True, supports_cancellation=True),
+        domains=ResourceDomainAdmissions(),
+    )
+    backend.load(_make_context(tmp_path / "bundle"))
+    backend.cancel_release.clear()
+
+    cancel_thread, _, cancel_errors = _thread_call(lambda: backend.cancel("target"))
+    assert backend.cancel_started.wait(timeout=2)
+    close_thread, _, close_errors = _thread_call(backend.close)
+    time.sleep(0.05)
+
+    assert close_thread.is_alive()
+    assert backend.close_calls == 0
+    backend.cancel_release.set()
+    cancel_thread.join(timeout=2)
+    close_thread.join(timeout=2)
+
+    assert cancel_errors == []
+    assert close_errors == []
+    assert backend.close_calls == 1
+    assert backend.health().state is BackendState.CLOSED
+
+
+def test_cancel_waiting_for_reset_respects_deadline_without_starting(tmp_path):
+    class BlockingResetBackend(FakeBackend):
+        def __init__(self):
+            super().__init__(
+                capabilities=BackendCapabilities(resettable=True, stateful=True, supports_cancellation=True),
+                domains=ResourceDomainAdmissions(),
+            )
+            self.reset_started = threading.Event()
+            self.reset_release = threading.Event()
+
+        def _reset(self) -> None:
+            self.reset_started.set()
+            if not self.reset_release.wait(timeout=2):
+                raise RuntimeError("reset release timed out")
+
+    backend = BlockingResetBackend()
+    backend.load(_make_context(tmp_path / "bundle"))
+    reset_thread, _, reset_errors = _thread_call(backend.reset)
+    assert backend.reset_started.wait(timeout=2)
+
+    with pytest.raises(BackendAdmissionError, match="waiting for control admission") as error:
+        backend.cancel("target", deadline=datetime.now(timezone.utc) + timedelta(milliseconds=20))
+
+    assert error.value.operation_started is False
+    assert not backend.cancel_started.is_set()
+    assert backend.health().state is BackendState.READY
+    backend.reset_release.set()
+    reset_thread.join(timeout=2)
+    assert reset_errors == []
+    backend.close()
+
+
+def test_started_cancel_admission_error_fails_stateful_backend_closed(tmp_path):
+    backend = FakeBackend(
+        capabilities=BackendCapabilities(resettable=True, stateful=True, supports_cancellation=True),
+        domains=ResourceDomainAdmissions(),
+    )
+    backend.load(_make_context(tmp_path / "bundle"))
+    backend.cancel_errors.append(
+        BackendAdmissionError(
+            "cancel acknowledgement timed out",
+            code="deadline_exceeded",
+            operation_started=True,
+        )
+    )
+
+    with pytest.raises(BackendCancellationError, match="cancel acknowledgement timed out") as error:
+        backend.cancel("target")
+
+    assert error.value.code == "deadline_exceeded"
+    assert error.value.operation_started is True
+    assert error.value.outcome_known is False
+    assert backend.health().state is BackendState.FAILED
+    backend.close()
 
 
 def test_partial_load_rolls_back_in_reverse_order_and_close_is_idempotent(tmp_path):
