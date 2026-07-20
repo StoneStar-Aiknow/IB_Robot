@@ -1,0 +1,30 @@
+# VLM model routing configuration for VLMClient
+#
+# api_key_env: environment variable NAME only — never put the key itself here
+# multimodal: true = model accepts image input; false = strip images before sending
+#
+# Usage:
+#   vlm = VLMClient()
+#   result = vlm.chat("hello")
+#   result = vlm.chat("describe this image", image=frame_bytes, model="qwen-vl-plus")
+
+defaults:
+  model: qwen-vl-plus
+  timeout_sec: 60
+  temperature: 0.1
+
+models:
+  # Multimodal VLM over an OpenAI-compatible endpoint (example: Aliyun DashScope).
+  qwen-vl-plus:
+    provider: openai_compatible
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: ALIYUN_API_KEY
+    multimodal: true
+
+  # Text-only LLM (images in the message are stripped before sending).
+  # Replace base_url / model name / api_key_env with your own endpoint.
+  my-llm:
+    provider: openai_compatible
+    base_url: https://your-llm-endpoint.example.com/v1
+    api_key_env: MY_LLM_API_KEY
+    multimodal: false
