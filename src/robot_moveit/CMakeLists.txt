@@ -44,9 +44,19 @@ if(BUILD_TESTING)
   # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  # Register the pure-Python regression tests so `colcon test` runs them.
+  # Disable plugin autoload because ROS launch_testing plugins are incompatible
+  # with pytest 9.x in the project virtual environment.
   ament_add_pytest_test(
     test_moveit_gateway_motion_lifecycle
     test/test_moveit_gateway_motion_lifecycle.py
+    ENV "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1"
+  )
+  ament_add_pytest_test(
+    test_so101_placo_home
+    test/test_so101_placo_home.py
+    TIMEOUT 60
     ENV "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1"
   )
 endif()
