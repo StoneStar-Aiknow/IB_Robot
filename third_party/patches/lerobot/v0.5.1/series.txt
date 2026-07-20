@@ -6,3 +6,4 @@
 0011-knowledge-distillation.patch
 0014-training-logs.patch
 0015-python310-disable-groot-config-generated-init.patch
+0016-smolvla-improve-graph-export-compatibility.patch

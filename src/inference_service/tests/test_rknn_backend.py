@@ -520,6 +520,16 @@ def test_rknn_smolvla_loads_prefill_first_reuses_vision_and_runs_host_links(tmp_
     assert environment.release_calls == [paths["action"], paths["vision_top"], paths["prefill"]]
 
 
+def test_rknn_converts_bfloat16_embedding_weights_to_float32(tmp_path):
+    torch = pytest.importorskip("torch")
+    weight = torch.tensor([[1.25, -2.5]], dtype=torch.bfloat16)
+
+    converted = RKNNBackend._to_numpy_weight(weight, tmp_path / "embedding.pt", "weight")
+
+    assert converted.dtype == np.float32
+    np.testing.assert_allclose(converted, np.array([[1.25, -2.5]], dtype=np.float32))
+
+
 def test_rknn_partial_smolvla_load_failure_releases_every_created_runtime(tmp_path):
     context = _smolvla_context(tmp_path)
     paths = {role: str(path) for role, path in context.resolved_artifacts.items()}

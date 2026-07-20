@@ -78,9 +78,13 @@ def generate_random_calibration(dataset_path, onnx_path, num_samples=20):
     return dataset_path
 
 
-def _extract_compiled_runtime_abi(rknn):
-    metadata = getattr(rknn.rknn_base, "inputs_meta", None)
-    attrs = metadata.get("attrs") if isinstance(metadata, dict) else None
+def _is_image_tensor(name, shape):
+    # Project exporters use image/pixel in controlled ONNX image input names.
+    normalized_name = name.lower()
+    return len(shape) == 4 and ("image" in normalized_name or "pixel" in normalized_name)
+
+
+def _runtime_abi_from_attrs(attrs):
     if not isinstance(attrs, dict) or not attrs:
         raise RuntimeError("RKNN Toolkit did not expose compiler-resolved tensor metadata")
 
@@ -96,7 +100,7 @@ def _extract_compiled_runtime_abi(rknn):
             if type(index) is not int or not isinstance(dtype, str) or not isinstance(shape, list) or not shape:
                 raise RuntimeError(f"RKNN tensor metadata is incomplete for {name!r}: {value!r}")
             item = {"name": name, "index": index, "dtype": dtype, "shape": shape}
-            if len(shape) == 4 and isinstance(layout, str):
+            if not is_output and _is_image_tensor(name, shape) and isinstance(layout, str):
                 item["layout"] = layout.upper()
             tensors.append(item)
         tensors.sort(key=lambda item: item["index"])
@@ -111,6 +115,12 @@ def _extract_compiled_runtime_abi(rknn):
     if not abi["inputs"] or not abi["outputs"]:
         raise RuntimeError("RKNN compiler metadata contains no runtime inputs or outputs")
     return abi
+
+
+def _extract_compiled_runtime_abi(rknn):
+    metadata = getattr(rknn.rknn_base, "inputs_meta", None)
+    attrs = metadata.get("attrs") if isinstance(metadata, dict) else None
+    return _runtime_abi_from_attrs(attrs)
 
 
 def convert(onnx_path, output_path, mode, dataset=None, verify=False, abi_output=None):

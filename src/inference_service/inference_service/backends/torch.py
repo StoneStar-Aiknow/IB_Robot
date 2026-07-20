@@ -423,18 +423,18 @@ class TorchBackend(LifecycleBackend):
         return noise
 
     def _place_noise(self, noise: object) -> object:
+        action_projection = getattr(getattr(self._policy, "model", None), "action_in_proj", None)
+        parameter = getattr(action_projection, "weight", None)
         parameters = getattr(self._policy, "parameters", None)
-        if callable(parameters):
+        if parameter is None and callable(parameters):
             try:
                 parameter = next(iter(parameters()))
             except (StopIteration, TypeError):
                 parameter = None
-            if parameter is not None:
-                move = getattr(noise, "to", None)
-                if callable(move):
-                    return move(
-                        device=getattr(parameter, "device", self._device), dtype=getattr(parameter, "dtype", None)
-                    )
+        if parameter is not None:
+            move = getattr(noise, "to", None)
+            if callable(move):
+                return move(device=getattr(parameter, "device", self._device), dtype=getattr(parameter, "dtype", None))
         move = getattr(noise, "to", None)
         return move(self._device) if callable(move) else noise
 

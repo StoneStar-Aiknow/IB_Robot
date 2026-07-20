@@ -1011,6 +1011,9 @@ class RKNNBackend(LifecycleBackend):
         cpu = getattr(value, "cpu", None)
         if callable(cpu):
             value = cpu()
+        cast_float = getattr(value, "float", None)
+        if callable(cast_float):
+            value = cast_float()
         numpy = getattr(value, "numpy", None)
         if callable(numpy):
             value = numpy()
