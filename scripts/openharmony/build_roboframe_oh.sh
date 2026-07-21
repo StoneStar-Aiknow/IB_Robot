@@ -283,6 +283,7 @@ verify_openharmony_lerobot_runtime_source() {
     local src_root="$1"
     local policies_init="${src_root}/lerobot/policies/__init__.py"
     local factory_file="${src_root}/lerobot/policies/factory.py"
+    local groot_config="${src_root}/lerobot/policies/groot/groot_n1.py"
     local pi05_init="${src_root}/lerobot/policies/pi05/__init__.py"
 
     grep -q 'from \.pi0_fast\.configuration_pi0_fast import PI0FastConfig' "${policies_init}" || {
@@ -301,6 +302,10 @@ verify_openharmony_lerobot_runtime_source() {
         log_error "OpenHarmony lerobot runtime staging unexpectedly removed upstream eager imports in ${factory_file}"
         exit 1
     fi
+    grep -q '^@dataclass(init=False)$' "${groot_config}" || {
+        log_error "OpenHarmony lerobot runtime staging is missing the Groot dataclass compatibility patch"
+        exit 1
+    }
 }
 
 prepare_openharmony_lerobot_runtime_src() {

@@ -1,7 +1,7 @@
 From 3e36f43e32ff4ba3ce4a5981ca80b3b30dda671d Mon Sep 17 00:00:00 2001
 From: IB Robot Setup <ibrobot@example.invalid>
 Date: Tue, 23 Jun 2026 10:48:02 +0800
-Subject: [PATCH] python310: disable groot config generated init
+Subject: [PATCH] compat: disable groot config generated init
 
 ---
  src/lerobot/policies/groot/groot_n1.py | 2 +-

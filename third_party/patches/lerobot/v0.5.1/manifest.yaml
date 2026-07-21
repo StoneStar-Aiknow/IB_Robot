@@ -129,11 +129,8 @@ patches:
       profiles: [master-parity-candidates, dev, training, distillation]
   - file: 0015-python310-disable-groot-config-generated-init.patch
     purpose:
-      - Disable the generated dataclass initializer for GR00TN15Config so Python 3.10 does not reject its init=False fields after default fields.
-      - Keep lerobot.policies importable on Python 3.10 when unrelated policies such as PI05 are loaded through the factory.
-    applies_to:
-      python_max: "<3.11"
-      profiles: [core, ros, hardware, dev, openeuler, inference]
+      - Disable the generated dataclass initializer for GR00TN15Config because the class provides its own initializer.
+      - Keep lerobot.policies importable across supported Python versions when unrelated policies are loaded through the factory.
   - file: 0016-smolvla-improve-graph-export-compatibility.patch
     purpose:
       - Normalize SmolVLA expert position IDs without an integer reduction operation.
@@ -177,8 +174,8 @@ notes:
   - Patch 0014 is part of the default Ubuntu training series so KD runs emit
     TensorBoard scalars without pulling in the weighted-training and
     quantization helpers from patch 0010.
-  - Patch 0015 is a Python 3.10 import-compatibility patch for Groot. It is
-    intentionally not applied on Python 3.11+ hosts.
+  - Patch 0015 prevents Groot dataclass field-order failures across supported
+    Python versions and is applied on every platform patch series.
   - Patch 0016 is backend-neutral and keeps SmolVLA position ID arithmetic valid
     for ONNX-based RKNN and HMM exporters on every supported platform.
   - The reference_submodule_commit records the current local development

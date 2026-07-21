@@ -22,6 +22,7 @@ RESOLVER="${REPO_ROOT}/scripts/setup/lerobot_resolve_active.py"
 INDEX="${REPO_ROOT}/third_party/patches/lerobot/INDEX.yaml"
 MANIFEST="${REPO_ROOT}/third_party/patches/lerobot/v0.5.1/manifest.yaml"
 DEFAULT_SERIES="${REPO_ROOT}/third_party/patches/lerobot/v0.5.1/series.txt"
+OPENHARMONY_SERIES="${REPO_ROOT}/third_party/patches/lerobot/v0.5.1/series.openharmony-5.1.0-musl.txt"
 EXPECTED_BASE_COMMIT="1396b9fab7aecddd10006c33c47a487ffdcb54b4"
 
 PASS=0
@@ -112,7 +113,7 @@ run_fixture "ubuntu-22.04 / py3.10 / desktop profile" \
 # patch. 0002/0003 stay gated to py<3.11 since typing.Unpack is native on 3.11
 # and the metadata after 0001 already accepts 3.11.
 run_fixture "openeuler-embedded-24.03 / py3.11" \
-    "0001-python-compat-syntax-and-metadata.patch,0005-compat-add-npu-device-detection.patch,0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0016-smolvla-improve-graph-export-compatibility.patch" \
+    "0001-python-compat-syntax-and-metadata.patch,0005-compat-add-npu-device-detection.patch,0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0015-python310-disable-groot-config-generated-init.patch,0016-smolvla-improve-graph-export-compatibility.patch" \
     IBR_HOST_PYTHON_VERSION=3.11 \
     IBR_LEROBOT_PROFILES=core,ros,hardware,openeuler \
     --
@@ -120,10 +121,11 @@ run_fixture "openeuler-embedded-24.03 / py3.11" \
 # OpenHarmony 5.1.0 / Python 3.12 — keep upstream Python syntax and apply only
 # the checkpoint compatibility patches used by the board runtime.
 run_fixture "openharmony-5.1.0 / py3.12" \
-    "0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0016-smolvla-improve-graph-export-compatibility.patch" \
+    "0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0015-python310-disable-groot-config-generated-init.patch,0016-smolvla-improve-graph-export-compatibility.patch" \
     IBR_HOST_PYTHON_VERSION=3.12 \
     IBR_LEROBOT_PROFILES=core,openharmony \
-    --
+    -- \
+    "${OPENHARMONY_SERIES}"
 
 # Force master-parity bring-up scenario where the operator wants the remaining
 # candidate patches as well. We point the filter at the master-parity series
