@@ -1,3 +1,5 @@
+import pytest
+
 from safety_guard.rules import validate_primitive_request, validate_skill_request
 
 SKILL_TEMPLATES = {
@@ -50,6 +52,28 @@ def test_validate_move_pose_inside_workspace():
     assert reason == ""
 
 
+def test_validate_named_pose_rejects_non_numeric_coordinate():
+    try:
+        allowed, reason = validate_primitive_request(
+            "move_to_named_pose",
+            "bad_pose",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            {"bad_pose": {"position": {"x": "not-a-number", "y": 0.0, "z": 0.0}}},
+            {"x": [0.0, 0.4], "y": [-0.2, 0.2], "z": [0.0, 0.4]},
+        )
+    except (TypeError, ValueError) as exc:
+        pytest.fail(f"validation must fail closed instead of raising: {exc}")
+
+    assert not allowed
+    assert "pose x must be finite" in reason
+
+
 def test_validate_skill_requires_target():
     allowed, reason = validate_skill_request(
         "pick_named_target",
@@ -80,6 +104,29 @@ def test_validate_skill_uses_default_templates_without_override():
     assert reason == ""
 
 
+def test_validate_skill_rejects_disabled_skill():
+    templates = {
+        "disabled_skill": {
+            "disabled": True,
+            "primitive_sequence": [{"primitive_name": "open_gripper"}],
+        }
+    }
+
+    allowed, reason = validate_skill_request(
+        "disabled_skill",
+        "",
+        "",
+        "",
+        0.0,
+        {},
+        {},
+        templates,
+    )
+
+    assert allowed is False
+    assert "unsupported skill" in reason
+
+
 def test_validate_relative_skill_direction():
     allowed, reason = validate_skill_request(
         "move_relative_ee",
@@ -93,6 +140,50 @@ def test_validate_relative_skill_direction():
     )
     assert allowed
     assert reason == ""
+
+
+def test_validate_relative_skill_rejects_non_finite_distance():
+    allowed, reason = validate_skill_request(
+        "move_relative_ee",
+        "",
+        "",
+        "forward",
+        float("nan"),
+        {"home": {}, "observe_table": {}, "tray_right": {}},
+        {"demo_object": {}},
+        SKILL_TEMPLATES,
+    )
+
+    assert not allowed
+    assert "motion_distance must be finite" in reason
+
+
+def test_validate_skill_rejects_non_finite_primitive_duration():
+    templates = {
+        "bad_duration": {
+            "primitive_sequence": [
+                {
+                    "primitive_name": "move_to_joint_positions",
+                    "joint_positions": {"1": 0.0},
+                    "duration_sec": float("nan"),
+                }
+            ]
+        }
+    }
+
+    allowed, reason = validate_skill_request(
+        "bad_duration",
+        "",
+        "",
+        "",
+        0.0,
+        {},
+        {},
+        templates,
+    )
+
+    assert not allowed
+    assert "duration_sec must be finite" in reason
 
 
 def test_validate_default_gripper_rotation_skill():
@@ -126,6 +217,105 @@ def test_validate_relative_primitive_target_workspace():
     )
     assert allowed
     assert reason == ""
+
+
+@pytest.mark.parametrize(
+    ("primitive_name", "overrides"),
+    [
+        ("move_relative_ee", {"relative_dx": float("inf")}),
+        ("move_relative_ee", {"target_x": float("nan")}),
+        (
+            "move_to_joint_positions",
+            {
+                "joint_names": ["1"],
+                "joint_positions": [float("nan")],
+                "arm_joint_names": ["1"],
+                "joint_limits": {"1": {"min": -1.0, "max": 1.0}},
+                "primitive_duration_sec": 0.4,
+            },
+        ),
+        (
+            "move_to_joint_positions",
+            {
+                "joint_names": ["1"],
+                "joint_positions": [0.0],
+                "arm_joint_names": ["1"],
+                "joint_limits": {"1": {"min": -1.0, "max": 1.0}},
+                "primitive_duration_sec": float("nan"),
+            },
+        ),
+        (
+            "move_through_joint_positions",
+            {
+                "joint_names": ["1"],
+                "joint_waypoints": [float("inf")],
+                "joint_waypoint_count": 1,
+                "arm_joint_names": ["1"],
+                "joint_limits": {"1": {"min": -1.0, "max": 1.0}},
+                "waypoint_duration_sec": 0.1,
+            },
+        ),
+        (
+            "move_through_joint_positions",
+            {
+                "joint_names": ["1"],
+                "joint_waypoints": [0.0],
+                "joint_waypoint_count": 1,
+                "arm_joint_names": ["1"],
+                "joint_limits": {"1": {"min": -1.0, "max": 1.0}},
+                "waypoint_duration_sec": float("nan"),
+            },
+        ),
+        ("rotate_gripper_cw", {"relative_dz": float("nan")}),
+        ("rotate_gripper_ccw", {"relative_dz": float("inf")}),
+        ("open_gripper", {"gripper_position": float("nan")}),
+        ("open_gripper", {"gripper_position": 10**1000}),
+    ],
+)
+def test_validate_primitive_rejects_non_finite_numbers(primitive_name, overrides):
+    request = {
+        "primitive_name": primitive_name,
+        "pose_name": "",
+        "relative_dx": 0.0,
+        "relative_dy": 0.0,
+        "relative_dz": 0.0,
+        "target_x": 0.2,
+        "target_y": 0.0,
+        "target_z": 0.2,
+        "gripper_position": 0.5,
+        "named_poses": {},
+        "workspace": {"x": [0.0, 0.4], "y": [-0.2, 0.2], "z": [0.0, 0.4]},
+    }
+    request.update(overrides)
+
+    allowed, reason = validate_primitive_request(**request)
+
+    assert not allowed
+    assert "finite" in reason
+
+
+def test_validate_joint_primitive_rejects_numeric_string_position():
+    allowed, reason = validate_primitive_request(
+        "move_to_joint_positions",
+        "",
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.5,
+        {},
+        {},
+        joint_names=["1"],
+        joint_positions=["0.0"],
+        arm_joint_names=["1"],
+        joint_limits={"1": {"min": -1.0, "max": 1.0}},
+        primitive_duration_sec=0.4,
+    )
+
+    assert not allowed
+    assert "joint target for 1" in reason
 
 
 def test_validate_hover_skill_requires_target_pose_key():
