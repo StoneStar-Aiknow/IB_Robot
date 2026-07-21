@@ -243,7 +243,7 @@ Vendor tokenizer/processor assets into the bundle and update the LeRobot metadat
 
 ### Board runtime initialization
 
-Read `oh-constraints` first. Source the RoboFrame environment and `scripts/setup/houmo_hmm_env.sh`; use `TCIM_BACKEND=Xh2HalBackend` and `HOUMO_TARGET=xh2`.
+Read `oh-constraints` first. Source the RoboFrame environment and `scripts/setup/houmo_hmm_env.sh`; native Houmo 1.3 uses `TCIM_BACKEND=xh2` and `HOUMO_TARGET=xh2`. `Xh2HalBackend` is only for the legacy runtime.
 
 ## References
 
