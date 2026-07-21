@@ -42,6 +42,44 @@ boundary. They do not appear in `list_skills`; `validate_skill` and
 `execute_skill` reject any name that is not a member of the current catalog
 before calling the ROS bridge.
 
+### Skill execution admission state machine
+
+`execute_skill` maintains a thread-safe **single MCP SkillCommand admission**
+slot so the robot never runs two skills in parallel. The slot has three states:
+
+| State | Meaning | Concurrent request response |
+|-------|---------|------------------------------|
+| `idle` | No in-flight action | Dispatch a new goal immediately |
+| `running` | Goal dispatched, awaiting terminal state | `SKILL_IN_PROGRESS` |
+| `recovering` | Previous goal timed out, draining to terminal | `MOTION_RECOVERY_IN_PROGRESS` |
+
+`validate_skill` is **not** gated by admission (it is a dry-run), only
+`execute_skill` is.
+
+### Error codes returned by `execute_skill`
+
+| `error_code` | Trigger | Admission after return | Caller action |
+|--------------|---------|--------------------------|---------------|
+| `UNSUPPORTED_SKILL` | Skill name not in catalog (disabled or unknown) | Released immediately | Fix skill_name; retry |
+| `BRIDGE_OFFLINE` / `ACTION_SERVER_UNAVAILABLE` | ROS bridge down or `/embodied/execute_skill` server not discovered | Released immediately | Start `skill_executor` / rclpy; retry |
+| `SKILL_IN_PROGRESS` | Another `execute_skill` is still `running` | Stays `running` | Wait for previous call to return a terminal result; do not retry in a tight loop |
+| `MOTION_RECOVERY_IN_PROGRESS` | Previous goal timed out, `cancel_and_drain_skill_goal` still running | Stays `recovering` | Wait; admission releases automatically when the result future reaches terminal state. If it never does, restart `robot_mcp_server` |
+| `ACCEPT_TIMEOUT` | `send_goal_async` did not complete within `_ACCEPT_TIMEOUT_SEC` (5s) | Transitions to `recovering` | Same as `MOTION_RECOVERY_IN_PROGRESS` |
+| `DISPATCH_FAILED` | `send_goal_async` / `get_result_async` raised (transport failure) | Released immediately | Retry; if persistent, restart `robot_mcp_server` |
+| `REJECTED` | Server-side reject (`goal_handle.accepted == False`) | Released immediately | Check `skill_executor` logs |
+| `RESULT_TIMEOUT` | Skill did not finish within `timeout_sec + _RESULT_GRACE_SEC` but cancel drained cleanly | Released immediately | Increase `timeout_sec`; retry |
+| `CANCEL_CLEANUP_TIMEOUT` | Cancel requested but result future did not reach terminal within `_CANCEL_DRAIN_TIMEOUT_SEC` (5s) | Stays `recovering` until the future eventually terminates | Wait for `MOTION_RECOVERY_IN_PROGRESS` to clear; if it never does, restart `robot_mcp_server` |
+| Server-side `error_code` (e.g. `SKILL_CANCELLED`, `PRIMITIVE_ARM_FAILED`, `SKILL_TIMEOUT`, `SKILL_CANCEL_CLEANUP_TIMEOUT`) | Goal completed terminally with non-success | Released immediately | Inspect `message` / `executed_primitives`; fix upstream config or retry |
+
+The caller-visible pattern is:
+- Admission is **claimed before** dispatch and **released in a `finally` block**
+  once the goal reaches a tracked terminal state.
+- Any path where the MCP side cannot prove the goal is terminal (late accepted
+  goals, cancel-drain timeouts) keeps admission in `recovering` to fail closed.
+- An LLM / Hermes orchestration loop should treat `SKILL_IN_PROGRESS`,
+  `MOTION_RECOVERY_IN_PROGRESS`, and `CANCEL_CLEANUP_TIMEOUT` as
+  "wait, do not retry" signals, and all other codes as "released, free to retry".
+
 opencode namespaces tools by the server name. With the server named `robot`
 below, you get `robot_list_skills`, `robot_execute_skill`, etc.
 
