@@ -62,6 +62,8 @@ class RosBridge:
         self._status_recv_sec: float = 0.0
         self._latest_joints: dict[str, float] | None = None
         self._joints_recv_sec: float = 0.0
+        self._skill_execution_lock = threading.Lock()
+        self._skill_execution_state = "idle"
 
         self._ros_available = False
         self._node = None
@@ -235,7 +237,7 @@ class RosBridge:
         place_name: str = "",
         motion_direction: str = "",
         motion_distance: float = 0.0,
-        timeout_sec: float = 15.0,
+        timeout_sec: float = 30.0,
         task_id: str | None = None,
     ):
         """Construct a SkillCommand.Goal from plain parameters."""
@@ -271,6 +273,65 @@ class RosBridge:
 
         send_future = self._skill_client.send_goal_async(goal, feedback_callback=_on_feedback)
         return send_future, fb_queue
+
+    def try_claim_skill_execution(self) -> str | None:
+        """Claim the single MCP skill execution slot, or return its current state."""
+        with self._skill_execution_lock:
+            if self._skill_execution_state == "idle":
+                self._skill_execution_state = "running"
+                return None
+            return self._skill_execution_state
+
+    def mark_skill_recovering(self) -> None:
+        """Prevent further MCP motion while a timed-out goal is being drained."""
+        with self._skill_execution_lock:
+            self._skill_execution_state = "recovering"
+
+    def release_skill_execution(self) -> None:
+        """Release MCP motion admission after the tracked action is terminal."""
+        with self._skill_execution_lock:
+            self._skill_execution_state = "idle"
+
+    def release_skill_execution_when_terminal(self, result_future) -> None:
+        """Keep recovery admission until a ROS action result future is terminal."""
+        result_future.add_done_callback(lambda _future: self.release_skill_execution())
+
+    def cancel_and_drain_skill_goal(self, goal_handle, result_future, timeout: float) -> bool:
+        """Request cancellation and wait for the SkillCommand result to become terminal."""
+        cancel_future = None
+        with contextlib.suppress(Exception):
+            cancel_future = goal_handle.cancel_goal_async()
+        if cancel_future is not None:
+            self._wait_future(cancel_future, timeout)
+        return self._wait_future(result_future, timeout)
+
+    def cancel_late_skill_goal(self, send_future, timeout: float) -> None:
+        """Cancel an acceptance that arrives after the MCP caller has timed out."""
+
+        def _on_goal_accepted(future) -> None:
+            try:
+                goal_handle = future.result()
+            except Exception:  # noqa: BLE001 - a failed send cannot move the robot
+                self.release_skill_execution()
+                return
+            if not goal_handle.accepted:
+                self.release_skill_execution()
+                return
+            try:
+                result_future = goal_handle.get_result_async()
+            except Exception:  # noqa: BLE001 - retain recovery admission when result tracking fails
+                logger.error("late SkillCommand goal accepted but result tracking failed")
+                return
+
+            def _drain_goal() -> None:
+                if self.cancel_and_drain_skill_goal(goal_handle, result_future, timeout):
+                    self.release_skill_execution()
+                else:
+                    self.release_skill_execution_when_terminal(result_future)
+
+            threading.Thread(target=_drain_goal, name="robot_mcp_late_goal_cleanup", daemon=True).start()
+
+        send_future.add_done_callback(_on_goal_accepted)
 
     # --------------------------------- helpers --------------------------------
 

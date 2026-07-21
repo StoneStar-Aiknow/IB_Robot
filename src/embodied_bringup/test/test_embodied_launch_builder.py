@@ -82,6 +82,27 @@ def test_generate_embodied_nodes_passes_arm_joint_metadata(config_name):
     assert set(_decode_launch_json_string(params["joint_limits_json"]).keys()) >= {"1", "2", "3", "4", "5"}
 
 
+def test_launch_injects_only_rule_entry_skill_aliases():
+    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
+    config = load_robot_config_dict(config_path)
+    config["embodied"]["enabled"] = True
+    nodes = generate_embodied_nodes(config, "moveit_planning")
+    task_entry = next(node for node in nodes if vars(node)["_Node__node_name"] == "task_entry_node")
+    params = _normalize_launch_param_mapping(task_entry._Node__parameters[0])
+    aliases = _decode_launch_json_string(params["skill_aliases_json"])
+
+    assert set(aliases) == {
+        "dance_basic",
+        "wave_hello",
+        "nod_yes",
+        "shake_no",
+        "celebrate",
+        "greet_observe_raise",
+        "act_cute",
+        "happy_spin_upright",
+    }
+
+
 def test_no_interaction_skills_node_is_generated():
     robot_config = {
         "embodied": {

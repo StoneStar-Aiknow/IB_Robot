@@ -10,6 +10,7 @@
   <depend>ament_index_python</depend>
   <depend>launch</depend>
   <depend>launch_ros</depend>
+  <depend>embodied_common</depend>
   <depend>robot_config</depend>
   <exec_depend>embodied_agent</exec_depend>
   <exec_depend>skill_library</exec_depend>
