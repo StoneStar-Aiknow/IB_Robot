@@ -1,5 +1,7 @@
 """Fallback planner that reuses the existing rule-based parser."""
 
+from __future__ import annotations
+
 from embodied_common.command_parser import parse_text_command
 from vlm_task_planner.response_parser import PlannerResult
 
@@ -9,12 +11,14 @@ def fallback_plan_from_text(
     default_target_name: str,
     default_place_name: str,
     default_relative_motion_step_m: float,
+    skill_aliases: dict[str, list[str]] | None = None,
 ) -> PlannerResult:
     plan = parse_text_command(
         text,
         default_target_name=default_target_name,
         default_place_name=default_place_name,
         default_relative_motion_step_m=default_relative_motion_step_m,
+        skill_aliases=skill_aliases,
     )
     return PlannerResult(
         task_type=plan.task_type,

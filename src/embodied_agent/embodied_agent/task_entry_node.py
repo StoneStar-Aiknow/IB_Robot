@@ -8,13 +8,14 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 from embodied_agent.command_parser import PlannedTask, parse_text_command
-from embodied_agent.visual_games import build_game_request, match_game
 from embodied_agent.task_context import (
     TIMEOUT_CONTEXT_KEY,
     build_timeout_context,
     dump_task_context,
     load_task_context,
 )
+from embodied_agent.visual_games import build_game_request, match_game
+from embodied_common.command_parser import load_skill_aliases
 from ibrobot_msgs.msg import SceneAnalysisRequest, TaskCommand, TaskStatus
 
 
@@ -60,6 +61,7 @@ class TaskEntryNode(Node):
         self.declare_parameter("default_place_name", "tray_right")
         self.declare_parameter("default_relative_motion_step_m", 0.03)
         self.declare_parameter("default_task_timeout_sec", 180.0)
+        self.declare_parameter("skill_aliases_json", "")
         self.declare_parameter("perception_request_topic", "/embodied/perception_request")
         self.declare_parameter("perception_enabled", False)
         self.declare_parameter("entry_visual_games_json", "{}")
@@ -75,21 +77,20 @@ class TaskEntryNode(Node):
             self.get_parameter("default_relative_motion_step_m").get_parameter_value().double_value
         )
         self._default_task_timeout = self.get_parameter("default_task_timeout_sec").get_parameter_value().double_value
+        self._skill_aliases = load_skill_aliases(
+            self.get_parameter("skill_aliases_json").get_parameter_value().string_value
+        )
         self._perception_request_topic = (
             self.get_parameter("perception_request_topic").get_parameter_value().string_value
         )
         self._perception_enabled = self.get_parameter("perception_enabled").get_parameter_value().bool_value
-        self._games = self._load_games(
-            self.get_parameter("entry_visual_games_json").get_parameter_value().string_value
-        )
+        self._games = self._load_games(self.get_parameter("entry_visual_games_json").get_parameter_value().string_value)
         self._debug = self.get_parameter("debug_tracing").get_parameter_value().bool_value
 
         self._publisher = self.create_publisher(TaskCommand, self._output_topic, 10)
         self._planned_publisher = self.create_publisher(TaskCommand, self._planned_output_topic, 10)
         self._status_publisher = self.create_publisher(TaskStatus, self._status_topic, 10)
-        self._perception_publisher = self.create_publisher(
-            SceneAnalysisRequest, self._perception_request_topic, 10
-        )
+        self._perception_publisher = self.create_publisher(SceneAnalysisRequest, self._perception_request_topic, 10)
         self.create_subscription(String, self._input_topic, self._handle_text_command, 10)
 
         # Guard against a visual game being enabled while its perception runtime
@@ -132,8 +133,7 @@ class TaskEntryNode(Node):
     def _dispatch_game(self, game_name: str, command: str) -> None:
         if not self._perception_enabled:
             self.get_logger().warning(
-                f"matched game '{game_name}' for '{command}' but perception is "
-                "disabled; dropping request"
+                f"matched game '{game_name}' for '{command}' but perception is disabled; dropping request"
             )
             return
         request = build_game_request(game_name)
@@ -166,6 +166,7 @@ class TaskEntryNode(Node):
             default_target_name=self._default_target,
             default_place_name=self._default_place,
             default_relative_motion_step_m=self._default_relative_motion_step,
+            skill_aliases=self._skill_aliases or None,
         )
         if plan.skill_sequence:
             planned_task = build_direct_planned_task(

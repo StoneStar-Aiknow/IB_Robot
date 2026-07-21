@@ -9,6 +9,7 @@ from typing import Any
 import rclpy
 
 from embodied_common.base_node import BaseTaskNode
+from embodied_common.command_parser import load_skill_aliases
 from embodied_common.json_utils import load_json_list, load_json_mapping
 from embodied_common.scene_analysis import SceneAnalysis, parse_scene_analysis_response
 from embodied_common.skill_templates import DEFAULT_ALLOWED_SKILLS
@@ -61,6 +62,7 @@ class VLMTaskPlannerNode(BaseTaskNode):
         self.declare_parameter("fallback_to_rule_planner", True)
         self.declare_parameter("min_confidence", 0.7)
         self.declare_parameter("allowed_skills_json", json.dumps(DEFAULT_ALLOWED_SKILLS))
+        self.declare_parameter("skill_aliases_json", "")
         self.declare_parameter("debug_tracing", False)
 
         self._input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
@@ -89,6 +91,9 @@ class VLMTaskPlannerNode(BaseTaskNode):
         self._relative_motion_direction_mapping = load_json_mapping(
             self.get_parameter("relative_motion_direction_mapping_json").get_parameter_value().string_value,
             "relative_motion_direction_mapping_json",
+        )
+        self._skill_aliases = load_skill_aliases(
+            self.get_parameter("skill_aliases_json").get_parameter_value().string_value
         )
         self._planner_mode = self.get_parameter("planner_mode").get_parameter_value().string_value
         self._primary_camera_topic = self.get_parameter("primary_camera_topic").get_parameter_value().string_value
@@ -391,6 +396,7 @@ class VLMTaskPlannerNode(BaseTaskNode):
             default_target_name=self._default_target,
             default_place_name=self._default_place,
             default_relative_motion_step_m=self._default_relative_motion_step,
+            skill_aliases=self._skill_aliases or None,
         )
         if not plan.skill_sequence:
             self._reject_task(msg.task_id, fallback_reason or "unsupported command", "UNSUPPORTED_COMMAND")
