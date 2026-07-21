@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from inference_manifest import load_inference_manifest
+from inference_service.backends import BackendCancellationError
 from inference_service.distributed import (
     CloudSession,
     DistributedCloudService,
@@ -30,6 +34,7 @@ from inference_service.distributed.ros_protocol import (
     status_from_message,
     status_to_message,
 )
+from inference_service.distributed.types import structured_error_from_exception
 from inference_service.pipeline import PipelineState
 from tests.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
 
@@ -223,6 +228,189 @@ def test_cloud_restart_creates_new_session_and_stale_response_is_discarded(tmp_p
     assert stale_update.error.code == "stale_response"
 
 
+def test_cloud_session_rollover_waits_for_old_generation_runtime_operation(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+
+    class Runtime:
+        capabilities = SimpleNamespace(resettable=True, stateful=True, supports_cancellation=False)
+
+        def __init__(self):
+            self.infer_started = threading.Event()
+            self.infer_release = threading.Event()
+            self.active = 0
+            self.max_active = 0
+            self.policy_state = 0
+            self.reset_calls = 0
+
+        def infer(self, _request_id, _inputs, *, prompt=None, deadline=None):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            self.infer_started.set()
+            try:
+                assert self.infer_release.wait(timeout=2)
+                self.policy_state += 1
+                return SimpleNamespace(action=np.zeros((1, 6)), actual_chunk_size=1, backend_latency_ms=1.0)
+            finally:
+                self.active -= 1
+
+        def reset(self, deadline=None):
+            assert self.active == 0
+            self.reset_calls += 1
+            self.policy_state = 0
+
+        @staticmethod
+        def health():
+            return SimpleNamespace(ready=True, state=SimpleNamespace(value="ready"))
+
+        @staticmethod
+        def close():
+            return None
+
+    runtime = Runtime()
+    service = DistributedCloudService(identity, runtime)
+    edge = EdgeSession(identity)
+    edge.start()
+    first_status = service.observe_edge(edge.local_status())
+    assert runtime.reset_calls == 0
+    edge.observe_cloud(first_status)
+    old_request = edge.prepare_request(Operation.INFER, "old", inputs={})
+    old_result: list[DistributedResult] = []
+    old_thread = threading.Thread(target=lambda: old_result.append(service.handle(old_request)))
+    old_thread.start()
+    assert runtime.infer_started.wait(timeout=2)
+
+    restarted_edge_status = replace(
+        edge.local_status(),
+        sequence=1,
+        session_id="",
+        session_generation=0,
+        ready=False,
+        runtime_state=PipelineState.HANDSHAKING.value,
+    )
+    rollover_status: list[PipelineStatus] = []
+    rollover_thread = threading.Thread(
+        target=lambda: rollover_status.append(service.observe_edge(restarted_edge_status))
+    )
+    rollover_thread.start()
+    time.sleep(0.05)
+
+    assert rollover_thread.is_alive()
+    assert rollover_status == []
+    runtime.infer_release.set()
+    old_thread.join(timeout=2)
+    rollover_thread.join(timeout=2)
+
+    assert not old_thread.is_alive()
+    assert not rollover_thread.is_alive()
+    assert old_result[0].success is True
+    assert rollover_status[0].session_id != first_status.session_id
+    assert rollover_status[0].session_generation > first_status.session_generation
+    assert runtime.max_active == 1
+    assert runtime.reset_calls == 1
+    assert runtime.policy_state == 0
+
+
+def test_stateless_cloud_session_rollover_does_not_reset_runtime(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+
+    class Runtime:
+        capabilities = SimpleNamespace(resettable=False, stateful=False, supports_cancellation=False)
+
+        def __init__(self):
+            self.reset_calls = 0
+
+        def reset(self, deadline=None):
+            self.reset_calls += 1
+
+        @staticmethod
+        def health():
+            return SimpleNamespace(ready=True, state=SimpleNamespace(value="ready"))
+
+        @staticmethod
+        def close():
+            return None
+
+    runtime = Runtime()
+    service = DistributedCloudService(identity, runtime)
+    edge = EdgeSession(identity)
+    edge.start()
+    first_status = service.observe_edge(edge.local_status())
+    restarted = replace(edge.local_status(), sequence=1)
+
+    rollover_status = service.observe_edge(restarted)
+
+    assert rollover_status.session_id != first_status.session_id
+    assert runtime.reset_calls == 0
+
+
+def test_stateful_cloud_session_rollover_reset_failure_does_not_publish_new_session(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+
+    class Runtime:
+        capabilities = SimpleNamespace(resettable=True, stateful=True, supports_cancellation=False)
+
+        def __init__(self):
+            self.reset_calls = 0
+
+        def reset(self, deadline=None):
+            self.reset_calls += 1
+            raise RuntimeError("reset failed")
+
+        @staticmethod
+        def health():
+            return SimpleNamespace(ready=True, state=SimpleNamespace(value="ready"))
+
+        @staticmethod
+        def close():
+            return None
+
+    runtime = Runtime()
+    service = DistributedCloudService(identity, runtime)
+    edge = EdgeSession(identity)
+    edge.start()
+    service.observe_edge(edge.local_status())
+    restarted = replace(edge.local_status(), sequence=1)
+
+    failed_statuses = [service.observe_edge(restarted) for _ in range(3)]
+
+    assert runtime.reset_calls == 3
+    assert all(status.ready is False for status in failed_statuses)
+    assert all(status.session_id == "" for status in failed_statuses)
+    assert all(status.session_generation == 0 for status in failed_statuses)
+    assert all(status.error is not None and status.error.stage == "reset" for status in failed_statuses)
+    assert all("reset failed" in status.error.message for status in failed_statuses if status.error is not None)
+
+
+def test_non_resettable_stateful_cloud_session_cannot_roll_over(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+
+    class Runtime:
+        capabilities = SimpleNamespace(resettable=False, stateful=True, supports_cancellation=False)
+
+        @staticmethod
+        def health():
+            return SimpleNamespace(ready=True, state=SimpleNamespace(value="ready"))
+
+        @staticmethod
+        def close():
+            return None
+
+    service = DistributedCloudService(identity, Runtime())
+    edge = EdgeSession(identity)
+    edge.start()
+    service.observe_edge(edge.local_status())
+    restarted = replace(edge.local_status(), sequence=1)
+
+    failed_statuses = [service.observe_edge(restarted) for _ in range(3)]
+
+    assert all(status.ready is False for status in failed_statuses)
+    assert all(status.session_id == "" for status in failed_statuses)
+    assert all(status.error is not None for status in failed_statuses)
+    assert all(
+        status.error.code == "session_reset_unsupported" for status in failed_statuses if status.error is not None
+    )
+
+
 def test_remote_backend_failure_revokes_ready_session(tmp_path):
     identity = _identity(tmp_path / "bundle")
     edge = EdgeSession(identity)
@@ -289,6 +477,64 @@ def test_cancel_request_requires_target_and_tracks_capability(tmp_path):
 
     assert edge.cancellation_supported is True
     assert cancel.target_request_id == "inference"
+
+
+def test_cancel_request_rejects_unknown_or_non_inference_target(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+    edge = EdgeSession(identity)
+    cloud = CloudSession(identity)
+    _handshake(edge, cloud)
+
+    with pytest.raises(DistributedProtocolError) as unknown:
+        edge.prepare_request(Operation.CANCEL, "cancel-unknown", target_request_id="missing")
+    assert unknown.value.code == "invalid_cancel_target"
+
+    edge.prepare_request(Operation.RESET, "reset")
+    with pytest.raises(DistributedProtocolError) as non_inference:
+        edge.prepare_request(Operation.CANCEL, "cancel-reset", target_request_id="reset")
+    assert non_inference.value.code == "invalid_cancel_target"
+
+
+def test_structured_cancellation_error_preserves_outcome_certainty():
+    error = BackendCancellationError(
+        "acknowledgement lost",
+        operation_started=True,
+        outcome_known=False,
+    )
+
+    structured = structured_error_from_exception(error, "cancel")
+
+    assert structured.details["operation_started"] is True
+    assert structured.details["outcome_known"] is False
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_cancel_result_must_match_requested_target(tmp_path, success):
+    identity = _identity(tmp_path / "bundle")
+    edge = EdgeSession(identity)
+    cloud = CloudSession(identity)
+    status = _handshake(edge, cloud)
+    edge.prepare_request(Operation.INFER, "target")
+    cancel = edge.prepare_request(Operation.CANCEL, "cancel", target_request_id="target")
+    result = DistributedResult(
+        operation=Operation.CANCEL,
+        pipeline_id=identity.pipeline_id,
+        request_id=cancel.request_id,
+        target_request_id="different-target",
+        session_id=status.session_id,
+        session_generation=status.session_generation,
+        deployment_fingerprint=identity.deployment_fingerprint,
+        success=success,
+        error=None if success else StructuredError(code="cancel_failed", message="cancel failed", stage="cancel"),
+        backend_ready=True,
+        backend_state="ready",
+    )
+
+    update = edge.accept_result(result)
+
+    assert update.error is not None
+    assert update.error.code == "stale_response"
+    assert update.canceled_request_id == ""
 
 
 def test_expired_deadline_is_rejected_before_transmission(tmp_path):
@@ -478,6 +724,69 @@ def test_unknown_pipeline_error_uses_cloud_pipeline_identity(tmp_path):
     assert result.error is not None
     assert result.error.code == "pipeline_not_found"
     assert edge.accept_result(result).error is None
+
+
+def test_cloud_status_advertises_reset_for_stateless_non_resettable_pipeline(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+
+    class Runtime:
+        capabilities = type(
+            "Capabilities",
+            (),
+            {"resettable": False, "stateful": False, "supports_cancellation": False},
+        )()
+
+        @staticmethod
+        def health():
+            state = type("State", (), {"value": "ready"})()
+            return type("Health", (), {"ready": True, "state": state})()
+
+        @staticmethod
+        def close():
+            return None
+
+    service = DistributedCloudService(identity, Runtime())
+    edge = EdgeSession(identity)
+    edge.start()
+
+    status = service.observe_edge(edge.local_status())
+
+    assert status.reset_supported is True
+
+
+def test_cloud_status_preserves_session_while_pipeline_is_resetting(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+    backend_health = type("BackendHealth", (), {"ready": True})()
+    runtime = type(
+        "Runtime",
+        (),
+        {
+            "capabilities": type(
+                "Capabilities",
+                (),
+                {"resettable": True, "stateful": True, "supports_cancellation": False},
+            )(),
+            "health": lambda _self: type(
+                "Diagnostics",
+                (),
+                {
+                    "ready": False,
+                    "state": PipelineState.RESETTING,
+                    "backend_health": backend_health,
+                },
+            )(),
+            "close": lambda _self: None,
+        },
+    )()
+    service = DistributedCloudService(identity, runtime)
+    edge = EdgeSession(identity)
+    edge.start()
+
+    status = service.observe_edge(edge.local_status())
+
+    assert status.ready is True
+    assert status.runtime_state == "resetting"
+    assert status.session_id
 
 
 def test_ros_protocol_round_trips_status_request_and_result(tmp_path):

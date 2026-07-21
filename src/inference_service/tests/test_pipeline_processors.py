@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from inference_manifest import load_inference_manifest
@@ -56,3 +57,65 @@ def test_local_tokenizer_reference_is_resolved_against_bundle(monkeypatch, tmp_p
     action = postprocessor(np.ones((1, 2), dtype=np.float32))
     assert isinstance(action, torch.Tensor)
     assert torch.equal(action, torch.ones((1, 2)))
+
+
+def test_processor_pair_reset_resets_preprocessor_and_postprocessor(monkeypatch, tmp_path: Path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    paths = create_policy_bundle(bundle, include_weights=False)
+    write_manifest(bundle, make_manifest(bundle, paths, deployment_name="rk3588", compiled=True))
+    context = RuntimeContext(load_inference_manifest(bundle, "rk3588"))
+    preprocessor = SimpleNamespace(reset_calls=0)
+    postprocessor = SimpleNamespace(reset_calls=0)
+    preprocessor.reset = lambda: setattr(preprocessor, "reset_calls", preprocessor.reset_calls + 1)
+    postprocessor.reset = lambda: setattr(postprocessor, "reset_calls", postprocessor.reset_calls + 1)
+
+    policies = ModuleType("lerobot.configs.policies")
+    policies.PreTrainedConfig = SimpleNamespace(
+        from_pretrained=lambda *_args, **_kwargs: SimpleNamespace(device="cuda")
+    )
+    factory = ModuleType("lerobot.policies.factory")
+    factory.make_pre_post_processors = lambda **_kwargs: (preprocessor, postprocessor)
+    monkeypatch.setitem(sys.modules, policies.__name__, policies)
+    monkeypatch.setitem(sys.modules, factory.__name__, factory)
+
+    preprocessor_view, _ = create_lerobot_processor_views()
+    preprocessor_view.load(context)
+    preprocessor_view.reset()
+
+    assert preprocessor.reset_calls == 1
+    assert postprocessor.reset_calls == 1
+
+
+def test_processor_pair_reset_attempts_both_processors_before_raising(monkeypatch, tmp_path: Path):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    paths = create_policy_bundle(bundle, include_weights=False)
+    write_manifest(bundle, make_manifest(bundle, paths, deployment_name="rk3588", compiled=True))
+    context = RuntimeContext(load_inference_manifest(bundle, "rk3588"))
+    postprocessor = SimpleNamespace(reset_calls=0)
+
+    def fail_reset():
+        raise RuntimeError("preprocessor reset failed")
+
+    def reset_postprocessor():
+        postprocessor.reset_calls += 1
+
+    preprocessor = SimpleNamespace(reset=fail_reset)
+    postprocessor.reset = reset_postprocessor
+    policies = ModuleType("lerobot.configs.policies")
+    policies.PreTrainedConfig = SimpleNamespace(
+        from_pretrained=lambda *_args, **_kwargs: SimpleNamespace(device="cuda")
+    )
+    factory = ModuleType("lerobot.policies.factory")
+    factory.make_pre_post_processors = lambda **_kwargs: (preprocessor, postprocessor)
+    monkeypatch.setitem(sys.modules, policies.__name__, policies)
+    monkeypatch.setitem(sys.modules, factory.__name__, factory)
+
+    preprocessor_view, _ = create_lerobot_processor_views()
+    preprocessor_view.load(context)
+
+    with pytest.raises(RuntimeError, match="preprocessor reset failed"):
+        preprocessor_view.reset()
+
+    assert postprocessor.reset_calls == 1

@@ -210,9 +210,16 @@ class RobotConfig:
         def _as_align(d):
             if not d:
                 return None
+            tol_ms = int(d.get("tol_ms", 0))
+            max_age_ms = int(d.get("max_age_ms", 0))
+            if tol_ms < 0:
+                raise ValueError("align.tol_ms must be non-negative")
+            if max_age_ms < 0:
+                raise ValueError("align.max_age_ms must be non-negative")
             return AlignSpec(
                 strategy=str(d.get("strategy", "hold")).lower(),
-                tol_ms=int(d.get("tol_ms", 0)),
+                tol_ms=tol_ms,
+                max_age_ms=max_age_ms,
                 stamp=str(d.get("stamp", "receive")).lower(),
             )
 

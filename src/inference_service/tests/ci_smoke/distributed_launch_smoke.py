@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from smoke_support import (
     assert_successful_action,
     prepare_smoke_runtime,
-    send_inference,
+    publish_required_observations,
+    send_inference_when_observations_ready,
     wait_for_distributed_ready,
 )
 
@@ -84,12 +85,18 @@ class TestDistributedLaunch(unittest.TestCase):
     def test_handshake_and_request(self) -> None:
         rclpy.init()
         node = rclpy.create_node("inference_distributed_smoke_client")
+        stop_observations = None
         try:
             health = wait_for_distributed_ready(node, "/inference/distributed/health")
             self.assertEqual("distributed", health["pipeline_id"])
-            result = send_inference(node, "/inference/distributed/dispatch", "distributed-request")
-            assert_successful_action(self, result, "distributed", "distributed-request")
+            stop_observations = publish_required_observations(node, expected_subscriptions=1)
+            result, request_id = send_inference_when_observations_ready(
+                node, "/inference/distributed/dispatch", "distributed-request"
+            )
+            assert_successful_action(self, result, "distributed", request_id)
         finally:
+            if stop_observations is not None:
+                stop_observations()
             node.destroy_node()
             rclpy.shutdown()
 

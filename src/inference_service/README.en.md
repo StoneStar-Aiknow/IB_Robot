@@ -206,6 +206,18 @@ ROS observations
   -> DispatchInfer result and action topic
 ```
 
+Before processors run, the node checks every observation required by the policy `input_features`. A buffered
+sample must exist at or before the requested timestamp and satisfy its `align.strategy` (`hold`, `asof`, or `drop`).
+When the contract configures `max_age_ms > 0` for that observation, it is an additional maximum live sample age,
+separate from `tol_ms` used by `asof` alignment. Live age uses the node's local receipt clock, which request
+timestamps cannot rewind; request timestamps only select aligned historical samples. Missing,
+future-dated, or stale samples return the recoverable `observation_not_ready` error instead of silently running the model with zero
+padding. The pipeline reset service resets the policy and LeRobot preprocessor/postprocessor, then clears
+observation buffers so the next inference waits for inputs from the new episode. Inference, reset, and distributed
+cancellation use the pipeline `request_timeout` as a cooperative deadline: lock and admission waits exit on time, while
+backend/processor hook overruns are detected when the hook returns. An uncertain reset or cancellation outcome fails
+the edge closed to prevent cloud and edge episode state from diverging.
+
 Normal robot startup creates pipelines from robot YAML through the `robot_config` launch builder. To evaluate one
 pipeline directly:
 
@@ -278,6 +290,13 @@ override above. A successful handshake binds a unique
 session ID and generation. Heartbeat expiry, cloud restart, fingerprint change, or a backend leaving `READY`
 immediately revokes readiness, rejects new requests, and fails in-flight requests with a structured unavailable
 error. Responses from old sessions are discarded, and recovery requires a new handshake.
+
+A new handshake is not sufficient to recover a stateful backend. When replacing an existing session, the cloud
+first stops admission for the old session and drains its runtime operations. A stateless backend may then create
+the new generation directly. A stateful backend must first reset successfully and return to `READY` before the
+cloud publishes a new generation. Reset failure remains fail-closed and subsequent heartbeats cannot bypass this
+recovery barrier. If a stateful backend declares `resettable: false`, session rollover cannot recover through
+handshaking; the cloud runtime must be restarted or rebuilt before it can serve requests again.
 
 ## Backends And Support Matrix
 

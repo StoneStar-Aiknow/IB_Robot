@@ -204,6 +204,17 @@ ROS observations
   -> DispatchInfer result and /actions/<pipeline_id>
 ```
 
+进入 processor 前，节点会对策略 `input_features` 所需的每个 observation 执行 readiness
+检查：缓存中必须已有时间戳不晚于请求时间、且满足 `align.strategy`（`hold` / `asof` / `drop`）
+的样本；当 contract 为该 observation 配置了
+`max_age_ms > 0` 时，该值作为在线推理额外的最大样本年龄，与 `asof` 对齐使用的 `tol_ms` 分离。
+在线年龄使用节点不可被请求方回拨的本地接收时钟计算，request timestamp 仅用于历史样本对齐选择。
+缺失、晚于请求时间或过期的样本会返回可恢复的 `observation_not_ready`，不会静默补零后执行模型。调用 pipeline
+reset service 会重置 policy、LeRobot preprocessor/postprocessor 并清空 observation 缓存，下一次推理
+必须等待新 episode 的输入。推理、reset 和分布式 cancel 都使用 pipeline `request_timeout`
+作为协作式 deadline；锁和 admission 等待会按时退出，backend/processor hook 超时会在其返回时被检测。
+reset 或 cancel 结果不确定时会使 edge fail closed，避免 cloud 与 edge episode 状态不一致。
+
 完整机器人启动通常由 `robot_config` launch builder 根据 YAML 创建 pipeline。仅评估一个
 pipeline 时可直接使用：
 
@@ -299,6 +310,13 @@ Edge 可由 robot YAML 中 `execution_mode: distributed` 创建，也可由上�
 fingerprint 改变或 backend 离开 `READY` 都会立即撤销 readiness、拒绝新请求，并使
 in-flight request 返回结构化 unavailable 错误。不属于当前 session ID 和 generation 的
 response 会被丢弃，连接恢复后必须重新握手。
+
+重新握手不是 stateful backend 的完整恢复条件。替换已有 session 时，Cloud 会先停止旧
+session 准入并等待其 runtime 操作结束；stateless backend 随后可直接创建新 generation，
+stateful backend 则必须先成功 reset，并确认 backend 回到 `READY`，才能发布新 generation。
+Reset 失败时 Cloud 会持续 fail-closed，后续 heartbeat 不能绕过该恢复屏障。若 stateful
+backend 声明 `resettable: false`，session rollover 无法通过重新握手恢复，必须重启或重建
+Cloud runtime 后才能重新提供服务。
 
 ## 后端与支持矩阵
 

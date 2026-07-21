@@ -142,15 +142,22 @@ class ResourceDomainLease:
         self._gate.semaphore.release()
 
     @contextmanager
-    def exclusive(self) -> Iterator[None]:
-        with self._gate.exclusive_lock:
+    def exclusive(self, deadline: datetime | None = None) -> Iterator[None]:
+        _acquire_before_deadline(
+            self._gate.exclusive_lock,
+            deadline,
+            "request deadline expired while waiting for exclusive resource-domain admission",
+        )
+        acquired = 0
+        try:
             for _ in range(self._gate.limit):
-                self.acquire()
-            try:
-                yield
-            finally:
-                for _ in range(self._gate.limit):
-                    self.release()
+                self.acquire(deadline)
+                acquired += 1
+            yield
+        finally:
+            for _ in range(acquired):
+                self.release()
+            self._gate.exclusive_lock.release()
 
     def close(self) -> None:
         with self._lock:
@@ -210,22 +217,33 @@ class BackendAdmission:
             self._instance_gate.release()
 
     @contextmanager
-    def exclusive(self) -> Iterator[None]:
+    def exclusive(self, deadline: datetime | None = None) -> Iterator[None]:
         self._assert_open()
-        with self._instance_exclusive_lock:
+        _acquire_before_deadline(
+            self._instance_exclusive_lock,
+            deadline,
+            "request deadline expired while waiting for exclusive backend instance admission",
+        )
+        acquired = 0
+        try:
             for _ in range(self._instance_limit):
-                self._instance_gate.acquire()
-            try:
-                if self._domain_lease is None:
+                _acquire_before_deadline(
+                    self._instance_gate,
+                    deadline,
+                    "request deadline expired while waiting for exclusive backend instance admission",
+                )
+                acquired += 1
+            if self._domain_lease is None:
+                self._assert_open()
+                yield
+            else:
+                with self._domain_lease.exclusive(deadline):
                     self._assert_open()
                     yield
-                else:
-                    with self._domain_lease.exclusive():
-                        self._assert_open()
-                        yield
-            finally:
-                for _ in range(self._instance_limit):
-                    self._instance_gate.release()
+        finally:
+            for _ in range(acquired):
+                self._instance_gate.release()
+            self._instance_exclusive_lock.release()
 
     def close(self) -> None:
         with self._close_lock:
@@ -243,7 +261,7 @@ class BackendAdmission:
 
 
 def _acquire_before_deadline(
-    semaphore: threading.BoundedSemaphore,
+    semaphore: threading.BoundedSemaphore | threading.Lock,
     deadline: datetime | None,
     timeout_message: str,
 ) -> None:

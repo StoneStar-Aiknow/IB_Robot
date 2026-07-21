@@ -4,7 +4,7 @@
 
 > **支持范围**：HMM backend 仅支持 PI0.5 和 SmolVLA。ACT HMM 已移除；ACT 应使用 `torch`、`ascend`、`hisilicon` 或 `rknn` deployment。
 
-> **板端环境前提**：Houmo 驱动已安装（参考 [`houmo_lq50_driver_install_oee.md`](houmo_lq50_driver_install_oee.md)），`houmo_tcim_runtime_xh2` 已安装到板端 Python 环境，并已执行 `source scripts/setup/houmo_hmm_env.sh`。
+> **板端环境前提**：已安装 Houmo 1.3.0 OpenHarmony runtime，并使用 OpenHarmony 工具链交叉编译和安装对应的 Python binding。具体安装资料暂不对外提供。
 
 ## 架构概览
 
@@ -239,8 +239,8 @@ OpenHarmony 板端没有 systemd，rootfs 默认只读，且脚本应兼容 POSI
 安装 aarch64 runtime SDK 后，运行 ROS/HMM 推理前加载 RoboFrame 和 Houmo 环境：
 
 ```bash
-source /data/roboframe/scripts/robooh_1.0.1.env
-source /data/roboframe/scripts/setup/houmo_hmm_env.sh
+. /data/roboframe/scripts/robooh_1.0.1.env
+. /data/roboframe/scripts/setup/houmo_hmm_env.sh
 ```
 
 若 release 中保留仓库目录布局，也可使用对应的 `scripts/setup/houmo_hmm_env.sh`。
@@ -248,7 +248,7 @@ source /data/roboframe/scripts/setup/houmo_hmm_env.sh
 关键变量应为：
 
 ```bash
-TCIM_BACKEND=Xh2HalBackend
+TCIM_BACKEND=xh2
 HOUMO_TARGET=xh2
 ```
 
@@ -284,7 +284,7 @@ python3 -c "import tcim_lite.runtime as r; print('device_num:', r.get_device_num
 
 ### `device_num: 0` 或 `InitDevice failed`
 
-检查 `TCIM_BACKEND=Xh2HalBackend`、`HOUMO_TARGET=xh2` 和 `libhal_xh2a.so` 的 library path，然后重新加载 `houmo_hmm_env.sh`。
+检查 native Houmo 1.3 runtime 使用 `TCIM_BACKEND=xh2`、`HOUMO_TARGET=xh2`，并确认 `/data/local/houmo/lib` 和 `/data/local/houmo-sdk/lib` 已加入 library path，然后重新加载 `houmo_hmm_env.sh`。`Xh2HalBackend` 是 legacy runtime 的 selector，不适用于此 native OpenHarmony 部署。
 
 ### `set_input error: Status.UNINITIALIZED`
 
@@ -303,4 +303,3 @@ PI0.5 使用 prefill input -> decode input 的 device pointer；SmolVLA 使用 p
 - HMM exporter tests：`src/model_utils/test/test_hmm_export.py`
 - 已迁移 bundle：`models/pi05_hmm/`、`models/smolvla_hmm/`
 - 板端环境：`scripts/setup/houmo_hmm_env.sh`
-- 驱动安装：[`houmo_lq50_driver_install_oee.md`](houmo_lq50_driver_install_oee.md)

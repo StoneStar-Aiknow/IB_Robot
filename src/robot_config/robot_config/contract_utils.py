@@ -4,23 +4,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
-
 import hashlib
 import json
+from collections.abc import Iterable, Sequence
+from dataclasses import asdict, dataclass
+from typing import Any
+
 import numpy as np
 from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
     QoSProfile,
     ReliabilityPolicy,
-    HistoryPolicy,
-    DurabilityPolicy,
 )
 
 # Bridge to tensormsg for global registry
 import tensormsg.registry as tensormsg_registry
-from tensormsg import register_encoder, register_decoder
 
 # ---------- Contract datamodel ----------
 
@@ -31,11 +30,13 @@ class AlignSpec:
 
     strategy:  "hold" | "asof" | "drop"
     tol_ms:    as-of tolerance in ms for 'asof' (ignored for others)
+    max_age_ms: maximum live age measured from local receipt time
     stamp:     "receive" | "header"
     """
 
     strategy: str = "hold"
     tol_ms: int = 0
+    max_age_ms: int = 0
     stamp: str = "receive"
 
 
@@ -46,13 +47,11 @@ class ObservationSpec:
     key: str
     topic: str
     type: str
-    selector: Optional[Dict[str, Any]] = None  # {names: [...]}
-    image: Optional[Dict[str, Any]] = (
-        None  # {resize:[H,W], encoding:'rgb8'|'bgr8'|'mono8'...}
-    )
-    align: Optional[AlignSpec] = None
+    selector: dict[str, Any] | None = None  # {names: [...]}
+    image: dict[str, Any] | None = None  # {resize:[H,W], encoding:'rgb8'|'bgr8'|'mono8'...}
+    align: AlignSpec | None = None
     # {reliability, history, depth, durability}
-    qos: Optional[Dict[str, Any]] = None
+    qos: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,10 +61,10 @@ class ActionSpec:
     key: str
     publish_topic: str
     type: str
-    selector: Optional[Dict[str, Any]] = None
-    from_tensor: Optional[Dict[str, Any]] = None
-    publish_qos: Optional[Dict[str, Any]] = None
-    publish_strategy: Optional[Dict[str, Any]] = None
+    selector: dict[str, Any] | None = None
+    from_tensor: dict[str, Any] | None = None
+    publish_qos: dict[str, Any] | None = None
+    publish_strategy: dict[str, Any] | None = None
     safety_behavior: str = "zeros"  # "zeros" | "hold"
 
 
@@ -76,7 +75,7 @@ class TaskSpec:
     key: str
     topic: str
     type: str
-    qos: Optional[Dict[str, Any]] = None
+    qos: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,21 +86,28 @@ class Contract:
     version: int
     rate_hz: float
     max_duration_s: float
-    observations: List[ObservationSpec]
-    actions: List[ActionSpec]
-    tasks: List[TaskSpec]
-    recording: Dict[str, Any]
-    robot_type: Optional[str] = None
+    observations: list[ObservationSpec]
+    actions: list[ActionSpec]
+    tasks: list[TaskSpec]
+    recording: dict[str, Any]
+    robot_type: str | None = None
     timestamp_source: str = "receive"
-    process: Dict[str, Any] = None
+    process: dict[str, Any] = None
 
 
-def _as_align(d: Optional[Dict[str, Any]]) -> Optional[AlignSpec]:
+def _as_align(d: dict[str, Any] | None) -> AlignSpec | None:
     if not d:
         return None
+    tol_ms = int(d.get("tol_ms", 0))
+    max_age_ms = int(d.get("max_age_ms", 0))
+    if tol_ms < 0:
+        raise ValueError("align.tol_ms must be non-negative")
+    if max_age_ms < 0:
+        raise ValueError("align.max_age_ms must be non-negative")
     return AlignSpec(
         strategy=str(d.get("strategy", "hold")).lower(),
-        tol_ms=int(d.get("tol_ms", 0)),
+        tol_ms=tol_ms,
+        max_age_ms=max_age_ms,
         stamp=str(d.get("stamp", "receive")).lower(),
     )
 
@@ -117,15 +123,16 @@ class SpecView:
     topic: str
     ros_type: str
     is_action: bool
-    names: List[str]
-    image_resize: Optional[Tuple[int, int]]
+    names: list[str]
+    image_resize: tuple[int, int] | None
     image_encoding: str
     image_channels: int  # 1, 3, or 4
     resample_policy: str  # obs: align.strategy; actions: "hold"
     asof_tol_ms: int
+    max_age_ms: int
     stamp_src: str
-    clamp: Optional[Tuple[float, float]]  # actions only
-    safety_behavior: Optional[str]  # actions only: "zeros" | "hold"
+    clamp: tuple[float, float] | None  # actions only
+    safety_behavior: str | None  # actions only: "zeros" | "hold"
 
 
 def _num_channels_from_encoding(encoding: str) -> int:
@@ -143,7 +150,7 @@ def _num_channels_from_encoding(encoding: str) -> int:
             if len(enc) == len(prefix):
                 return 1
             try:
-                channel_str = enc[len(prefix):]
+                channel_str = enc[len(prefix) :]
                 if channel_str.isdigit():
                     return int(channel_str)
             except (ValueError, IndexError):
@@ -184,13 +191,14 @@ def iter_specs(contract: Contract) -> Iterable[SpecView]:
             image_channels=channels,
             resample_policy=al.strategy,
             asof_tol_ms=int(al.tol_ms),
+            max_age_ms=int(al.max_age_ms),
             stamp_src=al.stamp,
             clamp=None,
             safety_behavior=None,
         )
     for a in contract.actions:
         names = list((a.selector or {}).get("names", []))
-        clamp: Optional[Tuple[float, float]] = None
+        clamp: tuple[float, float] | None = None
         if a.from_tensor and "clamp" in a.from_tensor:
             lo, hi = a.from_tensor["clamp"]
             clamp = (float(lo), float(hi))
@@ -205,15 +213,14 @@ def iter_specs(contract: Contract) -> Iterable[SpecView]:
             image_channels=3,
             resample_policy="hold",
             asof_tol_ms=0,
+            max_age_ms=0,
             stamp_src=contract.timestamp_source,
             clamp=clamp,
             safety_behavior=(a.safety_behavior or "zeros").lower(),
         )
 
 
-def feature_from_spec(
-    spec: SpecView, use_videos: bool
-) -> Tuple[str, Dict[str, Any], bool]:
+def feature_from_spec(spec: SpecView, use_videos: bool) -> tuple[str, dict[str, Any], bool]:
     if spec.image_resize:
         h, w = int(spec.image_resize[0]), int(spec.image_resize[1])
         dtype = "video" if use_videos else "image"
@@ -253,7 +260,7 @@ ENCODERS = tensormsg_registry.ENCODER_REGISTRY
 # ---------- Time helpers ----------
 
 
-def stamp_from_header_ns(msg) -> Optional[int]:
+def stamp_from_header_ns(msg) -> int | None:
     try:
         st = msg.header.stamp
         ts_ns = int(st.sec) * 1_000_000_000 + int(st.nanosec)
@@ -270,14 +277,15 @@ def stamp_from_header_ns(msg) -> Optional[int]:
 def decode_value(ros_type: str, msg, spec) -> Any:
     """Decode a ROS message using tensormsg through the rosetta API."""
     from tensormsg.converter import TensorMsgConverter
+
     return TensorMsgConverter.decode(msg, spec)
 
 
 # ---------- Resampling ----------
 
 
-def resample_hold(ts_ns: np.ndarray, vals: List[Any], ticks_ns: np.ndarray) -> List[Any]:
-    out: List[Any] = []
+def resample_hold(ts_ns: np.ndarray, vals: list[Any], ticks_ns: np.ndarray) -> list[Any]:
+    out: list[Any] = []
     j, last = 0, None
     if len(ts_ns) > 0 and len(ticks_ns) > 0 and ticks_ns[0] < ts_ns[0]:
         last = vals[0]
@@ -290,12 +298,10 @@ def resample_hold(ts_ns: np.ndarray, vals: List[Any], ticks_ns: np.ndarray) -> L
     return out
 
 
-def resample_asof(
-    ts_ns: np.ndarray, vals: List[Any], ticks_ns: np.ndarray, tol_ns: int
-) -> List[Optional[Any]]:
+def resample_asof(ts_ns: np.ndarray, vals: list[Any], ticks_ns: np.ndarray, tol_ns: int) -> list[Any | None]:
     if tol_ns <= 0:
         return resample_hold(ts_ns, vals, ticks_ns)
-    out: List[Optional[Any]] = []
+    out: list[Any | None] = []
     j = 0
     for t in ticks_ns:
         while j + 1 < len(ts_ns) and ts_ns[j + 1] <= t:
@@ -305,10 +311,8 @@ def resample_asof(
     return out
 
 
-def resample_drop(
-    ts_ns: np.ndarray, vals: List[Any], ticks_ns: np.ndarray, step_ns: int
-) -> List[Optional[Any]]:
-    out: List[Optional[Any]] = []
+def resample_drop(ts_ns: np.ndarray, vals: list[Any], ticks_ns: np.ndarray, step_ns: int) -> list[Any | None]:
+    out: list[Any | None] = []
     j, n = -1, len(ts_ns)
     for t in ticks_ns:
         while j + 1 < n and ts_ns[j + 1] <= t:
@@ -320,11 +324,11 @@ def resample_drop(
 def resample(
     policy: str,
     ts_ns: np.ndarray,
-    vals: List[Any],
+    vals: list[Any],
     ticks_ns: np.ndarray,
     step_ns: int,
     tol_ms: int,
-) -> List[Any]:
+) -> list[Any]:
     if policy == "drop":
         return resample_drop(ts_ns, vals, ticks_ns, step_ns)
     if policy == "asof":
@@ -337,8 +341,8 @@ class StreamBuffer:
         self.policy = policy
         self.step_ns = int(step_ns)
         self.tol_ns = int(tol_ns)
-        self.last_ts: Optional[int] = None
-        self.last_val: Optional[Any] = None
+        self.last_ts: int | None = None
+        self.last_val: Any | None = None
 
     def push(self, ts_ns: int, val: Any) -> None:
         if self.last_ts is None or ts_ns >= self.last_ts:
@@ -361,19 +365,20 @@ class StreamBuffer:
 
 def encode_value(
     ros_type: str,
-    names: List[str],
+    names: list[str],
     action_vec: Sequence[float],
-    clamp: Optional[Tuple[float, float]] = None,
+    clamp: tuple[float, float] | None = None,
 ):
     """Encode an action vector using tensormsg."""
     from tensormsg.converter import TensorMsgConverter
+
     return TensorMsgConverter.encode(ros_type, action_vec, names, clamp)
 
 
 # ---------- QoS utilities ----------
 
 
-def qos_profile_from_dict(d: Optional[Dict[str, Any]]) -> Optional[QoSProfile]:
+def qos_profile_from_dict(d: dict[str, Any] | None) -> QoSProfile | None:
     if not d:
         return None
     rel = str(d.get("reliability", "reliable")).lower()
@@ -381,27 +386,17 @@ def qos_profile_from_dict(d: Optional[Dict[str, Any]]) -> Optional[QoSProfile]:
     dur = str(d.get("durability", "volatile")).lower()
     depth = int(d.get("depth", 10))
     return QoSProfile(
-        reliability=(
-            ReliabilityPolicy.BEST_EFFORT
-            if rel == "best_effort"
-            else ReliabilityPolicy.RELIABLE
-        ),
-        history=(
-            HistoryPolicy.KEEP_ALL if hist == "keep_all" else HistoryPolicy.KEEP_LAST
-        ),
+        reliability=(ReliabilityPolicy.BEST_EFFORT if rel == "best_effort" else ReliabilityPolicy.RELIABLE),
+        history=(HistoryPolicy.KEEP_ALL if hist == "keep_all" else HistoryPolicy.KEEP_LAST),
         depth=depth,
-        durability=(
-            DurabilityPolicy.TRANSIENT_LOCAL
-            if dur == "transient_local"
-            else DurabilityPolicy.VOLATILE
-        ),
+        durability=(DurabilityPolicy.TRANSIENT_LOCAL if dur == "transient_local" else DurabilityPolicy.VOLATILE),
     )
 
 
 # ---------- Data processing utilities ----------
 
 
-def zero_pad(feature_meta: Dict[str, Any]) -> Any:
+def zero_pad(feature_meta: dict[str, Any]) -> Any:
     dtype = feature_meta["dtype"]
     shape = tuple(feature_meta.get("shape") or ())
     if dtype in ("video", "image"):
@@ -432,6 +427,7 @@ def contract_fingerprint(contract) -> str:
                 "topic": obs.get("topic"),
                 "type": obs.get("type"),
                 "selector": obs.get("selector"),
+                "align": obs.get("align"),
             }
         )
     for act in contract_dict.get("actions", []):

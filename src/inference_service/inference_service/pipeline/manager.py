@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterable, Mapping
+from datetime import datetime
 from types import MappingProxyType
 
 from inference_service.backends import BackendCapabilities, InferenceRequest
@@ -87,13 +88,13 @@ class InferencePipelineManager:
             capture_raw_action=capture_raw_action,
         )
 
-    def reset(self, pipeline_id: str) -> None:
+    def reset(self, pipeline_id: str, deadline: datetime | None = None) -> None:
         self._require_started()
-        self._pipeline(pipeline_id).reset()
+        self._pipeline(pipeline_id).reset(deadline)
 
-    def cancel(self, pipeline_id: str, request_id: str) -> None:
+    def cancel(self, pipeline_id: str, request_id: str, deadline: datetime | None = None) -> None:
         self._require_started()
-        self._pipeline(pipeline_id).cancel(request_id)
+        self._pipeline(pipeline_id).cancel(request_id, deadline)
 
     def capabilities(self, pipeline_id: str) -> BackendCapabilities:
         self._require_started()

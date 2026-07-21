@@ -39,8 +39,31 @@ class BackendInferenceError(BackendError):
 
 
 class BackendAdmissionError(BackendError):
-    def __init__(self, message: str, *, code: str = "admission_rejected") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "admission_rejected",
+        operation_started: bool = False,
+    ) -> None:
         super().__init__(message, code=code)
+        self.operation_started = operation_started
+
+
+class BackendCancellationError(BackendError):
+    """Cancellation failed after admission, with explicit outcome certainty."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "cancel_failed",
+        operation_started: bool,
+        outcome_known: bool,
+    ) -> None:
+        super().__init__(message, code=code)
+        self.operation_started = operation_started
+        self.outcome_known = outcome_known
 
 
 class BackendRegistryError(BackendError):

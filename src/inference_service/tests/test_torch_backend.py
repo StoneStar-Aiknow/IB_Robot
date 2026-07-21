@@ -249,10 +249,29 @@ def test_torch_backend_loads_original_bundle_and_preserves_native_inference_cont
     backend.reset()
     assert calls["policy"].reset_calls == 1
     backend.close()
-    backend.close()
     assert backend.policy is None
     assert backend.policy_config is None
     assert backend.health().state is BackendState.CLOSED
+
+
+def test_torch_backend_places_noise_at_action_projection_dtype():
+    torch = pytest.importorskip("torch")
+    from inference_service.backends.torch import TorchBackend
+
+    backend = TorchBackend("cpu")
+    backend._device = torch.device("cpu")
+    backend._policy = SimpleNamespace(
+        model=SimpleNamespace(
+            action_in_proj=SimpleNamespace(weight=torch.ones(1, dtype=torch.float32)),
+            parameter=torch.ones(1, dtype=torch.bfloat16),
+        )
+    )
+
+    placed = backend._place_noise(torch.ones((1, 2, 3), dtype=torch.bfloat16))
+
+    assert placed.dtype == torch.float32
+    assert placed.device == backend._policy.model.action_in_proj.weight.device
+    backend.close()
 
 
 def test_torch_backend_resolves_local_semantic_assets_without_rewriting_bundle(monkeypatch, tmp_path):

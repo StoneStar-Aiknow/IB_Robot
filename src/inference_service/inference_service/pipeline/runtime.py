@@ -7,12 +7,14 @@ import math
 import threading
 import time
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
 
 from inference_manifest import CompiledDeployment
 from inference_service.backends import (
     BackendAdmissionError,
+    BackendCancellationError,
     BackendCapabilities,
     BackendHealth,
     BackendResult,
@@ -97,6 +99,8 @@ class InferencePipeline:
         self._state_machine = PipelineStateMachine()
         self._condition = threading.Condition(threading.RLock())
         self._active_requests = 0
+        self._active_controls = 0
+        self._control_lock = threading.Lock()
         self._loading = False
         self._resetting = False
         self._execution_plan: ExecutionPlan | None = None
@@ -178,6 +182,7 @@ class InferencePipeline:
             self._active_requests += 1
 
         total_start = time.perf_counter()
+        backend_execution_started = False
         try:
             selected_prompt = request.prompt if request.prompt is not None else self._default_task
             processor_inputs = dict(request.inputs)
@@ -219,6 +224,7 @@ class InferencePipeline:
                 },
             )
             try:
+                backend_execution_started = True
                 backend_result = self._backend.infer(backend_request)
             except BackendAdmissionError as exc:
                 if exc.code != "deadline_exceeded":
@@ -257,6 +263,7 @@ class InferencePipeline:
 
             total_latency_ms = (time.perf_counter() - total_start) * 1000.0
             with self._condition:
+                self._require_ready_locked("publish inference result")
                 result_state = self._state_machine.state
             latency_metadata = MappingProxyType(
                 {
@@ -291,22 +298,57 @@ class InferencePipeline:
                     "latency_ms": latency_metadata,
                 },
             )
-        except Exception:
+        except PipelineTimeoutError as exc:
             with self._condition:
-                self._synchronize_backend_health_locked()
+                if exc.details.get("backend_completed") and self._backend.capabilities.stateful:
+                    if self._state_machine.state is PipelineState.READY:
+                        self._state_machine.transition(PipelineState.FAILED)
+                else:
+                    self._synchronize_backend_health_locked()
+            raise
+        except Exception as exc:
+            with self._condition:
+                non_mutating_rejection = isinstance(exc, BackendAdmissionError) and not exc.operation_started
+                if backend_execution_started and not non_mutating_rejection and self._backend.capabilities.stateful:
+                    if self._state_machine.state is PipelineState.READY:
+                        self._state_machine.transition(PipelineState.FAILED)
+                else:
+                    self._synchronize_backend_health_locked()
             raise
         finally:
             with self._condition:
                 self._active_requests -= 1
                 self._condition.notify_all()
 
-    def reset(self) -> None:
+    def reset(self, deadline: datetime | None = None) -> None:
+        deadline = self._effective_deadline(deadline)
+        with self._control_operation("reset", deadline):
+            self._reset(deadline)
+
+    def _reset(self, deadline: datetime | None) -> None:
         with self._condition:
-            self._synchronize_backend_health_locked()
-            self._require_ready_locked("reset")
+            if self._backend.capabilities.stateful and not self._backend.capabilities.resettable:
+                raise PipelineLifecycleError(
+                    f"pipeline {self.pipeline_id!r} backend is stateful but does not support reset",
+                    pipeline_id=self.pipeline_id,
+                    code="reset_unsupported",
+                )
             self._state_machine.transition(PipelineState.RESETTING)
             self._resetting = True
-            self._condition.wait_for(lambda: self._active_requests == 0)
+            completed = self._condition.wait_for(
+                lambda: self._active_requests == 0,
+                timeout=self._remaining_seconds(deadline),
+            )
+            if not completed:
+                if self._state_machine.state is PipelineState.RESETTING:
+                    health = self._backend.health()
+                    if health.ready:
+                        self._state_machine.transition(PipelineState.READY)
+                    else:
+                        self._transition_from_backend_failure_locked(health)
+                self._resetting = False
+                self._condition.notify_all()
+                raise self._timeout_error("reset admission", backend_completed=False)
             if self._state_machine.state is not PipelineState.RESETTING:
                 self._resetting = False
                 self._condition.notify_all()
@@ -316,21 +358,48 @@ class InferencePipeline:
                     code="reset_interrupted",
                 )
 
-        reset_error: Exception | None = None
-        try:
-            self._backend.reset()
-        except Exception as exc:
-            reset_error = exc
-        finally:
-            with self._condition:
-                health = self._backend.health()
-                if self._state_machine.state is PipelineState.RESETTING:
-                    if health.ready:
-                        self._state_machine.transition(PipelineState.READY)
-                    else:
-                        self._transition_from_backend_failure_locked(health)
-                self._resetting = False
-                self._condition.notify_all()
+        backend_reset_error: Exception | None = None
+        if self._backend.capabilities.resettable:
+            try:
+                self._backend.reset(deadline=deadline)
+            except Exception as exc:
+                backend_reset_error = exc
+
+        processor_reset_error: Exception | None = None
+        processor_reset_started = False
+        reset_mutated_state = self._backend.capabilities.resettable and backend_reset_error is None
+        if backend_reset_error is None:
+            seen: set[int] = set()
+            for component in (self._preprocessor, self._postprocessor):
+                if component is None or id(component) in seen:
+                    continue
+                seen.add(id(component))
+                reset = getattr(component, "reset", None)
+                if not callable(reset):
+                    continue
+                try:
+                    self._raise_if_expired(deadline, phase="reset", backend_completed=True)
+                    processor_reset_started = True
+                    reset()
+                    self._raise_if_expired(deadline, phase="reset", backend_completed=True)
+                except Exception as exc:
+                    if processor_reset_error is None:
+                        processor_reset_error = exc
+                    break
+        reset_error = backend_reset_error or processor_reset_error
+        with self._condition:
+            health = self._backend.health()
+            if self._state_machine.state is PipelineState.RESETTING:
+                if (processor_reset_error is not None and (processor_reset_started or reset_mutated_state)) or (
+                    backend_reset_error is not None and not health.ready
+                ):
+                    self._state_machine.transition(PipelineState.FAILED)
+                elif health.ready:
+                    self._state_machine.transition(PipelineState.READY)
+                else:
+                    self._transition_from_backend_failure_locked(health)
+            self._resetting = False
+            self._condition.notify_all()
 
         if reset_error is not None:
             raise reset_error
@@ -342,11 +411,26 @@ class InferencePipeline:
                 state=health.state.value,
             )
 
-    def cancel(self, request_id: str) -> None:
-        with self._condition:
-            self._synchronize_backend_health_locked()
-            self._require_ready_locked("cancel")
-        self._backend.cancel(request_id)
+    def cancel(self, request_id: str, deadline: datetime | None = None) -> None:
+        deadline = self._effective_deadline(deadline)
+        with self._control_operation("cancel", deadline):
+            try:
+                self._backend.cancel(request_id, deadline=deadline)
+            except (BackendAdmissionError, BackendCancellationError) as exc:
+                with self._condition:
+                    if (
+                        exc.operation_started
+                        and not getattr(exc, "outcome_known", False)
+                        and self._backend.capabilities.stateful
+                        and self._state_machine.state is PipelineState.READY
+                    ):
+                        self._state_machine.transition(PipelineState.FAILED)
+                    else:
+                        self._synchronize_backend_health_locked()
+                raise
+            with self._condition:
+                self._synchronize_backend_health_locked()
+                self._require_ready_locked("complete cancellation")
 
     def diagnostics(self) -> PipelineDiagnostics:
         with self._condition:
@@ -368,6 +452,27 @@ class InferencePipeline:
     def health(self) -> PipelineDiagnostics:
         return self.diagnostics()
 
+    @contextmanager
+    def _control_operation(self, operation: str, deadline: datetime | None):
+        timeout = self._remaining_seconds(deadline)
+        acquired = self._control_lock.acquire() if timeout is None else self._control_lock.acquire(timeout=timeout)
+        if not acquired:
+            raise self._timeout_error(f"{operation} admission", backend_completed=False)
+        registered = False
+        try:
+            with self._condition:
+                self._synchronize_backend_health_locked()
+                self._require_ready_locked(operation)
+                self._active_controls += 1
+                registered = True
+            yield
+        finally:
+            if registered:
+                with self._condition:
+                    self._active_controls -= 1
+                    self._condition.notify_all()
+            self._control_lock.release()
+
     def close(self) -> None:
         with self._condition:
             if self._state_machine.state is PipelineState.CLOSED:
@@ -376,7 +481,14 @@ class InferencePipeline:
                 self._condition.wait_for(lambda: self._state_machine.state is PipelineState.CLOSED)
                 return
             self._state_machine.transition(PipelineState.CLOSING)
-            self._condition.wait_for(lambda: not self._loading and not self._resetting and self._active_requests == 0)
+            self._condition.wait_for(
+                lambda: (
+                    not self._loading
+                    and not self._resetting
+                    and self._active_requests == 0
+                    and self._active_controls == 0
+                )
+            )
 
         errors: list[Exception] = []
         for component in self._owned_components_in_close_order():
@@ -534,6 +646,12 @@ class InferencePipeline:
             )
         normalized = request_deadline.astimezone(timezone.utc)
         return normalized if configured_deadline is None else min(normalized, configured_deadline)
+
+    @staticmethod
+    def _remaining_seconds(deadline: datetime | None) -> float | None:
+        if deadline is None:
+            return None
+        return max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
 
     def _raise_if_expired(self, deadline: datetime | None, *, phase: str, backend_completed: bool) -> None:
         if deadline is not None and datetime.now(timezone.utc) >= deadline:

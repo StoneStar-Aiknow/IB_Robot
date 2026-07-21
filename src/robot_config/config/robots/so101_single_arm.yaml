@@ -491,6 +491,7 @@ robot:
           strategy: hold
           stamp: header
           tol_ms: 1500
+          max_age_ms: 500
         qos:
           reliability: best_effort
           history: keep_last
@@ -506,6 +507,7 @@ robot:
           strategy: hold
           stamp: header
           tol_ms: 1500
+          max_age_ms: 500
         qos:
           reliability: best_effort
           history: keep_last
@@ -521,6 +523,7 @@ robot:
           strategy: hold
           stamp: header
           tol_ms: 1500
+          max_age_ms: 500
         qos:
           reliability: best_effort
           history: keep_last
@@ -534,6 +537,7 @@ robot:
           strategy: hold
           stamp: header
           tol_ms: 1500
+          max_age_ms: 500
         qos:
           reliability: best_effort
           history: keep_last
@@ -547,6 +551,7 @@ robot:
           strategy: hold
           stamp: header
           tol_ms: 1500
+          max_age_ms: 500
         qos:
           reliability: best_effort
           history: keep_last
@@ -708,3 +713,5 @@ robot:
   recording:
     bag_base_dir: "~/rosbag/episodes"
     storage: mcap
+    # This robot's deployed ACT policy was trained from centered-degree joint data.
+    lerobot_norm_mode: degrees

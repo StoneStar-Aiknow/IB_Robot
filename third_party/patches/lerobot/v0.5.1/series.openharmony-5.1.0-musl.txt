@@ -1,2 +1,3 @@
 0009-adaptive-weight-prerequisites.patch
 0011-knowledge-distillation.patch
+0016-smolvla-improve-graph-export-compatibility.patch

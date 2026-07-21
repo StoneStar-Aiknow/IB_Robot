@@ -201,6 +201,10 @@ cp "${REPO_ROOT}/scripts/robooh_1.0.1.env" "${PKG_ROOT}/scripts/"
 log_info "Copying setup_sshd.sh..."
 cp "${REPO_ROOT}/scripts/setup_sshd.sh" "${PKG_ROOT}/scripts/"
 
+log_info "Copying Houmo environment script..."
+mkdir -p "${PKG_ROOT}/scripts/setup"
+cp "${REPO_ROOT}/scripts/setup/houmo_hmm_env.sh" "${PKG_ROOT}/scripts/setup/"
+
 # [5] Re-generate wrapper scripts for new layout
 log_info "Rewriting wrapper scripts..."
 
@@ -302,6 +306,8 @@ printf '[3/5] Deploying environment script...\n'
 mkdir -p "${DEST}/scripts"
 cp "${DIR}/scripts/robooh_1.0.1.env" "${DEST}/scripts/"
 cp "${DIR}/scripts/setup_sshd.sh" "${DEST}/scripts/"
+mkdir -p "${DEST}/scripts/setup"
+cp "${DIR}/scripts/setup/houmo_hmm_env.sh" "${DEST}/scripts/setup/"
 chmod +x "${DEST}/scripts/setup_sshd.sh"
 
 printf '[4/5] Installing system native libs + patches...\n'
@@ -354,7 +360,7 @@ printf '     (replace YOUR_PUBLIC_KEY with content of ~/.ssh/id_rsa.pub)\n'
 printf '\n  2. SSH into the board:\n'
 printf '     ssh root@<board-ip>\n'
 printf '\n  3. Load the environment:\n'
-printf '     source /data/roboframe/scripts/robooh_1.0.1.env\n'
+printf '     . /data/roboframe/scripts/robooh_1.0.1.env\n'
 printf '================================================\n'
 INSTALL_EOF
 chmod +x "${PKG_ROOT}/install.sh"

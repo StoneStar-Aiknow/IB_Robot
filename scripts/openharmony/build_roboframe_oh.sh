@@ -461,7 +461,7 @@ EOF
 stage_board_scripts() {
     local install_root="${OH_CUSTOM_WS}/install"
 
-    log_info "Staging board scripts (robooh env, setup_sshd) ..."
+    log_info "Staging board scripts (robooh env, Houmo env, setup_sshd) ..."
 
     local scripts_dest="${install_root}/../scripts"
     mkdir -p "${scripts_dest}"
@@ -476,6 +476,10 @@ stage_board_scripts() {
             log_warn "  missing: ${src}"
         fi
     done
+
+    mkdir -p "${scripts_dest}/setup"
+    cp -f "${IB_ROBOT_ROOT}/scripts/setup/houmo_hmm_env.sh" "${scripts_dest}/setup/"
+    log_info "  staged setup/houmo_hmm_env.sh"
 }
 
 postprocess_runtime_bundle() {

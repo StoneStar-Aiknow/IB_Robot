@@ -1,0 +1,76 @@
+From 961e46b88810b4c25f493906563c9c898a0ff0ae Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Mon, 20 Jul 2026 18:53:53 +0800
+Subject: [PATCH] smolvla: improve graph export compatibility
+
+Avoid integer reductions for relative expert positions.
+Cast boolean padding masks before position ID sums.
+
+Signed-off-by: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+---
+ src/lerobot/policies/smolvla/modeling_smolvla.py    | 8 ++++----
+ src/lerobot/policies/smolvla/smolvlm_with_expert.py | 9 ++++++---
+ 2 files changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/src/lerobot/policies/smolvla/modeling_smolvla.py b/src/lerobot/policies/smolvla/modeling_smolvla.py
+index 440828f4f..d963d59a0 100644
+--- a/src/lerobot/policies/smolvla/modeling_smolvla.py
++++ b/src/lerobot/policies/smolvla/modeling_smolvla.py
+@@ -783,7 +783,7 @@ class VLAFlowMatching(nn.Module):
+         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+ 
+         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
++        position_ids = torch.cumsum(pad_masks.to(dtype=torch.long), dim=1) - 1
+         (_, suffix_out), _ = self.vlm_with_expert.forward(
+             attention_mask=att_2d_masks,
+             position_ids=position_ids,
+@@ -821,7 +821,7 @@ class VLAFlowMatching(nn.Module):
+             images, img_masks, lang_tokens, lang_masks, state=state
+         )
+         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
++        prefix_position_ids = torch.cumsum(prefix_pad_masks.to(dtype=torch.long), dim=1) - 1
+         # Compute image and language key value cache
+         _, past_key_values = self.vlm_with_expert.forward(
+             attention_mask=prefix_att_2d_masks,
+@@ -888,8 +888,8 @@ class VLAFlowMatching(nn.Module):
+         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+ 
+         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
++        prefix_offsets = torch.sum(prefix_pad_masks.to(dtype=torch.long), dim=-1)[:, None]
++        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks.to(dtype=torch.long), dim=1) - 1
+ 
+         outputs_embeds, _ = self.vlm_with_expert.forward(
+             attention_mask=full_att_2d_masks,
+diff --git a/src/lerobot/policies/smolvla/smolvlm_with_expert.py b/src/lerobot/policies/smolvla/smolvlm_with_expert.py
+index caca41dab..9bb7a45ac 100644
+--- a/src/lerobot/policies/smolvla/smolvlm_with_expert.py
++++ b/src/lerobot/policies/smolvla/smolvlm_with_expert.py
+@@ -51,6 +51,11 @@ def apply_rope(x, positions, max_wavelength=10_000):
+     return res.to(dtype)
+ 
+ 
++def normalize_expert_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
++    """Convert expert positions to row-relative offsets without a reduction op."""
++    return position_ids - position_ids[:, :1]
++
++
+ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
+     hidden_dim = int(2 * hidden_dim / 3)
+     hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+@@ -362,9 +367,7 @@ class SmolVLMWithExpertModel(nn.Module):
+                 *_value_states.shape[:-1], -1, expert_layer.self_attn.head_dim
+             )
+ 
+-            expert_position_id = (
+-                expert_position_id - torch.min(expert_position_id, dim=1, keepdim=True).values
+-            )  # start from 0
++            expert_position_id = normalize_expert_position_ids(expert_position_id)
+             expert_attention_mask = attention_mask[
+                 :, -inputs_embeds[1].shape[1] :, : expert_key_states.shape[1] :
+             ]  # take into account kv
+-- 
+2.34.1
