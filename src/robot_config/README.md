@@ -430,6 +430,38 @@ embodied:
     home:           {position: {x: 0.15, y: 0.0, z: 0.30}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
     observe_table:  {position: {x: 0.20, y: 0.0, z: 0.35}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
 
+  skill_templates:
+    wave_hello:
+      description:
+        summary: "Wave hello or goodbye with the wrist."   # ≤120 字符
+        category: social_greeting                          # 任意非空字符串
+        when_to_use: ["greet someone", "say hi or bye"]    # 非空字符串列表
+        aliases_zh: ["打招呼", "挥手"]                      # MCP catalog 与规则入口共用的中文别名
+        aliases_en: ["hello", "wave"]
+        motion_scope: [wrist]                              # base|shoulder|elbow|wrist|gripper|arm
+        anchor_pose: home                                  # 必须在 named_poses 中已定义，或 "none"
+        intensity: moderate                                # subtle|moderate|large
+        duration_sec_estimate: 8.0                         # 含 1.0 秒初始夹爪归一化并留有余量
+        requires_motion_params: false                      # 布尔
+        rule_entry: true                                   # 是否把 aliases_zh 注入规则解析器
+      initial_gripper_state: closed
+      primitive_sequence:
+        - primitive_name: move_to_joint_positions
+          joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
+          duration_sec: 2.0
+        - primitive_name: move_through_joint_positions
+          trajectory_template:
+            type: single_joint_wave_v1
+            waypoint_duration_sec: 0.05
+            active_waypoint_count: 16
+            repeat_count: 3
+            base_pose: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
+            joint: "5"
+            amplitude: 0.35
+        - primitive_name: move_to_joint_positions
+          joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
+          duration_sec: 2.0
+
   named_targets:
     demo_object:
       observe_pose:  {position: {x: 0.25, y: 0.0, z: 0.26}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
@@ -437,6 +469,29 @@ embodied:
       grasp_pose:    {position: {x: 0.25, y: 0.0, z: 0.10}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
       lift_pose:     {position: {x: 0.25, y: 0.0, z: 0.25}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
 ```
+
+#### skill_templates 与 description 契约
+
+`embodied.skill_templates` 是技能执行的单一事实来源。每个 skill 模板可挂一个
+结构化 `description` 块，作为 MCP catalog 可发现性与中文别名的唯一来源。
+`aliases_zh` 始终用于 catalog 文档；仅当 `rule_entry: true` 且
+`requires_motion_params: false` 时，launch 才会把这些别名注入规则解析器。
+`robot_config.loader._validate_skill_description` 在加载时强校验字段类型与受控词表。
+
+受控词表：
+- `motion_scope`：`base` / `shoulder` / `elbow` / `wrist` / `gripper` / `arm`
+- `intensity`：`subtle` / `moderate` / `large`
+- `anchor_pose`：必须引用 `named_poses` 中已定义的位姿，或填 `"none"`
+- `rule_entry`：可选布尔值；设为 `true` 时允许无动态运动参数的技能进入确定性规则入口
+- `disabled`：可选布尔值；设为 `true` 时从 planner allowlist、规则入口、resolver、safety guard
+  和 MCP catalog/validate/execute 的启用技能集合中统一排除
+- `duration_sec_estimate`：必须为正数，并覆盖确定性手臂 motion/wait 总时长、`open`/`closed`
+  初始夹爪归一化的 1.0 秒，以及每个显式 `open_gripper`/`close_gripper` primitive 的 1.0 秒，且保留执行余量
+
+绝对关节轨迹必须在 `move_through_joint_positions` 前显式使用
+`move_to_joint_positions` 进入首个 waypoint，并在需要时用另一条带正数
+`duration_sec` 的 `move_to_joint_positions` 显式返回手势基位。trajectory generator
+不会消费 `return_to_base` 一类隐式返回字段。
 
 `embodied.entry.visual_games` 声明入口层视觉趣味游戏（如分院帽）的触发别名与开关；
 camera/VLM/timeout 仍由 `embodied.perception` 统一管理。`validate_config()` 强制一致性：

@@ -47,9 +47,14 @@ ibrobot_msgs / rclpy
 - `embodied_common.json_utils.load_json_list`
 - `embodied_common.json_utils.string_list`
 - `embodied_common.json_utils.parse_confidence`
+- `embodied_common.command_parser.parse_text_command`
+- `embodied_common.command_parser.extract_skill_aliases`
+- `embodied_common.command_parser.load_skill_aliases`
 - `embodied_common.skill_templates.SUPPORTED_PRIMITIVES`
 - `embodied_common.skill_templates.DEFAULT_SKILL_TEMPLATES`
 - `embodied_common.skill_templates.DEFAULT_ALLOWED_SKILLS`
+- `embodied_common.skill_templates.DEFAULT_WAYPOINT_DURATION_SEC`
+- `embodied_common.skill_templates.is_skill_disabled`
 - `embodied_common.skill_templates.get_skill_templates`
 - `embodied_common.rgbd_snapshot.KNOWN_REQUIRED_INPUTS`
 - `embodied_common.rgbd_snapshot.RGBDSnapshotBuffer.build_snapshot`
@@ -66,9 +71,16 @@ ibrobot_msgs / rclpy
 
 该词表业务中立，不含任何具体游戏/任务特判。
 
+`get_skill_templates` 会先过滤显式设置 `disabled: true` 的模板，再做深拷贝并就地展开
+`trajectory_template` 为 `joint_waypoints`（调用 `expand_trajectory_template`）。只有字面量布尔值
+`True` 表示禁用；`robot_config.loader` 会拒绝非布尔 `disabled`。因此 loader、规则入口、resolver、
+safety guard 和 MCP catalog 共用同一份启用技能与模板展开语义。
+
 ## 与 SSOT 的关系
 
 `DEFAULT_SKILL_TEMPLATES` 是最小闭环的默认 fallback，不是最终机器人级 SSOT。
+机器人级 skill 名不在本包维护全局常量，而是从当前 `robot_config` YAML 的
+`embodied.skill_templates` 键集合派生。
 
 当前 `robot_config` 已提供 `embodied` 配置段，机器人级 skill templates、命名位姿、
 命名目标、workspace 边界和感知相机 topic 均由 `robot_config` YAML 作为单一事实来源

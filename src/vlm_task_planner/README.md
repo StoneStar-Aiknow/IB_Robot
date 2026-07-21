@@ -56,7 +56,13 @@
 | `api_model` | 模型名，当前默认 `Qwen3.5-9B` |
 | `api_timeout_sec` | 大模型输出空闲超时，由 `embodied.timeouts.model_idle_timeout_sec` 统一注入 |
 | `fallback_to_rule_planner` | API 失败时是否回退规则 planner |
-| `allowed_skills_json` | 允许输出的 skill 白名单 |
+| `allowed_skills_json` | VLM 响应允许输出的 skill 边界，来自当前机器人 YAML 的启用技能 |
+| `skill_aliases_json` | 确定性规则 fallback 使用的启用 `rule_entry` skill 中文别名 |
+
+`allowed_skills_json` 约束 VLM 最终可返回的 skill 序列；设置 `disabled: true` 的 skill 不进入该边界，
+响应中出现禁用或其他边界外 skill 都会被拒绝。
+`skill_aliases_json` 不参与 VLM 输出校验，只在 API 失败或规则模式下供确定性 fallback 解析，
+并且只包含 YAML 中启用且显式设置 `description.rule_entry: true` 的 skill，而不是 catalog 的全部别名。
 
 当前默认走本地 OpenAI-compatible 服务；原远端 Kimicode 仍然保留，只需把配置切回：
 

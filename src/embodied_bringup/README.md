@@ -68,6 +68,16 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 | `with_embodied` | `true` | 是否启动具身运行时节点 |
 | `with_perception` | 空 | 覆盖 `robot.embodied.perception.enabled` |
 
+## Rule-entry alias 注入
+
+`generate_embodied_nodes()` 从同一份 YAML `skill_templates` 中提取未禁用、
+`description.rule_entry: true` 且不需要运动参数的中文别名，生成唯一一份
+`skill_aliases_json`。该值同时注入 `task_entry_node`、规则 `task_planner_node` 和
+`vlm_task_planner_node` 的确定性 fallback，三条入口因此共享同一规则 alias 契约。
+
+未标记 `rule_entry` 的观察、回位、夹爪和参数化运动 alias 不会进入该 JSON；这些命令继续
+由 `embodied_agent` 的专用规则分支维持既有 `task_type`。
+
 ## 已知限制
 
 - 当前具身闭环要求 `control_mode:=moveit_planning` 或名称中包含 `moveit` 的兼容控制模式。
