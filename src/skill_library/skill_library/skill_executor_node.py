@@ -3,6 +3,7 @@
 import math
 import time
 import uuid
+from collections.abc import Callable
 
 import rclpy
 from builtin_interfaces.msg import Duration
@@ -195,9 +196,18 @@ class SkillExecutorNode(Node):
         return CancelResponse.ACCEPT
 
     @staticmethod
-    def _wait_for_future(future, timeout_sec: float) -> bool:
+    def _wait_for_future(
+        future,
+        timeout_sec: float,
+        cancel_requested: Callable[[], bool] | None = None,
+        cancel_callback: Callable[[], None] | None = None,
+    ) -> bool:
         deadline = time.monotonic() + timeout_sec
         while rclpy.ok() and not future.done() and time.monotonic() < deadline:
+            if cancel_requested is not None and cancel_requested():
+                if cancel_callback is not None:
+                    cancel_callback()
+                return False
             time.sleep(0.05)
         return future.done()
 
@@ -211,14 +221,74 @@ class SkillExecutorNode(Node):
         goal_handle.abort()
         return result
 
-    def _cancel_goal(self, goal_handle) -> None:
+    @staticmethod
+    def _cancel_skill(result, goal_handle, executed_primitives, skill_name: str):
+        result.success = False
+        result.error_code = "SKILL_CANCELLED"
+        result.message = f"skill cancelled: {skill_name}"
+        result.executed_primitives = executed_primitives
+        goal_handle.canceled()
+        return result
+
+    @staticmethod
+    def _finish_primitive_failure(result, goal_handle, error_code: str, message: str, pose_name: str):
+        result.success = False
+        result.error_code = "CANCEL_CLEANUP_TIMEOUT" if message.startswith("cancel cleanup timed out") else error_code
+        result.message = message
+        result.pose_name = pose_name
+        if result.error_code == "CANCEL_CLEANUP_TIMEOUT":
+            goal_handle.abort()
+        elif goal_handle.is_cancel_requested:
+            goal_handle.canceled()
+        else:
+            goal_handle.abort()
+        return result
+
+    def _cancel_goal(self, goal_handle, result_future=None) -> bool:
         if goal_handle is None:
-            return
+            return True
+        if result_future is None:
+            try:
+                result_future = goal_handle.get_result_async()
+            except Exception:
+                return False
         try:
             cancel_future = goal_handle.cancel_goal_async()
         except Exception:
-            return
-        self._wait_for_future(cancel_future, timeout_sec=self._rpc_timeout)
+            return False
+        if not self._wait_for_future(cancel_future, timeout_sec=self._rpc_timeout):
+            return False
+        if not self._wait_for_future(result_future, timeout_sec=self._rpc_timeout):
+            return False
+        try:
+            wrapped_result = result_future.result()
+        except Exception:
+            return False
+        child_result = getattr(wrapped_result, "result", None)
+        return getattr(child_result, "error_code", "") != "CANCEL_CLEANUP_TIMEOUT"
+
+    def _cancel_goal_when_ready(self, goal_future) -> None:
+        def cancel_accepted_goal(completed_future) -> None:
+            try:
+                goal_handle = completed_future.result()
+            except Exception:
+                return
+            if goal_handle is not None and goal_handle.accepted:
+                self._cancel_goal(goal_handle)
+
+        goal_future.add_done_callback(cancel_accepted_goal)
+
+    def _cancel_goal_future(self, goal_future) -> bool:
+        if not self._wait_for_future(goal_future, timeout_sec=self._rpc_timeout):
+            self._cancel_goal_when_ready(goal_future)
+            return False
+        try:
+            goal_handle = goal_future.result()
+        except Exception:
+            return False
+        if goal_handle is None or not goal_handle.accepted:
+            return True
+        return self._cancel_goal(goal_handle)
 
     def _sleep_with_cancel(self, goal_handle, timeout_sec: float) -> bool:
         deadline = time.monotonic() + timeout_sec
@@ -409,15 +479,7 @@ class SkillExecutorNode(Node):
                 float(goal.primitive_duration_sec),
             )
             if not ok:
-                result.success = False
-                result.error_code = "PRIMITIVE_ARM_FAILED"
-                result.message = err_msg
-                result.pose_name = ""
-                if goal_handle.is_cancel_requested:
-                    goal_handle.canceled()
-                else:
-                    goal_handle.abort()
-                return result
+                return self._finish_primitive_failure(result, goal_handle, "PRIMITIVE_ARM_FAILED", err_msg, "")
         elif goal.primitive_name == "move_through_joint_positions":
             move_timeout = float(goal.timeout_sec if goal.timeout_sec > 0.0 else 30.0)
             joint_count = len(goal.joint_names)
@@ -434,15 +496,7 @@ class SkillExecutorNode(Node):
                 float(goal.waypoint_duration_sec),
             )
             if not ok:
-                result.success = False
-                result.error_code = "PRIMITIVE_ARM_FAILED"
-                result.message = err_msg
-                result.pose_name = ""
-                if goal_handle.is_cancel_requested:
-                    goal_handle.canceled()
-                else:
-                    goal_handle.abort()
-                return result
+                return self._finish_primitive_failure(result, goal_handle, "PRIMITIVE_ARM_FAILED", err_msg, "")
         elif goal.primitive_name in {"move_to_named_pose", "move_relative_ee"}:
             if goal.primitive_name == "move_to_named_pose":
                 try:
@@ -468,15 +522,9 @@ class SkillExecutorNode(Node):
                 goal_handle, goal.primitive_name, pose, goal.task_id, move_timeout
             )
             if not ok:
-                result.success = False
-                result.error_code = "PRIMITIVE_ARM_FAILED"
-                result.message = err_msg
-                result.pose_name = goal.pose_name
-                if goal_handle.is_cancel_requested:
-                    goal_handle.canceled()
-                else:
-                    goal_handle.abort()
-                return result
+                return self._finish_primitive_failure(
+                    result, goal_handle, "PRIMITIVE_ARM_FAILED", err_msg, goal.pose_name
+                )
         elif goal.primitive_name in {"rotate_gripper_cw", "rotate_gripper_ccw"}:
             if self._latest_ee_pose is None:
                 result.success = False
@@ -490,27 +538,16 @@ class SkillExecutorNode(Node):
                 goal_handle, goal.primitive_name, goal.relative_dz, goal.task_id, move_timeout
             )
             if not ok:
-                result.success = False
-                result.error_code = "PRIMITIVE_ARM_FAILED"
-                result.message = err_msg
-                result.pose_name = ""
-                if goal_handle.is_cancel_requested:
-                    goal_handle.canceled()
-                else:
-                    goal_handle.abort()
-                return result
+                return self._finish_primitive_failure(result, goal_handle, "PRIMITIVE_ARM_FAILED", err_msg, "")
         else:
             # Delegate gripper control to task_dispatch via ExecuteTaskPlan action
             ok, err_msg = self._exec_gripper_via_task_dispatch(
                 goal_handle, goal.primitive_name, goal.gripper_position, goal.task_id
             )
             if not ok:
-                result.success = False
-                result.error_code = "PRIMITIVE_GRIPPER_FAILED"
-                result.message = err_msg
-                result.pose_name = goal.pose_name
-                goal_handle.abort()
-                return result
+                return self._finish_primitive_failure(
+                    result, goal_handle, "PRIMITIVE_GRIPPER_FAILED", err_msg, goal.pose_name
+                )
         result.success = True
         result.error_code = ""
         result.message = f"primitive completed: {goal.primitive_name}"
@@ -605,9 +642,21 @@ class SkillExecutorNode(Node):
         deadline = time.monotonic() + accept_timeout
         while not send_future.done():
             if goal_handle.is_cancel_requested:
-                return False, "cancelled while sending arm goal"
+                cleaned = self._cancel_goal_future(send_future)
+                return (
+                    False,
+                    "cancelled while sending arm goal"
+                    if cleaned
+                    else "cancel cleanup timed out while sending arm goal",
+                )
             if time.monotonic() > deadline:
-                return False, "timeout waiting for arm goal acceptance"
+                cleaned = self._cancel_goal_future(send_future)
+                return (
+                    False,
+                    "timeout waiting for arm goal acceptance"
+                    if cleaned
+                    else "cancel cleanup timed out while sending arm goal",
+                )
             time.sleep(0.05)
 
         gh = send_future.result()
@@ -618,11 +667,14 @@ class SkillExecutorNode(Node):
         deadline = time.monotonic() + timeout_sec
         while not result_future.done():
             if goal_handle.is_cancel_requested:
-                gh.cancel_goal_async()
-                return False, "cancelled during arm motion"
+                cleaned = self._cancel_goal(gh, result_future)
+                return False, "cancelled during arm motion" if cleaned else "cancel cleanup timed out during arm motion"
             if time.monotonic() > deadline:
-                gh.cancel_goal_async()
-                return False, "timeout waiting for arm motion"
+                cleaned = self._cancel_goal(gh, result_future)
+                return (
+                    False,
+                    "timeout waiting for arm motion" if cleaned else "cancel cleanup timed out during arm motion",
+                )
             time.sleep(0.05)
 
         result = result_future.result().result
@@ -661,9 +713,21 @@ class SkillExecutorNode(Node):
         deadline = time.monotonic() + accept_timeout
         while not send_future.done():
             if goal_handle.is_cancel_requested:
-                return False, "cancelled while sending arm trajectory goal"
+                cleaned = self._cancel_goal_future(send_future)
+                return (
+                    False,
+                    "cancelled while sending arm trajectory goal"
+                    if cleaned
+                    else "cancel cleanup timed out while sending arm trajectory goal",
+                )
             if time.monotonic() > deadline:
-                return False, "timeout waiting for arm trajectory goal acceptance"
+                cleaned = self._cancel_goal_future(send_future)
+                return (
+                    False,
+                    "timeout waiting for arm trajectory goal acceptance"
+                    if cleaned
+                    else "cancel cleanup timed out while sending arm trajectory goal",
+                )
             time.sleep(0.05)
 
         gh = send_future.result()
@@ -674,11 +738,21 @@ class SkillExecutorNode(Node):
         deadline = time.monotonic() + timeout_sec
         while not result_future.done():
             if goal_handle.is_cancel_requested:
-                gh.cancel_goal_async()
-                return False, "cancelled during arm joint trajectory execution"
+                cleaned = self._cancel_goal(gh, result_future)
+                return (
+                    False,
+                    "cancelled during arm joint trajectory execution"
+                    if cleaned
+                    else "cancel cleanup timed out during arm joint trajectory execution",
+                )
             if time.monotonic() > deadline:
-                gh.cancel_goal_async()
-                return False, "timeout waiting for arm joint trajectory execution"
+                cleaned = self._cancel_goal(gh, result_future)
+                return (
+                    False,
+                    "timeout waiting for arm joint trajectory execution"
+                    if cleaned
+                    else "cancel cleanup timed out during arm joint trajectory execution",
+                )
             time.sleep(0.05)
 
         result = result_future.result()
@@ -715,9 +789,21 @@ class SkillExecutorNode(Node):
         deadline = time.monotonic() + accept_timeout
         while not send_future.done():
             if goal_handle.is_cancel_requested:
-                return False, "cancelled while sending arm trajectory goal"
+                cleaned = self._cancel_goal_future(send_future)
+                return (
+                    False,
+                    "cancelled while sending arm trajectory goal"
+                    if cleaned
+                    else "cancel cleanup timed out while sending arm trajectory goal",
+                )
             if time.monotonic() > deadline:
-                return False, "timeout waiting for arm trajectory goal acceptance"
+                cleaned = self._cancel_goal_future(send_future)
+                return (
+                    False,
+                    "timeout waiting for arm trajectory goal acceptance"
+                    if cleaned
+                    else "cancel cleanup timed out while sending arm trajectory goal",
+                )
             time.sleep(0.05)
 
         gh = send_future.result()
@@ -728,11 +814,21 @@ class SkillExecutorNode(Node):
         deadline = time.monotonic() + timeout_sec
         while not result_future.done():
             if goal_handle.is_cancel_requested:
-                gh.cancel_goal_async()
-                return False, "cancelled during arm joint waypoint trajectory execution"
+                cleaned = self._cancel_goal(gh, result_future)
+                return (
+                    False,
+                    "cancelled during arm joint waypoint trajectory execution"
+                    if cleaned
+                    else "cancel cleanup timed out during arm joint waypoint trajectory execution",
+                )
             if time.monotonic() > deadline:
-                gh.cancel_goal_async()
-                return False, "timeout waiting for arm joint waypoint trajectory execution"
+                cleaned = self._cancel_goal(gh, result_future)
+                return (
+                    False,
+                    "timeout waiting for arm joint waypoint trajectory execution"
+                    if cleaned
+                    else "cancel cleanup timed out during arm joint waypoint trajectory execution",
+                )
             time.sleep(0.05)
 
         result = result_future.result()
@@ -772,9 +868,21 @@ class SkillExecutorNode(Node):
         deadline = time.monotonic() + accept_timeout
         while not send_future.done():
             if goal_handle.is_cancel_requested:
-                return False, "cancelled while sending gripper goal"
+                cleaned = self._cancel_goal_future(send_future)
+                return (
+                    False,
+                    "cancelled while sending gripper goal"
+                    if cleaned
+                    else "cancel cleanup timed out while sending gripper goal",
+                )
             if time.monotonic() > deadline:
-                return False, "timeout waiting for gripper goal acceptance"
+                cleaned = self._cancel_goal_future(send_future)
+                return (
+                    False,
+                    "timeout waiting for gripper goal acceptance"
+                    if cleaned
+                    else "cancel cleanup timed out while sending gripper goal",
+                )
             time.sleep(0.05)
 
         gh = send_future.result()
@@ -785,11 +893,21 @@ class SkillExecutorNode(Node):
         deadline = time.monotonic() + exec_timeout
         while not result_future.done():
             if goal_handle.is_cancel_requested:
-                gh.cancel_goal_async()
-                return False, "cancelled during gripper execution"
+                cleaned = self._cancel_goal(gh, result_future)
+                return (
+                    False,
+                    "cancelled during gripper execution"
+                    if cleaned
+                    else "cancel cleanup timed out during gripper execution",
+                )
             if time.monotonic() > deadline:
-                gh.cancel_goal_async()
-                return False, "timeout waiting for gripper execution"
+                cleaned = self._cancel_goal(gh, result_future)
+                return (
+                    False,
+                    "timeout waiting for gripper execution"
+                    if cleaned
+                    else "cancel cleanup timed out during gripper execution",
+                )
             time.sleep(0.05)
 
         result = result_future.result().result
@@ -850,12 +968,7 @@ class SkillExecutorNode(Node):
         executed_primitives: list[str] = []
         for primitive in primitives:
             if goal_handle.is_cancel_requested:
-                result.success = False
-                result.error_code = "SKILL_CANCELLED"
-                result.message = f"skill cancelled: {goal.skill_name}"
-                result.executed_primitives = executed_primitives
-                goal_handle.canceled()
-                return result
+                return self._cancel_skill(result, goal_handle, executed_primitives, goal.skill_name)
 
             remaining_timeout = None
             if skill_deadline is not None:
@@ -901,10 +1014,23 @@ class SkillExecutorNode(Node):
             send_goal_timeout = (
                 self._rpc_timeout if remaining_timeout is None else min(self._rpc_timeout, remaining_timeout)
             )
+
             if not self._wait_for_future(
                 send_goal_future,
                 timeout_sec=max(0.1, send_goal_timeout),
+                cancel_requested=lambda: goal_handle.is_cancel_requested,
             ):
+                if goal_handle.is_cancel_requested:
+                    if self._cancel_goal_future(send_goal_future):
+                        return self._cancel_skill(result, goal_handle, executed_primitives, goal.skill_name)
+                    return self._abort_skill(
+                        result,
+                        goal_handle,
+                        executed_primitives,
+                        "SKILL_CANCEL_CLEANUP_TIMEOUT",
+                        f"cancel cleanup timed out for primitive {primitive_name}",
+                    )
+                self._cancel_goal_future(send_goal_future)
                 return self._abort_skill(
                     result,
                     goal_handle,
@@ -928,7 +1054,14 @@ class SkillExecutorNode(Node):
             if skill_deadline is not None:
                 remaining_timeout = skill_deadline - time.monotonic()
                 if remaining_timeout <= 0.0:
-                    self._cancel_goal(primitive_handle)
+                    if not self._cancel_goal(primitive_handle, result_future):
+                        return self._abort_skill(
+                            result,
+                            goal_handle,
+                            executed_primitives,
+                            "SKILL_CANCEL_CLEANUP_TIMEOUT",
+                            f"cancel cleanup timed out for primitive {primitive_name}",
+                        )
                     return self._abort_skill(
                         result,
                         goal_handle,
@@ -937,8 +1070,29 @@ class SkillExecutorNode(Node):
                         f"primitive timed out: {primitive_name}",
                     )
             wait_timeout = remaining_timeout if remaining_timeout is not None else 30.0
-            if not self._wait_for_future(result_future, timeout_sec=max(0.1, wait_timeout)):
-                self._cancel_goal(primitive_handle)
+            if not self._wait_for_future(
+                result_future,
+                timeout_sec=max(0.1, wait_timeout),
+                cancel_requested=lambda: goal_handle.is_cancel_requested,
+            ):
+                if goal_handle.is_cancel_requested:
+                    if self._cancel_goal(primitive_handle, result_future):
+                        return self._cancel_skill(result, goal_handle, executed_primitives, goal.skill_name)
+                    return self._abort_skill(
+                        result,
+                        goal_handle,
+                        executed_primitives,
+                        "SKILL_CANCEL_CLEANUP_TIMEOUT",
+                        f"cancel cleanup timed out for primitive {primitive_name}",
+                    )
+                if not self._cancel_goal(primitive_handle, result_future):
+                    return self._abort_skill(
+                        result,
+                        goal_handle,
+                        executed_primitives,
+                        "SKILL_CANCEL_CLEANUP_TIMEOUT",
+                        f"cancel cleanup timed out for primitive {primitive_name}",
+                    )
                 return self._abort_skill(
                     result, goal_handle, executed_primitives, "SKILL_TIMEOUT", f"primitive timed out: {primitive_name}"
                 )

@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from embodied_common.json_utils import load_json_mapping
-from embodied_common.skill_templates import get_skill_templates
+from embodied_common.skill_templates import DEFAULT_WAYPOINT_DURATION_SEC, get_skill_templates
 
 __all__ = ["PrimitiveSpec", "load_json_mapping", "direction_to_delta", "resolve_skill_primitives"]
 
@@ -97,6 +97,15 @@ def resolve_skill_primitives(
         raise ValueError(f"skill template '{skill_name}' must define a non-empty primitive_sequence")
 
     primitives: list[PrimitiveSpec] = []
+    initial_gripper_state = str(template.get("initial_gripper_state", "")).strip().lower()
+    if initial_gripper_state:
+        if initial_gripper_state == "open":
+            primitives.append(PrimitiveSpec(primitive_name="open_gripper", gripper_position=open_position))
+        elif initial_gripper_state == "closed":
+            primitives.append(PrimitiveSpec(primitive_name="close_gripper", gripper_position=closed_position))
+        elif initial_gripper_state not in {"hold", "none"}:
+            raise ValueError(f"skill template '{skill_name}' initial_gripper_state must be open, closed, hold, or none")
+
     for step in primitive_sequence:
         if not isinstance(step, dict):
             raise ValueError(f"skill template '{skill_name}' contains a non-object step")
@@ -269,7 +278,7 @@ def resolve_skill_primitives(
                     ]
                 )
 
-            waypoint_duration_sec = float(step.get("waypoint_duration_sec", 0.08))
+            waypoint_duration_sec = float(step.get("waypoint_duration_sec", DEFAULT_WAYPOINT_DURATION_SEC))
             if waypoint_duration_sec <= 0.0:
                 raise ValueError(
                     f"skill template '{skill_name}' move_through_joint_positions waypoint_duration_sec must be > 0"
