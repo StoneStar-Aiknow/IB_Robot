@@ -121,7 +121,7 @@ class EmbodiedConfig:
     validate_primitive_service: str = "/embodied/validate_primitive"
     default_target_name: str = "demo_object"
     default_place_name: str = "tray_right"
-    skill_timeout_sec: float = 15.0
+    skill_timeout_sec: float = 30.0
     primitive_timeout_sec: float = 5.0
     primitive_wait_sec: float = 1.0
     timeouts: dict[str, Any] = field(default_factory=dict)

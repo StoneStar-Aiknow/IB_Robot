@@ -9,6 +9,8 @@ from robot_config.loader import (
     validate_embodied_launch_dict,
 )
 
+GRIPPER_TRAJECTORY_DURATION_SEC = 1.0
+
 
 @pytest.mark.parametrize(
     "config_name",
@@ -26,8 +28,10 @@ def test_loaded_embodied_skill_templates_include_dance_basic(config_name):
     assert "dance_basic" in skill_templates
     primitive_sequence = skill_templates["dance_basic"]["primitive_sequence"]
     assert primitive_sequence
-    assert primitive_sequence[0]["primitive_name"] == "move_through_joint_positions"
-    assert primitive_sequence[0]["joint_waypoints"]
+    trajectory_step = next(
+        step for step in primitive_sequence if step["primitive_name"] == "move_through_joint_positions"
+    )
+    assert trajectory_step["joint_waypoints"]
 
 
 def test_embodied_entry_visual_games_typed():
@@ -141,3 +145,26 @@ def test_enabled_embodied_config_uses_configured_default_place_pose():
 
     assert validate_config(config) == []
     assert config.embodied.default_place_name in config.embodied.named_poses
+
+
+@pytest.mark.parametrize(
+    "skill_name",
+    ["wave_hello", "nod_yes", "shake_no", "act_cute", "happy_spin_upright"],
+)
+def test_social_gesture_duration_estimate_covers_configured_motion(skill_name):
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    skill = load_robot_config_dict(config_path)["embodied"]["skill_templates"][skill_name]
+
+    configured_duration = 0.0
+    if skill.get("initial_gripper_state") in {"open", "closed"}:
+        configured_duration += GRIPPER_TRAJECTORY_DURATION_SEC
+    for step in skill["primitive_sequence"]:
+        primitive_name = step["primitive_name"]
+        if primitive_name == "move_to_joint_positions":
+            configured_duration += float(step.get("duration_sec", 0.4))
+        elif primitive_name == "move_through_joint_positions":
+            configured_duration += len(step["joint_waypoints"]) * float(step["waypoint_duration_sec"])
+        elif primitive_name in {"open_gripper", "close_gripper"}:
+            configured_duration += GRIPPER_TRAJECTORY_DURATION_SEC
+
+    assert float(skill["description"]["duration_sec_estimate"]) >= configured_duration

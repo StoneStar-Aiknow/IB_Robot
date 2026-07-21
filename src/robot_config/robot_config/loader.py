@@ -2,13 +2,16 @@
 
 import copy
 import logging
+import math
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from embodied_common.skill_templates import SUPPORTED_PRIMITIVES, SUPPORTED_SKILLS
-from embodied_common.trajectory_templates import expand_trajectory_template
+from embodied_common.skill_templates import (
+    SUPPORTED_PRIMITIVES,
+    get_skill_templates,
+)
 from robot_config.config import (
     CameraConfig,
     ContractAction,
@@ -25,6 +28,121 @@ from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from .utils import resolve_calibration_paths_from_config, resolve_ros_path
 
 logger = logging.getLogger(__name__)
+
+# Controlled vocabularies for the skill `description` contract exposed to MCP.
+_VALID_MOTION_SCOPES = {"base", "shoulder", "elbow", "wrist", "gripper", "arm"}
+_VALID_INTENSITIES = {"subtle", "moderate", "large"}
+
+
+def _is_finite_number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
+def _validate_skill_description(
+    skill_name: str,
+    description: Any,
+    valid_skills: set[str],
+    named_poses: dict[str, Any],
+    errors: list[str],
+) -> None:
+    """Validate the MCP-facing ``description`` contract of a skill template.
+
+    The description is the single source of truth for how an agent (rule parser
+    or MCP/Hermes) picks this skill over its near-synonyms, so structural fields
+    are enforced here rather than at call time.
+    """
+    prefix = f"embodied.skill_templates.{skill_name}.description"
+    if description is None:
+        errors.append(f"{prefix} is required")
+        return
+    if not isinstance(description, dict):
+        errors.append(f"{prefix} must be a mapping")
+        return
+
+    summary_value = description.get("summary")
+    if not isinstance(summary_value, str) or not summary_value.strip():
+        errors.append(f"{prefix}.summary must be a non-empty string")
+    elif len(summary_value.strip()) > 120:
+        errors.append(f"{prefix}.summary must be at most 120 characters")
+
+    category_value = description.get("category")
+    if not isinstance(category_value, str) or not category_value.strip():
+        errors.append(f"{prefix}.category must be a non-empty string")
+
+    when_to_use = description.get("when_to_use")
+    if not isinstance(when_to_use, list) or not when_to_use:
+        errors.append(f"{prefix}.when_to_use must be a non-empty list")
+    elif not all(isinstance(item, str) and item.strip() for item in when_to_use):
+        errors.append(f"{prefix}.when_to_use entries must be non-empty strings")
+
+    for field in ("aliases_zh", "aliases_en", "motion_scope"):
+        value = description.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+            errors.append(f"{prefix}.{field} must be a list of non-empty strings")
+        elif field == "motion_scope":
+            unknown = sorted(set(value) - _VALID_MOTION_SCOPES)
+            if unknown:
+                errors.append(f"{prefix}.motion_scope contains unsupported token(s): {', '.join(unknown)}")
+
+    intensity = description.get("intensity")
+    if intensity is not None:
+        if not isinstance(intensity, str):
+            errors.append(f"{prefix}.intensity must be a string when present")
+        elif intensity.strip() not in _VALID_INTENSITIES:
+            errors.append(f"{prefix}.intensity must be one of {sorted(_VALID_INTENSITIES)} when present")
+
+    anchor_pose = description.get("anchor_pose")
+    if anchor_pose is not None:
+        if not isinstance(anchor_pose, str):
+            errors.append(f"{prefix}.anchor_pose must be a string when present")
+        else:
+            anchor_pose = anchor_pose.strip()
+            if anchor_pose and anchor_pose != "none" and anchor_pose not in named_poses:
+                errors.append(f"{prefix}.anchor_pose references undefined pose '{anchor_pose}'")
+
+    duration = description.get("duration_sec_estimate")
+    if duration is not None:
+        if not _is_finite_number(duration):
+            errors.append(f"{prefix}.duration_sec_estimate must be a finite number")
+        elif float(duration) <= 0.0:
+            errors.append(f"{prefix}.duration_sec_estimate must be greater than zero")
+
+    requires_motion_params = description.get("requires_motion_params")
+    if requires_motion_params is not None and not isinstance(requires_motion_params, bool):
+        errors.append(f"{prefix}.requires_motion_params must be a boolean when present")
+
+    rule_entry = description.get("rule_entry")
+    if rule_entry is not None and not isinstance(rule_entry, bool):
+        errors.append(f"{prefix}.rule_entry must be a boolean when present")
+
+    do_not_use = description.get("do_not_use")
+    if do_not_use is None:
+        return
+    if not isinstance(do_not_use, list):
+        errors.append(f"{prefix}.do_not_use must be a list")
+        return
+    for index, entry in enumerate(do_not_use):
+        entry_prefix = f"{prefix}.do_not_use[{index}]"
+        if not isinstance(entry, dict):
+            errors.append(f"{entry_prefix} must be a mapping")
+            continue
+        condition = entry.get("condition")
+        if not isinstance(condition, str) or not condition.strip():
+            errors.append(f"{entry_prefix}.condition must be a non-empty string")
+        instead_use = entry.get("instead_use")
+        if not isinstance(instead_use, str) or not instead_use.strip():
+            errors.append(f"{entry_prefix}.instead_use must reference a skill name")
+        elif instead_use.strip() not in valid_skills:
+            errors.append(f"{entry_prefix}.instead_use references unknown skill '{instead_use.strip()}'")
+        elif instead_use.strip() == skill_name:
+            errors.append(f"{entry_prefix}.instead_use must not reference the same skill")
 
 
 def _load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
@@ -55,25 +173,7 @@ def _load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
 
 
 def _normalize_skill_templates(skill_templates: dict[str, Any]) -> dict[str, Any]:
-    resolved_templates = copy.deepcopy(skill_templates)
-    for template in resolved_templates.values():
-        primitive_sequence = template.get("primitive_sequence")
-        if not isinstance(primitive_sequence, list):
-            continue
-        for step in primitive_sequence:
-            if not isinstance(step, dict):
-                continue
-            trajectory_template = step.get("trajectory_template")
-            if not trajectory_template:
-                continue
-            if not isinstance(trajectory_template, dict):
-                raise ValueError("trajectory_template must be a mapping")
-            step["joint_waypoints"] = expand_trajectory_template(trajectory_template)
-            step["waypoint_duration_sec"] = float(
-                trajectory_template.get("waypoint_duration_sec", step.get("waypoint_duration_sec", 0.0))
-            )
-            del step["trajectory_template"]
-    return resolved_templates
+    return get_skill_templates(skill_templates)
 
 
 def _normalize_embodied_config(robot_config: dict[str, Any]) -> dict[str, Any]:
@@ -86,6 +186,210 @@ def _normalize_embodied_config(robot_config: dict[str, Any]) -> dict[str, Any]:
     return robot_config
 
 
+_GRIPPER_ONLY_PRIMITIVES = {"open_gripper", "close_gripper"}
+
+
+def _validate_absolute_joint_trajectory_entries(skill_templates: dict[str, Any], errors: list[str]) -> None:
+    """Require every absolute waypoint trajectory to start from its first waypoint."""
+    for skill_name, template in skill_templates.items():
+        if not isinstance(template, dict):
+            continue
+        primitive_sequence = template.get("primitive_sequence", [])
+        if not isinstance(primitive_sequence, list):
+            continue
+
+        for index, step in enumerate(primitive_sequence):
+            if not isinstance(step, dict) or step.get("primitive_name") != "move_through_joint_positions":
+                continue
+
+            prefix = f"embodied.skill_templates.{skill_name}.primitive_sequence[{index}]"
+            previous = None
+            for candidate in reversed(primitive_sequence[:index]):
+                if not isinstance(candidate, dict):
+                    previous = candidate
+                    break
+                if candidate.get("primitive_name") in _GRIPPER_ONLY_PRIMITIVES:
+                    continue
+                previous = candidate
+                break
+
+            if not isinstance(previous, dict) or previous.get("primitive_name") != "move_to_joint_positions":
+                errors.append(f"{prefix} must have a preceding move_to_joint_positions arm entry")
+                continue
+
+            try:
+                duration_sec = float(previous.get("duration_sec", 0.0))
+            except (OverflowError, TypeError, ValueError):
+                duration_sec = 0.0
+            if duration_sec <= 0.0:
+                errors.append(f"{prefix} arm entry duration_sec must be greater than zero")
+
+            waypoints = step.get("joint_waypoints", [])
+            first_waypoint = waypoints[0] if isinstance(waypoints, list) and waypoints else {}
+            first_positions = first_waypoint.get("joint_positions", {}) if isinstance(first_waypoint, dict) else {}
+            entry_positions = previous.get("joint_positions", {})
+            positions_match = bool(
+                isinstance(entry_positions, dict) and isinstance(first_positions, dict) and first_positions
+            )
+            if positions_match:
+                positions_match = set(entry_positions) == set(first_positions)
+            if positions_match:
+                try:
+                    positions_match = all(
+                        math.isclose(
+                            float(entry_positions[joint_name]),
+                            float(first_positions[joint_name]),
+                            rel_tol=0.0,
+                            abs_tol=1e-9,
+                        )
+                        for joint_name in first_positions
+                    )
+                except (OverflowError, TypeError, ValueError):
+                    positions_match = False
+            if not positions_match:
+                errors.append(f"{prefix} arm entry must match the first joint waypoint")
+
+
+def _validate_skill_primitive_sequence(
+    skill_name: str,
+    template: dict[str, Any],
+    named_poses: dict[str, Any],
+    errors: list[str],
+) -> None:
+    initial_gripper_state = template.get("initial_gripper_state")
+    valid_gripper_states = {"open", "closed", "hold", "none"}
+    if initial_gripper_state is not None and (
+        not isinstance(initial_gripper_state, str) or initial_gripper_state.strip().lower() not in valid_gripper_states
+    ):
+        errors.append(
+            f"embodied.skill_templates.{skill_name}.initial_gripper_state must be one of "
+            f"{sorted(valid_gripper_states)} when present"
+        )
+
+    primitive_sequence = template.get("primitive_sequence", [])
+    if skill_name == "inspect_scene" and not primitive_sequence:
+        return
+    if not isinstance(primitive_sequence, list) or not primitive_sequence:
+        errors.append(f"embodied.skill_templates.{skill_name}.primitive_sequence must be a non-empty list")
+        return
+
+    valid_directions = {"forward", "backward", "left", "right", "up", "down"}
+    for index, step in enumerate(primitive_sequence):
+        prefix = f"embodied.skill_templates.{skill_name}.primitive_sequence[{index}]"
+        if not isinstance(step, dict):
+            errors.append(f"embodied.skill_templates.{skill_name}.primitive_sequence entries must be objects")
+            continue
+        primitive_name = str(step.get("primitive_name", "")).strip()
+        if primitive_name not in SUPPORTED_PRIMITIVES:
+            errors.append(f"embodied.skill_templates.{skill_name} uses unsupported primitive '{primitive_name}'")
+            continue
+        if primitive_name == "move_to_named_pose":
+            pose_name = str(step.get("pose_name", "")).strip()
+            target_pose_key = str(step.get("target_pose_key", "")).strip()
+            place_name_from_request = bool(step.get("place_name_from_request", False))
+            if not pose_name and not target_pose_key and not place_name_from_request:
+                errors.append(
+                    f"embodied.skill_templates.{skill_name} move_to_named_pose step must define pose_name, "
+                    "target_pose_key, or enable place_name_from_request"
+                )
+            elif pose_name and pose_name not in named_poses:
+                errors.append(f"embodied.skill_templates.{skill_name} references undefined pose '{pose_name}'")
+        if primitive_name == "move_relative_ee":
+            literal_direction = str(step.get("motion_direction", "")).strip()
+            if not step.get("motion_direction_from_request", False) and literal_direction not in valid_directions:
+                errors.append(
+                    f"embodied.skill_templates.{skill_name} move_relative_ee step must provide a valid "
+                    "motion_direction or enable motion_direction_from_request"
+                )
+            if not step.get("motion_distance_from_request", False):
+                literal_distance = step.get("motion_distance", 0.0)
+                if not _is_finite_number(literal_distance) or float(literal_distance) <= 0.0:
+                    errors.append(
+                        f"embodied.skill_templates.{skill_name} move_relative_ee step must provide a positive "
+                        "finite motion_distance or enable motion_distance_from_request"
+                    )
+        if primitive_name == "move_to_joint_positions":
+            joint_positions = step.get("joint_positions")
+            joint_position_offsets = step.get("joint_position_offsets")
+            if joint_positions and joint_position_offsets:
+                errors.append(f"{prefix} cannot define both joint_positions and joint_position_offsets")
+                continue
+            joint_map = joint_positions or joint_position_offsets
+            if not isinstance(joint_map, dict) or not joint_map:
+                errors.append(f"{prefix} must define joint_positions or joint_position_offsets")
+            else:
+                for joint_name, position in joint_map.items():
+                    if not _is_finite_number(position):
+                        errors.append(f"{prefix}.joint_positions.{joint_name} must be a finite number")
+            duration_sec = step.get("duration_sec")
+            if duration_sec is not None:
+                if not _is_finite_number(duration_sec):
+                    errors.append(f"{prefix}.duration_sec must be a finite number")
+                elif float(duration_sec) <= 0.0:
+                    errors.append(f"{prefix}.duration_sec must be greater than zero")
+        if primitive_name == "move_through_joint_positions":
+            waypoint_duration_sec = step.get("waypoint_duration_sec")
+            if not _is_finite_number(waypoint_duration_sec):
+                errors.append(f"{prefix}.waypoint_duration_sec must be a finite number")
+            elif float(waypoint_duration_sec) <= 0.0:
+                errors.append(f"{prefix}.waypoint_duration_sec must be greater than zero")
+
+            joint_waypoints = step.get("joint_waypoints")
+            if not isinstance(joint_waypoints, list) or not joint_waypoints:
+                errors.append(f"{prefix}.joint_waypoints must be a non-empty list")
+                continue
+            for waypoint_index, waypoint in enumerate(joint_waypoints):
+                waypoint_prefix = f"{prefix}.joint_waypoints[{waypoint_index}]"
+                if not isinstance(waypoint, dict):
+                    errors.append(f"{waypoint_prefix} must be an object")
+                    continue
+                joint_positions = waypoint.get("joint_positions")
+                if not isinstance(joint_positions, dict) or not joint_positions:
+                    errors.append(f"{waypoint_prefix}.joint_positions must be a non-empty mapping")
+                    continue
+                for joint_name, position in joint_positions.items():
+                    if not _is_finite_number(position):
+                        errors.append(f"{waypoint_prefix}.joint_positions.{joint_name} must be a finite number")
+
+
+def _validate_embodied_skill_contract(robot_config: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    embodied = robot_config.get("embodied", {})
+    if not isinstance(embodied, dict):
+        return errors
+
+    skill_templates = embodied.get("skill_templates", {})
+    if not isinstance(skill_templates, dict):
+        return ["embodied.skill_templates must be a mapping"]
+
+    valid_skills = set(skill_templates)
+    named_poses = embodied.get("named_poses", {})
+    if not isinstance(named_poses, dict):
+        named_poses = {}
+    for skill_name, template in skill_templates.items():
+        if not isinstance(template, dict):
+            errors.append(f"embodied.skill_templates.{skill_name} must be a mapping")
+            continue
+        disabled = template.get("disabled")
+        if disabled is not None and not isinstance(disabled, bool):
+            errors.append(f"embodied.skill_templates.{skill_name}.disabled must be a boolean when present")
+        _validate_skill_description(skill_name, template.get("description"), valid_skills, named_poses, errors)
+        _validate_skill_primitive_sequence(skill_name, template, named_poses, errors)
+
+    planner = embodied.get("planner", {})
+    planning_policy = planner.get("planning_policy", {}) if isinstance(planner, dict) else {}
+    allowed_skills = planning_policy.get("allowed_skills", []) if isinstance(planning_policy, dict) else []
+    if isinstance(allowed_skills, list):
+        unknown = sorted(str(skill) for skill in allowed_skills if skill not in valid_skills)
+        if unknown:
+            errors.append(
+                "embodied.planner.planning_policy.allowed_skills contains unsupported skill(s): " + ", ".join(unknown)
+            )
+
+    _validate_absolute_joint_trajectory_entries(skill_templates, errors)
+    return errors
+
+
 def load_robot_config_dict(config_path: str | Path) -> dict[str, Any]:
     """Load robot configuration as a complete dict.
 
@@ -96,6 +400,9 @@ def load_robot_config_dict(config_path: str | Path) -> dict[str, Any]:
     resolved_config_path, robot_data = _load_robot_section(config_path)
     robot_config = copy.deepcopy(robot_data)
     robot_config = _normalize_embodied_config(robot_config)
+    validation_errors = _validate_embodied_skill_contract(robot_config)
+    if validation_errors:
+        raise ValueError("Invalid embodied configuration:\n- " + "\n- ".join(validation_errors))
     robot_config["_config_path"] = str(resolved_config_path)
     return robot_config
 
@@ -275,7 +582,7 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         validate_primitive_service=data.get("validate_primitive_service", "/embodied/validate_primitive"),
         default_target_name=data.get("default_target_name", "demo_object"),
         default_place_name=data.get("default_place_name", "tray_right"),
-        skill_timeout_sec=execution.get("skill_timeout_sec", 15.0),
+        skill_timeout_sec=execution.get("skill_timeout_sec", 30.0),
         primitive_timeout_sec=execution.get("primitive_timeout_sec", 5.0),
         primitive_wait_sec=execution.get("primitive_wait_sec", 1.0),
         timeouts=timeout_policy,
@@ -307,7 +614,8 @@ def load_robot_config(config_path: str | Path) -> RobotConfig:
         FileNotFoundError: If config file doesn't exist
         ValueError: If config is invalid
     """
-    resolved_config_path, robot_data = _load_robot_section(config_path)
+    robot_data = load_robot_config_dict(config_path)
+    resolved_config_path = Path(robot_data["_config_path"])
     config_dir = resolved_config_path.parent
 
     # Load required fields
@@ -525,7 +833,6 @@ def validate_config(config: RobotConfig) -> list[str]:
     if config.embodied.enabled:
         valid_directions = {"forward", "backward", "left", "right", "up", "down"}
         valid_planner_modes = {"rule", "vlm_api", "hybrid"}
-        valid_skills = SUPPORTED_SKILLS
         required_pose_names = {"home", "observe_table", "zero"}
         missing_pose_names = sorted(p for p in required_pose_names if p not in config.embodied.named_poses)
         if missing_pose_names:
@@ -535,53 +842,20 @@ def validate_config(config: RobotConfig) -> list[str]:
                 f"embodied.default_place_name references undefined pose: {config.embodied.default_place_name}"
             )
 
-        supported_primitives = SUPPORTED_PRIMITIVES
         skill_templates = config.embodied.skill_templates or {}
-        for skill_name, template in skill_templates.items():
-            if skill_name not in valid_skills:
-                errors.append(f"embodied.skill_templates contains unsupported skill key: {skill_name}")
-                continue
-            primitive_sequence = template.get("primitive_sequence", [])
-            # inspect_scene is intentionally vision-only with no primitives
-            if skill_name == "inspect_scene":
-                continue
-            if not isinstance(primitive_sequence, list) or not primitive_sequence:
-                errors.append(f"embodied.skill_templates.{skill_name}.primitive_sequence must be a non-empty list")
-                continue
-            for step in primitive_sequence:
-                if not isinstance(step, dict):
-                    errors.append(f"embodied.skill_templates.{skill_name}.primitive_sequence entries must be objects")
-                    continue
-                primitive_name = str(step.get("primitive_name", "")).strip()
-                if primitive_name not in supported_primitives:
-                    errors.append(
-                        f"embodied.skill_templates.{skill_name} uses unsupported primitive '{primitive_name}'"
-                    )
-                    continue
-                if primitive_name == "move_to_named_pose":
-                    pose_name = str(step.get("pose_name", "")).strip()
-                    if not pose_name:
-                        errors.append(
-                            f"embodied.skill_templates.{skill_name} move_to_named_pose step must define pose_name"
-                        )
-                    if pose_name and pose_name not in config.embodied.named_poses:
-                        errors.append(f"embodied.skill_templates.{skill_name} references undefined pose '{pose_name}'")
-                if primitive_name == "move_relative_ee":
-                    literal_direction = str(step.get("motion_direction", "")).strip()
-                    if (
-                        not step.get("motion_direction_from_request", False)
-                        and literal_direction not in valid_directions
-                    ):
-                        errors.append(
-                            f"embodied.skill_templates.{skill_name} move_relative_ee step must provide a valid "
-                            "motion_direction or enable motion_direction_from_request"
-                        )
-                    literal_distance = float(step.get("motion_distance", 0.0) or 0.0)
-                    if not step.get("motion_distance_from_request", False) and literal_distance <= 0.0:
-                        errors.append(
-                            f"embodied.skill_templates.{skill_name} move_relative_ee step must provide a positive "
-                            "motion_distance or enable motion_distance_from_request"
-                        )
+        try:
+            normalized_skill_templates = _normalize_skill_templates(skill_templates)
+        except ValueError as exc:
+            errors.append(f"embodied.skill_templates contains invalid trajectory template: {exc}")
+        else:
+            typed_robot_config = {
+                "embodied": {
+                    "skill_templates": normalized_skill_templates,
+                    "named_poses": config.embodied.named_poses,
+                    "planner": config.embodied.planner,
+                }
+            }
+            errors.extend(_validate_embodied_skill_contract(typed_robot_config))
 
         for axis in ("x", "y", "z"):
             axis_limits = config.embodied.workspace.get(axis)
@@ -667,13 +941,6 @@ def validate_config(config: RobotConfig) -> list[str]:
                     "embodied.planner.planning_policy.allowed_skills must be a non-empty list "
                     "when planner.mode uses VLM"
                 )
-            else:
-                unsupported = sorted(s for s in allowed_skills if s not in valid_skills)
-                if unsupported:
-                    errors.append(
-                        "embodied.planner.planning_policy.allowed_skills contains unsupported skill(s): "
-                        + ", ".join(unsupported)
-                    )
             min_confidence = float(planning_policy.get("min_confidence", 0.7))
             if min_confidence < 0.0 or min_confidence > 1.0:
                 errors.append("embodied.planner.planning_policy.min_confidence must be in [0.0, 1.0]")
