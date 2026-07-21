@@ -170,6 +170,22 @@ def validate_skill_request(
             if resolved_direction and resolved_distance == 0.0:
                 return False, "motion_distance must be greater than zero"
 
+        if primitive_name in {"rotate_gripper_cw", "rotate_gripper_ccw"}:
+            # Rotation angle is carried on motion_distance for these primitives.
+            # Reject NaN/inf/negative so an LLM or rule parser cannot dispatch a
+            # harmful wrist rotation through the safety layer. Absolute upper
+            # bound is enforced by the controller's joint limits, not here.
+            resolved_distance = step.get("motion_distance", 0.0)
+            if step.get("motion_distance_from_request"):
+                resolved_distance = motion_distance
+            if not _is_finite_number(resolved_distance):
+                return False, "rotation angle must be finite"
+            resolved_distance = float(resolved_distance)
+            if resolved_distance < 0.0:
+                return False, "rotation angle must be non-negative"
+            if resolved_distance == 0.0:
+                return False, "rotation angle must be greater than zero"
+
         if primitive_name == "move_to_joint_positions":
             joint_position_offsets = step.get("joint_position_offsets", {})
             joint_position_targets = step.get("joint_positions", {})

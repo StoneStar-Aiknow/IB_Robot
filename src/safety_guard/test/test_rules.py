@@ -201,6 +201,43 @@ def test_validate_default_gripper_rotation_skill():
     assert reason == ""
 
 
+@pytest.mark.parametrize(
+    ("angle", "fragment"),
+    [
+        (float("nan"), "rotation angle must be finite"),
+        (float("inf"), "rotation angle must be finite"),
+        (-30.0, "rotation angle must be non-negative"),
+        (0.0, "rotation angle must be greater than zero"),
+    ],
+)
+def test_validate_gripper_rotation_rejects_invalid_angle(angle, fragment):
+    allowed, reason = validate_skill_request(
+        "rotate_gripper_cw",
+        "",
+        "",
+        "",
+        angle,
+        {"home": {}},
+        {},
+        None,
+    )
+    assert not allowed
+    assert fragment in reason
+
+    allowed, reason = validate_skill_request(
+        "rotate_gripper_ccw",
+        "",
+        "",
+        "",
+        angle,
+        {"home": {}},
+        {},
+        None,
+    )
+    assert not allowed
+    assert fragment in reason
+
+
 def test_validate_relative_primitive_target_workspace():
     allowed, reason = validate_primitive_request(
         "move_relative_ee",
