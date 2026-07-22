@@ -75,6 +75,24 @@ The current runtime graph is `vision -> embedding -> prefill -> action`; it does
 
 #### SmolVLA v1.3.0 Export Requirements
 
+The repository-managed standard conversion is:
+
+```bash
+source .shrc_local
+MODEL_BUNDLE_ROOT=models/smolvla ./scripts/convert_hmm.sh smolvla
+```
+
+The repository keeps one public dispatcher, `scripts/convert_hmm.sh <policy>`. Policy-specific
+orchestration belongs beside its exporter under `model_utils/<policy>_export/`; do not add a new
+root-level `scripts/convert_<policy>_hmm.sh` for each policy.
+
+The SmolVLA workflow verifies the patched LeRobot v0.5.1 source, prefers `transformers==5.3.0` with `4.57.1` as a
+loading fallback, exports all modules, quantizes them, compiles TCIM HMM files, writes provenance,
+and packages a strict deployment under `models/smolvla_hmm_standard` by default.
+`MODEL_BUNDLE_ROOT` is required, has no default, and must identify an existing workspace-relative
+bundle directory. Keep this input parameter policy-neutral so every HMM converter uses the same
+bundle-root contract.
+
 When using `houmo-examples-xh2` v1.3.0, verify that the LLM KV-cache exporter loads the fine-tuned
 `SmolVLAPolicy` before attempting to construct a standalone `SmolVLMWithExpertModel`. The upstream
 script may load the base VLM successfully first and therefore never consume `model.safetensors` from
@@ -92,11 +110,18 @@ Required checks after export:
 - Re-export action after changing the prefill export, then recompile both HMONNX files so the cache
   ABI and checkpoint provenance remain paired.
 
-The v1.3.0 toolchain image is compatible with the following isolated dependency versions used by
-the verified workflow: `transformers==4.51.0`, `tokenizers==0.21.4`, and `diffusers==0.35.2`.
-Newer `transformers` and `diffusers` releases can break the bundled `hmquant-xh2` or LeRobot imports.
-The exporter resolves `vlm_model_name` relative to its working directory, so expose the bundle's
-`HuggingFaceTB/` directory there or use an equivalent local path without modifying `config.json`.
+The verified repository workflow uses `transformers==5.3.0`, `tokenizers==0.22.2`, and
+`diffusers==0.35.2`. The image's `hmquant-xh2` metadata still declares `transformers==4.51.0`, so
+the script performs a real SmolVLA policy-loading preflight instead of trusting dependency metadata.
+It also removes the image's incompatible `torchao==0.17.0` before importing LeRobot. The exporter
+resolves `vlm_model_name` from the bundle's local `HuggingFaceTB/` directory without changing
+`config.json`.
+
+For the fixed 512x512 full-patch vision input, the managed exporter replaces SmolVLM's boolean
+position-ID indexing with equivalent static position IDs and rejects any exported vision graph that
+still contains `NonZero`. Vision and prefill export with CUDA float16; action exports with CUDA
+float32 to avoid denoise dtype mixing. Calibration tensors are captured from the actual export
+inputs, including action KV cache tensors produced by the same prefill forward pass.
 
 ## Packaging Spec
 

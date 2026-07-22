@@ -26,7 +26,7 @@ Houmo 工具链的依赖可能与项目主环境冲突，建议使用 Houmo 官�
 # 官方镜像示例；具体镜像名以当前 Houmo SDK 发布为准
 docker run -it --gpus all \
     -v "$PWD/models:/work/models" \
-    harbor.houmo.ai/toolchain/release:Dadao-xh2-v1.3.0-ubuntu24.04-x86_64 bash
+    harbor.houmo.ai/toolchain/release:Dadao-xh2-v1.3.0-ubuntu24.04-x86.64 bash
 ```
 
 22.04 runtime 镜像通常只有 `houmo_tcim_runtime`，没有 `xhquant` 和 `tcim` 编译器，不能用于模型转换。
@@ -75,7 +75,34 @@ SmolVLA 需要以下角色：
 
 SmolVLA 的主链是 `vision -> embedding -> prefill -> action`。当前 HMM runtime 不执行独立 decode 模块。`state_projection.pt` 必须包含与 state input 和 hidden size 匹配的 projection weight/bias。
 
-SmolVLA action 导出建议使用 CPU + float32，避免 CUDA fp16 导出过程中 denoise 分支出现 dtype 混用。
+仓库提供完整的标准转换入口：
+
+```bash
+source .shrc_local
+MODEL_BUNDLE_ROOT=models/smolvla ./scripts/convert_hmm.sh smolvla
+```
+
+根目录只保留这一通用 HMM 转换入口；各策略的容器编排和导出实现放在对应的
+`model_utils/<policy>_export/` 目录，新增策略时不再增加 `scripts/convert_<policy>_hmm.sh`。
+
+`MODEL_BUNDLE_ROOT` 是必填的 workspace 相对路径，没有默认值。未设置、传入空值、绝对路径或
+不存在的目录时，脚本会在启动容器前失败。输出默认为 `models/smolvla_hmm_standard`，可通过
+`SMOLVLA_HMM_OUTPUT`、`SMOLVLA_EXPORT_DEVICE` 和 `HOUMO_IMAGE` 覆盖其他参数。脚本会校验仓库维护的
+LeRobot v0.5.1 patch 分支和 clean 状态，在 Houmo 1.3.0 容器中导出 ONNX、执行 xhquant PTQ、
+调用 TCIM 编译三个 HMM，并通过 strict loader 生成和验证 `inference_manifest.json`。
+
+标准流程优先使用 `transformers==5.3.0`，并在加载策略失败时尝试 `4.57.1`。容器预装的
+`torchao==0.17.0` 与 torch 2.8.0 不兼容，入口脚本会在导入 LeRobot 前卸载它。导出使用
+bundle 内的 `HuggingFaceTB/SmolVLM2-500M-Video-Instruct`，不依赖网络下载。
+
+vision 图是固定 `512x512`、全 patch 有效的静态导出。Exporter 会将 SmolVLM 的布尔索引位置
+编码替换为等价静态 position IDs，并拒绝仍含 `NonZero` 的 ONNX，避免 xhquant 编译失败。
+action 图使用 CUDA float32，避免 denoise 分支在 fp16 tracing 时发生 dtype 混用；vision 和
+prefill 在 CUDA 上使用 float16。PTQ calibration 文件直接保存对应 PyTorch dummy inputs，
+其中 action KV cache 来自同次 prefill 前向。
+
+输出目录还包含 `provenance.json`，记录 IB-Robot/LeRobot commit、checkpoint SHA-256、容器镜像、
+依赖版本、导出 shape 和量化参数。该文件用于追溯转换来源，不替代 runtime manifest。
 
 ## 三、组装统一 Deployment
 
