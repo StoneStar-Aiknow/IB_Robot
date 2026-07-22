@@ -57,7 +57,35 @@ Required compiler outputs:
 | action_out_proj | projection `.hmm` + TCIM `model.json` |
 | embedding | `embedding.pt` |
 
-The packager requires the exact PI0.5 role set. Prefill and decode cache inputs must have identical names, dtypes, and shapes. Device links are input-sourced: prefill input -> decode input.
+The packager requires the exact PI0.5 role set. Prefill cache outputs and decode cache inputs must have identical names, dtypes, and shapes. Device links are output-sourced: prefill output -> decode input.
+
+#### PI0.5 v1.3.0 Export Requirements
+
+The repository-managed conversion is:
+
+```bash
+source .shrc_local
+MODEL_BUNDLE_ROOT=models/pi05 ./scripts/convert_hmm.sh pi05
+```
+
+The native exporter does not require the untracked Houmo vendor example or `xh_model_zoo`.
+`MODEL_BUNDLE_ROOT` and `PI05_HMM_OUTPUT` must be workspace-relative. The output defaults to
+`models/pi05_hmm_standard` and must not already exist, preventing stale HMONNX or TCIM products
+from contaminating a rebuild. The workflow uses `transformers==5.3.0` and performs a strict
+checkpoint-loading preflight.
+
+Required checks after export:
+
+- Prefill exposes `prefix_embs`, `attention_mask`, and `position_ids`, followed by 18 key-cache and
+  18 value-cache outputs.
+- Decode exposes action embeddings, attention mask, position IDs, condition, then the same 36 cache
+  inputs with matching names, dtypes, and shapes.
+- `embedding.pt["weight"]` exactly equals
+  `model.safetensors["model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"]`.
+- `provenance.json` records the checkpoint SHA-256, image ID, LeRobot HEAD, Transformers, xhquant,
+  and TCIM versions.
+- Run the strict packager before replacing an existing deployment; it validates the projection
+  chain, action shapes, prefix capacity, and all cache links.
 
 ### SmolVLA
 
@@ -274,6 +302,7 @@ Read `oh-constraints` first. Source the RoboFrame environment and `scripts/setup
 
 - `docs/Houmo_HMM_Conversion.md`
 - `src/model_utils/model_utils/hmm_export.py`
+- `src/model_utils/model_utils/pi05_export/`
 - `src/model_utils/model_utils/inference_manifest_export.py`
 - `src/inference_service/inference_service/backends/hmm/backend.py`
 - `src/model_utils/test/test_hmm_export.py`

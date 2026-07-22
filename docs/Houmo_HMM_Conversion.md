@@ -10,7 +10,7 @@
 
 | 策略 | HMM 模块 | Host 侧辅助制品 | 设备指针链路 |
 |------|----------|-----------------|--------------|
-| **PI0.5** | vision、prefill、action_in_proj、time_mlp、decode、action_out_proj | `embedding.pt` | prefill input -> decode input |
+| **PI0.5** | vision、prefill、action_in_proj、time_mlp、decode、action_out_proj | `embedding.pt` | prefill output -> decode input |
 | **SmolVLA** | vision、prefill、action | `token_embedding.pt`、`state_projection.pt` | prefill output -> action input |
 | **ACT** | 不支持 | - | 启动时拒绝 |
 
@@ -59,7 +59,24 @@ PI0.5 需要以下角色：
 
 典型官方流程包含 vision、LLM、expert 和 action projection 的导出脚本，然后通过 `tcim.build_from_hmonnx` 生成 `.hmm` 与 ABI 元数据。自定义策略必须使用与实际 camera、chunk size、action dimension 和 tokenizer 长度一致的导出配置。
 
-PI0.5 的 cache 链路由 packager 根据 prefill/decode ABI 自动生成。两端 cache input 名称、dtype 和 shape 必须完全一致。
+PI0.5 的 cache 链路由 packager 根据 prefill/decode ABI 自动生成。native prefill 输出和 decode
+输入必须具有相同的交错 `past_key_N` / `past_value_N` 名称、dtype 和 shape，且以 device pointer 连接。
+
+仓库提供不依赖 `xh_model_zoo` 的受管转换入口：
+
+```bash
+source .shrc_local
+MODEL_BUNDLE_ROOT=models/pi05 \
+./scripts/convert_hmm.sh pi05
+```
+
+`MODEL_BUNDLE_ROOT` 是必填 workspace 相对路径。输出默认为 `models/pi05_hmm_standard`，可通过
+`PI05_HMM_OUTPUT` 覆盖；为防止混入旧 HMONNX/TCIM 产物，输出路径已存在时脚本会拒绝运行。入口
+严格加载当前 checkpoint 和 patched LeRobot，使用 `transformers==5.3.0` 导出 native PaliGemma
+prefill 与 action-expert decode 图。容器中的 `torchao==0.17.0` 会在导入前卸载。输出目录中的
+`provenance.json` 记录 checkpoint SHA-256、IB-Robot/LeRobot commit、镜像 ID、Transformers、
+xhquant 和 TCIM 版本。`embedding.pt["weight"]` 必须与当前 checkpoint 的
+`model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight` 完全一致。
 
 ### SmolVLA
 
@@ -299,7 +316,7 @@ python3 -c "import tcim_lite.runtime as r; print('device_num:', r.get_device_num
 
 确认传入的是每个 `.hmm` 对应的 compiler-emitted `model.json`，不要手写 tensor 顺序。重点检查：
 
-- PI0.5 prefill/decode cache input 名称完全一致；
+- PI0.5 prefill cache output 与 decode cache input 名称、dtype、shape 一致；
 - PI0.5 action/noise shape 为 `(1, chunk_size, max_action_dim)`；
 - SmolVLA prefill cache output 与 action cache input 名称、dtype、shape 一致；
 - vision 只有一个 image input 和一个 embedding output；
@@ -315,7 +332,7 @@ python3 -c "import tcim_lite.runtime as r; print('device_num:', r.get_device_num
 
 ### `set_input error: Status.UNINITIALIZED`
 
-PI0.5 使用 prefill input -> decode input 的 device pointer；SmolVLA 使用 prefill output -> action input。不要交换 `get_dev_input` 和 `get_dev_output` 语义。该关系应来自 manifest 的 `device_links`，不应在部署脚本中硬编码。
+PI0.5 使用 prefill output -> decode input 的 device pointer；SmolVLA 使用 prefill output -> action input。不要交换 `get_dev_input` 和 `get_dev_output` 语义。该关系应来自 manifest 的 `device_links`，不应在部署脚本中硬编码。
 
 ### PTQ 精度下降或 NPU 超时
 
@@ -324,6 +341,7 @@ PI0.5 使用 prefill input -> decode input 的 device pointer；SmolVLA 使用 p
 ## 参考
 
 - HMM packager：`src/model_utils/model_utils/hmm_export.py`
+- PI0.5 HMM exporter：`src/model_utils/model_utils/pi05_export/`
 - 统一 manifest writer：`src/model_utils/model_utils/inference_manifest_export.py`
 - HMM backend：`src/inference_service/inference_service/backends/hmm/backend.py`
 - HMM backend tests：`src/inference_service/tests/test_hmm_backend.py`

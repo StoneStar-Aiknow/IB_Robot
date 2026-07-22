@@ -317,8 +317,8 @@ def _pi05_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
     token_weight = np.arange(40, dtype=np.float32).reshape(10, 4) / 10.0
     _write_embedding(artifact_dir / "embedding.pt", token_weight)
 
-    cache_source = _binding("internal.cache.0", "prefill_cache", 4, "int8", [1, 1])
-    cache_target = _binding("internal.cache.0", "decode_cache", 5, "int8", [1, 1])
+    cache_source = _binding("internal.past_key.0", "past_key_0", 0, "float16", [1, 1])
+    cache_target = _binding("internal.past_key.0", "past_key_0", 4, "float16", [1, 1])
     deployment = {
         "backend": "hmm",
         "target": {"soc": "lq50", "runtime": "tcim-lite"},
@@ -347,22 +347,18 @@ def _pi05_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
                 "outputs": [
                     _binding("internal.prefix_embeddings", "prefix", 0, "float16", [1, 6, 4]),
                     _binding("internal.prefix_attention", "prefix_attention", 1, "float16", [1, 1, 6, 8]),
-                    _binding("internal.decode_attention", "decode_attention", 2, "float16", [1, 1, 2, 8]),
-                    _binding("internal.prefill_valid_length", "prefill_valid", 3, "int32", [1]),
-                    _binding("internal.prefill_current_length", "prefill_current", 4, "int32", [1]),
-                    _binding("internal.decode_valid_length", "decode_valid", 5, "int32", [1]),
-                    _binding("internal.decode_current_length", "decode_current", 6, "int32", [1]),
+                    _binding("internal.prefix_positions", "prefix_positions", 2, "int64", [1, 6]),
+                    _binding("internal.decode_attention", "decode_attention", 3, "float16", [1, 1, 2, 8]),
+                    _binding("internal.decode_positions", "decode_positions", 4, "int64", [1, 2]),
                 ],
             },
             "prefill": {
                 "inputs": [
-                    _binding("internal.prefix_embeddings", "input_1", 0, "float16", [1, 6, 4]),
-                    _binding("internal.prefill_valid_length", "valid_length", 1, "int32", [1]),
-                    _binding("internal.prefill_current_length", "current_length", 2, "int32", [1]),
-                    _binding("internal.prefix_attention", "attention_mask", 3, "float16", [1, 1, 6, 8]),
-                    cache_source,
+                    _binding("internal.prefix_embeddings", "prefix_embs", 0, "float16", [1, 6, 4]),
+                    _binding("internal.prefix_attention", "attention_mask", 1, "float16", [1, 1, 6, 8]),
+                    _binding("internal.prefix_positions", "position_ids", 2, "int64", [1, 6]),
                 ],
-                "outputs": [_binding("prefill.status", "status", 0, "float16", [1])],
+                "outputs": [cache_source],
             },
             "action_in_proj": {
                 "inputs": [_binding("noise", "action_in", 0, "float16", [1, 2, 8])],
@@ -374,11 +370,10 @@ def _pi05_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
             },
             "decode": {
                 "inputs": [
-                    _binding("internal.action_embedding", "input_1", 0, "float16", [1, 2, 4]),
-                    _binding("internal.decode_valid_length", "valid_length", 1, "int32", [1]),
-                    _binding("internal.decode_current_length", "current_length", 2, "int32", [1]),
-                    _binding("internal.time_condition", "cond", 3, "float16", [1, 4]),
-                    _binding("internal.decode_attention", "attention_mask", 4, "float16", [1, 1, 2, 8]),
+                    _binding("internal.action_embedding", "action_embs", 0, "float16", [1, 2, 4]),
+                    _binding("internal.decode_attention", "attention_mask", 1, "float16", [1, 1, 2, 8]),
+                    _binding("internal.decode_positions", "position_ids", 2, "int64", [1, 2]),
+                    _binding("internal.time_condition", "condition", 3, "float16", [1, 4]),
                     cache_target,
                 ],
                 "outputs": [_binding("internal.suffix_hidden", "last_hidden_state", 0, "float16", [1, 2, 4])],
@@ -390,10 +385,9 @@ def _pi05_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
         },
         "device_links": [
             {
-                "semantic": "internal.cache.0",
+                "semantic": "internal.past_key.0",
                 "producer": "prefill",
                 "consumer": "decode",
-                "producer_binding": "input",
                 "transport": "device_pointer",
                 "owner": "producer",
                 "lifetime": "inference",
@@ -527,12 +521,11 @@ def _pi05_environment(context: RuntimeContext, observed_times: list[float]) -> F
         return [np.full((1, 2, 4), float(image.mean()), dtype=np.float16)]
 
     def prefill(inputs):
-        prefix, valid, current, attention, _cache = inputs
+        prefix, attention, positions = inputs
         assert prefix.shape == (1, 6, 4)
-        np.testing.assert_array_equal(valid, np.array([0], dtype=np.int32))
-        np.testing.assert_array_equal(current, np.array([5], dtype=np.int32))
         assert attention.shape == (1, 1, 6, 8)
-        return [np.zeros((1,), dtype=np.float16)]
+        np.testing.assert_array_equal(positions, np.arange(6, dtype=np.int64)[None, :])
+        return [np.full((1, 1), 3.0, dtype=np.float16)]
 
     def action_in(inputs):
         (noise,) = inputs
@@ -544,12 +537,11 @@ def _pi05_environment(context: RuntimeContext, observed_times: list[float]) -> F
         return [time_embedding]
 
     def decode(inputs):
-        action_embedding, valid, current, condition, attention, cache = inputs
-        np.testing.assert_array_equal(valid, np.array([5], dtype=np.int32))
-        np.testing.assert_array_equal(current, np.array([2], dtype=np.int32))
+        action_embedding, attention, positions, condition, cache = inputs
         assert condition.shape == (1, 4)
         assert attention.shape == (1, 1, 2, 8)
-        assert cache is not None
+        np.testing.assert_array_equal(positions, np.array([[6, 7]], dtype=np.int64))
+        np.testing.assert_array_equal(cache, np.full((1, 1), 3.0, dtype=np.float16))
         return [action_embedding]
 
     def action_out(inputs):
@@ -565,13 +557,11 @@ def _pi05_environment(context: RuntimeContext, observed_times: list[float]) -> F
             ),
             paths["prefill"]: FakeModuleSpec(
                 inputs=(
-                    _tensor("input_1", "float16", (1, 6, 4)),
-                    _tensor("valid_length", "int32", (1,)),
-                    _tensor("current_length", "int32", (1,)),
+                    _tensor("prefix_embs", "float16", (1, 6, 4)),
                     _tensor("attention_mask", "float16", (1, 1, 6, 8)),
-                    _tensor("prefill_cache", "int8", (1, 1)),
+                    _tensor("position_ids", "int64", (1, 6)),
                 ),
-                outputs=(_tensor("status", "float16", (1,)),),
+                outputs=(_tensor("past_key_0", "float16", (1, 1)),),
                 callback=prefill,
             ),
             paths["action_in_proj"]: FakeModuleSpec(
@@ -586,12 +576,11 @@ def _pi05_environment(context: RuntimeContext, observed_times: list[float]) -> F
             ),
             paths["decode"]: FakeModuleSpec(
                 inputs=(
-                    _tensor("input_1", "float16", (1, 2, 4)),
-                    _tensor("valid_length", "int32", (1,)),
-                    _tensor("current_length", "int32", (1,)),
-                    _tensor("cond", "float16", (1, 4)),
+                    _tensor("action_embs", "float16", (1, 2, 4)),
                     _tensor("attention_mask", "float16", (1, 1, 2, 8)),
-                    _tensor("decode_cache", "int8", (1, 1)),
+                    _tensor("position_ids", "int64", (1, 2)),
+                    _tensor("condition", "float16", (1, 4)),
+                    _tensor("past_key_0", "float16", (1, 1)),
                 ),
                 outputs=(_tensor("last_hidden_state", "float16", (1, 2, 4)),),
                 callback=decode,
@@ -664,7 +653,7 @@ def _smolvla_environment(context: RuntimeContext, observed_times: list[float]) -
     )
 
 
-def test_hmm_pi05_pipeline_uses_input_owned_cache_and_all_projection_modules(tmp_path):
+def test_hmm_pi05_pipeline_uses_prefill_output_cache_and_all_projection_modules(tmp_path):
     context = _pi05_context(tmp_path, runtime_options={"device_id": 0, "random_seed": 7})
     observed_times: list[float] = []
     environment = _pi05_environment(context, observed_times)
@@ -693,9 +682,9 @@ def test_hmm_pi05_pipeline_uses_input_owned_cache_and_all_projection_modules(tmp
         assert environment.modules[paths[role]].runs == 2
     assert len(environment.device_links) == 1
     _, target_name, handle = environment.device_links[0]
-    assert target_name == "decode_cache"
-    assert handle.direction == "input"
-    assert handle.name == "prefill_cache"
+    assert target_name == "past_key_0"
+    assert handle.direction == "output"
+    assert handle.name == "past_key_0"
     assert len(observed_times) == 2
 
     pipeline.close()
