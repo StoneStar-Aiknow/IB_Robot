@@ -36,8 +36,20 @@ export PYTHONNOUSERSITE=1
 
 # 5. 设置 PYTHONPATH
 # 确保优先使用 venv 和 libs 中的源码，使用绝对路径以支持跨目录调用
-WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-${(%):-%x}}")" && pwd)"
+# 获取本脚本所在目录（兼容 bash/zsh × 交互/非交互）：
+#   bash 用 BASH_SOURCE[0]；zsh 用 prompt escape %x（eval 隔离语法，避免 bash 解析报错）；
+#   两者都不可用时回退 ${0}，最终兜底 PWD（要求调用前已 cd 到 workspace 根目录）。
+if [ -n "${BASH_VERSION:-}" ]; then
+    _IB_SELF="${BASH_SOURCE[0]}"
+elif [ -n "${ZSH_VERSION:-}" ]; then
+    eval '_IB_SELF="${(%):-%x}"'
+else
+    _IB_SELF="${0}"
+fi
+WORKSPACE_DIR="$(cd "$(dirname "${_IB_SELF:-.}")" 2>/dev/null && pwd)" || WORKSPACE_DIR="$(pwd)"
+[ -z "${WORKSPACE_DIR:-}" ] && WORKSPACE_DIR="$(pwd)"
 export WORKSPACE="${WORKSPACE_DIR}"
+unset _IB_SELF
 PYTHON_VER="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
 export PYTHONPATH="${WORKSPACE_DIR}/libs/lerobot/src:${WORKSPACE_DIR}/venv/lib/${PYTHON_VER}/site-packages:${PYTHONPATH}"
 _IB_STEPS+=("PYTHONPATH (lerobot)")
