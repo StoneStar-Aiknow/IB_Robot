@@ -37,6 +37,7 @@ export PYTHONNOUSERSITE=1
 # 5. 设置 PYTHONPATH
 # 确保优先使用 venv 和 libs 中的源码，使用绝对路径以支持跨目录调用
 WORKSPACE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-${(%):-%x}}")" && pwd)"
+export WORKSPACE="${WORKSPACE_DIR}"
 PYTHON_VER="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
 export PYTHONPATH="${WORKSPACE_DIR}/libs/lerobot/src:${WORKSPACE_DIR}/venv/lib/${PYTHON_VER}/site-packages:${PYTHONPATH}"
 _IB_STEPS+=("PYTHONPATH (lerobot)")

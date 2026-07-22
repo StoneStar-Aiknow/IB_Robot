@@ -18,26 +18,6 @@ robot:
     libgl_always_software: true
 
   # ============================================
-  # Model Library (新增)
-  # ============================================
-  models:
-    so101_act:
-      path: ./models/502000/pretrained_model
-      policy_type: act
-      # LeRobot motor normalization mode used during training.
-      # Determines how rad ↔ LeRobot units are converted:
-      #   range_m100_100 : arm [-100,+100], gripper [0,100]  (LeRobot default)
-      #   degrees        : arm centered degrees; gripper keeps [0,100]
-      #   none           : no conversion (pass-through, units already match)
-      lerobot_norm_mode: range_m100_100
-
-    so101_act_rknn:
-      path: ./models/502000/pretrained_model
-      policy_type: act
-      device: rknn
-      lerobot_norm_mode: range_m100_100
-
-  # ============================================
   # Unified joint definitions (Single Source of Truth)
   # ============================================
   joints:
@@ -85,7 +65,6 @@ robot:
         - gripper_position_controller
       inference:
         enabled: false
-        force_disable: true  # Explicitly disable inference in teleop mode
       executor:
         type: topic
         mode: teleop
@@ -105,26 +84,20 @@ robot:
       # ============================================
       inference:
         enabled: true
-        # execution_mode: "distributed"
-        model: so101_act
-        action_server: /inference/dispatch
-        default_task: ""  # VLA policies (SmolVLA/PI05) require a task prompt
-        publish_attention: false
-        attention_viz_topic: /attention/weights
-        attention_viz:
-          enabled: false
-          mode: file
-          save_dir: attention_visualizations
-          update_frequency: 10.0
-          headless: false
-          interactive_masking: false
-          mask_save_dir: gui_interactions
+        pipelines:
+          policy:
+            model_path: models/ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515
+            deployment: cpu
+            execution_mode: monolithic
+            request_timeout: 120.0
+            default_task: "pick up the banana"
       # ============================================
       # Executor configuration
       # ============================================
       executor:
         type: topic  # topic | action
         mode: model_inference
+        inference_pipeline: policy
         queue_size: 100
         # Keep about 2.5s of buffered actions so ~1.5s distributed RKNN latency
         # still leaves margin before the dispatcher falls back to hold.
@@ -1088,6 +1061,7 @@ robot:
           strategy: hold
           stamp: header
           tol_ms: 1500
+          max_age_ms: 500
         qos:
           reliability: best_effort
           history: keep_last
@@ -1103,6 +1077,7 @@ robot:
           strategy: hold
           stamp: header
           tol_ms: 1500
+          max_age_ms: 500
         qos:
           reliability: best_effort
           history: keep_last
@@ -1118,6 +1093,7 @@ robot:
           strategy: hold
           stamp: header
           tol_ms: 1500
+          max_age_ms: 500
         qos:
           reliability: best_effort
           history: keep_last
@@ -1131,6 +1107,7 @@ robot:
           strategy: hold
           stamp: header
           tol_ms: 1500
+          max_age_ms: 500
         qos:
           reliability: best_effort
           history: keep_last
@@ -1144,6 +1121,7 @@ robot:
           strategy: hold
           stamp: header
           tol_ms: 1500
+          max_age_ms: 500
         qos:
           reliability: best_effort
           history: keep_last
@@ -1195,7 +1173,7 @@ robot:
   # ============================================
   teleoperation:
     enabled: true
-    active_device: "so101_leader" # You can switch between "so101_leader" and "xbox_controller" and "phone_teleop"
+    active_device: "so101_leader" # You can switch between "so101_leader", "xbox_controller", "phone_teleop", and "vr_teleop"
 
     # Cartesian solver used when gamepad / phone is in cartesian mode.
     # Options:
@@ -1243,6 +1221,53 @@ robot:
           cartesian_linear_speed: 1.0
           cartesian_angular_speed: 1.0
           long_press_duration: 0.5
+      # VR teleop server. output_profile=so101 drives the placo cartesian
+      # servo; the VR node converts tool-frame angular → base via
+      # ToolAngularAdapter and the launch builder spawns so101_placo_servo_node
+      # alongside. Downstream placo topics/services use their defaults, so only
+      # tuning knobs are listed here. VR client connects to <host>:<port> (TCP).
+      - name: "vr_teleop"
+        type: "vr_teleop"
+        control_frequency: 50.0
+        vr_config:
+          output_profile: "so101"     # so101 | humanoid
+          controller_side: "right"    # left | right
+          # Security model: trusted LAN only. Listening on 0.0.0.0 is
+          # intentional so users can connect arbitrary VR headsets or other
+          # network devices without fixing their client IP in this config.
+          # This TCP control channel is unauthenticated: do NOT expose port
+          # 8889 through public port forwarding, untrusted Wi-Fi, or an
+          # untrusted VPN. The stale/disconnect watchdog remains mandatory.
+          host: "0.0.0.0"
+          port: 8889
+          # Input mode: "pose" = absolute EE pose passthrough (1:1 hand tracking,
+          # stop=stop, no drift); "velocity" = differential twist (placo
+          # integrates). Pose mode drives BOTH the VR node and the placo servo.
+          so101_input_mode: "pose"
+          # Hand→EE position gain (pose mode). SO-101 reach (~24cm) vs
+          # comfortable single-arm range (~60cm) suggests ~0.4, but 0.7 gives a
+          # less tiring feel (smaller hand travel reaches the target). Tune for
+          # finer/coarser feel.
+          position_scale: 0.7
+          # Rotation gate (pose mode). false = hand attitude drives the EE
+          # (default; VR +X/+Y wrist rotation maps to EE roll/pitch, validated on
+          # sim). true = hold the clutch-baseline attitude and teleop position
+          # only. NOTE: SO-101 is 5-DOF, so EE yaw about base +Z is NOT
+          # reproducible regardless of this setting (placo pins 3 position DOF +
+          # a soft 2-DOF orientation follow) — a kinematic limit, not a bug.
+          so101_position_only: false
+          # Stale-frame watchdog (s). If the VR client stays TCP-connected but
+          # stops sending frames, the last frame would otherwise be republished
+          # forever and the arm would keep tracking a dead target. When the
+          # newest frame is older than this, drop the clutch and call placo's
+          # stop service on the edge. ~0.2s = 10 missed frames at 50Hz.
+          so101_command_stale_s: 0.2
+          linear_speed_scale: 1.0
+          angular_speed_scale: 1.0
+          linear_deadzone: 0.005
+          angular_deadzone: 0.05
+          so101_gripper_open: 1.0
+          so101_gripper_closed: 0.0
     safety:
       joint_limits:
         "1": {"min": -2.0693, "max": 2.0709}
@@ -1258,3 +1283,5 @@ robot:
   recording:
     bag_base_dir: "~/rosbag/episodes"
     storage: mcap
+    # This robot's deployed ACT policy was trained from centered-degree joint data.
+    lerobot_norm_mode: degrees

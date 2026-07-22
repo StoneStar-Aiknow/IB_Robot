@@ -282,19 +282,27 @@ ros2 topic pub /cmd_pose geometry_msgs/Pose "{
 
 ### 三、分布式推理部署场景
 
-以下说明采用当前分布式部署模式：机器人侧只启动 Edge 代理节点，算力侧单独启动 `cloud_inference.launch.py`。
+分布式模式在 robot YAML 的命名 pipeline 中声明 `execution_mode: distributed`。机器人侧启动
+Edge pipeline，算力侧单独启动 `cloud_inference.launch.py`。两端必须使用相同的 pipeline ID、
+deployment name 和 bundle identity。
 
 #### 1. Ubuntu 单机调试分布式推理（Edge + Cloud 同机）
 
-适合开发和联调，在一台 Ubuntu 机器上同时运行分布式架构中的两侧节点。
+适合开发和联调，在一台 Ubuntu 机器的两个终端运行两侧节点。先准备一个将 `policy` pipeline
+配置为 distributed 的 YAML。
 
 ```bash
+# 终端 1：Edge
 ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
+    config_path:=/absolute/path/to/so101_single_arm_distributed.yaml \
     control_mode:=model_inference \
-    execution_mode:=distributed \
-    use_sim:=true \
-    cloud_local:=true
+    use_sim:=true
+
+# 终端 2：Cloud
+ros2 launch inference_service cloud_inference.launch.py \
+    pipeline_id:=policy \
+    model_path:=/absolute/path/to/policy_bundle \
+    deployment:=cpu
 ```
 
 #### 2. Ubuntu 启动仿真环境，端侧开发板启动 NPU 推理
@@ -305,9 +313,8 @@ Ubuntu 主机负责仿真与 Edge 侧预处理/后处理；端侧开发板负责
 
 ```bash
 ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
+    config_path:=/absolute/path/to/so101_single_arm_distributed.yaml \
     control_mode:=model_inference \
-    execution_mode:=distributed \
     use_sim:=true
 ```
 
@@ -315,18 +322,22 @@ ros2 launch robot_config robot.launch.py \
 
 ```bash
 ros2 launch inference_service cloud_inference.launch.py \
-    policy_path:=/path/to/model \
-    device:=npu
+    pipeline_id:=policy \
+    model_path:=/absolute/path/to/policy_bundle \
+    deployment:=npu
 ```
 
-如需改为 GPU 服务器，只需将 `device:=npu` 替换为 `device:=cuda`。
+这里的 `npu` 是 manifest 中命名的 Torch NPU deployment，而不是 backend alias。GPU server
+使用与 edge YAML 相同的命名 deployment，例如 `cuda`。
 
 快速验证分布式链路是否打通：
 
 ```bash
-ros2 node list | grep -E 'act_inference|pure_inference'
-ros2 topic list | grep -E 'preprocessed|inference/action'
-ros2 topic hz /inference/action
+ros2 node list | grep -E 'inference_policy|inference_policy_cloud'
+ros2 action info /inference/policy/dispatch
+ros2 topic info /inference/policy/request
+ros2 topic info /inference/policy/result
+ros2 topic hz /inference/policy/heartbeat
 ```
 
 #### 3. OpenHarmony 板端作为算力侧（RK3588）
@@ -430,8 +441,6 @@ bag 目录组织、`dataset.yaml` 元信息和更多转换参数，详见 `src/d
 | `use_sim` | 是否启用仿真模式 | `false` |
 | `control_mode` | 覆盖默认控制模式（`model_inference` / `moveit_planning` / `teleop`） | 从 YAML 读取 |
 | `with_inference` | 强制启用/禁用推理服务（空则自动检测） | 空 |
-| `execution_mode` | 推理执行模式（`monolithic` / `distributed`） | `monolithic` |
-| `cloud_local` | 在分布式模式下是否同时在本机启动 Cloud 节点 | `false` |
 | `with_moveit` | 强制启用/禁用 MoveIt 核心（空则自动检测） | 空 |
 | `moveit_display` | 是否启动 MoveIt RViz 可视化界面 | `true` |
 | `record` | 是否启用录制流水线 | `false` |
@@ -439,6 +448,9 @@ bag 目录组织、`dataset.yaml` 元信息和更多转换参数，详见 `src/d
 | `record_visualizer` | 录制可视化器（`none` / `rerun`） | `none` |
 | `with_embodied` | 基础 `robot_config` launch 中保留的兼容覆盖；完整具身链路请使用 `embodied_bringup` | 空 |
 | `auto_start_controllers` | 是否在启动后自动激活控制器 | `true` |
+
+推理执行模式不是 launch 参数；它在 robot YAML 的每个命名 pipeline 中配置。分布式 Cloud 节点需
+使用 `inference_service cloud_inference.launch.py` 单独启动。
 
 ***
 

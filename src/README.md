@@ -57,7 +57,7 @@ graph TD
 一个高性能、可扩展的模型部署后端。
 - **多模型适配**: 统一封装了 ACT、Diffusion Policy、Pi0.5 及 SmolVLA 等主流具身模型。
 - **异步拉取**: 采用 Action 通讯机制，支持按需触发推理，有效节省计算资源。
-- **硬件透明**: 自动识别并利用 CUDA 进行加速，处理多路高分辨率图像输入。
+- **显式部署选择**: 通过 `inference_manifest.json` 的命名 deployment 选择 Torch CPU/CUDA/NPU 或编译后端，不进行隐式硬件切换。
 
 ### 3. 📂 `action_dispatch` — 动作调度与安全小脑
 负责将高层张量转化为机器人可执行的连贯动作。

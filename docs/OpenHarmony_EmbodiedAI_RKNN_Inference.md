@@ -1,188 +1,302 @@
 # OpenHarmony EmbodiedAI 1.0.1 RKNN NPU 推理指南
 
-本文档覆盖：将训练好的 ACT 策略模型转换为 RKNN 格式，并在 OpenHarmony EmbodiedAI 1.0.1（RK3588）开发板上通过 NPU 运行推理。
+本文档说明如何将 ACT 策略打包为包含 RKNN deployment 的统一 policy bundle，并在
+OpenHarmony EmbodiedAI 1.0.1 的 RK3588 板卡上运行单体或边云分布式推理。
 
-> **板端环境前提**：RoboFrame 发布包的 `install.sh` 已自动完成全部板端配置（rknnlite、Python pysite、系统库、SSH 等）。以下内容假设 `install.sh` 已执行完毕。
+> 板端约束：RoboOH 使用 aarch64/musl、toybox、只读 rootfs 且没有 systemd。板端命令使用
+> POSIX `sh`，环境脚本用 `. /data/roboframe/scripts/robooh_1.0.1.env` 加载。发布包的
+> `install.sh` 应已完成 RoboFrame、Python pysite 和 RKNNLite 部署。
 
-## 1. 在主机上将 ONNX 转换为 RKNN
+## 1. Bundle Contract
 
-### 1.1 创建专用 RKNN 虚拟环境
+RKNN 运行时只接受 bundle 根目录下的 `inference_manifest.json`。目录示例：
 
-rknn-toolkit2 要求 `torch<=2.4.0` + `numpy<=1.26.4`，与 lerobot 的 `torch>=2.7` + `numpy>=2.0` 冲突，需要单独的虚拟环境：
+```text
+policy_bundle/
+├── config.json
+├── policy_preprocessor.json
+├── policy_preprocessor_step_*.safetensors
+├── policy_postprocessor.json
+├── policy_postprocessor_step_*.safetensors
+├── artifacts/
+│   └── rknn/
+│       └── rk3588/
+│           └── policy-<sha-prefix>.rknn
+└── inference_manifest.json
+```
+
+Manifest 中的命名 deployment 决定 backend、target、artifact、execution 和 bindings。运行时
+不会扫描目录寻找 `*.rknn`，不会猜测输入顺序，也不会使用 launch `device` 参数选择后端。
+
+LeRobot `config.json` 和 processor 文件保持只读。不要向 `config.json` 写入 IB-Robot backend
+字段。
+
+## 2. 主机侧 RKNN 转换
+
+### 2.1 环境
+
+RKNN Toolkit 与主项目依赖可能冲突，使用独立环境：
 
 ```bash
 python3 -m venv .venv-rknn
-source .venv-rknn/bin/activate
-pip install rknn-toolkit2==2.3.2
+. .venv-rknn/bin/activate
+python -m pip install rknn-toolkit2 onnx onnxruntime
 ```
 
-### 1.2 导出并转换
+板端 RKNN runtime 版本和主机 toolkit 版本应匹配。版本不一致可能导致模型加载失败或数值
+差异，应在目标板上完成最终验证。
+
+### 2.2 从 Policy Checkpoint 导出
+
+回到仓库环境后执行 exporter。Exporter 会：
+
+1. 从 LeRobot checkpoint 导出并简化 ACT ONNX。
+2. 调用独立 RKNN Python 环境转换模型。
+3. 生成 compiler-resolved runtime ABI JSON。
+4. 将 RKNN artifact 复制到 bundle 的 `artifacts/rknn/<deployment>/`。
+5. 生成完整 bindings、SHA-256、bundle digest，并更新 `inference_manifest.json`。
+6. 使用生产 strict loader 重新验证 deployment。
 
 ```bash
-source .venv-rknn/bin/activate
+source .shrc_local
 
-# 从 ONNX 转换
-python src/model_utils/model_utils/export_onnx_rknn.py \
-    --onnx models/502000/act_ros2_rknn.onnx \
-    --output models/502000/act_ros2_rknn.rknn \
-    --dtype float16
-
-# 或直接从 policy checkpoint 转换
-python src/model_utils/model_utils/export_onnx_rknn.py \
-    --policy_path models/502000 \
-    --output models/502000/act_ros2_rknn.rknn \
-    --dtype float16
+python3 src/model_utils/model_utils/export_onnx_rknn.py \
+    --policy_path "$WORKSPACE/models/502000/pretrained_model" \
+    --convert_rknn \
+    --rknn_output /tmp/act_policy.rknn \
+    --rknn_abi_output /tmp/act_policy.rknn.abi.json \
+    --rknn_mode float16 \
+    --rknn_venv_python "$WORKSPACE/.venv-rknn/bin/python" \
+    --deployment rknn
 ```
 
-转换结果：`act_ros2_rknn.rknn`（约 114 MB，float16）。确保模型目录下只有一个 `*.rknn` 文件。
+`rknn` 是示例 deployment 名称，可以改为 `rk3588`、`robopi` 等。启动时必须使用同一个
+名称。
 
-## 2. 部署与启动
+### 2.3 从已有 ONNX 转换
 
-### 2.1 配置 YAML
+```bash
+source .shrc_local
 
-在 `robot_config` YAML（如 `so101_single_arm.yaml`）中需要修改两处：
-
-**① 定义 RKNN 模型**（`models:` 节）：
-
-```yaml
-models:
-  so101_act_rknn:
-    path: models/502000/pretrained_model   # 模型目录路径（绝对或相对均可）
-    policy_type: act
-    device: rknn                            # 指定 RKNN 后端
-    lerobot_norm_mode: range_m100_100
+python3 src/model_utils/model_utils/export_onnx_rknn.py \
+    --onnx /path/to/act_policy.onnx \
+    --bundle_root "$WORKSPACE/models/502000/pretrained_model" \
+    --convert_rknn \
+    --rknn_output /tmp/act_policy.rknn \
+    --rknn_abi_output /tmp/act_policy.rknn.abi.json \
+    --rknn_mode float16 \
+    --rknn_venv_python "$WORKSPACE/.venv-rknn/bin/python" \
+    --deployment rknn
 ```
 
-**② 选择该模型**（`control_modes.model_inference.inference.model`）：
+`--onnx --convert_rknn` 必须同时提供 `--bundle_root`，因为 exporter 需要读取 LeRobot
+metadata，并验证 runtime ABI 是否与模型 semantic features 一致。
+
+### 2.4 验证 Manifest
+
+```bash
+source .shrc_local
+PYTHONPATH=src/inference_manifest \
+python3 -c "from inference_manifest import load_inference_manifest; print(load_inference_manifest('$WORKSPACE/models/502000/pretrained_model', 'rknn').fingerprint)"
+```
+
+不要手工修改 artifact path、binding、SHA-256 或 bundle digest。模型或 processor 文件变化后，
+重新运行 exporter。
+
+## 3. Robot YAML
+
+推理配置位于 `control_modes.<mode>.inference.pipelines`：
 
 ```yaml
 control_modes:
   model_inference:
     inference:
       enabled: true
-      model: so101_act_rknn    # ← 改为上面定义的模型名（原来是 so101_act）
+      pipelines:
+        policy:
+          model_path: models/502000/pretrained_model
+          deployment: rknn
+          execution_mode: monolithic
+          request_timeout: 10.0
+          default_task: ""
+          runtime_options: {}
+    executor:
+      type: topic
+      mode: model_inference
+      inference_pipeline: policy
+      queue_size: 100
+      watermark_threshold: 50
+      control_frequency: 20.0
 ```
 
-### 2.2 两种运行方式
+相对 `model_path` 只相对于绝对路径环境变量 `WORKSPACE` 解析。板端发布环境若没有合适的
+`WORKSPACE`，使用绝对路径，例如 `/data/models/502000/pretrained_model`。
 
-根据是否使用真实硬件，有两种运行方式：
+默认 pipeline endpoints：
 
-#### 方式一：分布式（Ubuntu 仿真 + 板端 NPU 推理）
+| 接口 | `policy` pipeline 默认值 |
+| --- | --- |
+| Action | `/inference/policy/dispatch` |
+| Reset service | `/inference/policy/reset` |
+| Health | `/inference/policy/health` |
+| Action output | `/actions/policy` |
+| 分布式 request | `/inference/policy/request` |
+| 分布式 result | `/inference/policy/result` |
+| 分布式 heartbeat | `/inference/policy/heartbeat` |
 
-Ubuntu 主机负责 Gazebo 仿真与 Edge 侧预处理/后处理；端侧开发板负责 NPU 纯推理。两台机器必须位于同一局域网，设置相同的 `ROS_DOMAIN_ID`。
+## 4. 板端独立验证
 
-**Ubuntu 主机（仿真 + Edge）**：
+板端启动前确认 bundle 已部署到 `/data` 可写区域：
+
+```sh
+. /data/roboframe/scripts/robooh_1.0.1.env
+export ROS_DOMAIN_ID=51
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+test -f /data/models/502000/pretrained_model/inference_manifest.json
+python3 -c "from rknnlite.api import RKNNLite; print('RKNNLite OK')"
+```
+
+使用最小化 launch 验证一个 deployment：
+
+```sh
+ros2 launch hardware_mock hardware_mock.launch.py robot_config:=so101_single_arm &
+
+ros2 launch inference_service eval_inference.launch.py \
+    robot_config_path:=/data/roboframe/install/robot_config/share/robot_config/config/robots/so101_single_arm.yaml \
+    model_path:=/data/models/502000/pretrained_model \
+    deployment:=rknn \
+    pipeline_id:=policy
+```
+
+另一个终端触发推理：
+
+```sh
+. /data/roboframe/scripts/robooh_1.0.1.env
+export ROS_DOMAIN_ID=51
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+ros2 action send_goal /inference/policy/dispatch \
+    ibrobot_msgs/action/DispatchInfer \
+    "{obs_timestamp: {sec: 0, nanosec: 0}, prompt: '', inference_id: 'rknn-test-001', deadline: {sec: 0, nanosec: 0}}"
+```
+
+结果应包含 `success: true`、实际 `chunk_size`、`pipeline_id: policy`、非空
+`deployment_fingerprint` 和 `backend_latency_ms`。
+
+## 5. 单板真实硬件闭环
+
+Robot YAML 中的 `policy` pipeline 必须选择 RKNN deployment 且
+`execution_mode: monolithic`。然后启动完整系统：
+
+```sh
+. /data/roboframe/scripts/robooh_1.0.1.env
+export ROS_DOMAIN_ID=51
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+ros2 launch robot_config robot.launch.py \
+    config_path:=/data/roboframe/install/robot_config/share/robot_config/config/robots/so101_single_arm.yaml \
+    control_mode:=model_inference \
+    use_sim:=false
+```
+
+典型进程：
+
+```text
+pipeline_policy_node        RKNN pipeline、processor、Action server
+action_dispatcher_node      action chunk 队列与控制频率
+usb_cam_node_exe            top / wrist cameras
+so101_hardware              ros2_control hardware interface
+```
+
+真机需要内核启用 `CONFIG_USB_ACM=y`，并完成机械臂与相机配置。
+
+## 6. 边云分布式 RKNN
+
+Execution mode 属于 YAML，不是 launch override。Edge 使用的 robot YAML：
+
+```yaml
+pipelines:
+  policy:
+    model_path: /absolute/edge/path/to/policy_bundle
+    deployment: rknn
+    execution_mode: distributed
+    request_timeout: 10.0
+```
+
+Edge bundle 可以不包含 cloud-only compiled artifact，但必须有匹配的
+`inference_manifest.json` 和本地 processor/tokenizer 文件。Edge 与 cloud 的 bundle digest、
+deployment name 和 deployment fingerprint 必须一致。
+
+Ubuntu edge：
 
 ```bash
+source .shrc_local
+export ROS_DOMAIN_ID=51
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
 ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
+    config_path:=/absolute/path/to/so101_single_arm_distributed.yaml \
     control_mode:=model_inference \
-    execution_mode:=distributed \
     use_sim:=true
 ```
 
-**端侧开发板（NPU Cloud 节点）**：
+OpenHarmony cloud：
 
-```bash
-source /data/roboframe/scripts/robooh_1.0.1.env
+```sh
+. /data/roboframe/scripts/robooh_1.0.1.env
+export ROS_DOMAIN_ID=51
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
 ros2 launch inference_service cloud_inference.launch.py \
-    policy_path:=<your_model_path> \
-    device:=rknn
+    pipeline_id:=policy \
+    model_path:=/data/models/502000/pretrained_model \
+    deployment:=rknn
 ```
 
-#### 方式二：单板全链路（板端独立运行）
+握手成功前 edge 不发送 inference tensors。Cloud 重启、heartbeat 超时、fingerprint 改变或
+backend 离开 `READY` 会使 session 失效；恢复后必须重新握手。
 
-开发板独立运行完整闭环：摄像头采集 → NPU 推理 → 机械臂控制，无需外接 Ubuntu 主机。
+## 7. 机械臂校准
 
-```
-开发板 (RK3588, OpenHarmony EmbodiedAI 1.0.1)
-├── usb_cam_node_exe × 2          (top + wrist 相机, MJPEG 640x480)
-├── static_transform_publisher × 4 (TF: base→camera, gripper→camera, optical)
-├── lerobot_policy_node × 1        (RKNN NPU 推理, ACT 策略)
-├── action_dispatcher_node × 1     (动作分发, 20Hz)
-└── so101_hardware                 (ros2_control, /dev/ttyACM0)
-     ↳ arm_position_controller / gripper_position_controller
-```
+首次使用前在板端执行：
 
-数据流：`相机 Image → 推理节点 (NPU ~500ms) → Action Dispatcher → Joint Commands → 机械臂`
-
-**前置条件**：内核已启用 `CONFIG_USB_ACM=y`（SO-101 机械臂）。预编译内核镜像获取详见 [README.OpenHarmony](../README.OpenHarmony.md) FAQ。
-
-```bash
-source /data/roboframe/scripts/robooh_1.0.1.env
-
-# 清理残留进程
-pkill -9 -f "ros2 launch\|lerobot_policy_node\|action_dispatcher_node\|usb_cam_node_exe"
-
-# 启动
-ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
-    use_sim:=false \
-    control_mode:=model_inference
-```
-
-## 3. 机械臂校准
-
-首次使用前必须在板端执行校准（交互式操作，需要手动转动机械臂关节）：
-
-```bash
-ssh root@<board_ip>
-source /data/roboframe/scripts/robooh_1.0.1.env
-
+```sh
+. /data/roboframe/scripts/robooh_1.0.1.env
 ros2 run so101_hardware calibrate_arm --arm follower --port /dev/ttyACM0
 ```
 
-校准 JSON 保存在 `~/.calibrate/so101_follower_calibrate.json`（SSH 环境 `HOME=/data/root`）。
+校准 JSON 通常保存在 `$HOME/.calibrate/so101_follower_calibrate.json`。SSH 和 HDC 的
+`HOME` 可能不同，robot YAML 中的校准路径必须解析到实际文件。
 
-如果通过 HDC shell（`HOME=/`）运行 launch，推理节点会找不到校准文件，需要符号链接：
+## 8. Runtime ABI
 
-```bash
-mkdir -p /.calibrate
-ln -sf /data/root/.calibrate/so101_follower_calibrate.json /.calibrate/so101_follower_calibrate.json
-```
+RKNN 编译器可能重排输入，因此 manifest bindings 同时记录 semantic、runtime name/index、
+dtype、shape 和图像 layout。Runtime 按 binding 映射输入，不依赖 `config.json` 插入顺序或
+固定 output index。
 
-## 4. 推理管线说明
+图像只有在 binding 声明 `layout: NHWC` 时才执行 NCHW-to-NHWC 转换。状态、token、mask、
+action 或其他非图像 tensor 不会因为是 4-D tensor 就自动转置。
 
-RKNN 后端与其他后端（CPU/GPU）共享同一套预处理/推理/后处理管线：
-
-- **预处理**：`LeRobotPreprocessor` 根据 `config.json` 对观测值做归一化（图像归一化 + 状态归一化）
-- **推理**：`PureInferenceEngine` 检测到 `device: rknn` 后，通过 `RKNNPolicyWrapper` → `RKNNRuntimeSession` 加载 `.rknn` 模型并在 NPU 上执行推理。RKNN 专属的 NHWC 布局转换在 session 内部自动完成
-- **后处理**：`LeRobotPostprocessor` 将推理输出反归一化为关节角度
-
-## 5. 预期输出与排障
-
-### 预期输出
-
-```
-[usb_cam_node_exe-1] [INFO] [top_camera]: Starting 'top' (/dev/video20) at 640x480 via mmap (mjpeg2rgb) at 30 FPS
-[usb_cam_node_exe-2] [INFO] [wrist_camera]: Starting 'wrist' (/dev/video22) at 640x480 via mmap (mjpeg2rgb) at 60 FPS
-[lerobot_policy_node-7] [INFO] [act_inference_node]: Using inference_backend=rknn, tensor_device=cpu
-[lerobot_policy_node-7] [INFO] [act_inference_node]: DispatchInfer Action Server ready
-[lerobot_policy_node-7] [INFO] [act_inference_node]: ✓ First inference complete (monolithic): total=~500ms
-[action_dispatcher_node-8] [INFO] [action_dispatcher]: ✓ First inference received: chunk=100
-```
-
-### 已知 warning 与排障
+## 9. 排障
 
 | 现象 | 原因 | 处理 |
-|------|------|------|
-| `robot_description not found` | URDF 包未部署，ros2_control 不需要它 | 忽略 |
-| `Camera calibration file not found` | 未做相机内参标定 | 忽略 |
-| `Query dynamic range failed (RKNN_ERR_MODEL_INVALID)` | 静态 shape 模型的正常警告 | 忽略 |
-| `Ignoring unexpected goal response` | DDS 残留，重启前未清理进程 | 启动前 `pkill` |
-| `unknown control 'white_balance_temperature_auto'` | USB 摄像头不支持该 V4L2 控制 | 忽略 |
-| `/dev/ttyACM0` 不存在 | 内核缺少 `CONFIG_USB_ACM=y` | 刷入预编译内核，见 [README.OpenHarmony](../README.OpenHarmony.md) FAQ |
-| `RKNN model file not found` | 模型目录下没有 `.rknn` 文件 | 确认模型文件已推送到 YAML 配置的 `path` 目录 |
-| `Calibration file not found` | SSH vs HDC 的 HOME 不同 | 符号链接校准文件（§3） |
-| 推理节点 SIGSEGV | env 未正确加载 | 确认 `source robooh_1.0.1.env` 已执行 |
-| `input[0] need 2dims input, but 4dims` | 输入顺序不匹配 | RKNN 编译器会重排输入，重新导出后需验证 |
+| --- | --- | --- |
+| `Deployment 'rknn' is not present` | 启动名称与 manifest 不一致 | 查看 `deployments` keys，并使用正确名称或重新导出 |
+| `SHA-256 mismatch` | artifact 或 processor 在 manifest 生成后改变 | 重新运行 owning exporter；不要手改 hash |
+| `Bundle digest mismatch` | `bundle.files` 与声明 digest 不一致 | 重新生成完整 manifest |
+| binding shape/name mismatch | compiler ABI 与 LeRobot feature contract 不一致 | 用同一模型重新转换并保留 ABI JSON |
+| RKNN dependency unavailable | RKNNLite 未部署或环境未加载 | `. robooh_1.0.1.env`，检查 `from rknnlite.api import RKNNLite` |
+| runtime/toolkit version mismatch | 主机 toolkit 与板端 runtime 不兼容 | 使用与板端 runtime 匹配的 toolkit 重建模型 |
+| `/dev/ttyACM0` 不存在 | 内核缺少 USB ACM | 启用 `CONFIG_USB_ACM=y` 并刷入内核 |
+| Calibration file not found | `HOME` 或 YAML 路径不一致 | 使用绝对路径或修正校准文件位置 |
+| 推理进程 SIGSEGV | 板端环境或 native library 不完整 | 确认已加载 RoboOH 环境并检查 RKNN runtime library |
 
-## 6. RKNN 运行时技术细节
+日志中应出现类似：
 
-### 输入顺序
+```text
+Unified pipeline started: id=policy, mode=monolithic, deployment=rknn, backend=rknn
+```
 
-RKNN 编译器会重排模型输入。ACT 模型原始 ONNX 输入为 `[cam_high, cam_left, state]`，转换后的 RKNN 模型期望 `[state, cam_high, cam_left]`。重新导出模型后务必通过测试推理验证输入顺序。
-
-### NHWC 布局
-
-RKNNLite 期望 4D 图像输入为 NHWC（1,H,W,C）布局。`RKNNRuntimeSession` 内部自动做 NCHW→NHWC 转换，无需手动处理。如果绕过 session 直接调用 `RKNNLite.inference()`，需自行确保 NHWC。
+具体 latency 取决于模型、RKNN toolkit/runtime 版本、NPU 负载、图像尺寸和 processor 开销，
+不应把单次测量值作为固定保证。

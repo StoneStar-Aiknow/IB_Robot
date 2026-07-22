@@ -1,271 +1,271 @@
 ---
 name: hmm-convert
-description: "Convert ACT / PI05 models to Houmo HMM (.hmm) format for XH2 NPU (LQ50 / M50) deployment. Use when user needs to 'convert to hmm', 'houmo', 'xh2', '后摩', 'tcim', 'xhquant', 'pi05 hmm', 'act hmm', 'LQ50', 'M50', 'HMM 模型转换', 'w8a8', 'sefp', 'hmonnx'. Triggers for Houmo NPU deployment, XH2 compilation, PI05 multi-module HMM pipeline."
+description: "Package PI0.5 or SmolVLA models as Houmo HMM (.hmm) deployments for XH2 NPU (LQ50 / M50). Use when users mention 'convert to hmm', 'houmo', 'xh2', '后摩', 'tcim', 'xhquant', 'pi05 hmm', 'smolvla hmm', 'LQ50', 'M50', 'HMM 模型转换', 'w8a8', 'sefp', 'hmonnx', or package-hmm-deployment. Explicitly reject ACT HMM requests and route ACT to torch, ascend, hisilicon, or rknn."
 ---
 
 # HMM Model Conversion Skill
 
-Convert ACT / PI05 policy models to Houmo HMM (`.hmm`) format for XH2 NPU (LQ50 / M50) deployment.
+Package Houmo compiler outputs for PI0.5 and SmolVLA into strict IB-Robot HMM deployments for XH2 NPU (LQ50 / M50).
 
-## Scope
+## Supported Matrix
 
-This skill covers:
+| Policy | HMM support | Graph |
+|--------|-------------|-------|
+| PI0.5 | Supported | vision + embedding + prefill + action projections + time MLP + decode |
+| SmolVLA | Supported | vision + embedding/state projection + prefill + action |
+| ACT | Unsupported | Reject; use `torch`, `ascend`, `hisilicon`, or `rknn` |
 
-- **ACT → HMM** (single-module, in-repo script `export_onnx_hmm.py`)
-- **PI05 → HMM** (6-module split, external Houmo SDK `houmo-examples/pi05/demo.py`)
+Never restore or recommend the removed ACT single-module HMM path, `config.hmm.json`, `HMM_MODEL_PATH`, directory scanning, `HMMRuntimeSession`, or `device:=hmm`.
 
-Do **not** use this skill for:
+## Required Workflow
 
-- RKNN conversion → use `rknn-convert`
-- Ascend OM conversion → use `pi05_export/` package
-- ONNX export for non-HMM targets → use `export_onnx_rknn.py` or `export_onnx_atc.py`
+1. Use Houmo's current `houmo-examples-xh2` workflow to export, quantize, and compile the supported policy modules.
+2. Preserve the compiler-emitted TCIM `model.json` next to each `.hmm`; it is the source of runtime names, indices, dtypes, and shapes.
+3. Keep the original LeRobot bundle metadata read-only: `config.json`, processor JSON/state, tokenizer assets, and policy metadata.
+4. Create a path-only packaging spec for `package-hmm-deployment`.
+5. Run the packager to write or update the bundle's only deployment manifest: `inference_manifest.json`.
+6. Configure a named inference pipeline that selects the generated deployment.
+7. Validate on the target or approved TCIM mocks.
 
-## Critical Workflow Split
-
-| Policy | Modules | Conversion Tool | In-repo Script |
-|--------|---------|-----------------|----------------|
-| ACT | 1 (policy) | `export_onnx_hmm.py` | Yes |
-| PI05 | 6 + embedding | `houmo-examples/pi05/demo.py` (external) | No (runtime + manifest contract only) |
-
-### Architecture Difference
-
-- **ACT HMM**: single `.hmm` module, loaded by `HMMRuntimeSession`, mirrors RKNN's single-model interface
-- **PI05 HMM**: 6 `.hmm` modules + 1 `embedding.pt`, loaded by `PI05HMMRuntimeSession` → `PI05HMMModel`, which orchestrates the denoise loop on host CPU with KV-cache handoff by device-pointer sharing between prefill and decode modules
+The packager owns artifact copies, bindings, execution order, device links, SHA-256 values, bundle digest, and strict-loader verification. Do not hand-edit generated manifest hashes or tensor bindings.
 
 ## Environment
 
-### Houmo Toolchain (required for both ACT and PI05)
-
-| Component | Source | Version |
-|-----------|--------|---------|
-| `xhquant` | `developer.houmoai.com/resources_v2` | ≥ xh2a_1.3.0 |
-| `tcim` | bundled with `houmo-examples-xh2` | ≥ xh2a_1.3.0 |
-| `houmo-examples-xh2` | `developer.houmoai.com/resources_v2` | v1.3.0 |
-| Driver | `houmo-drv-xh2-1.3.0-1.aarch64.rpm` | V1.3.0 |
-| Firmware | `M50_M2_fw-xh2_v1.3.0.tar.gz` | V1.3.0 |
-
-Driver install guide: `docs/houmo_lq50_driver_install_oee.md`
-
-### Python Environment
-
-The Houmo toolchain (`xhquant` / `tcim`) has its own Python dependency tree that may conflict with LeRobot. Use a **dedicated venv** for HMM conversion:
+The Houmo compiler toolchain may conflict with the IB-Robot Python environment. Use a dedicated venv or Houmo's current 24.04 toolchain image. Do not install `xhquant` or `tcim` into the main venv.
 
 ```bash
-cd <project_root>
 python3 -m venv .venv-hmm
 source .venv-hmm/bin/activate
-pip install xhquant tcim onnx onnxsim torch  # torch version per xhquant requirements
+pip install xhquant tcim onnx onnxsim torch
 ```
 
-**MUST NOT** install `xhquant` / `tcim` into the main venv.
+Use `source .shrc_local` before running IB-Robot packaging, manifest validation, ROS, or project commands.
 
-## ACT → HMM Conversion
+## Compiler Outputs
 
-### Step 1: Export ONNX (main venv)
+### PI0.5
 
-```bash
-cd <project_root>
-source .shrc_local
-python3 src/model_utils/model_utils/export_onnx_hmm.py \
-    --policy_path models/<your_model>/pretrained_model
-```
+Required compiler outputs:
 
-Produces `act_ros2_hmm.onnx` in the policy directory.
+| Role | Artifact pair |
+|------|---------------|
+| vision | vision `.hmm` + TCIM `model.json` |
+| prefill | prefill `.hmm` + TCIM `model.json` |
+| action_in_proj | projection `.hmm` + TCIM `model.json` |
+| time_mlp | time MLP `.hmm` + TCIM `model.json` |
+| decode | expert decode `.hmm` + TCIM `model.json` |
+| action_out_proj | projection `.hmm` + TCIM `model.json` |
+| embedding | `embedding.pt` |
 
-If the ONNX already exists, pass `--onnx <path>` to skip export and only strip + simplify.
+The packager requires the exact PI0.5 role set. Prefill and decode cache inputs must have identical names, dtypes, and shapes. Device links are input-sourced: prefill input -> decode input.
 
-### Step 2: PTQ Quantize + Compile (.venv-hmm)
+### SmolVLA
 
-```bash
-cd <project_root>
-source .venv-hmm/bin/activate
-python3 src/model_utils/model_utils/export_onnx_hmm.py \
-    --onnx models/<your_model>/pretrained_model/act_ros2_hmm.onnx \
-    --convert_hmm \
-    --hmm_target xh2 \
-    --hmm_quant_type w8a8h1_sefp \
-    --hmm_ncore 2 \
-    --hmm_opt_level O2
-```
+Required compiler outputs:
 
-This runs the two-stage Houmo pipeline:
+| Role | Artifact pair |
+|------|---------------|
+| vision | vision `.hmm` + TCIM `model.json` |
+| prefill | prefill `.hmm` + TCIM `model.json` |
+| action | action `.hmm` + TCIM `model.json` |
+| embedding | `token_embedding.pt` |
+| state_projection | `state_projection.pt` |
 
-1. **PTQ** (`xhquant.api.convert_onnx_to_hmonnx`): quantizes the ONNX with `QuantScheme(DeviceType.XH2a, "w8a8h1_sefp")` using random calibration tensors → `<name>.hmonnx.onnx`
-2. **Compile** (`tcim.build_from_hmonnx`): compiles to `.hmm` with `target="xh2", ncore=2, opt_level="O2"` → `model.hmm`
+The current runtime graph is `vision -> embedding -> prefill -> action`; it does not execute a standalone decode role. Device links are output-sourced: prefill output -> action input.
 
-### Step 3: Verify Manifest
+#### SmolVLA v1.3.0 Export Requirements
 
-The script auto-generates `config.hmm.json`:
+When using `houmo-examples-xh2` v1.3.0, verify that the LLM KV-cache exporter loads the fine-tuned
+`SmolVLAPolicy` before attempting to construct a standalone `SmolVLMWithExpertModel`. The upstream
+script may load the base VLM successfully first and therefore never consume `model.safetensors` from
+the policy bundle. That produces a valid-looking prefill HMM and token embedding from the base model,
+not the requested policy checkpoint.
+
+Required checks after export:
+
+- `work_dirs/<llm>_kvcache/meta_info.json` must contain `"load_mode": "policy"`.
+- `token_embedding.pt["weight"]` must equal
+  `model.safetensors["model.vlm_with_expert.vlm.model.text_model.embed_tokens.weight"]` after the
+  exporter's BF16-to-FP16 conversion.
+- Extract `state_projection.pt` from the same checkpoint using `model.state_proj.weight` and
+  `model.state_proj.bias`; do not reuse the projection from another policy bundle.
+- Re-export action after changing the prefill export, then recompile both HMONNX files so the cache
+  ABI and checkpoint provenance remain paired.
+
+The v1.3.0 toolchain image is compatible with the following isolated dependency versions used by
+the verified workflow: `transformers==4.51.0`, `tokenizers==0.21.4`, and `diffusers==0.35.2`.
+Newer `transformers` and `diffusers` releases can break the bundled `hmquant-xh2` or LeRobot imports.
+The exporter resolves `vlm_model_name` relative to its working directory, so expose the bundle's
+`HuggingFaceTB/` directory there or use an equivalent local path without modifying `config.json`.
+
+## Packaging Spec
+
+Use one JSON spec containing only source paths. Relative paths resolve from the spec directory.
+
+PI0.5 example:
 
 ```json
 {
-  "schema_version": 1,
-  "policy_type": "act",
-  "backend": "hmm",
-  "artifacts": {"policy": "model.hmm"},
-  "execution": ["policy"]
-}
-```
-
-Verify the output directory contains:
-
-```
-<policy_dir>/
-├── model.hmm              # compiled HMM module
-├── config.hmm.json        # manifest
-├── tcim_work/             # compiler intermediates (can be deleted)
-└── act_ros2_hmm.onnx      # source ONNX (keep for re-quantization)
-```
-
-### Quantization Modes
-
-| Mode | Description | Use Case |
-|------|-------------|----------|
-| `w8a8h1_sefp` | Weight 8-bit, Activation 8-bit, hardware sefp (default) | General purpose, good accuracy/speed balance |
-| `w16a16_sefp` | Weight 16-bit, Activation 16-bit | Higher accuracy, larger model |
-
-## PI05 → HMM Conversion
-
-PI05 is split into 6 modules by the Houmo toolchain. The conversion is performed **externally** using `houmo-examples/pi05/demo.py` — this repo provides only the runtime contract (`PI05HMMModel.py`) and manifest format.
-
-### Step 1: Prepare Environment
-
-```bash
-# Install houmo-examples SDK
-unzip houmo-examples-xh2_v1.3.0.zip -d /opt/houmo-examples
-cd /opt/houmo-examples/pi05
-# Follow the demo.py setup instructions for dependencies
-```
-
-### Step 2: Run External Compilation
-
-The `houmo-examples/pi05/demo.py` script performs:
-
-1. **Split PI05** into 6 subgraphs:
-
-   | Module | Subgraph | Output File |
-   |--------|----------|-------------|
-   | vision | SigLIP image encoder | `siglip.hmm` |
-   | prefill | Gemma-2B prefill (KV-cache init) | `gemma_2b_prefill.hmm` |
-   | decode | Gemma-300M expert decode | `gemma_expert_300m_decode.hmm` |
-   | time_mlp | Time embedding MLP | `time_mlp.hmm` |
-   | action_in_proj | Action input projection | `action_in_proj.hmm` |
-   | action_out_proj | Action output projection | `action_out_proj.hmm` |
-
-2. **PTQ quantize** each module via `xhquant` (XH2a target)
-3. **Compile** each via `tcim.build_from_hmonnx`
-4. **Dump** Gemma token-embedding table to `embedding.pt`
-
-### Step 3: Assemble Output Directory
-
-Copy all 7 artifacts into a single directory:
-
-```
-<pi05_policy_dir>/
-├── model/
-│   ├── siglip.hmm
-│   ├── gemma_2b_prefill.hmm
-│   ├── gemma_expert_300m_decode.hmm
-│   ├── time_mlp.hmm
-│   ├── action_in_proj.hmm
-│   ├── action_out_proj.hmm
-│   └── embedding.pt
-├── config.hmm.json        # manifest (see below)
-└── config.json            # PI05 policy config (chunk_size, etc.)
-```
-
-### Step 4: Write Manifest
-
-Create `config.hmm.json` manually (the external demo does not generate it):
-
-```json
-{
-  "schema_version": 1,
-  "policy_type": "pi05",
-  "backend": "hmm",
-  "artifacts": {
-    "vision": "model/siglip.hmm",
-    "prefill": "model/gemma_2b_prefill.hmm",
-    "decode": "model/gemma_expert_300m_decode.hmm",
-    "time_mlp": "model/time_mlp.hmm",
-    "action_in_proj": "model/action_in_proj.hmm",
-    "action_out_proj": "model/action_out_proj.hmm",
-    "embedding": "model/embedding.pt"
+  "vision": {
+    "artifact": "/compiler/pi05/vision.hmm",
+    "abi": "/compiler/pi05/vision/model.json"
   },
-  "execution": ["vision", "prefill", "decode", "time_mlp", "action_in_proj", "action_out_proj"]
+  "embedding": "/compiler/pi05/embedding.pt",
+  "roles": {
+    "prefill": {
+      "artifact": "/compiler/pi05/prefill.hmm",
+      "abi": "/compiler/pi05/prefill/model.json"
+    },
+    "action_in_proj": {
+      "artifact": "/compiler/pi05/action_in_proj.hmm",
+      "abi": "/compiler/pi05/action_in_proj/model.json"
+    },
+    "time_mlp": {
+      "artifact": "/compiler/pi05/time_mlp.hmm",
+      "abi": "/compiler/pi05/time_mlp/model.json"
+    },
+    "decode": {
+      "artifact": "/compiler/pi05/decode.hmm",
+      "abi": "/compiler/pi05/decode/model.json"
+    },
+    "action_out_proj": {
+      "artifact": "/compiler/pi05/action_out_proj.hmm",
+      "abi": "/compiler/pi05/action_out_proj/model.json"
+    }
+  },
+  "vision_layout": "NCHW"
 }
 ```
 
-Key rules:
-- `embedding` is in `artifacts` but **NOT** in `execution`
-- `execution` lists exactly 6 modules in the order they appear in the pipeline
-- Artifact paths are relative to the manifest directory
+SmolVLA example:
 
-### Known Gap
-
-The `PI05HMMModel` runtime initializes `action_proj` / `action_out_fc` CPU Linear layers with **random weights** (inherited from the upstream houmo-examples demo). Real deployment must load trained projection weights. Until then, action quality is undefined.
-
-## Runtime Dispatch
-
-HMM models are loaded based on `policy_type` + `backend`:
-
-| Policy | Backend | Runtime Session | Manifest |
-|--------|---------|-----------------|----------|
-| ACT | `hmm` | `HMMRuntimeSession` | `config.hmm.json` (1 artifact) |
-| PI05 | `hmm` | `PI05HMMRuntimeSession` → `PI05HMMModel` | `config.hmm.json` (7 artifacts) |
-
-Launch with `device:=hmm`:
-
-```bash
-ros2 launch inference_service eval_inference.launch.py \
-    robot_config_path:=<yaml> \
-    policy_path:=<pi05_policy_dir> \
-    device:=hmm
+```json
+{
+  "vision": {
+    "artifact": "/compiler/smolvla/vision.hmm",
+    "abi": "/compiler/smolvla/vision/model.json"
+  },
+  "embedding": "/compiler/smolvla/token_embedding.pt",
+  "state_projection": "/compiler/smolvla/state_projection.pt",
+  "roles": {
+    "prefill": {
+      "artifact": "/compiler/smolvla/prefill.hmm",
+      "abi": "/compiler/smolvla/prefill/model.json"
+    },
+    "action": {
+      "artifact": "/compiler/smolvla/action.hmm",
+      "abi": "/compiler/smolvla/action/model.json"
+    }
+  },
+  "vision_layout": "NCHW"
+}
 ```
 
-## Manifest Validation
+## Run The Packager
 
-The `load_compiled_manifest()` function in `compiled_policy.py` validates:
-- `backend` field matches `"hmm"`
-- `policy_type` matches `"act"` or `"pi05"`
-- All artifacts in `execution` list exist and have `.hmm` suffix
-- All required artifacts exist (PI05 also checks `embedding`)
+```bash
+source .shrc_local
+package-hmm-deployment \
+    --bundle-root models/<policy_bundle> \
+    --deployment hmm_lq50 \
+    --target-soc lq50 \
+    --target-runtime tcim-lite \
+    --spec /path/to/hmm-package-spec.json
+```
 
-If validation fails, the error message names the missing artifact.
+Source form:
+
+```bash
+source .shrc_local
+python3 -m model_utils.hmm_export \
+    --bundle-root models/<policy_bundle> \
+    --deployment hmm_lq50 \
+    --target-soc lq50 \
+    --target-runtime tcim-lite \
+    --spec /path/to/hmm-package-spec.json
+```
+
+Success means `<bundle-root>/inference_manifest.json` was written and accepted by the production strict loader.
+
+## Named Pipeline Configuration
+
+```yaml
+control_modes:
+  model_inference:
+    inference:
+      enabled: true
+      pipelines:
+        policy:
+          model_path: models/<policy_bundle>
+          deployment: hmm_lq50
+          execution_mode: monolithic
+          request_timeout: 10.0
+          default_task: "pick up the object"
+    executor:
+      type: topic
+      mode: model_inference
+      inference_pipeline: policy
+```
+
+Do not configure backend-valued `device`, a global model table, or a per-backend manifest filename.
+
+## Validation
+
+Run focused tests after changing HMM packaging or docs:
+
+```bash
+source .shrc_local
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+PYTHONPATH="$PWD/src/inference_manifest:$PWD/src/inference_service:$PWD/src/model_utils:$PYTHONPATH" \
+pytest -q \
+    src/model_utils/test/test_hmm_export.py \
+    src/inference_service/tests/test_hmm_backend.py \
+    src/inference_service/tests/test_backend_contract.py
+```
 
 ## Troubleshooting
 
-### Issue: `xhquant` or `tcim` ImportError
-**Cause**: Houmo SDK not installed or wrong Python environment
-**Fix**: Use a dedicated `.venv-hmm`, install `xhquant` + `tcim` per the Houmo SDK docs
+### ACT HMM request
 
-### Issue: PTQ quantization accuracy degradation
-**Cause**: Random calibration tensors may not represent real data distribution
-**Fix**: For production, replace random calibration with real data samples; consider `w16a16_sefp` for higher accuracy
+Reject the request as unsupported. Offer ACT deployments on `torch`, `ascend`, `hisilicon`, or `rknn`; do not provide a compatibility workflow.
 
-### Issue: `tcim.build_from_hmonnx` compilation fails
-**Cause**: Unsupported ONNX operator or shape mismatch
-**Fix**: Check the ONNX with `onnx.checker.check_model()`; simplify with `onnxsim` first; check `tcim_work/` for compiler error logs
+### TCIM ABI mismatch
 
-### Issue: PI05 manifest validation fails
-**Cause**: Missing artifact or wrong path in `config.hmm.json`
-**Fix**: Ensure all 6 `.hmm` files + `embedding.pt` exist at the declared paths; paths are relative to the manifest directory
+Use the `model.json` emitted for the exact `.hmm` file. Do not infer tensor order from Python dictionaries or copy ABI metadata from another build.
 
-### Issue: PI05 actions are garbage
-**Cause**: `action_proj` / `action_out_fc` using random weights (known gap)
-**Fix**: Load trained projection weights into these CPU Linear layers (requires modifying `PI05HMMModel.__init__`)
+### Manifest hash mismatch
 
-## When to Use This Skill
+Rerun `package-hmm-deployment`. Do not edit artifact SHA-256 or bundle digest manually.
 
-Invoke this skill when:
+### External tokenizer dependency
 
-- Converting ACT models to Houmo HMM format (`export_onnx_hmm.py`)
-- Setting up PI05 HMM deployment (manifest, artifact layout)
-- Troubleshooting Houmo xhquant / tcim compilation issues
-- Understanding HMM manifest format (`config.hmm.json`)
+Vendor tokenizer/processor assets into the bundle and update the LeRobot metadata to reference the local directory before packaging.
 
-Do **not** invoke for:
+### Board runtime initialization
 
-- RKNN conversion (use `rknn-convert`)
-- Ascend OM conversion (use `pi05_export/`)
-- HMM runtime debugging on the board (use `oh-constraints`)
+Read `oh-constraints` first. Source the RoboFrame environment and `scripts/setup/houmo_hmm_env.sh`; native Houmo 1.3 uses `TCIM_BACKEND=xh2` and `HOUMO_TARGET=xh2`. `Xh2HalBackend` is only for the legacy runtime.
+
+## References
+
+- `docs/Houmo_HMM_Conversion.md`
+- `src/model_utils/model_utils/hmm_export.py`
+- `src/model_utils/model_utils/inference_manifest_export.py`
+- `src/inference_service/inference_service/backends/hmm/backend.py`
+- `src/model_utils/test/test_hmm_export.py`
+- `src/inference_service/tests/test_hmm_backend.py`
+
+## When To Use This Skill
+
+Use for:
+
+- PI0.5 or SmolVLA Houmo HMM conversion and packaging
+- `xhquant`, `tcim`, `hmonnx`, LQ50, M50, or XH2 compiler troubleshooting
+- `package-hmm-deployment` specs and unified manifest generation
+- HMM execution roles, bindings, embedding artifacts, state projection, or device links
+
+Do not use for:
+
+- ACT HMM conversion; it is unsupported
+- RKNN conversion; use `rknn-convert`
+- Ascend OM conversion; use the Ascend exporter workflow
+- General OpenHarmony board operations; read `oh-constraints` and use the relevant board skill

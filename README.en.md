@@ -284,19 +284,27 @@ ros2 topic pub /cmd_pose geometry_msgs/Pose "{
 
 ### III. Distributed Inference Deployment
 
-The following uses the distributed deployment mode: the robot side runs only the Edge proxy node, while the compute side runs `cloud_inference.launch.py` separately.
+Distributed mode is declared by setting `execution_mode: distributed` on a named pipeline in robot YAML. The
+robot side starts the edge pipeline and the compute side starts `cloud_inference.launch.py`. Both sides must use
+the same pipeline ID, deployment name, and bundle identity.
 
 #### 1. Ubuntu Single-host Debug (Edge + Cloud on Same Machine)
 
-Suitable for development and integration testing, running both sides on one Ubuntu machine.
+For development, run the two sides in separate terminals on one Ubuntu host. First prepare robot YAML whose
+`policy` pipeline is distributed.
 
 ```bash
+# Terminal 1: Edge
 ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
+    config_path:=/absolute/path/to/so101_single_arm_distributed.yaml \
     control_mode:=model_inference \
-    execution_mode:=distributed \
-    use_sim:=true \
-    cloud_local:=true
+    use_sim:=true
+
+# Terminal 2: Cloud
+ros2 launch inference_service cloud_inference.launch.py \
+    pipeline_id:=policy \
+    model_path:=/absolute/path/to/policy_bundle \
+    deployment:=cpu
 ```
 
 #### 2. Ubuntu Simulation + Edge Board NPU Inference
@@ -307,9 +315,8 @@ The Ubuntu host handles simulation and Edge-side pre/post-processing; the edge b
 
 ```bash
 ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
+    config_path:=/absolute/path/to/so101_single_arm_distributed.yaml \
     control_mode:=model_inference \
-    execution_mode:=distributed \
     use_sim:=true
 ```
 
@@ -317,18 +324,22 @@ ros2 launch robot_config robot.launch.py \
 
 ```bash
 ros2 launch inference_service cloud_inference.launch.py \
-    policy_path:=/path/to/model \
-    device:=npu
+    pipeline_id:=policy \
+    model_path:=/absolute/path/to/policy_bundle \
+    deployment:=npu
 ```
 
-For a GPU server, replace `device:=npu` with `device:=cuda`.
+Here `npu` is a named Torch NPU deployment in the manifest, not a backend alias. A GPU server uses the same
+named deployment as the edge YAML, for example `cuda`.
 
 Quick verification of the distributed pipeline:
 
 ```bash
-ros2 node list | grep -E 'act_inference|pure_inference'
-ros2 topic list | grep -E 'preprocessed|inference/action'
-ros2 topic hz /inference/action
+ros2 node list | grep -E 'inference_policy|inference_policy_cloud'
+ros2 action info /inference/policy/dispatch
+ros2 topic info /inference/policy/request
+ros2 topic info /inference/policy/result
+ros2 topic hz /inference/policy/heartbeat
 ```
 
 #### 3. OpenHarmony Board as Compute Side (RK3588)
@@ -432,14 +443,15 @@ For bag directory structure, `dataset.yaml` metadata, and more conversion option
 | `use_sim` | Use Gazebo simulation mode | `false` |
 | `control_mode` | Override default mode (`model_inference` / `moveit_planning` / `teleop`) | From YAML |
 | `with_inference` | Force enable/disable inference service (empty = auto-detect) | Empty |
-| `execution_mode` | Inference execution mode (`monolithic` / `distributed`) | `monolithic` |
-| `cloud_local` | In distributed mode, launch Cloud node on the same machine | `false` |
 | `with_moveit` | Force enable/disable MoveIt core (empty = auto-detect) | Empty |
 | `moveit_display` | Launch MoveIt RViz interface | `true` |
 | `record` | Enable recording pipeline | `false` |
 | `record_mode` | Recording mode (`continuous` / `episodic`) | `continuous` |
 | `record_visualizer` | Recording visualizer (`none` / `rerun`) | `none` |
 | `auto_start_controllers` | Automatically activate controllers on start | `true` |
+
+Inference execution mode is not a launch argument; configure it on each named pipeline in robot YAML. Start a
+distributed cloud node separately with `inference_service cloud_inference.launch.py`.
 
 ---
 

@@ -13,6 +13,7 @@ from robot_config.config import (
     Ros2ControlConfig,
     VoiceASRConfig,
 )
+from robot_config.contract_utils import contract_fingerprint, iter_specs
 from robot_config.launch_builders.recording import get_recording_topics
 from robot_config.launch_builders.voice_asr import (
     default_voice_asr_model_path,
@@ -26,6 +27,7 @@ from robot_config.loader import (
     load_voice_asr_config,
     validate_config,
 )
+from robot_config.utils import resolve_lerobot_norm_mode
 from voice_asr_service.defaults import VOICE_ASR_DEFAULTS
 from voice_asr_service.model_manager import (
     STREAMING_ZH_BUNDLE,
@@ -84,11 +86,32 @@ def test_load_single_arm_config_dict_preserves_launch_schema():
     config = load_robot_config_dict(config_path)
 
     assert config["name"] == "so101_single_arm"
-    assert "models" in config
     assert "control_modes" in config
+    assert "policy" in config["control_modes"]["model_inference"]["inference"]["pipelines"]
     assert "joints" in config
     assert "simulation" in config
     assert config["_config_path"] == str(config_path.resolve())
+
+
+def test_so101_single_arm_uses_degrees_for_lerobot_joint_conversion():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+
+    config = load_robot_config_dict(config_path)
+
+    assert resolve_lerobot_norm_mode(config) == "degrees"
+
+
+def test_so101_single_arm_policy_inputs_require_fresh_live_observations():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+
+    config = load_robot_config_dict(config_path)
+    policy_keys = {"observation.state", "observation.images.top", "observation.images.wrist"}
+    policy_observations = [
+        observation for observation in config["contract"]["observations"] if observation["key"] in policy_keys
+    ]
+
+    assert len(policy_observations) == len(policy_keys)
+    assert {observation["align"]["max_age_ms"] for observation in policy_observations} == {500}
 
 
 def test_dict_contract_builder_matches_typed_contract_shape():
@@ -110,6 +133,66 @@ def test_dict_contract_builder_matches_typed_contract_shape():
     assert [obs.key for obs in dict_contract.observations] == [obs.key for obs in typed_contract.observations]
     assert [act.key for act in dict_contract.actions] == [act.key for act in typed_contract.actions]
     assert dict_contract.tasks == typed_contract.tasks
+    assert [obs.align for obs in dict_contract.observations] == [obs.align for obs in typed_contract.observations]
+
+
+def test_align_max_age_is_normalized_and_changes_contract_fingerprint():
+    base = {
+        "name": "test",
+        "contract": {
+            "rate_hz": 10,
+            "observations": [
+                {
+                    "key": "observation.state",
+                    "topic": "/joint_states",
+                    "type": "sensor_msgs/msg/JointState",
+                    "align": {"strategy": "hold", "max_age_ms": 500},
+                }
+            ],
+            "actions": [],
+        },
+    }
+    contract = build_contract_from_robot_config_dict(base)
+    changed = build_contract_from_robot_config_dict(
+        {
+            **base,
+            "contract": {
+                **base["contract"],
+                "observations": [
+                    {
+                        **base["contract"]["observations"][0],
+                        "align": {"strategy": "hold", "max_age_ms": 1000},
+                    }
+                ],
+            },
+        }
+    )
+
+    spec = next(iter(iter_specs(contract)))
+    assert contract.observations[0].align.max_age_ms == 500
+    assert spec.max_age_ms == 500
+    assert contract_fingerprint(contract) != contract_fingerprint(changed)
+
+
+def test_align_rejects_negative_max_age():
+    config = {
+        "name": "test",
+        "contract": {
+            "rate_hz": 10,
+            "observations": [
+                {
+                    "key": "observation.state",
+                    "topic": "/joint_states",
+                    "type": "sensor_msgs/msg/JointState",
+                    "align": {"max_age_ms": -1},
+                }
+            ],
+            "actions": [],
+        },
+    }
+
+    with pytest.raises(ValueError, match="max_age_ms must be non-negative"):
+        build_contract_from_robot_config_dict(config)
 
 
 def test_so101_single_arm_contract_includes_motor_current_observation():

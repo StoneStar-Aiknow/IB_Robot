@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import time
@@ -13,19 +12,14 @@ import time
 np = None  # type: ignore
 torch = None  # type: ignore
 tqdm = None  # type: ignore
-InferenceCoordinator = None  # type: ignore
+PureInferenceEngine = None  # type: ignore
 
 
 class LossUtils:
     def __init__(self, args):
         self.args = args
-        self.coordinator = self.prepare_policy()
-        # ``policy_type`` is reported by the engine after loading.  The CLI
-        # ``--policy_type`` is kept only as a hint / fallback for backends that
-        # cannot self-report (it must still match what the coordinator detects).
-        detected = (self.coordinator.policy_type or "").lower()
-        if detected:
-            self.args.policy_type = detected
+        self.engine = self.prepare_policy()
+        self.args.policy_type = self.engine.policy_type.lower()
 
     def run(self):
         if self.args.generate_target:
@@ -176,63 +170,21 @@ class LossUtils:
             )
 
     def prepare_policy(self):
-        # The InferenceCoordinator picks the backend from ``--device``:
-        #   cuda/cpu/npu  -> native LeRobot torch policy (LeRobotPolicyWrapper)
-        #   ascend_om     -> compiled OM offline model (CompiledPolicyWrapper)
-        #   ascend_om_3403/rknn -> their respective compiled wrappers
-        # All of them expose the same pre/infer/post pipeline, so loss_compare
-        # no longer depends on the raw LeRobot policy object.
-        coordinator = InferenceCoordinator(
-            policy_path=self.args.policy_path,
-            device=self.args.device,
+        runtime_options = {}
+        if self.args.model_dtype != "native":
+            runtime_options["model_dtype"] = self.args.model_dtype
+        engine = PureInferenceEngine(
+            model_path=self.args.policy_path,
+            deployment=self.args.deployment,
+            pipeline_id="loss_compare",
+            runtime_options=runtime_options,
         )
-
-        # Optional dtype cast — only meaningful for the torch backend (the
-        # compiled OM/RKNN models carry their own fixed dtype).  Use
-        # ``--model_dtype fp16`` to match the OM/ORT deployment dtype and
-        # isolate BF16<->FP16 conversion error from any real export error.
-        model_dtype = getattr(self.args, "model_dtype", "native")
-        raw_policy = coordinator.raw_policy
-        if raw_policy is not None and hasattr(raw_policy, "model"):
-            if model_dtype == "fp16":
-                raw_policy.model = raw_policy.model.half()
-                print("  Cast policy.model to float16")
-            elif model_dtype == "bf16":
-                raw_policy.model = raw_policy.model.bfloat16()
-                print("  Cast policy.model to bfloat16")
-            elif model_dtype == "fp32":
-                raw_policy.model = raw_policy.model.float()
-                print("  Cast policy.model to float32")
-            elif model_dtype != "native":
-                raise ValueError(f"unknown --model_dtype: {model_dtype}")
-
-            # CRITICAL: switch to eval mode.  Without this, LoRA's default
-            # dropout=0.1 stays active and randomises every forward pass
-            # (independent of seed) — the resulting KV jitter feeds into
-            # PI05's flow-matching ODE which is chaotic, so the 10-step
-            # trajectory diverges to ~zero correlation with the OM's
-            # deterministic output (observed: raw cos ~= -0.04).
-            with contextlib.suppress(Exception):
-                raw_policy.eval()
-
-            try:
-                sample_param = next(raw_policy.model.parameters())
-                print(f"  Running PT policy in dtype={sample_param.dtype}")
-            except (StopIteration, AttributeError):
-                pass
-        elif model_dtype != "native":
-            print(
-                f"  NOTE: --model_dtype={model_dtype} ignored for backend "
-                f"'{coordinator.backend_type or self.args.device}' "
-                f"(compiled models use their own fixed dtype)."
-            )
-
         print(
             f"model loaded: {self.args.policy_path} "
-            f"(policy_type={coordinator.policy_type}, "
-            f"backend={coordinator.backend_type or 'torch'})"
+            f"(policy_type={engine.policy_type}, deployment={self.args.deployment}, "
+            f"backend={engine.backend_type})"
         )
-        return coordinator
+        return engine
 
     def load_batches_as_tensors(self):
         with open(self.args.batch_path, encoding="utf-8") as f:
@@ -318,8 +270,6 @@ class LossUtils:
         noise_path = os.path.join(self.args.noise_dir, f"noise_{batch_idx:04d}.npy")
         if self.args.generate_target:
             noise_shape = self._pi05_noise_shape()
-            if noise_shape is None:
-                return None
             noise = torch.normal(mean=0.0, std=1.0, size=noise_shape, dtype=torch.float32)
             os.makedirs(self.args.noise_dir, exist_ok=True)
             np.save(noise_path, noise.numpy())
@@ -327,70 +277,32 @@ class LossUtils:
         return torch.from_numpy(np.load(noise_path)).float()
 
     def _pi05_noise_shape(self):
-        """(1, chunk_size, max_action_dim) inferred from whatever config the
-        backend exposes (torch policy config or the on-disk policy config.json)."""
-        raw_policy = self.coordinator.raw_policy
-        cfg = getattr(raw_policy, "config", None)
-        if cfg is not None and hasattr(cfg, "chunk_size") and hasattr(cfg, "max_action_dim"):
-            return (1, int(cfg.chunk_size), int(cfg.max_action_dim))
-        # Compiled backend (e.g. Ascend OM): raw_policy exposes no torch config.
-        # ``chunk_size`` / ``max_action_dim`` are part of the policy config
-        # contract, so read them from the on-disk policy config.json instead of
-        # assuming PI05 defaults (which silently break non-default policies).
-        disk_cfg = self._load_policy_config_json()
-        chunk = self.coordinator.chunk_size or 0
-        if chunk <= 0 and disk_cfg is not None and disk_cfg.get("chunk_size"):
-            chunk = int(disk_cfg["chunk_size"])
-        max_action_dim = None
-        if disk_cfg is not None and disk_cfg.get("max_action_dim") is not None:
-            max_action_dim = int(disk_cfg["max_action_dim"])
-        if chunk <= 0 or max_action_dim is None:
-            print(
-                "  WARN: cannot infer PI05 noise shape on this backend "
-                "(missing chunk_size/max_action_dim in policy config.json); skipping noise injection"
-            )
-            return None
-        return (1, int(chunk), max_action_dim)
+        """Return the policy-declared PI0.5 padded noise shape."""
+        chunk = self.engine.nominal_chunk_size
+        max_action_dim = self.engine.max_action_dimension
+        if chunk is None or max_action_dim is None:
+            raise RuntimeError("PI0.5 fixed-noise comparison requires chunk_size and max_action_dim in config.json")
+        return (1, int(chunk), int(max_action_dim))
 
-    def _load_policy_config_json(self):
-        """Best-effort read of the policy ``config.json`` for shape metadata."""
-        policy_path = getattr(self.args, "policy_path", None)
-        if not policy_path:
-            return None
-        config_path = os.path.join(policy_path, "config.json")
-        if not os.path.isfile(config_path):
-            return None
-        try:
-            with open(config_path, encoding="utf-8") as f:
-                cfg = json.load(f)
-        except (OSError, ValueError):
-            return None
-        return cfg if isinstance(cfg, dict) else None
+    def _reset_independent_sample(self):
+        capabilities = self.engine.capabilities
+        if not capabilities.stateful:
+            return
+        if not capabilities.resettable:
+            raise RuntimeError("selected stateful deployment cannot reset between independent comparison samples")
+        self.engine.reset()
 
-    def _inject_noise(self, batch, noise):
-        """Wire deterministic noise into whichever backend is active.
-
-        - torch LeRobot PI05: ``batch["_noise"]`` is forwarded by
-          ``LeRobotPolicyWrapper.infer`` as ``predict_action_chunk(..., noise=...)``.
-        - compiled OM PI05: ``batch["_noise"]`` is read by
-          ``PI05CompiledAdapter.prepare_inputs``.
-        """
-        if noise is None:
-            return batch
-
-        batch = dict(batch)
-        batch["_noise"] = noise
-        return batch
-
-    def _infer_raw(self, preprocessed_batch, noise):
-        """Run preprocess-already-done batch through inject+infer, return the
-        raw (pre-postprocessor) action on CPU.  Used by the noise self-check."""
-        b = self._inject_noise(dict(preprocessed_batch), noise)
-        if self.coordinator.raw_policy is not None and hasattr(self.coordinator.raw_policy, "_action_queue"):
-            self.coordinator.raw_policy._action_queue.clear()
-        with torch.inference_mode():
-            r = self.coordinator.infer_only(b)
-        return r.action.detach().cpu().float()
+    def _infer_raw(self, batch, noise):
+        """Run one independent sample and return its pre-postprocessor action."""
+        self._reset_independent_sample()
+        result = self.engine(
+            dict(batch),
+            control_inputs={"noise": noise},
+            capture_raw_action=True,
+        )
+        if result.raw_action is None:
+            raise RuntimeError("unified inference pipeline did not return the requested raw action")
+        return torch.as_tensor(result.raw_action).detach().cpu().float()
 
     def _assert_noise_effective(self, batch0):
         """One-shot self-check (PI05 + fixed noise only): prove the injected
@@ -415,17 +327,13 @@ class LossUtils:
             return  # no fixed-noise requirement -> nothing to guarantee
 
         shape = self._pi05_noise_shape()
-        if shape is None:
-            print("  noise self-check skipped (cannot infer PI05 noise shape on this backend)")
-            return
 
         nA = torch.zeros(shape, dtype=torch.float32)
         nB = torch.full(shape, 3.0, dtype=torch.float32)
 
-        b = self.coordinator.preprocess_only(dict(batch0))
-        oA1 = self._infer_raw(b, nA)
-        oB = self._infer_raw(b, nB)
-        oA2 = self._infer_raw(b, nA)
+        oA1 = self._infer_raw(batch0, nA)
+        oB = self._infer_raw(batch0, nB)
+        oA2 = self._infer_raw(batch0, nA)
 
         deterministic = torch.allclose(oA1, oA2, atol=1e-5)
         effective = not torch.allclose(oA1, oB, atol=1e-4)
@@ -456,32 +364,19 @@ class LossUtils:
         outputs = []
 
         for i in tqdm(range(len(batches)), desc="forwarding"):
-            # IMPORTANT: loss_compare treats each JSON batch as an independent
-            # sample, but the torch PI05Policy.select_action() keeps an internal
-            # ``_action_queue`` across calls. Reset it so batch i never consumes
-            # leftover actions from batch i-1.  (No-op for compiled backends,
-            # which are stateless.)
-            raw_policy = self.coordinator.raw_policy
-            if raw_policy is not None and hasattr(raw_policy, "_action_queue"):
-                raw_policy._action_queue.clear()
-
+            self._reset_independent_sample()
             noise = self._resolve_noise(i)
+            result = self.engine(
+                dict(batches[i]),
+                request_id=f"loss-compare-{i}",
+                control_inputs={"noise": noise} if noise is not None else None,
+                capture_raw_action=True,
+            )
+            if result.raw_action is None:
+                raise RuntimeError("unified inference pipeline did not return the requested raw action")
+            raw_preds.append(torch.as_tensor(result.raw_action).detach().cpu().clone())
 
-            # Run the pipeline stage-by-stage so we can capture the raw
-            # (pre-postprocessor / normalized-space) action for every backend
-            # uniformly — the OM/RKNN wrappers have no Python postprocessor hook
-            # we could intercept, so we split pre/infer/post explicitly here.
-            batch = self.coordinator.preprocess_only(dict(batches[i]))
-            batch = self._inject_noise(batch, noise)
-
-            with torch.inference_mode():
-                infer_result = self.coordinator.infer_only(batch)
-
-            raw_action = infer_result.action
-            with contextlib.suppress(Exception):
-                raw_preds.append(raw_action.detach().cpu().clone())
-
-            output = self.coordinator.postprocess_only(raw_action)
+            output = torch.as_tensor(result.action)
             # Normalize storage shape: drop a leading singleton batch dim so
             # ACT returns (T, D) / (D,) and PI05 returns (T, D), matching the
             # original loss_compare conventions.
@@ -540,24 +435,23 @@ def _import_heavy_deps():
     invocations stay fast.  Assign to module globals so LossUtils (defined at
     module level) can reference them as before.
     """
-    global np, torch, tqdm, InferenceCoordinator
+    global np, torch, tqdm, PureInferenceEngine
     import numpy as _np
     import torch as _torch
     from tqdm import tqdm as _tqdm
 
-    from inference_service.core import InferenceCoordinator as _Coord
+    from inference_service.core import PureInferenceEngine as _Engine
 
     np = _np
     torch = _torch
     tqdm = _tqdm
-    InferenceCoordinator = _Coord
+    PureInferenceEngine = _Engine
 
 
 def main():
     # All argument ergonomics (profile / wizard / --exp-dir derivation /
     # remember-last) live in loss_compare_cli so this entry point stays thin
-    # and LossUtils itself is unchanged.  Every historical explicit flag still
-    # works and overrides whatever a profile/derivation would supply.
+    # and LossUtils itself stays focused on inference and metrics.
     try:
         from model_utils import loss_compare_cli
     except ImportError:
@@ -578,16 +472,17 @@ def main():
     resolved = loss_compare_cli.resolve()
     loss_compare_cli.print_effective(resolved)
 
-    # Lazy-load torch/numpy/tqdm/coordinator only after resolve() returns;
+    # Lazy-load torch/numpy/tqdm/inference_service only after resolve() returns;
     # --list-profiles / --help / wizard-save exits in resolve() before this.
     _import_heavy_deps()
 
     loss_utils = LossUtils(resolved.args)
-    loss_utils.run()
-
-    # Persist this run's effective params as ``_last`` (replaces a separate
-    # "remember last args" cache).  Only after a successful run.
-    loss_compare_cli.write_last(resolved)
+    try:
+        loss_utils.run()
+        # Persist this run's effective params as ``_last`` only after success.
+        loss_compare_cli.write_last(resolved)
+    finally:
+        loss_utils.engine.close()
 
 
 if __name__ == "__main__":

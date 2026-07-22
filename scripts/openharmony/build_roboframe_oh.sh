@@ -52,6 +52,7 @@ declare -a PACKAGES=(
     "tensormsg"
     "embodied_common"
     "voice_asr_service"
+    "inference_manifest"
     "robot_config"
     "robot_description"
     "inference_service"
@@ -278,30 +279,26 @@ resolve_openharmony_lerobot_repo_source() {
     printf '%s\n' "${LEROBOT_OH_UPSTREAM_REPO}"
 }
 
-verify_openharmony_lerobot_runtime_patch() {
+verify_openharmony_lerobot_runtime_source() {
     local src_root="$1"
-    local init_file="${src_root}/lerobot/policies/__init__.py"
+    local policies_init="${src_root}/lerobot/policies/__init__.py"
     local factory_file="${src_root}/lerobot/policies/factory.py"
-    local optim_file="${src_root}/lerobot/optim/optimizers.py"
+    local pi05_init="${src_root}/lerobot/policies/pi05/__init__.py"
 
-    grep -q "_LAZY_EXPORTS" "${init_file}" || {
-        log_error "OpenHarmony lerobot runtime staging is missing lazy exports in ${init_file}"
+    grep -q 'from \.pi0_fast\.configuration_pi0_fast import PI0FastConfig' "${policies_init}" || {
+        log_error "OpenHarmony lerobot runtime staging is missing upstream PI0 Fast registration in ${policies_init}"
         exit 1
     }
-    grep -q "__getattr__" "${init_file}" || {
-        log_error "OpenHarmony lerobot runtime staging is missing __getattr__ lazy loading in ${init_file}"
+    grep -q 'from \.smolvla\.processor_smolvla import SmolVLANewLineProcessor' "${policies_init}" || {
+        log_error "OpenHarmony lerobot runtime staging is missing upstream SmolVLA processor registration in ${policies_init}"
         exit 1
     }
-    grep -q "_get_builtin_policy_config_class" "${factory_file}" || {
-        log_error "OpenHarmony lerobot runtime staging is missing lazy policy factory logic in ${factory_file}"
+    grep -q 'from \.processor_pi05 import make_pi05_pre_post_processors' "${pi05_init}" || {
+        log_error "OpenHarmony lerobot runtime staging is missing upstream PI0.5 processor registration in ${pi05_init}"
         exit 1
     }
-    if grep -q '^from lerobot\.datasets' "${factory_file}"; then
-        log_error "OpenHarmony lerobot runtime staging still has top-level dataset imports in ${factory_file}"
-        exit 1
-    fi
-    if grep -q '^from lerobot\.datasets' "${optim_file}"; then
-        log_error "OpenHarmony lerobot runtime staging still has top-level dataset imports in ${optim_file}"
+    if ! grep -q '^from lerobot\.datasets' "${factory_file}"; then
+        log_error "OpenHarmony lerobot runtime staging unexpectedly removed upstream eager imports in ${factory_file}"
         exit 1
     fi
 }
@@ -337,7 +334,7 @@ prepare_openharmony_lerobot_runtime_src() {
             am "${LEROBOT_OH_PATCH_DIR}/${patch_file}" >/dev/null
     done < "${LEROBOT_OH_PATCH_SERIES}"
 
-    verify_openharmony_lerobot_runtime_patch "${repo_dir}/src"
+    verify_openharmony_lerobot_runtime_source "${repo_dir}/src"
     printf '%s\n' "${repo_dir}/src"
 }
 
@@ -446,7 +443,7 @@ mkdir -p "\${ROS_HOME_ROOT}" "\${ROS_LOG_ROOT}" >/dev/null 2>&1 || true
 
 export HOME="\${ROS_HOME_ROOT}"
 export ROS_LOG_DIR="\${ROS_LOG_ROOT}"
-export PYTHONPATH="\${ROBOFRAME_ROOT}/pysite:${OH_CUSTOM_PREFIX}/lerobot/src:${OH_CUSTOM_PREFIX}/dataset_tools/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/inference_service/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/robot_config/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/tensormsg/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib/python3.12/site-packages:${OH_BOARD_ROS_PREFIX}/lib/python3.12/site-packages:/sys_prod/robot/out/lib/python3.12/site-packages:/sys_prod/robot/install/lib/python3.12/site-packages\${PYTHONPATH:+:\$PYTHONPATH}"
+export PYTHONPATH="\${ROBOFRAME_ROOT}/pysite:${OH_CUSTOM_PREFIX}/lerobot/src:${OH_CUSTOM_PREFIX}/dataset_tools/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/inference_manifest/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/inference_service/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/robot_config/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/tensormsg/lib/python3.12/site-packages:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib/python3.12/site-packages:${OH_BOARD_ROS_PREFIX}/lib/python3.12/site-packages:/sys_prod/robot/out/lib/python3.12/site-packages:/sys_prod/robot/install/lib/python3.12/site-packages\${PYTHONPATH:+:\$PYTHONPATH}"
 export LD_LIBRARY_PATH="${OH_CUSTOM_PREFIX}/dataset_tools/lib:${OH_CUSTOM_PREFIX}/inference_service/lib:${OH_CUSTOM_PREFIX}/robot_config/lib:${OH_CUSTOM_PREFIX}/tensormsg/lib:${OH_CUSTOM_PREFIX}/ibrobot_msgs/lib:${OH_BOARD_ROS_PREFIX}/lib:/sys_prod/robot/out/lib:/sys_prod/robot/install/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 export LD_PRELOAD="/sys_prod/robot/out/lib/libpython3.12.so.1.0\${LD_PRELOAD:+:\$LD_PRELOAD}"
 
@@ -455,7 +452,7 @@ EOF
             chmod +x "${script_path}"
         done
     done <<'EOF'
-lib/inference_service/lerobot_policy_node|inference_service.lerobot_policy_node
+lib/inference_service/pipeline_policy_node|inference_service.pipeline_policy_node
 lib/inference_service/pure_inference_node|inference_service.pure_inference_node
 lib/dataset_tools/policy_eval|dataset_tools.policy_eval
 EOF
@@ -464,7 +461,7 @@ EOF
 stage_board_scripts() {
     local install_root="${OH_CUSTOM_WS}/install"
 
-    log_info "Staging board scripts (robooh env, setup_sshd) ..."
+    log_info "Staging board scripts (robooh env, Houmo env, setup_sshd) ..."
 
     local scripts_dest="${install_root}/../scripts"
     mkdir -p "${scripts_dest}"
@@ -479,6 +476,10 @@ stage_board_scripts() {
             log_warn "  missing: ${src}"
         fi
     done
+
+    mkdir -p "${scripts_dest}/setup"
+    cp -f "${IB_ROBOT_ROOT}/scripts/setup/houmo_hmm_env.sh" "${scripts_dest}/setup/"
+    log_info "  staged setup/houmo_hmm_env.sh"
 }
 
 postprocess_runtime_bundle() {

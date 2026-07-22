@@ -52,10 +52,12 @@ diffik_damping: 0.001
 
 # max_joint_speed: per-joint velocity ceiling (rad/s) for the QP velocity-limit
 # constraint and the REAL speed ceiling of the servo. The SO-101 URDF declares
-# 10 rad/s which is far too fast for hand teleop; 2.0 rad/s gives a smooth,
-# controllable response while still letting the arm yield gracefully at the
-# reachable edge.
-max_joint_speed: 2.0
+# 10 rad/s which is far too fast for hand teleop; 3.0 rad/s gives a snappier
+# (esp. rotation) yet still controllable response on real hardware while
+# letting the arm yield gracefully at the reachable edge. Raise in small steps
+# (3.0 -> 4.0 -> 5.0) if faster is wanted; do NOT jump to 8-10 on hardware
+# (servo response + inertia overshoot unlike sim).
+max_joint_speed: 4.0
 
 # --- smoothness / safety -------------------------------------------------
 # The real speed ceiling is the in-QP velocity limit (enable_velocity_limits),
@@ -69,6 +71,19 @@ output_lowpass_alpha: 0.0        # 0 = off; (0,1] enables first-order LP on q_de
 # The node refuses to start if these keys are absent.
 joint_limits_lower: [-2.0693, -1.92, -1.6813, -1.65806, -2.9115]
 joint_limits_upper: [2.0709, 1.92, 1.6828, 1.65806, 2.9115]
+
+# --- input mode ----------------------------------------------------------
+# "velocity" (default): integrate a base-frame twist (linear_cmd/angular_cmd)
+#   into the command reference — the xbox/phone path, unchanged.
+# "pose": consume a relative clutch pose command (pose_cmd_topic) in the base
+#   frame — position is a displacement and orientation is a rotation delta,
+#   both composed onto the EE baseline latched by start. The resulting command
+#   reference is SET, not integrated, so a held hand pose holds the arm with zero
+#   drift and a stopped hand stops it immediately. teleop.py overrides this to
+#   "pose" when the active device is VR with a pose-mode vr_config, so this
+#   default stays "velocity".
+input_mode: velocity
+pose_cmd_topic: /so101_placo_servo_node/pose_cmd_base
 
 # --- topics & services ---------------------------------------------------
 # NOTE: angular is in the BASE frame here (PlacoServoBackend applies the

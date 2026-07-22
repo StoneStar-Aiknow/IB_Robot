@@ -1,256 +1,305 @@
 # Houmo HMM 模型转换与板端推理指南
 
-将训练好的策略模型（ACT / PI05 / SmolVLA）转换为 Houmo HMM（`.hmm`）格式，部署到 Houmo LQ50 / M50（xh2）算力卡上推理。
+本文说明如何把 PI0.5 或 SmolVLA 策略的 Houmo 编译产物打包为 IB-Robot 统一 HMM deployment，并部署到 Houmo LQ50 / M50（xh2）算力卡。
 
-> **板端环境前提**：Houmo 驱动已安装（参考 [`houmo_lq50_driver_install_oee.md`](houmo_lq50_driver_install_oee.md)），`houmo_tcim_runtime_xh2` 已 pip 装入板端 venv，`source scripts/setup/houmo_hmm_env.sh` 已执行。
+> **支持范围**：HMM backend 仅支持 PI0.5 和 SmolVLA。ACT HMM 已移除；ACT 应使用 `torch`、`ascend`、`hisilicon` 或 `rknn` deployment。
 
-## 架构差异：ACT vs PI05 vs SmolVLA
+> **板端环境前提**：已安装 Houmo 1.3.0 OpenHarmony runtime，并使用 OpenHarmony 工具链交叉编译和安装对应的 Python binding。具体安装资料暂不对外提供。
 
-| 策略 | 模块数 | 主机侧组件 | 转换工具 | 运行时编排 |
-|------|--------|-----------|---------|-----------|
-| **ACT** | 1（policy） | 无 | `export_onnx_hmm.py`（仓库内） | 单模块，`HMMRuntimeSession` 直接 run |
-| **PI05** | 6 + embedding | action_proj / action_out_fc（CPU Linear） | Houmo 官方 `houmo-examples/pi05`（外部） | 6 模块，host 侧 denoise 循环 |
-| **SmolVLA** | 3 + embedding | token embedding（CPU Embedding） | Houmo 官方 `houmo-examples/vla/smolvla`（外部） | 3 模块，host 侧 flow-matching denoise |
+## 架构概览
 
-运行时统一通过 `HMMRuntimeSession` 按 `policy_type`（act/pi05/smolvla）分发，对上层 launch 流程透明——只需在 robot_config YAML 里配 `device: hmm`。
+| 策略 | HMM 模块 | Host 侧辅助制品 | 设备指针链路 |
+|------|----------|-----------------|--------------|
+| **PI0.5** | vision、prefill、action_in_proj、time_mlp、decode、action_out_proj | `embedding.pt` | prefill input -> decode input |
+| **SmolVLA** | vision、prefill、action | `token_embedding.pt`、`state_projection.pt` | prefill output -> action input |
+| **ACT** | 不支持 | - | 启动时拒绝 |
 
-## 产物目录结构
+运行时由 `inference_service.backends.hmm.HMMBackend` 按 manifest 的 `execution`、`bindings` 和 `device_links` 编排。Runtime 不扫描目录、不猜测文件名，也不读取 `config.hmm.json` 或 `HMM_MODEL_PATH`。
 
-转换后组装成统一的 `config.hmm.json` 清单 + model 目录，三种策略格式一致：
+每个策略 bundle 根目录只使用一个 `inference_manifest.json`。LeRobot 的 `config.json`、processor 配置、processor 状态和 tokenizer 文件保持只读，所有 HMM deployment 元数据由 `package-hmm-deployment` 生成。
 
-**ACT**（单模块）：
-```
-models/<act_policy>/
-├── config.hmm.json          # {"policy_type":"act","backend":"hmm","artifacts":{"policy":"model.hmm"},"execution":["policy"]}
-├── config.json              # 原策略配置
-└── model.hmm                # 编译后的 .hmm
-```
+## 一、准备转换环境
 
-**PI05**（6 模块）：
-```
-models/<pi05_policy>_hmm/
-├── config.hmm.json
-├── config.json
-└── model/
-    ├── siglip.hmm                    # vision (SigLIP)
-    ├── gemma_2b_prefill.hmm          # Gemma-2B prefill
-    ├── gemma_expert_300m_decode.hmm  # Gemma-300M expert decode
-    ├── time_mlp.hmm
-    ├── action_in_proj.hmm
-    ├── action_out_proj.hmm
-    └── embedding.pt                  # Gemma token embedding（不在 execution）
+Houmo 工具链的依赖可能与项目主环境冲突，建议使用 Houmo 官方 24.04 工具链镜像或独立 venv。不要把 `xhquant`、`tcim` 安装到 IB-Robot 主 venv。
+
+```bash
+# 官方镜像示例；具体镜像名以当前 Houmo SDK 发布为准
+docker run -it --gpus all \
+    -v "$PWD/models:/work/models" \
+    harbor.houmo.ai/toolchain/release:Dadao-xh2-v1.3.0-ubuntu24.04-x86_64 bash
 ```
 
-**SmolVLA**（3 模块，主链 vision→prefill→action；decode 可选）：
-```
-models/<smolvla_policy>_hmm/
-├── config.hmm.json
-├── config.json
-└── model/
-    ├── smolvla_vision.hmm            # SmolVLM2 vision tower + connector
-    ├── smolvla_llm_prefill.hmm       # LLM prefill（KV cache 构建）
-    ├── smolvla_llm_decode.hmm        # LLM decode（可选，消融用）
-    ├── smolvla_action.hmm            # action denoise 分支
-    └── token_embedding.pt            # SmolVLM2 text embedding
-```
+22.04 runtime 镜像通常只有 `houmo_tcim_runtime`，没有 `xhquant` 和 `tcim` 编译器，不能用于模型转换。
 
-`config.hmm.json` 规则：`artifacts` 列出所有模块（含 embedding）；`execution` 只列参与推理的模块（embedding **不**在 execution）；路径相对清单目录。
-
-## 一、ACT → HMM（仓库脚本，最简单）
-
-ACT 用仓库自带的 `src/model_utils/model_utils/export_onnx_hmm.py`，一步完成 ONNX 导出 + PTQ 量化 + 编译。
-
-### 1.1 准备专用环境
-
-xhquant/tcim 工具链的依赖树与 lerobot 冲突，**必须用独立 venv**（不要装进主 venv）：
+若使用独立 venv：
 
 ```bash
 python3 -m venv .venv-hmm
 source .venv-hmm/bin/activate
-pip install xhquant tcim onnx onnxsim torch   # torch 版本按 xhquant 要求
+pip install xhquant tcim onnx onnxsim torch
 ```
 
-### 1.2 导出 + 量化 + 编译
+## 二、生成 HMM 与 ABI 元数据
+
+PI0.5 和 SmolVLA 使用 Houmo 官方 `houmo-examples-xh2` 导出、PTQ 和编译流程。每个传给 IB-Robot packager 的 `.hmm` 都必须配套编译器生成的 TCIM `model.json`，其中包含准确的 input/output 名称、顺序、dtype 和 shape。
+
+### PI0.5
+
+PI0.5 需要以下角色：
+
+| Role | 示例制品 |
+|------|----------|
+| vision | `siglip.hmm` + 对应 `model.json` |
+| prefill | `gemma_2b_prefill.hmm` + 对应 `model.json` |
+| action_in_proj | `action_in_proj.hmm` + 对应 `model.json` |
+| time_mlp | `time_mlp.hmm` + 对应 `model.json` |
+| decode | `gemma_expert_300m_decode.hmm` + 对应 `model.json` |
+| action_out_proj | `action_out_proj.hmm` + 对应 `model.json` |
+| embedding | `embedding.pt` |
+
+典型官方流程包含 vision、LLM、expert 和 action projection 的导出脚本，然后通过 `tcim.build_from_hmonnx` 生成 `.hmm` 与 ABI 元数据。自定义策略必须使用与实际 camera、chunk size、action dimension 和 tokenizer 长度一致的导出配置。
+
+PI0.5 的 cache 链路由 packager 根据 prefill/decode ABI 自动生成。两端 cache input 名称、dtype 和 shape 必须完全一致。
+
+### SmolVLA
+
+SmolVLA 需要以下角色：
+
+| Role | 示例制品 |
+|------|----------|
+| vision | `smolvla_vision.hmm` + 对应 `model.json` |
+| prefill | `smolvla_llm_prefill.hmm` + 对应 `model.json` |
+| action | `smolvla_action.hmm` + 对应 `model.json` |
+| embedding | `token_embedding.pt` |
+| state_projection | `state_projection.pt` |
+
+SmolVLA 的主链是 `vision -> embedding -> prefill -> action`。当前 HMM runtime 不执行独立 decode 模块。`state_projection.pt` 必须包含与 state input 和 hidden size 匹配的 projection weight/bias。
+
+SmolVLA action 导出建议使用 CPU + float32，避免 CUDA fp16 导出过程中 denoise 分支出现 dtype 混用。
+
+## 三、组装统一 Deployment
+
+不要手写 `inference_manifest.json`。先准备一个仅包含编译器输出路径的 packaging spec，再运行 `package-hmm-deployment`。Packager 会：
+
+- 从原始 LeRobot `config.json` 读取 policy family 和 feature metadata；
+- 读取每个 TCIM `model.json` 的 runtime ABI；
+- 校验 execution role、tensor name、dtype、shape 和 image layout；
+- 复制外部制品到 bundle 下的受管目录；
+- 生成完整 `bindings`、`device_links`、SHA-256 和 bundle digest；
+- 写入或更新根目录唯一的 `inference_manifest.json`；
+- 用 production strict loader 回读验证生成结果。
+
+### PI0.5 Spec
+
+```json
+{
+  "vision": {
+    "artifact": "/compiler/pi05/siglip.hmm",
+    "abi": "/compiler/pi05/siglip/model.json"
+  },
+  "embedding": "/compiler/pi05/embedding.pt",
+  "roles": {
+    "prefill": {
+      "artifact": "/compiler/pi05/gemma_2b_prefill.hmm",
+      "abi": "/compiler/pi05/prefill/model.json"
+    },
+    "action_in_proj": {
+      "artifact": "/compiler/pi05/action_in_proj.hmm",
+      "abi": "/compiler/pi05/action_in_proj/model.json"
+    },
+    "time_mlp": {
+      "artifact": "/compiler/pi05/time_mlp.hmm",
+      "abi": "/compiler/pi05/time_mlp/model.json"
+    },
+    "decode": {
+      "artifact": "/compiler/pi05/gemma_expert_300m_decode.hmm",
+      "abi": "/compiler/pi05/decode/model.json"
+    },
+    "action_out_proj": {
+      "artifact": "/compiler/pi05/action_out_proj.hmm",
+      "abi": "/compiler/pi05/action_out_proj/model.json"
+    }
+  },
+  "vision_layout": "NCHW"
+}
+```
+
+### SmolVLA Spec
+
+```json
+{
+  "vision": {
+    "artifact": "/compiler/smolvla/smolvla_vision.hmm",
+    "abi": "/compiler/smolvla/vision/model.json"
+  },
+  "embedding": "/compiler/smolvla/token_embedding.pt",
+  "state_projection": "/compiler/smolvla/state_projection.pt",
+  "roles": {
+    "prefill": {
+      "artifact": "/compiler/smolvla/smolvla_llm_prefill.hmm",
+      "abi": "/compiler/smolvla/prefill/model.json"
+    },
+    "action": {
+      "artifact": "/compiler/smolvla/smolvla_action.hmm",
+      "abi": "/compiler/smolvla/action/model.json"
+    }
+  },
+  "vision_layout": "NCHW"
+}
+```
+
+Spec 中的相对路径以 spec 文件所在目录为基准。`vision_layout` 只能是 `NCHW` 或 `NHWC`。
+
+### 运行 Packager
+
+项目命令执行前先加载 `.shrc_local`：
 
 ```bash
-source .shrc_local                          # 主环境（导出 ONNX 需要 lerobot）
-source .venv-hmm/bin/activate               # 切到 HMM 工具链（量化编译需要 xhquant/tcim）
+source .shrc_local
 
-# 从 policy checkpoint 一步到位
-python src/model_utils/model_utils/export_onnx_hmm.py \
-    --policy_path models/<act_policy>/pretrained_model \
-    --convert_hmm \
-    --hmm_target xh2 \
-    --hmm_quant_type w8a8h1_sefp \
-    --hmm_ncore 2 \
-    --hmm_opt_level O2
+package-hmm-deployment \
+    --bundle-root models/<policy_bundle> \
+    --deployment hmm_lq50 \
+    --target-soc lq50 \
+    --target-runtime tcim-lite \
+    --spec /path/to/hmm-package-spec.json
 ```
 
-产物：`model.hmm` + `config.hmm.json` + `tcim_work/`（编译中间产物，可删）+ `act_ros2_hmm.onnx`（源 ONNX，保留备重新量化）。
-
-量化类型：`w8a8h1_sefp`（默认，权重8位/激活8位，精度速度均衡）/ `w16a16_sefp`（更高精度，更大）。
-
-## 二、PI05 / SmolVLA → HMM（Houmo 官方脚本）
-
-PI05 / SmolVLA 是多模块 VLA，用 Houmo 官方 `houmo-examples-xh2` 的导出脚本（仓库只提供运行时契约，不内置转换脚本）。
-
-### 2.1 准备转换环境
-
-Houmo 工具链在 Docker 镜像里最省心（避免依赖冲突）：
+也可从源码调用：
 
 ```bash
-# 用 Dadao-xh2-v1.3.0 镜像（24.04 版含完整编译器 xhquant/tcim）
-docker run -it --gpus all \
-    -v $PWD/models:/work/models \
-    harbor.houmo.ai/toolchain/release:Dadao-xh2-v1.3.0-ubuntu24.04-x86.64 bash
+source .shrc_local
+python3 -m model_utils.hmm_export \
+    --bundle-root models/<policy_bundle> \
+    --deployment hmm_lq50 \
+    --target-soc lq50 \
+    --target-runtime tcim-lite \
+    --spec /path/to/hmm-package-spec.json
 ```
 
-> ⚠️ **必须用 24.04 镜像**：22.04 镜像只有 runtime（`houmo_tcim_runtime`），没有编译器（`xhquant`/`tcim`），无法量化编译。
+输出路径是 `<bundle-root>/inference_manifest.json`。典型 bundle 结构如下：
 
-### 2.2 安装依赖
-
-镜像预装了大部分依赖，但需补齐 lerobot 示例所需的轻量包 + 修复版本冲突：
-
-```bash
-pip install draccus typing_inspect mergedeep orderly_set pyserial deepdiff imageio gymnasium
-pip install 'diffusers==0.32.2'          # 镜像自带的 0.36 与 torch 2.8 不兼容
-pip install 'transformers@git+https://github.com/huggingface/transformers.git@fix/lerobot_openpi'  # PI05 需要
-pip install num2words                     # SmolVLA processor 需要
+```text
+models/<policy_bundle>/
+├── config.json
+├── policy_preprocessor.json
+├── policy_preprocessor_step_*.safetensors
+├── policy_postprocessor.json
+├── policy_postprocessor_step_*.safetensors
+├── <本地 tokenizer/processor assets>
+├── inference_manifest.json
+└── artifacts/
+    └── hmm/
+        └── hmm_lq50/
+            └── <packager 管理的 HMM/PT 制品>
 ```
 
-### 2.3 准备模型
+`config.json` 或 processor JSON 引用的 tokenizer/processor 依赖必须已经 vendored 到 bundle 内；packager 不接受远程 semantic dependency。
 
-VLA 模型的 config 可能有示例 lerobot 不认识的字段（如 `compile_model`、`use_relative_actions`），draccus 严格校验会报 `DecodingError`。需要剥离这些字段——用一个剥离后的 `config.json` 副本（权重从原 `model.safetensors` 读取，不受影响）。
+## 四、配置 Named Pipeline
 
-PI05 还需要 `paligemma-3b-pt-224` tokenizer（LLM 导出用），从 modelscope 下载到容器内。
-
-### 2.4 PI05：导出 6 模块（4 export + 4 build 脚本）
-
-```bash
-cd houmo-examples-xh2/.../pi05   # 或解压后的 houmo-pi05-20260210/example
-
-# 导出 + PTQ 量化 → hmonnx（用 GPU 加速）
-python pi05_export_vision_xh2a_libero.py    --model_path models/<pi05>   # vision (SigLIP)
-python pi05_export_llm_xh2a_libero.py       --config config/pi0/llm/pi05_gemma_2b_xh2a_2k_libero_mask.py
-python pi05_export_experts_xh2a_libero.py   --config config/pi0/llm/pi05_gemma_expert_300m_xh2a_2k_libero_mask.py
-python pi05_export_other_xh2a_libero.py     --model_path models/<pi05>   # time_mlp + action_in/out_proj
-
-# 编译 → .hmm（tcim）
-python build_vision.py
-python build_gemma_2b_prefill.py
-python build_gemma_expert_300m_decode.py
-python build_pi05_action_time_linear.py
-```
-
-每个 export 脚本默认假设 LIBERO dummy batch，自定义模型可能有 batch key 不匹配（如 banana-pick 用 `top`/`wrist` 而 LIBERO 用 `image`/`image2`）——export 脚本里的 `predict_action_chunk` sanity test 无害但会因 key 不符报错，可跳过（导出只依赖 SigLIP/Gemma 子模块，与 batch key 无关）。
-
-### 2.5 SmolVLA：导出 3 模块（3 export + build）
-
-SmolVLA 主链是 `vision → prefill → action`（decode 可选，消融用）：
-
-```bash
-cd houmo-examples-xh2/hmodel/xh2/examples/vla/smolvla
-
-# prefix_length 必须和实际 embed_prefix 输出一致（512x512 + 2 相机 ≈ 177）
-python smolvla_export_vision_xh2a.py \
-    --model_path models/<smolvla> --lerobot_src ./lerobot/src --device cuda \
-    --output_name smolvla_vision --quant_type w8a8h1_sefp
-
-python smolvla_export_llm_kvcache_xh2a.py \
-    --model_path models/<smolvla> --lerobot_src ./lerobot/src --device cuda \
-    --prefix_length 177 --suffix_length 50 --output_name smolvla_llm
-
-python smolvla_export_action_xh2a.py \
-    --model_path models/<smolvla> --lerobot_src ./lerobot/src --device cpu \
-    --prefix_length 177 --prefill_meta work_dirs/smolvla_llm_kvcache/meta_info.json \
-    --output_name smolvla_action
-```
-
-> ⚠️ **action 导出用 CPU + float32**：cuda + fp16 时 denoise 内部 dtype 混用会报 `mat1 and mat2 must have the same dtype`。
-
-用 `tcim.build_from_hmonnx` 把 3 个 hmonnx 编译成 `.hmm`（参考 PI05 的 build 脚本，`llm_opt=True` 给 prefill，`llm_opt=False` 给 vision/action）。
-
-### 2.6 组装产物 + 写清单
-
-把 `.hmm` + `embedding.pt` 组装成上面的产物目录结构，手写 `config.hmm.json`（官方脚本不生成清单）。
-
-## 三、板端部署
-
-### 3.1 装 runtime 到板端 venv
-
-```bash
-ssh OPi_20T
-# 把 aarch64 Runtime SDK 装进 IB_Robot venv（合法方式，不靠 PYTHONPATH 指向 /root）
-/IB_Robot/venv/bin/pip install /root/houmo_tcim_runtime_xh2_linux_aarch64-1.3.0.tar.gz
-```
-
-### 3.2 配置板端 runtime 环境
-
-```bash
-source scripts/setup/houmo_hmm_env.sh
-# 输出: [houmo_hmm_env] LQ50 device_num=1 (TCIM_BACKEND=Xh2HalBackend)
-```
-
-> ⚠️ **关键**：必须用 `TCIM_BACKEND=Xh2HalBackend` + `HOUMO_TARGET=xh2`（走 HAL backend，用 `libhal_xh2a.so`）。**不要**用 `HDPL_PLATFORM=ASIC`——那会让 tcim_lite 去找 `libhdplrt_asic.so`，而该库**不在** aarch64 Runtime SDK 里，会导致 `InitDevice` 失败、`device_num=0`。
-
-### 3.3 验证 NPU 可用
-
-```bash
-python3 -c "import tcim_lite.runtime as r; print('device_num:', r.get_device_num())"
-# 应输出 device_num: 1
-```
-
-### 3.4 配置 YAML + 启动
-
-在 robot_config YAML（如 `so101_single_arm.yaml`）加 HMM 模型并选中：
+HMM 不再通过 `device: hmm` 或全局 model table 选择。直接在 control mode 下配置 named pipeline，并选择 manifest 中的 deployment：
 
 ```yaml
-models:
-  <name>_hmm:
-    path: models/<pi05_policy>_hmm     # 指向含 config.hmm.json 的目录
-    policy_type: pi05                  # act | pi05 | smolvla
-    device: hmm
-    lerobot_norm_mode: range_m100_100
-
 control_modes:
   model_inference:
     inference:
-      model: <name>_hmm                # 选中上面的 HMM 模型
+      enabled: true
+      pipelines:
+        policy:
+          model_path: models/<policy_bundle>
+          deployment: hmm_lq50
+          execution_mode: monolithic
+          request_timeout: 10.0
+          default_task: "pick up the object"
+    executor:
+      type: topic
+      mode: model_inference
+      inference_pipeline: policy
+      control_frequency: 20.0
 ```
 
-启动（`device: hmm` 由 YAML model 决定，非 CLI 参数）：
+相对 `model_path` 只相对于 `WORKSPACE` 解析。`WORKSPACE` 未设置时配置加载会失败，不会退回当前工作目录。
+
+启动：
 
 ```bash
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm \
-    control_mode:=model_inference use_sim:=true sim_platform:=mock
+source .shrc_local
+ros2 launch robot_config robot.launch.py \
+    robot_config:=so101_single_arm \
+    control_mode:=model_inference \
+    use_sim:=true \
+    sim_platform:=mock
 ```
 
-## 四、已知坑与排查
+## 五、板端部署
 
-### 转换侧
+OpenHarmony 板端没有 systemd，rootfs 默认只读，且脚本应兼容 POSIX `sh`。部署前先阅读 `.agents/skills/oh-constraints/SKILL.md`。
 
-| 问题 | 原因 | 解决 |
-|------|------|------|
-| `DecodingError: fields ... not valid for XxxConfig` | 自定义模型 config 有示例 lerobot 不认识的字段 | 剥离多余字段（如 `compile_model`、`use_relative_actions`），用剥离后的 config.json 副本 |
-| `ModuleNotFoundError: num2words` / `draccus` 等 | 容器镜像未预装 | `pip install` 补齐 |
-| `diffusers RuntimeError: name 'logger' is not defined` | 镜像 diffusers 0.36 与 torch 2.8 不兼容 | `pip install 'diffusers==0.32.2'` |
-| SmolVLA vision `Unsupported ops: ['NonZero']` | SmolVLM2 布尔索引 `position_ids[][mask.view(-1)]` 编译成 NonZero | monkey-patch `SmolVLMVisionEmbeddings.forward`，固定全图输入时直接算 position_ids |
-| SmolVLA action `dtype Float and Half` | cuda+fp16 时 denoise 内部 dtype 混用 | action 导出改用 `--device cpu` |
-| PI05 `libhdplrt_asic.so not found` | 误设 `HDPL_PLATFORM=ASIC` | 改用 `TCIM_BACKEND=Xh2HalBackend` |
+安装 aarch64 runtime SDK 后，运行 ROS/HMM 推理前加载 RoboFrame 和 Houmo 环境：
 
-### 运行时侧
+```bash
+. /data/roboframe/scripts/robooh_1.0.1.env
+. /data/roboframe/scripts/setup/houmo_hmm_env.sh
+```
 
-| 问题 | 原因 | 解决 |
-|------|------|------|
-| `device_num: 0` / `InitDevice failed` | 缺 `TCIM_BACKEND=Xh2HalBackend` 或 `libhal_xh2a.so` 不在 LD_LIBRARY_PATH | `source scripts/setup/houmo_hmm_env.sh` |
-| `set_input error: Status.UNINITIALIZED` | KV-cache 设备指针共享用错 API（用了 `set_input`/`get_dev_input`） | 用 `set_dev_input(name, prefill.get_dev_input(name))`（PI05）或 `set_dev_input(name, prefill.get_dev_output(name))`（SmolVLA） |
-| `Module set_input error`（PI05 prefill） | input 名字写错 | 正确名：`input_1` / `valid_length` / `current_length` / `attention_mask`（非 `inputs_embeds` / `past_seq_length`） |
-| PI05 `siglip.hmm` NPU 执行 `ret:110` | PTQ 随机校准数据在 NPU 上产生异常导致挂起 | 用真实数据重新校准量化（模型编译层问题，非 runtime 代码问题） |
+若 release 中保留仓库目录布局，也可使用对应的 `scripts/setup/houmo_hmm_env.sh`。
+
+关键变量应为：
+
+```bash
+TCIM_BACKEND=xh2
+HOUMO_TARGET=xh2
+```
+
+不要设置 `HDPL_PLATFORM=ASIC`，否则 runtime 可能尝试加载 aarch64 SDK 中不存在的 `libhdplrt_asic.so`。
+
+验证设备：
+
+```bash
+python3 -c "import tcim_lite.runtime as r; print('device_num:', r.get_device_num())"
+```
+
+预期至少返回一个可用设备。
+
+## 六、校验与排查
+
+### ACT 被拒绝
+
+这是预期行为。HMM support matrix 只包含 PI0.5 和 SmolVLA。不要恢复单模块 ACT HMM wrapper、`config.hmm.json` 或 `HMM_MODEL_PATH` fallback。
+
+### Packager 报 ABI 不匹配
+
+确认传入的是每个 `.hmm` 对应的 compiler-emitted `model.json`，不要手写 tensor 顺序。重点检查：
+
+- PI0.5 prefill/decode cache input 名称完全一致；
+- PI0.5 action/noise shape 为 `(1, chunk_size, max_action_dim)`；
+- SmolVLA prefill cache output 与 action cache input 名称、dtype、shape 一致；
+- vision 只有一个 image input 和一个 embedding output；
+- image layout 与 compiler ABI 一致。
+
+### Manifest hash mismatch
+
+不要手改 SHA-256。重新运行 owning exporter 或 `package-hmm-deployment`，让工具重新打包制品并生成 digest。
+
+### `device_num: 0` 或 `InitDevice failed`
+
+检查 native Houmo 1.3 runtime 使用 `TCIM_BACKEND=xh2`、`HOUMO_TARGET=xh2`，并确认 `/data/local/houmo/lib` 和 `/data/local/houmo-sdk/lib` 已加入 library path，然后重新加载 `houmo_hmm_env.sh`。`Xh2HalBackend` 是 legacy runtime 的 selector，不适用于此 native OpenHarmony 部署。
+
+### `set_input error: Status.UNINITIALIZED`
+
+PI0.5 使用 prefill input -> decode input 的 device pointer；SmolVLA 使用 prefill output -> action input。不要交换 `get_dev_input` 和 `get_dev_output` 语义。该关系应来自 manifest 的 `device_links`，不应在部署脚本中硬编码。
+
+### PTQ 精度下降或 NPU 超时
+
+随机 calibration 数据通常不足以代表真实图像、状态和语言分布。生产模型应使用真实数据重新校准，并在目标板上执行数值对比。
 
 ## 参考
 
-- Houmo 官方示例：`houmo-examples-xh2`（PI05：`examples/pi05`；SmolVLA：`hmodel/xh2/examples/vla/smolvla`）
-- 仓库运行时：`src/inference_service/inference_service/core/hmm/`（pi05/PI05HMMModel.py、smolvla/SmolVLAHMMModel.py、policy_wrapper.py）
-- 仓库 ACT 转换：`src/model_utils/model_utils/export_onnx_hmm.py`
+- HMM packager：`src/model_utils/model_utils/hmm_export.py`
+- 统一 manifest writer：`src/model_utils/model_utils/inference_manifest_export.py`
+- HMM backend：`src/inference_service/inference_service/backends/hmm/backend.py`
+- HMM backend tests：`src/inference_service/tests/test_hmm_backend.py`
+- HMM exporter tests：`src/model_utils/test/test_hmm_export.py`
+- 已迁移 bundle：`models/pi05_hmm/`、`models/smolvla_hmm/`
 - 板端环境：`scripts/setup/houmo_hmm_env.sh`
-- 驱动安装：[`houmo_lq50_driver_install_oee.md`](houmo_lq50_driver_install_oee.md)

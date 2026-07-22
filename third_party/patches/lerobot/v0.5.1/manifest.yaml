@@ -34,7 +34,7 @@ profiles:
   openharmony: OpenHarmony 5.x device targets.
   ascend: Hosts with Huawei Ascend NPUs.
   om: Hosts running Ascend OM-format model artefacts.
-  "3403": Hisilicon SD3403 boards using the dedicated OM ACT wrapper.
+  hisilicon: Hisilicon boards using the manifest-driven worker backend.
   inference: Inference-only deployments (no training requirements).
   training: Hosts that run policy training, including weighted-training tweaks.
   distillation: Hosts that perform knowledge distillation across policies.
@@ -64,7 +64,8 @@ patch_profiles:
     purpose:
       - Keep upstream Python 3.12 support intact on the OpenHarmony board
         runtime.
-      - Document the board-validated lazy-import subset needed for inference.
+      - Apply only the board-validated training compatibility patches required
+        by the shipped checkpoints.
 
 # Per-patch applicability bounds. Schema v2 contract:
 #   * applies_to.python_min / python_max are PEP 440 specifiers (e.g. ">=3.10",
@@ -92,17 +93,6 @@ patches:
     applies_to:
       python_max: "<3.11"
       profiles: [core, ros, hardware, dev, openeuler]
-  - file: 0004-openharmony-lazy-import-policy-stack.patch
-    purpose:
-      - Defer policy, dataset, env, and processor imports that are not required
-        for inference-time policy loading.
-      - Keep `lerobot.processor.normalize_processor` importable on OpenHarmony
-        inference runtimes by guarding `LeRobotDataset` behind TYPE_CHECKING.
-      - Keep the OpenHarmony board on upstream Python 3.12 while trimming
-        board-side dependency pressure.
-    applies_to:
-      python_min: ">=3.12"
-      profiles: [openharmony]
   - file: 0005-compat-add-npu-device-detection.patch
     purpose:
       - Add torch NPU device recognition to the current upstream device utilities.
@@ -144,6 +134,13 @@ patches:
     applies_to:
       python_max: "<3.11"
       profiles: [core, ros, hardware, dev, openeuler, inference]
+  - file: 0016-smolvla-improve-graph-export-compatibility.patch
+    purpose:
+      - Normalize SmolVLA expert position IDs without an integer reduction operation.
+      - Cast SmolVLA boolean padding masks to integers before position ID reductions.
+      - Preserve eager semantics while supporting RKNN and HMM graph export.
+    applies_to:
+      profiles: [core]
 
 notes:
   - Schema v2 contract — each patch declares applicability via independent
@@ -164,8 +161,7 @@ notes:
     patches with explicit `profiles` predicates (e.g. `[openharmony]`) instead
     of forking this stack.
   - OpenHarmony 5.1.0 musl uses the `core,openharmony` profile set so the board
-    keeps upstream Python 3.12 syntax while applying only the lazy-import fixes
-    needed for runtime inference.
+    keeps upstream Python 3.12 policy and processor registration behavior.
   - Patches 0010 and 0012 are feature-scoped migration candidates extracted
     from lerobot_ros2 for master-parity work. They are intentionally tracked
     outside the default series until each feature is revalidated on the
@@ -183,6 +179,8 @@ notes:
     quantization helpers from patch 0010.
   - Patch 0015 is a Python 3.10 import-compatibility patch for Groot. It is
     intentionally not applied on Python 3.11+ hosts.
+  - Patch 0016 is backend-neutral and keeps SmolVLA position ID arithmetic valid
+    for ONNX-based RKNN and HMM exporters on every supported platform.
   - The reference_submodule_commit records the current local development
     result, but repeated git-am application will produce different commit
     hashes unless committer identity and dates are reproduced exactly.

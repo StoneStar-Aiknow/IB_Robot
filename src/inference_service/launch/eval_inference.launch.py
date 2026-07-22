@@ -1,3 +1,5 @@
+import json
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
@@ -6,32 +8,60 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     robot_config_arg = DeclareLaunchArgument("robot_config_path", description="Path to robot_config YAML")
-    policy_path_arg = DeclareLaunchArgument("policy_path", description="Path to pretrained policy directory")
-    device_arg = DeclareLaunchArgument("device", default_value="auto")
-    name_arg = DeclareLaunchArgument("name", default_value="lerobot_policy")
-    node_name_arg = DeclareLaunchArgument("node_name", default_value="lerobot_policy_node")
-    frequency_arg = DeclareLaunchArgument("frequency", default_value="10.0")
-    use_header_time_arg = DeclareLaunchArgument("use_header_time", default_value="true")
+    model_path_arg = DeclareLaunchArgument("model_path", description="Path to unified policy bundle")
+    deployment_arg = DeclareLaunchArgument("deployment", default_value="cpu")
+    pipeline_id_arg = DeclareLaunchArgument("pipeline_id", default_value="policy")
+    execution_mode_arg = DeclareLaunchArgument("inference_execution_mode", default_value="monolithic")
+    node_name_arg = DeclareLaunchArgument("node_name", default_value="inference_policy")
     request_timeout_arg = DeclareLaunchArgument("request_timeout", default_value="30.0")
-    lerobot_norm_mode_arg = DeclareLaunchArgument("lerobot_norm_mode", default_value="range_m100_100")
+    default_task_arg = DeclareLaunchArgument("default_task", default_value="")
+    use_sim_arg = DeclareLaunchArgument("use_sim", default_value="false")
+    action_server_arg = DeclareLaunchArgument(
+        "action_server", default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/dispatch"]
+    )
+    reset_service_arg = DeclareLaunchArgument(
+        "reset_service", default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/reset"]
+    )
+    health_topic_arg = DeclareLaunchArgument(
+        "health_topic", default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/health"]
+    )
+    action_topic_arg = DeclareLaunchArgument(
+        "action_topic", default_value=["/actions/", LaunchConfiguration("pipeline_id")]
+    )
+    request_topic_arg = DeclareLaunchArgument(
+        "request_topic", default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/request"]
+    )
+    result_topic_arg = DeclareLaunchArgument(
+        "result_topic", default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/result"]
+    )
+    heartbeat_topic_arg = DeclareLaunchArgument(
+        "heartbeat_topic", default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/heartbeat"]
+    )
 
     policy_node = Node(
         package="inference_service",
-        executable="lerobot_policy_node",
+        executable="pipeline_policy_node",
         name=LaunchConfiguration("node_name"),
         output="screen",
         parameters=[
             {
-                "name": LaunchConfiguration("name"),
+                "pipeline_id": LaunchConfiguration("pipeline_id"),
                 "node_name": LaunchConfiguration("node_name"),
-                "repo_id": LaunchConfiguration("policy_path"),
+                "model_path": LaunchConfiguration("model_path"),
+                "deployment": LaunchConfiguration("deployment"),
+                "execution_mode": LaunchConfiguration("inference_execution_mode"),
                 "robot_config_path": LaunchConfiguration("robot_config_path"),
-                "device": LaunchConfiguration("device"),
-                "frequency": LaunchConfiguration("frequency"),
-                "use_header_time": LaunchConfiguration("use_header_time"),
-                "execution_mode": "monolithic",
                 "request_timeout": LaunchConfiguration("request_timeout"),
-                "lerobot_norm_mode": LaunchConfiguration("lerobot_norm_mode"),
+                "default_task": LaunchConfiguration("default_task"),
+                "runtime_options_json": json.dumps({}),
+                "use_sim": LaunchConfiguration("use_sim"),
+                "action_server": LaunchConfiguration("action_server"),
+                "reset_service": LaunchConfiguration("reset_service"),
+                "health_topic": LaunchConfiguration("health_topic"),
+                "action_topic": LaunchConfiguration("action_topic"),
+                "request_topic": LaunchConfiguration("request_topic"),
+                "result_topic": LaunchConfiguration("result_topic"),
+                "heartbeat_topic": LaunchConfiguration("heartbeat_topic"),
             }
         ],
     )
@@ -39,14 +69,21 @@ def generate_launch_description():
     return LaunchDescription(
         [
             robot_config_arg,
-            policy_path_arg,
-            device_arg,
-            name_arg,
+            model_path_arg,
+            deployment_arg,
+            pipeline_id_arg,
+            execution_mode_arg,
             node_name_arg,
-            frequency_arg,
-            use_header_time_arg,
             request_timeout_arg,
-            lerobot_norm_mode_arg,
+            default_task_arg,
+            use_sim_arg,
+            action_server_arg,
+            reset_service_arg,
+            health_topic_arg,
+            action_topic_arg,
+            request_topic_arg,
+            result_topic_arg,
+            heartbeat_topic_arg,
             policy_node,
         ]
     )

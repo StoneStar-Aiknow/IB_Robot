@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from ament_index_python.packages import get_package_share_directory
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +51,8 @@ def resolve_ros_path(path):
     for match in find_pattern.finditer(path):
         pkg_name = match.group(1)
         try:
+            from ament_index_python.packages import get_package_share_directory
+
             pkg_path = get_package_share_directory(pkg_name)
             path = path.replace(f"$(find {pkg_name})", pkg_path)
         except Exception as e:
@@ -444,29 +445,6 @@ def resolve_lerobot_norm_mode(
     explicit_mode = recording_cfg.get("lerobot_norm_mode")
     if explicit_mode:
         return normalize_lerobot_norm_mode(str(explicit_mode))
-
-    control_modes = robot_config.get("control_modes", {}) or {}
-    models = robot_config.get("models", {}) or {}
-    mode_candidates: list[str] = []
-    for mode_name in (
-        preferred_control_mode,
-        robot_config.get("default_control_mode"),
-        "model_inference",
-    ):
-        if mode_name and mode_name not in mode_candidates:
-            mode_candidates.append(str(mode_name))
-
-    for mode_name in mode_candidates:
-        inference_cfg = (control_modes.get(mode_name, {}) or {}).get("inference", {}) or {}
-        model_name = inference_cfg.get("model")
-        if model_name and isinstance(models.get(model_name), dict):
-            model_mode = models[model_name].get("lerobot_norm_mode")
-            if model_mode:
-                return normalize_lerobot_norm_mode(str(model_mode))
-
-    for model_cfg in models.values():
-        if isinstance(model_cfg, dict) and model_cfg.get("lerobot_norm_mode"):
-            return normalize_lerobot_norm_mode(str(model_cfg["lerobot_norm_mode"]))
 
     return NORM_MODE_RANGE
 

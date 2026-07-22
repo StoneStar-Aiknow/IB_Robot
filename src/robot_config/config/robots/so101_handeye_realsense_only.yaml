@@ -80,7 +80,6 @@ robot:
         - gripper_position_controller
       inference:
         enabled: false
-        force_disable: true
       executor:
         type: topic
         mode: teleop

@@ -58,6 +58,9 @@ ibrobot_msgs / rclpy
 - `embodied_common.skill_templates.get_skill_templates`
 - `embodied_common.rgbd_snapshot.KNOWN_REQUIRED_INPUTS`
 - `embodied_common.rgbd_snapshot.RGBDSnapshotBuffer.build_snapshot`
+- `embodied_common.vlm_api_client.VLMAPIClient.analyze`（原有底层接口，返回 `(str, dict)`，向后兼容）
+- `embodied_common.vlm_api_client.VLMAPIClient.complete`（底层扩展接口，返回结构化 dict）
+- `embodied_common.vlm_api_client.VLMClient`（高层客户端，一行式多模型调用，自动路由 / 建图 / 上下文）
 
 ## 输入前置条件（required_inputs）
 
@@ -70,6 +73,47 @@ ibrobot_msgs / rclpy
   joint state 离线时成功。
 
 该词表业务中立，不含任何具体游戏/任务特判。
+
+## VLMClient 使用说明
+
+调用方一行创建实例即可随时调用云端模型，无需手动构造 messages 或指定 provider / key：
+
+```python
+from embodied_common.vlm_api_client import VLMClient
+
+vlm = VLMClient()                              # 加载 vlm_models.yaml，一次初始化
+
+vlm.chat("做任务规划")                          # 默认模型（defaults.model）
+vlm.chat("分析图片", image=frame_bytes)         # 传入图片字节，自动构造多模态 message
+vlm.chat("文本任务", model="my-llm")            # 按模型名路由到 vlm_models.yaml 中的条目
+vlm.chat("快速回答", enable_thinking=False)     # 关闭思维链（支持的 provider 生效）
+vlm.chat("新话题", clear_history=True)          # 清空上下文后再对话
+```
+
+同一个 `VLMClient` 实例的多次 `chat()` 自动累积历史（多轮记忆）；需要全新会话时新建实例。
+
+`chat()` / `complete()` 返回结构化 dict：
+
+| 字段 | 含义 |
+|------|------|
+| `status` | `"ok"` / `"error"` |
+| `model` | 实际调用的模型名 |
+| `content` | 文本回复 |
+| `reasoning` | 思维链内容（无则为空串） |
+| `tool_calls` | function call 列表 |
+| `usage` | token 用量 |
+| `timing_ms` | 端到端耗时（毫秒） |
+| `error` | 出错描述，成功时为 `None` |
+
+### 模型路由配置（vlm_models.yaml）
+
+位于 `embodied_common/vlm_models.yaml`。新增模型只需追加几行，`api_key_env` 只存环境变量名，
+`multimodal: false` 时自动过滤图片。API key 通过环境变量注入，不写入任何配置文件：
+
+```bash
+export ALIYUN_API_KEY=sk-xxxxxx
+export MY_LLM_API_KEY=sk-xxxxxx
+```
 
 `get_skill_templates` 会先过滤显式设置 `disabled: true` 的模板，再做深拷贝并就地展开
 `trajectory_template` 为 `joint_waypoints`（调用 `expand_trajectory_template`）。只有字面量布尔值

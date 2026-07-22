@@ -39,7 +39,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | Skill | 一句话描述 |
 | :--- | :--- |
 | **rknn-convert** | 将 ONNX 模型转换为 RKNN，并明确主 venv 导出 ONNX、`.venv-rknn` 转 RKNN 的分层流程 |
-| **hmm-convert** | 将 ACT / PI05 模型转后摩 HMM（xh2 NPU），涵盖 xhquant PTQ、tcim 编译与 PI05 6 模块拆分流程 |
+| **hmm-convert** | 将 PI0.5 / SmolVLA 编译产物打包为后摩 HMM deployment（xh2 NPU）；ACT HMM 不支持 |
 
 ### 🚀 工作流与验证
 
@@ -96,7 +96,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 编译 OpenHarmony 板端 IB_Robot     → oh-build-roboframe
 用 build_roboframe_oh.sh 构建 → oh-build-roboframe
 把 ONNX 转成 RKNN               → rknn-convert
-把 ACT/PI05 转成后摩 HMM         → hmm-convert
+把 PI0.5/SmolVLA 打包成后摩 HMM  → hmm-convert
 把 usb_cam 移植到板端            → oh-cross-build-ros-pkg
 编译 bash/zsh/vim 到板端         → ohloha-build-pkg
 重新编译板端内核                 → oh-rebuild-kernel

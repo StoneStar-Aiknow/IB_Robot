@@ -127,7 +127,7 @@ source .shrc_local
 | 技能 | 触发场景 |
 |------|---------|
 | [rknn-convert](.agents/skills/rknn-convert) | ONNX 转 RKNN、NPU 部署、模型转换 |
-| [hmm-convert](.agents/skills/hmm-convert) | ACT/PI05 转后摩 HMM、xh2 编译、tcim、xhquant、LQ50/M50 |
+| [hmm-convert](.agents/skills/hmm-convert) | PI0.5/SmolVLA 后摩 HMM 打包、xh2 编译、tcim、xhquant、LQ50/M50 |
 
 ### 工作流与验证
 

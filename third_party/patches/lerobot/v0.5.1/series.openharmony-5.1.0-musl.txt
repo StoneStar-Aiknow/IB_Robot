@@ -1,3 +1,3 @@
-0004-openharmony-lazy-import-policy-stack.patch
 0009-adaptive-weight-prerequisites.patch
 0011-knowledge-distillation.patch
+0016-smolvla-improve-graph-export-compatibility.patch

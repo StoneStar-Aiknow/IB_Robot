@@ -115,7 +115,6 @@ robot:
         - gripper_position_controller
       inference:
         enabled: false
-        force_disable: true
 
   teleoperation:
     enabled: true
@@ -157,19 +156,52 @@ robot:
         - gripper_position_controller
       inference:
         enabled: true
-        execution_mode: "distributed" # Or "monolithic" (single-machine zero-copy)
-        model: so101_act
+        pipelines:
+          policy:
+            model_path: models/ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515
+            deployment: cpu
+            execution_mode: monolithic # Or distributed
+            request_timeout: 5.0
+            default_task: ""
+            runtime_options: {}
+      executor:
+        type: topic
+        mode: model_inference
+        inference_pipeline: policy
+        queue_size: 100
+        watermark_threshold: 50
+        control_frequency: 20.0
 ```
 
 **Launched controllers:**
 - `arm_position_controller` (JointGroupPositionController)
 - `gripper_position_controller` (ForwardCommandController)
 
-The model-level `lerobot_norm_mode` controls conversion between LeRobot
+The robot recording-level `lerobot_norm_mode` controls conversion between LeRobot
 action/observation units and `ros2_control` radians. `range_m100_100` uses
 arm `[-100,100]` and gripper `[0,100]`; `degrees` uses centered degrees for
 arm joints while joints listed in `joints.gripper` keep `[0,100]` open/close
 semantics.
+
+Observation `align` settings serve both offline data processing and live inference, but their time limits have
+different meanings:
+
+- `tol_ms`: timestamp alignment tolerance for `strategy: asof`, used by both offline resampling and live sampling;
+  values less than or equal to `0` fall back to `hold`. `hold` and `drop` do not use it.
+- `max_age_ms`: maximum sample age accepted by live inference, measured from the node's local receipt clock so it
+  cannot be bypassed by rewinding a request timestamp. Missing samples and histories containing only future-dated
+  samples are always rejected; values greater than `0` also reject stale samples. These cases return
+  `observation_not_ready` instead of running the model with zero padding.
+
+```yaml
+contract:
+  observations:
+    - key: observation.images.top
+      align:
+        strategy: hold
+        tol_ms: 1500
+        max_age_ms: 500
+```
 
 **Command interface:**
 ```bash
@@ -280,7 +312,6 @@ robot:
         - gripper_position_controller
       inference:
         enabled: false
-        force_disable: true
 
     model_inference:
       description: "High-frequency end-to-end control mode (ACT/pi0)"
@@ -290,8 +321,18 @@ robot:
         - gripper_position_controller
       inference:
         enabled: true
-        execution_mode: "distributed" # Or "monolithic" (single-machine zero-copy)
-        model: so101_act
+        pipelines:
+          policy:
+            model_path: models/ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515
+            deployment: cpu
+            execution_mode: monolithic # Or distributed
+            request_timeout: 5.0
+            default_task: ""
+            runtime_options: {}
+      executor:
+        type: topic
+        mode: model_inference
+        inference_pipeline: policy
 
     moveit_planning:
       description: "MoveIt trajectory planning mode (VoxPoser/VLM)"
@@ -424,15 +465,22 @@ ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm
 # Launch with simulation
 ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true
 
-# Distributed inference — single-machine debug (Edge + Cloud co-located)
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=model_inference execution_mode:=distributed use_sim:=true cloud_local:=true
+# Distributed inference, single-host debug. The YAML policy pipeline must be distributed.
+# Terminal 1: Edge
+ros2 launch robot_config robot.launch.py config_path:=/absolute/path/to/so101_single_arm_distributed.yaml control_mode:=model_inference use_sim:=true
+# Terminal 2: Cloud
+ros2 launch inference_service cloud_inference.launch.py pipeline_id:=policy model_path:=/absolute/path/to/policy_bundle deployment:=cpu
 
 # Distributed inference — cross-machine (Device only launches Edge; Cloud runs separately on GPU server)
 # Device side:
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=model_inference execution_mode:=distributed use_sim:=true
+ros2 launch robot_config robot.launch.py config_path:=/absolute/path/to/so101_single_arm_distributed.yaml control_mode:=model_inference use_sim:=true
 # GPU server (set same ROS_DOMAIN_ID):
-# ros2 launch inference_service cloud_inference.launch.py policy_path:=/path/to/model device:=cuda
+# ros2 launch inference_service cloud_inference.launch.py pipeline_id:=policy model_path:=/absolute/path/to/policy_bundle deployment:=cuda
 ```
+
+Relative `model_path` values resolve only against an absolute `WORKSPACE` environment variable. The pipeline ID
+derives default action, reset, health, and distributed topics. With multiple pipelines,
+`executor.inference_pipeline` must select one explicitly.
 
 ### Validating Configuration
 

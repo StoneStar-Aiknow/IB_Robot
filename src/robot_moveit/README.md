@@ -7,7 +7,7 @@
 | 入口 | 用途 | 主要接口 |
 |---|---|---|
 | `moveit_gateway.py` | 任务级绝对位姿与已验证关节目标规划，供 `task_dispatch`、抓取执行脚本或外部节点调用 | `/cmd_pose`、`/moveit_gateway/move_to_pose`、`/moveit_gateway/move_to_configuration`、`/robot_status/ee_pose` |
-| `so101_placo_servo_node.py` | SO101 遥操作 Cartesian 后端，使用 Placo QP 微分 IK 实现位置优先、姿态软跟踪 | `/so101_placo_servo_node/linear_cmd_base`、`/so101_placo_servo_node/angular_cmd_base`、`/so101_placo_servo_node/start` |
+| `so101_placo_servo_node.py` | SO101 遥操作 Cartesian 后端，使用 Placo QP 微分 IK 实现位置优先、姿态软跟踪 | velocity/pose 输入话题、`/so101_placo_servo_node/start`、`/stop`、`/home` |
 
 `moveit_gateway` 专门针对 SO101 5自由度机械臂设计，解决 5DOF 机械臂在任务级逆运动学（IK）求解中的特殊约束问题。`so101_placo_servo_node.py` 不是任务规划入口，而是遥操作用的 Placo QP 后端：节点维护命令侧位置/姿态参考，使用命令侧关节种子求解，避免真机重力下垂和舵机滞后污染 IK 零空间。
 
@@ -59,7 +59,7 @@ teleoperation:
       angular_speed: 0.2
 ```
 
-启动 `control_mode:=teleop`、active device 为 Xbox/Phone 且 solver 为 `placo_servo` 时，`robot_config` 会启动 `so101_placo_servo_node.py`。Leader-arm teleop 不创建 Cartesian backend。该节点读取 `config/so101_placo_servo.yaml`，订阅 split linear/angular 命令，输出到 `/arm_position_controller/commands`。
+启动 `control_mode:=teleop`、active device 为 Xbox/Phone，或 VR 使用 `output_profile=so101`，且 solver 为 `placo_servo` 时，`robot_config` 会启动 `so101_placo_servo_node.py`。Leader-arm teleop 不创建 Cartesian backend。该节点读取 `config/so101_placo_servo.yaml`；Xbox/Phone 使用 velocity 输入，VR 可通过 `vr_config.so101_input_mode=pose` 将 VR 与 Placo 两端同时切换到 pose 输入。
 
 ## 主要功能
 
@@ -78,10 +78,43 @@ teleoperation:
 
 ### 4. SO101 Placo Servo
 - **配置文件**: `config/so101_placo_servo.yaml`
-- **输入话题**: `/so101_placo_servo_node/linear_cmd_base`、`/so101_placo_servo_node/angular_cmd_base`
-- **服务**: `/so101_placo_servo_node/start`、`/so101_placo_servo_node/stop`
 - **输出话题**: `/arm_position_controller/commands`
-- **功能**: Placo QP 微分 IK 跟随命令侧 TCP/末端位置参考，并用低权重姿态任务跟随角速度输入；关节限位和速度限位在 QP 内部约束。
+- **功能**: Placo QP 微分 IK 跟随命令侧 TCP/末端位置参考；关节限位和速度限位在 QP 内部约束。
+
+#### 输入模式与 ROS 接口
+
+`input_mode` 只接受 `velocity` 或 `pose`：
+
+| 模式 | 输入话题 | 消息类型 | 契约 |
+|---|---|---|---|
+| `velocity`（默认） | `/so101_placo_servo_node/linear_cmd_base` | `geometry_msgs/msg/Vector3Stamped` | robot base frame 中的线速度，单位 m/s；节点积分命令侧位置参考 |
+| `velocity`（默认） | `/so101_placo_servo_node/angular_cmd_base` | `geometry_msgs/msg/Vector3Stamped` | robot base frame 中的角速度，单位 rad/s；节点积分命令侧姿态参考 |
+| `pose` | `/so101_placo_servo_node/pose_cmd_base` | `geometry_msgs/msg/PoseStamped` | robot base/planning frame 中的 clutch-relative 位姿增量；不是绝对末端位姿 |
+
+pose 模式在成功调用 `start` 时从实时 `/joint_states` 锁存末端基准位置 `ee0_p` 和姿态 `ee0_R`。发布者必须将 `PoseStamped.header.frame_id` 设置为对应的 robot base/planning frame，并按以下规则填写 payload：
+
+```text
+p_target = ee0_p + delta_p_base
+rel_R = R_current @ inverse(R_clutch)
+R_target = rel_R @ ee0_R
+```
+
+因此 `PoseStamped.position` 是 base-frame 位移增量，orientation 是 base-frame 旋转增量 `rel_R` 的四元数。旋转必须左乘基准姿态；写成 `ee0_R @ rel_R` 会把增量误当成 tool/body-frame 旋转。命令超时后节点保持最后参考，不继续积分漂移。
+
+#### start/stop/home 状态转换
+
+| 服务 | 行为 |
+|---|---|
+| `/so101_placo_servo_node/start` | 要求已有 `/joint_states`；锁存当前测量末端位姿，清除旧 pose，最后打开 pose gate |
+| `/so101_placo_servo_node/stop` | 禁用求解并清空参考，关闭 pose gate，拒绝已排队或延迟到达的 pose |
+| `/so101_placo_servo_node/home` | 将参考平滑切换到配置的 home 末端位姿，并保持 pose gate 关闭；必须再次成功调用 `start` 才恢复 pose 接收 |
+
+home 位姿的 SSOT 是机器人 YAML 中的 `robot.embodied.named_poses.home`。`robot_config` launch builder 将其注入 Placo 节点的 `home_position` 与 `home_orientation`；VR 配置中的 `so101_home_service` 只负责统一 VR 与 Placo 两端的服务名，不定义 home 位姿。以下情况 home 服务会拒绝请求：
+
+- 未配置或无法注入有效的 `named_poses.home`，使 `home_position` 保持全零（home disabled）；
+- 节点尚未启用且还没有可用于初始化命令侧关节状态的 `/joint_states`。
+
+SO101 只有 5 DOF，姿态任务是低权重软约束；即使 pose 输入携带完整四元数，也不保证复现全部 3 个姿态自由度。
 
 ## 5DOF 机械臂的特殊处理
 

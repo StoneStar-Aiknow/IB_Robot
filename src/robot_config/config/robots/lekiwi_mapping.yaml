@@ -21,7 +21,6 @@ robot:
         - base_velocity_controller
       inference:
         enabled: false
-        force_disable: true
       executor:
         type: topic
         mode: teleop

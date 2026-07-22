@@ -31,7 +31,6 @@ robot:
         - joint_state_broadcaster
       inference:
         enabled: false
-        force_disable: true
       executor:
         type: topic
         mode: teleop
@@ -48,21 +47,16 @@ robot:
         - joint_state_broadcaster
       inference:
         enabled: true
-        model: so101_act
-        # Local/edge host: distributed mode publishes preprocessed batches to
-        # cloud_inference_topic and subscribes to cloud_result_topic.
-        # Board/cloud host: cloud_inference.launch.py must use matching topics
-        # (defaults are /preprocessed/batch and /inference/action, or pass the
-        # equivalent launch parameters if overriding them on the board).
-        execution_mode: distributed
-        cloud_inference_topic: /preprocessed/batch
-        cloud_result_topic: /inference/action
-        # Local/edge host timeout while waiting for board inference results; keep
-        # this above the board model latency plus network jitter.
-        request_timeout: 10.0
+        pipelines:
+          bimanual_policy:
+            model_path: models/dual_arm/pretrained_model
+            deployment: cpu
+            execution_mode: distributed
+            request_timeout: 10.0
       executor:
         type: topic
         mode: model_inference
+        inference_pipeline: bimanual_policy
         control_frequency: 30.0
         watermark_threshold: 40
         min_queue_size: 0
@@ -349,17 +343,6 @@ robot:
             mode: nearest
             tolerance_ms: 500
         safety_behavior: hold
-
-  models:
-    so101_act:
-      # Local/edge host: keep this as a repo-relative LeRobot policy path so
-      # robot.launch.py can read model metadata while distributed inference runs.
-      # Board/cloud host: pass the board model directory to cloud inference, e.g.
-      # ros2 launch inference_service cloud_inference.launch.py policy_path:=<board-model-dir> device:=ascend_om
-      path: ./models/dual_arm/pretrained_model
-      policy_type: act
-      device: cpu
-      lerobot_norm_mode: range_m100_100
 
   recording:
     bag_base_dir: "~/rosbag/episodes"
