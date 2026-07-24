@@ -2,12 +2,13 @@
 
 ## 概述
 
-`robot_moveit` 是 IB-Robot 的 MoveIt2 集成包，负责运动规划、MoveIt Servo 配置，以及 SO101 的 Placo Servo 节点。包内保留两个运行入口：
+`robot_moveit` 是 IB-Robot 的 MoveIt2 集成包，负责运动规划、MoveIt Servo 配置，以及 SO101 的 Placo Servo 节点。包内保留三个运行入口：
 
 | 入口 | 用途 | 主要接口 |
 |---|---|---|
 | `moveit_gateway.py` | 任务级绝对位姿与已验证关节目标规划，供 `task_dispatch`、抓取执行脚本或外部节点调用 | `/cmd_pose`、`/moveit_gateway/move_to_pose`、`/moveit_gateway/move_to_configuration`、`/robot_status/ee_pose` |
 | `so101_placo_servo_node.py` | SO101 遥操作 Cartesian 后端，使用 Placo QP 微分 IK 实现位置优先、姿态软跟踪 | velocity/pose 输入话题、`/so101_placo_servo_node/start`、`/stop`、`/home` |
+| `so101_ik_workers.launch.py` | 为抓取候选准备启动隔离的 MoveIt IK/FK worker 进程；只保留 Kinematics capability，不允许规划或执行运动 | `/ik_worker_<n>/compute_ik`、`/ik_worker_<n>/compute_fk` |
 
 `moveit_gateway` 专门针对 SO101 5自由度机械臂设计，解决 5DOF 机械臂在任务级逆运动学（IK）求解中的特殊约束问题。`so101_placo_servo_node.py` 不是任务规划入口，而是遥操作用的 Placo QP 后端：节点维护命令侧位置/姿态参考，使用命令侧关节种子求解，避免真机重力下垂和舵机滞后污染 IK 零空间。
 
@@ -45,6 +46,25 @@ ros2 launch robot_config robot.launch.py \
 ```
 
 两种场景都通过 `/cmd_pose` 发送位姿命令，通过 `/robot_status/ee_pose` 观察末端位姿反馈。
+
+### 抓取候选并行 IK/FK Worker
+
+主 `move_group` 的 `/compute_ik` 和 `/compute_fk` 使用默认互斥 callback group，同一进程内会串行处理。抓取测试需要并行准备大量候选时，可额外启动隔离 worker：
+
+```bash
+ros2 launch robot_moveit so101_ik_workers.launch.py \
+    worker_count:=4 \
+    namespace_prefix:=ik_worker \
+    use_sim_time:=false
+```
+
+每个 worker 是独立 `move_group` 进程和独立 LMA solver 实例，订阅公共 `/joint_states`、`/tf` 和 `/tf_static`。worker 禁用了规划、轨迹执行和 planning-scene 修改 capability，只提供命名空间内的 `compute_ik`/`compute_fk`。
+
+`scripts/test_banana_handeye_pick.py --ik-worker-count 4` 会将静止观察位上的候选准备分片到这些服务。脚本会把同一份 `/joint_states` 快照作为所有 worker 的 IK seed，并按原候选顺序合并结果。最终接触补偿、关节解执行和机器人运动仍使用主 MoveIt 服务串行完成。CLI 默认值为 `0`，SO101 手眼 robot_config 会将其覆盖为 `4`；可显式传 `--ik-worker-count 0` 退回串行。
+
+Hermes 抓取通过 `embodied_pipeline.launch.py` 启动时，会读取
+`robot.grasp_execution.ik.worker_count` 和 `worker_namespace_prefix` 自动包含本 launch；不需要再单独启动
+一组 worker。SO101 手眼抓取配置默认使用 4 个 worker。
 
 ### 遥操作 Placo Servo 后端
 
