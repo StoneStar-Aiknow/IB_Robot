@@ -47,6 +47,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/ExecuteTaskPlan.action"
   "action/SkillCommand.action"
   "action/PrimitiveCommand.action"
+  "action/PickObject.action"
   "srv/RecognizeFile.srv"
   "srv/SetHotwords.srv"
   "srv/MoveToConfiguration.srv"

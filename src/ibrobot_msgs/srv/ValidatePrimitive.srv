@@ -6,6 +6,11 @@ float32 relative_dz
 float32 target_x
 float32 target_y
 float32 target_z
+float32 target_qx
+float32 target_qy
+float32 target_qz
+float32 target_qw
+float32 velocity_scaling
 float32 gripper_position
 string[] joint_names
 float32[] joint_positions

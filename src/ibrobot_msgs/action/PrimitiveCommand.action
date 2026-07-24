@@ -1,9 +1,11 @@
 string task_id
 string primitive_name
 string pose_name
+geometry_msgs/Pose target_pose
 float32 relative_dx
 float32 relative_dy
 float32 relative_dz
+float32 velocity_scaling
 float32 gripper_position
 string[] joint_names
 float32[] joint_positions

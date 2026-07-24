@@ -11,7 +11,36 @@ float32 grasp_threshold
 string debug_output_mode
 ---
 # Response
+# grasps.header identifies the camera frame and depth-frame capture time used
+# to construct the returned 3D geometry.
 GraspCandidateArray grasps
+
+# Geometry of the selected detection in the camera optical frame. Consumers
+# can use the volume centroid for center-biased candidate ranking and fall back
+# to the visible-surface centroid when object_volume_m3 is unavailable.
+geometry_msgs/Point object_centroid_xyz
+geometry_msgs/Point object_volume_centroid_xyz
+float32 object_volume_m3
+int32 object_point_count
+
+# Table geometry fitted from the synchronized scene cloud. The plane equation
+# is normal dot point + offset = 0 in grasps.header.frame_id. The normal points
+# from the table toward the detected object.
+bool table_plane_found
+geometry_msgs/Vector3 table_plane_normal
+float32 table_plane_offset
+float32 table_plane_inlier_ratio
+geometry_msgs/Point object_top_xyz
+
+# Execution-side table geometry fitted from the completed scene cloud with the
+# same deterministic sampling contract used by target-gripper mesh filtering.
+# Consumers should prefer this plane for execution clearance checks and fall
+# back to table_plane_* only when completed-scene geometry is not required.
+bool execution_table_plane_found
+geometry_msgs/Vector3 execution_table_plane_normal
+float32 execution_table_plane_offset
+float32 execution_table_plane_inlier_ratio
+
 float32 inference_time_ms
 bool success
 string message

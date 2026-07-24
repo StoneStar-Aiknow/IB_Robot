@@ -87,6 +87,8 @@
 | `target_width_m` | 从目标点云估计的抓取方向宽度，`0.0` 表示不可用 |
 | `target_width_quality` | 宽度估计质量，范围通常为 `0.0` 到 `1.0` |
 | `width_axis_camera` | 宽度估计轴在相机坐标系下的单位方向 |
+| `target_width_min_offset_m` | 目标靠 `-width_axis_camera` 一侧的稳健边界，相对候选位姿原点 |
+| `target_width_max_offset_m` | 目标靠 `+width_axis_camera` 一侧的稳健边界，相对候选位姿原点 |
 
 ### `RobotStatus.msg`
 
@@ -113,7 +115,7 @@
 | 字段 | 说明 |
 | --- | --- |
 | `task_id` | 任务 ID |
-| `skill_name` | 技能名（如 `pick_named_target`、`move_relative_ee`） |
+| `skill_name` | 技能名（如 `pick_object`、`move_relative_ee`） |
 | `target_name` | 命名目标 |
 | `place_name` | 命名放置位 |
 | `motion_direction` | 相对运动方向（`forward` / `backward` / `left` / `right` / `up` / `down`） |
@@ -137,9 +139,11 @@
 | 字段 | 说明 |
 | --- | --- |
 | `task_id` | 任务 ID |
-| `primitive_name` | 原子动作名（`move_to_named_pose` / `move_relative_ee` / `move_to_joint_positions` / `move_through_joint_positions` / `open_gripper` / `close_gripper`） |
+| `primitive_name` | 原子动作名，包括动态 `move_to_pose` 和精确 IK `move_to_configuration` |
 | `pose_name` | 命名位姿（`move_to_named_pose` 使用） |
+| `target_pose` | 动态 base-frame 位姿（`move_to_pose` 使用） |
 | `relative_dx/dy/dz` | 相对增量（`move_relative_ee` 使用，单位米） |
+| `velocity_scaling` | MoveIt 速度比例，`0.0` 使用默认值 |
 | `gripper_position` | 夹爪目标开合量（`[0.0, 1.0]`） |
 | `joint_names` | 关节名列表，joint primitive 使用 |
 | `joint_positions` | 单个关节目标位置，`move_to_joint_positions` 使用 |
@@ -148,6 +152,18 @@
 | `joint_waypoint_count` | `joint_waypoints` 中包含的路点数量 |
 | `waypoint_duration_sec` | 相邻关节路点的时间间隔 |
 | `timeout_sec` | primitive 超时时间 |
+
+### `PickObject.action`
+
+抓取闭环接口，由 `manipulation_execution/pick_executor_node` 提供，默认路径
+`/manipulation/execute_pick`。
+
+| 字段 | 说明 |
+| --- | --- |
+| `target_query` | 运行时视觉文本查询，不是静态 `named_targets` 键 |
+| `timeout_sec` | 完整规划、执行和验证预算 |
+| `verification_status` | 未执行、成功、失败或不确定 |
+| `completed_phases` | 已进入的抓取状态机阶段 |
 
 ### `ExecuteTaskPlan.action`
 
@@ -187,6 +203,17 @@ GraspGen 抓取规划服务，通常由 `grasp_planner_node` 提供，路径 `/g
 | 字段 | 说明 |
 | --- | --- |
 | `grasps` | 抓取候选数组，候选位姿位于相机坐标系 |
+| `object_centroid_xyz` | 已选检测目标的可见表面质心，位于相机坐标系 |
+| `object_volume_centroid_xyz` | 已选检测目标的凸包体积质心，位于相机坐标系 |
+| `object_volume_m3` | 检测目标的凸包体积；大于 `0` 时体积质心可用于候选排序 |
+| `object_point_count` | 检测目标掩码内的有效三维点数 |
+| `table_plane_found` | 是否成功拟合执行侧可用的桌面平面 |
+| `table_plane_normal` / `table_plane_offset` | 候选坐标系中的桌面方程 `normal·point + offset = 0` |
+| `table_plane_inlier_ratio` | 桌面平面内点比例 |
+| `object_top_xyz` | 沿桌面法向最高的目标点，用于安全 pregrasp 高度计算 |
+| `execution_table_plane_found` | 是否从 completed scene cloud 获得执行侧桌面平面 |
+| `execution_table_plane_normal` / `execution_table_plane_offset` | 与历史执行侧采样和 RANSAC 规则一致的桌面方程，目标夹爪 clearance 检查应优先使用 |
+| `execution_table_plane_inlier_ratio` | completed-scene 执行桌面平面的内点比例 |
 | `inference_time_ms` | 规划耗时，单位毫秒 |
 | `success` | 是否成功生成可用候选 |
 | `message` | 失败原因或成功摘要 |
