@@ -10,6 +10,7 @@ import yaml
 
 from embodied_common.skill_templates import (
     SUPPORTED_PRIMITIVES,
+    SUPPORTED_SKILL_EXECUTORS,
     get_skill_templates,
 )
 from robot_config.config import (
@@ -265,6 +266,19 @@ def _validate_skill_primitive_sequence(
             f"embodied.skill_templates.{skill_name}.initial_gripper_state must be one of "
             f"{sorted(valid_gripper_states)} when present"
         )
+
+    executor_name = str(template.get("executor", "")).strip()
+    if executor_name:
+        prefix = f"embodied.skill_templates.{skill_name}"
+        if executor_name not in SUPPORTED_SKILL_EXECUTORS:
+            errors.append(f"{prefix} uses unsupported executor '{executor_name}'")
+        required_args = template.get("required_args", [])
+        if not isinstance(required_args, list) or any(not isinstance(arg, str) for arg in required_args):
+            errors.append(f"{prefix}.required_args must be a list of strings")
+        timeout_sec = template.get("timeout_sec")
+        if not _is_finite_number(timeout_sec) or float(timeout_sec) <= 0.0:
+            errors.append(f"{prefix}.timeout_sec must be a finite number greater than zero")
+        return
 
     primitive_sequence = template.get("primitive_sequence", [])
     if skill_name == "inspect_scene" and not primitive_sequence:
@@ -866,6 +880,9 @@ def validate_config(config: RobotConfig) -> list[str]:
                 continue
             if axis_limits[0] >= axis_limits[1]:
                 errors.append(f"embodied.safety.workspace.{axis} must satisfy min < max")
+        max_radius_m = config.embodied.workspace.get("max_radius_m")
+        if max_radius_m is not None and float(max_radius_m) <= 0.0:
+            errors.append("embodied.safety.workspace.max_radius_m must be greater than zero")
 
         if config.embodied.relative_motion_step_m <= 0.0:
             errors.append("embodied.execution.relative_motion_step_m must be greater than zero")

@@ -31,6 +31,33 @@ def _load_config(robot_config_name: str, config_path_override: str) -> dict:
     return config
 
 
+def _parallel_ik_worker_action(config: dict, use_sim_time: str):
+    grasp_execution = config.get("grasp_execution", {})
+    if not isinstance(grasp_execution, dict) or not bool(grasp_execution.get("enabled", False)):
+        return None
+    if not bool(grasp_execution.get("auto_start_dependencies", True)):
+        return None
+    ik_config = grasp_execution.get("ik", {})
+    worker_count = int(ik_config.get("worker_count", 0)) if isinstance(ik_config, dict) else 0
+    if worker_count <= 0 or not bool(ik_config.get("auto_start_workers", True)):
+        return None
+    if worker_count > 8:
+        raise ValueError("grasp_execution.ik.worker_count must be between 0 and 8")
+    namespace_prefix = str(ik_config.get("worker_namespace_prefix", "/ik_worker")).strip("/")
+    if not namespace_prefix:
+        raise ValueError("grasp_execution.ik.worker_namespace_prefix must not be empty")
+    worker_launch_path = Path(get_package_share_directory("robot_moveit")) / "launch" / "so101_ik_workers.launch.py"
+    logger.info(f"Launching {worker_count} parallel grasp IK/FK workers under /{namespace_prefix}_<n>")
+    return IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(str(worker_launch_path)),
+        launch_arguments={
+            "worker_count": str(worker_count),
+            "namespace_prefix": namespace_prefix,
+            "use_sim_time": use_sim_time,
+        }.items(),
+    )
+
+
 def launch_setup(context, *_args, **_kwargs):
     robot_config_name = context.launch_configurations.get("robot_config", "so101_single_arm")
     config_path_override = context.launch_configurations.get("config_path", "")
@@ -80,6 +107,9 @@ def launch_setup(context, *_args, **_kwargs):
     ]
     if embodied_config["enabled"]:
         logger.info("Launching embodied runtime nodes from embodied_bringup")
+        worker_action = _parallel_ik_worker_action(config, base_launch_arguments["use_sim"])
+        if worker_action is not None:
+            actions.append(worker_action)
         actions.extend(generate_embodied_nodes(config, active_control_mode))
     else:
         logger.info("Embodied runtime disabled by with_embodied:=false")

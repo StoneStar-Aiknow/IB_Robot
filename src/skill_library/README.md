@@ -1,7 +1,8 @@
 # skill_library 节点说明
 
 `skill_library` 是当前具身执行链路里的**技能执行层**。  
-它不直接做任务理解，而是负责把上层给出的技能请求，拆成有限的 primitive，并桥接到底层机械臂和夹爪控制接口。
+它不直接做任务理解，而是负责把上层给出的技能请求拆成有限 primitive，或委托给配置声明的受保护执行器，
+再桥接到底层机械臂和夹爪控制接口。
 
 当前包内包含 1 个 ROS 2 节点：
 
@@ -35,6 +36,10 @@
 
 ## 2. 技能模板来源
 
+当前技能由 `robot_config` 中的 `skill_templates` 统一配置。普通技能展开为有限 primitive；
+`executor: grasp_pipeline` 类型的技能委托给受保护的抓取闭环 action，但仍从同一个
+`/embodied/execute_skill` 入口进入。
+
 技能 action 层只执行当前模板集合中存在的技能。`get_skill_templates()` 的选择规则是：
 
 - `skill_templates_json` 非空时，使用当前机器人 YAML 注入并过滤 `disabled: true` 后的启用
@@ -52,6 +57,7 @@ SO101 当前配置示例：
 | 参数化动作 | `move_relative_ee`、`rotate_gripper_cw`、`rotate_gripper_ccw` |
 | 夹爪 | `open_gripper_skill`、`close_gripper_skill` |
 | 社交与娱乐 | `dance_basic`、`wave_hello`、`nod_yes`、`shake_no`、`celebrate`、`greet_observe_raise`、`act_cute`、`happy_spin_upright` |
+| 抓取 | `pick_object`（仅抓取配置，要求显式传入 `target_name`） |
 
 ## 3. 当前支持的 primitive
 
@@ -60,6 +66,8 @@ SO101 当前配置示例：
 | primitive | 作用 |
 | --- | --- |
 | `move_to_named_pose` | 移动到命名位姿 |
+| `move_to_pose` | 移动到经过安全校验的动态 base-frame 位姿 |
+| `move_to_configuration` | 经 MoveIt 移动到经过校验的完整机械臂关节配置 |
 | `move_relative_ee` | 相对当前末端位姿做笛卡尔增量移动 |
 | `move_to_joint_positions` | 按完整手臂关节顺序移动到单个关节目标 |
 | `move_through_joint_positions` | 按完整手臂关节顺序执行多路点关节轨迹 |
@@ -95,6 +103,10 @@ SO101 当前配置示例：
 | `move_relative_ee` | `move_relative_ee(direction, distance)` |
 | `dance_basic` | `close_gripper` -> `move_to_joint_positions(entry)` -> `move_through_joint_positions(joint_waypoints)` |
 | `celebrate` | `close_gripper` -> `move_to_named_pose(observe_table)` -> 多个 `move_relative_ee` -> `move_to_named_pose(observe_table)` |
+
+`pick_object` 不展开静态 `named_targets` 位姿，而是委托给
+`/manipulation/execute_pick`。GraspGen 在运行时生成动态 6-DOF 候选，执行器再通过安全 primitive
+完成 approach、补偿下降、夹爪闭合和 lift。
 
 ## 5. 直接控制机械臂的几种用法
 
@@ -158,8 +170,8 @@ ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '回原位'}"
 | 字段 | 说明 |
 | --- | --- |
 | `task_id` | 任务 ID |
-| `skill_name` | 技能名 |
-| `target_name` | 命名目标，如 `banana` |
+| `skill_name` | 技能名，如 `pick_object` |
+| `target_name` | 目标引用；对 `pick_object` 表示运行时视觉文本查询，如 `banana` |
 | `place_name` | 命名放置位，如 `tray_right` |
 | `motion_direction` | 相对运动方向 |
 | `motion_distance` | 相对运动距离 |
@@ -364,6 +376,8 @@ ros2 action send_goal /embodied/execute_primitive ibrobot_msgs/action/PrimitiveC
 | `joint_limits_json` | `{}` | 关节限位配置 |
 | `arm_trajectory_action_name` | `/arm_trajectory_controller/follow_joint_trajectory` | 手臂轨迹 action 名 |
 | `task_executor_action_name` | `/task_executor/execute_task_plan` | task_dispatch 执行动作名 |
+| `pick_action_name` | `/manipulation/execute_pick` | 委托型抓取技能 action 名 |
+| `move_configuration_service` | `/moveit_gateway/move_to_configuration` | 精确 IK 配置 MoveIt 服务 |
 | `ee_pose_topic` | `/robot_status/ee_pose` | 末端位姿反馈 topic |
 | `joint_state_topic` | `/joint_states` | 关节状态反馈 topic |
 | `debug_tracing` | `false` | 是否输出调试日志 |
@@ -383,4 +397,5 @@ ros2 action send_goal /embodied/execute_primitive ibrobot_msgs/action/PrimitiveC
 - 关节 primitive 要求命令完整手臂关节列表，并依赖安全层做关节限位检查
 - 技能集合仍是有限白名单，不支持任意自由组合动作
 - 使用 `target_pose_key` 的模板依赖 `named_targets_json` 预先配置对应位姿键
-- 当前 SO101 模板集合不包含完整的视觉伺服抓取、力反馈、碰撞后自恢复或在线重规划流程
+- `pick_object` 已接入 GraspGen、IK/FK 接触补偿、候选重试和抓后验证，但仍不包含连续视觉伺服或力控。
+- `move_to_configuration` 底层仍是同步服务，不能提供 action 级运动硬取消。

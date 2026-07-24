@@ -48,6 +48,22 @@ def validate_xyz_within_workspace(x: Any, y: Any, z: Any, workspace: dict[str, A
             return False, f"workspace axis {axis} minimum must not exceed maximum"
         if float(value) < min_value or float(value) > max_value:
             return False, f"pose is outside workspace on {axis}: {value}"
+    max_radius_m = workspace.get("max_radius_m")
+    if max_radius_m is not None:
+        radius = math.sqrt(x * x + y * y + z * z)
+        if radius > float(max_radius_m):
+            return False, f"pose radius is outside workspace: {radius}"
+    return True, ""
+
+
+def _validate_quaternion(qx: float, qy: float, qz: float, qw: float) -> tuple[bool, str]:
+    if not all(math.isfinite(value) for value in (qx, qy, qz, qw)):
+        return False, "pose orientation must contain finite values"
+    norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if norm <= 1e-6:
+        return False, "pose orientation quaternion must be non-zero"
+    if abs(norm - 1.0) > 0.05:
+        return False, f"pose orientation quaternion must be normalized: norm={norm}"
     return True, ""
 
 
@@ -111,6 +127,19 @@ def validate_skill_request(
     template = templates.get(skill_name)
     if template is None:
         return False, f"unsupported skill: {skill_name}"
+
+    executor_name = str(template.get("executor", "")).strip()
+    if executor_name:
+        if executor_name != "grasp_pipeline":
+            return False, f"unsupported skill executor: {executor_name}"
+        required_args = template.get("required_args", [])
+        if "target_name" in required_args and not target_name.strip():
+            return False, "target_name is required"
+        if place_name:
+            return False, "place_name is not accepted by pick_object"
+        if motion_direction or motion_distance:
+            return False, "motion parameters are not accepted by pick_object"
+        return True, ""
 
     primitive_sequence = template.get("primitive_sequence", [])
     if not isinstance(primitive_sequence, list) or not primitive_sequence:
@@ -254,9 +283,16 @@ def validate_primitive_request(
     joint_limits: dict[str, Any] | None = None,
     primitive_duration_sec: float = 0.0,
     waypoint_duration_sec: float = 0.0,
+    target_qx: float = 0.0,
+    target_qy: float = 0.0,
+    target_qz: float = 0.0,
+    target_qw: float = 0.0,
+    velocity_scaling: float = 0.0,
 ) -> tuple[bool, str]:
     if primitive_name not in {
         "move_to_named_pose",
+        "move_to_pose",
+        "move_to_configuration",
         "move_relative_ee",
         "move_to_joint_positions",
         "move_through_joint_positions",
@@ -266,6 +302,9 @@ def validate_primitive_request(
         "rotate_gripper_ccw",
     }:
         return False, f"unsupported primitive: {primitive_name}"
+
+    if velocity_scaling < 0.0 or velocity_scaling > 1.0:
+        return False, "velocity_scaling must be in [0.0, 1.0]"
 
     if primitive_name == "move_to_named_pose":
         pose = named_poses.get(pose_name)
@@ -283,11 +322,17 @@ def validate_primitive_request(
                 return False, f"{field_name} must be finite"
         return validate_xyz_within_workspace(target_x, target_y, target_z, workspace)
 
-    if primitive_name == "move_to_joint_positions":
+    if primitive_name == "move_to_pose":
+        allowed, reason = validate_xyz_within_workspace(target_x, target_y, target_z, workspace)
+        if not allowed:
+            return allowed, reason
+        return _validate_quaternion(target_qx, target_qy, target_qz, target_qw)
+
+    if primitive_name in {"move_to_configuration", "move_to_joint_positions"}:
         resolved_joint_names = list(joint_names or [])
         resolved_joint_positions = list(joint_positions or [])
         if not resolved_joint_names:
-            return False, "joint_names are required for move_to_joint_positions"
+            return False, f"joint_names are required for {primitive_name}"
         if len(resolved_joint_names) != len(resolved_joint_positions):
             return False, "joint_names and joint_positions must have the same length"
         if not _is_finite_number(primitive_duration_sec):

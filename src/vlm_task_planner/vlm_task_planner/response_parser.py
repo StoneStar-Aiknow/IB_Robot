@@ -13,7 +13,6 @@ DISABLED_SKILLS = {
     "observe_target_area",
     "approach_named_target",
     "hover_named_target",
-    "pick_named_target",
     "lift_named_target",
     "retreat_from_target",
     "place_named_pose",
@@ -93,6 +92,10 @@ def parse_planner_response(
             raise ValueError(f"planner selected unsupported skill: {skill_name}")
 
         skill_sequence.append(skill_name)
+        if skill_name == "pick_object" and not target_name:
+            target_name = str(args.get("target_name", "")).strip()
+            if not target_name:
+                raise ValueError("pick_object requires target_name")
         if skill_name == "move_relative_ee":
             if not motion_direction:
                 motion_direction = str(args.get("motion_direction", ""))

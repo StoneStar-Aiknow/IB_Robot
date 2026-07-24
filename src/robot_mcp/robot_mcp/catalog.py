@@ -173,13 +173,17 @@ def _build_skill_entry(skill_name: str, template: dict[str, Any]) -> dict[str, A
             accepts_motion = True
 
     description = template.get("description") if isinstance(template.get("description"), dict) else {}
+    executor_name = str(template.get("executor", "")).strip()
 
     entry: dict[str, Any] = {
         "name": skill_name,
         "primitives": primitives,
         "pose_targets": pose_targets,
         "accepts_motion": accepts_motion,
-        "vision_only": skill_name == "inspect_scene" or not primitives,
+        "required_args": [str(arg) for arg in template.get("required_args", [])],
+        "executor": executor_name or "primitive_sequence",
+        "timeout_sec": float(template.get("timeout_sec", 0.0) or 0.0),
+        "vision_only": skill_name == "inspect_scene" or (not primitives and not executor_name),
         "doc": _synthesize_skill_doc(skill_name, description),
     }
 
@@ -234,6 +238,7 @@ _SKILL_DOCS: dict[str, str] = {
     "greet_observe_raise": "Move to observe_table, then greet by raising and lowering the end-effector.",
     "act_cute": "Play a cute attention-seeking wiggle with gripper open-close.",
     "happy_spin_upright": "Keep an upright gesture base while spinning the base joint with a cheerful wrist wiggle.",
+    "pick_object": "Detect, grasp, verify, and lift the requested object.",
 }
 
 
@@ -285,6 +290,8 @@ def _normalize_workspace(workspace: dict[str, Any]) -> dict[str, Any]:
         bounds = workspace.get(axis)
         if isinstance(bounds, list | tuple) and len(bounds) == 2:
             out[axis] = [round(float(bounds[0]), 4), round(float(bounds[1]), 4)]
+    if workspace.get("max_radius_m") is not None:
+        out["max_radius_m"] = round(float(workspace["max_radius_m"]), 4)
     return out
 
 

@@ -42,7 +42,7 @@ def test_prompt_builder_includes_task_and_image():
     assert "抓取目标物并放到右侧托盘" in messages[1]["content"][0]["text"]
     assert "scene_understanding" in messages[1]["content"][0]["text"]
     assert "required_missing_skills" in messages[1]["content"][0]["text"]
-    assert "Object grounding, picking, placing" in messages[0]["content"][0]["text"]
+    assert "Object picking is available only when pick_object appears" in messages[0]["content"][0]["text"]
     assert messages[1]["content"][1]["type"] == "image_url"
     assert messages[1]["content"][2]["type"] == "image_url"
     assert "rgbd_context" in messages[1]["content"][0]["text"]

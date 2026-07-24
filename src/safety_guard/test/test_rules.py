@@ -14,13 +14,10 @@ SKILL_TEMPLATES = {
             {"primitive_name": "open_gripper"},
         ]
     },
-    "pick_named_target": {
-        "primitive_sequence": [
-            {"primitive_name": "move_to_named_pose", "target_pose_key": "pregrasp_pose"},
-            {"primitive_name": "move_to_named_pose", "target_pose_key": "grasp_pose"},
-            {"primitive_name": "close_gripper"},
-            {"primitive_name": "move_to_named_pose", "target_pose_key": "lift_pose"},
-        ]
+    "pick_object": {
+        "executor": "grasp_pipeline",
+        "required_args": ["target_name"],
+        "timeout_sec": 180.0,
     },
     "move_relative_ee": {
         "primitive_sequence": [
@@ -74,10 +71,10 @@ def test_validate_named_pose_rejects_non_numeric_coordinate():
     assert "pose x must be finite" in reason
 
 
-def test_validate_skill_requires_target():
+def test_validate_pick_object_requires_target_query():
     allowed, reason = validate_skill_request(
-        "pick_named_target",
-        "missing_target",
+        "pick_object",
+        "",
         "",
         "",
         0.0,
@@ -86,7 +83,22 @@ def test_validate_skill_requires_target():
         SKILL_TEMPLATES,
     )
     assert not allowed
-    assert "unknown target" in reason
+    assert "target_name is required" in reason
+
+
+def test_validate_pick_object_accepts_runtime_target_query():
+    allowed, reason = validate_skill_request(
+        "pick_object",
+        "banana",
+        "",
+        "",
+        0.0,
+        {"home": {}},
+        {},
+        SKILL_TEMPLATES,
+    )
+    assert allowed
+    assert reason == ""
 
 
 def test_validate_skill_uses_default_templates_without_override():
@@ -353,6 +365,45 @@ def test_validate_joint_primitive_rejects_numeric_string_position():
 
     assert not allowed
     assert "joint target for 1" in reason
+
+
+def test_validate_dynamic_pose_requires_normalized_quaternion():
+    allowed, reason = validate_primitive_request(
+        "move_to_pose",
+        "",
+        0.0,
+        0.0,
+        0.0,
+        0.2,
+        0.0,
+        0.2,
+        0.0,
+        {},
+        {"x": [0.0, 0.4], "y": [-0.2, 0.2], "z": [0.0, 0.4]},
+        target_qw=0.0,
+    )
+    assert not allowed
+    assert "quaternion must be non-zero" in reason
+
+
+def test_validate_dynamic_pose_inside_workspace():
+    allowed, reason = validate_primitive_request(
+        "move_to_pose",
+        "",
+        0.0,
+        0.0,
+        0.0,
+        0.2,
+        0.0,
+        0.2,
+        0.0,
+        {},
+        {"x": [0.0, 0.4], "y": [-0.2, 0.2], "z": [0.0, 0.4], "max_radius_m": 0.4},
+        target_qw=1.0,
+        velocity_scaling=0.05,
+    )
+    assert allowed
+    assert reason == ""
 
 
 def test_validate_hover_skill_requires_target_pose_key():

@@ -1,5 +1,3 @@
-import pytest
-
 from vlm_task_planner.response_parser import parse_planner_response
 
 
@@ -28,23 +26,24 @@ def test_parse_response_with_relative_motion():
     assert plan.confidence == 0.91
 
 
-def test_parse_response_rejects_disabled_pick_skill_even_if_allowed():
-    with pytest.raises(ValueError, match="disabled skill"):
-        parse_planner_response(
-            """
-            {
-              "intent": "pick_only",
-              "skill_sequence": [
-                {"skill_name": "pick_named_target", "args": {"target_name": "demo_object"}}
-              ],
-              "confidence": 0.91
-            }
-            """,
-            allowed_skills=["pick_named_target"],
-            default_target_name="demo_object",
-            default_place_name="tray_right",
-            default_relative_motion_step_m=0.03,
-        )
+def test_parse_response_accepts_pick_object_target_query():
+    plan = parse_planner_response(
+        """
+        {
+          "intent": "pick_only",
+          "skill_sequence": [
+            {"skill_name": "pick_object", "args": {"target_name": "banana"}}
+          ],
+          "confidence": 0.91
+        }
+        """,
+        allowed_skills=["pick_object"],
+        default_target_name="",
+        default_place_name="tray_right",
+        default_relative_motion_step_m=0.03,
+    )
+    assert plan.skill_sequence == ["pick_object"]
+    assert plan.target_name == "banana"
 
 
 def test_parse_response_rejects_unknown_skill():

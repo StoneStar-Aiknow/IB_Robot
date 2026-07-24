@@ -15,9 +15,13 @@
 - 抓取规划服务：`/grasp_planner/plan_grasp`
 - 抓取验证服务：`/grasp_verifier/verify_grasp`
 - 执行脚本：`scripts/test_banana_handeye_pick.py`
+- Hermes MCP 服务名：`ibrobot`
+- Hermes 抓取技能：`pick_object`，不要写成 `pick-object`
 
 真机启动必须传 `config_path:=/tmp/so101_handeye_realsense_grasp.yaml`。不要只传
 `robot_config:=so101_handeye_realsense_only`，否则可能加载仓库默认 YAML，把主臂端口当成从动臂控制。
+每次拉取抓取/Hermes 能力更新后，先运行 runtime 合成器；它保留本机串口、相机和手眼标定，
+并从仓库 SSOT 更新 `grasp_execution`、`embodied` 及安全策略。
 
 常用命令都从仓库根目录执行：
 
@@ -34,11 +38,17 @@ cd ~/IB_Robot
 ./scripts/download_perception_models.sh
 ```
 
-构建相关包：
+构建完整抓取与 Hermes 调用链：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && colcon build --symlink-install --merge-install --packages-select \
-  ibrobot_msgs perception_service manipulation_service robot_config dataset_tools
+cd ~/IB_Robot && source .shrc_local && colcon build --symlink-install --merge-install --packages-up-to \
+  embodied_bringup robot_mcp manipulation_execution
+```
+
+把仓库能力配置合入已标定的 runtime YAML：
+
+```bash
+cd ~/IB_Robot && source .shrc_local && python3 scripts/synthesize_so101_grasp_runtime_config.py
 ```
 
 ## 1. 清理残留节点
@@ -82,6 +92,22 @@ MoveIt Gateway fully initialized
 TaskExecutor ready
 ```
 
+### 终端 A2：并行 IK/FK Worker，监督式脚本需要
+
+当前 SO101 robot_config 默认使用 4 个隔离 worker；运行监督式脚本前启动：
+
+```bash
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 launch robot_moveit so101_ik_workers.launch.py \
+  worker_count:=4 \
+  namespace_prefix:=ik_worker \
+  use_sim_time:=false
+```
+
+这些 worker 只提供 `/ik_worker_<n>/compute_ik` 和 `/ik_worker_<n>/compute_fk`，不会发送运动命令。如需临时退回串行候选准备，显式传 `--ik-worker-count 0`。
+
+该终端只用于单独运行监督式脚本。通过第 11 节的 `embodied_pipeline.launch.py` 启动 Hermes 抓取时，
+launch 会读取 `grasp_execution.ik.worker_count` 并自动启动同样的 worker，不要重复启动本终端。
+
 ### 终端 B：Grounded-SAM2
 
 ```bash
@@ -108,6 +134,7 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 run mani
   -p debug_output_dir:=outputs/grasp_pipeline \
   -p enable_collision_filter:=false \
   -p enable_tabletop_filter:=true \
+  -p enable_source_gripper_tabletop_sweep:=false \
   -p require_tabletop_filter:=false \
   -p tabletop_filter_mode:=diagnostic \
   -p tabletop_clearance:=0.002 \
@@ -261,8 +288,9 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source instal
   --detect-only \
   --handeye-source robot-config \
   --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
-  --debug-output-mode full \
-  --execution-debug-preview \
+  --debug-output-mode diagnostic \
+  --no-execution-debug-preview \
+  --ik-worker-count 4 \
   --centroid-source volume \
   --task-goal-timeout-s 60.0 \
   --so101-tabletop-filter \
@@ -286,18 +314,18 @@ FLOW_RESULT success=True
 
 完整抓取前检查 `outputs/grasp_pipeline/...`：
 
+- `grasp_result.json`
 - `execution_candidates.json`
-- `grasp_preview_so101_execution.html`
-- `grasp_preview_so101_execution.svg`
-- `grasp_preview_execution_stages.svg`
+- `prepared_candidate_ranking.json`
 
 detect-only 选中的记录使用 `reason: selected_detect_only`，不能把它误认为已经执行过真实抓取。
 
 如果出现 `height_guard_failed`、`so101_tabletop_failed`，或候选明显在桌面下，不要继续完整抓取。
 
-`--so101-tabletop-filter` 依赖 `scene_cloud.ply` 拟合桌面。执行脚本在该开关开启时会自动把
-PlanGrasp 请求提升为 `debug_output_mode=full`；如果仍拿不到 SO101 tabletop clearance，候选会
-fail closed 并以 `so101_tabletop_failed` 拒绝，不会静默放行。
+`--so101-tabletop-filter` 优先使用 PlanGrasp 响应中的 execution table plane，不需要为了正常抓取
+生成完整 PLY 和 HTML/SVG/PNG 预览。如果响应中没有可用平面，候选会 fail closed 并以
+`so101_tabletop_failed` 拒绝，不会静默放行。只有排查点云或夹爪几何时才临时启用
+`--debug-output-mode full --execution-debug-preview`。
 
 同时检查终端日志中的：
 
@@ -313,8 +341,9 @@ fail closed 并以 `so101_tabletop_failed` 拒绝，不会静默放行。
 cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && python3 scripts/test_banana_handeye_pick.py \
   --handeye-source robot-config \
   --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
-  --debug-output-mode full \
-  --execution-debug-preview \
+  --debug-output-mode diagnostic \
+  --no-execution-debug-preview \
+  --ik-worker-count 4 \
   --pick-diagnostics \
   --no-pick-diagnostics-detect \
   --grasp-verification required \
@@ -368,7 +397,10 @@ FLOW_RESULT success=True
 - `pick_pose_diagnostics.json`：实际位姿误差和接触点 residual。
 - `grasp_verification.json`：close、3 cm probe lift 和最终 lift 的夹爪位置、电流及融合判定。
 - `execution_candidates.json`：最终 selected 候选和被拒原因。
-- `grasp_preview_so101_execution.html`：执行侧 3D 预览。
+- `prepared_candidate_ranking.json`：候选软排序和各评分项。
+
+默认命令不生成执行侧 HTML/SVG/PNG 预览。需要视觉排障时，临时改为
+`--debug-output-mode full --execution-debug-preview`。
 
 关键日志解释：
 
@@ -379,7 +411,9 @@ FLOW_RESULT success=True
 - `CONTACT_REALIGN_CHECK phase=grasp`：低位只检查 residual，不再横向 realign、回撤或 abort。
 - `IK_FK_CONTACT_COMP`：最终下降前使用 IK 关节解做 FK，按预测接触点的 base-X/Y residual 迭代修正命令。
 - `IK_FK_CANDIDATE`：候选 IK 解的完整接触点误差；`z_error` 是 X/Y 补偿无法消除的误差，超过上限时候选会在执行前被拒绝。
-- `IK_FK_CANDIDATE_RANK`：在所有保护检查通过后，按无法补偿的 `z_error` 从小到大排列执行顺序。
+- `PREPARED_CANDIDATE_RANK`：按固定爪包络、目标体积质心距离、IK/FK 接触误差和候选置信度的综合软分排列执行顺序。
+- `IK_FK_CANDIDATE_RANK`：仅在固定爪软排序关闭时使用，按无法补偿的 `z_error` 从小到大排列执行顺序。
+- `prepared_candidate_ranking.json`：Hermes 执行层和本监督式脚本都会输出的 IK/FK 后软排序明细，优先保留目标位于固定爪与活动爪包络内的候选；固定爪前缘间隙偏好只降级排名，不单独拒绝候选。
 - `IK_FK_GEOMETRY_CHECK`：用候选实际 IK 解的 FK 姿态重新检查夹爪网格和桌面间隙，detect-only 阶段也会执行。
 - `MOVE_CONFIGURATION_RESULT`：通过 MoveIt 执行补偿时使用的同一组 IK 关节角，避免网关重新求解。
 - `action=log_only_realign_threshold_exceeded` / `action=log_only_abort_threshold_exceeded`：说明 residual 超过对应日志阈值，但仍继续 close；这是现场策略，避免肉眼可抓位置被阈值误判后反复 retry。
@@ -431,6 +465,54 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source instal
 --target-offset-x 0.00 --target-offset-y 0.00 --target-offset-z 0.00
 ```
 
+这些参数是单次运行的 base-frame 执行修正，不是手眼标定修正。GraspGen 模式会在 workspace、
+桌面间隙和 IK/FK 检查前把修正应用到候选抓取位姿，因此修改后必须先用相同参数执行
+`--detect-only`，确认仍有安全候选，再进行真实抓取。不要根据单个目标的结果直接把修正写入机器人
+SSOT；不同目标的接触高度可能不同。
+
+2026-07-17 的 marker 实测中，两次无 Z 修正的执行接触点分别比观测体积质心高 `7.10 mm` 和
+`8.03 mm`，闭合电流均为 `0 A`。使用以下目标特定修正后，接触点高度差降至 `2.10 mm`，close、
+probe lift 和 final lift 三阶段验证均为 `confidence=1.00`：
+
+```bash
+--prompt marker --target-offset-z -0.008
+```
+
+该值目前只作为 marker 测试覆盖项保留。已有 banana 样例在 `--target-offset-z 0.000` 下成功，
+因此没有足够证据把 `-0.008 m` 设为全局默认值。
+
+需要连续测试并在每次成功后释放目标时：
+
+```bash
+--release-after-success \
+--release-drop-height-m 0.015 \
+--release-settle-s 1.0
+```
+
+脚本会先完成 close、probe lift 和 final lift 三阶段验证，再下降到抓取位姿上方 `15 mm` 打开夹爪。
+低位释放可以减少目标从 `5 cm` 高度直接掉落后的弹跳。close 验证失败会保持闭合并撤回到安全高度后
+打开；probe/final retention 验证失败会在当前抬升位打开，再返回观察位。
+
+prepared candidate 软排序 A/B 可用：
+
+```bash
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
+  python3 scripts/run_marker_grasp_ab_trials.py --trials-per-mode 10
+```
+
+runner 按 baseline、enhanced 交替执行。baseline 传入 `--no-prepared-candidate-scoring`，enhanced 传入
+`--prepared-candidate-scoring`；其他抓取、偏移、安全和验证参数保持一致。每次尝试写独立日志，并在
+`outputs/grasp_ab/<timestamp>_marker_ab/summary.json` 汇总结果。目标释放后如果移动到图像边界，需暂停
+并重新居中，避免把视野丢失误判为候选排序效果。
+
+2026-07-17 marker 正式 10+10 次测试结果为 baseline `5/10`、enhanced `5/10`。enhanced 成功
+候选的平均体积质心距离由 `11.0 mm` 降到 `7.2 mm`，平均 IK/FK XY residual 由 `12.5 mm`
+降到 `8.1 mm`，但本样本未观察到最终成功率提升。完整报告位于：
+
+```text
+outputs/grasp_ab/formal_marker_ab_20260717_report.md
+```
+
 最终抓取 X/Y 方向受 5-DOF 姿态误差影响时，优先使用动态 IK/FK 接触点补偿，而不是直接写死
 `target-offset-x` / `target-offset-y`：
 
@@ -460,7 +542,14 @@ GraspGen 候选：
 ```
 
 `--max-candidates` 是 IK/FK 检查预算。脚本会先对 GraspGen 返回的全部候选做质心、top-down 和
-置信度重排，再截取前 80 个；不会再把低于原始置信度前 80、但几何更合适的候选提前丢掉。
+置信度重排，再对全部候选执行 fixed-finger side、workspace、height 和 SO101 tabletop 等廉价
+几何检查，最后只把排序靠前的 80 个通过者送入 IK/FK。这样不会因为前 80 个源候选被廉价门限
+拒绝而丢掉后续可执行候选；`<=0` 时会检查全部通过廉价门限的候选。
+
+`--ik-worker-count 4` 只并行候选准备。脚本先从 `/joint_states` 固定一份共同 IK seed，再把通过
+workspace/height/tabletop 检查的候选分片到 4 个独立 MoveIt worker，最后按原候选顺序汇总。
+最终抓取前的接触补偿、`move_to_configuration` 和所有运动仍走主 MoveIt 串行链路。默认值为 0，
+因此未显式启用时行为仍是单 `/compute_ik`、`/compute_fk` 服务。
 
 Top-down 偏好：
 
@@ -541,3 +630,37 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service 
 - 先看 `HANDEYE_QUALITY` 和 runtime YAML 中 wrist 相机 transform。
 - 确认命令使用 `--handeye-source robot-config --robot-config /tmp/so101_handeye_realsense_grasp.yaml`。
 - 若 `GRASPGEN_EE_ALIGNMENT` 没出现，说明脚本或环境不是当前版本。
+
+## 11. 启动 Hermes 抓取链路
+
+终端 1：启动完整 ROS 抓取节点：
+
+```bash
+cd ~/IB_Robot && source .shrc_local && \
+python3 scripts/synthesize_so101_grasp_runtime_config.py && \
+export ROS_DOMAIN_ID=218 && source install/setup.bash && \
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
+  robot_config:=so101_handeye_realsense_only \
+  config_path:=/tmp/so101_handeye_realsense_grasp.yaml \
+  control_mode:=moveit_planning \
+  use_sim:=false \
+  moveit_display:=false \
+  with_embodied:=true
+```
+
+该 launch 会自动启动：
+
+- `grounded_sam2_node`：GDINO + SAM 检测分割。
+- `grasp_planner_node`：GraspGen 抓取规划。
+- `grasp_verifier_node`：抓取结果验证。
+- `pick_executor_node`：正式抓取执行。
+- 4 个 `/ik_worker_<n>/compute_ik`、`compute_fk`：与监督式脚本相同的候选并行准备池。
+- `skill_executor_node` 和 `safety_guard_node`：Hermes 技能执行与安全校验。
+
+不要再单独启动同名节点，否则会出现重复 service/action server。
+
+终端 2：启动 Hermes：
+
+```bash
+cd ~/IB_Robot && hermes --cli
+```

@@ -140,7 +140,7 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 ### 当前约束
 
 - 这是**规则规划器**，不是通用大模型 Planner。
-- 抓取、放置和目标物操作类文本当前会被显式拒绝，不会映射为 pick/place 技能。
+- 规则规划器仍不直接生成抓取；VLM 或 Hermes 可在机器人配置允许时显式选择 `pick_object`。
 - 不支持的文本会直接拒绝，并在 `/embodied/task_status` 发布 `rejected`。
 
 ### 当前接口

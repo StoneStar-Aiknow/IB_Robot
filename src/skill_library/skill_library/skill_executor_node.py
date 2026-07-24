@@ -1,6 +1,7 @@
 """Skill and primitive execution node for the embodied minimal closure."""
 
 import math
+import threading
 import time
 import uuid
 from collections.abc import Callable
@@ -9,16 +10,16 @@ import rclpy
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
 from geometry_msgs.msg import Pose, PoseStamped
-from rclpy.action import ActionClient, ActionServer, CancelResponse
+from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
-from ibrobot_msgs.action import ExecuteTaskPlan, PrimitiveCommand, SkillCommand
+from ibrobot_msgs.action import ExecuteTaskPlan, PickObject, PrimitiveCommand, SkillCommand
 from ibrobot_msgs.msg import TaskStep
-from ibrobot_msgs.srv import ValidatePrimitive, ValidateSkill
+from ibrobot_msgs.srv import MoveToConfiguration, ValidatePrimitive, ValidateSkill
 from skill_library.resolver import PrimitiveSpec, load_json_mapping, resolve_skill_primitives
 
 EE_POSITION_TOLERANCE_M = 0.02
@@ -81,6 +82,8 @@ class SkillExecutorNode(Node):
         self.declare_parameter("joint_limits_json", "{}")
         self.declare_parameter("arm_trajectory_action_name", "/arm_trajectory_controller/follow_joint_trajectory")
         self.declare_parameter("task_executor_action_name", "/task_executor/execute_task_plan")
+        self.declare_parameter("pick_action_name", "/manipulation/execute_pick")
+        self.declare_parameter("move_configuration_service", "/moveit_gateway/move_to_configuration")
         self.declare_parameter("ee_pose_topic", "/robot_status/ee_pose")
         self.declare_parameter("joint_state_topic", "/joint_states")
         self.declare_parameter("debug_tracing", False)
@@ -120,11 +123,17 @@ class SkillExecutorNode(Node):
         self._task_executor_action_name = (
             self.get_parameter("task_executor_action_name").get_parameter_value().string_value
         )
+        self._pick_action_name = self.get_parameter("pick_action_name").get_parameter_value().string_value
+        self._move_configuration_service = (
+            self.get_parameter("move_configuration_service").get_parameter_value().string_value
+        )
         self._ee_pose_topic = self.get_parameter("ee_pose_topic").get_parameter_value().string_value
         self._joint_state_topic = self.get_parameter("joint_state_topic").get_parameter_value().string_value
         self._debug = self.get_parameter("debug_tracing").get_parameter_value().bool_value
         self._latest_ee_pose = None
         self._latest_joint_state = None
+        self._skill_goal_lock = threading.Lock()
+        self._skill_goal_active = False
 
         callback_group = ReentrantCallbackGroup()
         self._pose_publisher = self.create_publisher(Pose, "/cmd_pose", 10)
@@ -160,11 +169,18 @@ class SkillExecutorNode(Node):
         self._primitive_client = ActionClient(
             self, PrimitiveCommand, self._primitive_action_name, callback_group=callback_group
         )
+        self._pick_client = ActionClient(self, PickObject, self._pick_action_name, callback_group=callback_group)
+        self._move_configuration_client = self.create_client(
+            MoveToConfiguration,
+            self._move_configuration_service,
+            callback_group=callback_group,
+        )
         self._skill_server = ActionServer(
             self,
             SkillCommand,
             self._skill_action_name,
             execute_callback=self._execute_skill,
+            goal_callback=self._handle_skill_goal,
             cancel_callback=self._handle_cancel,
             callback_group=callback_group,
         )
@@ -194,6 +210,13 @@ class SkillExecutorNode(Node):
     @staticmethod
     def _handle_cancel(_cancel_request):
         return CancelResponse.ACCEPT
+
+    def _handle_skill_goal(self, _goal_request):
+        with self._skill_goal_lock:
+            if self._skill_goal_active:
+                return GoalResponse.REJECT
+            self._skill_goal_active = True
+        return GoalResponse.ACCEPT
 
     @staticmethod
     def _wait_for_future(
@@ -346,6 +369,7 @@ class SkillExecutorNode(Node):
         relative_dy: float = 0.0,
         relative_dz: float = 0.0,
         target_pose: Pose | None = None,
+        velocity_scaling: float = 0.0,
         joint_names: list[str] | None = None,
         joint_positions: list[float] | None = None,
         joint_waypoints: list[float] | None = None,
@@ -366,10 +390,19 @@ class SkillExecutorNode(Node):
             request.target_x = float(target_pose.position.x)
             request.target_y = float(target_pose.position.y)
             request.target_z = float(target_pose.position.z)
+            request.target_qx = float(target_pose.orientation.x)
+            request.target_qy = float(target_pose.orientation.y)
+            request.target_qz = float(target_pose.orientation.z)
+            request.target_qw = float(target_pose.orientation.w)
         else:
             request.target_x = 0.0
             request.target_y = 0.0
             request.target_z = 0.0
+            request.target_qx = 0.0
+            request.target_qy = 0.0
+            request.target_qz = 0.0
+            request.target_qw = 0.0
+        request.velocity_scaling = float(velocity_scaling)
         request.gripper_position = float(gripper_position)
         request.joint_names = list(joint_names or [])
         request.joint_positions = [float(position) for position in (joint_positions or [])]
@@ -439,6 +472,8 @@ class SkillExecutorNode(Node):
                 result.pose_name = ""
                 goal_handle.abort()
                 return result
+        elif goal.primitive_name == "move_to_pose":
+            target_pose = goal.target_pose
 
         allowed, reason = self._validate_primitive(
             goal.primitive_name,
@@ -448,6 +483,7 @@ class SkillExecutorNode(Node):
             relative_dy=goal.relative_dy,
             relative_dz=goal.relative_dz,
             target_pose=target_pose,
+            velocity_scaling=goal.velocity_scaling,
             joint_names=list(goal.joint_names),
             joint_positions=list(goal.joint_positions),
             joint_waypoints=list(goal.joint_waypoints),
@@ -468,7 +504,26 @@ class SkillExecutorNode(Node):
         feedback.detail = f"primitive={goal.primitive_name}"
         goal_handle.publish_feedback(feedback)
 
-        if goal.primitive_name == "move_to_joint_positions":
+        if goal.primitive_name == "move_to_configuration":
+            move_timeout = float(goal.timeout_sec if goal.timeout_sec > 0.0 else 30.0)
+            ok, err_msg = self._exec_move_configuration(
+                goal_handle,
+                list(goal.joint_names),
+                list(goal.joint_positions),
+                float(goal.velocity_scaling),
+                move_timeout,
+            )
+            if not ok:
+                result.success = False
+                result.error_code = "PRIMITIVE_ARM_FAILED"
+                result.message = err_msg
+                result.pose_name = ""
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                else:
+                    goal_handle.abort()
+                return result
+        elif goal.primitive_name == "move_to_joint_positions":
             move_timeout = float(goal.timeout_sec if goal.timeout_sec > 0.0 else 30.0)
             ok, err_msg = self._exec_arm_joint_trajectory(
                 goal_handle,
@@ -497,7 +552,7 @@ class SkillExecutorNode(Node):
             )
             if not ok:
                 return self._finish_primitive_failure(result, goal_handle, "PRIMITIVE_ARM_FAILED", err_msg, "")
-        elif goal.primitive_name in {"move_to_named_pose", "move_relative_ee"}:
+        elif goal.primitive_name in {"move_to_named_pose", "move_to_pose", "move_relative_ee"}:
             if goal.primitive_name == "move_to_named_pose":
                 try:
                     pose = self._pose_from_name(goal.pose_name)
@@ -508,6 +563,8 @@ class SkillExecutorNode(Node):
                     result.pose_name = goal.pose_name
                     goal_handle.abort()
                     return result
+            elif goal.primitive_name == "move_to_pose":
+                pose = goal.target_pose
             else:
                 pose = target_pose
             if self._debug:
@@ -519,7 +576,12 @@ class SkillExecutorNode(Node):
                 )
             move_timeout = float(goal.timeout_sec if goal.timeout_sec > 0.0 else 30.0)
             ok, err_msg = self._exec_arm_via_task_dispatch(
-                goal_handle, goal.primitive_name, pose, goal.task_id, move_timeout
+                goal_handle,
+                goal.primitive_name,
+                pose,
+                goal.task_id,
+                move_timeout,
+                float(goal.velocity_scaling),
             )
             if not ok:
                 return self._finish_primitive_failure(
@@ -608,10 +670,16 @@ class SkillExecutorNode(Node):
                 f"-> quat=({qx:.3f},{qy:.3f},{qz:.3f},{qw:.3f})"
             )
 
-        return self._exec_arm_via_task_dispatch(goal_handle, primitive_name, target_pose, task_id, timeout_sec)
+        return self._exec_arm_via_task_dispatch(goal_handle, primitive_name, target_pose, task_id, timeout_sec, 0.0)
 
     def _exec_arm_via_task_dispatch(
-        self, goal_handle, primitive_name: str, target_pose: Pose, task_id: str, timeout_sec: float
+        self,
+        goal_handle,
+        primitive_name: str,
+        target_pose: Pose,
+        task_id: str,
+        timeout_sec: float,
+        velocity_scaling: float,
     ) -> tuple[bool, str]:
         """Send a MOVE_TO_POSE TaskStep to task_dispatch ExecuteTaskPlan action server."""
         if not self._task_executor_client.wait_for_server(timeout_sec=2.0):
@@ -623,7 +691,7 @@ class SkillExecutorNode(Node):
         step.type = TaskStep.MOVE_TO_POSE
         step.label = primitive_name
         step.target_pose = target_pose
-        step.velocity_scaling = 0.0  # use default
+        step.velocity_scaling = float(velocity_scaling)
 
         goal_msg = ExecuteTaskPlan.Goal()
         goal_msg.steps = [step]
@@ -759,6 +827,40 @@ class SkillExecutorNode(Node):
         if result is None or result.result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
             error_code = result.result.error_code if result is not None else "unknown"
             return False, f"arm trajectory execution failed: {error_code}"
+        return True, ""
+
+    def _exec_move_configuration(
+        self,
+        goal_handle,
+        joint_names: list[str],
+        joint_positions: list[float],
+        velocity_scaling: float,
+        timeout_sec: float,
+    ) -> tuple[bool, str]:
+        if not self._move_configuration_client.wait_for_service(timeout_sec=self._rpc_timeout):
+            return False, f"move configuration service unavailable: {self._move_configuration_service}"
+
+        request = MoveToConfiguration.Request()
+        request.target_joint_state = JointState()
+        request.target_joint_state.name = list(joint_names)
+        request.target_joint_state.position = [float(position) for position in joint_positions]
+        request.velocity_scaling = float(velocity_scaling)
+        future = self._move_configuration_client.call_async(request)
+        deadline = time.monotonic() + timeout_sec
+        while rclpy.ok() and not future.done():
+            if goal_handle.is_cancel_requested:
+                future.cancel()
+                return False, "cancelled during MoveIt configuration motion"
+            if time.monotonic() >= deadline:
+                future.cancel()
+                return False, "timeout waiting for MoveIt configuration motion"
+            time.sleep(0.05)
+
+        response = future.result()
+        if response is None:
+            return False, "move configuration service returned no response"
+        if not response.success:
+            return False, response.message
         return True, ""
 
     def _exec_arm_joint_waypoint_trajectory(
@@ -915,7 +1017,112 @@ class SkillExecutorNode(Node):
             return False, f"gripper execution failed: {result.message}"
         return True, ""
 
+    def _execute_pick_skill(self, goal_handle, template: dict) -> SkillCommand.Result:
+        goal = goal_handle.request
+        result = SkillCommand.Result()
+        timeout_sec = float(goal.timeout_sec or template.get("timeout_sec", 180.0))
+
+        if not self._pick_client.wait_for_server(timeout_sec=self._rpc_timeout):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "PICK_SERVER_UNAVAILABLE",
+                f"pick action server unavailable: {self._pick_action_name}",
+            )
+
+        completed_phases: list[str] = []
+
+        def _feedback_cb(feedback_msg) -> None:
+            pick_feedback = feedback_msg.feedback
+            phase = str(pick_feedback.phase)
+            if phase and (not completed_phases or completed_phases[-1] != phase):
+                completed_phases.append(phase)
+            feedback = SkillCommand.Feedback()
+            feedback.state = "executing"
+            feedback.detail = f"pick:{phase}:{pick_feedback.detail}"
+            goal_handle.publish_feedback(feedback)
+
+        pick_goal = PickObject.Goal()
+        pick_goal.task_id = goal.task_id
+        pick_goal.target_query = goal.target_name
+        pick_goal.timeout_sec = timeout_sec
+        send_future = self._pick_client.send_goal_async(pick_goal, feedback_callback=_feedback_cb)
+        if not self._wait_for_future(send_future, timeout_sec=self._rpc_timeout):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                completed_phases,
+                "PICK_GOAL_TIMEOUT",
+                "timed out sending pick goal",
+            )
+
+        pick_handle = send_future.result()
+        if pick_handle is None or not pick_handle.accepted:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                completed_phases,
+                "PICK_GOAL_REJECTED",
+                "pick executor rejected the goal",
+            )
+
+        result_future = pick_handle.get_result_async()
+        deadline = time.monotonic() + timeout_sec
+        while rclpy.ok() and not result_future.done():
+            if goal_handle.is_cancel_requested:
+                self._cancel_goal(pick_handle)
+                result.success = False
+                result.error_code = "SKILL_CANCELLED"
+                result.message = "pick skill cancelled"
+                result.executed_primitives = [f"grasp_pipeline:{phase}" for phase in completed_phases]
+                goal_handle.canceled()
+                return result
+            if time.monotonic() >= deadline:
+                self._cancel_goal(pick_handle)
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [f"grasp_pipeline:{phase}" for phase in completed_phases],
+                    "SKILL_TIMEOUT",
+                    "pick skill deadline exceeded",
+                )
+            time.sleep(0.05)
+
+        action_result = result_future.result()
+        pick_result = action_result.result if action_result is not None else None
+        result.executed_primitives = [f"grasp_pipeline:{phase}" for phase in completed_phases]
+        if pick_result is None:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                result.executed_primitives,
+                "MISSING_PICK_RESULT",
+                "pick executor returned no result",
+            )
+        if not pick_result.success:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                result.executed_primitives,
+                pick_result.error_code or "PICK_FAILED",
+                pick_result.message,
+            )
+
+        result.success = True
+        result.error_code = ""
+        result.message = pick_result.message
+        goal_handle.succeed()
+        return result
+
     def _execute_skill(self, goal_handle):
+        try:
+            return self._execute_skill_impl(goal_handle)
+        finally:
+            with self._skill_goal_lock:
+                self._skill_goal_active = False
+
+    def _execute_skill_impl(self, goal_handle):
         goal = goal_handle.request
         result = SkillCommand.Result()
 
@@ -928,6 +1135,10 @@ class SkillExecutorNode(Node):
         )
         if not allowed:
             return self._abort_skill(result, goal_handle, [], "SKILL_REJECTED", reason)
+
+        template = self._skill_templates.get(goal.skill_name, {})
+        if str(template.get("executor", "")).strip() == "grasp_pipeline":
+            return self._execute_pick_skill(goal_handle, template)
 
         try:
             primitives: list[PrimitiveSpec] = resolve_skill_primitives(
@@ -988,7 +1199,7 @@ class SkillExecutorNode(Node):
             feedback = SkillCommand.Feedback()
             feedback.state = "executing"
             feedback.detail = f"{primitive_name}:{pose_name or gripper_position}"
-            if primitive_name in {"move_to_joint_positions", "move_through_joint_positions"}:
+            if primitive_name in {"move_to_configuration", "move_to_joint_positions", "move_through_joint_positions"}:
                 feedback.detail = f"{primitive_name}:{','.join(primitive.joint_names)}"
             goal_handle.publish_feedback(feedback)
 
@@ -996,6 +1207,7 @@ class SkillExecutorNode(Node):
             primitive_goal.task_id = goal.task_id
             primitive_goal.primitive_name = primitive_name
             primitive_goal.pose_name = pose_name
+            primitive_goal.velocity_scaling = 0.0
             primitive_goal.relative_dx = float(primitive.relative_dx)
             primitive_goal.relative_dy = float(primitive.relative_dy)
             primitive_goal.relative_dz = float(primitive.relative_dz)
@@ -1110,7 +1322,7 @@ class SkillExecutorNode(Node):
                     f"{primitive_name}:{primitive.relative_dx:.3f},"
                     f"{primitive.relative_dy:.3f},{primitive.relative_dz:.3f}"
                 )
-            if primitive_name == "move_to_joint_positions":
+            if primitive_name in {"move_to_configuration", "move_to_joint_positions"}:
                 primitive_label = f"{primitive_name}:" + ",".join(
                     f"{joint_name}={joint_position:.3f}"
                     for joint_name, joint_position in zip(

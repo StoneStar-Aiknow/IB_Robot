@@ -146,7 +146,7 @@ async def execute_skill(
     place_name: str = "",
     motion_direction: str = "",
     motion_distance: float = 0.0,
-    timeout_sec: float = 30.0,
+    timeout_sec: float = 0.0,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Execute a real robot skill via /embodied/execute_skill (moves the robot).
@@ -163,7 +163,8 @@ async def execute_skill(
         target_name/place_name: object/place reference (skill-dependent).
         motion_direction: forward/backward/left/right/up/down (move_relative_ee).
         motion_distance: meters (for move_relative_ee).
-        timeout_sec: action-side timeout for the whole skill.
+        timeout_sec: action-side timeout for the whole skill. Zero uses the
+            skill timeout declared in robot_config, then falls back to 15s.
     """
     if _catalog is None:  # pragma: no cover
         raise RuntimeError("Catalog not initialized")
@@ -185,6 +186,11 @@ async def execute_skill(
             "error_code": "SERVER_UNAVAILABLE",
             "message": (f"{_bridge.skill_action_name} action server not available (is skill_executor running?)"),
         }
+
+    skill_entry = next((skill for skill in _catalog.skills if skill["name"] == skill_name), None)
+    effective_timeout = float(timeout_sec)
+    if effective_timeout <= 0.0:
+        effective_timeout = float((skill_entry or {}).get("timeout_sec", 0.0) or 15.0)
 
     admission_state = _bridge.try_claim_skill_execution()
     if admission_state is not None:
@@ -209,7 +215,7 @@ async def execute_skill(
             place_name=place_name,
             motion_direction=motion_direction,
             motion_distance=motion_distance,
-            timeout_sec=timeout_sec,
+            timeout_sec=effective_timeout,
             task_id=task_id,
         )
         send_future, fb_queue = _bridge.send_skill_goal(goal)
@@ -269,7 +275,7 @@ async def execute_skill(
             "message": "failed to track SkillCommand result.",
             "task_id": task_id,
         }
-    overall_deadline = time.monotonic() + float(timeout_sec) + _RESULT_GRACE_SEC
+    overall_deadline = time.monotonic() + effective_timeout + _RESULT_GRACE_SEC
     while not result_future.done() and time.monotonic() < overall_deadline:
         drained = False
         while not fb_queue.empty():
@@ -294,7 +300,8 @@ async def execute_skill(
                 "success": False,
                 "error_code": "RESULT_TIMEOUT",
                 "message": (
-                    f"skill did not complete within {timeout_sec + _RESULT_GRACE_SEC:.1f}s; goal canceled and drained."
+                    f"skill did not complete within {effective_timeout + _RESULT_GRACE_SEC:.1f}s; "
+                    "goal canceled and drained."
                 ),
                 "task_id": task_id,
             }
@@ -303,7 +310,7 @@ async def execute_skill(
             "success": False,
             "error_code": "CANCEL_CLEANUP_TIMEOUT",
             "message": (
-                f"skill did not complete within {timeout_sec + _RESULT_GRACE_SEC:.1f}s; "
+                f"skill did not complete within {effective_timeout + _RESULT_GRACE_SEC:.1f}s; "
                 "motion admission remains blocked until cancellation is terminal."
             ),
             "task_id": task_id,

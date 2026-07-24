@@ -34,6 +34,135 @@ robot:
     shoulder_link: shoulder
 
   grasp_execution:
+    enabled: true
+    action_name: /manipulation/execute_pick
+    auto_start_dependencies: true
+    planner_service: /grasp_planner/plan_grasp
+    verifier_service: /grasp_verifier/verify_grasp
+    detect_service: /grounded_sam2/detect_and_segment
+    ik_service: /compute_ik
+    fk_service: /compute_fk
+    joint_state_topic: /joint_states
+    move_configuration_service: /moveit_gateway/move_to_configuration
+    base_frame: base
+    ee_frame: gripper
+    observe_pose: observe_table
+    timeout_sec: 240.0
+    ready_timeout_sec: 30.0
+    verification: required
+    verification_timeout_sec: 5.0
+    verification_wait_sec: 0.1
+    recover_after_close_failure: true
+    recover_after_retention_failure: true
+    max_execution_attempts: 1
+    approach_distance_m: 0.08
+    lift_distance_m: 0.050
+    observe_velocity_scaling: 0.25
+    approach_velocity_scaling: 0.25
+    descend_velocity_scaling: 0.15
+    probe_lift_velocity_scaling: 0.02
+    lift_velocity_scaling: 0.02
+    observe_settle_sec: 0.6
+    open_settle_sec: 0.3
+    hold_sec: 0.8
+    probe_lift_height_m: 0.03
+    camera:
+      frame_id: camera_wrist_optical_frame
+      rgb_topic: /camera/wrist/image_raw
+      depth_topic: /camera/wrist/aligned_depth_to_color/image_raw
+      camera_info_topic: /camera/wrist/aligned_depth_to_color/camera_info
+    planner:
+      confidence_threshold: 0.30
+      grasp_threshold: 0.20
+      timeout_sec: 120.0
+      debug_output_mode: diagnostic
+    candidate_selection:
+      min_confidence: 0.0
+      min_point_count: 100
+      require_collision_free: false
+      min_contact_z: -0.045
+      min_approach_z: 0.04
+      min_topdown_score: 0.0
+      topdown_min_z: -0.25
+      max_candidates: 80
+      confidence_weight: 1.0
+      topdown_weight: 0.35
+    ik:
+      group_name: arm
+      timeout_sec: 0.20
+      avoid_collisions: false
+      check_orientation: false
+      worker_count: 4
+      worker_namespace_prefix: /ik_worker
+      auto_start_workers: true
+    contact_compensation:
+      enabled: true
+      xy_tolerance_m: 0.003
+      max_iterations: 6
+      max_correction_m: 0.03
+      max_z_error_m: 0.020
+    prepared_candidate_scoring:
+      enabled: true
+      # Prefer candidates that leave the narrow target inside the asymmetric
+      # fixed/moving finger envelope without turning this preference into a reject.
+      fixed_finger_envelope_weight: 0.55
+      contact_xy_weight: 0.25
+      contact_z_weight: 0.15
+      confidence_weight: 0.05
+      centroid_distance_weight: 0.50
+      contact_xy_scale_m: 0.030
+      contact_z_scale_m: 0.020
+      centroid_distance_scale_m: 0.010
+      fixed_finger_gap_sigma_m: 0.006
+      missing_fixed_finger_envelope_score: 0.20
+      fixed_finger_score_weight: 0.80
+      reliable_max_opening_m: 0.072
+      moving_finger_min_clearance_m: 0.003
+    contact_realign:
+      enabled: true
+      tolerance_m: 0.008
+      max_iterations: 2
+      max_correction_m: 0.030
+      settle_sec: 0.25
+      pregrasp_enabled: true
+      pregrasp_clearance_m: 0.020
+    pose_diagnostics:
+      enabled: true
+      settle_sec: 0.05
+      grasp_warn_threshold_m: 0.008
+      grasp_realign_log_threshold_m: 0.010
+      grasp_abort_log_threshold_m: 0.030
+    frame_diagnostics:
+      enabled: true
+    perception_node:
+      device: cuda
+    planner_node:
+      save_debug_outputs: true
+      debug_output_dir: outputs/grasp_pipeline
+      enable_collision_filter: false
+      enable_tabletop_filter: true
+      # Preserve table/object-top outputs; SO101 applies its own mesh hard gate downstream.
+      enable_source_gripper_tabletop_sweep: false
+      require_tabletop_filter: false
+      tabletop_filter_mode: diagnostic
+      tabletop_clearance: 0.002
+      tabletop_pregrasp_distance: 0.08
+      enable_object_cloud_completion: true
+      object_cloud_completion_mode: mask_depth_inpaint
+      enable_object_cloud_prismatic_extrude: true
+      sync_max_age_sec: 0.8
+      input_buffer_size: 90
+      num_grasps: 5000
+      topk_num_grasps: 1000
+    verifier_node:
+      gripper_joint: "6"
+      joint_state_topic: /joint_states
+      joint_current_topic: /so101_follower/joint_currents
+      wrist_depth_topic: /camera/wrist/aligned_depth_to_color/image_raw
+      gripper_closed_position: 0.0
+      gripper_contact_min_opening: 0.08
+      gripper_no_contact_max_opening: 0.03
+      current_contact_threshold_a: 0.08
     source_gripper: robotiq_2f_140
     source_contact_point: [0.0, 0.0, 0.195]
     adapter:
@@ -42,9 +171,19 @@ robot:
     # source candidate provider; these weights tell the target robot which
     # candidates it can execute more reliably.
     execution_scoring:
+      centroid_source: volume
       confidence_weight: 1.0
       contact_distance_weight: 1.0
       contact_distance_scale_m: 0.06
+      topdown_weight: 0.35
+    target_geometry:
+      tabletop_filter: true
+      # Matches the proven supervised banana-pick command while retaining a
+      # hard fail-closed mesh check when the fitted plane is unavailable.
+      tabletop_clearance_m: -0.020
+      tabletop_sweep_steps: 5
+      mesh_package: robot_description
+      mesh_directory: meshes/lerobot/so101
     target_gripper:
       type: asymmetric_single_moving_jaw
       ee_frame: gripper
@@ -54,16 +193,38 @@ robot:
       # Vector from the fixed finger contact point toward the target width center.
       # It must align with the GraspGen source gripper width axis after source_to_ee_rpy.
       closing_axis_ee: [1.0, 0.0, 0.0]
+      # The 5-DOF position-only IK keeps joint5 near its seed. Correct joint5
+      # from the FK closing-axis error before candidate acceptance, canonicalize
+      # it into the half-turn branch, and reject it if FK still misses these axes.
+      ik_orientation_guard:
+        enabled: true
+        approach_axis_ee: [0.0, 0.0, 1.0]
+        closing_axis_180_symmetric: true
+        joint5_abs_max: 2.0
+        max_approach_error_deg: 25.0
+        max_closing_error_deg: 20.0
       # Extra offset away from the fixed finger to reduce edge/top-first contact.
       fixed_finger_margin_m: 0.006
       # Narrow targets need more fixed-finger clearance because the fixed jaw cannot sweep the object back.
       fixed_finger_margin_max_m: 0.012
       fixed_finger_margin_width_ref_m: 0.035
       fixed_finger_margin_width_gain: 0.25
+      # Reject mirrored grasps that place the fixed jaw on the side away from
+      # the robot. The moving jaw then closes from the outer side toward base.
+      fixed_finger_base_side:
+        enabled: true
+        reference_point_base: [0.0, 0.0, 0.0]
+        min_alignment_cos: 0.0
+      # Before closing, project the measured low-height contact residual onto
+      # the closing axis and reject if it erodes too much of the target gap.
+      fixed_finger_robust_gap:
+        enabled: true
+        max_target_gap_deficit_m: 0.003
       width_clearance_m: 0.003
       min_width_m: 0.008
       max_width_m: 0.080
       fallback_width_m: 0.035
+      width_quality_min: 0.75
 
   default_control_mode: "moveit_planning"
   controller_startup_timeout:
@@ -119,6 +280,132 @@ robot:
     device_index: -1
     device_name: ""
     exit_on_init_failure: false
+
+  embodied:
+    enabled: false
+    debug_tracing: true
+    task_input_topic: /voice_command
+    task_command_topic: /embodied/task_command
+    planned_task_topic: /embodied/planned_task
+    status_topic: /embodied/task_status
+    skill_action_name: /embodied/execute_skill
+    primitive_action_name: /embodied/execute_primitive
+    validate_skill_service: /embodied/validate_skill
+    validate_primitive_service: /embodied/validate_primitive
+    default_target_name: ""
+    default_place_name: home
+    timeouts:
+      task_budget_sec: 240.0
+      scene_freshness_sec: 0.8
+      model_idle_timeout_sec: 120.0
+      rpc_timeout_sec: 5.0
+      gripper_settle_sec: 1.5
+    planner:
+      mode: rule
+      planning_policy:
+        fallback_to_rule_planner: true
+        min_confidence: 0.70
+        allowed_skills:
+          - inspect_scene
+          - recover_safe_pose
+          - recover_zero_pose
+          - move_relative_ee
+          - open_gripper_skill
+          - close_gripper_skill
+          - pick_object
+    execution:
+      relative_motion_step_m: 0.03
+      relative_motion_reference_frame: base
+      relative_motion_direction_mapping:
+        forward: [0.0, -1.0, 0.0]
+        backward: [0.0, 1.0, 0.0]
+        left: [1.0, 0.0, 0.0]
+        right: [-1.0, 0.0, 0.0]
+        up: [0.0, 0.0, 1.0]
+        down: [0.0, 0.0, -1.0]
+      gripper_open_position: 1.0
+      gripper_closed_position: 0.0
+      task_executor_action_name: /task_executor/execute_task_plan
+      move_configuration_service: /moveit_gateway/move_to_configuration
+    safety:
+      workspace:
+        x: [-0.52, 0.52]
+        y: [-0.45, 0.45]
+        z: [0.02, 0.55]
+        max_radius_m: 0.52
+    named_poses:
+      home:
+        position: {x: 0.020030733201442157, y: -0.11809839488683391, z: 0.13887055751050842}
+        orientation: {x: -0.26790866048257905, y: -0.2622185975709204, z: -0.6525133891660432, w: 0.6585534402654153}
+      observe_table:
+        position: {x: 0.10, y: -0.16, z: 0.22}
+        orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
+      zero:
+        position: {x: 0.0210077843415008, y: -0.278950111258735, z: 0.24858389783148477}
+        orientation: {x: -0.4740206645801369, y: -0.4668084047044082, z: -0.523033090590171, w: 0.532757645647648}
+    skill_templates:
+      inspect_scene:
+        description:
+          summary: "Move to observe_table and acquire a scene view for planning."
+          category: observation
+          when_to_use: ["look at the table", "update scene understanding"]
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: observe_table
+      recover_safe_pose:
+        description:
+          summary: "Return the arm to the home safe pose."
+          category: recovery
+          when_to_use: ["return to a safe position", "reset between tasks"]
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: home
+      recover_zero_pose:
+        description:
+          summary: "Return the arm to the calibration zero pose."
+          category: recovery
+          when_to_use: ["return to the calibration pose", "fully retract the arm"]
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: zero
+      move_relative_ee:
+        description:
+          summary: "Translate the end-effector by a requested direction and distance."
+          category: translation
+          when_to_use: ["make a small corrective end-effector move"]
+        primitive_sequence:
+          - primitive_name: move_relative_ee
+            motion_direction_from_request: true
+            motion_distance_from_request: true
+      open_gripper_skill:
+        description:
+          summary: "Open the gripper."
+          category: gripper
+          when_to_use: ["release an object", "prepare the gripper for grasping"]
+        primitive_sequence:
+          - primitive_name: open_gripper
+      close_gripper_skill:
+        description:
+          summary: "Close the gripper."
+          category: gripper
+          when_to_use: ["close or hold with the gripper"]
+        primitive_sequence:
+          - primitive_name: close_gripper
+      pick_object:
+        executor: grasp_pipeline
+        required_args: [target_name]
+        timeout_sec: 240.0
+        description:
+          summary: "Detect, grasp, verify, and lift the requested object."
+          category: manipulation
+          when_to_use: ["pick up a visible object identified by a text query"]
+          aliases_zh: ["抓取物体", "拿起物体"]
+          aliases_en: ["pick object", "grasp object"]
+          motion_scope: [arm, gripper]
+          anchor_pose: none
+          intensity: moderate
+          duration_sec_estimate: 120.0
+          requires_motion_params: false
 
   ros2_control:
     hardware_plugin: so101_hardware/SO101SystemHardware
