@@ -107,7 +107,7 @@ source .shrc_local
 |------|---------|
 | [ibrobot-env](.agents/skills/ibrobot-env) | 环境初始化、source .shrc_local、PYTHONPATH |
 | [ibrobot-build](.agents/skills/ibrobot-build) | 编译、colcon build、构建错误 |
-| [ibrobot-launch](.agents/skills/ibrobot-launch) | 启动机器人、运行仿真、测试推理、teleop |
+| [ibrobot-launch](.agents/skills/ibrobot-launch) | 分平台启动 Ubuntu/openEuler 工作区或 OpenHarmony 板端机器人、仿真、推理、teleop |
 | [ibrobot-architecture](.agents/skills/ibrobot-architecture) | 架构、SSOT、契约、robot_config、数据流 |
 
 ### 板端（OpenHarmony）

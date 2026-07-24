@@ -9,6 +9,7 @@ AtomGit PR Review Workflow
 
 import argparse
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +30,53 @@ class CodeReviewer:
         self.client = client
         self.formatter = formatter
 
+    @staticmethod
+    def _build_mandatory_review_checks(files: list[dict]) -> list[dict]:
+        """Flag repository-specific changes that require explicit review."""
+        checks = []
+        for file_info in files:
+            filename = file_info.get("filename") or file_info.get("new_path") or ""
+            paths = {
+                filename,
+                file_info.get("old_path") or "",
+                file_info.get("new_path") or "",
+            }
+            patch = file_info.get("patch") or ""
+            if isinstance(patch, dict):
+                patch = patch.get("diff") or ""
+
+            modes = {
+                str(file_info.get("mode") or ""),
+                str(file_info.get("old_mode") or file_info.get("a_mode") or ""),
+                str(file_info.get("new_mode") or file_info.get("b_mode") or ""),
+            }
+            is_lerobot_path = "libs/lerobot" in paths
+            is_lerobot_gitlink = is_lerobot_path and (
+                "160000" in modes or "Subproject commit " in patch or filename == "libs/lerobot"
+            )
+            if not is_lerobot_gitlink:
+                continue
+
+            commits = re.findall(r"Subproject commit ([0-9a-fA-F]{7,40})", patch)
+            checks.append(
+                {
+                    "id": "lerobot_gitlink_changed",
+                    "severity": "error",
+                    "blocking_until_reviewed": True,
+                    "file": "libs/lerobot",
+                    "detected_commits": commits,
+                    "message": (
+                        "PR changes the libs/lerobot submodule pointer. Verify that this is an explicit "
+                        "upstream base upgrade, that the new commit is fetchable from the .gitmodules "
+                        "remote, and that INDEX.yaml, manifest.yaml, series files, and patch-stack tests "
+                        "were migrated. Ordinary LeRobot source changes must be exported under "
+                        "third_party/patches/lerobot instead of committing a gitlink change."
+                    ),
+                }
+            )
+            break
+        return checks
+
     def extract_pr_info(self, pr_number: int, include_comments: bool = True) -> dict:
         """提取适合 review 场景的完整 PR 上下文"""
         pr = self.client.get_pull_request(pr_number)
@@ -38,6 +86,7 @@ class CodeReviewer:
         head_sha = pr.get("head", {}).get("sha", "HEAD")
         additions = sum(f.get("additions", 0) for f in files)
         deletions = sum(f.get("deletions", 0) for f in files)
+        mandatory_review_checks = self._build_mandatory_review_checks(files)
 
         changed_files = []
         for f in files:
@@ -71,6 +120,7 @@ class CodeReviewer:
                 "state": pr.get("state"),
                 "branch": f"{pr.get('head', {}).get('ref')} → {pr.get('base', {}).get('ref')}",
                 "head_sha": head_sha,
+                "mandatory_review_checks": mandatory_review_checks,
                 "stats": {
                     "files_changed": len(changed_files),
                     "commits": len(commits),
@@ -191,10 +241,16 @@ def mode_extract_info(args, reviewer: CodeReviewer):
     if not args.no_comments:
         print(f"   未解决评论: {pr_info['pr']['stats']['unresolved_comments']} 条")
 
+    mandatory_checks = pr_info["pr"].get("mandatory_review_checks", [])
+    if mandatory_checks:
+        print("\n🚨 强制专项检查:")
+        for check in mandatory_checks:
+            print(f"   [{check['severity'].upper()}] {check['id']}: {check['message']}")
+
     print("\n💡 下一步:")
     print("  AI Agent 应该:")
     print("  1. 读取此文件并进行代码审查")
-    print("  2. 结合 changed_files、commits 和 comments 生成 issues.json")
+    print("  2. 先处理 mandatory_review_checks，再结合 changed_files、commits 和 comments 生成 issues.json")
     print("  3. ⚠️ 将审查结果以用户可读的格式展示给用户确认")
     print("  4. 用户确认后，运行提交命令")
     print(f"\n     python3 pr_review.py --pr {args.pr} --submit-review issues.json --ai-model <your-model-name>")
@@ -261,7 +317,30 @@ def mode_auto(args, client: AtomGitClient, reviewer: CodeReviewer, config: dict)
     print("\n📝 获取 PR 文件变更...")
     files = client.get_pr_files(args.pr)
 
-    all_issues = []
+    mandatory_checks = reviewer._build_mandatory_review_checks(files)
+    all_issues = [
+        CodeIssue(
+            file="libs/lerobot",
+            line=1,
+            type="maintainability",
+            severity="error",
+            confidence=100,
+            title="禁止直接提交 LeRobot submodule 指针",
+            description=check["message"],
+            context_code="libs/lerobot (gitlink mode 160000)",
+            fix_code=(
+                "Restore libs/lerobot to the base branch gitlink. Export the LeRobot source change "
+                "as a mailbox patch under third_party/patches/lerobot, then update the target "
+                "series file, manifest.yaml, and scripts/setup/tests/test_lerobot_filter.sh."
+            ),
+            fix_explanation=(
+                "只有明确、可从权威 submodule remote 获取并完成整个 patch stack 迁移的上游基线升级，"
+                "才允许修改 gitlink。"
+            ),
+        )
+        for check in mandatory_checks
+        if check["id"] == "lerobot_gitlink_changed"
+    ]
 
     for i, file_info in enumerate(files, 1):
         file_path = file_info["filename"]

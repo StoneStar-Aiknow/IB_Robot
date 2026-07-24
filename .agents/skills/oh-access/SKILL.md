@@ -176,7 +176,8 @@ Invoke this skill when the user wants to:
 Do NOT use this skill for:
 - local workspace builds (`ibrobot-build`)
 - local ROS 2 environment setup (`ibrobot-env`)
-- launching the Ubuntu-side robot stack (`ibrobot-launch`)
+- choosing and validating the robot launch workflow (`ibrobot-launch`); use this skill only for the
+  OpenHarmony transport and remote-shell portion
 
 ## Quick Reference
 

@@ -10,7 +10,7 @@
 
 | 策略 | HMM 模块 | Host 侧辅助制品 | 设备指针链路 |
 |------|----------|-----------------|--------------|
-| **PI0.5** | vision、prefill、action_in_proj、time_mlp、decode、action_out_proj | `embedding.pt` | prefill input -> decode input |
+| **PI0.5** | vision、prefill、action_in_proj、time_mlp、decode、action_out_proj | `embedding.pt` | prefill output -> decode input |
 | **SmolVLA** | vision、prefill、action | `token_embedding.pt`、`state_projection.pt` | prefill output -> action input |
 | **ACT** | 不支持 | - | 启动时拒绝 |
 
@@ -26,7 +26,7 @@ Houmo 工具链的依赖可能与项目主环境冲突，建议使用 Houmo 官�
 # 官方镜像示例；具体镜像名以当前 Houmo SDK 发布为准
 docker run -it --gpus all \
     -v "$PWD/models:/work/models" \
-    harbor.houmo.ai/toolchain/release:Dadao-xh2-v1.3.0-ubuntu24.04-x86_64 bash
+    harbor.houmo.ai/toolchain/release:Dadao-xh2-v1.3.0-ubuntu24.04-x86.64 bash
 ```
 
 22.04 runtime 镜像通常只有 `houmo_tcim_runtime`，没有 `xhquant` 和 `tcim` 编译器，不能用于模型转换。
@@ -59,7 +59,24 @@ PI0.5 需要以下角色：
 
 典型官方流程包含 vision、LLM、expert 和 action projection 的导出脚本，然后通过 `tcim.build_from_hmonnx` 生成 `.hmm` 与 ABI 元数据。自定义策略必须使用与实际 camera、chunk size、action dimension 和 tokenizer 长度一致的导出配置。
 
-PI0.5 的 cache 链路由 packager 根据 prefill/decode ABI 自动生成。两端 cache input 名称、dtype 和 shape 必须完全一致。
+PI0.5 的 cache 链路由 packager 根据 prefill/decode ABI 自动生成。native prefill 输出和 decode
+输入必须具有相同的交错 `past_key_N` / `past_value_N` 名称、dtype 和 shape，且以 device pointer 连接。
+
+仓库提供不依赖 `xh_model_zoo` 的受管转换入口：
+
+```bash
+source .shrc_local
+MODEL_BUNDLE_ROOT=models/pi05 \
+./scripts/convert_hmm.sh pi05
+```
+
+`MODEL_BUNDLE_ROOT` 是必填 workspace 相对路径。输出默认为 `models/pi05_hmm_standard`，可通过
+`PI05_HMM_OUTPUT` 覆盖；为防止混入旧 HMONNX/TCIM 产物，输出路径已存在时脚本会拒绝运行。入口
+严格加载当前 checkpoint 和 patched LeRobot，使用 `transformers==5.3.0` 导出 native PaliGemma
+prefill 与 action-expert decode 图。容器中的 `torchao==0.17.0` 会在导入前卸载。输出目录中的
+`provenance.json` 记录 checkpoint SHA-256、IB-Robot/LeRobot commit、镜像 ID、Transformers、
+xhquant 和 TCIM 版本。`embedding.pt["weight"]` 必须与当前 checkpoint 的
+`model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight` 完全一致。
 
 ### SmolVLA
 
@@ -75,7 +92,34 @@ SmolVLA 需要以下角色：
 
 SmolVLA 的主链是 `vision -> embedding -> prefill -> action`。当前 HMM runtime 不执行独立 decode 模块。`state_projection.pt` 必须包含与 state input 和 hidden size 匹配的 projection weight/bias。
 
-SmolVLA action 导出建议使用 CPU + float32，避免 CUDA fp16 导出过程中 denoise 分支出现 dtype 混用。
+仓库提供完整的标准转换入口：
+
+```bash
+source .shrc_local
+MODEL_BUNDLE_ROOT=models/smolvla ./scripts/convert_hmm.sh smolvla
+```
+
+根目录只保留这一通用 HMM 转换入口；各策略的容器编排和导出实现放在对应的
+`model_utils/<policy>_export/` 目录，新增策略时不再增加 `scripts/convert_<policy>_hmm.sh`。
+
+`MODEL_BUNDLE_ROOT` 是必填的 workspace 相对路径，没有默认值。未设置、传入空值、绝对路径或
+不存在的目录时，脚本会在启动容器前失败。输出默认为 `models/smolvla_hmm_standard`，可通过
+`SMOLVLA_HMM_OUTPUT`、`SMOLVLA_EXPORT_DEVICE` 和 `HOUMO_IMAGE` 覆盖其他参数。脚本会校验仓库维护的
+LeRobot v0.5.1 patch 分支和 clean 状态，在 Houmo 1.3.0 容器中导出 ONNX、执行 xhquant PTQ、
+调用 TCIM 编译三个 HMM，并通过 strict loader 生成和验证 `inference_manifest.json`。
+
+标准流程优先使用 `transformers==5.3.0`，并在加载策略失败时尝试 `4.57.1`。容器预装的
+`torchao==0.17.0` 与 torch 2.8.0 不兼容，入口脚本会在导入 LeRobot 前卸载它。导出使用
+bundle 内的 `HuggingFaceTB/SmolVLM2-500M-Video-Instruct`，不依赖网络下载。
+
+vision 图是固定 `512x512`、全 patch 有效的静态导出。Exporter 会将 SmolVLM 的布尔索引位置
+编码替换为等价静态 position IDs，并拒绝仍含 `NonZero` 的 ONNX，避免 xhquant 编译失败。
+action 图使用 CUDA float32，避免 denoise 分支在 fp16 tracing 时发生 dtype 混用；vision 和
+prefill 在 CUDA 上使用 float16。PTQ calibration 文件直接保存对应 PyTorch dummy inputs，
+其中 action KV cache 来自同次 prefill 前向。
+
+输出目录还包含 `provenance.json`，记录 IB-Robot/LeRobot commit、checkpoint SHA-256、容器镜像、
+依赖版本、导出 shape 和量化参数。该文件用于追溯转换来源，不替代 runtime manifest。
 
 ## 三、组装统一 Deployment
 
@@ -272,7 +316,7 @@ python3 -c "import tcim_lite.runtime as r; print('device_num:', r.get_device_num
 
 确认传入的是每个 `.hmm` 对应的 compiler-emitted `model.json`，不要手写 tensor 顺序。重点检查：
 
-- PI0.5 prefill/decode cache input 名称完全一致；
+- PI0.5 prefill cache output 与 decode cache input 名称、dtype、shape 一致；
 - PI0.5 action/noise shape 为 `(1, chunk_size, max_action_dim)`；
 - SmolVLA prefill cache output 与 action cache input 名称、dtype、shape 一致；
 - vision 只有一个 image input 和一个 embedding output；
@@ -288,7 +332,7 @@ python3 -c "import tcim_lite.runtime as r; print('device_num:', r.get_device_num
 
 ### `set_input error: Status.UNINITIALIZED`
 
-PI0.5 使用 prefill input -> decode input 的 device pointer；SmolVLA 使用 prefill output -> action input。不要交换 `get_dev_input` 和 `get_dev_output` 语义。该关系应来自 manifest 的 `device_links`，不应在部署脚本中硬编码。
+PI0.5 使用 prefill output -> decode input 的 device pointer；SmolVLA 使用 prefill output -> action input。不要交换 `get_dev_input` 和 `get_dev_output` 语义。该关系应来自 manifest 的 `device_links`，不应在部署脚本中硬编码。
 
 ### PTQ 精度下降或 NPU 超时
 
@@ -297,6 +341,7 @@ PI0.5 使用 prefill input -> decode input 的 device pointer；SmolVLA 使用 p
 ## 参考
 
 - HMM packager：`src/model_utils/model_utils/hmm_export.py`
+- PI0.5 HMM exporter：`src/model_utils/model_utils/pi05_export/`
 - 统一 manifest writer：`src/model_utils/model_utils/inference_manifest_export.py`
 - HMM backend：`src/inference_service/inference_service/backends/hmm/backend.py`
 - HMM backend tests：`src/inference_service/tests/test_hmm_backend.py`

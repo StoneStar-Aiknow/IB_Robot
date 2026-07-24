@@ -53,6 +53,9 @@ the bootstrap variant documented below, based on plain `ubuntu:22.04`.
 - If the user explicitly requests a remote commit or branch, its repository is
   reachable from the container.
 - The host pip cache directory exists at `${PIP_CACHE_DIR:-$HOME/.cache/pip}`.
+- The container user must use the host's actual `id -u` and `id -g`. Never
+  hard-code `1000:1000`; doing so can make the bind-mounted pip cache
+  inaccessible even when the directory exists.
 - Network access to Aliyun apt mirror, TUNA ROS 2 repo, Huawei pip mirror,
   and `gitcode.com` / `atomgit.com` for lerobot submodule fetch.
 
@@ -86,6 +89,8 @@ the bootstrap variant documented below, based on plain `ubuntu:22.04`.
 - **挂载宿主机 pip cache**：只复用下载缓存，禁止挂载宿主机 `venv`、
   `build`、`install` 或整个源码工作区。默认流程使用 `docker cp` 复制源码，
   不是 bind mount，并在容器内删除宿主机构建产物。
+- **缓存权限必须以目标用户验证**：root 身份执行 `test -w` 没有意义。必须以
+  `testuser` 实际在 `PIP_CACHE_DIR` 创建并删除探针文件，失败时立即终止验证。
 
 ### 错误分类与报告
 
@@ -117,6 +122,11 @@ PROJECT_ROOT=$(git rev-parse --show-toplevel)
 HOST_UID=$(id -u)
 HOST_GID=$(id -g)
 HOST_PIP_CACHE=${PIP_CACHE_DIR:-"${HOME}/.cache/pip"}
+
+if [ "${HOST_UID}" -eq 0 ]; then
+  echo "Run Ubuntu Docker verification as the non-root workspace owner." >&2
+  exit 1
+fi
 
 if [ ! -d "${HOST_PIP_CACHE}" ]; then
   echo "Host pip cache does not exist: ${HOST_PIP_CACHE}"
@@ -192,7 +202,8 @@ docker exec "${CONTAINER}" bash -c '
     > /dev/null 2>&1
 '
 
-# 2.3 Match the container user to the host cache owner.
+# 2.3 Match the container user to the host cache owner. HOST_UID/HOST_GID must
+# come from Phase 0; never replace them with fixed values such as 1000:1000.
 docker exec \
   -e HOST_UID="${HOST_UID}" \
   -e HOST_GID="${HOST_GID}" \
@@ -204,7 +215,24 @@ docker exec \
     useradd -m -u "${HOST_UID}" -g "${group_name}" -s /bin/bash testuser
     echo "testuser ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/testuser
     locale-gen en_US.UTF-8 >/dev/null
-    test -w /var/cache/ibrobot-pip
+  '
+
+# 2.4 Fail fast unless the actual setup user can use the mounted cache. A root
+# check would produce a false positive for host directories owned by another
+# UID. Creating a file verifies both traversal and write permissions.
+docker exec \
+  -u testuser \
+  -e HOME=/home/testuser \
+  -e PIP_CACHE_DIR=/var/cache/ibrobot-pip \
+  "${CONTAINER}" bash -c '
+    set -e
+    test -r "${PIP_CACHE_DIR}"
+    test -w "${PIP_CACHE_DIR}"
+    probe="${PIP_CACHE_DIR}/.ibrobot-cache-write-test-$$"
+    : > "${probe}"
+    rm -f "${probe}"
+    printf "pip cache writable: %s (uid=%s gid=%s)\n" \
+      "${PIP_CACHE_DIR}" "$(id -u)" "$(id -g)"
   '
 
 CONTAINER_SECONDS=$(( $(date +%s) - CONTAINER_START ))
@@ -214,6 +242,10 @@ Mount pip at `/var/cache/ibrobot-pip`, not below `/home/testuser/.cache`.
 Docker may create missing parent directories as root before `useradd`, which
 can later break tools such as pre-commit even when the pip directory itself is
 writable.
+
+The cache probe is a hard prerequisite. Do not continue with setup when it
+fails, and do not work around it by making the host cache world-writable. Fix
+the UID/GID mapping or select a cache directory owned by the current host user.
 
 **Why NOPASSWD is required:** Docker `exec -d` (detached mode) allocates no
 tty.  Ubuntu 22.04's default sudoers enables `use_pty`, which makes
@@ -316,6 +348,17 @@ Verify the status is zero and the log contains:
 
 ```
 Setup complete! Run ./scripts/build.sh to build the workspace.
+```
+
+Also fail the verification as an infrastructure error if setup reports that
+pip disabled the mounted cache:
+
+```bash
+if docker exec "${CONTAINER}" \
+    grep -Fq "cache has been disabled" /tmp/setup.log; then
+  echo "Mounted pip cache was disabled; verification timing is invalid." >&2
+  exit 1
+fi
 ```
 
 ### Phase 5 — Run build.sh
@@ -441,6 +484,7 @@ docker exec -u testuser -e HOME=/home/testuser \
 | rosdep installs from `packages.ros.org` at ~10 KB/s | The ROS desktop-full image keeps its deb822 `ros2.sources` file | Phase 2 switches both `.sources` and `.list` ROS entries to TUNA before `apt-get update` |
 | TUNA ROS source index returns 404 | TUNA serves binary ROS packages but not the `deb-src` index | Phase 2 changes deb822 `Types` to `deb` and removes traditional `deb-src` entries |
 | `Permission denied: ~/.cache/pre-commit` | Bind mount caused Docker to create the home cache parent as root | Mount pip at `/var/cache/ibrobot-pip`, not below `~/.cache` |
+| `pip cache has been disabled` | Container UID/GID does not match the host cache owner, often because `1000:1000` was hard-coded | Recreate `testuser` from host `id -u`/`id -g` and require the user-level write probe before setup |
 | `The build time path ... doesn't exist` | Copied or iterative source retained host-specific venv/build paths | Remove `venv build install log`, then rerun setup from the selected source |
 | `git: command not found` mid-setup | `install_ros.sh` apt install may remove git | Phase 1 already installed git; re-run `apt-get install -y git git-lfs` if needed |
 | lerobot patch stack fetch fails | Submodule base commit not in local checkout | Rebase branch onto `upstream/master` before copying |

@@ -91,6 +91,34 @@ def resolve_device(device_arg: str) -> torch.device:
     return torch.device(device_arg)
 
 
+def patch_vision_embeddings_for_static_export(image_height: int, image_width: int) -> None:
+    """Remove boolean indexing from the fixed-size vision export graph."""
+    from transformers.models.smolvlm import modeling_smolvlm
+
+    def forward(self, pixel_values, patch_attention_mask=None):
+        patch_embeds = self.patch_embedding(pixel_values)
+        embeddings = patch_embeds.flatten(2).transpose(1, 2)
+
+        nb_patches_h = image_height // self.patch_size
+        nb_patches_w = image_width // self.patch_size
+        boundaries = torch.arange(
+            1 / self.num_patches_per_side,
+            1.0,
+            1 / self.num_patches_per_side,
+            device=pixel_values.device,
+        )
+        h_indices = torch.arange(nb_patches_h, device=pixel_values.device, dtype=torch.float32)
+        w_indices = torch.arange(nb_patches_w, device=pixel_values.device, dtype=torch.float32)
+        fractional_coords_h = h_indices / nb_patches_h * (1 - 1e-6)
+        fractional_coords_w = w_indices / nb_patches_w * (1 - 1e-6)
+        bucket_coords_h = torch.bucketize(fractional_coords_h, boundaries, right=True)
+        bucket_coords_w = torch.bucketize(fractional_coords_w, boundaries, right=True)
+        position_ids = (bucket_coords_h[:, None] * self.num_patches_per_side + bucket_coords_w).flatten().unsqueeze(0)
+        return embeddings + self.position_embedding(position_ids.to(dtype=torch.long))
+
+    modeling_smolvlm.SmolVLMVisionEmbeddings.forward = forward
+
+
 @torch.no_grad()
 def load_smolvla_policy(model_path: str, device: torch.device, lerobot_src: str | Path | None = None):
     ensure_lerobot_importable(lerobot_src)
@@ -100,7 +128,12 @@ def load_smolvla_policy(model_path: str, device: torch.device, lerobot_src: str 
     configure_hf_offline_env()
     config = PreTrainedConfig.from_pretrained(model_path)
     if hasattr(config, "vlm_model_name") and isinstance(config.vlm_model_name, str):
-        config.vlm_model_name = resolve_hf_cached_model_path(config.vlm_model_name)
+        local_vlm_path = Path(model_path) / config.vlm_model_name
+        config.vlm_model_name = (
+            str(local_vlm_path.resolve())
+            if local_vlm_path.exists()
+            else resolve_hf_cached_model_path(config.vlm_model_name)
+        )
     if hasattr(config, "device"):
         config.device = str(device)
     policy = SmolVLAPolicy.from_pretrained(model_path, config=config, strict=False)
@@ -259,6 +292,13 @@ def simplify_onnx(onnx_file, simplified_file, input_shapes):
         print(f"    Warning: onnxsim failed ({exc}); keeping toposorted ONNX.")
         model_simplified = onnx_model
     onnx.save(model_simplified, str(simplified_file))
+
+
+def reject_onnx_ops(onnx_file: Path, unsupported_ops: set[str]) -> None:
+    model = onnx.load(str(onnx_file), load_external_data=False)
+    found = sorted({node.op_type for node in model.graph.node} & unsupported_ops)
+    if found:
+        raise RuntimeError(f"Unsupported ONNX operators in {onnx_file}: {', '.join(found)}")
 
 
 def write_smolvla_rknn_deployment(
@@ -510,6 +550,8 @@ def export_all(args):
     device = resolve_device(args.device)
     export_dtype = torch.float16 if device.type == "cuda" else torch.float32
 
+    patch_vision_embeddings_for_static_export(args.image_height, args.image_width)
+
     policy = load_smolvla_policy(args.model_path, device, args.lerobot_src)
     flow_model = policy.model
     vlm_with_expert = flow_model.vlm_with_expert
@@ -531,6 +573,10 @@ def export_all(args):
     out_dir = Path(args.output_dir)
     onnx_dir = out_dir / "onnx"
     onnx_dir.mkdir(parents=True, exist_ok=True)
+    calibration_dir_value = getattr(args, "calibration_dir", None)
+    calibration_dir = Path(calibration_dir_value) if calibration_dir_value else None
+    if calibration_dir is not None:
+        calibration_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Vision ──
     print("\n=== Vision module ===")
@@ -538,6 +584,8 @@ def export_all(args):
     vision_model.eval()
     vision_model.to(device=device, dtype=export_dtype)
     dummy_pixel = torch.rand(1, 3, image_h, image_w, dtype=export_dtype, device=device)
+    if calibration_dir is not None:
+        torch.save((dummy_pixel.detach().cpu(),), calibration_dir / "vision.pt")
 
     with torch.no_grad():
         image_embeddings = vision_model(dummy_pixel)
@@ -563,6 +611,7 @@ def export_all(args):
         opset=args.opset,
     )
     simplify_onnx(vision_onnx, vision_simp, {"pixel_values": [1, 3, image_h, image_w]})
+    reject_onnx_ops(vision_simp, {"NonZero"})
 
     # ── Token embedding (CPU) ──
     print("\n=== Token embedding (CPU) ===")
@@ -593,6 +642,11 @@ def export_all(args):
 
     with torch.no_grad():
         flat_cache = prefill_model(prefix_embs, attn_mask, pos_ids)
+    if calibration_dir is not None:
+        torch.save(
+            tuple(tensor.detach().cpu() for tensor in (prefix_embs, attn_mask, pos_ids)),
+            calibration_dir / "prefill.pt",
+        )
     cache_shape = list(flat_cache[0].shape)
     print(f"  KV cache: {num_layers} layers × 2 = {len(flat_cache)} tensors, shape={cache_shape}")
 
@@ -622,12 +676,19 @@ def export_all(args):
     print("\n=== Action module ===")
     action_model = SmolVLAActionPart(flow_model)
     action_model.eval()
-    action_model.to(device=device, dtype=export_dtype)
+    action_dtype = torch.float32
+    action_model.to(device=device, dtype=action_dtype)
 
-    x_t = torch.randn(1, chunk_size, max_action_dim, device=device, dtype=export_dtype)
+    x_t = torch.randn(1, chunk_size, max_action_dim, device=device, dtype=action_dtype)
     timestep = torch.ones(1, device=device, dtype=torch.float32)
     prefix_pad_masks = torch.ones(1, prefix_length, device=device, dtype=torch.bool)
-    action_inputs = (x_t, timestep, prefix_pad_masks, *flat_cache)
+    action_cache = tuple(tensor.to(dtype=action_dtype) for tensor in flat_cache)
+    action_inputs = (x_t, timestep, prefix_pad_masks, *action_cache)
+    if calibration_dir is not None:
+        torch.save(
+            tuple(tensor.detach().cpu() for tensor in action_inputs),
+            calibration_dir / "action.pt",
+        )
 
     action_names_in = ["x_t", "timestep", "prefix_pad_masks", *build_cache_input_names(num_layers)]
     action_onnx = onnx_dir / "smolvla_action.onnx"

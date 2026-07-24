@@ -51,9 +51,9 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setu
   fi
   ```
 - 当前用户有运行容器的权限
-- **必须先检查验证镜像**，不能假设开发者本机已有该镜像；若本地不存在，或本地镜像创建时间距本次验证超过 30 天，则重新拉取：
+- **必须先检查验证镜像**，不能假设开发者本机已有该镜像；若本地不存在，或本地镜像创建时间距本次验证超过 30 天，则重新拉取。`:env` 镜像预装 ROS 2 并提供 pip 下载缓存，但 setup 仍会创建和填充 workspace venv：
   ```bash
-  IMAGE=swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest
+  IMAGE=swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:env
   CREATED=$(docker image inspect "$IMAGE" --format '{{.Created}}' 2>/dev/null || true)
   if [ -z "$CREATED" ]; then
     docker pull "$IMAGE"
@@ -79,15 +79,15 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setu
 │  ┌─ chroot /root/openeuler_rootfs (aarch64) ────┐│
 │  │  openEuler Embedded Reference Distro         ││
 │  │  openEuler ROS repos ( Embedded + SIG )      ││
-│  │  python3, dnf, git                           ││
+│  │  ROS 2 Humble, python3, dnf, git, pip cache  ││
 │  │  workspace at /root/IB_Robot                 ││
 │  └───────────────────────────────────────────────┘│
 └───────────────────────────────────────────────────┘
 ```
 
-> **关于 ROS 安装：** setup.sh 会自动检测 ROS 是否已安装。若未安装，会调用
-> `scripts/install_ros.sh` 完成安装（配置 openEuler ROS repo + dnf 安装）。
-> **不需要也不应该手动预装 ROS**，让 setup.sh 完整跑一遍才能验证安装流程。
+> **关于 ROS 安装：** `:env` 镜像已预装 ROS 2 Humble，因此本流程验证 setup.sh 的
+> ROS 检测和复用路径。若要验证从零安装 ROS，必须另用不含 ROS 的基础镜像，不能把
+> 本流程的成功结果描述为完整验证了 `install_ros.sh`。
 
 所有 `docker exec` 命令需要通过 `chroot /root/openeuler_rootfs` 进入 arm64 环境。
 
@@ -100,7 +100,7 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setu
 |----------------|----------------------------------------------------------|
 | Container name | `verify-oee`                                             |
 | User           | `root`（openEuler Embedded 默认 root 操作）              |
-| Image          | `swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest` |
+| Image          | `swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:env` |
 | Rootfs path    | `/root/openeuler_rootfs`（容器内，chroot 前）            |
 | Workspace      | `/root/openeuler_rootfs/root/IB_Robot`（chroot 内路径）  |
 | Host workspace | 宿主机上 IB_Robot 项目根目录                              |
@@ -165,7 +165,7 @@ fi
 > 通过 `date` 获取当前时间，通过 `docker image inspect --format '{{.Created}}'` 获取本地镜像创建时间。
 
 ```bash
-IMAGE=swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest
+IMAGE=swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:env
 CREATED=$(docker image inspect "$IMAGE" --format '{{.Created}}' 2>/dev/null || true)
 
 if [ -z "$CREATED" ]; then
@@ -193,7 +193,7 @@ fi
 #     keep the container running, then manually chroot as needed.
 docker run -d --name verify-oee --privileged \
   --entrypoint /bin/bash \
-  swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:latest \
+  swr.cn-north-4.myhuaweicloud.com/openeuler-embedded-2/openeuler-ibrobot-dev:env \
   -c "sleep infinity"
 
 # 2.2 Verify aarch64 emulation
@@ -208,11 +208,7 @@ docker exec verify-oee bash -c \
 docker exec verify-oee bash -c \
   'mkdir -p /root/openeuler_rootfs/var/volatile/log'
 
-# 2.5 Mount /proc and /sys for chroot compatibility
-docker exec verify-oee bash -c \
-  'mount -t proc proc /root/openeuler_rootfs/proc 2>/dev/null; mount --bind /sys /root/openeuler_rootfs/sys 2>/dev/null'
-
-# 2.6 Fix git safe.directory for UID mismatch after docker cp
+# 2.5 Fix git safe.directory for UID mismatch after docker cp
 docker exec verify-oee bash -c \
   'chroot /root/openeuler_rootfs git config --global --add safe.directory /root/IB_Robot
    chroot /root/openeuler_rootfs git config --global --add safe.directory /root/IB_Robot/libs/lerobot'
@@ -228,9 +224,9 @@ docker exec verify-oee bash -c \
 `exec chroot /root/openeuler_rootfs /bin/bash`。`docker exec` 命令在容器宿主空间
 执行，必须手动 `chroot /root/openeuler_rootfs` 才能进入 arm64 环境。
 
-**Host safety rule:** 任何 `chroot /root/openeuler_rootfs`、`mount /root/openeuler_rootfs/...`、
-qemu/rootfs 相关命令都必须包在 `docker exec verify-oee ...` 里执行。不要在宿主机直接
-执行这些命令，也不要把宿主机 chroot 到 aarch64 rootfs；这样可能破坏本地环境。
+**Host safety rule:** 任何 chroot 或 qemu/rootfs 相关命令都必须包在
+`docker exec verify-oee ...` 里执行。不要在宿主机直接 chroot 到 aarch64 rootfs，
+也不要把宿主机 `/proc`、`/sys`、`/dev` bind 到容器 rootfs；setup/build 不需要这些资源。
 
 ### Phase 3 — Inspect chroot Environment
 
@@ -246,8 +242,8 @@ docker exec verify-oee bash -c 'chroot /root/openeuler_rootfs /bin/bash -c "
 "'
 ```
 
-容器镜像应包含：git、python3、dnf + 两个 openEuler ROS repo 配置。
-ROS 2 安装由 setup.sh 通过 `install_ros.sh` 自动完成，无需手动干预。
+容器镜像应包含：git、python3、dnf、ROS 2 Humble、pip 下载缓存和两个 openEuler ROS repo 配置。
+setup.sh 仍须完整执行，以验证 ROS 检测、workspace venv 安装和项目依赖配置；无需手动干预。
 
 ### Phase 4 — Prepare Workspace
 
@@ -378,8 +374,9 @@ docker exec -d verify-oee bash -c \
 |---------|-------|-----|
 | `Couldn't resolve host name` | rootfs missing `/etc/resolv.conf` | Phase 2.3 copies from host container |
 | `Config error: File exists: /var/log` | `/var/log` symlink target missing | Phase 2.4 creates `/var/volatile/log` |
-| `/dev/stdout: No such file or directory` | `/proc` not mounted in chroot | Phase 2.5 mounts proc/sys |
-| `dubious ownership in repository` | UID mismatch after `docker cp` | Phase 2.6 adds `safe.directory` |
+| `/dev/stdout: No such file or directory` | 命令依赖了 chroot 中不存在的设备伪文件 | 将验证输出重定向到 rootfs 内普通文件，不要挂载宿主 `/dev` |
+| `mount: command not found` / `mountpoint: command not found` | `:env` 镜像外层不提供挂载工具 | setup/build 验证不需要挂载；删除相关基础设施命令 |
+| `dubious ownership in repository` | UID mismatch after `docker cp` | Phase 2.5 adds `safe.directory` |
 | `gpg.errors.GPGMEError` during `rosdep install` | qemu-aarch64 emulation bug with Python `gpg` | setup.sh 自动禁用 `gpgcheck` |
 | `git-lfs was not found` post-checkout hook | No git-lfs in rootfs | `lerobot_patches.sh` auto-removes hook when git-lfs missing |
 | `ERROR: file:///root/IB_Robot/libs/lerobot does not appear to be a Python project` | Copied a linked worktree or an uninitialized submodule tree into the container | Use a standalone clone and run `git submodule update --init --recursive` before `docker cp` |
