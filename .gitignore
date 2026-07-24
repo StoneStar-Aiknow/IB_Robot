@@ -32,3 +32,12 @@ openspec
 .worktrees/
 get-docker.sh
 docs/superpowers/
+
+# IDE
+.idea/
+
+# Runtime artifacts
+/outputs/
+
+# Vendored SDK migrated to PyPI (atomgit-sdk)
+libs/atomgit_sdk/
