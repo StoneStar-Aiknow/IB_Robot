@@ -59,6 +59,11 @@ if(BUILD_TESTING)
     TIMEOUT 60
     ENV "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1"
   )
+  ament_add_pytest_test(
+    test_so101_ik_workers_launch
+    test/test_so101_ik_workers_launch.py
+    ENV "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1"
+  )
 endif()
 
 ament_package()

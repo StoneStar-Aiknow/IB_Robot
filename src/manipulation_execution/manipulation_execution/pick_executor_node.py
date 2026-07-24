@@ -516,6 +516,26 @@ class PickExecutorNode(Node):
             self._check_cancel(goal_handle)
             time.sleep(0.05)
 
+    @staticmethod
+    def _table_geometry_from_response(response) -> tuple[tuple[float, float, float] | None, float, float]:
+        if bool(response.execution_table_plane_found):
+            normal_msg = response.execution_table_plane_normal
+            offset = float(response.execution_table_plane_offset)
+            inlier_ratio = float(response.execution_table_plane_inlier_ratio)
+        elif bool(response.table_plane_found):
+            normal_msg = response.table_plane_normal
+            offset = float(response.table_plane_offset)
+            inlier_ratio = float(response.table_plane_inlier_ratio)
+        else:
+            return None, 0.0, 0.0
+
+        normal = (float(normal_msg.x), float(normal_msg.y), float(normal_msg.z))
+        if not all(np.isfinite(value) for value in (*normal, offset, inlier_ratio)):
+            return None, 0.0, 0.0
+        if np.linalg.norm(normal) <= 1e-9:
+            return None, 0.0, 0.0
+        return normal, offset, inlier_ratio
+
     def _request_grasps(self, goal_handle, deadline: float, state: FlowState, target_query: str):
         self._publish_feedback(goal_handle, state, "planning", f"planning grasps for {target_query!r}")
         planner = self._config.get("planner", {})
@@ -555,28 +575,20 @@ class PickExecutorNode(Node):
                 centroid_source,
                 float(planner.get("confidence_threshold", 0.10)),
             )
-        table_normal = None
-        if bool(response.table_plane_found):
-            values = (
-                float(response.table_plane_normal.x),
-                float(response.table_plane_normal.y),
-                float(response.table_plane_normal.z),
-            )
-            if all(np.isfinite(value) for value in values) and np.linalg.norm(values) > 1e-9:
-                table_normal = values
+        table_normal, table_offset, table_inlier_ratio = self._table_geometry_from_response(response)
         object_top = None
         top_values = (
             float(response.object_top_xyz.x),
             float(response.object_top_xyz.y),
             float(response.object_top_xyz.z),
         )
-        if bool(response.table_plane_found) and all(np.isfinite(value) for value in top_values):
+        if table_normal is not None and all(np.isfinite(value) for value in top_values):
             object_top = top_values
         scene = PlannerSceneGeometry(
             object_centroid_camera=object_centroid,
             table_normal_camera=table_normal,
-            table_offset_camera=float(response.table_plane_offset),
-            table_inlier_ratio=float(response.table_plane_inlier_ratio),
+            table_offset_camera=table_offset,
+            table_inlier_ratio=table_inlier_ratio,
             object_top_camera=object_top,
         )
         return response.grasps.header, candidates, scene

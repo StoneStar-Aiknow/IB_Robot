@@ -10,6 +10,7 @@ from moveit_configs_utils import MoveItConfigsBuilder
 _DISABLED_CAPABILITIES = " ".join(
     (
         "move_group/MoveGroupCartesianPathService",
+        "move_group/MoveGroupExecuteService",
         "move_group/MoveGroupExecuteTrajectoryAction",
         "move_group/MoveGroupMoveAction",
         "move_group/MoveGroupPlanService",
@@ -18,6 +19,7 @@ _DISABLED_CAPABILITIES = " ".join(
         "move_group/MoveGroupGetPlanningSceneService",
         "move_group/ApplyPlanningSceneService",
         "move_group/ClearOctomapService",
+        "move_group/TfPublisher",
     )
 )
 

@@ -12,29 +12,91 @@ def test_runtime_hardware_overrides_do_not_shadow_capabilities():
             "name": "so101_handeye_realsense_only",
             "grasp_execution": {"enabled": True, "lift_distance_m": 0.05},
             "embodied": {"skill_templates": {"pick_object": {"executor": "grasp_pipeline"}}},
-            "ros2_control": {"port": "/dev/ttyACM0"},
-            "peripherals": [{"name": "wrist", "width": 1280}],
-            "contract": {"rate_hz": 20},
-            "teleoperation": {"enabled": False},
+            "ros2_control": {
+                "hardware_plugin": "base/plugin",
+                "port": "/dev/ttyACM0",
+                "controllers": ["base_controller"],
+            },
+            "peripherals": [
+                {
+                    "name": "wrist",
+                    "driver": "realsense",
+                    "serial_number": "base",
+                    "width": 1280,
+                    "streams": ["color", "depth"],
+                }
+            ],
+            "contract": {
+                "rate_hz": 20,
+                "observations": [
+                    {
+                        "key": "observation.images.wrist",
+                        "topic": "/camera/wrist/image_raw",
+                        "image": {"resize": [720, 1280]},
+                    }
+                ],
+                "actions": [{"key": "action", "topic": "/base/action"}],
+            },
+            "teleoperation": {"enabled": False, "active_device": "", "safety": {"limit": 1.0}},
         }
     }
     runtime = {
         "robot": {
             "name": "so101_handeye_realsense_only",
             "grasp_execution": {"enabled": False, "lift_distance_m": 0.165},
-            "ros2_control": {"port": "/dev/ttyACM1"},
-            "peripherals": [{"name": "wrist", "width": 640}],
-            "contract": {"rate_hz": 30},
-            "teleoperation": {"enabled": True, "active_device": "so101_leader"},
+            "ros2_control": {
+                "hardware_plugin": "stale/plugin",
+                "port": "/dev/ttyACM1",
+                "controllers": ["stale_controller"],
+            },
+            "peripherals": [
+                {
+                    "name": "wrist",
+                    "driver": "stale_driver",
+                    "serial_number": "runtime",
+                    "width": 640,
+                    "streams": ["color"],
+                },
+                {"name": "runtime_only", "driver": "unexpected"},
+            ],
+            "contract": {
+                "rate_hz": 30,
+                "observations": [
+                    {
+                        "key": "observation.images.wrist",
+                        "topic": "/stale/topic",
+                        "image": {"resize": [480, 640]},
+                    }
+                ],
+                "actions": [{"key": "action", "topic": "/stale/action"}],
+            },
+            "teleoperation": {
+                "enabled": True,
+                "active_device": "so101_leader",
+                "devices": [{"name": "so101_leader", "port": "/dev/ttyACM2"}],
+                "safety": {"limit": 9.0},
+            },
         }
     }
 
     merged = synthesize_runtime_config(base, runtime)["robot"]
 
     assert merged["ros2_control"]["port"] == "/dev/ttyACM1"
+    assert merged["ros2_control"]["hardware_plugin"] == "base/plugin"
+    assert merged["ros2_control"]["controllers"] == ["base_controller"]
     assert merged["peripherals"][0]["width"] == 640
-    assert merged["contract"]["rate_hz"] == 30
+    assert merged["peripherals"][0]["serial_number"] == "runtime"
+    assert merged["peripherals"][0]["driver"] == "realsense"
+    assert merged["peripherals"][0]["streams"] == ["color", "depth"]
+    assert len(merged["peripherals"]) == 1
+    assert merged["contract"]["rate_hz"] == 20
+    assert merged["contract"]["observations"][0]["topic"] == "/camera/wrist/image_raw"
+    assert merged["contract"]["observations"][0]["image"]["resize"] == [480, 640]
+    assert merged["contract"]["actions"] == [{"key": "action", "topic": "/base/action"}]
+    assert merged["teleoperation"]["enabled"] is False
     assert merged["teleoperation"]["active_device"] == "so101_leader"
+    assert merged["teleoperation"]["devices"][0]["port"] == "/dev/ttyACM2"
+    assert merged["teleoperation"]["safety"] == {"limit": 1.0}
     assert merged["grasp_execution"] == {"enabled": True, "lift_distance_m": 0.05}
     assert "pick_object" in merged["embodied"]["skill_templates"]
 
