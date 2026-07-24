@@ -98,12 +98,10 @@ def write_pi05_hmm_deployment(
     decode = role_abis["decode"]
     action_out = role_abis["action_out_proj"]
     _validate_vision_abi(vision_abi, vision_layout, "PI0.5")
+    _require_tensor_names(prefill.inputs, ("prefix_embs", "attention_mask", "position_ids"), "PI0.5 prefill inputs")
     _require_tensor_names(
-        prefill.inputs[:4], ("input_1", "valid_length", "current_length", "attention_mask"), "PI0.5 prefill inputs"
-    )
-    _require_tensor_names(
-        decode.inputs[:5],
-        ("input_1", "valid_length", "current_length", "cond", "attention_mask"),
+        decode.inputs[:4],
+        ("action_embs", "attention_mask", "position_ids", "condition"),
         "PI0.5 decode inputs",
     )
     _require_single_io(action_in, "action_in", "action_in_proj_out", "PI0.5 action_in_proj")
@@ -117,14 +115,15 @@ def write_pi05_hmm_deployment(
     _require_compatible(time_mlp.outputs[0], decode.inputs[3], "PI0.5 time projection to decode")
     _require_compatible(decode.outputs[0], action_out.inputs[0], "PI0.5 decode to action projection")
 
-    prefill_caches = prefill.inputs[4:]
-    decode_caches = decode.inputs[5:]
-    if not prefill_caches or tuple(tensor.name for tensor in prefill_caches) != tuple(
-        tensor.name for tensor in decode_caches
-    ):
-        raise ValueError("PI0.5 HMM prefill and decode cache input names must match exactly")
-    for source, target in zip(prefill_caches, decode_caches, strict=True):
-        _require_compatible(source, target, f"PI0.5 cache {source.name}")
+    prefill_caches = prefill.outputs
+    decode_caches = decode.inputs[4:]
+    _validate_cache_sequence(tuple(tensor.name for tensor in prefill_caches), "PI0.5 prefill")
+    _validate_cache_sequence(tuple(tensor.name for tensor in decode_caches), "PI0.5 decode")
+    prefill_outputs = {tensor.name: tensor for tensor in prefill_caches}
+    if tuple(prefill_outputs) != tuple(tensor.name for tensor in decode_caches):
+        raise ValueError("PI0.5 prefill cache outputs and decode cache inputs must match exactly")
+    for target in decode_caches:
+        _require_compatible(prefill_outputs[target.name], target, f"PI0.5 cache {target.name}")
 
     image_tokens = _image_token_count(vision_abi.outputs[0], "PI0.5")
     actual_prefix = len(cameras) * image_tokens + tokenizer_length
@@ -167,12 +166,10 @@ def write_pi05_hmm_deployment(
         ),
         outputs=(
             _synthetic_tensor("prefix_embeddings", 0, prefill.inputs[0]),
-            _synthetic_tensor("prefix_attention", 1, prefill.inputs[3]),
-            _synthetic_tensor("decode_attention", 2, decode.inputs[4]),
-            _synthetic_tensor("prefill_valid_length", 3, prefill.inputs[1]),
-            _synthetic_tensor("prefill_current_length", 4, prefill.inputs[2]),
-            _synthetic_tensor("decode_valid_length", 5, decode.inputs[1]),
-            _synthetic_tensor("decode_current_length", 6, decode.inputs[2]),
+            _synthetic_tensor("prefix_attention", 1, prefill.inputs[1]),
+            _synthetic_tensor("prefix_positions", 2, prefill.inputs[2]),
+            _synthetic_tensor("decode_attention", 3, decode.inputs[1]),
+            _synthetic_tensor("decode_positions", 4, decode.inputs[2]),
         ),
     )
     embedding_inputs = {f"image_{index}": semantic for index, semantic in enumerate(image_semantics)}
@@ -189,26 +186,20 @@ def write_pi05_hmm_deployment(
             "prefix_embeddings": "internal.prefix_embeddings",
             "prefix_attention": "internal.prefix_attention",
             "decode_attention": "internal.decode_attention",
-            "prefill_valid_length": "internal.prefill_valid_length",
-            "prefill_current_length": "internal.prefill_current_length",
-            "decode_valid_length": "internal.decode_valid_length",
-            "decode_current_length": "internal.decode_current_length",
+            "prefix_positions": "internal.prefix_positions",
+            "decode_positions": "internal.decode_positions",
         },
     )
 
-    cache_semantics = {tensor.name: f"internal.cache.{index}" for index, tensor in enumerate(prefill_caches)}
+    cache_semantics = {tensor.name: _cache_semantic(tensor.name) for tensor in prefill_caches}
     bindings["prefill"] = artifact_bindings(
         prefill,
         input_semantics={
-            "input_1": "internal.prefix_embeddings",
-            "valid_length": "internal.prefill_valid_length",
-            "current_length": "internal.prefill_current_length",
+            "prefix_embs": "internal.prefix_embeddings",
             "attention_mask": "internal.prefix_attention",
-            **cache_semantics,
+            "position_ids": "internal.prefix_positions",
         },
-        output_semantics={
-            tensor.name: f"diagnostic.prefill.output.{index}" for index, tensor in enumerate(prefill.outputs)
-        },
+        output_semantics={tensor.name: cache_semantics[tensor.name] for tensor in prefill.outputs},
     )
     bindings["action_in_proj"] = artifact_bindings(
         action_in,
@@ -223,11 +214,10 @@ def write_pi05_hmm_deployment(
     bindings["decode"] = artifact_bindings(
         decode,
         input_semantics={
-            "input_1": "internal.action_embedding",
-            "valid_length": "internal.decode_valid_length",
-            "current_length": "internal.decode_current_length",
-            "cond": "internal.time_condition",
+            "action_embs": "internal.action_embedding",
             "attention_mask": "internal.decode_attention",
+            "position_ids": "internal.decode_positions",
+            "condition": "internal.time_condition",
             **cache_semantics,
         },
         output_semantics={decode.outputs[0].name: "internal.suffix_hidden"},
@@ -245,7 +235,6 @@ def write_pi05_hmm_deployment(
             semantic=semantic,
             producer="prefill",
             consumer="decode",
-            producer_binding="input",
             transport="device_pointer",
             owner="producer",
             lifetime="inference",

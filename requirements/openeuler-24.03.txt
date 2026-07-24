@@ -3,3 +3,7 @@ onnx
 onnxruntime
 pygraphviz
 atomgit_sdk
+# Ascend NPU backend; matches the torch version pulled by the lerobot
+# editable install (torch>=2.7,<2.11.0). Installed after lerobot so pip
+# resolves a torch_npu release compatible with the already-installed torch.
+torch_npu

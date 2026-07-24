@@ -9,7 +9,7 @@
 | [intro](./intro) | 引导 | 「介绍」「有哪些功能」「help」「入门」「intro」等，作为所有 skill 的导航入口。 |
 | [ibrobot-env](./ibrobot-env) | 环境 | 加载 `.shrc_local`、设置 `ROS_DOMAIN_ID`、解决 `ModuleNotFoundError` 等。 |
 | [ibrobot-build](./ibrobot-build) | 操作 | 执行项目编译 (`colcon build`)、构建特定 package 或修复编译错误。 |
-| [ibrobot-launch](./ibrobot-launch) | 操作 | 启动机器人系统、运行仿真、测试 ACT 推理或进行遥操作调试。 |
+| [ibrobot-launch](./ibrobot-launch) | 操作 | 分平台启动 Ubuntu/openEuler 工作区或 OpenHarmony 板端机器人系统、仿真、推理与遥操作。 |
 | [ibrobot-robot-skill-design](./ibrobot-robot-skill-design) | 操作 | 交互式设计机器人 skill，澄清 anchor/motion space/safety/MCP 暴露并生成验证计划。 |
 | [oh-constraints](./oh-constraints) | 板端 | OpenHarmony 板端运行时约束汇总（toybox 命令缺失、musl libc、只读 rootfs、无 systemd、无 /usr/bin/env、LD_PRELOAD 干扰等），板端操作前必读。 |
 | [oh-access](./oh-access) | 板端 | 连接 OpenHarmony 开发板，执行 HDC shell / file send / file recv。 |
@@ -47,7 +47,7 @@
 
 - **环境管理 ([ibrobot-env](./ibrobot-env))**: 确保 shell 上下文正确继承了项目特有的环境变量。
 - **编译构建 ([ibrobot-build](./ibrobot-build))**: 封装了 ROS 2 复杂的编译参数，确保构建的一致性。
-- **系统启动 ([ibrobot-launch](./ibrobot-launch))**: 机器人系统的总入口，支持一键拉起复杂的节点拓扑。
+- **系统启动 ([ibrobot-launch](./ibrobot-launch))**: 机器人系统的总入口，区分 Ubuntu/openEuler 源码工作区与 OpenHarmony `/data/roboframe` 板端运行时。
 - **机器人 Skill 设计 ([ibrobot-robot-skill-design](./ibrobot-robot-skill-design))**: 通过交互式流程把自然语言动作需求转成安全的 SSOT skill 设计，避免把观察位/目标位附近动作误实现为无语义锚点的关节轨迹。
 - **板端约束 ([oh-constraints](./oh-constraints))**: OpenHarmony 板端运行时约束汇总（toybox 命令缺失、musl libc、只读 rootfs、无 systemd、无 /usr/bin/env、LD_PRELOAD 干扰、SSH RemoteCommand 等），凡涉及板端操作前必读。
 - **板端连接 ([oh-access](./oh-access))**: 统一封装 OpenHarmony 板的 HDC over TCP 访问与文件传输。

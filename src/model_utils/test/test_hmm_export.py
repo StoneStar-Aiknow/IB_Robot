@@ -64,7 +64,7 @@ def _artifact(root: Path, name: str) -> Path:
     return path
 
 
-def test_write_pi05_hmm_deployment_uses_tcim_abis_and_input_owned_caches(tmp_path):
+def test_write_pi05_hmm_deployment_uses_tcim_abis_and_output_cache_links(tmp_path):
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     config = _bundle(bundle, "pi05")
@@ -83,13 +83,14 @@ def test_write_pi05_hmm_deployment_uses_tcim_abis_and_input_owned_caches(tmp_pat
             _write_tcim(
                 compiler / "prefill.json",
                 [
-                    ("input_1", "float16", [1, 9, 4]),
-                    ("valid_length", "int32", [1]),
-                    ("current_length", "int32", [1]),
+                    ("prefix_embs", "float16", [1, 9, 4]),
                     ("attention_mask", "float16", [1, 1, 9, 11]),
-                    ("cache_0", "int8", [1, 1]),
+                    ("position_ids", "int64", [1, 9]),
                 ],
-                [("last_hidden_state", "float16", [1, 9, 4])],
+                [
+                    ("past_key_0", "float16", [1, 1, 9, 2]),
+                    ("past_value_0", "float16", [1, 1, 9, 2]),
+                ],
             ),
         ),
         "action_in_proj": (
@@ -113,14 +114,14 @@ def test_write_pi05_hmm_deployment_uses_tcim_abis_and_input_owned_caches(tmp_pat
             _write_tcim(
                 compiler / "decode.json",
                 [
-                    ("input_1", "float16", [1, 2, 4]),
-                    ("valid_length", "int32", [1]),
-                    ("current_length", "int32", [1]),
-                    ("cond", "float16", [1, 4]),
+                    ("action_embs", "float16", [1, 2, 4]),
                     ("attention_mask", "float16", [1, 1, 2, 11]),
-                    ("cache_0", "int8", [1, 1]),
+                    ("position_ids", "int64", [1, 2]),
+                    ("condition", "float16", [1, 4]),
+                    ("past_key_0", "float16", [1, 1, 9, 2]),
+                    ("past_value_0", "float16", [1, 1, 9, 2]),
                 ],
-                [("last_hidden_state", "float16", [1, 2, 4])],
+                [("suffix_hidden", "float16", [1, 2, 4])],
             ),
         ),
         "action_out_proj": (
@@ -154,9 +155,9 @@ def test_write_pi05_hmm_deployment_uses_tcim_abis_and_input_owned_caches(tmp_pat
         "decode",
         "action_out_proj",
     )
-    assert validated.deployment.device_links[0].producer_binding == "input"
-    assert validated.deployment.device_links[0].semantic == "internal.cache.0"
-    assert validated.deployment.bindings["prefill"].outputs[0].semantic.startswith("diagnostic.")
+    assert validated.deployment.device_links[0].producer_binding == "output"
+    assert validated.deployment.device_links[0].semantic == "internal.past_key.0"
+    assert validated.deployment.bindings["prefill"].outputs[0].semantic == "internal.past_key.0"
 
 
 def test_write_smolvla_hmm_deployment_links_only_action_cache_layers(tmp_path):

@@ -691,6 +691,16 @@ class HMMBackend(LifecycleBackend):
             (prefix.shape[0], 1, chunk_size, decode_key_length),
         ).copy()
 
+        prefix_positions_binding = self._binding_for_semantics(
+            bindings.outputs,
+            {"internal.prefix_positions"},
+            "prefix positions",
+        )
+        decode_positions_binding = self._binding_for_semantics(
+            bindings.outputs,
+            {"internal.decode_positions"},
+            "decode positions",
+        )
         generated: dict[str, object] = {
             prefix_binding.semantic: prefix,
             attention_binding.semantic: self._to_additive_attention(prefix_attention, attention_binding.dtype),
@@ -698,10 +708,10 @@ class HMMBackend(LifecycleBackend):
                 decode_attention,
                 decode_attention_binding.dtype,
             ),
-            "internal.prefill_valid_length": np.zeros((prefix.shape[0],), dtype=np.int32),
-            "internal.prefill_current_length": np.full((prefix.shape[0],), actual_length, dtype=np.int32),
-            "internal.decode_valid_length": np.full((prefix.shape[0],), actual_length, dtype=np.int32),
-            "internal.decode_current_length": np.full((prefix.shape[0],), chunk_size, dtype=np.int32),
+            prefix_positions_binding.semantic: np.arange(prefix.shape[1], dtype=np.int64)[None, :],
+            decode_positions_binding.semantic: np.arange(prefix.shape[1], prefix.shape[1] + chunk_size, dtype=np.int64)[
+                None, :
+            ],
         }
         return self._convert_semantic_outputs(bindings.outputs, generated, "embedding")
 
@@ -873,14 +883,14 @@ class HMMBackend(LifecycleBackend):
             cls._require_positive_config(policy_config, key, "PI0.5")
         if embedding.token_weight.ndim != 2:
             raise BackendLoadError("HMM PI0.5 token embedding must be rank 2", code="invalid_embedding")
-        input_links = [link for link in deployment.device_links if link.producer_binding == "input"]
-        if not input_links or any(link.producer != "prefill" or link.consumer != "decode" for link in input_links):
+        if not deployment.device_links or any(
+            link.producer != "prefill" or link.consumer != "decode" or link.producer_binding != "output"
+            for link in deployment.device_links
+        ):
             raise BackendLoadError(
-                "HMM PI0.5 requires prefill input to decode input device links",
+                "HMM PI0.5 requires prefill output to decode input device links",
                 code="invalid_device_links",
             )
-        if any(link.producer_binding != "input" for link in deployment.device_links):
-            raise BackendLoadError("HMM PI0.5 supports only input-sourced cache links", code="invalid_device_links")
         noise = cls._binding_for_semantics(
             deployment.bindings["action_in_proj"].inputs,
             _NOISE_SEMANTICS,

@@ -17,7 +17,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 
 | Skill | 一句话描述 |
 | :--- | :--- |
-| **ibrobot-launch** | 启动机器人节点、仿真环境、推理测试或遥操作调试 |
+| **ibrobot-launch** | 分平台启动 Ubuntu/openEuler 或 OpenHarmony 板端机器人、仿真、推理与遥操作 |
 | **ibrobot-build** | 编译整个工作空间或指定 package（`colcon build`） |
 | **ibrobot-env** | 初始化运行环境，加载 `.shrc_local`、设置 `ROS_DOMAIN_ID` |
 | **ibrobot-architecture** | 理解 SSOT 架构设计、配置规范与数据流 |
@@ -100,7 +100,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 把 usb_cam 移植到板端            → oh-cross-build-ros-pkg
 编译 bash/zsh/vim 到板端         → ohloha-build-pkg
 重新编译板端内核                 → oh-rebuild-kernel
-启动机器人仿真                  → ibrobot-launch
+启动机器人仿真或 OpenHarmony 板端运行 → ibrobot-launch
 设计一个新的机器人动作           → ibrobot-robot-skill-design
 让 Hermes 调用一个庆祝动作       → ibrobot-robot-skill-design
 初始化环境                      → ibrobot-env
