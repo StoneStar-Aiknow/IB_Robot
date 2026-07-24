@@ -105,6 +105,7 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 | `perception_request_topic` | `/embodied/perception_request` | 视觉互动请求输出（复用 perception 请求 topic） |
 | `perception_enabled` | `false` | perception 是否启用；用于互动启用一致性校验 |
 | `entry_visual_games_json` | `{}` | 入口视觉趣味游戏策略（开关 + 触发别名），来自 `embodied.entry.visual_games` |
+| `skill_aliases_json` | `{}` | 从启用且 `rule_entry: true` 的 YAML skill 注入的规则入口别名 |
 | `debug_tracing` | `false` | 是否打印调试日志 |
 
 ## 4. task_planner_node
@@ -123,6 +124,16 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 | `关闭夹爪` / `夹紧` | `close_gripper_skill` |
 | `顺时针旋转 45 度` | `rotate_gripper_cw` |
 | `逆时针旋转 45 度` | `rotate_gripper_ccw` |
+
+### Rule-entry alias 与 `task_type` 契约
+
+`skill_aliases_json` 由 `robot_config` 中启用且 `description.rule_entry: true` 的 skill
+生成，只用于让无参数社交动作进入确定性规则解析。设置 `disabled: true` 的 skill 不会进入
+别名集合。社交动作命中后，其 skill 名同时作为 `task_type` 和 `skill_sequence` 的唯一项。
+
+既有观察、回位、夹爪开合、相对移动和带角度旋转命令仍优先走专用规则分支，不由 alias
+改写其公开 `task_type`。例如观察保持 `observe_scene`、打开夹爪保持 `open_gripper`、
+相对移动保持 `relative_motion`。
 
 ### 当前约束
 
@@ -148,6 +159,7 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 | `default_target_name` | `demo_object` | 默认命名目标 |
 | `default_place_name` | `home` | 保留参数；当前规则规划不会生成放置技能 |
 | `default_relative_motion_step_m` | `0.03` | “一点”默认映射步长（米） |
+| `skill_aliases_json` | `{}` | 从启用且 `rule_entry: true` 的 YAML skill 注入的规则入口别名 |
 | `debug_tracing` | `false` | 是否打印规划调试日志 |
 
 ## 5. task_executor_node

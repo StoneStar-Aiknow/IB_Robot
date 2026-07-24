@@ -124,19 +124,14 @@ Task / Skill request
 
 ### 技能白名单
 
-当前只允许以下技能：
+技能白名单由 `get_skill_templates()` 选择：
 
-- `inspect_scene`
-- `open_gripper_skill`
-- `close_gripper_skill`
-- `recover_safe_pose`
-- `recover_zero_pose`
-- `move_relative_ee`
-- `rotate_gripper_cw`
-- `rotate_gripper_ccw`
-- `dance_basic`
+- `skill_templates_json` 非空时，使用当前机器人 YAML 注入并过滤 `disabled: true` 后的启用
+  `embodied.skill_templates` 集合
+- 未提供机器人模板时，回退到 `embodied_common.skill_templates` 的默认模板
 
-除此之外一律拒绝。
+机器人模板非空时替代默认模板，两套模板不会自动合并。请求技能必须存在于当前选中的模板集合中。
+安全守卫随后按顺序校验每个 primitive，任何未知技能、未知 primitive 或参数越界都会被拒绝。
 
 ### 技能依赖检查
 
@@ -147,7 +142,7 @@ Task / Skill request
 | `inspect_scene` | 必须存在 `observe_table` 命名位姿 |
 | `recover_safe_pose` | 必须存在 `home` 命名位姿 |
 | `recover_zero_pose` | 必须存在 `zero` 命名位姿 |
-| 其他技能 | 必须存在于 `skill_templates` 白名单配置中 |
+| YAML 派生技能 | 必须存在于 `skill_templates_json`，并通过其全部 primitive 校验 |
 
 ### 原子动作白名单
 

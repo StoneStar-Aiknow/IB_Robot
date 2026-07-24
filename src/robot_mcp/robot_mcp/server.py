@@ -16,14 +16,13 @@ yields ``robot_list_skills``, ``robot_execute_skill`` ...
 
 Usage:
     robot_mcp_server --config-name so101_single_arm                 # stdio (default)
-    robot_mcp_server --transport streamable-http --host 0.0.0.0 --port 8080
+    robot_mcp_server --transport streamable-http --host 127.0.0.1 --port 8080
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import logging
 import sys
 import time
@@ -50,6 +49,9 @@ _bridge: RosBridge | None = None
 
 # Grace beyond the action's own timeout before the MCP side gives up.
 _RESULT_GRACE_SEC = 5.0
+_ACCEPT_TIMEOUT_SEC = 5.0
+_CANCEL_DRAIN_TIMEOUT_SEC = 5.0
+DEFAULT_HTTP_HOST = "127.0.0.1"
 
 
 # =============================== Phase 0 tools ==============================
@@ -106,6 +108,12 @@ def get_status() -> dict[str, Any]:
 # =============================== Phase 1 tools ==============================
 
 
+def _catalog_has_skill(skill_name: str) -> bool:
+    if _catalog is None:  # pragma: no cover
+        raise RuntimeError("Catalog not initialized")
+    return any(skill.get("name") == skill_name for skill in _catalog.skills)
+
+
 def validate_skill(
     skill_name: str,
     target_name: str = "",
@@ -119,6 +127,8 @@ def validate_skill(
     Returns {allowed, reason}. Reason explains the rejection (unknown skill,
     workspace bound, missing target, etc.) straight from safety_guard.
     """
+    if not _catalog_has_skill(skill_name):
+        return {"allowed": False, "reason": f"unsupported skill: {skill_name}"}
     if _bridge is None or not _bridge.ros_available:
         return {"allowed": False, "reason": "ROS bridge offline (validate_skill unavailable)"}
     return _bridge.validate_skill(
@@ -136,7 +146,7 @@ async def execute_skill(
     place_name: str = "",
     motion_direction: str = "",
     motion_distance: float = 0.0,
-    timeout_sec: float = 15.0,
+    timeout_sec: float = 30.0,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     """Execute a real robot skill via /embodied/execute_skill (moves the robot).
@@ -157,6 +167,12 @@ async def execute_skill(
     """
     if _catalog is None:  # pragma: no cover
         raise RuntimeError("Catalog not initialized")
+    if not _catalog_has_skill(skill_name):
+        return {
+            "success": False,
+            "error_code": "UNSUPPORTED_SKILL",
+            "message": f"unsupported skill: {skill_name}",
+        }
     if _bridge is None or not _bridge.ros_available:
         return {
             "success": False,
@@ -170,35 +186,70 @@ async def execute_skill(
             "message": (f"{_bridge.skill_action_name} action server not available (is skill_executor running?)"),
         }
 
-    task_id = str(uuid.uuid4())
-    if ctx is not None:
-        await ctx.info(f"[{task_id}] dispatching skill '{skill_name}' to skill_executor")
-
-    goal = _bridge.build_skill_goal(
-        skill_name=skill_name,
-        target_name=target_name,
-        place_name=place_name,
-        motion_direction=motion_direction,
-        motion_distance=motion_distance,
-        timeout_sec=timeout_sec,
-        task_id=task_id,
-    )
-    send_future, fb_queue = _bridge.send_skill_goal(goal)
-
-    # Wait for goal acceptance.
-    accept_deadline = time.monotonic() + 5.0
-    while not send_future.done() and time.monotonic() < accept_deadline:
-        await asyncio.sleep(0.05)
-    if not send_future.done():
+    admission_state = _bridge.try_claim_skill_execution()
+    if admission_state is not None:
+        recovering = admission_state == "recovering"
         return {
             "success": False,
-            "error_code": "ACCEPT_TIMEOUT",
-            "message": "skill_executor did not accept the goal in time.",
+            "error_code": "MOTION_RECOVERY_IN_PROGRESS" if recovering else "SKILL_IN_PROGRESS",
+            "message": (
+                "a timed-out skill is still reaching a terminal state."
+                if recovering
+                else "another MCP skill is already executing."
+            ),
+        }
+
+    task_id = str(uuid.uuid4())
+    try:
+        if ctx is not None:
+            await ctx.info(f"[{task_id}] dispatching skill '{skill_name}' to skill_executor")
+        goal = _bridge.build_skill_goal(
+            skill_name=skill_name,
+            target_name=target_name,
+            place_name=place_name,
+            motion_direction=motion_direction,
+            motion_distance=motion_distance,
+            timeout_sec=timeout_sec,
+            task_id=task_id,
+        )
+        send_future, fb_queue = _bridge.send_skill_goal(goal)
+    except Exception as exc:  # noqa: BLE001 - transport failure must release admission
+        _bridge.release_skill_execution()
+        logger.warning("[%s] failed to dispatch skill %s: %s", task_id, skill_name, exc)
+        return {
+            "success": False,
+            "error_code": "DISPATCH_FAILED",
+            "message": "failed to send SkillCommand goal.",
             "task_id": task_id,
         }
 
-    goal_handle = send_future.result()
+    # Wait for goal acceptance.
+    accept_deadline = time.monotonic() + _ACCEPT_TIMEOUT_SEC
+    while not send_future.done() and time.monotonic() < accept_deadline:
+        await asyncio.sleep(0.05)
+    if not send_future.done():
+        _bridge.mark_skill_recovering()
+        _bridge.cancel_late_skill_goal(send_future, _CANCEL_DRAIN_TIMEOUT_SEC)
+        return {
+            "success": False,
+            "error_code": "ACCEPT_TIMEOUT",
+            "message": "skill_executor did not accept the goal in time; motion admission remains blocked.",
+            "task_id": task_id,
+        }
+
+    try:
+        goal_handle = send_future.result()
+    except Exception as exc:  # noqa: BLE001 - a failed send cannot leave an active goal
+        _bridge.release_skill_execution()
+        logger.warning("[%s] SkillCommand acceptance failed: %s", task_id, exc)
+        return {
+            "success": False,
+            "error_code": "DISPATCH_FAILED",
+            "message": "SkillCommand acceptance failed.",
+            "task_id": task_id,
+        }
     if not goal_handle.accepted:
+        _bridge.release_skill_execution()
         return {
             "success": False,
             "error_code": "REJECTED",
@@ -207,7 +258,17 @@ async def execute_skill(
         }
 
     # Wait for completion, streaming feedback as MCP progress notifications.
-    result_future = goal_handle.get_result_async()
+    try:
+        result_future = goal_handle.get_result_async()
+    except Exception as exc:  # noqa: BLE001 - no result future means no tracked motion
+        _bridge.release_skill_execution()
+        logger.warning("[%s] failed to track SkillCommand result: %s", task_id, exc)
+        return {
+            "success": False,
+            "error_code": "DISPATCH_FAILED",
+            "message": "failed to track SkillCommand result.",
+            "task_id": task_id,
+        }
     overall_deadline = time.monotonic() + float(timeout_sec) + _RESULT_GRACE_SEC
     while not result_future.done() and time.monotonic() < overall_deadline:
         drained = False
@@ -220,35 +281,51 @@ async def execute_skill(
             await asyncio.sleep(0.05)
 
     if not result_future.done():
-        # MCP-side timeout: cancel to avoid orphaned execution, then report.
-        with contextlib.suppress(Exception):
-            goal_handle.cancel_goal_async()
+        _bridge.mark_skill_recovering()
+        cleaned = await asyncio.to_thread(
+            _bridge.cancel_and_drain_skill_goal,
+            goal_handle,
+            result_future,
+            _CANCEL_DRAIN_TIMEOUT_SEC,
+        )
+        if cleaned:
+            _bridge.release_skill_execution()
+            return {
+                "success": False,
+                "error_code": "RESULT_TIMEOUT",
+                "message": (
+                    f"skill did not complete within {timeout_sec + _RESULT_GRACE_SEC:.1f}s; goal canceled and drained."
+                ),
+                "task_id": task_id,
+            }
+        _bridge.release_skill_execution_when_terminal(result_future)
         return {
             "success": False,
-            "error_code": "RESULT_TIMEOUT",
+            "error_code": "CANCEL_CLEANUP_TIMEOUT",
             "message": (
-                f"skill did not complete within {timeout_sec + _RESULT_GRACE_SEC:.1f}s; goal cancel requested."
+                f"skill did not complete within {timeout_sec + _RESULT_GRACE_SEC:.1f}s; "
+                "motion admission remains blocked until cancellation is terminal."
             ),
             "task_id": task_id,
         }
 
-    res = result_future.result().result
-    # Flush any trailing feedback.
-    if ctx is not None:
-        while not fb_queue.empty():
-            state, detail = fb_queue.get_nowait()
-            await ctx.info(f"[{task_id}] {state}: {detail}")
+    try:
+        res = result_future.result().result
+        # Flush any trailing feedback.
+        if ctx is not None:
+            while not fb_queue.empty():
+                state, detail = fb_queue.get_nowait()
+                await ctx.info(f"[{task_id}] {state}: {detail}")
 
-    return {
-        "success": bool(res.success),
-        "error_code": res.error_code,
-        "message": res.message,
-        "executed_primitives": list(res.executed_primitives),
-        "task_id": task_id,
-    }
-
-
-# contextlib.suppress is used for the cancel-goal best-effort path.
+        return {
+            "success": bool(res.success),
+            "error_code": res.error_code,
+            "message": res.message,
+            "executed_primitives": list(res.executed_primitives),
+            "task_id": task_id,
+        }
+    finally:
+        _bridge.release_skill_execution()
 
 
 _ALL_TOOLS = (list_skills, list_poses, get_status, validate_skill, execute_skill)
@@ -274,7 +351,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="stdio",
         help="MCP transport.",
     )
-    parser.add_argument("--host", default="0.0.0.0", help="HTTP host (http transport only).")
+    parser.add_argument(
+        "--host",
+        default=DEFAULT_HTTP_HOST,
+        help="HTTP host (http transport only; defaults to loopback).",
+    )
     parser.add_argument("--port", type=int, default=8080, help="HTTP port (http transport only).")
     parser.add_argument("--no-ros", action="store_true", help="Skip rclpy init (catalog-only mode).")
     return parser

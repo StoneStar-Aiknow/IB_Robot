@@ -21,6 +21,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | **ibrobot-build** | 编译整个工作空间或指定 package（`colcon build`） |
 | **ibrobot-env** | 初始化运行环境，加载 `.shrc_local`、设置 `ROS_DOMAIN_ID` |
 | **ibrobot-architecture** | 理解 SSOT 架构设计、配置规范与数据流 |
+| **ibrobot-robot-skill-design** | 交互式设计机器人 skill，明确 anchor、动作空间、安全链路、MCP 暴露和验证计划 |
 
 ### 🔌 板端（OpenHarmony）
 
@@ -100,6 +101,8 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 编译 bash/zsh/vim 到板端         → ohloha-build-pkg
 重新编译板端内核                 → oh-rebuild-kernel
 启动机器人仿真或 OpenHarmony 板端运行 → ibrobot-launch
+设计一个新的机器人动作           → ibrobot-robot-skill-design
+让 Hermes 调用一个庆祝动作       → ibrobot-robot-skill-design
 初始化环境                      → ibrobot-env
 提交代码                        → ibrobot-git-flow
 把 libs/lerobot 的改动做成 patch  → ibrobot-lerobot-patch

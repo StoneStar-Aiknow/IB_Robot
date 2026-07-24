@@ -11,7 +11,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", ["launch/robot_mcp.launch.py"]),
     ],
-    install_requires=["setuptools", "mcp"],
+    install_requires=["setuptools", "mcp>=1.26.0,<2"],
     zip_safe=True,
     maintainer="liuweihong",
     maintainer_email="liuweihong8@huawei.com",

@@ -397,8 +397,61 @@ def generate_wave_dance_v1(template: dict[str, Any]) -> list[dict[str, Any]]:
     for _ in range(repeat_count):
         waypoints.extend(_clone_waypoint(waypoint) for waypoint in cycle_waypoints)
 
-    for _ in range(zero_hold_count):
-        waypoints.append(_zero_waypoint(joint_names))
+    if zero_hold_count > 0:
+        if not waypoints:
+            raise ValueError("zero_hold_count requires at least one active waypoint")
+        hold_waypoint = _clone_waypoint(waypoints[-1])
+        for _ in range(zero_hold_count):
+            waypoints.append(_clone_waypoint(hold_waypoint))
+
+    return waypoints
+
+
+def generate_single_joint_wave_v1(template: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expand a single-joint sinusoidal wave template into concrete waypoints."""
+    active_waypoint_count = int(template.get("active_waypoint_count", 16))
+    repeat_count = int(template.get("repeat_count", 1))
+    base_pose = template.get("base_pose")
+    joint_name = str(template.get("joint", "")).strip()
+    amplitude = _as_float(template.get("amplitude", 0.0), "trajectory_template.amplitude")
+    phase = _as_float(template.get("phase", 0.0), "trajectory_template.phase")
+    workspace_limits = template.get("workspace_limits")
+
+    if active_waypoint_count <= 0:
+        raise ValueError("trajectory_template.active_waypoint_count must be positive")
+    if repeat_count <= 0:
+        raise ValueError("trajectory_template.repeat_count must be positive")
+    if not isinstance(base_pose, dict) or not base_pose:
+        raise ValueError("trajectory_template.base_pose must be a non-empty mapping")
+    if not joint_name:
+        raise ValueError("trajectory_template.joint must be a non-empty string")
+    if joint_name not in base_pose:
+        raise ValueError("trajectory_template.joint must exist in base_pose")
+    if workspace_limits is not None and not isinstance(workspace_limits, dict):
+        raise ValueError("trajectory_template.workspace_limits must be a mapping")
+
+    joint_names = [str(name) for name in base_pose]
+    base_pose_values = {
+        name: _as_float(base_pose[name], f"trajectory_template.base_pose.{name}") for name in joint_names
+    }
+    cycle_waypoints: list[dict[str, Any]] = []
+
+    for index in range(active_waypoint_count):
+        theta = (2.0 * math.pi * index) / active_waypoint_count
+        candidate_pose = dict(base_pose_values)
+        candidate_pose[joint_name] = base_pose_values[joint_name] + (amplitude * math.sin(theta + phase))
+        safe_pose = _scale_pose_into_workspace(base_pose_values, candidate_pose, workspace_limits)
+        cycle_waypoints.append(
+            {
+                "primitive_name": "move_to_joint_positions",
+                "joint_positions": _round_pose(safe_pose),
+                "duration_sec": 0,
+            }
+        )
+
+    waypoints: list[dict[str, Any]] = []
+    for _ in range(repeat_count):
+        waypoints.extend(_clone_waypoint(waypoint) for waypoint in cycle_waypoints)
 
     return waypoints
 
@@ -406,6 +459,8 @@ def generate_wave_dance_v1(template: dict[str, Any]) -> list[dict[str, Any]]:
 def expand_trajectory_template(template: dict[str, Any]) -> list[dict[str, Any]]:
     """Expand a supported trajectory template into concrete joint waypoints."""
     template_type = template.get("type")
-    if template_type != "wave_dance_v1":
-        raise ValueError(f"Unsupported trajectory_template type: {template_type}")
-    return generate_wave_dance_v1(template)
+    if template_type == "wave_dance_v1":
+        return generate_wave_dance_v1(template)
+    if template_type == "single_joint_wave_v1":
+        return generate_single_joint_wave_v1(template)
+    raise ValueError(f"Unsupported trajectory_template type: {template_type}")

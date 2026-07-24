@@ -109,6 +109,7 @@ source .shrc_local
 | [ibrobot-build](.agents/skills/ibrobot-build) | 编译、colcon build、构建错误 |
 | [ibrobot-launch](.agents/skills/ibrobot-launch) | 分平台启动 Ubuntu/openEuler 工作区或 OpenHarmony 板端机器人、仿真、推理、teleop |
 | [ibrobot-architecture](.agents/skills/ibrobot-architecture) | 架构、SSOT、契约、robot_config、数据流 |
+| [ibrobot-robot-skill-design](.agents/skills/ibrobot-robot-skill-design) | 交互式设计/新增机器人 skill、Hermes/MCP 动作、真机验证方案 |
 
 ### 板端（OpenHarmony）
 

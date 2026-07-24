@@ -5,6 +5,7 @@ from typing import Any
 
 from launch_ros.actions import Node
 
+from embodied_common.command_parser import extract_skill_aliases
 from robot_config.logger_utils import get_colored_logger
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
@@ -42,6 +43,9 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
     perception_conversation = perception.get("conversation", {})
     entry = embodied_config.get("entry", {})
     timeout_policy = resolve_embodied_timeout_policy(embodied_config)
+    # Chinese trigger keywords come straight from the SSOT skill descriptions so
+    # the rule planner and the MCP catalog share one keyword source.
+    skill_aliases_json = json.dumps(extract_skill_aliases(skill_templates))
     allowed_skills = planning_policy.get(
         "allowed_skills",
         [
@@ -96,6 +100,7 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
                 "default_target_name": embodied_config.get("default_target_name", "demo_object"),
                 "default_place_name": embodied_config.get("default_place_name", "home"),
                 "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
+                "skill_aliases_json": skill_aliases_json,
             }
         ],
     )
@@ -145,6 +150,7 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
                     "fallback_to_rule_planner": planning_policy.get("fallback_to_rule_planner", True),
                     "min_confidence": planning_policy.get("min_confidence", 0.7),
                     "allowed_skills_json": json.dumps(allowed_skills),
+                    "skill_aliases_json": skill_aliases_json,
                 }
             ],
         )
@@ -227,6 +233,7 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
                     "default_place_name": embodied_config.get("default_place_name", "home"),
                     "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
                     "default_task_timeout_sec": timeout_policy["task_budget_sec"],
+                    "skill_aliases_json": skill_aliases_json,
                     "perception_request_topic": perception.get("request_topic", "/embodied/perception_request"),
                     "perception_enabled": perception.get("enabled", False),
                     "entry_visual_games_json": json.dumps(entry.get("visual_games", {})),

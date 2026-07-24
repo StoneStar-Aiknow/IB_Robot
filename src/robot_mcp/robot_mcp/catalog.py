@@ -94,12 +94,72 @@ def resolve_config_path(
     )
 
 
+def _synthesize_skill_doc(skill_name: str, description: dict[str, Any]) -> str:
+    """Build a dense, disambiguation-rich doc string from the SSOT description block.
+
+    The synthesized doc is what an MCP/LLM caller reads to pick between
+    near-synonym skills, so it leads with category+summary, lists when-to-use,
+    and -- critically -- spells out do-not-use redirects toward the right
+    alternative. Falls back to the legacy ``_SKILL_DOCS`` one-liners only when
+    the SSOT description is absent.
+    """
+    summary = str(description.get("summary", "")).strip()
+    category = str(description.get("category", "")).strip()
+    when_to_use = description.get("when_to_use") or []
+    do_not_use = description.get("do_not_use") or []
+    aliases_zh = description.get("aliases_zh") or []
+    motion_scope = description.get("motion_scope") or []
+    intensity = str(description.get("intensity", "")).strip()
+    anchor_pose = str(description.get("anchor_pose", "")).strip()
+
+    parts: list[str] = []
+    if category:
+        parts.append(f"[{category}]")
+    if summary:
+        parts.append(summary)
+    if when_to_use:
+        parts.append("Use: " + ", ".join(str(item) for item in when_to_use) + ".")
+    redirects = [
+        f"{entry.get('condition', '')} -> {entry.get('instead_use', '')}"
+        for entry in do_not_use
+        if isinstance(entry, dict) and entry.get("instead_use")
+    ]
+    if redirects:
+        parts.append("Do NOT use for: " + "; ".join(redirects) + ".")
+    if aliases_zh:
+        parts.append("中文: " + "/".join(str(alias) for alias in aliases_zh) + ".")
+    scope_bits = []
+    if motion_scope:
+        scope_bits.append("scope=" + "+".join(str(token) for token in motion_scope))
+    if anchor_pose and anchor_pose != "none":
+        scope_bits.append(f"anchor={anchor_pose}")
+    if intensity:
+        scope_bits.append(f"intensity={intensity}")
+    if scope_bits:
+        parts.append(" ".join(scope_bits) + ".")
+    synthesized = " ".join(part for part in parts if part).strip()
+    return synthesized or _SKILL_DOCS.get(skill_name, "")
+
+
 def _build_skill_entry(skill_name: str, template: dict[str, Any]) -> dict[str, Any]:
-    """Derive an agent-facing description of a single skill from its template."""
+    """Derive an agent-facing description of a single skill from its template.
+
+    The structured ``description`` block (SSOT YAML) is surfaced verbatim so an
+    LLM can filter deterministically (category / aliases / motion_scope /
+    intensity / anchor_pose / requires_motion_params), while ``doc`` carries the
+    synthesized, human-readable disambiguation text. The legacy ``_SKILL_DOCS``
+    map is only consulted as a last-resort fallback when the SSOT block is
+    missing, so no skill is ever left without a hint.
+    """
     primitive_sequence = template.get("primitive_sequence") or []
     primitives: list[str] = []
     pose_targets: list[str] = []
     accepts_motion = False
+    initial_gripper_state = str(template.get("initial_gripper_state", "")).strip().lower()
+    if initial_gripper_state == "open":
+        primitives.append("open_gripper")
+    elif initial_gripper_state == "closed":
+        primitives.append("close_gripper")
     for step in primitive_sequence:
         if not isinstance(step, dict):
             continue
@@ -112,14 +172,30 @@ def _build_skill_entry(skill_name: str, template: dict[str, Any]) -> dict[str, A
         if step.get("motion_direction_from_request") or step.get("motion_distance_from_request"):
             accepts_motion = True
 
-    return {
+    description = template.get("description") if isinstance(template.get("description"), dict) else {}
+
+    entry: dict[str, Any] = {
         "name": skill_name,
         "primitives": primitives,
         "pose_targets": pose_targets,
         "accepts_motion": accepts_motion,
         "vision_only": skill_name == "inspect_scene" or not primitives,
-        "doc": _SKILL_DOCS.get(skill_name, ""),
+        "doc": _synthesize_skill_doc(skill_name, description),
     }
+
+    if description:
+        entry["category"] = description.get("category", "")
+        entry["aliases_zh"] = list(description.get("aliases_zh") or [])
+        entry["aliases_en"] = list(description.get("aliases_en") or [])
+        entry["motion_scope"] = list(description.get("motion_scope") or [])
+        entry["anchor_pose"] = description.get("anchor_pose", "")
+        entry["intensity"] = description.get("intensity", "")
+        entry["duration_sec_estimate"] = description.get("duration_sec_estimate")
+        entry["requires_motion_params"] = bool(description.get("requires_motion_params", False))
+        entry["when_to_use"] = list(description.get("when_to_use") or [])
+        entry["do_not_use"] = list(description.get("do_not_use") or [])
+
+    return entry
 
 
 def _build_pose_entry(pose_name: str, raw: dict[str, Any]) -> dict[str, Any]:
@@ -151,6 +227,13 @@ _SKILL_DOCS: dict[str, str] = {
     "rotate_gripper_cw": "Rotate the gripper clockwise.",
     "rotate_gripper_ccw": "Rotate the gripper counter-clockwise.",
     "dance_basic": "Play the basic dance sequence.",
+    "wave_hello": "Wave hello with the wrist, then return to the gesture base pose.",
+    "nod_yes": "Nod yes with small shoulder/elbow motion, then return to the gesture base pose.",
+    "shake_no": "Shake no with a small base joint motion, then return to the gesture base pose.",
+    "celebrate": "Move to observe_table, then celebrate by moving up/down/left/right around that observation pose.",
+    "greet_observe_raise": "Move to observe_table, then greet by raising and lowering the end-effector.",
+    "act_cute": "Play a cute attention-seeking wiggle with gripper open-close.",
+    "happy_spin_upright": "Keep an upright gesture base while spinning the base joint with a cheerful wrist wiggle.",
 }
 
 

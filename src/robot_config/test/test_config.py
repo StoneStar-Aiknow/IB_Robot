@@ -21,6 +21,7 @@ from robot_config.launch_builders.voice_asr import (
 )
 from robot_config.loader import (
     build_contract_from_robot_config_dict,
+    load_embodied_config,
     load_robot_config,
     load_robot_config_dict,
     load_voice_asr_config,
@@ -33,6 +34,11 @@ from voice_asr_service.model_manager import (
     infer_model_bundle_from_path_hint,
     resolve_model_assets,
 )
+
+
+def test_default_skill_timeout_is_thirty_seconds():
+    assert EmbodiedConfig().skill_timeout_sec == 30.0
+    assert load_embodied_config({}).skill_timeout_sec == 30.0
 
 
 def test_load_single_arm_config():
@@ -236,7 +242,7 @@ def test_dict_contract_builder_uses_camera_defaults_for_missing_resize():
     }
 
 
-def test_dict_contract_builder_warns_when_camera_lookup_fails(capsys):
+def test_dict_contract_builder_warns_when_camera_lookup_fails(caplog):
     contract = build_contract_from_robot_config_dict(
         {
             "name": "test_robot",
@@ -253,11 +259,12 @@ def test_dict_contract_builder_warns_when_camera_lookup_fails(capsys):
             },
         }
     )
-    stderr = capsys.readouterr().err
 
     assert contract.observations[0].type == "sensor_msgs/msg/Image"
     assert contract.observations[0].image is None
-    assert "Observation 'observation.images.top' references peripheral 'missing_camera' but no camera found" in stderr
+    assert (
+        "Observation 'observation.images.top' references peripheral 'missing_camera' but no camera found" in caplog.text
+    )
 
 
 def test_dict_contract_builder_ignores_tasks_to_match_typed_contract():
@@ -798,6 +805,64 @@ def test_validate_embodied_vlm_planner_mode():
     assert any("allowed_skills contains unsupported skill" in error for error in errors)
 
 
+def test_validate_embodied_accepts_skill_declared_by_current_robot():
+    descriptions = {
+        "inspect_scene": {
+            "summary": "Inspect the configured scene.",
+            "category": "observation",
+            "when_to_use": ["inspect"],
+            "motion_scope": ["arm"],
+            "intensity": "subtle",
+        },
+        "custom_signal": {
+            "summary": "Signal using the gripper.",
+            "category": "demo",
+            "when_to_use": ["signal"],
+            "motion_scope": ["gripper"],
+            "intensity": "subtle",
+        },
+    }
+    config = RobotConfig(
+        name="test_robot",
+        type="so101",
+        robot_type="so_101",
+        ros2_control=Ros2ControlConfig(
+            hardware_plugin="so101_hardware/SO101SystemHardware",
+            params={},
+        ),
+        contract=ContractExtensionConfig(observations=[], actions=[]),
+        embodied=EmbodiedConfig(
+            enabled=True,
+            default_place_name="home",
+            planner={
+                "mode": "rule",
+                "planning_policy": {
+                    "allowed_skills": ["inspect_scene", "custom_signal"],
+                },
+            },
+            skill_templates={
+                "inspect_scene": {
+                    "description": descriptions["inspect_scene"],
+                    "primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}],
+                },
+                "custom_signal": {
+                    "description": descriptions["custom_signal"],
+                    "primitive_sequence": [{"primitive_name": "open_gripper"}],
+                },
+            },
+            named_poses={
+                "home": {},
+                "observe_table": {},
+                "zero": {},
+            },
+        ),
+    )
+
+    errors = validate_config(config)
+
+    assert not any("custom_signal" in error for error in errors)
+
+
 def test_validate_embodied_perception_conversation_history():
     """Embodied perception config should validate conversation history setting."""
     config = RobotConfig(
@@ -960,7 +1025,14 @@ def test_validate_embodied_planner_require_depth_needs_topic():
     assert any("require_depth=true requires at least one aligned depth topic" in error for error in errors)
 
 
-def test_validate_embodied_skill_template_pose_keys():
+@pytest.mark.parametrize(
+    "pose_source",
+    [
+        {"target_pose_key": "hover_pose"},
+        {"place_name_from_request": True},
+    ],
+)
+def test_validate_embodied_skill_template_accepts_dynamic_pose_sources(pose_source):
     config = RobotConfig(
         name="test_robot",
         type="so101",
@@ -973,8 +1045,13 @@ def test_validate_embodied_skill_template_pose_keys():
         embodied=EmbodiedConfig(
             enabled=True,
             skill_templates={
-                "hover_named_target": {
-                    "primitive_sequence": [{"primitive_name": "move_to_named_pose", "target_pose_key": "hover_pose"}]
+                "dynamic_named_pose": {
+                    "description": {
+                        "summary": "Resolve a named pose at runtime.",
+                        "category": "motion",
+                        "when_to_use": ["move to a runtime pose"],
+                    },
+                    "primitive_sequence": [{"primitive_name": "move_to_named_pose", **pose_source}],
                 }
             },
             named_poses={
@@ -994,4 +1071,36 @@ def test_validate_embodied_skill_template_pose_keys():
     )
 
     errors = validate_config(config)
-    assert any("unsupported skill key: hover_named_target" in error for error in errors)
+
+    assert not any("move_to_named_pose step must define" in error for error in errors)
+
+
+def test_validate_embodied_skill_template_requires_pose_source():
+    config = RobotConfig(
+        name="test_robot",
+        type="so101",
+        robot_type="so_101",
+        ros2_control=Ros2ControlConfig(
+            hardware_plugin="so101_hardware/SO101SystemHardware",
+            params={},
+        ),
+        contract=ContractExtensionConfig(observations=[], actions=[]),
+        embodied=EmbodiedConfig(
+            enabled=True,
+            skill_templates={
+                "missing_named_pose": {
+                    "description": {
+                        "summary": "Invalid pose source.",
+                        "category": "motion",
+                        "when_to_use": ["never"],
+                    },
+                    "primitive_sequence": [{"primitive_name": "move_to_named_pose"}],
+                }
+            },
+            named_poses={"home": {}},
+        ),
+    )
+
+    errors = validate_config(config)
+
+    assert any("must define pose_name, target_pose_key, or enable place_name_from_request" in error for error in errors)

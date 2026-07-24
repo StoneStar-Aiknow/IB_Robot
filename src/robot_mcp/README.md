@@ -29,6 +29,57 @@ YAML). Changing the YAML changes what the agent sees — nothing is hard-coded.
 | `validate_skill` | `safety_guard` service | Dry-run a skill (no motion): `{allowed, reason}` |
 | `execute_skill` | `/embodied/execute_skill` action | Run a real skill, streaming feedback as progress |
 
+`so101_single_arm` exposes the social gesture skills `wave_hello`, `nod_yes`,
+`shake_no`, `celebrate`, `greet_observe_raise`, `act_cute`, and
+`happy_spin_upright` through the same guarded `execute_skill` path.
+The authoritative list is the `robot_config` SSOT YAML; call `list_skills`
+to enumerate them at runtime. Use `wave_hello` for generic hello/goodbye waving;
+`celebrate` and `greet_observe_raise` first move to `observe_table`, then perform
+relative motions around that observation pose.
+
+Templates with `disabled: true` are excluded by the shared enabled-template
+boundary. They do not appear in `list_skills`; `validate_skill` and
+`execute_skill` reject any name that is not a member of the current catalog
+before calling the ROS bridge.
+
+### Skill execution admission state machine
+
+`execute_skill` maintains a thread-safe **single MCP SkillCommand admission**
+slot so the robot never runs two skills in parallel. The slot has three states:
+
+| State | Meaning | Concurrent request response |
+|-------|---------|------------------------------|
+| `idle` | No in-flight action | Dispatch a new goal immediately |
+| `running` | Goal dispatched, awaiting terminal state | `SKILL_IN_PROGRESS` |
+| `recovering` | Previous goal timed out, draining to terminal | `MOTION_RECOVERY_IN_PROGRESS` |
+
+`validate_skill` is **not** gated by admission (it is a dry-run), only
+`execute_skill` is.
+
+### Error codes returned by `execute_skill`
+
+| `error_code` | Trigger | Admission after return | Caller action |
+|--------------|---------|--------------------------|---------------|
+| `UNSUPPORTED_SKILL` | Skill name not in catalog (disabled or unknown) | Released immediately | Fix skill_name; retry |
+| `BRIDGE_OFFLINE` / `ACTION_SERVER_UNAVAILABLE` | ROS bridge down or `/embodied/execute_skill` server not discovered | Released immediately | Start `skill_executor` / rclpy; retry |
+| `SKILL_IN_PROGRESS` | Another `execute_skill` is still `running` | Stays `running` | Wait for previous call to return a terminal result; do not retry in a tight loop |
+| `MOTION_RECOVERY_IN_PROGRESS` | Previous goal timed out, `cancel_and_drain_skill_goal` still running | Stays `recovering` | Wait; admission releases automatically when the result future reaches terminal state. If it never does, restart `robot_mcp_server` |
+| `ACCEPT_TIMEOUT` | `send_goal_async` did not complete within `_ACCEPT_TIMEOUT_SEC` (5s) | Transitions to `recovering` | Same as `MOTION_RECOVERY_IN_PROGRESS` |
+| `DISPATCH_FAILED` | `send_goal_async` / `get_result_async` raised (transport failure) | Released immediately | Retry; if persistent, restart `robot_mcp_server` |
+| `REJECTED` | Server-side reject (`goal_handle.accepted == False`) | Released immediately | Check `skill_executor` logs |
+| `RESULT_TIMEOUT` | Skill did not finish within `timeout_sec + _RESULT_GRACE_SEC` but cancel drained cleanly | Released immediately | Increase `timeout_sec`; retry |
+| `CANCEL_CLEANUP_TIMEOUT` | Cancel requested but result future did not reach terminal within `_CANCEL_DRAIN_TIMEOUT_SEC` (5s) | Stays `recovering` until the future eventually terminates | Wait for `MOTION_RECOVERY_IN_PROGRESS` to clear; if it never does, restart `robot_mcp_server` |
+| Server-side `error_code` (e.g. `SKILL_CANCELLED`, `PRIMITIVE_ARM_FAILED`, `SKILL_TIMEOUT`, `SKILL_CANCEL_CLEANUP_TIMEOUT`) | Goal completed terminally with non-success | Released immediately | Inspect `message` / `executed_primitives`; fix upstream config or retry |
+
+The caller-visible pattern is:
+- Admission is **claimed before** dispatch and **released in a `finally` block**
+  once the goal reaches a tracked terminal state.
+- Any path where the MCP side cannot prove the goal is terminal (late accepted
+  goals, cancel-drain timeouts) keeps admission in `recovering` to fail closed.
+- An LLM / Hermes orchestration loop should treat `SKILL_IN_PROGRESS`,
+  `MOTION_RECOVERY_IN_PROGRESS`, and `CANCEL_CLEANUP_TIMEOUT` as
+  "wait, do not retry" signals, and all other codes as "released, free to retry".
+
 opencode namespaces tools by the server name. With the server named `robot`
 below, you get `robot_list_skills`, `robot_execute_skill`, etc.
 
@@ -83,10 +134,31 @@ list the robot's skills  use robot
 Run on the robot host (lifecycle independent of the agent; survives reconnects):
 
 ```bash
+export ROS_DOMAIN_ID=49
 ros2 launch robot_mcp robot_mcp.launch.py robot_config:=so101_single_arm port:=8080
 # or directly:
-robot_mcp_server --transport streamable-http --host 0.0.0.0 --port 8080
+robot_mcp_server --transport streamable-http --host 127.0.0.1 --port 8080
 ```
+
+HTTP defaults to loopback. From a separate agent host, forward a local port over
+SSH instead of exposing the MCP endpoint directly on the robot network:
+
+```bash
+ssh -N -L 8080:127.0.0.1:8080 robot@<robot-host>
+```
+
+`execute_skill` moves real hardware. The MCP HTTP endpoint does not provide
+application-level authentication and must not be exposed to an untrusted
+network. Use `host:=0.0.0.0` (or `--host 0.0.0.0`) only as an explicit override
+behind an authenticated TLS proxy or on a controlled VPN.
+
+> Note: `robot_mcp.launch.py` launches `robot_mcp_server` via `ExecuteProcess`
+> against the installed binary path (`lib/robot_mcp/robot_mcp_server`) instead of
+> a ros2 `Node` descriptor. This keeps the MCP stdio/HTTP transport isolated from
+> ROS node lifecycle logging. The process therefore is not registered as a named
+> ROS node, does not accept launch `parameters=[...]`, and requires the package to
+> be installed (`colcon build`) so `FindPackagePrefix` can resolve. It still
+> connects to ROS 2 via the inherited environment (`ROS_DOMAIN_ID`, `rmw`).
 
 Point opencode at it:
 
@@ -94,10 +166,42 @@ Point opencode at it:
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
-    "robot": { "type": "remote", "url": "http://<robot-ip>:8080/mcp", "enabled": true }
+    "robot": { "type": "remote", "url": "http://127.0.0.1:8080/mcp", "enabled": true }
   }
 }
 ```
+
+### C. SO-101 real robot + Hermes
+
+Terminal 1, start the real robot stack and guarded embodied skill runtime:
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=49
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
+  robot_config:=so101_single_arm \
+  control_mode:=moveit_planning \
+  use_sim:=false \
+  moveit_display:=false
+```
+
+Terminal 2, expose MCP over HTTP for Hermes:
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=49
+ros2 launch robot_mcp robot_mcp.launch.py robot_config:=so101_single_arm port:=8080
+```
+
+If Hermes runs on another host, create the same SSH tunnel there:
+
+```bash
+ssh -N -L 8080:127.0.0.1:8080 robot@<robot-host>
+```
+
+Configure Hermes to use `http://127.0.0.1:8080/mcp` as the `robot` MCP server.
+Natural-language prompts should map to the guarded skill tools, for example
+`和我打个招呼` -> `robot_execute_skill(skill_name="wave_hello")`.
 
 ## Smoke test (no ROS needed)
 
@@ -105,8 +209,9 @@ Catalog-only mode validates config loading + tool registration without a ROS
 daemon:
 
 ```bash
-robot_mcp_server --config-name so101_single_arm --no-ros
-# in another terminal, against the http server, or use the stdio client of your host
+robot_mcp_server --config-name so101_single_arm --transport streamable-http \
+  --host 127.0.0.1 --port 8080 --no-ros
+# in another terminal, connect to http://127.0.0.1:8080/mcp
 ```
 
 `--no-ros` keeps `list_skills`/`list_poses` working; `get_status` reports

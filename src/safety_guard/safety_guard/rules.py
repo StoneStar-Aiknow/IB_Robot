@@ -1,5 +1,6 @@
 """Pure safety rules for the embodied minimal closure."""
 
+import math
 from typing import Any
 
 from embodied_common.json_utils import load_json_mapping
@@ -16,19 +17,36 @@ __all__ = [
 ]
 
 
+def _is_finite_number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except OverflowError:
+        return False
+
+
 def _extract_pose_xyz(pose: dict[str, Any]) -> tuple[float | None, float | None, float | None]:
     position = pose.get("position", {})
     return position.get("x"), position.get("y"), position.get("z")
 
 
-def validate_xyz_within_workspace(x: float, y: float, z: float, workspace: dict[str, Any]) -> tuple[bool, str]:
+def validate_xyz_within_workspace(x: Any, y: Any, z: Any, workspace: dict[str, Any]) -> tuple[bool, str]:
     for axis, value in (("x", x), ("y", y), ("z", z)):
+        if not _is_finite_number(value):
+            return False, f"pose {axis} must be finite"
         limits = workspace.get(axis)
         if limits is None:
             continue
         if not isinstance(limits, list) or len(limits) != 2:
             return False, f"workspace axis {axis} must be [min, max]"
-        if value < float(limits[0]) or value > float(limits[1]):
+        if not all(_is_finite_number(limit) for limit in limits):
+            return False, f"workspace axis {axis} limits must be finite"
+        min_value = float(limits[0])
+        max_value = float(limits[1])
+        if min_value > max_value:
+            return False, f"workspace axis {axis} minimum must not exceed maximum"
+        if float(value) < min_value or float(value) > max_value:
             return False, f"pose is outside workspace on {axis}: {value}"
     return True, ""
 
@@ -38,7 +56,7 @@ def validate_pose_within_workspace(pose: dict[str, Any], workspace: dict[str, An
     if x is None or y is None or z is None:
         return False, "pose is missing x/y/z position"
 
-    return validate_xyz_within_workspace(float(x), float(y), float(z), workspace)
+    return validate_xyz_within_workspace(x, y, z, workspace)
 
 
 def _validate_joint_targets(
@@ -47,6 +65,10 @@ def _validate_joint_targets(
     joint_limits: dict[str, Any] | None,
     label: str,
 ) -> tuple[bool, str]:
+    for joint_name, joint_position in joint_positions.items():
+        if not _is_finite_number(joint_position):
+            return False, f"joint target for {joint_name} in {label} must be finite"
+
     resolved_arm_joint_names = list(arm_joint_names or [])
     if resolved_arm_joint_names:
         unknown_joint_names = sorted(set(joint_positions) - set(resolved_arm_joint_names))
@@ -60,8 +82,12 @@ def _validate_joint_targets(
             return False, f"missing joint limits for arm joints: {', '.join(missing_joint_limits)}"
         for joint_name, joint_position in joint_positions.items():
             limits = resolved_joint_limits[joint_name]
+            if not _is_finite_number(limits.get("min")) or not _is_finite_number(limits.get("max")):
+                return False, f"joint limits for {joint_name} must be finite"
             min_position = float(limits["min"])
             max_position = float(limits["max"])
+            if min_position > max_position:
+                return False, f"joint limits for {joint_name} are reversed"
             position = float(joint_position)
             if position < min_position or position > max_position:
                 return False, f"joint target outside limits for {joint_name}: {position}"
@@ -133,13 +159,32 @@ def validate_skill_request(
             if resolved_direction not in valid_directions and resolved_direction != "":
                 return False, f"unsupported motion direction: {resolved_direction}"
 
-            resolved_distance = float(step.get("motion_distance", 0.0) or 0.0)
+            resolved_distance = step.get("motion_distance", 0.0)
             if step.get("motion_distance_from_request"):
                 resolved_distance = motion_distance
+            if not _is_finite_number(resolved_distance):
+                return False, "motion_distance must be finite"
+            resolved_distance = float(resolved_distance)
             if resolved_distance < 0.0:
                 return False, "motion_distance must be non-negative"
             if resolved_direction and resolved_distance == 0.0:
                 return False, "motion_distance must be greater than zero"
+
+        if primitive_name in {"rotate_gripper_cw", "rotate_gripper_ccw"}:
+            # Rotation angle is carried on motion_distance for these primitives.
+            # Reject NaN/inf/negative so an LLM or rule parser cannot dispatch a
+            # harmful wrist rotation through the safety layer. Absolute upper
+            # bound is enforced by the controller's joint limits, not here.
+            resolved_distance = step.get("motion_distance", 0.0)
+            if step.get("motion_distance_from_request"):
+                resolved_distance = motion_distance
+            if not _is_finite_number(resolved_distance):
+                return False, "rotation angle must be finite"
+            resolved_distance = float(resolved_distance)
+            if resolved_distance < 0.0:
+                return False, "rotation angle must be non-negative"
+            if resolved_distance == 0.0:
+                return False, "rotation angle must be greater than zero"
 
         if primitive_name == "move_to_joint_positions":
             joint_position_offsets = step.get("joint_position_offsets", {})
@@ -156,14 +201,20 @@ def validate_skill_request(
             allowed, reason = _validate_joint_targets(joint_map, arm_joint_names, joint_limits, "joint target")
             if not allowed:
                 return allowed, reason
-            if float(step.get("duration_sec", 0.0) or 0.0) < 0.0:
+            duration_sec = step.get("duration_sec", 0.0)
+            if not _is_finite_number(duration_sec):
+                return False, "duration_sec must be finite"
+            if float(duration_sec) < 0.0:
                 return False, "duration_sec must be non-negative"
 
         if primitive_name == "move_through_joint_positions":
             raw_waypoints = step.get("joint_waypoints", [])
             if not isinstance(raw_waypoints, list) or not raw_waypoints:
                 return False, "move_through_joint_positions requires joint_waypoints"
-            if float(step.get("waypoint_duration_sec", 0.0) or 0.0) <= 0.0:
+            waypoint_duration_sec = step.get("waypoint_duration_sec", 0.0)
+            if not _is_finite_number(waypoint_duration_sec):
+                return False, "waypoint_duration_sec must be finite"
+            if float(waypoint_duration_sec) <= 0.0:
                 return False, "waypoint_duration_sec must be greater than zero"
             for waypoint_index, waypoint in enumerate(raw_waypoints):
                 if not isinstance(waypoint, dict):
@@ -223,16 +274,26 @@ def validate_primitive_request(
         return validate_pose_within_workspace(pose, workspace)
 
     if primitive_name == "move_relative_ee":
+        for field_name, value in (
+            ("relative_dx", relative_dx),
+            ("relative_dy", relative_dy),
+            ("relative_dz", relative_dz),
+        ):
+            if not _is_finite_number(value):
+                return False, f"{field_name} must be finite"
         return validate_xyz_within_workspace(target_x, target_y, target_z, workspace)
 
     if primitive_name == "move_to_joint_positions":
         resolved_joint_names = list(joint_names or [])
-        resolved_joint_positions = [float(position) for position in (joint_positions or [])]
+        resolved_joint_positions = list(joint_positions or [])
         if not resolved_joint_names:
             return False, "joint_names are required for move_to_joint_positions"
         if len(resolved_joint_names) != len(resolved_joint_positions):
             return False, "joint_names and joint_positions must have the same length"
-        if float(primitive_duration_sec or 0.4) <= 0.0:
+        if not _is_finite_number(primitive_duration_sec):
+            return False, "primitive_duration_sec must be finite"
+        resolved_duration_sec = float(primitive_duration_sec) or 0.4
+        if float(resolved_duration_sec) <= 0.0:
             return False, "primitive_duration_sec must be greater than zero"
         if arm_joint_names and resolved_joint_names != list(arm_joint_names):
             return False, "joint target primitive must command the full arm joint list in configured order"
@@ -241,7 +302,7 @@ def validate_primitive_request(
 
     if primitive_name == "move_through_joint_positions":
         resolved_joint_names = list(joint_names or [])
-        resolved_joint_waypoints = [float(position) for position in (joint_waypoints or [])]
+        resolved_joint_waypoints = list(joint_waypoints or [])
         resolved_waypoint_count = int(joint_waypoint_count or 0)
         if not resolved_joint_names:
             return False, "joint_names are required for move_through_joint_positions"
@@ -249,7 +310,9 @@ def validate_primitive_request(
             return False, "joint_waypoint_count must be greater than zero"
         if len(resolved_joint_waypoints) != len(resolved_joint_names) * resolved_waypoint_count:
             return False, "joint_waypoints length must equal joint_names length times joint_waypoint_count"
-        if float(waypoint_duration_sec or 0.0) <= 0.0:
+        if not _is_finite_number(waypoint_duration_sec):
+            return False, "waypoint_duration_sec must be finite"
+        if float(waypoint_duration_sec) <= 0.0:
             return False, "waypoint_duration_sec must be greater than zero"
         if arm_joint_names and resolved_joint_names != list(arm_joint_names):
             return False, "joint waypoint primitive must command the full arm joint list in configured order"
@@ -262,6 +325,11 @@ def validate_primitive_request(
                 return allowed, reason
         return True, ""
 
+    if primitive_name in {"rotate_gripper_cw", "rotate_gripper_ccw"} and not _is_finite_number(relative_dz):
+        return False, "relative_dz must be finite for gripper rotation"
+
+    if not _is_finite_number(gripper_position):
+        return False, "gripper_position must be finite"
     if gripper_position < 0.0 or gripper_position > 1.0:
         return False, "gripper_position must be in [0.0, 1.0]"
 

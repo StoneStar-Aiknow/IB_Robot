@@ -10,24 +10,20 @@ Usage:
 """
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration
-from launch_ros.actions import Node
+from launch.actions import DeclareLaunchArgument, ExecuteProcess
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.substitutions import FindPackagePrefix
 
 
 def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             DeclareLaunchArgument("robot_config", default_value="so101_single_arm"),
-            DeclareLaunchArgument("host", default_value="0.0.0.0"),
+            DeclareLaunchArgument("host", default_value="127.0.0.1"),
             DeclareLaunchArgument("port", default_value="8080"),
-            Node(
-                package="robot_mcp",
-                executable="robot_mcp_server",
-                name="robot_mcp_server",
-                output="screen",
-                parameters=[],
-                arguments=[
+            ExecuteProcess(
+                cmd=[
+                    PathJoinSubstitution([FindPackagePrefix("robot_mcp"), "lib", "robot_mcp", "robot_mcp_server"]),
                     "--config-name",
                     LaunchConfiguration("robot_config"),
                     "--transport",
@@ -37,6 +33,7 @@ def generate_launch_description() -> LaunchDescription:
                     "--port",
                     LaunchConfiguration("port"),
                 ],
+                output="screen",
             ),
         ]
     )

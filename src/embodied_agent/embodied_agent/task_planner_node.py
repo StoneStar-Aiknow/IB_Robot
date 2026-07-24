@@ -5,6 +5,7 @@ import rclpy
 from embodied_agent.base_node import BaseTaskNode
 from embodied_agent.command_parser import parse_text_command
 from embodied_agent.task_context import dump_task_context, ensure_timeout_context
+from embodied_common.command_parser import load_skill_aliases
 from ibrobot_msgs.msg import TaskCommand, TaskStatus
 
 
@@ -19,6 +20,7 @@ class TaskPlannerNode(BaseTaskNode):
         self.declare_parameter("default_target_name", "demo_object")
         self.declare_parameter("default_place_name", "tray_right")
         self.declare_parameter("default_relative_motion_step_m", 0.03)
+        self.declare_parameter("skill_aliases_json", "")
         self.declare_parameter("debug_tracing", False)
 
         self._input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
@@ -28,6 +30,9 @@ class TaskPlannerNode(BaseTaskNode):
         self._default_place = self.get_parameter("default_place_name").get_parameter_value().string_value
         self._default_relative_motion_step = (
             self.get_parameter("default_relative_motion_step_m").get_parameter_value().double_value
+        )
+        self._skill_aliases = load_skill_aliases(
+            self.get_parameter("skill_aliases_json").get_parameter_value().string_value
         )
         self._debug = self.get_parameter("debug_tracing").get_parameter_value().bool_value
 
@@ -45,6 +50,7 @@ class TaskPlannerNode(BaseTaskNode):
             default_target_name=self._default_target,
             default_place_name=self._default_place,
             default_relative_motion_step_m=self._default_relative_motion_step,
+            skill_aliases=self._skill_aliases or None,
         )
         if not plan.skill_sequence:
             self._publish_status(
