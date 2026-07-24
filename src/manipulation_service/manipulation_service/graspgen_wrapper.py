@@ -2,6 +2,8 @@
 
 import logging
 import os
+import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,12 +20,16 @@ except ModuleNotFoundError as exc:
 
 logger = logging.getLogger(__name__)
 _VALID_TABLETOP_FILTER_MODES = {"strict", "adaptive", "soft", "diagnostic"}
+DEFAULT_ENABLE_SOURCE_GRIPPER_TABLETOP_SWEEP = False
 
 _LOCAL_BACKEND_REQUIRES_CUDA = (
     "GraspGen local backend requires CUDA. The upstream GraspGenSampler "
     "moves the model and point cloud tensors to CUDA internally."
 )
 _DEFAULT_MAX_INFERENCE_GRASPS_PER_BATCH = 1000
+_EXECUTION_TABLE_SCENE_MAX_POINTS = 30000
+_EXECUTION_TABLE_OBJECT_MAX_POINTS = 16000
+_RANSAC_PLANE_CHUNK_SIZE = 64
 
 
 def _cuda_status() -> str:
@@ -56,6 +62,8 @@ class GraspCandidate:
     target_width_m: float = 0.0
     target_width_quality: float = 0.0
     width_axis_camera: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    target_width_min_offset_m: float = 0.0
+    target_width_max_offset_m: float = 0.0
 
 
 @dataclass
@@ -89,7 +97,11 @@ class GraspDiagnostic:
     collision_filter_after: int = 0
     tabletop_filter_before: int = 0
     tabletop_filter_after: int = 0
+    source_gripper_tabletop_sweep_enabled: bool = False
     tabletop_plane_found: bool = False
+    tabletop_plane_normal: np.ndarray | None = None
+    tabletop_plane_d: float = 0.0
+    tabletop_object_top_xyz: np.ndarray | None = None
     tabletop_inlier_ratio: float = 0.0
     tabletop_best_inlier_ratio: float = 0.0
     tabletop_failure_reason: str = ""
@@ -109,6 +121,8 @@ class GraspDiagnostic:
     tabletop_auto_tune_reason: str = ""
     failure_reason: str = ""
     failure_stage: str = ""
+    _execution_table_fit_holder: dict[str, object] | None = None
+    _execution_table_fit_thread: threading.Thread | None = None
 
 
 @dataclass
@@ -143,9 +157,9 @@ def fit_table_plane_ransac(
         pts_work = pts[rng.choice(len(pts), max_samples, replace=False)]
     else:
         pts_work = pts
-    best_count = 0
-    best_normal = None
-    best_d = 0.0
+
+    candidate_normals = []
+    candidate_offsets = []
     for _ in range(max_iterations):
         tri = pts_work[rng.choice(len(pts_work), 3, replace=False)]
         n = np.cross(tri[1] - tri[0], tri[2] - tri[0])
@@ -154,13 +168,25 @@ def fit_table_plane_ransac(
             continue
         n = n / norm
         d = -n @ tri[0]
-        count = int((np.abs(pts_work @ n + d) < distance_threshold).sum())
-        if count > best_count:
-            best_count = count
-            best_normal = n
-            best_d = d
-    if best_normal is None:
+        candidate_normals.append(n)
+        candidate_offsets.append(d)
+    if not candidate_normals:
         return TablePlaneFit(None, failure_reason="no non-degenerate table plane sample found")
+
+    normals = np.asarray(candidate_normals)
+    offsets = np.asarray(candidate_offsets)
+    counts = np.empty(len(normals), dtype=np.int64)
+    for start in range(0, len(normals), _RANSAC_PLANE_CHUNK_SIZE):
+        end = min(start + _RANSAC_PLANE_CHUNK_SIZE, len(normals))
+        distances = np.abs(pts_work @ normals[start:end].T + offsets[start:end])
+        counts[start:end] = np.sum(distances < distance_threshold, axis=0)
+
+    best_index = int(np.argmax(counts))
+    best_count = int(counts[best_index])
+    if best_count <= 0:
+        return TablePlaneFit(None, failure_reason="no non-degenerate table plane sample found")
+    best_normal = normals[best_index]
+    best_d = float(offsets[best_index])
     inlier_mask = np.abs(pts @ best_normal + best_d) < distance_threshold
     inlier_pts = pts[inlier_mask]
     inlier_ratio = len(inlier_pts) / len(pts)
@@ -193,6 +219,52 @@ def fit_table_plane_ransac(
     return TablePlaneFit(TablePlane(normal=normal, d=d, inlier_ratio=inlier_ratio), best_inlier_ratio=inlier_ratio)
 
 
+def _sample_execution_table_points(points: np.ndarray | None, max_points: int) -> np.ndarray:
+    if points is None:
+        return np.zeros((0, 3), dtype=np.float32)
+    arr = np.asarray(points, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] != 3 or len(arr) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    step = max(1, len(arr) // max(1, int(max_points)))
+    return arr[::step]
+
+
+def fit_execution_table_plane(
+    scene_points: np.ndarray | None,
+    object_points: np.ndarray | None,
+) -> TablePlaneFit:
+    scene_sample = _sample_execution_table_points(scene_points, _EXECUTION_TABLE_SCENE_MAX_POINTS)
+    object_sample = _sample_execution_table_points(object_points, _EXECUTION_TABLE_OBJECT_MAX_POINTS)
+    positive_reference = object_sample.mean(axis=0) if len(object_sample) else None
+    return fit_table_plane_ransac(
+        scene_sample,
+        positive_reference=positive_reference,
+        distance_threshold=0.006,
+        min_inlier_ratio=0.15,
+    )
+
+
+def _start_execution_table_fit(diagnostic: GraspDiagnostic) -> None:
+    holder: dict[str, object] = {}
+
+    def worker() -> None:
+        started = time.perf_counter()
+        try:
+            object_points = diagnostic.object_pc_after_completion
+            if object_points is None:
+                object_points = diagnostic.object_pc_raw
+            holder["fit"] = fit_execution_table_plane(diagnostic.scene_pc_after_completion, object_points)
+        except Exception as exc:
+            holder["error"] = exc
+        finally:
+            holder["duration_s"] = time.perf_counter() - started
+
+    thread = threading.Thread(target=worker, name="execution-table-fit", daemon=True)
+    diagnostic._execution_table_fit_holder = holder
+    diagnostic._execution_table_fit_thread = thread
+    thread.start()
+
+
 def _shape_string(array: np.ndarray) -> str:
     return "x".join(str(dim) for dim in array.shape)
 
@@ -215,12 +287,12 @@ def estimate_candidate_target_width(
     min_width_m: float = 0.005,
     max_width_m: float = 0.14,
     min_points: int = 20,
-) -> tuple[float, float, tuple[float, float, float]]:
+) -> tuple[float, float, tuple[float, float, float], float, float]:
     pts = np.asarray(object_points_camera, dtype=np.float64)
     axis_local = np.asarray(width_axis_local, dtype=np.float64)
     axis_norm = float(np.linalg.norm(axis_local))
     if len(pts) < min_points or axis_norm <= 1e-9:
-        return 0.0, 0.0, (0.0, 0.0, 0.0)
+        return 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, 0.0
 
     low = float(percentile_low)
     high = float(percentile_high)
@@ -232,21 +304,97 @@ def estimate_candidate_target_width(
     axis_camera = rotation @ axis_local
     axis_camera_norm = float(np.linalg.norm(axis_camera))
     if axis_camera_norm <= 1e-9:
-        return 0.0, 0.0, (0.0, 0.0, 0.0)
+        return 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, 0.0
     axis_camera = axis_camera / axis_camera_norm
 
     finite = pts[np.isfinite(pts).all(axis=1)]
     if len(finite) < min_points:
-        return 0.0, 0.0, tuple(float(v) for v in axis_camera)
+        axis = (float(axis_camera[0]), float(axis_camera[1]), float(axis_camera[2]))
+        return 0.0, 0.0, axis, 0.0, 0.0
 
     projections = finite @ axis_camera
     p_low, p_high = np.percentile(projections, [low, high])
+    origin_projection = float(np.dot(np.asarray(grasp_pose_camera[:3, 3], dtype=np.float64), axis_camera))
+    min_offset = float(p_low - origin_projection)
+    max_offset = float(p_high - origin_projection)
     raw_width = max(0.0, float(p_high - p_low))
     width = min(max(raw_width, float(min_width_m)), float(max_width_m))
     quality = 1.0 if abs(width - raw_width) <= 1e-6 else 0.5
     if raw_width <= 0.0:
         quality = 0.0
-    return width, quality, tuple(float(v) for v in axis_camera)
+    axis = (float(axis_camera[0]), float(axis_camera[1]), float(axis_camera[2]))
+    return width, quality, axis, min_offset, max_offset
+
+
+def estimate_candidate_target_widths(
+    object_points_camera: np.ndarray,
+    grasp_poses_camera: np.ndarray,
+    width_axis_local: np.ndarray,
+    percentile_low: float = 5.0,
+    percentile_high: float = 95.0,
+    min_width_m: float = 0.005,
+    max_width_m: float = 0.14,
+    min_points: int = 20,
+    chunk_size: int = 100,
+) -> list[tuple[float, float, tuple[float, float, float], float, float]]:
+    """Estimate candidate widths in bounded projection batches."""
+    poses = np.asarray(grasp_poses_camera)
+    if len(poses) == 0:
+        return []
+
+    pts = np.asarray(object_points_camera, dtype=np.float64)
+    axis_local = np.asarray(width_axis_local, dtype=np.float64)
+    axis_norm = float(np.linalg.norm(axis_local))
+    if len(pts) < min_points or axis_norm <= 1e-9:
+        return [(0.0, 0.0, (0.0, 0.0, 0.0), 0.0, 0.0) for _ in poses]
+
+    low = float(percentile_low)
+    high = float(percentile_high)
+    if not (0.0 <= low < high <= 100.0):
+        low, high = 5.0, 95.0
+
+    axis_local = axis_local / axis_norm
+    rotations = np.asarray(poses[:, :3, :3], dtype=np.float64)
+    axes_camera = rotations @ axis_local
+    axis_norms = np.linalg.norm(axes_camera, axis=1)
+    valid_axes = axis_norms > 1e-9
+    axes_camera[valid_axes] /= axis_norms[valid_axes, None]
+
+    finite = pts[np.isfinite(pts).all(axis=1)]
+    results: list[tuple[float, float, tuple[float, float, float], float, float]] = [
+        (0.0, 0.0, (0.0, 0.0, 0.0), 0.0, 0.0) for _ in poses
+    ]
+    if len(finite) < min_points:
+        for index in np.flatnonzero(valid_axes):
+            axis = axes_camera[index]
+            results[index] = (0.0, 0.0, (float(axis[0]), float(axis[1]), float(axis[2])), 0.0, 0.0)
+        return results
+
+    chunk_size = max(1, int(chunk_size))
+    valid_indices = np.flatnonzero(valid_axes)
+    for start in range(0, len(valid_indices), chunk_size):
+        indices = valid_indices[start : start + chunk_size]
+        axes = axes_camera[indices]
+        projections = finite @ axes.T
+        p_low, p_high = np.percentile(projections, [low, high], axis=0)
+        origins = np.asarray(poses[indices, :3, 3], dtype=np.float64)
+        origin_projections = np.einsum("ij,ij->i", origins, axes)
+
+        raw_widths = np.maximum(0.0, p_high - p_low)
+        widths = np.clip(raw_widths, float(min_width_m), float(max_width_m))
+        qualities = np.where(np.abs(widths - raw_widths) <= 1e-6, 1.0, 0.5)
+        qualities[raw_widths <= 0.0] = 0.0
+
+        for offset, index in enumerate(indices):
+            axis = axes[offset]
+            results[index] = (
+                float(widths[offset]),
+                float(qualities[offset]),
+                (float(axis[0]), float(axis[1]), float(axis[2])),
+                float(p_low[offset] - origin_projections[offset]),
+                float(p_high[offset] - origin_projections[offset]),
+            )
+    return results
 
 
 def _resolve_tabletop_filter_params(
@@ -765,6 +913,7 @@ class GraspGenWrapper:
         collision_threshold: float = 0.005,
         max_scene_points: int = 8192,
         enable_tabletop_filter: bool = True,
+        enable_source_gripper_tabletop_sweep: bool = DEFAULT_ENABLE_SOURCE_GRIPPER_TABLETOP_SWEEP,
         require_tabletop_filter: bool = True,
         tabletop_clearance: float = 0.003,
         tabletop_pregrasp_distance: float = 0.08,
@@ -957,6 +1106,8 @@ class GraspGenWrapper:
             diag.scene_point_count = int(len(scene_pc))
             diag.scene_pc_after_completion = scene_pc.astype(np.float32, copy=True)
 
+        _start_execution_table_fit(diag)
+
         # GraspGen gets a hollow surface shell: visible object points, optional
         # mask-depth surface inpaint, and silhouette side walls to the table. We
         # never add interior volume samples.
@@ -1089,6 +1240,14 @@ class GraspGenWrapper:
                     return [], diag
             else:
                 diag.tabletop_plane_found = True
+                diag.tabletop_plane_normal = np.asarray(table.normal, dtype=np.float64).copy()
+                diag.tabletop_plane_d = float(table.d)
+                if len(object_pc_clean) > 0:
+                    object_heights = object_pc_clean @ table.normal + table.d
+                    diag.tabletop_object_top_xyz = np.asarray(
+                        object_pc_clean[int(np.argmax(object_heights))],
+                        dtype=np.float64,
+                    ).copy()
                 diag.tabletop_inlier_ratio = table.inlier_ratio
                 height, p05, median, p95 = _tabletop_object_height_stats(object_pc_clean, table)
                 diag.tabletop_object_height_m = height
@@ -1111,14 +1270,20 @@ class GraspGenWrapper:
                 diag.tabletop_clearance_used_m = clearance_used
                 diag.tabletop_pregrasp_distance_used_m = pregrasp_used
                 diag.tabletop_filter_before = len(grasps_final)
-                filtered_grasps, filtered_confidences, clearances = self._filter_tabletop_clearance(
-                    grasps_final,
-                    confidences_final,
-                    table=table,
-                    clearance=clearance_used,
-                    pregrasp_distance=pregrasp_used,
-                    pregrasp_steps=tabletop_pregrasp_steps,
-                )
+                if enable_source_gripper_tabletop_sweep:
+                    diag.source_gripper_tabletop_sweep_enabled = True
+                    filtered_grasps, filtered_confidences, clearances = self._filter_tabletop_clearance(
+                        grasps_final,
+                        confidences_final,
+                        table=table,
+                        clearance=clearance_used,
+                        pregrasp_distance=pregrasp_used,
+                        pregrasp_steps=tabletop_pregrasp_steps,
+                    )
+                else:
+                    filtered_grasps = grasps_final
+                    filtered_confidences = confidences_final
+                    clearances = np.zeros(0, dtype=np.float64)
                 if len(clearances) > 0:
                     diag.tabletop_best_candidate_clearance_m = float(np.max(clearances))
                     diag.tabletop_worst_candidate_clearance_m = float(np.min(clearances))
@@ -1196,12 +1361,18 @@ class GraspGenWrapper:
                 if mode == "diagnostic":
                     diag.tabletop_relaxed = len(filtered_grasps) < len(grasps_final)
                     diag.tabletop_filter_after = len(grasps_final)
-                    logger.info(
-                        "Tabletop diagnostic mode: kept %d grasps while %d/%d passed Robotiq tabletop clearance",
-                        len(grasps_final),
-                        len(filtered_grasps),
-                        diag.tabletop_filter_before,
-                    )
+                    if enable_source_gripper_tabletop_sweep:
+                        logger.info(
+                            "Tabletop diagnostic mode: kept %d grasps while %d/%d passed Robotiq tabletop clearance",
+                            len(grasps_final),
+                            len(filtered_grasps),
+                            diag.tabletop_filter_before,
+                        )
+                    else:
+                        logger.info(
+                            "Source-gripper tabletop sweep disabled: kept %d grasps with table/object diagnostics",
+                            len(grasps_final),
+                        )
                 else:
                     grasps_final = filtered_grasps
                     confidences_final = filtered_confidences
@@ -1217,18 +1388,19 @@ class GraspGenWrapper:
                     logger.warning(diag.failure_reason)
                     return [], diag
 
-        results = []
         width_axis_local = np.asarray(target_width_axis_local, dtype=np.float64)
-        for i in range(len(grasps_final)):
-            target_width_m, target_width_quality, width_axis_camera = estimate_candidate_target_width(
-                object_pc_clean,
-                grasps_final[i],
-                width_axis_local,
-                percentile_low=target_width_percentile_low,
-                percentile_high=target_width_percentile_high,
-                min_width_m=target_width_min_m,
-                max_width_m=target_width_max_m,
-            )
+        width_estimates = estimate_candidate_target_widths(
+            object_pc_clean,
+            grasps_final,
+            width_axis_local,
+            percentile_low=target_width_percentile_low,
+            percentile_high=target_width_percentile_high,
+            min_width_m=target_width_min_m,
+            max_width_m=target_width_max_m,
+        )
+        results = []
+        for i, width_estimate in enumerate(width_estimates):
+            target_width_m, target_width_quality, width_axis_camera, min_offset, max_offset = width_estimate
             results.append(
                 GraspCandidate(
                     pose_4x4=grasps_final[i].astype(np.float32),
@@ -1236,6 +1408,8 @@ class GraspGenWrapper:
                     target_width_m=target_width_m,
                     target_width_quality=target_width_quality,
                     width_axis_camera=width_axis_camera,
+                    target_width_min_offset_m=min_offset,
+                    target_width_max_offset_m=max_offset,
                 )
             )
 
