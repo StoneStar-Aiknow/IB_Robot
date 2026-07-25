@@ -1,9 +1,9 @@
 ---
 name: pi05-om-convert
-description: "Convert PI0.5/PI05 LeRobot policy bundles to Ascend OM deployments. Use when users mention 'PI05 OM', 'PI0.5 OM', 'convert pi05 to om', 'Ascend310P', 'ATC', 'pi05_export', 'PI05模型转换', '转OM', '生成OM', or want to export VLM and Action Expert ONNX/OM artifacts, save a reusable profile, and validate the bundle with hardware_mock. Before conversion, always ask about pipeline steps, FastGELU, and denoising schedule choice, in that order."
+description: "Internal PI0.5/PI05-specific Ascend OM conversion workflow. Use only after om-convert has validated a PI05 bundle path and resolved the exact ATC soc_version. Exports VLM and Action Expert ONNX/OM artifacts, confirms steps, FastGELU and denoising schedule, saves a reusable profile, and validates with hardware_mock."
 ---
 
-# PI05 Ascend OM Conversion Skill
+# PI05 Ascend OM Conversion Sub-Skill
 
 Convert a local PI0.5 LeRobot policy into a strict IB-Robot Ascend deployment containing VLM and
 Action Expert OM artifacts, compiler ABI metadata, and a named deployment in
@@ -11,6 +11,23 @@ Action Expert OM artifacts, compiler ABI metadata, and a named deployment in
 
 Use the repository entry point `python3 -m model_utils.pi05_export`. Do not create a second export
 script, hand-edit generated ABI bindings or identities, or deploy raw OM paths outside the policy bundle.
+
+This is an internal model-specific executor. `om-convert` is the public entry point.
+
+## Parent Handoff Contract
+
+Before any PI05-specific question or command, require all of these values from `om-convert`:
+
+| Field | Requirement |
+|-------|-------------|
+| `model_path` | Absolute existing bundle path |
+| `model_type` | Exactly `pi05`, validated from `<model_path>/config.json` |
+| `soc_version` | Exact ATC target value, including the full chip revision |
+| Host evidence | OS, `npu-smi` result, and ATC version or availability |
+
+If any value is absent, load `om-convert` and stop this workflow. Do not independently guess or ask
+again for the model path, model family, or target SoC. If the config changes after handoff, stop on the
+mismatch and return to the parent router.
 
 ## Supported Scope
 
@@ -24,8 +41,8 @@ script, hand-edit generated ABI bindings or identities, or deploy raw OM paths o
 | Optional quantization | VLM and/or Action Expert W8A8 steps, with representative calibration data |
 | Validation | Strict manifest loading, `loss_compare`, and ROS 2 `hardware_mock` |
 
-For RKNN use `rknn-convert`. For Houmo HMM use `hmm-convert`. Do not route ACT or SmolVLA OM
-requests through this skill.
+For RKNN use `rknn-convert`. For Houmo HMM use `hmm-convert`. Return ACT requests to `om-convert`,
+which delegates them to `act-om-convert`. Do not route SmolVLA OM requests through this skill.
 
 ## Mandatory Interaction Gate
 
@@ -115,27 +132,33 @@ After the three mandatory choices, collect or derive:
 
 | Input | Requirement |
 |-------|-------------|
-| Policy path | Existing local PI05 policy directory containing `config.json` and processor assets. |
+| Policy path | Use the absolute `model_path` inherited from `om-convert`; do not ask again. |
 | Experiment directory | New or existing directory for `onnx/`, `runtime_save/`, and `om/`. |
-| SoC version | Obtain from `npu-smi info`; Ascend310P boards commonly use `Ascend310P1`. |
-| Torch export device | Recommend `npu` on an Ascend310P conversion host; use `cpu` only when intended. |
-| Deployment name | Named FP deployment written into `inference_manifest.json`, e.g. `ascend310p_fp16`. |
-| Profile name | Reusable, descriptive name, e.g. `pi05-310p-fp16-npugeglu`. |
+| SoC version | Use the exact `soc_version` inherited from `om-convert`; do not replace it with a family-level default. |
+| Torch export device | Resolve explicitly: use `npu` when a compatible local Ascend device is available; otherwise use `cpu` for supported ONNX-only work. |
+| Deployment name | Named FP deployment written into `inference_manifest.json`, e.g. `ascend_target_fp16`. |
+| Profile name | Reusable, descriptive name, e.g. `pi05-target-fp16-npugeglu`. |
 | Profile config path | Default `~/.config/model_utils/pi05_export.yaml`, unless the user requests another path. |
 | Schedule file | Existing strict schedule selected above, or unset for generated uniform schedule. |
 | Task | Required only when `verify` is selected and later useful as the mock pipeline `default_task`. |
 | Calibration batch | Required for `vlm_quant`; must be representative real data. |
-| Quant deployment | Required for quantized OM finalization, e.g. `ascend310p_w8a8`. |
+| Quant deployment | Required for quantized OM finalization, e.g. `ascend_target_w8a8`. |
 
-Before running ATC on Ascend310P, inspect `npu-smi info`. If the toolkit cannot find standard C++
-headers, use the installed compiler's actual include directories rather than hard-coding another
-machine's paths. A known openEuler 310P environment may require:
+The parent router has already inspected `npu-smi info`; include that evidence in the report. If the
+toolkit cannot find standard C++ headers, use the installed compiler's actual include directories
+rather than hard-coding another machine's paths. A known openEuler 310P environment may require:
 
 ```bash
 export CPLUS_INCLUDE_PATH=/usr/include/c++/12:/usr/include/c++/12/aarch64-openEuler-linux${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}
 ```
 
 Only set this after confirming those directories exist.
+
+Before selecting any `*_om` step, verify that Python ACL can inspect OM descriptors on a compatible
+local NPU. The PI05 exporter uses `write_acl_om_abi()` after ATC. On an Ubuntu cross-conversion host
+without a compatible NPU, ONNX-only steps can proceed, but a new deployable OM bundle cannot be
+finalized locally. Stop before the long OM conversion unless the user explicitly accepts this partial
+result; never synthesize ABI metadata from ONNX.
 
 ## Environment
 
@@ -156,21 +179,22 @@ source install/setup.sh
 
 Use one explicit command and save the effective reusable parameters with `--save-as`.
 
-Default FP16 example:
+Default FP16 template. Replace every `RESOLVED_*` token with the parent handoff values before running;
+never execute placeholder text:
 
 ```bash
 source .shrc_local
 python3 -m model_utils.pi05_export \
     --config ~/.config/model_utils/pi05_export.yaml \
-    --policy-path /absolute/path/to/pi05_bundle \
+    --policy-path "RESOLVED_MODEL_PATH" \
     --exp-dir /absolute/path/to/pi05_export_run \
-    --soc-version Ascend310P1 \
-    --device npu \
+    --soc-version "RESOLVED_SOC_VERSION" \
+    --device "RESOLVED_EXPORT_DEVICE" \
     --dtype fp16 \
-    --deployment ascend310p_fp16 \
+    --deployment "RESOLVED_DEPLOYMENT" \
     --steps vlm_onnx,ae_onnx,vlm_om,ae_om \
     --no-fast-gelu \
-    --save-as pi05-310p-fp16-npugeglu
+    --save-as "RESOLVED_PROFILE_NAME"
 ```
 
 For an existing custom schedule, add:
@@ -189,15 +213,15 @@ FastGELU example changes only the selection and profile name:
 source .shrc_local
 python3 -m model_utils.pi05_export \
     --config ~/.config/model_utils/pi05_export.yaml \
-    --policy-path /absolute/path/to/pi05_bundle \
+    --policy-path "RESOLVED_MODEL_PATH" \
     --exp-dir /absolute/path/to/pi05_export_run-fastgelu \
-    --soc-version Ascend310P1 \
-    --device npu \
+    --soc-version "RESOLVED_SOC_VERSION" \
+    --device "RESOLVED_EXPORT_DEVICE" \
     --dtype fp16 \
-    --deployment ascend310p_fp16_fastgelu \
+    --deployment "RESOLVED_DEPLOYMENT" \
     --steps vlm_onnx,ae_onnx,vlm_om,ae_om \
     --fast-gelu \
-    --save-as pi05-310p-fp16-fastgelu
+    --save-as "RESOLVED_PROFILE_NAME"
 ```
 
 `--save-as` writes the profile before the long conversion starts. If conversion fails, report that
@@ -229,7 +253,7 @@ python3 -m model_utils.pi05_export \
 source .shrc_local
 python3 -m model_utils.pi05_export \
     --config ~/.config/model_utils/pi05_export.yaml \
-    --profile pi05-310p-fp16-npugeglu \
+    --profile "RESOLVED_PROFILE_NAME" \
     --steps vlm_onnx,ae_onnx,vlm_om,ae_om
 ```
 
@@ -260,6 +284,8 @@ individual `.om` file. The `deployment` is the named deployment supplied during 
 At the end, always report:
 
 - Absolute bundle path.
+- Exact target `soc_version` and how `om-convert` resolved it.
+- Local `npu-smi` and ATC evidence inherited from `om-convert`.
 - Named deployment.
 - Absolute experiment directory and OM directory.
 - VLM and Action Expert OM paths.
@@ -282,8 +308,8 @@ source install/setup.sh
 python3 src/model_utils/model_utils/loss_compare.py \
     --config /absolute/path/to/loss_compare.yaml \
     --profile pi05-baseline \
-    --policy_path /absolute/path/to/pi05_bundle \
-    --deployment ascend310p_fp16
+    --policy_path "RESOLVED_MODEL_PATH" \
+    --deployment "RESOLVED_DEPLOYMENT"
 ```
 
 Treat regressions in normalized Raw L1, Raw cosine, W1/std, or first-frame cosine as possible export
@@ -307,8 +333,8 @@ source install/setup.sh
 python3 src/model_utils/model_utils/loss_compare.py \
     --config /absolute/path/to/loss_compare.yaml \
     --profile pi05-baseline \
-    --policy_path /absolute/path/to/pi05_bundle \
-    --deployment ascend310p_fp16 \
+    --policy_path "RESOLVED_MODEL_PATH" \
+    --deployment "RESOLVED_DEPLOYMENT" \
     --schedule-override-path /absolute/path/to/dense_uniform_20.json \
     --curvature-log-path /absolute/path/to/tuning/curvature.jsonl \
     --metrics-json /absolute/path/to/tuning/dense_metrics.json
@@ -331,8 +357,8 @@ winner in the Manifest by default:
 ros2 run model_utils pi05-tune-schedule \
     --config /absolute/path/to/loss_compare.yaml \
     --profile pi05-baseline \
-    --policy-path /absolute/path/to/pi05_bundle \
-    --deployment ascend310p_fp16 \
+    --policy-path "RESOLVED_MODEL_PATH" \
+    --deployment "RESOLVED_DEPLOYMENT" \
     --candidate-steps 3 4 5 \
     --metric raw_l1 \
     --artifacts-dir /absolute/path/to/tuning/run
@@ -365,8 +391,8 @@ robot:
         enabled: true
         pipelines:
           policy:
-            model_path: /absolute/path/to/pi05_bundle
-            deployment: ascend310p_fp16
+            model_path: "RESOLVED_MODEL_PATH"
+            deployment: "RESOLVED_DEPLOYMENT"
             execution_mode: monolithic
             request_timeout: 120.0
             default_task: "Grasp banana and put it on the plate"
@@ -450,6 +476,7 @@ has the same quantized roles. A `VLM W8A8 + AE W8A8` deployment is not equivalen
 
 ## References
 
+- `.agents/skills/om-convert/SKILL.md`
 - `src/model_utils/model_utils/pi05_export/__main__.py`
 - `src/model_utils/model_utils/pi05_export/_cli.py`
 - `src/model_utils/model_utils/pi05_om_dump.py`

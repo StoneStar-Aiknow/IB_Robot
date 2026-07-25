@@ -39,7 +39,9 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 
 | Skill | 一句话描述 |
 | :--- | :--- |
-| **pi05-om-convert** | 将 PI0.5/PI05 转换为 Ascend VLM+AE OM，保存 profile 并通过 hardware_mock 验证 |
+| **om-convert** | Ascend OM 转换统一入口，解析模型路径/类型、探测 NPU、确认 ATC `soc_version` 并调用模型子 skill |
+| **act-om-convert** | `om-convert` 内部 ACT 子流程，完成 ONNX、ATC、ACL ABI、Manifest 打包和验证 |
+| **pi05-om-convert** | `om-convert` 内部 PI0.5 子流程，完成 VLM+AE OM、profile、schedule 和 hardware_mock 验证 |
 | **rknn-convert** | 将 ONNX 模型转换为 RKNN，并明确主 venv 导出 ONNX、`.venv-rknn` 转 RKNN 的分层流程 |
 | **hmm-convert** | 将 PI0.5 / SmolVLA 编译产物打包为后摩 HMM deployment（xh2 NPU）；ACT HMM 不支持 |
 
@@ -98,8 +100,10 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 编译 OpenHarmony 板端 IB_Robot     → oh-build-roboframe
 用 build_roboframe_oh.sh 构建 → oh-build-roboframe
 把 ONNX 转成 RKNN               → rknn-convert
-把 PI0.5 转成 Ascend OM          → pi05-om-convert
-生成 PI05 OM 并用 mock 测试      → pi05-om-convert
+把模型转成 Ascend OM             → om-convert（询问模型类型和路径）
+把 /path/to/act 转成 OM          → om-convert → act-om-convert
+把 PI0.5 转成 Ascend OM          → om-convert → pi05-om-convert
+生成 PI05 OM 并用 mock 测试      → om-convert → pi05-om-convert
 把 PI0.5/SmolVLA 打包成后摩 HMM  → hmm-convert
 把 usb_cam 移植到板端            → oh-cross-build-ros-pkg
 编译 bash/zsh/vim 到板端         → ohloha-build-pkg
