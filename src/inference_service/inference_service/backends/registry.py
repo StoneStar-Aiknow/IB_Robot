@@ -173,7 +173,7 @@ def _validate_ascend(deployment: Deployment) -> str | None:
     runtime = deployment.target.runtime
     if not (runtime.startswith("acl") or runtime.startswith("ascend")):
         return f"target.runtime {runtime!r} must identify the Ascend ACL runtime family"
-    invalid_formats = sorted({artifact.format for artifact in deployment.artifacts.values()} - {"om"})
+    invalid_formats = sorted({deployment.artifacts[role].format for role in deployment.execution} - {"om"})
     if invalid_formats:
         return f"Ascend execution artifacts must use format 'om', got {invalid_formats}"
     return None

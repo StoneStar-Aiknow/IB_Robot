@@ -352,6 +352,9 @@ def _run_om(ctx: Ctx, *, role: str, onnx_path: Path, om_path: Path) -> None:
             a.soc_version,
             *role_args,
             "--skip-manifest",
+            "--abi-device-id",
+            str(a.abi_device_id),
+            *(["--acl-config-path", a.acl_config_path] if a.acl_config_path else []),
             "--no-summary",
             "--log-level",
             a.log_level,
@@ -390,6 +393,7 @@ def _run_verify(ctx: Ctx) -> None:
             a.task,
             "--device",
             a.device,
+            *(["--schedule-file", a.schedule_file] if a.schedule_file else []),
             "--log-level",
             a.log_level,
         ],
@@ -442,6 +446,17 @@ def _validate_product_deps(ctx: Ctx, chosen: list[str]) -> None:
             problems.append(
                 f"  ✗ step '{name}' needs the product of '{dep}', but it is neither in --steps nor on disk{where}"
             )
+        if name == "ae_onnx" and "vlm_onnx" not in chosen_set:
+            runtime_inputs = (
+                ctx.runtime_save_dir / "past_kv_tensor.pth",
+                ctx.runtime_save_dir / "prefix_pad_masks.pth",
+            )
+            missing = [path for path in runtime_inputs if not path.is_file()]
+            if missing:
+                problems.append(
+                    "  ✗ step 'ae_onnx' needs VLM runtime handoff tensors that are not on disk:\n"
+                    + "\n".join(f"      {path}" for path in missing)
+                )
     if problems:
         raise SystemExit(
             "Unsatisfied step dependencies:\n"
@@ -594,53 +609,34 @@ def main() -> int:
         prod = _product(ctx, name)
         if prod is not None and prod.is_file():
             LOGGER.info("● [%d/%d] %s — rebuilding (requested; existing %s)", step_no, total, _TITLES[name], prod)
+        if prod is not None:
+            prod.unlink(missing_ok=True)
+            if name.endswith("_om"):
+                Path(f"{prod}.abi.json").unlink(missing_ok=True)
+        if name == "vlm_onnx":
+            (ctx.runtime_save_dir / "past_kv_tensor.pth").unlink(missing_ok=True)
+            (ctx.runtime_save_dir / "prefix_pad_masks.pth").unlink(missing_ok=True)
         with Stage(_TITLES[name], index=step_no, total=total):
             _RUNNERS[name](ctx)
+        if prod is not None and not prod.is_file():
+            raise RuntimeError(f"Step {name!r} completed without producing {prod}")
+        _validate_step_outputs(ctx, name)
         _append_summary(summary, ctx, name)
 
-    if {"vlm_om", "ae_om"}.issubset(ctx.chosen):
-        _run_module(
-            "model_utils.pi05_export.convert_om",
-            [
-                "--pretrained-policy-path",
-                str(ctx.policy_path),
-                "--soc-version",
-                args.soc_version,
-                "--vlm-onnx",
-                str(ctx.vlm_onnx),
-                "--vlm-om",
-                str(ctx.vlm_om),
-                "--ae-onnx",
-                str(ctx.ae_onnx),
-                "--ae-om",
-                str(ctx.ae_om),
-                "--manifest-only",
-                "--no-summary",
-                "--log-level",
-                args.log_level,
-            ],
-        )
-    elif {"vlm_quant_om", "ae_quant_om"}.issubset(ctx.chosen):
-        _run_module(
-            "model_utils.pi05_export.convert_om",
-            [
-                "--pretrained-policy-path",
-                str(ctx.policy_path),
-                "--soc-version",
-                args.soc_version,
-                "--vlm-onnx",
-                str(ctx.vlm_w8a8),
-                "--vlm-om",
-                str(ctx.vlm_quant_om),
-                "--ae-onnx",
-                str(ctx.ae_w8a8),
-                "--ae-om",
-                str(ctx.ae_quant_om),
-                "--manifest-only",
-                "--no-summary",
-                "--log-level",
-                args.log_level,
-            ],
+    if ctx.chosen & {"vlm_om", "ae_om"} and _finalize_deployment(
+        ctx, args.deployment, ctx.vlm_onnx, ctx.vlm_om, ctx.ae_onnx, ctx.ae_om
+    ):
+        summary.append(("Inference manifest", f"{ctx.policy_path / 'inference_manifest.json'} ({args.deployment})"))
+    if ctx.chosen & {"vlm_quant_om", "ae_quant_om"} and _finalize_deployment(
+        ctx,
+        args.quant_deployment,
+        ctx.vlm_w8a8,
+        ctx.vlm_quant_om,
+        ctx.ae_w8a8,
+        ctx.ae_quant_om,
+    ):
+        summary.append(
+            ("Inference manifest", f"{ctx.policy_path / 'inference_manifest.json'} ({args.quant_deployment})")
         )
 
     print_summary("PI05 export pipeline complete", _dedup(summary), status="✅ DONE")
@@ -648,6 +644,82 @@ def main() -> int:
 
     _cli.write_last(resolved)
     return 0
+
+
+def _finalize_deployment(
+    ctx: Ctx,
+    deployment: str,
+    vlm_onnx: Path,
+    vlm_om: Path,
+    ae_onnx: Path,
+    ae_om: Path,
+) -> bool:
+    quantized = deployment == ctx.args.quant_deployment
+    vlm_step = "vlm_quant_om" if quantized else "vlm_om"
+    action_step = "ae_quant_om" if quantized else "ae_om"
+    reuse_roles: set[str] = set()
+    if vlm_step not in ctx.chosen:
+        reuse_roles.add("vlm")
+    if action_step not in ctx.chosen:
+        reuse_roles.update({"action_expert", "denoising_schedule"})
+    required = {role: path for role, path in (("vlm", vlm_om), ("action_expert", ae_om)) if role not in reuse_roles}
+    missing = [(role, path) for role, path in required.items() if not path.is_file()]
+    manifest_path = ctx.policy_path / "inference_manifest.json"
+    if reuse_roles and not manifest_path.is_file():
+        missing.extend((role, manifest_path) for role in sorted(reuse_roles & {"vlm", "action_expert"}))
+    if missing:
+        details = ", ".join(f"{role}={path}" for role, path in missing)
+        LOGGER.warning(
+            "Deployment %s is not finalized because required new or reusable artifacts are missing (%s)",
+            deployment,
+            details,
+        )
+        return False
+    _run_module(
+        "model_utils.pi05_export.convert_om",
+        [
+            "--pretrained-policy-path",
+            str(ctx.policy_path),
+            "--soc-version",
+            ctx.args.soc_version,
+            "--vlm-onnx",
+            str(vlm_onnx),
+            "--vlm-om",
+            str(vlm_om),
+            "--ae-onnx",
+            str(ae_onnx),
+            "--ae-om",
+            str(ae_om),
+            "--deployment",
+            deployment,
+            "--abi-device-id",
+            str(ctx.args.abi_device_id),
+            *(["--acl-config-path", ctx.args.acl_config_path] if ctx.args.acl_config_path else []),
+            *(["--schedule-file", ctx.args.schedule_file] if ctx.args.schedule_file else []),
+            *[value for role in sorted(reuse_roles) for value in ("--reuse-artifact-role", role)],
+            "--manifest-only",
+            "--no-summary",
+            "--log-level",
+            ctx.args.log_level,
+        ],
+    )
+    return True
+
+
+def _validate_step_outputs(ctx: Ctx, step: str) -> None:
+    required: tuple[Path, ...] = ()
+    if step == "vlm_onnx":
+        required = (
+            ctx.runtime_save_dir / "past_kv_tensor.pth",
+            ctx.runtime_save_dir / "prefix_pad_masks.pth",
+        )
+    elif step.endswith("_om"):
+        product = _product(ctx, step)
+        assert product is not None
+        required = (Path(f"{product}.abi.json"),)
+    missing = [path for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"Step {step!r} did not produce required artifacts: {missing}")
 
 
 def _dedup(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
@@ -673,16 +745,12 @@ def _append_summary(summary: list[tuple[str, str]], ctx: Ctx, step: str) -> None
         summary.append(("Action Expert ONNX (W8A8)", str(ctx.ae_w8a8)))
     elif step == "vlm_om":
         summary.append(("VLM OM", str(ctx.vlm_om)))
-        summary.append(("Inference manifest", str(ctx.policy_path / "inference_manifest.json")))
     elif step == "ae_om":
         summary.append(("Action Expert OM", str(ctx.ae_om)))
-        summary.append(("Inference manifest", str(ctx.policy_path / "inference_manifest.json")))
     elif step == "vlm_quant_om":
         summary.append(("VLM OM (W8A8)", str(ctx.vlm_quant_om)))
-        summary.append(("Inference manifest", str(ctx.policy_path / "inference_manifest.json")))
     elif step == "ae_quant_om":
         summary.append(("Action Expert OM (W8A8)", str(ctx.ae_quant_om)))
-        summary.append(("Inference manifest", str(ctx.policy_path / "inference_manifest.json")))
     elif step == "verify":
         summary.append(("Verification", "✅ see log above"))
 

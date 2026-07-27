@@ -631,6 +631,80 @@ def _patch_pytorch_gelu_tanh_npu() -> list[tuple[Any, str, Any]]:
     return undo_log
 
 
+def _patch_gemma_geglu_npu() -> list[tuple[Any, str, Any]]:
+    """Fuse the Gemma text MLP ``gelu(gate_proj(x)) * up_proj(x)`` into one NPUGeglu.
+
+    ``GemmaMLP`` computes ``down_proj(act_fn(gate_proj(x)) * up_proj(x))`` with
+    ``act_fn = gelu_pytorch_tanh``. Ascend's ONNX/ATC ``GeGluV2`` fuses the
+    activation and gate multiply: given a single ``[..., 2I]`` input it splits
+    into halves ``[a, b]`` and returns ``a * gelu(b)`` on 310P. The fused input
+    is therefore ordered as ``[up, gate]`` so the OM computes the same result as
+    the original Gemma MLP.
+
+    The replacement emits one fused MatMul feeding a single-output
+    ``npu::NPUGeglu`` node, using tanh GELU for accuracy. It only patches Gemma
+    MLPs; the non-gated SigLIP vision MLP remains unaffected.
+    """
+    import importlib
+
+    undo_log: list[tuple[Any, str, Any]] = []
+
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError as exc:
+        LOGGER.warning(
+            "npu geglu patch requested but torch_npu is unavailable (%s); "
+            "skipping — GemmaMLP keeps its default gate/up/gelu decomposition",
+            exc,
+        )
+        return undo_log
+
+    import torch as _torch
+    import torch.nn.functional as _F
+
+    class _NpuGeglu(_torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            out = _torch.ops.npu.npu_geglu(x, -1, 1, False)
+            return out[0] if isinstance(out, tuple | list) else out
+
+        @staticmethod
+        def symbolic(g, x):
+            return g.op("npu::NPUGeglu", x, dim_i=-1, approximate_i=1, activate_left_i=0)
+
+    def _make_forward(geglu):
+        def _geglu_forward(self, x):
+            # ATC computes left * gelu(right), so concatenate [up, gate].
+            fused = getattr(self, "_npu_up_gate_weight", None)
+            if fused is None:
+                fused = _torch.cat([self.up_proj.weight, self.gate_proj.weight], dim=0)
+                self._npu_up_gate_weight = fused
+            up_gate = _F.linear(x, fused)
+            return self.down_proj(geglu.apply(up_gate))
+
+        return _geglu_forward
+
+    targets = [
+        ("transformers.models.gemma.modeling_gemma", "GemmaMLP"),
+        ("transformers.models.gemma2.modeling_gemma2", "Gemma2MLP"),
+        ("transformers.models.gemma3.modeling_gemma3", "Gemma3MLP"),
+    ]
+    for mod_path, cls_name in targets:
+        try:
+            mod = importlib.import_module(mod_path)
+        except ImportError:
+            continue
+        cls = getattr(mod, cls_name, None)
+        if cls is None:
+            continue
+        orig_forward = cls.forward
+        cls.forward = _make_forward(_NpuGeglu)
+        undo_log.append((cls, "forward", orig_forward))
+        LOGGER.info("Patched %s.%s.forward (fused gate_up + NPUGeglu, tanh GeGLU)", mod_path, cls_name)
+
+    return undo_log
+
+
 def _patch_gemma_eager_attention(
     *, softmax_in_model_dtype: bool = False, mqa_broadcast: bool = False
 ) -> list[tuple[Any, str, Any]]:
@@ -1835,6 +1909,10 @@ def _build_patch_registry(
     ]
     if use_npu_ops and fast_gelu:
         registry.append(("gelu_pytorch_tanh (torch_npu.fast_gelu -> NPUFastGelu)", _patch_pytorch_gelu_tanh_npu))
+    # NPUGeglu is the accuracy-preserving NPU default. An explicit fast_gelu
+    # request takes precedence for every gelu_pytorch_tanh site, including Gemma.
+    if use_npu_ops and not fast_gelu:
+        registry.append(("GemmaMLP gelu(gate)*up (torch_npu.npu_geglu -> NPUGeglu)", _patch_gemma_geglu_npu))
     return registry
 
 
@@ -1871,6 +1949,11 @@ def ascend_onnx_export_patches(
             multi-query layers and rely on matmul broadcasting instead.
         fast_gelu: Route gelu_pytorch_tanh to NPUFastGelu. Disabled by default
             because it is an approximation and can degrade PI05 action accuracy.
+
+    On NPU, the Gemma text MLP gelu(gate)*up is fused into one NPUGeglu by
+    default (GeGluV2, numerically exact tanh). When ``fast_gelu`` is true,
+    NPUGeglu is suppressed and every gelu_pytorch_tanh site is routed to
+    NPUFastGelu instead.
 
     Example::
 

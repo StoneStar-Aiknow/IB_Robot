@@ -2,12 +2,11 @@
 # Licensed under the Mulan PSL v2.
 """Dump the full AE (Action Expert) Euler trajectory for comparison.
 
-Pairs with :class:`PI05OMModel`'s ``PI05_OM_DUMP_AE`` machinery.
+Pairs with the explicit manifest-driven ``pi05-om-dump`` diagnostic command.
 
 Given a *fixed* ``past_kv_tensor`` + ``prefix_pad_masks`` + ``noise``, run
-:meth:`PI05ActionExpertPolicy.model.sample_actions` for ``num_steps``
-Euler steps (default: ``policy.config.num_inference_steps`` = 10 for
-PI05) and save ``x_t_step{i:02d}.npy`` after every step.
+:meth:`PI05ActionExpertPolicy.model.sample_actions` for each timestep, integrate
+its velocity output, and save ``x_t_step{i:02d}.npy`` after every Euler step.
 
 This isolates the Action Expert from the VLM and gives a per-step
 trajectory.  When PT and OM are fed identical inputs, ``compare()``
@@ -34,9 +33,9 @@ Recommended workflow
            --out-dir      /tmp/pt_ae_dump_0 \\
            --device       cuda
 
-4. **OM AE dump** (NPU machine): set ``PI05_OM_DUMP_AE=/tmp/om_ae_dump_0``
-   when running loss_compare; PI05OMModel will save ``x_t_step{i:02d}.npy``
-   for *every* Euler step of the *first* ``forward()`` call.
+4. **OM dump** (NPU machine): run ``pi05-om-dump`` with the same named
+   deployment, batch, and seed. No production-runtime environment variable is
+   used to activate diagnostics.
 
 5. **Compare** (per-step trajectory table)::
 
@@ -50,10 +49,14 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from collections.abc import Sequence
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
 import torch
+
+from inference_service.pi05_schedule import PI05DenoisingSchedule, load_pi05_schedule, uniform_pi05_schedule
 
 LOGGER = logging.getLogger("dump_ae_pt")
 
@@ -72,14 +75,13 @@ def dump(
     out_dir: str,
     device_str: str,
     num_steps: int | None = None,
+    timesteps: Sequence[float] | None = None,
     model_dtype: str = "native",
 ) -> None:
     """Run the full AE Euler trajectory in PyTorch and dump every step.
 
     Saves ``x_t_step{i:02d}.npy`` for ``i = 0 … num_steps - 1``.  Each file
-    contains ``x_t`` *after* Euler step ``i`` so files line up directly
-    with PI05OMModel's per-step dump (set ``PI05_OM_DUMP_AE`` on the NPU
-    side).
+    contains ``x_t`` *after* Euler step ``i`` for trajectory comparison.
     """
     from lerobot.configs.policies import PreTrainedConfig
 
@@ -123,8 +125,13 @@ def dump(
         raise ValueError(f"unknown --model-dtype: {model_dtype}")
 
     cfg = policy.config
-    if num_steps is None:
-        num_steps = cfg.num_inference_steps
+    if timesteps is not None and num_steps is not None:
+        raise ValueError("num_steps and explicit timesteps are mutually exclusive")
+    if timesteps is None:
+        schedule = uniform_pi05_schedule(cfg.num_inference_steps if num_steps is None else num_steps)
+    else:
+        schedule = PI05DenoisingSchedule(name="explicit", timesteps=tuple(float(value) for value in timesteps))
+    num_steps = schedule.step_count
     LOGGER.info("Trajectory length: %d Euler step(s) (cfg.num_inference_steps=%d)", num_steps, cfg.num_inference_steps)
 
     # ---- Load inputs ----
@@ -178,7 +185,7 @@ def dump(
 
     # ------------------------------------------------------------------
     # Dump AE inputs (KV / pad_masks / noise) BEFORE the loop.  File
-    # names match PI05OMModel so dump_ae_pt --compare can pair them up.
+    # Names are shared with the explicit OM diagnostic capture.
     # KV is saved in fp16 + the original loaded layout (same as OM dump).
     # ------------------------------------------------------------------
     try:
@@ -189,17 +196,12 @@ def dump(
     except Exception as exc:
         LOGGER.warning("AE input dump failed: %s", exc)
 
-    # Mirror PI05OMModel.forward() time/dt semantics.
-    # dt and time stepping run in fp32 here for clarity; OM keeps them in
-    # the model's native dtype (fp16) but the trajectory comparison is
-    # against the *output* x_t at each step, not against the time scalar
-    # itself, so this fp32 stepping is fine.
-    dt_val = -1.0 / num_steps
-    time_val = 1.0
+    np.save(out_path / "timesteps.npy", np.asarray(schedule.timesteps, dtype=np.float32))
 
     LOGGER.info("Running AE for %d Euler step(s) …", num_steps)
     with torch.no_grad():
-        for step_idx in range(num_steps):
+        for step_idx, (time_val, next_time_val) in enumerate(pairwise(schedule.timesteps)):
+            dt_val = next_time_val - time_val
             time_t = torch.tensor([time_val], dtype=model_dtype_t, device=device)
 
             # Per-step time dump (captures fp16 accumulation drift).
@@ -211,7 +213,18 @@ def dump(
             except Exception as exc:
                 LOGGER.warning("AE time dump (step %d) failed: %s", step_idx, exc)
 
-            x_t = policy.model.sample_actions(past_kv_t, pad_masks_t, time_t, x_t)
+            velocity = policy.model.sample_actions(past_kv_t, pad_masks_t, time_t, x_t.to(dtype=model_dtype_t))
+            dt_t = torch.tensor(dt_val, dtype=torch.float32, device=device)
+            x_t = x_t.float() + dt_t * velocity.float()
+
+            np.save(
+                out_path / f"dt_step{step_idx:02d}.npy",
+                np.asarray(dt_val, dtype=np.float32),
+            )
+            np.save(
+                out_path / f"velocity_step{step_idx:02d}.npy",
+                velocity.detach().cpu().to(torch.float16).numpy(),
+            )
 
             # Save x_t AFTER Euler step `step_idx` — matches OM dump layout.
             x_t_np = x_t.detach().cpu().to(torch.float16).numpy()
@@ -230,8 +243,6 @@ def dump(
                 float(a32.std()),
                 save_path.name,
             )
-
-            time_val += dt_val
 
 
 # ---------------------------------------------------------------------------
@@ -464,6 +475,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of Euler steps to dump. Defaults to policy.config.num_inference_steps (10 for PI05).",
     )
     p.add_argument(
+        "--schedule-file",
+        type=str,
+        default=None,
+        help="Optional strict PI0.5 denoising schedule JSON; mutually exclusive with --num-steps.",
+    )
+    p.add_argument(
         "--model-dtype",
         type=str,
         default="native",
@@ -508,6 +525,11 @@ def main() -> int:
         print(f"error: missing required args for dump mode: {missing}", file=sys.stderr)
         return 2
 
+    if args.schedule_file and args.num_steps is not None:
+        print("error: --schedule-file and --num-steps are mutually exclusive", file=sys.stderr)
+        return 2
+    timesteps = load_pi05_schedule(args.schedule_file).timesteps if args.schedule_file else None
+
     dump(
         policy_path=args.policy_path,
         past_kv_path=args.past_kv,
@@ -516,6 +538,7 @@ def main() -> int:
         out_dir=args.out_dir,
         device_str=args.device,
         num_steps=args.num_steps,
+        timesteps=timesteps,
         model_dtype=args.model_dtype,
     )
     return 0

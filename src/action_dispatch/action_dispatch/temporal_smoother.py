@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 Temporal Smoothing Module for Action Chunking.
 
@@ -10,16 +9,17 @@ The smoothing ensures continuity between consecutive inference outputs,
 preventing abrupt changes when the action plan is updated mid-execution.
 """
 
-from dataclasses import dataclass, field
-from typing import Optional, Union
-import torch
+from dataclasses import dataclass
+from threading import RLock
+
 import numpy as np
+import torch
 
 
 @dataclass
 class TemporalSmootherConfig:
     """Configuration for TemporalSmoother.
-    
+
     Attributes:
         enabled: Whether to enable temporal smoothing. If False, acts as pass-through.
         chunk_size: Maximum number of actions in a chunk (used for weight calculation).
@@ -31,11 +31,12 @@ class TemporalSmootherConfig:
         device: Device for tensor operations. Can be 'cpu', 'cuda', 'npu:0', etc.
             If None, will use the device of input tensors.
     """
+
     enabled: bool = True
     chunk_size: int = 100
     temporal_ensemble_coeff: float = 0.01
-    device: Optional[str] = None
-    
+    device: str | None = None
+
     def __post_init__(self):
         if self.chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {self.chunk_size}")
@@ -44,167 +45,157 @@ class TemporalSmootherConfig:
 class TemporalSmoother:
     """
     Cross-frame exponential smoother for action chunks.
-    
+
     This smoother maintains an internal smoothed action plan and updates it
     when new inference results arrive. The key insight is that when a new
     chunk arrives, there's typically overlap with the remaining actions from
     the previous chunk. This overlap region is smoothed using exponential
     weighting to ensure continuity.
-    
+
     Example:
         >>> config = TemporalSmootherConfig(enabled=True, chunk_size=100)
         >>> smoother = TemporalSmoother(config)
-        >>> 
+        >>>
         >>> # First inference: 100 actions
         >>> actions1 = np.random.randn(100, 7)  # 7-DOF robot
         >>> smoother.update(actions1, actions_executed=0)
-        >>> 
+        >>>
         >>> # Get actions one by one
         >>> for _ in range(30):
         ...     action = smoother.get_next_action()
         ...     # execute action...
-        >>> 
+        >>>
         >>> # Second inference arrives (30 actions executed during inference)
         >>> actions2 = np.random.randn(100, 7)
         >>> smoother.update(actions2, actions_executed=30)
-    
+
     The smoothing formula for overlapping actions:
         blended = (old_sum + new_term) / cumulative_weights
-        
+
     where:
         old_sum = old_action * cumulative_weight[old_count - 1]
         new_term = new_action * weight[old_count]
     """
-    
+
     def __init__(self, config: TemporalSmootherConfig):
         self.config = config
         self._device = config.device
-        
+        # Control and inference callbacks can access the plan concurrently.
+        self._lock = RLock()
+
         self._precompute_weights()
         self.reset()
-    
+
     def _precompute_weights(self):
         """Precompute exponential weights for smoothing."""
         coeff = self.config.temporal_ensemble_coeff
         chunk_size = self.config.chunk_size
-        
+
         self._weights = torch.exp(-coeff * torch.arange(chunk_size, dtype=torch.float32))
         self._weights_cumsum = torch.cumsum(self._weights, dim=0)
-    
-    def _get_device(self, tensor: Union[torch.Tensor, np.ndarray]) -> str:
+
+    def _get_device(self, tensor: torch.Tensor | np.ndarray) -> str:
         """Determine the device for tensor operations."""
         if self._device is not None:
             return self._device
         if isinstance(tensor, torch.Tensor):
             return tensor.device
-        return 'cpu'
-    
-    def _to_tensor(self, data: Union[torch.Tensor, np.ndarray], device: str) -> torch.Tensor:
+        return "cpu"
+
+    def _to_tensor(self, data: torch.Tensor | np.ndarray, device: str) -> torch.Tensor:
         """Convert input to tensor on specified device."""
         if isinstance(data, np.ndarray):
             return torch.from_numpy(data).float().to(device)
         return data.float().to(device)
-    
+
     def reset(self):
         """Reset internal state. Call this at the start of a new episode."""
-        self._smoothed_actions: Optional[torch.Tensor] = None
-        self._action_counts: Optional[torch.Tensor] = None
-    
+        with self._lock:
+            self._smoothed_actions: torch.Tensor | None = None
+            self._action_counts: torch.Tensor | None = None
+
     @property
     def plan_length(self) -> int:
         """Current number of actions in the smoothed plan."""
-        if self._smoothed_actions is None:
-            return 0
-        return self._smoothed_actions.shape[0]
-    
+        with self._lock:
+            if self._smoothed_actions is None:
+                return 0
+            return self._smoothed_actions.shape[0]
+
     @property
     def is_enabled(self) -> bool:
         """Check if smoothing is enabled."""
         return self.config.enabled
-    
-    def get_next_action(self) -> Union[torch.Tensor, np.ndarray]:
+
+    def get_next_action(self) -> torch.Tensor | np.ndarray:
         """
         Pop and return the next action from the smoothed plan.
-        
+
         Returns:
             The next action as a tensor or numpy array.
-            
+
         Raises:
             IndexError: If the plan is empty.
         """
-        if self.plan_length == 0:
-            raise IndexError("Cannot get action from empty plan. Call update() first.")
-        
-        action = self._smoothed_actions[0]
-        self._smoothed_actions = self._smoothed_actions[1:]
-        if self._action_counts is not None:
-            self._action_counts = self._action_counts[1:]
-        
-        return action
-    
+        with self._lock:
+            if self._smoothed_actions is None or self._smoothed_actions.shape[0] == 0:
+                raise IndexError("Cannot get action from empty plan. Call update() first.")
+
+            action = self._smoothed_actions[0]
+            self._smoothed_actions = self._smoothed_actions[1:]
+            if self._action_counts is not None:
+                self._action_counts = self._action_counts[1:]
+
+            return action
+
     def update(
         self,
-        new_actions: Union[torch.Tensor, np.ndarray],
+        new_actions: torch.Tensor | np.ndarray,
         actions_executed_during_inference: int = 0,
     ) -> int:
         """
         Update the smoothed plan with new inference results.
-        
+
         This is the core method that performs cross-frame smoothing.
-        
+
         Args:
             new_actions: New action chunk from inference. Shape: (N, action_dim)
             actions_executed_during_inference: Number of actions that were executed
                 from the previous plan while the inference was running. This is used
                 for temporal alignment.
-                
+
         Returns:
             The new plan length after update.
-            
+
         Note:
             If smoothing is disabled (config.enabled=False), this method simply
             replaces the remaining plan with the new actions (after alignment).
         """
-        if isinstance(new_actions, np.ndarray):
-            if new_actions.ndim == 1:
-                new_actions = new_actions.reshape(1, -1)
-        
+        if isinstance(new_actions, np.ndarray) and new_actions.ndim == 1:
+            new_actions = new_actions.reshape(1, -1)
+
         if new_actions.shape[0] == 0:
             return self.plan_length
-        
+
         device = self._get_device(new_actions)
         new_actions = self._to_tensor(new_actions, device)
-        
+
         weights = self._weights.to(device)
         weights_cumsum = self._weights_cumsum.to(device)
-        
+
         relevant_new = new_actions[actions_executed_during_inference:]
-        
-        if self._smoothed_actions is None or self._smoothed_actions.shape[0] == 0:
-            self._smoothed_actions = relevant_new
-            self._action_counts = torch.ones(
-                (relevant_new.shape[0], 1), 
-                dtype=torch.long, 
-                device=device
-            )
-        elif not self.config.enabled:
-            self._smoothed_actions = relevant_new
-            self._action_counts = torch.ones(
-                (relevant_new.shape[0], 1), 
-                dtype=torch.long, 
-                device=device
-            )
-        else:
-            self._smoothed_actions, self._action_counts = self._apply_smoothing(
-                self._smoothed_actions, 
-                self._action_counts,
-                relevant_new,
-                weights,
-                weights_cumsum
-            )
-        
-        return self.plan_length
-    
+
+        with self._lock:
+            if self._smoothed_actions is None or self._smoothed_actions.shape[0] == 0 or not self.config.enabled:
+                self._smoothed_actions = relevant_new
+                self._action_counts = torch.ones((relevant_new.shape[0], 1), dtype=torch.long, device=device)
+            else:
+                self._smoothed_actions, self._action_counts = self._apply_smoothing(
+                    self._smoothed_actions, self._action_counts, relevant_new, weights, weights_cumsum
+                )
+
+            return self._smoothed_actions.shape[0]
+
     def _apply_smoothing(
         self,
         old_actions: torch.Tensor,
@@ -215,61 +206,67 @@ class TemporalSmoother:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Apply exponential smoothing to overlapping action regions.
-        
+
         The smoothing formula:
-            blended[i] = (old[i] * cumsum[count[i]-1] + new[i] * weight[count[i]]) 
+            blended[i] = (old[i] * cumsum[count[i]-1] + new[i] * weight[count[i]])
                          / cumsum[count[i]]
-        
+
         This gives exponentially weighted average where older contributions
         have more weight (when coeff > 0).
         """
         overlap_len = min(old_actions.shape[0], new_actions.shape[0])
-        
+
         old_overlap = old_actions[:overlap_len]
         new_overlap = new_actions[:overlap_len]
         new_tail = new_actions[overlap_len:]
-        
+
         counts_for_update = old_counts[:overlap_len]
-        
-        old_sum = old_overlap * weights_cumsum[counts_for_update - 1]
-        new_term = new_overlap * weights[counts_for_update]
-        blended = (old_sum + new_term) / weights_cumsum[counts_for_update]
-        
-        updated_counts = torch.clamp(counts_for_update + 1, max=self.config.chunk_size)
-        
+
+        # Once a position has consumed chunk_size predictions, freeze it. The
+        # fixed weight table cannot represent additional contributions.
+        can_update = counts_for_update < self.config.chunk_size
+        contribution_index = torch.clamp(counts_for_update, max=self.config.chunk_size - 1)
+        old_sum = old_overlap * weights_cumsum[contribution_index - 1]
+        new_term = new_overlap * weights[contribution_index]
+        candidate = (old_sum + new_term) / weights_cumsum[contribution_index]
+        blended = torch.where(can_update, candidate, old_overlap)
+
+        updated_counts = torch.where(can_update, counts_for_update + 1, counts_for_update)
+
         smoothed_actions = torch.cat([blended, new_tail], dim=0)
         action_counts = torch.cat(
-            [updated_counts, torch.ones((new_tail.shape[0], 1), dtype=torch.long, device=new_actions.device)],
-            dim=0
+            [updated_counts, torch.ones((new_tail.shape[0], 1), dtype=torch.long, device=new_actions.device)], dim=0
         )
-        
+
         return smoothed_actions, action_counts
-    
-    def get_plan(self) -> Optional[torch.Tensor]:
+
+    def get_plan(self) -> torch.Tensor | None:
         """Get the current smoothed plan without modifying it."""
-        return self._smoothed_actions
-    
-    def peek_next_action(self) -> Optional[torch.Tensor]:
+        with self._lock:
+            return self._smoothed_actions
+
+    def peek_next_action(self) -> torch.Tensor | None:
         """Peek at the next action without removing it."""
-        if self.plan_length == 0:
-            return None
-        return self._smoothed_actions[0]
+        with self._lock:
+            if self._smoothed_actions is None or self._smoothed_actions.shape[0] == 0:
+                return None
+            return self._smoothed_actions[0]
 
 
 class TemporalSmootherManager:
     """
     Manager class that handles smoothing with optional passthrough mode.
-    
+
     This class provides a unified interface that can be used regardless of
     whether smoothing is enabled or not, simplifying integration.
     """
-    
+
     def __init__(
         self,
         enabled: bool = True,
         chunk_size: int = 100,
         temporal_ensemble_coeff: float = 0.01,
-        device: Optional[str] = None,
+        device: str | None = None,
     ):
         self._config = TemporalSmootherConfig(
             enabled=enabled,
@@ -278,43 +275,43 @@ class TemporalSmootherManager:
             device=device,
         )
         self._smoother = TemporalSmoother(self._config)
-    
+
     @property
     def config(self) -> TemporalSmootherConfig:
         return self._config
-    
+
     @property
     def plan_length(self) -> int:
         return self._smoother.plan_length
-    
+
     @property
     def is_enabled(self) -> bool:
         return self._config.enabled
-    
+
     def reset(self):
         """Reset the smoother state."""
         self._smoother.reset()
-    
+
     def update(
         self,
-        new_actions: Union[torch.Tensor, np.ndarray],
+        new_actions: torch.Tensor | np.ndarray,
         actions_executed_during_inference: int = 0,
     ) -> int:
         """Update with new actions."""
         return self._smoother.update(new_actions, actions_executed_during_inference)
-    
-    def get_next_action(self) -> Union[torch.Tensor, np.ndarray]:
+
+    def get_next_action(self) -> torch.Tensor | np.ndarray:
         """Get the next action."""
         return self._smoother.get_next_action()
-    
-    def get_plan(self) -> Optional[torch.Tensor]:
+
+    def get_plan(self) -> torch.Tensor | None:
         """Get the current plan."""
         return self._smoother.get_plan()
-    
-    def peek_next_action(self) -> Optional[torch.Tensor]:
+
+    def peek_next_action(self) -> torch.Tensor | None:
         """Peek at the next action."""
         return self._smoother.peek_next_action()
-    
+
     def set_enabled(self, enabled: bool):
         """Enable or disable smoothing at runtime."""
         self._config.enabled = enabled

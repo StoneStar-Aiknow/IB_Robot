@@ -13,12 +13,11 @@ from inference_manifest.errors import ManifestValidationError
 from inference_manifest.integrity import (
     deployment_fingerprint,
     verify_bundle_digest,
-    verify_file_sha256,
 )
 from inference_manifest.json_utils import load_json_strict
 from inference_manifest.metadata import PolicyFeature, PolicyMetadata, load_policy_metadata
 from inference_manifest.models import CompiledDeployment, Deployment, InferenceManifest, TensorBinding
-from inference_manifest.paths import normalize_unique_paths
+from inference_manifest.paths import normalize_unique_paths, resolve_bundle_file
 from inference_manifest.schema import validate_manifest_schema
 
 MANIFEST_FILENAME = "inference_manifest.json"
@@ -74,9 +73,14 @@ def _load_inference_manifest(
         raise ManifestValidationError(f"Inference manifest must be a JSON object: {manifest_path}")
 
     schema_version = raw.get("schema_version")
-    if schema_version != 1:
+    if schema_version != 2:
+        guidance = (
+            " Schema-v1 artifacts are unsupported; rerun the owning exporter or packager to create a schema-v2 bundle."
+            if schema_version == 1
+            else ""
+        )
         raise ManifestValidationError(
-            f"Unsupported schema_version {schema_version!r} in {manifest_path}; supported versions: [1]"
+            f"Unsupported schema_version {schema_version!r} in {manifest_path}; supported versions: [2].{guidance}"
         )
     validate_manifest_schema(raw, str(manifest_path))
     manifest = _parse_typed_manifest(raw, manifest_path)
@@ -91,18 +95,25 @@ def _load_inference_manifest(
 
     bundle_entries = tuple(manifest.bundle.files)
     selected_artifacts = tuple(deployment.artifacts.values()) if isinstance(deployment, CompiledDeployment) else ()
-    normalize_unique_paths(
-        [entry.path for entry in bundle_entries] + [artifact.path for artifact in selected_artifacts],
-        "selected manifest files",
-    )
+    bundle_paths = set(normalize_unique_paths((entry.path for entry in bundle_entries), "bundle.files"))
+    artifact_paths = {artifact.path for artifact in selected_artifacts}
+    overlap = sorted(bundle_paths & artifact_paths)
+    if overlap:
+        raise ManifestValidationError(f"bundle files and deployment artifacts must use distinct paths: {overlap}")
 
     if require_native_weights is None:
         require_native_weights = any(candidate.backend == "torch" for candidate in manifest.deployments.values())
 
     if verify_all_bundle_files:
         for entry in bundle_entries:
-            verify_file_sha256(root, entry.path, entry.sha256, "bundle file")
-        verify_bundle_digest(bundle_entries, manifest.bundle.digest.value)
+            resolve_bundle_file(root, entry.path)
+    verify_bundle_digest(
+        manifest.bundle.uuid,
+        manifest.bundle.revision,
+        manifest.bundle.name,
+        bundle_entries,
+        manifest.bundle.digest.value,
+    )
 
     policy = load_policy_metadata(root, require_native_weights=require_native_weights)
     _validate_required_bundle_files(
@@ -119,12 +130,11 @@ def _load_inference_manifest(
     )
     if not verify_all_bundle_files:
         for entry in entries_to_verify:
-            verify_file_sha256(root, entry.path, entry.sha256, "bundle file")
-        verify_bundle_digest(bundle_entries, manifest.bundle.digest.value)
+            resolve_bundle_file(root, entry.path)
 
     if verify_deployment_artifacts and isinstance(deployment, CompiledDeployment):
-        for role, artifact in deployment.artifacts.items():
-            verify_file_sha256(root, artifact.path, artifact.sha256, f"deployment {deployment_name!r} role {role!r}")
+        for artifact in deployment.artifacts.values():
+            resolve_bundle_file(root, artifact.path)
 
     if isinstance(deployment, CompiledDeployment):
         _validate_feature_compatibility(deployment, policy)

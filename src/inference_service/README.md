@@ -44,6 +44,8 @@ Torch deployment 直接声明运行设备：
 
 ```json
 {
+  "uuid": "f9ebdcd5-1ce8-4b56-8860-4f32454fc209",
+  "revision": 1,
   "backend": "torch",
   "device": "cpu"
 }
@@ -53,6 +55,8 @@ Torch deployment 直接声明运行设备：
 
 ```json
 {
+  "uuid": "f9ebdcd5-1ce8-4b56-8860-4f32454fc209",
+  "revision": 3,
   "backend": "rknn",
   "target": {
     "soc": "rk3588",
@@ -60,9 +64,8 @@ Torch deployment 直接声明运行设备：
   },
   "artifacts": {
     "policy": {
-      "path": "artifacts/rknn/rk3588/policy.rknn",
-      "format": "rknn",
-      "sha256": "<64 lowercase hex>"
+      "path": "artifacts/rknn/rk3588/generations/<uuid>/policy.rknn",
+      "format": "rknn"
     }
   },
   "execution": ["policy"],
@@ -338,6 +341,33 @@ Canonical backend 只有以下五个：
 | PI0.5 | 支持 | 支持 | 不支持 | 不支持 | 支持 |
 | SmolVLA | 支持 | 不支持 | 不支持 | 支持 | 支持 |
 
+### PI0.5 Ascend 行为
+
+优化后的 PI0.5 VLM 在模型内部把多相机图像合并为一个临时 vision batch，并在 handoff 前恢复
+camera-major prefix。该优化不改变外部 VLM ABI：runtime bindings、逐相机 observation semantic、
+raw image shape 和 ROS camera topic 契约保持不变。
+
+NPU 导出默认对 Gemma text MLP 使用精度保持的 `NPUGeglu`。只有显式导出参数
+`--fast-gelu` 才以近似 `NPUFastGelu` 覆盖该路径；它可能降低动作精度，必须针对既有 baseline
+验证。
+
+新 Action Expert OM 的 runtime output 名为 `velocity` 或 `v_t`，Manifest 仍将其映射为策略
+semantic `action`。Ascend backend 从选中 deployment 的 `denoising_schedule` artifact 读取严格
+递减的 timesteps，并在 host 侧执行 `x_next = x_t + (next_t - t) * velocity` Euler integration，
+最终才返回 action。Exporter 未提供 `--schedule-file` 时，根据 `config.num_inference_steps` 打包
+uniform schedule；提供时只接受严格的 `pi05-denoising-schedule-v1` JSON。
+
+`denoising_schedule` 是 versioned、non-execution artifact：不加入 `execution` 或 `bindings`，但
+其 artifact path 和 deployment revision 属于 deployment identity，schedule 变化会改变 selected
+deployment fingerprint。生产 Runtime 不扫描 bundle 根目录的 `schedule.json`，也不接受 schedule
+override。`loss_compare`/tuner 通过隔离的 diagnostic backend factory 注入临时 schedule；
+`curvature_log_path` 仅记录诊断数据，最终 schedule 必须安装回 Manifest。
+
+兼容性由 Action Expert runtime output 明确决定。已有 output 为 `action` 且没有 schedule artifact
+的 legacy PI0.5 deployment 保留旧的逐步 action-output 行为；velocity deployment 缺少 schedule
+则拒绝加载，不会猜测默认值。`hardware_mock` 仍只验证 raw image/topic、joint 和 action 契约，
+不需要 PI0.5 或 schedule 专用修改。
+
 可选 SDK 延迟导入。仅导入 `inference_service` 不要求 ACL、RKNNLite、TCIM、torch NPU 或
 Hisilicon worker dependency；只有选择相应 deployment 时才检查依赖。
 
@@ -363,24 +393,28 @@ Backend capabilities 决定：
 清理后，backend 才能声明更高并发。不同 pipeline 有独立准入状态，但共享 accelerator
 resource domain 时仍可能被后端串行化。
 
-## Manifest 完整性
+## Manifest Identity
 
-启动顺序是：严格 JSON/schema 校验，deployment 选择，路径安全校验，bundle 文件 SHA-256，
-bundle digest，LeRobot metadata，compiled artifact SHA-256，binding compatibility，最后才创建
-backend runtime。
+启动顺序是：严格 JSON/schema 校验，deployment 选择，UUID/revision 与轻量 bundle digest 校验，
+路径安全和普通文件校验，LeRobot metadata，binding compatibility，最后创建 backend runtime。
+Runtime 不读取 OM、RKNN、HMM 或 safetensors 计算内容 SHA-256。
 
 `bundle.digest` 算法：
 
-1. 将每个 `bundle.files` path 规范化为唯一的 bundle-relative POSIX path。
-2. 按 path 排序 `{\"path\": ..., \"sha256\": ...}` entries。
-3. 使用 UTF-8 JSON、无多余空白、key 顺序为 `path`、`sha256` 序列化整个数组。
-4. 对序列化 bytes 计算 SHA-256。
+1. 将每个 `bundle.files` path 规范化、去重并排序。
+2. 加入 bundle UUID、revision、name 和结构格式域。
+3. 使用 canonical UTF-8 JSON 序列化这个小型声明。
+4. 对声明 bytes 计算 SHA-256，不读取声明指向的文件。
+
+UUID/revision/digest/fingerprint 用于版本标识和分布式一致性，不提供文件防篡改。正式 artifact 更新
+必须经过 packager 并发布新 revision；生产防篡改应使用只读镜像、签名或 verity。
 
 Selected deployment fingerprint 对以下 canonical object 计算 SHA-256：
 
 ```json
 {
-  "schema_version": 1,
+  "format": "ibrobot.deployment-structure-v2",
+  "schema_version": 2,
   "bundle_digest": "...",
   "deployment_name": "rk3588",
   "deployment": {}
@@ -390,19 +424,20 @@ Selected deployment fingerprint 对以下 canonical object 计算 SHA-256：
 路径不能是绝对路径、不能包含 parent traversal、不能通过 symlink 逃逸 bundle root，规范化
 后也不能重复。
 
-### 完整性错误处理
+### Identity 错误处理
 
-遇到以下错误时不要手工改 hash：
+遇到以下错误时不要手工改 identity：
 
-- `SHA-256 mismatch`
 - `Bundle digest mismatch`
+- unsupported schema v1（必须重新导出或重新打包）
 - missing or unexpected LeRobot semantic files
 - execution role 缺少 artifact 或 bindings
 - runtime ABI 与 LeRobot feature shape 不匹配
 
 应重新运行拥有该 artifact 的 exporter 或 packaging workflow。Exporter 负责复制 artifact、
-读取 compiler/runtime ABI、生成 bindings、计算所有 SHA-256、更新 bundle digest，并通过生产
-loader 重新验证 manifest。
+读取 compiler/runtime ABI、生成 bindings、更新 UUID/revision 和轻量结构摘要，并通过生产 loader
+重新验证 manifest。Schema v1 和旧版 artifact 不受支持，必须使用当前 exporter 或 packager
+重新生成完整 schema-v2 bundle。
 
 ## Exporter 入口
 

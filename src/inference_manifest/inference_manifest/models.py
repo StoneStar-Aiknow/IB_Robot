@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from typing import Annotated, Literal, TypeAlias
+from uuid import UUID, uuid4
 
 from pydantic import (
     AfterValidator,
@@ -23,6 +24,16 @@ _DEPLOYMENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 def _validate_sha256(value: str) -> str:
     if not re.fullmatch(r"[0-9a-f]{64}", value):
         raise ValueError("must be a lowercase 64-character SHA-256 digest")
+    return value
+
+
+def _validate_uuid(value: str) -> str:
+    try:
+        parsed = UUID(value)
+    except ValueError as exc:
+        raise ValueError("must be a canonical UUID") from exc
+    if parsed.int == 0 or str(parsed) != value:
+        raise ValueError("must be a canonical non-nil lowercase UUID")
     return value
 
 
@@ -59,6 +70,12 @@ Sha256: TypeAlias = Annotated[
     StringConstraints(strict=True, min_length=64, max_length=64),
     AfterValidator(_validate_sha256),
 ]
+ManifestUUID: TypeAlias = Annotated[
+    str,
+    StringConstraints(strict=True, min_length=36, max_length=36),
+    AfterValidator(_validate_uuid),
+]
+Revision: TypeAlias = Annotated[int, Field(strict=True, ge=1)]
 ExecutionRole: TypeAlias = Annotated[
     str,
     StringConstraints(strict=True, min_length=1),
@@ -87,15 +104,17 @@ class StrictFrozenModel(BaseModel):
 
 class Digest(StrictFrozenModel):
     algorithm: Literal["sha256"]
+    scope: Literal["structure"]
     value: Sha256
 
 
 class BundleFile(StrictFrozenModel):
     path: BundlePath
-    sha256: Sha256
 
 
 class ManifestBundle(StrictFrozenModel):
+    uuid: ManifestUUID = Field(default_factory=lambda: str(uuid4()))
+    revision: Revision = 1
     name: StrictString
     files: tuple[BundleFile, ...] = Field(min_length=1)
     digest: Digest
@@ -116,7 +135,7 @@ class DeploymentTarget(StrictFrozenModel):
 class DeploymentArtifact(StrictFrozenModel):
     path: BundlePath
     format: StrictString
-    sha256: Sha256
+    share_group: StrictString | None = None
 
 
 class TensorBinding(StrictFrozenModel):
@@ -180,12 +199,17 @@ class DeviceLink(StrictFrozenModel):
         return self
 
 
-class TorchDeployment(StrictFrozenModel):
+class DeploymentIdentity(StrictFrozenModel):
+    uuid: ManifestUUID = Field(default_factory=lambda: str(uuid4()))
+    revision: Revision = 1
+
+
+class TorchDeployment(DeploymentIdentity):
     backend: Literal["torch"]
     device: Literal["cpu", "cuda", "mps", "npu"]
 
 
-class CompiledDeployment(StrictFrozenModel):
+class CompiledDeployment(DeploymentIdentity):
     backend: Literal["ascend", "hisilicon", "rknn", "hmm"]
     target: DeploymentTarget
     artifacts: dict[ExecutionRole, DeploymentArtifact] = Field(min_length=1)
@@ -211,9 +235,40 @@ class CompiledDeployment(StrictFrozenModel):
                 f"(missing={sorted(execution_roles - binding_roles)}, unexpected={sorted(binding_roles - execution_roles)})"
             )
 
-        artifact_paths = [artifact.path for artifact in self.artifacts.values()]
-        if len(artifact_paths) != len(set(artifact_paths)):
-            raise ValueError("compiled deployment contains duplicate artifact paths")
+        roles_by_path: dict[str, list[str]] = {}
+        for role, artifact in self.artifacts.items():
+            roles_by_path.setdefault(artifact.path, []).append(role)
+            if self.backend != "rknn" and artifact.share_group is not None:
+                raise ValueError("share_group is only valid for RKNN artifacts")
+        for path, roles in roles_by_path.items():
+            if len(roles) < 2:
+                continue
+            groups = {self.artifacts[role].share_group for role in roles}
+            if None in groups or len(groups) != 1:
+                raise ValueError(
+                    f"duplicate artifact path {path!r} requires one shared non-empty share_group for roles {roles}"
+                )
+        roles_by_group: dict[str, list[str]] = {}
+        for role, artifact in self.artifacts.items():
+            if artifact.share_group is not None:
+                roles_by_group.setdefault(artifact.share_group, []).append(role)
+        for group, roles in roles_by_group.items():
+            paths = {self.artifacts[role].path for role in roles}
+            if len(paths) != 1:
+                raise ValueError(f"RKNN share_group {group!r} must reference one artifact path")
+
+            def signature(role: str) -> tuple[tuple[object, ...], tuple[object, ...]]:
+                bindings = self.bindings[role]
+
+                def slots(values: tuple[TensorBinding, ...]) -> tuple[object, ...]:
+                    return tuple(
+                        (value.runtime_name, value.index, value.dtype, value.shape, value.layout) for value in values
+                    )
+
+                return slots(bindings.inputs), slots(bindings.outputs)
+
+            if len({signature(role) for role in roles}) != 1:
+                raise ValueError(f"RKNN share_group {group!r} roles must expose identical runtime ABI")
 
         role_positions = {role: index for index, role in enumerate(self.execution)}
         produced_internal: dict[str, str] = {}
@@ -272,7 +327,7 @@ Deployment: TypeAlias = Annotated[TorchDeployment | CompiledDeployment, Field(di
 
 
 class InferenceManifest(StrictFrozenModel):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     bundle: ManifestBundle
     deployments: dict[str, Deployment] = Field(min_length=1)
 

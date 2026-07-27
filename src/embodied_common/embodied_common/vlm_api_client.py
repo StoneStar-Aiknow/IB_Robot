@@ -277,7 +277,7 @@ def _detect_image_mime(image: bytes) -> str:
 class VLMClient:
     """High-level VLM client: one-line access with auto routing, message building and context."""
 
-    def __init__(self, yaml_path: pathlib.Path | None = None) -> None:
+    def __init__(self, yaml_path: pathlib.Path | None = None, system: str | None = None) -> None:
         resolved_path = yaml_path or _default_yaml_path()
         self._config = _load_yaml_config(resolved_path)
         self._defaults = self._config.get("defaults", {})
@@ -289,6 +289,10 @@ class VLMClient:
             raise RuntimeError(f"defaults.model '{self._default_model}' not found under 'models' in {resolved_path}")
         self._client_cache: dict[str, VLMAPIClient] = {}
         self._history: list[dict[str, Any]] = []
+        # A persistent system prompt is prepended to every request but kept OUT of
+        # _history, so a long conversation never pushes it out of context and
+        # clear_history() never drops it. None means no system message is sent.
+        self._system = system
 
     def _resolve_model(self, model: str | None) -> str:
         if model is None:
@@ -349,7 +353,9 @@ class VLMClient:
         current_message = self._build_user_message(text, image)
         history_message = {"role": "user", "content": f"{text}\n[图片已省略]"} if image is not None else current_message
 
-        send_messages = [*self._history, current_message]
+        # System prompt (if any) leads every request but is never stored in _history.
+        system_prefix = [{"role": "system", "content": self._system}] if self._system else []
+        send_messages = [*system_prefix, *self._history, current_message]
 
         result = client.complete(
             send_messages,

@@ -21,7 +21,11 @@ class PipelineResult:
     actual_chunk_size: int
     pipeline_id: str
     bundle: str
+    bundle_uuid: str
+    bundle_revision: int
     deployment: str
+    deployment_uuid: str
+    deployment_revision: int
     deployment_fingerprint: str
     backend: str
     state: PipelineState
@@ -50,7 +54,11 @@ class PipelineResult:
 class PipelineDiagnostics:
     pipeline_id: str
     bundle: str
+    bundle_uuid: str
+    bundle_revision: int
     deployment: str
+    deployment_uuid: str
+    deployment_revision: int
     deployment_fingerprint: str
     backend: str
     state: PipelineState
@@ -69,7 +77,11 @@ class PipelineDiagnostics:
             {
                 "pipeline_id": self.pipeline_id,
                 "bundle": self.bundle,
+                "bundle_uuid": self.bundle_uuid,
+                "bundle_revision": self.bundle_revision,
                 "deployment": self.deployment,
+                "deployment_uuid": self.deployment_uuid,
+                "deployment_revision": self.deployment_revision,
                 "deployment_fingerprint": self.deployment_fingerprint,
                 "backend": self.backend,
                 "state": self.state.value,

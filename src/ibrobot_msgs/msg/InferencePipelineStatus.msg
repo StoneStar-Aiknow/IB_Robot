@@ -6,8 +6,12 @@ uint32 protocol_version
 uint8 role
 string pipeline_id
 uint32 manifest_schema_version
+string bundle_uuid
+uint64 bundle_revision
 string bundle_digest
 string deployment_name
+string deployment_uuid
+uint64 deployment_revision
 string deployment_fingerprint
 InferencePolicySummary policy_summary
 uint64 sequence

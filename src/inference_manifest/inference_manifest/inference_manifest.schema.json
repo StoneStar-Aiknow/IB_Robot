@@ -11,7 +11,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": 1
+      "const": 2
     },
     "bundle": {
       "$ref": "#/$defs/bundle"
@@ -43,6 +43,14 @@
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"
     },
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
     "role": {
       "type": "string",
       "pattern": "^[A-Za-z][A-Za-z0-9_.-]*$"
@@ -51,15 +59,11 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "path",
-        "sha256"
+        "path"
       ],
       "properties": {
         "path": {
           "$ref": "#/$defs/non_empty_string"
-        },
-        "sha256": {
-          "$ref": "#/$defs/sha256"
         }
       }
     },
@@ -68,11 +72,15 @@
       "additionalProperties": false,
       "required": [
         "algorithm",
+        "scope",
         "value"
       ],
       "properties": {
         "algorithm": {
           "const": "sha256"
+        },
+        "scope": {
+          "const": "structure"
         },
         "value": {
           "$ref": "#/$defs/sha256"
@@ -83,11 +91,19 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "uuid",
+        "revision",
         "name",
         "files",
         "digest"
       ],
       "properties": {
+        "uuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
         "name": {
           "$ref": "#/$defs/non_empty_string"
         },
@@ -124,8 +140,7 @@
       "additionalProperties": false,
       "required": [
         "path",
-        "format",
-        "sha256"
+        "format"
       ],
       "properties": {
         "path": {
@@ -134,8 +149,8 @@
         "format": {
           "$ref": "#/$defs/non_empty_string"
         },
-        "sha256": {
-          "$ref": "#/$defs/sha256"
+        "share_group": {
+          "$ref": "#/$defs/non_empty_string"
         }
       }
     },
@@ -323,10 +338,18 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "uuid",
+        "revision",
         "backend",
         "device"
       ],
       "properties": {
+        "uuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
         "backend": {
           "const": "torch"
         },
@@ -344,6 +367,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "uuid",
+        "revision",
         "backend",
         "target",
         "artifacts",
@@ -351,6 +376,12 @@
         "bindings"
       ],
       "properties": {
+        "uuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "revision": {
+          "$ref": "#/$defs/revision"
+        },
         "backend": {
           "enum": [
             "ascend",

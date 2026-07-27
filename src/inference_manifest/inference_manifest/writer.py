@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ from inference_manifest.schema import validate_manifest_schema
 
 def canonical_manifest_bytes(manifest: InferenceManifest | dict[str, Any]) -> bytes:
     if isinstance(manifest, InferenceManifest):
-        value = manifest.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+        value = manifest.model_dump(mode="json", exclude_none=True)
     else:
         value = manifest
     validate_manifest_schema(value, "manifest writer input")
@@ -25,7 +26,7 @@ def canonical_manifest_bytes(manifest: InferenceManifest | dict[str, Any]) -> by
         typed = InferenceManifest.model_validate_json(json.dumps(value, ensure_ascii=False))
     except ValidationError as exc:
         raise ManifestValidationError(f"Typed manifest validation failed for writer input: {exc}") from exc
-    canonical = typed.model_dump(mode="json", exclude_none=True, exclude_defaults=True)
+    canonical = typed.model_dump(mode="json", exclude_none=True)
     return json.dumps(canonical, ensure_ascii=False, indent=2, sort_keys=True).encode() + b"\n"
 
 
@@ -35,6 +36,7 @@ def write_inference_manifest(path: str | Path, manifest: InferenceManifest | dic
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     content = canonical_manifest_bytes(manifest)
+    mode = stat.S_IMODE(destination.stat().st_mode) if destination.exists() else 0o644
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{destination.name}.",
         suffix=".tmp",
@@ -43,6 +45,7 @@ def write_inference_manifest(path: str | Path, manifest: InferenceManifest | dic
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as stream:
+            os.fchmod(stream.fileno(), mode)
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())

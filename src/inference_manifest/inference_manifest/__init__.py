@@ -9,9 +9,7 @@ from inference_manifest.errors import (
 from inference_manifest.integrity import (
     canonical_bundle_digest,
     deployment_fingerprint,
-    sha256_file,
     verify_bundle_digest,
-    verify_file_sha256,
 )
 from inference_manifest.loader import (
     MANIFEST_FILENAME,
@@ -32,6 +30,8 @@ from inference_manifest.models import (
     ExecutionRole,
     InferenceManifest,
     ManifestBundle,
+    ManifestUUID,
+    Revision,
     TensorBinding,
     TorchDeployment,
 )
@@ -59,11 +59,13 @@ __all__ = [
     "MANIFEST_FILENAME",
     "ManifestError",
     "ManifestBundle",
+    "ManifestUUID",
     "ManifestIntegrityError",
     "ManifestPathError",
     "ManifestValidationError",
     "PolicyFeature",
     "PolicyMetadata",
+    "Revision",
     "TensorBinding",
     "TorchDeployment",
     "ValidatedManifest",
@@ -78,9 +80,7 @@ __all__ = [
     "normalize_unique_paths",
     "resolve_bundle_file",
     "resolve_bundle_path",
-    "sha256_file",
     "verify_bundle_digest",
-    "verify_file_sha256",
     "validate_manifest_schema",
     "write_inference_manifest",
 ]

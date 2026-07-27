@@ -11,6 +11,8 @@
 | `task_planner_node` | `task_planner_node = embodied_agent.task_planner_node:main` | 按规则把文本任务规划为技能序列 |
 | `task_executor_node` | `task_executor_node = embodied_agent.task_executor_node:main` | 顺序调用技能 action，并发布任务状态 |
 
+包内还提供一个**非节点的库接口** `embodied_agent.llm_client_service.LLMClientService`：封装云端对话大模型的一行式调用，供上层按需 import，不随 launch 起节点。详见第 6 节。
+
 ## 1. 在整体架构中的位置
 
 当前最小闭环链路是：
@@ -203,7 +205,59 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 | `rpc_timeout_sec` | `5.0` | 等待 action/server/service 响应的统一 RPC 超时 |
 | `debug_tracing` | `false` | 是否打印执行调试日志 |
 
-## 6. 任务与状态接口
+## 6. LLMClientService
+
+`LLMClientService` 是一个**库接口**（非 ROS 节点，无控制台入口、无话题/参数），封装云端对话大模型的一行式调用。它接收由业务方提供的预设 prompt 与用户文字，调用云端对话模型生成回复文本。
+
+### 作用
+
+1. 可选地从文件读入预设 system prompt，作为每轮请求都携带的系统指令；不提供时退化为无预设的裸对话。
+2. 接收用户文字，调用云端对话模型生成回复。
+3. 复用 `embodied_common` 的 `VLMClient` 管理多轮上下文，业务层不自行维护对话历史。
+4. 返回底层结构化 dict，云端错误（网络、配额、缺 API key 等）如实透传，不吞异常、不返回空串。
+
+说明：
+
+- 本接口**不内置任何默认 prompt**：system prompt 的内容与来源属于业务设计，由业务方通过 `system_prompt_path` 传入。
+- 预设 system prompt（若提供）独立保存，每轮请求都置于最前，不写入对话历史；因此对话变长也不会把它挤出上下文，`reset()` 也不会丢失它。
+- 上下文管理完全由 `embodied_common.vlm_api_client.VLMClient` 负责，本接口只做拼装调用。
+- 云端模型路由（provider / endpoint / API key 环境变量名）由 `embodied_common` 的 `vlm_models.yaml` 单一管理；API key 通过环境变量注入，不写入任何配置文件。
+
+### 当前接口
+
+| 方法 | 说明 |
+| --- | --- |
+| `reply(user_text) -> dict` | 发送一轮用户文字，返回 `status`/`content`/`error`/`usage`/`timing_ms` 等结构化字段；空或非字符串输入抛 `ValueError` |
+| `reset() -> None` | 清空多轮对话历史；预设 system prompt 不受影响，后续仍会携带 |
+
+### 主要参数
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `system_prompt_path` | `None` | 预设 system prompt 文件路径（由业务方提供）；`None` 时不设 system prompt，退化为无预设的裸对话 |
+| `model` | `None` | 指定 `vlm_models.yaml` 中的模型名；`None` 时使用 `defaults.model` |
+| `vlm` | `None` | 注入自定义 `VLMClient`（用于测试或依赖注入）；给定时忽略 `system_prompt_path` |
+
+### 使用示例
+
+```python
+from embodied_agent.llm_client_service import LLMClientService
+
+svc = LLMClientService(system_prompt_path="/path/to/your_system_prompt.txt")  # 业务方提供 prompt
+# svc = LLMClientService()                # 也可不传，退化为无预设裸对话
+result = svc.reply("你好呀，你是谁？")       # 返回结构化 dict
+if result["status"] == "ok":
+    print(result["content"])
+svc.reset()                              # 开启新话题（system prompt 仍保留）
+```
+
+调用前需按 `vlm_models.yaml` 中对应模型的 `api_key_env` 注入 API key，例如：
+
+```bash
+export ALIYUN_API_KEY=sk-xxxxxx
+```
+
+## 7. 任务与状态接口
 
 ### `ibrobot_msgs/msg/TaskCommand`
 
@@ -219,7 +273,7 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 | `timeout_sec` | 任务总超时预算（秒），由入口统一设置并向后透传 |
 | `context_json` | 传递 `skill_sequence` 与 `timeout_context` 等上下文 |
 
-## 6.1 当前归一后的超时类型
+## 7.1 当前归一后的超时类型
 
 当前具身主链路只保留 5 类 timeout / freshness 配置：
 
@@ -244,7 +298,7 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 | `recoverable` | 是否可恢复 |
 | `replan_requested` | 是否建议重规划 |
 
-## 7. 当前验证通过的最小闭环
+## 8. 当前验证通过的最小闭环
 
 当前已经验证通过的仿真命令路径：
 
@@ -288,7 +342,7 @@ ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '零点'}"
 和 `relative_motion_direction_mapping` 解释，规划层只保留
 `forward/backward/left/right/up/down` 语义标签。
 
-## 8. 当前限制
+## 9. 当前限制
 
 - 目前只支持**最小规则闭环**，不是开放式具身智能 Agent。
 - 当前文本解析只覆盖少量中文模式。

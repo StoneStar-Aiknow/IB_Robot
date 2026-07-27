@@ -45,14 +45,19 @@ import logging
 import shutil
 import subprocess
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from inference_manifest import DeviceLink
+from inference_manifest import CompiledDeployment, DeploymentArtifact, DeviceLink, load_inference_manifest
+from inference_manifest.json_utils import load_json_strict
+from inference_service.pi05_schedule import load_pi05_schedule, uniform_pi05_schedule, write_pi05_schedule
 from model_utils.inference_manifest_export import (
     artifact_bindings,
-    compiled_deployment,
+    deployment_artifact,
     package_deployment_artifact,
     read_runtime_abi,
+    update_deployment,
     upsert_deployment,
+    write_acl_om_abi,
 )
 from model_utils.pi05_export._cli_ui import Stage, print_summary, setup_logging
 
@@ -161,6 +166,7 @@ def convert_role(
         raise FileNotFoundError(f"{role} ONNX not found: {onnx_path}")
 
     with Stage(f"ATC compile {role}", index=index, total=total):
+        om_output.unlink(missing_ok=True)
         ok = _run_atc(onnx_path, om_output, soc_version, extra_args=extra_args, input_shape_mode=input_shape_mode)
         if not ok:
             raise RuntimeError(f"ATC failed for {role} ({onnx_path.name}); see ATC log above")
@@ -178,42 +184,109 @@ def write_pi05_ascend_deployment(
     vlm_om: Path,
     action_abi_path: Path,
     action_om: Path,
+    schedule_file: Path | None = None,
+    reuse_artifact_roles: frozenset[str] = frozenset(),
 ) -> Path:
     """Write one complete PI0.5 Ascend deployment from compiled runtime ABIs."""
 
-    vlm_abi = read_runtime_abi(vlm_abi_path)
-    action_abi = read_runtime_abi(action_abi_path)
-    vlm_input_semantics = {
-        tensor.name: (
-            "observation.language.tokens"
-            if tensor.name in {"lang_tokens", "observation.language.tokens"}
-            else "observation.language.attention_mask"
-            if tensor.name in {"lang_masks", "observation.language.attention_mask"}
-            else tensor.name
+    created_artifacts: list[Path] = []
+    existing: CompiledDeployment | None = None
+    reusable_artifacts: dict[str, DeploymentArtifact] = {}
+    if reuse_artifact_roles:
+        selected = load_inference_manifest(bundle_root, deployment_name)
+        candidate = selected.deployment
+        if not isinstance(candidate, CompiledDeployment) or candidate.backend != "ascend":
+            raise ValueError(f"Cannot reuse PI0.5 artifacts from non-Ascend deployment {deployment_name!r}")
+        if candidate.target.soc != soc_version:
+            raise ValueError(
+                f"Cannot reuse {candidate.target.soc!r} artifacts for requested target SoC {soc_version!r}"
+            )
+        existing = candidate
+        for role in reuse_artifact_roles:
+            try:
+                reusable_artifacts[role] = candidate.artifacts[role]
+            except KeyError as exc:
+                raise ValueError(f"Deployment {deployment_name!r} has no reusable artifact role {role!r}") from exc
+
+    vlm_abi = None if "vlm" in reuse_artifact_roles else read_runtime_abi(vlm_abi_path)
+    action_abi = None if "action_expert" in reuse_artifact_roles else read_runtime_abi(action_abi_path)
+
+    def semantic_name(runtime_name: str) -> str:
+        known = {
+            "lang_tokens",
+            "lang_masks",
+            "observation.language.tokens",
+            "observation.language.attention_mask",
+            "past_kv_tensor",
+            "prefix_pad_masks",
+            "time",
+            "noise",
+            "action",
+            "velocity",
+            "v_t",
+        }
+        return next((part for part in reversed(runtime_name.split(":")) if part in known), runtime_name)
+
+    if action_abi is None:
+        assert existing is not None
+        action_bindings = existing.bindings["action_expert"]
+        action_runtime_name = action_bindings.outputs[0].runtime_name or action_bindings.outputs[0].semantic
+        action_output = semantic_name(action_runtime_name)
+    elif len(action_abi.outputs) != 1:
+        raise ValueError(f"PI0.5 Action Expert ABI must have exactly one output, got {len(action_abi.outputs)}")
+    else:
+        action_output = semantic_name(action_abi.outputs[0].name)
+    if action_output not in {"action", "velocity", "v_t"}:
+        output_name = action_abi.outputs[0].name if action_abi is not None else action_runtime_name
+        raise ValueError(f"PI0.5 Action Expert ABI output must be 'action', 'velocity', or 'v_t', got {output_name!r}")
+    velocity_mode = action_output in {"velocity", "v_t"}
+    if not velocity_mode and schedule_file is not None:
+        raise ValueError("--schedule-file is only valid for a velocity/v_t Action Expert ABI output")
+
+    if vlm_abi is None:
+        assert existing is not None
+        vlm_bindings = existing.bindings["vlm"]
+    else:
+        vlm_input_semantics = {
+            tensor.name: (
+                "observation.language.tokens"
+                if semantic_name(tensor.name) in {"lang_tokens", "observation.language.tokens"}
+                else "observation.language.attention_mask"
+                if semantic_name(tensor.name) in {"lang_masks", "observation.language.attention_mask"}
+                else semantic_name(tensor.name)
+            )
+            for tensor in vlm_abi.inputs
+        }
+        vlm_bindings = artifact_bindings(
+            vlm_abi,
+            input_semantics=vlm_input_semantics,
+            output_semantics={
+                tensor.name: {
+                    "past_kv_tensor": "internal.past_kv",
+                    "prefix_pad_masks": "internal.prefix_pad_masks",
+                }[semantic_name(tensor.name)]
+                for tensor in vlm_abi.outputs
+            },
+            image_layouts={
+                semantic: "NCHW"
+                for semantic in vlm_input_semantics.values()
+                if semantic.startswith("observation.images.")
+            },
         )
-        for tensor in vlm_abi.inputs
-    }
-    vlm_bindings = artifact_bindings(
-        vlm_abi,
-        input_semantics=vlm_input_semantics,
-        output_semantics={
-            "past_kv_tensor": "internal.past_kv",
-            "prefix_pad_masks": "internal.prefix_pad_masks",
-        },
-        image_layouts={
-            semantic: "NCHW" for semantic in vlm_input_semantics.values() if semantic.startswith("observation.images.")
-        },
-    )
-    action_bindings = artifact_bindings(
-        action_abi,
-        input_semantics={
-            "past_kv_tensor": "internal.past_kv",
-            "prefix_pad_masks": "internal.prefix_pad_masks",
-            "time": "time",
-            "noise": "noise",
-        },
-        output_semantics={"action": "action"},
-    )
+    if action_abi is not None:
+        action_bindings = artifact_bindings(
+            action_abi,
+            input_semantics={
+                tensor.name: {
+                    "past_kv_tensor": "internal.past_kv",
+                    "prefix_pad_masks": "internal.prefix_pad_masks",
+                    "time": "time",
+                    "noise": "noise",
+                }[semantic_name(tensor.name)]
+                for tensor in action_abi.inputs
+            },
+            output_semantics={action_abi.outputs[0].name: "action"},
+        )
     links = tuple(
         DeviceLink(
             semantic=semantic,
@@ -225,33 +298,176 @@ def write_pi05_ascend_deployment(
         )
         for semantic in ("internal.past_kv", "internal.prefix_pad_masks")
     )
-    packaged_vlm = package_deployment_artifact(
-        bundle_root,
-        vlm_om,
+
+    def package(role: str, source: Path) -> Path:
+        artifact = package_deployment_artifact(
+            bundle_root,
+            source,
+            backend="ascend",
+            deployment_name=deployment_name,
+            role=role,
+            force_copy=True,
+        )
+        created_artifacts.append(artifact)
+        return artifact
+
+    try:
+        artifact_values = {
+            "vlm": reusable_artifacts.get("vlm") or package("vlm", vlm_om),
+            "action_expert": reusable_artifacts.get("action_expert") or package("action_expert", action_om),
+        }
+        if velocity_mode:
+            if "denoising_schedule" in reusable_artifacts and schedule_file is None:
+                artifact_values["denoising_schedule"] = reusable_artifacts["denoising_schedule"]
+                return _upsert_pi05_deployment(
+                    bundle_root,
+                    deployment_name,
+                    soc_version,
+                    artifact_values,
+                    vlm_bindings,
+                    action_bindings,
+                    links,
+                )
+            temporary_schedule: TemporaryDirectory[str] | None = None
+            try:
+                if schedule_file is not None:
+                    schedule_source = Path(schedule_file).expanduser()
+                    load_pi05_schedule(schedule_source)
+                else:
+                    config_path = bundle_root / "config.json"
+                    config = load_json_strict(config_path)
+                    num_inference_steps = config.get("num_inference_steps") if isinstance(config, dict) else None
+                    schedule = uniform_pi05_schedule(num_inference_steps, name=f"uniform{num_inference_steps}")
+                    temporary_schedule = TemporaryDirectory(prefix="pi05-schedule-")
+                    schedule_source = write_pi05_schedule(
+                        schedule,
+                        Path(temporary_schedule.name) / "denoising_schedule.json",
+                    )
+                artifact_values["denoising_schedule"] = package("denoising_schedule", schedule_source)
+            finally:
+                if temporary_schedule is not None:
+                    temporary_schedule.cleanup()
+        return _upsert_pi05_deployment(
+            bundle_root,
+            deployment_name,
+            soc_version,
+            artifact_values,
+            vlm_bindings,
+            action_bindings,
+            links,
+        )
+    except Exception:
+        _remove_unreferenced_artifacts(bundle_root, created_artifacts)
+        raise
+
+
+def _remove_unreferenced_artifacts(bundle_root: Path, candidates: list[Path]) -> None:
+    referenced: set[Path] = set()
+    manifest_path = bundle_root / "inference_manifest.json"
+    if manifest_path.is_file():
+        manifest = load_json_strict(manifest_path)
+        if isinstance(manifest, dict) and isinstance(manifest.get("deployments"), dict):
+            referenced = {
+                bundle_root.joinpath(*artifact["path"].split("/")).resolve()
+                for deployment in manifest["deployments"].values()
+                if isinstance(deployment, dict) and isinstance(deployment.get("artifacts"), dict)
+                for artifact in deployment["artifacts"].values()
+                if isinstance(artifact, dict) and isinstance(artifact.get("path"), str)
+            }
+    generations_root = (bundle_root / "artifacts").resolve()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in referenced or not resolved.is_relative_to(generations_root):
+            continue
+        resolved.unlink(missing_ok=True)
+        parent = resolved.parent
+        if parent.name and parent.parent.name == "generations":
+            parent.rmdir()
+
+
+def _upsert_pi05_deployment(
+    bundle_root: Path,
+    deployment_name: str,
+    soc_version: str,
+    artifacts: dict[str, DeploymentArtifact | Path],
+    vlm_bindings,
+    action_bindings,
+    links: tuple[DeviceLink, ...],
+) -> Path:
+    artifact_values = {
+        role: artifact
+        if isinstance(artifact, DeploymentArtifact)
+        else DeploymentArtifact(
+            path=artifact.relative_to(bundle_root.resolve(strict=True)).as_posix(),
+            format="json" if role == "denoising_schedule" else "om",
+        )
+        for role, artifact in artifacts.items()
+    }
+    deployment = CompiledDeployment(
         backend="ascend",
-        deployment_name=deployment_name,
-        role="vlm",
-        force_copy=True,
-    )
-    packaged_action = package_deployment_artifact(
-        bundle_root,
-        action_om,
-        backend="ascend",
-        deployment_name=deployment_name,
-        role="action_expert",
-        force_copy=True,
-    )
-    deployment = compiled_deployment(
-        bundle_root,
-        backend="ascend",
-        target_soc=soc_version,
-        target_runtime="acl",
-        artifacts={"vlm": (packaged_vlm, "om"), "action_expert": (packaged_action, "om")},
+        target={"soc": soc_version, "runtime": "acl"},
+        artifacts=artifact_values,
         execution=("vlm", "action_expert"),
         bindings={"vlm": vlm_bindings, "action_expert": action_bindings},
         device_links=links,
     )
     return upsert_deployment(bundle_root, deployment_name, deployment).manifest_path
+
+
+def replace_pi05_ascend_schedule(
+    bundle_root: str | Path,
+    deployment_name: str,
+    schedule_path: str | Path,
+) -> Path:
+    """Replace only one velocity PI0.5 deployment's schedule artifact."""
+
+    root = Path(bundle_root).expanduser().resolve(strict=True)
+    selected = load_inference_manifest(root, deployment_name)
+    deployment = selected.deployment
+    if selected.policy.policy_type != "pi05":
+        raise ValueError(f"deployment {deployment_name!r} is not a PI0.5 deployment")
+    if not isinstance(deployment, CompiledDeployment) or deployment.backend != "ascend":
+        raise ValueError(f"deployment {deployment_name!r} must be a compiled Ascend deployment")
+    if deployment.execution != ("vlm", "action_expert"):
+        raise ValueError(f"deployment {deployment_name!r} is not a PI0.5 Ascend execution plan")
+
+    action_outputs = [
+        binding for binding in deployment.bindings["action_expert"].outputs if binding.semantic == "action"
+    ]
+    if len(action_outputs) != 1:
+        raise ValueError(f"deployment {deployment_name!r} must contain exactly one Action Expert action output")
+    runtime_name = action_outputs[0].runtime_name or ""
+    output_name = next(
+        (part for part in reversed(runtime_name.split(":")) if part in {"action", "velocity", "v_t"}),
+        runtime_name,
+    )
+    if output_name not in {"velocity", "v_t"}:
+        raise ValueError(f"deployment {deployment_name!r} does not expose a velocity/v_t Action Expert output")
+
+    schedule_source = Path(schedule_path).expanduser().resolve(strict=True)
+    load_pi05_schedule(schedule_source)
+    packaged_schedule = package_deployment_artifact(
+        root,
+        schedule_source,
+        backend="ascend",
+        deployment_name=deployment_name,
+        role="denoising_schedule",
+        force_copy=True,
+    )
+    artifacts = dict(deployment.artifacts)
+    artifacts["denoising_schedule"] = deployment_artifact(root, packaged_schedule, "json")
+    replacement = deployment.model_copy(update={"artifacts": artifacts})
+    try:
+        return update_deployment(
+            root,
+            deployment_name,
+            replacement,
+            expected_uuid=deployment.uuid,
+            expected_revision=deployment.revision,
+        ).manifest_path
+    except Exception:
+        _remove_unreferenced_artifacts(root, [packaged_schedule])
+        raise
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -300,6 +516,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Existing compiler/runtime-introspected Action Expert OM ABI JSON input (default: <ae-om>.abi.json).",
     )
     p.add_argument(
+        "--schedule-file",
+        type=str,
+        default=None,
+        help="PI0.5 velocity denoising schedule JSON. Defaults to a uniform schedule from bundle config.json.",
+    )
+    p.add_argument(
         "--bundle-root",
         type=str,
         default=None,
@@ -311,7 +533,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip ATC and finalize the manifest from existing ONNX and OM artifacts.",
     )
+    p.add_argument(
+        "--reuse-artifact-role",
+        action="append",
+        choices=("vlm", "action_expert", "denoising_schedule"),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     p.add_argument("--deployment", default="ascend", help="Unified manifest deployment name.")
+    p.add_argument("--abi-device-id", type=int, default=0, help="Ascend device used to inspect compiled OM ABI.")
+    p.add_argument("--acl-config-path", default=None, help="Optional ACL initialization config for ABI inspection.")
     p.add_argument(
         "--input-shape",
         choices=("none", "auto"),
@@ -338,7 +569,7 @@ def main() -> int:
     args = build_arg_parser().parse_args()
     setup_logging(args.log_level)
 
-    if not args.vlm_onnx and not args.ae_onnx:
+    if not args.vlm_onnx and not args.ae_onnx and not args.manifest_only:
         LOGGER.error("Nothing to do: pass --vlm-onnx and/or --ae-onnx.")
         return 1
 
@@ -362,6 +593,7 @@ def main() -> int:
         manifest_dir = policy_path.resolve()
 
     extra_args = list(args.atc_arg or [])
+    reuse_roles = frozenset(args.reuse_artifact_role or ())
 
     jobs: list[tuple[str, Path, Path]] = []
     if args.vlm_onnx:
@@ -378,6 +610,8 @@ def main() -> int:
     produced: list[tuple[str, str]] = []
     total = len(jobs)
     for i, (role, onnx_path, om_output) in enumerate(jobs, start=1):
+        if role in reuse_roles:
+            continue
         if args.manifest_only:
             if not onnx_path.is_file():
                 raise FileNotFoundError(f"{role} ONNX not found: {onnx_path}")
@@ -395,16 +629,55 @@ def main() -> int:
                 index=i,
                 total=total,
             )
+        explicit_abi = args.vlm_abi if role == "vlm" else args.ae_abi
+        abi_path = Path(explicit_abi).expanduser() if explicit_abi else Path(f"{om_path}.abi.json")
+        if explicit_abi:
+            read_runtime_abi(abi_path)
+        elif not args.manifest_only or not abi_path.is_file():
+            abi_path.unlink(missing_ok=True)
+            write_acl_om_abi(
+                om_path,
+                abi_path,
+                device_id=args.abi_device_id,
+                acl_config_path=args.acl_config_path,
+            )
         produced.append((role, str(om_path)))
 
     if not args.skip_manifest:
-        if not args.vlm_onnx or not args.ae_onnx:
-            LOGGER.error("Unified PI0.5 manifest finalization requires both --vlm-onnx and --ae-onnx.")
-            return 1
-        vlm_om = next(Path(path) for role, path in produced if role == "vlm")
-        action_om = next(Path(path) for role, path in produced if role == "action_expert")
+        vlm_om = (
+            Path(args.vlm_om).expanduser().resolve()
+            if args.vlm_om
+            else next((Path(path) for role, path in produced if role == "vlm"), _default_om_output(manifest_dir, "vlm"))
+        )
+        action_om = (
+            Path(args.ae_om).expanduser().resolve()
+            if args.ae_om
+            else next(
+                (Path(path) for role, path in produced if role == "action_expert"),
+                _default_om_output(manifest_dir, "action_expert"),
+            )
+        )
+        for role, om_path in (("vlm", vlm_om), ("action_expert", action_om)):
+            if role in reuse_roles:
+                continue
+            if not om_path.is_file():
+                raise FileNotFoundError(f"Cannot finalize PI0.5 manifest: {role} OM not found: {om_path}")
         vlm_abi = Path(args.vlm_abi).expanduser() if args.vlm_abi else Path(f"{vlm_om}.abi.json")
         action_abi = Path(args.ae_abi).expanduser() if args.ae_abi else Path(f"{action_om}.abi.json")
+        if "vlm" not in reuse_roles and not vlm_abi.is_file():
+            write_acl_om_abi(
+                vlm_om,
+                vlm_abi,
+                device_id=args.abi_device_id,
+                acl_config_path=args.acl_config_path,
+            )
+        if "action_expert" not in reuse_roles and not action_abi.is_file():
+            write_acl_om_abi(
+                action_om,
+                action_abi,
+                device_id=args.abi_device_id,
+                acl_config_path=args.acl_config_path,
+            )
         manifest_path = write_pi05_ascend_deployment(
             manifest_dir,
             args.deployment,
@@ -413,6 +686,8 @@ def main() -> int:
             vlm_om,
             action_abi,
             action_om,
+            Path(args.schedule_file).expanduser() if args.schedule_file else None,
+            reuse_roles,
         )
         LOGGER.info("  unified manifest → %s", manifest_path)
 

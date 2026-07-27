@@ -17,6 +17,7 @@ from inference_manifest import (
     DeploymentTarget,
     PolicyMetadata,
     ValidatedManifest,
+    resolve_bundle_file,
 )
 
 
@@ -118,9 +119,7 @@ class RuntimeContext:
         artifacts: dict[str, Path] = {}
         if isinstance(deployment, CompiledDeployment):
             for role, artifact in deployment.artifacts.items():
-                artifacts[role] = self.validated_manifest.bundle_root.joinpath(*artifact.path.split("/")).resolve(
-                    strict=True
-                )
+                artifacts[role] = resolve_bundle_file(self.validated_manifest.bundle_root, artifact.path)
         object.__setattr__(self, "runtime_options", _immutable_mapping(self.runtime_options))
         object.__setattr__(self, "resolved_artifacts", MappingProxyType(artifacts))
 

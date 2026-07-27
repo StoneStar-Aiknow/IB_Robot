@@ -344,7 +344,7 @@ Goal finished with status: SUCCEEDED
 | 推理节点 SIGSEGV | `LD_PRELOAD` 未设置 | 确认 `source robooh_1.0.1.env` 已执行 |
 | `ModuleNotFoundError: 'rknnlite.xxx'` | `.so` 后缀不匹配 | 重命名 `-gnu.so` → `-ohos.so` |
 | `Deployment 'rknn' is not present` | manifest 中没有同名 deployment | 查看 `inference_manifest.json` 并使用实际 deployment 名称，或重新运行 exporter |
-| `SHA-256 mismatch` / `Bundle digest mismatch` | bundle 或 artifact 在打包后被修改 | 重新运行 RKNN exporter；不要手工修改 manifest hash |
+| `Bundle digest mismatch` / artifact load failure | Manifest identity 被手改，或 artifact 损坏/ABI 不兼容 | 重新运行 RKNN exporter 并发布新 revision |
 
 > 更多问题与高级配置见各专项 skill（`oh-rebuild-kernel`、`oh-cross-build-ros-pkg`）与 [RKNN 推理指南](docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md)。
 

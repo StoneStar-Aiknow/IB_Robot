@@ -895,9 +895,13 @@ class RKNNBackend(LifecycleBackend):
     @staticmethod
     def _session_cache_key(deployment: CompiledDeployment, role: str) -> tuple[object, ...]:
         artifact = deployment.artifacts[role]
+        if artifact.share_group is None:
+            return ("role", role)
         bindings = deployment.bindings[role]
         return (
-            artifact.sha256,
+            "share_group",
+            artifact.share_group,
+            artifact.path,
             tuple(
                 (binding.runtime_name, binding.index, binding.dtype, binding.shape, binding.layout)
                 for binding in bindings.inputs

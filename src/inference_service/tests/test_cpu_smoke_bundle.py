@@ -8,10 +8,11 @@ from types import ModuleType, SimpleNamespace
 import numpy as np
 import pytest
 
-from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest, sha256_file
+from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
 from inference_service.backends import InferenceRequest
 from inference_service.pipeline import create_pipeline_manager
 from robot_config.inference_config import parse_inference_config
+from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID
 
 MODEL_NAME = "ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515"
 
@@ -37,17 +38,23 @@ def _create_tracked_equivalent_bundle(root: Path) -> Path:
     )
     for path in paths:
         (root / path).write_bytes((fixture / path).read_bytes())
-    entries = [BundleFile(path=path, sha256=sha256_file(root / path)) for path in paths]
+    entries = [BundleFile(path=path) for path in paths]
     _write_json(
         root / "inference_manifest.json",
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "bundle": {
+                "uuid": TEST_BUNDLE_UUID,
+                "revision": 1,
                 "name": MODEL_NAME,
                 "files": [entry.model_dump(mode="json") for entry in entries],
-                "digest": {"algorithm": "sha256", "value": canonical_bundle_digest(entries)},
+                "digest": {
+                    "algorithm": "sha256",
+                    "scope": "structure",
+                    "value": canonical_bundle_digest(TEST_BUNDLE_UUID, 1, MODEL_NAME, entries),
+                },
             },
-            "deployments": {"cpu": {"backend": "torch", "device": "cpu"}},
+            "deployments": {"cpu": {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, "backend": "torch", "device": "cpu"}},
         },
     )
     return root

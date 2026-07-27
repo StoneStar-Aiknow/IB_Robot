@@ -2,8 +2,8 @@
 # Licensed under the Mulan PSL v2.
 """Dump ORT-CPU VLM outputs for a single batch.
 
-Companion to :mod:`dump_vlm_pt` and the OM-side ``PI05_OM_DUMP_VLM``
-machinery — this script runs the **same VLM ONNX file** that ATC
+Companion to :mod:`dump_vlm_pt` and the explicit manifest-driven
+``pi05-om-dump`` command. This script runs the **same VLM ONNX file** that ATC
 compiles into the OM, but on the CPU through onnxruntime.
 
 By placing ORT between PT and OM in our diagnostic chain we can
@@ -172,7 +172,7 @@ def dump(
     LOGGER.info("  ORT feed keys: %s", sorted(vlm_feed.keys()))
 
     # ------------------------------------------------------------------
-    # Dump VLM inputs (file names aligned with dump_vlm_pt.py / PI05OMModel
+    # Dump VLM inputs (file names aligned with the PT and OM diagnostics
     # so the three sources can be diff'd directly).
     # ------------------------------------------------------------------
     try:

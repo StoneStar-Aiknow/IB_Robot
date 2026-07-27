@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 
 # Heavy imports (numpy, torch, tqdm, inference_service) are deferred to main()
 # after CLI argument resolution so that --list-profiles / --help / wizard-only
@@ -13,6 +14,32 @@ np = None  # type: ignore
 torch = None  # type: ignore
 tqdm = None  # type: ignore
 PureInferenceEngine = None  # type: ignore
+_DIAGNOSTIC_ASCEND_OPTIONS = None
+
+
+def _diagnostic_ascend_backend(context):
+    from inference_service.backends.ascend.backend import AscendBackend
+
+    if _DIAGNOSTIC_ASCEND_OPTIONS is None:
+        raise RuntimeError("diagnostic Ascend schedule was not configured")
+    schedule, source = _DIAGNOSTIC_ASCEND_OPTIONS
+    return AscendBackend(
+        int(context.runtime_options.get("device_id", 0)),
+        diagnostic_schedule=schedule,
+        diagnostic_schedule_source=source,
+    )
+
+
+def generate_pi05_noise(shape: tuple[int, ...], seed: int):
+    """Generate deterministic CPU fp32 noise without changing global Torch RNG state."""
+    global torch
+    if torch is None:
+        import torch as torch_module
+
+        torch = torch_module
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(seed)
+    return torch.randn(shape, generator=generator, dtype=torch.float32)
 
 
 class LossUtils:
@@ -23,9 +50,8 @@ class LossUtils:
 
     def run(self):
         if self.args.generate_target:
-            self.generate_target()
-        else:
-            self.compute_loss()
+            return self.generate_target()
+        return self.compute_loss()
 
     def compute_loss(self):
         print("computing loss...")
@@ -38,8 +64,8 @@ class LossUtils:
         batches = self.load_batches_as_tensors()
         start_time = time.perf_counter()
         preds = self.forward(batches)
-        end_time = time.perf_counter()
-        print(f"inference time: {end_time - start_time:.3f}s")
+        inference_elapsed = time.perf_counter() - start_time
+        print(f"inference time: {inference_elapsed:.3f}s")
 
         if len(targets) != len(preds):
             raise ValueError(f"Length mismatch: targets {len(targets)} vs preds {len(preds)}")
@@ -47,10 +73,12 @@ class LossUtils:
         arr_l1 = []
         arr_cos = []
         for i in range(len(targets)):
-            l1 = torch.nn.functional.l1_loss(preds[i], targets[i], reduction="mean").item()
+            pred = preds[i].float()
+            target = targets[i].float()
+            l1 = torch.nn.functional.l1_loss(pred, target, reduction="mean").item()
             cos = torch.nn.functional.cosine_similarity(
-                preds[i].flatten().unsqueeze(0),
-                targets[i].flatten().unsqueeze(0),
+                pred.flatten().unsqueeze(0),
+                target.flatten().unsqueeze(0),
             ).item()
             arr_l1.append(l1)
             arr_cos.append(cos)
@@ -65,6 +93,24 @@ class LossUtils:
         avg_l1 = sum(arr_l1) / len(arr_l1)
         avg_cos = sum(arr_cos) / len(arr_cos)
         print(f"{'Avg':>6} {avg_l1:>12.6f} {avg_cos:>12.6f}")
+        reported_latencies = getattr(self, "_inference_latencies_ms", [])
+        average_latency_ms = (
+            sum(reported_latencies) / len(reported_latencies)
+            if reported_latencies
+            else inference_elapsed * 1000.0 / len(preds)
+        )
+        metrics = {
+            "format": "loss-compare-metrics-v1",
+            "sample_count": len(preds),
+            "inference": {
+                "elapsed_seconds": inference_elapsed,
+                "average_latency_ms": average_latency_ms,
+                "latency_source": "pipeline" if reported_latencies else "wall_clock",
+            },
+            "unnormalized": {"l1": avg_l1, "cosine": avg_cos},
+            "normalized": {"l1": None, "cosine": None},
+            "pi05_distribution": {},
+        }
 
         # ------------------------------------------------------------------
         # Independent sanity check: compare in *normalized* (pre-postprocessor)
@@ -107,16 +153,16 @@ class LossUtils:
                     )
 
                 if arr_raw_l1:
+                    raw_avg_l1 = sum(arr_raw_l1) / len(arr_raw_l1)
+                    raw_avg_cos = sum(arr_raw_cos) / len(arr_raw_cos)
+                    metrics["normalized"] = {"l1": raw_avg_l1, "cosine": raw_avg_cos}
                     print("\n=== Normalized action space (pre-postprocessor) ===")
                     print(f"{'Batch':>6} {'raw L1':>12} {'raw Cos':>12}")
                     print("-" * 32)
                     for i in range(len(arr_raw_l1)):
                         print(f"{i:>6} {arr_raw_l1[i]:>12.6f} {arr_raw_cos[i]:>12.6f}")
                     print("-" * 32)
-                    print(
-                        f"{'Avg':>6} {sum(arr_raw_l1) / len(arr_raw_l1):>12.6f} "
-                        f"{sum(arr_raw_cos) / len(arr_raw_cos):>12.6f}"
-                    )
+                    print(f"{'Avg':>6} {raw_avg_l1:>12.6f} {raw_avg_cos:>12.6f}")
         elif raw_preds is not None and raw_targets_path and not os.path.exists(raw_targets_path):
             print(
                 f"\nNOTE: raw target file not found at {raw_targets_path}; "
@@ -162,22 +208,86 @@ class LossUtils:
 
             raw_preds_list = getattr(self, "_raw_preds", None)
             raw_targets_list = raw_targets_data
-            evaluate_pi05(
+            metrics["pi05_distribution"] = evaluate_pi05(
                 preds=preds,
                 targets=targets,
                 raw_preds=raw_preds_list,
                 raw_targets=raw_targets_list,
             )
+        metrics["aggregates"] = self._aggregate_metrics(metrics)
+        self._write_metrics_json(metrics)
+        return metrics
+
+    @staticmethod
+    def _aggregate_metrics(metrics: dict[str, object]) -> dict[str, float | None]:
+        inference = metrics["inference"]
+        normalized = metrics["normalized"]
+        unnormalized = metrics["unnormalized"]
+        pi05 = metrics["pi05_distribution"]
+        assert isinstance(inference, dict)
+        assert isinstance(normalized, dict)
+        assert isinstance(unnormalized, dict)
+        assert isinstance(pi05, dict)
+        normalized_distribution = pi05.get("normalized", {})
+        wasserstein = (
+            normalized_distribution.get("wasserstein", {}) if isinstance(normalized_distribution, dict) else {}
+        )
+        first_frame = (
+            normalized_distribution.get("first_frame", {}) if isinstance(normalized_distribution, dict) else {}
+        )
+        return {
+            "inference_time": inference["elapsed_seconds"],
+            "average_latency_ms": inference["average_latency_ms"],
+            "raw_l1": normalized["l1"],
+            "raw_cos": normalized["cosine"],
+            "unnorm_l1": unnormalized["l1"],
+            "unnorm_cos": unnormalized["cosine"],
+            "normalized_mean_w1_std": wasserstein.get("mean_ratio") if isinstance(wasserstein, dict) else None,
+            "normalized_first_frame_cos": first_frame.get("mean_cos") if isinstance(first_frame, dict) else None,
+        }
+
+    def _write_metrics_json(self, metrics: dict[str, object]) -> None:
+        destination_value = getattr(self.args, "metrics_json", None)
+        if destination_value is None:
+            return
+        destination = Path(destination_value).expanduser().resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(metrics, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        print(f"metrics JSON saved at {destination}")
 
     def prepare_policy(self):
         runtime_options = {}
         if self.args.model_dtype != "native":
             runtime_options["model_dtype"] = self.args.model_dtype
+        for option in ("curvature_log_path",):
+            value = getattr(self.args, option, None)
+            if value is not None:
+                runtime_options[option] = value
+        registry = None
+        schedule_override_path = getattr(self.args, "schedule_override_path", None)
+        if schedule_override_path is not None:
+            from inference_service.backends import BACKEND_REGISTRY, BackendRegistry
+            from inference_service.pi05_schedule import load_pi05_schedule
+
+            schedule_path = Path(schedule_override_path).expanduser().resolve(strict=True)
+            schedule = load_pi05_schedule(schedule_path)
+            descriptors = {name: BACKEND_REGISTRY.descriptor(name) for name in BACKEND_REGISTRY.names}
+            ascend = descriptors["ascend"]
+            descriptors["ascend"] = ascend.__class__(
+                name=ascend.name,
+                factory="model_utils.loss_compare:_diagnostic_ascend_backend",
+                supported_policy_families=ascend.supported_policy_families,
+                target_validator=ascend.target_validator,
+            )
+            global _DIAGNOSTIC_ASCEND_OPTIONS
+            _DIAGNOSTIC_ASCEND_OPTIONS = (schedule, str(schedule_path))
+            registry = BackendRegistry(descriptors)
         engine = PureInferenceEngine(
             model_path=self.args.policy_path,
             deployment=self.args.deployment,
             pipeline_id="loss_compare",
             runtime_options=runtime_options,
+            **({"registry": registry} if registry is not None else {}),
         )
         print(
             f"model loaded: {self.args.policy_path} "
@@ -206,7 +316,8 @@ class LossUtils:
                     # (PI0/PI05/SmolVLA): the preprocessor tokenizes them.
                     processed_batch[k] = v
                 else:
-                    processed_batch[k] = np.array(v).astype(np.float32)
+                    array = np.asarray(v, dtype=np.float32)
+                    processed_batch[k] = array[None, ...] if array.ndim == 1 else array
             # VLA policies (PI0/PI05/SmolVLA) require a natural-language task
             # prompt in the observation frame; the LeRobot preprocessor routes
             # ``task`` into complementary_data and tokenizes it.  Default to an
@@ -220,7 +331,7 @@ class LossUtils:
 
     @staticmethod
     def _prepare_image(value) -> np.ndarray:
-        """Normalize a JSON image to float32 [0, 1], HWC kept.
+        """Normalize a JSON image to batched float32 NCHW in [0, 1].
 
         The batch JSON stores images as HWC with [0, 255] pixel values (but
         encoded as float, not uint8).  The historical loss_compare path used
@@ -234,6 +345,12 @@ class LossUtils:
         arr = np.array(value, dtype=np.float32)
         if arr.size and float(arr.max()) > 1.0:
             arr = arr / 255.0
+        if arr.ndim == 3 and arr.shape[-1] in {1, 3, 4}:
+            arr = np.transpose(arr, (2, 0, 1))
+        elif arr.ndim == 4 and arr.shape[-1] in {1, 3, 4}:
+            arr = np.transpose(arr, (0, 3, 1, 2))
+        if arr.ndim == 3:
+            arr = arr[None, ...]
         return arr
 
     @staticmethod
@@ -260,21 +377,22 @@ class LossUtils:
         if self.args.policy_type != "pi05":
             return None
 
-        # Per-batch seed keeps diffusion/flow-matching noise deterministic
-        # across runs even without --noise-dir.
-        torch.manual_seed(self.args.seed + batch_idx)
-
+        noise_shape = self._pi05_noise_shape()
+        noise = generate_pi05_noise(noise_shape, self.args.seed + batch_idx)
         if not self.args.noise_dir:
-            return None
+            if self.args.generate_target:
+                raise RuntimeError("PI0.5 generate-target requires --noise-dir or --exp-dir to persist external noise")
+            return noise
 
         noise_path = os.path.join(self.args.noise_dir, f"noise_{batch_idx:04d}.npy")
         if self.args.generate_target:
-            noise_shape = self._pi05_noise_shape()
-            noise = torch.normal(mean=0.0, std=1.0, size=noise_shape, dtype=torch.float32)
             os.makedirs(self.args.noise_dir, exist_ok=True)
             np.save(noise_path, noise.numpy())
             return noise
-        return torch.from_numpy(np.load(noise_path)).float()
+        loaded = torch.from_numpy(np.load(noise_path)).float()
+        if tuple(loaded.shape) != noise_shape:
+            raise ValueError(f"Noise shape mismatch in {noise_path}: got {tuple(loaded.shape)}, expected {noise_shape}")
+        return loaded
 
     def _pi05_noise_shape(self):
         """Return the policy-declared PI0.5 padded noise shape."""
@@ -305,18 +423,12 @@ class LossUtils:
         return torch.as_tensor(result.raw_action).detach().cpu().float()
 
     def _assert_noise_effective(self, batch0):
-        """One-shot self-check (PI05 + fixed noise only): prove the injected
-        noise actually drives the flow-matching ODE and is deterministic.
+        """Prove the unified control-input noise binding is deterministic and effective.
 
-        Why this exists: the noise transport path differs by lerobot build —
-        some consume ``policy._external_noise`` (back-door), others accept a
-        ``predict_action_chunk(..., noise=)`` kwarg.  If loss_compare's
-        injection mechanism does not match the lerobot actually imported (e.g.
-        the ``.shrc_local`` ``libs/lerobot`` ignores ``_external_noise``), the
-        noise is *silently dropped* and ``sample_actions`` samples its own RNG
-        noise — producing targets that are NOT reproducible on the 310p OM,
-        with no error raised.  This converts that silent failure into a hard
-        abort *before* a bad target is written.
+        Noise is passed through ``PureInferenceEngine.control_inputs`` and bound
+        by the selected deployment's PI0.5 codec. This check turns a missing or
+        ignored manifest noise binding into a hard failure before a bad target
+        is written.
 
         Method (3 forwards on batch 0):
           A1, A2 with noise=zeros, B with noise=3*ones.
@@ -351,17 +463,16 @@ class LossUtils:
             raise RuntimeError(
                 "Noise self-check FAILED (no effect): two very different noises "
                 f"produced ~identical outputs (mean|A-B|={d_AB:.3e}). The injected "
-                "noise is being IGNORED — loss_compare's injection path does not "
-                "match the imported lerobot (e.g. it sets policy._external_noise "
-                "but this lerobot's predict_action_chunk only honors a noise= "
-                "kwarg, or vice-versa). Generated targets would NOT be "
-                "reproducible on the 310p OM. Aborting before writing a bad target."
+                "noise is being ignored by the selected deployment's unified "
+                "control-input or manifest binding path. Aborting before writing "
+                "a non-reproducible target."
             )
         print(f"  ✓ noise self-check passed (deterministic mean|A1-A2|={d_AA:.2e}, effective mean|A-B|={d_AB:.2e})")
 
     def forward(self, batches):
         raw_preds: list[torch.Tensor] = []
         outputs = []
+        inference_latencies_ms = []
 
         for i in tqdm(range(len(batches)), desc="forwarding"):
             self._reset_independent_sample()
@@ -375,6 +486,9 @@ class LossUtils:
             if result.raw_action is None:
                 raise RuntimeError("unified inference pipeline did not return the requested raw action")
             raw_preds.append(torch.as_tensor(result.raw_action).detach().cpu().clone())
+            latency_ms = getattr(result, "latency_ms", None)
+            if isinstance(latency_ms, int | float) and latency_ms >= 0:
+                inference_latencies_ms.append(float(latency_ms))
 
             output = torch.as_tensor(result.action)
             # Normalize storage shape: drop a leading singleton batch dim so
@@ -387,6 +501,7 @@ class LossUtils:
 
         # Stash raw preds for compute_loss / generate_target to use.
         self._raw_preds = raw_preds
+        self._inference_latencies_ms = inference_latencies_ms
         return outputs
 
     def generate_target(self):
@@ -398,7 +513,7 @@ class LossUtils:
 
         # Guard: before producing any target, prove the fixed noise is actually
         # consumed by this backend (PI05 + --noise-dir).  A silent noise-drop
-        # here would yield targets the 310p OM can never match.
+        # here would yield targets the selected compiled deployment can never match.
         if batches:
             self._assert_noise_effective(batches[0])
 

@@ -27,7 +27,7 @@ Never restore or recommend the removed ACT single-module HMM path, `config.hmm.j
 6. Configure a named inference pipeline that selects the generated deployment.
 7. Validate on the target or approved TCIM mocks.
 
-The packager owns artifact copies, bindings, execution order, device links, SHA-256 values, bundle digest, and strict-loader verification. Do not hand-edit generated manifest hashes or tensor bindings.
+The packager owns artifact generations, bindings, execution order, device links, UUID/revision updates, lightweight structural identities, and strict-loader verification. Do not hand-edit generated manifest identities or tensor bindings.
 
 ## Environment
 
@@ -288,7 +288,7 @@ Use the `model.json` emitted for the exact `.hmm` file. Do not infer tensor orde
 
 ### Manifest hash mismatch
 
-Rerun `package-hmm-deployment`. Do not edit artifact SHA-256 or bundle digest manually.
+Rerun `package-hmm-deployment`. Do not edit artifact identity, revision, or bundle digest manually.
 
 ### External tokenizer dependency
 

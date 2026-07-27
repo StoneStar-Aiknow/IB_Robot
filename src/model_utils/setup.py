@@ -13,6 +13,7 @@ setup(
     install_requires=[
         "setuptools",
         "inference_manifest",
+        "inference_service",
         "onnx",
         "onnxsim",
         "torch",
@@ -29,10 +30,14 @@ setup(
     entry_points={
         "console_scripts": [
             "frame_inspect = model_utils.frame_inspect:main",
+            "bump-inference-bundle-revision = model_utils.bundle_revision:main",
             "package-compiled-deployment = model_utils.package_compiled_deployment:main",
             "package-hmm-deployment = model_utils.hmm_export:main",
             "package-torch-deployment = model_utils.package_torch_deployment:main",
             "pi05-export = model_utils.pi05_export.__main__:console_main",
+            "pi05-curvature-schedule = model_utils.pi05_export.curvature_schedule:main",
+            "pi05-om-dump = model_utils.pi05_om_dump:main",
+            "pi05-tune-schedule = model_utils.pi05_export.tune_schedule:main",
         ],
     },
 )

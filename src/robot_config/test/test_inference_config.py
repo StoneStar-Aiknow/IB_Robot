@@ -7,8 +7,11 @@ from typing import Any
 
 import pytest
 
-from inference_manifest import BundleFile, ValidatedManifest, canonical_bundle_digest, sha256_file
+from inference_manifest import BundleFile, ValidatedManifest, canonical_bundle_digest
 from robot_config import InferenceConfigError, parse_inference_config
+
+_BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
+_DEPLOYMENT_UUID = "123e4567-e89b-42d3-a456-426614174001"
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -35,17 +38,27 @@ def _create_bundle(root: Path, deployments: dict[str, dict[str, str]] | None = N
         "policy_postprocessor.json",
         "policy_preprocessor.json",
     )
-    entries = [BundleFile(path=path, sha256=sha256_file(root / path)) for path in bundle_paths]
+    entries = [BundleFile(path=path) for path in bundle_paths]
+    deployment_values = deployments or {"cpu": {"backend": "torch", "device": "cpu"}}
+    deployment_values = {
+        name: {"uuid": _DEPLOYMENT_UUID, "revision": 1, **value} for name, value in deployment_values.items()
+    }
     _write_json(
         root / "inference_manifest.json",
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "bundle": {
+                "uuid": _BUNDLE_UUID,
+                "revision": 1,
                 "name": root.name,
                 "files": [entry.model_dump(mode="json") for entry in entries],
-                "digest": {"algorithm": "sha256", "value": canonical_bundle_digest(entries)},
+                "digest": {
+                    "algorithm": "sha256",
+                    "scope": "structure",
+                    "value": canonical_bundle_digest(_BUNDLE_UUID, 1, root.name, entries),
+                },
             },
-            "deployments": deployments or {"cpu": {"backend": "torch", "device": "cpu"}},
+            "deployments": deployment_values,
         },
     )
     return root

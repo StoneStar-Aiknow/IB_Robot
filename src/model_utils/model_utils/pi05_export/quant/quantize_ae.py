@@ -66,6 +66,9 @@ _DEFAULT_DISABLE_REGEXES: tuple[str, ...] = (
     # Attention score BMMs (Q@K^T, attn@V): activation×activation, no weight to
     # int8, wide dynamic range → keep fp16. Anchored to avoid q/k/v/o_proj.
     r"self_attn/MatMul(_\d+)?$",
+    # NPU export fuses gate_proj + up_proj into one [up;gate] MatMul feeding
+    # NPUGeglu, so Route A cannot transplant their separate donor int8 nodes.
+    r"mlp/(gate_proj|up_proj)/MatMul",
     # Final action head: emits the denoise velocity directly and its error
     # accumulates over all 10 Euler steps — keep it fp16 for accuracy.
     r"action_out_proj",
@@ -349,6 +352,9 @@ def main() -> int:
         amp_num=args.amp_num,
         npu_graph=npu_graph_path,
     )
+    if not output_path.is_file():
+        raise RuntimeError(f"msModelSlim reported success but did not produce {output_path}")
+    common.load_onnx(output_path)
 
     LOGGER.info(
         "Done. Next: ATC-compile %s on the board, then run the AE per-step "

@@ -63,13 +63,17 @@ import json
 import logging
 import os
 import time
+from collections.abc import Sequence
 from copy import copy
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 from torch import Tensor
+
+from inference_service.pi05_schedule import PI05DenoisingSchedule, load_pi05_schedule, uniform_pi05_schedule
 
 LOGGER = logging.getLogger(__name__)
 
@@ -432,9 +436,20 @@ def preprocess_real_batches(
     from lerobot.policies.factory import make_pre_post_processors
     from lerobot.policies.utils import prepare_observation_for_inference
 
+    from inference_service.lerobot_assets import TOKENIZER_REFERENCE_KEYS, resolve_local_semantic_reference
+
+    preprocessor_overrides = None
+    tokenizer_path = resolve_local_semantic_reference(
+        Path(policy_path).resolve(),
+        "policy_preprocessor.json",
+        TOKENIZER_REFERENCE_KEYS,
+    )
+    if tokenizer_path is not None:
+        preprocessor_overrides = {"tokenizer_processor": {"tokenizer_name": tokenizer_path}}
     preprocessor, _ = make_pre_post_processors(
         policy_cfg=full_policy,
         pretrained_path=policy_path,
+        preprocessor_overrides=preprocessor_overrides,
     )
     LOGGER.info("Preprocessor pipeline created — running on %d batch(es) …", len(raw_batches))
 
@@ -513,12 +528,24 @@ def verify_kv_cache(
 
 
 @torch.no_grad()
+def _integrate_full_velocity(full_model, prefix_pad_masks, past_key_values, noise, schedule):
+    x_t = noise.clone()
+    bsize = noise.shape[0]
+    for time_value, next_time_value in pairwise(schedule.timesteps):
+        timestep = torch.tensor(time_value, dtype=torch.float32, device=noise.device).expand(bsize)
+        velocity = full_model.denoise_step(prefix_pad_masks, past_key_values, x_t, timestep)
+        x_t = x_t + (next_time_value - time_value) * velocity.float()
+    return x_t
+
+
+@torch.no_grad()
 def verify_actions(
     full_policy,
     vlm_policy,
     ae_policy,
     batch: dict[str, Tensor],
     seed: int,
+    timesteps: Sequence[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compare full denoising (monolithic) vs split (VLM + N × AE).
 
@@ -528,12 +555,17 @@ def verify_actions(
     """
     from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS
 
-    from model_utils.pi05_export.modeling_pi05_action_expert import unflatten_kv
+    from model_utils.pi05_export.modeling_pi05_action_expert import make_att_2d_masks, unflatten_kv
 
     config = full_policy.config
     device = next(full_policy.parameters()).device
     bsize = next(v.shape[0] for v in batch.values() if isinstance(v, Tensor))
-    num_steps = config.num_inference_steps
+    schedule = (
+        uniform_pi05_schedule(config.num_inference_steps)
+        if timesteps is None
+        else PI05DenoisingSchedule(name="explicit", timesteps=tuple(float(value) for value in timesteps))
+    )
+    num_steps = schedule.step_count
 
     # --- Generate shared noise (float32, same seed) ---
     torch.manual_seed(seed)
@@ -552,14 +584,38 @@ def verify_actions(
     masks_full = batch[OBS_LANGUAGE_ATTENTION_MASK]
 
     t0 = time.perf_counter()
-    full_actions = full_policy.model.sample_actions(
-        images_full,
-        img_masks_full,
-        tokens_full,
-        masks_full,
-        noise=noise.clone(),
-        num_steps=num_steps,
-    )
+    if timesteps is None:
+        full_actions = full_policy.model.sample_actions(
+            images_full,
+            img_masks_full,
+            tokens_full,
+            masks_full,
+            noise=noise.clone(),
+            num_steps=num_steps,
+        )
+    else:
+        full_model = full_policy.model
+        prefix_embs, prefix_pad_masks_full, prefix_att_masks = full_model.embed_prefix(
+            images_full, img_masks_full, tokens_full, masks_full
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks_full, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks_full, dim=1) - 1
+        prefix_att_2d_masks_4d = full_model._prepare_attention_masks_4d(prefix_att_2d_masks)
+        full_model.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"
+        _, past_kv_full = full_model.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        full_actions = _integrate_full_velocity(
+            full_model,
+            prefix_pad_masks_full,
+            past_kv_full,
+            noise,
+            schedule,
+        )
     t_full = time.perf_counter() - t0
     LOGGER.info("Full model inference: %.4f sec", t_full)
 
@@ -584,13 +640,12 @@ def verify_actions(
     ae_model = ae_policy.model
     past_key_values = unflatten_kv(past_kv_tensor)
 
-    dt = -1.0 / num_steps
-    dt_tensor = torch.tensor(dt, dtype=torch.float32, device=device)
     x_t = noise.clone()
-    time_val = torch.tensor(1.0, dtype=torch.float32, device=device)
 
     t0 = time.perf_counter()
-    while time_val >= -dt_tensor / 2:
+    for time_value, next_time_value in pairwise(schedule.timesteps):
+        time_val = torch.tensor(time_value, dtype=torch.float32, device=device)
+        dt_tensor = torch.tensor(next_time_value - time_value, dtype=torch.float32, device=device)
         expanded_time = time_val.expand(bsize)
         v_t = ae_model.denoise_step(
             prefix_pad_masks,
@@ -600,7 +655,6 @@ def verify_actions(
         )
         # Keep float32 precision for Euler update (matches full model)
         x_t = x_t + dt_tensor * v_t.float()
-        time_val = time_val + dt_tensor
     t_ae = time.perf_counter() - t0
     LOGGER.info("  AE denoising (%d steps): %.4f sec", num_steps, t_ae)
     LOGGER.info("  Split total: %.4f sec", t_vlm + t_ae)
@@ -625,12 +679,13 @@ def verify_onnx_actions(
     vlm_onnx_path: str,
     ae_onnx_path: str,
     seed: int,
+    timesteps: Sequence[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compare full model (PyTorch) vs split ONNX (VLM ONNX + N × AE ONNX).
 
     The VLM ONNX model produces ``past_kv_tensor`` + ``prefix_pad_masks``.
     The AE ONNX model is called *N* times in a denoising loop; each call
-    performs a single Euler step and returns the updated ``x_t``.
+    returns velocity, which this utility integrates with the declared timesteps.
 
     Returns a tuple of:
         ``(full_actions_np, onnx_actions_np,
@@ -650,7 +705,12 @@ def verify_onnx_actions(
     config = full_policy.config
     device = next(full_policy.parameters()).device
     bsize = next(v.shape[0] for v in batch.values() if isinstance(v, Tensor))
-    num_steps = config.num_inference_steps
+    schedule = (
+        uniform_pi05_schedule(config.num_inference_steps)
+        if timesteps is None
+        else PI05DenoisingSchedule(name="explicit", timesteps=tuple(float(value) for value in timesteps))
+    )
+    num_steps = schedule.step_count
 
     # --- Generate shared noise (float32, same seed) ---
     torch.manual_seed(seed)
@@ -692,14 +752,23 @@ def verify_onnx_actions(
     full_masks_np = prefix_pad_masks_full.cpu().numpy()
 
     t0 = time.perf_counter()
-    full_actions = full_policy.model.sample_actions(
-        images_full,
-        img_masks_full,
-        tokens_full,
-        masks_full,
-        noise=noise.clone(),
-        num_steps=num_steps,
-    )
+    if timesteps is None:
+        full_actions = full_policy.model.sample_actions(
+            images_full,
+            img_masks_full,
+            tokens_full,
+            masks_full,
+            noise=noise.clone(),
+            num_steps=num_steps,
+        )
+    else:
+        full_actions = _integrate_full_velocity(
+            full_model,
+            prefix_pad_masks_full,
+            past_kv_full,
+            noise,
+            schedule,
+        )
     t_full = time.perf_counter() - t0
     LOGGER.info("Full model PyTorch inference: %.4f sec", t_full)
 
@@ -842,29 +911,27 @@ def verify_onnx_actions(
             torch.device(f"cuda:{ort_target_device_id}") if ort_target_device == "cuda" else torch.device("cpu")
         )
 
-        x_t_t = noise.to(device=ae_torch_device, dtype=ae_dtypes["noise"]).contiguous()
+        x_t_t = noise.to(device=ae_torch_device, dtype=torch.float32).contiguous()
         past_kv_t = (
             torch.from_numpy(past_kv_np).to(device=ae_torch_device, dtype=ae_dtypes["past_kv_tensor"]).contiguous()
         )
         prefix_masks_t = torch.from_numpy(prefix_masks_np.astype(bool)).to(ae_torch_device).contiguous()
 
-        dt_py = -1.0 / num_steps
-        time_val_py = 1.0
-
-        while time_val_py >= -dt_py / 2:
+        for time_val_py, next_time_val_py in pairwise(schedule.timesteps):
+            dt_py = next_time_val_py - time_val_py
             time_t = torch.full((bsize,), time_val_py, dtype=ae_dtypes["time"], device=ae_torch_device)
             ae_feed_ov = {
                 "past_kv_tensor": _torch_to_ort_value(past_kv_t),
                 "prefix_pad_masks": _torch_to_ort_value(prefix_masks_t),
                 "time": _torch_to_ort_value(time_t),
-                "noise": _torch_to_ort_value(x_t_t),
+                "noise": _torch_to_ort_value(x_t_t.to(dtype=ae_dtypes["noise"]).contiguous()),
             }
             ae_feed_ov = {k: v for k, v in ae_feed_ov.items() if k in ae_valid}
 
             ae_outputs = ae_session.run_with_ort_values(None, ae_feed_ov)
-            x_t_t = _ort_value_to_torch(ae_outputs[0]).to(dtype=ae_dtypes["noise"]).contiguous()
+            velocity_t = _ort_value_to_torch(ae_outputs[0]).float()
+            x_t_t = x_t_t + dt_py * velocity_t
 
-            time_val_py = time_val_py + dt_py
             step_count += 1
 
         if x_t_t.dtype == torch.bfloat16:
@@ -872,28 +939,27 @@ def verify_onnx_actions(
         x_t_np = x_t_t.detach().cpu().numpy()
     else:
         # Original numpy path — unchanged behavior for fp16 / fp32 models.
-        x_t_np = noise.cpu().numpy().astype(onnx_float_dtype)
+        x_t_np = noise.cpu().numpy().astype(np.float32)
         past_kv_cast = past_kv_np.astype(onnx_float_dtype)
         prefix_masks_bool = prefix_masks_np.astype(bool)
 
-        dt = onnx_float_dtype(-1.0 / num_steps)
-        time_val = onnx_float_dtype(1.0)
-
-        while time_val >= -dt / 2:
+        for time_value, next_time_value in pairwise(schedule.timesteps):
+            dt = next_time_value - time_value
+            time_val = onnx_float_dtype(time_value)
             time_arr = np.full((bsize,), time_val, dtype=onnx_float_dtype)
             ae_feed = {
                 "past_kv_tensor": past_kv_cast,
                 "prefix_pad_masks": prefix_masks_bool,
                 "time": time_arr,
-                "noise": x_t_np,
+                "noise": x_t_np.astype(onnx_float_dtype),
             }
             # Filter by valid input names
             ae_feed = {k: v for k, v in ae_feed.items() if k in ae_valid}
 
             ae_outputs = ae_session.run(None, ae_feed)
-            x_t_np = np.asarray(ae_outputs[0])  # x_t after single Euler step
+            velocity = np.asarray(ae_outputs[0], dtype=np.float32)
+            x_t_np = x_t_np + np.float32(dt) * velocity
 
-            time_val = time_val + dt
             step_count += 1
 
     t_ae = time.perf_counter() - t0
@@ -962,6 +1028,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip ONNX verification even when ONNX paths are provided.",
     )
     p.add_argument(
+        "--schedule-file",
+        type=str,
+        default=None,
+        help="Optional strict PI0.5 denoising schedule JSON used by split velocity integration.",
+    )
+    p.add_argument(
         "--key-map",
         type=str,
         nargs="*",
@@ -992,6 +1064,8 @@ def main() -> int:
     from model_utils.pi05_export._cli_ui import setup_logging
 
     setup_logging(args.log_level)
+
+    timesteps = load_pi05_schedule(args.schedule_file).timesteps if args.schedule_file else None
 
     device = torch.device(args.device)
     policy_path = args.pretrained_policy_path
@@ -1074,6 +1148,7 @@ def main() -> int:
                 args.vlm_onnx_path,
                 args.ae_onnx_path,
                 seed=args.seed + i,
+                timesteps=timesteps,
             )
 
             # KV cache: full PyTorch VLM vs VLM ONNX (isolates PT→ONNX
@@ -1112,6 +1187,7 @@ def main() -> int:
                 ae_policy,
                 batch,
                 seed=args.seed + i,
+                timesteps=timesteps,
             )
             report("Actions (PyTorch split)", full_actions, split_actions)
 

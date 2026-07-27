@@ -82,6 +82,7 @@ ibrobot_msgs / rclpy
 from embodied_common.vlm_api_client import VLMClient
 
 vlm = VLMClient()                              # 加载 vlm_models.yaml，一次初始化
+vlm = VLMClient(system="你是一只小鸭子机器人")   # 预设 system prompt，每轮请求自动携带
 
 vlm.chat("做任务规划")                          # 默认模型（defaults.model）
 vlm.chat("分析图片", image=frame_bytes)         # 传入图片字节，自动构造多模态 message
@@ -91,6 +92,8 @@ vlm.chat("新话题", clear_history=True)          # 清空上下文后再对话
 ```
 
 同一个 `VLMClient` 实例的多次 `chat()` 自动累积历史（多轮记忆）；需要全新会话时新建实例。
+
+构造时传入的 `system`（默认 `None`）是持久化的 system prompt：它被置于每轮请求最前，但**不写入对话历史**——因此对话变长不会把它挤出上下文，`clear_history=True` / `clear_history()` 也不会清掉它。
 
 `chat()` / `complete()` 返回结构化 dict：
 

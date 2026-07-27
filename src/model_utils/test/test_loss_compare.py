@@ -61,6 +61,9 @@ def _args(tmp_path, *, generate_target: bool = False) -> Namespace:
         task="pick",
         seed=42,
         policy_type="pi05",
+        metrics_json=None,
+        schedule_override_path=None,
+        curvature_log_path=None,
     )
 
 
@@ -84,8 +87,82 @@ def test_forward_resets_stateful_pipeline_and_separates_raw_from_final_actions(m
     assert engine.reset_calls == 2
     assert [call["request_id"] for call in engine.calls] == ["loss-compare-0", "loss-compare-1"]
     assert all(call["capture_raw_action"] is True for call in engine.calls)
-    assert torch.equal(utils._raw_preds[0], torch.full((2, 6), 1.0))
-    assert torch.equal(outputs[0], torch.full((2, 6), 11.0))
+    assert torch.equal(
+        utils._raw_preds[0], torch.full((2, 6), float(engine.calls[0]["control_inputs"]["noise"].mean()))
+    )
+    assert torch.equal(outputs[0], utils._raw_preds[0] + 10.0)
+
+
+def test_prepare_policy_forwards_exact_named_deployment(monkeypatch, tmp_path):
+    created = []
+
+    class Engine(_FakeEngine):
+        def __init__(self, **kwargs):
+            super().__init__()
+            created.append(kwargs)
+
+    monkeypatch.setattr(loss_compare, "PureInferenceEngine", Engine)
+    args = _args(tmp_path)
+    args.deployment = "lab.ascend-310p3"
+
+    engine = loss_compare.LossUtils.prepare_policy(SimpleNamespace(args=args))
+
+    assert engine is not None
+    assert created[0]["deployment"] == "lab.ascend-310p3"
+    assert created[0]["runtime_options"] == {}
+
+
+def test_prepare_policy_forwards_transient_ascend_diagnostics(monkeypatch, tmp_path):
+    created = []
+
+    class Engine(_FakeEngine):
+        def __init__(self, **kwargs):
+            super().__init__()
+            created.append(kwargs)
+
+    monkeypatch.setattr(loss_compare, "PureInferenceEngine", Engine)
+    args = _args(tmp_path)
+    schedule_path = tmp_path / "schedule.json"
+    schedule_path.write_text(
+        json.dumps(
+            {
+                "format": "pi05-denoising-schedule-v1",
+                "name": "test",
+                "algorithm": "euler",
+                "model_output": "velocity",
+                "timesteps": [1.0, 0.0],
+            }
+        )
+    )
+    args.schedule_override_path = str(schedule_path)
+    args.curvature_log_path = "/tmp/curvature.jsonl"
+
+    loss_compare.LossUtils.prepare_policy(SimpleNamespace(args=args))
+
+    assert created[0]["runtime_options"] == {"curvature_log_path": "/tmp/curvature.jsonl"}
+    assert created[0]["registry"] is not None
+
+
+def test_pi05_noise_is_external_and_deterministic_without_noise_dir(monkeypatch, tmp_path):
+    utils = _utils(tmp_path, _FakeEngine())
+    utils.args.noise_dir = ""
+    monkeypatch.setattr(loss_compare, "torch", torch)
+
+    first = utils._resolve_noise(3)
+    torch.manual_seed(999)
+    second = utils._resolve_noise(3)
+
+    assert torch.equal(first, second)
+    assert tuple(first.shape) == (1, 2, 8)
+
+
+def test_pi05_target_generation_requires_noise_persistence(monkeypatch, tmp_path):
+    utils = _utils(tmp_path, _FakeEngine(), generate_target=True)
+    utils.args.noise_dir = ""
+    monkeypatch.setattr(loss_compare, "torch", torch)
+
+    with pytest.raises(RuntimeError, match="noise-dir"):
+        utils._resolve_noise(0)
 
 
 def test_pi05_noise_self_check_uses_metadata_shape_and_resets_each_run(monkeypatch, tmp_path):
@@ -123,3 +200,62 @@ def test_pi05_noise_shape_requires_bundle_metadata(tmp_path):
 
     with pytest.raises(RuntimeError, match="max_action_dim"):
         utils._pi05_noise_shape()
+
+
+def test_load_batches_normalizes_unbatched_json_observations(monkeypatch, tmp_path):
+    utils = _utils(tmp_path, _FakeEngine())
+    batch = {
+        "observation.state": [1, 2, 3, 4, 5, 6],
+        "observation.images.top_view": np.full((2, 3, 3), 255).tolist(),
+        "observation.images.hand_view": np.zeros((2, 3, 3)).tolist(),
+    }
+    (tmp_path / "batches.json").write_text(json.dumps([batch]), encoding="utf-8")
+    monkeypatch.setattr(loss_compare, "np", np)
+
+    loaded = utils.load_batches_as_tensors()[0]
+
+    assert loaded["observation.state"].shape == (1, 6)
+    assert loaded["observation.images.top"].shape == (1, 3, 2, 3)
+    assert loaded["observation.images.wrist"].shape == (1, 3, 2, 3)
+    assert loaded["observation.images.top"].max() == 1.0
+    assert loaded["task"] == "pick"
+
+
+def test_compute_loss_writes_structured_aggregate_metrics_json(monkeypatch, tmp_path):
+    utils = _utils(tmp_path, _FakeEngine(stateful=False))
+    utils.args.metrics_json = str(tmp_path / "reports" / "metrics.json")
+    (tmp_path / "target.json").write_text(json.dumps([[[1.0, 0.0], [1.0, 0.0]]]), encoding="utf-8")
+    (tmp_path / "target_raw.json").write_text(json.dumps([[[1.0, 0.0], [1.0, 0.0]]]), encoding="utf-8")
+    monkeypatch.setattr(loss_compare, "np", np)
+    monkeypatch.setattr(loss_compare, "torch", torch)
+    monkeypatch.setattr(utils, "load_batches_as_tensors", lambda: [{}])
+
+    def forward(_batches):
+        utils._raw_preds = [torch.tensor([[2.0, 0.0], [2.0, 0.0]])]
+        utils._inference_latencies_ms = [12.5]
+        return [torch.tensor([[1.0, 0.0], [1.0, 0.0]])]
+
+    monkeypatch.setattr(utils, "forward", forward)
+    monkeypatch.setattr(
+        "model_utils.pi05_dist_metrics.evaluate_pi05",
+        lambda **_kwargs: {
+            "normalized": {
+                "wasserstein": {"mean_ratio": 0.25},
+                "first_frame": {"mean_cos": 0.75},
+            },
+            "unnormalized": {},
+        },
+    )
+
+    metrics = utils.compute_loss()
+    written = json.loads((tmp_path / "reports" / "metrics.json").read_text(encoding="utf-8"))
+
+    assert metrics == written
+    assert written["inference"]["average_latency_ms"] == 12.5
+    assert written["unnormalized"]["l1"] == 0.0
+    assert written["unnormalized"]["cosine"] == pytest.approx(1.0)
+    assert written["normalized"]["l1"] == 0.5
+    assert written["normalized"]["cosine"] == pytest.approx(1.0)
+    assert written["aggregates"]["raw_l1"] == 0.5
+    assert written["aggregates"]["normalized_mean_w1_std"] == 0.25
+    assert written["aggregates"]["normalized_first_frame_cos"] == 0.75

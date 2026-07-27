@@ -579,17 +579,47 @@ class PI05VLMPytorch(nn.Module):
         pad_masks = []
         att_masks = []
 
-        # Process images
-        for img, img_mask in zip(images, img_masks, strict=True):
+        if not images:
+            raise ValueError("images must not be empty")
+        if len(images) != len(img_masks):
+            raise ValueError(f"images/img_masks length mismatch: {len(images)} != {len(img_masks)}")
 
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+        # Process all cameras as one temporary vision batch, then restore the
+        # camera-major prefix layout expected by the exported model ABI.
+        first_image = images[0]
+        if first_image.ndim == 0:
+            raise ValueError("image tensors must have a batch dimension")
+        num_images = len(images)
+        bsize = first_image.shape[0]
+        image_shape = first_image.shape[1:]
+        image_dtype = first_image.dtype
+        image_device = first_image.device
+        for image_index, image in enumerate(images[1:], start=1):
+            if image.ndim == 0 or image.shape[1:] != image_shape:
+                raise ValueError(
+                    f"image {image_index} shape {tuple(image.shape)} is incompatible with "
+                    f"image 0 shape {tuple(first_image.shape)}"
+                )
+            if image.shape[0] != bsize:
+                raise ValueError(f"image {image_index} batch size {image.shape[0]} != image 0 batch size {bsize}")
+            if image.dtype != image_dtype:
+                raise ValueError(f"image {image_index} dtype {image.dtype} != image 0 dtype {image_dtype}")
+            if image.device != image_device:
+                raise ValueError(f"image {image_index} device {image.device} != image 0 device {image_device}")
 
-            img_emb = self._apply_checkpoint(image_embed_func, img)
-            img_emb = img_emb.to(dtype=torch.float16)
-            bsize, num_img_embs = img_emb.shape[:2]
+        def image_embed_func(img):
+            return self.paligemma_with_expert.embed_image(img)
 
-            embs.append(img_emb)
+        image_batch = torch.stack(images, dim=0).reshape(num_images * bsize, *image_shape)
+        img_emb = self._apply_checkpoint(image_embed_func, image_batch)
+        img_emb = img_emb.to(dtype=torch.float16)
+
+        num_img_embs = img_emb.shape[1]
+        embed_dim = img_emb.shape[2]
+        img_emb = img_emb.reshape(num_images, bsize, num_img_embs, embed_dim)
+
+        for image_index, img_mask in enumerate(img_masks):
+            embs.append(img_emb[image_index])
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
             att_masks += [0] * num_img_embs
 

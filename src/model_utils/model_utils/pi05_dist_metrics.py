@@ -53,6 +53,7 @@ import torch.nn.functional as F
 
 try:
     from scipy.stats import ks_2samp, wasserstein_distance
+
     _HAS_SCIPY = True
 except ImportError:  # pragma: no cover
     _HAS_SCIPY = False
@@ -61,6 +62,7 @@ except ImportError:  # pragma: no cover
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _stack(items) -> np.ndarray:
     """Stack a list of (T,D) or (B,T,D) tensors into a single (N,T,D) ndarray."""
@@ -92,26 +94,27 @@ def _grade(value: float, thresholds, higher_is_better: bool = False) -> str:
 # Method A — marginal Wasserstein-1 per action dim
 # ---------------------------------------------------------------------------
 
+
 def wasserstein_per_dim(preds, targets, space_label: str = "") -> dict:
     """Method A: marginal W1 + KS per action dim. Chaos-robust."""
-    if not _HAS_SCIPY:
-        print("[WARN] scipy not installed; skip Wasserstein metric "
-              "(`pip install scipy`)")
-        return {}
-
     P = _stack(preds)
     T = _stack(targets)
     if P.shape != T.shape:
-        print(f"[WARN] shape mismatch: pred={P.shape} vs target={T.shape}; "
-              f"skip Method A")
+        print(f"[WARN] shape mismatch: pred={P.shape} vs target={T.shape}; skip Method A")
         return {}
     D = P.shape[-1]
 
     p_flat = P.reshape(-1, D)
     t_flat = T.reshape(-1, D)
 
-    w1 = np.array([wasserstein_distance(p_flat[:, d], t_flat[:, d]) for d in range(D)])
-    ks = np.array([ks_2samp(p_flat[:, d], t_flat[:, d]).statistic for d in range(D)])
+    if _HAS_SCIPY:
+        w1 = np.array([wasserstein_distance(p_flat[:, d], t_flat[:, d]) for d in range(D)])
+        ks = np.array([ks_2samp(p_flat[:, d], t_flat[:, d]).statistic for d in range(D)])
+    else:  # Equal-sized samples make both empirical metrics straightforward in NumPy.
+        sorted_pred = np.sort(p_flat, axis=0)
+        sorted_target = np.sort(t_flat, axis=0)
+        w1 = np.mean(np.abs(sorted_pred - sorted_target), axis=0)
+        ks = np.array([_ks_statistic(sorted_pred[:, d], sorted_target[:, d]) for d in range(D)])
 
     # Per-dim drift ratio: W1 normalized by target std.  This makes the metric
     # scale-invariant -- a value of 0.1 means "W1 is one tenth of the spread of
@@ -126,8 +129,7 @@ def wasserstein_per_dim(preds, targets, space_label: str = "") -> dict:
     print("  (Compares value distributions per dim. Insensitive to ODE chaos.)")
     print(f"  {'dim':>4} {'W1':>12} {'tgt_std':>12} {'W1/std':>10} {'KS':>10}")
     for d in range(D):
-        print(f"  {d:>4} {w1[d]:>12.5f} {t_std[d]:>12.5f} "
-              f"{ratio[d]:>10.5f} {ks[d]:>10.5f}")
+        print(f"  {d:>4} {w1[d]:>12.5f} {t_std[d]:>12.5f} {ratio[d]:>10.5f} {ks[d]:>10.5f}")
     print("  ---")
     mean_w1 = float(w1.mean())
     max_w1 = float(w1.max())
@@ -135,17 +137,22 @@ def wasserstein_per_dim(preds, targets, space_label: str = "") -> dict:
     max_ratio = float(ratio.max())
     mean_ks = float(ks.mean())
     print(f"  mean W1 = {mean_w1:.5f}   max W1 = {max_w1:.5f}   mean KS = {mean_ks:.5f}")
-    print(f"  mean W1/std = {mean_ratio:.5f}   max W1/std = {max_ratio:.5f}  "
-          f"<-- scale-invariant; same scale in both spaces")
+    print(
+        f"  mean W1/std = {mean_ratio:.5f}   max W1/std = {max_ratio:.5f}  "
+        f"<-- scale-invariant; same scale in both spaces"
+    )
 
     # Verdict on the SCALE-INVARIANT ratio so it's meaningful in both
     # normalized and unnormalized spaces.
-    grade = _grade(mean_ratio, [
-        ("EXCELLENT  (deployable)",  0.05),
-        ("GOOD       (minor shift)", 0.15),
-        ("MARGINAL   (investigate)", 0.30),
-        ("POOR       (drift)",       float("inf")),
-    ])
+    grade = _grade(
+        mean_ratio,
+        [
+            ("EXCELLENT  (deployable)", 0.05),
+            ("GOOD       (minor shift)", 0.15),
+            ("MARGINAL   (investigate)", 0.30),
+            ("POOR       (drift)", float("inf")),
+        ],
+    )
     print(f"  Verdict: [{grade}]   (based on mean W1/std)")
     print("  Criteria (scale-invariant, applies to both spaces):")
     print("    W1/std <= 0.05   EXCELLENT  -- drift << distribution spread")
@@ -153,23 +160,33 @@ def wasserstein_per_dim(preds, targets, space_label: str = "") -> dict:
     print("    W1/std <= 0.30   MARGINAL   -- drift ~ 1/3 of std, investigate")
     print("    W1/std >  0.30   POOR       -- drift comparable to std")
     return {
-        "mean_w1": mean_w1, "max_w1": max_w1,
-        "mean_ratio": mean_ratio, "max_ratio": max_ratio,
-        "mean_ks": mean_ks, "verdict": grade,
+        "mean_w1": mean_w1,
+        "max_w1": max_w1,
+        "mean_ratio": mean_ratio,
+        "max_ratio": max_ratio,
+        "mean_ks": mean_ks,
+        "verdict": grade,
     }
+
+
+def _ks_statistic(sorted_pred: np.ndarray, sorted_target: np.ndarray) -> float:
+    values = np.concatenate((sorted_pred, sorted_target))
+    pred_cdf = np.searchsorted(sorted_pred, values, side="right") / sorted_pred.size
+    target_cdf = np.searchsorted(sorted_target, values, side="right") / sorted_target.size
+    return float(np.max(np.abs(pred_cdf - target_cdf)))
 
 
 # ---------------------------------------------------------------------------
 # Method C — first-frame cosine (control-relevant)
 # ---------------------------------------------------------------------------
 
+
 def first_frame_cosine(preds, targets, space_label: str = "") -> dict:
     """Method C: cosine sim on chunk[:, 0, :] only — the frame actually executed."""
     P = _stack(preds)
     T = _stack(targets)
     if P.shape != T.shape:
-        print(f"[WARN] shape mismatch: pred={P.shape} vs target={T.shape}; "
-              f"skip Method C")
+        print(f"[WARN] shape mismatch: pred={P.shape} vs target={T.shape}; skip Method C")
         return {}
 
     Pt = torch.from_numpy(P[:, 0, :])  # (N, D)
@@ -178,22 +195,25 @@ def first_frame_cosine(preds, targets, space_label: str = "") -> dict:
     l1 = (Pt - Tt).abs().mean(dim=-1).numpy()
 
     print(f"\n--- Method C: first-frame cosine {space_label} ---")
-    print("  (Receding-horizon control only executes chunk[:, 0]; "
-          "rest is overwritten by the next inference.)")
+    print("  (Receding-horizon control only executes chunk[:, 0]; rest is overwritten by the next inference.)")
     print(f"  {'sample':>6} {'cos':>10} {'L1':>10}")
-    for i, (c, l) in enumerate(zip(cos, l1)):
-        print(f"  {i:>6} {c:>10.5f} {l:>10.5f}")
+    for i, (cosine, l1_value) in enumerate(zip(cos, l1, strict=True)):
+        print(f"  {i:>6} {cosine:>10.5f} {l1_value:>10.5f}")
     print("  ---")
     mean_cos = float(cos.mean())
     min_cos = float(cos.min())
     print(f"  mean cos = {mean_cos:.5f}   min cos = {min_cos:.5f}")
 
-    grade = _grade(mean_cos, [
-        ("EXCELLENT", 0.95),
-        ("GOOD",      0.80),
-        ("MARGINAL",  0.50),
-        ("POOR",      -float("inf")),
-    ], higher_is_better=True)
+    grade = _grade(
+        mean_cos,
+        [
+            ("EXCELLENT", 0.95),
+            ("GOOD", 0.80),
+            ("MARGINAL", 0.50),
+            ("POOR", -float("inf")),
+        ],
+        higher_is_better=True,
+    )
     print(f"  Verdict: [{grade}]")
     print("  Criteria (first-frame cosine, control-relevant):")
     print("    cos >= 0.95   EXCELLENT  -- executed action nearly identical")
@@ -207,8 +227,9 @@ def first_frame_cosine(preds, targets, space_label: str = "") -> dict:
 # Top-level entry used by loss_compare.py
 # ---------------------------------------------------------------------------
 
-def evaluate_pi05(preds, targets, raw_preds=None, raw_targets=None) -> None:
-    """Print the full PI05 distributional evaluation report.
+
+def evaluate_pi05(preds, targets, raw_preds=None, raw_targets=None) -> dict:
+    """Print and return the full PI05 distributional evaluation report.
 
     Parameters
     ----------
@@ -224,18 +245,24 @@ def evaluate_pi05(preds, targets, raw_preds=None, raw_targets=None) -> None:
     print(" (per-sample cosine similarity is misleading on chaotic ODEs)")
     print("=" * 72)
 
+    result = {"normalized": {}, "unnormalized": {}}
     if raw_preds is not None and raw_targets is not None and len(raw_preds) > 0:
         print("\n>>> Normalized action space (pre-postprocessor) <<<")
         print("    Verdict thresholds are calibrated for this space.")
-        wasserstein_per_dim(raw_preds, raw_targets, space_label="(normalized)")
-        first_frame_cosine(raw_preds, raw_targets, space_label="(normalized)")
+        result["normalized"] = {
+            "wasserstein": wasserstein_per_dim(raw_preds, raw_targets, space_label="(normalized)"),
+            "first_frame": first_frame_cosine(raw_preds, raw_targets, space_label="(normalized)"),
+        }
 
     print("\n>>> Unnormalized action space (post-postprocessor) <<<")
     print("    Numbers are in physical units; absolute thresholds are heuristic.")
-    wasserstein_per_dim(preds, targets, space_label="(unnormalized)")
-    first_frame_cosine(preds, targets, space_label="(unnormalized)")
+    result["unnormalized"] = {
+        "wasserstein": wasserstein_per_dim(preds, targets, space_label="(unnormalized)"),
+        "first_frame": first_frame_cosine(preds, targets, space_label="(unnormalized)"),
+    }
 
     print("\n" + "=" * 72)
     print(" Note: for final deployment validation, also run a task-level")
     print(" success-rate evaluation on simulator or real robot.")
     print("=" * 72 + "\n")
+    return result

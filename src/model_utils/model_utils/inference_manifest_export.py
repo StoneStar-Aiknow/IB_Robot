@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import fcntl
+import filecmp
+import importlib
 import json
 import shutil
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from uuid import uuid4
 
 import onnx
 
@@ -27,7 +33,6 @@ from inference_manifest import (
     load_inference_manifest,
     load_policy_metadata,
     normalize_bundle_path,
-    sha256_file,
     write_inference_manifest,
 )
 from inference_manifest.json_utils import load_json_strict
@@ -66,6 +71,23 @@ class RuntimeABI:
     outputs: tuple[RuntimeTensor, ...]
 
 
+_ACL_DTYPES = {
+    0: "float32",
+    1: "float16",
+    2: "int8",
+    3: "int32",
+    4: "uint8",
+    6: "int16",
+    7: "uint16",
+    8: "uint32",
+    9: "int64",
+    10: "uint64",
+    11: "float64",
+    12: "bool",
+    27: "bfloat16",
+}
+
+
 def read_onnx_abi(path: str | Path) -> RuntimeABI:
     """Read the positional tensor ABI from an ONNX graph."""
 
@@ -94,6 +116,107 @@ def read_runtime_abi(path: str | Path) -> RuntimeABI:
         inputs=_parse_runtime_tensors(value.get("inputs"), "inputs", metadata_path),
         outputs=_parse_runtime_tensors(value.get("outputs"), "outputs", metadata_path),
     )
+
+
+def write_acl_om_abi(
+    om_path: str | Path,
+    output_path: str | Path,
+    *,
+    device_id: int = 0,
+    acl_config_path: str | None = None,
+) -> Path:
+    """Lazily import ACL, inspect an OM descriptor, and write runtime ABI JSON."""
+
+    model_path = Path(om_path).expanduser().resolve(strict=True)
+    destination = Path(output_path).expanduser().resolve()
+    acl = importlib.import_module("acl")
+    desc = None
+    model_id = None
+    context = None
+    initialized = False
+    device_set = False
+    pending_error: Exception | None = None
+    try:
+        _acl_check(acl.init(acl_config_path) if acl_config_path else acl.init(), "acl.init")
+        initialized = True
+        _acl_check(acl.rt.set_device(device_id), "acl.rt.set_device")
+        device_set = True
+        context = _acl_result(acl.rt.create_context(device_id), "acl.rt.create_context")
+        _acl_check(acl.rt.set_context(context), "acl.rt.set_context")
+        model_id = _acl_result(acl.mdl.load_from_file(str(model_path)), "acl.mdl.load_from_file")
+        desc = acl.mdl.create_desc()
+        if desc is None:
+            raise RuntimeError("acl.mdl.create_desc returned no descriptor")
+        _acl_check(acl.mdl.get_desc(desc, model_id), "acl.mdl.get_desc")
+        value = {
+            "inputs": _acl_tensors(acl, desc, "input"),
+            "outputs": _acl_tensors(acl, desc, "output"),
+        }
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+        read_runtime_abi(destination)
+        return destination
+    except Exception as exc:
+        pending_error = exc
+        raise
+    finally:
+        cleanup_errors: list[str] = []
+        if desc is not None:
+            try:
+                acl.mdl.destroy_desc(desc)
+            except Exception as exc:
+                cleanup_errors.append(f"acl.mdl.destroy_desc: {exc}")
+        if model_id is not None:
+            try:
+                acl.mdl.unload(model_id)
+            except Exception as exc:
+                cleanup_errors.append(f"acl.mdl.unload: {exc}")
+        if context is not None:
+            try:
+                acl.rt.destroy_context(context)
+            except Exception as exc:
+                cleanup_errors.append(f"acl.rt.destroy_context: {exc}")
+        if device_set:
+            try:
+                acl.rt.reset_device(device_id)
+            except Exception as exc:
+                cleanup_errors.append(f"acl.rt.reset_device: {exc}")
+        if initialized:
+            try:
+                acl.finalize()
+            except Exception as exc:
+                cleanup_errors.append(f"acl.finalize: {exc}")
+        if cleanup_errors and pending_error is None:
+            raise RuntimeError("; ".join(cleanup_errors))
+
+
+def _acl_tensors(acl: object, desc: object, direction: str) -> list[dict[str, object]]:
+    count = getattr(acl.mdl, f"get_num_{direction}s")(desc)
+    tensors = []
+    for index in range(count):
+        name = getattr(acl.mdl, f"get_{direction}_name_by_index")(desc, index)
+        dims = _acl_result(getattr(acl.mdl, f"get_{direction}_dims")(desc, index), f"ACL {direction} dims")
+        shape = dims.get("dims") if isinstance(dims, dict) else dims
+        dtype_code = getattr(acl.mdl, f"get_{direction}_data_type")(desc, index)
+        try:
+            dtype = _ACL_DTYPES[dtype_code]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported ACL dtype code {dtype_code!r} for {direction} {name!r}") from exc
+        tensors.append({"name": name, "index": index, "dtype": dtype, "shape": list(shape)})
+    return tensors
+
+
+def _acl_result(value: object, operation: str) -> object:
+    if isinstance(value, tuple) and len(value) == 2:
+        result, status = value
+        _acl_check(status, operation)
+        return result
+    return value
+
+
+def _acl_check(status: object, operation: str) -> None:
+    if status not in (None, 0):
+        raise RuntimeError(f"{operation} failed with ACL status {status}")
 
 
 def read_tcim_abi(path: str | Path) -> RuntimeABI:
@@ -131,8 +254,14 @@ def artifact_bindings(
     )
 
 
-def deployment_artifact(bundle_root: str | Path, path: str | Path, artifact_format: str) -> DeploymentArtifact:
-    """Create a hashed artifact whose path is safely contained by the bundle."""
+def deployment_artifact(
+    bundle_root: str | Path,
+    path: str | Path,
+    artifact_format: str,
+    *,
+    share_group: str | None = None,
+) -> DeploymentArtifact:
+    """Create a structural artifact descriptor safely contained by the bundle."""
 
     root = Path(bundle_root).expanduser().resolve(strict=True)
     artifact_path = Path(path).expanduser()
@@ -148,7 +277,7 @@ def deployment_artifact(bundle_root: str | Path, path: str | Path, artifact_form
     return DeploymentArtifact(
         path=normalize_bundle_path(relative),
         format=artifact_format,
-        sha256=sha256_file(artifact_path),
+        share_group=share_group,
     )
 
 
@@ -161,28 +290,26 @@ def package_deployment_artifact(
     role: str,
     force_copy: bool = False,
 ) -> Path:
-    """Copy a compiler output into the canonical artifact tree when needed."""
+    """Copy a compiler output into one immutable artifact generation when needed."""
 
     root = Path(bundle_root).expanduser().resolve(strict=True)
     source = Path(source_path).expanduser().resolve(strict=True)
     if not source.is_file():
         raise ValueError(f"Deployment artifact is not a regular file: {source}")
+    del force_copy  # Kept for CLI compatibility; normal publication always creates a generation.
+    suffix = "".join(source.suffixes)
+    generation = str(uuid4())
+    relative = normalize_bundle_path(f"artifacts/{backend}/{deployment_name}/generations/{generation}/{role}{suffix}")
+    destination = root.joinpath(*relative.split("/"))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid4()}.tmp")
     try:
-        source.relative_to(root)
-        contained = True
-    except ValueError:
-        contained = False
-    if force_copy or not contained:
-        suffix = "".join(source.suffixes)
-        digest = sha256_file(source)
-        relative = normalize_bundle_path(f"artifacts/{backend}/{deployment_name}/{role}-{digest[:12]}{suffix}")
-        destination = root.joinpath(*relative.split("/"))
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if source == destination:
-            return source
-        shutil.copy2(source, destination)
-        return destination
-    return source
+        shutil.copy2(source, temporary)
+        temporary.replace(destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return destination
 
 
 def compiled_deployment(
@@ -195,14 +322,21 @@ def compiled_deployment(
     execution: Sequence[str],
     bindings: Mapping[str, ArtifactBindings],
     device_links: Sequence[DeviceLink] = (),
+    artifact_share_groups: Mapping[str, str] | None = None,
 ) -> CompiledDeployment:
-    """Build a typed compiled deployment with current artifact hashes."""
+    """Build a typed compiled deployment from structural artifact descriptors."""
 
+    share_groups = dict(artifact_share_groups or {})
     return CompiledDeployment(
         backend=backend,
         target=DeploymentTarget(soc=target_soc, runtime=target_runtime),
         artifacts={
-            role: deployment_artifact(bundle_root, path, artifact_format)
+            role: deployment_artifact(
+                bundle_root,
+                path,
+                artifact_format,
+                share_group=share_groups.get(role),
+            )
             for role, (path, artifact_format) in artifacts.items()
         },
         execution=tuple(execution),
@@ -218,12 +352,61 @@ def upsert_deployment(
     *,
     bundle_name: str | None = None,
 ) -> ValidatedManifest:
+    """Atomically update one deployment under a bundle-local writer lock."""
+
+    root = Path(bundle_root).expanduser().resolve(strict=True)
+    with _manifest_lock(root):
+        return _upsert_deployment_unlocked(root, deployment_name, deployment, bundle_name=bundle_name)
+
+
+def update_deployment(
+    bundle_root: str | Path,
+    deployment_name: str,
+    deployment: Deployment,
+    *,
+    expected_uuid: str,
+    expected_revision: int,
+) -> ValidatedManifest:
+    """Publish a deployment only if its lineage still matches the caller's snapshot."""
+
+    root = Path(bundle_root).expanduser().resolve(strict=True)
+    with _manifest_lock(root):
+        existing = _load_existing_manifest(root / "inference_manifest.json")
+        if existing is None or deployment_name not in existing.deployments:
+            raise ValueError(f"Deployment {deployment_name!r} no longer exists")
+        current = existing.deployments[deployment_name]
+        if current.uuid != expected_uuid or current.revision != expected_revision:
+            raise ValueError(
+                f"Deployment {deployment_name!r} revision conflict: expected "
+                f"{expected_uuid}@{expected_revision}, got {current.uuid}@{current.revision}"
+            )
+        return _upsert_deployment_unlocked(root, deployment_name, deployment)
+
+
+def _upsert_deployment_unlocked(
+    bundle_root: str | Path,
+    deployment_name: str,
+    deployment: Deployment,
+    *,
+    bundle_name: str | None = None,
+) -> ValidatedManifest:
     """Write one deployment and prove the production strict loader accepts it."""
 
     root = Path(bundle_root).expanduser().resolve(strict=True)
     manifest_path = root / "inference_manifest.json"
     existing = _load_existing_manifest(manifest_path)
     deployments = dict(existing.deployments) if existing is not None else {}
+    previous_deployment = deployments.get(deployment_name)
+    if previous_deployment is not None:
+        previous_value = previous_deployment.model_dump(mode="json", exclude={"uuid", "revision"})
+        candidate_value = deployment.model_dump(mode="json", exclude={"uuid", "revision"})
+        deployment = (
+            previous_deployment
+            if previous_value == candidate_value
+            else deployment.model_copy(
+                update={"uuid": previous_deployment.uuid, "revision": previous_deployment.revision + 1}
+            )
+        )
     deployments[deployment_name] = deployment
 
     require_native_weights = any(candidate.backend == "torch" for candidate in deployments.values())
@@ -234,19 +417,33 @@ def upsert_deployment(
             "Unified manifest finalization requires all semantic dependencies to be local bundle assets; "
             f"vendor these references inside the bundle and update the LeRobot metadata: {dependencies}"
         )
-    bundle_files = tuple(
-        BundleFile(path=path, sha256=sha256_file(root.joinpath(*path.split("/")))) for path in policy.required_files
-    )
+    bundle_files = tuple(BundleFile(path=path) for path in policy.required_files)
     name = bundle_name or (existing.bundle.name if existing is not None else root.name)
+    if existing is None:
+        bundle_uuid = str(uuid4())
+        bundle_revision = 1
+    else:
+        bundle_uuid = existing.bundle.uuid
+        previous_structure = (existing.bundle.name, tuple(entry.path for entry in existing.bundle.files))
+        candidate_structure = (name, tuple(entry.path for entry in bundle_files))
+        bundle_revision = existing.bundle.revision + (candidate_structure != previous_structure)
     manifest = InferenceManifest(
-        schema_version=1,
+        schema_version=2,
         bundle=ManifestBundle(
+            uuid=bundle_uuid,
+            revision=bundle_revision,
             name=name,
             files=bundle_files,
-            digest=Digest(algorithm="sha256", value=canonical_bundle_digest(bundle_files)),
+            digest=Digest(
+                algorithm="sha256",
+                scope="structure",
+                value=canonical_bundle_digest(bundle_uuid, bundle_revision, name, bundle_files),
+            ),
         ),
         deployments=deployments,
     )
+    if existing is not None and manifest == existing:
+        return load_inference_manifest(root, deployment_name)
     try:
         write_inference_manifest(manifest_path, manifest)
         validated_deployments = {name: load_inference_manifest(root, name) for name in sorted(deployments)}
@@ -259,19 +456,120 @@ def upsert_deployment(
     return validated_deployments[deployment_name]
 
 
+@contextmanager
+def _manifest_lock(root: Path):
+    lock_path = root / ".inference_manifest.lock"
+    with lock_path.open("a+b") as stream:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def copy_policy_metadata_bundle(source_root: str | Path, destination_root: str | Path) -> tuple[str, ...]:
-    """Copy required read-only LeRobot semantic files into a compiled bundle."""
+    """Transactionally publish required LeRobot semantic files."""
 
     source = Path(source_root).expanduser().resolve(strict=True)
     destination = Path(destination_root).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
     policy = load_policy_metadata(source, require_native_weights=False)
-    for relative in policy.required_files:
-        source_path = source.joinpath(*relative.split("/"))
-        destination_path = destination.joinpath(*relative.split("/"))
-        destination_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_path, destination_path)
+    with TemporaryDirectory(prefix=".metadata-stage-", dir=destination) as temporary:
+        staging = Path(temporary) / "new"
+        backup = Path(temporary) / "old"
+        for relative in policy.required_files:
+            source_path = source.joinpath(*relative.split("/"))
+            staged_path = staging.joinpath(*relative.split("/"))
+            staged_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, staged_path)
+
+        with _manifest_lock(destination):
+            changed = tuple(
+                relative
+                for relative in policy.required_files
+                if not _same_file(staging.joinpath(*relative.split("/")), destination.joinpath(*relative.split("/")))
+            )
+            if not changed:
+                return policy.required_files
+
+            previously_missing: set[str] = set()
+            for relative in changed:
+                current = destination.joinpath(*relative.split("/"))
+                if current.is_file():
+                    saved = backup.joinpath(*relative.split("/"))
+                    saved.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(current, saved)
+                else:
+                    previously_missing.add(relative)
+
+            try:
+                for relative in changed:
+                    _atomic_copy(staging.joinpath(*relative.split("/")), destination.joinpath(*relative.split("/")))
+                if (destination / "inference_manifest.json").is_file():
+                    _refresh_bundle_revision_unlocked(destination)
+            except Exception:
+                for relative in changed:
+                    current = destination.joinpath(*relative.split("/"))
+                    if relative in previously_missing:
+                        current.unlink(missing_ok=True)
+                    else:
+                        _atomic_copy(backup.joinpath(*relative.split("/")), current)
+                raise
     return policy.required_files
+
+
+def refresh_bundle_revision(bundle_root: str | Path) -> InferenceManifest:
+    """Publish one new bundle revision after semantic assets were deliberately replaced."""
+
+    root = Path(bundle_root).expanduser().resolve(strict=True)
+    with _manifest_lock(root):
+        return _refresh_bundle_revision_unlocked(root)
+
+
+def _refresh_bundle_revision_unlocked(root: Path) -> InferenceManifest:
+    manifest_path = root / "inference_manifest.json"
+    existing = _load_existing_manifest(manifest_path)
+    if existing is None:
+        raise ValueError(f"Cannot refresh a bundle without inference_manifest.json: {root}")
+    require_native_weights = any(candidate.backend == "torch" for candidate in existing.deployments.values())
+    policy = load_policy_metadata(root, require_native_weights=require_native_weights)
+    bundle_files = tuple(BundleFile(path=path) for path in policy.required_files)
+    revision = existing.bundle.revision + 1
+    bundle = ManifestBundle(
+        uuid=existing.bundle.uuid,
+        revision=revision,
+        name=existing.bundle.name,
+        files=bundle_files,
+        digest=Digest(
+            algorithm="sha256",
+            scope="structure",
+            value=canonical_bundle_digest(existing.bundle.uuid, revision, existing.bundle.name, bundle_files),
+        ),
+    )
+    manifest = existing.model_copy(update={"bundle": bundle})
+    try:
+        write_inference_manifest(manifest_path, manifest)
+        for deployment_name in sorted(manifest.deployments):
+            load_inference_manifest(root, deployment_name)
+    except Exception:
+        write_inference_manifest(manifest_path, existing)
+        raise
+    return manifest
+
+
+def _same_file(source: Path, destination: Path) -> bool:
+    return destination.is_file() and filecmp.cmp(source, destination, shallow=False)
+
+
+def _atomic_copy(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.{uuid4()}.tmp")
+    try:
+        shutil.copy2(source, temporary)
+        temporary.replace(destination)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _onnx_tensor(value: object, index: int, path: Path) -> RuntimeTensor:

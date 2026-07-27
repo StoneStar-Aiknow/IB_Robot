@@ -135,7 +135,9 @@ def test_write_smolvla_rknn_deployment_packages_multi_camera_execution(tmp_path)
         "action",
         "state_projection",
     }
-    assert validated.deployment.artifacts["vision_top"].path != validated.deployment.artifacts["vision_wrist"].path
+    assert validated.deployment.artifacts["vision_top"].path == validated.deployment.artifacts["vision_wrist"].path
+    assert validated.deployment.artifacts["vision_top"].share_group == "vision"
+    assert validated.deployment.artifacts["vision_wrist"].share_group == "vision"
     assert tuple(binding.semantic for binding in validated.deployment.bindings["action"].inputs[-2:]) == (
         "internal.past_key.0",
         "internal.past_value.0",

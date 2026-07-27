@@ -169,14 +169,22 @@ def test_ros_transport_matching_startup_and_inference_metadata(tmp_path):
 @pytest.mark.parametrize(
     ("field", "code"),
     [
+        ("bundle_uuid", "bundle_uuid_mismatch"),
+        ("bundle_revision", "bundle_revision_mismatch"),
         ("bundle_digest", "bundle_digest_mismatch"),
         ("deployment_name", "deployment_mismatch"),
+        ("deployment_uuid", "deployment_uuid_mismatch"),
+        ("deployment_revision", "deployment_revision_mismatch"),
         ("deployment_fingerprint", "deployment_fingerprint_mismatch"),
     ],
 )
 def test_ros_transport_rejects_bundle_and_deployment_mismatches(tmp_path, field, code):
     edge_identity = _identity(tmp_path / "bundle")
-    cloud_identity = replace(edge_identity, **{field: f"different-{field}"})
+    current = getattr(edge_identity, field)
+    cloud_identity = replace(
+        edge_identity,
+        **{field: current + 1 if isinstance(current, int) else f"different-{field}"},
+    )
     runtime = _MockCloudRuntime()
     edge = EdgeSession(edge_identity)
     cloud = DistributedCloudService(cloud_identity, runtime)
