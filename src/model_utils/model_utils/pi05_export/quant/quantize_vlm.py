@@ -57,6 +57,27 @@ _DEFAULT_DROP_KEYS: set[str] = {
     "observation.images.side_view_right",
 }
 
+
+def _resize_calibration_images(feed: dict[str, np.ndarray], onnx_path: Path) -> None:
+    """Match preprocessed camera tensors to static VLM ONNX image shapes."""
+    import onnx
+
+    from inference_service.pi05_image_preprocess import resize_with_pad_nchw_numpy
+
+    model = onnx.load(str(onnx_path), load_external_data=False)
+    for model_input in model.graph.input:
+        name = model_input.name
+        if not name.startswith("observation.images.") or name not in feed:
+            continue
+        dims = model_input.type.tensor_type.shape.dim
+        if len(dims) != 4 or not dims[-2].HasField("dim_value") or not dims[-1].HasField("dim_value"):
+            raise ValueError(f"VLM ONNX image input {name!r} must have static NCHW spatial dimensions")
+        height, width = int(dims[-2].dim_value), int(dims[-1].dim_value)
+        image = np.asarray(feed[name], dtype=np.float32)
+        if image.shape[-2:] != (height, width):
+            feed[name] = resize_with_pad_nchw_numpy(image, height, width)
+
+
 # Regexes (case-insensitive, matched against ONNX node *name*) whose nodes are
 # kept in fp16 by default. Tune for your exported graph via --list-nodes first.
 _DEFAULT_DISABLE_REGEXES: tuple[str, ...] = (
@@ -72,6 +93,9 @@ _DEFAULT_DISABLE_REGEXES: tuple[str, ...] = (
     #    anchors avoid hitting q_proj/k_proj/v_proj/o_proj (those stay int8).
     r"rotary_emb",
     r"self_attn/MatMul(_\d+)?$",
+    # NPU export fuses gate_proj + up_proj into one [up;gate] MatMul feeding
+    # NPUGeglu, so Route A cannot transplant their separate donor int8 nodes.
+    r"mlp/(gate_proj|up_proj)/MatMul",
 )
 
 
@@ -149,6 +173,7 @@ def build_calib_data(
     calib_data: list[list[np.ndarray]] = []
     for batch in preprocessed:
         feed = _build_vlm_onnx_feed(batch, valid_names)
+        _resize_calibration_images(feed, onnx_path)
         if need_prefix_mask and mask_input not in feed:
             lang_masks_np = batch[OBS_LANGUAGE_ATTENTION_MASK].cpu().numpy().astype(bool)
             feed[mask_input] = build_prefix_att_2d_masks_4d_np(
@@ -270,6 +295,9 @@ def main() -> int:
         amp_num=args.amp_num,
         npu_graph=npu_graph_path,
     )
+    if not output_path.is_file():
+        raise RuntimeError(f"msModelSlim reported success but did not produce {output_path}")
+    common.load_onnx(output_path)
 
     LOGGER.info(
         "Done. Next: ATC-compile %s on the board, then run verify_vlm_cpu_vs_om.py "

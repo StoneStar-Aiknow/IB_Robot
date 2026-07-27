@@ -2,7 +2,7 @@
 # Licensed under the Mulan PSL v2.
 """Dump PyTorch VLM outputs for a single batch.
 
-Pairs with :class:`PI05OMModel`'s ``PI05_OM_DUMP_VLM`` machinery.
+Pairs with the explicit manifest-driven ``pi05-om-dump`` diagnostic command.
 
 Given the SAME ``batches.json`` file used by ``loss_compare.py`` and a
 trained PI05 checkpoint, this script:
@@ -22,9 +22,9 @@ Usage (on a GPU/CPU machine, no ``acl`` required):
         --out-dir     /tmp/pt_vlm_dump_0 \\
         --device      cuda
 
-Then on the NPU machine, run loss_compare with
-``PI05_OM_DUMP_VLM=/tmp/om_vlm_dump_0`` so PI05OMModel dumps the *same*
-batch's OM outputs.
+Then run ``pi05-om-dump`` on the NPU machine with the same batch and noise
+seed. The command uses the selected unified Ascend deployment and never
+enables dumping through production-runtime environment variables.
 
 Compare with::
 
@@ -150,7 +150,7 @@ def dump(
     torch.manual_seed(42 + batch_index)
 
     # ------------------------------------------------------------------
-    # Dump VLM inputs (file names match dump_vlm_ort.py / PI05OMModel)
+    # Dump VLM inputs using names shared by the PT, ORT, and OM diagnostics.
     # so the three sources can be diff'd directly.  Done BEFORE
     # select_action so we capture the exact tensors that get fed to the
     # OM/ONNX graph (resize+normalize happens inside the graph).

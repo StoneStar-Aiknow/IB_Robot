@@ -18,8 +18,8 @@
 π0.5 Action Expert part — denoising / action generation only.
 
 This module is the Action Expert half of the PI05 model split for deployment.
-It receives a KV cache (from the VLM part) + state + time + noise,
-and performs a single Euler denoising step to produce actions.
+It receives a KV cache (from the VLM part) + time + noise and predicts the
+denoising velocity integrated by the deployment runtime.
 
 Original full model: modeling_pi05.py
 """
@@ -576,28 +576,18 @@ class PI05ActionExpertPytorch(nn.Module):
 
     @torch.no_grad()
     def sample_actions(self, past_kv_tensor, prefix_pad_masks, time, noise) -> Tensor:
-        """Perform a single Euler denoising step using KV cache from VLM."""
+        """Return denoising velocity for one timestep using KV cache from VLM."""
         bsize = noise.shape[0]
-        device = noise.device
 
         past_key_values = unflatten_kv(past_kv_tensor)
 
-        dt = -1.0 / self.config.num_inference_steps
-        dt = torch.tensor(dt, dtype=torch.float16, device=device)
-
-        x_t = noise
-
         expanded_time = time.expand(bsize)
-        v_t = self.denoise_step(
+        return self.denoise_step(
             prefix_pad_masks,
             past_key_values,
-            x_t,
+            noise,
             expanded_time,
         )
-
-        # Single Euler step
-        x_t = x_t + dt * v_t
-        return x_t
 
     def denoise_step(
         self,
@@ -649,7 +639,7 @@ class PI05ActionExpertPytorch(nn.Module):
 
 
 class PI05ActionExpertPolicy(PreTrainedPolicy):
-    """PI05 Action Expert Policy — takes KV cache, outputs actions."""
+    """PI05 Action Expert Policy — takes KV cache and outputs velocity."""
 
     config_class = PI05Config
     name = "pi05"
@@ -906,7 +896,7 @@ class PI05ActionExpertPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        """Perform a single denoising step given KV cache from VLM.
+        """Predict denoising velocity given KV cache from VLM.
 
         Expected batch keys:
         - past_kv_tensor: KV cache from VLM part
@@ -920,14 +910,13 @@ class PI05ActionExpertPolicy(PreTrainedPolicy):
         time = batch["time"]
         noise = batch["noise"]
 
-        actions = self.model.sample_actions(past_kv_tensor, prefix_pad_masks, time, noise=noise)
-        return actions
+        return self.model.sample_actions(past_kv_tensor, prefix_pad_masks, time, noise=noise)
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
         """Not applicable for action-expert-only part without full denoising loop."""
         raise NotImplementedError(
-            "Action Expert performs single denoising steps. Use select_action in a loop for full denoising."
+            "Action Expert predicts velocity. Integrate select_action outputs in a denoising loop."
         )
 
     def forward(self, batch: dict[str, Tensor], teacher_policy=None) -> tuple[Tensor, dict]:

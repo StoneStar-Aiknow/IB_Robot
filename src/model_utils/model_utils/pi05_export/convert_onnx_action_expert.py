@@ -8,10 +8,10 @@
 # EITHER EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT,
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
-"""Export PI05 Action Expert to ONNX and emit the Ascend OM manifest entry.
+"""Export PI05 Action Expert velocity prediction to ONNX.
 
 The Action Expert takes KV cache (from the VLM part) + time + noise,
-and performs a single Euler denoising step to produce actions.
+and predicts the velocity integrated by the deployment backend.
 
 Note: Unlike PI0, PI05's action expert does NOT take state as input.
       It uses adaRMS conditioning from time embeddings instead.
@@ -345,8 +345,8 @@ class ONNXWrapper(torch.nn.Module):
                 input_dict[key] = tensor.to(self._dtype_for(key))
 
         with torch.no_grad():
-            actions = self.policy.select_action(input_dict)
-            return actions
+            velocity = self.policy.select_action(input_dict)
+            return velocity
 
 
 def main() -> int:
@@ -487,7 +487,7 @@ def main() -> int:
             opset_version=actual_opset,
             verbose=False,
             input_names=dummy_keys,
-            output_names=["action"],
+            output_names=["velocity"],
             do_constant_folding=bool(args.constant_folding),
             dynamo=bool(args.dynamo),
             external_data=True,
