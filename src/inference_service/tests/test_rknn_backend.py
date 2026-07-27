@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest, sha256_file
+from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
 from inference_manifest.models import DeviceLink
 from inference_service.backends import (
     BACKEND_REGISTRY,
@@ -21,7 +21,7 @@ from inference_service.backends import (
 from inference_service.backends.rknn import RKNNBackend, create_backend
 from inference_service.codecs import create_policy_codec
 from inference_service.pipeline import InferencePipeline
-from tests.manifest_fixtures import create_policy_bundle, write_manifest
+from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID, create_policy_bundle, write_manifest
 
 
 @dataclass(frozen=True)
@@ -84,19 +84,27 @@ class FakeRKNNEnvironment:
 
 
 def _bundle_entries(root: Path, paths: tuple[str, ...]) -> list[BundleFile]:
-    return [BundleFile(path=path, sha256=sha256_file(root / path)) for path in paths]
+    del root
+    return [BundleFile(path=path) for path in paths]
 
 
 def _write_compiled_manifest(root: Path, bundle_paths: tuple[str, ...], deployment: dict) -> None:
     entries = _bundle_entries(root, bundle_paths)
+    deployment = {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, **deployment}
     write_manifest(
         root,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "bundle": {
+                "uuid": TEST_BUNDLE_UUID,
+                "revision": 1,
                 "name": "rknn-test",
                 "files": [entry.model_dump(mode="json") for entry in entries],
-                "digest": {"algorithm": "sha256", "value": canonical_bundle_digest(entries)},
+                "digest": {
+                    "algorithm": "sha256",
+                    "scope": "structure",
+                    "value": canonical_bundle_digest(TEST_BUNDLE_UUID, 1, "rknn-test", entries),
+                },
             },
             "deployments": {"rk3588": deployment},
         },
@@ -115,9 +123,7 @@ def _act_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
         {
             "backend": "rknn",
             "target": {"soc": "rk3588", "runtime": "rknn-lite"},
-            "artifacts": {
-                "policy": {"path": "artifacts/custom-act.rknn", "format": "rknn", "sha256": sha256_file(model)}
-            },
+            "artifacts": {"policy": {"path": "artifacts/custom-act.rknn", "format": "rknn"}},
             "execution": ["policy"],
             "bindings": {
                 "policy": {
@@ -183,7 +189,7 @@ def _smolvla_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
     artifact_dir.mkdir(parents=True)
     artifact_paths = {
         "vision_top": artifact_dir / "vision-top.rknn",
-        "vision_wrist": artifact_dir / "vision-wrist.rknn",
+        "vision_wrist": artifact_dir / "vision-top.rknn",
         "prefill": artifact_dir / "prefill.rknn",
         "action": artifact_dir / "action.rknn",
         "embedding": artifact_dir / "token-embedding.pt",
@@ -205,11 +211,13 @@ def _smolvla_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
 
     def artifact(role: str, artifact_format: str) -> dict[str, str]:
         path = artifact_paths[role]
-        return {
+        value = {
             "path": str(path.relative_to(tmp_path)),
             "format": artifact_format,
-            "sha256": sha256_file(path),
         }
+        if role.startswith("vision_"):
+            value["share_group"] = "vision"
+        return value
 
     def vision_bindings(semantic, output):
         return {

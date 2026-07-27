@@ -4,7 +4,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-from inference_manifest import BundleFile, canonical_bundle_digest, sha256_file
+from inference_manifest import BundleFile, canonical_bundle_digest
+
+TEST_BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
+TEST_DEPLOYMENT_UUID = "123e4567-e89b-42d3-a456-426614174001"
 
 POLICY_FEATURES = {
     "input_features": {
@@ -101,20 +104,21 @@ def make_manifest(
     compiled: bool = False,
     backend: str = "rknn",
 ) -> dict[str, Any]:
-    entries = [BundleFile(path=path, sha256=sha256_file(root.joinpath(*path.split("/")))) for path in bundle_paths]
+    entries = [BundleFile(path=path) for path in bundle_paths]
     if compiled:
         artifact_path = "artifacts/policy.rknn"
         artifact_file = root / artifact_path
         artifact_file.parent.mkdir(parents=True, exist_ok=True)
         artifact_file.write_bytes(b"compiled-policy")
         deployment: dict[str, Any] = {
+            "uuid": TEST_DEPLOYMENT_UUID,
+            "revision": 1,
             "backend": backend,
             "target": {"soc": "rk3588", "runtime": "rknn-lite"},
             "artifacts": {
                 "policy": {
                     "path": artifact_path,
                     "format": "rknn",
-                    "sha256": sha256_file(artifact_file),
                 }
             },
             "execution": ["policy"],
@@ -150,14 +154,20 @@ def make_manifest(
             },
         }
     else:
-        deployment = {"backend": "torch", "device": "cpu"}
+        deployment = {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, "backend": "torch", "device": "cpu"}
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "bundle": {
+            "uuid": TEST_BUNDLE_UUID,
+            "revision": 1,
             "name": f"test-{deployment_name}",
             "files": [entry.model_dump(mode="json") for entry in entries],
-            "digest": {"algorithm": "sha256", "value": canonical_bundle_digest(entries)},
+            "digest": {
+                "algorithm": "sha256",
+                "scope": "structure",
+                "value": canonical_bundle_digest(TEST_BUNDLE_UUID, 1, f"test-{deployment_name}", entries),
+            },
         },
         "deployments": {deployment_name: deployment},
     }

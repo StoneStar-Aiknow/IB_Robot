@@ -12,9 +12,14 @@ from inference_manifest import (
     load_inference_manifest,
     load_inference_manifest_metadata,
     load_policy_metadata,
-    sha256_file,
 )
-from tests.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
+from tests.manifest_fixtures import (
+    TEST_BUNDLE_UUID,
+    TEST_DEPLOYMENT_UUID,
+    create_policy_bundle,
+    make_manifest,
+    write_manifest,
+)
 
 
 @pytest.mark.parametrize(
@@ -61,7 +66,12 @@ def test_policy_family_discovery_summaries_and_digests(
     validated = load_inference_manifest(tmp_path, "cpu")
     declared_entries = tuple(BundleFile.model_validate(entry) for entry in manifest["bundle"]["files"])
 
-    assert validated.manifest.bundle.digest.value == canonical_bundle_digest(declared_entries)
+    assert validated.manifest.bundle.digest.value == canonical_bundle_digest(
+        manifest["bundle"]["uuid"],
+        manifest["bundle"]["revision"],
+        manifest["bundle"]["name"],
+        declared_entries,
+    )
     assert validated.policy == metadata
 
 
@@ -108,7 +118,12 @@ def test_missing_required_semantic_file_is_rejected_but_arbitrary_extra_is_allow
     omitted = "policy_preprocessor_step_0_normalizer_processor.safetensors"
     manifest["bundle"]["files"] = [entry for entry in manifest["bundle"]["files"] if entry["path"] != omitted]
     entries = tuple(BundleFile.model_validate(entry) for entry in manifest["bundle"]["files"])
-    manifest["bundle"]["digest"]["value"] = canonical_bundle_digest(entries)
+    manifest["bundle"]["digest"]["value"] = canonical_bundle_digest(
+        manifest["bundle"]["uuid"],
+        manifest["bundle"]["revision"],
+        manifest["bundle"]["name"],
+        entries,
+    )
     write_manifest(tmp_path, manifest)
 
     with pytest.raises(ManifestValidationError, match=omitted):
@@ -148,7 +163,12 @@ def test_torch_requires_native_weights_while_compiled_metadata_does_not(tmp_path
 def test_multi_deployment_bundle_keeps_native_weights_when_compiled_is_selected(tmp_path):
     paths = create_policy_bundle(tmp_path, "act")
     manifest = make_manifest(tmp_path, paths, deployment_name="rk3588", compiled=True)
-    manifest["deployments"]["cpu"] = {"backend": "torch", "device": "cpu"}
+    manifest["deployments"]["cpu"] = {
+        "uuid": TEST_DEPLOYMENT_UUID,
+        "revision": 1,
+        "backend": "torch",
+        "device": "cpu",
+    }
     write_manifest(tmp_path, manifest)
 
     validated = load_inference_manifest(tmp_path, "rk3588")
@@ -160,7 +180,12 @@ def test_multi_deployment_bundle_keeps_native_weights_when_compiled_is_selected(
 def test_metadata_only_loader_does_not_require_cloud_artifacts_or_native_weights(tmp_path):
     paths = create_policy_bundle(tmp_path, "act")
     manifest = make_manifest(tmp_path, paths, deployment_name="rk3588", compiled=True)
-    manifest["deployments"]["cpu"] = {"backend": "torch", "device": "cpu"}
+    manifest["deployments"]["cpu"] = {
+        "uuid": TEST_DEPLOYMENT_UUID,
+        "revision": 1,
+        "backend": "torch",
+        "device": "cpu",
+    }
     write_manifest(tmp_path, manifest)
     (tmp_path / "artifacts/policy.rknn").unlink()
     (tmp_path / "model.safetensors").unlink()
@@ -190,18 +215,16 @@ def test_local_tokenizer_reference_must_not_escape_or_go_missing(tmp_path):
         load_policy_metadata(tmp_path, require_native_weights=True)
 
 
-def test_policy_fixture_digest_changes_when_semantic_file_changes(tmp_path):
+def test_policy_fixture_digest_tracks_revision_not_file_bytes(tmp_path):
     paths = create_policy_bundle(tmp_path, "pi05")
-    before_entries = tuple(
-        BundleFile(path=path, sha256=sha256_file(tmp_path.joinpath(*path.split("/")))) for path in paths
-    )
-    before = canonical_bundle_digest(before_entries)
+    before_entries = tuple(BundleFile(path=path) for path in paths)
+    before = canonical_bundle_digest(TEST_BUNDLE_UUID, 1, "pi05", before_entries)
 
     state_path = tmp_path / "policy_preprocessor_step_0_normalizer_processor.safetensors"
     state_path.write_bytes(b"changed-state")
-    after_entries = tuple(
-        BundleFile(path=path, sha256=sha256_file(tmp_path.joinpath(*path.split("/")))) for path in reversed(paths)
-    )
-    after = canonical_bundle_digest(after_entries)
+    after_entries = tuple(BundleFile(path=path) for path in reversed(paths))
+    unchanged = canonical_bundle_digest(TEST_BUNDLE_UUID, 1, "pi05", after_entries)
+    revised = canonical_bundle_digest(TEST_BUNDLE_UUID, 2, "pi05", after_entries)
 
-    assert before != after
+    assert before == unchanged
+    assert before != revised

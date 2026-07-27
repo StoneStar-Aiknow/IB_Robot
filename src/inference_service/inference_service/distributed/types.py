@@ -11,7 +11,7 @@ from types import MappingProxyType
 
 from inference_manifest import PolicyMetadata, ValidatedManifest
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 
 
 def _immutable_mapping(value: Mapping[str, object]) -> Mapping[str, object]:
@@ -66,18 +66,31 @@ class PolicySummary:
 class PipelineIdentity:
     pipeline_id: str
     manifest_schema_version: int
+    bundle_uuid: str
+    bundle_revision: int
     bundle_digest: str
     deployment_name: str
+    deployment_uuid: str
+    deployment_revision: int
     deployment_fingerprint: str
     policy: PolicySummary
     protocol_version: int = PROTOCOL_VERSION
 
     def __post_init__(self) -> None:
-        for field_name in ("pipeline_id", "bundle_digest", "deployment_name", "deployment_fingerprint"):
+        for field_name in (
+            "pipeline_id",
+            "bundle_uuid",
+            "bundle_digest",
+            "deployment_name",
+            "deployment_uuid",
+            "deployment_fingerprint",
+        ):
             if not getattr(self, field_name):
                 raise ValueError(f"{field_name} must be non-empty")
         if self.protocol_version < 1 or self.manifest_schema_version < 1:
             raise ValueError("protocol and manifest schema versions must be positive")
+        if self.bundle_revision < 1 or self.deployment_revision < 1:
+            raise ValueError("bundle and deployment revisions must be positive")
 
 
 @dataclass(frozen=True)
@@ -202,8 +215,12 @@ def build_pipeline_identity(pipeline_id: str, validated_manifest: ValidatedManif
     return PipelineIdentity(
         pipeline_id=pipeline_id,
         manifest_schema_version=validated_manifest.manifest.schema_version,
+        bundle_uuid=validated_manifest.manifest.bundle.uuid,
+        bundle_revision=validated_manifest.manifest.bundle.revision,
         bundle_digest=validated_manifest.manifest.bundle.digest.value,
         deployment_name=validated_manifest.deployment_name,
+        deployment_uuid=validated_manifest.deployment.uuid,
+        deployment_revision=validated_manifest.deployment.revision,
         deployment_fingerprint=validated_manifest.fingerprint,
         policy=summarize_policy(validated_manifest.policy),
     )
@@ -214,8 +231,12 @@ def identity_error(local: PipelineIdentity, remote: PipelineIdentity) -> Structu
         ("protocol_version", "protocol_version_mismatch"),
         ("pipeline_id", "pipeline_id_mismatch"),
         ("manifest_schema_version", "manifest_schema_version_mismatch"),
+        ("bundle_uuid", "bundle_uuid_mismatch"),
+        ("bundle_revision", "bundle_revision_mismatch"),
         ("bundle_digest", "bundle_digest_mismatch"),
         ("deployment_name", "deployment_mismatch"),
+        ("deployment_uuid", "deployment_uuid_mismatch"),
+        ("deployment_revision", "deployment_revision_mismatch"),
         ("deployment_fingerprint", "deployment_fingerprint_mismatch"),
         ("policy", "policy_summary_mismatch"),
     )

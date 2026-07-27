@@ -11,7 +11,7 @@ from types import ModuleType
 
 import pytest
 
-from inference_manifest import load_inference_manifest, sha256_file
+from inference_manifest import load_inference_manifest
 from inference_service.backends import (
     BACKEND_REGISTRY,
     BackendAdmissionError,
@@ -183,7 +183,6 @@ def _make_context(
             deployment["artifacts"]["worker"] = {
                 "path": "artifacts/worker",
                 "format": "executable",
-                "sha256": sha256_file(worker),
             }
             deployment["bindings"]["policy"]["outputs"][0]["index"] = 1
     write_manifest(root, manifest)

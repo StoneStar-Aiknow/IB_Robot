@@ -12,7 +12,7 @@ from launch import LaunchContext
 from launch.actions import RegisterEventHandler
 from launch_ros.actions import Node
 
-from inference_manifest import BundleFile, canonical_bundle_digest, sha256_file
+from inference_manifest import BundleFile, canonical_bundle_digest
 from robot_config.inference_config import InferenceConfigError
 from robot_config.launch_builders import tracing as tracing_builder
 from robot_config.launch_builders.control import (
@@ -38,6 +38,9 @@ assert _LAUNCH_SPEC is not None
 assert _LAUNCH_SPEC.loader is not None
 robot_launch = importlib.util.module_from_spec(_LAUNCH_SPEC)
 _LAUNCH_SPEC.loader.exec_module(robot_launch)
+
+_BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
+_DEPLOYMENT_UUID = "123e4567-e89b-42d3-a456-426614174001"
 
 
 def _block_voice_asr_service_import(monkeypatch):
@@ -100,17 +103,27 @@ def _create_inference_bundle(root, deployments=None):
     _write_json(root / "policy_postprocessor.json", {"name": "post", "steps": []})
     (root / "model.safetensors").write_bytes(b"test-weights")
     paths = ("config.json", "model.safetensors", "policy_postprocessor.json", "policy_preprocessor.json")
-    entries = [BundleFile(path=path, sha256=sha256_file(root / path)) for path in paths]
+    entries = [BundleFile(path=path) for path in paths]
+    deployment_values = deployments or {"cpu": {"backend": "torch", "device": "cpu"}}
+    deployment_values = {
+        name: {"uuid": _DEPLOYMENT_UUID, "revision": 1, **value} for name, value in deployment_values.items()
+    }
     _write_json(
         root / "inference_manifest.json",
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "bundle": {
+                "uuid": _BUNDLE_UUID,
+                "revision": 1,
                 "name": root.name,
                 "files": [entry.model_dump(mode="json") for entry in entries],
-                "digest": {"algorithm": "sha256", "value": canonical_bundle_digest(entries)},
+                "digest": {
+                    "algorithm": "sha256",
+                    "scope": "structure",
+                    "value": canonical_bundle_digest(_BUNDLE_UUID, 1, root.name, entries),
+                },
             },
-            "deployments": deployments or {"cpu": {"backend": "torch", "device": "cpu"}},
+            "deployments": deployment_values,
         },
     )
     return root

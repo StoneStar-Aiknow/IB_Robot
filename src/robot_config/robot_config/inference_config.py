@@ -12,7 +12,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
 
-from inference_manifest import MANIFEST_FILENAME, ManifestError, ValidatedManifest, load_inference_manifest
+from inference_manifest import (
+    MANIFEST_FILENAME,
+    ManifestError,
+    ValidatedManifest,
+    load_inference_manifest,
+    load_inference_manifest_metadata,
+)
 
 PIPELINE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
@@ -197,7 +203,7 @@ def _parse_pipeline(
 
     transport = _parse_transport(pipeline_id, execution_mode, value.get("transport", {}), pipeline_path)
     model_path = _resolve_model_path(model_path_value, pipeline_path)
-    validated_manifest = _validate_model_bundle(model_path, deployment, pipeline_path)
+    validated_manifest = _validate_model_bundle(model_path, deployment, execution_mode, pipeline_path)
     return InferencePipelineConfig(
         pipeline_id=pipeline_id,
         model_path=model_path,
@@ -313,7 +319,12 @@ def _resolve_model_path(value: str, pipeline_path: str) -> Path:
     return resolved
 
 
-def _validate_model_bundle(model_path: Path, deployment: str, pipeline_path: str) -> ValidatedManifest:
+def _validate_model_bundle(
+    model_path: Path,
+    deployment: str,
+    execution_mode: str,
+    pipeline_path: str,
+) -> ValidatedManifest:
     config_path = model_path / "config.json"
     if not config_path.is_file():
         raise InferenceConfigError(f"{pipeline_path} bundle is missing config.json: {config_path}")
@@ -321,7 +332,8 @@ def _validate_model_bundle(model_path: Path, deployment: str, pipeline_path: str
     if not manifest_path.is_file():
         raise InferenceConfigError(f"{pipeline_path} bundle is missing {MANIFEST_FILENAME}: {manifest_path}")
     try:
-        return load_inference_manifest(model_path, deployment)
+        loader = load_inference_manifest_metadata if execution_mode == "distributed" else load_inference_manifest
+        return loader(model_path, deployment)
     except ManifestError as exc:
         raise InferenceConfigError(
             f"{pipeline_path} failed bundle validation for deployment {deployment!r}: {exc}"

@@ -339,22 +339,22 @@ def write_smolvla_rknn_deployment(
     artifacts: dict[str, tuple[Path, str]] = {}
     bindings = {}
     image_semantics: list[str] = []
+    packaged_vision = package_deployment_artifact(
+        root,
+        vision_rknn,
+        backend="rknn",
+        deployment_name=deployment_name,
+        role="vision",
+        force_copy=True,
+    )
+    vision_roles: list[str] = []
     for camera in cameras:
         role = _vision_role(camera)
+        vision_roles.append(role)
         image_semantic = f"internal.image_embedding.{role.removeprefix('vision_')}"
         execution.append(role)
         image_semantics.append(image_semantic)
-        artifacts[role] = (
-            package_deployment_artifact(
-                root,
-                vision_rknn,
-                backend="rknn",
-                deployment_name=deployment_name,
-                role=role,
-                force_copy=True,
-            ),
-            "rknn",
-        )
+        artifacts[role] = (packaged_vision, "rknn")
         bindings[role] = artifact_bindings(
             vision_abi,
             input_semantics={vision_abi.inputs[0].name: camera},
@@ -472,6 +472,7 @@ def write_smolvla_rknn_deployment(
         artifacts=artifacts,
         execution=execution,
         bindings=bindings,
+        artifact_share_groups={role: "vision" for role in vision_roles},
     )
     return upsert_deployment(root, deployment_name, deployment).manifest_path
 

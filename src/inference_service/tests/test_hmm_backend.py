@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest, sha256_file
+from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
 from inference_service.backends import (
     BACKEND_REGISTRY,
     BackendCapabilityError,
@@ -19,7 +19,7 @@ from inference_service.backends import (
 from inference_service.backends.hmm import HMMBackend, create_backend
 from inference_service.codecs import create_policy_codec
 from inference_service.pipeline import InferencePipeline
-from tests.manifest_fixtures import create_policy_bundle, write_manifest
+from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID, create_policy_bundle, write_manifest
 
 
 @dataclass(frozen=True)
@@ -211,19 +211,27 @@ def _tensor(name: str, dtype: str, shape: tuple[int, ...]) -> FakeTensorSpec:
 
 
 def _bundle_entries(root: Path, paths: tuple[str, ...]) -> list[BundleFile]:
-    return [BundleFile(path=path, sha256=sha256_file(root / path)) for path in paths]
+    del root
+    return [BundleFile(path=path) for path in paths]
 
 
 def _write_compiled_manifest(root: Path, bundle_paths: tuple[str, ...], deployment: dict) -> None:
     entries = _bundle_entries(root, bundle_paths)
+    deployment = {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, **deployment}
     write_manifest(
         root,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "bundle": {
+                "uuid": TEST_BUNDLE_UUID,
+                "revision": 1,
                 "name": "hmm-test",
                 "files": [entry.model_dump(mode="json") for entry in entries],
-                "digest": {"algorithm": "sha256", "value": canonical_bundle_digest(entries)},
+                "digest": {
+                    "algorithm": "sha256",
+                    "scope": "structure",
+                    "value": canonical_bundle_digest(TEST_BUNDLE_UUID, 1, "hmm-test", entries),
+                },
             },
             "deployments": {"houmo": deployment},
         },
@@ -236,7 +244,6 @@ def _artifact(root: Path, role: str, artifact_format: str = "hmm") -> dict[str, 
     return {
         "path": str(path.relative_to(root)),
         "format": artifact_format,
-        "sha256": sha256_file(path),
     }
 
 

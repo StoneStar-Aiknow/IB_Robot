@@ -75,6 +75,10 @@ def test_identity_summary_is_canonical_and_includes_chunk_contract(tmp_path):
     ]
     assert identity.policy.action_dimension == 6
     assert identity.policy.nominal_chunk_size == 4
+    assert identity.bundle_uuid
+    assert identity.bundle_revision == 1
+    assert identity.deployment_uuid
+    assert identity.deployment_revision == 1
 
 
 def test_matching_handshake_gates_requests_and_routes_result(tmp_path):
@@ -118,8 +122,12 @@ def test_matching_handshake_gates_requests_and_routes_result(tmp_path):
     ("field", "code"),
     [
         ("pipeline_id", "pipeline_id_mismatch"),
+        ("bundle_uuid", "bundle_uuid_mismatch"),
+        ("bundle_revision", "bundle_revision_mismatch"),
         ("bundle_digest", "bundle_digest_mismatch"),
         ("deployment_name", "deployment_mismatch"),
+        ("deployment_uuid", "deployment_uuid_mismatch"),
+        ("deployment_revision", "deployment_revision_mismatch"),
         ("deployment_fingerprint", "deployment_fingerprint_mismatch"),
     ],
 )
@@ -127,7 +135,8 @@ def test_handshake_rejects_identity_mismatches(tmp_path, field, code):
     identity = _identity(tmp_path / "bundle")
     edge = EdgeSession(identity)
     edge.start()
-    remote_identity = replace(identity, **{field: f"different-{field}"})
+    current = getattr(identity, field)
+    remote_identity = replace(identity, **{field: current + 1 if isinstance(current, int) else f"different-{field}"})
     status = PipelineStatus(
         role=PeerRole.CLOUD,
         identity=remote_identity,

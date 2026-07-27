@@ -51,7 +51,8 @@ def test_write_rknn_deployment_uses_compiler_runtime_layout(tmp_path):
     assert manifest_path == tmp_path / "inference_manifest.json"
     assert validated.deployment.backend == "rknn"
     assert validated.deployment.bindings["policy"].inputs[1].layout == "NHWC"
-    assert validated.deployment.artifacts["policy"].path.startswith("artifacts/rknn/rknn/policy-")
+    assert validated.deployment.artifacts["policy"].path.startswith("artifacts/rknn/rknn/generations/")
+    assert validated.deployment.artifacts["policy"].path.endswith("/policy.rknn")
 
 
 def test_rknn_output_paths_derive_from_onnx_stem(tmp_path):

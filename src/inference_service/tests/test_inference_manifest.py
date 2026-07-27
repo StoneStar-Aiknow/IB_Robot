@@ -12,7 +12,6 @@ import pytest
 from inference_manifest import (
     BundleFile,
     CompiledDeployment,
-    ManifestIntegrityError,
     ManifestPathError,
     ManifestValidationError,
     canonical_bundle_digest,
@@ -21,11 +20,10 @@ from inference_manifest import (
     load_inference_manifest,
     normalize_bundle_path,
     normalize_unique_paths,
-    sha256_file,
     write_inference_manifest,
 )
 from inference_manifest.models import DeviceLink
-from tests.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
+from tests.manifest_fixtures import TEST_BUNDLE_UUID, create_policy_bundle, make_manifest, write_manifest
 
 
 @pytest.mark.parametrize(
@@ -70,9 +68,9 @@ def test_schema_version_unknown_fields_aliases_and_duplicate_json_keys(tmp_path)
     paths = create_policy_bundle(tmp_path)
     manifest = make_manifest(tmp_path, paths)
 
-    manifest["schema_version"] = 2
+    manifest["schema_version"] = 3
     write_manifest(tmp_path, manifest)
-    with pytest.raises(ManifestValidationError, match=r"Unsupported schema_version 2.*inference_manifest.json"):
+    with pytest.raises(ManifestValidationError, match=r"Unsupported schema_version 3.*inference_manifest.json"):
         load_inference_manifest(tmp_path, "cpu")
 
     manifest = make_manifest(tmp_path, paths)
@@ -88,10 +86,50 @@ def test_schema_version_unknown_fields_aliases_and_duplicate_json_keys(tmp_path)
         load_inference_manifest(tmp_path, "cpu")
 
     (tmp_path / "inference_manifest.json").write_text(
-        '{"schema_version":1,"schema_version":1}',
+        '{"schema_version":2,"schema_version":2}',
         encoding="utf-8",
     )
     with pytest.raises(ManifestValidationError, match="duplicate JSON key 'schema_version'"):
+        load_inference_manifest(tmp_path, "cpu")
+
+
+def test_schema_v1_requires_regeneration(tmp_path):
+    paths = tuple(path for path in create_policy_bundle(tmp_path) if path != "model.safetensors")
+    manifest = make_manifest(tmp_path, paths, deployment_name="rk3588", compiled=True)
+    manifest["schema_version"] = 1
+    manifest["bundle"].pop("uuid")
+    manifest["bundle"].pop("revision")
+    manifest["bundle"]["digest"].pop("scope")
+    for entry in manifest["bundle"]["files"]:
+        entry["sha256"] = "1" * 64
+    deployment = manifest["deployments"]["rk3588"]
+    deployment.pop("uuid")
+    deployment.pop("revision")
+    for artifact in deployment["artifacts"].values():
+        artifact["sha256"] = "2" * 64
+    write_manifest(tmp_path, manifest)
+
+    with pytest.raises(ManifestValidationError, match="unsupported.*rerun the owning exporter or packager"):
+        load_inference_manifest(tmp_path, "rk3588")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("uuid", "not-a-uuid"),
+        ("uuid", "00000000-0000-0000-0000-000000000000"),
+        ("revision", 0),
+        ("revision", True),
+        ("revision", "1"),
+    ],
+)
+def test_bundle_identity_requires_canonical_uuid_and_positive_integer_revision(tmp_path, field, value):
+    paths = create_policy_bundle(tmp_path)
+    manifest = make_manifest(tmp_path, paths)
+    manifest["bundle"][field] = value
+    write_manifest(tmp_path, manifest)
+
+    with pytest.raises(ManifestValidationError):
         load_inference_manifest(tmp_path, "cpu")
 
 
@@ -106,49 +144,40 @@ def test_removed_backend_aliases_are_rejected(tmp_path, alias):
         load_inference_manifest(tmp_path, "cpu")
 
 
-def test_hash_mismatch_reports_digests_and_exporter_guidance(tmp_path):
+def test_bundle_content_changes_do_not_require_runtime_rehashing(tmp_path):
     paths = create_policy_bundle(tmp_path)
     manifest = make_manifest(tmp_path, paths)
     write_manifest(tmp_path, manifest)
-    expected = next(entry["sha256"] for entry in manifest["bundle"]["files"] if entry["path"] == "config.json")
-    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
-    actual = sha256_file(tmp_path / "config.json")
-
-    with pytest.raises(ManifestIntegrityError) as error:
-        load_inference_manifest(tmp_path, "cpu")
-
-    message = str(error.value)
-    assert "config.json" in message
-    assert expected in message
-    assert actual in message
-    assert "Rerun the owning exporter or packaging workflow" in message
+    before = load_inference_manifest(tmp_path, "cpu")
+    config = tmp_path / "config.json"
+    config.write_text(config.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    after = load_inference_manifest(tmp_path, "cpu")
+    assert after.fingerprint == before.fingerprint
 
 
-def test_artifact_hash_mismatch_reports_role_and_exporter_guidance(tmp_path):
+def test_artifact_content_changes_are_left_to_backend_validation(tmp_path):
     paths = tuple(path for path in create_policy_bundle(tmp_path) if path != "model.safetensors")
     manifest = make_manifest(tmp_path, paths, deployment_name="rk3588", compiled=True)
     write_manifest(tmp_path, manifest)
     artifact = manifest["deployments"]["rk3588"]["artifacts"]["policy"]
+    before = load_inference_manifest(tmp_path, "rk3588")
     (tmp_path / artifact["path"]).write_bytes(b"changed-compiled-policy")
-    actual = sha256_file(tmp_path / artifact["path"])
-
-    with pytest.raises(ManifestIntegrityError) as error:
-        load_inference_manifest(tmp_path, "rk3588")
-
-    message = str(error.value)
-    assert "role 'policy'" in message
-    assert artifact["sha256"] in message
-    assert actual in message
-    assert "Rerun the owning exporter or packaging workflow" in message
+    after = load_inference_manifest(tmp_path, "rk3588")
+    assert after.fingerprint == before.fingerprint
 
 
 def test_canonical_bundle_digest_is_order_independent():
     entries = [
-        BundleFile(path="z.json", sha256="1" * 64),
-        BundleFile(path="a.json", sha256="2" * 64),
+        BundleFile(path="z.json"),
+        BundleFile(path="a.json"),
     ]
 
-    assert canonical_bundle_digest(entries) == canonical_bundle_digest(reversed(entries))
+    assert canonical_bundle_digest(TEST_BUNDLE_UUID, 1, "test", entries) == canonical_bundle_digest(
+        TEST_BUNDLE_UUID, 1, "test", reversed(entries)
+    )
+    assert canonical_bundle_digest(TEST_BUNDLE_UUID, 1, "test", entries) != canonical_bundle_digest(
+        TEST_BUNDLE_UUID, 2, "test", entries
+    )
 
 
 def test_deployment_fingerprint_is_stable_and_tracks_identity_changes():
@@ -156,8 +185,10 @@ def test_deployment_fingerprint_is_stable_and_tracks_identity_changes():
         json.dumps(
             {
                 "backend": "rknn",
+                "uuid": "123e4567-e89b-42d3-a456-426614174001",
+                "revision": 1,
                 "target": {"soc": "rk3588", "runtime": "rknn-lite"},
-                "artifacts": {"policy": {"path": "policy.rknn", "format": "rknn", "sha256": "3" * 64}},
+                "artifacts": {"policy": {"path": "policy.rknn", "format": "rknn"}},
                 "execution": ["policy"],
                 "bindings": {
                     "policy": {
@@ -183,13 +214,15 @@ def test_deployment_fingerprint_is_stable_and_tracks_identity_changes():
         )
     )
 
-    baseline = deployment_fingerprint(1, "4" * 64, "rk3588", deployment)
-    assert baseline == deployment_fingerprint(1, "4" * 64, "rk3588", deployment)
-    assert baseline != deployment_fingerprint(1, "5" * 64, "rk3588", deployment)
-    assert baseline != deployment_fingerprint(1, "4" * 64, "other", deployment)
+    baseline = deployment_fingerprint(2, "4" * 64, "rk3588", deployment)
+    assert baseline == deployment_fingerprint(2, "4" * 64, "rk3588", deployment)
+    assert baseline != deployment_fingerprint(2, "5" * 64, "rk3588", deployment)
+    assert baseline != deployment_fingerprint(2, "4" * 64, "other", deployment)
 
     changed = deployment.model_copy(update={"target": deployment.target.model_copy(update={"runtime": "rknn-lite-2"})})
-    assert baseline != deployment_fingerprint(1, "4" * 64, "rk3588", changed)
+    assert baseline != deployment_fingerprint(2, "4" * 64, "rk3588", changed)
+    revised = deployment.model_copy(update={"revision": 2})
+    assert baseline != deployment_fingerprint(2, "4" * 64, "rk3588", revised)
 
 
 def test_device_link_source_defaults_preserve_canonical_identity():
@@ -276,7 +309,6 @@ def test_compiled_deployment_allows_verified_auxiliary_artifacts_and_sparse_outp
     deployment["artifacts"]["worker"] = {
         "path": "artifacts/worker",
         "format": "executable",
-        "sha256": sha256_file(worker_path),
     }
     write_manifest(tmp_path, manifest)
 
@@ -287,8 +319,7 @@ def test_compiled_deployment_allows_verified_auxiliary_artifacts_and_sparse_outp
     assert validated.deployment.bindings["policy"].outputs[0].index == 1
 
     worker_path.write_bytes(b"changed-worker")
-    with pytest.raises(ManifestIntegrityError, match="role 'worker'"):
-        load_inference_manifest(tmp_path, "hisilicon")
+    assert load_inference_manifest(tmp_path, "hisilicon").deployment.backend == "hisilicon"
 
 
 @pytest.mark.parametrize("policy_type", ["pi05", "smolvla"])
@@ -325,12 +356,17 @@ def test_selected_bundle_and_artifact_paths_cannot_duplicate(tmp_path):
     paths = tuple(path for path in create_policy_bundle(tmp_path) if path != "model.safetensors")
     manifest = make_manifest(tmp_path, paths, deployment_name="rk3588", compiled=True)
     artifact = manifest["deployments"]["rk3588"]["artifacts"]["policy"]
-    manifest["bundle"]["files"].append({"path": artifact["path"], "sha256": artifact["sha256"]})
+    manifest["bundle"]["files"].append({"path": artifact["path"]})
     entries = [BundleFile.model_validate(entry) for entry in manifest["bundle"]["files"]]
-    manifest["bundle"]["digest"]["value"] = canonical_bundle_digest(entries)
+    manifest["bundle"]["digest"]["value"] = canonical_bundle_digest(
+        manifest["bundle"]["uuid"],
+        manifest["bundle"]["revision"],
+        manifest["bundle"]["name"],
+        entries,
+    )
     write_manifest(tmp_path, manifest)
 
-    with pytest.raises(ManifestPathError, match="duplicate normalized path 'artifacts/policy.rknn'"):
+    with pytest.raises(ManifestValidationError, match="distinct paths"):
         load_inference_manifest(tmp_path, "rk3588")
 
 
@@ -343,7 +379,7 @@ def test_canonical_writer_is_deterministic_and_replaces_atomically(tmp_path):
     first_content = first.read_bytes()
     assert first_content == canonical_manifest_bytes(manifest)
 
-    reordered = {"deployments": manifest["deployments"], "bundle": manifest["bundle"], "schema_version": 1}
+    reordered = {"deployments": manifest["deployments"], "bundle": manifest["bundle"], "schema_version": 2}
     write_inference_manifest(destination, reordered)
     assert destination.read_bytes() == first_content
     assert not list(destination.parent.glob("*.tmp"))

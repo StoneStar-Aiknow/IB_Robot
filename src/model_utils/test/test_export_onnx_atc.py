@@ -86,7 +86,8 @@ def test_write_ascend_deployment_records_complete_manifest(tmp_path):
     assert manifest_path == policy_dir / "inference_manifest.json"
     assert validated.deployment.backend == "ascend"
     assert validated.deployment.target.soc == "Ascend310B1"
-    assert validated.deployment.artifacts["policy"].path.startswith("artifacts/ascend/ascend/policy-")
+    assert validated.deployment.artifacts["policy"].path.startswith("artifacts/ascend/ascend/generations/")
+    assert validated.deployment.artifacts["policy"].path.endswith("/policy.om")
     assert validated.deployment.artifacts["policy"].path.endswith(".om")
     assert [binding.semantic for binding in validated.deployment.bindings["policy"].inputs] == [
         "observation.state",

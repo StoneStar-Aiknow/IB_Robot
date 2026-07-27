@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
 
-from inference_manifest import TensorBinding, TorchDeployment, load_inference_manifest, sha256_file
+from inference_manifest import TensorBinding, TorchDeployment, load_inference_manifest
 from model_utils.inference_manifest_export import (
     RuntimeABI,
     RuntimeTensor,
@@ -15,7 +16,9 @@ from model_utils.inference_manifest_export import (
     package_deployment_artifact,
     read_runtime_abi,
     read_tcim_abi,
+    refresh_bundle_revision,
     upsert_deployment,
+    write_acl_om_abi,
 )
 from model_utils.package_compiled_deployment import package_compiled_deployment
 from model_utils.package_torch_deployment import package_torch_deployments
@@ -61,7 +64,7 @@ def _act_bindings():
     )
 
 
-def test_upsert_deployment_preserves_existing_deployments_and_rehashes_bundle(tmp_path):
+def test_upsert_deployment_preserves_existing_deployments_and_structural_identity(tmp_path):
     _create_bundle(tmp_path)
     artifact = tmp_path / "artifacts" / "policy.rknn"
     artifact.parent.mkdir()
@@ -72,6 +75,7 @@ def test_upsert_deployment_preserves_existing_deployments_and_rehashes_bundle(tm
 
     (tmp_path / "model.safetensors").write_bytes(b"weights")
     upsert_deployment(tmp_path, "cpu", torch_deployment)
+    first = load_inference_manifest(tmp_path, "cpu")
     deployment = compiled_deployment(
         tmp_path,
         backend="rknn",
@@ -86,6 +90,56 @@ def test_upsert_deployment_preserves_existing_deployments_and_rehashes_bundle(tm
     assert set(validated.manifest.deployments) == {"cpu", "rknn"}
     assert "model.safetensors" in {entry.path for entry in validated.manifest.bundle.files}
     assert load_inference_manifest(tmp_path, "cpu").deployment.backend == "torch"
+    assert validated.manifest.bundle.uuid == first.manifest.bundle.uuid
+    assert validated.manifest.bundle.revision == first.manifest.bundle.revision
+    assert validated.deployment.uuid != first.deployment.uuid
+
+
+def test_upsert_deployment_preserves_uuid_and_automatically_revises_structural_changes(tmp_path):
+    _create_bundle(tmp_path)
+    artifact = tmp_path / "policy.rknn"
+    artifact.write_bytes(b"rknn-v1")
+    deployment = compiled_deployment(
+        tmp_path,
+        backend="rknn",
+        target_soc="rk3588",
+        target_runtime="rknn-lite2",
+        artifacts={"policy": (artifact, "rknn")},
+        execution=("policy",),
+        bindings={"policy": _act_bindings()},
+    )
+
+    first = upsert_deployment(tmp_path, "rknn", deployment)
+    no_op = upsert_deployment(tmp_path, "rknn", deployment)
+    changed = upsert_deployment(
+        tmp_path,
+        "rknn",
+        deployment.model_copy(update={"target": deployment.target.model_copy(update={"runtime": "rknn-lite2-2.3"})}),
+    )
+
+    assert no_op.deployment.uuid == first.deployment.uuid
+    assert no_op.deployment.revision == first.deployment.revision
+    assert changed.deployment.uuid == first.deployment.uuid
+    assert changed.deployment.revision == first.deployment.revision + 1
+    assert changed.fingerprint != first.fingerprint
+
+
+def test_refresh_bundle_revision_preserves_uuid_and_changes_deployment_fingerprint(tmp_path):
+    _create_bundle(tmp_path)
+    (tmp_path / "model.safetensors").write_bytes(b"weights")
+    first = upsert_deployment(tmp_path, "cpu", TorchDeployment(backend="torch", device="cpu"))
+    config_path = tmp_path / "config.json"
+    config_path.write_text(config_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+
+    refreshed = refresh_bundle_revision(tmp_path)
+    second = load_inference_manifest(tmp_path, "cpu")
+
+    assert refreshed.bundle.uuid == first.manifest.bundle.uuid
+    assert refreshed.bundle.revision == first.manifest.bundle.revision + 1
+    assert refreshed.bundle.digest.value != first.manifest.bundle.digest.value
+    assert second.deployment.uuid == first.deployment.uuid
+    assert second.deployment.revision == first.deployment.revision
+    assert second.fingerprint != first.fingerprint
 
 
 def test_package_torch_deployments_generates_cpu_and_cuda_by_default(tmp_path):
@@ -110,23 +164,32 @@ def test_package_torch_deployments_supports_device_selection_and_prefix(tmp_path
     assert validated[0].deployment.device == "cpu"
 
 
-def test_package_deployment_artifact_accepts_canonical_source_path(tmp_path):
+def test_package_deployment_artifact_creates_immutable_generation(tmp_path):
     source = tmp_path / "policy.rknn"
     source.write_bytes(b"rknn")
-    artifact = tmp_path / "artifacts" / "rknn" / "rk3588" / f"policy-{sha256_file(source)[:12]}.rknn"
-    artifact.parent.mkdir(parents=True)
-    source.rename(artifact)
 
     packaged = package_deployment_artifact(
         tmp_path,
-        artifact,
+        source,
         backend="rknn",
         deployment_name="rk3588",
         role="policy",
         force_copy=True,
     )
 
-    assert packaged == artifact
+    assert packaged != source
+    assert packaged.read_bytes() == b"rknn"
+    assert packaged.relative_to(tmp_path).parts[:4] == ("artifacts", "rknn", "rk3588", "generations")
+    assert packaged.name == "policy.rknn"
+    repackaged = package_deployment_artifact(
+        tmp_path,
+        packaged,
+        backend="rknn",
+        deployment_name="rk3588",
+        role="policy",
+    )
+    assert repackaged != packaged
+    assert repackaged.read_bytes() == packaged.read_bytes()
 
 
 def test_artifact_binding_requires_complete_semantic_and_layout_mapping():
@@ -171,6 +234,123 @@ def test_read_runtime_abi_accepts_sparse_output_indices(tmp_path):
     abi = read_runtime_abi(metadata)
 
     assert abi.outputs[0].index == 3
+
+
+def test_write_acl_om_abi_lazily_uses_runtime_descriptor(tmp_path, monkeypatch):
+    model = tmp_path / "model.om"
+    model.write_bytes(b"om")
+    calls = []
+
+    class FakeRuntime:
+        @staticmethod
+        def set_device(device_id):
+            calls.append(("set_device", device_id))
+            return 0
+
+        @staticmethod
+        def reset_device(device_id):
+            calls.append(("reset_device", device_id))
+            return 0
+
+        @staticmethod
+        def create_context(device_id):
+            calls.append(("create_context", device_id))
+            return "context", 0
+
+        @staticmethod
+        def set_context(context):
+            calls.append(("set_context", context))
+            return 0
+
+        @staticmethod
+        def destroy_context(context):
+            calls.append(("destroy_context", context))
+            return 0
+
+    class FakeModel:
+        names = {"input": ["image"], "output": ["action"]}
+        shapes = {"input": [[1, 3, 16, 24]], "output": [[1, 2, 8]]}
+        dtypes = {"input": [1], "output": [0]}
+
+        @staticmethod
+        def load_from_file(path):
+            calls.append(("load", path))
+            return 7, 0
+
+        @staticmethod
+        def create_desc():
+            return object()
+
+        @staticmethod
+        def get_desc(desc, model_id):
+            return 0
+
+        @classmethod
+        def get_num_inputs(cls, desc):
+            return 1
+
+        @classmethod
+        def get_num_outputs(cls, desc):
+            return 1
+
+        @classmethod
+        def get_input_name_by_index(cls, desc, index):
+            return cls.names["input"][index]
+
+        @classmethod
+        def get_output_name_by_index(cls, desc, index):
+            return cls.names["output"][index]
+
+        @classmethod
+        def get_input_dims(cls, desc, index):
+            return {"dims": cls.shapes["input"][index]}, 0
+
+        @classmethod
+        def get_output_dims(cls, desc, index):
+            return {"dims": cls.shapes["output"][index]}, 0
+
+        @classmethod
+        def get_input_data_type(cls, desc, index):
+            return cls.dtypes["input"][index]
+
+        @classmethod
+        def get_output_data_type(cls, desc, index):
+            return cls.dtypes["output"][index]
+
+        @staticmethod
+        def destroy_desc(desc):
+            calls.append(("destroy_desc",))
+
+        @staticmethod
+        def unload(model_id):
+            calls.append(("unload", model_id))
+            return 0
+
+    class FakeACL:
+        rt = FakeRuntime()
+        mdl = FakeModel()
+
+        @staticmethod
+        def init():
+            calls.append(("init",))
+            return 0
+
+        @staticmethod
+        def finalize():
+            calls.append(("finalize",))
+            return 0
+
+    monkeypatch.setattr("model_utils.inference_manifest_export.importlib.import_module", lambda name: FakeACL())
+
+    output = write_acl_om_abi(model, tmp_path / "model.om.abi.json")
+    abi = read_runtime_abi(output)
+
+    assert abi.inputs == (RuntimeTensor("image", 0, "float16", (1, 3, 16, 24)),)
+    assert abi.outputs == (RuntimeTensor("action", 0, "float32", (1, 2, 8)),)
+    assert calls[0] == ("init",)
+    assert ("create_context", 0) in calls
+    assert ("destroy_context", "context") in calls
+    assert calls[-1] == ("finalize",)
 
 
 def test_runtime_image_layout_is_authoritative():
@@ -234,7 +414,19 @@ def test_upsert_deployment_restores_previous_manifest_on_strict_validation_failu
     assert (tmp_path / "inference_manifest.json").read_bytes() == original
 
 
-def test_upsert_deployment_validates_preserved_deployment_artifacts(tmp_path):
+def test_manifest_writer_preserves_existing_mode_and_uses_readable_default(tmp_path):
+    _create_bundle(tmp_path)
+    (tmp_path / "model.safetensors").write_bytes(b"weights")
+    first = upsert_deployment(tmp_path, "cpu", TorchDeployment(backend="torch", device="cpu"))
+    path = first.manifest_path
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+
+    path.chmod(0o640)
+    upsert_deployment(tmp_path, "cuda", TorchDeployment(backend="torch", device="cuda"))
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+
+def test_upsert_deployment_does_not_rehash_preserved_deployment_artifacts(tmp_path):
     _create_bundle(tmp_path)
     first_artifact = tmp_path / "first.rknn"
     first_artifact.write_bytes(b"first")
@@ -248,7 +440,6 @@ def test_upsert_deployment_validates_preserved_deployment_artifacts(tmp_path):
         bindings={"policy": _act_bindings()},
     )
     upsert_deployment(tmp_path, "first", first)
-    original = (tmp_path / "inference_manifest.json").read_bytes()
     first_artifact.write_bytes(b"changed")
 
     second_artifact = tmp_path / "second.om"
@@ -263,10 +454,8 @@ def test_upsert_deployment_validates_preserved_deployment_artifacts(tmp_path):
         bindings={"policy": _act_bindings()},
     )
 
-    with pytest.raises(ValueError, match="SHA-256 mismatch"):
-        upsert_deployment(tmp_path, "second", second)
-
-    assert (tmp_path / "inference_manifest.json").read_bytes() == original
+    validated = upsert_deployment(tmp_path, "second", second)
+    assert set(validated.manifest.deployments) == {"first", "second"}
 
 
 def test_upsert_deployment_rejects_external_semantic_dependencies(tmp_path):
@@ -444,3 +633,66 @@ def test_copy_policy_metadata_bundle_copies_only_required_semantic_files(tmp_pat
     assert set(copied) == {"config.json", "policy_preprocessor.json", "policy_postprocessor.json"}
     assert (destination / "config.json").is_file()
     assert not (destination / "model.safetensors").exists()
+
+
+def test_copy_policy_metadata_bundle_only_revises_changed_content(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "compiled"
+    source.mkdir()
+    destination.mkdir()
+    _create_bundle(source)
+    _create_bundle(destination)
+    artifact = destination / "policy.rknn"
+    artifact.write_bytes(b"rknn")
+    deployment = compiled_deployment(
+        destination,
+        backend="rknn",
+        target_soc="rk3588",
+        target_runtime="rknn-lite2",
+        artifacts={"policy": (artifact, "rknn")},
+        execution=("policy",),
+        bindings={"policy": _act_bindings()},
+    )
+    first = upsert_deployment(destination, "rknn", deployment)
+
+    copy_policy_metadata_bundle(source, destination)
+    unchanged = load_inference_manifest(destination, "rknn")
+    assert unchanged.manifest.bundle.revision == first.manifest.bundle.revision
+
+    _write_json(source / "policy_preprocessor.json", {"name": "updated", "steps": []})
+    copy_policy_metadata_bundle(source, destination)
+    changed = load_inference_manifest(destination, "rknn")
+    assert changed.manifest.bundle.revision == first.manifest.bundle.revision + 1
+    assert json.loads((destination / "policy_preprocessor.json").read_text())["name"] == "updated"
+
+
+def test_copy_policy_metadata_bundle_rolls_back_files_and_manifest_on_validation_failure(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "compiled"
+    source.mkdir()
+    destination.mkdir()
+    _create_bundle(source)
+    _create_bundle(destination)
+    artifact = destination / "policy.rknn"
+    artifact.write_bytes(b"rknn")
+    deployment = compiled_deployment(
+        destination,
+        backend="rknn",
+        target_soc="rk3588",
+        target_runtime="rknn-lite2",
+        artifacts={"policy": (artifact, "rknn")},
+        execution=("policy",),
+        bindings={"policy": _act_bindings()},
+    )
+    upsert_deployment(destination, "rknn", deployment)
+    manifest_before = (destination / "inference_manifest.json").read_bytes()
+    config_before = (destination / "config.json").read_bytes()
+    config = json.loads((source / "config.json").read_text())
+    config["input_features"].pop("observation.state")
+    _write_json(source / "config.json", config)
+
+    with pytest.raises(ValueError, match="unknown LeRobot input feature"):
+        copy_policy_metadata_bundle(source, destination)
+
+    assert (destination / "config.json").read_bytes() == config_before
+    assert (destination / "inference_manifest.json").read_bytes() == manifest_before

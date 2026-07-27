@@ -15,8 +15,11 @@ from rclpy.action import ActionClient
 from sensor_msgs.msg import Image, JointState
 
 from ibrobot_msgs.action import DispatchInfer
-from inference_manifest import BundleFile, canonical_bundle_digest, sha256_file
+from inference_manifest import BundleFile, canonical_bundle_digest
 from tensormsg.converter import TensorMsgConverter
+
+_BUNDLE_UUID = "123e4567-e89b-42d3-a456-426614174000"
+_DEPLOYMENT_UUID = "123e4567-e89b-42d3-a456-426614174001"
 
 
 @dataclass(frozen=True)
@@ -85,17 +88,23 @@ def prepare_smoke_runtime() -> SmokeRuntime:
         "policy_preprocessor.json",
         "policy_preprocessor_step_2_normalizer_processor.safetensors",
     )
-    entries = [BundleFile(path=path, sha256=sha256_file(bundle / path)) for path in bundle_paths]
+    entries = [BundleFile(path=path) for path in bundle_paths]
     _write_json(
         bundle / "inference_manifest.json",
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "bundle": {
+                "uuid": _BUNDLE_UUID,
+                "revision": 1,
                 "name": "ci-smoke-act",
                 "files": [entry.model_dump(mode="json") for entry in entries],
-                "digest": {"algorithm": "sha256", "value": canonical_bundle_digest(entries)},
+                "digest": {
+                    "algorithm": "sha256",
+                    "scope": "structure",
+                    "value": canonical_bundle_digest(_BUNDLE_UUID, 1, "ci-smoke-act", entries),
+                },
             },
-            "deployments": {"cpu": {"backend": "torch", "device": "cpu"}},
+            "deployments": {"cpu": {"uuid": _DEPLOYMENT_UUID, "revision": 1, "backend": "torch", "device": "cpu"}},
         },
     )
 

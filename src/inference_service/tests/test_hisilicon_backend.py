@@ -7,7 +7,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest, sha256_file
+from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
 from inference_service.backends import (
     BACKEND_REGISTRY,
     BackendCapabilityError,
@@ -21,7 +21,7 @@ from inference_service.backends.hisilicon.backend import HisiliconBackend
 from inference_service.backends.hisilicon.sd3403_protocol import SD3403Response, SD3403WorkerExitedError
 from inference_service.codecs import create_policy_codec
 from inference_service.pipeline import InferencePipeline, PipelineValidationError
-from tests.manifest_fixtures import create_policy_bundle, write_manifest
+from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID, create_policy_bundle, write_manifest
 
 
 class FakeProtocol:
@@ -65,24 +65,31 @@ def hisilicon_context(tmp_path, *, executable: bool = True, runtime_options=None
     model.write_bytes(b"om")
     worker.write_text("#!/bin/sh\n", encoding="utf-8")
     worker.chmod(0o755 if executable else 0o644)
-    entries = [BundleFile(path=path, sha256=sha256_file(tmp_path / path)) for path in bundle_paths]
+    entries = [BundleFile(path=path) for path in bundle_paths]
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "bundle": {
+            "uuid": TEST_BUNDLE_UUID,
+            "revision": 1,
             "name": "hisilicon-act",
             "files": [entry.model_dump(mode="json") for entry in entries],
-            "digest": {"algorithm": "sha256", "value": canonical_bundle_digest(entries)},
+            "digest": {
+                "algorithm": "sha256",
+                "scope": "structure",
+                "value": canonical_bundle_digest(TEST_BUNDLE_UUID, 1, "hisilicon-act", entries),
+            },
         },
         "deployments": {
             "hisilicon": {
+                "uuid": TEST_DEPLOYMENT_UUID,
+                "revision": 1,
                 "backend": "hisilicon",
                 "target": {"soc": "sd3403", "runtime": "hisilicon-worker"},
                 "artifacts": {
-                    "policy": {"path": "artifacts/model.om", "format": "om", "sha256": sha256_file(model)},
+                    "policy": {"path": "artifacts/model.om", "format": "om"},
                     "worker": {
                         "path": "artifacts/worker",
                         "format": "executable",
-                        "sha256": sha256_file(worker),
                     },
                 },
                 "execution": ["policy"],
