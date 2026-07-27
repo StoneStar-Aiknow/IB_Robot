@@ -24,7 +24,7 @@ find_package(nlohmann_json REQUIRED)
 include(FetchContent)
 FetchContent_Declare(
   ftservo_sdk_external
-  GIT_REPOSITORY https://gitee.com/ftservo/FTServo_Linux.git
+  GIT_REPOSITORY https://gitcode.com/ib_robot/FTServo_Linux.git
   GIT_TAG        main
   GIT_SHALLOW    TRUE
 )
