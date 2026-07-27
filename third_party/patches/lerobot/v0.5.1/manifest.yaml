@@ -138,6 +138,11 @@ patches:
       - Preserve eager semantics while supporting RKNN and HMM graph export.
     applies_to:
       profiles: [core]
+  - file: 0017-diffusion-accept-observation-histories.patch
+    purpose:
+      - Allow Diffusion predict_action_chunk calls to consume caller-provided temporal observation batches.
+      - Preserve the internal observation queues used by online select_action rollouts.
+      - Add the temporal axis required by Diffusion for a single batched observation.
 
 notes:
   - Schema v2 contract — each patch declares applicability via independent
@@ -178,6 +183,10 @@ notes:
     Python versions and is applied on every platform patch series.
   - Patch 0016 is backend-neutral and keeps SmolVLA position ID arithmetic valid
     for ONNX-based RKNN and HMM exporters on every supported platform.
+  - Patch 0017 lets the unified inference service own Diffusion observation
+    history while keeping LeRobot's online rollout behavior unchanged. It also
+    keeps single-observation calls compatible with the same public chunk API
+    and is applied by every maintained platform series.
   - The reference_submodule_commit records the current local development
     result, but repeated git-am application will produce different commit
     hashes unless committer identity and dates are reproduced exactly.

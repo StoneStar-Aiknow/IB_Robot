@@ -3,3 +3,4 @@
 0011-knowledge-distillation.patch
 0012-mt-act-model.patch
 0014-training-logs.patch
+0017-diffusion-accept-observation-histories.patch

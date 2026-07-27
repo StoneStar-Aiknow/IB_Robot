@@ -76,6 +76,17 @@ def test_rad_to_lerobot_returns_float32_after_joint_conversion():
     np.testing.assert_array_equal(converted, np.array([0.0], dtype=np.float32))
 
 
+def test_rad_to_lerobot_converts_history_along_joint_axis():
+    node = SimpleNamespace(_joint_rad_limits=[(-1.0, 1.0, 200.0, -100.0)])
+
+    converted = PipelinePolicyNode._rad_to_lerobot(
+        node,
+        np.array([[-1.0, 5.0], [1.0, 6.0]], dtype=np.float32),
+    )
+
+    np.testing.assert_array_equal(converted, np.array([[-100.0, 5.0], [100.0, 6.0]], dtype=np.float32))
+
+
 def test_to_policy_inputs_converts_numpy_observations_to_contiguous_tensors():
     image = np.zeros((2, 3, 4), dtype=np.float32).transpose(1, 0, 2)
 
@@ -197,6 +208,7 @@ def test_hold_history_window_ignores_asof_tolerance():
     node = SimpleNamespace(
         _obs_specs=[spec],
         _frequency=20.0,
+        _n_obs_steps=1,
         _subs={},
         _state_specs=[],
         _topic_to_qos={spec.topic: {}},
@@ -212,6 +224,36 @@ def test_hold_history_window_ignores_asof_tolerance():
         PipelinePolicyNode._setup_observation_subscriptions(node)
 
     assert node._subs[spec.key].history_window_ns == 550_000_000
+
+
+def test_history_window_includes_model_observation_horizon():
+    spec = SimpleNamespace(
+        key="observation.state",
+        topic="/joint_states",
+        ros_type="sensor_msgs/msg/JointState",
+        resample_policy="hold",
+        asof_tol_ms=0,
+        max_age_ms=500,
+    )
+    node = SimpleNamespace(
+        _obs_specs=[spec],
+        _frequency=20.0,
+        _n_obs_steps=4,
+        _subs={},
+        _state_specs=[spec],
+        _topic_to_qos={spec.topic: {}},
+        _subscription_key=lambda current_spec: current_spec.key,
+        create_subscription=lambda *_args, **_kwargs: object(),
+        _observation_callback=lambda *_args: None,
+    )
+    message_module = ModuleType("rosidl_runtime_py.utilities")
+    message_module.get_message = lambda _ros_type: object
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, message_module.__name__, message_module)
+        PipelinePolicyNode._setup_observation_subscriptions(node)
+
+    assert node._subs[spec.key].history_window_ns == 700_000_000
 
 
 def test_sample_observations_fails_closed_when_required_input_is_missing():
@@ -231,8 +273,11 @@ def test_sample_observations_fails_closed_when_required_input_is_missing():
     node = SimpleNamespace(
         _subs={spec.key: state},
         _state_specs=[],
+        _frequency=20.0,
+        _n_obs_steps=1,
         _observation_lock=threading.Lock(),
         _sample_observation=PipelinePolicyNode._sample_observation,
+        _sample_observation_history=PipelinePolicyNode._sample_observation_history,
     )
 
     with pytest.raises(ObservationNotReadyError) as error:
@@ -241,6 +286,229 @@ def test_sample_observations_fails_closed_when_required_input_is_missing():
     assert error.value.code == "observation_not_ready"
     assert error.value.recoverable is True
     assert error.value.details["observations"][0]["reason"] == "missing"
+
+
+def test_sample_observations_reports_history_decode_failure(monkeypatch):
+    spec = SimpleNamespace(
+        key="observation.state",
+        topic="/joint_states",
+        ros_type="test/State",
+        resample_policy="hold",
+        asof_tol_ms=0,
+    )
+    state = SimpleNamespace(
+        spec=spec,
+        max_age_ns=500_000_000,
+        step_ns=50_000_000,
+        history_window_ns=1_000_000_000,
+        history=[(1_000_000_000, 1_000_000_000, np.array([1.0], dtype=np.float32))],
+    )
+    node = SimpleNamespace(
+        _subs={spec.key: state},
+        _state_specs=[spec],
+        _frequency=20.0,
+        _n_obs_steps=2,
+        _observation_lock=threading.Lock(),
+        _sample_observation=PipelinePolicyNode._sample_observation,
+        _sample_observation_history=PipelinePolicyNode._sample_observation_history,
+        _subscription_key=lambda current_spec: current_spec.key,
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1_000_000_000)),
+    )
+    monkeypatch.setattr(policy_node_module, "decode_value", lambda _ros_type, _value, _spec: None)
+
+    with pytest.raises(ObservationNotReadyError) as error:
+        PipelinePolicyNode._sample_observations(node, 1_000_000_000)
+
+    assert error.value.details["observations"][0]["reason"] == "decode_failed"
+
+
+def test_sample_observations_builds_aligned_history_with_startup_padding(monkeypatch):
+    state_spec = SimpleNamespace(
+        key="observation.state",
+        topic="/joint_states",
+        ros_type="test/State",
+        resample_policy="hold",
+        asof_tol_ms=0,
+    )
+    image_spec = SimpleNamespace(
+        key="observation.images.top",
+        topic="/camera/top/image_raw",
+        ros_type="test/Image",
+        resample_policy="hold",
+        asof_tol_ms=0,
+    )
+    state = SimpleNamespace(
+        spec=state_spec,
+        max_age_ns=500_000_000,
+        step_ns=50_000_000,
+        history_window_ns=1_000_000_000,
+        history=[
+            (900_000_000, 900_000_000, np.array([1.0], dtype=np.float32)),
+            (950_000_000, 950_000_000, np.array([2.0], dtype=np.float32)),
+            (1_000_000_000, 1_000_000_000, np.array([3.0], dtype=np.float32)),
+        ],
+    )
+    image = SimpleNamespace(
+        spec=image_spec,
+        max_age_ns=500_000_000,
+        step_ns=50_000_000,
+        history_window_ns=1_000_000_000,
+        history=[
+            (900_000_000, 900_000_000, np.full((1, 1, 1), 10.0, dtype=np.float32)),
+            (1_000_000_000, 1_000_000_000, np.full((1, 1, 1), 20.0, dtype=np.float32)),
+        ],
+    )
+    node = SimpleNamespace(
+        _subs={state_spec.key: state, image_spec.key: image},
+        _state_specs=[state_spec],
+        _frequency=20.0,
+        _n_obs_steps=4,
+        _observation_lock=threading.Lock(),
+        _sample_observation=PipelinePolicyNode._sample_observation,
+        _sample_observation_history=PipelinePolicyNode._sample_observation_history,
+        _subscription_key=lambda spec: spec.key,
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1_000_000_000)),
+    )
+    monkeypatch.setattr(policy_node_module, "decode_value", lambda _ros_type, value, _spec: value)
+
+    observations = PipelinePolicyNode._sample_observations(node, 1_000_000_000)
+
+    np.testing.assert_array_equal(
+        observations[state_spec.key],
+        np.array([[[1.0], [1.0], [2.0], [3.0]]], dtype=np.float32),
+    )
+    np.testing.assert_array_equal(
+        observations[image_spec.key][0, :, 0, 0, 0],
+        np.array([10.0, 10.0, 10.0, 20.0], dtype=np.float32),
+    )
+
+
+def test_history_sampling_checks_live_age_only_for_latest_observation():
+    spec = SimpleNamespace(
+        key="observation.state",
+        topic="/joint_states",
+        resample_policy="hold",
+        asof_tol_ms=0,
+    )
+    state = SimpleNamespace(
+        spec=spec,
+        max_age_ns=100_000_000,
+        step_ns=50_000_000,
+        history_window_ns=1_000_000_000,
+        history=[
+            (850_000_000, 850_000_000, "old"),
+            (1_000_000_000, 1_000_000_000, "latest"),
+        ],
+    )
+
+    values, issue = PipelinePolicyNode._sample_observation_history(
+        state,
+        [850_000_000, 900_000_000, 950_000_000, 1_000_000_000],
+        1_050_000_000,
+    )
+
+    assert issue is None
+    assert values == ["old", "old", "old", "latest"]
+
+
+def test_sample_observations_merges_historical_state_sources_on_joint_axis(monkeypatch):
+    first_spec = SimpleNamespace(
+        key="observation.state", topic="/arm", ros_type="test/State", resample_policy="hold", asof_tol_ms=0
+    )
+    second_spec = SimpleNamespace(
+        key="observation.state", topic="/base", ros_type="test/State", resample_policy="hold", asof_tol_ms=0
+    )
+
+    def key_for(spec):
+        return f"{spec.key}_{spec.topic.replace('/', '_')}"
+
+    first = SimpleNamespace(
+        spec=first_spec,
+        max_age_ns=500_000_000,
+        step_ns=50_000_000,
+        history_window_ns=1_000_000_000,
+        history=[(1_000_000_000, 1_000_000_000, np.array([1.0, 2.0], dtype=np.float32))],
+    )
+    second = SimpleNamespace(
+        spec=second_spec,
+        max_age_ns=500_000_000,
+        step_ns=50_000_000,
+        history_window_ns=1_000_000_000,
+        history=[(1_000_000_000, 1_000_000_000, np.array([3.0], dtype=np.float32))],
+    )
+    node = SimpleNamespace(
+        _subs={key_for(first_spec): first, key_for(second_spec): second},
+        _state_specs=[first_spec, second_spec],
+        _frequency=20.0,
+        _n_obs_steps=2,
+        _observation_lock=threading.Lock(),
+        _sample_observation=PipelinePolicyNode._sample_observation,
+        _sample_observation_history=PipelinePolicyNode._sample_observation_history,
+        _subscription_key=key_for,
+        get_clock=lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=1_000_000_000)),
+    )
+    monkeypatch.setattr(policy_node_module, "decode_value", lambda _ros_type, value, _spec: value)
+
+    observations = PipelinePolicyNode._sample_observations(node, 1_000_000_000)
+
+    np.testing.assert_array_equal(
+        observations["observation.state"],
+        np.array([[[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]]], dtype=np.float32),
+    )
+
+
+@pytest.mark.parametrize(
+    ("policy", "asof_tol_ms", "expected_constraint"),
+    [("asof", 10, "asof"), ("drop", 0, "drop")],
+)
+def test_history_sampling_preserves_alignment_constraints(policy, asof_tol_ms, expected_constraint):
+    spec = SimpleNamespace(
+        key="observation.state",
+        topic="/joint_states",
+        resample_policy=policy,
+        asof_tol_ms=asof_tol_ms,
+    )
+    state = SimpleNamespace(
+        spec=spec,
+        max_age_ns=500_000_000,
+        step_ns=50_000_000,
+        history_window_ns=1_000_000_000,
+        history=[(900_000_000, 900_000_000, "value"), (1_000_000_000, 1_000_000_000, "latest")],
+    )
+
+    values, issue = PipelinePolicyNode._sample_observation_history(
+        state,
+        [900_000_000, 950_000_000, 1_000_000_000],
+        1_000_000_000,
+    )
+
+    assert values is None
+    assert issue["constraint"] == expected_constraint
+
+
+def test_history_sampling_rejects_stale_latest_observation():
+    spec = SimpleNamespace(
+        key="observation.state",
+        topic="/joint_states",
+        resample_policy="hold",
+        asof_tol_ms=0,
+    )
+    state = SimpleNamespace(
+        spec=spec,
+        max_age_ns=100_000_000,
+        step_ns=50_000_000,
+        history_window_ns=1_000_000_000,
+        history=[(1_000_000_000, 1_000_000_000, "latest")],
+    )
+
+    values, issue = PipelinePolicyNode._sample_observation_history(
+        state,
+        [950_000_000, 1_000_000_000],
+        1_100_000_001,
+    )
+
+    assert values is None
+    assert issue["constraint"] == "max_age"
 
 
 def test_clear_observation_buffers_accepts_older_episode_timestamps():

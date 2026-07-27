@@ -318,6 +318,7 @@ The initial support matrix is normative and enforced at startup:
 | Policy family | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |
 | --- | --- | --- | --- | --- | --- |
 | ACT | supported | supported | supported | supported | unsupported |
+| Diffusion Policy | supported | unsupported | unsupported | unsupported | unsupported |
 | PI0.5 | supported | supported | unsupported | unsupported | supported |
 | SmolVLA | supported | unsupported | unsupported | supported | supported |
 
@@ -348,6 +349,11 @@ Compatibility is selected explicitly by the Action Expert runtime output. Existi
 an `action` output and no schedule artifact retain the old stepwise action-output behavior. A velocity deployment
 without a schedule is rejected rather than given a guessed default. `hardware_mock` still validates only the raw
 image/topic, joint, and action contracts and needs no PI0.5- or schedule-specific changes.
+
+Native Torch Diffusion Policy samples observation history at the contract control rate according to the model's
+`n_obs_steps`, and its nominal `predict_action_chunk()` length comes from `n_action_steps`. Missing startup history
+is left-padded with each stream's first frame, while different sensor rates retain their configured `hold`, `asof`,
+or `drop` alignment policy on a common time grid.
 
 Optional SDKs are imported lazily. Importing the inference core does not require ACL, RKNNLite, TCIM, torch NPU,
 or Hisilicon worker dependencies. A missing dependency fails only when its deployment is selected.

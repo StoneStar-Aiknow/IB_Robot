@@ -162,6 +162,7 @@ class PipelinePolicyNode(Node):
             load_inference_manifest if config.execution_mode == "monolithic" else load_inference_manifest_metadata
         )
         self._manifest: ValidatedManifest = manifest_loader(config.model_path, config.deployment)
+        self._n_obs_steps = self._manifest.policy.n_obs_steps
         self._contract = None
         self._frequency = 10.0
         self._obs_specs: list[SpecView] = []
@@ -331,14 +332,18 @@ class PipelinePolicyNode(Node):
             asof_tolerance_ns = max(0, int(getattr(spec, "asof_tol_ms", 0))) * 1_000_000
             policy = str(getattr(spec, "resample_policy", "hold")).lower()
             alignment_window_ns = asof_tolerance_ns if policy == "asof" else step_ns if policy == "drop" else 0
+            observation_history_ns = (self._n_obs_steps - 1) * step_ns
             self._subs[key] = _SubState(
                 spec=spec,
                 max_age_ns=max_age_ms * 1_000_000,
                 step_ns=step_ns,
-                history_window_ns=max(
-                    step_ns * 2,
-                    max_age_ms * 1_000_000 + step_ns,
-                    alignment_window_ns + step_ns,
+                history_window_ns=(
+                    max(
+                        step_ns * 2,
+                        max_age_ms * 1_000_000 + step_ns,
+                        alignment_window_ns + step_ns,
+                    )
+                    + observation_history_ns
                 ),
             )
             message_type = get_message(spec.ros_type)
@@ -415,7 +420,11 @@ class PipelinePolicyNode(Node):
 
     @staticmethod
     def _sample_observation(
-        state: _SubState, sample_time_ns: int, now_ns: int | None = None
+        state: _SubState,
+        sample_time_ns: int,
+        now_ns: int | None = None,
+        *,
+        check_live_age: bool = True,
     ) -> tuple[Any | None, dict[str, object] | None]:
         spec = state.spec
         if not state.history:
@@ -475,7 +484,7 @@ class PipelinePolicyNode(Node):
             }
 
         live_age_ns = max(0, (now_ns if now_ns is not None else sample_time_ns) - receive_time_ns)
-        if value is None or (state.max_age_ns > 0 and live_age_ns > state.max_age_ns):
+        if value is None or (check_live_age and state.max_age_ns > 0 and live_age_ns > state.max_age_ns):
             return None, {
                 "key": spec.key,
                 "topic": spec.topic,
@@ -488,13 +497,46 @@ class PipelinePolicyNode(Node):
             }
         return value, None
 
+    @staticmethod
+    def _sample_observation_history(
+        state: _SubState, sample_times_ns: list[int], now_ns: int
+    ) -> tuple[list[Any] | None, dict[str, object] | None]:
+        if not state.history:
+            _, issue = PipelinePolicyNode._sample_observation(state, sample_times_ns[-1], now_ns)
+            return None, issue
+        if state.history[0][0] > sample_times_ns[-1]:
+            _, issue = PipelinePolicyNode._sample_observation(state, sample_times_ns[-1], now_ns)
+            return None, issue
+
+        first_timestamp_ns, _, first_value = state.history[0]
+        values: list[Any] = []
+        for index, sample_time_ns in enumerate(sample_times_ns):
+            if sample_time_ns < first_timestamp_ns:
+                values.append(first_value)
+                continue
+            value, issue = PipelinePolicyNode._sample_observation(
+                state,
+                sample_time_ns,
+                now_ns,
+                check_live_age=index == len(sample_times_ns) - 1,
+            )
+            if issue is not None:
+                return None, issue
+            values.append(value)
+        return values, None
+
     def _sample_observations(self, sample_time_ns: int) -> dict[str, Any]:
         selected: dict[str, object] = {}
         issues: list[dict[str, object]] = []
         now_ns = self.get_clock().now().nanoseconds if hasattr(self, "get_clock") else sample_time_ns
+        step_ns = next(iter(self._subs.values())).step_ns if self._subs else int(1e9 / self._frequency)
+        sample_times_ns = [sample_time_ns - step_ns * offset for offset in reversed(range(self._n_obs_steps))]
         with self._observation_lock:
             for key, state in self._subs.items():
-                value, issue = self._sample_observation(state, sample_time_ns, now_ns)
+                if self._n_obs_steps == 1:
+                    value, issue = self._sample_observation(state, sample_time_ns, now_ns)
+                else:
+                    value, issue = self._sample_observation_history(state, sample_times_ns, now_ns)
                 if issue is not None:
                     issues.append(issue)
                 selected[key] = value
@@ -506,17 +548,20 @@ class PipelinePolicyNode(Node):
         decode_issues: list[dict[str, object]] = []
         for key, message in selected.items():
             state = self._subs[key]
-            value = decode_value(state.spec.ros_type, message, state.spec)
-            if value is None:
+            messages = message if self._n_obs_steps > 1 else [message]
+            values = [decode_value(state.spec.ros_type, item, state.spec) for item in messages]
+            if any(value is None for value in values):
                 decode_issues.append({"key": state.spec.key, "topic": state.spec.topic, "reason": "decode_failed"})
-            sampled[key] = value
+                sampled[key] = None
+            else:
+                sampled[key] = np.ascontiguousarray(np.stack(values)[None, ...]) if self._n_obs_steps > 1 else values[0]
         if decode_issues:
             raise ObservationNotReadyError(decode_issues)
 
         observations: dict[str, Any] = {}
         if len(self._state_specs) > 1:
             state_parts = [sampled[self._subscription_key(spec)] for spec in self._state_specs]
-            observations["observation.state"] = np.concatenate(state_parts)
+            observations["observation.state"] = np.concatenate(state_parts, axis=-1)
 
         for key, value in sampled.items():
             if key.startswith("observation.state_") and len(self._state_specs) > 1:
@@ -537,8 +582,8 @@ class PipelinePolicyNode(Node):
             return np.ascontiguousarray(state, dtype=np.float32)
         converted = state.astype(np.float64).copy()
         for index, (minimum, maximum, span, offset) in enumerate(self._joint_rad_limits):
-            if index < len(state):
-                converted[index] = (state[index] - minimum) / (maximum - minimum) * span + offset
+            if index < converted.shape[-1]:
+                converted[..., index] = (state[..., index] - minimum) / (maximum - minimum) * span + offset
         return converted.astype(np.float32)
 
     def _lerobot_to_rad(self, action: object) -> np.ndarray:

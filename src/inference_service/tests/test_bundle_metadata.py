@@ -100,9 +100,40 @@ def test_policy_metadata_reads_optional_action_generation_dimensions(tmp_path):
     assert metadata.max_action_dimension == 32
 
 
-@pytest.mark.parametrize(("key", "value"), [("chunk_size", 0), ("max_action_dim", -1)])
-def test_policy_metadata_rejects_invalid_action_generation_dimensions(tmp_path, key, value):
-    create_policy_bundle(tmp_path, "pi05")
+def test_diffusion_metadata_uses_observation_and_action_steps(tmp_path):
+    create_policy_bundle(tmp_path, "diffusion")
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.update({"n_obs_steps": 2, "horizon": 64, "n_action_steps": 44, "chunk_size": 99})
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    metadata = load_policy_metadata(tmp_path)
+
+    assert metadata.n_obs_steps == 2
+    assert metadata.nominal_chunk_size == 44
+
+
+@pytest.mark.parametrize(("policy_type", "expected"), [("act", 1), ("diffusion", 2)])
+def test_policy_metadata_defaults_observation_steps_by_policy(tmp_path, policy_type, expected):
+    create_policy_bundle(tmp_path, policy_type)
+
+    metadata = load_policy_metadata(tmp_path)
+
+    assert metadata.n_obs_steps == expected
+
+
+@pytest.mark.parametrize(
+    ("policy_type", "key", "value"),
+    [
+        ("pi05", "chunk_size", 0),
+        ("pi05", "max_action_dim", -1),
+        ("diffusion", "n_obs_steps", 0),
+        ("diffusion", "n_action_steps", 0),
+        ("diffusion", "n_action_steps", 1.5),
+    ],
+)
+def test_policy_metadata_rejects_invalid_action_generation_dimensions(tmp_path, policy_type, key, value):
+    create_policy_bundle(tmp_path, policy_type)
     config_path = tmp_path / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     config[key] = value

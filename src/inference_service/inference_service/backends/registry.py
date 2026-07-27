@@ -13,7 +13,7 @@ from inference_service.backends.errors import BackendCompatibilityError, Backend
 from inference_service.backends.types import InferenceBackend, RuntimeContext
 
 CANONICAL_BACKENDS = ("torch", "ascend", "hisilicon", "rknn", "hmm")
-POLICY_FAMILIES = frozenset({"act", "pi05", "smolvla"})
+POLICY_FAMILIES = frozenset({"act", "diffusion", "pi05", "smolvla"})
 _FACTORY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
 
 TargetValidator = Callable[[Deployment], str | None]
@@ -231,7 +231,7 @@ STATIC_BACKEND_DESCRIPTORS: Mapping[str, BackendDescriptor] = MappingProxyType(
         "torch": BackendDescriptor(
             name="torch",
             factory="inference_service.backends.torch:create_backend",
-            supported_policy_families=frozenset({"act", "pi05", "smolvla"}),
+            supported_policy_families=frozenset({"act", "diffusion", "pi05", "smolvla"}),
             target_validator=_validate_torch,
         ),
         "ascend": BackendDescriptor(
