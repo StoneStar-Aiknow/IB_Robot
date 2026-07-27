@@ -83,6 +83,35 @@ for _cann_env in "${_CANN_CANDIDATES[@]}"; do
 done
 if [ -n "${_CANN_LOADED}" ]; then
     _IB_STEPS+=("CANN (${_CANN_LOADED})")
+
+    # CANN/ATC 的 TIK C++ 编译阶段可能无法自动找到系统 libstdc++ 头文件。
+    # 根据当前编译器版本和目标三元组追加实际存在的目录，兼容 openEuler/Ubuntu
+    # 以及 aarch64/x86_64，避免硬编码 /usr/include/c++/12/aarch64-openEuler-linux。
+    if command -v g++ &> /dev/null; then
+        _CXX_VERSION="$(g++ -dumpversion 2>/dev/null)"
+        _CXX_FULL_VERSION="$(g++ -dumpfullversion -dumpversion 2>/dev/null)"
+        _CXX_TARGET="$(g++ -dumpmachine 2>/dev/null)"
+        _CXX_ROOT="/usr/include/c++/${_CXX_VERSION}"
+        _CXX_INCLUDE_DIRS=()
+        for _cxx_dir in \
+            "${_CXX_ROOT}" \
+            "${_CXX_ROOT}/backward" \
+            "${_CXX_ROOT}/${_CXX_TARGET}"; do
+            if [ -d "${_cxx_dir}" ]; then
+                _CXX_INCLUDE_DIRS+=("${_cxx_dir}")
+            fi
+        done
+        if [ "${#_CXX_INCLUDE_DIRS[@]}" -gt 0 ]; then
+            _CXX_INCLUDE_PATH="$(IFS=:; echo "${_CXX_INCLUDE_DIRS[*]}")"
+            export CPLUS_INCLUDE_PATH="${_CXX_INCLUDE_PATH}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+            _IB_STEPS+=("CANN C++ headers (${_CXX_TARGET}, GCC ${_CXX_FULL_VERSION})")
+        else
+            _IB_SKIPPED+=("CANN C++ headers (未找到 ${_CXX_ROOT})")
+        fi
+        unset _CXX_VERSION _CXX_FULL_VERSION _CXX_TARGET _CXX_ROOT _CXX_INCLUDE_DIRS _CXX_INCLUDE_PATH _cxx_dir
+    else
+        _IB_SKIPPED+=("CANN C++ headers (未找到 g++)")
+    fi
 else
     _IB_SKIPPED+=("CANN (未检测到 Ascend toolkit)")
 fi
