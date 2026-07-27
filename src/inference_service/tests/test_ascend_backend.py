@@ -1,20 +1,24 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import ModuleType
 
 import numpy as np
 import pytest
 
-from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest, sha256_file
+from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
 from inference_manifest.models import DeviceLink
 from inference_service.backends import (
     BACKEND_REGISTRY,
     BackendCapabilityError,
+    BackendDescriptor,
     BackendLoadError,
+    BackendRegistry,
     BackendState,
     InferenceRequest,
     RuntimeContext,
@@ -22,8 +26,11 @@ from inference_service.backends import (
 from inference_service.backends.ascend import AscendBackend, create_backend
 from inference_service.backends.ascend.acl_runtime import AclRuntimeManager
 from inference_service.codecs import CodecRequest, build_execution_plan, create_policy_codec
+from inference_service.core.pure_inference_engine import PureInferenceEngine
+from inference_service.pi05_schedule import load_pi05_schedule
 from inference_service.pipeline import InferencePipeline
-from tests.manifest_fixtures import create_policy_bundle, write_manifest
+from inference_service.pipeline import factory as pipeline_factory
+from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID, create_policy_bundle, write_manifest
 
 _DTYPE_CODES = {
     np.dtype("float32"): 0,
@@ -154,6 +161,7 @@ class FakeAclMDL:
     def unload(self, model_id):
         self.owner.unloaded_models.append(model_id)
         self.owner.loaded_models.pop(model_id)
+        self.owner.model_paths.pop(model_id)
         return 0
 
     @staticmethod
@@ -212,6 +220,13 @@ class FakeAclMDL:
 
     def execute(self, model_id, input_dataset, output_dataset):
         spec = self.owner.loaded_models[model_id]
+        self.owner.executions.append(
+            (
+                self.owner.model_paths[model_id],
+                tuple(item["pointer"] for item in input_dataset),
+                tuple(item["pointer"] for item in output_dataset),
+            )
+        )
         inputs = [
             np.frombuffer(self.owner.read_pointer(item["pointer"], tensor.size), dtype=tensor.dtype)
             .reshape(tensor.shape)
@@ -241,6 +256,7 @@ class FakeAcl:
         self.loaded_models: dict[object, FakeModelSpec] = {}
         self.model_paths: dict[object, str] = {}
         self.unloaded_models: list[object] = []
+        self.executions: list[tuple[str, tuple[object, ...], tuple[object, ...]]] = []
         self.memory: dict[object, bytearray] = {}
         self.freed_pointers: list[object] = []
         self.freed_host_pointers: list[object] = []
@@ -293,21 +309,31 @@ def _tensor(name: str, dtype: str, shape: tuple[int, ...]) -> FakeTensorSpec:
 
 
 def _bundle_entries(root: Path, paths: tuple[str, ...]) -> list[BundleFile]:
-    return [BundleFile(path=path, sha256=sha256_file(root / path)) for path in paths]
+    del root
+    return [BundleFile(path=path) for path in paths]
 
 
-def _write_compiled_manifest(root: Path, bundle_paths: tuple[str, ...], deployment: dict) -> None:
+def _write_compiled_manifest(
+    root: Path, bundle_paths: tuple[str, ...], deployment: dict, *, deployment_name: str = "ascend"
+) -> None:
     entries = _bundle_entries(root, bundle_paths)
+    deployment = {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, **deployment}
     write_manifest(
         root,
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "bundle": {
+                "uuid": TEST_BUNDLE_UUID,
+                "revision": 1,
                 "name": "ascend-test",
                 "files": [entry.model_dump(mode="json") for entry in entries],
-                "digest": {"algorithm": "sha256", "value": canonical_bundle_digest(entries)},
+                "digest": {
+                    "algorithm": "sha256",
+                    "scope": "structure",
+                    "value": canonical_bundle_digest(TEST_BUNDLE_UUID, 1, "ascend-test", entries),
+                },
             },
-            "deployments": {"ascend": deployment},
+            "deployments": {deployment_name: deployment},
         },
     )
 
@@ -324,7 +350,7 @@ def _act_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
         {
             "backend": "ascend",
             "target": {"soc": "ascend310", "runtime": "acl"},
-            "artifacts": {"policy": {"path": "artifacts/policy.om", "format": "om", "sha256": sha256_file(model)}},
+            "artifacts": {"policy": {"path": "artifacts/policy.om", "format": "om"}},
             "execution": ["policy"],
             "bindings": {
                 "policy": {
@@ -361,12 +387,28 @@ def _act_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
     return RuntimeContext(load_inference_manifest(tmp_path, "ascend"), runtime_options=runtime_options or {})
 
 
-def _pi05_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
+def _pi05_context(
+    tmp_path: Path,
+    *,
+    runtime_options=None,
+    deployment_name: str = "ascend",
+    chunk_size: int = 2,
+    max_action_dim: int = 8,
+    num_inference_steps: int = 2,
+    action_runtime_name: str = "action",
+    schedule: dict[str, object] | str | None = None,
+) -> RuntimeContext:
     tmp_path.mkdir(parents=True, exist_ok=True)
     bundle_paths = create_policy_bundle(tmp_path, "pi05", include_weights=False)
     config_path = tmp_path / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    config.update({"chunk_size": 2, "max_action_dim": 8, "num_inference_steps": 2})
+    config.update(
+        {
+            "chunk_size": chunk_size,
+            "max_action_dim": max_action_dim,
+            "num_inference_steps": num_inference_steps,
+        }
+    )
     config["input_features"].update(
         {
             "observation.language.tokens": {"type": "LANGUAGE", "shape": [4]},
@@ -379,20 +421,30 @@ def _pi05_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
     vlm.parent.mkdir(parents=True)
     vlm.write_bytes(b"vlm-om")
     action_expert.write_bytes(b"action-expert-om")
+    artifacts = {
+        "vlm": {"path": "artifacts/vlm.om", "format": "om"},
+        "action_expert": {
+            "path": "artifacts/action_expert.om",
+            "format": "om",
+        },
+    }
+    if schedule is not None:
+        schedule_path = tmp_path / "artifacts" / "denoising_schedule.json"
+        if isinstance(schedule, str):
+            schedule_path.write_text(schedule, encoding="utf-8")
+        else:
+            schedule_path.write_text(json.dumps(schedule), encoding="utf-8")
+        artifacts["denoising_schedule"] = {
+            "path": "artifacts/denoising_schedule.json",
+            "format": "json",
+        }
     _write_compiled_manifest(
         tmp_path,
         bundle_paths,
         {
             "backend": "ascend",
             "target": {"soc": "ascend310", "runtime": "acl"},
-            "artifacts": {
-                "vlm": {"path": "artifacts/vlm.om", "format": "om", "sha256": sha256_file(vlm)},
-                "action_expert": {
-                    "path": "artifacts/action_expert.om",
-                    "format": "om",
-                    "sha256": sha256_file(action_expert),
-                },
-            },
+            "artifacts": artifacts,
             "execution": ["vlm", "action_expert"],
             "bindings": {
                 "vlm": {
@@ -478,7 +530,7 @@ def _pi05_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
                     "outputs": [
                         {
                             "semantic": "action",
-                            "runtime_name": "action",
+                            "runtime_name": action_runtime_name,
                             "index": 0,
                             "dtype": "float32",
                             "shape": [1, 2, 8],
@@ -505,8 +557,9 @@ def _pi05_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
                 },
             ],
         },
+        deployment_name=deployment_name,
     )
-    return RuntimeContext(load_inference_manifest(tmp_path, "ascend"), runtime_options=runtime_options or {})
+    return RuntimeContext(load_inference_manifest(tmp_path, deployment_name), runtime_options=runtime_options or {})
 
 
 def _act_acl(
@@ -538,7 +591,12 @@ def _act_acl(
     )
 
 
-def _pi05_acl(context: RuntimeContext, observed_times: list[float]) -> FakeAcl:
+def _pi05_acl(
+    context: RuntimeContext,
+    observed_times: list[float],
+    observed_noise: list[np.ndarray] | None = None,
+    action_callback=None,
+) -> FakeAcl:
     vlm_path = str(context.resolved_artifacts["vlm"])
     action_path = str(context.resolved_artifacts["action_expert"])
 
@@ -554,7 +612,9 @@ def _pi05_acl(context: RuntimeContext, observed_times: list[float]) -> FakeAcl:
         np.testing.assert_array_equal(past_kv, np.array([[3.0, 4.0]], dtype=np.float32))
         np.testing.assert_array_equal(masks, np.array([[True, True, False, False]]))
         observed_times.append(float(time_value[0]))
-        return [noise - 1.0]
+        if observed_noise is not None:
+            observed_noise.append(noise.copy())
+        return [(action_callback(noise) if action_callback is not None else noise - 1.0)]
 
     return FakeAcl(
         {
@@ -578,9 +638,36 @@ def _pi05_acl(context: RuntimeContext, observed_times: list[float]) -> FakeAcl:
                     _tensor("time", "float32", (1,)),
                     _tensor("noise", "float32", (1, 2, 8)),
                 ),
-                outputs=(_tensor("action", "float32", (1, 2, 8)),),
+                outputs=(
+                    _tensor(
+                        context.deployment.bindings["action_expert"].outputs[0].runtime_name,
+                        "float32",
+                        (1, 2, 8),
+                    ),
+                ),
                 callback=execute_action,
             ),
+        }
+    )
+
+
+def _pure_engine_registry(monkeypatch, acl: FakeAcl) -> BackendRegistry:
+    module = ModuleType("tests.fake_ascend_engine_backend")
+
+    def fake_create_backend(context: RuntimeContext) -> AscendBackend:
+        device_id = context.runtime_options.get("device_id", 0)
+        return AscendBackend(int(device_id), runtime_manager=AclRuntimeManager(lambda: acl))
+
+    module.create_backend = fake_create_backend
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    return BackendRegistry(
+        {
+            "ascend": BackendDescriptor(
+                name="ascend",
+                factory=f"{module.__name__}:create_backend",
+                supported_policy_families=frozenset({"pi05"}),
+                target_validator=lambda deployment: None,
+            )
         }
     )
 
@@ -638,9 +725,322 @@ def test_ascend_pi05_keeps_device_links_internal_and_runs_denoising_loop(tmp_pat
     np.testing.assert_array_equal(result.action, np.full((1, 2, 6), -2.0, dtype=np.float32))
     assert result.actual_chunk_size == 2
     assert observed_times == [1.0, 0.5]
+    assert "denoising_schedule" not in result.metadata
     pipeline.close()
     assert acl.memory == {}
     assert acl.finalize_calls == 1
+
+
+def test_ascend_pi05_integrates_uniform_velocity_schedule(tmp_path):
+    schedule = {
+        "format": "pi05-denoising-schedule-v1",
+        "name": "uniform-two-step",
+        "algorithm": "euler",
+        "model_output": "velocity",
+        "timesteps": [1.0, 0.5, 0.0],
+    }
+    context = _pi05_context(tmp_path, action_runtime_name="/Identity:0:velocity", schedule=schedule)
+    observed_times: list[float] = []
+    observed_noise: list[np.ndarray] = []
+    acl = _pi05_acl(
+        context,
+        observed_times,
+        observed_noise,
+        action_callback=lambda noise: np.ones_like(noise),
+    )
+    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
+    pipeline = InferencePipeline("pi05", context, backend, codec=create_policy_codec(context.policy))
+    pipeline.load()
+
+    result = pipeline.infer(
+        InferenceRequest(
+            request_id="velocity-uniform",
+            inputs={
+                "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
+                "observation.language.tokens": np.array([1, 2, 3, 4], dtype=np.int64),
+                "observation.language.attention_mask": np.array([True, True, False, False]),
+                "noise": np.zeros((1, 2, 8), dtype=np.float32),
+            },
+        )
+    )
+
+    np.testing.assert_array_equal(result.action, np.full((1, 2, 6), -1.0, dtype=np.float32))
+    assert observed_times == [1.0, 0.5]
+    np.testing.assert_array_equal(observed_noise[0], np.zeros((1, 2, 8), dtype=np.float32))
+    np.testing.assert_array_equal(observed_noise[1], np.full((1, 2, 8), -0.5, dtype=np.float32))
+    assert result.metadata["denoising_schedule"] == {
+        "name": "uniform-two-step",
+        "step_count": 2,
+        "source": "artifacts/denoising_schedule.json",
+    }
+    pipeline.close()
+
+
+def test_ascend_pi05_integrates_non_uniform_velocity_schedule_and_captures_diagnostics(tmp_path):
+    schedule = {
+        "format": "pi05-denoising-schedule-v1",
+        "name": "non-uniform",
+        "algorithm": "euler",
+        "model_output": "velocity",
+        "timesteps": [1.0, 0.8, 0.2, 0.0],
+    }
+    context = _pi05_context(tmp_path, action_runtime_name="v_t", schedule=schedule)
+    observed_times: list[float] = []
+    observed_noise: list[np.ndarray] = []
+    captured: dict[str, np.ndarray] = {}
+    acl = _pi05_acl(
+        context,
+        observed_times,
+        observed_noise,
+        action_callback=lambda noise: np.full_like(noise, 2.0),
+    )
+    backend = AscendBackend(
+        0,
+        runtime_manager=AclRuntimeManager(lambda: acl),
+        diagnostic_capture=lambda name, value: captured.setdefault(name, np.asarray(value).copy()),
+    )
+    pipeline = InferencePipeline("pi05", context, backend, codec=create_policy_codec(context.policy))
+    pipeline.load()
+
+    result = pipeline.infer(
+        InferenceRequest(
+            request_id="velocity-non-uniform",
+            inputs={
+                "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
+                "observation.language.tokens": np.array([1, 2, 3, 4], dtype=np.int64),
+                "observation.language.attention_mask": np.array([True, True, False, False]),
+                "noise": np.zeros((1, 2, 8), dtype=np.float32),
+            },
+        )
+    )
+
+    np.testing.assert_allclose(result.action, np.full((1, 2, 6), -2.0, dtype=np.float32))
+    np.testing.assert_allclose(observed_times, [1.0, 0.8, 0.2])
+    np.testing.assert_allclose(captured["timesteps"], [1.0, 0.8, 0.2, 0.0])
+    np.testing.assert_allclose(captured["dt_step00"], -0.2)
+    np.testing.assert_allclose(captured["dt_step01"], -0.6)
+    np.testing.assert_allclose(captured["velocity_step01"], 2.0)
+    np.testing.assert_allclose(captured["x_t_step01"], -1.6)
+    pipeline.close()
+
+
+def test_ascend_rejects_invalid_schedule_before_acl_initialization(tmp_path):
+    invalid_schedule = {
+        "format": "pi05-denoising-schedule-v1",
+        "name": "invalid",
+        "algorithm": "euler",
+        "model_output": "velocity",
+        "timesteps": [1.0, 0.5, 0.6, 0.0],
+    }
+    context = _pi05_context(tmp_path, action_runtime_name="velocity", schedule=invalid_schedule)
+    acl = _pi05_acl(context, [])
+    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
+
+    with pytest.raises(BackendLoadError) as error:
+        backend.load(context)
+
+    assert error.value.code == "invalid_denoising_schedule"
+    assert acl.init_calls == []
+    backend.close()
+
+
+def test_ascend_diagnostic_schedule_takes_precedence_and_is_reported(tmp_path):
+    manifest_schedule = {
+        "format": "pi05-denoising-schedule-v1",
+        "name": "manifest",
+        "algorithm": "euler",
+        "model_output": "velocity",
+        "timesteps": [1.0, 0.5, 0.0],
+    }
+    override_path = tmp_path / "override.json"
+    override_path.write_text(
+        json.dumps({**manifest_schedule, "name": "override", "timesteps": [1.0, 0.75, 0.25, 0.0]}),
+        encoding="utf-8",
+    )
+    context = _pi05_context(tmp_path, action_runtime_name="velocity", schedule=manifest_schedule)
+    observed_times: list[float] = []
+    acl = _pi05_acl(context, observed_times, action_callback=lambda noise: np.ones_like(noise))
+    backend = AscendBackend(
+        0,
+        runtime_manager=AclRuntimeManager(lambda: acl),
+        diagnostic_schedule=load_pi05_schedule(override_path),
+        diagnostic_schedule_source=str(override_path.resolve()),
+    )
+    pipeline = InferencePipeline("override", context, backend, codec=create_policy_codec(context.policy))
+    pipeline.load()
+
+    result = pipeline.infer(
+        InferenceRequest(
+            request_id="override",
+            inputs={
+                "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
+                "observation.language.tokens": np.array([1, 2, 3, 4], dtype=np.int64),
+                "observation.language.attention_mask": np.array([True, True, False, False]),
+                "noise": np.zeros((1, 2, 8), dtype=np.float32),
+            },
+        )
+    )
+
+    assert observed_times == [1.0, 0.75, 0.25]
+    assert result.metadata["denoising_schedule"] == {
+        "name": "override",
+        "step_count": 3,
+        "source": str(override_path.resolve()),
+        "override": True,
+    }
+    pipeline.close()
+
+
+def test_ascend_rejects_schedule_diagnostics_for_legacy_action_output(tmp_path):
+    override_path = tmp_path / "override.json"
+    override_path.write_text(
+        json.dumps(
+            {
+                "format": "pi05-denoising-schedule-v1",
+                "name": "override",
+                "algorithm": "euler",
+                "model_output": "velocity",
+                "timesteps": [1.0, 0.0],
+            }
+        ),
+        encoding="utf-8",
+    )
+    context = _pi05_context(tmp_path)
+    acl = _pi05_acl(context, [])
+    backend = AscendBackend(
+        0,
+        runtime_manager=AclRuntimeManager(lambda: acl),
+        diagnostic_schedule=load_pi05_schedule(override_path),
+        diagnostic_schedule_source=str(override_path),
+    )
+
+    with pytest.raises(BackendLoadError) as error:
+        backend.load(context)
+
+    assert error.value.code == "invalid_runtime_options"
+    assert acl.init_calls == []
+    backend.close()
+
+
+def test_ascend_curvature_log_records_strict_schedule_and_adjacent_velocity_scores(tmp_path):
+    schedule = {
+        "format": "pi05-denoising-schedule-v1",
+        "name": "dense",
+        "algorithm": "euler",
+        "model_output": "velocity",
+        "timesteps": [1.0, 0.75, 0.25, 0.0],
+    }
+    curvature_path = tmp_path / "diagnostics" / "curvature.jsonl"
+    context = _pi05_context(
+        tmp_path,
+        action_runtime_name="v_t",
+        schedule=schedule,
+        runtime_options={"curvature_log_path": str(curvature_path)},
+    )
+    velocities = iter((1.0, 2.0, 4.0))
+    acl = _pi05_acl(
+        context,
+        [],
+        action_callback=lambda noise: np.full_like(noise, next(velocities)),
+    )
+    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
+    pipeline = InferencePipeline("curvature", context, backend, codec=create_policy_codec(context.policy))
+    pipeline.load()
+
+    pipeline.infer(
+        InferenceRequest(
+            request_id="curvature",
+            inputs={
+                "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
+                "observation.language.tokens": np.array([1, 2, 3, 4], dtype=np.int64),
+                "observation.language.attention_mask": np.array([True, True, False, False]),
+                "noise": np.zeros((1, 2, 8), dtype=np.float32),
+            },
+        )
+    )
+    pipeline.close()
+
+    record = json.loads(curvature_path.read_text(encoding="utf-8"))
+    assert record["schedule"] == schedule
+    np.testing.assert_allclose(record["curvature_scores"], [1.0, 1.0, 1.0], rtol=1e-5)
+
+
+@pytest.mark.parametrize("name", ["curvature_log_path"])
+def test_ascend_runtime_diagnostic_paths_must_be_nonempty(name):
+    with pytest.raises(BackendLoadError, match="non-empty"):
+        AscendBackend._validate_runtime_options({name: "   "})
+
+
+def test_ascend_rejects_schedule_override_runtime_option():
+    with pytest.raises(BackendLoadError, match="unknown Ascend runtime options"):
+        AscendBackend._validate_runtime_options({"schedule_override_path": "/tmp/schedule.json"})
+
+
+def test_pure_engine_runs_named_pi05_ascend_deployment_end_to_end_with_fake_acl(monkeypatch, tmp_path):
+    deployment_name = "warehouse-arm-om"
+    context = _pi05_context(
+        tmp_path,
+        deployment_name=deployment_name,
+        runtime_options={"device_id": 3, "random_seed": 99},
+    )
+    observed_times: list[float] = []
+    observed_noise: list[np.ndarray] = []
+    acl = _pi05_acl(context, observed_times, observed_noise)
+
+    def create_processor_views():
+        return (lambda inputs: inputs), (lambda action: np.asarray(action) + np.float32(10.0))
+
+    monkeypatch.setattr(pipeline_factory, "create_lerobot_processor_views", create_processor_views)
+    engine = PureInferenceEngine(
+        tmp_path,
+        deployment_name,
+        pipeline_id="named-pi05",
+        runtime_options={"device_id": 3, "random_seed": 99},
+        registry=_pure_engine_registry(monkeypatch, acl),
+    )
+    external_noise = np.full((1, 2, 8), 5.0, dtype=np.float32)
+
+    result = engine(
+        {
+            "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
+            "observation.language.tokens": np.array([1, 2, 3, 4], dtype=np.int64),
+            "observation.language.attention_mask": np.array([True, True, False, False]),
+        },
+        request_id="pure-pi05",
+        control_inputs={"noise": external_noise},
+        capture_raw_action=True,
+    )
+
+    assert result.policy_type == "pi05"
+    assert result.backend_type == "ascend"
+    assert result.chunk_size == 2
+    assert engine.chunk_size == 2
+    assert result.shape == (1, 2, 6)
+    np.testing.assert_array_equal(result.raw_action, np.full((1, 2, 6), 3.0, dtype=np.float32))
+    np.testing.assert_array_equal(result.action, np.full((1, 2, 6), 13.0, dtype=np.float32))
+    assert observed_times == [1.0, 0.5]
+    np.testing.assert_array_equal(observed_noise[0], external_noise)
+    np.testing.assert_array_equal(observed_noise[1], external_noise - 1.0)
+
+    vlm_path = str(context.resolved_artifacts["vlm"])
+    action_path = str(context.resolved_artifacts["action_expert"])
+    vlm_executions = [execution for execution in acl.executions if execution[0] == vlm_path]
+    action_executions = [execution for execution in acl.executions if execution[0] == action_path]
+    assert len(vlm_executions) == 1
+    assert len(action_executions) == 2
+    assert action_executions[0][1][:2] == vlm_executions[0][2]
+    assert action_executions[1][1][:2] == vlm_executions[0][2]
+
+    engine.close()
+    engine.close()
+    assert acl.init_calls == [None]
+    assert acl.set_device_calls == [3]
+    assert acl.reset_device_calls == [3]
+    assert acl.finalize_calls == 1
+    assert acl.loaded_models == {}
+    assert acl.model_paths == {}
+    assert acl.contexts == set()
+    assert acl.memory == {}
 
 
 def test_ascend_rejects_input_sourced_device_link_before_acl_initialization(tmp_path):
@@ -752,6 +1152,36 @@ def test_ascend_partial_load_failure_rolls_back_models_context_device_and_acl(tm
     assert acl.reset_device_calls == [0]
     assert acl.finalize_calls == 1
     assert acl.memory == {}
+    backend.close()
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("chunk_size", 0),
+        ("max_action_dim", True),
+        ("num_inference_steps", "2"),
+    ],
+)
+def test_ascend_rejects_invalid_pi05_policy_config_without_leaks(tmp_path, key, value):
+    context = _pi05_context(tmp_path)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config[key] = value
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    acl = _pi05_acl(context, [])
+    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
+
+    with pytest.raises(BackendLoadError) as error:
+        backend.load(context)
+
+    assert error.value.code == "invalid_policy_config"
+    assert backend.health().state is BackendState.FAILED
+    assert acl.loaded_models == {}
+    assert acl.contexts == set()
+    assert acl.memory == {}
+    assert acl.reset_device_calls == [0]
+    assert acl.finalize_calls == 1
     backend.close()
 
 

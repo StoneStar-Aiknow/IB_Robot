@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +69,7 @@ class InferenceResult:
     policy_type: str
     backend_type: str
     raw_action: object | None = None
+    metadata: Mapping[str, object] = field(default_factory=dict)
 
     def to_numpy(self) -> np.ndarray:
         candidate = self.action
@@ -139,6 +140,7 @@ class PureInferenceEngine:
             policy_type=self._context.policy.policy_type,
             backend_type=result.backend,
             raw_action=result.raw_action,
+            metadata=result.metadata,
         )
 
     def reset(self) -> None:
