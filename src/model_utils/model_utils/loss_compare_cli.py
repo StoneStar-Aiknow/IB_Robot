@@ -49,6 +49,10 @@ SRC_BUILTIN = "builtin"
 SRC_WIZARD = "wizard"
 SRC_DERIVED = "derived(exp-dir)"
 
+# Transient values are never written back; new diagnostics are also ignored in config files.
+_TRANSIENT_KEYS = {"generate_target", "metrics_json", "schedule_override_path", "curvature_log_path"}
+_CLI_ONLY_KEYS = {"metrics_json", "schedule_override_path", "curvature_log_path"}
+
 
 @dataclass
 class Param:
@@ -166,6 +170,24 @@ PARAMS: list[Param] = [
         is_flag=True,
         in_wizard=False,
     ),
+    Param(
+        dest="metrics_json",
+        cli="--metrics-json",
+        meaning="Write aggregate comparison metrics as machine-readable JSON",
+        in_wizard=False,
+    ),
+    Param(
+        dest="schedule_override_path",
+        cli="--schedule-override-path",
+        meaning="Transient strict PI0.5 schedule override passed to the selected runtime",
+        in_wizard=False,
+    ),
+    Param(
+        dest="curvature_log_path",
+        cli="--curvature-log-path",
+        meaning="Transient PI0.5 per-inference curvature JSONL output path",
+        in_wizard=False,
+    ),
 ]
 
 PARAMS_BY_DEST = {p.dest: p for p in PARAMS}
@@ -214,6 +236,10 @@ def save_config(path: str, data: dict[str, Any]) -> None:
 def _clean_run_params(values: dict[str, Any]) -> dict[str, Any]:
     """Keep only persistable run params (drop meta / None)."""
     return {k: v for k, v in values.items() if k in PARAMS_BY_DEST and k not in _META_KEYS and v is not None}
+
+
+def _clean_config_run_params(values: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in _clean_run_params(values).items() if key not in _CLI_ONLY_KEYS}
 
 
 # ---------------------------------------------------------------------------
@@ -370,15 +396,15 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
         else:
             print(f"profiles in {config_path}:")
             for name, vals in profiles.items():
-                print(f"  - {name}: {_clean_run_params(vals)}")
+                print(f"  - {name}: {_clean_config_run_params(vals)}")
         raise SystemExit(0)
 
     # CLI-provided run params (non-None means user passed it).
     cli_values = {p.dest: getattr(ns, p.dest) for p in PARAMS}
     cli_given = {k: v for k, v in cli_values.items() if v is not None}
 
-    defaults = _clean_run_params(config.get("defaults", {}))
-    last = _clean_run_params(config.get("_last", {}))
+    defaults = _clean_config_run_params(config.get("defaults", {}))
+    last = _clean_config_run_params(config.get("_last", {}))
     profiles = config.get("profiles", {})
 
     # Decide whether to run the wizard.
@@ -404,7 +430,7 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
         if ns.profile:
             if ns.profile not in profiles:
                 raise SystemExit(f"Profile '{ns.profile}' not found (config: {config_path}). Use --list-profiles.")
-            profile_values = _clean_run_params(profiles[ns.profile])
+            profile_values = _clean_config_run_params(profiles[ns.profile])
 
         # Precedence: builtin < _last(only w/o profile) < defaults < profile < CLI
         merged = {}
@@ -443,6 +469,15 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
             + "\nTip: use --exp-dir to simplify, --init for the wizard, or --profile to reuse."
         )
 
+    for dest in ("metrics_json", "schedule_override_path", "curvature_log_path"):
+        value = merged.get(dest)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise SystemExit(f"{PARAMS_BY_DEST[dest].cli} must be a non-empty string")
+    if merged.get("generate_target") and any(
+        merged.get(dest) is not None for dest in ("metrics_json", "schedule_override_path", "curvature_log_path")
+    ):
+        raise SystemExit("Diagnostic/tuning options are compute-only and cannot be used with --generate-target")
+
     # Overwrite guard for generate-target.
     check_overwrite_guard(merged, ns.force)
 
@@ -480,6 +515,9 @@ def print_effective(resolved: ResolvedConfig) -> None:
         "task",
         "seed",
         "model_dtype",
+        "metrics_json",
+        "schedule_override_path",
+        "curvature_log_path",
         "generate_target",
     ]
     for dest in order:
@@ -490,11 +528,6 @@ def print_effective(resolved: ResolvedConfig) -> None:
         arrow = "  → " if origin.startswith("derived") else "  "
         print(f"{arrow}{dest:16s}= {val}   ({origin})")
     print(f"  config: {resolved.config_path}")
-
-
-# Run params that are transient per-invocation flow switches — useful to pass
-# on the CLI but meaningless (and surprising) to persist into _last/profiles.
-_TRANSIENT_KEYS = {"generate_target"}
 
 
 def _strip_for_persist(run_params: dict[str, Any]) -> dict[str, Any]:
