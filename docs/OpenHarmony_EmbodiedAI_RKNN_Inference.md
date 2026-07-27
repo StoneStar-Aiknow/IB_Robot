@@ -100,7 +100,7 @@ PYTHONPATH=src/inference_manifest \
 python3 -c "from inference_manifest import load_inference_manifest; print(load_inference_manifest('$WORKSPACE/models/502000/pretrained_model', 'rknn').fingerprint)"
 ```
 
-不要手工修改 artifact path、binding、SHA-256 或 bundle digest。模型或 processor 文件变化后，
+不要手工修改 artifact path、binding、UUID/revision 或 bundle digest。模型或 processor 文件变化后，
 重新运行 exporter。
 
 ## 3. Robot YAML
@@ -283,7 +283,7 @@ action 或其他非图像 tensor 不会因为是 4-D tensor 就自动转置。
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
 | `Deployment 'rknn' is not present` | 启动名称与 manifest 不一致 | 查看 `deployments` keys，并使用正确名称或重新导出 |
-| `SHA-256 mismatch` | artifact 或 processor 在 manifest 生成后改变 | 重新运行 owning exporter；不要手改 hash |
+| artifact load failure | artifact 损坏或 ABI 不兼容 | 重新运行 owning exporter 并发布新 revision |
 | `Bundle digest mismatch` | `bundle.files` 与声明 digest 不一致 | 重新生成完整 manifest |
 | binding shape/name mismatch | compiler ABI 与 LeRobot feature contract 不一致 | 用同一模型重新转换并保留 ABI JSON |
 | RKNN dependency unavailable | RKNNLite 未部署或环境未加载 | `. robooh_1.0.1.env`，检查 `from rknnlite.api import RKNNLite` |

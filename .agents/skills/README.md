@@ -14,6 +14,7 @@
 | [oh-constraints](./oh-constraints) | 板端 | OpenHarmony 板端运行时约束汇总（toybox 命令缺失、musl libc、只读 rootfs、无 systemd、无 /usr/bin/env、LD_PRELOAD 干扰等），板端操作前必读。 |
 | [oh-access](./oh-access) | 板端 | 连接 OpenHarmony 开发板，执行 HDC shell / file send / file recv。 |
 | [oh-build-roboframe](./oh-build-roboframe) | 板端 | 使用 `build_roboframe_oh.sh` 主机侧交叉编译并打包 IB_Robot 自有 OpenHarmony 运行时。 |
+| [pi05-om-convert](./pi05-om-convert) | 模型 | 将 PI0.5/PI05 转换为 Ascend VLM+AE OM deployment，交互确认 steps/FastGELU/schedule，保存 profile 并用 hardware_mock 验证。 |
 | [rknn-convert](./rknn-convert) | 模型 | 将 ONNX 转成 RKNN，并维护主 `venv` 导出 ONNX、`.venv-rknn` 转 RKNN 的流程边界。 |
 | [hmm-convert](./hmm-convert) | 模型 | 将 PI0.5 / SmolVLA 编译产物打包为后摩 HMM deployment（xh2 NPU），生成统一 manifest；ACT HMM 不支持。 |
 | [ibrobot-architecture](./ibrobot-architecture) | 知识 | 理解 SSOT 模式、修改 `robot_config`、解释数据流或契约设计。 |
@@ -52,6 +53,7 @@
 - **板端约束 ([oh-constraints](./oh-constraints))**: OpenHarmony 板端运行时约束汇总（toybox 命令缺失、musl libc、只读 rootfs、无 systemd、无 /usr/bin/env、LD_PRELOAD 干扰、SSH RemoteCommand 等），凡涉及板端操作前必读。
 - **板端连接 ([oh-access](./oh-access))**: 统一封装 OpenHarmony 板的 HDC over TCP 访问与文件传输。
 - **OH 主机侧构建 ([oh-build-roboframe](./oh-build-roboframe))**: 通过 `build_roboframe_oh.sh` 交叉编译 `ibrobot_msgs,tensormsg,robot_config,inference_service`，并强制确认 `series.openharmony-5.1.0-musl.txt` 真正进入板端 runtime 产物。
+- **PI05 OM 转换 ([pi05-om-convert](./pi05-om-convert))**: 编排 PI0.5 VLM/Action Expert ONNX 与 Ascend OM 转换，执行 steps/FastGELU/schedule 交互确认、profile 复用和 `hardware_mock` 端到端测试。
 - **RKNN 转换 ([rknn-convert](./rknn-convert))**: 明确 ONNX 导出与 RKNN 转换的边界，避免主 `venv` 与 `.venv-rknn` 污染。
 - **HMM 转换 ([hmm-convert](./hmm-convert))**: 将 PI0.5 / SmolVLA 的 xhquant/tcim 编译产物通过 `package-hmm-deployment` 纳入统一 `inference_manifest.json`；ACT HMM 不支持。
 - **架构顾问 ([ibrobot-architecture](./ibrobot-architecture))**: 充当项目的架构师，解答一切关于设计模式和配置规范的问题。

@@ -45,6 +45,8 @@ A Torch deployment directly declares its runtime device:
 
 ```json
 {
+  "uuid": "f9ebdcd5-1ce8-4b56-8860-4f32454fc209",
+  "revision": 1,
   "backend": "torch",
   "device": "cpu"
 }
@@ -54,6 +56,8 @@ A compiled deployment declares its target, artifacts, execution order, and compl
 
 ```json
 {
+  "uuid": "f9ebdcd5-1ce8-4b56-8860-4f32454fc209",
+  "revision": 3,
   "backend": "rknn",
   "target": {
     "soc": "rk3588",
@@ -61,9 +65,8 @@ A compiled deployment declares its target, artifacts, execution order, and compl
   },
   "artifacts": {
     "policy": {
-      "path": "artifacts/rknn/rk3588/policy.rknn",
-      "format": "rknn",
-      "sha256": "<64 lowercase hex>"
+      "path": "artifacts/rknn/rk3588/generations/<uuid>/policy.rknn",
+      "format": "rknn"
     }
   },
   "execution": ["policy"],
@@ -318,6 +321,34 @@ The initial support matrix is normative and enforced at startup:
 | PI0.5 | supported | supported | unsupported | unsupported | supported |
 | SmolVLA | supported | unsupported | unsupported | supported | supported |
 
+### PI0.5 Ascend Behavior
+
+The optimized PI0.5 VLM combines all camera images into one temporary vision batch internally, then restores the
+camera-major prefix before the handoff. This optimization does not change the external VLM ABI: runtime bindings,
+per-camera observation semantics, raw image shapes, and ROS camera-topic contracts remain unchanged.
+
+NPU export uses the accuracy-preserving `NPUGeglu` path for the Gemma text MLP by default. Only the explicit
+`--fast-gelu` export option replaces it with approximate `NPUFastGelu`; this may reduce action accuracy and must be
+validated against an existing baseline.
+
+A new Action Expert OM has a runtime output named `velocity` or `v_t`, while the Manifest still maps that tensor
+to the policy `action` semantic. The Ascend backend reads strictly decreasing timesteps from the selected
+deployment's `denoising_schedule` artifact and performs host-side Euler integration as
+`x_next = x_t + (next_t - t) * velocity` before returning the final action. When export does not specify
+`--schedule-file`, the exporter packages a uniform schedule derived from `config.num_inference_steps`; an explicit
+file must be strict `pi05-denoising-schedule-v1` JSON.
+
+`denoising_schedule` is a versioned, non-execution artifact. It is absent from `execution` and `bindings`, but its
+artifact path and deployment revision are part of the deployment identity, so changing the schedule changes the selected deployment
+fingerprint. Production runtime does not scan for a root `schedule.json` and does not accept schedule overrides.
+`loss_compare` and the tuner inject a temporary schedule through an isolated diagnostic backend factory;
+`curvature_log_path` only records diagnostics. The final schedule must be installed in the Manifest.
+
+Compatibility is selected explicitly by the Action Expert runtime output. Existing legacy PI0.5 deployments with
+an `action` output and no schedule artifact retain the old stepwise action-output behavior. A velocity deployment
+without a schedule is rejected rather than given a guessed default. `hardware_mock` still validates only the raw
+image/topic, joint, and action contracts and needs no PI0.5- or schedule-specific changes.
+
 Optional SDKs are imported lazily. Importing the inference core does not require ACL, RKNNLite, TCIM, torch NPU,
 or Hisilicon worker dependencies. A missing dependency fails only when its deployment is selected.
 
@@ -342,24 +373,29 @@ Defaults are conservative and serialized. A backend may declare higher concurren
 prove overlapping calls, output isolation, failure isolation, and deterministic cleanup. Different pipelines have
 independent admission state, but a shared accelerator resource domain may still serialize them.
 
-## Manifest Integrity
+## Manifest Identity
 
-Startup performs strict JSON/schema validation, deployment selection, path-safety validation, bundle-file
-SHA-256 verification, bundle-digest verification, LeRobot metadata loading, compiled-artifact SHA-256 verification,
-and binding compatibility checks before creating a backend runtime.
+Startup performs strict JSON/schema validation, deployment selection, UUID/revision and lightweight bundle-digest
+validation, path-safety and regular-file checks, LeRobot metadata loading, and binding compatibility checks before
+creating a backend runtime. Runtime does not read OM, RKNN, HMM, or safetensors files to hash their contents.
 
 `bundle.digest` is calculated as follows:
 
-1. Normalize every `bundle.files` path to a unique bundle-relative POSIX path.
-2. Sort `{\"path\": ..., \"sha256\": ...}` entries by path.
-3. Serialize the array as UTF-8 JSON without insignificant whitespace and with keys ordered `path`, `sha256`.
-4. Calculate SHA-256 over the serialized bytes.
+1. Normalize, deduplicate, and sort every `bundle.files` path.
+2. Add the bundle UUID, revision, name, and a structure-format domain.
+3. Serialize this small declaration as canonical UTF-8 JSON.
+4. Calculate SHA-256 over the declaration bytes without reading the referenced files.
+
+UUIDs, revisions, digests, and fingerprints provide version identity and distributed consistency, not tamper
+protection. Production artifact updates must use the packager and publish a new revision; use signed read-only
+images or verity when artifact authenticity is required.
 
 The selected deployment fingerprint is SHA-256 over this canonical object:
 
 ```json
 {
-  "schema_version": 1,
+  "format": "ibrobot.deployment-structure-v2",
+  "schema_version": 2,
   "bundle_digest": "...",
   "deployment_name": "rk3588",
   "deployment": {}
@@ -369,19 +405,20 @@ The selected deployment fingerprint is SHA-256 over this canonical object:
 Paths cannot be absolute, use parent traversal, escape the bundle root through symlinks, or collide after
 normalization.
 
-### Integrity Failures
+### Identity Failures
 
-Do not edit hashes manually when startup reports:
+Do not edit identities manually when startup reports:
 
-- `SHA-256 mismatch`
 - `Bundle digest mismatch`
+- unsupported schema v1 (regeneration is required)
 - missing or unexpected LeRobot semantic files
 - an execution role missing an artifact or bindings
 - runtime ABI incompatible with LeRobot feature shapes
 
 Rerun the exporter or packaging workflow that owns the artifact. Exporters copy artifacts, read compiler/runtime
-ABI metadata, generate bindings, calculate all SHA-256 values, update the bundle digest, and validate the result
-through the production loader.
+ABI metadata, generate bindings, update UUIDs/revisions and lightweight structural identities, and validate the
+result through the production loader. Schema-v1 bundles and legacy artifacts are unsupported; regenerate a complete
+schema-v2 bundle with the current exporter or packager.
 
 ## Exporter Entry Points
 

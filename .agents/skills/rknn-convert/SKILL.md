@@ -34,8 +34,8 @@ Never restore or recommend `config.rknn.json`, `RKNN_MODEL_PATH`, directory scan
 6. Configure a named inference pipeline that selects that deployment.
 7. Validate the strict manifest loader and, when available, the RK3588 runtime.
 
-The exporter or packager owns artifact copies, bindings, SHA-256 values, bundle digest, and strict
-loader verification. Do not hand-edit generated hashes or tensor bindings.
+The exporter or packager owns artifact generations, bindings, UUID/revision updates, lightweight bundle digest,
+and strict loader verification. Do not hand-edit generated identities or tensor bindings.
 
 ## Environment Split
 
@@ -256,7 +256,7 @@ than adding a guessed layout to the manifest.
 
 ### Manifest hash mismatch
 
-Rerun the exporter or packager after replacing an artifact. Do not edit artifact SHA-256 or bundle
+Rerun the exporter or packager after replacing an artifact. Do not edit artifact identity, revision, or bundle
 digest values manually.
 
 ### Torch or NumPy version conflict
