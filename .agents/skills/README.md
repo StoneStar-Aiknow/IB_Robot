@@ -15,9 +15,7 @@
 | [oh-constraints](./oh-constraints) | 板端 | OpenHarmony 板端运行时约束汇总（toybox 命令缺失、musl libc、只读 rootfs、无 systemd、无 /usr/bin/env、LD_PRELOAD 干扰等），板端操作前必读。 |
 | [oh-access](./oh-access) | 板端 | 连接 OpenHarmony 开发板，执行 HDC shell / file send / file recv。 |
 | [oh-build-roboframe](./oh-build-roboframe) | 板端 | 使用 `build_roboframe_oh.sh` 主机侧交叉编译并打包 IB_Robot 自有 OpenHarmony 运行时。 |
-| [om-convert](./om-convert) | 模型 | Ascend OM 转换统一入口；要求显式模型路径，通过 `config.json.type` 路由，并用 `npu-smi` 和主机系统信息解析 ATC `soc_version`。 |
-| [act-om-convert](./act-om-convert) | 模型 | `om-convert` 的 ACT 子流程；导出静态 ONNX、调用 ATC、读取 ACL ABI、打包单 `policy` OM 并验证。 |
-| [pi05-om-convert](./pi05-om-convert) | 模型 | `om-convert` 的 PI0.5 子流程；转换 VLM+AE OM，交互确认 steps/FastGELU/schedule，保存 profile 并验证。 |
+| [om-convert](./om-convert) | 模型 | Ascend OM 唯一入口；要求用户确认 ACT/PI05 类型并显式提供路径，解析 `npu-smi`/ATC `soc_version`，再执行内部模型流程。 |
 | [rknn-convert](./rknn-convert) | 模型 | 将 ONNX 转成 RKNN，并维护主 `venv` 导出 ONNX、`.venv-rknn` 转 RKNN 的流程边界。 |
 | [hmm-convert](./hmm-convert) | 模型 | 将 PI0.5 / SmolVLA 编译产物打包为后摩 HMM deployment（xh2 NPU），生成统一 manifest；ACT HMM 不支持。 |
 | [ibrobot-architecture](./ibrobot-architecture) | 知识 | 理解 SSOT 模式、修改 `robot_config`、解释数据流或契约设计。 |
@@ -57,9 +55,7 @@
 - **板端约束 ([oh-constraints](./oh-constraints))**: OpenHarmony 板端运行时约束汇总（toybox 命令缺失、musl libc、只读 rootfs、无 systemd、无 /usr/bin/env、LD_PRELOAD 干扰、SSH RemoteCommand 等），凡涉及板端操作前必读。
 - **板端连接 ([oh-access](./oh-access))**: 统一封装 OpenHarmony 板的 HDC over TCP 访问与文件传输。
 - **OH 主机侧构建 ([oh-build-roboframe](./oh-build-roboframe))**: 通过 `build_roboframe_oh.sh` 交叉编译 `ibrobot_msgs,tensormsg,robot_config,inference_service`，并强制确认 `series.openharmony-5.1.0-musl.txt` 真正进入板端 runtime 产物。
-- **Ascend OM 统一入口 ([om-convert](./om-convert))**: 所有 Ascend OM 请求先经过该路由，强制解析用户提供的模型路径、校验 `config.json.type`、探测 `npu-smi`，并确定精确的 ATC `soc_version`。
-- **ACT OM 子流程 ([act-om-convert](./act-om-convert))**: 接收统一入口的 ACT 上下文，按 ONNX、ATC、ACL ABI、Manifest 顺序生成单 `policy` deployment，并明确无本地 ACL/NPU 时的分阶段边界。
-- **PI05 OM 子流程 ([pi05-om-convert](./pi05-om-convert))**: 接收统一入口的 PI0.5 上下文，编排 VLM/Action Expert 转换、steps/FastGELU/schedule 交互、profile 复用和 `hardware_mock` 测试。
+- **Ascend OM 唯一入口 ([om-convert](./om-convert))**: 所有 Ascend OM 请求只触发该 skill。它要求用户确认 ACT/PI05 类型、显式提供模型路径、校验 `config.json.type`、探测 `npu-smi` 并确定精确的 ATC `soc_version`，随后读取目录内的 ACT 或 PI05 内部流程。PI05 流程还会显式确认使用 bundle 本地 PaliGemma tokenizer 资产还是允许 Hugging Face 自动下载。
 - **RKNN 转换 ([rknn-convert](./rknn-convert))**: 明确 ONNX 导出与 RKNN 转换的边界，避免主 `venv` 与 `.venv-rknn` 污染。
 - **HMM 转换 ([hmm-convert](./hmm-convert))**: 将 PI0.5 / SmolVLA 的 xhquant/tcim 编译产物通过 `package-hmm-deployment` 纳入统一 `inference_manifest.json`；ACT HMM 不支持。
 - **架构顾问 ([ibrobot-architecture](./ibrobot-architecture))**: 充当项目的架构师，解答一切关于设计模式和配置规范的问题。

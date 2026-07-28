@@ -1,14 +1,9 @@
----
-name: act-om-convert
-description: "Internal ACT-specific Ascend OM conversion workflow. Use only after om-convert has validated an ACT bundle path and resolved the exact ATC soc_version. Exports static ACT ONNX, compiles it with ATC, introspects the exact OM ABI with ACL, packages one policy artifact into inference_manifest.json, and validates the deployment."
----
-
-# ACT Ascend OM Conversion Sub-Skill
+# ACT Ascend OM Conversion Workflow
 
 Convert a local ACT LeRobot policy into one static Ascend ACL `policy` OM and package it as a named
 deployment in `<bundle>/inference_manifest.json`.
 
-This is an internal model-specific executor. `om-convert` is the public entry point.
+This is an internal workflow reference. `om-convert` is the only user-facing entry point.
 
 ## Parent Handoff Contract
 
@@ -21,9 +16,9 @@ Before any ACT-specific operation, require all of these values from `om-convert`
 | `soc_version` | Exact ATC value, such as `Ascend310P3` |
 | Host evidence | OS, `npu-smi` result, and ATC version or availability |
 
-If any value is absent, load `om-convert` and stop this workflow. Do not independently guess or ask
-again for the model path, model family, or target SoC. If the config changes after handoff, stop on the
-mismatch and return to the parent router.
+If any value is absent, return to the shared resolution steps in `om-convert`. Do not independently
+guess or ask again for the model path, model family, or target SoC. If the config changes after
+handoff, stop on the mismatch and return to the parent workflow.
 
 ## Supported Scope
 

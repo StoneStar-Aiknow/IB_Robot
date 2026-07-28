@@ -1,6 +1,6 @@
 ---
 name: om-convert
-description: "Route Ascend OM conversion requests to model-specific workflows. Use whenever users mention 'convert to OM', 'Ascend OM', 'ATC', 'OM model conversion', '转OM', '转换OM', or '昇腾模型转换', including ACT and PI0.5 requests. Requires an explicitly supplied model bundle path, resolves or validates config.json type, probes npu-smi, resolves the exact ATC soc_version, then loads act-om-convert or pi05-om-convert."
+description: "Unified Ascend OM conversion entry point for ACT and PI0.5/PI05. Use whenever users mention 'convert to OM', 'Ascend OM', 'ATC', 'OM model conversion', '转OM', '转换OM', or '昇腾模型转换'. Requires the user to choose a model type and explicitly supply its bundle path, validates config.json, probes npu-smi, resolves the exact ATC soc_version, and executes the matching internal workflow."
 ---
 
 # Ascend OM Conversion Router
@@ -10,17 +10,17 @@ This is the public entry point for Ascend ACL OM conversion. It owns only the sh
 1. model family;
 2. model bundle path;
 3. target Ascend `soc_version`;
-4. delegation to one model-specific conversion skill.
+4. selection of one internal model-specific workflow.
 
-Do not execute model-specific export, ATC, packaging, or validation steps in this router. Once the
-shared context is complete, load exactly one child skill with the `skill` tool and follow it.
+Do not improvise model-specific export, ATC, packaging, or validation steps in this router. Once the
+shared context is complete, read exactly one internal workflow reference and follow it.
 
 ## Supported Routes
 
-| `config.json.type` | Child skill | Current artifact layout |
+| User choice / `config.json.type` | Internal reference | Current artifact layout |
 |--------------------|-------------|-------------------------|
-| `act` | `act-om-convert` | One static ACT `policy` OM |
-| `pi05` | `pi05-om-convert` | PI0.5 VLM + Action Expert OM files |
+| `act` | `references/act.md` | One static ACT `policy` OM |
+| `pi05` | `references/pi05.md` | PI0.5 VLM + Action Expert OM files |
 
 For RKNN use `rknn-convert`. For Houmo HMM use `hmm-convert`. Do not treat Hisilicon OM output as
 Ascend ACL OM, and do not invent an Ascend route for an unsupported policy type.
@@ -105,7 +105,7 @@ Target soc_version: <exact resolved value>
 Resolution source: <Ubuntu user choice | explicit cross-target | npu-smi detection>
 ```
 
-### 4. Delegate To One Child Skill
+### 4. Select One Internal Workflow
 
 Build this handoff context:
 
@@ -118,23 +118,23 @@ Build this handoff context:
 | `npu_smi_evidence` | Detected device or failure/unavailable state |
 | `atc_version` | Detected version or unavailable state |
 
-Then delegate:
+Then select the internal workflow:
 
-- For `act`, load `act-om-convert` with the `skill` tool.
-- For `pi05`, load `pi05-om-convert` with the `skill` tool.
+- For `act`, read `.agents/skills/om-convert/references/act.md` and follow it.
+- For `pi05`, read `.agents/skills/om-convert/references/pi05.md` and follow it.
 
-The child must not ask for the model path, model family, or `soc_version` again. If any handoff field
-is missing, return to this router instead of guessing. Keep the handoff values in the final conversion
-report so the chosen target is auditable.
+The internal workflow must not ask for the model path, model family, or `soc_version` again. If any
+handoff field is missing, return to this shared resolution flow instead of guessing. Keep the handoff
+values in the final conversion report so the chosen target is auditable.
 
 ## Routing Examples
 
 | Request | Router behavior |
 |---------|-----------------|
-| `帮我把模型转成 OM` | Ask model family, ask explicit bundle path, probe platform, resolve target, delegate. |
-| `把 /models/policy 转成 OM` | Read `/models/policy/config.json`, ask the user to confirm the inferred supported family, probe platform, delegate. |
-| `把 ACT 转成 Ascend OM` | Ask explicit ACT bundle path, validate `type: act`, probe platform, delegate. |
-| `把这个 PI05 模型转 OM，路径是 /models/pi05` | Validate `type: pi05`, probe platform, delegate. |
+| `帮我把模型转成 OM` | Ask model family, ask explicit bundle path, probe platform, resolve target, select the internal workflow. |
+| `把 /models/policy 转成 OM` | Read `/models/policy/config.json`, ask the user to confirm the inferred supported family, probe platform, select the internal workflow. |
+| `把 ACT 转成 Ascend OM` | Ask explicit ACT bundle path, validate `type: act`, probe platform, select the ACT workflow. |
+| `把这个 PI05 模型转 OM，路径是 /models/pi05` | Validate `type: pi05`, probe platform, then ask the PI05-specific PaliGemma asset question. |
 | `把模型转 OM，目标是 Ascend310P3` | Still resolve family and explicit path; probe `npu-smi` and record that the target was user-selected. |
 
 ## Failure Boundaries
@@ -144,4 +144,5 @@ report so the chosen target is auditable.
 - A local `npu-smi` device is not a target choice on Ubuntu.
 - A generic `310P` label is not a valid substitute for a full ATC revision.
 - A successful ONNX export is not a successful OM deployment.
-- Never report conversion success from this router; only the child workflow can establish it.
+- Never report conversion success from shared resolution alone; only the selected internal workflow
+  can establish it.

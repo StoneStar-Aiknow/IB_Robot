@@ -127,9 +127,7 @@ source .shrc_local
 
 | 技能 | 触发场景 |
 |------|---------|
-| [om-convert](.agents/skills/om-convert) | Ascend OM 转换统一入口、模型路径/类型解析、npu-smi 探测、soc_version 决策与子 skill 路由 |
-| [act-om-convert](.agents/skills/act-om-convert) | `om-convert` 内部 ACT 子流程、ONNX/ATC/ACL ABI/Manifest 打包与验证 |
-| [pi05-om-convert](.agents/skills/pi05-om-convert) | `om-convert` 内部 PI0.5/PI05 子流程、FastGELU、profile、schedule、hardware_mock 验证 |
+| [om-convert](.agents/skills/om-convert) | Ascend OM 唯一入口、ACT/PI05 类型确认、模型路径校验、npu-smi/soc_version 决策及内部流程编排 |
 | [rknn-convert](.agents/skills/rknn-convert) | ONNX 转 RKNN、NPU 部署、模型转换 |
 | [hmm-convert](.agents/skills/hmm-convert) | PI0.5/SmolVLA 后摩 HMM 打包、xh2 编译、tcim、xhquant、LQ50/M50 |
 
