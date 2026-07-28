@@ -435,19 +435,13 @@ ros2 launch robot_config robot.launch.py \
 `voice_asr_service` 的包级默认值与 `robot_config` 中的 `VoiceASRConfig` 默认值保持同步；
 具体机器人仍应以 `config/robots/<robot>.yaml` 中的 `robot.voice_asr` 为准。
 
-### 真机运行时配置合成
+### 真机手眼配置
 
-SO101 手眼标定会把串口、相机分辨率、标定外参和 leader 配置保存在主机本地 runtime YAML。
-启动完整抓取链路前，使用仓库 SSOT 刷新能力与安全配置，同时保留这些主机字段：
-
-```bash
-source .shrc_local && python3 scripts/synthesize_so101_grasp_runtime_config.py
-```
-
-默认输入为 `config/robots/so101_handeye_realsense_only.yaml`，输出为
-`/tmp/so101_handeye_realsense_grasp.yaml`。合成器只从旧 runtime 保留 `ros2_control`、
-`peripherals`、`contract` 和 `teleoperation`；`grasp_execution` 与 `embodied` 始终来自仓库
-SSOT，避免旧 runtime 隐藏新增技能或安全策略。可先传 `--dry-run` 只做校验。
+SO101 抓取使用同级独立配置 `config/robots/so101_handeye_realsense_grasp.yaml`。用户应直接在
+这份 YAML 中填写从动臂串口、相机序列号和 leader 配置；`scripts/handeye_calibrator.py` 质量检查
+通过后会就地更新 `peripherals[name=wrist].transform`。多台物理机器人应分别复制独立 YAML，避免
+不同实例的端口和标定值互相覆盖。`config_path` 仍可用于加载 workspace 外部的完整 robot YAML，
+但不再支持第三层 overlay 合成。
 
 ### 具身 AI 流水线（Embodied AI Pipeline）
 

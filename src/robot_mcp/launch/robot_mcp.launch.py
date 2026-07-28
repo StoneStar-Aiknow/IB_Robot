@@ -7,7 +7,7 @@ on the robot host independently of the agent client.
 Usage:
     ros2 launch robot_mcp robot_mcp.launch.py robot_config:=so101_single_arm
     ros2 launch robot_mcp robot_mcp.launch.py \
-      config_path:=/tmp/so101_handeye_realsense_grasp.yaml port:=8080
+      robot_config:=so101_handeye_realsense_grasp port:=8080
 """
 
 from launch import LaunchDescription

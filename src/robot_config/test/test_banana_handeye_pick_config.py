@@ -14,7 +14,7 @@ pick_script = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = pick_script
 SPEC.loader.exec_module(pick_script)
 
-ROBOT_CONFIG = WORKSPACE / "src" / "robot_config" / "config" / "robots" / "so101_handeye_realsense_only.yaml"
+ROBOT_CONFIG = WORKSPACE / "src" / "robot_config" / "config" / "robots" / "so101_handeye_realsense_grasp.yaml"
 
 
 def test_grasp_script_uses_robot_config_execution_defaults():

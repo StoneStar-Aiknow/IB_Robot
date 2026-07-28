@@ -108,12 +108,9 @@ The active robot is selected exactly like the main launch:
 `robot_config:=<name>` (name without `.yaml`), or `ROBOT_CONFIG=<path>` env,
 or `ROBOT_NAME=<name>`. Default is `so101_single_arm`.
 
-For the calibrated SO101 grasp host, synthesize the runtime file first and pass
-the same `config_path` to both `embodied_bringup` and `robot_mcp`:
-
-```bash
-source .shrc_local && python3 scripts/synthesize_so101_grasp_runtime_config.py
-```
+For the calibrated SO101 grasp host, maintain hardware and calibration values in
+`so101_handeye_realsense_grasp.yaml` and select that same config in both
+`embodied_bringup` and `robot_mcp`.
 
 ## Build
 
@@ -132,7 +129,7 @@ cbp robot_mcp          # colcon build --packages-select robot_mcp
   "mcp": {
     "robot": {
       "type": "local",
-      "command": ["bash", "-c", "source .shrc_local && ros2 run robot_mcp robot_mcp_server --config-path /tmp/so101_handeye_realsense_grasp.yaml"],
+      "command": ["bash", "-c", "source .shrc_local && ros2 run robot_mcp robot_mcp_server --config-name so101_handeye_realsense_grasp"],
       "cwd": "${workspaceFolder}",
       "enabled": true,
       "timeout": 10000
@@ -154,11 +151,11 @@ Run on the robot host (lifecycle independent of the agent; survives reconnects):
 ```bash
 export ROS_DOMAIN_ID=49
 ros2 launch robot_mcp robot_mcp.launch.py \
-  config_path:=/tmp/so101_handeye_realsense_grasp.yaml \
+  robot_config:=so101_handeye_realsense_grasp \
   port:=8080
 # or directly:
 ros2 run robot_mcp robot_mcp_server \
-  --config-path /tmp/so101_handeye_realsense_grasp.yaml \
+  --config-name so101_handeye_realsense_grasp \
   --transport streamable-http --host 127.0.0.1 --port 8080
 ```
 
@@ -201,7 +198,7 @@ Terminal 1, start the real robot stack and guarded embodied skill runtime:
 source .shrc_local
 export ROS_DOMAIN_ID=49
 ros2 launch embodied_bringup embodied_pipeline.launch.py \
-  robot_config:=so101_single_arm \
+  robot_config:=so101_handeye_realsense_grasp \
   control_mode:=moveit_planning \
   use_sim:=false \
   moveit_display:=false
@@ -212,7 +209,7 @@ Terminal 2, expose MCP over HTTP for Hermes:
 ```bash
 source .shrc_local
 export ROS_DOMAIN_ID=49
-ros2 launch robot_mcp robot_mcp.launch.py robot_config:=so101_single_arm port:=8080
+ros2 launch robot_mcp robot_mcp.launch.py robot_config:=so101_handeye_realsense_grasp port:=8080
 ```
 
 If Hermes runs on another host, create the same SSH tunnel there:
@@ -231,7 +228,7 @@ Catalog-only mode validates config loading + tool registration without a ROS
 daemon:
 
 ```bash
-robot_mcp_server --config-path /tmp/so101_handeye_realsense_grasp.yaml --transport streamable-http \
+robot_mcp_server --config-name so101_handeye_realsense_grasp --transport streamable-http \
   --host 127.0.0.1 --port 8080 --no-ros
 # in another terminal, connect to http://127.0.0.1:8080/mcp
 ```

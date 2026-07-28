@@ -20,6 +20,11 @@ Hermes / robot_mcp
 Hermes 只看到一个原子技能。内部运动仍逐步经过 `skill_library` 和 `safety_guard`，本包不直接发布
 控制器命令，也不直接调用 MoveIt 原始位姿接口。
 
+`pick_executor_node.py` 只管理 ROS action、service client、TF 和 joint-state 生命周期。抓取行为按职责拆分到
+`phases/flow.py`、`planning.py`、`preparation.py` 和 `execution.py`；共享状态模型与纯转换函数分别位于
+`pick_executor_models.py` 和 `pick_executor_helpers.py`。阶段 mixin 保留原有方法入口，便于隔离测试且不改变
+action 行为。
+
 ## 公开接口
 
 | 接口 | 类型 | 说明 |

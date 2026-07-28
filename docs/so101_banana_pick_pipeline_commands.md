@@ -6,8 +6,8 @@
 
 - 仓库：`~/IB_Robot`
 - ROS 域：`ROS_DOMAIN_ID=218`
-- robot config：`so101_handeye_realsense_only`
-- runtime config：`/tmp/so101_handeye_realsense_grasp.yaml`
+- robot config：`so101_handeye_realsense_grasp`
+- config file：`src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml`
 - 腕部 RGB：`/camera/wrist/image_raw`
 - 腕部对齐深度：`/camera/wrist/aligned_depth_to_color/image_raw`
 - 腕部 CameraInfo：`/camera/wrist/aligned_depth_to_color/camera_info`
@@ -18,10 +18,8 @@
 - Hermes MCP 服务名：`ibrobot`
 - Hermes 抓取技能：`pick_object`，不要写成 `pick-object`
 
-真机启动必须传 `config_path:=/tmp/so101_handeye_realsense_grasp.yaml`。不要只传
-`robot_config:=so101_handeye_realsense_only`，否则可能加载仓库默认 YAML，把主臂端口当成从动臂控制。
-每次拉取抓取/Hermes 能力更新后，先运行 runtime 合成器；它保留本机串口、相机和手眼标定，
-并从仓库 SSOT 更新 `grasp_execution`、`embodied` 及安全策略。
+真机启动使用 `robot_config:=so101_handeye_realsense_grasp`。启动前必须检查该 YAML 中的
+`ros2_control.port`、相机序列号和手眼标定值，避免把主臂端口当成从动臂控制。
 
 常用命令都从仓库根目录执行：
 
@@ -45,11 +43,7 @@ cd ~/IB_Robot && source .shrc_local && colcon build --symlink-install --merge-in
   embodied_bringup robot_mcp manipulation_execution
 ```
 
-把仓库能力配置合入已标定的 runtime YAML：
-
-```bash
-cd ~/IB_Robot && source .shrc_local && python3 scripts/synthesize_so101_grasp_runtime_config.py
-```
+在 `src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml` 中填写当前机器的硬件和标定值。
 
 ## 1. 清理残留节点
 
@@ -77,8 +71,7 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && \
 
 ```bash
 cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 launch robot_config robot.launch.py \
-  robot_config:=so101_handeye_realsense_only \
-  config_path:=/tmp/so101_handeye_realsense_grasp.yaml \
+  robot_config:=so101_handeye_realsense_grasp \
   control_mode:=moveit_planning \
   use_sim:=false \
   moveit_display:=false
@@ -191,7 +184,7 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && rviz2
 运行时抓取几何配置：
 
 ```bash
-grep -A16 "target_gripper:" /tmp/so101_handeye_realsense_grasp.yaml
+grep -A16 "target_gripper:" src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml
 ```
 
 应确认内容等价于：
@@ -204,7 +197,7 @@ fixed_finger_margin_width_ref_m: 0.035
 fixed_finger_margin_width_gain: 0.25
 ```
 
-`fixed_finger_contact_ee.z` 是 SO101 夹爪坐标系里的固定指接触深度，不是 base-Z 下压量。完整抓取日志里应看到 `TARGET_WIDTH_COMP` 和 `width_comp=...fixed_finger_margin...`，说明动态固定指 margin 已从 runtime config 生效。
+`fixed_finger_contact_ee.z` 是 SO101 夹爪坐标系里的固定指接触深度，不是 base-Z 下压量。完整抓取日志里应看到 `TARGET_WIDTH_COMP` 和 `width_comp=...fixed_finger_margin...`，说明动态固定指 margin 已从 robot config 生效。
 
 控制器：
 
@@ -244,7 +237,7 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source instal
   --prompt banana \
   --observe-only \
   --handeye-source robot-config \
-  --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
+  --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml \
   --observe-x 0.08 \
   --observe-y -0.23 \
   --observe-z 0.25
@@ -287,7 +280,7 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source instal
   --prompt banana \
   --detect-only \
   --handeye-source robot-config \
-  --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
+  --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml \
   --debug-output-mode diagnostic \
   --no-execution-debug-preview \
   --ik-worker-count 4 \
@@ -340,7 +333,7 @@ detect-only 选中的记录使用 `reason: selected_detect_only`，不能把它�
 ```bash
 cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && python3 scripts/test_banana_handeye_pick.py \
   --handeye-source robot-config \
-  --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
+  --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml \
   --debug-output-mode diagnostic \
   --no-execution-debug-preview \
   --ik-worker-count 4 \
@@ -627,8 +620,8 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service 
 
 抓取位置偏差大：
 
-- 先看 `HANDEYE_QUALITY` 和 runtime YAML 中 wrist 相机 transform。
-- 确认命令使用 `--handeye-source robot-config --robot-config /tmp/so101_handeye_realsense_grasp.yaml`。
+- 先看 `HANDEYE_QUALITY` 和 robot YAML 中 wrist 相机 transform。
+- 确认命令使用 `--handeye-source robot-config --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml`。
 - 若 `GRASPGEN_EE_ALIGNMENT` 没出现，说明脚本或环境不是当前版本。
 
 ## 11. 启动 Hermes 抓取链路
@@ -637,11 +630,9 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 service 
 
 ```bash
 cd ~/IB_Robot && source .shrc_local && \
-python3 scripts/synthesize_so101_grasp_runtime_config.py && \
 export ROS_DOMAIN_ID=218 && source install/setup.bash && \
 ros2 launch embodied_bringup embodied_pipeline.launch.py \
-  robot_config:=so101_handeye_realsense_only \
-  config_path:=/tmp/so101_handeye_realsense_grasp.yaml \
+  robot_config:=so101_handeye_realsense_grasp \
   control_mode:=moveit_planning \
   use_sim:=false \
   moveit_display:=false \

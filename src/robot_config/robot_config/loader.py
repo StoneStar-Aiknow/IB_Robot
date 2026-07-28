@@ -24,6 +24,7 @@ from robot_config.config import (
     Ros2ControlConfig,
     VoiceASRConfig,
 )
+from robot_config.grasp_execution_config import validate_grasp_execution_config
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 from .utils import resolve_calibration_paths_from_config, resolve_ros_path
@@ -414,9 +415,10 @@ def load_robot_config_dict(config_path: str | Path) -> dict[str, Any]:
     resolved_config_path, robot_data = _load_robot_section(config_path)
     robot_config = copy.deepcopy(robot_data)
     robot_config = _normalize_embodied_config(robot_config)
-    validation_errors = _validate_embodied_skill_contract(robot_config)
+    validation_errors = validate_grasp_execution_config(robot_config.get("grasp_execution"))
+    validation_errors.extend(_validate_embodied_skill_contract(robot_config))
     if validation_errors:
-        raise ValueError("Invalid embodied configuration:\n- " + "\n- ".join(validation_errors))
+        raise ValueError("Invalid robot configuration:\n- " + "\n- ".join(validation_errors))
     robot_config["_config_path"] = str(resolved_config_path)
     return robot_config
 

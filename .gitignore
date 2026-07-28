@@ -38,6 +38,3 @@ docs/superpowers/
 
 # Runtime artifacts
 /outputs/
-
-# Vendored SDK migrated to PyPI (atomgit-sdk)
-libs/atomgit_sdk/

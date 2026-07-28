@@ -95,6 +95,6 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
   启用某游戏需**同时**置 `embodied.perception.enabled: true` 与该游戏的 `enabled: true`；若 launch
   override（如 `with_perception:=false`）造成不一致，`embodied_pipeline.launch.py` 会在生成节点前 fail-fast
   拒绝启动，避免生成不一致的运行时节点图。
-- `so101_handeye_realsense_only` 可通过显式 `pick_object` 技能从 Hermes 调用完整抓取闭环。
-- 真机手眼配置应先运行 `scripts/synthesize_so101_grasp_runtime_config.py`，再将生成的同一
-  `config_path` 同时传给本 launch 和 `robot_mcp`，避免 runtime 配置缺失技能定义。
+- `so101_handeye_realsense_grasp` 可通过显式 `pick_object` 技能从 Hermes 调用完整抓取闭环。
+- 真机端口、相机和手眼标定直接维护在该 robot YAML 中；本 launch 与 `robot_mcp` 应使用同一个
+  `robot_config` 名称，workspace 外部完整 YAML 才需要显式传 `config_path`。

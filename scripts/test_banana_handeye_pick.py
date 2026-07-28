@@ -38,7 +38,6 @@ import rclpy
 import tf2_ros
 import yaml
 from geometry_msgs.msg import Pose
-from grasp_contact_compensation import ContactPrediction, compensate_contact_xy
 from moveit_msgs.srv import GetPositionFK, GetPositionIK
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
@@ -52,6 +51,7 @@ from sensor_msgs.msg import JointState
 from ibrobot_msgs.action import ExecuteTaskPlan
 from ibrobot_msgs.msg import Detection2D, TaskStep
 from ibrobot_msgs.srv import DetectSegment, MoveToConfiguration, PlanGrasp, VerifyGrasp
+from manipulation_execution.contact_compensation import ContactPrediction, compensate_contact_xy
 from manipulation_execution.grasp_geometry import (
     FixedFingerRobustGap,
     canonicalize_joint5,

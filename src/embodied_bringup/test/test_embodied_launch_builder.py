@@ -173,7 +173,9 @@ def test_launch_setup_aborts_when_game_enabled_but_perception_disabled():
 
 
 def test_handeye_grasp_config_launches_pick_pipeline():
-    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_handeye_realsense_only.yaml"
+    config_path = (
+        Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_handeye_realsense_grasp.yaml"
+    )
     config = load_robot_config_dict(config_path)
     assert config["grasp_execution"]["planner_node"]["enable_source_gripper_tabletop_sweep"] is False
     assert config["grasp_execution"]["ik"]["worker_count"] == 4
