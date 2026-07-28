@@ -154,7 +154,7 @@ class PickFlowPhase:
             raise PickFlowError(
                 result.error_code or "PRIMITIVE_FAILED",
                 result.message or f"primitive failed: {primitive_name}",
-                retryable=primitive_name in {"move_to_named_pose", "move_to_pose", "move_to_configuration"},
+                retryable=primitive_name in {"move_to_named_pose", "move_to_pose"},
             )
 
     def _move_to_observe(self, goal_handle, deadline: float, state: FlowState, task_id: str) -> None:

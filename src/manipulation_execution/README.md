@@ -89,6 +89,7 @@ pick_object:
 - 同一时间只接受一个抓取 goal，并将上游取消请求传给当前 primitive。
 - worker pool 只用于无运动的候选 IK/FK 准备；最终接触补偿、分支锁定和全部机器人运动仍使用主 MoveIt。
 - `MoveToConfiguration` 当前是同步 ROS service；取消会停止本地等待，但服务端运动不具备 action 级硬取消。
+  因此该 primitive 返回失败或超时后，`PickObject` 会 fail closed 并终止整个 goal，不会自动切换到下一候选。
 
 ## 测试
 
