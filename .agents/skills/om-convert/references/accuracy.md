@@ -1,0 +1,96 @@
+# Accuracy Gates
+
+The workflow has exactly two numerical comparisons:
+
+1. Torch vs portable ONNX;
+2. Torch vs Ascend OM.
+
+Do not add hardware-mock, tracing, or task-success gates here.
+
+## Limits Collected Up Front
+
+Before export, collect separate limits for both comparisons:
+
+| Comparison | Limits |
+|------------|--------|
+| Torch vs ONNX | `max_abs_max`, `mean_l1_max`, and `cosine_min`. |
+| Torch vs Ascend OM | `mean_l1_max` and `cosine_min`, matching the current `loss_compare` metrics. |
+
+The user may select `report only`. In that mode compute all metrics but use verdict
+`needs-user-acceptance`, not `pass`. Do not enter optional optimization until the user accepts the
+baseline.
+
+Record limits in `reports/accuracy-limits.json`. A later optimization may tighten limits but must not
+silently relax them. Relaxation is a hard user-approval gate even in autonomous mode.
+
+## Canonical Inputs
+
+Both comparisons use the same:
+
+- versioned observation batch;
+- task;
+- seed;
+- persisted noise/control inputs;
+- source Torch bundle and deployment;
+- preprocessing and postprocessing semantics.
+
+Generate targets only from the original Torch deployment as described in `multi-host-validation.md`.
+Never regenerate targets from ONNX or OM.
+
+## Torch Vs ONNX
+
+Keep a portable ONNX without NPU-only custom operators for this comparison. If the deployable ONNX
+uses custom NPU operators, validate the portable graph first, then prove any custom-op rewrite against
+the same Torch baseline or an exact subgraph reference before ATC.
+
+Compare:
+
+- every external output;
+- each role handoff for a split model;
+- raw action before postprocessing;
+- final postprocessed action.
+
+For each output report shape, dtype, finite status, max absolute error, mean L1, and cosine.
+Aggregate verdict is the worst result across all required outputs and samples.
+
+The report must contain policy/bundle identity, observation hash, task/seed, ONNX and external-data
+hashes, exporter command, opset, runtime versions, thresholds, metrics, and verdict.
+
+If ONNX Runtime cannot execute because of environment limits, diagnose and repair the environment or
+portable graph. Do not substitute successful `onnx.checker` for numerical equivalence.
+
+## Torch Vs Ascend OM
+
+Use `loss_compare` against the Torch-generated target package on the Ascend host:
+
+```bash
+source .shrc_local
+source install/setup.sh
+python3 src/model_utils/model_utils/loss_compare.py \
+    --policy_path "RESOLVED_ASCEND_BUNDLE" \
+    --deployment "RESOLVED_ASCEND_DEPLOYMENT" \
+    --batch_path "RESOLVED_OBSERVATIONS" \
+    --task "RESOLVED_TASK" \
+    --seed "RESOLVED_SEED" \
+    --exp-dir "RESOLVED_TARGET_DIR" \
+    --metrics-json "RESOLVED_REPORT_DIR/torch-vs-om.json"
+```
+
+Evaluate the configured mean-L1 and cosine limits using `loss_compare --metrics-json`. Preserve both
+normalized and unnormalized metrics and all policy-specific diagnostics. The current tool does not
+emit a global max-absolute metric, so do not collect or claim a Torch-vs-OM max-absolute verdict unless
+the implementation is extended to calculate it.
+
+Record exact `soc_version`, NPU, driver, CANN, ATC, ACL, deployment fingerprint, role OM hashes, and
+ABI hashes. A changed OM hash invalidates the previous OM accuracy result.
+
+## Candidate Rule
+
+Every performance candidate must rerun any comparison affected by its changes:
+
+- exporter/graph changes: Torch vs ONNX and Torch vs OM;
+- ATC-only/compiler options: Torch vs OM, while retaining the matching validated ONNX identity;
+- runtime-only buffer or execution changes: Torch vs OM;
+- preprocessing, action, schedule, or other semantic changes: hard user approval, then both gates.
+
+A candidate that improves latency but fails accepted accuracy limits is rejected and rolled back.

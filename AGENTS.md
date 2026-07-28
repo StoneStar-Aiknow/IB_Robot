@@ -127,7 +127,7 @@ source .shrc_local
 
 | 技能 | 触发场景 |
 |------|---------|
-| [om-convert](.agents/skills/om-convert) | Ascend OM 唯一入口、ACT/PI05 类型确认、模型路径校验、npu-smi/soc_version 决策及内部流程编排 |
+| [om-convert](.agents/skills/om-convert) | Ascend OM 唯一入口、已有/新 LeRobot policy 转换、跨机器精度验证、ais_bench 基线及可选性能优化 |
 | [rknn-convert](.agents/skills/rknn-convert) | ONNX 转 RKNN、NPU 部署、模型转换 |
 | [hmm-convert](.agents/skills/hmm-convert) | PI0.5/SmolVLA 后摩 HMM 打包、xh2 编译、tcim、xhquant、LQ50/M50 |
 

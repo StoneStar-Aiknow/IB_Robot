@@ -36,6 +36,17 @@ The repository does not currently implement ACT OM conversion profiles, dynamic 
 quantization controls, FastGELU, denoising schedules, or an ACT-specific ONNX equivalence verifier.
 Do not offer PI0.5 options in this workflow.
 
+Collect ACT choices as part of the shared upfront intake in `../SKILL.md`. Use `accuracy.md` and
+`multi-host-validation.md` for target generation and both numerical gates. Use `benchmark.md` for the
+required loop-50 baseline. Do not run hardware mock, LTTng, tracing, or trace summaries.
+
+Because ACT has no repository ONNX equivalence CLI, implement a minimal ACT verifier in the isolated
+worktree before claiming conversion completion. It must load the original ACT policy, use the same
+versioned observation batch and processor path as target generation, run ONNX Runtime with exported
+input order, and write per-sample/final aggregate max absolute error, mean L1, and cosine. Add tests for
+input ordering, image/state shapes, and multi-camera bundles. Do not replace this gate with
+`onnx.checker`.
+
 ## ACT-Specific Inputs
 
 After accepting the parent handoff, collect only choices that are not already resolved:
@@ -105,12 +116,53 @@ An OM file without its exact runtime-inspected ABI is a compiler artifact, not a
 
 ## Fresh Conversion
 
-The public `export_onnx_atc.py` CLI expects an ABI file but does not generate one. For a first-time
-conversion, call the repository's existing functions in the required order; do not create another
-export script.
+The existing `export_act_model()` function combines ONNX export and ATC, so it cannot enforce the
+mandatory Torch-vs-ONNX gate. Before first conversion, refactor the ACT exporter in the isolated
+worktree to expose an ONNX-only function while keeping `export_act_model()` as a thin composition if
+needed by existing callers. Add tests that ATC is not invoked by ONNX-only export.
 
-Construct one self-contained command. Replace every `RESOLVED_*` token before execution; never run
-placeholder text or reuse shell state from an earlier command:
+Run the phases in this order:
+
+1. export ACT ONNX only;
+2. run the new ACT verifier against the canonical observation batch and user limits;
+3. stop on a failed gate, or obtain explicit acceptance in report-only mode;
+4. call `convert_onnx_to_om()`;
+5. inspect ABI and package.
+
+The public `export_onnx_atc.py` CLI expects an ABI file but does not generate one. Do not use it as a
+first-time all-in-one workflow.
+
+Use three separate commands so a failed verifier cannot fall through to ATC. Replace every
+`RESOLVED_*` token before execution.
+
+Export only:
+
+```bash
+source .shrc_local
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+from model_utils.export_onnx_atc import export_act_onnx
+
+bundle = Path("RESOLVED_MODEL_PATH").expanduser().resolve(strict=True)
+work_dir = Path("RESOLVED_WORK_DIR").expanduser().resolve()
+work_dir.mkdir(parents=True, exist_ok=True)
+config = json.loads((bundle / "config.json").read_text(encoding="utf-8"))
+onnx_path = work_dir / "model.onnx"
+
+if str(config.get("type", "")).strip().lower() != "act":
+    raise ValueError(f"Expected ACT config, got {config.get('type')!r}")
+export_act_onnx(str(bundle), config, str(onnx_path))
+PY
+```
+
+Run the implemented ACT verifier as a separate command, using its actual recorded CLI name. It must
+receive `RESOLVED_MODEL_PATH`, `RESOLVED_WORK_DIR/model.onnx`, `RESOLVED_OBSERVATIONS`, task/seed when
+applicable, all Torch-vs-ONNX limits, and a metrics JSON destination. Stop here unless its exit status
+passes, or report-only results receive explicit user acceptance.
+
+Only then compile, inspect, and package:
 
 ```bash
 source .shrc_local
@@ -119,22 +171,19 @@ import json
 import os
 from pathlib import Path
 
-from model_utils.export_onnx_atc import export_act_model, write_ascend_deployment
+from model_utils.export_onnx_atc import convert_onnx_to_om, write_ascend_deployment
 from model_utils.inference_manifest_export import write_acl_om_abi
 
 bundle = Path("RESOLVED_MODEL_PATH").expanduser().resolve(strict=True)
-work_dir = Path("RESOLVED_WORK_DIR").expanduser().resolve()
-work_dir.mkdir(parents=True, exist_ok=True)
+work_dir = Path("RESOLVED_WORK_DIR").expanduser().resolve(strict=True)
 config = json.loads((bundle / "config.json").read_text(encoding="utf-8"))
 onnx_path = work_dir / "model.onnx"
 om_path = work_dir / "model.om"
 abi_path = work_dir / "model.om.abi.json"
 soc_version = "RESOLVED_SOC_VERSION"
 
-if str(config.get("type", "")).strip().lower() != "act":
-    raise ValueError(f"Expected ACT config, got {config.get('type')!r}")
-if not export_act_model(str(bundle), config, str(onnx_path), str(om_path), soc_version):
-    raise RuntimeError("ACT ONNX export or ATC conversion failed")
+if not convert_onnx_to_om(config, str(onnx_path), str(om_path), soc_version):
+    raise RuntimeError("ACT ATC conversion failed")
 
 write_acl_om_abi(
     om_path,
@@ -155,9 +204,10 @@ print(manifest_path)
 PY
 ```
 
-This uses only the current repository implementation:
+`export_act_onnx()` is the required narrow refactor described above. The remaining calls reuse current
+repository implementation:
 
-- `export_act_model()` exports ONNX and invokes ATC;
+- `convert_onnx_to_om()` invokes ATC after the ONNX gate;
 - `write_acl_om_abi()` introspects the exact resulting OM;
 - `write_ascend_deployment()` copies the OM into a managed generation and atomically updates the
   Manifest.
@@ -166,8 +216,8 @@ If any stage fails, retain useful work artifacts but do not claim that the deplo
 
 ## Existing ONNX Or OM
 
-For an existing ONNX, verify it belongs to the same ACT bundle. In the fresh workflow, replace the
-default `onnx_path` assignment and `export_act_model()` call with:
+For an existing ONNX, verify it belongs to the same ACT bundle, then run the same numerical ACT
+verifier and enforce the same stop boundary. Only after an accepted verdict call:
 
 ```python
 from model_utils.export_onnx_atc import convert_onnx_to_om
@@ -236,8 +286,10 @@ PY
 Expect policy type `act`, backend `ascend`, runtime `acl`, the resolved target SoC, and execution
 order `policy`.
 
-For numerical validation, generate a Torch baseline once and compare the Ascend deployment against
-the same batches and targets:
+For numerical validation, generate the Torch target on the resolved Torch host and compare the Ascend
+deployment on the resolved Ascend host using the same versioned observations, task, seed, targets, raw
+targets, and noises. Follow `multi-host-validation.md` and `accuracy.md`; these commands are a local-host
+shape only:
 
 ```bash
 source .shrc_local
@@ -261,9 +313,10 @@ python3 src/model_utils/model_utils/loss_compare.py \
     --metrics-json /absolute/path/to/act_comparison/metrics.json
 ```
 
-Do not regenerate targets from the OM being evaluated. `loss_compare` establishes numerical fidelity;
-`hardware_mock` separately validates ROS topics, contract adaptation, and action flow. Use a temporary
-robot YAML with the absolute bundle path and named deployment, following `src/hardware_mock/README.md`.
+Do not regenerate targets from the OM being evaluated. After collecting the conservative accuracy
+report, follow `benchmark.md` and run the ACT policy OM with `ais_bench --loop 50`, including
+report-only or failed-threshold baselines. Accuracy acceptance gates optional optimization, not
+baseline collection. The invocation-weighted total is the policy OM mean.
 
 ## Final Report
 
@@ -276,7 +329,8 @@ Always report:
 - ONNX, OM, and ABI paths;
 - deployment name and managed OM path;
 - strict Manifest result;
-- numerical and hardware-mock validation performed or still pending;
+- Torch-vs-ONNX and Torch-vs-OM thresholds, metrics, and verdicts;
+- loop-50 OM metrics and weighted total;
 - any incomplete ABI, packaging, or accuracy work.
 
 ## References
@@ -287,4 +341,6 @@ Always report:
 - `src/model_utils/model_utils/loss_compare.py`
 - `src/model_utils/model_utils/README.md`
 - `src/model_utils/test/test_export_onnx_atc.py`
-- `src/hardware_mock/README.md`
+- `.agents/skills/om-convert/references/multi-host-validation.md`
+- `.agents/skills/om-convert/references/accuracy.md`
+- `.agents/skills/om-convert/references/benchmark.md`
