@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 
 from model_utils.loss_compare import generate_pi05_noise
+from model_utils.observation_batch import load_observation_batch
 
 
 class DiagnosticCapture:
@@ -51,7 +52,7 @@ class DiagnosticCapture:
 
 
 def _prepare_batch(batch_path: str | Path, batch_index: int, task: str) -> dict[str, object]:
-    batches = json.loads(Path(batch_path).read_text(encoding="utf-8"))
+    batches = load_observation_batch(batch_path)
     if not 0 <= batch_index < len(batches):
         raise IndexError(f"batch_index {batch_index} out of range (have {len(batches)} batches)")
 
@@ -180,7 +181,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy-path", required=True, help="Policy bundle containing inference_manifest.json.")
     parser.add_argument("--deployment", required=True, help="Exact named Ascend deployment from the manifest.")
-    parser.add_argument("--batch-path", required=True, help="loss_compare-compatible batches.json.")
+    parser.add_argument(
+        "--batch-path",
+        required=True,
+        help="Raw observation batch (.safetensors; legacy .json is also supported).",
+    )
     parser.add_argument("--batch-index", type=int, default=0)
     parser.add_argument("--out-dir", required=True)
     parser.add_argument("--task", default="")

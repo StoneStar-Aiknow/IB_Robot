@@ -21,6 +21,7 @@ setup(
         "tqdm",
         "Pillow",
         "PyYAML",
+        "safetensors>=0.4.3,<1.0.0",
     ],
     zip_safe=True,
     maintainer="lwh",
@@ -30,6 +31,7 @@ setup(
     entry_points={
         "console_scripts": [
             "frame_inspect = model_utils.frame_inspect:main",
+            "observation-batch = model_utils.observation_batch_cli:main",
             "bump-inference-bundle-revision = model_utils.bundle_revision:main",
             "package-compiled-deployment = model_utils.package_compiled_deployment:main",
             "package-hmm-deployment = model_utils.hmm_export:main",

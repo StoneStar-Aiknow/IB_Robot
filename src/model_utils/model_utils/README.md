@@ -466,6 +466,42 @@ Spec 顶层字段：
 每个 execution role 必须有 artifact、ABI、完整 input semantic mapping 和 output semantic
 mapping。`abi_format` 为 `runtime` 或 `tcim`。
 
+## Observation Batch
+
+`model_utils` 使用版本化 Safetensors 保存可复用的原始 observation batch。图像统一为 HWC
+`uint8 [0,255]`，其他字段保留原始数值 dtype；所有 tensor 的第一维都是 sample 维。该格式不包含
+policy normalization、tokenization 或其他 model-ready 变换。旧 `.json` batch 仍可读取，但新 batch
+应使用 Safetensors。
+
+随机生成适合 shape/runtime smoke test，不适合量化校准：
+
+```bash
+ros2 run model_utils observation-batch random \
+    --output /tmp/random.observations.safetensors \
+    --samples 32 \
+    --seed 42 \
+    --field 'observation.state=6,float32,-100,100' \
+    --field 'observation.images.top=480x640x3,uint8,0,255' \
+    --field 'observation.images.wrist=480x640x3,uint8,0,255'
+```
+
+从本地 LeRobot dataset 进行 episode 分层抽样，使用 PyAV 解码视频，并保存 task 与来源索引：
+
+```bash
+ros2 run model_utils observation-batch dataset \
+    --dataset-root /path/to/lerobot_dataset \
+    --output /tmp/calibration.observations.safetensors \
+    --samples 256 \
+    --seed 42 \
+    --sampling episode-stratified \
+    --field observation.state \
+    --field observation.images.top \
+    --field observation.images.wrist
+
+ros2 run model_utils observation-batch inspect \
+    /tmp/calibration.observations.safetensors
+```
+
 ## loss_compare
 
 `loss_compare.py` 使用 `PureInferenceEngine` 和命名 deployment 比较同一 batch 在不同 runtime
@@ -480,7 +516,7 @@ source .shrc_local
 python3 src/model_utils/model_utils/loss_compare.py \
     --policy_path /path/to/policy_bundle \
     --deployment cuda \
-    --batch_path /path/to/batches.json \
+    --batch_path /path/to/batches.observations.safetensors \
     --exp-dir /path/to/experiment \
     --generate-target
 ```
@@ -504,7 +540,7 @@ PI0.5 的 external noise 始终由 `seed + batch_index` 在独立 CPU generator 
 python3 src/model_utils/model_utils/loss_compare.py \
     --policy_path /path/to/policy_bundle \
     --deployment ascend \
-    --batch_path /path/to/batches.json \
+    --batch_path /path/to/batches.observations.safetensors \
     --exp-dir /path/to/experiment \
     --metrics-json /path/to/experiment/metrics.json
 ```
@@ -576,7 +612,7 @@ source .shrc_local
 ros2 run model_utils pi05-om-dump \
     --policy-path /path/to/pi05_bundle \
     --deployment ascend_310p3 \
-    --batch-path /path/to/batches.json \
+    --batch-path /path/to/batches.observations.safetensors \
     --batch-index 0 \
     --seed 42 \
     --out-dir /tmp/pi05_om_dump_0

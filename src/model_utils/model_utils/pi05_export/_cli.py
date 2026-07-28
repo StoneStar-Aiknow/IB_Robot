@@ -303,7 +303,7 @@ PARAMS: list[Param] = [
     Param(
         dest="batch_path",
         cli="--batch-path",
-        meaning="Real calibration batches JSON (REQUIRED for vlm_quant; random data yields a garbage model)",
+        meaning="Real observation batch (.safetensors or legacy .json; REQUIRED for vlm_quant)",
         in_wizard=False,
     ),
     Param(
@@ -411,7 +411,7 @@ def parse_steps(raw: str | None) -> list[str]:
 # user exactly what to add (and why) rather than just the dest name.
 _PARAM_DEP_HINTS: dict[str, str] = {
     "soc_version": "--soc-version <SoC> (target Ascend SoC, e.g. Ascend310P3; see `npu-smi info`)",
-    "batch_path": "--batch-path <batches.json> (REAL calibration batches; random data yields a garbage model)",
+    "batch_path": "--batch-path <observations.safetensors> (REAL calibration data; random data yields a garbage model)",
     "task": "--task '<prompt>' (the deployment task prompt, must match default_task)",
 }
 

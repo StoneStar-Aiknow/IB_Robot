@@ -297,8 +297,9 @@ class LossUtils:
         return engine
 
     def load_batches_as_tensors(self):
-        with open(self.args.batch_path, encoding="utf-8") as f:
-            raw_batches = json.load(f)
+        from model_utils.observation_batch import load_observation_batch
+
+        raw_batches = load_observation_batch(self.args.batch_path)
         processed_batches = []
         for b in raw_batches:
             processed_batch = {}

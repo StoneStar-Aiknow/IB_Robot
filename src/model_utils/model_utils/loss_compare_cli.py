@@ -112,7 +112,7 @@ PARAMS: list[Param] = [
     Param(
         dest="batch_path",
         cli="--batch_path",
-        meaning="Input batch JSON file path",
+        meaning="Raw observation batch path (.safetensors; legacy .json supported)",
         required_for_run=True,
     ),
     Param(

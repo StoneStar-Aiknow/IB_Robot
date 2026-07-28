@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import model_utils.loss_compare as loss_compare
+from model_utils.observation_batch import save_observation_batch
 
 
 class _FakeEngine:
@@ -217,6 +218,31 @@ def test_load_batches_normalizes_unbatched_json_observations(monkeypatch, tmp_pa
     assert loaded["observation.state"].shape == (1, 6)
     assert loaded["observation.images.top"].shape == (1, 3, 2, 3)
     assert loaded["observation.images.wrist"].shape == (1, 3, 2, 3)
+    assert loaded["observation.images.top"].max() == 1.0
+    assert loaded["task"] == "pick"
+
+
+def test_load_batches_normalizes_safetensors_observations(monkeypatch, tmp_path):
+    pytest.importorskip("safetensors")
+    utils = _utils(tmp_path, _FakeEngine())
+    utils.args.batch_path = str(tmp_path / "batches.safetensors")
+    save_observation_batch(
+        utils.args.batch_path,
+        [
+            {
+                "observation.state": np.arange(1, 7, dtype=np.float32),
+                "observation.images.top_view": np.full((2, 3, 3), 255, dtype=np.uint8),
+                "observation.images.hand_view": np.zeros((2, 3, 3), dtype=np.uint8),
+                "task": "pick",
+            }
+        ],
+    )
+    monkeypatch.setattr(loss_compare, "np", np)
+
+    loaded = utils.load_batches_as_tensors()[0]
+
+    assert loaded["observation.state"].shape == (1, 6)
+    assert loaded["observation.images.top"].shape == (1, 3, 2, 3)
     assert loaded["observation.images.top"].max() == 1.0
     assert loaded["task"] == "pick"
 

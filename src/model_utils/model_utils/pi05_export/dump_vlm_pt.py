@@ -4,7 +4,7 @@
 
 Pairs with the explicit manifest-driven ``pi05-om-dump`` diagnostic command.
 
-Given the SAME ``batches.json`` file used by ``loss_compare.py`` and a
+Given the same observation batch used by ``loss_compare.py`` and a
 trained PI05 checkpoint, this script:
 
   1. Loads batch index ``--batch-index`` (default 0)
@@ -51,7 +51,7 @@ LOGGER = logging.getLogger("dump_vlm_pt")
 # ---------------------------------------------------------------------------
 
 # Default key remapping — matches the hard-coded renames in
-# ``loss_compare.py:load_batches_as_tensors`` so the same ``batches.json``
+# ``loss_compare.py:load_batches_as_tensors`` so the same observation batch
 # can be fed straight into this script.
 _DEFAULT_KEY_MAP: dict[str, str] = {
     "observation.images.hand_view": "observation.images.wrist",
@@ -371,7 +371,7 @@ def parse_args() -> argparse.Namespace:
 
     # Mode 1: dump
     p.add_argument("--policy-path", type=str, default=None, help="Path to pretrained PI05 checkpoint (dump mode).")
-    p.add_argument("--batch-path", type=str, default=None, help="Path to batches.json (dump mode).")
+    p.add_argument("--batch-path", type=str, default=None, help="Observation batch path (dump mode).")
     p.add_argument("--batch-index", type=int, default=0, help="Which batch to dump (default: 0).")
     p.add_argument("--out-dir", type=str, default=None, help="Output directory for .npy files (dump mode).")
     p.add_argument("--device", type=str, default="cuda", help="Torch device for PT inference (default: cuda).")

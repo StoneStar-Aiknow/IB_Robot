@@ -13,7 +13,7 @@ Everything else (msModelSlim runtime patches, the W8A8 driver, the AscendDequant
 fp16 pin, and the Route-A int8 transplant) is imported unchanged from
 :mod:`model_utils.pi05_export.quant.w8a8_common`.
 
-WARNING: a real ``--batch-path`` JSON is mandatory — calibrating on random data
+WARNING: a real ``--batch-path`` observation batch is mandatory — calibrating on random data
 would make the quantized model garbage.
 
 Examples
@@ -47,7 +47,7 @@ from model_utils.pi05_export.quant import w8a8_common as common
 
 LOGGER = logging.getLogger("quantize_vlm")
 
-# Same defaults as dump_vlm_ort.py so a single batches.json feeds every tool.
+# Same defaults as dump_vlm_ort.py so one observation batch feeds every tool.
 _DEFAULT_KEY_MAP: dict[str, str] = {
     "observation.images.hand_view": "observation.images.wrist",
     "observation.images.top_view": "observation.images.top",
@@ -204,7 +204,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     common.add_common_quant_args(p)
     p.add_argument("--policy-path", type=str, default=None, help="PI05 ckpt (for calibration preprocessing).")
     p.add_argument(
-        "--batch-path", type=str, default=None, help="Calibration batches JSON (same format as dump_vlm_ort.py)."
+        "--batch-path",
+        type=str,
+        default=None,
+        help="Calibration observation batch (.safetensors; legacy .json supported).",
     )
     p.add_argument("--task", type=str, default="", help="Task string for prompt building during preprocessing.")
     p.add_argument(
