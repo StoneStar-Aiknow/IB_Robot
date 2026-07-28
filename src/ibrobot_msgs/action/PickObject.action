@@ -1,0 +1,22 @@
+string task_id
+string target_query
+float32 timeout_sec
+---
+uint8 VERIFICATION_NOT_RUN=0
+uint8 VERIFICATION_SUCCESS=1
+uint8 VERIFICATION_FAILED=2
+uint8 VERIFICATION_UNCERTAIN=3
+
+bool success
+string error_code
+string message
+uint32 attempts
+uint8 verification_status
+float32 verification_confidence
+string debug_output_dir
+string[] completed_phases
+---
+string phase
+float32 progress
+uint32 attempt
+string detail

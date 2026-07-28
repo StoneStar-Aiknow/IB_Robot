@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enable SO101 leader-arm teleoperation in a runtime robot_config YAML."""
+"""Enable SO101 leader-arm teleoperation in a robot_config YAML."""
 
 from __future__ import annotations
 
@@ -11,6 +11,14 @@ import yaml
 
 DEFAULT_DEVICE_NAME = "so101_leader"
 DEFAULT_CALIB_FILE = "$(env HOME)/.calibrate/so101_leader_calibrate.json"
+DEFAULT_ROBOT_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / "src"
+    / "robot_config"
+    / "config"
+    / "robots"
+    / "so101_handeye_realsense_grasp.yaml"
+)
 
 
 def _load_robot_config(path: Path) -> dict[str, Any]:
@@ -50,13 +58,13 @@ def configure_teleop(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Enable SO101 leader-arm teleop in a runtime hand-eye robot_config YAML.",
+        description="Enable SO101 leader-arm teleop in a hand-eye robot_config YAML.",
     )
     parser.add_argument(
         "--robot-config",
         type=Path,
-        default=Path("/tmp/so101_handeye_realsense_grasp.yaml"),
-        help="Runtime robot_config YAML to update.",
+        default=DEFAULT_ROBOT_CONFIG,
+        help="Robot config YAML to update in place.",
     )
     parser.add_argument("--leader-port", required=True, help="Serial port for the SO101 leader arm.")
     parser.add_argument("--device-name", default=DEFAULT_DEVICE_NAME, help="Teleop device name to write.")

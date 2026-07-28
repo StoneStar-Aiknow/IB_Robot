@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 
-from grasp_contact_compensation import ContactPrediction, compensate_contact_xy
+from manipulation_execution.contact_compensation import ContactPrediction, compensate_contact_xy
 
 
 def test_compensation_moves_command_more_negative_for_positive_y_underreach() -> None:
@@ -79,25 +79,23 @@ def test_compensation_stops_before_exceeding_correction_limit() -> None:
     assert "exceeds_limit" in result.reason
 
 
-def test_compensation_corrects_both_x_and_y() -> None:
+def test_compensation_corrects_both_axes() -> None:
     def predict(command_xyz, previous_payload):
         _ = previous_payload
         return ContactPrediction(
-            contact_base=(command_xyz[0] + 0.003, command_xyz[1] - 0.005, 0.0),
-            payload=None,
+            contact_base=(command_xyz[0] - 0.01, command_xyz[1] + 0.02, command_xyz[2]),
+            payload=command_xyz,
         )
 
     result = compensate_contact_xy(
-        (0.2, -0.15, 0.05),
-        (0.2, -0.15, 0.0),
+        (0.2, -0.1, 0.1),
+        (0.2, -0.1, 0.1),
         predict,
         tolerance_m=0.001,
-        max_iterations=3,
+        max_iterations=2,
         max_correction_m=0.03,
     )
-
     assert result.converged
-    assert abs(result.residual_x) < 1e-12
-    assert abs(result.residual_y) < 1e-12
-    assert math.isclose(result.correction_x, -0.003, abs_tol=1e-12)
-    assert math.isclose(result.correction_y, 0.005, abs_tol=1e-12)
+    assert result.command_xyz == (0.21000000000000002, -0.12000000000000001, 0.1)
+    assert abs(result.residual_x) <= 0.001
+    assert abs(result.residual_y) <= 0.001

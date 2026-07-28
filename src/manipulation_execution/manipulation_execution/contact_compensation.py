@@ -11,16 +11,12 @@ PayloadT = TypeVar("PayloadT")
 
 @dataclass(frozen=True)
 class ContactPrediction(Generic[PayloadT]):
-    """Predicted base-frame contact point and solver-specific payload."""
-
     contact_base: Vector3
     payload: PayloadT
 
 
 @dataclass(frozen=True)
 class ContactCompensationResult(Generic[PayloadT]):
-    """Result of iteratively correcting a command along base-frame X and Y."""
-
     command_xyz: Vector3
     prediction: ContactPrediction[PayloadT]
     initial_residual_x: float
@@ -51,13 +47,6 @@ def compensate_contact_xy(
     max_iterations: int,
     max_correction_m: float,
 ) -> ContactCompensationResult[PayloadT]:
-    """Iteratively shift command X and Y until predicted contact reaches the target.
-
-    Both base-frame X and Y are corrected; Z is left untouched. ``max_iterations``
-    counts correction updates after the initial prediction, so a value of 3
-    performs at most four IK/FK predictions.
-    """
-
     tolerance = max(0.0, float(tolerance_m))
     correction_limit = max(0.0, float(max_correction_m))
     correction_iterations = max(0, int(max_iterations))
@@ -104,7 +93,6 @@ def compensate_contact_xy(
 
         if abs(residual_x) <= tolerance and abs(residual_y) <= tolerance:
             return _result(prediction, True, "contact_xy_within_tolerance", solve_index, residual_x, residual_y)
-
         if solve_index >= correction_iterations:
             return _result(prediction, False, "max_iterations_exceeded", solve_index, residual_x, residual_y)
 

@@ -4,10 +4,10 @@
 
 前提条件：
 
-- 运行时配置路径：`/tmp/so101_handeye_realsense_grasp.yaml`
-- 运行时配置中的从动臂端口：`/dev/ttyACM1`
+- robot config：`src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml`
+- robot config 中的从动臂端口：`/dev/ttyACM1`
 - 主臂端口：通常为 `/dev/ttyACM0`，但必须以实际 USB 枚举为准
-- 腕部 RealSense 话题（`so101_handeye_realsense_only` 的实际 remap）：
+- 腕部 RealSense 话题（`so101_handeye_realsense_grasp` 的实际 remap）：
   - RGB：`/camera/wrist/image_raw`
   - 对齐深度图：`/camera/wrist/aligned_depth_to_color/image_raw`
   - CameraInfo：`/camera/wrist/aligned_depth_to_color/camera_info`
@@ -29,9 +29,8 @@
 
 不要在 Bash 中 source `install/setup.zsh`，请使用 `.shrc_local`。
 
-重要：真机启动必须传 `config_path:=/tmp/so101_handeye_realsense_grasp.yaml`。
-如果只传 `robot_config:=so101_handeye_realsense_only`，launch 会加载仓库内默认 YAML；
-该默认 YAML 可能把 `ros2_control.port` 指到 `/dev/ttyACM0`。当 `/dev/ttyACM0`
+重要：真机启动使用 `robot_config:=so101_handeye_realsense_grasp`。启动前检查该 YAML；
+它可能仍把 `ros2_control.port` 指到 `/dev/ttyACM0`。当 `/dev/ttyACM0`
 是主臂时，主臂会被当作从动臂上电控制，并在启动时移动到 `reset_positions`。
 
 ## 0. 可选：清理残留的机器人节点
@@ -61,7 +60,7 @@ cd ~/IB_Robot && \
   source .shrc_local && \
   export ROS_DOMAIN_ID=218 && \
   python3 scripts/check_handeye_preconditions.py \
-    --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
+    --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml \
     --camera-name wrist
 ```
 
@@ -75,8 +74,8 @@ cd ~/IB_Robot && \
 仍处于 active。手眼标定采样需要 teleop 的 position controller：
 `arm_position_controller` / `gripper_position_controller`。
 当前 `robot.launch.py` 不支持 `teleop_auto_config` 或 `teleop_leader_port` 启动参数；
-`control_mode:=teleop` 只读取 runtime YAML 中的 `robot.teleoperation`。启动终端 A 前，
-先把 runtime YAML 中的主臂配置显式打开。
+`control_mode:=teleop` 只读取 robot YAML 中的 `robot.teleoperation`。启动终端 A 前，
+先把 robot YAML 中的主臂配置显式打开。
 
 把下面命令里的 `--leader-port` 改成实际主臂串口；它不能和
 `robot.ros2_control.port` 指向的从动臂串口相同：
@@ -85,7 +84,7 @@ cd ~/IB_Robot && \
 cd ~/IB_Robot && \
   source .shrc_local && \
   python3 scripts/configure_so101_handeye_teleop.py \
-    --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
+    --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml \
     --leader-port /dev/ttyACM0
 ```
 
@@ -94,17 +93,16 @@ cd ~/IB_Robot && \
   source .shrc_local && \
   export ROS_DOMAIN_ID=218 && \
   ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_handeye_realsense_only \
-    config_path:=/tmp/so101_handeye_realsense_grasp.yaml \
+    robot_config:=so101_handeye_realsense_grasp \
     control_mode:=teleop \
     use_sim:=false \
     moveit_display:=false
 ```
 
 如果启动日志出现 `WARNING: Teleop mode requested but teleoperation config not found`
-或 `Active device 'so101_leader' not found`，说明 runtime YAML 中的
+或 `Active device 'so101_leader' not found`，说明 robot YAML 中的
 `robot.teleoperation` 尚未正确配置，需先回到本节开头重新启用主臂配置。
-启动日志里必须看到 `Loading config from: /tmp/so101_handeye_realsense_grasp.yaml`。
+启动日志里必须看到加载 `so101_handeye_realsense_grasp.yaml`。
 
 等待以下输出：
 
@@ -196,7 +194,7 @@ topic 并按回车。若仍不刷新，把 Image display 的 QoS `Reliability` �
 cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic list | grep -E 'color/image_raw|image_raw'
 ```
 
-当前 `so101_handeye_realsense_only` 应使用 `/camera/wrist/image_raw`。不要把
+当前 `so101_handeye_realsense_grasp` 应使用 `/camera/wrist/image_raw`。不要把
 `/camera/camera/color/image_raw` 或 `/camera/wrist_camera/color/image_raw` 作为本流程默认输入。
 
 重要：RViz Image 显示、`handeye_calibrator --image-topic` 必须使用同一个 RGB topic；
@@ -248,7 +246,7 @@ cd ~/IB_Robot && \
     --max-reprojection 1.0 \
     --method park \
     --output-json outputs/handeye/wrist_handeye_new.json \
-    --robot-config /tmp/so101_handeye_realsense_grasp.yaml \
+    --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml \
     --camera-name wrist \
     --max-translation-std 0.01 \
     --max-rotation-rms 2.0 \
@@ -273,7 +271,7 @@ cd ~/IB_Robot && \
 
 ```text
 Quality check:
-  PASS: auto-wrote transform to /tmp/so101_handeye_realsense_grasp.yaml
+  PASS: auto-wrote transform to src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml
 ```
 
 如果质量不达标：
@@ -296,14 +294,14 @@ Quality check:
 
 ## 6. 确认配置文件已更新
 
-标定成功后，传给 `--robot-config` 的 runtime YAML 中 `peripherals[name=wrist].transform`
-字段已自动更新。抓取时推荐直接使用同一份 runtime 配置读取外参，避免 runtime YAML
+标定成功后，传给 `--robot-config` 的 robot YAML 中 `peripherals[name=wrist].transform`
+字段已自动更新。抓取时直接使用同一份 robot 配置读取外参，避免 robot YAML
 和本地 hand-eye JSON 报告保存两套不同结果。JSON 报告是本地生成的调试/留档产物，
 不会作为仓库默认标定结果提交。如果质量检查失败，脚本只写 JSON 报告，不会更新
 `robot_config`。
 
-不要只更新 `src/robot_config/config/robots/so101_handeye_realsense_only.yaml` 后就直接抓取；
-终端 A 使用的是 `config_path:=/tmp/so101_handeye_realsense_grasp.yaml`，抓取脚本也应读取同一份 `/tmp` runtime YAML。
+终端 A 和抓取脚本都应读取同一份
+`src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml`。
 
 也可打开生成的 JSON 报告查看完整指标：
 
@@ -311,10 +309,10 @@ Quality check:
 cd ~/IB_Robot && python3 -m json.tool outputs/handeye/wrist_handeye_new.json
 ```
 
-如果抓取命令使用推荐的 runtime 配置来源，则不需要复制或提交 JSON，只需在抓取脚本中传：
+如果抓取命令使用推荐的 robot 配置来源，则不需要复制 JSON，只需在抓取脚本中传：
 
 ```text
---handeye-source robot-config --robot-config /tmp/so101_handeye_realsense_grasp.yaml
+--handeye-source robot-config --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml
 ```
 
 然后重启终端 A 以加载新的相机变换。

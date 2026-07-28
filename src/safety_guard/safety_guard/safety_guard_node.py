@@ -108,6 +108,11 @@ class SafetyGuardNode(Node):
                 self._joint_limits,
                 request.primitive_duration_sec,
                 request.waypoint_duration_sec,
+                request.target_qx,
+                request.target_qy,
+                request.target_qz,
+                request.target_qw,
+                request.velocity_scaling,
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in primitive validation: {exc}")

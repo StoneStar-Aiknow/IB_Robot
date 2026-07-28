@@ -125,9 +125,15 @@ robot:
 
 ## Grasp execution target gripper
 
+`robot.grasp_execution.planner_node` 会原样传给 `grasp_planner_node`。当 GraspGen source gripper
+与目标执行器不一致，且执行侧已有目标夹爪 mesh tabletop hard gate 时，可设置
+`enable_source_gripper_tabletop_sweep: false`，跳过源夹爪逐候选扫描；`enable_tabletop_filter` 仍应保持
+`true`，以继续输出 table plane 和 object-top。
+
 真机抓取配置可在 robot YAML 的 `robot.grasp_execution.target_gripper` 下声明目标夹爪几何。
 SO101 单动爪使用 `fixed_finger_contact_ee` 作为固定指侧参考点，`closing_axis_ee` 表示从固定指
-指向目标宽度中心的方向。执行脚本会根据 GraspGen 候选的 `target_width_m` 计算有效接触中心：
+指向目标宽度中心的方向。`manipulation_execution/pick_executor_node` 会根据 GraspGen 候选的
+`target_width_m` 计算有效接触中心：
 
 ```text
 dynamic_fixed_finger_margin_m = min(
@@ -145,6 +151,60 @@ effective_center = fixed_finger_contact_ee
 `fixed_finger_margin_m` 是额外远离固定指的基础安全距离，用于降低固定指先碰物体边缘或上表面的风险。
 当前 SO101 RealSense 抓取配置默认基础值为 `0.006 m`；目标窄于 `fixed_finger_margin_width_ref_m=0.035 m`
 时按 `fixed_finger_margin_width_gain=0.25` 增加安全余量，并由 `fixed_finger_margin_max_m=0.012 m` 封顶。
+
+`target_gripper.fixed_finger_base_side` 是独立的候选硬约束。启用后，执行器在 `base` 坐标系 XY 平面
+计算“目标宽度中心到固定指”与“目标宽度中心到 `reference_point_base`”的夹角余弦；低于
+`min_alignment_cos` 的候选会在 IK/FK 准备前拒绝。SO101 默认参考机器人 base 原点且阈值为 `0.0`，
+因此固定指必须位于物体朝机器人一侧，移动指从外侧闭合。无法获得可靠目标宽度区间时也会拒绝，
+避免在固定指方向未知时继续执行。
+
+`target_gripper.fixed_finger_robust_gap` 在下降完成、夹爪闭合前执行第二层硬检查。它把当前接触点残差
+投影到实际闭合轴，并计算：
+
+```text
+effective_gap = fixed_finger_gap_m + contact_error_along_closing_axis_m
+required_gap = fixed_finger_target_gap_m - max_target_gap_deficit_m
+```
+
+朝固定指方向的误差为负，会缩小 `effective_gap`。SO101 默认最多允许相对目标间隙损失 `0.003 m`；
+不足时先退回 pregrasp，再尝试下一候选，避免在已知固定指侧覆盖不足时闭合夹爪。
+
+`target_gripper.ik_orientation_guard` 约束 position-only IK 的实际 FK 朝向。SO101 的 joint5 对 TCP 位置
+几乎不产生梯度，因此超出执行门限时会保持在 seed 附近；执行器将超限 joint5 seed 翻转 `±π`，让固定指和
+活动指换侧，再比较 GraspGen 目标和实际 FK 的接近轴、180° 对称闭合轴直线及固定指内侧关系。当前配置使用：
+
+```yaml
+ik_orientation_guard:
+  enabled: true
+  approach_axis_ee: [0.0, 0.0, 1.0]
+  closing_axis_180_symmetric: true
+  joint5_abs_max: 2.0
+  max_approach_error_deg: 25.0
+  max_closing_error_deg: 20.0
+```
+
+`joint5_abs_max` 同时约束监督式测试脚本和 Hermes 执行器。两条链路都会先把超过半圈的解映射到
+等价的 `[-π/2, π/2]` 分支，再以该门限和 FK 轴误差决定是否接受候选。
+
+闭合轴的 180° 对称只表示两指闭合直线相同，不表示固定指身份可忽略。执行器必须再用实际 FK 位姿执行
+`fixed_finger_base_side` 硬检查；固定指仍在外侧或目标宽度区间缺失时拒绝当前候选并继续 candidate fallback。
+
+候选准备加速由同一 `grasp_execution.ik` 配置控制：
+
+```yaml
+ik:
+  worker_count: 4
+  worker_namespace_prefix: /ik_worker
+  auto_start_workers: true
+```
+
+`embodied_pipeline.launch.py` 会自动启动对应数量的隔离 MoveIt worker。Hermes executor 与监督式脚本
+都固定一份共同 `/joint_states` seed，将候选按 worker 分片并按原顺序合并；最终补偿与运动不进入 worker。
+候选进入 worker 前的 SO101 mesh/tabletop 检查也采用与监督式脚本相同的凸包缓存和批量向量化路径。
+
+`robot.grasp_execution.prepared_candidate_scoring` 控制 IK/FK 后软排序。SO101 使用候选目标宽度区间和
+候选规划姿态计算固定指到目标前缘的间隙，并以动态 margin 为期望值计算包络分数。该分数与
+接触点 XY/Z 质量、目标体积质心距离和 GraspGen 置信度加权，只改变执行顺序，不作为候选硬拒绝条件。
 
 ## 控制模式配置
 
@@ -374,6 +434,14 @@ ros2 launch robot_config robot.launch.py \
 
 `voice_asr_service` 的包级默认值与 `robot_config` 中的 `VoiceASRConfig` 默认值保持同步；
 具体机器人仍应以 `config/robots/<robot>.yaml` 中的 `robot.voice_asr` 为准。
+
+### 真机手眼配置
+
+SO101 抓取使用同级独立配置 `config/robots/so101_handeye_realsense_grasp.yaml`。用户应直接在
+这份 YAML 中填写从动臂串口、相机序列号和 leader 配置；`scripts/handeye_calibrator.py` 质量检查
+通过后会就地更新 `peripherals[name=wrist].transform`。多台物理机器人应分别复制独立 YAML，避免
+不同实例的端口和标定值互相覆盖。`config_path` 仍可用于加载 workspace 外部的完整 robot YAML，
+但不再支持第三层 overlay 合成。
 
 ### 具身 AI 流水线（Embodied AI Pipeline）
 

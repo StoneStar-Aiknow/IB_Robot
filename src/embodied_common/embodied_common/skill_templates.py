@@ -12,6 +12,8 @@ DEFAULT_WAYPOINT_DURATION_SEC = 0.08
 
 SUPPORTED_PRIMITIVES = {
     "move_to_named_pose",
+    "move_to_pose",
+    "move_to_configuration",
     "move_relative_ee",
     "move_to_joint_positions",
     "move_through_joint_positions",
@@ -54,6 +56,7 @@ DEFAULT_SKILL_TEMPLATES: dict[str, dict[str, Any]] = {
     },
 }
 
+SUPPORTED_SKILL_EXECUTORS = {"grasp_pipeline"}
 DEFAULT_ALLOWED_SKILLS = list(DEFAULT_SKILL_TEMPLATES.keys())
 
 

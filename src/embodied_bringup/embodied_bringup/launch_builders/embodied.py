@@ -34,6 +34,7 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
     teleoperation = robot_config.get("teleoperation", {})
     planner = embodied_config.get("planner", {})
     perception = embodied_config.get("perception", {})
+    grasp_execution = robot_config.get("grasp_execution", {})
     planner_mode = str(planner.get("mode", "rule")).lower()
     scene_sources = planner.get("scene_sources", {})
     vlm_api = planner.get("vlm_api", {})
@@ -84,6 +85,10 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
         "gripper_open_position": execution.get("gripper_open_position", 1.0),
         "gripper_closed_position": execution.get("gripper_closed_position", 0.0),
         "task_executor_action_name": execution.get("task_executor_action_name", "/task_executor/execute_task_plan"),
+        "pick_action_name": grasp_execution.get("action_name", "/manipulation/execute_pick"),
+        "move_configuration_service": execution.get(
+            "move_configuration_service", "/moveit_gateway/move_to_configuration"
+        ),
     }
 
     planner_node = Node(
@@ -260,4 +265,93 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
     ]
     if perception_node is not None:
         nodes.append(perception_node)
+    if grasp_execution.get("enabled", False):
+        camera = grasp_execution.get("camera", {})
+        perception_params = grasp_execution.get("perception_node", {})
+        planner_params = grasp_execution.get("planner_node", {})
+        verifier_params = grasp_execution.get("verifier_node", {})
+        if grasp_execution.get("auto_start_dependencies", True):
+            nodes.extend(
+                [
+                    Node(
+                        package="perception_service",
+                        executable="grounded_sam2_node",
+                        name="grounded_sam2",
+                        output="screen",
+                        parameters=[
+                            {
+                                "rgb_topic": camera.get("rgb_topic", "/camera/wrist/image_raw"),
+                                "depth_topic": camera.get(
+                                    "depth_topic", "/camera/wrist/aligned_depth_to_color/image_raw"
+                                ),
+                                "camera_info_topic": camera.get(
+                                    "camera_info_topic", "/camera/wrist/aligned_depth_to_color/camera_info"
+                                ),
+                                **perception_params,
+                            }
+                        ],
+                    ),
+                    Node(
+                        package="manipulation_service",
+                        executable="grasp_planner_node",
+                        name="grasp_planner",
+                        output="screen",
+                        parameters=[
+                            {
+                                "depth_topic": camera.get(
+                                    "depth_topic", "/camera/wrist/aligned_depth_to_color/image_raw"
+                                ),
+                                "camera_info_topic": camera.get(
+                                    "camera_info_topic", "/camera/wrist/aligned_depth_to_color/camera_info"
+                                ),
+                                "detect_service": grasp_execution.get(
+                                    "detect_service", "/grounded_sam2/detect_and_segment"
+                                ),
+                                **planner_params,
+                            }
+                        ],
+                    ),
+                    Node(
+                        package="manipulation_service",
+                        executable="grasp_verifier_node",
+                        name="grasp_verifier",
+                        output="screen",
+                        parameters=[
+                            {
+                                "joint_state_topic": verifier_params.get("joint_state_topic", "/joint_states"),
+                                "joint_current_topic": verifier_params.get(
+                                    "joint_current_topic", "/so101_follower/joint_currents"
+                                ),
+                                "wrist_depth_topic": verifier_params.get(
+                                    "wrist_depth_topic",
+                                    camera.get("depth_topic", "/camera/wrist/aligned_depth_to_color/image_raw"),
+                                ),
+                                **verifier_params,
+                            }
+                        ],
+                    ),
+                ]
+            )
+        nodes.append(
+            Node(
+                package="manipulation_execution",
+                executable="pick_executor_node",
+                name="pick_executor_node",
+                output="screen",
+                parameters=[
+                    {
+                        "action_name": grasp_execution.get("action_name", "/manipulation/execute_pick"),
+                        "primitive_action_name": embodied_config.get(
+                            "primitive_action_name", "/embodied/execute_primitive"
+                        ),
+                        "grasp_execution_json": json.dumps(grasp_execution),
+                        "workspace_json": json.dumps(safety.get("workspace", {})),
+                        "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
+                        "gripper_open_position": execution.get("gripper_open_position", 1.0),
+                        "gripper_closed_position": execution.get("gripper_closed_position", 0.0),
+                        "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
+                    }
+                ],
+            )
+        )
     return nodes

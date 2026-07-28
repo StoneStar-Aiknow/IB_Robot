@@ -10,6 +10,7 @@ import yaml
 
 from embodied_common.skill_templates import (
     SUPPORTED_PRIMITIVES,
+    SUPPORTED_SKILL_EXECUTORS,
     get_skill_templates,
 )
 from robot_config.config import (
@@ -23,6 +24,7 @@ from robot_config.config import (
     Ros2ControlConfig,
     VoiceASRConfig,
 )
+from robot_config.grasp_execution_config import validate_grasp_execution_config
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 from .utils import resolve_calibration_paths_from_config, resolve_ros_path
@@ -266,6 +268,19 @@ def _validate_skill_primitive_sequence(
             f"{sorted(valid_gripper_states)} when present"
         )
 
+    executor_name = str(template.get("executor", "")).strip()
+    if executor_name:
+        prefix = f"embodied.skill_templates.{skill_name}"
+        if executor_name not in SUPPORTED_SKILL_EXECUTORS:
+            errors.append(f"{prefix} uses unsupported executor '{executor_name}'")
+        required_args = template.get("required_args", [])
+        if not isinstance(required_args, list) or any(not isinstance(arg, str) for arg in required_args):
+            errors.append(f"{prefix}.required_args must be a list of strings")
+        timeout_sec = template.get("timeout_sec")
+        if not _is_finite_number(timeout_sec) or float(timeout_sec) <= 0.0:
+            errors.append(f"{prefix}.timeout_sec must be a finite number greater than zero")
+        return
+
     primitive_sequence = template.get("primitive_sequence", [])
     if skill_name == "inspect_scene" and not primitive_sequence:
         return
@@ -400,9 +415,10 @@ def load_robot_config_dict(config_path: str | Path) -> dict[str, Any]:
     resolved_config_path, robot_data = _load_robot_section(config_path)
     robot_config = copy.deepcopy(robot_data)
     robot_config = _normalize_embodied_config(robot_config)
-    validation_errors = _validate_embodied_skill_contract(robot_config)
+    validation_errors = validate_grasp_execution_config(robot_config.get("grasp_execution"))
+    validation_errors.extend(_validate_embodied_skill_contract(robot_config))
     if validation_errors:
-        raise ValueError("Invalid embodied configuration:\n- " + "\n- ".join(validation_errors))
+        raise ValueError("Invalid robot configuration:\n- " + "\n- ".join(validation_errors))
     robot_config["_config_path"] = str(resolved_config_path)
     return robot_config
 
@@ -866,6 +882,9 @@ def validate_config(config: RobotConfig) -> list[str]:
                 continue
             if axis_limits[0] >= axis_limits[1]:
                 errors.append(f"embodied.safety.workspace.{axis} must satisfy min < max")
+        max_radius_m = config.embodied.workspace.get("max_radius_m")
+        if max_radius_m is not None and float(max_radius_m) <= 0.0:
+            errors.append("embodied.safety.workspace.max_radius_m must be greater than zero")
 
         if config.embodied.relative_motion_step_m <= 0.0:
             errors.append("embodied.execution.relative_motion_step_m must be greater than zero")

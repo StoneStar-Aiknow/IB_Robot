@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
+from builtin_interfaces.msg import Time as TimeMsg
 from cv_bridge import CvBridge
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -23,8 +24,11 @@ from ibrobot_msgs.msg import GraspCandidate, GraspCandidateArray
 from ibrobot_msgs.srv import DetectSegment, PlanGrasp
 
 from .graspgen_wrapper import (
+    DEFAULT_ENABLE_SOURCE_GRIPPER_TABLETOP_SWEEP,
     GraspDiagnostic,
     GraspGenWrapper,
+    TablePlaneFit,
+    fit_execution_table_plane,
 )
 
 _DEBUG_OUTPUT_DEFAULT = "default"
@@ -63,6 +67,11 @@ class DebugPreviewCandidate:
 
 def _stamp_to_ns(stamp) -> int:
     return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+
+def _stamp_from_ns(stamp_ns: int) -> TimeMsg:
+    stamp_ns = max(0, int(stamp_ns))
+    return TimeMsg(sec=stamp_ns // 1_000_000_000, nanosec=stamp_ns % 1_000_000_000)
 
 
 def _depth_scale_for_msg(msg: Image, fallback_scale: float) -> float:
@@ -125,9 +134,17 @@ def _diagnostic_to_lines(diag: GraspDiagnostic, *, detection_confidence: float |
             f"raw_grasp_count: {diag.raw_grasp_count}",
             f"collision_filter: {diag.collision_filter_after}/{diag.collision_filter_before}",
             f"tabletop_plane_found: {diag.tabletop_plane_found}",
+            "tabletop_plane_normal: "
+            + (
+                "unavailable"
+                if diag.tabletop_plane_normal is None
+                else ",".join(f"{float(value):.6f}" for value in diag.tabletop_plane_normal)
+            ),
+            f"tabletop_plane_d: {diag.tabletop_plane_d:.6f}",
             f"tabletop_inlier_ratio: {diag.tabletop_inlier_ratio:.3f}",
             f"tabletop_best_inlier_ratio: {diag.tabletop_best_inlier_ratio:.3f}",
             f"tabletop_filter_mode: {diag.tabletop_filter_mode}",
+            f"source_gripper_tabletop_sweep_enabled: {diag.source_gripper_tabletop_sweep_enabled}",
             f"tabletop_low_profile: {diag.tabletop_low_profile}",
             f"tabletop_relaxed: {diag.tabletop_relaxed}",
             f"tabletop_object_height_m: {diag.tabletop_object_height_m:.4f}",
@@ -175,10 +192,18 @@ def _diagnostic_to_dict(diag: GraspDiagnostic, *, detection_confidence: float | 
         "tabletop_filter_before": int(diag.tabletop_filter_before),
         "tabletop_filter_after": int(diag.tabletop_filter_after),
         "tabletop_plane_found": bool(diag.tabletop_plane_found),
+        "tabletop_plane_normal": (
+            None if diag.tabletop_plane_normal is None else [float(value) for value in diag.tabletop_plane_normal]
+        ),
+        "tabletop_plane_d": float(diag.tabletop_plane_d),
+        "tabletop_object_top_xyz": (
+            None if diag.tabletop_object_top_xyz is None else [float(value) for value in diag.tabletop_object_top_xyz]
+        ),
         "tabletop_inlier_ratio": float(diag.tabletop_inlier_ratio),
         "tabletop_best_inlier_ratio": float(diag.tabletop_best_inlier_ratio),
         "tabletop_failure_reason": diag.tabletop_failure_reason,
         "tabletop_filter_mode": diag.tabletop_filter_mode,
+        "source_gripper_tabletop_sweep_enabled": bool(diag.source_gripper_tabletop_sweep_enabled),
         "tabletop_low_profile": bool(diag.tabletop_low_profile),
         "tabletop_relaxed": bool(diag.tabletop_relaxed),
         "tabletop_object_height_m": float(diag.tabletop_object_height_m),
@@ -218,40 +243,11 @@ def _candidate_debug_record(index: int, candidate) -> dict:
         "target_width_m": round(float(candidate.target_width_m), 6),
         "target_width_quality": round(float(candidate.target_width_quality), 3),
         "width_axis_camera": [round(float(v), 6) for v in candidate.width_axis_camera],
+        "target_width_min_offset_m": round(float(candidate.target_width_min_offset_m), 6),
+        "target_width_max_offset_m": round(float(candidate.target_width_max_offset_m), 6),
         "position_xyz": [round(float(v), 6) for v in candidate.pose_4x4[:3, 3]],
         "pose_4x4_rowmajor": candidate.pose_4x4.flatten().tolist(),
     }
-
-
-def _points_from_pixels(depth_m, ys, xs, fx, fy, cx, cy):
-    zs = depth_m[ys, xs]
-    x3d = (xs - cx) * zs / fx
-    y3d = (ys - cy) * zs / fy
-    return np.stack([x3d, y3d, zs], axis=-1).astype(np.float32)
-
-
-def _build_debug_point_clouds(depth_m, mask, fx, fy, cx, cy):
-    h, w = depth_m.shape
-    if mask.shape != (h, w):
-        import cv2
-
-        mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
-
-    valid = np.isfinite(depth_m) & (depth_m > 0)
-    obj_mask = valid & (mask > 0)
-    scene_mask = valid & ~obj_mask
-
-    obj_ys, obj_xs = np.where(obj_mask)
-    scene_ys, scene_xs = np.where(scene_mask)
-
-    object_pts = _points_from_pixels(depth_m, obj_ys, obj_xs, fx, fy, cx, cy)
-    scene_pts = _points_from_pixels(depth_m, scene_ys, scene_xs, fx, fy, cx, cy)
-
-    object_colors = np.tile(np.array([[0, 255, 0]], dtype=np.uint8), (len(object_pts), 1))
-    scene_colors = np.tile(np.array([[180, 180, 180]], dtype=np.uint8), (len(scene_pts), 1))
-    all_pts = np.vstack([object_pts, scene_pts]).astype(np.float32)
-    all_colors = np.vstack([object_colors, scene_colors]).astype(np.uint8)
-    return scene_pts, scene_colors, object_pts, object_colors, all_pts, all_colors
 
 
 def _debug_points_or_fallback(points: np.ndarray | None, fallback: np.ndarray) -> np.ndarray:
@@ -261,6 +257,34 @@ def _debug_points_or_fallback(points: np.ndarray | None, fallback: np.ndarray) -
     if arr.ndim != 2 or arr.shape[1] != 3:
         return fallback.astype(np.float32, copy=False)
     return arr
+
+
+def _sample_execution_table_points(points: np.ndarray | None, max_points: int) -> np.ndarray:
+    if points is None:
+        return np.zeros((0, 3), dtype=np.float32)
+    arr = np.asarray(points, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[1] != 3 or len(arr) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    step = max(1, len(arr) // max(1, int(max_points)))
+    return arr[::step]
+
+
+def _fit_execution_table_plane(diagnostic: GraspDiagnostic) -> TablePlaneFit:
+    thread = getattr(diagnostic, "_execution_table_fit_thread", None)
+    holder = getattr(diagnostic, "_execution_table_fit_holder", None)
+    if thread is not None and isinstance(holder, dict):
+        thread.join()
+        error = holder.get("error")
+        if isinstance(error, Exception):
+            raise error
+        fit = holder.get("fit")
+        if isinstance(fit, TablePlaneFit):
+            return fit
+
+    object_source = diagnostic.object_pc_after_completion
+    if object_source is None:
+        object_source = diagnostic.object_pc_raw
+    return fit_execution_table_plane(diagnostic.scene_pc_after_completion, object_source)
 
 
 def _object_stage_colors(total: int, raw_count: int, inpaint_count: int) -> np.ndarray:
@@ -702,6 +726,79 @@ def _render_debug_previews(
         logger.info(f"Rendered grasp debug previews in {out_dir}")
 
 
+def _write_full_debug_artifacts(
+    *,
+    object_pts,
+    object_colors,
+    object_raw_pts,
+    object_raw_colors,
+    object_graspgen_input_pts,
+    object_graspgen_input_colors,
+    scene_pts,
+    scene_colors,
+    candidates,
+    gripper_name: str,
+    out_dir: Path,
+    max_grasps: int,
+    save_completion_clouds: bool,
+    render_enabled: bool,
+    render_max_points: int,
+    width: int,
+    height: int,
+    show_scene: bool,
+    render_labels: bool,
+    render_interactive: bool,
+    interactive_max_points: int,
+    interactive_show_scene: bool,
+    logger,
+):
+    try:
+        all_pts = np.vstack([object_pts, scene_pts]).astype(np.float32)
+        all_colors = np.vstack([object_colors, scene_colors]).astype(np.uint8)
+        _save_ply(object_pts, object_colors, out_dir / "object_cloud.ply")
+        if save_completion_clouds:
+            _save_ply(object_raw_pts, object_raw_colors, out_dir / "object_cloud_raw.ply")
+            _save_ply(object_pts, object_colors, out_dir / "object_cloud_completed.ply")
+            _save_ply(
+                object_graspgen_input_pts,
+                object_graspgen_input_colors,
+                out_dir / "object_cloud_graspgen_input.ply",
+            )
+        _save_ply(scene_pts, scene_colors, out_dir / "scene_cloud.ply")
+        _save_ply(all_pts, all_colors, out_dir / "grasp_cloud.ply")
+        _save_gripper_meshes(candidates, gripper_name, out_dir / "grasp_grippers.ply", max_grasps)
+        _save_gripper_lines(candidates, gripper_name, out_dir / "grasp_lines.ply", max_grasps)
+    except Exception as exc:
+        logger.warning(f"Failed to write full grasp debug artifacts in {out_dir}: {exc}")
+        return
+
+    if render_enabled:
+        render_pts = all_pts if show_scene else object_pts
+        render_colors = all_colors if show_scene else object_colors
+        render_pts, render_colors = _sample_preview_points(render_pts, render_colors, render_max_points)
+        _render_debug_previews(
+            pts=render_pts,
+            colors=render_colors,
+            object_pts=object_pts,
+            object_colors=object_colors,
+            scene_pts=scene_pts,
+            scene_colors=scene_colors,
+            candidates=candidates,
+            gripper_name=gripper_name,
+            out_dir=out_dir,
+            max_grasps=max_grasps,
+            width=width,
+            height=height,
+            show_scene=show_scene,
+            render_labels=render_labels,
+            render_interactive=render_interactive,
+            interactive_max_points=interactive_max_points,
+            interactive_show_scene=interactive_show_scene,
+            logger=logger,
+        )
+    logger.info(f"Finished full grasp debug outputs in {out_dir}")
+
+
 class GraspPlannerNode(Node):
     def __init__(self):
         super().__init__("grasp_planner")
@@ -723,6 +820,10 @@ class GraspPlannerNode(Node):
         self.declare_parameter("collision_threshold", 0.005)
         self.declare_parameter("collision_gripper", "")
         self.declare_parameter("enable_tabletop_filter", True)
+        self.declare_parameter(
+            "enable_source_gripper_tabletop_sweep",
+            DEFAULT_ENABLE_SOURCE_GRIPPER_TABLETOP_SWEEP,
+        )
         self.declare_parameter("require_tabletop_filter", True)
         self.declare_parameter("tabletop_clearance", 0.003)
         self.declare_parameter("tabletop_pregrasp_distance", 0.08)
@@ -899,7 +1000,7 @@ class GraspPlannerNode(Node):
                 f"low_confidence: best detection confidence={best_det.confidence:.4f} < threshold={confidence_threshold:.2f}",
             )
         mask = self._bridge.imgmsg_to_cv2(best_det.mask, desired_encoding="mono8")
-        return (mask, best_det.mask.header, best_det.confidence), None
+        return (mask, best_det.mask.header, best_det.confidence, best_det), None
 
     def _resolve_debug_output_mode(self, request_mode: str) -> str:
         mode = _normalize_debug_output_mode(request_mode)
@@ -998,6 +1099,7 @@ class GraspPlannerNode(Node):
         candidates,
         diagnostic: GraspDiagnostic,
         detection_confidence: float,
+        detection_stamp_ns: int,
         elapsed_ms: float,
         output_mode: str,
     ):
@@ -1013,6 +1115,11 @@ class GraspPlannerNode(Node):
             "diagnostic": _diagnostic_to_dict(diagnostic, detection_confidence=detection_confidence),
             "depth_frame_id": depth_frame.frame_id,
             "camera_frame_id": camera_info.header.frame_id,
+            "detection_stamp_ns": int(detection_stamp_ns),
+            "depth_stamp_ns": int(depth_frame.stamp_ns),
+            "camera_info_stamp_ns": _stamp_to_ns(camera_info.header.stamp),
+            "geometry_stamp_ns": int(depth_frame.stamp_ns or detection_stamp_ns),
+            "depth_detection_delta_ms": round(abs(depth_frame.stamp_ns - detection_stamp_ns) / 1_000_000.0, 3),
             "depth_scale": depth_frame.depth_scale,
             "camera_info": {
                 "k": list(camera_info.k),
@@ -1035,16 +1142,7 @@ class GraspPlannerNode(Node):
             )
             return out_dir
 
-        fx = float(camera_intrinsics[0, 0])
-        fy = float(camera_intrinsics[1, 1])
-        cx = float(camera_intrinsics[0, 2])
-        cy = float(camera_intrinsics[1, 2])
-        depth_m = depth_frame.data.astype(np.float64) / depth_frame.depth_scale
-        scene_pts, scene_colors, object_pts, object_colors, all_pts, all_colors = _build_debug_point_clouds(
-            depth_m, binary_mask, fx, fy, cx, cy
-        )
-
-        object_raw_pts = _debug_points_or_fallback(diagnostic.object_pc_raw, object_pts)
+        object_raw_pts = _debug_points_or_fallback(diagnostic.object_pc_raw, np.zeros((0, 3), dtype=np.float32))
         object_raw_colors = np.tile(np.array([[0, 255, 0]], dtype=np.uint8), (len(object_raw_pts), 1))
         object_pts = _debug_points_or_fallback(diagnostic.object_pc_after_completion, object_raw_pts)
         object_colors = _object_stage_colors(
@@ -1057,27 +1155,12 @@ class GraspPlannerNode(Node):
             np.array([[0, 200, 255]], dtype=np.uint8),
             (len(object_graspgen_input_pts), 1),
         )
+        scene_pts = _debug_points_or_fallback(diagnostic.scene_pc_after_completion, np.zeros((0, 3), dtype=np.float32))
         scene_pts_raw_count = int(diagnostic.scene_point_count_raw) or len(scene_pts)
-        scene_pts = _debug_points_or_fallback(diagnostic.scene_pc_after_completion, scene_pts)
         scene_colors = _scene_stage_colors(len(scene_pts), scene_pts_raw_count)
-
-        all_pts = np.vstack([object_pts, scene_pts]).astype(np.float32)
-        all_colors = np.vstack([object_colors, scene_colors]).astype(np.uint8)
-
-        _save_ply(object_pts, object_colors, out_dir / "object_cloud.ply")
-        if diagnostic.object_cloud_completion_enabled or diagnostic.object_prismatic_extrude_enabled:
-            _save_ply(object_raw_pts, object_raw_colors, out_dir / "object_cloud_raw.ply")
-            _save_ply(object_pts, object_colors, out_dir / "object_cloud_completed.ply")
-            _save_ply(
-                object_graspgen_input_pts, object_graspgen_input_colors, out_dir / "object_cloud_graspgen_input.ply"
-            )
-        _save_ply(scene_pts, scene_colors, out_dir / "scene_cloud.ply")
-        _save_ply(all_pts, all_colors, out_dir / "grasp_cloud.ply")
 
         max_grasps = int(self.get_parameter("debug_max_save_grasps").get_parameter_value().integer_value)
         vis_gripper = getattr(self._wrapper, "collision_gripper_name", self._wrapper.gripper_name)
-        _save_gripper_meshes(candidates, vis_gripper, out_dir / "grasp_grippers.ply", max_grasps)
-        _save_gripper_lines(candidates, vis_gripper, out_dir / "grasp_lines.ply", max_grasps)
 
         render_enabled = self.get_parameter("debug_render_preview").get_parameter_value().bool_value
         result["pointcloud"] = {
@@ -1109,55 +1192,57 @@ class GraspPlannerNode(Node):
             encoding="utf-8",
         )
 
-        if render_enabled:
-            show_scene = self.get_parameter("debug_render_show_scene").get_parameter_value().bool_value
-            render_labels = self.get_parameter("debug_render_labels").get_parameter_value().bool_value
-            render_interactive = self.get_parameter("debug_render_interactive").get_parameter_value().bool_value
-            interactive_show_scene = self.get_parameter("debug_interactive_show_scene").get_parameter_value().bool_value
-            render_pts = all_pts if show_scene else object_pts
-            render_colors = all_colors if show_scene else object_colors
-            max_points = int(self.get_parameter("debug_render_max_points").get_parameter_value().integer_value)
-            render_pts, render_colors = _sample_preview_points(render_pts, render_colors, max_points)
-            preview_candidates = [
-                DebugPreviewCandidate(
-                    pose_4x4=np.array(g.pose_4x4, dtype=np.float32, copy=True),
-                    confidence=float(g.confidence),
-                    collision_free=bool(g.collision_free),
-                )
-                for g in candidates[:max_grasps]
-            ]
-            width = int(self.get_parameter("debug_render_width").get_parameter_value().integer_value)
-            height = int(self.get_parameter("debug_render_height").get_parameter_value().integer_value)
-            interactive_max_points = int(
-                self.get_parameter("debug_interactive_max_points").get_parameter_value().integer_value
+        show_scene = self.get_parameter("debug_render_show_scene").get_parameter_value().bool_value
+        render_labels = self.get_parameter("debug_render_labels").get_parameter_value().bool_value
+        render_interactive = self.get_parameter("debug_render_interactive").get_parameter_value().bool_value
+        interactive_show_scene = self.get_parameter("debug_interactive_show_scene").get_parameter_value().bool_value
+        width = int(self.get_parameter("debug_render_width").get_parameter_value().integer_value)
+        height = int(self.get_parameter("debug_render_height").get_parameter_value().integer_value)
+        interactive_max_points = int(
+            self.get_parameter("debug_interactive_max_points").get_parameter_value().integer_value
+        )
+        render_max_points = int(self.get_parameter("debug_render_max_points").get_parameter_value().integer_value)
+        debug_candidates = [
+            DebugPreviewCandidate(
+                pose_4x4=np.array(g.pose_4x4, dtype=np.float32, copy=True),
+                confidence=float(g.confidence),
+                collision_free=bool(g.collision_free),
             )
-            thread = threading.Thread(
-                target=_render_debug_previews,
-                kwargs={
-                    "pts": np.array(render_pts, dtype=np.float32, copy=True),
-                    "colors": np.array(render_colors, dtype=np.uint8, copy=True),
-                    "object_pts": np.array(object_pts, dtype=np.float32, copy=True),
-                    "object_colors": np.array(object_colors, dtype=np.uint8, copy=True),
-                    "scene_pts": np.array(scene_pts, dtype=np.float32, copy=True),
-                    "scene_colors": np.array(scene_colors, dtype=np.uint8, copy=True),
-                    "candidates": preview_candidates,
-                    "gripper_name": vis_gripper,
-                    "out_dir": out_dir,
-                    "max_grasps": max_grasps,
-                    "width": max(320, width),
-                    "height": max(240, height),
-                    "show_scene": show_scene,
-                    "render_labels": render_labels,
-                    "render_interactive": render_interactive,
-                    "interactive_max_points": interactive_max_points,
-                    "interactive_show_scene": interactive_show_scene,
-                    "logger": self.get_logger(),
-                    "file_prefix": "grasp",
-                },
-                name="grasp-debug-render",
-                daemon=True,
-            )
-            thread.start()
+            for g in candidates[:max_grasps]
+        ]
+        thread = threading.Thread(
+            target=_write_full_debug_artifacts,
+            kwargs={
+                "object_pts": np.array(object_pts, dtype=np.float32, copy=True),
+                "object_colors": np.array(object_colors, dtype=np.uint8, copy=True),
+                "object_raw_pts": np.array(object_raw_pts, dtype=np.float32, copy=True),
+                "object_raw_colors": np.array(object_raw_colors, dtype=np.uint8, copy=True),
+                "object_graspgen_input_pts": np.array(object_graspgen_input_pts, dtype=np.float32, copy=True),
+                "object_graspgen_input_colors": np.array(object_graspgen_input_colors, dtype=np.uint8, copy=True),
+                "scene_pts": np.array(scene_pts, dtype=np.float32, copy=True),
+                "scene_colors": np.array(scene_colors, dtype=np.uint8, copy=True),
+                "candidates": debug_candidates,
+                "gripper_name": vis_gripper,
+                "out_dir": out_dir,
+                "max_grasps": max_grasps,
+                "save_completion_clouds": bool(
+                    diagnostic.object_cloud_completion_enabled or diagnostic.object_prismatic_extrude_enabled
+                ),
+                "render_enabled": render_enabled,
+                "render_max_points": render_max_points,
+                "width": max(320, width),
+                "height": max(240, height),
+                "show_scene": show_scene,
+                "render_labels": render_labels,
+                "render_interactive": render_interactive,
+                "interactive_max_points": interactive_max_points,
+                "interactive_show_scene": interactive_show_scene,
+                "logger": self.get_logger(),
+            },
+            name="grasp-debug-output",
+            daemon=True,
+        )
+        thread.start()
 
         return out_dir
 
@@ -1191,24 +1276,26 @@ class GraspPlannerNode(Node):
 
         self.get_logger().info(f"Getting segmentation for '{request.text_prompt}' ...")
         segmentation_result, detect_failure = self._get_segmentation_mask(request.text_prompt, confidence_threshold)
-        if detect_failure is not None:
+        if detect_failure is not None or segmentation_result is None:
+            reason = detect_failure or "detect_service_no_result"
             return self._populate_failure_response(
                 response,
                 text_prompt=request.text_prompt,
                 confidence_threshold=confidence_threshold,
                 grasp_threshold=grasp_threshold,
                 output_mode=debug_output_mode,
-                message=f"Detection failed: {detect_failure}",
+                message=f"Detection failed: {reason}",
                 diagnostic_details=[
                     "failure_stage: detection",
-                    f"failure_reason: {detect_failure}",
+                    f"failure_reason: {reason}",
                     f"text_prompt: {request.text_prompt}",
                     f"confidence_threshold: {confidence_threshold:.2f}",
                 ],
             )
-        mask, mask_header, best_confidence = segmentation_result
+        mask, mask_header, best_confidence, best_detection = segmentation_result
 
-        synced_inputs = self._get_synchronized_inputs(_stamp_to_ns(mask_header.stamp))
+        detection_stamp_ns = _stamp_to_ns(mask_header.stamp)
+        synced_inputs = self._get_synchronized_inputs(detection_stamp_ns)
         if synced_inputs is None:
             return self._populate_failure_response(
                 response,
@@ -1241,6 +1328,9 @@ class GraspPlannerNode(Node):
                 enable_collision_filter=self.get_parameter("enable_collision_filter").get_parameter_value().bool_value,
                 collision_threshold=self.get_parameter("collision_threshold").get_parameter_value().double_value,
                 enable_tabletop_filter=self.get_parameter("enable_tabletop_filter").get_parameter_value().bool_value,
+                enable_source_gripper_tabletop_sweep=self.get_parameter("enable_source_gripper_tabletop_sweep")
+                .get_parameter_value()
+                .bool_value,
                 require_tabletop_filter=self.get_parameter("require_tabletop_filter").get_parameter_value().bool_value,
                 tabletop_clearance=self.get_parameter("tabletop_clearance").get_parameter_value().double_value,
                 tabletop_pregrasp_distance=self.get_parameter("tabletop_pregrasp_distance")
@@ -1349,11 +1439,51 @@ class GraspPlannerNode(Node):
                 ],
             )
 
+        execution_table_parallel = getattr(diag, "_execution_table_fit_thread", None) is not None
+        execution_table_started = time.perf_counter()
+        execution_table_fit = _fit_execution_table_plane(diag)
+        execution_table_wait_s = time.perf_counter() - execution_table_started
+        execution_table_holder = getattr(diag, "_execution_table_fit_holder", None)
+        execution_table_duration_s = execution_table_wait_s
+        if isinstance(execution_table_holder, dict):
+            execution_table_duration_s = float(execution_table_holder.get("duration_s", execution_table_duration_s))
         elapsed_ms = (time.time() - t0) * 1000.0
 
         diagnostic_lines = _diagnostic_to_lines(diag, detection_confidence=best_confidence)
         diagnostic_lines.append(f"final_grasp_count: {len(candidates)}")
         diagnostic_lines.append(f"debug_output_mode: {debug_output_mode}")
+        diagnostic_lines.append(f"detection_stamp_ns: {detection_stamp_ns}")
+        diagnostic_lines.append(f"depth_stamp_ns: {depth_frame.stamp_ns}")
+        diagnostic_lines.append(
+            f"depth_detection_delta_ms: {abs(depth_frame.stamp_ns - detection_stamp_ns) / 1_000_000.0:.3f}"
+        )
+        diagnostic_lines.append(f"execution_table_plane_found: {execution_table_fit.plane is not None}")
+        diagnostic_lines.append(f"execution_table_plane_best_inlier_ratio: {execution_table_fit.best_inlier_ratio:.3f}")
+        diagnostic_lines.append(f"execution_table_plane_fit_duration_s: {execution_table_duration_s:.6f}")
+        diagnostic_lines.append(f"execution_table_plane_wait_duration_s: {execution_table_wait_s:.6f}")
+        diagnostic_lines.append(f"execution_table_plane_parallel: {execution_table_parallel}")
+        if execution_table_fit.failure_reason:
+            diagnostic_lines.append(f"execution_table_plane_failure_reason: {execution_table_fit.failure_reason}")
+        if (
+            execution_table_fit.plane is not None
+            and diag.tabletop_plane_found
+            and diag.tabletop_plane_normal is not None
+        ):
+            normal_dot = float(np.clip(diag.tabletop_plane_normal @ execution_table_fit.plane.normal, -1.0, 1.0))
+            plane_angle_deg = float(np.degrees(np.arccos(normal_dot)))
+            plane_offset_delta_m = abs(float(diag.tabletop_plane_d) - float(execution_table_fit.plane.d))
+            diagnostic_lines.append(f"execution_table_plane_shadow_angle_deg: {plane_angle_deg:.6f}")
+            diagnostic_lines.append(f"execution_table_plane_shadow_offset_delta_m: {plane_offset_delta_m:.6f}")
+            self.get_logger().info(
+                f"Execution table plane fit: compute={execution_table_duration_s * 1000.0:.3f}ms "
+                f"wait={execution_table_wait_s * 1000.0:.3f}ms parallel={execution_table_parallel}, "
+                f"planning delta angle={plane_angle_deg:.4f}deg offset={plane_offset_delta_m * 1000.0:.3f}mm"
+            )
+        else:
+            self.get_logger().info(
+                f"Execution table plane fit: compute={execution_table_duration_s * 1000.0:.3f}ms "
+                f"wait={execution_table_wait_s * 1000.0:.3f}ms parallel={execution_table_parallel}"
+            )
 
         if _debug_output_enabled(debug_output_mode):
             try:
@@ -1368,6 +1498,7 @@ class GraspPlannerNode(Node):
                     candidates=candidates,
                     diagnostic=diag,
                     detection_confidence=best_confidence,
+                    detection_stamp_ns=detection_stamp_ns,
                     elapsed_ms=elapsed_ms,
                     output_mode=debug_output_mode,
                 )
@@ -1378,7 +1509,8 @@ class GraspPlannerNode(Node):
                 self.get_logger().warn(f"Failed to save grasp debug outputs: {exc}")
                 diagnostic_lines.append(f"debug_output_error: {exc}")
 
-        header = Header(stamp=mask_header.stamp, frame_id=info.header.frame_id)
+        geometry_stamp_ns = depth_frame.stamp_ns or detection_stamp_ns
+        header = Header(stamp=_stamp_from_ns(geometry_stamp_ns), frame_id=info.header.frame_id)
 
         grasp_msgs = []
         for cand in candidates:
@@ -1390,12 +1522,39 @@ class GraspPlannerNode(Node):
             gm.target_width_m = float(cand.target_width_m)
             gm.target_width_quality = float(cand.target_width_quality)
             gm.width_axis_camera = [float(v) for v in cand.width_axis_camera]
+            gm.target_width_min_offset_m = float(cand.target_width_min_offset_m)
+            gm.target_width_max_offset_m = float(cand.target_width_max_offset_m)
             grasp_msgs.append(gm)
 
         grasp_array = GraspCandidateArray(header=header, grasps=grasp_msgs)
         self._grasp_pub.publish(grasp_array)
 
         response.grasps = grasp_array
+        response.object_centroid_xyz = best_detection.centroid_xyz
+        response.object_volume_centroid_xyz = best_detection.volume_centroid_xyz
+        response.object_volume_m3 = float(best_detection.volume_m3)
+        response.object_point_count = int(best_detection.point_count)
+        response.execution_table_plane_found = execution_table_fit.plane is not None
+        if execution_table_fit.plane is not None:
+            execution_table = execution_table_fit.plane
+            response.execution_table_plane_normal.x = float(execution_table.normal[0])
+            response.execution_table_plane_normal.y = float(execution_table.normal[1])
+            response.execution_table_plane_normal.z = float(execution_table.normal[2])
+            response.execution_table_plane_offset = float(execution_table.d)
+            response.execution_table_plane_inlier_ratio = float(execution_table.inlier_ratio)
+        response.table_plane_found = bool(diag.tabletop_plane_found and diag.tabletop_plane_normal is not None)
+        if response.table_plane_found:
+            table_normal = diag.tabletop_plane_normal
+            assert table_normal is not None
+            response.table_plane_normal.x = float(table_normal[0])
+            response.table_plane_normal.y = float(table_normal[1])
+            response.table_plane_normal.z = float(table_normal[2])
+            response.table_plane_offset = float(diag.tabletop_plane_d)
+            response.table_plane_inlier_ratio = float(diag.tabletop_inlier_ratio)
+        if diag.tabletop_object_top_xyz is not None:
+            response.object_top_xyz.x = float(diag.tabletop_object_top_xyz[0])
+            response.object_top_xyz.y = float(diag.tabletop_object_top_xyz[1])
+            response.object_top_xyz.z = float(diag.tabletop_object_top_xyz[2])
         response.inference_time_ms = elapsed_ms
         response.diagnostic_details = diagnostic_lines
 

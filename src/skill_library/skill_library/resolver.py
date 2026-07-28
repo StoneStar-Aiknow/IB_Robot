@@ -175,10 +175,10 @@ def resolve_skill_primitives(
             )
             continue
 
-        if primitive_name == "move_to_joint_positions":
+        if primitive_name in {"move_to_configuration", "move_to_joint_positions"}:
             resolved_arm_joint_names = list(arm_joint_names or [])
             if not resolved_arm_joint_names:
-                raise ValueError("arm_joint_names are required for move_to_joint_positions")
+                raise ValueError(f"arm_joint_names are required for {primitive_name}")
             joint_position_offsets = step.get("joint_position_offsets", {})
             joint_position_targets = step.get("joint_positions", {})
             has_offsets = bool(joint_position_offsets)
@@ -233,7 +233,7 @@ def resolve_skill_primitives(
                 raise ValueError(f"skill template '{skill_name}' move_to_joint_positions duration must be >= 0")
             primitives.append(
                 PrimitiveSpec(
-                    primitive_name="move_to_joint_positions",
+                    primitive_name=primitive_name,
                     joint_names=resolved_arm_joint_names,
                     joint_positions=joint_positions,
                     duration_sec=duration_sec,

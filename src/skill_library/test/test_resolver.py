@@ -3,12 +3,13 @@ import pytest
 from skill_library.resolver import direction_to_delta, resolve_skill_primitives
 
 SKILL_TEMPLATES = {
-    "pick_named_target": {
+    "move_configuration_test": {
         "primitive_sequence": [
-            {"primitive_name": "move_to_named_pose", "target_pose_key": "pregrasp_pose"},
-            {"primitive_name": "move_to_named_pose", "target_pose_key": "grasp_pose"},
-            {"primitive_name": "close_gripper"},
-            {"primitive_name": "move_to_named_pose", "target_pose_key": "lift_pose"},
+            {
+                "primitive_name": "move_to_configuration",
+                "joint_positions": {"1": 0.1, "2": 0.2},
+                "duration_sec": 2.0,
+            }
         ]
     },
     "hover_named_target": {
@@ -36,33 +37,23 @@ SKILL_TEMPLATES = {
 }
 
 
-def test_resolve_pick_sequence():
+def test_resolve_move_configuration_sequence():
     primitives = resolve_skill_primitives(
-        "pick_named_target",
-        "demo_object",
+        "move_configuration_test",
+        "",
         "",
         "",
         0.0,
-        {
-            "demo_object": {
-                "pregrasp_pose": "demo_pregrasp",
-                "hover_pose": "demo_hover",
-                "grasp_pose": "demo_grasp",
-                "lift_pose": "demo_lift",
-            }
-        },
+        {},
         1.0,
         0.15,
         SKILL_TEMPLATES,
         None,
+        arm_joint_names=["1", "2"],
     )
-    assert [primitive.primitive_name for primitive in primitives] == [
-        "move_to_named_pose",
-        "move_to_named_pose",
-        "close_gripper",
-        "move_to_named_pose",
-    ]
-    assert primitives[2].gripper_position == 0.15
+    assert [primitive.primitive_name for primitive in primitives] == ["move_to_configuration"]
+    assert primitives[0].joint_names == ["1", "2"]
+    assert primitives[0].joint_positions == [0.1, 0.2]
 
 
 @pytest.mark.parametrize(

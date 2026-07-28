@@ -23,7 +23,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from manipulation_service.graspgen_wrapper import GraspGenWrapper
+from manipulation_service.graspgen_wrapper import DEFAULT_ENABLE_SOURCE_GRIPPER_TABLETOP_SWEEP, GraspGenWrapper
 
 _LEGACY_INTRINSICS = (614.0, 614.0, 320.0, 240.0)
 
@@ -184,6 +184,8 @@ def _save_json(candidates, elapsed, out_path, gripper_name, diagnostic):
                 "target_width_m": round(float(g.target_width_m), 6),
                 "target_width_quality": round(float(g.target_width_quality), 3),
                 "width_axis_camera": [round(float(v), 6) for v in g.width_axis_camera],
+                "target_width_min_offset_m": round(float(g.target_width_min_offset_m), 6),
+                "target_width_max_offset_m": round(float(g.target_width_max_offset_m), 6),
                 "position_xyz": [round(v, 6) for v in pos],
                 "rotation_3x3": [[round(v, 6) for v in row] for row in rot],
                 "pose_4x4_rowmajor": g.pose_4x4.flatten().tolist(),
@@ -370,6 +372,7 @@ def test_with_existing_data(
     collision_threshold: float = 0.005,
     depth_scale: float = 1000.0,
     enable_tabletop_filter: bool = True,
+    enable_source_gripper_tabletop_sweep: bool = DEFAULT_ENABLE_SOURCE_GRIPPER_TABLETOP_SWEEP,
     require_tabletop_filter: bool = True,
     tabletop_clearance: float = 0.003,
     tabletop_pregrasp_distance: float = 0.08,
@@ -458,6 +461,7 @@ def test_with_existing_data(
         enable_collision_filter=True,
         collision_threshold=collision_threshold,
         enable_tabletop_filter=enable_tabletop_filter,
+        enable_source_gripper_tabletop_sweep=enable_source_gripper_tabletop_sweep,
         require_tabletop_filter=require_tabletop_filter,
         tabletop_clearance=tabletop_clearance,
         tabletop_pregrasp_distance=tabletop_pregrasp_distance,
@@ -652,6 +656,12 @@ if __name__ == "__main__":
         help="Return no grasps when tabletop filtering is enabled but no table plane is found (default: True).",
     )
     parser.add_argument(
+        "--enable-source-gripper-tabletop-sweep",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_ENABLE_SOURCE_GRIPPER_TABLETOP_SWEEP,
+        help="Check every candidate with the source-gripper mesh after fitting the table (default: False).",
+    )
+    parser.add_argument(
         "--tabletop-clearance",
         type=float,
         default=0.003,
@@ -744,6 +754,7 @@ if __name__ == "__main__":
         collision_threshold=args.collision_threshold,
         depth_scale=args.depth_scale,
         enable_tabletop_filter=args.enable_tabletop_filter,
+        enable_source_gripper_tabletop_sweep=args.enable_source_gripper_tabletop_sweep,
         require_tabletop_filter=args.require_tabletop_filter,
         tabletop_clearance=args.tabletop_clearance,
         tabletop_pregrasp_distance=args.tabletop_pregrasp_distance,

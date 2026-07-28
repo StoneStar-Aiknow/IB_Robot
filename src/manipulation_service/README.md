@@ -23,13 +23,19 @@
 ROS 接口：
 
 - 服务：`ibrobot_msgs/srv/PlanGrasp`、`ibrobot_msgs/srv/VerifyGrasp`
+- `PlanGrasp` 同时返回目标 surface/volume centroid、原始 scene 桌面方程、completed-scene 执行桌面
+  方程和 object-top 点，供执行层做 contact-distance 排序、目标夹爪 mesh tabletop 检查和安全
+  pregrasp 高度计算。
+- `PlanGrasp.grasps.header` 的 `stamp` 是生成 3D 候选所用 depth frame 的采集时间；执行层必须用该
+  时间查询 TF，不能用推理完成后的 latest transform。
 - 话题：`ibrobot_msgs/msg/GraspCandidateArray`
 - 单个抓取结果：`ibrobot_msgs/msg/GraspCandidate`
 - 感知依赖：`ibrobot_msgs/srv/DetectSegment`
 
 `GraspCandidate` 只包含机器人无关的抓取候选信息。除了 GraspGen 位姿、置信度和碰撞标记，
 节点还会基于分割目标点云估算每个候选沿源夹爪闭合轴方向的 `target_width_m`、
-`target_width_quality` 和 `width_axis_camera`。这些字段用于下游机器人执行层做自己的夹爪几何适配；
+`target_width_quality`、`width_axis_camera` 和相对候选原点的稳健宽度区间。区间保留目标偏向
+闭合轴哪一侧的信息，供非对称夹爪判断固定爪前缘间隙。这些字段用于下游机器人执行层做自己的夹爪几何适配；
 `manipulation_service` 不读取任何 SO101 配置，也不输出 SO101 专用 offset。
 
 默认在线话题遵循 SO101 wrist RealSense 抓取流水线约定：
@@ -79,8 +85,9 @@ SO101 wrist camera 话题：
 source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ros2 run manipulation_service grasp_planner_node
 ```
 
-默认使用 GraspGen Robotiq 2F-140 作为 source gripper 生成候选，并用同一 source
-gripper collision mesh 执行普通场景碰撞过滤和桌面 clearance 过滤。
+默认使用 GraspGen Robotiq 2F-140 作为 source gripper 生成候选，并用同一 source gripper
+collision mesh 执行普通场景碰撞过滤。桌面平面拟合默认开启，但逐候选 source-gripper tabletop
+sweep 默认关闭；目标执行层应使用自己的夹爪几何做 hard gate。
 
 使用 RealSense 顶置相机，并开启调试输出：
 
@@ -141,6 +148,7 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
   collision/tabletop 过滤前后数量。
 - `debug_output_dir`：本次请求实际写调试文件时返回输出目录；未写文件时为空。
 - `grasps.grasps[*].pose_matrix`：每个抓取位姿的 4x4 row-major 矩阵。
+- `grasps.header`：候选所在相机 frame，以及生成 3D 几何所用 depth frame 的采集时间。
 - `grasps.grasps[*].confidence`：GraspGen 置信度。
 - `grasps.grasps[*].collision_free`：当前过滤配置下是否认为无碰撞。
 
@@ -148,12 +156,14 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 置信度和几何过滤结果。目标机器人专用的目标夹爪宽度补偿、IK/workspace 过滤和
 接触点重对齐属于执行层后处理，当前由
 `scripts/test_banana_handeye_pick.py` 完成。该脚本从
-`robot_config.robot.grasp_execution` 读取 `target_gripper` 和 `execution_scoring`，
-因此 GraspGen 不需要绑定 SO101；新增机器人只需要在自己的 robot_config 中定义目标夹爪几何和评分权重。
+`robot_config.robot.grasp_execution` 读取服务名称、超时、速度、规划阈值、候选过滤、IK、接触补偿、
+接触重对齐、位姿诊断、目标夹爪几何和执行评分等默认参数；显式 CLI 参数仍优先。因此 GraspGen
+不需要绑定 SO101，新增机器人可在自己的 robot_config 中定义完整执行策略。
 
-SO101 执行侧 tabletop sweep 需要 `scene_cloud.ply`。`scripts/test_banana_handeye_pick.py`
-在 `--so101-tabletop-filter` 开启时会自动把单次 PlanGrasp 请求提升到 `debug_output_mode=full`；
-如果仍无法获得 tabletop clearance，候选会 fail closed 并被拒绝。
+SO101 执行侧 tabletop sweep 优先使用 `PlanGrasp.execution_table_plane_*`。该平面由服务端直接基于
+completed scene cloud 按执行侧历史采样规则拟合，因此正常运行不再依赖 `scene_cloud.ply`，也不会为了
+tabletop filter 强制提升到 `debug_output_mode=full`。显式 full-debug 请求仍会写 PLY；新平面不可用时，
+`scripts/test_banana_handeye_pick.py` 会尝试旧 PLY 路径，最终无法获得 clearance 时仍 fail closed。
 
 常见 `diagnostic_details` 字段：
 
@@ -170,6 +180,7 @@ SO101 执行侧 tabletop sweep 需要 `scene_cloud.ply`。`scripts/test_banana_h
 - `collision_filter`：碰撞过滤后/前的候选数量，例如 `0/80` 表示所有候选碰撞。
 - `tabletop_plane_found` / `tabletop_best_inlier_ratio`：是否找到桌面平面及最佳内点比例。
 - `tabletop_filter`：桌面 clearance 过滤后/前的候选数量。
+- `source_gripper_tabletop_sweep_enabled`：是否实际执行了 source-gripper 候选 mesh sweep。
 - `tabletop_auto_tuned` / `tabletop_auto_tune_reason`：低矮目标 adaptive retry
   是否生效，以及 retry 成功或跳过原因。
 - `final_grasp_count`：最终返回的抓取数量。
@@ -291,6 +302,9 @@ SO101 adapter 等目标执行器与 GraspGen 源夹爪不一致时，不要把�
 桌面过滤：
 
 - `enable_tabletop_filter`：启用桌面平面过滤，默认 `true`。
+- `enable_source_gripper_tabletop_sweep`：桌面拟合成功后，是否逐候选检查 GraspGen/source gripper
+  mesh 的 final-to-pregrasp clearance，默认 `false`。仅在需要分析 source-gripper clearance 或将其
+  作为过滤依据时开启；桌面平面、object-top 和执行桌面输出不受影响。
 - `require_tabletop_filter`：找不到可接受桌面平面时返回空结果，默认 `true`。
 - `tabletop_clearance`：夹爪 mesh 到桌面的最小距离，默认 `0.003` 米。
 - `tabletop_pregrasp_distance`：沿 GraspGen/source gripper approach 轴后退检查距离，默认 `0.08` 米。
@@ -339,6 +353,13 @@ pre-grasp path，并在诊断中记录 `tabletop_auto_tuned`、`tabletop_auto_tu
 
 ```bash
 -p tabletop_filter_mode:=diagnostic
+```
+
+如果执行侧已使用 SO101 自身 mesh 做 fail-closed tabletop hard gate，可进一步跳过仅供诊断的
+Robotiq 候选扫描，同时保留 table plane 和 object-top：
+
+```bash
+-p enable_tabletop_filter:=true -p enable_source_gripper_tabletop_sweep:=false
 ```
 
 如果仍希望保留一个近桌安全下限，可临时使用 `soft`。此时必须检查 `grasp_result.json`
@@ -532,5 +553,6 @@ ROS topic 同步、service timeout 和在线 perception 的影响。
 
 - 机器人和相机拓扑应保留在 `robot_config` YAML 中。
 - 本包不拥有 perception 模型推理、机器人控制、MoveIt 轨迹执行、策略推理或数据集转换。
+- 完整抓取编排由 `manipulation_execution` 消费本包的 `PlanGrasp` 和 `VerifyGrasp` 服务完成。
 - GraspGen 作为可选重量级运行依赖处理；若后续增加 server backend，ROS service
   合约应保持稳定。

@@ -170,3 +170,40 @@ def test_launch_setup_aborts_when_game_enabled_but_perception_disabled():
 
     with pytest.raises(RuntimeError, match="visual_games"):
         module.launch_setup(context)
+
+
+def test_handeye_grasp_config_launches_pick_pipeline():
+    config_path = (
+        Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_handeye_realsense_grasp.yaml"
+    )
+    config = load_robot_config_dict(config_path)
+    assert config["grasp_execution"]["planner_node"]["enable_source_gripper_tabletop_sweep"] is False
+    assert config["grasp_execution"]["ik"]["worker_count"] == 4
+    config["embodied"]["enabled"] = True
+    nodes = generate_embodied_nodes(config, "moveit_planning")
+    executables = {(node.__dict__.get("_Node__package"), node.__dict__.get("_Node__node_executable")) for node in nodes}
+    assert ("manipulation_execution", "pick_executor_node") in executables
+    assert ("manipulation_service", "grasp_planner_node") in executables
+    assert ("manipulation_service", "grasp_verifier_node") in executables
+    assert ("perception_service", "grounded_sam2_node") in executables
+
+
+def test_handeye_grasp_launch_auto_starts_parallel_ik_workers(monkeypatch, tmp_path):
+    module = _load_launch_module()
+    monkeypatch.setattr(module, "get_package_share_directory", lambda _package: str(tmp_path))
+    config = {
+        "grasp_execution": {
+            "enabled": True,
+            "auto_start_dependencies": True,
+            "ik": {
+                "worker_count": 4,
+                "worker_namespace_prefix": "/ik_worker",
+                "auto_start_workers": True,
+            },
+        }
+    }
+
+    action = module._parallel_ik_worker_action(config, "false")
+
+    assert action is not None
+    assert action.__class__.__name__ == "IncludeLaunchDescription"

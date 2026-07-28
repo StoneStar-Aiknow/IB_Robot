@@ -87,6 +87,11 @@ graph TD
 - **配置收敛**: 业务参数由 `robot_config` 中的 `robot.voice_asr` 注入；包内 launch 仅保留调试用途。
 - **稳健失败**: 模型初始化失败时会拒绝识别请求并返回明确错误，而不是在服务回调中直接崩溃。
 
+### 9. 📂 `manipulation_execution` — 抓取闭环执行层
+- **Agent 原子能力**: 将 Hermes 的一次 `pick_object` 调用转换为完整抓取状态机。
+- **动态安全执行**: GraspGen 候选经 IK/FK 补偿后，仍通过 `skill_library` 和 `safety_guard` 执行。
+- **结果闭环**: 区分运动完成和真实抓取成功，并融合夹爪、电流与深度证据。
+
 ---
 
 ## 快速开发命令

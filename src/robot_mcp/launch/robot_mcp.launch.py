@@ -6,7 +6,8 @@ on the robot host independently of the agent client.
 
 Usage:
     ros2 launch robot_mcp robot_mcp.launch.py robot_config:=so101_single_arm
-    ros2 launch robot_mcp robot_mcp.launch.py robot_config:=so101_single_arm port:=8080
+    ros2 launch robot_mcp robot_mcp.launch.py \
+      robot_config:=so101_handeye_realsense_grasp port:=8080
 """
 
 from launch import LaunchDescription
@@ -19,6 +20,7 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription(
         [
             DeclareLaunchArgument("robot_config", default_value="so101_single_arm"),
+            DeclareLaunchArgument("config_path", default_value=""),
             DeclareLaunchArgument("host", default_value="127.0.0.1"),
             DeclareLaunchArgument("port", default_value="8080"),
             ExecuteProcess(
@@ -26,6 +28,8 @@ def generate_launch_description() -> LaunchDescription:
                     PathJoinSubstitution([FindPackagePrefix("robot_mcp"), "lib", "robot_mcp", "robot_mcp_server"]),
                     "--config-name",
                     LaunchConfiguration("robot_config"),
+                    "--config-path",
+                    LaunchConfiguration("config_path"),
                     "--transport",
                     "streamable-http",
                     "--host",

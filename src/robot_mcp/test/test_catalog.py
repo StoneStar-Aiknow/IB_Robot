@@ -121,6 +121,27 @@ def test_skill_entry_without_description_falls_back_to_legacy_docs():
     assert "category" not in entry  # structured fields only when SSOT block present
 
 
+def test_delegated_pick_skill_exposes_runtime_contract():
+    entry = _build_skill_entry(
+        "pick_object",
+        {
+            "executor": "grasp_pipeline",
+            "required_args": ["target_name"],
+            "timeout_sec": 240.0,
+            "description": {
+                "summary": "Pick one object.",
+                "category": "manipulation",
+                "when_to_use": ["grasp a visible object"],
+            },
+        },
+    )
+    assert entry["executor"] == "grasp_pipeline"
+    assert entry["required_args"] == ["target_name"]
+    assert entry["timeout_sec"] == 240.0
+    assert entry["vision_only"] is False
+    assert "Pick one object." in entry["doc"]
+
+
 def test_pose_entry_rounds_and_drops_missing():
     raw = {
         "position": {"x": 0.02003073320, "y": -0.11809839, "z": 0.13887055751},
@@ -146,6 +167,7 @@ def test_normalize_workspace():
     }
     assert _normalize_workspace({}) == {}
     assert _normalize_workspace({"x": [1]}) == {}  # wrong length -> dropped
+    assert _normalize_workspace({"max_radius_m": 0.52}) == {"max_radius_m": 0.52}
 
 
 def test_valid_motion_directions():

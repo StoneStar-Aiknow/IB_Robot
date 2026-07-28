@@ -24,9 +24,13 @@ import argparse
 import json
 import math
 import struct
+import sys
+import threading
 import time
 from collections.abc import Iterable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -34,20 +38,37 @@ import rclpy
 import tf2_ros
 import yaml
 from geometry_msgs.msg import Pose
-from grasp_contact_compensation import ContactPrediction, compensate_contact_xy
 from moveit_msgs.srv import GetPositionFK, GetPositionIK
 from rclpy.action import ActionClient
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
+from scipy.spatial import ConvexHull, QhullError
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import JointState
 
 from ibrobot_msgs.action import ExecuteTaskPlan
 from ibrobot_msgs.msg import Detection2D, TaskStep
 from ibrobot_msgs.srv import DetectSegment, MoveToConfiguration, PlanGrasp, VerifyGrasp
+from manipulation_execution.contact_compensation import ContactPrediction, compensate_contact_xy
+from manipulation_execution.grasp_geometry import (
+    FixedFingerRobustGap,
+    canonicalize_joint5,
+    fixed_finger_base_side_alignment,
+    fixed_finger_envelope_score,
+    fixed_finger_robust_gap,
+    grasp_axis_errors,
+    joint5_closing_axis_correction,
+    prepared_candidate_soft_score,
+    target_width_extent_points,
+)
+
+JOINT5_ORIENTATION_MAX_CLOSING_ERROR_DEG = 20.0
+SO101_GEOMETRY_THRESHOLD_FALLBACK_M = 1e-5
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Move to an observation pose, plan source grasps, align them to the configured target gripper, and optionally pick.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -92,7 +113,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--execution-debug-preview",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Write SO101 execution-stage candidate JSON and a colored preview into the GraspGen debug output directory",
     )
     parser.add_argument(
@@ -297,8 +318,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--retry-after-grasp-residual",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Legacy option retained for compatibility; grasp residual checks are logging-only and do not trigger retry.",
+        default=True,
+        help="After a safe pregrasp retreat, retry the next candidate when the fixed-finger robust gap is insufficient.",
     )
 
     parser.add_argument("--observe-x", type=float, default=-0.25, help="Observation gripper target x in base frame")
@@ -344,6 +365,15 @@ def parse_args() -> argparse.Namespace:
         help="Post-close/lift verification policy; optional skips only when the verifier service is unavailable",
     )
     parser.add_argument(
+        "--completion-mode",
+        choices=("retained", "pick"),
+        default="retained",
+        help=(
+            "Completion policy: retained releases immediately after close/probe retention verification; "
+            "pick continues through final lift and optional post-success release"
+        ),
+    )
+    parser.add_argument(
         "--grasp-verification-service",
         default="/grasp_verifier/verify_grasp",
         help="VerifyGrasp service used to confirm object retention",
@@ -369,7 +399,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--grasp-verification-probe-lift-speed",
         type=float,
-        default=0.02,
+        default=0.10,
         help="Velocity scaling for the retention-check probe lift",
     )
     parser.add_argument(
@@ -377,6 +407,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Retract closed to pregrasp, open, and return to the observation pose after close verification fails",
+    )
+    parser.add_argument(
+        "--recover-after-retention-failure",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Open at the elevated pose and return to observation after probe or final retention verification fails",
     )
 
     parser.add_argument(
@@ -493,7 +529,13 @@ def parse_args() -> argparse.Namespace:
         dest="max_candidates",
         type=int,
         default=80,
-        help="Maximum candidates to test; <=0 tests all returned candidates",
+        help="Maximum candidates sent to IK after inexpensive geometry filters; <=0 tests all eligible candidates",
+    )
+    parser.add_argument(
+        "--prepared-candidate-scoring",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override robot_config and enable or disable IK/FK-prepared candidate soft ranking",
     )
 
     parser.add_argument(
@@ -550,6 +592,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--ik-service", default="/compute_ik", help="MoveIt GetPositionIK service name")
     parser.add_argument("--fk-service", default="/compute_fk", help="MoveIt GetPositionFK service name")
+    parser.add_argument(
+        "--final-joint5-max",
+        type=float,
+        default=2.0,
+        help="Reject the 180-degree-adjusted grasp IK when |joint5| exceeds this safety limit",
+    )
+    parser.add_argument(
+        "--ik-worker-count",
+        type=int,
+        default=0,
+        help="Number of isolated MoveIt IK/FK workers used for candidate preparation; 0 keeps the serial path",
+    )
+    parser.add_argument(
+        "--ik-worker-prefix",
+        default="/ik_worker",
+        help="Worker namespace prefix; worker services are <prefix>_<index>/compute_ik and compute_fk",
+    )
     parser.add_argument(
         "--move-configuration-service",
         default="/moveit_gateway/move_to_configuration",
@@ -616,13 +675,31 @@ def parse_args() -> argparse.Namespace:
         help="Require the lift pose to pass IK",
     )
 
-    parser.add_argument("--observe-speed", type=float, default=0.04, help="Velocity scaling for observation move")
-    parser.add_argument("--approach-speed", type=float, default=0.05, help="Velocity scaling for approach move")
-    parser.add_argument("--descend-speed", type=float, default=0.03, help="Velocity scaling for descend move")
-    parser.add_argument("--lift-speed", type=float, default=0.05, help="Velocity scaling for lift move")
+    parser.add_argument("--observe-speed", type=float, default=0.20, help="Velocity scaling for observation move")
+    parser.add_argument("--approach-speed", type=float, default=0.25, help="Velocity scaling for approach move")
+    parser.add_argument("--descend-speed", type=float, default=0.15, help="Velocity scaling for descend move")
+    parser.add_argument("--lift-speed", type=float, default=0.25, help="Velocity scaling for lift move")
     parser.add_argument("--observe-settle-s", type=float, default=0.6, help="Wait after reaching observation pose")
     parser.add_argument("--open-settle-s", type=float, default=0.3, help="Wait after opening gripper")
     parser.add_argument("--hold-s", type=float, default=0.8, help="Wait after closing gripper before lift")
+    parser.add_argument(
+        "--release-after-success",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Open the gripper at the final lift pose after successful retention verification",
+    )
+    parser.add_argument(
+        "--release-settle-s",
+        type=float,
+        default=1.0,
+        help="Wait after a requested post-success release so the target can fall clear",
+    )
+    parser.add_argument(
+        "--release-drop-height-m",
+        type=float,
+        default=-1.0,
+        help="Descend to this height above the grasp pose before release; negative keeps the final lift pose",
+    )
 
     parser.add_argument(
         "--detect-service", default="/grounded_sam2/detect_and_segment", help="DetectSegment service name"
@@ -634,11 +711,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task-goal-timeout-s", type=float, default=30.0, help="Task action goal acceptance timeout")
     parser.add_argument("--tf-timeout-s", type=float, default=10.0, help="TF lookup timeout")
 
-    args = parser.parse_args()
+    cli_args = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(cli_args)
+    args._explicit_cli_destinations = {  # noqa: SLF001 - script-local configuration state.
+        action.dest
+        for action in parser._actions
+        if any(
+            token == option or token.startswith(f"{option}=") for token in cli_args for option in action.option_strings
+        )
+    }
     args._graspgen_to_ee_translation_auto = (  # noqa: SLF001 - script-local diagnostic state.
         args.graspgen_to_ee_x is None and args.graspgen_to_ee_y is None and args.graspgen_to_ee_z is None
     )
     load_grasp_execution_config(args)
+    if args.final_joint5_max is not None and (not math.isfinite(args.final_joint5_max) or args.final_joint5_max <= 0.0):
+        raise ValueError("--final-joint5-max must be finite and positive")
+    if args.prepared_candidate_scoring is not None:
+        args.prepared_candidate_scoring_config["enabled"] = bool(args.prepared_candidate_scoring)
     resolve_graspgen_adapter_defaults(args)
     return args
 
@@ -659,12 +748,29 @@ def _normalized_vector(value: Iterable[float], name: str) -> np.ndarray:
 
 def load_grasp_execution_config(args: argparse.Namespace) -> None:
     args.grasp_execution_config = {}
+    args.target_gripper_type = ""
     args.target_fixed_finger_contact_ee = None
     args.target_closing_axis_ee = None
     args.target_fixed_finger_margin_m = 0.0
     args.target_fixed_finger_margin_max_m = 0.0
     args.target_fixed_finger_margin_width_ref_m = 0.035
     args.target_fixed_finger_margin_width_gain = 0.0
+    args.target_fixed_finger_base_side_config = {
+        "enabled": False,
+        "reference_point_base": (0.0, 0.0, 0.0),
+        "min_alignment_cos": 0.0,
+    }
+    args.target_fixed_finger_robust_gap_config = {
+        "enabled": False,
+        "max_target_gap_deficit_m": 0.003,
+    }
+    args.target_ik_orientation_guard_config = {
+        "enabled": False,
+        "approach_axis_ee": (0.0, 0.0, 1.0),
+        "closing_axis_180_symmetric": False,
+        "max_approach_error_deg": 25.0,
+        "max_closing_error_deg": 20.0,
+    }
     args.target_width_clearance_m = 0.003
     args.target_width_min_m = 0.005
     args.target_width_max_m = 0.08
@@ -674,6 +780,28 @@ def load_grasp_execution_config(args: argparse.Namespace) -> None:
     args.execution_topdown_weight = float(args.graspgen_topdown_weight)
     args.execution_confidence_weight = 1.0
     args.execution_contact_distance_scale = float(args.graspgen_contact_distance_scale)
+    args.prepared_candidate_scoring_config = {
+        "enabled": False,
+        "fixed_finger_envelope_weight": 0.55,
+        "contact_xy_weight": 0.25,
+        "contact_z_weight": 0.15,
+        "confidence_weight": 0.05,
+        "centroid_distance_weight": 0.50,
+        "contact_xy_scale_m": 0.030,
+        "contact_z_scale_m": 0.020,
+        "centroid_distance_scale_m": 0.010,
+        "fixed_finger_gap_sigma_m": 0.006,
+        "missing_fixed_finger_envelope_score": 0.20,
+        "fixed_finger_score_weight": 0.80,
+        "reliable_max_opening_m": 0.072,
+        "moving_finger_min_clearance_m": 0.003,
+    }
+
+    explicit_cli_destinations = getattr(args, "_explicit_cli_destinations", set())
+
+    def apply_config_value(destination: str, value, *, cli_destination: str | None = None) -> None:
+        if (cli_destination or destination) not in explicit_cli_destinations:
+            setattr(args, destination, value)
 
     if args.robot_config is None or not args.robot_config.exists():
         return
@@ -687,9 +815,141 @@ def load_grasp_execution_config(args: argparse.Namespace) -> None:
     if not isinstance(config, dict):
         return
 
+    direct_options = (
+        ("planner_service", "manipulation_service", str),
+        ("verifier_service", "grasp_verification_service", str),
+        ("detect_service", "detect_service", str),
+        ("ik_service", "ik_service", str),
+        ("fk_service", "fk_service", str),
+        ("move_configuration_service", "move_configuration_service", str),
+        ("base_frame", "base_frame", str),
+        ("ee_frame", "ee_frame", str),
+        ("timeout_sec", "task_timeout_s", float),
+        ("ready_timeout_sec", "ready_timeout_s", float),
+        ("verification", "grasp_verification", str),
+        ("verification_timeout_sec", "grasp_verification_timeout_s", float),
+        ("verification_wait_sec", "grasp_verification_wait_s", float),
+        ("recover_after_close_failure", "recover_after_close_failure", bool),
+        ("recover_after_retention_failure", "recover_after_retention_failure", bool),
+        ("max_execution_attempts", "max_execution_attempts", int),
+        ("approach_distance_m", "graspgen_approach_distance", float),
+        ("lift_distance_m", "final_lift", float),
+        ("observe_velocity_scaling", "observe_speed", float),
+        ("approach_velocity_scaling", "approach_speed", float),
+        ("descend_velocity_scaling", "descend_speed", float),
+        ("probe_lift_velocity_scaling", "grasp_verification_probe_lift_speed", float),
+        ("lift_velocity_scaling", "lift_speed", float),
+        ("observe_settle_sec", "observe_settle_s", float),
+        ("open_settle_sec", "open_settle_s", float),
+        ("hold_sec", "hold_s", float),
+        ("probe_lift_height_m", "grasp_verification_probe_lift_height", float),
+    )
+    for config_key, destination, cast in direct_options:
+        if config_key in config:
+            apply_config_value(destination, cast(config[config_key]))
+
+    planner = config.get("planner", {})
+    if isinstance(planner, dict):
+        planner_options = (
+            ("confidence_threshold", "confidence_threshold", float),
+            ("grasp_threshold", "grasp_threshold", float),
+            ("timeout_sec", "detect_timeout_s", float),
+            ("debug_output_mode", "debug_output_mode", str),
+        )
+        for config_key, destination, cast in planner_options:
+            if config_key in planner:
+                apply_config_value(destination, cast(planner[config_key]))
+
+    candidate_selection = config.get("candidate_selection", {})
+    if isinstance(candidate_selection, dict):
+        candidate_options = (
+            ("min_confidence", "min_grasp_confidence", float),
+            ("min_point_count", "min_point_count", int),
+            ("require_collision_free", "require_collision_free_grasp", bool),
+            ("min_contact_z", "min_contact_z", float),
+            ("min_approach_z", "min_approach_z", float),
+            ("topdown_min_z", "graspgen_topdown_min_z", float),
+            ("max_candidates", "max_candidates", int),
+        )
+        for config_key, destination, cast in candidate_options:
+            if config_key in candidate_selection:
+                apply_config_value(destination, cast(candidate_selection[config_key]))
+        if "confidence_weight" in candidate_selection:
+            args.execution_confidence_weight = float(candidate_selection["confidence_weight"])
+        if "topdown_weight" in candidate_selection:
+            apply_config_value(
+                "execution_topdown_weight",
+                float(candidate_selection["topdown_weight"]),
+                cli_destination="graspgen_topdown_weight",
+            )
+
+    ik = config.get("ik", {})
+    if isinstance(ik, dict):
+        ik_options = (
+            ("group_name", "ik_group", str),
+            ("timeout_sec", "ik_timeout_s", float),
+            ("avoid_collisions", "ik_avoid_collisions", bool),
+            ("check_orientation", "ik_check_orientation", bool),
+            ("worker_count", "ik_worker_count", int),
+            ("worker_namespace_prefix", "ik_worker_prefix", str),
+        )
+        for config_key, destination, cast in ik_options:
+            if config_key in ik:
+                apply_config_value(destination, cast(ik[config_key]))
+
+    contact_compensation = config.get("contact_compensation", {})
+    if isinstance(contact_compensation, dict):
+        compensation_options = (
+            ("enabled", "ik_fk_contact_compensation", bool),
+            ("xy_tolerance_m", "ik_fk_contact_tolerance", float),
+            ("max_iterations", "ik_fk_contact_max_iterations", int),
+            ("max_correction_m", "ik_fk_contact_max_correction", float),
+            ("max_z_error_m", "ik_fk_contact_max_xz_error", float),
+        )
+        for config_key, destination, cast in compensation_options:
+            if config_key in contact_compensation:
+                apply_config_value(destination, cast(contact_compensation[config_key]))
+
+    contact_realign = config.get("contact_realign", {})
+    if isinstance(contact_realign, dict):
+        realign_options = (
+            ("enabled", "contact_realign", bool),
+            ("tolerance_m", "contact_realign_tolerance", float),
+            ("max_iterations", "contact_realign_max_iterations", int),
+            ("pregrasp_clearance_m", "pregrasp_realign_clearance", float),
+        )
+        for config_key, destination, cast in realign_options:
+            if config_key in contact_realign:
+                apply_config_value(destination, cast(contact_realign[config_key]))
+
+    pose_diagnostics = config.get("pose_diagnostics", {})
+    if isinstance(pose_diagnostics, dict):
+        diagnostic_options = (
+            ("enabled", "pick_diagnostics", bool),
+            ("settle_sec", "pick_diagnostics_settle_s", float),
+            ("grasp_warn_threshold_m", "grasp_realign_max_xy_error", float),
+            ("grasp_realign_log_threshold_m", "grasp_residual_realign_xy_error", float),
+            ("grasp_abort_log_threshold_m", "grasp_residual_abort_xy_error", float),
+        )
+        for config_key, destination, cast in diagnostic_options:
+            if config_key in pose_diagnostics:
+                apply_config_value(destination, cast(pose_diagnostics[config_key]))
+
+    target_geometry = config.get("target_geometry", {})
+    if isinstance(target_geometry, dict):
+        geometry_options = (
+            ("tabletop_filter", "so101_tabletop_filter", bool),
+            ("tabletop_clearance_m", "so101_tabletop_clearance", float),
+            ("tabletop_sweep_steps", "so101_tabletop_sweep_steps", int),
+        )
+        for config_key, destination, cast in geometry_options:
+            if config_key in target_geometry:
+                apply_config_value(destination, cast(target_geometry[config_key]))
+
     target_gripper = config.get("target_gripper", {})
     if not isinstance(target_gripper, dict):
         target_gripper = {}
+    args.target_gripper_type = str(target_gripper.get("type", ""))
 
     fixed = target_gripper.get("fixed_finger_contact_ee")
     axis = target_gripper.get("closing_axis_ee")
@@ -700,6 +960,27 @@ def load_grasp_execution_config(args: argparse.Namespace) -> None:
     if axis is not None:
         args.target_closing_axis_ee = tuple(
             float(v) for v in _normalized_vector(axis, "grasp_execution.target_gripper.closing_axis_ee")
+        )
+    orientation_guard = target_gripper.get("ik_orientation_guard", {})
+    if isinstance(orientation_guard, dict):
+        args.target_ik_orientation_guard_config.update(orientation_guard)
+        if "joint5_abs_max" in orientation_guard:
+            apply_config_value("final_joint5_max", float(orientation_guard["joint5_abs_max"]))
+    args.target_ik_orientation_guard_config["approach_axis_ee"] = tuple(
+        float(v)
+        for v in _normalized_vector(
+            args.target_ik_orientation_guard_config["approach_axis_ee"],
+            "grasp_execution.target_gripper.ik_orientation_guard.approach_axis_ee",
+        )
+    )
+    for key in ("max_approach_error_deg", "max_closing_error_deg"):
+        value = float(args.target_ik_orientation_guard_config[key])
+        if not math.isfinite(value) or not 0.0 <= value <= 180.0:
+            raise ValueError(f"grasp_execution.target_gripper.ik_orientation_guard.{key} must be in [0, 180]")
+        args.target_ik_orientation_guard_config[key] = value
+    if bool(args.target_ik_orientation_guard_config["enabled"]) and args.target_closing_axis_ee is None:
+        raise ValueError(
+            "grasp_execution.target_gripper.closing_axis_ee is required when ik_orientation_guard is enabled"
         )
 
     if "fixed_finger_margin_m" in target_gripper:
@@ -726,6 +1007,26 @@ def load_grasp_execution_config(args: argparse.Namespace) -> None:
             "grasp_execution.target_gripper.fixed_finger_margin_max_m must be greater than or equal to "
             "fixed_finger_margin_m"
         )
+    base_side = target_gripper.get("fixed_finger_base_side", {})
+    if isinstance(base_side, dict):
+        args.target_fixed_finger_base_side_config.update(base_side)
+    args.target_fixed_finger_base_side_config["reference_point_base"] = _float_triplet(
+        args.target_fixed_finger_base_side_config["reference_point_base"],
+        "grasp_execution.target_gripper.fixed_finger_base_side.reference_point_base",
+    )
+    min_alignment_cos = float(args.target_fixed_finger_base_side_config["min_alignment_cos"])
+    if not -1.0 <= min_alignment_cos <= 1.0:
+        raise ValueError("grasp_execution.target_gripper.fixed_finger_base_side.min_alignment_cos must be in [-1, 1]")
+    args.target_fixed_finger_base_side_config["min_alignment_cos"] = min_alignment_cos
+    robust_gap = target_gripper.get("fixed_finger_robust_gap", {})
+    if isinstance(robust_gap, dict):
+        args.target_fixed_finger_robust_gap_config.update(robust_gap)
+    max_target_gap_deficit = float(args.target_fixed_finger_robust_gap_config["max_target_gap_deficit_m"])
+    if max_target_gap_deficit < 0.0:
+        raise ValueError(
+            "grasp_execution.target_gripper.fixed_finger_robust_gap.max_target_gap_deficit_m must be non-negative"
+        )
+    args.target_fixed_finger_robust_gap_config["max_target_gap_deficit_m"] = max_target_gap_deficit
     if "width_clearance_m" in target_gripper:
         args.target_width_clearance_m = float(target_gripper["width_clearance_m"])
     if "min_width_m" in target_gripper:
@@ -735,7 +1036,7 @@ def load_grasp_execution_config(args: argparse.Namespace) -> None:
     if "fallback_width_m" in target_gripper:
         args.target_width_fallback_m = float(target_gripper["fallback_width_m"])
     if "width_quality_min" in target_gripper:
-        args.target_width_quality_min = float(target_gripper["width_quality_min"])
+        apply_config_value("target_width_quality_min", float(target_gripper["width_quality_min"]))
 
     scoring = config.get("execution_scoring", {})
     if isinstance(scoring, dict):
@@ -743,25 +1044,39 @@ def load_grasp_execution_config(args: argparse.Namespace) -> None:
         if "contact_distance_weight" in scoring:
             args.execution_contact_distance_weight = float(scoring["contact_distance_weight"])
         if "topdown_weight" in scoring:
-            args.execution_topdown_weight = float(scoring["topdown_weight"])
+            apply_config_value(
+                "execution_topdown_weight",
+                float(scoring["topdown_weight"]),
+                cli_destination="graspgen_topdown_weight",
+            )
         if "confidence_weight" in scoring:
             args.execution_confidence_weight = float(scoring["confidence_weight"])
         if "contact_distance_scale_m" in scoring:
-            args.execution_contact_distance_scale = float(scoring["contact_distance_scale_m"])
+            apply_config_value(
+                "execution_contact_distance_scale",
+                float(scoring["contact_distance_scale_m"]),
+                cli_destination="graspgen_contact_distance_scale",
+            )
+
+    prepared_scoring = config.get("prepared_candidate_scoring", {})
+    if isinstance(prepared_scoring, dict):
+        args.prepared_candidate_scoring_config.update(prepared_scoring)
 
     source_contact = config.get("source_contact_point")
     if source_contact is not None:
-        args.graspgen_contact_x, args.graspgen_contact_y, args.graspgen_contact_z = _float_triplet(
-            source_contact, "grasp_execution.source_contact_point"
-        )
+        source_x, source_y, source_z = _float_triplet(source_contact, "grasp_execution.source_contact_point")
+        apply_config_value("graspgen_contact_x", source_x)
+        apply_config_value("graspgen_contact_y", source_y)
+        apply_config_value("graspgen_contact_z", source_z)
 
     adapter = config.get("adapter", {})
     if isinstance(adapter, dict):
         rpy = adapter.get("source_to_ee_rpy")
         if rpy is not None:
-            args.graspgen_to_ee_roll, args.graspgen_to_ee_pitch, args.graspgen_to_ee_yaw = _float_triplet(
-                rpy, "grasp_execution.adapter.source_to_ee_rpy"
-            )
+            roll, pitch, yaw = _float_triplet(rpy, "grasp_execution.adapter.source_to_ee_rpy")
+            apply_config_value("graspgen_to_ee_roll", roll)
+            apply_config_value("graspgen_to_ee_pitch", pitch)
+            apply_config_value("graspgen_to_ee_yaw", yaw)
 
     args.grasp_execution_config = config
 
@@ -796,14 +1111,17 @@ def candidate_target_width(candidate) -> tuple[float, float]:
     return width, quality
 
 
-def resolve_target_contact_for_candidate(args: argparse.Namespace, candidate) -> tuple[np.ndarray, str]:
+def resolve_target_contact_for_candidate(
+    args: argparse.Namespace,
+    candidate,
+) -> tuple[np.ndarray, str, float | None]:
     static_contact = _static_target_contact(args)
     if not args.target_auto_width_compensation:
-        return static_contact, "static:auto_disabled"
+        return static_contact, "static:auto_disabled", None
     if not args._graspgen_to_ee_translation_auto:
-        return static_contact, "static:manual_adapter"
+        return static_contact, "static:manual_adapter", None
     if args.target_fixed_finger_contact_ee is None or args.target_closing_axis_ee is None:
-        return static_contact, "static:missing_target_gripper_config"
+        return static_contact, "static:missing_target_gripper_config", None
 
     measured_width, quality = candidate_target_width(candidate)
     if measured_width <= 0.0 or quality < float(args.target_width_quality_min):
@@ -841,7 +1159,8 @@ def resolve_target_contact_for_candidate(args: argparse.Namespace, candidate) ->
         f"fixed_finger_margin={fixed_finger_margin:.4f}:"
         f"center_offset={center_offset:.4f}"
     )
-    return contact, reason
+    fixed_finger_target_gap = center_offset - 0.5 * width
+    return contact, reason, fixed_finger_target_gap
 
 
 def resolve_graspgen_adapter_defaults(args: argparse.Namespace) -> None:
@@ -1041,6 +1360,10 @@ class IKFKContactPayload:
     joint_state: JointState
     ee_xyz: tuple[float, float, float]
     ee_quat_xyzw: tuple[float, float, float, float]
+    joint5_retry_applied: bool = False
+    original_joint5: float | None = None
+    approach_axis_error_deg: float | None = None
+    closing_axis_error_deg: float | None = None
 
 
 def _load_robot_camera_transform(config_path: Path, camera_name: str, ee_frame: str) -> tuple[np.ndarray, dict]:
@@ -1100,15 +1423,55 @@ class BananaHandeyePickClient(Node):
             self.create_client(VerifyGrasp, args.grasp_verification_service) if self.use_grasp_verification else None
         )
         self.use_ik_fk_contact_compensation = bool(args.ik_fk_contact_compensation and args.target_source == "graspgen")
-        needs_ik_services = args.ik_filter or self.use_ik_fk_contact_compensation
-        self.ik_client = self.create_client(GetPositionIK, args.ik_service) if needs_ik_services else None
-        self.fk_client = (
-            self.create_client(GetPositionFK, args.fk_service) if self.use_ik_fk_contact_compensation else None
+        orientation_guard_enabled = bool(args.target_ik_orientation_guard_config.get("enabled", False))
+        needs_ik_services = (
+            args.ik_filter
+            or self.use_ik_fk_contact_compensation
+            or args.final_joint5_max is not None
+            or orientation_guard_enabled
         )
+        needs_fk_services = (
+            self.use_ik_fk_contact_compensation or args.final_joint5_max is not None or orientation_guard_enabled
+        )
+        self.ik_client = self.create_client(GetPositionIK, args.ik_service) if needs_ik_services else None
+        self.fk_client = self.create_client(GetPositionFK, args.fk_service) if needs_fk_services else None
+        worker_count = max(0, int(args.ik_worker_count))
+        worker_prefix = str(args.ik_worker_prefix).rstrip("/")
+        if worker_count and not worker_prefix:
+            raise ValueError("--ik-worker-prefix must not be empty when --ik-worker-count is positive")
+        self.ik_worker_clients = []
+        self.fk_worker_clients = []
+        self._ik_worker_callback_group = ReentrantCallbackGroup()
+        self._parallel_ik_seed: JointState | None = None
+        self._parallel_ik_seed_subscription = None
+        if needs_ik_services:
+            for index in range(worker_count):
+                namespace = f"{worker_prefix}_{index}"
+                self.ik_worker_clients.append(
+                    self.create_client(
+                        GetPositionIK,
+                        f"{namespace}/compute_ik",
+                        callback_group=self._ik_worker_callback_group,
+                    )
+                )
+                if needs_fk_services:
+                    self.fk_worker_clients.append(
+                        self.create_client(
+                            GetPositionFK,
+                            f"{namespace}/compute_fk",
+                            callback_group=self._ik_worker_callback_group,
+                        )
+                    )
+        if worker_count:
+            self._parallel_ik_seed_subscription = self.create_subscription(
+                JointState,
+                "/joint_states",
+                self._parallel_ik_seed_callback,
+                10,
+                callback_group=self._ik_worker_callback_group,
+            )
         self.move_configuration_client = (
-            self.create_client(MoveToConfiguration, args.move_configuration_service)
-            if self.use_ik_fk_contact_compensation
-            else None
+            self.create_client(MoveToConfiguration, args.move_configuration_service) if needs_fk_services else None
         )
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -1116,6 +1479,10 @@ class BananaHandeyePickClient(Node):
         self.selected_target_contact_ee: tuple[float, float, float] | None = None
         self.selected_plan_contact_base: tuple[float, float, float] | None = None
         self.selected_target_width_m = 0.0
+        self.selected_fixed_finger_envelope = None
+        self.selected_target_width_extent_base = None
+        self.selected_grasp_joint_seed: JointState | None = None
+        self.active_grasp_joint_seed: JointState | None = None
         self.current_grasp_verified = False
         self.current_execution_candidate_index: int | None = None
         self.observed_target_base: tuple[float, float, float] | None = None
@@ -1123,12 +1490,23 @@ class BananaHandeyePickClient(Node):
         self.current_plan_contact_base: tuple[float, float, float] | None = None
         self.realign_target_contact_base_by_phase: dict[str, tuple[float, float, float]] = {}
         self.last_graspgen_debug_output_dir: Path | None = None
+        self.last_graspgen_surface_centroid_camera: tuple[float, float, float] | None = None
+        self.last_graspgen_volume_centroid_camera: tuple[float, float, float] | None = None
+        self.last_graspgen_object_top_camera: tuple[float, float, float] | None = None
         self.execution_debug_records: list[dict[str, object]] = []
+        self.prepared_candidate_ranking_records: list[dict[str, object]] = []
         self.pick_diagnostic_records: list[dict[str, object]] = []
         self.grasp_verification_records: list[dict[str, object]] = []
         self.last_t_base_camera: np.ndarray | None = None
         self._so101_table_plane: tuple[np.ndarray, float, float] | None = None
+        self._so101_table_plane_shadow: tuple[np.ndarray, float, float] | None = None
         self._so101_table_plane_checked = False
+        self._so101_table_shadow_comparisons = 0
+        self._so101_table_shadow_mismatches = 0
+        self._so101_table_shadow_max_clearance_delta = 0.0
+
+    def _parallel_ik_seed_callback(self, message: JointState) -> None:
+        self._parallel_ik_seed = message
 
     @staticmethod
     def _load_handeye_data(path: Path) -> dict:
@@ -1282,20 +1660,43 @@ class BananaHandeyePickClient(Node):
             raise RuntimeError(f"Move configuration service is not available: {self.args.move_configuration_service}")
 
     def wait_ik_ready(self) -> None:
+        orientation_guard_enabled = bool(self.args.target_ik_orientation_guard_config.get("enabled", False))
         if (
-            (self.args.ik_filter or self.use_ik_fk_contact_compensation)
+            (
+                self.args.ik_filter
+                or self.use_ik_fk_contact_compensation
+                or self.args.final_joint5_max is not None
+                or orientation_guard_enabled
+            )
             and self.ik_client is not None
             and not self.ik_client.wait_for_service(timeout_sec=self.args.ik_wait_timeout_s)
         ):
             raise RuntimeError(f"IK service is not available: {self.args.ik_service}")
-        if (
-            self.use_ik_fk_contact_compensation
-            and self.fk_client is not None
-            and not self.fk_client.wait_for_service(timeout_sec=self.args.ik_wait_timeout_s)
-        ):
+        if self.fk_client is not None and not self.fk_client.wait_for_service(timeout_sec=self.args.ik_wait_timeout_s):
             raise RuntimeError(f"FK service is not available: {self.args.fk_service}")
+        worker_prefix = str(self.args.ik_worker_prefix).rstrip("/")
+        for index, client in enumerate(self.ik_worker_clients):
+            service = f"{worker_prefix}_{index}/compute_ik"
+            if not client.wait_for_service(timeout_sec=self.args.ik_wait_timeout_s):
+                raise RuntimeError(f"Parallel IK worker service is not available: {service}")
+        for index, client in enumerate(self.fk_worker_clients):
+            service = f"{worker_prefix}_{index}/compute_fk"
+            if not client.wait_for_service(timeout_sec=self.args.ik_wait_timeout_s):
+                raise RuntimeError(f"Parallel FK worker service is not available: {service}")
+        if self.ik_worker_clients:
+            deadline = time.monotonic() + float(self.args.ik_wait_timeout_s)
+            while self._parallel_ik_seed is None and time.monotonic() < deadline:
+                rclpy.spin_once(self, timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())))
+            if self._parallel_ik_seed is None:
+                raise RuntimeError("Parallel IK worker pool requires a current /joint_states sample")
+            print(
+                f"IK_WORKER_POOL ready=True workers={len(self.ik_worker_clients)} prefix={worker_prefix} "
+                f"seed_joints={len(self._parallel_ik_seed.name)}",
+                flush=True,
+            )
 
     def run_task(self, task_id: str, description: str, steps: list[TaskStep], timeout_s: float | None = None) -> bool:
+        started = time.monotonic()
         goal = ExecuteTaskPlan.Goal()
         goal.task_id = task_id
         goal.task_description = description
@@ -1319,12 +1720,13 @@ class BananaHandeyePickClient(Node):
         result = result_future.result().result
         print(
             f"TASK_RESULT success={result.success} steps={result.steps_completed} "
-            f"duration={result.total_duration_s:.2f}s msg={result.message}",
+            f"duration={result.total_duration_s:.2f}s wall_s={time.monotonic() - started:.3f} msg={result.message}",
             flush=True,
         )
         return bool(result.success)
 
     def run_joint_configuration(self, label: str, joint_state: JointState, velocity_scaling: float) -> bool:
+        started = time.monotonic()
         client = self.move_configuration_client
         if client is None:
             raise RuntimeError("Move configuration client is disabled")
@@ -1348,10 +1750,58 @@ class BananaHandeyePickClient(Node):
             raise RuntimeError(f"Move configuration returned no response: {label}")
         print(
             f"MOVE_CONFIGURATION_RESULT label={label} success={response.success} "
-            f"duration={response.execution_time_s:.2f}s msg={response.message}",
+            f"duration={response.execution_time_s:.2f}s wall_s={time.monotonic() - started:.3f} msg={response.message}",
             flush=True,
         )
         return bool(response.success)
+
+    def run_branch_locked_pose(
+        self,
+        label: str,
+        xyz: tuple[float, float, float],
+        quat_xyzw: tuple[float, float, float, float],
+        velocity_scaling: float,
+        *,
+        phase: str,
+        retryable: bool = True,
+        validate_orientation: bool = True,
+    ) -> IKFKContactPayload:
+        seed = self.active_grasp_joint_seed
+        payload, code, failed_reason = self.solve_grasp_ik_fk(
+            label,
+            xyz,
+            quat_xyzw,
+            seed,
+            validate_orientation=validate_orientation,
+        )
+        if payload is None:
+            raise PickExecutionError(
+                f"Branch-locked IK failed: code={code} reason={failed_reason}",
+                phase=phase,
+                retryable=retryable,
+            )
+        if not validate_orientation:
+            approach_error = payload.approach_axis_error_deg
+            closing_error = payload.closing_axis_error_deg
+            approach_text = "n/a" if approach_error is None else f"{approach_error:.3f}"
+            closing_text = "n/a" if closing_error is None else f"{closing_error:.3f}"
+            print(
+                f"IK_ORIENTATION_GATE label={label} enabled=False "
+                f"approach_error_deg={approach_text} closing_error_deg={closing_text}",
+                flush=True,
+            )
+        try:
+            self._validate_joint5_branch_continuity(label, seed, payload.joint_state)
+        except RuntimeError as exc:
+            raise PickExecutionError(str(exc), phase=phase, retryable=retryable) from exc
+        if not self.run_joint_configuration(label, payload.joint_state, velocity_scaling):
+            raise PickExecutionError(
+                f"Branch-locked joint motion failed: {label}",
+                phase=phase,
+                retryable=retryable,
+            )
+        self.active_grasp_joint_seed = payload.joint_state
+        return payload
 
     def verify_grasp_retention(self, label: str) -> None:
         if not self.use_grasp_verification:
@@ -1372,6 +1822,7 @@ class BananaHandeyePickClient(Node):
                 retryable=False,
             )
 
+        started = time.monotonic()
         request = VerifyGrasp.Request()
         request.task_id = f"banana_pick_{self.current_execution_candidate_index}_{label}"
         request.text_prompt = self.args.prompt
@@ -1416,7 +1867,7 @@ class BananaHandeyePickClient(Node):
             selected_record.setdefault("grasp_verification", []).append(record)
         print(
             f"GRASP_VERIFY label={label} success={response.success} status={status_name} "
-            f"confidence={response.confidence:.2f} msg={response.message}",
+            f"confidence={response.confidence:.2f} wall_s={time.monotonic() - started:.3f} msg={response.message}",
             flush=True,
         )
         for evidence in response.evidence:
@@ -1514,6 +1965,108 @@ class BananaHandeyePickClient(Node):
             flush=True,
         )
 
+    def recover_after_retention_failure(
+        self,
+        *,
+        task_id: str,
+        task_desc: str,
+        phase: str,
+        elevated_pose: tuple[float, float, float],
+    ) -> None:
+        print(
+            f"RETENTION_FAILURE_RECOVERY phase={phase} stage=open elevated_pose={fmt_xyz(elevated_pose)}",
+            flush=True,
+        )
+        steps = [
+            make_gripper_step(f"open_gripper_after_{phase}_failure", 1.0),
+            make_wait_step(f"settle_open_gripper_after_{phase}_failure", self.args.open_settle_s),
+        ]
+        recovery_target = phase
+        if not self.args.skip_observe:
+            observe = (self.args.observe_x, self.args.observe_y, self.args.observe_z)
+            steps.extend(
+                [
+                    make_move_step("return_to_observation_pose", observe, self.args.observe_speed),
+                    make_wait_step("settle_recovery_observation_image", self.args.observe_settle_s),
+                ]
+            )
+            recovery_target = "observe"
+        ok = self.run_task(
+            f"{task_id}_recover_{phase}",
+            f"{task_desc}: reset after {phase} retention failure",
+            steps,
+            timeout_s=90.0,
+        )
+        if not ok:
+            raise PickExecutionError(
+                f"{phase} retention-failure recovery could not open and return to observation",
+                phase=f"recover_{phase}",
+                retryable=False,
+            )
+        print(
+            f"RETENTION_FAILURE_RECOVERY phase={phase} success=True final={recovery_target} gripper=open",
+            flush=True,
+        )
+
+    def release_verified_target(
+        self,
+        *,
+        task_id: str,
+        task_desc: str,
+        current_pose: tuple[float, float, float],
+        release_pose: tuple[float, float, float],
+        move_quat: tuple[float, float, float, float] | None,
+        completion_mode: str,
+        drop_height_m: float | None,
+    ) -> None:
+        need_descent = norm_xyz(sub_xyz(release_pose, current_pose)) > 1e-6
+        branch_locked_release = need_descent and self.active_grasp_joint_seed is not None and move_quat is not None
+        if branch_locked_release:
+            self.run_branch_locked_pose(
+                "descend_to_release_height",
+                release_pose,
+                move_quat,
+                self.args.lift_speed,
+                phase="release",
+                retryable=False,
+            )
+        release_steps = []
+        if need_descent and not branch_locked_release:
+            release_steps.append(
+                make_move_step("descend_to_release_height", release_pose, self.args.lift_speed, move_quat)
+            )
+        release_steps.extend(
+            [
+                make_gripper_step("open_gripper_after_success", 1.0),
+                make_wait_step("settle_released_target", max(0.0, self.args.release_settle_s)),
+            ]
+        )
+        ok = self.run_task(
+            f"{task_id}_release",
+            f"{task_desc}: release after {completion_mode} completion",
+            release_steps,
+        )
+        if not ok:
+            raise PickExecutionError(
+                "Post-success target release failed",
+                phase="release",
+                retryable=False,
+            )
+        selected = next((record for record in self.execution_debug_records if record.get("selected")), None)
+        if selected is not None:
+            selected["post_success_release"] = {
+                "success": True,
+                "completion_mode": completion_mode,
+                "settle_s": round(max(0.0, float(self.args.release_settle_s)), 3),
+                "release_pose": _json_xyz(release_pose),
+                "drop_height_m": None if drop_height_m is None else round(drop_height_m, 6),
+            }
+        print(
+            f"POST_SUCCESS_RELEASE success=True completion_mode={completion_mode} "
+            f"gripper=open release_pose={fmt_xyz(release_pose)}",
+            flush=True,
+        )
+
     def lookup_base_to_gripper(self):
         deadline = time.monotonic() + self.args.tf_timeout_s
         last_error: Exception | None = None
@@ -1533,6 +2086,7 @@ class BananaHandeyePickClient(Node):
         raise RuntimeError(f"No TF from {self.args.ee_frame} to {self.args.base_frame}: {last_error}")
 
     def detect_target(self) -> Detection2D:
+        started = time.monotonic()
         request = DetectSegment.Request()
         request.text_prompt = self.args.prompt
         request.confidence_threshold = self.args.confidence_threshold
@@ -1563,7 +2117,7 @@ class BananaHandeyePickClient(Node):
             f"points={int(detection.point_count)} frame={detection.header.frame_id} "
             f"surface_xyz=({detection.centroid_xyz.x:.4f},{detection.centroid_xyz.y:.4f},{detection.centroid_xyz.z:.4f}) "
             f"volume_xyz=({detection.volume_centroid_xyz.x:.4f},{detection.volume_centroid_xyz.y:.4f},{detection.volume_centroid_xyz.z:.4f}) "
-            f"vol={detection.volume_m3 * 1e6:.1f}cm³",
+            f"vol={detection.volume_m3 * 1e6:.1f}cm³ wall_s={time.monotonic() - started:.3f}",
             flush=True,
         )
         return detection
@@ -1572,18 +2126,14 @@ class BananaHandeyePickClient(Node):
         self,
         debug_output_mode: str | None = None,
     ):
+        self.last_graspgen_surface_centroid_camera = None
+        self.last_graspgen_volume_centroid_camera = None
+        self.last_graspgen_object_top_camera = None
         request = PlanGrasp.Request()
         request.text_prompt = self.args.prompt
         request.confidence_threshold = self.args.confidence_threshold
         request.grasp_threshold = self.args.grasp_threshold
         output_mode = debug_output_mode or self.args.debug_output_mode
-        if self.args.so101_tabletop_filter and output_mode != "full":
-            print(
-                "SO101_TABLETOP_FILTER forcing_graspgen_debug_output_mode=full "
-                f"previous={output_mode!r} reason=filter_requires_scene_cloud",
-                flush=True,
-            )
-            output_mode = "full"
         request.debug_output_mode = output_mode
 
         print(
@@ -1600,8 +2150,21 @@ class BananaHandeyePickClient(Node):
         self.print_graspgen_diagnostics(response)
         debug_output_dir = getattr(response, "debug_output_dir", "")
         self.last_graspgen_debug_output_dir = Path(debug_output_dir) if debug_output_dir else None
+        if bool(getattr(response, "success", False)) and int(getattr(response, "object_point_count", 0)) > 0:
+            surface = response.object_centroid_xyz
+            volume = response.object_volume_centroid_xyz
+            self.last_graspgen_surface_centroid_camera = (float(surface.x), float(surface.y), float(surface.z))
+            self.last_graspgen_volume_centroid_camera = (float(volume.x), float(volume.y), float(volume.z))
+            if bool(getattr(response, "table_plane_found", False)):
+                object_top = response.object_top_xyz
+                object_top_xyz = (float(object_top.x), float(object_top.y), float(object_top.z))
+                if all(math.isfinite(value) for value in object_top_xyz):
+                    self.last_graspgen_object_top_camera = object_top_xyz
         self._so101_table_plane = None
+        self._so101_table_plane_shadow = None
         self._so101_table_plane_checked = False
+        if self.args.so101_tabletop_filter:
+            self._cache_so101_table_plane_from_response(response)
         return response
 
     def request_graspgen_candidates(self, base_to_gripper_tf=None):
@@ -1631,7 +2194,9 @@ class BananaHandeyePickClient(Node):
         t_base_gripper = transform_to_matrix(base_to_gripper_tf)
         t_gripper_camera = np.array(self.handeye_matrix, dtype=np.float64)
         t_camera_graspgen = matrix_from_rowmajor(candidate.pose_matrix)
-        target_contact, width_reason = resolve_target_contact_for_candidate(self.args, candidate)
+        target_contact, width_reason, fixed_finger_target_gap = resolve_target_contact_for_candidate(
+            self.args, candidate
+        )
         adapter_xyz = (
             _adapter_translation(self.args, target_contact)
             if self.args._graspgen_to_ee_translation_auto
@@ -1647,7 +2212,15 @@ class BananaHandeyePickClient(Node):
         )
         t_base_graspgen = t_base_gripper @ t_gripper_camera @ t_camera_graspgen
         t_base_ee = t_base_graspgen @ t_graspgen_ee
-        return t_base_ee, t_base_graspgen, t_camera_graspgen, target_contact, adapter_xyz, width_reason
+        return (
+            t_base_ee,
+            t_base_graspgen,
+            t_camera_graspgen,
+            target_contact,
+            adapter_xyz,
+            width_reason,
+            fixed_finger_target_gap,
+        )
 
     def graspgen_targets_from_pose(
         self, t_base_ee: np.ndarray, t_base_graspgen: np.ndarray
@@ -1702,6 +2275,20 @@ class BananaHandeyePickClient(Node):
         target_contact: Iterable[float] | None = None,
         target_width_m: float | None = None,
         target_width_quality: float | None = None,
+        target_width_min_offset_m: float | None = None,
+        target_width_max_offset_m: float | None = None,
+        source_rank_score: float | None = None,
+        selection_score: float | None = None,
+        fixed_finger_envelope_score_value: float | None = None,
+        fixed_finger_gap_score: float | None = None,
+        fixed_finger_gap_m: float | None = None,
+        fixed_finger_target_gap_m: float | None = None,
+        moving_finger_gap_m: float | None = None,
+        moving_finger_gap_score: float | None = None,
+        fixed_finger_base_side_alignment_cos: float | None = None,
+        fixed_finger_inward_offset_m: float | None = None,
+        contact_residual_xy_m: float | None = None,
+        contact_z_error_m: float | None = None,
         grasp_mesh_min_z: float | None = None,
         so101_tabletop_clearance_m: float | None = None,
         adapter_xyz: Iterable[float] | None = None,
@@ -1713,6 +2300,11 @@ class BananaHandeyePickClient(Node):
         ik_fk_contact_z_error: float | None = None,
         ik_fk_predicted_grasp_mesh_min_z: float | None = None,
         ik_fk_predicted_tabletop_clearance_m: float | None = None,
+        ik_grasp_joint5: float | None = None,
+        ik_joint5_retry_applied: bool | None = None,
+        ik_original_joint5: float | None = None,
+        ik_fk_approach_axis_error_deg: float | None = None,
+        ik_fk_closing_axis_error_deg: float | None = None,
         selected: bool = False,
     ) -> None:
         record: dict[str, object] = {
@@ -1732,6 +2324,30 @@ class BananaHandeyePickClient(Node):
             record["target_width_m"] = round(float(target_width_m), 6)
         if target_width_quality is not None:
             record["target_width_quality"] = round(float(target_width_quality), 6)
+        for key, value in (
+            ("target_width_min_offset_m", target_width_min_offset_m),
+            ("target_width_max_offset_m", target_width_max_offset_m),
+            ("source_rank_score", source_rank_score),
+            ("selection_score", selection_score),
+            ("fixed_finger_envelope_score", fixed_finger_envelope_score_value),
+            ("fixed_finger_gap_score", fixed_finger_gap_score),
+            ("fixed_finger_gap_m", fixed_finger_gap_m),
+            ("fixed_finger_target_gap_m", fixed_finger_target_gap_m),
+            ("moving_finger_gap_m", moving_finger_gap_m),
+            ("moving_finger_gap_score", moving_finger_gap_score),
+            ("fixed_finger_base_side_alignment_cos", fixed_finger_base_side_alignment_cos),
+            ("fixed_finger_inward_offset_m", fixed_finger_inward_offset_m),
+            ("contact_residual_xy_m", contact_residual_xy_m),
+            ("contact_z_error_m", contact_z_error_m),
+            ("ik_grasp_joint5", ik_grasp_joint5),
+            ("ik_original_joint5", ik_original_joint5),
+            ("ik_fk_approach_axis_error_deg", ik_fk_approach_axis_error_deg),
+            ("ik_fk_closing_axis_error_deg", ik_fk_closing_axis_error_deg),
+        ):
+            if value is not None:
+                record[key] = round(float(value), 6)
+        if ik_joint5_retry_applied is not None:
+            record["ik_joint5_retry_applied"] = bool(ik_joint5_retry_applied)
         if grasp_mesh_min_z is not None:
             record["grasp_mesh_min_z"] = round(float(grasp_mesh_min_z), 6)
         if so101_tabletop_clearance_m is not None:
@@ -1783,13 +2399,21 @@ class BananaHandeyePickClient(Node):
         self.execution_debug_records.append(record)
 
     def _write_execution_debug_outputs(self, *, render_previews: bool = True) -> None:
-        if not self.args.execution_debug_preview or not self.execution_debug_records:
+        if not self.execution_debug_records:
             return
         out_dir = self.last_graspgen_debug_output_dir
         if out_dir is None:
             return
+        started = time.monotonic()
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
+            if self.prepared_candidate_ranking_records:
+                (out_dir / "prepared_candidate_ranking.json").write_text(
+                    json.dumps(self.prepared_candidate_ranking_records, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8",
+                )
+            if not self.args.execution_debug_preview:
+                return
             payload = {
                 "frame_id": self.args.base_frame,
                 "legend": {
@@ -1834,7 +2458,10 @@ class BananaHandeyePickClient(Node):
                 self._render_execution_debug_preview(out_dir / "grasp_preview_so101_execution.png")
             except Exception as exc:
                 print(f"EXECUTION_DEBUG_PNG skipped=True error={exc}", flush=True)
-            print(f"EXECUTION_DEBUG_OUTPUT dir={out_dir}", flush=True)
+            print(
+                f"EXECUTION_DEBUG_OUTPUT dir={out_dir} duration_s={time.monotonic() - started:.3f}",
+                flush=True,
+            )
         except Exception as exc:
             print(f"EXECUTION_DEBUG_OUTPUT failed=True error={exc}", flush=True)
 
@@ -2014,6 +2641,13 @@ class BananaHandeyePickClient(Node):
         )
 
     def object_top_z_base(self) -> tuple[float | None, str]:
+        if self.last_t_base_camera is not None and self.last_graspgen_object_top_camera is not None:
+            top_base = self._transform_cloud(
+                self.last_t_base_camera,
+                np.asarray([self.last_graspgen_object_top_camera], dtype=np.float64),
+            )
+            if len(top_base):
+                return float(top_base[0, 2]), "plan_grasp_object_top"
         if self.last_graspgen_debug_output_dir is None:
             return None, "missing_debug_output_dir"
         if self.last_t_base_camera is None:
@@ -2037,13 +2671,19 @@ class BananaHandeyePickClient(Node):
         return None, "missing_object_cloud"
 
     @staticmethod
-    def _preview_lines_for_pose(pose_4x4: np.ndarray, gripper_name: str) -> list[np.ndarray]:
-        try:
-            from grasp_gen.robot import load_control_points_for_visualization
+    @lru_cache(maxsize=4)
+    def _preview_control_points(gripper_name: str) -> tuple[np.ndarray, ...]:
+        from grasp_gen.robot import load_control_points_for_visualization
 
+        return tuple(
+            np.asarray(ctrl_pts, dtype=np.float32) for ctrl_pts in load_control_points_for_visualization(gripper_name)
+        )
+
+    @classmethod
+    def _preview_lines_for_pose(cls, pose_4x4: np.ndarray, gripper_name: str) -> list[np.ndarray]:
+        try:
             lines = []
-            for ctrl_pts in load_control_points_for_visualization(gripper_name):
-                pts = np.asarray(ctrl_pts, dtype=np.float32)
+            for pts in cls._preview_control_points(gripper_name):
                 pts_h = np.hstack([pts, np.ones((len(pts), 1), dtype=np.float32)])
                 lines.append((pose_4x4[:3, :] @ pts_h.T).T)
             return lines
@@ -2257,6 +2897,7 @@ class BananaHandeyePickClient(Node):
         return matrix
 
     @staticmethod
+    @lru_cache(maxsize=4)
     def _read_stl_triangles(path: Path, max_triangles: int = 2500) -> tuple[np.ndarray, np.ndarray]:
         if not path.exists():
             raise FileNotFoundError(path)
@@ -2289,6 +2930,37 @@ class BananaHandeyePickClient(Node):
         faces = np.arange(len(vertices), dtype=np.int32).reshape(-1, 3)
         return vertices, faces
 
+    @staticmethod
+    @lru_cache(maxsize=4)
+    def _read_stl_convex_hull_vertices(path: Path, max_triangles: int = 2500) -> np.ndarray:
+        vertices, _ = BananaHandeyePickClient._read_stl_triangles(path, max_triangles)
+        unique_vertices = np.unique(vertices, axis=0)
+        if len(unique_vertices) < 4:
+            return unique_vertices
+        try:
+            return unique_vertices[ConvexHull(unique_vertices).vertices]
+        except QhullError:
+            return unique_vertices
+
+    @classmethod
+    @lru_cache(maxsize=1)
+    def _so101_geometry_mesh_data(
+        cls,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        mesh_dir = Path(__file__).resolve().parents[1] / "src/robot_description/meshes/lerobot/so101"
+        fixed_vertices = cls._read_stl_convex_hull_vertices(mesh_dir / "wrist_roll_follower_so101_v1.stl")
+        moving_vertices = cls._read_stl_convex_hull_vertices(mesh_dir / "moving_jaw_so101_v1.stl")
+        t_gripper_visual = cls._matrix_from_xyz_rpy(
+            (5.55112e-17, -0.000218214, 0.000949706),
+            (-3.14159, -5.55112e-17, -9.17912e-24),
+        )
+        t_gripper_jaw = cls._matrix_from_xyz_rpy((0.0202, 0.0188, -0.0234), (1.5708, 0.209440, 0.000001))
+        t_jaw_visual = cls._matrix_from_xyz_rpy(
+            (-5.55112e-17, -1.94746e-17, 0.0189),
+            (9.53145e-17, -4.66093e-24, 0.0),
+        )
+        return fixed_vertices, moving_vertices, t_gripper_visual, t_gripper_jaw, t_jaw_visual
+
     @classmethod
     def _so101_width_to_jaw_angle(cls, width_m: float | None) -> float:
         if width_m is None:
@@ -2298,8 +2970,8 @@ class BananaHandeyePickClient(Node):
 
     @classmethod
     def _transform_mesh(cls, transform: np.ndarray, vertices: np.ndarray) -> np.ndarray:
-        vertices_h = np.hstack([vertices.astype(np.float64), np.ones((len(vertices), 1), dtype=np.float64)])
-        return (transform[:3, :] @ vertices_h.T).T
+        vertices = vertices.astype(np.float64, copy=False)
+        return vertices @ transform[:3, :3].T + transform[:3, 3]
 
     @classmethod
     def _so101_gripper_meshes(
@@ -2350,8 +3022,285 @@ class BananaHandeyePickClient(Node):
         except Exception as exc:
             print(f"SO101_MESH_HEIGHT_CHECK skipped=True error={exc}", flush=True)
             return None
-        min_z = min(float(vertices[:, 2].min()) for _, vertices, _ in meshes if len(vertices))
-        return min_z
+        return cls._so101_mesh_min_z(meshes)
+
+    @staticmethod
+    def _so101_mesh_min_z(meshes: list[tuple[str, np.ndarray, np.ndarray]]) -> float:
+        return min(float(vertices[:, 2].min()) for _, vertices, _ in meshes if len(vertices))
+
+    @staticmethod
+    def _so101_tabletop_clearance_from_grasp_meshes(
+        approach: Iterable[float],
+        grasp: Iterable[float],
+        meshes: list[tuple[str, np.ndarray, np.ndarray]],
+        normal: np.ndarray,
+        d: float,
+    ) -> float | None:
+        min_grasp_clearance = math.inf
+        for _, vertices, _ in meshes:
+            if len(vertices):
+                min_grasp_clearance = min(min_grasp_clearance, float(np.min(vertices @ normal + d)))
+        if not math.isfinite(min_grasp_clearance):
+            return None
+
+        # Sweep orientation and jaw width are fixed, so signed plane distance is
+        # linear in translation and its minimum is at one of the endpoints.
+        translation = np.asarray(tuple(approach), dtype=np.float64) - np.asarray(tuple(grasp), dtype=np.float64)
+        approach_clearance = min_grasp_clearance + float(translation @ normal)
+        return min(min_grasp_clearance, approach_clearance)
+
+    def _so101_gripper_geometry_metrics(
+        self,
+        approach: tuple[float, float, float],
+        grasp: tuple[float, float, float],
+        quat_xyzw: tuple[float, float, float, float],
+        width_m: float | None,
+    ) -> tuple[float | None, float | None]:
+        try:
+            meshes = self._so101_gripper_meshes(grasp, quat_xyzw, width_m)
+        except Exception as exc:
+            print(f"SO101_MESH_HEIGHT_CHECK skipped=True error={exc}", flush=True)
+            if self.args.so101_tabletop_filter:
+                print(f"SO101_TABLETOP_FILTER skipped=True reason=mesh_failed error={exc}", flush=True)
+            return None, None
+
+        mesh_min_z = self._so101_mesh_min_z(meshes)
+        if not self.args.so101_tabletop_filter:
+            return mesh_min_z, None
+        plane = self._load_so101_table_plane()
+        if plane is None:
+            return mesh_min_z, None
+        normal, d, _ = plane
+        clearance = self._so101_tabletop_clearance_from_grasp_meshes(approach, grasp, meshes, normal, d)
+        record_shadow = getattr(self, "_record_so101_table_plane_shadow", None)
+        if callable(record_shadow):
+            record_shadow(approach, grasp, meshes, clearance)
+        return mesh_min_z, clearance
+
+    def _so101_gripper_geometry_metrics_batch(
+        self,
+        candidates: list[
+            tuple[
+                tuple[float, float, float],
+                tuple[float, float, float],
+                tuple[float, float, float, float],
+                float | None,
+            ]
+        ],
+    ) -> list[tuple[float | None, float | None, float | None]]:
+        if not candidates:
+            return []
+
+        try:
+            fixed_vertices, moving_vertices, t_gripper_visual, t_gripper_jaw, t_jaw_visual = (
+                self._so101_geometry_mesh_data()
+            )
+            fixed_transforms = []
+            moving_transforms = []
+            for _, grasp, quat_xyzw, width_m in candidates:
+                t_base_gripper = matrix_from_pose(grasp, quat_xyzw)
+                jaw_angle = self._so101_width_to_jaw_angle(width_m)
+                t_jaw_motion = self._matrix_from_xyz_rpy((0.0, 0.0, 0.0), (0.0, 0.0, jaw_angle))
+                fixed_transforms.append(t_base_gripper @ t_gripper_visual)
+                moving_transforms.append(t_base_gripper @ t_gripper_jaw @ t_jaw_motion @ t_jaw_visual)
+
+            fixed_transforms_array = np.stack(fixed_transforms)
+            moving_transforms_array = np.stack(moving_transforms)
+            fixed_world = (
+                np.matmul(
+                    fixed_vertices[None, :, :],
+                    np.swapaxes(fixed_transforms_array[:, :3, :3], 1, 2),
+                )
+                + fixed_transforms_array[:, None, :3, 3]
+            )
+            moving_world = (
+                np.matmul(
+                    moving_vertices[None, :, :],
+                    np.swapaxes(moving_transforms_array[:, :3, :3], 1, 2),
+                )
+                + moving_transforms_array[:, None, :3, 3]
+            )
+            min_z = np.minimum(np.min(fixed_world[:, :, 2], axis=1), np.min(moving_world[:, :, 2], axis=1))
+
+            execution_clearance = np.full(len(candidates), np.nan, dtype=np.float64)
+            planning_clearance = np.full(len(candidates), np.nan, dtype=np.float64)
+            execution_plane = self._load_so101_table_plane() if self.args.so101_tabletop_filter else None
+            planning_plane = self._so101_table_plane_shadow if execution_plane is not None else None
+            approaches = np.asarray([candidate[0] for candidate in candidates], dtype=np.float64)
+            grasps = np.asarray([candidate[1] for candidate in candidates], dtype=np.float64)
+
+            def calculate_clearance(normal: np.ndarray, d: float) -> np.ndarray:
+                fixed_grasp = np.min(fixed_world @ normal + d, axis=1)
+                moving_grasp = np.min(moving_world @ normal + d, axis=1)
+                grasp_clearance = np.minimum(fixed_grasp, moving_grasp)
+                approach_clearance = grasp_clearance + (approaches - grasps) @ normal
+                return np.minimum(grasp_clearance, approach_clearance)
+
+            if execution_plane is not None:
+                normal, d, _ = execution_plane
+                execution_clearance = calculate_clearance(normal, d)
+            if planning_plane is not None:
+                normal, d, _ = planning_plane
+                planning_clearance = calculate_clearance(normal, d)
+
+            if execution_plane is not None:
+                threshold = float(self.args.so101_tabletop_clearance)
+                near_threshold = np.abs(execution_clearance - threshold) <= SO101_GEOMETRY_THRESHOLD_FALLBACK_M
+                if planning_plane is not None:
+                    near_threshold |= np.abs(planning_clearance - threshold) <= SO101_GEOMETRY_THRESHOLD_FALLBACK_M
+                for index in np.flatnonzero(near_threshold):
+                    approach, grasp, quat_xyzw, width_m = candidates[int(index)]
+                    meshes = self._so101_gripper_meshes(grasp, quat_xyzw, width_m)
+                    min_z[index] = self._so101_mesh_min_z(meshes)
+                    normal, d, _ = execution_plane
+                    exact_execution = self._so101_tabletop_clearance_from_grasp_meshes(
+                        approach, grasp, meshes, normal, d
+                    )
+                    if exact_execution is not None:
+                        execution_clearance[index] = exact_execution
+                    if planning_plane is not None:
+                        normal, d, _ = planning_plane
+                        exact_planning = self._so101_tabletop_clearance_from_grasp_meshes(
+                            approach, grasp, meshes, normal, d
+                        )
+                        if exact_planning is not None:
+                            planning_clearance[index] = exact_planning
+
+            return [
+                (
+                    float(min_z[index]),
+                    None if not np.isfinite(execution_clearance[index]) else float(execution_clearance[index]),
+                    None if not np.isfinite(planning_clearance[index]) else float(planning_clearance[index]),
+                )
+                for index in range(len(candidates))
+            ]
+        except Exception as exc:
+            print(f"SO101_BATCH_GEOMETRY fallback=True error={exc}", flush=True)
+            results = []
+            for approach, grasp, quat_xyzw, width_m in candidates:
+                min_z, clearance = self._so101_gripper_geometry_metrics(approach, grasp, quat_xyzw, width_m)
+                results.append((min_z, clearance, None))
+            return results
+
+    @staticmethod
+    def _transform_plane(
+        transform: np.ndarray,
+        normal: Iterable[float],
+        d: float,
+    ) -> tuple[np.ndarray, float]:
+        normal_array = np.asarray(tuple(normal), dtype=np.float64)
+        normal_norm = float(np.linalg.norm(normal_array))
+        if normal_array.shape != (3,) or not np.isfinite(normal_array).all() or normal_norm <= 1e-9:
+            raise ValueError("table plane normal is invalid")
+        normal_array /= normal_norm
+        d = float(d) / normal_norm
+        transformed_normal = transform[:3, :3] @ normal_array
+        transformed_d = d - float(transformed_normal @ transform[:3, 3])
+        return transformed_normal, transformed_d
+
+    def _cache_so101_table_plane_from_response(self, response) -> bool:
+        if not bool(getattr(response, "execution_table_plane_found", False)):
+            return False
+        if self.last_t_base_camera is None:
+            print("SO101_TABLETOP_FILTER response_plane_skipped=True reason=missing_base_camera_transform", flush=True)
+            return False
+        normal_msg = getattr(response, "execution_table_plane_normal", None)
+        if normal_msg is None:
+            return False
+        try:
+            normal, d = self._transform_plane(
+                self.last_t_base_camera,
+                (float(normal_msg.x), float(normal_msg.y), float(normal_msg.z)),
+                float(response.execution_table_plane_offset),
+            )
+            inlier_ratio = float(response.execution_table_plane_inlier_ratio)
+        except (AttributeError, TypeError, ValueError) as exc:
+            print(f"SO101_TABLETOP_FILTER response_plane_skipped=True reason=invalid_plane error={exc}", flush=True)
+            return False
+        if not math.isfinite(d) or not math.isfinite(inlier_ratio):
+            print("SO101_TABLETOP_FILTER response_plane_skipped=True reason=non_finite_plane", flush=True)
+            return False
+        self._so101_table_plane = (normal, d, inlier_ratio)
+        if bool(getattr(response, "table_plane_found", False)):
+            shadow_normal_msg = getattr(response, "table_plane_normal", None)
+            if shadow_normal_msg is not None:
+                try:
+                    shadow_normal, shadow_d = self._transform_plane(
+                        self.last_t_base_camera,
+                        (
+                            float(shadow_normal_msg.x),
+                            float(shadow_normal_msg.y),
+                            float(shadow_normal_msg.z),
+                        ),
+                        float(response.table_plane_offset),
+                    )
+                    shadow_inlier_ratio = float(response.table_plane_inlier_ratio)
+                    if math.isfinite(shadow_d) and math.isfinite(shadow_inlier_ratio):
+                        self._so101_table_plane_shadow = (shadow_normal, shadow_d, shadow_inlier_ratio)
+                except (AttributeError, TypeError, ValueError) as exc:
+                    print(f"SO101_TABLETOP_SHADOW skipped=True reason=invalid_planning_plane error={exc}", flush=True)
+        self._so101_table_plane_checked = True
+        print(
+            "SO101_TABLETOP_FILTER plane_found=True "
+            f"normal={fmt_xyz(normal)} d={d:.4f} inlier_ratio={inlier_ratio:.3f} "
+            "source=plan_grasp_completed_scene",
+            flush=True,
+        )
+        return True
+
+    def _record_so101_table_plane_shadow(
+        self,
+        approach: Iterable[float],
+        grasp: Iterable[float],
+        meshes: list[tuple[str, np.ndarray, np.ndarray]],
+        execution_clearance: float | None,
+    ) -> None:
+        if self._so101_table_plane_shadow is None or execution_clearance is None:
+            return
+        normal, d, _ = self._so101_table_plane_shadow
+        planning_clearance = self._so101_tabletop_clearance_from_grasp_meshes(
+            approach,
+            grasp,
+            meshes,
+            normal,
+            d,
+        )
+        if planning_clearance is None:
+            return
+        self._record_so101_table_plane_shadow_clearances(execution_clearance, planning_clearance)
+
+    def _record_so101_table_plane_shadow_clearances(
+        self,
+        execution_clearance: float | None,
+        planning_clearance: float | None,
+    ) -> None:
+        if execution_clearance is None or planning_clearance is None:
+            return
+        threshold = float(self.args.so101_tabletop_clearance)
+        execution_passed = execution_clearance >= threshold
+        planning_passed = planning_clearance >= threshold
+        delta = abs(execution_clearance - planning_clearance)
+        self._so101_table_shadow_comparisons += 1
+        self._so101_table_shadow_max_clearance_delta = max(self._so101_table_shadow_max_clearance_delta, delta)
+        if execution_passed != planning_passed:
+            self._so101_table_shadow_mismatches += 1
+        print(
+            "SO101_TABLETOP_SHADOW "
+            f"execution_clearance={execution_clearance:.6f} planning_clearance={planning_clearance:.6f} "
+            f"delta_m={delta:.6f} threshold={threshold:.6f} pass_match={execution_passed == planning_passed}",
+            flush=True,
+        )
+
+    def print_so101_table_plane_shadow_summary(self) -> None:
+        if self._so101_table_shadow_comparisons == 0:
+            return
+        print(
+            "SO101_TABLETOP_SHADOW_SUMMARY "
+            f"comparisons={self._so101_table_shadow_comparisons} "
+            f"mismatches={self._so101_table_shadow_mismatches} "
+            f"max_clearance_delta_m={self._so101_table_shadow_max_clearance_delta:.6f}",
+            flush=True,
+        )
 
     def _load_so101_table_plane(self) -> tuple[np.ndarray, float, float] | None:
         if self._so101_table_plane_checked:
@@ -2398,7 +3347,7 @@ class BananaHandeyePickClient(Node):
         normal, d, inlier_ratio = self._so101_table_plane
         print(
             "SO101_TABLETOP_FILTER plane_found=True "
-            f"normal={fmt_xyz(normal)} d={d:.4f} inlier_ratio={inlier_ratio:.3f}",
+            f"normal={fmt_xyz(normal)} d={d:.4f} inlier_ratio={inlier_ratio:.3f} source=debug_ply_fallback",
             flush=True,
         )
         return self._so101_table_plane
@@ -2416,20 +3365,16 @@ class BananaHandeyePickClient(Node):
         if plane is None:
             return None
         normal, d, _ = plane
-        steps = max(1, int(self.args.so101_tabletop_sweep_steps))
-        min_clearance = math.inf
-        for alpha in np.linspace(0.0, 1.0, steps + 1):
-            xyz = tuple(float((1.0 - alpha) * approach[i] + alpha * grasp[i]) for i in range(3))
-            try:
-                meshes = self._so101_gripper_meshes(xyz, quat_xyzw, width_m)
-            except Exception as exc:
-                print(f"SO101_TABLETOP_FILTER skipped=True reason=mesh_failed error={exc}", flush=True)
-                return None
-            for _, vertices, _ in meshes:
-                if len(vertices):
-                    signed = vertices @ normal + d
-                    min_clearance = min(min_clearance, float(np.min(signed)))
-        return min_clearance if math.isfinite(min_clearance) else None
+        try:
+            meshes = self._so101_gripper_meshes(grasp, quat_xyzw, width_m)
+        except Exception as exc:
+            print(f"SO101_TABLETOP_FILTER skipped=True reason=mesh_failed error={exc}", flush=True)
+            return None
+        clearance = self._so101_tabletop_clearance_from_grasp_meshes(approach, grasp, meshes, normal, d)
+        record_shadow = getattr(self, "_record_so101_table_plane_shadow", None)
+        if callable(record_shadow):
+            record_shadow(approach, grasp, meshes, clearance)
+        return clearance
 
     @classmethod
     def _so101_gripper_wireframe_lines(
@@ -3179,8 +4124,13 @@ class BananaHandeyePickClient(Node):
 
     def _render_execution_debug_preview(self, path: Path) -> None:
         import matplotlib
+        import mpl_toolkits
 
         matplotlib.use("Agg")
+        local_toolkits = Path(matplotlib.__file__).resolve().parent.parent / "mpl_toolkits"
+        if local_toolkits.is_dir() and str(local_toolkits) not in mpl_toolkits.__path__:
+            # Ubuntu's system mpl_toolkits can shadow the venv copy and break mplot3d.
+            mpl_toolkits.__path__.insert(0, str(local_toolkits))
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
@@ -3216,8 +4166,9 @@ class BananaHandeyePickClient(Node):
                     path_points.append(pt)
                     points.append(pt)
             if len(path_points) >= 2:
-                line_segments.append(path_points)
-                line_colors.append(color)
+                for start_point, end_point in zip(path_points, path_points[1:], strict=False):
+                    line_segments.append([start_point, end_point])
+                    line_colors.append(color)
             grasp = record.get("grasp")
             if isinstance(grasp, list) and len(grasp) == 3:
                 points.append([float(v) for v in grasp])
@@ -3282,8 +4233,118 @@ class BananaHandeyePickClient(Node):
         )
         return (float(contact[0]), float(contact[1]), float(contact[2]))
 
-    def rank_graspgen_candidates(self, candidates, base_to_gripper_tf) -> list[tuple[int, object, float | None, float]]:
-        indexed = [(index, candidate, None, 0.0) for index, candidate in enumerate(candidates)]
+    def target_width_extent_for_candidate(self, candidate):
+        if self.last_t_base_camera is None:
+            return None
+        return target_width_extent_points(
+            candidate.pose_matrix,
+            self.last_t_base_camera,
+            getattr(candidate, "width_axis_camera", (0.0, 0.0, 0.0)),
+            float(getattr(candidate, "target_width_min_offset_m", 0.0)),
+            float(getattr(candidate, "target_width_max_offset_m", 0.0)),
+            float(candidate.target_width_quality),
+            float(self.args.target_width_quality_min),
+        )
+
+    def fixed_finger_envelope_for_candidate(
+        self,
+        grasp: tuple[float, float, float],
+        quat: tuple[float, float, float, float],
+        target_gap_m: float | None,
+        extent_points,
+    ):
+        config = self.args.prepared_candidate_scoring_config
+        if (
+            not bool(config.get("enabled", False))
+            or self.args.target_gripper_type != "asymmetric_single_moving_jaw"
+            or self.args.target_fixed_finger_contact_ee is None
+            or self.args.target_closing_axis_ee is None
+            or target_gap_m is None
+            or extent_points is None
+        ):
+            return None
+        return fixed_finger_envelope_score(
+            grasp,
+            quat,
+            self.args.target_fixed_finger_contact_ee,
+            self.args.target_closing_axis_ee,
+            extent_points[0],
+            extent_points[1],
+            target_gap_m,
+            gap_sigma_m=float(config.get("fixed_finger_gap_sigma_m", 0.006)),
+            reliable_max_opening_m=float(config.get("reliable_max_opening_m", 0.072)),
+            moving_min_clearance_m=float(config.get("moving_finger_min_clearance_m", 0.003)),
+            fixed_score_weight=float(config.get("fixed_finger_score_weight", 0.80)),
+        )
+
+    def fixed_finger_base_side_for_candidate(
+        self,
+        grasp: tuple[float, float, float],
+        quat: tuple[float, float, float, float],
+        extent_points,
+    ):
+        config = self.args.target_fixed_finger_base_side_config
+        if (
+            not bool(config.get("enabled", False))
+            or self.args.target_gripper_type != "asymmetric_single_moving_jaw"
+            or self.args.target_fixed_finger_contact_ee is None
+            or extent_points is None
+        ):
+            return None
+        return fixed_finger_base_side_alignment(
+            grasp,
+            quat,
+            self.args.target_fixed_finger_contact_ee,
+            extent_points[0],
+            extent_points[1],
+            config.get("reference_point_base", (0.0, 0.0, 0.0)),
+        )
+
+    def validate_fk_fixed_finger_base_side(
+        self,
+        label: str,
+        ee_xyz: tuple[float, float, float],
+        ee_quat_xyzw: tuple[float, float, float, float],
+        target_width_extent,
+    ):
+        config = self.args.target_fixed_finger_base_side_config
+        if not bool(config.get("enabled", False)):
+            return None
+        if target_width_extent is None:
+            raise RuntimeError(f"{label}: target width extent is unavailable for FK fixed-finger check")
+        try:
+            base_side = self.fixed_finger_base_side_for_candidate(
+                ee_xyz,
+                ee_quat_xyzw,
+                target_width_extent,
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"{label}: FK fixed-finger check failed: {exc}") from exc
+        if base_side is None:
+            raise RuntimeError(f"{label}: FK fixed-finger check is unavailable")
+        minimum_alignment = float(config.get("min_alignment_cos", 0.0))
+        passed = base_side.alignment_cos >= minimum_alignment
+        print(
+            f"FK_FIXED_FINGER_SIDE_CHECK label={label} alignment_cos={base_side.alignment_cos:.4f} "
+            f"inward_offset_m={base_side.inward_offset_m:.4f} min_alignment_cos={minimum_alignment:.4f} "
+            f"passed={passed}",
+            flush=True,
+        )
+        if not passed:
+            raise RuntimeError(
+                f"{label}: FK fixed finger is on the outer side: alignment={base_side.alignment_cos:.4f} "
+                f"< {minimum_alignment:.4f}"
+            )
+        return base_side
+
+    def rank_graspgen_candidates(
+        self,
+        candidates,
+        base_to_gripper_tf,
+    ) -> list[tuple[int, object, float | None, float, float]]:
+        indexed = [
+            (index, candidate, None, 0.0, float(candidate.confidence)) for index, candidate in enumerate(candidates)
+        ]
         topdown_weight = max(0.0, float(self.args.execution_topdown_weight))
         contact_weight = max(0.0, float(self.args.execution_contact_distance_weight))
         confidence_weight = max(0.0, float(self.args.execution_confidence_weight))
@@ -3295,19 +4356,34 @@ class BananaHandeyePickClient(Node):
         centroid_reason = "disabled"
         try:
             if self.args.graspgen_rank_by_centroid:
-                detection = self.detect_target()
                 use_vol = self.args.centroid_source == "volume"
-                src = detection.volume_centroid_xyz if use_vol else detection.centroid_xyz
-                centroid = np.array(
-                    [src.x, src.y, src.z],
-                    dtype=np.float64,
+                primary = (
+                    self.last_graspgen_volume_centroid_camera if use_vol else self.last_graspgen_surface_centroid_camera
                 )
-                self.observed_target_base = self.detection_to_base(detection, base_to_gripper_tf)
-                # Also compute the alternative centroid in base frame for the HTML preview.
-                self.observed_target_base_alt = self.detection_to_base(
-                    detection, base_to_gripper_tf, use_volume=not use_vol
+                alternative = (
+                    self.last_graspgen_surface_centroid_camera if use_vol else self.last_graspgen_volume_centroid_camera
                 )
-                centroid_reason = f"ok({self.args.centroid_source})"
+                if primary is not None:
+                    centroid = np.asarray(primary, dtype=np.float64)
+                    self.observed_target_base = self.camera_point_to_base(primary, base_to_gripper_tf)
+                    self.observed_target_base_alt = (
+                        self.camera_point_to_base(alternative, base_to_gripper_tf) if alternative is not None else None
+                    )
+                    centroid_reason = f"plan_grasp({self.args.centroid_source})"
+                    print(
+                        f"DETECTION_REUSE source=plan_grasp centroid={fmt_xyz(primary)} "
+                        f"centroid_type={self.args.centroid_source}",
+                        flush=True,
+                    )
+                else:
+                    detection = self.detect_target()
+                    src = detection.volume_centroid_xyz if use_vol else detection.centroid_xyz
+                    centroid = np.array([src.x, src.y, src.z], dtype=np.float64)
+                    self.observed_target_base = self.detection_to_base(detection, base_to_gripper_tf)
+                    self.observed_target_base_alt = self.detection_to_base(
+                        detection, base_to_gripper_tf, use_volume=not use_vol
+                    )
+                    centroid_reason = f"fallback_detection({self.args.centroid_source})"
         except Exception as exc:
             centroid_reason = str(exc)
 
@@ -3349,25 +4425,38 @@ class BananaHandeyePickClient(Node):
             f"topdown_min_z={min_topdown_z:.3f} order={summary}",
             flush=True,
         )
-        return [(index, candidate, distance, topdown) for index, candidate, _, distance, topdown, _ in scored]
+        return [
+            (index, candidate, distance, topdown, combined)
+            for index, candidate, _, distance, topdown, combined in scored
+        ]
 
     def select_graspgen_candidates(
         self,
         base_to_gripper_tf,
     ) -> list[dict[str, object]]:
+        selection_started = time.monotonic()
         self.wait_ik_ready()
         t_base_gripper_start = transform_to_matrix(base_to_gripper_tf)
         start, start_quat = pose_from_matrix(t_base_gripper_start)
         self.last_t_base_camera = t_base_gripper_start @ np.array(self.handeye_matrix, dtype=np.float64)
+        stage_started = time.monotonic()
         candidates = self.request_graspgen_candidates(base_to_gripper_tf)
-        self.execution_debug_records = []
-        ranked_candidates = self.rank_graspgen_candidates(candidates, base_to_gripper_tf)
-        max_candidates = int(self.args.max_candidates)
-        if max_candidates > 0:
-            ranked_candidates = ranked_candidates[:max_candidates]
-        max_count = len(ranked_candidates)
         print(
-            f"GRASPGEN_CANDIDATE_TOTAL n={len(candidates)} tested={max_count} ik_filter={self.args.ik_filter} "
+            f"PIPELINE_TIMING stage=graspgen_request duration_s={time.monotonic() - stage_started:.3f}",
+            flush=True,
+        )
+        self.execution_debug_records = []
+        self.prepared_candidate_ranking_records = []
+        stage_started = time.monotonic()
+        ranked_candidates = self.rank_graspgen_candidates(candidates, base_to_gripper_tf)
+        print(
+            f"PIPELINE_TIMING stage=candidate_ranking duration_s={time.monotonic() - stage_started:.3f}",
+            flush=True,
+        )
+        max_ik_candidates = int(self.args.max_candidates)
+        print(
+            f"GRASPGEN_CANDIDATE_TOTAL n={len(candidates)} tested={len(ranked_candidates)} "
+            f"max_ik_candidates={max_ik_candidates} ik_filter={self.args.ik_filter} "
             f"ik_check_orientation={self.args.ik_check_orientation} "
             f"ik_fk_contact_compensation={self.use_ik_fk_contact_compensation} "
             f"ik_fk_xy_tolerance={self.args.ik_fk_contact_tolerance:.4f} "
@@ -3403,9 +4492,49 @@ class BananaHandeyePickClient(Node):
                 "hint=pass --robot-config with grasp_execution.target_gripper",
                 flush=True,
             )
+        prepared_scoring = self.args.prepared_candidate_scoring_config
+        base_side_config = self.args.target_fixed_finger_base_side_config
+        base_side_enabled = bool(base_side_config.get("enabled", False))
+        print(
+            f"FIXED_FINGER_SOFT_RANK enabled={bool(prepared_scoring.get('enabled', False))} "
+            f"envelope_weight={float(prepared_scoring.get('fixed_finger_envelope_weight', 0.55)):.3f} "
+            f"gap_sigma={float(prepared_scoring.get('fixed_finger_gap_sigma_m', 0.006)):.4f} "
+            f"reliable_max_opening={float(prepared_scoring.get('reliable_max_opening_m', 0.072)):.4f}",
+            flush=True,
+        )
+        print(
+            f"FIXED_FINGER_BASE_SIDE enabled={base_side_enabled} "
+            f"reference={fmt_xyz(base_side_config.get('reference_point_base', (0.0, 0.0, 0.0)))} "
+            f"min_alignment_cos={float(base_side_config.get('min_alignment_cos', 0.0)):.3f}",
+            flush=True,
+        )
+        robust_gap_config = self.args.target_fixed_finger_robust_gap_config
+        print(
+            f"FIXED_FINGER_ROBUST_GAP enabled={bool(robust_gap_config.get('enabled', False))} "
+            f"max_target_gap_deficit="
+            f"{float(robust_gap_config.get('max_target_gap_deficit_m', 0.003)):.4f}",
+            flush=True,
+        )
+        orientation_guard = self.args.target_ik_orientation_guard_config
+        configured_max_closing = float(
+            orientation_guard.get("max_closing_error_deg", JOINT5_ORIENTATION_MAX_CLOSING_ERROR_DEG)
+        )
+        effective_max_closing = min(configured_max_closing, JOINT5_ORIENTATION_MAX_CLOSING_ERROR_DEG)
+        print(
+            f"IK_ORIENTATION_GUARD enabled={bool(orientation_guard.get('enabled', False))} "
+            f"approach_axis={fmt_xyz(orientation_guard.get('approach_axis_ee', (0.0, 0.0, 1.0)))} "
+            f"closing_axis_180_symmetric={bool(orientation_guard.get('closing_axis_180_symmetric', False))} "
+            f"max_approach_deg={float(orientation_guard.get('max_approach_error_deg', 25.0)):.1f} "
+            f"max_closing_deg={effective_max_closing:.1f} "
+            f"configured_max_closing_deg={configured_max_closing:.1f}",
+            flush=True,
+        )
 
         accepted: list[dict[str, object]] = []
-        for index, candidate, centroid_dist_camera, topdown_score in ranked_candidates:
+        candidate_geometry_contexts: list[dict[str, object]] = []
+        candidate_ik_contexts: list[dict[str, object]] = []
+        stage_started = time.monotonic()
+        for index, candidate, centroid_dist_camera, topdown_score, source_rank_score in ranked_candidates:
             confidence = float(candidate.confidence)
             if confidence < self.args.min_grasp_confidence:
                 self._record_execution_candidate(
@@ -3447,6 +4576,7 @@ class BananaHandeyePickClient(Node):
                     target_contact,
                     adapter_xyz,
                     width_reason,
+                    fixed_finger_target_gap,
                 ) = self.graspgen_to_base_pose(candidate, base_to_gripper_tf)
             except ValueError as exc:
                 self._record_execution_candidate(
@@ -3467,8 +4597,126 @@ class BananaHandeyePickClient(Node):
             contact = self.graspgen_contact_point_base(t_base_graspgen)
             execution_contact = self._contact_for_pose(grasp, quat, target_contact)
             width, width_quality = candidate_target_width(candidate)
-            grasp_mesh_min_z = self._so101_gripper_mesh_min_z(grasp, quat, width)
-            so101_tabletop_clearance = self._so101_tabletop_clearance(approach, grasp, quat, width)
+            target_width_extent = self.target_width_extent_for_candidate(candidate)
+            fixed_finger_envelope = self.fixed_finger_envelope_for_candidate(
+                grasp,
+                quat,
+                fixed_finger_target_gap,
+                target_width_extent,
+            )
+            try:
+                fixed_finger_base_side = self.fixed_finger_base_side_for_candidate(
+                    grasp,
+                    quat,
+                    target_width_extent,
+                )
+            except ValueError:
+                fixed_finger_base_side = None
+            minimum_base_side_alignment = float(base_side_config.get("min_alignment_cos", 0.0))
+            if base_side_enabled and (
+                fixed_finger_base_side is None or fixed_finger_base_side.alignment_cos < minimum_base_side_alignment
+            ):
+                alignment_text = (
+                    "unavailable" if fixed_finger_base_side is None else f"{fixed_finger_base_side.alignment_cos:.3f}"
+                )
+                reason = f"fixed_finger_base_side alignment={alignment_text} min={minimum_base_side_alignment:.3f}"
+                self._record_execution_candidate(
+                    index=index,
+                    confidence=confidence,
+                    stage="geometry_rejected",
+                    reason=reason,
+                    collision_free=bool(candidate.collision_free),
+                    topdown_score=topdown_score,
+                    centroid_dist_camera=centroid_dist_camera,
+                    approach=approach,
+                    grasp=grasp,
+                    lift=lift,
+                    quat=quat,
+                    target_contact=target_contact,
+                    target_width_m=width,
+                    target_width_quality=width_quality,
+                    source_rank_score=source_rank_score,
+                    fixed_finger_base_side_alignment_cos=(
+                        None if fixed_finger_base_side is None else fixed_finger_base_side.alignment_cos
+                    ),
+                    fixed_finger_inward_offset_m=(
+                        None if fixed_finger_base_side is None else fixed_finger_base_side.inward_offset_m
+                    ),
+                    adapter_xyz=adapter_xyz,
+                    width_reason=width_reason,
+                )
+                print(
+                    f"GRASPGEN_CANDIDATE_REJECT idx={index} grasp={fmt_xyz(grasp)} reason={reason}",
+                    flush=True,
+                )
+                continue
+            candidate_geometry_contexts.append(
+                {
+                    "index": index,
+                    "candidate": candidate,
+                    "confidence": confidence,
+                    "topdown_score": topdown_score,
+                    "centroid_dist_camera": centroid_dist_camera,
+                    "source_rank_score": source_rank_score,
+                    "approach": approach,
+                    "grasp": grasp,
+                    "lift": lift,
+                    "quat": quat,
+                    "radius": radius,
+                    "contact": contact,
+                    "target_contact": target_contact,
+                    "execution_contact": execution_contact,
+                    "width": width,
+                    "width_quality": width_quality,
+                    "fixed_finger_envelope": fixed_finger_envelope,
+                    "fixed_finger_base_side": fixed_finger_base_side,
+                    "target_width_extent": target_width_extent,
+                    "adapter_xyz": adapter_xyz,
+                    "width_reason": width_reason,
+                    "t_base_graspgen": t_base_graspgen,
+                    "t_camera_graspgen": t_camera_graspgen,
+                }
+            )
+
+        geometry_metrics = self._so101_gripper_geometry_metrics_batch(
+            [
+                (
+                    context["approach"],
+                    context["grasp"],
+                    context["quat"],
+                    context["width"],
+                )
+                for context in candidate_geometry_contexts
+            ]
+        )
+        for context, geometry_metric in zip(candidate_geometry_contexts, geometry_metrics, strict=True):
+            index = int(context["index"])
+            candidate = context["candidate"]
+            confidence = float(context["confidence"])
+            topdown_score = float(context["topdown_score"])
+            centroid_dist_camera = context["centroid_dist_camera"]
+            source_rank_score = float(context["source_rank_score"])
+            approach = context["approach"]
+            grasp = context["grasp"]
+            lift = context["lift"]
+            quat = context["quat"]
+            radius = float(context["radius"])
+            contact = context["contact"]
+            target_contact = context["target_contact"]
+            execution_contact = context["execution_contact"]
+            width = float(context["width"])
+            width_quality = float(context["width_quality"])
+            fixed_finger_envelope = context["fixed_finger_envelope"]
+            fixed_finger_base_side = context["fixed_finger_base_side"]
+            target_width_extent = context["target_width_extent"]
+            adapter_xyz = context["adapter_xyz"]
+            width_reason = str(context["width_reason"])
+            t_base_graspgen = context["t_base_graspgen"]
+            t_camera_graspgen = context["t_camera_graspgen"]
+            grasp_mesh_min_z, so101_tabletop_clearance, planning_tabletop_clearance = geometry_metric
+            record_shadow = getattr(self, "_record_so101_table_plane_shadow_clearances", None)
+            if callable(record_shadow):
+                record_shadow(so101_tabletop_clearance, planning_tabletop_clearance)
             workspace_ok, workspace_reason = self._is_within_workspace(grasp, radius)
             height_ok, height_reason = self._graspgen_height_guard(
                 approach,
@@ -3615,87 +4863,97 @@ class BananaHandeyePickClient(Node):
                 )
                 continue
 
-            checks = [("approach", approach)]
-            if self.args.require_grasp_ik or self.use_ik_fk_contact_compensation:
-                checks.append(("grasp", grasp))
-            if self.args.require_lift_ik:
-                checks.append(("lift", lift))
+            context["ik_seed"] = self._parallel_ik_seed if self.ik_worker_clients else None
+            context["grasp_mesh_min_z"] = grasp_mesh_min_z
+            context["so101_tabletop_clearance"] = so101_tabletop_clearance
+            candidate_ik_contexts.append(context)
 
-            failed = False
-            failed_reason = ""
-            ik_fk_predicted_contact = None
-            ik_fk_contact_error = None
-            ik_fk_contact_residual_x = None
-            ik_fk_contact_residual_y = None
-            ik_fk_contact_z_error = None
-            ik_fk_predicted_grasp_mesh_min_z = None
-            ik_fk_predicted_tabletop_clearance = None
-            for label, xyz in checks:
-                needs_solution = self.args.ik_filter or (self.use_ik_fk_contact_compensation and label == "grasp")
-                if not needs_solution:
-                    continue
-                ik_quat = quat if self.args.ik_check_orientation or label == "grasp" else None
-                solution, code = self.solve_ik(f"graspgen_{index}_{label}", xyz, ik_quat)
-                if solution is None:
-                    failed_reason = f"ik_failed_{label} code={code}"
-                    print(
-                        f"GRASPGEN_CANDIDATE_REJECT idx={index} grasp={fmt_xyz(grasp)} "
-                        f"reason=ik_failed_{label} code={code}",
-                        flush=True,
-                    )
-                    failed = True
-                    break
-                if self.use_ik_fk_contact_compensation and label == "grasp":
-                    try:
-                        ee_xyz, ee_quat = self.compute_fk(f"graspgen_{index}_{label}", solution)
-                    except RuntimeError as exc:
-                        failed_reason = f"ik_fk_failed_{label} {exc}"
-                        failed = True
-                        break
-                    ik_fk_predicted_contact = self._contact_for_pose(ee_xyz, ee_quat, target_contact)
-                    ik_fk_contact_error, ik_fk_contact_z_error, failed_reason = self.ik_fk_contact_guard(
-                        execution_contact,
-                        ik_fk_predicted_contact,
-                    )
-                    ik_fk_contact_residual_x = ik_fk_contact_error[0]
-                    ik_fk_contact_residual_y = ik_fk_contact_error[1]
-                    payload = IKFKContactPayload(
-                        joint_state=solution,
-                        ee_xyz=ee_xyz,
-                        ee_quat_xyzw=ee_quat,
-                    )
-                    if not failed_reason:
-                        try:
-                            (
-                                ik_fk_predicted_grasp_mesh_min_z,
-                                ik_fk_predicted_tabletop_clearance,
-                            ) = self.validate_ik_fk_grasp_geometry(
-                                payload,
-                                width=width,
-                                label=f"candidate_{index}",
-                            )
-                        except RuntimeError as exc:
-                            failed_reason = f"ik_fk_geometry_failed_{label} {exc}"
-                    clearance_text = (
-                        "n/a"
-                        if ik_fk_predicted_tabletop_clearance is None
-                        else f"{ik_fk_predicted_tabletop_clearance:.4f}"
-                    )
-                    print(
-                        f"IK_FK_CANDIDATE idx={index} target={fmt_xyz(execution_contact)} "
-                        f"predicted={fmt_xyz(ik_fk_predicted_contact)} "
-                        f"error={fmt_xyz(ik_fk_contact_error)} z_error={ik_fk_contact_z_error:.4f} "
-                        f"predicted_tabletop_clearance={clearance_text}",
-                        flush=True,
-                    )
-                    if failed_reason:
-                        print(
-                            f"GRASPGEN_CANDIDATE_REJECT idx={index} grasp={fmt_xyz(grasp)} reason={failed_reason}",
-                            flush=True,
-                        )
-                        failed = True
-                        break
-            if failed:
+        ik_eligible_count = len(candidate_ik_contexts)
+        deferred_ik_contexts: list[dict[str, object]] = []
+        if max_ik_candidates > 0 and ik_eligible_count > max_ik_candidates:
+            deferred_ik_contexts = candidate_ik_contexts[max_ik_candidates:]
+            candidate_ik_contexts = candidate_ik_contexts[:max_ik_candidates]
+        for context in deferred_ik_contexts:
+            index = int(context["index"])
+            candidate = context["candidate"]
+            reason = f"max_ik_candidates_{max_ik_candidates}_reached_after_geometry"
+            self._record_execution_candidate(
+                index=index,
+                confidence=float(context["confidence"]),
+                stage="ik_deferred",
+                reason=reason,
+                collision_free=bool(candidate.collision_free),
+                topdown_score=float(context["topdown_score"]),
+                centroid_dist_camera=context["centroid_dist_camera"],
+                approach=context["approach"],
+                grasp=context["grasp"],
+                lift=context["lift"],
+                quat=context["quat"],
+                target_contact=context["target_contact"],
+                target_width_m=float(context["width"]),
+                target_width_quality=float(context["width_quality"]),
+                grasp_mesh_min_z=context["grasp_mesh_min_z"],
+                so101_tabletop_clearance_m=context["so101_tabletop_clearance"],
+                adapter_xyz=context["adapter_xyz"],
+                width_reason=str(context["width_reason"]),
+            )
+            print(
+                f"GRASPGEN_CANDIDATE_DEFER idx={index} reason={reason}",
+                flush=True,
+            )
+
+        print(
+            f"PIPELINE_TIMING stage=candidate_geometry duration_s={time.monotonic() - stage_started:.3f} "
+            f"candidates={len(candidate_ik_contexts)} eligible={ik_eligible_count} "
+            f"deferred={len(deferred_ik_contexts)}",
+            flush=True,
+        )
+        stage_started = time.monotonic()
+        ik_results = self._evaluate_candidate_ik_contexts(candidate_ik_contexts)
+        print(
+            f"PIPELINE_TIMING stage=candidate_ik_fk duration_s={time.monotonic() - stage_started:.3f} "
+            f"workers={len(self.ik_worker_clients)} candidates={len(candidate_ik_contexts)}",
+            flush=True,
+        )
+        stage_started = time.monotonic()
+        for context, ik_result in zip(candidate_ik_contexts, ik_results, strict=True):
+            index = int(context["index"])
+            candidate = context["candidate"]
+            confidence = float(context["confidence"])
+            topdown_score = float(context["topdown_score"])
+            centroid_dist_camera = context["centroid_dist_camera"]
+            source_rank_score = float(context["source_rank_score"])
+            approach = context["approach"]
+            grasp = context["grasp"]
+            lift = context["lift"]
+            quat = context["quat"]
+            radius = float(context["radius"])
+            target_contact = context["target_contact"]
+            execution_contact = context["execution_contact"]
+            width = float(context["width"])
+            width_quality = float(context["width_quality"])
+            fixed_finger_envelope = context["fixed_finger_envelope"]
+            fixed_finger_base_side = ik_result["ik_fk_fixed_finger_base_side"] or context["fixed_finger_base_side"]
+            grasp_mesh_min_z = context["grasp_mesh_min_z"]
+            so101_tabletop_clearance = context["so101_tabletop_clearance"]
+            adapter_xyz = context["adapter_xyz"]
+            width_reason = str(context["width_reason"])
+            failed_reason = str(ik_result["failed_reason"])
+            ik_fk_predicted_contact = ik_result["ik_fk_predicted_contact"]
+            ik_fk_contact_error = ik_result["ik_fk_contact_error"]
+            ik_fk_contact_residual_x = ik_result["ik_fk_contact_residual_x"]
+            ik_fk_contact_residual_y = ik_result["ik_fk_contact_residual_y"]
+            ik_fk_contact_z_error = ik_result["ik_fk_contact_z_error"]
+            ik_fk_predicted_grasp_mesh_min_z = ik_result["ik_fk_predicted_grasp_mesh_min_z"]
+            ik_fk_predicted_tabletop_clearance = ik_result["ik_fk_predicted_tabletop_clearance"]
+            ik_grasp_joint5 = ik_result["ik_grasp_joint5"]
+            ik_joint5_retry_applied = bool(ik_result["ik_joint5_retry_applied"])
+            ik_original_joint5 = ik_result["ik_original_joint5"]
+            ik_fk_approach_axis_error_deg = ik_result["ik_fk_approach_axis_error_deg"]
+            ik_fk_closing_axis_error_deg = ik_result["ik_fk_closing_axis_error_deg"]
+            ik_grasp_joint_state = ik_result["ik_grasp_joint_state"]
+
+            if failed_reason:
                 self._record_execution_candidate(
                     index=index,
                     confidence=confidence,
@@ -3722,13 +4980,51 @@ class BananaHandeyePickClient(Node):
                     ik_fk_contact_z_error=ik_fk_contact_z_error,
                     ik_fk_predicted_grasp_mesh_min_z=ik_fk_predicted_grasp_mesh_min_z,
                     ik_fk_predicted_tabletop_clearance_m=ik_fk_predicted_tabletop_clearance,
+                    ik_grasp_joint5=ik_grasp_joint5,
+                    ik_joint5_retry_applied=ik_joint5_retry_applied,
+                    ik_original_joint5=ik_original_joint5,
+                    ik_fk_approach_axis_error_deg=ik_fk_approach_axis_error_deg,
+                    ik_fk_closing_axis_error_deg=ik_fk_closing_axis_error_deg,
+                    fixed_finger_base_side_alignment_cos=(
+                        None if fixed_finger_base_side is None else fixed_finger_base_side.alignment_cos
+                    ),
+                    fixed_finger_inward_offset_m=(
+                        None if fixed_finger_base_side is None else fixed_finger_base_side.inward_offset_m
+                    ),
                 )
                 continue
 
+            contact_residual_xy_m = (
+                math.hypot(ik_fk_contact_residual_x, ik_fk_contact_residual_y)
+                if ik_fk_contact_residual_x is not None and ik_fk_contact_residual_y is not None
+                else float(prepared_scoring.get("contact_xy_scale_m", 0.030))
+            )
+            contact_z_error_m = (
+                float(ik_fk_contact_z_error)
+                if ik_fk_contact_z_error is not None
+                else float(prepared_scoring.get("contact_z_scale_m", 0.020))
+            )
+            envelope_score = None if fixed_finger_envelope is None else fixed_finger_envelope.score
+            selection_score = prepared_candidate_soft_score(
+                prepared_scoring,
+                fixed_finger_envelope=envelope_score,
+                contact_residual_xy_m=contact_residual_xy_m,
+                contact_z_error_m=contact_z_error_m,
+                confidence=confidence,
+                centroid_distance_m=centroid_dist_camera,
+            )
+            target_width_min_offset_m = float(getattr(candidate, "target_width_min_offset_m", 0.0))
+            target_width_max_offset_m = float(getattr(candidate, "target_width_max_offset_m", 0.0))
+            envelope_text = "n/a" if envelope_score is None else f"{envelope_score:.3f}"
+            base_side_text = "n/a" if fixed_finger_base_side is None else f"{fixed_finger_base_side.alignment_cos:.3f}"
             print(
                 f"GRASPGEN_CANDIDATE_ACCEPT idx={index} conf={confidence:.3f} "
                 f"approach={fmt_xyz(approach)} grasp={fmt_xyz(grasp)} lift={fmt_xyz(lift)} "
-                f"quat={fmt_quat(quat)}",
+                f"quat={fmt_quat(quat)} selection_score={selection_score:.3f} "
+                f"fixed_finger_envelope={envelope_text} fixed_finger_base_side={base_side_text} "
+                f"joint5_retry={ik_joint5_retry_applied} "
+                f"approach_error_deg={ik_fk_approach_axis_error_deg} "
+                f"closing_error_deg={ik_fk_closing_axis_error_deg}",
                 flush=True,
             )
             self._record_execution_candidate(
@@ -3748,6 +5044,26 @@ class BananaHandeyePickClient(Node):
                 target_contact=target_contact,
                 target_width_m=width,
                 target_width_quality=width_quality,
+                target_width_min_offset_m=target_width_min_offset_m,
+                target_width_max_offset_m=target_width_max_offset_m,
+                source_rank_score=source_rank_score,
+                selection_score=selection_score,
+                fixed_finger_envelope_score_value=envelope_score,
+                fixed_finger_gap_score=None if fixed_finger_envelope is None else fixed_finger_envelope.fixed_score,
+                fixed_finger_gap_m=None if fixed_finger_envelope is None else fixed_finger_envelope.fixed_gap_m,
+                fixed_finger_target_gap_m=(
+                    None if fixed_finger_envelope is None else fixed_finger_envelope.target_gap_m
+                ),
+                moving_finger_gap_m=None if fixed_finger_envelope is None else fixed_finger_envelope.moving_gap_m,
+                moving_finger_gap_score=(None if fixed_finger_envelope is None else fixed_finger_envelope.moving_score),
+                fixed_finger_base_side_alignment_cos=(
+                    None if fixed_finger_base_side is None else fixed_finger_base_side.alignment_cos
+                ),
+                fixed_finger_inward_offset_m=(
+                    None if fixed_finger_base_side is None else fixed_finger_base_side.inward_offset_m
+                ),
+                contact_residual_xy_m=contact_residual_xy_m,
+                contact_z_error_m=contact_z_error_m,
                 grasp_mesh_min_z=grasp_mesh_min_z,
                 so101_tabletop_clearance_m=so101_tabletop_clearance,
                 adapter_xyz=adapter_xyz,
@@ -3759,6 +5075,11 @@ class BananaHandeyePickClient(Node):
                 ik_fk_contact_z_error=ik_fk_contact_z_error,
                 ik_fk_predicted_grasp_mesh_min_z=ik_fk_predicted_grasp_mesh_min_z,
                 ik_fk_predicted_tabletop_clearance_m=ik_fk_predicted_tabletop_clearance,
+                ik_grasp_joint5=ik_grasp_joint5,
+                ik_joint5_retry_applied=ik_joint5_retry_applied,
+                ik_original_joint5=ik_original_joint5,
+                ik_fk_approach_axis_error_deg=ik_fk_approach_axis_error_deg,
+                ik_fk_closing_axis_error_deg=ik_fk_closing_axis_error_deg,
                 selected=False,
             )
             accepted.append(
@@ -3771,16 +5092,60 @@ class BananaHandeyePickClient(Node):
                     "radius": radius,
                     "target_contact": tuple(float(v) for v in target_contact),
                     "target_width_m": width,
+                    "target_width_quality": width_quality,
+                    "target_width_min_offset_m": target_width_min_offset_m,
+                    "target_width_max_offset_m": target_width_max_offset_m,
                     "plan_contact": execution_contact,
                     "ik_fk_predicted_contact": ik_fk_predicted_contact,
                     "ik_fk_contact_error": ik_fk_contact_error,
                     "ik_fk_contact_residual_x": ik_fk_contact_residual_x,
                     "ik_fk_contact_residual_y": ik_fk_contact_residual_y,
                     "ik_fk_contact_z_error": ik_fk_contact_z_error,
+                    "contact_residual_xy_m": contact_residual_xy_m,
+                    "contact_z_error_m": contact_z_error_m,
+                    "centroid_distance_m": centroid_dist_camera,
+                    "fixed_finger_envelope": fixed_finger_envelope,
+                    "fixed_finger_base_side": fixed_finger_base_side,
+                    "target_width_extent": context["target_width_extent"],
+                    "selection_score": selection_score,
+                    "source_rank_score": source_rank_score,
+                    "grasp_joint_seed": ik_grasp_joint_state,
                 }
             )
 
-        if self.use_ik_fk_contact_compensation and accepted:
+        execution_order = {int(index): position for position, (index, *_rest) in enumerate(ranked_candidates)}
+        self.execution_debug_records.sort(
+            key=lambda record: execution_order.get(int(record.get("index", -1)), len(execution_order))
+        )
+
+        if bool(prepared_scoring.get("enabled", False)) and accepted:
+            accepted.sort(
+                key=lambda item: (
+                    -float(item["selection_score"]),
+                    float(item["contact_z_error_m"]),
+                    float(item["contact_residual_xy_m"]),
+                    -float(item["source_rank_score"]),
+                    int(item["index"]),
+                )
+            )
+            order_parts = []
+            for item in accepted:
+                envelope = item["fixed_finger_envelope"]
+                fixed_text = "n/a" if envelope is None else f"{envelope.score:.3f}"
+                base_side = item["fixed_finger_base_side"]
+                base_side_text = "n/a" if base_side is None else f"{base_side.alignment_cos:.3f}"
+                centroid_distance = item["centroid_distance_m"]
+                centroid_text = "n/a" if centroid_distance is None else f"{float(centroid_distance):.4f}"
+                order_parts.append(
+                    f"{int(item['index'])}:score={float(item['selection_score']):.3f}"
+                    f"/fixed={fixed_text}/z={float(item['contact_z_error_m']):.4f}"
+                    f"/base_side={base_side_text}"
+                    f"/dxy={float(item['contact_residual_xy_m']):.4f}"
+                    f"/centroid={centroid_text}"
+                )
+            order = ",".join(order_parts)
+            print(f"PREPARED_CANDIDATE_RANK order={order}", flush=True)
+        elif self.use_ik_fk_contact_compensation and accepted:
             accepted.sort(
                 key=lambda item: (
                     float(item["ik_fk_contact_z_error"]),
@@ -3797,7 +5162,44 @@ class BananaHandeyePickClient(Node):
             )
             print(f"IK_FK_CANDIDATE_RANK order={order}", flush=True)
 
+        self.prepared_candidate_ranking_records = []
+        for rank, item in enumerate(accepted, start=1):
+            envelope = item["fixed_finger_envelope"]
+            base_side = item["fixed_finger_base_side"]
+            self.prepared_candidate_ranking_records.append(
+                {
+                    "rank": rank,
+                    "candidate_index": int(item["index"]),
+                    "selection_score": float(item["selection_score"]),
+                    "fixed_finger_envelope_score": None if envelope is None else envelope.score,
+                    "fixed_finger_gap_score": None if envelope is None else envelope.fixed_score,
+                    "fixed_finger_gap_m": None if envelope is None else envelope.fixed_gap_m,
+                    "fixed_finger_target_gap_m": None if envelope is None else envelope.target_gap_m,
+                    "moving_finger_gap_m": None if envelope is None else envelope.moving_gap_m,
+                    "moving_finger_gap_score": None if envelope is None else envelope.moving_score,
+                    "fixed_finger_base_side_alignment_cos": (None if base_side is None else base_side.alignment_cos),
+                    "fixed_finger_inward_offset_m": None if base_side is None else base_side.inward_offset_m,
+                    "contact_residual_xy_m": float(item["contact_residual_xy_m"]),
+                    "contact_z_error_m": float(item["contact_z_error_m"]),
+                    "centroid_distance_m": item["centroid_distance_m"],
+                    "confidence": float(candidates[int(item["index"])].confidence),
+                    "source_rank_score": float(item["source_rank_score"]),
+                    "target_width_m": float(item["target_width_m"]),
+                    "target_width_quality": float(item["target_width_quality"]),
+                    "target_width_min_offset_m": float(item["target_width_min_offset_m"]),
+                    "target_width_max_offset_m": float(item["target_width_max_offset_m"]),
+                }
+            )
+
         self._write_execution_debug_outputs(render_previews=False)
+        print(
+            f"PIPELINE_TIMING stage=candidate_finalize duration_s={time.monotonic() - stage_started:.3f}",
+            flush=True,
+        )
+        print(
+            f"PIPELINE_TIMING stage=candidate_selection_total duration_s={time.monotonic() - selection_started:.3f}",
+            flush=True,
+        )
         if accepted:
             return accepted
         raise RuntimeError("No GraspGen candidate passed workspace, height, and IK filters")
@@ -3823,6 +5225,10 @@ class BananaHandeyePickClient(Node):
         self.selected_target_contact_ee = tuple(float(v) for v in candidate["target_contact"])
         self.selected_plan_contact_base = tuple(float(v) for v in candidate["plan_contact"])
         self.selected_target_width_m = float(candidate.get("target_width_m", 0.0))
+        self.selected_fixed_finger_envelope = candidate.get("fixed_finger_envelope")
+        self.selected_target_width_extent_base = candidate.get("target_width_extent")
+        self.selected_grasp_joint_seed = candidate.get("grasp_joint_seed")
+        self.active_grasp_joint_seed = self.selected_grasp_joint_seed
         self.current_execution_candidate_index = index
         return (
             candidate["approach"],
@@ -3832,13 +5238,8 @@ class BananaHandeyePickClient(Node):
             float(candidate["radius"]),
         )
 
-    def detection_to_base(
-        self, detection: Detection2D, base_to_gripper_tf, use_volume: bool | None = None
-    ) -> tuple[float, float, float]:
-        if use_volume is None:
-            use_volume = self.args.centroid_source == "volume"
-        src = detection.volume_centroid_xyz if use_volume else detection.centroid_xyz
-        camera_point = (src.x, src.y, src.z)
+    def camera_point_to_base(self, camera_point: Iterable[float], base_to_gripper_tf) -> tuple[float, float, float]:
+        camera_point = tuple(float(value) for value in camera_point)
         gripper_point = mat4_mul_point(self.handeye_matrix, camera_point)
 
         t = base_to_gripper_tf.transform.translation
@@ -3849,6 +5250,14 @@ class BananaHandeyePickClient(Node):
         print(f"TARGET_GRIPPER x={gripper_point[0]:.4f} y={gripper_point[1]:.4f} z={gripper_point[2]:.4f}", flush=True)
         print(f"TARGET_BASE x={base_point[0]:.4f} y={base_point[1]:.4f} z={base_point[2]:.4f}", flush=True)
         return base_point
+
+    def detection_to_base(
+        self, detection: Detection2D, base_to_gripper_tf, use_volume: bool | None = None
+    ) -> tuple[float, float, float]:
+        if use_volume is None:
+            use_volume = self.args.centroid_source == "volume"
+        src = detection.volume_centroid_xyz if use_volume else detection.centroid_xyz
+        return self.camera_point_to_base((src.x, src.y, src.z), base_to_gripper_tf)
 
     def apply_target_offset(self, target_base: tuple[float, float, float]) -> tuple[float, float, float]:
         offset = (self.args.target_offset_x, self.args.target_offset_y, self.args.target_offset_z)
@@ -3937,14 +5346,30 @@ class BananaHandeyePickClient(Node):
         nanosec = int((seconds - sec) * 1_000_000_000)
         return sec, nanosec
 
+    def _wait_for_rpc_future(self, future, timeout_s: float, *, background_executor: bool) -> bool:
+        if not background_executor:
+            rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_s)
+            return future.done()
+
+        completed = threading.Event()
+        future.add_done_callback(lambda _future: completed.set())
+        if completed.wait(timeout_s):
+            return True
+        future.cancel()
+        return False
+
     def solve_ik(
         self,
         label: str,
         xyz: tuple[float, float, float],
         quat_xyzw: tuple[float, float, float, float] | None = None,
         start_joint_state: JointState | None = None,
+        *,
+        client=None,
+        background_executor: bool = False,
     ) -> tuple[JointState | None, int]:
-        if self.ik_client is None:
+        client = self.ik_client if client is None else client
+        if client is None:
             return None, -1
 
         request = GetPositionIK.Request()
@@ -3959,9 +5384,9 @@ class BananaHandeyePickClient(Node):
         request.ik_request.timeout.sec = sec
         request.ik_request.timeout.nanosec = nanosec
 
-        future = self.ik_client.call_async(request)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=max(1.0, self.args.ik_timeout_s + 1.0))
-        if not future.done():
+        future = client.call_async(request)
+        rpc_timeout = max(1.0, self.args.ik_timeout_s + 1.0)
+        if not self._wait_for_rpc_future(future, rpc_timeout, background_executor=background_executor):
             print(
                 f"IK_RESULT label={label} xyz={fmt_xyz(xyz)} quat={fmt_quat(quat_xyzw or (0.0, 0.0, 0.0, 1.0))} ok=False code=timeout",
                 flush=True,
@@ -3996,8 +5421,11 @@ class BananaHandeyePickClient(Node):
         self,
         label: str,
         joint_state: JointState,
+        *,
+        client=None,
+        background_executor: bool = False,
     ) -> tuple[tuple[float, float, float], tuple[float, float, float, float]]:
-        client = self.fk_client
+        client = self.fk_client if client is None else client
         if client is None:
             raise RuntimeError("FK client is disabled")
 
@@ -4006,8 +5434,8 @@ class BananaHandeyePickClient(Node):
         request.fk_link_names = [self.args.ee_frame]
         request.robot_state.joint_state = joint_state
         future = client.call_async(request)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=max(1.0, self.args.ik_timeout_s + 1.0))
-        if not future.done():
+        rpc_timeout = max(1.0, self.args.ik_timeout_s + 1.0)
+        if not self._wait_for_rpc_future(future, rpc_timeout, background_executor=background_executor):
             raise RuntimeError(f"FK timed out for {label}")
         response = future.result()
         if response is None:
@@ -4027,6 +5455,576 @@ class BananaHandeyePickClient(Node):
         print(f"FK_RESULT label={label} xyz={fmt_xyz(xyz)} quat={fmt_quat(quat)}", flush=True)
         return xyz, quat
 
+    def validate_grasp_orientation(
+        self,
+        label: str,
+        target_quat_xyzw: tuple[float, float, float, float],
+        actual_quat_xyzw: tuple[float, float, float, float],
+    ) -> tuple[float | None, float | None]:
+        errors = self._grasp_orientation_errors(target_quat_xyzw, actual_quat_xyzw)
+        if errors is None:
+            return None, None
+        config = getattr(self.args, "target_ik_orientation_guard_config", {})
+        max_approach = float(config.get("max_approach_error_deg", 25.0))
+        max_closing = min(
+            float(config.get("max_closing_error_deg", JOINT5_ORIENTATION_MAX_CLOSING_ERROR_DEG)),
+            JOINT5_ORIENTATION_MAX_CLOSING_ERROR_DEG,
+        )
+        passed = errors.approach_deg <= max_approach and errors.closing_deg <= max_closing
+        print(
+            f"IK_ORIENTATION_CHECK label={label} approach_error_deg={errors.approach_deg:.3f} "
+            f"closing_error_deg={errors.closing_deg:.3f} max_approach_deg={max_approach:.3f} "
+            f"max_closing_deg={max_closing:.3f} passed={passed}",
+            flush=True,
+        )
+        if not passed:
+            raise RuntimeError(
+                f"FK orientation error exceeds configured limits: approach={errors.approach_deg:.3f}/"
+                f"{max_approach:.3f} deg, closing={errors.closing_deg:.3f}/{max_closing:.3f} deg"
+            )
+        return errors.approach_deg, errors.closing_deg
+
+    def _grasp_orientation_errors(
+        self,
+        target_quat_xyzw: tuple[float, float, float, float],
+        actual_quat_xyzw: tuple[float, float, float, float],
+    ):
+        config = getattr(self.args, "target_ik_orientation_guard_config", {})
+        if not bool(config.get("enabled", False)):
+            return None
+        closing_axis = getattr(self.args, "target_closing_axis_ee", None)
+        if closing_axis is None:
+            raise RuntimeError("IK orientation guard requires target_closing_axis_ee")
+        return grasp_axis_errors(
+            target_quat_xyzw,
+            actual_quat_xyzw,
+            config.get("approach_axis_ee", (0.0, 0.0, 1.0)),
+            closing_axis,
+            closing_axis_180_symmetric=bool(config.get("closing_axis_180_symmetric", False)),
+        )
+
+    def solve_grasp_ik_fk(
+        self,
+        label: str,
+        xyz: tuple[float, float, float],
+        quat_xyzw: tuple[float, float, float, float],
+        start_joint_state: JointState | None = None,
+        *,
+        ik_client=None,
+        fk_client=None,
+        background_executor: bool = False,
+        validate_orientation: bool = True,
+    ) -> tuple[IKFKContactPayload | None, int, str]:
+        solution, code = self.solve_ik(
+            label,
+            xyz,
+            quat_xyzw,
+            start_joint_state,
+            client=ik_client,
+            background_executor=background_executor,
+        )
+        if solution is None:
+            return None, code, f"ik_failed code={code}"
+        solution, original_joint5 = self._apply_joint5_retry_if_needed(
+            label,
+            xyz,
+            quat_xyzw,
+            solution,
+            ik_client=ik_client,
+            background_executor=background_executor,
+        )
+        if solution is None:
+            return None, code, "joint5_bounded_retry_failed"
+        try:
+            self.validate_grasp_joint5(label, solution)
+            ee_xyz, ee_quat = self.compute_fk(
+                label,
+                solution,
+                client=fk_client,
+                background_executor=background_executor,
+            )
+            if validate_orientation:
+                approach_error, closing_error = self.validate_grasp_orientation(label, quat_xyzw, ee_quat)
+            else:
+                errors = self._grasp_orientation_errors(quat_xyzw, ee_quat)
+                approach_error = None if errors is None else errors.approach_deg
+                closing_error = None if errors is None else errors.closing_deg
+        except RuntimeError as exc:
+            return None, code, str(exc)
+        return (
+            IKFKContactPayload(
+                joint_state=solution,
+                ee_xyz=ee_xyz,
+                ee_quat_xyzw=ee_quat,
+                joint5_retry_applied=original_joint5 is not None,
+                original_joint5=original_joint5,
+                approach_axis_error_deg=approach_error,
+                closing_axis_error_deg=closing_error,
+            ),
+            code,
+            "",
+        )
+
+    @staticmethod
+    def _joint_position(joint_state: JointState, joint_name: str) -> float | None:
+        positions = dict(zip(joint_state.name, joint_state.position, strict=False))
+        value = positions.get(joint_name)
+        return None if value is None else float(value)
+
+    @staticmethod
+    def _joint_state_with_joint5(joint_state: JointState, joint5: float) -> JointState:
+        seed = JointState()
+        seed.name = list(joint_state.name)
+        seed.position = [
+            float(joint5) if str(name) == "5" else float(position)
+            for name, position in zip(joint_state.name, joint_state.position, strict=False)
+        ]
+        return seed
+
+    @staticmethod
+    def _canonicalize_joint5(joint5: float) -> float:
+        return canonicalize_joint5(joint5)
+
+    def _joint5_closing_axis_correction(
+        self,
+        target_quat_xyzw: tuple[float, float, float, float],
+        actual_quat_xyzw: tuple[float, float, float, float],
+    ) -> float:
+        config = self.args.target_ik_orientation_guard_config
+        closing_axis_ee = getattr(self.args, "target_closing_axis_ee", None)
+        if closing_axis_ee is None:
+            raise RuntimeError("IK orientation guard requires target_closing_axis_ee")
+        try:
+            return joint5_closing_axis_correction(
+                target_quat_xyzw,
+                actual_quat_xyzw,
+                config.get("approach_axis_ee", (0.0, 0.0, 1.0)),
+                closing_axis_ee,
+                closing_axis_180_symmetric=bool(config.get("closing_axis_180_symmetric", False)),
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    def solve_orientation_consistent_grasp_ik_fk(
+        self,
+        label: str,
+        xyz: tuple[float, float, float],
+        quat_xyzw: tuple[float, float, float, float],
+        start_joint_state: JointState | None = None,
+        *,
+        ik_client=None,
+        fk_client=None,
+        background_executor: bool = False,
+    ) -> tuple[IKFKContactPayload | None, int, str]:
+        config = self.args.target_ik_orientation_guard_config
+        if not bool(config.get("enabled", False)):
+            return self.solve_grasp_ik_fk(
+                label,
+                xyz,
+                quat_xyzw,
+                start_joint_state,
+                ik_client=ik_client,
+                fk_client=fk_client,
+                background_executor=background_executor,
+            )
+
+        max_approach = float(config.get("max_approach_error_deg", 25.0))
+        max_closing = min(
+            float(config.get("max_closing_error_deg", JOINT5_ORIENTATION_MAX_CLOSING_ERROR_DEG)),
+            JOINT5_ORIENTATION_MAX_CLOSING_ERROR_DEG,
+        )
+        seed = start_joint_state
+        last_code = -1
+        last_reason = "orientation correction was not attempted"
+        seen_joint5: set[float] = set()
+
+        for attempt in range(3):
+            payload, code, failed_reason = self.solve_grasp_ik_fk(
+                f"{label}_orientation_{attempt}",
+                xyz,
+                quat_xyzw,
+                seed,
+                ik_client=ik_client,
+                fk_client=fk_client,
+                background_executor=background_executor,
+                validate_orientation=False,
+            )
+            last_code = code
+            if payload is None:
+                last_reason = failed_reason
+                break
+
+            joint5 = self._joint_position(payload.joint_state, "5")
+            approach_error = payload.approach_axis_error_deg
+            closing_error = payload.closing_axis_error_deg
+            if joint5 is None or approach_error is None or closing_error is None:
+                last_reason = "orientation correction requires joint 5 and FK axis errors"
+                break
+            passed = approach_error <= max_approach and closing_error <= max_closing
+            print(
+                f"JOINT5_ORIENTATION_SEARCH label={label} attempt={attempt} joint5={joint5:.4f} "
+                f"approach_error_deg={approach_error:.3f} closing_error_deg={closing_error:.3f} "
+                f"max_approach_deg={max_approach:.3f} max_closing_deg={max_closing:.3f} passed={passed}",
+                flush=True,
+            )
+            if passed:
+                return payload, code, ""
+
+            last_reason = (
+                f"FK orientation error exceeds strict limits: approach={approach_error:.3f}/{max_approach:.3f} deg, "
+                f"closing={closing_error:.3f}/{max_closing:.3f} deg"
+            )
+            correction = self._joint5_closing_axis_correction(quat_xyzw, payload.ee_quat_xyzw)
+            corrected_joint5 = self._canonicalize_joint5(joint5 + correction)
+            correction_key = round(corrected_joint5, 9)
+            if correction_key in seen_joint5 or abs(corrected_joint5 - joint5) <= 1e-6:
+                break
+            seen_joint5.add(round(joint5, 9))
+            print(
+                f"JOINT5_ORIENTATION_CORRECT label={label} attempt={attempt} current={joint5:.4f} "
+                f"signed_correction={correction:.4f} corrected={corrected_joint5:.4f}",
+                flush=True,
+            )
+            seed = self._joint_state_with_joint5(payload.joint_state, corrected_joint5)
+
+        return None, last_code, f"no_orientation_consistent_joint5_branch: {last_reason}"
+
+    def _validate_joint5_branch_continuity(
+        self,
+        label: str,
+        seed: JointState | None,
+        solution: JointState,
+    ) -> None:
+        if seed is None or self.args.final_joint5_max is None:
+            return
+        seed_joint5 = self._joint_position(seed, "5")
+        solution_joint5 = self._joint_position(solution, "5")
+        if seed_joint5 is None or solution_joint5 is None:
+            return
+        delta = abs(solution_joint5 - seed_joint5)
+        if delta > math.pi / 2.0:
+            raise RuntimeError(
+                f"{label} changed joint 5 branch by {delta:.4f} rad ({seed_joint5:.4f} -> {solution_joint5:.4f})"
+            )
+
+    def prepare_execution_grasp_branch(
+        self,
+        label: str,
+        xyz: tuple[float, float, float],
+        quat_xyzw: tuple[float, float, float, float],
+        initial_seed: JointState | None,
+    ) -> IKFKContactPayload:
+        if initial_seed is None:
+            raise RuntimeError("Selected grasp candidate has no prepared joint seed")
+        initial_joint5 = self._joint_position(initial_seed, "5")
+        if initial_joint5 is None:
+            raise RuntimeError("Selected grasp candidate seed has no joint 5 position")
+        payload, code, failed_reason = self.solve_orientation_consistent_grasp_ik_fk(
+            label,
+            xyz,
+            quat_xyzw,
+            initial_seed,
+        )
+        if payload is None:
+            raise RuntimeError(f"Execution branch IK failed: code={code} reason={failed_reason}")
+        self.validate_fk_fixed_finger_base_side(
+            label,
+            payload.ee_xyz,
+            payload.ee_quat_xyzw,
+            self.selected_target_width_extent_base,
+        )
+        self.validate_ik_fk_grasp_geometry(
+            payload,
+            width=self.selected_target_width_m,
+            label=f"{label}_branch",
+        )
+        if self.selected_target_contact_ee is not None and self.selected_plan_contact_base is not None:
+            predicted_contact = self._contact_for_pose(
+                payload.ee_xyz,
+                payload.ee_quat_xyzw,
+                self.selected_target_contact_ee,
+            )
+            _, _, contact_reason = self.ik_fk_contact_guard(
+                self.selected_plan_contact_base,
+                predicted_contact,
+            )
+            if contact_reason:
+                raise RuntimeError(f"Execution branch contact rejected: {contact_reason}")
+
+        selected_joint5 = self._joint_position(payload.joint_state, "5")
+        if selected_joint5 is None:
+            raise RuntimeError("Selected execution branch has no joint 5 position")
+        self.validate_grasp_joint5(label, payload.joint_state)
+        print(
+            f"JOINT5_BRANCH_SELECT label={label} initial={initial_joint5:.4f} selected={selected_joint5:.4f} "
+            f"half_turn_applied={payload.joint5_retry_applied} "
+            f"approach_error_deg={float(payload.approach_axis_error_deg or 0.0):.3f} "
+            f"closing_error_deg={float(payload.closing_axis_error_deg or 0.0):.3f}",
+            flush=True,
+        )
+        return payload
+
+    def _evaluate_candidate_ik(
+        self,
+        context: dict[str, object],
+        *,
+        ik_client,
+        fk_client,
+        background_executor: bool,
+    ) -> dict[str, object]:
+        index = int(context["index"])
+        approach = context["approach"]
+        grasp = context["grasp"]
+        lift = context["lift"]
+        quat = context["quat"]
+        target_contact = context["target_contact"]
+        execution_contact = context["execution_contact"]
+        width = float(context["width"])
+        ik_seed = context.get("ik_seed")
+        target_width_extent = context.get("target_width_extent")
+
+        checks = [("approach", approach)]
+        if (
+            self.args.require_grasp_ik
+            or self.use_ik_fk_contact_compensation
+            or self.args.final_joint5_max is not None
+            or bool(self.args.target_ik_orientation_guard_config.get("enabled", False))
+        ):
+            checks.append(("grasp", grasp))
+        if self.args.require_lift_ik:
+            checks.append(("lift", lift))
+
+        result: dict[str, object] = {
+            "failed_reason": "",
+            "ik_fk_predicted_contact": None,
+            "ik_fk_contact_error": None,
+            "ik_fk_contact_residual_x": None,
+            "ik_fk_contact_residual_y": None,
+            "ik_fk_contact_z_error": None,
+            "ik_fk_predicted_grasp_mesh_min_z": None,
+            "ik_fk_predicted_tabletop_clearance": None,
+            "ik_grasp_joint5": None,
+            "ik_joint5_retry_applied": False,
+            "ik_original_joint5": None,
+            "ik_fk_approach_axis_error_deg": None,
+            "ik_fk_closing_axis_error_deg": None,
+            "ik_fk_fixed_finger_base_side": None,
+            "ik_grasp_joint_state": None,
+        }
+        for label, xyz in checks:
+            needs_grasp_fk = label == "grasp" and (
+                self.use_ik_fk_contact_compensation
+                or self.args.final_joint5_max is not None
+                or bool(self.args.target_ik_orientation_guard_config.get("enabled", False))
+            )
+            needs_solution = self.args.ik_filter or needs_grasp_fk
+            if not needs_solution:
+                continue
+            ik_quat = quat if self.args.ik_check_orientation or label == "grasp" else None
+            if label == "grasp" and needs_grasp_fk:
+                payload, code, failed_reason = self.solve_orientation_consistent_grasp_ik_fk(
+                    f"graspgen_{index}_{label}",
+                    xyz,
+                    ik_quat,
+                    ik_seed,
+                    ik_client=ik_client,
+                    fk_client=fk_client,
+                    background_executor=background_executor,
+                )
+                if payload is None:
+                    result["failed_reason"] = f"ik_fk_failed_{label} {failed_reason}"
+                    print(
+                        f"GRASPGEN_CANDIDATE_REJECT idx={index} grasp={fmt_xyz(grasp)} "
+                        f"reason={result['failed_reason']}",
+                        flush=True,
+                    )
+                    return result
+                solution = payload.joint_state
+                ee_xyz = payload.ee_xyz
+                ee_quat = payload.ee_quat_xyzw
+                result["ik_grasp_joint5"] = self.validate_grasp_joint5(f"graspgen_{index}_{label}", solution)
+                result["ik_joint5_retry_applied"] = payload.joint5_retry_applied
+                result["ik_original_joint5"] = payload.original_joint5
+                result["ik_fk_approach_axis_error_deg"] = payload.approach_axis_error_deg
+                result["ik_fk_closing_axis_error_deg"] = payload.closing_axis_error_deg
+                result["ik_grasp_joint_state"] = payload.joint_state
+                try:
+                    result["ik_fk_fixed_finger_base_side"] = self.validate_fk_fixed_finger_base_side(
+                        f"graspgen_{index}_{label}",
+                        ee_xyz,
+                        ee_quat,
+                        target_width_extent,
+                    )
+                except RuntimeError as exc:
+                    result["failed_reason"] = f"ik_fk_fixed_finger_failed_{label} {exc}"
+                    print(
+                        f"GRASPGEN_CANDIDATE_REJECT idx={index} grasp={fmt_xyz(grasp)} "
+                        f"reason={result['failed_reason']}",
+                        flush=True,
+                    )
+                    return result
+            else:
+                solution, code = self.solve_ik(
+                    f"graspgen_{index}_{label}",
+                    xyz,
+                    ik_quat,
+                    ik_seed,
+                    client=ik_client,
+                    background_executor=background_executor,
+                )
+                if solution is None:
+                    failed_reason = f"ik_failed_{label} code={code}"
+                    result["failed_reason"] = failed_reason
+                    print(
+                        f"GRASPGEN_CANDIDATE_REJECT idx={index} grasp={fmt_xyz(grasp)} reason={failed_reason}",
+                        flush=True,
+                    )
+                    return result
+            if not self.use_ik_fk_contact_compensation or label != "grasp":
+                continue
+
+            predicted_contact = self._contact_for_pose(ee_xyz, ee_quat, target_contact)
+            contact_error, contact_z_error, failed_reason = self.ik_fk_contact_guard(
+                execution_contact,
+                predicted_contact,
+            )
+            result["ik_fk_predicted_contact"] = predicted_contact
+            result["ik_fk_contact_error"] = contact_error
+            result["ik_fk_contact_residual_x"] = contact_error[0]
+            result["ik_fk_contact_residual_y"] = contact_error[1]
+            result["ik_fk_contact_z_error"] = contact_z_error
+            if not failed_reason:
+                try:
+                    mesh_min_z, tabletop_clearance = self.validate_ik_fk_grasp_geometry(
+                        payload,
+                        width=width,
+                        label=f"candidate_{index}",
+                    )
+                    result["ik_fk_predicted_grasp_mesh_min_z"] = mesh_min_z
+                    result["ik_fk_predicted_tabletop_clearance"] = tabletop_clearance
+                except RuntimeError as exc:
+                    failed_reason = f"ik_fk_geometry_failed_{label} {exc}"
+            clearance = result["ik_fk_predicted_tabletop_clearance"]
+            clearance_text = "n/a" if clearance is None else f"{float(clearance):.4f}"
+            print(
+                f"IK_FK_CANDIDATE idx={index} target={fmt_xyz(execution_contact)} "
+                f"predicted={fmt_xyz(predicted_contact)} error={fmt_xyz(contact_error)} "
+                f"z_error={contact_z_error:.4f} predicted_tabletop_clearance={clearance_text}",
+                flush=True,
+            )
+            if failed_reason:
+                result["failed_reason"] = failed_reason
+                print(
+                    f"GRASPGEN_CANDIDATE_REJECT idx={index} grasp={fmt_xyz(grasp)} reason={failed_reason}",
+                    flush=True,
+                )
+                return result
+        return result
+
+    def _evaluate_candidate_ik_contexts(self, contexts: list[dict[str, object]]) -> list[dict[str, object]]:
+        if not contexts:
+            return []
+        if not self.ik_worker_clients:
+            return [
+                self._evaluate_candidate_ik(
+                    context,
+                    ik_client=self.ik_client,
+                    fk_client=self.fk_client,
+                    background_executor=False,
+                )
+                for context in contexts
+            ]
+
+        verification_context = contexts[0]
+        verification_xyz = verification_context["approach"]
+        verification_quat = verification_context["quat"] if self.args.ik_check_orientation else None
+        verification_seed = verification_context.get("ik_seed")
+        primary_solution, primary_code = self.solve_ik(
+            "worker_verify_primary",
+            verification_xyz,
+            verification_quat,
+            verification_seed,
+            client=self.ik_client,
+        )
+        worker_solution, worker_code = self.solve_ik(
+            "worker_verify_0",
+            verification_xyz,
+            verification_quat,
+            verification_seed,
+            client=self.ik_worker_clients[0],
+        )
+        if primary_code != worker_code or (primary_solution is None) != (worker_solution is None):
+            raise RuntimeError(
+                f"Parallel IK worker verification failed: primary_code={primary_code}, worker_code={worker_code}"
+            )
+        max_joint_delta = 0.0
+        if primary_solution is not None and worker_solution is not None:
+            primary_positions = dict(zip(primary_solution.name, primary_solution.position, strict=False))
+            worker_positions = dict(zip(worker_solution.name, worker_solution.position, strict=False))
+            common_names = sorted(primary_positions.keys() & worker_positions.keys())
+            if not common_names:
+                raise RuntimeError("Parallel IK worker verification returned no common joints")
+            max_joint_delta = max(
+                abs(float(primary_positions[name]) - float(worker_positions[name])) for name in common_names
+            )
+            if max_joint_delta > 1e-8:
+                raise RuntimeError(
+                    f"Parallel IK worker verification exceeded joint tolerance: max_delta={max_joint_delta:.12f}"
+                )
+        print(
+            f"IK_WORKER_VERIFY success=True code={primary_code} max_joint_delta={max_joint_delta:.12f}",
+            flush=True,
+        )
+
+        worker_count = min(len(self.ik_worker_clients), len(contexts))
+        partitions: list[list[tuple[int, dict[str, object]]]] = [[] for _ in range(worker_count)]
+        for position, context in enumerate(contexts):
+            partitions[position % worker_count].append((position, context))
+
+        executor = MultiThreadedExecutor(num_threads=max(2, worker_count * 2))
+        if not executor.add_node(self):
+            raise RuntimeError("Could not attach pick client to the parallel IK executor")
+        spin_thread = threading.Thread(target=executor.spin, name="candidate-ik-executor", daemon=True)
+        spin_thread.start()
+        started = time.monotonic()
+
+        def evaluate_partition(worker_index: int, partition: list[tuple[int, dict[str, object]]]):
+            fk_client = self.fk_worker_clients[worker_index] if self.fk_worker_clients else None
+            return [
+                (
+                    position,
+                    self._evaluate_candidate_ik(
+                        context,
+                        ik_client=self.ik_worker_clients[worker_index],
+                        fk_client=fk_client,
+                        background_executor=True,
+                    ),
+                )
+                for position, context in partition
+            ]
+
+        ordered_results: list[dict[str, object] | None] = [None] * len(contexts)
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="candidate-ik-worker") as pool:
+                jobs = [pool.submit(evaluate_partition, index, partition) for index, partition in enumerate(partitions)]
+                for job in jobs:
+                    for position, result in job.result():
+                        ordered_results[position] = result
+        finally:
+            executor.shutdown(timeout_sec=5.0)
+            spin_thread.join(timeout=5.0)
+            executor.remove_node(self)
+        if spin_thread.is_alive():
+            raise RuntimeError("Parallel IK executor did not stop cleanly")
+        if any(result is None for result in ordered_results):
+            raise RuntimeError("Parallel IK worker pool returned incomplete candidate results")
+        print(
+            f"IK_WORKER_POOL completed=True workers={worker_count} candidates={len(contexts)} "
+            f"duration_s={time.monotonic() - started:.3f}",
+            flush=True,
+        )
+        return [result for result in ordered_results if result is not None]
+
     def predict_contact_from_ik(
         self,
         label: str,
@@ -4035,18 +6033,19 @@ class BananaHandeyePickClient(Node):
         contact_ee: tuple[float, float, float],
         start_joint_state: JointState | None = None,
     ) -> ContactPrediction[IKFKContactPayload]:
-        joint_state, code = self.solve_ik(label, command_xyz, quat_xyzw, start_joint_state)
-        if joint_state is None:
-            raise RuntimeError(f"IK failed for {label}: code={code}")
-        ee_xyz, ee_quat = self.compute_fk(label, joint_state)
-        predicted_contact = self._contact_for_pose(ee_xyz, ee_quat, contact_ee)
+        payload, code, failed_reason = self.solve_grasp_ik_fk(
+            label,
+            command_xyz,
+            quat_xyzw,
+            start_joint_state,
+        )
+        if payload is None:
+            raise RuntimeError(f"IK/FK failed for {label}: code={code} reason={failed_reason}")
+        self._validate_joint5_branch_continuity(label, start_joint_state, payload.joint_state)
+        predicted_contact = self._contact_for_pose(payload.ee_xyz, payload.ee_quat_xyzw, contact_ee)
         return ContactPrediction(
             contact_base=predicted_contact,
-            payload=IKFKContactPayload(
-                joint_state=joint_state,
-                ee_xyz=ee_xyz,
-                ee_quat_xyzw=ee_quat,
-            ),
+            payload=payload,
         )
 
     def compensate_contact_xy_with_ik_fk(
@@ -4056,6 +6055,7 @@ class BananaHandeyePickClient(Node):
         quat_xyzw: tuple[float, float, float, float],
         target_contact_base: tuple[float, float, float],
         contact_ee: tuple[float, float, float],
+        start_joint_state: JointState | None = None,
     ):
         def predict(
             xyz: tuple[float, float, float],
@@ -4066,7 +6066,7 @@ class BananaHandeyePickClient(Node):
                 xyz,
                 quat_xyzw,
                 contact_ee,
-                previous_payload.joint_state if previous_payload is not None else None,
+                previous_payload.joint_state if previous_payload is not None else start_joint_state,
             )
 
         result = compensate_contact_xy(
@@ -4339,9 +6339,9 @@ class BananaHandeyePickClient(Node):
         grasp: tuple[float, float, float],
         quat_xyzw: tuple[float, float, float, float] | None,
         planned_contact_base: tuple[float, float, float] | None = None,
-    ) -> None:
+    ) -> FixedFingerRobustGap | None:
         if quat_xyzw is None:
-            return
+            return None
         if planned_contact_base is None:
             planned_contact_base = self.planned_contact_for_pose(grasp, quat_xyzw)
         self.current_plan_contact_base = planned_contact_base
@@ -4365,6 +6365,35 @@ class BananaHandeyePickClient(Node):
             f"planned_contact={fmt_xyz(planned_contact_base)} action={action}",
             flush=True,
         )
+        robust_gap = None
+        robust_gap_config = self.args.target_fixed_finger_robust_gap_config
+        if (
+            bool(robust_gap_config.get("enabled", False))
+            and self.selected_fixed_finger_envelope is not None
+            and self.args.target_closing_axis_ee is not None
+        ):
+            robust_gap = fixed_finger_robust_gap(
+                self.selected_fixed_finger_envelope.fixed_gap_m,
+                self.selected_fixed_finger_envelope.target_gap_m,
+                correction,
+                quat_xyzw,
+                self.args.target_closing_axis_ee,
+                max_target_gap_deficit_m=float(robust_gap_config.get("max_target_gap_deficit_m", 0.003)),
+            )
+            selected = next((record for record in self.execution_debug_records if record.get("selected")), None)
+            if selected is not None:
+                selected["fixed_finger_contact_error_m"] = round(robust_gap.contact_error_along_closing_axis_m, 6)
+                selected["fixed_finger_effective_gap_m"] = round(robust_gap.effective_gap_m, 6)
+                selected["fixed_finger_required_gap_m"] = round(robust_gap.required_gap_m, 6)
+                selected["fixed_finger_robust_gap_passed"] = robust_gap.passed
+            print(
+                f"FIXED_FINGER_ROBUST_GAP_CHECK passed={robust_gap.passed} "
+                f"closing_axis_error={robust_gap.contact_error_along_closing_axis_m:.4f} "
+                f"effective_gap={robust_gap.effective_gap_m:.4f} "
+                f"required_gap={robust_gap.required_gap_m:.4f}",
+                flush=True,
+            )
+        return robust_gap
 
     def update_selected_execution_pose(
         self,
@@ -4439,12 +6468,101 @@ class BananaHandeyePickClient(Node):
             "predicted_contact_base": _json_xyz(result.prediction.contact_base),
             "joint_names": [str(name) for name in payload.joint_state.name],
             "joint_positions": [round(float(value), 6) for value in payload.joint_state.position],
+            "joint5_retry_applied": bool(payload.joint5_retry_applied),
         }
+        if payload.original_joint5 is not None:
+            compensation_record["original_joint5"] = round(float(payload.original_joint5), 6)
+        if payload.approach_axis_error_deg is not None:
+            compensation_record["approach_axis_error_deg"] = round(float(payload.approach_axis_error_deg), 6)
+        if payload.closing_axis_error_deg is not None:
+            compensation_record["closing_axis_error_deg"] = round(float(payload.closing_axis_error_deg), 6)
         if predicted_mesh_min_z is not None:
             compensation_record["predicted_mesh_min_z"] = round(float(predicted_mesh_min_z), 6)
         if predicted_tabletop_clearance is not None:
             compensation_record["predicted_tabletop_clearance_m"] = round(float(predicted_tabletop_clearance), 6)
         selected["ik_fk_compensation"] = compensation_record
+
+    def _apply_joint5_retry_if_needed(
+        self,
+        label: str,
+        ik_xyz: tuple[float, float, float],
+        ik_quat: tuple[float, float, float, float] | None,
+        solution: JointState,
+        *,
+        ik_client,
+        background_executor: bool,
+    ) -> tuple[JointState | None, float | None]:
+        safety_limit = self.args.final_joint5_max
+        if safety_limit is None:
+            return solution, None
+        positions = dict(zip(solution.name, solution.position, strict=False))
+        if "5" not in positions:
+            return solution, None
+        original_j5 = float(positions["5"])
+        flip_threshold = math.pi / 2.0
+        if abs(original_j5) <= flip_threshold:
+            return solution, None
+
+        bounded_seed_j5 = self._canonicalize_joint5(original_j5)
+        retry_seed = self._joint_state_with_joint5(solution, bounded_seed_j5)
+        retry_solution, retry_code = self.solve_ik(
+            f"{label}_joint5_retry",
+            ik_xyz,
+            ik_quat,
+            retry_seed,
+            client=ik_client,
+            background_executor=background_executor,
+        )
+        if retry_solution is None:
+            print(
+                f"JOINT5_RETRY label={label} strategy=half_turn_fixed_finger_swap original={original_j5:.4f} "
+                f"original_abs={abs(original_j5):.4f} seed={bounded_seed_j5:.4f} retried=None "
+                f"flip_threshold={flip_threshold:.4f} abs_max={float(safety_limit):.4f} "
+                f"code={retry_code} status=ik_failed",
+                flush=True,
+            )
+            return None, original_j5
+        retry_positions = dict(zip(retry_solution.name, retry_solution.position, strict=False))
+        retry_j5 = float(retry_positions.get("5", float("inf")))
+        retry_passed = abs(retry_j5) <= float(safety_limit)
+        status = "resolved" if retry_passed else "still_outside_abs_limit"
+        print(
+            f"JOINT5_RETRY label={label} strategy=half_turn_fixed_finger_swap original={original_j5:.4f} "
+            f"original_abs={abs(original_j5):.4f} seed={bounded_seed_j5:.4f} retried={retry_j5:.4f} "
+            f"retried_abs={abs(retry_j5):.4f} flip_threshold={flip_threshold:.4f} "
+            f"abs_max={float(safety_limit):.4f} code={retry_code} status={status}",
+            flush=True,
+        )
+        return (retry_solution if retry_passed else None), original_j5
+
+    def validate_grasp_joint5(self, label: str, joint_state: JointState) -> float | None:
+        limit = self.args.final_joint5_max
+        if limit is None:
+            return None
+        positions = dict(zip(joint_state.name, joint_state.position, strict=False))
+        if "5" not in positions:
+            raise RuntimeError(f"Final joint 5 is unavailable for {label}")
+        value = float(positions["5"])
+        absolute_value = abs(value)
+        passed = absolute_value <= float(limit)
+        selected = next((record for record in self.execution_debug_records if record.get("selected")), None)
+        if selected is not None:
+            selected["final_joint5"] = round(value, 6)
+            selected["final_joint5_abs"] = round(absolute_value, 6)
+            selected["final_joint5_max"] = round(float(limit), 6)
+            selected["final_joint5_abs_max"] = round(float(limit), 6)
+            selected["final_joint5_passed"] = passed
+        print(
+            f"FINAL_JOINT5_CHECK label={label} value={value:.6f} abs={absolute_value:.6f} "
+            f"abs_max={float(limit):.6f} passed={passed}",
+            flush=True,
+        )
+        if not passed:
+            raise RuntimeError(
+                f"Final joint 5 absolute value {absolute_value:.6f} "
+                f"exceeds configured maximum {float(limit):.6f} (value={value:.6f})"
+            )
+        return value
 
     def validate_ik_fk_grasp_geometry(
         self,
@@ -4457,8 +6575,7 @@ class BananaHandeyePickClient(Node):
             selected = next((record for record in self.execution_debug_records if record.get("selected")), None)
             width_value = selected.get("target_width_m") if selected is not None else None
             width = float(width_value) if isinstance(width_value, int | float) else None
-        mesh_min_z = self._so101_gripper_mesh_min_z(payload.ee_xyz, payload.ee_quat_xyzw, width)
-        tabletop_clearance = self._so101_tabletop_clearance(
+        mesh_min_z, tabletop_clearance = self._so101_gripper_geometry_metrics(
             payload.ee_xyz,
             payload.ee_xyz,
             payload.ee_quat_xyzw,
@@ -4509,13 +6626,22 @@ class BananaHandeyePickClient(Node):
             if error_norm <= tolerance:
                 return current_command
 
-            ok = self.run_task(
-                f"banana_contact_realign_{phase}_{iteration}",
-                f"contact realign {phase} {iteration}",
-                [make_move_step(f"realign_{phase}_{iteration}", corrected, speed, quat_xyzw)],
-            )
-            if not ok:
-                raise RuntimeError(f"Contact realignment failed during {phase}")
+            if self.active_grasp_joint_seed is not None:
+                self.run_branch_locked_pose(
+                    f"realign_{phase}_{iteration}",
+                    corrected,
+                    quat_xyzw,
+                    speed,
+                    phase=phase,
+                )
+            else:
+                ok = self.run_task(
+                    f"banana_contact_realign_{phase}_{iteration}",
+                    f"contact realign {phase} {iteration}",
+                    [make_move_step(f"realign_{phase}_{iteration}", corrected, speed, quat_xyzw)],
+                )
+                if not ok:
+                    raise RuntimeError(f"Contact realignment failed during {phase}")
             current_command = corrected
 
         return current_command
@@ -4697,13 +6823,22 @@ class BananaHandeyePickClient(Node):
             if not ok:
                 raise PickExecutionError("Pick task failed during prepare", phase="prepare", retryable=True)
 
-            ok = self.run_task(
-                f"{task_id}_approach",
-                f"{task_desc}: approach",
-                [make_move_step("move_above_target", approach, self.args.approach_speed, move_quat)],
-            )
-            if not ok:
-                raise PickExecutionError("Pick task failed during approach", phase="approach", retryable=True)
+            if self.active_grasp_joint_seed is not None and move_quat is not None:
+                self.run_branch_locked_pose(
+                    "move_above_target",
+                    approach,
+                    move_quat,
+                    self.args.approach_speed,
+                    phase="approach",
+                )
+            else:
+                ok = self.run_task(
+                    f"{task_id}_approach",
+                    f"{task_desc}: approach",
+                    [make_move_step("move_above_target", approach, self.args.approach_speed, move_quat)],
+                )
+                if not ok:
+                    raise PickExecutionError("Pick task failed during approach", phase="approach", retryable=True)
             approach = self.realign_contact("approach", approach, self.args.approach_speed, move_quat)
             self.update_selected_execution_pose(approach=approach, quat_xyzw=move_quat)
             self.sample_pick_diagnostics(
@@ -4714,15 +6849,24 @@ class BananaHandeyePickClient(Node):
             )
 
             pregrasp, _, top_source = self.pregrasp_realign_pose(grasp, move_quat)
-            ok = self.run_task(
-                f"{task_id}_pregrasp_realign",
-                f"{task_desc}: pregrasp realign",
-                [make_move_step("move_to_pregrasp_realign_height", pregrasp, self.args.descend_speed, move_quat)],
-            )
-            if not ok:
-                raise PickExecutionError(
-                    "Pick task failed during pregrasp realign move", phase="pregrasp", retryable=True
+            if self.active_grasp_joint_seed is not None and move_quat is not None:
+                self.run_branch_locked_pose(
+                    "move_to_pregrasp_realign_height",
+                    pregrasp,
+                    move_quat,
+                    self.args.descend_speed,
+                    phase="pregrasp",
                 )
+            else:
+                ok = self.run_task(
+                    f"{task_id}_pregrasp_realign",
+                    f"{task_desc}: pregrasp realign",
+                    [make_move_step("move_to_pregrasp_realign_height", pregrasp, self.args.descend_speed, move_quat)],
+                )
+                if not ok:
+                    raise PickExecutionError(
+                        "Pick task failed during pregrasp realign move", phase="pregrasp", retryable=True
+                    )
             original_pregrasp = pregrasp
             pregrasp = self.realign_contact("pregrasp", pregrasp, self.args.descend_speed, move_quat)
             grasp, lift = self.apply_realign_delta_to_descent(original_pregrasp, pregrasp, grasp, lift)
@@ -4758,6 +6902,7 @@ class BananaHandeyePickClient(Node):
                         move_quat,
                         planned_grasp_contact,
                         self.selected_target_contact_ee,
+                        self.active_grasp_joint_seed,
                     )
                 except RuntimeError as exc:
                     raise PickExecutionError(
@@ -4787,6 +6932,25 @@ class BananaHandeyePickClient(Node):
                 lift = (lift[0] + result.correction_x, lift[1] + result.correction_y, lift[2])
                 grasp = result.command_xyz
                 payload = result.prediction.payload
+                self.active_grasp_joint_seed = payload.joint_state
+                try:
+                    self.validate_grasp_joint5(
+                        f"graspgen_{self.current_execution_candidate_index}_final",
+                        payload.joint_state,
+                    )
+                    self.validate_fk_fixed_finger_base_side(
+                        f"graspgen_{self.current_execution_candidate_index}_final",
+                        payload.ee_xyz,
+                        payload.ee_quat_xyzw,
+                        self.selected_target_width_extent_base,
+                    )
+                except RuntimeError as exc:
+                    self._write_execution_debug_outputs(render_previews=False)
+                    raise PickExecutionError(
+                        f"Final grasp posture rejected: {exc}",
+                        phase="grasp_posture",
+                        retryable=True,
+                    ) from exc
                 try:
                     predicted_mesh_min_z, predicted_tabletop_clearance = self.validate_ik_fk_grasp_geometry(payload)
                 except RuntimeError as exc:
@@ -4820,11 +6984,38 @@ class BananaHandeyePickClient(Node):
                 )
             if not ok:
                 raise PickExecutionError("Pick task failed during grasp", phase="grasp", retryable=True)
-            self.log_grasp_contact_residual(
+            robust_gap = self.log_grasp_contact_residual(
                 grasp_diagnostic_xyz,
                 grasp_diagnostic_quat,
                 planned_contact_base=planned_grasp_contact,
             )
+            robust_gap_enabled = bool(self.args.target_fixed_finger_robust_gap_config.get("enabled", False))
+            if robust_gap_enabled and (robust_gap is None or not robust_gap.passed):
+                retreat_ok = self.run_task(
+                    f"{task_id}_fixed_finger_gap_retreat",
+                    f"{task_desc}: retreat after fixed-finger gap rejection",
+                    [make_move_step("retreat_to_pregrasp", pregrasp, self.args.descend_speed, move_quat)],
+                )
+                if not retreat_ok:
+                    raise PickExecutionError(
+                        "Fixed-finger robust gap rejected and pregrasp retreat failed",
+                        phase="grasp_residual",
+                        retryable=False,
+                    )
+                detail = (
+                    "measurement unavailable"
+                    if robust_gap is None
+                    else (
+                        f"effective_gap={robust_gap.effective_gap_m:.4f} "
+                        f"required_gap={robust_gap.required_gap_m:.4f} "
+                        f"closing_axis_error={robust_gap.contact_error_along_closing_axis_m:.4f}"
+                    )
+                )
+                raise PickExecutionError(
+                    f"Fixed-finger robust gap rejected before close: {detail}",
+                    phase="grasp_residual",
+                    retryable=True,
+                )
             self.sample_pick_diagnostics(
                 "grasp",
                 grasp_diagnostic_xyz,
@@ -4870,21 +7061,45 @@ class BananaHandeyePickClient(Node):
                 if probe_z < lift[2] - 1e-6:
                     probe_lift = (lift[0], lift[1], probe_z)
             if probe_lift is not None:
-                ok = self.run_task(
-                    f"{task_id}_probe_lift",
-                    f"{task_desc}: slow retention-check lift",
-                    [
-                        make_move_step(
-                            "probe_lift_target",
-                            probe_lift,
-                            self.args.grasp_verification_probe_lift_speed,
-                            move_quat,
+                if self.active_grasp_joint_seed is not None and move_quat is not None:
+                    self.run_branch_locked_pose(
+                        "probe_lift_target",
+                        probe_lift,
+                        move_quat,
+                        self.args.grasp_verification_probe_lift_speed,
+                        phase="probe_lift",
+                        retryable=False,
+                    )
+                else:
+                    ok = self.run_task(
+                        f"{task_id}_probe_lift",
+                        f"{task_desc}: slow retention-check lift",
+                        [
+                            make_move_step(
+                                "probe_lift_target",
+                                probe_lift,
+                                self.args.grasp_verification_probe_lift_speed,
+                                move_quat,
+                            )
+                        ],
+                    )
+                    if not ok:
+                        raise PickExecutionError(
+                            "Pick task failed during probe lift", phase="probe_lift", retryable=False
                         )
-                    ],
-                )
-                if not ok:
-                    raise PickExecutionError("Pick task failed during probe lift", phase="probe_lift", retryable=False)
-                self.verify_grasp_retention("probe_lift")
+                try:
+                    self.verify_grasp_retention("probe_lift")
+                except PickExecutionError:
+                    if self.args.recover_after_retention_failure:
+                        self.recover_after_retention_failure(
+                            task_id=task_id,
+                            task_desc=task_desc,
+                            phase="probe_lift",
+                            elevated_pose=probe_lift,
+                        )
+                    else:
+                        print("RETENTION_FAILURE_RECOVERY phase=probe_lift enabled=False", flush=True)
+                    raise
                 self.sample_pick_diagnostics(
                     "probe_lift",
                     probe_lift,
@@ -4892,20 +7107,99 @@ class BananaHandeyePickClient(Node):
                     detect_target=False,
                 )
 
-            ok = self.run_task(
-                f"{task_id}_lift",
-                f"{task_desc}: lift",
-                [make_move_step("lift_target", lift, self.args.lift_speed, move_quat)],
-            )
-            if not ok:
-                raise PickExecutionError("Pick task failed during lift", phase="lift", retryable=False)
-            self.verify_grasp_retention("lift")
+            if self.active_grasp_joint_seed is not None and move_quat is not None:
+                self.run_branch_locked_pose(
+                    "lift_target",
+                    lift,
+                    move_quat,
+                    self.args.lift_speed,
+                    phase="lift",
+                    retryable=False,
+                    validate_orientation=False,
+                )
+            else:
+                ok = self.run_task(
+                    f"{task_id}_lift",
+                    f"{task_desc}: lift",
+                    [make_move_step("lift_target", lift, self.args.lift_speed, move_quat)],
+                )
+                if not ok:
+                    raise PickExecutionError("Pick task failed during lift", phase="lift", retryable=False)
+            try:
+                self.verify_grasp_retention("lift")
+            except PickExecutionError:
+                if self.args.recover_after_retention_failure:
+                    self.recover_after_retention_failure(
+                        task_id=task_id,
+                        task_desc=task_desc,
+                        phase="lift",
+                        elevated_pose=lift,
+                    )
+                else:
+                    print("RETENTION_FAILURE_RECOVERY phase=lift enabled=False", flush=True)
+                raise
             self.sample_pick_diagnostics(
                 "lift",
                 lift,
                 commanded_quat_xyzw=move_quat,
                 detect_target=False,
             )
+            if self.args.release_after_success:
+                release_pose = lift
+                release_drop_height = float(self.args.release_drop_height_m)
+                if release_drop_height >= 0.0:
+                    release_pose = (
+                        lift[0],
+                        lift[1],
+                        min(lift[2], grasp[2] + release_drop_height),
+                    )
+                need_descent = norm_xyz(sub_xyz(release_pose, lift)) > 1e-6
+                branch_locked_release = (
+                    need_descent and self.active_grasp_joint_seed is not None and move_quat is not None
+                )
+                if branch_locked_release:
+                    self.run_branch_locked_pose(
+                        "descend_to_release_height",
+                        release_pose,
+                        move_quat,
+                        self.args.lift_speed,
+                        phase="release",
+                        retryable=False,
+                    )
+                release_steps = []
+                if need_descent and not branch_locked_release:
+                    release_steps.append(
+                        make_move_step("descend_to_release_height", release_pose, self.args.lift_speed, move_quat)
+                    )
+                release_steps.extend(
+                    [
+                        make_gripper_step("open_gripper_after_success", 1.0),
+                        make_wait_step("settle_released_target", max(0.0, self.args.release_settle_s)),
+                    ]
+                )
+                ok = self.run_task(
+                    f"{task_id}_release",
+                    f"{task_desc}: release after verified lift",
+                    release_steps,
+                )
+                if not ok:
+                    raise PickExecutionError(
+                        "Post-success target release failed",
+                        phase="release",
+                        retryable=False,
+                    )
+                selected = next((record for record in self.execution_debug_records if record.get("selected")), None)
+                if selected is not None:
+                    selected["post_success_release"] = {
+                        "success": True,
+                        "settle_s": round(max(0.0, float(self.args.release_settle_s)), 3),
+                        "release_pose": _json_xyz(release_pose),
+                        "drop_height_m": None if release_drop_height < 0.0 else round(release_drop_height, 6),
+                    }
+                print(
+                    f"POST_SUCCESS_RELEASE success=True gripper=open release_pose={fmt_xyz(release_pose)}",
+                    flush=True,
+                )
             return
 
         steps = [
@@ -4942,6 +7236,10 @@ class BananaHandeyePickClient(Node):
             self.selected_target_contact_ee = tuple(float(v) for v in candidate["target_contact"])
             self.selected_plan_contact_base = tuple(float(v) for v in candidate["plan_contact"])
             self.selected_target_width_m = float(candidate.get("target_width_m", 0.0))
+            self.selected_fixed_finger_envelope = candidate.get("fixed_finger_envelope")
+            self.selected_target_width_extent_base = candidate.get("target_width_extent")
+            self.selected_grasp_joint_seed = candidate.get("grasp_joint_seed")
+            self.active_grasp_joint_seed = self.selected_grasp_joint_seed
             self.current_grasp_verified = False
             self.realign_target_contact_base_by_phase = {}
             self.mark_execution_candidate_attempt(
@@ -4957,6 +7255,22 @@ class BananaHandeyePickClient(Node):
                 flush=True,
             )
             try:
+                if candidate["quat"] is not None and self.selected_grasp_joint_seed is not None:
+                    try:
+                        branch = self.prepare_execution_grasp_branch(
+                            f"graspgen_{index}_execution_branch",
+                            candidate["grasp"],
+                            candidate["quat"],
+                            self.selected_grasp_joint_seed,
+                        )
+                    except RuntimeError as exc:
+                        raise PickExecutionError(
+                            f"Could not lock bounded grasp branch: {exc}",
+                            phase="grasp_posture",
+                            retryable=True,
+                        ) from exc
+                    self.selected_grasp_joint_seed = branch.joint_state
+                    self.active_grasp_joint_seed = branch.joint_state
                 self.execute_pick(
                     candidate["approach"],
                     candidate["grasp"],
@@ -5039,6 +7353,7 @@ def main() -> None:
         print(f"FLOW_RESULT success=False error={exc}", flush=True)
         raise
     finally:
+        node.print_so101_table_plane_shadow_summary()
         node._write_execution_debug_outputs()
         node.destroy_node()
         rclpy.shutdown()

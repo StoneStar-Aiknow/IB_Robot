@@ -32,3 +32,9 @@ openspec
 .worktrees/
 get-docker.sh
 docs/superpowers/
+
+# IDE
+.idea/
+
+# Runtime artifacts
+/outputs/

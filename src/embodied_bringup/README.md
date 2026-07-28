@@ -12,6 +12,10 @@ SSOT YAML 配置，负责把任务入口、规则/VLM planner、任务执行器�
 - 从 `robot_config` 加载机器人 YAML，并把配置以 ROS 参数注入下游节点。
 - 编排 `embodied_agent`、`skill_library`、`safety_guard`、`vlm_task_planner`
   和 `perception_service` 的启动顺序与参数。
+- 当 `robot.grasp_execution.enabled=true` 时，编排 Grounded-SAM2、GraspGen、抓取验证器和
+  `manipulation_execution/pick_executor_node`。
+- 当 `robot.grasp_execution.ik.worker_count>0` 时，自动包含 `robot_moveit/so101_ik_workers.launch.py`，
+  为 Hermes 启动与监督式抓取脚本相同的并行候选 IK/FK 池。
 - 保持具身业务运行时依赖集中在 bringup 层，避免 `robot_config` 反向依赖业务包。
 
 本包不负责：
@@ -31,6 +35,9 @@ embodied_bringup
     -> safety_guard          # 技能和 primitive 校验
     -> vlm_task_planner      # 可选 VLM 规划
     -> perception_service    # 可选连续场景理解
+    -> manipulation_service  # 可选 GraspGen 规划与抓后验证
+    -> manipulation_execution # 可选抓取闭环编排
+    -> robot_moveit          # 可选隔离 IK/FK worker 进程
 ```
 
 `robot_config` 不应 import 或依赖 `embodied_bringup`。如果需要启动完整具身链路，
@@ -88,3 +95,6 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
   启用某游戏需**同时**置 `embodied.perception.enabled: true` 与该游戏的 `enabled: true`；若 launch
   override（如 `with_perception:=false`）造成不一致，`embodied_pipeline.launch.py` 会在生成节点前 fail-fast
   拒绝启动，避免生成不一致的运行时节点图。
+- `so101_handeye_realsense_grasp` 可通过显式 `pick_object` 技能从 Hermes 调用完整抓取闭环。
+- 真机端口、相机和手眼标定直接维护在该 robot YAML 中；本 launch 与 `robot_mcp` 应使用同一个
+  `robot_config` 名称，workspace 外部完整 YAML 才需要显式传 `config_path`。
