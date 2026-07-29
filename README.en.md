@@ -459,6 +459,25 @@ distributed cloud node separately with `inference_service cloud_inference.launch
 
 IB-Robot includes built-in AI programming agent skills to help Claude Code, Gemini CLI, OpenCode, and other AI Agents better understand the project architecture and development workflow. For available skills, see [.agents/skills/README.md](.agents/skills/README.md).
 
+The default interface for robot capability discovery and guarded execution is `robot-skill`, not MCP, raw `ros2`,
+primitive, MoveIt, or controller commands. Real motion requires explicit user confirmation, and a running Agent must
+never enable `authorize_motion`.
+
+The default control path is:
+
+```text
+Hermes -> ibrobot-control Agent Skill -> robot-skill -> ROS Capability Gateway
+```
+
+`list-skills`, `describe`, and `list-poses` are catalog-only commands. Runtime `status`, `validate`, `execute`, and
+`cancel` require the Gateway. Non-execution commands emit one JSON envelope; `execute` emits JSONL with zero or more
+`feedback` records followed by exactly one `result`. Exit codes are `0` success, `2` argument/config/schema error, `3`
+Gateway/readiness/safety rejection, `4` unavailable runtime, `124` timeout, `130` converged SIGINT cancellation, and
+`143` converged SIGTERM cancellation. See [robot_skill_cli](src/robot_skill_cli/README.md) for commands and contracts.
+
+The `robot_mcp` compatibility layer has been removed. Use `robot-skill` through the ROS Capability Gateway
+for all robot capability discovery and execution.
+
 ### config.json Configuration
 
 `config.json` stores configuration for AI Agents, currently used for AtomGit API integration:
@@ -640,6 +659,10 @@ export ROS_LOCALHOST_ONLY=1
 
 IB-Robot deeply integrates the [OpenClaw](https://github.com/openclaw/openclaw) AI Agent framework with the [RosClaw](https://github.com/PlaiPin/rosclaw) bridge, enabling remote robot control via natural language through Feishu, QQ, Discord, or Slack.
 
+> **Compatibility note**: This section describes the optional legacy RosClaw social bridge, not the default Hermes
+> control surface. Hermes and local Agents must use `robot-skill` through the Capability Gateway. Do not copy or
+> register `docs/ib_robot_social_skill.md` as `ibrobot-control`; that legacy document exposes raw ROS motion interfaces.
+
 > **Acknowledgements**: Thanks to the OpenClaw team for the powerful AI agent framework, and RosClaw for the ROS 2 bridge solution.
 
 ### 1. Robot-Side Configuration (RosClaw & Bridge)
@@ -694,12 +717,6 @@ The robot side requires a WebSocket bridge driver and a discovery service.
   ```bash
   # Set the robot WebSocket address (replace with actual IP)
   openclaw config set plugins.entries.rosclaw.config.rosbridge.url "ws://<ROBOT_IP>:9090"
-  ```
-- **Inject IB-Robot specific skills**:
-  To help the AI accurately understand units (radians) and vision topics, deploy the skill specification:
-  ```bash
-  mkdir -p ~/.openclaw/workspace/skills/ibrobot-control
-  cp ./docs/ib_robot_social_skill.md ~/.openclaw/workspace/skills/ibrobot-control/SKILL.md
   ```
 - **Start Gateway**:
   ```bash

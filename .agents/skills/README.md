@@ -10,7 +10,8 @@
 | [ibrobot-env](./ibrobot-env) | 环境 | 加载 `.shrc_local`、设置 `ROS_DOMAIN_ID`、解决 `ModuleNotFoundError` 等。 |
 | [ibrobot-build](./ibrobot-build) | 操作 | 执行项目编译 (`colcon build`)、构建特定 package 或修复编译错误。 |
 | [ibrobot-launch](./ibrobot-launch) | 操作 | 分平台启动 Ubuntu/openEuler 工作区或 OpenHarmony 板端机器人系统、仿真、推理与遥操作。 |
-| [ibrobot-robot-skill-design](./ibrobot-robot-skill-design) | 操作 | 交互式设计机器人 skill，澄清 anchor/motion space/safety/MCP 暴露并生成验证计划。 |
+| [ibrobot-robot-skill-design](./ibrobot-robot-skill-design) | 操作 | 交互式设计机器人 skill，澄清 anchor/motion space/safety/catalog 暴露并生成验证计划。 |
+| [ibrobot-control](./ibrobot-control) | 操作 | Hermes/Agent 通过 `robot-skill` 发现、校验、执行或取消现有高层技能。 |
 | [oh-constraints](./oh-constraints) | 板端 | OpenHarmony 板端运行时约束汇总（toybox 命令缺失、musl libc、只读 rootfs、无 systemd、无 /usr/bin/env、LD_PRELOAD 干扰等），板端操作前必读。 |
 | [oh-access](./oh-access) | 板端 | 连接 OpenHarmony 开发板，执行 HDC shell / file send / file recv。 |
 | [oh-build-roboframe](./oh-build-roboframe) | 板端 | 使用 `build_roboframe_oh.sh` 主机侧交叉编译并打包 IB_Robot 自有 OpenHarmony 运行时。 |
@@ -49,7 +50,8 @@
 - **环境管理 ([ibrobot-env](./ibrobot-env))**: 确保 shell 上下文正确继承了项目特有的环境变量。
 - **编译构建 ([ibrobot-build](./ibrobot-build))**: 封装了 ROS 2 复杂的编译参数，确保构建的一致性。
 - **系统启动 ([ibrobot-launch](./ibrobot-launch))**: 机器人系统的总入口，区分 Ubuntu/openEuler 源码工作区与 OpenHarmony `/data/roboframe` 板端运行时。
-- **机器人 Skill 设计 ([ibrobot-robot-skill-design](./ibrobot-robot-skill-design))**: 通过交互式流程把自然语言动作需求转成安全的 SSOT skill 设计，避免把观察位/目标位附近动作误实现为无语义锚点的关节轨迹。
+- **机器人 Skill 设计 ([ibrobot-robot-skill-design](./ibrobot-robot-skill-design))**: 通过交互式流程把自然语言动作需求转成安全的 SSOT skill 设计，避免把观察位/目标位附近动作误实现为无语义锚点的关节轨迹；明确 anchor、动作空间、安全链路与 catalog 暴露。
+- **机器人控制 ([ibrobot-control](./ibrobot-control))**: 约束 Hermes/Agent 仅经 `robot-skill` 和 Capability Gateway 操作现有技能，并保持运动确认、取消终态和授权边界。
 - **板端约束 ([oh-constraints](./oh-constraints))**: OpenHarmony 板端运行时约束汇总（toybox 命令缺失、musl libc、只读 rootfs、无 systemd、无 /usr/bin/env、LD_PRELOAD 干扰、SSH RemoteCommand 等），凡涉及板端操作前必读。
 - **板端连接 ([oh-access](./oh-access))**: 统一封装 OpenHarmony 板的 HDC over TCP 访问与文件传输。
 - **OH 主机侧构建 ([oh-build-roboframe](./oh-build-roboframe))**: 通过 `build_roboframe_oh.sh` 交叉编译 `ibrobot_msgs,tensormsg,robot_config,inference_service`，并强制确认 `series.openharmony-5.1.0-musl.txt` 真正进入板端 runtime 产物。

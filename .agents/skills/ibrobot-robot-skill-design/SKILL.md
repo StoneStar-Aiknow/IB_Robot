@@ -1,6 +1,6 @@
 ---
 name: ibrobot-robot-skill-design
-description: "Use when designing, adding, modifying, or validating an IB-Robot embodied skill, MCP/Hermes robot action, social gesture, observation-pose motion, gripper action, MoveIt/relative end-effector action, or when the user asks '设计机器人skill', '新增机器人动作', '新增具身技能', '让机器人做一个动作', 'Hermes 调用机器人', 'MCP 暴露机器人 skill', '庆祝动作', '挥手', '点头', or '观察位置上下左右'."
+description: "Use when designing, adding, modifying, or validating an IB-Robot embodied skill, Hermes/Agent robot action, social gesture, observation-pose motion, gripper action, MoveIt/relative end-effector action, or when the user asks '设计机器人skill', '新增机器人动作', '新增具身技能', '让机器人做一个动作', 'Hermes 调用机器人', 'catalog 暴露机器人 skill', '庆祝动作', '挥手', '点头', or '观察位置上下左右'."
 ---
 
 # IB-Robot Robot Skill Design Guide
@@ -18,14 +18,14 @@ If the request says "around X", "near X", "at X", "观察位置", "桌面位置"
 All real robot execution must keep this path:
 
 ```text
-MCP / Hermes / CLI
+Hermes / Agent / CLI
   -> /embodied/execute_skill
   -> skill_executor
   -> safety_guard
   -> existing primitive executor
 ```
 
-Do not add direct MCP calls to hardware, `/task_executor/*`, MoveIt, ros2_control, or controllers unless the user explicitly asks for an architecture change and an architecture review is performed.
+Do not add direct hardware, `/task_executor/*`, MoveIt, ros2_control, or controller calls unless the user explicitly asks for an architecture change and an architecture review is performed.
 
 ## Mandatory Interaction Flow
 
@@ -91,7 +91,7 @@ For joint gesture patterns:
 
 ### Step 5: Author the Description Contract (Mandatory)
 
-Every new or modified skill MUST carry a `description:` block in the SSOT YAML (co-located with its `primitive_sequence`). This block is the single source of truth for how an MCP/Hermes caller and the rule parser pick THIS skill over its near-synonyms. Omitting it is an architecture violation, not a style choice.
+Every new or modified skill MUST carry a `description:` block in the SSOT YAML (co-located with its `primitive_sequence`). This block is the single source of truth for how an Agent/Hermes caller and the rule parser pick THIS skill over its near-synonyms. Omitting it is an architecture violation, not a style choice.
 
 Required schema (validated by `robot_config.loader._validate_skill_description`):
 
@@ -118,7 +118,7 @@ Disambiguation rule (the whole point of this contract):
 
 - Before finalizing a new skill, list its near-synonyms among existing skills and add one `do_not_use` entry per synonym redirecting to the right alternative.
 - Conversely, add反向 redirects on the existing synonym skills pointing at the new one when the boundary changes.
-- `aliases_zh` is the SSOT for Chinese trigger keywords and MCP catalog aliases; do NOT duplicate keyword lists in `embodied_common.command_parser` hardcode.
+- `aliases_zh` is the SSOT for Chinese trigger keywords and catalog aliases; do NOT duplicate keyword lists in `embodied_common.command_parser` hardcode.
 - `extract_skill_aliases` injects `aliases_zh` into the deterministic rule parser only when `rule_entry: true` and `requires_motion_params: false`.
 - `summary` must be intent-driven ("Wave hello/goodbye with the wrist"), not mechanical ("Sinusoidal joint-5 motion").
 - `do_not_use.instead_use` must reference a skill that actually exists in the same config — the loader rejects dangling redirects.
@@ -165,8 +165,8 @@ Motion Space: <named_pose/cartesian_relative/joint_trajectory/gripper/composite>
 Primitive Sequence:
 - <primitive details>
 Description Contract: summary / category / when_to_use / do_not_use redirects / aliases_zh / motion_scope / intensity
-MCP Exposure: <yes/no; catalog doc auto-synthesized from description>
-Safety Path: MCP -> /embodied/execute_skill -> skill_executor -> safety_guard
+Catalog Exposure: <yes/no; catalog doc auto-synthesized from description>
+Safety Path: robot-skill -> /embodied/execute_skill -> skill_executor -> safety_guard
 Validation Plan:
 - ruff check <files>
 - pytest <tests>
@@ -181,9 +181,9 @@ For normal robot skill changes, edit the smallest necessary set:
 - `src/robot_config/config/robots/<robot>.yaml` for SSOT skill definitions, the `description:` contract, and `allowed_skills`.
 - `src/embodied_common/embodied_common/trajectory_templates.py` only if a reusable trajectory template is truly needed.
 - `src/embodied_common/embodied_common/skill_templates.py` when adding supported skill names or template expansion logic.
-- `src/robot_mcp/robot_mcp/catalog.py` `_SKILL_DOCS` is fallback-only; the authoritative description is the YAML `description:` block, auto-surfaced by the catalog.
+- The authoritative skill description is the YAML `description:` block, auto-surfaced by the `robot-skill` catalog.
 - Tests under the affected packages.
-- README files when launch commands, MCP usage, or public behavior changes.
+- README files when launch commands, catalog usage, or public behavior changes.
 
 Do not add backward-compatibility aliases for removed skill names unless there is persisted data, an external consumer, or an explicit user requirement.
 
@@ -294,17 +294,17 @@ Use for "move around the observation pose".
 
 Always validate the design before real robot execution:
 
-- The skill name is in `planning_policy.allowed_skills` if the planner should be allowed to generate it. This allowlist does not control MCP exposure.
-- MCP catalog entries come from the current robot YAML; a configured skill is exposed unless its template sets `disabled: true`.
+- The skill name is in `planning_policy.allowed_skills` if the planner should be allowed to generate it. This allowlist does not control catalog exposure.
+- Catalog entries come from the current robot YAML; a configured skill is exposed unless its template sets `disabled: true`.
 - Every primitive is in `SUPPORTED_PRIMITIVES`.
 - Every named pose exists under `embodied.named_poses`.
 - Literal `move_relative_ee` steps have valid direction and positive distance.
 - Joint trajectories stay within joint limits and workspace limits.
 - Every absolute joint trajectory has a positive-duration `move_to_joint_positions` entry that matches its first waypoint; returns are explicit primitives, never generator-only flags.
 - The skill has a `description:` block with summary / category / when_to_use / motion_scope / intensity; the loader enforces this and rejects dangling `do_not_use.instead_use` targets.
-- Every near-synonym skill has at least one `do_not_use` redirect so MCP/LLM callers can disambiguate (e.g. wave_hello vs greet_observe_raise vs nod_yes).
+- Every near-synonym skill has at least one `do_not_use` redirect so Agent/LLM callers can disambiguate (e.g. wave_hello vs greet_observe_raise vs nod_yes).
 - Chinese trigger words live ONLY in `description.aliases_zh`; no parallel hardcoded keyword list in `command_parser`.
-- MCP catalog `doc` is auto-synthesized from the `description:` block; do not hand-maintain per-skill prose in `_SKILL_DOCS` for skills that have a YAML description.
+- Catalog `doc` is auto-synthesized from the `description:` block; do not hand-maintain per-skill prose.
 - Real robot testing starts with RViz when the user wants visual confirmation.
 - After real robot testing, execute `recover_safe_pose` unless the user explicitly wants to leave the robot at the final pose.
 
@@ -331,24 +331,24 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
   moveit_display:=true
 ```
 
-Then call MCP or ROS actions through the guarded skill interface:
+Then call `robot-skill` or ROS actions through the guarded skill interface:
 
 ```text
-validate_skill(skill_name="<skill>")
-execute_skill(skill_name="<skill>")
-execute_skill(skill_name="recover_safe_pose")
+robot-skill --config-name NAME validate SKILL ARGS
+robot-skill --config-name NAME execute SKILL --task-id ID
+robot-skill --config-name NAME execute recover_safe_pose --task-id ID
 ```
 
 ## Common Failure Modes
 
 - Implementing an anchored spatial request as joint `base_pose` motion.
 - Forgetting to add the skill to `planning_policy.allowed_skills` when the planner should generate it.
-- Assuming planner `allowed_skills` controls MCP exposure; MCP uses the current robot YAML catalog and the template's `disabled` flag.
-- Exposing a skill in MCP but not updating catalog tests.
+- Assuming planner `allowed_skills` controls catalog exposure; the catalog uses the current robot YAML and the template's `disabled` flag.
+- Exposing a skill in the catalog but not updating catalog tests.
 - Adding a new trajectory template when existing `move_relative_ee` primitives are sufficient.
 - Running real robot tests without `ROS_DOMAIN_ID` in the same shell.
-- Leaving RViz/runtime/MCP background processes running after verification without telling the user.
-- Adding a skill without a `description:` block, leaving MCP/LLM callers unable to disambiguate it from near-synonyms.
-- Hand-writing a `_SKILL_DOCS` entry instead of the SSOT `description:` block, so the catalog and rule parser drift from the YAML.
+- Leaving RViz/runtime background processes running after verification without telling the user.
+- Adding a skill without a `description:` block, leaving Agent/LLM callers unable to disambiguate it from near-synonyms.
+- Hand-writing per-skill prose instead of the SSOT `description:` block, so the catalog and rule parser drift from the YAML.
 - Declaring `do_not_use.instead_use` pointing at a skill that does not exist (loader will reject) or forgetting反向 redirects on the synonym skills.
 - Duplicating Chinese keywords in `command_parser` hardcode instead of sourcing them from `description.aliases_zh`.
