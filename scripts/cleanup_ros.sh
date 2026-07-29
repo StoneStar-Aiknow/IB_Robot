@@ -41,9 +41,6 @@ pkill -9 -f "perception_service_node" 2>/dev/null || true
 pkill -9 -f "geometric_grasp_node" 2>/dev/null || true
 pkill -9 -f "act_inference_node" 2>/dev/null || true
 
-# MCP bridge (robot_mcp_server) — killed so Hermes will respawn from current config
-pkill -9 -f "robot_mcp_server" 2>/dev/null || true
-
 # Auxiliary TF/relay/camera helper nodes
 pkill -9 -f "static_tf_" 2>/dev/null || true
 pkill -9 -f "interactive_marker" 2>/dev/null || true

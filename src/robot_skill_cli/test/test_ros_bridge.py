@@ -1,0 +1,338 @@
+import os
+import threading
+import time
+import uuid
+from types import SimpleNamespace
+
+import pytest
+
+from embodied_common.skill_request import skill_goal_uuid
+from robot_skill_cli.ros_bridge import BridgeError, RosBridge
+
+
+def _assert_isolated_ros_domain() -> None:
+    allocated = os.environ.get("IBROBOT_TEST_ROS_DOMAIN_ID", "")
+    assert allocated.isdecimal() and 1 <= int(allocated) <= 232
+    assert os.environ.get("ROS_DOMAIN_ID") == allocated
+    assert os.environ.get("ROS_LOCALHOST_ONLY") == "1"
+
+
+@pytest.fixture
+def bridge_rig():
+    _assert_isolated_ros_domain()
+    import rclpy
+    from rclpy.action import ActionServer, CancelResponse, GoalResponse
+    from rclpy.executors import MultiThreadedExecutor
+
+    from ibrobot_msgs.action import SkillCommand
+    from ibrobot_msgs.msg import SkillCapabilityStatus
+    from ibrobot_msgs.srv import GetSkillGatewayStatus, ValidateSkill
+
+    if not rclpy.ok():
+        rclpy.init()
+    suffix = f"cli_{os.getpid()}_{uuid.uuid4().hex}"
+    names = {
+        "status": f"/{suffix}/gateway_status",
+        "validate": f"/{suffix}/validate_skill",
+        "action": f"/{suffix}/execute_skill",
+    }
+    requests = []
+    status_control = {"delay_sec": 0.0, "queries": {}}
+    action_control = {"reject": False, "goal_ids": [], "delay_sec": 0.0}
+    server_node = rclpy.create_node(f"robot_skill_cli_test_server_{suffix}")
+
+    def get_status(request, response):
+        if status_control["delay_sec"]:
+            time.sleep(status_control["delay_sec"])
+        response.schema_version = 1
+        response.robot_name = "test_robot"
+        response.motion_authorized = True
+        response.active_control_mode = "moveit_planning"
+        response.busy = True
+        response.active_task_id = "active-task"
+        response.default_skill_timeout_sec = 12.0
+        response.task_budget_sec = 90.0
+        response.rpc_timeout_sec = 2.0
+        response.config_digest = "digest-1"
+        response.request_state, response.request_error_code = status_control["queries"].get(
+            (request.task_id, request.payload_hash),
+            ("active" if request.task_id else "", "DUPLICATE_TASK_ID" if request.payload_hash else ""),
+        )
+        capability = SkillCapabilityStatus()
+        capability.name = "move_relative_ee"
+        capability.ready = False
+        capability.reason = "SKILL_BUSY"
+        capability.required_control_mode = "moveit_planning"
+        response.capabilities = [capability]
+        return response
+
+    def validate_skill(request, response):
+        requests.append(request)
+        response.allowed = True
+        response.reason = "allowed"
+        return response
+
+    server_node.create_service(GetSkillGatewayStatus, names["status"], get_status)
+    server_node.create_service(ValidateSkill, names["validate"], validate_skill)
+
+    def goal_callback(_goal_request):
+        return GoalResponse.REJECT if action_control["reject"] else GoalResponse.ACCEPT
+
+    def cancel_callback(_goal_handle):
+        return CancelResponse.ACCEPT
+
+    def execute_skill(goal_handle):
+        action_control["goal_ids"].append(bytes(goal_handle.goal_id.uuid))
+        feedback = SkillCommand.Feedback()
+        feedback.state = "executing"
+        feedback.detail = "step 1 of 1"
+        goal_handle.publish_feedback(feedback)
+        result = SkillCommand.Result()
+        deadline = time.monotonic() + action_control["delay_sec"]
+        while time.monotonic() < deadline:
+            if goal_handle.is_cancel_requested:
+                result.success = False
+                result.error_code = "SKILL_CANCELLED"
+                result.message = "cancelled"
+                goal_handle.canceled()
+                return result
+            time.sleep(0.01)
+        result.success = True
+        result.error_code = ""
+        result.message = "completed"
+        result.executed_primitives = ["private_primitive"]
+        goal_handle.succeed()
+        return result
+
+    action_server = ActionServer(
+        server_node,
+        SkillCommand,
+        names["action"],
+        execute_callback=execute_skill,
+        goal_callback=goal_callback,
+        cancel_callback=cancel_callback,
+    )
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(server_node)
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    spin_thread.start()
+    bridge = RosBridge(
+        status_service=names["status"],
+        validate_skill_service=names["validate"],
+        skill_action=names["action"],
+    )
+    assert bridge.start() is True
+
+    yield bridge, names, requests, status_control, action_control
+
+    bridge.close()
+    executor.shutdown()
+    spin_thread.join(timeout=2.0)
+    action_server.destroy()
+    server_node.destroy_node()
+    if rclpy.ok():
+        rclpy.shutdown()
+
+
+def test_status_preserves_gateway_contract_fields(bridge_rig):
+    bridge, _names, _requests, _status_control, _action_control = bridge_rig
+
+    status = bridge.get_status(task_id="task-1", payload_hash="hash-1", timeout_sec=1.0)
+
+    assert status == {
+        "schema_version": 1,
+        "robot_name": "test_robot",
+        "motion_authorized": True,
+        "active_control_mode": "moveit_planning",
+        "busy": True,
+        "active_task_id": "active-task",
+        "default_skill_timeout_sec": pytest.approx(12.0),
+        "task_budget_sec": pytest.approx(90.0),
+        "rpc_timeout_sec": pytest.approx(2.0),
+        "config_digest": "digest-1",
+        "request_state": "active",
+        "request_error_code": "DUPLICATE_TASK_ID",
+        "capabilities": [
+            {
+                "name": "move_relative_ee",
+                "ready": False,
+                "reason": "SKILL_BUSY",
+                "required_control_mode": "moveit_planning",
+            }
+        ],
+    }
+
+
+def test_validate_skill_passes_all_fixed_request_fields(bridge_rig):
+    bridge, _names, requests, _status_control, _action_control = bridge_rig
+    payload = {
+        "skill_name": "move_relative_ee",
+        "target_name": "banana",
+        "place_name": "home",
+        "motion_direction": "forward",
+        "motion_distance": 0.03,
+        "timeout_sec": 12.0,
+    }
+
+    result = bridge.validate_skill(payload, timeout_sec=1.0)
+
+    assert result == {"allowed": True, "reason": "allowed"}
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.skill_name == "move_relative_ee"
+    assert request.target_name == "banana"
+    assert request.place_name == "home"
+    assert request.motion_direction == "forward"
+    assert request.motion_distance == pytest.approx(0.03)
+
+
+def test_unavailable_service_maps_to_server_unavailable(bridge_rig):
+    _bridge, names, _requests, _status_control, _action_control = bridge_rig
+    missing = RosBridge(
+        status_service=f"{names['status']}_missing",
+        validate_skill_service=f"{names['validate']}_missing",
+        skill_action=f"{names['action']}_missing",
+    )
+    assert missing.start() is True
+
+    try:
+        with pytest.raises(BridgeError) as exc_info:
+            missing.get_status(timeout_sec=0.05)
+        assert exc_info.value.code == "SERVER_UNAVAILABLE"
+    finally:
+        missing.close()
+
+
+def test_service_response_timeout_maps_to_result_timeout(bridge_rig):
+    bridge, _names, _requests, status_control, _action_control = bridge_rig
+    status_control["delay_sec"] = 0.2
+
+    with pytest.raises(BridgeError) as exc_info:
+        bridge.get_status(timeout_sec=0.05)
+
+    assert exc_info.value.code == "RESULT_TIMEOUT"
+
+
+def test_status_ledger_query_matrix(bridge_rig):
+    bridge, _names, _requests, status_control, _action_control = bridge_rig
+    cases = {
+        ("", ""): ("", ""),
+        ("active-task", ""): ("active", ""),
+        ("terminal-task", ""): ("terminal", ""),
+        ("unknown-task", ""): ("", ""),
+        ("new-task", "new-hash"): ("", ""),
+        ("same-task", "same-hash"): ("terminal", "DUPLICATE_TASK_ID"),
+        ("same-task", "different-hash"): ("terminal", "TASK_ID_CONFLICT"),
+        ("", "hash-without-task"): ("", "INVALID_ARGUMENT"),
+    }
+    status_control["queries"] = cases
+
+    actual = {
+        query: (
+            bridge.get_status(task_id=query[0], payload_hash=query[1], timeout_sec=1.0)["request_state"],
+            bridge.get_status(task_id=query[0], payload_hash=query[1], timeout_sec=1.0)["request_error_code"],
+        )
+        for query in cases
+    }
+
+    assert actual == cases
+
+
+def test_execute_uses_deterministic_goal_uuid_and_public_feedback(bridge_rig):
+    bridge, _names, _requests, _status_control, action_control = bridge_rig
+    feedback = []
+    payload = {
+        "skill_name": "move_relative_ee",
+        "target_name": "",
+        "place_name": "",
+        "motion_direction": "forward",
+        "motion_distance": 0.03,
+        "timeout_sec": 12.0,
+    }
+
+    assert bridge.wait_for_skill_server(timeout_sec=1.0) is True
+    send_future = bridge.send_skill_goal(payload, task_id="task-uuid", feedback_callback=feedback.append)
+    assert bridge.wait_future(send_future, timeout_sec=1.0) is True
+    goal_handle = send_future.result()
+    assert goal_handle.accepted is True
+    result_future = goal_handle.get_result_async()
+    assert bridge.wait_future(result_future, timeout_sec=1.0) is True
+
+    assert action_control["goal_ids"] == [skill_goal_uuid("task-uuid").bytes]
+    assert feedback == [{"state": "executing", "detail": "step 1 of 1"}]
+
+
+def test_cancel_task_targets_active_goal_by_deterministic_uuid(bridge_rig):
+    bridge, _names, _requests, _status_control, action_control = bridge_rig
+    action_control["delay_sec"] = 1.0
+    payload = {
+        "skill_name": "move_relative_ee",
+        "target_name": "",
+        "place_name": "",
+        "motion_direction": "forward",
+        "motion_distance": 0.03,
+        "timeout_sec": 12.0,
+    }
+
+    send_future = bridge.send_skill_goal(payload, task_id="task-cancel", feedback_callback=None)
+    assert bridge.wait_future(send_future, timeout_sec=1.0) is True
+    goal_handle = send_future.result()
+    result_future = goal_handle.get_result_async()
+
+    cancel = bridge.cancel_task("task-cancel", timeout_sec=1.0)
+
+    assert cancel == {"accepted": True, "return_code": 0}
+    assert bridge.wait_future(result_future, timeout_sec=1.0) is True
+    assert result_future.result().result.error_code == "SKILL_CANCELLED"
+    assert action_control["goal_ids"] == [skill_goal_uuid("task-cancel").bytes]
+
+
+def test_cancel_goal_waits_for_terminal_after_rejected_cancel_response():
+    class Future:
+        def __init__(self, value, *, done):
+            self.value = value
+            self.completed = done
+
+        def done(self):
+            return self.completed
+
+        def result(self):
+            return self.value
+
+    cancel_future = Future(SimpleNamespace(return_code=1, goals_canceling=[]), done=True)
+    result_future = Future(None, done=False)
+    goal_handle = SimpleNamespace(cancel_goal_async=lambda: cancel_future)
+
+    def complete_result():
+        time.sleep(0.02)
+        result_future.completed = True
+
+    thread = threading.Thread(target=complete_result)
+    thread.start()
+    try:
+        bridge = RosBridge(status_service="/unused", validate_skill_service="/unused", skill_action="/unused")
+        assert bridge.cancel_goal(goal_handle, result_future, timeout_sec=0.2) is True
+    finally:
+        thread.join(timeout=1.0)
+
+
+def test_send_skill_goal_exception_maps_to_ros_unavailable(bridge_rig):
+    bridge, _names, _requests, _status_control, _action_control = bridge_rig
+
+    def fail_send(*_args, **_kwargs):
+        raise RuntimeError("transport failed")
+
+    bridge._skill_client = SimpleNamespace(send_goal_async=fail_send)
+    payload = {
+        "skill_name": "move_relative_ee",
+        "target_name": "",
+        "place_name": "",
+        "motion_direction": "forward",
+        "motion_distance": 0.03,
+        "timeout_sec": 12.0,
+    }
+
+    with pytest.raises(BridgeError) as exc_info:
+        bridge.send_skill_goal(payload, task_id="task-send-error")
+
+    assert exc_info.value.code == "ROS_UNAVAILABLE"

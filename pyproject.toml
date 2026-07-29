@@ -39,7 +39,7 @@ known-first-party = [
     "safety_guard",
     "skill_library",
     "vlm_task_planner",
-    "robot_mcp",
+    "robot_skill_cli",
     "action_dispatch",
     "inference_manifest",
     "inference_service",
