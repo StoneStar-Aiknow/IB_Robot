@@ -30,6 +30,7 @@ from robot_config.launch_builders.perception import (
     generate_tf_nodes,
     generate_virtual_camera_relays,
 )
+from robot_config.launch_builders.perception_models import generate_perception_model_nodes
 from robot_config.launch_builders.simulation import generate_gazebo_nodes
 
 
@@ -53,6 +54,7 @@ __all__ = [
     "generate_lidar_nodes",
     "generate_tf_nodes",
     "generate_virtual_camera_relays",
+    "generate_perception_model_nodes",
     # Simulation
     "generate_gazebo_nodes",
     # MoveIt

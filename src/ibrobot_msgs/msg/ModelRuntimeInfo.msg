@@ -1,0 +1,12 @@
+string instance_id
+string model_name
+string model_version
+string manifest_fingerprint
+string deployment_name
+string deployment_fingerprint
+string backend
+string runtime_version
+string runtime_state
+string failure_reason
+bool ready
+string message

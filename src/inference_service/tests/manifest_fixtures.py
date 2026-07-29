@@ -96,6 +96,13 @@ def create_policy_bundle(
     return tuple(sorted(required))
 
 
+def create_non_policy_bundle(root: Path) -> tuple[str, ...]:
+    vocabulary_path = root / "assets" / "tags.txt"
+    vocabulary_path.parent.mkdir(parents=True, exist_ok=True)
+    vocabulary_path.write_text("robot\nworkbench\n", encoding="utf-8")
+    return ("assets/tags.txt",)
+
+
 def make_manifest(
     root: Path,
     bundle_paths: tuple[str, ...],
@@ -170,6 +177,80 @@ def make_manifest(
             },
         },
         "deployments": {deployment_name: deployment},
+    }
+
+
+def make_non_policy_manifest(
+    root: Path,
+    bundle_paths: tuple[str, ...],
+    *,
+    deployment_name: str = "ascend",
+    output_semantic: str = "tag_logits",
+) -> dict[str, Any]:
+    entries = [BundleFile(path=path) for path in bundle_paths]
+    artifact_path = "artifacts/ram_plus.om"
+    artifact_file = root / artifact_path
+    artifact_file.parent.mkdir(parents=True, exist_ok=True)
+    artifact_file.write_bytes(b"compiled-ram-plus")
+    return {
+        "schema_version": 2,
+        "bundle": {
+            "uuid": TEST_BUNDLE_UUID,
+            "revision": 1,
+            "name": "test-ram-plus",
+            "files": [entry.model_dump(mode="json") for entry in entries],
+            "digest": {
+                "algorithm": "sha256",
+                "scope": "structure",
+                "value": canonical_bundle_digest(TEST_BUNDLE_UUID, 1, "test-ram-plus", entries),
+            },
+        },
+        "model": {
+            "kind": "perception",
+            "family": "ram_plus",
+            "inputs": [
+                {
+                    "semantic": "observation.image",
+                    "dtype": "float32",
+                    "shape": [1, 3, 384, 384],
+                    "layout": "NCHW",
+                }
+            ],
+            "outputs": [{"semantic": output_semantic, "dtype": "float32", "shape": [1, 4585]}],
+        },
+        "deployments": {
+            deployment_name: {
+                "uuid": TEST_DEPLOYMENT_UUID,
+                "revision": 1,
+                "backend": "ascend",
+                "target": {"soc": "Ascend310P3", "runtime": "acl"},
+                "artifacts": {"model": {"path": artifact_path, "format": "om"}},
+                "execution": ["model"],
+                "bindings": {
+                    "model": {
+                        "inputs": [
+                            {
+                                "semantic": "observation.image",
+                                "runtime_name": "image",
+                                "index": 0,
+                                "dtype": "float32",
+                                "shape": [1, 3, 384, 384],
+                                "layout": "NCHW",
+                            }
+                        ],
+                        "outputs": [
+                            {
+                                "semantic": output_semantic,
+                                "runtime_name": "logits",
+                                "index": 0,
+                                "dtype": "float32",
+                                "shape": [1, 4585],
+                            }
+                        ],
+                    }
+                },
+            }
+        },
     }
 
 

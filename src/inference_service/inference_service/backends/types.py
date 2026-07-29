@@ -15,6 +15,7 @@ from inference_manifest import (
     CompiledDeployment,
     Deployment,
     DeploymentTarget,
+    ModelDescriptor,
     PolicyMetadata,
     ValidatedManifest,
     resolve_bundle_file,
@@ -133,7 +134,16 @@ class RuntimeContext:
 
     @property
     def policy(self) -> PolicyMetadata:
-        return self.validated_manifest.policy
+        policy = self.validated_manifest.policy
+        if policy is None:
+            raise ValueError(
+                f"RuntimeContext.policy is unavailable for {self.model.kind!r} model family {self.model.family!r}"
+            )
+        return policy
+
+    @property
+    def model(self) -> ModelDescriptor:
+        return self.validated_manifest.manifest.model
 
     @property
     def target(self) -> DeploymentTarget | None:

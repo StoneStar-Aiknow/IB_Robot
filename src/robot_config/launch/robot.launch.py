@@ -106,6 +106,7 @@ from robot_config.launch_builders.perception import (
     generate_lidar_nodes,
     generate_tf_nodes,
 )
+from robot_config.launch_builders.perception_models import generate_perception_model_nodes
 from robot_config.launch_builders.recording import (
     generate_recording_nodes,
     generate_rerun_viewer_node,
@@ -517,6 +518,15 @@ def launch_setup(context, *args, **kwargs):
         except Exception as e:
             logger.error(f"generating perception nodes: {e}")
             raise
+
+    try:
+        model_service_nodes = generate_perception_model_nodes(robot_config)
+        actions.extend(model_service_nodes)
+        if model_service_nodes:
+            logger.info(f"Added {len(model_service_nodes)} generic model service nodes")
+    except Exception as e:
+        logger.error(f"generating model service nodes: {e}")
+        raise
 
     # ========== 7. Generate Teleop Nodes (if in teleop mode) ==========
     logger.info("========== Checking Teleop Mode ==========")

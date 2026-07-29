@@ -16,6 +16,9 @@
     "bundle": {
       "$ref": "#/$defs/bundle"
     },
+    "model": {
+      "$ref": "#/$defs/model"
+    },
     "deployments": {
       "type": "object",
       "minProperties": 1,
@@ -226,13 +229,11 @@
       ],
       "if": {
         "properties": {
-          "semantic": {
-            "pattern": "^observation\\.images?(?:\\.|$)"
+          "shape": {
+            "minItems": 4,
+            "maxItems": 4
           }
-        },
-        "required": [
-          "semantic"
-        ]
+        }
       },
       "then": {
         "required": [
@@ -246,6 +247,127 @@
           ]
         }
       }
+    },
+    "semantic_tensor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "semantic",
+        "dtype",
+        "shape"
+      ],
+      "properties": {
+        "semantic": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "dtype": {
+          "enum": [
+            "bool",
+            "uint8",
+            "int8",
+            "int16",
+            "int32",
+            "int64",
+            "float16",
+            "bfloat16",
+            "float32",
+            "float64"
+          ]
+        },
+        "shape": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/shape_dimension"
+          }
+        },
+        "layout": {
+          "enum": [
+            "NCHW",
+            "NHWC"
+          ]
+        }
+      },
+      "if": {
+        "properties": {
+          "shape": {
+            "minItems": 4,
+            "maxItems": 4
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "layout"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "layout"
+          ]
+        }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "family",
+        "inputs",
+        "outputs"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "policy",
+            "perception",
+            "generic"
+          ]
+        },
+        "family": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "inputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/semantic_tensor"
+          }
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/semantic_tensor"
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "not": {
+                  "const": "policy"
+                }
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "inputs": {
+                "minItems": 1
+              },
+              "outputs": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      ]
     },
     "artifact_bindings": {
       "type": "object",
