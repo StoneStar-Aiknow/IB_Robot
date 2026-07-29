@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = "robot_mcp"
+package_name = "robot_skill_cli"
 
 setup(
     name=package_name,
@@ -9,17 +9,12 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
-        ("share/" + package_name + "/launch", ["launch/robot_mcp.launch.py"]),
     ],
-    install_requires=["setuptools", "mcp>=1.26.0,<2"],
+    install_requires=["setuptools"],
     zip_safe=True,
     maintainer="liuweihong",
     maintainer_email="liuweihong8@huawei.com",
-    description="MCP tool layer exposing IB-Robot runtime skills/status to MCP-compatible agent hosts.",
+    description="Stable JSON command-line adapter for the IB-Robot Capability Gateway.",
     license="Apache-2.0",
-    entry_points={
-        "console_scripts": [
-            "robot_mcp_server = robot_mcp.server:main",
-        ],
-    },
+    entry_points={"console_scripts": ["robot-skill = robot_skill_cli.cli:main"]},
 )

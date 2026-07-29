@@ -477,8 +477,27 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
     robot_config:=so101_single_arm \
     control_mode:=moveit_planning \
     use_sim:=true \
-    moveit_display:=false
+    moveit_display:=false \
+    authorize_motion:=false
 ```
+
+`authorize_motion` 默认 `false`，因此上述命令只启动可查询、默认拒绝运动的 Gateway。只有操作员完成
+现场安全检查后，才能在 launch 时显式设为 `true`；Agent、CLI、YAML 和动态 ROS 参数都不能代替操作员授权。
+
+### Agent 默认控制入口
+
+Hermes 等 Agent 默认通过 `robot-skill` 访问 Capability Gateway：
+
+```text
+Hermes -> ibrobot-control Agent Skill -> robot-skill -> ROS Capability Gateway
+```
+
+`list-skills`、`describe` 和 `list-poses` 是不初始化 ROS 的 catalog-only 命令；`status`、`validate`、
+`execute` 和 `cancel` 是 Gateway runtime 命令。普通命令输出单行 JSON，`execute` 输出 JSONL feedback 和
+唯一 terminal result。命令、退出码和授权说明见
+[`src/robot_skill_cli/README.md`](src/robot_skill_cli/README.md)。
+
+`robot_mcp` 兼容层已移除，统一通过 `robot-skill` 访问 Capability Gateway。
 
 ### 发送自然语言命令
 
@@ -521,6 +540,9 @@ embodied:
 
 IB-Robot 内置 AI 编程代理技能，帮助 Claude Code、Gemini CLI、OpenCode 等 AI Agent 更好地理解项目架构和开发流程。可用技能详见 [.agents/skills/README.md](.agents/skills/README.md)。
 
+机器人能力发现和受控执行的默认接口是 `robot-skill`，而不是 MCP、裸 `ros2`、primitive、MoveIt 或
+controller 命令。执行真实动作前必须由用户明确确认，且运行中的 Agent 不得开启 `authorize_motion`。
+
 ### config.json 配置文件
 
 `config.json` 用于存储 AI Agent 所需的配置信息，目前主要用于 AtomGit API 集成：
@@ -562,6 +584,10 @@ export ATOMGIT_TOKEN="your_token_here"
 ## 基于 OpenClaw 的社交控制与远程 AI 代理
 
 IB-Robot 深度集成 [OpenClaw](https://github.com/openclaw/openclaw) AI Agent 框架，配合 [RosClaw](https://github.com/PlaiPin/rosclaw) 桥接器，实现通过 飞书、QQ、Discord 或 Slack 以自然语言对话的方式远程控制机器人。
+
+> **兼容性说明**：本节描述可选的旧 RosClaw 社交桥接，不是 Hermes 的默认控制面。Hermes 和本地 Agent
+> 必须使用 `robot-skill` 访问 Capability Gateway；不得把 `docs/ib_robot_social_skill.md` 复制或注册为
+> `ibrobot-control`，因为该旧文档包含裸 ROS 运动接口。
 
 > **致谢**: 感谢 OpenClaw 团队提供的强大 AI 代理框架，以及 RosClaw 提供的 ROS 2 桥接方案。
 
@@ -617,12 +643,6 @@ IB-Robot 深度集成 [OpenClaw](https://github.com/openclaw/openclaw) AI Agent 
   ```bash
   # 设置机器人 WebSocket 地址（替换为实际 IP）
   openclaw config set plugins.entries.rosclaw.config.rosbridge.url "ws://<机器人IP>:9090"
-  ```
-- **注入 IB-Robot 专用技能**:
-  为了让 AI 准确理解单位（弧度）和视觉话题，请部署技能说明书：
-  ```bash
-  mkdir -p ~/.openclaw/workspace/skills/ibrobot-control
-  cp ./docs/ib_robot_social_skill.md ~/.openclaw/workspace/skills/ibrobot-control/SKILL.md
   ```
 - **启动 Gateway**:
   ```bash

@@ -106,6 +106,22 @@ class ContractExtensionConfig:
 
 
 @dataclass
+class SkillGatewayRuntimeConfig:
+    """Typed runtime settings consumed by the skill Gateway."""
+
+    status_service: str = "/embodied/get_skill_gateway_status"
+    required_control_mode: str = ""
+    # Retain the YAML-declared control_modes keys so validate_config can fully
+    # SSOT-check required_control_mode membership instead of rebuilding the set
+    # from the module-level _SUPPORTED_CONTROL_MODES constant.
+    control_modes: tuple[str, ...] = ()
+    default_skill_timeout_sec: float = 30.0
+    robot_state_freshness_sec: float = 0.5
+    task_budget_sec: float = 180.0
+    rpc_timeout_sec: float = 5.0
+
+
+@dataclass
 class EmbodiedConfig:
     """Minimum embodied claw closure configuration."""
 
@@ -119,6 +135,7 @@ class EmbodiedConfig:
     primitive_action_name: str = "/embodied/execute_primitive"
     validate_skill_service: str = "/embodied/validate_skill"
     validate_primitive_service: str = "/embodied/validate_primitive"
+    skill_gateway_status_service: str = "/embodied/get_skill_gateway_status"
     default_target_name: str = "demo_object"
     default_place_name: str = "tray_right"
     skill_timeout_sec: float = 30.0
@@ -183,6 +200,7 @@ class RobotConfig:
     contract: ContractExtensionConfig = field(default_factory=ContractExtensionConfig)
     voice_asr: VoiceASRConfig = field(default_factory=VoiceASRConfig)
     embodied: EmbodiedConfig = field(default_factory=EmbodiedConfig)
+    skill_gateway: SkillGatewayRuntimeConfig = field(default_factory=SkillGatewayRuntimeConfig)
 
     def get_camera(self, name: str) -> CameraConfig | None:
         """Get camera configuration by name."""

@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
+from launch.actions import DeclareLaunchArgument
 
 from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
 from robot_config.loader import load_robot_config_dict
@@ -24,6 +25,25 @@ def _decode_launch_json_string(raw_value: str):
     if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {"'", '"'}:
         normalized = normalized[1:-1]
     return json.loads(normalized)
+
+
+def _decode_launch_string(raw_value: str):
+    normalized = raw_value.strip()
+    if normalized.endswith("\n..."):
+        normalized = normalized[:-4].rstrip()
+    if len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {"'", '"'}:
+        normalized = normalized[1:-1]
+    return normalized
+
+
+def _skill_executor_params(nodes):
+    skill_executor = next(
+        node
+        for node in nodes
+        if node.__dict__.get("_Node__package") == "skill_library"
+        and node.__dict__.get("_Node__node_executable") == "skill_executor_node"
+    )
+    return _normalize_launch_param_mapping(skill_executor._Node__parameters[0])
 
 
 def test_task_entry_launch_params_do_not_include_unused_routing_config():
@@ -59,6 +79,37 @@ def test_task_entry_launch_params_do_not_include_unused_routing_config():
     assert "planner_route_keywords_json" not in params
 
 
+@pytest.mark.parametrize(
+    ("skill_templates", "expected"),
+    [
+        (None, "{}"),
+        ({}, "{}"),
+        ({"disabled_skill": {"disabled": True}}, '{"disabled_skill": {"disabled": true}}'),
+    ],
+)
+def test_launch_preserves_skill_templates_absent_vs_explicit_empty(skill_templates, expected):
+    embodied = {
+        "enabled": True,
+        "execution": {},
+        "entry": {},
+        "named_poses": {},
+        "named_targets": {},
+        "safety": {},
+        "planner": {},
+        "perception": {},
+    }
+    if skill_templates is not None:
+        embodied["skill_templates"] = skill_templates
+
+    nodes = generate_embodied_nodes({"embodied": embodied}, active_control_mode="moveit_planning")
+    params = _skill_executor_params(nodes)
+    actual = params["skill_templates_json"].strip()
+    if len(actual) >= 2 and actual[0] == actual[-1] and actual[0] in {"'", '"'}:
+        actual = actual[1:-1]
+
+    assert actual == expected
+
+
 @pytest.mark.parametrize("config_name", ["so101_single_arm"])
 def test_generate_embodied_nodes_passes_arm_joint_metadata(config_name):
     config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / f"{config_name}.yaml"
@@ -70,16 +121,62 @@ def test_generate_embodied_nodes_passes_arm_joint_metadata(config_name):
     config["embodied"]["enabled"] = True
     nodes = generate_embodied_nodes(config, "moveit_planning")
 
-    skill_executor = next(
-        node
-        for node in nodes
-        if node.__dict__.get("_Node__package") == "skill_library"
-        and node.__dict__.get("_Node__node_executable") == "skill_executor_node"
-    )
-    params = _normalize_launch_param_mapping(skill_executor._Node__parameters[0])
+    params = _skill_executor_params(nodes)
 
     assert _decode_launch_json_string(params["arm_joint_names_json"]) == ["1", "2", "3", "4", "5"]
     assert set(_decode_launch_json_string(params["joint_limits_json"]).keys()) >= {"1", "2", "3", "4", "5"}
+
+
+def test_launch_injects_gateway_startup_params_from_runtime_and_ssot():
+    robot_config = {
+        "name": "test_robot",
+        "default_control_mode": "model_inference",
+        "skill_required_control_mode": "moveit_planning",
+        "embodied": {
+            "enabled": True,
+            "skill_gateway_status_service": "/test/gateway_status",
+            "timeouts": {
+                "task_budget_sec": 90.0,
+                "default_skill_timeout_sec": 12.0,
+                "robot_state_freshness_sec": 0.25,
+                "scene_freshness_sec": 0.75,
+                "model_idle_timeout_sec": 45.0,
+                "rpc_timeout_sec": 2.0,
+                "gripper_settle_sec": 0.8,
+            },
+        },
+    }
+
+    nodes = generate_embodied_nodes(
+        robot_config,
+        active_control_mode="moveit_runtime_override",
+        motion_authorized=True,
+    )
+    params = _skill_executor_params(nodes)
+
+    assert params["motion_authorized"] is True
+    assert _decode_launch_string(params["active_control_mode"]) == "moveit_runtime_override"
+    assert _decode_launch_string(params["skill_required_control_mode"]) == "moveit_planning"
+    assert _decode_launch_string(params["skill_gateway_status_service"]) == "/test/gateway_status"
+    assert _decode_launch_string(params["robot_name"]) == "test_robot"
+    assert params["default_skill_timeout_sec"] == 12.0
+    assert params["task_budget_sec"] == 90.0
+    assert params["robot_state_freshness_sec"] == 0.25
+    assert params["scene_freshness_sec"] == 0.75
+    assert params["model_idle_timeout_sec"] == 45.0
+    assert params["rpc_timeout_sec"] == 2.0
+    assert params["gripper_settle_sec"] == 0.8
+
+
+def test_direct_builder_defaults_gateway_motion_authorization_to_false():
+    nodes = generate_embodied_nodes(
+        {"embodied": {"enabled": True, "safety": {"motion_authorized": True}}},
+        "moveit_planning",
+    )
+
+    params = _skill_executor_params(nodes)
+
+    assert params["motion_authorized"] is False
 
 
 def test_launch_injects_only_rule_entry_skill_aliases():
@@ -144,6 +241,18 @@ def _load_launch_module():
     return module
 
 
+def test_authorize_motion_launch_argument_defaults_to_false():
+    module = _load_launch_module()
+    description = module.generate_launch_description()
+    authorize_motion = next(
+        entity
+        for entity in description.entities
+        if isinstance(entity, DeclareLaunchArgument) and entity.name == "authorize_motion"
+    )
+
+    assert authorize_motion.default_value[0].text == "false"
+
+
 def test_launch_setup_aborts_when_game_enabled_but_perception_disabled():
     """with_perception:=false while a game is enabled must fail the launch, not
     start a node graph that routes the game to a dead topic. The validation gate
@@ -170,6 +279,36 @@ def test_launch_setup_aborts_when_game_enabled_but_perception_disabled():
 
     with pytest.raises(RuntimeError, match="visual_games"):
         module.launch_setup(context)
+
+
+@pytest.mark.parametrize(("authorize_motion", "expected"), [(None, False), ("true", True)])
+def test_launch_setup_passes_operator_motion_authorization(monkeypatch, authorize_motion, expected):
+    module = _load_launch_module()
+    config = {
+        "default_control_mode": "model_inference",
+        "embodied": {"enabled": True, "perception": {"enabled": False}},
+    }
+    module._load_config = lambda *_args, **_kwargs: config
+    monkeypatch.setattr(module, "get_package_share_directory", lambda package: f"/tmp/{package}")
+    generated = []
+
+    def capture_nodes(robot_config, active_control_mode, *, motion_authorized=False):
+        generated.append((robot_config, active_control_mode, motion_authorized))
+        return []
+
+    monkeypatch.setattr(module, "generate_embodied_nodes", capture_nodes)
+    launch_configurations = {
+        "robot_config": "so101_single_arm",
+        "control_mode": "moveit_runtime_override",
+        "with_embodied": "true",
+    }
+    if authorize_motion is not None:
+        launch_configurations["authorize_motion"] = authorize_motion
+
+    module.launch_setup(_FakeLaunchContext(launch_configurations))
+
+    assert len(generated) == 1
+    assert generated[0][1:] == ("moveit_runtime_override", expected)
 
 
 def test_handeye_grasp_config_launches_pick_pipeline():

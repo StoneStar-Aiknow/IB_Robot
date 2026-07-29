@@ -64,6 +64,7 @@ def launch_setup(context, *_args, **_kwargs):
     control_mode_override = context.launch_configurations.get("control_mode", "")
     with_embodied_str = context.launch_configurations.get("with_embodied", "true")
     with_perception_str = context.launch_configurations.get("with_perception", "")
+    authorize_motion_str = context.launch_configurations.get("authorize_motion", "false")
 
     config = _load_config(robot_config_name, config_path_override)
     if control_mode_override:
@@ -85,6 +86,7 @@ def launch_setup(context, *_args, **_kwargs):
         raise RuntimeError("embodied launch configuration is inconsistent: " + "; ".join(launch_errors))
 
     active_control_mode = config.get("default_control_mode", "moveit_planning")
+    motion_authorized = parse_bool(authorize_motion_str, default=False)
     base_launch_path = Path(get_package_share_directory("robot_config")) / "launch" / "robot.launch.py"
     base_launch_arguments = {
         "robot_config": robot_config_name,
@@ -110,7 +112,13 @@ def launch_setup(context, *_args, **_kwargs):
         worker_action = _parallel_ik_worker_action(config, base_launch_arguments["use_sim"])
         if worker_action is not None:
             actions.append(worker_action)
-        actions.extend(generate_embodied_nodes(config, active_control_mode))
+        actions.extend(
+            generate_embodied_nodes(
+                config,
+                active_control_mode,
+                motion_authorized=motion_authorized,
+            )
+        )
     else:
         logger.info("Embodied runtime disabled by with_embodied:=false")
     return actions
@@ -129,6 +137,7 @@ def generate_launch_description():
             DeclareLaunchArgument("moveit_display", default_value="false"),
             DeclareLaunchArgument("with_embodied", default_value="true"),
             DeclareLaunchArgument("with_perception", default_value=""),
+            DeclareLaunchArgument("authorize_motion", default_value="false"),
             OpaqueFunction(function=launch_setup),
         ]
     )

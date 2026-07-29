@@ -56,11 +56,44 @@ ibrobot_msgs / rclpy
 - `embodied_common.skill_templates.DEFAULT_WAYPOINT_DURATION_SEC`
 - `embodied_common.skill_templates.is_skill_disabled`
 - `embodied_common.skill_templates.get_skill_templates`
+- `embodied_common.capability_view.build_capability_view`
+- `embodied_common.skill_request.canonical_skill_payload`
+- `embodied_common.skill_request.skill_payload_hash`
+- `embodied_common.skill_request.skill_goal_uuid`
+- `embodied_common.skill_request.derive_skill_task_id`
 - `embodied_common.rgbd_snapshot.KNOWN_REQUIRED_INPUTS`
 - `embodied_common.rgbd_snapshot.RGBDSnapshotBuffer.build_snapshot`
 - `embodied_common.vlm_api_client.VLMAPIClient.analyze`（原有底层接口，返回 `(str, dict)`，向后兼容）
 - `embodied_common.vlm_api_client.VLMAPIClient.complete`（底层扩展接口，返回结构化 dict）
 - `embodied_common.vlm_api_client.VLMClient`（高层客户端，一行式多模型调用，自动路由 / 建图 / 上下文）
+
+## Capability Gateway 公开视图
+
+`capability_view.build_capability_view()` 从已经归一化的机器人配置构建 ROS 无关的公开能力文档。
+它只包含 `robot_name`、排序后的技能、排序后的命名位姿名称、完整的已解析 timeout policy
+和 `capability_digest`，不启动节点，也不读取 ROS 运行状态。
+
+- 每个技能公开 `name`、`summary`、`domain`、`moves_robot`、`required_control_mode`、
+  `parameters` 与 `recovery_policy`。字段从 `capability` 深拷贝，调用方修改返回值不会改写配置。
+- 共享 catalog 的 `list` 结果只使用 `name`、`summary`、`domain`、`moves_robot` 和
+  `required_control_mode`；`describe` 才补充 `parameters`、`recovery_policy`、完整 timeout policy
+  及 digest。
+- `pose_names` 只公开名称，不公开位姿坐标。primitive sequence、目标绑定、关节/夹爪数值、
+  named pose 坐标及 ROS service/action/topic 名称都不属于该视图。
+- 缺省、显式空值或全部 `disabled: true` 的 `embodied.skill_templates` 都产生零个公开技能。
+  `get_skill_templates()` 的禁用过滤在构建视图前生效。
+- digest 是整个公开文档的 SHA-256：JSON 使用排序 key、紧凑分隔符、ASCII 和
+  `allow_nan=False`。因此相同的公开能力、命名位姿名称或 timeout policy 才会得到相同 digest。
+
+`skill_request` 为 Gateway 请求提供同一套规范化规则：技能名和可选字符串会去首尾空白，
+`motion_direction` 会转为小写；`skill_name` 必须非空，`motion_distance`（给出时）必须为有限、
+非负且不超过 float32 最大值，最终 `timeout_sec` 必须为有限正数且不超过 float32 最大值（与 ROS action
+float32 字段对齐）。`canonical_skill_payload()` 在未给出 timeout 时使用
+调用方传入的默认值，`skill_payload_hash()` 对该 payload 使用同样的规范 JSON 计算 SHA-256，
+`skill_goal_uuid()` 则对去空白后的 task ID 计算 UUIDv5：
+`uuid.NAMESPACE_URL` 下的 `ibrobot:{task_id}`。`derive_skill_task_id(parent_task_id, skill_index)`
+派生 `<parent>/skill/<1-based index>` 形式的 child task ID，供 task_executor 与未来消费者共用。
+这些 helper 不包含 primitive 或 ROS transport 数据。
 
 ## 输入前置条件（required_inputs）
 
@@ -121,7 +154,7 @@ export MY_LLM_API_KEY=sk-xxxxxx
 `get_skill_templates` 会先过滤显式设置 `disabled: true` 的模板，再做深拷贝并就地展开
 `trajectory_template` 为 `joint_waypoints`（调用 `expand_trajectory_template`）。只有字面量布尔值
 `True` 表示禁用；`robot_config.loader` 会拒绝非布尔 `disabled`。因此 loader、规则入口、resolver、
-safety guard 和 MCP catalog 共用同一份启用技能与模板展开语义。
+safety guard 和 `robot-skill` catalog 共用同一份启用技能与模板展开语义。
 
 ## 与 SSOT 的关系
 

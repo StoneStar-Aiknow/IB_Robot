@@ -1,4 +1,4 @@
-"""Tests for the MCP-facing skill `description` contract and its validator."""
+"""Tests for the agent-facing skill `description` contract and its validator."""
 
 from __future__ import annotations
 

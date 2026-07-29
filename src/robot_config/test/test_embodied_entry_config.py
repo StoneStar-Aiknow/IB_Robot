@@ -1,7 +1,9 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
+from embodied_common.skill_templates import get_skill_templates
 from robot_config.loader import (
     load_robot_config,
     load_robot_config_dict,
@@ -32,6 +34,71 @@ def test_loaded_embodied_skill_templates_include_dance_basic(config_name):
         step for step in primitive_sequence if step["primitive_name"] == "move_through_joint_positions"
     )
     assert trajectory_step["joint_waypoints"]
+
+
+def test_default_loader_uses_robot_config_environment_path(monkeypatch):
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    monkeypatch.setenv("ROBOT_CONFIG", str(config_path))
+
+    config = load_robot_config_dict()
+
+    assert config["_config_path"] == str(config_path.resolve())
+
+
+@pytest.mark.parametrize("required_control_mode", ["unknown_mode", 1])
+def test_loader_rejects_invalid_global_skill_required_control_mode(tmp_path, required_control_mode):
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "robot": {
+                    "name": "test_robot",
+                    "control_modes": {"moveit_planning": {}},
+                    "skill_required_control_mode": required_control_mode,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="skill_required_control_mode"):
+        load_robot_config_dict(config_path)
+
+
+def test_so101_skill_gateway_control_mode_is_global_and_safety_has_no_motion_authorization():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    raw_config = yaml.safe_load(config_path.read_text(encoding="utf-8"))["robot"]
+    embodied = raw_config["embodied"]
+
+    assert raw_config["skill_required_control_mode"] == "moveit_planning"
+    assert raw_config["skill_required_control_mode"] in raw_config["control_modes"]
+    assert "motion_authorized" not in embodied["safety"]
+    assert all("skill_required_control_mode" not in skill for skill in embodied["skill_templates"].values())
+
+    typed_config = load_robot_config(config_path)
+    assert not hasattr(typed_config.embodied, "motion_authorized")
+
+
+def test_loaded_skill_templates_match_current_enabled_template_set():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config = load_robot_config_dict(config_path)
+    raw_templates = yaml.safe_load(config_path.read_text(encoding="utf-8"))["robot"]["embodied"]["skill_templates"]
+
+    assert set(config["embodied"]["skill_templates"]) == set(get_skill_templates(raw_templates))
+
+
+def test_loader_requires_capability_summary_in_copied_so101_config(tmp_path):
+    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    copied_config = yaml.safe_load(source_path.read_text(encoding="utf-8"))
+    capability = copied_config["robot"]["embodied"]["skill_templates"]["recover_safe_pose"].setdefault("capability", {})
+    capability.pop("summary", None)
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(yaml.safe_dump(copied_config), encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc_info:
+        load_robot_config_dict(config_path)
+
+    assert str(exc_info.value).endswith("embodied.skill_templates.recover_safe_pose.capability.summary is required")
 
 
 def test_embodied_entry_visual_games_typed():

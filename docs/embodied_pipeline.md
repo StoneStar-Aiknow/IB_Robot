@@ -34,6 +34,7 @@ flowchart TD
     end
 
     subgraph skill_executor["skill_executor_node<br/>(skill_library)"]
+        SE_GATEWAY["Capability Gateway<br/>授权 / readiness / budget<br/>lease / ledger / cancel"]
         SE_EXPAND["resolve_skill_primitives()<br/>技能 → Primitive 序列"]
         SE_VALIDATE["调用 validate_skill_srv"]
         SE_PRIM["执行每个 Primitive<br/>move_to_named_pose<br/>open/close_gripper<br/>move_relative_ee<br/>rotate_gripper_cw/ccw"]
@@ -78,6 +79,7 @@ flowchart TD
     PLANNED_RULE --> task_executor
 
     TE_LOOP -->|"SkillCommand action"| skill_executor
+    SE_GATEWAY --> SE_EXPAND
     SE_EXPAND --> SE_VALIDATE
     SE_VALIDATE -->|"ValidateSkill srv"| safety_guard
     SG_SKILL --> SG_RULES
@@ -103,7 +105,7 @@ flowchart TD
 | `task_planner_node` | embodied_agent | `/embodied/task_command` | `/embodied/planned_task`<br/>`/embodied/task_status` | — | — | — |
 | `vlm_task_planner_node` | vlm_task_planner | `/embodied/task_command`<br/>camera topics<br/>ee_pose / joint_states | `/embodied/planned_task`<br/>`/embodied/task_status` | — | — | — |
 | `task_executor_node` | embodied_agent | `/embodied/planned_task` | `/embodied/task_status` | — | — | `/embodied/execute_skill` (SkillCommand) |
-| `skill_executor_node` | skill_library | ee_pose / joint_states | `/cmd_pose` | `ValidateSkill`<br/>`ValidatePrimitive` (client) | `/embodied/execute_skill` (SkillCommand)<br/>`/embodied/execute_primitive` (PrimitiveCommand) | `PrimitiveCommand` (self-loop) |
+| `skill_executor_node` | skill_library | ee_pose / joint_states | — | `/embodied/get_skill_gateway_status` | `/embodied/execute_skill` (SkillCommand)<br/>`/embodied/execute_primitive` (PrimitiveCommand) | `/embodied/execute_primitive` (self-loop)<br/>`/task_executor/execute_task_plan` (ExecuteTaskPlan)<br/>`/arm_trajectory_controller/follow_joint_trajectory` (FollowJointTrajectory) |
 | `safety_guard_node` | safety_guard | — | — | `/embodied/validate_skill`<br/>`/embodied/validate_primitive` | — | — |
 | `perception_service_node` | perception_service | `/embodied/perception_request`<br/>camera topics<br/>ee_pose / joint_states | `/embodied/perception_result`<br/>`/embodied/perception_summary` | — | — | — |
 
@@ -231,7 +233,13 @@ completed（全序列成功）
 
 ### 3.6 skill_executor_node — 技能执行器
 
-**职责**：技能到 Primitive 的展开、安全校验、物理执行。是连接高层规划与底层驱动的关键桥梁。
+**职责**：作为 Capability Gateway 处理运行时授权、控制模式、readiness、budget、identity、lease、ledger
+和取消收敛，再完成技能到 Primitive 的展开、安全校验与物理执行。它是 Agent/任务编排与底层驱动之间的
+唯一高层技能边界。
+
+`/embodied/get_skill_gateway_status` 提供授权状态、实际控制模式、busy、timeout policy、config digest、
+per-skill readiness 和 task ledger 查询。Gateway 默认拒绝运动；`authorize_motion` 只能由操作员在 launch
+时显式开启，不能从 YAML、Agent 或动态 ROS 参数回退。
 
 **架构**：双层 Action Server
 
@@ -349,8 +357,12 @@ export KIMICODE_API_KEY=your_key_here
 ros2 launch embodied_bringup embodied_pipeline.launch.py \
   robot_config:=so101_single_arm \
   control_mode:=moveit_planning \
-  use_sim:=true
+  use_sim:=true \
+  authorize_motion:=false
 ```
+
+上述默认启动允许 catalog/status 查询，但拒绝运动。只有操作员完成现场安全检查后，才能在 launch 时使用
+`authorize_motion:=true`；Hermes、Agent 和 `robot-skill` 不得启动/重启 pipeline 或替操作员开启授权。
 
 ---
 
@@ -420,3 +432,34 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 4. 视觉游戏结果消费者按 source=game.sorting_hat 识别业务类型，读取 scene_summary（四学院之一）
 ```
 
+---
+
+## 七、Agent 与 CLI Gateway 入口
+
+Hermes 和本地 Agent 的默认控制链路为：
+
+```text
+Hermes -> ibrobot-control Agent Skill -> robot-skill -> ROS Capability Gateway
+```
+
+`robot-skill` 只暴露高层技能，不调用 primitive、MoveIt、controller 或裸 ROS 运动接口。catalog-only 命令
+`list-skills`、`describe`、`list-poses` 只读取本地归一化配置，不初始化 ROS；runtime 命令 `status`、
+`validate`、`execute`、`cancel` 只访问 Gateway 的 status、`ValidateSkill`、`SkillCommand` 和标准
+`CancelGoal` 接口。
+
+推荐的人机工作流固定为：
+
+```text
+status -> list-skills -> describe -> validate -> 用户明确运动确认 -> execute
+```
+
+当前 `execute` 可用 SIGINT/SIGTERM 请求取消，另一个进程可使用
+`robot-skill --config-name so101_single_arm cancel --task-id ID`。取消请求发送成功不等于机器人已停止；只有
+terminal result 或 task-only ledger 的 `terminal` 状态可以证明收敛。`SKILL_CANCEL_TIMEOUT` 与
+`robot stop state is unknown` 必须按停止状态未知处理，不得自动重试。
+
+普通命令输出单行 JSON envelope；`execute` 输出 JSONL feedback 和唯一 terminal result，均包含 task ID
+与 canonical payload hash。退出码和完整命令见
+[`src/robot_skill_cli/README.md`](../src/robot_skill_cli/README.md)。
+
+`robot_mcp` 兼容层已移除，统一通过 `robot-skill` 访问 Capability Gateway。

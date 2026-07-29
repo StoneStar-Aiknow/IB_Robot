@@ -74,6 +74,13 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 | `moveit_display` | `false` | 是否启动 MoveIt RViz |
 | `with_embodied` | `true` | 是否启动具身运行时节点 |
 | `with_perception` | 空 | 覆盖 `robot.embodied.perception.enabled` |
+| `authorize_motion` | `false` | 操作员运动授权；唯一运行时授权来源 |
+
+`authorize_motion` 默认关闭，因此标准启动只提供可查询的 Gateway 状态，不允许技能下发运动。
+只有操作员在完成现场安全检查后，才可以在启动时显式开启该参数。Agent、CLI 和运行中的节点
+不得代替操作员执行授权启动，也不得通过 YAML 或动态参数开启授权。实际 `control_mode` launch
+override 会原样注入 Gateway；`skill_required_control_mode`、status service、机器人名称和 timeout
+策略继续来自 `robot_config` SSOT。
 
 ## Rule-entry alias 注入
 

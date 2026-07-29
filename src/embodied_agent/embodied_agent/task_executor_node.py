@@ -9,8 +9,11 @@ from rclpy.action import ActionClient
 
 from embodied_agent.base_node import BaseTaskNode
 from embodied_agent.task_context import ensure_timeout_context, remaining_task_budget_sec
+from embodied_common.skill_request import derive_skill_task_id
 from ibrobot_msgs.action import SkillCommand
 from ibrobot_msgs.msg import TaskCommand, TaskStatus
+
+__all__ = ["TaskExecutorNode", "derive_skill_task_id"]
 
 
 class TaskExecutorNode(BaseTaskNode):
@@ -102,6 +105,18 @@ class TaskExecutorNode(BaseTaskNode):
                 )
                 return
 
+            try:
+                derive_skill_task_id(msg.task_id, 0)
+            except (TypeError, ValueError):
+                self._publish_status(
+                    task_id=msg.task_id,
+                    state="failed",
+                    success=False,
+                    message="invalid task ID",
+                    error_code="INVALID_TASK_ID",
+                )
+                return
+
             initial_budget = self._remaining_budget_sec(plan_context)
             if initial_budget is not None and initial_budget <= 0.0:
                 self._publish_status(
@@ -128,7 +143,8 @@ class TaskExecutorNode(BaseTaskNode):
                 )
                 return
 
-            for skill_name in skill_sequence:
+            for skill_index, skill_name in enumerate(skill_sequence):
+                child_task_id = derive_skill_task_id(msg.task_id, skill_index)
                 remaining_budget = self._remaining_budget_sec(plan_context)
                 if remaining_budget is not None and remaining_budget <= 0.0:
                     self._publish_status(
@@ -154,11 +170,12 @@ class TaskExecutorNode(BaseTaskNode):
                 )
                 if self._debug:
                     self.get_logger().info(
-                        f"[embodied-debug] task_executor dispatch skill task_id={msg.task_id} skill={skill_name}"
+                        f"[embodied-debug] task_executor dispatch parent_task_id={msg.task_id} "
+                        f"child_task_id={child_task_id} skill={skill_name}"
                     )
 
                 goal = SkillCommand.Goal()
-                goal.task_id = msg.task_id
+                goal.task_id = child_task_id
                 goal.skill_name = skill_name
                 goal.target_name = msg.target_name
                 goal.place_name = msg.place_name

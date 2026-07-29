@@ -1,0 +1,16 @@
+string task_id
+string payload_hash
+---
+uint32 schema_version
+string robot_name
+bool motion_authorized
+string active_control_mode
+bool busy
+string active_task_id
+float32 default_skill_timeout_sec
+float32 task_budget_sec
+float32 rpc_timeout_sec
+string config_digest
+string request_state
+string request_error_code
+SkillCapabilityStatus[] capabilities

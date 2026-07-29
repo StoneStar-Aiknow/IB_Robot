@@ -468,107 +468,155 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 #### YAML 配置结构
 
 ```yaml
-embodied:
-  enabled: false              # 默认关闭；通过 embodied_bringup launch 临时开启
-  debug_tracing: true
+robot:
+  name: example_robot
+  # The selected Gateway mode must be a key in control_modes.
+  control_modes:
+    moveit_planning: {}
+  skill_required_control_mode: moveit_planning
 
-  timeouts:
-    task_budget_sec: 180.0         # 任务端到端总预算
-    scene_freshness_sec: 0.5       # 图像/深度新鲜度门槛
-    model_idle_timeout_sec: 120.0  # 大模型输出空闲超时
-    rpc_timeout_sec: 5.0           # action/server/service 统一 RPC 超时
-    gripper_settle_sec: 1.5        # 夹爪稳定等待时间
+  embodied:
+    enabled: false              # 默认关闭；通过 embodied_bringup launch 临时开启
+    debug_tracing: true
 
-  planner:
-    mode: vlm_api             # rule / vlm_api / hybrid
-    scene_sources:
-      primary_camera_topic: /camera/front_camera/color/image_raw
-      primary_camera_info_topic: /camera/front_camera/color/camera_info
-      primary_aligned_depth_topic: /camera/front_camera/aligned_depth_to_color/image_raw
-      primary_pointcloud_topic: /camera/front_camera/depth/color/points
-      ee_pose_topic: /robot_status/ee_pose
-      joint_state_topic: /joint_states
-      require_depth: true
-      require_pointcloud: false
-    vlm_api:
-      provider: openai_compatible
-      base_url: http://localhost:8000/v1
-      model: Qwen3.5-9B
-      api_key_env: ""
+    timeouts:
+      task_budget_sec: 180.0         # 任务端到端总预算
+      scene_freshness_sec: 0.5       # 图像/深度新鲜度门槛
+      model_idle_timeout_sec: 120.0  # 大模型输出空闲超时
+      rpc_timeout_sec: 5.0           # action/server/service 统一 RPC 超时
+      gripper_settle_sec: 1.5        # 夹爪稳定等待时间
 
-  entry:
-    visual_games:
-      sorting_hat:
-        enabled: false        # 趣味视觉游戏默认关闭
-        trigger_aliases: [分院帽, 奔月帽, 风月帽, 分月帽]
+    planner:
+      mode: vlm_api             # rule / vlm_api / hybrid
+      scene_sources:
+        primary_camera_topic: /camera/front_camera/color/image_raw
+        primary_camera_info_topic: /camera/front_camera/color/camera_info
+        primary_aligned_depth_topic: /camera/front_camera/aligned_depth_to_color/image_raw
+        primary_pointcloud_topic: /camera/front_camera/depth/color/points
+        ee_pose_topic: /robot_status/ee_pose
+        joint_state_topic: /joint_states
+        require_depth: true
+        require_pointcloud: false
+      vlm_api:
+        provider: openai_compatible
+        base_url: http://localhost:8000/v1
+        model: Qwen3.5-9B
+        api_key_env: ""
 
-  execution:
-    relative_motion_reference_frame: base
-    relative_motion_step_m: 0.03
-    relative_motion_direction_mapping:
-      forward:  [1, 0, 0]
-      backward: [-1, 0, 0]
-      left:     [0, 1, 0]
-      right:    [0, -1, 0]
-      up:       [0, 0, 1]
-      down:     [0, 0, -1]
+    entry:
+      visual_games:
+        sorting_hat:
+          enabled: false        # 趣味视觉游戏默认关闭
+          trigger_aliases: [分院帽, 奔月帽, 风月帽, 分月帽]
 
-  safety:
-    workspace:
-      x: [-0.05, 0.45]
-      y: [-0.35, 0.35]
-      z: [0.05, 0.55]
+    execution:
+      relative_motion_reference_frame: base
+      relative_motion_step_m: 0.03
+      relative_motion_direction_mapping:
+        forward:  [1, 0, 0]
+        backward: [-1, 0, 0]
+        left:     [0, 1, 0]
+        right:    [0, -1, 0]
+        up:       [0, 0, 1]
+        down:     [0, 0, -1]
 
-  named_poses:
-    home:           {position: {x: 0.15, y: 0.0, z: 0.30}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
-    observe_table:  {position: {x: 0.20, y: 0.0, z: 0.35}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+    safety:
+      workspace:
+        x: [-0.05, 0.45]
+        y: [-0.35, 0.35]
+        z: [0.05, 0.55]
 
-  skill_templates:
-    wave_hello:
-      description:
-        summary: "Wave hello or goodbye with the wrist."   # ≤120 字符
-        category: social_greeting                          # 任意非空字符串
-        when_to_use: ["greet someone", "say hi or bye"]    # 非空字符串列表
-        aliases_zh: ["打招呼", "挥手"]                      # MCP catalog 与规则入口共用的中文别名
-        aliases_en: ["hello", "wave"]
-        motion_scope: [wrist]                              # base|shoulder|elbow|wrist|gripper|arm
-        anchor_pose: home                                  # 必须在 named_poses 中已定义，或 "none"
-        intensity: moderate                                # subtle|moderate|large
-        duration_sec_estimate: 8.0                         # 含 1.0 秒初始夹爪归一化并留有余量
-        requires_motion_params: false                      # 布尔
-        rule_entry: true                                   # 是否把 aliases_zh 注入规则解析器
-      initial_gripper_state: closed
-      primitive_sequence:
-        - primitive_name: move_to_joint_positions
-          joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
-          duration_sec: 2.0
-        - primitive_name: move_through_joint_positions
-          trajectory_template:
-            type: single_joint_wave_v1
-            waypoint_duration_sec: 0.05
-            active_waypoint_count: 16
-            repeat_count: 3
-            base_pose: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
-            joint: "5"
-            amplitude: 0.35
-        - primitive_name: move_to_joint_positions
-          joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
-          duration_sec: 2.0
+    named_poses:
+      home:           {position: {x: 0.15, y: 0.0, z: 0.30}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+      observe_table:  {position: {x: 0.20, y: 0.0, z: 0.35}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
 
-  named_targets:
-    demo_object:
-      observe_pose:  {position: {x: 0.25, y: 0.0, z: 0.26}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
-      pregrasp_pose: {position: {x: 0.25, y: 0.0, z: 0.16}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
-      grasp_pose:    {position: {x: 0.25, y: 0.0, z: 0.10}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
-      lift_pose:     {position: {x: 0.25, y: 0.0, z: 0.25}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+    skill_templates:
+      wave_hello:
+        description:
+          summary: "Wave hello or goodbye with the wrist."   # ≤120 字符
+          category: social_greeting                            # 任意非空字符串
+          when_to_use: ["greet someone", "say hi or bye"]    # 非空字符串列表
+          aliases_zh: ["打招呼", "挥手"]                      # description / 规则解析器元数据，不属于公开 catalog
+          aliases_en: ["hello", "wave"]
+          motion_scope: [wrist]                                # base|shoulder|elbow|wrist|gripper|arm
+          anchor_pose: home                                    # 必须在 named_poses 中已定义，或 "none"
+          intensity: moderate                                  # subtle|moderate|large
+          duration_sec_estimate: 8.0                           # 含 1.0 秒初始夹爪归一化并留有余量
+          requires_motion_params: false                        # 布尔
+          rule_entry: true                                     # 是否把 aliases_zh 注入规则解析器
+        capability:
+          schema_version: 1
+          summary: "Wave hello or goodbye with the wrist."
+          domain: social_greeting
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        initial_gripper_state: closed
+        primitive_sequence:
+          - primitive_name: move_to_joint_positions
+            joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
+            duration_sec: 2.0
+          - primitive_name: move_through_joint_positions
+            trajectory_template:
+              type: single_joint_wave_v1
+              waypoint_duration_sec: 0.05
+              active_waypoint_count: 16
+              repeat_count: 3
+              base_pose: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
+              joint: "5"
+              amplitude: 0.35
+          - primitive_name: move_to_joint_positions
+            joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
+            duration_sec: 2.0
+
+    named_targets:
+      demo_object:
+        observe_pose:  {position: {x: 0.25, y: 0.0, z: 0.26}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+        pregrasp_pose: {position: {x: 0.25, y: 0.0, z: 0.16}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+        grasp_pose:    {position: {x: 0.25, y: 0.0, z: 0.10}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
+        lift_pose:     {position: {x: 0.25, y: 0.0, z: 0.25}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
 ```
+
+#### Capability Gateway 公开契约
+
+`robot.embodied.skill_templates.<skill>.capability` 是 Capability Gateway 的公开 SSOT；它不是从
+`description` 或 primitive sequence 派生。所有未禁用的模板都必须声明 `schema_version: 1` 以及
+`summary`、`domain`、`moves_robot`、`required_control_mode`、`parameters` 和 `recovery_policy`。
+
+| 字段 | 校验规则 |
+| --- | --- |
+| `summary` / `domain` | 非空字符串 |
+| `moves_robot` | 布尔值 |
+| `required_control_mode` | `teleop`、`model_inference` 或 `moveit_planning`，且必须等于机器人级 `skill_required_control_mode` |
+| `parameters` | 严格 object schema：`type: object`、`additionalProperties: false`；只允许 `target_name`、`place_name`、`motion_direction`、`motion_distance` 属性，`required` 必须唯一且引用已声明属性 |
+| `recovery_policy` | `never_retry`、`ask_user` 或 `recover_safe_pose` |
+
+字符串参数只能使用 `type` 与非空 `enum`；`motion_direction` 的 enum 只能包含六个方向
+`forward`、`backward`、`left`、`right`、`up`、`down`。`motion_distance` 必须是 `type: number`、
+`exclusiveMinimum: 0`，并以 `meters` 或 `degrees` 标明 `unit`。其他 schema key 或请求属性会在加载时被拒绝。
+
+`load_robot_config_dict()` 是 launch、CLI 和 catalog 共用的规范化加载入口；它会在返回配置前执行上述
+capability、模板和 Gateway 一致性校验。若 `embodied.skill_templates` 非空，
+`skill_required_control_mode` 必须是 `control_modes` 的非空成员；每个启用能力的
+`required_control_mode` 必须与它完全相等。
+
+共享配置解析的选择顺序为：显式 `config_path`、显式 `config_name`、`ROBOT_CONFIG`、`ROBOT_NAME`、
+默认 `so101_single_arm`。按名称查找时先查已安装 `robot_config` 的 `config/robots/`，再查源码树的
+`config/robots/`；显式路径必须存在。公开 catalog 仅输出 capability 字段、命名位姿名称、timeout policy
+和 digest。primitive sequence、关节/笛卡尔坐标、目标绑定、ROS service/action/topic 名称仍是私有实现数据。
 
 #### skill_templates 与 description 契约
 
 `embodied.skill_templates` 是技能执行的单一事实来源。每个 skill 模板可挂一个
-结构化 `description` 块，作为 MCP catalog 可发现性与中文别名的唯一来源。
-`aliases_zh` 始终用于 catalog 文档；仅当 `rule_entry: true` 且
-`requires_motion_params: false` 时，launch 才会把这些别名注入规则解析器。
+结构化 `description` 块，用于人类可读的发现信息与中文别名；公开 catalog 的字段以相邻的
+`capability` 块为准，且不包含 `description` 或其中的 aliases。
+`aliases_zh` 是 description 与规则解析器元数据，不会出现在 `robot-skill` 或其他公开 capability catalog 中。
+仅当 `rule_entry: true` 且 `requires_motion_params: false` 时，launch 才会把这些别名注入规则解析器。
 `robot_config.loader._validate_skill_description` 在加载时强校验字段类型与受控词表。
 
 受控词表：
@@ -577,7 +625,7 @@ embodied:
 - `anchor_pose`：必须引用 `named_poses` 中已定义的位姿，或填 `"none"`
 - `rule_entry`：可选布尔值；设为 `true` 时允许无动态运动参数的技能进入确定性规则入口
 - `disabled`：可选布尔值；设为 `true` 时从 planner allowlist、规则入口、resolver、safety guard
-  和 MCP catalog/validate/execute 的启用技能集合中统一排除
+  和 `robot-skill` catalog/validate/execute 的启用技能集合中统一排除
 - `duration_sec_estimate`：必须为正数，并覆盖确定性手臂 motion/wait 总时长、`open`/`closed`
   初始夹爪归一化的 1.0 秒，以及每个显式 `open_gripper`/`close_gripper` primitive 的 1.0 秒，且保留执行余量
 
