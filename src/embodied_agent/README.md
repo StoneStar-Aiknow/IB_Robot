@@ -48,7 +48,8 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
   robot_config:=so101_single_arm \
   control_mode:=moveit_planning \
   use_sim:=true \
-  moveit_display:=false
+  moveit_display:=false \
+  authorize_motion:=false
 ```
 
 `embodied_bringup` 会读取同一份 `robot_config` YAML，并临时覆盖：
@@ -56,6 +57,10 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 - `robot.embodied.enabled=true`
 
 默认 YAML 中该能力仍是关闭的。
+
+`authorize_motion` 默认关闭，因此上述命令只会启动可查询、默认拒绝运动的 Gateway。只有操作员完成
+现场安全检查后，才能通过重启 launch 并显式设为 `true` 来授权运动；Agent、CLI 和运行中的节点不得代替
+操作员开启授权。
 
 ## 3. task_entry_node
 
@@ -175,6 +180,21 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 3. 按阶段发布 `TaskStatus`。
 4. 在超时、拒绝、服务缺失时明确失败并带错误码退出。
 5. 超时后会向下游 skill action 发送 cancel，而不是只在上层报错。
+
+### 父任务与子技能 ID
+
+`TaskCommand.task_id` 是父任务 ID。执行器发布的所有 `TaskStatus` 和任务级状态都保留这个
+父 ID；每个 `/embodied/execute_skill` action 则使用由其计划位置确定的子 ID：
+
+```text
+父任务 task-1，skill_sequence=[open_gripper_skill, close_gripper_skill]
+  -> open_gripper_skill: task-1/skill/0001
+  -> close_gripper_skill: task-1/skill/0002
+```
+
+子 ID 不包含 skill 名称。同一父任务和计划位置会稳定地产生相同 ID；若计划位置变化导致同一
+ID 的 payload 不同，下游的 payload conflict 是预期行为。取消和超时仍针对当前子 action，
+不会改变父任务预算或父任务状态的 ID。
 
 ### 当前接口
 

@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+import yaml
 
 from robot_config.config import (
     CameraConfig,
@@ -11,6 +12,7 @@ from robot_config.config import (
     PeripheralConfig,
     RobotConfig,
     Ros2ControlConfig,
+    SkillGatewayRuntimeConfig,
     VoiceASRConfig,
 )
 from robot_config.contract_utils import contract_fingerprint, iter_specs
@@ -27,6 +29,7 @@ from robot_config.loader import (
     load_voice_asr_config,
     validate_config,
 )
+from robot_config.timeout_policy import DEFAULT_EMBODIED_TIMEOUT_POLICY, resolve_embodied_timeout_policy
 from robot_config.utils import resolve_lerobot_norm_mode
 from voice_asr_service.defaults import VOICE_ASR_DEFAULTS
 from voice_asr_service.model_manager import (
@@ -35,10 +38,500 @@ from voice_asr_service.model_manager import (
     resolve_model_assets,
 )
 
+HUMBLE_FLOAT32_MAX = 3.402823466e38
+IEEE_FLOAT32_MAX = 3.4028234663852886e38
+HUMBLE_FLOAT32_OVERFLOW = 3.4028234661e38
+
+
+def _valid_capability_parameters(properties=None, required=None):
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {} if properties is None else properties,
+        "required": [] if required is None else required,
+    }
+
+
+def _valid_skill_capability(parameters=None, required_control_mode="moveit_planning"):
+    return {
+        "schema_version": 1,
+        "summary": "Open the gripper.",
+        "domain": "manipulation",
+        "moves_robot": True,
+        "required_control_mode": required_control_mode,
+        "parameters": _valid_capability_parameters() if parameters is None else parameters,
+        "recovery_policy": "never_retry",
+    }
+
+
+def _typed_config_with_skill_gateway_mode(required_control_mode):
+    return RobotConfig(
+        name="test_robot",
+        type="so101",
+        robot_type="so_101",
+        ros2_control=Ros2ControlConfig(
+            hardware_plugin="so101_hardware/SO101SystemHardware",
+            params={},
+        ),
+        contract=ContractExtensionConfig(observations=[], actions=[]),
+        embodied=EmbodiedConfig(
+            enabled=True,
+            default_place_name="home",
+            skill_templates={
+                "open_gripper": {
+                    "description": {
+                        "summary": "Open the gripper.",
+                        "category": "gripper",
+                        "when_to_use": ["release an object"],
+                    },
+                    "capability": _valid_skill_capability(required_control_mode="moveit_planning"),
+                    "primitive_sequence": [{"primitive_name": "open_gripper"}],
+                }
+            },
+            named_poses={"home": {}, "observe_table": {}, "zero": {}},
+        ),
+        skill_gateway=SkillGatewayRuntimeConfig(required_control_mode=required_control_mode),
+    )
+
+
+def _write_skill_capability_config(tmp_path, capability, *, global_control_mode="moveit_planning"):
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "robot": {
+                    "name": "skill_robot",
+                    "control_modes": {"moveit_planning": {}, "teleop": {}},
+                    "skill_required_control_mode": global_control_mode,
+                    "embodied": {
+                        "skill_templates": {
+                            "open_gripper": {
+                                "description": {
+                                    "summary": "Open the gripper.",
+                                    "category": "motion",
+                                    "when_to_use": ["release an object"],
+                                },
+                                "capability": capability,
+                                "primitive_sequence": [{"primitive_name": "open_gripper"}],
+                            }
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config_path
+
 
 def test_default_skill_timeout_is_thirty_seconds():
     assert EmbodiedConfig().skill_timeout_sec == 30.0
     assert load_embodied_config({}).skill_timeout_sec == 30.0
+
+
+def test_loader_requires_gateway_control_mode_for_non_empty_skill_templates(tmp_path):
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "robot": {
+                    "name": "skill_robot",
+                    "control_modes": {"moveit_planning": {}},
+                    "embodied": {
+                        "skill_templates": {
+                            "open_gripper": {
+                                "description": {
+                                    "summary": "Open the gripper.",
+                                    "category": "motion",
+                                    "when_to_use": ["release an object"],
+                                },
+                                "primitive_sequence": [{"primitive_name": "open_gripper"}],
+                            }
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="skill_required_control_mode"):
+        load_robot_config_dict(config_path)
+
+
+@pytest.mark.parametrize(
+    ("capability", "expected_error"),
+    [
+        (None, "embodied.skill_templates.open_gripper.capability is required"),
+        (
+            {
+                "schema_version": 2,
+                "summary": "Open the gripper.",
+                "domain": "manipulation",
+                "moves_robot": True,
+                "required_control_mode": "moveit_planning",
+                "parameters": {},
+                "recovery_policy": "never_retry",
+            },
+            "embodied.skill_templates.open_gripper.capability.schema_version must equal 1",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "domain": "manipulation",
+                "moves_robot": True,
+                "required_control_mode": "moveit_planning",
+                "parameters": {},
+                "recovery_policy": "never_retry",
+            },
+            "embodied.skill_templates.open_gripper.capability.summary is required",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "summary": "Open the gripper.",
+                "domain": "",
+                "moves_robot": True,
+                "required_control_mode": "moveit_planning",
+                "parameters": {},
+                "recovery_policy": "never_retry",
+            },
+            "embodied.skill_templates.open_gripper.capability.domain must be a non-empty string",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "summary": "Open the gripper.",
+                "domain": "manipulation",
+                "moves_robot": "true",
+                "required_control_mode": "moveit_planning",
+                "parameters": {},
+                "recovery_policy": "never_retry",
+            },
+            "embodied.skill_templates.open_gripper.capability.moves_robot must be a boolean",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "summary": "Open the gripper.",
+                "domain": "manipulation",
+                "moves_robot": True,
+                "required_control_mode": "unsupported",
+                "parameters": {},
+                "recovery_policy": "never_retry",
+            },
+            "embodied.skill_templates.open_gripper.capability.required_control_mode must be one of",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "summary": "Open the gripper.",
+                "domain": "manipulation",
+                "moves_robot": True,
+                "required_control_mode": "moveit_planning",
+                "parameters": [],
+                "recovery_policy": "never_retry",
+            },
+            "embodied.skill_templates.open_gripper.capability.parameters must be a mapping",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "summary": "Open the gripper.",
+                "domain": "manipulation",
+                "moves_robot": True,
+                "required_control_mode": "moveit_planning",
+                "parameters": {},
+                "recovery_policy": "retry_automatically",
+            },
+            "embodied.skill_templates.open_gripper.capability.recovery_policy must be one of",
+        ),
+        (
+            {
+                "schema_version": 1,
+                "summary": "Open the gripper.",
+                "domain": "manipulation",
+                "moves_robot": True,
+                "required_control_mode": "moveit_planning",
+                "parameters": {},
+                "recovery_policy": [],
+            },
+            "embodied.skill_templates.open_gripper.capability.recovery_policy must be a string",
+        ),
+    ],
+)
+def test_loader_validates_enabled_skill_capability_metadata(tmp_path, capability, expected_error):
+    template = {
+        "description": {
+            "summary": "Open the gripper.",
+            "category": "motion",
+            "when_to_use": ["release an object"],
+        },
+        "primitive_sequence": [{"primitive_name": "open_gripper"}],
+    }
+    if capability is not None:
+        template["capability"] = capability
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "robot": {
+                    "name": "skill_robot",
+                    "control_modes": {"moveit_planning": {}},
+                    "skill_required_control_mode": "moveit_planning",
+                    "embodied": {"skill_templates": {"open_gripper": template}},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        load_robot_config_dict(config_path)
+
+    assert expected_error in str(exc_info.value)
+
+
+def test_loader_allows_robot_without_embodied_skill_templates_to_omit_gateway_control_mode(tmp_path):
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(yaml.safe_dump({"robot": {"name": "plain_robot"}}), encoding="utf-8")
+
+    config = load_robot_config_dict(config_path)
+
+    assert config["name"] == "plain_robot"
+    assert "skill_required_control_mode" not in config
+
+
+@pytest.mark.parametrize(
+    ("parameters", "expected_error"),
+    [
+        (
+            {"type": "object", "additionalProperties": False, "required": []},
+            "embodied.skill_templates.open_gripper.capability.parameters.properties must be a mapping",
+        ),
+        (
+            _valid_capability_parameters() | {"properties": []},
+            "embodied.skill_templates.open_gripper.capability.parameters.properties must be a mapping",
+        ),
+        (
+            _valid_capability_parameters() | {"private": "value"},
+            "embodied.skill_templates.open_gripper.capability.parameters contains unsupported key 'private'",
+        ),
+        (
+            _valid_capability_parameters(properties={"private": {"type": "string"}}),
+            "embodied.skill_templates.open_gripper.capability.parameters.properties contains unsupported property 'private'",
+        ),
+        (
+            _valid_capability_parameters(properties={"target_name": "string"}),
+            "embodied.skill_templates.open_gripper.capability.parameters.properties.target_name must be a mapping",
+        ),
+        (
+            _valid_capability_parameters(required=["target_name"]),
+            "embodied.skill_templates.open_gripper.capability.parameters.required[0] must reference a property",
+        ),
+        (
+            _valid_capability_parameters(
+                properties={"target_name": {"type": "string"}}, required=["target_name", "target_name"]
+            ),
+            "embodied.skill_templates.open_gripper.capability.parameters.required entries must be unique",
+        ),
+        (
+            _valid_capability_parameters(properties={"target_name": {"type": "number"}}),
+            "embodied.skill_templates.open_gripper.capability.parameters.properties.target_name.type must be 'string'",
+        ),
+        (
+            _valid_capability_parameters(properties={"target_name": {"type": "string"}}),
+            "embodied.skill_templates.open_gripper.capability.parameters.properties.target_name.enum must be a non-empty list",
+        ),
+        (
+            _valid_capability_parameters(properties={"target_name": {"type": "string", "private": "value"}}),
+            "embodied.skill_templates.open_gripper.capability.parameters.properties.target_name contains unsupported key 'private'",
+        ),
+        (
+            _valid_capability_parameters(properties={"target_name": {"type": "string", "enum": []}}),
+            "embodied.skill_templates.open_gripper.capability.parameters.properties.target_name.enum must be a non-empty list",
+        ),
+        (
+            _valid_capability_parameters(properties={"motion_direction": {"type": "string", "enum": ["north"]}}),
+            "embodied.skill_templates.open_gripper.capability.parameters.properties.motion_direction.enum contains unsupported direction",
+        ),
+        (
+            _valid_capability_parameters(
+                properties={"motion_distance": {"type": "string", "exclusiveMinimum": 0, "unit": "meters"}}
+            ),
+            "embodied.skill_templates.open_gripper.capability.parameters.properties.motion_distance.type must be 'number'",
+        ),
+        (
+            _valid_capability_parameters(
+                properties={"motion_distance": {"type": "number", "exclusiveMinimum": -1, "unit": "meters"}}
+            ),
+            "embodied.skill_templates.open_gripper.capability.parameters.properties.motion_distance.exclusiveMinimum must equal 0",
+        ),
+        (
+            _valid_capability_parameters(
+                properties={"motion_distance": {"type": "number", "exclusiveMinimum": 0, "unit": "radians"}}
+            ),
+            "embodied.skill_templates.open_gripper.capability.parameters.properties.motion_distance.unit must be one of",
+        ),
+    ],
+)
+def test_loader_validates_capability_parameter_schema(tmp_path, parameters, expected_error):
+    config_path = _write_skill_capability_config(tmp_path, _valid_skill_capability(parameters))
+
+    with pytest.raises(ValueError) as exc_info:
+        load_robot_config_dict(config_path)
+
+    assert expected_error in str(exc_info.value)
+
+
+def test_loader_requires_capability_control_mode_to_match_gateway_mode(tmp_path):
+    config_path = _write_skill_capability_config(
+        tmp_path,
+        _valid_skill_capability(required_control_mode="teleop"),
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        load_robot_config_dict(config_path)
+
+    assert str(exc_info.value).endswith(
+        "embodied.skill_templates.open_gripper.capability.required_control_mode "
+        "must match skill_required_control_mode 'moveit_planning'"
+    )
+
+
+def test_skill_gateway_interfaces_are_registered_with_rosidl():
+    workspace_root = Path(__file__).parents[3]
+    message_path = workspace_root / "src" / "ibrobot_msgs" / "msg" / "SkillCapabilityStatus.msg"
+    service_path = workspace_root / "src" / "ibrobot_msgs" / "srv" / "GetSkillGatewayStatus.srv"
+    cmake_path = workspace_root / "src" / "ibrobot_msgs" / "CMakeLists.txt"
+
+    assert message_path.is_file()
+    assert service_path.is_file()
+    assert message_path.read_text(encoding="utf-8") == (
+        "string name\nbool ready\nstring reason\nstring required_control_mode\n"
+    )
+    assert service_path.read_text(encoding="utf-8") == (
+        "string task_id\n"
+        "string payload_hash\n"
+        "---\n"
+        "uint32 schema_version\n"
+        "string robot_name\n"
+        "bool motion_authorized\n"
+        "string active_control_mode\n"
+        "bool busy\n"
+        "string active_task_id\n"
+        "float32 default_skill_timeout_sec\n"
+        "float32 task_budget_sec\n"
+        "float32 rpc_timeout_sec\n"
+        "string config_digest\n"
+        "string request_state\n"
+        "string request_error_code\n"
+        "SkillCapabilityStatus[] capabilities\n"
+    )
+
+    cmake_contents = cmake_path.read_text(encoding="utf-8")
+    assert '"msg/SkillCapabilityStatus.msg"' in cmake_contents
+    assert '"srv/GetSkillGatewayStatus.srv"' in cmake_contents
+
+
+@pytest.mark.parametrize("invalid_value", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_timeout_policy_rejects_non_positive_and_non_finite_values(invalid_value):
+    timeout_names = (*DEFAULT_EMBODIED_TIMEOUT_POLICY, "default_skill_timeout_sec", "robot_state_freshness_sec")
+
+    for timeout_name in timeout_names:
+        with pytest.raises(ValueError, match=timeout_name):
+            resolve_embodied_timeout_policy({"timeouts": {timeout_name: invalid_value}})
+
+
+def test_timeout_policy_uses_legacy_execution_values_and_rejects_default_over_budget():
+    policy = resolve_embodied_timeout_policy(
+        {
+            "execution": {"skill_timeout_sec": 12.0, "primitive_wait_sec": 2.0},
+        }
+    )
+
+    assert policy["default_skill_timeout_sec"] == 12.0
+    assert policy["gripper_settle_sec"] == 2.0
+
+    with pytest.raises(ValueError, match="default_skill_timeout_sec.*task_budget_sec"):
+        resolve_embodied_timeout_policy(
+            {
+                "timeouts": {
+                    "default_skill_timeout_sec": 11.0,
+                    "task_budget_sec": 10.0,
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "timeout_name",
+    ["default_skill_timeout_sec", "task_budget_sec", "rpc_timeout_sec", "robot_state_freshness_sec"],
+)
+def test_timeout_policy_rejects_gateway_timeout_values_outside_float32_range(timeout_name):
+    timeouts = {timeout_name: 1e39}
+    if timeout_name == "default_skill_timeout_sec":
+        timeouts["task_budget_sec"] = HUMBLE_FLOAT32_MAX
+
+    with pytest.raises(ValueError, match=f"{timeout_name}.*float32"):
+        resolve_embodied_timeout_policy({"timeouts": timeouts})
+
+
+def test_timeout_policy_accepts_humble_float32_maximum_for_gateway_runtime_timeouts():
+    policy = resolve_embodied_timeout_policy(
+        {
+            "timeouts": {
+                "default_skill_timeout_sec": HUMBLE_FLOAT32_MAX,
+                "task_budget_sec": HUMBLE_FLOAT32_MAX,
+                "rpc_timeout_sec": HUMBLE_FLOAT32_MAX,
+                "robot_state_freshness_sec": HUMBLE_FLOAT32_MAX,
+            }
+        }
+    )
+
+    assert policy["default_skill_timeout_sec"] == HUMBLE_FLOAT32_MAX
+    assert policy["task_budget_sec"] == HUMBLE_FLOAT32_MAX
+    assert policy["rpc_timeout_sec"] == HUMBLE_FLOAT32_MAX
+    assert policy["robot_state_freshness_sec"] == HUMBLE_FLOAT32_MAX
+
+
+@pytest.mark.parametrize("timeout_name", ["default_skill_timeout_sec", "task_budget_sec", "rpc_timeout_sec"])
+def test_gateway_timeout_policy_boundary_matches_humble_response_setters(timeout_name):
+    from ibrobot_msgs.srv import GetSkillGatewayStatus
+
+    policy = resolve_embodied_timeout_policy(
+        {
+            "timeouts": {
+                "default_skill_timeout_sec": HUMBLE_FLOAT32_MAX,
+                "task_budget_sec": HUMBLE_FLOAT32_MAX,
+                "rpc_timeout_sec": HUMBLE_FLOAT32_MAX,
+            }
+        }
+    )
+    response = GetSkillGatewayStatus.Response()
+
+    for field_name in ("default_skill_timeout_sec", "task_budget_sec", "rpc_timeout_sec"):
+        setattr(response, field_name, policy[field_name])
+
+    with pytest.raises(AssertionError):
+        setattr(response, timeout_name, IEEE_FLOAT32_MAX)
+    with pytest.raises(ValueError, match=f"{timeout_name}.*float32"):
+        resolve_embodied_timeout_policy({"timeouts": {timeout_name: HUMBLE_FLOAT32_OVERFLOW}})
+
+
+def test_robot_state_freshness_defaults_independently_from_legacy_scene_freshness():
+    policy = resolve_embodied_timeout_policy(
+        {
+            "planner": {
+                "scene_sources": {
+                    "max_scene_age_sec": 10.0,
+                }
+            }
+        }
+    )
+
+    assert policy["scene_freshness_sec"] == 10.0
+    assert policy["robot_state_freshness_sec"] == 0.5
 
 
 def test_load_single_arm_config():
@@ -63,6 +556,14 @@ def test_load_single_arm_config():
     assert config.voice_asr.device_name == ""
     assert config.voice_asr.device_index == -1
     assert config.voice_asr.exit_on_init_failure is True
+    assert config.skill_gateway.status_service == "/embodied/get_skill_gateway_status"
+    assert config.skill_gateway.required_control_mode == "moveit_planning"
+    assert config.skill_gateway.default_skill_timeout_sec == 30.0
+    assert config.skill_gateway.robot_state_freshness_sec == 0.5
+    assert config.skill_gateway.task_budget_sec == 180.0
+    assert config.skill_gateway.rpc_timeout_sec == 5.0
+    assert config.embodied.timeouts["default_skill_timeout_sec"] == 30.0
+    assert config.embodied.timeouts["robot_state_freshness_sec"] == 0.5
 
     # Check cameras
     top_cam = config.get_camera("top")
@@ -806,6 +1307,15 @@ def test_validate_embodied_vlm_planner_mode():
 
 
 def test_validate_embodied_accepts_skill_declared_by_current_robot():
+    capability = {
+        "schema_version": 1,
+        "summary": "Move the robot for the requested skill.",
+        "domain": "manipulation",
+        "moves_robot": True,
+        "required_control_mode": "moveit_planning",
+        "parameters": _valid_capability_parameters(),
+        "recovery_policy": "never_retry",
+    }
     descriptions = {
         "inspect_scene": {
             "summary": "Inspect the configured scene.",
@@ -843,10 +1353,12 @@ def test_validate_embodied_accepts_skill_declared_by_current_robot():
             skill_templates={
                 "inspect_scene": {
                     "description": descriptions["inspect_scene"],
+                    "capability": capability,
                     "primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}],
                 },
                 "custom_signal": {
                     "description": descriptions["custom_signal"],
+                    "capability": capability,
                     "primitive_sequence": [{"primitive_name": "open_gripper"}],
                 },
             },
@@ -861,6 +1373,25 @@ def test_validate_embodied_accepts_skill_declared_by_current_robot():
     errors = validate_config(config)
 
     assert not any("custom_signal" in error for error in errors)
+
+
+def test_validate_typed_config_requires_capability_mode_to_match_gateway_mode():
+    config = _typed_config_with_skill_gateway_mode("teleop")
+
+    errors = validate_config(config)
+
+    assert any(
+        "embodied.skill_templates.open_gripper.capability.required_control_mode "
+        "must match skill_required_control_mode 'teleop'" in error
+        for error in errors
+    )
+
+
+@pytest.mark.parametrize("required_control_mode", ["", None, 1])
+def test_validate_typed_config_requires_gateway_mode_for_enabled_skills(required_control_mode):
+    errors = validate_config(_typed_config_with_skill_gateway_mode(required_control_mode))
+
+    assert "skill_required_control_mode is required when embodied.skill_templates is non-empty" in errors
 
 
 def test_validate_embodied_perception_conversation_history():

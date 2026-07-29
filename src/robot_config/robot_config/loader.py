@@ -22,18 +22,29 @@ from robot_config.config import (
     PeripheralConfig,
     RobotConfig,
     Ros2ControlConfig,
+    SkillGatewayRuntimeConfig,
     VoiceASRConfig,
 )
 from robot_config.grasp_execution_config import validate_grasp_execution_config
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
+from .config_path import resolve_robot_config_path
 from .utils import resolve_calibration_paths_from_config, resolve_ros_path
 
 logger = logging.getLogger(__name__)
 
-# Controlled vocabularies for the skill `description` contract exposed to MCP.
+# Controlled vocabularies for the skill `description` contract exposed to Agent callers.
 _VALID_MOTION_SCOPES = {"base", "shoulder", "elbow", "wrist", "gripper", "arm"}
 _VALID_INTENSITIES = {"subtle", "moderate", "large"}
+_SUPPORTED_CONTROL_MODES = {"teleop", "model_inference", "moveit_planning"}
+_VALID_RECOVERY_POLICIES = {"never_retry", "ask_user", "recover_safe_pose"}
+_PUBLIC_REQUEST_FIELDS = {"target_name", "place_name", "motion_direction", "motion_distance"}
+_STRING_REQUEST_FIELDS = {"target_name", "place_name", "motion_direction"}
+_VALID_MOTION_DIRECTIONS = {"forward", "backward", "left", "right", "up", "down"}
+_PARAMETER_SCHEMA_FIELDS = {"type", "additionalProperties", "properties", "required"}
+_STRING_PARAMETER_FIELDS = {"type", "enum", "freeform"}
+_DISTANCE_PARAMETER_FIELDS = {"type", "exclusiveMinimum", "unit"}
+_VALID_DISTANCE_UNITS = {"meters", "degrees"}
 
 
 def _is_finite_number(value: Any) -> bool:
@@ -52,10 +63,10 @@ def _validate_skill_description(
     named_poses: dict[str, Any],
     errors: list[str],
 ) -> None:
-    """Validate the MCP-facing ``description`` contract of a skill template.
+    """Validate the agent-facing ``description`` contract of a skill template.
 
     The description is the single source of truth for how an agent (rule parser
-    or MCP/Hermes) picks this skill over its near-synonyms, so structural fields
+    or Hermes/CLI) picks this skill over its near-synonyms, so structural fields
     are enforced here rather than at call time.
     """
     prefix = f"embodied.skill_templates.{skill_name}.description"
@@ -145,6 +156,161 @@ def _validate_skill_description(
             errors.append(f"{entry_prefix}.instead_use references unknown skill '{instead_use.strip()}'")
         elif instead_use.strip() == skill_name:
             errors.append(f"{entry_prefix}.instead_use must not reference the same skill")
+
+
+def _validate_parameter_enum(value: Any, prefix: str, errors: list[str]) -> list[str] | None:
+    if not isinstance(value, list) or not value:
+        errors.append(f"{prefix} must be a non-empty list of non-empty strings")
+        return None
+    if not all(isinstance(item, str) and item.strip() for item in value):
+        errors.append(f"{prefix} must be a non-empty list of non-empty strings")
+        return None
+    return value
+
+
+def _validate_capability_parameter_property(
+    property_name: str,
+    definition: Any,
+    prefix: str,
+    errors: list[str],
+) -> None:
+    if not isinstance(definition, dict):
+        errors.append(f"{prefix} must be a mapping")
+        return
+
+    allowed_fields = _STRING_PARAMETER_FIELDS if property_name in _STRING_REQUEST_FIELDS else _DISTANCE_PARAMETER_FIELDS
+    for key in definition:
+        if key not in allowed_fields:
+            errors.append(f"{prefix} contains unsupported key '{key}'")
+
+    expected_type = "string" if property_name in _STRING_REQUEST_FIELDS else "number"
+    if definition.get("type") != expected_type:
+        errors.append(f"{prefix}.type must be '{expected_type}'")
+
+    if property_name in _STRING_REQUEST_FIELDS:
+        if property_name == "target_name" and definition.get("freeform") is True:
+            return
+        enum = _validate_parameter_enum(definition.get("enum"), f"{prefix}.enum", errors)
+        if property_name == "motion_direction" and enum is not None:
+            unknown_directions = sorted(set(enum) - _VALID_MOTION_DIRECTIONS)
+            if unknown_directions:
+                errors.append(f"{prefix}.enum contains unsupported direction(s): {', '.join(unknown_directions)}")
+        return
+
+    if property_name == "motion_distance":
+        exclusive_minimum = definition.get("exclusiveMinimum")
+        if not _is_finite_number(exclusive_minimum) or float(exclusive_minimum) != 0.0:
+            errors.append(f"{prefix}.exclusiveMinimum must equal 0")
+        unit = definition.get("unit")
+        if not isinstance(unit, str) or unit not in _VALID_DISTANCE_UNITS:
+            errors.append(f"{prefix}.unit must be one of {sorted(_VALID_DISTANCE_UNITS)}")
+
+
+def _validate_capability_parameters(parameters: dict[str, Any], prefix: str, errors: list[str]) -> None:
+    parameter_prefix = f"{prefix}.parameters"
+    for key in parameters:
+        if key not in _PARAMETER_SCHEMA_FIELDS:
+            errors.append(f"{parameter_prefix} contains unsupported key '{key}'")
+
+    if parameters.get("type") != "object":
+        errors.append(f"{parameter_prefix}.type must be 'object'")
+    if parameters.get("additionalProperties") is not False:
+        errors.append(f"{parameter_prefix}.additionalProperties must be false")
+
+    properties = parameters.get("properties")
+    if not isinstance(properties, dict):
+        errors.append(f"{parameter_prefix}.properties must be a mapping")
+        properties = None
+    else:
+        for property_name, definition in properties.items():
+            if not isinstance(property_name, str) or property_name not in _PUBLIC_REQUEST_FIELDS:
+                errors.append(f"{parameter_prefix}.properties contains unsupported property '{property_name}'")
+                continue
+            _validate_capability_parameter_property(
+                property_name,
+                definition,
+                f"{parameter_prefix}.properties.{property_name}",
+                errors,
+            )
+
+    required = parameters.get("required")
+    if not isinstance(required, list):
+        errors.append(f"{parameter_prefix}.required must be a list")
+        return
+
+    required_names: set[str] = set()
+    for index, property_name in enumerate(required):
+        required_prefix = f"{parameter_prefix}.required[{index}]"
+        if not isinstance(property_name, str) or not property_name.strip():
+            errors.append(f"{required_prefix} must be a non-empty string")
+            continue
+        if property_name in required_names:
+            errors.append(f"{parameter_prefix}.required entries must be unique")
+            continue
+        required_names.add(property_name)
+        if properties is not None and property_name not in properties:
+            errors.append(f"{required_prefix} must reference a property")
+
+
+def _validate_skill_capability(
+    skill_name: str,
+    capability: Any,
+    gateway_control_mode: str | None,
+    errors: list[str],
+) -> None:
+    """Validate the public, ROS-independent capability metadata for one skill."""
+    prefix = f"embodied.skill_templates.{skill_name}.capability"
+    if capability is None:
+        errors.append(f"{prefix} is required")
+        return
+    if not isinstance(capability, dict):
+        errors.append(f"{prefix} must be a mapping")
+        return
+
+    schema_version = capability.get("schema_version")
+    if schema_version is None:
+        errors.append(f"{prefix}.schema_version is required")
+    elif isinstance(schema_version, bool) or not isinstance(schema_version, int) or schema_version != 1:
+        errors.append(f"{prefix}.schema_version must equal 1")
+
+    for field in ("summary", "domain"):
+        value = capability.get(field)
+        if value is None:
+            errors.append(f"{prefix}.{field} is required")
+        elif not isinstance(value, str) or not value.strip():
+            errors.append(f"{prefix}.{field} must be a non-empty string")
+
+    moves_robot = capability.get("moves_robot")
+    if moves_robot is None:
+        errors.append(f"{prefix}.moves_robot is required")
+    elif not isinstance(moves_robot, bool):
+        errors.append(f"{prefix}.moves_robot must be a boolean")
+
+    required_control_mode = capability.get("required_control_mode")
+    if required_control_mode is None:
+        errors.append(f"{prefix}.required_control_mode is required")
+    elif not isinstance(required_control_mode, str) or not required_control_mode.strip():
+        errors.append(f"{prefix}.required_control_mode must be a non-empty string")
+    elif required_control_mode not in _SUPPORTED_CONTROL_MODES:
+        errors.append(f"{prefix}.required_control_mode must be one of {sorted(_SUPPORTED_CONTROL_MODES)}")
+    elif gateway_control_mode is not None and required_control_mode != gateway_control_mode:
+        errors.append(f"{prefix}.required_control_mode must match skill_required_control_mode '{gateway_control_mode}'")
+
+    parameters = capability.get("parameters")
+    if parameters is None:
+        errors.append(f"{prefix}.parameters is required")
+    elif not isinstance(parameters, dict):
+        errors.append(f"{prefix}.parameters must be a mapping")
+    else:
+        _validate_capability_parameters(parameters, prefix, errors)
+
+    recovery_policy = capability.get("recovery_policy")
+    if recovery_policy is None:
+        errors.append(f"{prefix}.recovery_policy is required")
+    elif not isinstance(recovery_policy, str):
+        errors.append(f"{prefix}.recovery_policy must be a string")
+    elif recovery_policy not in _VALID_RECOVERY_POLICIES:
+        errors.append(f"{prefix}.recovery_policy must be one of {sorted(_VALID_RECOVERY_POLICIES)}")
 
 
 def _load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
@@ -381,6 +547,9 @@ def _validate_embodied_skill_contract(robot_config: dict[str, Any]) -> list[str]
     named_poses = embodied.get("named_poses", {})
     if not isinstance(named_poses, dict):
         named_poses = {}
+    gateway_control_mode = robot_config.get("skill_required_control_mode")
+    if not isinstance(gateway_control_mode, str) or not gateway_control_mode.strip():
+        gateway_control_mode = None
     for skill_name, template in skill_templates.items():
         if not isinstance(template, dict):
             errors.append(f"embodied.skill_templates.{skill_name} must be a mapping")
@@ -388,6 +557,8 @@ def _validate_embodied_skill_contract(robot_config: dict[str, Any]) -> list[str]
         disabled = template.get("disabled")
         if disabled is not None and not isinstance(disabled, bool):
             errors.append(f"embodied.skill_templates.{skill_name}.disabled must be a boolean when present")
+        if disabled is not True:
+            _validate_skill_capability(skill_name, template.get("capability"), gateway_control_mode, errors)
         _validate_skill_description(skill_name, template.get("description"), valid_skills, named_poses, errors)
         _validate_skill_primitive_sequence(skill_name, template, named_poses, errors)
 
@@ -405,18 +576,47 @@ def _validate_embodied_skill_contract(robot_config: dict[str, Any]) -> list[str]
     return errors
 
 
-def load_robot_config_dict(config_path: str | Path) -> dict[str, Any]:
+def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the Gateway fields that cross robot and embodied configuration."""
+    errors: list[str] = []
+    required_control_mode = robot_config.get("skill_required_control_mode")
+    embodied = robot_config.get("embodied", {})
+    skill_templates = embodied.get("skill_templates", {}) if isinstance(embodied, dict) else {}
+    gateway_enabled = isinstance(skill_templates, dict) and bool(skill_templates)
+    if gateway_enabled and (not isinstance(required_control_mode, str) or not required_control_mode.strip()):
+        errors.append("skill_required_control_mode is required when embodied.skill_templates is non-empty")
+    elif required_control_mode is not None:
+        if not isinstance(required_control_mode, str) or not required_control_mode.strip():
+            errors.append("skill_required_control_mode must be a non-empty control_modes member")
+        else:
+            control_modes = robot_config.get("control_modes")
+            if not isinstance(control_modes, dict) or required_control_mode not in control_modes:
+                errors.append("skill_required_control_mode must be a control_modes member")
+
+    if isinstance(embodied, dict):
+        status_service = embodied.get("skill_gateway_status_service")
+        if status_service is not None and (not isinstance(status_service, str) or not status_service.strip()):
+            errors.append("embodied.skill_gateway_status_service must be a non-empty string")
+        try:
+            resolve_embodied_timeout_policy(embodied)
+        except ValueError as exc:
+            errors.append(str(exc))
+    return errors
+
+
+def load_robot_config_dict(config_path: str | Path | None = None) -> dict[str, Any]:
     """Load robot configuration as a complete dict.
 
     This is the canonical loader for launch/builders/runtime consumers. It preserves
     the full YAML schema under ``robot`` and annotates the resolved source path for
     downstream users that need provenance.
     """
-    resolved_config_path, robot_data = _load_robot_section(config_path)
+    resolved_config_path, robot_data = _load_robot_section(resolve_robot_config_path(config_path=config_path))
     robot_config = copy.deepcopy(robot_data)
     robot_config = _normalize_embodied_config(robot_config)
     validation_errors = validate_grasp_execution_config(robot_config.get("grasp_execution"))
     validation_errors.extend(_validate_embodied_skill_contract(robot_config))
+    validation_errors.extend(_validate_skill_gateway_config(robot_config))
     if validation_errors:
         raise ValueError("Invalid robot configuration:\n- " + "\n- ".join(validation_errors))
     robot_config["_config_path"] = str(resolved_config_path)
@@ -596,6 +796,7 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         primitive_action_name=data.get("primitive_action_name", "/embodied/execute_primitive"),
         validate_skill_service=data.get("validate_skill_service", "/embodied/validate_skill"),
         validate_primitive_service=data.get("validate_primitive_service", "/embodied/validate_primitive"),
+        skill_gateway_status_service=data.get("skill_gateway_status_service", "/embodied/get_skill_gateway_status"),
         default_target_name=data.get("default_target_name", "demo_object"),
         default_place_name=data.get("default_place_name", "tray_right"),
         skill_timeout_sec=execution.get("skill_timeout_sec", 30.0),
@@ -617,7 +818,7 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
     )
 
 
-def load_robot_config(config_path: str | Path) -> RobotConfig:
+def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
     """Load robot configuration from YAML file.
 
     Args:
@@ -667,6 +868,17 @@ def load_robot_config(config_path: str | Path) -> RobotConfig:
 
     voice_asr = load_voice_asr_config(robot_data.get("voice_asr", {}))
     embodied = load_embodied_config(robot_data.get("embodied", {}))
+    skill_gateway = SkillGatewayRuntimeConfig(
+        status_service=embodied.skill_gateway_status_service,
+        required_control_mode=robot_data.get("skill_required_control_mode", ""),
+        control_modes=tuple(robot_data.get("control_modes", {}).keys())
+        if isinstance(robot_data.get("control_modes"), dict)
+        else (),
+        default_skill_timeout_sec=embodied.timeouts["default_skill_timeout_sec"],
+        robot_state_freshness_sec=embodied.timeouts["robot_state_freshness_sec"],
+        task_budget_sec=embodied.timeouts["task_budget_sec"],
+        rpc_timeout_sec=embodied.timeouts["rpc_timeout_sec"],
+    )
 
     return RobotConfig(
         name=name,
@@ -677,6 +889,7 @@ def load_robot_config(config_path: str | Path) -> RobotConfig:
         contract=contract,
         voice_asr=voice_asr,
         embodied=embodied,
+        skill_gateway=skill_gateway,
     )
 
 
@@ -871,7 +1084,19 @@ def validate_config(config: RobotConfig) -> list[str]:
                     "planner": config.embodied.planner,
                 }
             }
+            if normalized_skill_templates:
+                typed_robot_config["skill_required_control_mode"] = config.skill_gateway.required_control_mode
+                # Use the YAML-declared control_modes keys retained on SkillGatewayRuntimeConfig
+                # so _validate_skill_gateway_config can fully SSOT-check required_control_mode
+                # membership. Fall back to the supported-mode set only when the typed config
+                # was constructed without control_modes (e.g. unit-test fixtures).
+                if config.skill_gateway.control_modes:
+                    typed_robot_config["control_modes"] = {mode: {} for mode in config.skill_gateway.control_modes}
+                else:
+                    typed_robot_config["control_modes"] = {mode: {} for mode in _SUPPORTED_CONTROL_MODES}
             errors.extend(_validate_embodied_skill_contract(typed_robot_config))
+            if normalized_skill_templates:
+                errors.extend(_validate_skill_gateway_config(typed_robot_config))
 
         for axis in ("x", "y", "z"):
             axis_limits = config.embodied.workspace.get(axis)
@@ -925,18 +1150,22 @@ def validate_config(config: RobotConfig) -> list[str]:
                     )
 
         planner = config.embodied.planner or {}
-        timeout_policy = config.embodied.timeouts or resolve_embodied_timeout_policy(
-            {
-                "execution": {
-                    "skill_timeout_sec": config.embodied.skill_timeout_sec,
-                    "primitive_timeout_sec": config.embodied.primitive_timeout_sec,
-                    "primitive_wait_sec": config.embodied.primitive_wait_sec,
-                },
-                "planner": planner,
-                "perception": config.embodied.perception or {},
-                "timeouts": {},
-            }
-        )
+        try:
+            timeout_policy = resolve_embodied_timeout_policy(
+                {
+                    "execution": {
+                        "skill_timeout_sec": config.embodied.skill_timeout_sec,
+                        "primitive_timeout_sec": config.embodied.primitive_timeout_sec,
+                        "primitive_wait_sec": config.embodied.primitive_wait_sec,
+                    },
+                    "planner": planner,
+                    "perception": config.embodied.perception or {},
+                    "timeouts": config.embodied.timeouts or {},
+                }
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
+            timeout_policy = {}
         planner_mode = str(planner.get("mode", "rule")).lower()
         valid_vlm_api_providers = {"kimicode", "openai_compatible"}
         if planner_mode not in valid_planner_modes:

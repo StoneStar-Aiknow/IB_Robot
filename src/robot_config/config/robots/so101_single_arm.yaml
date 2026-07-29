@@ -50,6 +50,7 @@ robot:
 
   # Control mode management
   default_control_mode: "model_inference"
+  skill_required_control_mode: "moveit_planning"
   controller_startup_timeout:
     sim: 120.0
     hardware: 30.0
@@ -152,10 +153,13 @@ robot:
     primitive_action_name: /embodied/execute_primitive
     validate_skill_service: /embodied/validate_skill
     validate_primitive_service: /embodied/validate_primitive
+    skill_gateway_status_service: /embodied/get_skill_gateway_status
     default_target_name: demo_object
     default_place_name: home
     timeouts:
       task_budget_sec: 180.0
+      default_skill_timeout_sec: 30.0
+      robot_state_freshness_sec: 0.5
       scene_freshness_sec: 0.5
       model_idle_timeout_sec: 120.0
       rpc_timeout_sec: 5.0
@@ -285,6 +289,18 @@ robot:
           intensity: subtle
           duration_sec_estimate: 2.0
           requires_motion_params: false
+        capability:
+          schema_version: 1
+          summary: "Inspect the workspace from the observation view."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
         primitive_sequence:
           - primitive_name: move_to_named_pose
             pose_name: observe_table
@@ -305,6 +321,18 @@ robot:
           intensity: moderate
           duration_sec_estimate: 3.0
           requires_motion_params: false
+        capability:
+          schema_version: 1
+          summary: "Return the arm to a safe resting pose."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
         primitive_sequence:
           - primitive_name: move_to_named_pose
             pose_name: home
@@ -323,6 +351,18 @@ robot:
           intensity: moderate
           duration_sec_estimate: 3.0
           requires_motion_params: false
+        capability:
+          schema_version: 1
+          summary: "Return the arm to its calibration pose."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
         primitive_sequence:
           - primitive_name: move_to_named_pose
             pose_name: zero
@@ -343,6 +383,25 @@ robot:
           intensity: subtle
           duration_sec_estimate: 1.5
           requires_motion_params: true
+        capability:
+          schema_version: 1
+          summary: "Move the end effector in a requested direction by a requested distance."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties:
+              motion_direction:
+                type: string
+                enum: [forward, backward, left, right, up, down]
+              motion_distance:
+                type: number
+                exclusiveMinimum: 0
+                unit: meters
+            required: [motion_direction, motion_distance]
+          recovery_policy: ask_user
         primitive_sequence:
           - primitive_name: move_relative_ee
             motion_direction_from_request: true
@@ -362,6 +421,18 @@ robot:
           intensity: subtle
           duration_sec_estimate: 1.0
           requires_motion_params: false
+        capability:
+          schema_version: 1
+          summary: "Open the gripper."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
         primitive_sequence:
           - primitive_name: open_gripper
       close_gripper_skill:
@@ -379,6 +450,18 @@ robot:
           intensity: subtle
           duration_sec_estimate: 1.0
           requires_motion_params: false
+        capability:
+          schema_version: 1
+          summary: "Close the gripper."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
         primitive_sequence:
           - primitive_name: close_gripper
       rotate_gripper_cw:
@@ -396,6 +479,22 @@ robot:
           intensity: subtle
           duration_sec_estimate: 1.5
           requires_motion_params: true
+        capability:
+          schema_version: 1
+          summary: "Rotate the gripper clockwise by a requested angle."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties:
+              motion_distance:
+                type: number
+                exclusiveMinimum: 0
+                unit: degrees
+            required: [motion_distance]
+          recovery_policy: ask_user
         primitive_sequence:
           - primitive_name: rotate_gripper_cw
             motion_distance_from_request: true
@@ -414,6 +513,22 @@ robot:
           intensity: subtle
           duration_sec_estimate: 1.5
           requires_motion_params: true
+        capability:
+          schema_version: 1
+          summary: "Rotate the gripper counter-clockwise by a requested angle."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties:
+              motion_distance:
+                type: number
+                exclusiveMinimum: 0
+                unit: degrees
+            required: [motion_distance]
+          recovery_policy: ask_user
         primitive_sequence:
           - primitive_name: rotate_gripper_ccw
             motion_distance_from_request: true
@@ -437,6 +552,18 @@ robot:
           duration_sec_estimate: 22.0
           requires_motion_params: false
           rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a rhythmic dance gesture."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
         initial_gripper_state: closed
         primitive_sequence:
           - primitive_name: move_to_joint_positions
@@ -525,6 +652,18 @@ robot:
           duration_sec_estimate: 8.0
           requires_motion_params: false
           rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a casual greeting wave."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
         initial_gripper_state: closed
         primitive_sequence:
           - primitive_name: move_to_joint_positions
@@ -580,6 +719,18 @@ robot:
           duration_sec_estimate: 7.0
           requires_motion_params: false
           rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a gesture indicating agreement."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
         initial_gripper_state: closed
         primitive_sequence:
           - primitive_name: move_to_joint_positions
@@ -645,6 +796,18 @@ robot:
           duration_sec_estimate: 8.0
           requires_motion_params: false
           rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a gesture indicating disagreement."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
         initial_gripper_state: closed
         primitive_sequence:
           - primitive_name: move_to_joint_positions
@@ -702,6 +865,18 @@ robot:
           duration_sec_estimate: 4.0
           requires_motion_params: false
           rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a celebratory gesture."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
         initial_gripper_state: closed
         primitive_sequence:
           - primitive_name: move_to_named_pose
@@ -744,6 +919,18 @@ robot:
           duration_sec_estimate: 4.0
           requires_motion_params: false
           rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a formal raised-hand greeting."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
         initial_gripper_state: closed
         primitive_sequence:
           - primitive_name: move_to_named_pose
@@ -780,6 +967,18 @@ robot:
           duration_sec_estimate: 13.0
           requires_motion_params: false
           rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a playful attention-seeking gesture."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
         initial_gripper_state: closed
         primitive_sequence:
           - primitive_name: move_to_named_pose
@@ -865,6 +1064,18 @@ robot:
           duration_sec_estimate: 12.0
           requires_motion_params: false
           rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform an upright celebratory spin gesture."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
         initial_gripper_state: closed
         primitive_sequence:
           - primitive_name: move_to_joint_positions

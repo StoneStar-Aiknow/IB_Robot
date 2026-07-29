@@ -85,6 +85,36 @@ robot:
           resize: [480, 640]
 ```
 
+## Capability Gateway Public Contract
+
+`robot.embodied.skill_templates.<skill>.capability` is the public Capability Gateway SSOT. It is explicit metadata,
+not a schema derived from `description` or a primitive sequence. Every enabled template must declare
+`schema_version: 1`, `summary`, `domain`, `moves_robot`, `required_control_mode`, `parameters`, and
+`recovery_policy`.
+
+| Field | Validation |
+| --- | --- |
+| `summary` / `domain` | Non-empty strings |
+| `moves_robot` | Boolean |
+| `required_control_mode` | `teleop`, `model_inference`, or `moveit_planning`, exactly equal to global `skill_required_control_mode` |
+| `parameters` | Strict object schema: `type: object`, `additionalProperties: false`; only `target_name`, `place_name`, `motion_direction`, and `motion_distance`; unique `required` entries that name declared properties |
+| `recovery_policy` | `never_retry`, `ask_user`, or `recover_safe_pose` |
+
+String parameter definitions permit only `type` and a non-empty `enum`; a `motion_direction` enum is limited to
+`forward`, `backward`, `left`, `right`, `up`, and `down`. `motion_distance` must be a `number` with
+`exclusiveMinimum: 0` and a `meters` or `degrees` `unit`. Any other schema key or public request property is rejected.
+
+`load_robot_config_dict()` is the canonical normalized loader used by launch, CLI, and catalog consumers. It validates
+the capability, template, and Gateway invariants before returning a config. When `embodied.skill_templates` is
+non-empty, `skill_required_control_mode` must be a non-empty member of `control_modes`, and every enabled capability
+must match it exactly.
+
+Shared config selection is ordered as explicit `config_path`, explicit `config_name`, `ROBOT_CONFIG`, `ROBOT_NAME`,
+then `so101_single_arm`. A name resolves first from the installed `robot_config/config/robots/` directory and then
+from the source `config/robots/` directory; an explicit path must exist. The public catalog exposes only capability
+fields, named-pose names, timeout policy, and a digest. Primitive sequences, joint/cartesian coordinates, target
+bindings, and ROS service/action/topic names remain private implementation data.
+
 ## Control Mode Configuration
 
 The robot_config package supports dual control modes for different AI model requirements:

@@ -90,7 +90,7 @@ def _expand_skill_templates(raw_templates: dict[str, Any]) -> dict[str, Any]:
 
 
 def get_skill_templates(raw_templates: dict[str, Any] | None) -> dict[str, Any]:
-    source = raw_templates if raw_templates else DEFAULT_SKILL_TEMPLATES
+    source = DEFAULT_SKILL_TEMPLATES if raw_templates is None else raw_templates
     enabled_templates = {
         skill_name: template for skill_name, template in source.items() if not is_skill_disabled(template)
     }

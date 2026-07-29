@@ -1,6 +1,12 @@
+import os
+from types import SimpleNamespace
+
 import pytest
+import rclpy
+from rclpy.parameter import Parameter
 
 from safety_guard.rules import validate_primitive_request, validate_skill_request
+from safety_guard.safety_guard_node import SafetyGuardNode
 
 SKILL_TEMPLATES = {
     "hover_named_target": {
@@ -29,6 +35,26 @@ SKILL_TEMPLATES = {
         ]
     },
 }
+
+
+def _assert_test_ros_environment() -> None:
+    expected_domain = os.environ.get("IBROBOT_TEST_ROS_DOMAIN_ID")
+    assert expected_domain is not None
+    assert expected_domain.isdigit()
+    assert 1 <= int(expected_domain) <= 232
+    assert os.environ.get("ROS_DOMAIN_ID") == expected_domain
+    assert os.environ.get("ROS_LOCALHOST_ONLY") == "1"
+
+
+@pytest.fixture(scope="module", autouse=True)
+def ros_context():
+    _assert_test_ros_environment()
+    rclpy.init()
+    try:
+        yield
+    finally:
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def test_validate_move_pose_inside_workspace():
@@ -114,6 +140,49 @@ def test_validate_skill_uses_default_templates_without_override():
     )
     assert allowed
     assert reason == ""
+
+
+def test_validate_skill_rejects_default_skill_with_explicitly_empty_templates():
+    allowed, reason = validate_skill_request(
+        "inspect_scene",
+        "",
+        "",
+        "",
+        0.0,
+        {"observe_table": {}},
+        {},
+        {},
+    )
+
+    assert allowed is False
+    assert "unsupported skill" in reason
+
+
+def test_safety_guard_node_distinguishes_omitted_and_explicitly_empty_skill_templates():
+    _assert_test_ros_environment()
+    shared_overrides = [Parameter("named_poses_json", value='{"observe_table": {}}')]
+    request = SimpleNamespace(
+        skill_name="inspect_scene",
+        target_name="",
+        place_name="",
+        motion_direction="",
+        motion_distance=0.0,
+    )
+
+    def validate_skill(parameter_overrides):
+        node = SafetyGuardNode(parameter_overrides=parameter_overrides)
+        try:
+            return node._handle_validate_skill(request, SimpleNamespace())
+        finally:
+            node.destroy_node()
+
+    default_response = validate_skill(shared_overrides)
+    explicit_empty_response = validate_skill([*shared_overrides, Parameter("skill_templates_json", value="{}")])
+
+    assert default_response.allowed is True
+    assert default_response.reason == ""
+    assert explicit_empty_response.allowed is False
+    assert "unsupported skill" in explicit_empty_response.reason
 
 
 def test_validate_skill_rejects_disabled_skill():

@@ -3,6 +3,7 @@
 import rclpy
 from rclpy.node import Node
 
+from embodied_common.skill_templates import get_skill_templates
 from ibrobot_msgs.srv import ValidatePrimitive, ValidateSkill
 from safety_guard.rules import (
     load_json_mapping,
@@ -20,7 +21,7 @@ class SafetyGuardNode(Node):
         self.declare_parameter("validate_primitive_service", "/embodied/validate_primitive")
         self.declare_parameter("named_poses_json", "{}")
         self.declare_parameter("named_targets_json", "{}")
-        self.declare_parameter("skill_templates_json", "{}")
+        self.declare_parameter("skill_templates_json", "")
         self.declare_parameter("workspace_json", "{}")
         self.declare_parameter("arm_joint_names_json", "[]")
         self.declare_parameter("joint_limits_json", "{}")
@@ -34,8 +35,9 @@ class SafetyGuardNode(Node):
         self._named_targets = load_json_mapping(
             self.get_parameter("named_targets_json").get_parameter_value().string_value
         )
-        self._skill_templates = load_json_mapping(
-            self.get_parameter("skill_templates_json").get_parameter_value().string_value
+        raw_skill_templates_json = self.get_parameter("skill_templates_json").get_parameter_value().string_value
+        self._skill_templates = get_skill_templates(
+            load_json_mapping(raw_skill_templates_json) if raw_skill_templates_json.strip() else None
         )
         self._workspace = load_json_mapping(self.get_parameter("workspace_json").get_parameter_value().string_value)
         arm_joint_names = load_json_mapping(

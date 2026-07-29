@@ -12,7 +12,12 @@ from robot_config.timeout_policy import resolve_embodied_timeout_policy
 logger = get_colored_logger("embodied_bringup")
 
 
-def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: str) -> list[Node]:
+def generate_embodied_nodes(
+    robot_config: dict[str, Any],
+    active_control_mode: str,
+    *,
+    motion_authorized: bool = False,
+) -> list[Node]:
     """Generate embodied minimum-closure nodes from robot_config YAML."""
     embodied_config = robot_config.get("embodied", {})
     if not embodied_config.get("enabled", False):
@@ -28,7 +33,8 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
     execution = embodied_config.get("execution", {})
     named_poses = embodied_config.get("named_poses", {})
     named_targets = embodied_config.get("named_targets", {})
-    skill_templates = embodied_config.get("skill_templates", {})
+    raw_skill_templates = embodied_config.get("skill_templates")
+    skill_templates = raw_skill_templates if isinstance(raw_skill_templates, dict) else {}
     safety = embodied_config.get("safety", {})
     joint_config = robot_config.get("joints", {})
     teleoperation = robot_config.get("teleoperation", {})
@@ -45,7 +51,7 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
     entry = embodied_config.get("entry", {})
     timeout_policy = resolve_embodied_timeout_policy(embodied_config)
     # Chinese trigger keywords come straight from the SSOT skill descriptions so
-    # the rule planner and the MCP catalog share one keyword source.
+    # the rule planner and the robot-skill catalog share one keyword source.
     skill_aliases_json = json.dumps(extract_skill_aliases(skill_templates))
     allowed_skills = planning_policy.get(
         "allowed_skills",
@@ -66,7 +72,7 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
         "debug_tracing": embodied_config.get("debug_tracing", True),
         "named_poses_json": json.dumps(named_poses),
         "named_targets_json": json.dumps(named_targets),
-        "skill_templates_json": json.dumps(skill_templates),
+        "skill_templates_json": json.dumps(raw_skill_templates) if raw_skill_templates is not None else "{}",
         "workspace_json": json.dumps(safety.get("workspace", {})),
         "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
         "joint_limits_json": json.dumps(teleoperation.get("safety", {}).get("joint_limits", {})),
@@ -77,6 +83,18 @@ def generate_embodied_nodes(robot_config: dict[str, Any], active_control_mode: s
         "validate_skill_service": embodied_config.get("validate_skill_service", "/embodied/validate_skill"),
         "validate_primitive_service": embodied_config.get("validate_primitive_service", "/embodied/validate_primitive"),
         "status_topic": embodied_config.get("status_topic", "/embodied/task_status"),
+        "motion_authorized": motion_authorized,
+        "active_control_mode": active_control_mode,
+        "skill_required_control_mode": robot_config.get("skill_required_control_mode", ""),
+        "skill_gateway_status_service": embodied_config.get(
+            "skill_gateway_status_service", "/embodied/get_skill_gateway_status"
+        ),
+        "robot_name": robot_config.get("name", "unknown"),
+        "default_skill_timeout_sec": timeout_policy["default_skill_timeout_sec"],
+        "task_budget_sec": timeout_policy["task_budget_sec"],
+        "robot_state_freshness_sec": timeout_policy["robot_state_freshness_sec"],
+        "scene_freshness_sec": timeout_policy["scene_freshness_sec"],
+        "model_idle_timeout_sec": timeout_policy["model_idle_timeout_sec"],
         "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
         "gripper_settle_sec": timeout_policy["gripper_settle_sec"],
         "relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),

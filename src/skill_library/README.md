@@ -44,7 +44,8 @@
 
 - `skill_templates_json` 非空时，使用当前机器人 YAML 注入并过滤 `disabled: true` 后的启用
   `embodied.skill_templates` 集合。
-- 未提供机器人模板时，回退到 `embodied_common.skill_templates.DEFAULT_SKILL_TEMPLATES`。
+- 未提供、仅空白或为 `{}` 时，模板集合和 Gateway capability catalog 都为空；不会回退到
+  `embodied_common.skill_templates.DEFAULT_SKILL_TEMPLATES`。
 
 两套模板不会自动合并。当前机器人的实际技能集合必须以
 `robot_config/config/robots/<robot>.yaml` 为准，不应在本 README 另建固定白名单。
@@ -343,17 +344,63 @@ ros2 action send_goal /embodied/execute_primitive ibrobot_msgs/action/PrimitiveC
 
 ## 8. 安全联动
 
-`skill_library` 不会绕过安全层。  
-每次执行前都会调用：
+`skill_library` 不会绕过安全层，但两个 action 入口的校验路径不同：
 
-- `/embodied/validate_skill`
-- `/embodied/validate_primitive`
+- 高层 `SkillCommand` 先经过 Gateway 准入，再调用 `/embodied/validate_skill` 校验整个 skill；在父 admission
+  有效时，解析出的每个内部 primitive 复用父 `SkillCommand` 的 borrowed lease，经
+  `/embodied/execute_primitive`，并在下游 dispatch 前各自调用 `/embodied/validate_primitive`。
+- 直接/外部 `PrimitiveCommand` 的 Gateway primitive 准入只检查运动授权、所需控制模式，以及 execution
+  lease/busy 状态。对相对移动和夹爪旋转，随后才取得并检查新鲜的 EE state；
+  `/embodied/validate_primitive` 再校验该 primitive 的最终 target/request。下游 action/server readiness 和
+  已捕获 EE pose 的最终新鲜度在各自实际 send 边界前检查，而不是在校验前使用单一、通用的 readiness gate。
+  直接/外部 primitive 不会额外调用 `/embodied/validate_skill`。
 
 如果任一步被拒绝：
 
 1. 当前 skill / primitive 立即停止
 2. 不向下发送动作
 3. 返回明确的 `error_code` 和 `message`
+
+在调用安全校验之前，Gateway 还要求启动时只读参数 `motion_authorized=true`，并要求实际
+`active_control_mode` 等于 SSOT 的 `skill_required_control_mode`。运动授权默认关闭，且只能由
+`embodied_pipeline.launch.py` 的操作员 launch argument 注入；机器人 YAML、Agent、CLI 和动态参数
+都不能开启或修改授权。未授权请求返回 `MOTION_NOT_AUTHORIZED`，控制模式不匹配返回
+`CONTROL_MODE_MISMATCH`，两种情况都不会向 primitive 层发送动作。
+
+### 8.1 Gateway 准入、readiness 与新鲜度
+
+Gateway 先规范化 task ID 与公开 skill payload，再按固定顺序评估：操作员授权、控制模式、现有 root
+执行 busy 状态、task budget 和该技能的 runtime readiness。只有通过这些检查后，才会在本 Gateway
+进程内原子地查询 ledger、取得 root execution lease，并创建 active ledger 记录；相同 task ID/hash 返回
+`DUPLICATE_TASK_ID`，同一 task ID 的不同 hash 返回 `TASK_ID_CONFLICT`。lease 只协调本进程内的
+root skill 或外部 primitive，不是 ROS graph 范围的锁。
+
+`SkillCommand` 被拒绝时保留 admission 的原始 `error_code` 和 `message`，不会改写成笼统的安全错误。
+典型返回为：`MOTION_NOT_AUTHORIZED: operator authorization is disabled`、
+`CONTROL_MODE_MISMATCH: requires <required>, active mode is <active>`、
+`SKILL_BUSY: another root execution is active`，以及 `CAPABILITY_NOT_READY` 加以下首个缺失原因：
+`validate skill service unavailable`、`task executor action unavailable`、
+`arm trajectory action unavailable`、`ee pose unavailable or stale`。
+
+末端位姿回调在状态锁内同时记录消息和 monotonic receipt 时间；相对移动与夹爪旋转会从同一锁内深拷贝
+一个原子 snapshot。若该 snapshot 在 primitive 安全校验前已经过期，会以
+`CAPABILITY_NOT_READY: ee pose unavailable or stale` 返回，既不调用 `ValidatePrimitive`，也不向下游
+发送动作。若它在校验或 task executor readiness 等待期间过期，发送前会再次检查，仍在下游 dispatch 前
+失败。Gateway 不会对此类失败或任何动作失败自动重试。
+
+### 8.2 UUID 维度
+
+Gateway 涉及两类 UUID，分工不同，不要混淆：
+
+- **task identifier（UUIDv5）**：`embodied_common.skill_request.skill_goal_uuid(task_id)` 派生
+  `ibrobot:{task_id}` 的 UUIDv5，用于 ledger key、payload hash 关联，以及 `cancel --task-id` 的
+  `CancelGoal.goal_id`。CLI 的 `execute` 与 `cancel` 共用同一 task ID 的 UUIDv5。
+- **internal primitive ROS action goal_id（UUIDv4）**：`skill_executor_node` 在派发内部 primitive 时
+  用 `uuid.uuid4()` 随机生成 ROS action `goal_id.uuid`，仅用于 rclpy 跟踪 `goal_handle`，不暴露给
+  Agent，也不参与 ledger 关联。随机 UUID 避免 goal ID 冲突，是 rclpy 的实现细节。
+
+因此 PR 自述的「确定性 goal UUID」专指 task identifier 维度；internal primitive 的 ROS action
+goal_id 不在此约定范围内。
 
 ## 9. 主要参数
 
@@ -363,13 +410,23 @@ ros2 action send_goal /embodied/execute_primitive ibrobot_msgs/action/PrimitiveC
 | `primitive_action_name` | `/embodied/execute_primitive` | primitive action 名 |
 | `validate_skill_service` | `/embodied/validate_skill` | 技能校验服务 |
 | `validate_primitive_service` | `/embodied/validate_primitive` | primitive 校验服务 |
+| `skill_gateway_status_service` | `/embodied/get_skill_gateway_status` | 启动时固定；Gateway 状态服务名 |
+| `robot_name` | `unknown` | 启动时固定；capability view 中的机器人名称 |
+| `motion_authorized` | `false` | 启动时固定；唯一运动授权值，默认拒绝运动 |
+| `active_control_mode` | 空字符串 | 启动时固定；launch override 生效后的实际控制模式 |
+| `skill_required_control_mode` | 空字符串 | 启动时固定；SSOT 要求的技能控制模式 |
 | `named_poses_json` | `{}` | 命名位姿字典 |
 | `named_targets_json` | `{}` | 命名目标字典 |
-| `skill_templates_json` | `{}` | 技能模板字典 |
+| `skill_templates_json` | 空字符串 | 省略、空字符串、仅空白字符或显式 `{}` 均表示空模板/能力目录；Gateway 不启用 legacy fallback 模板；非空 JSON 为显式 SSOT |
 | `relative_motion_reference_frame` | `base` | 相对运动参考系 |
 | `relative_motion_direction_mapping_json` | `{}` | 相对运动方向映射 |
-| `rpc_timeout_sec` | `5.0` | 等待校验服务 / primitive action 的统一 RPC 超时 |
-| `gripper_settle_sec` | `1.5` | 夹爪 goal 接受等待预算的组成部分 |
+| `rpc_timeout_sec` | `5.0` | 启动时固定；等待校验服务 / primitive action 的统一 RPC 超时，并参与 capability digest |
+| `gripper_settle_sec` | `1.5` | 启动时固定；夹爪 goal 接受等待预算的组成部分，并参与 capability digest |
+| `default_skill_timeout_sec` | `30.0` | 启动时固定；Gateway skill 默认超时，并参与 capability digest |
+| `task_budget_sec` | `180.0` | 启动时固定；Gateway task 预算，并参与 capability digest |
+| `robot_state_freshness_sec` | `0.5` | 启动时固定；机器人状态新鲜度阈值，并参与 capability digest |
+| `scene_freshness_sec` | `0.5` | 启动时固定；场景新鲜度阈值，并参与 capability digest |
+| `model_idle_timeout_sec` | `120.0` | 启动时固定；模型空闲超时，并参与 capability digest |
 | `gripper_open_position` | `1.0` | 张开值 |
 | `gripper_closed_position` | `0.0` | 闭合值 |
 | `arm_joint_names_json` | `[]` | 手臂关节名顺序 |
@@ -384,11 +441,21 @@ ros2 action send_goal /embodied/execute_primitive ibrobot_msgs/action/PrimitiveC
 
 ### 取消终态契约
 
-父 `SkillCommand` 请求取消后，执行器会取消其直接 child primitive，并等待 child result 到达终态后
-才报告 canceled。primitive 对 `ExecuteTaskPlan`、手臂轨迹和夹爪轨迹采用相同规则；即使 goal 在取消
-请求后才被接受，也会继续取消并 drain。若取消清理未在 `rpc_timeout_sec` 内到达终态，执行器会 abort
-并返回 `SKILL_CANCEL_CLEANUP_TIMEOUT` 或 `CANCEL_CLEANUP_TIMEOUT`，不会把 cancel acknowledgement
-误报为动作已停止。
+父 `SkillCommand` 请求取消后，执行器会取消其直接 child primitive，并分别在最多
+`rpc_timeout_sec` 内确认 child cancel response 和 child result 终态；即使 goal 在取消请求后才被接受，
+也会继续取消并 drain。
+
+- 仅当两项确认都完成时，SkillCommand 才返回 `SKILL_CANCELLED` 并进入 canceled 终态。
+- send goal/result 状态未知、cancel response 或 terminal 超时、以及下游 primitive 清理状态未知时，
+  SkillCommand 会 abort 并返回 `SKILL_CANCEL_TIMEOUT`。对应 Gateway ledger 终态和 audit terminal
+  `error_code` 也保持为 `SKILL_CANCEL_TIMEOUT`。
+- PrimitiveCommand 的底层清理信号仍可使用 `CANCEL_CLEANUP_TIMEOUT`，但不会作为 SkillCommand 的
+  公共错误码暴露。
+
+### SkillCommand feedback
+
+SkillCommand 每个 primitive 步骤都发布 `state="executing"`，并使用 `step <current> of <total>` 作为
+`detail`。反馈不包含 primitive 名称、pose、关节或夹爪目标；PrimitiveCommand 自己的内部 feedback 不受此限制。
 
 ## 10. 当前限制
 
