@@ -2,3 +2,8 @@ scipy
 sherpa-onnx==1.10.46
 sounddevice
 soundfile
+# inference_manifest.schema imports jsonschema.protocols, which only exists in
+# jsonschema 4.x. The venv enables include-system-site-packages and otherwise
+# falls through to the Ubuntu apt package python3-jsonschema 3.2.0, breaking
+# ros2 launch with ModuleNotFoundError: No module named 'jsonschema.protocols'.
+jsonschema>=4,<5
