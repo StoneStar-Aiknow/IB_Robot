@@ -1,0 +1,2683 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IB手机遥操</title>
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            background-color: #f0f0f0;
+            -webkit-text-size-adjust: 100%;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-touch-callout: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+        body {
+            font-family: Arial, sans-serif;
+            padding: 12px;
+            overflow-y: auto;
+            overscroll-behavior-y: contain;
+        }
+        * {
+            box-sizing: border-box;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-touch-callout: none;
+        }
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            background-color: white;
+            border-radius: 10px;
+            padding: 16px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            text-align: center;
+            color: #333;
+        }
+        .status {
+            text-align: center;
+            margin: 20px 0;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+        }
+        .status.disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+        }
+        .status.connecting {
+            background-color: #fff3cd;
+            color: #856404;
+        }
+        .controls {
+            display: flex;
+            justify-content: space-around;
+            align-items: stretch;
+            flex-wrap: wrap;
+            margin: 16px 0;
+            gap: 12px;
+        }
+        button {
+            padding: 15px 18px;
+            font-size: 16px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            background-color: #007bff;
+            color: white;
+            touch-action: manipulation;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-touch-callout: none;
+            -webkit-tap-highlight-color: transparent;
+            min-height: 56px;
+            flex: 1 1 220px;
+            transition: background-color 0.15s, transform 0.1s;
+        }
+        button:hover {
+            background-color: #0069d9;
+        }
+        button:active {
+            background-color: #0056b3;
+            transform: scale(0.95);
+        }
+        button.pressed-flash {
+            background-color: #004085 !important;
+            transform: scale(0.95);
+            transition: background-color 0.1s, transform 0.1s;
+        }
+        .instructions {
+            margin: 16px 0;
+            padding: 15px;
+            background-color: #e7f3ff;
+            border-radius: 5px;
+        }
+        .instructions h3 {
+            margin-top: 0;
+        }
+        .motion-area {
+            margin: 16px 0;
+            padding: 24px 16px;
+            border: 2px dashed #007bff;
+            border-radius: 10px;
+            background-color: #f7fbff;
+            text-align: center;
+            color: #0056b3;
+            font-weight: bold;
+            touch-action: none;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-touch-callout: none;
+        }
+        .motion-area.active {
+            background-color: #dbeeff;
+            border-color: #0056b3;
+        }
+        .tracking-required-hint {
+            display: none;
+            margin: -8px 0 16px 0;
+            padding: 10px 16px;
+            background-color: #fff3cd;
+            border: 1px solid #ffc107;
+            border-radius: 8px;
+            color: #856404;
+            text-align: center;
+            font-size: 14px;
+        }
+        .tracking-required-hint.visible {
+            display: block;
+        }
+        .control-mode-ui {
+            display: none;
+        }
+        body.tracking-active .control-mode-ui {
+            display: contents;
+        }
+        body.tracking-active .container {
+            background-color: rgba(0, 0, 0, 0.55);
+            color: #fff;
+            backdrop-filter: blur(4px);
+            -webkit-backdrop-filter: blur(4px);
+            display: flex;
+            flex-direction: column-reverse;
+        }
+        body.tracking-active .motion-area {
+            order: 2;
+            min-height: 135px;
+            font-size: 18px;
+            margin-top: 0;
+        }
+        body.tracking-active .controls {
+            order: 2;
+        }
+        body.tracking-active .scale-control {
+            order: 4;
+        }
+        body.tracking-active .tracking-required-hint {
+            order: 3;
+        }
+        body.tracking-active .debug-panel {
+            order: 6;
+        }
+        body.tracking-active .status {
+            order: 7;
+        }
+        body.tracking-active .container h1 {
+            order: 1;
+            margin: 6px 0 0;
+            padding: 0;
+            background-color: transparent;
+            border: none;
+            color: #fff;
+            font-size: 22px;
+            line-height: 1.2;
+            font-weight: 700;
+            text-shadow: 0 2px 8px rgba(0, 0, 0, 0.8), 0 0 1px rgba(0, 0, 0, 0.9);
+        }
+        body.tracking-active .container .platform-info,
+        body.tracking-active .container .platform-info span {
+            color: #ddd;
+        }
+        body.tracking-active .container .instructions {
+            background-color: rgba(255, 255, 255, 0.12);
+            color: #eee;
+        }
+        body.tracking-active .container .instructions h3 {
+            color: #fff;
+        }
+        body.tracking-active .container .scale-control {
+            background-color: rgba(255, 255, 255, 0.12);
+            border-color: rgba(255, 255, 255, 0.25);
+            color: #fff;
+        }
+        body.tracking-active .container .scale-control .scale-control-header {
+            color: #fff;
+        }
+        body.tracking-active .container .scale-control .scale-hint {
+            color: #ccc;
+        }
+        body.tracking-active .container .motion-area {
+            background-color: rgba(0, 123, 255, 0.45);
+            border-color: rgba(0, 123, 255, 0.7);
+            color: #fff;
+        }
+        body.tracking-active .container .motion-area.active {
+            background-color: rgba(0, 86, 179, 0.65);
+            border-color: rgba(0, 86, 179, 0.9);
+        }
+        body.tracking-active .container .tracking-required-hint {
+            background-color: rgba(255, 193, 7, 0.85);
+            border-color: rgba(255, 193, 7, 0.9);
+            color: #333;
+        }
+        body.tracking-active .container .status {
+            margin: 6px 0;
+            padding: 8px 12px;
+            border-radius: 8px;
+            background-color: rgba(212, 237, 218, 0.82);
+        }
+        body.tracking-active .container .status.disconnected {
+            background-color: rgba(248, 215, 218, 0.82);
+        }
+        body.tracking-active .container .status.connecting {
+            background-color: rgba(255, 243, 205, 0.84);
+        }
+        body.tracking-active .ar-guidance,
+        body.tracking-active .platform-info,
+        body.tracking-active .sensor-actions,
+        body.tracking-active .instructions,
+        body.tracking-active .camera-tracking {
+            display: none;
+        }
+        body.tracking-active .motion-area {
+            min-height: 135px;
+            font-size: 18px;
+            margin-top: 0;
+        }
+        .sensor-actions {
+            margin: 16px 0;
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .scale-control {
+            margin: 16px 0;
+            padding: 14px 16px;
+            background-color: #f7fbff;
+            border: 1px solid #cfe2ff;
+            border-radius: 10px;
+        }
+        .scale-control-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 10px;
+            color: #0b5394;
+            font-weight: bold;
+        }
+        .scale-control input[type="range"] {
+            width: 100%;
+        }
+        .scale-hint {
+            margin: 8px 0 0;
+            color: #555;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+        .gripper-controls {
+            margin: 14px 0 10px;
+            gap: 10px;
+        }
+        .gripper-controls button {
+            flex: 1 1 0;
+            touch-action: none;
+        }
+        .secondary-controls {
+            margin: 10px 0 16px;
+            gap: 8px;
+        }
+        .secondary-controls button {
+            min-height: 44px;
+            padding: 10px 12px;
+            font-size: 14px;
+            flex: 1 1 0;
+            background-color: #eef4fb;
+            color: #0b5394;
+            border: 1px solid #bad4ef;
+        }
+        .secondary-controls button:hover {
+            background-color: #dcecff;
+        }
+        .secondary-controls button:active {
+            background-color: #c8ddf5;
+        }
+        .debug-panel {
+            contain: layout;
+            position: relative;
+            z-index: 10;
+            margin: 10px 0;
+            padding: 10px 12px;
+            border-radius: 8px;
+            background: rgba(18, 24, 30, 0.78);
+            color: #d7f2ff;
+            font-size: 12px;
+            line-height: 1.4;
+            border: 1px solid rgba(160, 205, 230, 0.3);
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+        }
+        .debug-panel-title {
+            color: #fff;
+            font-weight: bold;
+            margin-bottom: 6px;
+        }
+        .debug-grid {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr);
+            gap: 7px;
+        }
+        .debug-item {
+            display: flex;
+            min-width: 0;
+            gap: 8px;
+            justify-content: space-between;
+            align-items: baseline;
+        }
+        .debug-item.full {
+            grid-column: auto;
+        }
+        .debug-label {
+            color: #9fc1d0;
+            white-space: nowrap;
+        }
+        .debug-value {
+            color: #66ccff;
+            font-family: 'Courier New', monospace;
+            min-width: 0;
+            overflow: visible;
+            text-overflow: clip;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            text-align: right;
+        }
+        .debug-value.quality {
+            color: #ffcc00;
+        }
+        body.tracking-active .gripper-controls {
+            order: 3;
+            margin: 8px 0 12px;
+        }
+        body.tracking-active .secondary-controls {
+            order: 5;
+            margin: 12px 0 8px;
+        }
+        body.tracking-active .secondary-controls button {
+            background-color: rgba(255, 255, 255, 0.16);
+            border-color: rgba(255, 255, 255, 0.24);
+            color: #fff;
+        }
+        body.tracking-active .debug-panel {
+            margin: 8px 0;
+            background: rgba(9, 14, 18, 0.72);
+            border-color: rgba(255, 255, 255, 0.18);
+        }
+        .sensor-actions button {
+            background-color: #28a745;
+            flex: 1 1 240px;
+        }
+        .sensor-actions button:disabled {
+            background-color: #9aa0a6;
+            cursor: not-allowed;
+        }
+        .status,
+        .instructions,
+        .motion-area,
+        .controls,
+        button,
+        h1,
+        p,
+        li,
+        span {
+            -webkit-touch-callout: none;
+        }
+        .camera-tracking {
+            margin: 16px 0;
+            padding: 14px 16px;
+            background-color: #fff8e1;
+            border: 1px solid #ffe082;
+            border-radius: 10px;
+        }
+        .camera-tracking-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 10px;
+            color: #e65100;
+            font-weight: bold;
+        }
+        .camera-tracking button {
+            background-color: #ff9800;
+            min-height: 44px;
+            flex: none;
+            padding: 10px 16px;
+            font-size: 14px;
+        }
+        .camera-tracking button:hover {
+            background-color: #f57c00;
+        }
+        .camera-tracking button:disabled,
+        .ar-guidance button:disabled {
+            background-color: #9aa0a6;
+            cursor: not-allowed;
+        }
+        .camera-tracking button.active-cam {
+            background-color: #e65100;
+        }
+        .optical-expectation {
+            margin: 6px 0 8px;
+            padding: 8px 10px;
+            border-left: 4px solid #f57c00;
+            border-radius: 6px;
+            background-color: #fff3e0;
+            color: #6d3a00;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        .optical-expectation strong {
+            color: #bf360c;
+        }
+        .optical-expectation p {
+            margin: 0;
+        }
+        .camera-preview-container {
+            position: relative;
+            margin-top: 10px;
+            border-radius: 8px;
+            overflow: hidden;
+            background-color: #000;
+            display: none;
+        }
+        .camera-preview-container.visible {
+            display: block;
+        }
+        .camera-preview-container video {
+            width: 100%;
+            display: block;
+        }
+        .camera-preview-container canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+        }
+        .tracking-status {
+            margin-top: 8px;
+            font-size: 13px;
+            color: #555;
+            height: 54px;
+            line-height: 18px;
+            overflow: hidden;
+            font-variant-numeric: tabular-nums;
+            contain: layout;
+        }
+        .tracking-status strong { display: inline-block; min-width: 2.5ch; text-align: right; }
+        .tracking-status .quality-good { color: #2e7d32; font-weight: bold; }
+        .tracking-status .quality-fair { color: #f57f17; font-weight: bold; }
+        .tracking-status .quality-poor { color: #c62828; font-weight: bold; }
+        .ar-guidance {
+            margin: 16px 0;
+            padding: 14px 16px;
+            background-color: #f3e5f5;
+            border: 1px solid #ce93d8;
+            border-radius: 10px;
+            display: none;
+        }
+        .ar-guidance.visible {
+            display: block;
+        }
+        .ar-guidance-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 10px;
+            color: #6a1b9a;
+            font-weight: bold;
+        }
+        .ar-guidance button {
+            background-color: #8e24aa;
+            min-height: 44px;
+            flex: none;
+            padding: 10px 16px;
+            font-size: 14px;
+        }
+        .ar-guidance button:hover {
+            background-color: #7b1fa2;
+        }
+        .ar-guidance button.active-ar {
+            background-color: #4a148c;
+        }
+        .ar-guidance .ar-hint {
+            margin-top: 6px;
+            font-size: 13px;
+            color: #555;
+        }
+        .ar-guidance .ar-hint a {
+            color: #8e24aa;
+        }
+        .capability-details {
+            margin-top: 8px;
+            padding-top: 6px;
+            border-top: 1px solid rgba(0, 0, 0, 0.1);
+            color: #555;
+            font-size: 12px;
+        }
+        .capability-details summary {
+            cursor: pointer;
+            font-weight: bold;
+        }
+        .capability-details summary.ok {
+            color: #2e7d32;
+        }
+        .capability-details summary.pending {
+            color: #856404;
+        }
+        .capability-details summary.fail {
+            color: #c62828;
+        }
+        .capability-note {
+            margin: 6px 0 0;
+            line-height: 1.4;
+        }
+        .capability-checks {
+            margin-top: 6px;
+            font-size: 12px;
+            line-height: 1.55;
+            color: #555;
+        }
+        .capability-row {
+            display: flex;
+            align-items: flex-start;
+            flex-wrap: wrap;
+            gap: 5px 8px;
+            margin-top: 4px;
+        }
+        .capability-row-label {
+            min-width: 42px;
+            font-weight: bold;
+            color: #333;
+        }
+        .capability-item {
+            white-space: nowrap;
+        }
+        .capability-item.ok {
+            color: #2e7d32;
+        }
+        .capability-item.pending {
+            color: #856404;
+        }
+        .capability-item.fail {
+            color: #c62828;
+            font-weight: bold;
+        }
+        .capability-item.optional.fail {
+            color: #856404;
+            font-weight: normal;
+        }
+        body.tracking-active .capability-checks {
+            display: none;
+        }
+        .operation-notice {
+            display: none;
+            margin: 8px 0;
+            padding: 8px 10px;
+            border-radius: 6px;
+            background-color: #d4edda;
+            color: #155724;
+            text-align: center;
+            font-size: 14px;
+            line-height: 1.35;
+        }
+        .operation-notice.visible {
+            display: block;
+        }
+        .operation-notice.warning {
+            background-color: #fff3cd;
+            color: #856404;
+        }
+        .tracking-exit-button {
+            display: none;
+            position: fixed;
+            top: calc(10px + env(safe-area-inset-top));
+            right: max(12px, env(safe-area-inset-right));
+            z-index: 2000;
+            min-height: 44px;
+            padding: 8px 14px;
+            background-color: rgba(183, 28, 28, 0.92);
+            border: 0;
+            border-radius: 22px;
+            box-shadow: none;
+            font-size: 14px;
+            flex: none;
+        }
+        body.camera-active #trackingExitButton {
+            display: block;
+            background-color: rgba(230, 81, 0, 0.92);
+        }
+        body.ar-active #trackingExitButton {
+            display: block;
+        }
+        body.tracking-active .operation-notice {
+            order: 5;
+            color: #d7f5df;
+            background-color: rgba(21, 87, 36, 0.88);
+        }
+        body.tracking-active .operation-notice.warning {
+            color: #fff3cd;
+            background-color: rgba(133, 100, 4, 0.9);
+        }
+        body.camera-active {
+            overflow: hidden;
+            background-color: #000;
+        }
+        body.camera-active .container {
+            position: fixed;
+            left: max(12px, env(safe-area-inset-left));
+            right: max(12px, env(safe-area-inset-right));
+            bottom: max(12px, env(safe-area-inset-bottom));
+            z-index: 10;
+            width: auto;
+            max-width: 600px;
+            max-height: calc(100dvh - 76px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
+            margin: 0 auto;
+            overflow-y: auto;
+            background-color: transparent;
+            box-shadow: none;
+            backdrop-filter: none;
+            -webkit-backdrop-filter: none;
+        }
+        body.camera-active .camera-preview-container,
+        body.camera-active .camera-preview-container.visible {
+            display: block;
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            width: 100vw;
+            height: 100vh;
+            height: 100dvh;
+            margin: 0;
+            border-radius: 0;
+        }
+        body.camera-active .camera-preview-container video {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        .secondary-controls button:disabled {
+            background-color: #d7dce2;
+            border-color: #c3c8ce;
+            color: #70757a;
+            cursor: not-allowed;
+        }
+    </style>
+</head>
+<body>
+    <button id="trackingExitButton" class="tracking-exit-button" type="button" aria-label="退出当前追踪模式">退出控制</button>
+    <div class="container" id="arOverlay">
+        <h1>IB手机遥操</h1>
+        <div class="instructions">
+            <h3>使用说明</h3>
+            <ol>
+                <li><strong>优先使用 AR：</strong>需要浏览器支持 WebXR；不支持时请使用摄像头光流模式。</li>
+                <li><strong>光流仅作降级：</strong>不支持 AR 时再使用，适合低速、小范围临时调整。</li>
+                <li><strong>握持姿势：</strong>左手握持手机，顶端朝夹爪/前方，屏幕朝右侧。</li>
+                <li><strong>授权并连接：</strong>允许系统姿态传感器和摄像头权限，确认手机与机器人在同一局域网。</li>
+                <li><strong>网络安全：</strong>仅限受信内部网络，禁止公网映射、云隧道、访客 Wi-Fi 和不可信 VPN。</li>
+                <li><strong>开始操控：</strong>按住底部使能区移动手机；平移控制末端位置，旋转控制末端姿态。</li>
+                <li><strong>常用操作：</strong>夹爪用张开/闭合；需要重新建立控制基准时点重新标定；需要回安全位点 Home。</li>
+            </ol>
+        </div>
+        <div class="platform-info">
+            <p>设备平台：<span id="platform">检测中...</span></p>
+            <p>系统姿态支持：<span id="orientation-support">检测中...</span></p>
+        </div>
+        <div class="status disconnected" id="status" role="status" aria-live="polite" aria-atomic="true">
+            已断开连接
+        </div>
+        <div class="sensor-actions">
+            <button id="sensorPermissionButton">点击授权系统姿态</button>
+        </div>
+        <div class="ar-guidance" id="arGuidance">
+            <div class="ar-guidance-header">
+                <span>AR 追踪（6DoF 空间定位）</span>
+                <button id="arToggleButton">启用 AR 追踪</button>
+            </div>
+            <div class="ar-hint" id="arHint"></div>
+            <details class="capability-details" hidden>
+                <summary id="arCapabilitySummary">兼容性详情</summary>
+                <p class="capability-note">Chrome 不自带 AR 运行时；华为 AR Engine 不会自动接入 Chrome。</p>
+                <div class="capability-checks" id="arCapabilityChecks" role="status" aria-live="polite"></div>
+            </details>
+        </div>
+        <div class="camera-tracking">
+            <div class="camera-tracking-header">
+                <span>光流模式（备用）</span>
+                <button id="cameraToggleButton">启用摄像头</button>
+            </div>
+            <div class="optical-expectation">
+                <p>低速、小范围使用；旋转较稳，平移可能冻结或漂移。</p>
+            </div>
+            <div class="tracking-status" id="trackingStatus">
+                未启用
+            </div>
+            <details class="capability-details" hidden>
+                <summary id="opticalCapabilitySummary">兼容性详情</summary>
+                <div class="capability-checks" id="opticalCapabilityChecks" role="status" aria-live="polite"></div>
+            </details>
+        </div>
+        <div class="control-mode-ui">
+            <div class="scale-control">
+                <div class="scale-control-header">
+                    <span>控制比例</span>
+                    <span id="scaleValue">1.0x</span>
+                </div>
+                <input id="scaleSlider" type="range" min="0" max="17" step="1" value="9">
+                <p class="scale-hint">调节移动/旋转灵敏度，不影响夹爪。</p>
+            </div>
+            <div class="controls gripper-controls">
+                <button id="buttonA">张开夹爪</button>
+                <button id="buttonB">闭合夹爪</button>
+            </div>
+            <div class="debug-panel" id="debugPanel" style="display:none;">
+                <div class="debug-panel-title">信息详情</div>
+                <div class="debug-grid">
+                    <div class="debug-item"><span class="debug-label">视觉质量</span><span id="debugTrackingQuality" class="debug-value quality">-</span></div>
+                    <div class="debug-item"><span class="debug-label">控制/追踪</span><span id="debugTrackingMode" class="debug-value">-</span></div>
+                    <div class="debug-item"><span class="debug-label">位移来源</span><span id="debugVelSrc" class="debug-value">-</span></div>
+                    <div class="debug-item"><span class="debug-label">姿态来源</span><span id="debugAngVelSrc" class="debug-value">-</span></div>
+                    <div class="debug-item full"><span class="debug-label">追踪位置 (m)</span><span id="debugLinearVel" class="debug-value">-</span></div>
+                    <div class="debug-item full"><span class="debug-label">姿态 RPY (deg，仅显示)</span><span id="debugAngularVel" class="debug-value">-</span></div>
+                </div>
+            </div>
+            <div class="controls secondary-controls">
+                <button id="homeButton">回到 Home 位</button>
+                <button id="resetButton">重新标定基准</button>
+                <button id="debugToggleButton">信息详情</button>
+            </div>
+            <div id="trackingRequiredHint" class="tracking-required-hint">
+                请先启用 AR 追踪；不支持时再启用摄像头
+            </div>
+            <div class="motion-area" id="motionArea" role="button" aria-label="按住使能机械臂运动" aria-pressed="false">
+                按住使能并移动手机
+            </div>
+        </div>
+        <div id="operationNotice" class="operation-notice" role="status" aria-live="polite" aria-atomic="true"></div>
+    </div>
+    <div class="camera-preview-container" id="cameraPreviewContainer" aria-hidden="true">
+        <video id="cameraVideo" autoplay playsinline muted></video>
+        <canvas id="featureOverlay"></canvas>
+    </div>
+
+    <script src="/three.min.js" defer></script>
+    <script>
+        function detectPlatform() {
+            const userAgent = navigator.userAgent;
+            let platform = 'unknown';
+            if (userAgent.includes('iPhone') || userAgent.includes('iPad')) {
+                platform = 'ios';
+            } else if (userAgent.includes('Android')) {
+                platform = 'android';
+            }
+            document.getElementById('platform').textContent = platform;
+            return platform;
+        }
+
+        function checkOrientationSupport() {
+            const hasStandardOrientation = typeof window.DeviceOrientationEvent !== 'undefined';
+            const hasWebkitOrientation = 'ondeviceorientationabsolute' in window || 'ondeviceorientation' in window;
+            const needsPermission = hasStandardOrientation
+                && typeof DeviceOrientationEvent.requestPermission === 'function';
+
+            if (needsPermission) {
+                document.getElementById('orientation-support').textContent = '可用，点击下方按钮授权';
+                updateSensorPermissionButton(false, '点击授权系统姿态');
+                setCapability('optical', 'orientation', 'pending', '接口可用，待用户授权');
+                return true;
+            }
+
+            if (hasStandardOrientation || hasWebkitOrientation) {
+                document.getElementById('orientation-support').textContent = '浏览器已支持';
+                updateSensorPermissionButton(true, '当前浏览器无需手动授权');
+                setCapability('optical', 'orientation', 'pending', '接口可用，等待有效姿态数据');
+                return true;
+            }
+
+            document.getElementById('orientation-support').textContent = '当前浏览器不支持，仍可测试夹爪按钮';
+            updateSensorPermissionButton(true, '当前浏览器不支持系统姿态');
+            setCapability('optical', 'orientation', 'fail', '浏览器未提供DeviceOrientation');
+            return false;
+        }
+
+        let ws;
+        let platform = detectPlatform();
+        let isConnected = false;
+        let moveActive = false;
+        let buttonA = false;
+        let buttonB = false;
+        let orientationListenerAttached = false;
+        let motionScale = 1.0;
+        let opticalVirtualPosition = [0, 0, 0];
+        let currentRotationMatrix = null;
+        let lastSendTime = 0;
+        let arSessionManager = null;
+        const SEND_INTERVAL_MS = 33;
+        let reconnectAttempts = 0;
+        let reconnectTimer = null;
+        const INITIAL_RECONNECT_DELAY_MS = 1000;
+        const MAX_RECONNECT_DELAY_MS = 30000;
+        const WS_CONNECT_TIMEOUT_MS = 3000;
+        const AR_WARMUP_FRAMES = 5;
+        const AR_TRACKING_STALE_MS = 100;
+        const CONTROL_HEARTBEAT_INTERVAL_MS = 50;
+        const activePointers = {
+            move: new Set(),
+            buttonA: new Set(),
+            buttonB: new Set(),
+        };
+
+        const motionArea = document.getElementById('motionArea');
+        const buttonAEl = document.getElementById('buttonA');
+        const buttonBEl = document.getElementById('buttonB');
+        const homeButtonEl = document.getElementById('homeButton');
+        const resetButtonEl = document.getElementById('resetButton');
+        const debugToggleButton = document.getElementById('debugToggleButton');
+        const sensorPermissionButton = document.getElementById('sensorPermissionButton');
+        const scaleSlider = document.getElementById('scaleSlider');
+        const scaleValue = document.getElementById('scaleValue');
+        const cameraToggleButton = document.getElementById('cameraToggleButton');
+        const cameraPreviewContainer = document.getElementById('cameraPreviewContainer');
+        const cameraVideo = document.getElementById('cameraVideo');
+        const featureOverlay = document.getElementById('featureOverlay');
+        const trackingStatusEl = document.getElementById('trackingStatus');
+        const operationNoticeEl = document.getElementById('operationNotice');
+        const trackingExitButtonEl = document.getElementById('trackingExitButton');
+
+        let cameraEnabled = false;
+        let cameraStream = null;
+        let trackingMode = 'disabled';
+        let lastArPoseTimeMs = 0;
+        let lastOrientationTimeMs = 0;
+        let arTrackingReleaseRequired = false;
+        let arRuntimeRejected = false;
+
+        function effectiveMoveActive() {
+            if (
+                moveActive && trackingMode === 'ar_6dof' &&
+                (lastArPoseTimeMs <= 0 || performance.now() - lastArPoseTimeMs > AR_TRACKING_STALE_MS)
+            ) {
+                arTrackingReleaseRequired = true;
+                setCapability('ar', 'spatialTracking', 'pending', 'WebXR位姿暂时中断');
+            }
+            var requiredMode = trackingMode === 'ar_6dof'
+                ? 'ar'
+                : (trackingMode === 'optical_flow' ? 'optical' : null);
+            if (!requiredMode || !requiredCapabilitiesReady(requiredMode)) {
+                return false;
+            }
+            return moveActive && !arTrackingReleaseRequired;
+        }
+
+        let arSupported = false;
+        let useBinaryProtocol = true;
+        let serverConfig = {
+            ar_enabled: true,
+            binary_protocol_enabled: true,
+            binary_protocol_version: 1,
+            websocket_port: 8766,
+            websocket_scheme: window.location.protocol === 'https:' ? 'wss' : 'ws',
+            optical_flow_fallback_enabled: false,
+        };
+
+        const capabilityState = {
+            ar: [
+                { key: 'secureContext', label: '安全上下文', required: true, state: 'pending', detail: '检测中' },
+                { key: 'webxr', label: 'WebXR', required: true, state: 'pending', detail: '检测中' },
+                { key: 'immersiveAr', label: 'immersive-ar', required: true, state: 'pending', detail: '检测中' },
+                { key: 'spatialTracking', label: '相机/IMU空间追踪', required: true, state: 'pending', detail: '启动时验证' },
+                { key: 'domOverlay', label: 'DOM叠加控制', required: true, state: 'pending', detail: '启动时验证' },
+                { key: 'localFloor', label: '地面坐标', required: false, state: 'pending', detail: '启动时协商' },
+            ],
+            optical: [
+                { key: 'secureContext', label: '安全上下文', required: true, state: 'pending', detail: '检测中' },
+                { key: 'cameraApi', label: '摄像头接口', required: true, state: 'pending', detail: '检测中' },
+                { key: 'cameraPermission', label: '摄像头权限', required: true, state: 'pending', detail: '待授权' },
+                { key: 'processing', label: 'Canvas/Worker', required: true, state: 'pending', detail: '检测中' },
+                { key: 'orientation', label: 'DeviceOrientation', required: true, state: 'pending', detail: '检测中' },
+                { key: 'fullscreen', label: '全屏显示', required: false, state: 'pending', detail: '检测中' },
+            ],
+        };
+
+        function capabilityFor(mode, key) {
+            return capabilityState[mode].find(function(item) { return item.key === key; });
+        }
+
+        function capabilityStatusText(item) {
+            if (item.state === 'ok') return '可用';
+            if (item.state === 'fail') return '不可用';
+            return '待验证';
+        }
+
+        function renderCapabilityChecks(mode) {
+            var targetId = mode === 'ar' ? 'arCapabilityChecks' : 'opticalCapabilityChecks';
+            var summaryId = mode === 'ar' ? 'arCapabilitySummary' : 'opticalCapabilitySummary';
+            var target = document.getElementById(targetId);
+            var summary = document.getElementById(summaryId);
+            if (!target || !summary) return;
+
+            function renderRow(required) {
+                var items = capabilityState[mode].filter(function(item) { return item.required === required; });
+                var label = required ? '必需' : '可选';
+                return '<div class="capability-row"><span class="capability-row-label">' + label + '</span>' +
+                    items.map(function(item) {
+                        var title = item.detail ? ' title="' + item.detail.replace(/"/g, '&quot;') + '"' : '';
+                        var optionalClass = item.required ? '' : ' optional';
+                        return '<span class="capability-item ' + item.state + optionalClass + '"' + title + '>' +
+                            item.label + '：' + capabilityStatusText(item) + '</span>';
+                    }).join('') + '</div>';
+            }
+
+            target.innerHTML = renderRow(true) + renderRow(false);
+            var failures = capabilityState[mode].filter(function(item) { return item.state === 'fail'; });
+            var requiredFailures = failures.filter(function(item) { return item.required; });
+            var details = target.parentElement;
+            details.hidden = failures.length === 0;
+            summary.classList.remove('ok', 'pending', 'fail');
+            if (requiredFailures.length > 0) {
+                summary.textContent = '兼容性问题：' + requiredFailures.map(function(item) {
+                    return item.label;
+                }).join('、');
+                summary.classList.add('fail');
+            } else if (failures.length > 0) {
+                summary.textContent = '兼容性提示：' + failures.map(function(item) {
+                    return item.label;
+                }).join('、');
+                summary.classList.add('pending');
+            } else {
+                summary.textContent = '兼容性详情';
+            }
+        }
+
+        function setCapability(mode, key, state, detail) {
+            var item = capabilityFor(mode, key);
+            if (!item) return;
+            if (item.state === state && item.detail === (detail || '')) return;
+            item.state = state;
+            item.detail = detail || '';
+            renderCapabilityChecks(mode);
+            updateARGuidanceUI();
+        }
+
+        function requiredCapabilitiesReady(mode) {
+            return capabilityState[mode].filter(function(item) { return item.required; }).every(function(item) {
+                return item.state === 'ok';
+            });
+        }
+
+        function staticCapabilityFailures(mode) {
+            var runtimeKeys = mode === 'ar' ? ['spatialTracking'] : ['cameraPermission'];
+            return capabilityState[mode].filter(function(item) {
+                return item.required && item.state === 'fail' && runtimeKeys.indexOf(item.key) === -1;
+            });
+        }
+
+        function arEntryAllowed() {
+            return serverConfig.ar_enabled === true
+                && arSupported === true
+                && !arRuntimeRejected
+                && staticCapabilityFailures('ar').length === 0;
+        }
+
+        function initializeCapabilityChecks() {
+            var secure = window.isSecureContext === true;
+            var secureDetail = secure ? '浏览器确认当前页面为安全上下文' : '需要可信HTTPS安全上下文';
+            setCapability('ar', 'secureContext', secure ? 'ok' : 'fail', secureDetail);
+            setCapability('optical', 'secureContext', secure ? 'ok' : 'fail', secureDetail);
+
+            var hasWebXR = typeof navigator.xr !== 'undefined';
+            setCapability('ar', 'webxr', hasWebXR ? 'ok' : 'fail', hasWebXR ? 'WebXR API可用' : '浏览器未提供navigator.xr');
+
+            var hasCamera = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+            setCapability(
+                'optical', 'cameraApi', hasCamera ? 'ok' : 'fail',
+                hasCamera ? 'getUserMedia接口可用' : '浏览器未提供getUserMedia'
+            );
+            setCapability('optical', 'cameraPermission', 'pending', '启用摄像头时请求');
+
+            var hasProcessing = typeof Worker !== 'undefined' && typeof OffscreenCanvas !== 'undefined'
+                && typeof createImageBitmap === 'function' && !!featureOverlay.getContext('2d');
+            setCapability(
+                'optical', 'processing', hasProcessing ? 'ok' : 'fail',
+                hasProcessing ? '光流处理接口可用' : '缺少Canvas、Worker、OffscreenCanvas或createImageBitmap'
+            );
+
+            var root = document.documentElement;
+            var hasFullscreen = !!(root.requestFullscreen || root.webkitRequestFullscreen);
+            setCapability(
+                'optical', 'fullscreen', hasFullscreen ? 'ok' : 'fail',
+                hasFullscreen ? '可进入全屏' : '不影响光流数据与控制'
+            );
+            renderCapabilityChecks('ar');
+            renderCapabilityChecks('optical');
+        }
+
+        async function checkARSupport() {
+            arRuntimeRejected = false;
+            if (!navigator.xr) {
+                arSupported = false;
+                setCapability('ar', 'immersiveAr', 'fail', '浏览器未提供WebXR');
+                setCapability('ar', 'spatialTracking', 'fail', '无法创建AR会话');
+                return false;
+            }
+            try {
+                arSupported = await navigator.xr.isSessionSupported('immersive-ar');
+                setCapability(
+                    'ar', 'immersiveAr', arSupported ? 'ok' : 'fail',
+                    arSupported ? '浏览器可创建immersive-ar会话' : '当前浏览器或设备不支持immersive-ar'
+                );
+                if (!arSupported) {
+                    setCapability('ar', 'spatialTracking', 'fail', '没有可用的WebXR空间追踪后端');
+                }
+            } catch (e) {
+                arSupported = false;
+                setCapability('ar', 'immersiveAr', 'fail', e.message || '能力检查失败');
+                setCapability('ar', 'spatialTracking', 'fail', '无法验证空间追踪后端');
+            }
+            return arSupported;
+        }
+
+        async function fetchConfig() {
+            try {
+                var response = await fetch('/api/config');
+                if (!response.ok) {
+                    throw new Error('HTTP ' + response.status);
+                }
+                var config = await response.json();
+                var websocketPort = Number(config.websocket_port);
+                if (!Number.isInteger(websocketPort) || websocketPort < 1 || websocketPort > 65535) {
+                    throw new Error('invalid websocket_port');
+                }
+                if (config.websocket_scheme !== 'ws' && config.websocket_scheme !== 'wss') {
+                    throw new Error('invalid websocket_scheme');
+                }
+                if (config.binary_protocol_enabled !== false && Number(config.binary_protocol_version) !== 1) {
+                    throw new Error('unsupported binary protocol version');
+                }
+                serverConfig = config;
+                useBinaryProtocol = serverConfig.binary_protocol_enabled !== false;
+                return true;
+            } catch(e) {
+                console.error('Could not fetch WebPhone config:', e);
+                var statusEl = document.getElementById('status');
+                statusEl.textContent = '配置加载失败，请刷新页面重试';
+                statusEl.classList.remove('connecting', 'connected');
+                statusEl.classList.add('disconnected');
+                return false;
+            }
+        }
+
+        function updateARGuidanceUI() {
+            var arGuidanceEl = document.getElementById('arGuidance');
+            var arHintEl = document.getElementById('arHint');
+            var arToggleBtn = document.getElementById('arToggleButton');
+            var opticalPoseAllowed = serverConfig.optical_flow_fallback_enabled === true;
+            var opticalFailures = staticCapabilityFailures('optical');
+            cameraToggleButton.disabled = !opticalPoseAllowed || opticalFailures.length > 0;
+            if (!opticalPoseAllowed) {
+                cameraToggleButton.textContent = '配置未启用光流降级';
+            } else if (opticalFailures.length > 0) {
+                cameraToggleButton.textContent = '光流必需能力不可用';
+            } else if (!cameraEnabled) {
+                cameraToggleButton.textContent = '启用摄像头';
+            }
+
+            if (!serverConfig.ar_enabled) {
+                arGuidanceEl.classList.remove('visible');
+                return;
+            }
+
+            arGuidanceEl.classList.add('visible');
+            arToggleBtn.style.display = '';
+            var arFailures = staticCapabilityFailures('ar');
+            var arReady = arEntryAllowed();
+            var domOverlayUnavailable = capabilityFor('ar', 'domOverlay').state === 'fail';
+            arToggleBtn.disabled = !arReady || arSessionManager.isStarting;
+            arToggleBtn.setAttribute('aria-disabled', arToggleBtn.disabled ? 'true' : 'false');
+            if (arReady) {
+                arHintEl.textContent = '可用；启动后验证空间追踪。';
+                arToggleBtn.textContent = arSessionManager.isActive ? '关闭 AR 追踪' : '启用 AR 追踪';
+            } else if (arRuntimeRejected) {
+                arToggleBtn.textContent = 'AR 运行时不可用';
+                arHintEl.textContent = '系统 AR 运行时不可用，请使用光流。';
+            } else if (domOverlayUnavailable) {
+                arToggleBtn.textContent = 'AR 控制界面不可用';
+                arHintEl.textContent = '缺少控制叠加能力，请使用光流。';
+            } else if (!arSupported && arFailures.length === 0) {
+                arToggleBtn.textContent = 'AR 不可用';
+                arHintEl.textContent = '当前设备不支持 AR，请使用光流。';
+            } else {
+                arToggleBtn.textContent = 'AR 不可用';
+                arHintEl.textContent = '缺少必需能力，请查看兼容性详情。';
+            }
+        }
+
+        function updateMotionAreaState() {
+            motionArea.classList.toggle('active', moveActive);
+            motionArea.setAttribute('aria-pressed', moveActive ? 'true' : 'false');
+            resetButtonEl.disabled = moveActive;
+            resetButtonEl.setAttribute('aria-disabled', moveActive ? 'true' : 'false');
+            resetButtonEl.title = moveActive ? '请先松开使能再重新标定' : '';
+        }
+
+        function hideOperationNotice() {
+            if (!operationNoticeEl) return;
+            clearTimeout(operationNoticeEl._hideTimer);
+            operationNoticeEl.classList.remove('visible', 'warning');
+            operationNoticeEl.textContent = '';
+        }
+
+        function showOperationNotice(message, warning, durationMs) {
+            if (!operationNoticeEl) return;
+            clearTimeout(operationNoticeEl._hideTimer);
+            operationNoticeEl.textContent = message;
+            operationNoticeEl.classList.toggle('warning', !!warning);
+            operationNoticeEl.classList.add('visible');
+            operationNoticeEl._hideTimer = setTimeout(
+                hideOperationNotice,
+                Number.isFinite(durationMs) ? durationMs : 4500
+            );
+        }
+
+        function showTrackingRequiredHint() {
+            var hint = document.getElementById('trackingRequiredHint');
+            if (!hint) return;
+            hint.classList.add('visible');
+            clearTimeout(hint._hideTimer);
+            hint._hideTimer = setTimeout(function() {
+                hint.classList.remove('visible');
+            }, 3000);
+        }
+
+        function updateSensorPermissionButton(disabled, label) {
+            sensorPermissionButton.disabled = disabled;
+            sensorPermissionButton.textContent = label;
+        }
+
+        const SCALE_VALUES = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0];
+
+        function updateScaleDisplay() {
+            scaleValue.textContent = motionScale < 1 ? motionScale.toFixed(1) + 'x' : motionScale.toFixed(2) + 'x';
+        }
+
+        function setMotionScale(value) {
+            const parsedValue = Number.parseFloat(value);
+            motionScale = Number.isFinite(parsedValue)
+                ? Math.min(4.0, Math.max(0.1, parsedValue))
+                : 1.0;
+            updateScaleDisplay();
+        }
+
+        function scaleSliderToValue(sliderIndex) {
+            var idx = parseInt(sliderIndex, 10);
+            if (isNaN(idx) || idx < 0) idx = 0;
+            if (idx >= SCALE_VALUES.length) idx = SCALE_VALUES.length - 1;
+            return SCALE_VALUES[idx];
+        }
+
+        function resetControls() {
+            moveActive = false;
+            buttonA = false;
+            buttonB = false;
+            activePointers.move.clear();
+            activePointers.buttonA.clear();
+            activePointers.buttonB.clear();
+            updateMotionAreaState();
+        }
+
+        function suppressDefaultInteraction(event) {
+            event.preventDefault();
+            event.stopPropagation();
+        }
+
+        function syncMoveState() {
+            moveActive = activePointers.move.size > 0;
+            if (!moveActive) {
+                arTrackingReleaseRequired = false;
+            }
+            updateMotionAreaState();
+        }
+
+        function syncButtonState(buttonName) {
+            if (buttonName === 'buttonA') {
+                buttonA = activePointers.buttonA.size > 0;
+            } else if (buttonName === 'buttonB') {
+                buttonB = activePointers.buttonB.size > 0;
+            }
+        }
+
+        function attachOrientationListener(eventName = 'deviceorientation') {
+            if (orientationListenerAttached) {
+                return;
+            }
+            if (platform !== 'ios' && 'ondeviceorientationabsolute' in window) {
+                eventName = 'deviceorientationabsolute';
+            }
+            window.addEventListener(eventName, handleOrientation);
+            orientationListenerAttached = true;
+        }
+
+        function sendImmediateMessage(extraMessage = {}) {
+            if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+
+            if (useBinaryProtocol && currentRotationMatrix) {
+                var pose = Array.isArray(extraMessage.pose) ? extraMessage.pose.slice() : currentRotationMatrix.slice();
+                var linearVelocity = Array.isArray(extraMessage.linearVelocity)
+                    ? extraMessage.linearVelocity.slice()
+                    : [0, 0, 0];
+                var messageAngularVelocity = Array.isArray(extraMessage.angularVelocity)
+                    ? extraMessage.angularVelocity.slice()
+                    : [0, 0, 0];
+                var messageTrackingQuality = Number.isFinite(extraMessage.trackingQuality)
+                    ? extraMessage.trackingQuality
+                    : opticalFlow.controlQuality();
+                var messageTrackingMode = extraMessage.trackingMode || trackingMode;
+                var frame = packBinaryFrame(
+                    pose, linearVelocity, messageAngularVelocity,
+                    motionScale,
+                    messageTrackingQuality, messageTrackingMode,
+                    effectiveMoveActive(), buttonA, buttonB, !!extraMessage.reset, !!extraMessage.goHome
+                );
+                try { ws.send(frame); } catch(e) { console.error('Error sending binary:', e); }
+            } else {
+                const message = {
+                    move: effectiveMoveActive(),
+                    scale: motionScale,
+                    reservedButtonA: buttonA,
+                    reservedButtonB: buttonB,
+                    platform: platform,
+                    ...extraMessage,
+                };
+
+                try {
+                    ws.send(JSON.stringify(message));
+                } catch (error) {
+                    console.error('Error sending message:', error);
+                }
+            }
+        }
+
+        function identityPoseMatrix() {
+            return [
+                1, 0, 0, 0,
+                0, 1, 0, 0,
+                0, 0, 1, 0,
+                0, 0, 0, 1
+            ];
+        }
+
+        function rotationOnly(matrix) {
+            if (!matrix) return null;
+            return [
+                matrix[0], matrix[1], matrix[2],
+                matrix[4], matrix[5], matrix[6],
+                matrix[8], matrix[9], matrix[10]
+            ];
+        }
+
+        function opticalPoseFromRotation(matrix) {
+            var source = matrix || identityPoseMatrix();
+            return [
+                source[0], source[1], source[2], opticalVirtualPosition[0],
+                source[4], source[5], source[6], opticalVirtualPosition[1],
+                source[8], source[9], source[10], opticalVirtualPosition[2],
+                0, 0, 0, 1
+            ];
+        }
+
+        function resetOpticalVirtualPose(resetTracker) {
+            opticalVirtualPosition = [0, 0, 0];
+            if (cameraEnabled && (!arSessionManager || !arSessionManager.isActive)) {
+                currentRotationMatrix = opticalPoseFromRotation(currentRotationMatrix);
+            }
+            if (resetTracker && opticalFlow && opticalFlow.resetTrackingBaseline) {
+                opticalFlow.resetTrackingBaseline();
+            }
+        }
+
+        function setSyntheticPoseIfNeeded() {
+            if (currentRotationMatrix) {
+                return false;
+            }
+            currentRotationMatrix = identityPoseMatrix();
+            return true;
+        }
+
+        function sendSyntheticPoseIfNeeded() {
+            if (!setSyntheticPoseIfNeeded()) {
+                return;
+            }
+            sendImmediateMessage({
+                pose: currentRotationMatrix.slice(),
+            });
+        }
+
+        function bindHoldButton(element, key) {
+            element.addEventListener('pointerdown', function(event) {
+                suppressDefaultInteraction(event);
+                activePointers[key].add(event.pointerId);
+                syncButtonState(key);
+                element.setPointerCapture(event.pointerId);
+                sendSyntheticPoseIfNeeded();
+                sendImmediateMessage();
+            });
+
+            const release = function(event) {
+                suppressDefaultInteraction(event);
+                activePointers[key].delete(event.pointerId);
+                syncButtonState(key);
+                sendImmediateMessage();
+            };
+
+            element.addEventListener('pointerup', release);
+            element.addEventListener('pointercancel', release);
+            element.addEventListener('lostpointercapture', function(event) {
+                activePointers[key].delete(event.pointerId);
+                syncButtonState(key);
+                sendImmediateMessage();
+            });
+        }
+
+        function bindMotionArea(element) {
+            element.addEventListener('pointerdown', function(event) {
+                suppressDefaultInteraction(event);
+                if (!cameraEnabled && !arSessionManager.isActive) {
+                    showTrackingRequiredHint();
+                    return;
+                }
+                var wasActive = moveActive;
+                activePointers.move.add(event.pointerId);
+                syncMoveState();
+                if (!wasActive && moveActive) {
+                    hideOperationNotice();
+                    if (cameraEnabled && !arSessionManager.isActive) {
+                        resetOpticalVirtualPose(true);
+                    }
+                }
+                element.setPointerCapture(event.pointerId);
+                sendSyntheticPoseIfNeeded();
+                sendImmediateMessage();
+            });
+
+            const release = function(event) {
+                suppressDefaultInteraction(event);
+                activePointers.move.delete(event.pointerId);
+                syncMoveState();
+                sendImmediateMessage();
+            };
+
+            element.addEventListener('pointerup', release);
+            element.addEventListener('pointercancel', release);
+            element.addEventListener('lostpointercapture', function(event) {
+                activePointers.move.delete(event.pointerId);
+                syncMoveState();
+                sendImmediateMessage();
+            });
+        }
+
+        function scheduleWebSocketReconnect(immediate = false) {
+            if (immediate && reconnectTimer !== null) {
+                clearTimeout(reconnectTimer);
+                reconnectTimer = null;
+            }
+            if (reconnectTimer !== null || (ws && (
+                ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN
+            ))) {
+                return;
+            }
+            const delay = immediate ? 0 : Math.min(
+                INITIAL_RECONNECT_DELAY_MS * Math.pow(2, Math.min(reconnectAttempts, 5)),
+                MAX_RECONNECT_DELAY_MS
+            );
+            reconnectAttempts++;
+            reconnectTimer = setTimeout(function() {
+                reconnectTimer = null;
+                connectWebSocket();
+            }, delay);
+        }
+
+        function connectWebSocket() {
+            if (ws && (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.OPEN)) {
+                return;
+            }
+            const host = window.location.hostname;
+            const wsScheme = serverConfig.websocket_scheme ||
+                (window.location.protocol === 'https:' ? 'wss' : 'ws');
+            const wsPort = Number(serverConfig.websocket_port || 8766);
+            const wsUrl = `${wsScheme}://${host}:${wsPort}`;
+
+            const statusEl = document.getElementById('status');
+            statusEl.textContent = reconnectAttempts > 0
+                ? `正在重连 WebSocket（第 ${reconnectAttempts} 次）...`
+                : '正在连接 WebSocket...';
+            statusEl.classList.remove('connected', 'disconnected');
+            statusEl.classList.add('connecting');
+
+            ws = new WebSocket(wsUrl);
+            const thisWs = ws;
+            const connectTimeout = setTimeout(function() {
+                if (thisWs.readyState === WebSocket.CONNECTING) {
+                    console.warn('WebSocket connection timeout:', wsUrl);
+                    thisWs.close();
+                }
+            }, WS_CONNECT_TIMEOUT_MS);
+
+            ws.onopen = function() {
+                clearTimeout(connectTimeout);
+                if (ws !== thisWs) {
+                    thisWs.close();
+                    return;
+                }
+                statusEl.textContent = '已连接';
+                statusEl.classList.remove('connecting', 'disconnected');
+                statusEl.classList.add('connected');
+                isConnected = true;
+                reconnectAttempts = 0;
+                if (reconnectTimer !== null) {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = null;
+                }
+                sendSyntheticPoseIfNeeded();
+            };
+
+            ws.onclose = function(event) {
+                clearTimeout(connectTimeout);
+                if (ws !== thisWs && isConnected) {
+                    return;
+                }
+                const closeReason = event.reason ? `：${event.reason}` : '';
+                statusEl.textContent = event.code === 1008
+                    ? `连接被拒绝${closeReason}`
+                    : `已断开连接${closeReason}`;
+                statusEl.classList.remove('connecting', 'connected');
+                statusEl.classList.add('disconnected');
+                isConnected = false;
+                resetControls();
+                scheduleWebSocketReconnect();
+            };
+
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                if (thisWs.readyState === WebSocket.CONNECTING) {
+                    thisWs.close();
+                }
+            };
+        }
+
+        function quaternionToMatrix(q) {
+            const [x, y, z, w] = q;
+            const x2 = x * 2;
+            const y2 = y * 2;
+            const z2 = z * 2;
+
+            const xx = x * x2;
+            const yx = y * x2;
+            const yy = y * y2;
+            const zx = z * x2;
+            const zy = z * y2;
+            const zz = z * z2;
+            const wx = w * x2;
+            const wy = w * y2;
+            const wz = w * z2;
+
+            return [
+                1 - yy - zz, yx - wz, zx + wy, 0,
+                yx + wz, 1 - xx - zz, zy - wx, 0,
+                zx - wy, zy + wx, 1 - xx - yy, 0,
+                0, 0, 0, 1
+            ];
+        }
+
+        function quaternionToMatrixWithTranslation(q, tx, ty, tz) {
+            var m = quaternionToMatrix(q);
+            return [
+                m[0], m[1], m[2], tx,
+                m[4], m[5], m[6], ty,
+                m[8], m[9], m[10], tz,
+                0, 0, 0, 1
+            ];
+        }
+
+        function multiplyQuaternions(left, right) {
+            return [
+                left[3] * right[0] + left[0] * right[3] + left[1] * right[2] - left[2] * right[1],
+                left[3] * right[1] - left[0] * right[2] + left[1] * right[3] + left[2] * right[0],
+                left[3] * right[2] + left[0] * right[1] - left[1] * right[0] + left[2] * right[3],
+                left[3] * right[3] - left[0] * right[0] - left[1] * right[1] - left[2] * right[2]
+            ];
+        }
+
+        function deviceOrientationToViewerQuaternion(alpha, beta, gamma) {
+            // Match THREE.DeviceOrientationControls/WebXR viewer axes:
+            // intrinsic device Z-X'-Y'', then device-camera and screen rotation.
+            const halfX = beta / 2;
+            const halfY = alpha / 2;
+            const halfZ = -gamma / 2;
+            const c1 = Math.cos(halfX), c2 = Math.cos(halfY), c3 = Math.cos(halfZ);
+            const s1 = Math.sin(halfX), s2 = Math.sin(halfY), s3 = Math.sin(halfZ);
+            var quaternion = [
+                s1 * c2 * c3 + c1 * s2 * s3,
+                c1 * s2 * c3 - s1 * c2 * s3,
+                c1 * c2 * s3 - s1 * s2 * c3,
+                c1 * c2 * c3 + s1 * s2 * s3
+            ];
+            const sqrtHalf = Math.sqrt(0.5);
+            quaternion = multiplyQuaternions(quaternion, [-sqrtHalf, 0, 0, sqrtHalf]);
+            const screenAngleDegrees = screen.orientation && Number.isFinite(screen.orientation.angle)
+                ? screen.orientation.angle
+                : (Number(window.orientation) || 0);
+            const screenHalfAngle = -screenAngleDegrees * Math.PI / 360;
+            quaternion = multiplyQuaternions(
+                quaternion,
+                [0, 0, Math.sin(screenHalfAngle), Math.cos(screenHalfAngle)]
+            );
+            const norm = Math.hypot(quaternion[0], quaternion[1], quaternion[2], quaternion[3]);
+            return quaternion.map(function(value) { return value / Math.max(norm, 1e-9); });
+        }
+
+        function packBinaryFrame(pose, linearVel, angularVel, scale, trackingQuality, trackingMode, move, buttonA, buttonB, reset, goHome) {
+            var flags = 0;
+            if (move) flags |= 0x01;
+            if (buttonA) flags |= 0x02;
+            if (buttonB) flags |= 0x04;
+            if (reset) flags |= 0x08;
+            var tmBits = 0;
+            if (trackingMode === 'optical_flow') tmBits = 1;
+            else if (trackingMode === 'ar_6dof') tmBits = 2;
+            flags |= (tmBits << 4);
+            if (goHome) flags |= 0x40;
+
+            var platformId = 0;
+            if (platform === 'ios') platformId = 1;
+            else if (platform === 'android') platformId = 2;
+
+            var buffer = new ArrayBuffer(99);
+            var view = new DataView(buffer);
+            var offset = 0;
+
+            view.setUint8(offset++, Number(serverConfig.binary_protocol_version || 1));
+            view.setUint8(offset++, flags);
+
+            for (var i = 0; i < 16; i++) {
+                view.setFloat32(offset, pose[i], true);
+                offset += 4;
+            }
+            for (var i = 0; i < 3; i++) {
+                view.setFloat32(offset, linearVel[i], true);
+                offset += 4;
+            }
+            // Reserved velocity slots stay zero; WebPhone is relative-pose only.
+            for (var i = 0; i < 3; i++) {
+                view.setFloat32(offset, angularVel[i], true);
+                offset += 4;
+            }
+            view.setFloat32(offset, scale, true);
+            offset += 4;
+            view.setFloat32(offset, trackingQuality, true);
+            offset += 4;
+            view.setUint8(offset, platformId);
+
+            return buffer;
+        }
+
+        arSessionManager = {
+            session: null,
+            renderer: null,
+            scene: null,
+            camera: null,
+            referenceSpace: null,
+            isActive: false,
+            isStarting: false,
+            _warmupCount: 0,
+            _trackingStartTimer: null,
+
+            start: async function() {
+                if (this.isActive || this.isStarting) return;
+                if (!arEntryAllowed()) {
+                    showOperationNotice('当前设备或浏览器不支持 AR，按钮保持禁用状态', true, 6000);
+                    return;
+                }
+                var blockers = staticCapabilityFailures('ar');
+                if (blockers.length > 0) {
+                    showOperationNotice('AR缺少必需能力：' + blockers.map(function(item) {
+                        return item.label;
+                    }).join('、'), true, 6000);
+                    return;
+                }
+                if (typeof THREE === 'undefined') {
+                    console.warn('three.js not loaded yet, AR unavailable');
+                    showOperationNotice('AR页面组件未加载，请刷新后重试', true, 6000);
+                    return;
+                }
+                this.isStarting = true;
+                setCapability('ar', 'spatialTracking', 'pending', '正在请求相机/IMU空间追踪');
+                try {
+                    this.session = await navigator.xr.requestSession('immersive-ar', {
+                        optionalFeatures: ['dom-overlay', 'local-floor'],
+                        domOverlay: { root: document.getElementById('arOverlay') }
+                    });
+                    this._onSessionEndedBound = this._onSessionEnded.bind(this);
+                    this.session.addEventListener('end', this._onSessionEndedBound);
+
+                    var hasDomOverlay = !!this.session.domOverlayState;
+                    if (!hasDomOverlay) {
+                        var domOverlayError = new Error('AR会话缺少DOM Overlay，无法提供安全控制界面');
+                        domOverlayError.name = 'DomOverlayUnavailableError';
+                        throw domOverlayError;
+                    }
+                    setCapability(
+                        'ar', 'domOverlay', 'ok', 'HTML控制界面可叠加显示'
+                    );
+                    try {
+                        await this.session.requestReferenceSpace('local-floor');
+                        setCapability('ar', 'localFloor', 'ok', '浏览器支持地面参考空间');
+                    } catch (referenceError) {
+                        setCapability('ar', 'localFloor', 'fail', '将使用局部参考空间，不影响相对控制');
+                    }
+
+                    this.renderer = new THREE.WebGLRenderer({ alpha: true });
+                    this.renderer.xr.enabled = true;
+                    this.renderer.xr.setReferenceSpaceType('local');
+                    await this.renderer.xr.setSession(this.session);
+
+                    this.scene = new THREE.Scene();
+                    this.camera = new THREE.PerspectiveCamera(70, 1, 0.01, 20);
+                    this.referenceSpace = null;
+                    this._offsetRefSpace = null;
+                    this._originReset = false;
+
+                    var self = this;
+                    this.renderer.setAnimationLoop(function(timestamp, frame) {
+                        self._arFrameCallback(timestamp, frame);
+                    });
+
+                    this.isActive = true;
+                    arRuntimeRejected = false;
+                    this._warmupCount = 0;
+                    lastArPoseTimeMs = 0;
+                    arTrackingReleaseRequired = false;
+                    this._trackingStartTimer = setTimeout(function() {
+                        if (self.isActive && lastArPoseTimeMs <= 0) {
+                            setCapability('ar', 'spatialTracking', 'fail', '启动后未收到有效6DoF位姿');
+                            showOperationNotice('AR会话已启动，但没有收到6DoF空间位姿', true, 6000);
+                        }
+                    }, 3000);
+
+                    document.getElementById('arOverlay').appendChild(trackingExitButtonEl);
+                    document.body.classList.remove('camera-active');
+                    document.body.classList.add('ar-active', 'tracking-active');
+                    trackingExitButtonEl.textContent = '退出 AR';
+
+                    var arToggleBtn = document.getElementById('arToggleButton');
+                    arToggleBtn.textContent = '关闭 AR 追踪';
+                    arToggleBtn.classList.add('active-ar');
+                } catch (e) {
+                    var domOverlayUnavailable = !!(e && e.name === 'DomOverlayUnavailableError');
+                    if (this.session) {
+                        if (this._onSessionEndedBound) {
+                            this.session.removeEventListener('end', this._onSessionEndedBound);
+                        }
+                        try {
+                            await this.session.end();
+                        } catch (endError) {
+                            console.debug('Could not end failed AR session:', endError);
+                        }
+                    }
+                    this._cleanup();
+                    if (e && e.name === 'NotSupportedError') {
+                        arRuntimeRejected = true;
+                    }
+                    if (domOverlayUnavailable) {
+                        setCapability('ar', 'domOverlay', 'fail', 'AR会话可建立，但浏览器未提供DOM Overlay');
+                    } else {
+                        setCapability('ar', 'domOverlay', 'pending', 'AR会话未建立，无法验证DOM叠加能力');
+                        setCapability(
+                            'ar', 'spatialTracking', 'fail',
+                            arRuntimeRejected
+                                ? '系统没有可供浏览器使用的WebXR空间追踪运行时'
+                                : (e.message || 'AR会话启动失败')
+                        );
+                    }
+                    console.error('Failed to start AR session:', e);
+                    alert(
+                        domOverlayUnavailable
+                            ? 'AR会话可建立，但浏览器不支持DOM Overlay；当前页面无法提供安全控制界面。'
+                            : arRuntimeRejected
+                            ? '无法启动 AR：浏览器接口存在，但系统空间追踪运行时不支持该会话。请使用光流模式。'
+                            : '无法启动 AR 会话：' + e.message
+                    );
+                } finally {
+                    this.isStarting = false;
+                    updateARGuidanceUI();
+                }
+            },
+
+            stop: function() {
+                if (!this.isActive && !this.session) return;
+                if (this.session) {
+                    if (this._onSessionEndedBound) {
+                        this.session.removeEventListener('end', this._onSessionEndedBound);
+                    }
+                    this.session.end().catch(function(error) {
+                        console.debug('Could not end AR session cleanly:', error);
+                    });
+                }
+                this._cleanup();
+            },
+
+            _onSessionEnded: function() {
+                if (!this.isActive && !this.session) return;
+                this._cleanup();
+            },
+
+            _cleanup: function() {
+                if (this._trackingStartTimer !== null) {
+                    clearTimeout(this._trackingStartTimer);
+                    this._trackingStartTimer = null;
+                }
+                if (this.renderer) {
+                    this.renderer.setAnimationLoop(null);
+                    this.renderer.dispose();
+                }
+                this.session = null;
+                this.renderer = null;
+                this.scene = null;
+                this.camera = null;
+                this.referenceSpace = null;
+                this._offsetRefSpace = null;
+                this._originReset = false;
+                this._onSessionEndedBound = null;
+                this.isActive = false;
+                this.isStarting = false;
+                this._warmupCount = 0;
+                lastArPoseTimeMs = 0;
+                arTrackingReleaseRequired = false;
+                setCapability('ar', 'spatialTracking', 'pending', '等待重新启动AR验证');
+
+                resetControls();
+                sendImmediateMessage({
+                    trackingMode: 'disabled',
+                    trackingQuality: 0,
+                    linearVelocity: [0, 0, 0],
+                    angularVelocity: [0, 0, 0]
+                });
+
+                document.body.classList.remove('ar-active', 'tracking-active');
+
+                trackingMode = 'disabled';
+
+                var arToggleBtn = document.getElementById('arToggleButton');
+                arToggleBtn.textContent = '启用 AR 追踪';
+                arToggleBtn.classList.remove('active-ar');
+            },
+
+            _arFrameCallback: function(timestamp, frame) {
+                if (!frame || !this.session) return;
+
+                var refSpace = this.renderer.xr.getReferenceSpace();
+                if (!refSpace) return;
+
+                this.referenceSpace = refSpace;
+
+                var viewerPose = frame.getViewerPose(this.referenceSpace);
+                if (!viewerPose) return;
+
+                var transform = viewerPose.transform;
+                var pos = [transform.position.x, transform.position.y, transform.position.z];
+                var quat = [transform.orientation.x, transform.orientation.y, transform.orientation.z, transform.orientation.w];
+
+                var pose = quaternionToMatrixWithTranslation(quat, pos[0], pos[1], pos[2]);
+                currentRotationMatrix = pose;
+                lastArPoseTimeMs = performance.now();
+                if (this._trackingStartTimer !== null) {
+                    clearTimeout(this._trackingStartTimer);
+                    this._trackingStartTimer = null;
+                }
+                setCapability('ar', 'spatialTracking', 'ok', 'WebXR持续返回位置与姿态');
+
+                trackingMode = 'ar_6dof';
+
+                // Skip the first few frames while the WebXR tracking backend stabilizes.
+                this._warmupCount++;
+                if (this._warmupCount <= AR_WARMUP_FRAMES) {
+                    return;
+                }
+
+                var trackingQuality = 0.9;
+                updateDebugPanel(trackingQuality, trackingMode, 'ar-pose', 'webxr-orientation');
+
+                if (isConnected && ws && ws.readyState === WebSocket.OPEN) {
+                    if (useBinaryProtocol) {
+                        var frameData = packBinaryFrame(
+                            pose, [0, 0, 0], [0, 0, 0],
+                            motionScale,
+                            trackingQuality, trackingMode,
+                            effectiveMoveActive(), buttonA, buttonB, false, false
+                        );
+                        try { ws.send(frameData); } catch(e) { console.error('Error sending AR binary:', e); }
+                    } else {
+                        var message = {
+                            pose: pose,
+                            linearVelocity: [0, 0, 0],
+                            angularVelocity: [0, 0, 0],
+                            move: effectiveMoveActive(),
+                            scale: motionScale,
+                            reservedButtonA: buttonA,
+                            reservedButtonB: buttonB,
+                            platform: platform,
+                            trackingMode: trackingMode,
+                            trackingQuality: trackingQuality,
+                            velocitySource: 'ar-pose',
+                            angularVelocitySource: 'webxr-orientation'
+                        };
+                        try { ws.send(JSON.stringify(message)); } catch(e) { console.error('Error sending AR JSON:', e); }
+                    }
+                }
+            }
+        };
+
+        function rotateVectorByMatrix(vx, vy, vz, m) {
+            if (!m) return [vx, vy, vz];
+            return [
+                m[0] * vx + m[1] * vy + m[2] * vz,
+                m[4] * vx + m[5] * vy + m[6] * vz,
+                m[8] * vx + m[9] * vy + m[10] * vz,
+            ];
+        }
+
+        function rotateVectorByRotation3(vx, vy, vz, rotation) {
+            if (!rotation || rotation.length !== 9) return rotateVectorByMatrix(vx, vy, vz, currentRotationMatrix);
+            return [
+                rotation[0] * vx + rotation[1] * vy + rotation[2] * vz,
+                rotation[3] * vx + rotation[4] * vy + rotation[5] * vz,
+                rotation[6] * vx + rotation[7] * vy + rotation[8] * vz,
+            ];
+        }
+
+        function formatVec3(vec, digits) {
+            if (!vec || vec.length < 3) return "[-, -, -]";
+            var precision = Number.isInteger(digits) ? digits : 3;
+            return "[" + vec.map(function(v) {
+                var s = (Number.isFinite(v) ? v : 0).toFixed(precision);
+                return s.length < 7 ? s.padStart(7, ' ') : s;
+            }).join(", ") + "]";
+        }
+
+        function posePosition(matrix) {
+            return matrix ? [matrix[3], matrix[7], matrix[11]] : [0, 0, 0];
+        }
+
+        function poseRpyDegrees(matrix) {
+            if (!matrix) return [0, 0, 0];
+            var horizontal = Math.hypot(matrix[0], matrix[4]);
+            var singular = horizontal < 1e-6;
+            var roll = singular ? Math.atan2(-matrix[6], matrix[5]) : Math.atan2(matrix[9], matrix[10]);
+            var pitch = Math.atan2(-matrix[8], horizontal);
+            var yaw = singular ? 0 : Math.atan2(matrix[4], matrix[0]);
+            return [roll, pitch, yaw].map(function(value) { return value * 180 / Math.PI; });
+        }
+
+        function updateDebugPanel(trackingQuality, mode, velocitySource, angularSource) {
+            var debugPanel = document.getElementById('debugPanel');
+            if (!debugPanel || debugPanel.style.display === 'none') {
+                return;
+            }
+            var srcMap = {
+                'none': '无',
+                'ar-pose': 'WebXR 位姿',
+                'webxr-orientation': 'WebXR 姿态',
+                'device-orientation': '系统融合姿态',
+                'optical-pose': '光流虚拟位姿'
+            };
+            if (mode === 'ar_6dof') {
+                velocitySource = 'ar-pose';
+                angularSource = 'webxr-orientation';
+            } else if (mode === 'optical_flow') {
+                velocitySource = 'optical-pose';
+                angularSource = 'device-orientation';
+            }
+            var qualityText = '-';
+            if (Number.isFinite(trackingQuality)) {
+                var qualityGrade = trackingQuality >= 0.75 ? '优秀' : (trackingQuality >= 0.55 ? '良好' : (trackingQuality >= 0.30 ? '一般' : '差'));
+                qualityText = trackingQuality.toFixed(2) + ' ' + qualityGrade;
+            }
+            document.getElementById('debugTrackingQuality').textContent =
+                qualityText;
+            document.getElementById('debugTrackingMode').textContent = 'Pose位置 / ' + (mode || '-');
+            document.getElementById('debugVelSrc').textContent = srcMap[velocitySource] || velocitySource || '-';
+            document.getElementById('debugAngVelSrc').textContent = srcMap[angularSource] || angularSource || '-';
+            document.getElementById('debugLinearVel').textContent = formatVec3(posePosition(currentRotationMatrix));
+            document.getElementById('debugAngularVel').textContent = formatVec3(poseRpyDegrees(currentRotationMatrix), 1);
+        }
+
+        function handleOrientation(event) {
+            if (!isConnected) return;
+            if (arSessionManager.isActive) return;
+            if (!cameraEnabled) return;
+
+            const now = Date.now();
+            if (now - lastSendTime < SEND_INTERVAL_MS) return;
+            lastSendTime = now;
+
+            let alpha, beta, gamma;
+
+            if (platform === 'ios') {
+                alpha = event.webkitCompassHeading != null ? event.webkitCompassHeading : event.alpha;
+                beta = event.beta;
+                gamma = event.gamma;
+            } else {
+                alpha = event.alpha;
+                beta = event.beta;
+                gamma = event.gamma;
+            }
+
+            if (alpha == null || beta == null || gamma == null) {
+                return;
+            }
+            lastOrientationTimeMs = performance.now();
+            setCapability('optical', 'orientation', 'ok', '系统持续返回有效姿态数据');
+
+            alpha = alpha * Math.PI / 180;
+            beta = beta * Math.PI / 180;
+            gamma = gamma * Math.PI / 180;
+
+            // Use the OS-fused DeviceOrientation as the single optical-mode
+            // attitude source, then convert it into WebXR viewer axes. Raw
+            // gyro integration is intentionally not used because its bias
+            // produces visible drift while the phone is stationary.
+            const q = deviceOrientationToViewerQuaternion(alpha, beta, gamma);
+            const matrix = quaternionToMatrix(q);
+            currentRotationMatrix = opticalPoseFromRotation(matrix);
+
+            updateDebugPanel(
+                opticalFlow.currentQuality(), trackingMode,
+                trackingMode === 'optical_flow' ? 'optical-pose' : 'none',
+                'device-orientation'
+            );
+
+            sendImmediateMessage({
+                pose: currentRotationMatrix.slice(),
+                linearVelocity: [0, 0, 0],
+                angularVelocity: [0, 0, 0],
+                trackingMode: trackingMode,
+                trackingQuality: opticalFlow.controlQuality(),
+                velocitySource: 'optical-pose',
+                angularVelocitySource: 'device-orientation',
+            });
+        }
+
+        function requestMotionPermission() {
+            if (typeof DeviceOrientationEvent === 'undefined') {
+                document.getElementById('orientation-support').textContent = '当前浏览器不支持';
+                updateSensorPermissionButton(true, '当前浏览器不支持系统姿态');
+                setCapability('optical', 'orientation', 'fail', '浏览器未提供DeviceOrientation');
+                return;
+            }
+
+            if (typeof DeviceOrientationEvent.requestPermission === 'function') {
+                document.getElementById('orientation-support').textContent = '等待授权';
+                updateSensorPermissionButton(true, '授权请求中...');
+                setCapability('optical', 'orientation', 'pending', '正在请求系统姿态权限');
+                DeviceOrientationEvent.requestPermission()
+                    .then(permissionState => {
+                        if (permissionState === 'granted') {
+                            document.getElementById('orientation-support').textContent = '已授权';
+                            updateSensorPermissionButton(true, '系统姿态已授权');
+                            setCapability('optical', 'orientation', 'pending', '已授权，等待有效姿态数据');
+                            if (!orientationListenerAttached) {
+                                attachOrientationListener('deviceorientation');
+                            }
+                        } else {
+                            document.getElementById('orientation-support').textContent = '权限被拒绝';
+                            updateSensorPermissionButton(false, '重新请求系统姿态授权');
+                            setCapability('optical', 'orientation', 'fail', '系统姿态权限被拒绝');
+                            alert('运动传感器权限被拒绝，请授权后再使用该页面。');
+                        }
+                    })
+                    .catch(error => {
+                        document.getElementById('orientation-support').textContent = '授权失败';
+                        updateSensorPermissionButton(false, '重试系统姿态授权');
+                        setCapability('optical', 'orientation', 'fail', error.message || '系统姿态授权失败');
+                        console.error(error);
+                    });
+                return;
+            }
+
+            document.getElementById('orientation-support').textContent = '已启用';
+            updateSensorPermissionButton(true, '当前浏览器无需手动授权');
+            setCapability('optical', 'orientation', 'pending', '等待有效姿态数据');
+            if (!orientationListenerAttached) {
+                attachOrientationListener('deviceorientation');
+            }
+        }
+
+        sensorPermissionButton.addEventListener('click', function(event) {
+            suppressDefaultInteraction(event);
+            requestMotionPermission();
+        });
+
+        scaleSlider.addEventListener('input', function(event) {
+            setMotionScale(scaleSliderToValue(event.target.value));
+            sendImmediateMessage();
+        });
+
+        bindHoldButton(buttonAEl, 'buttonA');
+        bindHoldButton(buttonBEl, 'buttonB');
+        bindMotionArea(motionArea);
+
+        function flashButton(btn, duration) {
+            btn.classList.add('pressed-flash');
+            setTimeout(function() { btn.classList.remove('pressed-flash'); }, duration || 300);
+        }
+
+        resetButtonEl.addEventListener('pointerdown', function(event) {
+            suppressDefaultInteraction(event);
+            if (moveActive) {
+                showOperationNotice('请先松开使能再重新标定', true);
+                return;
+            }
+            if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+                showOperationNotice('当前未连接，无法重新标定', true);
+                return;
+            }
+            flashButton(resetButtonEl);
+            if (cameraEnabled && !arSessionManager.isActive) {
+                resetOpticalVirtualPose(true);
+            }
+            sendSyntheticPoseIfNeeded();
+            sendImmediateMessage({ reset: true });
+            showOperationNotice('标定完成，请重新按住使能', false, 6000);
+        });
+
+        homeButtonEl.addEventListener('pointerdown', function(event) {
+            suppressDefaultInteraction(event);
+            if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            flashButton(homeButtonEl);
+            resetControls();
+            sendSyntheticPoseIfNeeded();
+            sendImmediateMessage({ goHome: true });
+            showOperationNotice('回零中，完成后请重新按住使能', false, 6000);
+        });
+
+        debugToggleButton.addEventListener('pointerdown', function(event) {
+            suppressDefaultInteraction(event);
+            var debugPanel = document.getElementById('debugPanel');
+            if (debugPanel) {
+                var isHidden = debugPanel.style.display === 'none';
+                debugPanel.style.display = isHidden ? 'block' : 'none';
+                debugToggleButton.textContent = isHidden ? '隐藏详情' : '信息详情';
+                if (isHidden) {
+                    if (arSessionManager.isActive) {
+                        updateDebugPanel(
+                            0.5, trackingMode,
+                            'ar-pose',
+                            'webxr-orientation'
+                        );
+                    } else {
+                        updateDebugPanel(
+                            opticalFlow.currentQuality(), trackingMode,
+                            trackingMode === 'optical_flow' ? 'optical-pose' : 'none',
+                            moveActive ? 'device-orientation' : 'none'
+                        );
+                    }
+                }
+            }
+        });
+
+        ['contextmenu', 'selectstart', 'dragstart'].forEach(function(eventName) {
+            document.addEventListener(eventName, function(event) {
+                event.preventDefault();
+            });
+        });
+
+        // Keep two-finger operation (deadman + gripper) out of the browser's
+        // scroll/pinch gesture recognizer.  Some Android browsers otherwise
+        // emit pointercancel for the first finger when the second one lands.
+        document.addEventListener('touchmove', function(event) {
+            if (moveActive || buttonA || buttonB) event.preventDefault();
+        }, { passive: false });
+        ['gesturestart', 'gesturechange', 'gestureend'].forEach(function(eventName) {
+            document.addEventListener(eventName, function(event) {
+                if (moveActive || buttonA || buttonB) event.preventDefault();
+            }, { passive: false });
+        });
+
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                resetControls();
+                sendImmediateMessage();
+            } else if (!isConnected) {
+                reconnectAttempts = 0;
+                scheduleWebSocketReconnect(true);
+            }
+        });
+
+        function releaseForPageLifecycle() {
+            resetControls();
+            sendImmediateMessage();
+        }
+
+        // Mobile Chrome may emit window blur while showing browser chrome or a
+        // transient system overlay. Those events do not mean the page stopped
+        // being the active control surface. visibilitychange covers app
+        // switching and screen lock; pagehide/freeze cover navigation and
+        // lifecycle suspension without introducing false deadman releases.
+        window.addEventListener('pagehide', releaseForPageLifecycle);
+        document.addEventListener('freeze', releaseForPageLifecycle);
+
+        // Mobile browsers frequently suspend timers and sockets while the tab
+        // is in the background. Re-entering the page or recovering the network
+        // must restart the transport even if the previous retry budget elapsed.
+        ['focus', 'online', 'pageshow'].forEach(function(eventName) {
+            window.addEventListener(eventName, function() {
+                if (!isConnected) {
+                    reconnectAttempts = 0;
+                    scheduleWebSocketReconnect(true);
+                }
+            });
+        });
+
+        // ============================================================
+        // Optical Flow Module
+        // ============================================================
+
+        const opticalFlow = {
+            featureCount: 0,
+            trackingQuality: 0,
+            lastResultTime: 0,
+            lastAppliedTimestamp: 0,
+            processingMs: 0,
+            translationSuppressed: false,
+            translationGain: 1,
+            rotationRateRadS: 0,
+            rotationCompensationConfidence: 0,
+            yawModelUsed: false,
+            PROCESS_WIDTH: 320,
+            PROCESS_HEIGHT: 240,
+            PROCESS_INTERVAL_MS: 50,
+            lastFrameTime: 0,
+            animFrameId: null,
+            worker: null,
+            workerReady: false,
+            workerBusy: false,
+
+            init: function() {
+                featureOverlay.width = this.PROCESS_WIDTH;
+                featureOverlay.height = this.PROCESS_HEIGHT;
+
+                if ('Worker' in window && 'OffscreenCanvas' in window && 'createImageBitmap' in window) {
+                    try {
+                        const self = this;
+                        this.worker = new Worker('optical_flow_worker.js?v=15');
+                        this.worker.onmessage = function(event) {
+                            self._handleWorkerMessage(event.data);
+                        };
+                        this.worker.onerror = function(error) {
+                            console.error('Optical-flow worker failed:', error);
+                            self.workerBusy = false;
+                            self.workerReady = false;
+                            self.trackingQuality = 0;
+                            setCapability('optical', 'processing', 'fail', '光流Worker运行失败');
+                        };
+                        this.worker.postMessage({
+                            type: 'init',
+                            width: this.PROCESS_WIDTH,
+                            height: this.PROCESS_HEIGHT
+                        });
+                    } catch (error) {
+                        console.error('Could not create optical-flow worker:', error);
+                        this.worker = null;
+                        setCapability('optical', 'processing', 'fail', error.message || '无法创建光流Worker');
+                    }
+                } else {
+                    console.warn('This browser lacks Web Worker/OffscreenCanvas optical-flow support');
+                    setCapability('optical', 'processing', 'fail', '缺少Worker、OffscreenCanvas或createImageBitmap');
+                }
+            },
+
+            startTracking: function() {
+                if (this.animFrameId) return;
+                this.lastFrameTime = performance.now();
+                this.trackingQuality = 0;
+                this.lastResultTime = 0;
+                this.lastAppliedTimestamp = 0;
+                this.processingMs = 0;
+                this.translationSuppressed = false;
+                this.translationGain = 1;
+                this.rotationRateRadS = 0;
+                this.rotationCompensationConfidence = 0;
+                this.yawModelUsed = false;
+                this.workerBusy = false;
+                if (this.workerReady && this.worker) {
+                    this.worker.postMessage({ type: 'reset' });
+                }
+                this._trackLoop();
+            },
+
+            stopTracking: function() {
+                if (this.animFrameId) {
+                    cancelAnimationFrame(this.animFrameId);
+                    this.animFrameId = null;
+                }
+                this.trackingQuality = 0;
+                this.lastResultTime = 0;
+                this.lastAppliedTimestamp = 0;
+                this.processingMs = 0;
+                this.translationSuppressed = false;
+                this.translationGain = 1;
+                this.rotationRateRadS = 0;
+                this.rotationCompensationConfidence = 0;
+                this.yawModelUsed = false;
+                this.featureCount = 0;
+                this.workerBusy = false;
+                this.workerReady = false;
+                if (this.worker) {
+                    this.worker.terminate();
+                    this.worker = null;
+                }
+                const ctx = featureOverlay.getContext('2d');
+                ctx.clearRect(0, 0, featureOverlay.width, featureOverlay.height);
+            },
+
+            _trackLoop: function() {
+                const self = this;
+                this.animFrameId = requestAnimationFrame(function() {
+                    self._submitWorkerFrame();
+                    self._trackLoop();
+                });
+            },
+
+            _submitWorkerFrame: function() {
+                if (!this.worker || !this.workerReady || this.workerBusy || !cameraVideo.videoWidth) return;
+                const now = performance.now();
+                if (now - this.lastFrameTime < this.PROCESS_INTERVAL_MS) return;
+                this.lastFrameTime = now;
+                this.workerBusy = true;
+                const self = this;
+                const orientationAtCapture = rotationOnly(currentRotationMatrix);
+                createImageBitmap(cameraVideo).then(function(bitmap) {
+                    if (!self.worker || !cameraEnabled) {
+                        bitmap.close();
+                        self.workerBusy = false;
+                        return;
+                    }
+                    self.worker.postMessage({
+                        type: 'frame',
+                        bitmap: bitmap,
+                        timestamp: now,
+                        orientation: orientationAtCapture
+                    }, [bitmap]);
+                }).catch(function(error) {
+                    console.error('Could not capture camera frame:', error);
+                    self.workerBusy = false;
+                });
+            },
+
+            _handleWorkerMessage: function(message) {
+                if (message.type === 'ready') {
+                    this.workerReady = true;
+                    this.workerBusy = false;
+                    setCapability('optical', 'processing', 'ok', '光流Worker已就绪');
+                    return;
+                }
+                if (message.type === 'error') {
+                    console.error('Optical-flow worker error:', message.message);
+                    this.workerBusy = false;
+                    this.trackingQuality = 0;
+                    setCapability('optical', 'processing', 'fail', message.message || '光流Worker处理失败');
+                    return;
+                }
+                if (message.type !== 'result') return;
+                this.workerBusy = false;
+                const localDelta = Array.isArray(message.delta) ? message.delta : [0, 0, 0];
+                this.trackingQuality = Number.isFinite(message.quality) ? message.quality : 0;
+                this.featureCount = Number.isFinite(message.reliableCount) ? message.reliableCount : 0;
+                this.processingMs = Number.isFinite(message.processingMs) ? message.processingMs : 0;
+                this.translationSuppressed = message.translationSuppressed === true;
+                this.translationGain = Number.isFinite(message.translationGain) ? message.translationGain : 1;
+                this.rotationRateRadS = Number.isFinite(message.rotationRateRadS) ? message.rotationRateRadS : 0;
+                this.rotationCompensationConfidence = Number.isFinite(message.rotationCompensationConfidence)
+                    ? message.rotationCompensationConfidence
+                    : 0;
+                this.yawModelUsed = message.yawModelUsed === true;
+                this.lastResultTime = performance.now();
+                if (
+                    message.accepted === true && moveActive && Number.isFinite(message.timestamp) &&
+                    message.timestamp > this.lastAppliedTimestamp
+                ) {
+                    this.lastAppliedTimestamp = message.timestamp;
+                    var worldDelta = rotateVectorByRotation3(
+                        localDelta[0], localDelta[1], localDelta[2], message.frameOrientation
+                    );
+                    opticalVirtualPosition[0] += worldDelta[0];
+                    opticalVirtualPosition[1] += worldDelta[1];
+                    opticalVirtualPosition[2] += worldDelta[2];
+                    var displacement = Math.hypot(
+                        opticalVirtualPosition[0], opticalVirtualPosition[1], opticalVirtualPosition[2]
+                    );
+                    if (displacement > 0.35) {
+                        var limitRatio = 0.35 / displacement;
+                        opticalVirtualPosition = opticalVirtualPosition.map(function(value) {
+                            return value * limitRatio;
+                        });
+                    }
+                    currentRotationMatrix = opticalPoseFromRotation(currentRotationMatrix);
+                }
+                this._drawFeatures(Array.isArray(message.features) ? message.features : []);
+                if (cameraEnabled && trackingMode === 'optical_flow') {
+                    // A fresh worker result is also a valid control heartbeat.
+                    // This supplements setInterval on mobile browsers that
+                    // occasionally delay main-page timers under load.
+                    sendControlHeartbeat();
+                }
+            },
+
+            resetTrackingBaseline: function() {
+                this.trackingQuality = 0;
+                this.lastResultTime = 0;
+                this.lastAppliedTimestamp = 0;
+                this.processingMs = 0;
+                this.translationSuppressed = false;
+                this.translationGain = 1;
+                this.rotationRateRadS = 0;
+                this.rotationCompensationConfidence = 0;
+                this.yawModelUsed = false;
+                if (this.workerReady && this.worker) this.worker.postMessage({ type: 'reset' });
+            },
+
+            currentQuality: function() {
+                if (this.lastResultTime <= 0 || performance.now() - this.lastResultTime > 150) return 0;
+                return this.trackingQuality;
+            },
+
+            orientationFresh: function() {
+                return lastOrientationTimeMs > 0 && performance.now() - lastOrientationTimeMs <= 250;
+            },
+
+            controlQuality: function() {
+                var visualQuality = this.currentQuality();
+                // Component-wise degradation: weak vision freezes translation,
+                // while fresh system-fused attitude can still provide safe
+                // rotation control.
+                // Only loss of both components closes the server gate.
+                return this.orientationFresh() ? Math.max(visualQuality, 0.25) : visualQuality;
+            },
+
+            _drawFeatures: function(features) {
+                var ctx = featureOverlay.getContext('2d');
+                ctx.clearRect(0, 0, featureOverlay.width, featureOverlay.height);
+
+                var scaleX = featureOverlay.width / this.PROCESS_WIDTH;
+                var scaleY = featureOverlay.height / this.PROCESS_HEIGHT;
+
+                ctx.fillStyle = '#ff0000';
+                for (var i = 0; i < features.length; i++) {
+                    var x = features[i].x * scaleX;
+                    var y = features[i].y * scaleY;
+                    ctx.beginPath();
+                    ctx.arc(x, y, 1.25, 0, 2 * Math.PI);
+                    ctx.fill();
+                }
+            }
+        };
+
+        // ============================================================
+        // Optical-flow virtual WebXR pose state
+        // ============================================================
+
+        function updateTrackingStatusUI() {
+            if (!cameraEnabled && !arSessionManager.isActive) {
+                trackingStatusEl.innerHTML = '<span class="quality-poor">未启用 — 请优先启用 AR；不支持时再启用摄像头</span>';
+                return;
+            }
+
+            var modeText = trackingMode === 'ar_6dof'
+                ? 'AR 6DoF'
+                : (trackingMode === 'optical_flow' ? '光流+系统姿态' : '未追踪');
+            var velSrcText = '';
+            if (arSessionManager.isActive) {
+                velSrcText = ' | 位姿：<span class="quality-good">WebXR</span>';
+                var q = arSessionManager.isActive ? 0.9 : 0;
+                var qualityClass = q >= 0.55 ? 'quality-good' : (q >= 0.20 ? 'quality-fair' : 'quality-poor');
+                var qualityText = q >= 0.75 ? '优秀' : (q >= 0.55 ? '良好' : (q >= 0.30 ? '一般' : '差'));
+                trackingStatusEl.innerHTML =
+                    '追踪模式：<strong>' + modeText + '</strong>' + velSrcText +
+                    ' | 质量：<span class="' + qualityClass + '">' + qualityText + '</span>';
+                return;
+            }
+
+            var q = opticalFlow.currentQuality();
+            var fc = opticalFlow.featureCount;
+            var qualityClass = q >= 0.55 ? 'quality-good' : (q >= 0.20 ? 'quality-fair' : 'quality-poor');
+            var qualityText = q >= 0.75 ? '优秀' : (q >= 0.55 ? '良好' : (q >= 0.30 ? '一般' : '差'));
+            var processingText = opticalFlow.processingMs > 0 ? opticalFlow.processingMs.toFixed(0) + 'ms' : '-';
+            var positionState;
+            if (opticalFlow.translationSuppressed) {
+                positionState = '<span class="quality-fair">低置信冻结</span>';
+            } else if (opticalFlow.yawModelUsed) {
+                positionState = '<span class="quality-good">分离中 | 平移保留' +
+                    Math.round(opticalFlow.translationGain * 100) + '% | 置信' +
+                    Math.round(opticalFlow.rotationCompensationConfidence * 100) + '%</span>';
+            } else if (opticalFlow.rotationRateRadS >= 0.15) {
+                positionState = '<span class="quality-good">补偿中 | 平移保留' +
+                    Math.round(opticalFlow.translationGain * 100) + '% | 置信' +
+                    Math.round(opticalFlow.rotationCompensationConfidence * 100) + '%</span>';
+            } else {
+                positionState = '<span class="quality-good">跟踪</span>';
+            }
+            var orientationText = opticalFlow.orientationFresh()
+                ? '<span class="quality-good">系统融合有效</span>'
+                : '<span class="quality-poor">等待</span>';
+            var controlText = 'Pose位置';
+
+            trackingStatusEl.innerHTML =
+                '控制：<strong>' + controlText + '</strong> | 追踪：<strong>' + modeText + '</strong><br>' +
+                '可靠点：<strong>' + fc + '</strong> | 位置：' + positionState + ' | 耗时：<strong>' + processingText + '</strong><br>' +
+                '视觉：<span class="' + qualityClass + '">' + qualityText + ' (' + q.toFixed(2) + ')</span>' +
+                ' | 姿态：' + orientationText;
+        }
+
+        function sendControlHeartbeat() {
+            if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+                return;
+            }
+            if (arSessionManager && arSessionManager.isActive && currentRotationMatrix) {
+                sendImmediateMessage({
+                    pose: currentRotationMatrix.slice(),
+                    linearVelocity: [0, 0, 0],
+                    angularVelocity: [0, 0, 0],
+                    trackingMode: 'ar_6dof',
+                    trackingQuality: 0.9,
+                    velocitySource: 'ar-pose',
+                    angularVelocitySource: 'webxr-orientation',
+                });
+                return;
+            }
+            if (cameraEnabled) {
+                var orientationCapability = capabilityFor('optical', 'orientation');
+                if (orientationCapability.state !== 'fail') {
+                    setCapability(
+                        'optical', 'orientation', opticalFlow.orientationFresh() ? 'ok' : 'pending',
+                        opticalFlow.orientationFresh() ? '系统姿态数据正常' : '等待新的系统姿态数据'
+                    );
+                }
+                setSyntheticPoseIfNeeded();
+                sendImmediateMessage({
+                    pose: currentRotationMatrix.slice(),
+                    linearVelocity: [0, 0, 0],
+                    angularVelocity: [0, 0, 0],
+                    trackingMode: 'optical_flow',
+                    trackingQuality: opticalFlow.controlQuality(),
+                    velocitySource: 'optical-pose',
+                    angularVelocitySource: 'device-orientation',
+                });
+                return;
+            }
+            // Keep non-motion controls alive before tracking starts. This safe
+            // heartbeat carries gripper state and resets one-shot Home edges,
+            // while trackingMode=disabled and move=false cannot command the arm.
+            setSyntheticPoseIfNeeded();
+            sendImmediateMessage({
+                pose: currentRotationMatrix.slice(),
+                linearVelocity: [0, 0, 0],
+                angularVelocity: [0, 0, 0],
+                trackingMode: 'disabled',
+                trackingQuality: 0,
+                velocitySource: 'none',
+                angularVelocitySource: 'none',
+            });
+        }
+
+        setInterval(sendControlHeartbeat, CONTROL_HEARTBEAT_INTERVAL_MS);
+        setInterval(updateTrackingStatusUI, 500);
+
+        // ============================================================
+        // Camera Toggle
+        // ============================================================
+
+        async function requestCameraFullscreen() {
+            var root = document.documentElement;
+            var request = root.requestFullscreen || root.webkitRequestFullscreen;
+            if (document.fullscreenElement || document.webkitFullscreenElement || !request) return;
+            try {
+                await request.call(root, { navigationUI: 'hide' });
+            } catch (error) {
+                try {
+                    await request.call(root);
+                } catch (fallbackError) {
+                    console.debug('Fullscreen request unavailable:', fallbackError || error);
+                }
+            }
+        }
+
+        async function exitCameraFullscreen() {
+            var exit = document.exitFullscreen || document.webkitExitFullscreen;
+            if ((!document.fullscreenElement && !document.webkitFullscreenElement) || !exit) return;
+            try {
+                await exit.call(document);
+            } catch (error) {
+                console.debug('Fullscreen exit unavailable:', error);
+            }
+        }
+
+        async function toggleCamera() {
+            if (cameraEnabled) {
+                resetControls();
+                sendImmediateMessage({
+                    trackingMode: 'disabled',
+                    trackingQuality: 0,
+                    linearVelocity: [0, 0, 0],
+                    angularVelocity: [0, 0, 0]
+                });
+                cameraEnabled = false;
+                opticalFlow.stopTracking();
+
+                if (cameraStream) {
+                    cameraStream.getTracks().forEach(function(t) { t.stop(); });
+                    cameraStream = null;
+                }
+                cameraVideo.srcObject = null;
+                cameraPreviewContainer.classList.remove('visible');
+                cameraToggleButton.textContent = '启用摄像头';
+                cameraToggleButton.classList.remove('active-cam');
+                document.body.classList.remove('camera-active', 'tracking-active');
+                await exitCameraFullscreen();
+                trackingMode = 'disabled';
+                opticalVirtualPosition = [0, 0, 0];
+                return;
+            }
+
+            if (serverConfig.optical_flow_fallback_enabled !== true) {
+                alert('当前机器人配置未启用光流 pose 降级。');
+                return;
+            }
+
+            var blockers = staticCapabilityFailures('optical');
+            if (blockers.length > 0) {
+                showOperationNotice('光流缺少必需能力：' + blockers.map(function(item) {
+                    return item.label;
+                }).join('、'), true, 6000);
+                return;
+            }
+
+            await requestCameraFullscreen();
+            setCapability('optical', 'cameraPermission', 'pending', '正在请求摄像头权限');
+            try {
+                cameraStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'environment',
+                        width: { ideal: 640 },
+                        height: { ideal: 480 }
+                    }
+                });
+
+                cameraVideo.srcObject = cameraStream;
+                await cameraVideo.play();
+                setCapability('optical', 'cameraPermission', 'ok', '摄像头权限已授予，视频流正常');
+
+                cameraEnabled = true;
+                trackingMode = 'optical_flow';
+                resetOpticalVirtualPose(false);
+                cameraPreviewContainer.classList.add('visible');
+                cameraToggleButton.textContent = '关闭摄像头';
+                cameraToggleButton.classList.add('active-cam');
+                document.body.insertBefore(trackingExitButtonEl, document.body.firstChild);
+                document.body.classList.remove('ar-active');
+                document.body.classList.add('camera-active', 'tracking-active');
+                trackingExitButtonEl.textContent = '退出光流';
+
+                opticalFlow.init();
+                opticalFlow.startTracking();
+            } catch (err) {
+                cameraEnabled = false;
+                opticalFlow.stopTracking();
+                if (cameraStream) {
+                    cameraStream.getTracks().forEach(function(t) { t.stop(); });
+                    cameraStream = null;
+                }
+                cameraVideo.srcObject = null;
+                cameraPreviewContainer.classList.remove('visible');
+                cameraToggleButton.textContent = '启用摄像头';
+                cameraToggleButton.classList.remove('active-cam');
+                document.body.classList.remove('camera-active', 'tracking-active');
+                await exitCameraFullscreen();
+                setCapability('optical', 'cameraPermission', 'fail', err.message || '摄像头访问失败');
+                console.error('Camera access failed:', err);
+                alert('无法访问摄像头，请确认已授予权限。错误：' + err.message);
+            }
+        }
+
+        cameraToggleButton.addEventListener('click', function(event) {
+            suppressDefaultInteraction(event);
+            toggleCamera();
+        });
+
+        document.getElementById('arToggleButton').addEventListener('click', function(event) {
+            suppressDefaultInteraction(event);
+            if (arSessionManager.isActive) {
+                arSessionManager.stop();
+            } else {
+                arSessionManager.start();
+            }
+        });
+
+        async function exitTrackingMode(event) {
+            suppressDefaultInteraction(event);
+            if (arSessionManager.isActive) {
+                resetControls();
+                sendImmediateMessage();
+                arSessionManager.stop();
+                showOperationNotice('已退出 AR，请重新选择追踪模式', false);
+            } else if (cameraEnabled) {
+                await toggleCamera();
+                showOperationNotice('已退出光流，请重新选择追踪模式', false);
+            }
+        }
+
+        trackingExitButtonEl.addEventListener('pointerdown', exitTrackingMode);
+
+        // ============================================================
+        // Init
+        // ============================================================
+
+        async function init() {
+            initializeCapabilityChecks();
+            checkOrientationSupport();
+            // Set initial scale from slider index (default 9 = 1.0x)
+            scaleSlider.value = '9';
+            setMotionScale(scaleSliderToValue(scaleSlider.value));
+            // Gripper commands must be usable before AR, camera, or sensor
+            // initialization.  A safe identity pose keeps the transport frame
+            // complete while move=false prevents any arm motion.
+            setSyntheticPoseIfNeeded();
+            var initResults = await Promise.all([checkARSupport(), fetchConfig()]);
+            updateARGuidanceUI();
+            if (!initResults[1]) {
+                return;
+            }
+            connectWebSocket();
+            if (typeof DeviceOrientationEvent !== 'undefined'
+                && typeof DeviceOrientationEvent.requestPermission !== 'function') {
+                requestMotionPermission();
+            }
+        }
+
+        // Deferred local scripts are ready before DOMContentLoaded. Fetch the
+        // runtime endpoint/protocol configuration before opening WebSocket.
+        document.addEventListener('DOMContentLoaded', init);
+    </script>
+</body>
+</html>

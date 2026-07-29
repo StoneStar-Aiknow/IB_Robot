@@ -1,13 +1,12 @@
 """
 Phone teleoperation device implementation.
 
-Supports iOS (via HEBI Mobile I/O) and Android (via WebXR) for
-6-DoF pose-based robot teleoperation.
+Uses browser-based WebXR or optical-flow input for relative-pose Cartesian
+phone teleoperation.
 """
 
 import logging
 import threading
-import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,361 +16,83 @@ from tf2_ros import Buffer, TransformListener
 
 from ..base_teleop import BaseTeleopDevice
 from ..cartesian_backend import make_cartesian_backend
-from .config_phone import PhoneConfig, PhoneOS
+from ..vr_rotation import compute_base_rotation_delta, remap_base_rotation
+from .config_phone import PhoneConfig
+from .web_phone import WebPhone
 
 logger = logging.getLogger(__name__)
+
+_MAX_WEBPHONE_STOP_REQUEST_LATENCY_S = 0.22
+
+# Proper rotation from the calibrated Web control frame to the robot base frame.
+# Translation and rotation must share this basis so one browser pose remains one
+# rigid-body transform all the way to the Placo base-frame pose contract.
+_WEB_WORLD_TO_BACKEND = np.array(
+    [
+        [0.0, 0.0, -1.0],
+        [-1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+    ]
+)
+
+
+def compute_webphone_pose_delta(
+    current_position: np.ndarray,
+    current_rotation: Rotation,
+    clutch_position: np.ndarray,
+    clutch_rotation: Rotation,
+    *,
+    position_scale: float,
+    angular_scale: float,
+    user_scale: float,
+) -> tuple[np.ndarray, Rotation]:
+    """Map a browser viewer-pose delta into the Placo base-frame contract."""
+    relative_position = (
+        (_WEB_WORLD_TO_BACKEND @ (np.asarray(current_position, dtype=float) - np.asarray(clutch_position, dtype=float)))
+        * position_scale
+        * user_scale
+    )
+    control_delta = compute_base_rotation_delta(current_rotation, clutch_rotation)
+    # WebXR or the optical virtual pose supplies an active viewer-to-world
+    # orientation. Preserve that active relative-rotation direction when
+    # re-expressing it in the robot base frame; Placo then left-multiplies the
+    # result onto the clutch-baseline tool attitude.
+    base_delta = remap_base_rotation(control_delta, _WEB_WORLD_TO_BACKEND)
+    scaled_rotvec = base_delta.as_rotvec() * angular_scale * user_scale
+    return relative_position, Rotation.from_rotvec(scaled_rotvec)
 
 
 @dataclass
 class _CartesianCommand:
-    """Internal per-cycle Cartesian command from phone (linear/angular displacement + gripper)."""
+    """Internal per-cycle phone command for the Cartesian backend and gripper."""
 
-    linear: "np.ndarray"
-    angular: "np.ndarray"
     gripper_pos: float = 0.0
     go_home: bool = False
-
-
-class BasePhone:
-    """Base class for phone teleoperation with calibration support."""
-
-    _enabled: bool = False
-    _calib_pos: np.ndarray | None = None
-    _calib_rot_inv: Rotation | None = None
-
-    def _reapply_position_calibration(self, pos: np.ndarray) -> None:
-        """Reapply position calibration (called on enable rising edge)."""
-        self._calib_pos = pos.copy()
-
-    @property
-    def is_calibrated(self) -> bool:
-        """Check if the phone has been calibrated."""
-        return (self._calib_pos is not None) and (self._calib_rot_inv is not None)
-
-    def get_action_features(self) -> dict[str, type]:
-        """Get the action features provided by this phone."""
-        return {
-            "phone.pos": np.ndarray,
-            "phone.rot": Rotation,
-            "phone.raw_inputs": dict,
-            "phone.enabled": bool,
-        }
-
-
-class IOSPhone(BasePhone):
-    """
-    iOS phone teleoperation via HEBI Mobile I/O app.
-
-    Uses HEBI SDK to communicate with the Mobile I/O app for
-    ARKit-based 6-DoF pose tracking.
-    """
-
-    def __init__(self, config: PhoneConfig):
-        self.config = config
-        self._group = None
-        self._is_connected = False
-
-    @property
-    def is_connected(self) -> bool:
-        return self._is_connected and self._group is not None
-
-    def connect(self) -> bool:
-        """Connect to iOS device via HEBI SDK."""
-        try:
-            import hebi
-
-            logger.info("Connecting to iPhone, make sure to open the HEBI Mobile I/O app.")
-            lookup = hebi.Lookup()
-            time.sleep(2.0)
-
-            group = lookup.get_group_from_names(["HEBI"], ["mobileIO"])
-            if group is None:
-                raise RuntimeError("Mobile I/O not found — check name/family settings in the app.")
-
-            self._group = group
-            self._is_connected = True
-            logger.info(f"Connected to HEBI group with {group.size} module(s).")
-
-            self.calibrate()
-            return True
-
-        except ImportError:
-            logger.error("=" * 60)
-            logger.error("MISSING DEPENDENCY: HEBI Python SDK not installed!")
-            logger.error("")
-            logger.error("This package is required for iOS phone teleoperation.")
-            logger.error("")
-            logger.error("Install with:")
-            logger.error("    pip install hebi-py")
-            logger.error("")
-            logger.error("Or install all phone dependencies:")
-            logger.error("    pip install -r $(ros2 pkg prefix robot_teleop)/share/robot_teleop/requirements.txt")
-            logger.error("=" * 60)
-            return False
-        except Exception as e:
-            logger.error(f"Failed to connect to iOS device: {e}")
-            self._is_connected = False
-            return False
-
-    def calibrate(self) -> None:
-        """Perform calibration by capturing reference pose."""
-        print(
-            "Hold the phone so that: top edge points forward in same direction "
-            "as the robot (robot +x) and screen points up (robot +z)"
-        )
-        print("Press and hold B1 in the HEBI Mobile I/O app to capture this pose...\n")
-
-        position, rotation = self._wait_for_capture_trigger()
-        self._calib_pos = position.copy()
-        self._calib_rot_inv = rotation.inv()
-        self._enabled = False
-        print("Calibration done\n")
-
-    def _wait_for_capture_trigger(self) -> tuple[np.ndarray, Rotation]:
-        """Wait for B1 button press to capture calibration pose."""
-        while True:
-            has_pose, position, rotation, fb_pose = self._read_current_pose()
-            if not has_pose:
-                time.sleep(0.01)
-                continue
-
-            io = getattr(fb_pose, "io", None)
-            button_b = getattr(io, "b", None) if io is not None else None
-            button_b1_pressed = False
-            if button_b is not None:
-                button_b1_pressed = bool(button_b.get_int(1))
-
-            if button_b1_pressed:
-                return position, rotation
-
-            time.sleep(0.01)
-
-    def _read_current_pose(
-        self,
-    ) -> tuple[bool, np.ndarray | None, Rotation | None, Any]:
-        """Read the current 6-DoF pose from the iOS device."""
-        if self._group is None:
-            return False, None, None, None
-
-        fbk = self._group.get_next_feedback()
-        pose = fbk[0]
-        ar_pos = getattr(pose, "ar_position", None)
-        ar_quat = getattr(pose, "ar_orientation", None)
-
-        if ar_pos is None or ar_quat is None:
-            return False, None, None, None
-
-        quat_xyzw = np.concatenate((ar_quat[1:], [ar_quat[0]]))
-        rot = Rotation.from_quat(quat_xyzw)
-        pos = ar_pos - rot.apply(self.config.camera_offset)
-
-        return True, pos, rot, pose
-
-    def get_action(self) -> dict[str, Any]:
-        """Get the current phone action (pose and inputs)."""
-        has_pose, raw_position, raw_rotation, fb_pose = self._read_current_pose()
-
-        if not has_pose or not self.is_calibrated:
-            return {}
-
-        raw_inputs: dict[str, Any] = {}
-        io = getattr(fb_pose, "io", None)
-        if io is not None:
-            bank_a, bank_b = io.a, io.b
-            if bank_a:
-                for ch in range(1, 9):
-                    if bank_a.has_float(ch):
-                        raw_inputs[f"a{ch}"] = float(bank_a.get_float(ch))
-            if bank_b:
-                for ch in range(1, 9):
-                    if bank_b.has_int(ch):
-                        raw_inputs[f"b{ch}"] = int(bank_b.get_int(ch))
-                    elif hasattr(bank_b, "has_bool") and bank_b.has_bool(ch):
-                        raw_inputs[f"b{ch}"] = int(bank_b.get_bool(ch))
-
-        enable = bool(raw_inputs.get("b1", 0))
-
-        if enable and not self._enabled:
-            self._reapply_position_calibration(raw_position)
-
-        pos_cal = self._calib_rot_inv.apply(raw_position - self._calib_pos)
-        rot_cal = self._calib_rot_inv * raw_rotation
-
-        self._enabled = enable
-
-        return {
-            "phone.pos": pos_cal,
-            "phone.rot": rot_cal,
-            "phone.raw_inputs": raw_inputs,
-            "phone.enabled": self._enabled,
-        }
-
-    def disconnect(self) -> None:
-        """Disconnect from iOS device."""
-        self._group = None
-        self._is_connected = False
-
-
-class AndroidPhone(BasePhone):
-    """
-    Android phone teleoperation via WebXR.
-
-    Uses the teleop package to receive pose data from a WebXR session
-    in the phone's browser.
-    """
-
-    def __init__(self, config: PhoneConfig):
-        self.config = config
-        self._teleop = None
-        self._teleop_thread = None
-        self._latest_pose = None
-        self._latest_message = None
-        self._android_lock = threading.Lock()
-        self._is_connected = False
-
-    @property
-    def is_connected(self) -> bool:
-        return self._is_connected and self._teleop is not None
-
-    def connect(self) -> bool:
-        """Connect to Android device via teleop package."""
-        try:
-            from teleop import Teleop
-
-            logger.info("Starting teleop stream for Android...")
-            self._teleop = Teleop()
-            self._teleop.subscribe(self._android_callback)
-            self._teleop_thread = threading.Thread(target=self._teleop.run, daemon=True)
-            self._teleop_thread.start()
-            self._is_connected = True
-            logger.info("Connected, teleop stream started.")
-
-            self.calibrate()
-            return True
-
-        except ImportError:
-            logger.error("=" * 60)
-            logger.error("MISSING DEPENDENCY: 'teleop' package not installed!")
-            logger.error("")
-            logger.error("This package is required for Android phone teleoperation.")
-            logger.error("")
-            logger.error("Install with:")
-            logger.error("    pip install teleop")
-            logger.error("")
-            logger.error("Or install all phone dependencies:")
-            logger.error("    pip install -r $(ros2 pkg prefix robot_teleop)/share/robot_teleop/requirements.txt")
-            logger.error("=" * 60)
-            return False
-        except Exception as e:
-            logger.error(f"Failed to connect to Android device: {e}")
-            self._is_connected = False
-            return False
-
-    def calibrate(self) -> None:
-        """Perform calibration by capturing reference pose."""
-        print(
-            "Hold the phone so that: top edge points forward in same direction "
-            "as the robot (robot +x) and screen points up (robot +z)"
-        )
-        print("Touch and move on the WebXR page to capture this pose...\n")
-
-        pos, rot = self._wait_for_capture_trigger()
-        self._calib_pos = pos.copy()
-        self._calib_rot_inv = rot.inv()
-        self._enabled = False
-        print("Calibration done\n")
-
-    def _wait_for_capture_trigger(self) -> tuple[np.ndarray, Rotation]:
-        """Wait for touch move event to capture calibration pose."""
-        while True:
-            with self._android_lock:
-                msg = self._latest_message or {}
-
-            if bool(msg.get("move", False)):
-                ok, pos, rot, _pose = self._read_current_pose()
-                if ok:
-                    return pos, rot
-
-            time.sleep(0.01)
-
-    def _read_current_pose(
-        self,
-    ) -> tuple[bool, np.ndarray | None, Rotation | None, Any]:
-        """Read the latest pose from the Android device."""
-        with self._android_lock:
-            if self._latest_pose is None:
-                return False, None, None, None
-            p = self._latest_pose.copy()
-            pose = self._latest_pose
-
-        rot = Rotation.from_matrix(p[:3, :3])
-        pos = p[:3, 3] - rot.apply(self.config.camera_offset)
-
-        return True, pos, rot, pose
-
-    def _android_callback(self, pose: np.ndarray, message: dict) -> None:
-        """Callback for receiving pose data from Android device."""
-        with self._android_lock:
-            self._latest_pose = pose
-            self._latest_message = message
-
-    def get_action(self) -> dict[str, Any]:
-        """Get the current phone action (pose and inputs)."""
-        ok, raw_pos, raw_rot, pose = self._read_current_pose()
-
-        if not ok or not self.is_calibrated:
-            return {}
-
-        raw_inputs: dict[str, Any] = {}
-        msg = self._latest_message or {}
-        raw_inputs["move"] = bool(msg.get("move", False))
-        raw_inputs["scale"] = float(msg.get("scale", 1.0))
-        raw_inputs["reservedButtonA"] = bool(msg.get("reservedButtonA", False))
-        raw_inputs["reservedButtonB"] = bool(msg.get("reservedButtonB", False))
-
-        enable = bool(raw_inputs.get("move", False))
-
-        if enable and not self._enabled:
-            self._reapply_position_calibration(raw_pos)
-
-        pos_cal = self._calib_rot_inv.apply(raw_pos - self._calib_pos)
-        rot_cal = self._calib_rot_inv * raw_rot
-
-        self._enabled = enable
-
-        return {
-            "phone.pos": pos_cal,
-            "phone.rot": rot_cal,
-            "phone.raw_inputs": raw_inputs,
-            "phone.enabled": self._enabled,
-        }
-
-    def disconnect(self) -> None:
-        """Disconnect from Android device."""
-        self._teleop = None
-        if self._teleop_thread and self._teleop_thread.is_alive():
-            self._teleop_thread.join(timeout=1.0)
-            self._teleop_thread = None
-        self._latest_pose = None
-        self._is_connected = False
+    enabled: bool = False
+    pose_position: np.ndarray | None = None
+    pose_rotation: Rotation | None = None
+    user_scale: float = 1.0
 
 
 class PhoneDevice(BaseTeleopDevice):
     """
     Phone-based teleoperation device.
 
-    Supports iOS (via HEBI Mobile I/O) and Android (via WebXR).
+    Uses built-in WebPhone with WebXR AR or optical-flow input.
 
     Parses sensor data from the phone, drives the selected Cartesian backend for arm
-    control via servo_client.servo(), and returns only the gripper target to
-    TeleopNode for direct publishing.
+    control via relative-pose commands, and returns only the gripper
+    target to TeleopNode for direct publishing.
 
-    go_home mode switches to joint-position control: returns full arm+gripper
-    targets until the arm reaches home, then re-enables Servo.
+    Go-Home is delegated to the Placo backend, which reports measured joint
+    completion while PhoneDevice keeps a backend-independent deadman gate.
     """
 
     def __init__(self, config: dict, node=None):
         super().__init__(config, node=node)
+        if node is not None and hasattr(node, "get_logger"):
+            # Route device lifecycle and WebPhone access URLs through ROS logs.
+            self.logger = node.get_logger()
 
         phone_config_data = config.get("phone_config", {})
         if isinstance(phone_config_data, dict):
@@ -379,10 +100,14 @@ class PhoneDevice(BaseTeleopDevice):
         else:
             self.phone_config = PhoneConfig()
 
-        self._phone_impl: BasePhone | None = None
+        self._phone_impl: WebPhone | None = None
         self._last_gripper_pos: float = 0.0
-        self._prev_pos: np.ndarray | None = None
-        self._prev_rot: Rotation | None = None
+        self._pose_clutch_pos: np.ndarray | None = None
+        self._pose_clutch_rot: Rotation | None = None
+        self._pose_sent_pos = np.zeros(3)
+        self._pose_sent_rot = Rotation.identity()
+        self._pose_filtered_rotvec = np.zeros(3)
+        self._go_home_prev = False
 
         # _state_lock protects only shared state; ROS calls happen outside the lock
         self._state_lock = threading.Lock()
@@ -392,13 +117,27 @@ class PhoneDevice(BaseTeleopDevice):
         self._first_state_received = False
         self._going_home = False
         self._servo_enabled = False
-        self._home_start_time: float | None = None
+        self._deadman_release_required = False
+        self._last_command_failure_reason = "phone command unavailable"
 
         # Injected by teleop.py launch builder
         self.arm_joint_names = config.get("arm_joint_names", ["1", "2", "3", "4", "5"])
         self.gripper_joint_names = config.get("gripper_joint_names", ["6"])
-        self.home_joint_positions = config.get("home_joint_positions", [0.0, 0.0, 0.0, 0.0, 0.0])
-        self._control_dt = 1.0 / config.get("control_frequency", 30.0)
+        self._cartesian_solver = str(config.get("cartesian_solver", "placo_servo"))
+        if self._cartesian_solver != "placo_servo":
+            raise ValueError("PhoneDevice requires cartesian_solver=placo_servo")
+        raw_control_frequency = config.get("control_frequency", 50.0)
+        if isinstance(raw_control_frequency, bool):
+            raise ValueError("PhoneDevice control_frequency must be finite and positive")
+        control_frequency = float(raw_control_frequency)
+        if not np.isfinite(control_frequency) or control_frequency <= 0.0:
+            raise ValueError("PhoneDevice control_frequency must be finite and positive")
+        self._control_dt = 1.0 / control_frequency
+        if self.phone_config.web.command_stale_s + self._control_dt > _MAX_WEBPHONE_STOP_REQUEST_LATENCY_S + 1e-9:
+            raise ValueError(
+                "WebPhone command_stale_s plus one control period must not exceed "
+                f"{_MAX_WEBPHONE_STOP_REQUEST_LATENCY_S:.2f}s before a stop request is issued"
+            )
 
     def connect(self) -> bool:
         """Connect to phone hardware and initialise Cartesian backend."""
@@ -407,20 +146,18 @@ class PhoneDevice(BaseTeleopDevice):
             return False
 
         try:
-            if self.phone_config.phone_os == PhoneOS.IOS:
-                self._phone_impl = IOSPhone(self.phone_config)
-            elif self.phone_config.phone_os == PhoneOS.ANDROID:
-                self._phone_impl = AndroidPhone(self.phone_config)
-            else:
-                raise ValueError(f"Invalid phone_os: {self.phone_config.phone_os}")
+            self._phone_impl = WebPhone(self.phone_config)
 
             if not self._phone_impl.connect():
                 return False
 
             base_link = self._config.get("base_link_name", "base")
-            solver = self._config.get("cartesian_solver", "placo_servo")
+            solver = self._cartesian_solver
             tool_frame = self._config.get("tool_frame", "gripper")
             control_params = self._config.get("control_params", {}) or {}
+            backend_config = self._config.get("cartesian_backend_config", {}) or {}
+            if not isinstance(backend_config, dict):
+                raise ValueError("cartesian_backend_config must be a mapping")
             linear_speed = float(control_params.get("cartesian_linear_speed", 1.0))
             angular_speed = float(control_params.get("cartesian_angular_speed", 1.0))
 
@@ -435,9 +172,12 @@ class PhoneDevice(BaseTeleopDevice):
                 tool_frame=tool_frame,
                 linear_speed=linear_speed,
                 angular_speed=angular_speed,
+                input_mode=self.phone_config.cartesian_input_mode,
+                **backend_config,
             )
             self.logger.info(
-                f"PhoneDevice: cartesian solver={solver}, tool_frame={tool_frame}, "
+                f"PhoneDevice: cartesian solver={solver}, input_mode={self.phone_config.cartesian_input_mode}, "
+                f"tool_frame={tool_frame}, "
                 f"base={base_link}, linear_speed={linear_speed}, angular_speed={angular_speed}"
             )
 
@@ -449,10 +189,20 @@ class PhoneDevice(BaseTeleopDevice):
 
             self._is_connected = True
             self.logger.info("Phone device connected. Servo will be enabled on first control cycle.")
+            self.logger.warning(
+                "WebPhone has no user authentication and is only supported on a trusted internal LAN. "
+                "Do not expose its HTTP/WebSocket ports through public forwarding, cloud tunnels, "
+                "guest Wi-Fi, or untrusted VPNs; restrict access with the host or network firewall."
+            )
+            for url in self._phone_impl.access_urls:
+                self.logger.info(f"WebPhone page: {url}")
             return True
 
         except Exception as e:
             self.logger.error(f"Failed to connect phone device: {e}")
+            if self._phone_impl is not None:
+                self._phone_impl.disconnect()
+                self._phone_impl = None
             self._is_connected = False
             return False
 
@@ -460,186 +210,319 @@ class PhoneDevice(BaseTeleopDevice):
         """
         Drive the selected Cartesian backend for arm control; return gripper target.
 
-        During go_home: returns full arm+gripper targets for joint-position
-        control and re-enables Servo once arm reaches home position.
+        During go_home Placo owns joint-space motion and measured arrival
+        detection through the shared ArmReturnHome action.
         """
+        self._consume_transport_stop()
+
         # Read shared state under lock; ROS calls happen outside
         with self._state_lock:
             going_home = self._going_home
-            home_start_time = self._home_start_time
             first_state_rcvd = self._first_state_received
-            current_joints = dict(self._current_joint_states)
             servo_enabled = self._servo_enabled
 
         if going_home:
-            return self._compute_home_targets(current_joints, first_state_rcvd, home_start_time)
+            if self.servo_client is not None and not getattr(self.servo_client, "stop_pending", False):
+                self.servo_client.keepalive()
+            return self._update_home_state()
 
         cmd = self._get_cmd_internal()
         if cmd is None:
+            backend_active = bool(
+                self.servo_client and (servo_enabled or getattr(self.servo_client, "is_enabled", False))
+            )
+            if backend_active:
+                self._fail_closed_on_invalid_command(self._last_command_failure_reason)
             return {}
-
-        if not servo_enabled:
-            if first_state_rcvd and not cmd.go_home:
-                with self._state_lock:
-                    self._servo_enabled = True
-                self.servo_client.enable()
-                self.logger.info("Servo enabled: joint_states ready and phone control active.")
-            else:
-                return {}
-
-        if self.servo_client and not self.servo_client.is_enabled:
+        invalid_reason = self._validate_cartesian_command(cmd)
+        if invalid_reason is not None:
+            backend_active = bool(
+                self.servo_client and (servo_enabled or getattr(self.servo_client, "is_enabled", False))
+            )
+            if backend_active:
+                self._fail_closed_on_invalid_command(invalid_reason)
             return {}
+        if self.servo_client is not None and not getattr(self.servo_client, "stop_pending", False):
+            self.servo_client.keepalive()
 
         if cmd.go_home:
+            if self.servo_client is None or not self.servo_client.home():
+                self.logger.warning("Go-Home ignored because the Placo ArmReturnHome action is not ready")
+                return {self.gripper_joint_names[0]: cmd.gripper_pos}
             with self._state_lock:
                 self._going_home = True
-                self._home_start_time = self._node.get_clock().now().nanoseconds * 1e-9
-            if self.servo_client and self.servo_client.is_enabled:
-                self.servo_client.disable()  # ROS call, outside lock
-            return self._compute_home_targets(
-                current_joints, first_state_rcvd, self._node.get_clock().now().nanoseconds * 1e-9
-            )
+                self._servo_enabled = False
+                self._clear_pose_state_locked()
+            self._require_deadman_release("go-home requested", request_transport_stop=False)
+            return {self.gripper_joint_names[0]: cmd.gripper_pos}
 
-        # Cartesian control: normalize displacement to [-1, 1] for backend unitless mode.
-        # cmd.linear is already clamped to max_ee_step_m, so dividing gives values in [-1, 1].
-        max_lin = self.phone_config.max_ee_step_m
-        max_ang = self.phone_config.max_angular_step_rad
-        linear = tuple(float(v) / max_lin for v in cmd.linear)
-        angular = tuple(float(v) / max_ang for v in cmd.angular)
-        self.servo_client.servo(linear=linear, angular=angular)  # ROS call, outside lock
+        if not cmd.enabled:
+            self._disable_motion()
+            return {self.gripper_joint_names[0]: cmd.gripper_pos}
+
+        if not servo_enabled:
+            if first_state_rcvd:
+                requested = bool(self.servo_client and self.servo_client.enable())
+                with self._state_lock:
+                    self._servo_enabled = requested
+                    self._clear_pose_state_locked()
+                if requested:
+                    self.logger.info("Servo start requested: waiting for Placo to latch the EE baseline.")
+            else:
+                return {}
+            return {self.gripper_joint_names[0]: cmd.gripper_pos}
+
+        if self.servo_client and not self.servo_client.is_enabled:
+            return {self.gripper_joint_names[0]: cmd.gripper_pos}
+
+        if self._pose_clutch_pos is None or self._pose_clutch_rot is None:
+            self._pose_clutch_pos = cmd.pose_position.copy()
+            self._pose_clutch_rot = cmd.pose_rotation
+            self._pose_sent_pos = np.zeros(3)
+            self._pose_sent_rot = Rotation.identity()
+            self._pose_filtered_rotvec = np.zeros(3)
+            self.servo_client.servo_pose(
+                position=(0.0, 0.0, 0.0),
+                orientation=(0.0, 0.0, 0.0, 1.0),
+            )
+            self.logger.info("Phone pose clutch latched after Placo start confirmation.")
+            return {self.gripper_joint_names[0]: cmd.gripper_pos}
+
+        target_position, target_rotation = compute_webphone_pose_delta(
+            cmd.pose_position,
+            cmd.pose_rotation,
+            self._pose_clutch_pos,
+            self._pose_clutch_rot,
+            position_scale=self.phone_config.position_scale,
+            angular_scale=self.phone_config.angular_scale,
+            user_scale=cmd.user_scale,
+        )
+        bounds = self.phone_config.end_effector_bounds
+        target_position = np.clip(target_position, bounds["min"], bounds["max"])
+        target_rotation = self._filter_pose_rotation(target_rotation)
+        position, rotation = self._limit_pose_step(target_position, target_rotation)
+        quaternion = rotation.as_quat()
+        self.servo_client.servo_pose(
+            position=tuple(float(v) for v in position),
+            orientation=tuple(float(v) for v in quaternion),
+        )
 
         return {self.gripper_joint_names[0]: cmd.gripper_pos}
 
-    def _compute_home_targets(
-        self,
-        current_joints: dict[str, float],
-        first_state_rcvd: bool,
-        home_start_time: float | None,
-    ) -> dict[str, float]:
-        """Return home joint targets; clear _going_home flag once arm arrives."""
-        targets = dict(zip(self.arm_joint_names, self.home_joint_positions, strict=False))
-        targets[self.gripper_joint_names[0]] = self._last_gripper_pos
-        now = self._node.get_clock().now().nanoseconds * 1e-9
-        elapsed = now - (home_start_time or now)
-        # Arrival check: received joint_states + ≥0.5 s elapsed + error < 0.05 rad
-        if first_state_rcvd and elapsed >= 0.5:
-            actual = [current_joints.get(n) for n in self.arm_joint_names]
-            if None not in actual and all(
-                abs(a - h) < 0.05 for a, h in zip(actual, self.home_joint_positions, strict=False)
-            ):
-                with self._state_lock:
-                    self._going_home = False
-                    self._home_start_time = None
-                    self._servo_enabled = True
-                self.servo_client.enable()  # ROS call, outside lock
-        return targets
+    def _update_home_state(self) -> dict[str, float]:
+        """Hold the gate until Placo reports measured Home completion."""
+        result = self.servo_client.consume_home_result() if self.servo_client else False
+        if result is False:
+            self._disable_motion(force=True)
+            with self._state_lock:
+                self._going_home = False
+            # The terminal Home path is already disabled on the Placo side. One
+            # explicit stop above covers action rejection/transport failure;
+            # requesting another transport stop would only delay the next grip.
+            self._require_deadman_release("go-home rejected", request_transport_stop=False)
+            self.logger.error("Placo rejected Go-Home; phone motion remains released")
+            return {self.gripper_joint_names[0]: self._last_gripper_pos}
+        if result is True:
+            with self._state_lock:
+                self._going_home = False
+                self._servo_enabled = False
+                self._clear_pose_state_locked()
+            # The release latch was set when Home was requested and commands are
+            # not consumed while Home owns the backend. A real release observed
+            # after this point clears it; do not re-latch or stop Placo again.
+        return {self.gripper_joint_names[0]: self._last_gripper_pos}
+
+    def _require_deadman_release(self, reason: str, *, request_transport_stop: bool) -> None:
+        with self._state_lock:
+            self._deadman_release_required = True
+            self._clear_pose_state_locked()
+        if self._phone_impl is not None:
+            self._phone_impl.require_release(reason, request_stop=request_transport_stop)
+
+    def _clear_pose_state_locked(self) -> None:
+        self._pose_clutch_pos = None
+        self._pose_clutch_rot = None
+        self._pose_sent_pos = np.zeros(3)
+        self._pose_sent_rot = Rotation.identity()
+        self._pose_filtered_rotvec = np.zeros(3)
+
+    def _filter_pose_rotation(self, target_rotation: Rotation) -> Rotation:
+        """Apply reachable-axis masking, deadzone, and low-pass filtering."""
+        rotvec = target_rotation.as_rotvec() * self.phone_config.orientation_axis_mask
+        rotvec[np.abs(rotvec) < self.phone_config.orientation_deadzone_rad] = 0.0
+        alpha = self.phone_config.orientation_filter_alpha
+        self._pose_filtered_rotvec = alpha * rotvec + (1.0 - alpha) * self._pose_filtered_rotvec
+        return Rotation.from_rotvec(self._pose_filtered_rotvec)
+
+    def _disable_motion(self, *, force: bool = False) -> None:
+        # Safety stop must be able to bypass local active flags: during
+        # asynchronous home those flags are false while Placo is still moving.
+        should_disable = bool(self.servo_client and (force or self._servo_enabled or self.servo_client.is_enabled))
+        if should_disable:
+            self.servo_client.disable()
+        with self._state_lock:
+            self._servo_enabled = False
+            self._clear_pose_state_locked()
+
+    def _limit_pose_step(self, target_position: np.ndarray, target_rotation: Rotation) -> tuple[np.ndarray, Rotation]:
+        position_step = np.asarray(target_position, dtype=float) - self._pose_sent_pos
+        position_step = self._limit_vector_norm(position_step, self.phone_config.max_ee_step_m)
+        self._pose_sent_pos = self._pose_sent_pos + position_step
+
+        rotation_step = target_rotation * self._pose_sent_rot.inv()
+        limited_rotvec = self._limit_vector_norm(rotation_step.as_rotvec(), self.phone_config.max_angular_step_rad)
+        self._pose_sent_rot = Rotation.from_rotvec(limited_rotvec) * self._pose_sent_rot
+        return self._pose_sent_pos.copy(), self._pose_sent_rot
+
+    def _consume_transport_stop(self) -> None:
+        if self._phone_impl is None:
+            return
+        reason = self._phone_impl.consume_stop_request()
+        if reason is None:
+            return
+        self._disable_motion(force=True)
+        with self._state_lock:
+            self._going_home = False
+            self._deadman_release_required = True
+        self.logger.warning(f"WebPhone safety stop: {reason}; release and re-press deadman to resume")
 
     def _joint_state_callback(self, msg) -> None:
-        """Update joint state cache (only writes shared state, never blocks)."""
+        """Open the start gate only after all selected arm joints are observed."""
+        measured = dict(zip(msg.name, msg.position, strict=False))
         with self._state_lock:
-            for name, pos in zip(msg.name, msg.position, strict=False):
-                self._current_joint_states[name] = pos
-            self._first_state_received = True
+            self._current_joint_states.update(measured)
+            self._first_state_received = all(name in self._current_joint_states for name in self.arm_joint_names)
 
     def _get_cmd_internal(self) -> _CartesianCommand | None:
         """Read phone hardware and compute Cartesian command (ROS-free)."""
         if not self._is_connected or self._phone_impl is None:
+            self._last_command_failure_reason = "phone transport is not connected"
             return None
         try:
             action = self._phone_impl.get_action()
             if not action:
+                self._last_command_failure_reason = "phone input returned no action"
                 return None
-            return self._compute_cartesian_command(action)
+            command = self._compute_cartesian_command(action)
+            if command is None:
+                self._last_command_failure_reason = "phone action is incomplete or invalid"
+                return None
+            self._last_command_failure_reason = ""
+            return command
         except Exception as e:
+            self._last_command_failure_reason = f"phone input processing failed: {e}"
             self.logger.error(f"Failed to get Cartesian command from phone: {e}")
             return None
 
-    def _compute_cartesian_command(self, action: dict[str, Any]) -> _CartesianCommand | None:
-        """Map raw phone action to a _CartesianCommand (pure math, no ROS)."""
-        enabled = action.get("phone.enabled", False)
-        pos = action.get("phone.pos")
-        rot = action.get("phone.rot")
-        raw_inputs = action.get("phone.raw_inputs", {})
+    def _validate_cartesian_command(self, command: _CartesianCommand) -> str | None:
+        """Return a fail-closed reason when a per-cycle command is incomplete or non-finite."""
+        try:
+            if not np.isfinite(command.gripper_pos):
+                return "phone command contains a non-finite gripper target"
+            if command.go_home or not command.enabled:
+                return None
+            if command.pose_position is None or command.pose_rotation is None:
+                return "phone pose command is incomplete"
+            position = np.asarray(command.pose_position, dtype=float)
+            quaternion = np.asarray(command.pose_rotation.as_quat(), dtype=float)
+            if position.shape != (3,) or not np.all(np.isfinite(position)) or not np.all(np.isfinite(quaternion)):
+                return "phone pose command contains invalid values"
+            return None
+        except (AttributeError, TypeError, ValueError):
+            return "phone command has an invalid structure"
 
-        if pos is None or rot is None:
+    def _fail_closed_on_invalid_command(self, reason: str) -> None:
+        """Stop an active backend when the current control cycle has no safe command."""
+        self._disable_motion(force=True)
+        self._require_deadman_release(reason, request_transport_stop=False)
+        self.logger.error(f"Phone command failed closed: {reason}; release and re-press deadman to resume")
+
+    def _compute_cartesian_command(self, action: dict[str, Any]) -> _CartesianCommand | None:
+        """Map a normalized phone action to unitless Cartesian backend commands."""
+        enabled = bool(action.get("phone.enabled", False))
+        position = action.get("phone.pos")
+        rotation = action.get("phone.rot")
+        raw_inputs = action.get("phone.raw_inputs", {})
+        if position is None or rotation is None:
             return None
 
-        if self.phone_config.phone_os == PhoneOS.IOS:
-            gripper_vel = float(raw_inputs.get("a3", 0.0))
-            go_home = bool(raw_inputs.get("b2", 0))
-        else:
-            a = float(raw_inputs.get("reservedButtonA", 0.0))
-            b = float(raw_inputs.get("reservedButtonB", 0.0))
-            gripper_vel = a - b
-            go_home = bool(raw_inputs.get("reservedButtonA", 0)) and bool(raw_inputs.get("reservedButtonB", 0))
+        button_a = float(raw_inputs.get("reservedButtonA", 0.0))
+        button_b = float(raw_inputs.get("reservedButtonB", 0.0))
+        gripper_velocity = button_a - button_b
+        go_home_requested = bool(raw_inputs.get("goHome", False)) or (bool(button_a) and bool(button_b))
+        go_home = go_home_requested and not self._go_home_prev
+        self._go_home_prev = go_home_requested
 
-        if not enabled:
-            self._prev_pos = None
-            self._prev_rot = None
-            return _CartesianCommand(
-                linear=np.zeros(3),
-                angular=np.zeros(3),
-                gripper_pos=self._last_gripper_pos,
-                go_home=go_home,
-            )
+        with self._state_lock:
+            release_required = self._deadman_release_required
+            if release_required and not enabled:
+                self._deadman_release_required = False
+        if release_required:
+            enabled = False
+            go_home = False
 
         self._last_gripper_pos = float(
             np.clip(
-                self._last_gripper_pos + gripper_vel * self.phone_config.gripper_speed_factor,
+                self._last_gripper_pos + gripper_velocity * self.phone_config.gripper_speed_factor * self._control_dt,
                 self.phone_config.gripper_range[0],
                 self.phone_config.gripper_range[1],
             )
         )
 
-        # First frame after enable: record baseline, output zero
-        if self._prev_pos is None or self._prev_rot is None:
-            self._prev_pos = pos.copy()
-            self._prev_rot = rot
+        if not enabled:
             return _CartesianCommand(
-                linear=np.zeros(3),
-                angular=np.zeros(3),
                 gripper_pos=self._last_gripper_pos,
                 go_home=go_home,
+                enabled=False,
             )
 
-        # Differential: compute change since last frame
-        delta_pos = pos - self._prev_pos
-        delta_rot = self._prev_rot.inv() * rot
-
-        self._prev_pos = pos.copy()
-        self._prev_rot = rot
-
-        linear = delta_pos.astype(float) * self.phone_config.linear_scale
-
-        # Clamp to max single-step magnitude
-        norm = float(np.linalg.norm(linear))
-        if norm > self.phone_config.max_ee_step_m and norm > 0:
-            linear = linear * (self.phone_config.max_ee_step_m / norm)
-
-        # Differential rotation stays in the device/tool semantic frame.
-        # The Cartesian backend owns any required tool->base conversion.
-        angular = delta_rot.as_rotvec()
-
-        # Clamp to max single-step angular magnitude
-        angular_norm = float(np.linalg.norm(angular))
-        if angular_norm > self.phone_config.max_angular_step_rad and angular_norm > 0:
-            angular = angular * (self.phone_config.max_angular_step_rad / angular_norm)
-
+        scale = float(np.clip(self._finite_float(raw_inputs.get("scale", 1.0), 1.0), 0.1, 4.0))
         return _CartesianCommand(
-            linear=linear,
-            angular=angular,
             gripper_pos=self._last_gripper_pos,
             go_home=go_home,
+            enabled=True,
+            pose_position=np.asarray(position, dtype=float).copy(),
+            pose_rotation=rotation,
+            user_scale=scale,
         )
+
+    @staticmethod
+    def _limit_vector_norm(vector: np.ndarray, max_norm: float) -> np.ndarray:
+        vector = np.asarray(vector, dtype=float)
+        if not np.isfinite(max_norm) or max_norm <= 0.0:
+            return np.zeros_like(vector)
+        norm = float(np.linalg.norm(vector))
+        if norm <= max_norm or norm <= 1e-12:
+            return vector
+        return vector * (max_norm / norm)
+
+    @staticmethod
+    def _finite_float(value: Any, default: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return default
+        return parsed if np.isfinite(parsed) else default
 
     def disconnect(self) -> None:
         """Disconnect from phone device and disable Servo."""
-        if self.servo_client and self.servo_client.is_enabled:
-            self.servo_client.disable()
+        self._disable_motion(force=True)
         with self._state_lock:
-            self._servo_enabled = False
             self._going_home = False
+            self._deadman_release_required = True
         if self._phone_impl is not None:
             self._phone_impl.disconnect()
             self._phone_impl = None
         self._is_connected = False
+
+    @property
+    def shutdown_complete(self) -> bool:
+        """Return whether the downstream stop request has been acknowledged."""
+        return not bool(self.servo_client and getattr(self.servo_client, "stop_pending", False))
+
+    def emergency_stop(self) -> None:
+        """Disable Cartesian motion and latch WebPhone re-grip recovery."""
+        self._disable_motion(force=True)
+        with self._state_lock:
+            self._going_home = False
+        self._require_deadman_release("emergency stop", request_transport_stop=False)

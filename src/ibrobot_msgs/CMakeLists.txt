@@ -58,6 +58,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/SkillCommand.action"
   "action/PrimitiveCommand.action"
   "action/PickObject.action"
+  "action/ArmReturnHome.action"
   "srv/RecognizeFile.srv"
   "srv/SetHotwords.srv"
   "srv/MoveToConfiguration.srv"

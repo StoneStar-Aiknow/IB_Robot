@@ -194,44 +194,32 @@ setup_python_venv() {
     log_info "Installing hardware dependencies..."
     run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/hardware.txt" --quiet
 
-    # Install optional dependencies for mobile teleop (iOS: hebi-py, Android: teleop)
+    # Install the optional built-in WebPhone dependency
     log_info "Installing optional phone teleoperation dependencies..."
     if [[ "${AUTO_YES}" == true ]]; then
-        log_info "Auto-yes mode: installing both phone backends (hebi-py + teleop)..."
-        run_cmd "${pip_install[@]}" hebi-py teleop --quiet
-        log_done "Phone teleoperation dependencies installed (hebi-py + teleop)"
+        log_info "Auto-yes mode: installing WebPhone dependency (websockets)..."
+        run_cmd "${pip_install[@]}" websockets --quiet
+        log_done "Phone teleoperation dependency installed (websockets)"
     else
         echo ""
-        echo "  Phone teleoperation backends (optional):"
-        echo "    1) iOS only  — hebi-py  (HEBI Mobile I/O + ARKit)"
-        echo "    2) Android only — teleop  (WebXR WebSocket)"
-        echo "    3) Both (iOS + Android)"
-        echo "    0) Skip phone backends"
+        echo "  WebPhone teleoperation (optional):"
+        echo "    1) Install websockets (browser WebXR AR + optical-flow fallback)"
+        echo "    0) Skip WebPhone"
         echo ""
         while true; do
-            read -r -p "  Enter your choice [0-3]: " PHONE_CHOICE
+            read -r -p "  Enter your choice [0-1]: " PHONE_CHOICE
             case "${PHONE_CHOICE}" in
                 1)
-                    run_cmd "${pip_install[@]}" hebi-py --quiet
-                    log_done "Phone dependencies installed: hebi-py (iOS)"
-                    break
-                    ;;
-                2)
-                    run_cmd "${pip_install[@]}" teleop --quiet
-                    log_done "Phone dependencies installed: teleop (Android)"
-                    break
-                    ;;
-                3)
-                    run_cmd "${pip_install[@]}" hebi-py teleop --quiet
-                    log_done "Phone dependencies installed: hebi-py + teleop (iOS + Android)"
+                    run_cmd "${pip_install[@]}" websockets --quiet
+                    log_done "Phone dependencies installed: websockets (WebPhone)"
                     break
                     ;;
                 0)
-                    log_info "Skipping phone teleoperation dependencies."
+                    log_info "Skipping WebPhone teleoperation dependency."
                     break
                     ;;
                 *)
-                    echo "  Invalid choice. Please enter 0-3."
+                    echo "  Invalid choice. Please enter 0 or 1."
                     ;;
             esac
         done

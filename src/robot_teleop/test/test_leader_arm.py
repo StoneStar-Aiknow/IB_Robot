@@ -4,6 +4,14 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+_STUB_MODULE_NAMES = (
+    "robot_teleop",
+    "robot_teleop.base_teleop",
+    "robot_teleop.devices",
+    "robot_teleop.devices.leader_arm",
+)
+_ORIGINAL_MODULES = {name: sys.modules.get(name) for name in _STUB_MODULE_NAMES}
+
 base_module = types.ModuleType("robot_teleop")
 base_teleop_module = types.ModuleType("robot_teleop.base_teleop")
 
@@ -28,6 +36,12 @@ leader_arm_module = importlib.util.module_from_spec(spec)
 sys.modules["robot_teleop.devices.leader_arm"] = leader_arm_module
 spec.loader.exec_module(leader_arm_module)
 LeaderArmDevice = leader_arm_module.LeaderArmDevice
+
+for module_name, original_module in _ORIGINAL_MODULES.items():
+    if original_module is None:
+        sys.modules.pop(module_name, None)
+    else:
+        sys.modules[module_name] = original_module
 
 
 class FakeMotorsBus:

@@ -46,20 +46,25 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import time
+from dataclasses import dataclass
 
 import numpy as np
 import rclpy
 import tf2_ros
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.duration import Duration
-from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Bool, Empty, Float64MultiArray
 from std_srvs.srv import Trigger
+
+from ibrobot_msgs.action import ArmReturnHome
 
 # The radian-native Placo wrapper lives next to this node (installed into the
 # same lib/<pkg> directory). Make the script dir importable so both the
@@ -126,6 +131,28 @@ def _quat_to_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
     )
 
 
+@dataclass
+class _HomeActionRequest:
+    """Cross-callback handoff for one ArmReturnHome action transaction."""
+
+    goal_handle: object
+    done: threading.Event
+    outcome: str | None = None
+    error_code: str = ""
+    message: str = ""
+    max_joint_error_rad: float = float("inf")
+    cancel_requested: bool = False
+
+
+@dataclass(frozen=True)
+class _HomePreemption:
+    """Terminal error reserved before the action execute callback starts."""
+
+    outcome: str
+    error_code: str
+    message: str
+
+
 class SO101PlacoServoNode(Node):
     """In-process Placo QP differential-IK Cartesian servo for SO-101."""
 
@@ -134,6 +161,7 @@ class SO101PlacoServoNode(Node):
         super().__init__("so101_placo_servo_node")
 
         self.cb_group = MutuallyExclusiveCallbackGroup()
+        self.action_group = ReentrantCallbackGroup()
 
         # ---- parameters ----
         self.declare_parameter("planning_frame", "base")
@@ -187,14 +215,17 @@ class SO101PlacoServoNode(Node):
         self.declare_parameter("angular_cmd_topic", "/so101_placo_servo_node/angular_cmd_base")
         self.declare_parameter("start_service", "/so101_placo_servo_node/start")
         self.declare_parameter("stop_service", "/so101_placo_servo_node/stop")
-        self.declare_parameter("home_service", "/so101_placo_servo_node/home")
-        # Home EE pose (base frame): position xyz + orientation quaternion xyzw.
-        # Injected from the robot config's named_poses.home by teleop.py. When
-        # the home service is called, _p_ref/_r_ref (and the clutch baseline
-        # ee0) are set to this pose so the QP drives the EE smoothly to home
-        # without dropping enable. Zeros => home disabled (service rejects).
-        self.declare_parameter("home_position", [0.0, 0.0, 0.0])
-        self.declare_parameter("home_orientation", [0.0, 0.0, 0.0, 1.0])
+        self.declare_parameter("home_action", "/so101_placo_servo_node/return_home")
+        self.declare_parameter("command_lease_topic", "/so101_placo_servo_node/command_lease")
+        self.declare_parameter("estop_topic", "/emergency_stop")
+        # Teleop Home is a deterministic joint-space safe return. The launch
+        # builder injects ros2_control.reset_positions in arm_joint_names order.
+        self.declare_parameter("home_joint_positions", descriptor=_dyn)
+        self.declare_parameter("home_joint_tolerance_rad", 0.05)
+        self.declare_parameter("home_max_joint_speed", 1.0)
+        self.declare_parameter("home_joint_state_stale_s", 0.2)
+        self.declare_parameter("home_stable_duration_s", 0.2)
+        self.declare_parameter("home_timeout_s", 10.0)
         self.declare_parameter("command_out_topic", "/arm_position_controller/commands")
 
         # Timing.
@@ -202,6 +233,9 @@ class SO101PlacoServoNode(Node):
         self.declare_parameter("incoming_command_timeout", 0.5)
         self.declare_parameter("target_reset_timeout_s", 2.0)
         self.declare_parameter("tf_stale_threshold_s", 0.2)
+        # Zero preserves the existing VR/Xbox behavior. Phone launch enables the
+        # lease from its existing command_stale_s setting.
+        self.declare_parameter("command_lease_timeout_s", 0.0)
 
         # Optional pre-expanded URDF path; if absent the node expands the
         # so101 xacro in-memory at runtime (decision: runtime expansion).
@@ -246,21 +280,44 @@ class SO101PlacoServoNode(Node):
             raise RuntimeError(f"input_mode must be 'velocity' or 'pose', got {self.input_mode!r}")
         self.start_srv_name = self.get_parameter("start_service").value
         self.stop_srv_name = self.get_parameter("stop_service").value
-        self.home_srv_name = self.get_parameter("home_service").value
-        home_pos = list(self.get_parameter("home_position").value)
-        home_quat = list(self.get_parameter("home_orientation").value)
-        # Precompute the home EE pose (base frame). Enabled only when a non-zero
-        # position was injected; otherwise the home service is a no-op reject.
-        self._home_p = np.array(home_pos, dtype=np.float64) if len(home_pos) == 3 else None
-        self._home_R = (
-            _quat_to_matrix(home_quat[0], home_quat[1], home_quat[2], home_quat[3]) if len(home_quat) == 4 else None
+        self.home_action_name = self.get_parameter("home_action").value
+        self.command_lease_topic = self.get_parameter("command_lease_topic").value
+        self.estop_topic = self.get_parameter("estop_topic").value
+        home_joint_positions = _opt_param("home_joint_positions")
+        self._home_q = np.asarray(home_joint_positions, dtype=np.float64) if home_joint_positions is not None else None
+        self._home_enabled = bool(
+            self._home_q is not None
+            and self._home_q.shape == (len(self.arm_joint_names),)
+            and np.all(np.isfinite(self._home_q))
         )
-        self._home_enabled = self._home_p is not None and bool(np.any(self._home_p))
+        if self._home_enabled and (np.any(self._home_q < self.joint_lo) or np.any(self._home_q > self.joint_hi)):
+            raise RuntimeError("home_joint_positions must stay within joint_limits_lower/upper")
+        self.home_joint_tolerance_rad = float(self.get_parameter("home_joint_tolerance_rad").value)
+        self.home_max_joint_speed = float(self.get_parameter("home_max_joint_speed").value)
+        self.home_joint_state_stale_s = float(self.get_parameter("home_joint_state_stale_s").value)
+        self.home_stable_duration_s = float(self.get_parameter("home_stable_duration_s").value)
+        self.home_timeout_s = float(self.get_parameter("home_timeout_s").value)
+        home_limits = (
+            self.home_joint_tolerance_rad,
+            self.home_max_joint_speed,
+            self.home_joint_state_stale_s,
+            self.home_stable_duration_s,
+            self.home_timeout_s,
+        )
+        if not all(np.isfinite(value) and value > 0.0 for value in home_limits):
+            raise RuntimeError(
+                "Home joint tolerance, speed, stale threshold, stable duration, and timeout must be positive"
+            )
+        if self.home_max_joint_speed > self.max_joint_speed:
+            raise RuntimeError("home_max_joint_speed must not exceed max_joint_speed")
         self.cmd_out_topic = self.get_parameter("command_out_topic").value
         self.control_period = float(self.get_parameter("control_period").value)
         self.input_timeout = float(self.get_parameter("incoming_command_timeout").value)
         self.target_reset_timeout = float(self.get_parameter("target_reset_timeout_s").value)
         self.tf_stale_threshold_s = float(self.get_parameter("tf_stale_threshold_s").value)
+        self.command_lease_timeout_s = float(self.get_parameter("command_lease_timeout_s").value)
+        if not np.isfinite(self.command_lease_timeout_s) or self.command_lease_timeout_s < 0.0:
+            raise RuntimeError("command_lease_timeout_s must be finite and non-negative")
         urdf_path = self.get_parameter("urdf_path").value or None
 
         # ---- Placo differential-IK (in-process, radian-native, IB-Robot URDF) ----
@@ -277,6 +334,7 @@ class SO101PlacoServoNode(Node):
 
         # ---- state ----
         self._enabled: bool = False
+        self._estop_active = False
         # Command-side IK state: hardware /joint_states are used to initialise
         # and reset, but NOT as the per-tick IK seed. Real servos lag/sag under
         # gravity; if that measured lag is fed back into a 5-DOF position-only
@@ -292,6 +350,7 @@ class SO101PlacoServoNode(Node):
         self._latest_linear_stamp: float = 0.0
         self._latest_angular: Vector3Stamped | None = None
         self._latest_angular_stamp: float = 0.0
+        self._accept_velocity_commands: bool = False
         # Pose-mode input: the latest pose command carries a RELATIVE clutch
         # increment in the base frame. ``position`` is added to the EE position
         # latched at enable; ``orientation`` is a base-frame rotation delta that
@@ -309,7 +368,19 @@ class SO101PlacoServoNode(Node):
         self._ee0_p: np.ndarray | None = None  # measured EE position at enable (base, m)
         self._ee0_R: np.ndarray | None = None  # measured EE rotation at enable (base, 3x3)
         self._latest_js: JointState | None = None
+        self._latest_js_received_at = 0.0
+        self._joint_state_generation = 0
         self._last_input_time: float = 0.0
+        self._last_lease_time: float = self._now()
+        self._home_active = False
+        self._home_started_at = 0.0
+        self._home_stable_since: float | None = None
+        self._home_last_joint_state_generation = 0
+        self._home_request_lock = threading.Lock()
+        self._home_goal_reserved = False
+        self._home_preemption: _HomePreemption | None = None
+        self._pending_home_request: _HomeActionRequest | None = None
+        self._active_home_request: _HomeActionRequest | None = None
 
         # ---- diagnostics counters ----
         self._recovery_count: int = 0
@@ -329,10 +400,27 @@ class SO101PlacoServoNode(Node):
         if self.input_mode == "pose":
             self.create_subscription(PoseStamped, self.pose_topic, self._on_pose, 10, callback_group=self.cb_group)
         self.create_subscription(JointState, "/joint_states", self._on_joint_state, 10, callback_group=self.cb_group)
+        self.create_subscription(Bool, self.estop_topic, self._on_estop, 10, callback_group=self.cb_group)
+        if self.command_lease_timeout_s > 0.0:
+            self.create_subscription(
+                Empty,
+                self.command_lease_topic,
+                self._on_command_lease,
+                10,
+                callback_group=self.cb_group,
+            )
         self.cmd_pub = self.create_publisher(Float64MultiArray, self.cmd_out_topic, 10)
         self.create_service(Trigger, self.start_srv_name, self._on_start_srv, callback_group=self.cb_group)
         self.create_service(Trigger, self.stop_srv_name, self._on_stop_srv, callback_group=self.cb_group)
-        self.create_service(Trigger, self.home_srv_name, self._on_home_srv, callback_group=self.cb_group)
+        self._home_action_server = ActionServer(
+            self,
+            ArmReturnHome,
+            self.home_action_name,
+            execute_callback=self._execute_home_action,
+            goal_callback=self._home_goal_callback,
+            cancel_callback=self._home_cancel_callback,
+            callback_group=self.action_group,
+        )
 
         # ---- timer (fixed-rate solve+publish for smoothness) ----
         self.create_timer(self.control_period, self._on_control_tick, callback_group=self.cb_group)
@@ -349,11 +437,15 @@ class SO101PlacoServoNode(Node):
 
     # ------------------------------------------------------------------ subs
     def _on_linear(self, msg: Vector3Stamped) -> None:
+        if not self._accept_velocity_commands:
+            return
         self._latest_linear = msg
         self._latest_linear_stamp = self._now()
         self._last_input_time = self._latest_linear_stamp
 
     def _on_angular(self, msg: Vector3Stamped) -> None:
+        if not self._accept_velocity_commands:
+            return
         self._latest_angular = msg
         self._latest_angular_stamp = self._now()
         self._last_input_time = self._latest_angular_stamp
@@ -371,9 +463,202 @@ class SO101PlacoServoNode(Node):
 
     def _on_joint_state(self, msg: JointState) -> None:
         self._latest_js = msg
+        self._latest_js_received_at = self._now()
+        self._joint_state_generation += 1
+
+    def _on_command_lease(self, _msg: Empty) -> None:
+        self._last_lease_time = self._now()
+
+    def _on_estop(self, msg: Bool) -> None:
+        active = bool(msg.data)
+        if active:
+            self._estop_active = True
+            self._preempt_home("EMERGENCY_STOP", "ArmReturnHome aborted by emergency stop")
+            self._disable_motion_state()
+            self.get_logger().error("emergency stop active; Placo motion disabled")
+            return
+        if self._estop_active:
+            self.get_logger().info("emergency stop released; a new start is still required")
+        self._estop_active = False
+
+    def _home_goal_callback(self, goal_request: ArmReturnHome.Goal) -> GoalResponse:
+        if self._estop_active or goal_request.target_name not in ("", "home") or not self._home_enabled:
+            return GoalResponse.REJECT
+        with self._home_request_lock:
+            if (
+                self._home_goal_reserved
+                or self._pending_home_request is not None
+                or self._active_home_request is not None
+            ):
+                return GoalResponse.REJECT
+            self._home_goal_reserved = True
+            self._home_preemption = None
+        return GoalResponse.ACCEPT
+
+    def _home_cancel_callback(self, goal_handle) -> CancelResponse:
+        with self._home_request_lock:
+            for request in (self._pending_home_request, self._active_home_request):
+                if request is not None and request.goal_handle is goal_handle:
+                    request.cancel_requested = True
+                    return CancelResponse.ACCEPT
+            if self._home_goal_reserved:
+                if self._home_preemption is None:
+                    self._home_preemption = _HomePreemption(
+                        "canceled",
+                        "CANCELED",
+                        "ArmReturnHome canceled by client before execution",
+                    )
+                return CancelResponse.ACCEPT
+        return CancelResponse.REJECT
+
+    def _execute_home_action(self, goal_handle) -> ArmReturnHome.Result:
+        request = _HomeActionRequest(goal_handle=goal_handle, done=threading.Event())
+        with self._home_request_lock:
+            preemption = self._home_preemption
+            self._home_preemption = None
+            if preemption is None:
+                self._pending_home_request = request
+            else:
+                self._home_goal_reserved = False
+
+        if preemption is not None:
+            self._complete_home_request(request, preemption.outcome, preemption.error_code, preemption.message)
+
+        while rclpy.ok() and not request.done.wait(timeout=0.05):
+            if goal_handle.is_cancel_requested:
+                request.cancel_requested = True
+
+        if not request.done.is_set():
+            self._complete_home_request(
+                request,
+                "aborted",
+                "ROS_SHUTDOWN",
+                "ArmReturnHome interrupted by ROS shutdown",
+            )
+
+        result = ArmReturnHome.Result()
+        result.success = request.outcome == "succeeded"
+        result.error_code = request.error_code
+        result.message = request.message
+        if request.outcome == "succeeded":
+            goal_handle.succeed()
+        elif request.outcome == "canceled":
+            goal_handle.canceled()
+        else:
+            goal_handle.abort()
+        return result
+
+    def _process_home_action(self, now: float) -> None:
+        with self._home_request_lock:
+            request = self._active_home_request
+            if request is None and self._pending_home_request is not None:
+                request = self._pending_home_request
+                self._pending_home_request = None
+                self._active_home_request = request
+        if request is None:
+            return
+        if request.cancel_requested:
+            self._finish_home("canceled", "CANCELED", "ArmReturnHome canceled by client")
+            return
+        if not self._home_active:
+            self._begin_home(now)
+
+    def _begin_home(self, now: float) -> None:
+        q = self._measured_arm_joints()
+        joint_state_fresh = (
+            self._latest_js_received_at > 0.0 and now - self._latest_js_received_at <= self.home_joint_state_stale_s
+        )
+        if q is None or not np.all(np.isfinite(q)) or not joint_state_fresh:
+            self._finish_home("aborted", "JOINT_STATE_UNAVAILABLE", "ArmReturnHome requires fresh finite joint states")
+            return
+
+        self._enabled = True
+        self._accept_velocity_commands = False
+        self._accept_pose_commands = False
+        self._latest_linear = None
+        self._latest_angular = None
+        self._latest_pose = None
+        self._p_ref = None
+        self._r_ref = None
+        self._ee0_p = None
+        self._ee0_R = None
+        self._last_cmd = q.copy()
+        self._last_lease_time = now
+        self._home_active = True
+        self._home_started_at = now
+        self._home_stable_since = None
+        self._home_last_joint_state_generation = self._joint_state_generation
+        self.get_logger().info("ArmReturnHome accepted: moving to ros2_control.reset_positions")
+
+    def _finish_home(self, outcome: str, error_code: str, message: str, max_error: float = float("inf")) -> None:
+        self._home_active = False
+        self._home_stable_since = None
+        self._disable_motion_state()
+        with self._home_request_lock:
+            request = self._active_home_request
+            self._active_home_request = None
+            self._home_goal_reserved = False
+            self._home_preemption = None
+        if request is None:
+            return
+        self._complete_home_request(request, outcome, error_code, message, max_error)
+
+    @staticmethod
+    def _complete_home_request(
+        request: _HomeActionRequest,
+        outcome: str,
+        error_code: str,
+        message: str,
+        max_error: float = float("inf"),
+    ) -> None:
+        request.outcome = outcome
+        request.error_code = error_code
+        request.message = message
+        request.max_joint_error_rad = max_error
+        request.done.set()
+
+    def _preempt_home(self, error_code: str, message: str) -> None:
+        """Make stop/shutdown win even before the action execute callback exists."""
+        with self._home_request_lock:
+            request = self._active_home_request or self._pending_home_request
+            if request is None:
+                if self._home_goal_reserved:
+                    self._home_preemption = _HomePreemption("aborted", error_code, message)
+                return
+            self._active_home_request = None
+            self._pending_home_request = None
+            self._home_goal_reserved = False
+            self._home_preemption = None
+
+        self._home_active = False
+        self._home_stable_since = None
+        self._disable_motion_state()
+        self._complete_home_request(request, "aborted", error_code, message)
+
+    def _disable_motion_state(self) -> None:
+        self._enabled = False
+        self._accept_velocity_commands = False
+        self._accept_pose_commands = False
+        self._latest_linear = None
+        self._latest_angular = None
+        self._p_ref = None
+        self._r_ref = None
+        self._ee0_p = None
+        self._ee0_R = None
+        self._last_cmd = None
 
     # ------------------------------------------------------------------ srvs
     def _on_start_srv(self, _req, resp: Trigger.Response) -> Trigger.Response:
+        if self._estop_active:
+            resp.success = False
+            resp.message = "enable refused: emergency stop is active"
+            return resp
+        with self._home_request_lock:
+            home_reserved = self._home_goal_reserved
+        if self._home_active or home_reserved:
+            resp.success = False
+            resp.message = "enable refused: ArmReturnHome has priority"
+            return resp
         # Latch command-side state to the current measured pose on enable so the
         # first hold tick targets where the arm actually is (no jump). After
         # that, the hot path seeds from _last_cmd to avoid feeding hardware
@@ -401,11 +686,19 @@ class SO101PlacoServoNode(Node):
         # (e.g. shifting seat/headset). Dropping it forces pose_stale=True until
         # a fresh command lands, so the arm holds the new baseline.
         self._latest_pose = None
-        self._latest_pose_stamp = self._now()
+        now = self._now()
+        self._latest_pose_stamp = now
         self._enabled = True
-        self._last_input_time = self._now()
+        self._last_input_time = now
+        # Topic and service callbacks have no cross-entity delivery ordering.
+        # Refresh here so a freshly accepted Phone start cannot lose its lease
+        # before the first keepalive message is dispatched by DDS.
+        self._last_lease_time = now
         # Open the pose gate LAST: drop the stale cache, then accept fresh
         # commands. Any pose queued before this instant was rejected by the gate.
+        self._latest_linear = None
+        self._latest_angular = None
+        self._accept_velocity_commands = True
         self._accept_pose_commands = True
         resp.success = True
         resp.message = "so101_placo_servo_node enabled"
@@ -413,67 +706,10 @@ class SO101PlacoServoNode(Node):
         return resp
 
     def _on_stop_srv(self, _req, resp: Trigger.Response) -> Trigger.Response:
-        self._enabled = False
-        # Close the pose gate so no queued/late pose message revives a target
-        # while disabled; the next start re-opens it after re-latching.
-        self._accept_pose_commands = False
-        self._p_ref = None
-        self._r_ref = None
-        self._ee0_p = None
-        self._ee0_R = None
-        self._last_cmd = None
+        self._preempt_home("STOP_REQUESTED", "ArmReturnHome aborted by stop request")
+        self._disable_motion_state()
         resp.success = True
         resp.message = "so101_placo_servo_node disabled"
-        self.get_logger().info(resp.message)
-        return resp
-
-    def _on_home_srv(self, _req, resp: Trigger.Response) -> Trigger.Response:
-        # Drive the EE to the configured home pose without dropping enable: set
-        # the command reference (and clutch baseline) to home. The QP moves the
-        # arm there smoothly over subsequent ticks (bounded by joint/vel limits).
-        if not self._home_enabled or self._home_R is None:
-            resp.success = False
-            resp.message = "home refused: no home pose configured"
-            self.get_logger().error(resp.message)
-            return resp
-        if not self._enabled:
-            # Need a measured seed so the QP has a valid starting point.
-            q = self._measured_arm_joints()
-            if q is None:
-                resp.success = False
-                resp.message = "home refused: no /joint_states seed available yet"
-                self.get_logger().error(resp.message)
-                return resp
-            self._last_cmd = q.copy()
-            self._enabled = True
-        self._p_ref = self._home_p.copy()
-        self._r_ref = self._home_R.copy()
-        # Re-latch clutch baseline to home so a later trigger press re-grips from
-        # home without the arm jumping.
-        self._ee0_p = self._p_ref.copy()
-        self._ee0_R = self._r_ref.copy()
-        # Drop any pose command cached from before this home request. In pose
-        # mode the hot path (see _on_control_tick) recomputes _p_ref as
-        # _ee0_p + _latest_pose.position every fresh tick. If the trigger is
-        # still held and the hand has moved, _latest_pose still carries the
-        # previous grip's displacement; leaving it would make the very next tick
-        # target home + that displacement instead of home. Same reset _on_start_srv
-        # does; forces pose_stale=True until a fresh command lands, so the arm
-        # holds at home until the user re-grips.
-        self._latest_pose = None
-        self._latest_pose_stamp = self._now()
-        self._last_input_time = self._now()
-        # Keep the pose gate CLOSED after home. A single-threaded executor only
-        # guarantees no pose is interleaved DURING this callback — it cannot tell
-        # a pose that arrives just AFTER the callback returns from a stale one
-        # still queued in DDS from before home ran. Re-opening here would let such
-        # a late stale frame land in _on_pose and re-apply the previous grip's
-        # displacement onto the home baseline. The gate is re-opened only by the
-        # next _on_start_srv, which re-latches the clutch baseline first, so any
-        # pose accepted after that is measured against home, not the old grip.
-        self._accept_pose_commands = False
-        resp.success = True
-        resp.message = "so101_placo_servo_node moving to home"
         self.get_logger().info(resp.message)
         return resp
 
@@ -492,10 +728,23 @@ class SO101PlacoServoNode(Node):
             5. finite-check, defense-in-depth limit clamp, optional low-pass
             6. publish
         """
+        now = self._now()
+        if self._estop_active:
+            self._disable_motion_state()
+            return
+        self._process_home_action(now)
         if not self._enabled:
             return
 
-        now = self._now()
+        if self.command_lease_timeout_s > 0.0 and now - self._last_lease_time > self.command_lease_timeout_s:
+            if self._home_active:
+                self._finish_home("aborted", "COMMAND_LEASE_EXPIRED", "ArmReturnHome command lease expired")
+            else:
+                self._disable_motion_state()
+            self.get_logger().error("command lease expired; so101_placo_servo_node disabled")
+            return
+        if self._home_timed_out(now):
+            return
         dt = self.control_period
 
         # Hardware /joint_states are not a stable IK seed under gravity: the
@@ -512,6 +761,24 @@ class SO101PlacoServoNode(Node):
             self._dropped_frame_count += 1
             return
         q_cmd_seed = self._last_cmd.copy() if self._last_cmd is not None else q_measured.copy()
+
+        if self._home_active:
+            if now - self._latest_js_received_at > self.home_joint_state_stale_s:
+                self._finish_home("aborted", "JOINT_STATE_STALE", "ArmReturnHome joint-state feedback became stale")
+                return
+            if not np.all(np.isfinite(q_measured)):
+                self._finish_home("aborted", "JOINT_STATE_INVALID", "ArmReturnHome joint-state feedback is non-finite")
+                return
+            max_step = self.home_max_joint_speed * dt
+            q_des = q_cmd_seed + np.clip(self._home_q - q_cmd_seed, -max_step, max_step)
+            q_des = np.clip(q_des, self.joint_lo, self.joint_hi)
+            out = Float64MultiArray()
+            out.data = [float(value) for value in q_des]
+            self.cmd_pub.publish(out)
+            self._last_cmd = q_des
+            self._solve_count += 1
+            self._update_home_progress(q_measured, now)
+            return
 
         idle = (now - self._last_input_time) > self.target_reset_timeout
 
@@ -639,10 +906,68 @@ class SO101PlacoServoNode(Node):
         self.cmd_pub.publish(out)
         self._last_cmd = q_des
         self._solve_count += 1
+        self._update_home_progress(q_measured, now)
 
     # ------------------------------------------------------------------ helpers
     def _now(self) -> float:
         return time.monotonic()
+
+    def _update_home_progress(self, q_measured: np.ndarray, now: float) -> None:
+        if not self._home_active or self._home_q is None:
+            return
+        if self._joint_state_generation <= self._home_last_joint_state_generation:
+            return
+        self._home_last_joint_state_generation = self._joint_state_generation
+
+        max_error = float(np.max(np.abs(q_measured - self._home_q)))
+        with self._home_request_lock:
+            request = self._active_home_request
+        if request is not None:
+            request.max_joint_error_rad = max_error
+            feedback = ArmReturnHome.Feedback()
+            feedback.state = "moving"
+            feedback.max_joint_error_rad = max_error
+            request.goal_handle.publish_feedback(feedback)
+        within_tolerance = max_error <= self.home_joint_tolerance_rad
+        if not within_tolerance:
+            self._home_stable_since = None
+            return
+        if self._home_stable_since is None:
+            self._home_stable_since = now
+            return
+        if now - self._home_stable_since < self.home_stable_duration_s:
+            return
+
+        self._finish_home("succeeded", "", "ArmReturnHome reached reset_positions", max_error)
+        self.get_logger().info(f"ArmReturnHome reached: max_joint_error={max_error:.4f}rad")
+
+    def _home_timed_out(self, now: float) -> bool:
+        """Abort Home independently of joint-state and IK availability."""
+        if not self._home_active or now - self._home_started_at <= self.home_timeout_s:
+            return False
+
+        message = "ArmReturnHome timed out"
+        max_error = float("inf")
+        q_measured = self._measured_arm_joints()
+        if (
+            q_measured is not None
+            and self._home_q is not None
+            and q_measured.shape == self._home_q.shape
+            and np.all(np.isfinite(q_measured))
+        ):
+            errors = np.abs(q_measured - self._home_q)
+            worst_index = int(np.argmax(errors))
+            max_error = float(errors[worst_index])
+            joint_name = self.arm_joint_names[worst_index]
+            message = (
+                f"ArmReturnHome timed out: joint {joint_name!r} error={max_error:.4f}rad "
+                f"(measured={q_measured[worst_index]:.4f}, target={self._home_q[worst_index]:.4f}, "
+                f"tolerance={self.home_joint_tolerance_rad:.4f})"
+            )
+
+        self._finish_home("aborted", "TIMEOUT", message, max_error)
+        self.get_logger().error(f"{message}; servo disabled")
+        return True
 
     def _measured_arm_joints(self) -> np.ndarray | None:
         """Return measured arm joints (rad) ordered by ``arm_joint_names``."""
@@ -665,9 +990,19 @@ class SO101PlacoServoNode(Node):
         return (now_s - tf_s) <= self.tf_stale_threshold_s
 
     def destroy_node(self) -> bool:
+        self.prepare_shutdown()
+        with self._home_request_lock:
+            self._home_goal_reserved = False
+            self._home_preemption = None
+        if hasattr(self, "_home_action_server"):
+            self._home_action_server.destroy()
         if hasattr(self, "diffik"):
             self.diffik.close()
         return super().destroy_node()
+
+    def prepare_shutdown(self) -> None:
+        """Release a blocking Action execute callback before executor shutdown."""
+        self._preempt_home("ROS_SHUTDOWN", "ArmReturnHome interrupted by ROS shutdown")
 
 
 def main(args=None) -> None:
@@ -675,13 +1010,19 @@ def main(args=None) -> None:
     node = SO101PlacoServoNode()
     # All callbacks are short (<5 ms) and the solve tick must never overlap
     # itself.
-    executor = SingleThreadedExecutor()
+    # One worker waits for the long-running ArmReturnHome action while the motion
+    # callback group remains serialized on the other worker.
+    executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
     try:
         executor.spin()
     except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
+        # ArmReturnHome execute_callback waits on a transaction event. Signal it
+        # before executor.shutdown(wait_for_threads=True), otherwise shutdown can
+        # wait forever for the callback that destroy_node would release later.
+        node.prepare_shutdown()
         executor.shutdown()
         node.destroy_node()
         rclpy.try_shutdown()

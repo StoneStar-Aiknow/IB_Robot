@@ -341,6 +341,43 @@ robot:
 多设备遥操作时，`active_devices` 按名称选择 `devices` 中的多个输入设备。每个
 设备可通过 `target` 指定要控制的关节组和控制器命令话题；未指定时回退到机器人级
 `joints.arm` / `joints.gripper` 以及默认单臂控制器话题。
+`target.arm_command_topic` 与 `target.gripper_command_topic` 同时构成控制权边界：每个
+活动设备必须独占它实际发布的手臂和夹爪控制器话题，任一话题被两个活动设备共享都会在
+启动前报错。SO-101 VR 的夹爪话题由 `vr_config.so101_gripper_topic` 指定；其 Placo 手臂
+输出当前使用标准 `/arm_position_controller/commands`。因此双臂等多设备配置必须同时拆分
+arm 和 gripper 两类话题，不能只拆分手臂话题。
+当前 SO-101 Placo 是按目标手臂唯一的执行资源，同一 launch 最多选择一个 Phone、
+SO-101 VR 或 Xbox Cartesian 输入；多个 leader 等非 Cartesian 输入不受此限制。
+
+手机设备只使用内置 WebPhone；显式配置时 `phone_config.backend` 必须为 `webphone`。HTTPS/WSS
+端口、TLS 文件和 `command_stale_s` 必须定义在 `phone_config.web` 中；启动构建器会
+校验端口、超时和证书/密钥配对，并将设备级 `control_frequency` 原样传给节点。
+WebPhone 还要求 `command_stale_s + 1 / control_frequency <= 0.22s`；该式约束
+“检测并发起 stop 请求”的时间，不是机械臂物理停止的硬实时保证。默认 stale 为
+0.18s，50Hz 配置可显式使用 0.2s。
+WebPhone 统一使用 Placo clutch 相对位姿契约：浏览器可提供 WebXR AR 位姿，或在不支持
+WebXR 时提供光流虚拟位姿；两条跟踪路径都不再把位姿微分成速度。
+Phone 因此要求 `teleoperation.cartesian.solver: placo_servo`，不提供速度模式
+开关；旧配置中 `input_mode: pose` 仍可读取，`velocity` 会在启动前报错。Phone 使用相对
+基线位姿，因此 `end_effector_bounds` 的每个轴必须严格满足 `min < 0 < max`。
+手机使用的 Placo `position_only` 位于
+`teleoperation.cartesian.placo_servo.position_only`；launch 会把解析后的配置传给手机的
+Placo 链路。遥操作 Home 的唯一目标来自 `ros2_control.reset_positions`；launch 按所选手臂
+关节顺序校验并注入 Placo。Phone 与 SO-101 VR 都调用同一个
+`/so101_placo_servo_node/return_home` Action，并等待新鲜 `/joint_states` 的最大关节误差连续
+稳定后得到终态，不再使用 Cartesian named pose、状态话题或固定等待时间。launch 还会将
+`command_stale_s` 注入 Phone 专用 Placo 命令租约；VR/Xbox 的 YAML 默认租约为关闭。
+该租约只在 Phone 本周期取得有效控制命令或正在执行受控 Home 时续租；空输入、传输/转换
+异常不会用“进程仍存活”冒充有效命令。Home 要求 `reset_positions` 覆盖全部选中手臂关节、
+数值有限且位于 Placo 关节限位内；Phone 启动会拒绝 MoveIt Servo，因为 Phone 固定使用
+Placo pose 且 Home 由 Placo 执行。Home 终态后仍要求
+deadman 松开再按，运行期间夹爪保持最后目标。launch 还会把 `safety.estop_topic` 同时注入
+Placo 与独立 VR 节点，使该路径满足 `E-stop > Home/start/pose/twist`，不依赖 `TeleopNode` 转发急停。
+手机 pose 模式还必须至少启用 WebXR AR 或光流降级之一。
+
+WebPhone 不提供账号鉴权，仅支持受信内部网络。Origin 和单客户端限制不等于身份认证；
+禁止公网映射、反向/云隧道、访客 Wi-Fi 和不可信 VPN，建议通过独立控制网段及防火墙限制
+HTTP/WSS 端口来源，并在不使用遥操时停止服务。
 
 **启动命令：**
 ```bash

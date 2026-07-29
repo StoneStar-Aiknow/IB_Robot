@@ -93,10 +93,23 @@ linear_cmd_topic: /so101_placo_servo_node/linear_cmd_base
 angular_cmd_topic: /so101_placo_servo_node/angular_cmd_base
 start_service: /so101_placo_servo_node/start
 stop_service: /so101_placo_servo_node/stop
+home_action: /so101_placo_servo_node/return_home
+command_lease_topic: /so101_placo_servo_node/command_lease
+estop_topic: /emergency_stop
 command_out_topic: /arm_position_controller/commands
+
+# ArmReturnHome is a deterministic joint-space motion to the launch-injected
+# ros2_control.reset_positions. The Action result is based only on fresh
+# measured joint states; Cartesian named poses are not a teleop Home target.
+home_joint_tolerance_rad: 0.05
+home_max_joint_speed: 1.0
+home_joint_state_stale_s: 0.2
+home_stable_duration_s: 0.2
+home_timeout_s: 10.0
 
 # --- timing --------------------------------------------------------------
 control_period: 0.02             # 50 Hz solve/publish tick
 incoming_command_timeout: 0.5    # >500 ms without input → hold (zero twist)
 target_reset_timeout_s: 2.0      # >2 s idle → force zero twist; does NOT re-latch p_ref
 tf_stale_threshold_s: 0.2
+command_lease_timeout_s: 0.0  # Phone launch overrides; zero preserves VR/Xbox behavior.

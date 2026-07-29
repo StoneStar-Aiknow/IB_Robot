@@ -670,6 +670,13 @@ def test_generate_teleop_nodes_injects_target_joint_names_into_device_config():
                         },
                     }
                 ],
+                "safety": {
+                    "joint_limits": {
+                        "joint1_left": {"min": -1.0, "max": 1.0},
+                        "joint2_left": {"min": -1.0, "max": 1.0},
+                        "joint6_left": {"min": 0.0, "max": 1.0},
+                    }
+                },
             },
         }
     )

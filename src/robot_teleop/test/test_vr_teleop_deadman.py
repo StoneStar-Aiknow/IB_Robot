@@ -32,9 +32,7 @@ import pytest
 # Package source dir resolved relative to THIS file, so the test works both from
 # the source tree (bare pytest at workspace root) and under ``colcon test``
 # (CWD is the build tree). ``<pkg>/test/..``/robot_teleop is the package dir.
-_PKG_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "robot_teleop"
-)
+_PKG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "robot_teleop")
 
 
 # --------------------------------------------------------------------------- #
@@ -55,6 +53,18 @@ def _install_stubs():
     if not hasattr(node_mod, "Node"):
         node_mod.Node = type("_Node", (), {})
     sys.modules["rclpy"].node = node_mod
+    action_mod = _mod("rclpy.action")
+    action_mod.ActionClient = type("ActionClient", (), {})
+
+    _mod("ibrobot_msgs")
+    action_msgs = _mod("ibrobot_msgs.action")
+
+    class _ArmReturnHome:
+        class Goal:
+            def __init__(self):
+                self.target_name = ""
+
+    action_msgs.ArmReturnHome = _ArmReturnHome
 
     # Message packages: only the names imported at module top-level are needed.
     if "geometry_msgs.msg" not in sys.modules:
@@ -65,6 +75,7 @@ def _install_stubs():
     if "std_msgs.msg" not in sys.modules:
         _mod("std_msgs")
         sm = _mod("std_msgs.msg")
+        sm.Bool = type("Bool", (), {})
         sm.Float64MultiArray = type("Float64MultiArray", (), {})
     if "std_srvs.srv" not in sys.modules:
         _mod("std_srvs")
@@ -101,9 +112,7 @@ _install_stubs()
 
 import importlib.util  # noqa: E402
 
-_spec = importlib.util.spec_from_file_location(
-    "robot_teleop.vr_teleop", os.path.join(_PKG_DIR, "vr_teleop.py")
-)
+_spec = importlib.util.spec_from_file_location("robot_teleop.vr_teleop", os.path.join(_PKG_DIR, "vr_teleop.py"))
 vr_teleop = importlib.util.module_from_spec(_spec)
 sys.modules["robot_teleop.vr_teleop"] = vr_teleop
 _spec.loader.exec_module(vr_teleop)
@@ -144,6 +153,11 @@ class _FakeFuture:
         if self._cb:
             self._cb(self)
 
+    def resolve_value(self, value):
+        self._result = value
+        if self._cb:
+            self._cb(self)
+
     def result(self):
         if self._exc is not None:
             raise self._exc
@@ -169,6 +183,45 @@ class _FakeClient:
         return fut
 
 
+class _FakeGoalHandle:
+    def __init__(self):
+        self.accepted = True
+        self.cancel_calls = 0
+        self.result_future = _FakeFuture()
+
+    def cancel_goal_async(self):
+        self.cancel_calls += 1
+        return _FakeFuture()
+
+    def get_result_async(self):
+        return self.result_future
+
+    def finish(self, success=True, error_code="", message="done"):
+        result = types.SimpleNamespace(success=success, error_code=error_code, message=message)
+        self.result_future.resolve_value(types.SimpleNamespace(result=result))
+
+
+class _FakeActionClient:
+    def __init__(self, ready=True):
+        self._ready = ready
+        self.futures = []
+        self.goal_handles = []
+
+    def server_is_ready(self):
+        return self._ready
+
+    def send_goal_async(self, _goal):
+        future = _FakeFuture()
+        self.futures.append(future)
+        return future
+
+    def accept(self, index=-1):
+        goal_handle = _FakeGoalHandle()
+        self.goal_handles.append(goal_handle)
+        self.futures[index].resolve_value(goal_handle)
+        return goal_handle
+
+
 class _FakeLogger:
     def info(self, *a, **k):
         pass
@@ -189,8 +242,6 @@ def _make_node(stop_ready=True, start_ready=True, home_ready=True):
     node._output_profile = "so101"
     node._so101_input_mode = "pose"
     node._so101_command_stale_s = 0.2
-    node._so101_home_settle_s = 2.0
-    node._home_dispatch_time = None
     node._controller_side = "right"
     # Deadman / start-path flags (mirror the constructor defaults).
     node._so101_started = False
@@ -198,16 +249,26 @@ def _make_node(stop_ready=True, start_ready=True, home_ready=True):
     node._so101_stop_inflight = False
     node._so101_recalib_inflight = False
     node._so101_home_inflight = False
+    node._so101_home_goal_handle = None
+    node._so101_home_cancel_pending = False
     node._so101_stop_pending = False
+    node._so101_reengage_required = False
+    node._estop_active = False
     node._so101_stalled = False
     node._homing = False
+    node._home_terminal = False
+    node._home_deadman_held = False
     node._secondary_prev = False
     node._pose_calib_pos = None
     node._pose_calib_rot = None
     # Service clients.
     node._so101_start_cli = _FakeClient(start_ready)
     node._so101_stop_cli = _FakeClient(stop_ready)
-    node._so101_home_cli = _FakeClient(home_ready)
+    node._so101_home_cli = _FakeActionClient(home_ready)
+    node._arm_state = {
+        "left": vr_teleop._ArmState(),
+        "right": vr_teleop._ArmState(),
+    }
     # Logger.
     node._logger = _FakeLogger()
     node.get_logger = lambda: node._logger
@@ -304,16 +365,17 @@ def test_stop_during_inflight_recalib_wins_over_success():
     assert len(node._so101_stop_cli.futures) == 1
 
 
-def test_stop_during_inflight_home_wins_over_success():
+def test_stop_during_inflight_home_cancels_action_and_wins():
     node = _make_node()
-    node._so101_home_inflight = True
-    home_fut = node._so101_home_cli.call_async(Trigger.Request())
-    home_fut.add_done_callback(node._on_so101_home_response)
+    assert node._go_home_so101() is True
+    goal_handle = node._so101_home_cli.accept()
 
     node._stop_so101_servo("stall during home")
     assert node._so101_stop_pending is True
+    assert goal_handle.cancel_calls == 1
+    assert len(node._so101_stop_cli.futures) == 1
 
-    home_fut.resolve_success()
+    goal_handle.finish(success=False, error_code="STOP_REQUESTED")
     assert node._so101_started is False
     assert len(node._so101_stop_cli.futures) == 1
 
@@ -373,7 +435,7 @@ def test_ensure_started_retries_pending_stop_from_timer():
     # The timer fires: it must retry the stop (not attempt a start).
     node._ensure_so101_started()
     assert len(node._so101_stop_cli.futures) == 2  # retry dispatched
-    assert node._so101_start_cli.futures == []     # no start raced
+    assert node._so101_start_cli.futures == []  # no start raced
 
     # This retry confirms → latch clears, and the arm can be re-engaged later.
     node._so101_stop_cli.futures[1].resolve_success()
@@ -513,11 +575,55 @@ def test_velocity_absent_controller_does_not_clear_stall():
     assert node._so101_stalled is True
 
 
+def test_velocity_disconnect_requests_transactional_stop():
+    node = _make_node()
+    node._so101_input_mode = "velocity"
+    node._so101_started = True
+
+    node._publish_all_zero()
+
+    assert node._so101_stalled is True
+    assert node._so101_reengage_required is True
+    assert len(node._so101_stop_cli.futures) == 1
+
+
+def test_stale_release_blocks_auto_start_until_next_press():
+    node = _make_velocity_node()
+    node._so101_started = True
+    node._handle_so101_stale()
+    node._so101_stop_cli.futures[0].resolve_success()
+
+    node._control_so101(_vel_data(enabled=False))
+    node._ensure_so101_started()
+    assert node._so101_start_cli.futures == []
+
+    node._control_so101(_vel_data(enabled=True))
+    assert len(node._so101_start_cli.futures) == 1
+    node._so101_start_cli.futures[0].resolve_success()
+    assert node._so101_reengage_required is False
+
+
+def test_estop_requires_velocity_release_and_repress():
+    node = _make_velocity_node()
+    node._so101_started = True
+
+    node._on_estop(types.SimpleNamespace(data=True))
+    assert node._estop_active is True
+    assert node._so101_stalled is True
+    assert node._so101_reengage_required is True
+    assert len(node._so101_stop_cli.futures) == 1
+    node._so101_stop_cli.futures[0].resolve_success()
+
+    node._on_estop(types.SimpleNamespace(data=False))
+    node._control_so101(_vel_data(enabled=False))
+    node._control_so101(_vel_data(enabled=True))
+    assert len(node._so101_start_cli.futures) == 1
+
+
 # --------------------------------------------------------------------------- #
-# Fix #2: Home settle gate. Home is async (service returns before the arm
-# arrives). A quick release-then-press mid-transit must NOT re-baseline: the
-# _homing gate clears only after the trigger is released AND the settle time has
-# elapsed since dispatch.
+# Transactional Home gate. A press during Home cannot count as the post-Home
+# re-engagement; the action must finish while released, or the user must release
+# once more after the terminal result and then press again.
 # --------------------------------------------------------------------------- #
 def _pose_ctrl(enabled=False, secondary=False):
     c = types.SimpleNamespace()
@@ -533,55 +639,42 @@ def _pose_ctrl(enabled=False, secondary=False):
     return c
 
 
-def test_home_gate_holds_through_early_release_until_settle(monkeypatch):
+def test_home_gate_uses_action_result_and_requires_post_home_repress():
     node = _make_node()
     node._publish_so101_gripper = lambda *_a, **_k: None
     node._publish_so101_pose = lambda *_a, **_k: None
-    node._so101_home_settle_s = 2.0
+    held_home = _pose_ctrl(enabled=True, secondary=True)
 
-    # Drive a virtual clock so the test is deterministic (no real sleeping).
-    clock = {"t": 100.0}
-    monkeypatch.setattr(vr_teleop.time, "monotonic", lambda: clock["t"])
-
-    # B pressed with trigger held → home dispatched, gate latched at t=100.
-    # The settle timer is UNCONFIRMED until the async response lands.
-    node._control_so101_pose(_pose_ctrl(enabled=True, secondary=True))
+    assert node._handle_so101_home_input(held_home) is True
     assert node._homing is True
-    assert node._home_dispatch_time is None
+    goal_handle = node._so101_home_cli.accept()
 
-    # Release before the home response has arrived: gate stays latched because the
-    # settle timer is still unconfirmed (None) — never lift on an unacknowledged
-    # home.
-    clock["t"] = 100.3
-    node._control_so101_pose(_pose_ctrl(enabled=False, secondary=False))
+    # Release then press again while Home is still moving. The held state at the
+    # action terminal result must keep the gate closed.
+    assert node._handle_so101_home_input(_pose_ctrl(enabled=False)) is True
+    assert node._handle_so101_home_input(_pose_ctrl(enabled=True)) is True
+    goal_handle.finish(success=True)
     assert node._homing is True
 
-    # Home response comes back successful: settle timer starts NOW (t=100.4), not
-    # at dispatch, so a slow round-trip cannot shorten the window.
-    clock["t"] = 100.4
-    fut = _FakeFuture()
-    fut.resolve_success()
-    node._on_so101_home_response(fut)
-    assert node._home_dispatch_time == 100.4
-
-    # Release only 0.5s after confirmation (mid-transit): gate must STAY latched.
-    clock["t"] = 100.9
-    node._control_so101_pose(_pose_ctrl(enabled=False, secondary=False))
-    assert node._homing is True
-
-    # A press during the gate must NOT re-baseline (no recalib dispatched).
-    node._control_so101_pose(_pose_ctrl(enabled=True, secondary=False))
-    assert node._so101_start_cli.futures == []
-    assert node._pose_calib_pos is None
-
-    # Release after the settle time elapses (from confirmation): gate clears now.
-    clock["t"] = 102.5
-    node._control_so101_pose(_pose_ctrl(enabled=False, secondary=False))
+    # A real release after completion clears the gate. Only the following press
+    # is allowed to run the normal re-latch path.
+    assert node._handle_so101_home_input(_pose_ctrl(enabled=False)) is False
     assert node._homing is False
-
-    # Next press re-baselines: recalib dispatched.
     node._control_so101_pose(_pose_ctrl(enabled=True, secondary=False))
     assert len(node._so101_start_cli.futures) == 1
+
+
+def test_home_holds_gripper_output_while_action_is_running():
+    node = _make_node()
+    published_gripper = []
+    node._publish_so101_gripper = published_gripper.append
+    node._publish_so101_pose = lambda *_args, **_kwargs: None
+    data = types.SimpleNamespace(left=None, right=_pose_ctrl(enabled=False, secondary=True))
+
+    node._control_so101(data)
+    node._control_so101(types.SimpleNamespace(left=None, right=_pose_ctrl(enabled=False)))
+
+    assert published_gripper == []
 
 
 if __name__ == "__main__":
