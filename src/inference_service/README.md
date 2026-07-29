@@ -338,6 +338,7 @@ Canonical backend 只有以下五个：
 | Policy family | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |
 | --- | --- | --- | --- | --- | --- |
 | ACT | 支持 | 支持 | 支持 | 支持 | 不支持 |
+| Diffusion Policy | 支持 | 不支持 | 不支持 | 不支持 | 不支持 |
 | PI0.5 | 支持 | 支持 | 不支持 | 不支持 | 支持 |
 | SmolVLA | 支持 | 不支持 | 不支持 | 支持 | 支持 |
 
@@ -367,6 +368,11 @@ override。`loss_compare`/tuner 通过隔离的 diagnostic backend factory 注�
 的 legacy PI0.5 deployment 保留旧的逐步 action-output 行为；velocity deployment 缺少 schedule
 则拒绝加载，不会猜测默认值。`hardware_mock` 仍只验证 raw image/topic、joint 和 action 契约，
 不需要 PI0.5 或 schedule 专用修改。
+
+原生 Torch Diffusion Policy 按模型 `n_obs_steps` 在 contract 控制频率上采样历史观测，
+`predict_action_chunk()` 返回的 nominal chunk 长度取自 `n_action_steps`。历史不足时使用每个
+观测流的首帧进行左侧填充；不同频率的传感器仍按相同时间栅格应用各自的 `hold`、`asof`
+或 `drop` 对齐策略。
 
 可选 SDK 延迟导入。仅导入 `inference_service` 不要求 ACL、RKNNLite、TCIM、torch NPU 或
 Hisilicon worker dependency；只有选择相应 deployment 时才检查依赖。

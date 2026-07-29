@@ -1,0 +1,42 @@
+From 75f1e08463172710854eea968231a4c6eee1d3d6 Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Wed, 29 Jul 2026 14:42:49 +0800
+Subject: [PATCH] diffusion: accept observation histories
+
+Allow predict_action_chunk to consume caller-provided temporal observation batches while preserving the queued online rollout behavior used by select_action. Add the temporal axis for a single batched observation.
+
+Signed-off-by: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+---
+ .../policies/diffusion/modeling_diffusion.py     | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/src/lerobot/policies/diffusion/modeling_diffusion.py b/src/lerobot/policies/diffusion/modeling_diffusion.py
+index 5da6aa14..f6836f84 100644
+--- a/src/lerobot/policies/diffusion/modeling_diffusion.py
++++ b/src/lerobot/policies/diffusion/modeling_diffusion.py
+@@ -92,9 +92,19 @@ class DiffusionPolicy(PreTrainedPolicy):
+ 
+     @torch.no_grad()
+     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
+-        """Predict a chunk of actions given environment observations."""
+-        # stack n latest observations from the queue
+-        batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
++        """Predict actions from queued online observations or a complete history batch."""
++        queues_populated = any(len(queue) > 0 for queue in self._queues.values())
++        if queues_populated:
++            batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
++        else:
++            batch = dict(batch)
++            if batch[OBS_STATE].ndim == 2:
++                batch[OBS_STATE] = batch[OBS_STATE].unsqueeze(1)
++            if self.config.image_features:
++                for key in self.config.image_features:
++                    if batch[key].ndim == 4:
++                        batch[key] = batch[key].unsqueeze(1)
++                batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
+         actions = self.diffusion.generate_actions(batch, noise=noise)
+ 
+         return actions
+-- 
+2.34.1
+

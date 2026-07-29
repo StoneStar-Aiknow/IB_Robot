@@ -103,7 +103,7 @@ echo "== lerobot_filter_series regression harness =="
 # Ubuntu 22.04 / Python 3.10 — keeps the default compatibility series plus
 # the KD training prerequisites and distillation patch.
 run_fixture "ubuntu-22.04 / py3.10 / desktop profile" \
-    "0001-python-compat-syntax-and-metadata.patch,0002-python-compat-min-version-3.10.patch,0003-python-compat-typing-unpack.patch,0005-compat-add-npu-device-detection.patch,0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0014-training-logs.patch,0015-python310-disable-groot-config-generated-init.patch,0016-smolvla-improve-graph-export-compatibility.patch" \
+    "0001-python-compat-syntax-and-metadata.patch,0002-python-compat-min-version-3.10.patch,0003-python-compat-typing-unpack.patch,0005-compat-add-npu-device-detection.patch,0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0014-training-logs.patch,0015-python310-disable-groot-config-generated-init.patch,0016-smolvla-improve-graph-export-compatibility.patch,0017-diffusion-accept-observation-histories.patch" \
     IBR_HOST_PYTHON_VERSION=3.10 \
     IBR_LEROBOT_PROFILES=core,ros,hardware,dev,training,distillation \
     --
@@ -113,7 +113,7 @@ run_fixture "ubuntu-22.04 / py3.10 / desktop profile" \
 # patch. 0002/0003 stay gated to py<3.11 since typing.Unpack is native on 3.11
 # and the metadata after 0001 already accepts 3.11.
 run_fixture "openeuler-embedded-24.03 / py3.11" \
-    "0001-python-compat-syntax-and-metadata.patch,0005-compat-add-npu-device-detection.patch,0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0015-python310-disable-groot-config-generated-init.patch,0016-smolvla-improve-graph-export-compatibility.patch" \
+    "0001-python-compat-syntax-and-metadata.patch,0005-compat-add-npu-device-detection.patch,0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0015-python310-disable-groot-config-generated-init.patch,0016-smolvla-improve-graph-export-compatibility.patch,0017-diffusion-accept-observation-histories.patch" \
     IBR_HOST_PYTHON_VERSION=3.11 \
     IBR_LEROBOT_PROFILES=core,ros,hardware,openeuler \
     --
@@ -121,7 +121,7 @@ run_fixture "openeuler-embedded-24.03 / py3.11" \
 # OpenHarmony 5.1.0 / Python 3.12 — keep upstream Python syntax and apply only
 # the checkpoint compatibility patches used by the board runtime.
 run_fixture "openharmony-5.1.0 / py3.12" \
-    "0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0015-python310-disable-groot-config-generated-init.patch,0016-smolvla-improve-graph-export-compatibility.patch" \
+    "0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0015-python310-disable-groot-config-generated-init.patch,0016-smolvla-improve-graph-export-compatibility.patch,0017-diffusion-accept-observation-histories.patch" \
     IBR_HOST_PYTHON_VERSION=3.12 \
     IBR_LEROBOT_PROFILES=core,openharmony \
     -- \
@@ -134,7 +134,7 @@ run_fixture "openharmony-5.1.0 / py3.12" \
 MASTER_PARITY_SERIES="${REPO_ROOT}/third_party/patches/lerobot/v0.5.1/series.master-parity-candidates.txt"
 if [[ -f "${MASTER_PARITY_SERIES}" ]]; then
     run_fixture "ascend-forced / py3.10 / master-parity series" \
-        "0009-adaptive-weight-prerequisites.patch,0010-weighted-training.patch,0011-knowledge-distillation.patch,0012-mt-act-model.patch,0014-training-logs.patch" \
+        "0009-adaptive-weight-prerequisites.patch,0010-weighted-training.patch,0011-knowledge-distillation.patch,0012-mt-act-model.patch,0014-training-logs.patch,0017-diffusion-accept-observation-histories.patch" \
         IBR_HOST_PYTHON_VERSION=3.10 \
         IBR_LEROBOT_PROFILES=core,ascend,master-parity-candidates,om,training,distillation,models,mt-act,tooling \
         -- \
@@ -160,7 +160,7 @@ run_negative "malformed manifest exits 1" 1 \
 # HEAD matching commit_range.min must succeed and produce the same default
 # series as the baseline ubuntu fixture above.
 run_fixture "tag-binding / head_commit==range.min keeps default series" \
-    "0001-python-compat-syntax-and-metadata.patch,0002-python-compat-min-version-3.10.patch,0003-python-compat-typing-unpack.patch,0005-compat-add-npu-device-detection.patch,0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0014-training-logs.patch,0015-python310-disable-groot-config-generated-init.patch,0016-smolvla-improve-graph-export-compatibility.patch" \
+    "0001-python-compat-syntax-and-metadata.patch,0002-python-compat-min-version-3.10.patch,0003-python-compat-typing-unpack.patch,0005-compat-add-npu-device-detection.patch,0009-adaptive-weight-prerequisites.patch,0011-knowledge-distillation.patch,0014-training-logs.patch,0015-python310-disable-groot-config-generated-init.patch,0016-smolvla-improve-graph-export-compatibility.patch,0017-diffusion-accept-observation-histories.patch" \
     IBR_HOST_PYTHON_VERSION=3.10 \
     IBR_LEROBOT_PROFILES=core,ros,hardware,dev,training,distillation \
     -- \

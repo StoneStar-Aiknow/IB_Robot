@@ -7,3 +7,4 @@
 0014-training-logs.patch
 0015-python310-disable-groot-config-generated-init.patch
 0016-smolvla-improve-graph-export-compatibility.patch
+0017-diffusion-accept-observation-histories.patch

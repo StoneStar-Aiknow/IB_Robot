@@ -51,6 +51,7 @@ class PolicyMetadata(_FrozenModel):
     policy_type: NonEmptyString
     input_features: dict[str, PolicyFeature]
     output_features: dict[str, PolicyFeature]
+    n_obs_steps: int = Field(default=1, ge=1)
     nominal_chunk_size: int | None = Field(default=None, ge=1)
     max_action_dimension: int | None = Field(default=None, ge=1)
     required_files: tuple[str, ...] = Field(min_length=3)
@@ -77,7 +78,11 @@ def load_policy_metadata(bundle_root: Path, require_native_weights: bool = False
 
     input_features = _parse_features(config.get("input_features"), "input_features", config_path)
     output_features = _parse_features(config.get("output_features"), "output_features", config_path)
-    nominal_chunk_size = _optional_positive_int(config, "chunk_size", config_path)
+    n_obs_steps = _optional_positive_int(config, "n_obs_steps", config_path)
+    if n_obs_steps is None:
+        n_obs_steps = 2 if policy_type == "diffusion" else 1
+    chunk_size_key = "n_action_steps" if policy_type == "diffusion" else "chunk_size"
+    nominal_chunk_size = _optional_positive_int(config, chunk_size_key, config_path)
     max_action_dimension = _optional_positive_int(config, "max_action_dim", config_path)
     required_files = {"config.json"}
     external_dependencies: set[tuple[str, str]] = set()
@@ -112,6 +117,7 @@ def load_policy_metadata(bundle_root: Path, require_native_weights: bool = False
         "policy_type": policy_type,
         "input_features": input_features,
         "output_features": output_features,
+        "n_obs_steps": n_obs_steps,
         "nominal_chunk_size": nominal_chunk_size,
         "max_action_dimension": max_action_dimension,
         "required_files": tuple(sorted(required_files)),
