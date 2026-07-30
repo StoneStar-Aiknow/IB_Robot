@@ -23,6 +23,7 @@ from inference_service.backends.errors import (
 from inference_service.backends.types import (
     BackendCapabilities,
     BackendHealth,
+    BackendPriorityMapping,
     BackendResult,
     BackendState,
     InferenceRequest,
@@ -109,6 +110,7 @@ class LifecycleBackend(ABC):
         stateful: bool,
         supports_attention: bool,
         supports_cancellation: bool = False,
+        priority_mapping: BackendPriorityMapping | None = None,
     ) -> None:
         """Refine observational capabilities during load without changing admission."""
 
@@ -124,6 +126,7 @@ class LifecycleBackend(ABC):
                 stateful=stateful,
                 supports_attention=supports_attention,
                 supports_cancellation=supports_cancellation,
+                priority_mapping=priority_mapping,
             )
 
     def load(self, context: RuntimeContext) -> None:
@@ -163,6 +166,7 @@ class LifecycleBackend(ABC):
 
     def infer(self, request: InferenceRequest) -> BackendResult:
         self._require_ready("infer")
+        self._validate_request(request)
         with self._admission.admit(request.deadline):
             with self._condition:
                 self._require_ready_locked("infer")
@@ -393,6 +397,11 @@ class LifecycleBackend(ABC):
             f"backend {self.name!r} does not implement cancellation for request {request_id!r}",
             capability="cancellation",
         )
+
+    def _validate_request(self, request: InferenceRequest) -> None:
+        """Reject backend-specific request values before execution admission."""
+
+        del request
 
     def _handle_runtime_failure(self, error: BackendError) -> None:
         with self._condition:

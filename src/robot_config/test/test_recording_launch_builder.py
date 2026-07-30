@@ -1,6 +1,6 @@
 from launch.substitutions import TextSubstitution
 
-from robot_config.launch_builders.recording import generate_rerun_viewer_node
+from robot_config.launch_builders.recording import _record_cli_command, generate_rerun_viewer_node
 
 
 def _text(substitutions):
@@ -12,3 +12,14 @@ def test_generate_rerun_viewer_node_forces_pythonnousesite():
 
     assert len(nodes) == 1
     assert dict((_text(key), _text(value)) for key, value in nodes[0].additional_env) == {"PYTHONNOUSERSITE": "1"}
+
+
+def test_record_cli_command_is_legacy_when_scheduler_is_disabled():
+    expected = "ros2 run dataset_tools record_cli --ros-args -p control_mode:=model_inference"
+    assert _record_cli_command("model_inference") == expected
+
+
+def test_record_cli_command_uses_session_restart_when_scheduler_enabled():
+    assert _record_cli_command("model_inference", scheduler_enabled=True).endswith(
+        " -p restart_session_service:=/action_dispatcher/restart_session"
+    )

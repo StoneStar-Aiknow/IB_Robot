@@ -15,8 +15,10 @@ from inference_manifest import BundleFile, canonical_bundle_digest, load_inferen
 from inference_manifest.models import DeviceLink
 from inference_service.backends import (
     BACKEND_REGISTRY,
+    BackendAdmissionError,
     BackendCapabilityError,
     BackendDescriptor,
+    BackendInferenceError,
     BackendLoadError,
     BackendRegistry,
     BackendState,
@@ -89,6 +91,32 @@ class FakeAclRT:
     def destroy_context(self, context):
         self.owner.contexts.remove(context)
         self.owner.destroyed_contexts.append(context)
+        return 0
+
+    def device_get_stream_priority_range(self):
+        return self.owner.least_stream_priority, self.owner.greatest_stream_priority, 0
+
+    def create_stream_with_config(self, priority, flag):
+        if priority == self.owner.fail_stream_priority:
+            return None, 1
+        stream = ("stream", self.owner.next_identifier())
+        self.owner.streams.add(stream)
+        self.owner.created_streams.append((priority, flag, stream))
+        return stream, 0
+
+    def synchronize_stream(self, stream):
+        if stream not in self.owner.streams:
+            return 1
+        if self.owner.fail_stream_synchronization:
+            return 2
+        self.owner.synchronized_streams.append(stream)
+        return 0
+
+    def destroy_stream(self, stream):
+        if stream not in self.owner.streams:
+            return 1
+        self.owner.streams.remove(stream)
+        self.owner.destroyed_streams.append(stream)
         return 0
 
     def malloc(self, size, policy):
@@ -248,6 +276,12 @@ class FakeAclMDL:
             self.owner.memory[item["pointer"]][:] = array.tobytes()
         return 0
 
+    def execute_async(self, model_id, input_dataset, output_dataset, stream):
+        self.owner.async_executions.append((self.owner.model_paths[model_id], stream))
+        if self.owner.fail_async_execution:
+            return 2
+        return self.execute(model_id, input_dataset, output_dataset)
+
 
 class FakeAcl:
     def __init__(self, model_specs: dict[str, FakeModelSpec]) -> None:
@@ -257,6 +291,7 @@ class FakeAcl:
         self.model_paths: dict[object, str] = {}
         self.unloaded_models: list[object] = []
         self.executions: list[tuple[str, tuple[object, ...], tuple[object, ...]]] = []
+        self.async_executions: list[tuple[str, object]] = []
         self.memcpy_calls: list[tuple[object, object, int, int]] = []
         self.memory: dict[object, bytearray] = {}
         self.freed_pointers: list[object] = []
@@ -264,6 +299,15 @@ class FakeAcl:
         self.contexts: set[object] = set()
         self.destroyed_contexts: list[object] = []
         self.context_bindings: list[object] = []
+        self.least_stream_priority = 7
+        self.greatest_stream_priority = 0
+        self.fail_stream_priority: int | None = None
+        self.fail_async_execution = False
+        self.fail_stream_synchronization = False
+        self.streams: set[object] = set()
+        self.created_streams: list[tuple[int, int, object]] = []
+        self.synchronized_streams: list[object] = []
+        self.destroyed_streams: list[object] = []
         self.set_device_calls: list[int] = []
         self.reset_device_calls: list[int] = []
         self.init_calls: list[object] = []
@@ -339,7 +383,7 @@ def _write_compiled_manifest(
     )
 
 
-def _act_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
+def _act_context(tmp_path: Path, *, runtime_options=None, priority_scheduling: bool = False) -> RuntimeContext:
     tmp_path.mkdir(parents=True, exist_ok=True)
     bundle_paths = create_policy_bundle(tmp_path, include_weights=False)
     model = tmp_path / "artifacts" / "policy.om"
@@ -385,7 +429,11 @@ def _act_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
             },
         },
     )
-    return RuntimeContext(load_inference_manifest(tmp_path, "ascend"), runtime_options=runtime_options or {})
+    return RuntimeContext(
+        load_inference_manifest(tmp_path, "ascend"),
+        runtime_options=runtime_options or {},
+        priority_scheduling=priority_scheduling,
+    )
 
 
 def _pi05_context(
@@ -398,6 +446,7 @@ def _pi05_context(
     num_inference_steps: int = 2,
     action_runtime_name: str = "action",
     schedule: dict[str, object] | str | None = None,
+    priority_scheduling: bool = False,
 ) -> RuntimeContext:
     tmp_path.mkdir(parents=True, exist_ok=True)
     bundle_paths = create_policy_bundle(tmp_path, "pi05", include_weights=False)
@@ -561,7 +610,11 @@ def _pi05_context(
         },
         deployment_name=deployment_name,
     )
-    return RuntimeContext(load_inference_manifest(tmp_path, deployment_name), runtime_options=runtime_options or {})
+    return RuntimeContext(
+        load_inference_manifest(tmp_path, deployment_name),
+        runtime_options=runtime_options or {},
+        priority_scheduling=priority_scheduling,
+    )
 
 
 def _act_acl(
@@ -696,12 +749,172 @@ def test_ascend_act_pipeline_uses_manifest_bindings_and_matches_reference(tmp_pa
     assert result.actual_chunk_size == 4
     assert result.metadata["device_id"] == 0
     assert backend.health().state is BackendState.READY
+    assert backend.capabilities.hardware_resource_id is None
+    assert backend.capabilities.priority_mapping is None
     pipeline.close()
     pipeline.close()
     assert acl.init_calls == [None]
     assert acl.finalize_calls == 1
     assert acl.reset_device_calls == [0]
     assert acl.memory == {}
+    assert acl.created_streams == []
+    assert acl.async_executions == []
+
+
+def test_ascend_priority_mode_maps_requests_to_async_hardware_streams(tmp_path):
+    context = _act_context(tmp_path, priority_scheduling=True)
+    acl = _act_acl(context)
+    backend = AscendBackend(
+        0,
+        priority_scheduling=True,
+        runtime_manager=AclRuntimeManager(lambda: acl),
+    )
+    pipeline = InferencePipeline("policy", context, backend, codec=create_policy_codec(context.policy))
+    pipeline.load()
+
+    assert backend.capabilities.priority_mapping is not None
+    assert backend.capabilities.priority_mapping.generic_level_count == 8
+    assert backend.capabilities.hardware_resource_id == "ascend:0"
+    assert backend.capabilities.resource_domain is None
+    assert [(priority, flag) for priority, flag, _stream in acl.created_streams] == [
+        (priority, 1) for priority in range(8)
+    ]
+    streams_by_priority = {priority: stream for priority, _flag, stream in acl.created_streams}
+
+    for request_id, generic_priority in (("highest", 0), ("middle", 3), ("lowest", 7)):
+        result = pipeline.infer(
+            InferenceRequest(
+                request_id=request_id,
+                inputs={
+                    "observation.state": np.arange(6, dtype=np.float32),
+                    "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
+                },
+                priority=generic_priority,
+            )
+        )
+        assert result.metadata["hardware_priority"] == generic_priority
+
+    assert [stream for _path, stream in acl.async_executions] == [
+        streams_by_priority[0],
+        streams_by_priority[3],
+        streams_by_priority[7],
+    ]
+    assert acl.synchronized_streams[:3] == [
+        streams_by_priority[0],
+        streams_by_priority[3],
+        streams_by_priority[7],
+    ]
+
+    with pytest.raises(BackendAdmissionError) as error:
+        backend.infer(InferenceRequest(request_id="out-of-range", inputs={}, priority=8))
+    assert error.value.code == "unsupported_priority"
+    assert error.value.operation_started is False
+    assert backend.health().state is BackendState.READY
+    assert len(acl.async_executions) == 3
+
+    pipeline.close()
+    assert acl.streams == set()
+    assert set(acl.destroyed_streams) == set(streams_by_priority.values())
+    assert acl.destroyed_contexts
+
+
+def test_ascend_priority_stream_creation_failure_rolls_back_runtime(tmp_path):
+    context = _act_context(tmp_path, priority_scheduling=True)
+    acl = _act_acl(context)
+    acl.fail_stream_priority = 3
+    backend = AscendBackend(
+        0,
+        priority_scheduling=True,
+        runtime_manager=AclRuntimeManager(lambda: acl),
+    )
+
+    with pytest.raises(BackendLoadError, match="create_stream_with_config"):
+        backend.load(context)
+
+    assert acl.streams == set()
+    assert [priority for priority, _flag, _stream in acl.created_streams] == [0, 1, 2]
+    assert len(acl.destroyed_streams) == 3
+    assert acl.destroyed_contexts
+    assert acl.reset_device_calls == [0]
+    assert acl.finalize_calls == 1
+    backend.close()
+
+
+@pytest.mark.parametrize("failure_point", ["execute_async", "synchronize_stream"])
+def test_ascend_priority_execution_failure_has_unknown_outcome(tmp_path, failure_point):
+    context = _act_context(tmp_path, priority_scheduling=True)
+    acl = _act_acl(context)
+    if failure_point == "execute_async":
+        acl.fail_async_execution = True
+    else:
+        acl.fail_stream_synchronization = True
+    backend = AscendBackend(
+        0,
+        priority_scheduling=True,
+        runtime_manager=AclRuntimeManager(lambda: acl),
+    )
+    pipeline = InferencePipeline("policy", context, backend, codec=create_policy_codec(context.policy))
+    pipeline.load()
+
+    with pytest.raises(BackendInferenceError) as error:
+        pipeline.infer(
+            InferenceRequest(
+                request_id="uncertain",
+                inputs={
+                    "observation.state": np.arange(6, dtype=np.float32),
+                    "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
+                },
+                priority=0,
+            )
+        )
+
+    assert error.value.code == "async_execution_uncertain"
+    assert error.value.operation_started is True
+    assert error.value.outcome_known is False
+    acl.fail_stream_synchronization = False
+    pipeline.close()
+
+
+def test_ascend_priority_stream_creation_failure_preserves_cleanup_errors(tmp_path):
+    context = _act_context(tmp_path, priority_scheduling=True)
+    acl = _act_acl(context)
+    acl.fail_stream_priority = 1
+    acl.fail_stream_synchronization = True
+    backend = AscendBackend(
+        0,
+        priority_scheduling=True,
+        runtime_manager=AclRuntimeManager(lambda: acl),
+    )
+
+    with pytest.raises(BackendLoadError) as error:
+        backend.load(context)
+
+    assert "create_stream_with_config(priority=1)" in str(error.value)
+    assert "stream rollback errors" in str(error.value)
+    assert "synchronize_stream(priority=0)" in str(error.value)
+    assert acl.streams == set()
+    assert acl.destroyed_contexts
+    backend.close()
+
+
+def test_ascend_priority_mode_rejects_incomplete_hardware_range(tmp_path):
+    context = _act_context(tmp_path, priority_scheduling=True)
+    acl = _act_acl(context)
+    acl.least_stream_priority = 0
+    backend = AscendBackend(
+        0,
+        priority_scheduling=True,
+        runtime_manager=AclRuntimeManager(lambda: acl),
+    )
+
+    with pytest.raises(BackendLoadError) as error:
+        backend.load(context)
+
+    assert error.value.code == "hardware_priority_unsupported"
+    assert acl.created_streams == []
+    assert acl.destroyed_contexts
+    assert acl.finalize_calls == 1
+    backend.close()
 
 
 def test_ascend_pi05_keeps_device_links_internal_and_runs_denoising_loop(tmp_path):
@@ -1073,9 +1286,10 @@ def test_ascend_rejects_input_sourced_device_link_before_acl_initialization(tmp_
     backend.close()
 
 
-def test_ascend_multiple_instances_share_acl_lifecycle_and_serialize_device(tmp_path):
-    first_context = _act_context(tmp_path / "first")
-    second_context = _act_context(tmp_path / "second")
+@pytest.mark.parametrize(("priority_scheduling", "expected_parallelism"), [(False, 1), (True, 2)])
+def test_ascend_multiple_contexts_respect_runtime_priority_mode(tmp_path, priority_scheduling, expected_parallelism):
+    first_context = _act_context(tmp_path / "first", priority_scheduling=priority_scheduling)
+    second_context = _act_context(tmp_path / "second", priority_scheduling=priority_scheduling)
     first_path = str(first_context.resolved_artifacts["policy"])
     second_path = str(second_context.resolved_artifacts["policy"])
 
@@ -1091,13 +1305,13 @@ def test_ascend_multiple_instances_share_acl_lifecycle_and_serialize_device(tmp_
     acl = FakeAcl({first_path: spec, second_path: spec})
     acl.execution_delay = 0.05
     manager = AclRuntimeManager(lambda: acl)
-    first = AscendBackend(0, runtime_manager=manager)
-    second = AscendBackend(0, runtime_manager=manager)
+    first = AscendBackend(0, priority_scheduling=priority_scheduling, runtime_manager=manager)
+    second = AscendBackend(0, priority_scheduling=priority_scheduling, runtime_manager=manager)
     first.load(first_context)
     second.load(second_context)
     errors: list[Exception] = []
 
-    def infer(backend, context):
+    def infer(backend, context, priority):
         try:
             deployment = context.deployment
             plan = build_execution_plan(deployment.execution, deployment.bindings, deployment.device_links)
@@ -1115,20 +1329,22 @@ def test_ascend_multiple_instances_share_acl_lifecycle_and_serialize_device(tmp_
                 InferenceRequest(
                     request_id="shared",
                     inputs={"execution_plan": plan, "role_inputs": {"policy": bound}},
+                    priority=priority,
                 )
             )
         except Exception as exc:  # pragma: no cover - asserted below
             errors.append(exc)
 
-    first_thread = threading.Thread(target=infer, args=(first, first_context))
-    second_thread = threading.Thread(target=infer, args=(second, second_context))
+    first_thread = threading.Thread(target=infer, args=(first, first_context, 0))
+    second_thread = threading.Thread(target=infer, args=(second, second_context, 7 if priority_scheduling else 0))
     first_thread.start()
     second_thread.start()
     first_thread.join(timeout=2.0)
     second_thread.join(timeout=2.0)
 
     assert errors == []
-    assert acl.max_active_executions == 1
+    assert acl.max_active_executions == expected_parallelism
+    assert len(acl.async_executions) == (2 if priority_scheduling else 0)
     assert acl.init_calls == [None]
     assert acl.set_device_calls == [0]
     first.close()

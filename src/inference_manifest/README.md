@@ -1,7 +1,8 @@
 # inference_manifest
 
 `inference_manifest` 定义 IB-Robot 统一推理 bundle 的硬件无关契约。Schema v2 使用稳定 UUID、自动
-revision 和轻量结构摘要，不在启动阶段读取模型文件计算内容 SHA-256。
+revision 和轻量结构摘要，并允许 compiled artifact 声明内容 SHA-256。普通 runtime 不强制读取模型文件
+计算 hash；启用 inference scheduler 时，`robot_config` 要求并流式校验 selected compiled artifacts 的 SHA-256。
 
 ## Schema v2
 
@@ -29,10 +30,15 @@ revision 和轻量结构摘要，不在启动阶段读取模型文件计算内�
       "backend": "ascend",
       "target": {"soc": "Ascend310P3", "runtime": "acl"},
       "artifacts": {
-        "vlm": {"path": "artifacts/ascend/ascend-fp16/generations/<uuid>/vlm.om", "format": "om"},
+        "vlm": {
+          "path": "artifacts/ascend/ascend-fp16/generations/<uuid>/vlm.om",
+          "format": "om",
+          "sha256": "<64 lowercase hex>"
+        },
         "action_expert": {
           "path": "artifacts/ascend/ascend-fp16/generations/<uuid>/action_expert.om",
-          "format": "om"
+          "format": "om",
+          "sha256": "<64 lowercase hex>"
         }
       },
       "execution": ["vlm", "action_expert"],
@@ -72,9 +78,9 @@ Deployment fingerprint 对 schema version、bundle digest、deployment 名称和
 声明计算 SHA-256。两者只处理几 KB Manifest JSON，不读取 OM、RKNN、HMM、safetensors 或 tokenizer
 文件内容。
 
-这些值提供版本标识和分布式一致性检查，不提供文件完整性或发布者认证。ABI 相同的 OM 被原地覆盖时，
-Runtime 不会自动发现。正式发布必须经过 packager，并把发布目录设为只读；需要防篡改时应在安装阶段使用
-签名、fs-verity、dm-verity 或只读镜像。
+这些 identity 值提供版本标识和分布式一致性检查，不提供发布者认证。Scheduler 开启时会通过 artifact
+`sha256` 发现原地内容变化；正式发布仍必须经过 packager，并把发布目录设为只读。需要防篡改时应在安装阶段
+使用签名、fs-verity、dm-verity 或只读镜像。
 
 ## Revision Lifecycle
 
@@ -103,8 +109,8 @@ PI0.5 单独重编 VLM 或 Action Expert 时，未变化的 counterpart artifact
 6. 加载 LeRobot metadata，校验 required files、features、bindings、execution graph 和 device links。
 7. 计算 selected deployment fingerprint。
 
-Runtime 不读取模型文件计算内容 hash。Compiled backend 仍会在加载时校验实际 runtime descriptor；ABI
-不兼容或损坏到 SDK 无法解析的 artifact 会失败，ABI 兼容但权重不同的 artifact 不会失败。
+普通 runtime 不读取模型文件计算内容 hash。Scheduler 开启时由 `robot_config` 在 backend SDK 初始化前校验
+selected compiled artifact；之后 backend 仍会校验实际 runtime descriptor。
 
 ## RKNN Sharing
 

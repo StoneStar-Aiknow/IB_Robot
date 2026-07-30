@@ -35,6 +35,7 @@ setup(
         "console_scripts": [
             "pipeline_policy_node = inference_service.pipeline_policy_node:main",
             "pure_inference_node = inference_service.pure_inference_node:main",
+            "global_inference_scheduler_node = inference_service.global_inference_scheduler_node:main",
         ],
     },
 )

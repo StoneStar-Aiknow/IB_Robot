@@ -11,8 +11,9 @@ pipeline ID，并支持单体和边云分布式执行。
 `NamedTensorResult` 和 `ModelSession` 使用同一套生命周期、准入、健康状态、deployment fingerprint 与资源回收。
 模型家族的预处理、后处理和 ROS service 形状不属于 backend runtime，由调用方 adapter/plugin 持有。
 
-manifest fingerprint 是经过验证的 bundle 结构身份，deployment fingerprint 标识所选运行部署。服务启动不会
-为了生成诊断身份扫描大型权重文件；artifact 内容完整性应在模型打包/转换阶段记录和验证。
+manifest fingerprint 是经过验证的 bundle 结构身份，deployment fingerprint 标识所选运行部署。常规 loader
+不会为了生成诊断身份扫描大型权重文件；启用推理 scheduler 时，本地 compiled artifact 还必须声明内容
+`sha256`，`robot_config` 会在构造 scheduled launch 前流式校验文件内容。
 
 ## 核心概念
 
@@ -139,6 +140,84 @@ Pipeline ID 是模型实例和 ROS 路由的稳定标识，必须匹配
 | 分布式 heartbeat | `/inference/<pipeline_id>/heartbeat` |
 | 视频 descriptor | `/inference/<pipeline_id>/video/descriptors` |
 | 视频 status | `/inference/<pipeline_id>/video/status` |
+
+## 推理调度控制面
+
+唯一开关是 `control_modes.<mode>.inference.scheduler.enable`，默认 `false`。
+
+- 开关缺失或为 `false`：保持 legacy 路径
+  `executor.inference_pipeline -> pipeline /dispatch + /reset`。Launch 只创建
+  `pipeline_policy_node` 和 `action_dispatcher_node`；pipeline 不注册 scheduled action server，
+  不发布 serving status，也不创建 product session 或 Global Scheduler。
+- `scheduler` 块存在且 `enable: false` 时，可以原样保留完整调度配置；这些字段处于 dormant 状态，不生成
+  runtime policy，也不改变 legacy 节点参数、接口、线程数或 backend 执行方式。因此启停调度只需修改
+  `scheduler.enable`。若整个 `scheduler` 块缺失，scheduled 字段仍按 unknown field 拒绝，以保留拼写检查。
+- 开关为 `true`：Launch 创建 pipeline、`global_inference_scheduler_node` 和
+  `scheduled_action_dispatcher_node`。产品调用只经过 Global 的 Open、Dispatch、Close endpoint，
+  Global 负责逻辑 session、多 pipeline binding、逐请求路由、deadline precheck 和 quarantine；pipeline 负责
+  generation fence、实际 admission、执行和 drain。Launch 只为 `required: true` pipeline 注册
+  进程退出后的全局 Shutdown；optional pipeline 退出后由 readiness 和路由逻辑将其排除。该路径当前只接受
+  `execution_mode: monolithic`。
+
+生产执行路径只支持 schema v2 whole-graph plan。公开 Open 只建立 route-independent 的逻辑 session 和
+logical generation，不选择模型、不检查 fallback，也不访问 pipeline。每个 Dispatch 都携带自己的 target
+pipeline、fallback chain、priority 和 deadline；候选首次被该 session 选中时，Global 才向对应 pipeline
+下发私有 Open/reset 并记录其 pipeline generation。同一个逻辑 session 可按需建立多个 pipeline binding。
+Close 停止新 admission，并逐一 drain/reset 实际使用过的全部 binding；从未 Dispatch 的 session 可直接关闭。
+
+priority-0 请求按 `[target, *fallback_chain]` 顺序逐个检查。`profile_path` 可选，但实际参与本次准入的候选
+必须有匹配身份、覆盖当前输入契约和 prompt 大小、未过期的离线测量：
+已绑定候选使用 `full_infer` closure；尚未绑定的候选还必须包含 `session_open` closure，确保 Open/reset 与推理
+其 p99 admission SLA 估计加 safety margin 不超过该请求的绝对 deadline。同一个 `hardware_resource_id` 上已准入的 priority-0 工作按同优先级
+FIFO 串行下发：reservation 未成为资源队首前不会 Open/Dispatch；真正取得下发权时会按当前剩余时间再次检查
+deadline。已知未开始或已知完成时释放，执行结果不确定时保持隔离直到对应 pipeline 重启。
+这不是 pipeline 数量上限，也不限制 priority 大于 0 的请求。缺失或无效 profile 的候选按不可准入处理并继续
+fallback；没有候选可完成时返回
+`no_feasible_deadline/NOT_STARTED`，不会下发；
+`NOT_STARTED` 才继续下一个 fallback，`UNKNOWN` 立即 quarantine，绝不 fallback。Global ingress 仍保持有界：
+Open/Close 各两个执行 context；Dispatch 共四个 context，其中 lower-priority 最多占两个，不能耗尽为 priority-0
+保留的进入能力。priority-0 可使用任意空闲 Dispatch context。
+
+profile 文件顶层只包含 `closure_profiles`。Global 消费的 entry scope 为 `global_proxy`。action-generation entry
+必须携带 pipeline 发布的 `input_contract_fingerprint` 和标定覆盖的 `prompt_bytes_max`；session-control entry 使用
+空 input fingerprint 和 `prompt_bytes_max: 0`。每个 entry 还必须携带匹配的 deployment、hardware、
+`profile_compatibility_fingerprint`、work class、closure key、priority、采样时间、样本数、goal acceptance p99.9
+和 closure latency p99。Global 选择能够覆盖当前 prompt 的最小 profile bucket；超出覆盖范围时 fail closed。
+这些统计量定义 p99 admission SLA，不是绝对完成保证；最终估计仍叠加配置的 safety margin。
+
+priority 大于 0 的请求只路由到 target，不查询 profile，也不尝试 fallback；调用方 deadline 不参与业务准入。
+Global 会生成独立的内部 request timeout 并传给 pipeline，用于约束 RPC、取消和故障恢复，避免调用永久挂起。
+
+通用 priority 通过 scheduled request metadata 传给 monolithic backend；`0` 为最高优先级，数值越大优先级越低。
+通用 wire 取值为非负 int32，不施加 backend-specific 上限。只有支持多优先级的 backend 才暴露显式的
+generic-to-native priority mapping capability；没有该 capability 的 backend 为单优先级，只接受 priority 0。
+当前只有 Ascend 暴露多优先级 mapping。
+AscendBackend 在 scheduled 模式加载时查询 `acl.rt.device_get_stream_priority_range()`，并通过
+`acl.rt.create_stream_with_config()` 为硬件支持的每一级优先级创建可复用 stream。Ascend 接受 `[0, 7]`，并将
+通用 priority 一一映射到同编号 ACL priority；大于 `7` 的请求在模型执行前直接拒绝。模型通过
+`acl.mdl.execute_async()` 下发，并在读取输出或复用 dataset/buffer 前调用
+`acl.rt.synchronize_stream()`；同一 backend 实例仍保持单 in-flight。调度模式不设置进程内跨 context 数量上限，
+从而允许 ACL 在不同 context 的 stream 之间执行硬件优先级抢占；实际并发能力由 Ascend runtime 和硬件决定。
+disabled/legacy 模式不创建 stream，继续调用同步 `acl.mdl.execute()`。
+pipeline 的 `action_generation.max_in_flight` 不得超过 backend 声明的 `max_in_flight_per_instance`；没有可用
+execution slot 时立即返回 `pipeline_busy/NOT_STARTED`，不在 pipeline 内排队。该容量必须是正整数；pipeline
+Dispatch action server 的有界 ingress 容量至少保留两个 context 以处理重复请求，并随更高执行容量扩展。
+serving status 仅在 session state 允许且
+`current_in_flight < max_in_flight` 时报告 `accepting_requests=true`。后端报告的
+serving status 中的 `hardware_priority_levels` 是该 capability 的只读观测值；请求 priority 超出 backend mapping
+声明范围时，pipeline 在模型执行前返回不可恢复的 `unsupported_priority/NOT_STARTED`。Global readiness 至少要求
+一个通用 priority level；当 launch 配置的默认 priority 大于 0 时，只额外检查默认 target pipeline 在线且支持该
+priority，不要求 fallback 或其他 pipeline 支持多优先级。
+
+`hardware_resource_id` 是 backend 实际运行设备的身份，用于 serving readiness 和 Global deadline reservation；
+`resource_domain` 只用于进程内并发准入。两者独立：Ascend priority mode 不设置进程内 resource domain gate，
+但仍上报 `ascend:<device_id>` 作为硬件身份。
+`hardware_profile_fingerprint` 则是离线标定环境的 SHA-256 身份，必须覆盖 SoC、CANN/驱动/固件版本、频率/功耗
+模式和其他会影响时延的配置。profile entry 使用独立的 `hardware_fingerprint` 与其匹配，不能再用 `ascend:0`
+这类资源互斥 ID 代替标定环境身份。
+
+分布式推理继续使用原 protocol v2 和原 topic，不参与 scheduler、product session 或优先级抢占。
+`scheduler.enable=true` 与 `execution_mode: distributed` 的组合会在 `robot_config` 校验阶段被拒绝。
 
 ## Robot 配置
 
@@ -440,7 +519,8 @@ resource domain 时仍可能被后端串行化。
 
 启动顺序是：严格 JSON/schema 校验，deployment 选择，UUID/revision 与轻量 bundle digest 校验，
 路径安全和普通文件校验，LeRobot metadata，binding compatibility，最后创建 backend runtime。
-Runtime 不读取 OM、RKNN、HMM 或 safetensors 计算内容 SHA-256。
+常规 Runtime 不读取 OM、RKNN、HMM 或 safetensors 计算内容 SHA-256；scheduled 本地 compiled deployment
+由 `robot_config` 在 launch 构造前额外验证 manifest 中声明的 artifact SHA-256。
 
 `bundle.digest` 算法：
 
@@ -480,7 +560,7 @@ Selected deployment fingerprint 对以下 canonical object 计算 SHA-256：
 应重新运行拥有该 artifact 的 exporter 或 packaging workflow。Exporter 负责复制 artifact、
 读取 compiler/runtime ABI、生成 bindings、更新 UUID/revision 和轻量结构摘要，并通过生产 loader
 重新验证 manifest。Schema v1 和旧版 artifact 不受支持，必须使用当前 exporter 或 packager
-重新生成完整 schema-v2 bundle。
+重新生成完整 schema-v2 whole-graph bundle。
 
 ## Exporter 入口
 

@@ -12,13 +12,19 @@ import numpy as np
 
 from inference_manifest import CompiledDeployment, TensorBinding
 from inference_manifest.json_utils import load_json_strict
-from inference_service.backends.ascend.acl_runtime import ACL_RUNTIME_MANAGER, AclRuntimeLease, AclRuntimeManager
+from inference_service.backends.ascend.acl_runtime import (
+    ACL_RUNTIME_MANAGER,
+    AclPriorityStreamPool,
+    AclRuntimeLease,
+    AclRuntimeManager,
+)
 from inference_service.backends.ascend.model import AclDeviceBuffer, AclModel, numpy_dtype
-from inference_service.backends.errors import BackendInferenceError, BackendLoadError
+from inference_service.backends.errors import BackendAdmissionError, BackendInferenceError, BackendLoadError
 from inference_service.backends.lifecycle import LifecycleBackend, PartialLoadRollback
 from inference_service.backends.types import (
     BackendAdmissionEvidence,
     BackendCapabilities,
+    BackendPriorityMapping,
     BackendResult,
     InferenceRequest,
     RuntimeContext,
@@ -38,6 +44,7 @@ class AscendBackend(LifecycleBackend):
         self,
         device_id: int,
         *,
+        priority_scheduling: bool = False,
         runtime_manager: AclRuntimeManager = ACL_RUNTIME_MANAGER,
         diagnostic_capture=None,
         diagnostic_schedule: PI05DenoisingSchedule | None = None,
@@ -45,13 +52,18 @@ class AscendBackend(LifecycleBackend):
     ) -> None:
         if diagnostic_capture is not None and not callable(diagnostic_capture):
             raise TypeError("diagnostic_capture must be callable or None")
+        if not isinstance(priority_scheduling, bool):
+            raise TypeError("priority_scheduling must be a bool")
         super().__init__(
             "ascend",
             BackendCapabilities(
                 max_in_flight_per_instance=1,
                 supports_multiple_instances=True,
-                resource_domain=f"ascend:{device_id}",
-                max_in_flight_per_resource_domain=1,
+                hardware_resource_id=f"ascend:{device_id}" if priority_scheduling else None,
+                # Priority streams are intentionally not placed behind the
+                # process-local domain gate: separate contexts must overlap so
+                # ACL can apply hardware preemption across their streams.
+                resource_domain=None if priority_scheduling else f"ascend:{device_id}",
                 admission_evidence=BackendAdmissionEvidence(
                     sdk_initialization=True,
                     multi_instance_execution=True,
@@ -61,8 +73,10 @@ class AscendBackend(LifecycleBackend):
             ),
         )
         self._device_id = device_id
+        self._priority_scheduling = priority_scheduling
         self._runtime_manager = runtime_manager
         self._lease: AclRuntimeLease | None = None
+        self._priority_streams: AclPriorityStreamPool | None = None
         self._models: dict[str, AclModel] = {}
         self._shared_buffers: list[AclDeviceBuffer] = []
         self._context: RuntimeContext | None = None
@@ -78,6 +92,11 @@ class AscendBackend(LifecycleBackend):
         self._diagnostic_schedule_source = diagnostic_schedule_source
 
     def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+        if context.priority_scheduling != self._priority_scheduling:
+            raise BackendLoadError(
+                "Ascend backend priority mode differs from its runtime context",
+                code="deployment_context_mismatch",
+            )
         deployment = context.deployment
         if not isinstance(deployment, CompiledDeployment) or deployment.backend != "ascend":
             raise BackendLoadError("AscendBackend requires a compiled ascend deployment", code="invalid_deployment")
@@ -145,6 +164,9 @@ class AscendBackend(LifecycleBackend):
 
         lease = self._runtime_manager.acquire(self._device_id, options["acl_config_path"])
         rollback.defer(lease.close)
+        priority_streams = AclPriorityStreamPool.create(lease) if self._priority_scheduling else None
+        if priority_streams is not None:
+            rollback.defer(priority_streams.close)
         models: dict[str, AclModel] = {}
         shared_buffers: list[AclDeviceBuffer] = []
 
@@ -213,6 +235,7 @@ class AscendBackend(LifecycleBackend):
         if context.policy.policy_type == "pi05":
             self._validate_pi05_config(policy_config)
         self._lease = lease
+        self._priority_streams = priority_streams
         self._models = models
         self._shared_buffers = shared_buffers
         self._context = context
@@ -223,17 +246,41 @@ class AscendBackend(LifecycleBackend):
         self._denoising_schedule_override = denoising_schedule_override
         self._curvature_log_path = curvature_log_path
         self._random = np.random.default_rng(options["random_seed"])
+        self._update_loaded_capabilities(
+            resettable=False,
+            stateful=False,
+            supports_attention=False,
+            priority_mapping=(
+                BackendPriorityMapping(tuple(range(priority_streams.level_count)))
+                if priority_streams is not None
+                else None
+            ),
+        )
 
     def _infer(self, request: InferenceRequest) -> BackendResult:
         context = self._context
         if context is None:
             raise BackendInferenceError("AscendBackend is not fully loaded", code="runtime_not_loaded")
         plan, role_inputs = self._request_execution(request)
+        native_priority = None
+        stream = None
+        if self._priority_streams is not None:
+            mapping = self.capabilities.priority_mapping
+            if mapping is None:
+                raise BackendInferenceError(
+                    "Ascend priority mapping is unavailable",
+                    code="hardware_priority_unavailable",
+                )
+            try:
+                native_priority = mapping.map_generic(request.priority)
+                stream = self._priority_streams.select(native_priority)
+            except ValueError as exc:
+                raise BackendInferenceError(str(exc), code="hardware_priority_unavailable") from exc
         started = time.perf_counter()
         if context.policy.policy_type == "act":
-            outputs = self._infer_act(plan, role_inputs)
+            outputs = self._infer_act(plan, role_inputs, stream=stream)
         else:
-            outputs = self._infer_pi05(plan, role_inputs)
+            outputs = self._infer_pi05(plan, role_inputs, stream=stream)
         latency_ms = (time.perf_counter() - started) * 1000.0
         action = self._raw_action(outputs, plan)
         metadata = {
@@ -243,6 +290,8 @@ class AscendBackend(LifecycleBackend):
             "deployment_name": context.deployment_name,
             "deployment_fingerprint": context.deployment_fingerprint,
         }
+        if native_priority is not None:
+            metadata["hardware_priority"] = native_priority
         if self._denoising_schedule is not None:
             metadata["denoising_schedule"] = {
                 "name": self._denoising_schedule.name,
@@ -258,11 +307,42 @@ class AscendBackend(LifecycleBackend):
             metadata=metadata,
         )
 
+    def _validate_request(self, request: InferenceRequest) -> None:
+        priority_streams = self._priority_streams
+        if priority_streams is None:
+            if request.priority != 0:
+                raise BackendAdmissionError(
+                    "non-zero Ascend priority requires scheduler-enabled priority streams",
+                    code="hardware_priority_unavailable",
+                )
+            return
+        mapping = self.capabilities.priority_mapping
+        if mapping is None:
+            raise BackendAdmissionError(
+                "Ascend priority mapping is unavailable",
+                code="hardware_priority_unavailable",
+            )
+        try:
+            native_priority = mapping.map_generic(request.priority)
+        except ValueError as exc:
+            raise BackendAdmissionError(
+                f"Ascend priority {request.priority} exceeds the supported generic range "
+                f"[0, {mapping.generic_level_count - 1}]",
+                code="unsupported_priority",
+            ) from exc
+        if not priority_streams.supports(native_priority):
+            raise BackendAdmissionError(
+                f"Ascend hardware does not expose native priority {native_priority}",
+                code="hardware_priority_unavailable",
+            )
+
     def _close(self) -> None:
         lease = self._lease
+        priority_streams = self._priority_streams
         models = self._models
         shared_buffers = self._shared_buffers
         self._lease = None
+        self._priority_streams = None
         self._models = {}
         self._shared_buffers = []
         self._context = None
@@ -274,6 +354,11 @@ class AscendBackend(LifecycleBackend):
         self._curvature_log_path = None
         self._random = None
         errors: list[Exception] = []
+        if priority_streams is not None:
+            try:
+                priority_streams.close()
+            except Exception as exc:
+                errors.append(exc)
         for model in reversed(tuple(models.values())):
             try:
                 model.close()
@@ -293,13 +378,23 @@ class AscendBackend(LifecycleBackend):
         if errors:
             raise RuntimeError("; ".join(str(error) for error in errors))
 
-    def _infer_act(self, plan: ExecutionPlan, role_inputs: Mapping[str, BoundInputs]) -> dict[int, np.ndarray]:
+    def _infer_act(
+        self,
+        plan: ExecutionPlan,
+        role_inputs: Mapping[str, BoundInputs],
+        *,
+        stream: object | None,
+    ) -> dict[int, np.ndarray]:
         if plan.role_names != ("policy",):
             raise BackendInferenceError("Ascend ACT requires one policy role", code="invalid_request")
-        return self._models["policy"].execute(role_inputs["policy"])
+        return self._models["policy"].execute(role_inputs["policy"], stream=stream)
 
     def _infer_pi05(
-        self, plan: ExecutionPlan, role_inputs: Mapping[str, BoundInputs]
+        self,
+        plan: ExecutionPlan,
+        role_inputs: Mapping[str, BoundInputs],
+        *,
+        stream: object | None,
     ) -> dict[str, dict[int, np.ndarray]]:
         if plan.role_names != ("vlm", "action_expert"):
             raise BackendInferenceError("Ascend PI0.5 requires vlm and action_expert roles", code="invalid_request")
@@ -312,7 +407,11 @@ class AscendBackend(LifecycleBackend):
                     int(binding.index) for binding in plan.role("vlm").bindings.outputs if binding.index is not None
                 )
                 self._capture_bound_inputs("vlm", role_inputs["vlm"])
-            vlm_outputs = self._models["vlm"].execute(role_inputs["vlm"], read_outputs=vlm_read_indices)
+            vlm_outputs = self._models["vlm"].execute(
+                role_inputs["vlm"],
+                read_outputs=vlm_read_indices,
+                stream=stream,
+            )
             semantic_vlm_outputs = self._semantic_outputs(plan, "vlm", vlm_outputs)
             self._capture_vlm_outputs(semantic_vlm_outputs)
             frame.finish_role("vlm", semantic_vlm_outputs)
@@ -350,6 +449,7 @@ class AscendBackend(LifecycleBackend):
                     outputs = self._models["action_expert"].execute(
                         inputs,
                         read_outputs={int(action_binding.index)},
+                        stream=stream,
                     )
                     noise = outputs[int(action_binding.index)]
                     self._capture(f"x_t_step{step:02d}", noise)
@@ -372,6 +472,7 @@ class AscendBackend(LifecycleBackend):
                     outputs = self._models["action_expert"].execute(
                         inputs,
                         read_outputs={int(action_binding.index)},
+                        stream=stream,
                     )
                     velocity = outputs[int(action_binding.index)]
                     if velocity_trace is not None:
@@ -679,4 +780,7 @@ def create_backend(context: RuntimeContext) -> AscendBackend:
     if not isinstance(deployment, CompiledDeployment) or deployment.backend != "ascend":
         raise BackendLoadError("AscendBackend requires a compiled ascend deployment", code="invalid_deployment")
     options = AscendBackend._validate_runtime_options(context.runtime_options)
-    return AscendBackend(int(options["device_id"]))
+    return AscendBackend(
+        int(options["device_id"]),
+        priority_scheduling=context.priority_scheduling,
+    )

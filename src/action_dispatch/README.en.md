@@ -6,6 +6,11 @@ A pull-based action distribution layer between inference models and ros2_control
 
 This package provides an efficient action dispatching mechanism for distributing actions output by embodied AI models to robot controllers. It supports cross-frame temporal smoothing for Action Chunking models (e.g., ACT, Diffusion Policy), ensuring smooth transitions between consecutive inference outputs.
 
+The legacy and scheduled executables are mutually exclusive. The scheduled dispatcher validates the reported
+`chunk_size` against the decoded tensor, uses local monotonic receive time for safe-stop joint-state freshness, and
+performs safe-stop followed by Close on terminal or uncertain failures. With the scheduler switch absent or `false`,
+the legacy dispatcher behavior remains unchanged.
+
 ## System Architecture
 
 ### Component Architecture

@@ -98,6 +98,7 @@ class PureInferenceEngine:
         request_timeout: float | None = None,
         default_task: str | None = None,
         runtime_options: Mapping[str, object] | None = None,
+        priority_scheduling: bool = False,
         registry: BackendRegistry = BACKEND_REGISTRY,
     ) -> None:
         validated_manifest = load_inference_manifest(model_path, deployment)
@@ -110,6 +111,7 @@ class PureInferenceEngine:
             request_timeout=request_timeout,
             default_task=default_task,
             runtime_options=runtime_options,
+            priority_scheduling=priority_scheduling,
             registry=registry,
         )
 

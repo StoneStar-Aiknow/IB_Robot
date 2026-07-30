@@ -23,6 +23,7 @@ from inference_service.backends import (
     BackendDescriptor,
     BackendInferenceError,
     BackendNotReadyError,
+    BackendPriorityMapping,
     BackendRegistry,
     BackendRegistryError,
     BackendResult,
@@ -47,6 +48,34 @@ _MULTI_INSTANCE_EVIDENCE = BackendAdmissionEvidence(
     failure_isolation=True,
     independent_close=True,
 )
+
+
+def test_backend_priority_mapping_is_explicit_and_backend_owned() -> None:
+    mapping = BackendPriorityMapping((7, 3, 0))
+
+    assert mapping.generic_level_count == 3
+    assert mapping.map_generic(0) == 7
+    assert mapping.map_generic(2) == 0
+    with pytest.raises(ValueError, match="generic priority"):
+        mapping.map_generic(3)
+
+
+def test_backend_hardware_identity_is_absent_from_legacy_capabilities() -> None:
+    capabilities = BackendCapabilities()
+
+    assert capabilities.hardware_resource_id is None
+    assert capabilities.priority_mapping is None
+
+
+def test_backend_capabilities_preserves_legacy_positional_field_order() -> None:
+    capabilities = BackendCapabilities(False, False, False, 1, False, "npu", 1, True, True, None)
+
+    assert capabilities.resource_domain == "npu"
+    assert capabilities.max_in_flight_per_resource_domain == 1
+    assert capabilities.supports_attention
+    assert capabilities.supports_cancellation
+    assert capabilities.hardware_resource_id is None
+    assert capabilities.priority_mapping is None
 
 
 class FakeBackend(LifecycleBackend):
@@ -229,6 +258,21 @@ def _thread_call(callback: Callable[[], object]) -> tuple[threading.Thread, list
 def _close_all(*backends: FakeBackend) -> None:
     for backend in backends:
         backend.close()
+
+
+def test_generic_request_priority_is_not_limited_to_ascend_range():
+    request = InferenceRequest(request_id="generic-priority", inputs={"value": 1.0}, priority=1024)
+
+    assert request.priority == 1024
+
+
+def test_inference_request_preserves_legacy_positional_metadata_field() -> None:
+    metadata = {"source": "legacy-positional"}
+
+    request = InferenceRequest("legacy-request", {"value": 1.0}, None, None, metadata)
+
+    assert request.metadata == metadata
+    assert request.priority == 0
 
 
 def test_load_returns_only_after_ready_and_infer_updates_health(tmp_path):

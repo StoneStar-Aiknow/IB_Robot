@@ -784,6 +784,7 @@ def test_distributed_backend_unavailable_result_fails_pending_operation(monkeypa
     result = SimpleNamespace(request_id="request", error=None)
     update = SimpleNamespace(error=remote_error, canceled_request_id="", invalidated_request_ids=())
     node = SimpleNamespace(
+        _config=SimpleNamespace(pipeline_id="policy"),
         _pending_lock=threading.RLock(),
         _pending={"request": pending},
         _require_edge_session=lambda: SimpleNamespace(accept_result=lambda _result: update),
@@ -792,7 +793,17 @@ def test_distributed_backend_unavailable_result_fails_pending_operation(monkeypa
     )
     monkeypatch.setattr(policy_node_module, "result_from_message", lambda _message: result)
 
-    PipelinePolicyNode._distributed_result_callback(node, SimpleNamespace(request_id="request"))
+    PipelinePolicyNode._distributed_result_callback(
+        node,
+        SimpleNamespace(
+            request_id="request",
+            pipeline_id="policy",
+            session_id="",
+            session_generation=0,
+            deployment_fingerprint="",
+            operation=int(Operation.INFER),
+        ),
+    )
 
     assert pending.event.is_set()
     assert pending.result is None

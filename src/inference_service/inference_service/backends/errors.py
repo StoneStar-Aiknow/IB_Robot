@@ -34,8 +34,20 @@ class BackendLoadError(BackendError):
 
 
 class BackendInferenceError(BackendError):
-    def __init__(self, message: str, *, code: str = "inference_failed", recoverable: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "inference_failed",
+        recoverable: bool = False,
+        operation_started: bool | None = None,
+        outcome_known: bool | None = None,
+    ) -> None:
         super().__init__(message, code=code, recoverable=recoverable)
+        if operation_started is not None:
+            self.operation_started = operation_started
+        if outcome_known is not None:
+            self.outcome_known = outcome_known
 
 
 class BackendAdmissionError(BackendError):

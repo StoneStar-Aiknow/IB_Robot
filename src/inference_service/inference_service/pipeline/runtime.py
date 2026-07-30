@@ -47,6 +47,18 @@ def _identity_postprocessor(action: object) -> object:
     return action
 
 
+def _annotate_execution_certainty(
+    error: Exception,
+    *,
+    operation_started: bool,
+    outcome_known: bool = True,
+) -> None:
+    """Attach the pipeline boundary evidence consumed by scheduled transport."""
+
+    error.operation_started = bool(getattr(error, "operation_started", operation_started))
+    error.outcome_known = bool(getattr(error, "outcome_known", outcome_known))
+
+
 class InferencePipeline:
     """Own one processor/backend instance and expose one named inference route.
 
@@ -216,6 +228,7 @@ class InferencePipeline:
                 inputs=backend_inputs,
                 prompt=selected_prompt,
                 deadline=deadline,
+                priority=request.priority,
                 metadata={
                     **request.metadata,
                     "pipeline_id": self.pipeline_id,
@@ -307,6 +320,10 @@ class InferencePipeline:
                 },
             )
         except PipelineTimeoutError as exc:
+            _annotate_execution_certainty(
+                exc,
+                operation_started=bool(exc.details.get("backend_completed")),
+            )
             with self._condition:
                 if exc.details.get("backend_completed") and self._backend.capabilities.stateful:
                     if self._state_machine.state is PipelineState.READY:
@@ -315,6 +332,7 @@ class InferencePipeline:
                     self._synchronize_backend_health_locked()
             raise
         except Exception as exc:
+            _annotate_execution_certainty(exc, operation_started=backend_execution_started)
             with self._condition:
                 non_mutating_rejection = isinstance(exc, BackendAdmissionError) and not exc.operation_started
                 if backend_execution_started and not non_mutating_rejection and self._backend.capabilities.stateful:

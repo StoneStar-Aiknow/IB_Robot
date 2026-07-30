@@ -20,11 +20,16 @@ def create_inference_pipeline(
     default_task: str | None = None,
     execution_mode: str = "monolithic",
     runtime_options: Mapping[str, object] | None = None,
+    priority_scheduling: bool = False,
     registry: BackendRegistry = BACKEND_REGISTRY,
 ) -> InferencePipeline:
     """Create one pipeline exclusively from a validated manifest and registry."""
 
-    context = RuntimeContext(validated_manifest, runtime_options=runtime_options or {})
+    context = RuntimeContext(
+        validated_manifest,
+        runtime_options=runtime_options or {},
+        priority_scheduling=priority_scheduling,
+    )
     backend = registry.create(context)
     preprocessor = None
     postprocessor = None
@@ -57,6 +62,7 @@ def create_pipeline_manager(
     default_task: str | None = None,
     execution_mode: str = "monolithic",
     runtime_options: Mapping[str, object] | None = None,
+    priority_scheduling: bool = False,
     registry: BackendRegistry = BACKEND_REGISTRY,
 ) -> InferencePipelineManager:
     pipeline = create_inference_pipeline(
@@ -66,6 +72,7 @@ def create_pipeline_manager(
         default_task=default_task,
         execution_mode=execution_mode,
         runtime_options=runtime_options,
+        priority_scheduling=priority_scheduling,
         registry=registry,
     )
     manager = InferencePipelineManager((pipeline,))

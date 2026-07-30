@@ -435,6 +435,29 @@ IK/FK 验证的 `sensor_msgs/JointState`，网关直接规划到同一组机械�
 
 ---
 
-## 4. 许可证
+## 4. 推理调度接口
+
+调度启用路径使用三个 product-session action；它们与 legacy `DispatchInfer.action` 并存，但不会由同一
+launch graph 同时对产品调用方暴露：
+
+| Action | 所有权与用途 |
+| --- | --- |
+| `OpenInferenceSession` | 公开 Open 只建立逻辑 session/generation；候选首次被 Dispatch 选中时，同一 action 才用于 pipeline 私有 Open/reset 和 generation fence |
+| `ScheduledDispatchInfer` | 为本次请求指定 target、fallback、priority 和 deadline，在逻辑 session 内按需绑定 pipeline 并回显完整 identity |
+| `CloseInferenceSession` | 停止新 admission，drain 后发布更高 generation；generation 0 只用于 uncertain Open cleanup |
+
+`InferenceOutcome` 表示终态确定性，而不是业务成功：`NOT_STARTED` 保证没有执行副作用，`COMPLETED`
+表示结果确定但允许 `success=false`，`UNKNOWN` 表示无法确认下游是否接受或完成。`UNKNOWN` 不允许 fallback
+或重试，调用方必须进入 safe-stop，Global/pipeline 必须 quarantine 并通过 Close 或新 boot reconcile。
+
+`InferenceServingStatus` 是 monolithic pipeline 对 Global 发布的 product-session 状态，包含 deployment/runtime-policy
+fingerprint、运行时硬件资源、hardware priority levels 和公开容量。它不替代
+`InferencePipelineStatus`；后者只负责 distributed edge/cloud transport handshake。
+
+原有 `DistributedInferenceRequest`、`DistributedInferenceResult`、`InferencePipelineStatus` 保持 protocol v2
+字段和 topic 不变。分布式推理当前不接入 scheduled product session 或优先级抢占；Open、ScheduledDispatch 和
+Close 接口只用于 monolithic pipeline。
+
+## 5. 许可证
 
 Apache-2.0

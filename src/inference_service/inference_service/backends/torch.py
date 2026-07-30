@@ -39,13 +39,14 @@ _MODEL_DTYPES = {
 class TorchBackend(LifecycleBackend):
     """Load and execute one native LeRobot policy without rewriting its bundle."""
 
-    def __init__(self, device_name: str) -> None:
+    def __init__(self, device_name: str, *, expose_hardware_identity: bool = False) -> None:
         super().__init__(
             "torch",
             BackendCapabilities(
                 thread_safe=False,
                 max_in_flight_per_instance=1,
                 supports_multiple_instances=True,
+                hardware_resource_id=f"torch:{device_name}" if expose_hardware_identity else None,
                 resource_domain=f"torch:{device_name}",
                 max_in_flight_per_resource_domain=1,
                 supports_cancellation=False,
@@ -485,4 +486,4 @@ def create_backend(context: RuntimeContext) -> TorchBackend:
             f"TorchBackend requires a native Torch deployment, got {type(deployment).__name__}",
             code="invalid_deployment",
         )
-    return TorchBackend(deployment.device)
+    return TorchBackend(deployment.device, expose_hardware_identity=context.priority_scheduling)

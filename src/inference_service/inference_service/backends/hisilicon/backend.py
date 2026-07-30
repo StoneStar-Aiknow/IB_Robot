@@ -31,8 +31,19 @@ ProtocolFactory = Callable[..., SD3403Protocol]
 class HisiliconBackend(LifecycleBackend):
     """Execute an ACT OM through the manifest-declared Hisilicon worker."""
 
-    def __init__(self, *, protocol_factory: ProtocolFactory = SD3403Protocol) -> None:
-        super().__init__("hisilicon", BackendCapabilities(max_in_flight_per_instance=1))
+    def __init__(
+        self,
+        *,
+        protocol_factory: ProtocolFactory = SD3403Protocol,
+        expose_hardware_identity: bool = False,
+    ) -> None:
+        super().__init__(
+            "hisilicon",
+            BackendCapabilities(
+                max_in_flight_per_instance=1,
+                hardware_resource_id="hisilicon:0" if expose_hardware_identity else None,
+            ),
+        )
         self._protocol_factory = protocol_factory
         self._protocol: SD3403Protocol | None = None
         self._context: RuntimeContext | None = None
@@ -294,4 +305,4 @@ def create_backend(context: RuntimeContext) -> HisiliconBackend:
     deployment = context.deployment
     if not isinstance(deployment, CompiledDeployment) or deployment.backend != "hisilicon":
         raise BackendLoadError("HisiliconBackend requires a compiled hisilicon deployment", code="invalid_deployment")
-    return HisiliconBackend()
+    return HisiliconBackend(expose_hardware_identity=context.priority_scheduling)

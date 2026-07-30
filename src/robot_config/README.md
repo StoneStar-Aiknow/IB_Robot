@@ -535,6 +535,99 @@ robot:
         control_frequency: 20.0
 ```
 
+### 推理调度控制面
+
+调度只有一个功能开关：`control_modes.<mode>.inference.scheduler.enable`，缺失时按 `false` 处理。
+`inference.enabled` 仍只表示该控制模式是否启用推理，不是调度模式开关。
+
+当 `scheduler.enable` 缺失或为 `false` 时，launch graph 与原路径相同：
+
+```text
+executor.inference_pipeline
+  -> pipeline_policy_node /inference/<pipeline_id>/dispatch
+  -> pipeline_policy_node /inference/<pipeline_id>/reset
+  -> action_dispatcher_node
+```
+
+该分支不创建 Global Scheduler、ScheduledActionDispatcher、product session、scheduled endpoint 或 serving
+status。显式保留 `scheduler` 块并设置 `enable: false` 时，完整调度配置可以原样保留为 dormant 配置，
+不会生成 runtime policy，也不会改变 legacy launch graph、节点参数、接口、线程数或 backend 执行方式，
+因此启停只需修改这一处开关。若整个 `scheduler` 块缺失，scheduled 字段仍按 unknown field 拒绝，以保留
+旧配置的严格拼写检查。
+仓库当前发布的机器人 YAML 都未启用该开关，因此默认生产启动仍是这条 legacy 路径；下面的 `true` 片段是配置
+契约示例，不是默认切流。
+
+开启调度时，每个 pipeline 必须显式声明 pipeline-scoped endpoint、兼容组、真实硬件资源和公开容量。
+`profile_path` 可选；只有实际参与 priority-0 deadline 准入的候选才需要有效的离线 profile：
+
+```yaml
+control_modes:
+  model_inference:
+    inference:
+      enabled: true
+      scheduler:
+        enable: true
+        global_endpoints:
+          readiness: /inference/scheduler/ready
+          open_session: /inference/session/open
+          dispatch: /inference/dispatch
+          close_session: /inference/session/close
+      pipelines:
+        policy:
+          model_path: models/policy
+          deployment: ascend_310p3
+          execution_mode: monolithic
+          transport:
+            open_session: /inference/policy/session/open
+            dispatch: /inference/policy/scheduled_dispatch
+            close_session: /inference/policy/session/close
+            serving_status: /inference/policy/serving_status
+          required: true
+          compatibility_group: so101_action
+          hardware_resource_id: ascend:0
+          hardware_profile_fingerprint: <calibration-environment-sha256>
+          profile_path: /absolute/path/to/measured-profile.yaml  # optional; required for priority-0 admission
+          public_capacity:
+            session_control: {max_in_flight: 1}
+            action_generation: {max_in_flight: 1}
+    executor:
+      type: topic
+      mode: model_inference
+      inference_pipeline: policy
+      inference_fallback_chain: []
+      inference_priority: 0
+      inference_retry:
+        max_not_started_attempts: 3  # 首次请求之后最多自动重试 3 次
+        initial_backoff_ms: 50
+        max_backoff_ms: 500
+```
+
+Scheduler 开启时只接受 schema v2 whole-graph monolithic deployment，生产路径为 Open/Dispatch/Close。
+分布式 pipeline 保持 legacy protocol v2，不能与 `scheduler.enable=true` 组合。`inference_priority` 使用 `0` 表示
+最高优先级，数值越大优先级越低；通用 wire 范围是非负 int32，具体 backend 范围和映射由 backend 校验。
+priority-0 的每个请求独立使用自己的 target、fallback chain 和 deadline 做
+准入；同一 `hardware_resource_id` 上已准入的 priority-0 会按 reservation FIFO 串行下发，并在实际轮到执行时
+重新检查 deadline，但不设置 pipeline 数量上限。`hardware_profile_fingerprint` 独立标识离线标定环境，不能使用
+资源 ID 代替。
+profile entry 使用 `global_proxy` scope。action-generation entry 必须声明 pipeline serving status 发布的
+`input_contract_fingerprint` 和标定覆盖的 `prompt_bytes_max`；session-control entry 使用空 fingerprint 和
+`prompt_bytes_max: 0`。profile identity 使用 `profile_compatibility_fingerprint`，不再绑定 endpoint 名称、
+required 状态或 compatibility group。其他 priority 只下发 target，
+不做 fallback 或 deadline 准入。缺失或无效 profile 不影响 readiness 和非零优先级请求；priority-0 实际遍历到
+该候选时会将其判为不可准入并继续 fallback，所有候选都不可准入时返回 `no_feasible_deadline`。Global/pipeline
+不保存等待队列，每个
+Global Dispatch ingress 共四个有界 context，lower-priority 最多占两个；因此低优先级请求不能耗尽 priority-0
+保留容量。Open/Close 和 pipeline-local endpoint 仍各使用两个有界 context。
+公开 Open 只创建逻辑 session，不使用 `executor.inference_pipeline` 或 fallback 做初始模型绑定；pipeline
+Open/reset 在某个 Dispatch 首次选中该候选时惰性执行。
+
+本地 compiled artifact 需要 manifest content SHA-256。Global readiness 要求真实后端至少报告一个通用
+priority level 和匹配的资源身份；当默认 `inference_priority` 大于 0 时，还会要求默认
+`inference_pipeline` 在线并支持该优先级，不要求其他 pipeline 支持多优先级。
+`public_capacity.action_generation.max_in_flight` 可以大于 1，但 pipeline 启动时
+会验证它是正整数且不超过 backend 的 `max_in_flight_per_instance`；pipeline Dispatch ingress 至少保留两个
+context 处理重复请求，并随更高执行容量扩展。没有可用 execution slot 时立即返回错误，不排队。
+
 **启动的控制器：**
 - `arm_position_controller` (JointGroupPositionController)
 - `gripper_position_controller` (ForwardCommandController)

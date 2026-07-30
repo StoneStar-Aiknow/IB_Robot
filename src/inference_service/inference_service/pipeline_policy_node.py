@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import threading
 import time
 import traceback
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -22,11 +25,19 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_srvs.srv import Trigger
 
-from ibrobot_msgs.action import DispatchInfer
+from ibrobot_msgs.action import (
+    CloseInferenceSession,
+    DispatchInfer,
+    OpenInferenceSession,
+    ScheduledDispatchInfer,
+)
 from ibrobot_msgs.msg import (
     DistributedInferenceRequest,
     DistributedInferenceResult,
+    InferenceOutcome,
     InferencePipelineStatus,
+    InferenceServingStatus,
+    InferenceWorkCapacity,
     VariantsList,
     VideoStreamDescriptor,
     VideoStreamStatus,
@@ -55,6 +66,26 @@ from inference_service.distributed.ros_protocol import (
     video_status_to_message,
 )
 from inference_service.pipeline import InferencePipelineManager, create_pipeline_manager
+from inference_service.scheduler.action_idempotency import (
+    ResolutionErrorCodes,
+    execute_resolved_action,
+)
+from inference_service.scheduler.goal_slots import GOAL_CONTEXTS_PER_ENDPOINT, GoalSlotPool
+from inference_service.scheduler.idempotency import (
+    IdempotencyError,
+    canonical_fingerprint,
+    validate_uuid4,
+)
+from inference_service.scheduler.ledger import (
+    IdempotencyLedger,
+    LedgerAction,
+    LedgerError,
+    close_key,
+    dispatch_key,
+    open_key,
+)
+from inference_service.scheduler.time_domains import monotonic_expiry_to_ros_ns
+from inference_service.scheduler.wire_bounds import set_scheduled_error, utf8_size
 from robot_config.contract_utils import (
     SpecView,
     StreamBuffer,
@@ -94,8 +125,31 @@ class PipelineNodeConfig:
     request_topic: str
     result_topic: str
     heartbeat_topic: str
-    video_descriptor_topic: str
-    video_status_topic: str
+    video_descriptor_topic: str = ""
+    video_status_topic: str = ""
+    # Empty when scheduler is disabled.
+    scheduled_open_session: str = ""
+    scheduled_dispatch: str = ""
+    scheduled_close_session: str = ""
+    scheduled_serving_status: str = ""
+    runtime_policy_json: str = ""
+    runtime_policy_fingerprint: str = ""
+    hardware_resource_id: str = ""
+    session_idle_timeout_ns: int = 0
+    max_prompt_bytes: int = 4096
+    max_error_message_bytes: int = 1024
+    max_error_details_bytes: int = 8192
+    public_capacity_json: str = ""
+    max_session_records: int = 1
+    terminal_result_cache_entries: int = 1
+    max_duplicate_waiters_per_request: int = 1
+    terminal_session_retention_ns: int = 1
+
+    @property
+    def scheduler_enabled(self) -> bool:
+        """Derive runtime mode from the SSOT-generated policy, never a second switch."""
+
+        return bool(self.runtime_policy_json)
 
 
 @dataclass
@@ -163,6 +217,11 @@ class RequestCanceledError(RuntimeError):
     recoverable = True
     stage = "cancel"
 
+    def __init__(self, message: str, *, operation_started: bool = False) -> None:
+        super().__init__(message)
+        self.operation_started = operation_started
+        self.outcome_known = True
+
 
 class DeadlineExceededError(RuntimeError):
     code = "deadline_exceeded"
@@ -177,6 +236,8 @@ class PipelinePolicyNode(Node):
         super().__init__(node_name)
         if config.execution_mode not in {"monolithic", "distributed"}:
             raise RuntimeError(f"unsupported pipeline execution mode {config.execution_mode!r}")
+        if config.scheduler_enabled and config.execution_mode != "monolithic":
+            raise RuntimeError("scheduled inference supports only monolithic pipelines")
 
         self._config = config
         self._manager: InferencePipelineManager | None = None
@@ -198,6 +259,8 @@ class PipelinePolicyNode(Node):
         self._inference_count = 0
         self._last_error = ""
         self._remote_state = "unavailable"
+        # Preserve the legacy operation lock unchanged. Scheduled Dispatch uses
+        # separate capacity slots validated against backend capabilities.
         self._operation_lock = threading.Lock()
         self._reset_pending = threading.Event()
         self._observation_lock = threading.RLock()
@@ -212,6 +275,21 @@ class PipelinePolicyNode(Node):
         self._goal_request_ids: dict[int, str] = {}
 
         self._load_contract(config.robot_config_path)
+        runtime_policy: dict[str, object] = {}
+        if config.scheduler_enabled:
+            self._pipeline_compatibility_fingerprint = self._build_pipeline_compatibility_fingerprint()
+            if not config.runtime_policy_fingerprint:
+                raise RuntimeError("scheduled runtime policy JSON and fingerprint must be provided together")
+            expected = hashlib.sha256(config.runtime_policy_json.encode("utf-8")).hexdigest()
+            if expected != config.runtime_policy_fingerprint:
+                raise RuntimeError("scheduled runtime policy JSON/fingerprint mismatch")
+            try:
+                runtime_policy = json.loads(config.runtime_policy_json)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"scheduled runtime policy JSON is invalid: {exc}") from exc
+            if not isinstance(runtime_policy, dict):
+                raise RuntimeError("scheduled runtime policy JSON must decode to an object")
+            self._validate_runtime_policy(runtime_policy)
         self._setup_observation_subscriptions()
         try:
             runtime_options = json.loads(config.runtime_options_json)
@@ -226,6 +304,7 @@ class PipelinePolicyNode(Node):
                 request_timeout=config.request_timeout,
                 default_task=config.default_task or None,
                 runtime_options=runtime_options,
+                priority_scheduling=config.scheduler_enabled,
             )
         else:
             for name in ("request_topic", "result_topic", "heartbeat_topic"):
@@ -246,7 +325,9 @@ class PipelinePolicyNode(Node):
                 observation_specs=self._obs_specs,
             )
 
-        self._action_pub = self.create_publisher(VariantsList, config.action_topic, 10)
+        self._action_pub = None
+        if not config.scheduler_enabled:
+            self._action_pub = self.create_publisher(VariantsList, config.action_topic, 10)
         self._health_pub = self.create_publisher(DiagnosticStatus, config.health_topic, 10)
         if config.execution_mode == "distributed":
             status_qos = QoSProfile(
@@ -282,32 +363,88 @@ class PipelinePolicyNode(Node):
             self._status_timer = self.create_timer(0.5, self._publish_distributed_status)
             self._heartbeat_timer = self.create_timer(0.25, self._check_heartbeat)
             self._video_status_timer = self.create_timer(0.25, self._publish_video_stream_control)
-        self._action_server = rclpy.action.ActionServer(
-            self,
-            DispatchInfer,
-            config.action_server,
-            execute_callback=self._dispatch_infer_callback,
-            goal_callback=lambda _request: rclpy.action.GoalResponse.ACCEPT,
-            cancel_callback=self._cancel_callback,
-            callback_group=(
-                MutuallyExclusiveCallbackGroup() if config.execution_mode == "monolithic" else ReentrantCallbackGroup()
-            ),
-        )
+        self._action_server = None
+        self._reset_server = None
         self._reset_callback_group = MutuallyExclusiveCallbackGroup()
-        self._reset_server = self.create_service(
-            Trigger,
-            config.reset_service,
-            self._reset_callback,
-            callback_group=self._reset_callback_group,
-        )
+        if not config.scheduler_enabled:
+            self._action_server = rclpy.action.ActionServer(
+                self,
+                DispatchInfer,
+                config.action_server,
+                execute_callback=self._dispatch_infer_callback,
+                goal_callback=lambda _request: rclpy.action.GoalResponse.ACCEPT,
+                cancel_callback=self._cancel_callback,
+                callback_group=(
+                    MutuallyExclusiveCallbackGroup()
+                    if config.execution_mode == "monolithic"
+                    else ReentrantCallbackGroup()
+                ),
+            )
+            self._reset_server = self.create_service(
+                Trigger,
+                config.reset_service,
+                self._reset_callback,
+                callback_group=self._reset_callback_group,
+            )
         self._health_timer = self.create_timer(1.0, self._publish_health)
         self._log_video_stream_diagnostics()
-        self.get_logger().info(
+
+        # Scheduled-path action servers and serving status.
+        # Only registered when scheduler_enabled; the legacy DispatchInfer/reset
+        # above remain for the disabled branch.
+        if config.scheduler_enabled:
+            self._scheduled_operation_slots: threading.BoundedSemaphore | None = None
+            self._scheduled_operation_capacity = 0
+            self._session_controller = None
+            self._pipeline_ledger = None
+            self._serving_status_pub = None
+            self._serving_status_timer = None
+            self._boot_id = str(uuid.uuid4())
+            self._serving_sequence = 0
+            self._setup_scheduled_path()
+
+        startup = (
             f"Unified pipeline started: id={config.pipeline_id}, mode={config.execution_mode}, "
             f"bundle={self._manifest.manifest.bundle.name}, "
             f"deployment={config.deployment}, backend={self._manifest.deployment.backend}, "
-            f"action={config.action_server}, reset={config.reset_service}"
         )
+        if config.scheduler_enabled:
+            startup += "path=scheduled"
+        else:
+            startup += f"action={config.action_server}, reset={config.reset_service}"
+        self.get_logger().info(startup)
+
+    def _validate_runtime_policy(self, policy: dict[str, object]) -> None:
+        expected_scalars = {
+            "pipeline_id": self._config.pipeline_id,
+            "execution_mode": self._config.execution_mode,
+            "hardware_resource_id": self._config.hardware_resource_id,
+            "deployment_fingerprint": self._manifest.fingerprint,
+        }
+        for field_name, expected in expected_scalars.items():
+            if policy.get(field_name) != expected:
+                raise RuntimeError(
+                    f"scheduled runtime policy {field_name} mismatch: {policy.get(field_name)!r} != {expected!r}"
+                )
+        try:
+            configured_capacity = json.loads(self._config.public_capacity_json)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"public_capacity_json is invalid: {exc}") from exc
+        if policy.get("public_capacity") != configured_capacity:
+            raise RuntimeError("scheduled runtime policy public_capacity mismatch")
+        transport = policy.get("transport")
+        if not isinstance(transport, dict):
+            raise RuntimeError("scheduled runtime policy transport must be an object")
+        expected_transport = {
+            "open_session": self._config.scheduled_open_session,
+            "dispatch": self._config.scheduled_dispatch,
+            "close_session": self._config.scheduled_close_session,
+            "serving_status": self._config.scheduled_serving_status,
+            "health_topic": self._config.health_topic,
+        }
+        for field_name, expected in expected_transport.items():
+            if transport.get(field_name) != expected:
+                raise RuntimeError(f"scheduled runtime policy transport.{field_name} mismatch")
 
     def _load_contract(self, robot_config_path: str) -> None:
         config_path = Path(robot_config_path)
@@ -397,6 +534,28 @@ class PipelinePolicyNode(Node):
                 qos,
                 callback_group=ReentrantCallbackGroup(),
             )
+
+    def _build_pipeline_compatibility_fingerprint(self) -> str:
+        observation_specs = {self._subscription_key(spec): asdict(spec) for spec in self._obs_specs}
+        action_specs = [asdict(spec) for spec in iter_specs(self._contract) if spec.is_action]
+        policy = self._manifest.policy
+        payload = {
+            "rate_hz": self._frequency,
+            "n_obs_steps": self._n_obs_steps,
+            "observations": observation_specs,
+            "actions": action_specs,
+            "policy_type": policy.policy_type,
+            "input_features": {
+                key: feature.model_dump(mode="json") for key, feature in sorted(policy.input_features.items())
+            },
+            "output_features": {
+                key: feature.model_dump(mode="json") for key, feature in sorted(policy.output_features.items())
+            },
+            "max_action_dimension": policy.max_action_dimension,
+            "default_task": self._config.default_task,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def _subscription_key(self, spec: SpecView) -> str:
         if spec.key == "observation.state" and len(self._state_specs) > 1:
@@ -728,6 +887,8 @@ class PipelinePolicyNode(Node):
             else:
                 expired = False
                 canceled = False
+                if self._action_pub is None:
+                    raise RuntimeError("legacy action publisher is unavailable on the scheduled path")
                 self._action_pub.publish(action_message)
                 goal_handle.succeed()
                 self._completed_goals.add(id(goal_handle))
@@ -780,6 +941,7 @@ class PipelinePolicyNode(Node):
                     inputs=observations,
                     prompt=request.prompt if request.prompt else None,
                     deadline=deadline,
+                    priority=0,
                 ),
             )
             raw_action = result.action
@@ -853,6 +1015,9 @@ class PipelinePolicyNode(Node):
 
     def _reset_callback(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         deadline = datetime.now(timezone.utc) + timedelta(seconds=self._config.request_timeout)
+        return PipelinePolicyNode._reset_with_deadline(self, response, deadline)
+
+    def _reset_with_deadline(self, response: Trigger.Response, deadline: datetime) -> Trigger.Response:
         self._reset_pending.set()
         acquired = self._operation_lock.acquire(
             timeout=max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
@@ -989,6 +1154,678 @@ class PipelinePolicyNode(Node):
         health.hardware_id = self._manifest.fingerprint
         health.values = [KeyValue(key=str(key), value=str(value)) for key, value in values.items()]
         self._health_pub.publish(health)
+
+    # ==================================================================
+    # Scheduled path: product session and serving status.
+    # ==================================================================
+
+    def _set_scheduled_error(
+        self,
+        error,
+        *,
+        code: object,
+        message: object = "",
+        recoverable: bool = False,
+        stage: object = "",
+        details: dict[str, object] | None = None,
+    ) -> None:
+        set_scheduled_error(
+            error,
+            code=code,
+            message=message,
+            recoverable=recoverable,
+            stage=stage,
+            details=details,
+            max_message_bytes=self._config.max_error_message_bytes,
+            max_details_bytes=self._config.max_error_details_bytes,
+        )
+
+    def _scheduled_deadline(self, deadline_message: object) -> datetime:
+        deadline = self._goal_deadline(deadline_message)
+        if deadline is None:
+            raise IdempotencyError("scheduled pipeline requires an absolute deadline from Global")
+        return deadline
+
+    def _setup_scheduled_path(self) -> None:
+        """Register pipeline-scoped scheduled action servers and serving status.
+
+        Uses ProductSessionController for session/generation/fencing and the
+        existing InferencePipeline.infer() for whole-graph execution.
+        """
+        from inference_service.scheduler.session_controller import (
+            ProductSessionController,
+            WorkClassCapacity,
+        )
+        from inference_service.scheduler.work_classes import WorkClass, work_class_name
+
+        # parse public_capacity from config JSON
+        caps: dict[WorkClass, WorkClassCapacity] = {}
+        try:
+            cap_data = json.loads(self._config.public_capacity_json) if self._config.public_capacity_json else {}
+        except json.JSONDecodeError:
+            cap_data = {}
+        for work_class in WorkClass:
+            wc_name = work_class_name(work_class)
+            if wc_name in cap_data:
+                caps[work_class] = WorkClassCapacity(
+                    work_class,
+                    int(cap_data[wc_name].get("max_in_flight", 1)),
+                )
+        # Always include session_control and action_generation.
+        if WorkClass.SESSION_CONTROL not in caps:
+            caps[WorkClass.SESSION_CONTROL] = WorkClassCapacity(WorkClass.SESSION_CONTROL, 1)
+        if WorkClass.ACTION_GENERATION not in caps:
+            caps[WorkClass.ACTION_GENERATION] = WorkClassCapacity(WorkClass.ACTION_GENERATION, 1)
+
+        action_capacity = caps[WorkClass.ACTION_GENERATION].max_in_flight
+        backend_capacity = self._require_manager().capabilities(self._config.pipeline_id).max_in_flight_per_instance
+        if action_capacity > backend_capacity:
+            raise RuntimeError(
+                "configured action_generation capacity exceeds backend max_in_flight_per_instance: "
+                f"{action_capacity} > {backend_capacity}"
+            )
+        self._scheduled_operation_slots = threading.BoundedSemaphore(action_capacity)
+        self._scheduled_operation_capacity = action_capacity
+
+        self._session_controller = ProductSessionController(
+            boot_id=self._boot_id,
+            capacities=caps,
+            session_idle_timeout_ns=self._config.session_idle_timeout_ns or 30_000_000_000,
+            now_ns=time.monotonic_ns,
+        )
+        self._session_controller.mark_ready()
+        self._pipeline_ledger = IdempotencyLedger(
+            max_session_records=self._config.max_session_records,
+            max_duplicate_waiters_per_request=self._config.max_duplicate_waiters_per_request,
+            terminal_session_retention_ns=self._config.terminal_session_retention_ns,
+            now_ns=time.monotonic_ns,
+            max_entries=self._config.max_session_records * (self._config.terminal_result_cache_entries + 4),
+            max_terminal_entries_per_session=self._config.terminal_result_cache_entries,
+        )
+
+        # Serving status publisher.
+        status_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self._serving_status_pub = self.create_publisher(
+            InferenceServingStatus, self._config.scheduled_serving_status, status_qos
+        )
+        self._serving_status_timer = self.create_timer(0.5, self._publish_serving_status)
+
+        # scheduled action servers (reentrant group — independent from legacy)
+        group = ReentrantCallbackGroup()
+        self._scheduled_lifecycle_goal_slots = GoalSlotPool(("open", "close"))
+        self._scheduled_dispatch_goal_slots = GoalSlotPool(
+            ("dispatch",),
+            capacity=max(GOAL_CONTEXTS_PER_ENDPOINT, action_capacity),
+        )
+        self._scheduled_open_server = rclpy.action.ActionServer(
+            self,
+            OpenInferenceSession,
+            self._config.scheduled_open_session,
+            execute_callback=lambda goal_handle: self._scheduled_lifecycle_goal_slots.run(
+                "open", self._scheduled_open_callback, goal_handle
+            ),
+            goal_callback=lambda _request: (
+                rclpy.action.GoalResponse.ACCEPT
+                if self._scheduled_lifecycle_goal_slots.try_acquire("open")
+                else rclpy.action.GoalResponse.REJECT
+            ),
+            callback_group=group,
+        )
+        self._scheduled_dispatch_server = rclpy.action.ActionServer(
+            self,
+            ScheduledDispatchInfer,
+            self._config.scheduled_dispatch,
+            execute_callback=lambda goal_handle: self._scheduled_dispatch_goal_slots.run(
+                "dispatch", self._scheduled_dispatch_callback, goal_handle
+            ),
+            goal_callback=lambda _request: (
+                rclpy.action.GoalResponse.ACCEPT
+                if self._scheduled_dispatch_goal_slots.try_acquire("dispatch")
+                else rclpy.action.GoalResponse.REJECT
+            ),
+            cancel_callback=self._scheduled_cancel_callback,
+            callback_group=group,
+        )
+        self._scheduled_close_server = rclpy.action.ActionServer(
+            self,
+            CloseInferenceSession,
+            self._config.scheduled_close_session,
+            execute_callback=lambda goal_handle: self._scheduled_lifecycle_goal_slots.run(
+                "close", self._scheduled_close_callback, goal_handle
+            ),
+            goal_callback=lambda _request: (
+                rclpy.action.GoalResponse.ACCEPT
+                if self._scheduled_lifecycle_goal_slots.try_acquire("close")
+                else rclpy.action.GoalResponse.REJECT
+            ),
+            callback_group=group,
+        )
+
+    def _publish_serving_status(self) -> None:
+        """Publish state, generation, fingerprints,
+        hardware identity, capacities."""
+        if self._session_controller is None or self._serving_status_pub is None:
+            return
+        snap = self._session_controller.snapshot()
+        msg = InferenceServingStatus()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pipeline_id = self._config.pipeline_id
+        msg.boot_id = self._boot_id
+        self._serving_sequence += 1
+        msg.sequence = self._serving_sequence
+        msg.state = int(snap.state)
+        msg.product_session_id = snap.product_session_id
+        msg.product_session_generation = snap.product_session_generation
+        lease_expires_at_ros_ns = monotonic_expiry_to_ros_ns(
+            snap.lease_expires_at_ns,
+            monotonic_now_ns=time.monotonic_ns(),
+            ros_now_ns=self.get_clock().now().nanoseconds,
+        )
+        msg.lease_expires_at.sec, msg.lease_expires_at.nanosec = divmod(lease_expires_at_ros_ns, 1_000_000_000)
+        msg.deployment_fingerprint = self._manifest.fingerprint
+        msg.runtime_policy_fingerprint = self._config.runtime_policy_fingerprint
+        msg.pipeline_compatibility_fingerprint = self._pipeline_compatibility_fingerprint
+        msg.configured_hardware_resource_id = self._config.hardware_resource_id
+        runtime_resource_id = self._runtime_hardware_resource_id()
+        msg.runtime_hardware_resource_id = runtime_resource_id
+        msg.hardware_priority_levels = self._runtime_hardware_priority_levels()
+        from inference_service.scheduler.session_controller import ServingState
+        from inference_service.scheduler.work_classes import WorkClass, work_class_name
+
+        for work_class in WorkClass:
+            try:
+                in_flight = self._session_controller.capacity_count(work_class)
+            except KeyError:
+                continue
+            configured = json.loads(self._config.public_capacity_json)[work_class_name(work_class)]
+            capacity = InferenceWorkCapacity()
+            capacity.work_class = int(work_class)
+            capacity.max_in_flight = int(configured["max_in_flight"])
+            capacity.current_in_flight = in_flight
+            state_accepting = (
+                snap.state == ServingState.IDLE
+                if work_class == WorkClass.SESSION_CONTROL
+                else snap.state == ServingState.ACTIVE
+            )
+            capacity.accepting_requests = state_accepting and in_flight < capacity.max_in_flight
+            msg.capacities.append(capacity)
+        if not runtime_resource_id:
+            msg.error.code = "runtime_hardware_identity_unavailable"
+            msg.error.message = "backend did not report a runtime hardware resource identity"
+            msg.error.recoverable = False
+        self._serving_status_pub.publish(msg)
+
+    def _runtime_hardware_resource_id(self) -> str:
+        capabilities = self._require_manager().capabilities(self._config.pipeline_id)
+        return capabilities.hardware_resource_id or ""
+
+    def _runtime_hardware_priority_levels(self) -> int:
+        mapping = self._require_manager().capabilities(self._config.pipeline_id).priority_mapping
+        return mapping.generic_level_count if mapping is not None else 1
+
+    def _scheduled_open_callback(self, goal_handle) -> OpenInferenceSession.Result:
+        goal = goal_handle.request
+        return self._execute_pipeline_idempotent(
+            goal_handle=goal_handle,
+            action=LedgerAction.OPEN,
+            key=open_key(goal.session_id),
+            payload={"deadline": goal.deadline},
+            deadline=goal.deadline,
+            execute=self._scheduled_open_once,
+        )
+
+    def _scheduled_dispatch_callback(self, goal_handle) -> ScheduledDispatchInfer.Result:
+        goal = goal_handle.request
+        return self._execute_pipeline_idempotent(
+            goal_handle=goal_handle,
+            action=LedgerAction.DISPATCH,
+            key=dispatch_key(goal.session_id, goal.session_generation, goal.request_id),
+            payload={
+                "session_generation": goal.session_generation,
+                "obs_timestamp": goal.obs_timestamp,
+                "prompt": goal.prompt,
+                "priority": goal.priority,
+                "target_pipeline_id": goal.target_pipeline_id,
+                "fallback_chain": list(goal.fallback_chain),
+                "deadline": goal.deadline,
+            },
+            deadline=goal.deadline,
+            execute=self._scheduled_dispatch_once,
+            request_id=goal.request_id,
+        )
+
+    def _scheduled_close_callback(self, goal_handle) -> CloseInferenceSession.Result:
+        goal = goal_handle.request
+        return self._execute_pipeline_idempotent(
+            goal_handle=goal_handle,
+            action=LedgerAction.CLOSE,
+            key=close_key(goal.session_id, goal.session_generation),
+            payload={"session_generation": goal.session_generation},
+            deadline=goal.deadline,
+            execute=self._scheduled_close_once,
+        )
+
+    def _execute_pipeline_idempotent(
+        self,
+        *,
+        goal_handle,
+        action: LedgerAction,
+        key: tuple,
+        payload: dict[str, object],
+        deadline,
+        execute,
+        request_id: str = "",
+    ):
+        goal = goal_handle.request
+        ledger = self._pipeline_ledger
+        if ledger is None:
+            return self._pipeline_idempotency_failure(
+                goal_handle, action, goal, request_id, "pipeline_ledger_unavailable", "", InferenceOutcome.UNKNOWN
+            )
+        try:
+            validate_uuid4(goal.session_id, field="session_id")
+            if request_id:
+                validate_uuid4(request_id, field="request_id")
+            original_deadline_ns = int(deadline.sec) * 1_000_000_000 + int(deadline.nanosec)
+            if original_deadline_ns <= 0:
+                raise IdempotencyError("scheduled pipeline requires an absolute deadline from Global")
+            resolution = ledger.resolve(
+                action=action,
+                key=key,
+                payload_fingerprint=canonical_fingerprint(payload),
+                effective_deadline_utc_ns=original_deadline_ns,
+            )
+        except (IdempotencyError, LedgerError, TypeError, ValueError) as exc:
+            return self._pipeline_idempotency_failure(
+                goal_handle, action, goal, request_id, "request_conflict", str(exc), InferenceOutcome.NOT_STARTED
+            )
+        return execute_resolved_action(
+            ledger,
+            resolution,
+            key=key,
+            goal_handle=goal_handle,
+            execute=lambda _entry: execute(goal_handle),
+            failure=lambda code, message, outcome: self._pipeline_idempotency_failure(
+                goal_handle, action, goal, request_id, code, message, outcome
+            ),
+            error_codes=ResolutionErrorCodes(
+                ledger_full="pipeline_ledger_full",
+                ledger_error="pipeline_ledger_error",
+                internal_error="pipeline_internal_error",
+            ),
+            not_started_outcome=InferenceOutcome.NOT_STARTED,
+            unknown_outcome=InferenceOutcome.UNKNOWN,
+            log_internal_error=lambda exc: self.get_logger().exception(
+                f"unhandled pipeline {action.value} failure: {exc}"
+            ),
+        )
+
+    def _pipeline_idempotency_failure(
+        self, goal_handle, action, goal, request_id: str, code: str, message: str, outcome: int
+    ):
+        if action is LedgerAction.OPEN:
+            result = OpenInferenceSession.Result()
+            result.session_id = goal.session_id
+        elif action is LedgerAction.DISPATCH:
+            result = ScheduledDispatchInfer.Result()
+            result.request_id = request_id
+            result.session_id = goal.session_id
+            result.session_generation = goal.session_generation
+            result.pipeline_id = self._config.pipeline_id
+        else:
+            result = CloseInferenceSession.Result()
+            result.session_id = goal.session_id
+            result.pipeline_id = self._config.pipeline_id
+        result.outcome.value = outcome
+        self._set_scheduled_error(
+            result.error,
+            code=code,
+            message=message,
+            recoverable=outcome == InferenceOutcome.NOT_STARTED,
+            stage="admission",
+        )
+        goal_handle.abort()
+        return result
+
+    def _scheduled_open_once(self, goal_handle) -> OpenInferenceSession.Result:
+        """Perform atomic session admission and the reset barrier."""
+        goal = goal_handle.request
+        result = OpenInferenceSession.Result()
+        result.session_id = goal.session_id
+        ctrl = self._session_controller
+        if ctrl is None:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(result.error, code="session_not_configured", stage="open")
+            return result
+        deadline = self._scheduled_deadline(goal.deadline)
+        try:
+            self._raise_if_deadline_expired(deadline, goal.session_id)
+        except DeadlineExceededError as exc:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(result.error, code=exc.code, message=exc, recoverable=True, stage=exc.stage)
+            return result
+        try:
+            validate_uuid4(goal.session_id, field="session_id")
+        except IdempotencyError as exc:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(
+                result.error, code="invalid_session_id", message=exc, recoverable=True, stage="open"
+            )
+            return result
+        open_res = ctrl.begin_open(goal.session_id)
+        if not open_res.accepted:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(result.error, code=open_res.code, recoverable=True, stage="open")
+            return result
+        result.session_generation = open_res.fence_generation
+        # Run the whole-graph reset barrier.
+        try:
+            reset_response = self._reset_with_deadline(Trigger.Response(), deadline)
+            if not reset_response.success:
+                raise RuntimeError(reset_response.message)
+            ctrl.finish_open(success=True)
+            self._publish_serving_status()
+            result.success = True
+            result.actual_pipeline_id = self._config.pipeline_id
+            result.session_generation = open_res.fence_generation
+            result.deployment_fingerprint = self._manifest.fingerprint
+            result.runtime_policy_fingerprint = self._config.runtime_policy_fingerprint
+            snapshot = ctrl.snapshot()
+            lease_expires_at_ros_ns = monotonic_expiry_to_ros_ns(
+                snapshot.lease_expires_at_ns,
+                monotonic_now_ns=time.monotonic_ns(),
+                ros_now_ns=self.get_clock().now().nanoseconds,
+            )
+            result.lease_expires_at.sec, result.lease_expires_at.nanosec = divmod(
+                lease_expires_at_ros_ns, 1_000_000_000
+            )
+            result.outcome.value = InferenceOutcome.COMPLETED
+            goal_handle.succeed()
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                ctrl.finish_open(success=False)
+            self._publish_serving_status()
+            result.success = False
+            result.outcome.value = InferenceOutcome.COMPLETED
+            self._set_scheduled_error(result.error, code="session_reset_failed", message=exc, stage="open")
+            goal_handle.abort()
+        return result
+
+    def _scheduled_dispatch_once(self, goal_handle) -> ScheduledDispatchInfer.Result:
+        """Dispatch scheduled inference within an active session."""
+        goal = goal_handle.request
+        operation_acquired = False
+        side_effect_started = False
+        result = ScheduledDispatchInfer.Result()
+        result.request_id = goal.request_id
+        result.session_id = goal.session_id
+        result.session_generation = goal.session_generation
+        result.pipeline_id = self._config.pipeline_id
+        result.deployment_fingerprint = self._manifest.fingerprint
+        result.runtime_policy_fingerprint = self._config.runtime_policy_fingerprint
+        ctrl = self._session_controller
+        if ctrl is None:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(result.error, code="session_not_configured", stage="dispatch")
+            return result
+        from inference_service.scheduler.work_classes import WorkClass
+
+        deadline = self._scheduled_deadline(goal.deadline)
+        try:
+            self._raise_if_deadline_expired(deadline, goal.request_id)
+        except DeadlineExceededError as exc:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(result.error, code=exc.code, message=exc, recoverable=True, stage=exc.stage)
+            return result
+        if utf8_size(goal.prompt) > self._config.max_prompt_bytes:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(
+                result.error,
+                code="prompt_too_large",
+                message=f"prompt exceeds max_prompt_bytes={self._config.max_prompt_bytes}",
+                recoverable=True,
+                stage="admission",
+            )
+            return result
+        if goal.target_pipeline_id not in ("", self._config.pipeline_id) or goal.fallback_chain:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(
+                result.error,
+                code="invalid_pipeline_scoped_dispatch",
+                recoverable=True,
+                stage="admission",
+            )
+            return result
+        if goal.priority < 0:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(result.error, code="invalid_priority", recoverable=True, stage="admission")
+            return result
+        priority_mapping = self._require_manager().capabilities(self._config.pipeline_id).priority_mapping
+        priority_levels = priority_mapping.generic_level_count if priority_mapping is not None else 1
+        try:
+            if priority_mapping is None:
+                if goal.priority != 0:
+                    raise ValueError("single-priority backend")
+            else:
+                priority_mapping.map_generic(goal.priority)
+        except ValueError:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(
+                result.error,
+                code="unsupported_priority",
+                message=(
+                    f"backend for pipeline {self._config.pipeline_id!r} supports priorities "
+                    f"[0, {priority_levels - 1}], got {goal.priority}"
+                ),
+                recoverable=False,
+                stage="admission",
+            )
+            return result
+        admission = ctrl.admit(
+            WorkClass.ACTION_GENERATION,
+            generation=goal.session_generation,
+            session_id=goal.session_id,
+        )
+        if not admission.accepted:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(
+                result.error,
+                code=admission.code,
+                recoverable=admission.code == "no_session_capacity",
+                stage="admission",
+            )
+            return result
+        try:
+            if self._goal_cancel_requested(goal_handle):
+                raise RequestCanceledError(f"scheduled dispatch {goal.request_id!r} was canceled before admission")
+            if self._scheduled_operation_slots is None or not self._scheduled_operation_slots.acquire(blocking=False):
+                raise PipelineBusyError(f"pipeline {self._config.pipeline_id!r} has no scheduled execution capacity")
+            operation_acquired = True
+            # capture observation snapshot (zero obs_timestamp -> use now)
+            sample_time = goal.obs_timestamp.sec * 1_000_000_000 + goal.obs_timestamp.nanosec
+            if sample_time <= 0:
+                sample_time = self.get_clock().now().nanoseconds
+            observations = self._sample_observations(sample_time)
+            if self._goal_cancel_requested(goal_handle):
+                raise RequestCanceledError(f"scheduled dispatch {goal.request_id!r} was canceled before execution")
+            ctrl.record_product_activity()
+            self._raise_if_deadline_expired(deadline, goal.request_id)
+            if "observation.state" in observations:
+                observations["observation.state"] = self._rad_to_lerobot(observations["observation.state"])
+            request = InferenceRequest(
+                request_id=goal.request_id,
+                inputs=self._to_policy_inputs(observations),
+                prompt=goal.prompt if goal.prompt else None,
+                deadline=deadline,
+                priority=goal.priority,
+                metadata={
+                    "product_session_id": goal.session_id,
+                    "product_session_generation": goal.session_generation,
+                },
+            )
+            backend_result = self._require_manager().infer(
+                self._config.pipeline_id,
+                request,
+            )
+            side_effect_started = True
+            raw_action = backend_result.action
+            chunk_size = backend_result.actual_chunk_size
+            backend_latency_ms = backend_result.backend_latency_ms
+            total_latency_ms = backend_result.total_latency_ms
+            if self._goal_cancel_requested(goal_handle):
+                raise RequestCanceledError(
+                    f"scheduled dispatch {goal.request_id!r} was canceled before publication",
+                    operation_started=side_effect_started,
+                )
+            if ctrl.is_stale_generation(goal.session_generation):
+                raise RuntimeError("dispatch completion crossed a session generation fence")
+            action = self._lerobot_to_rad(raw_action)
+            result.action_chunk = TensorMsgConverter.to_variant({"action": action})
+            result.chunk_size = chunk_size
+            result.success = True
+            result.inference_latency_ms = total_latency_ms
+            result.backend_latency_ms = backend_latency_ms
+            result.outcome.value = InferenceOutcome.COMPLETED
+            self._last_inference_time = time.time()
+            self._inference_count += 1
+            self._last_error = ""
+            goal_handle.succeed()
+        except Exception as exc:
+            self._last_error = str(exc)
+            result.success = False
+            if not bool(getattr(exc, "outcome_known", True)):
+                result.outcome.value = InferenceOutcome.UNKNOWN
+            elif bool(getattr(exc, "operation_started", side_effect_started)):
+                result.outcome.value = InferenceOutcome.COMPLETED
+            else:
+                result.outcome.value = InferenceOutcome.NOT_STARTED
+            if result.outcome.value == InferenceOutcome.UNKNOWN:
+                ctrl.mark_failed_quarantine()
+            self._set_scheduled_error(
+                result.error,
+                code=getattr(exc, "code", "dispatch_failed"),
+                message=exc,
+                recoverable=(
+                    result.outcome.value == InferenceOutcome.NOT_STARTED and bool(getattr(exc, "recoverable", True))
+                ),
+                stage=getattr(exc, "stage", "dispatch"),
+                details=getattr(exc, "details", None),
+            )
+            if getattr(exc, "code", "") == "request_canceled":
+                self._finish_canceled_goal(goal_handle)
+            else:
+                goal_handle.abort()
+        finally:
+            if operation_acquired:
+                assert self._scheduled_operation_slots is not None
+                self._scheduled_operation_slots.release()
+            ctrl.release_in_flight(WorkClass.ACTION_GENERATION)
+        return result
+
+    def _scheduled_close_once(self, goal_handle) -> CloseInferenceSession.Result:
+        """Close the session through the drain barrier."""
+        goal = goal_handle.request
+        result = CloseInferenceSession.Result()
+        result.session_id = goal.session_id
+        result.pipeline_id = self._config.pipeline_id
+        ctrl = self._session_controller
+        if ctrl is None:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(result.error, code="session_not_configured", stage="close")
+            return result
+        deadline = self._scheduled_deadline(goal.deadline)
+        try:
+            self._raise_if_deadline_expired(deadline, goal.session_id)
+        except DeadlineExceededError as exc:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(result.error, code=exc.code, message=exc, recoverable=True, stage=exc.stage)
+            return result
+        snapshot = ctrl.snapshot()
+        if snapshot.product_session_id != goal.session_id:
+            goal_handle.abort()
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(result.error, code="session_mismatch", recoverable=True, stage="close")
+            return result
+        close_res = ctrl.begin_close(generation=goal.session_generation)
+        if not close_res.accepted and close_res.code == "cleanup_not_needed":
+            goal_handle.succeed()
+            result.success = True
+            result.closed_session_generation = 0
+            result.drained_generation = 0
+            result.outcome.value = InferenceOutcome.COMPLETED
+            return result
+        if not close_res.accepted:
+            goal_handle.abort()
+            result.success = False
+            result.outcome.value = InferenceOutcome.NOT_STARTED
+            self._set_scheduled_error(result.error, code=close_res.code, recoverable=True, stage="close")
+            return result
+        result.closed_session_generation = close_res.closed_generation
+        result.drained_generation = close_res.drain_generation
+        # Reuse the whole-graph reset path for the Close drain barrier.
+        drained_slots = 0
+        try:
+            drained_slots = self._acquire_scheduled_drain_slots(deadline)
+            reset_response = self._reset_with_deadline(Trigger.Response(), deadline)
+            if not reset_response.success:
+                raise RuntimeError(reset_response.message)
+            ctrl.finish_close(success=True)
+            self._publish_serving_status()
+            result.success = True
+            result.outcome.value = InferenceOutcome.COMPLETED
+            goal_handle.succeed()
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                ctrl.finish_close(success=False)
+            self._publish_serving_status()
+            result.success = False
+            result.outcome.value = InferenceOutcome.COMPLETED
+            self._set_scheduled_error(result.error, code="close_drain_failed", message=exc, stage="close")
+            goal_handle.abort()
+        finally:
+            self._release_scheduled_drain_slots(drained_slots)
+        return result
+
+    def _acquire_scheduled_drain_slots(self, deadline: datetime) -> int:
+        slots = self._scheduled_operation_slots
+        capacity = self._scheduled_operation_capacity
+        if slots is None or capacity <= 0:
+            raise RuntimeError("scheduled execution slots are unavailable")
+        acquired = 0
+        try:
+            while acquired < capacity:
+                remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+                if remaining <= 0 or not slots.acquire(timeout=max(0.0, remaining)):
+                    raise RuntimeError("scheduled Close timed out draining active operations")
+                acquired += 1
+            return acquired
+        except Exception:
+            self._release_scheduled_drain_slots(acquired)
+            raise
+
+    def _release_scheduled_drain_slots(self, count: int) -> None:
+        slots = self._scheduled_operation_slots
+        if slots is None:
+            return
+        for _ in range(count):
+            slots.release()
 
     @staticmethod
     def _format_video_stream_diagnostic(snapshot: object) -> str:
@@ -1242,6 +2079,24 @@ class PipelinePolicyNode(Node):
             deadline=datetime.now(timezone.utc) + timedelta(seconds=self._config.request_timeout),
         )
 
+    def _scheduled_cancel_callback(self, goal_handle: object):
+        request = goal_handle.request
+        request_id = getattr(request, "request_id", "")
+        if not request_id:
+            return rclpy.action.CancelResponse.REJECT
+        manager = self._require_manager()
+        if not manager.capabilities(self._config.pipeline_id).supports_cancellation:
+            return rclpy.action.CancelResponse.REJECT
+        with contextlib.suppress(Exception):
+            manager.cancel(
+                self._config.pipeline_id,
+                request_id,
+                datetime.now(timezone.utc) + timedelta(seconds=self._config.request_timeout),
+            )
+        # Before admission there is no runtime work item to signal. The execute
+        # callback still observes is_cancel_requested before starting work.
+        return rclpy.action.CancelResponse.ACCEPT
+
     def _cancel_callback(self, goal_handle: object):
         if self._config.execution_mode == "distributed" and self._require_edge_session().cancellation_supported:
             with self._goal_state_lock:
@@ -1363,6 +2218,22 @@ def _read_config() -> tuple[PipelineNodeConfig, str]:
         "request_topic": "",
         "result_topic": "",
         "heartbeat_topic": "",
+        "scheduled_open_session": "",
+        "scheduled_dispatch": "",
+        "scheduled_close_session": "",
+        "scheduled_serving_status": "",
+        "runtime_policy_json": "",
+        "runtime_policy_fingerprint": "",
+        "hardware_resource_id": "",
+        "session_idle_timeout_ns": 0,
+        "max_prompt_bytes": 4096,
+        "max_error_message_bytes": 1024,
+        "max_error_details_bytes": 8192,
+        "public_capacity_json": "",
+        "max_session_records": 1,
+        "terminal_result_cache_entries": 1,
+        "max_duplicate_waiters_per_request": 1,
+        "terminal_session_retention_ns": 1,
         "video_descriptor_topic": "/inference/policy/video/descriptors",
         "video_status_topic": "/inference/policy/video/status",
     }
@@ -1374,13 +2245,23 @@ def _read_config() -> tuple[PipelineNodeConfig, str]:
     return PipelineNodeConfig(**values), node_name
 
 
+def _pipeline_executor_threads(config: PipelineNodeConfig) -> int:
+    if not config.scheduler_enabled:
+        return 4
+    try:
+        capacity = json.loads(config.public_capacity_json)["action_generation"]["max_in_flight"]
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        capacity = 1
+    return max(8, int(capacity) + 4)
+
+
 def main(args: list[str] | None = None) -> None:
     rclpy.init(args=args)
     node: PipelinePolicyNode | None = None
     try:
         config, node_name = _read_config()
         node = PipelinePolicyNode(config, node_name=node_name)
-        executor = MultiThreadedExecutor(num_threads=4)
+        executor = MultiThreadedExecutor(num_threads=_pipeline_executor_threads(config))
         executor.add_node(node)
         executor.spin()
     except KeyboardInterrupt:

@@ -296,11 +296,18 @@ class HMMModule:
 class HMMBackend(LifecycleBackend):
     """Execute PI0.5 and SmolVLA through manifest-declared TCIM modules."""
 
-    def __init__(self, device_id: int = 0, *, runtime_loader: Callable[[], object] | None = None) -> None:
+    def __init__(
+        self,
+        device_id: int = 0,
+        *,
+        runtime_loader: Callable[[], object] | None = None,
+        expose_hardware_identity: bool = False,
+    ) -> None:
         super().__init__(
             "hmm",
             BackendCapabilities(
                 max_in_flight_per_instance=1,
+                hardware_resource_id=f"hmm:{device_id}" if expose_hardware_identity else None,
                 resource_domain=f"hmm:{device_id}",
                 max_in_flight_per_resource_domain=1,
             ),
@@ -1338,4 +1345,7 @@ def create_backend(context: RuntimeContext) -> HMMBackend:
     if not isinstance(deployment, CompiledDeployment) or deployment.backend != "hmm":
         raise BackendLoadError("HMMBackend requires a compiled hmm deployment", code="invalid_deployment")
     options = HMMBackend._validate_runtime_options(context.runtime_options)
-    return HMMBackend(int(options["device_id"]))
+    return HMMBackend(
+        int(options["device_id"]),
+        expose_hardware_identity=context.priority_scheduling,
+    )

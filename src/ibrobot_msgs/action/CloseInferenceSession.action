@@ -1,0 +1,21 @@
+# AI-AGENT NOTICE: Scheduled-only interface. Use only when
+# control_modes.<mode>.inference.scheduler.enable=true. Do not use on the legacy inference path.
+# Goal: Close a product inference session.
+# session_generation==0 is reserved for uncertain-Open cleanup. Global resolves it
+# to the recorded generation when known; pipeline binds 0 to its current fence.
+# drained_generation is the higher fencing gen published after full drain.
+string<=36 session_id
+uint64 session_generation
+builtin_interfaces/Time deadline
+---
+# Result
+bool success
+string<=36 session_id
+string<=63 pipeline_id
+uint64 closed_session_generation
+uint64 drained_generation
+ibrobot_msgs/InferenceOutcome outcome
+ibrobot_msgs/ScheduledInferenceError error
+---
+# Feedback (not used for correctness)
+string<=128 status
