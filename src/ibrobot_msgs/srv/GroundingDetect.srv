@@ -1,0 +1,10 @@
+sensor_msgs/Image image
+string text_prompt
+float32 box_threshold
+float32 text_threshold
+---
+DetectionArray detections
+ModelRuntimeInfo model
+float32 inference_time_ms
+bool success
+string message

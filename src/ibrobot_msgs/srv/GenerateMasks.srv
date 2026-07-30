@@ -1,0 +1,11 @@
+sensor_msgs/Image image
+uint32 max_masks
+uint32 min_mask_pixels
+float32 min_mask_area_ratio
+float32 max_overlap_ratio
+---
+DetectionArray detections
+ModelRuntimeInfo model
+float32 inference_time_ms
+bool success
+string message

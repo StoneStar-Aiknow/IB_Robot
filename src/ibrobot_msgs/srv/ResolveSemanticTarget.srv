@@ -1,0 +1,13 @@
+string object_id
+string query_text
+float32 stand_off_distance_m
+bool require_manipulation_ready
+---
+SemanticObject3D object
+geometry_msgs/PoseStamped staging_pose
+float32 clearance_m
+SemanticMapMetadata metadata
+bool navigation_ready
+bool manipulation_ready
+bool success
+string message

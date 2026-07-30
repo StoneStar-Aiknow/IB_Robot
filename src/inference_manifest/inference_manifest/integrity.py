@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from pydantic import BaseModel
 
 from inference_manifest.errors import ManifestIntegrityError
-from inference_manifest.models import BundleFile, Deployment
+from inference_manifest.models import BundleFile, Deployment, SemanticIdentity
 from inference_manifest.paths import normalize_unique_paths
 
 _REGENERATE_GUIDANCE = (
@@ -72,3 +72,18 @@ def deployment_fingerprint(
     }
     serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
     return hashlib.sha256(serialized).hexdigest()
+
+
+def canonical_semantic_identity_json(identity: SemanticIdentity) -> str:
+    """Serialize a validated semantic identity without deployment provenance."""
+
+    if not isinstance(identity, SemanticIdentity):
+        raise TypeError("identity must be a validated SemanticIdentity")
+    value = identity.model_dump(mode="json", exclude_none=True)
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def semantic_identity_fingerprint(identity: SemanticIdentity) -> str:
+    """Hash only validated semantic model-space metadata, never model artifacts."""
+
+    return hashlib.sha256(canonical_semantic_identity_json(identity).encode()).hexdigest()

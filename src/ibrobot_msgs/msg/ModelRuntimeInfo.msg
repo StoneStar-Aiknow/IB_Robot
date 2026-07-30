@@ -10,3 +10,9 @@ string runtime_state
 string failure_reason
 bool ready
 string message
+string semantic_identity_json
+string semantic_identity_fingerprint
+string embedding_space_id
+uint32 embedding_dimension
+string normalization
+uint64 configuration_generation

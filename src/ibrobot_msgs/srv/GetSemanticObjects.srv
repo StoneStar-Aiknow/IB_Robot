@@ -1,0 +1,16 @@
+# Empty object_ids and an empty label match every object.
+string[] object_ids
+string label
+string query_text
+string[] states
+bool include_inactive
+float32 min_confidence
+float32 max_age_sec
+geometry_msgs/Point region_center
+float32 region_radius_m
+uint32 max_results
+---
+SemanticObject3DArray semantic_map
+SemanticMapMetadata metadata
+bool success
+string message

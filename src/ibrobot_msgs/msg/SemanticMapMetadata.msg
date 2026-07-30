@@ -1,0 +1,11 @@
+uint32 schema_version
+string map_version
+string geometry_map_hash
+string localization_session_id
+string global_frame
+string calibration_hash
+string urdf_hash
+string coordinate_convention
+ModelRuntimeInfo[] models
+bool compatible
+string readiness_reason

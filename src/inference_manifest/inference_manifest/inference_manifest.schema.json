@@ -309,6 +309,58 @@
         }
       }
     },
+    "embedding_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "embedding_space_id",
+        "dimension",
+        "normalization",
+        "image_preprocessing",
+        "text_preprocessing"
+      ],
+      "properties": {
+        "embedding_space_id": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "dimension": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "normalization": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "image_preprocessing": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "text_preprocessing": {
+          "$ref": "#/$defs/non_empty_string"
+        }
+      }
+    },
+    "semantic_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "logical_model_revision",
+        "preprocessing_contract",
+        "output_semantics"
+      ],
+      "properties": {
+        "logical_model_revision": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "preprocessing_contract": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "output_semantics": {
+          "$ref": "#/$defs/non_empty_string"
+        },
+        "embedding": {
+          "$ref": "#/$defs/embedding_metadata"
+        }
+      }
+    },
     "model": {
       "type": "object",
       "additionalProperties": false,
@@ -340,6 +392,9 @@
           "items": {
             "$ref": "#/$defs/semantic_tensor"
           }
+        },
+        "semantic_identity": {
+          "$ref": "#/$defs/semantic_identity"
         }
       },
       "allOf": [

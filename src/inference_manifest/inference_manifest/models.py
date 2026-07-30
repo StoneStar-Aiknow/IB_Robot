@@ -167,11 +167,29 @@ class SemanticTensor(StrictFrozenModel):
         return self
 
 
+class EmbeddingMetadata(StrictFrozenModel):
+    embedding_space_id: StrictString
+    dimension: Annotated[int, Field(strict=True, gt=0)]
+    normalization: StrictString
+    image_preprocessing: StrictString
+    text_preprocessing: StrictString
+
+
+class SemanticIdentity(StrictFrozenModel):
+    """Logical model-space contract independent of its deployment."""
+
+    logical_model_revision: StrictString
+    preprocessing_contract: StrictString
+    output_semantics: StrictString
+    embedding: EmbeddingMetadata | None = None
+
+
 class ModelDescriptor(StrictFrozenModel):
     kind: Literal["policy", "perception", "generic"] = "policy"
     family: StrictString = "lerobot"
     inputs: tuple[SemanticTensor, ...] = ()
     outputs: tuple[SemanticTensor, ...] = ()
+    semantic_identity: SemanticIdentity | None = None
 
     @model_validator(mode="after")
     def validate_unique_semantics(self) -> ModelDescriptor:
