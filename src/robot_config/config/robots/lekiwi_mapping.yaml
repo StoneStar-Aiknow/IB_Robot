@@ -149,8 +149,13 @@ robot:
       depth_topic: /camera/realsense/aligned_depth_to_color/image_raw
       camera_info_topic: /camera/realsense/camera_info
     slam:
+      # Replace these identities with values exported by the active SLAM,
+      # calibration, and robot-description deployments before enabling mapping.
       global_frame: map
       cloud_map_topic: /cloud_map
+      active_map_hash_topic: /slam/active_geometry_map_hash
+      localization_ready_topic: /slam/localization_ready
+      authoritative_map_odom_topic: /slam/authoritative_map_odom_ready
       geometry_map_id: rtabmap-lekiwi
       geometry_map_hash: REPLACE_WITH_ACTIVE_GEOMETRY_MAP_HASH
       localization_session_id: REPLACE_WITH_LOCALIZATION_SESSION_ID
@@ -199,6 +204,9 @@ robot:
       scan_profile: fixed_d435_base_scan
       stand_off_distance_m: 0.8
       clearance_m: 0.2
+      footprint_ready_topic: /navigation/footprint_ready
+      obstacle_map_ready_topic: /navigation/obstacle_map_ready
+      reachability_ready_topic: /navigation/reachability_ready
     interfaces:
       semantic_map_topic: /semantic_mapping/objects
       object_cloud_topic: /semantic_mapping/object_cloud
