@@ -218,6 +218,29 @@ identity tensor session 验证 bundle -> runtime -> adapter -> typed response �
 生产模型或 accelerator deployment 已通过语义/硬件 conformance。生产服务类型、adapter、wrapper 和配置由各自
 消费功能负责。
 
+## 9. Semantic Mapping Model Services
+
+新语义建图流水线使用五个独立的 generic `model_service_node` 进程：SAM2 mask、RAM++ tagging、SigLIP2
+masked-image、SigLIP2 text 和可选 Grounding DINO confirmation。每个进程只承载一个 typed endpoint 和一个
+named deployment；SigLIP2 image/text 不共享进程，但必须声明兼容的 embedding space。
+
+每个 generic host 通过 response `ModelRuntimeInfo` 报告 readiness、semantic identity 和 deployment
+provenance。未完成 target conformance 的 Ascend adapter 保持 not-ready；CUDA 不可用时必须在 SSOT 中选择另一个
+已经验证的 named deployment，节点不会自动切换 backend。
+
+感知模型与 ACT/PI0.5 使用相同的 bundle-first 结构。下载脚本直接生成四个 bundle 根目录：
+`models/sam2.1_hiera_tiny/`、`models/ram_plus_swin_large_14m/`、
+`models/siglip2_so400m_patch14_384/` 和 `models/grounded_sam2_swint_ogc/`。每个目录包含
+`inference_manifest.json`、`assets/adapter.json`、模型资产和 `torch_cpu`/`torch_cuda` named deployment。
+Grounding DINO Swin-T OGC 的网络结构配置由 `perception_service.grounding_dino_config` 常量绑定到软件版本，
+不作为模型资产复制进 bundle；bundle 仅保存 checkpoint、文本编码器和 SAM2 checkpoint 等运行资产。
+
+SigLIP2 image/text 服务共享同一 bundle 与 embedding identity，但仍由独立进程加载独立 session。RAM++ 仍从
+`ram_models/recognize-anything/` 导入上游 `ram` 源码；源码不是模型资产。ONNX、OM 等未验证转换结果只能放在
+bundle 的 `model_utils_work/`，通过 conformance 与 promotion 后才可复制到不可变
+`artifacts/<backend>/<deployment>/generations/<uuid>/` 并注册为 named deployment。这些 service-backed mapping
+资产不应与 legacy `grounded_sam2_node` 的 `DetectSegment` contract 混用。
+
 ### 检测结果质心
 
 每个 `Detection2D` 携带两种 3D 质心（相机光学系，单位 m）：

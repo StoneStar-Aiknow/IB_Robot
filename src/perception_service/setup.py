@@ -10,9 +10,6 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
     ],
-    package_data={
-        "perception_service": ["config/gdino/*.py"],
-    },
     install_requires=["setuptools"],
     zip_safe=True,
     maintainer="liuweihong",
@@ -25,6 +22,7 @@ setup(
             "grounded_sam2_node = perception_service.grounded_sam2_node:main",
             "grounded_sam2_snapshot = perception_service.grounded_sam2_snapshot:main",
             "model_service_node = perception_service.model_service_node:main",
+            "package_perception_bundles = perception_service.package_perception_bundles:main",
         ],
     },
 )

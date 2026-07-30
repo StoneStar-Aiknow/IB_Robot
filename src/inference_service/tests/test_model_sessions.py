@@ -5,6 +5,7 @@ import time
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -239,16 +240,38 @@ class _FakeAclModel:
         if self.role == self.fail_role:
             raise BackendLoadError("runtime name mismatch", code="runtime_name_mismatch")
 
-    def prepare_datasets(self) -> None:
-        pass
+        class Descriptor:
+            def __init__(self, index, binding):
+                self.index = index
+                self.size = int(np.prod(binding.shape)) * np.dtype(binding.dtype).itemsize
 
-    def execute(self, inputs):
+        self.input_descriptors = tuple(Descriptor(index, binding) for index, binding in enumerate(self.bindings.inputs))
+        self.output_descriptors = tuple(
+            Descriptor(index, binding) for index, binding in enumerate(self.bindings.outputs)
+        )
+        self.output_buffers = []
+
+    def prepare_datasets(self, *, input_overrides=None) -> None:
+        self.input_overrides = input_overrides or {}
+        self.output_buffers = [
+            SimpleNamespace(pointer=(self.role, index), size=descriptor.size)
+            for index, descriptor in enumerate(self.output_descriptors)
+        ]
+
+    def output_buffer(self, index):
+        return self.output_buffers[index]
+
+    def execute(self, inputs, *, read_outputs=None):
         self.execute_calls += 1
-        assert sorted(inputs) == list(range(len(self.bindings.inputs)))
+        assert sorted(inputs) == [
+            index for index in range(len(self.bindings.inputs)) if index not in self.input_overrides
+        ]
+        selected = set(range(len(self.bindings.outputs))) if read_outputs is None else read_outputs
+        self.read_outputs = selected
         return {
             int(binding.index): np.full(binding.shape, 0.25, dtype=np.dtype(binding.dtype))
             for binding in self.bindings.outputs
-            if binding.index is not None
+            if binding.index is not None and int(binding.index) in selected
         }
 
     def close(self) -> None:
@@ -276,6 +299,70 @@ def test_ascend_session_validates_abi_executes_named_outputs_and_closes_once(tmp
     session.close()
     assert _FakeAclModel.instances[0].close_calls == 1
     assert manager.lease.close_calls == 1
+
+
+def test_ascend_session_routes_device_links_without_host_round_trip(tmp_path) -> None:
+    _FakeAclModel.instances = []
+    _FakeAclModel.fail_role = None
+    bundle_files = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, bundle_files)
+    (tmp_path / "artifacts/consumer.om").write_bytes(b"consumer")
+    manifest["model"] = {
+        "kind": "generic",
+        "family": "linked",
+        "inputs": [
+            {"semantic": "features", "dtype": "float32", "shape": [1, 2]},
+            {"semantic": "bias", "dtype": "float32", "shape": [1, 2]},
+        ],
+        "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1, 2]}],
+    }
+    deployment = manifest["deployments"]["ascend"]
+    deployment["artifacts"] = {
+        "producer": {"path": "artifacts/ram_plus.om", "format": "om"},
+        "consumer": {"path": "artifacts/consumer.om", "format": "om"},
+    }
+    deployment["execution"] = ["producer", "consumer"]
+    deployment["bindings"] = {
+        "producer": {
+            "inputs": [{"semantic": "features", "index": 0, "dtype": "float32", "shape": [1, 2]}],
+            "outputs": [{"semantic": "internal.hidden", "index": 0, "dtype": "float32", "shape": [1, 2]}],
+        },
+        "consumer": {
+            "inputs": [
+                {"semantic": "internal.hidden", "index": 0, "dtype": "float32", "shape": [1, 2]},
+                {"semantic": "bias", "index": 1, "dtype": "float32", "shape": [1, 2]},
+            ],
+            "outputs": [{"semantic": "scores", "index": 0, "dtype": "float32", "shape": [1, 2]}],
+        },
+    }
+    deployment["device_links"] = [
+        {
+            "semantic": "internal.hidden",
+            "producer": "producer",
+            "consumer": "consumer",
+            "transport": "device_pointer",
+            "owner": "producer",
+        }
+    ]
+    write_manifest(tmp_path, manifest)
+    session = AscendOmModelSession(runtime_manager=_FakeRuntimeManager(), model_factory=_FakeAclModel)
+    session.load(RuntimeContext(load_inference_manifest(tmp_path, "ascend")))
+
+    result = session.infer(
+        NamedTensorRequest(
+            "linked",
+            {
+                "features": np.zeros((1, 2), dtype=np.float32),
+                "bias": np.ones((1, 2), dtype=np.float32),
+            },
+        )
+    )
+
+    producer, consumer = _FakeAclModel.instances
+    assert result.outputs["scores"].shape == (1, 2)
+    assert producer.read_outputs == set()
+    assert consumer.input_overrides[0] is producer.output_buffer(0)
+    session.close()
 
 
 def test_ascend_close_reports_structured_lifecycle_error_after_releasing_all_resources(tmp_path) -> None:
@@ -458,13 +545,13 @@ def test_ascend_resource_domain_serializes_sessions(tmp_path) -> None:
         max_active = 0
         lock = threading.Lock()
 
-        def execute(self, inputs):
+        def execute(self, inputs, *, read_outputs=None):
             with self.lock:
                 type(self).active += 1
                 type(self).max_active = max(type(self).max_active, type(self).active)
             try:
                 time.sleep(0.05)
-                return super().execute(inputs)
+                return super().execute(inputs, read_outputs=read_outputs)
             finally:
                 with self.lock:
                     type(self).active -= 1

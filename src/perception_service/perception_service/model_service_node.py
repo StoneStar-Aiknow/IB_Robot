@@ -13,7 +13,11 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from ibrobot_msgs.msg import ModelRuntimeInfo
-from inference_manifest import load_inference_manifest
+from inference_manifest import (
+    canonical_semantic_identity_json,
+    load_inference_manifest,
+    semantic_identity_fingerprint,
+)
 
 from .model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
 
@@ -57,9 +61,15 @@ def _instantiate_plugin(plugin_class, service_type_name: str, host, validated, o
     return plugin_class(host, validated, options)
 
 
-def _runtime_info(instance_id: str, validated, status: PluginRuntimeStatus) -> ModelRuntimeInfo:
+def _runtime_info(
+    instance_id: str,
+    validated,
+    status: PluginRuntimeStatus,
+    configuration_generation: int = 0,
+) -> ModelRuntimeInfo:
     result = ModelRuntimeInfo()
     result.instance_id = instance_id
+    result.configuration_generation = configuration_generation
     if validated is not None:
         manifest = validated.manifest
         result.model_name = manifest.bundle.name
@@ -68,6 +78,14 @@ def _runtime_info(instance_id: str, validated, status: PluginRuntimeStatus) -> M
         result.deployment_name = validated.deployment_name
         result.deployment_fingerprint = validated.fingerprint
         result.backend = validated.deployment.backend
+        identity = manifest.model.semantic_identity
+        if identity is not None:
+            result.semantic_identity_json = canonical_semantic_identity_json(identity)
+            result.semantic_identity_fingerprint = semantic_identity_fingerprint(identity)
+            if identity.embedding is not None:
+                result.embedding_space_id = identity.embedding.embedding_space_id
+                result.embedding_dimension = identity.embedding.dimension
+                result.normalization = identity.embedding.normalization
     result.runtime_state = status.state
     result.failure_reason = status.failure_reason
     result.ready = status.ready
@@ -93,6 +111,8 @@ class ModelServiceNode(Node):
         ):
             self.declare_parameter(name, default)
         self.declare_parameter("required", False)
+        self.declare_parameter("require_semantic_identity", False)
+        self.declare_parameter("configuration_generation", 0)
         self.bridge = CvBridge()
         self.validated_manifest = None
         self.plugin = None
@@ -115,10 +135,16 @@ class ModelServiceNode(Node):
             options = json.loads(str(self.get_parameter("runtime_options_json").value))
             if not isinstance(options, dict):
                 raise ValueError("runtime_options_json must contain a JSON object")
-            self.validated_manifest = load_inference_manifest(
+            validated_manifest = load_inference_manifest(
                 str(self.get_parameter("bundle_path").value),
                 str(self.get_parameter("deployment").value),
             )
+            if (
+                bool(self.get_parameter("require_semantic_identity").value)
+                and validated_manifest.manifest.model.semantic_identity is None
+            ):
+                raise RuntimeError("selected model manifest does not declare semantic_identity")
+            self.validated_manifest = validated_manifest
             plugin_class = _load_class(str(self.get_parameter("adapter_class").value))
             self.plugin = _instantiate_plugin(plugin_class, service_type_name, self, self.validated_manifest, options)
             self.failure_reason = ""
@@ -158,7 +184,12 @@ class ModelServiceNode(Node):
             except Exception as exc:
                 self.failure_reason = str(exc)
                 status = PluginRuntimeStatus(state="failed", ready=False, failure_reason=self.failure_reason)
-        return _runtime_info(str(self.get_parameter("instance_id").value), self.validated_manifest, status)
+        return _runtime_info(
+            str(self.get_parameter("instance_id").value),
+            self.validated_manifest,
+            status,
+            int(self.get_parameter("configuration_generation").value),
+        )
 
     def destroy_node(self):
         if self.plugin is not None:

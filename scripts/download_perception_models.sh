@@ -1,31 +1,43 @@
 #!/bin/bash
 # download_perception_models.sh - Download perception model assets
-# Downloads SAM2, Grounding-DINO, and the BERT text encoder used by perception_service.
+# Downloads SAM2, Grounding-DINO, BERT, RAM++, and SigLIP2 assets used by perception services.
 #
 # Usage:
 #   ./scripts/download_perception_models.sh              # Download all
 #   ./scripts/download_perception_models.sh --sam-only   # Download SAM2 only
 #   ./scripts/download_perception_models.sh --gdino-only # Download Grounding-DINO only
+#   ./scripts/download_perception_models.sh --ram-only   # Download RAM++ only
+#   ./scripts/download_perception_models.sh --siglip2-only # Download SigLIP2 only
 #   ./scripts/download_perception_models.sh --target /custom/path  # Custom target directory
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE="$(cd "${SCRIPT_DIR}/.." && pwd)"
-DEFAULT_MODEL_DIR="${WORKSPACE}/models/perception"
+DEFAULT_MODEL_DIR="${WORKSPACE}/models"
 MODEL_DIR="${DEFAULT_MODEL_DIR}"
 
-SAM_ONLY=false
-GDINO_ONLY=false
+ONLY_MODEL=""
 
 SAM_BASE_URL="https://dl.fbaipublicfiles.com/segment_anything_2/092824"
 SAM_CHECKPOINT="sam2.1_hiera_tiny.pt"
 SAM_URL="${SAM_BASE_URL}/${SAM_CHECKPOINT}"
+SAM_BUNDLE="sam2.1_hiera_tiny"
+SAM_DIR="${SAM_BUNDLE}/assets"
 
-GDINO_BASE_URL="https://github.com/IDEA-Research/GroundingDINO/releases/download"
 GDINO_CHECKPOINT="groundingdino_swint_ogc.pth"
-GDINO_URL="${GDINO_BASE_URL}/v0.1.0-alpha/${GDINO_CHECKPOINT}"
+GDINO_URL="https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/${GDINO_CHECKPOINT}"
+GDINO_BUNDLE="grounded_sam2_swint_ogc"
+GDINO_DIR="${GDINO_BUNDLE}/assets"
 BERT_MODEL_ID="bert-base-uncased"
-BERT_DIR="${BERT_MODEL_ID}"
+BERT_DIR="${GDINO_BUNDLE}/assets/${BERT_MODEL_ID}"
+RAM_MODEL_ID="xinyu1205/recognize-anything-plus-model"
+RAM_CHECKPOINT="ram_plus_swin_large_14m.pth"
+RAM_BUNDLE="ram_plus_swin_large_14m"
+RAM_DIR="${RAM_BUNDLE}/assets"
+RAM_BERT_DIR="${RAM_BUNDLE}/assets/${BERT_MODEL_ID}"
+SIGLIP_MODEL_ID="google/siglip2-so400m-patch14-384"
+SIGLIP_BUNDLE="siglip2_so400m_patch14_384"
+SIGLIP_DIR="${SIGLIP_BUNDLE}/assets/model"
 
 PYTHON_BIN="${PYTHON:-}"
 if [[ -z "${PYTHON_BIN}" ]]; then
@@ -46,21 +58,36 @@ Usage:
 Options:
   --sam-only       Download SAM2 model only
   --gdino-only     Download Grounding-DINO model only
-  --target DIR     Target directory (default: models/perception/)
+  --ram-only       Download RAM++ model only
+  --siglip2-only   Download SigLIP2 model only
+  --target DIR     Bundle parent directory (default: models/)
   -h, --help       Show this help
 
 Models downloaded:
   - SAM 2.1 Hiera Tiny (~150 MB)
   - Grounding-DINO SwinT OGC (~660 MB)
   - BERT base uncased text encoder for Grounding-DINO (~420 MB)
+  - RAM++ Swin Large 14M (~3 GB)
+  - SigLIP2 SO400M patch14-384 for image/text embeddings
 EOF
+}
+
+select_only() {
+    local model="$1"
+    if [[ -n "${ONLY_MODEL}" ]]; then
+        echo "Error: only one --*-only option may be specified"
+        exit 1
+    fi
+    ONLY_MODEL="${model}"
 }
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --sam-only) SAM_ONLY=true ;;
-            --gdino-only) GDINO_ONLY=true ;;
+            --sam-only) select_only sam2 ;;
+            --gdino-only) select_only grounding_dino ;;
+            --ram-only) select_only ram_plus ;;
+            --siglip2-only) select_only siglip2 ;;
             --target)
                 shift
                 if [[ $# -eq 0 ]]; then echo "Error: --target requires a path"; exit 1; fi
@@ -78,7 +105,8 @@ download_file() {
     local dest="$2"
     local desc="$3"
 
-    if [[ -f "${dest}" ]]; then
+    mkdir -p "$(dirname "${dest}")"
+    if [[ -s "${dest}" ]]; then
         echo "[skip] ${desc} already exists: ${dest}"
         return 0
     fi
@@ -98,10 +126,10 @@ download_file() {
 }
 
 download_bert_text_encoder() {
-    local dest="${MODEL_DIR}/${BERT_DIR}"
+    local dest="$1"
 
-    if [[ -f "${dest}/config.json" ]] && [[ -f "${dest}/vocab.txt" ]] &&
-       { [[ -f "${dest}/model.safetensors" ]] || [[ -f "${dest}/pytorch_model.bin" ]]; }; then
+    if [[ -s "${dest}/config.json" ]] && [[ -s "${dest}/vocab.txt" ]] &&
+       { [[ -s "${dest}/model.safetensors" ]] || [[ -s "${dest}/pytorch_model.bin" ]]; }; then
         echo "[skip] BERT text encoder already exists: ${dest}"
         return 0
     fi
@@ -139,14 +167,95 @@ PY
     echo "[done] BERT text encoder"
 }
 
+download_siglip_encoder() {
+    local dest="${MODEL_DIR}/${SIGLIP_DIR}"
+    if [[ -s "${dest}/config.json" ]] && [[ -s "${dest}/preprocessor_config.json" ]] \
+        && { [[ -s "${dest}/model.safetensors" ]] || [[ -s "${dest}/pytorch_model.bin" ]]; }; then
+        echo "[skip] SigLIP2 encoder already exists: ${dest}"
+        return 0
+    fi
+
+    echo "[download] SigLIP2 encoder -> ${dest}"
+    "${PYTHON_BIN}" - "$SIGLIP_MODEL_ID" "$dest" <<'PY'
+import sys
+from pathlib import Path
+
+from huggingface_hub import snapshot_download
+
+repo_id = sys.argv[1]
+dest = Path(sys.argv[2])
+dest.mkdir(parents=True, exist_ok=True)
+snapshot_download(repo_id=repo_id, local_dir=str(dest))
+PY
+    echo "[done] SigLIP2 encoder"
+}
+
+download_ram_plus() {
+    local dest="${MODEL_DIR}/${RAM_DIR}"
+    local checkpoint="${dest}/${RAM_CHECKPOINT}"
+    if [[ -s "${checkpoint}" ]]; then
+        echo "[skip] RAM++ checkpoint already exists: ${checkpoint}"
+        return 0
+    fi
+
+    echo "[download] RAM++ checkpoint -> ${checkpoint}"
+    "${PYTHON_BIN}" - "$RAM_MODEL_ID" "$RAM_CHECKPOINT" "$dest" <<'PY'
+import sys
+from pathlib import Path
+
+from huggingface_hub import snapshot_download
+
+repo_id, checkpoint, destination = sys.argv[1:]
+dest = Path(destination)
+dest.mkdir(parents=True, exist_ok=True)
+snapshot_download(repo_id=repo_id, local_dir=str(dest), allow_patterns=[checkpoint])
+PY
+    echo "[done] RAM++ checkpoint"
+}
+
+prepare_bundle_metadata() {
+    local family="$1"
+    case "${family}" in
+        sam2)
+            ;;
+        grounding_dino)
+            download_file "${SAM_URL}" "${MODEL_DIR}/${GDINO_DIR}/${SAM_CHECKPOINT}" \
+                "Grounded-SAM2 SAM 2.1 Hiera Tiny"
+            ;;
+        ram_plus)
+            local ram_data="${WORKSPACE}/ram_models/recognize-anything/ram/data"
+            if [[ ! -s "${ram_data}/ram_tag_list.txt" ]] || [[ ! -s "${ram_data}/ram_tag_list_threshold.txt" ]]; then
+                echo "Error: RAM++ vocabulary assets are missing under ${ram_data}"
+                exit 1
+            fi
+            cp "${ram_data}/ram_tag_list.txt" "${MODEL_DIR}/${RAM_DIR}/ram_tag_list.txt"
+            cp "${ram_data}/ram_tag_list_threshold.txt" "${MODEL_DIR}/${RAM_DIR}/ram_tag_list_threshold.txt"
+            download_bert_text_encoder "${MODEL_DIR}/${RAM_BERT_DIR}"
+            ;;
+        siglip2)
+            ;;
+    esac
+}
+
+finalize_bundle() {
+    local family="$1"
+    PYTHONPATH="${WORKSPACE}/src/perception_service:${WORKSPACE}/src/inference_manifest:${WORKSPACE}/src/inference_service:${PYTHONPATH:-}" \
+        "${PYTHON_BIN}" -m perception_service.package_perception_bundles \
+        --models-root "${MODEL_DIR}" --family "${family}"
+}
+
 main() {
     parse_args "$@"
 
-    local download_sam=true
-    local download_gdino=true
+    local download_sam=false
+    local download_gdino=false
+    local download_ram=false
+    local download_siglip=false
 
-    if [[ "${SAM_ONLY}" == true ]]; then download_gdino=false; fi
-    if [[ "${GDINO_ONLY}" == true ]]; then download_sam=false; fi
+    if [[ -z "${ONLY_MODEL}" || "${ONLY_MODEL}" == "sam2" ]]; then download_sam=true; fi
+    if [[ -z "${ONLY_MODEL}" || "${ONLY_MODEL}" == "grounding_dino" ]]; then download_gdino=true; fi
+    if [[ -z "${ONLY_MODEL}" || "${ONLY_MODEL}" == "ram_plus" ]]; then download_ram=true; fi
+    if [[ -z "${ONLY_MODEL}" || "${ONLY_MODEL}" == "siglip2" ]]; then download_siglip=true; fi
 
     mkdir -p "${MODEL_DIR}"
 
@@ -154,22 +263,42 @@ main() {
     echo ""
 
     if [[ "${download_sam}" == true ]]; then
-        download_file "${SAM_URL}" "${MODEL_DIR}/${SAM_CHECKPOINT}" "SAM 2.1 Hiera Tiny"
+        download_file "${SAM_URL}" "${MODEL_DIR}/${SAM_DIR}/${SAM_CHECKPOINT}" "SAM 2.1 Hiera Tiny"
+        prepare_bundle_metadata sam2
+        finalize_bundle sam2
     fi
 
     if [[ "${download_gdino}" == true ]]; then
-        download_file "${GDINO_URL}" "${MODEL_DIR}/${GDINO_CHECKPOINT}" "Grounding-DINO SwinT OGC"
-        download_bert_text_encoder
+        download_file "${GDINO_URL}" "${MODEL_DIR}/${GDINO_DIR}/${GDINO_CHECKPOINT}" "Grounding-DINO SwinT OGC"
+        download_bert_text_encoder "${MODEL_DIR}/${BERT_DIR}"
+        prepare_bundle_metadata grounding_dino
+        finalize_bundle grounded_sam2
+    fi
+    if [[ "${download_ram}" == true ]]; then
+        download_ram_plus
+        prepare_bundle_metadata ram_plus
+        finalize_bundle ram_plus
+    fi
+    if [[ "${download_siglip}" == true ]]; then
+        download_siglip_encoder
+        prepare_bundle_metadata siglip2
+        finalize_bundle siglip2
     fi
 
     echo ""
     echo "All requested models downloaded to: ${MODEL_DIR}"
     if [[ "${download_sam}" == true ]]; then
-        echo "  SAM2:  ${MODEL_DIR}/${SAM_CHECKPOINT}"
+        echo "  SAM2:    ${MODEL_DIR}/${SAM_DIR}/${SAM_CHECKPOINT}"
     fi
     if [[ "${download_gdino}" == true ]]; then
-        echo "  GDINO: ${MODEL_DIR}/${GDINO_CHECKPOINT}"
-        echo "  BERT:  ${MODEL_DIR}/${BERT_DIR}"
+        echo "  GDINO:   ${MODEL_DIR}/${GDINO_DIR}/${GDINO_CHECKPOINT}"
+        echo "  BERT:    ${MODEL_DIR}/${BERT_DIR}"
+    fi
+    if [[ "${download_ram}" == true ]]; then
+        echo "  RAM++:   ${MODEL_DIR}/${RAM_DIR}/${RAM_CHECKPOINT}"
+    fi
+    if [[ "${download_siglip}" == true ]]; then
+        echo "  SigLIP2: ${MODEL_DIR}/${SIGLIP_DIR}"
     fi
 }
 

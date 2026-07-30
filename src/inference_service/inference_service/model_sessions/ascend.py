@@ -51,6 +51,7 @@ class AscendOmModelSession(ModelSession):
         self._model_factory = model_factory
         self._lease: AclRuntimeLease | None = None
         self._models: dict[str, AclModel] = {}
+        self._linked_inputs: frozenset[tuple[str, str]] = frozenset()
 
     def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
         deployment = context.deployment
@@ -73,12 +74,11 @@ class AscendOmModelSession(ModelSession):
                 f"Ascend target runtime {deployment.target.runtime!r} is not ACL-compatible",
                 code="incompatible_backend_target",
             )
-        if deployment.device_links:
+        if any(link.producer_binding == "input" for link in deployment.device_links):
             raise BackendLoadError(
-                "generic Ascend OM sessions currently require host-routed execution without device links",
-                code="unsupported_execution_graph",
+                "Ascend model sessions do not support input-sourced device links",
+                code="unsupported_device_link_source",
             )
-
         config_path = context.runtime_options.get("acl_config_path")
         if config_path is not None and (not isinstance(config_path, str) or not config_path.strip()):
             raise BackendLoadError("acl_config_path must be a non-empty string", code="invalid_runtime_options")
@@ -98,9 +98,36 @@ class AscendOmModelSession(ModelSession):
             model = self._model_factory(lease, role, path, deployment.bindings[role])
             models[role] = model
             model.load_descriptor()
-            model.prepare_datasets()
+        linked_inputs = {(link.consumer, link.semantic) for link in deployment.device_links}
+        for role in deployment.execution:
+            input_overrides = {}
+            for link in deployment.device_links:
+                if link.consumer != role:
+                    continue
+                producer_binding = self._binding_for_semantic(
+                    deployment.bindings[link.producer].outputs, link.semantic, "producer output"
+                )
+                consumer_binding = self._binding_for_semantic(
+                    deployment.bindings[link.consumer].inputs, link.semantic, "consumer input"
+                )
+                if producer_binding.index is None or consumer_binding.index is None:
+                    raise BackendLoadError(
+                        f"Ascend device link {link.semantic!r} requires explicit runtime indices",
+                        code="invalid_device_link",
+                    )
+                producer_buffer = models[link.producer].output_buffer(int(producer_binding.index))
+                consumer_descriptor = models[role].input_descriptors[int(consumer_binding.index)]
+                if producer_buffer.size != consumer_descriptor.size:
+                    raise BackendLoadError(
+                        f"Ascend device link {link.semantic!r} size differs between producer "
+                        f"({producer_buffer.size}) and consumer ({consumer_descriptor.size})",
+                        code="device_link_size_mismatch",
+                    )
+                input_overrides[int(consumer_binding.index)] = producer_buffer
+            models[role].prepare_datasets(input_overrides=input_overrides)
         self._lease = lease
         self._models = models
+        self._linked_inputs = frozenset(linked_inputs)
 
     def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
         context = self._require_context()
@@ -109,7 +136,7 @@ class AscendOmModelSession(ModelSession):
             raise BackendInferenceError("Ascend OM model session is not loaded", code="runtime_not_loaded")
         values = dict(request.inputs)
         public_outputs: dict[str, object] = {}
-        for role in deployment.execution:
+        for role_index, role in enumerate(deployment.execution):
             bindings = deployment.bindings[role]
             indexed_inputs: dict[int, np.ndarray] = {}
             for binding in bindings.inputs:
@@ -117,6 +144,8 @@ class AscendOmModelSession(ModelSession):
                     raise BackendInferenceError(
                         f"Ascend input {binding.semantic!r} has no runtime index", code="invalid_input_bindings"
                     )
+                if (role, binding.semantic) in self._linked_inputs:
+                    continue
                 try:
                     indexed_inputs[int(binding.index)] = np.asarray(values[binding.semantic])
                 except KeyError as exc:
@@ -124,8 +153,32 @@ class AscendOmModelSession(ModelSession):
                         f"Ascend role {role!r} is missing semantic input {binding.semantic!r}",
                         code="missing_semantic_input",
                     ) from exc
-            runtime_outputs = self._models[role].execute(indexed_inputs)
+            public_indices = {
+                int(binding.index)
+                for binding in bindings.outputs
+                if binding.index is not None and not binding.semantic.startswith("internal.")
+            }
+            host_internal_indices = {
+                int(binding.index)
+                for binding in bindings.outputs
+                if binding.index is not None
+                and binding.semantic.startswith("internal.")
+                and any(
+                    later_input.semantic == binding.semantic
+                    for later_role in deployment.execution[role_index + 1 :]
+                    for later_input in deployment.bindings[later_role].inputs
+                    if not any(
+                        link.producer == role and link.consumer == later_role and link.semantic == binding.semantic
+                        for link in deployment.device_links
+                    )
+                )
+            }
+            runtime_outputs = self._models[role].execute(
+                indexed_inputs, read_outputs=public_indices | host_internal_indices
+            )
             for binding in bindings.outputs:
+                if binding.index is not None and int(binding.index) not in runtime_outputs:
+                    continue
                 output = self._bound_output(role, binding, runtime_outputs)
                 values[binding.semantic] = output
                 if not binding.semantic.startswith("internal."):
@@ -137,6 +190,7 @@ class AscendOmModelSession(ModelSession):
         lease = self._lease
         self._models = {}
         self._lease = None
+        self._linked_inputs = frozenset()
         errors: list[Exception] = []
         for model in reversed(tuple(models.values())):
             try:
@@ -161,3 +215,13 @@ class AscendOmModelSession(ModelSession):
                 f"Ascend role {role!r} did not return output {binding.semantic!r}", code="missing_runtime_output"
             )
         return outputs[int(binding.index)]
+
+    @staticmethod
+    def _binding_for_semantic(bindings, semantic: str, description: str) -> TensorBinding:
+        matches = [binding for binding in bindings if binding.semantic == semantic]
+        if len(matches) != 1:
+            raise BackendLoadError(
+                f"Ascend device link {semantic!r} requires exactly one {description} binding",
+                code="invalid_device_link",
+            )
+        return matches[0]

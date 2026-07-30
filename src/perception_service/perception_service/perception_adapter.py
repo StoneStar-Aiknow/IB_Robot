@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from inference_manifest import SemanticIdentity
 from inference_service.generic_runtime import NamedTensorResult
 
 
@@ -29,6 +30,20 @@ class PerceptionAdapter(ABC):
             raise RuntimeError(
                 f"{self.identity.family} deployment {deployment!r} is not supported; "
                 f"supported deployments: {sorted(self.identity.supported_deployments)}"
+            )
+
+    def validate_identity(self, identity: SemanticIdentity | None) -> None:
+        if identity is None:
+            raise ValueError(f"{self.identity.family} manifest must declare semantic_identity")
+        if identity.preprocessing_contract != self.identity.preprocessing:
+            raise ValueError(
+                f"{self.identity.family} preprocessing identity mismatch: "
+                f"expected {self.identity.preprocessing!r}, got {identity.preprocessing_contract!r}"
+            )
+        if identity.output_semantics != self.identity.postprocessing:
+            raise ValueError(
+                f"{self.identity.family} output identity mismatch: "
+                f"expected {self.identity.postprocessing!r}, got {identity.output_semantics!r}"
             )
 
     @abstractmethod
