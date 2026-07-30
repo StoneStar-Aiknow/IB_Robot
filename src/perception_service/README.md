@@ -198,6 +198,26 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 run perception_service gro
 
 该节点提供 `ibrobot_msgs/srv/DetectSegment`，并发布 `ibrobot_msgs/msg/DetectionArray`，供下游 `manipulation_service` 抓取规划消费。
 
+## 8. Generic Model Services
+
+`model_service_node` 是强类型模型服务的通用宿主。每个实例从 robot-config SSOT 读取 bundle、命名 deployment、
+plugin class、具体 ROS service type、endpoint 和 runtime options。宿主不包含模型家族到 executable 的映射，也
+不通过一个匿名 tensor service 暴露推理。
+
+Plugin 必须实现 `ModelServicePlugin`：拥有具体 service request/response 映射，调用 adapter 和 shared
+`ModelSession`，并投影统一的 runtime health。Adapter 拥有模型语义预处理和后处理；`inference_service` 拥有
+设备生命周期、准入、tensor ABI、健康状态和资源回收。
+
+每个响应中的 `ModelRuntimeInfo` 报告 instance ID、manifest fingerprint、deployment name/fingerprint、
+backend、runtime state、readiness 和 failure reason。诊断身份来自节点配置和已验证 manifest，不允许 plugin
+metadata 覆写，也不在启动时重新计算权重 SHA-256。
+
+`perception_service.echo_adapter:EchoServicePlugin` 是唯一的通用层参考集成。它使用真实的
+`ibrobot_msgs/srv/EchoModel` 契约以及无权重、无硬件 SDK 的
+identity tensor session 验证 bundle -> runtime -> adapter -> typed response 链路，仅证明框架契约，不表示任何
+生产模型或 accelerator deployment 已通过语义/硬件 conformance。生产服务类型、adapter、wrapper 和配置由各自
+消费功能负责。
+
 ### 检测结果质心
 
 每个 `Detection2D` 携带两种 3D 质心（相机光学系，单位 m）：

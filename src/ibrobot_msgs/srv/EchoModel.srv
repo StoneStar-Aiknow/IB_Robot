@@ -1,0 +1,8 @@
+string request_id
+float32[] value
+---
+float32[] value
+ModelRuntimeInfo model
+float32 inference_time_ms
+bool success
+string message

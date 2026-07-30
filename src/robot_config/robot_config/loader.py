@@ -26,6 +26,7 @@ from robot_config.config import (
     VoiceASRConfig,
 )
 from robot_config.grasp_execution_config import validate_grasp_execution_config
+from robot_config.perception_runtime_config import PerceptionRuntimeConfigError, parse_perception_runtime_config
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 from .config_path import resolve_robot_config_path
@@ -617,6 +618,10 @@ def load_robot_config_dict(config_path: str | Path | None = None) -> dict[str, A
     validation_errors = validate_grasp_execution_config(robot_config.get("grasp_execution"))
     validation_errors.extend(_validate_embodied_skill_contract(robot_config))
     validation_errors.extend(_validate_skill_gateway_config(robot_config))
+    try:
+        parse_perception_runtime_config(robot_config)
+    except PerceptionRuntimeConfigError as exc:
+        validation_errors.append(str(exc))
     if validation_errors:
         raise ValueError("Invalid robot configuration:\n- " + "\n- ".join(validation_errors))
     robot_config["_config_path"] = str(resolved_config_path)

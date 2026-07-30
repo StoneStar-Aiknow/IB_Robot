@@ -14,6 +14,12 @@ from robot_config.inference_config import (
     InferenceTransportConfig,
     parse_inference_config,
 )
+from robot_config.perception_runtime_config import (
+    PerceptionModelServiceConfig,
+    PerceptionRuntimeConfig,
+    PerceptionRuntimeConfigError,
+    parse_perception_runtime_config,
+)
 
 _LAZY_EXPORTS = {
     "build_contract_from_robot_config_dict": (
@@ -81,6 +87,10 @@ __all__ = [
     "InferencePipelineConfig",
     "InferenceTransportConfig",
     "parse_inference_config",
+    "PerceptionModelServiceConfig",
+    "PerceptionRuntimeConfig",
+    "PerceptionRuntimeConfigError",
+    "parse_perception_runtime_config",
     # Launch builders
     "generate_ros2_control_nodes",
     "generate_camera_nodes",

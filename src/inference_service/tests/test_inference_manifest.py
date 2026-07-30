@@ -12,6 +12,7 @@ import pytest
 from inference_manifest import (
     BundleFile,
     CompiledDeployment,
+    ManifestIntegrityError,
     ManifestPathError,
     ManifestValidationError,
     canonical_bundle_digest,
@@ -23,7 +24,14 @@ from inference_manifest import (
     write_inference_manifest,
 )
 from inference_manifest.models import DeviceLink
-from tests.manifest_fixtures import TEST_BUNDLE_UUID, create_policy_bundle, make_manifest, write_manifest
+from tests.manifest_fixtures import (
+    TEST_BUNDLE_UUID,
+    create_non_policy_bundle,
+    create_policy_bundle,
+    make_manifest,
+    make_non_policy_manifest,
+    write_manifest,
+)
 
 
 @pytest.mark.parametrize(
@@ -111,6 +119,149 @@ def test_schema_v1_requires_regeneration(tmp_path):
 
     with pytest.raises(ManifestValidationError, match="unsupported.*rerun the owning exporter or packager"):
         load_inference_manifest(tmp_path, "rk3588")
+
+
+def test_missing_manifest_fails_before_bundle_metadata_loading(tmp_path):
+    with pytest.raises(ManifestValidationError, match=r"Unable to read JSON file.*inference_manifest.json"):
+        load_inference_manifest(tmp_path, "cpu")
+
+
+def test_legacy_and_explicit_policy_manifests_retain_strict_lerobot_validation(tmp_path):
+    paths = create_policy_bundle(tmp_path)
+    legacy = make_manifest(tmp_path, paths)
+    write_manifest(tmp_path, legacy)
+
+    legacy_validated = load_inference_manifest(tmp_path, "cpu")
+    assert legacy_validated.manifest.model.kind == "policy"
+    assert legacy_validated.manifest.model.family == "lerobot"
+    assert legacy_validated.policy is not None
+
+    explicit = copy.deepcopy(legacy)
+    explicit["model"] = {"kind": "policy", "family": "act", "inputs": [], "outputs": []}
+    write_manifest(tmp_path, explicit)
+    explicit_validated = load_inference_manifest(tmp_path, "cpu")
+    assert explicit_validated.manifest.model.family == "act"
+    assert explicit_validated.policy.policy_type == "act"
+    assert explicit_validated.fingerprint == legacy_validated.fingerprint
+
+    mismatched = copy.deepcopy(explicit)
+    mismatched["model"]["family"] = "smolvla"
+    write_manifest(tmp_path, mismatched)
+    with pytest.raises(ManifestValidationError, match=r"family 'smolvla'.*policy type 'act'"):
+        load_inference_manifest(tmp_path, "cpu")
+
+    write_manifest(tmp_path, explicit)
+    (tmp_path / "policy_preprocessor.json").unlink()
+    with pytest.raises(ManifestPathError, match="policy_preprocessor.json"):
+        load_inference_manifest(tmp_path, "cpu")
+
+
+def test_unknown_model_kind_is_rejected(tmp_path):
+    paths = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, paths)
+    manifest["model"]["kind"] = "detector"
+    write_manifest(tmp_path, manifest)
+
+    with pytest.raises(ManifestValidationError, match=r"model.kind.*detector"):
+        load_inference_manifest(tmp_path, "ascend")
+
+
+@pytest.mark.parametrize("output_semantic", ["tag_logits", "image_embedding", "masks", "boxes"])
+def test_compiled_non_policy_bundle_accepts_declared_semantic_outputs(tmp_path, output_semantic):
+    paths = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, paths, output_semantic=output_semantic)
+    write_manifest(tmp_path, manifest)
+
+    validated = load_inference_manifest(tmp_path, "ascend")
+
+    assert validated.policy is None
+    assert validated.manifest.model.kind == "perception"
+    assert validated.manifest.model.family == "ram_plus"
+    assert validated.manifest.model.outputs[0].semantic == output_semantic
+    assert validated.deployment.bindings["model"].outputs[0].semantic == output_semantic
+    assert not (tmp_path / "config.json").exists()
+    assert not (tmp_path / "policy_preprocessor.json").exists()
+    assert not (tmp_path / "policy_postprocessor.json").exists()
+    assert not (tmp_path / "model.safetensors").exists()
+
+
+def test_torch_non_policy_bundle_does_not_require_lerobot_files(tmp_path):
+    paths = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, paths, deployment_name="cpu")
+    manifest["deployments"]["cpu"] = {
+        "uuid": manifest["deployments"]["cpu"]["uuid"],
+        "revision": 1,
+        "backend": "torch",
+        "device": "cpu",
+    }
+    write_manifest(tmp_path, manifest)
+
+    validated = load_inference_manifest(tmp_path, "cpu")
+
+    assert validated.deployment.backend == "torch"
+    assert validated.policy is None
+
+
+def test_compiled_policy_bundle_still_requires_action_output(tmp_path):
+    paths = tuple(path for path in create_policy_bundle(tmp_path) if path != "model.safetensors")
+    manifest = make_manifest(tmp_path, paths, deployment_name="rk3588", compiled=True)
+    manifest["deployments"]["rk3588"]["bindings"]["policy"]["outputs"][0]["semantic"] = "tag_logits"
+    write_manifest(tmp_path, manifest)
+
+    with pytest.raises(ManifestValidationError, match="policy deployment must declare an action output"):
+        load_inference_manifest(tmp_path, "rk3588")
+
+
+@pytest.mark.parametrize(
+    ("direction", "field", "value", "message"),
+    [
+        ("outputs", "semantic", "scores", "declared semantic output bindings"),
+        ("outputs", "dtype", "float16", "tag_logits.*dtype expected float32, actual float16"),
+        ("outputs", "shape", [1, 1000], "tag_logits.*shape expected.*4585.*actual.*1000"),
+        ("inputs", "layout", "NHWC", "observation.image.*layout expected NCHW, actual NHWC"),
+    ],
+)
+def test_non_policy_binding_must_match_declared_semantic_contract(tmp_path, direction, field, value, message):
+    paths = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, paths)
+    manifest["deployments"]["ascend"]["bindings"]["model"][direction][0][field] = value
+    write_manifest(tmp_path, manifest)
+
+    with pytest.raises(ManifestValidationError, match=message):
+        load_inference_manifest(tmp_path, "ascend")
+
+
+def test_non_policy_manifest_requires_complete_semantic_contract(tmp_path):
+    paths = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, paths)
+    manifest["model"]["outputs"] = []
+    write_manifest(tmp_path, manifest)
+
+    with pytest.raises(ManifestValidationError, match=r"model.outputs.*should be non-empty"):
+        load_inference_manifest(tmp_path, "ascend")
+
+
+def test_non_policy_bundle_integrity_artifacts_and_paths_are_validated(tmp_path):
+    paths = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, paths)
+
+    invalid_digest = copy.deepcopy(manifest)
+    invalid_digest["bundle"]["digest"]["value"] = "0" * 64
+    write_manifest(tmp_path, invalid_digest)
+    with pytest.raises(ManifestIntegrityError, match="Bundle digest mismatch"):
+        load_inference_manifest(tmp_path, "ascend")
+
+    missing_artifact = copy.deepcopy(manifest)
+    (tmp_path / "artifacts" / "ram_plus.om").unlink()
+    write_manifest(tmp_path, missing_artifact)
+    with pytest.raises(ManifestPathError, match="does not exist"):
+        load_inference_manifest(tmp_path, "ascend")
+
+    escaped_artifact = copy.deepcopy(manifest)
+    escaped_artifact["deployments"]["ascend"]["artifacts"]["model"]["path"] = "../ram_plus.om"
+    write_manifest(tmp_path, escaped_artifact)
+    with pytest.raises(ManifestValidationError, match="parent traversal"):
+        load_inference_manifest(tmp_path, "ascend")
 
 
 @pytest.mark.parametrize(
@@ -350,6 +501,22 @@ def test_vla_visual_bindings_allow_compiled_resize_dimensions(tmp_path, layout):
     validated = load_inference_manifest(tmp_path, "rk3588")
 
     assert validated.policy.policy_type == "smolvla"
+
+
+def test_rank_four_layout_validation_is_independent_of_semantic_prefix(tmp_path):
+    paths = tuple(path for path in create_policy_bundle(tmp_path) if path != "model.safetensors")
+    manifest = make_manifest(tmp_path, paths, deployment_name="rk3588", compiled=True)
+    image_binding = manifest["deployments"]["rk3588"]["bindings"]["policy"]["inputs"][1]
+    image_binding["semantic"] = "depth.frame"
+    write_manifest(tmp_path, manifest)
+
+    validated = load_inference_manifest(tmp_path, "rk3588")
+    assert validated.deployment.bindings["policy"].inputs[1].layout == "NCHW"
+
+    del image_binding["layout"]
+    write_manifest(tmp_path, manifest)
+    with pytest.raises(ManifestValidationError, match=r"layout.*required"):
+        load_inference_manifest(tmp_path, "rk3588")
 
 
 def test_selected_bundle_and_artifact_paths_cannot_duplicate(tmp_path):

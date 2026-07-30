@@ -40,6 +40,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/JointCurrent.msg"
   "msg/Detection2D.msg"
   "msg/DetectionArray.msg"
+  "msg/ModelRuntimeInfo.msg"
   "msg/GraspCandidate.msg"
   "msg/GraspCandidateArray.msg"
   "action/RecordEpisode.action"
@@ -57,6 +58,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/ValidatePrimitive.srv"
   "srv/GetSkillGatewayStatus.srv"
   "srv/DetectSegment.srv"
+  "srv/EchoModel.srv"
   "srv/PlanGrasp.srv"
   "srv/VerifyGrasp.srv"
   DEPENDENCIES std_msgs action_msgs builtin_interfaces geometry_msgs sensor_msgs

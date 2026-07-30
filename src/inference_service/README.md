@@ -1,18 +1,24 @@
 # inference_service
 
-`inference_service` 是 IB-Robot 的统一推理运行时。它以一个策略 bundle、一个命名
-deployment 和一个稳定的 pipeline ID 为输入，统一承载 Torch、Ascend、Hisilicon、
-RKNN 与 HMM 后端，并支持单体和边云分布式执行。
+`inference_service` 是 IB-Robot 的统一推理运行时。它以一个模型 bundle 和一个命名
+deployment 为输入，统一承载 Torch、Ascend、Hisilicon、RKNN 与 HMM 后端。策略模型额外使用稳定的
+pipeline ID，并支持单体和边云分布式执行。
 
-运行时从策略 bundle 中唯一的 `inference_manifest.json` 读取命名 deployment、artifact、
+运行时从 bundle 中唯一的 `inference_manifest.json` 读取模型类型、语义 tensor、命名 deployment、artifact、
 执行顺序和 runtime ABI bindings。Launch 和 robot YAML 通过 deployment 名称选择运行配置。
+
+非 policy bundle 不需要 LeRobot metadata 或 `action` 输出。它通过 `NamedTensorRequest`、
+`NamedTensorResult` 和 `ModelSession` 使用同一套生命周期、准入、健康状态、deployment fingerprint 与资源回收。
+模型家族的预处理、后处理和 ROS service 形状不属于 backend runtime，由调用方 adapter/plugin 持有。
+
+manifest fingerprint 是经过验证的 bundle 结构身份，deployment fingerprint 标识所选运行部署。服务启动不会
+为了生成诊断身份扫描大型权重文件；artifact 内容完整性应在模型打包/转换阶段记录和验证。
 
 ## 核心概念
 
-### 策略 Bundle
+### Bundle
 
-每个可部署策略目录必须同时包含 LeRobot 语义文件和唯一的
-`inference_manifest.json`：
+每个可部署目录必须包含唯一的 `inference_manifest.json`。Policy bundle 还必须包含 LeRobot 语义文件：
 
 ```text
 policy_bundle/

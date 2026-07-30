@@ -14,6 +14,7 @@ from inference_service.backends.types import InferenceBackend, RuntimeContext
 
 CANONICAL_BACKENDS = ("torch", "ascend", "hisilicon", "rknn", "hmm")
 POLICY_FAMILIES = frozenset({"act", "diffusion", "pi05", "smolvla"})
+NON_POLICY_MODEL_KINDS = frozenset({"perception", "generic"})
 _FACTORY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
 
 TargetValidator = Callable[[Deployment], str | None]
@@ -23,8 +24,10 @@ TargetValidator = Callable[[Deployment], str | None]
 class BackendDescriptor:
     name: str
     factory: str
-    supported_policy_families: frozenset[str]
     target_validator: TargetValidator
+    supported_policy_families: frozenset[str] = frozenset()
+    supported_model_kinds: frozenset[str] = frozenset()
+    supported_model_families: frozenset[str] = frozenset()
 
     def validate_definition(self) -> None:
         if self.name not in CANONICAL_BACKENDS:
@@ -37,16 +40,28 @@ class BackendDescriptor:
                 f"backend {self.name!r} has invalid factory import string {self.factory!r}",
                 code="invalid_factory",
             )
-        if not self.supported_policy_families:
+        if not (self.supported_policy_families or self.supported_model_kinds or self.supported_model_families):
             raise BackendRegistryError(
-                f"backend {self.name!r} must support at least one policy family",
-                code="empty_policy_support",
+                f"backend {self.name!r} must declare policy or model support",
+                code="empty_model_support",
             )
         unsupported = self.supported_policy_families - POLICY_FAMILIES
         if unsupported:
             raise BackendRegistryError(
                 f"backend {self.name!r} declares unknown policy families: {sorted(unsupported)}",
                 code="unknown_policy_family",
+            )
+        unsupported_kinds = self.supported_model_kinds - NON_POLICY_MODEL_KINDS
+        if unsupported_kinds:
+            raise BackendRegistryError(
+                f"backend {self.name!r} declares unknown or policy-only model kinds: {sorted(unsupported_kinds)}",
+                code="unknown_model_kind",
+            )
+        invalid_families = sorted(family for family in self.supported_model_families if not family.strip())
+        if invalid_families:
+            raise BackendRegistryError(
+                f"backend {self.name!r} declares empty model families",
+                code="invalid_model_family",
             )
         if not callable(self.target_validator):
             raise BackendRegistryError(
@@ -93,17 +108,28 @@ class BackendRegistry:
     def validate(self, context: RuntimeContext) -> BackendDescriptor:
         deployment = context.deployment
         descriptor = self.descriptor(deployment.backend)
-        policy_family = context.policy.policy_type
-        if policy_family not in POLICY_FAMILIES:
+        model = context.model
+        if model.kind == "policy":
+            policy_family = context.policy.policy_type
+            if policy_family not in POLICY_FAMILIES:
+                raise BackendCompatibilityError(
+                    f"policy family {policy_family!r} is not recognized for deployment {context.deployment_name!r}",
+                    code="unknown_policy_family",
+                )
+            if policy_family not in descriptor.supported_policy_families:
+                raise BackendCompatibilityError(
+                    f"backend {descriptor.name!r} does not support policy family {policy_family!r} "
+                    f"for deployment {context.deployment_name!r}",
+                    code="unsupported_policy_backend_pair",
+                )
+        elif (
+            model.kind not in descriptor.supported_model_kinds
+            and model.family not in descriptor.supported_model_families
+        ):
             raise BackendCompatibilityError(
-                f"policy family {policy_family!r} is not recognized for deployment {context.deployment_name!r}",
-                code="unknown_policy_family",
-            )
-        if policy_family not in descriptor.supported_policy_families:
-            raise BackendCompatibilityError(
-                f"backend {descriptor.name!r} does not support policy family {policy_family!r} "
-                f"for deployment {context.deployment_name!r}",
-                code="unsupported_policy_backend_pair",
+                f"backend {descriptor.name!r} does not support model family {model.family!r} "
+                f"(kind {model.kind!r}) for deployment {context.deployment_name!r}",
+                code="unsupported_model_backend_pair",
             )
         incompatibility = descriptor.target_validator(deployment)
         if incompatibility is not None:

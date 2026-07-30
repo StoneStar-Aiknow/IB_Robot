@@ -16,7 +16,14 @@ from inference_manifest.integrity import (
 )
 from inference_manifest.json_utils import load_json_strict
 from inference_manifest.metadata import PolicyFeature, PolicyMetadata, load_policy_metadata
-from inference_manifest.models import CompiledDeployment, Deployment, InferenceManifest, TensorBinding
+from inference_manifest.models import (
+    CompiledDeployment,
+    Deployment,
+    InferenceManifest,
+    ModelDescriptor,
+    SemanticTensor,
+    TensorBinding,
+)
 from inference_manifest.paths import normalize_unique_paths, resolve_bundle_file
 from inference_manifest.schema import validate_manifest_schema
 
@@ -30,7 +37,7 @@ class ValidatedManifest:
     manifest: InferenceManifest
     deployment_name: str
     deployment: Deployment
-    policy: PolicyMetadata
+    policy: PolicyMetadata | None
     fingerprint: str
 
 
@@ -101,8 +108,11 @@ def _load_inference_manifest(
     if overlap:
         raise ManifestValidationError(f"bundle files and deployment artifacts must use distinct paths: {overlap}")
 
+    is_policy = manifest.model.kind == "policy"
     if require_native_weights is None:
-        require_native_weights = any(candidate.backend == "torch" for candidate in manifest.deployments.values())
+        require_native_weights = is_policy and any(
+            candidate.backend == "torch" for candidate in manifest.deployments.values()
+        )
 
     if verify_all_bundle_files:
         for entry in bundle_entries:
@@ -115,14 +125,19 @@ def _load_inference_manifest(
         manifest.bundle.digest.value,
     )
 
-    policy = load_policy_metadata(root, require_native_weights=require_native_weights)
-    _validate_required_bundle_files(
-        manifest,
-        policy,
-        allow_declared_native_weights=not require_native_weights,
-    )
+    policy = load_policy_metadata(root, require_native_weights=require_native_weights) if is_policy else None
+    if policy is not None:
+        if manifest.model.family not in {"lerobot", policy.policy_type}:
+            raise ManifestValidationError(
+                f"Policy model family {manifest.model.family!r} does not match LeRobot policy type {policy.policy_type!r}"
+            )
+        _validate_required_bundle_files(
+            manifest,
+            policy,
+            allow_declared_native_weights=not require_native_weights,
+        )
 
-    required_paths = set(policy.required_files)
+    required_paths = set(policy.required_files) if policy is not None else set()
     entries_to_verify = (
         bundle_entries
         if verify_all_bundle_files
@@ -137,7 +152,9 @@ def _load_inference_manifest(
             resolve_bundle_file(root, artifact.path)
 
     if isinstance(deployment, CompiledDeployment):
-        _validate_feature_compatibility(deployment, policy)
+        _validate_semantic_contract(deployment, manifest.model)
+        if policy is not None:
+            _validate_policy_deployment(deployment, policy)
 
     fingerprint = deployment_fingerprint(
         manifest.schema_version,
@@ -208,6 +225,71 @@ def _validate_feature_compatibility(deployment: CompiledDeployment, policy: Poli
                     f"Binding {binding.semantic!r} for role {role!r} has shape {binding.shape} "
                     f"incompatible with LeRobot feature shape {feature.shape}"
                 )
+
+
+def _validate_policy_deployment(deployment: CompiledDeployment, policy: PolicyMetadata) -> None:
+    if not any(
+        binding.semantic == "action" for role in deployment.execution for binding in deployment.bindings[role].outputs
+    ):
+        raise ManifestValidationError("Compiled policy deployment must declare an action output binding")
+    _validate_feature_compatibility(deployment, policy)
+
+
+def _validate_semantic_contract(deployment: CompiledDeployment, model: ModelDescriptor) -> None:
+    if not model.inputs and not model.outputs:
+        return
+
+    declared_inputs = {descriptor.semantic: descriptor for descriptor in model.inputs}
+    declared_outputs = {descriptor.semantic: descriptor for descriptor in model.outputs}
+    bound_inputs = _external_bindings(deployment, "inputs")
+    bound_outputs = _external_bindings(deployment, "outputs")
+    _validate_contract_direction("input", declared_inputs, bound_inputs)
+    _validate_contract_direction("output", declared_outputs, bound_outputs)
+
+
+def _external_bindings(deployment: CompiledDeployment, direction: str) -> dict[str, list[tuple[str, TensorBinding]]]:
+    bindings: dict[str, list[tuple[str, TensorBinding]]] = {}
+    for role in deployment.execution:
+        for binding in getattr(deployment.bindings[role], direction):
+            if binding.semantic.startswith("internal."):
+                continue
+            bindings.setdefault(binding.semantic, []).append((role, binding))
+    return bindings
+
+
+def _validate_contract_direction(
+    direction: str,
+    declared: dict[str, SemanticTensor],
+    bound: dict[str, list[tuple[str, TensorBinding]]],
+) -> None:
+    missing = sorted(set(declared) - set(bound))
+    if missing:
+        raise ManifestValidationError(f"Compiled deployment omits declared semantic {direction} bindings: {missing}")
+    unexpected = sorted(set(bound) - set(declared))
+    if unexpected:
+        raise ManifestValidationError(f"Compiled deployment has undeclared semantic {direction} bindings: {unexpected}")
+
+    for semantic, descriptor in declared.items():
+        for role, binding in bound[semantic]:
+            mismatches: list[str] = []
+            if binding.dtype != descriptor.dtype:
+                mismatches.append(f"dtype expected {descriptor.dtype}, actual {binding.dtype}")
+            if not _shapes_compatible(binding.shape, descriptor.shape):
+                mismatches.append(f"shape expected {descriptor.shape}, actual {binding.shape}")
+            if binding.layout != descriptor.layout:
+                mismatches.append(f"layout expected {descriptor.layout}, actual {binding.layout}")
+            if mismatches:
+                raise ManifestValidationError(
+                    f"Binding {semantic!r} for role {role!r} conflicts with declared model {direction} contract: "
+                    + "; ".join(mismatches)
+                )
+
+
+def _shapes_compatible(actual: tuple[int, ...], expected: tuple[int, ...]) -> bool:
+    return len(actual) == len(expected) and all(
+        actual_dimension == -1 or expected_dimension == -1 or actual_dimension == expected_dimension
+        for actual_dimension, expected_dimension in zip(actual, expected, strict=True)
+    )
 
 
 def _policy_feature_for_semantic(semantic: str, policy: PolicyMetadata) -> PolicyFeature | None:

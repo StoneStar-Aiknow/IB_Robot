@@ -22,6 +22,7 @@ ros2_control 和外设的统一机器人配置系统。
 - **标定支持**：标准 ROS2 camera_info_manager 集成
 - **tensormsg 集成**：契约通过名称引用外设
 - **RealSense contract relay**：在 `robot_config` 内部将驱动原生 topic 收口到统一 `/camera/{name}/...` 接口
+- **通用模型服务编排**：通过顶层 `perception_services.services` 列表启动任意强类型 model-service plugin
 
 ## 架构
 
@@ -39,6 +40,33 @@ robot_config YAML（单一数据源）
         └───► tensormsg 契约（ML I/O）
                 └───► PolicyBridge / EpisodeRecorder
 ```
+
+### 通用模型服务 SSOT
+
+模型服务使用顶层 `perception_services`，不属于具体消费者。每个 enabled entry 必须显式选择 manifest 中的命名
+deployment，不能直接填写 `backend` 或 `device`：
+
+```yaml
+robot:
+  perception_services:
+    services:
+      - id: depth_front
+        enabled: true
+        required: true
+        bundle_path: models/depth/front
+        deployment: cpu
+        adapter_class: depth_service.plugin:DepthServicePlugin
+        service_type: depth_msgs/srv/EstimateDepth
+        endpoint: /depth/front
+        node_name: depth_front_service
+        runtime_options: {}
+```
+
+配置 loader 验证 bundle/manifest/deployment、plugin 和 service type 语法，并拒绝重复 ID、node name 和 endpoint。
+Launch builder 对每个 enabled entry 启动一个相互独立的 `perception_service/model_service_node`，不维护模型家族
+白名单或 family-to-executable map。Manifest/deployment fingerprint 是结构化运行身份；artifact 内容校验属于
+模型打包流程，不通过服务启动时扫描大文件完成。通用层只用 dummy/echo plugin 做 CI 参考，生产 adapter 和具体
+service entry 由消费功能自行注册。
 
 ## Sim camera pose override（仅限仿真标定，opt-in）
 

@@ -33,7 +33,13 @@ from inference_service.backends import (
     ResourceDomainAdmissions,
     RuntimeContext,
 )
-from tests.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
+from tests.manifest_fixtures import (
+    create_non_policy_bundle,
+    create_policy_bundle,
+    make_manifest,
+    make_non_policy_manifest,
+    write_manifest,
+)
 
 _MULTI_INSTANCE_EVIDENCE = BackendAdmissionEvidence(
     sdk_initialization=True,
@@ -194,6 +200,13 @@ def _make_context(
 
 def _request(request_id: str = "request-1") -> InferenceRequest:
     return InferenceRequest(request_id=request_id, inputs={"value": 1.0}, metadata={"source": "test"})
+
+
+def _make_non_policy_context(root: Path) -> RuntimeContext:
+    root.mkdir()
+    bundle_paths = create_non_policy_bundle(root)
+    write_manifest(root, make_non_policy_manifest(root, bundle_paths))
+    return RuntimeContext(load_inference_manifest(root, "ascend"))
 
 
 def _thread_call(callback: Callable[[], object]) -> tuple[threading.Thread, list[object], list[BaseException]]:
@@ -576,6 +589,61 @@ def test_registry_enforces_exact_policy_support_matrix(tmp_path, policy_type, ba
         with pytest.raises(BackendCompatibilityError, match="does not support") as error:
             BACKEND_REGISTRY.validate(context)
         assert error.value.code == "unsupported_policy_backend_pair"
+
+
+def test_registry_accepts_non_policy_model_family_support(tmp_path):
+    context = _make_non_policy_context(tmp_path / "bundle")
+    registry = BackendRegistry(
+        {
+            "ascend": BackendDescriptor(
+                name="ascend",
+                factory="tests.fake_backend_factory:create_backend",
+                target_validator=lambda deployment: None,
+                supported_model_families=frozenset({"ram_plus"}),
+            )
+        }
+    )
+
+    assert registry.validate(context).name == "ascend"
+    assert context.model.family == "ram_plus"
+    with pytest.raises(ValueError, match=r"RuntimeContext\.policy is unavailable.*ram_plus"):
+        _ = context.policy
+
+
+def test_registry_accepts_non_policy_model_kind_support(tmp_path):
+    context = _make_non_policy_context(tmp_path / "bundle")
+    registry = BackendRegistry(
+        {
+            "ascend": BackendDescriptor(
+                name="ascend",
+                factory="tests.fake_backend_factory:create_backend",
+                target_validator=lambda deployment: None,
+                supported_model_kinds=frozenset({"perception"}),
+            )
+        }
+    )
+
+    assert registry.validate(context).name == "ascend"
+
+
+def test_registry_rejects_undeclared_non_policy_model_support(tmp_path):
+    context = _make_non_policy_context(tmp_path / "bundle")
+
+    with pytest.raises(BackendCompatibilityError, match=r"ascend.*ram_plus") as error:
+        BACKEND_REGISTRY.validate(context)
+
+    assert error.value.code == "unsupported_model_backend_pair"
+
+
+def test_descriptor_can_declare_model_support_without_policy_support():
+    descriptor = BackendDescriptor(
+        name="ascend",
+        factory="tests.fake_backend_factory:create_backend",
+        target_validator=lambda deployment: None,
+        supported_model_families=frozenset({"ram_plus"}),
+    )
+
+    descriptor.validate_definition()
 
 
 @pytest.mark.parametrize("alias", ["ascend_om", "ascend_om_3403", "3403", "om"])

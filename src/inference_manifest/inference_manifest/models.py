@@ -51,12 +51,11 @@ def _validate_shape(value: tuple[int, ...]) -> tuple[int, ...]:
     return value
 
 
-def _is_image_semantic(semantic: str) -> bool:
-    return (
-        semantic == "observation.image"
-        or semantic.startswith("observation.image.")
-        or semantic.startswith("observation.images.")
-    )
+def _validate_layout(shape: tuple[int, ...], layout: str | None, semantic: str) -> None:
+    if len(shape) == 4 and layout is None:
+        raise ValueError(f"rank-4 tensor {semantic!r} requires NCHW or NHWC layout")
+    if len(shape) != 4 and layout is not None:
+        raise ValueError(f"non-rank-4 tensor {semantic!r} must omit layout")
 
 
 StrictString: TypeAlias = Annotated[str, StringConstraints(strict=True, min_length=1)]
@@ -150,11 +149,38 @@ class TensorBinding(StrictFrozenModel):
     def validate_runtime_slot_and_layout(self) -> TensorBinding:
         if self.runtime_name is None and self.index is None:
             raise ValueError("a tensor binding requires runtime_name, index, or both")
-        if _is_image_semantic(self.semantic):
-            if self.layout is None:
-                raise ValueError(f"image semantic {self.semantic!r} requires NCHW or NHWC layout")
-        elif self.layout is not None:
-            raise ValueError(f"non-image semantic {self.semantic!r} must omit layout")
+        _validate_layout(self.shape, self.layout, self.semantic)
+        return self
+
+
+class SemanticTensor(StrictFrozenModel):
+    """Model-owned semantic tensor contract shared by all deployments."""
+
+    semantic: StrictString
+    dtype: TensorDType
+    shape: TensorShape
+    layout: Literal["NCHW", "NHWC"] | None = None
+
+    @model_validator(mode="after")
+    def validate_layout(self) -> SemanticTensor:
+        _validate_layout(self.shape, self.layout, self.semantic)
+        return self
+
+
+class ModelDescriptor(StrictFrozenModel):
+    kind: Literal["policy", "perception", "generic"] = "policy"
+    family: StrictString = "lerobot"
+    inputs: tuple[SemanticTensor, ...] = ()
+    outputs: tuple[SemanticTensor, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_unique_semantics(self) -> ModelDescriptor:
+        for direction, descriptors in (("inputs", self.inputs), ("outputs", self.outputs)):
+            semantics = [descriptor.semantic for descriptor in descriptors]
+            if len(semantics) != len(set(semantics)):
+                raise ValueError(f"model.{direction} contains duplicate semantic descriptors")
+        if self.kind != "policy" and (not self.inputs or not self.outputs):
+            raise ValueError("non-policy models must declare non-empty model inputs and outputs")
         return self
 
 
@@ -318,8 +344,6 @@ class CompiledDeployment(DeploymentIdentity):
                     "and consumer input bindings"
                 )
 
-        if not any(binding.semantic == "action" for role in self.execution for binding in self.bindings[role].outputs):
-            raise ValueError("compiled deployment must declare an action output binding")
         return self
 
 
@@ -329,6 +353,7 @@ Deployment: TypeAlias = Annotated[TorchDeployment | CompiledDeployment, Field(di
 class InferenceManifest(StrictFrozenModel):
     schema_version: Literal[2]
     bundle: ManifestBundle
+    model: ModelDescriptor = Field(default_factory=ModelDescriptor)
     deployments: dict[str, Deployment] = Field(min_length=1)
 
     @model_validator(mode="after")
