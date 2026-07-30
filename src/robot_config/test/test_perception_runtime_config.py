@@ -34,6 +34,11 @@ def _bundle(root: Path, family: str, *, deployment: str = "torch_cpu") -> Path:
             "family": family,
             "inputs": [{"semantic": "features", "dtype": "float32", "shape": [1]}],
             "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1]}],
+            "semantic_identity": {
+                "logical_model_revision": f"{family}@v1",
+                "preprocessing_contract": "test-pre-v1",
+                "output_semantics": "test-output-v1",
+            },
         },
         "deployments": {
             deployment: {
@@ -91,6 +96,7 @@ def test_parse_perception_runtime_config_is_typed_and_immutable(tmp_path: Path) 
     assert service.bundle_path == bundle
     assert service.deployment == "torch_cpu"
     assert service.validated_manifest.deployment_name == "torch_cpu"
+    assert 0 < runtime.configuration_generation({"depth": "depth_front"}) < 2**63
     with pytest.raises(TypeError):
         service.runtime_options["device_id"] = 1  # type: ignore[index]
 
@@ -157,6 +163,7 @@ def test_launch_builder_emits_named_selection_and_keeps_optional_service_indepen
     assert parameters["service_type"] == "example_depth_msgs/srv/EstimateDepth"
     assert parameters["service_endpoint"] == "/depth/front"
     assert json.loads(parameters["runtime_options_json"])["device_id"] == 0
+    assert parameters["require_semantic_identity"] is False
     assert "backend" not in parameters
 
 

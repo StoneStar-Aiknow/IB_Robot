@@ -142,6 +142,14 @@ robot:
     device_name: ""
     exit_on_init_failure: true
 
+  semantic_mapping:
+    enabled: false
+    migration:
+      grounded_sam2_node: compatibility
+      grounded_sam2_snapshot: diagnostic_only
+      perception_service_node: general_scene
+      embedded_mapping_backend: disabled
+
   embodied:
     enabled: false
     debug_tracing: true
