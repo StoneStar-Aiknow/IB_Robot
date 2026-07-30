@@ -225,8 +225,9 @@ masked-image、SigLIP2 text 和可选 Grounding DINO confirmation。每个进程
 named deployment；SigLIP2 image/text 不共享进程，但必须声明兼容的 embedding space。
 
 每个 generic host 通过 response `ModelRuntimeInfo` 报告 readiness、semantic identity 和 deployment
-provenance。未完成 target conformance 的 Ascend adapter 保持 not-ready；CUDA 不可用时必须在 SSOT 中选择另一个
-已经验证的 named deployment，节点不会自动切换 backend。
+provenance。Ascend OM 只能通过 schema-v2 manifest named deployment 进入 shared `AscendOmModelSession`；raw
+wrapper 的 `backend=ascend_om` 路径不再提供。CUDA 不可用时必须在 SSOT 中选择另一个已经验证的 named
+deployment，节点不会自动切换 backend。
 
 感知模型与 ACT/PI0.5 使用相同的 bundle-first 结构。下载脚本直接生成四个 bundle 根目录：
 `models/sam2.1_hiera_tiny/`、`models/ram_plus_swin_large_14m/`、
@@ -240,6 +241,11 @@ SigLIP2 image/text 服务共享同一 bundle 与 embedding identity，但仍由�
 bundle 的 `model_utils_work/`，通过 conformance 与 promotion 后才可复制到不可变
 `artifacts/<backend>/<deployment>/generations/<uuid>/` 并注册为 named deployment。这些 service-backed mapping
 资产不应与 legacy `grounded_sam2_node` 的 `DetectSegment` contract 混用。
+
+经 ABI 审核的 compiled-only 资产由 `perception_service.package_ascend_perception_bundles` 从
+`model_utils_work/candidates/ascend_*` 打包。SAM2 和 SigLIP2 提供 `ascend_310p`、`ascend_310b` deployment；
+Grounding DINO 当前只提供固定 720x1280、文本长度 8 的 `ascend_310p` deployment。多 OM pipeline 的中间 tensor
+通过 manifest `device_links` 保持在设备侧，service adapter 只负责模型语义预处理与最终输出后处理。
 
 ### 检测结果质心
 

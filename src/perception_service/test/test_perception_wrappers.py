@@ -141,12 +141,7 @@ def test_siglip2_wrapper_rejects_unbounded_or_empty_masks():
         wrapper.encode(image, [np.zeros((2, 2), dtype=np.uint8)], [])
 
 
-@pytest.mark.parametrize("wrapper", [SAM2Wrapper, SigLIP2Wrapper])
-def test_unimplemented_ascend_adapters_fail_closed(wrapper):
-    with pytest.raises(RuntimeError, match="Ascend OM adapter is not ready"):
+@pytest.mark.parametrize("wrapper", [SAM2Wrapper, SigLIP2Wrapper, RAMPlusWrapper])
+def test_raw_wrappers_require_named_ascend_deployment(wrapper):
+    with pytest.raises(RuntimeError, match="manifest named deployment"):
         wrapper(backend="ascend_om")
-
-
-def test_ram_plus_ascend_adapter_fails_closed_without_acl():
-    with pytest.raises(RuntimeError, match="Ascend ACL"):
-        RAMPlusWrapper(backend="ascend_om")

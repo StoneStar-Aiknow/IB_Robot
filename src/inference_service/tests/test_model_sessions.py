@@ -84,6 +84,8 @@ class _FakeCuda:
 
 
 class _FakeTorch:
+    __version__ = "fake-torch-1.0"
+
     def __init__(self, *, cuda_available: bool = True) -> None:
         self.cuda = _FakeCuda(cuda_available)
 
@@ -151,6 +153,7 @@ def test_torch_session_readiness_named_execution_and_repeated_close(tmp_path) ->
 
     session.load(context)
     assert session.health().ready
+    assert session.runtime_version == "fake-torch-1.0"
     result = session.infer(NamedTensorRequest("request-1", {"features": np.ones((1, 2), dtype=np.float32)}))
 
     np.testing.assert_array_equal(result.outputs["scores"], np.full((1, 2), 2.0, dtype=np.float32))
@@ -168,6 +171,7 @@ def test_torch_session_readiness_named_execution_and_repeated_close(tmp_path) ->
     session.close()
     session.close()
     assert session.health().state is BackendState.CLOSED
+    assert session.runtime_version == ""
 
 
 def test_torch_session_fails_clear_when_sdk_or_cuda_is_unavailable(tmp_path) -> None:

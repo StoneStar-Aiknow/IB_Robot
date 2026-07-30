@@ -40,6 +40,50 @@ def test_packager_preserves_lineage_and_bumps_bundle_for_asset_replacement(tmp_p
     assert spec.required_paths[0] in digests
 
 
+def test_ram_plus_packager_promotes_available_ascend_om_deployments(tmp_path) -> None:
+    spec = _specs()["ram_plus"]
+    root = tmp_path / spec.name
+    _write_required_assets(root, spec)
+    for compiled in spec.compiled:
+        candidate = root / compiled.source
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_bytes(compiled.deployment.encode())
+
+    package_bundle(root, spec)
+    first = load_inference_manifest(root, "ascend_310p").manifest
+    for compiled in spec.compiled:
+        deployment = first.deployments[compiled.deployment]
+        assert (root / compiled.artifact).read_bytes() == compiled.deployment.encode()
+        assert deployment.target.soc == compiled.target_soc
+        assert deployment.artifacts["model"].path == compiled.artifact
+        assert deployment.bindings["model"].inputs[0].semantic == "observation.image"
+        assert deployment.bindings["model"].outputs[0].semantic == "tag_logits"
+
+    package_bundle(root, spec)
+    second = load_inference_manifest(root, "ascend_310p").manifest
+    assert second.deployments == first.deployments
+
+    compiled = spec.compiled[0]
+    deployment = first.deployments[compiled.deployment]
+    candidate = root / compiled.source
+    candidate.write_bytes(b"replacement-om")
+    package_bundle(root, spec)
+    third = load_inference_manifest(root, compiled.deployment).manifest
+    assert third.deployments[compiled.deployment].uuid == deployment.uuid
+    assert third.deployments[compiled.deployment].revision == deployment.revision + 1
+
+
+def test_ram_plus_packager_omits_unavailable_ascend_deployment(tmp_path) -> None:
+    spec = _specs()["ram_plus"]
+    root = tmp_path / spec.name
+    _write_required_assets(root, spec)
+
+    package_bundle(root, spec)
+
+    manifest = load_inference_manifest(root, "torch_cpu").manifest
+    assert all(compiled.deployment not in manifest.deployments for compiled in spec.compiled)
+
+
 def test_grounded_sam2_bundle_uses_source_bound_architecture_config() -> None:
     spec = _specs()["grounded_sam2"]
 

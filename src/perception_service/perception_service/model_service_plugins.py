@@ -6,7 +6,6 @@ import importlib
 import itertools
 import json
 from collections.abc import Callable
-from contextlib import suppress
 
 import numpy as np
 
@@ -80,11 +79,11 @@ def _new_session(family: str, adapter, validated, options) -> ModelSession:
     if isinstance(deployment, CompiledDeployment):
         if deployment.backend != "ascend" or not adapter.compiled_abi_finalized:
             raise RuntimeError(f"{family} compiled adapter ABI is not finalized; deployment remains not-ready")
-        allowed = {"acl_config_path"}
+        allowed = {"acl_config_path", "device_id"}
         unknown = sorted(set(options) - allowed)
         if unknown:
             raise ValueError(f"unknown Ascend runtime options: {unknown}")
-        return AscendOmModelSession()
+        return AscendOmModelSession(device_id=int(options.get("device_id", 0)))
     if isinstance(deployment, TorchDeployment):
         if options:
             raise ValueError(
@@ -92,31 +91,6 @@ def _new_session(family: str, adapter, validated, options) -> ModelSession:
             )
         return TorchModelSession(lambda context: _load_torch_module(family, context))
     raise RuntimeError(f"{family} deployment type is unsupported and has no fallback")
-
-
-def _loaded_runtime_version(session: ModelSession) -> str:
-    """Read the version from the runtime object actually loaded by the session."""
-    runtime = None
-    if isinstance(session, TorchModelSession):
-        runtime = session._torch
-    elif isinstance(session, AscendOmModelSession) and session._lease is not None:
-        runtime = session._lease.acl
-    else:
-        runtime = getattr(session, "loaded_runtime", None)
-    if runtime is None:
-        return ""
-    version = getattr(runtime, "__version__", None)
-    if version is not None and str(version).strip():
-        return str(version).strip()
-    getter = getattr(runtime, "get_version", None)
-    if callable(getter):
-        with suppress(Exception):
-            value = getter()
-            if isinstance(value, tuple):
-                value = ".".join(str(part) for part in value)
-            if value is not None and str(value).strip():
-                return str(value).strip()
-    return ""
 
 
 class _SessionPlugin(ModelServicePlugin):
@@ -165,7 +139,7 @@ class _SessionPlugin(ModelServicePlugin):
     def runtime_status(self) -> PluginRuntimeStatus:
         health = self.session.health()
         state = health.state.value if hasattr(health.state, "value") else str(health.state)
-        runtime_version = _loaded_runtime_version(self.session)
+        runtime_version = self.session.runtime_version
         ready = health.ready and bool(runtime_version)
         return PluginRuntimeStatus(
             state=state,

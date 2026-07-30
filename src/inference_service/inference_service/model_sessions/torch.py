@@ -47,6 +47,10 @@ class TorchModelSession(ModelSession):
         self._device_name: str | None = None
         self._module: object | None = None
 
+    @property
+    def runtime_version(self) -> str:
+        return self._runtime_version(self._torch)
+
     def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
         deployment = context.deployment
         if not isinstance(deployment, TorchDeployment) or deployment.device not in {"cpu", "cuda"}:

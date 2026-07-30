@@ -5,12 +5,17 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 from inference_manifest import (
+    ArtifactBindings,
     BundleFile,
+    CompiledDeployment,
+    DeploymentArtifact,
+    DeploymentTarget,
     Digest,
     EmbeddingMetadata,
     InferenceManifest,
@@ -18,6 +23,7 @@ from inference_manifest import (
     ModelDescriptor,
     SemanticIdentity,
     SemanticTensor,
+    TensorBinding,
     TorchDeployment,
     canonical_bundle_digest,
     load_inference_manifest,
@@ -35,6 +41,24 @@ class BundleSpec:
     adapter: dict[str, object]
     model: ModelDescriptor
     required_paths: tuple[str, ...]
+    compiled: tuple[CompiledSpec, ...] = ()
+
+
+@dataclass(frozen=True)
+class CompiledSpec:
+    deployment: str
+    source: str
+    artifact: str
+    target_soc: str
+    bindings: ArtifactBindings
+
+
+RAM_PLUS_BINDINGS = ArtifactBindings(
+    inputs=(
+        TensorBinding(semantic="observation.image", index=0, dtype="float32", shape=(1, 3, 384, 384), layout="NCHW"),
+    ),
+    outputs=(TensorBinding(semantic="tag_logits", index=0, dtype="float32", shape=(1, 4585)),),
+)
 
 
 def _tensor(semantic: str, dtype: str, shape: tuple[int, ...], layout: str | None = None) -> SemanticTensor:
@@ -114,6 +138,22 @@ def _specs() -> dict[str, BundleSpec]:
                 "assets/bert-base-uncased/config.json",
                 "assets/ram_tag_list.txt",
                 "assets/ram_tag_list_threshold.txt",
+            ),
+            compiled=(
+                CompiledSpec(
+                    deployment="ascend_310p",
+                    source="model_utils_work/candidates/ascend_310p/ram_plus_310p.om",
+                    artifact="artifacts/ascend_310p/ram_plus_310p.om",
+                    target_soc="Ascend310P1",
+                    bindings=RAM_PLUS_BINDINGS,
+                ),
+                CompiledSpec(
+                    deployment="ascend_310b",
+                    source="model_utils_work/candidates/ascend_310b/ram_plus_swin_large_14m_fp16.om",
+                    artifact="artifacts/ascend_310b/ram_plus_swin_large_14m_fp16.om",
+                    target_soc="Ascend310B1",
+                    bindings=RAM_PLUS_BINDINGS,
+                ),
             ),
         ),
         "siglip2": BundleSpec(
@@ -208,6 +248,16 @@ def _asset_paths(root: Path) -> tuple[str, ...]:
     )
 
 
+def _promote_compiled_artifact(root: Path, compiled: CompiledSpec) -> Path | None:
+    source = root / compiled.source
+    artifact = root / compiled.artifact
+    if source.is_file():
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        if not artifact.is_file() or _sha256(source) != _sha256(artifact):
+            shutil.copy2(source, artifact)
+    return artifact if artifact.is_file() else None
+
+
 def package_bundle(root: Path, spec: BundleSpec) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     if spec.family == "grounding_dino":
@@ -220,9 +270,14 @@ def package_bundle(root: Path, spec: BundleSpec) -> Path:
     adapter_path.parent.mkdir(parents=True, exist_ok=True)
     adapter_path.write_text(json.dumps(spec.adapter, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
+    compiled_artifacts = {compiled.deployment: _promote_compiled_artifact(root, compiled) for compiled in spec.compiled}
     digest_path = root / "assets" / "artifact-digests.json"
     asset_paths = tuple(path for path in _asset_paths(root) if path != "assets/artifact-digests.json")
     digests = {path: _sha256(root / path) for path in asset_paths}
+    for compiled in spec.compiled:
+        artifact = compiled_artifacts[compiled.deployment]
+        if artifact is not None:
+            digests[compiled.artifact] = _sha256(artifact)
     previous_digests = digest_path.read_text(encoding="utf-8") if digest_path.is_file() else ""
     digest_document = json.dumps(digests, indent=2, sort_keys=True) + "\n"
     digest_path.write_text(digest_document, encoding="utf-8")
@@ -249,6 +304,31 @@ def package_bundle(root: Path, spec: BundleSpec) -> Path:
         if previous is not None:
             candidate = candidate.model_copy(update={"uuid": previous.uuid, "revision": previous.revision})
         deployments[name] = candidate
+    for compiled in spec.compiled:
+        name = compiled.deployment
+        compiled_artifact = compiled_artifacts[name]
+        if compiled_artifact is None:
+            deployments.pop(name, None)
+        else:
+            candidate = CompiledDeployment(
+                backend="ascend",
+                target=DeploymentTarget(soc=compiled.target_soc, runtime="acl"),
+                artifacts={"model": DeploymentArtifact(path=compiled.artifact, format="om")},
+                execution=("model",),
+                bindings={"model": compiled.bindings},
+            )
+            previous = deployments.get(name)
+            if isinstance(previous, CompiledDeployment):
+                previous_digest = ""
+                if previous_digests:
+                    previous_digest = json.loads(previous_digests).get(compiled.artifact, "")
+                candidate = candidate.model_copy(
+                    update={
+                        "uuid": previous.uuid,
+                        "revision": previous.revision + int(previous_digest != digests[compiled.artifact]),
+                    }
+                )
+            deployments[name] = candidate
     manifest = InferenceManifest(
         schema_version=2,
         bundle=ManifestBundle(

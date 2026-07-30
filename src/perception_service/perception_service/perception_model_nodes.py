@@ -15,7 +15,6 @@ from std_msgs.msg import Header
 from ibrobot_msgs.msg import Detection2D, DetectionArray, MaskEmbedding, ModelRuntimeInfo, TextEmbedding
 from ibrobot_msgs.srv import EncodeEmbeddings, EncodeText, GenerateMasks, GroundingDetect, RecognizeTags
 
-from .ascend_om_contracts import require_om_adapter_ready
 from .grounded_sam2_wrapper import GroundedSAM2Wrapper
 from .model_contracts import (
     ModelManifest,
@@ -24,8 +23,10 @@ from .model_contracts import (
     validate_mask_batch,
     validate_text_batch,
 )
+from .ram_plus_adapter import RAM_PLUS_PREPROCESSING
 from .ram_plus_wrapper import RAMPlusWrapper
 from .sam2_wrapper import SAM2Wrapper, SegmentationMask
+from .semantic_model_adapters import GroundingDINOAdapter, SAM2Adapter, SigLIP2ImageAdapter
 from .siglip2_wrapper import SigLIP2Wrapper
 
 
@@ -176,7 +177,7 @@ class SAM2ServiceNode(_ModelServiceNode):
                 path=self._wrapper.checkpoint_path,
                 backend=self._backend,
                 runtime_version=self._wrapper.runtime_version,
-                preprocessing="sam2-rgb-uint8-v1",
+                preprocessing=SAM2Adapter.identity.preprocessing,
             )
         self.create_service(
             GenerateMasks,
@@ -217,11 +218,6 @@ class RAMPlusServiceNode(_ModelServiceNode):
         self.declare_parameter("checkpoint", "ram_plus_swin_large_14m/assets/ram_plus_swin_large_14m.pth")
         self.declare_parameter("model_dir", "")
         self.declare_parameter("text_encoder", "bert-base-uncased")
-        self.declare_parameter("om_model_path", "")
-        self.declare_parameter("tag_list_path", "")
-        self.declare_parameter("threshold_path", "")
-        self.declare_parameter("device_id", 0)
-        self.declare_parameter("acl_config_path", "")
         checkpoint = self.get_parameter("checkpoint").value
         model_dir = self.get_parameter("model_dir").value or None
         text_encoder = self.get_parameter("text_encoder").value
@@ -231,11 +227,6 @@ class RAMPlusServiceNode(_ModelServiceNode):
                 checkpoint=checkpoint,
                 model_dir=model_dir,
                 text_encoder=text_encoder,
-                om_model_path=self.get_parameter("om_model_path").value or None,
-                tag_list_path=self.get_parameter("tag_list_path").value or None,
-                threshold_path=self.get_parameter("threshold_path").value or None,
-                device_id=int(self.get_parameter("device_id").value),
-                acl_config_path=self.get_parameter("acl_config_path").value or None,
             )
         )
         if self._wrapper is not None:
@@ -245,7 +236,7 @@ class RAMPlusServiceNode(_ModelServiceNode):
                 path=self._wrapper.checkpoint_path,
                 backend=self._backend,
                 runtime_version=self._wrapper.runtime_version,
-                preprocessing="resize384-imagenet-normalize-v1",
+                preprocessing=RAM_PLUS_PREPROCESSING,
             )
         self.create_service(
             RecognizeTags,
@@ -281,21 +272,14 @@ class SigLIP2ServiceNode(_ModelServiceNode):
         model_dir = self.get_parameter("model_dir").value or None
         self._load(lambda: SigLIP2Wrapper(backend=self._backend, model_path=model_path, model_dir=model_dir))
         if self._wrapper is not None:
-            config = self._wrapper._model.config
-            text_config = getattr(config, "text_config", None)
-            embedding_dim = int(
-                getattr(config, "projection_dim", 0)
-                or getattr(text_config, "projection_size", 0)
-                or getattr(text_config, "hidden_size", 0)
-            )
             self._manifest = _manifest(
                 name="siglip2",
                 version=Path(model_path).name,
                 path=self._wrapper.model_path,
                 backend=self._backend,
                 runtime_version=self._wrapper.runtime_version,
-                preprocessing="huggingface-processor-masked-gray127-v1",
-                embedding_dim=embedding_dim,
+                preprocessing=SigLIP2ImageAdapter.identity.preprocessing,
+                embedding_dim=self._wrapper.embedding_dim,
                 normalization="l2",
             )
         inference_group = MutuallyExclusiveCallbackGroup()
@@ -380,8 +364,6 @@ class GroundingConfirmationServiceNode(_ModelServiceNode):
             self.declare_parameter(name, default)
 
         def load_wrapper():
-            if self._backend == "ascend_om":
-                require_om_adapter_ready("grounding_dino")
             return GroundedSAM2Wrapper(
                 device=self._backend,
                 sam_checkpoint=self.get_parameter("sam_checkpoint").value,
@@ -399,7 +381,7 @@ class GroundingConfirmationServiceNode(_ModelServiceNode):
                 path=Path(self.get_parameter("model_dir").value or ".") / self.get_parameter("gdino_checkpoint").value,
                 backend=self._wrapper.device,
                 runtime_version="torch",
-                preprocessing="gdino-rgb-normalize-sam2-v1",
+                preprocessing=GroundingDINOAdapter.identity.preprocessing,
             )
         self.create_service(
             GroundingDetect,

@@ -5,7 +5,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .ascend_om_contracts import require_om_adapter_ready
 from .model_contracts import MAX_MASK_BATCH, validate_text_batch
 from .model_utils import inspect_backend, resolve_model_path
 
@@ -31,7 +30,7 @@ class SigLIP2Wrapper:
         text_encoder=None,
     ):
         if backend == "ascend_om":
-            require_om_adapter_ready("siglip2")
+            raise RuntimeError("Ascend OM requires a manifest named deployment")
         status = inspect_backend(backend)
         if not status.ready:
             raise RuntimeError(status.message)
@@ -58,6 +57,16 @@ class SigLIP2Wrapper:
         self._model = AutoModel.from_pretrained(self.model_path, local_files_only=True).eval().to(backend)
         self._encode_images = self._model.get_image_features
         self._encode_texts = self._model.get_text_features
+
+    @property
+    def embedding_dim(self) -> int:
+        config = getattr(self._model, "config", None)
+        text_config = getattr(config, "text_config", None)
+        return int(
+            getattr(config, "projection_dim", 0)
+            or getattr(text_config, "projection_size", 0)
+            or getattr(text_config, "hidden_size", 0)
+        )
 
     def _inference_context(self):
         torch = getattr(self, "_torch", None)

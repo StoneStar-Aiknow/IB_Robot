@@ -10,7 +10,7 @@ from inference_service.backends import BackendCapabilities
 from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import RuntimeContext
 from inference_service.generic_runtime import NamedTensorRequest
-from inference_service.model_sessions import ModelSession
+from inference_service.model_sessions import AscendOmModelSession, ModelSession
 from perception_service.model_service_node import _runtime_info
 from perception_service.model_service_plugin import ModelServicePlugin
 from perception_service.model_service_plugins import (
@@ -182,7 +182,11 @@ class _FakeSession(ModelSession):
         self.adapter = adapter
         self.close_count = 0
         self.requests = []
-        self.loaded_runtime = SimpleNamespace(__version__="test-runtime-2.1")
+        self._runtime = SimpleNamespace(__version__="test-runtime-2.1")
+
+    @property
+    def runtime_version(self):
+        return self._runtime_version(self._runtime)
 
     def _load(self, context: RuntimeContext, _rollback: PartialLoadRollback) -> None:
         assert context.deployment_name == "torch_cpu"
@@ -302,7 +306,7 @@ def test_plugin_status_projects_parseable_runtime_provenance(tmp_path) -> None:
 def test_plugin_fails_closed_when_loaded_runtime_exposes_no_version(tmp_path) -> None:
     validated = _write_bundle(tmp_path / "sam2", "sam2")
     plugin = SAM2GenerateMasksPlugin(_host(), validated, {})
-    plugin.session.loaded_runtime = SimpleNamespace()
+    plugin.session._runtime = SimpleNamespace()
 
     status = plugin.runtime_status()
 
@@ -404,3 +408,38 @@ def test_unfinished_compiled_family_fails_before_session_creation_without_fallba
 
     with pytest.raises(RuntimeError, match="ABI is not finalized"):
         _new_session("sam2", SAM2Adapter(), validated, {})
+
+
+def test_only_conformant_ram_plus_adapter_promotes_compiled_abi() -> None:
+    adapters = (RAMPlusAdapter, SAM2Adapter, SigLIP2ImageAdapter, SigLIP2TextAdapter, GroundingDINOAdapter)
+
+    assert {adapter.identity.family for adapter in adapters if adapter.compiled_abi_finalized} == {"ram_plus"}
+
+
+def test_conformant_ram_plus_compiled_deployment_selects_ascend_session() -> None:
+    deployment = CompiledDeployment.model_validate(
+        {
+            "uuid": "26547f4a-1d02-4ea1-b4dc-c887ca557a68",
+            "revision": 1,
+            "backend": "ascend",
+            "target": {"soc": "Ascend310P3", "runtime": "acl"},
+            "artifacts": {"model": {"path": "artifacts/model.om", "format": "om"}},
+            "execution": ("model",),
+            "bindings": {
+                "model": {
+                    "inputs": ({"semantic": "observation.image", "index": 0, "dtype": "float32", "shape": (1,)},),
+                    "outputs": ({"semantic": "tag_logits", "index": 0, "dtype": "float32", "shape": (1, 4585)},),
+                }
+            },
+        }
+    )
+
+    session = _new_session(
+        "ram_plus",
+        SimpleNamespace(compiled_abi_finalized=True),
+        SimpleNamespace(deployment=deployment),
+        {},
+    )
+
+    assert isinstance(session, AscendOmModelSession)
+    session.close()

@@ -30,7 +30,7 @@ class RAMPlusAdapter(PerceptionAdapter):
         family="ram_plus",
         preprocessing=RAM_PLUS_PREPROCESSING,
         postprocessing=RAM_PLUS_POSTPROCESSING,
-        supported_deployments=frozenset({"torch_cpu", "torch_cuda", "ascend_310p"}),
+        supported_deployments=frozenset({"torch_cpu", "torch_cuda", "ascend_310p", "ascend_310b"}),
     )
 
     compiled_abi_finalized = True

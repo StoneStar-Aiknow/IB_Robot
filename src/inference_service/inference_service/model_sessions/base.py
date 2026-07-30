@@ -6,7 +6,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 
 import numpy as np
@@ -59,6 +59,28 @@ class ModelSession(ABC):
     @property
     def capabilities(self) -> BackendCapabilities:
         return self._capabilities
+
+    @property
+    def runtime_version(self) -> str:
+        """Return the version reported by the runtime loaded by this session."""
+        return ""
+
+    @staticmethod
+    def _runtime_version(runtime: object | None) -> str:
+        if runtime is None:
+            return ""
+        version = getattr(runtime, "__version__", None)
+        if version is not None and str(version).strip():
+            return str(version).strip()
+        getter = getattr(runtime, "get_version", None)
+        if callable(getter):
+            with suppress(Exception):
+                value = getter()
+                if isinstance(value, tuple):
+                    value = ".".join(str(part) for part in value)
+                if value is not None and str(value).strip():
+                    return str(value).strip()
+        return ""
 
     def load(self, context: RuntimeContext) -> None:
         if not isinstance(context, RuntimeContext):

@@ -23,6 +23,7 @@ setup(
             "grounded_sam2_snapshot = perception_service.grounded_sam2_snapshot:main",
             "model_service_node = perception_service.model_service_node:main",
             "package_perception_bundles = perception_service.package_perception_bundles:main",
+            "package_ascend_perception_bundles = perception_service.package_ascend_perception_bundles:main",
         ],
     },
 )

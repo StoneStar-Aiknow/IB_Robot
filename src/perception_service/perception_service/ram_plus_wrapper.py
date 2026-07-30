@@ -3,17 +3,10 @@
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
-from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 
-from .model_utils import DEFAULT_MODEL_DIR, WORKSPACE_ROOT, inspect_backend, resolve_model_path
-
-RAM_PLUS_OM_PATH = (
-    DEFAULT_MODEL_DIR / "ram_plus_swin_large_14m/model_utils_work/candidates/ram_plus_swin_large_14m_fp16.om"
-)
-RAM_PLUS_DATA_DIR = WORKSPACE_ROOT / "ram_models" / "recognize-anything" / "ram" / "data"
+from .model_utils import WORKSPACE_ROOT, inspect_backend, resolve_model_path
 
 
 @dataclass(frozen=True)
@@ -33,31 +26,15 @@ class RAMPlusWrapper:
         model=None,
         transform=None,
         logits_inference=None,
-        om_model_path: str | None = None,
-        tag_list_path: str | None = None,
-        threshold_path: str | None = None,
-        device_id: int = 0,
-        acl_config_path: str | None = None,
-        om_session=None,
     ):
+        if backend == "ascend_om":
+            raise RuntimeError("Ascend OM requires a manifest named deployment")
         status = inspect_backend(backend)
         if not status.ready:
             raise RuntimeError(status.message)
 
         self.backend = backend
         self.runtime_version = status.runtime_version
-        self._om_session = None
-        if backend == "ascend_om":
-            self._initialize_ascend_om(
-                om_model_path=om_model_path,
-                tag_list_path=tag_list_path,
-                threshold_path=threshold_path,
-                device_id=device_id,
-                acl_config_path=acl_config_path,
-                om_session=om_session,
-            )
-            return
-
         self.checkpoint_path = resolve_model_path(checkpoint, model_dir)
         if model is not None and transform is not None and logits_inference is not None:
             self._model = model
@@ -92,52 +69,6 @@ class RAMPlusWrapper:
         )
         self._transform = get_transform(image_size=384)
         self._infer_logits = self._forward_logits
-
-    def _initialize_ascend_om(
-        self,
-        *,
-        om_model_path: str | None,
-        tag_list_path: str | None,
-        threshold_path: str | None,
-        device_id: int,
-        acl_config_path: str | None,
-        om_session,
-    ) -> None:
-        model_path = Path(om_model_path).expanduser() if om_model_path else RAM_PLUS_OM_PATH
-        self.checkpoint_path = model_path.resolve()
-        tag_path = Path(tag_list_path).expanduser() if tag_list_path else RAM_PLUS_DATA_DIR / "ram_tag_list.txt"
-        threshold_file = (
-            Path(threshold_path).expanduser() if threshold_path else RAM_PLUS_DATA_DIR / "ram_tag_list_threshold.txt"
-        )
-        labels = np.asarray(tag_path.read_text(encoding="utf-8").splitlines())
-        thresholds = np.loadtxt(threshold_file, dtype=np.float32).reshape(-1)
-        if labels.shape != (4585,) or thresholds.shape != labels.shape:
-            raise ValueError("RAM++ OM tag list and thresholds must each contain 4585 entries")
-
-        if om_session is None:
-            from .ascend_om_bindings import RAM_PLUS_BINDINGS
-            from .ascend_om_runtime import AscendOmModelSession
-
-            om_session = AscendOmModelSession(
-                role="ram_plus",
-                model_path=self.checkpoint_path,
-                bindings=RAM_PLUS_BINDINGS,
-                device_id=device_id,
-                acl_config_path=acl_config_path,
-            )
-        self._om_session = om_session
-        self._model = SimpleNamespace(class_threshold=thresholds, tag_list=labels, delete_tag_index=[])
-        self._transform = self._preprocess_ascend_om
-        self._infer_logits = lambda image: self._om_session.execute({0: image})[0]
-
-    @staticmethod
-    def _preprocess_ascend_om(image) -> np.ndarray:
-        image = image.convert("RGB").resize((384, 384))
-        value = np.asarray(image, dtype=np.float32) / 255.0
-        mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
-        std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
-        value = (value - mean) / std
-        return np.ascontiguousarray(value.transpose(2, 0, 1)[None], dtype=np.float32)
 
     def _forward_logits(self, image):
         model = self._model
@@ -199,8 +130,3 @@ class RAMPlusWrapper:
         indices = [int(index) for index in indices if int(index) not in deleted]
         indices.sort(key=lambda index: (-float(scores[index]), str(labels[index])))
         return [RecognizedTag(str(labels[index]), float(scores[index])) for index in indices]
-
-    def close(self) -> None:
-        if self._om_session is not None:
-            self._om_session.close()
-            self._om_session = None

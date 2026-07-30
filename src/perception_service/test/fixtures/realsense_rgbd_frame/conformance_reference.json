@@ -1,0 +1,105 @@
+{
+  "format_version": 1,
+  "fixture_id": "fixed-d435-rgbd-frame-2026-06-15",
+  "source": {
+    "rgb": "color.png",
+    "aligned_depth": "depth.png",
+    "camera_info": "camera_info.json",
+    "source_frame": "camera_color_optical_frame",
+    "stamp": {
+      "sec": 1781526434,
+      "nanosec": 85625732
+    }
+  },
+  "inputs": {
+    "candidate_labels": [
+      "cup",
+      "bottle",
+      "table"
+    ],
+    "mask_rect_xyxy": [
+      250,
+      180,
+      390,
+      320
+    ],
+    "depth_scale": 1000.0,
+    "depth_trunc_m": 4.0,
+    "min_points": 30,
+    "global_transform": {
+      "translation_xyz": [
+        1.0,
+        -0.5,
+        0.2
+      ],
+      "quaternion_xyzw": [
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    }
+  },
+  "reference_outputs": {
+    "sam2": {
+      "mask_count": 1,
+      "mask_area_pixels": 19600,
+      "bbox_xyxy": [
+        250.0,
+        180.0,
+        390.0,
+        320.0
+      ]
+    },
+    "ram_plus": {
+      "tags": [
+        "cup",
+        "table"
+      ],
+      "scores": [
+        0.91,
+        0.72
+      ]
+    },
+    "siglip2": {
+      "embedding": [
+        0.6,
+        0.8,
+        0.0,
+        0.0
+      ],
+      "embedding_dim": 4,
+      "normalization": "l2",
+      "matched_label": "cup",
+      "matched_score": 0.83
+    },
+    "grounding_dino": {
+      "label": "cup",
+      "score": 0.88,
+      "bbox_xyxy": [
+        250.0,
+        180.0,
+        390.0,
+        320.0
+      ]
+    },
+    "geometry": {
+      "valid_point_count": 8949,
+      "camera_centroid_xyz": [
+        0.0021519095171242952,
+        0.013315153308212757,
+        0.1899999976158142
+      ],
+      "world_centroid_xyz": [
+        1.0021519095171243,
+        -0.48668484669178724,
+        0.3899999976158142
+      ],
+      "extent_xyz": [
+        0.04171261191368103,
+        0.029467525854706737,
+        0.05300000309944153
+      ]
+    }
+  }
+}

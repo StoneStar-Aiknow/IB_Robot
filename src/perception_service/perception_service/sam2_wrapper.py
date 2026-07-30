@@ -6,7 +6,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .ascend_om_contracts import require_om_adapter_ready
 from .model_utils import DEFAULT_MODEL_DIR, inspect_backend, resolve_model_path
 
 
@@ -34,7 +33,7 @@ class SAM2Wrapper:
         image_predictor=None,
     ):
         if backend == "ascend_om":
-            require_om_adapter_ready("sam2")
+            raise RuntimeError("Ascend OM requires a manifest named deployment")
         status = inspect_backend(backend)
         if not status.ready:
             raise RuntimeError(status.message)

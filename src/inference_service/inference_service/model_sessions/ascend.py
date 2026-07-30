@@ -53,6 +53,10 @@ class AscendOmModelSession(ModelSession):
         self._models: dict[str, AclModel] = {}
         self._linked_inputs: frozenset[tuple[str, str]] = frozenset()
 
+    @property
+    def runtime_version(self) -> str:
+        return self._runtime_version(None if self._lease is None else self._lease.acl)
+
     def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
         deployment = context.deployment
         if not isinstance(deployment, CompiledDeployment) or deployment.backend != "ascend":
