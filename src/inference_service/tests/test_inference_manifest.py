@@ -15,12 +15,15 @@ from inference_manifest import (
     ManifestIntegrityError,
     ManifestPathError,
     ManifestValidationError,
+    SemanticIdentity,
     canonical_bundle_digest,
     canonical_manifest_bytes,
+    canonical_semantic_identity_json,
     deployment_fingerprint,
     load_inference_manifest,
     normalize_bundle_path,
     normalize_unique_paths,
+    semantic_identity_fingerprint,
     write_inference_manifest,
 )
 from inference_manifest.models import DeviceLink
@@ -164,6 +167,80 @@ def test_unknown_model_kind_is_rejected(tmp_path):
 
     with pytest.raises(ManifestValidationError, match=r"model.kind.*detector"):
         load_inference_manifest(tmp_path, "ascend")
+
+
+def _semantic_identity():
+    return {
+        "logical_model_revision": "google/siglip2-base-patch16-224@v1",
+        "preprocessing_contract": "siglip2-dual-encoder-v1",
+        "output_semantics": "normalized-joint-image-text-embedding-v1",
+        "embedding": {
+            "embedding_space_id": "siglip2-base-patch16-224:v1",
+            "dimension": 768,
+            "normalization": "l2",
+            "image_preprocessing": "siglip2-image-224-v1",
+            "text_preprocessing": "siglip2-tokenizer-64-v1",
+        },
+    }
+
+
+def test_perception_manifest_accepts_complete_semantic_embedding_identity(tmp_path):
+    paths = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, paths)
+    manifest["model"]["semantic_identity"] = _semantic_identity()
+    write_manifest(tmp_path, manifest)
+
+    identity = load_inference_manifest(tmp_path, "ascend").manifest.model.semantic_identity
+
+    assert identity is not None
+    assert identity.embedding is not None
+    assert identity.embedding.embedding_space_id == "siglip2-base-patch16-224:v1"
+    assert identity.embedding.dimension == 768
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        (lambda embedding: embedding.pop("text_preprocessing"), "text_preprocessing"),
+        (lambda embedding: embedding.update(dimension=0), "dimension"),
+        (lambda embedding: embedding.update(extra="invalid"), "extra"),
+    ],
+)
+def test_semantic_embedding_identity_is_strict_and_complete(tmp_path, mutation, expected):
+    paths = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, paths)
+    identity = _semantic_identity()
+    mutation(identity["embedding"])
+    manifest["model"]["semantic_identity"] = identity
+    write_manifest(tmp_path, manifest)
+
+    with pytest.raises(ManifestValidationError, match=expected):
+        load_inference_manifest(tmp_path, "ascend")
+
+
+def test_semantic_identity_json_and_fingerprint_are_canonical_and_provenance_independent():
+    identity = SemanticIdentity.model_validate(_semantic_identity())
+    reordered = SemanticIdentity.model_validate(
+        {
+            "output_semantics": identity.output_semantics,
+            "embedding": identity.embedding.model_dump(),
+            "preprocessing_contract": identity.preprocessing_contract,
+            "logical_model_revision": identity.logical_model_revision,
+        }
+    )
+
+    expected_json = (
+        '{"embedding":{"dimension":768,"embedding_space_id":"siglip2-base-patch16-224:v1",'
+        '"image_preprocessing":"siglip2-image-224-v1","normalization":"l2",'
+        '"text_preprocessing":"siglip2-tokenizer-64-v1"},'
+        '"logical_model_revision":"google/siglip2-base-patch16-224@v1",'
+        '"output_semantics":"normalized-joint-image-text-embedding-v1",'
+        '"preprocessing_contract":"siglip2-dual-encoder-v1"}'
+    )
+    assert canonical_semantic_identity_json(identity) == expected_json
+    assert canonical_semantic_identity_json(reordered) == expected_json
+    assert semantic_identity_fingerprint(identity) == semantic_identity_fingerprint(reordered)
+    assert len(semantic_identity_fingerprint(identity)) == 64
 
 
 @pytest.mark.parametrize("output_semantic", ["tag_logits", "image_embedding", "masks", "boxes"])

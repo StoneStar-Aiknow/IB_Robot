@@ -1,0 +1,9 @@
+sensor_msgs/Image image
+float32 score_threshold
+---
+string[] tags
+float32[] scores
+ModelRuntimeInfo model
+float32 inference_time_ms
+bool success
+string message

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from robot_config.contract_utils import Contract
+    from robot_config.perception_runtime_config import PerceptionRuntimeConfig
 
 
 @dataclass
@@ -182,6 +183,23 @@ class VoiceASRConfig:
 
 
 @dataclass
+class SemanticMappingConfig:
+    """Standalone semantic mapping configuration managed by robot_config."""
+
+    enabled: bool = False
+    camera: dict[str, Any] = field(default_factory=dict)
+    slam: dict[str, Any] = field(default_factory=dict)
+    perception: dict[str, Any] = field(default_factory=dict)
+    persistence: dict[str, Any] = field(default_factory=dict)
+    filtering: dict[str, Any] = field(default_factory=dict)
+    queue: dict[str, Any] = field(default_factory=dict)
+    lifecycle: dict[str, Any] = field(default_factory=dict)
+    target_watch: dict[str, Any] = field(default_factory=dict)
+    interfaces: dict[str, Any] = field(default_factory=dict)
+    migration: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class RobotConfig:
     """Unified robot configuration.
 
@@ -201,6 +219,8 @@ class RobotConfig:
     voice_asr: VoiceASRConfig = field(default_factory=VoiceASRConfig)
     embodied: EmbodiedConfig = field(default_factory=EmbodiedConfig)
     skill_gateway: SkillGatewayRuntimeConfig = field(default_factory=SkillGatewayRuntimeConfig)
+    semantic_mapping: SemanticMappingConfig = field(default_factory=SemanticMappingConfig)
+    perception_services: "PerceptionRuntimeConfig | None" = None
 
     def get_camera(self, name: str) -> CameraConfig | None:
         """Get camera configuration by name."""

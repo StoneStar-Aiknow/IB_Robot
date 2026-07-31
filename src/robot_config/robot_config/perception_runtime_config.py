@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -11,7 +12,13 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
-from inference_manifest import MANIFEST_FILENAME, ManifestError, ValidatedManifest, load_inference_manifest
+from inference_manifest import (
+    MANIFEST_FILENAME,
+    ManifestError,
+    ValidatedManifest,
+    load_inference_manifest,
+    semantic_identity_fingerprint,
+)
 
 _INSTANCE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _NODE_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -60,6 +67,34 @@ class PerceptionRuntimeConfig:
     @property
     def enabled_services(self) -> tuple[PerceptionModelServiceConfig, ...]:
         return tuple(service for service in self.services if service.enabled)
+
+    def configuration_generation(self, role_bindings: Mapping[str, str]) -> int:
+        """Return a stable positive generation for the effective role-bound services."""
+        by_id = {service.instance_id: service for service in self.enabled_services}
+        records = []
+        for role, instance_id in sorted(role_bindings.items()):
+            service = by_id.get(instance_id)
+            if service is None or service.validated_manifest is None:
+                raise PerceptionRuntimeConfigError(f"Role {role!r} references unavailable service {instance_id!r}")
+            identity = service.validated_manifest.manifest.model.semantic_identity
+            records.append(
+                {
+                    "role": role,
+                    "id": instance_id,
+                    "required": service.required,
+                    "deployment": service.deployment,
+                    "deployment_fingerprint": service.validated_manifest.fingerprint,
+                    "semantic_identity_fingerprint": semantic_identity_fingerprint(identity) if identity else None,
+                    "service_type": service.service_type,
+                    "endpoint": service.endpoint,
+                    "node_name": service.node_name,
+                    "adapter_class": service.adapter_class,
+                    "runtime_options": dict(service.runtime_options),
+                }
+            )
+        payload = json.dumps(records, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        generation = int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
+        return generation or 1
 
 
 def parse_perception_runtime_config(robot_config: Mapping[str, Any]) -> PerceptionRuntimeConfig:

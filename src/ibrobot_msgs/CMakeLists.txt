@@ -41,6 +41,11 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Detection2D.msg"
   "msg/DetectionArray.msg"
   "msg/ModelRuntimeInfo.msg"
+  "msg/MaskEmbedding.msg"
+  "msg/TextEmbedding.msg"
+  "msg/SemanticMapMetadata.msg"
+  "msg/SemanticObject3D.msg"
+  "msg/SemanticObject3DArray.msg"
   "msg/GraspCandidate.msg"
   "msg/GraspCandidateArray.msg"
   "action/RecordEpisode.action"
@@ -59,8 +64,15 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetSkillGatewayStatus.srv"
   "srv/DetectSegment.srv"
   "srv/EchoModel.srv"
+  "srv/GenerateMasks.srv"
+  "srv/RecognizeTags.srv"
+  "srv/EncodeEmbeddings.srv"
+  "srv/EncodeText.srv"
+  "srv/GroundingDetect.srv"
   "srv/PlanGrasp.srv"
   "srv/VerifyGrasp.srv"
+  "srv/GetSemanticObjects.srv"
+  "srv/ResolveSemanticTarget.srv"
   DEPENDENCIES std_msgs action_msgs builtin_interfaces geometry_msgs sensor_msgs
 )
 

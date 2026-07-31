@@ -339,6 +339,10 @@ Canonical backend 只有以下五个：
 | `rknn` | RKNNLite 执行 RKNN artifact |
 | `hmm` | Houmo TCIM 执行 HMM 多模块 artifact |
 
+Ascend compiled deployment 可通过 manifest `device_links` 把 producer output buffer 直接绑定到 consumer input。
+`AscendOmModelSession` 按 `execution` 顺序调度这些 role，只把公开输出以及未声明 device link 的 host-routed 中间
+tensor 复制回主机；设备生命周期、buffer ownership 和串行准入仍由 shared runtime 统一管理。
+
 以下支持矩阵在启动时强制校验，不在表中的组合会被拒绝：
 
 | Policy family | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |

@@ -14,8 +14,8 @@ robot:
 
   control_modes:
     teleop:
-      description: "Base-only teleoperation mode for D455 RTAB-Map mapping"
-      description_cn: "用于 D455 RTAB-Map 建图的仅底盘遥操作模式"
+      description: "Base-only teleoperation mode for fixed D435 semantic mapping"
+      description_cn: "用于固定安装 D435 语义建图的仅底盘遥操作模式"
       controllers:
         - joint_state_broadcaster
         - base_velocity_controller
@@ -119,3 +119,101 @@ robot:
 
     rviz:
       enabled: false
+
+  # Disabled templates keep this checked-in config loadable without production bundles.
+  perception_services:
+    services:
+      - id: semantic_sam2_masks
+        enabled: false
+        required: false
+      - id: semantic_ram_plus_tags
+        enabled: false
+        required: false
+      - id: semantic_siglip2_image
+        enabled: false
+        required: false
+      - id: semantic_siglip2_text
+        enabled: false
+        required: false
+      - id: semantic_gdino_confirmation
+        enabled: false
+        required: false
+
+  semantic_mapping:
+    enabled: false
+    camera:
+      peripheral: realsense
+      mounting: fixed
+      parent_frame: base_link
+      rgb_topic: /camera/realsense/image_raw
+      depth_topic: /camera/realsense/aligned_depth_to_color/image_raw
+      camera_info_topic: /camera/realsense/camera_info
+    slam:
+      # Replace these identities with values exported by the active SLAM,
+      # calibration, and robot-description deployments before enabling mapping.
+      global_frame: map
+      cloud_map_topic: /cloud_map
+      active_map_hash_topic: /slam/active_geometry_map_hash
+      localization_ready_topic: /slam/localization_ready
+      authoritative_map_odom_topic: /slam/authoritative_map_odom_ready
+      geometry_map_id: rtabmap-lekiwi
+      geometry_map_hash: REPLACE_WITH_ACTIVE_GEOMETRY_MAP_HASH
+      localization_session_id: REPLACE_WITH_LOCALIZATION_SESSION_ID
+      calibration_id: REPLACE_WITH_D435_CALIBRATION_HASH
+      urdf_hash: REPLACE_WITH_ACTIVE_URDF_HASH
+      coordinate_convention: ros-rep-103-map-enu
+      map_odom_authority: slam
+    perception:
+      mapping_backend: service
+      service_wait_sec: 1.0
+      semantic_roles:
+        sam2_masks: semantic_sam2_masks
+        ram_plus_tags: semantic_ram_plus_tags
+        siglip2_image: semantic_siglip2_image
+        siglip2_text: semantic_siglip2_text
+        gdino_confirmation: semantic_gdino_confirmation
+      allow_legacy_embedded: false
+    persistence:
+      database_path: ~/.ros/ibrobot/semantic_map.sqlite3
+      artifact_output_dir: ~/.ros/ibrobot/semantic_artifacts
+    filtering:
+      depth_trunc_m: 4.0
+      min_points: 30
+      min_frame_valid_depth_ratio: 0.05
+      min_mask_pixels: 30
+      min_mask_area_ratio: 0.0005
+      min_mask_valid_depth_ratio: 0.2
+      max_mask_overlap_ratio: 0.8
+    queue:
+      sync_queue_size: 10
+      sync_slop_sec: 0.06
+      tf_timeout_sec: 0.15
+      processing_interval_sec: 0.5
+      frame_capacity: 2
+      policy: drop_oldest
+      max_masks_per_batch: 8
+    lifecycle:
+      association_distance_m: 0.45
+      association_position_weight: 0.55
+      embedding_similarity_threshold: 0.72
+      stale_after_sec: 10.0
+      move_stability_m: 0.1
+      move_confirmations: 2
+    target_watch:
+      max_attempts: 3
+      scan_profile: fixed_d435_base_scan
+      stand_off_distance_m: 0.8
+      clearance_m: 0.2
+      footprint_ready_topic: /navigation/footprint_ready
+      obstacle_map_ready_topic: /navigation/obstacle_map_ready
+      reachability_ready_topic: /navigation/reachability_ready
+    interfaces:
+      semantic_map_topic: /semantic_mapping/objects
+      object_cloud_topic: /semantic_mapping/object_cloud
+      query_service: /semantic_mapping/get_objects
+      target_service: /semantic_mapping/resolve_target
+    migration:
+      grounded_sam2_node: compatibility
+      grounded_sam2_snapshot: diagnostic_only
+      perception_service_node: general_scene
+      embedded_mapping_backend: disabled

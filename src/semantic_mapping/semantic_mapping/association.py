@@ -1,0 +1,246 @@
+"""Persistent semantic-object association and fusion."""
+
+import time
+import uuid
+from dataclasses import dataclass, field
+
+import numpy as np
+
+FROZEN = "frozen"
+OBSERVED = "observed"
+STALE = "stale"
+MISSING = "missing"
+MOVED = "moved"
+LOST = "lost"
+ACTION_READY_STATES = {OBSERVED, MOVED}
+LIFECYCLE_STATES = {FROZEN, OBSERVED, STALE, MISSING, MOVED, LOST}
+_ALLOWED_TRANSITIONS = {
+    FROZEN: {OBSERVED},
+    OBSERVED: {OBSERVED, MOVED, STALE, MISSING},
+    STALE: {OBSERVED, LOST},
+    MISSING: {MOVED, LOST},
+    MOVED: {OBSERVED},
+    LOST: {OBSERVED},
+}
+
+
+@dataclass(frozen=True)
+class LifecycleEvidence:
+    identity_confirmed: bool = False
+    geometry_confirmed: bool = False
+    search_exhausted: bool = False
+    freshness_expired: bool = False
+    details: dict = field(default_factory=dict)
+
+
+@dataclass
+class SemanticObservation:
+    label: str
+    confidence: float
+    position: np.ndarray
+    size: np.ndarray
+    point_count: int
+    stamp_ns: int
+    embedding: np.ndarray | None = None
+    attributes: dict = field(default_factory=dict)
+    canonical_label: str = ""
+    map_version: str = ""
+    session_id: str = ""
+    source_frame: str = ""
+    model_versions: dict = field(default_factory=dict)
+    semantic_identities: dict = field(default_factory=dict)
+    deployment_provenance: dict = field(default_factory=dict)
+    mapping_run_id: str = ""
+
+
+@dataclass
+class SemanticTrack:
+    object_id: str
+    label: str
+    confidence: float
+    position: np.ndarray
+    size: np.ndarray
+    point_count: int
+    first_seen_ns: int
+    last_seen_ns: int
+    observation_count: int = 1
+    embedding: np.ndarray | None = None
+    attributes: dict = field(default_factory=dict)
+    canonical_label: str = ""
+    state: str = OBSERVED
+    map_version: str = ""
+    session_id: str = ""
+    object_version: int = 1
+    model_versions: dict = field(default_factory=dict)
+    lifecycle_evidence: dict = field(default_factory=dict)
+    semantic_identities: dict = field(default_factory=dict)
+    deployment_provenance: dict = field(default_factory=dict)
+
+    @property
+    def active(self) -> bool:
+        return self.state in ACTION_READY_STATES
+
+    @active.setter
+    def active(self, value: bool) -> None:
+        self.state = OBSERVED if value else STALE
+
+
+def normalize_embedding(embedding: np.ndarray | None) -> np.ndarray | None:
+    if embedding is None:
+        return None
+    vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(vector))
+    return vector / norm if norm > 1e-12 else None
+
+
+def cosine_similarity(left: np.ndarray | None, right: np.ndarray | None) -> float | None:
+    left, right = normalize_embedding(left), normalize_embedding(right)
+    if left is None or right is None or left.shape != right.shape:
+        return None
+    return float(np.clip(np.dot(left, right), -1.0, 1.0))
+
+
+class SemanticTracker:
+    def __init__(
+        self,
+        association_distance_m: float = 0.45,
+        embedding_similarity_threshold: float = 0.72,
+        position_weight: float = 0.55,
+        stale_after_sec: float = 10.0,
+    ):
+        self.association_distance_m = association_distance_m
+        self.embedding_similarity_threshold = embedding_similarity_threshold
+        self.position_weight = position_weight
+        self.stale_after_ns = int(stale_after_sec * 1e9)
+        self.tracks: dict[str, SemanticTrack] = {}
+
+    def add_track(self, track: SemanticTrack) -> None:
+        if track.state not in LIFECYCLE_STATES:
+            raise ValueError(f"unknown lifecycle state: {track.state}")
+        track.embedding = normalize_embedding(track.embedding)
+        self.tracks[track.object_id] = track
+
+    def update(self, observation: SemanticObservation, excluded_object_ids: set[str] | None = None) -> SemanticTrack:
+        observation.embedding = normalize_embedding(observation.embedding)
+        match = self._best_match(observation, excluded_object_ids or set())
+        if match is None:
+            track = SemanticTrack(
+                object_id=str(uuid.uuid4()),
+                label=observation.label,
+                confidence=observation.confidence,
+                position=np.asarray(observation.position, dtype=np.float64),
+                size=np.asarray(observation.size, dtype=np.float64),
+                point_count=observation.point_count,
+                first_seen_ns=observation.stamp_ns,
+                last_seen_ns=observation.stamp_ns,
+                embedding=observation.embedding,
+                attributes=dict(observation.attributes),
+                canonical_label=observation.canonical_label or observation.label.casefold(),
+                map_version=observation.map_version,
+                session_id=observation.session_id,
+                model_versions=dict(observation.model_versions),
+                semantic_identities=dict(observation.semantic_identities),
+                deployment_provenance=dict(observation.deployment_provenance),
+            )
+            self.tracks[track.object_id] = track
+            return track
+
+        alpha = 1.0 / min(match.observation_count + 1, 5)
+        match.position = (1.0 - alpha) * match.position + alpha * observation.position
+        match.size = (1.0 - alpha) * match.size + alpha * observation.size
+        match.confidence = max(match.confidence * 0.9, observation.confidence)
+        match.point_count = observation.point_count
+        match.last_seen_ns = observation.stamp_ns
+        match.observation_count += 1
+        self.transition(
+            match.object_id,
+            OBSERVED,
+            LifecycleEvidence(identity_confirmed=True, geometry_confirmed=True, details={"source": "association"}),
+        )
+        match.attributes.update(observation.attributes)
+        match.object_version += 1
+        match.map_version = observation.map_version or match.map_version
+        match.session_id = observation.session_id or match.session_id
+        match.model_versions.update(observation.model_versions)
+        match.semantic_identities.update(observation.semantic_identities)
+        match.deployment_provenance.update(observation.deployment_provenance)
+        if observation.embedding is not None:
+            if match.embedding is None:
+                match.embedding = observation.embedding
+            else:
+                match.embedding = normalize_embedding((1.0 - alpha) * match.embedding + alpha * observation.embedding)
+        return match
+
+    def mark_stale(self, now_ns: int | None = None) -> bool:
+        now_ns = time.time_ns() if now_ns is None else now_ns
+        changed = False
+        for track in self.tracks.values():
+            if track.state == OBSERVED and now_ns - track.last_seen_ns > self.stale_after_ns:
+                self.transition(
+                    track.object_id,
+                    STALE,
+                    LifecycleEvidence(freshness_expired=True, details={"now_ns": now_ns}),
+                )
+                changed = True
+        return changed
+
+    def transition(self, object_id: str, new_state: str, evidence: LifecycleEvidence) -> SemanticTrack:
+        if new_state not in LIFECYCLE_STATES:
+            raise ValueError(f"unknown lifecycle state: {new_state}")
+        track = self.tracks[object_id]
+        if new_state not in _ALLOWED_TRANSITIONS[track.state]:
+            raise ValueError(f"invalid lifecycle transition: {track.state} -> {new_state}")
+        if new_state == OBSERVED and not (evidence.identity_confirmed and evidence.geometry_confirmed):
+            raise ValueError("observed transition requires identity and geometry evidence")
+        if new_state == MOVED and not (evidence.identity_confirmed and evidence.geometry_confirmed):
+            raise ValueError("moved transition requires identity and stable geometry evidence")
+        if new_state == STALE and not evidence.freshness_expired:
+            raise ValueError("stale transition requires freshness-expiry evidence")
+        if new_state == MISSING and not evidence.geometry_confirmed:
+            raise ValueError("missing transition requires observed-empty geometry evidence")
+        if new_state == LOST and not evidence.search_exhausted:
+            raise ValueError("lost transition requires exhausted-search evidence")
+        if track.state != new_state:
+            track.state = new_state
+            track.object_version += 1
+        track.lifecycle_evidence = {
+            "identity_confirmed": evidence.identity_confirmed,
+            "geometry_confirmed": evidence.geometry_confirmed,
+            "search_exhausted": evidence.search_exhausted,
+            "freshness_expired": evidence.freshness_expired,
+            "details": dict(evidence.details),
+        }
+        return track
+
+    def mark_missing(self, object_id: str, evidence: LifecycleEvidence) -> SemanticTrack:
+        return self.transition(object_id, MISSING, evidence)
+
+    def mark_moved(self, object_id: str, position: np.ndarray, evidence: LifecycleEvidence) -> SemanticTrack:
+        track = self.transition(object_id, MOVED, evidence)
+        track.position = np.asarray(position, dtype=np.float64)
+        return track
+
+    def mark_lost(self, object_id: str, evidence: LifecycleEvidence) -> SemanticTrack:
+        return self.transition(object_id, LOST, evidence)
+
+    def _best_match(self, observation: SemanticObservation, excluded_object_ids: set[str]) -> SemanticTrack | None:
+        best_track = None
+        best_score = float("-inf")
+        for track in self.tracks.values():
+            if track.object_id in excluded_object_ids:
+                continue
+            if track.label.casefold() != observation.label.casefold():
+                continue
+            distance = float(np.linalg.norm(track.position - observation.position))
+            if distance > self.association_distance_m:
+                continue
+            similarity = cosine_similarity(track.embedding, observation.embedding)
+            if similarity is not None and similarity < self.embedding_similarity_threshold:
+                continue
+            distance_score = 1.0 - distance / self.association_distance_m
+            score = self.position_weight * distance_score
+            if similarity is not None:
+                score += (1.0 - self.position_weight) * similarity
+            if score > best_score:
+                best_track, best_score = track, score
+        return best_track

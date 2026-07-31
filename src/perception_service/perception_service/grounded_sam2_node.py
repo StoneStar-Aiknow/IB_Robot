@@ -40,11 +40,10 @@ class GroundedSAM2Node(Node):
         self._latest_depth_scale: float = 1000.0
 
         self.declare_parameter("device", "cuda")
-        self.declare_parameter("sam_checkpoint", "sam2.1_hiera_tiny.pt")
+        self.declare_parameter("sam_checkpoint", "grounded_sam2_swint_ogc/assets/sam2.1_hiera_tiny.pt")
         self.declare_parameter("sam_config", "configs/sam2.1/sam2.1_hiera_t.yaml")
-        self.declare_parameter("gdino_config", "GroundingDINO_SwinT_OGC.py")
-        self.declare_parameter("gdino_checkpoint", "groundingdino_swint_ogc.pth")
-        self.declare_parameter("gdino_text_encoder", "bert-base-uncased")
+        self.declare_parameter("gdino_checkpoint", "grounded_sam2_swint_ogc/assets/groundingdino_swint_ogc.pth")
+        self.declare_parameter("gdino_text_encoder", "grounded_sam2_swint_ogc/assets/bert-base-uncased")
         self.declare_parameter("model_dir", "")
         self.declare_parameter("rgb_topic", "/camera/wrist/image_raw")
         self.declare_parameter("depth_topic", "/camera/wrist/aligned_depth_to_color/image_raw")
@@ -55,7 +54,6 @@ class GroundedSAM2Node(Node):
         device = self.get_parameter("device").get_parameter_value().string_value
         sam_ckpt = self.get_parameter("sam_checkpoint").get_parameter_value().string_value
         sam_cfg = self.get_parameter("sam_config").get_parameter_value().string_value
-        gdino_cfg = self.get_parameter("gdino_config").get_parameter_value().string_value
         gdino_ckpt = self.get_parameter("gdino_checkpoint").get_parameter_value().string_value
         gdino_text_encoder = self.get_parameter("gdino_text_encoder").get_parameter_value().string_value
         model_dir = self.get_parameter("model_dir").get_parameter_value().string_value or None
@@ -65,7 +63,6 @@ class GroundedSAM2Node(Node):
             device=device,
             sam_checkpoint=sam_ckpt,
             sam_config=sam_cfg,
-            gdino_config=gdino_cfg,
             gdino_checkpoint=gdino_ckpt,
             gdino_text_encoder=gdino_text_encoder,
             model_dir=model_dir,

@@ -68,6 +68,12 @@ Launch builder 对每个 enabled entry 启动一个相互独立的 `perception_s
 模型打包流程，不通过服务启动时扫描大文件完成。通用层只用 dummy/echo plugin 做 CI 参考，生产 adapter 和具体
 service entry 由消费功能自行注册。
 
+语义建图在 `semantic_mapping.perception.semantic_roles` 中仅把 `sam2_masks`、`ram_plus_tags`、
+`siglip2_image`、`siglip2_text` 和可选 `gdino_confirmation` 绑定到上述 service ID。语义层验证每个 role 的
+精确 service type、required/optional policy、manifest semantic identity，以及 SigLIP image/text embedding
+metadata 兼容性；通用 parser 仍不维护模型 family 词表。有效 role bindings、service declarations、deployment
+fingerprint 和 semantic identity fingerprint 共同生成与路径和列表顺序无关的正 63-bit configuration generation。
+
 ## Sim camera pose override（仅限仿真标定，opt-in）
 
 仿真启动时，URDF / MJCF 中相机位姿默认来自 robot YAML 与

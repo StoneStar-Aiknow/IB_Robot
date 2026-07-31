@@ -114,6 +114,29 @@ Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `Vali
 | `volume_m3` | `float32` | 凸包体积，`0.0` 表示点数不足、几何退化或无法计算体积质心 |
 | `point_count` | `int32` | mask 内有效深度点数量 |
 
+### `DetectionArray.msg` / `DetectSegment.srv` 兼容边界
+
+`DetectSegment` 是订阅最新相机快照后按文本 prompt 检测的兼容接口。接口 schema 由 `ibrobot_msgs` 维护，
+`perception_service/grounded_sam2_node` 维护运行时兼容实现，`manipulation_service` 维护主抓取消费路径，
+`manipulation_execution` 维护检测回退路径。`grounded_sam2_snapshot` 是诊断消费者。
+
+离线语义建图不改变该接口，而使用显式携带图像的 `GenerateMasks`、`RecognizeTags`、
+`EncodeEmbeddings`、`EncodeText` 和 `GroundingDetect`。只有新确认链通过兼容测试且上述消费者全部迁移后，才能在明确的
+发布边界废弃 `DetectSegment`。
+
+### 显式图像感知服务
+
+| 服务 | 职责 |
+| --- | --- |
+| `GenerateMasks` | SAM2 无 prompt 盲扫，返回与输入同尺寸的 `mono8` masks |
+| `RecognizeTags` | RAM++ 整图打标，不把标签直接绑定到某个 mask |
+| `EncodeEmbeddings` | 一张图像最多 8 个 masks 的 SigLIP2 批量编码与候选标签匹配 |
+| `EncodeText` | 最多 16 条文本的 SigLIP2 查询时编码；不携带图像或持久 image embedding |
+| `GroundingDetect` | 显式图像输入的低频目标确认，不参与建图主链 |
+
+所有新服务返回 `ModelRuntimeInfo`。`EncodeText` 返回瞬时、归一化的查询文本向量，供语义地图内部与私有
+image embedding 比较；持久对象 embedding 仍是语义地图私有数据，不进入对象快照消息。
+
 ### `GraspCandidate.msg`
 
 机器人无关的抓取候选，用于 manipulation service 与执行脚本之间传递 GraspGen 结果。
@@ -129,6 +152,14 @@ Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `Vali
 | `width_axis_camera` | 宽度估计轴在相机坐标系下的单位方向 |
 | `target_width_min_offset_m` | 目标靠 `-width_axis_camera` 一侧的稳健边界，相对候选位姿原点 |
 | `target_width_max_offset_m` | 目标靠 `+width_axis_camera` 一侧的稳健边界，相对候选位姿原点 |
+
+### `SemanticObject3D.msg` / `SemanticObject3DArray.msg`
+
+3D 语义地图的持久目标接口。`object_id` 跨观测和进程重启保持稳定；`pose` 和 `size` 位于配置的
+持久固定坐标系，`first_seen`、`last_seen`、`observation_count` 和 `active` 描述目标生命周期。
+SigLIP 特征向量属于关联内部状态，不通过公共消息发布。
+`state`、`map_version`、`object_version` 和 readiness 字段用于 fail-closed 查询与动作准入；
+`stale`、`missing`、`lost` 对象可诊断查询但不得直接驱动导航或抓取。
 
 ### `RobotStatus.msg`
 
@@ -232,6 +263,13 @@ Episode 录制控制接口，由 `dataset_tools` 的录制服务提供。
 ---
 
 ## 3. 服务定义（srv/）
+
+### `GetSemanticObjects.srv`
+
+查询持久 3D 语义目标。空 `object_ids` 和空 `label` 表示不按对应字段过滤；`query_text` 通过感知服务的
+`EncodeText` 编码后，在语义地图边界内与私有 image embedding 比较。`states`、`min_confidence`、
+`max_age_sec`、`region_center`/`region_radius_m` 和 `max_results` 提供结构化过滤；`include_inactive` 控制
+是否返回 `stale`、`missing`、`lost` 等诊断对象。
 
 ### `PlanGrasp.srv`
 

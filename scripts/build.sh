@@ -303,7 +303,7 @@ if [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
         OPENEULER_SKIP_PACKAGES+=("sim_models")
     fi
     if [[ "${IBR_BUILD_INCLUDE_PERCEPTION_SERVICE_ON_OPENEULER:-0}" != "1" ]]; then
-        OPENEULER_SKIP_PACKAGES+=("perception_service" "vlm_task_planner")
+        OPENEULER_SKIP_PACKAGES+=("perception_service" "semantic_mapping" "vlm_task_planner")
     fi
     if [[ "${IBR_BUILD_INCLUDE_MANIPULATION_SERVICE_ON_OPENEULER:-0}" != "1" ]]; then
         OPENEULER_SKIP_PACKAGES+=("manipulation_service")

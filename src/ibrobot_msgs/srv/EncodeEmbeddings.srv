@@ -1,0 +1,9 @@
+sensor_msgs/Image image
+sensor_msgs/Image[] masks
+string[] candidate_labels
+---
+MaskEmbedding[] results
+ModelRuntimeInfo model
+float32 inference_time_ms
+bool success
+string message

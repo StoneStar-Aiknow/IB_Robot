@@ -52,6 +52,7 @@ known-first-party = [
     "tensormsg",
     "model_utils",
     "ibrobot_msgs",
+    "semantic_mapping",
 ]
 
 [tool.ruff.format]

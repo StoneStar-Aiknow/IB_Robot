@@ -34,6 +34,13 @@ robot:
     shoulder_link: shoulder
 
   skill_required_control_mode: "moveit_planning"
+  semantic_mapping:
+    enabled: false
+    migration:
+      grounded_sam2_node: compatibility
+      grounded_sam2_snapshot: diagnostic_only
+      perception_service_node: general_scene
+      embedded_mapping_backend: disabled
 
   grasp_execution:
     enabled: true

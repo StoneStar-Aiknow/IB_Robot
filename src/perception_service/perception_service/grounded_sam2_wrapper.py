@@ -6,6 +6,9 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .grounding_dino_config import GROUNDING_DINO_SWINT_OGC_CONFIG
+from .model_utils import DEFAULT_MODEL_DIR, resolve_model_path, resolve_text_encoder
+
 try:
     import cv2
     import numpy as np
@@ -19,21 +22,6 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 logger = logging.getLogger(__name__)
-
-
-def _find_workspace_root() -> Path:
-    p = Path(__file__).resolve()
-    for parent in p.parents:
-        if (parent / "src").is_dir() and (parent / ".git").exists():
-            return parent
-        if (parent / "models").is_dir():
-            return parent
-    return Path(".").resolve()
-
-
-_WORKSPACE_ROOT = _find_workspace_root()
-_DEFAULT_MODEL_DIR = _WORKSPACE_ROOT / "models" / "perception"
-_GDINO_CONFIG_DIR = Path(__file__).resolve().parent / "config" / "gdino"
 
 
 def volume_centroid_hull(points: np.ndarray) -> tuple[np.ndarray, float]:
@@ -75,35 +63,6 @@ def volume_centroid_hull(points: np.ndarray) -> tuple[np.ndarray, float]:
     if total_v < 1e-12:
         return points.mean(axis=0), 0.0
     return total_vc / total_v, total_v
-
-
-def _resolve_model_path(path_str: str, model_dir: Path) -> Path:
-    p = Path(path_str).expanduser()
-    if p.is_absolute():
-        return p
-    candidate = model_dir / p
-    if candidate.exists():
-        return candidate
-    workspace_models = Path(os.environ.get("IB_ROBOT_WORKSPACE", ".")).resolve() / "models" / "perception" / p
-    if workspace_models.exists():
-        return workspace_models
-    return candidate
-
-
-def _resolve_text_encoder_type(text_encoder: str, model_dir: Path) -> str:
-    p = Path(text_encoder).expanduser()
-    if p.is_absolute():
-        return str(p)
-
-    candidate = model_dir / p
-    if candidate.exists():
-        return str(candidate)
-
-    workspace_models = Path(os.environ.get("IB_ROBOT_WORKSPACE", ".")).resolve() / "models" / "perception" / p
-    if workspace_models.exists():
-        return str(workspace_models)
-
-    return text_encoder
 
 
 def _patch_transformers_bert_for_groundingdino() -> None:
@@ -168,29 +127,26 @@ class GroundedSAM2Wrapper:
     def __init__(
         self,
         device: str = "cuda",
-        sam_checkpoint: str = "sam2.1_hiera_tiny.pt",
+        sam_checkpoint: str = "grounded_sam2_swint_ogc/assets/sam2.1_hiera_tiny.pt",
         sam_config: str = "configs/sam2.1/sam2.1_hiera_t.yaml",
-        gdino_config: str = "GroundingDINO_SwinT_OGC.py",
-        gdino_checkpoint: str = "groundingdino_swint_ogc.pth",
-        gdino_text_encoder: str = "bert-base-uncased",
+        gdino_checkpoint: str = "grounded_sam2_swint_ogc/assets/groundingdino_swint_ogc.pth",
+        gdino_text_encoder: str = "grounded_sam2_swint_ogc/assets/bert-base-uncased",
         model_dir: str | None = None,
     ):
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-        self.device = device if torch.cuda.is_available() else "cpu"
+        self.device = device
 
-        base = Path(model_dir) if model_dir else _DEFAULT_MODEL_DIR
+        base = Path(model_dir) if model_dir else DEFAULT_MODEL_DIR
 
-        sam_ckpt = _resolve_model_path(sam_checkpoint, base)
+        sam_ckpt = resolve_model_path(sam_checkpoint, base)
         sam_cfg = sam_config
-        gdino_cfg = _GDINO_CONFIG_DIR / gdino_config
-        gdino_ckpt = _resolve_model_path(gdino_checkpoint, base)
-        text_encoder_type = _resolve_text_encoder_type(gdino_text_encoder, base)
+        gdino_ckpt = resolve_model_path(gdino_checkpoint, base)
+        text_encoder_type = resolve_text_encoder(gdino_text_encoder, base)
 
         for p, label in [
             (sam_ckpt, "SAM2 checkpoint"),
-            (gdino_cfg, "GDINO config"),
             (gdino_ckpt, "GDINO checkpoint"),
         ]:
             if not os.path.exists(p):
@@ -207,7 +163,7 @@ class GroundedSAM2Wrapper:
         self.sam_predictor = SAM2ImagePredictor(sam2_model)
 
         logger.info("Loading Grounding-DINO from %s", gdino_ckpt)
-        self.grounding_model = self._load_grounding_model(gdino_cfg, gdino_ckpt, text_encoder_type, self.device)
+        self.grounding_model = self._load_grounding_model(gdino_ckpt, text_encoder_type, self.device)
 
         if self.device == "cuda":
             torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
@@ -219,7 +175,6 @@ class GroundedSAM2Wrapper:
 
     @staticmethod
     def _load_grounding_model(
-        config_path: Path,
         checkpoint_path: Path,
         text_encoder_type: str,
         device: str,
@@ -230,7 +185,7 @@ class GroundedSAM2Wrapper:
 
         _patch_transformers_bert_for_groundingdino()
 
-        args = SLConfig.fromfile(str(config_path))
+        args = SLConfig(GROUNDING_DINO_SWINT_OGC_CONFIG.copy())
         args.device = device
         args.text_encoder_type = text_encoder_type
 

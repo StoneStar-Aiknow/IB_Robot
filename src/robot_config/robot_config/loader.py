@@ -22,6 +22,7 @@ from robot_config.config import (
     PeripheralConfig,
     RobotConfig,
     Ros2ControlConfig,
+    SemanticMappingConfig,
     SkillGatewayRuntimeConfig,
     VoiceASRConfig,
 )
@@ -55,6 +56,290 @@ def _is_finite_number(value: Any) -> bool:
         return math.isfinite(float(value))
     except OverflowError:
         return False
+
+
+def _required_string(section: dict[str, Any], key: str, path: str, errors: list[str]) -> None:
+    if not isinstance(section.get(key), str) or not section[key].strip():
+        errors.append(f"{path}.{key} must be a non-empty string")
+
+
+def _active_identity(section: dict[str, Any], key: str, path: str, errors: list[str]) -> None:
+    _required_string(section, key, path, errors)
+    value = section.get(key)
+    if isinstance(value, str) and value.startswith("REPLACE_WITH_"):
+        errors.append(f"{path}.{key} must be an active identity")
+
+
+def _positive_number(section: dict[str, Any], key: str, path: str, errors: list[str]) -> None:
+    value = section.get(key)
+    if not _is_finite_number(value) or float(value) <= 0.0:
+        errors.append(f"{path}.{key} must be a finite number greater than zero")
+
+
+def _positive_integer(section: dict[str, Any], key: str, path: str, errors: list[str]) -> None:
+    value = section.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        errors.append(f"{path}.{key} must be a positive integer")
+
+
+def _unit_interval(section: dict[str, Any], key: str, path: str, errors: list[str]) -> None:
+    value = section.get(key)
+    if not _is_finite_number(value) or not 0.0 <= float(value) <= 1.0:
+        errors.append(f"{path}.{key} must be in [0.0, 1.0]")
+
+
+def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the standalone semantic mapping SSOT contract."""
+    config = robot_config.get("semantic_mapping")
+    if config is None:
+        return []
+    if not isinstance(config, dict):
+        return ["semantic_mapping must be a mapping"]
+
+    errors: list[str] = []
+    enabled = config.get("enabled", False)
+    if not isinstance(enabled, bool):
+        return ["semantic_mapping.enabled must be a boolean"]
+
+    migration = config.get("migration", {})
+    if migration and not isinstance(migration, dict):
+        errors.append("semantic_mapping.migration must be a mapping")
+        migration = {}
+    migration_states = {
+        "grounded_sam2_node": {"compatibility", "disabled"},
+        "grounded_sam2_snapshot": {"diagnostic_only", "disabled"},
+        "perception_service_node": {"general_scene", "disabled"},
+        "embedded_mapping_backend": {"migration_only", "disabled"},
+    }
+    for key, valid_states in migration_states.items():
+        state = migration.get(key)
+        if state is not None and state not in valid_states:
+            errors.append(f"semantic_mapping.migration.{key} must be one of: {', '.join(sorted(valid_states))}")
+
+    grasp_execution = robot_config.get("grasp_execution", {})
+    if (
+        migration.get("grounded_sam2_node") == "disabled"
+        and isinstance(grasp_execution, dict)
+        and grasp_execution.get("enabled", False)
+        and grasp_execution.get("auto_start_dependencies", True)
+    ):
+        errors.append("semantic_mapping.migration.grounded_sam2_node cannot be disabled while grasp auto-start uses it")
+    embodied_perception = robot_config.get("embodied", {}).get("perception", {})
+    if (
+        migration.get("perception_service_node") == "disabled"
+        and isinstance(embodied_perception, dict)
+        and embodied_perception.get("enabled", False)
+    ):
+        errors.append(
+            "semantic_mapping.migration.perception_service_node cannot be disabled while embodied perception is enabled"
+        )
+    if not enabled:
+        return errors
+
+    section_names = (
+        "camera",
+        "slam",
+        "perception",
+        "persistence",
+        "filtering",
+        "queue",
+        "lifecycle",
+        "target_watch",
+        "interfaces",
+    )
+    sections: dict[str, dict[str, Any]] = {}
+    for name in section_names:
+        value = config.get(name)
+        if not isinstance(value, dict):
+            errors.append(f"semantic_mapping.{name} must be a mapping when semantic mapping is enabled")
+            value = {}
+        sections[name] = value
+
+    camera = sections["camera"]
+    camera_path = "semantic_mapping.camera"
+    for key in ("peripheral", "mounting", "parent_frame", "rgb_topic", "depth_topic", "camera_info_topic"):
+        _required_string(camera, key, camera_path, errors)
+    if camera.get("mounting") != "fixed":
+        errors.append("semantic_mapping.camera.mounting must be 'fixed'")
+    peripheral_name = camera.get("peripheral")
+    peripherals = robot_config.get("peripherals", [])
+    matching = [item for item in peripherals if isinstance(item, dict) and item.get("name") == peripheral_name]
+    if not matching or matching[0].get("type") != "camera":
+        errors.append("semantic_mapping.camera.peripheral must reference a configured camera peripheral")
+    else:
+        peripheral = matching[0]
+        if peripheral.get("driver") != "realsense":
+            errors.append("semantic_mapping.camera.peripheral must use the realsense driver")
+        if not peripheral.get("align_depth", False):
+            errors.append("semantic_mapping.camera.peripheral must enable aligned depth")
+        if peripheral.get("transform", {}).get("parent_frame") != camera.get("parent_frame"):
+            errors.append(
+                "semantic_mapping.camera.parent_frame must match the camera peripheral transform parent_frame"
+            )
+    if camera.get("depth_topic") == camera.get("rgb_topic"):
+        errors.append("semantic_mapping.camera.depth_topic must differ from rgb_topic")
+
+    slam = sections["slam"]
+    slam_path = "semantic_mapping.slam"
+    for key in (
+        "global_frame",
+        "cloud_map_topic",
+        "active_map_hash_topic",
+        "localization_ready_topic",
+        "authoritative_map_odom_topic",
+        "geometry_map_id",
+        "coordinate_convention",
+        "map_odom_authority",
+    ):
+        _required_string(slam, key, slam_path, errors)
+    for key in ("geometry_map_hash", "localization_session_id", "calibration_id", "urdf_hash"):
+        _active_identity(slam, key, slam_path, errors)
+    if slam.get("global_frame") == "odom":
+        errors.append("semantic_mapping.slam.global_frame must be a persistent global frame, not 'odom'")
+    if slam.get("map_odom_authority") != "slam":
+        errors.append("semantic_mapping.slam.map_odom_authority must be 'slam'")
+
+    perception = sections["perception"]
+    perception_path = "semantic_mapping.perception"
+    mapping_backend = perception.get("mapping_backend")
+    if mapping_backend not in {"service", "embedded"}:
+        errors.append("semantic_mapping.perception.mapping_backend must be 'service' or 'embedded'")
+    for legacy_field in (
+        "model_backend",
+        "model_identities",
+        "sam_service",
+        "ram_plus_service",
+        "siglip2_service",
+        "encode_text_service",
+        "grounding_service",
+    ):
+        if legacy_field in perception:
+            errors.append(
+                f"semantic_mapping.perception.{legacy_field} is unsupported; bind semantic_roles to perception_services.services IDs"
+            )
+    _positive_number(perception, "service_wait_sec", perception_path, errors)
+    if mapping_backend == "service":
+        errors.extend(_validate_semantic_service_roles(robot_config, perception))
+    elif mapping_backend == "embedded" and not bool(perception.get("allow_legacy_embedded", False)):
+        errors.append("semantic_mapping.perception.allow_legacy_embedded must be true for the migration-only backend")
+    if mapping_backend == "embedded" and migration.get("embedded_mapping_backend") != "migration_only":
+        errors.append(
+            "semantic_mapping.migration.embedded_mapping_backend must be 'migration_only' for the embedded backend"
+        )
+
+    persistence = sections["persistence"]
+    for key in ("database_path", "artifact_output_dir"):
+        _required_string(persistence, key, "semantic_mapping.persistence", errors)
+
+    filtering = sections["filtering"]
+    filtering_path = "semantic_mapping.filtering"
+    _positive_number(filtering, "depth_trunc_m", filtering_path, errors)
+    for key in ("min_points", "min_mask_pixels"):
+        _positive_integer(filtering, key, filtering_path, errors)
+    for key in (
+        "min_frame_valid_depth_ratio",
+        "min_mask_area_ratio",
+        "min_mask_valid_depth_ratio",
+        "max_mask_overlap_ratio",
+    ):
+        _unit_interval(filtering, key, filtering_path, errors)
+
+    queue = sections["queue"]
+    queue_path = "semantic_mapping.queue"
+    for key in ("sync_queue_size", "frame_capacity", "max_masks_per_batch"):
+        _positive_integer(queue, key, queue_path, errors)
+    for key in ("sync_slop_sec", "tf_timeout_sec", "processing_interval_sec"):
+        _positive_number(queue, key, queue_path, errors)
+    if queue.get("policy") not in {"drop_oldest", "drop_newest", "backpressure"}:
+        errors.append("semantic_mapping.queue.policy must be 'drop_oldest', 'drop_newest', or 'backpressure'")
+    max_masks = queue.get("max_masks_per_batch")
+    if isinstance(max_masks, int) and not isinstance(max_masks, bool) and max_masks > 8:
+        errors.append("semantic_mapping.queue.max_masks_per_batch must be <= 8")
+
+    lifecycle = sections["lifecycle"]
+    lifecycle_path = "semantic_mapping.lifecycle"
+    for key in ("association_distance_m", "stale_after_sec", "move_stability_m"):
+        _positive_number(lifecycle, key, lifecycle_path, errors)
+    _positive_integer(lifecycle, "move_confirmations", lifecycle_path, errors)
+    for key in ("association_position_weight", "embedding_similarity_threshold"):
+        _unit_interval(lifecycle, key, lifecycle_path, errors)
+
+    target_watch = sections["target_watch"]
+    target_watch_path = "semantic_mapping.target_watch"
+    _positive_integer(target_watch, "max_attempts", target_watch_path, errors)
+    for key in ("stand_off_distance_m", "clearance_m"):
+        _positive_number(target_watch, key, target_watch_path, errors)
+    for key in (
+        "scan_profile",
+        "footprint_ready_topic",
+        "obstacle_map_ready_topic",
+        "reachability_ready_topic",
+    ):
+        _required_string(target_watch, key, target_watch_path, errors)
+
+    interfaces = sections["interfaces"]
+    for key in ("semantic_map_topic", "object_cloud_topic", "query_service", "target_service"):
+        _required_string(interfaces, key, "semantic_mapping.interfaces", errors)
+    return errors
+
+
+_SEMANTIC_SERVICE_TYPES = {
+    "sam2_masks": "ibrobot_msgs/srv/GenerateMasks",
+    "ram_plus_tags": "ibrobot_msgs/srv/RecognizeTags",
+    "siglip2_image": "ibrobot_msgs/srv/EncodeEmbeddings",
+    "siglip2_text": "ibrobot_msgs/srv/EncodeText",
+    "gdino_confirmation": "ibrobot_msgs/srv/GroundingDetect",
+}
+_CONSTRUCTION_ROLES = frozenset({"sam2_masks", "ram_plus_tags", "siglip2_image"})
+
+
+def _validate_semantic_service_roles(robot_config: dict[str, Any], perception: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    roles = perception.get("semantic_roles")
+    if not isinstance(roles, dict):
+        return ["semantic_mapping.perception.semantic_roles must be a mapping"]
+    unknown_roles = sorted(set(roles) - set(_SEMANTIC_SERVICE_TYPES))
+    if unknown_roles:
+        errors.append(f"semantic_mapping.perception.semantic_roles contains unsupported roles: {unknown_roles}")
+    for role in _CONSTRUCTION_ROLES | {"siglip2_text"}:
+        _required_string(roles, role, "semantic_mapping.perception.semantic_roles", errors)
+
+    try:
+        runtime = parse_perception_runtime_config(robot_config)
+    except PerceptionRuntimeConfigError:
+        return errors
+    services = {service.instance_id: service for service in runtime.services}
+    bound = {}
+    for role, instance_id in roles.items():
+        if role not in _SEMANTIC_SERVICE_TYPES or not isinstance(instance_id, str) or not instance_id:
+            continue
+        service = services.get(instance_id)
+        path = f"semantic_mapping.perception.semantic_roles.{role}"
+        if service is None:
+            errors.append(f"{path} references unknown perception service {instance_id!r}")
+            continue
+        if not service.enabled:
+            errors.append(f"{path} references disabled perception service {instance_id!r}")
+            continue
+        if service.service_type != _SEMANTIC_SERVICE_TYPES[role]:
+            errors.append(f"{path} must reference service type {_SEMANTIC_SERVICE_TYPES[role]}")
+        if (role in _CONSTRUCTION_ROLES) != service.required:
+            policy = "required" if role in _CONSTRUCTION_ROLES else "optional"
+            errors.append(f"{path} must reference an enabled {policy} service")
+        manifest = service.validated_manifest.manifest if service.validated_manifest else None
+        identity = manifest.model.semantic_identity if manifest else None
+        if identity is None:
+            errors.append(f"{path} service manifest must declare model.semantic_identity")
+        bound[role] = identity
+
+    image_identity = bound.get("siglip2_image")
+    text_identity = bound.get("siglip2_text")
+    if image_identity is not None and text_identity is not None:
+        image_embedding = image_identity.embedding
+        text_embedding = text_identity.embedding
+        if image_embedding is None or text_embedding is None or image_embedding != text_embedding:
+            errors.append("semantic_mapping SigLIP2 image/text services must declare compatible embedding metadata")
+    return errors
 
 
 def _validate_skill_description(
@@ -622,6 +907,7 @@ def load_robot_config_dict(config_path: str | Path | None = None) -> dict[str, A
         parse_perception_runtime_config(robot_config)
     except PerceptionRuntimeConfigError as exc:
         validation_errors.append(str(exc))
+    validation_errors.extend(validate_semantic_mapping_config(robot_config))
     if validation_errors:
         raise ValueError("Invalid robot configuration:\n- " + "\n- ".join(validation_errors))
     robot_config["_config_path"] = str(resolved_config_path)
@@ -666,6 +952,10 @@ def load_camera_config(data: dict[str, Any]) -> CameraConfig:
         depth_width=data.get("depth_width"),
         depth_height=data.get("depth_height"),
         depth_fps=data.get("depth_fps"),
+        enable_pointcloud=data.get("enable_pointcloud", False),
+        enable_sync=data.get("enable_sync", True),
+        align_depth=data.get("align_depth", False),
+        transform=data.get("transform"),
     )
 
 
@@ -780,6 +1070,23 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
     )
 
 
+def load_semantic_mapping_config(data: dict[str, Any]) -> SemanticMappingConfig:
+    """Load the standalone semantic mapping section without flattening its contracts."""
+    return SemanticMappingConfig(
+        enabled=data.get("enabled", False),
+        camera=dict(data.get("camera", {})),
+        slam=dict(data.get("slam", {})),
+        perception=dict(data.get("perception", {})),
+        persistence=dict(data.get("persistence", {})),
+        filtering=dict(data.get("filtering", {})),
+        queue=dict(data.get("queue", {})),
+        lifecycle=dict(data.get("lifecycle", {})),
+        target_watch=dict(data.get("target_watch", {})),
+        interfaces=dict(data.get("interfaces", {})),
+        migration=dict(data.get("migration", {})),
+    )
+
+
 def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
     """Load embodied minimal-closure configuration from dict."""
     execution = data.get("execution", {})
@@ -884,6 +1191,8 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         task_budget_sec=embodied.timeouts["task_budget_sec"],
         rpc_timeout_sec=embodied.timeouts["rpc_timeout_sec"],
     )
+    semantic_mapping = load_semantic_mapping_config(robot_data.get("semantic_mapping", {}))
+    perception_services = parse_perception_runtime_config(robot_data)
 
     return RobotConfig(
         name=name,
@@ -895,6 +1204,8 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         voice_asr=voice_asr,
         embodied=embodied,
         skill_gateway=skill_gateway,
+        semantic_mapping=semantic_mapping,
+        perception_services=perception_services,
     )
 
 
@@ -1017,6 +1328,60 @@ def validate_config(config: RobotConfig) -> list[str]:
         List of error messages (empty if valid)
     """
     errors = []
+
+    semantic_mapping_dict = {
+        "enabled": config.semantic_mapping.enabled,
+        "camera": config.semantic_mapping.camera,
+        "slam": config.semantic_mapping.slam,
+        "perception": config.semantic_mapping.perception,
+        "persistence": config.semantic_mapping.persistence,
+        "filtering": config.semantic_mapping.filtering,
+        "queue": config.semantic_mapping.queue,
+        "lifecycle": config.semantic_mapping.lifecycle,
+        "target_watch": config.semantic_mapping.target_watch,
+        "interfaces": config.semantic_mapping.interfaces,
+        "migration": config.semantic_mapping.migration,
+    }
+    errors.extend(
+        validate_semantic_mapping_config(
+            {
+                "semantic_mapping": semantic_mapping_dict,
+                "perception_services": {
+                    "services": [
+                        {
+                            "id": service.instance_id,
+                            "enabled": service.enabled,
+                            "required": service.required,
+                            **(
+                                {
+                                    "bundle_path": str(service.bundle_path),
+                                    "deployment": service.deployment,
+                                    "adapter_class": service.adapter_class,
+                                    "service_type": service.service_type,
+                                    "endpoint": service.endpoint,
+                                    "node_name": service.node_name,
+                                    "runtime_options": dict(service.runtime_options),
+                                }
+                                if service.enabled
+                                else {}
+                            ),
+                        }
+                        for service in (config.perception_services.services if config.perception_services else ())
+                    ]
+                },
+                "peripherals": [
+                    {
+                        "type": "camera" if isinstance(peripheral, CameraConfig) else peripheral.type,
+                        "name": peripheral.name,
+                        "driver": peripheral.driver,
+                        "align_depth": peripheral.align_depth if isinstance(peripheral, CameraConfig) else False,
+                        "transform": peripheral.transform if isinstance(peripheral, CameraConfig) else {},
+                    }
+                    for peripheral in config.peripherals
+                ],
+            }
+        )
+    )
 
     # Validate ros2_control config
     if not config.ros2_control.hardware_plugin:

@@ -1,0 +1,7 @@
+string[] texts
+---
+TextEmbedding[] results
+ModelRuntimeInfo model
+float32 inference_time_ms
+bool success
+string message

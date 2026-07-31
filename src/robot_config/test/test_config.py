@@ -592,6 +592,8 @@ def test_load_single_arm_config_dict_preserves_launch_schema():
     assert "joints" in config
     assert "simulation" in config
     assert config["_config_path"] == str(config_path.resolve())
+    assert "semantic_mapping" in config
+    assert "semantic_mapping" not in config["embodied"]["perception"]
 
 
 def test_so101_single_arm_uses_degrees_for_lerobot_joint_conversion():
