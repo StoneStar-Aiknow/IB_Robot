@@ -16,6 +16,8 @@ from ibrobot_msgs.msg import (
     InferencePolicySummary,
     VariantsList,
 )
+from ibrobot_msgs.msg import VideoStreamDescriptor as VideoStreamDescriptorMessage
+from ibrobot_msgs.msg import VideoStreamStatus as VideoStreamStatusMessage
 from tensormsg.converter import TensorMsgConverter
 
 from .types import (
@@ -28,7 +30,14 @@ from .types import (
     PipelineIdentity,
     PipelineStatus,
     PolicySummary,
+    StreamReference,
     StructuredError,
+)
+from .video_streams import (
+    VIDEO_DESCRIPTOR_FIELDS,
+    VIDEO_STATUS_FIELDS,
+    VideoStreamDescriptor,
+    VideoStreamRuntimeStatus,
 )
 
 
@@ -101,6 +110,9 @@ def request_to_message(request: DistributedRequest) -> DistributedInferenceReque
         message.deadline.sec = int(seconds)
         message.deadline.nanosec = int((seconds - int(seconds)) * 1_000_000_000)
     message.prompt = request.prompt or ""
+    _nanoseconds_to_time(request.observation_timestamp_ns, message.observation_timestamp)
+    message.stream_observation_keys = [reference.observation_key for reference in request.stream_references]
+    message.stream_ids = [reference.stream_id for reference in request.stream_references]
     message.tensors = TensorMsgConverter.to_variant(dict(request.inputs))
     return message
 
@@ -111,6 +123,8 @@ def request_from_message(message: DistributedInferenceRequest) -> DistributedReq
             f"unsupported distributed protocol version {message.protocol_version}; expected {PROTOCOL_VERSION}"
         )
     deadline = _datetime_from_message(message.deadline.sec, message.deadline.nanosec)
+    if len(message.stream_observation_keys) != len(message.stream_ids):
+        raise ValueError("distributed request stream reference arrays must have equal length")
     return DistributedRequest(
         operation=Operation(message.operation),
         pipeline_id=message.pipeline_id,
@@ -122,6 +136,47 @@ def request_from_message(message: DistributedInferenceRequest) -> DistributedReq
         inputs=TensorMsgConverter.from_variant(message.tensors),
         prompt=message.prompt or None,
         deadline=deadline,
+        observation_timestamp_ns=_time_to_nanoseconds(message.observation_timestamp),
+        stream_references=tuple(
+            StreamReference(observation_key, stream_id)
+            for observation_key, stream_id in zip(
+                message.stream_observation_keys,
+                message.stream_ids,
+                strict=True,
+            )
+        ),
+    )
+
+
+def video_descriptor_to_message(
+    descriptor: VideoStreamDescriptor, *, stamp: Any | None = None
+) -> VideoStreamDescriptorMessage:
+    message = VideoStreamDescriptorMessage()
+    if stamp is not None:
+        message.header.stamp = stamp
+    for field_name in VIDEO_DESCRIPTOR_FIELDS:
+        setattr(message, field_name, getattr(descriptor, field_name))
+    return message
+
+
+def video_descriptor_from_message(message: VideoStreamDescriptorMessage) -> VideoStreamDescriptor:
+    return VideoStreamDescriptor(**{field_name: getattr(message, field_name) for field_name in VIDEO_DESCRIPTOR_FIELDS})
+
+
+def video_status_to_message(status: VideoStreamRuntimeStatus, *, stamp: Any | None = None) -> VideoStreamStatusMessage:
+    message = VideoStreamStatusMessage()
+    if stamp is not None:
+        message.header.stamp = stamp
+    for field_name in VIDEO_STATUS_FIELDS:
+        setattr(message, field_name, getattr(status, field_name))
+    _nanoseconds_to_time(status.mapping_capture_timestamp_ns, message.mapping_capture_time)
+    return message
+
+
+def video_status_from_message(message: VideoStreamStatusMessage) -> VideoStreamRuntimeStatus:
+    return VideoStreamRuntimeStatus(
+        **{field_name: getattr(message, field_name) for field_name in VIDEO_STATUS_FIELDS},
+        mapping_capture_timestamp_ns=_time_to_nanoseconds(message.mapping_capture_time),
     )
 
 
@@ -289,6 +344,14 @@ def _datetime_from_message(seconds: int, nanoseconds: int) -> datetime | None:
     if seconds == 0 and nanoseconds == 0:
         return None
     return datetime.fromtimestamp(seconds + nanoseconds / 1_000_000_000, tz=timezone.utc)
+
+
+def _nanoseconds_to_time(timestamp_ns: int, message: Any) -> None:
+    message.sec, message.nanosec = divmod(timestamp_ns, 1_000_000_000)
+
+
+def _time_to_nanoseconds(message: Any) -> int:
+    return int(message.sec) * 1_000_000_000 + int(message.nanosec)
 
 
 def _json_default(value: object) -> object:

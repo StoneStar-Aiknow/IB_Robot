@@ -857,6 +857,58 @@ def test_health_exception_is_not_masked_by_previous_error():
     assert published[0].message == "health unavailable"
 
 
+def test_distributed_health_augments_existing_keys_with_stream_summaries():
+    published = []
+    snapshot = SimpleNamespace(
+        observation_key="observation.images.top",
+        stream_id="top",
+        mode="rtp",
+        configured_encoder_backend="auto",
+        selected_encoder_backend="software",
+        configured_decoder_backend="software",
+        selected_decoder_backend="not-local",
+        endpoint=("127.0.0.1", 5004),
+        contract_fingerprint="contract",
+        deployment_fingerprint="deployment",
+        security="none/trusted-network-only",
+        lifecycle_state="configured",
+        ready=False,
+    )
+    session = SimpleNamespace(
+        ready=True,
+        state=SimpleNamespace(value="ready"),
+        session=("session", 1),
+    )
+    node = SimpleNamespace(
+        _config=SimpleNamespace(execution_mode="distributed", pipeline_id="policy", deployment="cpu"),
+        _manifest=SimpleNamespace(
+            fingerprint="deployment",
+            manifest=SimpleNamespace(bundle=SimpleNamespace(name="bundle")),
+            deployment=SimpleNamespace(backend="torch"),
+        ),
+        _remote_state="ready",
+        _require_edge_session=lambda: session,
+        _video_stream_manager=SimpleNamespace(diagnostic_snapshots=lambda: (snapshot,)),
+        _inference_count=3,
+        _last_inference_time=1.5,
+        _last_error="",
+        _health_pub=SimpleNamespace(publish=published.append),
+        _format_video_stream_diagnostic=PipelinePolicyNode._format_video_stream_diagnostic,
+    )
+
+    PipelinePolicyNode._publish_health(node)
+
+    values = {item.key: item.value for item in published[0].values}
+    assert values["pipeline_id"] == "policy"
+    assert values["backend"] == "torch"
+    assert values["inference_count"] == "3"
+    assert values["video_stream.count"] == "1"
+    summary = json.loads(values["video_stream.observation.images.top"])
+    assert summary["endpoint"] == "127.0.0.1:5004"
+    assert summary["security"] == "none/trusted-network-only"
+    assert summary["ready"] is False
+
+
 def test_late_distributed_cancel_fails_session_before_rejecting_action():
     published = []
     failure = SimpleNamespace(invalidated_request_ids=(), error=None)

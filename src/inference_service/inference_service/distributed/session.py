@@ -19,6 +19,7 @@ from .types import (
     PeerRole,
     PipelineIdentity,
     PipelineStatus,
+    StreamReference,
     StructuredError,
     identity_error,
 )
@@ -195,6 +196,8 @@ class EdgeSession:
         prompt: str | None = None,
         deadline: datetime | None = None,
         target_request_id: str = "",
+        observation_timestamp_ns: int = 0,
+        stream_references: tuple[StreamReference, ...] = (),
     ) -> DistributedRequest:
         with self._lock:
             return self._prepare_request_locked(
@@ -204,6 +207,8 @@ class EdgeSession:
                 prompt=prompt,
                 deadline=deadline,
                 target_request_id=target_request_id,
+                observation_timestamp_ns=observation_timestamp_ns,
+                stream_references=stream_references,
             )
 
     def dispatch_request(
@@ -216,6 +221,8 @@ class EdgeSession:
         prompt: str | None = None,
         deadline: datetime | None = None,
         target_request_id: str = "",
+        observation_timestamp_ns: int = 0,
+        stream_references: tuple[StreamReference, ...] = (),
     ) -> DistributedRequest:
         """Register and transmit one request without an invalidation window."""
 
@@ -227,6 +234,8 @@ class EdgeSession:
                 prompt=prompt,
                 deadline=deadline,
                 target_request_id=target_request_id,
+                observation_timestamp_ns=observation_timestamp_ns,
+                stream_references=stream_references,
             )
             try:
                 sender(request)
@@ -244,6 +253,8 @@ class EdgeSession:
         prompt: str | None,
         deadline: datetime | None,
         target_request_id: str,
+        observation_timestamp_ns: int,
+        stream_references: tuple[StreamReference, ...],
     ) -> DistributedRequest:
         if self._state.state is not PipelineState.READY or not self._session_id:
             raise DistributedProtocolError(
@@ -300,6 +311,8 @@ class EdgeSession:
             prompt=prompt,
             deadline=deadline,
             target_request_id=target_request_id,
+            observation_timestamp_ns=observation_timestamp_ns,
+            stream_references=stream_references,
         )
         self._pending[request_id] = (operation, target_request_id)
         return request
@@ -401,8 +414,14 @@ class EdgeSession:
 class CloudSession:
     """Own cloud session generations and validate every routed operation."""
 
-    def __init__(self, identity: PipelineIdentity) -> None:
+    def __init__(
+        self,
+        identity: PipelineIdentity,
+        *,
+        request_stream_validator: Callable[[tuple[StreamReference, ...]], None] | None = None,
+    ) -> None:
         self.identity = identity
+        self._request_stream_validator = request_stream_validator
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._rollover_lock = threading.Lock()
@@ -580,6 +599,18 @@ class CloudSession:
                 raise DistributedProtocolError(
                     StructuredError(code=code, message=message, stage="routing", recoverable=True)
                 )
+        if self._request_stream_validator is not None and request.operation is Operation.INFER:
+            try:
+                self._request_stream_validator(request.stream_references)
+            except Exception as exc:
+                error = StructuredError(
+                    code=str(getattr(exc, "code", "stream_negotiation_failed")),
+                    message=str(exc) or type(exc).__name__,
+                    stage="handshake",
+                    recoverable=bool(getattr(exc, "recoverable", False)),
+                    details=getattr(exc, "details", {}),
+                )
+                raise DistributedProtocolError(error) from exc
         if request.deadline is not None and datetime.now(timezone.utc) >= request.deadline.astimezone(timezone.utc):
             raise DistributedProtocolError(
                 StructuredError(

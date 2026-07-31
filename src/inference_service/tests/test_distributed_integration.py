@@ -401,21 +401,17 @@ def test_edge_session_failure_is_terminal_and_invalidates_pending_requests(tmp_p
     assert not transport.edge.ready
 
 
-def test_edge_processor_runtime_blocks_inference_after_reset_failure():
+def test_edge_processor_runtime_has_no_lerobot_processor_state():
     runtime = EdgeProcessorRuntime.__new__(EdgeProcessorRuntime)
+    runtime.pipeline_id = "policy"
     runtime._loaded = True
-    runtime._reset_error = None
     runtime._default_task = None
+    runtime._manifest = SimpleNamespace(policy=SimpleNamespace(output_features={"action": SimpleNamespace(shape=(6,))}))
 
-    def fail_reset():
-        raise RuntimeError("processor reset failed")
-
-    runtime._preprocessor = SimpleNamespace(reset=fail_reset)
-
-    with pytest.raises(RuntimeError, match="processor reset failed"):
-        runtime.reset()
-    with pytest.raises(RuntimeError, match="unavailable after reset failure"):
-        runtime.preprocess({"observation.state": np.zeros((1, 6), dtype=np.float32)})
+    inputs = {"observation.state": np.zeros((1, 6), dtype=np.float32)}
+    assert runtime.preprocess(inputs) == inputs
+    runtime.reset()
+    assert runtime.postprocess(np.zeros((1, 6), dtype=np.float32), actual_chunk_size=1).shape == (1, 6)
 
 
 def test_edge_processor_runtime_deadline_after_successful_reset_does_not_poison_runtime():
