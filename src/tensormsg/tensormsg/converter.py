@@ -1,6 +1,6 @@
 # tensormsg/converter.py
-import logging
 from collections.abc import Sequence
+from numbers import Integral
 from typing import Any
 
 import numpy as np
@@ -11,7 +11,17 @@ from torch import Tensor
 from tensormsg.registry import DECODER_REGISTRY, ENCODER_REGISTRY, register_decoder, register_encoder
 from tensormsg.utils import dot_get, dot_set, nearest_resize_any, nearest_resize_rgb
 
-logger = logging.getLogger(__name__)
+_COLOR_ENCODING_CHANNELS = {
+    "mono8": 1,
+    "8uc1": 1,
+    "rgb8": 3,
+    "bgr8": 3,
+    "8uc3": 3,
+    "rgba8": 4,
+    "bgra8": 4,
+    "8uc4": 4,
+}
+_BT709_COLOR_RANGES = {"limited", "full"}
 
 
 class TensorMsgConverter:
@@ -84,6 +94,227 @@ class TensorMsgConverter:
 
 
 # ---------- Internal Helpers ----------
+
+
+def _validated_resize(resize: Sequence[int] | None) -> tuple[int, int] | None:
+    if resize is None:
+        return None
+    if isinstance(resize, str | bytes):
+        raise ValueError("image resize must contain exactly (height, width)")
+    try:
+        height, width = resize
+    except (TypeError, ValueError) as exc:
+        raise ValueError("image resize must contain exactly (height, width)") from exc
+    if (
+        isinstance(height, bool)
+        or isinstance(width, bool)
+        or not isinstance(height, Integral)
+        or not isinstance(width, Integral)
+    ):
+        raise ValueError("image resize dimensions must be positive integers")
+    resize_hw = (int(height), int(width))
+    if resize_hw[0] <= 0 or resize_hw[1] <= 0:
+        raise ValueError("image resize dimensions must be positive integers")
+    return resize_hw
+
+
+def _image_rows(msg: Any, packed_row_bytes: int) -> np.ndarray:
+    height = int(msg.height)
+    width = int(msg.width)
+    if height <= 0 or width <= 0:
+        raise ValueError(f"image dimensions must be positive, got {height}x{width}")
+
+    step = int(getattr(msg, "step", 0)) or packed_row_bytes
+    if step < packed_row_bytes:
+        raise ValueError(f"image step {step} is smaller than packed row size {packed_row_bytes}")
+
+    raw = np.frombuffer(msg.data, dtype=np.uint8)
+    required = height * step
+    if raw.size < required:
+        raise ValueError(
+            f"image data has {raw.size} bytes, expected at least {required} for height={height}, step={step}"
+        )
+    return raw[:required].reshape(height, step)[:, :packed_row_bytes]
+
+
+def decoded_frame_to_hwc_uint8(
+    frame: np.ndarray,
+    *,
+    encoding: str,
+    output_encoding: str = "rgb8",
+    resize: Sequence[int] | None = None,
+) -> np.ndarray:
+    """Convert a backend-decoded color frame to contiguous RGB or BGR HWC uint8."""
+    source_encoding = str(encoding).lower()
+    target_encoding = str(output_encoding).lower()
+    if source_encoding not in _COLOR_ENCODING_CHANNELS:
+        raise ValueError(f"Unsupported color image encoding '{source_encoding}'")
+    if target_encoding not in ("rgb8", "bgr8"):
+        raise ValueError(f"output_encoding must be 'rgb8' or 'bgr8', got '{target_encoding}'")
+
+    image = np.asarray(frame)
+    if image.dtype != np.uint8:
+        raise ValueError(f"color image dtype must be uint8, got {image.dtype}")
+    channels = _COLOR_ENCODING_CHANNELS[source_encoding]
+    expected_shape = image.shape[:2] if channels == 1 else (*image.shape[:2], channels)
+    if image.ndim != (2 if channels == 1 else 3) or image.shape != expected_shape:
+        shape = "HxW" if channels == 1 else f"HxWx{channels}"
+        raise ValueError(f"encoding '{source_encoding}' requires a {shape} frame, got shape {image.shape}")
+    if image.shape[0] <= 0 or image.shape[1] <= 0:
+        raise ValueError(f"image dimensions must be positive, got {image.shape[0]}x{image.shape[1]}")
+
+    if channels == 1:
+        color = np.repeat(image[..., None], 3, axis=-1)
+    else:
+        color = image[..., :3]
+        source_is_rgb = source_encoding in ("rgb8", "rgba8")
+        if source_is_rgb != (target_encoding == "rgb8"):
+            color = color[..., ::-1]
+
+    resize_hw = _validated_resize(resize)
+    if resize_hw is not None:
+        color = nearest_resize_rgb(color, *resize_hw)
+    return np.ascontiguousarray(color, dtype=np.uint8)
+
+
+def ros_image_to_hwc_uint8(
+    msg: Any, *, output_encoding: str = "rgb8", resize: Sequence[int] | None = None
+) -> np.ndarray:
+    """Extract a padded ``sensor_msgs/Image`` as contiguous encoder-ready HWC uint8."""
+    encoding = str(getattr(msg, "encoding", "bgr8")).lower()
+    channels = _COLOR_ENCODING_CHANNELS.get(encoding)
+    if channels is None:
+        raise ValueError(f"Unsupported color image encoding '{encoding}'")
+    packed = _image_rows(msg, int(msg.width) * channels)
+    if channels == 1:
+        frame = packed.reshape(int(msg.height), int(msg.width))
+    else:
+        frame = packed.reshape(int(msg.height), int(msg.width), channels)
+    return decoded_frame_to_hwc_uint8(
+        frame,
+        encoding=encoding,
+        output_encoding=output_encoding,
+        resize=resize,
+    )
+
+
+def decoded_frame_to_chw_float(
+    frame: np.ndarray,
+    *,
+    encoding: str,
+    output_encoding: str = "rgb8",
+    resize: Sequence[int] | None = None,
+) -> np.ndarray:
+    """Convert a backend-decoded color frame to canonical contiguous CHW float32."""
+    hwc = decoded_frame_to_hwc_uint8(
+        frame,
+        encoding=encoding,
+        output_encoding=output_encoding,
+        resize=resize,
+    )
+    return np.ascontiguousarray(np.transpose(hwc, (2, 0, 1)), dtype=np.float32) / 255.0
+
+
+def hwc_uint8_to_nv12(
+    frame: np.ndarray,
+    *,
+    encoding: str = "rgb8",
+    color_space: str = "bt709",
+    color_range: str = "limited",
+    stride: int | None = None,
+) -> np.ndarray:
+    """Convert RGB/BGR HWC uint8 into an optionally padded NV12 surface."""
+    if color_space.lower() != "bt709":
+        raise ValueError(f"NV12 color_space must be 'bt709', got {color_space!r}")
+    normalized_range = color_range.lower()
+    if normalized_range not in _BT709_COLOR_RANGES:
+        raise ValueError(f"NV12 color_range must be one of {sorted(_BT709_COLOR_RANGES)}, got {color_range!r}")
+    rgb = decoded_frame_to_hwc_uint8(frame, encoding=encoding, output_encoding="rgb8")
+    height, width, _ = rgb.shape
+    if height % 2 or width % 2:
+        raise ValueError(f"NV12 requires even dimensions, got {height}x{width}")
+    surface_stride = width if stride is None else int(stride)
+    if surface_stride < width:
+        raise ValueError(f"NV12 stride {surface_stride} is smaller than width {width}")
+
+    red = rgb[..., 0].astype(np.float32)
+    green = rgb[..., 1].astype(np.float32)
+    blue = rgb[..., 2].astype(np.float32)
+    if normalized_range == "limited":
+        y_plane = 16.0 + 0.182586 * red + 0.614231 * green + 0.062007 * blue
+        u_plane = 128.0 - 0.100644 * red - 0.338572 * green + 0.439216 * blue
+        v_plane = 128.0 + 0.439216 * red - 0.398942 * green - 0.040274 * blue
+    else:
+        y_plane = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+        u_plane = 128.0 - 0.114572 * red - 0.385428 * green + 0.5 * blue
+        v_plane = 128.0 + 0.5 * red - 0.454153 * green - 0.045847 * blue
+
+    u_subsampled = u_plane.reshape(height // 2, 2, width // 2, 2).mean(axis=(1, 3))
+    v_subsampled = v_plane.reshape(height // 2, 2, width // 2, 2).mean(axis=(1, 3))
+    surface = np.zeros((height + height // 2, surface_stride), dtype=np.uint8)
+    surface[:height, :width] = _rounded_uint8(y_plane)
+    surface[height:, :width:2] = _rounded_uint8(u_subsampled)
+    surface[height:, 1:width:2] = _rounded_uint8(v_subsampled)
+    return surface
+
+
+def nv12_to_hwc_uint8(
+    frame: np.ndarray | bytes | bytearray | memoryview,
+    *,
+    width: int,
+    height: int,
+    stride: int | None = None,
+    output_encoding: str = "rgb8",
+    color_space: str = "bt709",
+    color_range: str = "limited",
+    resize: Sequence[int] | None = None,
+) -> np.ndarray:
+    """Convert a packed or padded NV12 surface into RGB/BGR HWC uint8."""
+    if width <= 0 or height <= 0 or width % 2 or height % 2:
+        raise ValueError(f"NV12 requires positive even dimensions, got {height}x{width}")
+    if color_space.lower() != "bt709":
+        raise ValueError(f"NV12 color_space must be 'bt709', got {color_space!r}")
+    normalized_range = color_range.lower()
+    if normalized_range not in _BT709_COLOR_RANGES:
+        raise ValueError(f"NV12 color_range must be one of {sorted(_BT709_COLOR_RANGES)}, got {color_range!r}")
+    target_encoding = output_encoding.lower()
+    if target_encoding not in {"rgb8", "bgr8"}:
+        raise ValueError(f"output_encoding must be 'rgb8' or 'bgr8', got {output_encoding!r}")
+    surface_stride = width if stride is None else int(stride)
+    if surface_stride < width:
+        raise ValueError(f"NV12 stride {surface_stride} is smaller than width {width}")
+    raw = np.frombuffer(frame, dtype=np.uint8) if not isinstance(frame, np.ndarray) else np.asarray(frame)
+    required = (height + height // 2) * surface_stride
+    if raw.dtype != np.uint8:
+        raise ValueError(f"NV12 surface dtype must be uint8, got {raw.dtype}")
+    if raw.size < required:
+        raise ValueError(f"NV12 surface has {raw.size} bytes, expected at least {required}")
+    surface = raw.reshape(-1)[:required].reshape(height + height // 2, surface_stride)
+    y_plane = surface[:height, :width].astype(np.float32)
+    uv_plane = surface[height:, :width]
+    u_plane = np.repeat(np.repeat(uv_plane[:, 0::2], 2, axis=0), 2, axis=1).astype(np.float32) - 128.0
+    v_plane = np.repeat(np.repeat(uv_plane[:, 1::2], 2, axis=0), 2, axis=1).astype(np.float32) - 128.0
+
+    if normalized_range == "limited":
+        luminance = 1.164384 * (y_plane - 16.0)
+        red = luminance + 1.792741 * v_plane
+        green = luminance - 0.213249 * u_plane - 0.532909 * v_plane
+        blue = luminance + 2.112402 * u_plane
+    else:
+        red = y_plane + 1.5748 * v_plane
+        green = y_plane - 0.187324 * u_plane - 0.468124 * v_plane
+        blue = y_plane + 1.8556 * u_plane
+    rgb = _rounded_uint8(np.stack((red, green, blue), axis=-1))
+    if target_encoding == "bgr8":
+        rgb = rgb[..., ::-1]
+    resize_hw = _validated_resize(resize)
+    if resize_hw is not None:
+        rgb = nearest_resize_rgb(rgb, *resize_hw)
+    return np.ascontiguousarray(rgb)
+
+
+def _rounded_uint8(values: np.ndarray) -> np.ndarray:
+    return np.clip(np.rint(values), 0, 255).astype(np.uint8)
 
 
 def _encode_via_dotted_paths(
@@ -227,84 +458,32 @@ def _dec_image(msg, spec):
 
     h, w = int(msg.height), int(msg.width)
     enc = getattr(msg, "encoding", "bgr8").lower()
-    raw = np.frombuffer(msg.data, dtype=np.uint8)
-    step = int(getattr(msg, "step", 0))
+    resize_hw = _validated_resize(spec.image_resize if spec and hasattr(spec, "image_resize") else None)
 
-    resize_hw = spec.image_resize if spec and hasattr(spec, "image_resize") else None
-
-    # Depth handling (simplified port)
     if enc in ("32fc1", "32fc"):
-        data32 = raw.view(np.float32)
-        row_elems = (step // 4) if step else w
-        arr = data32.reshape(h, row_elems)[:, :w].reshape(h, w)
+        byte_order = ">" if bool(getattr(msg, "is_bigendian", False)) else "<"
+        packed = np.ascontiguousarray(_image_rows(msg, w * 4))
+        arr = packed.view(np.dtype(f"{byte_order}f4")).reshape(h, w).astype(np.float32)
         hwc = arr[..., None]
-        if resize_hw:
-            hwc = nearest_resize_any(hwc, int(resize_hw[0]), int(resize_hw[1]))
+        if resize_hw is not None:
+            hwc = nearest_resize_any(hwc, *resize_hw)
         hwc_normalized = np.where(np.isfinite(hwc), np.clip(hwc, 0, 50) / 50, hwc)
         return np.ascontiguousarray(np.transpose(np.repeat(hwc_normalized, 3, axis=-1), (2, 0, 1)), dtype=np.float32)
 
     elif enc in ("16uc1", "mono16"):
-        data16 = raw.view(np.uint16)
-        row_elems = (step // 2) if step else w
-        arr16 = data16.reshape(h, row_elems)[:, :w].reshape(h, w)
+        byte_order = ">" if bool(getattr(msg, "is_bigendian", False)) else "<"
+        packed = np.ascontiguousarray(_image_rows(msg, w * 2))
+        arr16 = packed.view(np.dtype(f"{byte_order}u2")).reshape(h, w).astype(np.uint16)
         arr_m = arr16.astype(np.float32)
         arr_m[arr16 == 0] = np.nan
         arr_m[arr16 != 0] *= 1.0 / 1000.0
         hwc = arr_m[..., None]
-        if resize_hw:
-            hwc = nearest_resize_any(hwc, int(resize_hw[0]), int(resize_hw[1]))
+        if resize_hw is not None:
+            hwc = nearest_resize_any(hwc, *resize_hw)
         hwc_normalized = np.where(np.isfinite(hwc), np.clip(hwc, 0, 10) / 10, hwc)
         return np.ascontiguousarray(np.transpose(np.repeat(hwc_normalized, 3, axis=-1), (2, 0, 1)), dtype=np.float32)
 
-    # Color handling
-    if enc in ("rgb8", "bgr8", "8uc3"):
-        # NOTE: 8uc3 is currently a decode-only compatibility addition.
-        ch = 3
-        if not step:
-            step = w * ch
-        if step < w * ch:
-            logger.warning(
-                "Suspicious step=%s for %sx%s image (encoding=%r), using step=%s",
-                step,
-                w,
-                ch,
-                enc,
-                w * ch,
-            )
-            step = w * ch
-        row = raw.reshape(h, step)[:, : w * ch]
-        arr = row.reshape(h, w, ch)
-        hwc_rgb = arr if enc == "rgb8" else arr[..., ::-1]
-    elif enc in ("rgba8", "bgra8", "8uc4"):
-        # NOTE: 8uc4 is currently a decode-only compatibility addition.
-        ch = 4
-        if not step:
-            step = w * ch
-        if step < w * ch:
-            logger.warning(
-                "Suspicious step=%s for %sx%s image (encoding=%r), using step=%s",
-                step,
-                w,
-                ch,
-                enc,
-                w * ch,
-            )
-            step = w * ch
-        row = raw.reshape(h, step)[:, : w * ch]
-        arr = row.reshape(h, w, ch)
-        rgb = arr[..., :3]
-        hwc_rgb = rgb if enc == "rgba8" else rgb[..., ::-1]
-    elif enc in ("mono8", "8uc1"):
-        if not step:
-            step = w
-        arr = raw.reshape(h, step)[:, :w].reshape(h, w)
-        hwc_rgb = np.repeat(arr[..., None], 3, axis=-1)
-    else:
-        raise ValueError(f"Unsupported image encoding '{enc}'")
-
-    if resize_hw:
-        hwc_rgb = nearest_resize_rgb(hwc_rgb, int(resize_hw[0]), int(resize_hw[1]))
-
+    hwc_rgb = ros_image_to_hwc_uint8(msg, resize=resize_hw)
     return np.ascontiguousarray(np.transpose(hwc_rgb, (2, 0, 1)), dtype=np.float32) / 255.0
 
 

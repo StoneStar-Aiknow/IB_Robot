@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -11,7 +13,7 @@ from types import MappingProxyType
 
 from inference_manifest import PolicyMetadata, ValidatedManifest
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 
 def _immutable_mapping(value: Mapping[str, object]) -> Mapping[str, object]:
@@ -129,6 +131,16 @@ class PipelineStatus:
             raise ValueError("ready status requires a live session ID and generation")
 
 
+@dataclass(frozen=True, slots=True)
+class StreamReference:
+    observation_key: str
+    stream_id: str
+
+    def __post_init__(self) -> None:
+        if not self.observation_key or not self.stream_id:
+            raise ValueError("stream references require observation_key and stream_id")
+
+
 @dataclass(frozen=True)
 class DistributedRequest:
     operation: Operation
@@ -141,6 +153,8 @@ class DistributedRequest:
     prompt: str | None = None
     deadline: datetime | None = None
     target_request_id: str = ""
+    observation_timestamp_ns: int = 0
+    stream_references: tuple[StreamReference, ...] = ()
 
     def __post_init__(self) -> None:
         for field_name in ("pipeline_id", "request_id", "session_id", "deployment_fingerprint"):
@@ -154,6 +168,21 @@ class DistributedRequest:
             raise ValueError("cancel requests require target_request_id")
         if self.operation is not Operation.CANCEL and self.target_request_id:
             raise ValueError("target_request_id is valid only for cancel requests")
+        if self.observation_timestamp_ns < 0:
+            raise ValueError("observation_timestamp_ns cannot be negative")
+        if self.operation is not Operation.INFER and (self.observation_timestamp_ns or self.stream_references):
+            raise ValueError("observation timestamp and stream references are valid only for inference requests")
+        if self.stream_references and self.observation_timestamp_ns <= 0:
+            raise ValueError("stream-backed inference requires a positive observation timestamp")
+        observation_keys = [reference.observation_key for reference in self.stream_references]
+        stream_ids = [reference.stream_id for reference in self.stream_references]
+        if len(set(observation_keys)) != len(observation_keys):
+            raise ValueError("stream references contain duplicate observation keys")
+        if len(set(stream_ids)) != len(stream_ids):
+            raise ValueError("stream references contain duplicate stream IDs")
+        collisions = sorted(set(observation_keys) & set(self.inputs))
+        if collisions:
+            raise ValueError(f"stream references collide with tensor input semantics: {collisions}")
         object.__setattr__(self, "inputs", _immutable_mapping(self.inputs))
 
 
@@ -224,6 +253,27 @@ def build_pipeline_identity(pipeline_id: str, validated_manifest: ValidatedManif
         deployment_fingerprint=validated_manifest.fingerprint,
         policy=summarize_policy(validated_manifest.policy),
     )
+
+
+def deployed_pipeline_fingerprint(
+    manifest_fingerprint: str,
+    contract_fingerprint: str,
+    *,
+    execution_mode: str,
+    processor_ownership: Mapping[str, str],
+) -> str:
+    """Compose the model deployment and observation contract identities."""
+    if not manifest_fingerprint or not contract_fingerprint or not execution_mode:
+        raise ValueError("deployment, contract, and execution mode fingerprints must be non-empty")
+    payload = {
+        "format": "ibrobot.deployed-pipeline-v1",
+        "manifest_fingerprint": manifest_fingerprint,
+        "contract_fingerprint": contract_fingerprint,
+        "execution_mode": execution_mode,
+        "processor_ownership": dict(sorted(processor_ownership.items())),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def identity_error(local: PipelineIdentity, remote: PipelineIdentity) -> StructuredError | None:
