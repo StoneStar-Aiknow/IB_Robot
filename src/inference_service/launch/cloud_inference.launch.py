@@ -2,6 +2,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -11,6 +12,7 @@ def generate_launch_description():
         DeclareLaunchArgument("deployment", description="Named deployment from inference_manifest.json"),
         DeclareLaunchArgument("request_timeout", default_value="5.0"),
         DeclareLaunchArgument("runtime_options_json", default_value="{}"),
+        DeclareLaunchArgument("robot_config_path", description="Absolute path to the robot configuration YAML"),
         DeclareLaunchArgument(
             "node_name",
             default_value=["inference_", LaunchConfiguration("pipeline_id"), "_cloud"],
@@ -27,6 +29,14 @@ def generate_launch_description():
             "heartbeat_topic",
             default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/heartbeat"],
         ),
+        DeclareLaunchArgument(
+            "video_descriptor_topic",
+            default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/video/descriptors"],
+        ),
+        DeclareLaunchArgument(
+            "video_status_topic",
+            default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/video/status"],
+        ),
     ]
     cloud_node = Node(
         package="inference_service",
@@ -39,11 +49,14 @@ def generate_launch_description():
                 "model_path": LaunchConfiguration("model_path"),
                 "deployment": LaunchConfiguration("deployment"),
                 "request_timeout": LaunchConfiguration("request_timeout"),
-                "runtime_options_json": LaunchConfiguration("runtime_options_json"),
+                "runtime_options_json": ParameterValue(LaunchConfiguration("runtime_options_json"), value_type=str),
+                "robot_config_path": LaunchConfiguration("robot_config_path"),
                 "node_name": LaunchConfiguration("node_name"),
                 "request_topic": LaunchConfiguration("request_topic"),
                 "result_topic": LaunchConfiguration("result_topic"),
                 "heartbeat_topic": LaunchConfiguration("heartbeat_topic"),
+                "video_descriptor_topic": LaunchConfiguration("video_descriptor_topic"),
+                "video_status_topic": LaunchConfiguration("video_status_topic"),
                 "use_sim_time": False,
             }
         ],

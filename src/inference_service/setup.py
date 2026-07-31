@@ -15,6 +15,7 @@ setup(
         (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
     ],
     install_requires=[
+        "av>=15,<16",
         "rclpy",
         "sensor_msgs",
         "geometry_msgs",

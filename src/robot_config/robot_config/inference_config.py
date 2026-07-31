@@ -46,8 +46,19 @@ _TRANSPORT_FIELDS = (
     "request_topic",
     "result_topic",
     "heartbeat_topic",
+    "video_descriptor_topic",
+    "video_status_topic",
 )
-_DISTRIBUTED_TRANSPORT_FIELDS = frozenset({"cloud_node_name", "request_topic", "result_topic", "heartbeat_topic"})
+_DISTRIBUTED_TRANSPORT_FIELDS = frozenset(
+    {
+        "cloud_node_name",
+        "request_topic",
+        "result_topic",
+        "heartbeat_topic",
+        "video_descriptor_topic",
+        "video_status_topic",
+    }
+)
 
 
 class InferenceConfigError(ValueError):
@@ -67,6 +78,8 @@ class InferenceTransportConfig:
     request_topic: str | None
     result_topic: str | None
     heartbeat_topic: str | None
+    video_descriptor_topic: str | None
+    video_status_topic: str | None
 
 
 @dataclass(frozen=True)
@@ -268,6 +281,10 @@ def _parse_transport(
         "request_topic": f"/inference/{pipeline_id}/request" if execution_mode == "distributed" else None,
         "result_topic": f"/inference/{pipeline_id}/result" if execution_mode == "distributed" else None,
         "heartbeat_topic": f"/inference/{pipeline_id}/heartbeat" if execution_mode == "distributed" else None,
+        "video_descriptor_topic": (
+            f"/inference/{pipeline_id}/video/descriptors" if execution_mode == "distributed" else None
+        ),
+        "video_status_topic": f"/inference/{pipeline_id}/video/status" if execution_mode == "distributed" else None,
     }
     for field, override in value.items():
         if not isinstance(override, str) or not override:

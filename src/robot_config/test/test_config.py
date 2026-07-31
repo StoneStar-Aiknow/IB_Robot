@@ -637,6 +637,11 @@ def test_dict_contract_builder_matches_typed_contract_shape():
     assert [act.key for act in dict_contract.actions] == [act.key for act in typed_contract.actions]
     assert dict_contract.tasks == typed_contract.tasks
     assert [obs.align for obs in dict_contract.observations] == [obs.align for obs in typed_contract.observations]
+    assert [obs.image for obs in dict_contract.observations] == [obs.image for obs in typed_contract.observations]
+    assert [obs.qos for obs in dict_contract.observations] == [obs.qos for obs in typed_contract.observations]
+    assert [obs.transport for obs in dict_contract.observations] == [
+        obs.transport for obs in typed_contract.observations
+    ]
 
 
 def test_align_max_age_is_normalized_and_changes_contract_fingerprint():

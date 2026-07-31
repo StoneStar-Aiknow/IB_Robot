@@ -37,6 +37,13 @@ def generate_launch_description():
     heartbeat_topic_arg = DeclareLaunchArgument(
         "heartbeat_topic", default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/heartbeat"]
     )
+    video_descriptor_topic_arg = DeclareLaunchArgument(
+        "video_descriptor_topic",
+        default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/video/descriptors"],
+    )
+    video_status_topic_arg = DeclareLaunchArgument(
+        "video_status_topic", default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/video/status"]
+    )
 
     policy_node = Node(
         package="inference_service",
@@ -62,6 +69,8 @@ def generate_launch_description():
                 "request_topic": LaunchConfiguration("request_topic"),
                 "result_topic": LaunchConfiguration("result_topic"),
                 "heartbeat_topic": LaunchConfiguration("heartbeat_topic"),
+                "video_descriptor_topic": LaunchConfiguration("video_descriptor_topic"),
+                "video_status_topic": LaunchConfiguration("video_status_topic"),
             }
         ],
     )
@@ -84,6 +93,8 @@ def generate_launch_description():
             request_topic_arg,
             result_topic_arg,
             heartbeat_topic_arg,
+            video_descriptor_topic_arg,
+            video_status_topic_arg,
             policy_node,
         ]
     )

@@ -105,6 +105,8 @@ def generate_inference_node(
             "request_topic": transport.request_topic or "",
             "result_topic": transport.result_topic or "",
             "heartbeat_topic": transport.heartbeat_topic or "",
+            "video_descriptor_topic": transport.video_descriptor_topic or "",
+            "video_status_topic": transport.video_status_topic or "",
         }
         nodes.append(
             Node(

@@ -2,6 +2,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -33,16 +34,26 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "heartbeat_topic", default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/heartbeat"]
         ),
+        DeclareLaunchArgument(
+            "video_descriptor_topic",
+            default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/video/descriptors"],
+        ),
+        DeclareLaunchArgument(
+            "video_status_topic",
+            default_value=["/inference/", LaunchConfiguration("pipeline_id"), "/video/status"],
+        ),
     ]
     shared = {
         "pipeline_id": LaunchConfiguration("pipeline_id"),
         "model_path": LaunchConfiguration("model_path"),
         "deployment": LaunchConfiguration("deployment"),
         "request_timeout": LaunchConfiguration("request_timeout"),
-        "runtime_options_json": LaunchConfiguration("runtime_options_json"),
+        "runtime_options_json": ParameterValue(LaunchConfiguration("runtime_options_json"), value_type=str),
         "request_topic": LaunchConfiguration("request_topic"),
         "result_topic": LaunchConfiguration("result_topic"),
         "heartbeat_topic": LaunchConfiguration("heartbeat_topic"),
+        "video_descriptor_topic": LaunchConfiguration("video_descriptor_topic"),
+        "video_status_topic": LaunchConfiguration("video_status_topic"),
     }
     edge = Node(
         package="inference_service",
@@ -73,6 +84,7 @@ def generate_launch_description():
         parameters=[
             {
                 **shared,
+                "robot_config_path": LaunchConfiguration("robot_config_path"),
                 "node_name": ["inference_", LaunchConfiguration("pipeline_id"), "_cloud"],
                 "use_sim_time": False,
             }

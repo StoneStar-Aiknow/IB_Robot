@@ -14,6 +14,14 @@ from robot_config.inference_config import (
     InferenceTransportConfig,
     parse_inference_config,
 )
+from robot_config.observation_transport import (
+    H264Spec,
+    ObservationTransportSpec,
+    RtpEndpointSpec,
+    VideoBufferSpec,
+    VideoMediaSpec,
+    VideoReadinessSpec,
+)
 from robot_config.perception_runtime_config import (
     PerceptionModelServiceConfig,
     PerceptionRuntimeConfig,
@@ -76,6 +84,12 @@ __all__ = [
     "PeripheralConfig",
     "ContractExtensionConfig",
     "CameraConfig",
+    "ObservationTransportSpec",
+    "RtpEndpointSpec",
+    "H264Spec",
+    "VideoMediaSpec",
+    "VideoBufferSpec",
+    "VideoReadinessSpec",
     # Loaders
     "load_robot_config",
     "load_robot_config_dict",
