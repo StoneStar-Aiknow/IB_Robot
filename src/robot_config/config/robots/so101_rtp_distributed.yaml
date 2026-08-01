@@ -1,0 +1,1486 @@
+# SO-101 Single Arm with RTP distributed inference to remote Ascend 310B.
+# Based on so101_single_arm.yaml. Key changes:
+# - Camera observations use RTP H.264 transport instead of DDS tensors
+# - Inference runs in distributed mode on remote Ascend 310B
+# - Front RealSense camera removed (not connected on this host)
+
+robot:
+  name: so101_rtp_distributed
+  type: so101
+  robot_type: so_101  # For LeRobot dataset metadata
+  # Gazebo：须与 config/worlds 里 <world name="..."> 一致；create 不传 -world 时会随机取 worlds 列表第一个
+  gazebo_world_name: demo
+  # Gazebo 实体创建现在基于 /clock ready 判定，不再依赖固定启动延时。
+
+  # Gazebo 窗口灰屏、实体树空但 /joint_states 正常时，日志常见：
+  #   libEGL warning: egl: failed to create dri2 screen
+  # 可保持下方为 true；若显卡正常、仅想开 GPU 加速，把 libgl_always_software 改为 false
+  gazebo_gui:
+    qt_platform: xcb
+    libgl_always_software: true
+
+  # ============================================
+  # Unified joint definitions (Single Source of Truth)
+  # ============================================
+  joints:
+    arm:
+      - "1"
+      - "2"
+      - "3"
+      - "4"
+      - "5"
+    gripper:
+      - "6"
+    all: ["1", "2", "3", "4", "5", "6"]
+
+  # ============================================
+  # MoveIt configuration
+  # ============================================
+  moveit:
+    # End-effector selection for MoveIt and Cartesian teleop.
+    # Default keeps the upstream gripper-origin path:
+    #   arm_group_name: arm
+    #   ee_link: gripper
+    # To target the jaw-center TCP instead, switch both lines to:
+    #   arm_group_name: arm_tcp
+    #   ee_link: tcp
+    arm_group_name: arm
+    base_link: base
+    ee_link: gripper
+    shoulder_link: shoulder
+    so101_placo_servo_config_path: $(find robot_moveit)/config/so101_placo_servo.yaml
+
+  # Control mode management
+  default_control_mode: "model_inference"
+  skill_required_control_mode: "moveit_planning"
+  controller_startup_timeout:
+    sim: 120.0
+    hardware: 30.0
+
+  control_modes:
+    # Human teleoperation mode (direct control via leader arm/gamepad)
+    teleop:
+      description: "Human teleoperation mode (direct control)"
+      description_cn: "人工遥操作模式（直接控制）"
+      controllers:
+        - joint_state_broadcaster
+        - arm_position_controller
+        - gripper_position_controller
+      inference:
+        enabled: false
+      executor:
+        type: topic
+        mode: teleop
+        queue_size: 100
+        control_frequency: 50.0
+
+    # Model inference mode (ACT/pi0 end-to-end control)
+    model_inference:
+      description: "High-frequency end-to-end control mode (ACT/pi0)"
+      description_cn: "高频端到端控制模式（ACT/pi0）"
+      controllers:
+        - joint_state_broadcaster
+        - arm_position_controller
+        - gripper_position_controller
+      # ============================================
+      # Inference configuration
+      # ============================================
+      inference:
+        enabled: true
+        pipelines:
+          policy:
+            model_path: models/ACT_1arm_2cam_banana_pick_v1_step_160000_distill_20260515
+            deployment: ascend_310b1
+            execution_mode: distributed
+            request_timeout: 120.0
+            default_task: "pick up the banana"
+      # ============================================
+      # Executor configuration
+      # ============================================
+      executor:
+        type: topic  # topic | action
+        mode: model_inference
+        inference_pipeline: policy
+        queue_size: 100
+        # Keep about 2.5s of buffered actions so ~1.5s distributed RKNN latency
+        # still leaves margin before the dispatcher falls back to hold.
+        watermark_threshold: 50
+        control_frequency: 20.0
+
+    moveit_planning:
+      description: "MoveIt trajectory planning mode (VoxPoser/VLM)"
+      description_cn: "MoveIt轨迹规划模式（VoxPoser/VLM）"
+      controllers:
+        - joint_state_broadcaster
+        - arm_trajectory_controller
+        - gripper_trajectory_controller
+      inference:
+        enabled: false  # MoveIt模式不需要推理
+      executor:
+        type: action
+        mode: moveit_planning
+
+  # Voice ASR is configured here and injected by robot_config/robot.launch.py.
+  # The standalone voice_asr_service launch file is kept only for debugging.
+  voice_asr:
+    enabled: false
+    auto_download_model: true
+    # 默认使用 continuous 监听模式；可通过 launch 参数临时覆盖是否启用。
+    active_mode: continuous
+    language: zh
+    model_path: "models/voice_asr/sherpa-onnx-streaming-zipformer-zh-14M-2023-02-23"
+    tokens_path: ""
+    provider: cpu
+    model_type: streaming
+    max_recording_duration: 10.0
+    vad_sensitivity: 0.6
+    realtime_pre_roll_seconds: 0.5
+    publish_partial: true
+    sample_rate: 16000
+    chunk_size: 512
+    buffer_seconds: 5.0
+    output_topic: /voice_command
+    device_index: -1
+    device_name: ""
+    exit_on_init_failure: true
+
+  semantic_mapping:
+    enabled: false
+    migration:
+      grounded_sam2_node: compatibility
+      grounded_sam2_snapshot: diagnostic_only
+      perception_service_node: general_scene
+      embedded_mapping_backend: disabled
+
+  embodied:
+    enabled: false
+    debug_tracing: true
+    task_input_topic: /voice_command
+    task_command_topic: /embodied/task_command
+    planned_task_topic: /embodied/planned_task
+    status_topic: /embodied/task_status
+    skill_action_name: /embodied/execute_skill
+    primitive_action_name: /embodied/execute_primitive
+    validate_skill_service: /embodied/validate_skill
+    validate_primitive_service: /embodied/validate_primitive
+    skill_gateway_status_service: /embodied/get_skill_gateway_status
+    default_target_name: demo_object
+    default_place_name: home
+    timeouts:
+      task_budget_sec: 180.0
+      default_skill_timeout_sec: 30.0
+      robot_state_freshness_sec: 0.5
+      scene_freshness_sec: 0.5
+      model_idle_timeout_sec: 120.0
+      rpc_timeout_sec: 5.0
+      gripper_settle_sec: 1.5
+    planner:
+      mode: hybrid  # rule | vlm_api | hybrid
+      scene_sources:
+        primary_camera_topic: /camera/front_camera/color/image_raw
+        primary_camera_info_topic: /camera/front_camera/color/camera_info
+        primary_aligned_depth_topic: /camera/front_camera/aligned_depth_to_color/image_raw
+        primary_pointcloud_topic: /camera/front_camera/depth/color/points
+        wrist_camera_topic: ""
+        wrist_camera_info_topic: ""
+        wrist_aligned_depth_topic: ""
+        wrist_pointcloud_topic: ""
+        ee_pose_topic: /robot_status/ee_pose
+        joint_state_topic: /joint_states
+        require_depth: false  # 仿真环境无深度流，仅用 RGB
+        require_pointcloud: false
+      vlm_api:
+        provider: kimicode
+        base_url: https://api.kimi.com/coding/v1
+        api_key_env: KIMICODE_API_KEY
+        model: kimi-latest
+        max_image_width: 640
+        jpeg_quality: 80
+      planning_policy:
+        fallback_to_rule_planner: true
+        min_confidence: 0.70
+        allowed_skills:
+          - inspect_scene
+          - recover_safe_pose
+          - recover_zero_pose
+          - move_relative_ee
+          - open_gripper_skill
+          - close_gripper_skill
+          - rotate_gripper_cw
+          - rotate_gripper_ccw
+          - dance_basic
+          - wave_hello
+          - nod_yes
+          - shake_no
+          - celebrate
+          - greet_observe_raise
+          - act_cute
+          - happy_spin_upright
+    perception:
+      enabled: false
+      request_topic: /embodied/perception_request
+      text_input_topic: /embodied/perception_text
+      result_topic: /embodied/perception_result
+      summary_topic: /embodied/perception_summary
+      default_session_id: default
+      scene_sources:
+        primary_camera_topic: /camera/front_camera/color/image_raw
+        primary_camera_info_topic: /camera/front_camera/color/camera_info
+        primary_aligned_depth_topic: /camera/front_camera/aligned_depth_to_color/image_raw
+        primary_pointcloud_topic: /camera/front_camera/depth/color/points
+        wrist_camera_topic: ""
+        wrist_camera_info_topic: ""
+        wrist_aligned_depth_topic: ""
+        wrist_pointcloud_topic: ""
+        ee_pose_topic: /robot_status/ee_pose
+        joint_state_topic: /joint_states
+        require_depth: false  # 仿真环境无深度流，仅用 RGB
+        require_pointcloud: false
+      vlm_api:
+        provider: openai_compatible
+        base_url: http://localhost:8000/v1
+        api_key_env: ""
+        model: Qwen3.5-9B
+        max_image_width: 320
+        jpeg_quality: 70
+      conversation:
+        max_history_turns: 4
+    entry:
+      # 入口层视觉趣味游戏策略：拥有"何时触发、问什么"；camera/VLM/timeout 仍由
+      # embodied.perception 唯一管理，此处不重复。命中触发词后 task_entry_node
+      # 构造 SceneAnalysisRequest 发给 perception_service，并立即返回。
+      visual_games:
+        sorting_hat:
+          enabled: false  # 趣味游戏默认关；现场启用需同时置 perception.enabled: true
+          trigger_aliases: [分院帽, 奔月帽, 风月帽, 分月帽]
+    execution:
+      relative_motion_step_m: 0.03
+      relative_motion_reference_frame: base
+      relative_motion_direction_mapping:
+        forward: [0.0, -1.0, 0.0]
+        backward: [0.0, 1.0, 0.0]
+        left: [1.0, 0.0, 0.0]
+        right: [-1.0, 0.0, 0.0]
+        up: [0.0, 0.0, 1.0]
+        down: [0.0, 0.0, -1.0]
+      gripper_open_position: 1.0
+      gripper_closed_position: 0.15
+      task_executor_action_name: /task_executor/execute_task_plan
+    safety:
+      workspace:
+        x: [-0.32, 0.25]
+        y: [-0.42, 0.00]
+        z: [0.05, 0.55]
+    named_poses:
+      home:
+        position: {x: 0.020030733201442157, y: -0.11809839488683391, z: 0.13887055751050842}
+        orientation: {x: -0.26790866048257905, y: -0.2622185975709204, z: -0.6525133891660432, w: 0.6585534402654153}
+      observe_table:
+        position: {x: 0.02160863957360322, y: -0.1310933191355222, z: 0.33769602460194537}
+        orientation: {x: -0.35328551634048977, y: -0.32020226597268203, z: -0.5842845082802226, w: 0.6567126207053827}
+      zero:
+        position: {x: 0.0210077843415008, y: -0.278950111258735, z: 0.24858389783148477}
+        orientation: {x: -0.4740206645801369, y: -0.4668084047044082, z: -0.523033090590171, w: 0.532757645647648}
+    skill_templates:
+      inspect_scene:
+        description:
+          summary: "Move to observe_table and acquire a top-down scene view for planning."
+          category: observation
+          when_to_use: ["look at the table", "scan the workspace before acting", "update scene understanding"]
+          do_not_use:
+            - condition: "return the arm to a safe rest pose"
+              instead_use: recover_safe_pose
+            - condition: "greet or wave at someone"
+              instead_use: wave_hello
+          aliases_zh: ["观察桌面", "观察场景", "看看桌面", "扫描桌面", "观察点", "观察位置"]
+          aliases_en: ["observe", "look", "scan scene", "inspect"]
+          motion_scope: [arm]
+          anchor_pose: observe_table
+          intensity: subtle
+          duration_sec_estimate: 2.0
+          requires_motion_params: false
+        capability:
+          schema_version: 1
+          summary: "Inspect the workspace from the observation view."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: observe_table
+      recover_safe_pose:
+        description:
+          summary: "Return the arm to the 'home' safe rest pose."
+          category: recovery
+          when_to_use: ["go back to a safe position", "reset between tasks", "stop and rest"]
+          do_not_use:
+            - condition: "return to the factory zero/calibration pose"
+              instead_use: recover_zero_pose
+            - condition: "look at the table"
+              instead_use: inspect_scene
+          aliases_zh: ["回原位", "回安全位", "回安全位置", "原位", "原点", "回到home", "返回home"]
+          aliases_en: ["home", "safe pose", "reset", "recover"]
+          motion_scope: [arm]
+          anchor_pose: home
+          intensity: moderate
+          duration_sec_estimate: 3.0
+          requires_motion_params: false
+        capability:
+          schema_version: 1
+          summary: "Return the arm to a safe resting pose."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: home
+      recover_zero_pose:
+        description:
+          summary: "Return the arm to the calibration 'zero' pose (all joints at 0)."
+          category: recovery
+          when_to_use: ["go to the zero/calibration pose", "fully retract to factory zero"]
+          do_not_use:
+            - condition: "just return to a comfortable rest pose"
+              instead_use: recover_safe_pose
+          aliases_zh: ["零点", "零位", "回零点", "到零点"]
+          aliases_en: ["zero", "calibration pose"]
+          motion_scope: [arm]
+          anchor_pose: zero
+          intensity: moderate
+          duration_sec_estimate: 3.0
+          requires_motion_params: false
+        capability:
+          schema_version: 1
+          summary: "Return the arm to its calibration pose."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: zero
+      move_relative_ee:
+        description:
+          summary: "Translate the end-effector by a caller-supplied direction and distance."
+          category: translation
+          when_to_use: ["nudge the gripper a little up/down/left/right/forward/back", "small corrective move"]
+          do_not_use:
+            - condition: "move to a named pose"
+              instead_use: recover_safe_pose
+            - condition: "do a predefined gesture"
+              instead_use: wave_hello
+          aliases_zh: ["往前一点", "往上一点", "夹爪往左", "移动一点"]
+          aliases_en: ["move a bit", "nudge"]
+          motion_scope: [arm]
+          anchor_pose: none
+          intensity: subtle
+          duration_sec_estimate: 1.5
+          requires_motion_params: true
+        capability:
+          schema_version: 1
+          summary: "Move the end effector in a requested direction by a requested distance."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties:
+              motion_direction:
+                type: string
+                enum: [forward, backward, left, right, up, down]
+              motion_distance:
+                type: number
+                exclusiveMinimum: 0
+                unit: meters
+            required: [motion_direction, motion_distance]
+          recovery_policy: ask_user
+        primitive_sequence:
+          - primitive_name: move_relative_ee
+            motion_direction_from_request: true
+            motion_distance_from_request: true
+      open_gripper_skill:
+        description:
+          summary: "Open the gripper to its open position."
+          category: gripper
+          when_to_use: ["release or open the gripper", "drop an object"]
+          do_not_use:
+            - condition: "close or grasp"
+              instead_use: close_gripper_skill
+          aliases_zh: ["打开夹爪", "张开夹爪", "展开夹爪", "夹爪打开", "夹爪张开", "开爪"]
+          aliases_en: ["open gripper", "release"]
+          motion_scope: [gripper]
+          anchor_pose: none
+          intensity: subtle
+          duration_sec_estimate: 1.0
+          requires_motion_params: false
+        capability:
+          schema_version: 1
+          summary: "Open the gripper."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        primitive_sequence:
+          - primitive_name: open_gripper
+      close_gripper_skill:
+        description:
+          summary: "Close the gripper to its closed position."
+          category: gripper
+          when_to_use: ["close or grasp with the gripper", "pick an object"]
+          do_not_use:
+            - condition: "open or release"
+              instead_use: open_gripper_skill
+          aliases_zh: ["关闭夹爪", "合拢夹爪", "夹爪关闭", "夹爪合拢", "夹紧", "闭爪"]
+          aliases_en: ["close gripper", "grasp"]
+          motion_scope: [gripper]
+          anchor_pose: none
+          intensity: subtle
+          duration_sec_estimate: 1.0
+          requires_motion_params: false
+        capability:
+          schema_version: 1
+          summary: "Close the gripper."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        primitive_sequence:
+          - primitive_name: close_gripper
+      rotate_gripper_cw:
+        description:
+          summary: "Rotate the gripper clockwise by a caller-supplied angle."
+          category: rotation
+          when_to_use: ["twist the wrist clockwise", "rotate the held object clockwise"]
+          do_not_use:
+            - condition: "rotate counter-clockwise"
+              instead_use: rotate_gripper_ccw
+          aliases_zh: ["顺时针旋转", "顺时针转"]
+          aliases_en: ["rotate clockwise", "twist cw"]
+          motion_scope: [wrist]
+          anchor_pose: none
+          intensity: subtle
+          duration_sec_estimate: 1.5
+          requires_motion_params: true
+        capability:
+          schema_version: 1
+          summary: "Rotate the gripper clockwise by a requested angle."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties:
+              motion_distance:
+                type: number
+                exclusiveMinimum: 0
+                unit: degrees
+            required: [motion_distance]
+          recovery_policy: ask_user
+        primitive_sequence:
+          - primitive_name: rotate_gripper_cw
+            motion_distance_from_request: true
+      rotate_gripper_ccw:
+        description:
+          summary: "Rotate the gripper counter-clockwise by a caller-supplied angle."
+          category: rotation
+          when_to_use: ["twist the wrist counter-clockwise", "rotate the held object counter-clockwise"]
+          do_not_use:
+            - condition: "rotate clockwise"
+              instead_use: rotate_gripper_cw
+          aliases_zh: ["逆时针旋转", "逆时针转"]
+          aliases_en: ["rotate counter-clockwise", "twist ccw"]
+          motion_scope: [wrist]
+          anchor_pose: none
+          intensity: subtle
+          duration_sec_estimate: 1.5
+          requires_motion_params: true
+        capability:
+          schema_version: 1
+          summary: "Rotate the gripper counter-clockwise by a requested angle."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties:
+              motion_distance:
+                type: number
+                exclusiveMinimum: 0
+                unit: degrees
+            required: [motion_distance]
+          recovery_policy: ask_user
+        primitive_sequence:
+          - primitive_name: rotate_gripper_ccw
+            motion_distance_from_request: true
+      dance_basic:
+        description:
+          summary: "Play a multi-joint rhythmic dance sequence (shoulder/elbow/wrist)."
+          category: dance
+          when_to_use: ["dance", "play a rhythm motion for entertainment"]
+          do_not_use:
+            - condition: "act cute or seek attention"
+              instead_use: act_cute
+            - condition: "celebrate a success"
+              instead_use: celebrate
+            - condition: "spin cheerfully upright"
+              instead_use: happy_spin_upright
+          aliases_zh: ["跳舞", "跳个舞", "舞动"]
+          aliases_en: ["dance", "groove"]
+          motion_scope: [shoulder, elbow, wrist]
+          anchor_pose: home
+          intensity: moderate
+          duration_sec_estimate: 22.0
+          requires_motion_params: false
+          rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a rhythmic dance gesture."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        initial_gripper_state: closed
+        primitive_sequence:
+          - primitive_name: move_to_joint_positions
+            joint_positions: {"1": 0.02, "2": 0.57, "3": -0.76, "4": -0.58, "5": 0.51}
+            duration_sec: 2.0
+          - primitive_name: move_through_joint_positions
+            trajectory_template:
+              type: wave_dance_v1
+              waypoint_duration_sec: 0.05
+              active_waypoint_count: 120
+              repeat_count: 3
+              zero_hold_count: 4
+              base_pose:
+                "1": 0.02
+                "2": 0.54
+                "3": -0.82
+                "4": -0.18
+                "5": 0.02
+              joints:
+                "1":
+                  terms:
+                    - amplitude: 0
+                      harmonic: 1
+                      phase: 1.2
+                "2":
+                  terms:
+                    - amplitude: 0.3
+                      harmonic: 1
+                      phase: 0.0
+                    - amplitude: 0.03
+                      harmonic: 2
+                      phase: 1.5707963267948966
+                "3":
+                  terms:
+                    - amplitude: 0.3
+                      harmonic: 1
+                      phase: 0.0
+                    - amplitude: 0.06
+                      harmonic: 2
+                      phase: 1.5707963267948966
+                "4":
+                  terms:
+                    - amplitude: -0.8
+                      harmonic: 1
+                      phase: 0.45
+                    - amplitude: -0.05
+                      harmonic: 2
+                      phase: 1.8
+                "5":
+                  terms:
+                    - amplitude: 0.5
+                      harmonic: 1
+                      phase: 1.8
+              workspace_limits:
+                model: so101_arm_v1
+                points:
+                  joint3:
+                    z: [0.04, 0.55]
+                  upper_arm_mid:
+                    z: [0.03, 0.55]
+                  forearm_mid:
+                    z: [0.025, 0.55]
+                  wrist_mid:
+                    z: [0.025, 0.55]
+                  ee:
+                    x: [-0.32, 0.25]
+                    y: [-0.42, 0.00]
+                    z: [0.05, 0.55]
+      wave_hello:
+        description:
+          summary: "Wave hello or goodbye with the wrist (casual greeting gesture)."
+          category: social_greeting
+          when_to_use: ["greet someone", "say hi or bye", "wave to a person"]
+          do_not_use:
+            - condition: "agree or say yes"
+              instead_use: nod_yes
+            - condition: "formal raise-hand greet at the observe pose"
+              instead_use: greet_observe_raise
+            - condition: "dance rhythmically"
+              instead_use: dance_basic
+          aliases_zh: ["打招呼", "挥手", "挥挥手", "再见", "嗨"]
+          aliases_en: ["hello", "hi", "wave", "goodbye", "bye"]
+          motion_scope: [wrist]
+          anchor_pose: home
+          intensity: moderate
+          duration_sec_estimate: 8.0
+          requires_motion_params: false
+          rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a casual greeting wave."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        initial_gripper_state: closed
+        primitive_sequence:
+          - primitive_name: move_to_joint_positions
+            joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
+            duration_sec: 2.0
+          - primitive_name: move_through_joint_positions
+            trajectory_template:
+              type: single_joint_wave_v1
+              waypoint_duration_sec: 0.05
+              active_waypoint_count: 16
+              repeat_count: 3
+              base_pose:
+                "1": 0.02
+                "2": 0.54
+                "3": -0.82
+                "4": -0.18
+                "5": 0.02
+              joint: "5"
+              amplitude: 0.35
+              workspace_limits:
+                model: so101_arm_v1
+                points:
+                  joint3:
+                    z: [0.04, 0.55]
+                  upper_arm_mid:
+                    z: [0.03, 0.55]
+                  forearm_mid:
+                    z: [0.025, 0.55]
+                  wrist_mid:
+                    z: [0.025, 0.55]
+                  ee:
+                    x: [-0.32, 0.25]
+                    y: [-0.42, 0.00]
+                    z: [0.05, 0.55]
+          - primitive_name: move_to_joint_positions
+            joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
+            duration_sec: 2.0
+      nod_yes:
+        description:
+          summary: "Nod 'yes' (agreement) with small shoulder/elbow motion."
+          category: social_affirmation
+          when_to_use: ["agree", "say yes", "confirm", "nod"]
+          do_not_use:
+            - condition: "disagree or say no"
+              instead_use: shake_no
+            - condition: "greet someone"
+              instead_use: wave_hello
+          aliases_zh: ["点头", "同意", "是的", "点头表示同意"]
+          aliases_en: ["yes", "agree", "nod", "confirm"]
+          motion_scope: [shoulder, elbow]
+          anchor_pose: home
+          intensity: subtle
+          duration_sec_estimate: 7.0
+          requires_motion_params: false
+          rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a gesture indicating agreement."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        initial_gripper_state: closed
+        primitive_sequence:
+          - primitive_name: move_to_joint_positions
+            joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
+            duration_sec: 2.0
+          - primitive_name: move_through_joint_positions
+            trajectory_template:
+              type: wave_dance_v1
+              waypoint_duration_sec: 0.05
+              active_waypoint_count: 16
+              repeat_count: 2
+              zero_hold_count: 0
+              base_pose:
+                "1": 0.02
+                "2": 0.54
+                "3": -0.82
+                "4": -0.18
+                "5": 0.02
+              joints:
+                "2":
+                  terms:
+                    - amplitude: 0.15
+                      harmonic: 1
+                      phase: 0.0
+                "3":
+                  terms:
+                    - amplitude: -0.15
+                      harmonic: 1
+                      phase: 0.0
+              workspace_limits:
+                model: so101_arm_v1
+                points:
+                  joint3:
+                    z: [0.04, 0.55]
+                  upper_arm_mid:
+                    z: [0.03, 0.55]
+                  forearm_mid:
+                    z: [0.025, 0.55]
+                  wrist_mid:
+                    z: [0.025, 0.55]
+                  ee:
+                    x: [-0.32, 0.25]
+                    y: [-0.42, 0.00]
+                    z: [0.05, 0.55]
+          - primitive_name: move_to_joint_positions
+            joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
+            duration_sec: 2.0
+      shake_no:
+        description:
+          summary: "Shake 'no' (disagreement) with a small base-joint motion."
+          category: social_affirmation
+          when_to_use: ["disagree", "say no", "decline", "shake head"]
+          do_not_use:
+            - condition: "agree or say yes"
+              instead_use: nod_yes
+            - condition: "greet someone"
+              instead_use: wave_hello
+          aliases_zh: ["摇头", "不同意", "不是", "摇头表示否定"]
+          aliases_en: ["no", "disagree", "decline", "shake head"]
+          motion_scope: [base]
+          anchor_pose: home
+          intensity: subtle
+          duration_sec_estimate: 8.0
+          requires_motion_params: false
+          rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a gesture indicating disagreement."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        initial_gripper_state: closed
+        primitive_sequence:
+          - primitive_name: move_to_joint_positions
+            joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
+            duration_sec: 2.0
+          - primitive_name: move_through_joint_positions
+            trajectory_template:
+              type: single_joint_wave_v1
+              waypoint_duration_sec: 0.05
+              active_waypoint_count: 16
+              repeat_count: 3
+              base_pose:
+                "1": 0.02
+                "2": 0.54
+                "3": -0.82
+                "4": -0.18
+                "5": 0.02
+              joint: "1"
+              amplitude: 0.2
+              workspace_limits:
+                model: so101_arm_v1
+                points:
+                  joint3:
+                    z: [0.04, 0.55]
+                  upper_arm_mid:
+                    z: [0.03, 0.55]
+                  forearm_mid:
+                    z: [0.025, 0.55]
+                  wrist_mid:
+                    z: [0.025, 0.55]
+                  ee:
+                    x: [-0.32, 0.25]
+                    y: [-0.42, 0.00]
+                    z: [0.05, 0.55]
+          - primitive_name: move_to_joint_positions
+            joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
+            duration_sec: 2.0
+      celebrate:
+        description:
+          summary: "Celebrate at observe_table with quick up/down/left/right relative moves."
+          category: social_emotion
+          when_to_use: ["celebrate a success", "show excitement with motion", "cheer"]
+          do_not_use:
+            - condition: "just spin cheerfully in place"
+              instead_use: happy_spin_upright
+            - condition: "dance rhythmically"
+              instead_use: dance_basic
+            - condition: "greet someone"
+              instead_use: wave_hello
+          aliases_zh: ["庆祝", "庆祝一下", "欢呼", "太棒了"]
+          aliases_en: ["celebrate", "cheer", "yay"]
+          motion_scope: [arm]
+          anchor_pose: observe_table
+          intensity: large
+          duration_sec_estimate: 4.0
+          requires_motion_params: false
+          rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a celebratory gesture."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        initial_gripper_state: closed
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: observe_table
+          - primitive_name: move_relative_ee
+            motion_direction: up
+            motion_distance: 0.04
+          - primitive_name: move_relative_ee
+            motion_direction: down
+            motion_distance: 0.08
+          - primitive_name: move_relative_ee
+            motion_direction: up
+            motion_distance: 0.04
+          - primitive_name: move_relative_ee
+            motion_direction: left
+            motion_distance: 0.04
+          - primitive_name: move_relative_ee
+            motion_direction: right
+            motion_distance: 0.08
+          - primitive_name: move_relative_ee
+            motion_direction: left
+            motion_distance: 0.04
+          - primitive_name: move_to_named_pose
+            pose_name: observe_table
+      greet_observe_raise:
+        description:
+          summary: "Formal greet: move to observe_table, raise/lower the end-effector, return."
+          category: social_greeting
+          when_to_use: ["formal raise-hand greeting", "acknowledge someone politely at the observe pose"]
+          do_not_use:
+            - condition: "casual wrist wave hello or bye"
+              instead_use: wave_hello
+            - condition: "celebrate a success"
+              instead_use: celebrate
+          aliases_zh: ["举手致意", "正式打招呼", "举手打招呼"]
+          aliases_en: ["raise hand", "formal greet", "acknowledge"]
+          motion_scope: [arm]
+          anchor_pose: observe_table
+          intensity: moderate
+          duration_sec_estimate: 4.0
+          requires_motion_params: false
+          rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a formal raised-hand greeting."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        initial_gripper_state: closed
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: observe_table
+          - primitive_name: move_relative_ee
+            motion_direction: up
+            motion_distance: 0.04
+          - primitive_name: move_relative_ee
+            motion_direction: down
+            motion_distance: 0.04
+          - primitive_name: move_relative_ee
+            motion_direction: up
+            motion_distance: 0.04
+          - primitive_name: move_relative_ee
+            motion_direction: down
+            motion_distance: 0.04
+          - primitive_name: move_to_named_pose
+            pose_name: observe_table
+      act_cute:
+        description:
+          summary: "Act cute: small wiggle with gripper open/close to seek attention."
+          category: social_emotion
+          when_to_use: ["act cute", "seek attention playfully", "play cute or coy"]
+          do_not_use:
+            - condition: "dance rhythmically"
+              instead_use: dance_basic
+            - condition: "wave hello"
+              instead_use: wave_hello
+          aliases_zh: ["撒娇", "卖萌", "装可爱", "可爱一下", "求关注"]
+          aliases_en: ["act cute", "cute", "coy"]
+          motion_scope: [base, wrist, gripper]
+          anchor_pose: home
+          intensity: moderate
+          duration_sec_estimate: 13.0
+          requires_motion_params: false
+          rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform a playful attention-seeking gesture."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        initial_gripper_state: closed
+        primitive_sequence:
+          - primitive_name: move_to_named_pose
+            pose_name: home
+          - primitive_name: move_to_joint_positions
+            joint_positions: {"1": 0.10, "2": 0.54, "3": -0.82, "4": -0.22, "5": 0.30}
+            duration_sec: 2.0
+          - primitive_name: open_gripper
+          - primitive_name: move_through_joint_positions
+            trajectory_template:
+              type: wave_dance_v1
+              waypoint_duration_sec: 0.05
+              active_waypoint_count: 48
+              repeat_count: 2
+              zero_hold_count: 2
+              base_pose:
+                "1": 0.02
+                "2": 0.54
+                "3": -0.82
+                "4": -0.18
+                "5": 0.02
+              joints:
+                "1":
+                  terms:
+                    - amplitude: 0.08
+                      harmonic: 1
+                      phase: 1.5707963267948966
+                "2":
+                  terms:
+                    - amplitude: 0.10
+                      harmonic: 1
+                      phase: 0.0
+                "3":
+                  terms:
+                    - amplitude: 0.08
+                      harmonic: 1
+                      phase: 0.0
+                "4":
+                  terms:
+                    - amplitude: -0.12
+                      harmonic: 1
+                      phase: 0.35
+                "5":
+                  terms:
+                    - amplitude: 0.28
+                      harmonic: 1
+                      phase: 1.5707963267948966
+              workspace_limits:
+                model: so101_arm_v1
+                points:
+                  joint3:
+                    z: [0.04, 0.55]
+                  upper_arm_mid:
+                    z: [0.03, 0.55]
+                  forearm_mid:
+                    z: [0.025, 0.55]
+                  wrist_mid:
+                    z: [0.025, 0.55]
+                  ee:
+                    x: [-0.32, 0.25]
+                    y: [-0.42, 0.00]
+                    z: [0.05, 0.55]
+          - primitive_name: close_gripper
+          - primitive_name: open_gripper
+          - primitive_name: move_to_joint_positions
+            joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
+            duration_sec: 2.0
+      happy_spin_upright:
+        description:
+          summary: "Keep an upright pose while spinning the base joint with a wrist wiggle."
+          category: social_emotion
+          when_to_use: ["spin cheerfully", "show joy with a turn", "happy spin"]
+          do_not_use:
+            - condition: "celebrate a success with up/down moves"
+              instead_use: celebrate
+            - condition: "dance rhythmically"
+              instead_use: dance_basic
+          aliases_zh: ["开心转圈", "高兴转圈", "快乐转圈", "直立转圈", "开心地转圈"]
+          aliases_en: ["happy spin", "joyful turn", "spin cheerfully"]
+          motion_scope: [base, wrist]
+          anchor_pose: home
+          intensity: large
+          duration_sec_estimate: 12.0
+          requires_motion_params: false
+          rule_entry: true
+        capability:
+          schema_version: 1
+          summary: "Perform an upright celebratory spin gesture."
+          domain: manipulation
+          moves_robot: true
+          required_control_mode: moveit_planning
+          parameters:
+            type: object
+            additionalProperties: false
+            properties: {}
+            required: []
+          recovery_policy: never_retry
+        initial_gripper_state: closed
+        primitive_sequence:
+          - primitive_name: move_to_joint_positions
+            joint_positions: {"1": 0.02, "2": 0.08, "3": -1.30, "4": -0.18, "5": 0.02}
+            duration_sec: 2.0
+          - primitive_name: move_through_joint_positions
+            trajectory_template:
+              type: wave_dance_v1
+              waypoint_duration_sec: 0.05
+              active_waypoint_count: 64
+              repeat_count: 2
+              zero_hold_count: 3
+              base_pose:
+                "1": 0.02
+                "2": 0.0
+                "3": -1.22
+                "4": -0.18
+                "5": 0.02
+              joints:
+                "1":
+                  terms:
+                    - amplitude: 0.55
+                      harmonic: 1
+                      phase: 0.0
+                "2":
+                  terms:
+                    - amplitude: 0.08
+                      harmonic: 2
+                      phase: 1.5707963267948966
+                "3":
+                  terms:
+                    - amplitude: -0.08
+                      harmonic: 2
+                      phase: 1.5707963267948966
+                "4":
+                  terms:
+                    - amplitude: 0.10
+                      harmonic: 2
+                      phase: 0.0
+                "5":
+                  terms:
+                    - amplitude: 0.35
+                      harmonic: 2
+                      phase: 0.0
+              workspace_limits:
+                model: so101_arm_v1
+                points:
+                  joint3:
+                    z: [0.04, 0.55]
+                  upper_arm_mid:
+                    z: [0.03, 0.55]
+                  forearm_mid:
+                    z: [0.025, 0.55]
+                  wrist_mid:
+                    z: [0.025, 0.55]
+                  ee:
+                    x: [-0.32, 0.25]
+                    y: [-0.42, 0.00]
+                    z: [0.05, 0.55]
+          - primitive_name: move_to_joint_positions
+            joint_positions: {"1": 0.02, "2": 0.0, "3": -1.22, "4": -0.18, "5": 0.02}
+            duration_sec: 2.0
+  # ros2_control configuration
+  ros2_control:
+    hardware_plugin: so101_hardware/SO101SystemHardware
+    port: /dev/ttyACM0
+    calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
+    joint_names: ["1", "2", "3", "4", "5", "6"]
+    # Reset positions (optional) - uses 'rest' pose from SRDF
+    reset_positions:
+      "1": 0.0       # shoulder_pan:  centered
+      "2": -1.5854   # shoulder_lift: ~-90° (down)
+      "3": 1.5708    # elbow_flex:    ~+90° (folded)
+      "4": 0.7854    # wrist_flex:    ~+45° (tilted)
+      "5": 0.0       # wrist_roll:    centered
+    urdf_path: $(find robot_description)/urdf/lerobot/so101/so101.urdf.xacro
+
+    # Controllers configuration
+    # Path to the controllers configuration file (YAML format)
+    controllers_config: $(find so101_hardware)/config/so101_controllers.yaml
+
+    # List of controllers to auto-start
+    # These controllers will be automatically spawned when the robot launches
+    controllers:
+      - joint_state_broadcaster  # Publishes joint states to /joint_states
+      - arm_controller           # Controls the robot arm joints
+      - gripper_controller       # Controls the gripper
+
+  # Peripheral devices (cameras, microphones, etc.)
+  peripherals:
+    - type: camera
+      name: top
+      driver: opencv
+      index: 0
+      width: 640
+      height: 480
+      fps: 30
+      pixel_format: mjpeg2rgb
+      frame_id: camera_top_frame
+      optical_frame_id: camera_top_optical_frame
+      # use_default_transform: 启用仿真相机预设位姿。
+      # 为 true 时，下方 transform 和 fovy 被忽略，
+      # 根据相机名和当前仿真平台自动填入位姿与视场角。
+      use_default_transform: true
+      transform:
+        parent_frame: base
+        x: 0.0
+        y: 0.0
+        z: 0.0
+        roll: 0.0
+        pitch: 0.0
+        yaw: 0.0
+      fovy: 0
+      # camera_info_url: file://$(env HOME)/.ros/camera_info/top_camera.yaml
+
+    - type: camera
+      name: wrist
+      driver: opencv
+      index: 2
+      width: 640
+      height: 480
+      fps: 60
+      pixel_format: mjpeg2rgb
+      frame_id: camera_wrist_frame
+      optical_frame_id: camera_wrist_optical_frame
+      # use_default_transform: 启用仿真相机预设位姿。
+      # 为 true 时，下方 transform 和 fovy 被忽略，
+      # 根据相机名和当前仿真平台自动填入位姿与视场角。
+      use_default_transform: true
+      transform:
+        parent_frame: gripper
+        x: 0.0
+        y: 0.0
+        z: 0.0
+        roll: 0.0
+        pitch: 0.0
+        yaw: 0.0
+      fovy: 0
+      # camera_info_url: file://$(env HOME)/.ros/camera_info/wrist_camera.yaml
+
+
+  # ============================================
+  # Simulation Configuration
+  # ============================================
+  simulation:
+    platform: gazebo        # "gazebo" | "mujoco" | "mock"
+    scene: pick_banana      # null = 不加载场景；pick_banana = 香蕉抓取场景
+    robot_spawn:            # Robot spawn pose owned by robot_config SSOT
+      x: 0.0
+      y: 0.30
+      z: -0.03
+    sim_models_pkg: sim_models
+
+  # IB-Robot contract integration
+  contract:
+    base_contract: $(find robot_config)/config/contracts/act_grab_pan.yaml
+    rate_hz: 20
+    max_duration_s: 90.0
+
+    observations:
+      - key: observation.images.top
+        topic: /camera/top/image_raw
+        type: sensor_msgs/msg/Image
+        peripheral: top
+        image:
+          resize: [480, 640]
+          encoding: rgb8
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+          max_age_ms: 500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 10
+        transport:
+          mode: rtp
+          stream_id: top
+          endpoint: {host: 192.168.136.127, port: 5004}
+          encoder_backend: software
+          decoder_backend: ascend
+          codec: h264
+          media: {width: 640, height: 480, frame_rate_hz: 30, pixel_format: nv12, color_space: bt709, color_range: limited}
+          h264: {profile: main, bitrate_bps: 4000000, gop_frames: 15}
+
+      - key: observation.images.wrist
+        topic: /camera/wrist/image_raw
+        type: sensor_msgs/msg/Image
+        peripheral: wrist
+        image:
+          resize: [480, 640]
+          encoding: rgb8
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+          max_age_ms: 500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 10
+        transport:
+          mode: rtp
+          stream_id: wrist
+          endpoint: {host: 192.168.136.127, port: 5006}
+          encoder_backend: software
+          decoder_backend: ascend
+          codec: h264
+          media: {width: 640, height: 480, frame_rate_hz: 30, pixel_format: nv12, color_space: bt709, color_range: limited}
+          h264: {profile: main, bitrate_bps: 4000000, gop_frames: 15}
+
+      - key: observation.state
+        topic: /joint_states
+        type: sensor_msgs/msg/JointState
+        selector: { names: ["position.1", "position.2", "position.3", "position.4", "position.5", "position.6"] }
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+          max_age_ms: 500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 50
+
+      - key: observation.current
+        topic: /so101_follower/joint_currents
+        type: ibrobot_msgs/msg/JointCurrent
+        selector: { names: ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"] }
+        align:
+          strategy: hold
+          stamp: header
+          tol_ms: 1500
+          max_age_ms: 500
+        qos:
+          reliability: best_effort
+          history: keep_last
+          depth: 50
+
+    actions:
+      # Arm joints (1-5) - uses same key "action" for consolidation
+      - key: action
+        selector:
+          names:
+            - "action.0"
+            - "action.1"
+            - "action.2"
+            - "action.3"
+            - "action.4"
+        publish:
+          topic: /arm_position_controller/commands
+          type: std_msgs/msg/Float64MultiArray
+          layout: flat
+          qos:
+            reliability: best_effort
+            history: keep_last
+            depth: 10
+          strategy:
+            mode: nearest
+            tolerance_ms: 500
+        safety_behavior: hold
+
+      # Gripper joint (6) - uses same key "action" for consolidation
+      - key: action
+        selector:
+          names:
+            - "action.5"
+        publish:
+          topic: /gripper_position_controller/commands
+          type: std_msgs/msg/Float64MultiArray
+          layout: flat
+          qos:
+            reliability: best_effort
+            history: keep_last
+            depth: 10
+          strategy:
+            mode: nearest
+            tolerance_ms: 500
+        safety_behavior: hold
+
+  # ============================================
+  # Teleoperation Configuration (for human teleop mode)
+  # ============================================
+  teleoperation:
+    enabled: true
+    active_device: "so101_leader" # You can switch between "so101_leader", "xbox_controller", "phone_teleop", and "vr_teleop"
+
+    # Cartesian solver used when gamepad / phone is in cartesian mode.
+    # Options:
+    #   placo_servo  - SO-101 default, command-side Placo differential IK.
+    #   moveit_servo - MoveIt Servo comparison path. Simulation works; Humble
+    #                  real-hardware anti-drift handling is tracked separately.
+    cartesian:
+      solver: placo_servo
+      # tool_frame defaults to moveit.ee_link, so arm/gripper and arm_tcp/tcp
+      # remain a single SSOT. Set tool_frame only to override the angular
+      # velocity reference frame.
+      # Placo-only speed knobs, as fractions of the backend physical maximum.
+      placo_servo:
+        linear_speed: 0.17   # 0.0~1.0
+        angular_speed: 0.2   # 0.0~1.0
+
+    devices:
+      - name: "so101_leader"
+        type: "leader_arm"
+        port: "/dev/ttyACM1"
+        calib_file: "$(env HOME)/.calibrate/so101_leader_calibrate.json"
+      - name: "phone_teleop"
+        type: "phone"
+        control_frequency: 30.0
+        phone_config:
+          phone_os: "android" # android/ios
+          camera_offset: [0.0, -0.02, 0.04]
+          linear_scale: 2.0
+          end_effector_bounds:
+            min: [-0.5, -0.5, 0.0]
+            max: [0.5, 0.5, 0.5]
+          max_ee_step_m: 0.05
+          gripper_speed_factor: 20.0
+          gripper_range: [0.0, 1.0]
+        ee_frame_name: "gripper"
+      - name: "xbox_controller"
+        type: "xbox_controller"
+        input_device: "/dev/input/js0"
+        default_mode: "joint"
+        mapping_config: "xbox_mapping"
+        servo_config: "so101_servo"
+        control_params:
+          deadzone: 0.1
+          joint_velocity_gain: 1.5
+          cartesian_linear_speed: 1.0
+          cartesian_angular_speed: 1.0
+          long_press_duration: 0.5
+      # VR teleop server. output_profile=so101 drives the placo cartesian
+      # servo; the VR node converts tool-frame angular → base via
+      # ToolAngularAdapter and the launch builder spawns so101_placo_servo_node
+      # alongside. Downstream placo topics/services use their defaults, so only
+      # tuning knobs are listed here. VR client connects to <host>:<port> (TCP).
+      - name: "vr_teleop"
+        type: "vr_teleop"
+        control_frequency: 50.0
+        vr_config:
+          output_profile: "so101"     # so101 | humanoid
+          controller_side: "right"    # left | right
+          # Security model: trusted LAN only. Listening on 0.0.0.0 is
+          # intentional so users can connect arbitrary VR headsets or other
+          # network devices without fixing their client IP in this config.
+          # This TCP control channel is unauthenticated: do NOT expose port
+          # 8889 through public port forwarding, untrusted Wi-Fi, or an
+          # untrusted VPN. The stale/disconnect watchdog remains mandatory.
+          host: "0.0.0.0"
+          port: 8889
+          # Input mode: "pose" = absolute EE pose passthrough (1:1 hand tracking,
+          # stop=stop, no drift); "velocity" = differential twist (placo
+          # integrates). Pose mode drives BOTH the VR node and the placo servo.
+          so101_input_mode: "pose"
+          # Hand→EE position gain (pose mode). SO-101 reach (~24cm) vs
+          # comfortable single-arm range (~60cm) suggests ~0.4, but 0.7 gives a
+          # less tiring feel (smaller hand travel reaches the target). Tune for
+          # finer/coarser feel.
+          position_scale: 0.7
+          # Rotation gate (pose mode). false = hand attitude drives the EE
+          # (default; VR +X/+Y wrist rotation maps to EE roll/pitch, validated on
+          # sim). true = hold the clutch-baseline attitude and teleop position
+          # only. NOTE: SO-101 is 5-DOF, so EE yaw about base +Z is NOT
+          # reproducible regardless of this setting (placo pins 3 position DOF +
+          # a soft 2-DOF orientation follow) — a kinematic limit, not a bug.
+          so101_position_only: false
+          # Stale-frame watchdog (s). If the VR client stays TCP-connected but
+          # stops sending frames, the last frame would otherwise be republished
+          # forever and the arm would keep tracking a dead target. When the
+          # newest frame is older than this, drop the clutch and call placo's
+          # stop service on the edge. ~0.2s = 10 missed frames at 50Hz.
+          so101_command_stale_s: 0.2
+          linear_speed_scale: 1.0
+          angular_speed_scale: 1.0
+          linear_deadzone: 0.005
+          angular_deadzone: 0.05
+          so101_gripper_open: 1.0
+          so101_gripper_closed: 0.0
+    safety:
+      joint_limits:
+        "1": {"min": -2.0693, "max": 2.0709}
+        "2": {"min": -1.92, "max": 1.92}
+        "3": {"min": -1.6813, "max": 1.6828}
+        "4": {"min": -1.65806, "max": 1.65806}
+        "5": {"min": -2.9115, "max": 2.9115}
+        "6": {"min": 0.0, "max": 1.0}
+
+  # ============================================
+  # Recording Configuration
+  # ============================================
+  recording:
+    bag_base_dir: "~/rosbag/episodes"
+    storage: mcap
+    # This robot's deployed ACT policy was trained from centered-degree joint data.
+    lerobot_norm_mode: degrees
