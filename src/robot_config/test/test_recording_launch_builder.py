@@ -1,6 +1,10 @@
 from launch.substitutions import TextSubstitution
 
-from robot_config.launch_builders.recording import _record_cli_command, generate_rerun_viewer_node
+from robot_config.launch_builders.recording import (
+    _record_cli_command,
+    generate_episodic_recording_node,
+    generate_rerun_viewer_node,
+)
 
 
 def _text(substitutions):
@@ -23,3 +27,24 @@ def test_record_cli_command_uses_session_restart_when_scheduler_enabled():
     assert _record_cli_command("model_inference", scheduler_enabled=True).endswith(
         " -p restart_session_service:=/action_dispatcher/restart_session"
     )
+
+
+def test_rtp_episodic_recording_is_not_launched_on_edge():
+    config = {
+        "_config_path": "/tmp/robot.yaml",
+        "contract": {"observations": [{"transport": {"mode": "rtp"}}]},
+    }
+
+    assert generate_episodic_recording_node(config, "model_inference") == []
+
+
+def test_dds_episodic_recording_still_launches_episode_recorder():
+    config = {
+        "_config_path": "/tmp/robot.yaml",
+        "contract": {"observations": [{"transport": {"mode": "dds"}}]},
+    }
+
+    nodes = generate_episodic_recording_node(config, "teleop")
+
+    assert len(nodes) == 1
+    assert _text(nodes[0].node_executable) == "episode_recorder"

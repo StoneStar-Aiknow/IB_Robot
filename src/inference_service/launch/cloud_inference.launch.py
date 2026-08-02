@@ -1,5 +1,6 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
@@ -13,6 +14,7 @@ def generate_launch_description():
         DeclareLaunchArgument("request_timeout", default_value="5.0"),
         DeclareLaunchArgument("runtime_options_json", default_value="{}"),
         DeclareLaunchArgument("robot_config_path", description="Absolute path to the robot configuration YAML"),
+        DeclareLaunchArgument("recording", default_value="false"),
         DeclareLaunchArgument(
             "node_name",
             default_value=["inference_", LaunchConfiguration("pipeline_id"), "_cloud"],
@@ -43,6 +45,7 @@ def generate_launch_description():
         executable="pure_inference_node",
         name=LaunchConfiguration("node_name"),
         output="screen",
+        condition=UnlessCondition(LaunchConfiguration("recording")),
         parameters=[
             {
                 "pipeline_id": LaunchConfiguration("pipeline_id"),
@@ -61,4 +64,20 @@ def generate_launch_description():
             }
         ],
     )
-    return LaunchDescription([*arguments, cloud_node])
+    recording_node = Node(
+        package="inference_service",
+        executable="recording_node",
+        name="recording_node",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("recording")),
+        parameters=[
+            {
+                "robot_config_path": LaunchConfiguration("robot_config_path"),
+                "pipeline_id": LaunchConfiguration("pipeline_id"),
+                "video_descriptor_topic": LaunchConfiguration("video_descriptor_topic"),
+                "video_status_topic": LaunchConfiguration("video_status_topic"),
+                "runtime_options_json": ParameterValue(LaunchConfiguration("runtime_options_json"), value_type=str),
+            }
+        ],
+    )
+    return LaunchDescription([*arguments, cloud_node, recording_node])

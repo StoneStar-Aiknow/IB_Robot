@@ -54,6 +54,11 @@ class VideoReadinessSpec:
 
 
 @dataclass(frozen=True, slots=True)
+class RecordingSpec:
+    integrity_mode: str = "strict"
+
+
+@dataclass(frozen=True, slots=True)
 class ObservationTransportSpec:
     mode: str = "dds"
     stream_id: str | None = None
@@ -65,6 +70,7 @@ class ObservationTransportSpec:
     media: VideoMediaSpec | None = None
     buffer: VideoBufferSpec | None = None
     readiness: VideoReadinessSpec | None = None
+    recording: RecordingSpec | None = None
     security: str = "none"
 
 
@@ -98,6 +104,7 @@ def parse_observation_transport(value: Any) -> ObservationTransportSpec | None:
             "media",
             "buffer",
             "readiness",
+            "recording",
             "security",
         },
         "transport",
@@ -164,6 +171,11 @@ def parse_observation_transport(value: Any) -> ObservationTransportSpec | None:
             timestamp_mapping_max_age_ms=int(item.get("timestamp_mapping_max_age_ms", 1000)),
             max_inter_camera_skew_ms=int(item.get("max_inter_camera_skew_ms", 50)),
         )
+    recording = None
+    if data.get("recording") is not None:
+        item = _mapping(data["recording"], "transport.recording")
+        _check_fields(item, {"integrity_mode"}, "transport.recording")
+        recording = RecordingSpec(integrity_mode=str(item.get("integrity_mode", "strict")).lower())
     return ObservationTransportSpec(
         mode=mode,
         stream_id=str(data["stream_id"]).strip() if data.get("stream_id") is not None else None,
@@ -175,6 +187,7 @@ def parse_observation_transport(value: Any) -> ObservationTransportSpec | None:
         media=media,
         buffer=buffer,
         readiness=readiness,
+        recording=recording,
         security=str(data.get("security", "none")).lower(),
     )
 
@@ -186,7 +199,10 @@ def effective_observation_transport(value: ObservationTransportSpec | None) -> O
 def observation_transport_to_dict(value: ObservationTransportSpec) -> dict[str, Any]:
     if value.mode == "dds":
         return {"mode": "dds"}
-    return asdict(value)
+    payload = asdict(value)
+    if value.recording is None:
+        payload.pop("recording")
+    return payload
 
 
 def resolve_observation_transport(
@@ -225,6 +241,7 @@ def validate_observation_transports(
     errors: list[str] = []
     stream_ids: dict[str, str] = {}
     endpoints: dict[tuple[str, int], str] = {}
+    integrity_modes: set[str] = set()
     for obs in observations:
         key = str(getattr(obs, "key", "?"))
         ros_type = str(getattr(obs, "type", "") or "")
@@ -236,7 +253,17 @@ def validate_observation_transports(
             errors.append(f"Observation '{key}' transport.mode must be one of: dds, rtp")
             continue
         if value.mode == "dds":
-            if any((value.stream_id, value.endpoint, value.h264, value.media, value.buffer, value.readiness)):
+            if any(
+                (
+                    value.stream_id,
+                    value.endpoint,
+                    value.h264,
+                    value.media,
+                    value.buffer,
+                    value.readiness,
+                    value.recording,
+                )
+            ):
                 errors.append(f"Observation '{key}' DDS transport cannot define RTP-specific fields")
             continue
         if distributed_enabled is False:
@@ -283,6 +310,11 @@ def validate_observation_transports(
             errors.append(f"Observation '{key}' has unsupported video codec backend")
         if value.security != "none":
             errors.append(f"Observation '{key}' transport.security currently must be none")
+        integrity_mode = value.recording.integrity_mode if value.recording is not None else "strict"
+        if integrity_mode not in {"strict", "tolerant"}:
+            errors.append(f"Observation '{key}' transport.recording.integrity_mode must be strict or tolerant")
+        else:
+            integrity_modes.add(integrity_mode)
         if value.buffer is None or min(asdict(value.buffer).values()) <= 0:
             errors.append(f"Observation '{key}' transport.buffer values must be positive")
         if value.readiness is None:
@@ -293,6 +325,8 @@ def validate_observation_transports(
             or value.readiness.max_inter_camera_skew_ms < 0
         ):
             errors.append(f"Observation '{key}' transport.readiness values are invalid")
+    if len(integrity_modes) > 1:
+        errors.append("integrity_mode must be uniform across episode (found both strict and tolerant)")
     return errors
 
 

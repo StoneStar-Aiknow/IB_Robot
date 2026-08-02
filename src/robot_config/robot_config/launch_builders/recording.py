@@ -301,6 +301,12 @@ def generate_episodic_recording_node(
         logger.error("No 'contract' section found in robot configuration.")
         logger.info("  Please add 'contract' section with observations and actions.")
         return []
+    if any(
+        isinstance(obs, dict) and isinstance(obs.get("transport"), dict) and obs["transport"].get("mode") == "rtp"
+        for obs in contract_config.get("observations", [])
+    ):
+        logger.info("RTP episodic recording is owned by the cloud recording_node")
+        return []
 
     # Determine bag output directory
     recording_config = robot_config.get("recording", {})

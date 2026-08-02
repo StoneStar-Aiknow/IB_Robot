@@ -200,6 +200,7 @@ observations:
         color_range: limited
       buffer: {sender_queue_frames: 2, receiver_queue_packets: 256, decoded_frame_capacity: 32, retention_ms: 1000}
       readiness: {keyframe_timeout_ms: 3000, timestamp_mapping_max_age_ms: 1000, max_inter_camera_skew_ms: 50}
+      recording: {integrity_mode: strict}
       security: none
 ```
 
@@ -213,6 +214,14 @@ integrity protection and is limited to a trusted robot network. Use an explicit
 Development examples are available in `config/robots/dev_rtp_single_camera.yaml`
 and `config/robots/dev_rtp_multi_camera.yaml`; production profiles remain DDS by
 default.
+
+`transport.recording.integrity_mode` controls episode-level RTP recording integrity:
+
+- `strict` is the default. Any RTP packet gap, timestamp mapping failure, or session
+  generation change rejects the episode and removes every RTP stream recorded for it.
+- `tolerant` preserves the episode and records gaps in each `.h264.json` NDJSON sidecar.
+- All RTP observations in one contract must use the same mode. Mixed strict/tolerant
+  declarations are rejected during contract validation.
 
 `nvidia` 当前仅支持 encoder，典型组合是 edge 使用 `encoder_backend: nvidia`，310B cloud 使用
 `decoder_backend: ascend`。`auto` 的 encoder 探测顺序为 `ascend`、`nvidia`、`software`；显式选择

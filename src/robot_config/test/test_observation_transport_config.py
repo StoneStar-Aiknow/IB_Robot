@@ -15,7 +15,9 @@ from robot_config.generators.contract import (
 from robot_config.loader import load_robot_config
 from robot_config.observation_transport import (
     ObservationTransportSpec,
+    RecordingSpec,
     effective_observation_transport,
+    observation_transport_to_dict,
     parse_observation_transport,
     validate_observation_transports,
     validate_robot_config_observation_transports,
@@ -73,6 +75,40 @@ def test_rtp_transport_parses_and_validates():
     assert transport.media.width == 640
     assert transport.buffer.retention_ms == 1000
     assert validate_observation_transports(contract.observations) == []
+
+
+def test_recording_integrity_mode_round_trip_and_fingerprint():
+    strict_observation = _rtp_observation()
+    strict_observation["transport"]["recording"] = {"integrity_mode": "strict"}
+    tolerant_observation = _rtp_observation()
+    tolerant_observation["transport"]["recording"] = {"integrity_mode": "tolerant"}
+
+    strict = _contract(strict_observation)
+    tolerant = _contract(tolerant_observation)
+
+    assert strict.observations[0].transport.recording == RecordingSpec("strict")
+    assert tolerant.observations[0].transport.recording == RecordingSpec("tolerant")
+    assert contract_fingerprint(strict) != contract_fingerprint(tolerant)
+
+
+def test_omitted_recording_section_stays_absent_from_serialized_transport():
+    transport = _contract(_rtp_observation()).observations[0].transport
+
+    assert "recording" not in observation_transport_to_dict(transport)
+
+
+def test_recording_integrity_mode_validation_rejects_invalid_and_mixed_values():
+    invalid = _rtp_observation()
+    invalid["transport"]["recording"] = {"integrity_mode": "best-effort"}
+    with pytest.raises(ValueError, match="integrity_mode"):
+        _contract(invalid)
+
+    strict = _contract(_rtp_observation(stream_id="top", port=5004)).observations[0]
+    tolerant_raw = _rtp_observation(stream_id="wrist", port=5006)
+    tolerant_raw["key"] = "observation.images.wrist"
+    tolerant_raw["transport"]["recording"] = {"integrity_mode": "tolerant"}
+    tolerant = _contract(tolerant_raw).observations[0]
+    assert any("uniform across episode" in error for error in validate_observation_transports([strict, tolerant]))
 
 
 def test_peripheral_values_complete_rtp_media():
