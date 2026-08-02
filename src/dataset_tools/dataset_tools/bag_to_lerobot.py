@@ -79,7 +79,7 @@ import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import rosbag2_py
@@ -138,6 +138,146 @@ class _Stream:
     ros_type: str
     ts: list[int]
     val: list[Any]
+
+
+# ---------------------------------------------------------------------------
+# Input adapters
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class VideoFrameEntry:
+    """One decoded video frame with its capture timestamp and integrity metadata.
+
+    Attributes
+    ----------
+    timestamp_ns : int
+        Capture timestamp in nanoseconds (RTP-mapped for Annex-B sources).
+    image : Any
+        Decoded frame as an HWC uint8 numpy array (RGB).
+    keyframe : bool
+        True when this frame is an IDR/keyframe.
+    lost_packets : int
+        RTP packets lost immediately before this frame (0 when clean).
+    """
+
+    timestamp_ns: int
+    image: Any
+    keyframe: bool = False
+    lost_packets: int = 0
+
+
+@dataclass
+class IntegrityReport:
+    """Per-episode integrity summary propagated into LeRobot ``info.json``.
+
+    Attributes
+    ----------
+    clean : bool
+        True when no frame gaps or dropped frames were recorded.
+    frame_gaps : list[dict[str, Any]]
+        One entry per affected frame: ``frame_index``, ``lost_packets``, ``reason``.
+    """
+
+    clean: bool = True
+    frame_gaps: list[dict[str, Any]] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Render as the ``integrity`` block written into dataset ``info.json``."""
+        payload: dict[str, Any] = {"clean": self.clean}
+        if self.frame_gaps:
+            payload["frame_gaps"] = self.frame_gaps
+        return payload
+
+
+def _merge_integrity_report(
+    dataset_info: dict[str, Any],
+    episode_index: int,
+    obs_key: str,
+    report: IntegrityReport,
+) -> None:
+    """Merge one Annex-B stream report into dataset-level integrity metadata."""
+    integrity = dataset_info.setdefault("integrity", {"clean": True})
+    if report.clean:
+        return
+
+    integrity["clean"] = False
+    frame_gaps = integrity.setdefault("frame_gaps", [])
+    for gap in report.frame_gaps or []:
+        frame_gaps.append(
+            {
+                "episode_index": episode_index,
+                "observation_key": obs_key,
+                **gap,
+            }
+        )
+
+
+class VideoInputAdapter(Protocol):
+    """Read decoded video frames for one observation key from an episode directory.
+
+    Implementations supply visual observations from a specific on-disk format.
+    Non-visual observations (action, state, task) always come from the rosbag and
+    are not routed through this abstraction.
+
+    ``AnnexBInputAdapter`` implements this for ``.h264`` + ``.h264.json`` pairs
+    produced by cross-device RTP recording. DDS recordings keep reading images
+    from the rosbag directly, so they need no adapter.
+    """
+
+    def list_observations(self) -> list[str]:
+        """Return observation keys this adapter can supply."""
+        ...
+
+    def read_frames(self, obs_key: str) -> list[VideoFrameEntry]:
+        """Return all frames for ``obs_key`` in capture-timestamp order."""
+        ...
+
+    def integrity_report(self, obs_key: str) -> IntegrityReport:
+        """Return the integrity summary recorded for ``obs_key``."""
+        ...
+
+    def close(self) -> None:
+        """Release any open file handles or decoders."""
+        ...
+
+
+def discover_video_adapters(episode_dir: Path) -> dict[str, VideoInputAdapter]:
+    """Detect recorded video streams in ``episode_dir`` and build their adapters.
+
+    Detection is filesystem-based rather than contract-based, so it reflects what
+    was actually recorded even when a run ends early. An episode with no ``.h264``
+    files yields an empty mapping, which keeps DDS-only conversions on the
+    original rosbag path.
+
+    Parameters
+    ----------
+    episode_dir : Path
+        Episode directory to scan (contains the rosbag plus any video streams).
+
+    Returns
+    -------
+    dict[str, VideoInputAdapter]
+        Mapping from observation key to the adapter serving it.
+    """
+    streams = sorted(episode_dir.glob("*.h264"))
+    if not streams:
+        return {}
+
+    from dataset_tools.annex_b_input_adapter import AnnexBInputAdapter
+
+    adapters: dict[str, VideoInputAdapter] = {}
+    try:
+        for stream_path in streams:
+            obs_key = stream_path.stem
+            if obs_key in adapters:
+                raise ValueError(f"Duplicate external video observation: {obs_key}")
+            adapters[obs_key] = AnnexBInputAdapter(stream_path)
+    except Exception:
+        for adapter in adapters.values():
+            adapter.close()
+        raise
+    return adapters
 
 
 # ---------------------------------------------------------------------------
@@ -393,8 +533,10 @@ def _log_image_stream_diagnostics(
     ticks_ns: np.ndarray,
     step_ns: int,
     target_fps: int,
+    video_sources: dict[str, str] | None = None,
 ) -> None:
     """Log observed image rates and repeated-frame ratios after resampling."""
+    video_sources = video_sources or {}
     for key, st in streams.items():
         if st.spec.image_resize is None or not st.ts:
             continue
@@ -411,10 +553,16 @@ def _log_image_stream_diagnostics(
         used_frames = int(np.count_nonzero(selected >= 0))
         unique_frames = int(np.unique(selected[selected >= 0]).size) if used_frames else 0
         repeated_ratio = 1.0 - (unique_frames / len(ticks_ns)) if len(ticks_ns) else 0.0
+        valid_ticks = np.flatnonzero(selected >= 0)
+        max_alignment_error_ms = 0.0
+        if len(valid_ticks):
+            selected_ts = ts[selected[valid_ticks]]
+            max_alignment_error_ms = float(np.max(np.abs(ticks_ns[valid_ticks] - selected_ts)) / 1e6)
         print(
-            f"  [diag] {key}: source_frames={len(st.ts)} (~{rate_hz:.1f} Hz), "
+            f"  [diag] {key}: source={video_sources.get(key, 'rosbag')}, "
+            f"source_frames={len(st.ts)} (~{rate_hz:.1f} Hz), "
             f"unique_output_frames={unique_frames}/{len(ticks_ns)}, "
-            f"repeated_frame_ratio={repeated_ratio:.1%}"
+            f"repeated_frame_ratio={repeated_ratio:.1%}, max_alignment_error={max_alignment_error_ms:.3f} ms"
         )
         if rate_hz > 0 and rate_hz < target_fps * 0.9:
             print(
@@ -431,6 +579,7 @@ def _log_image_stream_diagnostics(
 def _plan_streams(
     specs: Iterable[Any],
     tmap: dict[str, str],
+    external_video_keys: set[str] | None = None,
 ) -> tuple[dict[str, _Stream], dict[str, list[str]]]:
     """Plan `_Stream` buffers for contract specs and build a topic dispatch index.
 
@@ -453,10 +602,14 @@ def _plan_streams(
     RuntimeError
         If none of the contract topics exist in the bag.
     """
+    external_video_keys = external_video_keys or set()
     streams: dict[str, _Stream] = {}
     by_topic: dict[str, list[str]] = {}
     for sv in specs:
-        if sv.topic not in tmap:
+        uses_external_video = sv.key in external_video_keys
+        if uses_external_video and sv.image_resize is None:
+            raise ValueError(f"External video input '{sv.key}' does not map to an image observation in the contract")
+        if sv.topic not in tmap and not uses_external_video:
             # Derive a human-readable kind for logging without assuming SpecView internals.
             if hasattr(sv, "is_action") and sv.is_action:
                 kind = "action"
@@ -466,7 +619,7 @@ def _plan_streams(
                 kind = "observation"
             print(f"[WARN] Missing {kind} '{getattr(sv, 'key', '?')}' topic in bag: {sv.topic}")
             continue
-        rt = sv.ros_type or tmap[sv.topic]
+        rt = sv.ros_type or tmap.get(sv.topic, "")
 
         # Create unique key for multiple observation.state specs and action specs
         if sv.key == "observation.state":
@@ -482,7 +635,8 @@ def _plan_streams(
             unique_key = sv.key
 
         streams[unique_key] = _Stream(spec=sv, ros_type=rt, ts=[], val=[])
-        by_topic.setdefault(sv.topic, []).append(unique_key)
+        if not uses_external_video:
+            by_topic.setdefault(sv.topic, []).append(unique_key)
     if not streams:
         raise RuntimeError("No contract topics found in bag.")
     return streams, by_topic
@@ -700,7 +854,12 @@ def export_bags_to_lerobot(
         # Per-episode point cloud buffer (one entry per key)
         pc_buf: dict[str, dict[str, list]] = {k: {"xyz": [], "rgb": [], "ts": []} for k in pc_keys}
 
+        video_adapters: dict[str, VideoInputAdapter] = {}
+        video_sources: dict[str, str] = {}
+        integrity_reports: dict[str, IntegrityReport] = {}
         try:
+            video_adapters = discover_video_adapters(bag_dir)
+            video_sources.update({key: "Annex-B" for key in video_adapters})
             meta = _read_yaml(bag_dir / "metadata.yaml")
             dataset_meta = _dataset_metadata_for_bag(bag_dir)
             info = meta.get("rosbag2_bagfile_information") or {}
@@ -726,6 +885,8 @@ def export_bags_to_lerobot(
                 ),
             )
         except Exception as e:
+            for adapter in video_adapters.values():
+                adapter.close()
             print(f"⚠️  Skipping bag {bag_dir} due to error: {e}")
             continue
 
@@ -733,7 +894,20 @@ def export_bags_to_lerobot(
         print(f"tmap: {tmap}")
 
         # Plan once - handle multiple observation.state specs and action specs
-        streams, by_topic = _plan_streams(specs, tmap)
+        streams, by_topic = _plan_streams(specs, tmap, set(video_adapters))
+
+        try:
+            for obs_key, adapter in video_adapters.items():
+                if obs_key not in streams:
+                    raise ValueError(f"Annex-B observation '{obs_key}' is not defined by the robot contract")
+                frames = adapter.read_frames(obs_key)
+                streams[obs_key].ts.extend(frame.timestamp_ns for frame in frames)
+                streams[obs_key].val.extend(frame.image for frame in frames)
+                integrity_reports[obs_key] = adapter.integrity_report(obs_key)
+                print(f"  [video] {obs_key}: source=Annex-B, decoded_frames={len(frames)}")
+        finally:
+            for adapter in video_adapters.values():
+                adapter.close()
 
         # Create consolidated observation.state stream if we have multiple state specs
         if state_specs:
@@ -746,7 +920,7 @@ def export_bags_to_lerobot(
         print(f"streams: {streams}")
 
         # Counters for light diagnostics
-        decoded_msgs = 0
+        decoded_msgs = sum(len(st.val) for st in streams.values())
 
         # Decode single pass
         while reader.has_next():
@@ -779,6 +953,14 @@ def export_bags_to_lerobot(
 
         if decoded_msgs == 0:
             raise RuntimeError(f"No usable messages in {bag_dir} (none decoded).")
+        if video_adapters:
+            has_action = any(st.spec.is_action and st.ts for st in streams.values())
+            has_state = any(st.spec.key == "observation.state" and st.ts for st in streams.values())
+            if not has_action or not has_state:
+                raise RuntimeError(
+                    f"action/state data required for LeRobot dataset: {bag_dir} "
+                    f"(action={'present' if has_action else 'missing'}, state={'present' if has_state else 'missing'})"
+                )
 
         # Choose anchor + duration
         valid_ts = [np.asarray(st.ts, dtype=np.int64) for st in streams.values() if st.ts]
@@ -809,6 +991,7 @@ def export_bags_to_lerobot(
             ticks_ns=ticks_ns,
             step_ns=step_ns,
             target_fps=fps,
+            video_sources=video_sources,
         )
 
         # Resample onto ticks
@@ -977,6 +1160,9 @@ def export_bags_to_lerobot(
             frame["task"] = prompt if prompt else ""
             ds.add_frame(frame)
 
+        output_episode_index = int(ds.meta.info["total_episodes"])
+        for obs_key, report in integrity_reports.items():
+            _merge_integrity_report(ds.meta.info, output_episode_index, obs_key, report)
         ds.save_episode()
         expected_duration_s = n_ticks / fps if fps > 0 else 0
         print(
