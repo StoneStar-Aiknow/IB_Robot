@@ -34,6 +34,11 @@ Both comparisons use the same:
 - source Torch bundle and deployment;
 - preprocessing and postprocessing semantics.
 
+Persist stochastic control inputs as versioned artifacts with explicit canonical storage dtype and each
+backend's consumer dtype. Do not assume that a policy's dominant weight dtype is also its noise input dtype;
+inspect the actual consuming layer or manifest binding. When Torch and OM consume different dtypes, preserve
+one canonical FP32 sample and independently cast it once at each backend boundary.
+
 Generate targets only from the original Torch deployment as described in `multi-host-validation.md`.
 Never regenerate targets from ONNX or OM.
 
@@ -58,6 +63,10 @@ hashes, exporter command, opset, runtime versions, thresholds, metrics, and verd
 
 If ONNX Runtime cannot execute because of environment limits, diagnose and repair the environment or
 portable graph. Do not substitute successful `onnx.checker` for numerical equivalence.
+
+For split or patched exporters, also prove native Torch policy vs split Torch wrapper equivalence before
+interpreting Torch-vs-ONNX results. A pure refactor must be bit-identical at the same dtype. Test each exporter
+monkey patch independently; do not let a global patch mutate the native reference in the same process.
 
 ## Torch Vs Ascend OM
 
@@ -94,3 +103,9 @@ Every performance candidate must rerun any comparison affected by its changes:
 - preprocessing, action, schedule, or other semantic changes: hard user approval, then both gates.
 
 A candidate that improves latency but fails accepted accuracy limits is rejected and rolled back.
+
+## Troubleshooting
+
+When a gate fails, follow `precision-troubleshooting.md`. It records proven failure modes involving image
+resize/padding, static vision position IDs, FP16 Softmax, task/token alignment, noise provenance, opset
+lowering, eval-mode audits, and invalid comparison harnesses.

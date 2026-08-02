@@ -26,6 +26,7 @@ Read only the references needed for the selected route:
 | New LeRobot policy port | `references/port-new-policy.md` |
 | Multi-host target workflow | `references/multi-host-validation.md` |
 | Accuracy gates | `references/accuracy.md` |
+| Precision drift troubleshooting and proven fixes | `references/precision-troubleshooting.md` |
 | OM performance baseline | `references/benchmark.md` |
 | Optional optimization | `references/optimize.md` |
 
@@ -161,6 +162,8 @@ evidence, ATC version, target, and resolution source.
 - Use one versioned observation batch and the same task, seed, targets, raw targets, and noises across
   Torch, ONNX, and OM checks.
 - Perform only two numerical gates: Torch vs ONNX and Torch vs Ascend OM. Follow `accuracy.md`.
+- If accuracy is below the accepted limit, or a new policy needs exporter/runtime rewrites, read
+  `precision-troubleshooting.md` before changing compiler precision, preprocessing, or graph math.
 - Benchmark every final OM with `ais_bench --loop 50` and compute the invocation-weighted sum. Follow
   `benchmark.md`.
 - Do not run `hardware_mock`, LTTng, tracing, or trace-summary validation in conversion or optimization.
