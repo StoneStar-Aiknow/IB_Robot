@@ -599,6 +599,8 @@ def test_launch_generation_emits_distributed_edge_with_transport_parameters(tmp_
     assert params["request_topic"] == "/inference/edge/request"
     assert params["result_topic"] == "/inference/edge/result"
     assert params["heartbeat_topic"] == "/inference/edge/heartbeat"
+    assert params["video_descriptor_topic"] == "/inference/edge/video/descriptors"
+    assert params["video_status_topic"] == "/inference/edge/video/status"
 
 
 def test_launch_generation_supports_mixed_execution_modes(tmp_path):

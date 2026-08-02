@@ -6,7 +6,6 @@ import json
 import threading
 import time
 import traceback
-from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,15 +28,19 @@ from ibrobot_msgs.msg import (
     DistributedInferenceResult,
     InferencePipelineStatus,
     VariantsList,
+    VideoStreamDescriptor,
+    VideoStreamStatus,
 )
 from inference_manifest import ValidatedManifest, load_inference_manifest, load_inference_manifest_metadata
 from inference_service.backends import InferenceRequest
+from inference_service.device_video_streams import DeviceVideoStreamManager
 from inference_service.distributed import (
     DistributedProtocolError,
     DistributedResult,
     EdgeProcessorRuntime,
     EdgeSession,
     Operation,
+    StreamReference,
     StructuredError,
     build_pipeline_identity,
     structured_error_from_exception,
@@ -48,10 +51,14 @@ from inference_service.distributed.ros_protocol import (
     result_from_message,
     status_from_message,
     status_to_message,
+    video_descriptor_to_message,
+    video_status_to_message,
 )
 from inference_service.pipeline import InferencePipelineManager, create_pipeline_manager
 from robot_config.contract_utils import (
     SpecView,
+    StreamBuffer,
+    contract_fingerprint,
     decode_value,
     iter_specs,
     qos_profile_from_dict,
@@ -87,6 +94,8 @@ class PipelineNodeConfig:
     request_topic: str
     result_topic: str
     heartbeat_topic: str
+    video_descriptor_topic: str
+    video_status_topic: str
 
 
 @dataclass
@@ -95,7 +104,22 @@ class _SubState:
     max_age_ns: int
     step_ns: int
     history_window_ns: int
-    history: list[tuple[int, int, object]] = field(default_factory=list)
+    buffer: StreamBuffer = field(init=False)
+
+    def __post_init__(self) -> None:
+        policy = str(getattr(self.spec, "resample_policy", "hold")).lower()
+        tolerance_ns = max(0, int(getattr(self.spec, "asof_tol_ms", 0))) * 1_000_000
+        self.buffer = StreamBuffer(
+            policy,
+            self.step_ns,
+            tolerance_ns,
+            max_age_ns=self.max_age_ns,
+            retention_ns=self.history_window_ns,
+        )
+
+    @property
+    def history(self) -> list[tuple[int, int, object]]:
+        return self.buffer.history
 
 
 @dataclass
@@ -158,6 +182,7 @@ class PipelinePolicyNode(Node):
         self._manager: InferencePipelineManager | None = None
         self._edge_runtime: EdgeProcessorRuntime | None = None
         self._edge_session: EdgeSession | None = None
+        self._video_stream_manager: DeviceVideoStreamManager | None = None
         manifest_loader = (
             load_inference_manifest if config.execution_mode == "monolithic" else load_inference_manifest_metadata
         )
@@ -214,12 +239,23 @@ class PipelinePolicyNode(Node):
             self._edge_runtime.load()
             self._edge_session = EdgeSession(build_pipeline_identity(config.pipeline_id, self._manifest))
             self._edge_session.start()
+            self._video_stream_manager = DeviceVideoStreamManager(
+                pipeline_id=config.pipeline_id,
+                contract_fingerprint=contract_fingerprint(self._contract),
+                deployment_fingerprint=self._manifest.fingerprint,
+                observation_specs=self._obs_specs,
+            )
 
         self._action_pub = self.create_publisher(VariantsList, config.action_topic, 10)
         self._health_pub = self.create_publisher(DiagnosticStatus, config.health_topic, 10)
         if config.execution_mode == "distributed":
             status_qos = QoSProfile(
                 depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            )
+            descriptor_qos = QoSProfile(
+                depth=max(1, len(self._video_stream_manager.diagnostic_snapshots())),
                 reliability=ReliabilityPolicy.RELIABLE,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
             )
@@ -232,6 +268,10 @@ class PipelinePolicyNode(Node):
                 callback_group=ReentrantCallbackGroup(),
             )
             self._status_pub = self.create_publisher(InferencePipelineStatus, config.heartbeat_topic, status_qos)
+            self._video_descriptor_pub = self.create_publisher(
+                VideoStreamDescriptor, config.video_descriptor_topic, descriptor_qos
+            )
+            self._video_status_pub = self.create_publisher(VideoStreamStatus, config.video_status_topic, 10)
             self.create_subscription(
                 InferencePipelineStatus,
                 config.heartbeat_topic,
@@ -241,6 +281,7 @@ class PipelinePolicyNode(Node):
             )
             self._status_timer = self.create_timer(0.5, self._publish_distributed_status)
             self._heartbeat_timer = self.create_timer(0.25, self._check_heartbeat)
+            self._video_status_timer = self.create_timer(0.25, self._publish_video_stream_control)
         self._action_server = rclpy.action.ActionServer(
             self,
             DispatchInfer,
@@ -260,6 +301,7 @@ class PipelinePolicyNode(Node):
             callback_group=self._reset_callback_group,
         )
         self._health_timer = self.create_timer(1.0, self._publish_health)
+        self._log_video_stream_diagnostics()
         self.get_logger().info(
             f"Unified pipeline started: id={config.pipeline_id}, mode={config.execution_mode}, "
             f"bundle={self._manifest.manifest.bundle.name}, "
@@ -375,9 +417,21 @@ class PipelinePolicyNode(Node):
                 reset_cutoff_ns = 0
             if timestamp is not None and timestamp <= reset_cutoff_ns:
                 return
-            PipelinePolicyNode._store_observation_locked(
+            stored = PipelinePolicyNode._store_observation_locked(
                 self, self._subscription_key(spec), epoch, int(timestamp or receive_time), receive_time, message
             )
+        manager = getattr(self, "_video_stream_manager", None)
+        if stored and manager is not None and spec.key in manager.observation_keys:
+            try:
+                manager.submit_ros_image(
+                    spec.key,
+                    message,
+                    capture_timestamp_ns=int(timestamp or receive_time),
+                    receive_timestamp_ns=receive_time,
+                )
+            except Exception as exc:
+                self._last_error = f"video stream {spec.key} failed: {exc}"
+                self.get_logger().error(self._last_error, throttle_duration_sec=1.0)
 
     def _store_observation(
         self,
@@ -405,18 +459,29 @@ class PipelinePolicyNode(Node):
         if epoch != node._observation_epoch:
             return False
         state = node._subs[key]
-        if timestamp_ns > receive_time_ns + state.history_window_ns:
-            return False
-        history = state.history
-        index = bisect_right([item[0] for item in history], timestamp_ns)
-        item = (timestamp_ns, receive_time_ns, value)
-        if index > 0 and history[index - 1][0] == timestamp_ns:
-            history[index - 1] = item
-        else:
-            history.insert(index, item)
-        cutoff_ns = min(history[-1][0], receive_time_ns) - state.history_window_ns
-        del history[: bisect_left([item[0] for item in history], cutoff_ns)]
-        return True
+        return PipelinePolicyNode._buffer_for_state(state).push(
+            timestamp_ns,
+            value,
+            receive_time_ns=receive_time_ns,
+        )
+
+    @staticmethod
+    def _buffer_for_state(state: object) -> StreamBuffer:
+        buffer = getattr(state, "buffer", None)
+        if buffer is not None:
+            return buffer
+        spec = state.spec
+        buffer = StreamBuffer(
+            str(getattr(spec, "resample_policy", "hold")).lower(),
+            state.step_ns,
+            max(0, int(getattr(spec, "asof_tol_ms", 0))) * 1_000_000,
+            max_age_ns=state.max_age_ns,
+            retention_ns=state.history_window_ns,
+        )
+        buffer.history.extend(state.history)
+        state.buffer = buffer
+        state.history = buffer.history
+        return buffer
 
     @staticmethod
     def _sample_observation(
@@ -426,76 +491,14 @@ class PipelinePolicyNode(Node):
         *,
         check_live_age: bool = True,
     ) -> tuple[Any | None, dict[str, object] | None]:
-        spec = state.spec
-        if not state.history:
-            return None, {
-                "key": spec.key,
-                "topic": spec.topic,
-                "reason": "missing",
-                "sample_timestamp_ns": sample_time_ns,
-            }
-
-        index = bisect_right([item[0] for item in state.history], sample_time_ns) - 1
-        if index < 0:
-            timestamp_ns = state.history[0][0]
-            return None, {
-                "key": spec.key,
-                "topic": spec.topic,
-                "reason": "newer_than_request",
-                "sample_timestamp_ns": sample_time_ns,
-                "first_timestamp_ns": timestamp_ns,
-                "age_ms": (sample_time_ns - timestamp_ns) / 1_000_000,
-            }
-
-        timestamp_ns, receive_time_ns, value = state.history[index]
-        age_ns = sample_time_ns - timestamp_ns
-        policy = str(getattr(spec, "resample_policy", "hold")).lower()
-        if policy == "asof":
-            alignment_tolerance_ns = max(0, int(getattr(spec, "asof_tol_ms", 0))) * 1_000_000
-            if alignment_tolerance_ns > 0 and age_ns > alignment_tolerance_ns:
-                return None, {
-                    "key": spec.key,
-                    "topic": spec.topic,
-                    "reason": "stale",
-                    "constraint": "asof",
-                    "sample_timestamp_ns": sample_time_ns,
-                    "last_timestamp_ns": timestamp_ns,
-                    "age_ms": age_ns / 1_000_000,
-                    "tolerance_ms": alignment_tolerance_ns / 1_000_000,
-                }
-        elif policy == "drop":
-            if age_ns >= state.step_ns:
-                return None, {
-                    "key": spec.key,
-                    "topic": spec.topic,
-                    "reason": "stale",
-                    "constraint": "drop",
-                    "sample_timestamp_ns": sample_time_ns,
-                    "last_timestamp_ns": timestamp_ns,
-                    "age_ms": age_ns / 1_000_000,
-                    "tolerance_ms": state.step_ns / 1_000_000,
-                }
-        elif policy != "hold":
-            return None, {
-                "key": spec.key,
-                "topic": spec.topic,
-                "reason": "unsupported_alignment_strategy",
-                "strategy": policy,
-            }
-
-        live_age_ns = max(0, (now_ns if now_ns is not None else sample_time_ns) - receive_time_ns)
-        if value is None or (check_live_age and state.max_age_ns > 0 and live_age_ns > state.max_age_ns):
-            return None, {
-                "key": spec.key,
-                "topic": spec.topic,
-                "reason": "stale",
-                "constraint": "max_age",
-                "sample_timestamp_ns": sample_time_ns,
-                "last_timestamp_ns": timestamp_ns,
-                "age_ms": live_age_ns / 1_000_000,
-                "tolerance_ms": state.max_age_ns / 1_000_000,
-            }
-        return value, None
+        value, issue = PipelinePolicyNode._buffer_for_state(state).select(
+            sample_time_ns,
+            now_ns=now_ns,
+            check_live_age=check_live_age,
+        )
+        if issue is not None:
+            issue = {"key": state.spec.key, "topic": state.spec.topic, **issue}
+        return value, issue
 
     @staticmethod
     def _sample_observation_history(
@@ -525,7 +528,9 @@ class PipelinePolicyNode(Node):
             values.append(value)
         return values, None
 
-    def _sample_observations(self, sample_time_ns: int) -> dict[str, Any]:
+    def _sample_observations(
+        self, sample_time_ns: int, *, skip_decode_keys: frozenset[str] = frozenset()
+    ) -> dict[str, Any]:
         selected: dict[str, object] = {}
         issues: list[dict[str, object]] = []
         now_ns = self.get_clock().now().nanoseconds if hasattr(self, "get_clock") else sample_time_ns
@@ -548,6 +553,8 @@ class PipelinePolicyNode(Node):
         decode_issues: list[dict[str, object]] = []
         for key, message in selected.items():
             state = self._subs[key]
+            if state.spec.key in skip_decode_keys:
+                continue
             messages = message if self._n_obs_steps > 1 else [message]
             values = [decode_value(state.spec.ros_type, item, state.spec) for item in messages]
             if any(value is None for value in values):
@@ -575,7 +582,10 @@ class PipelinePolicyNode(Node):
             if reset_time_ns is not None:
                 self._observation_reset_cutoff_ns = max(self._observation_reset_cutoff_ns, reset_time_ns)
             for state in self._subs.values():
-                state.history.clear()
+                PipelinePolicyNode._buffer_for_state(state).reset()
+        video_stream_manager = getattr(self, "_video_stream_manager", None)
+        if video_stream_manager is not None:
+            video_stream_manager.reset()
 
     def _rad_to_lerobot(self, state: np.ndarray) -> np.ndarray:
         if not self._joint_rad_limits:
@@ -752,12 +762,17 @@ class PipelinePolicyNode(Node):
         if deadline is None:
             deadline = datetime.now(timezone.utc) + timedelta(seconds=self._config.request_timeout)
         self._raise_if_deadline_expired(deadline, request_id)
-        observations = self._sample_observations(sample_time)
+        video_keys = (
+            self._video_stream_manager.observation_keys
+            if self._config.execution_mode == "distributed" and self._video_stream_manager is not None
+            else frozenset()
+        )
+        observations = self._sample_observations(sample_time, skip_decode_keys=video_keys)
         self._raise_if_deadline_expired(deadline, request_id)
         if "observation.state" in observations:
             observations["observation.state"] = self._rad_to_lerobot(observations["observation.state"])
-        observations = self._to_policy_inputs(observations)
         if self._config.execution_mode == "monolithic":
+            observations = self._to_policy_inputs(observations)
             result = self._require_manager().infer(
                 self._config.pipeline_id,
                 InferenceRequest(
@@ -778,6 +793,15 @@ class PipelinePolicyNode(Node):
                     observations,
                     prompt=request.prompt if request.prompt else None,
                 )
+                video_manager = self._video_stream_manager
+                stream_references: tuple[StreamReference, ...] = ()
+                if video_manager is not None:
+                    stream_references = video_manager.stream_references
+                    canonical_inputs = {
+                        key: value
+                        for key, value in canonical_inputs.items()
+                        if key not in video_manager.observation_keys
+                    }
                 self._raise_if_deadline_expired(deadline, request_id)
                 distributed_result = self._round_trip(
                     Operation.INFER,
@@ -786,6 +810,8 @@ class PipelinePolicyNode(Node):
                     prompt=request.prompt if request.prompt else None,
                     deadline=deadline,
                     goal_handle=goal_handle,
+                    observation_timestamp_ns=sample_time if stream_references else 0,
+                    stream_references=stream_references,
                 )
                 self._raise_if_deadline_expired(deadline, request_id)
                 if self._goal_cancel_requested(goal_handle):
@@ -937,6 +963,14 @@ class PipelinePolicyNode(Node):
                     "session_id": session_id,
                     "session_generation": generation,
                 }
+                video_manager = self._video_stream_manager
+                if video_manager is not None:
+                    snapshots = video_manager.diagnostic_snapshots()
+                    values["video_stream.count"] = len(snapshots)
+                    for snapshot in snapshots:
+                        values[f"video_stream.{snapshot.observation_key}"] = self._format_video_stream_diagnostic(
+                            snapshot
+                        )
             values.update(
                 {
                     "inference_count": self._inference_count,
@@ -956,6 +990,37 @@ class PipelinePolicyNode(Node):
         health.values = [KeyValue(key=str(key), value=str(value)) for key, value in values.items()]
         self._health_pub.publish(health)
 
+    @staticmethod
+    def _format_video_stream_diagnostic(snapshot: object) -> str:
+        return json.dumps(
+            {
+                "stream_id": snapshot.stream_id,
+                "mode": snapshot.mode,
+                "configured_encoder_backend": snapshot.configured_encoder_backend,
+                "selected_encoder_backend": snapshot.selected_encoder_backend,
+                "configured_decoder_backend": snapshot.configured_decoder_backend,
+                "selected_decoder_backend": snapshot.selected_decoder_backend,
+                "endpoint": f"{snapshot.endpoint[0]}:{snapshot.endpoint[1]}",
+                "contract_fingerprint": snapshot.contract_fingerprint,
+                "deployment_fingerprint": snapshot.deployment_fingerprint,
+                "security": snapshot.security,
+                "lifecycle_state": snapshot.lifecycle_state,
+                "ready": snapshot.ready,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _log_video_stream_diagnostics(self) -> None:
+        manager = self._video_stream_manager
+        if manager is None:
+            return
+        for snapshot in manager.diagnostic_snapshots():
+            self.get_logger().info(
+                f"Video stream startup: observation={snapshot.observation_key}, "
+                f"diagnostic={self._format_video_stream_diagnostic(snapshot)}"
+            )
+
     def _cloud_status_callback(self, message: InferencePipelineStatus) -> None:
         if message.role != InferencePipelineStatus.ROLE_CLOUD:
             return
@@ -964,6 +1029,14 @@ class PipelinePolicyNode(Node):
             update = self._require_edge_session().observe_cloud(status)
             self._remote_state = status.runtime_state
             self._complete_invalidated(update.invalidated_request_ids, update.error)
+            video_manager = self._video_stream_manager
+            if video_manager is not None:
+                session_id, session_generation = self._require_edge_session().session
+                if session_id:
+                    if video_manager.bind_session(session_id, session_generation):
+                        self._publish_video_stream_control()
+                else:
+                    video_manager.clear_session()
         except Exception as exc:
             self._last_error = f"invalid cloud status: {exc}"
             self.get_logger().error(self._last_error)
@@ -981,6 +1054,22 @@ class PipelinePolicyNode(Node):
     def _check_heartbeat(self) -> None:
         update = self._require_edge_session().expire_heartbeat()
         self._complete_invalidated(update.invalidated_request_ids, update.error)
+        if update.error is not None and self._video_stream_manager is not None:
+            self._video_stream_manager.clear_session()
+
+    def _publish_video_stream_control(self) -> None:
+        manager = self._video_stream_manager
+        if manager is None:
+            return
+        stamp = self.get_clock().now().to_msg()
+        try:
+            for descriptor in manager.descriptors():
+                self._video_descriptor_pub.publish(video_descriptor_to_message(descriptor, stamp=stamp))
+            for status in manager.statuses():
+                self._video_status_pub.publish(video_status_to_message(status, stamp=stamp))
+        except Exception as exc:
+            self._last_error = f"failed to publish video stream control status: {exc}"
+            self.get_logger().error(self._last_error, throttle_duration_sec=1.0)
 
     def _distributed_result_callback(self, message: DistributedInferenceResult) -> None:
         try:
@@ -1041,6 +1130,8 @@ class PipelinePolicyNode(Node):
         target_request_id: str = "",
         goal_handle: object | None = None,
         progress: _RoundTripProgress | None = None,
+        observation_timestamp_ns: int = 0,
+        stream_references: tuple[StreamReference, ...] = (),
     ) -> DistributedResult:
         pending = _PendingOperation(event=threading.Event(), operation=operation)
         with self._pending_lock:
@@ -1068,6 +1159,8 @@ class PipelinePolicyNode(Node):
                 prompt=prompt,
                 deadline=deadline,
                 target_request_id=target_request_id,
+                observation_timestamp_ns=observation_timestamp_ns,
+                stream_references=stream_references,
             )
             while not pending.event.wait(timeout=0.05):
                 if request.deadline is not None and datetime.now(timezone.utc) >= request.deadline:
@@ -1224,6 +1317,13 @@ class PipelinePolicyNode(Node):
         return self._edge_session
 
     def destroy_node(self) -> None:
+        video_stream_manager = self._video_stream_manager
+        self._video_stream_manager = None
+        if video_stream_manager is not None:
+            try:
+                video_stream_manager.close()
+            except Exception as exc:
+                self.get_logger().error(f"video stream shutdown failed: {exc}")
         manager = self._manager
         self._manager = None
         if manager is not None:
@@ -1263,6 +1363,8 @@ def _read_config() -> tuple[PipelineNodeConfig, str]:
         "request_topic": "",
         "result_topic": "",
         "heartbeat_topic": "",
+        "video_descriptor_topic": "/inference/policy/video/descriptors",
+        "video_status_topic": "/inference/policy/video/status",
     }
     for name, default in defaults.items():
         reader.declare_parameter(name, default)

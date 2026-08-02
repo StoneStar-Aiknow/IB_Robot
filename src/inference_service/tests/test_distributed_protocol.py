@@ -22,6 +22,7 @@ from inference_service.distributed import (
     Operation,
     PeerRole,
     PipelineStatus,
+    StreamReference,
     StructuredError,
     build_pipeline_identity,
 )
@@ -96,6 +97,8 @@ def test_matching_handshake_gates_requests_and_routes_result(tmp_path):
         "request-1",
         inputs={"observation.state": np.zeros((1, 6), dtype=np.float32)},
         deadline=datetime.now(timezone.utc) + timedelta(seconds=1),
+        observation_timestamp_ns=1_000_000_000,
+        stream_references=(StreamReference("observation.images.top", "top"),),
     )
     cloud.validate_request(request)
     result = DistributedResult(
@@ -121,6 +124,7 @@ def test_matching_handshake_gates_requests_and_routes_result(tmp_path):
 @pytest.mark.parametrize(
     ("field", "code"),
     [
+        ("protocol_version", "protocol_version_mismatch"),
         ("pipeline_id", "pipeline_id_mismatch"),
         ("bundle_uuid", "bundle_uuid_mismatch"),
         ("bundle_revision", "bundle_revision_mismatch"),
@@ -808,6 +812,8 @@ def test_ros_protocol_round_trips_status_request_and_result(tmp_path):
         "request",
         inputs={"observation.state": np.zeros((1, 6), dtype=np.float32)},
         deadline=datetime.now(timezone.utc) + timedelta(seconds=1),
+        observation_timestamp_ns=1_000_000_000,
+        stream_references=(StreamReference("observation.images.top", "top"),),
     )
     result = DistributedResult(
         operation=Operation.INFER,
@@ -829,9 +835,67 @@ def test_ros_protocol_round_trips_status_request_and_result(tmp_path):
     assert decoded_request.operation == request.operation
     assert decoded_request.request_id == request.request_id
     assert np.array_equal(decoded_request.inputs["observation.state"], request.inputs["observation.state"])
+    assert decoded_request.observation_timestamp_ns == request.observation_timestamp_ns
+    assert decoded_request.stream_references == request.stream_references
     decoded_result = result_from_message(result_to_message(result))
     assert decoded_result.actual_chunk_size == result.actual_chunk_size
     assert np.array_equal(decoded_result.action, result.action)
+
+
+def test_non_inference_operations_reject_stream_fields(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+
+    with pytest.raises(ValueError, match="only for inference"):
+        DistributedRequest(
+            operation=Operation.RESET,
+            pipeline_id=identity.pipeline_id,
+            request_id="reset",
+            session_id="session",
+            session_generation=1,
+            deployment_fingerprint=identity.deployment_fingerprint,
+            observation_timestamp_ns=1,
+            stream_references=(StreamReference("observation.images.top", "top"),),
+        )
+
+
+def test_stream_reference_cannot_collide_with_tensor_semantic(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+
+    with pytest.raises(ValueError, match="collide"):
+        DistributedRequest(
+            operation=Operation.INFER,
+            pipeline_id=identity.pipeline_id,
+            request_id="request",
+            session_id="session",
+            session_generation=1,
+            deployment_fingerprint=identity.deployment_fingerprint,
+            inputs={"observation.images.top": np.zeros((1, 3, 4, 4), dtype=np.float32)},
+            observation_timestamp_ns=1,
+            stream_references=(StreamReference("observation.images.top", "top"),),
+        )
+
+
+def test_request_decoder_rejects_old_protocol_and_malformed_stream_arrays(tmp_path):
+    identity = _identity(tmp_path / "bundle")
+    request = DistributedRequest(
+        operation=Operation.INFER,
+        pipeline_id=identity.pipeline_id,
+        request_id="request",
+        session_id="session",
+        session_generation=1,
+        deployment_fingerprint=identity.deployment_fingerprint,
+        observation_timestamp_ns=1,
+        stream_references=(StreamReference("observation.images.top", "top"),),
+    )
+    message = request_to_message(request)
+    message.protocol_version = 2
+    with pytest.raises(ValueError, match="expected 3"):
+        request_from_message(message)
+
+    message.protocol_version = 3
+    message.stream_ids = []
+    with pytest.raises(ValueError, match="equal length"):
+        request_from_message(message)
 
 
 def test_decode_failure_uses_cloud_identity_and_unknown_operation(tmp_path):

@@ -245,9 +245,11 @@ ros2 action send_goal /inference/policy/dispatch \
 
 ### Distributed
 
-For a distributed pipeline, the edge `pipeline_policy_node` retains the observation adapter, processors, and
-postprocessor. The cloud `pure_inference_node` owns the selected backend. Before tensors can be sent, both sides
-must match:
+For a distributed pipeline, the edge `pipeline_policy_node` retains observation sampling, robot-state unit
+conversion, non-image tensor serialization, the action `TemporalSmoother`, and final robot-unit conversion. The
+cloud `pure_inference_node` assembles the complete raw observation and runs the LeRobot preprocessor, selected
+backend, and postprocessor in one process so processor state is not split across hosts. Before requests are
+accepted, both sides must match:
 
 - pipeline ID
 - manifest schema version
@@ -256,6 +258,32 @@ must match:
 - selected deployment fingerprint
 - policy input/output summary
 - cloud backend `READY` state
+
+Image observations may retain explicit `mode: dds` or use an H.264 RTP/UDP data plane. In RTP mode DDS carries
+only descriptors, status/timestamp mappings, requests/results, and heartbeats; H.264 payloads never enter
+`VariantsList`. Each camera needs a unique stream ID, SSRC, and even UDP port, with `port + 1` reserved during
+collision validation. The cloud accepts requests only after every descriptor matches the protocol, session
+generation, contract fingerprint, and deployment fingerprint and each stream has a keyframe and a fresh
+RTP-to-capture timestamp mapping.
+
+`encoder_backend` accepts `software`, `nvidia`, `ascend`, or `auto`; `nvidia` is currently encode-only and cannot
+be selected as a decoder. The software backend uses PyAV 15 and probes its FFmpeg build for `libx264` and an H.264
+decoder. The NVIDIA backend opens a real `h264_nvenc` session and uses ultra-low-latency, zero-delay, no-B-frame
+H.264 with repeated SPS/PPS. RGB/BGR-to-NV12 conversion still occurs through FFmpeg and is not CUDA zero-copy.
+The optional Ascend backend lazily discovers a
+private FFmpeg 4.4 `h264_ascend` installation through `IBROBOT_ASCEND_FFMPEG` or
+`IBROBOT_ASCEND_FFMPEG_PREFIX`; it neither replaces system FFmpeg nor adds ACL/DVPP Python dependencies. Startup
+logs and `/diagnostics` report configured and selected backends, endpoints, fingerprints, lifecycle, and readiness.
+
+`auto` probes `ascend`, then `nvidia`, then `software`. Ascend boards retain DVPP priority, NVIDIA hosts select
+NVENC when a real session opens, and other Linux hosts fall back to software. Explicit backend failure never falls
+back.
+
+RTP/UDP provides no authentication, confidentiality, or integrity and is restricted to a trusted robot network.
+An interrupted stream, descriptor mismatch, unavailable explicit backend, stale timestamp mapping, or excessive
+camera skew fails closed without an RTP-to-DDS fallback. Rollback requires a matching `mode: dds` contract on both
+hosts. rosbag/MCAP recording remains DDS-image based; RTP-aware recording and untrusted-network security are
+separate follow-up work.
 
 Cloud example:
 

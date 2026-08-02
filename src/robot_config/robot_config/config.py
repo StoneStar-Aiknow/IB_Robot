@@ -3,6 +3,12 @@
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from robot_config.observation_transport import (
+    ObservationTransportSpec,
+    require_valid_observation_transports,
+    resolve_observation_transport,
+)
+
 if TYPE_CHECKING:
     from robot_config.contract_utils import Contract
     from robot_config.perception_runtime_config import PerceptionRuntimeConfig
@@ -82,6 +88,7 @@ class ContractObservation:
     image: dict[str, Any] | None = None
     align: dict[str, Any] | None = None
     qos: dict[str, Any] | None = None
+    transport: ObservationTransportSpec | None = None
 
 
 @dataclass
@@ -238,33 +245,13 @@ class RobotConfig:
 
         This establishes RobotConfig as the Single Source of Truth for I/O mappings.
         """
-        from robot_config.contract_utils import (
-            ActionSpec,
-            AlignSpec,
-            Contract,
-            ObservationSpec,
-        )
-
-        def _as_align(d):
-            if not d:
-                return None
-            tol_ms = int(d.get("tol_ms", 0))
-            max_age_ms = int(d.get("max_age_ms", 0))
-            if tol_ms < 0:
-                raise ValueError("align.tol_ms must be non-negative")
-            if max_age_ms < 0:
-                raise ValueError("align.max_age_ms must be non-negative")
-            return AlignSpec(
-                strategy=str(d.get("strategy", "hold")).lower(),
-                tol_ms=tol_ms,
-                max_age_ms=max_age_ms,
-                stamp=str(d.get("stamp", "receive")).lower(),
-            )
+        from robot_config.contract_utils import ActionSpec, Contract, ObservationSpec, _as_align
 
         obs_specs = []
         for obs in self.contract.observations:
             # Resolve peripheral if referenced
             image_meta = obs.image
+            cam = None
             # Prefer explicit type from YAML; fall back to inference
             topic_type = obs.type or "sensor_msgs/msg/JointState"
 
@@ -277,6 +264,14 @@ class RobotConfig:
                 else:
                     topic_type = "sensor_msgs/msg/Image"
 
+            transport = resolve_observation_transport(
+                obs.transport,
+                image=image_meta,
+                camera_width=cam.width if cam else None,
+                camera_height=cam.height if cam else None,
+                camera_fps=cam.fps if cam else None,
+            )
+
             obs_specs.append(
                 ObservationSpec(
                     key=obs.key,
@@ -286,6 +281,7 @@ class RobotConfig:
                     image=image_meta,
                     align=_as_align(obs.align),
                     qos=obs.qos,
+                    transport=transport,
                 )
             )
 
@@ -311,7 +307,7 @@ class RobotConfig:
         # Assuming no tasks for now as they are not explicitly typed in ContractExtensionConfig
         task_specs = []
 
-        return Contract(
+        contract = Contract(
             name=self.name,
             version=1,
             rate_hz=float(self.contract.rate_hz),
@@ -324,3 +320,5 @@ class RobotConfig:
             timestamp_source="receive",
             process={},
         )
+        require_valid_observation_transports(contract.observations)
+        return contract

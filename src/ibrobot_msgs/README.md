@@ -165,6 +165,18 @@ SigLIP 特征向量属于关联内部状态，不通过公共消息发布。
 
 机器人当前状态汇报，包含末端位姿、关节状态和控制模式信息。
 
+### 分布式观测视频控制面
+
+`VideoStreamDescriptor.msg` 通过可靠、transient-local DDS 控制面声明一条 RTP/H.264 观测流，包含
+pipeline/session、observation key、stream ID、RTP endpoint/SSRC、媒体参数以及 contract/deployment
+双 fingerprint。`VideoStreamStatus.msg` 周期发布生命周期、codec backend、RTP-to-capture 时间映射、
+keyframe readiness、队列深度、收发/丢包计数和最后错误。
+
+`DistributedInferenceRequest.msg` 保留 `VariantsList tensors`，非图像观测和显式 DDS 图像模式继续通过
+该字段传输。RTP 图像只通过 `stream_observation_keys`/`stream_ids` 引用已协商 descriptor，并使用
+`observation_timestamp` 指定统一采样时间；H.264 payload 不进入 `VariantsList`。协议版本 3 要求 DDS
+和 RTP 模式都完成严格版本协商，旧版本或 fingerprint/descriptor 不匹配时 fail closed。
+
 ### `TaskStep.msg`
 
 单个任务步骤描述，用于 `ExecuteTaskPlan.action` 中的步骤序列。

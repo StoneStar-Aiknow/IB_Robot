@@ -115,6 +115,48 @@ from the source `config/robots/` directory; an explicit path must exist. The pub
 fields, named-pose names, timeout policy, and a digest. Primitive sequences, joint/cartesian coordinates, target
 bindings, and ROS service/action/topic names remain private implementation data.
 
+## Observation Video Transport
+
+Observation transport is part of the contract. Omitting `transport` preserves the existing DDS image path. Explicit
+RTP is valid only for `sensor_msgs/msg/Image` observations using `rgb8` or `bgr8` in a distributed pipeline, and it
+fails closed rather than falling back to DDS.
+
+```yaml
+contract:
+  observations:
+    - key: observation.images.top
+      topic: /camera/top/image_raw
+      type: sensor_msgs/msg/Image
+      image: {resize: [480, 640], encoding: rgb8}
+      transport:
+        mode: rtp
+        stream_id: top
+        endpoint: {host: 192.168.10.20, port: 5004}
+        codec: h264
+        encoder_backend: nvidia
+        decoder_backend: ascend
+        h264: {profile: main, bitrate_bps: 4000000, gop_frames: 15}
+        media: {width: 640, height: 480, frame_rate_hz: 30, pixel_format: nv12,
+                color_space: bt709, color_range: limited}
+        buffer: {sender_queue_frames: 2, receiver_queue_packets: 256,
+                 decoded_frame_capacity: 32, retention_ms: 1000}
+        readiness: {keyframe_timeout_ms: 3000, timestamp_mapping_max_age_ms: 1000,
+                    max_inter_camera_skew_ms: 50}
+        security: none
+```
+
+Stream IDs and endpoint port pairs must be unique. The contract fingerprint includes endpoint, codec/media
+reconstruction semantics, buffering/readiness limits, and image metadata, so edge and cloud must deploy matching
+configuration. `software`, `ascend`, and `auto` backend policies are resolved independently on each host; an
+unavailable explicit backend rejects startup. RTP/UDP has no authentication, confidentiality, or integrity and is
+restricted to a trusted robot network. Use an explicit matching `mode: dds` contract for rollback or DDS-based
+recording. Development examples are `config/robots/dev_rtp_single_camera.yaml` and
+`config/robots/dev_rtp_multi_camera.yaml`; production profiles remain DDS by default.
+
+`nvidia` is currently encoder-only. A typical split uses `encoder_backend: nvidia` on an RTX edge host and
+`decoder_backend: ascend` on the 310B cloud. Encoder `auto` probes `ascend`, `nvidia`, then `software`; an
+unavailable explicit backend rejects startup.
+
 ## Control Mode Configuration
 
 The robot_config package supports dual control modes for different AI model requirements:

@@ -17,6 +17,12 @@ from robot_config.contract_utils import (
     TaskSpec,
     _as_align,
 )
+from robot_config.observation_transport import (
+    observation_transport_to_dict,
+    parse_observation_transport,
+    require_valid_observation_transports,
+    resolve_observation_transport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +65,14 @@ def load_contract_with_robot_config(
 
     # Build contract dataclasses
     def _obs(it: dict[str, Any]) -> ObservationSpec:
+        peripheral = it.get("_peripheral") or {}
+        transport = resolve_observation_transport(
+            parse_observation_transport(it.get("transport")),
+            image=it.get("image"),
+            camera_width=peripheral.get("width"),
+            camera_height=peripheral.get("height"),
+            camera_fps=peripheral.get("fps"),
+        )
         obs = ObservationSpec(
             key=it["key"],
             topic=it["topic"],
@@ -67,6 +81,7 @@ def load_contract_with_robot_config(
             image=it.get("image"),
             align=_as_align(it.get("align")),
             qos=it.get("qos"),
+            transport=transport,
         )
         # Add peripheral metadata if available
         # if "_peripheral" in it:
@@ -105,7 +120,7 @@ def load_contract_with_robot_config(
 
     from robot_config.contract_utils import Contract
 
-    return Contract(
+    contract = Contract(
         name=contract_data.get("name", "contract"),
         version=int(contract_data.get("version", 1)),
         rate_hz=float(contract_data.get("rate_hz", contract_data.get("fps", 20.0))),
@@ -118,6 +133,8 @@ def load_contract_with_robot_config(
         timestamp_source=str(contract_data.get("timestamp_source", "receive")).lower(),
         process=proc,
     )
+    require_valid_observation_transports(contract.observations)
+    return contract
 
 
 def _resolve_peripheral_references(contract_data: dict, robot_config: Any) -> dict:
@@ -215,6 +232,7 @@ def build_contract_from_robot_config_dict(robot_config: dict[str, Any]) -> Contr
         topic = str(obs.get("topic", "") or "")
         topic_type = obs.get("type") or "sensor_msgs/msg/JointState"
         peripheral_name = obs.get("peripheral")
+        camera = None
         if peripheral_name:
             topic_type = "sensor_msgs/msg/Image"
             camera = _camera_lookup(str(peripheral_name))
@@ -234,6 +252,13 @@ def build_contract_from_robot_config_dict(robot_config: dict[str, Any]) -> Contr
         elif not topic:
             raise ValueError(f"Observation '{obs.get('key', '?')}' must specify a topic when no peripheral is set")
 
+        transport = resolve_observation_transport(
+            parse_observation_transport(obs.get("transport")),
+            image=image_meta,
+            camera_width=int(camera.get("width")) if camera and camera.get("width") is not None else None,
+            camera_height=int(camera.get("height")) if camera and camera.get("height") is not None else None,
+            camera_fps=float(camera.get("fps")) if camera and camera.get("fps") is not None else None,
+        )
         obs_specs.append(
             ObservationSpec(
                 key=obs["key"],
@@ -243,6 +268,7 @@ def build_contract_from_robot_config_dict(robot_config: dict[str, Any]) -> Contr
                 image=image_meta,
                 align=_as_align(obs.get("align")),
                 qos=obs.get("qos"),
+                transport=transport,
             )
         )
 
@@ -267,7 +293,7 @@ def build_contract_from_robot_config_dict(robot_config: dict[str, Any]) -> Contr
             )
         )
 
-    return Contract(
+    contract = Contract(
         name=str(robot_config.get("name", "contract")),
         version=1,
         rate_hz=float(contract_config.get("rate_hz", 20.0)),
@@ -280,6 +306,8 @@ def build_contract_from_robot_config_dict(robot_config: dict[str, Any]) -> Contr
         timestamp_source="receive",
         process={},
     )
+    require_valid_observation_transports(contract.observations)
+    return contract
 
 
 def generate_contract_from_robot_config(robot_config: Any) -> str:
@@ -310,7 +338,7 @@ def generate_contract_from_robot_config(robot_config: Any) -> str:
         obs_dict = {
             "key": obs.key,
             "topic": obs.topic,
-            "type": "sensor_msgs/msg/Image" if obs.peripheral else "sensor_msgs/msg/JointState",
+            "type": obs.type or ("sensor_msgs/msg/Image" if obs.peripheral else "sensor_msgs/msg/JointState"),
         }
 
         if obs.peripheral:
@@ -332,10 +360,15 @@ def generate_contract_from_robot_config(robot_config: Any) -> str:
             # Non-peripheral observation (e.g., joint states)
             if obs.selector:
                 obs_dict["selector"] = obs.selector
+            if obs.image:
+                obs_dict["image"] = obs.image
             if obs.align:
                 obs_dict["align"] = obs.align
             if obs.qos:
                 obs_dict["qos"] = obs.qos
+
+        if obs.transport is not None:
+            obs_dict["transport"] = observation_transport_to_dict(obs.transport)
 
         contract["observations"].append(obs_dict)
 
@@ -354,4 +387,4 @@ def generate_contract_from_robot_config(robot_config: Any) -> str:
 
         contract["actions"].append(action_dict)
 
-    return yaml.dump(contract, default_flow_style=False, sort_keys=False)
+    return yaml.safe_dump(contract, default_flow_style=False, sort_keys=False)

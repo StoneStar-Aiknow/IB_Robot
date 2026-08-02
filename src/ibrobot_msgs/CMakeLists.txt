@@ -25,6 +25,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/InferenceFeatureSummary.msg"
   "msg/InferencePolicySummary.msg"
   "msg/InferencePipelineStatus.msg"
+  "msg/VideoStreamDescriptor.msg"
+  "msg/VideoStreamStatus.msg"
   "msg/DistributedInferenceRequest.msg"
   "msg/DistributedInferenceResult.msg"
   "msg/RobotStatus.msg"

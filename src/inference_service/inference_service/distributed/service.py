@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import replace
 
 from inference_service.distributed.runtime import CloudBackendRuntime
@@ -15,6 +16,17 @@ from inference_service.distributed.types import (
     StructuredError,
     structured_error_from_exception,
 )
+from inference_service.distributed.video_streams import VideoStreamNegotiator
+
+
+class _StreamManager:
+    negotiator: VideoStreamNegotiator
+
+    def reset_session(self, session_id: str, session_generation: int) -> None: ...
+
+    def assemble_inputs(self, target_timestamp_ns: int) -> dict[str, object]: ...
+
+    def close(self) -> None: ...
 
 
 class DistributedCloudService:
@@ -24,43 +36,59 @@ class DistributedCloudService:
         runtime: CloudBackendRuntime | None,
         *,
         startup_error: StructuredError | None = None,
+        stream_negotiator: VideoStreamNegotiator | None = None,
+        stream_manager: _StreamManager | None = None,
     ) -> None:
         if runtime is None and startup_error is None:
             raise ValueError("startup_error is required when the cloud runtime is unavailable")
         self.identity = identity
+        self._lifecycle_lock = threading.RLock()
         self.runtime = runtime
         self.startup_error = startup_error
-        self.session = CloudSession(identity)
+        if stream_manager is not None and stream_negotiator is not None:
+            raise ValueError("provide stream_manager or stream_negotiator, not both")
+        self.stream_manager = stream_manager
+        self.stream_negotiator = stream_manager.negotiator if stream_manager is not None else stream_negotiator
+        self.session = CloudSession(
+            identity,
+            request_stream_validator=(
+                self.stream_negotiator.validate_request if self.stream_negotiator is not None else None
+            ),
+        )
 
     def observe_edge(self, status: PipelineStatus) -> PipelineStatus:
-        if self.runtime is None:
-            self.session.observe_edge(status, backend_ready=False)
-            return self.status()
-        _, backend_available, _ = self._runtime_status()
-        self.session.observe_edge(
-            status,
-            backend_ready=backend_available,
-            rollover_barrier=self._reset_stateful_runtime_for_rollover,
-        )
-        return self.status()
+        with self._lifecycle_lock:
+            if self.runtime is None:
+                self.session.observe_edge(status, backend_ready=False)
+                return self.status()
+            _, backend_available, _ = self._runtime_status()
+            self.session.observe_edge(
+                status,
+                backend_ready=backend_available,
+                rollover_barrier=self._reset_stateful_runtime_for_rollover,
+            )
+            cloud_status = self.status()
+            self._sync_stream_negotiator_session(cloud_status)
+            return cloud_status
 
     def status(self) -> PipelineStatus:
-        if self.runtime is None:
-            status = self.session.status(
-                backend_ready=False,
-                backend_state="failed",
-                reset_supported=False,
-                cancellation_supported=False,
+        with self._lifecycle_lock:
+            if self.runtime is None:
+                status = self.session.status(
+                    backend_ready=False,
+                    backend_state="failed",
+                    reset_supported=False,
+                    cancellation_supported=False,
+                )
+                return replace(status, error=self.startup_error)
+            _, backend_available, runtime_state = self._runtime_status()
+            capabilities = self.runtime.capabilities
+            return self.session.status(
+                backend_ready=backend_available,
+                backend_state=runtime_state,
+                reset_supported=capabilities.resettable or not getattr(capabilities, "stateful", True),
+                cancellation_supported=capabilities.supports_cancellation,
             )
-            return replace(status, error=self.startup_error)
-        _, backend_available, runtime_state = self._runtime_status()
-        capabilities = self.runtime.capabilities
-        return self.session.status(
-            backend_ready=backend_available,
-            backend_state=runtime_state,
-            reset_supported=capabilities.resettable or not getattr(capabilities, "stateful", True),
-            cancellation_supported=capabilities.supports_cancellation,
-        )
 
     def handle(self, request: DistributedRequest) -> DistributedResult:
         if self.runtime is None:
@@ -80,9 +108,12 @@ class DistributedCloudService:
         try:
             with self.session.operation(request):
                 if request.operation is Operation.INFER:
+                    inputs = dict(request.inputs)
+                    if self.stream_manager is not None:
+                        inputs.update(self.stream_manager.assemble_inputs(request.observation_timestamp_ns))
                     pipeline_result = self.runtime.infer(
                         request.request_id,
-                        request.inputs,
+                        inputs,
                         prompt=request.prompt,
                         deadline=request.deadline,
                     )
@@ -91,6 +122,8 @@ class DistributedCloudService:
                     latency_ms = pipeline_result.backend_latency_ms
                 elif request.operation is Operation.RESET:
                     self.runtime.reset(deadline=request.deadline)
+                    if self.stream_manager is not None:
+                        self.stream_manager.reset_session(request.session_id, request.session_generation)
                     action = None
                     chunk_size = 0
                     latency_ms = 0.0
@@ -139,8 +172,30 @@ class DistributedCloudService:
         )
 
     def close(self) -> None:
+        error: Exception | None = None
+        if self.stream_manager is not None:
+            try:
+                self.stream_manager.close()
+            except Exception as exc:
+                error = exc
         if self.runtime is not None:
-            self.runtime.close()
+            try:
+                self.runtime.close()
+            except Exception as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
+
+    def _sync_stream_negotiator_session(self, status: PipelineStatus) -> None:
+        if self.stream_negotiator is None or not status.session_id or status.session_generation < 1:
+            return
+        requirements = self.stream_negotiator.requirements
+        if requirements.session_id != status.session_id or requirements.session_generation != status.session_generation:
+            if self.stream_manager is not None:
+                self.stream_manager.reset_session(status.session_id, status.session_generation)
+            else:
+                self.stream_negotiator.reset(status.session_id, status.session_generation)
 
     def _runtime_status(self) -> tuple[object, bool, str]:
         assert self.runtime is not None

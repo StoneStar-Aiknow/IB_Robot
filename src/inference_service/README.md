@@ -137,6 +137,8 @@ Pipeline ID 是模型实例和 ROS 路由的稳定标识，必须匹配
 | 分布式 request | `/inference/<pipeline_id>/request` |
 | 分布式 result | `/inference/<pipeline_id>/result` |
 | 分布式 heartbeat | `/inference/<pipeline_id>/heartbeat` |
+| 视频 descriptor | `/inference/<pipeline_id>/video/descriptors` |
+| 视频 status | `/inference/<pipeline_id>/video/status` |
 
 ## Robot 配置
 
@@ -248,9 +250,10 @@ ros2 action send_goal /inference/policy/dispatch \
 
 ### Distributed
 
-分布式 pipeline 在 edge 的 `pipeline_policy_node` 中保留 observation adapter、processor 和
-postprocessor，在 cloud 的 `pure_inference_node` 中加载 selected backend。两端在发送 tensor
-前必须匹配：
+分布式 pipeline 在 edge 的 `pipeline_policy_node` 中保留 observation 采样、机器人状态单位换算、
+非图像 tensor 序列化、action `TemporalSmoother` 和最终机器人单位换算。Cloud 的
+`pure_inference_node` 组装完整 raw observation，在同一进程中依次运行 LeRobot preprocessor、
+selected backend 和 postprocessor，避免 processor state 跨机器分裂。两端在接受请求前必须匹配：
 
 ```text
 Robot / Edge host                              Compute / Cloud host
@@ -260,9 +263,9 @@ Robot / Edge host                              Compute / Cloud host
 │       v                          │           │                                  │
 │ inference_<pipeline_id>          │           │ selected deployment and backend  │
 │ pipeline_policy_node             │           │                                  │
-│ ├─ observation contract adapter  │           │                                  │
-│ ├─ LeRobot preprocessor          │           │                                  │
-│ └─ LeRobot postprocessor         │           │                                  │
+│ ├─ observation sampling          │           │ ├─ raw observation assembly      │
+│ ├─ state/action unit conversion  │           │ ├─ LeRobot pre/postprocessors    │
+│ └─ action TemporalSmoother       │           │ └─ selected deployment/backend   │
 │       │ request      ▲ result     │           │       ▲ request      │ result    │
 └───────┼──────────────┼────────────┘           └───────┼──────────────┼───────────┘
         │              │                                │              │
@@ -274,6 +277,30 @@ Robot / Edge host                              Compute / Cloud host
 
 每个 pipeline 使用独立的 request、result 和 heartbeat endpoint；两端使用相同的 pipeline
 ID、bundle 和 deployment 身份信息。
+
+图像 observation 可继续使用显式 `mode: dds`，或使用 H.264 RTP/UDP 数据面。RTP 模式下，DDS
+只承载 descriptor、status、timestamp mapping、request/result 和 heartbeat；H.264 payload 不进入
+`VariantsList`。每路相机使用唯一 stream ID、SSRC 和偶数 UDP port，`port + 1` 保留用于端点冲突检查。
+Cloud 必须收到匹配 protocol/session generation、contract fingerprint 和 deployment fingerprint 的
+全部 descriptor，并等到 keyframe 与 RTP-to-capture timestamp mapping 就绪后才接受请求。
+
+`encoder_backend` 可设为 `software`、`nvidia`、`ascend` 或 `auto`；`nvidia` 当前仅提供 NVENC 编码，
+不能用作 decoder。Software backend 使用 PyAV 15 和其 FFmpeg `libx264`/H.264 decoder；启动 probe
+缺少 codec 时会 fail closed。NVIDIA backend 会实际打开一个 `h264_nvenc` session，使用 ultra-low-latency、
+zero-delay、无 B-frame 和重复 SPS/PPS 的 H.264 配置；RGB/BGR 到 NV12 的转换仍由 FFmpeg 完成，不是
+CUDA zero-copy。Ascend backend
+仅在选择或自动探测时查找私有 FFmpeg 4.4 `h264_ascend`，可用
+`IBROBOT_ASCEND_FFMPEG` 或 `IBROBOT_ASCEND_FFMPEG_PREFIX` 指定，不替换系统 FFmpeg，也不引入
+ACL/DVPP Python 依赖。启动日志和 `/diagnostics` 报告 configured/selected backend、endpoint、
+fingerprint、lifecycle 和 readiness。
+
+`auto` 按 `ascend`、`nvidia`、`software` 顺序探测。310B 优先使用 Ascend，本机 NVIDIA GPU 可用时
+自动选择 NVENC，其他 Linux 主机回退 software；显式 backend 失败时不会回退。
+
+RTP/UDP 不提供认证、加密或完整性保护，只允许可信机器人网络。链路中断、descriptor 不一致、显式
+backend 不可用、时间映射过期或跨相机 skew 超限都会拒绝推理，不会自动回退 DDS。回滚必须在两端
+部署匹配的 `mode: dds` contract。当前 rosbag/MCAP 录制仍采集 DDS image topic；RTP-aware recording
+和不可信网络安全属于后续工作。
 
 - pipeline ID
 - manifest schema version

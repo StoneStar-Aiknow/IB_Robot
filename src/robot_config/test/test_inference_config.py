@@ -390,6 +390,8 @@ def test_distributed_transport_defaults_are_exact(tmp_path: Path) -> None:
     assert transport.request_topic == "/inference/policy/request"
     assert transport.result_topic == "/inference/policy/result"
     assert transport.heartbeat_topic == "/inference/policy/heartbeat"
+    assert transport.video_descriptor_topic == "/inference/policy/video/descriptors"
+    assert transport.video_status_topic == "/inference/policy/video/status"
 
 
 def test_distributed_transport_overrides_are_typed_and_exact(tmp_path: Path) -> None:
@@ -470,6 +472,8 @@ def test_reject_invalid_ros_transport_names(tmp_path: Path, transport: dict[str,
         ("request_topic", "/inference/alpha/request"),
         ("result_topic", "/inference/alpha/result"),
         ("heartbeat_topic", "/inference/alpha/heartbeat"),
+        ("video_descriptor_topic", "/inference/alpha/video/descriptors"),
+        ("video_status_topic", "/inference/alpha/video/status"),
     ],
 )
 def test_reject_endpoint_conflicts_between_pipelines(tmp_path: Path, field: str, conflicting_value: str) -> None:

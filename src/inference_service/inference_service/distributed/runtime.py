@@ -5,6 +5,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime, timezone
 
+import numpy as np
+import torch
+
 from inference_manifest import CompiledDeployment, ValidatedManifest
 from inference_service.backends import (
     BACKEND_REGISTRY,
@@ -28,7 +31,7 @@ def _identity_postprocessor(action: object) -> object:
 
 
 class EdgeProcessorRuntime:
-    """Load only LeRobot processors and policy metadata on the edge."""
+    """Preserve the edge raw-observation and robot-unit boundary."""
 
     def __init__(
         self,
@@ -40,63 +43,39 @@ class EdgeProcessorRuntime:
         self.pipeline_id = pipeline_id
         self._manifest = validated_manifest
         self._default_task = default_task
-        self._preprocessor, self._postprocessor = create_lerobot_processor_views()
         self._loaded = False
-        self._reset_error: Exception | None = None
 
     def load(self) -> None:
         if self._loaded:
             return
-        self._preprocessor.load(self._manifest)
-        self._postprocessor.load(self._manifest)
         self._loaded = True
 
     def preprocess(self, inputs: Mapping[str, object], *, prompt: str | None = None) -> Mapping[str, object]:
         self._require_ready()
-        values = dict(inputs)
-        selected_prompt = prompt if prompt is not None else self._default_task
-        if selected_prompt is not None:
-            values["task"] = selected_prompt
-        result = self._preprocessor(values)
-        if not isinstance(result, Mapping):
-            raise TypeError("LeRobot preprocessor must return a mapping")
-        return result
+        return dict(inputs)
 
     def postprocess(self, action: object, *, actual_chunk_size: int) -> object:
         self._require_ready()
-        result = self._postprocessor(action)
         validate_action_output(
-            result,
+            action,
             actual_chunk_size=actual_chunk_size,
             action_dimension=self._manifest.policy.output_features["action"].shape[-1],
             pipeline_id=self.pipeline_id,
             phase="postprocessor",
         )
-        return result
+        return action
 
     def reset(self, deadline: datetime | None = None) -> None:
         self._require_ready()
-        try:
-            self._preprocessor.reset()
-        except Exception as exc:
-            self._reset_error = exc
-            raise
         if deadline is not None and datetime.now(timezone.utc) >= deadline:
             raise TimeoutError("edge processor reset deadline expired")
 
     def close(self) -> None:
-        self._postprocessor.close()
-        self._preprocessor.close()
         self._loaded = False
-        self._reset_error = None
 
     def _require_ready(self) -> None:
         if not self._loaded:
             raise RuntimeError("edge processors are not loaded")
-        if self._reset_error is not None:
-            raise RuntimeError(
-                f"edge processors are unavailable after reset failure: {self._reset_error}"
-            ) from self._reset_error
 
 
 class CloudBackendRuntime:
@@ -114,12 +93,13 @@ class CloudBackendRuntime:
         context = RuntimeContext(validated_manifest, runtime_options=runtime_options or {})
         backend = registry.create(context)
         codec = create_policy_codec(context.policy) if isinstance(context.deployment, CompiledDeployment) else None
+        preprocessor, postprocessor = create_lerobot_processor_views()
         pipeline = InferencePipeline(
             pipeline_id,
             context,
             backend,
-            preprocessor=_identity_preprocessor,
-            postprocessor=_identity_postprocessor,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
             codec=codec,
             request_timeout=request_timeout,
         )
@@ -139,9 +119,13 @@ class CloudBackendRuntime:
         prompt: str | None = None,
         deadline: datetime | None = None,
     ):
+        processor_inputs = {
+            key: torch.from_numpy(np.ascontiguousarray(value)) if isinstance(value, np.ndarray) else value
+            for key, value in inputs.items()
+        }
         return self._manager.infer(
             self.pipeline_id,
-            InferenceRequest(request_id=request_id, inputs=inputs, prompt=prompt, deadline=deadline),
+            InferenceRequest(request_id=request_id, inputs=processor_inputs, prompt=prompt, deadline=deadline),
         )
 
     def reset(self, deadline: datetime | None = None) -> None:

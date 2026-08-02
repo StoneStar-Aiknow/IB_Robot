@@ -157,6 +157,56 @@ robot:
           names: ["current.1", "current.2", "current.3", "current.4", "current.5", "current.6"]
 ```
 
+## Observation video transport
+
+Observation transport is part of the contract and is absent by default. An omitted
+`transport` field keeps the existing DDS image behavior. Explicit RTP is only valid
+for `sensor_msgs/msg/Image` observations using `rgb8` or `bgr8`, and requires a
+distributed inference pipeline. RTP configuration is fail-closed: it does not fall
+back to DDS when a stream or codec is unavailable.
+
+```yaml
+observations:
+  - key: observation.images.top
+    topic: /camera/top/image_raw
+    type: sensor_msgs/msg/Image
+    peripheral: top
+    image: {resize: [480, 640], encoding: rgb8}
+    transport:
+      mode: rtp
+      stream_id: top
+      endpoint: {host: 192.168.10.20, port: 5004}
+      codec: h264
+      encoder_backend: nvidia  # 本机 RTX 使用 NVENC；也可用 auto/software/ascend
+      decoder_backend: ascend
+      h264: {profile: main, bitrate_bps: 4000000, gop_frames: 15}
+      media:
+        width: 640
+        height: 480
+        frame_rate_hz: 30
+        pixel_format: nv12
+        color_space: bt709
+        color_range: limited
+      buffer: {sender_queue_frames: 2, receiver_queue_packets: 256, decoded_frame_capacity: 32, retention_ms: 1000}
+      readiness: {keyframe_timeout_ms: 3000, timestamp_mapping_max_age_ms: 1000, max_inter_camera_skew_ms: 50}
+      security: none
+```
+
+The contract fingerprint includes stream identity, endpoint, codec/media reconstruction
+semantics, buffering/readiness limits, and image metadata. Consequently endpoint
+changes require matching edge and cloud deployments; there are no excluded endpoint
+overrides in this milestone. RTP/UDP has no authentication, confidentiality, or
+integrity protection and is limited to a trusted robot network. Use an explicit
+`mode: dds` contract for rollback or recording-compatible deployments.
+
+Development examples are available in `config/robots/dev_rtp_single_camera.yaml`
+and `config/robots/dev_rtp_multi_camera.yaml`; production profiles remain DDS by
+default.
+
+`nvidia` 当前仅支持 encoder，典型组合是 edge 使用 `encoder_backend: nvidia`，310B cloud 使用
+`decoder_backend: ascend`。`auto` 的 encoder 探测顺序为 `ascend`、`nvidia`、`software`；显式选择
+不可用 backend 时直接拒绝启动。
+
 ## Grasp execution target gripper
 
 `robot.grasp_execution.planner_node` 会原样传给 `grasp_planner_node`。当 GraspGen source gripper

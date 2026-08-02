@@ -1,0 +1,46 @@
+# Development-only single-camera RTP contract profile.
+robot:
+  name: dev_rtp_single_camera
+  type: so101
+  robot_type: so_101
+  ros2_control:
+    hardware_plugin: so101_hardware/SO101SystemHardware
+  control_modes:
+    model_inference:
+      inference:
+        enabled: true
+        pipelines:
+          dev_policy:
+            model_path: models/development
+            deployment: cpu
+            execution_mode: distributed
+  peripherals:
+    - type: camera
+      name: top
+      driver: opencv
+      index: 0
+      width: 640
+      height: 480
+      fps: 30
+      pixel_format: rgb8
+      frame_id: camera_top_frame
+  contract:
+    rate_hz: 30
+    observations:
+      - key: observation.images.top
+        topic: /camera/top/image_raw
+        type: sensor_msgs/msg/Image
+        peripheral: top
+        image: {resize: [480, 640], encoding: rgb8}
+        transport:
+          mode: rtp
+          stream_id: top
+          endpoint: {host: 127.0.0.1, port: 5004}
+          encoder_backend: software
+          decoder_backend: software
+          h264: {profile: main, bitrate_bps: 4000000, gop_frames: 15}
+          media: {width: 640, height: 480, frame_rate_hz: 30, pixel_format: nv12, color_space: bt709, color_range: limited}
+      - key: observation.state
+        topic: /joint_states
+        type: sensor_msgs/msg/JointState
+    actions: []

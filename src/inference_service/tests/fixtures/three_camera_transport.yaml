@@ -1,0 +1,44 @@
+name: three_camera_test
+contract:
+  rate_hz: 20
+  observations:
+    - key: observation.images.top
+      topic: /camera/top/image_raw
+      type: sensor_msgs/msg/Image
+      image: {resize: [48, 64], encoding: rgb8}
+      transport:
+        mode: rtp
+        stream_id: top
+        endpoint: {host: 127.0.0.1, port: 15004}
+        encoder_backend: software
+        decoder_backend: software
+        media: {width: 64, height: 48, frame_rate_hz: 20}
+        buffer: {sender_queue_frames: 2, receiver_queue_packets: 16, decoded_frame_capacity: 8, retention_ms: 200}
+        readiness: {keyframe_timeout_ms: 1000, timestamp_mapping_max_age_ms: 1000, max_inter_camera_skew_ms: 15}
+    - key: observation.images.left_wrist
+      topic: /camera/left_wrist/image_raw
+      type: sensor_msgs/msg/Image
+      image: {resize: [48, 64], encoding: rgb8}
+      transport:
+        mode: rtp
+        stream_id: left_wrist
+        endpoint: {host: 127.0.0.1, port: 15006}
+        encoder_backend: software
+        decoder_backend: software
+        media: {width: 64, height: 48, frame_rate_hz: 20}
+        buffer: {sender_queue_frames: 2, receiver_queue_packets: 16, decoded_frame_capacity: 8, retention_ms: 200}
+        readiness: {keyframe_timeout_ms: 1000, timestamp_mapping_max_age_ms: 1000, max_inter_camera_skew_ms: 15}
+    - key: observation.images.right_wrist
+      topic: /camera/right_wrist/image_raw
+      type: sensor_msgs/msg/Image
+      image: {resize: [48, 64], encoding: rgb8}
+      transport:
+        mode: rtp
+        stream_id: right_wrist
+        endpoint: {host: 127.0.0.1, port: 15008}
+        encoder_backend: software
+        decoder_backend: software
+        media: {width: 64, height: 48, frame_rate_hz: 20}
+        buffer: {sender_queue_frames: 2, receiver_queue_packets: 16, decoded_frame_capacity: 8, retention_ms: 200}
+        readiness: {keyframe_timeout_ms: 1000, timestamp_mapping_max_age_ms: 1000, max_inter_camera_skew_ms: 15}
+  actions: []

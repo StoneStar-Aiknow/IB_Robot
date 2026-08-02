@@ -12,5 +12,11 @@ uint64 session_generation
 string deployment_fingerprint
 # Absolute UTC/system-clock deadline. Zero means no explicit deadline.
 builtin_interfaces/Time deadline
+# Target observation time in the contract clock domain. Zero when no RTP stream is referenced.
+builtin_interfaces/Time observation_timestamp
 string prompt
+# Parallel arrays identifying RTP-backed observations negotiated through VideoStreamDescriptor.
+string[] stream_observation_keys
+string[] stream_ids
+# Non-streamed observations, including explicit DDS image mode, remain in tensors.
 VariantsList tensors

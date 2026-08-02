@@ -27,6 +27,11 @@ from robot_config.config import (
     VoiceASRConfig,
 )
 from robot_config.grasp_execution_config import validate_grasp_execution_config
+from robot_config.observation_transport import (
+    parse_observation_transport,
+    validate_observation_transports,
+    validate_robot_config_observation_transports,
+)
 from robot_config.perception_runtime_config import PerceptionRuntimeConfigError, parse_perception_runtime_config
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
@@ -908,6 +913,10 @@ def load_robot_config_dict(config_path: str | Path | None = None) -> dict[str, A
     except PerceptionRuntimeConfigError as exc:
         validation_errors.append(str(exc))
     validation_errors.extend(validate_semantic_mapping_config(robot_config))
+    try:
+        validation_errors.extend(validate_robot_config_observation_transports(robot_config))
+    except (TypeError, ValueError) as exc:
+        validation_errors.append(str(exc))
     if validation_errors:
         raise ValueError("Invalid robot configuration:\n- " + "\n- ".join(validation_errors))
     robot_config["_config_path"] = str(resolved_config_path)
@@ -1017,6 +1026,7 @@ def load_contract_config(data: dict[str, Any]) -> ContractExtensionConfig:
                 image=obs_data.get("image"),
                 align=obs_data.get("align"),
                 qos=obs_data.get("qos"),
+                transport=parse_observation_transport(obs_data.get("transport")),
             )
         )
 
@@ -1425,6 +1435,13 @@ def validate_config(config: RobotConfig) -> list[str]:
     for obs in config.contract.observations:
         if obs.peripheral and obs.peripheral not in peripheral_names:
             errors.append(f"Observation '{obs.key}' references undefined peripheral: {obs.peripheral}")
+
+    try:
+        contract = config.to_contract()
+    except ValueError as exc:
+        errors.append(str(exc))
+    else:
+        errors.extend(validate_observation_transports(contract.observations))
 
     if config.voice_asr.enabled and not config.voice_asr.model_path and not config.voice_asr.auto_download_model:
         errors.append("voice_asr.model_path is required when voice_asr.enabled is true")

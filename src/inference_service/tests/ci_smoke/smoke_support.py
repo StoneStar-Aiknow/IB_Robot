@@ -29,7 +29,7 @@ class SmokeRuntime:
     process_environment: dict[str, str]
 
 
-def prepare_smoke_runtime() -> SmokeRuntime:
+def prepare_smoke_runtime(*, video_transport: bool = False, video_encoder_backend: str = "software") -> SmokeRuntime:
     temp_dir = tempfile.TemporaryDirectory(prefix="ibrobot-inference-smoke-")
     atexit.register(temp_dir.cleanup)
     root = Path(temp_dir.name)
@@ -108,11 +108,52 @@ def prepare_smoke_runtime() -> SmokeRuntime:
         },
     )
 
+    image_observation = {
+        "key": "observation.images.top",
+        "topic": "/ci_smoke/camera/top",
+        "type": "sensor_msgs/msg/Image",
+        "image": {"resize": [16, 24], "encoding": "rgb8"},
+    }
+    if video_transport:
+        video_width, video_height = (640, 480) if video_encoder_backend == "nvidia" else (64, 48)
+        image_observation["align"] = {"strategy": "hold", "max_age_ms": 300, "stamp": "header"}
+        image_observation["transport"] = {
+            "mode": "rtp",
+            "stream_id": "top",
+            "endpoint": {"host": "127.0.0.1", "port": 55004},
+            "encoder_backend": video_encoder_backend,
+            "decoder_backend": "software",
+            "h264": {"bitrate_bps": 300_000, "gop_frames": 5},
+            "media": {
+                "width": video_width,
+                "height": video_height,
+                "frame_rate_hz": 20,
+                "pixel_format": "nv12",
+                "color_space": "bt709",
+                "color_range": "limited",
+            },
+            "readiness": {"timestamp_mapping_max_age_ms": 300, "max_inter_camera_skew_ms": 50},
+        }
+
     robot_config = {
         "robot": {
             "name": "ci_smoke_robot",
             "type": "test",
             "robot_type": "test",
+            "control_modes": {
+                "model_inference": {
+                    "inference": {
+                        "enabled": True,
+                        "pipelines": {
+                            "smoke_policy": {
+                                "model_path": str(bundle),
+                                "deployment": "cpu",
+                                "execution_mode": "distributed" if video_transport else "monolithic",
+                            }
+                        },
+                    }
+                }
+            },
             "contract": {
                 "rate_hz": 10.0,
                 "observations": [
@@ -122,12 +163,7 @@ def prepare_smoke_runtime() -> SmokeRuntime:
                         "type": "sensor_msgs/msg/JointState",
                         "selector": {"names": [f"position.joint_{index}" for index in range(6)]},
                     },
-                    {
-                        "key": "observation.images.top",
-                        "topic": "/ci_smoke/camera/top",
-                        "type": "sensor_msgs/msg/Image",
-                        "image": {"resize": [16, 24], "encoding": "rgb8"},
-                    },
+                    image_observation,
                 ],
                 "actions": [],
             },
@@ -234,6 +270,63 @@ def publish_required_observations(node, *, expected_subscriptions: int, timeout:
             publish()
             rclpy.spin_once(node, timeout_sec=0.1)
         return stop
+    except Exception:
+        stop()
+        raise
+
+
+def publish_video_observations(node, *, expected_subscriptions: int, timeout: float = 10.0):
+    joint_publisher = node.create_publisher(JointState, "/ci_smoke/joint_states", 10)
+    image_publisher = node.create_publisher(Image, "/ci_smoke/camera/top", 10)
+    image_enabled = True
+
+    def publish() -> None:
+        stamp = node.get_clock().now().to_msg()
+        joints = JointState()
+        joints.header.stamp = stamp
+        joints.name = [f"joint_{index}" for index in range(6)]
+        joints.position = [0.0] * 6
+        joint_publisher.publish(joints)
+        if not image_enabled:
+            return
+        image = Image()
+        image.header.stamp = stamp
+        image.height = 48
+        image.width = 64
+        image.encoding = "rgb8"
+        image.step = 64 * 3
+        y, x = np.indices((48, 64))
+        pixels = np.stack((x * 4, y * 5, (x + y) * 2), axis=-1).astype(np.uint8)
+        image.data = pixels.tobytes()
+        image_publisher.publish(image)
+
+    timer = node.create_timer(0.05, publish)
+
+    def stop_images() -> None:
+        nonlocal image_enabled
+        image_enabled = False
+
+    def stop() -> None:
+        node.destroy_timer(timer)
+        node.destroy_publisher(image_publisher)
+        node.destroy_publisher(joint_publisher)
+
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if (
+                joint_publisher.get_subscription_count() >= expected_subscriptions
+                and image_publisher.get_subscription_count() >= expected_subscriptions
+            ):
+                break
+            rclpy.spin_once(node, timeout_sec=0.1)
+        else:
+            raise AssertionError("video inference observation subscriptions did not become available")
+
+        for _ in range(3):
+            publish()
+            rclpy.spin_once(node, timeout_sec=0.1)
+        return stop_images, stop
     except Exception:
         stop()
         raise

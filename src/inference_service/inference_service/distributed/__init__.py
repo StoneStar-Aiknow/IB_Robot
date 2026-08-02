@@ -13,11 +13,23 @@ from inference_service.distributed.types import (
     PipelineIdentity,
     PipelineStatus,
     PolicySummary,
+    StreamReference,
     StructuredError,
     build_pipeline_identity,
     identity_error,
     structured_error_from_exception,
     summarize_policy,
+)
+from inference_service.distributed.video_streams import (
+    StreamNegotiationError,
+    StreamNegotiationRequirements,
+    VideoStreamDescriptor,
+    VideoStreamNegotiator,
+    VideoStreamRequirement,
+    VideoStreamRuntimeStatus,
+    VideoTransportCapabilities,
+    negotiate_video_streams,
+    validate_request_streams,
 )
 
 __all__ = [
@@ -38,8 +50,18 @@ __all__ = [
     "PolicySummary",
     "SessionUpdate",
     "StructuredError",
+    "StreamReference",
+    "StreamNegotiationError",
+    "StreamNegotiationRequirements",
+    "VideoStreamDescriptor",
+    "VideoStreamNegotiator",
+    "VideoStreamRequirement",
+    "VideoStreamRuntimeStatus",
+    "VideoTransportCapabilities",
     "build_pipeline_identity",
     "identity_error",
+    "negotiate_video_streams",
     "structured_error_from_exception",
     "summarize_policy",
+    "validate_request_streams",
 ]

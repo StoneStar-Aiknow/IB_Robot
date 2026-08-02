@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -20,6 +22,12 @@ from rclpy.qos import (
 
 # Bridge to tensormsg for global registry
 import tensormsg.registry as tensormsg_registry
+from robot_config.observation_transport import (
+    ObservationTransportSpec,
+    effective_observation_transport,
+    observation_transport_to_dict,
+    parse_observation_transport,
+)
 
 # ---------- Contract datamodel ----------
 
@@ -52,6 +60,7 @@ class ObservationSpec:
     align: AlignSpec | None = None
     # {reliability, history, depth, durability}
     qos: dict[str, Any] | None = None
+    transport: ObservationTransportSpec | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +142,7 @@ class SpecView:
     stamp_src: str
     clamp: tuple[float, float] | None  # actions only
     safety_behavior: str | None  # actions only: "zeros" | "hold"
+    transport: ObservationTransportSpec | None
 
 
 def _num_channels_from_encoding(encoding: str) -> int:
@@ -195,6 +205,7 @@ def iter_specs(contract: Contract) -> Iterable[SpecView]:
             stamp_src=al.stamp,
             clamp=None,
             safety_behavior=None,
+            transport=o.transport,
         )
     for a in contract.actions:
         names = list((a.selector or {}).get("names", []))
@@ -217,6 +228,7 @@ def iter_specs(contract: Contract) -> Iterable[SpecView]:
             stamp_src=contract.timestamp_source,
             clamp=clamp,
             safety_behavior=(a.safety_behavior or "zeros").lower(),
+            transport=None,
         )
 
 
@@ -337,27 +349,138 @@ def resample(
 
 
 class StreamBuffer:
-    def __init__(self, policy: str, step_ns: int, tol_ns: int = 0):
-        self.policy = policy
+    """Ordered timestamped history shared by DDS and decoded video streams.
+
+    Capture timestamps drive alignment while receive timestamps drive live-age
+    checks. Out-of-order samples are inserted in capture-time order, and a new
+    sample with an existing capture timestamp replaces the previous sample.
+    """
+
+    def __init__(
+        self,
+        policy: str,
+        step_ns: int,
+        tol_ns: int = 0,
+        *,
+        max_age_ns: int = 0,
+        retention_ns: int = 0,
+    ) -> None:
+        self.policy = str(policy).lower()
         self.step_ns = int(step_ns)
-        self.tol_ns = int(tol_ns)
-        self.last_ts: int | None = None
-        self.last_val: Any | None = None
+        self.tol_ns = max(0, int(tol_ns))
+        self.max_age_ns = max(0, int(max_age_ns))
+        self.retention_ns = max(0, int(retention_ns))
+        self.history: list[tuple[int, int, Any]] = []
+        self._lock = threading.RLock()
 
-    def push(self, ts_ns: int, val: Any) -> None:
-        if self.last_ts is None or ts_ns >= self.last_ts:
-            self.last_ts, self.last_val = ts_ns, val
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self.history)
 
-    def sample(self, tick_ns: int):
-        if self.last_ts is None:
-            return None
-        if self.policy == "drop":
-            return self.last_val if (self.last_ts > tick_ns - self.step_ns) else None
-        if self.policy == "asof":
-            return self.last_val if (tick_ns - self.last_ts <= self.tol_ns) else None
-        if self.policy == "hold":
-            return self.last_val
-        return None
+    def reset(self) -> None:
+        with self._lock:
+            self.history.clear()
+
+    def push(self, ts_ns: int, val: Any, *, receive_time_ns: int | None = None) -> bool:
+        timestamp_ns = int(ts_ns)
+        received_ns = timestamp_ns if receive_time_ns is None else int(receive_time_ns)
+        if self.retention_ns > 0 and timestamp_ns > received_ns + self.retention_ns:
+            return False
+
+        with self._lock:
+            timestamps = [item[0] for item in self.history]
+            index = bisect_right(timestamps, timestamp_ns)
+            item = (timestamp_ns, received_ns, val)
+            if index > 0 and self.history[index - 1][0] == timestamp_ns:
+                self.history[index - 1] = item
+            else:
+                self.history.insert(index, item)
+
+            if self.retention_ns > 0:
+                cutoff_ns = min(self.history[-1][0], received_ns) - self.retention_ns
+                timestamps = [item[0] for item in self.history]
+                del self.history[: bisect_left(timestamps, cutoff_ns)]
+        return True
+
+    def select(
+        self,
+        tick_ns: int,
+        *,
+        now_ns: int | None = None,
+        check_live_age: bool = True,
+    ) -> tuple[Any | None, dict[str, object] | None]:
+        item, issue = self.select_entry(tick_ns, now_ns=now_ns, check_live_age=check_live_age)
+        return (item[2] if item is not None else None), issue
+
+    def select_entry(
+        self,
+        tick_ns: int,
+        *,
+        now_ns: int | None = None,
+        check_live_age: bool = True,
+    ) -> tuple[tuple[int, int, Any] | None, dict[str, object] | None]:
+        with self._lock:
+            return self._select_entry_locked(tick_ns, now_ns=now_ns, check_live_age=check_live_age)
+
+    def _select_entry_locked(
+        self,
+        tick_ns: int,
+        *,
+        now_ns: int | None,
+        check_live_age: bool,
+    ) -> tuple[tuple[int, int, Any] | None, dict[str, object] | None]:
+        if not self.history:
+            return None, {"reason": "missing", "sample_timestamp_ns": tick_ns}
+
+        timestamps = [item[0] for item in self.history]
+        index = bisect_right(timestamps, tick_ns) - 1
+        if index < 0:
+            timestamp_ns = self.history[0][0]
+            return None, {
+                "reason": "newer_than_request",
+                "sample_timestamp_ns": tick_ns,
+                "first_timestamp_ns": timestamp_ns,
+                "age_ms": (tick_ns - timestamp_ns) / 1_000_000,
+            }
+
+        timestamp_ns, receive_time_ns, value = self.history[index]
+        age_ns = tick_ns - timestamp_ns
+        if self.policy == "asof" and self.tol_ns > 0 and age_ns > self.tol_ns:
+            return None, self._stale_issue("asof", tick_ns, timestamp_ns, age_ns, self.tol_ns)
+        if self.policy == "drop" and age_ns >= self.step_ns:
+            return None, self._stale_issue("drop", tick_ns, timestamp_ns, age_ns, self.step_ns)
+        if self.policy not in {"hold", "asof", "drop"}:
+            return None, {"reason": "unsupported_alignment_strategy", "strategy": self.policy}
+
+        live_age_ns = max(0, (tick_ns if now_ns is None else now_ns) - receive_time_ns)
+        if value is None or (check_live_age and self.max_age_ns > 0 and live_age_ns > self.max_age_ns):
+            return None, self._stale_issue("max_age", tick_ns, timestamp_ns, live_age_ns, self.max_age_ns)
+        return (timestamp_ns, receive_time_ns, value), None
+
+    def sample(self, tick_ns: int, *, now_ns: int | None = None) -> Any | None:
+        value, _ = self.select(tick_ns, now_ns=now_ns)
+        return value
+
+    def first_entry(self) -> tuple[int, int, Any] | None:
+        with self._lock:
+            return self.history[0] if self.history else None
+
+    @staticmethod
+    def _stale_issue(
+        constraint: str,
+        tick_ns: int,
+        timestamp_ns: int,
+        age_ns: int,
+        tolerance_ns: int,
+    ) -> dict[str, object]:
+        return {
+            "reason": "stale",
+            "constraint": constraint,
+            "sample_timestamp_ns": tick_ns,
+            "last_timestamp_ns": timestamp_ns,
+            "age_ms": age_ns / 1_000_000,
+            "tolerance_ms": tolerance_ns / 1_000_000,
+        }
 
 
 # ---------- Encoders (Bridged) ----------
@@ -421,13 +544,22 @@ def contract_fingerprint(contract) -> str:
         "actions": [],
     }
     for obs in contract_dict.get("observations", []):
+        transport = obs.get("transport")
+        if transport is None:
+            transport = observation_transport_to_dict(effective_observation_transport(None))
+        elif transport.get("mode", "dds") == "dds":
+            transport = {"mode": "dds"}
+        else:
+            transport = observation_transport_to_dict(parse_observation_transport(transport))
         fingerprint_data["observations"].append(
             {
                 "key": obs.get("key"),
                 "topic": obs.get("topic"),
                 "type": obs.get("type"),
                 "selector": obs.get("selector"),
+                "image": obs.get("image"),
                 "align": obs.get("align"),
+                "transport": transport,
             }
         )
     for act in contract_dict.get("actions", []):
