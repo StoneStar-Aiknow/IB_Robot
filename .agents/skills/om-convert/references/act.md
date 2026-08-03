@@ -38,7 +38,7 @@ Do not offer PI0.5 options in this workflow.
 
 Collect ACT choices as part of the shared upfront intake in `../SKILL.md`. Use `accuracy.md` and
 `multi-host-validation.md` for target generation and both numerical gates. Use `benchmark.md` for the
-required loop-50 baseline. Do not run hardware mock, LTTng, tracing, or trace summaries.
+required loop-20 baseline. Do not run hardware mock, LTTng, tracing, or trace summaries.
 
 Because ACT has no repository ONNX equivalence CLI, implement a minimal ACT verifier in the isolated
 worktree before claiming conversion completion. It must load the original ACT policy, use the same
@@ -46,6 +46,10 @@ versioned observation batch and processor path as target generation, run ONNX Ru
 input order, and write per-sample/final aggregate max absolute error, mean L1, and cosine. Add tests for
 input ordering, image/state shapes, and multi-camera bundles. Do not replace this gate with
 `onnx.checker`.
+
+The current ACT exporter is FP32. As part of the required `export_act_onnx()` refactor, add a validated
+FP16 export path and make it the OM conversion default. Keep only measured correctness-required FP32
+islands. Compare the FP16 wrapper against native Torch before ATC.
 
 ## ACT-Specific Inputs
 
@@ -182,6 +186,9 @@ om_path = work_dir / "model.om"
 abi_path = work_dir / "model.om.abi.json"
 soc_version = "RESOLVED_SOC_VERSION"
 
+# ACT support must first extend convert_onnx_to_om() to append
+# --precision_mode_v2=RESOLVED_PRECISION_MODE_V2. The resolved value is only
+# "origin" or "default"; never use --precision_mode.
 if not convert_onnx_to_om(config, str(onnx_path), str(om_path), soc_version):
     raise RuntimeError("ACT ATC conversion failed")
 
@@ -314,7 +321,7 @@ python3 src/model_utils/model_utils/loss_compare.py \
 ```
 
 Do not regenerate targets from the OM being evaluated. After collecting the conservative accuracy
-report, follow `benchmark.md` and run the ACT policy OM with `ais_bench --loop 50`, including
+report, follow `benchmark.md` and run the ACT policy OM with `ais_bench --loop 20`, including
 report-only or failed-threshold baselines. Accuracy acceptance gates optional optimization, not
 baseline collection. The invocation-weighted total is the policy OM mean.
 
@@ -330,7 +337,8 @@ Always report:
 - deployment name and managed OM path;
 - strict Manifest result;
 - Torch-vs-ONNX and Torch-vs-OM thresholds, metrics, and verdicts;
-- loop-50 OM metrics and weighted total;
+- loop-20 OM metrics and weighted total;
+- experience hits-among-evaluated and catalog coverage from `experience-ledger.md`;
 - any incomplete ABI, packaging, or accuracy work.
 
 ## References

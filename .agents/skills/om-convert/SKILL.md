@@ -29,6 +29,7 @@ Read only the references needed for the selected route:
 | Precision drift troubleshooting and proven fixes | `references/precision-troubleshooting.md` |
 | OM performance baseline | `references/benchmark.md` |
 | Optional optimization | `references/optimize.md` |
+| Experience accounting and final report | `references/experience-ledger.md` |
 
 Do not expose these references as separate skills.
 
@@ -59,6 +60,17 @@ Collect:
 
 If all roles use one host, ask once and record that the topology is shared. Host paths are independent:
 never assume the same absolute path exists on two machines.
+
+Before relying on remote hosts, ask the user to verify non-interactive SSH access. Many lab machines
+disable password authentication. Recommend preparing key authentication from the controlling host:
+
+```bash
+ssh-copy-id "RESOLVED_USER@RESOLVED_HOST"
+ssh -o BatchMode=yes "RESOLVED_USER@RESOLVED_HOST" true
+```
+
+`ssh-copy-id` itself may require one interactive password or an administrator-approved alternative.
+Never weaken the remote SSH configuration, request credentials, or assume password login is enabled.
 
 For PI05 also collect its PaliGemma asset, pipeline, FastGELU, and schedule choices from `pi05.md` in
 the same upfront intake. For a new policy, collect whether source/runtime changes may include a new
@@ -114,14 +126,18 @@ Read `config.json`. The raw `type` must be canonical and must agree with the use
 Do not route from directory or weight names. If only a path was supplied, ask the user to confirm the
 family inferred from `type`.
 
-Route:
+Classify IB-Robot support separately from LeRobot support:
 
 | Family status | Action |
 |---------------|--------|
-| ACT | Follow `act.md`, then shared accuracy and benchmark references. |
-| PI05 | Follow `pi05.md`, then shared accuracy and benchmark references. |
-| LeRobot supports it but IB-Robot has no Ascend workflow | Follow `port-new-policy.md`. |
+| IB-Robot supports Torch and Ascend OM | Use the existing ACT/PI05 workflow. |
+| IB-Robot supports Torch but not Ascend OM | Reuse the production codec, Torch deployment, bundle processors, and already-vendored assets; add only exporter/Ascend support through `port-new-policy.md`. |
+| LeRobot supports it but IB-Robot has no production Torch support | Use `port-new-policy.md`, first adding the smallest production Torch codec/registration needed to generate targets, then add OM support. |
 | LeRobot does not support it | Stop as out of scope. |
+
+Do not redownload a dependency already resolved inside the supplied bundle. A Torch-supported bundle
+is the preferred starting point because it may already contain tokenizer/processor assets such as a
+vendored PaliGemma tokenizer.
 
 For an unknown IB-Robot family, prove LeRobot support from the current revision by locating its config,
 policy/model implementation, factory/registry path, `from_pretrained()` loading, processor handling,
@@ -159,19 +175,33 @@ evidence, ATC version, target, and resolution source.
   `source install/setup.sh` for runtime commands.
 - Generate Torch targets before testing OM accuracy. Target generation and OM deployment are expected
   to occur on different machines; follow `multi-host-validation.md`.
+- For stochastic policies including PI0, PI05, SmolVLA, Diffusion Policy, and any policy exposing
+  noise/control inputs, persist and reuse the exact noise per sample across Torch, ONNX, and OM. The
+  current shared `loss_compare` implements this only for PI05; other families must add and test their
+  control-input persistence/replay before accuracy validation.
 - Use one versioned observation batch and the same task, seed, targets, raw targets, and noises across
   Torch, ONNX, and OM checks.
 - Perform only two numerical gates: Torch vs ONNX and Torch vs Ascend OM. Follow `accuracy.md`.
 - If accuracy is below the accepted limit, or a new policy needs exporter/runtime rewrites, read
   `precision-troubleshooting.md` before changing compiler precision, preprocessing, or graph math.
-- Benchmark every final OM with `ais_bench --loop 50` and compute the invocation-weighted sum. Follow
+- Benchmark every final OM with `ais_bench --loop 20` and compute the invocation-weighted sum. Follow
   `benchmark.md`.
-- Do not run `hardware_mock`, LTTng, tracing, or trace-summary validation in conversion or optimization.
-- Conversion defaults to conservative FP16. Quantization is never a default conversion step.
+- Do not run the IB-Robot `hardware_mock`/LTTng trace-summary workflow in conversion or optimization.
+  Diagnostic Ascend profiling with `msprof` remains allowed during optional optimization.
+- Export ONNX in FP16 by default, retaining only explicit FP32 islands required for demonstrated
+  correctness. Compile with `--precision_mode_v2=origin` by default. The only permitted
+  `precision_mode_v2` values are `origin` and `default`; never use the legacy `precision_mode` option.
+- Quantization is never a default conversion step.
 - For a new policy, all exploratory source edits must occur in a dedicated worktree created according
   to `port-new-policy.md`.
 - Do not create a permanent deployment for every optimization candidate. Preserve reports and
   reproduction commands; publish only the selected result.
+- Keep only one active large candidate. Check experiment size during work, delete rejected ONNX/OM,
+  ABI, dumps, temporary bundles, and profiler payloads after extracting reports, and retain only the
+  selected final artifacts plus text/JSON reports and reproduction commands.
+- Apply the 10-second single-inference guard from `benchmark.md` before any repeated performance run.
+- Track which reusable experiences were evaluated and successfully applied through
+  `experience-ledger.md`.
 
 ## Default Stop Point
 
@@ -182,7 +212,7 @@ For a LeRobot-supported policy not previously supported by IB-Robot, the default
 3. Torch vs ONNX is evaluated against the agreed limits;
 4. conservative FP16 OM, ACL ABI, Manifest, and runtime loading are complete;
 5. Torch vs Ascend OM is evaluated against the same baseline;
-6. each OM has an `ais_bench --loop 50` report and the weighted total is calculated;
+6. each OM has an `ais_bench --loop 20` report and the weighted total is calculated;
 7. reports, decisions, source diff, and reproduction commands are retained.
 
 Then stop and ask whether to continue with `optimize.md`, unless the upfront intent explicitly selected
@@ -195,6 +225,9 @@ user explicitly accepts report-only accuracy results.
 - ATC success without exact ACL-inspected ABI is a compiler artifact, not a deployment.
 - A deployment without Torch-generated targets has not passed OM accuracy validation.
 - Report-only metrics are not an accuracy pass until the user accepts them.
-- Performance optimization is successful only when accuracy remains accepted and loop-50 weighted
+- Performance optimization is successful only when accuracy remains accepted and loop-20 weighted
   latency improves.
+- The final report includes experience hits among evaluated items plus catalog coverage, with evidence
+  for every successful hit and explicit not-applicable/failed entries for the remaining evaluated
+  experiences.
 - Never claim mock, robot-task, or real-hardware validation; those are outside this workflow.

@@ -20,6 +20,17 @@ Prove LeRobot support by finding:
 
 If any of these is absent, stop: the family is not supported by this workflow.
 
+Then classify IB-Robot support:
+
+- `Torch supported, OM unsupported`: first run the existing production Torch deployment. Reuse the
+  existing codec, registry entry, processors, and bundle-local remote assets. Focus changes on export,
+  Ascend bindings, and execution strategy.
+- `IB-Robot unsupported`: add the smallest production Torch codec/registration required to load the
+  LeRobot bundle and generate targets before implementing OM support.
+
+Prefer a supplied Torch-supported bundle over reconstructing one. It may already vendor otherwise
+remote assets such as tokenizer files, avoiding unnecessary downloads and revision drift.
+
 ## Isolated Worktree Gate
 
 Never explore in the user's current worktree. First record the current root, branch, and `HEAD`, then
@@ -108,6 +119,8 @@ comparison behavior in shared modules.
 The first ONNX must:
 
 - use static batch 1 and static deployment shapes;
+- use FP16 inputs, weights, and operations by default, with documented FP32 islands only where FP16
+  changes correctness or the target kernel requires them;
 - avoid approximate and NPU-only operators;
 - expose explicit stable input/output names;
 - return only deployment tensors;
@@ -125,7 +138,9 @@ the user limits or the user explicitly accepts report-only results.
 Compile the portable design with the resolved exact `soc_version`. Start with:
 
 - static shapes;
-- FP16 or the least aggressive supported dtype;
+- FP16 ONNX;
+- `--precision_mode_v2=origin` initially, with only `origin` or `default` permitted;
+- no legacy `--precision_mode` argument;
 - no quantization;
 - no approximate operators;
 - no schedule/step/action changes;
@@ -136,6 +151,10 @@ Classify ATC failures before modifying code: unsupported op/opset, shape inferen
 domain/parser, dtype, external data, or compiler bug. Add a regression test for every non-trivial graph
 rewrite. In autonomous mode choose the safest semantics-preserving fix and record it; in approval mode
 stop before a material architecture change.
+
+Scan the full ATC log for warnings similar to `does not hit high priority library`. Treat them as
+performance and possible precision risks: record the operator, dtype, format/layout, shape, and chosen
+fallback kernel. Do not ignore the warning because compilation succeeded.
 
 ## Phase 5: ACL ABI, Manifest, And Runtime
 
@@ -161,13 +180,13 @@ Follow:
 
 - `multi-host-validation.md` to move observation batches and Torch targets;
 - `accuracy.md` for Torch vs OM;
-- `benchmark.md` for every final OM with loop 50 and the weighted total.
+- `benchmark.md` for every final OM with loop 20 and the weighted total.
 
 Do not run hardware mock, tracing, or LTTng.
 
 ## Default Completion
 
-Stop after conservative conversion, both accuracy comparisons, and the loop-50 baseline. Report:
+Stop after conservative conversion, both accuracy comparisons, and the loop-20 baseline. Report:
 
 - source and experiment worktree paths/branches/SHAs;
 - changed files and dirty diff summary;
@@ -176,6 +195,7 @@ Stop after conservative conversion, both accuracy comparisons, and the loop-50 b
 - Torch-vs-ONNX and Torch-vs-OM verdicts;
 - per-role and weighted latency;
 - decision ledger and reproduction script;
-- tests run and remaining gaps.
+- tests run and remaining gaps;
+- experience hits-among-evaluated and catalog coverage from `experience-ledger.md`.
 
 Ask whether to continue with `optimize.md` unless optimization was selected in the upfront intent.

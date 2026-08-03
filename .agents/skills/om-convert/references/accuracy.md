@@ -48,6 +48,12 @@ Keep a portable ONNX without NPU-only custom operators for this comparison. If t
 uses custom NPU operators, validate the portable graph first, then prove any custom-op rewrite against
 the same Torch baseline or an exact subgraph reference before ATC.
 
+After replacing operators with an NPU custom domain, standard ONNX Runtime commonly cannot load the
+deployment graph because no NPU ORT kernel is registered. Do not report this as an accuracy failure and
+do not pretend ORT validated the custom graph. Preserve the last portable ONNX report, prove the
+replacement subgraph in eager Torch or a focused reference where possible, then require Torch-vs-OM
+for the custom-op candidate. Record that the post-rewrite ORT gate was `not_applicable` and why.
+
 Compare:
 
 - every external output;

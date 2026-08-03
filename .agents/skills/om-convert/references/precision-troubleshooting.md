@@ -42,6 +42,12 @@ Prefer a static VLM image ABI at the policy resolution and perform resize/paddin
 Resize into ONNX/OM unless VLM KV and final action are revalidated. Small ATC Resize differences can be
 amplified by attention, KV caching, and iterative action integration.
 
+On CANN 8.1 RC1, treat vision `Resize`, padding, and reshape lowering as suspect even when the ONNX
+expression appears conventional. PI05-family vision paths have repeatedly exposed different padding,
+layout, or reshape behavior after ATC. Prefer host-side preprocessing with a static tensor ABI. If such
+logic must remain in ONNX, state the risk before compilation and validate pixels/masks, VLM handoff,
+and final action rather than relying only on ONNX shape inference.
+
 For `[0, 1]` inputs normalized later with `x * 2 - 1`, padding must be `0` before normalization so that it
 becomes `-1`. Padding with `-1` before normalization incorrectly produces `-3`.
 
@@ -140,6 +146,25 @@ In the proven CANN 8.1 RC1/Ascend310P3 experiment:
   or correct exporter semantics.
 
 Never infer OM accuracy from ORT success for a different opset.
+
+## ATC Precision And Fusion Diagnosis
+
+Use `--precision_mode_v2`, never the legacy `--precision_mode`. Permit only:
+
+- `origin` for the conservative baseline;
+- `default` as an explicit diagnostic or measured candidate.
+
+Do not use undocumented or broader precision modes through this skill.
+
+When portable ONNX passes but OM fails, a no-fusion ATC candidate is a useful localization step before
+replacing operators. Disable graph/UB fusion only through a fusion-switch file supported by the
+installed CANN version, preserve the file and command, and compare Torch-vs-OM. If accuracy returns,
+isolate the offending pass or subgraph; do not ship all fusion disabled without a measured reason.
+
+Read the complete ATC log. Warnings like `does not hit high priority library` mean the selected dtype,
+layout, shape, or op form missed a preferred kernel. Treat them as possible precision and performance
+risks, especially for FP32 fallbacks. Record and correlate them with `msprof`; successful compilation
+does not make the warning harmless.
 
 ## Invalid Evidence To Reject
 

@@ -36,6 +36,17 @@ Ask once whether remote execution is allowed. Use the user's existing SSH config
 passwords, private keys, access tokens, or secret file contents. If direct transfer is unavailable,
 provide exact commands and stop at a clear handoff point.
 
+Many lab hosts disable password authentication. Before starting a cross-host run, ask the user to
+prepare key-based access from the controlling machine when needed:
+
+```bash
+ssh-copy-id "RESOLVED_USER@RESOLVED_HOST"
+ssh -o BatchMode=yes "RESOLVED_USER@RESOLVED_HOST" true
+```
+
+If policy forbids `ssh-copy-id`, ask the user to use the organization's approved key provisioning
+method. Do not change `sshd_config` or enable password authentication.
+
 ## Canonical Validation Package
 
 Keep one package of immutable comparison inputs:
@@ -100,6 +111,16 @@ python3 src/model_utils/model_utils/loss_compare.py \
 Use a new experiment directory. Do not add `--force` unless the user explicitly approves replacing a
 baseline. For stochastic policies, target generation must persist `noises/`; missing noises is a hard
 failure for cross-machine comparison.
+
+This applies to PI0, PI05, SmolVLA, Diffusion Policy, and any new policy whose production inference
+accepts random noise or stochastic control inputs. Verify identical persisted noise reproduces
+identical Torch actions, different noise changes actions, and the Ascend run consumes the transferred
+noise rather than regenerating it.
+
+The current `loss_compare` implements persisted noise only for PI05. Before validating any other
+stochastic family, extend its codec/runtime and comparison harness with family-specific control-input
+generation, versioned storage, replay, shape/dtype validation, and effectiveness tests. Do not assume
+`--seed` alone reproduces a backend's internal random state.
 
 ## Seal The Package
 

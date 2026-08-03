@@ -5,7 +5,10 @@ upfront intent selected optimization or the user confirms after the conservative
 
 ## Optimization Intake
 
-Reuse the initial intake and ask only for unresolved optimization choices together:
+Optimization may happen days after conversion. Always refresh the Torch and Ascend host topology before
+planning: SSH targets, IB-Robot paths/revisions, bundle/deployment paths, observation/target/raw-target/
+noise package, processor/tokenizer and other bundle-local external-asset paths and hashes, device IDs,
+and baseline report locations. Then ask unresolved optimization choices together:
 
 - target performance goal, if any;
 - whether approximate math is allowed;
@@ -17,6 +20,11 @@ Reuse the initial intake and ask only for unresolved optimization choices togeth
 Default all risky choices to disabled. Quantization is not a mandatory rung and is never enabled by
 autonomous mode without explicit user selection.
 
+Before changing code, present an optimization ladder plan tailored to the current model and baseline.
+For each proposed rung show evidence, expected gain, accuracy risk, artifacts/commands, and the stop or
+rollback condition. In approval mode wait for confirmation; in autonomous mode record the plan and
+continue with the recommended first rung.
+
 ## Candidate Discipline
 
 For each candidate:
@@ -26,7 +34,7 @@ one principal hypothesis
 -> source/export change
 -> required accuracy gates
 -> ATC + exact ABI
--> ais_bench --loop 50 for every role
+-> ais_bench --loop 20 for every role
 -> weighted total
 -> keep or rollback
 ```
@@ -38,13 +46,18 @@ Do not create a permanent Manifest deployment for every candidate. Use `current/
 retain reports and reproduction commands, delete rejected large ONNX/OM files when no longer needed,
 and publish only the selected final generation.
 
+Keep one active large candidate. After each verdict, immediately delete rejected ONNX, OM, ABI,
+temporary bundles, tensor dumps, and large `msprof` payloads after extracting the summary needed for
+the report. Check experiment size and file count regularly. Reports, hashes, source diffs, and
+reproduction commands are the durable record, not every binary candidate.
+
 ## Optimization Ladder
 
 The order is evidence-driven. Skip a rung when profiling shows it is irrelevant.
 
 ### 0. Freeze The Baseline
 
-Require accepted Torch-vs-ONNX, accepted Torch-vs-OM, all OM loop-50 logs, weighted totals, input and
+Require accepted Torch-vs-ONNX, accepted Torch-vs-OM, all OM loop-20 logs, weighted totals, input and
 artifact hashes, toolchain versions, and invocation counts.
 
 ### 1. Remove Data-Path And Structural Waste
@@ -55,9 +68,15 @@ duplicated image encoding. Prefer reusable generic ACL changes over model-specif
 
 ### 2. Profile And Rank ROI
 
-Use `msprof` only as a diagnostic tool; final performance remains ais_bench loop 50. Check AICPU
+Use `msprof` as the primary diagnostic profiler; final performance remains ais_bench loop 20. Check AICPU
 fallback, host/runtime overhead, OP-type cumulative duration, normalized source-module names, and
 `mac_ratio`, `mte1/mte2`, and vector ratios.
+
+Scan ATC logs before profiling. Warnings similar to `xxx op does not hit high priority library` are
+high-signal: the op may be using a low-priority fallback because dtype, format/layout, shape, or op
+form is ineligible. Record every warning and correlate it with `msprof`. Prefer FP16 because it more
+often reaches high-priority kernels, but prove accuracy and do not globally force numerically sensitive
+operations to FP16.
 
 Rank by measured share, removability, expected benefit, implementation cost, accuracy risk, and risk of
 being invalidated by later quantization/layout changes. Do not optimize a cheap non-bottleneck merely
@@ -69,7 +88,21 @@ Try semantics-preserving removal of unused outputs, Cast/Slice chains, materiali
 redundant shape graphs, and avoidable layout conversion. For MQA, `num_kv_heads == 1` may allow MatMul
 broadcast instead of `repeat_kv`; do not apply this to GQA where the head dimension cannot broadcast.
 
-### 4. Use Exact NPU Fused Operators
+### 4. Diagnose Fusion-Induced Precision Drift
+
+When portable ONNX passes but OM fails accuracy, compile one diagnostic candidate with ATC graph and
+UB fusion disabled using a toolchain-valid fusion-switch configuration. Preserve the exact switch file
+and command. This is a diagnosis, not an automatic final deployment:
+
+- accuracy restored: identify the offending pass or pattern before replacing operators;
+- accuracy still bad: fusion is unlikely to be the primary cause; continue precision localization;
+- performance is irrelevant for this diagnostic candidate.
+
+Do not invent a fusion-switch syntax; inspect the installed CANN documentation/examples. If the
+toolchain cannot disable all relevant fusion safely, record the limitation instead of claiming the
+experiment ran.
+
+### 5. Use Exact NPU Fused Operators
 
 A candidate requires all three:
 
@@ -83,26 +116,30 @@ Reusable PI05 examples are exact RoPE/RMSNorm and, where weight order and formul
 Beware hidden costs: ND-only fused operators can add TransData, alignment can add Pad/Slice, bool ops
 can fall to AICPU, and an available parser may have no target kernel. Measure the complete role.
 
-### 5. Remove Dtype Islands
+After an NPU custom-domain replacement, standard ORT may no longer run. Keep the portable ONNX
+equivalence report, prove the replacement subgraph separately where possible, mark custom-graph ORT
+as not applicable, and require Torch-vs-OM.
+
+### 6. Remove Dtype Islands
 
 Target measured fp16/fp32 Cast islands around attention, softmax, norm, reductions, masks, and MatMul.
 Keep finite mask sentinels valid in the chosen dtype. A local FP16 rewrite is approximate unless proven
 exact and therefore must pass the applicable accuracy gates.
 
-### 6. Scan Static Shape/Tiling Choices
+### 7. Scan Static Shape/Tiling Choices
 
 Only scan dimensions whose valid business range permits change, such as padding/sequence length, image
-resolution, or chunk shape. Benchmark every point with loop 50. ATC tiling has discontinuous slow bands;
+resolution, or chunk shape. Benchmark every point with loop 20. ATC tiling has discontinuous slow bands;
 never predict winners from divisibility, powers of two, or prime factors. Changing valid input range or
 truncating data is a hard approval gate.
 
-### 7. Approximate Operators
+### 8. Approximate Operators
 
 Consider FastGELU or similar approximations only after user approval and hotspot evidence. Different
 GELU approximations are not interchangeable merely because cosine is high at one layer. Validate final
 action against the original Torch targets.
 
-### 8. Optional Quantization
+### 9. Optional Quantization
 
 Run only if the user explicitly selected quantization. It is useful when GEMM/BatchMatMul and weight
 movement dominate after glue removal.
@@ -115,18 +152,18 @@ Requirements:
 - start with selected linear layers;
 - exclude sensitive norm, attention BMM, final action head, and empirically sensitive layers by default;
 - validate each quantized role and the complete action;
-- rerun loop 50 and weighted totals.
+- rerun loop 20 and weighted totals.
 
 Quantization may rebuild layout and TransData decisions, so postpone fragile manual layout work until
 the quantized graph is final.
 
-### 9. Split, Parallelize, Or Cache
+### 10. Split, Parallelize, Or Cache
 
 Attempt only when measured repeated computation or reusable state justifies additional roles. Include
 launch, synchronization, device-link, and transfer overhead in the weighted result. Validate every role
 handoff and final action. Do not copy PI05's split topology to unrelated policies.
 
-### 10. Algorithmic Changes
+### 11. Algorithmic Changes
 
 Step count, schedule, tokenizer limits, action chunk semantics, or cache semantics are behavior changes,
 not compiler optimizations. They always require explicit approval and separately identified reports.
@@ -134,6 +171,8 @@ not compiler optimizations. They always require explicit approval and separately
 ## Completion
 
 Select the fastest candidate that meets accepted accuracy and operational constraints. Publish only
-that candidate, rerun final accuracy and loop-50 reports against final hashes, and provide `reproduce.sh`.
+that candidate, rerun final accuracy and loop-20 reports against final hashes, and provide `reproduce.sh`.
 If no candidate improves weighted mean beyond noise, keep the conservative baseline and report that
 optimization produced no accepted gain.
+
+End with the hits-among-evaluated and catalog-coverage section from `experience-ledger.md`.
