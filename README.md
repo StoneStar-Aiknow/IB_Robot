@@ -1,760 +1,391 @@
-# IB-Robot
+# RoboFrame for OpenHarmony
 
-> IB-Robot (Intelligence Boom Robot): 融合 LeRobot 与 ROS 2 生态的智能具身机器人开发框架
+> 基于 OpenHarmony 的端侧具身智能机器人框架，支持在 OpenHarmony 上完成 CPU / NPU 推理、数据采集、机器人控制等功能。
 
-## 重磅更新：支持 OpenClaw 社交控制！
+RoboFrame 融合视觉-动作策略模型（ACT、Diffusion Policy 等 VLA 模型）与 ROS 2 机器人控制链路，在 OpenHarmony 上提供端到端的具身智能能力——涵盖 **CPU / NPU 模型推理**、**多模态数据采集**与**机械臂运动控制**。
 
-IB-Robot 现已全面支持通过 **[OpenClaw](https://github.com/openclaw/openclaw)** AI Agent 进行远程社交控制！无论是在 **Gazebo 仿真环境** 还是 **真实 SO-101 机械臂** 上，你都可以通过 飞书、QQ、Discord 等软件，用最自然的语言与机器人对话并下达指令。
+## 效果展示：OpenClaw 社交控制
 
 |                            仿真演示 (Simulation)                            |                             真实硬件 (Real Robot)                            |
 | :---------------------------------------------------------------------: | :----------------------------------------------------------------------: |
 | ![仿真演示](docs/pictures/openclaw_sim.gif) | ![真实硬件](docs/pictures/openclaw_real.gif) |
 
-***
+## 目录
 
-## 项目定位
+- [快速开始](#快速开始)
+- [支持的硬件板卡](#支持的硬件板卡)
+- [系统架构](#系统架构)
+- [一、获取 OpenHarmony EmbodiedAI 源码与镜像](#一获取-openharmony-embodiedai-源码与镜像)
+- [二、板端调试连接：HDC 与 SSH](#二板端调试连接hdc-与-ssh)
+- [三、板端安装 ROS 2 Humble 运行时](#三板端安装-ros-2-humble-运行时)
+- [四、交叉编译与发布包](#四交叉编译与发布包)
+- [五、启动推理与验证](#五启动推理与验证)
+- [六、常见问题（FAQ）](#六常见问题faq)
+- [七、相关文档与生态](#七相关文档与生态)
 
-**用户指导文档**：[IB-Robot 使用指南](https://pages.openeuler.openatom.cn/embedded/docs/build/html/master/features/embodied_ai/index.html)
+---
 
-IB-Robot 是一个**智能融合机器人开发框架**，旨在打通 Hugging Face LeRobot 机器学习生态与 ROS 2 机器人中间件之间的壁垒，为具身智能研发提供从采集、训练到部署的完整工具链。
+## 快速开始
 
-### 核心融合能力
+已有编译好的发布包？3 步即可在 RoboOH 1.0.1 板卡上运行推理：
 
-| 维度       | LeRobot 生态    | ROS 2 生态   | IB-Robot 方案              |
-| -------- | ------------- | ---------- | ------------------------ |
-| **数据流**  | Episode 回合    | Topic 话题   | 契约驱动的双向实时转换              |
-| **时间观**  | 离散时间步 (Steps) | 连续时间流 (RT) | 自动对齐与高频插值平滑              |
-| **控制方式** | 端到端神经网络模型     | 分层规划控制架构   | **双模控制 (ACT vs MoveIt)** |
-| **部署形态** | Python 脚本     | ROS 2 节点   | 分布式端边协同部署                |
+```bash
+# ① 推送到板端并安装
+scp roboframe-robopi-*.tar.gz root@<board-ip>:/data/local/tmp/
+ssh root@<board-ip> 'cd /data/local/tmp && tar xzf roboframe-robopi-*.tar.gz && cd roboframe-ohos && sh install.sh'
 
-### 平台支持
+# ② 加载环境
+ssh root@<board-ip>
+. /data/roboframe/scripts/robooh_1.0.1.env
+export ROS_DOMAIN_ID=51
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
-当前主干工作流已支持三类运行平台：
+# ③ 启动推理
+ros2 launch hardware_mock hardware_mock.launch.py robot_config:=so101_single_arm &
+ros2 launch inference_service eval_inference.launch.py \
+    model_path:=/data/models/502000_rknn/pretrained_model \
+    deployment:=rknn \
+    pipeline_id:=policy \
+    robot_config_path:=/data/roboframe/install/robot_config/share/robot_config/config/robots/so101_single_arm.yaml
+```
 
-| 平台 | 角色定位 | 当前支持状态 | 典型场景 |
-| --- | --- | --- | --- |
-| **Ubuntu 22.04** | 主机 / 开发机 | 完整支持 setup、build、仿真、录制、MoveIt、推理联调 | Gazebo 仿真、数据采集、单机推理、边云联调 |
-| **openEuler Embedded 24.03** | 端侧开发板 | 支持 setup、clean build 与板端运行 | NPU 推理、实机控制、录制客户端 |
-| **OpenHarmony 5.1** | 端侧开发板 | 支持板端运行工作流、HDC 调试、最小 inference workspace 构建辅助与 LeRobot patch profile | BQ3588HM 板端推理、HDC/SSH 调试 |
+> 没有发布包？按照[第四节](#四交叉编译与发布包)从源码交叉编译并打包。
+
+## 支持的硬件板卡
+
+本框架当前以 Rockchip RK3588（6 TOPS NPU）系列板卡为目标，已验证支持以下三款（均来自 OpenHarmony EmbodiedAI 1.0.1 Release）：
+
+| 板卡 | 芯片 | NPU | 内存/存储 | 典型用途 |
+| --- | --- | --- | --- | --- |
+| **贝启 BQ3588HM** | RK3588 | 6 TOPS | 8GB + 64GB | 具身智能机器人主控、端侧推理 |
+| **曦胧 RoboPi** | RK3588 | 6 TOPS | 8GB + 64GB | 4×千兆网口（2 路 EtherCAT），工业级机器人控制 |
+| **贝启 Robo3588** | RK3588 + RK1828 | 6 TOPS | 8GB + 64GB | 6×CAN、4×GMSL2 车载相机，人形 / AMR |
+
+详细规格与固件下载见 [OpenHarmony EmbodiedAI 1.0.1 Release](https://gitcode.com/openharmony-robot/docs/blob/main/device-dev/usage.md)。
 
 ## 系统架构
 
-![IB-Robot 架构图](docs/pictures/architecture.png)
+![RoboFrame 架构图](docs/pictures/architecture.png)
 
-### 架构深度解析
+RoboFrame 构建从感知、决策到执行的端到端闭环：
 
-IB-Robot 构建了一个从感知、决策到执行的端到端闭环体系，实现了机器学习世界与机器人控制世界的无缝对接：
+1. **感知**：ROS 2 Driver 接入多路相机 / 雷达 / 麦克风；支持 VR 手柄、Xbox 控制器遥操作采集
+2. **协议转换 (tensormsg)**：`ros_msg` ↔ `tensor` 双向转换，合约机制保证类型安全
+3. **推理 (inference_service)**：通过 bundle 内唯一的 `inference_manifest.json` 和命名 deployment 选择 Torch、RKNN 等后端
+4. **动作执行 (action_dispatch)**：Action Chunking 调度 / MoveIt 2 轨迹执行，统一 `RobotStatus` 汇报
+5. **配置中心 (robot_config)**：单一 YAML 驱动关节、控制器、传感器外参，一键切换仿真 / 实机
 
-1. **多模态感知与采集**:
-   - **底层感知**: 通过 ROS 2 Driver 统一接入多路相机 (USB/RealSense)、雷达及麦克风。
-   - **多样化采集**: 支持 **VR 手柄、Xbox 控制器及手机 IMU** 等遥操作设备，为模仿学习提供专家示范数据。
-2. **协议转换枢纽 (tensormsg)**:
-   - 作为架构的枢纽，tensormsg 负责 `ros_msg` 与 `tensor` 之间的双向转换，通过合约（Contract）机制保证数据流的类型安全与一致性。
-3. **推理与研发服务 (Inference Service)**:
-   - 支持各类 VLA（视觉-语言-动作）大模型（如 SmolVLA, Pi0.5）以及端到端策略模型（如 ACT, Diffusion Policy）。系统支持 **自动检测后端** 并根据控制模式按需启动。
-4. **统一动作执行器 (Action Dispatch)**:
-   - 充当机器人的"小脑"。在 ACT 模式下负责 **Action Chunking** 调度与高频插值；在规划模式下对接 **MoveIt 2** 执行受限轨迹，并提供统一的 `RobotStatus` 汇报。
-5. **配置驱动中心 (robot\_config)**:
-   - 实现"规格驱动本体行为"。通过单一 YAML 定义关节、控制器模式及传感器外参，支持一键切换仿真与实机环境。
-
-***
-
-## 仓库结构
+### 部署拓扑
 
 ```text
-IB_Robot/                           # 主工作空间 (本仓库)
-├── .gitmodules                     # Git 子模块配置
-├── README.md                       # 本文件
-├── LICENSE                         # Apache 2.0 许可证
-├── config.json                     # AI Agent 配置文件 (AtomGit API 令牌等)
-│
-├── .agents/                        # AI Agent 配置目录
-│   └── skills/                     # AI Agent 技能库 (详见 .agents/skills/README.md)
-│
-├── libs/                           # 外部依赖库
-│   └── lerobot/                    # [子模块] LeRobot 训练框架
-│
-├── src/                            # 核心源码包集合
-│   ├── robot_config/               # 系统总控、规格定义与启动入口
-│   ├── action_dispatch/            # 统一动作执行器 (双模支持)
-│   ├── task_dispatch/              # 任务调度与分发服务
-│   ├── tensormsg/                  # LeRobot ↔ ROS 2 协议转换枢纽
-│   ├── ibrobot_msgs/               # 系统统一接口定义 (Message/Action/Service)
-│   ├── dataset_tools/              # 数据集采集与转换工具 (Episode Recorder)
-│   ├── robot_teleop/               # 遥操作控制 (Leader Arm/Xbox 手柄)
-│   ├── robot_description/          # 统一机器人 URDF/SRDF/MJCF 模型描述
-│   ├── lekiwi_description/         # Lekiwi 底盘 URDF/Mesh 模型描述
-│   ├── robot_moveit/               # MoveIt 2 运动规划集成
-│   ├── robot_navigation/           # 导航功能包
-│   ├── inference_service/          # 多模型推理与部署服务
-│   ├── so101_hardware/             # SO-101 电机驱动接口
-│   ├── lekiwi_hardware/            # Lekiwi 底盘硬件驱动接口
-│   ├── hardware_mock/              # 硬件模拟 (Mock) 接口
-│   ├── omni_wheel_controller/      # 全向轮控制器插件
-│   ├── pymoveit2/                  # [子模块] MoveIt2 Python 接口
-│   ├── rosclaw/                    # [子模块] OpenClaw 社交控制集成
-│   ├── sim_models/                 # 仿真场景模型 (Gazebo/MuJoCo)
-│   ├── model_utils/                # 模型工具库
-│   ├── attention_viz/              # 注意力可视化工具
-│   ├── voice_asr_service/          # 语音识别服务
-│   ├── workflows/                  # CI/CD 配置
-│   │
-│   ├── embodied_agent/             # 具身 AI 任务入口与编排 (task_entry / planner / executor)
-│   ├── vlm_task_planner/           # VLM 视觉语言任务规划器 (多模态场景理解 + 技能规划)
-│   ├── perception_service/         # 连续场景理解服务 (RGB-D / 多视角感知)
-│   ├── skill_library/              # 技能执行层 (skill → primitive → MoveIt)
-│   └── safety_guard/               # 显式安全校验层 (白名单 + 工作空间边界)
-│
-├── docs/                           # 深度架构文档与开发指南
-│   ├── pictures/                   # 架构图与演示 GIF
-│   └── videos/                     # 演示视频 (源文件)
-├── scripts/                        # 环境配置与验证工具脚本
-└── build/                          # 编译输出 (自动创建)
+┌─────────────────────────────────────────────────────────┐
+│  Host (Ubuntu 22.04 x86_64)                             │
+│                                                         │
+│  Docker: voxelsky/ohos-ros-humble-builder:v0.1.5       │
+│    build_roboframe_oh.sh → 13 个 aarch64/musl 包   │
+│  pack_roboframe_release.sh → roboframe-robopi-*.tar.gz  │
+│                                                         │
+│  ONNX ── rknn-toolkit2 ──► *.rknn (float16, NPU)        │
+└───────────────────────────┬─────────────────────────────┘
+                            │ scp / hdc file send
+                            ▼
+┌─────────────────────────────────────────────────────────┐
+│  Board (RK3588, RoboOH 1.0.1, musl)                     │
+│                                                         │
+│  /data/roboframe/                                       │
+│    ├── install/     ← 13 个 RoboFrame ROS 包 + lerobot  │
+│    ├── pysite/      ← Python 依赖 (lerobot_deps 发布)    │
+│    └── scripts/robooh_1.0.1.env                         │
+│                                                         │
+│  /sys_prod/robot/out/   ← 系统 ROS + sysdeps (预装)     │
+│  /sys_prod/robot/install/ ← ROS 2 Humble 运行时 (预装)  │
+│  /vendor/lib64/librknnrt.so ← NPU 驱动                  │
+└─────────────────────────────────────────────────────────┘
 ```
 
-***
+> **核心约束**：OpenHarmony 使用 musl libc + aarch64，所有 C++ 节点和 Python 扩展必须用 OHOS 交叉工具链编译，不能复用 glibc 构建产物。
 
-## 环境初始化 (First-time Setup)
+## 一、获取 OpenHarmony EmbodiedAI 源码与镜像
 
-**重要：本步骤仅需在初次克隆项目后运行一次。**
+源码获取、镜像编译与烧录流程见社区讨论：👉 [获取 OpenHarmony EmbodiedAI 源码与镜像](https://gitcode.com/org/openharmony-robot/discussions/4)
 
-### 0. 系统要求
+## 二、板端调试连接：HDC 与 SSH
 
-- **操作系统**: 当前支持三平台协同：Ubuntu 主机负责仿真、录制服务或云侧推理；端侧开发板支持 openEuler Embedded 与 OpenHarmony
-- **ROS 版本**: ROS 2 Humble
-- **Python**: >= 3.10，默认使用系统自带 Python。**严禁在 Conda 激活的环境中执行，否则会导致动态库冲突。**
-- **加速器**: 支持 NVIDIA GPU、Ascend 310B、Ascend 310P，若未检测到则按 CPU-only 路径运行。
-
-### 1. 执行一键初始化
-
-运行 `./scripts/setup.sh`。该脚本会自动完成以下重型操作：
-
-1.  **子模块同步**: 执行 `git submodule update --init --recursive`，下载核心源码。
-2.  **平台与硬件检测**: 自动识别 Ubuntu / openEuler Embedded / OpenHarmony，以及 NVIDIA GPU / Ascend 310B / 310P / CPU-only 环境。
-3.  **ROS 2 安装** (如未安装): 自动检测并安装 ROS 2 Humble 和 colcon 构建工具。
-4.  **系统依赖安装**: 通过系统包管理器安装 C++ 编译工具、`nlohmann-json` 等硬件驱动依赖。
-5.  **虚拟环境 (venv) 构建**: 在根目录创建 `venv` 文件夹。这能确保 ML 相关依赖与系统 ROS 2 环境隔离，同时通过 `--system-site-packages` 复用系统 `rclpy`。
-6.  **ML 栈安装**: 自动在 `venv` 中安装 `lerobot`、硬件依赖以及适配 ROS 2 Humble 的 NumPy 1.26.x。
-7.  **环境验证**: 自动验证 `rosdepc`、`colcon`、`rclpy`、`lerobot` 与 NumPy 兼容性。
-
-***
-
-## 开发工作流
-
-### 1. 加载环境
-
-每次开启新终端后，请在 `IB_Robot` 项目根目录下加载环境：
+### HDC 工具
 
 ```bash
-cd /path/to/IB_Robot
-source .shrc_local
+echo 'export PATH=<sdk-root>/toolchains:$PATH' >> ~/.bashrc && source ~/.bashrc
+hdc list targets   # 验证
 ```
 
-> **注意**：`.shrc_local` 会自动完成 `venv` 激活、ROS 2 环境加载和工作区 `install/setup.sh` 的 source。每次另起新终端都必须重新执行上述命令，否则 `ros2` 命令和 Python 包将不可用。
+### TCP 网络调试（推荐）
 
-完成首次构建后，再额外加载工作区环境：
 ```bash
-source install/setup.sh
+hdc tmode port 8710
+hdc shell ifconfig                  # 获取板端 IP
+hdc tconn <board-ip>:8710
+hdc -t <board-ip>:8710 shell
 ```
 
-### 2. 分配 Domain ID
+### SSH（推荐）
 
-为了避免与局域网内其他 ROS 2 用户冲突，建议设置唯一的 Domain ID。**每次另起新终端都需要重新设置**：
+HDC shell 的 PTY 缓冲区有限，长时间 launch 日志会被截断。RoboFrame 提供一键配置脚本：
 
 ```bash
-export ROS_DOMAIN_ID=<0-232之间的唯一数字>
+hdc -t <board-ip>:8710 file send scripts/setup_sshd.sh /data/setup_sshd.sh
+hdc -t <board-ip>:8710 shell 'sh /data/setup_sshd.sh'
+hdc -t <board-ip>:8710 shell 'passwd root'  # 设置密码
+ssh root@<board-ip>
 ```
 
-> **注意**：跨机器运行时，参与的所有机器必须使用**相同的 `ROS_DOMAIN_ID`**。
+## 三、板端安装 ROS 2 Humble 运行时
 
-### 3. 编译项目
+RoboOH 1.0.1 固件已预装 ROS 2 Humble 运行时和系统依赖库（sysdeps），通常**无需额外安装**。
 
-代码修改后，运行统一构建脚本：
+如需手动安装，从 [usage.md](https://gitcode.com/openharmony-robot/docs/blob/main/device-dev/usage.md) 下载：
+
+| 类别 | 文件 | 用途 |
+| --- | --- | --- |
+| ROS 系统依赖 | `ohos-*-sysdeps-*.tar.gz` | tinyxml2/openssl/libz/python 等 1200+ 库 |
+| ROS 2 Humble | `ohos-humble-build-*.tar.gz` | 板端 ROS 2 Humble 运行时 |
 
 ```bash
-./scripts/build.sh --clean
+hdc -t <board-ip>:8710 file send ohos-humble-build-aarch64-*.tar.gz /data/
+hdc -t <board-ip>:8710 file send ohos-*-sysdeps-aarch64-*.tar.gz /data/
+hdc -t <board-ip>:8710 shell 'cd /data && tar -zxpvf ohos-humble-build-*.tar.gz && tar -zxpvf ohos-*-sysdeps-*.tar.gz'
 ```
 
-*注：`build.sh` 现在只负责加载环境并执行构建；Python 环境、`lerobot` 可编辑安装与 NumPy 兼容性由 `setup.sh` 统一负责。*
+## 四、交叉编译与发布包
 
-***
+### 4.1 前提条件
 
-## 运行指南
+- Ubuntu 22.04 主机，已安装 Docker
+- Docker 镜像：`docker pull voxelsky/ohos-ros-humble-builder:v0.1.5`
+- 三类官方包（从 [usage.md](https://gitcode.com/openharmony-robot/docs/blob/main/device-dev/usage.md) 下载）：
+  - `ohos-sdk-18-linux-aarch64-*.tar.gz`（OHOS SDK）
+  - `ohos-*-sysdeps-*.tar.gz`（系统依赖）
+  - `ohos-humble-build-aarch64-*.tar.gz`（ROS 2 运行时）
+- Python 依赖（pysite）由 [lerobot_deps](https://atomgit.com/openharmony-robot/lerobot_deps) 仓库发布，直接下载 release 包即可，无需手动构建
 
-所有运行入口都以 `robot_config` 包的统一入口 `robot.launch.py` 为主。下文中的"端侧开发板"统一指可运行 **openEuler Embedded** 或 **OpenHarmony** 的板端设备。
+### 4.2 主机目录布局
 
-开始任一场景前，请先完成环境加载并设置唯一的 `ROS_DOMAIN_ID`。跨机器运行时，参与的所有机器必须使用**相同的 `ROS_DOMAIN_ID`**。
-
-```bash
-source .shrc_local
-export ROS_DOMAIN_ID=<0-232之间的唯一数字>
+```text
+<OH_ROOT>/
+├── downloads/
+│   ├── sdk/         ohos-sdk-18-linux-aarch64-*.tar.gz
+│   ├── sysdeps/     ohos-*-sysdeps-*.tar.gz
+│   └── runtime/     ohos-humble-build-aarch64-*.tar.gz
+└── custom_build_root/
+    ├── ibrobot_oh_ws/install/   ← 交叉编译产物
+    ├── ohos-robot-toolchain/18/ ← OHOS SDK
+    └── ...
 ```
 
-更详细的子模块说明可参考下表：
-
-| 文档 | 简短说明 |
-| :--- | :--- |
-| [`src/inference_service/README.md`](src/inference_service/README.md) | 推理服务架构、单机/分布式部署与 NPU/GPU Cloud 节点启动方式 |
-| [`src/robot_moveit/README.md`](src/robot_moveit/README.md) | MoveIt Planning 控制、`/cmd_pose` 用法与 headless 启动方式 |
-| [`src/dataset_tools/README.md`](src/dataset_tools/README.md) | episodic 录制、`record_cli` 用法与 `bag_to_lerobot` 数据集转换流程 |
-
-### 一、Ubuntu 仿真场景
-
-#### 1. Ubuntu 启动仿真环境（仅仿真与控制器）
-
-适合验证 Gazebo、相机、控制器和基础 ROS 2 拓扑，不启动模型推理。
+### 4.3 交叉编译 11 个包
 
 ```bash
-ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
-    control_mode:=model_inference \
-    use_sim:=true \
-    with_inference:=false
+export OH_ROOT="<your-oh-root>"
+
+./scripts/openharmony/build_roboframe_oh.sh \
+  --oh-root "$OH_ROOT"
 ```
 
-#### 2. Ubuntu 启动仿真并用模型推理控制仿真机械臂
+默认编译以下 13 个包（覆盖推理 + 控制 + 仿真全链路）：
 
-显式切到 `model_inference` 模式，使用本机推理链路控制仿真机械臂。
+| 类别 | 包 |
+| --- | --- |
+| 消息 | `ibrobot_msgs` `tensormsg` |
+| 配置 | `robot_config` `robot_description` |
+| 推理 | `inference_service` `dataset_tools` |
+| 控制 | `action_dispatch` `task_dispatch` `robot_moveit` |
+| 硬件 | `so101_hardware` `hardware_mock` |
+| 其他 | `embodied_common` `voice_asr_service` |
+
+> 脚本自动处理：SDK 解压、sysdeps overlay（tinyxml2/openssl/libz 等 1200+ 库整体提取到 sysroot）、lerobot patch 应用、wrapper 脚本生成。如需增减包，用 `--packages pkg1,pkg2,...` 覆盖。
+
+### 4.4 打包发布包
 
 ```bash
-ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
-    control_mode:=model_inference \
-    use_sim:=true
+./scripts/pack_roboframe_release.sh \
+    --build-install "$OH_ROOT/custom_build_root/ibrobot_oh_ws/install" \
+    --output roboframe-robopi-$(date +%Y%m%d).tar.gz
 ```
 
-#### 3. Ubuntu 启动 MoveIt Planning 控制（仿真）
+发布包结构：
 
-该场景默认会启动 MoveIt 与 RViz，并暴露 `/cmd_pose` 接口用于发送目标位姿。
-
-```bash
-ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
-    control_mode:=moveit_planning \
-    use_sim:=true
+```text
+roboframe-ohos/
+├── install/              # 13 个 ROS 包 + lerobot(patched) + wrapper 入口
+├── scripts/
+│   ├── robooh_1.0.1.env  # 统一环境脚本 (PYTHONPATH / LD_PRELOAD)
+│   └── setup_sshd.sh     # SSH 服务配置脚本
+└── install.sh            # 一键部署
 ```
 
-如需在板端或无图形界面的环境中运行，可关闭 RViz：
+> Python 依赖（pysite，含 torch/transformers/tokenizers/regex 等 ~200MB）由
+> [lerobot_deps](https://atomgit.com/openharmony-robot/lerobot_deps) 仓库独立发布，
+> 需单独下载部署。
+
+### 4.5 部署到板端
 
 ```bash
-ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
-    control_mode:=moveit_planning \
-    use_sim:=true \
-    moveit_display:=false
+# 1. 下载 RoboFrame 发布包（install + scripts）
+scp roboframe-robopi-*.tar.gz root@<board-ip>:/data/local/tmp/
+ssh root@<board-ip> 'cd /data/local/tmp && tar xzf roboframe-robopi-*.tar.gz && cd roboframe-ohos && sh install.sh'
+
+# 2. 下载 Python 依赖包（pysite）并部署
+curl -L -o roboframe-deps.tar.gz \
+    https://atomgit.com/openharmony-robot/lerobot_deps/releases/download/v1.0.0/roboframe-deps-1.0.0-robopi-20260703.tar.gz
+scp roboframe-deps.tar.gz root@<board-ip>:/data/roboframe/
+ssh root@<board-ip> 'cd /data/roboframe && tar xzf roboframe-deps.tar.gz'
 ```
 
-发送位姿命令控制机械臂移动：
+部署完成后板端目录结构：
 
-```bash
-ros2 topic pub /cmd_pose geometry_msgs/Pose "{
-  position: {x: 0.15, y: 0.0, z: 0.25},
-  orientation: {x: 0.0, y: 0.0, z: 0.707, w: 0.707}
-}" --once
+```text
+/data/roboframe/
+├── install/     ← 13 个 RoboFrame ROS 包 + lerobot
+├── pysite/      ← Python 依赖 (torch/numpy/transformers/tokenizers/regex ~200MB)
+└── scripts/
+    ├── robooh_1.0.1.env
+    └── setup_sshd.sh
 ```
 
-查看末端位姿反馈：
+### 4.6 验证
 
 ```bash
-ros2 topic echo /robot_status/ee_pose
+ssh root@<board-ip>
+. /data/roboframe/scripts/robooh_1.0.1.env
+
+ros2 pkg list | grep -E 'inference_service|hardware_mock|so101_hardware'
+python3 -c "import torch; print('torch', torch.__version__)"
+python3 -c "import transformers; print('transformers', transformers.__version__)"
+python3 -c "import tokenizers; print('tokenizers', tokenizers.__version__)"
+python3 -c "from rknnlite.api import RKNNLite; print('RKNN OK')"
 ```
 
-### 二、真机场景
+## 五、启动推理与验证
 
-#### 1. 端侧开发板启动 MoveIt Planning 控制（真机）
-
-与 Ubuntu 上的 MoveIt 用法保持一致，只是 `use_sim` 不再开启，适合真实机械臂控制。
+### 5.1 RKNN NPU 推理
 
 ```bash
-ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
-    control_mode:=moveit_planning
-```
+. /data/roboframe/scripts/robooh_1.0.1.env
+export ROS_DOMAIN_ID=51
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 
-控制接口仍然是同一套话题：
+# 启动硬件 mock（发布模拟相机 + 关节状态）
+ros2 launch hardware_mock hardware_mock.launch.py robot_config:=so101_single_arm &
 
-```bash
-ros2 topic pub /cmd_pose geometry_msgs/Pose "{
-  position: {x: 0.15, y: 0.0, z: 0.25},
-  orientation: {x: 0.0, y: 0.0, z: 0.707, w: 0.707}
-}" --once
-```
-
-### 三、分布式推理部署场景
-
-分布式模式在 robot YAML 的命名 pipeline 中声明 `execution_mode: distributed`。机器人侧启动
-Edge pipeline，算力侧单独启动 `cloud_inference.launch.py`。两端必须使用相同的 pipeline ID、
-deployment name 和 bundle identity。
-
-#### 1. Ubuntu 单机调试分布式推理（Edge + Cloud 同机）
-
-适合开发和联调，在一台 Ubuntu 机器的两个终端运行两侧节点。先准备一个将 `policy` pipeline
-配置为 distributed 的 YAML。
-
-```bash
-# 终端 1：Edge
-ros2 launch robot_config robot.launch.py \
-    config_path:=/absolute/path/to/so101_single_arm_distributed.yaml \
-    control_mode:=model_inference \
-    use_sim:=true
-
-# 终端 2：Cloud
-ros2 launch inference_service cloud_inference.launch.py \
+# 启动 RKNN 推理
+ros2 launch inference_service eval_inference.launch.py \
+    model_path:=/data/models/502000_rknn/pretrained_model \
+    deployment:=rknn \
     pipeline_id:=policy \
-    model_path:=/absolute/path/to/policy_bundle \
-    deployment:=cpu
+    robot_config_path:=/data/roboframe/install/robot_config/share/robot_config/config/robots/so101_single_arm.yaml
 ```
 
-#### 2. Ubuntu 启动仿真环境，端侧开发板启动 NPU 推理
+`/data/models/502000_rknn/pretrained_model` 必须是完整 policy bundle，至少包含
+`config.json`、processor 文件、`inference_manifest.json` 和 manifest 声明的 RKNN artifact。
+`rknn` 是该 manifest 中的 deployment 名称；运行时不会扫描目录寻找 `*.rknn`。
 
-Ubuntu 主机负责仿真与 Edge 侧预处理/后处理；端侧开发板负责云侧纯推理。两台机器必须位于同一局域网，并设置相同的 `ROS_DOMAIN_ID`。
+### 5.2 CPU 推理
 
-**Ubuntu 主机（仿真 + Edge）**
-
-```bash
-ros2 launch robot_config robot.launch.py \
-    config_path:=/absolute/path/to/so101_single_arm_distributed.yaml \
-    control_mode:=model_inference \
-    use_sim:=true
-```
-
-**端侧开发板（NPU Cloud 节点）**
+将 deployment 改为 bundle 中的 Torch CPU deployment 名称，例如 `cpu`：
 
 ```bash
-ros2 launch inference_service cloud_inference.launch.py \
+ros2 launch inference_service eval_inference.launch.py \
+    model_path:=/data/models/502000/pretrained_model \
+    deployment:=cpu \
     pipeline_id:=policy \
-    model_path:=/absolute/path/to/policy_bundle \
-    deployment:=npu
+    robot_config_path:=/data/roboframe/install/robot_config/share/robot_config/config/robots/so101_single_arm.yaml
 ```
 
-这里的 `npu` 是 manifest 中命名的 Torch NPU deployment，而不是 backend alias。GPU server
-使用与 edge YAML 相同的命名 deployment，例如 `cuda`。
+### 5.3 触发推理
 
-快速验证分布式链路是否打通：
+默认 `policy` pipeline 暴露 `/inference/policy/dispatch` ROS 2 Action，发送 goal 即可触发一次推理：
 
 ```bash
-ros2 node list | grep -E 'inference_policy|inference_policy_cloud'
-ros2 action info /inference/policy/dispatch
-ros2 topic info /inference/policy/request
-ros2 topic info /inference/policy/result
-ros2 topic hz /inference/policy/heartbeat
+ros2 action send_goal /inference/policy/dispatch \
+    ibrobot_msgs/action/DispatchInfer \
+    "{obs_timestamp: {sec: 0, nanosec: 0}, prompt: '', inference_id: 'test-001', deadline: {sec: 0, nanosec: 0}}"
 ```
 
-#### 3. OpenHarmony 板端作为算力侧（RK3588）
-
-OpenHarmony 板端的完整指南（构建、部署、RKNN 推理、内核、SSH 配置等）详见 **[README.OpenHarmony.md](README.OpenHarmony.md)**。
-
-### 四、数据集录制场景
-
-episodic 录制始终由两部分组成：
-
-1. `robot.launch.py` 启动 `episode_recorder` 录制服务端
-2. `ros2 run dataset_tools record_cli` 启动交互式录制客户端
-
-`record_visualizer:=rerun` 只会额外拉起 Rerun 可视化 sidecar，不会替代 `record_cli`。
-
-#### 1. Ubuntu 启动录制服务器 + Ubuntu 启动录制客户端
-
-**不启用 Rerun**
-
-```bash
-ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
-    control_mode:=teleop \
-    record:=true \
-    record_mode:=episodic \
-    use_sim:=false
-```
-
-**启用 Rerun**
-
-```bash
-ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
-    control_mode:=teleop \
-    record:=true \
-    record_mode:=episodic \
-    record_visualizer:=rerun \
-    use_sim:=false
-```
-
-**客户端（同机另一个终端）**
-
-```bash
-ros2 run dataset_tools record_cli
-```
-
-启动 `record_cli` 后输入任务描述即可开始录制，按回车可提前结束当前 episode。
-
-#### 2. Ubuntu 启动录制服务器，端侧开发板启动录制客户端
-
-该模式适合把机器人控制与录制操作分离。Ubuntu 主机负责录制服务端，端侧开发板只负责运行 `record_cli`。两端仍需保持相同的 `ROS_DOMAIN_ID`。
-
-**Ubuntu 录制服务器（可选启用 Rerun）**
-
-```bash
-ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
-    control_mode:=teleop \
-    record:=true \
-    record_mode:=episodic \
-    use_sim:=false
-```
-
-如需开启可视化，在服务端命令中增加：
-
-```bash
-ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_single_arm \
-    control_mode:=teleop \
-    record:=true \
-    record_mode:=episodic \
-    record_visualizer:=rerun \
-    use_sim:=false
-```
-
-**端侧开发板录制客户端**
-
-```bash
-ros2 run dataset_tools record_cli
-```
-
-录制完成后，可将整个 episodic dataset 根目录转换为 LeRobot 数据集格式：
-
-```bash
-ros2 run dataset_tools bag_to_lerobot \
-    --bags-dir ~/rosbag/episodes/so101_single_arm \
-    --robot-config src/robot_config/config/robots/so101_single_arm.yaml \
-    --out /path/to/output_dataset
-```
-
-bag 目录组织、`dataset.yaml` 元信息和更多转换参数，详见 `src/dataset_tools/README.md`。
-
-***
-
-## 参数说明
-
-| 参数名 | 说明 | 默认值 |
-| :--- | :--- | :--- |
-| `robot_config` | 机器人配置名称（对应 `config/robots/` 下的 YAML） | `so101_single_arm` |
-| `config_path` | 配置文件绝对路径（可选，覆盖 `robot_config`） | 空 |
-| `use_sim` | 是否启用仿真模式 | `false` |
-| `control_mode` | 覆盖默认控制模式（`model_inference` / `moveit_planning` / `teleop`） | 从 YAML 读取 |
-| `with_inference` | 强制启用/禁用推理服务（空则自动检测） | 空 |
-| `with_moveit` | 强制启用/禁用 MoveIt 核心（空则自动检测） | 空 |
-| `moveit_display` | 是否启动 MoveIt RViz 可视化界面 | `true` |
-| `record` | 是否启用录制流水线 | `false` |
-| `record_mode` | 录制模式（`continuous` / `episodic`） | `continuous` |
-| `record_visualizer` | 录制可视化器（`none` / `rerun`） | `none` |
-| `with_embodied` | 基础 `robot_config` launch 中保留的兼容覆盖；完整具身链路请使用 `embodied_bringup` | 空 |
-| `auto_start_controllers` | 是否在启动后自动激活控制器 | `true` |
-
-推理执行模式不是 launch 参数；它在 robot YAML 的每个命名 pipeline 中配置。分布式 Cloud 节点需
-使用 `inference_service cloud_inference.launch.py` 单独启动。
-
-***
-
-## 四、具身 AI 流水线
-
-IB-Robot 内置了一条完整的**具身 AI 执行链路**，以自然语言（或 `/voice_command` 话题）为入口，经 VLM 视觉语言理解和技能规划后，驱动 MoveIt 2 执行真实动作。该链路在 `moveit_planning` 控制模式下可用。
-
-### 链路结构
+期望输出：
 
 ```text
-/voice_command
-  → task_entry_node         # 任务入口，优先规则直达
-  → vlm_task_planner_node   # VLM 视觉语言任务规划（场景理解 + 技能选择）
-  → task_executor_node      # 技能序列编排
-  → skill_executor_node     # 技能 → primitive 分解
-  → safety_guard_node       # 安全校验（白名单 + 工作空间边界）
-  → moveit_gateway          # MoveIt 2 运动规划执行
+Goal accepted with ID: ...
+success: true
+inference_latency_ms: ~570 (RKNN) / ~700 (CPU)
+Goal finished with status: SUCCEEDED
 ```
 
-### 启动具身流水线
+### 5.4 全链路闭环（真实硬件）
 
-```bash
-ros2 launch embodied_bringup embodied_pipeline.launch.py \
-    robot_config:=so101_single_arm \
-    control_mode:=moveit_planning \
-    use_sim:=true \
-    moveit_display:=false \
-    authorize_motion:=false
-```
+真实 SO-101 机械臂闭环需要额外的 USB 相机驱动和内核配置，详见 [RKNN 推理指南](docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md) §5。
 
-`authorize_motion` 默认 `false`，因此上述命令只启动可查询、默认拒绝运动的 Gateway。只有操作员完成
-现场安全检查后，才能在 launch 时显式设为 `true`；Agent、CLI、YAML 和动态 ROS 参数都不能代替操作员授权。
+### 5.5 性能数据
 
-### Agent 默认控制入口
+| 指标 | RKNN (NPU) | CPU |
+| --- | --- | --- |
+| 推理延迟 | ~470ms | ~80s |
+| 端到端（含预处理） | ~570ms | ~80s |
+| Action chunk size | 100 | 100 |
+| 输出 shape | `(1, 100, 6)` | `(1, 100, 6)` |
 
-Hermes 等 Agent 默认通过 `robot-skill` 访问 Capability Gateway：
+## 六、常见问题（FAQ）
 
-```text
-Hermes -> ibrobot-control Agent Skill -> robot-skill -> ROS Capability Gateway
-```
+| 问题 | 原因 | 解决方法 |
+| --- | --- | --- |
+| `Calibration file not found: /data/local/tmp/ros_home/...` | launch 环境的 `HOME` 与 SSH 不同 | `ln -sf /root/.calibrate /data/local/tmp/ros_home/.calibrate` |
+| `URLError: download.pytorch.org` | 板端无外网，torchvision 下载 ResNet18 权重 | 在有网主机下载 `resnet18-f37072fd.pth`，推送到板端 `/root/.cache/torch/hub/checkpoints/` 和 `/data/local/tmp/ros_home/.cache/torch/hub/checkpoints/` |
+| `Can not find dynamic library on RK3588!` | rknnlite 硬编码搜索 `/usr/lib/librknnrt.so` | `ln -sf /vendor/lib64/librknnrt.so /usr/lib/librknnrt.so` |
+| `Assertion failed: cast_or_create_topic` | 使用了 `rmw_fastrtps_cpp`（旧版 OH） | `export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` |
+| `/dev/ttyACM0` 不存在 | 内核缺少 `CONFIG_USB_ACM` | 重新编译内核，见 `oh-rebuild-kernel` skill |
+| 推理节点 SIGSEGV | `LD_PRELOAD` 未设置 | 确认 `source robooh_1.0.1.env` 已执行 |
+| `ModuleNotFoundError: 'rknnlite.xxx'` | `.so` 后缀不匹配 | 重命名 `-gnu.so` → `-ohos.so` |
+| `Deployment 'rknn' is not present` | manifest 中没有同名 deployment | 查看 `inference_manifest.json` 并使用实际 deployment 名称，或重新运行 exporter |
+| `Bundle digest mismatch` / artifact load failure | Manifest identity 被手改，或 artifact 损坏/ABI 不兼容 | 重新运行 RKNN exporter 并发布新 revision |
 
-`list-skills`、`describe` 和 `list-poses` 是不初始化 ROS 的 catalog-only 命令；`status`、`validate`、
-`execute` 和 `cancel` 是 Gateway runtime 命令。普通命令输出单行 JSON，`execute` 输出 JSONL feedback 和
-唯一 terminal result。命令、退出码和授权说明见
-[`src/robot_skill_cli/README.md`](src/robot_skill_cli/README.md)。
+> 更多问题与高级配置见各专项 skill（`oh-rebuild-kernel`、`oh-cross-build-ros-pkg`）与 [RKNN 推理指南](docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md)。
 
-`robot_mcp` 兼容层已移除，统一通过 `robot-skill` 访问 Capability Gateway。
+## 七、相关文档与生态
 
-### 发送自然语言命令
+### 详细文档
 
-```bash
-# 场景理解（纯视觉分析，不触发机械臂移动）
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '当前摄像头中可以看到什么'}"
+| 文档 / Skill | 内容 |
+| --- | --- |
+| [板端烧录与调试](docs/OpenHarmony_EmbodiedAI_Board_Setup.md) | 开发板烧录、HDC 工具准备、TCP 调试、SSH 配置 |
+| [RKNN NPU 推理](docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md) | ONNX→RKNN 转换、推理验证、单板全链路闭环 |
+| [Node.js + OpenClaw Gateway](docs/OpenHarmony_EmbodiedAI_NodeJS_OpenClaw_Gateway.md) | 板端 Node.js 部署与 OpenClaw 社交控制 |
+| [`oh-cross-build-ros-pkg`](.agents/skills/oh-cross-build-ros-pkg/SKILL.md) | 第三方 ROS 2 包交叉编译（含 ros2_control 补丁说明） |
+| [`oh-build-roboframe`](.agents/skills/oh-build-roboframe/SKILL.md) | RoboFrame 发布包构建（`build_roboframe_oh.sh`） |
 
-# 相对移动
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
+### 官方资源
 
-# 回安全位
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '回原位'}"
-```
+- [OpenHarmony EmbodiedAI 1.0.1 Release](https://gitcode.com/openharmony-robot/docs/blob/main/device-dev/usage.md)
+- [Docker 交叉编译官方文档](https://gitcode.com/openharmony-robot/docs/blob/main/device-dev/docker-build.md)
 
-### VLM 配置
+### OpenHarmony 机器人生态
 
-具身链路默认对接本地 OpenAI-compatible 服务（如 vLLM / Ollama）：
+| 仓库 | 说明 |
+| --- | --- |
+| [ros_ros2_base](https://gitcode.com/openharmony-robot/ros_ros2_base) | ROS 2 核心基础功能包 |
+| [ros_ros2_control](https://gitcode.com/openharmony-robot/ros_ros2_control) | ros2_control 控制框架 |
+| [ros_moveit2](https://gitcode.com/openharmony-robot/ros_moveit2) | MoveIt2 运动规划框架 |
+| [ros_navigation2](https://gitcode.com/openharmony-robot/ros_navigation2) | Navigation2 自主导航 |
+| [ros_peripheral](https://gitcode.com/openharmony-robot/ros_peripheral) | 传感器及外设驱动 |
+| [oh_robot_sim](https://gitcode.com/openharmony-robot/oh_robot_sim) | 具身智能模拟器框架 |
+| [tools_ohloha](https://gitcode.com/openharmony-robot/tools_ohloha) | ohloha 系统级包管理工具 |
+| [tools_ohloha_pkgs](https://gitcode.com/openharmony-robot/tools_ohloha_pkgs) | 80+ 系统依赖库源码级迁移方案 |
+| [thirdparty_pytorch](https://gitcode.com/openharmony-robot/thirdparty_pytorch) | 板端 PyTorch / Python runtime |
 
-```yaml
-embodied:
-  planner:
-    mode: vlm_api          # rule / vlm_api / hybrid
-    vlm_api:
-      provider: openai_compatible
-      base_url: http://localhost:8000/v1
-      model: Qwen3.5-9B
-      api_key_env: ""      # 本地服务无需 key
-```
+### 工具与镜像
 
-更多配置说明见：
-- [`src/embodied_agent/README.md`](src/embodied_agent/README.md) — 任务入口与编排
-- [`src/vlm_task_planner/README.md`](src/vlm_task_planner/README.md) — VLM 规划器
-- [`src/perception_service/README.md`](src/perception_service/README.md) — 场景感知服务
-- [`src/skill_library/README.md`](src/skill_library/README.md) — 技能执行层
-- [`src/safety_guard/README.md`](src/safety_guard/README.md) — 安全校验层
-
-***
-
-## AI Agent Skills
-
-IB-Robot 内置 AI 编程代理技能，帮助 Claude Code、Gemini CLI、OpenCode 等 AI Agent 更好地理解项目架构和开发流程。可用技能详见 [.agents/skills/README.md](.agents/skills/README.md)。
-
-机器人能力发现和受控执行的默认接口是 `robot-skill`，而不是 MCP、裸 `ros2`、primitive、MoveIt 或
-controller 命令。执行真实动作前必须由用户明确确认，且运行中的 Agent 不得开启 `authorize_motion`。
-
-### config.json 配置文件
-
-`config.json` 用于存储 AI Agent 所需的配置信息，目前主要用于 AtomGit API 集成：
-
-```json
-{
-  "atomgit": {
-    "token": "$ATOMGIT_TOKEN",
-    "owner": "openEuler",
-    "repo": "IB_Robot",
-    "baseUrl": "https://api.atomgit.com"
-  }
-}
-```
-
-**获取 AtomGit Personal Access Token**：
-
-1. 访问 <https://atomgit.com> 并登录
-2. 点击右上角头像 → 个人设置
-3. 找到「访问令牌」选项
-4. 点击「新建访问令牌」，勾选 `repo` 和 `pull_request` 权限
-5. **立即复制保存** Token（只显示一次）
-
-设置环境变量：
-
-将以下内容添加到你本地的 `~/.zshrc` 或 `~/.bashrc` 中：
-
-```bash
-export ATOMGIT_TOKEN="your_token_here"
-```
-
-### 支持的 Agent
-
-所有符合 Agent Skills 标准的客户端都会自动扫描 `.agents/skills/`：
-详见 [agentskills.io](https://agentskills.io)。
-
-***
-
-## 基于 OpenClaw 的社交控制与远程 AI 代理
-
-IB-Robot 深度集成 [OpenClaw](https://github.com/openclaw/openclaw) AI Agent 框架，配合 [RosClaw](https://github.com/PlaiPin/rosclaw) 桥接器，实现通过 飞书、QQ、Discord 或 Slack 以自然语言对话的方式远程控制机器人。
-
-> **兼容性说明**：本节描述可选的旧 RosClaw 社交桥接，不是 Hermes 的默认控制面。Hermes 和本地 Agent
-> 必须使用 `robot-skill` 访问 Capability Gateway；不得把 `docs/ib_robot_social_skill.md` 复制或注册为
-> `ibrobot-control`，因为该旧文档包含裸 ROS 运动接口。
-
-> **致谢**: 感谢 OpenClaw 团队提供的强大 AI 代理框架，以及 RosClaw 提供的 ROS 2 桥接方案。
-
-### 1. 机器人端配置 (RosClaw & Bridge)
-
-机器人端需要安装 WebSocket 桥接驱动并启动发现服务。
-
-- **拉取子模块**:
-  确保已拉取最新的 RosClaw 子模块源码：
-  ```bash
-  git submodule update --init --recursive
-  ```
-- **安装系统依赖**:
-  ```bash
-  # 必须安装 rosbridge_suite 以提供 WebSocket 通信能力
-  sudo apt-get update && sudo apt-get install -y ros-humble-rosbridge-suite
-  ```
-- **启动机器人本体**:
-  首先启动机器人本体程序（支持仿真或实机）：
-  ```bash
-  # use_sim:=true 为仿真模式，false 为真实硬件模式
-  ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=model_inference use_sim:=true with_inference:=false
-  ```
-- **启动社交桥梁**:
-  本项目已将 RosClaw 作为子模块引入 `src/rosclaw`。执行以下脚本一键启动：
-  ```bash
-  # 自动编译子模块并启动 rosbridge_websocket, rosapi 和 discovery 节点
-  ./scripts/start_rosclaw.sh
-  ```
-  启动后，系统将在 `9090` 端口开启 WebSocket 服务。
-
-### 2. 控制端配置 (OpenClaw)
-
-- OpenClaw 是机器人的"大脑"和"前端"，负责连接社交软件并调用 LLM 理解指令。
-
-> **重要**：在使用 OpenClaw 控制机器人之前，必须确保 OpenClaw 侧的 `ROS_DOMAIN_ID` 与机器人端一致。否则 OpenClaw 将无法发现 ROS2 话题和服务，表现为"ros2 CLI 不可用"或无法发送控制指令。需要在会话时告知 OpenClaw 对应的 `ROS_DOMAIN_ID`。
-
-- **安装 OpenClaw**:
-  推荐使用官方提供的快速安装脚本（需要 Node.js 22+）：
-  ```bash
-  # 安装 OpenClaw CLI
-  npm install -g openclaw
-
-  # 执行初始化向导，配置你的 LLM (如 GLM-4/5 或 GPT-4)
-  openclaw onboard
-  ```
-- **集成 RosClaw 插件**:
-  ```bash
-  # 在 IB_Robot 根目录下执行，将插件安装到 OpenClaw
-  openclaw plugins install ./src/rosclaw/extensions/openclaw-plugin
-  ```
-- **配置机器人连接**:
-  ```bash
-  # 设置机器人 WebSocket 地址（替换为实际 IP）
-  openclaw config set plugins.entries.rosclaw.config.rosbridge.url "ws://<机器人IP>:9090"
-  ```
-- **启动 Gateway**:
-  ```bash
-  openclaw gateway
-  ```
-
-### 3. 交互示例
-
-连接成功后，你可以在网页端 (`http://localhost:18789`) 或绑定的飞书、QQ 或 Discord 中输入：
-
-- *"查看机器人当前的能力清单"* —— 获取所有传感器话题。
-- *"把机械臂恢复到初始位置"* —— AI 会根据技能文档自动将角度转换为**弧度**。
-- *"帮我看看桌子上有什么？"* —— AI 会调用 `/camera/top/image_raw` 抓拍并分析图像。
-- *"帮我抓取桌上的瓶子"* —— AI 将触发 IB-Robot 的 `DispatchInfer` AI 任务。
-
-***
-
-## FAQ
-
-### 1. 控制器残留/清理
-
-如果遇到控制器无法启动或端口占用的问题，请运行清理脚本重置 ROS 2 后台进程：
-
-```bash
-./scripts/cleanup_ros.sh
-```
-
-### 2. 共享内存 (SHM) 报错
-
-若出现 `RTPS_TRANSPORT_SHM Error`，请尝试清理缓存：
-
-```bash
-sudo rm -rf /dev/shm/fastrtps_*
-export ROS_LOCALHOST_ONLY=1
-```
-
-### 3. 仿真窗口无法显示
-
-若启动仿真后没有出现可视化窗口（如 MuJoCo/Gazebo），请检查 `DISPLAY` 环境变量。在 Wayland 或某些远程桌面环境下，可能需要手动设置：
-
-```bash
-export DISPLAY=:1
-```
+| 资源 | 地址 |
+| --- | --- |
+| 交叉编译 Docker 镜像 | `docker pull voxelsky/ohos-ros-humble-builder:v0.1.5` |
+| ROS 2 Humble Desktop 镜像 | `docker pull voxelsky/ros-humble-desktop-classic:v0.0.1` |
 
 ---
 
-## 更新日志
-
-### 2025-06-15：感知系统增强 + 未实现技能清理
-
-#### 感知服务（perception_service）重大升级
-
-**新增 2D 物体检测 + 3D 坐标接地能力**，感知服务从"场景描述"升级为"物体级感知"：
-
-- **新增 `object_parser.py`**：解析 VLM 返回的物体级 grounding 结果（label、bbox、confidence），支持 `0-1000` 归一化坐标系到实际像素坐标的自动缩放
-- **新增 `grounding_3d.py`**：将 2D bbox 结合 RGB-D 深度图反投影为相机坐标系 3D 位置（中位深度估计 + 越界过滤）
-- **新增 ROS 消息类型**：
-  - `SceneObject.msg`：单物体检测结果（label、bbox、3D pose、confidence）
-  - `SceneObservation.msg`：完整场景观测（多物体列表 + 场景摘要 + 风险评估）
-- **新增 `perception_observation` topic**：发布结构化 `SceneObservation` 消息，供下游 planner / executor 消费
-- **prompt_builder 升级**：在 VLM prompt 中增加 `objects` 字段请求，要求返回 bbox 坐标；删除重复的 `append_images` 定义
-- **并发安全增强**：会话历史加线程锁（`_history_lock`），新增 `max_concurrent_requests` 信号量限制
-- **最小置信度过滤**：新增 `min_object_confidence` 参数，自动过滤低置信度物体
-
-**实际 VLM 验证通过**（使用 `glm-4.5v` 模型）：
-
-| 物体 | 2D bbox | 3D 位置 (m) | 置信度 |
-|---|---|---|---|
-| 草莓 | [355, 15, 548, 254] | (0.039, -0.036, 0.196) | 0.85 |
-| 白色长方体 | [204, 0, 481, 273] | (0.004, -0.029, 0.165) | 0.85 |
-| 黑色小方块 | [179, 373, 266, 443] | (-0.030, 0.046, 0.172) | 0.60 |
-| 电线 | [0, 313, 179, 479] | (-0.064, 0.040, 0.162) | 0.60 |
-
-> ⚠️ `glm-4.7` 不支持图像输入，感知节点请使用 `glm-4.5v` 作为视觉模型。
-
-#### 未实现技能清理（死代码移除）
-
-移除了 8 个依赖物理抓取流水线但尚未实现的技能及其全部关联代码（模板、配置、解析器、命令路由）：
-
-| 移除的技能 | 说明 |
-|---|---|
-| `pick_named_target` | 未对接实际抓取 pipeline |
-| `place_named_pose` | 同上 |
-| `observe_target_area` | 无实际感知闭环 |
-| `approach_named_target` | 无目标定位能力 |
-| `hover_named_target` | 同上 |
-| `lift_named_target` | 同上 |
-| `retreat_from_target` | 同上 |
-| `release_at_named_pose` | 同上 |
-
-**涉及变更的模块**：
-- `embodied_agent/command_parser.py`：删除硬编码的目标名解析和上述技能的文本路由
-- `embodied_common/skill_templates.py`：删除 8 个技能的模板定义
-- `vlm_task_planner/prompt_builder.py`：在 system prompt 中声明抓取/放置类技能已禁用
-- `vlm_task_planner/response_parser.py`：新增 `DISABLED_SKILLS` 集合，planner 若选中被禁用技能则报错
-- `robot_config/config/robots/so101_single_arm.yaml`：删除 `entry` 路由配置、`named_targets` 定义、被移除技能的 `allowed_skills` 和 `skill_templates`
-- `robot_config/robot_config/loader.py`：精简配置校验逻辑，移除 `target_pose_key` / `place_name_from_request` 等间接引用
-- `robot_config/robot_config/launch_builders/embodied.py`：移除 entry 参数注入
-
-#### 夹爪执行路径规划器（gripper_path.py）
-
-新增 `vlm_task_planner/gripper_path.py` 模块：根据任务描述和命名目标，生成夹爪执行路径（坐标接地 + 可达性检查），参考 Code as Policies + SayCan 模式设计。已集成到 `vlm_task_planner_node` 的 plan context 中。
-
-#### 测试
-
-- 新增 `test_object_parser.py`、`test_grounding_3d_fixture.py`、`test_perception_node_observation.py`、`test_realsense_rgbd_fixture.py`
-- 更新 `test_response_parser.py`、`test_prompt_builder.py`、`test_command_parser.py` 适配技能清理
-- **全部 16 项测试通过**，ruff lint 通过，3 个 ROS 包构建成功
-
----
-
-**维护者**: IB-Robot Team\
-**使用指导**: <https://pages.openeuler.openatom.cn/embedded/docs/build/html/master/features/embodied_ai/index.html>\
-**项目地址**: <https://atomgit.com/openEuler/IB_Robot>\
-**反馈**: <https://atomgit.com/openEuler/IB_Robot/issues>
+**许可证**：Apache 2.0
