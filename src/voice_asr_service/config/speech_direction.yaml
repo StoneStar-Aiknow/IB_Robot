@@ -1,0 +1,37 @@
+speech_direction_node:
+  ros__parameters:
+    # 音频输入与麦克风设备参数仅归 voice_asr_service 所有。
+    device_name_contains: "ReSpeaker"
+    sample_rate: 16000
+    channel_indices: [1, 2, 3, 4]
+
+    # 阵列安装偏角和四麦二维坐标；ROS 2 参数使用一维浮点数组。
+    mount_yaw_deg: 0.0
+    mic_positions: [
+      0.02285, 0.02285,
+      -0.02285, 0.02285,
+      -0.02285, -0.02285,
+      0.02285, -0.02285
+    ]
+
+    input_source: "device"
+    wav_path: ""
+    wav_replay_rate: 1.0
+
+    silero_vad_model_path: "voice_asr/silero-vad/silero_vad_v5.onnx"
+    fullsubnet_repo_dir: "fullsubnet_repo"
+    fullsubnet_ckpt: "fullsubnet/fullsubnet_best_model_58epochs.tar"
+    fullsubnet_device: "auto"
+
+    speech_direction_max_age_ms: 1100
+
+    # 高通量离线维测参数；默认关闭(总开关 false),现场诊断时显式开启。
+    # 子开关 save_* 在总开关开启时表示默认保存哪些流,总开关关闭时一律不写盘。
+    diagnostics_high_throughput_enabled: false
+    diagnostics_rollover_seconds: 300
+    diagnostics_save_raw6ch: true
+    diagnostics_save_enh4ch: true
+    diagnostics_save_frame_metrics: true
+    diagnostics_save_gray_events: true
+    diagnostics_queue_size: 128
+    diagnostics_drop_when_full: true

@@ -328,6 +328,17 @@ EOF
         log_info "Skipping optional grasp dependencies. Re-run setup with --with-grasp if needed."
     fi
 
+    # Optional speech_direction report dependencies (Plotly/Matplotlib). Pure-Python.
+    # Only the `speech_direction_report` offline CLI imports these; the runtime node
+    # does not, so the default install (without this flag) stays lightweight.
+    if [[ "${INSTALL_DIAGNOSTICS_DEPS:-false}" == true ]]; then
+        log_info "Installing optional speech_direction report dependencies (Plotly, Matplotlib)..."
+        run_cmd "${pip_install[@]}" -r "${WORKSPACE}/requirements/diagnostics.txt" --quiet
+        installed_diagnostics_deps=true
+    else
+        log_info "Skipping optional speech_direction report dependencies. Re-run setup with --with-diagnostics if needed."
+    fi
+
     # Optional perception/grasp dependencies can pull OpenCV wheels whose latest
     # releases require NumPy 2.x. Re-apply the final ROS 2 ABI pin before smoke tests.
     log_info "Re-applying NumPy/OpenCV ROS 2 ABI pins after optional dependencies..."

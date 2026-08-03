@@ -3,9 +3,148 @@
 `voice_asr_node.py` 是 `voice_asr_service` 包中的运行时 ROS 2 语音识别节点。
 它负责把麦克风音频或音频文件转换成文本，并统一管理音频采集、VAD、sherpa-onnx 模型加载、ROS 接口以及内部状态机。
 
-这份 README 说明的是**节点本身**，不是仅针对包级入口的简单介绍。
+这份 README 同时说明两个独立节点：本文第 1～14 节描述 `VoiceASRNode`；下方“Speech Direction 独立节点”一节描述 `SpeechDirectionNode`。两者当前没有共享音频采集链路。
 
-## 1. 节点职责
+## Speech Direction 独立节点
+
+`speech_direction_node` 属于 `voice_asr_service`，与上文所述的 `VoiceASRNode` 是两个独立节点。它负责多通道人声音频增强、语音门控和方向估计，不执行 ASR，也不控制底盘。
+
+麦克风、阵列、输入源、模型和运行时效参数统一由以下包内配置管理：
+
+```text
+src/voice_asr_service/config/speech_direction.yaml
+```
+
+可独立启动方向节点：
+
+```bash
+ros2 launch voice_asr_service speech_direction.launch.py
+```
+
+该 launch 默认读取上述 YAML；也可通过 `config_file` 指向同结构的配置文件。模型相对路径在 launch 边界相对 `models_root`（默认 `<标准工作区>/models`）解析，绝对路径保持原样。自定义 colcon install base 时应显式指定模型根，例如：
+
+```bash
+ros2 launch voice_asr_service speech_direction.launch.py models_root:=/path/to/models
+```
+
+YAML 的三项模型相对路径以 models 目录为根，不再包含额外的 `models/` 前缀。`speech_direction` 不属于 `robot_config` 的机器人级配置，也不由 `sound_follow` 管理。
+
+执行 `./scripts/download_speech_direction_models.sh` 时，FullSubNet 源码固定到提交
+`e97448375cd1e883276ad583317b1828318910dc`，与当前 v0.2 58epochs checkpoint 的验证组合保持一致。脚本先在 `fullsubnet_repo.part` 中浅 fetch 该提交并校验 revision 与关键 `model.py`，成功后再替换最终目录；残缺目录或其他 revision 不会被静默复用。
+
+### 配置所有权
+
+| 类别 | YAML 参数 | 当前配置 / 含义 |
+| --- | --- | --- |
+| 麦克风与音频 | `device_name_contains` | `ReSpeaker`，实时设备名匹配条件 |
+| 麦克风与音频 | `sample_rate` | `16000` Hz；当前 speech-direction 完整算法链仅支持此采样率，其他值会在参数校验阶段被拒绝 |
+| 麦克风与音频 | `channel_indices` | `[1, 2, 3, 4]`，参与处理的输入通道 |
+| 阵列 | `mount_yaw_deg` | `0.0`，阵列安装偏角，逆时针为正 |
+| 阵列 | `mic_positions` | 四麦二维坐标的一维展开数组，长度必须为通道数的两倍 |
+| 输入源 | `input_source` | `device`；也支持 `wav` |
+| 输入源 | `wav_path` | WAV 输入路径；`input_source=wav` 时必填。离线输入与实时 ReSpeaker 原始流使用同一入口契约，文件必须是 `16 kHz / 6 通道` WAV，并保留设备输入的 ch0～ch5；pipeline 随后按 `channel_indices=[1,2,3,4]` 选取四个麦克风通道。文中的“4 通道增强/DOA”是内部算法通道数，不表示接受 4 通道 WAV |
+| 输入源 | `wav_replay_rate` | `1.0`，WAV 回放倍率，必须大于 0。有效音频播放到 EOF 后，回放器会根据增强窗口尾部、hop 大小和段末静音门限追加若干个内部 6 通道零帧，使现有 VAD/状态机自然结算最后一个语音段；无需在测试文件末尾手工添加静音 |
+| 模型 | `silero_vad_model_path` | Silero VAD 模型路径 |
+| 模型 | `fullsubnet_repo_dir` | FullSubNet 源码目录 |
+| 模型 | `fullsubnet_ckpt` | FullSubNet checkpoint 路径 |
+| 模型 | `fullsubnet_device` | `auto`；可选 `auto`、`cuda`、`cpu` |
+| 运行时效 | `speech_direction_max_age_ms` | `1100` ms，方向结果最大保鲜时间 |
+
+这些参数均由 `voice_asr_service` 独占管理。`sound_follow` 只维护底盘最小集和跟随行为参数，其完整 launch 通过无参数 include 复用本包的 `speech_direction.launch.py`，不读取或转发任何音频参数。
+
+
+### 高通量离线维测
+
+`speech_direction.yaml` 还包含以下 8 个高通量维测参数：
+
+| YAML 参数 | 当前值 | 说明 |
+| --- | --- | --- |
+| `diagnostics_high_throughput_enabled` | `false` | 总开关；默认关闭，现场诊断/测试时显式开启 |
+| `diagnostics_rollover_seconds` | `300` | raw、enhanced 和 metrics 的固定分卷时长（秒） |
+| `diagnostics_save_raw6ch` | `true` | 总开关开启时保存完整原始 6 通道 PCM WAV；总开关关闭时不写盘 |
+| `diagnostics_save_enh4ch` | `true` | 总开关开启时保存 FullSubNet 输出的 4 通道 PCM WAV |
+| `diagnostics_save_frame_metrics` | `true` | 总开关开启时保存逐 hop 的 VAD、RMS、DOA 和耗时 JSONL |
+| `diagnostics_save_gray_events` | `true` | 总开关开启时保存灰区事件摘要；运行时不截取灰区 WAV |
+| `diagnostics_queue_size` | `128` | 后台 writer 有界队列容量 |
+| `diagnostics_drop_when_full` | `true` | 接口兼容项；实时链路始终非阻塞，队列满时丢弃并计数 |
+
+默认关闭高通量维测（总开关 `false`），避免部署即写盘到磁盘满。需要现场诊断时，
+将 `diagnostics_high_throughput_enabled` 改为 `true`；四个 `save_*` 子开关在总开关
+开启时表示默认保存哪些流，可按定位需求独立关闭。启用后，每次启动会创建独立会话：
+
+```text
+~/.ros/speech_direction/runs/run_<YYYYmmdd-HHMMSS>/
+├── manifest.json
+├── audio/full/raw6ch_*.wav
+├── audio/full/enh4ch_*.wav
+├── metrics/frames_*.jsonl
+└── events/gray_events.jsonl
+```
+
+节点停止后 `manifest.json` 才进入 `completed` 终态。writer 写盘失败只会永久停用本次
+维测旁路，方向 pipeline 继续运行，并在基础 `/diagnostics` 中报告 `WARN`；不会在线生成
+报告，也不会加载 Plotly 或任何绘图 fallback。
+
+离线报告依赖 Plotly 与 Matplotlib，仅 `speech_direction_report` CLI 需要，`speech_direction_node`
+运行时不加载。首次使用前通过可选开关安装（不会污染板端/CI 的 base 安装链）：
+
+```bash
+./scripts/setup.sh --with-diagnostics      # 新装工作区时一并带上
+# 或:
+python3 -m pip install -r requirements/diagnostics.txt
+```
+
+停止节点后可离线生成报告：
+
+```bash
+source .shrc_local && speech_direction_report \
+  ~/.ros/speech_direction/runs/run_<YYYYmmdd-HHMMSS>
+```
+
+默认严格同时生成 `reports/doa_curves.html` 和 `reports/doa_curves.png`，不会生成灰区音频。
+需要导出灰区时显式增加 `--extract-gray-audio`；事件跨分卷时会按统一 sample 轴拼接
+`raw6ch` 和 `enh4ch`：
+
+```bash
+source .shrc_local && speech_direction_report \
+  ~/.ros/speech_direction/runs/run_<YYYYmmdd-HHMMSS> \
+  --extract-gray-audio
+```
+
+输出已存在时命令默认拒绝覆盖；确认重跑可加 `--overwrite`。HTML 与 PNG 是严格双依赖：
+必须同时安装 Plotly 和 Matplotlib，缺任一项即失败，不提供降级或 fallback。同一会话不要
+并发生成报告。输出提交边界只是先生成临时 HTML/PNG，再按 HTML、PNG 顺序分别替换；
+它不是事务锁或 journal，第二次替换失败时可能留下半套新输出，请检查后带
+`--overwrite` 顺序重跑。
+
+### 发布契约、坐标与故障语义
+
+- 方向发布到 `/voice/speech_direction`，消息类型为 `ibrobot_msgs/msg/SpeechDirection`，QoS 为 `RELIABLE + KEEP_LAST(1)`。
+- `header.frame_id` 为 `base_link`；`azimuth_rad` 遵循 REP-103：`0` 为前、`+π/2` 为左、`-π/2` 为右，左转为正。
+- `header.stamp` 按方向类型分流构造，承载方向的"真年龄"信息，而非固定取发布时刻：
+  - 段末方向（`seg_end`）：`stamp = 发布时刻的 ROS 时钟 − age`，还原段结束时刻，使消费者按 `now − stamp` 判过期时得到真实年龄，executor 积压/DDS 延迟不会被盖掉；
+  - 中间方向（`mid_long_seg`）：`stamp = 发布时刻的 ROS 时钟`，`age≈0`，符合"立即响应正在说话"的低延迟设计，由 QoS `KEEP_LAST(1)` 与 `seq_id` 去重兜底，不额外设过期上限。
+  - 方向的 `age` 在 `runtime` 内部用墙钟（`time.time()`）计算；`stamp` 在 `node` 用 ROS 时钟（`get_clock().now()`）构造。**当前部署 `use_sim_time=false`，ROS 时钟与墙钟同属系统时钟域，二者差值有效**，上述分流在实车上正确。`use_sim_time=true`（仿真/Bag 回放）下 ROS 时钟与墙钟不同步，本 PR 不解决该混合时钟域；如需在仿真或回放场景消费方向，应使用 `use_sim_time=false`，或后续单独统一为单一时钟域。
+- 长语音累计达到 `max_accum_dur_s` 时发布一次中间方向并清理本轮累积，避免持续讲话时等待整段结束才响应；语音段结束时再发布当前累积窗口的段末方向。两类输出都是有效方向事件。
+- 每次中间方向或段末方向都有独立递增的 `seq_id`，消费者按输出事件去重；`seq_id` 不表示“一段语音只对应一个序号”。
+- 节点只在取得新的有效方向事件时发布；无人声、结果过期或降级时不发布方向。
+- 参数缺失、参数非法或配置的模型资产不存在时，节点启动失败。其中模型资产缺失会提示运行 `./scripts/download_speech_direction_models.sh`。
+- 模型资产已存在但模型加载、音频设备打开或运行时推理失败时，节点保持运行、不发布方向，并通过 `/diagnostics` 持续报告降级状态。
+
+### 实时音频采集兼容性
+
+`speech_direction_node` 使用专用 Python 线程调用 PyAudio blocking `stream.read()`，
+并把原始交错多通道 int16 PCM 写入内部 RingBuffer。该路径不使用 PyAudio callback，
+用于规避 Ubuntu 22.04 apt 默认 PyAudio 0.2.11 的 callback ABI 路径；音频后端异常通过
+受控 fatal 通道上报，不会从 callback C bridge 异步注入 ROS executor。采集线程只负责
+读取和缓冲，VAD、增强与 DOA 仍在独立 worker 中执行。当前已完成软件单元测试、构建
+与并发生命周期验证，尚未使用真实 ReSpeaker 硬件完成采集验证。
+
+### 麦克风资源互斥
+
+`VoiceASRNode` 与 `SpeechDirectionNode` 当前各自建立音频采集链路，并未共享采集。两者不能同时占用同一个 ReSpeaker 实时输入设备；启动方向节点前，应停止正在使用该设备进行实时识别的 `VoiceASRNode`，反之亦然。WAV / 文件输入不等同于占用实时麦克风设备。
+
+## 1. VoiceASRNode 节点职责
 
 `VoiceASRNode` 支持两类输入路径：
 
