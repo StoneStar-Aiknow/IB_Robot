@@ -44,20 +44,20 @@ Options:
   -h, --help               Show this help
 
 Common mixins:
-  dev          Development (debug, no tests, symlink-install) [DEFAULT]
-  debug        Debug build with full symbols
-  release      Optimized release build
-  test         Enable testing
-  ci           CI build (release + tests + linting)
-  prod         Production (optimized, no debug/tests/tracing)
-  asan         AddressSanitizer
-  tsan         ThreadSanitizer
+  dev               Development (debug, no tests, symlink-install) [DEFAULT]
+  debug             Debug build with full symbols
+  release           Optimized release build
+  rel-with-deb-info Release with debug info (RelWithDebInfo)
+  test              Enable testing
+  no-test           Disable testing
+  lint              Enable testing + ament_lint_auto
+  prod              Production (optimized, no tests, tracing disabled)
 
 Examples:
   ./scripts/build.sh                           # Default dev build
   ./scripts/build.sh --mixin release           # Release build
   ./scripts/build.sh --mixin debug test        # Debug with tests
-  ./scripts/build.sh --mixin asan              # With AddressSanitizer
+  ./scripts/build.sh --mixin release lint      # Release with linting
   ./scripts/build.sh --clean --mixin release   # Clean release build
   ./scripts/build.sh -- --packages-select foo  # Pass args to colcon
 EOF
@@ -75,7 +75,7 @@ list_mixins() {
         column -t -s $'\t'
     fi
     echo ""
-    echo "Combine mixins: --mixin debug test asan"
+    echo "Combine mixins: --mixin debug test lint"
 }
 
 # ============================================================================
