@@ -42,6 +42,45 @@ one canonical FP32 sample and independently cast it once at each backend boundar
 Generate targets only from the original Torch deployment as described in `multi-host-validation.md`.
 Never regenerate targets from ONNX or OM.
 
+### Single Authoritative Target Rule
+
+For one fixed reference contract, generate native-Torch action targets exactly once. The reference
+contract includes policy weights and revision, LeRobot revision, native Torch deployment and dtype,
+observation batch, task, persisted noise/control inputs, preprocessing, postprocessing, schedule, step
+count, and action semantics.
+
+After the package is sealed:
+
+- every portable ONNX, OM, ATC, runtime, and semantics-preserving optimization candidate uses the same
+  `target.json`, `target_raw.json`, observations, and noises;
+- exporter fixes, host resize/padding experiments, dtype probes, graph rewrites, kernel selection, and
+  performance candidates do not justify generating new action targets;
+- diagnostic runs may save `candidate_output*.json`, metrics, tensor dumps, or native intermediate-stage
+  references, but must not name or treat them as alternate targets;
+- native FP32 or wrapper outputs used to diagnose native BF16 behavior are candidate/control outputs,
+  not new authoritative targets.
+
+Create a new versioned target package only when the user intentionally changes the reference contract,
+or when evidence proves the existing package was generated incorrectly. Never overwrite the prior
+package. Record the old and new package identities, the exact contract change, and why regeneration was
+necessary. A candidate disagreeing with the target is evidence to investigate, not permission to
+regenerate the target around the candidate.
+
+### Accuracy Preflight
+
+Before every Torch-vs-ONNX or Torch-vs-OM comparison:
+
+1. identify the authoritative package directory and its `validation.json`/`SHA256SUMS` identity;
+2. verify observations, target, raw target, and every persisted noise/control file against that package;
+3. ensure every CLI path resolves inside that one directory and task, seed, sample count, revisions, and
+   inference contract match its manifest;
+4. record the package path and identity in the candidate report.
+
+Do not combine target files from one directory with noises or observations from another. Matching
+filenames, observation hashes, or sample counts do not prove that independently generated targets and
+noises belong together. If the package lacks sufficient provenance, first reproduce the accepted
+baseline with the complete package; do not infer authority from a directory name.
+
 ## Torch Vs ONNX
 
 Keep a portable ONNX without NPU-only custom operators for this comparison. If the deployable ONNX
@@ -98,6 +137,12 @@ the implementation is extended to calculate it.
 
 Record exact `soc_version`, NPU, driver, CANN, ATC, ACL, deployment fingerprint, role OM hashes, and
 ABI hashes. A changed OM hash invalidates the previous OM accuracy result.
+
+If several materially different candidates produce suspiciously similar failures, or a result conflicts
+with an accepted baseline, stop candidate attribution. Rerun the accepted baseline artifact against the
+same complete package. If the baseline does not reproduce its accepted metrics, classify the comparison
+as a validation/provenance failure rather than a model regression and repair the experiment record before
+continuing.
 
 ## Candidate Rule
 

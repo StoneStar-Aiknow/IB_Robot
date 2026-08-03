@@ -175,12 +175,21 @@ evidence, ATC version, target, and resolution source.
   `source install/setup.sh` for runtime commands.
 - Generate Torch targets before testing OM accuracy. Target generation and OM deployment are expected
   to occur on different machines; follow `multi-host-validation.md`.
+- Freeze exactly one authoritative native-Torch target package for each fixed reference contract. All
+  ONNX, OM, compiler, runtime, and semantics-preserving optimization candidates must compare against
+  that same package. Diagnostic experiments may save candidate outputs or native intermediate-stage
+  references, but must not generate alternate action targets. Generate a new versioned target package
+  only when the intended reference contract itself changes or the existing package is proven invalid.
 - For stochastic policies including PI0, PI05, SmolVLA, Diffusion Policy, and any policy exposing
   noise/control inputs, persist and reuse the exact noise per sample across Torch, ONNX, and OM. The
   current shared `loss_compare` implements this only for PI05; other families must add and test their
   control-input persistence/replay before accuracy validation.
 - Use one versioned observation batch and the same task, seed, targets, raw targets, and noises across
   Torch, ONNX, and OM checks.
+- Before every accuracy command, resolve observations, targets, raw targets, and noises from the same
+  authoritative package directory, verify its recorded hashes, and record the package identity in the
+  report. Never compose a comparison from files in different experiment directories, even when their
+  observations or filenames appear identical.
 - Perform only two numerical gates: Torch vs ONNX and Torch vs Ascend OM. Follow `accuracy.md`.
 - If accuracy is below the accepted limit, or a new policy needs exporter/runtime rewrites, read
   `precision-troubleshooting.md` before changing compiler precision, preprocessing, or graph math.

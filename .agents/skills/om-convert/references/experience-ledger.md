@@ -11,7 +11,7 @@ Use these 12 experience IDs for every run:
 | ID | Experience |
 |----|------------|
 | `E01` | Reuse an IB-Robot Torch-supported bundle, codec, processor, and vendored assets. |
-| `E02` | Persist one canonical observation/task/seed/noise package across hosts and backends. |
+| `E02` | Persist one authoritative native-Torch target/observation/task/seed/noise package across all candidates. |
 | `E03` | Export a portable FP16 ONNX baseline with only correctness-required FP32 islands. |
 | `E04` | Keep image resize, padding, and risky reshape logic on the host when ATC semantics are suspect. |
 | `E05` | Use `precision_mode_v2=origin|default` and investigate precision before approximating math. |

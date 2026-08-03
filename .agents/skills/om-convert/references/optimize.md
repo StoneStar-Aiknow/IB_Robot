@@ -40,7 +40,14 @@ one principal hypothesis
 ```
 
 Append to `reports/experiments.jsonl`: candidate ID, hypothesis, evidence, source diff/commit, commands,
-artifact hashes, accuracy, latency, verdict, and rollback.
+artifact hashes, authoritative validation-package identity, accuracy, latency, verdict, and rollback.
+
+Optimization candidates produce outputs and metrics only; they never regenerate action targets. If
+different hypotheses produce nearly identical unexpected accuracy failures, pause the ladder. Do not
+attribute the failure to a graph region until the accepted baseline reproduces under the exact same
+validation package and command contract. Treat cross-directory target/noise composition or a
+non-reproducing baseline as a harness/provenance failure, invalidate affected verdicts, and rerun them
+after correction.
 
 Do not create a permanent Manifest deployment for every candidate. Use `current/` for working artifacts,
 retain reports and reproduction commands, delete rejected large ONNX/OM files when no longer needed,
@@ -59,6 +66,11 @@ The order is evidence-driven. Skip a rung when profiling shows it is irrelevant.
 
 Require accepted Torch-vs-ONNX, accepted Torch-vs-OM, all OM loop-20 logs, weighted totals, input and
 artifact hashes, toolchain versions, and invocation counts.
+
+Also freeze one authoritative native-Torch validation package. Record its manifest and checksum identity
+in every candidate entry. Before the first candidate, rerun the accepted baseline against that package
+and require the recorded accuracy to reproduce. This control prevents a stale or mismatched target/noise
+package from being misdiagnosed as an optimization regression.
 
 ### 1. Remove Data-Path And Structural Waste
 

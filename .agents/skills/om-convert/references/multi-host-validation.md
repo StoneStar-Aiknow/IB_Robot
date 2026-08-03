@@ -65,6 +65,17 @@ validation-inputs/
 seed, sample count, generation command, IB-Robot SHA, and LeRobot SHA. Compute hashes after target
 generation and verify them after every transfer.
 
+This is the only authoritative action-target package for its recorded reference contract. Do not create
+new target directories for exporter fixes, host preprocessing variants, dtype experiments, ONNX/OM
+candidates, or optimization stages. Save their outputs under reports or candidate directories with names
+such as `candidate_output.json`, `metrics.json`, or `stage_reference/`, never as another consumable
+`target.json` package.
+
+If multiple historical target directories already exist, do not choose by name or recency. Identify the
+authoritative package by manifest and hashes, then prove it by rerunning the accepted baseline artifact and
+reproducing its recorded metrics. Mark the others as historical diagnostic snapshots in the experiment
+ledger and never mix files across them.
+
 ## Observation Batch
 
 Prefer a real local LeRobot dataset:
@@ -111,6 +122,9 @@ python3 src/model_utils/model_utils/loss_compare.py \
 Use a new experiment directory. Do not add `--force` unless the user explicitly approves replacing a
 baseline. For stochastic policies, target generation must persist `noises/`; missing noises is a hard
 failure for cross-machine comparison.
+
+Run target generation once per reference-contract version. After sealing, all later diagnostics and
+optimization candidates reuse it. A failed candidate must not trigger target regeneration.
 
 This applies to PI0, PI05, SmolVLA, Diffusion Policy, and any new policy whose production inference
 accepts random noise or stochastic control inputs. Verify identical persisted noise reproduces
@@ -207,6 +221,10 @@ python3 src/model_utils/model_utils/loss_compare.py \
 
 Never use `--generate-target` with the Ascend deployment under test. The task and seed must match
 target generation exactly.
+
+Before executing the command, verify that `--batch_path` and `--exp-dir`, plus any explicit target,
+raw-target, or noise paths, all resolve to the same transferred package. Do not manually assemble a
+comparison from similarly named files in separate directories.
 
 ## Handoff Report
 
