@@ -115,6 +115,12 @@ def test_write_pi05_ascend_deployment_uses_compiled_abis_and_strict_loader(tmp_p
                 },
                 {"name": "lang_tokens", "index": 1, "dtype": "int64", "shape": [1, 4]},
                 {"name": "lang_masks", "index": 2, "dtype": "bool", "shape": [1, 4]},
+                {
+                    "name": "prefix_att_2d_masks_4d",
+                    "index": 3,
+                    "dtype": "float32",
+                    "shape": [1, 1, 8, 8],
+                },
             ],
             "outputs": [
                 {"name": "/Concat_12:0:past_kv_tensor", "index": 0, "dtype": "float16", "shape": [1, 2]},
@@ -153,6 +159,9 @@ def test_write_pi05_ascend_deployment_uses_compiled_abis_and_strict_loader(tmp_p
         "internal.prefix_pad_masks",
     }
     assert validated.deployment.bindings["vlm"].inputs[1].semantic == "observation.language.tokens"
+    prefix_mask = validated.deployment.bindings["vlm"].inputs[3]
+    assert prefix_mask.semantic == "prefix_att_2d_masks_4d"
+    assert prefix_mask.layout == "NCHW"
     assert all(
         artifact.path.startswith("artifacts/ascend/ascend/") for artifact in validated.deployment.artifacts.values()
     )
@@ -404,6 +413,12 @@ def _write_pi05_abis(vlm_path: Path, action_path: Path) -> None:
                 },
                 {"name": "lang_tokens", "index": 1, "dtype": "int64", "shape": [1, 4]},
                 {"name": "lang_masks", "index": 2, "dtype": "bool", "shape": [1, 4]},
+                {
+                    "name": "prefix_att_2d_masks_4d",
+                    "index": 3,
+                    "dtype": "float32",
+                    "shape": [1, 1, 8, 8],
+                },
             ],
             "outputs": [
                 {"name": "past_kv_tensor", "index": 0, "dtype": "float16", "shape": [1, 2]},

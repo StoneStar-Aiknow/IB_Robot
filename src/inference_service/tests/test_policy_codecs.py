@@ -239,6 +239,7 @@ def test_nchw_image_and_non_image_rank_four_preserve_axis_order():
                 index=1,
                 dtype="float32",
                 shape=(1, 3, 2, 4),
+                layout="NCHW",
             ),
         )
     )

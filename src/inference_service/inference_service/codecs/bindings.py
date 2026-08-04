@@ -51,11 +51,10 @@ def _validate_direction(bindings: tuple[TensorBinding, ...], direction: str) -> 
         raise BindingError(f"{direction} runtime indices must be contiguous and start at zero")
 
     for binding in bindings:
-        image_semantic = _is_image_semantic(binding.semantic)
-        if image_semantic and binding.layout not in {"NCHW", "NHWC"}:
-            raise BindingError(f"image binding {binding.semantic!r} requires NCHW or NHWC layout")
-        if not image_semantic and binding.layout is not None:
-            raise BindingError(f"non-image binding {binding.semantic!r} must not declare image layout")
+        if len(binding.shape) == 4 and binding.layout not in {"NCHW", "NHWC"}:
+            raise BindingError(f"rank-4 binding {binding.semantic!r} requires NCHW or NHWC layout")
+        if len(binding.shape) != 4 and binding.layout is not None:
+            raise BindingError(f"non-rank-4 binding {binding.semantic!r} must not declare layout")
 
 
 def validate_artifact_bindings(bindings: ArtifactBindings) -> None:
