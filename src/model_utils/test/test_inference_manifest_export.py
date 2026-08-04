@@ -353,6 +353,19 @@ def test_write_acl_om_abi_lazily_uses_runtime_descriptor(tmp_path, monkeypatch):
     assert calls[-1] == ("finalize",)
 
 
+def test_write_acl_om_abi_explains_missing_acl_runtime(tmp_path, monkeypatch):
+    om_path = tmp_path / "policy.om"
+    om_path.write_bytes(b"om")
+
+    def missing_acl(name):
+        raise ModuleNotFoundError(name)
+
+    monkeypatch.setattr("model_utils.inference_manifest_export.importlib.import_module", missing_acl)
+
+    with pytest.raises(RuntimeError, match="source the CANN environment or provide a pre-generated"):
+        write_acl_om_abi(om_path, tmp_path / "policy.om.abi.json")
+
+
 def test_runtime_image_layout_is_authoritative():
     abi = RuntimeABI(
         inputs=(RuntimeTensor("image", 0, "float32", (1, 16, 24, 3), "NHWC"),),

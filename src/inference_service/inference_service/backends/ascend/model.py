@@ -105,7 +105,7 @@ class AclModel:
         self.output_dataset: object | None = None
         self.input_buffers: list[_DatasetBuffer] = []
         self.output_buffers: list[_DatasetBuffer] = []
-        self.output_host_buffers: list[object] = []
+        self.output_host_buffers: list[object | None] = []
         self._closed = False
 
     def load_descriptor(self) -> None:
@@ -138,10 +138,7 @@ class AclModel:
             self.output_dataset, self.output_buffers = self._create_dataset(
                 self.output_descriptors, output_overrides or {}
             )
-            for descriptor in self.output_descriptors:
-                host_buffer, ret = self._acl.rt.malloc_host(descriptor.size)
-                check_acl_ret(ret, f"acl.rt.malloc_host({self.role} output {descriptor.index})")
-                self.output_host_buffers.append(host_buffer)
+            self.output_host_buffers = [None] * len(self.output_descriptors)
         except Exception:
             self.close()
             raise
@@ -187,6 +184,10 @@ class AclModel:
         ):
             if descriptor.index not in selected:
                 continue
+            if host_buffer is None:
+                host_buffer, ret = self._acl.rt.malloc_host(descriptor.size)
+                check_acl_ret(ret, f"acl.rt.malloc_host({self.role} output {descriptor.index})")
+                self.output_host_buffers[descriptor.index] = host_buffer
             check_acl_ret(
                 self._acl.rt.memcpy(host_buffer, buffer.size, buffer.pointer, buffer.size, ACL_MEMCPY_DEVICE_TO_HOST),
                 f"acl.rt.memcpy D2H({self.role} output {descriptor.index})",
@@ -216,7 +217,8 @@ class AclModel:
         acl = self._acl
         self._lease.bind_current_thread()
         for host_buffer in reversed(self.output_host_buffers):
-            acl.rt.free_host(host_buffer)
+            if host_buffer is not None:
+                acl.rt.free_host(host_buffer)
         self.output_host_buffers.clear()
         self._destroy_dataset(self.output_dataset, self.output_buffers)
         self._destroy_dataset(self.input_dataset, self.input_buffers)

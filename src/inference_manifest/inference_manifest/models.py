@@ -19,6 +19,7 @@ from inference_manifest.paths import normalize_bundle_path
 
 _ROLE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
 _DEPLOYMENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_RETURN_SEMANTICS = frozenset({"action", "grasp.poses", "detection.boxes", "segmentation.masks"})
 
 
 def _validate_sha256(value: str) -> str:

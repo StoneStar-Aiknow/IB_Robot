@@ -214,6 +214,8 @@ def _is_reserved_semantic_path(path: str) -> bool:
 
 
 def _validate_feature_compatibility(deployment: CompiledDeployment, policy: PolicyMetadata) -> None:
+    if policy.policy_type == "graspgen":
+        return
     for role in deployment.execution:
         group = deployment.bindings[role]
         for binding in (*group.inputs, *group.outputs):
@@ -228,9 +230,16 @@ def _validate_feature_compatibility(deployment: CompiledDeployment, policy: Poli
 
 
 def _validate_policy_deployment(deployment: CompiledDeployment, policy: PolicyMetadata) -> None:
-    if not any(
-        binding.semantic == "action" for role in deployment.execution for binding in deployment.bindings[role].outputs
-    ):
+    output_semantics = {
+        binding.semantic for role in deployment.execution for binding in deployment.bindings[role].outputs
+    }
+    if policy.policy_type == "graspgen":
+        missing_outputs = sorted({"grasp.poses", "grasp.confidence"} - output_semantics)
+        if missing_outputs:
+            raise ManifestValidationError(
+                f"Compiled GraspGen policy deployment is missing output bindings: {missing_outputs}"
+            )
+    elif "action" not in output_semantics:
         raise ManifestValidationError("Compiled policy deployment must declare an action output binding")
     _validate_feature_compatibility(deployment, policy)
 

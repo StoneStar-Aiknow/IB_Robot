@@ -566,6 +566,33 @@ def test_vla_bindings_allow_declared_state_and_action_padding(tmp_path, policy_t
     assert validated.policy.policy_type == policy_type
 
 
+def test_graspgen_compiled_deployment_accepts_grasp_outputs_without_action(tmp_path):
+    paths = tuple(
+        path for path in create_policy_bundle(tmp_path, policy_type="graspgen") if path != "model.safetensors"
+    )
+    manifest = make_manifest(
+        tmp_path,
+        paths,
+        deployment_name="ascend",
+        compiled=True,
+        backend="ascend",
+        policy_type="graspgen",
+    )
+    deployment = manifest["deployments"]["ascend"]
+    deployment["target"] = {"soc": "Ascend310P3", "runtime": "acl"}
+    deployment["artifacts"]["policy"]["format"] = "om"
+    write_manifest(tmp_path, manifest)
+
+    validated = load_inference_manifest(tmp_path, "ascend")
+
+    assert validated.policy.policy_type == "graspgen"
+    assert "grasp.poses" in validated.policy.output_features
+    assert "grasp.confidence" in validated.policy.output_features
+    outputs = {b.semantic for b in validated.deployment.bindings["policy"].outputs}
+    assert outputs == {"grasp.poses", "grasp.confidence"}
+    assert validated.deployment.execution == ("policy",)
+
+
 @pytest.mark.parametrize("layout", ["NCHW", "NHWC"])
 def test_vla_visual_bindings_allow_compiled_resize_dimensions(tmp_path, layout):
     paths = tuple(path for path in create_policy_bundle(tmp_path, policy_type="smolvla") if path != "model.safetensors")

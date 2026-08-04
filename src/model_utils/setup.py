@@ -38,6 +38,7 @@ setup(
             "pi05-curvature-schedule = model_utils.pi05_export.curvature_schedule:main",
             "pi05-om-dump = model_utils.pi05_om_dump:main",
             "pi05-tune-schedule = model_utils.pi05_export.tune_schedule:main",
+            "package-graspgen-ascend-deployment = model_utils.graspgen_export.write_manifest:main",
         ],
     },
 )

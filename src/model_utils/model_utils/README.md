@@ -319,6 +319,34 @@ python3 -m model_utils.pi05_export.convert_om \
 运行 `python3 -m model_utils.pi05_export.convert_om --help` 查看当前参数名称和可选的
 `--input-shape` / `--atc-arg` 配置。
 
+## GraspGen Ascend Packaging
+
+GraspGen 的八个 OM 必须使用 ACL runtime introspection 得到的实际 ABI，不能使用 ONNX
+tensor name 代替编译后 ABI。默认情况下，packager 会在 sidecar 缺失时使用本机 Ascend
+device 检查 OM，并把 `<role>.om.abi.json` 写入 `--om-abi-dir`：
+
+```bash
+source .shrc_local
+
+ros2 run model_utils package-graspgen-ascend-deployment \
+    --bundle-root /path/to/graspgen_bundle \
+    --onnx-manifest /path/to/graspgen.onnx.json \
+    --om-dir /path/to/compiled_om \
+    --om-abi-dir /path/to/runtime_abi \
+    --abi-device-id 0 \
+    --soc-version Ascend310P1
+```
+
+ABI 目录需要包含 `generator_sa1.om.abi.json` 到
+`discriminator_head.om.abi.json` 的全部八个 sidecar。已有 sidecar 不会重新生成；在无 Ascend
+device 的打包主机上需要提前生成全部 sidecar，并传入 `--no-inspect-missing-abi`。Packager 按
+runtime index 绑定 GraspGen semantic，并保留 ACL 实际暴露的 tensor name、dtype 和 shape。
+
+GraspGen packager 会把运行时 artifact 复制到唯一 generation，并在 manifest 中记录
+bundle-relative path。发布和部署时应手动传输完整 bundle 目录；板端不需要保留 `--om-dir`
+或 `--om-abi-dir` 指向的构建输入。schema v2 不对大文件记录或启动时计算 SHA-256；identity
+由 UUID、revision 和轻量结构摘要组成。
+
 ## HMM Packaging
 
 HMM 只支持 PI0.5 与 SmolVLA，不支持 ACT。TCIM 编译完成后准备一个只包含路径和 target

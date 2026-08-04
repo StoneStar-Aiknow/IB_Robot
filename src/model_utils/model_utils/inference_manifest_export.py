@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from uuid import uuid4
 
 import onnx
@@ -125,13 +126,18 @@ def write_acl_om_abi(
     device_id: int = 0,
     acl_config_path: str | None = None,
 ) -> Path:
-    """Lazily import ACL, inspect an OM descriptor, and write runtime ABI JSON."""
+    """Inspect one OM with ACL and write its actual runtime tensor ABI."""
 
     model_path = Path(om_path).expanduser().resolve(strict=True)
     destination = Path(output_path).expanduser().resolve()
-    acl = importlib.import_module("acl")
-    desc = None
+    try:
+        acl = importlib.import_module("acl")
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "ACL Python runtime is unavailable; source the CANN environment or provide a pre-generated OM ABI sidecar"
+        ) from exc
     model_id = None
+    descriptor = None
     context = None
     initialized = False
     device_set = False
@@ -144,13 +150,13 @@ def write_acl_om_abi(
         context = _acl_result(acl.rt.create_context(device_id), "acl.rt.create_context")
         _acl_check(acl.rt.set_context(context), "acl.rt.set_context")
         model_id = _acl_result(acl.mdl.load_from_file(str(model_path)), "acl.mdl.load_from_file")
-        desc = acl.mdl.create_desc()
-        if desc is None:
+        descriptor = acl.mdl.create_desc()
+        if descriptor is None:
             raise RuntimeError("acl.mdl.create_desc returned no descriptor")
-        _acl_check(acl.mdl.get_desc(desc, model_id), "acl.mdl.get_desc")
+        _acl_check(acl.mdl.get_desc(descriptor, model_id), "acl.mdl.get_desc")
         value = {
-            "inputs": _acl_tensors(acl, desc, "input"),
-            "outputs": _acl_tensors(acl, desc, "output"),
+            "inputs": _acl_tensors(acl, descriptor, "input"),
+            "outputs": _acl_tensors(acl, descriptor, "output"),
         }
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
@@ -161,9 +167,9 @@ def write_acl_om_abi(
         raise
     finally:
         cleanup_errors: list[str] = []
-        if desc is not None:
+        if descriptor is not None:
             try:
-                acl.mdl.destroy_desc(desc)
+                acl.mdl.destroy_desc(descriptor)
             except Exception as exc:
                 cleanup_errors.append(f"acl.mdl.destroy_desc: {exc}")
         if model_id is not None:
@@ -190,14 +196,19 @@ def write_acl_om_abi(
             raise RuntimeError("; ".join(cleanup_errors))
 
 
-def _acl_tensors(acl: object, desc: object, direction: str) -> list[dict[str, object]]:
-    count = getattr(acl.mdl, f"get_num_{direction}s")(desc)
+def _acl_tensors(acl: Any, descriptor: object, direction: str) -> list[dict[str, object]]:
+    count = getattr(acl.mdl, f"get_num_{direction}s")(descriptor)
     tensors = []
     for index in range(count):
-        name = getattr(acl.mdl, f"get_{direction}_name_by_index")(desc, index)
-        dims = _acl_result(getattr(acl.mdl, f"get_{direction}_dims")(desc, index), f"ACL {direction} dims")
+        name = getattr(acl.mdl, f"get_{direction}_name_by_index")(descriptor, index)
+        dims = _acl_result(
+            getattr(acl.mdl, f"get_{direction}_dims")(descriptor, index),
+            f"ACL {direction} dims",
+        )
         shape = dims.get("dims") if isinstance(dims, dict) else dims
-        dtype_code = getattr(acl.mdl, f"get_{direction}_data_type")(desc, index)
+        if not isinstance(shape, list | tuple):
+            raise ValueError(f"ACL {direction} {name!r} returned invalid shape {shape!r}")
+        dtype_code = getattr(acl.mdl, f"get_{direction}_data_type")(descriptor, index)
         try:
             dtype = _ACL_DTYPES[dtype_code]
         except KeyError as exc:

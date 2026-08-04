@@ -4,6 +4,7 @@ import json
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import ModuleType
@@ -113,7 +114,7 @@ class FakeAclRT:
         return 0
 
     def memcpy(self, destination, destination_size, source, count, kind):
-        del kind
+        self.owner.memcpy_calls.append((destination, source, count, kind))
         payload = self.owner.read_pointer(source, count)
         if count > destination_size:
             return 1
@@ -257,6 +258,7 @@ class FakeAcl:
         self.model_paths: dict[object, str] = {}
         self.unloaded_models: list[object] = []
         self.executions: list[tuple[str, tuple[object, ...], tuple[object, ...]]] = []
+        self.memcpy_calls: list[tuple[object, object, int, int]] = []
         self.memory: dict[object, bytearray] = {}
         self.freed_pointers: list[object] = []
         self.freed_host_pointers: list[object] = []
@@ -477,6 +479,7 @@ def _pi05_context(
                             "index": 3,
                             "dtype": "float32",
                             "shape": [1, 1, 8, 8],
+                            "layout": "NCHW",
                         },
                     ],
                     "outputs": [
@@ -1248,3 +1251,345 @@ def test_ascend_rejects_invalid_runtime_options(tmp_path, runtime_options):
         create_backend(context)
 
     assert error.value.code == "invalid_runtime_options"
+
+
+_GRASPGEN_ROLE_SHAPES = {
+    "generator_sa1": ((1, 3, 256, 64), (1, 64, 256)),
+    "generator_sa2": ((1, 131, 64, 128), (1, 128, 64)),
+    "generator_encoder_head": ((1, 259, 1, 64), (1, 512)),
+    "discriminator_sa1": ((1, 3, 256, 64), (1, 64, 256)),
+    "discriminator_sa2": ((1, 131, 64, 128), (1, 128, 64)),
+    "discriminator_encoder_head": ((1, 259, 1, 64), (1, 512)),
+    "denoiser": ((1, 512), (1000, 6), (1,), (1000, 6)),
+    "discriminator_head": ((1, 512), (1000, 6)),
+}
+
+
+def _graspgen_input_bindings(role: str, geometry: dict):
+    npoints = geometry["npoints"]
+    nsamples = geometry["nsamples"]
+    if role == "generator_sa1" or role == "discriminator_sa1":
+        return [
+            {
+                "semantic": "observation.object_points",
+                "runtime_name": "grouped_features",
+                "index": 0,
+                "dtype": "float32",
+                "shape": [1, 3, npoints[0], nsamples[0]],
+                "layout": "NCHW",
+            }
+        ]
+    if role == "generator_sa2" or role == "discriminator_sa2":
+        return [
+            {
+                "semantic": "stage2_features",
+                "runtime_name": "grouped_features",
+                "index": 0,
+                "dtype": "float32",
+                "shape": [1, 131, npoints[1], nsamples[1]],
+                "layout": "NCHW",
+            }
+        ]
+    if role == "generator_encoder_head" or role == "discriminator_encoder_head":
+        return [
+            {
+                "semantic": "global_features",
+                "runtime_name": "grouped_features",
+                "index": 0,
+                "dtype": "float32",
+                "shape": [1, 259, 1, npoints[1]],
+                "layout": "NCHW",
+            }
+        ]
+    if role == "denoiser":
+        return [
+            {
+                "semantic": "generator_embedding",
+                "runtime_name": "object_embedding",
+                "index": 0,
+                "dtype": "float32",
+                "shape": [1, 512],
+            },
+            {
+                "semantic": "diffusion.sample",
+                "runtime_name": "sample",
+                "index": 1,
+                "dtype": "float32",
+                "shape": [1000, 6],
+            },
+            {"semantic": "diffusion.time", "runtime_name": "timestep", "index": 2, "dtype": "float32", "shape": [1]},
+        ]
+    if role == "discriminator_head":
+        return [
+            {
+                "semantic": "discriminator_embedding",
+                "runtime_name": "object_embedding",
+                "index": 0,
+                "dtype": "float32",
+                "shape": [1, 512],
+            },
+            {"semantic": "sample_rt", "runtime_name": "grasp_rt", "index": 1, "dtype": "float32", "shape": [1000, 6]},
+        ]
+    raise ValueError(f"unknown graspgen role {role!r}")
+
+
+def _graspgen_output_bindings(role: str, geometry: dict):
+    npoints = geometry["npoints"]
+    if role in {"generator_sa1", "discriminator_sa1"}:
+        return [
+            {
+                "semantic": "features",
+                "runtime_name": "PartitionedCall_/ReduceMax_ReduceMax_1:0:features",
+                "index": 0,
+                "dtype": "float32",
+                "shape": [1, 128, npoints[0]],
+            }
+        ]
+    if role in {"generator_sa2", "discriminator_sa2"}:
+        return [
+            {
+                "semantic": "features",
+                "runtime_name": "PartitionedCall_/ReduceMax_ReduceMax_1:0:features",
+                "index": 0,
+                "dtype": "float32",
+                "shape": [1, 256, npoints[1]],
+            }
+        ]
+    if role in {"generator_encoder_head", "discriminator_encoder_head"}:
+        return [
+            {
+                "semantic": "object_embedding",
+                "runtime_name": "PartitionedCall_/prediction_head/Gemm:0:object_embedding",
+                "index": 0,
+                "dtype": "float32",
+                "shape": [1, 512],
+            }
+        ]
+    if role == "denoiser":
+        return [
+            {
+                "semantic": "predicted_noise",
+                "runtime_name": "PartitionedCall_/prediction_head/Gemm:0:predicted_noise",
+                "index": 0,
+                "dtype": "float32",
+                "shape": [1000, 6],
+            }
+        ]
+    if role == "discriminator_head":
+        return [
+            {
+                "semantic": "grasp.poses",
+                "runtime_name": "logits",
+                "index": 0,
+                "dtype": "float32",
+                "shape": [1000, 4, 4],
+            },
+            {
+                "semantic": "grasp.confidence",
+                "runtime_name": "confidence",
+                "index": 1,
+                "dtype": "float32",
+                "shape": [1000],
+            },
+        ]
+    raise ValueError(f"unknown graspgen role {role!r}")
+
+
+def _graspgen_context(tmp_path: Path, *, runtime_options=None, device_link_embeddings: bool = False) -> RuntimeContext:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    bundle_paths = create_policy_bundle(tmp_path, "graspgen", include_weights=False)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config.update(
+        {
+            "kappa": 2.02217,
+            "diffusion_steps": 2,
+            "grasp_batch_size": 4,
+            "point_count": 128,
+            "geometry": {"npoints": [16, 8], "radii": [0.05, 0.10], "nsamples": [4, 8]},
+        }
+    )
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    artifacts: dict[str, object] = {}
+    for role in _GRASPGEN_ROLE_SHAPES:
+        artifact_path = tmp_path / "artifacts" / f"{role}.om"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(f"{role}-om".encode())
+        artifacts[role] = {"path": f"artifacts/{role}.om", "format": "om"}
+    execution = list(_GRASPGEN_ROLE_SHAPES.keys())
+    geometry = config["geometry"]
+    bindings = {
+        role: {"inputs": _graspgen_input_bindings(role, geometry), "outputs": _graspgen_output_bindings(role, geometry)}
+        for role in execution
+    }
+    device_links = []
+    if device_link_embeddings:
+        generator_semantic = "internal.graspgen.generator_embedding"
+        discriminator_semantic = "internal.graspgen.discriminator_embedding"
+        bindings["generator_encoder_head"]["outputs"][0]["semantic"] = generator_semantic
+        bindings["denoiser"]["inputs"][0]["semantic"] = generator_semantic
+        bindings["discriminator_encoder_head"]["outputs"][0]["semantic"] = discriminator_semantic
+        bindings["discriminator_head"]["inputs"][0]["semantic"] = discriminator_semantic
+        device_links = [
+            {
+                "semantic": generator_semantic,
+                "producer": "generator_encoder_head",
+                "consumer": "denoiser",
+                "transport": "device_pointer",
+                "owner": "producer",
+            },
+            {
+                "semantic": discriminator_semantic,
+                "producer": "discriminator_encoder_head",
+                "consumer": "discriminator_head",
+                "transport": "device_pointer",
+                "owner": "producer",
+            },
+        ]
+    _write_compiled_manifest(
+        tmp_path,
+        bundle_paths,
+        {
+            "backend": "ascend",
+            "target": {"soc": "Ascend310P3", "runtime": "acl"},
+            "artifacts": artifacts,
+            "execution": execution,
+            "bindings": bindings,
+            "device_links": device_links,
+        },
+    )
+    return RuntimeContext(
+        validated_manifest=load_inference_manifest(tmp_path, "ascend"),
+        runtime_options=runtime_options or {"device_id": 0, "random_seed": 0},
+    )
+
+
+def _graspgen_acl(context: RuntimeContext) -> FakeAcl:
+    specs: dict[str, FakeModelSpec] = {}
+    deployment = context.deployment
+
+    def make_callback(role: str):
+        def callback(inputs):
+            outputs = []
+            for binding in deployment.bindings[role].outputs:
+                outputs.append(np.full(binding.shape, 0.5, dtype=np.float32))
+            return outputs
+
+        return callback
+
+    for role in deployment.execution:
+        path = str(context.resolved_artifacts[role])
+        inputs = tuple(
+            _tensor(b.runtime_name or f"input_{b.index}", b.dtype, tuple(b.shape))
+            for b in deployment.bindings[role].inputs
+        )
+        outputs = tuple(
+            _tensor(b.runtime_name or f"output_{b.index}", b.dtype, tuple(b.shape))
+            for b in deployment.bindings[role].outputs
+        )
+        specs[path] = FakeModelSpec(inputs=inputs, outputs=outputs, callback=make_callback(role))
+    return FakeAcl(specs)
+
+
+def test_ascend_graspgen_loads_eight_role_deployment_and_runs_inference(tmp_path):
+    context = _graspgen_context(tmp_path, runtime_options={"random_seed": 7})
+    acl = _graspgen_acl(context)
+    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
+    backend.load(context)
+
+    assert backend.health().state is BackendState.READY
+    assert set(backend._models.keys()) == set(_GRASPGEN_ROLE_SHAPES.keys())
+
+    deployment = context.deployment
+    plan = build_execution_plan(deployment.execution, deployment.bindings, deployment.device_links)
+    from inference_service.codecs import BoundInputs, BoundTensor
+
+    points = np.random.randn(200, 3).astype(np.float32)
+    first_role = deployment.execution[0]
+    role_inputs = {role: BoundInputs(tensors=()) for role in deployment.execution}
+    role_inputs[first_role] = BoundInputs(
+        tensors=(BoundTensor(semantic="observation.object_points", runtime_name=None, index=0, value=points),)
+    )
+    result = backend.infer(
+        InferenceRequest(
+            request_id="graspgen-1",
+            inputs={"execution_plan": plan, "role_inputs": role_inputs},
+        )
+    )
+
+    assert result.actual_chunk_size > 0
+    assert result.backend_latency_ms >= 0.0
+    assert result.metadata["graspgen_denoiser_steps"] == 2
+    timing_ms = result.metadata["graspgen_timing_ms"]
+    assert isinstance(timing_ms, Mapping)
+    assert set(timing_ms) == {
+        "input_prepare",
+        "pointnet_geometry",
+        "generator_sa1",
+        "generator_encoder_host",
+        "generator_sa2",
+        "generator_encoder_head",
+        "discriminator_sa1",
+        "discriminator_encoder_host",
+        "discriminator_sa2",
+        "discriminator_encoder_head",
+        "denoiser_setup",
+        "denoiser_execute",
+        "denoiser_host",
+        "pose_conversion",
+        "discriminator_head",
+        "output_finalize",
+        "total",
+    }
+    assert all(value >= 0.0 for value in timing_ms.values())
+    backend.close()
+    assert acl.memory == {}
+
+
+def test_ascend_graspgen_keeps_embeddings_on_device_and_skips_unused_logits(tmp_path):
+    context = _graspgen_context(
+        tmp_path,
+        runtime_options={"random_seed": 7},
+        device_link_embeddings=True,
+    )
+    acl = _graspgen_acl(context)
+    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
+    backend.load(context)
+
+    deployment = context.deployment
+    plan = build_execution_plan(deployment.execution, deployment.bindings, deployment.device_links)
+    from inference_service.codecs import BoundInputs, BoundTensor
+
+    role_inputs = {role: BoundInputs(tensors=()) for role in deployment.execution}
+    role_inputs[deployment.execution[0]] = BoundInputs(
+        tensors=(
+            BoundTensor(
+                semantic="observation.object_points",
+                runtime_name=None,
+                index=0,
+                value=np.random.randn(200, 3).astype(np.float32),
+            ),
+        )
+    )
+    result = backend.infer(
+        InferenceRequest(
+            request_id="graspgen-device-links",
+            inputs={"execution_plan": plan, "role_inputs": role_inputs},
+        )
+    )
+
+    executions_by_role = {
+        Path(path).stem: (inputs, outputs) for path, inputs, outputs in acl.executions if Path(path).stem != "denoiser"
+    }
+    denoiser_executions = [execution for execution in acl.executions if Path(execution[0]).stem == "denoiser"]
+    assert denoiser_executions
+    assert executions_by_role["generator_encoder_head"][1][0] == denoiser_executions[0][1][0]
+    assert executions_by_role["discriminator_encoder_head"][1][0] == (executions_by_role["discriminator_head"][0][0])
+    assert backend._models["generator_encoder_head"].output_host_buffers == [None]
+    assert backend._models["discriminator_encoder_head"].output_host_buffers == [None]
+    assert backend._models["discriminator_head"].output_host_buffers[0] is None
+    assert backend._models["discriminator_head"].output_host_buffers[1] is not None
+    assert result.actual_chunk_size > 0
+
+    backend.close()
+    assert acl.memory == {}

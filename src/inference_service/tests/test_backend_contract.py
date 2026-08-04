@@ -167,6 +167,7 @@ def _make_context(
         deployment_name=backend,
         compiled=compiled,
         backend=backend,
+        policy_type=policy_type,
     )
     if compiled:
         defaults = {
@@ -190,7 +191,8 @@ def _make_context(
                 "path": "artifacts/worker",
                 "format": "executable",
             }
-            deployment["bindings"]["policy"]["outputs"][0]["index"] = 1
+            if len(deployment["bindings"]["policy"]["outputs"]) == 1:
+                deployment["bindings"]["policy"]["outputs"][0]["index"] = 1
     write_manifest(root, manifest)
     return RuntimeContext(
         validated_manifest=load_inference_manifest(root, backend),
@@ -578,6 +580,11 @@ def test_registry_does_not_instantiate_unavailable_backend_during_validation(tmp
         ("smolvla", "hisilicon", False),
         ("smolvla", "rknn", True),
         ("smolvla", "hmm", True),
+        ("graspgen", "torch", False),
+        ("graspgen", "ascend", True),
+        ("graspgen", "hisilicon", False),
+        ("graspgen", "rknn", False),
+        ("graspgen", "hmm", False),
     ],
 )
 def test_registry_enforces_exact_policy_support_matrix(tmp_path, policy_type, backend, supported):
