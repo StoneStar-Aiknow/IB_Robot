@@ -121,7 +121,7 @@ robot:
       confidence_threshold: 0.30
       grasp_threshold: 0.20
       timeout_sec: 120.0
-      debug_output_mode: diagnostic
+      debug_output_mode: none
     candidate_selection:
       min_confidence: 0.0
       min_point_count: 100
