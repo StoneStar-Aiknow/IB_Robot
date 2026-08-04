@@ -1,4 +1,5 @@
 string task_id
+string execution_token
 string primitive_name
 string pose_name
 geometry_msgs/Pose target_pose

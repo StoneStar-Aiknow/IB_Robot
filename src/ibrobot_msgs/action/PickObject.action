@@ -1,6 +1,13 @@
+uint8 MODE_EXECUTE=0
+uint8 MODE_PLAN_ONLY=1
+uint8 MODE_OBSERVE_ONLY=2
+
 string task_id
 string target_query
 float32 timeout_sec
+uint8 mode
+bool release_after_success
+float32 release_drop_height_m
 ---
 uint8 VERIFICATION_NOT_RUN=0
 uint8 VERIFICATION_SUCCESS=1
@@ -15,6 +22,9 @@ uint8 verification_status
 float32 verification_confidence
 string debug_output_dir
 string[] completed_phases
+int32 candidate_index
+bool released_after_success
+string pipeline_timings_json
 ---
 string phase
 float32 progress

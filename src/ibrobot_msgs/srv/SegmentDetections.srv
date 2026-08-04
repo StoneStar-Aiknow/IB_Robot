@@ -1,9 +1,8 @@
-# Request
-string text_prompt
-float32 confidence_threshold
----
-# Response
+sensor_msgs/Image image
 DetectionArray detections
+---
+DetectionArray detections
+ModelRuntimeInfo model
 float32 inference_time_ms
 bool success
 string message
