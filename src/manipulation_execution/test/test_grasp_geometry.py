@@ -1,17 +1,16 @@
 import math
 
 import numpy as np
+import pytest
 
 from manipulation_execution.grasp_geometry import (
     build_candidate_plan,
-    canonicalize_joint5,
     contact_distance_score,
     euler_xyz_matrix,
     fixed_finger_base_side_alignment,
     fixed_finger_envelope_score,
     fixed_finger_robust_gap,
     grasp_axis_errors,
-    joint5_closing_axis_correction,
     quaternion_from_matrix,
     quaternion_matrix,
     source_contact_camera,
@@ -76,22 +75,6 @@ def test_grasp_axis_errors_measure_approach_and_closing_independently():
 
     assert math.isclose(errors.approach_deg, 30.0, abs_tol=1e-8)
     assert math.isclose(errors.closing_deg, 30.0, abs_tol=1e-8)
-
-
-def test_joint5_helpers_select_the_equivalent_closing_axis_branch():
-    target = quaternion_from_matrix(euler_xyz_matrix((0.0, 0.0, math.pi / 3.0)))
-    actual = quaternion_from_matrix(np.eye(3, dtype=np.float64))
-
-    correction = joint5_closing_axis_correction(
-        target,
-        actual,
-        (0.0, 0.0, 1.0),
-        (1.0, 0.0, 0.0),
-        closing_axis_180_symmetric=True,
-    )
-
-    assert math.isclose(correction, math.pi / 3.0, abs_tol=1e-8)
-    assert math.isclose(canonicalize_joint5(2.0 * math.pi / 3.0), -math.pi / 3.0, abs_tol=1e-8)
 
 
 def test_candidate_plan_preserves_contact_alignment():
@@ -239,6 +222,33 @@ def test_fixed_finger_robust_gap_rejects_error_toward_fixed_finger():
     assert rejected.passed is False
     assert accepted.effective_gap_m > accepted.required_gap_m
     assert accepted.passed is True
+
+
+def test_fixed_finger_robust_gap_tolerates_only_configured_measurement_noise():
+    borderline = fixed_finger_robust_gap(
+        0.0099,
+        0.0135,
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+        (1.0, 0.0, 0.0),
+        max_target_gap_deficit_m=0.003,
+        measurement_tolerance_m=0.001,
+    )
+    unsafe = fixed_finger_robust_gap(
+        0.0094,
+        0.0135,
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+        (1.0, 0.0, 0.0),
+        max_target_gap_deficit_m=0.003,
+        measurement_tolerance_m=0.001,
+    )
+
+    assert borderline.gap_deficit_m == pytest.approx(0.0006)
+    assert borderline.measurement_tolerance_m == pytest.approx(0.001)
+    assert borderline.passed is True
+    assert unsafe.gap_deficit_m == pytest.approx(0.0011)
+    assert unsafe.passed is False
 
 
 def test_source_contact_camera_and_centroid_score():

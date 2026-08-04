@@ -20,8 +20,8 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Header
 
-from ibrobot_msgs.msg import GraspCandidate, GraspCandidateArray
-from ibrobot_msgs.srv import DetectSegment, PlanGrasp
+from ibrobot_msgs.msg import DetectionArray, GraspCandidate, GraspCandidateArray
+from ibrobot_msgs.srv import GroundingDetect, PlanGrasp, SegmentDetections
 
 from .graspgen_wrapper import (
     DEFAULT_ENABLE_SOURCE_GRIPPER_TABLETOP_SWEEP,
@@ -59,6 +59,12 @@ class CameraInfoFrame:
 
 
 @dataclass
+class RGBFrame:
+    stamp_ns: int
+    msg: Image
+
+
+@dataclass
 class DebugPreviewCandidate:
     pose_4x4: np.ndarray
     confidence: float
@@ -78,6 +84,77 @@ def _depth_scale_for_msg(msg: Image, fallback_scale: float) -> float:
     if msg.encoding in ("32FC1", "64FC1"):
         return 1.0
     return fallback_scale
+
+
+def _volume_centroid_hull(points: np.ndarray) -> tuple[np.ndarray, float]:
+    if points.shape[0] < 4:
+        return points.mean(axis=0) if points.shape[0] else np.zeros(3), 0.0
+    try:
+        from scipy.spatial import ConvexHull, QhullError
+    except ModuleNotFoundError:
+        return points.mean(axis=0), 0.0
+    try:
+        hull = ConvexHull(points)
+    except (QhullError, ValueError):
+        return points.mean(axis=0), 0.0
+
+    anchor = points[hull.vertices].mean(axis=0)
+    total_volume = 0.0
+    weighted_centroid = np.zeros(3)
+    for simplex in hull.simplices:
+        a, b, c = points[simplex] - anchor
+        volume = abs(float(np.dot(a, np.cross(b, c)) / 6.0))
+        total_volume += volume
+        weighted_centroid += volume * (anchor + points[simplex].sum(axis=0)) / 4.0
+    if total_volume < 1e-12:
+        return points.mean(axis=0), 0.0
+    return weighted_centroid / total_volume, total_volume
+
+
+def _compute_detection_geometry(
+    mask: np.ndarray,
+    depth_image: np.ndarray,
+    camera_intrinsics: np.ndarray,
+    *,
+    depth_scale: float,
+    depth_trunc_m: float = 3.0,
+) -> tuple[np.ndarray, np.ndarray, float, int]:
+    binary_mask = np.asarray(mask) > 0
+    if binary_mask.shape != depth_image.shape[:2]:
+        import cv2
+
+        binary_mask = (
+            cv2.resize(
+                binary_mask.astype(np.uint8),
+                (depth_image.shape[1], depth_image.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            > 0
+        )
+    depth_m = np.asarray(depth_image, dtype=np.float64) / float(depth_scale)
+    valid = binary_mask & np.isfinite(depth_m) & (depth_m > 0.0) & (depth_m <= depth_trunc_m)
+    ys, xs = np.where(valid)
+    zs = depth_m[valid]
+    if zs.size == 0:
+        zero = np.zeros(3, dtype=np.float64)
+        return zero, zero.copy(), 0.0, 0
+
+    median_z = float(np.median(zs))
+    mad_z = float(np.median(np.abs(zs - median_z)))
+    inliers = np.abs(zs - median_z) <= max(3.0 * 1.4826 * mad_z, 0.02)
+    if int(inliers.sum()) >= max(10, int(0.2 * zs.size)):
+        xs, ys, zs = xs[inliers], ys[inliers], zs[inliers]
+
+    fx = float(camera_intrinsics[0, 0])
+    fy = float(camera_intrinsics[1, 1])
+    cx = float(camera_intrinsics[0, 2])
+    cy = float(camera_intrinsics[1, 2])
+    xs_3d = (xs - cx) * zs / fx
+    ys_3d = (ys - cy) * zs / fy
+    points = np.stack((xs_3d, ys_3d, zs), axis=1)
+    surface_centroid = points.mean(axis=0)
+    volume_centroid, volume_m3 = _volume_centroid_hull(points)
+    return surface_centroid, volume_centroid, volume_m3, int(len(points))
 
 
 def _safe_name(value: str) -> str:
@@ -154,7 +231,14 @@ def _diagnostic_to_lines(diag: GraspDiagnostic, *, detection_confidence: float |
             f"tabletop_auto_tuned: {diag.tabletop_auto_tuned}",
             f"tabletop_auto_tune_attempts: {diag.tabletop_auto_tune_attempts}",
             f"tabletop_auto_tune_reason: {diag.tabletop_auto_tune_reason}",
+            f"tabletop_ransac_iterations: {diag.tabletop_ransac_iterations}",
+            f"timing_tabletop_ransac_ms: {diag.tabletop_ransac_duration_ms:.3f}",
             f"tabletop_filter: {diag.tabletop_filter_after}/{diag.tabletop_filter_before}",
+            f"timing_point_cloud_preprocess_ms: {diag.point_cloud_preprocess_ms:.3f}",
+            f"timing_outlier_removal_ms: {diag.outlier_removal_ms:.3f}",
+            f"timing_model_inference_ms: {diag.model_inference_ms:.3f}",
+            f"timing_grasp_postprocess_ms: {diag.grasp_postprocess_ms:.3f}",
+            f"timing_plan_total_ms: {diag.plan_total_ms:.3f}",
         ]
     )
     if diag.tabletop_failure_reason:
@@ -217,6 +301,13 @@ def _diagnostic_to_dict(diag: GraspDiagnostic, *, detection_confidence: float | 
         "tabletop_auto_tuned": bool(diag.tabletop_auto_tuned),
         "tabletop_auto_tune_attempts": int(diag.tabletop_auto_tune_attempts),
         "tabletop_auto_tune_reason": diag.tabletop_auto_tune_reason,
+        "tabletop_ransac_iterations": int(diag.tabletop_ransac_iterations),
+        "timing_tabletop_ransac_ms": float(diag.tabletop_ransac_duration_ms),
+        "timing_point_cloud_preprocess_ms": float(diag.point_cloud_preprocess_ms),
+        "timing_outlier_removal_ms": float(diag.outlier_removal_ms),
+        "timing_model_inference_ms": float(diag.model_inference_ms),
+        "timing_grasp_postprocess_ms": float(diag.grasp_postprocess_ms),
+        "timing_plan_total_ms": float(diag.plan_total_ms),
     }
     if detection_confidence is not None:
         data["detection_confidence"] = float(detection_confidence)
@@ -807,11 +898,25 @@ class GraspPlannerNode(Node):
         self._lock = threading.Lock()
 
         self.declare_parameter("device", "cuda")
+        self.declare_parameter("inference_backend", "local_cuda")
         self.declare_parameter("gripper_config", "graspgen_robotiq_2f_140.yml")
         self.declare_parameter("model_dir", "")
+        self.declare_parameter("remote_310p_host", "")
+        self.declare_parameter("remote_310p_port", 22)
+        self.declare_parameter("remote_310p_username", "root")
+        self.declare_parameter("remote_310p_password_env", "GRASPGEN_310P_PASSWORD")
+        self.declare_parameter("remote_310p_root", "/root/GraspGen")
+        self.declare_parameter("remote_310p_timeout_sec", 120.0)
+        self.declare_parameter("ascend_local_manifest_path", "")
+        self.declare_parameter("ascend_local_deployment_name", "ascend")
+        self.declare_parameter("ascend_local_device_id", 0)
+        self.declare_parameter("ascend_local_random_seed", -1)
+        self.declare_parameter("startup_warmup", False)
+        self.declare_parameter("rgb_topic", "/camera/wrist/image_raw")
         self.declare_parameter("depth_topic", "/camera/wrist/aligned_depth_to_color/image_raw")
         self.declare_parameter("camera_info_topic", "/camera/wrist/aligned_depth_to_color/camera_info")
-        self.declare_parameter("detect_service", "/grounded_sam2/detect_and_segment")
+        self.declare_parameter("detect_service", "/perception/grounding_detect")
+        self.declare_parameter("segment_service", "")
         self.declare_parameter("grasp_threshold", 0.5)
         self.declare_parameter("num_grasps", 2000)
         self.declare_parameter("topk_num_grasps", 300)
@@ -873,31 +978,72 @@ class GraspPlannerNode(Node):
         self.declare_parameter("debug_interactive_max_points", 120000)
 
         buffer_size = int(self.get_parameter("input_buffer_size").get_parameter_value().integer_value)
+        self._rgb_buffer: deque[RGBFrame] = deque(maxlen=max(1, buffer_size))
         self._depth_buffer: deque[DepthFrame] = deque(maxlen=max(1, buffer_size))
         self._info_buffer: deque[CameraInfoFrame] = deque(maxlen=max(1, buffer_size))
 
         device = self.get_parameter("device").get_parameter_value().string_value
+        inference_backend = self.get_parameter("inference_backend").get_parameter_value().string_value
         gripper_config = self.get_parameter("gripper_config").get_parameter_value().string_value
         model_dir = self.get_parameter("model_dir").get_parameter_value().string_value or None
         collision_gripper = self.get_parameter("collision_gripper").get_parameter_value().string_value or None
 
-        self.get_logger().info(f"Loading GraspGen models (gripper={gripper_config}) ...")
+        self.get_logger().info(f"Loading GraspGen backend (backend={inference_backend}, gripper={gripper_config}) ...")
         self._wrapper = GraspGenWrapper(
             gripper_config=gripper_config,
             model_dir=model_dir,
             device=device,
             collision_gripper=collision_gripper,
+            inference_backend=inference_backend,
+            remote_310p_host=self.get_parameter("remote_310p_host").get_parameter_value().string_value,
+            remote_310p_port=int(self.get_parameter("remote_310p_port").get_parameter_value().integer_value),
+            remote_310p_username=self.get_parameter("remote_310p_username").get_parameter_value().string_value,
+            remote_310p_password_env=self.get_parameter("remote_310p_password_env").get_parameter_value().string_value,
+            remote_310p_root=self.get_parameter("remote_310p_root").get_parameter_value().string_value,
+            remote_310p_timeout_sec=self.get_parameter("remote_310p_timeout_sec").get_parameter_value().double_value,
+            ascend_local_manifest_path=self.get_parameter("ascend_local_manifest_path")
+            .get_parameter_value()
+            .string_value,
+            ascend_local_deployment_name=self.get_parameter("ascend_local_deployment_name")
+            .get_parameter_value()
+            .string_value,
+            ascend_local_device_id=int(
+                self.get_parameter("ascend_local_device_id").get_parameter_value().integer_value
+            ),
+            ascend_local_random_seed=(
+                None
+                if self.get_parameter("ascend_local_random_seed").get_parameter_value().integer_value < 0
+                else self.get_parameter("ascend_local_random_seed").get_parameter_value().integer_value
+            ),
         )
-        self.get_logger().info(f"GraspGen models loaded (collision_gripper={self._wrapper.collision_gripper_name}).")
+        self.get_logger().info(
+            f"GraspGen backend loaded (backend={inference_backend}, "
+            f"collision_gripper={self._wrapper.collision_gripper_name})."
+        )
+        if self.get_parameter("startup_warmup").get_parameter_value().bool_value:
+            started = time.perf_counter()
+            try:
+                warmed = self._wrapper.warmup()
+            except Exception as exc:
+                self.get_logger().warn(f"GraspGen startup warmup failed; continuing: {exc}")
+            else:
+                self.get_logger().info(
+                    f"GraspGen startup warmup completed enabled={warmed} duration_s={time.perf_counter() - started:.3f}"
+                )
 
         cb_group = ReentrantCallbackGroup()
         detect_cb_group = ReentrantCallbackGroup()
         srv_cb_group = MutuallyExclusiveCallbackGroup()
 
+        rgb_topic = self.get_parameter("rgb_topic").get_parameter_value().string_value
         depth_topic = self.get_parameter("depth_topic").get_parameter_value().string_value
         info_topic = self.get_parameter("camera_info_topic").get_parameter_value().string_value
         detect_service = self.get_parameter("detect_service").get_parameter_value().string_value
+        segment_service = self.get_parameter("segment_service").get_parameter_value().string_value
 
+        self._rgb_sub = self.create_subscription(
+            Image, rgb_topic, self._rgb_cb, qos_profile_sensor_data, callback_group=cb_group
+        )
         self._depth_sub = self.create_subscription(
             Image, depth_topic, self._depth_cb, qos_profile_sensor_data, callback_group=cb_group
         )
@@ -905,15 +1051,25 @@ class GraspPlannerNode(Node):
             CameraInfo, info_topic, self._info_cb, qos_profile_sensor_data, callback_group=cb_group
         )
 
-        self._detect_client = self.create_client(DetectSegment, detect_service, callback_group=detect_cb_group)
+        self._detect_client = self.create_client(GroundingDetect, detect_service, callback_group=detect_cb_group)
+        self._segment_client = (
+            self.create_client(SegmentDetections, segment_service, callback_group=detect_cb_group)
+            if segment_service
+            else None
+        )
 
         self._srv = self.create_service(PlanGrasp, "~/plan_grasp", self._srv_cb, callback_group=srv_cb_group)
 
         self._grasp_pub = self.create_publisher(GraspCandidateArray, "~/grasps", 10)
 
         self.get_logger().info(
-            f"GraspPlannerNode ready — depth: {depth_topic}, info: {info_topic}, detect: {detect_service}"
+            f"GraspPlannerNode ready — rgb: {rgb_topic}, depth: {depth_topic}, info: {info_topic}, "
+            f"detect: {detect_service}, segment: {segment_service or 'inline'}"
         )
+
+    def _rgb_cb(self, msg: Image):
+        with self._lock:
+            self._rgb_buffer.append(RGBFrame(stamp_ns=_stamp_to_ns(msg.header.stamp), msg=msg))
 
     def _depth_cb(self, msg: Image):
         try:
@@ -965,24 +1121,31 @@ class GraspPlannerNode(Node):
 
     def _get_segmentation_mask(self, text_prompt: str, confidence_threshold: float):
         if not self._detect_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error("DetectSegment service not available")
+            self.get_logger().error("GroundingDetect service not available")
             return None, "detect_service_unavailable"
 
-        request = DetectSegment.Request()
+        with self._lock:
+            rgb_frame = self._rgb_buffer[-1] if self._rgb_buffer else None
+        if rgb_frame is None:
+            return None, "rgb_frame_not_ready"
+
+        request = GroundingDetect.Request()
+        request.image = rgb_frame.msg
         request.text_prompt = text_prompt
-        request.confidence_threshold = confidence_threshold
+        request.box_threshold = confidence_threshold
+        request.text_threshold = min(0.99, max(0.01, confidence_threshold))
 
         future = self._detect_client.call_async(request)
         done_event = threading.Event()
         future.add_done_callback(lambda _: done_event.set())
         if not done_event.wait(timeout=10.0):
-            self.get_logger().error("Timed out waiting for DetectSegment response")
+            self.get_logger().error("Timed out waiting for GroundingDetect response")
             return None, "detect_service_timeout"
 
         try:
             result = future.result()
         except Exception as exc:
-            self.get_logger().error(f"DetectSegment service call failed: {exc}")
+            self.get_logger().error(f"GroundingDetect service call failed: {exc}")
             return None, f"detect_service_error: {exc}"
         if result is None:
             return None, "detect_service_no_result"
@@ -999,6 +1162,30 @@ class GraspPlannerNode(Node):
                 None,
                 f"low_confidence: best detection confidence={best_det.confidence:.4f} < threshold={confidence_threshold:.2f}",
             )
+        if self._segment_client is not None:
+            if not self._segment_client.wait_for_service(timeout_sec=5.0):
+                return None, "segment_service_unavailable"
+            segment_request = SegmentDetections.Request()
+            segment_request.image = rgb_frame.msg
+            segment_request.detections = DetectionArray(
+                header=result.detections.header,
+                detections=[best_det],
+            )
+            segment_future = self._segment_client.call_async(segment_request)
+            segment_done = threading.Event()
+            segment_future.add_done_callback(lambda _: segment_done.set())
+            if not segment_done.wait(timeout=10.0):
+                return None, "segment_service_timeout"
+            try:
+                segmented = segment_future.result()
+            except Exception as exc:
+                return None, f"segment_service_error: {exc}"
+            if segmented is None or not segmented.success or not segmented.detections.detections:
+                return None, "segment_service_no_result"
+            candidates = sorted(segmented.detections.detections, key=lambda d: d.confidence, reverse=True)
+            best_det = candidates[0]
+        if not best_det.mask.data:
+            return None, "detection_mask_missing"
         mask = self._bridge.imgmsg_to_cv2(best_det.mask, desired_encoding="mono8")
         return (mask, best_det.mask.header, best_det.confidence, best_det), None
 
@@ -1292,7 +1479,7 @@ class GraspPlannerNode(Node):
                     f"confidence_threshold: {confidence_threshold:.2f}",
                 ],
             )
-        mask, mask_header, best_confidence, best_detection = segmentation_result
+        mask, mask_header, best_confidence, _best_detection = segmentation_result
 
         detection_stamp_ns = _stamp_to_ns(mask_header.stamp)
         synced_inputs = self._get_synchronized_inputs(detection_stamp_ns)
@@ -1314,6 +1501,12 @@ class GraspPlannerNode(Node):
         binary_mask = (mask > 0).astype(np.int32)
 
         K = np.array(info.k).reshape(3, 3)
+        surface_centroid, volume_centroid, volume_m3, object_point_count = _compute_detection_geometry(
+            mask,
+            depth_frame.data,
+            K,
+            depth_scale=depth_frame.depth_scale,
+        )
 
         t0 = time.time()
         try:
@@ -1462,6 +1655,7 @@ class GraspPlannerNode(Node):
         diagnostic_lines.append(f"execution_table_plane_fit_duration_s: {execution_table_duration_s:.6f}")
         diagnostic_lines.append(f"execution_table_plane_wait_duration_s: {execution_table_wait_s:.6f}")
         diagnostic_lines.append(f"execution_table_plane_parallel: {execution_table_parallel}")
+        diagnostic_lines.append(f"execution_table_plane_ransac_iterations: {execution_table_fit.iterations_evaluated}")
         if execution_table_fit.failure_reason:
             diagnostic_lines.append(f"execution_table_plane_failure_reason: {execution_table_fit.failure_reason}")
         if (
@@ -1530,10 +1724,14 @@ class GraspPlannerNode(Node):
         self._grasp_pub.publish(grasp_array)
 
         response.grasps = grasp_array
-        response.object_centroid_xyz = best_detection.centroid_xyz
-        response.object_volume_centroid_xyz = best_detection.volume_centroid_xyz
-        response.object_volume_m3 = float(best_detection.volume_m3)
-        response.object_point_count = int(best_detection.point_count)
+        response.object_centroid_xyz.x = float(surface_centroid[0])
+        response.object_centroid_xyz.y = float(surface_centroid[1])
+        response.object_centroid_xyz.z = float(surface_centroid[2])
+        response.object_volume_centroid_xyz.x = float(volume_centroid[0])
+        response.object_volume_centroid_xyz.y = float(volume_centroid[1])
+        response.object_volume_centroid_xyz.z = float(volume_centroid[2])
+        response.object_volume_m3 = float(volume_m3)
+        response.object_point_count = object_point_count
         response.execution_table_plane_found = execution_table_fit.plane is not None
         if execution_table_fit.plane is not None:
             execution_table = execution_table_fit.plane

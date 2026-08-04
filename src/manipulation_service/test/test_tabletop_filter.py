@@ -1,7 +1,5 @@
-import sys
-from types import ModuleType
-
 import numpy as np
+import pytest
 
 from manipulation_service import graspgen_wrapper
 from manipulation_service.graspgen_wrapper import (
@@ -18,6 +16,41 @@ def test_tabletop_filter_modes_include_diagnostic():
 
 def test_source_gripper_tabletop_sweep_defaults_disabled():
     assert DEFAULT_ENABLE_SOURCE_GRIPPER_TABLETOP_SWEEP is False
+
+
+def test_table_plane_ransac_stops_early_for_dominant_plane():
+    rng = np.random.default_rng(7)
+    x, y = np.meshgrid(np.linspace(-0.2, 0.2, 30), np.linspace(-0.2, 0.2, 30))
+    plane_points = np.column_stack([x.ravel(), y.ravel(), np.zeros(x.size)])
+    outliers = rng.uniform([-0.2, -0.2, 0.05], [0.2, 0.2, 0.15], size=(100, 3))
+    scene = np.vstack([plane_points, outliers]).astype(np.float32)
+
+    fit = graspgen_wrapper.fit_table_plane_ransac(
+        scene,
+        positive_reference=np.array([0.0, 0.0, 0.1]),
+        distance_threshold=0.001,
+        min_inlier_ratio=0.15,
+        max_iterations=1000,
+    )
+
+    assert fit.plane is not None
+    assert fit.iterations_evaluated == 64
+    assert fit.plane.normal[2] == pytest.approx(1.0, abs=1e-12)
+    assert fit.plane.d == pytest.approx(0.0, abs=1e-12)
+
+
+def test_table_plane_ransac_uses_full_budget_without_consensus():
+    scene = np.random.default_rng(11).uniform(-1.0, 1.0, size=(1000, 3)).astype(np.float32)
+
+    fit = graspgen_wrapper.fit_table_plane_ransac(
+        scene,
+        distance_threshold=1e-6,
+        min_inlier_ratio=0.15,
+        max_iterations=130,
+    )
+
+    assert fit.plane is None
+    assert fit.iterations_evaluated == 130
 
 
 def test_tabletop_pregrasp_sweep_uses_source_mesh_and_pr200_axis():
@@ -79,22 +112,15 @@ def test_disabled_source_gripper_sweep_preserves_table_and_object_top(monkeypatc
         np.float32
     )
 
-    point_cloud_utils = ModuleType("grasp_gen.utils.point_cloud_utils")
-    point_cloud_utils.__dict__.update(
-        {
-            "depth_and_segmentation_to_point_clouds": lambda **_kwargs: (scene_pc, object_pc, None, None),
-            "filter_colliding_grasps": lambda **_kwargs: None,
-            "point_cloud_outlier_removal": lambda points: (points, None),
-        }
+    monkeypatch.setattr(
+        graspgen_wrapper,
+        "_depth_and_segmentation_to_point_clouds",
+        lambda **_kwargs: (scene_pc, object_pc, None, None),
     )
-    grasp_server = ModuleType("grasp_gen.grasp_server")
-    grasp_server.__dict__["GraspGenSampler"] = object
-    monkeypatch.setitem(sys.modules, "grasp_gen", ModuleType("grasp_gen"))
-    monkeypatch.setitem(sys.modules, "grasp_gen.grasp_server", grasp_server)
-    monkeypatch.setitem(sys.modules, "grasp_gen.utils", ModuleType("grasp_gen.utils"))
-    monkeypatch.setitem(sys.modules, "grasp_gen.utils.point_cloud_utils", point_cloud_utils)
+    monkeypatch.setattr(graspgen_wrapper, "_point_cloud_outlier_removal", lambda points: (points, None))
 
     wrapper = object.__new__(GraspGenWrapper)
+    wrapper.inference_backend = "ascend_local"
     wrapper._inference_point_count = 2048
     grasp = graspgen_wrapper.torch.eye(4, dtype=graspgen_wrapper.torch.float32).reshape(1, 4, 4)
     grasp[0, :3, 3] = graspgen_wrapper.torch.tensor([0.0, 0.0, 0.53])

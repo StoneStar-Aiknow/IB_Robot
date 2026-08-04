@@ -1,13 +1,20 @@
 """Wrapper for GraspGen inference pipeline (ROS-free)."""
 
+import io
 import logging
 import os
+import shlex
 import threading
 import time
+import uuid
+from collections.abc import Mapping
+from contextlib import suppress
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import yaml
 
 try:
     import torch
@@ -30,6 +37,95 @@ _DEFAULT_MAX_INFERENCE_GRASPS_PER_BATCH = 1000
 _EXECUTION_TABLE_SCENE_MAX_POINTS = 30000
 _EXECUTION_TABLE_OBJECT_MAX_POINTS = 16000
 _RANSAC_PLANE_CHUNK_SIZE = 64
+_RANSAC_CONFIDENCE = 0.999
+_VALID_INFERENCE_BACKENDS = {"local_cuda", "remote_310p", "ascend_local"}
+
+
+def _load_grasp_metadata(config_path: Path) -> tuple[str, int]:
+    with config_path.open(encoding="utf-8") as stream:
+        config = yaml.safe_load(stream)
+    data = config.get("data") if isinstance(config, dict) else None
+    if not isinstance(data, dict):
+        raise ValueError(f"GraspGen config is missing a data mapping: {config_path}")
+    gripper_name = str(data.get("gripper_name") or "").strip()
+    if not gripper_name:
+        raise ValueError(f"GraspGen config is missing data.gripper_name: {config_path}")
+    point_count = int(data.get("num_points", 2048))
+    if point_count <= 0:
+        raise ValueError(f"GraspGen config data.num_points must be positive: {config_path}")
+    return gripper_name, point_count
+
+
+def _depth_and_segmentation_to_point_clouds(
+    *,
+    depth_image: np.ndarray,
+    segmentation_mask: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    target_object_id: int = 1,
+    remove_object_from_scene: bool = False,
+) -> tuple[np.ndarray, np.ndarray, None, None]:
+    depth = np.asarray(depth_image)
+    segmentation = np.asarray(segmentation_mask)
+    if depth.ndim != 2 or segmentation.shape != depth.shape:
+        raise ValueError(
+            "depth_image and segmentation_mask must be matching 2D arrays, "
+            f"got depth={depth.shape} segmentation={segmentation.shape}"
+        )
+    if fx <= 0.0 or fy <= 0.0:
+        raise ValueError("camera focal lengths must be positive")
+
+    object_pixels = segmentation == target_object_id
+    if not object_pixels.any():
+        raise ValueError(f"No points found for target object ID {target_object_id}")
+    other_ids = np.unique(segmentation[(segmentation != 0) & ~object_pixels])
+    if len(other_ids):
+        raise ValueError(f"Multiple objects detected in segmentation mask: {other_ids}")
+
+    z = depth.astype(np.float32, copy=False)
+    valid = np.isfinite(z) & (z > 0.0)
+    ys_v, xs_v = np.where(valid)
+    zv = z[ys_v, xs_v]
+    xv = (xs_v - np.float32(cx)) * zv / np.float32(fx)
+    yv = (ys_v - np.float32(cy)) * zv / np.float32(fy)
+    xyz_v = np.stack((xv, yv, zv), axis=-1)
+    object_at_valid = object_pixels[ys_v, xs_v]
+    object_pc = xyz_v[object_at_valid]
+    if len(object_pc) == 0:
+        raise ValueError(f"No valid depth points found for target object ID {target_object_id}")
+    if remove_object_from_scene:
+        scene_pc = xyz_v[~object_at_valid]
+    else:
+        scene_pc = xyz_v
+    return scene_pc, object_pc, None, None
+
+
+def _point_cloud_outlier_removal(
+    object_pc: np.ndarray | torch.Tensor,
+    *,
+    threshold: float = 0.014,
+    neighbor_count: int = 20,
+    chunk_size: int = 1024,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    points = torch.as_tensor(object_pc, dtype=torch.float32).reshape(-1, 3)
+    if len(points) <= 1:
+        return points, points[:0]
+
+    neighbors = min(max(1, int(neighbor_count)), len(points) - 1)
+    keep_chunks = []
+    chunk_size = max(1, int(chunk_size))
+    for start in range(0, len(points), chunk_size):
+        stop = min(start + chunk_size, len(points))
+        distances = torch.cdist(points[start:stop], points, p=1)
+        row_indices = torch.arange(stop - start)
+        column_indices = torch.arange(start, stop)
+        distances[row_indices, column_indices] = float("inf")
+        nearest = torch.topk(distances, neighbors, dim=1, largest=False).values
+        keep_chunks.append(nearest.mean(dim=1) < float(threshold))
+    keep = torch.cat(keep_chunks)
+    return points[keep], points[~keep]
 
 
 def _cuda_status() -> str:
@@ -52,6 +148,338 @@ def _find_workspace_root() -> Path:
 
 _WORKSPACE_ROOT = _find_workspace_root()
 _DEFAULT_MODEL_DIR = _WORKSPACE_ROOT / "models" / "grasp"
+
+
+class Remote310PInferenceClient:
+    def __init__(
+        self,
+        host: str,
+        *,
+        port: int = 22,
+        username: str = "root",
+        password_env: str = "GRASPGEN_310P_PASSWORD",
+        remote_root: str = "/root/GraspGen",
+        timeout_sec: float = 120.0,
+    ):
+        if not host.strip():
+            raise ValueError("remote_310p_host must not be empty")
+        if port <= 0:
+            raise ValueError("remote_310p_port must be positive")
+        if timeout_sec <= 0:
+            raise ValueError("remote_310p_timeout_sec must be positive")
+        self._host = host.strip()
+        self._port = int(port)
+        self._username = username.strip()
+        self._password_env = password_env.strip()
+        self._remote_root = remote_root.rstrip("/")
+        self._timeout_sec = float(timeout_sec)
+
+    def sample(
+        self,
+        object_pc: np.ndarray,
+        *,
+        grasp_threshold: float,
+        num_grasps: int,
+        topk_num_grasps: int,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        try:
+            import paramiko
+        except ModuleNotFoundError as exc:
+            raise RuntimeError("remote_310p backend requires the Python package 'paramiko'") from exc
+
+        points = np.asarray(object_pc, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+            raise ValueError(f"object_pc must have shape [N,3] with N > 0, got {points.shape}")
+        if not np.isfinite(points).all():
+            raise ValueError("object_pc contains non-finite values")
+
+        request_id = f"ibrobot_{uuid.uuid4().hex}"
+        request_dir = f"{self._remote_root}/runtime_requests/{request_id}"
+        input_dir = f"{request_dir}/input"
+        output_dir = f"{request_dir}/output"
+        input_path = f"{input_dir}/{request_id}.npy"
+        output_path = f"{output_dir}/{request_id}.npz"
+        error_path = f"{output_dir}/{request_id}.error.txt"
+        script_path = f"{self._remote_root}/watch_offline.sh"
+
+        command = " ".join(
+            [
+                shlex.quote(script_path),
+                "--input-dir",
+                shlex.quote(input_dir),
+                "--output-dir",
+                shlex.quote(output_dir),
+                "--num-grasps",
+                str(int(num_grasps)),
+                "--threshold",
+                str(float(grasp_threshold)),
+                "--topk",
+                str(int(topk_num_grasps)),
+                "--seed 0 --once",
+            ]
+        )
+
+        password = os.environ.get(self._password_env) if self._password_env else None
+        client = self._connect(paramiko, password)
+        sftp = None
+        try:
+            sftp = client.open_sftp()
+
+            _, stdout, stderr = client.exec_command(
+                f"mkdir -p {shlex.quote(input_dir)} {shlex.quote(output_dir)}",
+                timeout=self._timeout_sec,
+            )
+            mkdir_status = stdout.channel.recv_exit_status()
+            mkdir_error = stderr.read().decode("utf-8", errors="replace").strip()
+            if mkdir_status != 0:
+                raise RuntimeError(f"failed to create remote request directory: {mkdir_error}")
+
+            input_buffer = io.BytesIO()
+            np.save(input_buffer, points, allow_pickle=False)
+            input_buffer.seek(0)
+            sftp.putfo(input_buffer, input_path)
+
+            _, stdout, stderr = client.exec_command(command, timeout=self._timeout_sec)
+            stdout_text = stdout.read().decode("utf-8", errors="replace").strip()
+            stderr_text = stderr.read().decode("utf-8", errors="replace").strip()
+            exit_status = stdout.channel.recv_exit_status()
+            if exit_status != 0:
+                remote_error = ""
+                try:
+                    with sftp.open(error_path, "r") as file:
+                        remote_error = file.read().decode("utf-8", errors="replace").strip()
+                except OSError:
+                    pass
+                detail = remote_error or stderr_text or stdout_text or f"exit status {exit_status}"
+                raise RuntimeError(f"remote GraspGen inference failed: {detail}")
+
+            output_buffer = io.BytesIO()
+            sftp.getfo(output_path, output_buffer)
+            output_buffer.seek(0)
+            with np.load(output_buffer, allow_pickle=False) as result:
+                poses = np.asarray(result["poses"], dtype=np.float32)
+                confidence = np.asarray(result["confidence"], dtype=np.float32)
+                inference_seconds = float(np.asarray(result["inference_seconds"]).reshape(()))
+            self._validate_result(poses, confidence)
+            logger.info(
+                "Remote 310P GraspGen completed: host=%s grasps=%d board_inference_s=%.3f output=%s",
+                self._host,
+                len(confidence),
+                inference_seconds,
+                stdout_text,
+            )
+            return poses, confidence, inference_seconds
+        finally:
+            if sftp is not None:
+                for path in (input_path, output_path, error_path):
+                    with suppress(OSError):
+                        sftp.remove(path)
+                for path in (input_dir, output_dir, request_dir):
+                    with suppress(OSError):
+                        sftp.rmdir(path)
+                sftp.close()
+            client.close()
+
+    def _connect(self, paramiko, password: str | None):
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        connect_timeout = min(self._timeout_sec, 15.0)
+        try:
+            client.connect(
+                hostname=self._host,
+                port=self._port,
+                username=self._username,
+                password=password,
+                timeout=connect_timeout,
+                banner_timeout=connect_timeout,
+                auth_timeout=connect_timeout,
+                look_for_keys=True,
+                allow_agent=True,
+            )
+            return client
+        except paramiko.AuthenticationException:
+            client.close()
+            if password is None:
+                raise
+
+        transport = paramiko.Transport((self._host, self._port))
+        transport.banner_timeout = connect_timeout
+        transport.auth_timeout = connect_timeout
+        try:
+            transport.start_client(timeout=connect_timeout)
+            transport.auth_interactive(
+                self._username,
+                lambda _title, _instructions, prompts: [password for _prompt, _echo in prompts],
+            )
+        except Exception:
+            transport.close()
+            raise
+
+        client = paramiko.SSHClient()
+        client._transport = transport
+        return client
+
+    @staticmethod
+    def _validate_result(poses: np.ndarray, confidence: np.ndarray) -> None:
+        if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+            raise RuntimeError(f"remote GraspGen poses must have shape [K,4,4], got {poses.shape}")
+        if confidence.ndim != 1 or len(confidence) != len(poses):
+            raise RuntimeError(
+                "remote GraspGen confidence must have shape [K] matching poses, "
+                f"got poses={poses.shape} confidence={confidence.shape}"
+            )
+        if not np.isfinite(poses).all() or not np.isfinite(confidence).all():
+            raise RuntimeError("remote GraspGen result contains non-finite values")
+
+
+class AscendLocalBackend:
+    """In-process GraspGen inference via the standard AscendBackend.
+
+    Loads a unified ``inference_manifest.json`` produced by
+    ``model_utils.graspgen_export.write_manifest`` and runs the eight OM
+    sub-graphs through ``inference_service.backends.ascend.AscendBackend``,
+    bypassing the SSH/SFTP transport used by :class:`Remote310PInferenceClient`.
+    """
+
+    def __init__(
+        self,
+        manifest_path: str,
+        *,
+        deployment_name: str = "ascend",
+        device_id: int = 0,
+        random_seed: int | None = None,
+    ):
+        if not manifest_path.strip():
+            raise ValueError("ascend_local_manifest_path must not be empty")
+        if device_id < 0:
+            raise ValueError("ascend_local_device_id must be a non-negative integer")
+        self._manifest_path = manifest_path.strip()
+        self._deployment_name = deployment_name.strip() or "ascend"
+        self._device_id = int(device_id)
+        self._random_seed = random_seed
+        self._backend = None
+        self._plan = None
+        self._first_role = None
+
+    def _ensure_loaded(self) -> None:
+        if self._backend is not None:
+            return
+        from inference_manifest import load_inference_manifest
+        from inference_service.backends import RuntimeContext
+        from inference_service.backends.ascend import AscendBackend
+        from inference_service.backends.ascend.acl_runtime import AclRuntimeManager
+        from inference_service.codecs import build_execution_plan
+
+        bundle_root = Path(self._manifest_path).expanduser().resolve()
+        manifest_root = bundle_root.parent if bundle_root.name == "inference_manifest.json" else bundle_root
+        validated = load_inference_manifest(manifest_root, self._deployment_name)
+        runtime_options: dict[str, object] = {"device_id": self._device_id}
+        if self._random_seed is not None:
+            runtime_options["random_seed"] = self._random_seed
+        context = RuntimeContext(validated, runtime_options=runtime_options)
+        acl_runtime = AclRuntimeManager()
+        backend = AscendBackend(self._device_id, runtime_manager=acl_runtime)
+        backend.load(context)
+        execution = validated.deployment.execution
+        bindings = validated.deployment.bindings
+        links = validated.deployment.device_links
+        self._plan = build_execution_plan(execution, bindings, links)
+        self._first_role = execution[0]
+        self._backend = backend
+        logger.info(
+            "AscendLocalBackend ready (manifest=%s, deployment=%s, device_id=%d, roles=%d)",
+            manifest_root,
+            self._deployment_name,
+            self._device_id,
+            len(execution),
+        )
+
+    def sample(
+        self,
+        object_pc: np.ndarray,
+        *,
+        grasp_threshold: float,
+        num_grasps: int,
+        topk_num_grasps: int,
+    ) -> tuple[np.ndarray, np.ndarray, float]:
+        self._ensure_loaded()
+        from inference_service.backends import InferenceRequest
+        from inference_service.codecs import BoundInputs, BoundTensor
+
+        points = np.asarray(object_pc, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+            raise ValueError(f"object_pc must have shape [N,3] with N > 0, got {points.shape}")
+        if not np.isfinite(points).all():
+            raise ValueError("object_pc contains non-finite values")
+
+        role_inputs = {role: BoundInputs(tensors=()) for role in self._plan.role_names}
+        role_inputs[self._first_role] = BoundInputs(
+            tensors=(
+                BoundTensor(
+                    semantic="observation.object_points",
+                    runtime_name=None,
+                    index=0,
+                    value=points,
+                ),
+            )
+        )
+        started = time.perf_counter()
+        result = self._backend.infer(
+            InferenceRequest(
+                request_id=f"ascend_local_{uuid.uuid4().hex}",
+                inputs={"execution_plan": self._plan, "role_inputs": role_inputs},
+            )
+        )
+        inference_seconds = time.perf_counter() - started
+        outputs = result.action
+        head_outputs = outputs.get("discriminator_head") if isinstance(outputs, dict) else None
+        if not isinstance(head_outputs, dict) or len(head_outputs) < 2:
+            raise RuntimeError("AscendLocalBackend did not return discriminator_head outputs")
+        ordered = tuple(head_outputs.values())
+        poses = np.asarray(ordered[0], dtype=np.float32)
+        confidence = np.asarray(ordered[1], dtype=np.float32).reshape(-1)
+        if poses.shape[-2:] != (4, 4):
+            raise RuntimeError(f"AscendLocalBackend poses have unexpected shape {poses.shape}")
+        keep = confidence >= np.float32(grasp_threshold)
+        poses = poses[keep]
+        confidence = confidence[keep]
+        if topk_num_grasps > 0 and len(confidence) > topk_num_grasps:
+            order = np.argsort(-confidence, kind="stable")[:topk_num_grasps]
+            poses = poses[order]
+            confidence = confidence[order]
+        stage_timing = result.metadata.get("graspgen_timing_ms")
+        stage_timing_text = ""
+        if isinstance(stage_timing, Mapping):
+            stage_timing_text = " ".join(
+                f"{name}={float(duration_ms):.1f}" for name, duration_ms in stage_timing.items()
+            )
+        logger.info(
+            "AscendLocalBackend completed: grasps=%d wall_s=%.3f backend_s=%.3f denoiser_steps=%s stages_ms=%s",
+            len(confidence),
+            inference_seconds,
+            result.backend_latency_ms / 1000.0,
+            result.metadata.get("graspgen_denoiser_steps"),
+            stage_timing_text,
+        )
+        return poses, confidence, inference_seconds
+
+    def warmup(self, object_pc: np.ndarray) -> None:
+        """Run inference without consuming the configured request random stream."""
+        self._ensure_loaded()
+        assert self._backend is not None
+        random_generator = self._backend._random  # noqa: SLF001 - paired backend integration.
+        random_state = None if random_generator is None else deepcopy(random_generator.bit_generator.state)
+        try:
+            self.sample(
+                object_pc,
+                grasp_threshold=1.0,
+                num_grasps=1,
+                topk_num_grasps=1,
+            )
+        finally:
+            if random_generator is not None and random_state is not None:
+                random_generator.bit_generator.state = random_state
 
 
 @dataclass
@@ -119,6 +547,13 @@ class GraspDiagnostic:
     tabletop_auto_tuned: bool = False
     tabletop_auto_tune_attempts: int = 0
     tabletop_auto_tune_reason: str = ""
+    tabletop_ransac_iterations: int = 0
+    tabletop_ransac_duration_ms: float = 0.0
+    point_cloud_preprocess_ms: float = 0.0
+    outlier_removal_ms: float = 0.0
+    model_inference_ms: float = 0.0
+    grasp_postprocess_ms: float = 0.0
+    plan_total_ms: float = 0.0
     failure_reason: str = ""
     failure_stage: str = ""
     _execution_table_fit_holder: dict[str, object] | None = None
@@ -137,6 +572,7 @@ class TablePlaneFit:
     plane: TablePlane | None
     best_inlier_ratio: float = 0.0
     failure_reason: str = ""
+    iterations_evaluated: int = 0
 
 
 def fit_table_plane_ransac(
@@ -158,35 +594,54 @@ def fit_table_plane_ransac(
     else:
         pts_work = pts
 
-    candidate_normals = []
-    candidate_offsets = []
-    for _ in range(max_iterations):
-        tri = pts_work[rng.choice(len(pts_work), 3, replace=False)]
-        n = np.cross(tri[1] - tri[0], tri[2] - tri[0])
-        norm = np.linalg.norm(n)
-        if norm < 1e-9:
+    attempts = 0
+    iterations_evaluated = 0
+    best_count = 0
+    best_normal = None
+    best_d = 0.0
+    while attempts < max_iterations:
+        candidate_normals = []
+        candidate_offsets = []
+        while attempts < max_iterations and len(candidate_normals) < _RANSAC_PLANE_CHUNK_SIZE:
+            attempts += 1
+            tri = pts_work[rng.choice(len(pts_work), 3, replace=False)]
+            n = np.cross(tri[1] - tri[0], tri[2] - tri[0])
+            norm = np.linalg.norm(n)
+            if norm < 1e-9:
+                continue
+            n = n / norm
+            candidate_normals.append(n)
+            candidate_offsets.append(-n @ tri[0])
+        if not candidate_normals:
             continue
-        n = n / norm
-        d = -n @ tri[0]
-        candidate_normals.append(n)
-        candidate_offsets.append(d)
-    if not candidate_normals:
-        return TablePlaneFit(None, failure_reason="no non-degenerate table plane sample found")
 
-    normals = np.asarray(candidate_normals)
-    offsets = np.asarray(candidate_offsets)
-    counts = np.empty(len(normals), dtype=np.int64)
-    for start in range(0, len(normals), _RANSAC_PLANE_CHUNK_SIZE):
-        end = min(start + _RANSAC_PLANE_CHUNK_SIZE, len(normals))
-        distances = np.abs(pts_work @ normals[start:end].T + offsets[start:end])
-        counts[start:end] = np.sum(distances < distance_threshold, axis=0)
+        normals = np.asarray(candidate_normals)
+        offsets = np.asarray(candidate_offsets)
+        distances = np.abs(pts_work @ normals.T + offsets)
+        counts = np.sum(distances < distance_threshold, axis=0)
+        batch_best_index = int(np.argmax(counts))
+        batch_best_count = int(counts[batch_best_index])
+        if batch_best_count > best_count:
+            best_count = batch_best_count
+            best_normal = normals[batch_best_index]
+            best_d = float(offsets[batch_best_index])
+        iterations_evaluated += len(normals)
 
-    best_index = int(np.argmax(counts))
-    best_count = int(counts[best_index])
-    if best_count <= 0:
-        return TablePlaneFit(None, failure_reason="no non-degenerate table plane sample found")
-    best_normal = normals[best_index]
-    best_d = float(offsets[best_index])
+        best_ratio = best_count / len(pts_work)
+        all_inlier_sample_probability = best_ratio**3
+        if all_inlier_sample_probability >= 1.0:
+            break
+        if all_inlier_sample_probability > 0.0:
+            required_iterations = int(np.ceil(np.log1p(-_RANSAC_CONFIDENCE) / np.log1p(-all_inlier_sample_probability)))
+            if iterations_evaluated >= required_iterations:
+                break
+
+    if best_normal is None or best_count <= 0:
+        return TablePlaneFit(
+            None,
+            failure_reason="no non-degenerate table plane sample found",
+            iterations_evaluated=iterations_evaluated,
+        )
     inlier_mask = np.abs(pts @ best_normal + best_d) < distance_threshold
     inlier_pts = pts[inlier_mask]
     inlier_ratio = len(inlier_pts) / len(pts)
@@ -200,6 +655,7 @@ def fit_table_plane_ransac(
             None,
             best_inlier_ratio=float(inlier_ratio),
             failure_reason=f"best inlier ratio {inlier_ratio:.3f} < minimum {min_inlier_ratio:.3f}",
+            iterations_evaluated=iterations_evaluated,
         )
     center = inlier_pts.mean(axis=0)
     _, _, vh = np.linalg.svd(inlier_pts - center, full_matrices=False)
@@ -209,14 +665,20 @@ def fit_table_plane_ransac(
         normal = -normal
         d = -d
     logger.info(
-        "Table plane: n=[%.4f,%.4f,%.4f] d=%.4f inlier_ratio=%.3f",
+        "Table plane: n=[%.4f,%.4f,%.4f] d=%.4f inlier_ratio=%.3f ransac_iterations=%d/%d",
         normal[0],
         normal[1],
         normal[2],
         d,
         inlier_ratio,
+        iterations_evaluated,
+        max_iterations,
     )
-    return TablePlaneFit(TablePlane(normal=normal, d=d, inlier_ratio=inlier_ratio), best_inlier_ratio=inlier_ratio)
+    return TablePlaneFit(
+        TablePlane(normal=normal, d=d, inlier_ratio=inlier_ratio),
+        best_inlier_ratio=inlier_ratio,
+        iterations_evaluated=iterations_evaluated,
+    )
 
 
 def _sample_execution_table_points(points: np.ndarray | None, max_points: int) -> np.ndarray:
@@ -547,35 +1009,59 @@ def complete_object_cloud_from_mask_depth(
 
     import cv2
 
-    mask = segmentation_mask > 0
-    valid = np.isfinite(depth_m) & (depth_m > 0) & mask
-    holes = mask & ~valid
-    if not holes.any():
-        return np.empty((0, 3), dtype=np.float32)
-
-    if not valid.any():
-        return np.empty((0, 3), dtype=np.float32)
-
     k = max(3, int(kernel_size))
     if k % 2 == 0:
         k += 1
-    kernel = np.ones((k, k), dtype=np.float32)
-    valid_f = valid.astype(np.float32)
-    depth_sum = cv2.filter2D((depth_m * valid_f).astype(np.float32), -1, kernel, borderType=cv2.BORDER_CONSTANT)
-    neighbor_count = cv2.filter2D(valid_f, -1, kernel, borderType=cv2.BORDER_CONSTANT)
 
-    fill = holes & (neighbor_count >= float(min_neighbors))
-    ys, xs = np.where(fill)
-    if len(ys) == 0:
+    mask = segmentation_mask > 0
+    if not mask.any():
         return np.empty((0, 3), dtype=np.float32)
-    if len(ys) > max_added_points:
-        keep = np.linspace(0, len(ys) - 1, max_added_points, dtype=np.int64)
-        ys = ys[keep]
-        xs = xs[keep]
 
-    completed_depth = depth_m.copy()
-    completed_depth[ys, xs] = depth_sum[ys, xs] / neighbor_count[ys, xs]
-    return _points_from_pixels(completed_depth, ys, xs, fx, fy, cx, cy)
+    ys_mask, xs_mask = np.where(mask)
+    y0 = int(ys_mask.min())
+    y1 = int(ys_mask.max()) + 1
+    x0 = int(xs_mask.min())
+    x1 = int(xs_mask.max()) + 1
+    # Pad by kernel radius (plus one) so the convolution result is identical
+    # to a full-image filter2D with BORDER_CONSTANT zero padding.
+    pad = k // 2 + 1
+    y0 = max(0, y0 - pad)
+    y1 = min(depth_m.shape[0], y1 + pad)
+    x0 = max(0, x0 - pad)
+    x1 = min(depth_m.shape[1], x1 + pad)
+
+    mask_roi = np.ascontiguousarray(mask[y0:y1, x0:x1])
+    depth_roi = np.ascontiguousarray(depth_m[y0:y1, x0:x1])
+    valid_roi = np.isfinite(depth_roi) & (depth_roi > 0) & mask_roi
+    holes_roi = mask_roi & ~valid_roi
+    if not holes_roi.any() or not valid_roi.any():
+        return np.empty((0, 3), dtype=np.float32)
+
+    kernel = np.ones((k, k), dtype=np.float32)
+    valid_f_roi = valid_roi.astype(np.float32)
+    depth_sum_roi = cv2.filter2D(
+        (depth_roi * valid_f_roi).astype(np.float32), -1, kernel, borderType=cv2.BORDER_CONSTANT
+    )
+    neighbor_count_roi = cv2.filter2D(valid_f_roi, -1, kernel, borderType=cv2.BORDER_CONSTANT)
+
+    fill_roi = holes_roi & (neighbor_count_roi >= float(min_neighbors))
+    ys_roi, xs_roi = np.where(fill_roi)
+    if len(ys_roi) == 0:
+        return np.empty((0, 3), dtype=np.float32)
+    if len(ys_roi) > max_added_points:
+        keep = np.linspace(0, len(ys_roi) - 1, max_added_points, dtype=np.int64)
+        ys_roi = ys_roi[keep]
+        xs_roi = xs_roi[keep]
+
+    # Depths at the filled pixels only, computed in the ROI's local frame.
+    zs = (depth_sum_roi[ys_roi, xs_roi] / neighbor_count_roi[ys_roi, xs_roi]).astype(np.float32)
+    # Map ROI-local pixel coordinates back to the full image frame so that
+    # camera-intrinsics projection matches the original full-image math.
+    ys = ys_roi.astype(np.int64) + y0
+    xs = xs_roi.astype(np.int64) + x0
+    x3d = (xs - cx) * zs / fx
+    y3d = (ys - cy) * zs / fy
+    return np.stack([x3d, y3d, zs], axis=-1).astype(np.float32)
 
 
 def complete_object_cloud_prismatic_extrude(
@@ -841,15 +1327,24 @@ class GraspGenWrapper:
         model_dir: str | None = None,
         device: str = "cuda",
         collision_gripper: str | None = None,
+        inference_backend: str = "local_cuda",
+        remote_310p_host: str = "",
+        remote_310p_port: int = 22,
+        remote_310p_username: str = "root",
+        remote_310p_password_env: str = "GRASPGEN_310P_PASSWORD",
+        remote_310p_root: str = "/root/GraspGen",
+        remote_310p_timeout_sec: float = 120.0,
+        ascend_local_manifest_path: str = "",
+        ascend_local_deployment_name: str = "ascend",
+        ascend_local_device_id: int = 0,
+        ascend_local_random_seed: int | None = None,
     ):
-        from grasp_gen.grasp_server import GraspGenSampler, load_grasp_cfg
-        from grasp_gen.robot import get_gripper_info
-
-        if device != "cuda":
-            raise RuntimeError(f"{_LOCAL_BACKEND_REQUIRES_CUDA} Requested device={device!r}.")
-        if not torch.cuda.is_available():
-            raise RuntimeError(f"{_LOCAL_BACKEND_REQUIRES_CUDA} CUDA status: {_cuda_status()}.")
-        self.device = "cuda"
+        backend = inference_backend.strip().lower()
+        if backend not in _VALID_INFERENCE_BACKENDS:
+            raise ValueError(
+                f"invalid inference_backend {inference_backend!r}; expected one of {_VALID_INFERENCE_BACKENDS}"
+            )
+        self.inference_backend = backend
 
         base = Path(model_dir) if model_dir else _DEFAULT_MODEL_DIR
         gripper_cfg_path = self._resolve_config(gripper_config, base)
@@ -866,17 +1361,82 @@ class GraspGenWrapper:
             )
 
         logger.info("Loading GraspGen config from %s", gripper_cfg_path)
-        self._cfg = load_grasp_cfg(str(gripper_cfg_path))
-        self._gripper_name = self._cfg.data.gripper_name
-        self._inference_point_count = int(getattr(self._cfg.data, "num_points", 2048))
+        if backend == "local_cuda":
+            from grasp_gen.grasp_server import load_grasp_cfg
 
-        logger.info("Initializing GraspGenSampler on %s ...", self.device)
-        self._sampler = GraspGenSampler(self._cfg)
-        logger.info("GraspGenSampler ready (gripper=%s)", self._gripper_name)
+            self._cfg = load_grasp_cfg(str(gripper_cfg_path))
+            self._gripper_name = self._cfg.data.gripper_name
+            self._inference_point_count = int(getattr(self._cfg.data, "num_points", 2048))
+        else:
+            self._cfg = None
+            self._gripper_name, self._inference_point_count = _load_grasp_metadata(gripper_cfg_path)
+
+        if backend == "local_cuda":
+            from grasp_gen.grasp_server import GraspGenSampler
+
+            if device != "cuda":
+                raise RuntimeError(f"{_LOCAL_BACKEND_REQUIRES_CUDA} Requested device={device!r}.")
+            if not torch.cuda.is_available():
+                raise RuntimeError(f"{_LOCAL_BACKEND_REQUIRES_CUDA} CUDA status: {_cuda_status()}.")
+            self.device = "cuda"
+            logger.info("Initializing GraspGenSampler on %s ...", self.device)
+            self._sampler = GraspGenSampler(self._cfg)
+            self._remote_client = None
+            self._ascend_local_client = None
+            logger.info("GraspGenSampler ready (gripper=%s)", self._gripper_name)
+        elif backend == "ascend_local":
+            self.device = "ascend"
+            self._sampler = None
+            self._remote_client = None
+            self._ascend_local_client = AscendLocalBackend(
+                ascend_local_manifest_path,
+                deployment_name=ascend_local_deployment_name,
+                device_id=ascend_local_device_id,
+                random_seed=ascend_local_random_seed,
+            )
+            logger.info(
+                "Ascend local GraspGen backend ready (manifest=%s, deployment=%s, gripper=%s)",
+                ascend_local_manifest_path,
+                ascend_local_deployment_name,
+                self._gripper_name,
+            )
+        else:
+            self.device = "remote_310p"
+            self._sampler = None
+            self._remote_client = Remote310PInferenceClient(
+                remote_310p_host,
+                port=remote_310p_port,
+                username=remote_310p_username,
+                password_env=remote_310p_password_env,
+                remote_root=remote_310p_root,
+                timeout_sec=remote_310p_timeout_sec,
+            )
+            self._ascend_local_client = None
+            logger.info(
+                "Remote 310P GraspGen backend ready (host=%s, gripper=%s)",
+                remote_310p_host,
+                self._gripper_name,
+            )
 
         collision_name = collision_gripper or self._gripper_name
         self._collision_gripper_name = collision_name
-        self._gripper_info = get_gripper_info(collision_name)
+        self._gripper_info = None
+        self._collision_mesh = None
+        self._collision_vertices = None
+        if backend == "local_cuda":
+            self._ensure_collision_geometry()
+
+    def _ensure_collision_geometry(self) -> None:
+        if self._collision_vertices is not None:
+            return
+        try:
+            from grasp_gen.robot import get_gripper_info
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "GraspGen source package is required when collision filtering, source-gripper "
+                "tabletop sweep, or full debug rendering is enabled"
+            ) from exc
+        self._gripper_info = get_gripper_info(self._collision_gripper_name)
         self._collision_mesh = self._gripper_info.collision_mesh
         self._collision_vertices = np.asarray(self._collision_mesh.vertices)
 
@@ -948,12 +1508,12 @@ class GraspGenWrapper:
         enable_scene_cloud_table_holes: bool = False,
         scene_cloud_table_holes_max_points: int = 8000,
     ) -> tuple[list[GraspCandidate], GraspDiagnostic]:
-        from grasp_gen.grasp_server import GraspGenSampler as _GS
-        from grasp_gen.utils.point_cloud_utils import (
-            depth_and_segmentation_to_point_clouds,
-            filter_colliding_grasps,
-            point_cloud_outlier_removal,
-        )
+        plan_started = time.perf_counter()
+        grasp_server_cls = None
+        if self.inference_backend == "local_cuda":
+            from grasp_gen.grasp_server import GraspGenSampler
+
+            grasp_server_cls = GraspGenSampler
 
         diag = GraspDiagnostic()
         completion_mode = object_cloud_completion_mode.strip().lower()
@@ -973,7 +1533,7 @@ class GraspGenWrapper:
             )
         diag.tabletop_filter_mode = mode
 
-        depth_m = depth_image.astype(np.float64) / depth_scale
+        depth_m = depth_image.astype(np.float32) / np.float32(depth_scale)
 
         mask_for_pc = _align_mask_to_depth(segmentation_mask, depth_m, diag)
         _populate_depth_mask_diagnostics(mask_for_pc, depth_m, diag)
@@ -1002,7 +1562,7 @@ class GraspGenWrapper:
         cx = float(camera_intrinsics[0, 2])
         cy = float(camera_intrinsics[1, 2])
 
-        scene_pc, object_pc, scene_colors, object_colors = depth_and_segmentation_to_point_clouds(
+        scene_pc, object_pc, scene_colors, object_colors = _depth_and_segmentation_to_point_clouds(
             depth_image=depth_m,
             segmentation_mask=mask_for_pc,
             fx=fx,
@@ -1032,12 +1592,15 @@ class GraspGenWrapper:
         shared_table_fit = TablePlaneFit(None)
         if scene_pc is not None and len(scene_pc) > 0:
             shared_min_inlier_ratio = min(float(tabletop_min_inlier_ratio), 0.10)
+            table_fit_started = time.perf_counter()
             shared_table_fit = fit_table_plane_ransac(
                 scene_pc,
                 positive_reference=object_pc.mean(axis=0),
                 distance_threshold=float(tabletop_ransac_threshold),
                 min_inlier_ratio=shared_min_inlier_ratio,
             )
+            diag.tabletop_ransac_duration_ms = (time.perf_counter() - table_fit_started) * 1000.0
+            diag.tabletop_ransac_iterations = shared_table_fit.iterations_evaluated
         shared_table = shared_table_fit.plane
 
         if completion_enabled:
@@ -1107,12 +1670,21 @@ class GraspGenWrapper:
             diag.scene_pc_after_completion = scene_pc.astype(np.float32, copy=True)
 
         _start_execution_table_fit(diag)
+        diag.point_cloud_preprocess_ms = (time.perf_counter() - plan_started) * 1000.0
 
         # GraspGen gets a hollow surface shell: visible object points, optional
         # mask-depth surface inpaint, and silhouette side walls to the table. We
         # never add interior volume samples.
-        object_pc_tensor = torch.from_numpy(object_pc_shell).float()
-        pc_filtered, _ = point_cloud_outlier_removal(object_pc_tensor)
+        stage_started = time.perf_counter()
+        outlier_input = _downsample_points(object_pc_shell, self._inference_point_count)
+        if len(outlier_input) < len(object_pc_shell):
+            logger.info(
+                "Object PC downsampled before outlier removal: %d -> %d points",
+                len(object_pc_shell),
+                len(outlier_input),
+            )
+        object_pc_tensor = torch.from_numpy(outlier_input).float()
+        pc_filtered, _ = _point_cloud_outlier_removal(object_pc_tensor)
         object_pc_clean = pc_filtered.numpy()
         diag.object_point_count = len(object_pc_clean)
         logger.info("Object PC for GraspGen inference (hollow shell): %d points", len(object_pc_clean))
@@ -1135,8 +1707,10 @@ class GraspGenWrapper:
                 len(object_pc_inference),
             )
 
+        diag.outlier_removal_ms = (time.perf_counter() - stage_started) * 1000.0
+        stage_started = time.perf_counter()
         grasps, confidences = self._run_batched_inference(
-            _GS,
+            grasp_server_cls,
             object_pc_inference,
             grasp_threshold=grasp_threshold,
             num_grasps=num_grasps,
@@ -1144,6 +1718,8 @@ class GraspGenWrapper:
             min_grasps=min_grasps,
             max_tries=max_tries,
         )
+        diag.model_inference_ms = (time.perf_counter() - stage_started) * 1000.0
+        postprocess_started = time.perf_counter()
 
         diag.raw_grasp_count = len(grasps)
 
@@ -1162,6 +1738,9 @@ class GraspGenWrapper:
         grasps_np[:, 3, 3] = 1.0
 
         if enable_collision_filter and scene_pc is not None and len(scene_pc) > 0:
+            self._ensure_collision_geometry()
+            from grasp_gen.utils.point_cloud_utils import filter_colliding_grasps
+
             pc_mean = scene_pc.mean(axis=0)
             scene_centered = scene_pc - pc_mean
             grasps_centered = grasps_np.copy()
@@ -1414,6 +1993,16 @@ class GraspGenWrapper:
             )
 
         results.sort(key=lambda g: g.confidence, reverse=True)
+        diag.grasp_postprocess_ms = (time.perf_counter() - postprocess_started) * 1000.0
+        diag.plan_total_ms = (time.perf_counter() - plan_started) * 1000.0
+        logger.info(
+            "GraspGen plan stages_ms: point_cloud=%.1f outlier=%.1f model=%.1f postprocess=%.1f total=%.1f",
+            diag.point_cloud_preprocess_ms,
+            diag.outlier_removal_ms,
+            diag.model_inference_ms,
+            diag.grasp_postprocess_ms,
+            diag.plan_total_ms,
+        )
         return results, diag
 
     def _run_batched_inference(
@@ -1427,6 +2016,24 @@ class GraspGenWrapper:
         min_grasps: int,
         max_tries: int,
     ):
+        if self.inference_backend == "remote_310p":
+            poses, confidence, _ = self._remote_client.sample(
+                object_pc,
+                grasp_threshold=grasp_threshold,
+                num_grasps=num_grasps,
+                topk_num_grasps=topk_num_grasps,
+            )
+            return torch.from_numpy(poses), torch.from_numpy(confidence)
+
+        if self.inference_backend == "ascend_local":
+            poses, confidence, _ = self._ascend_local_client.sample(
+                object_pc,
+                grasp_threshold=grasp_threshold,
+                num_grasps=num_grasps,
+                topk_num_grasps=topk_num_grasps,
+            )
+            return torch.from_numpy(poses), torch.from_numpy(confidence)
+
         batches = _graspgen_inference_batches(num_grasps, _DEFAULT_MAX_INFERENCE_GRASPS_PER_BATCH)
         if len(batches) > 1:
             logger.info(
@@ -1468,7 +2075,7 @@ class GraspGenWrapper:
             )
 
         if not all_grasps:
-            return torch.tensor([], device="cuda"), torch.tensor([], device="cuda")
+            return torch.tensor([], device=self.device), torch.tensor([], device=self.device)
 
         grasps = torch.cat(all_grasps, dim=0)
         confidences = torch.cat(all_confidences, dim=0)
@@ -1481,6 +2088,21 @@ class GraspGenWrapper:
     @property
     def gripper_name(self) -> str:
         return self._gripper_name
+
+    def warmup(self) -> bool:
+        """Run one deterministic Ascend inference to initialize lazy runtime state."""
+        if self.inference_backend != "ascend_local":
+            return False
+        assert self._ascend_local_client is not None
+        rng = np.random.default_rng(0)
+        point_count = max(20, int(self._inference_point_count))
+        object_pc = rng.uniform(
+            low=(-0.03, -0.02, 0.35),
+            high=(0.03, 0.02, 0.40),
+            size=(point_count, 3),
+        ).astype(np.float32)
+        self._ascend_local_client.warmup(object_pc)
+        return True
 
     @property
     def collision_gripper_name(self) -> str:
@@ -1495,6 +2117,7 @@ class GraspGenWrapper:
         pregrasp_distance: float,
         pregrasp_steps: int,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        self._ensure_collision_geometry()
         verts_local = self._collision_vertices
         tabletop_mask = np.ones(len(grasps), dtype=bool)
         min_clearances = np.full(len(grasps), np.inf, dtype=np.float64)

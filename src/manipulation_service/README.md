@@ -16,9 +16,10 @@
   `/so101_follower/joint_currents` 和腕部深度图，提供 `~/verify_grasp` 服务，
   融合夹爪残余开度、夹爪电流和腕部 RealSense 可见性判断抓取是否成功。腕部相机抓后可能因
   夹爪/手腕自遮挡、目标离开视野、深度缺失、反光或 lift 后视角变化而不可靠；此时视觉结果
-  只作为诊断/弱证据，不会单独判失败。
-- `test_graspgen.py`：离线 GraspGen 调试脚本。读取 `grounded_sam2_snapshot`
-  生成的数据目录，直接运行 GraspGen，并保存 PLY、JSON 和可选 Open3D 视图。
+  只作为诊断/弱证据，不会单独判失败。深度订阅回调只保留最新消息；全帧有效率、近距比例和
+  中位深度在 `VerifyGrasp` 请求时计算，避免空闲期间持续扫描 30 Hz 深度图。
+- `test_graspgen.py`：离线 GraspGen 调试脚本。读取已有 RGB-D/mask fixture 目录，直接运行
+  GraspGen，并保存 PLY、JSON 和可选 Open3D 视图。
 
 ROS 接口：
 
@@ -30,7 +31,7 @@ ROS 接口：
   时间查询 TF，不能用推理完成后的 latest transform。
 - 话题：`ibrobot_msgs/msg/GraspCandidateArray`
 - 单个抓取结果：`ibrobot_msgs/msg/GraspCandidate`
-- 感知依赖：`ibrobot_msgs/srv/DetectSegment`
+- 感知依赖：`ibrobot_msgs/srv/GroundingDetect`，可选串联 `ibrobot_msgs/srv/SegmentDetections`
 
 `GraspCandidate` 只包含机器人无关的抓取候选信息。除了 GraspGen 位姿、置信度和碰撞标记，
 节点还会基于分割目标点云估算每个候选沿源夹爪闭合轴方向的 `target_width_m`、
@@ -42,7 +43,8 @@ ROS 接口：
 
 - 对齐深度：`/camera/wrist/aligned_depth_to_color/image_raw`
 - CameraInfo：`/camera/wrist/aligned_depth_to_color/camera_info`
-- 检测服务：`/grounded_sam2/detect_and_segment`
+- 检测服务：`/perception/grasp/grounding_detect`
+- 分割服务（310P）：`/perception/grasp/segment_detections`
 
 RealSense 顶置相机调试时常用的话题为：
 
@@ -65,7 +67,7 @@ RealSense 顶置相机调试时常用的话题为：
 所有 ROS 调试命令都应在仓库根目录运行，并在同一条命令里完成环境初始化：
 
 ```bash
-source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && <ros2 command>
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ros2 service list
 ```
 
 修改代码或首次运行前，先构建接口和本包：
@@ -78,7 +80,7 @@ source .shrc_local && colcon build --symlink-install --merge-install --packages-
 
 ### 1. 单独运行在线 GraspGen 抓取节点
 
-运行前需先启动相机和 `perception_service` 的 `grounded_sam2_node`。默认使用
+运行前需先通过 robot-config 启动相机和抓取所选的 generic model service。默认使用
 SO101 wrist camera 话题：
 
 ```bash
@@ -133,7 +135,7 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 
 请求字段：
 
-- `text_prompt`：目标名称，会转发给 `DetectSegment`，例如 `banana`。
+- `text_prompt`：目标名称，会转发给 `GroundingDetect`，例如 `banana`。
 - `confidence_threshold`：感知检测阈值；大于 `0` 时覆盖 perception 节点默认值。
 - `grasp_threshold`：GraspGen discriminator 置信度阈值；大于 `0` 时覆盖节点参数。
 - `debug_output_mode`：单次请求调试输出模式。空字符串或 `default` 沿用节点
@@ -154,16 +156,16 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 
 `manipulation_service` 返回的是机器人无关的 GraspGen 候选，排序主要来自 GraspGen
 置信度和几何过滤结果。目标机器人专用的目标夹爪宽度补偿、IK/workspace 过滤和
-接触点重对齐属于执行层后处理，当前由
-`scripts/test_banana_handeye_pick.py` 完成。该脚本从
+接触点重对齐属于执行层后处理，统一由
+`manipulation_execution/pick_executor_node` 完成。正式 executor 从
 `robot_config.robot.grasp_execution` 读取服务名称、超时、速度、规划阈值、候选过滤、IK、接触补偿、
-接触重对齐、位姿诊断、目标夹爪几何和执行评分等默认参数；显式 CLI 参数仍优先。因此 GraspGen
+接触重对齐、位姿诊断、目标夹爪几何和执行评分；监督式客户端不能覆盖这些行为参数。因此 GraspGen
 不需要绑定 SO101，新增机器人可在自己的 robot_config 中定义完整执行策略。
 
 SO101 执行侧 tabletop sweep 优先使用 `PlanGrasp.execution_table_plane_*`。该平面由服务端直接基于
 completed scene cloud 按执行侧历史采样规则拟合，因此正常运行不再依赖 `scene_cloud.ply`，也不会为了
-tabletop filter 强制提升到 `debug_output_mode=full`。显式 full-debug 请求仍会写 PLY；新平面不可用时，
-`scripts/test_banana_handeye_pick.py` 会尝试旧 PLY 路径，最终无法获得 clearance 时仍 fail closed。
+tabletop filter 强制提升到 `debug_output_mode=full`。显式 full-debug 请求仍会写 PLY；execution plane
+不可用时，正式 executor 的目标夹爪 tabletop 门禁 fail closed。
 
 常见 `diagnostic_details` 字段：
 
@@ -235,8 +237,8 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 - `evidence`：稳定的 `key: value` 诊断行，包括夹爪开度、电流、腕部深度有效比例和遮挡状态。
 
 **触发方式与边界**：`verify_grasp` 是被动 ROS 2 服务，仍需调用方主动触发。
-`test_banana_handeye_pick.py` 默认使用 `--grasp-verification required`，会在 close、低速 3 cm
-probe lift 和最终 lift 后自动调用；`task_executor`、`action_dispatch` 尚未集成 verify client。
+`manipulation_execution/pick_executor_node` 会按 `robot.grasp_execution.verification` 策略在 close、低速
+probe lift 和最终 lift 后自动调用；监督式测试和 Hermes 通过同一个 `PickObject` action 进入该路径。
 每次调用独立采样当前传感器状态，不追踪抓取历史。
 
 当前版本只做后验状态融合，不做外部 RGBD 目标跟踪。返回 `UNCERTAIN` 时，required 策略会保守停止；
@@ -259,7 +261,9 @@ probe lift 和最终 lift 后自动调用；`task_executor`、`action_dispatch` 
 - `model_dir`：GraspGen 模型根目录；空字符串表示使用默认模型目录。
 - `depth_topic`：对齐深度图输入。
 - `camera_info_topic`：与深度/RGB 对应的相机内参。
-- `detect_service`：目标检测分割服务，默认 `/grounded_sam2/detect_and_segment`。
+- `detect_service`：目标检测服务，默认 `/perception/grounding_detect`。
+- `segment_service`：可选分割服务。为空时使用 `GroundingDetect` 内联返回的 mask；配置 endpoint 时始终
+  把检测 bbox 传给 `SegmentDetections`。
 - `depth_scale`：整数深度转米比例，默认 `1000.0`；浮点深度会自动按米处理。
 
 抓取生成：
@@ -430,22 +434,25 @@ PNG/HTML 渲染在后台 daemon thread 中执行；service response 不等待图
 
 ## 调试 test_graspgen.py
 
-`test_graspgen.py` 不依赖 ROS service。它读取 `grounded_sam2_snapshot` 生成的
-`result.json`、mask、深度和 CameraInfo，直接运行 GraspGen，适合单独验证 GraspGen
+`test_graspgen.py` 不依赖 ROS service。它读取已有 fixture 中的 `result.json`、mask、深度和
+CameraInfo，直接运行 GraspGen，适合单独验证 GraspGen
 模型、过滤器和可视化。
 
 基础命令：
 
 ```bash
-source .shrc_local && python3 src/manipulation_service/test_graspgen.py \
-  --data-dir outputs/grounded_sam2/<timestamp>_banana
+fixture_dir="outputs/grounded_sam2/REPLACE_WITH_EXISTING_FIXTURE"
+test -d "$fixture_dir" && source .shrc_local && \
+  python3 src/manipulation_service/test_graspgen.py --data-dir "$fixture_dir"
 ```
 
 显示交互式 Open3D 视图和分数标签：
 
 ```bash
-source .shrc_local && python3 src/manipulation_service/test_graspgen.py \
-  --data-dir outputs/grounded_sam2/<timestamp>_banana \
+fixture_dir="outputs/grounded_sam2/REPLACE_WITH_EXISTING_FIXTURE"
+test -d "$fixture_dir" && source .shrc_local && \
+  python3 src/manipulation_service/test_graspgen.py \
+  --data-dir "$fixture_dir" \
   --show \
   --show-scores
 ```
@@ -453,15 +460,17 @@ source .shrc_local && python3 src/manipulation_service/test_graspgen.py \
 只验证 GraspGen 候选生成，临时关闭桌面过滤：
 
 ```bash
-source .shrc_local && python3 src/manipulation_service/test_graspgen.py \
-  --data-dir outputs/grounded_sam2/<timestamp>_banana \
+fixture_dir="outputs/grounded_sam2/REPLACE_WITH_EXISTING_FIXTURE"
+test -d "$fixture_dir" && source .shrc_local && \
+  python3 src/manipulation_service/test_graspgen.py \
+  --data-dir "$fixture_dir" \
   --no-enable-tabletop-filter \
   --no-require-tabletop-filter
 ```
 
 常用参数：
 
-- `--data-dir`：`grounded_sam2_snapshot` 输出目录。
+- `--data-dir`：已有 RGB-D/mask fixture 目录；历史 `outputs/grounded_sam2/...` 数据仍可直接 replay。
 - `--show`：打开 Open3D 交互式 3D 视图；无桌面环境时不要加。
 - `--show-scores`：在可视化中显示 confidence 标签。
 - `--show-scene`：显示完整 scene 点云；默认只显示目标点云，更清晰。
@@ -500,35 +509,35 @@ source .shrc_local && python3 src/manipulation_service/test_graspgen.py \
 - `grasp_lines.ply`：top grasp 的夹爪线框。
 - `grasp_preview.png`：离线预览截图。
 
-注意：离线预览中的编号仍是 GraspGen 服务返回顺序，不包含 SO101 执行脚本里的
+注意：离线预览中的编号仍是 GraspGen 服务返回顺序，不包含 SO101 正式执行层的
 接触点质心重排、动态宽度补偿或 IK/workspace 过滤结果。若要确认最终会抓哪个候选，
-以 `scripts/test_banana_handeye_pick.py --detect-only` 输出的 `GRASPGEN_RANK` 和
-`GRASPGEN_CANDIDATE_ACCEPT` 日志为准。
+使用 `pick_action_client --mode plan_only`，以 `PickObject.Result.candidate_index` 和
+`prepared_candidate_ranking.json` 为准。
 
 ## 常见调试路径
 
 ### 只调 perception，不调 GraspGen
 
-在 `perception_service` 中运行 `grounded_sam2_node` 和 `grounded_sam2_snapshot`，
-确认 `overlay.png`、mask 和点云正确后，再进入本包调 GraspGen。
+分别调用配置的 `GroundingDetect` 和可选 `SegmentDetections` endpoint，确认 bbox、mask 和 model
+runtime info 正确后，再进入本包调 GraspGen。
 
 ### 只调 GraspGen，不启动 ROS service
 
-使用已有 `grounded_sam2_snapshot` 输出目录运行 `test_graspgen.py`。这样可以排除
+使用已有 RGB-D/mask fixture 目录运行 `test_graspgen.py`。这样可以排除
 ROS topic 同步、service timeout 和在线 perception 的影响。
 
 ### 调完整在线链路
 
 1. 启动相机。
-2. 启动 `perception_service` 的 `grounded_sam2_node`。
+2. 由 robot-config 启动抓取所需的 generic model service。
 3. 启动 `grasp_planner_node`，建议先开启 `save_debug_outputs`。
 4. 调用 `/grasp_planner/plan_grasp`。
 5. 查看输出目录中的 `grasp_preview_labeled.png` 和 `grasp_preview.html`。
 
 ## 排障
 
-- `DetectSegment service not available`：perception 节点未启动，或 `detect_service`
-  参数不对。
+- `GroundingDetect service not available`：检测 model service 未启动，或 `detect_service` 参数不对。
+- `segment_service_unavailable`：配置了独立分割 endpoint，但对应 `SegmentDetections` model service 未就绪。
 - `No synchronized depth/CameraInfo`：mask 时间戳与深度/内参差距超过
   `sync_max_age_sec`，检查相机话题和时间戳。
 - `No grasps generated`：先查看 `diagnostic_details` 或 `grasp_result.json` 中的

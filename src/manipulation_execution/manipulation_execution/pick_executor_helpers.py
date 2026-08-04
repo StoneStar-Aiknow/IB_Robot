@@ -13,7 +13,7 @@ from sensor_msgs.msg import JointState
 from ibrobot_msgs.action import PickObject
 from manipulation_execution.grasp_geometry import quaternion_from_matrix, quaternion_matrix, transform_matrix
 from manipulation_execution.pick_executor_models import BaseSceneGeometry, FlowState, PlannerSceneGeometry
-from manipulation_execution.so101_geometry import transform_point, transform_table_plane
+from manipulation_execution.so101_geometry import orient_table_plane_upward, transform_point, transform_table_plane
 
 
 class PickExecutorHelpers:
@@ -115,11 +115,13 @@ class PickExecutorHelpers:
     def _scene_geometry_base(base_to_camera: np.ndarray, scene: PlannerSceneGeometry) -> BaseSceneGeometry:
         table_plane = None
         if scene.table_normal_camera is not None:
-            table_plane = transform_table_plane(
-                base_to_camera,
-                scene.table_normal_camera,
-                scene.table_offset_camera,
-                inlier_ratio=scene.table_inlier_ratio,
+            table_plane = orient_table_plane_upward(
+                transform_table_plane(
+                    base_to_camera,
+                    scene.table_normal_camera,
+                    scene.table_offset_camera,
+                    inlier_ratio=scene.table_inlier_ratio,
+                )
             )
         object_top_base = None
         if scene.object_top_camera is not None:
@@ -150,10 +152,14 @@ class PickExecutorHelpers:
 
     @staticmethod
     def _result_from_state(state: FlowState) -> PickObject.Result:
+        state.finish_active_phase()
         result = PickObject.Result()
         result.attempts = int(state.attempt)
         result.verification_status = int(state.verification_status)
         result.verification_confidence = float(state.verification_confidence)
         result.debug_output_dir = state.debug_output_dir
         result.completed_phases = list(state.completed_phases)
+        result.candidate_index = int(state.candidate_index)
+        result.released_after_success = bool(state.released_after_success)
+        result.pipeline_timings_json = json.dumps(state.pipeline_timings, sort_keys=True)
         return result

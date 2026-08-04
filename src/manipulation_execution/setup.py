@@ -18,6 +18,7 @@ setup(
     license="Apache-2.0",
     entry_points={
         "console_scripts": [
+            "pick_action_client = manipulation_execution.pick_action_client:main",
             "pick_executor_node = manipulation_execution.pick_executor_node:main",
         ],
     },

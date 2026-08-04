@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -314,6 +315,56 @@ class ExecutionPhase:
         )
         return payload
 
+    def _move_and_verify_retention(
+        self,
+        goal_handle,
+        deadline: float,
+        state: FlowState,
+        task_id: str,
+        target_query: str,
+        prepared: PreparedCandidate,
+        *,
+        phase: str,
+        feedback_phase: str,
+        feedback_detail: str,
+        xyz: tuple[float, float, float],
+        quaternion: tuple[float, float, float, float],
+        velocity_scaling: float,
+        seed: JointState | None,
+        validate_orientation: bool = True,
+    ) -> IKPayload:
+        self._publish_feedback(goal_handle, state, feedback_phase, feedback_detail)
+        try:
+            payload = self._move_branch_locked_pose(
+                goal_handle,
+                deadline,
+                task_id,
+                xyz,
+                quaternion,
+                velocity_scaling,
+                seed,
+                validate_orientation=validate_orientation,
+            )
+            self._verify(
+                goal_handle,
+                deadline,
+                state,
+                f"verify_{phase}",
+                task_id,
+                target_query,
+                prepared.ranked.index,
+                prepared.ranked.candidate,
+            )
+        except PickFlowError:
+            if bool(self._config.get("recover_after_retention_failure", True)):
+                recovery_started = time.monotonic()
+                try:
+                    self._recover_after_retention_failure(goal_handle, deadline, task_id)
+                finally:
+                    state.add_timing("subphase_recovery", time.monotonic() - recovery_started)
+            raise
+        return payload
+
     def _realign_contact(
         self,
         goal_handle,
@@ -397,6 +448,62 @@ class ExecutionPhase:
             prepared.plan.grasp[2] + dz,
         )
 
+    def _release_verified_pick(
+        self,
+        goal_handle,
+        deadline: float,
+        state: FlowState,
+        task_id: str,
+        prepared: PreparedCandidate,
+        active_joint_state: JointState,
+        release_drop_height_m: float,
+    ) -> None:
+        """Release a verified target without creating a second execution path in test tooling."""
+
+        plan = prepared.plan
+        release_xyz = plan.lift
+        if release_drop_height_m >= 0.0:
+            release_xyz = (
+                plan.lift[0],
+                plan.lift[1],
+                min(plan.lift[2], plan.grasp[2] + release_drop_height_m),
+            )
+        if math.dist(release_xyz, plan.lift) > 1e-6:
+            self._publish_feedback(goal_handle, state, "release", "descending to post-success release height")
+            release_payload = self._move_branch_locked_pose(
+                goal_handle,
+                deadline,
+                task_id,
+                release_xyz,
+                plan.quaternion,
+                float(
+                    self._config.get(
+                        "release_velocity_scaling",
+                        self._config.get("lift_velocity_scaling", 0.05),
+                    )
+                ),
+                active_joint_state,
+                validate_orientation=False,
+            )
+            active_joint_state = release_payload.joint_state
+        self._publish_feedback(goal_handle, state, "release", "opening gripper after verified pick")
+        self._run_primitive(
+            goal_handle,
+            deadline,
+            task_id,
+            "open_gripper",
+            gripper_position=self._gripper_open,
+        )
+        self._sleep_with_cancel(
+            goal_handle,
+            deadline,
+            float(self._config.get("release_settle_sec", self._config.get("open_settle_sec", 0.3))),
+        )
+        state.released_after_success = True
+        self.get_logger().info(
+            f"post-success release completed: candidate={prepared.ranked.index} release_xyz={release_xyz}"
+        )
+
     def _execute_candidate(
         self,
         goal_handle,
@@ -406,6 +513,9 @@ class ExecutionPhase:
         target_query: str,
         prepared: PreparedCandidate,
         scene_base: BaseSceneGeometry,
+        *,
+        release_after_success: bool = False,
+        release_drop_height_m: float = -1.0,
     ) -> None:
         prepared = self._prepare_candidate(
             prepared.ranked,
@@ -439,17 +549,21 @@ class ExecutionPhase:
         )
         active_joint_state = approach_payload.joint_state
 
-        aligned_approach, active_joint_state = self._realign_contact(
-            goal_handle,
-            deadline,
-            task_id,
-            "approach",
-            plan.approach,
-            plan.quaternion,
-            plan.target_contact_ee,
-            float(self._config.get("approach_velocity_scaling", 0.05)),
-            active_joint_state,
-        )
+        realign_started = time.monotonic()
+        try:
+            aligned_approach, active_joint_state = self._realign_contact(
+                goal_handle,
+                deadline,
+                task_id,
+                "approach",
+                plan.approach,
+                plan.quaternion,
+                plan.target_contact_ee,
+                float(self._config.get("approach_velocity_scaling", 0.05)),
+                active_joint_state,
+            )
+        finally:
+            state.add_timing("subphase_contact_realign", time.monotonic() - realign_started)
         self._record_pose_diagnostic(
             goal_handle,
             deadline,
@@ -459,7 +573,6 @@ class ExecutionPhase:
             plan.quaternion,
             plan.target_contact_ee,
         )
-
         pregrasp = self._pregrasp_pose(prepared, scene_base)
         self._publish_feedback(goal_handle, state, "pregrasp", "moving to safe target-relative pregrasp")
         pregrasp_payload = self._move_branch_locked_pose(
@@ -472,17 +585,21 @@ class ExecutionPhase:
             active_joint_state,
         )
         active_joint_state = pregrasp_payload.joint_state
-        aligned_pregrasp, active_joint_state = self._realign_contact(
-            goal_handle,
-            deadline,
-            task_id,
-            "pregrasp",
-            pregrasp,
-            plan.quaternion,
-            plan.target_contact_ee,
-            float(self._config.get("descend_velocity_scaling", 0.03)),
-            active_joint_state,
-        )
+        realign_started = time.monotonic()
+        try:
+            aligned_pregrasp, active_joint_state = self._realign_contact(
+                goal_handle,
+                deadline,
+                task_id,
+                "pregrasp",
+                pregrasp,
+                plan.quaternion,
+                plan.target_contact_ee,
+                float(self._config.get("descend_velocity_scaling", 0.03)),
+                active_joint_state,
+            )
+        finally:
+            state.add_timing("subphase_contact_realign", time.monotonic() - realign_started)
         self._record_pose_diagnostic(
             goal_handle,
             deadline,
@@ -506,6 +623,7 @@ class ExecutionPhase:
             goal_handle,
             deadline,
             apply_compensation=True,
+            enforce_fixed_finger_robust_gap=False,
             initial_seed=active_joint_state,
         )
         plan = prepared.plan
@@ -521,6 +639,15 @@ class ExecutionPhase:
             velocity_scaling=float(self._config.get("descend_velocity_scaling", 0.03)),
             duration_sec=float(self._config.get("descend_duration_sec", 2.0)),
         )
+        self._publish_feedback(goal_handle, state, "close", "closing gripper on target")
+        self._run_primitive(
+            goal_handle,
+            deadline,
+            task_id,
+            "close_gripper",
+            gripper_position=self._gripper_closed,
+        )
+
         self.get_logger().info(
             f"grasp prediction candidate={prepared.ranked.index} commanded_xyz={plan.grasp} "
             f"predicted_xyz={prepared.actual_ee_xyz} "
@@ -528,41 +655,57 @@ class ExecutionPhase:
             f"contact_xy_residual_m={prepared.contact_residual_xy_m:.4f} "
             f"contact_z_error_m={prepared.contact_z_error_m:.4f}"
         )
-        grasp_measurement = self._record_pose_diagnostic(
-            goal_handle,
-            deadline,
-            state,
-            "grasp",
-            prepared.actual_ee_xyz,
-            prepared.actual_ee_quaternion,
-            plan.target_contact_ee,
-            planned_contact=plan.target_contact_base,
-        )
+        try:
+            grasp_measurement = self._record_pose_diagnostic(
+                goal_handle,
+                deadline,
+                state,
+                "grasp",
+                prepared.actual_ee_xyz,
+                prepared.actual_ee_quaternion,
+                plan.target_contact_ee,
+                planned_contact=plan.target_contact_base,
+            )
+        except Exception as exc:
+            grasp_measurement = None
+            self.get_logger().warning(f"post-close grasp pose diagnostic failed; continuing verification: {exc}")
         target_gripper = self._config.get("target_gripper", {})
         robust_gap_config = target_gripper.get("fixed_finger_robust_gap", {})
         if bool(robust_gap_config.get("enabled", False)):
             robust_gap = None
             if prepared.fixed_finger_envelope is not None and grasp_measurement is not None:
                 contact_residual, actual_quaternion = grasp_measurement
-                robust_gap = fixed_finger_robust_gap(
-                    prepared.fixed_finger_envelope.fixed_gap_m,
-                    prepared.fixed_finger_envelope.target_gap_m,
-                    contact_residual,
-                    actual_quaternion,
-                    target_gripper.get("closing_axis_ee", [1.0, 0.0, 0.0]),
-                    max_target_gap_deficit_m=float(robust_gap_config.get("max_target_gap_deficit_m", 0.003)),
-                )
+                try:
+                    robust_gap = fixed_finger_robust_gap(
+                        prepared.fixed_finger_envelope.fixed_gap_m,
+                        prepared.fixed_finger_envelope.target_gap_m,
+                        contact_residual,
+                        actual_quaternion,
+                        target_gripper.get("closing_axis_ee", [1.0, 0.0, 0.0]),
+                        max_target_gap_deficit_m=float(robust_gap_config.get("max_target_gap_deficit_m", 0.003)),
+                        measurement_tolerance_m=float(robust_gap_config.get("measurement_tolerance_m", 0.0)),
+                    )
+                except Exception as exc:
+                    self.get_logger().warning(
+                        f"post-close fixed-finger robust gap diagnostic failed; continuing verification: {exc}"
+                    )
             if robust_gap is not None and state.pose_diagnostics:
                 state.pose_diagnostics[-1].update(
                     {
                         "fixed_finger_contact_error_m": robust_gap.contact_error_along_closing_axis_m,
                         "fixed_finger_effective_gap_m": robust_gap.effective_gap_m,
                         "fixed_finger_required_gap_m": robust_gap.required_gap_m,
+                        "fixed_finger_gap_deficit_m": robust_gap.gap_deficit_m,
+                        "fixed_finger_measurement_tolerance_m": robust_gap.measurement_tolerance_m,
                         "fixed_finger_robust_gap_passed": robust_gap.passed,
                         "action": (
-                            "continue_fixed_finger_robust_gap_passed"
-                            if robust_gap.passed
-                            else "retreat_fixed_finger_robust_gap_rejected"
+                            "close_fixed_finger_robust_gap_within_measurement_tolerance"
+                            if robust_gap.passed and robust_gap.gap_deficit_m > 1e-9
+                            else (
+                                "close_fixed_finger_robust_gap_passed"
+                                if robust_gap.passed
+                                else "post_close_robust_gap_diagnostic_failed"
+                            )
                         ),
                     }
                 )
@@ -572,38 +715,28 @@ class ExecutionPhase:
                         output_path.write_text(json.dumps(state.pose_diagnostics, indent=2) + "\n", encoding="utf-8")
                     except OSError as exc:
                         self.get_logger().warning(f"failed to write {output_path}: {exc}")
-            if robust_gap is None or not robust_gap.passed:
-                self._run_primitive(
-                    goal_handle,
-                    deadline,
-                    task_id,
-                    "move_to_pose",
-                    pose=self._pose(aligned_pregrasp, plan.quaternion),
-                    velocity_scaling=float(self._config.get("descend_velocity_scaling", 0.03)),
+            if robust_gap is not None and robust_gap.passed and robust_gap.gap_deficit_m > 1e-9:
+                self.get_logger().info(
+                    f"fixed-finger robust gap accepted within measurement tolerance: "
+                    f"candidate={prepared.ranked.index} deficit={robust_gap.gap_deficit_m:.4f}m "
+                    f"tolerance={robust_gap.measurement_tolerance_m:.4f}m"
                 )
-                detail = (
-                    "measurement unavailable"
-                    if robust_gap is None
-                    else (
-                        f"effective_gap={robust_gap.effective_gap_m:.4f}m "
-                        f"required_gap={robust_gap.required_gap_m:.4f}m "
-                        f"closing_axis_error={robust_gap.contact_error_along_closing_axis_m:.4f}m"
-                    )
+            if robust_gap is None:
+                self.get_logger().warning(
+                    f"post-close fixed-finger robust gap measurement unavailable for "
+                    f"candidate={prepared.ranked.index}; gripper already closed by commit-to-grasp policy, "
+                    f"continuing verification"
                 )
-                raise PickFlowError(
-                    "FIXED_FINGER_ROBUST_GAP_REJECTED",
-                    f"candidate {prepared.ranked.index}: {detail}",
-                    retryable=True,
+            elif not robust_gap.passed:
+                self.get_logger().warning(
+                    f"post-close fixed-finger robust gap diagnostic failed for candidate={prepared.ranked.index}: "
+                    f"effective_gap={robust_gap.effective_gap_m:.4f}m "
+                    f"required_gap={robust_gap.required_gap_m:.4f}m "
+                    f"gap_deficit={robust_gap.gap_deficit_m:.4f}m "
+                    f"measurement_tolerance={robust_gap.measurement_tolerance_m:.4f}m; "
+                    f"gripper already closed by commit-to-grasp policy, continuing verification"
                 )
 
-        self._publish_feedback(goal_handle, state, "close", "closing gripper on target")
-        self._run_primitive(
-            goal_handle,
-            deadline,
-            task_id,
-            "close_gripper",
-            gripper_position=self._gripper_closed,
-        )
         self._sleep_with_cancel(goal_handle, deadline, float(self._config.get("hold_sec", 0.8)))
 
         try:
@@ -629,39 +762,33 @@ class ExecutionPhase:
             )
         except PickFlowError:
             if bool(self._config.get("recover_after_close_failure", True)):
-                self._recover_after_close_failure(goal_handle, deadline, task_id, prepared, aligned_pregrasp)
+                recovery_started = time.monotonic()
+                try:
+                    self._recover_after_close_failure(goal_handle, deadline, task_id, prepared, aligned_pregrasp)
+                finally:
+                    state.add_timing("subphase_recovery", time.monotonic() - recovery_started)
             raise
 
         probe_height = max(0.0, float(self._config.get("probe_lift_height_m", 0.03)))
         if probe_height > 0.0 and plan.lift[2] > plan.grasp[2] + 1e-6:
             probe_xyz = (plan.lift[0], plan.lift[1], min(plan.lift[2], plan.grasp[2] + probe_height))
             if probe_xyz[2] < plan.lift[2] - 1e-6:
-                self._publish_feedback(goal_handle, state, "probe_lift", "performing slow retention-check lift")
-                probe_payload = self._move_branch_locked_pose(
+                probe_payload = self._move_and_verify_retention(
                     goal_handle,
                     deadline,
+                    state,
                     task_id,
-                    probe_xyz,
-                    plan.quaternion,
-                    float(self._config.get("probe_lift_velocity_scaling", 0.02)),
-                    active_joint_state,
+                    target_query,
+                    prepared,
+                    phase="probe",
+                    feedback_phase="probe_lift",
+                    feedback_detail="performing slow retention-check lift",
+                    xyz=probe_xyz,
+                    quaternion=plan.quaternion,
+                    velocity_scaling=float(self._config.get("probe_lift_velocity_scaling", 0.02)),
+                    seed=active_joint_state,
                 )
                 active_joint_state = probe_payload.joint_state
-                try:
-                    self._verify(
-                        goal_handle,
-                        deadline,
-                        state,
-                        "verify_probe",
-                        task_id,
-                        target_query,
-                        prepared.ranked.index,
-                        candidate,
-                    )
-                except PickFlowError:
-                    if bool(self._config.get("recover_after_retention_failure", True)):
-                        self._recover_after_retention_failure(goal_handle, deadline, task_id)
-                    raise
                 self._record_pose_diagnostic(
                     goal_handle,
                     deadline,
@@ -672,32 +799,23 @@ class ExecutionPhase:
                     plan.target_contact_ee,
                 )
 
-        self._publish_feedback(goal_handle, state, "lift", "lifting verified target")
-        self._move_branch_locked_pose(
+        lift_payload = self._move_and_verify_retention(
             goal_handle,
             deadline,
+            state,
             task_id,
-            plan.lift,
-            plan.quaternion,
-            float(self._config.get("lift_velocity_scaling", 0.05)),
-            active_joint_state,
+            target_query,
+            prepared,
+            phase="lift",
+            feedback_phase="lift",
+            feedback_detail="lifting verified target",
+            xyz=plan.lift,
+            quaternion=plan.quaternion,
+            velocity_scaling=float(self._config.get("lift_velocity_scaling", 0.05)),
+            seed=active_joint_state,
             validate_orientation=False,
         )
-        try:
-            self._verify(
-                goal_handle,
-                deadline,
-                state,
-                "verify_lift",
-                task_id,
-                target_query,
-                prepared.ranked.index,
-                candidate,
-            )
-        except PickFlowError:
-            if bool(self._config.get("recover_after_retention_failure", True)):
-                self._recover_after_retention_failure(goal_handle, deadline, task_id)
-            raise
+        active_joint_state = lift_payload.joint_state
         self._record_pose_diagnostic(
             goal_handle,
             deadline,
@@ -707,3 +825,13 @@ class ExecutionPhase:
             plan.quaternion,
             plan.target_contact_ee,
         )
+        if release_after_success:
+            self._release_verified_pick(
+                goal_handle,
+                deadline,
+                state,
+                task_id,
+                prepared,
+                active_joint_state,
+                release_drop_height_m,
+            )

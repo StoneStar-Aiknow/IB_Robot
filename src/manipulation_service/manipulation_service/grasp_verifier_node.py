@@ -176,19 +176,8 @@ class GraspVerifierNode(Node):
             self._latest_joint_current = TimedSample(received_ns=self._now_ns(), value=msg)
 
     def _wrist_depth_cb(self, msg: Image) -> None:
-        try:
-            stats = _depth_visibility_stats(
-                msg,
-                depth_scale=float(self.get_parameter("depth_scale").value),
-                min_valid_fraction=float(self.get_parameter("wrist_min_valid_depth_fraction").value),
-                near_depth_m=float(self.get_parameter("wrist_near_depth_m").value),
-                max_near_fraction=float(self.get_parameter("wrist_max_near_fraction").value),
-            )
-        except Exception as exc:
-            self.get_logger().debug(f"Skipping wrist depth frame: {exc}")
-            return
         with self._lock:
-            self._latest_wrist_depth = TimedSample(received_ns=self._now_ns(), value=stats)
+            self._latest_wrist_depth = TimedSample(received_ns=self._now_ns(), value=msg)
 
     def _verify_cb(self, request: VerifyGrasp.Request, response: VerifyGrasp.Response):
         wait_s = float(request.post_grasp_wait_s)
@@ -240,7 +229,19 @@ class GraspVerifierNode(Node):
 
         joint_state = self._fresh_value(joint_state_sample, now_ns, max_age_ns)
         current = self._fresh_value(current_sample, now_ns, max_age_ns)
-        wrist_depth = self._fresh_value(wrist_depth_sample, now_ns, max_age_ns)
+        wrist_depth_msg = self._fresh_value(wrist_depth_sample, now_ns, max_age_ns)
+        wrist_depth = None
+        if wrist_depth_msg is not None:
+            try:
+                wrist_depth = _depth_visibility_stats(
+                    wrist_depth_msg,
+                    depth_scale=float(self.get_parameter("depth_scale").value),
+                    min_valid_fraction=float(self.get_parameter("wrist_min_valid_depth_fraction").value),
+                    near_depth_m=float(self.get_parameter("wrist_near_depth_m").value),
+                    max_near_fraction=float(self.get_parameter("wrist_max_near_fraction").value),
+                )
+            except Exception as exc:
+                self.get_logger().debug(f"Skipping wrist depth sample: {exc}")
 
         gripper_joint = str(self.get_parameter("gripper_joint").value).strip()
         gripper_joint_note = ""

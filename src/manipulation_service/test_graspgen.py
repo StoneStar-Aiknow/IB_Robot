@@ -136,7 +136,7 @@ def _resolve_camera_intrinsics(data_dir, fx=None, fy=None, cx=None, cy=None):
     print(
         "[warn] Camera intrinsics not found in result.json; "
         f"using legacy defaults fx/fy/cx/cy={_LEGACY_INTRINSICS}. "
-        "Re-run grounded_sam2_snapshot or pass --fx --fy --cx --cy."
+        "Provide a fixture with camera intrinsics or pass --fx --fy --cx --cy."
     )
     return _LEGACY_INTRINSICS, "legacy-default"
 

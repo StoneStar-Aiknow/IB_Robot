@@ -1,5 +1,8 @@
 from types import SimpleNamespace
 
+import numpy as np
+
+from manipulation_execution.pick_executor_models import PlannerSceneGeometry
 from manipulation_execution.pick_executor_node import PickExecutorNode
 
 
@@ -43,3 +46,20 @@ def test_planning_table_plane_is_used_as_fallback():
     assert normal == (0.0, 1.0, 0.0)
     assert offset == -0.3
     assert inlier_ratio == 0.6
+
+
+def test_scene_table_plane_is_oriented_toward_base_up():
+    base_to_camera = np.eye(4, dtype=np.float64)
+    base_to_camera[:3, :3] = np.diag((1.0, -1.0, -1.0))
+    scene = PlannerSceneGeometry(
+        table_normal_camera=(0.0, 0.0, 1.0),
+        table_offset_camera=-0.2,
+        table_inlier_ratio=0.9,
+    )
+
+    geometry = PickExecutorNode._scene_geometry_base(base_to_camera, scene)
+
+    assert geometry.table_plane is not None
+    assert geometry.table_plane.normal == (0.0, 0.0, 1.0)
+    assert geometry.table_plane.offset == 0.2
+    assert geometry.table_plane.inlier_ratio == 0.9

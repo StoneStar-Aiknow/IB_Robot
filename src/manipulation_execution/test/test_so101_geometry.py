@@ -8,6 +8,7 @@ from manipulation_execution.so101_geometry import (
     axis_error_deg,
     gripper_geometry_metrics_batch,
     gripper_mesh_min_z,
+    orient_table_plane_upward,
     quaternion_error_deg,
     tabletop_clearance,
     transform_point,
@@ -24,6 +25,23 @@ def test_transform_table_plane_preserves_signed_distance():
     target_point = transform_point(transform, source_point)
     signed = np.dot(plane.normal, target_point) + plane.offset
     assert math.isclose(signed, 0.0, abs_tol=1e-9)
+
+
+def test_orient_table_plane_upward_flips_downward_normal_and_offset():
+    plane = TablePlane(normal=(0.1, -0.2, -0.9), offset=-0.4, inlier_ratio=0.75)
+
+    oriented = orient_table_plane_upward(plane)
+
+    assert oriented == TablePlane(normal=(-0.1, 0.2, 0.9), offset=0.4, inlier_ratio=0.75)
+    point_on_plane = np.array((4.0, 0.0, 0.0), dtype=np.float64)
+    assert math.isclose(np.dot(plane.normal, point_on_plane) + plane.offset, 0.0, abs_tol=1e-9)
+    assert math.isclose(np.dot(oriented.normal, point_on_plane) + oriented.offset, 0.0, abs_tol=1e-9)
+
+
+def test_orient_table_plane_upward_leaves_upward_plane_unchanged():
+    plane = TablePlane(normal=(0.1, -0.2, 0.9), offset=-0.4, inlier_ratio=0.75)
+
+    assert orient_table_plane_upward(plane) is plane
 
 
 def test_axis_error_uses_directed_closing_axis():

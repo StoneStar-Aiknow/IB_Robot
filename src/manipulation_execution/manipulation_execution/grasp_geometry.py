@@ -54,7 +54,9 @@ class FixedFingerRobustGap:
     contact_error_along_closing_axis_m: float
     effective_gap_m: float
     required_gap_m: float
+    gap_deficit_m: float
     max_target_gap_deficit_m: float
+    measurement_tolerance_m: float
     passed: bool
 
 
@@ -178,49 +180,6 @@ def grasp_axis_errors(
     return GraspAxisErrors(
         approach_deg=error_deg(approach_axis_ee),
         closing_deg=error_deg(closing_axis_ee, symmetric=closing_axis_180_symmetric),
-    )
-
-
-def canonicalize_joint5(joint5: float) -> float:
-    """Map SO101 joint5 onto the equivalent half-turn branch nearest zero."""
-
-    value = float(joint5)
-    while value > math.pi / 2.0:
-        value -= math.pi
-    while value < -math.pi / 2.0:
-        value += math.pi
-    return value
-
-
-def joint5_closing_axis_correction(
-    target_quaternion: Quaternion,
-    actual_quaternion: Quaternion,
-    approach_axis_ee: Iterable[float],
-    closing_axis_ee: Iterable[float],
-    *,
-    closing_axis_180_symmetric: bool = False,
-) -> float:
-    """Return the signed joint5 correction that aligns the closing axis."""
-
-    target_rotation = quaternion_matrix(target_quaternion)
-    actual_rotation = quaternion_matrix(actual_quaternion)
-    approach_axis = actual_rotation @ _normalized(approach_axis_ee)
-    actual_closing = np.asarray(actual_rotation @ _normalized(closing_axis_ee), dtype=np.float64)
-    target_closing = np.asarray(target_rotation @ _normalized(closing_axis_ee), dtype=np.float64)
-    if closing_axis_180_symmetric and float(np.dot(actual_closing, target_closing)) < 0.0:
-        target_closing *= -1.0
-
-    actual_closing -= approach_axis * float(np.dot(actual_closing, approach_axis))
-    target_closing -= approach_axis * float(np.dot(target_closing, approach_axis))
-    actual_norm = float(np.linalg.norm(actual_closing))
-    target_norm = float(np.linalg.norm(target_closing))
-    if actual_norm <= 1e-9 or target_norm <= 1e-9:
-        raise ValueError("could not project closing axes onto the joint5 rotation plane")
-    actual_closing /= actual_norm
-    target_closing /= target_norm
-    return math.atan2(
-        float(np.dot(approach_axis, np.cross(actual_closing, target_closing))),
-        float(np.dot(actual_closing, target_closing)),
     )
 
 
@@ -401,20 +360,25 @@ def fixed_finger_robust_gap(
     closing_axis_ee: Iterable[float],
     *,
     max_target_gap_deficit_m: float,
+    measurement_tolerance_m: float = 0.0,
 ) -> FixedFingerRobustGap:
     """Apply the measured contact residual to the fixed-finger safety gap."""
 
     closing_axis_base = quaternion_matrix(ee_quaternion) @ _normalized(closing_axis_ee)
     contact_error = float(np.dot(np.asarray(list(contact_residual_base), dtype=np.float64), closing_axis_base))
     maximum_deficit = max(0.0, float(max_target_gap_deficit_m))
+    measurement_tolerance = max(0.0, float(measurement_tolerance_m))
     effective_gap = float(fixed_gap_m) + contact_error
     required_gap = max(0.0, float(target_gap_m) - maximum_deficit)
+    gap_deficit = max(0.0, required_gap - effective_gap)
     return FixedFingerRobustGap(
         contact_error_along_closing_axis_m=contact_error,
         effective_gap_m=effective_gap,
         required_gap_m=required_gap,
+        gap_deficit_m=gap_deficit,
         max_target_gap_deficit_m=maximum_deficit,
-        passed=effective_gap + 1e-9 >= required_gap,
+        measurement_tolerance_m=measurement_tolerance,
+        passed=gap_deficit <= measurement_tolerance + 1e-9,
     )
 
 
@@ -426,6 +390,7 @@ def prepared_candidate_soft_score(
     contact_z_error_m: float,
     confidence: float,
     centroid_distance_m: float | None = None,
+    robust_gap_headroom_m: float | None = None,
 ) -> float:
     def quality(error: float, scale: float) -> float:
         return 1.0 - min(max(abs(float(error)) / max(1e-6, float(scale)), 0.0), 1.0)
@@ -462,6 +427,14 @@ def prepared_candidate_soft_score(
                 max(0.0, float(config.get("centroid_distance_weight", 0.0))),
             )
         )
+    headroom_weight = max(0.0, float(config.get("robust_gap_headroom_weight", 0.0)))
+    if headroom_weight > 0.0:
+        if robust_gap_headroom_m is None or not math.isfinite(float(robust_gap_headroom_m)):
+            headroom_quality = float(config.get("missing_robust_gap_headroom_score", 0.5))
+        else:
+            scale = max(1e-6, float(config.get("robust_gap_headroom_scale_m", 0.004)))
+            headroom_quality = 0.5 + float(robust_gap_headroom_m) / (2.0 * scale)
+        weighted_terms.append((min(max(headroom_quality, 0.0), 1.0), headroom_weight))
     total_weight = sum(weight for _, weight in weighted_terms)
     if total_weight <= 0.0:
         return 0.0

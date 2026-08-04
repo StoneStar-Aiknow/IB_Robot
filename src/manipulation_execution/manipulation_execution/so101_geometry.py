@@ -60,6 +60,19 @@ def transform_table_plane(
     )
 
 
+def orient_table_plane_upward(plane: TablePlane) -> TablePlane:
+    """Canonicalize a table plane so its safe half-space faces base +Z."""
+
+    normal = np.asarray(plane.normal, dtype=np.float64)
+    if float(np.dot(normal, (0.0, 0.0, 1.0))) < 0.0:
+        return TablePlane(
+            normal=tuple(float(value) for value in -normal),
+            offset=-float(plane.offset),
+            inlier_ratio=float(plane.inlier_ratio),
+        )
+    return plane
+
+
 def axis_error_deg(
     planned_quaternion: Quaternion,
     actual_quaternion: Quaternion,
