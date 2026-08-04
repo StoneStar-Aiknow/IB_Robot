@@ -292,7 +292,7 @@ EOF
     # Optional perception and manipulation dependencies are installed after the
     # core dependency set and ABI pins so later setup steps cannot overwrite them.
     if [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
-        log_warn "Skipping optional perception dependencies on openEuler; SAM2/Grounding-DINO are validated on Ubuntu only."
+        log_info "Skipping Torch perception source packages on openEuler; the Ascend OM path uses core dependencies."
     elif [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true ]]; then
         log_info "Installing optional perception dependencies (SAM2, Grounding-DINO)..."
         run_cmd env SAM2_BUILD_CUDA="${SAM2_BUILD_CUDA:-0}" SAM2_BUILD_ALLOW_ERRORS=1 \

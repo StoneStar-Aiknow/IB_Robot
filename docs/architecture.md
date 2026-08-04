@@ -84,96 +84,96 @@
 ### 整体架构图
 
 ```mermaid
-graph TB
-    subgraph "应用层 Application Layer"
-        A1["具身智能体<br/>Embodied Agent"]
-        A2["任务编排<br/>Task Orchestrator"]
-        A3["运动规划<br/>MoveIt 2"]
+flowchart TB
+    subgraph application["应用层 Application"]
+        Hermes["Hermes / Agent"]
+        NaturalLanguage["ASR / VLM / 规则任务"]
+        PolicyRequest["策略推理任务"]
     end
 
-    subgraph "规划与分发层 Planning & Dispatching"
-        N1["SLAM/导航<br/>ledog_slam"]
-        N2["统一动作执行器<br/>action_dispatch"]
+    subgraph orchestration["编排与安全层 Orchestration and Safety"]
+        AgentSkill["ibrobot-control Agent Skill"]
+        CLI["robot-skill"]
+        Gateway["ROS Capability Gateway"]
+        Agent["embodied_agent"]
+        Skill["skill_library"]
+        Safety["safety_guard"]
+        Pick["manipulation_execution"]
+        Motion["task_dispatch / MoveIt gateway"]
+        MoveIt["MoveIt 2 main + IK/FK workers"]
+        Dispatch["action_dispatch"]
     end
 
-    subgraph "推理与研发层 Inference & Development"
-        I1["协议转换枢纽<br/>tensormsg"]
-        I2["多模型推理服务<br/>inference_service"]
-        I3["训练节点<br/>Training Node"]
-        I4["遥操作采集<br/>Teleoperation"]
-        I5["可视化调试<br/>Debug Tools"]
+    subgraph intelligence["感知与推理层 Perception and Inference"]
+        Sensor["相机 / 深度 / joint_states / 电流"]
+        GraspPerception["Grounded-SAM2 / GraspGen / grasp verifier"]
+        Tensor["tensormsg"]
+        Inference["inference_service"]
     end
 
-    subgraph "感知层 Perception"
-        S1["多模态采集<br/>Data Collection"]
-        S2["空间语义感知<br/>Spatial Perception"]
+    subgraph control["控制与执行层 Control and Execution"]
+        Controller["ros2_control"]
+        Hardware["so101_hardware"]
+        Simulation["Gazebo / Ignition"]
     end
 
-    subgraph "验证层 Validation"
-        V1["配置与校准验证<br/>Configuration Check"]
+    subgraph global["全局契约 Global Contracts"]
+        Config["robot_config<br/>SSOT"]
+        Interfaces["ibrobot_msgs"]
+        Description["robot_description"]
     end
 
-    subgraph "控制层 Control"
-        C1["控制框架<br/>ros2_control"]
-        C2["硬件接口<br/>so101_hardware"]
-        C3["模型描述<br/>robot_description"]
-    end
+    Hermes --> AgentSkill
+    AgentSkill --> CLI
+    CLI --> Gateway
+    Gateway -->|"SkillCommand"| Skill
+    Skill -.->|"feedback / result"| Gateway
+    Gateway -.-> CLI
+    CLI -.-> Hermes
+    NaturalLanguage --> Agent
+    Agent -->|"SkillCommand"| Skill
+    Skill -->|"ValidateSkill / ValidatePrimitive"| Safety
+    Skill -->|"PickObject"| Pick
+    Pick -->|"PlanGrasp / VerifyGrasp"| GraspPerception
+    GraspPerception -->|"候选、场景几何、验证证据"| Pick
+    Pick -->|"受限 PrimitiveCommand"| Skill
+    Skill -->|"已校验运动"| Motion
+    Pick -.->|"候选 IK/FK，无运动"| MoveIt
+    Motion --> MoveIt
+    MoveIt -->|"规划轨迹"| Controller
 
-    subgraph "执行层 Execution"
-        E1["真实机器人<br/>Real Robot"]
-        E2["仿真环境<br/>Simulation"]
-    end
+    PolicyRequest --> Inference
+    Sensor --> Tensor
+    Tensor -->|"契约对齐 observations"| Inference
+    Inference -->|"动作块"| Dispatch
+    Dispatch -->|"高频关节指令"| Controller
 
-    subgraph "全局管理 Global"
-        G1["配置中心<br/>robot_config"]
-        G2["接口标准定义<br/>ibrobot_msgs"]
-    end
+    Controller --> Hardware
+    Controller --> Simulation
+    Hardware -->|"状态反馈"| Sensor
+    Simulation -->|"状态反馈"| Sensor
+    Sensor --> GraspPerception
+    Sensor --> Pick
 
-    %% 数据流
-    A1 --> A2
-    A2 --> N2
-    A1 -.-> A3
-    
-    N1 --> N2
-    N2 --> I2
-    N2 --> I4
-    I4 --> N2
-    
-    I2 --> I1
-    I3 -.-> I1
-    I5 -.-> I1
-    
-    S1 --> S2
-    S2 --> N2
-    S2 -.-> V1
-    V1 -.-> C1
-    
-    I1 --> C1
-    A3 -.-> C1
-    
-    C1 --> C2
-    C1 -.-> E2
-    
-    C3 --> C1
-    C3 -.-> A3
-    
-    G1 -.-> A1
-    G1 -.-> N2
-    G1 -.-> I1
-    G1 -.-> I2
-    G1 -.-> C1
-    G1 -.-> C2
-    G1 -.-> C3
-    
-    G2 -.-> I1
-    G2 -.-> I2
-    G2 -.-> N2
+    Config -.-> CLI
+    Config -.-> Gateway
+    Config -.-> Agent
+    Config -.-> Skill
+    Config -.-> Pick
+    Config -.-> Tensor
+    Config -.-> Inference
+    Config -.-> Controller
+    Interfaces -.-> Gateway
+    Interfaces -.-> Skill
+    Interfaces -.-> Pick
+    Interfaces -.-> GraspPerception
+    Description -.-> MoveIt
+    Description -.-> Controller
 
-    style G1 fill:#fff3e0,stroke:#ff9800,stroke-width:3px
-    style G2 fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
-    style I1 fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
-    style I2 fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
-    style N2 fill:#fff3e0,stroke:#ff9800,stroke-width:2px
+    style Config fill:#fff3e0,stroke:#ff9800,stroke-width:3px
+    style Interfaces fill:#e3f2fd,stroke:#1976d2,stroke-width:2px
+    style Skill fill:#fff3e0,stroke:#ff9800,stroke-width:2px
+    style Pick fill:#e8f5e9,stroke:#388e3c,stroke-width:2px
 ```
 
 ### 架构设计原则

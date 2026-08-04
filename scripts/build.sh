@@ -312,7 +312,7 @@ if [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
         OPENEULER_SKIP_PACKAGES+=("embodied_bringup")
     fi
     if [[ ${#OPENEULER_SKIP_PACKAGES[@]} -gt 0 ]]; then
-        log_info "openEuler detected: skipping Ubuntu/CUDA-only packages: ${OPENEULER_SKIP_PACKAGES[*]}."
+        log_info "openEuler detected: skipping unsupported simulation packages: ${OPENEULER_SKIP_PACKAGES[*]}."
         PLATFORM_ARGS+=("--packages-skip" "${OPENEULER_SKIP_PACKAGES[@]}")
     fi
 fi

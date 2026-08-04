@@ -82,6 +82,21 @@ for _cann_env in "${_CANN_CANDIDATES[@]}"; do
     fi
 done
 if [ -n "${_CANN_LOADED}" ]; then
+    _CANN_HOME="${ASCEND_TOOLKIT_HOME:-}"
+    if [ -z "${_CANN_HOME}" ] && [ -d "$(dirname "${_CANN_LOADED}")/latest" ]; then
+        _CANN_HOME="$(dirname "${_CANN_LOADED}")/latest"
+    fi
+    if [ -n "${_CANN_HOME}" ]; then
+        _CANN_PYTHON="${_CANN_HOME}/python/site-packages"
+        if [ -d "${_CANN_PYTHON}" ] && [[ ":${PYTHONPATH:-}:" != *":${_CANN_PYTHON}:"* ]]; then
+            export PYTHONPATH="${_CANN_PYTHON}${PYTHONPATH:+:${PYTHONPATH}}"
+        fi
+        for _cann_lib in "${_CANN_HOME}/aarch64-linux/lib64" "${_CANN_HOME}/lib64" "/usr/local/Ascend/driver/lib64"; do
+            if [ -d "${_cann_lib}" ] && [[ ":${LD_LIBRARY_PATH:-}:" != *":${_cann_lib}:"* ]]; then
+                export LD_LIBRARY_PATH="${_cann_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+            fi
+        done
+    fi
     _IB_STEPS+=("CANN (${_CANN_LOADED})")
 
     # CANN/ATC 的 TIK C++ 编译阶段可能无法自动找到系统 libstdc++ 头文件。
@@ -115,7 +130,7 @@ if [ -n "${_CANN_LOADED}" ]; then
 else
     _IB_SKIPPED+=("CANN (未检测到 Ascend toolkit)")
 fi
-unset _CANN_CANDIDATES _cann_env _CANN_LOADED
+unset _CANN_CANDIDATES _cann_env _CANN_LOADED _CANN_HOME _CANN_PYTHON _cann_lib
 
 # 8. 别名设置
 alias cb='python3 -m colcon build --symlink-install --merge-install --cmake-args -DCMAKE_BUILD_TYPE=Release'

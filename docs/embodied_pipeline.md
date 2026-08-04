@@ -2,7 +2,10 @@
 
 ## 概述
 
-具身 AI Pipeline 是 IB_Robot 的核心执行链路，将自然语言语音指令转化为机械臂的物理动作。整条链路由 7 个 ROS 2 节点组成，分为**感知**、**规划**、**执行**三个层级。
+具身 AI Pipeline 是 IB_Robot 的技能执行主干。它同时接收自然语言任务和 Hermes 的显式技能调用，
+并将它们收敛到同一个 `SkillCommand -> safety_guard -> primitive` 安全边界。启用
+`robot.grasp_execution` 后，`pick_object` 在这条主干上增加感知、GraspGen、候选 IK/FK、物理执行和
+抓后验证子流程，而不是建立一条绕过现有控制层的旁路。
 
 ---
 
@@ -10,97 +13,104 @@
 
 ```mermaid
 flowchart TD
-    ASR["ASR 语音识别<br/>/voice_command<br/>(std_msgs/String)"]
+    Config["robot_config<br/>SSOT"]
 
-    subgraph task_entry["task_entry_node<br/>(embodied_agent)"]
-        TE_GAME{"命中视觉游戏触发词?<br/>(如 分院帽)"}
-        TE_PARSE["parse_text_command()<br/>规则匹配中文指令"]
-        TE_DIRECT{"命中规则?"}
+    subgraph entry["任务入口"]
+        ASR["ASR /voice_command"] --> TaskEntry["task_entry_node"]
+        TaskEntry -->|"规则直接命中"| Planned["/embodied/planned_task"]
+        TaskEntry -->|"未规划任务"| Planner["规则或 VLM planner<br/>launch 时二选一"]
+        Planner --> Planned
+        Hermes["Hermes"] --> AgentSkill["ibrobot-control Agent Skill"]
+        AgentSkill --> CLI["robot-skill"]
+        CLI --> Gateway["ROS Capability Gateway"]
     end
 
-    subgraph vlm_planner["vlm_task_planner_node<br/>(vlm_task_planner)"]
-        VLM_SNAP["SceneSnapshotBuffer<br/>采集摄像头/关节状态"]
-        VLM_API["VLMAPIClient<br/>KimiCode / OpenAI Compatible"]
-        VLM_FB{"confidence ≥ 0.7?"}
-        VLM_RULE["fallback_plan_from_text()<br/>规则降级规划"]
+    subgraph skill_runtime["技能编排与安全"]
+        Planned --> TaskExecutor["task_executor_node"]
+        TaskExecutor -->|"SkillCommand"| Skill["skill_executor_node"]
+        Gateway -->|"SkillCommand"| Skill
+        Skill -->|"ValidateSkill"| Safety["safety_guard_node"]
+        Skill -->|"普通模板"| Primitive["PrimitiveCommand server"]
+        Skill -->|"executor: grasp_pipeline<br/>PickObject"| Pick["pick_executor_node"]
+        Pick -->|"受限 PrimitiveCommand"| Primitive
+        Primitive -->|"ValidatePrimitive"| Safety
     end
 
-    subgraph task_planner["task_planner_node<br/>(embodied_agent)"]
-        TP_PARSE["parse_text_command()<br/>规则规划"]
+    subgraph grasp_runtime["抓取感知与候选准备"]
+        GraspServices["GroundingDetect + SegmentDetections<br/>GraspGen planner<br/>grasp verifier"]
+        MoveItCompute["MoveIt main + IK/FK workers"]
+        GraspServices -->|"候选、场景几何、验证证据"| Pick
+        Pick -->|"PlanGrasp / VerifyGrasp"| GraspServices
+        Pick -.->|"候选 IK/FK，无运动"| MoveItCompute
     end
 
-    subgraph task_executor["task_executor_node<br/>(embodied_agent)"]
-        TE_LOOP["遍历 skill_sequence<br/>逐个调用技能"]
+    subgraph motion_runtime["运动与硬件"]
+        Primitive -->|"pose / gripper primitive"| TaskDispatch["task_dispatch"]
+        Primitive -->|"move_to_configuration"| Gateway["MoveIt gateway"]
+        TaskDispatch -->|"MOVE_TO_POSE"| Gateway
+        TaskDispatch -->|"GRIPPER trajectory"| Control
+        Gateway --> MoveIt["MoveIt 2"]
+        MoveIt --> Control["ros2_control"]
+        Control --> Robot["SO101 / simulation"]
     end
 
-    subgraph skill_executor["skill_executor_node<br/>(skill_library)"]
-        SE_GATEWAY["Capability Gateway<br/>授权 / readiness / budget<br/>lease / ledger / cancel"]
-        SE_EXPAND["resolve_skill_primitives()<br/>技能 → Primitive 序列"]
-        SE_VALIDATE["调用 validate_skill_srv"]
-        SE_PRIM["执行每个 Primitive<br/>move_to_named_pose<br/>open/close_gripper<br/>move_relative_ee<br/>rotate_gripper_cw/ccw"]
-    end
+    Sensors["RGB / depth / TF<br/>joint_states / joint currents"] --> GraspServices
+    Sensors --> Pick
+    Robot --> Sensors
+    Pick -->|"PickObject feedback/result"| Skill
+    Skill -->|"SkillCommand feedback/result"| Gateway
+    Gateway --> CLI
+    CLI --> Hermes
+    TaskExecutor -->|"TaskStatus"| Status["/embodied/task_status"]
 
-    subgraph safety_guard["safety_guard_node<br/>(safety_guard)"]
-        SG_SKILL["/embodied/validate_skill<br/>srv server"]
-        SG_PRIM["/embodied/validate_primitive<br/>srv server"]
-        SG_RULES["validate_skill_request()<br/>workspace 范围检查<br/>named_pose 存在性验证"]
-    end
+    TaskEntry -->|"视觉游戏请求"| ScenePerception["perception_service_node"]
+    ScenePerception -->|"SceneAnalysisResult"| GameResult["视觉游戏结果消费者"]
+    Sensors --> ScenePerception
 
-    subgraph perception["perception_service_node<br/>(perception_service)"]
-        PS_SNAP["SceneSnapshotBuffer<br/>front + wrist 双路 RGB/Depth/PC"]
-        PS_API["VLMAPIClient<br/>场景理解"]
-        PS_OUT["SceneAnalysisResult"]
-    end
+    Config -.-> TaskEntry
+    Config -.-> Planner
+    Config -.-> Skill
+    Config -.-> Safety
+    Config -.-> Pick
+    Config -.-> GraspServices
+```
 
-    ROBOT["机械臂驱动层<br/>/cmd_pose<br/>/joint_states<br/>/robot_status/ee_pose"]
+### 1.1 `pick_object` 子流程
 
-    ASR -->|"/voice_command"| task_entry
-    TE_GAME -->|"命中: 发 SceneAnalysisRequest 后立即返回<br/>source=game.&lt;name&gt;"| PERC_REQ["/embodied/perception_request"]
-    TE_GAME -->|"未命中"| TE_PARSE
-    TE_PARSE --> TE_DIRECT
-    TE_DIRECT -->|"有 skill_sequence"| PLANNED_DIRECT["/embodied/planned_task"]
-    TE_DIRECT -->|"无 skill_sequence"| UNPLANNED["/embodied/task_command"]
+```mermaid
+flowchart LR
+    Goal["PickObject goal<br/>target_query"] --> Preflight["preflight + observe"]
+    Preflight -->|"safe primitive"| Motion["PrimitiveCommand<br/>safety_guard"]
+    Preflight --> Plan["PlanGrasp"]
 
-    PERC_REQ --> perception
-    perception -->|"/embodied/perception_result<br/>(游戏结果，不进 planner/executor)"| GAME_RESULT["视觉游戏结果消费者"]
+    RGBD["同帧 RGB / depth / CameraInfo"] --> Detect["GroundingDetect"]
+    Detect --> Segment["可选 SegmentDetections"]
+    Segment -->|"bbox + mask"| Plan
+    RGBD --> Plan
+    Plan -->|"GraspCandidateArray<br/>capture stamp<br/>centroid + table plane"| Filter["capture-time TF<br/>workspace / tabletop / mesh filter"]
 
-    UNPLANNED --> vlm_planner
-    UNPLANNED --> task_planner
+    JointState["/joint_states shared seed"] --> Prepare["parallel IK/FK preparation<br/>joint5 + FK orientation guard<br/>contact compensation"]
+    Filter --> Prepare
+    Prepare --> Rank["prepared candidate ranking"]
+    Rank --> Execute["approach -> pregrasp -> descend<br/>close -> probe lift -> final lift"]
+    Execute -->|"safe primitive"| Motion
 
-    VLM_SNAP --> VLM_API
-    VLM_API --> VLM_FB
-    VLM_FB -->|"是"| PLANNED_VLM["/embodied/planned_task"]
-    VLM_FB -->|"否/失败"| VLM_RULE --> PLANNED_VLM
-
-    task_planner --> TP_PARSE --> PLANNED_RULE["/embodied/planned_task"]
-
-    PLANNED_DIRECT --> task_executor
-    PLANNED_VLM --> task_executor
-    PLANNED_RULE --> task_executor
-
-    TE_LOOP -->|"SkillCommand action"| skill_executor
-    SE_GATEWAY --> SE_EXPAND
-    SE_EXPAND --> SE_VALIDATE
-    SE_VALIDATE -->|"ValidateSkill srv"| safety_guard
-    SG_SKILL --> SG_RULES
-    SE_PRIM -->|"ValidatePrimitive srv"| SG_PRIM
-    SE_PRIM -->|"Pose / JointCmd"| ROBOT
-
-    ROBOT -->|"ee_pose / joint_states"| skill_executor
-    ROBOT -->|"image topics"| vlm_planner
-    ROBOT -->|"image topics"| perception
-
-    perception -->|"/embodied/perception_result"| vlm_planner
-
-    task_executor & vlm_planner & task_planner -->|"TaskStatus"| STATUS["/embodied/task_status<br/>(ibrobot_msgs/TaskStatus)"]
+    Motion --> Controller["task_dispatch / MoveIt gateway<br/>ros2_control"]
+    Controller --> Robot["SO101"]
+    Robot --> JointState
+    VerifyInput["gripper opening<br/>joint current<br/>wrist depth"] --> Verify["VerifyGrasp"]
+    Execute -->|"close / probe / lift checkpoints"| Verify
+    Verify -->|"success / failed / uncertain"| Execute
+    Execute --> Result["PickObject feedback/result<br/>or configured recovery"]
 ```
 
 ---
 
 ## 二、节点拓扑与 Topic/Service/Action 总览
 
-| 节点 | 包 | 订阅 | 发布 | Service（server） | Action（server） | Action（client） |
+| 节点 | 包 | 订阅 | 发布 | Service（client/server） | Action（server） | Action（client） |
 |---|---|---|---|---|---|---|
+| `robot-skill` | robot_skill_cli | — | JSON/JSONL CLI 输出 | Gateway status / `ValidateSkill` client | — | `/embodied/execute_skill` |
 | `task_entry_node` | embodied_agent | `/voice_command` | `/embodied/task_command`<br/>`/embodied/planned_task`<br/>`/embodied/perception_request`<br/>`/embodied/task_status` | — | — | — |
 | `task_planner_node` | embodied_agent | `/embodied/task_command` | `/embodied/planned_task`<br/>`/embodied/task_status` | — | — | — |
 | `vlm_task_planner_node` | vlm_task_planner | `/embodied/task_command`<br/>camera topics<br/>ee_pose / joint_states | `/embodied/planned_task`<br/>`/embodied/task_status` | — | — | — |
@@ -108,6 +118,11 @@ flowchart TD
 | `skill_executor_node` | skill_library | ee_pose / joint_states | — | `/embodied/get_skill_gateway_status` | `/embodied/execute_skill` (SkillCommand)<br/>`/embodied/execute_primitive` (PrimitiveCommand) | `/embodied/execute_primitive` (self-loop)<br/>`/task_executor/execute_task_plan` (ExecuteTaskPlan)<br/>`/arm_trajectory_controller/follow_joint_trajectory` (FollowJointTrajectory) |
 | `safety_guard_node` | safety_guard | — | — | `/embodied/validate_skill`<br/>`/embodied/validate_primitive` | — | — |
 | `perception_service_node` | perception_service | `/embodied/perception_request`<br/>camera topics<br/>ee_pose / joint_states | `/embodied/perception_result`<br/>`/embodied/perception_summary` | — | — | — |
+| `model_service_node` | perception_service | 显式 request image | — | `GroundingDetect` 或 `SegmentDetections` server | — | — |
+| `grasp_planner` | manipulation_service | wrist RGB/depth/CameraInfo | `/grasp_planner/grasps` | `PlanGrasp` server<br/>`GroundingDetect` / 可选 `SegmentDetections` client | — | — |
+| `grasp_verifier` | manipulation_service | joint states/current<br/>wrist depth | — | `VerifyGrasp` server | — | — |
+| `pick_executor_node` | manipulation_execution | `/joint_states`<br/>TF | Pick feedback/result | `PlanGrasp` / `VerifyGrasp` / IK / FK clients | `/manipulation/execute_pick` (PickObject) | `/embodied/execute_primitive` |
+| `moveit_gateway` | robot_moveit | MoveIt/TF state | — | `MoveToPose` / `MoveToConfiguration` server | — | MoveIt trajectory execution |
 
 ---
 
@@ -161,7 +176,9 @@ ASR 文本
 | 逆时针旋转 45 度 | rotate_gripper_ccw | `["rotate_gripper_ccw"]` |
 | ... | ... | ... |
 
-抓取、放置和目标物操作类文本当前会被显式拒绝；物体 grounding、pick/place、hover/retreat 等能力需等待后续物理抓取链路接入。
+规则解析器仍会拒绝自由形式的抓取、放置和目标物操作文本，避免在没有视觉 grounding 时猜测目标。
+在抓取配置中，Hermes 可通过 `robot-skill` 显式调用 `pick_object(target_name=...)`；VLM planner 也可在
+`planning_policy.allowed_skills` 包含 `pick_object` 时生成该技能。放置和自由形式目标运动仍未开放。
 
 ---
 
@@ -208,7 +225,9 @@ vlm_api:
 
 ### 3.4 task_planner_node — 规则规划器节点
 
-**职责**：纯规则版的规划节点，将未规划的 `TaskCommand` 通过 `command_parser` 转化为 `planned_task`。与 `vlm_task_planner_node` 并联监听 `/embodied/task_command`，适合调试或无 VLM 环境。
+**职责**：纯规则版的规划节点，将未规划的 `TaskCommand` 通过 `command_parser` 转化为 `planned_task`。
+launch 根据 `planner.mode` 在该节点与 `vlm_task_planner_node` 之间选择一个，不会让两个 planner 同时消费并
+重复发布同一任务。该节点适合调试或无 VLM 环境。
 
 ---
 
@@ -240,6 +259,8 @@ completed（全序列成功）
 `/embodied/get_skill_gateway_status` 提供授权状态、实际控制模式、busy、timeout policy、config digest、
 per-skill readiness 和 task ledger 查询。Gateway 默认拒绝运动；`authorize_motion` 只能由操作员在 launch
 时显式开启，不能从 YAML、Agent 或动态 ROS 参数回退。
+对于 `executor: grasp_pipeline` 的 `pick_object`，Gateway 将其委托给 `PickObject` action；抓取执行器返回的
+动态运动仍以 `PrimitiveCommand` 回到本节点，因此不会绕过 primitive 安全校验。
 
 **架构**：双层 Action Server
 
@@ -248,25 +269,29 @@ SkillCommand Action Server (/embodied/execute_skill)
     ↓
 validate_skill() → SafetyGuardNode
     ↓
-resolve_skill_primitives() → PrimitiveSpec 列表
-    ↓
-for each primitive:
-    validate_primitive() → SafetyGuardNode
-    PrimitiveCommand Action Client → 自身 primitive server
-        ↓
-        实际硬件控制:
-        - move_to_named_pose → 发布 /cmd_pose
-        - open_gripper / close_gripper → 夹爪位置控制
-        - move_relative_ee → 当前位姿 + delta → /cmd_pose
-        - rotate_gripper_cw/ccw → 旋转矩阵变换 → /cmd_pose
+executor == grasp_pipeline?
+    ├─ 是 → PickObject action → pick_executor_node
+    │          ↓ 动态 approach/descend/gripper/lift
+    │       PrimitiveCommand action → 本节点 primitive server
+    └─ 否 → resolve_skill_primitives() → PrimitiveSpec 列表
+               ↓
+            PrimitiveCommand action → 本节点 primitive server
+               ↓
+            validate_primitive() → SafetyGuardNode
+               ↓
+            task_dispatch / MoveIt gateway → ros2_control
 ```
 
-**内置 Primitive 类型**（6 种）：
+**内置 Primitive 类型**：
 
 | Primitive | 说明 |
 |---|---|
 | `move_to_named_pose` | 移动到预定义命名位姿 |
+| `move_to_pose` | 移动到安全层校验过的动态 base-frame 位姿 |
+| `move_to_configuration` | 执行完整、已校验的机械臂关节配置 |
 | `move_relative_ee` | 末端执行器相对位移（6 方向） |
+| `move_to_joint_positions` | 执行单个完整关节目标 |
+| `move_through_joint_positions` | 执行多路点关节轨迹 |
 | `open_gripper` | 夹爪打开（position=1.0） |
 | `close_gripper` | 夹爪关闭（position=0.0） |
 | `rotate_gripper_cw` | 顺时针旋转指定角度 |
@@ -286,10 +311,13 @@ for each primitive:
   - 运动方向合法性
 - **Primitive 校验** (`/embodied/validate_primitive`)：
   - pose 是否在 workspace 范围内（xyz 三轴边界检查）
+  - 动态姿态四元数和 velocity scaling 是否有效
+  - 完整机械臂关节顺序、关节限位和轨迹时长是否合法
   - gripper_position ∈ [0.0, 1.0]
   - 相对运动目标点是否在 workspace 内
 
-**Fail-safe 策略**：规则文件缺失时降级 allow-all；回调中任何未捕获异常默认 `allowed=False`。
+**Fail-safe 策略**：机器人模板未注入时只回退到内置有限技能白名单，不会 allow-all；未知技能、未知
+primitive 和回调中的未捕获异常都返回 `allowed=False`。
 
 ---
 
@@ -315,6 +343,29 @@ for each primitive:
 
 ---
 
+### 3.9 pick_executor_node — 抓取闭环执行器
+
+**职责**：把一个运行时文本目标转换为经过验证的物理抓取。该节点拥有抓取状态机，但不拥有底层运动权限。
+
+**输入与计算数据流**：
+
+- `PickObject.target_query` 进入 `PlanGrasp`，Grounded-SAM2 和 GraspGen 使用同一采集帧生成候选、目标质心、
+  桌面平面和 capture timestamp。
+- executor 使用 capture timestamp 查询 `base -> camera` TF，避免机械臂移动后再用 latest TF 解释旧候选。
+- workspace、SO101 mesh/tabletop、固定指朝向等几何检查先过滤候选；主 MoveIt 与隔离 worker 只执行无运动
+  IK/FK 计算，并共享同一 `/joint_states` seed。
+- 准备完成的候选经过 FK 姿态、接触补偿和软排序后，动态 approach、pregrasp、descend、close、probe lift
+  和 final lift 被重新编码为 `PrimitiveCommand`。
+- `skill_executor_node` 对每个动态 primitive 调用 `ValidatePrimitive`；关节配置运动进入 MoveIt gateway，
+  位姿和夹爪 primitive 进入 `task_dispatch`，最终汇合到 `ros2_control`。
+- close、probe lift 和 final lift 后分别调用 `VerifyGrasp`，融合夹爪开度、关节电流和腕部深度证据。验证结果
+  决定成功、失败、不确定或配置化恢复，并沿 `PickObject -> SkillCommand -> Capability Gateway` 返回 Hermes。
+
+这条路径与策略推理路径并行存在。它不经过 `tensormsg`、`inference_service` 或 `action_dispatch`，因为
+GraspGen 输出的是离散 6-DOF 候选而不是策略 action chunk；两条路径只在 MoveIt/控制器和硬件反馈层汇合。
+
+---
+
 ## 四、Skill 模板系统
 
 技能通过 `robot.embodied.skill_templates` 定义，当前最小闭环默认包含以下技能：
@@ -329,6 +380,7 @@ move_relative_ee       → [move_relative_ee(from_request)]
 rotate_gripper_cw      → [rotate_gripper_cw]
 rotate_gripper_ccw     → [rotate_gripper_ccw]
 dance_basic            → [move_through_joint_positions]
+pick_object             → grasp_pipeline(PickObject, required target_name)
 ```
 
 可通过 `skill_templates_json` 参数覆盖或扩展。
@@ -337,11 +389,13 @@ dance_basic            → [move_through_joint_positions]
 
 ## 五、启动与配置
 
-具身 pipeline 通过 `robot_config` 统一管理，在 `so101_single_arm.yaml` 中配置：
+具身 pipeline 通过 `robot_config` 统一管理。机器人 YAML 中的 `robot.embodied` 定义技能、规划和安全参数，
+`robot.grasp_execution` 定义抓取闭环；`embodied_pipeline.launch.py` 默认用 `with_embodied:=true` 启用运行时，
+并把配置注入各节点。
 
 ```yaml
 embodied:
-  enabled: false          # 主开关，true 时启动全部具身节点
+  enabled: false          # YAML 默认值；embodied_pipeline launch 默认覆盖为 true
   planner:
     mode: hybrid
     vlm_api:
@@ -349,6 +403,22 @@ embodied:
       api_key_env: KIMICODE_API_KEY
       base_url: https://api.kimi.com/coding/v1
       model: kimi-latest
+```
+
+抓取配置还必须声明：
+
+```yaml
+grasp_execution:
+  enabled: true
+  action_name: /manipulation/execute_pick
+  planner_service: /grasp_planner/plan_grasp
+  verifier_service: /grasp_verifier/verify_grasp
+
+embodied:
+  skill_templates:
+    pick_object:
+      executor: grasp_pipeline
+      required_args: [target_name]
 ```
 
 启动命令：
@@ -363,10 +433,34 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 
 上述默认启动允许 catalog/status 查询，但拒绝运动。只有操作员完成现场安全检查后，才能在 launch 时使用
 `authorize_motion:=true`；Hermes、Agent 和 `robot-skill` 不得启动/重启 pipeline 或替操作员开启授权。
+SO101 抓取链路由同一份 robot-config 启动；Hermes 只通过 `ibrobot-control` skill 调用 `robot-skill`，不启动
+或重启 pipeline，也不替操作员开启运动授权。
 
 ---
 
 ## 六、典型执行链路示例
+
+### 场景：Hermes 抓取 banana
+
+```
+1. Hermes → ibrobot-control → robot-skill describe/validate/execute pick_object --target-name banana
+2. ROS Capability Gateway → /embodied/execute_skill (SkillCommand)
+3. skill_executor_node → ValidateSkill → safety_guard
+4. skill_executor_node → /manipulation/execute_pick (PickObject)
+5. pick_executor_node:
+   - observe → PlanGrasp → capture-time TF → geometry filter
+   - parallel IK/FK → contact compensation → candidate ranking
+   - PrimitiveCommand → ValidatePrimitive → task_dispatch/MoveIt → ros2_control
+   - close/probe/lift 后调用 VerifyGrasp
+6. PickObject feedback/result → SkillCommand feedback/result → robot-skill JSONL → Hermes
+```
+
+第 4 步由 Gateway 为 `PickObject` action goal UUID 注册一次性内部授权；第 5 步的抓取 executor 将该 UUID
+作为不透明 `PrimitiveCommand.execution_token` 透传。Gateway 校验 token、task ID 和当前 root admission
+后发放 borrowed lease，因此观察位和抓取 primitive 不会与父 `pick_object` 自冲突。
+
+Hermes 通过 Gateway 调用技能时，进度和终态沿 action/CLI JSONL 返回，不经过 `task_executor_node`，因此不会为这次调用
+额外发布 `/embodied/task_status`。语音/VLM 任务仍由 `task_executor_node` 发布统一 `TaskStatus`。
 
 ### 场景：语音说"夹爪往前一点"
 
@@ -380,11 +474,11 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 
 3. task_executor_node:
    - 技能: move_relative_ee
-     → SkillCommand → skill_executor
-     → validate_skill → safety_guard
-     → primitive: move_relative_ee
-     → validate_primitive → safety_guard
-     → 发布 /cmd_pose
+      → SkillCommand → skill_executor
+      → validate_skill → safety_guard
+      → primitive: move_relative_ee
+      → validate_primitive → safety_guard
+      → task_dispatch → MoveIt gateway → ros2_control
 
 4. 状态流: planned → executing(move_relative_ee) → completed
    → 发布到 /embodied/task_status
@@ -431,7 +525,6 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 
 4. 视觉游戏结果消费者按 source=game.sorting_hat 识别业务类型，读取 scene_summary（四学院之一）
 ```
-
 ---
 
 ## 七、Agent 与 CLI Gateway 入口
