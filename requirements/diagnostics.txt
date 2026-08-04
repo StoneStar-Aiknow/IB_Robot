@@ -1,0 +1,10 @@
+# Optional dependencies for speech_direction offline diagnostic report.
+# Only needed by the `speech_direction_report` CLI (HTML/PNG rendering);
+# the speech_direction_node runtime does NOT import these.
+# Install with:
+#   ./scripts/setup.sh --with-diagnostics
+# or:
+#   python3 -m pip install -r requirements/diagnostics.txt
+
+plotly>=5
+matplotlib

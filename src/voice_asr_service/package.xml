@@ -11,9 +11,22 @@
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>ibrobot_msgs</depend>
+  <depend>diagnostic_msgs</depend>
 
   <exec_depend>python3-numpy</exec_depend>
-  
+  <exec_depend>python3-pyaudio</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
+  <!-- Plotly/Matplotlib 仅 speech_direction_report 离线 CLI 渲染用,不在 base.txt;
+       通过 setup.sh 的 with-diagnostics 开关或 requirements/diagnostics.txt 可选安装。
+       rosdep 无 python3-plotly key,故不声明 exec_depend;运行时节点不 import。 -->
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <!-- speech_direction 链路重依赖(运行时按需导入,缺失时降级) -->
+  <exec_depend>python3-torch</exec_depend>
+  <exec_depend>python3-onnxruntime</exec_depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

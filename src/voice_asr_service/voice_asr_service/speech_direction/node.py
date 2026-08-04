@@ -1,0 +1,607 @@
+"""speech_direction_node ROS 适配层。
+
+~250 行,职责:
+    - ROS 参数:device_name_contains, sample_rate, mount_yaw_deg, input_source, wav_path, 模型路径
+    - 构造 FullSubNetEnhancer + SpeechGate + StftSrpPhat + SpeechDirectionPipeline + Runtime
+    - 定时器轮询 get_speech_direction(pull 模型,~10Hz)
+    - 坐标转换:阵列坐标系(度) → REP-103(弧度)(统一角度单位,显式 deg2rad)
+    - 发布 SpeechDirection(header.stamp=音频样本时间, seq_id=段序号)
+    - 降级处理:设备打开失败 / FullSubNet 加载失败 → 不发布, diagnostic_msgs 报告, 不 crash
+
+发布契约(段级事件,无人声不发布):
+    - 一段人声结束时发布一次最终方向(段级能量加权累积结果)
+    - 无人声时不发布任何方向消息
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+import os
+import threading
+from collections.abc import Mapping
+from typing import Any
+
+import numpy as np
+import rclpy
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
+from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+
+from ibrobot_msgs.msg import SpeechDirection
+
+from .config import SpeechDirectionConfig
+from .diagnostics import DiagnosticsRecorder, RecorderStatus
+from .doa.srp_phat import StftSrpPhat
+from .enhancement.fullsubnet import FullSubNetEnhancer
+from .pipeline import DoaState, PipelineParams, SpeechDirectionPipeline, VadState
+from .runtime import SpeechDirectionRuntime
+from .speech_gate import SpeechGate
+from .wav_input import WavInput
+
+logger = logging.getLogger(__name__)
+
+# 发布节拍(轮询 get_speech_direction 的频率,~10Hz)
+POLL_PERIOD_SEC = 0.1
+
+_PARAMETER_TYPES = {
+    "device_name_contains": Parameter.Type.STRING,
+    "sample_rate": Parameter.Type.INTEGER,
+    "mount_yaw_deg": Parameter.Type.DOUBLE,
+    "input_source": Parameter.Type.STRING,
+    "wav_path": Parameter.Type.STRING,
+    "wav_replay_rate": Parameter.Type.DOUBLE,
+    "fullsubnet_device": Parameter.Type.STRING,
+    "silero_vad_model_path": Parameter.Type.STRING,
+    "fullsubnet_repo_dir": Parameter.Type.STRING,
+    "fullsubnet_ckpt": Parameter.Type.STRING,
+    "speech_direction_max_age_ms": Parameter.Type.INTEGER,
+    "channel_indices": Parameter.Type.INTEGER_ARRAY,
+    "mic_positions": Parameter.Type.DOUBLE_ARRAY,
+    "diagnostics_high_throughput_enabled": Parameter.Type.BOOL,
+    "diagnostics_rollover_seconds": Parameter.Type.INTEGER,
+    "diagnostics_save_raw6ch": Parameter.Type.BOOL,
+    "diagnostics_save_enh4ch": Parameter.Type.BOOL,
+    "diagnostics_save_frame_metrics": Parameter.Type.BOOL,
+    "diagnostics_save_gray_events": Parameter.Type.BOOL,
+    "diagnostics_queue_size": Parameter.Type.INTEGER,
+    "diagnostics_drop_when_full": Parameter.Type.BOOL,
+}
+_PARAMETER_NAMES = tuple(_PARAMETER_TYPES)
+
+
+def _require_string(values: Mapping[str, Any], name: str, *, allow_empty: bool = False) -> str:
+    """严格读取字符串参数，不接受隐式字符串化。"""
+    raw_value = values[name]
+    if not isinstance(raw_value, str):
+        raise ValueError(f"参数 {name} 必须是字符串")
+    value = raw_value.strip()
+    if not allow_empty and not value:
+        raise ValueError(f"参数 {name} 不能为空")
+    return value
+
+
+def _require_non_empty_string(values: Mapping[str, Any], name: str) -> str:
+    """读取并校验必填字符串参数。"""
+    return _require_string(values, name)
+
+
+def _convert_int(values: Mapping[str, Any], name: str) -> int:
+    """严格读取整数参数，bool、浮点和字符串均不接受。"""
+    value = values[name]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"参数 {name} 必须是整数")
+    return value
+
+
+def _require_bool(values: Mapping[str, Any], name: str) -> bool:
+    """严格读取布尔参数，不接受 0/1 或字符串等隐式转换。"""
+    value = values[name]
+    if not isinstance(value, bool):
+        raise ValueError(f"参数 {name} 必须是布尔值")
+    return value
+
+
+def _require_positive_int(values: Mapping[str, Any], name: str) -> int:
+    """严格读取正整数参数。"""
+    value = _convert_int(values, name)
+    if value <= 0:
+        raise ValueError(f"参数 {name} 必须是正整数")
+    return value
+
+
+def _convert_float(values: Mapping[str, Any], name: str) -> float:
+    """严格读取 DOUBLE 参数，不接受整数或字符串代替。"""
+    value = values[name]
+    if not isinstance(value, float):
+        raise ValueError(f"参数 {name} 必须是浮点数")
+    return value
+
+
+def _convert_int_list(values: Mapping[str, Any], name: str) -> list[int]:
+    """严格读取整数数组及其元素类型。"""
+    raw_values = values[name]
+    if not isinstance(raw_values, list | tuple) or any(
+        isinstance(value, bool) or not isinstance(value, int) for value in raw_values
+    ):
+        raise ValueError(f"参数 {name} 必须是整数数组")
+    return list(raw_values)
+
+
+def _convert_float_list(values: Mapping[str, Any], name: str) -> list[float]:
+    """严格读取 DOUBLE 数组及其元素类型。"""
+    raw_values = values[name]
+    if not isinstance(raw_values, list | tuple) or any(not isinstance(value, float) for value in raw_values):
+        raise ValueError(f"参数 {name} 必须是浮点数数组")
+    return list(raw_values)
+
+
+def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirectionConfig:
+    """将已读取的 ROS 参数校验并映射为算法配置。"""
+    device_name = _require_non_empty_string(values, "device_name_contains")
+    sample_rate = _convert_int(values, "sample_rate")
+    if sample_rate != 16000:
+        raise ValueError("参数 sample_rate 当前仅支持 16000 Hz")
+
+    channel_indices = _convert_int_list(values, "channel_indices")
+    # 当前 FullSubNet、缓冲区和 SRP 阵列均固定处理四路麦克风信号。
+    if len(channel_indices) != 4 or any(value < 0 for value in channel_indices):
+        raise ValueError("参数 channel_indices 必须包含 4 个非负整数通道")
+    if len(set(channel_indices)) != len(channel_indices):
+        raise ValueError("参数 channel_indices 不能包含重复通道")
+
+    flat_positions = _convert_float_list(values, "mic_positions")
+    if len(flat_positions) != 2 * len(channel_indices):
+        raise ValueError("参数 mic_positions 长度必须等于 channel_indices 数量的两倍")
+    if not all(math.isfinite(value) for value in flat_positions):
+        raise ValueError("参数 mic_positions 必须全部为有限浮点数")
+    mic_positions = [flat_positions[index : index + 2] for index in range(0, len(flat_positions), 2)]
+
+    input_source = _require_string(values, "input_source")
+    if input_source not in {"device", "wav"}:
+        raise ValueError("参数 input_source 只能为 device 或 wav")
+    wav_path = _require_string(values, "wav_path", allow_empty=True)
+    if input_source == "wav" and not wav_path:
+        raise ValueError("input_source=wav 时参数 wav_path 不能为空")
+
+    wav_replay_rate = _convert_float(values, "wav_replay_rate")
+    if not math.isfinite(wav_replay_rate) or wav_replay_rate <= 0:
+        raise ValueError("参数 wav_replay_rate 必须是大于 0 的有限数")
+
+    fullsubnet_device = _require_string(values, "fullsubnet_device")
+    if fullsubnet_device not in {"auto", "cuda", "cpu"}:
+        raise ValueError("参数 fullsubnet_device 只能为 auto、cuda 或 cpu")
+
+    silero_path = _require_non_empty_string(values, "silero_vad_model_path")
+    repo_dir = _require_non_empty_string(values, "fullsubnet_repo_dir")
+    ckpt_path = _require_non_empty_string(values, "fullsubnet_ckpt")
+    max_age_ms = _convert_int(values, "speech_direction_max_age_ms")
+    if max_age_ms <= 0:
+        raise ValueError("参数 speech_direction_max_age_ms 必须大于 0")
+    mount_yaw_deg = _convert_float(values, "mount_yaw_deg")
+    if not math.isfinite(mount_yaw_deg):
+        raise ValueError("参数 mount_yaw_deg 必须是有限浮点数")
+
+    # 高通量维测契约拒绝 Python 的隐式类型兼容，避免 ROS 参数被静默改写。
+    diagnostics_high_throughput_enabled = _require_bool(values, "diagnostics_high_throughput_enabled")
+    diagnostics_rollover_seconds = _require_positive_int(values, "diagnostics_rollover_seconds")
+    diagnostics_save_raw6ch = _require_bool(values, "diagnostics_save_raw6ch")
+    diagnostics_save_enh4ch = _require_bool(values, "diagnostics_save_enh4ch")
+    diagnostics_save_frame_metrics = _require_bool(values, "diagnostics_save_frame_metrics")
+    diagnostics_save_gray_events = _require_bool(values, "diagnostics_save_gray_events")
+    diagnostics_queue_size = _require_positive_int(values, "diagnostics_queue_size")
+    diagnostics_drop_when_full = _require_bool(values, "diagnostics_drop_when_full")
+
+    # 仅使用上述归一化变量构造配置，避免未校验输入进入算法链。
+    cfg = SpeechDirectionConfig()
+    cfg.audio.device_name = device_name
+    cfg.audio.sample_rate = sample_rate
+    cfg.pipeline.sample_rate = sample_rate
+    cfg.vad.sample_rate = sample_rate
+    cfg.doa.sample_rate = sample_rate
+    if any(value >= cfg.audio.channels for value in channel_indices):
+        raise ValueError(f"参数 channel_indices 必须小于音频通道数 {cfg.audio.channels}")
+    cfg.audio.channel_indices = channel_indices
+    cfg.pipeline.input_channels = list(channel_indices)
+    cfg.doa.input_channels = list(channel_indices)
+    cfg.doa.mic_positions = mic_positions
+    cfg.vad.model_path = silero_path
+    cfg.fullnet.repo_dir = repo_dir
+    cfg.fullnet.ckpt = ckpt_path
+    cfg.fullnet.device = fullsubnet_device
+    cfg.input_source = input_source
+    cfg.wav_path = wav_path
+    cfg.wav_replay_rate = wav_replay_rate
+    cfg.mount_yaw_deg = mount_yaw_deg
+    cfg.speech_direction_max_age_ms = max_age_ms
+    cfg.diagnostics.high_throughput_enabled = diagnostics_high_throughput_enabled
+    cfg.diagnostics.rollover_seconds = diagnostics_rollover_seconds
+    cfg.diagnostics.save_raw6ch = diagnostics_save_raw6ch
+    cfg.diagnostics.save_enh4ch = diagnostics_save_enh4ch
+    cfg.diagnostics.save_frame_metrics = diagnostics_save_frame_metrics
+    cfg.diagnostics.save_gray_events = diagnostics_save_gray_events
+    cfg.diagnostics.queue_size = diagnostics_queue_size
+    cfg.diagnostics.drop_when_full = diagnostics_drop_when_full
+    return cfg
+
+
+class SpeechDirectionNode(Node):
+    """speech_direction ROS 节点。"""
+
+    def __init__(self) -> None:
+        super().__init__("speech_direction_node")
+
+        # ============================ 声明并加载 ROS 参数 ============================
+        # 部署参数必须由 launch/YAML 注入，节点代码不提供业务默认值。
+        self._declare_parameters()
+        cfg = self._load_config_from_parameters()
+        self._config = cfg
+        self._mount_yaw_deg = cfg.mount_yaw_deg
+
+        # ============================ 发布者 ============================
+        # 方向 topic 用 KEEP_LAST(1),只保留最新方向
+        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
+        self._direction_pub = self.create_publisher(SpeechDirection, "/voice/speech_direction", qos)
+        # 在线状态(诊断)
+        self._diag_pub = self.create_publisher(DiagnosticArray, "/diagnostics", 10)
+
+        # ============================ 降级状态 ============================
+        self._degraded = False
+        self._degrade_reason = ""
+        self._degraded_lock = threading.Lock()
+
+        # ============================ 构建算法链(可能失败 → 降级)============================
+        self._runtime: SpeechDirectionRuntime | None = None
+        self._wav_input: WavInput | None = None
+        self._diagnostics_recorder: DiagnosticsRecorder | None = None
+        self._diagnostics_status = RecorderStatus(False, "disabled", None, None, 0)
+        self._diagnostics_session_dir = ""
+        self._last_published_seq_id: int | None = None  # 已发布的段序号,避免重复发布
+
+        # 模型校验:缺失直接 raise FileNotFoundError 退出(对齐 perception_service 风格,
+        # 不降级保持运行)。模型文件"没下载"是部署问题,应由用户跑下载脚本,不是运行时故障。
+        from .model_downloader import require_configured_models
+
+        require_configured_models(
+            cfg.vad.model_path,
+            cfg.fullnet.repo_dir,
+            cfg.fullnet.ckpt,
+        )
+
+        # 算法链构建:模型文件已就绪,此后的加载/推理失败才走降级(运行时故障降级策略)
+        try:
+            self._build_and_start()
+        except Exception as e:
+            self._enter_degraded(f"算法链构建/启动失败: {e}")
+            logger.error("speech_direction 降级: %s", e, exc_info=True)
+
+        # ============================ 轮询定时器 ============================
+        self._poll_timer = self.create_timer(POLL_PERIOD_SEC, self._poll_and_publish)
+        # 诊断定时器(1Hz)
+        self._diag_timer = self.create_timer(1.0, self._publish_diagnostics)
+
+        self.get_logger().info(
+            f"speech_direction_node 已启动: input_source={cfg.input_source}, "
+            f"mount_yaw_deg={cfg.mount_yaw_deg}, degraded={self._degraded}"
+        )
+
+    def _declare_parameters(self) -> None:
+        """声明必须由 YAML 提供的 ROS 参数，不在节点代码中设置部署默认值。"""
+        for name, parameter_type in _PARAMETER_TYPES.items():
+            self.declare_parameter(name, parameter_type)
+
+    def _load_config_from_parameters(self) -> SpeechDirectionConfig:
+        """读取 ROS 参数并通过纯函数完成集中校验与配置构造。"""
+        values = {name: self.get_parameter(name).value for name in _PARAMETER_NAMES}
+        return build_config_from_parameter_values(values)
+
+    # ------------------------------------------------------------------ 算法链构建
+    def _make_session_dir(self) -> str:
+        """创建本次运行的 session 目录路径(runs/run_<timestamp>)。"""
+        import datetime
+
+        # 目录由 recorder 在 start() 的原子会话初始化中创建；此处只分配路径。
+        base = os.path.expanduser("~/.ros/speech_direction/runs")
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        return os.path.join(base, f"run_{ts}")
+
+    def _build_and_start(self) -> None:
+        """构建 FullSubNet + SpeechGate + SRP + Pipeline + Runtime 并启动。
+
+        模型文件已由 __init__ 调用 require_configured_models() 校验过(缺失直接 raise 退出)。
+        本方法只负责加载与线程启动;此处的加载/推理失败走降级(运行时故障降级策略)。
+        """
+        cfg = self._config
+
+        # FullSubNet 增强(可能加载失败 → 抛异常 → 降级)
+        fullnet = FullSubNetEnhancer(
+            repo_dir=cfg.fullnet.repo_dir,
+            ckpt=cfg.fullnet.ckpt,
+            device=cfg.fullnet.device,
+        )
+
+        # 人声门控(复用 common/vad/silero)
+        speech_gate = SpeechGate(
+            model_path=cfg.vad.model_path,
+            sample_rate=cfg.vad.sample_rate,
+            vad_threshold=cfg.gray_region.vad_threshold,
+            rms_threshold=cfg.gray_region.rms_threshold,
+        )
+
+        # SRP-PHAT(阵列几何与声学参数从配置传入,配置驱动)
+        angles = np.arange(0, 360, cfg.doa.angle_step_degree, dtype=np.float32)
+        srp = StftSrpPhat(
+            frame_size=cfg.doa.frame_size,
+            hop_size=cfg.doa.hop_size,
+            angles_deg=angles,
+            sample_rate=cfg.doa.sample_rate,
+            mic_positions=np.array(cfg.doa.mic_positions, dtype=np.float64),
+            sound_speed=cfg.doa.sound_speed,
+            freq_lo=cfg.doa.freq_band_hz[0],
+            freq_hi=cfg.doa.freq_band_hz[1],
+            diag_freq_hi=cfg.doa.diag_pair_freq_max_hz,
+        )
+
+        # pipeline 参数
+        params = PipelineParams(
+            sample_rate=cfg.pipeline.sample_rate,
+            frame_size=cfg.pipeline.frame_size,
+            hop_size=cfg.pipeline.hop_size,
+            input_channels=cfg.pipeline.input_channels,
+            seg_end_gap_s=cfg.gray_region.seg_end_gap_s,
+            min_seg_dur_s=cfg.gray_region.min_seg_dur_s,
+            min_accum_frames=cfg.gray_region.min_accum_frames,
+            max_accum_dur_s=cfg.gray_region.max_accum_dur_s,
+            seg_max_rms_threshold=cfg.gray_region.seg_max_rms_threshold,
+        )
+
+        vad_state = VadState()
+        doa_state = DoaState()
+
+        # 高通量维测是旁路：关闭或初始化失败均不改变定位 pipeline 的健康状态。
+        diagnostics = None
+        if cfg.diagnostics.high_throughput_enabled:
+            session_dir = ""
+            try:
+                session_dir = self._make_session_dir()
+                session_id = os.path.basename(session_dir)
+                diagnostics = DiagnosticsRecorder(
+                    session_dir,
+                    session_id=session_id,
+                    sample_rate=cfg.audio.sample_rate,
+                    rollover_seconds=cfg.diagnostics.rollover_seconds,
+                    save_raw6ch=cfg.diagnostics.save_raw6ch,
+                    save_enh4ch=cfg.diagnostics.save_enh4ch,
+                    save_frame_metrics=cfg.diagnostics.save_frame_metrics,
+                    save_gray_events=cfg.diagnostics.save_gray_events,
+                    queue_size=cfg.diagnostics.queue_size,
+                    drop_when_full=cfg.diagnostics.drop_when_full,
+                    gray_merge_gap_samples=round(cfg.gray_region.seg_end_gap_s * cfg.audio.sample_rate),
+                )
+                diagnostics.start()
+                self._diagnostics_recorder = diagnostics
+                self._diagnostics_status = diagnostics.status
+                self._diagnostics_session_dir = session_dir
+                if diagnostics.status.enabled:
+                    self.get_logger().info(f"维测已启用: session_dir={session_dir}")
+                else:
+                    self.get_logger().warning(
+                        f"维测初始化失败,关闭维测: {diagnostics.status.disabled_reason or '未知原因'}"
+                    )
+            except Exception as e:
+                self._diagnostics_recorder = None
+                # 空异常消息仍须暴露可定位的异常类型，避免 WARN reason 为空。
+                reason = str(e) or type(e).__name__
+                # 构造失败时没有 recorder 可查询，节点保存等价的持久状态快照。
+                self._diagnostics_status = RecorderStatus(False, "diagnostics_disabled", reason, None, 0)
+                self._diagnostics_session_dir = session_dir
+                self.get_logger().warning(f"维测初始化失败,关闭维测: {reason}")
+                diagnostics = None
+
+        pipeline = SpeechDirectionPipeline(
+            fullnet, speech_gate, srp, params, vad_state, doa_state, diagnostics=diagnostics
+        )
+
+        # runtime(input_source=wav 时 enable_capture=False)
+        enable_capture = cfg.input_source == "device"
+        self._runtime = SpeechDirectionRuntime(
+            cfg,
+            pipeline,
+            enable_capture=enable_capture,
+            on_fatal_error=self._enter_degraded,
+        )
+        self._runtime.start()
+
+        # 离线 WAV 输入
+        if cfg.input_source == "wav":
+            if not cfg.wav_path:
+                raise ValueError("input_source=wav 时 wav_path 必填")
+            self._wav_input = WavInput(
+                self._runtime,
+                cfg.wav_path,
+                replay_rate=cfg.wav_replay_rate,
+            )
+            self._wav_input.start()
+
+    # ------------------------------------------------------------------ 轮询发布
+    def _poll_and_publish(self) -> None:
+        """轮询 get_speech_direction,有新段级方向时发布。"""
+        if self._degraded or self._runtime is None:
+            return
+
+        try:
+            result = self._runtime.get_speech_direction()
+        except Exception as e:
+            self.get_logger().error(f"get_speech_direction 异常: {e}")
+            return
+
+        angle = result["angle"]
+        seq_id = result["seq_id"]
+
+        # 无可靠方向(冷启动/过期/无人声)→ 不发布
+        if angle is None:
+            return
+
+        # 段级去重:同一 seq_id 只发布一次。
+        # pipeline 每次段级输出(中间方向 / 段末方向)前 _output_seq += 1,
+        # 中间方向与段末方向 seq_id 各自独立,都会被发布;此处去重只防"同一条方向被重复拉取发布"。
+        if self._last_published_seq_id == seq_id:
+            return
+        self._last_published_seq_id = seq_id
+
+        # 坐标转换:阵列坐标系(度) → REP-103(弧度)(统一角度单位,显式 deg2rad)
+        # angle: 阵列坐标系角度(度),0°=右,90°=前,180°=左,逆时针为正
+        # mount_yaw_deg: 阵列安装偏角(度),逆时针为正
+        # ros_azimuth: REP-103 平面角度(弧度),0=前,+π/2=左,左为正
+        ros_azimuth = self._normalize_radians(
+            math.radians(float(angle)) - math.pi / 2 + math.radians(self._mount_yaw_deg)
+        )
+
+        msg = SpeechDirection()
+        # header.stamp 承载方向的"真实产生时间",而非发布时刻,使 sound_follow
+        # 算 age = ros_now - stamp 时得到方向真年龄,executor 积压/DDS 延迟不会被盖掉。
+        # 按方向类型分流(对齐 SpeechDirection.msg 契约:stamp=最后音频样本时间):
+        #   - mid_long_seg(长语音中间方向):用发布时刻,age≈0,低延迟响应正在说话的方向
+        #   - seg_end(段末方向):用来源真实 age 还原段结束时刻,sound_follow 据此判过期
+        # 时钟域:age 用墙钟(time.time)算,stamp 用 ROS 钟(get_clock().now)构造;
+        # use_sim_time=false 下两钟同属系统时钟域,差值有效;use_sim_time=true(仿真/回放)
+        # 下两钟不同步,本实现不解决该混合域,仿真场景应 use_sim_time=false。
+        ros_now = self.get_clock().now()
+        direction_type = result.get("type")
+        if direction_type == "seg_end":
+            age_sec = float(result.get("age_ms", 0.0)) / 1000.0
+            if not math.isfinite(age_sec) or age_sec < 0:
+                age_sec = 0.0  # 异常 age 安全钳制为 0(视为新鲜)
+            msg.header.stamp = (ros_now - rclpy.duration.Duration(seconds=age_sec)).to_msg()
+        else:
+            # mid_long_seg 或缺失 type:用发布时刻,age≈0
+            msg.header.stamp = ros_now.to_msg()
+        msg.header.frame_id = "base_link"
+        msg.azimuth_rad = float(ros_azimuth)
+        msg.seq_id = int(seq_id)
+        self._direction_pub.publish(msg)
+
+    @staticmethod
+    def _normalize_radians(angle: float) -> float:
+        """归一化到 [-π, π]。"""
+        return math.atan2(math.sin(angle), math.cos(angle))
+
+    # ------------------------------------------------------------------ 降级处理
+    def _enter_degraded(self, reason: str) -> None:
+        """进入降级状态:不发布方向,通过 diagnostic_msgs 报告,不 crash。"""
+        # runtime worker 可能从后台线程回调；锁保证首个原因稳定且不重复刷日志。
+        with self._degraded_lock:
+            if self._degraded:
+                return
+            self._degraded = True
+            self._degrade_reason = reason
+        self.get_logger().error(f"speech_direction 进入降级状态: {reason}")
+
+    def _recorder_diagnostics(self) -> tuple[RecorderStatus, str]:
+        """获取基础 diagnostics 使用的高通量状态，不触碰 recorder 内部并发状态。"""
+        recorder = self._diagnostics_recorder
+        if recorder is None:
+            return self._diagnostics_status, self._diagnostics_session_dir
+        session_dir = self._diagnostics_session_dir or str(getattr(recorder, "session_dir", ""))
+        return recorder.status, session_dir
+
+    def _publish_diagnostics(self) -> None:
+        """发布诊断状态(1Hz)，基础状态不依赖高通量总开关。"""
+        recorder_status, session_dir = self._recorder_diagnostics()
+        # 状态位与原因必须来自同一临界区，避免发布混合的新旧降级信息。
+        with self._degraded_lock:
+            degraded = self._degraded
+            degrade_reason = self._degrade_reason
+        if degraded:
+            # 定位链降级优先级最高；高通量状态仍作为附加字段持续暴露。
+            status = DiagnosticStatus()
+            status.level = DiagnosticStatus.ERROR
+            status.name = "speech_direction"
+            status.message = f"降级: {degrade_reason}"
+            status.hardware_id = "respeaker_4mic"
+            values = [KeyValue(key="degraded", value="true")]
+        elif self._runtime is not None:
+            status = DiagnosticStatus()
+            status.name = "speech_direction"
+            status.hardware_id = "respeaker_4mic"
+            full = self._runtime.doa_state.get_full()
+            values = [
+                KeyValue(key="latest_angle", value=str(full.get("angle"))),
+                KeyValue(key="seq_id", value=str(full.get("seq_id"))),
+                KeyValue(
+                    key="capture_running",
+                    value=str(self._runtime.capture is not None and self._runtime.capture.is_running()),
+                ),
+            ]
+            if recorder_status.state == "diagnostics_disabled":
+                status.level = DiagnosticStatus.WARN
+                status.message = f"高通量维测已停用: {recorder_status.disabled_reason or '未知原因'}"
+            else:
+                status.level = DiagnosticStatus.OK
+                status.message = "运行正常"
+        else:
+            return
+
+        values.extend(
+            [
+                KeyValue(key="enabled", value=str(recorder_status.enabled).lower()),
+                KeyValue(key="state", value=recorder_status.state),
+                KeyValue(key="reason", value=recorder_status.disabled_reason or ""),
+                KeyValue(key="dropped", value=str(recorder_status.dropped_count)),
+                KeyValue(key="session_dir", value=session_dir),
+            ]
+        )
+        status.values = values
+
+        msg = DiagnosticArray()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.status = [status]
+        self._diag_pub.publish(msg)
+
+    # ------------------------------------------------------------------ 资源清理
+    def destroy_node(self) -> bool:
+        """关闭时完成全部资源收尾。
+
+        按 rclpy.shutdown 调度设计(单次调用),不做并发重入保护,对齐仓库其他节点
+        (perception_service / voice_asr_node)的惯例。如未来确有并发 destroy 需求再加锁。
+        """
+        cleanup_error = None
+        if self._wav_input is not None:
+            try:
+                self._wav_input.stop()
+            except Exception as exc:
+                cleanup_error = exc
+        if self._runtime is not None:
+            try:
+                self._runtime.stop()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        # 在线节点只关闭高通量记录会话；报告生成严格留给离线 CLI。
+        if self._diagnostics_recorder is not None:
+            try:
+                self._diagnostics_recorder.stop()
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+        if cleanup_error is not None:
+            self.get_logger().error(f"清理异常: {cleanup_error}")
+        return super().destroy_node()
+
+
+def main(args=None) -> None:
+    """speech_direction_node 入口。"""
+    rclpy.init(args=args)
+    node = SpeechDirectionNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        node.get_logger().info("用户中断,正在停止...")
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

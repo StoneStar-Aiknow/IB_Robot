@@ -50,6 +50,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SemanticObject3DArray.msg"
   "msg/GraspCandidate.msg"
   "msg/GraspCandidateArray.msg"
+  "msg/SpeechDirection.msg"
   "action/RecordEpisode.action"
   "action/RunPolicy.action"
   "action/DispatchInfer.action"
