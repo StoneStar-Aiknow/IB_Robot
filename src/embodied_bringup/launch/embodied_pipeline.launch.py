@@ -4,8 +4,17 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction
+from launch.actions import (
+    DeclareLaunchArgument,
+    EmitEvent,
+    IncludeLaunchDescription,
+    OpaqueFunction,
+    RegisterEventHandler,
+)
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch_ros.actions import Node
 
 from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
 from robot_config.loader import load_robot_config_dict, validate_embodied_launch_dict
@@ -13,6 +22,69 @@ from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import parse_bool
 
 logger = get_colored_logger("embodied_bringup.launch")
+
+
+def _required_controllers(config: dict, active_control_mode: str, use_sim: bool) -> list[str]:
+    if use_sim and str(config.get("simulation", {}).get("platform", "gazebo")).lower() == "mock":
+        return []
+    control_modes = config.get("control_modes", {})
+    mode_config = control_modes.get(active_control_mode, {}) if isinstance(control_modes, dict) else {}
+    if use_sim and mode_config.get("sim_controllers") is not None:
+        return list(mode_config.get("sim_controllers", []))
+    if not use_sim and mode_config.get("hardware_controllers") is not None:
+        return list(mode_config.get("hardware_controllers", []))
+    controllers = mode_config.get("controllers")
+    if controllers is not None:
+        return list(controllers)
+    return list(config.get("ros2_control", {}).get("controllers", []))
+
+
+def _controller_startup_timeout(config: dict, use_sim: bool) -> float:
+    configured = config.get("controller_startup_timeout", 120.0 if use_sim else 30.0)
+    if isinstance(configured, dict):
+        configured = configured.get("sim" if use_sim else "hardware", 120.0 if use_sim else 30.0)
+    timeout = float(configured)
+    if timeout <= 0.0:
+        raise ValueError("controller_startup_timeout must be greater than zero")
+    return timeout
+
+
+def _controller_ready_waiter(config: dict, active_control_mode: str, use_sim: bool, auto_start: bool):
+    if not auto_start:
+        return None
+    required = _required_controllers(config, active_control_mode, use_sim)
+    if not required:
+        return None
+    timeout = _controller_startup_timeout(config, use_sim)
+    return Node(
+        package="robot_config",
+        executable="wait_for_controllers",
+        name="wait_for_embodied_controllers",
+        arguments=[
+            *required,
+            "--controller-manager",
+            "controller_manager",
+            "--timeout",
+            str(timeout),
+            "--service-wait-timeout",
+            str(min(timeout, 5.0)),
+        ],
+        output="screen",
+    )
+
+
+def _start_runtime_after_controller_readiness(runtime_actions):
+    frozen_actions = tuple(runtime_actions)
+
+    def _handler(event, _context):
+        if event.returncode == 0:
+            logger.info("Controllers are active; starting embodied runtime and IK workers")
+            return list(frozen_actions)
+        reason = f"Embodied controller readiness failed (returncode={event.returncode})"
+        logger.error(reason)
+        return [EmitEvent(event=Shutdown(reason=reason))]
+
+    return _handler
 
 
 def _load_config(robot_config_name: str, config_path_override: str) -> dict:
@@ -108,17 +180,34 @@ def launch_setup(context, *_args, **_kwargs):
         )
     ]
     if embodied_config["enabled"]:
-        logger.info("Launching embodied runtime nodes from embodied_bringup")
+        logger.info("Preparing embodied runtime nodes from embodied_bringup")
+        runtime_actions = []
         worker_action = _parallel_ik_worker_action(config, base_launch_arguments["use_sim"])
         if worker_action is not None:
-            actions.append(worker_action)
-        actions.extend(
+            runtime_actions.append(worker_action)
+        runtime_actions.extend(
             generate_embodied_nodes(
                 config,
                 active_control_mode,
                 motion_authorized=motion_authorized,
             )
         )
+        use_sim = parse_bool(base_launch_arguments["use_sim"], default=False)
+        auto_start = parse_bool(base_launch_arguments["auto_start_controllers"], default=True)
+        ready_waiter = _controller_ready_waiter(config, active_control_mode, use_sim, auto_start)
+        if ready_waiter is None:
+            actions.extend(runtime_actions)
+        else:
+            actions.append(
+                RegisterEventHandler(
+                    event_handler=OnProcessExit(
+                        target_action=ready_waiter,
+                        on_exit=_start_runtime_after_controller_readiness(runtime_actions),
+                    )
+                )
+            )
+            actions.append(ready_waiter)
+            logger.info(f"Deferring {len(runtime_actions)} embodied runtime action(s) until controllers are active")
     else:
         logger.info("Embodied runtime disabled by with_embodied:=false")
     return actions

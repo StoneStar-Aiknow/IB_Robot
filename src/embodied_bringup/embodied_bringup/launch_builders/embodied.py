@@ -12,6 +12,24 @@ from robot_config.timeout_policy import resolve_embodied_timeout_policy
 logger = get_colored_logger("embodied_bringup")
 
 
+def _node_runtime_settings(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
+    node_params = dict(params)
+    host_runtime = node_params.pop("host_runtime", {})
+    environment = {}
+    if "omp_threads" in host_runtime:
+        environment.update(
+            {
+                "OMP_NUM_THREADS": str(host_runtime["omp_threads"]),
+                "OMP_DYNAMIC": "FALSE",
+                "OMP_WAIT_POLICY": "PASSIVE",
+                "GOMP_SPINCOUNT": "0",
+            }
+        )
+    if "blas_threads" in host_runtime:
+        environment["OPENBLAS_NUM_THREADS"] = str(host_runtime["blas_threads"])
+    return node_params, environment
+
+
 def generate_embodied_nodes(
     robot_config: dict[str, Any],
     active_control_mode: str,
@@ -285,17 +303,17 @@ def generate_embodied_nodes(
         nodes.append(perception_node)
     if grasp_execution.get("enabled", False):
         camera = grasp_execution.get("camera", {})
-        perception_params = grasp_execution.get("perception_node", {})
-        planner_params = grasp_execution.get("planner_node", {})
+        planner_params, planner_env = _node_runtime_settings(grasp_execution.get("planner_node", {}))
         verifier_params = grasp_execution.get("verifier_node", {})
         if grasp_execution.get("auto_start_dependencies", True):
             nodes.extend(
                 [
                     Node(
-                        package="perception_service",
-                        executable="grounded_sam2_node",
-                        name="grounded_sam2",
+                        package="manipulation_service",
+                        executable="grasp_planner_node",
+                        name="grasp_planner",
                         output="screen",
+                        additional_env=planner_env,
                         parameters=[
                             {
                                 "rgb_topic": camera.get("rgb_topic", "/camera/wrist/image_raw"),
@@ -305,26 +323,8 @@ def generate_embodied_nodes(
                                 "camera_info_topic": camera.get(
                                     "camera_info_topic", "/camera/wrist/aligned_depth_to_color/camera_info"
                                 ),
-                                **perception_params,
-                            }
-                        ],
-                    ),
-                    Node(
-                        package="manipulation_service",
-                        executable="grasp_planner_node",
-                        name="grasp_planner",
-                        output="screen",
-                        parameters=[
-                            {
-                                "depth_topic": camera.get(
-                                    "depth_topic", "/camera/wrist/aligned_depth_to_color/image_raw"
-                                ),
-                                "camera_info_topic": camera.get(
-                                    "camera_info_topic", "/camera/wrist/aligned_depth_to_color/camera_info"
-                                ),
-                                "detect_service": grasp_execution.get(
-                                    "detect_service", "/grounded_sam2/detect_and_segment"
-                                ),
+                                "detect_service": grasp_execution.get("detect_service", "/perception/grounding_detect"),
+                                "segment_service": grasp_execution.get("segment_service", ""),
                                 **planner_params,
                             }
                         ],

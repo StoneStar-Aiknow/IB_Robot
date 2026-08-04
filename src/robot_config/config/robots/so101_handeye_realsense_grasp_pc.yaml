@@ -1,17 +1,20 @@
-# SO-101 grasp configuration with one gripper-mounted RealSense.
+# SO-101 grasp configuration with one gripper-mounted RealSense (PC / NVIDIA GPU).
 #
 # Hardware assumptions:
 # - SO-101 follower arm on /dev/ttyACM0
 # - follower joint calibration at ~/.calibrate/so101_follower_calibrate.json
-# - one RealSense connected to the 310P board, with the camera bracket mounted on SO101
+# - one RealSense connected to the PC, with the camera bracket mounted on SO101
 # - the RealSense moves rigidly with the gripper
 # - no separate top/front fixed camera
+#
+# Identical hardware to so101_handeye_realsense_grasp (310P) but uses NVIDIA CUDA
+# for GraspGen and perception inference instead of Ascend NPU.
 #
 # The camera is named "wrist" by role. The USB connection location does not
 # define the hand-eye type; the rigid transform parent does.
 
 robot:
-  name: so101_handeye_realsense_grasp
+  name: so101_handeye_realsense_grasp_pc
   type: so101
   robot_type: so_101
 
@@ -48,25 +51,12 @@ robot:
       - id: grasp_grounding
         enabled: true
         required: true
-        bundle_path: models/perception/grounding_dino_swint_seq8_1280x720_ascend
-        deployment: ascend_310p
-        adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
+        bundle_path: models/perception/grounded_sam2_swint_ogc
+        deployment: torch_cuda
+        adapter_class: perception_service.model_service_plugins:GroundingDetectPlugin
         service_type: ibrobot_msgs/srv/GroundingDetect
         endpoint: /perception/grasp/grounding_detect
         node_name: grasp_grounding_detect
-        runtime_options:
-          device_id: 0
-      - id: grasp_segmentation
-        enabled: true
-        required: true
-        bundle_path: models/perception/sam2_hiera_tiny_ascend
-        deployment: ascend_310p
-        adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
-        service_type: ibrobot_msgs/srv/SegmentDetections
-        endpoint: /perception/grasp/segment_detections
-        node_name: grasp_segment_detections
-        runtime_options:
-          device_id: 0
 
   grasp_execution:
     enabled: true
@@ -75,7 +65,7 @@ robot:
     planner_service: /grasp_planner/plan_grasp
     verifier_service: /grasp_verifier/verify_grasp
     detect_service: /perception/grasp/grounding_detect
-    segment_service: /perception/grasp/segment_detections
+    segment_service: ""
     ik_service: /compute_ik
     fk_service: /compute_fk
     joint_state_topic: /joint_states
@@ -121,7 +111,7 @@ robot:
       confidence_threshold: 0.30
       grasp_threshold: 0.20
       timeout_sec: 120.0
-      debug_output_mode: diagnostic
+      debug_output_mode: none
     candidate_selection:
       min_confidence: 0.0
       min_point_count: 100
@@ -131,10 +121,7 @@ robot:
       min_topdown_score: 0.0
       topdown_min_z: -0.25
       max_candidates: 80
-      # Ascend perception is frame-dependent; retain the same hard geometry and
-      # IK gates while allowing enough fresh captures to find a 5-DOF-executable
-      # candidate on a real scene.
-      selection_attempts: 12
+      selection_attempts: 3
       confidence_weight: 1.0
       topdown_weight: 0.35
     ik:
@@ -189,11 +176,8 @@ robot:
     frame_diagnostics:
       enabled: true
     planner_node:
-      inference_backend: ascend_local
-      ascend_local_manifest_path: /root/graspgen_310p_bundle
-      ascend_local_deployment_name: ascend
-      ascend_local_device_id: 0
-      ascend_local_random_seed: 0
+      inference_backend: local_cuda
+      device: cuda
       startup_warmup: true
       host_runtime:
         omp_threads: 4
@@ -299,6 +283,8 @@ robot:
   default_control_mode: "moveit_planning"
   controller_startup_timeout:
     sim: 120.0
+    # Heavy CUDA/MoveIt processes are gated behind controller readiness, so a
+    # missing controller manager or failed hardware activation should fail fast.
     hardware: 30.0
 
   control_modes:
@@ -743,6 +729,6 @@ robot:
   recording:
     bag_base_dir: "~/rosbag/episodes"
     storage: mcap
-    dataset_name: so101_handeye_realsense_grasp
+    dataset_name: so101_handeye_realsense_grasp_pc
     default_task: "check eye-in-hand calibration preconditions"
     task_family: calibration

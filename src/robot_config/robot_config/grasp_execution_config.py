@@ -65,6 +65,7 @@ _SCHEMA: dict[str, Any] = {
     "planner_service": _string(),
     "verifier_service": _string(),
     "detect_service": _string(),
+    "segment_service": _string(allow_empty=True),
     "ik_service": _string(),
     "fk_service": _string(),
     "joint_state_topic": _string(),
@@ -87,9 +88,19 @@ _SCHEMA: dict[str, Any] = {
     "descend_velocity_scaling": _VELOCITY,
     "probe_lift_velocity_scaling": _VELOCITY,
     "lift_velocity_scaling": _VELOCITY,
+    "release_velocity_scaling": _VELOCITY,
     "observe_settle_sec": _NON_NEGATIVE,
     "open_settle_sec": _NON_NEGATIVE,
     "hold_sec": _NON_NEGATIVE,
+    "release_settle_sec": _NON_NEGATIVE,
+    "state_wait": {
+        "enabled": _bool(),
+        "minimum_sec": _NON_NEGATIVE,
+        "stable_sec": _NON_NEGATIVE,
+        "joint_delta_rad": _NON_NEGATIVE,
+        "gripper_tolerance_rad": _NON_NEGATIVE,
+        "gripper_joint": _string(),
+    },
     "probe_lift_height_m": _NON_NEGATIVE,
     "descend_duration_sec": _POSITIVE,
     "camera": {
@@ -113,6 +124,8 @@ _SCHEMA: dict[str, Any] = {
         "min_topdown_score": _UNIT_INTERVAL,
         "topdown_min_z": _number(-1.0, 1.0),
         "max_candidates": _integer(0),
+        "selection_attempts": _integer(1),
+        "retry_settle_sec": _NON_NEGATIVE,
         "confidence_weight": _NON_NEGATIVE,
         "topdown_weight": _NON_NEGATIVE,
     },
@@ -139,11 +152,14 @@ _SCHEMA: dict[str, Any] = {
         "contact_z_weight": _NON_NEGATIVE,
         "confidence_weight": _NON_NEGATIVE,
         "centroid_distance_weight": _NON_NEGATIVE,
+        "robust_gap_headroom_weight": _NON_NEGATIVE,
         "contact_xy_scale_m": _POSITIVE,
         "contact_z_scale_m": _POSITIVE,
         "centroid_distance_scale_m": _POSITIVE,
+        "robust_gap_headroom_scale_m": _POSITIVE,
         "fixed_finger_gap_sigma_m": _POSITIVE,
         "missing_fixed_finger_envelope_score": _UNIT_INTERVAL,
+        "missing_robust_gap_headroom_score": _UNIT_INTERVAL,
         "fixed_finger_score_weight": _UNIT_INTERVAL,
         "reliable_max_opening_m": _POSITIVE,
         "moving_finger_min_clearance_m": _NON_NEGATIVE,
@@ -165,8 +181,20 @@ _SCHEMA: dict[str, Any] = {
         "grasp_abort_log_threshold_m": _NON_NEGATIVE,
     },
     "frame_diagnostics": {"enabled": _bool()},
-    "perception_node": {"device": _string()},
     "planner_node": {
+        "device": _string(),
+        "inference_backend": _enum("local_cuda", "remote_310p", "ascend_local"),
+        "remote_310p_host": _string(),
+        "remote_310p_port": _integer(1, 65535),
+        "remote_310p_username": _string(),
+        "remote_310p_password_env": _string(),
+        "remote_310p_root": _string(),
+        "remote_310p_timeout_sec": _POSITIVE,
+        "ascend_local_manifest_path": _string(),
+        "ascend_local_deployment_name": _string(),
+        "ascend_local_device_id": _integer(0),
+        "ascend_local_random_seed": _integer(-1),
+        "startup_warmup": _bool(),
         "save_debug_outputs": _bool(),
         "debug_output_dir": _string(),
         "enable_collision_filter": _bool(),
@@ -183,6 +211,10 @@ _SCHEMA: dict[str, Any] = {
         "input_buffer_size": _integer(1),
         "num_grasps": _integer(1),
         "topk_num_grasps": _integer(1),
+        "host_runtime": {
+            "omp_threads": _integer(1),
+            "blas_threads": _integer(1),
+        },
     },
     "verifier_node": {
         "gripper_joint": _string(),
@@ -221,6 +253,8 @@ _SCHEMA: dict[str, Any] = {
             "approach_axis_ee": _vector(nonzero=True),
             "closing_axis_180_symmetric": _bool(),
             "joint5_abs_max": _POSITIVE,
+            "joint5_branch_filter": _bool(),
+            "joint5_branch_max_delta_rad": _number(0.0, math.pi),
             "max_approach_error_deg": _number(0.0, 180.0),
             "max_closing_error_deg": _number(0.0, 180.0),
         },
@@ -236,6 +270,7 @@ _SCHEMA: dict[str, Any] = {
         "fixed_finger_robust_gap": {
             "enabled": _bool(),
             "max_target_gap_deficit_m": _NON_NEGATIVE,
+            "measurement_tolerance_m": _NON_NEGATIVE,
         },
         "width_clearance_m": _NON_NEGATIVE,
         "min_width_m": _NON_NEGATIVE,
@@ -356,8 +391,14 @@ def validate_grasp_execution_config(value: Any) -> list[str]:
 
     planner_node = value.get("planner_node")
     if isinstance(planner_node, dict):
+        planner_backend = planner_node.get("inference_backend")
+        if planner_backend == "ascend_local" and not str(planner_node.get("ascend_local_manifest_path", "")).strip():
+            errors.append(
+                "grasp_execution.planner_node.ascend_local_manifest_path must not be empty when using ascend_local"
+            )
         total = _number_value(planner_node.get("num_grasps"))
         topk = _number_value(planner_node.get("topk_num_grasps"))
         if total is not None and topk is not None and topk > total:
             errors.append("grasp_execution.planner_node.topk_num_grasps must not exceed num_grasps")
+
     return errors

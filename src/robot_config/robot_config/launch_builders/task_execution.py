@@ -60,6 +60,10 @@ def generate_task_executor_node(robot_config, control_mode, use_sim=False):
             {
                 "robot_config_path": str(robot_config_path),
                 "use_sim_time": is_sim,
+                "skip_redundant_gripper_open": bool(executor_config.get("skip_redundant_gripper_open", False)),
+                "gripper_open_position": float(executor_config.get("gripper_open_position", 1.0)),
+                "gripper_position_tolerance": max(float(executor_config.get("gripper_position_tolerance", 0.05)), 0.0),
+                "joint_state_max_age_s": max(float(executor_config.get("joint_state_max_age_s", 0.25)), 0.0),
             }
         ],
         output="screen",

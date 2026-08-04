@@ -60,6 +60,15 @@ def generate_moveit_nodes(robot_config, control_mode, use_sim=False, display=Tru
             base_link = robot_config["moveit"]["base_link"]
             ee_link = robot_config["moveit"]["ee_link"]
             shoulder_link = robot_config["moveit"]["shoulder_link"]
+            motion_status_hold_s = max(float(robot_config["moveit"].get("motion_status_hold_s", 0.0)), 0.0)
+            motion_feedback_timeout_s = max(float(robot_config["moveit"].get("motion_feedback_timeout_s", 0.3)), 0.0)
+            motion_feedback_tolerance_rad = max(
+                float(robot_config["moveit"].get("motion_feedback_tolerance_rad", 0.12)), 0.0
+            )
+            motion_require_tf_sync = bool(robot_config["moveit"].get("motion_require_tf_sync", True))
+            motion_hardware_feedback_topic = (
+                "" if use_sim else str(robot_config["moveit"].get("motion_hardware_feedback_topic", "")).strip()
+            )
 
             # Include MoveIt launch file
             moveit_launch = IncludeLaunchDescription(
@@ -72,6 +81,11 @@ def generate_moveit_nodes(robot_config, control_mode, use_sim=False, display=Tru
                     "base_link": base_link,
                     "ee_link": ee_link,
                     "shoulder_link": shoulder_link,
+                    "motion_status_hold_s": str(motion_status_hold_s),
+                    "motion_feedback_timeout_s": str(motion_feedback_timeout_s),
+                    "motion_feedback_tolerance_rad": str(motion_feedback_tolerance_rad),
+                    "motion_require_tf_sync": str(motion_require_tf_sync),
+                    "motion_hardware_feedback_topic": motion_hardware_feedback_topic,
                 }.items(),
             )
             actions.append(moveit_launch)

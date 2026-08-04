@@ -21,8 +21,17 @@ ros2_control 和外设的统一机器人配置系统。
 - **TF 发布**：自动发布相机坐标系变换
 - **标定支持**：标准 ROS2 camera_info_manager 集成
 - **tensormsg 集成**：契约通过名称引用外设
-- **RealSense contract relay**：在 `robot_config` 内部将驱动原生 topic 收口到统一 `/camera/{name}/...` 接口
+- **RealSense contract normalization**：将驱动原生 topic 收口到统一 `/camera/{name}/...` 接口；高带宽
+  RGB-D 可由驱动直接 remap，CameraInfo relay 仅负责规范化 `frame_id`
 - **通用模型服务编排**：通过顶层 `perception_services.services` 列表启动任意强类型 model-service plugin
+
+### ros2_control 启动门禁
+
+真机控制器由 `robot_config/controller_spawner` 串行加载、配置和激活；该入口修复 ROS 2 Humble 官方 spawner
+未向 `load_controller` 传递 service call timeout 的问题，并在调用超时后重新读取 lifecycle 状态，接受服务端
+已经完成的加载。随后统一的 `wait_for_controllers` 再确认 robot YAML 为当前控制模式声明的全部 controller 都是
+`active`，通过后才启动 MoveIt、teleop 或 task executor。发现、service call 和 switch 的等待上限都来自
+robot YAML 的 `robot.controller_startup_timeout.hardware`，不再维护第二套 hardware lifecycle readiness 判定。
 
 ## 架构
 
@@ -35,7 +44,8 @@ robot_config YAML（单一数据源）
         ├───► 相机驱动（现有 ROS2 包）
         │       ├───► usb_cam（USB 相机）
         │       └───► realsense2_camera（RealSense D400）
-        │               └───► topic_relay（统一 contract topic）
+        │               ├───► direct topic remap（高带宽 RGB-D）
+        │               └───► topic_relay（CameraInfo/frame_id 规范化）
         │
         └───► tensormsg 契约（ML I/O）
                 └───► PolicyBridge / EpisodeRecorder
@@ -209,10 +219,23 @@ default.
 
 ## Grasp execution target gripper
 
-`robot.grasp_execution.planner_node` 会原样传给 `grasp_planner_node`。当 GraspGen source gripper
-与目标执行器不一致，且执行侧已有目标夹爪 mesh tabletop hard gate 时，可设置
+`robot.grasp_execution.planner_node` 中的 ROS 参数会传给 `grasp_planner_node`；`host_runtime` 是
+bringup 消费的进程启动配置，不会注入 ROS 参数。当 GraspGen source gripper 与目标执行器不一致，
+且执行侧已有目标夹爪 mesh tabletop hard gate 时，可设置
 `enable_source_gripper_tabletop_sweep: false`，跳过源夹爪逐候选扫描；`enable_tabletop_filter` 仍应保持
 `true`，以继续输出 table plane 和 object-top。
+
+Ascend 板端可分别在 `perception_node` 和 `planner_node` 下限制 CPU 数值库线程：
+
+```yaml
+host_runtime:
+  omp_threads: 4
+  blas_threads: 1
+```
+
+`embodied_bringup` 会据此设置进程级 `OMP_NUM_THREADS` 和 `OPENBLAS_NUM_THREADS`，并让 GNU OpenMP
+worker 使用被动等待，避免 NPU 请求完成后继续抢占 CPU。该配置只影响对应节点进程，不影响 MoveIt、
+相机驱动或其他机器人配置。
 
 真机抓取配置可在 robot YAML 的 `robot.grasp_execution.target_gripper` 下声明目标夹爪几何。
 SO101 单动爪使用 `fixed_finger_contact_ee` 作为固定指侧参考点，`closing_axis_ee` 表示从固定指
@@ -242,16 +265,23 @@ effective_center = fixed_finger_contact_ee
 因此固定指必须位于物体朝机器人一侧，移动指从外侧闭合。无法获得可靠目标宽度区间时也会拒绝，
 避免在固定指方向未知时继续执行。
 
-`target_gripper.fixed_finger_robust_gap` 在下降完成、夹爪闭合前执行第二层硬检查。它把当前接触点残差
-投影到实际闭合轴，并计算：
+`target_gripper.fixed_finger_robust_gap` 在候选 IK/FK 准备阶段执行硬检查。它把预测接触点残差投影到
+实际闭合轴，并计算：
 
 ```text
 effective_gap = fixed_finger_gap_m + contact_error_along_closing_axis_m
 required_gap = fixed_finger_target_gap_m - max_target_gap_deficit_m
+gap_deficit = max(0, required_gap - effective_gap)
+pass = gap_deficit <= measurement_tolerance_m
 ```
 
-朝固定指方向的误差为负，会缩小 `effective_gap`。SO101 默认最多允许相对目标间隙损失 `0.003 m`；
-不足时先退回 pregrasp，再尝试下一候选，避免在已知固定指侧覆盖不足时闭合夹爪。
+朝固定指方向的误差为负，会缩小 `effective_gap`。SO101 默认最多允许相对目标间隙损失 `0.003 m`，并给
+IK/FK、TF 和舵机误差保留 `0.001 m` 容差；超过该范围的候选在 approach/descend 之前拒绝。候选准备阶段的
+`robust_gap_headroom` 仍记录未经容差放宽的原始余量用于排序。
+
+下降运动成功即进入 commit-to-grasp 状态：`close_gripper` 是下降后的第一条动作；低位实测在闭爪后继续以
+best-effort 方式写入 pose diagnostics，诊断异常不会阻止闭爪或后续验证。执行器不再退回 pregrasp 或切换
+候选。这样所有可恢复的候选淘汰都发生在低位运动之前，避免机械臂到达物体后因边界测量噪声突然上升。
 
 `target_gripper.ik_orientation_guard` 约束 position-only IK 的实际 FK 朝向。SO101 的 joint5 对 TCP 位置
 几乎不产生梯度，因此超出执行门限时会保持在 seed 附近；执行器将超限 joint5 seed 翻转 `±π`，让固定指和
@@ -267,8 +297,9 @@ ik_orientation_guard:
   max_closing_error_deg: 20.0
 ```
 
-`joint5_abs_max` 同时约束监督式测试脚本和 Hermes 执行器。两条链路都会先把超过半圈的解映射到
-等价的 `[-π/2, π/2]` 分支，再以该门限和 FK 轴误差决定是否接受候选。
+`joint5_abs_max` 只由正式 `manipulation_execution/pick_executor_node` 读取和执行。Hermes 与监督式
+客户端都向同一个 `/manipulation/execute_pick` 发送 `PickObject` goal；执行器先把超过半圈的解
+映射到等价的 `[-π/2, π/2]` 分支，再以该门限和 FK 轴误差决定是否接受候选。
 
 闭合轴的 180° 对称只表示两指闭合直线相同，不表示固定指身份可忽略。执行器必须再用实际 FK 位姿执行
 `fixed_finger_base_side` 硬检查；固定指仍在外侧或目标宽度区间缺失时拒绝当前候选并继续 candidate fallback。
@@ -282,13 +313,32 @@ ik:
   auto_start_workers: true
 ```
 
-`embodied_pipeline.launch.py` 会自动启动对应数量的隔离 MoveIt worker。Hermes executor 与监督式脚本
-都固定一份共同 `/joint_states` seed，将候选按 worker 分片并按原顺序合并；最终补偿与运动不进入 worker。
-候选进入 worker 前的 SO101 mesh/tabletop 检查也采用与监督式脚本相同的凸包缓存和批量向量化路径。
+`embodied_pipeline.launch.py` 会自动启动对应数量的隔离 MoveIt worker。正式执行器为整批候选
+固定一份共同 `/joint_states` seed，空闲 worker 从共享动态队列领取下一个候选，并按原候选顺序
+合并结果；最终补偿与运动不进入 worker。候选进入 worker 前的 SO101 mesh/tabletop 检查
+也由该执行器的唯一公共实现完成，使用凸包缓存和批量向量化路径。
+
+SO101 真机的 MoveIt 完成语义也由同一 robot YAML 的 `moveit` 域声明：
+
+```yaml
+moveit:
+  motion_status_hold_s: 0.0
+  motion_feedback_timeout_s: 0.3
+  motion_feedback_tolerance_rad: 0.12
+  motion_require_tf_sync: true
+  motion_hardware_feedback_topic: /so101_follower/joint_currents
+```
+
+网关只在 MoveIt 终态之后同时看到新的硬件读取心跳、收敛关节样本和覆盖该样本时间戳的末端 TF 时
+返回成功，不再依赖固定 `0.3 s` sleep。由该屏障覆盖的 `contact_realign.settle_sec` 和
+`pose_diagnostics.settle_sec` 可设为 `0.0`；相机与夹爪稳定等待不在此屏障覆盖范围内。仿真启动会
+清空硬件心跳话题，只保留关节与 TF 屏障。
 
 `robot.grasp_execution.prepared_candidate_scoring` 控制 IK/FK 后软排序。SO101 使用候选目标宽度区间和
 候选规划姿态计算固定指到目标前缘的间隙，并以动态 margin 为期望值计算包络分数。该分数与
-接触点 XY/Z 质量、目标体积质心距离和 GraspGen 置信度加权，只改变执行顺序，不作为候选硬拒绝条件。
+接触点 XY/Z 质量、目标体积质心距离和 GraspGen 置信度加权。`robust_gap_headroom_weight` 和
+`robust_gap_headroom_scale_m` 进一步把 IK/FK 预测接触残差对应的安全间隙余量归一化后纳入排序；
+软排序本身只改变执行顺序；启用 `fixed_finger_robust_gap` 时，同一预测余量还会在运动前执行独立硬门禁。
 
 ## 控制模式配置
 
@@ -1012,8 +1062,17 @@ sudo apt install ros-humble-usb-cam
   depth_fps: 30
   enable_depth: true
   enable_color: true
-  align_depth: false
+  align_depth: true
+  # 高带宽 image/pointcloud 由驱动直接改名，避免通过第二个 DDS relay 复制。
+  # CameraInfo 仍使用轻量 relay，把 frame_id 规范为 optical_frame_id。
+  direct_topic_remap: true
+  # 仅在确有 PointCloud2 消费者时开启；RGB-D 抓取可直接从对齐深度构造点云。
+  enable_pointcloud: false
 ```
+
+`direct_topic_remap` 默认是 `false`，保留旧的全 relay 行为。对单机高带宽 RealSense pipeline，建议设为
+`true`；下游仍使用 `/camera/{name}/image_raw` 和
+`/camera/{name}/aligned_depth_to_color/{image_raw,camera_info}`，不需要了解驱动原生 topic 前缀。
 
 **安装：**
 ```bash

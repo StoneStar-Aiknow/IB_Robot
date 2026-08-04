@@ -101,7 +101,7 @@ robot:
     port: /dev/ttyACM2
     calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
     joint_names: ["1", "2", "3", "4", "5", "6"]
-    # Reset positions (optional)
+    # Semantic reset positions (optional); hardware activation holds the measured position.
     reset_positions:
       "1": 0.0
       "2": 0.0

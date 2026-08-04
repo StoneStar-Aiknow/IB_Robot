@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 from launch import LaunchContext
-from launch.actions import RegisterEventHandler
+from launch.actions import ExecuteProcess, RegisterEventHandler
 from launch_ros.actions import Node
 
 from inference_manifest import BundleFile, canonical_bundle_digest
@@ -26,7 +26,7 @@ from robot_config.launch_builders.execution import (
     generate_inference_node,
 )
 from robot_config.launch_builders.navigation import generate_navigation_nodes
-from robot_config.launch_builders.perception import generate_camera_nodes
+from robot_config.launch_builders.perception import generate_camera_nodes, generate_tf_nodes
 from robot_config.launch_builders.sim_backend import get_sim_backend
 from robot_config.launch_builders.teleop import generate_teleop_nodes
 from robot_config.loader import load_robot_config_dict
@@ -161,18 +161,75 @@ def test_missing_inactive_controllers_returns_only_non_active():
     assert pending == ["arm_position_controller", "missing_controller"]
 
 
-def test_generate_controller_spawners_groups_activation():
+def test_generate_controller_spawners_uses_repository_timeout_aware_process_per_controller():
     spawners = generate_controller_spawners(
         ["joint_state_broadcaster", "arm_position_controller"],
         use_sim=True,
+        controller_manager_timeout=42.5,
     )
 
-    assert len(spawners) == 1
-    assert isinstance(spawners[0], Node)
-    cmd_text = [item[0].text for item in spawners[0].cmd if item and hasattr(item[0], "text")]
-    assert "--controller-manager" in cmd_text
-    assert "controller_manager" in cmd_text
-    assert "--activate-as-group" in cmd_text
+    assert len(spawners) == 2
+    for spawner, controller_name in zip(
+        spawners,
+        ["joint_state_broadcaster", "arm_position_controller"],
+        strict=True,
+    ):
+        assert isinstance(spawner, Node)
+        assert spawner.node_package == "robot_config"
+        assert spawner.node_executable == "controller_spawner"
+        cmd_text = [item[0].text for item in spawner.cmd if item and hasattr(item[0], "text")]
+        assert controller_name in cmd_text
+        assert "--controller-manager" in cmd_text
+        assert "controller_manager" in cmd_text
+        assert "--service-call-timeout" in cmd_text
+        assert "--switch-timeout" in cmd_text
+        assert "42.5" in cmd_text
+        assert "10.0" in cmd_text
+        assert "--activate-as-group" not in cmd_text
+
+
+def test_real_hardware_controller_spawners_use_configured_readiness_timeout():
+    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_handeye_realsense_grasp.yaml"
+    robot_config = load_robot_config_dict(config_path)
+    robot_config["default_control_mode"] = "moveit_planning"
+
+    nodes, controller_names, deferred_spawners, _robot_description = generate_ros2_control_nodes(
+        robot_config,
+        use_sim=False,
+        auto_start_controllers="true",
+        controller_startup_timeout=120.0,
+    )
+
+    assert controller_names == [
+        "joint_state_broadcaster",
+        "arm_trajectory_controller",
+        "gripper_trajectory_controller",
+    ]
+    assert len(deferred_spawners) == len(controller_names)
+    assert all(spawner.node_package == "robot_config" for spawner in deferred_spawners)
+    assert all(spawner.node_executable == "controller_spawner" for spawner in deferred_spawners)
+    assert all(node.node_executable != "controller_spawner" for node in nodes)
+    assert all("120.0" in _text(spawner._Node__arguments) for spawner in deferred_spawners)
+
+
+def test_controller_startup_processes_are_serialized():
+    processes = [ExecuteProcess(cmd=["true"]) for _ in range(4)]
+
+    actions = robot_launch._serialize_process_startup(processes, "test controller startup")
+
+    assert len(actions) == len(processes)
+    assert all(isinstance(action, RegisterEventHandler) for action in actions[:-1])
+    assert actions[-1] is processes[0]
+
+
+def test_last_strict_spawner_is_the_controller_readiness_barrier():
+    spawners = [ExecuteProcess(cmd=["true"]) for _ in range(3)]
+    fallback_waiter = ExecuteProcess(cmd=["false"])
+
+    barrier = robot_launch._controller_readiness_barrier(spawners, fallback_waiter)
+
+    assert barrier is spawners[-1]
+    assert robot_launch._controller_readiness_barrier([], fallback_waiter) is fallback_waiter
 
 
 def _relay_targets(nodes):
@@ -207,6 +264,19 @@ def test_realsense_camera_topics_are_remapped_to_robot_config_contract_names():
     )
 
     relay_pairs = _relay_targets(nodes)
+    driver = next(
+        node
+        for node in nodes
+        if vars(node).get("_Node__package") == "realsense2_camera"
+        and vars(node).get("_Node__node_executable") == "realsense2_camera_node"
+    )
+    driver_params = _node_parameters(driver)
+    assert driver_params["base_frame_id"] == "wrist_camera_link"
+    assert driver_params["align_depth.enable"] is True
+    assert driver_params["pointcloud.enable"] is True
+    assert driver_params["enable_infra"] is False
+    assert driver_params["enable_infra1"] is False
+    assert driver_params["enable_infra2"] is False
     assert (
         "/camera/wrist_camera/color/image_raw",
         "/camera/wrist/image_raw",
@@ -227,6 +297,73 @@ def test_realsense_camera_topics_are_remapped_to_robot_config_contract_names():
         "/camera/wrist_camera/aligned_depth_to_color/camera_info",
         "/camera/wrist/aligned_depth_to_color/camera_info",
     ) in relay_pairs
+    assert (
+        "/camera/wrist_camera/depth/color/points",
+        "/camera/wrist/depth/color/points",
+    ) in relay_pairs
+
+
+def test_realsense_direct_topic_remap_avoids_large_payload_relays():
+    nodes = generate_camera_nodes(
+        {
+            "peripherals": [
+                {
+                    "type": "camera",
+                    "name": "wrist",
+                    "driver": "realsense",
+                    "width": 640,
+                    "height": 360,
+                    "fps": 30,
+                    "align_depth": True,
+                    "enable_pointcloud": False,
+                    "direct_topic_remap": True,
+                    "optical_frame_id": "camera_wrist_optical_frame",
+                }
+            ]
+        },
+        use_sim=False,
+    )
+
+    driver = next(node for node in nodes if getattr(node, "_Node__package", None) == "realsense2_camera")
+    assert _node_remappings(driver) == [
+        ("/camera/wrist_camera/color/image_raw", "/camera/wrist/image_raw"),
+        (
+            "/camera/wrist_camera/aligned_depth_to_color/image_raw",
+            "/camera/wrist/aligned_depth_to_color/image_raw",
+        ),
+    ]
+    relay_pairs = _relay_targets(nodes)
+    assert relay_pairs == [
+        ("/camera/wrist_camera/color/camera_info", "/camera/wrist/camera_info"),
+        (
+            "/camera/wrist_camera/aligned_depth_to_color/camera_info",
+            "/camera/wrist/aligned_depth_to_color/camera_info",
+        ),
+    ]
+
+
+def test_realsense_tf_bridge_targets_the_driver_prefixed_base_frame():
+    nodes = generate_tf_nodes(
+        {
+            "peripherals": [
+                {
+                    "type": "camera",
+                    "name": "wrist",
+                    "driver": "realsense",
+                    "driver_camera_name": "wrist_camera",
+                    "frame_id": "camera_wrist_link",
+                    "optical_frame_id": "camera_wrist_optical_frame",
+                    "transform": {"parent_frame": "gripper"},
+                }
+            ]
+        },
+        use_sim=False,
+    )
+
+    bridge = next(node for node in nodes if vars(node).get("_Node__node_name") == "static_tf_wrist_driver_bridge")
+    arguments = [_text(value) for value in bridge._Node__arguments]
+    assert arguments[arguments.index("--frame-id") + 1] == "camera_wrist_link"
+    assert arguments[arguments.index("--child-frame-id") + 1] == "wrist_camera_camera_wrist_link"
 
 
 def test_start_actions_handler_snapshots_action_list():

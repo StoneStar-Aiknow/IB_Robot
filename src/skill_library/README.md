@@ -349,6 +349,9 @@ ros2 action send_goal /embodied/execute_primitive ibrobot_msgs/action/PrimitiveC
 - 高层 `SkillCommand` 先经过 Gateway 准入，再调用 `/embodied/validate_skill` 校验整个 skill；在父 admission
   有效时，解析出的每个内部 primitive 复用父 `SkillCommand` 的 borrowed lease，经
   `/embodied/execute_primitive`，并在下游 dispatch 前各自调用 `/embodied/validate_primitive`。
+- `pick_object` 的抓取 pipeline 运行在独立 action server 中。Gateway 为该 `PickObject` action goal UUID
+  注册一次性内部授权；pipeline 将它编码为不透明 `PrimitiveCommand.execution_token`，使观察位和后续
+  primitive 借用同一个 root lease。仅复用 `task_id` 不会获得内部授权。
 - 直接/外部 `PrimitiveCommand` 的 Gateway primitive 准入只检查运动授权、所需控制模式，以及 execution
   lease/busy 状态。对相对移动和夹爪旋转，随后才取得并检查新鲜的 EE state；
   `/embodied/validate_primitive` 再校验该 primitive 的最终 target/request。下游 action/server readiness 和
@@ -390,7 +393,7 @@ root skill 或外部 primitive，不是 ROS graph 范围的锁。
 
 ### 8.2 UUID 维度
 
-Gateway 涉及两类 UUID，分工不同，不要混淆：
+Gateway 涉及三类 UUID，分工不同，不要混淆：
 
 - **task identifier（UUIDv5）**：`embodied_common.skill_request.skill_goal_uuid(task_id)` 派生
   `ibrobot:{task_id}` 的 UUIDv5，用于 ledger key、payload hash 关联，以及 `cancel --task-id` 的
@@ -398,6 +401,9 @@ Gateway 涉及两类 UUID，分工不同，不要混淆：
 - **internal primitive ROS action goal_id（UUIDv4）**：`skill_executor_node` 在派发内部 primitive 时
   用 `uuid.uuid4()` 随机生成 ROS action `goal_id.uuid`，仅用于 rclpy 跟踪 `goal_handle`，不暴露给
   Agent，也不参与 ledger 关联。随机 UUID 避免 goal ID 冲突，是 rclpy 的实现细节。
+- **pick handoff goal_id（UUIDv4）**：Gateway 派发 `PickObject` 时生成并注册。抓取 executor 将其编码到
+  `PrimitiveCommand.execution_token`；Gateway 只有在 token、task ID 和当前 admission 全部匹配时才发放
+  borrowed lease。正常终态或已确认的取消清理会撤销该授权。
 
 因此 PR 自述的「确定性 goal UUID」专指 task identifier 维度；internal primitive 的 ROS action
 goal_id 不在此约定范围内。

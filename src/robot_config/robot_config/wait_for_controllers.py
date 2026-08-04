@@ -5,23 +5,18 @@
 import argparse
 import sys
 import time
-from typing import Iterable
+from collections.abc import Iterable
+from contextlib import suppress
 
 import rclpy
 from controller_manager_msgs.srv import ListControllers
 from rclpy.node import Node
 
 
-def missing_inactive_controllers(
-    controllers: Iterable[object], required_names: Iterable[str]
-) -> list[str]:
+def missing_inactive_controllers(controllers: Iterable[object], required_names: Iterable[str]) -> list[str]:
     """Return required controllers that are missing or not active."""
     states = {controller.name: controller.state for controller in controllers}
-    return [
-        name
-        for name in required_names
-        if states.get(name) != "active"
-    ]
+    return [name for name in required_names if states.get(name) != "active"]
 
 
 class ControllerWaiter(Node):
@@ -46,9 +41,7 @@ class ControllerWaiter(Node):
             if self._client.wait_for_service(timeout_sec=min(service_wait_timeout, remaining)):
                 break
         else:
-            self.get_logger().error(
-                f"Timed out after {timeout:.1f}s waiting for controller_manager services."
-            )
+            self.get_logger().error(f"Timed out after {timeout:.1f}s waiting for controller_manager services.")
             return 1
 
         while rclpy.ok() and time.monotonic() < deadline:
@@ -64,27 +57,19 @@ class ControllerWaiter(Node):
                 self._required_names,
             )
             if not pending:
-                self.get_logger().info(
-                    "Controllers are active: " + ", ".join(self._required_names)
-                )
+                self.get_logger().info("Controllers are active: " + ", ".join(self._required_names))
                 return 0
 
-            self.get_logger().info(
-                "Waiting for controllers to become active: " + ", ".join(pending)
-            )
+            self.get_logger().info("Waiting for controllers to become active: " + ", ".join(pending))
             time.sleep(poll_period)
 
-        self.get_logger().error(
-            "Timed out waiting for controllers: " + ", ".join(self._required_names)
-        )
+        self.get_logger().error("Timed out waiting for controllers: " + ", ".join(self._required_names))
         return 1
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv
-    parser = argparse.ArgumentParser(
-        description="Wait for ros2_control controllers to reach the active state."
-    )
+    parser = argparse.ArgumentParser(description="Wait for ros2_control controllers to reach the active state.")
     parser.add_argument("controllers", nargs="+", help="Controller names to wait for.")
     parser.add_argument(
         "--controller-manager",
@@ -119,9 +104,14 @@ def main(argv: list[str] | None = None) -> int:
             service_wait_timeout=args.service_wait_timeout,
             poll_period=args.poll_period,
         )
+    except KeyboardInterrupt:
+        return 130
     finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        with suppress(KeyboardInterrupt):
+            node.destroy_node()
+        if rclpy.ok():
+            with suppress(KeyboardInterrupt):
+                rclpy.shutdown()
 
 
 if __name__ == "__main__":

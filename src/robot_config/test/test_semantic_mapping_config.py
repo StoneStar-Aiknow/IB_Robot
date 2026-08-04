@@ -49,7 +49,6 @@ def test_disabled_semantic_mapping_contract_is_preserved() -> None:
     assert config.semantic_mapping.camera["mounting"] == "fixed"
     assert config.semantic_mapping.perception["mapping_backend"] == "service"
     assert len(config.perception_services.services) == 5
-    assert config.semantic_mapping.migration["grounded_sam2_node"] == "compatibility"
 
 
 def test_enabled_semantic_mapping_contract_loads_and_validates(tmp_path: Path) -> None:
@@ -97,12 +96,6 @@ def test_enabled_semantic_mapping_contract_loads_and_validates(tmp_path: Path) -
             ),
             "allow_legacy_embedded must be true",
         ),
-        (
-            lambda config: config["semantic_mapping"].update(
-                {"migration": {**config["semantic_mapping"]["migration"], "grounded_sam2_snapshot": "production"}}
-            ),
-            "migration.grounded_sam2_snapshot must be one of",
-        ),
     ],
 )
 def test_semantic_mapping_contract_fails_closed(tmp_path: Path, mutate, expected: str) -> None:
@@ -113,18 +106,17 @@ def test_semantic_mapping_contract_fails_closed(tmp_path: Path, mutate, expected
         load_robot_config_dict(_write_config(tmp_path, config))
 
 
-def test_embedded_mapping_requires_explicit_migration_state(tmp_path: Path) -> None:
+def test_embedded_mapping_requires_explicit_legacy_opt_in(tmp_path: Path) -> None:
     config = _enabled_config(tmp_path)
-    config["semantic_mapping"]["perception"].update({"mapping_backend": "embedded", "allow_legacy_embedded": True})
+    config["semantic_mapping"]["perception"].update({"mapping_backend": "embedded", "allow_legacy_embedded": False})
 
-    with pytest.raises(ValueError, match="embedded_mapping_backend must be 'migration_only'"):
+    with pytest.raises(ValueError, match="allow_legacy_embedded must be true"):
         load_robot_config_dict(_write_config(tmp_path, config))
 
 
 def test_embedded_mapping_validation_does_not_require_generic_services(tmp_path: Path) -> None:
     config = _enabled_config(tmp_path)
     config["semantic_mapping"]["perception"].update({"mapping_backend": "embedded", "allow_legacy_embedded": True})
-    config["semantic_mapping"]["migration"]["embedded_mapping_backend"] = "migration_only"
     config["perception_services"] = {"services": []}
 
     loaded = load_robot_config_dict(_write_config(tmp_path, config))

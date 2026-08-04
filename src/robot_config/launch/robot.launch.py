@@ -226,6 +226,37 @@ def _start_actions_on_success(start_actions, success_message: str, failure_reaso
     return _handler
 
 
+def _serialize_process_startup(processes, sequence_name: str):
+    """Start each process only after the previous process exits successfully."""
+    frozen_processes = tuple(processes)
+    if not frozen_processes:
+        return []
+
+    actions = []
+    for index in range(len(frozen_processes) - 1):
+        current_process = frozen_processes[index]
+        next_process = frozen_processes[index + 1]
+        actions.append(
+            RegisterEventHandler(
+                event_handler=OnProcessExit(
+                    target_action=current_process,
+                    on_exit=_start_actions_on_success(
+                        [next_process],
+                        success_message=f"{sequence_name} step {index + 1} completed; starting next step.",
+                        failure_reason=f"{sequence_name} step {index + 1} failed; aborting launch.",
+                    ),
+                )
+            )
+        )
+    actions.append(frozen_processes[0])
+    return actions
+
+
+def _controller_readiness_barrier(deferred_spawners, readiness_waiter):
+    """Use the last strict spawner as the barrier when this launch owns startup."""
+    return deferred_spawners[-1] if deferred_spawners else readiness_waiter
+
+
 def _resolve_controller_startup_timeout(robot_config: dict, use_sim: bool) -> float:
     """Resolve controller startup timeout from robot YAML."""
     configured_timeout = robot_config.get("controller_startup_timeout")
@@ -400,15 +431,20 @@ def launch_setup(context, *args, **kwargs):
 
     # ========== 4. Generate Control System Nodes ==========
     logger.info("========== Generating Control Nodes ==========")
-    deferred_sim_spawners = []
+    deferred_controller_spawners = []
     controller_names = []
     robot_description = {}
     if not sim_backend_needs_ros2_control:
         logger.info(f"simulation.platform={sim_platform}: skipping ros2_control / controller spawners")
     else:
         try:
-            control_nodes, controller_names, deferred_sim_spawners, robot_description = generate_ros2_control_nodes(
-                robot_config, use_sim, auto_start_controllers
+            control_nodes, controller_names, deferred_controller_spawners, robot_description = (
+                generate_ros2_control_nodes(
+                    robot_config,
+                    use_sim,
+                    auto_start_controllers,
+                    controller_startup_timeout=_resolve_controller_startup_timeout(robot_config, use_sim),
+                )
             )
             actions.extend(control_nodes)
             logger.info(f"Added {len(control_nodes)} control nodes")
@@ -423,6 +459,10 @@ def launch_setup(context, *args, **kwargs):
             controller_names,
             use_sim,
         )
+    controller_ready_barrier = _controller_readiness_barrier(
+        deferred_controller_spawners,
+        controller_ready_waiter,
+    )
 
     # ========== 5. Generate Simulation Nodes (only in simulation mode) ==========
     gz_create_entity = None
@@ -460,10 +500,9 @@ def launch_setup(context, *args, **kwargs):
             logger.error(f"generating simulation nodes: {e}")
             raise
 
-    if deferred_sim_spawners:
-        startup_sequence = list(deferred_sim_spawners)
-        if controller_ready_waiter is not None:
-            startup_sequence.append(controller_ready_waiter)
+    if deferred_controller_spawners:
+        startup_processes = list(deferred_controller_spawners)
+        startup_sequence = _serialize_process_startup(startup_processes, "Controller startup")
         if use_sim and gz_create_entity is not None:
             logger.info("Scheduling controller startup after ros_gz_sim create exits")
             actions.append(
@@ -478,7 +517,10 @@ def launch_setup(context, *args, **kwargs):
                     )
                 )
             )
+        elif use_sim:
+            actions.extend(startup_sequence)
         else:
+            logger.info("Starting controller startup sequence; spawners wait for controller_manager readiness")
             actions.extend(startup_sequence)
     elif controller_ready_waiter is not None:
         actions.append(controller_ready_waiter)
@@ -490,14 +532,15 @@ def launch_setup(context, *args, **kwargs):
         logger.info("simulation.platform=mock: contract_mock started by simulation backend")
     else:
         try:
+            perception_nodes = []
             # Camera nodes (Physical drivers)
             camera_nodes = generate_camera_nodes(robot_config, use_sim)
-            actions.extend(camera_nodes)
+            perception_nodes.extend(camera_nodes)
             logger.info(f"Added {len(camera_nodes)} camera nodes")
 
             # LiDAR nodes (Physical drivers)
             lidar_nodes = generate_lidar_nodes(robot_config, use_sim)
-            actions.extend(lidar_nodes)
+            perception_nodes.extend(lidar_nodes)
             print(f"[robot_config] Added {len(lidar_nodes)} lidar nodes")
 
             # Virtual camera relay nodes (Topic tools)
@@ -506,14 +549,23 @@ def launch_setup(context, *args, **kwargs):
             )
 
             virtual_nodes = generate_virtual_camera_relays(robot_config)
-            actions.extend(virtual_nodes)
+            perception_nodes.extend(virtual_nodes)
             if virtual_nodes:
                 logger.info(f"Added {len(virtual_nodes)} virtual camera relays")
 
             # Static TF publishers
             tf_nodes = generate_tf_nodes(robot_config, use_sim)
-            actions.extend(tf_nodes)
+            perception_nodes.extend(tf_nodes)
             logger.info(f"Added {len(tf_nodes)} TF nodes")
+
+            if controller_ready_barrier is not None:
+                controller_dependent_actions.extend(perception_nodes)
+                logger.info(
+                    f"Deferring {len(perception_nodes)} physical perception action(s) "
+                    "until required controllers are active"
+                )
+            else:
+                actions.extend(perception_nodes)
 
         except Exception as e:
             logger.error(f"generating perception nodes: {e}")
@@ -521,9 +573,17 @@ def launch_setup(context, *args, **kwargs):
 
     try:
         model_service_nodes = generate_perception_model_nodes(robot_config)
-        actions.extend(model_service_nodes)
-        if model_service_nodes:
-            logger.info(f"Added {len(model_service_nodes)} generic model service nodes")
+        if controller_ready_barrier is not None:
+            controller_dependent_actions.extend(model_service_nodes)
+            if model_service_nodes:
+                logger.info(
+                    f"Deferring {len(model_service_nodes)} generic model service node(s) "
+                    "until required controllers are active"
+                )
+        else:
+            actions.extend(model_service_nodes)
+            if model_service_nodes:
+                logger.info(f"Added {len(model_service_nodes)} generic model service nodes")
     except Exception as e:
         logger.error(f"generating model service nodes: {e}")
         raise
@@ -544,7 +604,7 @@ def launch_setup(context, *args, **kwargs):
                 # Generate teleop nodes
                 teleop_nodes = generate_teleop_nodes(robot_config, robot_description)
 
-                if controller_ready_waiter is not None:
+                if controller_ready_barrier is not None:
                     logger.info("Deferring teleop nodes until required controllers are active...")
                     controller_dependent_actions.extend(teleop_nodes)
                 else:
@@ -596,7 +656,7 @@ def launch_setup(context, *args, **kwargs):
                     navigation_mode=navigation_mode,
                     force_enable=True,
                 )
-                if controller_ready_waiter is not None:
+                if controller_ready_barrier is not None:
                     logger.info("Deferring navigation nodes until required controllers are active...")
                     controller_dependent_actions.extend(navigation_nodes)
                 else:
@@ -618,7 +678,7 @@ def launch_setup(context, *args, **kwargs):
                 use_sim,
                 use_sim_time=node_use_sim_time,
             )
-            if controller_ready_waiter is not None:
+            if controller_ready_barrier is not None:
                 logger.info("Deferring execution nodes until required controllers are active...")
                 controller_dependent_actions.extend(execution_nodes)
             else:
@@ -659,7 +719,7 @@ def launch_setup(context, *args, **kwargs):
                 force=parse_bool(with_moveit_str, default=False),
             )
 
-            if controller_ready_waiter is not None:
+            if controller_ready_barrier is not None:
                 logger.info("Deferring MoveIt nodes until required controllers are active...")
                 controller_dependent_actions.extend(moveit_nodes)
             else:
@@ -686,7 +746,7 @@ def launch_setup(context, *args, **kwargs):
 
             task_node = generate_task_executor_node(robot_config, active_control_mode, node_use_sim_time)
             if task_node is not None:
-                if controller_ready_waiter is not None:
+                if controller_ready_barrier is not None:
                     controller_dependent_actions.append(task_node)
                 else:
                     actions.append(task_node)
@@ -731,7 +791,7 @@ def launch_setup(context, *args, **kwargs):
         logger.info("Continuing without recording visualizer...")
 
     if controller_dependent_actions:
-        if controller_ready_waiter is not None:
+        if controller_ready_barrier is not None:
             logger.info(
                 f"Controller readiness barrier armed for "
                 f"{len(controller_dependent_actions)} control-dependent action(s)"
@@ -739,7 +799,7 @@ def launch_setup(context, *args, **kwargs):
             actions.append(
                 RegisterEventHandler(
                     event_handler=OnProcessExit(
-                        target_action=controller_ready_waiter,
+                        target_action=controller_ready_barrier,
                         on_exit=_start_actions_on_success(
                             controller_dependent_actions,
                             success_message="Required controllers are active; starting control-dependent nodes.",
