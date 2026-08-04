@@ -78,12 +78,11 @@ def test_standalone_launch_rejects_disabled_mapping_config() -> None:
         load_semantic_mapping_robot_config("unused", str(CONFIG_PATH))
 
 
-def test_embedded_migration_does_not_require_service_bundles_or_identities(tmp_path: Path) -> None:
+def test_embedded_backend_does_not_require_service_bundles_or_identities(tmp_path: Path) -> None:
     data = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8"))
     mapping = data["robot"]["semantic_mapping"]
     mapping["enabled"] = True
     mapping["perception"].update({"mapping_backend": "embedded", "allow_legacy_embedded": True})
-    mapping["migration"]["embedded_mapping_backend"] = "migration_only"
     mapping["slam"].update(
         {
             "geometry_map_hash": "geometry-hash",

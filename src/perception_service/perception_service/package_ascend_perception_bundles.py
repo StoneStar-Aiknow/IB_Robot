@@ -106,9 +106,30 @@ def _sam2_deployment(name: str, soc: str, candidate: str, decoder_name: str, bat
         _bindings(
             (_binding("image", 0, "float32", (1, 3, 1024, 1024), "NCHW", "image"),),
             (
-                _binding("internal.high_res_feats_0", 0, "float32", (1, 32, 256, 256), "NCHW"),
-                _binding("internal.high_res_feats_1", 1, "float32", (1, 64, 128, 128), "NCHW"),
-                _binding("internal.image_embed", 2, "float32", (1, 256, 64, 64), "NCHW"),
+                _binding(
+                    "internal.high_res_feats_0",
+                    0,
+                    "float32",
+                    (1, 32, 256, 256),
+                    "NCHW",
+                    "/Reshape_5:0:high_res_feats_0",
+                ),
+                _binding(
+                    "internal.high_res_feats_1",
+                    1,
+                    "float32",
+                    (1, 64, 128, 128),
+                    "NCHW",
+                    "/Reshape_4:0:high_res_feats_1",
+                ),
+                _binding(
+                    "internal.image_embed",
+                    2,
+                    "float32",
+                    (1, 256, 64, 64),
+                    "NCHW",
+                    "/Reshape_3:0:image_embed",
+                ),
             ),
         ),
     )
@@ -126,9 +147,16 @@ def _sam2_deployment(name: str, soc: str, candidate: str, decoder_name: str, bat
                 _binding("has_mask_input", 6, "int8", (batch,), runtime_name="has_mask_input"),
             ),
             (
-                _binding("mask_logits", 0, "float32", (batch, 1, 256, 256), "NCHW", "masks"),
-                _binding("iou_predictions", 1, "float32", (batch, 1), runtime_name="iou_predictions"),
-                _binding("low_res_masks", 2, "float32", (batch, 1, 256, 256), "NCHW", "low_res_masks"),
+                _binding("mask_logits", 0, "float32", (batch, 1, 256, 256), "NCHW", "/Where_8:0:masks"),
+                _binding("iou_predictions", 1, "float32", (batch, 1), runtime_name="/Where_9:0:iou_predictions"),
+                _binding(
+                    "low_res_masks",
+                    2,
+                    "float32",
+                    (batch, 1, 256, 256),
+                    "NCHW",
+                    "/Clip:0:low_res_masks",
+                ),
             ),
         ),
     )
@@ -186,7 +214,7 @@ def _grounding_dino_deployment() -> DeploymentSpec:
                     _binding("token_type_ids", 2, "int64", (1, 8), runtime_name="token_type_ids"),
                     _binding("position_ids", 3, "int64", (1, 8), runtime_name="position_ids"),
                 ),
-                (_binding("internal.text_0", 0, "float32", (1, 8, 256), runtime_name="encoded_text"),),
+                (_binding("internal.text_0", 0, "float32", (1, 8, 256), runtime_name="/feat_map/Add:0:encoded_text"),),
             ),
         ),
         _artifact(
@@ -238,10 +266,18 @@ def _grounding_dino_deployment() -> DeploymentSpec:
                     ),
                     (
                         _binding(
-                            f"internal.visual_{index + 1}", 0, "float32", (1, 19160, 256), runtime_name="visual_out"
+                            f"internal.visual_{index + 1}",
+                            0,
+                            "float32",
+                            (1, 19160, 256),
+                            runtime_name=("PartitionedCall_/visual/norm2/LayerNormalization_LayerNorm_96:0:visual_out"),
                         ),
                         _binding(
-                            f"internal.text_{index + 1}", 1, "float32", (1, 8, 256), runtime_name="memory_text_out"
+                            f"internal.text_{index + 1}",
+                            1,
+                            "float32",
+                            (1, 8, 256),
+                            runtime_name="PartitionedCall_/Transpose_2_Transpose_155:0:memory_text_out",
                         ),
                     ),
                 ),
@@ -258,7 +294,11 @@ def _grounding_dino_deployment() -> DeploymentSpec:
                         _binding("internal.text_6", 1, "float32", (1, 8, 256), runtime_name="memory_text"),
                         _binding("text_token_mask", 2, "int64", (1, 8), runtime_name="text_token_mask"),
                     ),
-                    (_binding("internal.refpoint", 0, "float32", (1, 900, 4), runtime_name="refpoint"),),
+                    (
+                        _binding(
+                            "internal.refpoint", 0, "float32", (1, 900, 4), runtime_name="/GatherElements:0:refpoint"
+                        ),
+                    ),
                 ),
             ),
             _artifact(
@@ -290,8 +330,14 @@ def _grounding_dino_deployment() -> DeploymentSpec:
                         _binding("text_token_mask", 3, "int64", (1, 8), runtime_name="text_token_mask"),
                     ),
                     (
-                        _binding("pred_logits", 0, "float32", (1, 900, 256), runtime_name="pred_logits"),
-                        _binding("pred_boxes", 1, "float32", (1, 900, 4), runtime_name="pred_boxes"),
+                        _binding(
+                            "pred_logits",
+                            0,
+                            "float32",
+                            (1, 900, 256),
+                            runtime_name="/class_embed/ScatterND:0:pred_logits",
+                        ),
+                        _binding("pred_boxes", 1, "float32", (1, 900, 4), runtime_name="/Sigmoid:0:pred_boxes"),
                     ),
                 ),
             ),
@@ -400,6 +446,10 @@ def _specs() -> dict[str, BundleSpec]:
                 (
                     "grounded_sam2_swint_ogc/model_utils_work/candidates/ascend_310p/encoder_tgt.npy",
                     "assets/encoder_tgt.npy",
+                ),
+                (
+                    "grounded_sam2_swint_ogc/assets/bert-base-uncased/vocab.txt",
+                    "assets/bert-base-uncased/vocab.txt",
                 ),
             ),
         ),

@@ -5,11 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
 import numpy as np
 from PIL import Image
 
 from inference_service.generic_runtime import NamedTensorResult
 
+from .grounding_dino_tokenizer import BertWordPieceTokenizer
 from .model_contracts import MAX_MASK_BATCH, MAX_TEXT_BATCH
 from .perception_adapter import AdapterIdentity, PerceptionAdapter
 
@@ -307,10 +309,187 @@ class GroundingDINOAdapter(PerceptionAdapter):
         ]
 
 
+class GroundingDINORawAdapter(PerceptionAdapter):
+    """Manifest adapter for the 310P raw Grounding-DINO execution graph."""
+
+    identity = AdapterIdentity(
+        "grounding_dino_raw",
+        "grounding-dino-swint-rgb720x1280-bert-seq8-v1",
+        "grounding-dino-raw-logits-cxcywh-v1",
+        frozenset({"ascend_310p"}),
+    )
+    compiled_abi_finalized = True
+
+    @classmethod
+    def from_bundle(cls, bundle_root: str | Path, _identity=None) -> GroundingDINORawAdapter:
+        root = Path(bundle_root)
+        _read_adapter_identity(root, cls.identity)
+        tokenizer = BertWordPieceTokenizer(root / "assets" / "bert-base-uncased" / "vocab.txt", sequence_length=8)
+        target_path = root / "assets" / "encoder_tgt.npy"
+        target = np.ascontiguousarray(np.load(target_path, allow_pickle=False), dtype=np.float32)
+        if target.shape != (1, 900, 256):
+            raise ValueError(f"Grounding-DINO encoder_tgt must have shape (1,900,256), got {target.shape}")
+        instance = cls()
+        instance.tokenizer = tokenizer
+        instance.encoder_target = target
+        return instance
+
+    def preprocess(self, value: object) -> dict[str, np.ndarray]:
+        image_rgb, prompt, box_threshold, text_threshold = value
+        image = np.asarray(image_rgb, dtype=np.uint8)
+        if image.shape[:2] != (720, 1280):
+            image = cv2.resize(image, (1280, 720), interpolation=cv2.INTER_LINEAR)
+        normalized = image.astype(np.float32) / np.float32(255.0)
+        normalized = (normalized - np.asarray([0.485, 0.456, 0.406], dtype=np.float32)) / np.asarray(
+            [0.229, 0.224, 0.225], dtype=np.float32
+        )
+        tokenized = self.tokenizer.encode(str(prompt))
+        del box_threshold, text_threshold
+        return {
+            "image": np.ascontiguousarray(normalized.transpose(2, 0, 1)[None], dtype=np.float32),
+            "input_ids": tokenized["gdino.input_ids"],
+            "token_type_ids": tokenized["gdino.token_type_ids"],
+            "position_ids": tokenized["gdino.position_ids"],
+            "text_self_attention_masks": tokenized["gdino.text_self_attention_masks"],
+            "text_token_mask": tokenized["gdino.text_token_mask"],
+            "encoder_tgt": self.encoder_target,
+        }
+
+    def postprocess(
+        self,
+        result: NamedTensorResult,
+        *,
+        image_shape=None,
+        prompt="",
+        box_threshold=0.35,
+        text_threshold=0.25,
+        **_options,
+    ) -> list[GroundingDetection]:
+        logits = np.asarray(_output(result, "pred_logits"), dtype=np.float32)
+        boxes = np.asarray(_output(result, "pred_boxes"), dtype=np.float32)
+        if logits.ndim != 3 or logits.shape[0] != 1 or boxes.shape != (1, logits.shape[1], 4):
+            raise RuntimeError(f"Grounding-DINO raw outputs have incompatible shapes {logits.shape} and {boxes.shape}")
+        probabilities = 1.0 / (1.0 + np.exp(-np.clip(logits[0], -50.0, 50.0)))
+        scores = probabilities[:, : self.tokenizer.sequence_length].max(axis=1)
+        selected = np.flatnonzero(scores > float(box_threshold or 0.35))
+        height, width = tuple(image_shape or (720, 1280))
+        detections = []
+        for index in selected:
+            center_x, center_y, box_width, box_height = boxes[0, index]
+            xyxy = np.asarray(
+                [
+                    (center_x - box_width / 2.0) * width,
+                    (center_y - box_height / 2.0) * height,
+                    (center_x + box_width / 2.0) * width,
+                    (center_y + box_height / 2.0) * height,
+                ],
+                dtype=np.float32,
+            )
+            xyxy[[0, 2]] = np.clip(xyxy[[0, 2]], 0, width)
+            xyxy[[1, 3]] = np.clip(xyxy[[1, 3]], 0, height)
+            if xyxy[2] <= xyxy[0] or xyxy[3] <= xyxy[1]:
+                continue
+            label = (
+                self.tokenizer.decode_probability_mask(
+                    self.tokenizer.encode(str(prompt))["gdino.input_ids"],
+                    probabilities[index],
+                    float(text_threshold or 0.25),
+                )
+                or str(prompt).strip()
+            )
+            detections.append(
+                GroundingDetection(
+                    label=label,
+                    confidence=float(scores[index]),
+                    bbox_xyxy=xyxy,
+                    mask=np.zeros((height, width), dtype=np.uint8),
+                )
+            )
+        return detections
+
+
+class SAM2PromptAdapter(PerceptionAdapter):
+    """Manifest adapter for box-prompt SAM2 execution on Ascend 310P."""
+
+    identity = AdapterIdentity(
+        "sam2_prompt",
+        "sam2-longest-side1024-imagenet-box-prompt-v1",
+        "sam2-mask-logits-iou-v1",
+        frozenset({"ascend_310p", "ascend_310b"}),
+    )
+    compiled_abi_finalized = True
+
+    @classmethod
+    def from_bundle(cls, bundle_root: str | Path, _identity=None) -> SAM2PromptAdapter:
+        _read_adapter_identity(Path(bundle_root), cls.identity)
+        instance = cls()
+        instance.batch_size = 4
+        return instance
+
+    def preprocess(self, value: object) -> dict[str, np.ndarray]:
+        image_rgb, boxes = value
+        image = np.asarray(image_rgb, dtype=np.uint8)
+        height, width = image.shape[:2]
+        scale = 1024.0 / max(height, width)
+        resized_width = max(1, int(round(width * scale)))
+        resized_height = max(1, int(round(height * scale)))
+        resized = cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
+        canvas = np.zeros((1024, 1024, 3), dtype=np.uint8)
+        canvas[:resized_height, :resized_width] = resized
+        normalized = canvas.astype(np.float32) / np.float32(255.0)
+        normalized = (normalized - np.asarray([0.485, 0.456, 0.406], dtype=np.float32)) / np.asarray(
+            [0.229, 0.224, 0.225], dtype=np.float32
+        )
+        selected = [np.asarray(box, dtype=np.float32).reshape(4) for box in boxes][: self.batch_size]
+        if not selected:
+            raise ValueError("at least one bounding box is required")
+        coords = np.zeros((self.batch_size, 2, 2), dtype=np.float32)
+        labels = np.zeros((self.batch_size, 2), dtype=np.int8)
+        for index, box in enumerate(selected):
+            x1, y1, x2, y2 = box
+            coords[index] = np.asarray([[x1 * scale, y1 * scale], [x2 * scale, y2 * scale]], dtype=np.float32)
+            labels[index] = (2, 3)
+        for index in range(len(selected), self.batch_size):
+            coords[index] = coords[len(selected) - 1]
+            labels[index] = labels[len(selected) - 1]
+        return {
+            "image": np.ascontiguousarray(normalized.transpose(2, 0, 1)[None], dtype=np.float32),
+            "point_coords": coords,
+            "point_labels": labels,
+            "mask_input": np.zeros((self.batch_size, 1, 256, 256), dtype=np.float32),
+            "has_mask_input": np.zeros((self.batch_size,), dtype=np.int8),
+        }
+
+    def postprocess(self, result: NamedTensorResult, *, image_shape=None, count=1, **_options) -> list[np.ndarray]:
+        logits = np.asarray(_output(result, "mask_logits"), dtype=np.float32)
+        if logits.ndim != 4 or logits.shape[1] != 1:
+            raise RuntimeError(f"SAM2 prompt output has incompatible mask shape {logits.shape}")
+        height, width = tuple(image_shape or (1024, 1024))
+        scale = 1024.0 / max(height, width)
+        resized_width = max(1, int(round(width * scale)))
+        resized_height = max(1, int(round(height * scale)))
+        logits_height, logits_width = logits.shape[-2:]
+        valid_width = min(logits_width, max(1, int(round(resized_width * logits_width / 1024.0))))
+        valid_height = min(logits_height, max(1, int(round(resized_height * logits_height / 1024.0))))
+        return [
+            (
+                cv2.resize(
+                    logits[index, 0, :valid_height, :valid_width],
+                    (width, height),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                > 0
+            ).astype(np.uint8)
+            for index in range(min(int(count), len(logits)))
+        ]
+
+
 __all__ = [
     "GroundingDINOAdapter",
+    "GroundingDINORawAdapter",
     "MaskEncoding",
     "SAM2Adapter",
+    "SAM2PromptAdapter",
     "SegmentationMask",
     "SigLIP2ImageAdapter",
     "SigLIP2TextAdapter",

@@ -20,7 +20,9 @@ from .model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
 from .ram_plus_adapter import RAMPlusAdapter
 from .semantic_model_adapters import (
     GroundingDINOAdapter,
+    GroundingDINORawAdapter,
     SAM2Adapter,
+    SAM2PromptAdapter,
     SigLIP2ImageAdapter,
     SigLIP2TextAdapter,
 )
@@ -279,10 +281,68 @@ class GroundingDetectPlugin(_SessionPlugin):
         return f"confirmed {len(records)} detections"
 
 
+class GroundingDINORawDetectPlugin(_SessionPlugin):
+    """Text detection service for a compiled raw Grounding-DINO deployment."""
+
+    service_type = "ibrobot_msgs/srv/GroundingDetect"
+    family = "grounding_dino_raw"
+    adapter_class = GroundingDINORawAdapter
+
+    def handle(self, request, response) -> str:
+        if not request.text_prompt.strip():
+            raise ValueError("text prompt must not be empty")
+        image = self.image_rgb(request.image)
+        result = self._infer(
+            self.adapter.preprocess(
+                (image, request.text_prompt, float(request.box_threshold), float(request.text_threshold))
+            )
+        )
+        records = self.adapter.postprocess(
+            result,
+            image_shape=image.shape[:2],
+            prompt=request.text_prompt,
+            box_threshold=float(request.box_threshold),
+            text_threshold=float(request.text_threshold),
+        )
+        response.detections = _detection_array(self.host.bridge, request.image.header, records)
+        return f"detected {len(records)} boxes"
+
+
+class SegmentDetectionsPlugin(_SessionPlugin):
+    """Fill masks for detections using a manifest-bound SAM2 box-prompt service."""
+
+    service_type = "ibrobot_msgs/srv/SegmentDetections"
+    family = "sam2_prompt"
+    adapter_class = SAM2PromptAdapter
+
+    def handle(self, request, response) -> str:
+        source = list(request.detections.detections)
+        if not source:
+            response.detections = DetectionArray(header=request.image.header, detections=[])
+            return "segmented 0 detections"
+        image = self.image_rgb(request.image)
+        result = self._infer(self.adapter.preprocess((image, [detection.bbox for detection in source])))
+        masks = self.adapter.postprocess(result, image_shape=image.shape[:2], count=len(source))
+        output = []
+        for detection, mask in zip(source, masks, strict=False):
+            record = Detection2D()
+            record.header = request.image.header
+            record.label = detection.label
+            record.confidence = detection.confidence
+            record.bbox = detection.bbox
+            record.mask = self.host.bridge.cv2_to_imgmsg((mask > 0).astype(np.uint8) * 255, encoding="mono8")
+            record.mask.header = request.image.header
+            output.append(record)
+        response.detections = DetectionArray(header=request.image.header, detections=output)
+        return f"segmented {len(output)} detections"
+
+
 __all__ = [
     "GroundingDetectPlugin",
+    "GroundingDINORawDetectPlugin",
     "RAMPlusRecognizeTagsPlugin",
     "SAM2GenerateMasksPlugin",
+    "SegmentDetectionsPlugin",
     "SigLIP2EncodeEmbeddingsPlugin",
     "SigLIP2EncodeTextPlugin",
 ]

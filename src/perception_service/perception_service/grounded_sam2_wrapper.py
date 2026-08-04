@@ -12,14 +12,15 @@ from .model_utils import DEFAULT_MODEL_DIR, resolve_model_path, resolve_text_enc
 try:
     import cv2
     import numpy as np
+except ModuleNotFoundError as exc:
+    raise ModuleNotFoundError("perception_service requires NumPy and OpenCV; run `./scripts/setup.sh`.") from exc
+
+try:
     import torch
     from torchvision.ops import box_convert
-except ModuleNotFoundError as exc:
-    raise ModuleNotFoundError(
-        "Grounding-DINO/SAM2 perception dependencies are missing. Install them with "
-        "`./scripts/setup.sh --with-perception` or "
-        "`python3 -m pip install -r requirements/perception.txt`."
-    ) from exc
+except ModuleNotFoundError:
+    torch = None
+    box_convert = None
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,11 @@ class GroundedSAM2Wrapper:
         gdino_text_encoder: str = "grounded_sam2_swint_ogc/assets/bert-base-uncased",
         model_dir: str | None = None,
     ):
+        if torch is None or box_convert is None:
+            raise ModuleNotFoundError(
+                "The Torch Grounding-DINO/SAM2 backend dependencies are missing. Install them with "
+                "`./scripts/setup.sh --with-perception` or select `inference_backend:=ascend_local`."
+            )
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
 

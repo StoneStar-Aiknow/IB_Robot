@@ -173,30 +173,25 @@ embodied:
 
 如果希望统一走仓内推荐的 `/camera/front/...` 命名，应通过 `robot_config` launch 或显式 remap 做标准化。
 
-## 7. Grounded-SAM2 检测分割
+## 7. 抓取检测与分割
 
-`grounded_sam2_node` 和 `grounded_sam2_snapshot` 已并入 `perception_service`，作为感知包中的开放词汇检测/分割能力。
-抓取流水线默认使用腕部相机 topic：
-
-- RGB：`/camera/wrist/image_raw`
-- 对齐深度：`/camera/wrist/aligned_depth_to_color/image_raw`
-- CameraInfo：`/camera/wrist/aligned_depth_to_color/camera_info`
-
-首次使用前安装可选依赖并下载模型：
+抓取链使用 `model_service_node` 承载强类型服务，不包含订阅相机快照的专用兼容节点。首次使用 PC Torch
+deployment 前安装可选依赖并下载模型：
 
 ```bash
 ./scripts/setup.sh --with-perception
 ./scripts/download_perception_models.sh
 ```
 
-构建并运行在线节点：
+构建接口和 generic host：
 
 ```bash
 source .shrc_local && colcon build --symlink-install --merge-install --packages-select ibrobot_msgs perception_service
-source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 run perception_service grounded_sam2_node
 ```
 
-该节点提供 `ibrobot_msgs/srv/DetectSegment`，并发布 `ibrobot_msgs/msg/DetectionArray`，供下游 `manipulation_service` 抓取规划消费。
+正式运行由 robot-config `perception_services.services` 为每个 named deployment 启动一个 host。PC 配置选择组合
+Grounded-SAM2 Torch deployment，通过 `GroundingDetect` 一次返回 bbox 和 mask；310P 配置分别选择
+`grounding_dino_raw` 与 `sam2_prompt` bundle，通过 `GroundingDetect -> SegmentDetections` 返回相同语义结果。
 
 ## 8. Generic Model Services
 
@@ -230,8 +225,8 @@ wrapper 的 `backend=ascend_om` 路径不再提供。CUDA 不可用时必须在 
 deployment，节点不会自动切换 backend。
 
 感知模型与 ACT/PI0.5 使用相同的 bundle-first 结构。下载脚本直接生成四个 bundle 根目录：
-`models/sam2.1_hiera_tiny/`、`models/ram_plus_swin_large_14m/`、
-`models/siglip2_so400m_patch14_384/` 和 `models/grounded_sam2_swint_ogc/`。每个目录包含
+`models/perception/sam2.1_hiera_tiny/`、`models/perception/ram_plus_swin_large_14m/`、
+`models/perception/siglip2_so400m_patch14_384/` 和 `models/perception/grounded_sam2_swint_ogc/`。每个目录包含
 `inference_manifest.json`、`assets/adapter.json`、模型资产和 `torch_cpu`/`torch_cuda` named deployment。
 Grounding DINO Swin-T OGC 的网络结构配置由 `perception_service.grounding_dino_config` 常量绑定到软件版本，
 不作为模型资产复制进 bundle；bundle 仅保存 checkpoint、文本编码器和 SAM2 checkpoint 等运行资产。
@@ -239,8 +234,7 @@ Grounding DINO Swin-T OGC 的网络结构配置由 `perception_service.grounding
 SigLIP2 image/text 服务共享同一 bundle 与 embedding identity，但仍由独立进程加载独立 session。RAM++ 仍从
 `ram_models/recognize-anything/` 导入上游 `ram` 源码；源码不是模型资产。ONNX、OM 等未验证转换结果只能放在
 bundle 的 `model_utils_work/`，通过 conformance 与 promotion 后才可复制到不可变
-`artifacts/<backend>/<deployment>/generations/<uuid>/` 并注册为 named deployment。这些 service-backed mapping
-资产不应与 legacy `grounded_sam2_node` 的 `DetectSegment` contract 混用。
+`artifacts/<backend>/<deployment>/generations/<uuid>/` 并注册为 named deployment。
 
 经 ABI 审核的 compiled-only 资产由 `perception_service.package_ascend_perception_bundles` 从
 `model_utils_work/candidates/ascend_*` 打包。SAM2 和 SigLIP2 提供 `ascend_310p`、`ascend_310b` deployment；
@@ -249,7 +243,8 @@ Grounding DINO 当前只提供固定 720x1280、文本长度 8 的 `ascend_310p`
 
 ### 检测结果质心
 
-每个 `Detection2D` 携带两种 3D 质心（相机光学系，单位 m）：
+generic 感知服务不读取深度，因此其 `Detection2D` 只保证 bbox 与 mask。`grasp_planner_node` 使用同一 RGB
+时间戳附近的 depth/CameraInfo 计算两种 3D 质心，并放入 `PlanGrasp` 响应（相机光学系，单位 m）：
 
 | 字段 | 计算方式 | 适用场景 |
 |------|---------|---------|
@@ -265,3 +260,41 @@ Grounding DINO 当前只提供固定 720x1280、文本长度 8 的 `ascend_310p`
 - 凸形物体（marker、cucumber）：两种质心差异小，体积质心可靠
 
 若需更准确的体积质心，应使用多视角点云融合补全背面，再做网格体积积分。
+
+### 9.1 Ascend 310P 抓取感知
+
+310P 抓取感知使用两个 schema-v2 bundle 和 shared `AscendOmModelSession`，不进入 policy `AscendBackend`。
+板端只依赖 NumPy、OpenCV、`inference_manifest`、`inference_service` 和 CANN ACL，不导入
+GroundingDINO、SAM2、TorchVision 或对应 CUDA 扩展。用仓库打包器从已验证候选生成独立 bundle：
+
+```bash
+source .shrc_local
+ros2 run perception_service package_ascend_perception_bundles \
+  --models-root models/perception \
+  --family grounding_dino
+ros2 run perception_service package_ascend_perception_bundles \
+  --models-root models/perception \
+  --family sam2
+```
+
+Grounding-DINO bundle 记录并校验 12 个 OM、`encoder_tgt.npy`、bundle-local WordPiece vocab 和 D2D links；
+SAM2 bundle 独立记录 encoder 与固定 batch-4 decoder。GroundingDINO 固定输入为
+`1x3x720x1280`、文本长度为 8；提示词超过 8 个 BERT token 时会明确报错，不能静默截断。
+
+完整抓取配置在顶层 `perception_services` 选择两个本地 Ascend named deployment：
+
+```yaml
+perception_services:
+  services:
+    - id: grasp_grounding
+      bundle_path: models/perception/grounding_dino_swint_seq8_1280x720_ascend
+      deployment: ascend_310p
+      service_type: ibrobot_msgs/srv/GroundingDetect
+    - id: grasp_segmentation
+      bundle_path: models/perception/sam2_hiera_tiny_ascend
+      deployment: ascend_310p
+      service_type: ibrobot_msgs/srv/SegmentDetections
+```
+
+由统一 robot launch 启动后，RGB-D 相机、两个 model service、GraspGen、MoveIt 执行和抓取验证使用同一
+ROS service/topic 契约；`grasp_planner_node` 通过配置的 endpoint 区分组合 PC 服务和 310P 两段服务。

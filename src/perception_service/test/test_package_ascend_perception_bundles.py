@@ -26,6 +26,7 @@ def test_compiled_ascend_bundle_specs_validate(tmp_path):
         if family == "grounding_dino":
             assert len(validated.deployment.execution) == 12
             assert validated.deployment.device_links
+            assert (manifest_path.parent / "assets/bert-base-uncased/vocab.txt").read_bytes() == b"asset"
 
 
 def test_compiled_ascend_bundle_revisions_follow_artifact_content(tmp_path):
