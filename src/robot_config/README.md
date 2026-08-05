@@ -697,6 +697,26 @@ ros2 launch robot_config robot.launch.py \
 `voice_asr_service` 的包级默认值与 `robot_config` 中的 `VoiceASRConfig` 默认值保持同步；
 具体机器人仍应以 `config/robots/<robot>.yaml` 中的 `robot.voice_asr` 为准。
 
+### Voice TTS（语音合成）
+
+`robot_config` 通过 `robot.voice_tts` 启停 `voice_tts_service`。启用时必须显式提供 ZipVoice
+`bundle_path` 和 manifest 中的 named `deployment`；不接受独立的 `backend` 或 `device` 选择，
+也不会在加载失败后切换后端。完整系统从 `robot.launch.py` 启动，包级 launch 仅用于调试。
+
+TTS 对外提供 `/voice_tts/synthesize` typed service。请求和响应携带音频字节而不是服务端文件路径，
+并通过文本、prompt、分段数和响应字节上限约束单个 DDS response。真实模型未就绪时服务返回
+`MODEL_NOT_READY`；部署身份和 readiness 由响应中的 `ModelRuntimeInfo` 报告。
+launch builder 只解析配置和创建节点，不提前打开模型 bundle。节点启动时校验 bundle，因而
+`exit_on_init_failure=false` 能在模型存储暂不可用时保留服务并返回 `MODEL_NOT_READY`。默认不把模型载入
+内存，首次有效调用 `/voice_tts/synthesize` 时自动加载并常驻；
+`/voice_tts/load` 可提前预热，`/voice_tts/unload` 会等待当前合成结束后释放模型资源，节点和服务仍保持运行，
+下次合成再自动加载。将 `load_on_startup` 设为 `true` 可恢复节点启动时立即加载的行为。
+相对 `bundle_path` 以 `.shrc_local` 设置的绝对 `WORKSPACE` 为根目录解析，例如默认值对应
+`$WORKSPACE/models/voice_tts/zipvoice`。
+当前经 310P1 真机核查的 `ascend_310p` deployment 支持固定 bundle prompt、中文/数字/常用标点和 24 kHz
+WAV；它尚不支持请求级 prompt，调用时返回 `UNSUPPORTED_PROMPT`。该限制属于 deployment capability，
+不是 `robot_config` 的隐式后端选择。
+
 ### 真机手眼配置
 
 SO101 抓取使用同级独立配置 `config/robots/so101_handeye_realsense_grasp.yaml`。用户应直接在

@@ -368,6 +368,15 @@ The only canonical backend names are:
 | `rknn` | RKNNLite execution of RKNN artifacts |
 | `hmm` | Houmo TCIM execution of HMM multi-module artifacts |
 
+An Ascend compiled deployment can use manifest `device_links` to bind a producer output buffer directly to a
+consumer input. `AscendOmModelSession` executes these roles in manifest order and copies back only public outputs
+and host-routed intermediates that have no device link; the shared runtime still owns device lifetime, buffers,
+and serial admission. For flow-matching or ODE pipelines whose model-family adapter repeatedly calls one role
+under host scheduling, the public `AscendOmRoleSession` provides manifest ABI validation, resident model
+resources, semantic-name I/O, and a shared ACL lease without exposing private model dictionaries or initializing
+a second process-wide ACL runtime. If ACL reports a zero-byte symbolic output, a fully fixed manifest shape is
+required to calculate the exact buffer size; dynamic shapes remain rejected.
+
 The initial support matrix is normative and enforced at startup:
 
 | Policy family | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |

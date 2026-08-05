@@ -14,6 +14,7 @@ from robot_config.config import (
     Ros2ControlConfig,
     SkillGatewayRuntimeConfig,
     VoiceASRConfig,
+    VoiceTTSConfig,
 )
 from robot_config.contract_utils import contract_fingerprint, iter_specs
 from robot_config.launch_builders.recording import get_recording_topics
@@ -27,6 +28,7 @@ from robot_config.loader import (
     load_robot_config,
     load_robot_config_dict,
     load_voice_asr_config,
+    load_voice_tts_config,
     validate_config,
 )
 from robot_config.timeout_policy import DEFAULT_EMBODIED_TIMEOUT_POLICY, resolve_embodied_timeout_policy
@@ -37,6 +39,7 @@ from voice_asr_service.model_manager import (
     infer_model_bundle_from_path_hint,
     resolve_model_assets,
 )
+from voice_tts_service.defaults import VOICE_TTS_DEFAULTS
 
 HUMBLE_FLOAT32_MAX = 3.402823466e38
 IEEE_FLOAT32_MAX = 3.4028234663852886e38
@@ -544,6 +547,13 @@ def test_load_single_arm_config():
     assert config.voice_asr.device_name == ""
     assert config.voice_asr.device_index == -1
     assert config.voice_asr.exit_on_init_failure is True
+    assert config.voice_tts.enabled is False
+    assert config.voice_tts.bundle_path == "models/voice_tts/zipvoice"
+    assert config.voice_tts.deployment == ""
+    assert config.voice_tts.service_name == "/voice_tts/synthesize"
+    assert config.voice_tts.load_service_name == "/voice_tts/load"
+    assert config.voice_tts.unload_service_name == "/voice_tts/unload"
+    assert config.voice_tts.load_on_startup is False
     assert config.skill_gateway.status_service == "/embodied/get_skill_gateway_status"
     assert config.skill_gateway.required_control_mode == "moveit_planning"
     assert config.skill_gateway.default_skill_timeout_sec == 120.0
@@ -1172,6 +1182,48 @@ def test_voice_asr_runtime_defaults_match_robot_config_defaults():
     assert config_defaults.device_index == VOICE_ASR_DEFAULTS["device_index"]
     assert config_defaults.device_name == VOICE_ASR_DEFAULTS["device_name"]
     assert config_defaults.exit_on_init_failure == VOICE_ASR_DEFAULTS["exit_on_init_failure"]
+
+
+def test_voice_tts_loader_and_runtime_defaults_match():
+    config = load_voice_tts_config(
+        {
+            "enabled": True,
+            "bundle_path": "models/voice_tts/custom",
+            "deployment": "torch_cpu",
+            "max_request_chars": 1000,
+        }
+    )
+    defaults = VoiceTTSConfig()
+
+    assert config.enabled is True
+    assert config.bundle_path == "models/voice_tts/custom"
+    assert config.deployment == "torch_cpu"
+    assert config.max_request_chars == 1000
+    assert defaults.bundle_path == VOICE_TTS_DEFAULTS["bundle_path"]
+    assert defaults.deployment == VOICE_TTS_DEFAULTS["deployment"]
+    assert defaults.service_name == VOICE_TTS_DEFAULTS["service_name"]
+    assert defaults.load_service_name == VOICE_TTS_DEFAULTS["load_service_name"]
+    assert defaults.unload_service_name == VOICE_TTS_DEFAULTS["unload_service_name"]
+    assert defaults.load_on_startup == VOICE_TTS_DEFAULTS["load_on_startup"]
+    assert defaults.prompt_profile == VOICE_TTS_DEFAULTS["prompt_profile"]
+    assert defaults.max_response_audio_bytes == VOICE_TTS_DEFAULTS["max_response_audio_bytes"]
+
+
+def test_validate_voice_tts_requires_explicit_deployment_and_valid_limits():
+    config = RobotConfig(
+        name="test_robot",
+        type="so101",
+        robot_type="so_101",
+        ros2_control=Ros2ControlConfig(hardware_plugin="so101_hardware/SO101SystemHardware", params={}),
+    )
+    config.voice_tts.enabled = True
+    config.voice_tts.deployment = ""
+    config.voice_tts.max_segments = 0
+
+    errors = validate_config(config)
+
+    assert "voice_tts.deployment is required when voice_tts.enabled is true" in errors
+    assert "voice_tts.max_segments must be positive" in errors
 
 
 def test_validate_embodied_ignores_disabled_named_target_poses():

@@ -754,6 +754,14 @@ IK/FK 验证的 `sensor_msgs/JointState`，网关直接规划到同一组机械�
 
 热词设置服务，由 `voice_asr_service` 提供。
 
+### `SynthesizeSpeech.srv`
+
+跨主机安全的语音合成服务，由 `voice_tts_service` 提供。请求携带文本和可选 WAV prompt 字节，
+响应返回一个或多个完整 `SynthesizedAudio` WAV 段、稳定错误码、耗时和 `ModelRuntimeInfo`，不使用
+服务端本地输入或输出路径。
+请求级 prompt 的可用性由 named deployment 的真实能力决定；不支持时返回 `UNSUPPORTED_PROMPT`，不会
+静默忽略 prompt。
+
 ---
 
 ## 4. 推理调度接口

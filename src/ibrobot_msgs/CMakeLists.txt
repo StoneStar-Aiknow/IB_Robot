@@ -59,6 +59,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/SemanticMapMetadata.msg"
   "msg/SemanticObject3D.msg"
   "msg/SemanticObject3DArray.msg"
+  "msg/SynthesizedAudio.msg"
   "msg/GraspCandidate.msg"
   "msg/GraspCandidateArray.msg"
   "msg/SpeechDirection.msg"
@@ -101,6 +102,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/VerifyGrasp.srv"
   "srv/GetSemanticObjects.srv"
   "srv/ResolveSemanticTarget.srv"
+  "srv/SynthesizeSpeech.srv"
   DEPENDENCIES std_msgs action_msgs builtin_interfaces geometry_msgs sensor_msgs
 )
 

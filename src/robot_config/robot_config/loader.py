@@ -26,6 +26,7 @@ from robot_config.config import (
     SemanticMappingConfig,
     SkillGatewayRuntimeConfig,
     VoiceASRConfig,
+    VoiceTTSConfig,
 )
 from robot_config.grasp_execution_config import validate_grasp_execution_config
 from robot_config.observation_transport import (
@@ -1097,6 +1098,33 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
     )
 
 
+def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
+    """Load Voice TTS configuration without selecting a backend implicitly."""
+
+    defaults = VoiceTTSConfig()
+    bundle_path = data.get("bundle_path", defaults.bundle_path)
+    return VoiceTTSConfig(
+        enabled=data.get("enabled", defaults.enabled),
+        bundle_path=resolve_ros_path(bundle_path) if bundle_path else "",
+        deployment=data.get("deployment", defaults.deployment),
+        service_name=data.get("service_name", defaults.service_name),
+        load_service_name=data.get("load_service_name", defaults.load_service_name),
+        unload_service_name=data.get("unload_service_name", defaults.unload_service_name),
+        load_on_startup=data.get("load_on_startup", defaults.load_on_startup),
+        prompt_profile=data.get("prompt_profile", defaults.prompt_profile),
+        segment_max_chars=data.get("segment_max_chars", defaults.segment_max_chars),
+        segment_pause_ms=data.get("segment_pause_ms", defaults.segment_pause_ms),
+        max_request_chars=data.get("max_request_chars", defaults.max_request_chars),
+        max_prompt_audio_bytes=data.get("max_prompt_audio_bytes", defaults.max_prompt_audio_bytes),
+        max_prompt_duration_sec=data.get("max_prompt_duration_sec", defaults.max_prompt_duration_sec),
+        max_segments=data.get("max_segments", defaults.max_segments),
+        max_response_audio_bytes=data.get("max_response_audio_bytes", defaults.max_response_audio_bytes),
+        max_queue_size=data.get("max_queue_size", defaults.max_queue_size),
+        device_id=data.get("device_id", defaults.device_id),
+        exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
+    )
+
+
 def load_semantic_mapping_config(data: dict[str, Any]) -> SemanticMappingConfig:
     """Load the standalone semantic mapping section without flattening its contracts."""
     return SemanticMappingConfig(
@@ -1206,6 +1234,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
     contract = load_contract_config(contract_data)
 
     voice_asr = load_voice_asr_config(robot_data.get("voice_asr", {}))
+    voice_tts = load_voice_tts_config(robot_data.get("voice_tts", {}))
     embodied = load_embodied_config(robot_data.get("embodied", {}))
     skill_gateway = SkillGatewayRuntimeConfig(
         status_service=embodied.skill_gateway_status_service,
@@ -1229,6 +1258,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         peripherals=peripherals,
         contract=contract,
         voice_asr=voice_asr,
+        voice_tts=voice_tts,
         embodied=embodied,
         skill_gateway=skill_gateway,
         semantic_mapping=semantic_mapping,
@@ -1476,6 +1506,33 @@ def validate_config(config: RobotConfig) -> list[str]:
 
     if config.voice_asr.enabled and not config.voice_asr.model_path and not config.voice_asr.auto_download_model:
         errors.append("voice_asr.model_path is required when voice_asr.enabled is true")
+
+    if config.voice_tts.enabled:
+        if not config.voice_tts.bundle_path:
+            errors.append("voice_tts.bundle_path is required when voice_tts.enabled is true")
+        if not config.voice_tts.deployment:
+            errors.append("voice_tts.deployment is required when voice_tts.enabled is true")
+        if not config.voice_tts.service_name.startswith("/"):
+            errors.append("voice_tts.service_name must be an absolute ROS service name")
+        if not config.voice_tts.load_service_name.startswith("/"):
+            errors.append("voice_tts.load_service_name must be an absolute ROS service name")
+        if not config.voice_tts.unload_service_name.startswith("/"):
+            errors.append("voice_tts.unload_service_name must be an absolute ROS service name")
+        if not config.voice_tts.prompt_profile:
+            errors.append("voice_tts.prompt_profile must be non-empty")
+        positive_limits = {
+            "segment_max_chars": config.voice_tts.segment_max_chars,
+            "max_request_chars": config.voice_tts.max_request_chars,
+            "max_prompt_audio_bytes": config.voice_tts.max_prompt_audio_bytes,
+            "max_prompt_duration_sec": config.voice_tts.max_prompt_duration_sec,
+            "max_segments": config.voice_tts.max_segments,
+            "max_response_audio_bytes": config.voice_tts.max_response_audio_bytes,
+        }
+        for name, value in positive_limits.items():
+            if value <= 0:
+                errors.append(f"voice_tts.{name} must be positive")
+        if config.voice_tts.segment_pause_ms < 0 or config.voice_tts.max_queue_size < 0:
+            errors.append("voice_tts.segment_pause_ms and max_queue_size must be non-negative")
 
     if config.embodied.enabled:
         valid_directions = {"forward", "backward", "left", "right", "up", "down"}

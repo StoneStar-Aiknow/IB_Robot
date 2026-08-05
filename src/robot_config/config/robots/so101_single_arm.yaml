@@ -142,6 +142,27 @@ robot:
     device_name: ""
     exit_on_init_failure: true
 
+  # Voice TTS is disabled until a validated ZipVoice bundle and named deployment are installed.
+  voice_tts:
+    enabled: false
+    bundle_path: "models/voice_tts/zipvoice"
+    deployment: ""
+    service_name: /voice_tts/synthesize
+    load_service_name: /voice_tts/load
+    unload_service_name: /voice_tts/unload
+    load_on_startup: false
+    prompt_profile: default
+    segment_max_chars: 200
+    segment_pause_ms: 150
+    max_request_chars: 4000
+    max_prompt_audio_bytes: 10485760
+    max_prompt_duration_sec: 30.0
+    max_segments: 32
+    max_response_audio_bytes: 67108864
+    max_queue_size: 2
+    device_id: 0
+    exit_on_init_failure: true
+
   semantic_mapping:
     enabled: false
 

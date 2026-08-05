@@ -46,6 +46,7 @@ known-first-party = [
     "robot_teleop",
     "robot_moveit",
     "voice_asr_service",
+    "voice_tts_service",
     "so101_hardware",
     "sim_models",
     "tensormsg",

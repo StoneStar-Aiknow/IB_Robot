@@ -194,6 +194,30 @@ class VoiceASRConfig:
 
 
 @dataclass
+class VoiceTTSConfig:
+    """Typed Voice TTS service configuration managed by robot_config."""
+
+    enabled: bool = False
+    bundle_path: str = "models/voice_tts/zipvoice"
+    deployment: str = ""
+    service_name: str = "/voice_tts/synthesize"
+    load_service_name: str = "/voice_tts/load"
+    unload_service_name: str = "/voice_tts/unload"
+    load_on_startup: bool = False
+    prompt_profile: str = "default"
+    segment_max_chars: int = 200
+    segment_pause_ms: int = 150
+    max_request_chars: int = 4000
+    max_prompt_audio_bytes: int = 10 * 1024 * 1024
+    max_prompt_duration_sec: float = 30.0
+    max_segments: int = 32
+    max_response_audio_bytes: int = 64 * 1024 * 1024
+    max_queue_size: int = 2
+    device_id: int = 0
+    exit_on_init_failure: bool = True
+
+
+@dataclass
 class SemanticMappingConfig:
     """Standalone semantic mapping configuration managed by robot_config."""
 
@@ -227,6 +251,7 @@ class RobotConfig:
     peripherals: list[CameraConfig | PeripheralConfig] = field(default_factory=list)
     contract: ContractExtensionConfig = field(default_factory=ContractExtensionConfig)
     voice_asr: VoiceASRConfig = field(default_factory=VoiceASRConfig)
+    voice_tts: VoiceTTSConfig = field(default_factory=VoiceTTSConfig)
     embodied: EmbodiedConfig = field(default_factory=EmbodiedConfig)
     skill_gateway: SkillGatewayRuntimeConfig = field(default_factory=SkillGatewayRuntimeConfig)
     semantic_mapping: SemanticMappingConfig = field(default_factory=SemanticMappingConfig)

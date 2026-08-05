@@ -590,6 +590,28 @@ For more details, see:
 - [action_dispatch README](../action_dispatch/README.md) - Detailed executor documentation
 - [docs/architecture.md](../../docs/architecture.md) - System architecture overview
 
+### Voice TTS
+
+`robot.voice_tts` is the robot-level single source of truth for enabling and configuring the optional
+`voice_tts_service` package. Enabling it requires an explicit ZipVoice `bundle_path` and a named manifest
+`deployment`; configuration never selects a separate backend or silently falls back after a load failure. The
+full system starts TTS through `robot.launch.py`, while the package launch remains a standalone debugging entry.
+
+The public typed service is `/voice_tts/synthesize`. Requests and responses carry audio bytes rather than
+server-local paths and bound text, prompt, segment count, and response size. The launch builder resolves
+configuration and creates the node but does not open the model bundle. The node validates the bundle at startup,
+so `exit_on_init_failure=false` can keep the endpoints alive and report `MODEL_NOT_READY` when model storage is
+temporarily unavailable.
+
+With `load_on_startup=false`, the first valid synthesis request loads the model and later requests reuse it in
+memory. `/voice_tts/load` pre-warms the model, while `/voice_tts/unload` waits for active synthesis and then
+releases model resources without stopping the ROS endpoints. Relative `bundle_path` values resolve from the
+absolute `WORKSPACE` set by `.shrc_local`.
+
+The verified `ascend_310p` deployment uses the fixed bundle prompt, accepts Chinese, numbers, and common
+punctuation, and returns 24 kHz mono WAV. Request-scoped prompts are currently rejected with
+`UNSUPPORTED_PROMPT`; this is a deployment capability rather than an implicit backend choice.
+
 
 ## Usage
 

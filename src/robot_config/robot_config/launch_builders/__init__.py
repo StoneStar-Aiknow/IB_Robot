@@ -39,6 +39,10 @@ def __getattr__(name: str):
         from robot_config.launch_builders.voice_asr import generate_voice_asr_nodes
 
         return generate_voice_asr_nodes
+    if name == "generate_voice_tts_nodes":
+        from robot_config.launch_builders.voice_tts import generate_voice_tts_nodes
+
+        return generate_voice_tts_nodes
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -61,6 +65,7 @@ __all__ = [
     "generate_moveit_nodes",
     # Voice ASR
     "generate_voice_asr_nodes",
+    "generate_voice_tts_nodes",
     # Navigation
     "generate_navigation_nodes",
     # Hardware mock
