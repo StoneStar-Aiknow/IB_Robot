@@ -125,7 +125,9 @@ single-step graph. Reducing denoising steps remains an algorithmic hard approval
 
 ## No-Gain Results And Re-Profiling
 
-Do not assume a plausible rewrite helps:
+No-gain and regression results lower a candidate's priority for a similar graph; they do not ban the
+candidate in other policies, shapes, CANN releases, or exact SoCs. Retest when the mechanism could change.
+Do not assume a plausible rewrite helps, but do not universalize one result:
 
 - two-camera internal batching measured 479.238 ms versus 479.944 ms and provided no meaningful gain;
 - query blocking alone did not improve vision PV;
@@ -133,6 +135,21 @@ Do not assume a plausible rewrite helps:
 - Expert opset 17 alone did not help;
 - Expert rank-3 FP32 alone regressed;
 - unchanged ONNX means the source patch did not reach export.
+
+Multi-camera vision batching deserves explicit reconsideration. Its purpose is to increase AI Core
+occupancy by running identical vision towers as one larger batch. It has produced meaningful gains in PI05,
+even though the measured SmolVLA/Ascend310P3 graph gained only 0.15% after earlier attention optimization.
+Ascend310P1 has more AI Cores than Ascend310P3, so a batch-1 camera branch may leave more capacity unused and
+batch-2 may still improve utilization. Recommend a focused batch-1-versus-batch-N benchmark when:
+
+- two or more cameras use the same vision weights and resolution;
+- external camera ordering can be restored after an internal batch/split;
+- profiling suggests low cube/core utilization or duplicated launch overhead;
+- the target changes between P1 and P3;
+- the policy family or vision token shape differs from the previous no-gain experiment.
+
+Keep the external observation ABI and camera-major token semantics unchanged, and accept only measured
+loop-20 weighted improvement with final-action accuracy.
 
 Re-profile after every major gain. Calculate `sum(role_mean * invocations_per_action)`. The Expert initially
 represented only about 2.3% of latency, but ten invocations became dominant after VLM optimization.

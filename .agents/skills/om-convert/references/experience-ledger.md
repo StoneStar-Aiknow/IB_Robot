@@ -47,6 +47,10 @@ Exclude `not_evaluated` because the user may choose conversion only and never en
 A hit requires evidence; merely following a default does not count unless it solved a real conversion
 constraint or produced a measured gain.
 
+`attempted_no_gain` is scoped to the recorded policy, shapes, toolchain, and exact SoC. It lowers priority
+for a close repeat but does not make the experience globally inapplicable. Re-evaluate it when those inputs
+change, especially utilization-driven choices such as multi-camera batching between Ascend310P3 and P1.
+
 Also report catalog coverage as `evaluated/12` so `1/1` cannot be mistaken for full experience
 coverage.
 

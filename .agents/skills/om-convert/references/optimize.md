@@ -62,6 +62,9 @@ reproduction commands are the durable record, not every binary candidate.
 
 The order is evidence-driven. Skip a rung when profiling shows it is irrelevant.
 
+An earlier `attempted_no_gain` or regression lowers priority only for a materially similar graph and target.
+It is not a permanent skip rule. Re-evaluate when policy family, shapes, compiler, dtype, or exact SoC changes.
+
 For Ascend310P, read `ascend310p-optimization.md` before proposing the ladder. Default to opset 17 and
 end-to-end FP16 with only accuracy-proven FP32 islands. Give PFA low priority and prefer standard-ONNX
 rank-3 BMM rewrites.
@@ -104,6 +107,11 @@ because a fused operator exists.
 
 Re-rank after every large gain using invocation-weighted latency. A repeatedly invoked Action Expert can
 become dominant only after VLM optimization.
+
+For repeated camera encoders, include an internal camera-batch candidate when core utilization can improve.
+PI05 has shown meaningful gains from this structure. A weak Ascend310P3 result does not rule it out on
+Ascend310P1, whose additional cores may benefit more from a larger vision batch. Preserve the external camera
+ABI and token order, then decide from exact-SoC loop-20 and final-action measurements.
 
 ### 2A. Prefer Opset 17 And FP16 On 310P
 

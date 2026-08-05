@@ -210,6 +210,10 @@ evidence, ATC version, target, and resolution source.
 - Give PromptFlashAttention low priority on Ascend310P. Warn that P1/P3 deployments commonly cannot use
   it through a portable ONNX path; the available parser may require private `NPUPromptFlashAttention`.
   Prefer standard-ONNX BMM rewrites.
+- Treat prior no-gain or regression results as ranking evidence, not universal prohibitions. Reconsider
+  them when policy family, tensor shape, compiler, or exact SoC changes. In particular, test multi-camera
+  vision batching when duplicate encoders underutilize cores; PI05 has shown useful gains, and the extra
+  cores on Ascend310P1 may make batching more valuable than an Ascend310P3 result suggests.
 - For serial OM roles, connect producer outputs directly to consumer inputs with shared ACL device
   buffers, following the PI05 VLM-to-Action-Expert device-link pattern. Do not round-trip internal
   handoff tensors through the host.
