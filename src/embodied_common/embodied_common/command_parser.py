@@ -19,6 +19,14 @@ class PlannedTask:
     message: str = ""
 
 
+_WORKFLOW_LEADING_RE = re.compile(r"^\s*(?:first(?:ly)?|先|首先)\s*[,，:：]?\s*", re.IGNORECASE)
+_WORKFLOW_SEPARATOR_RE = re.compile(
+    r"\s*(?:(?:,|，|;|；)\s*)?(?:then|followed\s+by|next|after\s+that|然后|再(?!见)|接着|随后)\s*",
+    re.IGNORECASE,
+)
+_STEP_LEADING_RE = re.compile(r"^\s*(?:please|execute|perform|do|请|执行|做)\s*", re.IGNORECASE)
+
+
 def _contains_any(text: str, keywords: list[str]) -> bool:
     return any(keyword in text for keyword in keywords)
 
@@ -39,6 +47,65 @@ def _match_skill_alias(text: str, skill_aliases: dict[str, list[str]] | None) ->
     # Prefer longer keyword; for equal length, prefer earlier position in text.
     matched.sort(key=lambda item: (-len(item[1]), item[2]))
     return matched[0][0]
+
+
+def _matched_skill_names(text: str, skill_aliases: dict[str, list[str]] | None) -> set[str]:
+    if not skill_aliases:
+        return set()
+    normalized = text.lower().replace(" ", "")
+    matches = []
+    for skill_name, aliases in skill_aliases.items():
+        for alias in aliases:
+            candidate = alias.lower().replace(" ", "")
+            if not candidate:
+                continue
+            start = normalized.find(candidate)
+            if start >= 0:
+                matches.append((skill_name, start, start + len(candidate)))
+    matches.sort(key=lambda item: (-(item[2] - item[1]), item[1]))
+    selected = []
+    for match in matches:
+        if any(match[1] < other[2] and other[1] < match[2] for other in selected):
+            continue
+        selected.append(match)
+    return {skill_name for skill_name, _start, _end in selected}
+
+
+def parse_text_workflow(
+    text: str,
+    default_target_name: str = "demo_object",
+    default_place_name: str = "tray_right",
+    default_relative_motion_step_m: float = 0.03,
+    skill_aliases: dict[str, list[str]] | None = None,
+) -> tuple[list[PlannedTask], str]:
+    """Parse an explicitly ordered command into independently parameterized steps."""
+
+    raw = (text or "").strip()
+    if not raw:
+        return [], "empty command"
+    aliases = {skill_name: [skill_name, *values] for skill_name, values in (skill_aliases or {}).items()}
+    without_leading = _WORKFLOW_LEADING_RE.sub("", raw, count=1)
+    segments = [segment.strip(" \t,，;；") for segment in _WORKFLOW_SEPARATOR_RE.split(without_leading)]
+    explicit_workflow = len(segments) > 1
+    if any(not segment for segment in segments):
+        return [], "workflow contains an empty step"
+    if not explicit_workflow and len(_matched_skill_names(raw, aliases)) > 1:
+        return [], "multiple skills require an explicit ordered connector"
+
+    parsed_steps = []
+    for index, segment in enumerate(segments):
+        step_text = _STEP_LEADING_RE.sub("", segment, count=1)
+        parsed = parse_text_command(
+            step_text,
+            default_target_name=default_target_name,
+            default_place_name=default_place_name,
+            default_relative_motion_step_m=default_relative_motion_step_m,
+            skill_aliases=aliases or None,
+        )
+        if len(parsed.skill_sequence) != 1:
+            return [], parsed.message or f"workflow step {index + 1} cannot be planned"
+        parsed_steps.append(parsed)
+    return parsed_steps, ""
 
 
 def extract_skill_aliases(skill_templates: dict[str, Any] | None) -> dict[str, list[str]]:
@@ -132,7 +199,7 @@ def parse_text_command(
     their public task types. Finally, ``skill_aliases`` built from descriptions
     explicitly marked ``rule_entry`` route direct no-parameter skills.
     """
-    normalized = (text or "").strip().replace(" ", "")
+    normalized = (text or "").strip().replace(" ", "").lower()
     if not normalized:
         return PlannedTask(
             task_type="unknown",

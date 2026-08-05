@@ -1,0 +1,52 @@
+schema_version: 1
+name: wave_hello
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Wave hello or goodbye with the wrist (casual greeting gesture).
+  category: social_greeting
+  when_to_use:
+  - greet someone
+  - say hi or bye
+  - wave to a person
+  do_not_use:
+  - condition: agree or say yes
+    instead_use: nod_yes
+  - condition: formal raise-hand greet at the observe pose
+    instead_use: greet_observe_raise
+  - condition: dance rhythmically
+    instead_use: dance_basic
+  aliases_zh:
+  - 打招呼
+  - 挥手
+  - 挥挥手
+  - 再见
+  - 嗨
+  aliases_en:
+  - hello
+  - hi
+  - wave
+  - goodbye
+  - bye
+  motion_scope:
+  - wrist
+  anchor_pose: home
+  intensity: moderate
+  duration_sec_estimate: 8.0
+  requires_motion_params: false
+  rule_entry: true
+capability:
+  schema_version: 1
+  summary: Perform a casual greeting wave.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  so101_single_arm: implementations/so101_single_arm.yaml
+  so101_rtp_distributed: implementations/so101_rtp_distributed.yaml

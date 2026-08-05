@@ -1,0 +1,50 @@
+schema_version: 1
+name: act_cute
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: 'Act cute: small wiggle with gripper open/close to seek attention.'
+  category: social_emotion
+  when_to_use:
+  - act cute
+  - seek attention playfully
+  - play cute or coy
+  do_not_use:
+  - condition: dance rhythmically
+    instead_use: dance_basic
+  - condition: wave hello
+    instead_use: wave_hello
+  aliases_zh:
+  - 撒娇
+  - 卖萌
+  - 装可爱
+  - 可爱一下
+  - 求关注
+  aliases_en:
+  - act cute
+  - cute
+  - coy
+  motion_scope:
+  - base
+  - wrist
+  - gripper
+  anchor_pose: home
+  intensity: moderate
+  duration_sec_estimate: 13.0
+  requires_motion_params: false
+  rule_entry: true
+capability:
+  schema_version: 1
+  summary: Perform a playful attention-seeking gesture.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  so101_single_arm: implementations/so101_single_arm.yaml
+  so101_rtp_distributed: implementations/so101_rtp_distributed.yaml

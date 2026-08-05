@@ -3,13 +3,14 @@
 `embodied_agent` 是当前最小具身闭环中的**任务入口与任务编排包**。
 它不直接控制机械臂，而是把文本命令转换成结构化任务，再规划为技能序列，最后把技能逐个交给 `skill_library` 执行。
 
-当前包内包含 3 个 ROS 2 节点：
+当前包内包含 4 个 ROS 2 节点：
 
 | 节点 | 控制台入口 | 主要职责 |
 | --- | --- | --- |
 | `task_entry_node` | `task_entry_node = embodied_agent.task_entry_node:main` | 把 `/voice_command` 文本优先做规则直达，命中则直接产出 `planned_task`，否则封装成 `TaskCommand` 交给 planner |
 | `task_planner_node` | `task_planner_node = embodied_agent.task_planner_node:main` | 按规则把文本任务规划为技能序列 |
 | `task_executor_node` | `task_executor_node = embodied_agent.task_executor_node:main` | 顺序调用技能 action，并发布任务状态 |
+| `agent_plan_node` | `agent_plan_node = embodied_agent.agent_plan_node:main` | 持有短时 Agent plan，提供 plan/validate/confirm 服务和带确认令牌的执行 action |
 
 包内还提供一个**非节点的库接口** `embodied_agent.llm_client_service.LLMClientService`：封装云端对话大模型的一行式调用，供上层按需 import，不随 launch 起节点。详见第 6 节。
 
@@ -28,6 +29,13 @@
   -> /embodied/execute_skill
   -> skill_library
   -> MoveIt / gripper
+
+Hermes / robot-skill Agent flow:
+  -> /embodied/plan_agent_command
+  -> /embodied/validate_agent_plan
+  -> 用户确认后 /embodied/confirm_agent_plan
+  -> /embodied/execute_agent_plan
+  -> skill_library Gateway
 ```
 
 其中：
@@ -176,10 +184,12 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 ### 作用
 
 1. 读取 `planned_task` 中的 `skill_sequence`。
-2. 逐个调用 `/embodied/execute_skill` action。
+2. 先通过 `/embodied/begin_workflow_execution` 固定 exact snapshot、root budget、digest 和 root lease，再按顺序调用
+   `/embodied/execute_skill` child action。
 3. 按阶段发布 `TaskStatus`。
 4. 在超时、拒绝、服务缺失时明确失败并带错误码退出。
 5. 超时后会向下游 skill action 发送 cancel，而不是只在上层报错。
+6. 所有成功、失败和超时路径都通过 `/embodied/finalize_workflow_execution` 释放 root scope；finalize 未收敛时 fail closed。
 
 ### 父任务与子技能 ID
 
@@ -203,6 +213,9 @@ ID 的 payload 不同，下游的 payload conflict 是预期行为。取消和�
 | 订阅 | `/embodied/planned_task` | `ibrobot_msgs/msg/TaskCommand` | 已规划任务 |
 | 发布 | `/embodied/task_status` | `ibrobot_msgs/msg/TaskStatus` | 执行中、失败、完成状态 |
 | 调用 | `/embodied/execute_skill` | `ibrobot_msgs/action/SkillCommand` | 技能执行入口 |
+| 调用 | `/embodied/get_skill_gateway_status` | `ibrobot_msgs/srv/GetSkillGatewayStatus` | 获取 exact registry identity |
+| 调用 | `/embodied/begin_workflow_execution` | `ibrobot_msgs/srv/BeginWorkflowExecution` | 原子建立 workflow root scope |
+| 调用 | `/embodied/finalize_workflow_execution` | `ibrobot_msgs/srv/FinalizeWorkflowExecution` | 幂等结束 workflow root scope |
 
 ### 当前状态机语义
 
@@ -225,7 +238,26 @@ ID 的 payload 不同，下游的 payload conflict 是预期行为。取消和�
 | `rpc_timeout_sec` | `5.0` | 等待 action/server/service 响应的统一 RPC 超时 |
 | `debug_tracing` | `false` | 是否打印执行调试日志 |
 
-## 6. LLMClientService
+## 6. Agent plan lifecycle
+
+`agent_plan_node` 将自然语言命令转换为最多 16 个 typed `WorkflowStep`，并在 plan TTL（默认 300 秒）内保存不可变
+计划。`plan_token` 和 `confirmation_token` 都是不透明的一次性令牌，不提供运动授权，也不能由调用方构造。
+
+确认调用必须同时提交 `plan_token`、`plan_digest`、新生成的 `task_id` 以及当前
+`(registry_epoch, registry_generation, registry_digest)`。目录 reload 或任何字段不一致都会 fail closed。
+单步计划进入 Gateway 根 SkillCommand，多步计划通过 Begin/ordered child/Finalize 工作流执行；child action 只能
+使用 Begin 返回的工作流租约和 exact snapshot identity。
+
+公开接口：
+
+| 名称 | 类型 | 说明 |
+| --- | --- | --- |
+| `/embodied/plan_agent_command` | `PlanAgentCommand` | 生成或幂等重放一份短时计划 |
+| `/embodied/validate_agent_plan` | `ValidateAgentPlan` | exact snapshot 的只读逐步预检 |
+| `/embodied/confirm_agent_plan` | `ConfirmAgentPlan` | 原子绑定用户确认、计划摘要和 task ID |
+| `/embodied/execute_agent_plan` | `ExecuteAgentPlan` | 执行已确认计划并传播取消到当前 child |
+
+## 7. LLMClientService
 
 `LLMClientService` 是一个**库接口**（非 ROS 节点，无控制台入口、无话题/参数），封装云端对话大模型的一行式调用。它接收由业务方提供的预设 prompt 与用户文字，调用云端对话模型生成回复文本。
 

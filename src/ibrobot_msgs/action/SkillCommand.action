@@ -1,15 +1,45 @@
-string task_id
+# SkillCommand.action - Skill / Atomic Operator execution action. Served by
+# skill_executor_node at /embodied/execute_skill.
+#
+# See docs/lightweight_skill_package_registry_design_zh.md section 11.5.
+#
+# The SkillCommand name in v1 carries both Atomic Operator and Skill to limit
+# the IDL migration surface; admission reads semantic_level from the snapshot
+# and validates the v1 structural invariants. Callers must not self-report the
+# level. The four parameter fields target_name/place_name/motion_direction/
+# motion_distance must stay in sync with WorkflowStep and ValidateSkill.
+# dispatch_binding carries the full task/version envelope (task_id moved here).
+# timeout_sec is the per-catalog-entry request cap.
+#
+# The dispatch_binding must provide complete expected identity on planned
+# SkillCommand; root_lease_nonce is only for Workflow child SkillCommand (and
+# its read-only validation / internal dispatch) and must be empty for direct
+# root SkillCommand (with workflow_step_index=0). dispatch_nonce is always
+# empty on the SkillCommand goal.
+
+# --- Goal ---
+DispatchBinding dispatch_binding
 string skill_name
 string target_name
 string place_name
-string motion_direction  # 运动方向：forward, backward, left, right, up, down
+string motion_direction
 float32 motion_distance
 float32 timeout_sec
 ---
+# --- Result ---
 bool success
 string error_code
 string message
 string[] executed_primitives
+string actual_registry_epoch
+uint64 actual_registry_generation
+string actual_registry_digest
+string source_release_digest
+string provenance_digest
+SkillDiagnostic[] diagnostics
 ---
+# --- Feedback ---
 string state
 string detail
+string actual_registry_epoch
+uint64 actual_registry_generation

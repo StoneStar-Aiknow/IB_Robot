@@ -1,0 +1,60 @@
+schema_version: 1
+name: inspect_scene
+version: 1.0.0
+semantic_level: atomic_operator
+description:
+  summary: Move to observe_table and acquire a top-down scene view for planning.
+  category: observation
+  when_to_use:
+  - look at the table
+  - scan the workspace before acting
+  - update scene understanding
+  do_not_use:
+  - condition: return the arm to a safe rest pose
+    instead_use: recover_safe_pose
+  - condition: greet or wave at someone
+    instead_use: wave_hello
+  aliases_zh:
+  - 观察桌面
+  - 观察场景
+  - 看看桌面
+  - 扫描桌面
+  - 观察点
+  - 观察位置
+  aliases_en:
+  - observe
+  - look
+  - scan scene
+  - inspect
+  motion_scope:
+  - arm
+  anchor_pose: observe_table
+  intensity: subtle
+  duration_sec_estimate: 2.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Inspect the workspace from the observation view.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  so101_single_arm: implementations/so101_single_arm.yaml
+  so101_handeye_realsense_grasp: implementations/so101_handeye_realsense_grasp.yaml
+  so101_rtp_distributed: implementations/so101_rtp_distributed.yaml
+description_variants:
+  so101_handeye_realsense_grasp:
+    summary: Move to observe_table and acquire a scene view for planning.
+    category: observation
+    when_to_use:
+    - look at the table
+    - update scene understanding
+    motion_scope:
+    - arm
+    intensity: moderate

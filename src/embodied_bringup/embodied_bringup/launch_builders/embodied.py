@@ -1,11 +1,12 @@
 """Embodied minimal-closure launch builder."""
 
 import json
+from pathlib import Path
 from typing import Any
 
 from launch_ros.actions import Node
 
-from embodied_common.command_parser import extract_skill_aliases
+from robot_config.loader import robot_config_digest
 from robot_config.logger_utils import get_colored_logger
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
@@ -51,8 +52,6 @@ def generate_embodied_nodes(
     execution = embodied_config.get("execution", {})
     named_poses = embodied_config.get("named_poses", {})
     named_targets = embodied_config.get("named_targets", {})
-    raw_skill_templates = embodied_config.get("skill_templates")
-    skill_templates = raw_skill_templates if isinstance(raw_skill_templates, dict) else {}
     safety = embodied_config.get("safety", {})
     joint_config = robot_config.get("joints", {})
     teleoperation = robot_config.get("teleoperation", {})
@@ -68,29 +67,22 @@ def generate_embodied_nodes(
     perception_conversation = perception.get("conversation", {})
     entry = embodied_config.get("entry", {})
     timeout_policy = resolve_embodied_timeout_policy(embodied_config)
-    # Chinese trigger keywords come straight from the SSOT skill descriptions so
-    # the rule planner and the robot-skill catalog share one keyword source.
-    skill_aliases_json = json.dumps(extract_skill_aliases(skill_templates))
-    allowed_skills = planning_policy.get(
-        "allowed_skills",
-        [
-            "inspect_scene",
-            "recover_safe_pose",
-            "recover_zero_pose",
-            "move_relative_ee",
-            "open_gripper_skill",
-            "close_gripper_skill",
-            "rotate_gripper_cw",
-            "rotate_gripper_ccw",
-            "dance_basic",
-        ],
-    )
+    skill_catalog_source_mode = embodied_config.get("skill_catalog_source_mode", "installed")
+    skill_catalog_source_root = embodied_config.get("skill_catalog_source_root", "")
+    if skill_catalog_source_root and not Path(skill_catalog_source_root).is_absolute():
+        config_path = Path(robot_config.get("_config_path", ""))
+        try:
+            repository_root = next(parent for parent in config_path.parents if parent.name == "src").parent
+        except StopIteration:
+            skill_catalog_source_mode = "installed"
+            skill_catalog_source_root = ""
+        else:
+            skill_catalog_source_root = str(repository_root / skill_catalog_source_root)
 
     common_params = {
         "debug_tracing": embodied_config.get("debug_tracing", True),
         "named_poses_json": json.dumps(named_poses),
         "named_targets_json": json.dumps(named_targets),
-        "skill_templates_json": json.dumps(raw_skill_templates) if raw_skill_templates is not None else "{}",
         "workspace_json": json.dumps(safety.get("workspace", {})),
         "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
         "joint_limits_json": json.dumps(teleoperation.get("safety", {}).get("joint_limits", {})),
@@ -107,7 +99,21 @@ def generate_embodied_nodes(
         "skill_gateway_status_service": embodied_config.get(
             "skill_gateway_status_service", "/embodied/get_skill_gateway_status"
         ),
+        "skill_catalog_source_mode": skill_catalog_source_mode,
+        "skill_catalog_source_root": skill_catalog_source_root,
+        "skill_catalog_profile": embodied_config.get("skill_catalog_profile", robot_config.get("name", "")),
+        "skill_catalog_snapshot_service": embodied_config.get(
+            "skill_catalog_snapshot_service", "/embodied/get_skill_snapshot"
+        ),
+        "skill_registry_event_topic": embodied_config.get(
+            "skill_registry_event_topic", "/embodied/skill_registry_events"
+        ),
+        "begin_workflow_service": embodied_config.get("begin_workflow_service", "/embodied/begin_workflow_execution"),
+        "finalize_workflow_service": embodied_config.get(
+            "finalize_workflow_service", "/embodied/finalize_workflow_execution"
+        ),
         "robot_name": robot_config.get("name", "unknown"),
+        "config_digest": robot_config_digest(robot_config),
         "default_skill_timeout_sec": timeout_policy["default_skill_timeout_sec"],
         "task_budget_sec": timeout_policy["task_budget_sec"],
         "robot_state_freshness_sec": timeout_policy["robot_state_freshness_sec"],
@@ -122,6 +128,7 @@ def generate_embodied_nodes(
         "gripper_closed_position": execution.get("gripper_closed_position", 0.0),
         "task_executor_action_name": execution.get("task_executor_action_name", "/task_executor/execute_task_plan"),
         "pick_action_name": grasp_execution.get("action_name", "/manipulation/execute_pick"),
+        "grasp_execution_json": json.dumps(grasp_execution),
         "move_configuration_service": execution.get(
             "move_configuration_service", "/moveit_gateway/move_to_configuration"
         ),
@@ -141,7 +148,9 @@ def generate_embodied_nodes(
                 "default_target_name": embodied_config.get("default_target_name", "demo_object"),
                 "default_place_name": embodied_config.get("default_place_name", "home"),
                 "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
-                "skill_aliases_json": skill_aliases_json,
+                "skill_gateway_status_service": common_params["skill_gateway_status_service"],
+                "skill_catalog_snapshot_service": common_params["skill_catalog_snapshot_service"],
+                "skill_registry_event_topic": common_params["skill_registry_event_topic"],
             }
         ],
     )
@@ -190,8 +199,9 @@ def generate_embodied_nodes(
                     "api_jpeg_quality": vlm_api.get("jpeg_quality", 80),
                     "fallback_to_rule_planner": planning_policy.get("fallback_to_rule_planner", True),
                     "min_confidence": planning_policy.get("min_confidence", 0.7),
-                    "allowed_skills_json": json.dumps(allowed_skills),
-                    "skill_aliases_json": skill_aliases_json,
+                    "skill_gateway_status_service": common_params["skill_gateway_status_service"],
+                    "skill_catalog_snapshot_service": common_params["skill_catalog_snapshot_service"],
+                    "skill_registry_event_topic": common_params["skill_registry_event_topic"],
                 }
             ],
         )
@@ -268,16 +278,40 @@ def generate_embodied_nodes(
                     "debug_tracing": embodied_config.get("debug_tracing", True),
                     "input_topic": embodied_config.get("task_input_topic", "/voice_command"),
                     "output_topic": embodied_config.get("task_command_topic", "/embodied/task_command"),
-                    "planned_output_topic": embodied_config.get("planned_task_topic", "/embodied/planned_task"),
                     "status_topic": embodied_config.get("status_topic", "/embodied/task_status"),
                     "default_target_name": embodied_config.get("default_target_name", "demo_object"),
                     "default_place_name": embodied_config.get("default_place_name", "home"),
                     "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
                     "default_task_timeout_sec": timeout_policy["task_budget_sec"],
-                    "skill_aliases_json": skill_aliases_json,
                     "perception_request_topic": perception.get("request_topic", "/embodied/perception_request"),
                     "perception_enabled": perception.get("enabled", False),
                     "entry_visual_games_json": json.dumps(entry.get("visual_games", {})),
+                }
+            ],
+        ),
+        Node(
+            package="embodied_agent",
+            executable="agent_plan_node",
+            name="agent_plan_node",
+            output="screen",
+            parameters=[
+                {
+                    "gateway_status_service": common_params["skill_gateway_status_service"],
+                    "validate_skill_service": common_params["validate_skill_service"],
+                    "skill_catalog_snapshot_service": common_params["skill_catalog_snapshot_service"],
+                    "skill_action_name": common_params["skill_action_name"],
+                    "begin_workflow_service": common_params["begin_workflow_service"],
+                    "finalize_workflow_service": common_params["finalize_workflow_service"],
+                    "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
+                    "default_target_name": embodied_config.get("default_target_name", "demo_object"),
+                    "default_place_name": embodied_config.get("default_place_name", "home"),
+                    "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
+                    "plan_service": embodied_config.get("plan_service", "/embodied/plan_agent_command"),
+                    "validate_plan_service": embodied_config.get(
+                        "validate_plan_service", "/embodied/validate_agent_plan"
+                    ),
+                    "confirm_plan_service": embodied_config.get("confirm_plan_service", "/embodied/confirm_agent_plan"),
+                    "execute_plan_action": embodied_config.get("execute_plan_action", "/embodied/execute_agent_plan"),
                 }
             ],
         ),
@@ -293,6 +327,9 @@ def generate_embodied_nodes(
                     "input_topic": embodied_config.get("planned_task_topic", "/embodied/planned_task"),
                     "status_topic": embodied_config.get("status_topic", "/embodied/task_status"),
                     "skill_action_name": embodied_config.get("skill_action_name", "/embodied/execute_skill"),
+                    "gateway_status_service": common_params["skill_gateway_status_service"],
+                    "begin_workflow_service": common_params["begin_workflow_service"],
+                    "finalize_workflow_service": common_params["finalize_workflow_service"],
                     "default_task_timeout_sec": timeout_policy["task_budget_sec"],
                     "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
                 }

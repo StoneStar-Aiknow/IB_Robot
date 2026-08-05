@@ -1,0 +1,245 @@
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+from types import SimpleNamespace
+
+from robot_skill_cli import hermes_launcher
+from robot_skill_cli.ros_bridge import BridgeError
+
+
+def test_packaged_control_skill_matches_workspace_canonical_copy() -> None:
+    repository_root = Path(__file__).resolve().parents[3]
+    canonical = repository_root / ".agents" / "skills" / "ibrobot-control" / "SKILL.md"
+    packaged = Path(__file__).resolve().parents[1] / "resource" / "ibrobot-control" / "SKILL.md"
+
+    assert packaged.read_bytes() == canonical.read_bytes()
+
+
+def test_launcher_preflights_and_execs_hermes_without_changing_authorization(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text("robot:\n  name: test\n", encoding="utf-8")
+    skill_path = tmp_path / "installed" / "SKILL.md"
+    skill_path.parent.mkdir()
+    skill_path.write_text("---\nname: ibrobot-control\n---\n", encoding="utf-8")
+    calls = {"binaries": [], "exec": None, "chdir": None}
+
+    def require_binary(name):
+        calls["binaries"].append(name)
+        return f"/bin/{name}"
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("PYTHONPATH", "/stale/python3.10/site-packages")
+    monkeypatch.setenv("PYTHONHOME", "/stale/python")
+    monkeypatch.setenv("ROS_DOMAIN_ID", "226")
+    monkeypatch.setenv("ROS_LOCALHOST_ONLY", "0")
+    monkeypatch.setattr(hermes_launcher, "_require_binary", require_binary)
+    monkeypatch.setattr(hermes_launcher, "_check_hermes_version", lambda _path: None)
+    monkeypatch.setattr(hermes_launcher, "_check_robot_runtime", lambda _name, _path: config_path)
+    monkeypatch.setattr(hermes_launcher, "_installed_skill_path", lambda: skill_path)
+    monkeypatch.setattr(os, "chdir", lambda path: calls.__setitem__("chdir", Path(path)))
+    monkeypatch.setattr(
+        os,
+        "execvpe",
+        lambda executable, arguments, environment: calls.__setitem__("exec", (executable, arguments, environment)),
+    )
+
+    assert hermes_launcher.main(["--config-name", "test"]) == 0
+
+    executable, arguments, environment = calls["exec"]
+    assert calls["binaries"] == ["hermes", "robot-skill"]
+    assert executable == "/bin/hermes"
+    assert arguments == ["/bin/hermes", "--skills", "ibrobot-control"]
+    assert environment["ROBOT_CONFIG"] == str(config_path)
+    assert "PYTHONPATH" not in environment
+    assert "PYTHONHOME" not in environment
+    wrapper = calls["chdir"] / ".ibrobot" / "bin" / "robot-skill"
+    assert wrapper.stat().st_mode & 0o111
+    assert "export PYTHONPATH=/stale/python3.10/site-packages" in wrapper.read_text(encoding="utf-8")
+    assert f"export ROBOT_CONFIG={config_path}" in wrapper.read_text(encoding="utf-8")
+    assert "export ROS_DOMAIN_ID=226" in wrapper.read_text(encoding="utf-8")
+    assert environment["PATH"].split(os.pathsep)[0] == str(wrapper.parent)
+    assert "authorize_motion" not in environment
+    assert (calls["chdir"] / ".agents" / "skills" / "ibrobot-control" / "SKILL.md").read_bytes() == (
+        skill_path.read_bytes()
+    )
+
+
+def test_runtime_check_allows_unauthorized_motion_but_requires_agent_interfaces(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text("robot:\n  name: test\n", encoding="utf-8")
+
+    class Bridge:
+        def __init__(self):
+            self.closed = False
+            self.timeouts = []
+
+        def start(self):
+            return True
+
+        def get_status(self, **kwargs):
+            self.timeouts.append(kwargs["timeout_sec"])
+            return {
+                "control_plane_ready": True,
+                "control_plane_error_code": "",
+                "motion_authorized": False,
+            }
+
+        def wait_for_agent_plan_interfaces(self, **kwargs):
+            self.timeouts.append(kwargs["timeout_sec"])
+            return True
+
+        def close(self):
+            self.closed = True
+
+    bridge = Bridge()
+    monkeypatch.setattr(hermes_launcher, "resolve_robot_config_path", lambda **_kwargs: config_path)
+    monkeypatch.setattr(
+        hermes_launcher,
+        "load_runtime_context",
+        lambda **_kwargs: (SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0}}), object()),
+    )
+    monkeypatch.setattr(hermes_launcher, "_create_bridge", lambda _transport: bridge)
+
+    assert hermes_launcher._check_robot_runtime("test", None) == config_path
+    assert bridge.closed is True
+    assert bridge.timeouts == [15.0, 15.0]
+
+
+def test_launcher_passes_hermes_chat_arguments_after_separator(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text("robot:\n  name: test\n", encoding="utf-8")
+    skill_path = tmp_path / "SKILL.md"
+    skill_path.write_text("---\nname: ibrobot-control\n---\n", encoding="utf-8")
+    calls = {}
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setattr(hermes_launcher, "_require_binary", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(hermes_launcher, "_check_hermes_version", lambda _path: None)
+    monkeypatch.setattr(hermes_launcher, "_check_robot_runtime", lambda _name, _path: config_path)
+    monkeypatch.setattr(hermes_launcher, "_installed_skill_path", lambda: skill_path)
+    monkeypatch.setattr(os, "chdir", lambda _path: None)
+    monkeypatch.setattr(
+        os,
+        "execvpe",
+        lambda executable, arguments, environment: calls.update(
+            executable=executable, arguments=arguments, environment=environment
+        ),
+    )
+
+    assert hermes_launcher.main(["--config-path", str(config_path), "--", "chat", "-q", "check robot", "-Q"]) == 0
+    assert calls["arguments"] == [
+        "/bin/hermes",
+        "chat",
+        "-q",
+        "check robot",
+        "-Q",
+        "--skills",
+        "ibrobot-control",
+    ]
+
+
+def test_launcher_reports_gateway_timeout_without_traceback(monkeypatch, capsys) -> None:
+    monkeypatch.setattr(hermes_launcher, "_require_binary", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(hermes_launcher, "_check_hermes_version", lambda _path: None)
+    monkeypatch.setattr(
+        hermes_launcher,
+        "_check_robot_runtime",
+        lambda _name, _path: (_ for _ in ()).throw(
+            BridgeError("RESULT_TIMEOUT", "service response timed out", exit_code=5)
+        ),
+    )
+
+    assert hermes_launcher.main(["--config-name", "test"]) == 5
+    assert capsys.readouterr().err == "hermes-robot: RESULT_TIMEOUT: service response timed out\n"
+
+
+def test_robot_skill_wrapper_binds_config_and_ros_environment(tmp_path) -> None:
+    actual = tmp_path / "actual-robot-skill"
+    actual.write_text(
+        "#!/bin/sh\n"
+        "printf 'CONFIG=%s\\n' \"$2\"\n"
+        "printf 'DOMAIN=%s\\n' \"$ROS_DOMAIN_ID\"\n"
+        "printf 'LOCALHOST=%s\\n' \"$ROS_LOCALHOST_ONLY\"\n"
+        "printf 'COMMAND=%s\\n' \"$3\"\n",
+        encoding="utf-8",
+    )
+    actual.chmod(0o755)
+    config_path = tmp_path / "robot.yaml"
+    wrapper = (
+        hermes_launcher._prepare_robot_skill_wrapper(
+            tmp_path / "workspace",
+            str(actual),
+            "/ros/python",
+            config_path,
+            {"ROS_DOMAIN_ID": "226", "ROS_LOCALHOST_ONLY": "0"},
+        )
+        / "robot-skill"
+    )
+
+    completed = subprocess.run(
+        [wrapper, "status"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "ROS_DOMAIN_ID": "174"},
+    )
+
+    assert completed.stdout == f"CONFIG={config_path}\nDOMAIN=226\nLOCALHOST=0\nCOMMAND=status\n"
+
+
+def test_robot_skill_wrapper_rejects_agent_config_override(tmp_path) -> None:
+    actual = tmp_path / "actual-robot-skill"
+    actual.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    actual.chmod(0o755)
+    wrapper = (
+        hermes_launcher._prepare_robot_skill_wrapper(
+            tmp_path / "workspace",
+            str(actual),
+            "",
+            tmp_path / "robot.yaml",
+            {"ROS_DOMAIN_ID": "226"},
+        )
+        / "robot-skill"
+    )
+
+    completed = subprocess.run([wrapper, "--config-name", "wrong", "status"], check=False, capture_output=True)
+
+    assert completed.returncode == 2
+
+
+def test_runtime_check_retries_transient_read_only_status_timeout(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text("robot:\n  name: test\n", encoding="utf-8")
+
+    class Bridge:
+        def __init__(self, fail):
+            self.fail = fail
+            self.closed = False
+
+        def start(self):
+            return True
+
+        def get_status(self, **_kwargs):
+            if self.fail:
+                raise BridgeError("RESULT_TIMEOUT", "transient timeout", exit_code=5)
+            return {"control_plane_ready": True, "control_plane_error_code": ""}
+
+        def wait_for_agent_plan_interfaces(self, **_kwargs):
+            return True
+
+        def close(self):
+            self.closed = True
+
+    bridges = [Bridge(True), Bridge(False)]
+    monkeypatch.setattr(hermes_launcher, "resolve_robot_config_path", lambda **_kwargs: config_path)
+    monkeypatch.setattr(
+        hermes_launcher,
+        "load_runtime_context",
+        lambda **_kwargs: (SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0}}), object()),
+    )
+    monkeypatch.setattr(hermes_launcher, "_create_bridge", lambda _transport: bridges.pop(0))
+    monkeypatch.setattr(hermes_launcher.time, "sleep", lambda _seconds: None)
+
+    assert hermes_launcher._check_robot_runtime("test", None) == config_path
+    assert bridges == []

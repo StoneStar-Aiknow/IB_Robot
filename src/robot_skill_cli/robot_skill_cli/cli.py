@@ -26,6 +26,9 @@ from robot_skill_cli.output import (
     success_envelope,
 )
 
+_STATUS_PREFLIGHT_TIMEOUT_FLOOR_SEC = 15.0
+_CATALOG_RELOAD_TIMEOUT_FLOOR_SEC = 60.0
+
 
 class _CliArgumentError(ValueError):
     pass
@@ -69,6 +72,25 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_skill_parameters(execute_parser)
     cancel_parser = subparsers.add_parser("cancel", help="cancel one active task by task ID")
     cancel_parser.add_argument("--task-id", required=True)
+    reload_parser = subparsers.add_parser("reload-catalog", help="reload the configured runtime skill catalog")
+    reload_parser.add_argument("--request-id", required=True)
+    reload_parser.add_argument("--force", action="store_true")
+    plan_parser = subparsers.add_parser("plan-text", help="plan a natural-language Agent command")
+    plan_parser.add_argument("--text", dest="raw_command", required=True)
+    plan_parser.add_argument("--request-id", required=True)
+    validate_plan_parser = subparsers.add_parser("validate-plan", help="preflight an Agent plan")
+    validate_plan_parser.add_argument("--plan-token", required=True)
+    confirm_plan_parser = subparsers.add_parser("confirm-plan", help="confirm one exact Agent plan")
+    confirm_plan_parser.add_argument("--plan-token", required=True)
+    confirm_plan_parser.add_argument("--plan-digest", required=True)
+    confirm_plan_parser.add_argument("--task-id", required=True)
+    execute_plan_parser = subparsers.add_parser("execute-plan", help="execute one confirmed Agent plan")
+    execute_plan_parser.add_argument("--plan-token", required=True)
+    execute_plan_parser.add_argument("--confirmation-token", required=True)
+    execute_plan_parser.add_argument("--task-id", required=True)
+    execute_plan_parser.add_argument("--timeout-sec", type=float)
+    cancel_plan_parser = subparsers.add_parser("cancel-plan", help="cancel an active Agent plan by task ID")
+    cancel_plan_parser.add_argument("--task-id", required=True)
     return parser
 
 
@@ -97,8 +119,14 @@ def _create_bridge(transport):
 
     return RosBridge(
         status_service=transport.status_service,
+        snapshot_service=transport.snapshot_service,
+        reload_service=transport.reload_service,
         validate_skill_service=transport.validate_skill_service,
         skill_action=transport.skill_action_name,
+        plan_service=transport.plan_service,
+        validate_plan_service=transport.validate_plan_service,
+        confirm_plan_service=transport.confirm_plan_service,
+        execute_plan_action=transport.execute_plan_action,
     )
 
 
@@ -144,20 +172,28 @@ def _prepare_request(
     args: argparse.Namespace, context, bridge
 ) -> tuple[dict[str, Any], str, dict[str, Any], dict[str, Any]]:
     from embodied_common.skill_request import canonical_skill_payload, skill_payload_hash
-    from robot_skill_cli.catalog import describe_skill
+    from robot_skill_cli.catalog import capability_view_from_snapshot, describe_skill
 
     status = bridge.get_status(
         task_id="",
         payload_hash="",
-        timeout_sec=context.view["timeout_policy"]["rpc_timeout_sec"],
+        timeout_sec=_status_preflight_timeout(context),
     )
-    if status["config_digest"] != context.view["capability_digest"]:
+    snapshot = bridge.get_skill_snapshot(
+        registry_epoch=status["registry_epoch"],
+        generation=status["registry_generation"],
+        timeout_sec=status["rpc_timeout_sec"],
+    )
+    try:
+        runtime_view = capability_view_from_snapshot(snapshot, status)
+    except ValueError as exc:
+        error_code, _separator, message = str(exc).partition(":")
         raise _CommandError(
-            "CONFIG_MISMATCH",
-            "local capability digest does not match the Gateway",
+            error_code or "SKILL_SNAPSHOT_DIGEST_MISMATCH",
+            message.strip() or str(exc),
             exit_code=EXIT_GATEWAY_REJECTED,
-        )
-    skill = describe_skill(context.view, args.skill)
+        ) from exc
+    skill = describe_skill(runtime_view, args.skill)
     _validate_schema(skill, args)
     effective_timeout = _validate_timeout(status, args.timeout_sec)
     capability = next((item for item in status["capabilities"] if item["name"] == skill["name"]), None)
@@ -181,7 +217,30 @@ def _prepare_request(
         timeout_sec=effective_timeout,
         default_timeout_sec=status["default_skill_timeout_sec"],
     )
-    validation = bridge.validate_skill(payload, timeout_sec=status["rpc_timeout_sec"])
+    validation = bridge.validate_skill(
+        payload,
+        registry_identity=(
+            status.get("registry_epoch", ""),
+            status.get("registry_generation", 0),
+            status.get("registry_digest", ""),
+        ),
+        timeout_sec=status["rpc_timeout_sec"],
+    )
+    actual_identity = (
+        validation.get("actual_registry_epoch", ""),
+        validation.get("actual_registry_generation", 0),
+        validation.get("actual_registry_digest", ""),
+    )
+    if any(actual_identity) and actual_identity != (
+        status.get("registry_epoch", ""),
+        status.get("registry_generation", 0),
+        status.get("registry_digest", ""),
+    ):
+        raise _CommandError(
+            "SKILL_REGISTRY_VERSION_MISMATCH",
+            "Gateway validation used a different registry identity",
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
     if not validation["allowed"]:
         raise _CommandError("SAFETY_REJECTED", validation["reason"], exit_code=EXIT_GATEWAY_REJECTED)
     return payload, skill_payload_hash(payload), status, validation
@@ -194,6 +253,158 @@ def _run_validate(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
         "reason": validation["reason"],
         "payload": payload,
         "payload_hash": payload_hash,
+    }
+
+
+def _run_reload_catalog(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
+    request_id = args.request_id.strip()
+    if not request_id:
+        raise _CliArgumentError("request_id must be non-empty")
+    result = bridge.reload_skill_catalog(
+        request_id=request_id,
+        force=bool(args.force),
+        timeout_sec=max(_plan_rpc_timeout(context), _CATALOG_RELOAD_TIMEOUT_FLOOR_SEC),
+    )
+    if not result["success"]:
+        raise _CommandError(
+            result["error_code"] or "SKILL_SCHEMA_INVALID",
+            result["message"] or "skill catalog reload failed",
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
+    return result
+
+
+def _plan_rpc_timeout(context) -> float:
+    timeout_sec = context.view["timeout_policy"]["rpc_timeout_sec"]
+    if not math.isfinite(timeout_sec) or timeout_sec <= 0.0:
+        raise _CliArgumentError("configured rpc_timeout_sec must be a finite number greater than zero")
+    return timeout_sec
+
+
+def _status_preflight_timeout(context) -> float:
+    return max(_plan_rpc_timeout(context), _STATUS_PREFLIGHT_TIMEOUT_FLOOR_SEC)
+
+
+def _raise_plan_error(result: dict[str, Any], *, default_code: str, exit_code: int) -> None:
+    if result.get("success", result.get("allowed", result.get("confirmed", False))):
+        return
+    raise _CommandError(
+        str(result.get("error_code") or default_code),
+        str(result.get("message") or result.get("reason") or default_code),
+        exit_code=exit_code,
+    )
+
+
+def _run_plan_text(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
+    request_id = args.request_id.strip()
+    raw_command = args.raw_command.strip()
+    if not request_id:
+        raise _CliArgumentError("request_id must be non-empty")
+    if not raw_command:
+        raise _CliArgumentError("raw_command must be non-empty")
+    result = bridge.plan_agent_command(
+        request_id=request_id,
+        raw_command=raw_command,
+        timeout_sec=_plan_rpc_timeout(context),
+    )
+    _raise_plan_error(result, default_code="SKILL_SCHEMA_INVALID", exit_code=EXIT_GATEWAY_REJECTED)
+    return result
+
+
+def _run_validate_plan(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
+    result = bridge.validate_agent_plan(plan_token=args.plan_token, timeout_sec=_plan_rpc_timeout(context))
+    _raise_plan_error(result, default_code="SKILL_SCHEMA_INVALID", exit_code=EXIT_GATEWAY_REJECTED)
+    return result
+
+
+def _run_confirm_plan(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
+    task_id = args.task_id.strip()
+    if not task_id:
+        raise _CliArgumentError("task_id must be non-empty")
+    timeout_sec = _status_preflight_timeout(context)
+    status = bridge.get_status(task_id="", payload_hash="", timeout_sec=timeout_sec)
+    result = bridge.confirm_agent_plan(
+        plan_token=args.plan_token,
+        plan_digest=args.plan_digest,
+        task_id=task_id,
+        status=status,
+        timeout_sec=timeout_sec,
+    )
+    _raise_plan_error(result, default_code="SKILL_REQUEST_ID_CONFLICT", exit_code=EXIT_GATEWAY_REJECTED)
+    return {"task_id": task_id, "registry": status, **result}
+
+
+def _public_agent_plan_result(result) -> dict[str, Any]:
+    return {
+        "success": bool(result.success),
+        "plan_id": str(result.plan_id),
+        "plan_digest": str(result.plan_digest),
+        "workflow_digest": str(result.workflow_digest),
+        "completed_step_count": int(result.completed_step_count),
+        "error_code": str(result.error_code),
+        "message": str(result.message),
+        "actual_registry_epoch": str(result.actual_registry_epoch),
+        "actual_registry_generation": int(result.actual_registry_generation),
+        "actual_registry_digest": str(result.actual_registry_digest),
+    }
+
+
+def _run_execute_plan(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
+    task_id = args.task_id.strip()
+    if not task_id:
+        raise _CliArgumentError("task_id must be non-empty")
+    rpc_timeout = _plan_rpc_timeout(context)
+    status = bridge.get_status(task_id=task_id, payload_hash="", timeout_sec=_status_preflight_timeout(context))
+    timeout_sec = _validate_timeout(status, args.timeout_sec)
+    if not bridge.wait_for_execute_plan_server(timeout_sec=rpc_timeout):
+        raise _CommandError(
+            "SERVER_UNAVAILABLE", "agent plan action server unavailable", exit_code=EXIT_ROS_UNAVAILABLE
+        )
+    goal_future = bridge.send_agent_plan_goal(
+        plan_token=args.plan_token,
+        confirmation_token=args.confirmation_token,
+        task_id=task_id,
+        timeout_sec=timeout_sec,
+    )
+    if not bridge.wait_future(goal_future, timeout_sec=rpc_timeout):
+        raise _CommandError("RESULT_TIMEOUT", "agent plan goal response timed out", exit_code=EXIT_TIMEOUT)
+    goal_handle = goal_future.result()
+    if goal_handle is None or not goal_handle.accepted:
+        raise _CommandError("GOAL_REJECTED", "agent plan goal was rejected", exit_code=EXIT_GATEWAY_REJECTED)
+    result_future = goal_handle.get_result_async()
+    deadline = time.monotonic() + timeout_sec + rpc_timeout
+    while not result_future.done() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    if not result_future.done() and not bridge.cancel_goal(goal_handle, result_future, timeout_sec=rpc_timeout):
+        raise _CommandError("SKILL_CANCEL_TIMEOUT", "robot stop state is unknown", exit_code=EXIT_TIMEOUT)
+    result = result_future.result()
+    data = _public_agent_plan_result(result.result)
+    if not data["success"]:
+        raise _CommandError(
+            data["error_code"] or "SKILL_EXECUTION_FAILED",
+            data["message"] or "agent plan execution failed",
+            exit_code=_result_exit_code(data),
+        )
+    return {"task_id": task_id, "registry": status, **data}
+
+
+def _run_cancel_plan(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
+    task_id = args.task_id.strip()
+    if not task_id:
+        raise _CliArgumentError("task_id must be non-empty")
+    timeout_sec = _plan_rpc_timeout(context)
+    cancel = bridge.cancel_agent_plan(task_id, timeout_sec=timeout_sec)
+    if not cancel["accepted"]:
+        raise _CommandError("GOAL_NOT_FOUND", "agent plan goal was not active", exit_code=EXIT_GATEWAY_REJECTED)
+    terminal = bridge.get_agent_plan_result(
+        task_id,
+        timeout_sec=context.view["timeout_policy"]["task_budget_sec"] + timeout_sec,
+    )
+    return {
+        "task_id": task_id,
+        "accepted": True,
+        "terminal": True,
+        "result": terminal["result"],
     }
 
 
@@ -250,6 +461,9 @@ def _run_execute(args: argparse.Namespace, context, bridge) -> _CommandExit:
     if not task_id:
         raise _CliArgumentError("task_id must be non-empty")
     payload, payload_hash, status, _validation = _prepare_request(args, context, bridge)
+    payload["_registry_epoch"] = status.get("registry_epoch", "")
+    payload["_registry_generation"] = status.get("registry_generation", 0)
+    payload["_registry_digest"] = status.get("registry_digest", "")
     rpc_timeout = status["rpc_timeout_sec"]
     output_lock = threading.Lock()
     terminal_output = {"written": False}
@@ -488,13 +702,25 @@ def _run_runtime_command(args: argparse.Namespace, context, transport) -> dict[s
         raise BridgeError("ROS_UNAVAILABLE", "failed to initialize ROS bridge", exit_code=EXIT_ROS_UNAVAILABLE)
     try:
         if args.command == "status":
-            return bridge.get_status(timeout_sec=context.view["timeout_policy"]["rpc_timeout_sec"])
+            return bridge.get_status(timeout_sec=_status_preflight_timeout(context))
+        if args.command == "reload-catalog":
+            return _run_reload_catalog(args, context, bridge)
         if args.command == "validate":
             return _run_validate(args, context, bridge)
         if args.command == "execute":
             return _run_execute(args, context, bridge)
         if args.command == "cancel":
             return _run_cancel(args, context, bridge)
+        if args.command == "plan-text":
+            return _run_plan_text(args, context, bridge)
+        if args.command == "validate-plan":
+            return _run_validate_plan(args, context, bridge)
+        if args.command == "confirm-plan":
+            return _run_confirm_plan(args, context, bridge)
+        if args.command == "execute-plan":
+            return _run_execute_plan(args, context, bridge)
+        if args.command == "cancel-plan":
+            return _run_cancel_plan(args, context, bridge)
         raise _CliArgumentError(f"unsupported command: {args.command}")
     finally:
         bridge.close()

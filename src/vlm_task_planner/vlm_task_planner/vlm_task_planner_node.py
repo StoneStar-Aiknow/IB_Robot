@@ -10,11 +10,14 @@ import rclpy
 
 from embodied_common.base_node import BaseTaskNode
 from embodied_common.command_parser import load_skill_aliases
+from embodied_common.dispatch_binding import copy_binding, workflow_step
 from embodied_common.json_utils import load_json_list, load_json_mapping
 from embodied_common.scene_analysis import SceneAnalysis, parse_scene_analysis_response
 from embodied_common.skill_templates import DEFAULT_ALLOWED_SKILLS
 from embodied_common.vlm_prompt_builder import build_scene_analysis_messages
+from embodied_common.workflow_contracts import compute_workflow_digest
 from ibrobot_msgs.msg import TaskCommand, TaskStatus
+from skill_catalog.ros_consumer import CatalogViewSynchronizer
 from vlm_task_planner.api_client import VLMAPIClient
 from vlm_task_planner.planner_fallback import fallback_plan_from_text
 from vlm_task_planner.prompt_builder import build_chat_messages
@@ -63,6 +66,10 @@ class VLMTaskPlannerNode(BaseTaskNode):
         self.declare_parameter("min_confidence", 0.7)
         self.declare_parameter("allowed_skills_json", json.dumps(DEFAULT_ALLOWED_SKILLS))
         self.declare_parameter("skill_aliases_json", "")
+        self.declare_parameter("skill_gateway_status_service", "/embodied/get_skill_gateway_status")
+        self.declare_parameter("skill_catalog_snapshot_service", "/embodied/get_skill_snapshot")
+        self.declare_parameter("skill_registry_event_topic", "/embodied/skill_registry_events")
+        self.declare_parameter("snapshot_sync_period_sec", 0.5)
         self.declare_parameter("debug_tracing", False)
 
         self._input_topic = self.get_parameter("input_topic").get_parameter_value().string_value
@@ -111,6 +118,13 @@ class VLMTaskPlannerNode(BaseTaskNode):
             self.get_parameter("allowed_skills_json").get_parameter_value().string_value
         )
         self._debug = self.get_parameter("debug_tracing").get_parameter_value().bool_value
+        self._catalog = CatalogViewSynchronizer(
+            self,
+            status_service=self.get_parameter("skill_gateway_status_service").get_parameter_value().string_value,
+            snapshot_service=self.get_parameter("skill_catalog_snapshot_service").get_parameter_value().string_value,
+            event_topic=self.get_parameter("skill_registry_event_topic").get_parameter_value().string_value,
+            sync_period_sec=self.get_parameter("snapshot_sync_period_sec").get_parameter_value().double_value,
+        )
 
         self._scene_buffer = SceneSnapshotBuffer.from_node(self)
         self._api_client = VLMAPIClient(
@@ -196,9 +210,14 @@ class VLMTaskPlannerNode(BaseTaskNode):
         scene_analysis: SceneAnalysis | None = None,
         fallback_reason: str = "",
         request_context: dict[str, Any] | None = None,
+        catalog=None,
     ) -> None:
         planned = TaskCommand()
-        planned.task_id = msg.task_id
+        planned.dispatch_binding = copy_binding(msg.dispatch_binding)
+        if catalog is not None:
+            planned.dispatch_binding.expected_registry_epoch = catalog.identity.registry_epoch
+            planned.dispatch_binding.expected_registry_generation = catalog.identity.generation
+            planned.dispatch_binding.expected_registry_digest = catalog.identity.registry_digest
         planned.source = msg.source
         planned.raw_command = msg.raw_command
         planned.task_type = plan.task_type
@@ -213,7 +232,6 @@ class VLMTaskPlannerNode(BaseTaskNode):
                 request_context = self._load_request_context(msg)
             except (ValueError, json.JSONDecodeError):
                 request_context = {}
-        request_context["skill_sequence"] = plan.skill_sequence
         request_context["planner_source"] = plan.planner_source
         request_context["planner_confidence"] = plan.confidence
         request_context["scene_summary"] = plan.scene_summary
@@ -224,9 +242,31 @@ class VLMTaskPlannerNode(BaseTaskNode):
         )
         request_context["fallback_reason"] = fallback_reason
         planned.context_json = json.dumps(request_context, ensure_ascii=False)
+        planned.workflow_steps = [
+            workflow_step(
+                skill_name=skill_name,
+                target_name=plan.target_name,
+                place_name=plan.place_name,
+                motion_direction=plan.motion_direction,
+                motion_distance=plan.motion_distance,
+                timeout_sec=float(catalog.timeout_policy.get("default_skill_timeout_sec", msg.timeout_sec))
+                if catalog is not None
+                else msg.timeout_sec,
+            )
+            for skill_name in plan.skill_sequence
+        ]
+        if catalog is not None and planned.dispatch_binding.task_budget.schema_version == 1:
+            planned.dispatch_binding.workflow_digest = compute_workflow_digest(
+                root_task_id=planned.dispatch_binding.root_task_id or planned.dispatch_binding.task_id,
+                task_budget=planned.dispatch_binding.task_budget,
+                expected_registry_epoch=catalog.identity.registry_epoch,
+                expected_registry_generation=catalog.identity.generation,
+                expected_registry_digest=catalog.identity.registry_digest,
+                workflow_steps=planned.workflow_steps,
+            )
         self._planned_publisher.publish(planned)
         self._publish_status(
-            task_id=msg.task_id,
+            task_id=msg.dispatch_binding.task_id,
             state="planned",
             success=True,
             message=f"planned skills: {plan.skill_sequence}",
@@ -234,7 +274,7 @@ class VLMTaskPlannerNode(BaseTaskNode):
         if self._debug:
             self.get_logger().info(
                 "[embodied-debug] vlm_task_planner planned "
-                f"task_id={msg.task_id} source={plan.planner_source} "
+                f"task_id={msg.dispatch_binding.task_id} source={plan.planner_source} "
                 f"confidence={plan.confidence:.3f} target={plan.target_name or '-'} "
                 f"place={plan.place_name or '-'} motion={plan.motion_direction or '-'} "
                 f"skills={plan.skill_sequence} scene_summary='{plan.scene_summary}' "
@@ -266,7 +306,7 @@ class VLMTaskPlannerNode(BaseTaskNode):
         raw_content, _ = self._api_client.plan(messages, timeout_sec=remaining_budget)
         if self._debug:
             self.get_logger().info(
-                f"[embodied-debug] vlm_task_planner scene_analysis task_id={msg.task_id} preview={raw_content[:240]!r}"
+                f"[embodied-debug] vlm_task_planner scene_analysis task_id={msg.dispatch_binding.task_id} preview={raw_content[:240]!r}"
             )
         return parse_scene_analysis_response(raw_content)
 
@@ -282,7 +322,7 @@ class VLMTaskPlannerNode(BaseTaskNode):
         if self._debug:
             self.get_logger().info(
                 "[embodied-debug] vlm_task_planner scene_snapshot "
-                f"task_id={msg.task_id} camera={scene_snapshot.get('camera_topic')} "
+                f"task_id={msg.dispatch_binding.task_id} camera={scene_snapshot.get('camera_topic')} "
                 f"errors={scene_snapshot.get('errors')}"
             )
         if scene_snapshot["errors"]:
@@ -313,7 +353,7 @@ class VLMTaskPlannerNode(BaseTaskNode):
         raw_content, _ = self._api_client.plan(messages, timeout_sec=remaining_budget)
         if self._debug:
             self.get_logger().info(
-                f"[embodied-debug] vlm_task_planner api_response task_id={msg.task_id} preview={raw_content[:240]!r}"
+                f"[embodied-debug] vlm_task_planner api_response task_id={msg.dispatch_binding.task_id} preview={raw_content[:240]!r}"
             )
         plan = parse_planner_response(
             raw_content,
@@ -348,18 +388,20 @@ class VLMTaskPlannerNode(BaseTaskNode):
             if self._debug and scene_analysis is not None:
                 self.get_logger().info(
                     f"[embodied-debug] vlm_task_planner scene_summary "
-                    f"task_id={msg.task_id} summary={scene_analysis.scene_summary!r}"
+                    f"task_id={msg.dispatch_binding.task_id} summary={scene_analysis.scene_summary!r}"
                 )
         except Exception as exc:
             fallback_reason = str(exc)
             if self._requires_missing_skill_rejection(fallback_reason):
-                self._reject_task(msg.task_id, fallback_reason, "MISSING_REQUIRED_SKILLS")
+                self._reject_task(msg.dispatch_binding.task_id, fallback_reason, "MISSING_REQUIRED_SKILLS")
                 return None
             self.get_logger().warning(
-                f"[embodied-debug] vlm_task_planner scene analysis failed task_id={msg.task_id}: {fallback_reason}"
+                f"[embodied-debug] vlm_task_planner scene analysis failed task_id={msg.dispatch_binding.task_id}: {fallback_reason}"
             )
             if self._planner_mode == "vlm_api" and not self._fallback_enabled:
-                self._reject_task(msg.task_id, f"scene analysis failed: {fallback_reason}", "SCENE_ANALYSIS_FAILED")
+                self._reject_task(
+                    msg.dispatch_binding.task_id, f"scene analysis failed: {fallback_reason}", "SCENE_ANALYSIS_FAILED"
+                )
                 return None
 
         # Step 2: second LLM call (skill planning) - scene_analysis preserved on failure
@@ -370,13 +412,17 @@ class VLMTaskPlannerNode(BaseTaskNode):
             except Exception as exc:
                 fallback_reason = str(exc)
                 if self._requires_missing_skill_rejection(fallback_reason):
-                    self._reject_task(msg.task_id, fallback_reason, "MISSING_REQUIRED_SKILLS")
+                    self._reject_task(msg.dispatch_binding.task_id, fallback_reason, "MISSING_REQUIRED_SKILLS")
                     return None
                 self.get_logger().warning(
-                    f"[embodied-debug] vlm_task_planner VLM planning failed task_id={msg.task_id}: {fallback_reason}"
+                    f"[embodied-debug] vlm_task_planner VLM planning failed task_id={msg.dispatch_binding.task_id}: {fallback_reason}"
                 )
                 if self._planner_mode == "vlm_api" and not self._fallback_enabled:
-                    self._reject_task(msg.task_id, f"vlm planning failed: {fallback_reason}", "VLM_PLANNING_FAILED")
+                    self._reject_task(
+                        msg.dispatch_binding.task_id,
+                        f"vlm planning failed: {fallback_reason}",
+                        "VLM_PLANNING_FAILED",
+                    )
                     return None
 
         return None, scene_analysis, fallback_reason
@@ -388,7 +434,7 @@ class VLMTaskPlannerNode(BaseTaskNode):
         task has already been rejected and the caller should return.
         """
         if self._planner_mode == "vlm_api" and not self._fallback_enabled:
-            self._reject_task(msg.task_id, "vlm planner produced no valid plan", "EMPTY_VLM_PLAN")
+            self._reject_task(msg.dispatch_binding.task_id, "vlm planner produced no valid plan", "EMPTY_VLM_PLAN")
             return None
 
         plan = fallback_plan_from_text(
@@ -399,17 +445,28 @@ class VLMTaskPlannerNode(BaseTaskNode):
             skill_aliases=self._skill_aliases or None,
         )
         if not plan.skill_sequence:
-            self._reject_task(msg.task_id, fallback_reason or "unsupported command", "UNSUPPORTED_COMMAND")
+            self._reject_task(
+                msg.dispatch_binding.task_id, fallback_reason or "unsupported command", "UNSUPPORTED_COMMAND"
+            )
             return None
         return plan
 
     def _handle_task_command(self, msg: TaskCommand) -> None:
         if self._debug:
             self.get_logger().info(
-                f"[embodied-debug] vlm_task_planner received task_id={msg.task_id} text='{msg.raw_command}'"
+                f"[embodied-debug] vlm_task_planner received task_id={msg.dispatch_binding.task_id} text='{msg.raw_command}'"
             )
 
-        self._publish_status(task_id=msg.task_id, state="planning", success=True, message="planning task")
+        catalog = self._catalog.current
+        if catalog is None:
+            self._reject_task(msg.dispatch_binding.task_id, "catalog snapshot is not ready", "SKILL_REGISTRY_NOT_READY")
+            return
+        self._allowed_skills = sorted(catalog.planner_visible_names)
+        self._skill_aliases = {name: list(values) for name, values in catalog.aliases.items()}
+
+        self._publish_status(
+            task_id=msg.dispatch_binding.task_id, state="planning", success=True, message="planning task"
+        )
 
         plan: PlannerResult | None = None
         scene_analysis: SceneAnalysis | None = None
@@ -430,7 +487,14 @@ class VLMTaskPlannerNode(BaseTaskNode):
             rejection_reason = f"required missing skills: {', '.join(plan.required_missing_skills)}"
             if plan.planner_reason:
                 rejection_reason = f"{rejection_reason}; {plan.planner_reason}"
-            self._reject_task(msg.task_id, rejection_reason, "MISSING_REQUIRED_SKILLS")
+            self._reject_task(msg.dispatch_binding.task_id, rejection_reason, "MISSING_REQUIRED_SKILLS")
+            return
+        if any(skill_name not in catalog.planner_visible_names for skill_name in plan.skill_sequence):
+            self._reject_task(
+                msg.dispatch_binding.task_id,
+                "planner returned an entry outside the captured planner-visible set",
+                "SKILL_SCHEMA_INVALID",
+            )
             return
 
         try:
@@ -443,6 +507,7 @@ class VLMTaskPlannerNode(BaseTaskNode):
             scene_analysis=scene_analysis,
             fallback_reason=fallback_reason,
             request_context=_parsed_context,
+            catalog=catalog,
         )
 
 

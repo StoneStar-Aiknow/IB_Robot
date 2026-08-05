@@ -34,15 +34,23 @@ source install/local_setup.sh
 | `validate SKILL` | 是 | 本地 schema 检查后调用 Gateway 安全校验，不执行动作 |
 | `execute SKILL --task-id ID` | 是 | 通过 `SkillCommand` 执行高层技能 |
 | `cancel --task-id ID` | 是 | 以同一 deterministic goal UUID 请求取消并轮询 terminal |
+| `reload-catalog --request-id ID --force` | 是 | 重新编译并原子激活 Gateway 已配置的 Skill catalog source |
+| `plan-text TEXT --request-id ID` | 是 | 生成一份短时 typed Agent plan |
+| `validate-plan --plan-token TOKEN` | 是 | 对 exact snapshot 计划做只读逐步预检 |
+| `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID` | 是 | 绑定用户确认、task ID 和当前 registry identity |
+| `execute-plan --plan-token TOKEN --confirmation-token TOKEN --task-id ID` | 是 | 执行已确认的 Agent plan |
+| `cancel-plan --task-id ID` | 是 | 通过 Agent plan action 的标准 CancelGoal 请求取消 |
 
 catalog-only 命令不初始化 `rclpy`，只读取本地归一化配置。runtime 命令只访问 Gateway status、
-`ValidateSkill`、`SkillCommand` 和标准 `CancelGoal` 接口。
+`ValidateSkill`、`SkillCommand`、Agent plan services/actions 和标准 `CancelGoal` 接口。
 
 ```bash
 robot-skill --config-name so101_single_arm list-skills
 robot-skill --config-name so101_single_arm describe move_relative_ee
 robot-skill --config-name so101_single_arm list-poses
 robot-skill --config-name so101_single_arm status
+robot-skill --config-name so101_single_arm reload-catalog \
+  --request-id reload-001 --force
 
 robot-skill --config-name so101_single_arm validate move_relative_ee \
   --motion-direction forward --motion-distance 0.03
@@ -53,6 +61,17 @@ robot-skill --config-name so101_single_arm execute move_relative_ee \
 
 robot-skill --config-name so101_single_arm cancel \
   --task-id task-20260725-001
+
+robot-skill --config-name so101_single_arm plan-text \
+  --request-id plan-request-001 --text "打开夹爪"
+robot-skill --config-name so101_single_arm validate-plan \
+  --plan-token PLAN_TOKEN
+robot-skill --config-name so101_single_arm confirm-plan \
+  --plan-token PLAN_TOKEN --plan-digest PLAN_DIGEST --task-id agent-task-001
+robot-skill --config-name so101_single_arm execute-plan \
+  --plan-token PLAN_TOKEN --confirmation-token CONFIRMATION_TOKEN --task-id agent-task-001
+robot-skill --config-name so101_single_arm cancel-plan \
+  --task-id agent-task-001
 ```
 
 可用 typed flags 为 `--target-name`、`--place-name`、`--motion-direction`、`--motion-distance` 和
@@ -67,7 +86,7 @@ primitive sequence、目标绑定、关节值和 ROS transport 名称不属于 C
 
 ## 调用顺序
 
-Agent 必须按以下顺序工作：
+传统单技能 Agent 必须按以下顺序工作：
 
 1. `status`
 2. `list-skills`
@@ -75,6 +94,14 @@ Agent 必须按以下顺序工作：
 4. `validate SKILL`
 5. 获取用户明确的运动确认
 6. `execute SKILL --task-id ID`
+
+自然语言计划必须按以下顺序工作：
+
+1. `plan-text TEXT --request-id ID`
+2. `validate-plan --plan-token TOKEN`
+3. 向用户展示步骤、参数、plan digest 和 registry identity，获取明确确认并生成 task ID
+4. `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID`
+5. `execute-plan --plan-token TOKEN --confirmation-token TOKEN --task-id ID`
 
 当前 `execute` 可用 SIGINT/SIGTERM 请求取消；另一个进程可使用 `cancel --task-id ID`。失败、timeout 或
 停止状态未知时不得自动重试。`SKILL_CANCEL_TIMEOUT` 表示机器人停止状态未知，不能表述为“已停止”。
@@ -122,3 +149,16 @@ pipeline、开启授权、修改 ROS 参数，或从 YAML 推导授权。只有�
 pipeline 时显式授权。未授权状态下仍可使用 catalog、`status` 和不执行动作的本地检查；Gateway 会拒绝运动。
 
 `robot_mcp` 兼容层已移除。Hermes 推荐配置和示例统一通过 `robot-skill` 访问 Capability Gateway。
+
+## Hermes 启动器
+
+完整构建后可运行：
+
+```bash
+hermes-robot --config-name so101_single_arm
+```
+
+启动器要求 Hermes Agent `0.16.0` 或更新版本，并在启动前验证 `hermes`、`robot-skill`、安装空间中的
+`ibrobot-control`、目标 robot config、Gateway control-plane status 以及全部 Agent plan service/action。
+`motion_authorized=false` 不阻止 Hermes 启动，只会继续由 Gateway 拒绝运动。启动器仅设置精确
+`ROBOT_CONFIG` 并预加载 `ibrobot-control`；它不会启动/重启 pipeline、修改 ROS 参数或开启运动授权。

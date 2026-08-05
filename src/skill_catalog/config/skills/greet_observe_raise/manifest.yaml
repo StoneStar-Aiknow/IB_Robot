@@ -1,0 +1,45 @@
+schema_version: 1
+name: greet_observe_raise
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: 'Formal greet: move to observe_table, raise/lower the end-effector, return.'
+  category: social_greeting
+  when_to_use:
+  - formal raise-hand greeting
+  - acknowledge someone politely at the observe pose
+  do_not_use:
+  - condition: casual wrist wave hello or bye
+    instead_use: wave_hello
+  - condition: celebrate a success
+    instead_use: celebrate
+  aliases_zh:
+  - 举手致意
+  - 正式打招呼
+  - 举手打招呼
+  aliases_en:
+  - raise hand
+  - formal greet
+  - acknowledge
+  motion_scope:
+  - arm
+  anchor_pose: observe_table
+  intensity: moderate
+  duration_sec_estimate: 4.0
+  requires_motion_params: false
+  rule_entry: true
+capability:
+  schema_version: 1
+  summary: Perform a formal raised-hand greeting.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  so101_single_arm: implementations/so101_single_arm.yaml
+  so101_rtp_distributed: implementations/so101_rtp_distributed.yaml

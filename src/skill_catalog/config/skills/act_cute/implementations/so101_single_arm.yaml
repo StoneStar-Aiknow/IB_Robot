@@ -1,0 +1,95 @@
+schema_version: 1
+kind: primitive_sequence
+robot: so101_single_arm
+initial_gripper_state: closed
+timeout_sec: 30.0
+primitive_sequence:
+- primitive_name: move_to_named_pose
+  pose_name: home
+- primitive_name: move_to_joint_positions
+  joint_positions:
+    '1': 0.1
+    '2': 0.54
+    '3': -0.82
+    '4': -0.22
+    '5': 0.3
+  duration_sec: 2.0
+- primitive_name: open_gripper
+- primitive_name: move_through_joint_positions
+  trajectory_template:
+    type: wave_dance_v1
+    waypoint_duration_sec: 0.05
+    active_waypoint_count: 48
+    repeat_count: 2
+    zero_hold_count: 2
+    base_pose:
+      '1': 0.02
+      '2': 0.54
+      '3': -0.82
+      '4': -0.18
+      '5': 0.02
+    joints:
+      '1':
+        terms:
+        - amplitude: 0.08
+          harmonic: 1
+          phase: 1.5707963267948966
+      '2':
+        terms:
+        - amplitude: 0.1
+          harmonic: 1
+          phase: 0.0
+      '3':
+        terms:
+        - amplitude: 0.08
+          harmonic: 1
+          phase: 0.0
+      '4':
+        terms:
+        - amplitude: -0.12
+          harmonic: 1
+          phase: 0.35
+      '5':
+        terms:
+        - amplitude: 0.28
+          harmonic: 1
+          phase: 1.5707963267948966
+    workspace_limits:
+      model: so101_arm_v1
+      points:
+        joint3:
+          z:
+          - 0.04
+          - 0.55
+        upper_arm_mid:
+          z:
+          - 0.03
+          - 0.55
+        forearm_mid:
+          z:
+          - 0.025
+          - 0.55
+        wrist_mid:
+          z:
+          - 0.025
+          - 0.55
+        ee:
+          x:
+          - -0.32
+          - 0.25
+          y:
+          - -0.42
+          - 0.0
+          z:
+          - 0.05
+          - 0.55
+- primitive_name: close_gripper
+- primitive_name: open_gripper
+- primitive_name: move_to_joint_positions
+  joint_positions:
+    '1': 0.02
+    '2': 0.54
+    '3': -0.82
+    '4': -0.18
+    '5': 0.02
+  duration_sec: 2.0

@@ -1,0 +1,49 @@
+schema_version: 1
+name: happy_spin_upright
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Keep an upright pose while spinning the base joint with a wrist wiggle.
+  category: social_emotion
+  when_to_use:
+  - spin cheerfully
+  - show joy with a turn
+  - happy spin
+  do_not_use:
+  - condition: celebrate a success with up/down moves
+    instead_use: celebrate
+  - condition: dance rhythmically
+    instead_use: dance_basic
+  aliases_zh:
+  - 开心转圈
+  - 高兴转圈
+  - 快乐转圈
+  - 直立转圈
+  - 开心地转圈
+  aliases_en:
+  - happy spin
+  - joyful turn
+  - spin cheerfully
+  motion_scope:
+  - base
+  - wrist
+  anchor_pose: home
+  intensity: large
+  duration_sec_estimate: 12.0
+  requires_motion_params: false
+  rule_entry: true
+capability:
+  schema_version: 1
+  summary: Perform an upright celebratory spin gesture.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  so101_single_arm: implementations/so101_single_arm.yaml
+  so101_rtp_distributed: implementations/so101_rtp_distributed.yaml

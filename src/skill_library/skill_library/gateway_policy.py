@@ -24,7 +24,7 @@ INVALID_ARGUMENT = "INVALID_ARGUMENT"
 SKILL_REJECTED = "SKILL_REJECTED"
 GATEWAY_FINALIZATION_FAILED = "GATEWAY_FINALIZATION_FAILED"
 
-_ROOT_OWNER_KINDS = {"skill_command", "external_primitive"}
+_ROOT_OWNER_KINDS = {"skill_command", "workflow", "external_primitive"}
 _CAPABILITY_ORDER = (
     "validate_skill",
     "task_executor",
@@ -190,6 +190,11 @@ class ExecutionOwner:
     def external_primitive(cls, task_id: str) -> ExecutionOwner:
         """Create the owner for a primitive requested outside a SkillCommand."""
         return cls(root_task_id=task_id, kind="external_primitive")
+
+    @classmethod
+    def workflow(cls, task_id: str) -> ExecutionOwner:
+        """Create the owner for one typed Workflow root."""
+        return cls(root_task_id=task_id, kind="workflow")
 
     @classmethod
     def internal_child(cls, root_owner: ExecutionOwner, name: str) -> ExecutionOwner:
@@ -533,6 +538,33 @@ class GatewayPolicy:
         """Resolve a request's canonical identity and effective timeout."""
         return build_request_identity(request, default_timeout_sec=self._default_timeout_sec)
 
+    def replace_catalog(
+        self,
+        timeout_policy: Mapping[str, Any],
+        skill_requirements: Mapping[str, SkillRequirements],
+        *,
+        parameter_schemas: Mapping[str, Mapping[str, Any]],
+    ) -> None:
+        """Replace immutable admission indexes for the next root request.
+
+        Active admissions retain their prepared identity and lease.  The node
+        must keep their execution template separately until finalization.
+        """
+        default_timeout = _finite_positive(
+            timeout_policy.get("default_skill_timeout_sec"),
+            "timeout_policy.default_skill_timeout_sec",
+        )
+        task_budget = _finite_positive(timeout_policy.get("task_budget_sec"), "timeout_policy.task_budget_sec")
+        if default_timeout > task_budget:
+            raise ValueError("timeout_policy.default_skill_timeout_sec must be <= task_budget_sec")
+        if not isinstance(parameter_schemas, Mapping):
+            raise ValueError("parameter_schemas must be a mapping")
+        with self._transition_lock:
+            self._default_timeout_sec = default_timeout
+            self._task_budget_sec = task_budget
+            self._skill_requirements = dict(skill_requirements)
+            self._parameter_schemas = dict(parameter_schemas)
+
     def evaluate(
         self,
         request: GatewayRequest,
@@ -703,6 +735,53 @@ class GatewayPolicy:
             if token is None:
                 return SKILL_BUSY, None
             return "", token
+
+    def admit_workflow(
+        self,
+        owner: ExecutionOwner,
+        snapshot: RuntimeSnapshot,
+        *,
+        timeout_sec: float,
+    ) -> tuple[str, object | None]:
+        """Atomically acquire the root lease for a prevalidated typed Workflow."""
+        _ledger, lease = self._atomic_resources()
+        with self._transition_lock:
+            if owner.kind != "workflow" or not owner.root_task_id:
+                return SKILL_REJECTED, None
+            if not snapshot.motion_authorized:
+                return MOTION_NOT_AUTHORIZED, None
+            if snapshot.active_control_mode != snapshot.required_control_mode:
+                return CONTROL_MODE_MISMATCH, None
+            if snapshot.is_busy and not _is_active_owner(owner, snapshot.active_task_id):
+                return SKILL_BUSY, None
+            if timeout_sec > self._task_budget_sec:
+                return TIMEOUT_EXCEEDS_POLICY, None
+            token = lease.acquire(owner)
+            if token is None:
+                return SKILL_BUSY, None
+            return "", token
+
+    def borrow_workflow_internal(
+        self,
+        root_owner: ExecutionOwner,
+        lease_token: object,
+        task_id: str,
+        child_name: str,
+    ) -> object | None:
+        """Issue a non-releasable borrow for one Workflow child dispatch."""
+        _ledger, lease = self._atomic_resources()
+        with self._transition_lock:
+            if root_owner.kind != "workflow" or lease.owner is not root_owner or not task_id:
+                return None
+            return lease.reuse(ExecutionOwner.internal_child(root_owner, child_name), lease_token)
+
+    def release_workflow(self, owner: ExecutionOwner, lease_token: object) -> bool:
+        """Release only the exact currently active Workflow root lease."""
+        _ledger, lease = self._atomic_resources()
+        with self._transition_lock:
+            if owner.kind != "workflow" or lease.owner is not owner:
+                return False
+            return lease.release(lease_token)
 
     def release_external_primitive(self, token: object) -> bool:
         """Release a successfully cleaned-up external primitive lease."""

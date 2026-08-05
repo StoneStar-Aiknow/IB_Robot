@@ -1,0 +1,22 @@
+# PlanAgentCommand.srv - Capture the exact current snapshot and produce one or
+# more typed WorkflowSteps for the Hermes natural-language flow.
+#
+# See docs/lightweight_skill_package_registry_design_zh.md section 11.6.
+#
+# May only select enabled && planner_visible Atomic Operator / Skill entries;
+# must not output Primitives, nested Workflows or context_json execution
+# fields. Unknown, ambiguous, partial, missing-parameter or extra-field inputs
+# all fail closed: no partial execution of a recognized prefix. A retry with
+# the same (request_id, raw_command, exact identity) returns the same plan /
+# token; the same request_id with a different payload returns
+# SKILL_REQUEST_ID_CONFLICT. schema_version is 1 in v1.
+
+uint32 schema_version
+string request_id
+string raw_command
+---
+bool success
+AgentPlan plan
+string error_code
+string message
+SkillDiagnostic[] diagnostics

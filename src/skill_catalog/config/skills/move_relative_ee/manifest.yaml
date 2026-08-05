@@ -1,0 +1,69 @@
+schema_version: 1
+name: move_relative_ee
+version: 1.0.0
+semantic_level: atomic_operator
+description:
+  summary: Translate the end-effector by a caller-supplied direction and distance.
+  category: translation
+  when_to_use:
+  - nudge the gripper a little up/down/left/right/forward/back
+  - small corrective move
+  do_not_use:
+  - condition: move to a named pose
+    instead_use: recover_safe_pose
+  - condition: do a predefined gesture
+    instead_use: wave_hello
+  aliases_zh:
+  - 往前一点
+  - 往上一点
+  - 夹爪往左
+  - 移动一点
+  aliases_en:
+  - move a bit
+  - nudge
+  motion_scope:
+  - arm
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 1.5
+  requires_motion_params: true
+capability:
+  schema_version: 1
+  summary: Move the end effector in a requested direction by a requested distance.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties:
+      motion_direction:
+        type: string
+        enum:
+        - forward
+        - backward
+        - left
+        - right
+        - up
+        - down
+      motion_distance:
+        type: number
+        exclusiveMinimum: 0
+        unit: meters
+    required:
+    - motion_direction
+    - motion_distance
+  recovery_policy: ask_user
+implementations:
+  so101_single_arm: implementations/so101_single_arm.yaml
+  so101_handeye_realsense_grasp: implementations/so101_handeye_realsense_grasp.yaml
+  so101_rtp_distributed: implementations/so101_rtp_distributed.yaml
+description_variants:
+  so101_handeye_realsense_grasp:
+    summary: Translate the end-effector by a requested direction and distance.
+    category: translation
+    when_to_use:
+    - make a small corrective end-effector move
+    motion_scope:
+    - arm
+    intensity: moderate

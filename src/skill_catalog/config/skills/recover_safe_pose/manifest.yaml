@@ -1,0 +1,61 @@
+schema_version: 1
+name: recover_safe_pose
+version: 1.0.0
+semantic_level: atomic_operator
+description:
+  summary: Return the arm to the 'home' safe rest pose.
+  category: recovery
+  when_to_use:
+  - go back to a safe position
+  - reset between tasks
+  - stop and rest
+  do_not_use:
+  - condition: return to the factory zero/calibration pose
+    instead_use: recover_zero_pose
+  - condition: look at the table
+    instead_use: inspect_scene
+  aliases_zh:
+  - 回原位
+  - 回安全位
+  - 回安全位置
+  - 原位
+  - 原点
+  - 回到home
+  - 返回home
+  aliases_en:
+  - home
+  - safe pose
+  - reset
+  - recover
+  motion_scope:
+  - arm
+  anchor_pose: home
+  intensity: moderate
+  duration_sec_estimate: 3.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Return the arm to a safe resting pose.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  so101_single_arm: implementations/so101_single_arm.yaml
+  so101_handeye_realsense_grasp: implementations/so101_handeye_realsense_grasp.yaml
+  so101_rtp_distributed: implementations/so101_rtp_distributed.yaml
+description_variants:
+  so101_handeye_realsense_grasp:
+    summary: Return the arm to the home safe pose.
+    category: recovery
+    when_to_use:
+    - return to a safe position
+    - reset between tasks
+    motion_scope:
+    - arm
+    intensity: moderate

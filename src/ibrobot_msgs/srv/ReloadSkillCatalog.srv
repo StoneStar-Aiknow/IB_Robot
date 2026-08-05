@@ -1,0 +1,33 @@
+# ReloadSkillCatalog.srv - Reload the skill catalog from the configured source
+# resolver. std_srvs/Trigger cannot express the structured result.
+#
+# See docs/lightweight_skill_package_registry_design_zh.md section 11.2.
+#
+# Production deployments should disable this service or restrict callers via
+# operator policy. The service always reloads the configured source root; it
+# must never accept an arbitrary caller-supplied path. request_id is used for
+# log correlation and short-term idempotency; same request_id with different
+# request fields returns SKILL_REQUEST_ID_CONFLICT. force=true only forces
+# recompile and re-validation: when neither registry_digest nor
+# provenance_digest changed, generation must not be artificially incremented.
+# schema_version is 1 in v1.
+#
+# A successful no-op returns success=true, old_generation == generation and an
+# empty changed_skills list.
+
+uint32 schema_version
+string request_id
+bool force
+---
+bool success
+string registry_epoch
+uint64 old_generation
+uint64 generation
+string registry_digest
+string capability_digest
+string source_release_digest
+string provenance_digest
+string error_code
+string message
+string[] changed_skills
+SkillDiagnostic[] diagnostics

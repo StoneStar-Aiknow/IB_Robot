@@ -1,0 +1,45 @@
+schema_version: 1
+name: rotate_gripper_ccw
+version: 1.0.0
+semantic_level: atomic_operator
+description:
+  summary: Rotate the gripper counter-clockwise by a caller-supplied angle.
+  category: rotation
+  when_to_use:
+  - twist the wrist counter-clockwise
+  - rotate the held object counter-clockwise
+  do_not_use:
+  - condition: rotate clockwise
+    instead_use: rotate_gripper_cw
+  aliases_zh:
+  - 逆时针旋转
+  - 逆时针转
+  aliases_en:
+  - rotate counter-clockwise
+  - twist ccw
+  motion_scope:
+  - wrist
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 1.5
+  requires_motion_params: true
+capability:
+  schema_version: 1
+  summary: Rotate the gripper counter-clockwise by a requested angle.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties:
+      motion_distance:
+        type: number
+        exclusiveMinimum: 0
+        unit: degrees
+    required:
+    - motion_distance
+  recovery_policy: ask_user
+implementations:
+  so101_single_arm: implementations/so101_single_arm.yaml
+  so101_rtp_distributed: implementations/so101_rtp_distributed.yaml

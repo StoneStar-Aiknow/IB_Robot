@@ -1,0 +1,31 @@
+# ConfirmAgentPlan.srv - Post-user-confirmation trusted Agent call. NOT a way
+# to turn verbal confirmation into authorize_motion.
+#
+# See docs/lightweight_skill_package_registry_design_zh.md section 11.6.
+#
+# The Agent must first generate a fresh task_id and present the user with the
+# plan kind, ordered steps, typed parameters, exact snapshot identity and that
+# task_id; only after explicit user confirmation may the CLI call this service.
+# The coordinator/plan store must atomically validate
+# (plan_token, plan_digest, task_id, registry_epoch, registry_generation,
+# registry_digest), transition the plan from PLANNED to CONFIRMED and return a
+# single-use confirmation_token bound to that exact tuple. Mismatch, duplicate
+# confirmation, expired plan or reload-changed identity all fail closed.
+#
+# confirmation_token does not grant motion authorization, does not hold the
+# root lease and does not enter any digest; it only proves that this exact
+# plan/task pair has been confirmed once. schema_version is 1 in v1.
+
+uint32 schema_version
+string plan_token
+string plan_digest
+string task_id
+string registry_epoch
+uint64 registry_generation
+string registry_digest
+---
+bool confirmed
+string confirmation_token
+string error_code
+string message
+SkillDiagnostic[] diagnostics

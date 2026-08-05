@@ -8,7 +8,6 @@ from pathlib import Path
 import pytest
 
 from embodied_common.skill_request import canonical_skill_payload, skill_payload_hash
-from embodied_common.skill_templates import get_skill_templates
 from robot_config.loader import load_robot_config_dict
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
@@ -28,6 +27,13 @@ def test_catalog_import_does_not_load_rclpy(monkeypatch):
     importlib.reload(module)
 
 
+def test_status_preflight_timeout_has_hardware_discovery_floor():
+    from robot_skill_cli.cli import _status_preflight_timeout
+
+    context = type("Context", (), {"view": {"timeout_policy": {"rpc_timeout_sec": 5.0}}})()
+    assert _status_preflight_timeout(context) == 15.0
+
+
 def test_load_catalog_uses_exported_config_resolver(monkeypatch):
     from robot_skill_cli import catalog
 
@@ -44,15 +50,13 @@ def test_load_catalog_uses_exported_config_resolver(monkeypatch):
     assert view["robot_name"] == "so101_single_arm"
 
 
-def test_list_skills_uses_every_enabled_template_and_only_public_fields():
+def test_list_skills_uses_every_profile_enabled_entry_and_only_public_fields():
     from robot_skill_cli.catalog import list_skills, load_capability_catalog
-
-    config = load_robot_config_dict(CONFIG_PATH)
-    expected_names = sorted(get_skill_templates(config["embodied"]["skill_templates"]))
 
     data = list_skills(load_capability_catalog(config_path=CONFIG_PATH))
 
-    assert [skill["name"] for skill in data["skills"]] == expected_names
+    assert len(data["skills"]) == 16
+    assert [skill["name"] for skill in data["skills"]] == sorted(skill["name"] for skill in data["skills"])
     assert all(
         set(skill)
         == {
@@ -176,16 +180,14 @@ def test_catalog_uses_capability_metadata_without_legacy_descriptions():
     assert "description" not in described
 
 
-def test_catalog_lists_no_skills_when_config_omits_skill_templates(tmp_path):
-    from robot_skill_cli.catalog import list_skills, load_capability_catalog
+def test_catalog_requires_an_explicit_profile(tmp_path):
+    from robot_skill_cli.catalog import load_capability_catalog
 
     config_path = tmp_path / "robot.yaml"
     config_path.write_text("robot:\n  name: catalog_robot\n", encoding="utf-8")
 
-    listed = list_skills(load_capability_catalog(config_path=config_path))
-
-    assert listed["robot_name"] == "catalog_robot"
-    assert listed["skills"] == []
+    with pytest.raises(KeyError, match="embodied"):
+        load_capability_catalog(config_path=config_path)
 
 
 def test_unknown_skill_has_stable_error_and_exit_code(capsys):
@@ -213,6 +215,40 @@ def test_catalog_commands_emit_one_json_document(capsys):
         payload = json.loads(captured.out)
         assert payload["schema_version"] == 1
         assert payload["ok"] is True
+
+
+def test_agent_plan_parser_uses_frozen_text_option_and_lifecycle_commands():
+    from robot_skill_cli.cli import _build_parser
+
+    parser = _build_parser()
+    plan = parser.parse_args(["plan-text", "--request-id", "request-1", "--text", "打开夹爪"])
+    confirm = parser.parse_args(
+        [
+            "confirm-plan",
+            "--plan-token",
+            "plan-token",
+            "--plan-digest",
+            "digest",
+            "--task-id",
+            "task-1",
+        ]
+    )
+
+    assert plan.raw_command == "打开夹爪"
+    assert plan.request_id == "request-1"
+    assert confirm.command == "confirm-plan"
+
+
+def test_runtime_capability_view_rejects_tampered_snapshot() -> None:
+    from robot_skill_cli.catalog import capability_view_from_snapshot
+
+    bridge = _FakeBridge(_ready_status("legacy-digest"))
+    status = bridge.get_status()
+    snapshot = bridge.get_skill_snapshot()
+    snapshot["snapshot_json"] += " "
+
+    with pytest.raises(ValueError, match="SKILL_SNAPSHOT_DIGEST_MISMATCH"):
+        capability_view_from_snapshot(snapshot, status)
 
 
 def test_skill_payload_normalization_and_default_timeout_identity():
@@ -324,6 +360,9 @@ class _FakeBridge:
         self.status = status
         self.calls = []
         self.validate_payloads = []
+        self.status_timeouts = []
+        self.reload_requests = []
+        self._snapshot = None
 
     def start(self):
         self.calls.append("start")
@@ -331,12 +370,58 @@ class _FakeBridge:
 
     def get_status(self, **kwargs):
         self.calls.append("status")
+        self.status_timeouts.append(kwargs.get("timeout_sec"))
+        if self._snapshot is None:
+            self._snapshot = self._build_snapshot()
+            self.status.update(
+                registry_epoch="epoch-1",
+                registry_generation=1,
+                registry_digest=self._snapshot.registry_digest,
+                capability_digest=self._snapshot.capability_digest,
+            )
         return self.status
 
     def validate_skill(self, payload, **kwargs):
         self.calls.append("validate")
         self.validate_payloads.append(payload)
         return {"allowed": True, "reason": "allowed"}
+
+    def reload_skill_catalog(self, **kwargs):
+        self.reload_requests.append(kwargs)
+        return {
+            "success": True,
+            "registry_epoch": "epoch-2",
+            "old_generation": 1,
+            "generation": 2,
+            "registry_digest": "registry-2",
+            "capability_digest": "capability-2",
+            "source_release_digest": "source-2",
+            "provenance_digest": "provenance-2",
+            "error_code": "",
+            "message": "reloaded",
+            "changed_skills": ["nod_yes"],
+            "diagnostics": [],
+        }
+
+    def get_skill_snapshot(self, **_kwargs):
+        snapshot = self._snapshot or self._build_snapshot()
+        return {
+            "success": True,
+            "registry_epoch": "epoch-1",
+            "generation": 1,
+            "registry_digest": snapshot.registry_digest,
+            "capability_digest": snapshot.capability_digest,
+            "provenance_digest": snapshot.provenance_digest,
+            "snapshot_json": snapshot.snapshot_json,
+        }
+
+    @staticmethod
+    def _build_snapshot():
+        from robot_config.loader import load_robot_config_dict
+        from robot_skill_cli.catalog import compile_local_snapshot
+
+        config = load_robot_config_dict(CONFIG_PATH)
+        return compile_local_snapshot(config, CONFIG_PATH)
 
     def close(self):
         self.calls.append("close")
@@ -354,6 +439,9 @@ def _ready_status(config_digest, *, ready=True, reason=""):
         "task_budget_sec": 180.0,
         "rpc_timeout_sec": 5.0,
         "config_digest": config_digest,
+        "registry_epoch": "epoch-1",
+        "registry_generation": 1,
+        "registry_digest": "registry-digest",
         "request_state": "",
         "request_error_code": "",
         "capabilities": [
@@ -373,7 +461,43 @@ def _ready_status(config_digest, *, ready=True, reason=""):
     }
 
 
-def test_validate_checks_digest_before_schema_or_safety(monkeypatch, capsys):
+def test_status_command_uses_hardware_discovery_timeout_floor(monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    bridge = _FakeBridge(_ready_status("legacy-digest"))
+    monkeypatch.setattr(cli, "_create_bridge", lambda _transport: bridge)
+
+    assert cli.main(["--config-path", str(CONFIG_PATH), "status"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["ok"] is True
+    assert bridge.status_timeouts == [15.0]
+
+
+def test_reload_catalog_command_uses_bound_gateway_source(monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    bridge = _FakeBridge(_ready_status("legacy-digest"))
+    monkeypatch.setattr(cli, "_create_bridge", lambda _transport: bridge)
+
+    assert (
+        cli.main(
+            [
+                "--config-path",
+                str(CONFIG_PATH),
+                "reload-catalog",
+                "--request-id",
+                "reload-1",
+                "--force",
+            ]
+        )
+        == 0
+    )
+
+    assert json.loads(capsys.readouterr().out)["data"]["changed_skills"] == ["nod_yes"]
+    assert bridge.reload_requests == [{"request_id": "reload-1", "force": True, "timeout_sec": 60.0}]
+
+
+def test_validate_uses_verified_snapshot_instead_of_legacy_config_digest(monkeypatch, capsys):
     from robot_skill_cli import cli
     from robot_skill_cli.catalog import load_capability_catalog
 
@@ -387,6 +511,8 @@ def test_validate_checks_digest_before_schema_or_safety(monkeypatch, capsys):
             str(CONFIG_PATH),
             "validate",
             "move_relative_ee",
+            "--motion-direction",
+            "forward",
             "--motion-distance",
             "1.0",
         ]
@@ -394,9 +520,9 @@ def test_validate_checks_digest_before_schema_or_safety(monkeypatch, capsys):
 
     payload = json.loads(capsys.readouterr().out)
     assert view["capability_digest"] != bridge.status["config_digest"]
-    assert exit_code == 3
-    assert payload["error"]["code"] == "CONFIG_MISMATCH"
-    assert bridge.calls == ["start", "status", "close"]
+    assert exit_code == 0
+    assert payload["ok"] is True
+    assert bridge.calls == ["start", "status", "validate", "close"]
 
 
 def test_validate_checks_schema_before_readiness_or_safety(monkeypatch, capsys):

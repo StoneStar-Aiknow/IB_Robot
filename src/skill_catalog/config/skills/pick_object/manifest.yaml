@@ -1,0 +1,40 @@
+schema_version: 1
+name: pick_object
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Detect, grasp, verify, and lift the requested object.
+  category: manipulation
+  when_to_use:
+  - pick up a visible object identified by a text query
+  aliases_zh:
+  - 抓取物体
+  - 拿起物体
+  aliases_en:
+  - pick object
+  - grasp object
+  motion_scope:
+  - arm
+  - gripper
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 120.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Detect, grasp, verify, and lift the requested object.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties:
+      target_name:
+        type: string
+        freeform: true
+    required:
+    - target_name
+  recovery_policy: ask_user
+implementations:
+  so101_handeye_realsense_grasp: implementations/so101_handeye_realsense_grasp.yaml

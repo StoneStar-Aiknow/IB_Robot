@@ -1,0 +1,7 @@
+schema_version: 1
+kind: primitive_sequence
+robot: so101_rtp_distributed
+initial_gripper_state: none
+timeout_sec: 30.0
+primitive_sequence:
+- primitive_name: close_gripper

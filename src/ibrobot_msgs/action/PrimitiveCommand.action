@@ -1,5 +1,17 @@
-string task_id
-string execution_token
+# PrimitiveCommand.action - Atomic motion action served by skill_executor_node
+# at /embodied/execute_primitive.
+#
+# See docs/lightweight_skill_package_registry_design_zh.md section 11.5.
+#
+# Internal and delegated cross-process dispatch must carry the exact active
+# DispatchBinding. For an explicitly admitted external-root Primitive, the
+# Gateway canonicalizes the binding only after acquiring the exclusive root
+# lease. Primitive server matches every field of an active child binding, not
+# just task id; child finalize/cancel invalidates dispatch_nonce immediately.
+# schema_version on DispatchBinding is 1 in v1.
+
+# --- Goal ---
+DispatchBinding dispatch_binding
 string primitive_name
 string pose_name
 geometry_msgs/Pose target_pose
@@ -16,10 +28,15 @@ uint32 joint_waypoint_count
 float32 waypoint_duration_sec
 float32 timeout_sec
 ---
+# --- Result ---
 bool success
 string error_code
 string message
 string pose_name
+string actual_registry_epoch
+uint64 actual_registry_generation
+string actual_registry_digest
 ---
+# --- Feedback ---
 string state
 string detail

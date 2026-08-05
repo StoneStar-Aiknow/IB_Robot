@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import threading
 from pathlib import Path
 
@@ -17,6 +16,12 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
+from embodied_common.dispatch_binding import (
+    copy_binding,
+    delegated_executor_identity,
+    delegated_executor_identity_matches,
+    fill_delegated_executor_identity,
+)
 from ibrobot_msgs.action import PickObject, PrimitiveCommand
 from ibrobot_msgs.srv import DetectSegment, MoveToConfiguration, PlanGrasp, VerifyGrasp
 from manipulation_execution.phases.execution import ExecutionPhase
@@ -76,7 +81,6 @@ class PickExecutorNode(
         "verify_probe": 0.84,
         "lift": 0.92,
         "verify_lift": 0.97,
-        "release": 0.99,
         "completed": 1.0,
     }
 
@@ -94,7 +98,14 @@ class PickExecutorNode(
 
         self._action_name = self.get_parameter("action_name").value
         self._primitive_action_name = self.get_parameter("primitive_action_name").value
+        self._dispatch_nonce = ""
+        self._dispatch_binding = None
         self._config = self._load_json_object(self.get_parameter("grasp_execution_json").value)
+        self._executor_identity = delegated_executor_identity(
+            name="grasp_pipeline",
+            endpoint_name=self._action_name,
+            configuration=self._config,
+        )
         self._workspace = self._load_json_object(self.get_parameter("workspace_json").value)
         self._home_joint_positions = {
             str(name): float(value)
@@ -210,19 +221,23 @@ class PickExecutorNode(
     def _handle_goal(self, goal_request):
         if not str(goal_request.target_query).strip():
             return GoalResponse.REJECT
-        if int(goal_request.mode) not in {
-            PickObject.Goal.MODE_EXECUTE,
-            PickObject.Goal.MODE_PLAN_ONLY,
-            PickObject.Goal.MODE_OBSERVE_ONLY,
-        }:
+        if not delegated_executor_identity_matches(goal_request.expected_executor, self._executor_identity):
             return GoalResponse.REJECT
-        if not math.isfinite(float(goal_request.release_drop_height_m)):
+        dispatch_nonce = str(goal_request.dispatch_binding.dispatch_nonce).strip()
+        if not dispatch_nonce:
             return GoalResponse.REJECT
         with self._goal_lock:
             if self._goal_active:
                 return GoalResponse.REJECT
             self._goal_active = True
+            self._dispatch_nonce = dispatch_nonce
+            self._dispatch_binding = copy_binding(goal_request.dispatch_binding)
         return GoalResponse.ACCEPT
+
+    def _result_from_state(self, state: FlowState) -> PickObject.Result:
+        result = PickExecutorHelpers._result_from_state(state)
+        fill_delegated_executor_identity(result.actual_executor, self._executor_identity)
+        return result
 
     def _handle_joint_state(self, message: JointState) -> None:
         with self._joint_state_lock:

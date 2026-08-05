@@ -1,6 +1,8 @@
 """Configuration loader and validator for robot_config."""
 
 import copy
+import hashlib
+import json
 import logging
 import math
 from pathlib import Path
@@ -52,6 +54,14 @@ _PARAMETER_SCHEMA_FIELDS = {"type", "additionalProperties", "properties", "requi
 _STRING_PARAMETER_FIELDS = {"type", "enum", "freeform"}
 _DISTANCE_PARAMETER_FIELDS = {"type", "exclusiveMinimum", "unit"}
 _VALID_DISTANCE_UNITS = {"meters", "degrees"}
+
+
+def robot_config_digest(robot_config: dict[str, Any]) -> str:
+    """Return the canonical digest of normalized robot configuration content."""
+    content = {key: value for key, value in robot_config.items() if not key.startswith("_")}
+    return hashlib.sha256(
+        json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
 
 
 def _is_finite_number(value: Any) -> bool:
@@ -789,46 +799,14 @@ def _validate_skill_primitive_sequence(
 
 
 def _validate_embodied_skill_contract(robot_config: dict[str, Any]) -> list[str]:
-    errors: list[str] = []
     embodied = robot_config.get("embodied", {})
     if not isinstance(embodied, dict):
-        return errors
-
-    skill_templates = embodied.get("skill_templates", {})
-    if not isinstance(skill_templates, dict):
-        return ["embodied.skill_templates must be a mapping"]
-
-    valid_skills = set(skill_templates)
-    named_poses = embodied.get("named_poses", {})
-    if not isinstance(named_poses, dict):
-        named_poses = {}
-    gateway_control_mode = robot_config.get("skill_required_control_mode")
-    if not isinstance(gateway_control_mode, str) or not gateway_control_mode.strip():
-        gateway_control_mode = None
-    for skill_name, template in skill_templates.items():
-        if not isinstance(template, dict):
-            errors.append(f"embodied.skill_templates.{skill_name} must be a mapping")
-            continue
-        disabled = template.get("disabled")
-        if disabled is not None and not isinstance(disabled, bool):
-            errors.append(f"embodied.skill_templates.{skill_name}.disabled must be a boolean when present")
-        if disabled is not True:
-            _validate_skill_capability(skill_name, template.get("capability"), gateway_control_mode, errors)
-        _validate_skill_description(skill_name, template.get("description"), valid_skills, named_poses, errors)
-        _validate_skill_primitive_sequence(skill_name, template, named_poses, errors)
-
-    planner = embodied.get("planner", {})
-    planning_policy = planner.get("planning_policy", {}) if isinstance(planner, dict) else {}
-    allowed_skills = planning_policy.get("allowed_skills", []) if isinstance(planning_policy, dict) else []
-    if isinstance(allowed_skills, list):
-        unknown = sorted(str(skill) for skill in allowed_skills if skill not in valid_skills)
-        if unknown:
-            errors.append(
-                "embodied.planner.planning_policy.allowed_skills contains unsupported skill(s): " + ", ".join(unknown)
-            )
-
-    _validate_absolute_joint_trajectory_entries(skill_templates, errors)
-    return errors
+        return []
+    return (
+        ["embodied.skill_templates is removed; use embodied.skill_catalog_profile"]
+        if "skill_templates" in embodied
+        else []
+    )
 
 
 def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
@@ -836,10 +814,9 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     required_control_mode = robot_config.get("skill_required_control_mode")
     embodied = robot_config.get("embodied", {})
-    skill_templates = embodied.get("skill_templates", {}) if isinstance(embodied, dict) else {}
-    gateway_enabled = isinstance(skill_templates, dict) and bool(skill_templates)
+    gateway_enabled = isinstance(embodied, dict) and bool(embodied.get("skill_catalog_profile"))
     if gateway_enabled and (not isinstance(required_control_mode, str) or not required_control_mode.strip()):
-        errors.append("skill_required_control_mode is required when embodied.skill_templates is non-empty")
+        errors.append("skill_required_control_mode is required when embodied.skill_catalog_profile is configured")
     elif required_control_mode is not None:
         if not isinstance(required_control_mode, str) or not required_control_mode.strip():
             errors.append("skill_required_control_mode must be a non-empty control_modes member")
@@ -852,6 +829,21 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
         status_service = embodied.get("skill_gateway_status_service")
         if status_service is not None and (not isinstance(status_service, str) or not status_service.strip()):
             errors.append("embodied.skill_gateway_status_service must be a non-empty string")
+        source_mode = embodied.get("skill_catalog_source_mode", "installed")
+        source_root = embodied.get("skill_catalog_source_root", "")
+        profile_name = embodied.get("skill_catalog_profile", "")
+        if source_mode not in {"installed", "development", "production"}:
+            errors.append("embodied.skill_catalog_source_mode must be installed, development, or production")
+        elif source_mode in {"development", "production"} and (
+            not isinstance(source_root, str) or not source_root.strip()
+        ):
+            errors.append("embodied.skill_catalog_source_root is required in development and production modes")
+        if (
+            embodied.get("enabled", False)
+            and "skill_templates" not in embodied
+            and (not isinstance(profile_name, str) or not profile_name.strip())
+        ):
+            errors.append("embodied.skill_catalog_profile is required")
         try:
             resolve_embodied_timeout_policy(embodied)
         except ValueError as exc:
@@ -1083,6 +1075,9 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         validate_skill_service=data.get("validate_skill_service", "/embodied/validate_skill"),
         validate_primitive_service=data.get("validate_primitive_service", "/embodied/validate_primitive"),
         skill_gateway_status_service=data.get("skill_gateway_status_service", "/embodied/get_skill_gateway_status"),
+        skill_catalog_source_mode=data.get("skill_catalog_source_mode", "installed"),
+        skill_catalog_source_root=data.get("skill_catalog_source_root", ""),
+        skill_catalog_profile=data.get("skill_catalog_profile", ""),
         default_target_name=data.get("default_target_name", "demo_object"),
         default_place_name=data.get("default_place_name", "tray_right"),
         skill_timeout_sec=execution.get("skill_timeout_sec", 30.0),
@@ -1421,32 +1416,15 @@ def validate_config(config: RobotConfig) -> list[str]:
                 f"embodied.default_place_name references undefined pose: {config.embodied.default_place_name}"
             )
 
-        skill_templates = config.embodied.skill_templates or {}
-        try:
-            normalized_skill_templates = _normalize_skill_templates(skill_templates)
-        except ValueError as exc:
-            errors.append(f"embodied.skill_templates contains invalid trajectory template: {exc}")
-        else:
-            typed_robot_config = {
-                "embodied": {
-                    "skill_templates": normalized_skill_templates,
-                    "named_poses": config.embodied.named_poses,
-                    "planner": config.embodied.planner,
-                }
-            }
-            if normalized_skill_templates:
-                typed_robot_config["skill_required_control_mode"] = config.skill_gateway.required_control_mode
-                # Use the YAML-declared control_modes keys retained on SkillGatewayRuntimeConfig
-                # so _validate_skill_gateway_config can fully SSOT-check required_control_mode
-                # membership. Fall back to the supported-mode set only when the typed config
-                # was constructed without control_modes (e.g. unit-test fixtures).
-                if config.skill_gateway.control_modes:
-                    typed_robot_config["control_modes"] = {mode: {} for mode in config.skill_gateway.control_modes}
-                else:
-                    typed_robot_config["control_modes"] = {mode: {} for mode in _SUPPORTED_CONTROL_MODES}
-            errors.extend(_validate_embodied_skill_contract(typed_robot_config))
-            if normalized_skill_templates:
-                errors.extend(_validate_skill_gateway_config(typed_robot_config))
+        if config.embodied.skill_templates:
+            errors.append("embodied.skill_templates is removed; use embodied.skill_catalog_profile")
+        if not config.embodied.skill_catalog_profile:
+            errors.append("embodied.skill_catalog_profile is required when embodied is enabled")
+        required_control_mode = config.skill_gateway.required_control_mode
+        if not isinstance(required_control_mode, str) or not required_control_mode.strip():
+            errors.append("skill_required_control_mode is required when embodied.skill_catalog_profile is configured")
+        elif config.skill_gateway.control_modes and required_control_mode not in config.skill_gateway.control_modes:
+            errors.append("skill_required_control_mode must be a control_modes member")
 
         for axis in ("x", "y", "z"):
             axis_limits = config.embodied.workspace.get(axis)

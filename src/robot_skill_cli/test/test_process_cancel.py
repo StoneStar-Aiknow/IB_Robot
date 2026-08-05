@@ -6,7 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from robot_skill_cli.catalog import load_capability_catalog
+from robot_config.loader import load_robot_config_dict
+from robot_skill_cli.catalog import compile_local_snapshot, load_capability_catalog
+from skill_catalog.models import SkillSnapshot
 
 CONFIG_PATH = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
 
@@ -68,6 +70,14 @@ class _ExecuteBridge:
         late_feedback_on_close=False,
         result_error=None,
     ):
+        self.snapshot = _runtime_snapshot()
+        for status in statuses:
+            status.update(
+                registry_epoch="epoch-1",
+                registry_generation=1,
+                registry_digest=self.snapshot.registry_digest,
+                capability_digest=self.snapshot.capability_digest,
+            )
         self.statuses = deque(statuses)
         self.calls = []
         self.sent = []
@@ -100,6 +110,17 @@ class _ExecuteBridge:
     def validate_skill(self, payload, **kwargs):
         self.calls.append("validate")
         return {"allowed": True, "reason": "allowed"}
+
+    def get_skill_snapshot(self, **_kwargs):
+        return {
+            "success": True,
+            "registry_epoch": "epoch-1",
+            "generation": 1,
+            "registry_digest": self.snapshot.registry_digest,
+            "capability_digest": self.snapshot.capability_digest,
+            "provenance_digest": self.snapshot.provenance_digest,
+            "snapshot_json": self.snapshot.snapshot_json,
+        }
 
     def wait_for_skill_server(self, **kwargs):
         self.calls.append("wait_server")
@@ -155,6 +176,11 @@ def _status(state, *, error_code=""):
         "request_error_code": error_code,
         "capabilities": [],
     }
+
+
+def _runtime_snapshot() -> SkillSnapshot:
+    config = load_robot_config_dict(CONFIG_PATH)
+    return compile_local_snapshot(config, CONFIG_PATH)
 
 
 def _gateway_status(*, request_state="", request_error_code="", ready=True):

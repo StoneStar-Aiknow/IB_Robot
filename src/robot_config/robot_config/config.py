@@ -145,6 +145,9 @@ class EmbodiedConfig:
     validate_skill_service: str = "/embodied/validate_skill"
     validate_primitive_service: str = "/embodied/validate_primitive"
     skill_gateway_status_service: str = "/embodied/get_skill_gateway_status"
+    skill_catalog_source_mode: str = "installed"
+    skill_catalog_source_root: str = ""
+    skill_catalog_profile: str = ""
     default_target_name: str = "demo_object"
     default_place_name: str = "tray_right"
     skill_timeout_sec: float = 30.0

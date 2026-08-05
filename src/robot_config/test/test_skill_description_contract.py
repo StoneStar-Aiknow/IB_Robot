@@ -7,34 +7,32 @@ from pathlib import Path
 import pytest
 import yaml
 
-from robot_config.loader import _validate_skill_description, load_robot_config, load_robot_config_dict
+from robot_config.loader import _validate_skill_description
 
 SO101 = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+SKILLS = SO101.parents[3] / "skill_catalog" / "config" / "skills"
+PROFILE = SO101.parents[3] / "skill_catalog" / "config" / "profiles" / "so101_single_arm.yaml"
 
 _REQUIRED_FIELDS = ("summary", "category", "when_to_use", "motion_scope", "intensity")
 
 
-def _description(skill_templates: dict, skill_name: str) -> dict:
-    description = skill_templates[skill_name].get("description")
+def _description(skill_name: str) -> dict:
+    description = yaml.safe_load((SKILLS / skill_name / "manifest.yaml").read_text(encoding="utf-8")).get("description")
     assert description, f"{skill_name} is missing a description block"
     return description
 
 
-def _write_config(tmp_path: Path, mutate) -> Path:
-    data = yaml.safe_load(SO101.read_text(encoding="utf-8"))
-    mutate(data["robot"]["embodied"]["skill_templates"])
-    path = tmp_path / "robot.yaml"
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-    return path
+def _enabled_skills() -> set[str]:
+    profile = yaml.safe_load(PROFILE.read_text(encoding="utf-8"))
+    return {entry["name"] for entry in profile["enabled_skills"]}
 
 
 def test_so101_skills_all_carry_description_contract():
-    config = load_robot_config_dict(SO101)
-    skill_templates = config["embodied"]["skill_templates"]
+    skill_names = _enabled_skills()
 
-    assert skill_templates, "so101 must define embodied.skill_templates"
-    for skill_name in skill_templates:
-        description = _description(skill_templates, skill_name)
+    assert skill_names
+    for skill_name in skill_names:
+        description = _description(skill_name)
         for field in _REQUIRED_FIELDS:
             assert field in description, f"{skill_name}.description missing {field}"
         assert isinstance(description["when_to_use"], list) and description["when_to_use"]
@@ -47,8 +45,7 @@ def test_so101_skills_all_carry_description_contract():
     ["wave_hello", "nod_yes", "shake_no", "celebrate", "greet_observe_raise", "act_cute", "happy_spin_upright"],
 )
 def test_social_gestures_declare_disambiguation(skill_name: str):
-    config = load_robot_config_dict(SO101)
-    description = _description(config["embodied"]["skill_templates"], skill_name)
+    description = _description(skill_name)
     do_not_use = description.get("do_not_use")
 
     assert do_not_use, f"{skill_name} must declare do_not_use to disambiguate from near-synonyms"
@@ -58,30 +55,14 @@ def test_social_gestures_declare_disambiguation(skill_name: str):
 
 
 def test_so101_description_aliases_match_supported_skills():
-    """Every instead_use target must be a real skill declared in the same config."""
-    config = load_robot_config_dict(SO101)
-    skill_templates = config["embodied"]["skill_templates"]
-    known_skills = set(skill_templates)
+    """Every instead_use target must be enabled by the same profile."""
+    known_skills = _enabled_skills()
 
-    for skill_name, template in skill_templates.items():
-        for entry in template.get("description", {}).get("do_not_use", []):
+    for skill_name in known_skills:
+        for entry in _description(skill_name).get("do_not_use", []):
             target = entry["instead_use"]
             assert target in known_skills, f"{skill_name}.description.do_not_use points to unknown skill '{target}'"
             assert target != skill_name, f"{skill_name}.description.do_not_use points to itself"
-
-
-def test_skill_disabled_flag_must_be_boolean(tmp_path):
-    config_path = _write_config(tmp_path, lambda skills: skills["wave_hello"].update(disabled="yes"))
-
-    with pytest.raises(ValueError, match="disabled must be a boolean"):
-        load_robot_config_dict(config_path)
-
-
-def test_planner_allowlist_rejects_disabled_skill(tmp_path):
-    config_path = _write_config(tmp_path, lambda skills: skills["recover_zero_pose"].update(disabled=True))
-
-    with pytest.raises(ValueError, match=r"allowed_skills.*recover_zero_pose"):
-        load_robot_config_dict(config_path)
 
 
 def _collect_errors(description: dict, valid_skills: set[str], named_poses: dict | None = None) -> list[str]:
@@ -187,87 +168,3 @@ def test_validator_rejects_non_finite_or_non_numeric_duration(duration):
 def test_validator_rejects_missing_description():
     errors = _collect_errors(None, {"demo"})
     assert any("description is required" in error for error in errors)
-
-
-@pytest.mark.parametrize(
-    ("mutation", "message"),
-    [
-        (
-            lambda skills: skills["wave_hello"]["primitive_sequence"].pop(0),
-            "must have a preceding move_to_joint_positions arm entry",
-        ),
-        (
-            lambda skills: skills["wave_hello"]["primitive_sequence"][0].update(duration_sec=0.0),
-            "duration_sec must be greater than zero",
-        ),
-        (
-            lambda skills: skills["wave_hello"]["primitive_sequence"][0]["joint_positions"].update({"5": 0.0}),
-            "must match the first joint waypoint",
-        ),
-    ],
-)
-def test_canonical_loader_rejects_unsafe_absolute_trajectory_entry(tmp_path, mutation, message):
-    path = _write_config(tmp_path, mutation)
-
-    with pytest.raises(ValueError, match=message):
-        load_robot_config_dict(path)
-
-
-def test_canonical_loader_rejects_unknown_description_redirect(tmp_path):
-    def mutate(skills):
-        skills["wave_hello"]["description"]["do_not_use"][0]["instead_use"] = "ghost_skill"
-
-    with pytest.raises(ValueError, match="ghost_skill"):
-        load_robot_config_dict(_write_config(tmp_path, mutate))
-
-
-def test_typed_loader_rejects_unknown_description_redirect(tmp_path):
-    def mutate(skills):
-        skills["wave_hello"]["description"]["do_not_use"][0]["instead_use"] = "ghost_skill"
-
-    with pytest.raises(ValueError, match="ghost_skill"):
-        load_robot_config(_write_config(tmp_path, mutate))
-
-
-@pytest.mark.parametrize(
-    ("mutation", "message"),
-    [
-        (
-            lambda skills: skills["wave_hello"]["primitive_sequence"][-1]["joint_positions"].update(
-                {"5": float("nan")}
-            ),
-            "joint_positions.*finite",
-        ),
-        (
-            lambda skills: skills["wave_hello"]["primitive_sequence"][0].update(duration_sec=float("inf")),
-            "duration_sec must be a finite number",
-        ),
-        (
-            lambda skills: skills["wave_hello"]["primitive_sequence"][0].update(duration_sec=10**1000),
-            "duration_sec must be a finite number",
-        ),
-        (
-            lambda skills: skills["wave_hello"]["primitive_sequence"][0]["joint_positions"].update({"1": 10**1000}),
-            "joint_positions.*finite",
-        ),
-        (
-            lambda skills: skills["wave_hello"]["primitive_sequence"][1]["trajectory_template"].update(
-                waypoint_duration_sec=float("nan")
-            ),
-            "waypoint_duration_sec must be a finite number",
-        ),
-    ],
-)
-def test_canonical_loader_rejects_non_finite_primitive_numbers(tmp_path, mutation, message):
-    with pytest.raises(ValueError, match=message):
-        load_robot_config_dict(_write_config(tmp_path, mutation))
-
-
-def test_canonical_loader_rejects_unknown_planner_skill(tmp_path):
-    data = yaml.safe_load(SO101.read_text(encoding="utf-8"))
-    data["robot"]["embodied"]["planner"]["planning_policy"]["allowed_skills"].append("ghost_skill")
-    path = tmp_path / "robot.yaml"
-    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-
-    with pytest.raises(ValueError, match="allowed_skills.*ghost_skill"):
-        load_robot_config_dict(path)

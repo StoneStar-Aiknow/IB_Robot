@@ -1,8 +1,6 @@
 import pytest
 
-from embodied_agent.command_parser import parse_text_command
-from embodied_agent.task_context import load_task_context
-from embodied_agent.task_entry_node import build_direct_planned_task
+from embodied_agent.command_parser import parse_text_command, parse_text_workflow
 from embodied_common.command_parser import extract_skill_aliases, load_skill_aliases
 
 
@@ -314,23 +312,6 @@ def test_load_skill_aliases_handles_empty_and_invalid():
     assert load_skill_aliases('{"wave": "not_a_list"}') == {}
 
 
-def test_build_direct_planned_task_keeps_skill_sequence_in_context():
-    plan = parse_text_command("回原位")
-    task = build_direct_planned_task(
-        task_id="task-demo",
-        source="voice_asr",
-        raw_command="回原位",
-        plan=plan,
-        timeout_sec=30.0,
-    )
-    assert task.task_id == "task-demo"
-    assert task.task_type == "recover_safe_pose"
-    assert task.target_name == ""
-    context = load_task_context(task.context_json)
-    assert context["skill_sequence"] == ["recover_safe_pose"]
-    assert context["timeout_context"]["task_timeout_sec"] == 30.0
-
-
 @pytest.mark.parametrize(
     "text",
     [
@@ -358,3 +339,63 @@ def test_overlapping_aliases_resolve_by_position():
     }
     plan = parse_text_command("不是的", skill_aliases=skill_aliases)
     assert plan.task_type == "shake_no"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "先点头，然后挥手",
+        "点头，接着挥手",
+        "first nod yes, then wave hello",
+        "execute nod_yes then execute wave_hello",
+        "nod_yes followed by wave_hello",
+    ],
+)
+def test_parse_explicit_ordered_multi_skill_workflow(text):
+    steps, error = parse_text_workflow(
+        text,
+        skill_aliases={
+            "nod_yes": ["点头", "nod", "yes"],
+            "wave_hello": ["挥手", "wave", "hello"],
+        },
+    )
+
+    assert error == ""
+    assert [step.skill_sequence[0] for step in steps] == ["nod_yes", "wave_hello"]
+
+
+def test_multiple_skills_without_ordered_connector_are_rejected():
+    steps, error = parse_text_workflow(
+        "点头和挥手",
+        skill_aliases={"nod_yes": ["点头"], "wave_hello": ["挥手"]},
+    )
+
+    assert steps == []
+    assert error == "multiple skills require an explicit ordered connector"
+
+
+def test_overlapping_short_english_alias_does_not_create_false_workflow_ambiguity():
+    steps, error = parse_text_workflow(
+        "nod",
+        skill_aliases={"nod_yes": ["nod"], "shake_no": ["no"]},
+    )
+
+    assert error == ""
+    assert [step.skill_sequence[0] for step in steps] == ["nod_yes"]
+
+
+def test_unknown_workflow_step_rejects_the_entire_workflow():
+    steps, error = parse_text_workflow(
+        "先点头，然后唱首歌，再挥手",
+        skill_aliases={"nod_yes": ["点头"], "wave_hello": ["挥手"]},
+    )
+
+    assert steps == []
+    assert error == "unsupported command: 唱首歌"
+
+
+def test_goodbye_alias_is_not_mistaken_for_the_chinese_then_connector():
+    steps, error = parse_text_workflow("再见啦", skill_aliases={"wave_hello": ["再见"]})
+
+    assert error == ""
+    assert [step.skill_sequence[0] for step in steps] == ["wave_hello"]

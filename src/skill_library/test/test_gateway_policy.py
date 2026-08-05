@@ -155,6 +155,21 @@ def test_policy_rejects_timeout_over_budget_without_truncating_effective_timeout
     assert decision.effective_timeout_sec == 10.1
 
 
+def test_workflow_root_lease_issues_only_internal_child_borrows() -> None:
+    policy, _ledger, lease = _atomic_policy()
+    owner = ExecutionOwner.workflow("workflow-1")
+
+    error_code, token = policy.admit_workflow(owner, _snapshot(), timeout_sec=8.0)
+
+    assert error_code == ""
+    assert token is not None
+    assert lease.owner is owner
+    assert policy.borrow_workflow_internal(owner, token, "workflow-1/skill/0001", "relative") is not None
+    assert policy.borrow_workflow_internal(owner, object(), "workflow-1/skill/0001", "relative") is None
+    assert policy.release_workflow(owner, token) is True
+    assert lease.owner is None
+
+
 @pytest.mark.parametrize(
     ("snapshot", "timeout_sec", "expected_reason"),
     [

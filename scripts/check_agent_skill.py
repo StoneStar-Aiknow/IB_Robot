@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """Validate the repository contract for the ibrobot-control Agent Skill.
 
-This script currently only validates the ``ibrobot-control`` skill: the
-frontmatter name, description prefix, ordered ``robot-skill`` workflow,
-explicit user motion confirmation placement, cancel ``--task-id`` command,
-SIGINT/SIGTERM guidance, and the hardcoded REQUIRED_RULES prohibitions.
+This script validates the ``ibrobot-control`` plan and cancellation contracts.
 When additional Agent skills are added, extend this script to accept a
 ``--skill-name`` parameter and load per-skill rule sets instead of
 duplicating the hardcoded checks below.
@@ -17,7 +14,7 @@ import re
 from collections.abc import Sequence
 from pathlib import Path
 
-COMMANDS = ("status", "list-skills", "describe", "validate", "execute")
+PLAN_COMMANDS = ("status", "list-skills", "plan-text", "describe", "validate-plan", "confirm-plan", "execute-plan")
 REQUIRED_RULES = {
     "explicit user motion confirmation": "missing explicit user motion confirmation requirement",
     "must not launch or restart the pipeline": "missing prohibition: launch or restart pipeline",
@@ -30,6 +27,16 @@ REQUIRED_RULES = {
     "must not automatically retry after failure, timeout, or unknown result": (
         "missing prohibition: automatic retry after failure, timeout, or unknown result"
     ),
+    "natural-language single-skill and workflow requests both use the plan workflow": (
+        "missing natural-language single-Skill/Workflow routing rule"
+    ),
+    "stop on any failure": "missing stop-on-failure rule",
+    "must not source environment scripts, select a ros domain, or discover another repository/config": (
+        "missing prohibition: environment or repository discovery"
+    ),
+    "on any nonzero exit, report the exact cli error and stop": "missing truthful nonzero-exit reporting rule",
+    "call `plan-text` exactly once with the user's original wording": "missing single-attempt workflow planning rule",
+    "do not retry alternate phrasings": "missing prohibition: alternate workflow paraphrase retries",
 }
 
 
@@ -60,7 +67,7 @@ def _parse_frontmatter(content: str) -> tuple[dict[str, str], list[str]]:
 
 def _validate_command_order(content: str) -> bool:
     positions = []
-    for command in COMMANDS:
+    for command in PLAN_COMMANDS:
         match = re.search(rf"`robot-skill\b[^`\n]*\b{re.escape(command)}\b[^`\n]*`", content)
         if match is None:
             return False
@@ -69,7 +76,11 @@ def _validate_command_order(content: str) -> bool:
 
 
 def _required_workflow(content: str) -> str | None:
-    match = re.search(r"^## Required Workflow\s*$\n(.*?)(?=^## |\Z)", content, flags=re.MULTILINE | re.DOTALL)
+    match = re.search(
+        r"^## Natural-Language Plan Workflow\s*$\n(.*?)(?=^## |\Z)",
+        content,
+        flags=re.MULTILINE | re.DOTALL,
+    )
     return None if match is None else match.group(1)
 
 
@@ -91,26 +102,36 @@ def validate_skill(skill_path: Path) -> list[str]:
     normalized = " ".join(content.lower().split())
     workflow = _required_workflow(content)
     if workflow is None or any(
-        re.search(rf"`robot-skill\b[^`\n]*\b{re.escape(command)}\b[^`\n]*`", workflow) is None for command in COMMANDS
+        re.search(rf"`robot-skill\b[^`\n]*\b{re.escape(command)}\b[^`\n]*`", workflow) is None
+        for command in PLAN_COMMANDS
     ):
         errors.append("required workflow section is missing ordered robot-skill commands")
     elif not _validate_command_order(workflow):
         errors.append("robot-skill workflow commands are missing or out of order")
-    validate_match = None if workflow is None else re.search(r"`robot-skill\b[^`\n]*\bvalidate\b[^`\n]*`", workflow)
-    execute_match = None if workflow is None else re.search(r"`robot-skill\b[^`\n]*\bexecute\b[^`\n]*`", workflow)
+    validate_match = (
+        None if workflow is None else re.search(r"`robot-skill\b[^`\n]*\bvalidate-plan\b[^`\n]*`", workflow)
+    )
+    confirm_match = None if workflow is None else re.search(r"`robot-skill\b[^`\n]*\bconfirm-plan\b[^`\n]*`", workflow)
     if (
         validate_match is not None
-        and execute_match is not None
-        and workflow.lower().find(
-            "explicit user motion confirmation",
-            validate_match.end(),
-            execute_match.start(),
+        and confirm_match is not None
+        and re.search(
+            r"explicit\s+user\s+motion\s+confirmation",
+            workflow[validate_match.end() : confirm_match.start()],
+            flags=re.IGNORECASE,
         )
-        == -1
+        is None
     ):
-        errors.append("explicit user motion confirmation must appear between validate and execute")
+        errors.append("explicit user motion confirmation must appear between validate-plan and confirm-plan")
+    if workflow is not None and not all(
+        phrase in " ".join(workflow.lower().split())
+        for phrase in ("exact ordered steps", "plan digest", "registry identity", "fresh task id")
+    ):
+        errors.append("workflow must display the exact plan, digest, registry identity, and fresh task ID")
     if re.search(r"`robot-skill\b[^`\n]*\bcancel\b[^`\n]*--task-id\b[^`\n]*`", content) is None:
         errors.append("missing task-ID cancel command")
+    if re.search(r"`robot-skill\b[^`\n]*\bcancel-plan\b[^`\n]*--task-id\b[^`\n]*`", content) is None:
+        errors.append("missing Agent plan cancel command")
     if "sigint/sigterm" not in normalized:
         errors.append("missing current execute signal cancellation guidance")
     for requirement, message in REQUIRED_RULES.items():

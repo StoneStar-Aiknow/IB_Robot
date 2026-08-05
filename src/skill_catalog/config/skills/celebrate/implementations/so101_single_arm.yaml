@@ -1,0 +1,28 @@
+schema_version: 1
+kind: primitive_sequence
+robot: so101_single_arm
+initial_gripper_state: closed
+timeout_sec: 30.0
+primitive_sequence:
+- primitive_name: move_to_named_pose
+  pose_name: observe_table
+- primitive_name: move_relative_ee
+  motion_direction: up
+  motion_distance: 0.04
+- primitive_name: move_relative_ee
+  motion_direction: down
+  motion_distance: 0.08
+- primitive_name: move_relative_ee
+  motion_direction: up
+  motion_distance: 0.04
+- primitive_name: move_relative_ee
+  motion_direction: left
+  motion_distance: 0.04
+- primitive_name: move_relative_ee
+  motion_direction: right
+  motion_distance: 0.08
+- primitive_name: move_relative_ee
+  motion_direction: left
+  motion_distance: 0.04
+- primitive_name: move_to_named_pose
+  pose_name: observe_table

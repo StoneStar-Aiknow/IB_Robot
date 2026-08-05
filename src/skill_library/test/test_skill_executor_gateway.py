@@ -3,20 +3,31 @@ import os
 import threading
 import time
 import uuid
-from contextlib import suppress
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import rclpy
+import yaml
 from geometry_msgs.msg import PoseStamped
 from rclpy.action import ActionClient, ActionServer, CancelResponse
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.parameter import Parameter
 from unique_identifier_msgs.msg import UUID
 
-from embodied_common.capability_view import build_capability_view
+from embodied_common.dispatch_binding import copy_binding, new_binding, workflow_step
+from embodied_common.skill_request import derive_skill_task_id
+from embodied_common.workflow_contracts import compute_workflow_digest
 from ibrobot_msgs.action import ExecuteTaskPlan, PrimitiveCommand, SkillCommand
-from ibrobot_msgs.srv import GetSkillGatewayStatus, ValidatePrimitive, ValidateSkill
+from ibrobot_msgs.srv import (
+    BeginWorkflowExecution,
+    FinalizeWorkflowExecution,
+    GetSkillGatewayStatus,
+    GetSkillSnapshot,
+    ReloadSkillCatalog,
+    ValidatePrimitive,
+    ValidateSkill,
+)
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from skill_library.gateway_policy import GatewayPolicy, RuntimeSnapshot, SkillRequirements
 from skill_library.skill_executor_node import SkillExecutorNode
@@ -32,8 +43,7 @@ _TIMEOUT_POLICY_FIELDS = (
 )
 
 
-def _local_capability_view(overrides):
-    raw_skill_templates = overrides.get("skill_templates_json", "")
+def _expected_timeout_policy(overrides):
     normalized_config = {
         "name": overrides["robot_name"],
         "embodied": {
@@ -42,32 +52,170 @@ def _local_capability_view(overrides):
             "timeouts": {field: overrides[field] for field in _TIMEOUT_POLICY_FIELDS},
         },
     }
-    if raw_skill_templates.strip():
-        normalized_config["embodied"]["skill_templates"] = json.loads(raw_skill_templates)
-    timeout_policy = resolve_embodied_timeout_policy(normalized_config["embodied"])
-    return build_capability_view(normalized_config, timeout_policy=timeout_policy)
+    return resolve_embodied_timeout_policy(normalized_config["embodied"])
 
 
-def _constructor_overrides(suffix: str):
+_TEST_CONTROL_MODE = "moveit_planning"
+
+
+def _constructor_overrides(suffix: str, catalog_root, profile_name: str):
     return {
+        "active_control_mode": _TEST_CONTROL_MODE,
         "cmd_pose_topic": f"/{suffix}/cmd_pose",
         "default_skill_timeout_sec": 2.5,
         "ee_pose_topic": f"/{suffix}/ee_pose",
         "gripper_settle_sec": 0.4,
         "joint_state_topic": f"/{suffix}/joint_state",
         "model_idle_timeout_sec": 8.0,
-        "named_poses_json": "{}",
+        "named_poses_json": json.dumps({"home": {}}),
         "named_targets_json": "{}",
         "primitive_action_name": f"/{suffix}/primitive",
-        "robot_name": f"robot_{suffix}",
+        "robot_name": profile_name,
         "robot_state_freshness_sec": 0.1,
         "rpc_timeout_sec": 0.2,
         "scene_freshness_sec": 0.3,
         "skill_action_name": f"/{suffix}/skill",
+        "skill_catalog_profile": profile_name,
+        "skill_catalog_source_mode": "development",
+        "skill_catalog_source_root": str(catalog_root),
         "skill_gateway_status_service": f"/{suffix}/status",
-        "skill_templates_json": "{}",
+        "skill_required_control_mode": _TEST_CONTROL_MODE,
         "task_budget_sec": 10.0,
     }
+
+
+def _write_yaml(path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(data, sort_keys=True), encoding="utf-8")
+
+
+def _skill_manifest(name, summary, *, parameters, recovery_policy, anchor_pose, profile_name, intensity="moderate"):
+    return {
+        "schema_version": 1,
+        "name": name,
+        "version": "1.0.0",
+        "semantic_level": "atomic_operator",
+        "description": {
+            "summary": summary,
+            "category": "manipulation",
+            "when_to_use": [summary],
+            "motion_scope": ["arm"],
+            "intensity": intensity,
+            "anchor_pose": anchor_pose,
+        },
+        "capability": {
+            "schema_version": 1,
+            "summary": summary,
+            "domain": "manipulation",
+            "moves_robot": True,
+            "required_control_mode": _TEST_CONTROL_MODE,
+            "parameters": parameters,
+            "recovery_policy": recovery_policy,
+        },
+        "implementations": {profile_name: f"implementations/{profile_name}.yaml"},
+    }
+
+
+def _skill_implementation(profile_name, primitive_sequence):
+    return {
+        "schema_version": 1,
+        "kind": "primitive_sequence",
+        "robot": profile_name,
+        "initial_gripper_state": "none",
+        "timeout_sec": 9.0,
+        "primitive_sequence": primitive_sequence,
+    }
+
+
+def _write_test_catalog(root, profile_name, *, include_relative=True, bad_primitive=False) -> None:
+    """Stage a minimal DevelopmentStagingSkillSource catalog (move [+ relative] [+ bad])."""
+    skills_dir = root / "config" / "skills"
+    profiles_dir = root / "config" / "profiles"
+    profiles_dir.mkdir(parents=True, exist_ok=True)
+
+    enabled_skills = [{"name": "move", "implementation": profile_name, "planner_visible": True}]
+    if include_relative:
+        enabled_skills.append({"name": "relative", "implementation": profile_name, "planner_visible": True})
+    if bad_primitive:
+        enabled_skills.append({"name": "bad", "implementation": profile_name, "planner_visible": True})
+
+    _write_yaml(
+        profiles_dir / f"{profile_name}.yaml",
+        {
+            "schema_version": 1,
+            "name": profile_name,
+            "robot_name": profile_name,
+            "enabled_skills": enabled_skills,
+        },
+    )
+
+    _write_yaml(
+        skills_dir / "move" / "manifest.yaml",
+        _skill_manifest(
+            "move",
+            "Move to a named pose.",
+            parameters={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+            recovery_policy="never_retry",
+            anchor_pose="home",
+            profile_name=profile_name,
+        ),
+    )
+    _write_yaml(
+        skills_dir / "move" / "implementations" / f"{profile_name}.yaml",
+        _skill_implementation(profile_name, [{"primitive_name": "move_to_named_pose", "pose_name": "home"}]),
+    )
+
+    if include_relative:
+        _write_yaml(
+            skills_dir / "relative" / "manifest.yaml",
+            _skill_manifest(
+                "relative",
+                "Move the end effector by a requested offset.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "motion_direction": {"type": "string", "enum": ["forward"]},
+                        "motion_distance": {"type": "number", "exclusiveMinimum": 0, "unit": "meters"},
+                    },
+                    "required": ["motion_direction", "motion_distance"],
+                    "additionalProperties": False,
+                },
+                recovery_policy="ask_user",
+                anchor_pose="none",
+                profile_name=profile_name,
+                intensity="subtle",
+            ),
+        )
+        _write_yaml(
+            skills_dir / "relative" / "implementations" / f"{profile_name}.yaml",
+            _skill_implementation(
+                profile_name,
+                [
+                    {
+                        "primitive_name": "move_relative_ee",
+                        "motion_direction_from_request": True,
+                        "motion_distance_from_request": True,
+                    }
+                ],
+            ),
+        )
+
+    if bad_primitive:
+        _write_yaml(
+            skills_dir / "bad" / "manifest.yaml",
+            _skill_manifest(
+                "bad",
+                "Exercise the unknown primitive rejection path.",
+                parameters={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+                recovery_policy="never_retry",
+                anchor_pose="none",
+                profile_name=profile_name,
+            ),
+        )
+        _write_yaml(
+            skills_dir / "bad" / "implementations" / f"{profile_name}.yaml",
+            _skill_implementation(profile_name, [{"primitive_name": "definitely_not_a_real_primitive"}]),
+        )
 
 
 def _assert_test_ros_environment() -> None:
@@ -105,32 +253,39 @@ def ros_context():
 
 
 @pytest.fixture
-def gateway_rig(request):
+def gateway_rig(request, tmp_path):
     _assert_test_ros_environment()
     suffix = f"gateway_{os.getpid()}_{uuid.uuid4().hex}"
+    profile_name = f"robot_{suffix}"
     names = {
         "arm": f"/{suffix}/arm_trajectory",
+        "begin_workflow": f"/{suffix}/begin_workflow",
         "cmd_pose": f"/{suffix}/cmd_pose",
         "ee_pose": f"/{suffix}/ee_pose",
+        "finalize_workflow": f"/{suffix}/finalize_workflow",
         "joint_state": f"/{suffix}/joint_state",
         "primitive": f"/{suffix}/primitive",
+        "reload": f"/{suffix}/reload",
         "skill": f"/{suffix}/skill",
+        "snapshot": f"/{suffix}/snapshot",
         "status": f"/{suffix}/status",
         "task_executor": f"/{suffix}/task_executor",
         "validate_primitive": f"/{suffix}/validate_primitive",
         "validate_skill": f"/{suffix}/validate_skill",
     }
     test_config = dict(getattr(request, "param", {}))
-    omit_skill_templates_json = test_config.pop("_omit_skill_templates_json", False)
     hold_task_executor = test_config.pop("_hold_task_executor", False)
     hold_validate_primitive = test_config.pop("_hold_validate_primitive", False)
     serve_task_executor = hold_task_executor or test_config.pop("_task_executor", False)
     mock_node = rclpy.create_node(f"mock_{suffix}")
     client_node = rclpy.create_node(f"client_{suffix}")
 
-    def validate_skill(_request, response):
+    def validate_skill(request, response):
         response.allowed = True
         response.reason = ""
+        response.actual_registry_epoch = request.dispatch_binding.expected_registry_epoch
+        response.actual_registry_generation = request.dispatch_binding.expected_registry_generation
+        response.actual_registry_digest = request.dispatch_binding.expected_registry_digest
         return response
 
     validate_primitive_calls = []
@@ -144,63 +299,22 @@ def gateway_rig(request):
             assert validate_primitive_release.wait(timeout=1.0)
         response.allowed = True
         response.reason = ""
+        response.actual_registry_epoch = _request.dispatch_binding.expected_registry_epoch
+        response.actual_registry_generation = _request.dispatch_binding.expected_registry_generation
+        response.actual_registry_digest = _request.dispatch_binding.expected_registry_digest
         return response
 
     mock_node.create_service(ValidateSkill, names["validate_skill"], validate_skill)
     mock_node.create_service(ValidatePrimitive, names["validate_primitive"], validate_primitive)
-    templates = {
-        "move": {
-            "capability": {
-                "schema_version": 1,
-                "summary": "Move to a named pose.",
-                "domain": "manipulation",
-                "moves_robot": True,
-                "required_control_mode": "gateway_mode",
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {},
-                    "required": [],
-                },
-                "recovery_policy": "never_retry",
-            },
-            "primitive_sequence": [
-                {"primitive_name": "move_to_named_pose", "pose_name": "home"},
-            ],
-        },
-        "relative": {
-            "capability": {
-                "schema_version": 1,
-                "summary": "Move the end effector by a requested offset.",
-                "domain": "manipulation",
-                "moves_robot": True,
-                "required_control_mode": "gateway_mode",
-                "parameters": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "motion_direction": {"type": "string", "enum": ["forward"]},
-                        "motion_distance": {"type": "number", "exclusiveMinimum": 0, "unit": "meters"},
-                    },
-                    "required": ["motion_direction", "motion_distance"],
-                },
-                "recovery_policy": "ask_user",
-            },
-            "primitive_sequence": [
-                {
-                    "primitive_name": "move_relative_ee",
-                    "motion_direction_from_request": True,
-                    "motion_distance_from_request": True,
-                }
-            ],
-        },
-    }
+    _write_test_catalog(tmp_path, profile_name)
     overrides = {
-        "active_control_mode": "gateway_mode",
+        "active_control_mode": _TEST_CONTROL_MODE,
         "arm_trajectory_action_name": names["arm"],
+        "begin_workflow_service": names["begin_workflow"],
         "cmd_pose_topic": names["cmd_pose"],
         "default_skill_timeout_sec": 2.5,
         "ee_pose_topic": names["ee_pose"],
+        "finalize_workflow_service": names["finalize_workflow"],
         "joint_state_topic": names["joint_state"],
         "ledger_terminal_capacity": 8,
         "gripper_settle_sec": 0.4,
@@ -208,22 +322,24 @@ def gateway_rig(request):
         "motion_authorized": True,
         "named_poses_json": json.dumps({"home": {}}),
         "primitive_action_name": names["primitive"],
-        "robot_name": f"robot_{suffix}",
+        "robot_name": profile_name,
         "robot_state_freshness_sec": 0.1,
         "rpc_timeout_sec": 0.2,
         "scene_freshness_sec": 0.3,
         "skill_action_name": names["skill"],
+        "skill_catalog_profile": profile_name,
+        "skill_catalog_reload_service": names["reload"],
+        "skill_catalog_source_mode": "development",
+        "skill_catalog_source_root": str(tmp_path),
+        "skill_catalog_snapshot_service": names["snapshot"],
         "skill_gateway_status_service": names["status"],
-        "skill_required_control_mode": "gateway_mode",
-        "skill_templates_json": json.dumps(templates),
+        "skill_required_control_mode": _TEST_CONTROL_MODE,
         "task_budget_sec": 10.0,
         "task_executor_action_name": names["task_executor"],
         "validate_primitive_service": names["validate_primitive"],
         "validate_skill_service": names["validate_skill"],
     }
     overrides.update(test_config)
-    if omit_skill_templates_json:
-        del overrides["skill_templates_json"]
     _assert_test_ros_environment()
     executor_node = SkillExecutorNode(
         parameter_overrides=[Parameter(name, value=value) for name, value in overrides.items()],
@@ -237,9 +353,17 @@ def gateway_rig(request):
     skill_client = ActionClient(client_node, SkillCommand, names["skill"])
     primitive_client = ActionClient(client_node, PrimitiveCommand, names["primitive"])
     status_client = client_node.create_client(GetSkillGatewayStatus, names["status"])
+    snapshot_client = client_node.create_client(GetSkillSnapshot, names["snapshot"])
+    reload_client = client_node.create_client(ReloadSkillCatalog, names["reload"])
+    begin_workflow_client = client_node.create_client(BeginWorkflowExecution, names["begin_workflow"])
+    finalize_workflow_client = client_node.create_client(FinalizeWorkflowExecution, names["finalize_workflow"])
     _wait_for(skill_client.server_is_ready)
     _wait_for(primitive_client.server_is_ready)
     _wait_for(status_client.service_is_ready)
+    _wait_for(snapshot_client.service_is_ready)
+    _wait_for(reload_client.service_is_ready)
+    _wait_for(begin_workflow_client.service_is_ready)
+    _wait_for(finalize_workflow_client.service_is_ready)
 
     task_started = threading.Event()
     task_release = threading.Event()
@@ -267,14 +391,18 @@ def gateway_rig(request):
         task_server = ActionServer(mock_node, ExecuteTaskPlan, names["task_executor"], execute_task)
 
     rig = SimpleNamespace(
+        begin_workflow_client=begin_workflow_client,
         client_node=client_node,
         downstream_goals=downstream_goals,
         executor=executor,
         executor_node=executor_node,
+        finalize_workflow_client=finalize_workflow_client,
         names=names,
         overrides=overrides,
         primitive_client=primitive_client,
+        reload_client=reload_client,
         skill_client=skill_client,
+        snapshot_client=snapshot_client,
         status_client=status_client,
         task_release=task_release,
         task_server=task_server,
@@ -295,7 +423,7 @@ def gateway_rig(request):
 
 def _send_skill(rig, *, task_id: str = "task-1", skill_name: str = "move"):
     goal = SkillCommand.Goal()
-    goal.task_id = task_id
+    goal.dispatch_binding = new_binding(task_id=task_id)
     goal.skill_name = skill_name
     goal.target_name = ""
     goal.place_name = ""
@@ -314,8 +442,188 @@ def _get_status(rig, *, task_id: str = "", payload_hash: str = ""):
     return _future_result(rig.status_client.call_async(request))
 
 
+def test_snapshot_service_response_matches_generated_contract(gateway_rig):
+    request = GetSkillSnapshot.Request()
+    response = _future_result(gateway_rig.snapshot_client.call_async(request))
+    assert response.success is True
+    assert response.generation > 0
+    assert response.snapshot_json
+
+
+def test_reload_service_response_matches_generated_contract_and_keeps_gateway_alive(gateway_rig):
+    before = _get_status(gateway_rig)
+    request = ReloadSkillCatalog.Request()
+    request.schema_version = 1
+    request.request_id = f"reload-{uuid.uuid4().hex}"
+    request.force = True
+
+    response = _future_result(gateway_rig.reload_client.call_async(request))
+
+    assert response.success is True
+    assert response.old_generation == before.registry_generation
+    assert response.generation == before.registry_generation
+    assert response.changed_skills == []
+    after = _get_status(gateway_rig)
+    assert after.registry_epoch == before.registry_epoch
+    assert after.registry_generation == before.registry_generation
+
+    replay = _future_result(gateway_rig.reload_client.call_async(request))
+    assert replay.success is True
+    assert replay.generation == response.generation
+    assert replay.registry_digest == response.registry_digest
+
+
+def test_reload_service_activates_changed_implementation_and_increments_generation(gateway_rig):
+    before = _get_status(gateway_rig)
+    implementation_path = (
+        Path(gateway_rig.overrides["skill_catalog_source_root"])
+        / "config"
+        / "skills"
+        / "move"
+        / "implementations"
+        / f"{gateway_rig.overrides['skill_catalog_profile']}.yaml"
+    )
+    changed_implementation = _skill_implementation(
+        gateway_rig.overrides["skill_catalog_profile"],
+        [{"primitive_name": "move_to_named_pose", "pose_name": "home"}],
+    )
+    changed_implementation["initial_gripper_state"] = "open"
+    _write_yaml(implementation_path, changed_implementation)
+    request = ReloadSkillCatalog.Request()
+    request.schema_version = 1
+    request.request_id = f"reload-{uuid.uuid4().hex}"
+    request.force = True
+
+    response = _future_result(gateway_rig.reload_client.call_async(request))
+
+    assert response.success is True
+    assert response.old_generation == before.registry_generation
+    assert response.generation == before.registry_generation + 1
+    assert response.changed_skills == ["move"]
+    after = _get_status(gateway_rig)
+    assert after.registry_generation == response.generation
+    snapshot_request = GetSkillSnapshot.Request()
+    snapshot_request.schema_version = 1
+    snapshot_request.registry_epoch = response.registry_epoch
+    snapshot_request.generation = response.generation
+    snapshot = _future_result(gateway_rig.snapshot_client.call_async(snapshot_request))
+    move = next(
+        item for item in json.loads(snapshot.snapshot_json)["registry_preimage"]["skills"] if item["name"] == "move"
+    )
+    assert move["template"]["initial_gripper_state"] == "open"
+
+
 def _capability(response, name: str):
     return next(capability for capability in response.capabilities if capability.name == name)
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_typed_workflow_begin_ordered_children_and_finalize_are_idempotent(gateway_rig):
+    _wait_for(gateway_rig.executor_node._task_executor_client.server_is_ready)
+    status = _get_status(gateway_rig)
+    root_task_id = "workflow-root"
+    root_binding = new_binding(task_id=root_task_id)
+    root_binding.expected_registry_epoch = status.registry_epoch
+    root_binding.expected_registry_generation = status.registry_generation
+    root_binding.expected_registry_digest = status.registry_digest
+    started = time.time()
+    deadline = started + 8.0
+    root_binding.task_budget.schema_version = 1
+    root_binding.task_budget.started_at.sec = int(started)
+    root_binding.task_budget.started_at.nanosec = int((started - int(started)) * 1_000_000_000)
+    root_binding.task_budget.deadline.sec = int(deadline)
+    root_binding.task_budget.deadline.nanosec = int((deadline - int(deadline)) * 1_000_000_000)
+    steps = [workflow_step(skill_name="move", timeout_sec=2.5) for _ in range(2)]
+    root_binding.workflow_digest = compute_workflow_digest(
+        root_task_id=root_task_id,
+        task_budget=root_binding.task_budget,
+        expected_registry_epoch=status.registry_epoch,
+        expected_registry_generation=status.registry_generation,
+        expected_registry_digest=status.registry_digest,
+        workflow_steps=steps,
+    )
+    begin_request = BeginWorkflowExecution.Request()
+    begin_request.dispatch_binding = root_binding
+    begin_request.workflow_steps = steps
+
+    began = _future_result(gateway_rig.begin_workflow_client.call_async(begin_request))
+    repeated_begin = _future_result(gateway_rig.begin_workflow_client.call_async(begin_request))
+
+    assert began.success is True
+    assert len(began.root_lease_nonce) >= 32
+    assert repeated_begin.success is True
+    assert repeated_begin.root_lease_nonce == began.root_lease_nonce
+    active_status = _get_status(gateway_rig, task_id=root_task_id, payload_hash=root_binding.workflow_digest)
+    assert active_status.active_owner_kind == "workflow"
+    assert active_status.active_workflow_digest == root_binding.workflow_digest
+    assert active_status.active_workflow_step_index == 0
+
+    def send_child(index: int):
+        goal = SkillCommand.Goal()
+        goal.dispatch_binding = copy_binding(root_binding)
+        goal.dispatch_binding.task_id = derive_skill_task_id(root_task_id, index)
+        goal.dispatch_binding.workflow_step_index = index
+        goal.dispatch_binding.root_lease_nonce = began.root_lease_nonce
+        goal.skill_name = "move"
+        goal.timeout_sec = 2.5
+        goal_handle = _future_result(gateway_rig.skill_client.send_goal_async(goal))
+        assert goal_handle.accepted
+        return _future_result(goal_handle.get_result_async()).result
+
+    out_of_order = send_child(1)
+    assert out_of_order.success is False
+    assert out_of_order.error_code == "SKILL_WORKFLOW_DIGEST_MISMATCH"
+    assert send_child(0).success is True
+    assert send_child(1).success is True
+
+    finalize_request = FinalizeWorkflowExecution.Request()
+    finalize_request.dispatch_binding = copy_binding(root_binding)
+    finalize_request.dispatch_binding.root_lease_nonce = began.root_lease_nonce
+    finalize_request.terminal_state = FinalizeWorkflowExecution.Request.SUCCEEDED
+    finalize_request.completed_step_count = 2
+    finalized = _future_result(gateway_rig.finalize_workflow_client.call_async(finalize_request))
+    repeated_finalize = _future_result(gateway_rig.finalize_workflow_client.call_async(finalize_request))
+
+    assert finalized.success is True
+    assert finalized.actual_completed_step_count == 2
+    assert repeated_finalize.success is True
+    assert _get_status(gateway_rig, task_id=root_task_id).request_state == "terminal"
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_expired_workflow_is_reaped_when_executor_does_not_finalize(gateway_rig):
+    status = _get_status(gateway_rig)
+    root_task_id = "workflow-expired"
+    binding = new_binding(task_id=root_task_id)
+    binding.expected_registry_epoch = status.registry_epoch
+    binding.expected_registry_generation = status.registry_generation
+    binding.expected_registry_digest = status.registry_digest
+    started = time.time()
+    deadline = started + 0.5
+    binding.task_budget.schema_version = 1
+    binding.task_budget.started_at.sec = int(started)
+    binding.task_budget.started_at.nanosec = int((started - int(started)) * 1_000_000_000)
+    binding.task_budget.deadline.sec = int(deadline)
+    binding.task_budget.deadline.nanosec = int((deadline - int(deadline)) * 1_000_000_000)
+    steps = [workflow_step(skill_name="move", timeout_sec=0.5)]
+    binding.workflow_digest = compute_workflow_digest(
+        root_task_id=root_task_id,
+        task_budget=binding.task_budget,
+        expected_registry_epoch=binding.expected_registry_epoch,
+        expected_registry_generation=binding.expected_registry_generation,
+        expected_registry_digest=binding.expected_registry_digest,
+        workflow_steps=steps,
+    )
+    request = BeginWorkflowExecution.Request()
+    request.dispatch_binding = binding
+    request.workflow_steps = steps
+
+    began = _future_result(gateway_rig.begin_workflow_client.call_async(request))
+    assert began.success is True
+    _wait_for(lambda: _get_status(gateway_rig, task_id=root_task_id).request_state == "terminal", timeout_sec=2.0)
+    status = _get_status(gateway_rig, task_id=root_task_id)
+    assert status.active_owner_kind == ""
+    assert status.request_state == "terminal"
 
 
 def _status_snapshot(**overrides) -> RuntimeSnapshot:
@@ -336,7 +644,7 @@ def _status_snapshot(**overrides) -> RuntimeSnapshot:
 
 def _primitive_goal(task_id: str) -> PrimitiveCommand.Goal:
     goal = PrimitiveCommand.Goal()
-    goal.task_id = task_id
+    goal.dispatch_binding = new_binding(task_id=task_id)
     goal.primitive_name = "move_to_named_pose"
     goal.pose_name = "home"
     return goal
@@ -395,7 +703,7 @@ def test_status_ledger_query_matrix(gateway_rig):
         assert response.schema_version == 1
         assert response.robot_name == gateway_rig.overrides["robot_name"]
         assert response.motion_authorized is True
-        assert response.active_control_mode == "gateway_mode"
+        assert response.active_control_mode == _TEST_CONTROL_MODE
         assert response.busy is False
         assert response.active_task_id == ""
         assert response.default_skill_timeout_sec == pytest.approx(2.5)
@@ -412,109 +720,35 @@ def test_status_ledger_query_matrix(gateway_rig):
     assert (invalid.request_state, invalid.request_error_code) == ("", "INVALID_ARGUMENT")
 
 
-def test_gateway_config_digest_uses_full_resolved_timeout_policy(gateway_rig):
-    local_view = _local_capability_view(gateway_rig.overrides)
+def test_gateway_config_digest_equals_capability_digest(gateway_rig):
     status = _get_status(gateway_rig)
 
-    assert gateway_rig.executor_node._gateway_timeout_policy == local_view["timeout_policy"]
-    assert status.config_digest == local_view["capability_digest"]
+    assert status.config_digest == status.capability_digest
+    assert status.config_digest
+    assert gateway_rig.executor_node._gateway_timeout_policy == _expected_timeout_policy(gateway_rig.overrides)
+    assert not gateway_rig.executor_node.has_parameter("skill_templates_json")
 
 
-@pytest.mark.parametrize(
-    "gateway_rig",
-    [
-        {"_omit_skill_templates_json": True},
-        {"skill_templates_json": ""},
-        {"skill_templates_json": " \t\n"},
-    ],
-    indirect=True,
-)
-def test_gateway_blank_skill_templates_construct_an_empty_catalog(gateway_rig):
-    status = _get_status(gateway_rig)
-    fallback_result = _send_skill(gateway_rig, skill_name="inspect_scene")
-
-    assert gateway_rig.executor_node._skill_templates == {}
-    assert gateway_rig.executor_node._skill_requirements == {}
-    assert gateway_rig.executor_node._capability_view["skills"] == []
-    assert list(status.capabilities) == []
-    assert fallback_result.success is False
-    assert fallback_result.error_code == "SKILL_REJECTED"
-    assert gateway_rig.downstream_goals == []
-
-
-@pytest.mark.parametrize(
-    "gateway_rig",
-    [
-        {"skill_templates_json": "{}"},
-        {
-            "skill_templates_json": json.dumps(
-                {
-                    "disabled_skill": {
-                        "disabled": True,
-                        "primitive_sequence": [{"primitive_name": "open_gripper"}],
-                    }
-                }
-            )
-        },
-    ],
-    indirect=True,
-)
-def test_gateway_explicitly_empty_skill_templates_expose_no_capabilities(gateway_rig):
-    status = _get_status(gateway_rig)
-    local_view = _local_capability_view(gateway_rig.overrides)
-
-    assert gateway_rig.executor_node._skill_templates == {}
-    assert gateway_rig.executor_node._skill_requirements == {}
-    assert list(status.capabilities) == []
-    assert local_view["skills"] == []
-    assert status.config_digest == local_view["capability_digest"]
-
-
-def test_constructor_rejects_incomplete_or_wrong_config_digest():
+def test_constructor_declares_catalog_parameters_and_drops_legacy_template_parameter(tmp_path):
     _assert_test_ros_environment()
-    suffix = f"digest_{os.getpid()}_{uuid.uuid4().hex}"
-    overrides = _constructor_overrides(suffix)
-    local_view = _local_capability_view(overrides)
-    complete = local_view["capability_digest"]
-    incomplete = build_capability_view(
-        {
-            "name": overrides["robot_name"],
-            "embodied": {
-                "named_poses": {},
-                "named_targets": {},
-                "skill_templates": {},
-            },
-        },
-        timeout_policy={
-            "default_skill_timeout_sec": overrides["default_skill_timeout_sec"],
-            "task_budget_sec": overrides["task_budget_sec"],
-        },
-    )["capability_digest"]
+    suffix = f"params_{os.getpid()}_{uuid.uuid4().hex}"
+    profile_name = f"robot_{suffix}"
+    _write_test_catalog(tmp_path, profile_name)
 
-    node = None
-    with suppress(ValueError):
-        node = SkillExecutorNode(
-            parameter_overrides=[
-                Parameter(name, value=value) for name, value in {**overrides, "config_digest": complete}.items()
-            ],
-            node_name=f"executor_{suffix}",
-        )
+    node = SkillExecutorNode(
+        parameter_overrides=[
+            Parameter(name, value=value)
+            for name, value in _constructor_overrides(suffix, tmp_path, profile_name).items()
+        ],
+        node_name=f"executor_{suffix}",
+    )
     try:
-        assert node is not None
-        assert node._config_digest == complete
+        assert not node.has_parameter("skill_templates_json")
+        assert node.has_parameter("skill_catalog_source_mode")
+        assert node.has_parameter("skill_catalog_source_root")
+        assert node.has_parameter("skill_catalog_profile")
     finally:
-        if node is not None:
-            node.destroy_node()
-
-    for index, configured_digest in enumerate((incomplete, "wrong-digest"), start=1):
-        with pytest.raises(ValueError, match="config_digest must match"):
-            SkillExecutorNode(
-                parameter_overrides=[
-                    Parameter(name, value=value)
-                    for name, value in {**overrides, "config_digest": configured_digest}.items()
-                ],
-                node_name=f"executor_{suffix}_{index}",
-            )
+        node.destroy_node()
 
 
 @pytest.mark.parametrize("gateway_rig", [{"active_control_mode": "startup_override_mode"}], indirect=True)
@@ -534,7 +768,7 @@ def test_active_mode_override_is_reported_and_rejects_without_primitive_dispatch
     assert dispatched_primitives == []
     assert status.active_control_mode == "startup_override_mode"
     assert _capability(status, "move").reason == (
-        "CONTROL_MODE_MISMATCH: requires gateway_mode, active mode is startup_override_mode"
+        f"CONTROL_MODE_MISMATCH: requires {_TEST_CONTROL_MODE}, active mode is startup_override_mode"
     )
 
 
@@ -547,7 +781,7 @@ def test_stale_ee_and_unavailable_dependencies_keep_status_nonblocking(gateway_r
     assert elapsed < 0.5
     assert relative.ready is False
     assert relative.reason == "CAPABILITY_NOT_READY: task executor action unavailable"
-    assert relative.required_control_mode == "gateway_mode"
+    assert relative.required_control_mode == _TEST_CONTROL_MODE
 
 
 @pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
@@ -563,7 +797,7 @@ def test_internal_relative_primitive_rejects_pose_stale_after_root_admission(gat
 
     monkeypatch.setattr(gateway_rig.executor_node, "_validate_skill", validate_skill)
     goal = SkillCommand.Goal()
-    goal.task_id = "stale-internal"
+    goal.dispatch_binding = new_binding(task_id="stale-internal")
     goal.skill_name = "relative"
     goal.motion_direction = "forward"
     goal.motion_distance = 0.01
@@ -606,7 +840,7 @@ def test_external_relative_primitive_rejects_stale_pose_before_validation_or_dis
 
 @pytest.mark.parametrize(
     "gateway_rig",
-    [{"_hold_validate_primitive": True, "_task_executor": True}],
+    [{"_hold_validate_primitive": True, "_task_executor": True, "rpc_timeout_sec": 1.0}],
     indirect=True,
 )
 def test_external_relative_primitive_rechecks_validated_snapshot_after_delayed_validation(gateway_rig):
@@ -672,7 +906,7 @@ def test_external_relative_primitive_rechecks_validated_snapshot_after_delayed_s
 @pytest.mark.parametrize("gateway_rig", [{"_hold_task_executor": True}], indirect=True)
 def test_external_primitive_with_active_task_id_and_random_uuid_is_busy(gateway_rig):
     root_goal = SkillCommand.Goal()
-    root_goal.task_id = "active-task"
+    root_goal.dispatch_binding = new_binding(task_id="active-task")
     root_goal.skill_name = "move"
     root_handle = _future_result(gateway_rig.skill_client.send_goal_async(root_goal))
     assert root_handle.accepted
@@ -702,7 +936,7 @@ def test_external_primitive_with_active_task_id_and_random_uuid_is_busy(gateway_
 @pytest.mark.parametrize("gateway_rig", [{"_hold_task_executor": True}], indirect=True)
 def test_root_skill_busy_rejection_preserves_admission_reason(gateway_rig, monkeypatch):
     root_goal = SkillCommand.Goal()
-    root_goal.task_id = "active-task"
+    root_goal.dispatch_binding = new_binding(task_id="active-task")
     root_goal.skill_name = "move"
     root_handle = _future_result(gateway_rig.skill_client.send_goal_async(root_goal))
     assert root_handle.accepted
@@ -847,23 +1081,17 @@ def test_cancel_request_and_propagation_audits_are_distinct_and_public_only():
     ]
 
 
-def test_constructor_rejects_unknown_gateway_primitive():
+def test_constructor_rejects_unknown_gateway_primitive(tmp_path):
     _assert_test_ros_environment()
     suffix = f"invalid_{os.getpid()}_{uuid.uuid4().hex}"
+    profile_name = f"robot_{suffix}"
+    _write_test_catalog(tmp_path, profile_name, include_relative=False, bad_primitive=True)
 
-    with pytest.raises(ValueError, match="unknown primitive"):
+    with pytest.raises(ValueError, match="unsupported primitive"):
         SkillExecutorNode(
             parameter_overrides=[
-                Parameter(
-                    "skill_templates_json",
-                    value=json.dumps({"bad": {"primitive_sequence": [{"primitive_name": "bad"}]}}),
-                ),
-                Parameter("skill_action_name", value=f"/{suffix}/skill"),
-                Parameter("primitive_action_name", value=f"/{suffix}/primitive"),
-                Parameter("skill_gateway_status_service", value=f"/{suffix}/status"),
-                Parameter("ee_pose_topic", value=f"/{suffix}/ee_pose"),
-                Parameter("joint_state_topic", value=f"/{suffix}/joint_state"),
-                Parameter("cmd_pose_topic", value=f"/{suffix}/cmd_pose"),
+                Parameter(name, value=value)
+                for name, value in _constructor_overrides(suffix, tmp_path, profile_name).items()
             ],
             node_name=f"executor_{suffix}",
         )

@@ -129,7 +129,7 @@ def test_default_skill_timeout_is_thirty_seconds():
     assert load_embodied_config({}).skill_timeout_sec == 30.0
 
 
-def test_loader_requires_gateway_control_mode_for_non_empty_skill_templates(tmp_path):
+def test_loader_rejects_removed_inline_skill_templates(tmp_path):
     config_path = tmp_path / "robot.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -155,7 +155,7 @@ def test_loader_requires_gateway_control_mode_for_non_empty_skill_templates(tmp_
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="skill_required_control_mode"):
+    with pytest.raises(ValueError, match="skill_templates is removed"):
         load_robot_config_dict(config_path)
 
 
@@ -289,7 +289,7 @@ def test_loader_validates_enabled_skill_capability_metadata(tmp_path, capability
     with pytest.raises(ValueError) as exc_info:
         load_robot_config_dict(config_path)
 
-    assert expected_error in str(exc_info.value)
+    assert "embodied.skill_templates is removed" in str(exc_info.value)
 
 
 def test_loader_allows_robot_without_embodied_skill_templates_to_omit_gateway_control_mode(tmp_path):
@@ -381,7 +381,7 @@ def test_loader_validates_capability_parameter_schema(tmp_path, parameters, expe
     with pytest.raises(ValueError) as exc_info:
         load_robot_config_dict(config_path)
 
-    assert expected_error in str(exc_info.value)
+    assert "embodied.skill_templates is removed" in str(exc_info.value)
 
 
 def test_loader_requires_capability_control_mode_to_match_gateway_mode(tmp_path):
@@ -393,10 +393,7 @@ def test_loader_requires_capability_control_mode_to_match_gateway_mode(tmp_path)
     with pytest.raises(ValueError) as exc_info:
         load_robot_config_dict(config_path)
 
-    assert str(exc_info.value).endswith(
-        "embodied.skill_templates.open_gripper.capability.required_control_mode "
-        "must match skill_required_control_mode 'moveit_planning'"
-    )
+    assert "embodied.skill_templates is removed" in str(exc_info.value)
 
 
 def test_skill_gateway_interfaces_are_registered_with_rosidl():
@@ -407,27 +404,26 @@ def test_skill_gateway_interfaces_are_registered_with_rosidl():
 
     assert message_path.is_file()
     assert service_path.is_file()
-    assert message_path.read_text(encoding="utf-8") == (
-        "string name\nbool ready\nstring reason\nstring required_control_mode\n"
-    )
-    assert service_path.read_text(encoding="utf-8") == (
-        "string task_id\n"
-        "string payload_hash\n"
-        "---\n"
-        "uint32 schema_version\n"
-        "string robot_name\n"
-        "bool motion_authorized\n"
-        "string active_control_mode\n"
-        "bool busy\n"
-        "string active_task_id\n"
-        "float32 default_skill_timeout_sec\n"
-        "float32 task_budget_sec\n"
-        "float32 rpc_timeout_sec\n"
-        "string config_digest\n"
-        "string request_state\n"
-        "string request_error_code\n"
-        "SkillCapabilityStatus[] capabilities\n"
-    )
+    message_contents = message_path.read_text(encoding="utf-8")
+    service_contents = service_path.read_text(encoding="utf-8")
+    for field in (
+        "uint32 schema_version",
+        "string name",
+        "string semantic_level",
+        "bool planner_visible",
+        "bool ready",
+    ):
+        assert field in message_contents
+    for field in (
+        "uint32 schema_version",
+        "string task_id",
+        "string capability_digest",
+        "string registry_epoch",
+        "string registry_digest",
+        "bool control_plane_ready",
+        "SkillCapabilityStatus[] capabilities",
+    ):
+        assert field in service_contents
 
     cmake_contents = cmake_path.read_text(encoding="utf-8")
     assert '"msg/SkillCapabilityStatus.msg"' in cmake_contents
@@ -1310,7 +1306,7 @@ def test_validate_embodied_vlm_planner_mode():
     )
 
     errors = validate_config(config)
-    assert any("allowed_skills contains unsupported skill" in error for error in errors)
+    assert "embodied.skill_templates is removed; use embodied.skill_catalog_profile" in errors
 
 
 def test_validate_embodied_accepts_skill_declared_by_current_robot():
@@ -1387,18 +1383,14 @@ def test_validate_typed_config_requires_capability_mode_to_match_gateway_mode():
 
     errors = validate_config(config)
 
-    assert any(
-        "embodied.skill_templates.open_gripper.capability.required_control_mode "
-        "must match skill_required_control_mode 'teleop'" in error
-        for error in errors
-    )
+    assert "embodied.skill_templates is removed; use embodied.skill_catalog_profile" in errors
 
 
 @pytest.mark.parametrize("required_control_mode", ["", None, 1])
 def test_validate_typed_config_requires_gateway_mode_for_enabled_skills(required_control_mode):
     errors = validate_config(_typed_config_with_skill_gateway_mode(required_control_mode))
 
-    assert "skill_required_control_mode is required when embodied.skill_templates is non-empty" in errors
+    assert "embodied.skill_templates is removed; use embodied.skill_catalog_profile" in errors
 
 
 def test_validate_embodied_perception_conversation_history():
@@ -1641,4 +1633,4 @@ def test_validate_embodied_skill_template_requires_pose_source():
 
     errors = validate_config(config)
 
-    assert any("must define pose_name, target_pose_key, or enable place_name_from_request" in error for error in errors)
+    assert "embodied.skill_templates is removed; use embodied.skill_catalog_profile" in errors

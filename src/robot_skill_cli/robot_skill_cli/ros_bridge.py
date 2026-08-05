@@ -27,23 +27,49 @@ class RosBridge:
         self,
         *,
         status_service: str,
+        snapshot_service: str = "/embodied/get_skill_snapshot",
+        reload_service: str = "/embodied/reload_skill_catalog",
         validate_skill_service: str,
         skill_action: str,
+        plan_service: str = "/embodied/plan_agent_command",
+        validate_plan_service: str = "/embodied/validate_agent_plan",
+        confirm_plan_service: str = "/embodied/confirm_agent_plan",
+        execute_plan_action: str = "/embodied/execute_agent_plan",
     ) -> None:
         self._status_service = status_service
+        self._snapshot_service = snapshot_service
+        self._reload_service = reload_service
         self._validate_skill_service = validate_skill_service
         self._skill_action = skill_action.rstrip("/")
+        self._plan_service = plan_service
+        self._validate_plan_service = validate_plan_service
+        self._confirm_plan_service = confirm_plan_service
+        self._execute_plan_action = execute_plan_action.rstrip("/")
         self._node = None
         self._executor = None
         self._spin_thread = None
         self._owns_rclpy_context = False
         self._status_client = None
+        self._snapshot_client = None
+        self._reload_client = None
         self._validate_client = None
         self._skill_client = None
+        self._plan_client = None
+        self._validate_plan_client = None
+        self._confirm_plan_client = None
+        self._execute_plan_client = None
         self._cancel_client = None
+        self._cancel_plan_client = None
+        self._plan_result_client = None
         self._GetSkillGatewayStatus = None
+        self._GetSkillSnapshot = None
+        self._ReloadSkillCatalog = None
         self._ValidateSkill = None
         self._SkillCommand = None
+        self._PlanAgentCommand = None
+        self._ValidateAgentPlan = None
+        self._ConfirmAgentPlan = None
+        self._ExecuteAgentPlan = None
         self._CancelGoal = None
 
     def start(self) -> bool:
@@ -54,8 +80,16 @@ class RosBridge:
             from rclpy.callback_groups import ReentrantCallbackGroup
             from rclpy.executors import MultiThreadedExecutor
 
-            from ibrobot_msgs.action import SkillCommand
-            from ibrobot_msgs.srv import GetSkillGatewayStatus, ValidateSkill
+            from ibrobot_msgs.action import ExecuteAgentPlan, SkillCommand
+            from ibrobot_msgs.srv import (
+                ConfirmAgentPlan,
+                GetSkillGatewayStatus,
+                GetSkillSnapshot,
+                PlanAgentCommand,
+                ReloadSkillCatalog,
+                ValidateAgentPlan,
+                ValidateSkill,
+            )
         except Exception:
             return False
 
@@ -71,6 +105,12 @@ class RosBridge:
                 self._status_service,
                 callback_group=callback_group,
             )
+            self._snapshot_client = self._node.create_client(
+                GetSkillSnapshot, self._snapshot_service, callback_group=callback_group
+            )
+            self._reload_client = self._node.create_client(
+                ReloadSkillCatalog, self._reload_service, callback_group=callback_group
+            )
             self._validate_client = self._node.create_client(
                 ValidateSkill,
                 self._validate_skill_service,
@@ -82,14 +122,45 @@ class RosBridge:
                 self._skill_action,
                 callback_group=callback_group,
             )
+            self._plan_client = self._node.create_client(
+                PlanAgentCommand, self._plan_service, callback_group=callback_group
+            )
+            self._validate_plan_client = self._node.create_client(
+                ValidateAgentPlan, self._validate_plan_service, callback_group=callback_group
+            )
+            self._confirm_plan_client = self._node.create_client(
+                ConfirmAgentPlan, self._confirm_plan_service, callback_group=callback_group
+            )
+            self._execute_plan_client = ActionClient(
+                self._node,
+                ExecuteAgentPlan,
+                self._execute_plan_action,
+                callback_group=callback_group,
+            )
             self._cancel_client = self._node.create_client(
                 CancelGoal,
                 f"{self._skill_action}/_action/cancel_goal",
                 callback_group=callback_group,
             )
+            self._cancel_plan_client = self._node.create_client(
+                CancelGoal,
+                f"{self._execute_plan_action}/_action/cancel_goal",
+                callback_group=callback_group,
+            )
+            self._plan_result_client = self._node.create_client(
+                ExecuteAgentPlan.Impl.GetResultService,
+                f"{self._execute_plan_action}/_action/get_result",
+                callback_group=callback_group,
+            )
             self._GetSkillGatewayStatus = GetSkillGatewayStatus
+            self._GetSkillSnapshot = GetSkillSnapshot
+            self._ReloadSkillCatalog = ReloadSkillCatalog
             self._ValidateSkill = ValidateSkill
             self._SkillCommand = SkillCommand
+            self._PlanAgentCommand = PlanAgentCommand
+            self._ValidateAgentPlan = ValidateAgentPlan
+            self._ConfirmAgentPlan = ConfirmAgentPlan
+            self._ExecuteAgentPlan = ExecuteAgentPlan
             self._CancelGoal = CancelGoal
             self._executor = MultiThreadedExecutor(num_threads=2)
             self._executor.add_node(self._node)
@@ -142,6 +213,7 @@ class RosBridge:
         if self._GetSkillGatewayStatus is None:
             raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
         request = self._GetSkillGatewayStatus.Request()
+        request.schema_version = 1
         request.task_id = task_id
         request.payload_hash = payload_hash
         response = self._call_service(
@@ -161,11 +233,23 @@ class RosBridge:
             "task_budget_sec": float(response.task_budget_sec),
             "rpc_timeout_sec": float(response.rpc_timeout_sec),
             "config_digest": response.config_digest,
+            "capability_digest": response.capability_digest,
+            "registry_epoch": response.registry_epoch,
+            "registry_generation": int(response.registry_generation),
+            "registry_digest": response.registry_digest,
+            "primitive_contract_digest": response.primitive_contract_digest,
+            "source_release_digest": response.source_release_digest,
+            "provenance_digest": response.provenance_digest,
+            "control_plane_ready": bool(response.control_plane_ready),
+            "control_plane_state": response.control_plane_state,
+            "control_plane_error_code": response.control_plane_error_code,
             "request_state": response.request_state,
             "request_error_code": response.request_error_code,
             "capabilities": [
                 {
                     "name": capability.name,
+                    "semantic_level": capability.semantic_level,
+                    "planner_visible": bool(capability.planner_visible),
                     "ready": bool(capability.ready),
                     "reason": capability.reason,
                     "required_control_mode": capability.required_control_mode,
@@ -174,10 +258,27 @@ class RosBridge:
             ],
         }
 
-    def validate_skill(self, payload: dict[str, Any], *, timeout_sec: float) -> dict[str, Any]:
+    def validate_skill(
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout_sec: float,
+        registry_identity: tuple[str, int, str] | None = None,
+    ) -> dict[str, Any]:
         if self._ValidateSkill is None:
             raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
         request = self._ValidateSkill.Request()
+        request.dispatch_binding.schema_version = 1
+        request.dispatch_binding.task_id = str(payload.get("_task_id", ""))
+        request.dispatch_binding.root_task_id = str(payload.get("_root_task_id", request.dispatch_binding.task_id))
+        identity = registry_identity or (
+            str(payload.get("_registry_epoch", "")),
+            int(payload.get("_registry_generation", 0)),
+            str(payload.get("_registry_digest", "")),
+        )
+        request.dispatch_binding.expected_registry_epoch = identity[0]
+        request.dispatch_binding.expected_registry_generation = identity[1]
+        request.dispatch_binding.expected_registry_digest = identity[2]
         request.skill_name = payload["skill_name"]
         request.target_name = payload["target_name"]
         request.place_name = payload["place_name"]
@@ -189,7 +290,322 @@ class RosBridge:
             service_name=self._validate_skill_service,
             timeout_sec=timeout_sec,
         )
-        return {"allowed": bool(response.allowed), "reason": response.reason}
+        return {
+            "allowed": bool(response.allowed),
+            "reason": response.reason,
+            "error_code": response.error_code,
+            "actual_registry_epoch": response.actual_registry_epoch,
+            "actual_registry_generation": int(response.actual_registry_generation),
+            "actual_registry_digest": response.actual_registry_digest,
+            "diagnostics": [
+                {
+                    "schema_version": int(diagnostic.schema_version),
+                    "severity": int(diagnostic.severity),
+                    "error_code": diagnostic.error_code,
+                    "source_relative_path": diagnostic.source_relative_path,
+                    "field_path": diagnostic.field_path,
+                    "message": diagnostic.message,
+                }
+                for diagnostic in response.diagnostics
+            ],
+        }
+
+    def get_skill_snapshot(
+        self,
+        *,
+        registry_epoch: str,
+        generation: int,
+        timeout_sec: float,
+    ) -> dict[str, Any]:
+        if self._GetSkillSnapshot is None:
+            raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
+        request = self._GetSkillSnapshot.Request()
+        request.schema_version = 1
+        request.registry_epoch = registry_epoch
+        request.generation = int(generation)
+        response = self._call_service(
+            self._snapshot_client,
+            request,
+            service_name=self._snapshot_service,
+            timeout_sec=timeout_sec,
+        )
+        return {
+            "success": bool(response.success),
+            "registry_epoch": str(response.registry_epoch),
+            "generation": int(response.generation),
+            "registry_digest": str(response.registry_digest),
+            "capability_digest": str(response.capability_digest),
+            "source_release_digest": str(response.source_release_digest),
+            "provenance_digest": str(response.provenance_digest),
+            "profile_name": str(response.profile_name),
+            "snapshot_json": str(response.snapshot_json),
+            "error_code": str(response.error_code),
+            "message": str(response.message),
+        }
+
+    def reload_skill_catalog(self, *, request_id: str, force: bool, timeout_sec: float) -> dict[str, Any]:
+        if self._ReloadSkillCatalog is None:
+            raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
+        request = self._ReloadSkillCatalog.Request()
+        request.schema_version = 1
+        request.request_id = request_id
+        request.force = force
+        response = self._call_service(
+            self._reload_client,
+            request,
+            service_name=self._reload_service,
+            timeout_sec=timeout_sec,
+        )
+        return {
+            "success": bool(response.success),
+            "registry_epoch": str(response.registry_epoch),
+            "old_generation": int(response.old_generation),
+            "generation": int(response.generation),
+            "registry_digest": str(response.registry_digest),
+            "capability_digest": str(response.capability_digest),
+            "source_release_digest": str(response.source_release_digest),
+            "provenance_digest": str(response.provenance_digest),
+            "error_code": str(response.error_code),
+            "message": str(response.message),
+            "changed_skills": list(response.changed_skills),
+            "diagnostics": [
+                {
+                    "schema_version": int(diagnostic.schema_version),
+                    "severity": int(diagnostic.severity),
+                    "error_code": diagnostic.error_code,
+                    "source_relative_path": diagnostic.source_relative_path,
+                    "field_path": diagnostic.field_path,
+                    "message": diagnostic.message,
+                }
+                for diagnostic in response.diagnostics
+            ],
+        }
+
+    @staticmethod
+    def _workflow_step_dict(step) -> dict[str, Any]:
+        return {
+            "schema_version": int(step.schema_version),
+            "skill_name": str(step.skill_name),
+            "target_name": str(step.target_name),
+            "place_name": str(step.place_name),
+            "motion_direction": str(step.motion_direction),
+            "motion_distance": float(step.motion_distance),
+            "timeout_sec": float(step.timeout_sec),
+        }
+
+    @classmethod
+    def _agent_plan_dict(cls, plan) -> dict[str, Any]:
+        return {
+            "schema_version": int(plan.schema_version),
+            "plan_id": str(plan.plan_id),
+            "plan_token": str(plan.plan_token),
+            "plan_kind": int(plan.plan_kind),
+            "raw_command": str(plan.raw_command),
+            "workflow_steps": [cls._workflow_step_dict(step) for step in plan.workflow_steps],
+            "plan_digest": str(plan.plan_digest),
+            "registry_epoch": str(plan.registry_epoch),
+            "registry_generation": int(plan.registry_generation),
+            "registry_digest": str(plan.registry_digest),
+            "expires_at": {
+                "sec": int(plan.expires_at.sec),
+                "nanosec": int(plan.expires_at.nanosec),
+            },
+        }
+
+    def plan_agent_command(self, *, request_id: str, raw_command: str, timeout_sec: float) -> dict[str, Any]:
+        if self._PlanAgentCommand is None:
+            raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
+        request = self._PlanAgentCommand.Request()
+        request.schema_version = 1
+        request.request_id = request_id
+        request.raw_command = raw_command
+        response = self._call_service(
+            self._plan_client,
+            request,
+            service_name=self._plan_service,
+            timeout_sec=timeout_sec,
+        )
+        return {
+            "success": bool(response.success),
+            "plan": self._agent_plan_dict(response.plan),
+            "error_code": str(response.error_code),
+            "message": str(response.message),
+            "diagnostics": self._diagnostics(response.diagnostics),
+        }
+
+    def validate_agent_plan(self, *, plan_token: str, timeout_sec: float) -> dict[str, Any]:
+        if self._ValidateAgentPlan is None:
+            raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
+        request = self._ValidateAgentPlan.Request()
+        request.schema_version = 1
+        request.plan_token = plan_token
+        response = self._call_service(
+            self._validate_plan_client,
+            request,
+            service_name=self._validate_plan_service,
+            timeout_sec=timeout_sec,
+        )
+        return {
+            "allowed": bool(response.allowed),
+            "plan_id": str(response.plan_id),
+            "plan_digest": str(response.plan_digest),
+            "error_code": str(response.error_code),
+            "message": str(response.message),
+            "diagnostics": self._diagnostics(response.diagnostics),
+        }
+
+    def confirm_agent_plan(
+        self,
+        *,
+        plan_token: str,
+        plan_digest: str,
+        task_id: str,
+        status: dict[str, Any],
+        timeout_sec: float,
+    ) -> dict[str, Any]:
+        if self._ConfirmAgentPlan is None:
+            raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
+        request = self._ConfirmAgentPlan.Request()
+        request.schema_version = 1
+        request.plan_token = plan_token
+        request.plan_digest = plan_digest
+        request.task_id = task_id
+        request.registry_epoch = status["registry_epoch"]
+        request.registry_generation = int(status["registry_generation"])
+        request.registry_digest = status["registry_digest"]
+        response = self._call_service(
+            self._confirm_plan_client,
+            request,
+            service_name=self._confirm_plan_service,
+            timeout_sec=timeout_sec,
+        )
+        return {
+            "confirmed": bool(response.confirmed),
+            "confirmation_token": str(response.confirmation_token),
+            "error_code": str(response.error_code),
+            "message": str(response.message),
+            "diagnostics": self._diagnostics(response.diagnostics),
+        }
+
+    @staticmethod
+    def _diagnostics(diagnostics) -> list[dict[str, Any]]:
+        return [
+            {
+                "schema_version": int(item.schema_version),
+                "severity": int(item.severity),
+                "error_code": str(item.error_code),
+                "source_relative_path": str(item.source_relative_path),
+                "field_path": str(item.field_path),
+                "message": str(item.message),
+            }
+            for item in diagnostics
+        ]
+
+    def wait_for_execute_plan_server(self, *, timeout_sec: float) -> bool:
+        if self._execute_plan_client is None:
+            return False
+        return self._execute_plan_client.wait_for_server(timeout_sec=timeout_sec)
+
+    def wait_for_agent_plan_interfaces(self, *, timeout_sec: float) -> bool:
+        """Return whether every Hermes-facing plan service/action is discoverable."""
+        deadline = time.monotonic() + timeout_sec
+        for client in (self._plan_client, self._validate_plan_client, self._confirm_plan_client):
+            remaining = deadline - time.monotonic()
+            if client is None or remaining <= 0.0 or not client.wait_for_service(timeout_sec=remaining):
+                return False
+        remaining = deadline - time.monotonic()
+        return (
+            self._execute_plan_client is not None
+            and remaining > 0.0
+            and self._execute_plan_client.wait_for_server(timeout_sec=remaining)
+        )
+
+    def send_agent_plan_goal(
+        self, *, plan_token: str, confirmation_token: str, task_id: str, timeout_sec: float, feedback_callback=None
+    ):
+        if self._ExecuteAgentPlan is None or self._execute_plan_client is None:
+            raise BridgeError(
+                "ROS_UNAVAILABLE", "agent plan action client is not started", exit_code=EXIT_ROS_UNAVAILABLE
+            )
+        goal = self._ExecuteAgentPlan.Goal()
+        goal.schema_version = 1
+        goal.plan_token = plan_token
+        goal.confirmation_token = confirmation_token
+        goal.task_id = task_id
+        goal.timeout_sec = float(timeout_sec)
+
+        def on_feedback(feedback) -> None:
+            if feedback_callback is None:
+                return
+            message = getattr(feedback, "feedback", feedback)
+            feedback_callback(
+                {
+                    "state": str(message.state),
+                    "detail": str(message.detail),
+                    "current_skill": str(message.current_skill),
+                    "workflow_step_index": int(message.workflow_step_index),
+                }
+            )
+
+        from unique_identifier_msgs.msg import UUID
+
+        goal_uuid = UUID(uuid=list(skill_goal_uuid(task_id).bytes))
+        try:
+            return self._execute_plan_client.send_goal_async(goal, feedback_callback=on_feedback, goal_uuid=goal_uuid)
+        except Exception as exc:
+            raise BridgeError("ROS_UNAVAILABLE", str(exc), exit_code=EXIT_ROS_UNAVAILABLE) from exc
+
+    def cancel_agent_plan(self, task_id: str, *, timeout_sec: float) -> dict[str, Any]:
+        if self._cancel_plan_client is None or self._CancelGoal is None:
+            raise BridgeError(
+                "ROS_UNAVAILABLE", "agent plan cancel client is not started", exit_code=EXIT_ROS_UNAVAILABLE
+            )
+        request = self._CancelGoal.Request()
+        request.goal_info.goal_id.uuid = list(skill_goal_uuid(task_id).bytes)
+        service_name = f"{self._execute_plan_action}/_action/cancel_goal"
+        response = self._call_service(
+            self._cancel_plan_client,
+            request,
+            service_name=service_name,
+            timeout_sec=timeout_sec,
+        )
+        return {
+            "accepted": int(response.return_code) == 0 and bool(response.goals_canceling),
+            "return_code": int(response.return_code),
+        }
+
+    @staticmethod
+    def _agent_plan_result_dict(result) -> dict[str, Any]:
+        return {
+            "success": bool(result.success),
+            "plan_id": str(result.plan_id),
+            "plan_digest": str(result.plan_digest),
+            "workflow_digest": str(result.workflow_digest),
+            "completed_step_count": int(result.completed_step_count),
+            "error_code": str(result.error_code),
+            "message": str(result.message),
+            "actual_registry_epoch": str(result.actual_registry_epoch),
+            "actual_registry_generation": int(result.actual_registry_generation),
+            "actual_registry_digest": str(result.actual_registry_digest),
+        }
+
+    def get_agent_plan_result(self, task_id: str, *, timeout_sec: float) -> dict[str, Any]:
+        if self._plan_result_client is None or self._ExecuteAgentPlan is None:
+            raise BridgeError(
+                "ROS_UNAVAILABLE", "agent plan result client is not started", exit_code=EXIT_ROS_UNAVAILABLE
+            )
+        request = self._ExecuteAgentPlan.Impl.GetResultService.Request()
+        request.goal_id.uuid = list(skill_goal_uuid(task_id).bytes)
+        response = self._call_service(
+            self._plan_result_client,
+            request,
+            service_name=f"{self._execute_plan_action}/_action/get_result",
+            timeout_sec=timeout_sec,
+        )
+        return {
+            "status": int(response.status),
+            "result": self._agent_plan_result_dict(response.result),
+        }
 
     def wait_for_skill_server(self, *, timeout_sec: float) -> bool:
         if self._skill_client is None:
@@ -205,7 +621,12 @@ class RosBridge:
         if self._skill_client is None or self._SkillCommand is None:
             raise BridgeError("ROS_UNAVAILABLE", "skill action client is not started", exit_code=EXIT_ROS_UNAVAILABLE)
         goal = self._SkillCommand.Goal()
-        goal.task_id = task_id
+        goal.dispatch_binding.schema_version = 1
+        goal.dispatch_binding.task_id = task_id
+        goal.dispatch_binding.root_task_id = task_id
+        goal.dispatch_binding.expected_registry_epoch = str(payload.get("_registry_epoch", ""))
+        goal.dispatch_binding.expected_registry_generation = int(payload.get("_registry_generation", 0))
+        goal.dispatch_binding.expected_registry_digest = str(payload.get("_registry_digest", ""))
         goal.skill_name = payload["skill_name"]
         goal.target_name = payload["target_name"]
         goal.place_name = payload["place_name"]

@@ -1,0 +1,7 @@
+schema_version: 1
+kind: delegated_executor
+robot: so101_handeye_realsense_grasp
+executor: grasp_pipeline
+required_args:
+- target_name
+timeout_sec: 240.0

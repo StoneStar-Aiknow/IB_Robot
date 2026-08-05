@@ -1,0 +1,32 @@
+# GetSkillSnapshot.srv - Exact-version snapshot query.
+#
+# See docs/lightweight_skill_package_registry_design_zh.md section 11.3.
+#
+# Query semantics:
+#   1. generation == 0 and empty epoch: return current bundle.
+#   2. generation == 0 and non-empty epoch: epoch must equal current epoch,
+#      otherwise epoch mismatch.
+#   3. generation > 0: must exactly match (epoch, generation); no silent
+#      upgrade to a newer version.
+#   4. Exact snapshot already reclaimed: SKILL_SNAPSHOT_NOT_RETAINED.
+#
+# snapshot_json must strictly use the snapshot_payload_v1 from section 6.4; no
+# consumer-private fields. schema_version is 1 in v1. This service is an
+# internal synchronization interface between runtime nodes; it does not replace
+# the public Agent-facing capability catalog.
+
+uint32 schema_version
+string registry_epoch
+uint64 generation
+---
+bool success
+string registry_epoch
+uint64 generation
+string registry_digest
+string capability_digest
+string source_release_digest
+string provenance_digest
+string profile_name
+string snapshot_json
+string error_code
+string message
