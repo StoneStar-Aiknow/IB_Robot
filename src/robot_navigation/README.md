@@ -20,6 +20,7 @@ mapping 由 cmd_vel bridge 发布 `odom -> base_link`。LiDAR profile 以 `lekiw
 
 - **语音控制**: 基于 `voice_asr_service` (sherpa-onnx 本地 ASR) + `voice_control` 关键词匹配的语音导航
 - **导航控制**: Nav2 导航 Goal 客户端，支持语音触发导航，到达后自动触发机械臂推理
+- **全向局部控制**: 提供 Nav2 MPPI `Omni` 候选 profile，实机门禁通过前默认保留 DWB
 - **底盘桥接**: `cmd_vel_bridge_node` 通过 IK/FK 将标准 `/cmd_vel` 桥接到 ros2_control 全向轮速度指令 (rad/s)，并发布里程计
 - **定位融合**: EKF (robot_localization) 融合底盘里程计速度，RTAB-Map 视觉 SLAM 提供全局定位修正
 - **建图保存**: `save_rtabmap_map` 包装 Nav2 map_saver，将 `/rtabmap/map` 默认保存为 `rtabmap.yaml/rtabmap.pgm`
@@ -103,6 +104,11 @@ Nav2 使用静态地图与 RTAB-Map 提供的 `map → odom` 定位结果，不�
 | 单独调试导航节点 | [底层调试入口](#底层调试入口) | `ros2 run robot_navigation ...` |
 
 `robot_config` 的优势：YAML 单一数据源，自动启动控制器、相机、TF、定位、Nav2 和导航节点，并通过 `control_mode` 切换运行模式。
+
+LeKiwi 导航的 body-frame 速度与加速度包络由 `lekiwi_navi.yaml` 的
+`robot.navigation.motion_envelope` 唯一维护。`nav2_params.yaml` 中的 MPPI 和
+velocity smoother 参数是该包络的镜像，FAST-LIO、SLAM 与其他导航消费者不得
+另建权威值。静态测试会同时检查镜像漂移和整个速度盒的轮空间可行性。
 
 ## 现场直接运行流程
 
@@ -395,9 +401,20 @@ LeKiwi 建图和导航支持两类运行方式：
 ```yaml
 navigation:
   enabled: true
+  motion_envelope:
+    velocity:
+      vx: {min: -0.13, max: 0.13}
+      vy: {min: -0.11, max: 0.11}
+      wz: {min: -0.44, max: 0.44}
+    acceleration:
+      vx: {min: -0.65, max: 0.65}
+      vy: {min: -0.55, max: 0.55}
+      wz: {min: -2.2, max: 2.2}
   nav2_bringup:
     enabled: true
     map_file: "$(env HOME)/.ros/ibrobot/maps/rtabmap.yaml"
+    # MPPI promotion 前保持 DWB 为实机默认值。
+    params_file: "$(find robot_navigation)/config/nav2_params_dwb.yaml"
   ekf_rtabmap:
     enabled: true
     rtabmap:
@@ -418,6 +435,26 @@ navigation:
   rviz:
     enabled: true
 ```
+
+MPPI 未通过完整门禁时，`lekiwi_navi.yaml` 保持选择
+`$(find robot_navigation)/config/nav2_params_dwb.yaml`。验证 MPPI 候选时显式选择
+`nav2_params.yaml`，全部门禁通过后才可将它设为实机默认值。仿真对应
+`nav2_sim_params.yaml` 与 `nav2_sim_params_dwb.yaml`。切换前必须终止当前导航目标并
+重启 Nav2；切换不会改变 `NavigateToPose`、`FollowPath`、costmap 或 `/cmd_vel` 接口。
+
+DWB/MPPI 对照矩阵和 promotion gate 定义在
+`config/nav2/controller_regression.yaml`。采集的 baseline/candidate JSON 均包含 `runs`
+数组后，可执行：
+
+```bash
+ros2 run robot_navigation evaluate_controller_regression \
+  --matrix $(ros2 pkg prefix robot_navigation)/share/robot_navigation/config/nav2/controller_regression.yaml \
+  --baseline /path/to/dwb.json \
+  --candidate /path/to/mppi.json
+```
+
+只有成功率不下降、无新增碰撞或持续振荡、无命令越界且 controller computation
+P95 严格低于 50 ms 时才返回成功。仅有 `/cmd_vel` 到达间隔不能替代 computation trace。
 
 ## 建图流程
 

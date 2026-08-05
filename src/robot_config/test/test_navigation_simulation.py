@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 import rclpy
+import yaml
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import Twist
@@ -38,6 +39,7 @@ GAZEBO_STARTUP_TIMEOUT = 120
 NAV2_SETTLE_TIME = 10
 NAV_GOAL_TIMEOUT = 90
 NAV_TEST_PROFILE_ENV = "NAV_TEST_PROFILE"
+NAV2_TEST_PARAMS_FILE_ENV = "NAV2_TEST_PARAMS_FILE"
 
 SPAWN_X = -1.5
 SPAWN_Y = -1.5
@@ -178,6 +180,13 @@ def _get_odom_position(node: Node, topic="/odom", timeout=5.0):
     return odom.pose.pose.position
 
 
+def _navigation_failure_context(probe, cmd_vel_msgs):
+    maxima = tuple(max((abs(msg[index]) for msg in cmd_vel_msgs), default=0.0) for index in range(3))
+    position = _get_odom_position(probe, "/odom", timeout=2.0)
+    position_text = "unavailable" if position is None else f"({position.x:.3f}, {position.y:.3f})"
+    return f"max_abs_cmd={maxima}, final_position={position_text}, samples={len(cmd_vel_msgs)}"
+
+
 def _terminate_process(managed: ManagedProcess, timeout=15):
     proc = managed.proc
     with contextlib.suppress(ProcessLookupError):
@@ -228,6 +237,16 @@ def gazebo_env():
 
     robot_config_share = get_package_share_directory("robot_config")
     config_path = os.path.join(robot_config_share, "test", "config", "lekiwi_navi_sim.yaml")
+    params_override = os.environ.get(NAV2_TEST_PARAMS_FILE_ENV, "").strip()
+    if params_override:
+        params_path = Path(params_override).expanduser().resolve()
+        if not params_path.is_file():
+            pytest.fail(f"{NAV2_TEST_PARAMS_FILE_ENV} does not exist: {params_path}")
+        config = yaml.safe_load(Path(config_path).read_text(encoding="utf-8"))
+        config["robot"]["navigation"]["nav2_bringup"]["params_file"] = str(params_path)
+        override_path = Path(tempfile.mkdtemp(prefix="robot_config_nav_profile_")) / "lekiwi_navi_sim.yaml"
+        override_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        config_path = str(override_path)
     robot_launch = os.path.join(robot_config_share, "launch", "robot.launch.py")
     e2e_dir = Path(robot_config_share) / "test" / "e2e"
     log_dir = Path(tempfile.mkdtemp(prefix="robot_config_nav_sim_"))
@@ -376,7 +395,7 @@ class TestNavigationSimulation:
         status = _send_nav_goal(probe, POINT_A_X, POINT_A_Y, 0.0, timeout=NAV_GOAL_TIMEOUT)
         probe.destroy_subscription(cmd_sub)
 
-        assert status is not None, "Navigation did not complete"
+        assert status is not None, f"Navigation did not complete: {_navigation_failure_context(probe, cmd_vel_msgs)}"
         assert status == GoalStatus.STATUS_SUCCEEDED, f"Expected SUCCEEDED, got status {status}"
         assert any(abs(v[0]) > 1e-4 or abs(v[1]) > 1e-4 for v in cmd_vel_msgs)
 

@@ -51,6 +51,7 @@ setup(
             "navigation_command_server = robot_navigation.navigation_command_server:main",
             "navigation_lifecycle_coordinator = robot_navigation.navigation_lifecycle_coordinator:main",
             "nav_cmd = robot_navigation.nav_cmd:main",
+            "evaluate_controller_regression = robot_navigation.controller_regression:main",
         ],
     },
 )

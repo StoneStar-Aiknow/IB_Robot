@@ -119,13 +119,27 @@ robot:
   navigation:
     enabled: true
 
+    # Authoritative body-frame envelope for navigation controllers. These
+    # conservative simultaneous-motion limits reserve wheel-speed headroom and
+    # remain subject to the MPPI simulation and low-speed hardware gates.
+    motion_envelope:
+      velocity:
+        vx: {min: -0.13, max: 0.13}  # m/s
+        vy: {min: -0.11, max: 0.11}  # m/s
+        wz: {min: -0.44, max: 0.44}  # rad/s; not the pure-rotation physical limit
+      acceleration:
+        vx: {min: -0.65, max: 0.65}  # m/s^2
+        vy: {min: -0.55, max: 0.55}  # m/s^2
+        wz: {min: -2.2, max: 2.2}    # rad/s^2
+
     robot_description:
       urdf_path: $(find lekiwi_description)/urdf/lekiwi_assembled.urdf.xacro
 
     nav2_bringup:
       enabled: true
       map_file: "$(env HOME)/.ros/ibrobot/maps/rtabmap.yaml"
-      params_file: ""
+      # MPPI remains a candidate until simulation timing and hardware gates pass.
+      params_file: "$(find robot_navigation)/config/nav2_params_dwb.yaml"
 
     ekf_rtabmap:
       enabled: true
