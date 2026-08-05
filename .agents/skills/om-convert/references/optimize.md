@@ -62,6 +62,10 @@ reproduction commands are the durable record, not every binary candidate.
 
 The order is evidence-driven. Skip a rung when profiling shows it is irrelevant.
 
+For Ascend310P, read `ascend310p-optimization.md` before proposing the ladder. Default to opset 17 and
+end-to-end FP16 with only accuracy-proven FP32 islands. Give PFA low priority and prefer standard-ONNX
+rank-3 BMM rewrites.
+
 ### 0. Freeze The Baseline
 
 Require accepted Torch-vs-ONNX, accepted Torch-vs-OM, all OM loop-20 logs, weighted totals, input and
@@ -78,6 +82,10 @@ Inspect repeated dataset/buffer creation, avoidable H2D/D2H, host round-trips be
 outputs copied to host, missing buffer reuse, repeated invariant prefix/embedding/cache work, and
 duplicated image encoding. Prefer reusable generic ACL changes over model-specific copies.
 
+For serial OM roles, bind producer outputs and consumer inputs to one ACL device allocation through
+Manifest device links, following PI05. Keep allocation ownership centralized and verify normal inference
+performs no D2H/H2D for linked tensors.
+
 ### 2. Profile And Rank ROI
 
 Use `msprof` as the primary diagnostic profiler; final performance remains ais_bench loop 20. Check AICPU
@@ -93,6 +101,19 @@ operations to FP16.
 Rank by measured share, removability, expected benefit, implementation cost, accuracy risk, and risk of
 being invalidated by later quantization/layout changes. Do not optimize a cheap non-bottleneck merely
 because a fused operator exists.
+
+Re-rank after every large gain using invocation-weighted latency. A repeatedly invoked Action Expert can
+become dominant only after VLM optimization.
+
+### 2A. Prefer Opset 17 And FP16 On 310P
+
+For Ascend310P, first export opset 17 and inspect whether standard `LayerNormalization` survives. Opset
+<=16 can decompose LayerNorm into AI CPU primitives. This is not universal: roles without eligible
+LayerNorm may show no gain.
+
+Make QK, PV, Linear, and other MatMul paths FP16 by default. Test rank-3 batch/head flattening together
+with FP16; an FP32 rank-3 candidate can regress even when rank-3 plus FP16 wins. Retain FP32 only for
+islands required by final-action accuracy.
 
 ### 3. Eliminate Exact Glue
 
@@ -124,6 +145,10 @@ A candidate requires all three:
 
 Check CANN ops-info and `libops_all_onnx_plugin.so`; do not infer support from torch_npu API presence.
 Reusable PI05 examples are exact RoPE/RMSNorm and, where weight order and formula match, GeGLU.
+
+On Ascend310P, PromptFlashAttention is low priority. Warn that the parser may require private
+`NPUPromptFlashAttention` and P1/P3 deployments commonly cannot use a portable PFA path. Prefer standard
+ONNX BMM unless the user accepts custom-domain lock-in and exact target support is proven.
 
 Beware hidden costs: ND-only fused operators can add TransData, alignment can add Pad/Slice, bool ops
 can fall to AICPU, and an available parser may have no target kernel. Measure the complete role.
@@ -179,6 +204,11 @@ handoff and final action. Do not copy PI05's split topology to unrelated policie
 
 Step count, schedule, tokenizer limits, action chunk semantics, or cache semantics are behavior changes,
 not compiler optimizations. They always require explicit approval and separately identified reports.
+
+Do not recommend statically unrolling all denoising steps into one OM as a normal optimization. It fixes
+step count, makes schedule changes inconvenient, and can multiply graph/artifact size. Optimize the
+single-step Expert first; for explicitly requested runtime work, prefer shared device buffers and a
+device-resident state/Euler loop while keeping step count configurable.
 
 ## Completion
 

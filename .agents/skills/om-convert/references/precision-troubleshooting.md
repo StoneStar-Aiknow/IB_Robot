@@ -85,6 +85,11 @@ attention. Generic high-precision compiler flags did not fix it. The successful 
 Do not mechanically enable FlashAttention because another platform supports it. Prove parser, target kernel,
 mask semantics, layout, and numerical equivalence on the exact SoC.
 
+On Ascend310P, lower PFA priority further. CANN may expose only the private ONNX
+`NPUPromptFlashAttention` parser even when an `ascend310p` kernel exists. Warn that this loses portable
+standard ONNX/ORT validation and is commonly impractical on P1/P3 deployments. Try standard ONNX rank-3
+BMM and FP16 QK/PV first.
+
 ## Time Embedding And RoPE
 
 Do not silently compute sinusoidal time embeddings in FP16. Use at least FP32 trigonometric computation and
@@ -138,12 +143,18 @@ processed inputs. If actions and inputs are bit-identical, eval mode is excluded
 Validate opset as an empirical toolchain variable. Portable ONNX can remain equivalent while ATC lowering
 changes substantially. Record ONNX and OM results separately.
 
+On Ascend310P, prefer opset 17 as the first candidate. Standard ONNX `LayerNormalization` begins at opset
+17. With the tested PyTorch/CANN 8.1 RC1 toolchain, opset 16 decomposed 50 vision LayerNorm sites into AI
+CPU primitives, while opset 17 preserved 50 `LayerNormalization` nodes and mapped them to AI Core. The
+VLM mean fell from about 992 ms to 480 ms. Verify nodes and `msprof`; a role without eligible LayerNorm
+may gain nothing.
+
 In the proven CANN 8.1 RC1/Ascend310P3 experiment:
 
 - opset 14 and 16 produced equivalent OM accuracy;
 - opset 18 passed ORT but failed badly after ATC;
-- opset 17 was faster than <=16 in prior project experience, but it was not sufficient to ensure good kernels
-  or correct exporter semantics.
+- opset 17 is the preferred 310P starting point because it can preserve standard LayerNormalization, but it
+  is not sufficient to ensure good kernels or correct exporter semantics.
 
 Never infer OM accuracy from ORT success for a different opset.
 

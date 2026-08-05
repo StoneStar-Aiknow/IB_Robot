@@ -12,13 +12,13 @@ Use these 12 experience IDs for every run:
 |----|------------|
 | `E01` | Reuse an IB-Robot Torch-supported bundle, codec, processor, and vendored assets. |
 | `E02` | Persist one authoritative native-Torch target/observation/task/seed/noise package across all candidates. |
-| `E03` | Export a portable FP16 ONNX baseline with only correctness-required FP32 islands. |
+| `E03` | Prefer opset-17 portable FP16 ONNX on 310P, with only correctness-required FP32 islands. |
 | `E04` | Keep image resize, padding, and risky reshape logic on the host when ATC semantics are suspect. |
 | `E05` | Use `precision_mode_v2=origin|default` and investigate precision before approximating math. |
 | `E06` | Diagnose fusion-induced drift by compiling a no-fusion candidate. |
-| `E07` | Detect high-priority-library misses and correct dtype/layout/operator eligibility. |
-| `E08` | Eliminate exact glue, redundant materialization, and unnecessary host/device transfer. |
-| `E09` | Replace proven exact subgraphs with supported NPU fused operators. |
+| `E07` | Correct dtype/layout/operator eligibility, especially FP32 MatMul/BMM misses on 310P. |
+| `E08` | Eliminate exact glue and host transfer, including shared ACL buffers between serial OM roles. |
+| `E09` | Use fused operators only after parser/kernel proof; keep 310P PFA low priority. |
 | `E10` | Use `msprof` to rank measured bottlenecks before optimization. |
 | `E11` | Scan valid static shapes/tiling empirically rather than guessing. |
 | `E12` | Use explicit optional quantization only with representative real calibration data. |

@@ -29,6 +29,7 @@ Read only the references needed for the selected route:
 | Precision drift troubleshooting and proven fixes | `references/precision-troubleshooting.md` |
 | OM performance baseline | `references/benchmark.md` |
 | Optional optimization | `references/optimize.md` |
+| Ascend310P optimization patterns | `references/ascend310p-optimization.md` |
 | Experience accounting and final report | `references/experience-ledger.md` |
 
 Do not expose these references as separate skills.
@@ -200,6 +201,21 @@ evidence, ATC version, target, and resolution source.
 - Export ONNX in FP16 by default, retaining only explicit FP32 islands required for demonstrated
   correctness. Compile with `--precision_mode_v2=origin` by default. The only permitted
   `precision_mode_v2` values are `origin` and `default`; never use the legacy `precision_mode` option.
+- On Ascend310P, prefer ONNX opset 17 unless the installed exporter/ATC combination proves it invalid.
+  Verify that standard `LayerNormalization` nodes survive export and map to AI Core; opset <=16 may
+  decompose them into slow AI CPU primitives.
+- On Ascend310P, keep ONNX and OM end-to-end FP16 wherever accuracy permits. FP32 QK/PV and other
+  MatMul islands commonly miss high-priority kernels. Retain FP32 only for islands proven necessary by
+  final-action accuracy, such as sensitive masks, reductions, or Softmax.
+- Give PromptFlashAttention low priority on Ascend310P. Warn that P1/P3 deployments commonly cannot use
+  it through a portable ONNX path; the available parser may require private `NPUPromptFlashAttention`.
+  Prefer standard-ONNX BMM rewrites.
+- For serial OM roles, connect producer outputs directly to consumer inputs with shared ACL device
+  buffers, following the PI05 VLM-to-Action-Expert device-link pattern. Do not round-trip internal
+  handoff tensors through the host.
+- Do not recommend unrolling all denoising steps into one OM as a normal performance tactic. It fixes
+  step count, makes schedule changes inconvenient, and can multiply graph/artifact size. Optimize the
+  reusable single-step Expert and prefer a runtime-managed device loop when explicitly requested.
 - Quantization is never a default conversion step.
 - For a new policy, all exploratory source edits must occur in a dedicated worktree created according
   to `port-new-policy.md`.
