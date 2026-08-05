@@ -58,6 +58,29 @@ temporary bundles, tensor dumps, and large `msprof` payloads after extracting th
 the report. Check experiment size and file count regularly. Reports, hashes, source diffs, and
 reproduction commands are the durable record, not every binary candidate.
 
+## Requests For More Optimization Options
+
+Treat open-ended follow-ups such as "what else can we optimize?", "any other approach?", "还有什么优化方案",
+"还有没有其他方案", and "还有没有更多方案" as a request to audit unused experience, not as permission to
+invent an unbounded new ladder.
+
+Before answering or starting another candidate:
+
+1. reopen `reports/experience-ledger.json` and apply the experience gap review from
+   `experience-ledger.md`;
+2. compare every `not_evaluated` experience with the latest `msprof`, ATC warnings, graph structure,
+   exact SoC/toolchain, accuracy results, and weighted bottleneck;
+3. revisit `attempted_no_gain` and `not_applicable` only when recorded assumptions have materially
+   changed, and state the changed evidence;
+4. list remaining applicable experiences in ROI order with expected mechanism, evidence, accuracy risk,
+   approval requirement, and the experiment that would accept or reject each one;
+5. explicitly state when the catalog has no remaining evidence-backed candidate, then separate any new
+   speculative idea from accumulated experience.
+
+Do not merely repeat successful or rejected candidates. Do not silently expand scope into quantization,
+approximate math, shape-range changes, or algorithm changes; their existing approval gates still apply.
+Update the ledger after each newly evaluated candidate so a later follow-up uses current evidence.
+
 ## Optimization Ladder
 
 The order is evidence-driven. Skip a rung when profiling shows it is irrelevant.

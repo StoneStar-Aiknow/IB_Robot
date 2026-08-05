@@ -54,6 +54,34 @@ change, especially utilization-driven choices such as multi-camera batching betw
 Also report catalog coverage as `evaluated/12` so `1/1` cannot be mistaken for full experience
 coverage.
 
+## Experience Gap Review
+
+Run this review whenever the user asks for more, other, or alternative optimization approaches. Review
+all 12 entries instead of considering only the most recent experiments:
+
+1. collect `not_evaluated` entries and test their prerequisites against the current graph, profile, ATC
+   warnings, exact SoC, toolchain, and accepted accuracy constraints;
+2. keep applicable entries as remaining candidates and rank them by measured bottleneck share, expected
+   mechanism, implementation cost, accuracy risk, and approval requirements;
+3. retain `not_applicable` unless its recorded prerequisite evidence has changed;
+4. retain `attempted_no_gain` unless policy family, shape, dtype, compiler, exact SoC, or another recorded
+   assumption has changed;
+5. exclude `hit` from the remaining list unless profiling after that gain exposes a distinct follow-up
+   opportunity.
+
+Report the review before proposing experiments:
+
+```text
+Remaining experience-backed candidates: E07, E09
+Reconsidered because assumptions changed: E11 (new exact SoC)
+Still not applicable or no-gain: E04, E06
+No remaining catalog candidate: yes|no
+```
+
+For each remaining candidate, cite the evidence that makes it applicable and the smallest experiment
+that can reject it. If none remain, say so explicitly. New ideas may still be proposed, but label them
+`speculative` and do not count them as catalog experience until the catalog is intentionally revised.
+
 ## Entry Schema
 
 ```json

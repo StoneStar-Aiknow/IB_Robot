@@ -231,6 +231,11 @@ evidence, ATC version, target, and resolution source.
 - Apply the 10-second single-inference guard from `benchmark.md` before any repeated performance run.
 - Track which reusable experiences were evaluated and successfully applied through
   `experience-ledger.md`.
+- When the user asks for more or alternative optimization ideas, such as "what else can we optimize?",
+  "any other approach?", "还有什么优化方案", or "还有没有更多方案", do not answer from memory or repeat
+  the current ladder. Reopen `experience-ledger.md`, run its experience gap review against the current
+  profile and experiment results, and present the remaining applicable experiences before proposing new
+  speculative work. Preserve all hard approval gates.
 
 ## Default Stop Point
 
