@@ -1416,13 +1416,12 @@ robot:
         calib_file: "$(env HOME)/.calibrate/so101_leader_calibrate.json"
       - name: "phone_teleop"
         type: "phone"
-        control_frequency: 30.0
+        control_frequency: 50.0
         phone_config:
-          phone_os: "android" # android/ios
+          backend: "webphone"
           camera_offset: [0.0, -0.02, 0.04]
-          linear_scale: 2.0
           end_effector_bounds:
-            min: [-0.5, -0.5, 0.0]
+            min: [-0.5, -0.5, -0.5]
             max: [0.5, 0.5, 0.5]
           max_ee_step_m: 0.05
           gripper_speed_factor: 20.0

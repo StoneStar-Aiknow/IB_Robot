@@ -5,6 +5,7 @@ for integration with the robot_config launch system.
 """
 
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -15,6 +16,28 @@ from robot_config.logger_utils import get_colored_logger
 from robot_config.utils import prepare_lerobot_env, resolve_ros_path
 
 logger = get_colored_logger("robot_config.teleop")
+
+_PLACO_ENDPOINT_DEFAULTS = {
+    "linear_cmd_topic": "/so101_placo_servo_node/linear_cmd_base",
+    "angular_cmd_topic": "/so101_placo_servo_node/angular_cmd_base",
+    "pose_cmd_topic": "/so101_placo_servo_node/pose_cmd_base",
+    "start_service": "/so101_placo_servo_node/start",
+    "stop_service": "/so101_placo_servo_node/stop",
+    "home_action": "/so101_placo_servo_node/return_home",
+    "command_lease_topic": "/so101_placo_servo_node/command_lease",
+    "estop_topic": "/emergency_stop",
+    "command_out_topic": "/arm_position_controller/commands",
+}
+
+
+def _is_finite_number(value: object) -> bool:
+    """Return whether a YAML value is a finite real number, excluding booleans."""
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
 
 
 def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = None) -> list[Node]:
@@ -60,6 +83,10 @@ def generate_teleop_nodes(robot_config: dict, robot_description_dict: dict = Non
     if not teleop_config.get("enabled", False):
         logger.info("Teleoperation not enabled, skipping")
         return nodes
+
+    validation_errors = validate_teleop_config(teleop_config)
+    if validation_errors:
+        raise ConfigError("Invalid teleoperation configuration: " + "; ".join(validation_errors))
 
     active_device_names = teleop_config.get("active_devices")
     if active_device_names:
@@ -190,8 +217,8 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
     device_param["tool_frame"] = cart_tool_frame
     device_param["base_link_name"] = device_param.get("base_link_name", moveit_cfg.get("base_link", "base"))
 
+    placo_cfg = cart_cfg.get("placo_servo", {}) or {}
     if cart_solver == "placo_servo":
-        placo_cfg = cart_cfg.get("placo_servo", {}) or {}
         placo_linear_speed = placo_cfg.get("linear_speed", 0.3)
         placo_angular_speed = placo_cfg.get("angular_speed", 0.7)
         cp = device_param.setdefault("control_params", {})
@@ -206,6 +233,21 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
     device_type = device_config.get("type", "")
 
     control_frequency = device_config.get("control_frequency", 50.0)
+    phone_input_mode = None
+    if device_type == "phone":
+        phone_cfg = device_config.get("phone_config", {}) or {}
+        phone_backend = str(phone_cfg.get("backend", "webphone")).lower()
+        if phone_backend != "webphone":
+            raise ValueError("phone_config.backend must be 'webphone'")
+        phone_input_mode = "pose"
+        legacy_input_mode = phone_cfg.get("input_mode")
+        if legacy_input_mode is not None and str(legacy_input_mode).lower() != phone_input_mode:
+            raise ValueError(
+                f"phone_config.input_mode={legacy_input_mode!r} is no longer supported for "
+                "WebPhone; phone teleoperation uses the fixed 'pose' contract"
+            )
+        if cart_solver != "placo_servo":
+            raise ValueError("Phone teleoperation requires teleoperation.cartesian.solver=placo_servo")
 
     if device_type == "joy_teleop":
         return _create_joy_teleop_nodes(device_config)
@@ -223,6 +265,29 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
     # Prepare lerobot environment
     env = prepare_lerobot_env()
 
+    # Resolve the Placo runtime contract once, then inject the same topic/service
+    # names into both the device-side backend and the downstream solver node.
+    resolved_placo_params = None
+    if cart_solver == "placo_servo" and device_type == "phone":
+        position_only_override = placo_cfg.get("position_only")
+        if "position_only" in phone_cfg:
+            logger.warning(
+                "phone_config.position_only is deprecated; use teleoperation.cartesian.placo_servo.position_only"
+            )
+            position_only_override = phone_cfg["position_only"]
+        resolved_placo_params = _resolve_so101_placo_servo_params(
+            robot_config,
+            arm_joint_names=arm_joint_names,
+            command_out_topic=target_config.get("arm_command_topic"),
+            input_mode=phone_input_mode,
+            position_only=position_only_override,
+            require_complete_contract=True,
+        )
+        resolved_placo_params["command_lease_timeout_s"] = float(
+            (phone_cfg.get("web", {}) or {}).get("command_stale_s", 0.18)
+        )
+        device_param["cartesian_backend_config"] = _placo_backend_config(resolved_placo_params)
+
     # Convert dicts to JSON strings for ROS 2 parameter passing
     device_param_json = json.dumps(device_param)
     joint_limits_json = json.dumps(joint_limits)
@@ -231,23 +296,17 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
 
     moveit_config = robot_config.get("moveit", {})
 
-    # For phone devices: inject extra params into device_config so PhoneDevice
-    # can read arm/gripper joint names, home positions, and servo frame at runtime.
     if device_type == "phone":
         base_link_name = device_param.get("base_link_name", moveit_config.get("base_link", "base_link"))
-        reset_positions = robot_config.get("ros2_control", {}).get("reset_positions", {})
-        home_positions_list = [reset_positions.get(n, 0.0) for n in arm_joint_names]
 
         device_param_ext = dict(device_param)
         device_param_ext.update(
             {
-                "home_joint_positions": home_positions_list,
                 "base_link_name": base_link_name,
-                "control_frequency": 50.0,
+                "control_frequency": control_frequency,
             }
         )
         device_param_json = json.dumps(device_param_ext)
-        control_frequency = 50.0
 
     node_name = "robot_teleop_node"
     if device_config.get("name"):
@@ -270,6 +329,7 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
                 "gripper_command_topic": target_config.get(
                     "gripper_command_topic", "/gripper_position_controller/commands"
                 ),
+                "estop_topic": safety_config.get("estop_topic", "/emergency_stop"),
             }
         ],
     )
@@ -304,7 +364,13 @@ def _generate_device_nodes(robot_config: dict, device_config: dict, robot_descri
             nodes.append(servo_node)
             logger.info("Generated servo_node for Cartesian servo (MoveIt Servo) control")
         elif cart_solver == "placo_servo":
-            placo_node = _create_so101_placo_servo_node(robot_config, device_config, robot_description_dict)
+            placo_node = _create_so101_placo_servo_node(
+                robot_config,
+                device_config,
+                robot_description_dict,
+                input_mode=phone_input_mode if device_type == "phone" else None,
+                resolved_params=resolved_placo_params,
+            )
             nodes.append(placo_node)
             logger.info("Generated so101_placo_servo_node for SO101 Placo QP Cartesian control")
 
@@ -382,22 +448,15 @@ def _generate_vr_teleop_nodes(
     # to match every other teleop device; accept it there as the default and
     # still allow a vr_config override. Reading only vr_config.control_frequency
     # silently ignored the device-layer value.
-    control_frequency = float(
-        vr_cfg.get("control_frequency", device_config.get("control_frequency", 50.0))
-    )
+    control_frequency = float(vr_cfg.get("control_frequency", device_config.get("control_frequency", 50.0)))
 
-    # Resolve the placo start/stop/home service names ONCE (with defaults) so
+    # Resolve the Placo start/stop services and Home action ONCE so
     # both the VR node and the placo node below are wired to the same names.
     # A user override of any of these in vr_config must reach BOTH sides.
-    so101_start_service = vr_cfg.get(
-        "so101_start_service", "/so101_placo_servo_node/start"
-    )
-    so101_stop_service = vr_cfg.get(
-        "so101_stop_service", "/so101_placo_servo_node/stop"
-    )
-    so101_home_service = vr_cfg.get(
-        "so101_home_service", "/so101_placo_servo_node/home"
-    )
+    so101_start_service = vr_cfg.get("so101_start_service", "/so101_placo_servo_node/start")
+    so101_stop_service = vr_cfg.get("so101_stop_service", "/so101_placo_servo_node/stop")
+    so101_home_action = vr_cfg.get("so101_home_action", "/so101_placo_servo_node/return_home")
+    safety_cfg = (robot_config.get("teleoperation", {}) or {}).get("safety", robot_config.get("safety", {}) or {})
 
     # Downstream placo wiring (overridable via vr_config). base/tool frames come
     # from the shared cartesian SSOT so the tool→base angular conversion inside
@@ -410,18 +469,13 @@ def _generate_vr_teleop_nodes(
         "controller_side": vr_cfg.get("controller_side", "right"),
         "base_link_name": vr_cfg.get("base_link_name", base_link_name),
         "tool_frame": vr_cfg.get("tool_frame", tool_frame),
-        "so101_linear_topic": vr_cfg.get(
-            "so101_linear_topic", "/so101_placo_servo_node/linear_cmd_base"
-        ),
-        "so101_angular_topic": vr_cfg.get(
-            "so101_angular_topic", "/so101_placo_servo_node/angular_cmd_base"
-        ),
-        "so101_gripper_topic": vr_cfg.get(
-            "so101_gripper_topic", "/gripper_position_controller/commands"
-        ),
+        "so101_linear_topic": vr_cfg.get("so101_linear_topic", "/so101_placo_servo_node/linear_cmd_base"),
+        "so101_angular_topic": vr_cfg.get("so101_angular_topic", "/so101_placo_servo_node/angular_cmd_base"),
+        "so101_gripper_topic": vr_cfg.get("so101_gripper_topic", "/gripper_position_controller/commands"),
         "so101_start_service": so101_start_service,
         "so101_stop_service": so101_stop_service,
-        "so101_home_service": so101_home_service,
+        "so101_home_action": so101_home_action,
+        "estop_topic": safety_cfg.get("estop_topic", "/emergency_stop"),
         "so101_input_mode": so101_input_mode,
         "so101_pose_topic": so101_pose_topic,
     }
@@ -441,7 +495,6 @@ def _generate_vr_teleop_nodes(
         "position_scale",
         "so101_position_only",
         "so101_command_stale_s",
-        "so101_home_settle_s",
     }
     for key in _passthrough:
         if key in vr_cfg:
@@ -463,8 +516,7 @@ def _generate_vr_teleop_nodes(
     if output_profile == "so101":
         if cart_solver != "placo_servo":
             raise ValueError(
-                "vr_teleop output_profile=so101 requires cartesian.solver="
-                f"'placo_servo', got {cart_solver!r}"
+                f"vr_teleop output_profile=so101 requires cartesian.solver='placo_servo', got {cart_solver!r}"
             )
         placo_node = _create_so101_placo_servo_node(
             robot_config,
@@ -474,13 +526,10 @@ def _generate_vr_teleop_nodes(
             pose_cmd_topic=so101_pose_topic,
             start_service=so101_start_service,
             stop_service=so101_stop_service,
-            home_service=so101_home_service,
+            home_action=so101_home_action,
         )
         nodes.append(placo_node)
-        logger.info(
-            f"Generated so101_placo_servo_node for VR so101 Cartesian control "
-            f"(input_mode={so101_input_mode})"
-        )
+        logger.info(f"Generated so101_placo_servo_node for VR so101 Cartesian control (input_mode={so101_input_mode})")
 
     return nodes
 
@@ -586,23 +635,36 @@ def _validate_tool_frame(tool_frame: str, robot_config: dict) -> None:
     )
 
 
-def _create_so101_placo_servo_node(
-    robot_config: dict,
-    device_config: dict,  # noqa: ARG001 — kept for signature parity with siblings
-    robot_description_dict: dict = None,
-    *,
-    input_mode: str = None,
-    pose_cmd_topic: str = None,
-    start_service: str = None,
-    stop_service: str = None,
-    home_service: str = None,
-) -> Node:
-    """Launch ``so101_placo_servo_node``.
+def _placo_backend_config(params: dict) -> dict[str, str]:
+    """Translate resolved solver parameter names to backend constructor keys."""
+    return {
+        "linear_topic": params["linear_cmd_topic"],
+        "angular_topic": params["angular_cmd_topic"],
+        "pose_topic": params["pose_cmd_topic"],
+        "start_srv": params["start_service"],
+        "stop_srv": params["stop_service"],
+        "home_action": params["home_action"],
+        "command_lease_topic": params["command_lease_topic"],
+    }
 
-    Loads the solver YAML from ``moveit.so101_placo_servo_config_path`` and
-    appends arm joint names from ``robot.joints.arm`` so the node knows the
-    controller output order.
-    """
+
+def _resolve_so101_placo_servo_params(
+    robot_config: dict,
+    *,
+    arm_joint_names: list[str] | None = None,
+    command_out_topic: str | None = None,
+    input_mode: str | None = None,
+    linear_cmd_topic: str | None = None,
+    angular_cmd_topic: str | None = None,
+    pose_cmd_topic: str | None = None,
+    start_service: str | None = None,
+    stop_service: str | None = None,
+    home_action: str | None = None,
+    command_lease_topic: str | None = None,
+    position_only: bool | None = None,
+    require_complete_contract: bool = False,
+) -> dict:
+    """Resolve Placo parameters, optionally requiring Phone's full endpoint contract."""
     import yaml as _yaml
 
     moveit_cfg = robot_config.get("moveit", {}) or {}
@@ -615,15 +677,24 @@ def _create_so101_placo_servo_node(
     yaml_path = resolve_ros_path(yaml_ref)
     with open(yaml_path) as f:
         params = _yaml.safe_load(f) or {}
+    missing_endpoints = [key for key in _PLACO_ENDPOINT_DEFAULTS if not params.get(key)]
+    if require_complete_contract and missing_endpoints:
+        raise ConfigError(
+            "Placo solver config must define the complete topic/service contract; missing: "
+            + ", ".join(missing_endpoints)
+        )
 
-    joints_cfg = robot_config.get("joints", {}) or {}
-    arm_joint_names = joints_cfg.get("arm", [])
+    if arm_joint_names is None:
+        joints_cfg = robot_config.get("joints", {}) or {}
+        arm_joint_names = joints_cfg.get("arm", [])
     if not arm_joint_names:
         raise ConfigError(
-            "solver=placo_servo requires robot.joints.arm to list the arm "
+            "solver=placo_servo requires the selected target to list arm "
             "joint names (used to order the position command output)"
         )
-    params["arm_joint_names"] = arm_joint_names
+    params["arm_joint_names"] = list(arm_joint_names)
+    if command_out_topic is not None:
+        params["command_out_topic"] = command_out_topic
 
     # Drop-in TCP support: the IK tip frame is the SSOT moveit.ee_link
     # (gripper | tcp). Inject it so selecting tcp re-targets placo's frame
@@ -633,41 +704,94 @@ def _create_so101_placo_servo_node(
     if ee_link:
         params["ik_link_name"] = ee_link
 
-    # VR pose passthrough: when the caller (VR builder) selects pose mode, override
-    # the servo node's input_mode and pose topic to match vr_config — single
-    # source of truth. Left as the YAML default ("velocity") for xbox/phone.
     if input_mode is not None:
         params["input_mode"] = input_mode
+    if linear_cmd_topic is not None:
+        params["linear_cmd_topic"] = linear_cmd_topic
+    if angular_cmd_topic is not None:
+        params["angular_cmd_topic"] = angular_cmd_topic
     if pose_cmd_topic is not None:
         params["pose_cmd_topic"] = pose_cmd_topic
 
-    # Service names MUST match whatever the VR node was told to call. The VR
-    # builder resolves these from vr_config (with the same defaults) and passes
-    # them here so a user override of so101_start/stop/home_service re-targets
-    # BOTH nodes. Forwarding only to the VR node (as before) left placo serving
-    # the default names while VR called the overridden ones — the handshake and
-    # the deadman stop would silently miss.
     if start_service is not None:
         params["start_service"] = start_service
     if stop_service is not None:
         params["stop_service"] = stop_service
-    if home_service is not None:
-        params["home_service"] = home_service
+    if home_action is not None:
+        params["home_action"] = home_action
+    if command_lease_topic is not None:
+        params["command_lease_topic"] = command_lease_topic
+    if position_only is not None:
+        params["position_only"] = position_only
+    teleop_safety = (robot_config.get("teleoperation", {}) or {}).get("safety", robot_config.get("safety", {}) or {})
+    params["estop_topic"] = teleop_safety.get("estop_topic", "/emergency_stop")
+    invalid_endpoints = [
+        key
+        for key in _PLACO_ENDPOINT_DEFAULTS
+        if key in params and (not isinstance(params[key], str) or not params[key].strip())
+    ]
+    if invalid_endpoints:
+        raise ConfigError("Placo topic/service names must be non-empty strings: " + ", ".join(invalid_endpoints))
 
-    # Home pose for the B-button go-home service: inject the EE pose from
-    # embodied.named_poses.home (base frame). The placo node drives the EE here
-    # smoothly when its home service is called. Absent/malformed => left as the
-    # YAML default (zeros), which the node treats as "home disabled".
-    named_poses = ((robot_config.get("embodied", {}) or {}).get("named_poses", {}) or {})
-    home_pose = named_poses.get("home", {}) or {}
-    hp = home_pose.get("position") or {}
-    ho = home_pose.get("orientation") or {}
-    if hp and ho:
-        params["home_position"] = [float(hp.get("x", 0.0)), float(hp.get("y", 0.0)), float(hp.get("z", 0.0))]
-        params["home_orientation"] = [
-            float(ho.get("x", 0.0)), float(ho.get("y", 0.0)),
-            float(ho.get("z", 0.0)), float(ho.get("w", 1.0)),
-        ]
+    reset_positions = robot_config.get("ros2_control", {}).get("reset_positions", {}) or {}
+    if not isinstance(reset_positions, dict):
+        raise ConfigError("ros2_control.reset_positions must be a mapping")
+    missing_home_joints = [name for name in arm_joint_names if name not in reset_positions]
+    if missing_home_joints:
+        raise ConfigError(
+            "ros2_control.reset_positions is missing arm joint target(s) required by Placo ArmReturnHome; "
+            f"missing: {', '.join(missing_home_joints)}"
+        )
+    home_joint_positions = [reset_positions[name] for name in arm_joint_names]
+    invalid_home_joints = [
+        name
+        for name, position in zip(arm_joint_names, home_joint_positions, strict=True)
+        if not _is_finite_number(position)
+    ]
+    if invalid_home_joints:
+        raise ConfigError(
+            "ros2_control.reset_positions must contain a finite number for every Placo ArmReturnHome arm joint; "
+            f"invalid: {', '.join(invalid_home_joints)}"
+        )
+    params["home_joint_positions"] = [float(position) for position in home_joint_positions]
+    return params
+
+
+def _create_so101_placo_servo_node(
+    robot_config: dict,
+    device_config: dict,
+    robot_description_dict: dict = None,
+    *,
+    input_mode: str = None,
+    pose_cmd_topic: str = None,
+    start_service: str = None,
+    stop_service: str = None,
+    home_action: str = None,
+    position_only: bool | None = None,
+    resolved_params: dict | None = None,
+) -> Node:
+    """Launch ``so101_placo_servo_node`` from a resolved shared contract."""
+    target_config = device_config.get("target", {}) or {}
+    joints_config = robot_config.get("joints", {}) or {}
+    selected_arm_joint_names = target_config.get("arm_joint_names", joints_config.get("arm", []))
+    params = (
+        dict(resolved_params)
+        if resolved_params is not None
+        else _resolve_so101_placo_servo_params(
+            robot_config,
+            arm_joint_names=selected_arm_joint_names,
+            command_out_topic=target_config.get("arm_command_topic"),
+            input_mode=input_mode,
+            linear_cmd_topic=None,
+            angular_cmd_topic=None,
+            pose_cmd_topic=pose_cmd_topic,
+            start_service=start_service,
+            stop_service=stop_service,
+            home_action=home_action,
+            command_lease_topic=None,
+            position_only=position_only,
+        )
+    )
 
     # The node expands the so101 xacro in-memory at runtime via the
     # robot_description package share dir, so robot_description_dict is not
@@ -723,8 +847,63 @@ def validate_teleop_config(teleop_config: dict[str, object]) -> list[str]:
     else:
         errors.append("active_device or active_devices must be specified when teleoperation is enabled")
         return errors
+    if not all(isinstance(name, str) and name for name in active_device_names):
+        errors.append("active_device names must be non-empty strings")
+        return errors
 
     devices_by_name = {device.get("name"): device for device in devices}
+    if len(set(active_device_names)) != len(active_device_names):
+        errors.append("active_devices must not contain duplicate device names")
+    cartesian_devices = []
+    command_topic_owners: dict[str, dict[str, list[str]]] = {"arm": {}, "gripper": {}}
+    for name in active_device_names:
+        device = devices_by_name.get(name) or {}
+        device_type = device.get("type")
+        if (
+            device_type in ("phone", "xbox_controller")
+            or device_type == "vr_teleop"
+            and (device.get("vr_config", {}) or {}).get("output_profile", "humanoid") == "so101"
+        ):
+            cartesian_devices.append(name)
+        commands_so101 = device_type in ("leader_arm", "phone", "xbox_controller") or (
+            device_type == "vr_teleop"
+            and (device.get("vr_config", {}) or {}).get("output_profile", "humanoid") == "so101"
+        )
+        if commands_so101:
+            target = device.get("target", {}) or {}
+            if not isinstance(target, dict):
+                target = {}
+            if device_type == "vr_teleop":
+                vr_config = device.get("vr_config", {}) or {}
+                topics = {
+                    "arm": "/arm_position_controller/commands",
+                    "gripper": vr_config.get("so101_gripper_topic", "/gripper_position_controller/commands"),
+                }
+            else:
+                topics = {
+                    "arm": target.get("arm_command_topic", "/arm_position_controller/commands"),
+                    "gripper": target.get("gripper_command_topic", "/gripper_position_controller/commands"),
+                }
+            for controller, topic in topics.items():
+                if isinstance(topic, str) and topic.strip():
+                    command_topic_owners[controller].setdefault(topic, []).append(name)
+    if len(cartesian_devices) > 1:
+        errors.append(
+            f"only one active SO-101 Cartesian device is currently supported; selected: {', '.join(cartesian_devices)}"
+        )
+    for controller, topic_owners in command_topic_owners.items():
+        for topic, owners in topic_owners.items():
+            if len(owners) > 1:
+                errors.append(
+                    f"active devices share {controller} command topic {topic!r}: {', '.join(owners)}; "
+                    f"only one controller may own a {controller} command topic"
+                )
+
+    cartesian = teleop_config.get("cartesian", {}) or {}
+    placo_config = cartesian.get("placo_servo", {}) or {}
+    if "position_only" in placo_config and not isinstance(placo_config["position_only"], bool):
+        errors.append("teleoperation.cartesian.placo_servo.position_only must be a boolean")
+    requires_joint_limits = False
     for active_device_name in active_device_names:
         device = devices_by_name.get(active_device_name)
         if not device:
@@ -732,25 +911,111 @@ def validate_teleop_config(teleop_config: dict[str, object]) -> list[str]:
             continue
 
         # Validate device type
-        if not device.get("type"):
+        device_type = device.get("type")
+        if not device_type:
             errors.append(f"Device '{active_device_name}': missing 'type' field")
+        elif device_type not in ("joy_teleop", "vr_teleop"):
+            requires_joint_limits = True
 
         # Type-specific validation
-        if device.get("type") == "leader_arm" and not device.get("port"):
+        if device_type == "leader_arm" and not device.get("port"):
             errors.append(f"Device '{active_device_name}': leader_arm requires 'port' field")
 
-        if device.get("type") == "phone":
+        if device_type == "phone":
             phone_config = device.get("phone_config", {})
             if not phone_config:
                 errors.append(f"Device '{active_device_name}': phone requires 'phone_config' field")
+                continue
+            backend = str(phone_config.get("backend", "webphone")).lower()
+            if backend != "webphone":
+                errors.append(f"Device '{active_device_name}': phone backend must be 'webphone'")
+            control_frequency = device.get("control_frequency", 50.0)
+            control_frequency_valid = _is_finite_number(control_frequency) and control_frequency > 0
+            if not control_frequency_valid:
+                errors.append(f"Device '{active_device_name}': control_frequency must be finite and positive")
+
+            input_mode = "pose"
+            legacy_input_mode = phone_config.get("input_mode")
+            if "position_only" in phone_config and not isinstance(phone_config["position_only"], bool):
+                errors.append(f"Device '{active_device_name}': legacy phone_config.position_only must be a boolean")
+            if legacy_input_mode is not None and str(legacy_input_mode).lower() != input_mode:
+                errors.append(
+                    f"Device '{active_device_name}': phone_config.input_mode={legacy_input_mode!r} is not supported "
+                    f"for WebPhone; expected {input_mode!r}"
+                )
+            if cartesian.get("solver", "placo_servo") != "placo_servo":
+                errors.append(f"Device '{active_device_name}': phone teleoperation requires solver=placo_servo")
+            bounds = phone_config.get(
+                "end_effector_bounds",
+                {"min": [-0.5, -0.5, -0.5], "max": [0.5, 0.5, 0.5]},
+            )
+            bounds_min = bounds.get("min") if isinstance(bounds, dict) else None
+            bounds_max = bounds.get("max") if isinstance(bounds, dict) else None
+            bounds_are_valid = (
+                isinstance(bounds_min, list | tuple)
+                and isinstance(bounds_max, list | tuple)
+                and len(bounds_min) == 3
+                and len(bounds_max) == 3
+                and all(_is_finite_number(value) for value in (*bounds_min, *bounds_max))
+                and all(minimum < 0.0 < maximum for minimum, maximum in zip(bounds_min, bounds_max, strict=True))
+            )
+            if not bounds_are_valid:
+                errors.append(
+                    f"Device '{active_device_name}': phone end_effector_bounds must contain zero "
+                    "strictly inside every axis (min < 0 < max)"
+                )
+            web = phone_config.get("web", {})
+            if not isinstance(web, dict):
+                errors.append(f"Device '{active_device_name}': phone_config.web must be a mapping")
+                continue
+            ar_enabled = web.get("ar_enabled", True)
+            optical_fallback = phone_config.get("optical_flow_fallback_enabled", True)
+            if not isinstance(ar_enabled, bool):
+                errors.append(f"Device '{active_device_name}': phone_config.web.ar_enabled must be a boolean")
+            if not isinstance(optical_fallback, bool):
+                errors.append(
+                    f"Device '{active_device_name}': phone_config.optical_flow_fallback_enabled must be a boolean"
+                )
+            if ar_enabled is False and optical_fallback is False:
+                errors.append(f"Device '{active_device_name}': WebPhone requires WebXR AR or optical-flow fallback")
+            http_port = web.get("http_port", 8765)
+            websocket_port = web.get("websocket_port", 8766)
+            for field, port in (("http_port", http_port), ("websocket_port", websocket_port)):
+                if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+                    errors.append(f"Device '{active_device_name}': phone_config.web.{field} is invalid")
+            if http_port == websocket_port:
+                errors.append(f"Device '{active_device_name}': WebPhone ports must differ")
+            stale_s = web.get("command_stale_s", 0.18)
+            if not _is_finite_number(stale_s) or stale_s <= 0:
+                errors.append(
+                    f"Device '{active_device_name}': phone_config.web.command_stale_s must be finite and positive"
+                )
+            elif control_frequency_valid:
+                stop_latency_s = float(stale_s) + 1.0 / float(control_frequency)
+                if stop_latency_s > 0.22 + 1e-9:
+                    errors.append(
+                        f"Device '{active_device_name}': WebPhone stop-request latency bound "
+                        f"command_stale_s + one control period is {stop_latency_s:.3f}s, exceeding 0.220s"
+                    )
+            tls = web.get("tls", {})
+            if not isinstance(tls, dict):
+                errors.append(f"Device '{active_device_name}': phone_config.web.tls must be a mapping")
+            elif tls.get("enabled", True):
+                cert_file = tls.get("cert_file")
+                key_file = tls.get("key_file")
+                if bool(cert_file) != bool(key_file):
+                    errors.append(f"Device '{active_device_name}': WebPhone TLS cert_file/key_file must be paired")
 
     # Validate safety config
     safety = teleop_config.get("safety", {})
     joint_limits = safety.get("joint_limits", {})
+    estop_topic = safety.get("estop_topic", "/emergency_stop")
+    if not isinstance(estop_topic, str) or not estop_topic.strip():
+        errors.append("safety.estop_topic must be a non-empty string")
 
-    if not joint_limits:
-        errors.append("safety.joint_limits not specified (recommended for safe operation)")
-    else:
+    if requires_joint_limits and not joint_limits:
+        errors.append("safety.joint_limits must be specified for teleoperation")
+    elif joint_limits:
         # Validate joint limit format
         for joint_name, limits in joint_limits.items():
             if "min" not in limits or "max" not in limits:

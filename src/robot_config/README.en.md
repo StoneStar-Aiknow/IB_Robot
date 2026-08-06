@@ -198,6 +198,60 @@ robot:
         calib_file: "$(env HOME)/.calibrate/so101_leader_calibrate.json"
 ```
 
+`active_devices` may still combine independent leader/joint inputs. The current
+`target.arm_command_topic` and `target.gripper_command_topic` together define the
+controller-ownership boundary: every active device must exclusively own both topics
+that it actually publishes. Launch validation rejects sharing either topic. SO-101
+VR takes its gripper topic from `vr_config.so101_gripper_topic`, while its Placo arm
+output currently uses `/arm_position_controller/commands`. Multi-arm configurations
+must therefore separate both arm and gripper topics, not only the arm topic.
+The current
+SO-101 Placo path is one execution resource per target arm, so a launch may select
+at most one Phone, SO-101 VR, or Xbox Cartesian input.
+
+Phone devices use only the built-in WebPhone transport; when specified,
+`phone_config.backend` must be `webphone`. HTTPS/WSS
+ports, TLS files, and `command_stale_s` live under `phone_config.web`. The launch
+builder validates ports, timeout, and certificate/key pairing, and preserves the
+device-level `control_frequency` when constructing the teleop node.
+WebPhone also requires `command_stale_s + 1 / control_frequency <= 0.22s`.
+This bounds stale detection and stop-request dispatch, not the arm's physical
+stopping time. The stale timeout defaults to 0.18 seconds; a 50 Hz device may
+explicitly use 0.2 seconds.
+WebPhone uses the Placo clutch-relative pose contract. The browser supplies either
+WebXR AR poses or optical-flow virtual poses when WebXR is unavailable. Neither
+tracking path differentiates pose into velocity. Phone therefore requires `teleoperation.cartesian.solver:
+placo_servo` and has no velocity-mode switch. A matching legacy `input_mode: pose`
+remains readable, while `velocity` fails before launch. Because Phone commands are
+relative to the clutch baseline, every `end_effector_bounds` axis must satisfy
+`min < 0 < max`.
+The Phone Placo path reads `position_only` from
+`teleoperation.cartesian.placo_servo.position_only`. The launch builder passes the
+resolved setting to the Phone Placo path. Teleop Home has one target source:
+`ros2_control.reset_positions`, validated and injected in selected-arm joint order.
+Phone and SO-101 VR call the same `/so101_placo_servo_node/return_home` action. Its
+terminal result requires fresh `/joint_states` samples to remain within the maximum
+joint-error tolerance; it does not use a Cartesian named pose, status topic, or fixed
+settle delay. The
+launch builder also injects `command_stale_s` as a Phone-only Placo command lease;
+the YAML default keeps that lease disabled for VR/Xbox. Phone refreshes the lease
+only after a valid command is obtained for the current cycle or
+while a controlled Home is active. Empty input and SDK/conversion failures cannot use
+process liveness as a substitute for a valid command. Home requires finite
+`reset_positions` for every selected arm joint and values inside the Placo joint limits.
+Phone launch rejects MoveIt Servo because the Phone contract is pose-only and Home
+is owned by Placo. After any Home terminal result the
+operator must release and re-press deadman; the gripper holds its last target while Home
+runs. The launch builder also injects `safety.estop_topic` into both Placo and the
+standalone VR node, preserving `E-stop > Home/start/pose/twist` without relying on
+TeleopNode to relay the stop. Phone pose mode must also
+enable at least one tracking source: WebXR AR or optical flow.
+
+WebPhone has no account authentication and is supported only on a trusted internal
+network. Origin and single-client checks do not establish operator identity. Do
+not use public forwarding, reverse/cloud tunnels, guest Wi-Fi, or untrusted VPNs;
+restrict HTTP/WSS access to the robot control subnet and stop the service when idle.
+
 **Launch command:**
 ```bash
 # Teleop mode (with auto recording)

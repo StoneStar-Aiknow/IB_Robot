@@ -26,7 +26,7 @@ graph TB
         LA[Leader Arm<br/>Serial]
         XB[Xbox Controller<br/>/joy topic]
         CUSTOM[Custom Device<br/>register_device()]
-        PH[Phone<br/>iOS HEBI / Android WebXR]
+        PH[Phone<br/>Built-in WebPhone]
     end
     
     subgraph Device["Device Abstraction Layer"]
@@ -117,9 +117,9 @@ classDiagram
     }
 
     class PhoneDevice {
-        -_backend: BasePhone
-        -_calib_pos: ndarray
-        -_calib_rot_inv: Rotation
+        -_phone_impl: WebPhone
+        -_pose_clutch_pos: ndarray
+        -_pose_clutch_rot: Rotation
         +connect() bool
         +get_joint_targets() Dict
         +disconnect()
@@ -132,8 +132,7 @@ classDiagram
     LeaderArmDevice ..> FeetechMotorsBus : serial communication
     XboxTeleopDevice ..> Joy : /joy topic
     XboxTeleopDevice ..> CartesianBackend : Cartesian mode
-    PhoneDevice ..> IOSPhone : HEBI SDK
-    PhoneDevice ..> AndroidPhone : WebXR WS
+    PhoneDevice ..> WebPhone : browser pose over HTTPS/WSS
 ```
 
 ### Core Design Patterns
@@ -259,7 +258,212 @@ class BaseTeleopDevice(ABC):
 - **Open-Closed Principle**: Open for extension, closed for modification
 - **Dependency Inversion**: TeleopNode depends on abstraction, not concrete implementation
 
-#### 3. SafetyFilter (Safety Filter)
+#### 3. PhoneDevice (WebPhone)
+
+`PhoneDevice` uses the repository's built-in WebPhone transport. WebXR AR and the
+optical-flow fallback are two mutually exclusive browser tracking sources; both
+route a clutch-relative 6DoF pose through `placo_servo`.
+
+WebPhone reuses the VR/Placo clutch-relative pose contract. Position is
+a base-frame displacement and orientation is `R_current * R_clutch^-1` remapped
+with a similarity transform. PhoneDevice waits for the Placo start response,
+then latches the current phone pose and publishes identity as the first frame.
+Phone no longer supports velocity input and does not differentiate tracked poses
+only for Placo to integrate them again.
+When `optical_flow_fallback_enabled=true`, the browser applies each reliable visual
+frame displacement exactly once to a complete virtual 6DoF pose and publishes it
+through the same Placo pose backend. Switching AR/optical-flow while held fails
+closed and requires a release followed by a new press.
+
+WebPhone serves the installed browser page over HTTPS and accepts one WSS control
+client on a trusted LAN. Releasing the motion area outputs zero immediately. A
+disconnect or command gap longer than `web.command_stale_s` disables the Cartesian
+backend and retries Placo stop until it is acknowledged; enable/home stay blocked
+while stop is pending. The same timeout enables a Phone-only Placo command lease,
+so Placo disables itself if the Phone control loop stalls or exits. Phone refreshes
+that lease only after obtaining a valid command for the current cycle or while a
+controlled Home is active. An empty pose, transport failure, or command-conversion failure
+immediately disables the backend, clears baselines/filters, and revokes deadman;
+recovery requires a live released frame followed by a new press. The same rule
+applies after Home or emergency stop. The WebPhone Home button releases the page
+deadman immediately; keep it released during Home and the first new press after
+completion can take over. Go-Home is available only with Placo: Phone sends the shared
+`ArmReturnHome` action, Placo interpolates the arm to `ros2_control.reset_positions`,
+and the terminal result requires fresh measured JointState error to remain stable.
+Phone rejects MoveIt Servo because its relative-pose and Home contracts require
+Placo. Phone takeover stays gated until the action terminal result. If the user
+presses early during Home, another release/re-press is still required; the gripper
+holds its last target while Home runs.
+
+Safety state flow:
+
+```text
+valid command / controlled Home -> refresh Placo lease
+empty pose / transport or conversion failure / stale -> stop/disable -> clear baseline -> revoke deadman -> release then re-press
+Placo ArmReturnHome -> SSOT reset_positions -> fresh stable JointState arrival, or cancel/stale/stop/timeout failure
+```
+Before AR or camera tracking starts, the page sends a safe heartbeat with
+`trackingMode=disabled` and `move=false`. This keeps gripper and Go-Home controls
+available but cannot command arm motion.
+The WebSocket accepts browser origins only when the page and socket host match and
+the origin uses the configured HTTP(S) port. Three.js and the optical-flow worker
+are installed locally; the control page does not require a public CDN. A large AR
+translation or rotation discontinuity invalidates the frame, stops Placo, and
+requires release/re-press before a new pose baseline can be latched.
+The page fails closed when `/api/config` cannot be loaded instead of guessing a
+port or protocol. Disabled or unsupported binary protocol frames close the
+offending client and release single-client ownership.
+Binary protocol v1 retains its velocity slots to preserve the frame layout, but
+the page writes zeros and the server never produces a WebPhone velocity command.
+
+> ⚠️ **Deployment security boundary**: WebPhone has no account or user
+> authentication. Origin checks and the single-client rule reduce accidental
+> browser connections and control contention, but do not establish operator
+> identity. Use it only on a trusted internal lab/home network. Never expose its
+> ports through public forwarding, reverse/cloud tunnels, guest Wi-Fi, or an
+> untrusted VPN. Prefer a dedicated control VLAN/SSID and restrict HTTP/WSS access
+> to the robot control subnet with host or network firewalls. Keep HTTPS, the
+> deadman, stale watchdog, and emergency stop enabled, and stop the service when
+> teleoperation is not in use.
+
+Shared Placo settings live above the device list:
+
+```yaml
+cartesian:
+  solver: placo_servo
+  placo_servo:
+    position_only: false
+```
+
+```yaml
+- name: "phone_teleop"
+  type: "phone"
+  control_frequency: 50.0
+  phone_config:
+    backend: "webphone"
+    optical_flow_fallback_enabled: true
+    camera_offset: [0.0, -0.02, 0.04]
+    position_scale: 0.7
+    angular_scale: 1.0
+    orientation_axis_mask: [1.0, 1.0, 1.0]
+    orientation_deadzone_rad: 0.025
+    orientation_filter_alpha: 0.15
+    end_effector_bounds:
+      min: [-0.5, -0.5, -0.5]
+      max: [0.5, 0.5, 0.5]
+    max_ee_step_m: 0.05
+    max_angular_step_rad: 0.03
+    web:
+      bind_address: "0.0.0.0"
+      http_port: 8765
+      websocket_port: 8766
+      command_stale_s: 0.2
+      tls:
+        enabled: true
+        cert_file: "$(env HOME)/.ssl/ib_robot/web_phone_cert.pem"
+        key_file: "$(env HOME)/.ssl/ib_robot/web_phone_key.pem"
+        allow_insecure_http: false
+```
+
+The node logs the browser URL after startup. A certificate trusted by the phone
+is required for WebXR on a LAN address. Missing TLS files fail closed unless
+`allow_insecure_http` is explicitly enabled for local debugging.
+Phone requires `placo_servo`. WebPhone uses direct relative pose for `ar_6dof`; when
+`optical_flow_fallback_enabled=true`, each accepted visual displacement updates a
+virtual relative pose once. The fallback remains fail-closed across mode changes.
+Chrome only exposes the WebXR browser entry point; it does not include a spatial
+tracking runtime. Android AR normally also requires an ARCore-supported device, a
+working Google Play Services for AR installation, and an `immersive-ar` session that
+Chrome can actually create. Sufficient camera and IMU hardware alone does not mean
+that ARCore supports the device. Devices without browser AR may still use the camera
+fallback after granting camera and system-attitude permissions.
+
+The page reports AR and optical-flow capabilities separately:
+
+| Capability | Mode | Requirement |
+|---|---|---|
+| Trusted HTTPS secure context | AR and optical | Required; certificate errors may hide sensor APIs |
+| WebXR and `immersive-ar` | AR | Required; this only exposes the browser session entry point |
+| Browser-accessible spatial tracking runtime | AR | Required; Android Chrome normally depends on supported ARCore hardware and runtime |
+| DOM Overlay | AR | Required by this teleop UI so deadman, gripper, Home, and exit controls remain touchable |
+| `local-floor` | AR | Optional; the controller falls back to the relative `local` reference space |
+| Camera API, permission, and Canvas/Worker | Optical | Required |
+| Live `DeviceOrientation` | Optical | Required for attitude and image-rotation compensation |
+| Fullscreen presentation | Optical | Optional and display-only |
+
+The presence of `navigator.xr`, or even a `true` result from
+`isSessionSupported('immersive-ar')`, does not prove that the system can create a
+spatial tracking session. The user-triggered `requestSession()` call is the runtime
+check. A `NotSupportedError` changes the page state to `AR runtime unavailable` and
+disables AR while leaving optical flow available. Huawei AR Engine on HarmonyOS is
+not automatically exposed to Chrome WebXR. In a Mate 70 Pro + Chrome 149 validation,
+the WebXR API was visible but the runtime rejected the AR session. Using Huawei AR
+Engine would require a separate native application and is outside the browser
+WebPhone path.
+Closing the camera or ending AR sends `move=false` before releasing the tracking
+resources. `end_effector_bounds` clamps the relative base-frame Placo pose target.
+WebPhone requires `min < 0 < max` on every axis, so motion remains available in
+both directions from the clutch baseline. `command_stale_s` defaults to 0.18 seconds;
+launch requires it plus one control period to remain at or below 0.22 seconds
+before a stop request is issued. This is not a hard bound on physical stopping time.
+
+The canonical Phone `position_only` entry is
+`teleoperation.cartesian.placo_servo.position_only`. Launch passes it to the Placo
+solver used by Phone. Legacy `phone_config.position_only` is accepted temporarily
+with a migration warning.
+
+Fallback rotation comes directly from the browser's system-fused
+`DeviceOrientation`, converted into WebXR viewer axes. WebPhone does not consume
+`DeviceMotion.rotationRate` or integrate raw gyro rates into attitude. The RPY values in the details panel are
+display-only; control and image-rotation compensation use rotation matrices and
+quaternions throughout.
+
+**Coordinate contract**: AR follows WebXR viewer axes (`+X` right, `+Y` up,
+`+Z` back). The optical-flow worker reports per-frame displacement in the same
+viewer-local frame. The page uses device attitude to accumulate it into an
+absolute WebXR-world virtual pose, then shares AR's clutch-yaw alignment and
+`PhoneDevice -> Placo base-frame` mapping. Heartbeats resend the current pose and
+never reapply an old delta. `screen.orientation.angle` is included when converting
+device orientation into the viewer pose. Both WebXR AR and the optical virtual pose
+describe the camera centre: the WebXR spatial runtime supplies it directly, while optical flow
+integrates camera translation after image-rotation compensation. AR applies the
+complete `p_control = p_camera - R * camera_offset` transform. The monocular
+fallback keeps only its horizontal lever-arm component so phone pitch/roll cannot
+become robot vertical motion. Rotation compensation is axis-aware: yaw uses the
+whole-image model to preserve lateral translation, while pitch/roll use point-wise
+perspective compensation and attenuate translation more conservatively at low
+confidence.
+The calibrated control frame uses one proper-rotation basis for translation and
+rotation: `-Z -> +X`, `+X -> -Y`, and `+Y -> +Z`. The active WebXR
+viewer-to-world delta preserves its active relative-rotation direction when
+converted to the Placo base-frame tool target, and its axis is transformed by
+that same basis instead of being aligned separately by the page RPY labels. The
+default `orientation_axis_mask: [1, 1, 1]`
+preserves all three mapped rotation axes. SO-101 remains a 5-DOF arm, so Placo
+computes the best reachable result with position primary and orientation soft.
+
+The quality-first worker uses 320x240 frames at about 20 Hz, four-level subpixel
+LK, forward/backward validation, RANSAC, and system-fused attitude rotation
+compensation at frame submission time.
+The worker estimates focal length online, removes the rotation homography from
+optical flow, and uses the residual for translation so rotation and translation
+can occur together.
+Rotation is subtracted only after motion crosses the rotation gate; ordinary
+translation uses raw optical flow so heading noise cannot continuously cancel
+lateral motion. During horizontal yaw it prioritizes subtracting the
+system-attitude rotation model
+from the robust whole-image model, preserving common lateral translation.
+Low compensation confidence only softens an accepted translation, retaining at
+least 65%; translation freezes only when the visual track itself is rejected,
+while system-fused device attitude continues updating.
+Depth-scale motion uses a 0.45 m assumed scene distance for typical indoor
+features while retaining the existing per-frame displacement cap.
+Motion blur or displacement beyond the search range can still lower quality. The last
+reliable position is held while fresh system-fused attitude may continue updating
+rotation. Placo stops after 0.2 seconds only when both visual displacement and
+device attitude are unavailable, then requires a release followed by a new press.
+
+#### 4. SafetyFilter (Safety Filter)
 
 **File**: `safety_filter.py`
 
@@ -277,7 +481,7 @@ class BaseTeleopDevice(ABC):
 # Output: {"1": 1.0, "2": 0.5}  # Joint "1" clipped
 ```
 
-#### 4. DeviceFactory (Device Factory)
+#### 5. DeviceFactory (Device Factory)
 
 **File**: `device_factory.py`
 
@@ -409,7 +613,9 @@ if (delta > 0 and lead < -0.01) or (delta < 0 and lead > 0.01):
 | `so101` | `so101_placo_servo_node` | Single-arm Placo Cartesian servo. When `so101_input_mode=pose`, publishes a **clutch-relative pose delta** to `pose_cmd_base` (position is a relative displacement, orientation a relative rotation delta; placo composes them onto its own latched EE baseline — 1:1 hand tracking, stop-on-release, zero drift). When `velocity`, publishes a tool-frame differential twist |
 | `humanoid` | `/humanoid_teleop/*` | Dual-arm differential velocity, published as `Vector3Stamped` to the per-arm linear/angular topics |
 
-**Clutch semantics (pose mode)**: on the trigger (`enabled`) rising edge the hand baseline is latched; position is `(hand - clutch) * position_scale` (base frame) and attitude is the base-frame relative delta `R_current * R_clutch^-1` (with `so101_position_only=true`, attitude publishes identity and only position is teleoperated). Releasing the trigger clears the baseline and placo holds the last reference pose; pressing again re-grips from the new hand pose. Pressing **B** (secondary) calls placo's home service to return to home. Home is asynchronous (the service returns before the arm arrives), so **the moment the home request is dispatched** the node enters the **homing gate** — pose input is suspended and re-gripping is only allowed **after the trigger is released AND `so101_home_settle_s` (default 2s, sized to cover a typical homing travel) has elapsed**. The settle timer starts from the **confirmed successful async home response** (not from dispatch), so a slow service round-trip cannot shorten the wait window; the gate stays latched until the response is confirmed (it never lifts before the arm has even begun homing). A single release is not enough: a quick release-then-press mid-transit would re-latch placo's baseline onto the still-moving arm and overwrite the home target; because the gate holds until release *and* enough travel time has passed, a mid-transit re-press just holds still. (There is no arrival feedback, so this is a conservative time bound, not a measurement.) If the home service is not ready or is rejected (dispatch failure or a failed async response), the gate is **not** entered — pose input keeps working normally and the arm is not frozen in place.
+**Clutch and Home semantics**: on the trigger (`enabled`) rising edge the hand baseline is latched; pose position is `(hand - clutch) * position_scale` in the base frame, and attitude is the base-frame delta `R_current * R_clutch^-1`. Releasing clears the baseline; pressing again re-grips. Both SO-101 pose and velocity modes use **B** (secondary) to send the shared `ArmReturnHome` action. While it runs, all arm input is suspended and the gripper holds its last target. Placo reports the terminal result from `ros2_control.reset_positions` and fresh measured JointState error; there is no fixed settle delay. Releasing and pressing again during Home cannot take over early. If the action finishes while the trigger is held, the user must release once more and then press again to re-latch. An unavailable action does not enter the Home gate.
+
+Placo and the standalone VR node both subscribe to `safety.estop_topic` (default `/emergency_stop`). On `Bool=true`, Placo preempts ArmReturnHome, closes the pose/twist gates, and disables motion; VR mirrors the stop/reengage latch so both pose and velocity modes require a real release and re-press after `false`. Placo remains the motion-side E-stop authority, without relying on TeleopNode to relay the stop.
 
 > **Stale-frame watchdog (closed-loop deadman)**: if the client TCP stays connected but stalls without sending frames, the server would just re-send `_latest` forever. To prevent this, the receive side records each frame's arrival time with `time.monotonic()`; once the newest frame is older than `so101_command_stale_s` (default 0.2s) it is treated as no-data: the clutch is cleared and placo's `stop` service is called. Merely stopping publishing is not enough — placo latches the last reference and keeps driving toward that target.
 >
@@ -417,7 +623,7 @@ if (delta > 0 and lead < -0.01) or (delta < 0 and lead > 0.01):
 >
 > **Recovery semantics (deliberate re-grip, not auto-resume)**: a stall sets `_so101_stalled` (for **both** pose and velocity modes). After the stream recovers, **if the user is still holding the trigger the arm does not auto-resume** — `_so101_stalled` is cleared only by a **trigger release** (and it must be a real release with live controller data; a `ctrl is None` disconnect does not count). Pose mode clears it in the release path; velocity mode clears it in the release branch of `_control_so101` (`not ctrl.enabled` with the controller online). While the stall persists, velocity mode publishes zero velocity even if the trigger is held — it does not feed `_compute_velocities` — avoiding a large velocity spike on the first recovery frame. Only the next **press** takes the rising edge: re-latch the baseline, re-grip. That is, "recovery ⇒ the user deliberately re-grips", not "recovery ⇒ auto-takeover", so the arm does not lurch when the user is not ready during stream jitter.
 
-> **Late-frame overwrite protection (placo-side pose gate)**: clearing the `_latest_pose` cache is not enough to stop "an old Pose that was already queued in DDS when the stop/home service ran, and only delivered afterward" — there is no cross-entity ordering guarantee between the pose topic and the services. The placo node uses an `_accept_pose_commands` gate: `stop`/`home` close the gate and drop the cache, and **only `start` re-opens it after re-latching the baseline**; while closed, `_on_pose` drops the message. Key point: **the gate stays closed after home** — a single-threaded executor only guarantees no Pose is interleaved *during* the home callback, and cannot distinguish "a frame that arrives after the callback returns" as an old queued frame vs. a new one; re-opening at the end of home would let an old Pose (enqueued before home ran, delivered after) be accepted and add the stale displacement back onto the home baseline. So the gate is re-opened only by the next `start` (which re-latches the clutch baseline first), and any Pose accepted after that is measured against the new home, not the old grip. The node runs a single-threaded executor with a single `MutuallyExclusiveCallbackGroup`, so the service callbacks and `_on_pose` are serialized and the gate's close/open is atomic w.r.t. `_on_pose`, fully closing the `home + old offset` reappearance.
+> **Late-frame overwrite protection (placo-side pose gate)**: clearing `_latest_pose` is not enough to reject an old Pose already queued in DDS when stop/Home starts. Placo closes `_accept_pose_commands` and drops the cache on stop and ArmReturnHome; only the next `start` re-opens it after re-latching the EE baseline. Motion topics, services, and the timer share one mutually-exclusive callback group. The long-running action wait uses a separate callback group and a two-thread executor, so it cannot block the 50 Hz motion tick.
 
 > **Coordinate contract**: the pose-mode rotation delta is defined in the **base frame** (same frame as the position delta). The production formulas live in the ROS-agnostic pure-function module `vr_rotation.py` (`compute_base_rotation_delta` computes `R_current * R_clutch^-1`, `remap_base_rotation` does the base-frame-aligned similarity transform), and the placo side left-multiplies `rel_R @ ee0_R`. `test/test_vr_teleop_rotation.py` calls these two production functions directly (no more copying the formula into the test, no more `sys.modules` stubbing). The base-alignment matrix `R_ROBOT_BASE_FROM_VR_BASE` maps VR +X/+Y wrist rotations to EE roll/pitch (axes and signs verified usable in sim). **5-DOF limitation**: the SO-101 has only 5 revolute joints and cannot independently realize all 6 Cartesian DOF — placo constrains the 3 positions with a hard PositionTask and follows attitude with a low-weight (0.01) soft OrientationTask, leaving ~2 reachable attitude DOF. **EE yaw about base +Z cannot be reproduced** (a hand yaw about the vertical axis barely drives the EE), which is an inherent kinematic limitation of the arm, not a calibration error. Set `so101_position_only=true` when only pure translation is needed or a fixed wrist attitude is desired.
 
@@ -435,7 +641,7 @@ if (delta > 0 and lead < -0.01) or (delta < 0 and lead > 0.01):
 | `position_scale` | 0.4 | pose-mode hand→EE position gain |
 | `so101_position_only` | `false` | pose-mode rotation gate. When `true`, locks the clutch-baseline attitude and teleoperates position only (ΔR publishes identity); for pure-translation or fixed-wrist scenarios. Default `false` (attitude on): VR +X/+Y wrist rotations map to EE roll/pitch; subject to the 5-DOF limit, EE yaw about base +Z cannot be reproduced |
 | `so101_command_stale_s` | 0.2 | stale-frame watchdog. When the client stays connected but stops sending frames past this value, it is treated as no-data: clear the clutch, latch stop intent, and call placo `stop`; if the service is not ready, errors, or is rejected, keep retrying until a success response, so the arm does not keep tracking a frozen old target |
-| `so101_home_settle_s` | 2.0 | homing-gate conservative time. Home is async (the service returns first, the arm arrives later), so after a trigger release the user must wait this long before re-gripping, preventing a mid-transit re-press from re-latching the baseline onto a half-way pose and overwriting home. There is no arrival feedback, so it is a time bound; size it to a typical homing travel |
+| `so101_home_action` | `/so101_placo_servo_node/return_home` | shared `ibrobot_msgs/action/ArmReturnHome` endpoint; Phone, VR, and Placo must use the same name |
 | `control_frequency` | 50.0 | control frequency. Declared at the **device layer** (peer of `vr_config`, consistent with other teleop devices); `vr_config.control_frequency` may override it |
 
 > ⚠️ **Security model (trusted LAN)**: the `0.0.0.0:8889` listen is kept by default so a user's VR headset, phone, or other network device can connect directly even when its IP is not fixed. This TCP control channel is **unauthenticated**, so it may only be used on a trusted lab/home LAN; do not set up public port forwarding on the router, and never expose it to the public internet, untrusted Wi-Fi, or an untrusted VPN. This node does not pass through `SafetyFilter` — joint limits are enforced by the downstream `so101_placo_servo_node` QP constraints — and the disconnect/stale-frame deadman must stay enabled.
@@ -446,7 +652,8 @@ if (delta > 0 and lead < -0.01) or (delta < 0 and lead > 0.01):
 |---|---|---|---|
 | `/so101_placo_servo_node/pose_cmd_base` | `PoseStamped` | publish | **clutch-relative pose delta** (base frame): `position` is a relative displacement, `orientation` a relative rotation delta; composed by placo onto its latched EE baseline `_ee0_p/_ee0_R`, **not** an absolute EE pose |
 | `so101_gripper_topic` (default `/gripper_position_controller/commands`) | `Float64MultiArray` | publish | gripper target position |
-| `/so101_placo_servo_node/start` `/stop` `/home` | `Trigger` | service call | enable / re-latch the clutch baseline, disable, home |
+| `/so101_placo_servo_node/start` `/stop` | `Trigger` | service call | enable / re-latch the clutch baseline, disable |
+| `/so101_placo_servo_node/return_home` | `ibrobot_msgs/action/ArmReturnHome` | action call | transactional joint Home with measured completion; stop/stale/cancel preempts it |
 
 ### Performance Optimization
 
@@ -507,8 +714,12 @@ if not self.device.is_connected:
 
 ```python
 def estop_callback(self, msg):
-    self.estop_active = True
-    # Stop publishing commands
+    if msg.data:
+        self.estop_active = True
+        # Gate publishing and dispatch device.emergency_stop().
+    else:
+        self.estop_active = False
+        # WebPhone still requires a real release and a new deadman press.
 ```
 
 ### Extension Guide
@@ -728,6 +939,21 @@ devices:
   # selected backend.
 ```
 
+#### 4. phone
+
+Phone devices use a nested `phone_config`; `backend` must be `webphone` when
+specified. WebPhone HTTP and WebSocket ports must differ,
+`command_stale_s` must be positive, and TLS certificate/key paths must be paired.
+Phone pose mode additionally requires `backend=webphone` and
+`teleoperation.cartesian.solver=placo_servo`. `ar_6dof` uses direct relative pose;
+optical-flow requires `optical_flow_fallback_enabled=true`. Pose mode must enable
+at least one of WebXR AR or the optical-flow fallback.
+
+The default WebPhone configuration is unauthenticated and intended only for a
+trusted internal LAN. Treat it as a robot control interface, not an internet
+service. Do not expose its ports through public forwarding, reverse/cloud
+tunnels, guest Wi-Fi, or untrusted VPNs; restrict them to the robot control subnet.
+
 ### Validation Rules
 
 1. **Required fields:**
@@ -739,9 +965,12 @@ devices:
    - `leader_arm` devices require `port` field
    - `xbox_controller` requires `/joy` topic subscription
    - Cartesian devices require a configured `teleoperation.cartesian.solver`
+   - A launch may activate at most one SO-101 Cartesian Phone/VR/Xbox input
 
 3. **Safety requirements:**
-   - `joint_limits` should cover all joints in `robot.joints.all`
+   - Leader, phone, Xbox, and custom devices routed through `TeleopNode/SafetyFilter`
+     require non-empty `safety.joint_limits`; standalone mobile-base `joy_teleop`
+     does not use this joint-target contract
    - Each joint limit needs `min` and `max` fields
    - `min` must be less than `max`
 
@@ -753,7 +982,7 @@ devices:
 - `/diagnostics` (DiagnosticArray) - 1 Hz
 
 **Subscribed by TeleopNode:**
-- `/emergency_stop` (Bool) - Emergency stop signal
+- `safety.estop_topic` (Bool, default `/emergency_stop`) - Emergency stop signal
 
 ## Safety
 
@@ -763,9 +992,10 @@ devices:
 - Diagnostic warnings issued for clipped commands
 
 **Emergency Stop:**
-- Subscribes to `/emergency_stop` topic
-- Stops publishing commands when E-stop is active
-- Resumes when E-stop is cleared
+- Subscribes to `safety.estop_topic` (`Bool`, default `/emergency_stop`): `true` gates publishing and dispatches the device stop
+- `false` explicitly releases the TeleopNode latch but never replays an old command
+- WebPhone still requires a live released frame followed by a new deadman press
+- The gripper holds its current target during E-stop instead of opening automatically
 
 ## Performance Targets
 
@@ -800,6 +1030,23 @@ sudo usermod -a -G dialout $USER
 2. Verify `teleoperation.active_device` matches a device name
 3. Verify device `type` is registered in `DEVICE_MAP`
 
+### Issue: "WebPhone or WebXR is unavailable"
+
+1. Open the HTTPS URL printed by the teleop node and trust its certificate on the phone.
+2. Check that both configured ports are reachable through the host firewall.
+3. Chrome does not bundle ARCore. AR needs a supported device, a working Google Play
+   Services for AR runtime, and a successful `immersive-ar` session.
+4. `AR runtime unavailable` means the browser API exists but the system rejected the
+   spatial session. Huawei AR Engine cannot directly replace Chrome's ARCore path.
+5. `AR control overlay unavailable` means the session lacks DOM Overlay, so this page
+   cannot provide a safe deadman control inside AR.
+6. Optical mode requires both camera and system-attitude permission. The details
+   panel should report `system-fused attitude` as the attitude source.
+7. If a disconnect occurred, fully release the motion area before pressing it again.
+8. Insecure HTTP is an explicit debug fallback and may not expose sensor APIs.
+9. Pose mode uses AR 6DoF directly; enable `optical_flow_fallback_enabled` for
+   browsers limited to optical-flow.
+
 ## Documentation
 
 - **Integration Guide:** [INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md)
@@ -817,10 +1064,17 @@ src/robot_teleop/
 │   ├── device_factory.py         # Factory pattern
 │   ├── safety_filter.py          # Safety layer
 │   ├── teleop_node.py            # Main ROS 2 node
-│   └── devices/
+│   ├── devices/
 │       ├── __init__.py
 │       ├── leader_arm.py         # SO-101 leader arm
 │       └── xbox_controller.py    # Xbox controller
+│   └── phone/
+│       ├── phone_device.py       # WebPhone to Cartesian backend
+│       ├── web_phone.py          # WSS protocol, filtering, deadman watchdog
+│       └── web_server.py         # Installed HTTPS page server
+├── web/
+│   ├── web_teleop.html           # WebXR/optical-flow browser client
+│   └── optical_flow_worker.js    # Monocular tracking and attitude compensation
 ├── launch/
 │   └── teleop_device.launch.py   # Standalone launch file
 ├── package.xml

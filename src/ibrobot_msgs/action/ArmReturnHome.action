@@ -1,0 +1,9 @@
+# Request a named, backend-owned safe arm return motion.
+string target_name
+---
+bool success
+string error_code
+string message
+---
+string state
+float64 max_joint_error_rad

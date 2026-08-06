@@ -123,3 +123,7 @@ class BaseTeleopDevice(ABC):
         """Context manager exit - disconnect from device."""
         self.disconnect()
         return False
+
+    def emergency_stop(self) -> None:
+        """Stop device-owned motion immediately when the node receives E-stop."""
+        return None

@@ -1,17 +1,17 @@
 """
 Phone teleoperation module.
 
-Provides phone-based teleoperation for robot arms using
-iOS (HEBI Mobile I/O) or Android (WebXR) devices.
+Provides browser-based phone teleoperation using built-in WebPhone.
 """
 
-from .config_phone import PhoneConfig, PhoneOS
-from .phone_device import PhoneDevice, IOSPhone, AndroidPhone
+from .config_phone import PhoneConfig, WebPhoneConfig, WebTLSConfig
+from .phone_device import PhoneDevice
+from .web_phone import WebPhone
 
 __all__ = [
     "PhoneConfig",
-    "PhoneOS",
+    "WebPhoneConfig",
+    "WebTLSConfig",
     "PhoneDevice",
-    "IOSPhone",
-    "AndroidPhone",
+    "WebPhone",
 ]

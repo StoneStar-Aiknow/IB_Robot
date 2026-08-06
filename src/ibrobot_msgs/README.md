@@ -256,6 +256,20 @@ keyframe readiness、队列深度、收发/丢包计数和最后错误。
 | `verification_status` | 未执行、成功、失败或不确定 |
 | `completed_phases` | 已进入的抓取状态机阶段 |
 
+### `ArmReturnHome.action`
+
+遥操作后端拥有的事务式回零接口。SO101 Placo 默认在
+`/so101_placo_servo_node/return_home` 提供该 Action；Goal 使用 `target_name`
+选择后端定义的目标，当前支持 `home`。执行结果以新鲜 JointState 的实测关节误差和
+连续稳定时间为准，取消、急停、反馈超时或动作超时都会返回明确失败状态。
+
+| 字段 | 说明 |
+| --- | --- |
+| `target_name` | 后端定义的回零目标名称 |
+| `success` / `error_code` / `message` | 终态与可诊断失败原因 |
+| `state` | 当前执行阶段反馈 |
+| `max_joint_error_rad` | 当前最大关节误差反馈，单位弧度 |
+
 ### `ExecuteTaskPlan.action`
 
 MoveIt 任务步骤执行接口，由 `task_executor_node` 提供，路径 `/task_executor/execute_task_plan`。

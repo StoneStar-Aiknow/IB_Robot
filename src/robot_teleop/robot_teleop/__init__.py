@@ -7,33 +7,32 @@ through a device abstraction layer.
 """
 
 from .base_teleop import BaseTeleopDevice
-from .device_factory import device_factory, DEVICE_MAP
-from .safety_filter import SafetyFilter
-from .devices.leader_arm import LeaderArmDevice
-from .phone.phone_device import PhoneDevice
-from .phone.config_phone import PhoneConfig, PhoneOS
 from .config_loader import (
-    TeleoperationConfig,
     TeleopDeviceConfig,
+    TeleoperationConfig,
     TeleopSafetyConfig,
-    load_teleoperation_config,
     get_active_device_config,
+    load_teleoperation_config,
 )
+from .device_factory import DEVICE_MAP, device_factory
+from .devices.leader_arm import LeaderArmDevice
+from .phone.config_phone import PhoneConfig
+from .phone.phone_device import PhoneDevice
+from .safety_filter import SafetyFilter
 
 __all__ = [
-    'BaseTeleopDevice',
-    'device_factory',
-    'DEVICE_MAP',
-    'SafetyFilter',
-    'LeaderArmDevice',
-    'PhoneDevice',
-    'PhoneConfig',
-    'PhoneOS',
-    'TeleoperationConfig',
-    'TeleopDeviceConfig',
-    'TeleopSafetyConfig',
-    'load_teleoperation_config',
-    'get_active_device_config',
+    "BaseTeleopDevice",
+    "device_factory",
+    "DEVICE_MAP",
+    "SafetyFilter",
+    "LeaderArmDevice",
+    "PhoneDevice",
+    "PhoneConfig",
+    "TeleoperationConfig",
+    "TeleopDeviceConfig",
+    "TeleopSafetyConfig",
+    "load_teleoperation_config",
+    "get_active_device_config",
 ]
 
-__version__ = '0.1.0'
+__version__ = "0.1.0"

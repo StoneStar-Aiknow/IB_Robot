@@ -12,12 +12,18 @@ import rclpy
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.node import Node
-from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
+from rclpy.signals import SignalHandlerOptions
+from std_msgs.msg import Bool, Float64MultiArray
 
 from .base_teleop import BaseTeleopDevice
 from .device_factory import device_factory
 from .safety_filter import SafetyFilter
+
+
+def connect_device_or_raise(device: BaseTeleopDevice) -> None:
+    """Connect a teleoperation device and fail node startup when its transport is unavailable."""
+    if not device.connect():
+        raise RuntimeError("Teleoperation device connection failed")
 
 
 class TeleopNode(Node):
@@ -36,7 +42,7 @@ class TeleopNode(Node):
         - /diagnostics (DiagnosticArray)
 
     Subscribers:
-        - /emergency_stop (Bool) - Emergency stop signal
+        - estop_topic (Bool) - Configured emergency stop signal
 
     Parameters:
         - control_frequency (double): Control loop frequency in Hz (default: 50.0)
@@ -44,6 +50,7 @@ class TeleopNode(Node):
         - joint_limits (dict): Joint limits for safety filter
         - arm_command_topic (string): Arm controller command topic
         - gripper_command_topic (string): Gripper controller command topic
+        - estop_topic (string): Emergency-stop Bool topic
     """
 
     def __init__(self):
@@ -59,6 +66,7 @@ class TeleopNode(Node):
 
         self.declare_parameter("arm_command_topic", "/arm_position_controller/commands")
         self.declare_parameter("gripper_command_topic", "/gripper_position_controller/commands")
+        self.declare_parameter("estop_topic", "/emergency_stop")
 
         # Get parameters
         self.control_frequency = self.get_parameter("control_frequency").value
@@ -68,6 +76,7 @@ class TeleopNode(Node):
         self.gripper_joint_names = self.get_parameter("gripper_joint_names").value
         self.arm_command_topic = self.get_parameter("arm_command_topic").value
         self.gripper_command_topic = self.get_parameter("gripper_command_topic").value
+        self.estop_topic = self.get_parameter("estop_topic").value
 
         # Parse JSON parameters if provided as strings
         import json
@@ -80,16 +89,15 @@ class TeleopNode(Node):
         # Initialize device
         self.device: BaseTeleopDevice | None = None
         self._device_lock = threading.Lock()
+        self._device_disconnected = False
 
         try:
             self.device = device_factory(device_config, node=self)
             self.get_logger().info(f"Created device: {device_config.get('type', 'unknown')}")
 
             # Connect to device
-            if self.device.connect():
-                self.get_logger().info("Device connected successfully")
-            else:
-                self.get_logger().error("Device connection failed")
+            connect_device_or_raise(self.device)
+            self.get_logger().info("Device connected successfully")
         except Exception as e:
             self.get_logger().error(f"Failed to create/connect device: {e}")
             raise
@@ -106,9 +114,12 @@ class TeleopNode(Node):
 
         # Emergency stop
         self.estop_active = False
+        self._estop_state_lock = threading.Lock()
+        self._estop_stop_pending = False
+        self._estop_release_pending = False
         self.estop_sub = self.create_subscription(
-            JointState,  # Using JointState as placeholder for Bool
-            "/emergency_stop",
+            Bool,
+            self.estop_topic,
             self.estop_callback,
             10,
         )
@@ -135,20 +146,36 @@ class TeleopNode(Node):
         """
         loop_start = time.time()
 
-        # Skip if emergency stop active
-        if self.estop_active:
+        # Skip if emergency stop active. Dispatching the device stop here also
+        # retries a request that arrived while another control cycle owned the
+        # device lock.
+        if self._estop_is_active():
+            self._try_dispatch_estop()
             return
 
         # Read from device
+        estop_seen_after_lock = False
         with self._device_lock:
-            if self.device is None or not self.device.is_connected:
+            if self._estop_is_active():
+                estop_seen_after_lock = True
+            elif self.device is None or not self.device.is_connected:
                 return
+            else:
+                try:
+                    joint_targets = self.device.get_joint_targets()
+                except Exception as e:
+                    self.get_logger().error(f"Device read failed: {e}")
+                    return
 
-            try:
-                joint_targets = self.device.get_joint_targets()
-            except Exception as e:
-                self.get_logger().error(f"Device read failed: {e}")
-                return
+        if estop_seen_after_lock:
+            self._try_dispatch_estop()
+            return
+
+        # A multi-threaded executor may deliver E-stop while get_joint_targets
+        # is running. Never publish the command computed by that in-flight cycle.
+        if self._estop_is_active():
+            self._try_dispatch_estop()
+            return
 
         # Apply safety filter
         safe_targets = self.safety_filter.apply_limits(joint_targets)
@@ -173,11 +200,69 @@ class TeleopNode(Node):
         self._update_diagnostics(loop_time)
 
     def estop_callback(self, msg):
-        """Handle emergency stop signal."""
-        # For now, treat any message as E-stop trigger
-        # In production, would check Bool message
-        self.estop_active = True
-        self.get_logger().warn("Emergency stop activated!")
+        """Latch or explicitly release the emergency-stop gate."""
+        if msg.data:
+            with self._estop_state_lock:
+                newly_active = not self.estop_active
+                self.estop_active = True
+                self._estop_release_pending = False
+                if newly_active:
+                    self._estop_stop_pending = True
+            self._try_dispatch_estop()
+            if newly_active:
+                self.get_logger().warn("Emergency stop activated")
+            return
+
+        with self._estop_state_lock:
+            if not self.estop_active:
+                return
+            if self._estop_stop_pending:
+                self._estop_release_pending = True
+                released = False
+            else:
+                self.estop_active = False
+                self._estop_release_pending = False
+                released = True
+
+        if not released:
+            self._try_dispatch_estop()
+            released = not self._estop_is_active()
+        if released:
+            self.get_logger().warn("Emergency stop released; WebPhone requires deadman release and re-press")
+        else:
+            self.get_logger().warn("Emergency stop release deferred until the device stop is dispatched")
+
+    def _estop_is_active(self) -> bool:
+        with self._estop_state_lock:
+            return self.estop_active
+
+    def _try_dispatch_estop(self) -> bool:
+        """Dispatch a pending device stop without blocking on the control-loop lock."""
+        with self._estop_state_lock:
+            if not self._estop_stop_pending:
+                return True
+
+        if not self._device_lock.acquire(blocking=False):
+            return False
+        try:
+            with self._estop_state_lock:
+                if not self._estop_stop_pending:
+                    return True
+            try:
+                if self.device is not None:
+                    self.device.emergency_stop()
+            except Exception as exc:  # noqa: BLE001 - retry on the next control cycle
+                self.get_logger().error(f"Emergency stop dispatch failed: {exc}")
+                return False
+
+            with self._estop_state_lock:
+                self._estop_stop_pending = False
+                if self._estop_release_pending:
+                    self.estop_active = False
+                    self._estop_release_pending = False
+            return True
+        finally:
+            self._device_lock.release()
 
     def _update_diagnostics(self, loop_time: float):
         """Update diagnostic statistics."""
@@ -210,24 +295,38 @@ class TeleopNode(Node):
             if self.avg_loop_time > 0.005:  # 5ms threshold
                 self.get_logger().warn(f"High latency detected: {self.avg_loop_time * 1000:.2f}ms > 5ms")
 
-    def destroy_node(self):
-        """Clean up resources on node shutdown."""
-        self.get_logger().info("Shutting down TeleopNode...")
-
+    def disconnect_device(self) -> None:
+        """Request device shutdown while the ROS context is still alive."""
         with self._device_lock:
-            if self.device is not None:
+            if self.device is not None and not self._device_disconnected:
                 try:
                     self.device.disconnect()
+                    self._device_disconnected = True
                     self.get_logger().info("Device disconnected")
                 except Exception as e:
                     self.get_logger().error(f"Error disconnecting device: {e}")
+
+    def device_shutdown_complete(self) -> bool:
+        """Return whether any asynchronous device stop has been acknowledged."""
+        with self._device_lock:
+            if self.device is None:
+                return True
+            return bool(getattr(self.device, "shutdown_complete", True))
+
+    def destroy_node(self):
+        """Clean up resources on node shutdown."""
+        self.get_logger().info("Shutting down TeleopNode...")
+        self.disconnect_device()
 
         super().destroy_node()
 
 
 def main(args=None):
     """Entry point for teleop_node."""
-    rclpy.init(args=args)
+    # Keep the ROS context alive while Python handles SIGINT. The finally block
+    # can then spin until an asynchronous Cartesian stop is acknowledged.
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
+    node = None
 
     try:
         node = TeleopNode()
@@ -241,5 +340,15 @@ def main(args=None):
         logger.error(f"TeleopNode failed: {e}")
         raise
     finally:
+        if node is not None:
+            node.disconnect_device()
+            deadline = time.monotonic() + 0.5
+            while rclpy.ok() and not node.device_shutdown_complete() and time.monotonic() < deadline:
+                rclpy.spin_once(node, timeout_sec=0.05)
+            if not node.device_shutdown_complete():
+                node.get_logger().error(
+                    "Device stop was not acknowledged before shutdown; verify the Placo node is stopped"
+                )
+            node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

@@ -60,11 +60,14 @@ from dataclasses import dataclass, field
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, Vector3Stamped
+from rclpy.action import ActionClient
 from rclpy.node import Node
 from scipy.spatial.transform import Rotation
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Bool, Float64MultiArray
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformListener
+
+from ibrobot_msgs.action import ArmReturnHome
 
 from .cartesian_backend.frame_adapter import ToolAngularAdapter
 from .vr_rotation import compute_base_rotation_delta, remap_base_rotation
@@ -78,17 +81,13 @@ logger = logging.getLogger(__name__)
 # both flip, z stays: ros = [-ux, -uz, uy]. This is a reflection (det -1) no
 # proper rotation can produce, which is expected for position; orientation gets
 # its OWN proper basis below (_ORI_UNITY_TO_ROS).
-_POS_UNITY_TO_ROS = np.array([[-1.0, 0.0, 0.0],
-                              [0.0, 0.0, -1.0],
-                              [0.0, 1.0, 0.0]])  # det -1 (mirror, by design)
+_POS_UNITY_TO_ROS = np.array([[-1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])  # det -1 (mirror, by design)
 
 # ORIENTATION proper basis (det +1). Must map through a proper basis or wrist
 # attitude scrambles. Aligned to the SAME face-to-face orientation as position
 # (position's mirror = this rotation composed with a reflection), so wrist turns
 # feel consistent with translation. ros_quat_vec = [qx, -qz, qy], w unchanged.
-_ORI_UNITY_TO_ROS = np.array([[1.0, 0.0, 0.0],
-                              [0.0, 0.0, -1.0],
-                              [0.0, 1.0, 0.0]])  # det +1
+_ORI_UNITY_TO_ROS = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])  # det +1
 
 
 def _unity_pos_to_ros(pos_unity: np.ndarray) -> np.ndarray:
@@ -225,11 +224,7 @@ class VRDualArmTcpServer:
                 conn, addr = self._server_sock.accept()
                 self._connected = True
                 self._connected_addr = f"{addr[0]}:{addr[1]}"
-                self._log(
-                    f"\n{'=' * 60}\n"
-                    f"  VR CLIENT CONNECTED from {addr[0]}:{addr[1]}\n"
-                    f"{'=' * 60}"
-                )
+                self._log(f"\n{'=' * 60}\n  VR CLIENT CONNECTED from {addr[0]}:{addr[1]}\n{'=' * 60}")
                 conn.settimeout(0.5)
                 # _receive_loop owns per-connection cleanup in its own finally
                 # (clears _latest + connected state) so an EXCEPTION path here —
@@ -309,11 +304,10 @@ class VRDualArmTcpServer:
         # go-home works regardless of the client's naming. TEMP probe below
         # logs the actual controller keys once so we can confirm the name.
         secondary = bool(
-            ctrl.get("secondaryButton",
-                     ctrl.get("buttonB",
-                              ctrl.get("button_b",
-                                       ctrl.get("secondary_button",
-                                                ctrl.get("bButton", False)))))
+            ctrl.get(
+                "secondaryButton",
+                ctrl.get("buttonB", ctrl.get("button_b", ctrl.get("secondary_button", ctrl.get("bButton", False)))),
+            )
         )
         if not VRDualArmTcpServer._logged_ctrl_keys:
             VRDualArmTcpServer._logged_ctrl_keys = True
@@ -427,17 +421,8 @@ class VRTeleopNode(Node):
         self.declare_parameter("so101_gripper_topic", "/gripper_position_controller/commands")
         self.declare_parameter("so101_start_service", "/so101_placo_servo_node/start")
         self.declare_parameter("so101_stop_service", "/so101_placo_servo_node/stop")
-        self.declare_parameter("so101_home_service", "/so101_placo_servo_node/home")
-        # Conservative time (s) the arm needs to reach home. Home is async: the
-        # service returns immediately while the arm is still in transit. The
-        # _homing gate must NOT clear on the first trigger release alone — a quick
-        # release-then-press mid-transit would re-latch placo's baseline onto the
-        # moving arm and abort the home. The gate stays latched until BOTH the
-        # trigger has been released AND this settle time has elapsed since the
-        # home service confirmed success, so a re-grip can only re-baseline a
-        # settled home pose. Sized to cover the typical home travel; there is no
-        # arrival feedback from the servo, so this is a bound, not a measurement.
-        self.declare_parameter("so101_home_settle_s", 2.0)
+        self.declare_parameter("so101_home_action", "/so101_placo_servo_node/return_home")
+        self.declare_parameter("estop_topic", "/emergency_stop")
         self.declare_parameter("so101_gripper_open", 1.0)
         self.declare_parameter("so101_gripper_closed", 0.0)
         # so101 input mode. "velocity" (default): publish tool-frame differential
@@ -482,12 +467,7 @@ class VRTeleopNode(Node):
         self._controller_side = str(self.get_parameter("controller_side").value)
         self._so101_input_mode = str(self.get_parameter("so101_input_mode").value).lower()
         self._so101_position_only = bool(self.get_parameter("so101_position_only").value)
-        self._so101_command_stale_s = float(
-            self.get_parameter("so101_command_stale_s").value
-        )
-        self._so101_home_settle_s = float(
-            self.get_parameter("so101_home_settle_s").value
-        )
+        self._so101_command_stale_s = float(self.get_parameter("so101_command_stale_s").value)
         # Edge tracker for the stale watchdog: True once we have handled a stall
         # (dropped clutch + issued stop), so the stop service is called once per
         # stall rather than every tick.
@@ -519,6 +499,8 @@ class VRTeleopNode(Node):
         self._so101_stop_inflight = False
         self._so101_recalib_inflight = False
         self._so101_home_inflight = False
+        self._so101_home_goal_handle = None
+        self._so101_home_cancel_pending = False
         # Latched "the arm MUST be stopped and has not confirmed it" intent.
         # Set whenever a stop is needed but could not be confirmed (service not
         # ready, request failed/rejected, or a start/recalib/home was inflight
@@ -528,23 +510,22 @@ class VRTeleopNode(Node):
         # closed-loop: without it, a single failed stop left the software
         # believing the arm was stopped while placo kept tracking the last target.
         self._so101_stop_pending = False
+        # Set by any safety stop or Home dispatch. It blocks the 0.5 s automatic
+        # start path until a live, held trigger explicitly re-latches Placo.
+        self._so101_reengage_required = False
+        self._estop_active = False
         # Latches once the start service has been acknowledged; gates the 0.5 s
         # keepalive/deadman timer (see _so101_deadman_tick). Must exist before that
         # timer first fires: with fresh data and the trigger released, no stop path
         # runs to create it, so initialize it here.
         self._so101_started = False
         self._secondary_prev = False  # B-button edge detect (go-home)
-        # Set when B triggers a go-home; blocks the clutch from re-arming (which
-        # would re-latch placo's baseline to the arm's CURRENT, still-in-transit
-        # pose and overwrite the home target) until the trigger is released once.
+        # Home blocks all arm input until the ArmReturnHome action reaches a terminal
+        # result and a real trigger release has been observed. The next press then
+        # re-latches both VR and Placo baselines.
         self._homing = False
-        # Monotonic timestamp of the confirmed home response (set in
-        # _on_so101_home_response), or None while a home is dispatched but not yet
-        # acknowledged. The _homing gate uses it with so101_home_settle_s to stay
-        # latched until the arm has had time to settle at home; None keeps the gate
-        # latched (never lift before the servo has even accepted home). See
-        # _control_so101_pose.
-        self._home_dispatch_time = None
+        self._home_terminal = False
+        self._home_deadman_held = False
         self._tf_buffer = None
         self._tf_listener = None
         self._angular_adapter = None
@@ -569,7 +550,9 @@ class VRTeleopNode(Node):
         self._timer = self.create_timer(self._control_dt, self._control_callback)
 
         self.get_logger().info(
-            "\n" + "=" * 60 + "\n"
+            "\n"
+            + "=" * 60
+            + "\n"
             + "  VR Dual-Arm Teleop Node READY\n"
             + f"  TCP server listening on {host}:{port}\n"
             + f"  Control frequency: {freq} Hz\n"
@@ -580,24 +563,14 @@ class VRTeleopNode(Node):
         )
 
     def _init_humanoid_publishers(self) -> None:
-        self._right_linear_pub = self.create_publisher(
-            Vector3Stamped, "/humanoid_teleop/right_arm/linear_cmd_base", 10
-        )
-        self._left_linear_pub = self.create_publisher(
-            Vector3Stamped, "/humanoid_teleop/left_arm/linear_cmd_base", 10
-        )
+        self._right_linear_pub = self.create_publisher(Vector3Stamped, "/humanoid_teleop/right_arm/linear_cmd_base", 10)
+        self._left_linear_pub = self.create_publisher(Vector3Stamped, "/humanoid_teleop/left_arm/linear_cmd_base", 10)
         self._right_angular_pub = self.create_publisher(
             Vector3Stamped, "/humanoid_teleop/right_arm/angular_cmd_tool", 10
         )
-        self._left_angular_pub = self.create_publisher(
-            Vector3Stamped, "/humanoid_teleop/left_arm/angular_cmd_tool", 10
-        )
-        self._right_gripper_pub = self.create_publisher(
-            Float64MultiArray, "/right_gripper_controller/commands", 10
-        )
-        self._left_gripper_pub = self.create_publisher(
-            Float64MultiArray, "/left_gripper_controller/commands", 10
-        )
+        self._left_angular_pub = self.create_publisher(Vector3Stamped, "/humanoid_teleop/left_arm/angular_cmd_tool", 10)
+        self._right_gripper_pub = self.create_publisher(Float64MultiArray, "/right_gripper_controller/commands", 10)
+        self._left_gripper_pub = self.create_publisher(Float64MultiArray, "/left_gripper_controller/commands", 10)
 
     def _init_so101_publishers(self) -> None:
         if self._so101_input_mode == "pose":
@@ -605,9 +578,7 @@ class VRTeleopNode(Node):
             # tool→base angular conversion is needed (orientation is a base-frame
             # rotation delta, not a tool-frame twist), so no TF listener /
             # ToolAngularAdapter here.
-            self._so101_pose_pub = self.create_publisher(
-                PoseStamped, self.get_parameter("so101_pose_topic").value, 10
-            )
+            self._so101_pose_pub = self.create_publisher(PoseStamped, self.get_parameter("so101_pose_topic").value, 10)
         else:
             self._so101_linear_pub = self.create_publisher(
                 Vector3Stamped, self.get_parameter("so101_linear_topic").value, 10
@@ -618,15 +589,10 @@ class VRTeleopNode(Node):
         self._so101_gripper_pub = self.create_publisher(
             Float64MultiArray, self.get_parameter("so101_gripper_topic").value, 10
         )
-        self._so101_start_cli = self.create_client(
-            Trigger, self.get_parameter("so101_start_service").value
-        )
-        self._so101_stop_cli = self.create_client(
-            Trigger, self.get_parameter("so101_stop_service").value
-        )
-        self._so101_home_cli = self.create_client(
-            Trigger, self.get_parameter("so101_home_service").value
-        )
+        self._so101_start_cli = self.create_client(Trigger, self.get_parameter("so101_start_service").value)
+        self._so101_stop_cli = self.create_client(Trigger, self.get_parameter("so101_stop_service").value)
+        self._so101_home_cli = ActionClient(self, ArmReturnHome, self.get_parameter("so101_home_action").value)
+        self.create_subscription(Bool, self.get_parameter("estop_topic").value, self._on_estop, 10)
         if self._so101_input_mode == "velocity":
             # tool→base angular converter. placo consumes angular as a base-frame
             # velocity and does NOT transform it, so the raw tool-frame VR angular
@@ -647,18 +613,15 @@ class VRTeleopNode(Node):
         self.create_timer(0.5, self._ensure_so101_started)
 
     def destroy_node(self) -> None:
-        if (
-            self._output_profile == "so101"
-            and self._so101_stop_cli
-            and self._so101_stop_cli.service_is_ready()
-        ):
+        self._cancel_so101_home("VR teleop node shutdown")
+        if self._output_profile == "so101" and self._so101_stop_cli and self._so101_stop_cli.service_is_ready():
             self._so101_stop_cli.call_async(Trigger.Request())
         if self._tcp_server:
             self._tcp_server.stop()
         super().destroy_node()
 
     def _ensure_so101_started(self) -> None:
-        if self._output_profile != "so101":
+        if self._output_profile != "so101" or self._estop_active:
             return
         # If a stop is pending but never confirmed (e.g. it was rejected while the
         # stream was still fresh, so no watchdog tick retries it), drive the retry
@@ -669,7 +632,13 @@ class VRTeleopNode(Node):
         if self._so101_stop_pending and not self._so101_stop_inflight:
             self._stop_so101_servo("retry pending stop from watchdog timer")
             return
-        if self._so101_started or self._so101_start_inflight:
+        if (
+            self._so101_started
+            or self._so101_start_inflight
+            or self._homing
+            or self._so101_home_inflight
+            or self._so101_reengage_required
+        ):
             return
         # Do NOT auto-restart while the command stream is stalled/disconnected, a
         # stop is still inflight, or a stop is pending (requested but not yet
@@ -701,9 +670,7 @@ class VRTeleopNode(Node):
         # intent: the servo is now running, so issue the deferred stop instead of
         # flipping _so101_started back on and resuming tracking.
         if self._so101_stalled or self._so101_stop_pending:
-            self.get_logger().warn(
-                "SO101 servo start completed but a stop is pending; stopping"
-            )
+            self.get_logger().warn("SO101 servo start completed but a stop is pending; stopping")
             self._stop_so101_servo("start completed while stop pending")
             return
         self._so101_started = True
@@ -725,17 +692,15 @@ class VRTeleopNode(Node):
         # _so101_started is cleared unconditionally: whatever raced, the node's
         # intent is now "stopped", and the auto-start timer keys off this flag.
         self._so101_started = False
+        self._so101_reengage_required = True
+        self._cancel_so101_home(reason)
         if self._so101_stop_inflight:
             # A stop is already on the wire; its response will resolve pending.
             return
-        # A start/recalib/home is inflight. Issuing stop now would race their
+        # A start/recalib is inflight. Issuing stop now would race their
         # success callbacks (which set _so101_started=True). Latch intent; the
         # callback re-issues stop once it lands, or the watchdog retries next tick.
-        if (
-            self._so101_start_inflight
-            or self._so101_recalib_inflight
-            or self._so101_home_inflight
-        ):
+        if self._so101_start_inflight or self._so101_recalib_inflight:
             self._so101_stop_pending = True
             return
         if self._so101_stop_cli is None or not self._so101_stop_cli.service_is_ready():
@@ -758,15 +723,11 @@ class VRTeleopNode(Node):
         except Exception as exc:  # noqa: BLE001
             # Stop never landed. Keep _so101_stop_pending latched so the watchdog
             # retries; the arm is NOT confirmed stopped.
-            self.get_logger().error(
-                f"SO101 servo stop request failed: {exc}; will retry"
-            )
+            self.get_logger().error(f"SO101 servo stop request failed: {exc}; will retry")
             return
         if not response.success:
             # Servo rejected the stop; stay pending and retry.
-            self.get_logger().error(
-                response.message or "SO101 servo rejected stop request; will retry"
-            )
+            self.get_logger().error(response.message or "SO101 servo rejected stop request; will retry")
             return
         # Confirmed stopped. Release the deadman latch. _so101_stalled stays set
         # (input still untrusted) until a trigger release clears it.
@@ -787,6 +748,8 @@ class VRTeleopNode(Node):
         the next frame emit a real displacement with no inflight gate, which
         jumps the arm on the very first press after startup.
         """
+        if self._estop_active:
+            return False
         if self._so101_start_cli is None or not self._so101_start_cli.service_is_ready():
             self.get_logger().warning(
                 "SO101 start service not ready on trigger press; deferring "
@@ -828,14 +791,13 @@ class VRTeleopNode(Node):
             # servo is now enabled, so honor the pending stop instead of marking
             # started and resuming tracking.
             if self._so101_stop_pending or self._so101_stalled:
-                self.get_logger().warn(
-                    "SO101 re-latch completed but a stop is pending; stopping"
-                )
+                self.get_logger().warn("SO101 re-latch completed but a stop is pending; stopping")
                 self._pose_calib_pos = None
                 self._pose_calib_rot = None
                 self._stop_so101_servo("re-latch completed while stop pending")
                 return
             self._so101_started = True
+            self._so101_reengage_required = False
             self.get_logger().info("SO101 baseline re-latched on trigger press")
         else:
             self.get_logger().error(response.message or "SO101 servo rejected re-latch")
@@ -845,64 +807,84 @@ class VRTeleopNode(Node):
             self._pose_calib_rot = None
 
     def _go_home_so101(self) -> bool:
-        """B-button (secondary): drive the arm to the configured home pose via
-        placo's home service. Async, guarded against re-entry. Independent of
-        the trigger — home works whether or not the clutch is engaged.
-
-        Returns True only if a home request was actually dispatched. When it
-        returns False (service not ready, or a request already inflight) the
-        caller MUST NOT engage the homing gate — otherwise the arm never moves
-        home yet pose input stays frozen until the trigger is released."""
-        if self._so101_home_cli is None or not self._so101_home_cli.service_is_ready():
-            self.get_logger().warn("SO101 home service not ready")
+        """Dispatch the shared transactional ArmReturnHome action."""
+        if self._estop_active:
             return False
-        # Home enables the servo, so it is a start path: refuse while a stop is
-        # pending or the stream is stalled. Homing a dead-input arm would re-enable
-        # tracking behind the watchdog's back.
+        if self._so101_home_cli is None or not self._so101_home_cli.server_is_ready():
+            self.get_logger().warn("SO101 ArmReturnHome action not ready")
+            return False
         if self._so101_stop_pending or self._so101_stalled:
-            self.get_logger().warn(
-                "SO101 home refused: stop pending / stream stalled"
-            )
+            self.get_logger().warn("SO101 ArmReturnHome refused: stop pending / stream stalled")
             return False
         if self._so101_home_inflight:
             return False
+
         self._so101_home_inflight = True
-        future = self._so101_home_cli.call_async(Trigger.Request())
-        future.add_done_callback(self._on_so101_home_response)
+        self._so101_home_cancel_pending = False
+        self._so101_started = False
+        self._so101_reengage_required = True
+        goal = ArmReturnHome.Goal()
+        goal.target_name = "home"
+        try:
+            future = self._so101_home_cli.send_goal_async(goal)
+        except Exception as exc:  # noqa: BLE001
+            self._so101_home_inflight = False
+            self.get_logger().error(f"SO101 ArmReturnHome dispatch failed: {exc}")
+            return False
+        future.add_done_callback(self._on_so101_home_goal_response)
         return True
 
-    def _on_so101_home_response(self, future) -> None:
-        self._so101_home_inflight = False
+    def _on_so101_home_goal_response(self, future) -> None:
         try:
-            response = future.result()
+            goal_handle = future.result()
         except Exception as exc:  # noqa: BLE001
-            self.get_logger().error(f"SO101 home request failed: {exc}")
-            # Home never happened → release the gate so pose input is not frozen
-            # waiting for an arm that is not moving. The next held frame re-arms.
-            self._homing = False
+            self._so101_home_inflight = False
+            self._home_terminal = True
+            self.get_logger().error(f"SO101 ArmReturnHome goal request failed: {exc}")
+            self._release_home_gate_if_ready()
             return
-        if response.success:
-            # A stop that latched while home was inflight must win.
-            if self._so101_stop_pending or self._so101_stalled:
-                self.get_logger().warn(
-                    "SO101 home completed but a stop is pending; stopping"
-                )
-                self._homing = False
-                self._stop_so101_servo("home completed while stop pending")
-                return
-            self._so101_started = True
-            # Start the settle window HERE, on the confirmed home response, not at
-            # dispatch: the service round-trip can be slow, and the arm only begins
-            # moving once the servo has accepted home. Timing from dispatch would
-            # let a delayed response eat into the settle budget, lifting the gate
-            # before the arm has actually traveled. See the release path in
-            # _control_so101_pose.
-            self._home_dispatch_time = time.monotonic()
-            self.get_logger().info("SO101 moving to home pose")
-        else:
-            self.get_logger().error(response.message or "SO101 servo rejected home")
-            # Servo refused the home request → same as the exception path: do not
-            # leave pose input frozen behind a homing gate that will never lift.
+        if not goal_handle.accepted:
+            self._so101_home_inflight = False
+            self._home_terminal = True
+            self.get_logger().error("SO101 ArmReturnHome goal was rejected")
+            self._release_home_gate_if_ready()
+            return
+
+        self._so101_home_goal_handle = goal_handle
+        if self._so101_home_cancel_pending or self._so101_stop_pending or self._so101_stalled:
+            goal_handle.cancel_goal_async()
+        goal_handle.get_result_async().add_done_callback(self._on_so101_home_result)
+        self.get_logger().info("SO101 ArmReturnHome accepted")
+
+    def _on_so101_home_result(self, future) -> None:
+        self._so101_home_inflight = False
+        self._so101_home_goal_handle = None
+        self._so101_home_cancel_pending = False
+        self._home_terminal = True
+        self._so101_started = False
+        try:
+            result = future.result().result
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(f"SO101 ArmReturnHome result failed: {exc}")
+            self._release_home_gate_if_ready()
+            return
+
+        log = self.get_logger().info if result.success else self.get_logger().error
+        log(result.message or result.error_code or "SO101 ArmReturnHome completed")
+        self._release_home_gate_if_ready()
+        if self._so101_stop_pending and not self._so101_stop_inflight:
+            self._stop_so101_servo("ArmReturnHome completed while stop pending")
+
+    def _cancel_so101_home(self, reason: str) -> None:
+        if not self._so101_home_inflight:
+            return
+        self._so101_home_cancel_pending = True
+        if self._so101_home_goal_handle is not None:
+            self._so101_home_goal_handle.cancel_goal_async()
+        self.get_logger().warn(f"Canceling SO101 ArmReturnHome: {reason}")
+
+    def _release_home_gate_if_ready(self) -> None:
+        if self._homing and self._home_terminal and not self._home_deadman_held:
             self._homing = False
 
     def _control_callback(self) -> None:
@@ -910,14 +892,12 @@ class VRTeleopNode(Node):
         if event is not None:
             if event.startswith("connected"):
                 addr = event.split(" ", 1)[1]
-                self.get_logger().info(
-                    "\n" + "=" * 60 + "\n"
-                    + f"  VR CLIENT CONNECTED from {addr}\n"
-                    + "=" * 60
-                )
+                self.get_logger().info("\n" + "=" * 60 + "\n" + f"  VR CLIENT CONNECTED from {addr}\n" + "=" * 60)
             elif event == "disconnected":
                 self.get_logger().info(
-                    "\n" + "=" * 60 + "\n"
+                    "\n"
+                    + "=" * 60
+                    + "\n"
                     + "  VR CLIENT DISCONNECTED\n"
                     + "  Waiting for new connection...\n"
                     + "=" * 60
@@ -964,25 +944,18 @@ class VRTeleopNode(Node):
             self._arm_state[side].ema_linear = np.zeros(3)
             self._arm_state[side].ema_angular = np.zeros(3)
         if self._output_profile == "so101":
+            # No fresh data (hard disconnect / client exit): request a servo stop
+            # for both pose and velocity modes. Publishing zero velocity is not a
+            # transactional stop and would not cancel an active ArmReturnHome action.
             if self._so101_input_mode == "pose":
-                # No fresh data (hard disconnect / client exit): placo would keep
-                # driving to the last pose reference, so request a servo stop on
-                # the rising edge — publishing nothing is not enough. If that
-                # stop is not confirmed, the stop-pending latch retries it on
-                # later no-data ticks. Keep the auto-start timer suppressed until
-                # fresh frames return and the user deliberately re-grips.
                 self._pose_calib_pos = None
                 self._pose_calib_rot = None
-                self._homing = False
-                if not self._so101_stalled:
-                    self._so101_stalled = True
-                    self._stop_so101_servo("VR command stream disconnected")
-                elif self._so101_stop_pending:
-                    # Disconnected and the deadman stop never confirmed: retry
-                    # every no-data tick until the servo acknowledges stopped.
-                    self._stop_so101_servo("stop still pending while disconnected")
-                return
-            self._publish_so101(np.zeros(3), np.zeros(3), None)
+            self._homing = False
+            if not self._so101_stalled:
+                self._so101_stalled = True
+                self._stop_so101_servo("VR command stream disconnected")
+            elif self._so101_stop_pending:
+                self._stop_so101_servo("stop still pending while disconnected")
             return
         for side in ("left", "right"):
             self._publish_zero(side)
@@ -1006,9 +979,7 @@ class VRTeleopNode(Node):
         self._homing = False
         if not self._so101_stalled:
             self._so101_stalled = True
-            self._stop_so101_servo(
-                f"VR command stream stalled (> {self._so101_command_stale_s:.2f}s)"
-            )
+            self._stop_so101_servo(f"VR command stream stalled (> {self._so101_command_stale_s:.2f}s)")
         elif self._so101_stop_pending:
             # Already stalled but the deadman stop never confirmed. Keep
             # retrying every stale tick until the servo acknowledges — a single
@@ -1017,6 +988,10 @@ class VRTeleopNode(Node):
 
     def _control_so101(self, data: _DualArmVRData) -> None:
         ctrl = getattr(data, self._controller_side)
+        if self._estop_active:
+            return
+        if self._handle_so101_home_input(ctrl):
+            return
         if self._so101_input_mode == "pose":
             self._control_so101_pose(ctrl)
             return
@@ -1052,6 +1027,60 @@ class VRTeleopNode(Node):
         linear, angular = self._compute_velocities(ctrl, state)
         self._publish_so101(linear, angular, ctrl.grip_value)
 
+    def _on_estop(self, msg: Bool) -> None:
+        if bool(msg.data):
+            self._estop_active = True
+            self._pose_calib_pos = None
+            self._pose_calib_rot = None
+            self._homing = False
+            self._so101_stalled = True
+            self._stop_so101_servo("emergency stop")
+            return
+        self._estop_active = False
+        self.get_logger().info("VR emergency stop released; release and re-press trigger to resume")
+
+    def _handle_so101_home_input(self, ctrl: _ControllerData | None) -> bool:
+        """Own the Home button/gate for both pose and velocity input modes."""
+        secondary = bool(getattr(ctrl, "secondary_button", False)) if ctrl is not None else False
+        if secondary and not self._secondary_prev:
+            self._secondary_prev = True
+            if self._go_home_so101():
+                self._pose_calib_pos = None
+                self._pose_calib_rot = None
+                state = self._arm_state[self._controller_side]
+                state.prev_pos = None
+                state.prev_rot = None
+                state.enabled_prev = False
+                state.ema_linear = np.zeros(3)
+                state.ema_angular = np.zeros(3)
+                self._homing = True
+                self._home_terminal = False
+                self._home_deadman_held = bool(ctrl is not None and ctrl.enabled)
+                return True
+        else:
+            self._secondary_prev = secondary
+
+        if not self._homing:
+            if not self._so101_reengage_required:
+                return False
+            if ctrl is None or not ctrl.enabled:
+                return False
+            if self._so101_stalled or self._so101_stop_pending:
+                return False
+            if self._so101_recalib_inflight:
+                return True
+            if self._so101_input_mode == "pose":
+                self._pose_calib_pos = ctrl.position.copy()
+                self._pose_calib_rot = ctrl.rotation
+            if not self._recalibrate_so101_baseline():
+                self._pose_calib_pos = None
+                self._pose_calib_rot = None
+            return True
+        if ctrl is not None:
+            self._home_deadman_held = bool(ctrl.enabled)
+        self._release_home_gate_if_ready()
+        return self._homing
+
     def _control_so101_pose(self, ctrl: _ControllerData | None) -> None:
         """Pose passthrough: publish a RELATIVE (clutch) pose command.
 
@@ -1065,49 +1094,6 @@ class VRTeleopNode(Node):
         own enable (_ee0_p / _ee0_R), so a held hand holds the arm and a zero
         delta at press means no motion.
         """
-        # B-button (secondary) rising edge → go to home pose. Independent of the
-        # trigger/clutch: home works whether or not the arm is engaged.
-        secondary = bool(ctrl.secondary_button) if ctrl is not None else False
-        if secondary and not self._secondary_prev:
-            self._secondary_prev = secondary
-            dispatched = self._go_home_so101()
-            if not dispatched:
-                # Home request was not dispatched (service not ready or one is
-                # already inflight). Do NOT drop the clutch or engage the homing
-                # gate — that would freeze pose input while the arm stays put.
-                # Fall through and keep teleoperating normally this frame.
-                pass
-            else:
-                # Clear the clutch baseline and skip this frame's pose command.
-                # Otherwise, if the trigger is still held, the code below would
-                # keep publishing a displacement computed against the OLD calib,
-                # which placo overlays onto the home reference it just latched —
-                # the arm ends up at home+offset instead of home, or never
-                # reaches home. Dropping the calib pauses pose input; the next
-                # held frame re-arms via the rising-edge path and re-latches
-                # placo's baseline (now at home), so teleop resumes cleanly.
-                self._pose_calib_pos = None
-                self._pose_calib_rot = None
-                # Latch the homing gate: home is async (the service returns
-                # before the arm arrives). Re-arming the clutch NOW would
-                # re-latch placo's baseline to the arm's mid-transit pose and
-                # overwrite the home target. The gate is held until the trigger
-                # has been released AND a conservative settle time has elapsed
-                # (so a quick release-then-press mid-transit cannot re-baseline a
-                # moving arm); see the release path below. It is also released if
-                # the async home response comes back failed (see
-                # _on_so101_home_response).
-                self._homing = True
-                # Mark the settle timer unconfirmed: it starts only when the async
-                # home response comes back successful (_on_so101_home_response), so
-                # a slow round-trip cannot shorten the settle window, and the gate
-                # never lifts before the servo has accepted home.
-                self._home_dispatch_time = None
-                if ctrl is not None:
-                    self._publish_so101_gripper(ctrl.grip_value)
-                return
-        self._secondary_prev = secondary
-
         if ctrl is None or not ctrl.enabled:
             # Trigger released or controller absent: clear clutch baseline and
             # publish nothing for the ARM (placo holds last reference). Next
@@ -1116,23 +1102,6 @@ class VRTeleopNode(Node):
             # holding the trigger.
             self._pose_calib_pos = None
             self._pose_calib_rot = None
-            # Clear the homing gate only once the arm has had time to settle at
-            # home: trigger released AND at least so101_home_settle_s since the
-            # home service confirmed success. A release alone is not enough — home
-            # is async, so a quick release-then-press during the travel would let
-            # the next press re-latch placo's baseline onto the still-moving arm
-            # and abort the home. Until settle, keep _homing latched so the
-            # re-press path below holds instead of re-baselining.
-            if self._homing:
-                # Lift only after the home was CONFIRMED (the response callback
-                # records the timestamp) AND the settle window has elapsed. While
-                # unconfirmed (None), the gate stays latched.
-                if (
-                    self._home_dispatch_time is not None
-                    and (time.monotonic() - self._home_dispatch_time)
-                    >= self._so101_home_settle_s
-                ):
-                    self._homing = False
             # A release is also what clears a stall. Fresh frames alone do NOT
             # resume motion (see _control_callback): the arm was stopped on
             # purpose, so recovery requires the user to let go and deliberately
@@ -1144,13 +1113,6 @@ class VRTeleopNode(Node):
             if ctrl is not None:
                 self._so101_stalled = False
                 self._publish_so101_gripper(ctrl.grip_value)
-            return
-
-        # Homing gate: B was pressed while the trigger stayed held. Hold pose
-        # input (arm keeps driving to home under placo) until the trigger is
-        # released once; do not re-arm the clutch against a mid-transit pose.
-        if self._homing:
-            self._publish_so101_gripper(ctrl.grip_value)
             return
 
         # Enable rising edge (first frame with trigger held): latch clutch
@@ -1240,18 +1202,14 @@ class VRTeleopNode(Node):
         msg.data = [gripper_pos]
         self._so101_gripper_pub.publish(msg)
 
-    def _compute_velocities(
-        self, ctrl: _ControllerData, state: _ArmState
-    ) -> tuple:
+    def _compute_velocities(self, ctrl: _ControllerData, state: _ArmState) -> tuple:
         if state.calib_pos is None or state.calib_rot is None:
             state.calib_pos = ctrl.position.copy()
             state.calib_rot = ctrl.rotation
             state.prev_pos = None
             state.prev_rot = None
             state.enabled_prev = False
-            self.get_logger().info(
-                f"Arm calibrated on first data. Ref pos: {state.calib_pos}"
-            )
+            self.get_logger().info(f"Arm calibrated on first data. Ref pos: {state.calib_pos}")
             return np.zeros(3), np.zeros(3)
 
         if not ctrl.enabled:
