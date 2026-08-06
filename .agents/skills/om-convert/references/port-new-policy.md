@@ -139,7 +139,9 @@ Compile the portable design with the resolved exact `soc_version`. Start with:
 
 - static shapes;
 - FP16 ONNX;
-- `--precision_mode_v2=origin` initially, with only `origin` or `default` permitted;
+- `--precision_mode_v2=origin` initially; after accuracy passes, optionally test
+  ATC-default `--precision_mode_v2=fp16` against the same targets;
+- do not pass the literal value `default`;
 - no legacy `--precision_mode` argument;
 - no quantization;
 - no approximate operators;

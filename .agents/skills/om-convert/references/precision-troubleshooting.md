@@ -160,10 +160,15 @@ Never infer OM accuracy from ORT success for a different opset.
 
 ## ATC Precision And Fusion Diagnosis
 
-Use `--precision_mode_v2`, never the legacy `--precision_mode`. Permit only:
+Use `--precision_mode_v2`, never the legacy `--precision_mode`. The normal comparison is:
 
 - `origin` for the conservative baseline;
-- `default` as an explicit diagnostic or measured candidate.
+- `fp16` for the ATC-default candidate after `origin` passes.
+
+Do not pass the literal value `default`. In the tested ATC interface, `fp16` is the default value. Either
+omit `--precision_mode_v2` or pass `--precision_mode_v2=fp16`; prefer the explicit form in reproduction
+commands and record the exact ATC help output. The `fp16` candidate remains subject to the unchanged
+final-action accuracy gate; successful ATC compilation does not establish equivalence.
 
 Do not use undocumented or broader precision modes through this skill.
 

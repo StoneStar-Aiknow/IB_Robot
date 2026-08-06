@@ -14,7 +14,7 @@ Use these 12 experience IDs for every run:
 | `E02` | Persist one authoritative native-Torch target/observation/task/seed/noise package across all candidates. |
 | `E03` | Prefer opset-17 portable FP16 ONNX on 310P, with only correctness-required FP32 islands. |
 | `E04` | Keep image resize, padding, and risky reshape logic on the host when ATC semantics are suspect. |
-| `E05` | Use `precision_mode_v2=origin|default` and investigate precision before approximating math. |
+| `E05` | Establish `precision_mode_v2=origin`, then optionally test ATC-default `fp16` against the same accuracy targets before approximating math. |
 | `E06` | Diagnose fusion-induced drift by compiling a no-fusion candidate. |
 | `E07` | Correct dtype/layout/operator eligibility, including upstream FP32 islands that poison downstream MatMul/BMM kernels on 310P. |
 | `E08` | Eliminate exact glue and host transfer, including shared ACL buffers between serial OM roles. |

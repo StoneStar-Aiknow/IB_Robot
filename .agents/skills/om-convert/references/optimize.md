@@ -89,8 +89,9 @@ An earlier `attempted_no_gain` or regression lowers priority only for a material
 It is not a permanent skip rule. Re-evaluate when policy family, shapes, compiler, dtype, or exact SoC changes.
 
 For Ascend310P, read `ascend310p-optimization.md` before proposing the ladder. Default to opset 17 and
-end-to-end FP16 with only accuracy-proven FP32 islands. Give PFA low priority and prefer standard-ONNX
-rank-3 BMM rewrites.
+end-to-end FP16 with only accuracy-proven FP32 islands. Establish an `origin` ATC baseline first, then
+optionally compile the ATC-default `fp16` candidate against the same targets; do not pass the literal
+value `default`. Give PFA low priority and prefer standard-ONNX rank-3 BMM rewrites.
 
 ### 0. Freeze The Baseline
 
@@ -145,6 +146,44 @@ LayerNorm may show no gain.
 Make QK, PV, Linear, and other MatMul paths FP16 by default. Test rank-3 batch/head flattening together
 with FP16; an FP32 rank-3 candidate can regress even when rank-3 plus FP16 wins. Retain FP32 only for
 islands required by final-action accuracy.
+
+### 2B. ATC Precision Mode Philosophy
+
+Use two deliberate stages rather than treating compiler precision modes as interchangeable:
+
+```text
+origin
+-> conservative compiler precision baseline
+-> establish accepted Torch-vs-OM accuracy
+
+fp16 (ATC default; omit the option or pass --precision_mode_v2=fp16)
+-> performance candidate
+-> compare against the same authoritative Torch targets
+```
+
+Use `origin` first when the deployment contract or accuracy behavior is not established. Once `origin`
+passes, try ATC-default `fp16` when precision selection may expose more high-performance FP16 kernels or
+remove unnecessary precision barriers. This is especially useful when the ONNX graph already preserves
+explicit FP32 islands for Softmax, masks, reductions, or other sensitive stages: ATC can optimize other
+eligible operators without changing the graph.
+
+The `fp16` candidate must pass the unchanged accuracy and deployment gates:
+
+1. same observations, targets, raw targets, task, seed, and persisted noise;
+2. same Torch-vs-OM mean-L1 and cosine limits as `origin`;
+3. exact ABI and same-SoC deployment validation;
+4. complete-role `ais_bench --loop 20` and invocation-weighted latency comparison.
+
+Do not pass the literal `--precision_mode_v2=default`. In the tested ATC interface, `fp16` is the default
+value. Prefer the explicit, reproducible spelling:
+
+```bash
+--precision_mode_v2=fp16
+```
+
+If the option is omitted to exercise the compiler default, record that omission and the exact ATC help
+output. Never use the legacy `--precision_mode` option. If `fp16` fails accuracy or produces non-finite
+outputs, keep `origin`, record the failure, and do not relax thresholds or regenerate targets.
 
 ### 3. Eliminate Exact Glue
 

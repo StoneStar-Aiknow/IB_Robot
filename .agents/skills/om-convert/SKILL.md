@@ -199,8 +199,10 @@ evidence, ATC version, target, and resolution source.
 - Do not run the IB-Robot `hardware_mock`/LTTng trace-summary workflow in conversion or optimization.
   Diagnostic Ascend profiling with `msprof` remains allowed during optional optimization.
 - Export ONNX in FP16 by default, retaining only explicit FP32 islands required for demonstrated
-  correctness. Compile with `--precision_mode_v2=origin` by default. The only permitted
-  `precision_mode_v2` values are `origin` and `default`; never use the legacy `precision_mode` option.
+  correctness. Use `--precision_mode_v2=origin` as the conservative ATC accuracy baseline. After it
+  passes, optionally compile the ATC-default `fp16` candidate to look for additional performance, using
+  the same authoritative Torch targets. The accepted workflow values are `origin` and `fp16`; do not pass
+  the literal value `default`, and never use the legacy `precision_mode` option.
 - On Ascend310P, prefer ONNX opset 17 unless the installed exporter/ATC combination proves it invalid.
   Verify that standard `LayerNormalization` nodes survive export and map to AI Core; opset <=16 may
   decompose them into slow AI CPU primitives.
@@ -244,7 +246,8 @@ For a LeRobot-supported policy not previously supported by IB-Robot, the default
 1. an isolated worktree contains the required exporter/runtime changes;
 2. IB-Robot runs the original Torch deployment and generates reusable targets;
 3. Torch vs ONNX is evaluated against the agreed limits;
-4. conservative FP16 OM, ACL ABI, Manifest, and runtime loading are complete;
+4. conservative `origin` and, when selected, ATC-default `fp16` OM, ACL ABI, Manifest, and runtime
+   loading are complete;
 5. Torch vs Ascend OM is evaluated against the same baseline;
 6. each OM has an `ais_bench --loop 20` report and the weighted total is calculated;
 7. reports, decisions, source diff, and reproduction commands are retained.

@@ -60,6 +60,12 @@ probabilities were cast to the value dtype.
 Test shape and dtype changes together. An FP32 rank-3 candidate can regress even when rank-3 plus FP16 is
 the winning combination. Retain FP32 only for accuracy-proven islands.
 
+Compiler precision mode is a separate candidate axis from ONNX tensor dtype. First compile
+`--precision_mode_v2=origin` to establish the conservative accuracy baseline. Once accepted, optionally
+compile the same ONNX with ATC-default `--precision_mode_v2=fp16`; it may expose additional FP16 kernel
+selection while preserving explicit graph-level FP32 islands. Accept it only when the same final-action
+limits pass and loop-20 weighted latency improves. Do not pass the literal value `default`.
+
 ## FP32 Islands Can Poison Downstream Kernels
 
 Treat an FP32 island as a connected region inside an otherwise FP16 graph where dtype promotion keeps

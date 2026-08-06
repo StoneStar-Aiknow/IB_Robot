@@ -187,8 +187,9 @@ abi_path = work_dir / "model.om.abi.json"
 soc_version = "RESOLVED_SOC_VERSION"
 
 # ACT support must first extend convert_onnx_to_om() to append
-# --precision_mode_v2=RESOLVED_PRECISION_MODE_V2. The resolved value is only
-# "origin" or "default"; never use --precision_mode.
+# --precision_mode_v2=RESOLVED_PRECISION_MODE_V2. The resolved value is
+# "origin" or "fp16"; "fp16" is ATC's default precision mode. Never pass
+# the literal value "default" and never use --precision_mode.
 if not convert_onnx_to_om(config, str(onnx_path), str(om_path), soc_version):
     raise RuntimeError("ACT ATC conversion failed")
 

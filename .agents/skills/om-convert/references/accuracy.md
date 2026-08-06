@@ -155,6 +155,11 @@ Every performance candidate must rerun any comparison affected by its changes:
 
 A candidate that improves latency but fails accepted accuracy limits is rejected and rolled back.
 
+`precision_mode_v2` candidates follow the same rule. Accept `origin` as the conservative compiler baseline
+first. An ATC-default `fp16` candidate may then reuse the exact ONNX identity and target package, but must
+pass the same final-action limits. A faster `fp16` candidate that exceeds those limits is rejected; the ATC
+default is not an accuracy waiver.
+
 ## Troubleshooting
 
 When a gate fails, follow `precision-troubleshooting.md`. It records proven failure modes involving image
