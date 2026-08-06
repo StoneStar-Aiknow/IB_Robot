@@ -3,10 +3,10 @@ from threading import Lock
 from types import SimpleNamespace
 
 import pytest
-from manipulation_execution.pick_executor_node import PickExecutorNode, PickFlowError
 
 from embodied_common.dispatch_binding import delegated_executor_identity, fill_delegated_executor_identity, new_binding
 from ibrobot_msgs.action import PickObject
+from manipulation_execution.pick_executor_node import PickExecutorNode, PickFlowError
 
 
 class _PrimitiveClient:
@@ -33,7 +33,14 @@ class _PrimitiveHarness:
         self._arm_joint_names = []
         self._primitive_handle = SimpleNamespace(accepted=True, get_result_async=lambda: object())
         self._action_result = SimpleNamespace(
-            result=SimpleNamespace(success=success, error_code="MOTION_FAILED", message="motion failed")
+            result=SimpleNamespace(
+                success=success,
+                error_code="MOTION_FAILED",
+                message="motion failed",
+                actual_registry_epoch="epoch-1",
+                actual_registry_generation=2,
+                actual_registry_digest="digest-2",
+            )
         )
         self._wait_count = 0
 

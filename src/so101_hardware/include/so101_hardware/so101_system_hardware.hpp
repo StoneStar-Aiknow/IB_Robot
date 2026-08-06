@@ -46,6 +46,57 @@ ActivationRollbackResult rollback_activation(
   const std::vector<u8> & motor_ids, const std::set<u8> & unlocked_motors,
   const std::function<int(u8, u8)> & enable_torque,
   const std::function<int(u8)> & lock_eprom, int retry_count = 3);
+
+// One decoded Feetech feedback frame for a single motor (raw servo units).
+// Promoted to the header so the activation initial-sync helper below can be
+// unit-tested without a live serial bus.
+struct FeedbackSample
+{
+  int position{0};
+  int speed{0};
+  int current{0};
+};
+
+// Outcome of the initial feedback sync read performed during on_activate.
+// The two failure modes are reported distinctly so the caller can log a
+// precise diagnostic before routing through abort_activation.
+struct InitialSyncFeedbackOutcome
+{
+  // True only when every motor returned a full, CRC-valid feedback frame and
+  // hw_commands/positions/velocities/currents were fully seeded.
+  bool success{false};
+  // True when the failure was the sync-read transmit / bus reply (Tx returned
+  // <= 0). When false and success is false, the failure was a per-motor Rx.
+  bool tx_failed{false};
+  // Motor ID whose syncReadPacketRx failed first (valid only when !success &&
+  // !tx_failed). Reported as-is in the activation abort log.
+  u8 failed_motor_id{0};
+};
+
+// Seed hw_commands/positions/velocities/currents from the first sync-read
+// round after torque is enabled. Fail-closed: returns success=false if the
+// sync-read transmit fails (do_sync_tx returns <= 0) or if ANY motor's Rx
+// fails (do_sync_rx returns false), so on_activate can route through
+// abort_activation (torque off / EPROM relock / port close) instead of
+// dismissing the rollback guard with partially-initialised state.
+//
+// This helper is hardware-agnostic: it takes the SMS_STS sync-read operations
+// as callbacks, so unit tests can inject Tx/Rx failures without a real bus.
+// Note: SMS_STS::syncReadBegin returns void (verified in SCS.h) and only
+// allocates the SDK receive buffer, so it is NOT a fail-closed gate; the gate
+// is the Tx return value checked here.
+InitialSyncFeedbackOutcome perform_initial_sync_feedback(
+  const std::vector<u8> & motor_ids,
+  bool has_reset_positions,
+  const std::vector<double> & reset_positions,
+  double ticks_per_rad,
+  double current_raw_to_ampere,
+  const std::function<int()> & do_sync_tx,
+  const std::function<bool(u8, FeedbackSample &)> & do_sync_rx,
+  std::vector<double> & hw_commands,
+  std::vector<double> & hw_positions,
+  std::vector<double> & hw_velocities,
+  std::vector<double> & hw_currents);
 } // namespace detail
 
 class SafeSMSSTS : public SMS_STS

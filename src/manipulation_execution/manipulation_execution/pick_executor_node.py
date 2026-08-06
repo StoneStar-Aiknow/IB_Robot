@@ -23,6 +23,7 @@ from embodied_common.dispatch_binding import (
     delegated_executor_identity,
     delegated_executor_identity_matches,
     fill_delegated_executor_identity,
+    load_delegated_model_identity,
 )
 from ibrobot_msgs.action import PickObject, PrimitiveCommand
 from ibrobot_msgs.srv import DetectSegment, MoveToConfiguration, PlanGrasp, VerifyGrasp
@@ -107,6 +108,7 @@ class PickExecutorNode(
             name="grasp_pipeline",
             endpoint_name=self._action_name,
             configuration=self._config,
+            **load_delegated_model_identity(self._config),
         )
         self._workspace = self._load_json_object(self.get_parameter("workspace_json").value)
         self._home_joint_positions = {
@@ -255,7 +257,6 @@ class PickExecutorNode(
             or deadline <= now
             or not math.isfinite(timeout_sec)
             or timeout_sec <= 0.0
-            or timeout_sec > deadline - now
         ):
             return GoalResponse.REJECT
         with self._goal_lock:

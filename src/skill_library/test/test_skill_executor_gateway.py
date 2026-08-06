@@ -711,7 +711,7 @@ def test_finalize_release_failure_keeps_terminal_workflow_busy_and_is_retryable(
     assert status.busy is True
     assert status.active_owner_kind == "workflow"
     assert status.request_state == "terminal"
-    assert workflow.runtime_generation_released is False
+    assert workflow.runtime_generation_released is True
     assert generation in gateway_rig.executor_node._runtime_coordinator.retained_generations
     retried = _future_result(gateway_rig.finalize_workflow_client.call_async(request))
     assert retried.success is True

@@ -199,6 +199,36 @@ REGISTRY_PREIMAGE_SCHEMA_VERSION = 1
 CAPABILITY_PREIMAGE_SCHEMA_VERSION = 1
 PROVENANCE_PREIMAGE_SCHEMA_VERSION = 1
 
+REGISTRY_PREIMAGE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "robot_name",
+        "profile_name",
+        "primitive_contract_digest",
+        "robot_context",
+        "delegated_executors",
+        "skills",
+        "aliases",
+        "parameter_schemas",
+        "requirements",
+        "enabled_skill_names",
+        "planner_visible_skill_names",
+    }
+)
+CAPABILITY_PREIMAGE_FIELDS = frozenset(
+    {
+        "schema_version",
+        "robot_name",
+        "profile_name",
+        "capability_view",
+        "enabled_skill_names",
+        "planner_visible_skill_names",
+        "named_pose_names",
+        "timeout_policy",
+    }
+)
+PROVENANCE_PREIMAGE_FIELDS = frozenset({"schema_version", "source_release_digest", "skill_package_digests"})
+
 
 def _robot_context_to_preimage(robot_context: Any) -> dict[str, Any]:
     return {
@@ -238,6 +268,7 @@ def _skill_to_registry_entry(
     template: Any,
     *,
     semantic_levels: Mapping[str, str],
+    capability_view: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Build a ``registry_preimage_v1.skills[]`` entry (section 6.4).
 
@@ -252,6 +283,11 @@ def _skill_to_registry_entry(
     version = body.get("version", "0.0.0")
     implementation_identity = body.get("implementation_identity", "")
     clean_body = {key: value for key, value in body.items() if key not in ("version", "implementation_identity")}
+    # The public capability is duplicated inside the registry-bound template so
+    # consumers can deterministically reconstruct capability_preimage_v1. This
+    # prevents a valid capability digest from being paired with an unrelated
+    # execution registry.
+    clean_body["capability"] = _as_mapping(capability_view[name])
     return {
         "name": name,
         "version": version,
@@ -273,6 +309,7 @@ def derive_registry_preimage(
     aliases: Mapping[str, Any],
     parameter_schemas: Mapping[str, Any],
     requirements: Mapping[str, Any],
+    capability_view: Mapping[str, Any],
     enabled_skill_names: Iterable[str],
     planner_visible_skill_names: Iterable[str],
 ) -> dict[str, Any]:
@@ -282,7 +319,13 @@ def derive_registry_preimage(
     """
 
     skills = [
-        _skill_to_registry_entry(name, templates[name], semantic_levels=semantic_levels) for name in sorted(templates)
+        _skill_to_registry_entry(
+            name,
+            templates[name],
+            semantic_levels=semantic_levels,
+            capability_view=capability_view,
+        )
+        for name in sorted(templates)
     ]
     executors = [_delegated_executor_to_preimage(delegated_executors[name]) for name in sorted(delegated_executors)]
     return {
@@ -299,6 +342,52 @@ def derive_registry_preimage(
         "enabled_skill_names": sorted(enabled_skill_names),
         "planner_visible_skill_names": sorted(planner_visible_skill_names),
     }
+
+
+def derive_capability_view_from_registry(registry_preimage: Mapping[str, Any]) -> dict[str, Any]:
+    """Rebuild the public view using only registry-bound normalized entries."""
+
+    skills = registry_preimage.get("skills")
+    schemas = registry_preimage.get("parameter_schemas")
+    if not isinstance(skills, list) or not isinstance(schemas, Mapping):
+        raise ValueError("registry skills and parameter_schemas are required")
+    enabled = set(registry_preimage.get("enabled_skill_names", ()))
+    visible = set(registry_preimage.get("planner_visible_skill_names", ()))
+    result: dict[str, Any] = {}
+    for entry in skills:
+        if not isinstance(entry, Mapping):
+            raise ValueError("registry skill entry must be an object")
+        name = entry.get("name")
+        template = entry.get("template")
+        if not isinstance(name, str) or not name or name in result or not isinstance(template, Mapping):
+            raise ValueError("registry skill entry is invalid")
+        capability = template.get("capability")
+        if not isinstance(capability, Mapping):
+            raise ValueError("registry skill capability is missing")
+        expected_fields = {
+            "name",
+            "summary",
+            "domain",
+            "semantic_level",
+            "planner_visible",
+            "moves_robot",
+            "required_control_mode",
+            "parameters",
+            "recovery_policy",
+        }
+        if set(capability) != expected_fields:
+            raise ValueError("registry skill capability fields are invalid")
+        rebuilt = dict(capability)
+        rebuilt["name"] = name
+        rebuilt["semantic_level"] = entry.get("semantic_level")
+        rebuilt["planner_visible"] = name in visible
+        rebuilt["parameters"] = _as_mapping(schemas.get(name, {}))
+        if name not in enabled:
+            raise ValueError("registry contains a non-enabled skill entry")
+        result[name] = rebuilt
+    if set(result) != enabled or not visible <= enabled:
+        raise ValueError("registry enabled or planner-visible set is inconsistent")
+    return {name: result[name] for name in sorted(result)}
 
 
 def derive_registry_digest(registry_preimage: Mapping[str, Any]) -> str:

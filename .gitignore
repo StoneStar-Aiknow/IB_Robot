@@ -3,6 +3,12 @@ build
 install
 log
 models
+!models/
+models/*
+!models/grasp/
+models/grasp/*
+!models/grasp/inference_manifest.json
+!models/grasp/model-source.json
 datasets
 logs
 venv

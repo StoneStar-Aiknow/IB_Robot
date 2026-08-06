@@ -9,7 +9,7 @@ from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
 
 from embodied_agent.base_node import BaseTaskNode
-from embodied_agent.task_context import TIMEOUT_CONTEXT_KEY, ensure_timeout_context, remaining_task_budget_sec
+from embodied_agent.task_context import TIMEOUT_CONTEXT_KEY, load_task_context, remaining_task_budget_sec
 from embodied_common.dispatch_binding import binding_task_id, copy_binding
 from embodied_common.skill_request import derive_skill_task_id
 from embodied_common.workflow_contracts import compute_workflow_digest
@@ -91,7 +91,25 @@ class TaskExecutorNode(BaseTaskNode):
         return future.done()
 
     def _resolve_task_context(self, msg: TaskCommand) -> dict[str, Any]:
-        return ensure_timeout_context(msg.context_json, msg.timeout_sec or self._default_timeout)
+        context = load_task_context(msg.context_json)
+        budget = msg.dispatch_binding.task_budget
+        started = budget.started_at.sec + budget.started_at.nanosec / 1_000_000_000
+        deadline = budget.deadline.sec + budget.deadline.nanosec / 1_000_000_000
+        if (
+            budget.schema_version != 1
+            or budget.started_at.sec < 0
+            or budget.deadline.sec < 0
+            or not 0 <= budget.started_at.nanosec < 1_000_000_000
+            or not 0 <= budget.deadline.nanosec < 1_000_000_000
+            or deadline <= started
+        ):
+            raise ValueError("planned task carries an invalid TaskBudget")
+        context[TIMEOUT_CONTEXT_KEY] = {
+            "task_timeout_sec": deadline - started,
+            "created_at_unix_sec": started,
+            "deadline_unix_sec": deadline,
+        }
+        return context
 
     def _remaining_budget_sec(self, context: dict[str, Any]) -> float | None:
         return remaining_task_budget_sec(context)
@@ -218,8 +236,15 @@ class TaskExecutorNode(BaseTaskNode):
         try:
             try:
                 plan_context = self._resolve_task_context(msg)
-            except ValueError:
-                plan_context = ensure_timeout_context("{}", msg.timeout_sec or self._default_timeout)
+            except (ValueError, TypeError):
+                self._publish_status(
+                    task_id=binding_task_id(msg),
+                    state="failed",
+                    success=False,
+                    message="planned task budget is invalid",
+                    error_code="SKILL_SCHEMA_INVALID",
+                )
+                return
 
             workflow_steps = tuple(msg.workflow_steps)
             if not workflow_steps:
@@ -530,6 +555,16 @@ class TaskExecutorNode(BaseTaskNode):
                         finalized = False
                 if not finalized:
                     self.get_logger().error("workflow failure finalization did not converge")
+                    self._publish_status(
+                        task_id=binding_task_id(msg),
+                        state="unknown",
+                        success=False,
+                        message="workflow finalization state is unknown",
+                        completed_skills=completed_skills,
+                        error_code="GATEWAY_FINALIZATION_FAILED",
+                        recoverable=False,
+                        replan_requested=False,
+                    )
             self._active_task_id = ""
             self._active_task_lock.release()
 

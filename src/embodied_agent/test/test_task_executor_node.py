@@ -66,6 +66,9 @@ def _make_message(task_id: str, skill_sequence: list[str]):
     message.dispatch_binding.expected_registry_digest = "registry-digest"
     message.context_json = "{}"
     message.timeout_sec = 30.0
+    message.dispatch_binding.task_budget.schema_version = 1
+    message.dispatch_binding.task_budget.started_at.sec = 1
+    message.dispatch_binding.task_budget.deadline.sec = 2_000_000_000
     message.workflow_steps = [
         workflow_step(
             skill_name=skill,

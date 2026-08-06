@@ -1,6 +1,7 @@
 """Skill and primitive execution node for the embodied minimal closure."""
 
 import copy
+import hashlib
 import json
 import math
 import threading
@@ -24,9 +25,6 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
-from skill_catalog.compiler import SkillCatalogCompiler
-from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
-from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 
@@ -35,6 +33,7 @@ from embodied_common.dispatch_binding import (
     delegated_executor_identity,
     delegated_executor_identity_matches,
     fill_delegated_executor_identity,
+    load_delegated_model_identity,
 )
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
 from embodied_common.skill_request import derive_skill_task_id
@@ -52,6 +51,9 @@ from ibrobot_msgs.srv import (
     ValidateSkill,
 )
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
+from skill_catalog.compiler import SkillCatalogCompiler
+from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext
+from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
 from skill_library.gateway_policy import (
     GATEWAY_FINALIZATION_FAILED,
     SKILL_BUSY,
@@ -153,6 +155,18 @@ class _TerminalWorkflow:
     task_budget_key: tuple[int, int, int, int]
     terminal_state: int
     completed_step_count: int
+    workflow_steps: tuple[CanonicalWorkflowStep, ...]
+
+
+@dataclass
+class _ExternalPrimitiveAdmission:
+    task_id: str
+    payload_digest: str
+    lease_token: object
+    bundle: object
+    generation_released: bool = False
+    terminal_recorded: bool = False
+    lease_released: bool = False
 
 
 @dataclass(frozen=True)
@@ -501,6 +515,7 @@ class SkillExecutorNode(Node):
         self._retained_admission_cleanup = {}
         self._active_workflow: _WorkflowExecution | None = None
         self._terminal_workflows: dict[str, _TerminalWorkflow] = {}
+        self._external_admissions: dict[int, _ExternalPrimitiveAdmission] = {}
         self._robot_config_digest = self.get_parameter("config_digest").get_parameter_value().string_value
         self._runtime_coordinator = SkillRuntimeCoordinator(self._compile_runtime_snapshot)
         startup_reload = self._runtime_coordinator.reload("startup")
@@ -698,6 +713,7 @@ class SkillExecutorNode(Node):
                 name="grasp_pipeline",
                 endpoint_name=self._pick_action_name,
                 configuration=self._grasp_execution,
+                **load_delegated_model_identity(self._grasp_execution),
             )
         )
         return {descriptor.name: descriptor}
@@ -907,6 +923,19 @@ class SkillExecutorNode(Node):
         return duration
 
     @classmethod
+    def _validate_task_budget_schema(cls, binding) -> None:
+        started_sec, started_nanosec, deadline_sec, deadline_nanosec = cls._task_budget_key(binding)
+        if (
+            binding.task_budget.schema_version != 1
+            or started_sec < 0
+            or deadline_sec < 0
+            or not 0 <= started_nanosec < 1_000_000_000
+            or not 0 <= deadline_nanosec < 1_000_000_000
+            or (deadline_sec, deadline_nanosec) <= (started_sec, started_nanosec)
+        ):
+            raise ValueError("invalid task budget")
+
+    @classmethod
     def _remaining_task_budget_sec(cls, binding) -> float:
         cls._task_budget_duration_sec(binding)
         deadline_sec = binding.task_budget.deadline.sec + binding.task_budget.deadline.nanosec / 1_000_000_000
@@ -973,6 +1002,48 @@ class SkillExecutorNode(Node):
         result.actual_registry_epoch = bundle.registry_epoch if bundle is not None else ""
         result.actual_registry_generation = bundle.generation if bundle is not None else 0
         result.actual_registry_digest = bundle.snapshot.registry_digest if bundle is not None else ""
+
+    def _set_primitive_replay_identity(self, result, task_id: str) -> None:
+        ledger = getattr(self, "_gateway_ledger", None)
+        record = ledger.get(task_id) if ledger is not None else None
+        metadata = record.terminal_metadata if record is not None else {}
+        if record is not None and record.state == "terminal" and metadata.get("registry_epoch"):
+            result.actual_registry_epoch = str(metadata["registry_epoch"])
+            result.actual_registry_generation = int(metadata["registry_generation"])
+            result.actual_registry_digest = str(metadata["registry_digest"])
+            return
+        self._set_primitive_result_catalog_identity(result)
+
+    @staticmethod
+    def _primitive_payload_digest(goal) -> str:
+        """Digest the complete canonical external primitive payload before admission mutation."""
+        payload = {
+            "schema_version": 1,
+            "binding": _binding_key(goal.dispatch_binding),
+            "primitive_name": str(goal.primitive_name),
+            "pose_name": str(goal.pose_name),
+            "target_pose": [
+                float(goal.target_pose.position.x),
+                float(goal.target_pose.position.y),
+                float(goal.target_pose.position.z),
+                float(goal.target_pose.orientation.x),
+                float(goal.target_pose.orientation.y),
+                float(goal.target_pose.orientation.z),
+                float(goal.target_pose.orientation.w),
+            ],
+            "relative": [float(goal.relative_dx), float(goal.relative_dy), float(goal.relative_dz)],
+            "velocity_scaling": float(goal.velocity_scaling),
+            "gripper_position": float(goal.gripper_position),
+            "joint_names": list(goal.joint_names),
+            "joint_positions": [float(value) for value in goal.joint_positions],
+            "primitive_duration_sec": float(goal.primitive_duration_sec),
+            "joint_waypoints": [float(value) for value in goal.joint_waypoints],
+            "joint_waypoint_count": int(goal.joint_waypoint_count),
+            "waypoint_duration_sec": float(goal.waypoint_duration_sec),
+            "timeout_sec": float(goal.timeout_sec),
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        return hashlib.sha256(encoded).hexdigest()
 
     @staticmethod
     def _set_begin_failure(response, error_code: str, message: str = ""):
@@ -1161,6 +1232,7 @@ class SkillExecutorNode(Node):
             task_budget_key=active.task_budget_key,
             terminal_state=terminal_state,
             completed_step_count=active.completed_step_count,
+            workflow_steps=active.workflow_steps,
         )
         existing = self._terminal_workflows.get(active.root_task_id)
         if existing is not None and existing != terminal:
@@ -1178,13 +1250,13 @@ class SkillExecutorNode(Node):
 
     def _cleanup_terminal_workflow(self, active: _WorkflowExecution) -> bool:
         """Release retained runtime state before making the root lease available."""
+        if not active.runtime_generation_released:
+            self._runtime_coordinator.release(active.bundle.generation)
+            active.runtime_generation_released = True
         if not active.lease_released:
             if not active.policy.release_workflow(active.owner, active.lease_token):
                 return False
             active.lease_released = True
-        if not active.runtime_generation_released:
-            self._runtime_coordinator.release(active.bundle.generation)
-            active.runtime_generation_released = True
         return True
 
     @staticmethod
@@ -1197,6 +1269,10 @@ class SkillExecutorNode(Node):
     def _finalize_workflow_execution(self, request, response):
         binding = request.dispatch_binding
         root_task_id = str(binding.root_task_id).strip()
+        try:
+            self._validate_task_budget_schema(binding)
+        except ValueError as exc:
+            return self._set_finalize_failure(response, "SKILL_SCHEMA_INVALID", str(exc))
         if (
             binding.schema_version != 1
             or not root_task_id
@@ -1219,8 +1295,20 @@ class SkillExecutorNode(Node):
                 terminal = self._terminal_workflows.get(root_task_id)
                 if terminal is None:
                     return self._set_finalize_failure(response, "SKILL_WORKFLOW_NOT_FOUND")
+                try:
+                    recomputed_digest = compute_workflow_digest(
+                        root_task_id=root_task_id,
+                        task_budget=binding.task_budget,
+                        expected_registry_epoch=binding.expected_registry_epoch,
+                        expected_registry_generation=binding.expected_registry_generation,
+                        expected_registry_digest=binding.expected_registry_digest,
+                        workflow_steps=terminal.workflow_steps,
+                    )
+                except (TypeError, ValueError) as exc:
+                    return self._set_finalize_failure(response, "SKILL_SCHEMA_INVALID", str(exc))
                 if (
-                    terminal.workflow_digest != binding.workflow_digest
+                    recomputed_digest != binding.workflow_digest
+                    or terminal.workflow_digest != binding.workflow_digest
                     or terminal.root_lease_nonce != binding.root_lease_nonce
                     or terminal.registry_epoch != binding.expected_registry_epoch
                     or terminal.registry_generation != binding.expected_registry_generation
@@ -1234,11 +1322,26 @@ class SkillExecutorNode(Node):
                 response.actual_terminal_state = terminal.terminal_state
                 response.actual_completed_step_count = terminal.completed_step_count
                 return response
+            try:
+                recomputed_digest = compute_workflow_digest(
+                    root_task_id=root_task_id,
+                    task_budget=binding.task_budget,
+                    expected_registry_epoch=binding.expected_registry_epoch,
+                    expected_registry_generation=binding.expected_registry_generation,
+                    expected_registry_digest=binding.expected_registry_digest,
+                    workflow_steps=active.workflow_steps,
+                )
+            except (TypeError, ValueError) as exc:
+                return self._set_finalize_failure(response, "SKILL_SCHEMA_INVALID", str(exc))
             if (
                 active.root_task_id != root_task_id
+                or recomputed_digest != binding.workflow_digest
                 or active.workflow_digest != binding.workflow_digest
                 or active.root_lease_nonce != binding.root_lease_nonce
                 or active.task_budget_key != self._task_budget_key(binding)
+                or binding.expected_registry_epoch != active.bundle.registry_epoch
+                or binding.expected_registry_generation != active.bundle.generation
+                or binding.expected_registry_digest != active.bundle.snapshot.registry_digest
             ):
                 return self._set_finalize_failure(response, "SKILL_REQUEST_ID_CONFLICT")
             active_child = self._active_skill_admission
@@ -1918,8 +2021,35 @@ class SkillExecutorNode(Node):
             del self._retained_admission_cleanup[id(admission)]
 
     def _release_late_external_primitive(self, token) -> None:
-        with suppress(Exception):
-            self._gateway_policy.release_external_primitive(token)
+        """Converge terminal ledger and retained generation before reopening the root lease."""
+        admission = getattr(self, "_external_admissions", {}).get(id(token))
+        if admission is None:
+            with suppress(Exception):
+                self._gateway_policy.release_external_primitive(token)
+            return
+        try:
+            if not admission.terminal_recorded:
+                self._gateway_policy.terminal_external_primitive(
+                    admission.task_id,
+                    admission.payload_digest,
+                    token,
+                    error_code=PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    terminal_metadata={
+                        "registry_epoch": admission.bundle.registry_epoch,
+                        "registry_generation": admission.bundle.generation,
+                        "registry_digest": admission.bundle.snapshot.registry_digest,
+                    },
+                )
+                admission.terminal_recorded = True
+            if not admission.generation_released:
+                self._runtime_coordinator.release(admission.bundle.generation)
+                admission.generation_released = True
+            if not admission.lease_released:
+                admission.lease_released = self._gateway_policy.release_external_primitive(token)
+            if admission.lease_released:
+                self._external_admissions.pop(id(token), None)
+        except Exception:
+            return
 
     def _schedule_late_internal_cleanup(self, goal_future, admission, goal_key: bytes) -> None:
         confirmation = _LateCleanupConfirmation()
@@ -1938,6 +2068,12 @@ class SkillExecutorNode(Node):
             delegated_primitive = True
         if isinstance(internal_admission, _WorkflowChildAdmission):
             workflow = internal_admission.workflow
+            try:
+                remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
+            except ValueError:
+                return "SKILL_SCHEMA_INVALID", None, None, False
+            if goal.timeout_sec <= 0.0 or goal.timeout_sec > remaining_budget:
+                goal.timeout_sec = remaining_budget
             borrow = workflow.policy.borrow_workflow_internal(
                 workflow.owner,
                 workflow.lease_token,
@@ -1958,9 +2094,19 @@ class SkillExecutorNode(Node):
             )
             is not None
         ):
+            try:
+                remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
+            except ValueError:
+                return "SKILL_SCHEMA_INVALID", None, None, False
+            if goal.timeout_sec <= 0.0 or goal.timeout_sec > remaining_budget:
+                goal.timeout_sec = remaining_budget
             return "", None, internal_admission, delegated_primitive
         coordinator = getattr(self, "_runtime_coordinator", None)
         bundle = coordinator.current if coordinator is not None else None
+        if coordinator is None:
+            task_id = _binding_task_id(goal) or f"external-primitive-{uuid.uuid4()}"
+            error_code, token = self._gateway_policy.admit_external_primitive(task_id, snapshot)
+            return error_code, token, None, False
         binding_error = self._prepare_root_binding(goal.dispatch_binding, bundle, allow_zero_budget=True)
         if binding_error:
             return binding_error, None, None, False
@@ -1968,12 +2114,28 @@ class SkillExecutorNode(Node):
             remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
         except ValueError:
             return "SKILL_SCHEMA_INVALID", None, None, False
-        if goal.timeout_sec > 0.0 and goal.timeout_sec > remaining_budget:
-            return "TIMEOUT_EXCEEDS_POLICY", None, None, False
-        if goal.timeout_sec <= 0.0:
+        if goal.timeout_sec <= 0.0 or goal.timeout_sec > remaining_budget:
             goal.timeout_sec = remaining_budget
+        payload_digest = self._primitive_payload_digest(goal)
+        if not goal.dispatch_binding.dispatch_nonce:
+            goal.dispatch_binding.schema_version = 1
+            goal.dispatch_binding.task_id = _binding_task_id(goal) or f"external-primitive-{uuid.uuid4()}"
+            goal.dispatch_binding.root_task_id = goal.dispatch_binding.task_id
+            goal.dispatch_binding.dispatch_nonce = uuid.uuid4().hex
         task_id = _binding_task_id(goal) or f"external-primitive-{uuid.uuid4()}"
-        error_code, token = self._gateway_policy.admit_external_primitive(task_id, snapshot)
+        error_code, token = self._gateway_policy.admit_external_primitive(task_id, payload_digest, snapshot)
+        if not error_code and token is not None and bundle is not None:
+            try:
+                retained_bundle = self._runtime_coordinator.retain(bundle.generation)
+                self._external_admissions[id(token)] = _ExternalPrimitiveAdmission(
+                    task_id=task_id,
+                    payload_digest=payload_digest,
+                    lease_token=token,
+                    bundle=retained_bundle,
+                )
+            except Exception:
+                self._gateway_policy.release_external_primitive(token)
+                return "SKILL_SNAPSHOT_NOT_RETAINED", None, None, False
         return error_code, token, None, False
 
     def _execute_primitive(self, goal_handle):
@@ -1993,16 +2155,18 @@ class SkillExecutorNode(Node):
             result.error_code = error_code
             result.message = error_code
             result.pose_name = goal_handle.request.pose_name
-            self._set_primitive_result_catalog_identity(result)
+            self._set_primitive_replay_identity(result, _binding_task_id(goal_handle.request))
             goal_handle.abort()
             return result
         if token is not None and hasattr(self, "_runtime_coordinator"):
-            binding = goal_handle.request.dispatch_binding
-            task_id = _binding_task_id(goal_handle.request) or f"external-primitive-{uuid.uuid4()}"
-            binding.schema_version = 1
-            binding.task_id = task_id
-            binding.root_task_id = task_id
-            binding.dispatch_nonce = uuid.uuid4().hex
+            external_admission = getattr(self, "_external_admissions", {}).get(id(token))
+            external_payload_digest = (
+                external_admission.payload_digest
+                if external_admission is not None
+                else self._primitive_payload_digest(goal_handle.request)
+            )
+        else:
+            external_payload_digest = ""
         deferred_goal_handle = _DeferredTerminalGoalHandle(goal_handle)
         late_cleanup_confirmation = _LateCleanupConfirmation()
         if internal_admission is not None:
@@ -2032,7 +2196,33 @@ class SkillExecutorNode(Node):
                 self._forget_internal_primitive_goal(goal_key)
         if token is not None and result.error_code != PRIMITIVE_CANCEL_CLEANUP_TIMEOUT:
             try:
+                external_admission = getattr(self, "_external_admissions", {}).get(id(token))
+                if external_admission is not None:
+                    self._set_primitive_result_catalog_identity(result, external_admission.bundle)
+                terminal_external = getattr(self._gateway_policy, "terminal_external_primitive", None)
+                if terminal_external is not None:
+                    terminal_external(
+                        _binding_task_id(goal_handle.request),
+                        external_payload_digest,
+                        token,
+                        error_code=result.error_code,
+                        terminal_metadata=(
+                            {
+                                "registry_epoch": external_admission.bundle.registry_epoch,
+                                "registry_generation": external_admission.bundle.generation,
+                                "registry_digest": external_admission.bundle.snapshot.registry_digest,
+                            }
+                            if external_admission is not None
+                            else None
+                        ),
+                    )
+                if external_admission is not None:
+                    self._runtime_coordinator.release(external_admission.bundle.generation)
+                    external_admission.generation_released = True
                 released = self._gateway_policy.release_external_primitive(token)
+                if external_admission is not None:
+                    external_admission.lease_released = bool(released)
+                    self._external_admissions.pop(id(token), None)
             except Exception:
                 released = False
             if not released:
@@ -2042,6 +2232,10 @@ class SkillExecutorNode(Node):
                 self._set_primitive_result_catalog_identity(result)
                 deferred_goal_handle.force_abort()
                 return result
+        elif token is not None:
+            external_admission = getattr(self, "_external_admissions", {}).get(id(token))
+            if external_admission is not None:
+                self._set_primitive_result_catalog_identity(result, external_admission.bundle)
         committed = deferred_goal_handle.commit()
         if committed and internal_admission is not None and result.error_code != PRIMITIVE_CANCEL_CLEANUP_TIMEOUT:
             late_cleanup_confirmation.confirm()
@@ -2101,6 +2295,15 @@ class SkillExecutorNode(Node):
             result.pose_name = goal.pose_name
             goal_handle.abort()
             return result
+
+        if goal.dispatch_binding.task_budget.schema_version == 1:
+            try:
+                remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
+            except ValueError:
+                return self._finish_primitive_failure(
+                    result, goal_handle, "SKILL_TIMEOUT", "task budget expired or invalid", goal.pose_name
+                )
+            goal.timeout_sec = min(goal.timeout_sec, remaining_budget) if goal.timeout_sec > 0.0 else remaining_budget
 
         feedback = PrimitiveCommand.Feedback()
         feedback.state = "dispatching"
@@ -2888,7 +3091,11 @@ class SkillExecutorNode(Node):
         with self._state_guard():
             coordinator = getattr(self, "_runtime_coordinator", None)
             bundle = coordinator.current if coordinator is not None else None
-            binding_error = self._prepare_root_binding(goal.dispatch_binding, bundle, allow_zero_budget=True)
+            binding_error = (
+                self._prepare_root_binding(goal.dispatch_binding, bundle, allow_zero_budget=True)
+                if coordinator is not None
+                else ""
+            )
             if binding_error:
                 result = SkillCommand.Result()
                 return self._abort_skill(
@@ -2899,11 +3106,19 @@ class SkillExecutorNode(Node):
                     "skill request binding is invalid or stale",
                 )
             try:
-                remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
+                remaining_budget = (
+                    self._remaining_task_budget_sec(goal.dispatch_binding)
+                    if coordinator is not None
+                    else getattr(self._gateway_policy, "_task_budget_sec", 1.0)
+                )
             except ValueError:
                 result = SkillCommand.Result()
                 return self._abort_skill(result, goal_handle, [], "SKILL_SCHEMA_INVALID", "task budget is invalid")
-            total_budget = self._task_budget_duration_sec(goal.dispatch_binding)
+            total_budget = (
+                self._task_budget_duration_sec(goal.dispatch_binding)
+                if coordinator is not None
+                else getattr(self._gateway_policy, "_task_budget_sec", 1.0)
+            )
             if goal.timeout_sec > 0.0 and goal.timeout_sec > total_budget:
                 result = SkillCommand.Result()
                 return self._abort_skill(
@@ -2975,12 +3190,32 @@ class SkillExecutorNode(Node):
                 result = SkillCommand.Result()
                 result = self._abort_skill(result, deferred_goal_handle, [], "SKILL_REJECTED", reason)
             else:
-                result = self._execute_skill_child(
-                    deferred_goal_handle,
-                    validation_done=True,
-                    effective_timeout_sec=min(admission.effective_timeout_sec, remaining_budget),
-                    canonical_task_id=prepared.identity.task_id,
-                )
+                if coordinator is not None:
+                    try:
+                        remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
+                    except ValueError:
+                        result = SkillCommand.Result()
+                        result = self._abort_skill(
+                            result, deferred_goal_handle, [], "SKILL_TIMEOUT", "root task budget expired"
+                        )
+                if result is not None:
+                    pass
+                elif goal.timeout_sec > 0.0 and goal.timeout_sec > remaining_budget:
+                    result = SkillCommand.Result()
+                    result = self._abort_skill(
+                        result,
+                        deferred_goal_handle,
+                        [],
+                        "TIMEOUT_EXCEEDS_POLICY",
+                        "skill timeout exceeds remaining root task budget",
+                    )
+                else:
+                    result = self._execute_skill_child(
+                        deferred_goal_handle,
+                        validation_done=True,
+                        effective_timeout_sec=min(admission.effective_timeout_sec, remaining_budget),
+                        canonical_task_id=prepared.identity.task_id,
+                    )
         except Exception as exc:
             self.get_logger().error(f"[skill_executor] gateway execution failed: {exc}")
             self._audit("gateway_exception", error_code="SKILL_REJECTED", **audit_context)

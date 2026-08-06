@@ -9,7 +9,7 @@
 
 - 不启动 ROS 节点、不创建 action/service/client 的纯工具函数。
 - 被多个具身包共同使用的轻量数据规整逻辑。
-- 作为 fallback 的默认 skill / primitive 描述。
+- Primitive canonical descriptor 和仅供兼容测试使用的默认 fallback 数据。
 - 不依赖具体业务包内部实现的基础节点 helper。
 
 不应放入本包的内容：
@@ -51,8 +51,8 @@ ibrobot_msgs / rclpy
 - `embodied_common.command_parser.extract_skill_aliases`
 - `embodied_common.command_parser.load_skill_aliases`
 - `embodied_common.skill_templates.SUPPORTED_PRIMITIVES`
-- `embodied_common.skill_templates.DEFAULT_SKILL_TEMPLATES`
-- `embodied_common.skill_templates.DEFAULT_ALLOWED_SKILLS`
+- `embodied_common.skill_templates.DEFAULT_SKILL_TEMPLATES`（legacy fallback，不是运行时 SSOT）
+- `embodied_common.skill_templates.DEFAULT_ALLOWED_SKILLS`（legacy fallback，不是运行时 SSOT）
 - `embodied_common.skill_templates.DEFAULT_WAYPOINT_DURATION_SEC`
 - `embodied_common.skill_templates.is_skill_disabled`
 - `embodied_common.skill_templates.get_skill_templates`
@@ -69,7 +69,8 @@ ibrobot_msgs / rclpy
 
 ## Capability Gateway 公开视图
 
-`capability_view.build_capability_view()` 从已经归一化的机器人配置构建 ROS 无关的公开能力文档。
+`capability_view.build_capability_view()` 只保留为 legacy/config 单元测试兼容接口。生产 Gateway、CLI、Planner
+和 Safety 的公开能力必须来自 `skill_catalog` 已验证 exact snapshot，不能从 inline robot YAML 重建第二份视图。
 它只包含 `robot_name`、排序后的技能、排序后的命名位姿名称、完整的已解析 timeout policy
 和 `capability_digest`，不启动节点，也不读取 ROS 运行状态。
 

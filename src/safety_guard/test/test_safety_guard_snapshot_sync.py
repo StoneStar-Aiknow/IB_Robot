@@ -50,7 +50,15 @@ def _snapshot(name: str) -> SkillSnapshot:
     )
     template = {
         "capability": {
-            "parameters": {"type": "object", "additionalProperties": False, "properties": {}, "required": []}
+            "name": name,
+            "summary": "Gripper skill.",
+            "domain": "manipulation",
+            "semantic_level": "skill",
+            "planner_visible": True,
+            "moves_robot": True,
+            "required_control_mode": "moveit_planning",
+            "parameters": {"type": "object", "additionalProperties": False, "properties": {}, "required": []},
+            "recovery_policy": "never_retry",
         },
         "primitive_sequence": [{"primitive_name": "open_gripper"}],
     }
@@ -68,7 +76,7 @@ def _snapshot(name: str) -> SkillSnapshot:
         provenance={"schema_version": 1, "source_release_digest": f"source-{name}"},
         enabled_skill_names=(name,),
         planner_visible_skill_names=(name,),
-        capability_view={name: {"name": name}},
+        capability_view={name: template["capability"]},
     )
 
 

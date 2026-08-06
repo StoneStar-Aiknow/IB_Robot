@@ -1,5 +1,7 @@
 import copy
 
+import pytest
+
 from robot_config.loader import robot_config_digest
 
 
@@ -54,3 +56,22 @@ def test_robot_config_digest_covers_execution_semantics_and_defaults():
 
     assert robot_config_digest(original) == robot_config_digest(explicit_defaults)
     assert robot_config_digest(original) != robot_config_digest(changed)
+
+
+def test_robot_config_digest_normalizes_negative_zero_with_unicode_context():
+    negative_zero = _config()
+    negative_zero["name"] = "测试机器人"
+    negative_zero["embodied"]["execution"]["relative_motion_step_m"] = -0.0
+    positive_zero = copy.deepcopy(negative_zero)
+    positive_zero["embodied"]["execution"]["relative_motion_step_m"] = 0.0
+
+    assert robot_config_digest(negative_zero) == robot_config_digest(positive_zero)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_robot_config_digest_rejects_non_finite_execution_values(value):
+    config = _config()
+    config["embodied"]["execution"]["relative_motion_step_m"] = value
+
+    with pytest.raises(ValueError, match="NaN and Infinity"):
+        robot_config_digest(config)

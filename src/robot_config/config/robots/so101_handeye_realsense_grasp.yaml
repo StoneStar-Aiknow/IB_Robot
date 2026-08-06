@@ -72,6 +72,8 @@ robot:
     enabled: true
     action_name: /manipulation/execute_pick
     auto_start_dependencies: true
+    model_bundle_path: "$(env WORKSPACE)/models/grasp"
+    model_deployment: torch_cuda
     planner_service: /grasp_planner/plan_grasp
     verifier_service: /grasp_verifier/verify_grasp
     detect_service: /perception/grasp/grounding_detect

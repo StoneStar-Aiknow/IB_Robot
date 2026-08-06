@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from embodied_common.dispatch_binding import delegated_executor_identity, load_delegated_model_identity
+from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
+from robot_config.config_path import resolve_robot_config_path
+from robot_config.loader import load_robot_config_dict, robot_config_digest
+from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from skill_catalog.compiler import compile_skill_catalog
 from skill_catalog.digest import (
     derive_capability_digest,
@@ -18,12 +23,6 @@ from skill_catalog.digest import (
 )
 from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
 from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillSource, DirectoryReleaseSkillSource
-
-from embodied_common.dispatch_binding import delegated_executor_identity
-from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
-from robot_config.config_path import resolve_robot_config_path
-from robot_config.loader import load_robot_config_dict, robot_config_digest
-from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 _LIST_CAPABILITY_FIELDS = (
     "summary",
@@ -123,7 +122,12 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
     delegated = {}
     if embodied.get("skill_catalog_profile") == "so101_handeye_realsense_grasp":
         descriptor = DelegatedExecutorDescriptor(
-            **delegated_executor_identity(name="grasp_pipeline", endpoint_name=endpoint, configuration=grasp_execution)
+            **delegated_executor_identity(
+                name="grasp_pipeline",
+                endpoint_name=endpoint,
+                configuration=grasp_execution,
+                **load_delegated_model_identity(grasp_execution),
+            )
         )
         delegated[descriptor.name] = descriptor
     robot_context = SkillRobotContext(

@@ -265,11 +265,13 @@ class SafetyGuardNode(Node):
             int(request.dispatch_binding.expected_registry_generation),
             request.dispatch_binding.expected_registry_digest,
         )
-        if request.dispatch_binding.schema_version != 1 or not all(
-            (expected.registry_epoch, expected.generation > 0, expected.registry_digest)
+        if (
+            request.dispatch_binding.schema_version != 1
+            or not all((expected.registry_epoch, expected.generation > 0, expected.registry_digest))
+            or request.dispatch_binding.dispatch_nonce
         ):
             response.allowed = False
-            response.reason = "planned validation requires a complete registry identity"
+            response.reason = "planned validation requires exact identity and an empty dispatch nonce"
             response.error_code = "SKILL_SCHEMA_INVALID"
             self._set_actual_identity(response, self._snapshot_cache.current_identity)
             return response

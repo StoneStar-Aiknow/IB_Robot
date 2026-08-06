@@ -88,6 +88,61 @@ rollback_activation(
   }
   return result;
 }
+
+InitialSyncFeedbackOutcome perform_initial_sync_feedback(
+  const std::vector<u8> & motor_ids,
+  bool has_reset_positions,
+  const std::vector<double> & reset_positions,
+  double ticks_per_rad,
+  double current_raw_to_ampere,
+  const std::function<int()> & do_sync_tx,
+  const std::function<bool(u8, FeedbackSample &)> & do_sync_rx,
+  std::vector<double> & hw_commands,
+  std::vector<double> & hw_positions,
+  std::vector<double> & hw_velocities,
+  std::vector<double> & hw_currents)
+{
+  InitialSyncFeedbackOutcome outcome;
+
+  // Fail-closed gate 1: the sync-read transmit + bus reply. syncReadPacketTx
+  // returns the number of bytes received into the SDK buffer; <= 0 means no
+  // reply (timeout) or a write failure, so there is nothing to decode and the
+  // whole activation must abort.
+  if (do_sync_tx() <= 0) {
+    outcome.success = false;
+    outcome.tx_failed = true;
+    return outcome;
+  }
+
+  // Fail-closed gate 2: EVERY motor must return a full, CRC-valid packet
+  // before we seed any state. A single failing motor aborts activation, so we
+  // never dismiss the rollback guard with partially-initialised
+  // hw_commands/positions/velocities/currents (the values written before the
+  // failure are discarded because the caller returns ERROR).
+  // Centre tick of the 12-bit (4096-count) STS3215 position range.
+  constexpr double kCenterTicks = 2048.0;
+  for (size_t i = 0; i < motor_ids.size(); ++i) {
+    const u8 id = motor_ids[i];
+    FeedbackSample sample{};
+    if (!do_sync_rx(id, sample)) {
+      outcome.success = false;
+      outcome.tx_failed = false;
+      outcome.failed_motor_id = id;
+      return outcome;
+    }
+
+    const double rad =
+      (static_cast<double>(sample.position) - kCenterTicks) / ticks_per_rad;
+    hw_positions[i] = rad;
+    hw_velocities[i] = static_cast<double>(sample.speed) / ticks_per_rad;
+    hw_currents[i] = static_cast<double>(sample.current) * current_raw_to_ampere;
+    // Hold the current pose unless an explicit reset pose was configured.
+    hw_commands[i] = has_reset_positions ? reset_positions[i] : rad;
+  }
+
+  outcome.success = true;
+  return outcome;
+}
 } // namespace detail
 
 int SafeSMSSTS::readSCS(unsigned char * data, int length)
@@ -167,16 +222,12 @@ constexpr u8 FEEDBACK_READ_LEN =
 constexpr u32 FEEDBACK_READ_TIMEOUT_MS = 20;
 constexpr double CURRENT_RAW_TO_AMPERE = 0.0065;
 
-struct FeedbackSample
+// Decode a single motor's feedback frame from the SDK packet buffer that
+// syncReadPacketRx just populated. FeedbackSample itself lives in detail
+// (header) so the initial-sync helper can be unit-tested.
+detail::FeedbackSample parse_feedback_packet(SMS_STS & sms_sts)
 {
-  int position;
-  int speed;
-  int current;
-};
-
-FeedbackSample parse_feedback_packet(SMS_STS & sms_sts)
-{
-  FeedbackSample sample;
+  detail::FeedbackSample sample;
   // syncReadPacketRx() must have just populated the SDK packet/index buffers.
   sample.position = sms_sts.syncReadRxPacketToWrod();
   // syncReadRxPacketToWrod(15) decodes 15-bit signed values per Feetech SDK
@@ -480,7 +531,9 @@ SO101SystemHardware::on_activate(const rclcpp_lifecycle::State &)
   }
 
   // 2. Initialize sync read buffer for the extended position/speed/current
-  // frame.
+  // frame. NOTE: SMS_STS::syncReadBegin returns void (verified in SCS.h); it
+  // only allocates the SDK receive buffer and stores the timeout, so it is not
+  // a fail-closed gate. The gate is the Tx/Rx round below.
   sms_sts_.syncReadBegin(
     motor_ids_.size(), FEEDBACK_READ_LEN,
     FEEDBACK_READ_TIMEOUT_MS);
@@ -489,38 +542,47 @@ SO101SystemHardware::on_activate(const rclcpp_lifecycle::State &)
     current_node_->create_publisher<ibrobot_msgs::msg::JointCurrent>(
     "/so101_follower/joint_currents", 10);
 
-  // Initial sync
-  if (sms_sts_.syncReadPacketTx(
-      motor_ids_.data(), motor_ids_.size(),
-      FEEDBACK_START_ADDR, FEEDBACK_READ_LEN) > 0)
-  {
-    for (size_t i = 0; i < motor_ids_.size(); i++) {
-      u8 id = motor_ids_[i];
+  // Initial sync: seed hw_commands_/positions_/velocities_/currents_ from real
+  // feedback. Fail-closed: if the sync-read transmit fails or ANY motor fails
+  // to return a full packet, on_activate must abort (torque off / EPROM relock
+  // / port close) via abort_activation. We never dismiss the rollback guard
+  // with uninitialised state.
+  const auto sync_outcome = detail::perform_initial_sync_feedback(
+    motor_ids_, has_reset_positions_, reset_positions_, TICKS_PER_RAD,
+    CURRENT_RAW_TO_AMPERE,
+    [this]() {
+      return sms_sts_.syncReadPacketTx(
+        motor_ids_.data(), motor_ids_.size(),
+        FEEDBACK_START_ADDR, FEEDBACK_READ_LEN);
+    },
+    [this](u8 id, detail::FeedbackSample & out) -> bool {
       u8 data[FEEDBACK_READ_LEN];
-      if (sms_sts_.syncReadPacketRx(id, data) == FEEDBACK_READ_LEN) {
-        const auto feedback = parse_feedback_packet(sms_sts_);
-        int pos = feedback.position;
-        double rad = (static_cast<double>(pos) - 2048.0) / TICKS_PER_RAD;
-
-        // Use reset position if specified, otherwise stay at current position
-        if (has_reset_positions_) {
-          hw_commands_[i] = reset_positions_[i];
-          RCLCPP_INFO(
-            rclcpp::get_logger("SO101SystemHardware"),
-            "Initial command set to RESET position: %.4f (Current RAW: %d)",
-            reset_positions_[i], pos);
-        } else {
-          hw_commands_[i] = rad;
-          RCLCPP_DEBUG(
-            rclcpp::get_logger("SO101SystemHardware"),
-            "Initial Sync ID %d: RAW=%d -> RAD=%.4f", id, pos, rad);
-        }
-        hw_positions_[i] = rad;
-        hw_velocities_[i] = static_cast<double>(feedback.speed) / TICKS_PER_RAD;
-        hw_currents_[i] =
-          static_cast<double>(feedback.current) * CURRENT_RAW_TO_AMPERE;
+      if (sms_sts_.syncReadPacketRx(id, data) != FEEDBACK_READ_LEN) {
+        return false;
       }
+      out = parse_feedback_packet(sms_sts_);
+      return true;
+    },
+    hw_commands_, hw_positions_, hw_velocities_, hw_currents_);
+  if (!sync_outcome.success) {
+    if (sync_outcome.tx_failed) {
+      RCLCPP_ERROR(
+        rclcpp::get_logger("SO101SystemHardware"),
+        "Initial sync read transmit failed; aborting activation");
+    } else {
+      RCLCPP_ERROR(
+        rclcpp::get_logger("SO101SystemHardware"),
+        "Initial sync read for motor ID %d failed; aborting activation",
+        sync_outcome.failed_motor_id);
     }
+    return abort_activation();
+  }
+  if (has_reset_positions_) {
+    // Safety-relevant: with reset_positions configured the arm will move to
+    // the configured safe pose rather than hold its current position.
+    RCLCPP_INFO(
+      rclcpp::get_logger("SO101SystemHardware"),
+      "Initial commands set to configured reset_positions");
   }
   publish_currents(current_node_->get_clock()->now());
 

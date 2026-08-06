@@ -121,13 +121,13 @@ UUIDv5（`ibrobot:{task_id}`）。`cancel` 只对 ledger 中 `active` task 发�
 
 ## 输出契约
 
-除 `execute` 外，命令向 stdout 输出单行 JSON envelope：
+除 `execute` 和 `execute-plan` 外，命令向 stdout 输出单行 JSON envelope：
 
 ```json
 {"command":"status","data":{},"error":null,"ok":true,"schema_version":1}
 ```
 
-`execute` 输出 JSONL：零到多条 `feedback`，最后恰好一条 `result`。每行都包含 `task_id` 和
+`execute` 与 `execute-plan` 输出 JSONL：零到多条 `feedback`，最后恰好一条 `result`。每行都包含 `task_id` 和
 `payload_hash`；公开结果只提供 `executed_step_count`，不暴露 primitive、pose 或 joint 名称。
 
 ```json

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+from pathlib import Path
 from typing import Any
 
 from ibrobot_msgs.msg import DelegatedExecutorIdentity, DispatchBinding, WorkflowStep
@@ -41,6 +44,9 @@ def delegated_executor_identity(
     contract_version: str = "1",
     endpoint_kind: str = "ros_action",
     configuration: Any = None,
+    model_deployment_name: str = "",
+    model_fingerprint: str = "",
+    model_bundle_digest: str = "",
 ) -> dict[str, str]:
     configuration_digest = hashlib.sha256(
         json.dumps(
@@ -53,15 +59,48 @@ def delegated_executor_identity(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+    model_fields = (model_deployment_name, model_fingerprint, model_bundle_digest)
+    if any(model_fields) and not all(model_fields):
+        raise ValueError("model identity fields must be all present or all empty")
     return {
         "name": name,
         "contract_version": contract_version,
         "endpoint_kind": endpoint_kind,
         "endpoint_name": endpoint_name,
         "configuration_digest": configuration_digest,
-        "model_deployment_name": "",
-        "model_fingerprint": "",
-        "model_bundle_digest": "",
+        "model_deployment_name": model_deployment_name,
+        "model_fingerprint": model_fingerprint,
+        "model_bundle_digest": model_bundle_digest,
+    }
+
+
+def load_delegated_model_identity(configuration: Any) -> dict[str, str]:
+    """Load the selected model deployment identity from a strict manifest."""
+    if not isinstance(configuration, dict):
+        return {"model_deployment_name": "", "model_fingerprint": "", "model_bundle_digest": ""}
+    bundle_path = str(configuration.get("model_bundle_path", "")).strip()
+    deployment = str(configuration.get("model_deployment", "")).strip()
+    if not bundle_path or not deployment:
+        return {"model_deployment_name": "", "model_fingerprint": "", "model_bundle_digest": ""}
+
+    def replace_env(match: re.Match[str]) -> str:
+        name = match.group(1)
+        value = os.environ.get(name)
+        if not value:
+            raise ValueError(f"environment variable is not set: {name}")
+        return value
+
+    bundle_path = re.sub(r"\$\(env\s+(\w+)\)", replace_env, bundle_path)
+    try:
+        from inference_manifest import load_inference_manifest
+
+        validated = load_inference_manifest(Path(bundle_path), deployment)
+    except Exception as exc:
+        raise ValueError(f"delegated model manifest is invalid: {exc}") from exc
+    return {
+        "model_deployment_name": validated.deployment_name,
+        "model_fingerprint": validated.fingerprint,
+        "model_bundle_digest": validated.manifest.bundle.digest.value,
     }
 
 

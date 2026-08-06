@@ -211,6 +211,21 @@ class PickFlowPhase:
                 result.message or f"primitive failed: {primitive_name}",
                 retryable=primitive_name in {"move_to_named_pose", "move_to_pose"},
             )
+        actual_identity = (
+            result.actual_registry_epoch,
+            int(result.actual_registry_generation),
+            result.actual_registry_digest,
+        )
+        expected_identity = (
+            primitive_goal.dispatch_binding.expected_registry_epoch,
+            int(primitive_goal.dispatch_binding.expected_registry_generation),
+            primitive_goal.dispatch_binding.expected_registry_digest,
+        )
+        if actual_identity != expected_identity:
+            raise PickFlowError(
+                "SKILL_REGISTRY_VERSION_MISMATCH",
+                f"primitive used a different registry identity: {primitive_name}",
+            )
 
     def _move_to_observe(self, goal_handle, deadline: float, state: FlowState, task_id: str) -> None:
         observe_pose = str(self._config.get("observe_pose", "observe_table"))

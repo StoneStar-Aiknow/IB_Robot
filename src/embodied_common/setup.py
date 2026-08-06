@@ -14,7 +14,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
         (os.path.join("share", package_name, "config"), glob(package_name + "/*.yaml")),
     ],
-    install_requires=["setuptools", "pyyaml"],
+    install_requires=["setuptools", "pyyaml", "inference_manifest"],
     zip_safe=True,
     maintainer="liuweihong",
     maintainer_email="liuweihong8@huawei.com",

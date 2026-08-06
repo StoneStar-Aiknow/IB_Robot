@@ -184,6 +184,7 @@ class _BoundRequest(SimpleNamespace):
     """Test request with the typed binding and a legacy test-only alias."""
 
     def __init__(self, *, task_id: str, **fields) -> None:
+        fields.setdefault("timeout_sec", 0.0)
         super().__init__(dispatch_binding=new_binding(task_id=task_id), **fields)
 
     @property
@@ -258,9 +259,12 @@ def test_delegated_primitive_requires_exact_active_nonce_binding():
     owner = ExecutionOwner.skill_command("task-1")
     admission = policy.admit(GatewayRequest("task-1", "skill"), node._runtime_snapshot(), owner)
     binding = new_binding(task_id="task-1")
+    binding.task_budget.schema_version = 1
+    binding.task_budget.started_at.sec = 1
+    binding.task_budget.deadline.sec = 2_000_000_000
     binding.dispatch_nonce = "delegated-nonce"
     node._active_delegated_dispatches[binding.dispatch_nonce] = (admission, copy_binding(binding))
-    goal = SimpleNamespace(dispatch_binding=binding, primitive_name="move_to_named_pose")
+    goal = SimpleNamespace(dispatch_binding=binding, primitive_name="move_to_named_pose", timeout_sec=0.0)
 
     assert node._admit_primitive(goal, None) == ("", None, admission, True)
     goal.dispatch_binding.root_task_id = "tampered"
@@ -970,6 +974,9 @@ def _admit_internal_primitive(node, policy):
     binding.expected_registry_epoch = "epoch-1"
     binding.expected_registry_generation = 1
     binding.expected_registry_digest = "digest-1"
+    binding.task_budget.schema_version = 1
+    binding.task_budget.started_at.sec = 1
+    binding.task_budget.deadline.sec = 2_000_000_000
     binding.dispatch_nonce = "nonce-1"
     goal_key = node._register_internal_primitive_goal(goal_id, admission, binding)
     return admission, goal_id, goal_key, binding
@@ -979,7 +986,15 @@ def test_clean_internal_primitive_terminal_converges_later_retained_root():
     node, policy, lease = _make_retained_gateway_node(_Future(done=False))
     admission, goal_id, goal_key, binding = _admit_internal_primitive(node, policy)
     node._execute_primitive_unchecked = lambda goal_handle: (
-        goal_handle.succeed() or SimpleNamespace(success=True, error_code="", message="")
+        goal_handle.succeed()
+        or SimpleNamespace(
+            success=True,
+            error_code="",
+            message="",
+            actual_registry_epoch="epoch-1",
+            actual_registry_generation=1,
+            actual_registry_digest="digest-1",
+        )
     )
     child_goal_handle = _PrimitiveActionGoalHandle(goal_id, binding=binding)
 
@@ -1009,7 +1024,14 @@ def test_cleanup_unknown_internal_primitive_does_not_confirm_retained_root():
     admission, goal_id, _goal_key, binding = _admit_internal_primitive(node, policy)
     node._execute_primitive_unchecked = lambda goal_handle: (
         goal_handle.abort()
-        or SimpleNamespace(success=False, error_code="CANCEL_CLEANUP_TIMEOUT", message="cleanup unknown")
+        or SimpleNamespace(
+            success=False,
+            error_code="CANCEL_CLEANUP_TIMEOUT",
+            message="cleanup unknown",
+            actual_registry_epoch="epoch-1",
+            actual_registry_generation=1,
+            actual_registry_digest="digest-1",
+        )
     )
 
     result = node._execute_primitive(_PrimitiveActionGoalHandle(goal_id, binding=binding))
@@ -1030,7 +1052,15 @@ def test_only_current_internal_goal_cleanup_can_converge_retained_root():
     node, policy, lease = _make_retained_gateway_node(_Future(done=False))
     admission, first_goal_id, first_goal_key, first_binding = _admit_internal_primitive(node, policy)
     node._execute_primitive_unchecked = lambda goal_handle: (
-        goal_handle.succeed() or SimpleNamespace(success=True, error_code="", message="")
+        goal_handle.succeed()
+        or SimpleNamespace(
+            success=True,
+            error_code="",
+            message="",
+            actual_registry_epoch="epoch-1",
+            actual_registry_generation=1,
+            actual_registry_digest="digest-1",
+        )
     )
 
     first_result = node._execute_primitive(_PrimitiveActionGoalHandle(first_goal_id, binding=first_binding))
@@ -1041,11 +1071,21 @@ def test_only_current_internal_goal_cleanup_can_converge_retained_root():
     second_binding.expected_registry_epoch = "epoch-1"
     second_binding.expected_registry_generation = 1
     second_binding.expected_registry_digest = "digest-1"
+    second_binding.task_budget.schema_version = 1
+    second_binding.task_budget.started_at.sec = 1
+    second_binding.task_budget.deadline.sec = 2_000_000_000
     second_binding.dispatch_nonce = "nonce-2"
     second_goal_key = node._register_internal_primitive_goal(second_goal_id, admission, second_binding)
     node._execute_primitive_unchecked = lambda goal_handle: (
         goal_handle.abort()
-        or SimpleNamespace(success=False, error_code="CANCEL_CLEANUP_TIMEOUT", message="cleanup unknown")
+        or SimpleNamespace(
+            success=False,
+            error_code="CANCEL_CLEANUP_TIMEOUT",
+            message="cleanup unknown",
+            actual_registry_epoch="epoch-1",
+            actual_registry_generation=1,
+            actual_registry_digest="digest-1",
+        )
     )
 
     second_result = node._execute_primitive(_PrimitiveActionGoalHandle(second_goal_id, binding=second_binding))

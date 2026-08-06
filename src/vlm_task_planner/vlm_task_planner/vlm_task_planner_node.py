@@ -334,18 +334,20 @@ class VLMTaskPlannerNode(BaseTaskNode):
         msg: TaskCommand,
         scene_snapshot: dict[str, Any],
         scene_analysis: SceneAnalysis,
+        catalog,
     ) -> PlannerResult:
         """Second LLM call: select skill sequence based on scene analysis."""
+        robot_context = catalog.robot_context
         messages = build_chat_messages(
             task_text=msg.raw_command,
             scene_snapshot=scene_snapshot,
             scene_analysis=self._scene_analysis_to_payload(scene_analysis),
             allowed_skills=self._allowed_skills,
-            named_poses=self._named_poses,
-            named_targets=self._named_targets,
-            workspace=self._workspace,
-            relative_motion_reference_frame=self._relative_motion_reference_frame,
-            relative_motion_direction_mapping=self._relative_motion_direction_mapping,
+            named_poses=robot_context.get("named_poses", {}),
+            named_targets=robot_context.get("named_targets", {}),
+            workspace=robot_context.get("workspace_limits", {}),
+            relative_motion_reference_frame=robot_context.get("relative_motion_reference_frame", "base"),
+            relative_motion_direction_mapping=robot_context.get("relative_motion_direction_mapping", {}),
         )
         remaining_budget = self._remaining_task_budget_sec(msg)
         if remaining_budget is not None and remaining_budget <= 0.0:
@@ -368,7 +370,9 @@ class VLMTaskPlannerNode(BaseTaskNode):
             )
         return plan
 
-    def _try_vlm_planning(self, msg: TaskCommand) -> tuple[PlannerResult | None, SceneAnalysis | None, str] | None:
+    def _try_vlm_planning(
+        self, msg: TaskCommand, catalog
+    ) -> tuple[PlannerResult | None, SceneAnalysis | None, str] | None:
         """Run VLM-based planning (scene analysis + skill planning).
 
         Returns ``(plan, scene_analysis, fallback_reason)`` on success or
@@ -407,7 +411,7 @@ class VLMTaskPlannerNode(BaseTaskNode):
         # Step 2: second LLM call (skill planning) - scene_analysis preserved on failure
         if scene_snapshot is not None and scene_analysis is not None:
             try:
-                plan = self._call_planning_api(msg, scene_snapshot, scene_analysis)
+                plan = self._call_planning_api(msg, scene_snapshot, scene_analysis, catalog)
                 return plan, scene_analysis, fallback_reason
             except Exception as exc:
                 fallback_reason = str(exc)
@@ -473,7 +477,7 @@ class VLMTaskPlannerNode(BaseTaskNode):
         fallback_reason = ""
 
         if self._planner_mode in {"vlm_api", "hybrid"}:
-            result = self._try_vlm_planning(msg)
+            result = self._try_vlm_planning(msg, catalog)
             if result is None:
                 return
             plan, scene_analysis, fallback_reason = result
@@ -494,6 +498,15 @@ class VLMTaskPlannerNode(BaseTaskNode):
                 msg.dispatch_binding.task_id,
                 "planner returned an entry outside the captured planner-visible set",
                 "SKILL_SCHEMA_INVALID",
+            )
+            return
+
+        current_catalog = self._catalog.current
+        if current_catalog is None or current_catalog.identity != catalog.identity:
+            self._reject_task(
+                msg.dispatch_binding.task_id,
+                "catalog changed while planning; replan against the current snapshot",
+                "SKILL_REGISTRY_VERSION_MISMATCH",
             )
             return
 

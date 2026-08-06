@@ -329,7 +329,7 @@ PRIMITIVE_DESCRIPTORS = MappingProxyType(
             _descriptor(
                 "rotate_gripper_cw",
                 dispatch_kind="task_executor_action",
-                capabilities=_TASK_EXECUTOR_CAPABILITIES,
+                capabilities=("fresh_ee_pose", *_TASK_EXECUTOR_CAPABILITIES),
                 properties={
                     "motion_distance": _property("number", exclusiveMinimum=0.0),
                     "motion_distance_from_request": _property("boolean"),
@@ -338,7 +338,7 @@ PRIMITIVE_DESCRIPTORS = MappingProxyType(
             _descriptor(
                 "rotate_gripper_ccw",
                 dispatch_kind="task_executor_action",
-                capabilities=_TASK_EXECUTOR_CAPABILITIES,
+                capabilities=("fresh_ee_pose", *_TASK_EXECUTOR_CAPABILITIES),
                 properties={
                     "motion_distance": _property("number", exclusiveMinimum=0.0),
                     "motion_distance_from_request": _property("boolean"),

@@ -86,6 +86,11 @@ required_args:
 timeout_sec: 240.0
 ```
 
+`grasp_pipeline` 是模型驱动 delegated executor。`robot.grasp_execution.model_bundle_path` 与
+`model_deployment` 必须指向可由 `inference_manifest` 严格校验的 bundle；Gateway 与本节点分别加载同一
+manifest，并在 `expected_executor` / `actual_executor` 中比较 deployment name、fingerprint 和 bundle digest。
+模型 identity 缺失、manifest 不可用或两端不一致时 fail closed，不接受抓取 goal。
+
 ## 安全边界
 
 - goal acceptance 先比对 `expected_executor` 与本节点实际 `DelegatedExecutorIdentity`，不匹配直接

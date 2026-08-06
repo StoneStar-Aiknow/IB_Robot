@@ -87,8 +87,9 @@ robot:
 
 ## Capability Gateway Public Contract
 
-`robot.embodied.skill_templates.<skill>.capability` is the public Capability Gateway SSOT. It is explicit metadata,
-not a schema derived from `description` or a primitive sequence. Every enabled template must declare
+Versioned packages under `skill_catalog/config/skills/` are the public Capability Gateway SSOT. Robot YAML selects an
+exact catalog source/profile and retains only robot execution context such as poses, limits, timeouts, and endpoints.
+Capability metadata is explicit and is not derived from a primitive sequence. Every enabled catalog package must declare
 `schema_version: 1`, `summary`, `domain`, `moves_robot`, `required_control_mode`, `parameters`, and
 `recovery_policy`.
 
@@ -104,10 +105,11 @@ String parameter definitions permit only `type` and a non-empty `enum`; a `motio
 `forward`, `backward`, `left`, `right`, `up`, and `down`. `motion_distance` must be a `number` with
 `exclusiveMinimum: 0` and a `meters` or `degrees` `unit`. Any other schema key or public request property is rejected.
 
-`load_robot_config_dict()` is the canonical normalized loader used by launch, CLI, and catalog consumers. It validates
-the capability, template, and Gateway invariants before returning a config. When `embodied.skill_templates` is
-non-empty, `skill_required_control_mode` must be a non-empty member of `control_modes`, and every enabled capability
-must match it exactly.
+`load_robot_config_dict()` is the canonical normalized loader for robot execution context. `skill_catalog` compiles the
+selected profile and validates capability, implementation, delegated-executor, and Gateway invariants. Inline
+`embodied.skill_templates` is not a runtime source of skill identity. Model-driven delegated executors additionally
+declare `model_bundle_path` and `model_deployment`; all runtime participants load the same strict
+`inference_manifest.json`, and startup/catalog compilation fails if that identity cannot be verified.
 
 Shared config selection is ordered as explicit `config_path`, explicit `config_name`, `ROBOT_CONFIG`, `ROBOT_NAME`,
 then `so101_single_arm`. A name resolves first from the installed `robot_config/config/robots/` directory and then

@@ -101,6 +101,18 @@ class TaskPlannerNode(BaseTaskNode):
                 replan_requested=True,
             )
             return
+        current_catalog = self._catalog.current
+        if current_catalog is None or current_catalog.identity != catalog.identity:
+            self._publish_status(
+                task_id=msg.dispatch_binding.task_id,
+                state="rejected",
+                success=False,
+                message="catalog changed while planning; replan against the current snapshot",
+                error_code="SKILL_REGISTRY_VERSION_MISMATCH",
+                recoverable=True,
+                replan_requested=True,
+            )
+            return
 
         planned = TaskCommand()
         planned.dispatch_binding = copy_binding(msg.dispatch_binding)

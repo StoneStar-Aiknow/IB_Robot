@@ -62,6 +62,8 @@ _SCHEMA: dict[str, Any] = {
     "enabled": _bool(),
     "action_name": _string(),
     "auto_start_dependencies": _bool(),
+    "model_bundle_path": _string(),
+    "model_deployment": _string(),
     "planner_service": _string(),
     "verifier_service": _string(),
     "detect_service": _string(),

@@ -15,7 +15,6 @@ from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalRespons
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from skill_catalog.consumer import CatalogConsumerError, CatalogIdentity, verify_snapshot_response
 
 from embodied_agent.agent_plan_store import AgentPlan, AgentPlanError, AgentPlanStore
 from embodied_agent.command_parser import parse_text_workflow
@@ -36,6 +35,7 @@ from ibrobot_msgs.srv import (
     ValidateAgentPlan,
     ValidateSkill,
 )
+from skill_catalog.consumer import CatalogConsumerError, CatalogIdentity, verify_snapshot_response
 
 
 class _ChildStateUnknown(AgentPlanError):
@@ -329,14 +329,28 @@ class AgentPlanNode(Node):
                 )
             response.plan_id = plan.plan_id
             response.plan_digest = plan.plan_digest
+            first_error_code = ""
+            first_error_message = ""
             for step in plan.workflow_steps:
                 validation = self._validate_step(plan, step)
                 response.diagnostics.extend(self._copy_diagnostics(validation.diagnostics))
-                if not validation.allowed:
-                    response.allowed = False
-                    response.error_code = validation.error_code or "SKILL_REJECTED"
-                    response.message = validation.reason or response.error_code
-                    return response
+                actual_identity = (
+                    validation.actual_registry_epoch,
+                    int(validation.actual_registry_generation),
+                    validation.actual_registry_digest,
+                )
+                expected_identity = (plan.registry_epoch, plan.registry_generation, plan.registry_digest)
+                if actual_identity != expected_identity and not first_error_code:
+                    first_error_code = "SKILL_REGISTRY_VERSION_MISMATCH"
+                    first_error_message = "validation used a different registry identity"
+                elif not validation.allowed and not first_error_code:
+                    first_error_code = validation.error_code or "SKILL_REJECTED"
+                    first_error_message = validation.reason or first_error_code
+            if first_error_code:
+                response.allowed = False
+                response.error_code = first_error_code
+                response.message = first_error_message
+                return response
             with self._store_lock:
                 self._store.mark_validated(
                     plan_token=request.plan_token,

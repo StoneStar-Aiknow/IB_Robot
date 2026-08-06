@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <set>
 #include <unistd.h>
 #include <utility>
@@ -9,6 +10,8 @@
 
 namespace
 {
+namespace detail = so101_hardware::detail;
+
 class TestableSafeSMSSTS : public so101_hardware::SafeSMSSTS
 {
 public:
@@ -148,6 +151,128 @@ TEST(SO101Hardware, ActivationRollbackStaysFailClosedWhenBothOpsFail) {
   EXPECT_EQ(result.relock_failures[0], static_cast<u8>(1));
   // Relock was still attempted (3 retries) despite torque failing.
   EXPECT_EQ(lock_attempts, 3);
+}
+
+// ===== Initial sync feedback fail-closed tests =====
+// These exercise detail::perform_initial_sync_feedback with injected Tx/Rx
+// callbacks, so no real Feetech bus is required.
+
+namespace
+{
+// Mirror of the plugin's ticks<->radian constant. Computed from a literal PI
+// so the test does not depend on M_PI being defined.
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kTicksPerRad = 4096.0 / (2.0 * kPi);
+constexpr double kCurrentRawToAmpere = 0.0065;
+
+// Sentinel proving a state slot was never written by the helper.
+constexpr double kUntouched = -1234.5;
+} // namespace
+
+TEST(SO101Hardware, InitialSyncFeedbackAbortsWhenTransmitFails)
+{
+  std::vector<double> commands(2, kUntouched);
+  std::vector<double> positions(2, kUntouched);
+  std::vector<double> velocities(2, kUntouched);
+  std::vector<double> currents(2, kUntouched);
+
+  int rx_calls = 0;
+  const auto outcome = detail::perform_initial_sync_feedback(
+    {1, 2}, false, {0.0, 0.0}, kTicksPerRad, kCurrentRawToAmpere,
+    []() {return 0;},   // syncReadPacketTx returned <= 0: bus reply failure
+    [&rx_calls](u8, detail::FeedbackSample &) {
+      ++rx_calls;
+      return true;
+    },
+    commands, positions, velocities, currents);
+
+  EXPECT_FALSE(outcome.success);
+  EXPECT_TRUE(outcome.tx_failed);
+  // Tx failure must short-circuit before any per-motor Rx is attempted.
+  EXPECT_EQ(rx_calls, 0);
+  // State vectors must be left untouched so activation rolls back cleanly.
+  EXPECT_EQ(positions[0], kUntouched);
+  EXPECT_EQ(commands[1], kUntouched);
+}
+
+TEST(SO101Hardware, InitialSyncFeedbackAbortsWhenOneMotorRxFails)
+{
+  std::vector<double> commands(2, kUntouched);
+  std::vector<double> positions(2, kUntouched);
+  std::vector<double> velocities(2, kUntouched);
+  std::vector<double> currents(2, kUntouched);
+
+  int rx_calls = 0;
+  const auto outcome = detail::perform_initial_sync_feedback(
+    {1, 2}, false, {0.0, 0.0}, kTicksPerRad, kCurrentRawToAmpere,
+    []() {return 64;},   // Tx ok
+    [&rx_calls](u8 id, detail::FeedbackSample & out) {
+      ++rx_calls;
+      if (id == 2) {
+        return false;   // motor 2 fails to return a full/CRC-valid packet
+      }
+      out = detail::FeedbackSample{2048, 0, 0};
+      return true;
+    },
+    commands, positions, velocities, currents);
+
+  EXPECT_FALSE(outcome.success);
+  EXPECT_FALSE(outcome.tx_failed);
+  EXPECT_EQ(outcome.failed_motor_id, static_cast<u8>(2));
+  // Motor 1 was queried before the fail-fast stop at motor 2.
+  EXPECT_EQ(rx_calls, 2);
+}
+
+TEST(SO101Hardware, InitialSyncFeedbackSeedsStateWhenAllMotorsReply)
+{
+  std::vector<double> commands(2, kUntouched);
+  std::vector<double> positions(2, kUntouched);
+  std::vector<double> velocities(2, kUntouched);
+  std::vector<double> currents(2, kUntouched);
+
+  const auto outcome = detail::perform_initial_sync_feedback(
+    {1, 2}, false, {0.0, 0.0}, kTicksPerRad, kCurrentRawToAmpere,
+    []() {return 64;},
+    [](u8 id, detail::FeedbackSample & out) {
+      out = detail::FeedbackSample{id == 1 ? 2048 : 3072, 4096, 200};
+      return true;
+    },
+    commands, positions, velocities, currents);
+
+  ASSERT_TRUE(outcome.success);
+  // position = (raw - 2048) / ticks
+  EXPECT_NEAR(positions[0], 0.0, 1e-9);
+  EXPECT_NEAR(positions[1], (3072.0 - 2048.0) / kTicksPerRad, 1e-9);
+  // velocity = speed / ticks
+  EXPECT_NEAR(velocities[0], 4096.0 / kTicksPerRad, 1e-9);
+  // current = raw * 6.5mA
+  EXPECT_NEAR(currents[0], 200.0 * kCurrentRawToAmpere, 1e-9);
+  // Without configured reset positions, commands must mirror measured pose.
+  EXPECT_NEAR(commands[0], positions[0], 1e-9);
+  EXPECT_NEAR(commands[1], positions[1], 1e-9);
+}
+
+TEST(SO101Hardware, InitialSyncFeedbackUsesResetPositionsWhenConfigured)
+{
+  std::vector<double> commands(2, kUntouched);
+  std::vector<double> positions(2, kUntouched);
+  std::vector<double> velocities(2, kUntouched);
+  std::vector<double> currents(2, kUntouched);
+
+  const auto outcome = detail::perform_initial_sync_feedback(
+    {1, 2}, true, {0.5, -0.25}, kTicksPerRad, kCurrentRawToAmpere,
+    []() {return 64;},
+    [](u8, detail::FeedbackSample & out) {
+      out = detail::FeedbackSample{2048, 0, 0};
+      return true;
+    },
+    commands, positions, velocities, currents);
+
+  ASSERT_TRUE(outcome.success);
+  // Commands come from reset_positions; state still reflects live feedback.
+  EXPECT_DOUBLE_EQ(commands[0], 0.5);
+  EXPECT_DOUBLE_EQ(commands[1], -0.25);
+  EXPECT_NEAR(positions[0], 0.0, 1e-9);
 }
 
 int main(int argc, char ** argv)

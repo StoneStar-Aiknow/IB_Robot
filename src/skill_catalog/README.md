@@ -52,8 +52,9 @@ digest passed to `SkillRobotContext.robot_config_digest`. It deliberately
 excludes catalog source selection (`skill_catalog_source_mode` /
 `skill_catalog_source_root`), the active profile (`skill_catalog_profile`),
 the resolved config path, and unrelated robot configuration. Flipping only
-those fields keeps the same execution identity, so a compiled snapshot can be
-reused across source/profile/path metadata changes; changing named poses,
+those fields keeps the same robot execution-context digest. It does not make
+a complete snapshot reusable: profile remains part of registry/capability
+identity and source release remains part of provenance identity. Changing named poses,
 named targets, joint limits, workspace, control mode, timeout policy, or
 execution endpoints produces a different digest and forces a new registry
 generation.

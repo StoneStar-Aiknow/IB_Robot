@@ -365,6 +365,7 @@ def generate_embodied_nodes(
                                 "legacy_detect_service": grasp_execution.get(
                                     "fallback_detect_service", "/grasp_planner/detect_and_segment"
                                 ),
+                                "model_dir": grasp_execution.get("model_bundle_path", ""),
                                 **planner_params,
                             }
                         ],

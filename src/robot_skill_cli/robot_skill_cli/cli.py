@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import math
 import signal
 import threading
@@ -243,7 +245,11 @@ def _prepare_request(
             exit_code=EXIT_GATEWAY_REJECTED,
         )
     if not validation["allowed"]:
-        raise _CommandError("SAFETY_REJECTED", validation["reason"], exit_code=EXIT_GATEWAY_REJECTED)
+        raise _CommandError(
+            validation.get("error_code") or "SAFETY_REJECTED",
+            validation["reason"],
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
     return payload, skill_payload_hash(payload), status, validation
 
 
@@ -354,7 +360,52 @@ def _public_agent_plan_result(result) -> dict[str, Any]:
     }
 
 
-def _run_execute_plan(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
+def _agent_plan_payload_hash(args: argparse.Namespace, timeout_sec: float) -> str:
+    payload = {
+        "schema_version": 1,
+        "plan_token": args.plan_token,
+        "confirmation_token": args.confirmation_token,
+        "task_id": args.task_id.strip(),
+        "timeout_sec": float(timeout_sec),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _agent_feedback_event(task_id: str, payload_hash: str, feedback: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "event": "feedback",
+        "task_id": task_id,
+        "payload_hash": payload_hash,
+        "data": {
+            "state": feedback["state"],
+            "detail": feedback["detail"],
+            "current_skill": feedback["current_skill"],
+            "workflow_step_index": feedback["workflow_step_index"],
+        },
+    }
+
+
+def _agent_result_event(task_id: str, payload_hash: str, data: dict[str, Any]) -> dict[str, Any]:
+    return {"schema_version": 1, "event": "result", "task_id": task_id, "payload_hash": payload_hash, "data": data}
+
+
+def _converge_unknown_agent_goal(bridge, task_id: str, rpc_timeout: float) -> dict[str, Any] | None:
+    try:
+        cancel = bridge.cancel_agent_plan(task_id, timeout_sec=rpc_timeout)
+    except Exception:
+        cancel = {"accepted": False}
+    try:
+        terminal = bridge.get_agent_plan_result(task_id, timeout_sec=rpc_timeout)
+    except Exception:
+        return None
+    status = int(terminal.get("status", 0))
+    # action_msgs/GoalStatus terminal values: succeeded=4, canceled=5, aborted=6.
+    return terminal if status in {4, 5, 6} and (cancel.get("accepted") or status in {4, 5, 6}) else None
+
+
+def _run_execute_plan(args: argparse.Namespace, context, bridge) -> _CommandExit:
     task_id = args.task_id.strip()
     if not task_id:
         raise _CliArgumentError("task_id must be non-empty")
@@ -363,6 +414,24 @@ def _run_execute_plan(args: argparse.Namespace, context, bridge) -> dict[str, An
     timeout_sec = status["task_budget_sec"] if args.timeout_sec is None else args.timeout_sec
     if not math.isfinite(timeout_sec) or timeout_sec <= 0.0 or timeout_sec > status["task_budget_sec"]:
         raise _CliArgumentError("timeout_sec must be finite, positive, and within the Gateway task budget")
+    payload_hash = _agent_plan_payload_hash(args, timeout_sec)
+    output_lock = threading.Lock()
+    terminal_written = False
+
+    def emit_feedback(feedback: dict[str, Any]) -> None:
+        nonlocal terminal_written
+        with output_lock:
+            if not terminal_written:
+                print(json_dumps(_agent_feedback_event(task_id, payload_hash, feedback)), flush=True)
+
+    def emit_result(data: dict[str, Any]) -> None:
+        nonlocal terminal_written
+        with output_lock:
+            if terminal_written:
+                return
+            terminal_written = True
+            print(json_dumps(_agent_result_event(task_id, payload_hash, data)), flush=True)
+
     if not bridge.wait_for_execute_plan_server(timeout_sec=rpc_timeout):
         raise _CommandError(
             "SERVER_UNAVAILABLE", "agent plan action server unavailable", exit_code=EXIT_ROS_UNAVAILABLE
@@ -372,27 +441,67 @@ def _run_execute_plan(args: argparse.Namespace, context, bridge) -> dict[str, An
         confirmation_token=args.confirmation_token,
         task_id=task_id,
         timeout_sec=timeout_sec,
+        feedback_callback=emit_feedback,
     )
     if not bridge.wait_future(goal_future, timeout_sec=rpc_timeout):
-        raise _CommandError("RESULT_TIMEOUT", "agent plan goal response timed out", exit_code=EXIT_TIMEOUT)
+        terminal = _converge_unknown_agent_goal(bridge, task_id, rpc_timeout)
+        if terminal is None:
+            data = {
+                "success": False,
+                "plan_id": "",
+                "plan_digest": "",
+                "workflow_digest": "",
+                "completed_step_count": 0,
+                "error_code": "SKILL_CANCEL_TIMEOUT",
+                "message": "robot stop state is unknown",
+                "actual_registry_epoch": "",
+                "actual_registry_generation": 0,
+                "actual_registry_digest": "",
+            }
+            emit_result(data)
+            return _CommandExit(EXIT_TIMEOUT)
+        data = terminal["result"]
+        emit_result(data)
+        return _CommandExit(_result_exit_code(data))
     goal_handle = goal_future.result()
     if goal_handle is None or not goal_handle.accepted:
-        raise _CommandError("GOAL_REJECTED", "agent plan goal was rejected", exit_code=EXIT_GATEWAY_REJECTED)
+        data = {
+            "success": False,
+            "plan_id": "",
+            "plan_digest": "",
+            "workflow_digest": "",
+            "completed_step_count": 0,
+            "error_code": "GOAL_REJECTED",
+            "message": "agent plan goal was rejected",
+            "actual_registry_epoch": "",
+            "actual_registry_generation": 0,
+            "actual_registry_digest": "",
+        }
+        emit_result(data)
+        return _CommandExit(EXIT_GATEWAY_REJECTED)
     result_future = goal_handle.get_result_async()
     deadline = time.monotonic() + timeout_sec + rpc_timeout
     while not result_future.done() and time.monotonic() < deadline:
         time.sleep(0.02)
     if not result_future.done() and not bridge.cancel_goal(goal_handle, result_future, timeout_sec=rpc_timeout):
-        raise _CommandError("SKILL_CANCEL_TIMEOUT", "robot stop state is unknown", exit_code=EXIT_TIMEOUT)
+        data = {
+            "success": False,
+            "plan_id": "",
+            "plan_digest": "",
+            "workflow_digest": "",
+            "completed_step_count": 0,
+            "error_code": "SKILL_CANCEL_TIMEOUT",
+            "message": "robot stop state is unknown",
+            "actual_registry_epoch": "",
+            "actual_registry_generation": 0,
+            "actual_registry_digest": "",
+        }
+        emit_result(data)
+        return _CommandExit(EXIT_TIMEOUT)
     result = result_future.result()
     data = _public_agent_plan_result(result.result)
-    if not data["success"]:
-        raise _CommandError(
-            data["error_code"] or "SKILL_EXECUTION_FAILED",
-            data["message"] or "agent plan execution failed",
-            exit_code=_result_exit_code(data),
-        )
-    return {"task_id": task_id, "registry": status, **data}
+    emit_result(data)
+    return _CommandExit(_result_exit_code(data))
 
 
 def _run_cancel_plan(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
@@ -407,6 +516,8 @@ def _run_cancel_plan(args: argparse.Namespace, context, bridge) -> dict[str, Any
         task_id,
         timeout_sec=context.view["timeout_policy"]["task_budget_sec"] + timeout_sec,
     )
+    if int(terminal.get("status", 0)) not in {4, 5, 6}:
+        raise _CommandError("SKILL_CANCEL_TIMEOUT", "robot stop state is unknown", exit_code=EXIT_TIMEOUT)
     return {
         "task_id": task_id,
         "accepted": True,

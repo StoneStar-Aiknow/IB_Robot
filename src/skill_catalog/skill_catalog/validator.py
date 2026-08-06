@@ -857,6 +857,14 @@ def _validate_executor(
             source_relative_path=path,
             field_path=field_path,
         )
+    if executor.name == "grasp_pipeline" and not all(model_fields):
+        _error(
+            diagnostics,
+            "SKILL_SCHEMA_INVALID",
+            "grasp_pipeline requires inference manifest model identity",
+            source_relative_path=path,
+            field_path=field_path,
+        )
 
 
 def validate_robot_context(context: SkillRobotContext) -> list[SkillDiagnostic]:

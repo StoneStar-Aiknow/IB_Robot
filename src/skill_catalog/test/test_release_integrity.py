@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from pathlib import Path
 
@@ -43,6 +44,40 @@ def test_materialize_rejects_changed_content_without_version_bump(tmp_path):
         materialize_release(source, destination)
 
     assert exc_info.value.code == "SKILL_SEMVER_CONTENT_CHANGED"
+
+
+def test_materialize_checks_semver_against_staged_copy(tmp_path, monkeypatch):
+    source = _copy_catalog(tmp_path)
+    destination = tmp_path / "installed"
+    materialize_release(source, destination)
+    original_copytree = shutil.copytree
+
+    def copy_and_mutate(src, dst):
+        copied = original_copytree(src, dst, symlinks=True)
+        manifest = copied / "skills" / "wave_hello" / "manifest.yaml"
+        manifest.write_text(manifest.read_text(encoding="utf-8") + "\n# staged mutation\n", encoding="utf-8")
+        return copied
+
+    monkeypatch.setattr("skill_catalog.release._stage_source_config", copy_and_mutate)
+
+    with pytest.raises(SkillCatalogError) as exc_info:
+        materialize_release(source, destination)
+
+    assert exc_info.value.code == "SKILL_SEMVER_CONTENT_CHANGED"
+
+
+def test_materialize_merges_fresh_history_under_lock(tmp_path):
+    source = _copy_catalog(tmp_path)
+    destination = tmp_path / "installed"
+    materialize_release(source, destination)
+    index = destination / "release_index.json"
+    history = json.loads(index.read_text(encoding="utf-8"))
+    history["external@1.0.0"] = "f" * 64
+    index.write_text(to_canonical_json(history), encoding="utf-8")
+
+    materialize_release(source, destination)
+
+    assert json.loads(index.read_text(encoding="utf-8"))["external@1.0.0"] == "f" * 64
 
 
 def test_production_current_cannot_escape_releases_directory(tmp_path):

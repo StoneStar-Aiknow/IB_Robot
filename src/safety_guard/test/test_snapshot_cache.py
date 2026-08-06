@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import pytest
-from skill_catalog.models import SkillRobotContext, SkillSnapshot
 
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST
 from ibrobot_msgs.srv import ValidateSkill
 from safety_guard.safety_guard_node import SafetyGuardNode
 from safety_guard.snapshot_cache import SafetySnapshotCache, SnapshotCacheError, SnapshotIdentity
+from skill_catalog.models import SkillRobotContext, SkillSnapshot
 
 
 def _snapshot(name: str = "open_gripper_skill") -> SkillSnapshot:
@@ -41,7 +41,15 @@ def _snapshot(name: str = "open_gripper_skill") -> SkillSnapshot:
     )
     template = {
         "capability": {
-            "parameters": {"type": "object", "additionalProperties": False, "properties": {}, "required": []}
+            "name": name,
+            "summary": "Open the gripper.",
+            "domain": "manipulation",
+            "semantic_level": "skill",
+            "planner_visible": True,
+            "moves_robot": True,
+            "required_control_mode": "moveit_planning",
+            "parameters": {"type": "object", "additionalProperties": False, "properties": {}, "required": []},
+            "recovery_policy": "never_retry",
         },
         "primitive_sequence": [{"primitive_name": "open_gripper"}],
     }
@@ -59,7 +67,7 @@ def _snapshot(name: str = "open_gripper_skill") -> SkillSnapshot:
         provenance={"schema_version": 1, "source_release_digest": "source"},
         enabled_skill_names=(name,),
         planner_visible_skill_names=(name,),
-        capability_view={name: {"name": name}},
+        capability_view={name: template["capability"]},
     )
 
 
@@ -145,6 +153,20 @@ def test_reconcile_keeps_only_current_and_gateway_retained_generations() -> None
             cache.get(SnapshotIdentity("epoch-1", generation, snapshots[generation - 1].registry_digest))
 
 
+def test_reconcile_drops_current_when_gateway_no_longer_retains_it() -> None:
+    cache = SafetySnapshotCache()
+    old = _snapshot("old")
+    new = _snapshot("new")
+    _activate(cache, old, 1, current=True)
+    _activate(cache, new, 2, current=False)
+
+    cache.reconcile("epoch-1", {2})
+
+    assert cache.current_identity is None
+    with pytest.raises(SnapshotCacheError):
+        cache.get(SnapshotIdentity("epoch-1", 1, old.registry_digest))
+
+
 def test_validate_skill_uses_exact_cached_snapshot_and_reports_current_on_miss() -> None:
     node = object.__new__(SafetyGuardNode)
     node._snapshot_cache = SafetySnapshotCache()
@@ -168,3 +190,22 @@ def test_validate_skill_uses_exact_cached_snapshot_and_reports_current_on_miss()
     assert missing.allowed is False
     assert missing.error_code == "SKILL_SNAPSHOT_NOT_RETAINED"
     assert missing.actual_registry_generation == 1
+
+
+def test_validate_skill_rejects_dispatch_nonce() -> None:
+    node = object.__new__(SafetyGuardNode)
+    node._snapshot_cache = SafetySnapshotCache()
+    node._debug = False
+    cached = _activate(node._snapshot_cache, _snapshot())
+    request = ValidateSkill.Request()
+    request.dispatch_binding.schema_version = 1
+    request.dispatch_binding.expected_registry_epoch = cached.identity.registry_epoch
+    request.dispatch_binding.expected_registry_generation = cached.identity.generation
+    request.dispatch_binding.expected_registry_digest = cached.identity.registry_digest
+    request.dispatch_binding.dispatch_nonce = "execution-nonce"
+    request.skill_name = "open_gripper_skill"
+
+    response = node._handle_validate_skill(request, ValidateSkill.Response())
+
+    assert response.allowed is False
+    assert response.error_code == "SKILL_SCHEMA_INVALID"

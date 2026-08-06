@@ -78,9 +78,13 @@ def plan_rig():
         response.capabilities = [capability]
         return response
 
+    validation_control = {"registry": registry, "allowed": True}
+
     def validate_callback(_request, response):
-        response.allowed = True
-        response.actual_registry_epoch, response.actual_registry_generation, response.actual_registry_digest = registry
+        response.allowed = validation_control["allowed"]
+        response.actual_registry_epoch, response.actual_registry_generation, response.actual_registry_digest = (
+            validation_control["registry"]
+        )
         return response
 
     def snapshot_callback(_request, response):
@@ -149,6 +153,7 @@ def plan_rig():
             plan_client=plan_client,
             registry=registry,
             validate_client=validate_client,
+            validation_control=validation_control,
         )
     finally:
         executor.shutdown(timeout_sec=1.0)
@@ -281,6 +286,23 @@ def test_confirm_plan_rejects_plan_that_was_not_validated(plan_rig):
 
     assert confirmed.confirmed is False
     assert confirmed.error_code == "SKILL_REJECTED"
+
+
+def test_validate_plan_rejects_mismatched_safety_identity(plan_rig):
+    request = PlanAgentCommand.Request()
+    request.schema_version = 1
+    request.request_id = "request-validation-identity"
+    request.raw_command = "打开夹爪"
+    planned = _future_result(plan_rig.plan_client.call_async(request))
+    plan_rig.validation_control["registry"] = ("epoch-test", 8, "different")
+
+    validate_request = ValidateAgentPlan.Request()
+    validate_request.schema_version = 1
+    validate_request.plan_token = planned.plan.plan_token
+    validated = _future_result(plan_rig.validate_client.call_async(validate_request))
+
+    assert validated.allowed is False
+    assert validated.error_code == "SKILL_REGISTRY_VERSION_MISMATCH"
 
 
 class _PendingFuture:

@@ -17,6 +17,8 @@ SO-101 机械臂的硬件驱动包，提供高性能 C++ ros2_control 接口和 
 - **电流反馈**：C++ 插件和 Python 桥接脚本会按 STS3215 `1 LSB = 6.5mA` 把 Feetech `Present_Current` 转为安培，并通过 `/so101_follower/joint_currents` 或 `/so101_leader/joint_currents` 发布 `ibrobot_msgs/msg/JointCurrent`，供数据集转换生成 `observation.current`。
 - **安全保障**：节点关闭时自动卸载舵机力矩（Torque Off）；`on_activate` 失败回滚时先对所有舵机
   fail-closed 卸力矩，再尝试 relock 任何处于解锁状态的 EPROM，最后才关闭串口，并对两类失败给出独立诊断。
+  该回滚保护覆盖整个激活流程，包括最后的初始同步读（initial sync read）：只要 sync-read 发送或任意一个
+  舵机返回包失败，激活立即中止并走同一条回滚路径。
 
 ## 架构
 
@@ -117,6 +119,28 @@ ros2 run so101_hardware leader_arm_pub --port /dev/ttyACM0 --publish_rate 50.0
 
 即使力矩卸载失败，relock 仍会被尝试（均为 best-effort、fail-closed 语义），调用方可据此判断是否需要
 人工复位持久参数。
+
+### 初始同步读 (Initial Sync Read)
+
+`on_activate` 在使能力矩之后，会做一次 sync-read 把真实反馈写入
+`hw_commands_/hw_positions_/hw_velocities_/hw_currents_`。该步骤**同样受上面的激活回滚保护**
+（fail-closed），由 `detail::perform_initial_sync_feedback` 实现：
+
+1. **发送/总线应答（syncReadPacketTx）**：返回收到 SDK 缓冲区的字节数；`<= 0` 表示发送失败或无应答
+   （超时）。`syncReadBegin` 仅返回 `void`（分配 SDK 接收缓冲区、记录超时），不是 fail-closed 门禁，
+   真正的门禁是这里的 Tx 返回值。
+2. **每个舵机返回包（syncReadPacketRx）**：返回内存字节数表示成功、`0` 表示失败。**必须全部舵机**
+   都返回完整且 CRC 校验通过的包，才会初始化状态并 dismiss 回滚守卫返回 SUCCESS。
+
+任何一个门禁失败，`on_activate` 立即调用 `abort_activation()`（力矩 off / EPROM relock / 关闭串口），
+绝不会在 `hw_commands_/positions/velocities/currents` 未完整初始化的情况下解除回滚守卫。失败日志：
+
+- 发送/总线失败 → `Initial sync read transmit failed; aborting activation`；
+- 某舵机 Rx 失败 → `Initial sync read for motor ID <id> failed; aborting activation`，`<id>` 为
+  第一个返回包失败的舵机 ID（与 EPROM relock 的 `relock_failures` 相互独立）。
+
+该 helper 以回调形式注入 sync-read 操作（Tx/Rx），因此可在不接真机的情况下用 gtest 覆盖 Tx 失败、
+某舵机 Rx 失败以及全部成功的路径。
 
 ## 对比：C++ 插件 vs Python 工具
 

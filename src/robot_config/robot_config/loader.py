@@ -56,6 +56,32 @@ _DISTANCE_PARAMETER_FIELDS = {"type", "exclusiveMinimum", "unit"}
 _VALID_DISTANCE_UNITS = {"meters", "degrees"}
 
 
+def _normalize_digest_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("digest preimage mapping keys must be strings")
+        return {key: _normalize_digest_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_normalize_digest_value(item) for item in value]
+    if isinstance(value, bool) or value is None or isinstance(value, str | int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("NaN and Infinity are not allowed in digest preimages")
+        return 0.0 if value == 0.0 else value
+    raise TypeError(f"unsupported type in digest preimage: {type(value).__name__}")
+
+
+def _canonical_digest_json(value: Any) -> str:
+    return json.dumps(
+        _normalize_digest_value(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+
+
 def robot_config_digest(robot_config: dict[str, Any]) -> str:
     """Return the digest of the closed skill execution context preimage.
 
@@ -115,9 +141,7 @@ def robot_config_digest(robot_config: dict[str, Any]) -> str:
             ),
         },
     }
-    return hashlib.sha256(
-        json.dumps(preimage, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(_canonical_digest_json(preimage).encode("utf-8")).hexdigest()
 
 
 def _is_finite_number(value: Any) -> bool:

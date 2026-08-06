@@ -7,7 +7,7 @@
 
 | 节点 | 控制台入口 | 主要职责 |
 | --- | --- | --- |
-| `task_entry_node` | `task_entry_node = embodied_agent.task_entry_node:main` | 把 `/voice_command` 文本优先做规则直达，命中则直接产出 `planned_task`，否则封装成 `TaskCommand` 交给 planner |
+| `task_entry_node` | `task_entry_node = embodied_agent.task_entry_node:main` | 路由视觉互动命令；普通文本统一封装成未规划 `TaskCommand` 交给 planner |
 | `task_planner_node` | `task_planner_node = embodied_agent.task_planner_node:main` | 按规则把文本任务规划为技能序列 |
 | `task_executor_node` | `task_executor_node = embodied_agent.task_executor_node:main` | 顺序调用技能 action，并发布任务状态 |
 | `agent_plan_node` | `agent_plan_node = embodied_agent.agent_plan_node:main` | 持有短时 Agent plan，提供 plan/validate/confirm 服务和带确认令牌的执行 action |
@@ -22,8 +22,7 @@
 /voice_command
   -> task_entry_node
   -> 命中视觉互动触发词(如"分院帽"): /embodied/perception_request -> perception_service_node -> /embodied/perception_result (立即返回，不进 planner/executor)
-  -> 规则可直达: /embodied/planned_task -> task_executor_node
-  -> 规则未命中: /embodied/task_command -> task_planner_node / vlm_task_planner_node
+  -> 普通文本: /embodied/task_command -> task_planner_node / vlm_task_planner_node
   -> /embodied/planned_task
   -> task_executor_node
   -> /embodied/execute_skill
@@ -79,9 +78,7 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 1. 订阅文本命令。
 2. 为每条命令生成唯一 `task_id`。
 3. **先匹配视觉趣味游戏触发词**（如"分院帽"，别名与开关来自 `embodied.entry.visual_games`）。命中即构造 `SceneAnalysisRequest` 发到 `/embodied/perception_request` 交给 `perception_service_node`，并**立即返回**——一句语音只属于一个业务域，不会同时触发趣味 VLM 和机器人任务规划。
-4. 未命中游戏时，用现有规则解析器判断是否能直接映射到技能序列。
-5. 能直接映射时，直接发布到 `/embodied/planned_task`。
-6. 规则未命中时，再封装成 `ibrobot_msgs/msg/TaskCommand` 发布到规划阶段。
+4. 未命中游戏时，封装成未规划的 `ibrobot_msgs/msg/TaskCommand` 发布到规划阶段。
 
 说明：
 
@@ -101,9 +98,7 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 | --- | --- | --- | --- |
 | 订阅 | `/voice_command` | `std_msgs/msg/String` | 当前默认文本输入入口 |
 | 发布 | `/embodied/perception_request` | `ibrobot_msgs/msg/SceneAnalysisRequest` | 命中视觉游戏触发词后发给 perception |
-| 发布 | `/embodied/planned_task` | `ibrobot_msgs/msg/TaskCommand` | 规则直达命中后的已规划任务 |
-| 发布 | `/embodied/task_command` | `ibrobot_msgs/msg/TaskCommand` | 规则未命中的任务封装，交给 planner/VLM |
-| 发布 | `/embodied/task_status` | `ibrobot_msgs/msg/TaskStatus` | 规则直达命中时补发 `planned` 状态 |
+| 发布 | `/embodied/task_command` | `ibrobot_msgs/msg/TaskCommand` | 普通文本任务封装，交给 planner/VLM |
 
 ### 主要参数
 
@@ -111,16 +106,13 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 | --- | --- | --- |
 | `input_topic` | `/voice_command` | 文本命令来源 |
 | `output_topic` | `/embodied/task_command` | 任务封装输出 |
-| `planned_output_topic` | `/embodied/planned_task` | 规则直达输出 |
-| `status_topic` | `/embodied/task_status` | 规则直达时的任务状态输出 |
-| `default_target_name` | `demo_object` | 规则直达时使用的默认命名目标 |
-| `default_place_name` | `home` | 保留参数；当前规则规划不会生成放置技能 |
-| `default_relative_motion_step_m` | `0.03` | “一点”默认映射步长（米） |
+| `default_target_name` | `demo_object` | 保留的默认目标名 |
+| `default_place_name` | `tray_right` | 保留的默认放置名 |
+| `default_relative_motion_step_m` | `0.03` | 保留的默认相对运动步长（米） |
 | `default_task_timeout_sec` | `180.0` | 单个任务的端到端总超时预算 |
 | `perception_request_topic` | `/embodied/perception_request` | 视觉互动请求输出（复用 perception 请求 topic） |
 | `perception_enabled` | `false` | perception 是否启用；用于互动启用一致性校验 |
 | `entry_visual_games_json` | `{}` | 入口视觉趣味游戏策略（开关 + 触发别名），来自 `embodied.entry.visual_games` |
-| `skill_aliases_json` | `{}` | 从启用且 `rule_entry: true` 的 YAML skill 注入的规则入口别名 |
 | `debug_tracing` | `false` | 是否打印调试日志 |
 
 ## 4. task_planner_node
@@ -142,9 +134,9 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 
 ### Rule-entry alias 与 `task_type` 契约
 
-`skill_aliases_json` 由 `robot_config` 中启用且 `description.rule_entry: true` 的 skill
-生成，只用于让无参数社交动作进入确定性规则解析。设置 `disabled: true` 的 skill 不会进入
-别名集合。社交动作命中后，其 skill 名同时作为 `task_type` 和 `skill_sequence` 的唯一项。
+alias 来自 Gateway 已验证 catalog snapshot 中启用且 `description.rule_entry: true` 的 skill，
+只用于让无参数社交动作进入确定性规则解析。禁用 skill 不会进入别名集合。社交动作命中后，
+其 skill 名同时作为 `task_type` 和 `skill_sequence` 的唯一项。
 
 既有观察、回位、夹爪开合、相对移动和带角度旋转命令仍优先走专用规则分支，不由 alias
 改写其公开 `task_type`。例如观察保持 `observe_scene`、打开夹爪保持 `open_gripper`、
@@ -177,7 +169,7 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 | `default_target_name` | `demo_object` | 默认命名目标 |
 | `default_place_name` | `home` | 保留参数；当前规则规划不会生成放置技能 |
 | `default_relative_motion_step_m` | `0.03` | “一点”默认映射步长（米） |
-| `skill_aliases_json` | `{}` | 从启用且 `rule_entry: true` 的 YAML skill 注入的规则入口别名 |
+| `skill_aliases_json` | `{}` | 启动 fallback；运行时由已验证 catalog snapshot 覆盖 |
 | `debug_tracing` | `false` | 是否打印规划调试日志 |
 
 ## 5. task_executor_node

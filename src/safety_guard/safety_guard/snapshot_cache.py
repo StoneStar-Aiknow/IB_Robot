@@ -8,6 +8,8 @@ from threading import RLock
 from types import MappingProxyType
 from typing import Any
 
+from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST
+from skill_catalog.consumer import CatalogIdentity, verify_snapshot_response
 from skill_catalog.digest import (
     deep_freeze,
     derive_capability_digest,
@@ -15,8 +17,6 @@ from skill_catalog.digest import (
     derive_registry_digest,
     to_canonical_json,
 )
-
-from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST
 
 
 class SnapshotCacheError(ValueError):
@@ -90,6 +90,25 @@ class SafetySnapshotCache:
             raise SnapshotCacheError("SKILL_SNAPSHOT_DIGEST_MISMATCH", "capability digest does not match snapshot")
         if derive_provenance_digest(provenance_preimage) != provenance_digest:
             raise SnapshotCacheError("SKILL_SNAPSHOT_DIGEST_MISMATCH", "provenance digest does not match snapshot")
+        response = type(
+            "SnapshotResponse",
+            (),
+            {
+                "success": True,
+                "error_code": "",
+                "message": "",
+                "registry_epoch": registry_epoch,
+                "generation": generation,
+                "registry_digest": registry_digest,
+                "capability_digest": capability_digest,
+                "provenance_digest": provenance_digest,
+                "snapshot_json": snapshot_json,
+            },
+        )()
+        try:
+            verify_snapshot_response(response, CatalogIdentity(registry_epoch, generation, registry_digest))
+        except Exception as exc:
+            raise SnapshotCacheError("SKILL_SNAPSHOT_DIGEST_MISMATCH", str(exc)) from exc
         if registry_preimage.get("primitive_contract_digest") != PRIMITIVE_CONTRACT_DIGEST:
             raise SnapshotCacheError(
                 "SKILL_SNAPSHOT_DIGEST_MISMATCH", "primitive contract digest does not match local SSOT"
@@ -149,11 +168,12 @@ class SafetySnapshotCache:
     def reconcile(self, registry_epoch: str, retained_generations: set[int], *, keep_recent: int = 2) -> None:
         del keep_recent
         with self._lock:
-            if self._current_key is not None and self._current_key[0] != registry_epoch:
+            if self._current_key is not None and (
+                self._current_key[0] != registry_epoch or self._current_key[1] not in retained_generations
+            ):
                 self._current_key = None
             self._snapshots = {
                 key: value
                 for key, value in self._snapshots.items()
-                if (key == self._current_key and key[0] == registry_epoch)
-                or (key[0] == registry_epoch and key[1] in retained_generations)
+                if key[0] == registry_epoch and key[1] in retained_generations
             }

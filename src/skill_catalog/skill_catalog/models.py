@@ -374,6 +374,7 @@ class SkillSnapshot:
             aliases=self.aliases,
             parameter_schemas=self.parameter_schemas,
             requirements=self.requirements,
+            capability_view=self.capability_view,
             enabled_skill_names=self.enabled_skill_names,
             planner_visible_skill_names=self.planner_visible_skill_names,
         )

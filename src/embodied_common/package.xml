@@ -10,6 +10,7 @@
   <depend>rclpy</depend>
   <depend>ament_index_python</depend>
   <depend>ibrobot_msgs</depend>
+  <depend>inference_manifest</depend>
   <depend>sensor_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>cv_bridge</depend>

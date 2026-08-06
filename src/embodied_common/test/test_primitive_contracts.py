@@ -31,3 +31,8 @@ def test_registry_and_descriptors_are_immutable():
         pass
     else:
         raise AssertionError("registry must be immutable")
+
+
+def test_rotate_descriptors_require_fresh_ee_pose():
+    for name in ("rotate_gripper_cw", "rotate_gripper_ccw"):
+        assert "fresh_ee_pose" in PRIMITIVE_DESCRIPTORS[name].required_runtime_capabilities

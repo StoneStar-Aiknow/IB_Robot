@@ -12,6 +12,7 @@ from types import MappingProxyType
 from typing import Any
 
 from embodied_common import skill_request
+from embodied_common.primitive_contracts import PRIMITIVE_DESCRIPTORS
 
 MOTION_NOT_AUTHORIZED = "MOTION_NOT_AUTHORIZED"
 CONTROL_MODE_MISMATCH = "CONTROL_MODE_MISMATCH"
@@ -115,18 +116,6 @@ class SkillRequirements:
     task_executor: bool = False
     arm_trajectory: bool = False
     fresh_ee_pose: bool = False
-
-
-_PRIMITIVE_CAPABILITY_MAP: dict[str, SkillRequirements] = {
-    "move_to_named_pose": SkillRequirements(validate_skill=True, task_executor=True),
-    "open_gripper": SkillRequirements(validate_skill=True, task_executor=True),
-    "close_gripper": SkillRequirements(validate_skill=True, task_executor=True),
-    "move_relative_ee": SkillRequirements(validate_skill=True, task_executor=True, fresh_ee_pose=True),
-    "rotate_gripper_cw": SkillRequirements(validate_skill=True, task_executor=True, fresh_ee_pose=True),
-    "rotate_gripper_ccw": SkillRequirements(validate_skill=True, task_executor=True, fresh_ee_pose=True),
-    "move_to_joint_positions": SkillRequirements(validate_skill=True, arm_trajectory=True),
-    "move_through_joint_positions": SkillRequirements(validate_skill=True, arm_trajectory=True),
-}
 
 
 @dataclass(frozen=True)
@@ -392,6 +381,11 @@ class BoundedRequestLedger:
                 return LedgerQuery(state=record.state, error_code=DUPLICATE_TASK_ID)
             return LedgerQuery(state=record.state, error_code=TASK_ID_CONFLICT)
 
+    def get(self, task_id: str) -> LedgerRecord | None:
+        """Return the immutable record for internal replay bookkeeping."""
+        with self._lock:
+            return self._record_for(task_id)
+
     def _record_for(self, task_id: str) -> LedgerRecord | None:
         return self._active.get(task_id) or self._terminal.get(task_id)
 
@@ -438,11 +432,11 @@ def build_skill_requirements(expanded_skill_templates: Mapping[str, Any]) -> dic
             if not isinstance(step, Mapping):
                 raise ValueError(f"skill template '{skill_name}' contains a non-object step")
             primitive_name = str(step.get("primitive_name", "")).strip()
-            requirements_for_primitive = _PRIMITIVE_CAPABILITY_MAP.get(primitive_name)
-            if requirements_for_primitive is None:
+            descriptor = PRIMITIVE_DESCRIPTORS.get(primitive_name)
+            if descriptor is None:
                 raise ValueError(f"skill template '{skill_name}' uses unknown primitive '{primitive_name}'")
-            for field_name in ("validate_skill", "task_executor", "arm_trajectory", "fresh_ee_pose"):
-                if getattr(requirements_for_primitive, field_name):
+            for field_name in descriptor.required_runtime_capabilities:
+                if field_name in merged:
                     merged[field_name] = True
 
         requirements[str(skill_name)] = SkillRequirements(
@@ -723,18 +717,52 @@ class GatewayPolicy:
                 return None
             return lease.reuse(ExecutionOwner.internal_child(root_owner, child_name), token)
 
-    def admit_external_primitive(self, task_id: str, snapshot: RuntimeSnapshot) -> tuple[str, object | None]:
-        """Atomically admit an external primitive without adding it to the skill ledger."""
-        _ledger, lease = self._atomic_resources()
+    def admit_external_primitive(
+        self, task_id: str, payload_hash: str | RuntimeSnapshot, snapshot: RuntimeSnapshot | None = None
+    ) -> tuple[str, object | None]:
+        """Atomically ledger and lease an external primitive root."""
+        if snapshot is None:
+            snapshot = payload_hash
+            payload_hash = f"external:{task_id}"
+        if not isinstance(snapshot, RuntimeSnapshot):
+            raise TypeError("snapshot is required")
+        ledger, lease = self._atomic_resources()
         with self._transition_lock:
             if not snapshot.motion_authorized:
                 return MOTION_NOT_AUTHORIZED, None
             if snapshot.active_control_mode != snapshot.required_control_mode:
                 return CONTROL_MODE_MISMATCH, None
+            if lease.owner is not None:
+                return SKILL_BUSY, None
+            if snapshot.is_busy:
+                return SKILL_BUSY, None
+            duplicate = ledger.query(task_id, payload_hash)
+            if duplicate.error_code:
+                return duplicate.error_code, None
             token = lease.acquire(ExecutionOwner.external_primitive(task_id))
             if token is None:
                 return SKILL_BUSY, None
+            try:
+                ledger.begin(task_id, payload_hash)
+            except Exception:
+                lease.release(token)
+                raise
             return "", token
+
+    def terminal_external_primitive(
+        self, task_id: str, payload_hash: str, token: object, *, error_code: str, terminal_metadata=None
+    ) -> LedgerRecord:
+        """Record external terminal identity while deliberately retaining the lease."""
+        ledger, lease = self._atomic_resources()
+        with self._transition_lock:
+            if not lease.holds(token):
+                raise ValueError("external primitive lease is not active")
+            return ledger.terminal(
+                task_id,
+                payload_hash,
+                error_code=error_code,
+                terminal_metadata=terminal_metadata,
+            )
 
     def admit_workflow(
         self,
