@@ -16,7 +16,7 @@ Use these 12 experience IDs for every run:
 | `E04` | Keep image resize, padding, and risky reshape logic on the host when ATC semantics are suspect. |
 | `E05` | Use `precision_mode_v2=origin|default` and investigate precision before approximating math. |
 | `E06` | Diagnose fusion-induced drift by compiling a no-fusion candidate. |
-| `E07` | Correct dtype/layout/operator eligibility, especially FP32 MatMul/BMM misses on 310P. |
+| `E07` | Correct dtype/layout/operator eligibility, including upstream FP32 islands that poison downstream MatMul/BMM kernels on 310P. |
 | `E08` | Eliminate exact glue and host transfer, including shared ACL buffers between serial OM roles. |
 | `E09` | Use fused operators only after parser/kernel proof; keep 310P PFA low priority. |
 | `E10` | Use `msprof` to rank measured bottlenecks before optimization. |
@@ -46,6 +46,11 @@ y = count(status in {"hit", "attempted_no_gain", "not_applicable"})
 Exclude `not_evaluated` because the user may choose conversion only and never enter optimization.
 A hit requires evidence; merely following a default does not count unless it solved a real conversion
 constraint or produced a measured gain.
+
+For `E07`, record both the local rewrite and its downstream evidence. A fused operator's direct duration is
+not enough when the actual gain comes from changing a later MatMul/BMM dtype, layout, or kernel. Prefer
+before/after operator statistics and identify whether attribution is measured by a single-variable ablation
+or inferred from the combined graph mechanism.
 
 `attempted_no_gain` is scoped to the recorded policy, shapes, toolchain, and exact SoC. It lowers priority
 for a close repeat but does not make the experience globally inapplicable. Re-evaluate it when those inputs

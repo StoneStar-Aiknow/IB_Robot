@@ -194,6 +194,25 @@ Target measured fp16/fp32 Cast islands around attention, softmax, norm, reductio
 Keep finite mask sentinels valid in the chosen dtype. A local FP16 rewrite is approximate unless proven
 exact and therefore must pass the applicable accuracy gates.
 
+Trace dtype propagation beyond the local primitives. A cheap FP32 producer can force an expensive downstream
+MatMul/BMM onto a low-priority FP32 kernel. Compare producer output dtype and consumer dtype/rank/layout in
+both ONNX and `msprof`; do not estimate value from the producer's own duration alone.
+
+A proven Ascend310P pattern is exact RoPE replacement with `NPURotaryMul`: keep frequency and Sin/Cos
+calculation in FP32, cast cos/sin once to the Q/K dtype, and require FP16 rotated Q/K outputs. In one SmolVLA
+graph this changed fifteen text QK BMMs from about 26-28 ms each to a high-performance FP16 path, reducing
+the `BatchMatMulV2` category by about 405 ms while `RotaryMul` itself consumed only 0.176 ms. Treat this as a
+downstream kernel-eligibility gain, not as direct fused-operator latency.
+
+When reporting attribution, separate:
+
+- direct operator savings;
+- downstream dtype/layout/kernel-selection savings;
+- other graph/compiler changes;
+- measured ablation evidence versus mechanism-based inference.
+
+Do not claim precise independent contribution from a combined candidate without single-variable controls.
+
 ### 7. Scan Static Shape/Tiling Choices
 
 Only scan dimensions whose valid business range permits change, such as padding/sequence length, image

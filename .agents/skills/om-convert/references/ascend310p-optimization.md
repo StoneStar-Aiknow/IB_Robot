@@ -60,6 +60,50 @@ probabilities were cast to the value dtype.
 Test shape and dtype changes together. An FP32 rank-3 candidate can regress even when rank-3 plus FP16 is
 the winning combination. Retain FP32 only for accuracy-proven islands.
 
+## FP32 Islands Can Poison Downstream Kernels
+
+Treat an FP32 island as a connected region inside an otherwise FP16 graph where dtype promotion keeps
+intermediate tensors in FP32 and propagates that dtype into downstream operators. The expensive operator
+may not be the primitive that created the island. For example, a RoPE implementation can compute position
+frequencies and trigonometric values in FP32 for valid numerical reasons, then accidentally perform:
+
+```text
+FP16 Q/K * FP32 cos/sin
+-> FP32 rotated Q/K
+-> FP32 attention QK BMM
+```
+
+On the measured SmolVLA/Ascend310P3 graph, the RoPE primitives themselves were cheap, but their FP32 outputs
+made fifteen text QK operations use rank-4 FP32 `BatchMatMulV2` with ND layout and low parallelism. Each QK
+took about 26-28 ms. The complete `BatchMatMulV2` category consumed 423.089 ms of a 479.944 ms VLM.
+
+Replacing the exact half-rotation expression with `NPURotaryMul` preserved FP32 frequency/Sin/Cos
+calculation, explicitly cast cos/sin to the Q/K dtype at the operator boundary, and produced FP16 rotated
+Q/K. This made the downstream attention QK eligible for a high-performance FP16 kernel:
+
+| Metric | Primitive RoPE | `NPURotaryMul` candidate |
+|---|---:|---:|
+| VLM mean | 479.944 ms | 66.761 ms |
+| `BatchMatMulV2` total | 423.089 ms | 18.019 ms |
+| Fused `RotaryMul` total | not applicable | 0.176 ms |
+
+The 405.070 ms reduction in `BatchMatMulV2` explains 98.04% of the 413.184 ms VLM reduction. Do not report
+this as the RotaryMul kernel itself saving 405 ms. Its direct execution is only about 0.176 ms; its main
+effect is establishing a stable FP16 boundary that changes downstream kernel selection.
+
+Use this diagnostic method for any normalization, position encoding, mask, activation, or glue rewrite:
+
+1. inspect producer and downstream consumer dtype, rank, layout, and shape before and after the candidate;
+2. compare the downstream high-cost operator's kernel, block dimension, and cumulative duration;
+3. keep numerically sensitive calculation in FP32, but cast once at the intended consumer boundary;
+4. use an exact fused operator when it gives ATC an unambiguous output dtype/layout contract;
+5. measure the complete role, because the gain can be much larger than the fused operator's own time;
+6. run single-variable candidates when exact per-rewrite attribution is required.
+
+For SmolVLA, `NPURmsNorm` also replaced 31 primitive sites and executed in 0.530 ms total, but no
+RMSNorm-only candidate was measured. The profile strongly attributes the large combined gain to the text QK
+dtype/kernel change, while exact independent RMSNorm and RotaryMul contributions require separate ablations.
+
 ## Softmax And Accuracy Islands
 
 End-to-end FP16 does not mean blindly forcing every operation to FP16. Keep finite masks and sensitive
