@@ -28,6 +28,15 @@ def _create(store):
     )
 
 
+def _validate(store, plan):
+    return store.mark_validated(
+        plan_token=plan.plan_token,
+        registry_epoch="epoch-1",
+        registry_generation=1,
+        registry_digest="digest-1",
+    )
+
+
 def test_plan_digest_excludes_opaque_token_and_is_deterministic():
     step = CanonicalWorkflowStep(1, "open_gripper_skill")
     first = compute_plan_digest(
@@ -62,6 +71,7 @@ def test_plan_lifecycle_binds_identity_and_consumes_confirmation_once():
         )
         == plan
     )
+    _validate(store, plan)
     confirmation = store.confirm(
         plan_token=plan.plan_token,
         plan_digest=plan.plan_digest,
@@ -69,6 +79,7 @@ def test_plan_lifecycle_binds_identity_and_consumes_confirmation_once():
         registry_epoch="epoch-1",
         registry_generation=1,
         registry_digest="digest-1",
+        task_budget_sec=10.0,
     )
     accepted = store.accept_execution(
         plan_token=plan.plan_token,
@@ -77,6 +88,7 @@ def test_plan_lifecycle_binds_identity_and_consumes_confirmation_once():
         registry_epoch="epoch-1",
         registry_generation=1,
         registry_digest="digest-1",
+        task_budget_sec=10.0,
     )
     assert accepted.state == "ACCEPTED"
     assert accepted.newly_accepted is True
@@ -87,6 +99,7 @@ def test_plan_lifecycle_binds_identity_and_consumes_confirmation_once():
         registry_epoch="epoch-1",
         registry_generation=1,
         registry_digest="digest-1",
+        task_budget_sec=10.0,
     )
     assert repeated.state == "ACCEPTED"
     assert repeated.newly_accepted is False
@@ -98,6 +111,7 @@ def test_plan_lifecycle_binds_identity_and_consumes_confirmation_once():
             registry_epoch="epoch-1",
             registry_generation=1,
             registry_digest="digest-1",
+            task_budget_sec=10.0,
         )
     assert raised.value.code == "SKILL_REQUEST_ID_CONFLICT"
     store.mark_terminal(
@@ -114,6 +128,7 @@ def test_plan_lifecycle_binds_identity_and_consumes_confirmation_once():
         registry_epoch="epoch-1",
         registry_generation=1,
         registry_digest="digest-1",
+        task_budget_sec=10.0,
     )
     assert replay.state == "TERMINAL"
     assert replay.newly_accepted is False
@@ -174,6 +189,7 @@ def test_expired_token_history_is_bounded():
 def test_terminal_replay_expires_without_blocking_new_plans():
     store, current = _store()
     plan = _create(store)
+    _validate(store, plan)
     confirmation = store.confirm(
         plan_token=plan.plan_token,
         plan_digest=plan.plan_digest,
@@ -181,6 +197,7 @@ def test_terminal_replay_expires_without_blocking_new_plans():
         registry_epoch="epoch-1",
         registry_generation=1,
         registry_digest="digest-1",
+        task_budget_sec=10.0,
     )
     store.accept_execution(
         plan_token=plan.plan_token,
@@ -189,6 +206,7 @@ def test_terminal_replay_expires_without_blocking_new_plans():
         registry_epoch="epoch-1",
         registry_generation=1,
         registry_digest="digest-1",
+        task_budget_sec=10.0,
     )
     store.mark_terminal(plan_token=plan.plan_token, task_id="task-1")
     current[0] += 301.0
@@ -201,6 +219,63 @@ def test_terminal_replay_expires_without_blocking_new_plans():
             registry_epoch="epoch-1",
             registry_generation=1,
             registry_digest="digest-1",
+            task_budget_sec=10.0,
         )
 
     assert raised.value.code == "SKILL_AGENT_PLAN_EXPIRED"
+
+
+def test_confirm_requires_successful_validation_state():
+    store, _ = _store()
+    plan = _create(store)
+
+    with pytest.raises(AgentPlanError) as raised:
+        store.confirm(
+            plan_token=plan.plan_token,
+            plan_digest=plan.plan_digest,
+            task_id="task-1",
+            registry_epoch="epoch-1",
+            registry_generation=1,
+            registry_digest="digest-1",
+            task_budget_sec=10.0,
+        )
+
+    assert raised.value.code == "SKILL_REJECTED"
+    _validate(store, plan)
+    assert store.confirm(
+        plan_token=plan.plan_token,
+        plan_digest=plan.plan_digest,
+        task_id="task-1",
+        registry_epoch="epoch-1",
+        registry_generation=1,
+        registry_digest="digest-1",
+        task_budget_sec=10.0,
+    ).confirmed
+
+
+def test_execution_budget_is_frozen_by_confirmation():
+    store, _ = _store()
+    plan = _create(store)
+    _validate(store, plan)
+    confirmation = store.confirm(
+        plan_token=plan.plan_token,
+        plan_digest=plan.plan_digest,
+        task_id="task-budget",
+        registry_epoch="epoch-1",
+        registry_generation=1,
+        registry_digest="digest-1",
+        task_budget_sec=12.5,
+    )
+
+    with pytest.raises(AgentPlanError) as raised:
+        store.accept_execution(
+            plan_token=plan.plan_token,
+            confirmation_token=confirmation.confirmation_token,
+            task_id="task-budget",
+            registry_epoch="epoch-1",
+            registry_generation=1,
+            registry_digest="digest-1",
+            task_budget_sec=10.0,
+        )
+
+    assert raised.value.code == "SKILL_REQUEST_ID_CONFLICT"

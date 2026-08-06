@@ -5,6 +5,7 @@ import time
 from typing import Any
 
 import rclpy
+from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient
 
 from embodied_agent.base_node import BaseTaskNode
@@ -15,6 +16,11 @@ from embodied_common.workflow_contracts import compute_workflow_digest
 from ibrobot_msgs.action import SkillCommand
 from ibrobot_msgs.msg import TaskCommand, TaskStatus
 from ibrobot_msgs.srv import BeginWorkflowExecution, FinalizeWorkflowExecution, GetSkillGatewayStatus
+
+
+class _WorkflowStateUnknown(RuntimeError):
+    """A workflow control request may have committed remotely."""
+
 
 __all__ = ["TaskExecutorNode", "derive_skill_task_id"]
 
@@ -90,14 +96,22 @@ class TaskExecutorNode(BaseTaskNode):
     def _remaining_budget_sec(self, context: dict[str, Any]) -> float | None:
         return remaining_task_budget_sec(context)
 
-    def _cancel_goal(self, goal_handle) -> None:
+    def _cancel_goal(self, goal_handle, result_future) -> bool:
         if goal_handle is None:
-            return
+            return False
         try:
             cancel_future = goal_handle.cancel_goal_async()
         except Exception:
-            return
-        self._wait_for_future(cancel_future, timeout_sec=self._rpc_timeout)
+            return False
+        if not self._wait_for_future(cancel_future, timeout_sec=self._rpc_timeout):
+            return False
+        response = cancel_future.result()
+        if response is None or not getattr(response, "goals_canceling", []):
+            return False
+        if not self._wait_for_future(result_future, timeout_sec=self._rpc_timeout):
+            return False
+        action_result = result_future.result()
+        return action_result is not None and getattr(action_result, "status", None) == GoalStatus.STATUS_CANCELED
 
     def _call_service(self, client, request, service_name: str):
         if not client.wait_for_service(timeout_sec=self._rpc_timeout):
@@ -174,7 +188,10 @@ class TaskExecutorNode(BaseTaskNode):
         begin_request = BeginWorkflowExecution.Request()
         begin_request.dispatch_binding = binding
         begin_request.workflow_steps = list(workflow_steps)
-        response = self._call_service(self._begin_workflow_client, begin_request, self._begin_workflow_service)
+        try:
+            response = self._call_service(self._begin_workflow_client, begin_request, self._begin_workflow_service)
+        except RuntimeError as exc:
+            raise _WorkflowStateUnknown("workflow admission state is unknown") from exc
         if not response.success or not response.root_lease_nonce:
             raise RuntimeError(f"{response.error_code or 'SKILL_REJECTED'}: {response.message}")
         if response.workflow_digest != binding.workflow_digest:
@@ -189,13 +206,15 @@ class TaskExecutorNode(BaseTaskNode):
         request.completed_step_count = completed_step_count
         try:
             response = self._call_service(self._finalize_workflow_client, request, self._finalize_workflow_service)
-        except RuntimeError:
-            return False
+        except RuntimeError as exc:
+            raise _WorkflowStateUnknown("workflow finalization state is unknown") from exc
         return bool(response.success)
 
     def _execute_task(self, msg: TaskCommand) -> None:
         completed_skills: list[str] = []
         workflow_binding = None
+        child_state_unknown = False
+        failure_terminal_state = FinalizeWorkflowExecution.Request.FAILED
         try:
             try:
                 plan_context = self._resolve_task_context(msg)
@@ -253,6 +272,16 @@ class TaskExecutorNode(BaseTaskNode):
                 return
             try:
                 workflow_binding = self._begin_workflow(msg, workflow_steps, plan_context)
+            except _WorkflowStateUnknown as exc:
+                child_state_unknown = True
+                self._publish_status(
+                    task_id=binding_task_id(msg),
+                    state="unknown",
+                    success=False,
+                    message=str(exc),
+                    error_code="CHILD_STATE_UNKNOWN",
+                )
+                return
             except (RuntimeError, TypeError, ValueError) as exc:
                 self._publish_status(
                     task_id=binding_task_id(msg),
@@ -312,21 +341,32 @@ class TaskExecutorNode(BaseTaskNode):
                 send_goal_future = self._skill_client.send_goal_async(goal)
                 send_timeout = min(self._rpc_timeout, goal.timeout_sec)
                 if not self._wait_for_future(send_goal_future, timeout_sec=max(0.1, send_timeout)):
+                    child_state_unknown = True
                     self._publish_status(
                         task_id=binding_task_id(msg),
-                        state="failed",
+                        state="unknown",
                         success=False,
-                        message=f"timeout while sending goal for {skill_name}",
+                        message=f"skill goal acceptance state unknown: {skill_name}",
                         current_skill=skill_name,
                         completed_skills=completed_skills,
-                        error_code="GOAL_TIMEOUT",
-                        recoverable=True,
-                        replan_requested=True,
+                        error_code="CHILD_STATE_UNKNOWN",
                     )
                     return
 
                 goal_handle = send_goal_future.result()
-                if goal_handle is None or not goal_handle.accepted:
+                if goal_handle is None:
+                    child_state_unknown = True
+                    self._publish_status(
+                        task_id=binding_task_id(msg),
+                        state="unknown",
+                        success=False,
+                        message=f"skill goal acceptance state unknown: {skill_name}",
+                        current_skill=skill_name,
+                        completed_skills=completed_skills,
+                        error_code="CHILD_STATE_UNKNOWN",
+                    )
+                    return
+                if not goal_handle.accepted:
                     self._publish_status(
                         task_id=binding_task_id(msg),
                         state="failed",
@@ -345,7 +385,19 @@ class TaskExecutorNode(BaseTaskNode):
                 if result_timeout is None:
                     result_timeout = goal.timeout_sec
                 if not self._wait_for_future(result_future, timeout_sec=max(0.1, result_timeout)):
-                    self._cancel_goal(goal_handle)
+                    if not self._cancel_goal(goal_handle, result_future):
+                        child_state_unknown = True
+                        self._publish_status(
+                            task_id=binding_task_id(msg),
+                            state="unknown",
+                            success=False,
+                            message=f"skill cancellation state unknown: {skill_name}",
+                            current_skill=skill_name,
+                            completed_skills=completed_skills,
+                            error_code="CHILD_STATE_UNKNOWN",
+                        )
+                        return
+                    failure_terminal_state = FinalizeWorkflowExecution.Request.CANCELED
                     self._publish_status(
                         task_id=binding_task_id(msg),
                         state="failed",
@@ -361,7 +413,26 @@ class TaskExecutorNode(BaseTaskNode):
 
                 action_result = result_future.result()
                 result = action_result.result if action_result is not None else None
-                if result is None or not result.success:
+                terminal_status = getattr(action_result, "status", GoalStatus.STATUS_UNKNOWN)
+                if result is None or terminal_status not in {
+                    GoalStatus.STATUS_SUCCEEDED,
+                    GoalStatus.STATUS_CANCELED,
+                    GoalStatus.STATUS_ABORTED,
+                }:
+                    child_state_unknown = True
+                    self._publish_status(
+                        task_id=binding_task_id(msg),
+                        state="unknown",
+                        success=False,
+                        message=f"skill terminal result unknown: {skill_name}",
+                        current_skill=skill_name,
+                        completed_skills=completed_skills,
+                        error_code="CHILD_STATE_UNKNOWN",
+                    )
+                    return
+                if not result.success:
+                    if terminal_status == GoalStatus.STATUS_CANCELED:
+                        failure_terminal_state = FinalizeWorkflowExecution.Request.CANCELED
                     self._publish_status(
                         task_id=binding_task_id(msg),
                         state="failed",
@@ -377,18 +448,41 @@ class TaskExecutorNode(BaseTaskNode):
 
                 completed_skills.append(skill_name)
 
-            if not self._finalize_workflow(
-                workflow_binding,
-                FinalizeWorkflowExecution.Request.SUCCEEDED,
-                len(completed_skills),
-            ):
+            try:
+                finalized = self._finalize_workflow(
+                    workflow_binding,
+                    FinalizeWorkflowExecution.Request.SUCCEEDED,
+                    len(completed_skills),
+                )
+            except _WorkflowStateUnknown as exc:
+                child_state_unknown = True
                 self._publish_status(
                     task_id=binding_task_id(msg),
-                    state="failed",
+                    state="unknown",
                     success=False,
-                    message="workflow finalization failed",
+                    message=str(exc),
                     completed_skills=completed_skills,
-                    error_code="GATEWAY_FINALIZATION_FAILED",
+                    error_code="CHILD_STATE_UNKNOWN",
+                )
+                return
+            if not finalized:
+                try:
+                    finalized = self._finalize_workflow(
+                        workflow_binding,
+                        FinalizeWorkflowExecution.Request.SUCCEEDED,
+                        len(completed_skills),
+                    )
+                except _WorkflowStateUnknown:
+                    finalized = False
+            if not finalized:
+                child_state_unknown = True
+                self._publish_status(
+                    task_id=binding_task_id(msg),
+                    state="unknown",
+                    success=False,
+                    message="workflow finalization state is unknown",
+                    completed_skills=completed_skills,
+                    error_code="CHILD_STATE_UNKNOWN",
                 )
                 return
             workflow_binding = None
@@ -416,12 +510,26 @@ class TaskExecutorNode(BaseTaskNode):
                 error_code="INTERNAL_ERROR",
             )
         finally:
-            if workflow_binding is not None and not self._finalize_workflow(
-                workflow_binding,
-                FinalizeWorkflowExecution.Request.FAILED,
-                len(completed_skills),
-            ):
-                self.get_logger().error("workflow failure finalization did not converge")
+            if workflow_binding is not None and not child_state_unknown:
+                try:
+                    finalized = self._finalize_workflow(
+                        workflow_binding,
+                        failure_terminal_state,
+                        len(completed_skills),
+                    )
+                except _WorkflowStateUnknown:
+                    finalized = False
+                if not finalized:
+                    try:
+                        finalized = self._finalize_workflow(
+                            workflow_binding,
+                            failure_terminal_state,
+                            len(completed_skills),
+                        )
+                    except _WorkflowStateUnknown:
+                        finalized = False
+                if not finalized:
+                    self.get_logger().error("workflow failure finalization did not converge")
             self._active_task_id = ""
             self._active_task_lock.release()
 

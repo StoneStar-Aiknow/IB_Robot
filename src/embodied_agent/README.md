@@ -155,6 +155,9 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 - 这是**规则规划器**，不是通用大模型 Planner。
 - 规则规划器仍不直接生成抓取；VLM 或 Hermes 可在机器人配置允许时显式选择 `pick_object`。
 - 不支持的文本会直接拒绝，并在 `/embodied/task_status` 发布 `rejected`。
+- 规划器只消费 Gateway 的**已验证 exact catalog 视图**（`CatalogViewSynchronizer.current`）。当目录 reload
+  推出一个新 identity、对应 snapshot 尚未校验通过时，`current` 为 `None`，规划器直接以
+  `SKILL_REGISTRY_NOT_READY` 拒绝任务（`rejected`，可重规划），而不是用过期技能边界继续规划。
 
 ### 当前接口
 
@@ -190,6 +193,8 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 4. 在超时、拒绝、服务缺失时明确失败并带错误码退出。
 5. 超时后会向下游 skill action 发送 cancel，而不是只在上层报错。
 6. 所有成功、失败和超时路径都通过 `/embodied/finalize_workflow_execution` 释放 root scope；finalize 未收敛时 fail closed。
+   唯一例外是 child goal 接受/取消/终态**状态未知**（`CHILD_STATE_UNKNOWN`）：此时不 finalize root scope，工作流
+   租约保留，状态发布为 `unknown`，避免在 child 可能仍在执行时留下无主 root scope。
 
 ### 父任务与子技能 ID
 
@@ -226,6 +231,12 @@ ID 的 payload 不同，下游的 payload conflict 是预期行为。取消和�
 - `completed`
 - `failed`
 - `rejected`
+- `unknown`
+
+`unknown` 表示某个 child skill action 的接受、取消或终态结果无法被确认（`CHILD_STATE_UNKNOWN`）。出现该状态时，
+child 可能仍在执行或持有工作流租约，因此执行器**不**调用 `finalize_workflow_execution` 释放 root scope，也**不**
+自动重试；调用方不得把它表述为“已停止”。只有在 child 确认进入终态或整体任务确定成功/失败/拒绝时，才会
+finalize root scope 并发布对应的终态状态。
 
 ### 主要参数
 
@@ -243,19 +254,44 @@ ID 的 payload 不同，下游的 payload conflict 是预期行为。取消和�
 `agent_plan_node` 将自然语言命令转换为最多 16 个 typed `WorkflowStep`，并在 plan TTL（默认 300 秒）内保存不可变
 计划。`plan_token` 和 `confirmation_token` 都是不透明的一次性令牌，不提供运动授权，也不能由调用方构造。
 
-确认调用必须同时提交 `plan_token`、`plan_digest`、新生成的 `task_id` 以及当前
-`(registry_epoch, registry_generation, registry_digest)`。目录 reload 或任何字段不一致都会 fail closed。
+计划状态机为：
+
+```text
+PLANNED -> VALIDATED -> CONFIRMED -> ACCEPTED -> TERMINAL
+```
+
+- `plan_agent_command` 创建或幂等重放一份计划，记录进入 `PLANNED`。
+- `validate_agent_plan` 做 exact snapshot 的只读逐步预检，成功后把记录推进到 `VALIDATED`；未在 `PLANNED`/`VALIDATED`
+  状态的记录拒绝再次校验。确认必须先经过 `VALIDATED`。
+- `confirm_agent_plan` 必须同时提交 `plan_token`、`plan_digest`、新生成的 `task_id`、当前
+  `(registry_epoch, registry_generation, registry_digest)` 以及 `task_budget_sec`。`task_budget_sec` 以 float32
+  规范化后冻结进记录，同时生成不可变 `started_at/deadline`，且不得超过 Gateway 当前的 `task_budget_sec`
+  （`TIMEOUT_EXCEEDS_POLICY`）。成功后状态转为 `CONFIRMED`，并返回与该 exact 元组绑定的
+  `confirmation_token`、`confirmed_task_budget_sec` 和绝对 deadline。目录 reload 或
+  任何字段不一致都会 fail closed。
+- `execute_agent_plan` 必须复用 confirm 时冻结的**同一** `task_budget_sec`（float32 严格相等），否则
+  `accept_execution` 以 `SKILL_REQUEST_ID_CONFLICT` 拒绝；随后状态转为 `ACCEPTED` 并以该冻结预算作为执行
+  deadline；确认到执行之间的等待已经消耗预算，不会在执行时重置完整时长。
+
 单步计划进入 Gateway 根 SkillCommand，多步计划通过 Begin/ordered child/Finalize 工作流执行；child action 只能
 使用 Begin 返回的工作流租约和 exact snapshot identity。
+
+### 目标/取消状态未知
+
+当 child goal 的接受、取消或终态结果无法被确认时（`SKILL_EXECUTION_STATE_UNKNOWN`、`SKILL_CANCEL_TIMEOUT`），
+执行器**不**把计划标记为终态，也**不**释放 workflow root scope：plan 留在 `ACCEPTED`、工作流租约保留、
+`finalize_workflow_execution` 不被调用。这是因为 child 可能仍在执行或持有租约，贸然闭环会留下无主 root scope。
+此时 action result 以 `success=false` 和对应的 unknown 错误码返回，但状态不进入 `TERMINAL`；调用方不得据此自动重试，
+也不得把它表述为“已停止”。
 
 公开接口：
 
 | 名称 | 类型 | 说明 |
 | --- | --- | --- |
-| `/embodied/plan_agent_command` | `PlanAgentCommand` | 生成或幂等重放一份短时计划 |
-| `/embodied/validate_agent_plan` | `ValidateAgentPlan` | exact snapshot 的只读逐步预检 |
-| `/embodied/confirm_agent_plan` | `ConfirmAgentPlan` | 原子绑定用户确认、计划摘要和 task ID |
-| `/embodied/execute_agent_plan` | `ExecuteAgentPlan` | 执行已确认计划并传播取消到当前 child |
+| `/embodied/plan_agent_command` | `PlanAgentCommand` | 生成或幂等重放一份短时计划（`PLANNED`） |
+| `/embodied/validate_agent_plan` | `ValidateAgentPlan` | exact snapshot 的只读逐步预检，推进到 `VALIDATED` |
+| `/embodied/confirm_agent_plan` | `ConfirmAgentPlan` | 校验身份/摘要/task_id 并冻结 `task_budget_sec`，转入 `CONFIRMED` |
+| `/embodied/execute_agent_plan` | `ExecuteAgentPlan` | 复用冻结预算执行已确认计划并传播取消到当前 child |
 
 ## 7. LLMClientService
 

@@ -57,10 +57,66 @@ _VALID_DISTANCE_UNITS = {"meters", "degrees"}
 
 
 def robot_config_digest(robot_config: dict[str, Any]) -> str:
-    """Return the canonical digest of normalized robot configuration content."""
-    content = {key: value for key, value in robot_config.items() if not key.startswith("_")}
+    """Return the digest of the closed skill execution context preimage.
+
+    This is deliberately not a digest of the YAML document.  Catalog source
+    selection, profile selection and unrelated robot configuration must not
+    change the identity used by catalog consumers.
+    """
+    embodied = robot_config.get("embodied", {})
+    execution = embodied.get("execution", {}) if isinstance(embodied, dict) else {}
+    safety = embodied.get("safety", {}) if isinstance(embodied, dict) else {}
+    if not isinstance(execution, dict):
+        execution = {}
+    if not isinstance(safety, dict):
+        safety = {}
+    joints = robot_config.get("joints", {})
+    if not isinstance(joints, dict):
+        joints = {}
+    teleoperation = robot_config.get("teleoperation", {})
+    if not isinstance(teleoperation, dict):
+        teleoperation = {}
+    teleop_safety = teleoperation.get("safety", {})
+    if not isinstance(teleop_safety, dict):
+        teleop_safety = {}
+    preimage = {
+        "context_schema_version": 1,
+        "robot_name": robot_config.get("name"),
+        "named_poses": embodied.get("named_poses", {}) if isinstance(embodied, dict) else {},
+        "named_targets": embodied.get("named_targets", {}) if isinstance(embodied, dict) else {},
+        "arm_joint_names": joints.get("arm", []),
+        "joint_limits": teleop_safety.get("joint_limits", {}),
+        "workspace_limits": safety.get("workspace", {}),
+        "required_control_mode": robot_config.get("skill_required_control_mode"),
+        "timeout_policy": resolve_embodied_timeout_policy(embodied if isinstance(embodied, dict) else {}),
+        "relative_motion_reference_frame": execution.get("relative_motion_reference_frame", "base"),
+        "relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
+        "relative_motion_direction_mapping": execution.get("relative_motion_direction_mapping", {}),
+        "gripper_open_position": execution.get("gripper_open_position", 1.0),
+        "gripper_closed_position": execution.get("gripper_closed_position", 0.0),
+        "execution_endpoints": {
+            "skill_action": embodied.get("skill_action_name", "/embodied/execute_skill"),
+            "primitive_action": embodied.get("primitive_action_name", "/embodied/execute_primitive"),
+            "validate_skill_service": embodied.get("validate_skill_service", "/embodied/validate_skill"),
+            "validate_primitive_service": embodied.get("validate_primitive_service", "/embodied/validate_primitive"),
+            "gateway_status_service": embodied.get(
+                "skill_gateway_status_service", "/embodied/get_skill_gateway_status"
+            ),
+            "begin_workflow_service": embodied.get("begin_workflow_service", "/embodied/begin_workflow_execution"),
+            "finalize_workflow_service": embodied.get(
+                "finalize_workflow_service", "/embodied/finalize_workflow_execution"
+            ),
+            "task_executor_action": execution.get("task_executor_action_name", "/task_executor/execute_task_plan"),
+            "arm_trajectory_action": execution.get(
+                "arm_trajectory_action_name", "/arm_trajectory_controller/follow_joint_trajectory"
+            ),
+            "move_configuration_service": execution.get(
+                "move_configuration_service", "/moveit_gateway/move_to_configuration"
+            ),
+        },
+    }
     return hashlib.sha256(
-        json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        json.dumps(preimage, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ).hexdigest()
 
 

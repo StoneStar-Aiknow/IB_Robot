@@ -28,9 +28,12 @@ Run natural-language motion requests in this order. Replace placeholders with re
 5. Show the exact ordered steps, parameters, plan digest, registry identity, and a fresh task ID. Obtain explicit user
    motion confirmation. General permission, a prior confirmation, or schedule pressure does not count.
 6. Bind that exact tuple once with
-   `robot-skill confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID`.
+   `robot-skill confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID --timeout-sec SEC`.
 7. Execute only the returned confirmation token with
-   `robot-skill execute-plan --plan-token TOKEN --confirmation-token CONFIRMATION_TOKEN --task-id ID`.
+   `robot-skill execute-plan --plan-token TOKEN --confirmation-token CONFIRMATION_TOKEN --task-id ID --timeout-sec SEC`.
+
+Use the same `SEC` value for confirmation and execution. If both commands omit `--timeout-sec`, both use the current
+Gateway task budget. Never change the budget after confirmation.
 
 Natural-language single-Skill and Workflow requests both use the plan workflow above. For an explicitly selected single
 skill, the direct `describe -> validate -> explicit user motion confirmation -> execute` path remains valid.

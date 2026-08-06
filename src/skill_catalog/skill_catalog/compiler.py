@@ -12,6 +12,7 @@ from embodied_common.primitive_contracts import (
 )
 from skill_catalog.digest import compute_skill_package_digest
 from skill_catalog.models import (
+    SkillCatalogError,
     SkillCompileContext,
     SkillCompileError,
     SkillDiagnostic,
@@ -60,6 +61,7 @@ class SkillCatalogCompiler:
         packages = source.discover_packages(release)
         package_index: dict[str, SkillPackageLocation] = {}
         package_digests: dict[str, str] = {}
+        discovered_manifests: dict[str, Mapping[str, Any]] = {}
         for package in packages:
             if package.name in package_index:
                 diagnostics.append(
@@ -73,6 +75,36 @@ class SkillCatalogCompiler:
             package_digests[package.name] = compute_skill_package_digest(
                 build_package_file_manifest(package.package_dir)
             )
+
+            if not package.manifest_path.is_file():
+                diagnostics.append(
+                    SkillDiagnostic.error(
+                        "SKILL_SCHEMA_INVALID",
+                        "non-hidden skill package is missing manifest.yaml",
+                        source_relative_path=package.source_relative_path,
+                    )
+                )
+                continue
+            try:
+                manifest = load_yaml_mapping(package.manifest_path)
+            except SkillCatalogError as exc:
+                diagnostic = exc.diagnostic()
+                if not diagnostic.source_relative_path:
+                    diagnostic = SkillDiagnostic.error(
+                        diagnostic.error_code,
+                        diagnostic.message,
+                        source_relative_path=_relative_path(package.manifest_path, release.root),
+                        field_path=diagnostic.field_path,
+                    )
+                diagnostics.append(diagnostic)
+                continue
+            discovered_manifests[package.name] = manifest
+            manifest_diagnostics = validate_manifest(
+                manifest,
+                package_name=package.name,
+                source_relative_path=_relative_path(package.manifest_path, release.root),
+            )
+            diagnostics.extend(manifest_diagnostics)
 
         profile_entries = profile.get("enabled_skills", []) if isinstance(profile, Mapping) else []
         if not isinstance(profile_entries, list):
@@ -108,15 +140,21 @@ class SkillCatalogCompiler:
                     )
                 )
                 continue
-            manifest = load_yaml_mapping(package.manifest_path)
+            if not package.manifest_path.is_file():
+                diagnostics.append(
+                    SkillDiagnostic.error(
+                        "SKILL_SCHEMA_INVALID",
+                        "skill package is missing manifest.yaml",
+                        source_relative_path=package.source_relative_path,
+                    )
+                )
+                continue
+            manifest = discovered_manifests.get(skill_name)
+            if manifest is None:
+                continue
             manifests[skill_name] = manifest
             manifest_relative_path = _relative_path(package.manifest_path, release.root)
-            manifest_diagnostics = validate_manifest(
-                manifest,
-                package_name=package.name,
-                source_relative_path=manifest_relative_path,
-            )
-            diagnostics.extend(manifest_diagnostics)
+            manifest_diagnostics = [item for item in diagnostics if item.source_relative_path == manifest_relative_path]
             if any(item.severity == 1 for item in manifest_diagnostics):
                 continue
             implementation_paths = manifest.get("implementations", {})

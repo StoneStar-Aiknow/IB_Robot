@@ -222,33 +222,36 @@ class SafetyGuardNode(Node):
     def _handle_snapshot_future(self, key: tuple[str, int], future) -> None:
         with self._sync_lock:
             self._snapshot_in_flight.discard(key)
-            desired = self._desired_current
-            retained = set(self._retained_generations)
         try:
             response = future.result()
         except Exception:
             return
         if response is None or not response.success or (response.registry_epoch, int(response.generation)) != key:
             return
-        make_current = desired == SnapshotIdentity(
+        response_identity = SnapshotIdentity(
             response.registry_epoch,
             int(response.generation),
             response.registry_digest,
         )
-        try:
-            self._snapshot_cache.activate(
-                registry_epoch=response.registry_epoch,
-                generation=int(response.generation),
-                registry_digest=response.registry_digest,
-                capability_digest=response.capability_digest,
-                provenance_digest=response.provenance_digest,
-                snapshot_json=response.snapshot_json,
-                make_current=make_current,
-            )
-        except SnapshotCacheError as exc:
-            self.get_logger().error(f"safety snapshot rejected: {exc.code}: {exc}")
-            return
-        self._snapshot_cache.reconcile(response.registry_epoch, retained)
+        with self._sync_lock:
+            retained = set(self._retained_generations)
+            desired = self._desired_current
+            if response.generation not in retained and response_identity != desired:
+                return
+            try:
+                self._snapshot_cache.activate(
+                    registry_epoch=response.registry_epoch,
+                    generation=int(response.generation),
+                    registry_digest=response.registry_digest,
+                    capability_digest=response.capability_digest,
+                    provenance_digest=response.provenance_digest,
+                    snapshot_json=response.snapshot_json,
+                    make_current=response_identity == desired,
+                )
+            except SnapshotCacheError as exc:
+                self.get_logger().error(f"safety snapshot rejected: {exc.code}: {exc}")
+                return
+            self._snapshot_cache.reconcile(response.registry_epoch, retained)
 
     @staticmethod
     def _set_actual_identity(response, identity: SnapshotIdentity | None) -> None:

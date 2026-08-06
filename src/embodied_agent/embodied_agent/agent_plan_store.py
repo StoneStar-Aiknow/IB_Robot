@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import math
 import secrets
 import time
 import uuid
@@ -18,6 +19,12 @@ from embodied_common.workflow_contracts import CanonicalWorkflowStep, normalize_
 MAX_PLAN_STEPS = 16
 DEFAULT_PLAN_TTL_SEC = 300.0
 DEFAULT_MAX_RECORDS = 1024
+
+
+def _float32(value: float) -> float:
+    import struct
+
+    return struct.unpack("!f", struct.pack("!f", float(value)))[0]
 
 
 class AgentPlanError(Exception):
@@ -52,6 +59,9 @@ class PlanConfirmation:
     confirmation_token: str = field(repr=False)
     plan_digest: str
     task_id: str
+    task_budget_sec: float
+    task_budget_started_at: tuple[int, int]
+    task_budget_deadline: tuple[int, int]
 
 
 @dataclass(frozen=True)
@@ -60,6 +70,9 @@ class AgentPlanExecution:
     task_id: str
     state: str
     confirmation_token: str = field(repr=False)
+    task_budget_sec: float = 0.0
+    task_budget_started_at: tuple[int, int] = (0, 0)
+    task_budget_deadline: tuple[int, int] = (0, 0)
     terminal_code: str = ""
     terminal_message: str = ""
     workflow_digest: str = ""
@@ -75,6 +88,9 @@ class _PlanRecord:
     state: str = "PLANNED"
     task_id: str = ""
     confirmation_token: str = field(default="", repr=False)
+    task_budget_sec: float = 0.0
+    task_budget_started_at: tuple[int, int] = (0, 0)
+    task_budget_deadline: tuple[int, int] = (0, 0)
     terminal_code: str = ""
     terminal_message: str = ""
     workflow_digest: str = ""
@@ -185,6 +201,22 @@ class AgentPlanStore:
         self._require_identity(record.plan, registry_epoch, registry_generation, registry_digest)
         return record.plan
 
+    def mark_validated(
+        self,
+        *,
+        plan_token: str,
+        registry_epoch: str,
+        registry_generation: int,
+        registry_digest: str,
+    ) -> AgentPlan:
+        record = self._get_record(plan_token)
+        self._require_identity(record.plan, registry_epoch, registry_generation, registry_digest)
+        if record.state == "PLANNED":
+            record.state = "VALIDATED"
+        elif record.state != "VALIDATED":
+            raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "plan can no longer be validated")
+        return record.plan
+
     def confirm(
         self,
         *,
@@ -194,6 +226,7 @@ class AgentPlanStore:
         registry_epoch: str,
         registry_generation: int,
         registry_digest: str,
+        task_budget_sec: float,
     ) -> PlanConfirmation:
         record = self._get_record(plan_token)
         self._require_identity(record.plan, registry_epoch, registry_generation, registry_digest)
@@ -201,13 +234,29 @@ class AgentPlanStore:
             raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "plan digest does not match")
         if not task_id.strip():
             raise AgentPlanError("SKILL_SCHEMA_INVALID", "task_id must be non-empty")
-        if record.state != "PLANNED":
-            raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "plan has already been confirmed or accepted")
+        normalized_budget = _float32(task_budget_sec)
+        if isinstance(task_budget_sec, bool) or not math.isfinite(normalized_budget) or normalized_budget <= 0.0:
+            raise AgentPlanError("SKILL_SCHEMA_INVALID", "task_budget_sec must be finite and positive")
+        if record.state != "VALIDATED":
+            raise AgentPlanError("SKILL_REJECTED", "plan must be validated before confirmation")
         confirmation_token = _new_opaque_token(self._token_factory)
+        started_at = _wall_time(self._wall_clock())
+        deadline = _wall_time(started_at[0] + started_at[1] / 1_000_000_000 + normalized_budget)
         record.state = "CONFIRMED"
         record.task_id = task_id
         record.confirmation_token = confirmation_token
-        return PlanConfirmation(True, confirmation_token, record.plan.plan_digest, task_id)
+        record.task_budget_sec = normalized_budget
+        record.task_budget_started_at = started_at
+        record.task_budget_deadline = deadline
+        return PlanConfirmation(
+            True,
+            confirmation_token,
+            record.plan.plan_digest,
+            task_id,
+            record.task_budget_sec,
+            started_at,
+            deadline,
+        )
 
     def accept_execution(
         self,
@@ -218,11 +267,19 @@ class AgentPlanStore:
         registry_epoch: str,
         registry_generation: int,
         registry_digest: str,
+        task_budget_sec: float,
     ) -> AgentPlanExecution:
         record = self._get_record(plan_token, allow_terminal=True)
         self._require_identity(record.plan, registry_epoch, registry_generation, registry_digest)
         if record.task_id and record.task_id != task_id:
             raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "plan is bound to a different task")
+        if (
+            isinstance(task_budget_sec, bool)
+            or not math.isfinite(task_budget_sec)
+            or task_budget_sec <= 0.0
+            or _float32(task_budget_sec) != record.task_budget_sec
+        ):
+            raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "execution budget does not match confirmation")
         if record.state in {"ACCEPTED", "TERMINAL"}:
             if not hmac.compare_digest(record.confirmation_token, confirmation_token):
                 raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "confirmation token does not match")
@@ -231,6 +288,9 @@ class AgentPlanStore:
                 task_id=record.task_id,
                 state=record.state,
                 confirmation_token=record.confirmation_token,
+                task_budget_sec=record.task_budget_sec,
+                task_budget_started_at=record.task_budget_started_at,
+                task_budget_deadline=record.task_budget_deadline,
                 terminal_code=record.terminal_code,
                 terminal_message=record.terminal_message,
                 workflow_digest=record.workflow_digest,
@@ -244,6 +304,9 @@ class AgentPlanStore:
             task_id,
             record.state,
             record.confirmation_token,
+            record.task_budget_sec,
+            record.task_budget_started_at,
+            record.task_budget_deadline,
             newly_accepted=True,
         )
 
@@ -273,6 +336,9 @@ class AgentPlanStore:
             task_id=task_id,
             state=record.state,
             confirmation_token=record.confirmation_token,
+            task_budget_sec=record.task_budget_sec,
+            task_budget_started_at=record.task_budget_started_at,
+            task_budget_deadline=record.task_budget_deadline,
             terminal_code=terminal_code,
             terminal_message=terminal_message,
             workflow_digest=workflow_digest,

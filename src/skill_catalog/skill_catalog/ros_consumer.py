@@ -80,6 +80,20 @@ class CatalogViewSynchronizer:
             int(response.registry_generation),
             str(response.registry_digest),
         )
+        with self._lock:
+            desired = self._desired
+            if desired is not None:
+                if identity.registry_epoch != desired.registry_epoch:
+                    return
+                if identity.registry_epoch == desired.registry_epoch and identity.generation < desired.generation:
+                    return
+                if (
+                    identity.registry_epoch == desired.registry_epoch
+                    and identity.generation == desired.generation
+                    and identity.registry_digest != desired.registry_digest
+                ):
+                    self._current = None
+                    return
         self._select(identity)
 
     def _handle_event(self, event: SkillRegistryEvent) -> None:
@@ -107,6 +121,9 @@ class CatalogViewSynchronizer:
                 self._desired = identity
                 return
             self._desired = identity
+            # A newer identity is not usable until its exact snapshot has
+            # been verified. Never leave stale capabilities visible.
+            self._current = None
             key = (identity.registry_epoch, identity.generation)
             if self._snapshot_in_flight == key or not self._snapshot_client.service_is_ready():
                 return

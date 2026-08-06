@@ -1131,7 +1131,8 @@ Coordinator 另外持有当前 `registry_epoch` 内的 immutable `WorkflowTermin
 terminal_state, completed_step_count)`、实际 terminal response 和完成时间，但不再持有 bundle、lease 或 live
 budget 对象。Finalize 的线性化点必须先在
 coordinator lock 下写入该 record，再释放 root lease、bundle retention 和 root budget；因此 cleanup 后的相同
-binding 仍能返回既有 terminal result。Terminal record 在 epoch 结束前保留，root task ID 在该 epoch 内不得复用；
+binding 仍能返回既有 terminal result。Terminal record 在 epoch 结束前完整保留，不按普通 ledger capacity 淘汰；
+root task ID 在该 epoch 内不得复用；
 重启会创建新 epoch，旧 binding 按 epoch mismatch 拒绝。
 
 默认 retention policy 固定为：current bundle、所有仍被活动/cleanup 引用的 bundle，以及最近两个已完成
@@ -1195,6 +1196,8 @@ nonce 或 digest 冲突时拒绝，不能释放其他执行。Coordinator 必须
 2. `SUCCEEDED` 只在每个 canonical Workflow step 都是 `SUCCEEDED`、`next_step_index == len(workflow_steps)` 且没有
    active 引用时允许；caller 的 `completed_step_count` 不能将 partial Workflow 标记成功。
 3. `FAILED`/`CANCELED` 只在对应 child 已进入相同 terminal state、没有活动引用且 root 处于可终止状态时允许。
+   child 尚未到达 Gateway admission 时 step 仍为 `PENDING`，且不存在 active child；这种 pre-dispatch 失败或取消
+   允许 root 直接终止。一旦 step 进入 `ACTIVE`，必须等待并匹配 child 的真实 terminal state。
 4. 已存在 terminal record 时，相同 terminal payload 的重复 Finalize 返回既有结果；不同 terminal state 或 count
    返回 `SKILL_REQUEST_ID_CONFLICT`，不能释放其他执行。仍处于 active root 时，terminal state/count 的请求值
    只在后续 active-root 校验中判断。
@@ -1935,9 +1938,13 @@ string task_id
 string registry_epoch
 uint64 registry_generation
 string registry_digest
+float32 task_budget_sec
 ---
 bool confirmed
 string confirmation_token
+float32 confirmed_task_budget_sec
+builtin_interfaces/Time task_budget_started_at
+builtin_interfaces/Time task_budget_deadline
 string error_code
 string message
 SkillDiagnostic[] diagnostics
@@ -1946,8 +1953,11 @@ SkillDiagnostic[] diagnostics
 `ConfirmAgentPlan` 是确认后的受信 Agent 调用，不是把口头确认变成 `authorize_motion`。Agent 必须先生成 fresh
 `task_id`，向用户展示包含 plan kind、ordered steps、typed parameters、exact snapshot identity 和该 task ID
 的计划；用户明确确认后，CLI 才能调用此 service。Coordinator/plan store 必须原子校验
-`(plan_token, plan_digest, task_id, registry_epoch, registry_generation, registry_digest)`，将 plan 从
-`PLANNED` 转为 `CONFIRMED`，并返回绑定同一 tuple 的单次 `confirmation_token`。不匹配、重复确认、过期 plan 或
+`(plan_token, plan_digest, task_id, registry_epoch, registry_generation, registry_digest, task_budget_sec)`，将 plan
+从 `VALIDATED` 转为 `CONFIRMED`，并返回绑定同一 tuple 的单次 `confirmation_token`。`task_budget_sec` 必须为有限
+正数且不超过 Gateway task budget，并以 float32 规范化冻结，同时冻结绝对 `started_at/deadline`；
+`ExecuteAgentPlan.timeout_sec` 必须精确复用该值，执行时必须传播已冻结的绝对 deadline，不能重新计时。
+不匹配、未完成 validate、重复确认、过期 plan 或
 reload 后 identity 变化全部 fail closed。
 
 `ConfirmAgentPlan` 和 `ExecuteAgentPlan` 只能被部署 policy 允许的 Agent/CLI caller 调用；ROS transport policy

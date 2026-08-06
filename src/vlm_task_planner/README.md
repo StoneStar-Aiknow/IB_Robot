@@ -28,6 +28,10 @@
 - 不直接输出关节角或底层 pose
 - 只输出有限 skill 集
 - 若大模型判断任务依赖缺失 skill，则拒绝规划而不是伪造 workaround
+- 只消费 Gateway 的**已验证 exact catalog 视图**：每条任务到达时读取 `CatalogViewSynchronizer.current`，
+  当目录 reload 推出新 identity、对应 snapshot 尚未校验通过时 `current` 为 `None`，planner 立即以
+  `SKILL_REGISTRY_NOT_READY` 拒绝任务（可重规划），而不是用过期技能边界继续规划。技能边界和别名
+  均取自该已验证视图，而非节点启动时的静态参数。
 - 最终执行仍然经过：
   - `task_executor_node`
   - `safety_guard`
@@ -56,13 +60,15 @@
 | `api_model` | 模型名，当前默认 `Qwen3.5-9B` |
 | `api_timeout_sec` | 大模型输出空闲超时，由 `embodied.timeouts.model_idle_timeout_sec` 统一注入 |
 | `fallback_to_rule_planner` | API 失败时是否回退规则 planner |
-| `allowed_skills_json` | VLM 响应允许输出的 skill 边界，来自当前机器人 YAML 的启用技能 |
-| `skill_aliases_json` | 确定性规则 fallback 使用的启用 `rule_entry` skill 中文别名 |
+| `allowed_skills_json` | VLM 响应允许输出的 skill 边界的**初始默认值**；运行时被已验证 catalog 视图刷新 |
+| `skill_aliases_json` | 确定性规则 fallback 别名的**初始默认值**；运行时被已验证 catalog 视图刷新 |
+| `skill_catalog_snapshot_service` | Gateway exact snapshot 服务名，默认 `/embodied/get_skill_snapshot` |
 
-`allowed_skills_json` 约束 VLM 最终可返回的 skill 序列；设置 `disabled: true` 的 skill 不进入该边界，
-响应中出现禁用或其他边界外 skill 都会被拒绝。
-`skill_aliases_json` 不参与 VLM 输出校验，只在 API 失败或规则模式下供确定性 fallback 解析，
-并且只包含 YAML 中启用且显式设置 `description.rule_entry: true` 的 skill，而不是 catalog 的全部别名。
+`allowed_skills_json` 与 `skill_aliases_json` 只是节点启动时的初始默认值；每条任务到达时，planner 会用
+已验证 exact catalog 视图中的 `planner_visible_names` 和 `aliases` 覆盖二者。设置 `disabled: true` 的 skill
+不进入该边界，响应中出现禁用或其他边界外 skill 都会被拒绝。
+`skill_aliases_json` 不参与 VLM 输出校验，只在 API 失败或规则模式下供确定性 fallback 解析，并且运行时只包含
+已验证 catalog 视图中启用且显式设置 `description.rule_entry: true` 的 skill，而不是 catalog 的全部别名。
 
 当前默认走本地 OpenAI-compatible 服务；原远端 Kimicode 仍然保留，只需把配置切回：
 

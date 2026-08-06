@@ -1,8 +1,8 @@
 schema_version: 1
 kind: primitive_sequence
-robot: so101_rtp_distributed
+robot: so101_arm_v1
 initial_gripper_state: none
 timeout_sec: 30.0
 primitive_sequence:
 - primitive_name: move_to_named_pose
-  pose_name: zero
+  pose_name: home

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import threading
+import time
 from pathlib import Path
 
 import rclpy
@@ -225,6 +227,36 @@ class PickExecutorNode(
             return GoalResponse.REJECT
         dispatch_nonce = str(goal_request.dispatch_binding.dispatch_nonce).strip()
         if not dispatch_nonce:
+            return GoalResponse.REJECT
+        binding = goal_request.dispatch_binding
+        budget = binding.task_budget
+        if (
+            binding.schema_version != 1
+            or not str(binding.task_id).strip()
+            or not str(binding.root_task_id).strip()
+            or not binding.expected_registry_epoch
+            or binding.expected_registry_generation <= 0
+            or not binding.expected_registry_digest
+            or budget.schema_version != 1
+        ):
+            return GoalResponse.REJECT
+        started = budget.started_at.sec + budget.started_at.nanosec / 1_000_000_000
+        deadline = budget.deadline.sec + budget.deadline.nanosec / 1_000_000_000
+        timeout_sec = float(goal_request.timeout_sec)
+        now = time.time()
+        if (
+            budget.started_at.sec < 0
+            or budget.deadline.sec < 0
+            or not 0 <= budget.started_at.nanosec < 1_000_000_000
+            or not 0 <= budget.deadline.nanosec < 1_000_000_000
+            or not math.isfinite(started)
+            or not math.isfinite(deadline)
+            or deadline <= started
+            or deadline <= now
+            or not math.isfinite(timeout_sec)
+            or timeout_sec <= 0.0
+            or timeout_sec > deadline - now
+        ):
             return GoalResponse.REJECT
         with self._goal_lock:
             if self._goal_active:

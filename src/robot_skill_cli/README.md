@@ -37,8 +37,8 @@ source install/local_setup.sh
 | `reload-catalog --request-id ID --force` | 是 | 重新编译并原子激活 Gateway 已配置的 Skill catalog source |
 | `plan-text TEXT --request-id ID` | 是 | 生成一份短时 typed Agent plan |
 | `validate-plan --plan-token TOKEN` | 是 | 对 exact snapshot 计划做只读逐步预检 |
-| `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID` | 是 | 绑定用户确认、task ID 和当前 registry identity |
-| `execute-plan --plan-token TOKEN --confirmation-token TOKEN --task-id ID` | 是 | 执行已确认的 Agent plan |
+| `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID [--timeout-sec SEC]` | 是 | 校验身份/摘要/task_id 并冻结 `task_budget_sec`，转入 `CONFIRMED` |
+| `execute-plan --plan-token TOKEN --confirmation-token TOKEN --task-id ID [--timeout-sec SEC]` | 是 | 执行已确认的 Agent plan，必须复用 confirm 冻结的同一预算 |
 | `cancel-plan --task-id ID` | 是 | 通过 Agent plan action 的标准 CancelGoal 请求取消 |
 
 catalog-only 命令不初始化 `rclpy`，只读取本地归一化配置。runtime 命令只访问 Gateway status、
@@ -68,8 +68,10 @@ robot-skill --config-name so101_single_arm validate-plan \
   --plan-token PLAN_TOKEN
 robot-skill --config-name so101_single_arm confirm-plan \
   --plan-token PLAN_TOKEN --plan-digest PLAN_DIGEST --task-id agent-task-001
+# 可选 --timeout-sec 30 冻结一份小于等于 Gateway task budget 的预算
 robot-skill --config-name so101_single_arm execute-plan \
   --plan-token PLAN_TOKEN --confirmation-token CONFIRMATION_TOKEN --task-id agent-task-001
+# execute-plan 必须传 confirm 时使用的同一 --timeout-sec；省略时两端都默认 Gateway task budget
 robot-skill --config-name so101_single_arm cancel-plan \
   --task-id agent-task-001
 ```
@@ -100,8 +102,13 @@ primitive sequence、目标绑定、关节值和 ROS transport 名称不属于 C
 1. `plan-text TEXT --request-id ID`
 2. `validate-plan --plan-token TOKEN`
 3. 向用户展示步骤、参数、plan digest 和 registry identity，获取明确确认并生成 task ID
-4. `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID`
-5. `execute-plan --plan-token TOKEN --confirmation-token TOKEN --task-id ID`
+4. `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID [--timeout-sec SEC]`
+5. `execute-plan --plan-token TOKEN --confirmation-token TOKEN --task-id ID [--timeout-sec SEC]`
+
+`confirm-plan` 与 `execute-plan` 共享可选的 `--timeout-sec`：省略时两端都默认使用 Gateway 当前
+`task_budget_sec`；显式给出时必须为有限正数且不超过 Gateway task budget。`confirm-plan` 把该值以 float32
+冻结进计划，`execute-plan` 必须传入**同一**值（float32 严格相等），否则协调器以 `SKILL_REQUEST_ID_CONFLICT`
+拒绝——这是为了防止执行阶段悄悄放大或缩小用户确认过的任务预算。
 
 当前 `execute` 可用 SIGINT/SIGTERM 请求取消；另一个进程可使用 `cancel --task-id ID`。失败、timeout 或
 停止状态未知时不得自动重试。`SKILL_CANCEL_TIMEOUT` 表示机器人停止状态未知，不能表述为“已停止”。

@@ -5,13 +5,14 @@ import json
 from pathlib import Path
 
 import pytest
-
-from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
-from robot_config.loader import load_robot_config_dict
-from robot_config.timeout_policy import resolve_embodied_timeout_policy
+import yaml
 from skill_catalog.compiler import compile_skill_catalog
 from skill_catalog.models import DelegatedExecutorDescriptor, SkillCompileContext, SkillRobotContext
 from skill_catalog.source import DevelopmentStagingSkillSource
+
+from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
+from robot_config.loader import load_robot_config_dict, robot_config_digest
+from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 ROOT = Path(__file__).resolve().parents[2]
 CATALOG_ROOT = Path(__file__).resolve().parents[1]
@@ -97,7 +98,7 @@ def test_migrated_profile_preserves_legacy_templates_capabilities_and_visibility
     compiled = compile_skill_catalog(
         DevelopmentStagingSkillSource(CATALOG_ROOT),
         profile_name=profile,
-        context=_context(config, "robot-context-golden"),
+        context=_context(config, robot_config_digest(config)),
     )
     expected_enabled = {
         "so101_single_arm": {
@@ -148,3 +149,11 @@ def test_migrated_profile_preserves_legacy_templates_capabilities_and_visibility
     }[profile]
     assert set(compiled.enabled_skill_names) == expected_enabled
     assert set(compiled.planner_visible_skill_names) == expected_enabled
+
+
+def test_equivalent_so101_profiles_select_shared_stable_implementation_variant() -> None:
+    for profile in ("so101_single_arm", "so101_rtp_distributed"):
+        profile_config = yaml.safe_load(
+            (CATALOG_ROOT / "config" / "profiles" / f"{profile}.yaml").read_text(encoding="utf-8")
+        )
+        assert all(entry["implementation"] == "so101_arm_v1" for entry in profile_config["enabled_skills"])

@@ -461,6 +461,7 @@ class RosBridge:
         plan_digest: str,
         task_id: str,
         status: dict[str, Any],
+        task_budget_sec: float,
         timeout_sec: float,
     ) -> dict[str, Any]:
         if self._ConfirmAgentPlan is None:
@@ -473,6 +474,7 @@ class RosBridge:
         request.registry_epoch = status["registry_epoch"]
         request.registry_generation = int(status["registry_generation"])
         request.registry_digest = status["registry_digest"]
+        request.task_budget_sec = float(task_budget_sec)
         response = self._call_service(
             self._confirm_plan_client,
             request,
@@ -482,6 +484,15 @@ class RosBridge:
         return {
             "confirmed": bool(response.confirmed),
             "confirmation_token": str(response.confirmation_token),
+            "confirmed_task_budget_sec": float(response.confirmed_task_budget_sec),
+            "task_budget_started_at": {
+                "sec": int(response.task_budget_started_at.sec),
+                "nanosec": int(response.task_budget_started_at.nanosec),
+            },
+            "task_budget_deadline": {
+                "sec": int(response.task_budget_deadline.sec),
+                "nanosec": int(response.task_budget_deadline.nanosec),
+            },
             "error_code": str(response.error_code),
             "message": str(response.message),
             "diagnostics": self._diagnostics(response.diagnostics),

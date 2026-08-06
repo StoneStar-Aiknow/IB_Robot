@@ -4,6 +4,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from action_msgs.msg import GoalStatus
 
 from embodied_agent.task_executor_node import TaskExecutorNode, derive_skill_task_id
 from embodied_common.dispatch_binding import new_binding, workflow_step
@@ -26,10 +27,10 @@ class _AcceptedGoalHandle:
 
     def get_result_async(self):
         result = SimpleNamespace(success=True, error_code="", message="completed")
-        return _DoneFuture(SimpleNamespace(result=result))
+        return _DoneFuture(SimpleNamespace(result=result, status=GoalStatus.STATUS_SUCCEEDED))
 
     def cancel_goal_async(self):
-        return _DoneFuture(None)
+        return _DoneFuture(SimpleNamespace(goals_canceling=[object()]))
 
 
 class _ImmediateActionClient:
@@ -180,3 +181,81 @@ def test_execute_task_rejects_invalid_parent_without_dispatch():
     assert len(statuses) == 1
     assert statuses[0]["task_id"] == ""
     assert statuses[0]["error_code"] == "INVALID_TASK_ID"
+
+
+class _PendingFuture:
+    def done(self) -> bool:
+        return False
+
+
+class _UnknownBeginClient(_ImmediateServiceClient):
+    def call_async(self, request):
+        self.requests.append(request)
+        return _PendingFuture()
+
+
+class _UnknownAcceptanceClient(_ImmediateActionClient):
+    def send_goal_async(self, goal):
+        self.goals.append(goal)
+        return _PendingFuture()
+
+
+class _TimedOutGoalHandle:
+    accepted = True
+
+    def __init__(self, cancel_response):
+        self._result_future = _PendingFuture()
+        self._cancel_response = cancel_response
+
+    def get_result_async(self):
+        return self._result_future
+
+    def cancel_goal_async(self):
+        return _DoneFuture(self._cancel_response)
+
+
+class _TimedOutActionClient(_ImmediateActionClient):
+    def __init__(self, cancel_response):
+        super().__init__()
+        self._handle = _TimedOutGoalHandle(cancel_response)
+
+    def send_goal_async(self, goal):
+        self.goals.append(goal)
+        return _DoneFuture(self._handle)
+
+
+def test_unknown_goal_acceptance_does_not_finalize_or_report_terminal_state():
+    node, statuses = _make_executor()
+    node._skill_client = _UnknownAcceptanceClient()  # noqa: SLF001
+    node._wait_for_future = lambda future, timeout_sec: future.done()  # noqa: SLF001
+
+    node._execute_task(_make_message("parent", ["only_skill"]))  # noqa: SLF001
+
+    assert node._finalize_workflow_client.requests == []  # noqa: SLF001
+    assert statuses[-1]["state"] == "unknown"
+    assert statuses[-1]["error_code"] == "CHILD_STATE_UNKNOWN"
+
+
+def test_cancel_rejection_does_not_finalize_or_report_timeout_as_terminal():
+    node, statuses = _make_executor()
+    node._skill_client = _TimedOutActionClient(SimpleNamespace(goals_canceling=[]))  # noqa: SLF001
+    node._wait_for_future = lambda future, timeout_sec: future.done()  # noqa: SLF001
+
+    node._execute_task(_make_message("parent", ["only_skill"]))  # noqa: SLF001
+
+    assert node._finalize_workflow_client.requests == []  # noqa: SLF001
+    assert statuses[-1]["state"] == "unknown"
+    assert statuses[-1]["error_code"] == "CHILD_STATE_UNKNOWN"
+
+
+def test_unknown_workflow_begin_does_not_dispatch_or_finalize():
+    node, statuses = _make_executor()
+    node._begin_workflow_client = _UnknownBeginClient(lambda _request: None)  # noqa: SLF001
+    node._wait_for_future = lambda future, timeout_sec: future.done()  # noqa: SLF001
+
+    node._execute_task(_make_message("parent", ["only_skill"]))  # noqa: SLF001
+
+    assert node._skill_client.goals == []  # noqa: SLF001
+    assert node._finalize_workflow_client.requests == []  # noqa: SLF001
+    assert statuses[-1]["state"] == "unknown"
+    assert statuses[-1]["error_code"] == "CHILD_STATE_UNKNOWN"

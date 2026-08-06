@@ -8,8 +8,9 @@
 # task_id; only after explicit user confirmation may the CLI call this service.
 # The coordinator/plan store must atomically validate
 # (plan_token, plan_digest, task_id, registry_epoch, registry_generation,
-# registry_digest), transition the plan from PLANNED to CONFIRMED and return a
-# single-use confirmation_token bound to that exact tuple. Mismatch, duplicate
+# registry_digest, task_budget_sec), transition the plan from VALIDATED to
+# CONFIRMED and return a single-use confirmation_token bound to that exact
+# tuple. Mismatch, duplicate
 # confirmation, expired plan or reload-changed identity all fail closed.
 #
 # confirmation_token does not grant motion authorization, does not hold the
@@ -23,9 +24,13 @@ string task_id
 string registry_epoch
 uint64 registry_generation
 string registry_digest
+float32 task_budget_sec
 ---
 bool confirmed
 string confirmation_token
+float32 confirmed_task_budget_sec
+builtin_interfaces/Time task_budget_started_at
+builtin_interfaces/Time task_budget_deadline
 string error_code
 string message
 SkillDiagnostic[] diagnostics

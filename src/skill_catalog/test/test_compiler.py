@@ -1,11 +1,11 @@
 from pathlib import Path
 
 import pytest
-
-from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
 from skill_catalog.compiler import compile_skill_catalog
 from skill_catalog.models import SkillCompileContext, SkillCompileError, SkillRobotContext
 from skill_catalog.source import DevelopmentStagingSkillSource
+
+from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
 
 
 def _context() -> SkillCompileContext:
@@ -120,3 +120,44 @@ def test_compiler_rejects_robot_timeout_limit(tmp_path):
     with pytest.raises(SkillCompileError) as raised:
         compile_skill_catalog(DevelopmentStagingSkillSource(tmp_path), profile_name="test_robot", context=_context())
     assert raised.value.code == "SKILL_LIMIT_VIOLATION"
+
+
+def test_compiler_rejects_non_hidden_skill_directory_without_manifest(tmp_path):
+    _write_catalog(tmp_path)
+    (tmp_path / "config" / "skills" / "broken_skill").mkdir()
+
+    with pytest.raises(SkillCompileError) as raised:
+        compile_skill_catalog(DevelopmentStagingSkillSource(tmp_path), profile_name="test_robot", context=_context())
+
+    assert any(
+        diagnostic.source_relative_path == "config/skills/broken_skill"
+        and diagnostic.error_code == "SKILL_SCHEMA_INVALID"
+        for diagnostic in raised.value.diagnostics
+    )
+
+
+def test_compiler_validates_manifest_outside_enabled_profile(tmp_path):
+    _write_catalog(tmp_path)
+    disabled = tmp_path / "config" / "skills" / "disabled_broken"
+    disabled.mkdir()
+    (disabled / "manifest.yaml").write_text("schema_version: 1\nname: wrong_name\n", encoding="utf-8")
+
+    with pytest.raises(SkillCompileError) as raised:
+        compile_skill_catalog(DevelopmentStagingSkillSource(tmp_path), profile_name="test_robot", context=_context())
+
+    assert any(
+        diagnostic.source_relative_path == "config/skills/disabled_broken/manifest.yaml"
+        for diagnostic in raised.value.diagnostics
+    )
+
+
+def test_compiler_reports_malformed_yaml_as_schema_diagnostic(tmp_path):
+    _write_catalog(tmp_path)
+    malformed = tmp_path / "config" / "skills" / "malformed"
+    malformed.mkdir()
+    (malformed / "manifest.yaml").write_text("name: [unterminated\n", encoding="utf-8")
+
+    with pytest.raises(SkillCompileError) as raised:
+        compile_skill_catalog(DevelopmentStagingSkillSource(tmp_path), profile_name="test_robot", context=_context())
+
+    assert any(diagnostic.error_code == "SKILL_SCHEMA_INVALID" for diagnostic in raised.value.diagnostics)

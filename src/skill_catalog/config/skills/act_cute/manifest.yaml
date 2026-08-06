@@ -46,5 +46,4 @@ capability:
     required: []
   recovery_policy: never_retry
 implementations:
-  so101_single_arm: implementations/so101_single_arm.yaml
-  so101_rtp_distributed: implementations/so101_rtp_distributed.yaml
+  so101_arm_v1: implementations/so101_arm_v1.yaml

@@ -424,6 +424,10 @@ def gateway_rig(request, tmp_path):
 def _send_skill(rig, *, task_id: str = "task-1", skill_name: str = "move"):
     goal = SkillCommand.Goal()
     goal.dispatch_binding = new_binding(task_id=task_id)
+    status = _get_status(rig)
+    goal.dispatch_binding.expected_registry_epoch = status.registry_epoch
+    goal.dispatch_binding.expected_registry_generation = status.registry_generation
+    goal.dispatch_binding.expected_registry_digest = status.registry_digest
     goal.skill_name = skill_name
     goal.target_name = ""
     goal.place_name = ""
@@ -440,6 +444,13 @@ def _get_status(rig, *, task_id: str = "", payload_hash: str = ""):
     request.task_id = task_id
     request.payload_hash = payload_hash
     return _future_result(rig.status_client.call_async(request))
+
+
+def _set_root_identity(rig, binding) -> None:
+    status = _get_status(rig)
+    binding.expected_registry_epoch = status.registry_epoch
+    binding.expected_registry_generation = status.registry_generation
+    binding.expected_registry_digest = status.registry_digest
 
 
 def test_snapshot_service_response_matches_generated_contract(gateway_rig):
@@ -590,6 +601,123 @@ def test_typed_workflow_begin_ordered_children_and_finalize_are_idempotent(gatew
     assert _get_status(gateway_rig, task_id=root_task_id).request_state == "terminal"
 
 
+def _begin_single_step_workflow(rig, root_task_id: str):
+    status = _get_status(rig)
+    binding = new_binding(task_id=root_task_id)
+    binding.expected_registry_epoch = status.registry_epoch
+    binding.expected_registry_generation = status.registry_generation
+    binding.expected_registry_digest = status.registry_digest
+    started = time.time()
+    deadline = started + 8.0
+    binding.task_budget.schema_version = 1
+    binding.task_budget.started_at.sec = int(started)
+    binding.task_budget.started_at.nanosec = int((started - int(started)) * 1_000_000_000)
+    binding.task_budget.deadline.sec = int(deadline)
+    binding.task_budget.deadline.nanosec = int((deadline - int(deadline)) * 1_000_000_000)
+    steps = [workflow_step(skill_name="move", timeout_sec=2.5)]
+    binding.workflow_digest = compute_workflow_digest(
+        root_task_id=root_task_id,
+        task_budget=binding.task_budget,
+        expected_registry_epoch=status.registry_epoch,
+        expected_registry_generation=status.registry_generation,
+        expected_registry_digest=status.registry_digest,
+        workflow_steps=steps,
+    )
+    request = BeginWorkflowExecution.Request()
+    request.dispatch_binding = binding
+    request.workflow_steps = steps
+    began = _future_result(rig.begin_workflow_client.call_async(request))
+    assert began.success is True
+    return binding, began
+
+
+def _send_workflow_child(rig, binding, root_lease_nonce: str):
+    goal = SkillCommand.Goal()
+    goal.dispatch_binding = copy_binding(binding)
+    goal.dispatch_binding.task_id = derive_skill_task_id(binding.root_task_id, 0)
+    goal.dispatch_binding.workflow_step_index = 0
+    goal.dispatch_binding.root_lease_nonce = root_lease_nonce
+    goal.skill_name = "move"
+    goal.timeout_sec = 2.5
+    goal_handle = _future_result(rig.skill_client.send_goal_async(goal))
+    assert goal_handle.accepted
+    return _future_result(goal_handle.get_result_async()).result
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_failed_workflow_child_cannot_be_replayed(gateway_rig, monkeypatch):
+    binding, began = _begin_single_step_workflow(gateway_rig, "workflow-failed-child")
+    monkeypatch.setattr(gateway_rig.executor_node, "_validate_skill", lambda *_args, **_kwargs: (False, "denied"))
+
+    failed = _send_workflow_child(gateway_rig, binding, began.root_lease_nonce)
+    replay = _send_workflow_child(gateway_rig, binding, began.root_lease_nonce)
+
+    assert failed.success is False
+    assert failed.error_code == "SKILL_REJECTED"
+    assert replay.success is False
+    assert replay.error_code == "SKILL_WORKFLOW_DIGEST_MISMATCH"
+
+    finalize = FinalizeWorkflowExecution.Request()
+    finalize.dispatch_binding = copy_binding(binding)
+    finalize.dispatch_binding.root_lease_nonce = began.root_lease_nonce
+    finalize.terminal_state = FinalizeWorkflowExecution.Request.FAILED
+    finalize.completed_step_count = 0
+    finalized = _future_result(gateway_rig.finalize_workflow_client.call_async(finalize))
+    assert finalized.success is True
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_workflow_can_fail_before_child_reaches_gateway_admission(gateway_rig):
+    binding, began = _begin_single_step_workflow(gateway_rig, "workflow-pre-dispatch-failure")
+    finalize = FinalizeWorkflowExecution.Request()
+    finalize.dispatch_binding = copy_binding(binding)
+    finalize.dispatch_binding.root_lease_nonce = began.root_lease_nonce
+    finalize.terminal_state = FinalizeWorkflowExecution.Request.FAILED
+    finalize.completed_step_count = 0
+
+    finalized = _future_result(gateway_rig.finalize_workflow_client.call_async(finalize))
+
+    assert finalized.success is True
+    assert finalized.actual_completed_step_count == 0
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_finalize_release_failure_keeps_terminal_workflow_busy_and_is_retryable(gateway_rig, monkeypatch):
+    binding, began = _begin_single_step_workflow(gateway_rig, "workflow-release-failure")
+    assert _send_workflow_child(gateway_rig, binding, began.root_lease_nonce).success is True
+    workflow = gateway_rig.executor_node._active_workflow
+    generation = workflow.bundle.generation
+    assert generation in gateway_rig.executor_node._runtime_coordinator.retained_generations
+    original_release = workflow.policy.release_workflow
+    release_attempts = 0
+
+    def release_workflow(owner, token):
+        nonlocal release_attempts
+        release_attempts += 1
+        return False if release_attempts == 1 else original_release(owner, token)
+
+    monkeypatch.setattr(workflow.policy, "release_workflow", release_workflow)
+    request = FinalizeWorkflowExecution.Request()
+    request.dispatch_binding = copy_binding(binding)
+    request.dispatch_binding.root_lease_nonce = began.root_lease_nonce
+    request.terminal_state = FinalizeWorkflowExecution.Request.SUCCEEDED
+    request.completed_step_count = 1
+
+    failed = _future_result(gateway_rig.finalize_workflow_client.call_async(request))
+    status = _get_status(gateway_rig, task_id=binding.root_task_id)
+
+    assert failed.success is False
+    assert failed.error_code == "GATEWAY_FINALIZATION_FAILED"
+    assert status.busy is True
+    assert status.active_owner_kind == "workflow"
+    assert status.request_state == "terminal"
+    assert workflow.runtime_generation_released is False
+    assert generation in gateway_rig.executor_node._runtime_coordinator.retained_generations
+    retried = _future_result(gateway_rig.finalize_workflow_client.call_async(request))
+    assert retried.success is True
+    assert release_attempts == 2
+
+
 @pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
 def test_expired_workflow_is_reaped_when_executor_does_not_finalize(gateway_rig):
     status = _get_status(gateway_rig)
@@ -642,16 +770,18 @@ def _status_snapshot(**overrides) -> RuntimeSnapshot:
     return RuntimeSnapshot(**values)
 
 
-def _primitive_goal(task_id: str) -> PrimitiveCommand.Goal:
+def _primitive_goal(task_id: str, rig=None) -> PrimitiveCommand.Goal:
     goal = PrimitiveCommand.Goal()
     goal.dispatch_binding = new_binding(task_id=task_id)
+    if rig is not None:
+        _set_root_identity(rig, goal.dispatch_binding)
     goal.primitive_name = "move_to_named_pose"
     goal.pose_name = "home"
     return goal
 
 
-def _relative_primitive_goal(task_id: str) -> PrimitiveCommand.Goal:
-    goal = _primitive_goal(task_id)
+def _relative_primitive_goal(task_id: str, rig=None) -> PrimitiveCommand.Goal:
+    goal = _primitive_goal(task_id, rig)
     goal.primitive_name = "move_relative_ee"
     goal.pose_name = ""
     goal.relative_dx = 0.01
@@ -684,6 +814,44 @@ def test_unauthorized_skill_does_not_dispatch_primitive(gateway_rig, monkeypatch
     assert status.motion_authorized is False
     assert capability.ready is False
     assert capability.reason == "MOTION_NOT_AUTHORIZED: operator authorization is disabled"
+
+
+def test_direct_skill_rejects_incomplete_registry_binding(gateway_rig):
+    goal = SkillCommand.Goal()
+    goal.dispatch_binding = new_binding(task_id="missing-identity")
+    goal.skill_name = "move"
+
+    handle = _future_result(gateway_rig.skill_client.send_goal_async(goal))
+    result = _future_result(handle.get_result_async()).result
+
+    assert result.success is False
+    assert result.error_code == "SKILL_SCHEMA_INVALID"
+
+
+def test_zero_budget_root_accepts_timeout_equal_to_gateway_task_budget(gateway_rig):
+    goal = SkillCommand.Goal()
+    goal.dispatch_binding = new_binding(task_id="full-root-budget")
+    _set_root_identity(gateway_rig, goal.dispatch_binding)
+    goal.skill_name = "move"
+    goal.timeout_sec = gateway_rig.overrides["task_budget_sec"]
+
+    handle = _future_result(gateway_rig.skill_client.send_goal_async(goal))
+    result = _future_result(handle.get_result_async()).result
+
+    assert result.error_code != "TIMEOUT_EXCEEDS_POLICY"
+
+
+@pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)
+def test_external_primitive_reports_exact_registry_identity(gateway_rig):
+    goal = _primitive_goal("primitive-identity", gateway_rig)
+
+    handle = _future_result(gateway_rig.primitive_client.send_goal_async(goal))
+    result = _future_result(handle.get_result_async()).result
+    status = _get_status(gateway_rig)
+
+    assert result.actual_registry_epoch == status.registry_epoch
+    assert result.actual_registry_generation == status.registry_generation
+    assert result.actual_registry_digest == status.registry_digest
 
 
 def test_status_ledger_query_matrix(gateway_rig):
@@ -798,6 +966,7 @@ def test_internal_relative_primitive_rejects_pose_stale_after_root_admission(gat
     monkeypatch.setattr(gateway_rig.executor_node, "_validate_skill", validate_skill)
     goal = SkillCommand.Goal()
     goal.dispatch_binding = new_binding(task_id="stale-internal")
+    _set_root_identity(gateway_rig, goal.dispatch_binding)
     goal.skill_name = "relative"
     goal.motion_direction = "forward"
     goal.motion_distance = 0.01
@@ -826,7 +995,7 @@ def test_external_relative_primitive_rejects_stale_pose_before_validation_or_dis
     time.sleep(gateway_rig.overrides["robot_state_freshness_sec"] + 0.05)
 
     goal_handle = _future_result(
-        gateway_rig.primitive_client.send_goal_async(_relative_primitive_goal("stale-external"))
+        gateway_rig.primitive_client.send_goal_async(_relative_primitive_goal("stale-external", gateway_rig))
     )
     assert goal_handle.accepted
     result = _future_result(goal_handle.get_result_async()).result
@@ -846,7 +1015,7 @@ def test_external_relative_primitive_rejects_stale_pose_before_validation_or_dis
 def test_external_relative_primitive_rechecks_validated_snapshot_after_delayed_validation(gateway_rig):
     _record_fresh_ee_pose(gateway_rig, x=0.2)
     goal_handle = _future_result(
-        gateway_rig.primitive_client.send_goal_async(_relative_primitive_goal("stale-after-validation"))
+        gateway_rig.primitive_client.send_goal_async(_relative_primitive_goal("stale-after-validation", gateway_rig))
     )
     assert goal_handle.accepted
     result_future = goal_handle.get_result_async()
@@ -882,7 +1051,7 @@ def test_external_relative_primitive_rechecks_validated_snapshot_after_delayed_s
 
     monkeypatch.setattr(gateway_rig.executor_node._task_executor_client, "wait_for_server", wait_for_server)
     goal_handle = _future_result(
-        gateway_rig.primitive_client.send_goal_async(_relative_primitive_goal("stale-after-readiness"))
+        gateway_rig.primitive_client.send_goal_async(_relative_primitive_goal("stale-after-readiness", gateway_rig))
     )
     assert goal_handle.accepted
     result_future = goal_handle.get_result_async()
@@ -907,6 +1076,7 @@ def test_external_relative_primitive_rechecks_validated_snapshot_after_delayed_s
 def test_external_primitive_with_active_task_id_and_random_uuid_is_busy(gateway_rig):
     root_goal = SkillCommand.Goal()
     root_goal.dispatch_binding = new_binding(task_id="active-task")
+    _set_root_identity(gateway_rig, root_goal.dispatch_binding)
     root_goal.skill_name = "move"
     root_handle = _future_result(gateway_rig.skill_client.send_goal_async(root_goal))
     assert root_handle.accepted
@@ -914,7 +1084,7 @@ def test_external_primitive_with_active_task_id_and_random_uuid_is_busy(gateway_
     _wait_for(gateway_rig.task_started.is_set)
 
     try:
-        external_goal = _primitive_goal("active-task")
+        external_goal = _primitive_goal("active-task", gateway_rig)
         external_uuid = UUID(uuid=list(uuid.uuid4().bytes))
         external_handle = _future_result(
             gateway_rig.primitive_client.send_goal_async(external_goal, goal_uuid=external_uuid)
@@ -937,6 +1107,7 @@ def test_external_primitive_with_active_task_id_and_random_uuid_is_busy(gateway_
 def test_root_skill_busy_rejection_preserves_admission_reason(gateway_rig, monkeypatch):
     root_goal = SkillCommand.Goal()
     root_goal.dispatch_binding = new_binding(task_id="active-task")
+    _set_root_identity(gateway_rig, root_goal.dispatch_binding)
     root_goal.skill_name = "move"
     root_handle = _future_result(gateway_rig.skill_client.send_goal_async(root_goal))
     assert root_handle.accepted

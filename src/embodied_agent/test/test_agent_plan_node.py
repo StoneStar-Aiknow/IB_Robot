@@ -14,6 +14,9 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.parameter import Parameter
 
 from embodied_agent.agent_plan_node import AgentPlanNode
+from embodied_agent.agent_plan_store import AgentPlanError
+from embodied_common.dispatch_binding import new_binding
+from embodied_common.workflow_contracts import CanonicalWorkflowStep
 from ibrobot_msgs.action import ExecuteAgentPlan, SkillCommand
 from ibrobot_msgs.msg import SkillCapabilityStatus
 from ibrobot_msgs.srv import (
@@ -181,16 +184,17 @@ def test_plan_validate_confirm_execute_and_terminal_replay(plan_rig):
     confirm_request.registry_epoch, confirm_request.registry_generation, confirm_request.registry_digest = (
         plan_rig.registry
     )
+    confirm_request.task_budget_sec = 5.0
     confirmed = _future_result(plan_rig.confirm_client.call_async(confirm_request))
     assert confirmed.confirmed is True
 
-    def execute():
+    def execute(timeout_sec=5.0):
         goal = ExecuteAgentPlan.Goal()
         goal.schema_version = 1
         goal.plan_token = planned.plan.plan_token
         goal.confirmation_token = confirmed.confirmation_token
         goal.task_id = "agent-task-1"
-        goal.timeout_sec = 5.0
+        goal.timeout_sec = timeout_sec
         handle = _future_result(plan_rig.execute_client.send_goal_async(goal))
         assert handle.accepted
         return _future_result(handle.get_result_async()).result
@@ -200,6 +204,42 @@ def test_plan_validate_confirm_execute_and_terminal_replay(plan_rig):
     assert first.success is True
     assert replay.success is True
     assert replay.completed_step_count == 1
+
+
+def test_execute_rejects_budget_changed_after_confirmation(plan_rig):
+    plan_request = PlanAgentCommand.Request()
+    plan_request.schema_version = 1
+    plan_request.request_id = "request-budget-mismatch"
+    plan_request.raw_command = "打开夹爪"
+    planned = _future_result(plan_rig.plan_client.call_async(plan_request))
+
+    validate_request = ValidateAgentPlan.Request()
+    validate_request.schema_version = 1
+    validate_request.plan_token = planned.plan.plan_token
+    assert _future_result(plan_rig.validate_client.call_async(validate_request)).allowed is True
+
+    confirm_request = ConfirmAgentPlan.Request()
+    confirm_request.schema_version = 1
+    confirm_request.plan_token = planned.plan.plan_token
+    confirm_request.plan_digest = planned.plan.plan_digest
+    confirm_request.task_id = "agent-task-budget-mismatch"
+    confirm_request.registry_epoch, confirm_request.registry_generation, confirm_request.registry_digest = (
+        plan_rig.registry
+    )
+    confirm_request.task_budget_sec = 5.0
+    confirmed = _future_result(plan_rig.confirm_client.call_async(confirm_request))
+
+    goal = ExecuteAgentPlan.Goal()
+    goal.schema_version = 1
+    goal.plan_token = planned.plan.plan_token
+    goal.confirmation_token = confirmed.confirmation_token
+    goal.task_id = confirm_request.task_id
+    goal.timeout_sec = 4.0
+    handle = _future_result(plan_rig.execute_client.send_goal_async(goal))
+    result = _future_result(handle.get_result_async()).result
+
+    assert result.success is False
+    assert result.error_code == "SKILL_REQUEST_ID_CONFLICT"
 
 
 def test_plan_service_returns_one_typed_ordered_multi_skill_workflow(plan_rig):
@@ -217,3 +257,102 @@ def test_plan_service_returns_one_typed_ordered_multi_skill_workflow(plan_rig):
     validate_request.plan_token = planned.plan.plan_token
     validated = _future_result(plan_rig.validate_client.call_async(validate_request))
     assert validated.allowed is True
+
+
+def test_confirm_plan_rejects_plan_that_was_not_validated(plan_rig):
+    plan_request = PlanAgentCommand.Request()
+    plan_request.schema_version = 1
+    plan_request.request_id = "request-unvalidated"
+    plan_request.raw_command = "打开夹爪"
+    planned = _future_result(plan_rig.plan_client.call_async(plan_request))
+    assert planned.success is True
+
+    confirm_request = ConfirmAgentPlan.Request()
+    confirm_request.schema_version = 1
+    confirm_request.plan_token = planned.plan.plan_token
+    confirm_request.plan_digest = planned.plan.plan_digest
+    confirm_request.task_id = "agent-task-unvalidated"
+    confirm_request.registry_epoch, confirm_request.registry_generation, confirm_request.registry_digest = (
+        plan_rig.registry
+    )
+    confirm_request.task_budget_sec = 5.0
+
+    confirmed = _future_result(plan_rig.confirm_client.call_async(confirm_request))
+
+    assert confirmed.confirmed is False
+    assert confirmed.error_code == "SKILL_REJECTED"
+
+
+class _PendingFuture:
+    def done(self):
+        return False
+
+
+class _DoneFuture:
+    def __init__(self, value):
+        self._value = value
+
+    def done(self):
+        return True
+
+    def result(self):
+        return self._value
+
+
+class _UnknownAcceptanceSkillClient:
+    def wait_for_server(self, *, timeout_sec):
+        return True
+
+    def send_goal_async(self, _goal):
+        return _PendingFuture()
+
+
+class _CancelRejectedHandle:
+    accepted = True
+
+    def get_result_async(self):
+        return _PendingFuture()
+
+    def cancel_goal_async(self):
+        return _DoneFuture(SimpleNamespace(goals_canceling=[]))
+
+
+class _CancelRejectedSkillClient(_UnknownAcceptanceSkillClient):
+    def send_goal_async(self, _goal):
+        return _DoneFuture(_CancelRejectedHandle())
+
+
+def _send_skill_node(client):
+    node = object.__new__(AgentPlanNode)
+    node._skill_client = client
+    node._rpc_timeout = 0.01
+    node._wait_future = lambda future, timeout_sec: future.done()
+    return node
+
+
+def test_send_skill_reports_unknown_when_goal_acceptance_times_out():
+    node = _send_skill_node(_UnknownAcceptanceSkillClient())
+
+    with pytest.raises(AgentPlanError) as raised:
+        node._send_skill(
+            SimpleNamespace(is_cancel_requested=False),
+            new_binding(task_id="task-1"),
+            CanonicalWorkflowStep(1, "open_gripper_skill", timeout_sec=1.0),
+            time.monotonic() + 1.0,
+        )
+
+    assert raised.value.code == "SKILL_EXECUTION_STATE_UNKNOWN"
+
+
+def test_send_skill_requires_cancel_acceptance_and_terminal_result():
+    node = _send_skill_node(_CancelRejectedSkillClient())
+
+    with pytest.raises(AgentPlanError) as raised:
+        node._send_skill(
+            SimpleNamespace(is_cancel_requested=True),
+            new_binding(task_id="task-1"),
+            CanonicalWorkflowStep(1, "open_gripper_skill", timeout_sec=1.0),
+            time.monotonic() + 1.0,
+        )
+
+    assert raised.value.code == "SKILL_CANCEL_TIMEOUT"

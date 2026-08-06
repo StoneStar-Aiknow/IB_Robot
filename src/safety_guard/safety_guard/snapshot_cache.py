@@ -8,7 +8,6 @@ from threading import RLock
 from types import MappingProxyType
 from typing import Any
 
-from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST
 from skill_catalog.digest import (
     deep_freeze,
     derive_capability_digest,
@@ -16,6 +15,8 @@ from skill_catalog.digest import (
     derive_registry_digest,
     to_canonical_json,
 )
+
+from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST
 
 
 class SnapshotCacheError(ValueError):
@@ -146,14 +147,13 @@ class SafetySnapshotCache:
             self._current_key = (identity.registry_epoch, identity.generation)
 
     def reconcile(self, registry_epoch: str, retained_generations: set[int], *, keep_recent: int = 2) -> None:
+        del keep_recent
         with self._lock:
             if self._current_key is not None and self._current_key[0] != registry_epoch:
                 self._current_key = None
-            epoch_generations = sorted(generation for epoch, generation in self._snapshots if epoch == registry_epoch)
-            keep = retained_generations | set(epoch_generations[-keep_recent:])
             self._snapshots = {
                 key: value
                 for key, value in self._snapshots.items()
                 if (key == self._current_key and key[0] == registry_epoch)
-                or (key[0] == registry_epoch and key[1] in keep)
+                or (key[0] == registry_epoch and key[1] in retained_generations)
             }

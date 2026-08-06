@@ -1,31 +1,65 @@
 schema_version: 1
 kind: primitive_sequence
-robot: so101_single_arm
+robot: so101_arm_v1
 initial_gripper_state: closed
 timeout_sec: 30.0
 primitive_sequence:
 - primitive_name: move_to_joint_positions
   joint_positions:
     '1': 0.02
-    '2': 0.54
-    '3': -0.82
-    '4': -0.18
-    '5': 0.02
+    '2': 0.57
+    '3': -0.76
+    '4': -0.58
+    '5': 0.51
   duration_sec: 2.0
 - primitive_name: move_through_joint_positions
   trajectory_template:
-    type: single_joint_wave_v1
+    type: wave_dance_v1
     waypoint_duration_sec: 0.05
-    active_waypoint_count: 16
+    active_waypoint_count: 120
     repeat_count: 3
+    zero_hold_count: 4
     base_pose:
       '1': 0.02
       '2': 0.54
       '3': -0.82
       '4': -0.18
       '5': 0.02
-    joint: '5'
-    amplitude: 0.35
+    joints:
+      '1':
+        terms:
+        - amplitude: 0
+          harmonic: 1
+          phase: 1.2
+      '2':
+        terms:
+        - amplitude: 0.3
+          harmonic: 1
+          phase: 0.0
+        - amplitude: 0.03
+          harmonic: 2
+          phase: 1.5707963267948966
+      '3':
+        terms:
+        - amplitude: 0.3
+          harmonic: 1
+          phase: 0.0
+        - amplitude: 0.06
+          harmonic: 2
+          phase: 1.5707963267948966
+      '4':
+        terms:
+        - amplitude: -0.8
+          harmonic: 1
+          phase: 0.45
+        - amplitude: -0.05
+          harmonic: 2
+          phase: 1.8
+      '5':
+        terms:
+        - amplitude: 0.5
+          harmonic: 1
+          phase: 1.8
     workspace_limits:
       model: so101_arm_v1
       points:
@@ -55,11 +89,3 @@ primitive_sequence:
           z:
           - 0.05
           - 0.55
-- primitive_name: move_to_joint_positions
-  joint_positions:
-    '1': 0.02
-    '2': 0.54
-    '3': -0.82
-    '4': -0.18
-    '5': 0.02
-  duration_sec: 2.0

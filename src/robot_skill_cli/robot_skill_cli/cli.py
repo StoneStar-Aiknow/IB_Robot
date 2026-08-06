@@ -84,6 +84,7 @@ def _build_parser() -> argparse.ArgumentParser:
     confirm_plan_parser.add_argument("--plan-token", required=True)
     confirm_plan_parser.add_argument("--plan-digest", required=True)
     confirm_plan_parser.add_argument("--task-id", required=True)
+    confirm_plan_parser.add_argument("--timeout-sec", type=float)
     execute_plan_parser = subparsers.add_parser("execute-plan", help="execute one confirmed Agent plan")
     execute_plan_parser.add_argument("--plan-token", required=True)
     execute_plan_parser.add_argument("--confirmation-token", required=True)
@@ -323,11 +324,15 @@ def _run_confirm_plan(args: argparse.Namespace, context, bridge) -> dict[str, An
         raise _CliArgumentError("task_id must be non-empty")
     timeout_sec = _status_preflight_timeout(context)
     status = bridge.get_status(task_id="", payload_hash="", timeout_sec=timeout_sec)
+    task_budget_sec = status["task_budget_sec"] if args.timeout_sec is None else args.timeout_sec
+    if not math.isfinite(task_budget_sec) or task_budget_sec <= 0.0 or task_budget_sec > status["task_budget_sec"]:
+        raise _CliArgumentError("timeout_sec must be finite, positive, and within the Gateway task budget")
     result = bridge.confirm_agent_plan(
         plan_token=args.plan_token,
         plan_digest=args.plan_digest,
         task_id=task_id,
         status=status,
+        task_budget_sec=task_budget_sec,
         timeout_sec=timeout_sec,
     )
     _raise_plan_error(result, default_code="SKILL_REQUEST_ID_CONFLICT", exit_code=EXIT_GATEWAY_REJECTED)
@@ -355,7 +360,9 @@ def _run_execute_plan(args: argparse.Namespace, context, bridge) -> dict[str, An
         raise _CliArgumentError("task_id must be non-empty")
     rpc_timeout = _plan_rpc_timeout(context)
     status = bridge.get_status(task_id=task_id, payload_hash="", timeout_sec=_status_preflight_timeout(context))
-    timeout_sec = _validate_timeout(status, args.timeout_sec)
+    timeout_sec = status["task_budget_sec"] if args.timeout_sec is None else args.timeout_sec
+    if not math.isfinite(timeout_sec) or timeout_sec <= 0.0 or timeout_sec > status["task_budget_sec"]:
+        raise _CliArgumentError("timeout_sec must be finite, positive, and within the Gateway task budget")
     if not bridge.wait_for_execute_plan_server(timeout_sec=rpc_timeout):
         raise _CommandError(
             "SERVER_UNAVAILABLE", "agent plan action server unavailable", exit_code=EXIT_ROS_UNAVAILABLE

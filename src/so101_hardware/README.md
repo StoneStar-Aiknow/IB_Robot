@@ -15,7 +15,8 @@ SO-101 机械臂的硬件驱动包，提供高性能 C++ ros2_control 接口和 
 - **启动位置保护**：支持配置 `reset_positions`，防止机械臂在启动时因回零产生剧烈跳动（对机器狗背负式机械臂尤为重要）。
 - **生命周期管理**：支持标准的 `on_configure`, `on_activate`, `on_deactivate` 生命周期。
 - **电流反馈**：C++ 插件和 Python 桥接脚本会按 STS3215 `1 LSB = 6.5mA` 把 Feetech `Present_Current` 转为安培，并通过 `/so101_follower/joint_currents` 或 `/so101_leader/joint_currents` 发布 `ibrobot_msgs/msg/JointCurrent`，供数据集转换生成 `observation.current`。
-- **安全保障**：在节点关闭时自动卸载舵机力矩（Torque Off）。
+- **安全保障**：节点关闭时自动卸载舵机力矩（Torque Off）；`on_activate` 失败回滚时先对所有舵机
+  fail-closed 卸力矩，再尝试 relock 任何处于解锁状态的 EPROM，最后才关闭串口，并对两类失败给出独立诊断。
 
 ## 架构
 
@@ -98,6 +99,24 @@ ros2 run so101_hardware leader_arm_pub --port /dev/ttyACM0 --publish_rate 50.0
 插件内部自动处理步数 (Steps) 与弧度 (Radians) 的转换：
 - **读取**：`radians = ((steps - range_min) / range - 0.5) * 2.0 * PI`
 - **写入**：`steps = (radians / (2.0 * PI) + 0.5) * range + range_min`
+
+### 激活回滚 (Activation Rollback)
+`on_activate` 在配置舵机过程中失败时执行 fail-closed 回滚，由 `detail::rollback_activation` 完成：
+
+1. **先卸力矩**：对所有 `motor_ids_` 执行 `EnableTorque(id, 0)`（带重试），这是安全默认动作，独立于
+   EPROM 状态。卸力矩优先于 relock，因为部分 Feetech 舵机仅在力矩关闭时才接受 EPROM 锁定指令。
+2. **再 relock EPROM**：仅对回滚开始时仍处于解锁状态（`unlocked_motors` 集合）的舵机尝试
+   `LockEprom(id)`（带重试），在**关闭串口之前**完成。正常流程中每完成一个舵机的配置就会把它从
+   解锁集合移除，因此只有中途失败时仍解锁的舵机才会进入 relock。
+3. **最后关闭串口**：`sms_sts_.end()`。
+
+两类结果独立汇报，互不掩盖：
+- 力矩卸载失败 → `Failed to disable torque for one or more motors during activation abort`；
+- EPROM relock 失败 → `Failed to relock EPROM for N motor(s) during activation abort; persistent parameters may be unprotected`，
+  并在 `relock_failures` 中列出具体舵机 ID。
+
+即使力矩卸载失败，relock 仍会被尝试（均为 best-effort、fail-closed 语义），调用方可据此判断是否需要
+人工复位持久参数。
 
 ## 对比：C++ 插件 vs Python 工具
 

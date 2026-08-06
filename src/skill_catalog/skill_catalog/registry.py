@@ -65,7 +65,7 @@ class SkillRegistry:
     def release(self, generation: int) -> None:
         count = self._retention_counts.get(generation, 0)
         if count <= 0:
-            raise SkillRegistryError("snapshot generation is not retained", code="SKILL_SNAPSHOT_NOT_RETAINED")
+            return
         self._retention_counts[generation] = count - 1
         self._collect_history()
 

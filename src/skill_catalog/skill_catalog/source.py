@@ -165,8 +165,14 @@ def load_yaml_mapping(path: Path) -> Mapping[str, Any]:
             code="SKILL_PACKAGE_NOT_FOUND",
             source_relative_path=str(path),
         )
-    with open(path, encoding="utf-8") as handle:
-        loaded = yaml.safe_load(handle)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            loaded = yaml.safe_load(handle)
+    except yaml.YAMLError as exc:
+        raise SkillCatalogError(
+            "invalid YAML",
+            code="SKILL_SCHEMA_INVALID",
+        ) from exc
     if loaded is None:
         return {}
     if not isinstance(loaded, dict):
@@ -230,14 +236,16 @@ class DirectoryReleaseSkillSource:
             if not entry.is_dir() or entry.name.startswith(_HIDDEN_PREFIXES):
                 continue
             manifest_path = entry / "manifest.yaml"
-            if not manifest_path.is_file():
-                continue
-            manifest = load_yaml_mapping(manifest_path)
-            implementations = manifest.get("implementations", {})
             impl_paths: dict[str, Path] = {}
-            if isinstance(implementations, dict):
-                for impl_name, rel in implementations.items():
-                    impl_paths[str(impl_name)] = entry / str(rel)
+            if manifest_path.is_file():
+                try:
+                    manifest = load_yaml_mapping(manifest_path)
+                except SkillCatalogError:
+                    manifest = {}
+                implementations = manifest.get("implementations", {})
+                if isinstance(implementations, dict):
+                    for impl_name, rel in implementations.items():
+                        impl_paths[str(impl_name)] = entry / str(rel)
             skill_md = entry / "SKILL.md"
             packages.append(
                 SkillPackageLocation(

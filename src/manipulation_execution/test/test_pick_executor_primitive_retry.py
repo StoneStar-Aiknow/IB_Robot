@@ -1,11 +1,12 @@
+import time
 from threading import Lock
 from types import SimpleNamespace
 
 import pytest
+from manipulation_execution.pick_executor_node import PickExecutorNode, PickFlowError
 
 from embodied_common.dispatch_binding import delegated_executor_identity, fill_delegated_executor_identity, new_binding
 from ibrobot_msgs.action import PickObject
-from manipulation_execution.pick_executor_node import PickExecutorNode, PickFlowError
 
 
 class _PrimitiveClient:
@@ -89,5 +90,16 @@ def test_pick_executor_rejects_identity_mismatch_and_requires_dispatch_nonce() -
 
     assert executor._handle_goal(goal).name == "REJECT"
     fill_delegated_executor_identity(goal.expected_executor, executor._executor_identity)
+    goal.dispatch_binding.schema_version = 1
+    goal.dispatch_binding.task_id = "task-1"
+    goal.dispatch_binding.root_task_id = "task-1"
+    goal.dispatch_binding.expected_registry_epoch = "epoch-1"
+    goal.dispatch_binding.expected_registry_generation = 1
+    goal.dispatch_binding.expected_registry_digest = "digest-1"
+    goal.dispatch_binding.task_budget.schema_version = 1
+    now = time.time()
+    goal.dispatch_binding.task_budget.started_at.sec = int(now)
+    goal.dispatch_binding.task_budget.deadline.sec = int(now + 10.0)
+    goal.timeout_sec = 5.0
     assert executor._handle_goal(goal).name == "ACCEPT"
     assert executor._dispatch_nonce == "nonce-1"

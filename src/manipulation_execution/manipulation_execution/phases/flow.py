@@ -394,7 +394,19 @@ class PickFlowPhase:
     def _execute_pick(self, goal_handle):
         goal = goal_handle.request
         state = FlowState(completed_phases=[])
-        timeout_sec = float(goal.timeout_sec or self._config.get("timeout_sec", 180.0))
+        task_deadline_unix = (
+            goal.dispatch_binding.task_budget.deadline.sec
+            + goal.dispatch_binding.task_budget.deadline.nanosec / 1_000_000_000
+        )
+        remaining_budget = task_deadline_unix - time.time()
+        timeout_sec = min(float(goal.timeout_sec), remaining_budget)
+        if timeout_sec <= 0.0:
+            result = self._result_from_state(state)
+            result.success = False
+            result.error_code = "TASK_TIMEOUT"
+            result.message = "shared task budget expired before pick execution"
+            goal_handle.abort()
+            return result
         deadline = time.monotonic() + timeout_sec
         target_query = str(goal.target_query).strip()
         task_id = str(goal.dispatch_binding.task_id).strip() or f"pick-{int(time.time() * 1000)}"

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import pytest
+from skill_catalog.models import SkillRobotContext, SkillSnapshot
 
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST
 from ibrobot_msgs.srv import ValidateSkill
 from safety_guard.safety_guard_node import SafetyGuardNode
 from safety_guard.snapshot_cache import SafetySnapshotCache, SnapshotCacheError, SnapshotIdentity
-from skill_catalog.models import SkillRobotContext, SkillSnapshot
 
 
 def _snapshot(name: str = "open_gripper_skill") -> SkillSnapshot:
@@ -130,7 +130,7 @@ def test_missing_or_wrong_exact_identity_fails_closed() -> None:
     assert stale.value.code == "SKILL_REGISTRY_VERSION_MISMATCH"
 
 
-def test_reconcile_keeps_retained_and_two_recent_generations() -> None:
+def test_reconcile_keeps_only_current_and_gateway_retained_generations() -> None:
     cache = SafetySnapshotCache()
     snapshots = [_snapshot(f"skill-{generation}") for generation in range(1, 5)]
     for generation, snapshot in enumerate(snapshots, start=1):
@@ -139,10 +139,10 @@ def test_reconcile_keeps_retained_and_two_recent_generations() -> None:
     cache.reconcile("epoch-1", {1, 4})
 
     assert cache.get(SnapshotIdentity("epoch-1", 1, snapshots[0].registry_digest))
-    assert cache.get(SnapshotIdentity("epoch-1", 3, snapshots[2].registry_digest))
     assert cache.get(SnapshotIdentity("epoch-1", 4, snapshots[3].registry_digest))
-    with pytest.raises(SnapshotCacheError):
-        cache.get(SnapshotIdentity("epoch-1", 2, snapshots[1].registry_digest))
+    for generation in (2, 3):
+        with pytest.raises(SnapshotCacheError):
+            cache.get(SnapshotIdentity("epoch-1", generation, snapshots[generation - 1].registry_digest))
 
 
 def test_validate_skill_uses_exact_cached_snapshot_and_reports_current_on_miss() -> None:

@@ -45,9 +45,8 @@ capability:
     required: []
   recovery_policy: never_retry
 implementations:
-  so101_single_arm: implementations/so101_single_arm.yaml
   so101_handeye_realsense_grasp: implementations/so101_handeye_realsense_grasp.yaml
-  so101_rtp_distributed: implementations/so101_rtp_distributed.yaml
+  so101_arm_v1: implementations/so101_arm_v1.yaml
 description_variants:
   so101_handeye_realsense_grasp:
     summary: Move to observe_table and acquire a scene view for planning.
