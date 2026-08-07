@@ -22,7 +22,7 @@ Run natural-language motion requests in this order. Replace placeholders with re
 
 1. Query the Gateway: `robot-skill status`.
 2. Discover capabilities: `robot-skill list-skills`.
-3. Generate a typed plan: `robot-skill plan-text --request-id REQUEST_ID --text TEXT`.
+3. Generate a typed plan: `robot-skill plan-workflow --request-id REQUEST_ID --text TEXT --workflow-json JSON`.
 4. Read every selected contract with `robot-skill describe SKILL`, then run
    `robot-skill validate-plan --plan-token TOKEN`.
 5. Show the exact ordered steps, parameters, plan digest, registry identity, and a fresh task ID. Obtain explicit user
@@ -40,7 +40,7 @@ skill, the direct `describe -> validate -> explicit user motion confirmation -> 
 
 Stop on any failure, unavailable/not-ready Gateway, unauthorized motion, rejected validation, or missing confirmation.
 Do not invent parameters absent from `describe`.
-For an ordered multi-Skill request, call `plan-text` exactly once with the user's original wording. The returned single
+For an ordered multi-Skill request, call `plan-workflow` exactly once with the user's original wording and typed steps. The returned single
 plan must contain all ordered `workflow_steps`. If planning omits, reorders, or rejects a requested step, report that
 exact result and stop; do not retry alternate phrasings and do not split the request into separately confirmed plans.
 

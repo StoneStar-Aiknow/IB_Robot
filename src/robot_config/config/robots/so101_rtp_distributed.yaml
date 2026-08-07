@@ -154,6 +154,7 @@ robot:
 
   embodied:
     enabled: false
+    entry_mode: hermes
     skill_catalog_source_mode: development
     skill_catalog_source_root: src/skill_catalog
     skill_catalog_profile: so101_rtp_distributed
@@ -177,48 +178,6 @@ robot:
       model_idle_timeout_sec: 120.0
       rpc_timeout_sec: 5.0
       gripper_settle_sec: 1.5
-    planner:
-      mode: hybrid  # rule | vlm_api | hybrid
-      scene_sources:
-        primary_camera_topic: /camera/front_camera/color/image_raw
-        primary_camera_info_topic: /camera/front_camera/color/camera_info
-        primary_aligned_depth_topic: /camera/front_camera/aligned_depth_to_color/image_raw
-        primary_pointcloud_topic: /camera/front_camera/depth/color/points
-        wrist_camera_topic: ""
-        wrist_camera_info_topic: ""
-        wrist_aligned_depth_topic: ""
-        wrist_pointcloud_topic: ""
-        ee_pose_topic: /robot_status/ee_pose
-        joint_state_topic: /joint_states
-        require_depth: false  # 仿真环境无深度流，仅用 RGB
-        require_pointcloud: false
-      vlm_api:
-        provider: kimicode
-        base_url: https://api.kimi.com/coding/v1
-        api_key_env: KIMICODE_API_KEY
-        model: kimi-latest
-        max_image_width: 640
-        jpeg_quality: 80
-      planning_policy:
-        fallback_to_rule_planner: true
-        min_confidence: 0.70
-        allowed_skills:
-          - inspect_scene
-          - recover_safe_pose
-          - recover_zero_pose
-          - move_relative_ee
-          - open_gripper_skill
-          - close_gripper_skill
-          - rotate_gripper_cw
-          - rotate_gripper_ccw
-          - dance_basic
-          - wave_hello
-          - nod_yes
-          - shake_no
-          - celebrate
-          - greet_observe_raise
-          - act_cute
-          - happy_spin_upright
     perception:
       enabled: false
       request_topic: /embodied/perception_request

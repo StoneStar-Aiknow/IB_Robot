@@ -18,7 +18,7 @@ from embodied_agent.agent_plan_store import AgentPlanError
 from embodied_common.dispatch_binding import new_binding
 from embodied_common.workflow_contracts import CanonicalWorkflowStep
 from ibrobot_msgs.action import ExecuteAgentPlan, SkillCommand
-from ibrobot_msgs.msg import SkillCapabilityStatus
+from ibrobot_msgs.msg import SkillCapabilityStatus, WorkflowStep
 from ibrobot_msgs.srv import (
     ConfirmAgentPlan,
     GetSkillGatewayStatus,
@@ -35,6 +35,15 @@ def _future_result(future, timeout_sec: float = 3.0):
         time.sleep(0.01)
     assert future.done()
     return future.result()
+
+
+def _workflow_request(request, *skill_names: str) -> None:
+    request.workflow_steps = []
+    for skill_name in skill_names:
+        step = WorkflowStep()
+        step.schema_version = 1
+        step.skill_name = skill_name
+        request.workflow_steps.append(step)
 
 
 @pytest.fixture
@@ -170,6 +179,7 @@ def test_plan_validate_confirm_execute_and_terminal_replay(plan_rig):
     plan_request.schema_version = 1
     plan_request.request_id = "request-1"
     plan_request.raw_command = "打开夹爪"
+    _workflow_request(plan_request, "open_gripper_skill")
     planned = _future_result(plan_rig.plan_client.call_async(plan_request))
     assert planned.success is True
     assert planned.plan.plan_token
@@ -216,6 +226,7 @@ def test_execute_rejects_budget_changed_after_confirmation(plan_rig):
     plan_request.schema_version = 1
     plan_request.request_id = "request-budget-mismatch"
     plan_request.raw_command = "打开夹爪"
+    _workflow_request(plan_request, "open_gripper_skill")
     planned = _future_result(plan_rig.plan_client.call_async(plan_request))
 
     validate_request = ValidateAgentPlan.Request()
@@ -252,6 +263,7 @@ def test_plan_service_returns_one_typed_ordered_multi_skill_workflow(plan_rig):
     request.schema_version = 1
     request.request_id = "request-workflow"
     request.raw_command = "先点头，然后挥手"
+    _workflow_request(request, "nod_yes", "wave_hello")
 
     planned = _future_result(plan_rig.plan_client.call_async(request))
 
@@ -269,6 +281,7 @@ def test_confirm_plan_rejects_plan_that_was_not_validated(plan_rig):
     plan_request.schema_version = 1
     plan_request.request_id = "request-unvalidated"
     plan_request.raw_command = "打开夹爪"
+    _workflow_request(plan_request, "open_gripper_skill")
     planned = _future_result(plan_rig.plan_client.call_async(plan_request))
     assert planned.success is True
 
@@ -293,6 +306,7 @@ def test_validate_plan_rejects_mismatched_safety_identity(plan_rig):
     request.schema_version = 1
     request.request_id = "request-validation-identity"
     request.raw_command = "打开夹爪"
+    _workflow_request(request, "open_gripper_skill")
     planned = _future_result(plan_rig.plan_client.call_async(request))
     plan_rig.validation_control["registry"] = ("epoch-test", 8, "different")
 

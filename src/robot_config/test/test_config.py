@@ -515,16 +515,8 @@ def test_gateway_timeout_policy_boundary_matches_humble_response_setters(timeout
         resolve_embodied_timeout_policy({"timeouts": {timeout_name: HUMBLE_FLOAT32_OVERFLOW}})
 
 
-def test_robot_state_freshness_defaults_independently_from_legacy_scene_freshness():
-    policy = resolve_embodied_timeout_policy(
-        {
-            "planner": {
-                "scene_sources": {
-                    "max_scene_age_sec": 10.0,
-                }
-            }
-        }
-    )
+def test_robot_state_freshness_defaults_independently_from_perception_scene_freshness():
+    policy = resolve_embodied_timeout_policy({"perception": {"scene_sources": {"max_scene_age_sec": 10.0}}})
 
     assert policy["scene_freshness_sec"] == 10.0
     assert policy["robot_state_freshness_sec"] == 0.5
@@ -1257,8 +1249,7 @@ def test_validate_embodied_relative_motion_direction_mapping():
     assert any("missing directions: down" in error for error in errors)
 
 
-def test_validate_embodied_vlm_planner_mode():
-    """Embodied planner mode and allowed skills must be valid."""
+def test_validate_embodied_requires_hermes_entry_mode():
     config = RobotConfig(
         name="test_robot",
         type="so101",
@@ -1270,20 +1261,7 @@ def test_validate_embodied_vlm_planner_mode():
         contract=ContractExtensionConfig(observations=[], actions=[]),
         embodied=EmbodiedConfig(
             enabled=True,
-            planner={
-                "mode": "vlm_api",
-                "scene_sources": {"primary_camera_topic": "/camera/top/image_raw"},
-                "vlm_api": {
-                    "provider": "kimicode",
-                    "base_url": "https://api.kimi.com/coding/v1",
-                    "api_key_env": "KIMICODE_API_KEY",
-                    "model": "kimi-for-coding",
-                },
-                "planning_policy": {
-                    "allowed_skills": ["inspect_scene", "unknown_skill"],
-                    "min_confidence": 0.7,
-                },
-            },
+            entry_mode="hermes",
             skill_templates={
                 "inspect_scene": {
                     "primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}]
@@ -1347,12 +1325,6 @@ def test_validate_embodied_accepts_skill_declared_by_current_robot():
         embodied=EmbodiedConfig(
             enabled=True,
             default_place_name="home",
-            planner={
-                "mode": "rule",
-                "planning_policy": {
-                    "allowed_skills": ["inspect_scene", "custom_signal"],
-                },
-            },
             skill_templates={
                 "inspect_scene": {
                     "description": descriptions["inspect_scene"],
@@ -1456,20 +1428,6 @@ def test_validate_embodied_openai_compatible_allows_empty_api_key_env():
         contract=ContractExtensionConfig(observations=[], actions=[]),
         embodied=EmbodiedConfig(
             enabled=True,
-            planner={
-                "mode": "vlm_api",
-                "scene_sources": {"primary_camera_topic": "/camera/top/image_raw"},
-                "vlm_api": {
-                    "provider": "openai_compatible",
-                    "base_url": "http://localhost:8000/v1",
-                    "api_key_env": "",
-                    "model": "Qwen3.5-9B",
-                },
-                "planning_policy": {
-                    "allowed_skills": ["inspect_scene"],
-                    "min_confidence": 0.7,
-                },
-            },
             skill_templates={
                 "inspect_scene": {
                     "primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}]
@@ -1498,7 +1456,7 @@ def test_validate_embodied_openai_compatible_allows_empty_api_key_env():
     assert not any("api_key_env is required" in error for error in errors)
 
 
-def test_validate_embodied_planner_require_depth_needs_topic():
+def test_validate_embodied_does_not_validate_removed_planner_depth_policy():
     config = RobotConfig(
         name="test_robot",
         type="so101",
@@ -1510,23 +1468,6 @@ def test_validate_embodied_planner_require_depth_needs_topic():
         contract=ContractExtensionConfig(observations=[], actions=[]),
         embodied=EmbodiedConfig(
             enabled=True,
-            planner={
-                "mode": "vlm_api",
-                "scene_sources": {
-                    "primary_camera_topic": "/camera/top/image_raw",
-                    "require_depth": True,
-                },
-                "vlm_api": {
-                    "provider": "openai_compatible",
-                    "base_url": "http://localhost:8000/v1",
-                    "api_key_env": "",
-                    "model": "Qwen3.5-9B",
-                },
-                "planning_policy": {
-                    "allowed_skills": ["inspect_scene"],
-                    "min_confidence": 0.7,
-                },
-            },
             skill_templates={
                 "inspect_scene": {
                     "primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}]
@@ -1552,7 +1493,7 @@ def test_validate_embodied_planner_require_depth_needs_topic():
     )
 
     errors = validate_config(config)
-    assert any("require_depth=true requires at least one aligned depth topic" in error for error in errors)
+    assert not any("require_depth=true requires at least one aligned depth topic" in error for error in errors)
 
 
 @pytest.mark.parametrize(

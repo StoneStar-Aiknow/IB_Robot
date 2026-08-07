@@ -841,7 +841,6 @@ camera/VLM/timeout 仍由 `embodied.perception` 统一管理。`validate_config(
 
 更多具身节点说明，详见各子包 README：
 - [`embodied_agent`](../embodied_agent/README.md)
-- [`vlm_task_planner`](../vlm_task_planner/README.md)
 - [`perception_service`](../perception_service/README.md)
 - [`skill_library`](../skill_library/README.md)
 - [`safety_guard`](../safety_guard/README.md)

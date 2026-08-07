@@ -36,7 +36,6 @@ pkill -9 -f "safety_guard_node" 2>/dev/null || true
 pkill -9 -f "skill_executor_node" 2>/dev/null || true
 pkill -9 -f "agent_plan_node" 2>/dev/null || true
 pkill -9 -f "task_entry_node" 2>/dev/null || true
-pkill -9 -f "vlm_task_planner_node" 2>/dev/null || true
 pkill -9 -f "task_executor_node" 2>/dev/null || true
 pkill -9 -f "perception_service_node" 2>/dev/null || true
 pkill -9 -f "geometric_grasp_node" 2>/dev/null || true

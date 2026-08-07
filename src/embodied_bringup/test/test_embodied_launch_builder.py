@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 from launch.actions import DeclareLaunchArgument
 
-from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
+from embodied_bringup.launch_builders.embodied import _resolve_development_source_root, generate_embodied_nodes
 from robot_config.loader import load_robot_config_dict
 
 
@@ -46,10 +46,11 @@ def _skill_executor_params(nodes):
     return _normalize_launch_param_mapping(skill_executor._Node__parameters[0])
 
 
-def test_task_entry_launch_params_do_not_include_unused_routing_config():
+def test_hermes_entry_does_not_launch_voice_routing_node():
     robot_config = {
         "embodied": {
             "enabled": True,
+            "entry_mode": "hermes",
             "execution": {},
             "entry": {},
             "named_poses": {},
@@ -62,26 +63,15 @@ def test_task_entry_launch_params_do_not_include_unused_routing_config():
     }
 
     nodes = generate_embodied_nodes(robot_config, active_control_mode="moveit_planning")
-    task_entry = next(node for node in nodes if vars(node)["_Node__node_name"] == "task_entry_node")
-    params = {}
-    for group in vars(task_entry)["_Node__parameters"]:
-        if isinstance(group, dict):
-            for key, value in group.items():
-                normalized_key = key[0].text if isinstance(key, tuple) else key.text
-                normalized_value = value[0] if isinstance(value, tuple) else value
-                if hasattr(normalized_value, "text"):
-                    normalized_value = normalized_value.text
-                params[normalized_key] = normalized_value
-
-    assert "forward_unmatched_to_planner" not in params
-    assert "reject_invalid_only" not in params
-    assert "direct_skill_whitelist_json" not in params
-    assert "planner_route_keywords_json" not in params
+    node_names = {vars(node)["_Node__node_name"] for node in nodes}
+    assert "task_entry_node" not in node_names
+    assert "task_executor_node" not in node_names
 
 
 def test_launch_does_not_inject_legacy_skill_templates():
     embodied = {
         "enabled": True,
+        "entry_mode": "hermes",
         "execution": {},
         "entry": {},
         "named_poses": {},
@@ -180,29 +170,13 @@ def test_direct_builder_defaults_gateway_motion_authorization_to_false():
     assert params["motion_authorized"] is False
 
 
-def test_launch_planner_uses_snapshot_endpoints_instead_of_static_aliases():
-    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
-    config = load_robot_config_dict(config_path)
-    config["embodied"]["enabled"] = True
-    nodes = generate_embodied_nodes(config, "moveit_planning")
-    planner = next(
-        node for node in nodes if vars(node)["_Node__node_name"] in {"task_planner_node", "vlm_task_planner_node"}
-    )
-    params = _normalize_launch_param_mapping(planner._Node__parameters[0])
-
-    assert "skill_aliases_json" not in params
-    assert "allowed_skills_json" not in params
-    assert params["skill_catalog_snapshot_service"]
-    assert params["skill_gateway_status_service"]
-
-
 def test_no_interaction_skills_node_is_generated():
     robot_config = {
         "embodied": {
             "enabled": True,
+            "entry_mode": "hermes",
             "execution": {},
             "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
-            "planner": {},
             "perception": {"enabled": True},
         }
     }
@@ -212,13 +186,38 @@ def test_no_interaction_skills_node_is_generated():
     node_names = [vars(node)["_Node__node_name"] for node in nodes]
     assert "interaction_skills_node" not in node_names
 
-    task_entry = next(node for node in nodes if vars(node)["_Node__node_name"] == "task_entry_node")
-    params = _normalize_launch_param_mapping(task_entry._Node__parameters[0])
-    assert "perception_request_topic" in params
-    assert "entry_visual_games_json" in params
-    games = _decode_launch_json_string(params["entry_visual_games_json"])
-    assert games["sorting_hat"]["enabled"] is True
-    assert params["perception_enabled"] is True
+    node_names = {vars(node)["_Node__node_name"] for node in nodes}
+    assert "task_entry_node" not in node_names
+    assert "perception_service_node" in node_names
+
+
+def test_hermes_entry_mode_omits_voice_pipeline_nodes():
+    nodes = generate_embodied_nodes(
+        {"embodied": {"enabled": True, "entry_mode": "hermes"}},
+        active_control_mode="moveit_planning",
+    )
+
+    node_names = {vars(node)["_Node__node_name"] for node in nodes}
+    assert {"safety_guard_node", "skill_executor_node", "agent_plan_node"} <= node_names
+    assert {"task_entry_node", "task_executor_node"}.isdisjoint(node_names)
+
+
+def test_development_catalog_resolves_from_source_module_when_config_is_installed():
+    installed_config = Path(__file__).parents[3] / "install/share/robot_config/config/robots/robot.yaml"
+
+    resolved = _resolve_development_source_root(installed_config, "src/skill_catalog")
+
+    assert resolved == (Path(__file__).parents[3] / "src/skill_catalog").resolve()
+
+
+def test_non_hermes_entry_mode_is_rejected():
+    import pytest
+
+    with pytest.raises(ValueError, match="entry_mode must be hermes"):
+        generate_embodied_nodes(
+            {"embodied": {"enabled": True, "entry_mode": "voice"}},
+            active_control_mode="moveit_planning",
+        )
 
 
 class _FakeLaunchContext:

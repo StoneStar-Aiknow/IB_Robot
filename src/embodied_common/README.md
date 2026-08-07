@@ -1,7 +1,7 @@
 # embodied_common 架构契约
 
 `embodied_common` 是具身管线的中立共享包，只承载无业务副作用的公共 helper 与默认 fallback 数据。
-它用于消除 `embodied_agent`、`perception_service`、`vlm_task_planner`、`safety_guard`、`skill_library` 之间的重复实现和反向依赖。
+它用于消除 `embodied_agent`、`perception_service`、`safety_guard`、`skill_library` 之间的重复实现和反向依赖。
 
 ## 职责边界
 
@@ -17,7 +17,7 @@
 - 依赖感知、规划、安全或执行节点运行状态的业务逻辑。
 - 机器人型号、相机 topic、命名位姿、工作空间等应由 `robot_config` 管理的 SSOT 配置。
 - `ibrobot_msgs` 已经表达的 ROS msg/srv/action 契约。
-- 对 `perception_service`、`vlm_task_planner`、`safety_guard`、`skill_library`、`embodied_agent` 的反向 import。
+- 对 `perception_service`、`safety_guard`、`skill_library`、`embodied_agent` 的反向 import。
 
 ## 依赖方向
 
@@ -26,7 +26,6 @@
 ```text
 embodied_agent
 perception_service
-vlm_task_planner
 safety_guard
 skill_library
         ↓
@@ -47,16 +46,12 @@ ibrobot_msgs / rclpy
 - `embodied_common.json_utils.load_json_list`
 - `embodied_common.json_utils.string_list`
 - `embodied_common.json_utils.parse_confidence`
-- `embodied_common.command_parser.parse_text_command`
-- `embodied_common.command_parser.extract_skill_aliases`
-- `embodied_common.command_parser.load_skill_aliases`
 - `embodied_common.skill_templates.SUPPORTED_PRIMITIVES`
 - `embodied_common.skill_templates.DEFAULT_SKILL_TEMPLATES`（legacy fallback，不是运行时 SSOT）
 - `embodied_common.skill_templates.DEFAULT_ALLOWED_SKILLS`（legacy fallback，不是运行时 SSOT）
 - `embodied_common.skill_templates.DEFAULT_WAYPOINT_DURATION_SEC`
 - `embodied_common.skill_templates.is_skill_disabled`
 - `embodied_common.skill_templates.get_skill_templates`
-- `embodied_common.capability_view.build_capability_view`
 - `embodied_common.skill_request.canonical_skill_payload`
 - `embodied_common.skill_request.skill_payload_hash`
 - `embodied_common.skill_request.skill_goal_uuid`

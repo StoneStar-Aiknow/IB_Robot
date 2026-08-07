@@ -135,6 +135,7 @@ class EmbodiedConfig:
     """Minimum embodied claw closure configuration."""
 
     enabled: bool = False
+    entry_mode: str = "hermes"
     debug_tracing: bool = True
     task_input_topic: str = "/voice_command"
     task_command_topic: str = "/embodied/task_command"
@@ -157,7 +158,6 @@ class EmbodiedConfig:
     relative_motion_step_m: float = 0.03
     relative_motion_reference_frame: str = "base"
     relative_motion_direction_mapping: dict[str, Any] = field(default_factory=dict)
-    planner: dict[str, Any] = field(default_factory=dict)
     perception: dict[str, Any] = field(default_factory=dict)
     entry: dict[str, Any] = field(default_factory=dict)
     gripper_open_position: float = 1.0

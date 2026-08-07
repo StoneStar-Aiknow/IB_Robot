@@ -35,7 +35,7 @@ source install/local_setup.sh
 | `execute SKILL --task-id ID` | 是 | 通过 `SkillCommand` 执行高层技能 |
 | `cancel --task-id ID` | 是 | 以同一 deterministic goal UUID 请求取消并轮询 terminal |
 | `reload-catalog --request-id ID --force` | 是 | 重新编译并原子激活 Gateway 已配置的 Skill catalog source |
-| `plan-text TEXT --request-id ID` | 是 | 生成一份短时 typed Agent plan |
+| `plan-workflow --text TEXT --workflow-json JSON --request-id ID` | 是 | 提交一份短时 typed Agent plan |
 | `validate-plan --plan-token TOKEN` | 是 | 对 exact snapshot 计划做只读逐步预检 |
 | `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID [--timeout-sec SEC]` | 是 | 校验身份/摘要/task_id 并冻结 `task_budget_sec`，转入 `CONFIRMED` |
 | `execute-plan --plan-token TOKEN --confirmation-token TOKEN --task-id ID [--timeout-sec SEC]` | 是 | 执行已确认的 Agent plan，必须复用 confirm 冻结的同一预算 |
@@ -62,8 +62,9 @@ robot-skill --config-name so101_single_arm execute move_relative_ee \
 robot-skill --config-name so101_single_arm cancel \
   --task-id task-20260725-001
 
-robot-skill --config-name so101_single_arm plan-text \
-  --request-id plan-request-001 --text "打开夹爪"
+robot-skill --config-name so101_single_arm plan-workflow \
+  --request-id plan-request-001 --text "打开夹爪" \
+  --workflow-json '[{"skill_name":"open_gripper_skill"}]'
 robot-skill --config-name so101_single_arm validate-plan \
   --plan-token PLAN_TOKEN
 robot-skill --config-name so101_single_arm confirm-plan \
@@ -99,7 +100,7 @@ primitive sequence、目标绑定、关节值和 ROS transport 名称不属于 C
 
 自然语言计划必须按以下顺序工作：
 
-1. `plan-text TEXT --request-id ID`
+1. `plan-workflow --text TEXT --workflow-json JSON --request-id ID`
 2. `validate-plan --plan-token TOKEN`
 3. 向用户展示步骤、参数、plan digest 和 registry identity，获取明确确认并生成 task ID
 4. `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID [--timeout-sec SEC]`

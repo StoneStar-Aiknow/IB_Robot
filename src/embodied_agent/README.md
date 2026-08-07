@@ -1,35 +1,23 @@
-# embodied_agent 节点说明
+# embodied_agent 架构契约
 
-`embodied_agent` 是当前最小具身闭环中的**任务入口与任务编排包**。
-它不直接控制机械臂，而是把文本命令转换成结构化任务，再规划为技能序列，最后把技能逐个交给 `skill_library` 执行。
+`embodied_agent` 是 Hermes-only 具身运行时中的 Agent plan 生命周期与 Workflow 编排包。
+它不拥有 Skill catalog、运动授权或物理执行权。
 
-当前包内包含 4 个 ROS 2 节点：
+## 当前 ROS 节点
 
-| 节点 | 控制台入口 | 主要职责 |
-| --- | --- | --- |
-| `task_entry_node` | `task_entry_node = embodied_agent.task_entry_node:main` | 路由视觉互动命令；普通文本统一封装成未规划 `TaskCommand` 交给 planner |
-| `task_planner_node` | `task_planner_node = embodied_agent.task_planner_node:main` | 按规则把文本任务规划为技能序列 |
-| `task_executor_node` | `task_executor_node = embodied_agent.task_executor_node:main` | 顺序调用技能 action，并发布任务状态 |
-| `agent_plan_node` | `agent_plan_node = embodied_agent.agent_plan_node:main` | 持有短时 Agent plan，提供 plan/validate/confirm 服务和带确认令牌的执行 action |
+| 节点 | 主要职责 |
+| --- | --- |
+| `agent_plan_node` | plan / validate / confirm / execute 生命周期，按顺序调用 Skill Gateway |
+| `task_entry_node` | 遗留 voice adapter，当前不由 bringup 启动 |
+| `task_executor_node` | 遗留 planned-task executor，当前不由 bringup 启动 |
 
-包内还提供一个**非节点的库接口** `embodied_agent.llm_client_service.LLMClientService`：封装云端对话大模型的一行式调用，供上层按需 import，不随 launch 起节点。详见第 6 节。
+规则 `task_planner_node` 已删除；`vlm_task_planner` 也已删除。运行时唯一公开入口模式为
+`embodied.entry_mode: hermes`。
 
-## 1. 在整体架构中的位置
-
-当前最小闭环链路是：
+## 调用链
 
 ```text
-/voice_command
-  -> task_entry_node
-  -> 命中视觉互动触发词(如"分院帽"): /embodied/perception_request -> perception_service_node -> /embodied/perception_result (立即返回，不进 planner/executor)
-  -> 普通文本: /embodied/task_command -> task_planner_node / vlm_task_planner_node
-  -> /embodied/planned_task
-  -> task_executor_node
-  -> /embodied/execute_skill
-  -> skill_library
-  -> MoveIt / gripper
-
-Hermes / robot-skill Agent flow:
+Hermes / robot-skill
   -> /embodied/plan_agent_command
   -> /embodied/validate_agent_plan
   -> 用户确认后 /embodied/confirm_agent_plan
@@ -37,394 +25,35 @@ Hermes / robot-skill Agent flow:
   -> skill_library Gateway
 ```
 
-其中：
-
-- `robot_config` 仍然是配置和 launch 的单一事实来源。
-- `embodied_agent` 只负责**任务理解、规则规划、执行编排**。
-- 安全校验由 `safety_guard` 负责。
-- 技能和原子动作执行由 `skill_library` 负责。
-
-## 2. 推荐启动方式
-
-建议通过统一 launch 启动，而不是手工分别起节点：
-
-```bash
-cd ~/IB_Robot
-source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.sh && \
-ros2 launch embodied_bringup embodied_pipeline.launch.py \
-  robot_config:=so101_single_arm \
-  control_mode:=moveit_planning \
-  use_sim:=true \
-  moveit_display:=false \
-  authorize_motion:=false
-```
-
-`embodied_bringup` 会读取同一份 `robot_config` YAML，并临时覆盖：
-
-- `robot.embodied.enabled=true`
-
-默认 YAML 中该能力仍是关闭的。
-
-`authorize_motion` 默认关闭，因此上述命令只会启动可查询、默认拒绝运动的 Gateway。只有操作员完成
-现场安全检查后，才能通过重启 launch 并显式设为 `true` 来授权运动；Agent、CLI 和运行中的节点不得代替
-操作员开启授权。
-
-## 3. task_entry_node
-
-`task_entry_node` 是最前面的文本任务入口。
-
-### 作用
-
-1. 订阅文本命令。
-2. 为每条命令生成唯一 `task_id`。
-3. **先匹配视觉趣味游戏触发词**（如"分院帽"，别名与开关来自 `embodied.entry.visual_games`）。命中即构造 `SceneAnalysisRequest` 发到 `/embodied/perception_request` 交给 `perception_service_node`，并**立即返回**——一句语音只属于一个业务域，不会同时触发趣味 VLM 和机器人任务规划。
-4. 未命中游戏时，封装成未规划的 `ibrobot_msgs/msg/TaskCommand` 发布到规划阶段。
-
-说明：
-
-- 视觉游戏结果以 `/embodied/perception_result` 上的 `SceneAnalysisResult` 为准，通过 `source=game.<name>`（如 `game.sorting_hat`）识别业务类型，`scene_summary` 保存最终结果（分院帽为四学院之一），失败时带 `error_code`/`message`。
-- 启用某游戏需**同时**置 `embodied.perception.enabled: true` 与 `embodied.entry.visual_games.<name>.enabled: true`；否则请求会打到无人消费的 topic，`task_entry_node` 会记 ERROR 并丢弃请求（配置层 `validate_config` 也会拒绝该不一致配置）。
-- **输入前置条件（通用 `required_inputs`）**：请求在 `context_json.required_inputs` 里声明它真正需要的输入，perception 据此判定哪些缺失才阻塞。分院帽只声明 `primary_image`，因此即便 EE pose / joint state 离线（MoveIt 未起、控制器重启、独立跑 perception）也能成功，只要主相机图像可用。未声明 `required_inputs` 的普通感知请求维持严格默认：要求主图 + EE pose + joint state 全部在线，否则返回 `SCENE_ANALYSIS_FAILED`。
-
-说明：
-
-- `task_entry_node` 现在会为每个任务写入统一的**任务总超时预算**。
-- deadline 会通过 `TaskCommand.context_json.timeout_context` 贯穿 planner / executor。
-- 规划、执行都会共同消耗这一预算，而不是只在执行阶段单独计时。
-
-### 当前接口
-
-| 方向 | 话题 | 类型 | 说明 |
-| --- | --- | --- | --- |
-| 订阅 | `/voice_command` | `std_msgs/msg/String` | 当前默认文本输入入口 |
-| 发布 | `/embodied/perception_request` | `ibrobot_msgs/msg/SceneAnalysisRequest` | 命中视觉游戏触发词后发给 perception |
-| 发布 | `/embodied/task_command` | `ibrobot_msgs/msg/TaskCommand` | 普通文本任务封装，交给 planner/VLM |
-
-### 主要参数
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `input_topic` | `/voice_command` | 文本命令来源 |
-| `output_topic` | `/embodied/task_command` | 任务封装输出 |
-| `default_target_name` | `demo_object` | 保留的默认目标名 |
-| `default_place_name` | `tray_right` | 保留的默认放置名 |
-| `default_relative_motion_step_m` | `0.03` | 保留的默认相对运动步长（米） |
-| `default_task_timeout_sec` | `180.0` | 单个任务的端到端总超时预算 |
-| `perception_request_topic` | `/embodied/perception_request` | 视觉互动请求输出（复用 perception 请求 topic） |
-| `perception_enabled` | `false` | perception 是否启用；用于互动启用一致性校验 |
-| `entry_visual_games_json` | `{}` | 入口视觉趣味游戏策略（开关 + 触发别名），来自 `embodied.entry.visual_games` |
-| `debug_tracing` | `false` | 是否打印调试日志 |
-
-## 4. task_planner_node
-
-`task_planner_node` 把 `TaskCommand.raw_command` 转成一个**确定性的技能序列**。
-
-### 当前支持的任务意图
-
-| 输入意图 | 规划结果 |
-| --- | --- |
-| `观察点` / `观察位置` / `观察桌面` / `看看桌面` / `观察场景` | `inspect_scene` |
-| `原位` / `原点` / `回到home` / `回原位` / `回安全位` | `recover_safe_pose` |
-| `零点` / `零位` / `回零点` / `到零点` | `recover_zero_pose` |
-| `夹爪往前/后/左/右/上/下一点` | `move_relative_ee` |
-| `打开夹爪` / `开爪` | `open_gripper_skill` |
-| `关闭夹爪` / `夹紧` | `close_gripper_skill` |
-| `顺时针旋转 45 度` | `rotate_gripper_cw` |
-| `逆时针旋转 45 度` | `rotate_gripper_ccw` |
-
-### Rule-entry alias 与 `task_type` 契约
-
-alias 来自 Gateway 已验证 catalog snapshot 中启用且 `description.rule_entry: true` 的 skill，
-只用于让无参数社交动作进入确定性规则解析。禁用 skill 不会进入别名集合。社交动作命中后，
-其 skill 名同时作为 `task_type` 和 `skill_sequence` 的唯一项。
-
-既有观察、回位、夹爪开合、相对移动和带角度旋转命令仍优先走专用规则分支，不由 alias
-改写其公开 `task_type`。例如观察保持 `observe_scene`、打开夹爪保持 `open_gripper`、
-相对移动保持 `relative_motion`。
-
-### 当前约束
-
-- 这是**规则规划器**，不是通用大模型 Planner。
-- 规则规划器仍不直接生成抓取；VLM 或 Hermes 可在机器人配置允许时显式选择 `pick_object`。
-- 不支持的文本会直接拒绝，并在 `/embodied/task_status` 发布 `rejected`。
-- 规划器只消费 Gateway 的**已验证 exact catalog 视图**（`CatalogViewSynchronizer.current`）。当目录 reload
-  推出一个新 identity、对应 snapshot 尚未校验通过时，`current` 为 `None`，规划器直接以
-  `SKILL_REGISTRY_NOT_READY` 拒绝任务（`rejected`，可重规划），而不是用过期技能边界继续规划。
-
-### 当前接口
-
-| 方向 | 话题 | 类型 | 说明 |
-| --- | --- | --- | --- |
-| 订阅 | `/embodied/task_command` | `ibrobot_msgs/msg/TaskCommand` | 原始任务 |
-| 发布 | `/embodied/planned_task` | `ibrobot_msgs/msg/TaskCommand` | 已规划任务 |
-| 发布 | `/embodied/task_status` | `ibrobot_msgs/msg/TaskStatus` | 规划结果与拒绝原因 |
-
-### 主要参数
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `input_topic` | `/embodied/task_command` | 规划输入 |
-| `output_topic` | `/embodied/planned_task` | 规划输出 |
-| `status_topic` | `/embodied/task_status` | 任务状态输出 |
-| `default_target_name` | `demo_object` | 默认命名目标 |
-| `default_place_name` | `home` | 保留参数；当前规则规划不会生成放置技能 |
-| `default_relative_motion_step_m` | `0.03` | “一点”默认映射步长（米） |
-| `skill_aliases_json` | `{}` | 启动 fallback；运行时由已验证 catalog snapshot 覆盖 |
-| `debug_tracing` | `false` | 是否打印规划调试日志 |
-
-## 5. task_executor_node
-
-`task_executor_node` 是任务级执行编排器。
-
-### 作用
-
-1. 读取 `planned_task` 中的 `skill_sequence`。
-2. 先通过 `/embodied/begin_workflow_execution` 固定 exact snapshot、root budget、digest 和 root lease，再按顺序调用
-   `/embodied/execute_skill` child action。
-3. 按阶段发布 `TaskStatus`。
-4. 在超时、拒绝、服务缺失时明确失败并带错误码退出。
-5. 超时后会向下游 skill action 发送 cancel，而不是只在上层报错。
-6. 所有成功、失败和超时路径都通过 `/embodied/finalize_workflow_execution` 释放 root scope；finalize 未收敛时 fail closed。
-   唯一例外是 child goal 接受/取消/终态**状态未知**（`CHILD_STATE_UNKNOWN`）：此时不 finalize root scope，工作流
-   租约保留，状态发布为 `unknown`，避免在 child 可能仍在执行时留下无主 root scope。
-
-### 父任务与子技能 ID
-
-`TaskCommand.task_id` 是父任务 ID。执行器发布的所有 `TaskStatus` 和任务级状态都保留这个
-父 ID；每个 `/embodied/execute_skill` action 则使用由其计划位置确定的子 ID：
-
-```text
-父任务 task-1，skill_sequence=[open_gripper_skill, close_gripper_skill]
-  -> open_gripper_skill: task-1/skill/0001
-  -> close_gripper_skill: task-1/skill/0002
-```
-
-子 ID 不包含 skill 名称。同一父任务和计划位置会稳定地产生相同 ID；若计划位置变化导致同一
-ID 的 payload 不同，下游的 payload conflict 是预期行为。取消和超时仍针对当前子 action，
-不会改变父任务预算或父任务状态的 ID。
-
-### 当前接口
-
-| 方向 | 名称 | 类型 | 说明 |
-| --- | --- | --- | --- |
-| 订阅 | `/embodied/planned_task` | `ibrobot_msgs/msg/TaskCommand` | 已规划任务 |
-| 发布 | `/embodied/task_status` | `ibrobot_msgs/msg/TaskStatus` | 执行中、失败、完成状态 |
-| 调用 | `/embodied/execute_skill` | `ibrobot_msgs/action/SkillCommand` | 技能执行入口 |
-| 调用 | `/embodied/get_skill_gateway_status` | `ibrobot_msgs/srv/GetSkillGatewayStatus` | 获取 exact registry identity |
-| 调用 | `/embodied/begin_workflow_execution` | `ibrobot_msgs/srv/BeginWorkflowExecution` | 原子建立 workflow root scope |
-| 调用 | `/embodied/finalize_workflow_execution` | `ibrobot_msgs/srv/FinalizeWorkflowExecution` | 幂等结束 workflow root scope |
-
-### 当前状态机语义
-
-常见状态包括：
-
-- `planned`
-- `executing`
-- `completed`
-- `failed`
-- `rejected`
-- `unknown`
-
-`unknown` 表示某个 child skill action 的接受、取消或终态结果无法被确认（`CHILD_STATE_UNKNOWN`）。出现该状态时，
-child 可能仍在执行或持有工作流租约，因此执行器**不**调用 `finalize_workflow_execution` 释放 root scope，也**不**
-自动重试；调用方不得把它表述为“已停止”。只有在 child 确认进入终态或整体任务确定成功/失败/拒绝时，才会
-finalize root scope 并发布对应的终态状态。
-
-### 主要参数
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `input_topic` | `/embodied/planned_task` | 执行输入 |
-| `status_topic` | `/embodied/task_status` | 状态输出 |
-| `skill_action_name` | `/embodied/execute_skill` | 技能 action 名 |
-| `default_task_timeout_sec` | `180.0` | 单个任务的端到端总超时预算 |
-| `rpc_timeout_sec` | `5.0` | 等待 action/server/service 响应的统一 RPC 超时 |
-| `debug_tracing` | `false` | 是否打印执行调试日志 |
-
-## 6. Agent plan lifecycle
-
-`agent_plan_node` 将自然语言命令转换为最多 16 个 typed `WorkflowStep`，并在 plan TTL（默认 300 秒）内保存不可变
-计划。`plan_token` 和 `confirmation_token` 都是不透明的一次性令牌，不提供运动授权，也不能由调用方构造。
-
-计划状态机为：
+## Agent plan 状态机
 
 ```text
 PLANNED -> VALIDATED -> CONFIRMED -> ACCEPTED -> TERMINAL
 ```
 
-- `plan_agent_command` 创建或幂等重放一份计划，记录进入 `PLANNED`。
-- `validate_agent_plan` 做 exact snapshot 的只读逐步预检，成功后把记录推进到 `VALIDATED`；未在 `PLANNED`/`VALIDATED`
-  状态的记录拒绝再次校验。确认必须先经过 `VALIDATED`。
-- `confirm_agent_plan` 必须同时提交 `plan_token`、`plan_digest`、新生成的 `task_id`、当前
-  `(registry_epoch, registry_generation, registry_digest)` 以及 `task_budget_sec`。`task_budget_sec` 以 float32
-  规范化后冻结进记录，同时生成不可变 `started_at/deadline`，且不得超过 Gateway 当前的 `task_budget_sec`
-  （`TIMEOUT_EXCEEDS_POLICY`）。成功后状态转为 `CONFIRMED`，并返回与该 exact 元组绑定的
-  `confirmation_token`、`confirmed_task_budget_sec` 和绝对 deadline。目录 reload 或
-  任何字段不一致都会 fail closed。
-- `execute_agent_plan` 必须复用 confirm 时冻结的**同一** `task_budget_sec`（float32 严格相等），否则
-  `accept_execution` 以 `SKILL_REQUEST_ID_CONFLICT` 拒绝；随后状态转为 `ACCEPTED` 并以该冻结预算作为执行
-  deadline；确认到执行之间的等待已经消耗预算，不会在执行时重置完整时长。
+- plan 捕获 exact catalog identity，并保存短时不可变 `AgentPlan`。
+- validate 对每个步骤执行只读 Safety 预检。
+- confirm 绑定 plan digest、task ID、registry identity 和绝对 task budget。
+- execute 复用确认时冻结的预算，通过 Gateway 执行 Skill 或 Workflow。
+- child 接受、取消或终态未知时保持 plan 为 `ACCEPTED`，不得自动重试或释放可能仍有效的 root lease。
 
-单步计划进入 Gateway 根 SkillCommand，多步计划通过 Begin/ordered child/Finalize 工作流执行；child action 只能
-使用 Begin 返回的工作流租约和 exact snapshot identity。
+Agent 必须通过 `robot-skill plan-workflow` 提交结构化步骤；机器人运行时不解析自然语言，
+`raw_command` 只作为审计文本和幂等请求摘要的一部分。
 
-### 目标/取消状态未知
+## 边界
 
-当 child goal 的接受、取消或终态结果无法被确认时（`SKILL_EXECUTION_STATE_UNKNOWN`、`SKILL_CANCEL_TIMEOUT`），
-执行器**不**把计划标记为终态，也**不**释放 workflow root scope：plan 留在 `ACCEPTED`、工作流租约保留、
-`finalize_workflow_execution` 不被调用。这是因为 child 可能仍在执行或持有租约，贸然闭环会留下无主 root scope。
-此时 action result 以 `success=false` 和对应的 unknown 错误码返回，但状态不进入 `TERMINAL`；调用方不得据此自动重试，
-也不得把它表述为“已停止”。
+- 本包不得调用 primitive、MoveIt 或 controller。
+- motion authorization 只能来自操作员 launch 参数。
+- 所有执行必须经过 `skill_library` 和 `safety_guard`。
+- `perception_service` 是独立服务，不由已停用的 voice adapter 自动路由。
 
-公开接口：
-
-| 名称 | 类型 | 说明 |
-| --- | --- | --- |
-| `/embodied/plan_agent_command` | `PlanAgentCommand` | 生成或幂等重放一份短时计划（`PLANNED`） |
-| `/embodied/validate_agent_plan` | `ValidateAgentPlan` | exact snapshot 的只读逐步预检，推进到 `VALIDATED` |
-| `/embodied/confirm_agent_plan` | `ConfirmAgentPlan` | 校验身份/摘要/task_id 并冻结 `task_budget_sec`，转入 `CONFIRMED` |
-| `/embodied/execute_agent_plan` | `ExecuteAgentPlan` | 复用冻结预算执行已确认计划并传播取消到当前 child |
-
-## 7. LLMClientService
-
-`LLMClientService` 是一个**库接口**（非 ROS 节点，无控制台入口、无话题/参数），封装云端对话大模型的一行式调用。它接收由业务方提供的预设 prompt 与用户文字，调用云端对话模型生成回复文本。
-
-### 作用
-
-1. 可选地从文件读入预设 system prompt，作为每轮请求都携带的系统指令；不提供时退化为无预设的裸对话。
-2. 接收用户文字，调用云端对话模型生成回复。
-3. 复用 `embodied_common` 的 `VLMClient` 管理多轮上下文，业务层不自行维护对话历史。
-4. 返回底层结构化 dict，云端错误（网络、配额、缺 API key 等）如实透传，不吞异常、不返回空串。
-
-说明：
-
-- 本接口**不内置任何默认 prompt**：system prompt 的内容与来源属于业务设计，由业务方通过 `system_prompt_path` 传入。
-- 预设 system prompt（若提供）独立保存，每轮请求都置于最前，不写入对话历史；因此对话变长也不会把它挤出上下文，`reset()` 也不会丢失它。
-- 上下文管理完全由 `embodied_common.vlm_api_client.VLMClient` 负责，本接口只做拼装调用。
-- 云端模型路由（provider / endpoint / API key 环境变量名）由 `embodied_common` 的 `vlm_models.yaml` 单一管理；API key 通过环境变量注入，不写入任何配置文件。
-
-### 当前接口
-
-| 方法 | 说明 |
-| --- | --- |
-| `reply(user_text) -> dict` | 发送一轮用户文字，返回 `status`/`content`/`error`/`usage`/`timing_ms` 等结构化字段；空或非字符串输入抛 `ValueError` |
-| `reset() -> None` | 清空多轮对话历史；预设 system prompt 不受影响，后续仍会携带 |
-
-### 主要参数
-
-| 参数 | 默认值 | 说明 |
-| --- | --- | --- |
-| `system_prompt_path` | `None` | 预设 system prompt 文件路径（由业务方提供）；`None` 时不设 system prompt，退化为无预设的裸对话 |
-| `model` | `None` | 指定 `vlm_models.yaml` 中的模型名；`None` 时使用 `defaults.model` |
-| `vlm` | `None` | 注入自定义 `VLMClient`（用于测试或依赖注入）；给定时忽略 `system_prompt_path` |
-
-### 使用示例
-
-```python
-from embodied_agent.llm_client_service import LLMClientService
-
-svc = LLMClientService(system_prompt_path="/path/to/your_system_prompt.txt")  # 业务方提供 prompt
-# svc = LLMClientService()                # 也可不传，退化为无预设裸对话
-result = svc.reply("你好呀，你是谁？")       # 返回结构化 dict
-if result["status"] == "ok":
-    print(result["content"])
-svc.reset()                              # 开启新话题（system prompt 仍保留）
-```
-
-调用前需按 `vlm_models.yaml` 中对应模型的 `api_key_env` 注入 API key，例如：
+## 启动
 
 ```bash
-export ALIYUN_API_KEY=sk-xxxxxx
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.sh && \
+ros2 launch embodied_bringup embodied_pipeline.launch.py \
+  robot_config:=so101_single_arm \
+  entry_mode:=hermes \
+  control_mode:=moveit_planning \
+  authorize_motion:=false
 ```
-
-## 7. 任务与状态接口
-
-### `ibrobot_msgs/msg/TaskCommand`
-
-当前主要使用这些字段：
-
-| 字段 | 说明 |
-| --- | --- |
-| `task_id` | 任务唯一 ID |
-| `raw_command` | 原始中文命令 |
-| `task_type` | 规则规划后的任务类型 |
-| `target_name` | 规划出的命名目标 |
-| `place_name` | 规划出的命名放置位 |
-| `timeout_sec` | 任务总超时预算（秒），由入口统一设置并向后透传 |
-| `context_json` | 传递 `skill_sequence` 与 `timeout_context` 等上下文 |
-
-## 7.1 当前归一后的超时类型
-
-当前具身主链路只保留 5 类 timeout / freshness 配置：
-
-1. `task_budget_sec`：任务端到端总预算
-2. `scene_freshness_sec`：图像/深度/状态的新鲜度门槛
-3. `model_idle_timeout_sec`：大模型输出空闲超时
-4. `rpc_timeout_sec`：等待 action/server/service 的统一 RPC 超时
-5. `gripper_settle_sec`：夹爪命令发出后的稳定等待时间
-
-### `ibrobot_msgs/msg/TaskStatus`
-
-当前主要使用这些字段：
-
-| 字段 | 说明 |
-| --- | --- |
-| `state` | 当前状态 |
-| `success` | 当前阶段是否成功 |
-| `current_skill` | 正在执行的技能 |
-| `completed_skills` | 已完成技能列表 |
-| `error_code` | 明确错误码 |
-| `message` | 详细说明 |
-| `recoverable` | 是否可恢复 |
-| `replan_requested` | 是否建议重规划 |
-
-## 8. 当前验证通过的最小闭环
-
-当前已经验证通过的仿真命令路径：
-
-```bash
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
-```
-
-可以观测到：
-
-1. `/embodied/task_command`
-2. `/embodied/planned_task`
-3. `/embodied/task_status`
-4. 技能 action 被依次调用
-5. 最终 `TaskStatus.state=completed`
-
-当前也支持夹爪开合类命令，例如：
-
-```bash
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '打开夹爪'}"
-```
-
-这类命令会被规划成单技能：
-
-- `open_gripper_skill`
-
-当前还支持直接移动到配置好的 named pose：
-
-```bash
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '原位'}"
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '观察点'}"
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '零点'}"
-```
-
-这三类命令分别会被规划成：
-
-- `recover_safe_pose`
-- `inspect_scene`
-- `recover_zero_pose`
-
-方向语义由执行层按 `robot.embodied.execution.relative_motion_reference_frame=base`
-和 `relative_motion_direction_mapping` 解释，规划层只保留
-`forward/backward/left/right/up/down` 语义标签。
-
-## 9. 当前限制
-
-- 目前只支持**最小规则闭环**，不是开放式具身智能 Agent。
-- 当前文本解析只覆盖少量中文模式。
-- 目标物识别仍是命名目标映射，不是视觉 grounding。
-- 执行依赖 `moveit_planning` 控制模式和 `skill_library`/`safety_guard` 正常工作。

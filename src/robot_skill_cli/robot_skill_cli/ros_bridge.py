@@ -71,6 +71,7 @@ class RosBridge:
         self._ConfirmAgentPlan = None
         self._ExecuteAgentPlan = None
         self._CancelGoal = None
+        self._WorkflowStep = None
 
     def start(self) -> bool:
         try:
@@ -81,6 +82,7 @@ class RosBridge:
             from rclpy.executors import MultiThreadedExecutor
 
             from ibrobot_msgs.action import ExecuteAgentPlan, SkillCommand
+            from ibrobot_msgs.msg import WorkflowStep
             from ibrobot_msgs.srv import (
                 ConfirmAgentPlan,
                 GetSkillGatewayStatus,
@@ -162,6 +164,7 @@ class RosBridge:
             self._ConfirmAgentPlan = ConfirmAgentPlan
             self._ExecuteAgentPlan = ExecuteAgentPlan
             self._CancelGoal = CancelGoal
+            self._WorkflowStep = WorkflowStep
             self._executor = MultiThreadedExecutor(num_threads=2)
             self._executor.add_node(self._node)
             self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
@@ -412,13 +415,21 @@ class RosBridge:
             },
         }
 
-    def plan_agent_command(self, *, request_id: str, raw_command: str, timeout_sec: float) -> dict[str, Any]:
+    def plan_agent_command(
+        self,
+        *,
+        request_id: str,
+        raw_command: str,
+        workflow_steps: list[dict[str, Any]],
+        timeout_sec: float,
+    ) -> dict[str, Any]:
         if self._PlanAgentCommand is None:
             raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
         request = self._PlanAgentCommand.Request()
         request.schema_version = 1
         request.request_id = request_id
         request.raw_command = raw_command
+        request.workflow_steps = [self._workflow_step_message(step) for step in workflow_steps]
         response = self._call_service(
             self._plan_client,
             request,
@@ -432,6 +443,21 @@ class RosBridge:
             "message": str(response.message),
             "diagnostics": self._diagnostics(response.diagnostics),
         }
+
+    def _workflow_step_message(self, step: dict[str, Any]):
+        if self._WorkflowStep is None:
+            raise BridgeError(
+                "ROS_UNAVAILABLE", "WorkflowStep interface is unavailable", exit_code=EXIT_ROS_UNAVAILABLE
+            )
+        message = self._WorkflowStep()
+        message.schema_version = int(step.get("schema_version", 1))
+        message.skill_name = str(step.get("skill_name", ""))
+        message.target_name = str(step.get("target_name", ""))
+        message.place_name = str(step.get("place_name", ""))
+        message.motion_direction = str(step.get("motion_direction", ""))
+        message.motion_distance = float(step.get("motion_distance", 0.0))
+        message.timeout_sec = float(step.get("timeout_sec", 0.0))
+        return message
 
     def validate_agent_plan(self, *, plan_token: str, timeout_sec: float) -> dict[str, Any]:
         if self._ValidateAgentPlan is None:

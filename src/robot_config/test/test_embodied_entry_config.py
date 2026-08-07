@@ -147,15 +147,17 @@ def test_launch_dict_enabled_game_without_perception_is_rejected():
     assert any("visual_games" in error for error in errors)
 
 
-def test_launch_dict_enabled_game_with_perception_is_ok():
+def test_launch_dict_enabled_game_with_perception_is_rejected_in_hermes_mode():
     config = {
         "embodied": {
             "enabled": True,
+            "entry_mode": "hermes",
             "perception": {"enabled": True},
             "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
         }
     }
-    assert validate_embodied_launch_dict(config) == []
+    errors = validate_embodied_launch_dict(config)
+    assert any("voice entry mode" in error for error in errors)
 
 
 def test_launch_dict_skips_when_embodied_disabled():

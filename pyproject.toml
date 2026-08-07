@@ -38,7 +38,6 @@ known-first-party = [
     "perception_service",
     "safety_guard",
     "skill_library",
-    "vlm_task_planner",
     "robot_skill_cli",
     "action_dispatch",
     "inference_manifest",

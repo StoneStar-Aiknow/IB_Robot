@@ -100,8 +100,7 @@ IB_Robot/                           # Main Workspace
 │   ├── voice_asr_service/          # Voice recognition service
 │   ├── workflows/                  # CI/CD configuration
 │   │
-│   ├── embodied_agent/             # Embodied AI task entry & orchestration (task_entry / planner / executor)
-│   ├── vlm_task_planner/           # VLM vision-language task planner (scene understanding + skill planning)
+│   ├── embodied_agent/             # Hermes Agent plan lifecycle and execution orchestration
 │   ├── perception_service/         # Continuous scene understanding service (RGB-D / multi-view)
 │   ├── skill_library/              # Skill execution layer (skill → primitive → MoveIt)
 │   └── safety_guard/               # Explicit safety validation layer (allowlist + workspace bounds)
@@ -573,15 +572,13 @@ ros2 launch robot_config robot.launch.py control_mode:=model_inference with_infe
 
 ## Embodied AI Pipeline
 
-IB-Robot includes a complete **embodied AI execution pipeline** that accepts natural language input (or `/voice_command` topic), performs VLM-based scene understanding and skill planning, and drives MoveIt 2 to execute real robot motions. This pipeline is available in `moveit_planning` control mode.
+IB-Robot includes a Hermes Agent embodied execution pipeline that accepts structured skill plans and drives MoveIt 2 to execute real robot motions. This pipeline is available in `moveit_planning` control mode.
 
 ### Pipeline Architecture
 
 ```text
-/voice_command
-  → task_entry_node         # Task entry: rule-based fast-path first
-  → vlm_task_planner_node   # VLM vision-language task planning (scene understanding + skill selection)
-  → task_executor_node      # Skill sequence orchestration
+Hermes / robot-skill
+  → agent_plan_node         # Agent plan / validate / confirm / execute
   → skill_executor_node     # Skill → primitive decomposition
   → safety_guard_node       # Safety validation (allowlist + workspace bounds)
   → moveit_gateway          # MoveIt 2 motion planning & execution
@@ -597,37 +594,16 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
     moveit_display:=false
 ```
 
-### Sending Natural Language Commands
+### Sending Agent Plans
 
 ```bash
-# Scene understanding (pure visual analysis — no arm motion)
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: 'What can you see in the camera?'}"
-
-# Relative motion
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
-
-# Return to home pose
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '回原位'}"
-```
-
-### VLM Configuration
-
-The embodied pipeline defaults to a local OpenAI-compatible service (e.g., vLLM / Ollama):
-
-```yaml
-embodied:
-  planner:
-    mode: vlm_api          # rule / vlm_api / hybrid
-    vlm_api:
-      provider: openai_compatible
-      base_url: http://localhost:8000/v1
-      model: Qwen3.5-9B
-      api_key_env: ""      # no key needed for local services
+robot-skill --config-name so101_single_arm plan-workflow \
+  --request-id plan-request-001 --text "打开夹爪" \
+  --workflow-json '[{"skill_name":"open_gripper_skill"}]'
 ```
 
 For further details, see:
 - [`src/embodied_agent/README.md`](src/embodied_agent/README.md) — task entry & orchestration
-- [`src/vlm_task_planner/README.md`](src/vlm_task_planner/README.md) — VLM planner
 - [`src/perception_service/README.md`](src/perception_service/README.md) — scene perception service
 - [`src/skill_library/README.md`](src/skill_library/README.md) — skill execution layer
 - [`src/safety_guard/README.md`](src/safety_guard/README.md) — safety validation layer

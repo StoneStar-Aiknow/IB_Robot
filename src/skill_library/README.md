@@ -12,21 +12,18 @@
 
 ## 1. 现在可以如何控制机械臂
 
-当前有 3 种主要控制方式，都是通过 `skill_library` 最终落到真实执行：
+当前有 2 种主要控制方式，都是通过 `skill_library` 最终落到真实执行：
 
 | 控制方式 | 入口 | 适合场景 |
 | --- | --- | --- |
-| 自然语言任务 | `/voice_command` | 当前规则入口支持观察、回位、夹爪开合、相对移动、夹爪旋转以及社交手势（挥手、点头、庆祝等，需 launch 注入 SSOT 别名） |
 | 技能级控制 | `/embodied/execute_skill` | 明确指定技能名，做稳定、可控的动作编排 |
 | primitive 级控制 | `/embodied/execute_primitive` | 直接控制命名位姿、相对位移、关节轨迹、夹爪开合 |
 
 整体链路如下：
 
 ```text
-/voice_command
-  -> task_entry_node
-  -> task_planner_node / vlm_task_planner_node
-  -> task_executor_node
+Hermes / robot-skill
+  -> agent_plan_node
   -> /embodied/execute_skill
   -> skill_executor_node
   -> /embodied/execute_primitive
@@ -125,53 +122,7 @@ SO101 当前配置示例：
 
 ## 5. 直接控制机械臂的几种用法
 
-### 5.1 用自然语言控制
-
-自然语言控制走的是：
-
-- topic：`/voice_command`
-- 类型：`std_msgs/msg/String`
-
-标准发送方式如下：
-
-```bash
-source .shrc_local && export ROS_DOMAIN_ID=42 && \
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
-```
-
-把 `data` 里的中文自然语言替换成不同指令即可。
-
-当前 README 推荐使用下面这些自然语言输入：
-
-| 自然语言输入 | 典型效果 | 对应技能 |
-| --- | --- | --- |
-| `观察桌面` | 移动到桌面观察位 | `inspect_scene` |
-| `看看桌面` | 移动到桌面观察位 | `inspect_scene` |
-| `查看桌面` | 移动到桌面观察位 | `inspect_scene` |
-| `观察场景` | 移动到桌面观察位 | `inspect_scene` |
-| `夹爪往前一点` | 末端向前相对移动一步 | `move_relative_ee` |
-| `夹爪往左一点` | 末端向左相对移动一步 | `move_relative_ee` |
-| `夹爪往上一点` | 末端向上相对移动一步 | `move_relative_ee` |
-| `回原位` | 回到安全位 / home 位 | `recover_safe_pose` |
-| `挥挥手` | 执行腕部挥手动作 | `wave_hello` |
-| `庆祝一下` | 在观察位执行庆祝动作 | `celebrate` |
-| `开心转圈` | 执行直立旋转动作 | `happy_spin_upright` |
-
-观察、回位、夹爪和参数化移动保留基础规则；机器人 YAML 中满足
-`description.rule_entry: true` 且 `requires_motion_params: false` 的技能，还会通过
-`skill_aliases_json` 把 `aliases_zh` 注入规则解析器。实际可用同义词以当前机器人 YAML 为准。
-
-例如：
-
-```bash
-source .shrc_local && export ROS_DOMAIN_ID=42 && \
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
-
-source .shrc_local && export ROS_DOMAIN_ID=42 && \
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '回原位'}"
-```
-
-### 5.2 直接发技能 action
+### 5.1 直接发技能 action
 
 适合调试 skill 级执行，不经过自然语言解析。
 

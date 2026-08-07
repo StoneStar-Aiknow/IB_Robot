@@ -13,22 +13,27 @@ from robot_config.timeout_policy import resolve_embodied_timeout_policy
 logger = get_colored_logger("embodied_bringup")
 
 
-def _node_runtime_settings(params: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
-    node_params = dict(params)
-    host_runtime = node_params.pop("host_runtime", {})
-    environment = {}
-    if "omp_threads" in host_runtime:
-        environment.update(
-            {
-                "OMP_NUM_THREADS": str(host_runtime["omp_threads"]),
-                "OMP_DYNAMIC": "FALSE",
-                "OMP_WAIT_POLICY": "PASSIVE",
-                "GOMP_SPINCOUNT": "0",
-            }
-        )
-    if "blas_threads" in host_runtime:
-        environment["OPENBLAS_NUM_THREADS"] = str(host_runtime["blas_threads"])
-    return node_params, environment
+def _resolve_development_source_root(config_path: Path, configured_root: str) -> Path | None:
+    module_path = Path(__file__).resolve()
+    anchors = [config_path]
+    repository_root = next((parent.parent for parent in module_path.parents if parent.name == "src"), None)
+    if repository_root is not None:
+        install_root = repository_root / "install"
+        try:
+            config_path.absolute().relative_to(install_root)
+        except ValueError:
+            pass
+        else:
+            anchors.append(module_path)
+    for anchor in anchors:
+        try:
+            repository_root = next(parent for parent in anchor.parents if parent.name == "src").parent
+        except StopIteration:
+            continue
+        candidate = (repository_root / configured_root).resolve()
+        if candidate.is_dir():
+            return candidate
+    return None
 
 
 def generate_embodied_nodes(
@@ -50,34 +55,30 @@ def generate_embodied_nodes(
         )
 
     execution = embodied_config.get("execution", {})
+    entry_mode = str(embodied_config.get("entry_mode", "hermes")).lower()
+    if entry_mode != "hermes":
+        raise ValueError("embodied.entry_mode must be hermes")
     named_poses = embodied_config.get("named_poses", {})
     named_targets = embodied_config.get("named_targets", {})
     safety = embodied_config.get("safety", {})
     joint_config = robot_config.get("joints", {})
     teleoperation = robot_config.get("teleoperation", {})
-    planner = embodied_config.get("planner", {})
     perception = embodied_config.get("perception", {})
     grasp_execution = robot_config.get("grasp_execution", {})
-    planner_mode = str(planner.get("mode", "rule")).lower()
-    scene_sources = planner.get("scene_sources", {})
-    vlm_api = planner.get("vlm_api", {})
-    planning_policy = planner.get("planning_policy", {})
     perception_scene_sources = perception.get("scene_sources", {})
     perception_vlm_api = perception.get("vlm_api", {})
     perception_conversation = perception.get("conversation", {})
-    entry = embodied_config.get("entry", {})
     timeout_policy = resolve_embodied_timeout_policy(embodied_config)
     skill_catalog_source_mode = embodied_config.get("skill_catalog_source_mode", "installed")
     skill_catalog_source_root = embodied_config.get("skill_catalog_source_root", "")
     if skill_catalog_source_root and not Path(skill_catalog_source_root).is_absolute():
         config_path = Path(robot_config.get("_config_path", ""))
-        try:
-            repository_root = next(parent for parent in config_path.parents if parent.name == "src").parent
-        except StopIteration:
+        resolved_source_root = _resolve_development_source_root(config_path, skill_catalog_source_root)
+        if resolved_source_root is None:
             skill_catalog_source_mode = "installed"
             skill_catalog_source_root = ""
         else:
-            skill_catalog_source_root = str(repository_root / skill_catalog_source_root)
+            skill_catalog_source_root = str(resolved_source_root)
 
     common_params = {
         "debug_tracing": embodied_config.get("debug_tracing", True),
@@ -133,78 +134,6 @@ def generate_embodied_nodes(
             "move_configuration_service", "/moveit_gateway/move_to_configuration"
         ),
     }
-
-    planner_node = Node(
-        package="embodied_agent",
-        executable="task_planner_node",
-        name="task_planner_node",
-        output="screen",
-        parameters=[
-            {
-                "debug_tracing": embodied_config.get("debug_tracing", True),
-                "input_topic": embodied_config.get("task_command_topic", "/embodied/task_command"),
-                "output_topic": embodied_config.get("planned_task_topic", "/embodied/planned_task"),
-                "status_topic": embodied_config.get("status_topic", "/embodied/task_status"),
-                "default_target_name": embodied_config.get("default_target_name", "demo_object"),
-                "default_place_name": embodied_config.get("default_place_name", "home"),
-                "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
-                "skill_gateway_status_service": common_params["skill_gateway_status_service"],
-                "skill_catalog_snapshot_service": common_params["skill_catalog_snapshot_service"],
-                "skill_registry_event_topic": common_params["skill_registry_event_topic"],
-            }
-        ],
-    )
-    if planner_mode in {"vlm_api", "hybrid"}:
-        planner_node = Node(
-            package="vlm_task_planner",
-            executable="vlm_task_planner_node",
-            name="vlm_task_planner_node",
-            output="screen",
-            parameters=[
-                {
-                    "debug_tracing": embodied_config.get("debug_tracing", True),
-                    "input_topic": embodied_config.get("task_command_topic", "/embodied/task_command"),
-                    "output_topic": embodied_config.get("planned_task_topic", "/embodied/planned_task"),
-                    "status_topic": embodied_config.get("status_topic", "/embodied/task_status"),
-                    "default_target_name": embodied_config.get("default_target_name", "demo_object"),
-                    "default_place_name": embodied_config.get("default_place_name", "home"),
-                    "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
-                    "named_poses_json": json.dumps(named_poses),
-                    "named_targets_json": json.dumps(named_targets),
-                    "workspace_json": json.dumps(safety.get("workspace", {})),
-                    "relative_motion_reference_frame": execution.get("relative_motion_reference_frame", "base"),
-                    "relative_motion_direction_mapping_json": json.dumps(
-                        execution.get("relative_motion_direction_mapping", {})
-                    ),
-                    "planner_mode": planner_mode,
-                    "primary_camera_topic": scene_sources.get("primary_camera_topic", "/camera/top/image_raw"),
-                    "wrist_camera_topic": scene_sources.get("wrist_camera_topic", "/camera/wrist/image_raw"),
-                    "primary_camera_info_topic": scene_sources.get("primary_camera_info_topic", ""),
-                    "primary_aligned_depth_topic": scene_sources.get("primary_aligned_depth_topic", ""),
-                    "primary_pointcloud_topic": scene_sources.get("primary_pointcloud_topic", ""),
-                    "wrist_camera_info_topic": scene_sources.get("wrist_camera_info_topic", ""),
-                    "wrist_aligned_depth_topic": scene_sources.get("wrist_aligned_depth_topic", ""),
-                    "wrist_pointcloud_topic": scene_sources.get("wrist_pointcloud_topic", ""),
-                    "ee_pose_topic": scene_sources.get("ee_pose_topic", "/robot_status/ee_pose"),
-                    "joint_state_topic": scene_sources.get("joint_state_topic", "/joint_states"),
-                    "max_scene_age_sec": timeout_policy["scene_freshness_sec"],
-                    "require_depth": scene_sources.get("require_depth", False),
-                    "require_pointcloud": scene_sources.get("require_pointcloud", False),
-                    "api_provider": vlm_api.get("provider", "openai_compatible"),
-                    "api_base_url": vlm_api.get("base_url", "http://localhost:8000/v1"),
-                    "api_key_env": vlm_api.get("api_key_env", ""),
-                    "api_model": vlm_api.get("model", "Qwen3.5-9B"),
-                    "api_timeout_sec": timeout_policy["model_idle_timeout_sec"],
-                    "api_max_image_width": vlm_api.get("max_image_width", 640),
-                    "api_jpeg_quality": vlm_api.get("jpeg_quality", 80),
-                    "fallback_to_rule_planner": planning_policy.get("fallback_to_rule_planner", True),
-                    "min_confidence": planning_policy.get("min_confidence", 0.7),
-                    "skill_gateway_status_service": common_params["skill_gateway_status_service"],
-                    "skill_catalog_snapshot_service": common_params["skill_catalog_snapshot_service"],
-                    "skill_registry_event_topic": common_params["skill_registry_event_topic"],
-                }
-            ],
-        )
 
     perception_node = None
     if perception.get("enabled", False):
@@ -270,27 +199,6 @@ def generate_embodied_nodes(
         ),
         Node(
             package="embodied_agent",
-            executable="task_entry_node",
-            name="task_entry_node",
-            output="screen",
-            parameters=[
-                {
-                    "debug_tracing": embodied_config.get("debug_tracing", True),
-                    "input_topic": embodied_config.get("task_input_topic", "/voice_command"),
-                    "output_topic": embodied_config.get("task_command_topic", "/embodied/task_command"),
-                    "status_topic": embodied_config.get("status_topic", "/embodied/task_status"),
-                    "default_target_name": embodied_config.get("default_target_name", "demo_object"),
-                    "default_place_name": embodied_config.get("default_place_name", "home"),
-                    "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
-                    "default_task_timeout_sec": timeout_policy["task_budget_sec"],
-                    "perception_request_topic": perception.get("request_topic", "/embodied/perception_request"),
-                    "perception_enabled": perception.get("enabled", False),
-                    "entry_visual_games_json": json.dumps(entry.get("visual_games", {})),
-                }
-            ],
-        ),
-        Node(
-            package="embodied_agent",
             executable="agent_plan_node",
             name="agent_plan_node",
             output="screen",
@@ -303,9 +211,6 @@ def generate_embodied_nodes(
                     "begin_workflow_service": common_params["begin_workflow_service"],
                     "finalize_workflow_service": common_params["finalize_workflow_service"],
                     "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
-                    "default_target_name": embodied_config.get("default_target_name", "demo_object"),
-                    "default_place_name": embodied_config.get("default_place_name", "home"),
-                    "default_relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
                     "plan_service": embodied_config.get("plan_service", "/embodied/plan_agent_command"),
                     "validate_plan_service": embodied_config.get(
                         "validate_plan_service", "/embodied/validate_agent_plan"
@@ -315,42 +220,22 @@ def generate_embodied_nodes(
                 }
             ],
         ),
-        planner_node,
-        Node(
-            package="embodied_agent",
-            executable="task_executor_node",
-            name="task_executor_node",
-            output="screen",
-            parameters=[
-                {
-                    "debug_tracing": embodied_config.get("debug_tracing", True),
-                    "input_topic": embodied_config.get("planned_task_topic", "/embodied/planned_task"),
-                    "status_topic": embodied_config.get("status_topic", "/embodied/task_status"),
-                    "skill_action_name": embodied_config.get("skill_action_name", "/embodied/execute_skill"),
-                    "gateway_status_service": common_params["skill_gateway_status_service"],
-                    "begin_workflow_service": common_params["begin_workflow_service"],
-                    "finalize_workflow_service": common_params["finalize_workflow_service"],
-                    "default_task_timeout_sec": timeout_policy["task_budget_sec"],
-                    "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
-                }
-            ],
-        ),
     ]
     if perception_node is not None:
         nodes.append(perception_node)
     if grasp_execution.get("enabled", False):
         camera = grasp_execution.get("camera", {})
-        planner_params, planner_env = _node_runtime_settings(grasp_execution.get("planner_node", {}))
+        perception_params = grasp_execution.get("perception_node", {})
+        planner_params = grasp_execution.get("planner_node", {})
         verifier_params = grasp_execution.get("verifier_node", {})
         if grasp_execution.get("auto_start_dependencies", True):
             nodes.extend(
                 [
                     Node(
-                        package="manipulation_service",
-                        executable="grasp_planner_node",
-                        name="grasp_planner",
+                        package="perception_service",
+                        executable="grounded_sam2_node",
+                        name="grounded_sam2",
                         output="screen",
-                        additional_env=planner_env,
                         parameters=[
                             {
                                 "rgb_topic": camera.get("rgb_topic", "/camera/wrist/image_raw"),
@@ -360,10 +245,25 @@ def generate_embodied_nodes(
                                 "camera_info_topic": camera.get(
                                     "camera_info_topic", "/camera/wrist/aligned_depth_to_color/camera_info"
                                 ),
-                                "detect_service": grasp_execution.get("detect_service", "/perception/grounding_detect"),
-                                "segment_service": grasp_execution.get("segment_service", ""),
-                                "legacy_detect_service": grasp_execution.get(
-                                    "fallback_detect_service", "/grasp_planner/detect_and_segment"
+                                **perception_params,
+                            }
+                        ],
+                    ),
+                    Node(
+                        package="manipulation_service",
+                        executable="grasp_planner_node",
+                        name="grasp_planner",
+                        output="screen",
+                        parameters=[
+                            {
+                                "depth_topic": camera.get(
+                                    "depth_topic", "/camera/wrist/aligned_depth_to_color/image_raw"
+                                ),
+                                "camera_info_topic": camera.get(
+                                    "camera_info_topic", "/camera/wrist/aligned_depth_to_color/camera_info"
+                                ),
+                                "detect_service": grasp_execution.get(
+                                    "detect_service", "/grounded_sam2/detect_and_segment"
                                 ),
                                 "model_dir": grasp_execution.get("model_bundle_path", ""),
                                 **planner_params,
@@ -405,9 +305,6 @@ def generate_embodied_nodes(
                         ),
                         "grasp_execution_json": json.dumps(grasp_execution),
                         "workspace_json": json.dumps(safety.get("workspace", {})),
-                        "home_joint_positions_json": json.dumps(
-                            robot_config.get("ros2_control", {}).get("reset_positions", {})
-                        ),
                         "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
                         "gripper_open_position": execution.get("gripper_open_position", 1.0),
                         "gripper_closed_position": execution.get("gripper_closed_position", 0.0),

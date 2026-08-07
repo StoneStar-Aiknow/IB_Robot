@@ -517,8 +517,8 @@ deployed and the active pointer is atomically switched.
 | `embodied_bringup` | Stop treating startup template JSON as the profile-mode authority. |
 | `skill_library` | Add bundle swap, shared `ExecutionCoordinator`, exact version admission, and restart handling. |
 | `safety_guard` | Add exact snapshot sync and epoch/generation validation. |
-| `embodied_common.command_parser` | Gate hardcoded and alias-based outputs by the snapshot enabled set. |
-| `embodied_agent` and `vlm_task_planner` | Consume dynamic enabled/planner-visible skills and carry request version identity. |
+| `embodied_common.workflow_contracts` | Normalize typed workflow steps and compute the canonical workflow digest. |
+| `embodied_agent` | Consume dynamic enabled/planner-visible skills and carry request version identity. |
 | `robot_skill_cli` | Bind preflight, validation, and execution to one snapshot identity. |
 | `ibrobot_msgs` | Add reload/snapshot/event interfaces and version fields on task, validation, status, and action contracts. |
 | Package README and tests | Update SSOT, interfaces, install layout, and concurrency expectations. |

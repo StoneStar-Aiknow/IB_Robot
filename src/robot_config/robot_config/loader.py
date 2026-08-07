@@ -1138,7 +1138,6 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
     execution = data.get("execution", {})
     safety = data.get("safety", {})
     direction_mapping = execution.get("relative_motion_direction_mapping", {})
-    planner = data.get("planner", {})
     perception = data.get("perception", {})
     entry = data.get("entry", {})
     timeout_policy = resolve_embodied_timeout_policy(data)
@@ -1167,7 +1166,6 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         relative_motion_step_m=execution.get("relative_motion_step_m", 0.03),
         relative_motion_reference_frame=execution.get("relative_motion_reference_frame", "base"),
         relative_motion_direction_mapping=direction_mapping,
-        planner=planner,
         perception=perception,
         entry=entry,
         gripper_open_position=execution.get("gripper_open_position", 1.0),
@@ -1324,7 +1322,12 @@ def _validate_vlm_runtime_config(
         errors.append("embodied.timeouts.model_idle_timeout_sec must be greater than zero")
 
 
-def validate_visual_games_consistency(entry: dict[str, Any], perception: dict[str, Any]) -> list[str]:
+def validate_visual_games_consistency(
+    entry: dict[str, Any],
+    perception: dict[str, Any],
+    *,
+    entry_mode: str = "hermes",
+) -> list[str]:
     """Check the visual-games <-> perception enable consistency rule.
 
     Any enabled ``embodied.entry.visual_games.<name>`` routes its trigger to
@@ -1344,6 +1347,11 @@ def validate_visual_games_consistency(entry: dict[str, Any], perception: dict[st
                 "embodied.entry.visual_games requires "
                 "embodied.perception.enabled: true when any game is enabled "
                 f"({enabled_games})"
+            )
+        if enabled_games and entry_mode == "hermes":
+            errors.append(
+                "embodied.entry.visual_games requires a voice entry mode, which is not supported "
+                f"when any game is enabled ({enabled_games})"
             )
     return errors
 
@@ -1367,7 +1375,12 @@ def validate_embodied_launch_dict(config: dict[str, Any]) -> list[str]:
         return []
     entry = embodied.get("entry", {}) or {}
     perception = embodied.get("perception", {}) or {}
-    return validate_visual_games_consistency(entry, perception)
+    entry_mode = str(embodied.get("entry_mode", "hermes")).lower()
+    errors = []
+    if entry_mode != "hermes":
+        errors.append("embodied.entry_mode must be hermes")
+    errors.extend(validate_visual_games_consistency(entry, perception, entry_mode=entry_mode))
+    return errors
 
 
 def validate_config(config: RobotConfig) -> list[str]:
@@ -1486,7 +1499,8 @@ def validate_config(config: RobotConfig) -> list[str]:
 
     if config.embodied.enabled:
         valid_directions = {"forward", "backward", "left", "right", "up", "down"}
-        valid_planner_modes = {"rule", "vlm_api", "hybrid"}
+        if config.embodied.entry_mode != "hermes":
+            errors.append("embodied.entry_mode must be hermes")
         required_pose_names = {"home", "observe_table", "zero"}
         missing_pose_names = sorted(p for p in required_pose_names if p not in config.embodied.named_poses)
         if missing_pose_names:
@@ -1557,7 +1571,6 @@ def validate_config(config: RobotConfig) -> list[str]:
                         f"embodied.execution.relative_motion_direction_mapping.{direction} must not be a zero vector"
                     )
 
-        planner = config.embodied.planner or {}
         try:
             timeout_policy = resolve_embodied_timeout_policy(
                 {
@@ -1566,7 +1579,6 @@ def validate_config(config: RobotConfig) -> list[str]:
                         "primitive_timeout_sec": config.embodied.primitive_timeout_sec,
                         "primitive_wait_sec": config.embodied.primitive_wait_sec,
                     },
-                    "planner": planner,
                     "perception": config.embodied.perception or {},
                     "timeouts": config.embodied.timeouts or {},
                 }
@@ -1574,33 +1586,7 @@ def validate_config(config: RobotConfig) -> list[str]:
         except ValueError as exc:
             errors.append(str(exc))
             timeout_policy = {}
-        planner_mode = str(planner.get("mode", "rule")).lower()
         valid_vlm_api_providers = {"kimicode", "openai_compatible"}
-        if planner_mode not in valid_planner_modes:
-            errors.append("embodied.planner.mode must be one of: " + ", ".join(sorted(valid_planner_modes)))
-
-        if planner_mode in {"vlm_api", "hybrid"}:
-            _validate_vlm_runtime_config(
-                errors,
-                "embodied.planner",
-                planner,
-                timeout_policy,
-                valid_vlm_api_providers,
-                "planner.mode uses VLM",
-            )
-
-        planning_policy = planner.get("planning_policy", {})
-        allowed_skills = planning_policy.get("allowed_skills", [])
-        if planner_mode in {"vlm_api", "hybrid"}:
-            if not isinstance(allowed_skills, list) or not allowed_skills:
-                errors.append(
-                    "embodied.planner.planning_policy.allowed_skills must be a non-empty list "
-                    "when planner.mode uses VLM"
-                )
-            min_confidence = float(planning_policy.get("min_confidence", 0.7))
-            if min_confidence < 0.0 or min_confidence > 1.0:
-                errors.append("embodied.planner.planning_policy.min_confidence must be in [0.0, 1.0]")
-
         perception = config.embodied.perception or {}
         if perception.get("enabled", False):
             if not str(perception.get("request_topic", "")).strip():

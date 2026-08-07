@@ -28,10 +28,18 @@ def test_catalog_import_does_not_load_rclpy(monkeypatch):
 
 
 def test_status_preflight_timeout_has_hardware_discovery_floor():
-    from robot_skill_cli.cli import _status_preflight_timeout
+    from robot_skill_cli.cli import _plan_rpc_timeout, _status_preflight_timeout
 
     context = type("Context", (), {"view": {"timeout_policy": {"rpc_timeout_sec": 5.0}}})()
+    assert _plan_rpc_timeout(context) == 15.0
     assert _status_preflight_timeout(context) == 15.0
+
+
+def test_agent_control_timeout_preserves_larger_configured_value():
+    from robot_skill_cli.cli import _plan_rpc_timeout
+
+    context = type("Context", (), {"view": {"timeout_policy": {"rpc_timeout_sec": 20.0}}})()
+    assert _plan_rpc_timeout(context) == 20.0
 
 
 def test_load_catalog_uses_exported_config_resolver(monkeypatch):
@@ -217,11 +225,21 @@ def test_catalog_commands_emit_one_json_document(capsys):
         assert payload["ok"] is True
 
 
-def test_agent_plan_parser_uses_frozen_text_option_and_lifecycle_commands():
+def test_agent_plan_parser_uses_typed_workflow_option_and_lifecycle_commands():
     from robot_skill_cli.cli import _build_parser
 
     parser = _build_parser()
-    plan = parser.parse_args(["plan-text", "--request-id", "request-1", "--text", "打开夹爪"])
+    plan = parser.parse_args(
+        [
+            "plan-workflow",
+            "--request-id",
+            "request-1",
+            "--text",
+            "打开夹爪",
+            "--workflow-json",
+            '[{"skill_name":"open_gripper_skill"}]',
+        ]
+    )
     confirm = parser.parse_args(
         [
             "confirm-plan",
@@ -235,6 +253,7 @@ def test_agent_plan_parser_uses_frozen_text_option_and_lifecycle_commands():
     )
 
     assert plan.raw_command == "打开夹爪"
+    assert plan.workflow_json == '[{"skill_name":"open_gripper_skill"}]'
     assert plan.request_id == "request-1"
     assert confirm.command == "confirm-plan"
 

@@ -17,11 +17,13 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from embodied_agent.agent_plan_store import AgentPlan, AgentPlanError, AgentPlanStore
-from embodied_agent.command_parser import parse_text_workflow
-from embodied_common.command_parser import load_skill_aliases
 from embodied_common.dispatch_binding import new_binding, workflow_step
 from embodied_common.skill_request import derive_skill_task_id
-from embodied_common.workflow_contracts import CanonicalWorkflowStep, compute_workflow_digest
+from embodied_common.workflow_contracts import (
+    CanonicalWorkflowStep,
+    compute_workflow_digest,
+    normalize_workflow_steps,
+)
 from ibrobot_msgs.action import ExecuteAgentPlan, SkillCommand
 from ibrobot_msgs.msg import AgentPlan as AgentPlanMsg
 from ibrobot_msgs.msg import SkillDiagnostic
@@ -64,10 +66,6 @@ class AgentPlanNode(Node):
         self.declare_parameter("rpc_timeout_sec", 5.0)
         self.declare_parameter("plan_ttl_sec", 300.0)
         self.declare_parameter("plan_store_max_records", 1024)
-        self.declare_parameter("default_target_name", "demo_object")
-        self.declare_parameter("default_place_name", "tray_right")
-        self.declare_parameter("default_relative_motion_step_m", 0.03)
-        self.declare_parameter("skill_aliases_json", "")
 
         self._status_service = self._string_parameter("gateway_status_service")
         self._validate_skill_service = self._string_parameter("validate_skill_service")
@@ -78,12 +76,6 @@ class AgentPlanNode(Node):
         self._rpc_timeout = self.get_parameter("rpc_timeout_sec").get_parameter_value().double_value
         if not math.isfinite(self._rpc_timeout) or self._rpc_timeout <= 0.0:
             raise ValueError("rpc_timeout_sec must be finite and positive")
-        self._default_target = self._string_parameter("default_target_name")
-        self._default_place = self._string_parameter("default_place_name")
-        self._default_relative_motion_step = (
-            self.get_parameter("default_relative_motion_step_m").get_parameter_value().double_value
-        )
-        self._skill_aliases = load_skill_aliases(self._string_parameter("skill_aliases_json"))
         self._store = AgentPlanStore(
             ttl_sec=self.get_parameter("plan_ttl_sec").get_parameter_value().double_value,
             max_records=self.get_parameter("plan_store_max_records").get_parameter_value().integer_value,
@@ -242,20 +234,27 @@ class AgentPlanNode(Node):
             timeout_sec=step.timeout_sec,
         )
 
-    def _parse_steps(self, raw_command: str, status, catalog) -> tuple[CanonicalWorkflowStep, ...]:
-        parsed_steps, message = parse_text_workflow(
-            raw_command,
-            default_target_name=self._default_target,
-            default_place_name=self._default_place,
-            default_relative_motion_step_m=self._default_relative_motion_step,
-            skill_aliases={name: list(values) for name, values in catalog.aliases.items()}
-            or self._skill_aliases
-            or None,
-        )
-        if not parsed_steps:
-            raise AgentPlanError("SKILL_SCHEMA_INVALID", message or "command cannot be planned")
-        for parsed in parsed_steps:
-            skill_name = parsed.skill_sequence[0]
+    def _normalize_steps(self, workflow_steps, status, catalog) -> tuple[CanonicalWorkflowStep, ...]:
+        try:
+            requested_steps = normalize_workflow_steps(workflow_steps)
+            steps = tuple(
+                CanonicalWorkflowStep(
+                    schema_version=1,
+                    skill_name=step.skill_name,
+                    target_name=step.target_name,
+                    place_name=step.place_name,
+                    motion_direction=step.motion_direction.strip().lower(),
+                    motion_distance=self._float32(step.motion_distance),
+                    timeout_sec=self._float32(status.default_skill_timeout_sec),
+                )
+                for step in requested_steps
+            )
+        except (TypeError, ValueError, OverflowError, struct.error) as exc:
+            raise AgentPlanError("SKILL_SCHEMA_INVALID", str(exc)) from exc
+        if any(step.timeout_sec != 0.0 for step in requested_steps):
+            raise AgentPlanError("SKILL_SCHEMA_INVALID", "workflow steps must not set timeout_sec")
+        for step in steps:
+            skill_name = step.skill_name
             capability = catalog.capability_view.get(skill_name)
             if (
                 skill_name not in catalog.planner_visible_names
@@ -263,18 +262,7 @@ class AgentPlanNode(Node):
                 or capability.get("semantic_level") not in {"atomic_operator", "skill"}
             ):
                 raise AgentPlanError("SKILL_UNKNOWN", f"skill is not planner-visible: {skill_name}")
-        return tuple(
-            CanonicalWorkflowStep(
-                schema_version=1,
-                skill_name=parsed.skill_sequence[0],
-                target_name=parsed.target_name,
-                place_name=parsed.place_name,
-                motion_direction=parsed.motion_direction,
-                motion_distance=self._float32(parsed.motion_distance),
-                timeout_sec=self._float32(status.default_skill_timeout_sec),
-            )
-            for parsed in parsed_steps
-        )
+        return steps
 
     def _plan_command(self, request, response):
         try:
@@ -282,7 +270,7 @@ class AgentPlanNode(Node):
                 raise AgentPlanError("SKILL_SCHEMA_INVALID", "schema_version must be 1")
             status = self._gateway_status()
             catalog = self._catalog_view(status)
-            steps = self._parse_steps(request.raw_command, status, catalog)
+            steps = self._normalize_steps(request.workflow_steps, status, catalog)
             epoch, generation, digest = self._identity(status)
             with self._store_lock:
                 plan = self._store.create_plan(

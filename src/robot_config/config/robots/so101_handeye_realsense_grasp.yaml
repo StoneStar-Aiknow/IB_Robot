@@ -409,6 +409,7 @@ robot:
 
   embodied:
     enabled: false
+    entry_mode: hermes
     skill_catalog_source_mode: development
     skill_catalog_source_root: src/skill_catalog
     skill_catalog_profile: so101_handeye_realsense_grasp
@@ -429,19 +430,6 @@ robot:
       model_idle_timeout_sec: 120.0
       rpc_timeout_sec: 5.0
       gripper_settle_sec: 1.5
-    planner:
-      mode: rule
-      planning_policy:
-        fallback_to_rule_planner: true
-        min_confidence: 0.70
-        allowed_skills:
-          - inspect_scene
-          - recover_safe_pose
-          - recover_zero_pose
-          - move_relative_ee
-          - open_gripper_skill
-          - close_gripper_skill
-          - pick_object
     execution:
       relative_motion_step_m: 0.03
       relative_motion_reference_frame: base

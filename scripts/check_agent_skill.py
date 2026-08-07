@@ -14,7 +14,15 @@ import re
 from collections.abc import Sequence
 from pathlib import Path
 
-PLAN_COMMANDS = ("status", "list-skills", "plan-text", "describe", "validate-plan", "confirm-plan", "execute-plan")
+PLAN_COMMANDS = (
+    "status",
+    "list-skills",
+    "plan-workflow",
+    "describe",
+    "validate-plan",
+    "confirm-plan",
+    "execute-plan",
+)
 REQUIRED_RULES = {
     "explicit user motion confirmation": "missing explicit user motion confirmation requirement",
     "must not launch or restart the pipeline": "missing prohibition: launch or restart pipeline",
@@ -35,7 +43,7 @@ REQUIRED_RULES = {
         "missing prohibition: environment or repository discovery"
     ),
     "on any nonzero exit, report the exact cli error and stop": "missing truthful nonzero-exit reporting rule",
-    "call `plan-text` exactly once with the user's original wording": "missing single-attempt workflow planning rule",
+    "call `plan-workflow` exactly once with the user's original wording": "missing single-attempt workflow planning rule",
     "do not retry alternate phrasings": "missing prohibition: alternate workflow paraphrase retries",
 }
 
