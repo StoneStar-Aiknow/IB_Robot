@@ -17,6 +17,8 @@ from inference_manifest.integrity import (
 from inference_manifest.json_utils import load_json_strict
 from inference_manifest.metadata import PolicyFeature, PolicyMetadata, load_policy_metadata
 from inference_manifest.models import (
+    HOST_SEMANTIC_PREFIX,
+    INTERNAL_SEMANTIC_PREFIX,
     CompiledDeployment,
     Deployment,
     InferenceManifest,
@@ -214,8 +216,6 @@ def _is_reserved_semantic_path(path: str) -> bool:
 
 
 def _validate_feature_compatibility(deployment: CompiledDeployment, policy: PolicyMetadata) -> None:
-    if policy.policy_type == "graspgen":
-        return
     for role in deployment.execution:
         group = deployment.bindings[role]
         for binding in (*group.inputs, *group.outputs):
@@ -233,13 +233,7 @@ def _validate_policy_deployment(deployment: CompiledDeployment, policy: PolicyMe
     output_semantics = {
         binding.semantic for role in deployment.execution for binding in deployment.bindings[role].outputs
     }
-    if policy.policy_type == "graspgen":
-        missing_outputs = sorted({"grasp.poses", "grasp.confidence"} - output_semantics)
-        if missing_outputs:
-            raise ManifestValidationError(
-                f"Compiled GraspGen policy deployment is missing output bindings: {missing_outputs}"
-            )
-    elif "action" not in output_semantics:
+    if "action" not in output_semantics:
         raise ManifestValidationError("Compiled policy deployment must declare an action output binding")
     _validate_feature_compatibility(deployment, policy)
 
@@ -252,15 +246,31 @@ def _validate_semantic_contract(deployment: CompiledDeployment, model: ModelDesc
     declared_outputs = {descriptor.semantic: descriptor for descriptor in model.outputs}
     bound_inputs = _external_bindings(deployment, "inputs")
     bound_outputs = _external_bindings(deployment, "outputs")
-    _validate_contract_direction("input", declared_inputs, bound_inputs)
-    _validate_contract_direction("output", declared_outputs, bound_outputs)
+    orchestrated = _is_host_orchestrated(deployment)
+    _validate_contract_direction("input", declared_inputs, bound_inputs, host_orchestrated=orchestrated)
+    _validate_contract_direction("output", declared_outputs, bound_outputs, host_orchestrated=orchestrated)
+
+
+def _is_host_orchestrated(deployment: CompiledDeployment) -> bool:
+    """Report whether the host, not the compiled graph, joins this deployment's roles.
+
+    A deployment whose roles consume or produce ``host.*`` tensors is driven role by role
+    with host computation in between - PointNet++ grouping, a diffusion loop, pose
+    integration - so the tensors the service declares need not each be an input or output
+    slot on some OM. The straight-through deployments keep the strict 1:1 mapping.
+    """
+    return any(
+        binding.semantic.startswith(HOST_SEMANTIC_PREFIX)
+        for role in deployment.execution
+        for binding in (*deployment.bindings[role].inputs, *deployment.bindings[role].outputs)
+    )
 
 
 def _external_bindings(deployment: CompiledDeployment, direction: str) -> dict[str, list[tuple[str, TensorBinding]]]:
     bindings: dict[str, list[tuple[str, TensorBinding]]] = {}
     for role in deployment.execution:
         for binding in getattr(deployment.bindings[role], direction):
-            if binding.semantic.startswith("internal."):
+            if binding.semantic.startswith((INTERNAL_SEMANTIC_PREFIX, HOST_SEMANTIC_PREFIX)):
                 continue
             bindings.setdefault(binding.semantic, []).append((role, binding))
     return bindings
@@ -270,16 +280,18 @@ def _validate_contract_direction(
     direction: str,
     declared: dict[str, SemanticTensor],
     bound: dict[str, list[tuple[str, TensorBinding]]],
+    *,
+    host_orchestrated: bool = False,
 ) -> None:
     missing = sorted(set(declared) - set(bound))
-    if missing:
+    if missing and not host_orchestrated:
         raise ManifestValidationError(f"Compiled deployment omits declared semantic {direction} bindings: {missing}")
     unexpected = sorted(set(bound) - set(declared))
     if unexpected:
         raise ManifestValidationError(f"Compiled deployment has undeclared semantic {direction} bindings: {unexpected}")
 
     for semantic, descriptor in declared.items():
-        for role, binding in bound[semantic]:
+        for role, binding in bound.get(semantic, ()):
             mismatches: list[str] = []
             if binding.dtype != descriptor.dtype:
                 mismatches.append(f"dtype expected {descriptor.dtype}, actual {binding.dtype}")

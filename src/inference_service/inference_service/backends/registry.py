@@ -13,7 +13,7 @@ from inference_service.backends.errors import BackendCompatibilityError, Backend
 from inference_service.backends.types import InferenceBackend, RuntimeContext
 
 CANONICAL_BACKENDS = ("torch", "ascend", "hisilicon", "rknn", "hmm")
-POLICY_FAMILIES = frozenset({"act", "diffusion", "pi05", "smolvla", "graspgen"})
+POLICY_FAMILIES = frozenset({"act", "diffusion", "pi05", "smolvla"})
 NON_POLICY_MODEL_KINDS = frozenset({"perception", "generic"})
 _FACTORY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -263,7 +263,7 @@ STATIC_BACKEND_DESCRIPTORS: Mapping[str, BackendDescriptor] = MappingProxyType(
         "ascend": BackendDescriptor(
             name="ascend",
             factory="inference_service.backends.ascend:create_backend",
-            supported_policy_families=frozenset({"act", "pi05", "graspgen"}),
+            supported_policy_families=frozenset({"act", "pi05"}),
             target_validator=_validate_ascend,
         ),
         "hisilicon": BackendDescriptor(

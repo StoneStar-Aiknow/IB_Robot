@@ -3,13 +3,13 @@ from collections import deque
 from types import SimpleNamespace
 
 import numpy as np
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Header
 
 from ibrobot_msgs.msg import Detection2D, DetectionArray
-from ibrobot_msgs.srv import GroundingDetect, SegmentDetections
+from ibrobot_msgs.srv import DetectSegment, GroundingDetect, SegmentDetections
 from manipulation_service import grasp_planner_node
-from manipulation_service.grasp_planner_node import GraspPlannerNode, RGBFrame
+from manipulation_service.grasp_planner_node import DepthFrame, GraspPlannerNode, RGBFrame
 
 
 class _Future:
@@ -169,3 +169,39 @@ def test_detection_timeout_is_reported(monkeypatch):
 
     assert result is None
     assert failure == "detect_service_timeout"
+
+
+def test_legacy_detect_adapter_populates_pr259_depth_geometry(monkeypatch):
+    header = Header(frame_id="camera")
+    detection = _detection(255)
+    detection.header = header
+    detection.mask.header = header
+    depth = np.full((2, 2), 1000, dtype=np.uint16)
+    camera_info = CameraInfo(header=header, height=2, width=2)
+    camera_info.k = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    planner = SimpleNamespace(
+        _get_segmentation_mask=lambda *_args: (
+            (np.full((2, 2), 255, dtype=np.uint8), header, 0.9, detection),
+            None,
+        ),
+        _get_synchronized_inputs=lambda _stamp: (
+            DepthFrame(stamp_ns=0, frame_id="camera", data=depth, depth_scale=1000.0),
+            camera_info,
+        ),
+    )
+    monkeypatch.setattr(grasp_planner_node.time, "perf_counter", lambda: 1.0)
+
+    response = GraspPlannerNode._legacy_detect_cb(
+        planner,
+        DetectSegment.Request(text_prompt="banana", confidence_threshold=0.3),
+        DetectSegment.Response(),
+    )
+
+    assert response.success is True
+    assert len(response.detections.detections) == 1
+    adapted = response.detections.detections[0]
+    assert adapted.point_count == 4
+    assert adapted.centroid_xyz.x == 0.5
+    assert adapted.centroid_xyz.y == 0.5
+    assert adapted.centroid_xyz.z == 1.0
+    assert adapted.volume_m3 == 0.0

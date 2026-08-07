@@ -193,6 +193,37 @@ source .shrc_local && colcon build --symlink-install --merge-install --packages-
 Grounded-SAM2 Torch deployment，通过 `GroundingDetect` 一次返回 bbox 和 mask；310P 配置分别选择
 `grounding_dino_raw` 与 `sam2_prompt` bundle，通过 `GroundingDetect -> SegmentDetections` 返回相同语义结果。
 
+### 7.1 310P 原始执行图的张量契约
+
+`grounding-dino-raw-logits-cxcywh-v1` postprocessing 契约规定 `pred_logits` 的列布局：
+
+| 维度 | 含义 |
+| --- | --- |
+| `pred_logits[0, q, :]` | decoder query `q` 的分类 logits |
+| 列 `0 .. sequence_length-1` | 与 BERT prompt token 一一对应的相关性 logit |
+| 列 `sequence_length .. 255` | 编译期填充，语义为空 |
+
+`sequence_length` 不是常量，而由 manifest `model.inputs` 中 `input_ids` 的尾部维度决定
+（310P 部署为 8）；adapter 从同一 `ModelDescriptor` 推导 tokenizer 窗口和 `encoder_tgt` 形状，
+因此 manifest ABI 是唯一事实源。相关性打分只在前 `sequence_length` 列上取最大值，标签解码只在同
+一窗口内按 token id 反查并剔除 `[CLS]`/`[SEP]`/`[PAD]`/`.` 等特殊 token；若 token 窗口宽于
+`pred_logits` 的列数，adapter 直接抛错而不是截断，避免把填充列的噪声当成置信度。
+
+`pred_boxes` 为归一化 `cxcywh`，由 adapter 换算到请求图像分辨率的 `xyxy` 并裁剪到图像边界；退化
+框（宽或高非正）被丢弃。
+
+### 7.2 检测数量与分割批次
+
+原始 Grounding-DINO 每次输出 900 个 decoder query，而编译后的 SAM2 box-prompt decoder 只接受固定
+数量的框（310P 部署为 4）。数量收敛由服务契约而非模型决定：
+
+1. `model_contracts.MAX_DETECTIONS`（16）是 `GroundingDetect` 允许输出的检测上限。两个检测 plugin
+   都用 `rank_detections()` 按置信度降序、原 query 序号稳定排序后截断，因此同一输入的输出顺序可复现。
+2. `SegmentDetections` 先用 `validate_detection_batch()` 拒绝超过该上限的请求，再按 adapter 的
+   `batch_size` 把检测切成多个编译批次逐批推理，并按原始检测顺序拼回 mask。检测数不是 `batch_size`
+   的整数倍时，最后一批的空闲槽位用最后一个真实框填充，但只取前 `len(chunk)` 个 mask，不会多出检测。
+3. 任一批次返回的 mask 数与该批检测数不符时服务直接失败，不做静默截断。
+
 ## 8. Generic Model Services
 
 `model_service_node` 是强类型模型服务的通用宿主。每个实例从 robot-config SSOT 读取 bundle、命名 deployment、
@@ -298,3 +329,120 @@ perception_services:
 
 由统一 robot launch 启动后，RGB-D 相机、两个 model service、GraspGen、MoveIt 执行和抓取验证使用同一
 ROS service/topic 契约；`grasp_planner_node` 通过配置的 endpoint 区分组合 PC 服务和 310P 两段服务。
+
+## 10. GraspGen 6-DoF 抓取
+
+GraspGen 是感知模型，不是 LeRobot policy：输入一朵已分割的物体点云，输出一组相机系 6-DoF
+抓取位姿和置信度。它与 SAM2/RAM++/SigLIP2 走同一条链路——bundle-first、named deployment、
+typed endpoint、`ModelSession`——所以既不出现在 `inference_service` 的 policy family 矩阵里，
+也不通过匿名 tensor service 暴露。
+
+### 10.1 Typed service
+
+| 项 | 值 |
+|---|---|
+| Service type | `ibrobot_msgs/srv/GenerateGrasps` |
+| Plugin | `perception_service.model_service_plugins:GraspGenGenerateGraspsPlugin` |
+| Adapter | `perception_service.graspgen_adapter:GraspGenAdapter` |
+| Family | `graspgen`（`ModelDescriptor.kind == "perception"`） |
+
+Request 是 `sensor_msgs/PointCloud2 object_points` 加 `max_grasps` / `min_confidence`；
+Response 是 `GraspCandidateArray grasps` 加通用诊断字段 `model` / `inference_time_ms` /
+`success` / `message`。点云按声明的 field offset 解码，因此带 RGB 通道的 RealSense 点云可以
+直接送入。`GraspCandidate.pose_matrix` 是行主序展平的 4x4 相机系变换，与请求点云同 frame；
+`target_width_m`、`width_axis_camera`、`collision_free` 保持默认值——GraspGen 只对位姿打分，
+不测量夹爪开口也不做碰撞检查，这几项由 `manipulation_execution` 用自己的几何计算填充。
+
+注意 `ibrobot_msgs/srv/PlanGrasp` 是 `manipulation_service` 的文本提示抓取管线服务，没有
+`ModelRuntimeInfo model` 字段，过不了 `model_service_node` 的服务契约校验，两者不可互换。
+
+### 10.2 Adapter 与 host orchestration
+
+`GraspGenAdapter` 拥有模型语义的预处理与后处理：`prepare()` 剔除非有限点与统计离群点、
+下采样到 `point_count`、按物体质心居中并乘 `kappa`，返回张量和质心；`postprocess()` 把
+`grasp.poses` / `grasp.confidence` 还原回相机系（加回质心）、按置信度排序、先过
+`min_confidence` 阈值再截断到 `max_grasps`。identity 为
+`preprocessing=object-points-outlier-filtered-centered-kappa-scaled-v1`、
+`postprocessing=grasp-pose-matrix-confidence-sorted-v1`、
+`supported_deployments={ascend_310p, ascend_310b}`。
+
+设备侧是八个 OM 子图（`inference_manifest.GRASPGEN_EXECUTION`）：generator 与 discriminator
+各三个 PointNet++ 编码 stage，加一个 denoiser 和一个 discriminator head。子图之间的
+PointNet++ 分组（FPS / ball query / grouping）、DDPM 去噪循环和 SO(3) 位姿转换都不在任何编译
+图里，由主机计算，因此 `GraspGenAscendSession` 继承通用的 `AscendOmModelSession` 并只重写
+`_execute`，逐角色驱动而不是直线执行 `execution`。
+
+这些主机中间张量用 `host.` 语义命名空间声明（`host.graspgen.*`）。`host.` 是继 `internal.`
+之后的第三类语义：既不属于对外契约（不参与 `ModelDescriptor` 的 1:1 校验），也不要求图内
+producer。声明了任一 `host.` binding 的 deployment 即为 host-orchestrated；manifest 校验对它
+放宽"声明的 semantic 必须都被绑定"，但仍然拒绝"绑定了未声明的外部 semantic"。两个 encoder
+embedding 走 `internal.graspgen.*` 与 `device_links`，始终留在设备侧、不经主机拷贝。
+
+对外契约只有三个 semantic：
+
+```
+inputs  = [observation.object_points  float32 [-1, 3]]
+outputs = [grasp.poses      float32 [-1, 4, 4],
+           grasp.confidence float32 [-1]]
+```
+
+`grasp.poses` 是主机积分出来的，不绑定到任何 OM 输出张量。
+
+Runtime options 在通用 Ascend 的 `acl_config_path` / `device_id` 之外多接受一个
+`random_seed`，用于让去噪循环可复现；除此之外选项集合仍然是封闭的。GraspGen 没有 Torch
+deployment——八个 OM 与它们之间的主机数学是一个整体契约，未编译的 bundle 没有可回退的实现，
+`_new_graspgen_session` 会直接拒绝。
+
+### 10.3 Bundle 与 promotion
+
+Bundle 是标准 perception bundle，不含任何 LeRobot 资产：
+
+```
+graspgen_bundle/
+  inference_manifest.json          # schema v2, model.kind=perception, family=graspgen
+  assets/adapter.json              # family/identity + kappa, diffusion_steps,
+                                   # grasp_batch_size, point_count, geometry
+  artifacts/ascend/ascend_310p/    # 八个 <role>.om
+```
+
+模型常量只落在 `assets/adapter.json`，由 `GraspGenAdapter.from_bundle()` 读回并逐项校验——
+写错一个常量在设备上是一次沉默的 shape 失败，所以在加载时就拒绝。
+
+ONNX → OM → ABI → bundle 的三步流程：前两步 `graspgen-export-onnx` 与
+`graspgen-onnx-to-om` 是 `model_utils` 的导出工具（见
+`src/model_utils/model_utils/README.md`）；第三步用本包的命令打包：
+
+```bash
+ros2 run perception_service package_graspgen_ascend_bundle \
+    --bundle-root /path/to/graspgen_bundle \
+    --onnx-manifest /path/to/onnx/graspgen.onnx.json \
+    --om-dir /path/to/compiled_om \
+    --om-abi-dir /path/to/runtime_abi \
+    --soc-version Ascend310P3
+```
+
+八个 OM 的 binding 必须来自 ACL runtime introspection 得到的实际 ABI，不能用 ONNX tensor
+name 代替；sidecar 缺失时 packager 默认用本机 Ascend device 生成，无 device 的打包主机需要预
+先备齐并传 `--no-inspect-missing-abi`。全部八个角色解析通过后才写第一个字节，任一 OM 或 ABI
+缺失都不会留下半成品 bundle。ONNX manifest 的 `contract_version` 与
+`inference_manifest.GRASPGEN_CONTRACT_VERSION` 不一致时直接拒绝——角色顺序、语义命名或
+PointNet++ 采样几何变更都会 bump 该版本号，避免旧图编出的 OM 被新 session 用错误的分组驱动。
+
+### 10.4 SSOT 配置
+
+与其它五个感知服务一样，由 robot-config 的 `perception_services.services[]` 声明；
+`lekiwi_mapping.yaml` 里模板条目为 `id: semantic_graspgen_grasps`（默认 `enabled: false`）。
+启用时补齐 `bundle_path`、`deployment`（如 `ascend_310p`）、`adapter_class`、`service_type`、
+`endpoint`。GraspGen 不绑定到 `semantic_mapping.perception.semantic_roles` 的任何角色——
+抓取由 manipulation 侧直接调用 `GenerateGrasps`，不参与建图。
+
+### 10.5 Conformance
+
+`perception_service.conformance` 提供 `grasp_pose_error()` 与 `evaluate_grasp_conformance()`，
+按置信度排名逐位比较两个 backend 的抓取输出：平移误差、旋转误差（`R_ref.T @ R_cand` 的测地
+角，能穿过 axis-angle 往返表示变换）、置信度差和抓取数量差，阈值见 `ConformanceThresholds`。
+排名比较是刻意的——执行器只会尝试前几个，两个列表"元素集合相同但顺序不同"不算等价行为。
+
+板端实机推理不在本仓库的自动化测试范围内；`test_graspgen_session.py` /
+`test_graspgen_plugin.py` 用 fake `AclModel` 驱动八个角色，manifest 与 packager 保持真实，
+因此 binding 写错会在这里失败而不是在设备上。

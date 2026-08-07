@@ -7,10 +7,9 @@ import shlex
 import threading
 import time
 import uuid
-from collections.abc import Mapping
 from contextlib import suppress
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -334,19 +333,21 @@ class Remote310PInferenceClient:
 
 
 class AscendLocalBackend:
-    """In-process GraspGen inference via the standard AscendBackend.
+    """In-process GraspGen inference via the perception GraspGen session.
 
-    Loads a unified ``inference_manifest.json`` produced by
-    ``model_utils.graspgen_export.write_manifest`` and runs the eight OM
-    sub-graphs through ``inference_service.backends.ascend.AscendBackend``,
-    bypassing the SSH/SFTP transport used by :class:`Remote310PInferenceClient`.
+    GraspGen is a ``kind=perception`` model, so its semantics live in
+    ``perception_service.GraspGenAdapter`` (point-cloud preparation and grasp
+    decoding) and its eight-role execution lives in
+    ``perception_service.GraspGenAscendSession``. This class only drives that
+    pair in-process, bypassing the SSH/SFTP transport used by
+    :class:`Remote310PInferenceClient`; it holds no GraspGen semantics of its own.
     """
 
     def __init__(
         self,
         manifest_path: str,
         *,
-        deployment_name: str = "ascend",
+        deployment_name: str = "ascend_310p",
         device_id: int = 0,
         random_seed: int | None = None,
     ):
@@ -355,44 +356,49 @@ class AscendLocalBackend:
         if device_id < 0:
             raise ValueError("ascend_local_device_id must be a non-negative integer")
         self._manifest_path = manifest_path.strip()
-        self._deployment_name = deployment_name.strip() or "ascend"
+        self._deployment_name = deployment_name.strip() or "ascend_310p"
         self._device_id = int(device_id)
         self._random_seed = random_seed
-        self._backend = None
-        self._plan = None
-        self._first_role = None
+        self._session = None
+        self._adapter = None
+        self._sample_lock = threading.Lock()
 
     def _ensure_loaded(self) -> None:
-        if self._backend is not None:
+        if self._session is not None:
             return
         from inference_manifest import load_inference_manifest
-        from inference_service.backends import RuntimeContext
-        from inference_service.backends.ascend import AscendBackend
-        from inference_service.backends.ascend.acl_runtime import AclRuntimeManager
-        from inference_service.codecs import build_execution_plan
+        from inference_service.backends.types import RuntimeContext
+        from perception_service.graspgen_adapter import GraspGenAdapter
+        from perception_service.graspgen_session import GraspGenAscendSession
 
         bundle_root = Path(self._manifest_path).expanduser().resolve()
         manifest_root = bundle_root.parent if bundle_root.name == "inference_manifest.json" else bundle_root
         validated = load_inference_manifest(manifest_root, self._deployment_name)
+        model = validated.manifest.model
+        if model.kind != "perception" or model.family != "graspgen":
+            raise ValueError(f"ascend_local requires a perception/graspgen bundle, got {model.kind!r}/{model.family!r}")
+        adapter = GraspGenAdapter.from_bundle(validated.bundle_root, model.semantic_identity, model=model)
+        adapter.validate_identity(model.semantic_identity)
+        adapter.validate_deployment(self._deployment_name)
+
         runtime_options: dict[str, object] = {"device_id": self._device_id}
         if self._random_seed is not None:
             runtime_options["random_seed"] = self._random_seed
-        context = RuntimeContext(validated, runtime_options=runtime_options)
-        acl_runtime = AclRuntimeManager()
-        backend = AscendBackend(self._device_id, runtime_manager=acl_runtime)
-        backend.load(context)
-        execution = validated.deployment.execution
-        bindings = validated.deployment.bindings
-        links = validated.deployment.device_links
-        self._plan = build_execution_plan(execution, bindings, links)
-        self._first_role = execution[0]
-        self._backend = backend
+        session = GraspGenAscendSession(device_id=self._device_id, config=adapter.config)
+        try:
+            session.load(RuntimeContext(validated_manifest=validated, runtime_options=runtime_options))
+        except Exception:
+            session.close()
+            raise
+        self._adapter = adapter
+        self._session = session
         logger.info(
-            "AscendLocalBackend ready (manifest=%s, deployment=%s, device_id=%d, roles=%d)",
+            "AscendLocalBackend ready (manifest=%s, deployment=%s, device_id=%d, roles=%d, point_count=%d)",
             manifest_root,
             self._deployment_name,
             self._device_id,
-            len(execution),
+            len(validated.deployment.execution),
+            adapter.config.point_count,
         )
 
     def sample(
@@ -404,8 +410,8 @@ class AscendLocalBackend:
         topk_num_grasps: int,
     ) -> tuple[np.ndarray, np.ndarray, float]:
         self._ensure_loaded()
-        from inference_service.backends import InferenceRequest
-        from inference_service.codecs import BoundInputs, BoundTensor
+        from inference_manifest import GRASPGEN_CONFIDENCE_SEMANTIC, GRASPGEN_POSE_SEMANTIC
+        from inference_service.generic_runtime import NamedTensorRequest
 
         points = np.asarray(object_pc, dtype=np.float32)
         if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
@@ -413,62 +419,97 @@ class AscendLocalBackend:
         if not np.isfinite(points).all():
             raise ValueError("object_pc contains non-finite values")
 
-        role_inputs = {role: BoundInputs(tensors=()) for role in self._plan.role_names}
-        role_inputs[self._first_role] = BoundInputs(
-            tensors=(
-                BoundTensor(
-                    semantic="observation.object_points",
-                    runtime_name=None,
-                    index=0,
-                    value=points,
-                ),
+        # The adapter owns cleaning, capping, centring and kappa scaling, and hands
+        # back the centre so the decoded grasps return to the camera frame.
+        inputs, object_center = self._adapter.prepare(points)
+        batches = _graspgen_inference_batches(num_grasps, _DEFAULT_MAX_INFERENCE_GRASPS_PER_BATCH)
+        if len(batches) > 1:
+            logger.info(
+                "Running Ascend GraspGen inference in %d batches: total=%d max_batch=%d",
+                len(batches),
+                num_grasps,
+                _DEFAULT_MAX_INFERENCE_GRASPS_PER_BATCH,
             )
-        )
+
+        all_poses = []
+        all_confidence = []
+        backend_seconds = 0.0
         started = time.perf_counter()
-        result = self._backend.infer(
-            InferenceRequest(
-                request_id=f"ascend_local_{uuid.uuid4().hex}",
-                inputs={"execution_plan": self._plan, "role_inputs": role_inputs},
-            )
-        )
+        # Keep a complete multi-batch request on one uninterrupted random stream.
+        # The session owns a persistent Generator, so each infer call consumes
+        # fresh diffusion noise without resetting the configured seed.
+        with self._sample_lock:
+            for index, batch_size in enumerate(batches, start=1):
+                result = self._session.infer(
+                    NamedTensorRequest(
+                        request_id=f"ascend_local_{uuid.uuid4().hex}",
+                        inputs=inputs,
+                    )
+                )
+                # Current GraspGen OM files have a static batch of 1000. For a
+                # partial final batch, retain only the requested number of raw
+                # samples so num_grasps keeps the same meaning as the CUDA path.
+                # Slicing happens before decoding because postprocess sorts.
+                if batch_size < len(np.asarray(result.outputs[GRASPGEN_CONFIDENCE_SEMANTIC]).reshape(-1)):
+                    result = replace(
+                        result,
+                        outputs={
+                            GRASPGEN_POSE_SEMANTIC: np.asarray(result.outputs[GRASPGEN_POSE_SEMANTIC])[:batch_size],
+                            GRASPGEN_CONFIDENCE_SEMANTIC: np.asarray(
+                                result.outputs[GRASPGEN_CONFIDENCE_SEMANTIC]
+                            ).reshape(-1)[:batch_size],
+                        },
+                    )
+                candidates = self._adapter.postprocess(
+                    result,
+                    object_center=object_center,
+                    max_grasps=0,
+                    min_confidence=float(grasp_threshold),
+                )
+                if candidates:
+                    all_poses.append(np.stack([candidate.pose_matrix for candidate in candidates]))
+                    all_confidence.append(
+                        np.asarray([candidate.confidence for candidate in candidates], dtype=np.float32)
+                    )
+                backend_seconds += result.latency.backend_ms / 1000.0
+                logger.info(
+                    "AscendLocalBackend batch %d/%d kept %d grasps",
+                    index,
+                    len(batches),
+                    len(candidates),
+                )
+
         inference_seconds = time.perf_counter() - started
-        outputs = result.action
-        head_outputs = outputs.get("discriminator_head") if isinstance(outputs, dict) else None
-        if not isinstance(head_outputs, dict) or len(head_outputs) < 2:
-            raise RuntimeError("AscendLocalBackend did not return discriminator_head outputs")
-        ordered = tuple(head_outputs.values())
-        poses = np.asarray(ordered[0], dtype=np.float32)
-        confidence = np.asarray(ordered[1], dtype=np.float32).reshape(-1)
-        if poses.shape[-2:] != (4, 4):
-            raise RuntimeError(f"AscendLocalBackend poses have unexpected shape {poses.shape}")
-        keep = confidence >= np.float32(grasp_threshold)
-        poses = poses[keep]
-        confidence = confidence[keep]
-        if topk_num_grasps > 0 and len(confidence) > topk_num_grasps:
-            order = np.argsort(-confidence, kind="stable")[:topk_num_grasps]
-            poses = poses[order]
-            confidence = confidence[order]
-        stage_timing = result.metadata.get("graspgen_timing_ms")
-        stage_timing_text = ""
-        if isinstance(stage_timing, Mapping):
-            stage_timing_text = " ".join(
-                f"{name}={float(duration_ms):.1f}" for name, duration_ms in stage_timing.items()
+        if not all_poses:
+            return (
+                np.zeros((0, 4, 4), dtype=np.float32),
+                np.zeros((0,), dtype=np.float32),
+                inference_seconds,
             )
+        poses = np.concatenate(all_poses, axis=0)
+        confidence = np.concatenate(all_confidence, axis=0)
+        # Each batch arrives sorted on its own, so re-sort across batches to keep the
+        # adapter's confidence-descending contract whether or not topk trims the tail.
+        order = np.argsort(-confidence, kind="stable")
+        if topk_num_grasps > 0:
+            order = order[:topk_num_grasps]
+        poses = poses[order]
+        confidence = confidence[order]
         logger.info(
-            "AscendLocalBackend completed: grasps=%d wall_s=%.3f backend_s=%.3f denoiser_steps=%s stages_ms=%s",
+            "AscendLocalBackend completed: batches=%d grasps=%d wall_s=%.3f backend_s=%.3f denoiser_steps=%d",
+            len(batches),
             len(confidence),
             inference_seconds,
-            result.backend_latency_ms / 1000.0,
-            result.metadata.get("graspgen_denoiser_steps"),
-            stage_timing_text,
+            backend_seconds,
+            self._adapter.config.diffusion_steps,
         )
         return poses, confidence, inference_seconds
 
     def warmup(self, object_pc: np.ndarray) -> None:
         """Run inference without consuming the configured request random stream."""
         self._ensure_loaded()
-        assert self._backend is not None
-        random_generator = self._backend._random  # noqa: SLF001 - paired backend integration.
+        assert self._session is not None
+        random_generator = self._session._random  # noqa: SLF001 - paired session integration.
         random_state = None if random_generator is None else deepcopy(random_generator.bit_generator.state)
         try:
             self.sample(
@@ -1335,7 +1376,7 @@ class GraspGenWrapper:
         remote_310p_root: str = "/root/GraspGen",
         remote_310p_timeout_sec: float = 120.0,
         ascend_local_manifest_path: str = "",
-        ascend_local_deployment_name: str = "ascend",
+        ascend_local_deployment_name: str = "ascend_310p",
         ascend_local_device_id: int = 0,
         ascend_local_random_seed: int | None = None,
     ):

@@ -283,6 +283,11 @@ IK/FK、TF 和舵机误差保留 `0.001 m` 容差；超过该范围的候选在 
 best-effort 方式写入 pose diagnostics，诊断异常不会阻止闭爪或后续验证。执行器不再退回 pregrasp 或切换
 候选。这样所有可恢复的候选淘汰都发生在低位运动之前，避免机械臂到达物体后因边界测量噪声突然上升。
 
+`candidate_target_offset_base_m` 是候选目标在 `base_frame` 中的三轴平移补偿。它统一作用于 grasp、approach、
+lift 和规划接触点，不改变相机测得的物体宽度端点。SO101 hand-eye profile 使用旧 310P marker test
+验证过的 `[0.0, 0.0, -0.008]`；该值属于机器人/手眼执行几何，因此由 robot YAML 管理，action 客户端不提供
+覆盖参数。
+
 `target_gripper.ik_orientation_guard` 约束 position-only IK 的实际 FK 朝向。SO101 的 joint5 对 TCP 位置
 几乎不产生梯度，因此超出执行门限时会保持在 seed 附近；执行器将超限 joint5 seed 翻转 `±π`，让固定指和
 活动指换侧，再比较 GraspGen 目标和实际 FK 的接近轴、180° 对称闭合轴直线及固定指内侧关系。当前配置使用：
@@ -292,14 +297,45 @@ ik_orientation_guard:
   enabled: true
   approach_axis_ee: [0.0, 0.0, 1.0]
   closing_axis_180_symmetric: true
-  joint5_abs_max: 2.0
+  joint5_home_max_delta_rad: 1.5707963267948966
+  joint5_limit_epsilon_rad: 0.001
+  joint5_stage_continuity: true
+  joint5_stage_max_delta_rad: 1.5707963267948966
   max_approach_error_deg: 25.0
   max_closing_error_deg: 20.0
+  moveit_orientation_search:
+    enabled: true
+    approach_tolerance_deg: 15.0
+    free_rotation_tolerance_deg: 180.0
+    constraint_weight: 1.0
+    max_attempts: 3
 ```
 
-`joint5_abs_max` 只由正式 `manipulation_execution/pick_executor_node` 读取和执行。Hermes 与监督式
-客户端都向同一个 `/manipulation/execute_pick` 发送 `PickObject` goal；执行器先把超过半圈的解
-映射到等价的 `[-π/2, π/2]` 分支，再以该门限和 FK 轴误差决定是否接受候选。
+HOME joint5 由同一 robot YAML 的 `ros2_control.reset_positions["5"]` 提供。初始候选只检查
+`abs(candidate_joint5 - home_joint5) <= joint5_home_max_delta_rad + joint5_limit_epsilon_rad`，不把观察位
+joint5 当作抓取安全原点；候选选定以后，approach、pregrasp、grasp 和 lift 才使用阶段连续性门阻止真正的
+半圈翻腕。Hermes 与监督式客户端都向同一个 `/manipulation/execute_pick` 发送 `PickObject` goal。
+
+MoveIt LMA 仍使用 `position_only_ik: true`。只有初始 FK 接近轴超过 25°硬阈值时，执行器才把上述
+当前 SO101 profile 不启用 `moveit_orientation_search`。LMA 已配置为 position-only，OrientationConstraint
+不会为 5-DOF 机械臂创造额外自由度，反而可能把本应由最终 FK 门禁解释的姿态误差变成 `NO_IK_SOLUTION`。
+最终 IK/FK 结果仍必须通过 25°/20° 硬门禁。
+
+可靠开口参数由 `prepared_candidate_scoring` 声明，因为准备阶段是从这个块里读取它们的：
+
+```yaml
+prepared_candidate_scoring:
+  reliable_max_opening_m: 0.072
+  moving_finger_min_clearance_m: 0.003
+```
+
+这两个值进入 `fixed_finger_envelope_score`，按 `moving_gap = reliable_max_opening_m - far_extent` 折算成
+`moving_score`，再与 `fixed_score` 加权成候选软分数 —— **它们是排序偏好，不是硬拒绝**。把它们写到
+`target_gripper` 下面会让准备阶段读不到，静默回落到硬编码默认值。
+
+真正的固定指硬拒绝是 `target_gripper.fixed_finger_robust_gap`，在降到抓取位姿之后、闭合之前用实测
+接触残差评估一次；不通过则撤回 pregrasp 并以 `FIXED_FINGER_ROBUST_GAP_REJECTED` 继续 candidate
+fallback。准备阶段目前没有对应的前置硬门，规划位姿固定指间隙已为负的候选仍会被执行一次才被拒。
 
 闭合轴的 180° 对称只表示两指闭合直线相同，不表示固定指身份可忽略。执行器必须再用实际 FK 位姿执行
 `fixed_finger_base_side` 硬检查；固定指仍在外侧或目标宽度区间缺失时拒绝当前候选并继续 candidate fallback。
@@ -314,7 +350,7 @@ ik:
 ```
 
 `embodied_pipeline.launch.py` 会自动启动对应数量的隔离 MoveIt worker。正式执行器为整批候选
-固定一份共同 `/joint_states` seed，空闲 worker 从共享动态队列领取下一个候选，并按原候选顺序
+固定一份共同 `/joint_states` seed，并按候选排名固定 round-robin 分配到 worker，再按原候选顺序
 合并结果；最终补偿与运动不进入 worker。候选进入 worker 前的 SO101 mesh/tabletop 检查
 也由该执行器的唯一公共实现完成，使用凸包缓存和批量向量化路径。
 

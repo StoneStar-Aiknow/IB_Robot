@@ -6,7 +6,7 @@ from collections.abc import Mapping
 
 import numpy as np
 
-from inference_manifest import CompiledDeployment, TensorBinding
+from inference_manifest import INTERNAL_SEMANTIC_PREFIX, CompiledDeployment, TensorBinding
 from inference_service.backends.admission import ResourceDomainAdmissions
 from inference_service.backends.ascend.acl_runtime import ACL_RUNTIME_MANAGER, AclRuntimeLease, AclRuntimeManager
 from inference_service.backends.ascend.model import AclModel
@@ -19,6 +19,10 @@ from inference_service.model_sessions.base import ModelSession
 
 class AscendOmModelSession(ModelSession):
     """Execute manifest-declared OM roles using shared ACL leases and model resources."""
+
+    # Subclasses that need extra knobs (a denoising seed, say) widen this rather than
+    # reimplementing _load; anything not listed is still rejected at load time.
+    allowed_runtime_options: frozenset[str] = frozenset({"device_id", "acl_config_path"})
 
     def __init__(
         self,
@@ -63,7 +67,7 @@ class AscendOmModelSession(ModelSession):
             raise BackendLoadError(
                 "AscendOmModelSession requires a compiled Ascend deployment", code="invalid_deployment"
             )
-        unknown_options = sorted(set(context.runtime_options) - {"device_id", "acl_config_path"})
+        unknown_options = sorted(set(context.runtime_options) - self.allowed_runtime_options)
         if unknown_options:
             raise BackendLoadError(
                 f"unknown Ascend model-session options: {unknown_options}", code="invalid_runtime_options"
@@ -134,60 +138,92 @@ class AscendOmModelSession(ModelSession):
         self._linked_inputs = frozenset(linked_inputs)
 
     def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
-        context = self._require_context()
-        deployment = context.deployment
-        if not isinstance(deployment, CompiledDeployment) or not self._models:
-            raise BackendInferenceError("Ascend OM model session is not loaded", code="runtime_not_loaded")
+        deployment = self._loaded_deployment()
         values = dict(request.inputs)
         public_outputs: dict[str, object] = {}
         for role_index, role in enumerate(deployment.execution):
-            bindings = deployment.bindings[role]
-            indexed_inputs: dict[int, np.ndarray] = {}
-            for binding in bindings.inputs:
-                if binding.index is None:
-                    raise BackendInferenceError(
-                        f"Ascend input {binding.semantic!r} has no runtime index", code="invalid_input_bindings"
-                    )
-                if (role, binding.semantic) in self._linked_inputs:
-                    continue
-                try:
-                    indexed_inputs[int(binding.index)] = np.asarray(values[binding.semantic])
-                except KeyError as exc:
-                    raise BackendInferenceError(
-                        f"Ascend role {role!r} is missing semantic input {binding.semantic!r}",
-                        code="missing_semantic_input",
-                    ) from exc
-            public_indices = {
-                int(binding.index)
-                for binding in bindings.outputs
-                if binding.index is not None and not binding.semantic.startswith("internal.")
-            }
-            host_internal_indices = {
-                int(binding.index)
-                for binding in bindings.outputs
-                if binding.index is not None
-                and binding.semantic.startswith("internal.")
-                and any(
-                    later_input.semantic == binding.semantic
-                    for later_role in deployment.execution[role_index + 1 :]
-                    for later_input in deployment.bindings[later_role].inputs
-                    if not any(
-                        link.producer == role and link.consumer == later_role and link.semantic == binding.semantic
-                        for link in deployment.device_links
-                    )
-                )
-            }
-            runtime_outputs = self._models[role].execute(
-                indexed_inputs, read_outputs=public_indices | host_internal_indices
-            )
-            for binding in bindings.outputs:
-                if binding.index is not None and int(binding.index) not in runtime_outputs:
-                    continue
-                output = self._bound_output(role, binding, runtime_outputs)
-                values[binding.semantic] = output
-                if not binding.semantic.startswith("internal."):
-                    public_outputs[binding.semantic] = output
+            for semantic, output in self._run_role(role_index, role, values).items():
+                if not semantic.startswith(INTERNAL_SEMANTIC_PREFIX):
+                    public_outputs[semantic] = output
         return public_outputs
+
+    def _loaded_deployment(self) -> CompiledDeployment:
+        deployment = self._require_context().deployment
+        if not isinstance(deployment, CompiledDeployment) or not self._models:
+            raise BackendInferenceError("Ascend OM model session is not loaded", code="runtime_not_loaded")
+        return deployment
+
+    def _run_role(self, role_index: int, role: str, values: dict[str, object]) -> dict[str, np.ndarray]:
+        """Execute one manifest role and write its outputs back into ``values``.
+
+        Sessions whose roles are joined by the compiled graph alone walk ``execution``
+        straight through, but a host-orchestrated model computes tensors between roles and
+        drives them one at a time. Both need identical binding, device-link and
+        read-selection behaviour per role, so that behaviour lives here rather than in the
+        loop that happens to call it.
+        """
+        runtime_outputs = self._models[role].execute(
+            self._role_inputs(role, values),
+            read_outputs=self._role_read_indices(role_index, role),
+        )
+        outputs: dict[str, np.ndarray] = {}
+        for binding in self._loaded_deployment().bindings[role].outputs:
+            if binding.index is not None and int(binding.index) not in runtime_outputs:
+                continue
+            output = self._bound_output(role, binding, runtime_outputs)
+            values[binding.semantic] = output
+            outputs[binding.semantic] = output
+        return outputs
+
+    def _role_inputs(self, role: str, values: Mapping[str, object]) -> dict[int, np.ndarray]:
+        """Gather one role's runtime inputs, skipping the slots a device link already fills."""
+        indexed_inputs: dict[int, np.ndarray] = {}
+        for binding in self._loaded_deployment().bindings[role].inputs:
+            if binding.index is None:
+                raise BackendInferenceError(
+                    f"Ascend input {binding.semantic!r} has no runtime index", code="invalid_input_bindings"
+                )
+            if (role, binding.semantic) in self._linked_inputs:
+                continue
+            try:
+                indexed_inputs[int(binding.index)] = np.asarray(values[binding.semantic])
+            except KeyError as exc:
+                raise BackendInferenceError(
+                    f"Ascend role {role!r} is missing semantic input {binding.semantic!r}",
+                    code="missing_semantic_input",
+                ) from exc
+        return indexed_inputs
+
+    def _role_read_indices(self, role_index: int, role: str) -> set[int]:
+        """Select the output slots worth copying back to the host for one role.
+
+        Everything that leaves the compiled graph is read, plus any internal tensor a later
+        role consumes over something other than a device link - those still have to travel
+        through host memory.
+        """
+        deployment = self._loaded_deployment()
+        bindings = deployment.bindings[role]
+        public_indices = {
+            int(binding.index)
+            for binding in bindings.outputs
+            if binding.index is not None and not binding.semantic.startswith(INTERNAL_SEMANTIC_PREFIX)
+        }
+        host_internal_indices = {
+            int(binding.index)
+            for binding in bindings.outputs
+            if binding.index is not None
+            and binding.semantic.startswith(INTERNAL_SEMANTIC_PREFIX)
+            and any(
+                later_input.semantic == binding.semantic
+                for later_role in deployment.execution[role_index + 1 :]
+                for later_input in deployment.bindings[later_role].inputs
+                if not any(
+                    link.producer == role and link.consumer == later_role and link.semantic == binding.semantic
+                    for link in deployment.device_links
+                )
+            )
+        }
+        return public_indices | host_internal_indices
 
     def _close(self) -> None:
         models = self._models

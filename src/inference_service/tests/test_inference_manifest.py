@@ -566,31 +566,124 @@ def test_vla_bindings_allow_declared_state_and_action_padding(tmp_path, policy_t
     assert validated.policy.policy_type == policy_type
 
 
-def test_graspgen_compiled_deployment_accepts_grasp_outputs_without_action(tmp_path):
-    paths = tuple(
-        path for path in create_policy_bundle(tmp_path, policy_type="graspgen") if path != "model.safetensors"
-    )
-    manifest = make_manifest(
-        tmp_path,
-        paths,
-        deployment_name="ascend",
-        compiled=True,
-        backend="ascend",
-        policy_type="graspgen",
-    )
+def _host_orchestrated_manifest(tmp_path) -> tuple[dict, dict]:
+    """A two-role perception deployment joined by the host, plus its second role's bindings.
+
+    The first role consumes what the caller declared and hands an ``internal.`` embedding
+    to the second over a device link. The second also consumes a ``host.`` tensor the host
+    computes between them, and the semantic the service publishes is integrated on the
+    host from that role's raw output rather than read out of a slot. This is the shape
+    GraspGen has, expressed with nothing GraspGen-specific in it.
+    """
+    paths = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, paths)
+    manifest["model"]["outputs"] = [{"semantic": "grasp.poses", "dtype": "float32", "shape": [-1, 4, 4]}]
     deployment = manifest["deployments"]["ascend"]
-    deployment["target"] = {"soc": "Ascend310P3", "runtime": "acl"}
-    deployment["artifacts"]["policy"]["format"] = "om"
+    encoder = deployment["bindings"]["model"]
+    encoder["outputs"] = [
+        {
+            "semantic": "internal.embedding",
+            "runtime_name": "embedding",
+            "index": 0,
+            "dtype": "float32",
+            "shape": [1, 512],
+        }
+    ]
+    head = {
+        "inputs": [
+            {
+                "semantic": "internal.embedding",
+                "runtime_name": "object_embedding",
+                "index": 0,
+                "dtype": "float32",
+                "shape": [1, 512],
+            },
+            {
+                "semantic": "host.sample",
+                "runtime_name": "sample",
+                "index": 1,
+                "dtype": "float32",
+                "shape": [16, 6],
+            },
+        ],
+        "outputs": [
+            {
+                "semantic": "host.logits",
+                "runtime_name": "logits",
+                "index": 0,
+                "dtype": "float32",
+                "shape": [16, 1],
+            }
+        ],
+    }
+    head_artifact = "artifacts/head.om"
+    (tmp_path / head_artifact).write_bytes(b"compiled-head")
+    deployment["artifacts"]["head"] = {"path": head_artifact, "format": "om"}
+    deployment["execution"] = ["model", "head"]
+    deployment["bindings"]["head"] = head
+    deployment["device_links"] = [
+        {
+            "semantic": "internal.embedding",
+            "producer": "model",
+            "consumer": "head",
+            "transport": "device_pointer",
+            "owner": "producer",
+        }
+    ]
+    return manifest, head
+
+
+def test_host_orchestrated_deployment_need_not_bind_every_declared_semantic(tmp_path):
+    """``grasp.poses`` is integrated between roles, so no OM slot carries it."""
+    manifest, _ = _host_orchestrated_manifest(tmp_path)
     write_manifest(tmp_path, manifest)
 
     validated = load_inference_manifest(tmp_path, "ascend")
 
-    assert validated.policy.policy_type == "graspgen"
-    assert "grasp.poses" in validated.policy.output_features
-    assert "grasp.confidence" in validated.policy.output_features
-    outputs = {b.semantic for b in validated.deployment.bindings["policy"].outputs}
-    assert outputs == {"grasp.poses", "grasp.confidence"}
-    assert validated.deployment.execution == ("policy",)
+    assert validated.deployment.execution == ("model", "head")
+    assert {descriptor.semantic for descriptor in validated.manifest.model.outputs} == {"grasp.poses"}
+
+
+def test_host_inputs_do_not_need_an_in_graph_producer(tmp_path):
+    """``host.sample`` has no producing role by construction, unlike an ``internal.`` tensor."""
+    manifest, head = _host_orchestrated_manifest(tmp_path)
+    write_manifest(tmp_path, manifest)
+
+    inputs = load_inference_manifest(tmp_path, "ascend").deployment.bindings["head"].inputs
+
+    assert [binding.semantic for binding in inputs] == ["internal.embedding", "host.sample"]
+    assert head["inputs"][1]["semantic"].startswith("host.")
+
+
+def test_internal_inputs_still_need_an_in_graph_producer(tmp_path):
+    """Relaxing the producer rule for ``host.`` must not relax it for ``internal.``."""
+    manifest, head = _host_orchestrated_manifest(tmp_path)
+    head["inputs"][1]["semantic"] = "internal.sample"
+    write_manifest(tmp_path, manifest)
+
+    with pytest.raises(ManifestValidationError, match="internal.sample"):
+        load_inference_manifest(tmp_path, "ascend")
+
+
+def test_host_orchestration_does_not_excuse_an_undeclared_external_binding(tmp_path):
+    """The ``missing`` check relaxes; the ``unexpected`` check does not."""
+    manifest, head = _host_orchestrated_manifest(tmp_path)
+    head["inputs"][1]["semantic"] = "gripper.width"
+    write_manifest(tmp_path, manifest)
+
+    with pytest.raises(ManifestValidationError, match="undeclared semantic input bindings"):
+        load_inference_manifest(tmp_path, "ascend")
+
+
+def test_a_straight_through_deployment_still_binds_every_declared_semantic(tmp_path):
+    """Without a ``host.`` binding the 1:1 mapping stays strict."""
+    paths = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, paths)
+    manifest["model"]["outputs"].append({"semantic": "tag_scores", "dtype": "float32", "shape": [1, 4585]})
+    write_manifest(tmp_path, manifest)
+
+    with pytest.raises(ManifestValidationError, match="omits declared semantic output bindings"):
+        load_inference_manifest(tmp_path, "ascend")
 
 
 @pytest.mark.parametrize("layout", ["NCHW", "NHWC"])

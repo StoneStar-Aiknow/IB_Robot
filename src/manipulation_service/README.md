@@ -53,13 +53,17 @@ RealSense 顶置相机调试时常用的话题为：
 
 ## 环境与依赖
 
-当前路径使用 pip 安装的 GraspGen：`manipulation_service` 在同一 Python 进程中导入
-`grasp_gen`，并用 CUDA 执行推理。GraspGen 不再放在 `libs/` 下；安装脚本会把
-固定上游源码作为 editable pip 依赖放到 workspace venv 的 `src/` 缓存中。
+CUDA 路径使用 pip 安装的 GraspGen：`manipulation_service` 在同一 Python 进程中导入
+`grasp_gen`。Ascend 本地路径通过统一 `inference_manifest.json` 加载 GraspGen OM 子图。
+两个后端都把 `num_grasps` 按每批最多 1000 拆分，并在所有批次合并后执行一次全局
+`topk_num_grasps`；该值小于等于 0 时保留全部达到阈值的候选。Ascend 各批次连续消耗同一个随机流，
+避免重复候选。GraspGen 不再放在
+`libs/` 下；安装脚本会把固定上游源码作为 editable pip 依赖放到 workspace venv 的 `src/` 缓存中。
 
 运行前需要满足：
 
-- 当前环境可用 CUDA PyTorch；上游 `GraspGenSampler` 内部会把模型和点云移到 CUDA。
+- 使用 `local_cuda` 时当前环境需有可用 CUDA PyTorch；上游 `GraspGenSampler` 内部会把模型和点云移到 CUDA。
+- 使用 `ascend_local` 时需有可加载的 Ascend GraspGen manifest/OM bundle 和 ACL 运行环境。
 - 已通过 `./scripts/setup.sh --with-grasp` 安装 `grasp_gen` 和 `pointnet2_ops`。
 - GraspGen 模型文件在 `models/grasp/`，或通过 `GRASPGEN_MODEL_DIR` 指定。
 - 已构建 `manipulation_service` 和 `ibrobot_msgs`。

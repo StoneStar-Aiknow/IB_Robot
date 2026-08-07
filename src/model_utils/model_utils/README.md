@@ -321,28 +321,85 @@ python3 -m model_utils.pi05_export.convert_om \
 
 ## GraspGen Ascend Packaging
 
+从 GraspGen checkpoint 到板端可加载 bundle 共三步，三步都有对应的 console entry point，
+不需要 `python3 -m`：checkpoint → `graspgen.onnx.json` → `graspgen.om.json` 与八个 OM →
+统一 `inference_manifest.json`。
+
+前两步（导出与编译）是 `model_utils` 的工具，记录在本节；**第 3 步打包由
+`perception_service` 提供**——GraspGen 是 `kind="perception"` 模型，bundle 的读者是
+perception_service 的 adapter 与 typed `GenerateGrasps` service，写者与读者同包。
+bundle 布局、adapter asset、named deployment 与 conformance 见
+`src/perception_service/README.md` 的 GraspGen 章节。GraspGen **不是** policy family，
+不出现在本文件末尾的策略支持矩阵中。
+
+### 1. 导出八个 ONNX 子图
+
+```bash
+source .shrc_local
+
+ros2 run model_utils graspgen-export-onnx \
+    --config /path/to/gripper.yaml \
+    --generator-checkpoint /path/to/generator.pth \
+    --discriminator-checkpoint /path/to/discriminator.pth \
+    --output-dir /path/to/onnx \
+    --grasp-batch-size 1000
+```
+
+导出后每个子图都会用相同输入跑一次 PyTorch 与 onnxruntime 对比，超出容差即失败退出：删除
+已写出的图和 manifest，不会留下"导出成功但数值不对"的产物。基线容差是
+`max_relative<=1e-4`、`mean_relative<=1e-5`、`cosine>=1-1e-6`；确需重新标定时用
+`--verify-tolerance-scale` 按倍数放宽（例如 `--verify-tolerance-scale 10`），它用于重新
+标定基线，不是用来掩盖回归。`--skip-verify` 只应在没有 onnxruntime 的主机上临时使用。
+
+`--artifacts` 可只重导子集（角色名见 `inference_manifest.GRASPGEN_EXECUTION`）；
+`--disable-constant-folding` / `--disable-simplify` 关闭默认开启的图清理。
+
+`graspgen.onnx.json` 会写入 `contract_version`，取自
+`inference_manifest.graspgen.GRASPGEN_CONTRACT_VERSION`——执行角色顺序或 PointNet++ 采样
+几何变更时该版本号会 bump，packager 拒绝打包版本不一致的导出，避免用旧图编出的 OM 被新
+backend 用错误的分组驱动。遇到该报错时按本节重跑导出即可。
+
+### 2. 编译 OM
+
+```bash
+ros2 run model_utils graspgen-onnx-to-om \
+    --manifest /path/to/onnx/graspgen.onnx.json \
+    --output-dir /path/to/compiled_om \
+    --soc-version Ascend310P3
+```
+
+输出 `<role>.om` 与记录 ATC 参数、来源 manifest 的 `graspgen.om.json`。`--skip-existing`
+复用已编译产物，`--dry-run` 只打印 ATC 命令，`--atc-path` / `--atc-arg` 覆盖 CANN 查找和
+额外编译参数。
+
+### 3. 打包统一 bundle（perception_service 命令）
+
 GraspGen 的八个 OM 必须使用 ACL runtime introspection 得到的实际 ABI，不能使用 ONNX
 tensor name 代替编译后 ABI。默认情况下，packager 会在 sidecar 缺失时使用本机 Ascend
 device 检查 OM，并把 `<role>.om.abi.json` 写入 `--om-abi-dir`：
 
 ```bash
-source .shrc_local
-
-ros2 run model_utils package-graspgen-ascend-deployment \
+ros2 run perception_service package_graspgen_ascend_bundle \
     --bundle-root /path/to/graspgen_bundle \
-    --onnx-manifest /path/to/graspgen.onnx.json \
+    --onnx-manifest /path/to/onnx/graspgen.onnx.json \
     --om-dir /path/to/compiled_om \
     --om-abi-dir /path/to/runtime_abi \
     --abi-device-id 0 \
-    --soc-version Ascend310P1
+    --soc-version Ascend310P3
 ```
 
 ABI 目录需要包含 `generator_sa1.om.abi.json` 到
 `discriminator_head.om.abi.json` 的全部八个 sidecar。已有 sidecar 不会重新生成；在无 Ascend
 device 的打包主机上需要提前生成全部 sidecar，并传入 `--no-inspect-missing-abi`。Packager 按
 runtime index 绑定 GraspGen semantic，并保留 ACL 实际暴露的 tensor name、dtype 和 shape。
+八个角色全部解析成功后才落盘，任一 OM 或 ABI 缺失都不会留下半成品 bundle。
 
-GraspGen packager 会把运行时 artifact 复制到唯一 generation，并在 manifest 中记录
+打包产物是 perception bundle，不含任何 LeRobot 资产（没有 `config.json` /
+`policy_preprocessor.json` / `policy_postprocessor.json`）；模型常量写在
+`assets/adapter.json` 里，由 `perception_service.graspgen_adapter.GraspGenAdapter`
+读回。参数含义与运行时配置见 `src/perception_service/README.md`。
+
+Packager 会把运行时 artifact 复制到唯一 generation，并在 manifest 中记录
 bundle-relative path。发布和部署时应手动传输完整 bundle 目录；板端不需要保留 `--om-dir`
 或 `--om-abi-dir` 指向的构建输入。schema v2 不对大文件记录或启动时计算 SHA-256；identity
 由 UUID、revision 和轻量结构摘要组成。

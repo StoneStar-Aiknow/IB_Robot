@@ -19,6 +19,7 @@
   <exec_depend>cv_bridge</exec_depend>
   <exec_depend>inference_manifest</exec_depend>
   <exec_depend>inference_service</exec_depend>
+  <exec_depend>perception_service</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
 

@@ -9,13 +9,15 @@
 
 This package ports the upstream ModelZoo-PyTorch/ACL_PyTorch GraspGen toolchain
 into IB-Robot so that the eight compiled Ascend OM sub-graphs can be produced
-from a single command and packaged into a unified ``inference_manifest.json``
-that the standard ``inference_service.backends.ascend.AscendBackend`` consumes.
+from a single command. Export stops there: GraspGen is a perception model, so
+the bundle it goes into is written by
+``perception_service.package_graspgen_ascend_bundle`` alongside the other
+perception bundles, and the host-side geometry (FPS / ball-query / grouping),
+the dual DDPM schedulers and the SO(3) helpers live next to it in
+``perception_service.graspgen_geometry``.
 
-The host-side geometry (FPS / ball-query / grouping), the dual DDPM schedulers
-and the SO(3) helpers live in
-``inference_service.backends.ascend.graspgen_runtime`` and are shared between
-the backend runtime and the export-time verification tools.
+The role order, the sampling geometry and the binding semantics all three of
+them share come from ``inference_manifest.graspgen``.
 """
 
 from model_utils.graspgen_export.export_onnx import ARTIFACT_ORDER as ONNX_ARTIFACT_ORDER

@@ -325,6 +325,9 @@ def generate_embodied_nodes(
                                 ),
                                 "detect_service": grasp_execution.get("detect_service", "/perception/grounding_detect"),
                                 "segment_service": grasp_execution.get("segment_service", ""),
+                                "legacy_detect_service": grasp_execution.get(
+                                    "fallback_detect_service", "/grasp_planner/detect_and_segment"
+                                ),
                                 **planner_params,
                             }
                         ],
@@ -364,6 +367,9 @@ def generate_embodied_nodes(
                         ),
                         "grasp_execution_json": json.dumps(grasp_execution),
                         "workspace_json": json.dumps(safety.get("workspace", {})),
+                        "home_joint_positions_json": json.dumps(
+                            robot_config.get("ros2_control", {}).get("reset_positions", {})
+                        ),
                         "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
                         "gripper_open_position": execution.get("gripper_open_position", 1.0),
                         "gripper_closed_position": execution.get("gripper_closed_position", 0.0),

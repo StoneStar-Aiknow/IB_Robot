@@ -60,12 +60,6 @@ class PolicyMetadata(_FrozenModel):
 
     @model_validator(mode="after")
     def require_action_feature(self) -> PolicyMetadata:
-        if self.policy_type == "graspgen":
-            required = {"grasp.poses", "grasp.confidence"}
-            missing = sorted(required - set(self.output_features))
-            if missing:
-                raise ValueError(f"GraspGen config output_features must contain {sorted(required)}; missing {missing}")
-            return self
         if "action" not in self.output_features:
             raise ValueError("LeRobot config output_features must contain 'action'")
         return self

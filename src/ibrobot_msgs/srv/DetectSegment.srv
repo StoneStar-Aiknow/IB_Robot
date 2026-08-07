@@ -1,0 +1,9 @@
+# Request
+string text_prompt
+float32 confidence_threshold
+---
+# Response
+DetectionArray detections
+float32 inference_time_ms
+bool success
+string message

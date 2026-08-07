@@ -48,7 +48,8 @@ class RAMPlusAdapter(PerceptionAdapter):
             raise ValueError("RAM++ class thresholds must be finite")
 
     @classmethod
-    def from_bundle(cls, bundle_root: str | Path, _identity=None) -> RAMPlusAdapter:
+    def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None) -> RAMPlusAdapter:
+        del model
         root = Path(bundle_root)
         identity = json.loads((root / "assets" / "adapter.json").read_text(encoding="utf-8"))
         expected = {

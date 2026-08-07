@@ -22,6 +22,13 @@ import numpy as np
 import torch
 import yaml
 
+from inference_manifest import (
+    GRASPGEN_CONTRACT_VERSION,
+    GRASPGEN_EXECUTION,
+    GRASPGEN_NPOINTS,
+    GRASPGEN_NSAMPLES,
+    graspgen_geometry,
+)
 from model_utils.graspgen_export.modeling import (
     GraspGenDenoiser,
     GraspGenDiscriminatorHead,
@@ -30,16 +37,29 @@ from model_utils.graspgen_export.modeling import (
 )
 
 MANIFEST_NAME = "graspgen.onnx.json"
-ARTIFACT_ORDER = [
-    "generator_sa1",
-    "generator_sa2",
-    "generator_encoder_head",
-    "discriminator_sa1",
-    "discriminator_sa2",
-    "discriminator_encoder_head",
-    "denoiser",
-    "discriminator_head",
-]
+
+# Numerical envelope every exported subgraph must stay inside before its manifest is
+# published. The metrics are normalised by the largest reference activation so that a
+# single envelope covers subgraphs whose outputs span very different magnitudes
+# (PointNet features around 1e0, denoiser noise around 1e0, discriminator logits an
+# order of magnitude higher).
+#
+# The envelope is sized for float32 CPU onnxruntime against float32 CPU PyTorch, where
+# the only legitimate difference is GEMM/Conv reassociation. Measured across all eight
+# subgraphs at production dimensions (opset 14, constant folding on, grasp batch 1000)
+# the worst observed deviation was max_relative 1.8e-6 and mean_relative 3.7e-7 on the
+# denoiser, with cosine 1.0 everywhere; the limits below keep roughly fifty times that
+# headroom. Every structural defect the export can introduce - a mis-mapped weight
+# slice, a dropped bias, a wrong activation, a transposed grouping axis - is at least
+# 1e-2 relative, four orders of magnitude outside, and also breaks the cosine gate.
+# Each run records its own measured numbers under ``artifacts[*].verification`` in the
+# manifest, so the envelope can be re-baselined against real checkpoints;
+# ``--verify-tolerance-scale`` widens it without editing code.
+VERIFY_MAX_RELATIVE = 1e-4
+VERIFY_MEAN_RELATIVE = 1e-5
+VERIFY_COSINE_DEFICIT = 1e-6
+
+ARTIFACT_ORDER = list(GRASPGEN_EXECUTION)
 
 
 @dataclass
@@ -102,46 +122,54 @@ def _artifact_specs(
     denoiser = GraspGenDenoiser.from_state_dict(generator_state)
     scorer = GraspGenDiscriminatorHead.from_state_dict(discriminator_state)
 
+    # The traced example shapes become the OMs' static input shapes, so they have to be
+    # the same neighbourhood sizes the backend groups points into at runtime. The channel
+    # counts come from the checkpoints: stage two sees stage one's 128 features plus the
+    # 3 relative coordinates, and the head sees stage two's 256 plus the same 3.
+    stage1_shape = (1, 3, GRASPGEN_NPOINTS[0], GRASPGEN_NSAMPLES[0])
+    stage2_shape = (1, 131, GRASPGEN_NPOINTS[1], GRASPGEN_NSAMPLES[1])
+    head_shape = (1, 259, 1, GRASPGEN_NPOINTS[1])
+
     return {
         "generator_sa1": ExportArtifact(
             "generator_sa1",
             generator_sa1,
-            (torch.randn(1, 3, 256, 64),),
+            (torch.randn(*stage1_shape),),
             ["grouped_features"],
             ["features"],
         ),
         "generator_sa2": ExportArtifact(
             "generator_sa2",
             generator_sa2,
-            (torch.randn(1, 131, 64, 128),),
+            (torch.randn(*stage2_shape),),
             ["grouped_features"],
             ["features"],
         ),
         "generator_encoder_head": ExportArtifact(
             "generator_encoder_head",
             generator_head,
-            (torch.randn(1, 259, 1, 64),),
+            (torch.randn(*head_shape),),
             ["grouped_features"],
             ["object_embedding"],
         ),
         "discriminator_sa1": ExportArtifact(
             "discriminator_sa1",
             discriminator_sa1,
-            (torch.randn(1, 3, 256, 64),),
+            (torch.randn(*stage1_shape),),
             ["grouped_features"],
             ["features"],
         ),
         "discriminator_sa2": ExportArtifact(
             "discriminator_sa2",
             discriminator_sa2,
-            (torch.randn(1, 131, 64, 128),),
+            (torch.randn(*stage2_shape),),
             ["grouped_features"],
             ["features"],
         ),
         "discriminator_encoder_head": ExportArtifact(
             "discriminator_encoder_head",
             discriminator_head,
-            (torch.randn(1, 259, 1, 64),),
+            (torch.randn(*head_shape),),
             ["grouped_features"],
             ["object_embedding"],
         ),
@@ -184,12 +212,57 @@ def _cosine(reference: np.ndarray, candidate: np.ndarray) -> float:
     return float(np.dot(first, second) / (first_norm * second_norm))
 
 
-def _verify_onnx(path: Path, artifact: ExportArtifact) -> None:
+def _output_metrics(reference: np.ndarray, candidate: np.ndarray) -> dict[str, float]:
+    """Measure one output against its PyTorch reference, absolutely and relatively."""
+    reference64 = reference.astype(np.float64)
+    diff = np.abs(reference64 - candidate.astype(np.float64))
+    scale = float(np.max(np.abs(reference64)))
+    if not scale > 0.0:
+        # An all-zero reference has no relative scale; fall back to the absolute
+        # numbers so a nonzero candidate still trips the gate instead of dividing
+        # by zero into a NaN that compares false against every limit.
+        scale = 1.0
+    return {
+        "max_abs": float(diff.max()),
+        "mean_abs": float(diff.mean()),
+        "max_relative": float(diff.max()) / scale,
+        "mean_relative": float(diff.mean()) / scale,
+        "cosine": _cosine(reference, candidate),
+        "reference_scale": scale,
+    }
+
+
+def _tolerance_violations(name: str, metrics: dict[str, float], tolerance_scale: float) -> list[str]:
+    max_limit = VERIFY_MAX_RELATIVE * tolerance_scale
+    mean_limit = VERIFY_MEAN_RELATIVE * tolerance_scale
+    cosine_limit = 1.0 - VERIFY_COSINE_DEFICIT * tolerance_scale
+    violations = []
+    if not metrics["max_relative"] <= max_limit:
+        violations.append(f"{name} max_relative={metrics['max_relative']:.6e} exceeds {max_limit:.6e}")
+    if not metrics["mean_relative"] <= mean_limit:
+        violations.append(f"{name} mean_relative={metrics['mean_relative']:.6e} exceeds {mean_limit:.6e}")
+    if not metrics["cosine"] >= cosine_limit:
+        violations.append(f"{name} cosine={metrics['cosine']:.8f} below {cosine_limit:.8f}")
+    return violations
+
+
+def _verify_onnx(path: Path, artifact: ExportArtifact, tolerance_scale: float = 1.0) -> dict[str, dict[str, float]]:
+    """Compare the exported graph against PyTorch and fail closed outside the envelope.
+
+    Returns the measured metrics so the manifest can publish the numbers the gate was
+    decided on. Raises ``RuntimeError`` when any output leaves the envelope; the caller
+    is responsible for making sure neither the graph nor a manifest describing it is
+    published after that.
+    """
     try:
         ort = importlib.import_module("onnxruntime")
-    except ImportError:
-        print("  onnxruntime is not installed; skipping numerical verification")
-        return
+    except ImportError as error:
+        # Silently skipping verification would publish an unverified graph under the
+        # same manifest shape as a verified one, so an unusable verifier is a failure.
+        raise RuntimeError(
+            "onnxruntime is required to verify exported GraspGen subgraphs; "
+            "install it or pass --skip-verify to export without numerical verification"
+        ) from error
 
     feed = {
         name: tensor.detach().cpu().numpy()
@@ -199,13 +272,20 @@ def _verify_onnx(path: Path, artifact: ExportArtifact) -> None:
     onnx_outputs = session.run(None, feed)
     with torch.no_grad():
         torch_outputs = _as_output_list(artifact.model(*artifact.example_inputs))
+
+    metrics: dict[str, dict[str, float]] = {}
+    violations: list[str] = []
     for name, reference, candidate in zip(artifact.output_names, torch_outputs, onnx_outputs, strict=True):
-        reference_np = reference.detach().cpu().numpy()
-        diff = np.abs(reference_np.astype(np.float64) - candidate.astype(np.float64))
+        measured = _output_metrics(reference.detach().cpu().numpy(), candidate)
+        metrics[name] = measured
         print(
-            f"  verify {name}: max_abs={diff.max():.6e}, "
-            f"mean_abs={diff.mean():.6e}, cosine={_cosine(reference_np, candidate):.8f}"
+            f"  verify {name}: max_abs={measured['max_abs']:.6e}, "
+            f"mean_abs={measured['mean_abs']:.6e}, cosine={measured['cosine']:.8f}"
         )
+        violations.extend(_tolerance_violations(name, measured, tolerance_scale))
+    if violations:
+        raise RuntimeError(f"ONNX verification failed for {artifact.name}: " + "; ".join(violations))
+    return metrics
 
 
 def _export_artifact(
@@ -215,6 +295,7 @@ def _export_artifact(
     verify: bool,
     constant_folding: bool,
     simplify: bool,
+    tolerance_scale: float = 1.0,
 ) -> dict[str, Any]:
     path = output_dir / f"{artifact.name}.onnx"
     print(f"Exporting {artifact.name} -> {path}")
@@ -243,9 +324,18 @@ def _export_artifact(
         onnx.checker.check_model(model)
         onnx.save(model, str(path))
     operators = Counter(f"{node.domain}::{node.op_type}" if node.domain else node.op_type for node in model.graph.node)
+    verification: dict[str, dict[str, float]] | None = None
     if verify:
-        _verify_onnx(path, artifact)
-    return {
+        try:
+            verification = _verify_onnx(path, artifact, tolerance_scale)
+        except RuntimeError:
+            # A graph that failed the numerical gate must not survive on disk, where a
+            # later onnx2om run would happily compile it into an OM that nothing has
+            # checked. The manifest for this run is never written either, because the
+            # exception propagates out of main() before _write_manifest.
+            path.unlink(missing_ok=True)
+            raise
+    record: dict[str, Any] = {
         "onnx": path.name,
         "inputs": {
             name: list(tensor.shape) for name, tensor in zip(artifact.input_names, artifact.example_inputs, strict=True)
@@ -254,6 +344,9 @@ def _export_artifact(
         "operators": dict(sorted(operators.items())),
         "file_size_bytes": path.stat().st_size,
     }
+    if verification is not None:
+        record["verification"] = verification
+    return record
 
 
 def _write_manifest(
@@ -272,6 +365,7 @@ def _write_manifest(
     data = config["data"]
     manifest = {
         "schema_version": 1,
+        "contract_version": GRASPGEN_CONTRACT_VERSION,
         "model_type": "graspgen",
         "backend": "onnx",
         "source": {
@@ -291,13 +385,9 @@ def _write_manifest(
             "kappa": float(diffusion["kappa"]),
             "diffusion_steps": int(diffusion["num_diffusion_iters_eval"]),
             "compositional_scheduler": bool(diffusion["compositional_schedular"]),
-            "geometry": {
-                "npoints": [256, 64, None],
-                "radii": [0.02, 0.04, None],
-                "nsamples": [64, 128, None],
-                "fps_start_index": 0,
-                "ball_query_order": "input_index",
-            },
+            # One entry per exported set-abstraction stage, so the encoder head's null
+            # stage is listed alongside the two sampled ones.
+            "geometry": graspgen_geometry(include_head_stage=True),
         },
     }
     path = output_dir / MANIFEST_NAME
@@ -317,6 +407,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--opset", type=int, default=14)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--skip-verify", action="store_true")
+    parser.add_argument(
+        "--verify-tolerance-scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Multiplier on the baseline verification envelope "
+            f"(max_relative={VERIFY_MAX_RELATIVE:g}, mean_relative={VERIFY_MEAN_RELATIVE:g}, "
+            f"cosine>=1-{VERIFY_COSINE_DEFICIT:g}); use it to re-baseline, not to hide a regression"
+        ),
+    )
     parser.add_argument(
         "--disable-constant-folding",
         action="store_true",
@@ -341,6 +441,8 @@ def main() -> int:
     args = parse_args()
     if args.grasp_batch_size <= 0:
         raise ValueError("--grasp-batch-size must be positive")
+    if not args.verify_tolerance_scale > 0.0:
+        raise ValueError("--verify-tolerance-scale must be positive")
     torch.manual_seed(args.seed)
 
     config_path = Path(args.config).expanduser().resolve()
@@ -365,6 +467,11 @@ def main() -> int:
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    # The manifest is the publication point: onnx2om and every downstream consumer read
+    # it, not the loose .onnx files. Clearing it before the export means a run that
+    # fails the numerical gate leaves no manifest at all, rather than an older one that
+    # still advertises artifacts this run has just replaced or deleted.
+    (output_dir / MANIFEST_NAME).unlink(missing_ok=True)
     requested = ARTIFACT_ORDER if "all" in args.artifacts else args.artifacts
     specs = _artifact_specs(generator_state, discriminator_state, args.grasp_batch_size)
     artifacts = {
@@ -375,6 +482,7 @@ def main() -> int:
             not args.skip_verify,
             not args.disable_constant_folding,
             not args.disable_simplify,
+            args.verify_tolerance_scale,
         )
         for name in requested
     }

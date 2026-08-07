@@ -364,6 +364,7 @@ def test_handeye_grasp_config_launches_pick_pipeline():
     assert str(planner_params["inference_backend"]).splitlines()[0] == "ascend_local"
     assert str(planner_params["ascend_local_manifest_path"]).splitlines()[0] == "/root/graspgen_310p_bundle"
     assert planner_params["startup_warmup"] is True
+    assert _decode_launch_string(str(planner_params["legacy_detect_service"])) == ("/grasp_planner/detect_and_segment")
     assert "remote_310p_host" not in planner_params
     assert "host_runtime" not in planner_params
     assert _normalize_launch_environment(planner) == {
@@ -373,6 +374,11 @@ def test_handeye_grasp_config_launches_pick_pipeline():
         "OMP_WAIT_POLICY": "PASSIVE",
         "OPENBLAS_NUM_THREADS": "1",
     }
+
+    pick_executor = next(node for node in nodes if vars(node).get("_Node__node_name") == "pick_executor_node")
+    pick_executor_params = _normalize_launch_param_mapping(pick_executor._Node__parameters[0])
+    home_joint_positions = _decode_launch_json_string(str(pick_executor_params["home_joint_positions_json"]))
+    assert home_joint_positions["5"] == 0.0
 
 
 def test_handeye_grasp_launch_auto_starts_parallel_ik_workers(monkeypatch, tmp_path):

@@ -89,7 +89,8 @@ class SAM2Adapter(PerceptionAdapter):
     compiled_abi_finalized = False
 
     @classmethod
-    def from_bundle(cls, bundle_root: str | Path, _identity=None) -> SAM2Adapter:
+    def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None) -> SAM2Adapter:
+        del model
         _read_adapter_identity(Path(bundle_root), cls.identity)
         return cls()
 
@@ -140,7 +141,8 @@ class _SigLIP2Adapter(PerceptionAdapter):
         self.tokenizer = tokenizer
 
     @classmethod
-    def from_bundle(cls, bundle_root: str | Path, identity) -> _SigLIP2Adapter:
+    def from_bundle(cls, bundle_root: str | Path, identity, *, model=None) -> _SigLIP2Adapter:
+        del model
         _read_adapter_identity(Path(bundle_root), cls.identity)
         if identity is None or identity.embedding is None:
             raise ValueError("SigLIP2 manifest semantic_identity must declare embedding metadata")
@@ -250,7 +252,7 @@ class GroundingDetection:
     label: str
     confidence: float
     bbox_xyxy: np.ndarray
-    mask: np.ndarray
+    mask: np.ndarray | None
 
 
 class GroundingDINOAdapter(PerceptionAdapter):
@@ -263,7 +265,8 @@ class GroundingDINOAdapter(PerceptionAdapter):
     compiled_abi_finalized = False
 
     @classmethod
-    def from_bundle(cls, bundle_root: str | Path, _identity=None) -> GroundingDINOAdapter:
+    def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None) -> GroundingDINOAdapter:
+        del model
         _read_adapter_identity(Path(bundle_root), cls.identity)
         return cls()
 
@@ -309,6 +312,15 @@ class GroundingDINOAdapter(PerceptionAdapter):
         ]
 
 
+def _manifest_input_shape(model, semantic: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    """Read a declared input shape from the manifest ModelDescriptor, if available."""
+    if model is not None:
+        for tensor in model.inputs:
+            if tensor.semantic == semantic:
+                return tuple(tensor.shape)
+    return default
+
+
 class GroundingDINORawAdapter(PerceptionAdapter):
     """Manifest adapter for the 310P raw Grounding-DINO execution graph."""
 
@@ -320,15 +332,26 @@ class GroundingDINORawAdapter(PerceptionAdapter):
     )
     compiled_abi_finalized = True
 
+    # Fallback ABI shapes for callers that construct the adapter without a
+    # manifest ModelDescriptor (e.g. bundle-local unit tests); real deployments
+    # derive these from `model.inputs` instead (see `_manifest_input_shape`).
+    _DEFAULT_INPUT_IDS_SHAPE = (1, 8)
+    _DEFAULT_ENCODER_TGT_SHAPE = (1, 900, 256)
+
     @classmethod
-    def from_bundle(cls, bundle_root: str | Path, _identity=None) -> GroundingDINORawAdapter:
+    def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None) -> GroundingDINORawAdapter:
         root = Path(bundle_root)
         _read_adapter_identity(root, cls.identity)
-        tokenizer = BertWordPieceTokenizer(root / "assets" / "bert-base-uncased" / "vocab.txt", sequence_length=8)
+        input_ids_shape = _manifest_input_shape(model, "input_ids", cls._DEFAULT_INPUT_IDS_SHAPE)
+        sequence_length = int(input_ids_shape[-1])
+        tokenizer = BertWordPieceTokenizer(
+            root / "assets" / "bert-base-uncased" / "vocab.txt", sequence_length=sequence_length
+        )
         target_path = root / "assets" / "encoder_tgt.npy"
         target = np.ascontiguousarray(np.load(target_path, allow_pickle=False), dtype=np.float32)
-        if target.shape != (1, 900, 256):
-            raise ValueError(f"Grounding-DINO encoder_tgt must have shape (1,900,256), got {target.shape}")
+        expected_shape = _manifest_input_shape(model, "encoder_tgt", cls._DEFAULT_ENCODER_TGT_SHAPE)
+        if target.shape != expected_shape:
+            raise ValueError(f"Grounding-DINO encoder_tgt must have shape {expected_shape}, got {target.shape}")
         instance = cls()
         instance.tokenizer = tokenizer
         instance.encoder_target = target
@@ -370,9 +393,20 @@ class GroundingDINORawAdapter(PerceptionAdapter):
         if logits.ndim != 3 or logits.shape[0] != 1 or boxes.shape != (1, logits.shape[1], 4):
             raise RuntimeError(f"Grounding-DINO raw outputs have incompatible shapes {logits.shape} and {boxes.shape}")
         probabilities = 1.0 / (1.0 + np.exp(-np.clip(logits[0], -50.0, 50.0)))
-        scores = probabilities[:, : self.tokenizer.sequence_length].max(axis=1)
+        # The "grounding-dino-raw-logits-cxcywh-v1" postprocessing contract packs one
+        # classification logit per BERT prompt token into the leading
+        # `sequence_length` columns of `pred_logits`; columns beyond that are unused
+        # padding and must never contribute to a box's relevance score.
+        prompt_token_columns = self.tokenizer.sequence_length
+        if not 0 < prompt_token_columns <= logits.shape[2]:
+            raise RuntimeError(
+                f"Grounding-DINO {self.identity.postprocessing!r} contract expects prompt token columns "
+                f"in (0, {logits.shape[2]}], got {prompt_token_columns}"
+            )
+        scores = probabilities[:, :prompt_token_columns].max(axis=1)
         selected = np.flatnonzero(scores > float(box_threshold or 0.35))
         height, width = tuple(image_shape or (720, 1280))
+        prompt_input_ids = self.tokenizer.encode(str(prompt))["gdino.input_ids"]
         detections = []
         for index in selected:
             center_x, center_y, box_width, box_height = boxes[0, index]
@@ -391,7 +425,7 @@ class GroundingDINORawAdapter(PerceptionAdapter):
                 continue
             label = (
                 self.tokenizer.decode_probability_mask(
-                    self.tokenizer.encode(str(prompt))["gdino.input_ids"],
+                    prompt_input_ids,
                     probabilities[index],
                     float(text_threshold or 0.25),
                 )
@@ -402,7 +436,7 @@ class GroundingDINORawAdapter(PerceptionAdapter):
                     label=label,
                     confidence=float(scores[index]),
                     bbox_xyxy=xyxy,
-                    mask=np.zeros((height, width), dtype=np.uint8),
+                    mask=None,
                 )
             )
         return detections
@@ -420,7 +454,8 @@ class SAM2PromptAdapter(PerceptionAdapter):
     compiled_abi_finalized = True
 
     @classmethod
-    def from_bundle(cls, bundle_root: str | Path, _identity=None) -> SAM2PromptAdapter:
+    def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None) -> SAM2PromptAdapter:
+        del model
         _read_adapter_identity(Path(bundle_root), cls.identity)
         instance = cls()
         instance.batch_size = 4
@@ -440,7 +475,13 @@ class SAM2PromptAdapter(PerceptionAdapter):
         normalized = (normalized - np.asarray([0.485, 0.456, 0.406], dtype=np.float32)) / np.asarray(
             [0.229, 0.224, 0.225], dtype=np.float32
         )
-        selected = [np.asarray(box, dtype=np.float32).reshape(4) for box in boxes][: self.batch_size]
+        all_boxes = [np.asarray(box, dtype=np.float32).reshape(4) for box in boxes]
+        if len(all_boxes) > self.batch_size:
+            raise ValueError(
+                f"SAM2 box-prompt batch received {len(all_boxes)} boxes but the compiled deployment "
+                f"only accepts {self.batch_size}; upstream detection filtering must cap the batch first"
+            )
+        selected = all_boxes
         if not selected:
             raise ValueError("at least one bounding box is required")
         coords = np.zeros((self.batch_size, 2, 2), dtype=np.float32)

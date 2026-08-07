@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
 
-from inference_service.backends.ascend.graspgen_runtime import (
+from inference_manifest import GRASPGEN_NPOINTS, GRASPGEN_NSAMPLES, GRASPGEN_RADII
+from perception_service.graspgen_geometry import (
     ball_query,
     build_pointnet_geometry,
     furthest_point_sample,
@@ -123,3 +126,17 @@ def test_pointnet_geometry_matches_reference_composition():
     )
     np.testing.assert_array_equal(actual.stage2_indices, stage2_indices)
     np.testing.assert_array_equal(actual.stage2_xyz, stage2_xyz)
+
+
+def test_pointnet_geometry_defaults_come_from_the_shared_contract():
+    """A caller that omits the counts must group points the way the OMs were traced.
+
+    The exporter bakes these counts into the static input shapes of the eight subgraphs,
+    so a default that drifted from ``inference_manifest.graspgen`` would not be caught by
+    any manifest check - the session would simply hand an OM a wrongly sized group.
+    """
+    defaults = inspect.signature(build_pointnet_geometry).parameters
+
+    assert defaults["npoints"].default == GRASPGEN_NPOINTS
+    assert defaults["radii"].default == GRASPGEN_RADII
+    assert defaults["nsamples"].default == GRASPGEN_NSAMPLES

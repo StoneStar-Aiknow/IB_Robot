@@ -1,4 +1,4 @@
-"""Host-side GraspGen runtime helpers shared by the Ascend backend and exporters.
+"""Host-side GraspGen math the session runs between the compiled OM roles.
 
 These functions reproduce the upstream CUDA semantics of NVlabs GraspGen on a
 CPU host so that the eight compiled Ascend OM sub-graphs can be fed deterministic
@@ -6,17 +6,18 @@ inputs. The implementation mirrors the reference runtime shipped with the model
 export pipeline (``ModelZoo-PyTorch/ACL_PyTorch/.../GraspGen/runtime.py``) and
 intentionally avoids any CUDA-specific extension such as ``pointnet2_ops``.
 
-The module is deliberately dependency-free (NumPy only) so it can be imported
-without the Ascend ACL runtime.
+The module is deliberately dependency-free (NumPy only) so the packager, the
+adapter and the tests can import it without the Ascend ACL runtime.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
+
+from inference_manifest import GRASPGEN_NPOINTS, GRASPGEN_NSAMPLES, GRASPGEN_RADII
 
 
 def furthest_point_sample(xyz: np.ndarray, npoint: int) -> np.ndarray:
@@ -121,9 +122,9 @@ class PointNetGeometry:
 
 def build_pointnet_geometry(
     xyz: np.ndarray,
-    npoints: tuple[int, int] = (256, 64),
-    radii: tuple[float, float] = (0.02, 0.04),
-    nsamples: tuple[int, int] = (64, 128),
+    npoints: tuple[int, int] = GRASPGEN_NPOINTS,
+    radii: tuple[float, float] = GRASPGEN_RADII,
+    nsamples: tuple[int, int] = GRASPGEN_NSAMPLES,
 ) -> PointNetGeometry:
     points = np.ascontiguousarray(xyz, dtype=np.float32)
     stage1_fps = furthest_point_sample(points, npoints[0])
@@ -276,32 +277,27 @@ class DDPMSchedulerNumpy:
         return np.ascontiguousarray(previous, dtype=np.float32), np.ascontiguousarray(pred_original, dtype=np.float32)
 
 
-@dataclass
-class GraspGenRuntimeConfig:
-    kappa: float
-    diffusion_steps: int
-    grasp_batch_size: int
-    point_count: int
-    npoints: tuple[int, int]
-    radii: tuple[float, float]
-    nsamples: tuple[int, int]
+def positive_int(value: object, name: str) -> int:
+    """Return ``value`` as a positive int, rejecting bool, float, and non-positive input.
 
-    @classmethod
-    def from_manifest(cls, backend_config: Mapping[str, object]) -> GraspGenRuntimeConfig:
-        geometry_value = backend_config.get("geometry") or {}
-        if not isinstance(geometry_value, Mapping):
-            raise TypeError("GraspGen backend_config.geometry must be a mapping")
-        npoints_raw = list(geometry_value.get("npoints") or [256, 64])
-        radii_raw = list(geometry_value.get("radii") or [0.02, 0.04])
-        nsamples_raw = list(geometry_value.get("nsamples") or [64, 128])
-        if len(npoints_raw) < 2 or len(radii_raw) < 2 or len(nsamples_raw) < 2:
-            raise ValueError("GraspGen geometry manifest must contain two sampled stages")
-        return cls(
-            kappa=float(backend_config.get("kappa", 2.02217)),
-            diffusion_steps=int(backend_config.get("diffusion_steps", 10)),
-            grasp_batch_size=int(backend_config.get("grasp_batch_size", 1000)),
-            point_count=int(backend_config.get("point_count", 2048)),
-            npoints=(int(npoints_raw[0]), int(npoints_raw[1])),
-            radii=(float(radii_raw[0]), float(radii_raw[1])),
-            nsamples=(int(nsamples_raw[0]), int(nsamples_raw[1])),
-        )
+    ``bool`` is a subclass of ``int``, so an ``isinstance`` check would silently accept
+    ``True`` as ``1``; a float would silently truncate. Both are configuration mistakes
+    that must fail at load time rather than produce a degenerate execution plan.
+    """
+    if type(value) is not int:
+        raise ValueError(f"GraspGen {name} must be an int, got {type(value).__name__}")
+    if value <= 0:
+        raise ValueError(f"GraspGen {name} must be positive, got {value}")
+    return value
+
+
+def positive_float(value: object, name: str) -> float:
+    """Return ``value`` as a finite positive float, rejecting bool, NaN, inf, and <= 0."""
+    if isinstance(value, bool) or not isinstance(value, float | int):
+        raise ValueError(f"GraspGen {name} must be a real number, got {type(value).__name__}")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"GraspGen {name} must be finite, got {number}")
+    if number <= 0.0:
+        raise ValueError(f"GraspGen {name} must be positive, got {number}")
+    return number

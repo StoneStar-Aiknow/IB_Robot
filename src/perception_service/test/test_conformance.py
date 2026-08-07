@@ -7,8 +7,36 @@ from perception_service.conformance import (
     ConformanceThresholds,
     embedding_cosine,
     evaluate_backend_conformance,
+    evaluate_grasp_conformance,
+    grasp_pose_error,
     mask_iou,
 )
+
+
+def _pose(translation, rotation=None) -> np.ndarray:
+    pose = np.eye(4, dtype=np.float64)
+    if rotation is not None:
+        pose[:3, :3] = rotation
+    pose[:3, 3] = translation
+    return pose
+
+
+def _rotation_z(degrees: float) -> np.ndarray:
+    angle = np.radians(degrees)
+    return np.asarray(
+        [[np.cos(angle), -np.sin(angle), 0.0], [np.sin(angle), np.cos(angle), 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+
+
+def _grasps() -> dict:
+    poses = [_pose([0.1, 0.2, 0.3]), _pose([0.4, 0.5, 0.6], _rotation_z(30.0))]
+    return {
+        "reference_poses": poses,
+        "candidate_poses": [pose.copy() for pose in poses],
+        "reference_confidences": [0.91, 0.72],
+        "candidate_confidences": [0.90, 0.73],
+    }
 
 
 def _inputs() -> dict:
@@ -87,3 +115,84 @@ def test_metric_helpers_reject_incompatible_tensors() -> None:
         embedding_cosine(np.ones(2), np.ones(3))
     with pytest.raises(ValueError, match="non-zero norm"):
         embedding_cosine(np.zeros(2), np.ones(2))
+
+
+def test_two_backends_that_agree_on_every_grasp_pass_conformance() -> None:
+    report = evaluate_grasp_conformance(**_grasps())
+
+    assert report.passed
+    assert report.metrics["grasp_translation_error_m"] == pytest.approx(0.0)
+    assert report.metrics["grasp_rotation_error_deg"] == pytest.approx(0.0)
+    assert report.metrics["grasp_confidence_delta"] == pytest.approx(0.01)
+    assert report.failures == ()
+
+
+def test_grasps_are_compared_rank_by_rank_rather_than_as_a_set() -> None:
+    """The executor only ever tries the first few, so a reordered list is not equivalent."""
+    inputs = _grasps()
+    inputs["candidate_poses"] = list(reversed(inputs["candidate_poses"]))
+    inputs["candidate_confidences"] = list(reversed(inputs["candidate_confidences"]))
+
+    report = evaluate_grasp_conformance(**inputs)
+
+    assert not report.passed
+    assert set(report.failures) == {
+        "grasp translation error exceeds threshold",
+        "grasp rotation error exceeds threshold",
+        "grasp confidence delta exceeds threshold",
+    }
+
+
+def test_each_grasp_dimension_fails_on_its_own_threshold() -> None:
+    inputs = _grasps()
+    inputs["candidate_poses"] = [_pose([0.1, 0.2, 0.3], _rotation_z(20.0)), _pose([0.4, 0.5, 0.6], _rotation_z(30.0))]
+
+    report = evaluate_grasp_conformance(**inputs)
+
+    assert report.metrics["grasp_translation_error_m"] == pytest.approx(0.0)
+    assert report.metrics["grasp_rotation_error_deg"] == pytest.approx(20.0)
+    assert report.failures == ("grasp rotation error exceeds threshold",)
+
+
+def test_a_backend_that_returns_fewer_grasps_is_not_conformant() -> None:
+    inputs = _grasps()
+    inputs["candidate_poses"] = inputs["candidate_poses"][:1]
+    inputs["candidate_confidences"] = inputs["candidate_confidences"][:1]
+
+    report = evaluate_grasp_conformance(**inputs)
+
+    assert not report.passed
+    assert report.metrics["grasp_count_delta"] == 1
+    assert report.failures == ("grasp count delta exceeds threshold",)
+
+
+def test_grasp_rotation_error_is_geodesic_so_it_survives_the_axis_angle_round_trip() -> None:
+    """``matrix_to_rt``/``rt_to_matrix`` change the representation, not the rotation."""
+    translation, rotation = grasp_pose_error(_pose([0.0, 0.0, 0.0]), _pose([0.003, 0.0, 0.0], _rotation_z(-180.0)))
+
+    assert translation == pytest.approx(0.003)
+    assert rotation == pytest.approx(180.0)
+
+
+def test_comparing_two_empty_grasp_sets_is_conformant_rather_than_an_error() -> None:
+    """A cloud both backends refuse is agreement; it must not divide by an empty maximum."""
+    report = evaluate_grasp_conformance(
+        reference_poses=[], candidate_poses=[], reference_confidences=[], candidate_confidences=[]
+    )
+
+    assert report.passed
+    assert report.metrics == {
+        "grasp_count_delta": 0,
+        "grasp_translation_error_m": 0.0,
+        "grasp_rotation_error_deg": 0.0,
+        "grasp_confidence_delta": 0.0,
+    }
+
+
+def test_grasp_thresholds_are_explicit_and_can_be_tightened() -> None:
+    inputs = _grasps()
+
+    report = evaluate_grasp_conformance(**inputs, thresholds=ConformanceThresholds(maximum_grasp_confidence_delta=0.0))
+
+    assert not report.passed
+    assert report.failures == ("grasp confidence delta exceeds threshold",)

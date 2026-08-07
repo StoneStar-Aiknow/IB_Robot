@@ -17,16 +17,6 @@ POLICY_FEATURES = {
     "output_features": {"action": {"type": "ACTION", "shape": [6]}},
 }
 
-GRASPGEN_POLICY_FEATURES = {
-    "input_features": {
-        "observation.object_points": {"type": "POINTCLOUD", "shape": [2048, 3]},
-    },
-    "output_features": {
-        "grasp.poses": {"type": "POSE", "shape": [1000, 4, 4]},
-        "grasp.confidence": {"type": "CONFIDENCE", "shape": [1000]},
-    },
-}
-
 
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -40,8 +30,7 @@ def create_policy_bundle(
     local_tokenizer: bool = False,
     include_weights: bool = True,
 ) -> tuple[str, ...]:
-    is_graspgen = policy_type == "graspgen"
-    features = GRASPGEN_POLICY_FEATURES if is_graspgen else POLICY_FEATURES
+    features = POLICY_FEATURES
     config: dict[str, Any] = {
         "type": policy_type,
         **features,
@@ -130,93 +119,49 @@ def make_manifest(
         artifact_file = root / artifact_path
         artifact_file.parent.mkdir(parents=True, exist_ok=True)
         artifact_file.write_bytes(b"compiled-policy")
-        if policy_type == "graspgen":
-            deployment: dict[str, Any] = {
-                "uuid": TEST_DEPLOYMENT_UUID,
-                "revision": 1,
-                "backend": backend,
-                "target": {"soc": "rk3588", "runtime": "rknn-lite"},
-                "artifacts": {
-                    "policy": {
-                        "path": artifact_path,
-                        "format": "rknn",
-                    }
-                },
-                "execution": ["policy"],
-                "bindings": {
-                    "policy": {
-                        "inputs": [
-                            {
-                                "semantic": "observation.object_points",
-                                "runtime_name": "object_points",
-                                "index": 0,
-                                "dtype": "float32",
-                                "shape": [2048, 3],
-                            },
-                        ],
-                        "outputs": [
-                            {
-                                "semantic": "grasp.poses",
-                                "runtime_name": "poses",
-                                "index": 0,
-                                "dtype": "float32",
-                                "shape": [1000, 4, 4],
-                            },
-                            {
-                                "semantic": "grasp.confidence",
-                                "runtime_name": "confidence",
-                                "index": 1,
-                                "dtype": "float32",
-                                "shape": [1000],
-                            },
-                        ],
-                    }
-                },
-            }
-        else:
-            deployment: dict[str, Any] = {
-                "uuid": TEST_DEPLOYMENT_UUID,
-                "revision": 1,
-                "backend": backend,
-                "target": {"soc": "rk3588", "runtime": "rknn-lite"},
-                "artifacts": {
-                    "policy": {
-                        "path": artifact_path,
-                        "format": "rknn",
-                    }
-                },
-                "execution": ["policy"],
-                "bindings": {
-                    "policy": {
-                        "inputs": [
-                            {
-                                "semantic": "observation.state",
-                                "runtime_name": "state",
-                                "index": 0,
-                                "dtype": "float32",
-                                "shape": [1, 6],
-                            },
-                            {
-                                "semantic": "observation.images.top",
-                                "runtime_name": "image",
-                                "index": 1,
-                                "dtype": "float32",
-                                "layout": "NCHW",
-                                "shape": [1, 3, 16, 24],
-                            },
-                        ],
-                        "outputs": [
-                            {
-                                "semantic": "action",
-                                "runtime_name": "actions",
-                                "index": 0,
-                                "dtype": "float32",
-                                "shape": [1, 4, 6],
-                            }
-                        ],
-                    }
-                },
-            }
+        deployment: dict[str, Any] = {
+            "uuid": TEST_DEPLOYMENT_UUID,
+            "revision": 1,
+            "backend": backend,
+            "target": {"soc": "rk3588", "runtime": "rknn-lite"},
+            "artifacts": {
+                "policy": {
+                    "path": artifact_path,
+                    "format": "rknn",
+                }
+            },
+            "execution": ["policy"],
+            "bindings": {
+                "policy": {
+                    "inputs": [
+                        {
+                            "semantic": "observation.state",
+                            "runtime_name": "state",
+                            "index": 0,
+                            "dtype": "float32",
+                            "shape": [1, 6],
+                        },
+                        {
+                            "semantic": "observation.images.top",
+                            "runtime_name": "image",
+                            "index": 1,
+                            "dtype": "float32",
+                            "layout": "NCHW",
+                            "shape": [1, 3, 16, 24],
+                        },
+                    ],
+                    "outputs": [
+                        {
+                            "semantic": "action",
+                            "runtime_name": "actions",
+                            "index": 0,
+                            "dtype": "float32",
+                            "shape": [1, 4, 6],
+                        }
+                    ],
+                }
+            },
+        }
     else:
         deployment = {"uuid": TEST_DEPLOYMENT_UUID, "revision": 1, "backend": "torch", "device": "cpu"}
 

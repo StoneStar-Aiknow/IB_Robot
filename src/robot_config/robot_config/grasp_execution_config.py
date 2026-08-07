@@ -65,6 +65,7 @@ _SCHEMA: dict[str, Any] = {
     "planner_service": _string(),
     "verifier_service": _string(),
     "detect_service": _string(),
+    "fallback_detect_service": _string(),
     "segment_service": _string(allow_empty=True),
     "ik_service": _string(),
     "fk_service": _string(),
@@ -89,6 +90,8 @@ _SCHEMA: dict[str, Any] = {
     "probe_lift_velocity_scaling": _VELOCITY,
     "lift_velocity_scaling": _VELOCITY,
     "release_velocity_scaling": _VELOCITY,
+    # Robot-specific candidate correction expressed in the planning base frame.
+    "candidate_target_offset_base_m": _vector(),
     "observe_settle_sec": _NON_NEGATIVE,
     "open_settle_sec": _NON_NEGATIVE,
     "hold_sec": _NON_NEGATIVE,
@@ -131,7 +134,10 @@ _SCHEMA: dict[str, Any] = {
     },
     "ik": {
         "group_name": _string(),
+        # MoveIt solver budget; keep it small so LMA cannot discard the seed.
         "timeout_sec": _POSITIVE,
+        # Service wait budget, independent of the solver budget above.
+        "rpc_timeout_sec": _POSITIVE,
         "avoid_collisions": _bool(),
         "check_orientation": _bool(),
         "worker_count": _integer(0, 8),
@@ -161,6 +167,7 @@ _SCHEMA: dict[str, Any] = {
         "missing_fixed_finger_envelope_score": _UNIT_INTERVAL,
         "missing_robust_gap_headroom_score": _UNIT_INTERVAL,
         "fixed_finger_score_weight": _UNIT_INTERVAL,
+        # Read from this block by the preparation phase, not from target_gripper.
         "reliable_max_opening_m": _POSITIVE,
         "moving_finger_min_clearance_m": _NON_NEGATIVE,
     },
@@ -210,7 +217,8 @@ _SCHEMA: dict[str, Any] = {
         "sync_max_age_sec": _POSITIVE,
         "input_buffer_size": _integer(1),
         "num_grasps": _integer(1),
-        "topk_num_grasps": _integer(1),
+        # Non-positive means retain the complete threshold-qualified pool.
+        "topk_num_grasps": _integer(-1),
         "host_runtime": {
             "omp_threads": _integer(1),
             "blas_threads": _integer(1),
@@ -253,10 +261,20 @@ _SCHEMA: dict[str, Any] = {
             "approach_axis_ee": _vector(nonzero=True),
             "closing_axis_180_symmetric": _bool(),
             "joint5_abs_max": _POSITIVE,
-            "joint5_branch_filter": _bool(),
-            "joint5_branch_max_delta_rad": _number(0.0, math.pi),
+            "joint5_constraints_enabled": _bool(),
+            "joint5_home_max_delta_rad": _number(0.0, math.pi, exclusive_minimum=True),
+            "joint5_limit_epsilon_rad": _NON_NEGATIVE,
+            "joint5_stage_continuity": _bool(),
+            "joint5_stage_max_delta_rad": _number(0.0, math.pi, exclusive_minimum=True),
             "max_approach_error_deg": _number(0.0, 180.0),
             "max_closing_error_deg": _number(0.0, 180.0),
+            "moveit_orientation_search": {
+                "enabled": _bool(),
+                "approach_tolerance_deg": _number(0.0, 180.0),
+                "free_rotation_tolerance_deg": _number(0.0, 180.0),
+                "constraint_weight": _POSITIVE,
+                "max_attempts": _integer(1, 8),
+            },
         },
         "fixed_finger_margin_m": _NON_NEGATIVE,
         "fixed_finger_margin_max_m": _NON_NEGATIVE,
@@ -371,6 +389,16 @@ def validate_grasp_execution_config(value: Any) -> list[str]:
         if positive_worker_count and not str(ik.get("worker_namespace_prefix", "")).strip("/"):
             errors.append("grasp_execution.ik.worker_namespace_prefix must not be empty when worker_count is positive")
 
+    prepared_scoring = value.get("prepared_candidate_scoring")
+    if isinstance(prepared_scoring, dict):
+        reliable_opening = _number_value(prepared_scoring.get("reliable_max_opening_m"))
+        moving_clearance = _number_value(prepared_scoring.get("moving_finger_min_clearance_m"))
+        if reliable_opening is not None and moving_clearance is not None and moving_clearance >= reliable_opening:
+            errors.append(
+                "grasp_execution.prepared_candidate_scoring.moving_finger_min_clearance_m "
+                "must be less than reliable_max_opening_m"
+            )
+
     target = value.get("target_gripper")
     if isinstance(target, dict):
         minimum = _number_value(target.get("min_width_m"))
@@ -388,6 +416,39 @@ def validate_grasp_execution_config(value: Any) -> list[str]:
             errors.append(
                 "grasp_execution.target_gripper.fixed_finger_margin_m must not exceed fixed_finger_margin_max_m"
             )
+        orientation_guard = target.get("ik_orientation_guard")
+        if isinstance(orientation_guard, dict):
+            search = orientation_guard.get("moveit_orientation_search")
+            if isinstance(search, dict) and bool(search.get("enabled", False)):
+                approach_tolerance = _number_value(search.get("approach_tolerance_deg"))
+                hard_approach_limit = _number_value(orientation_guard.get("max_approach_error_deg"))
+                if (
+                    approach_tolerance is not None
+                    and hard_approach_limit is not None
+                    and approach_tolerance > hard_approach_limit
+                ):
+                    errors.append(
+                        "grasp_execution.target_gripper.ik_orientation_guard.moveit_orientation_search."
+                        "approach_tolerance_deg must not exceed max_approach_error_deg"
+                    )
+                approach_axis = orientation_guard.get("approach_axis_ee")
+                if (
+                    isinstance(approach_axis, list | tuple)
+                    and len(approach_axis) == 3
+                    and all(_is_number(item) for item in approach_axis)
+                ):
+                    norm = math.sqrt(sum(float(item) ** 2 for item in approach_axis))
+                    normalized = [float(item) / norm for item in approach_axis] if norm > 1e-9 else []
+                    if normalized:
+                        dominant = max(range(3), key=lambda index: abs(normalized[index]))
+                        cardinal = abs(abs(normalized[dominant]) - 1.0) <= 1e-6 and all(
+                            abs(item) <= 1e-6 for index, item in enumerate(normalized) if index != dominant
+                        )
+                        if not cardinal:
+                            errors.append(
+                                "grasp_execution.target_gripper.ik_orientation_guard.moveit_orientation_search "
+                                "requires approach_axis_ee to be an EE-frame cardinal axis"
+                            )
 
     planner_node = value.get("planner_node")
     if isinstance(planner_node, dict):

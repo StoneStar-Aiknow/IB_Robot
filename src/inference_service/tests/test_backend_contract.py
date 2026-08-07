@@ -580,11 +580,6 @@ def test_registry_does_not_instantiate_unavailable_backend_during_validation(tmp
         ("smolvla", "hisilicon", False),
         ("smolvla", "rknn", True),
         ("smolvla", "hmm", True),
-        ("graspgen", "torch", False),
-        ("graspgen", "ascend", True),
-        ("graspgen", "hisilicon", False),
-        ("graspgen", "rknn", False),
-        ("graspgen", "hmm", False),
     ],
 )
 def test_registry_enforces_exact_policy_support_matrix(tmp_path, policy_type, backend, supported):

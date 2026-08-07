@@ -21,7 +21,7 @@ from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Header
 
 from ibrobot_msgs.msg import DetectionArray, GraspCandidate, GraspCandidateArray
-from ibrobot_msgs.srv import GroundingDetect, PlanGrasp, SegmentDetections
+from ibrobot_msgs.srv import DetectSegment, GroundingDetect, PlanGrasp, SegmentDetections
 
 from .graspgen_wrapper import (
     DEFAULT_ENABLE_SOURCE_GRIPPER_TABLETOP_SWEEP,
@@ -84,6 +84,28 @@ def _depth_scale_for_msg(msg: Image, fallback_scale: float) -> float:
     if msg.encoding in ("32FC1", "64FC1"):
         return 1.0
     return fallback_scale
+
+
+_DEPTH_ENCODING_DTYPES = {
+    "16UC1": np.uint16,
+    "mono16": np.uint16,
+    "32FC1": np.float32,
+    "64FC1": np.float64,
+}
+
+
+def _decode_depth_image(msg: Image) -> np.ndarray:
+    # cv_bridge's imgmsg_to_cv2 has been observed to silently mis-decode
+    # 16UC1 depth messages as uint8 in this node's process (encoding-table
+    # mismatch), corrupting all downstream depth math. Decode manually from
+    # the message's declared encoding/step instead of relying on cv_bridge.
+    base_dtype = _DEPTH_ENCODING_DTYPES.get(msg.encoding)
+    if base_dtype is None:
+        raise ValueError(f"unsupported depth encoding: {msg.encoding!r}")
+    dtype = np.dtype(base_dtype).newbyteorder(">" if msg.is_bigendian else "<")
+    itemsize = np.dtype(dtype).itemsize
+    rows = np.frombuffer(msg.data, dtype=dtype).reshape(msg.height, msg.step // itemsize)
+    return rows[:, : msg.width].astype(base_dtype, copy=True)
 
 
 def _volume_centroid_hull(points: np.ndarray) -> tuple[np.ndarray, float]:
@@ -908,7 +930,7 @@ class GraspPlannerNode(Node):
         self.declare_parameter("remote_310p_root", "/root/GraspGen")
         self.declare_parameter("remote_310p_timeout_sec", 120.0)
         self.declare_parameter("ascend_local_manifest_path", "")
-        self.declare_parameter("ascend_local_deployment_name", "ascend")
+        self.declare_parameter("ascend_local_deployment_name", "ascend_310p")
         self.declare_parameter("ascend_local_device_id", 0)
         self.declare_parameter("ascend_local_random_seed", -1)
         self.declare_parameter("startup_warmup", False)
@@ -917,6 +939,7 @@ class GraspPlannerNode(Node):
         self.declare_parameter("camera_info_topic", "/camera/wrist/aligned_depth_to_color/camera_info")
         self.declare_parameter("detect_service", "/perception/grounding_detect")
         self.declare_parameter("segment_service", "")
+        self.declare_parameter("legacy_detect_service", "~/detect_and_segment")
         self.declare_parameter("grasp_threshold", 0.5)
         self.declare_parameter("num_grasps", 2000)
         self.declare_parameter("topk_num_grasps", 300)
@@ -1059,6 +1082,12 @@ class GraspPlannerNode(Node):
         )
 
         self._srv = self.create_service(PlanGrasp, "~/plan_grasp", self._srv_cb, callback_group=srv_cb_group)
+        self._legacy_detect_srv = self.create_service(
+            DetectSegment,
+            self.get_parameter("legacy_detect_service").get_parameter_value().string_value,
+            self._legacy_detect_cb,
+            callback_group=detect_cb_group,
+        )
 
         self._grasp_pub = self.create_publisher(GraspCandidateArray, "~/grasps", 10)
 
@@ -1067,15 +1096,62 @@ class GraspPlannerNode(Node):
             f"detect: {detect_service}, segment: {segment_service or 'inline'}"
         )
 
+    def _legacy_detect_cb(self, request: DetectSegment.Request, response: DetectSegment.Response):
+        """Expose the PR259 DetectSegment contract over the typed perception pipeline."""
+
+        started = time.perf_counter()
+        segmentation_result, failure = self._get_segmentation_mask(
+            request.text_prompt,
+            float(request.confidence_threshold),
+        )
+        if failure is not None or segmentation_result is None:
+            response.success = False
+            response.message = f"Detection failed: {failure or 'detect_service_no_result'}"
+            response.inference_time_ms = (time.perf_counter() - started) * 1000.0
+            return response
+
+        mask, mask_header, _confidence, detection = segmentation_result
+        synchronized = self._get_synchronized_inputs(_stamp_to_ns(mask_header.stamp))
+        if synchronized is None:
+            response.success = False
+            response.message = "No synchronized depth/CameraInfo for detection frame"
+            response.inference_time_ms = (time.perf_counter() - started) * 1000.0
+            return response
+
+        depth_frame, camera_info = synchronized
+        intrinsics = np.asarray(camera_info.k, dtype=np.float64).reshape(3, 3)
+        surface_centroid, volume_centroid, volume_m3, point_count = _compute_detection_geometry(
+            mask,
+            depth_frame.data,
+            intrinsics,
+            depth_scale=depth_frame.depth_scale,
+        )
+        detection.centroid_xyz.x = float(surface_centroid[0])
+        detection.centroid_xyz.y = float(surface_centroid[1])
+        detection.centroid_xyz.z = float(surface_centroid[2])
+        detection.volume_centroid_xyz.x = float(volume_centroid[0])
+        detection.volume_centroid_xyz.y = float(volume_centroid[1])
+        detection.volume_centroid_xyz.z = float(volume_centroid[2])
+        detection.volume_m3 = float(volume_m3)
+        detection.point_count = int(point_count)
+        detection.header = mask_header
+        detection.mask.header = mask_header
+
+        response.detections = DetectionArray(header=mask_header, detections=[detection])
+        response.success = True
+        response.inference_time_ms = (time.perf_counter() - started) * 1000.0
+        response.message = f"Detected 1 object with {point_count} depth points"
+        return response
+
     def _rgb_cb(self, msg: Image):
         with self._lock:
             self._rgb_buffer.append(RGBFrame(stamp_ns=_stamp_to_ns(msg.header.stamp), msg=msg))
 
     def _depth_cb(self, msg: Image):
         try:
-            depth = self._bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
-        except Exception:
-            self.get_logger().warn("Failed to convert depth image")
+            depth = _decode_depth_image(msg)
+        except Exception as exc:
+            self.get_logger().warn(f"Failed to convert depth image: {exc}")
             return
         fallback_scale = self.get_parameter("depth_scale").get_parameter_value().double_value
         frame = DepthFrame(

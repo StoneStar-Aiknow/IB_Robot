@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import numpy as np
@@ -110,6 +111,113 @@ def test_ascend_local_backend_delegates_one_request_without_local_sampler():
     }
 
 
+@dataclass(frozen=True)
+class _FakeLatency:
+    backend_ms: float
+
+
+@dataclass(frozen=True)
+class _FakeResult:
+    """Minimal stand-in for NamedTensorResult; a dataclass so sample() can replace() it."""
+
+    outputs: dict
+    latency: _FakeLatency
+
+
+def _graspgen_adapter():
+    from perception_service.graspgen_adapter import GraspGenAdapter, GraspGenConfig
+
+    return GraspGenAdapter(
+        GraspGenConfig(
+            kappa=2.02217,
+            diffusion_steps=10,
+            grasp_batch_size=1000,
+            point_count=2048,
+            npoints=(256, 64),
+            radii=(0.02, 0.04),
+            nsamples=(64, 128),
+        )
+    )
+
+
+def _fake_batch(batch_index: int) -> _FakeResult:
+    from inference_manifest import GRASPGEN_CONFIDENCE_SEMANTIC, GRASPGEN_POSE_SEMANTIC
+
+    poses = np.repeat(np.eye(4, dtype=np.float32)[None, ...], 1000, axis=0)
+    poses[:, 0, 3] = batch_index
+    confidence = np.linspace(0.0, 0.999, 1000, dtype=np.float32) + batch_index
+    return _FakeResult(
+        outputs={GRASPGEN_POSE_SEMANTIC: poses, GRASPGEN_CONFIDENCE_SEMANTIC: confidence},
+        latency=_FakeLatency(backend_ms=10.0),
+    )
+
+
+def test_ascend_local_backend_runs_distinct_batches_and_applies_global_topk():
+    class FakeSession:
+        def __init__(self):
+            self.random = np.random.default_rng(7)
+            self.random_tokens = []
+            self.request_ids = []
+
+        def infer(self, request):
+            self.random_tokens.append(float(self.random.random()))
+            self.request_ids.append(request.request_id)
+            return _fake_batch(len(self.random_tokens) - 1)
+
+    client = object.__new__(AscendLocalBackend)
+    client._session = FakeSession()
+    client._adapter = _graspgen_adapter()
+    client._sample_lock = graspgen_wrapper.threading.Lock()
+    client._ensure_loaded = lambda: None
+    points = np.zeros((2048, 3), dtype=np.float32)
+
+    poses, confidence, _ = client.sample(
+        points,
+        grasp_threshold=0.2,
+        num_grasps=5000,
+        topk_num_grasps=3,
+    )
+
+    expected_tokens = np.random.default_rng(7).random(5)
+    assert np.allclose(client._session.random_tokens, expected_tokens)
+    assert len(set(client._session.request_ids)) == 5
+    assert poses[:, 0, 3].tolist() == [4.0, 4.0, 4.0]
+    assert np.allclose(confidence, [4.999, 4.998, 4.997])
+
+
+def test_ascend_local_backend_limits_a_partial_static_batch():
+    from inference_manifest import GRASPGEN_CONFIDENCE_SEMANTIC, GRASPGEN_POSE_SEMANTIC
+
+    class FakeSession:
+        def infer(self, _request):
+            return _FakeResult(
+                outputs={
+                    GRASPGEN_POSE_SEMANTIC: np.repeat(np.eye(4, dtype=np.float32)[None, ...], 1000, axis=0),
+                    GRASPGEN_CONFIDENCE_SEMANTIC: np.arange(1000, dtype=np.float32),
+                },
+                latency=_FakeLatency(backend_ms=1.0),
+            )
+
+    client = object.__new__(AscendLocalBackend)
+    client._session = FakeSession()
+    client._adapter = _graspgen_adapter()
+    client._sample_lock = graspgen_wrapper.threading.Lock()
+    client._ensure_loaded = lambda: None
+
+    poses, confidence, _ = client.sample(
+        np.zeros((20, 3), dtype=np.float32),
+        grasp_threshold=-1.0,
+        num_grasps=1200,
+        topk_num_grasps=-1,
+    )
+
+    # 1000 full samples plus a 200-sample tail, returned confidence-descending.
+    assert poses.shape == (1200, 4, 4)
+    assert confidence.shape == (1200,)
+    assert confidence[0] == 999.0
+    assert confidence[-1] == 0.0
+
+
 def test_ascend_local_backend_rejects_empty_manifest_path():
     with pytest.raises(ValueError, match="manifest_path"):
         AscendLocalBackend("")
@@ -146,7 +254,7 @@ def test_ascend_local_backend_rejects_negative_device_id():
 def test_ascend_local_warmup_preserves_request_random_stream():
     client = object.__new__(AscendLocalBackend)
     random_generator = np.random.default_rng(7)
-    client._backend = SimpleNamespace(_random=random_generator)
+    client._session = SimpleNamespace(_random=random_generator)
     client._ensure_loaded = lambda: None
     client.sample = lambda *_args, **_kwargs: random_generator.standard_normal(16)
 
