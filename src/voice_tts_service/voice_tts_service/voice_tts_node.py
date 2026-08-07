@@ -275,8 +275,6 @@ class VoiceTTSNode(Node):
             response.success = True
             response.message = "Voice TTS model unloaded" if unloaded else "Voice TTS model is already unloaded"
         except Exception as exc:
-            self._runtime_state = "failed"
-            self._init_error = str(exc)
             response.success = False
             response.message = str(exc)
         return response

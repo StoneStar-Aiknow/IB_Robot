@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import sys
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,20 @@ from voice_tts_service.prompt_audio import PromptAudio
 
 _PINYIN_TAG = re.compile(r"<([A-Za-z]+[1-5])>")
 _ASCII_LETTER = re.compile(r"[A-Za-z]")
-_PUNCTUATION = {";", ":", ",", ".", "!", "?"}
+_PUNCTUATION = {";", ":", ",", ".", "!", "?", "…"}
+
+
+@contextmanager
+def _temporary_sys_path(path: Path):
+    """Temporarily prioritize a bundle-vendored import path."""
+
+    entry = str(path)
+    sys.path.insert(0, entry)
+    try:
+        yield
+    finally:
+        with suppress(ValueError):
+            sys.path.remove(entry)
 
 
 @dataclass(frozen=True)
@@ -36,13 +50,13 @@ class _ChineseTokenizer:
     """ZipVoice Emilia-style Chinese frontend with bundle-vendored dependencies."""
 
     def __init__(self, token_file: Path, vendor_python: Path) -> None:
-        if vendor_python.is_dir():
-            sys.path.insert(0, str(vendor_python))
         try:
-            self._cn2an = importlib.import_module("cn2an")
-            self._jieba = importlib.import_module("jieba")
-            pypinyin = importlib.import_module("pypinyin")
-            tone_convert = importlib.import_module("pypinyin.contrib.tone_convert")
+            import_context = _temporary_sys_path(vendor_python) if vendor_python.is_dir() else nullcontext()
+            with import_context:
+                self._cn2an = importlib.import_module("cn2an")
+                self._jieba = importlib.import_module("jieba")
+                pypinyin = importlib.import_module("pypinyin")
+                tone_convert = importlib.import_module("pypinyin.contrib.tone_convert")
         except (ImportError, OSError) as exc:
             raise BackendLoadError(f"ZipVoice Chinese frontend dependency is unavailable: {exc}") from exc
         self._style = pypinyin.Style
@@ -265,11 +279,11 @@ class ZipVoice310PAdapter:
 
     def _load_vocos(self) -> None:
         vendor_root = self._asset("vocos_vendor_path").parent
-        sys.path.insert(0, str(vendor_root))
         try:
-            torch = importlib.import_module("torch")
-            heads = importlib.import_module("vocos.heads")
-            models = importlib.import_module("vocos.models")
+            with _temporary_sys_path(vendor_root):
+                torch = importlib.import_module("torch")
+                heads = importlib.import_module("vocos.heads")
+                models = importlib.import_module("vocos.models")
         except (ImportError, OSError) as exc:
             raise BackendLoadError(f"ZipVoice Vocos dependency is unavailable: {exc}") from exc
 

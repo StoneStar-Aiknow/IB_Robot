@@ -1,3 +1,4 @@
+import threading
 from types import SimpleNamespace
 
 from voice_tts_service.voice_tts_node import VoiceTTSNode
@@ -73,3 +74,23 @@ def test_unload_is_idempotent():
 
     assert VoiceTTSNode._unload_model_locked(node) is False
     assert node._runtime_state == "unloaded"
+
+
+def test_unload_handler_leaves_failure_state_to_lifecycle_helper():
+    node = _node()
+    node._backend_lock = threading.Lock()
+
+    def fail_unload(target):
+        target._runtime_state = "failed"
+        target._init_error = "lifecycle cleanup failed"
+        raise RuntimeError("service-visible failure")
+
+    node._unload_model_locked = lambda: fail_unload(node)
+    response = SimpleNamespace(success=True, message="")
+
+    VoiceTTSNode._on_unload(node, None, response)
+
+    assert response.success is False
+    assert response.message == "service-visible failure"
+    assert node._runtime_state == "failed"
+    assert node._init_error == "lifecycle cleanup failed"

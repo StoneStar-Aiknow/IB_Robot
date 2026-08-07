@@ -1,10 +1,11 @@
+import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
-from voice_tts_service.errors import BackendInferenceError, TTSError
+from voice_tts_service.errors import BackendInferenceError, BackendLoadError, TTSError
 from voice_tts_service.zipvoice_310p_adapter import ZipVoice310PAdapter, _ChineseTokenizer
 
 
@@ -133,7 +134,28 @@ def test_chinese_frontend_rejects_ascii_before_loading_optional_dependencies(tmp
         "pypinyin.contrib.tone_convert": fake_tone,
     }
     monkeypatch.setattr("importlib.import_module", lambda name: modules[name])
-    tokenizer = _ChineseTokenizer(token_file, tmp_path / "missing-vendor")
+    tokenizer = _ChineseTokenizer(token_file, tmp_path)
+
+    assert str(tmp_path) not in sys.path
 
     with pytest.raises(BackendInferenceError, match="not English words"):
         tokenizer.text_to_tokens("hello")
+
+
+def test_vendor_import_path_is_restored_after_import_failure(tmp_path, monkeypatch):
+    token_file = tmp_path / "tokens.txt"
+    token_file.write_text("_\t0\n", encoding="utf-8")
+    monkeypatch.setattr("importlib.import_module", lambda _name: (_ for _ in ()).throw(ImportError("missing")))
+
+    with pytest.raises(BackendLoadError, match="dependency is unavailable"):
+        _ChineseTokenizer(token_file, tmp_path)
+
+    assert str(tmp_path) not in sys.path
+
+
+def test_ellipsis_is_treated_as_sentence_punctuation():
+    assert _ChineseTokenizer._map_punctuation("等等...") == "等等…"
+    assert _ChineseTokenizer.chunk_tokens(["deng3", "…", "hao3", "."], 3) == [
+        ["deng3", "…"],
+        ["hao3", "."],
+    ]
