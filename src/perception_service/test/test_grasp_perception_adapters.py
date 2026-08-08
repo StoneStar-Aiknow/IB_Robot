@@ -31,6 +31,85 @@ def _result(outputs):
     )
 
 
+def _compiled(roles, execution):
+    """Build a compiled deployment carrying only the bindings a test cares about."""
+    from inference_manifest import ArtifactBindings, CompiledDeployment, DeploymentArtifact, DeploymentTarget
+
+    return CompiledDeployment(
+        backend="ascend",
+        target=DeploymentTarget(soc="Ascend310P1", runtime="ascend"),
+        artifacts={role: DeploymentArtifact(path=f"artifacts/test/{role}.om", format="om") for role in execution},
+        execution=tuple(execution),
+        bindings={
+            role: ArtifactBindings(inputs=tuple(inputs), outputs=tuple(outputs))
+            for role, (inputs, outputs) in roles.items()
+        },
+    )
+
+
+def _write_sam2_prompt_bundle(root):
+    assets = root / "assets"
+    assets.mkdir(parents=True)
+    (assets / "adapter.json").write_text(
+        json.dumps(
+            {
+                "family": "sam2_prompt",
+                "preprocessing": "sam2-longest-side1024-imagenet-box-prompt-v1",
+                "postprocessing": "sam2-mask-logits-iou-v1",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _sam2_prompt_deployment(*, batch: int, canvas: int, mask_batch: int | None = None):
+    from inference_manifest import TensorBinding
+
+    mask = batch if mask_batch is None else mask_batch
+    return _compiled(
+        {
+            "encoder": (
+                [
+                    TensorBinding(
+                        semantic="image", index=0, dtype="float32", shape=(1, 3, canvas, canvas), layout="NCHW"
+                    )
+                ],
+                [
+                    TensorBinding(
+                        semantic="internal.image_embed", index=0, dtype="float32", shape=(1, 256, 64, 64), layout="NCHW"
+                    )
+                ],
+            ),
+            "decoder": (
+                [
+                    TensorBinding(
+                        semantic="internal.image_embed", index=0, dtype="float32", shape=(1, 256, 64, 64), layout="NCHW"
+                    ),
+                    TensorBinding(semantic="point_coords", index=1, dtype="float32", shape=(batch, 2, 2)),
+                    TensorBinding(semantic="point_labels", index=2, dtype="int8", shape=(batch, 2)),
+                    TensorBinding(
+                        semantic="mask_input",
+                        index=3,
+                        dtype="float32",
+                        shape=(mask, 1, canvas // 4, canvas // 4),
+                        layout="NCHW",
+                    ),
+                ],
+                [
+                    TensorBinding(
+                        semantic="mask_logits",
+                        index=0,
+                        dtype="float32",
+                        shape=(batch, 1, canvas // 4, canvas // 4),
+                        layout="NCHW",
+                    )
+                ],
+            ),
+        },
+        ("encoder", "decoder"),
+    )
+
+
 def _write_grounding_bundle(root):
     assets = root / "assets"
     vocab = assets / "bert-base-uncased" / "vocab.txt"
@@ -196,6 +275,76 @@ def test_grounding_dino_raw_adapter_rejects_a_token_window_wider_than_the_logits
             image_shape=(360, 640),
             prompt="banana",
         )
+
+
+def test_grounding_dino_raw_adapter_feeds_the_image_in_the_declared_layout(tmp_path):
+    """A deployment compiled NHWC at 360x640 must not be fed a 720x1280 NCHW tensor."""
+    from inference_manifest import TensorBinding
+
+    _write_grounding_bundle(tmp_path)
+    deployment = _compiled(
+        {
+            "vision": (
+                [
+                    TensorBinding(semantic="image", index=0, dtype="float32", shape=(1, 360, 640, 3), layout="NHWC"),
+                    TensorBinding(semantic="input_ids", index=1, dtype="int64", shape=(1, 8)),
+                    TensorBinding(semantic="encoder_tgt", index=2, dtype="float32", shape=(1, 900, 256)),
+                ],
+                [TensorBinding(semantic="pred_boxes", index=0, dtype="float32", shape=(1, 900, 4))],
+            )
+        },
+        ("vision",),
+    )
+
+    adapter = GroundingDINORawAdapter.from_bundle(tmp_path, deployment=deployment)
+    inputs = adapter.preprocess((np.zeros((720, 1280, 3), dtype=np.uint8), "banana", 0.3, 0.25))
+
+    assert adapter.image_layout == "NHWC"
+    assert inputs["image"].shape == (1, 360, 640, 3)
+
+
+def test_sam2_prompt_adapter_derives_batch_and_canvas_from_the_compiled_deployment(tmp_path):
+    """`model.inputs` declares a -1 batch, so only the deployment bindings carry it."""
+    _write_sam2_prompt_bundle(tmp_path)
+    adapter = SAM2PromptAdapter.from_bundle(tmp_path, deployment=_sam2_prompt_deployment(batch=1, canvas=512))
+
+    assert (adapter.batch_size, adapter.image_size) == (1, 512)
+
+    inputs = adapter.preprocess((np.zeros((256, 512, 3), dtype=np.uint8), [[0, 0, 10, 10]]))
+
+    assert inputs["image"].shape == (1, 3, 512, 512)
+    assert inputs["point_coords"].shape == (1, 2, 2)
+    assert inputs["point_labels"].shape == (1, 2)
+    assert inputs["mask_input"].shape == (1, 1, 128, 128)
+    assert inputs["has_mask_input"].shape == (1,)
+    with pytest.raises(ValueError, match="only accepts 1"):
+        adapter.preprocess((np.zeros((256, 512, 3), dtype=np.uint8), [[0, 0, 10, 10]] * 2))
+
+
+def test_sam2_prompt_adapter_scales_prompts_and_masks_to_the_declared_canvas(tmp_path):
+    _write_sam2_prompt_bundle(tmp_path)
+    adapter = SAM2PromptAdapter.from_bundle(tmp_path, deployment=_sam2_prompt_deployment(batch=2, canvas=512))
+
+    inputs = adapter.preprocess((np.zeros((256, 512, 3), dtype=np.uint8), [[0, 0, 128, 64]]))
+
+    # A 512-wide source letterboxes onto a 512 canvas at scale 1.0, not 1024/512.
+    np.testing.assert_allclose(inputs["point_coords"][0], [[0.0, 0.0], [128.0, 64.0]])
+
+    logits = np.full((2, 1, 128, 128), -1.0, dtype=np.float32)
+    logits[:, :, :64, :] = 1.0
+    masks = adapter.postprocess(_result({"mask_logits": logits}), image_shape=(256, 512), count=1)
+
+    # The source occupies the top half of the square canvas, so the whole crop is mask.
+    assert masks[0].shape == (256, 512)
+    assert masks[0].all()
+
+
+def test_sam2_prompt_adapter_rejects_a_deployment_whose_mask_batch_disagrees(tmp_path):
+    _write_sam2_prompt_bundle(tmp_path)
+    deployment = _sam2_prompt_deployment(batch=4, canvas=1024, mask_batch=1)
+
+    with pytest.raises(ValueError, match="mask_input batch"):
+        SAM2PromptAdapter.from_bundle(tmp_path, deployment=deployment)
 
 
 def test_sam2_prompt_preprocess_rejects_batch_larger_than_compiled_size():

@@ -139,7 +139,9 @@ class _SessionPlugin(ModelServicePlugin):
             )
         self.host = host
         self.validated = validated
-        self.adapter = self.adapter_class.from_bundle(validated.bundle_root, model.semantic_identity, model=model)
+        self.adapter = self.adapter_class.from_bundle(
+            validated.bundle_root, model.semantic_identity, model=model, deployment=validated.deployment
+        )
         self.adapter.validate_identity(model.semantic_identity)
         self._closed = False
         self._requests = itertools.count(1)

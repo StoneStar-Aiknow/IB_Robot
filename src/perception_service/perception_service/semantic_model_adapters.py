@@ -89,8 +89,8 @@ class SAM2Adapter(PerceptionAdapter):
     compiled_abi_finalized = False
 
     @classmethod
-    def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None) -> SAM2Adapter:
-        del model
+    def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None, deployment=None) -> SAM2Adapter:
+        del deployment, model
         _read_adapter_identity(Path(bundle_root), cls.identity)
         return cls()
 
@@ -141,8 +141,8 @@ class _SigLIP2Adapter(PerceptionAdapter):
         self.tokenizer = tokenizer
 
     @classmethod
-    def from_bundle(cls, bundle_root: str | Path, identity, *, model=None) -> _SigLIP2Adapter:
-        del model
+    def from_bundle(cls, bundle_root: str | Path, identity, *, model=None, deployment=None) -> _SigLIP2Adapter:
+        del deployment, model
         _read_adapter_identity(Path(bundle_root), cls.identity)
         if identity is None or identity.embedding is None:
             raise ValueError("SigLIP2 manifest semantic_identity must declare embedding metadata")
@@ -265,8 +265,10 @@ class GroundingDINOAdapter(PerceptionAdapter):
     compiled_abi_finalized = False
 
     @classmethod
-    def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None) -> GroundingDINOAdapter:
-        del model
+    def from_bundle(
+        cls, bundle_root: str | Path, _identity=None, *, model=None, deployment=None
+    ) -> GroundingDINOAdapter:
+        del deployment, model
         _read_adapter_identity(Path(bundle_root), cls.identity)
         return cls()
 
@@ -312,13 +314,54 @@ class GroundingDINOAdapter(PerceptionAdapter):
         ]
 
 
-def _manifest_input_shape(model, semantic: str, default: tuple[int, ...]) -> tuple[int, ...]:
-    """Read a declared input shape from the manifest ModelDescriptor, if available."""
-    if model is not None:
-        for tensor in model.inputs:
-            if tensor.semantic == semantic:
-                return tuple(tensor.shape)
-    return default
+def _resolve_input(deployment, model, semantic: str):
+    """Find the ABI descriptor for one input semantic, preferring the compiled binding.
+
+    `model.inputs` is deployment-agnostic, so a semantic whose batch differs per target -
+    SAM2's `point_coords` is compiled at 4 on 310P and 1 on 310B - is declared there as
+    `-1`. Only the selected deployment's bindings carry the shape the artifact was
+    actually built for, so they win whenever the caller supplied a deployment.
+    """
+    for bindings in (getattr(deployment, "bindings", None) or {}).values():
+        for binding in bindings.inputs:
+            if binding.semantic == semantic:
+                return binding
+    for tensor in getattr(model, "inputs", ()) or ():
+        if tensor.semantic == semantic:
+            return tensor
+    return None
+
+
+def _input_shape(deployment, model, semantic: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    """Read a declared input shape from the manifest ABI, if available."""
+    tensor = _resolve_input(deployment, model, semantic)
+    return tuple(tensor.shape) if tensor is not None else default
+
+
+def _image_geometry(
+    deployment, model, semantic: str, default_shape: tuple[int, ...], default_layout: str
+) -> tuple[int, int, str]:
+    """Resolve ``(height, width, layout)`` for one rank-4 image input.
+
+    The manifest declares NCHW/NHWC per rank-4 tensor, so the adapter reads the channel
+    order from the ABI instead of assuming the exported graph is NCHW.
+    """
+    tensor = _resolve_input(deployment, model, semantic)
+    shape = tuple(tensor.shape) if tensor is not None else default_shape
+    layout = (tensor.layout if tensor is not None else None) or default_layout
+    if len(shape) != 4:
+        raise ValueError(f"image input {semantic!r} must be rank-4, got shape {shape}")
+    if layout == "NCHW":
+        return int(shape[2]), int(shape[3]), layout
+    if layout == "NHWC":
+        return int(shape[1]), int(shape[2]), layout
+    raise ValueError(f"image input {semantic!r} declares unsupported layout {layout!r}")
+
+
+def _arrange_image(image_hwc: np.ndarray, layout: str) -> np.ndarray:
+    """Add the batch axis in the channel order the compiled graph declares."""
+    ordered = image_hwc.transpose(2, 0, 1) if layout == "NCHW" else image_hwc
+    return np.ascontiguousarray(ordered[None], dtype=np.float32)
 
 
 class GroundingDINORawAdapter(PerceptionAdapter):
@@ -332,36 +375,48 @@ class GroundingDINORawAdapter(PerceptionAdapter):
     )
     compiled_abi_finalized = True
 
-    # Fallback ABI shapes for callers that construct the adapter without a
-    # manifest ModelDescriptor (e.g. bundle-local unit tests); real deployments
-    # derive these from `model.inputs` instead (see `_manifest_input_shape`).
+    # Fallback ABI for callers that construct the adapter without a manifest
+    # ModelDescriptor (e.g. bundle-local unit tests); real deployments derive these
+    # from the compiled bindings or `model.inputs` instead (see `_resolve_input`).
     _DEFAULT_INPUT_IDS_SHAPE = (1, 8)
     _DEFAULT_ENCODER_TGT_SHAPE = (1, 900, 256)
+    _DEFAULT_IMAGE_SHAPE = (1, 3, 720, 1280)
+    _DEFAULT_IMAGE_LAYOUT = "NCHW"
+
+    def __init__(self) -> None:
+        self.image_height, self.image_width, self.image_layout = _image_geometry(
+            None, None, "image", self._DEFAULT_IMAGE_SHAPE, self._DEFAULT_IMAGE_LAYOUT
+        )
 
     @classmethod
-    def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None) -> GroundingDINORawAdapter:
+    def from_bundle(
+        cls, bundle_root: str | Path, _identity=None, *, model=None, deployment=None
+    ) -> GroundingDINORawAdapter:
         root = Path(bundle_root)
         _read_adapter_identity(root, cls.identity)
-        input_ids_shape = _manifest_input_shape(model, "input_ids", cls._DEFAULT_INPUT_IDS_SHAPE)
+        input_ids_shape = _input_shape(deployment, model, "input_ids", cls._DEFAULT_INPUT_IDS_SHAPE)
         sequence_length = int(input_ids_shape[-1])
         tokenizer = BertWordPieceTokenizer(
             root / "assets" / "bert-base-uncased" / "vocab.txt", sequence_length=sequence_length
         )
         target_path = root / "assets" / "encoder_tgt.npy"
         target = np.ascontiguousarray(np.load(target_path, allow_pickle=False), dtype=np.float32)
-        expected_shape = _manifest_input_shape(model, "encoder_tgt", cls._DEFAULT_ENCODER_TGT_SHAPE)
+        expected_shape = _input_shape(deployment, model, "encoder_tgt", cls._DEFAULT_ENCODER_TGT_SHAPE)
         if target.shape != expected_shape:
             raise ValueError(f"Grounding-DINO encoder_tgt must have shape {expected_shape}, got {target.shape}")
         instance = cls()
         instance.tokenizer = tokenizer
         instance.encoder_target = target
+        instance.image_height, instance.image_width, instance.image_layout = _image_geometry(
+            deployment, model, "image", cls._DEFAULT_IMAGE_SHAPE, cls._DEFAULT_IMAGE_LAYOUT
+        )
         return instance
 
     def preprocess(self, value: object) -> dict[str, np.ndarray]:
         image_rgb, prompt, box_threshold, text_threshold = value
         image = np.asarray(image_rgb, dtype=np.uint8)
-        if image.shape[:2] != (720, 1280):
-            image = cv2.resize(image, (1280, 720), interpolation=cv2.INTER_LINEAR)
+        if image.shape[:2] != (self.image_height, self.image_width):
+            image = cv2.resize(image, (self.image_width, self.image_height), interpolation=cv2.INTER_LINEAR)
         normalized = image.astype(np.float32) / np.float32(255.0)
         normalized = (normalized - np.asarray([0.485, 0.456, 0.406], dtype=np.float32)) / np.asarray(
             [0.229, 0.224, 0.225], dtype=np.float32
@@ -369,7 +424,7 @@ class GroundingDINORawAdapter(PerceptionAdapter):
         tokenized = self.tokenizer.encode(str(prompt))
         del box_threshold, text_threshold
         return {
-            "image": np.ascontiguousarray(normalized.transpose(2, 0, 1)[None], dtype=np.float32),
+            "image": _arrange_image(normalized, self.image_layout),
             "input_ids": tokenized["gdino.input_ids"],
             "token_type_ids": tokenized["gdino.token_type_ids"],
             "position_ids": tokenized["gdino.position_ids"],
@@ -405,7 +460,7 @@ class GroundingDINORawAdapter(PerceptionAdapter):
             )
         scores = probabilities[:, :prompt_token_columns].max(axis=1)
         selected = np.flatnonzero(scores > float(box_threshold or 0.35))
-        height, width = tuple(image_shape or (720, 1280))
+        height, width = tuple(image_shape or (self.image_height, self.image_width))
         prompt_input_ids = self.tokenizer.encode(str(prompt))["gdino.input_ids"]
         detections = []
         for index in selected:
@@ -453,23 +508,62 @@ class SAM2PromptAdapter(PerceptionAdapter):
     )
     compiled_abi_finalized = True
 
+    # Fallback ABI for callers that construct the adapter without a manifest
+    # deployment (e.g. bundle-local unit tests). `point_coords` and `mask_input` are
+    # declared with a `-1` batch on the deployment-agnostic ModelDescriptor, so the
+    # real batch only ever comes from the selected deployment's bindings: 4 on 310P,
+    # 1 on 310B.
+    _DEFAULT_IMAGE_SHAPE = (1, 3, 1024, 1024)
+    _DEFAULT_IMAGE_LAYOUT = "NCHW"
+    _DEFAULT_POINT_COORDS_SHAPE = (4, 2, 2)
+    _DEFAULT_MASK_INPUT_SHAPE = (4, 1, 256, 256)
+
+    def __init__(self) -> None:
+        self.batch_size = int(self._DEFAULT_POINT_COORDS_SHAPE[0])
+        self.mask_input_shape = self._DEFAULT_MASK_INPUT_SHAPE
+        self.image_size, _, self.image_layout = _image_geometry(
+            None, None, "image", self._DEFAULT_IMAGE_SHAPE, self._DEFAULT_IMAGE_LAYOUT
+        )
+
     @classmethod
-    def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None) -> SAM2PromptAdapter:
-        del model
+    def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None, deployment=None) -> SAM2PromptAdapter:
         _read_adapter_identity(Path(bundle_root), cls.identity)
         instance = cls()
-        instance.batch_size = 4
+        height, width, layout = _image_geometry(
+            deployment, model, "image", cls._DEFAULT_IMAGE_SHAPE, cls._DEFAULT_IMAGE_LAYOUT
+        )
+        if height != width:
+            raise ValueError(
+                f"SAM2 box-prompt letterboxes onto a square canvas but the deployment declares a {height}x{width} image"
+            )
+        point_coords_shape = _input_shape(deployment, model, "point_coords", cls._DEFAULT_POINT_COORDS_SHAPE)
+        mask_input_shape = _input_shape(deployment, model, "mask_input", cls._DEFAULT_MASK_INPUT_SHAPE)
+        batch_size = int(point_coords_shape[0])
+        if batch_size < 1:
+            raise ValueError(
+                f"SAM2 box-prompt deployment must declare a concrete point_coords batch, got shape {point_coords_shape}"
+            )
+        if int(mask_input_shape[0]) != batch_size:
+            raise ValueError(
+                f"SAM2 box-prompt deployment declares point_coords batch {batch_size} but mask_input batch "
+                f"{mask_input_shape[0]}; the compiled decoder consumes one mask slot per prompt"
+            )
+        instance.batch_size = batch_size
+        instance.mask_input_shape = mask_input_shape
+        instance.image_size = height
+        instance.image_layout = layout
         return instance
 
     def preprocess(self, value: object) -> dict[str, np.ndarray]:
         image_rgb, boxes = value
         image = np.asarray(image_rgb, dtype=np.uint8)
         height, width = image.shape[:2]
-        scale = 1024.0 / max(height, width)
+        canvas_size = int(self.image_size)
+        scale = float(canvas_size) / max(height, width)
         resized_width = max(1, int(round(width * scale)))
         resized_height = max(1, int(round(height * scale)))
         resized = cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_LINEAR)
-        canvas = np.zeros((1024, 1024, 3), dtype=np.uint8)
+        canvas = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
         canvas[:resized_height, :resized_width] = resized
         normalized = canvas.astype(np.float32) / np.float32(255.0)
         normalized = (normalized - np.asarray([0.485, 0.456, 0.406], dtype=np.float32)) / np.asarray(
@@ -494,10 +588,10 @@ class SAM2PromptAdapter(PerceptionAdapter):
             coords[index] = coords[len(selected) - 1]
             labels[index] = labels[len(selected) - 1]
         return {
-            "image": np.ascontiguousarray(normalized.transpose(2, 0, 1)[None], dtype=np.float32),
+            "image": _arrange_image(normalized, self.image_layout),
             "point_coords": coords,
             "point_labels": labels,
-            "mask_input": np.zeros((self.batch_size, 1, 256, 256), dtype=np.float32),
+            "mask_input": np.zeros((self.batch_size, *self.mask_input_shape[1:]), dtype=np.float32),
             "has_mask_input": np.zeros((self.batch_size,), dtype=np.int8),
         }
 
@@ -505,13 +599,14 @@ class SAM2PromptAdapter(PerceptionAdapter):
         logits = np.asarray(_output(result, "mask_logits"), dtype=np.float32)
         if logits.ndim != 4 or logits.shape[1] != 1:
             raise RuntimeError(f"SAM2 prompt output has incompatible mask shape {logits.shape}")
-        height, width = tuple(image_shape or (1024, 1024))
-        scale = 1024.0 / max(height, width)
+        canvas_size = int(self.image_size)
+        height, width = tuple(image_shape or (canvas_size, canvas_size))
+        scale = float(canvas_size) / max(height, width)
         resized_width = max(1, int(round(width * scale)))
         resized_height = max(1, int(round(height * scale)))
         logits_height, logits_width = logits.shape[-2:]
-        valid_width = min(logits_width, max(1, int(round(resized_width * logits_width / 1024.0))))
-        valid_height = min(logits_height, max(1, int(round(resized_height * logits_height / 1024.0))))
+        valid_width = min(logits_width, max(1, int(round(resized_width * logits_width / canvas_size))))
+        valid_height = min(logits_height, max(1, int(round(resized_height * logits_height / canvas_size))))
         return [
             (
                 cv2.resize(

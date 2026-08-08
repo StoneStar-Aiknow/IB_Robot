@@ -90,7 +90,8 @@ class GraspGenAdapter(PerceptionAdapter):
         self.config = config
 
     @classmethod
-    def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None) -> GraspGenAdapter:
+    def from_bundle(cls, bundle_root: str | Path, _identity=None, *, model=None, deployment=None) -> GraspGenAdapter:
+        del deployment
         root = Path(bundle_root)
         assets = json.loads((root / "assets" / "adapter.json").read_text(encoding="utf-8"))
         expected = {
