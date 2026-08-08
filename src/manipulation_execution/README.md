@@ -34,8 +34,9 @@ Hermes 只看到一个原子技能。内部运动仍逐步经过 `skill_library`
 
 `pick_executor_node.py` 只管理 ROS action、service client、TF 和 joint-state 生命周期。抓取行为按职责拆分到
 `phases/flow.py`、`planning.py`、`preparation.py` 和 `execution.py`；共享状态模型与纯转换函数分别位于
-`pick_executor_models.py` 和 `pick_executor_helpers.py`。`pipeline_worker.py` 只提供与机器人无关的动态 worker
-队列；SO101 joint5 分支、归一化、闭合轴修正和 IK 重试集中在 `so101_kinematics_guard.py`，
+`pick_executor_models.py` 和 `pick_executor_helpers.py`。候选 IK/FK 按固定 round-robin 分区并行处理；
+`pipeline_worker.py` 保留与机器人无关的动态 worker 队列工具，但不参与当前候选准备路径。SO101 joint5
+分支、归一化、闭合轴修正和 IK 重试集中在 `so101_kinematics_guard.py`，
 不混入通用 pipeline 工具。阶段 mixin 保留原有方法入口，便于隔离测试且不改变 action 行为。
 
 ## 公开接口
@@ -67,28 +68,44 @@ Hermes 只看到一个原子技能。内部运动仍逐步经过 `skill_library`
 - source gripper 到目标夹爪的几何适配。
 - 基于检测目标体积质心的 contact-distance 排序，以及 confidence/top-down 权重。
 - approach、lift、速度、候选数量和物理执行重试次数；IK/FK 准备失败不消耗物理重试次数。
-- `ik.worker_count` 个隔离 MoveIt worker 从同一个动态队列准备候选；所有 worker 使用同一份
-  `/joint_states` seed，空闲 worker 立即领取下一个候选，结果仍按原候选顺序合并，并在每次抓取前校验
-  主 MoveIt 与全部 worker 的 IK 解一致。
+- `candidate_target_offset_base_m` 对候选的 grasp、approach、lift 和规划接触点施加统一的 base-frame
+  平移补偿；SO101 hand-eye profile 使用旧 test 在 310P 上验证过的 `[0.0, 0.0, -0.008]`。
+- `ik.worker_count` 个隔离 MoveIt worker 按候选排名做固定 round-robin 分配；所有 worker 使用同一份
+  `/joint_states` seed，结果按原候选顺序合并，并在每次抓取前使用当前 seed 的 FK 可达位姿校验主 MoveIt
+  与全部 worker 的 IK 解一致，避免用尚未验证的候选 approach 位姿误判 worker 健康状态。
 - `candidate_selection.selection_attempts` 控制整批候选无安全 IK 解或规划暂时失败时重新获取新帧并规划；
   不可恢复的配置、安全门禁和 worker 一致性错误不会重试。
+- `planner_node.topk_num_grasps` 为正数时保留置信度最高的 Top-K；设为 `-1` 时保留全部达到
+  `grasp_threshold` 的候选，再由目标夹爪几何和 SO101 IK/FK 门禁筛选。置信度不等价于 5-DOF 可执行性。
 - SO101 tabletop 前置检查由正式 pipeline 的公共实现完成；相机平面变换到 base 后先将法向规范为朝向
   base +Z 的安全半空间，再使用缓存的 mesh 凸包顶点和批量 NumPy 变换处理全部候选。固定姿态平移 sweep
   只计算两个端点，临界阈值附近再回退到单候选精确检查。
-- SO101 实际夹爪 STL 的 approach-to-grasp 桌面间隙，以及 joint5 分支修正后的 FK 接近轴/闭合轴硬校验。
+- SO101 实际夹爪 STL 的 approach-to-grasp 桌面间隙，以及 grasp/approach 在 joint5 分支修正后的
+  FK 接近轴/闭合轴硬校验。probe/final lift 保留 position-only IK/FK、关节/分支安全和抓持验证，
+  但不按 FK 姿态误差拒绝。
+- SO101 的 LMA 保持 position-only。正式 profile 不启用 MoveIt `OrientationConstraint` 搜索：该约束不会
+  为 5-DOF 机械臂创造额外自由度，且可能把本应由最终 FK 门禁解释的姿态误差变成 `NO_IK_SOLUTION`。
+  最终 IK/FK 结果仍按配置的接近轴/闭合轴阈值校验。
+- 初始抓取 joint5 相对 robot YAML 的 HOME 位置限制在配置范围内，不再相对观察位 joint5 做候选拒绝；
+  候选选定后才对各执行阶段实施 joint5 连续性门，阻止真正的半圈翻腕。
+- 目标宽度端点投影到实际 FK 闭合轴后，必须满足投影宽度加移动指余量不超过可靠开口；规划准备和
+  pregrasp 重对齐后都会复核，超宽候选在下降前拒绝。
 - 候选 FK 残差重排、pregrasp 高位接触点 realign 和最终 IK/FK 接触点补偿阈值。
 - IK/FK 准备完成后按候选规划姿态的固定爪前缘包络、目标体积质心距离、FK 接触点 XY/Z 质量和
   置信度做软重排；固定爪包络偏好不会单独硬拒绝候选。
 - 非对称单动夹爪先按规划姿态检查固定爪是否位于朝机器人底座的一侧，再按最终 IK 解的 FK 姿态
   复检；最终姿态镜像或缺少目标宽度范围时，在产生运动前拒绝该候选并继续准备其他候选。
-- 固定指 robust gap 使用最终 IK/FK 预测接触残差在 approach/descend 前完成硬门禁；下降成功后进入
-  commit-to-grasp 状态，`close_gripper` 是下降成功后的第一条动作。低位实测改在闭爪后以 best-effort
-  方式记录；诊断异常不影响闭爪和后续验证，也不再回到 pregrasp 或切换候选。
+- 固定指 robust gap 使用最终 IK/FK 预测接触残差参与候选软排序；启用
+  `target_gripper.fixed_finger_robust_gap.enabled` 时，下降完成后、闭爪前再用低位实测残差执行硬门禁。
+  测量不可用或门禁失败会先撤回 pregrasp，再以可重试错误切换候选；只有门禁通过后才会闭爪。
 - commanded/actual 位姿和接触点 residual 诊断；有 planner 输出目录时写入 `pick_pose_diagnostics.json`。
 - 抓取候选使用其 depth capture timestamp 查询 TF，不使用推理完成后的 latest TF；capture/latest/hand-eye
   变换写入 `pick_frame_diagnostics.json`。
 - 最终软排序明细写入 `prepared_candidate_ranking.json`，包含固定爪实际/目标间隙、移动爪余量、
   质心距离和综合分数。
+- 每次 selection attempt 都输出一条 `CANDIDATE_SELECTION_STATS` JSON 日志，记录原始、几何通过、预算保留、
+  IK/FK 准备成功数量以及各层淘汰错误码；有 planner 输出目录时，累计明细写入
+  `pick_candidate_rejections.json`，即使 `debug_output_mode=none` 也保留紧凑日志。
 - 抓后验证策略。
 - `PickObject.Result.pipeline_timings_json` 返回 `phase_preflight`、`phase_observe`、`phase_planning`、
   `phase_selecting`、`phase_open`、`phase_approach`、`phase_pregrasp`、`phase_descend`、`phase_close`、
@@ -111,18 +128,20 @@ pick_object:
   分支，并通过 `move_to_configuration` primitive 执行精确 IK 解；安全层检查完整关节顺序和限位。
 - 抓取前检查所有必需服务，缺失时不产生运动。
 - 最终 IK 解的 FK 固定爪朝向复检失败时，不执行该候选的 approach/descend/close。
-- 固定指间隙不足的候选只在批量候选准备阶段拒绝。到达 pregrasp 并完成在线接触补偿后，不再用第二次
-  robust-gap 复核触发撤回或候选 fallback；该结果降级为诊断，执行器继续 `descend` 和 `close_gripper`。
-  闭爪后的 TF/pose/robust-gap 检查同样是 best-effort，不能中断 commit-to-grasp。
-- position-only IK 的 joint5 超出执行门限时，将 seed 翻转 `±π` 以交换固定指/活动指所在侧；最终 FK 接近轴、
-  180° 对称闭合轴直线或固定指内侧检查失败时拒绝该候选，不再把 joint5 强制归零或停在 `±2.0` 边界。
+- 启用 `fixed_finger_robust_gap` 时，下降后、闭爪前必须取得低位位姿测量并通过 robust-gap 门禁；测量
+  缺失或间隙不足时先撤回 pregrasp，再以 `FIXED_FINGER_ROBUST_GAP_REJECTED` 切换候选。当前 SO101
+  profile 可通过该开关显式禁用此门禁；禁用时下降后直接闭爪。
+- position-only IK 的 joint5 超出 HOME 相对执行门限时，将 seed 翻转 `±π` 以交换固定指/活动指所在侧；
+  最终 FK 接近轴、180° 对称闭合轴直线或固定指内侧检查失败时拒绝该候选。观察位只提供初始 IK seed，
+  不作为 joint5 安全原点。
 - close 验证失败时闭爪撤回后再打开；probe/final lift 的 IK/FK、运动或 retention 验证失败时在当前位置
   打开并返回观察位。监督式客户端通过同一个 action 获得完全相同的恢复行为。
 - 桌面平面或 SO101 mesh 不可用时，目标夹爪 tabletop filter fail closed。
 - 同一时间只接受一个抓取 goal，并将上游取消请求传给当前 primitive。
-- 隔离 worker pool 同时承担候选准备和执行期接触补偿、分支锁定所需的 IK/FK；单个 worker RPC 超时后会
-  移除悬挂请求、隔离该 worker 并切换到其他已验证 worker。主 MoveIt 只负责真实规划和运动，避免不可取消的
-  `/compute_ik` 请求阻塞后续恢复运动。
+- 隔离 worker pool 按固定 round-robin 分区承担批量候选 IK/FK，主 MoveIt 在执行前校验全部 worker 的
+  当前 `/joint_states` FK 位姿的共同 seed 解。worker RPC 失败按既有候选准备错误策略处理，不会在本次
+  批处理中改派到其他 worker。
+  执行期接触补偿和真实规划、运动仍使用主 MoveIt。
 - `MoveToConfiguration` 当前是同步 ROS service；取消会停止本地等待，但服务端运动不具备 action 级硬取消。
   因此该 primitive 返回失败或超时后，`PickObject` 会 fail closed 并终止整个 goal，不会自动切换到下一候选。
 
@@ -135,7 +154,7 @@ source .shrc_local && source install/setup.bash && \
 ros2 run manipulation_execution pick_action_client --prompt banana --mode execute
 ```
 
-连续真机测试应使用同一个客户端进程，避免为每次抓取新建 DDS participant：
+单次 marker 真机抓取并在成功后低位释放：
 
 ```bash
 source .shrc_local && source install/setup.bash && \
@@ -143,9 +162,12 @@ ros2 run manipulation_execution pick_action_client \
   --prompt marker \
   --mode execute \
   --release-after-success \
-  --release-drop-height-m 0.015 \
-  --repeat 5
+  --release-drop-height-m 0.015
 ```
+
+客户端每次启动只发送一个 goal，不提供批量 repeat 功能。需要多次验证时，必须等待上一条命令完成并
+检查目标、机械臂和工作空间后，再人工执行下一次；不要使用 shell 循环自动连续下发真实运动。单次
+端到端耗时由 `PICK_ACTION_TIMING` 输出，各阶段耗时位于 `pipeline_timings_json`。
 
 客户端为每个 goal 预先生成 UUID。如果 DDS 压力导致 `SendGoal` response 丢失，客户端会通过原 UUID
 查询结果，不会重发抓取动作；`PICK_ACTION_GOAL_RESPONSE_RECOVERY` 表示进入了该安全恢复路径。
