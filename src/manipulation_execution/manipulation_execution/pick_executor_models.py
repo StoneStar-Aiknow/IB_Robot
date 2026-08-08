@@ -14,6 +14,46 @@ from manipulation_execution.so101_geometry import TablePlane
 
 
 @dataclass
+class CandidateSelectionDiagnostics:
+    """Request-local counters for one grasp selection attempt."""
+
+    selection_attempt: int
+    raw_candidates: int = 0
+    geometry_surviving_candidates: int = 0
+    ranked_candidates: int = 0
+    truncated_by_candidate_budget: int = 0
+    prepared_candidates: int = 0
+    geometry_rejections: dict[str, int] = field(default_factory=dict)
+    preparation_rejections: dict[str, int] = field(default_factory=dict)
+    terminal_code: str = ""
+    duration_s: float = 0.0
+
+    @staticmethod
+    def _increment(counters: dict[str, int], code: str) -> None:
+        counters[code] = counters.get(code, 0) + 1
+
+    def reject_geometry(self, code: str) -> None:
+        self._increment(self.geometry_rejections, code)
+
+    def reject_preparation(self, code: str) -> None:
+        self._increment(self.preparation_rejections, code)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "selection_attempt": self.selection_attempt,
+            "raw_candidates": self.raw_candidates,
+            "geometry_surviving_candidates": self.geometry_surviving_candidates,
+            "ranked_candidates": self.ranked_candidates,
+            "truncated_by_candidate_budget": self.truncated_by_candidate_budget,
+            "prepared_candidates": self.prepared_candidates,
+            "geometry_rejections": dict(sorted(self.geometry_rejections.items())),
+            "preparation_rejections": dict(sorted(self.preparation_rejections.items())),
+            "terminal_code": self.terminal_code,
+            "duration_s": self.duration_s,
+        }
+
+
+@dataclass
 class FlowState:
     completed_phases: list[str]
     pose_diagnostics: list[dict[str, Any]] = field(default_factory=list)
@@ -26,6 +66,7 @@ class FlowState:
     candidate_index: int = -1
     released_after_success: bool = False
     pipeline_timings: dict[str, float] = field(default_factory=dict)
+    candidate_selection_diagnostics: list[dict[str, Any]] = field(default_factory=list)
     active_phase: str = field(default="", repr=False)
     active_phase_started_at: float = field(default=0.0, repr=False)
 
@@ -94,8 +135,10 @@ class PreparedCandidate:
     mesh_min_z: float | None
     fixed_finger_envelope: FixedFingerEnvelope | None
     fk_fixed_finger_base_side: FixedFingerBaseSide | None
-    predicted_robust_gap_headroom_m: float | None
     selection_score: float
+    # Kept for compatibility with diagnostics added after PR259.  The PR259
+    # preparation phase does not calculate this value.
+    predicted_robust_gap_headroom_m: float | None = None
 
 
 @dataclass(frozen=True)

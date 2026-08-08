@@ -66,6 +66,24 @@ class GraspAxisErrors:
     closing_deg: float
 
 
+def target_extent_along_closing_axis(
+    ee_quaternion: Quaternion,
+    closing_axis_ee: Iterable[float],
+    target_width_min_base: Vector3,
+    target_width_max_base: Vector3,
+) -> float:
+    """Project the measured target extent onto the actual FK closing axis."""
+
+    closing_axis_base = quaternion_matrix(ee_quaternion) @ _normalized(closing_axis_ee)
+    target_extent = np.asarray(target_width_max_base, dtype=np.float64) - np.asarray(
+        target_width_min_base,
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(target_extent)):
+        raise ValueError("target width extent must be finite")
+    return abs(float(np.dot(target_extent, closing_axis_base)))
+
+
 def _triplet(value: Any, default: Vector3) -> Vector3:
     if not isinstance(value, list | tuple) or len(value) != 3:
         return default
@@ -227,6 +245,8 @@ def _target_contact_geometry(
     )
     closing_axis = _normalized(_triplet(target_gripper.get("closing_axis_ee"), (1.0, 0.0, 0.0)))
     quality_min = float(target_gripper.get("width_quality_min", 0.75))
+    min_width = float(target_gripper.get("min_width_m", 0.008))
+    max_width = float(target_gripper.get("max_width_m", 0.080))
     width = float(target_width_m)
     if not math.isfinite(width) or width <= 0.0 or float(target_width_quality) < quality_min:
         width = float(target_gripper.get("fallback_width_m", 0.035))
@@ -234,8 +254,6 @@ def _target_contact_geometry(
     else:
         source = "measured"
 
-    min_width = float(target_gripper.get("min_width_m", 0.008))
-    max_width = float(target_gripper.get("max_width_m", 0.080))
     width = min(max(width, min_width), max_width)
     width_with_clearance = min(max(width + float(target_gripper.get("width_clearance_m", 0.003)), min_width), max_width)
     base_margin = max(0.0, float(target_gripper.get("fixed_finger_margin_m", 0.0)))
@@ -470,8 +488,8 @@ def target_width_extent_points(
     candidate_origin = candidate_matrix[:3, 3]
     transform = np.asarray(base_to_camera, dtype=np.float64)
     extent_points = []
-    for offset in (target_width_min_offset_m, target_width_max_offset_m):
-        point_camera = candidate_origin + width_axis * float(offset)
+    for width_offset in (target_width_min_offset_m, target_width_max_offset_m):
+        point_camera = candidate_origin + width_axis * float(width_offset)
         point_base = transform @ np.array([*point_camera, 1.0], dtype=np.float64)
         extent_points.append((float(point_base[0]), float(point_base[1]), float(point_base[2])))
     return extent_points[0], extent_points[1]
@@ -494,7 +512,7 @@ def build_candidate_plan(
     )
     adapter = grasp_execution.get("adapter", {})
     adapter_rotation = euler_xyz_matrix(_triplet(adapter.get("source_to_ee_rpy"), (math.pi, 0.0, 0.0)))
-    target_contact, _, fixed_finger_target_gap, width_reason = _target_contact_geometry(
+    target_contact, target_width_used, fixed_finger_target_gap, width_reason = _target_contact_geometry(
         grasp_execution,
         target_width_m,
         target_width_quality,
@@ -508,6 +526,13 @@ def build_candidate_plan(
     base_to_camera = np.asarray(base_to_camera, dtype=np.float64)
     base_to_source = base_to_camera @ candidate_matrix
     base_to_ee = base_to_source @ source_to_ee
+    target_offset = np.asarray(
+        _triplet(grasp_execution.get("candidate_target_offset_base_m"), (0.0, 0.0, 0.0)),
+        dtype=np.float64,
+    )
+    if not np.all(np.isfinite(target_offset)):
+        raise ValueError("candidate_target_offset_base_m must be finite")
+    base_to_ee[:3, 3] += target_offset
     grasp: Vector3 = (float(base_to_ee[0, 3]), float(base_to_ee[1, 3]), float(base_to_ee[2, 3]))
     approach_axis: Vector3 = (
         float(base_to_source[0, 2]),
@@ -548,7 +573,7 @@ def build_candidate_plan(
         approach_axis=approach_axis,
         target_contact_ee=(float(target_contact[0]), float(target_contact[1]), float(target_contact[2])),
         target_contact_base=(float(contact[0]), float(contact[1]), float(contact[2])),
-        target_width_m=float(target_width_m),
+        target_width_m=target_width_used,
         width_reason=width_reason,
         fixed_finger_target_gap_m=fixed_finger_target_gap,
         target_width_min_base=target_width_min_base,

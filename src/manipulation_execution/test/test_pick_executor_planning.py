@@ -1,9 +1,15 @@
 from types import SimpleNamespace
 from typing import Any, cast
 
+import pytest
+
 import manipulation_execution.phases.planning as planning_module
 from manipulation_execution.grasp_geometry import CandidatePlan
-from manipulation_execution.pick_executor_models import BaseSceneGeometry, PlannerSceneGeometry
+from manipulation_execution.pick_executor_models import (
+    BaseSceneGeometry,
+    CandidateSelectionDiagnostics,
+    PlannerSceneGeometry,
+)
 from manipulation_execution.pick_executor_node import PickExecutorNode
 
 
@@ -60,6 +66,7 @@ def test_candidate_budget_is_applied_after_cheap_geometry_filters(monkeypatch):
         _target_geometry={},
         _stamp_to_ns=PickExecutorNode._stamp_to_ns,
     )
+    diagnostics = CandidateSelectionDiagnostics(selection_attempt=1)
 
     ranked = PickExecutorNode._rank_candidates(
         cast(Any, harness),
@@ -69,7 +76,35 @@ def test_candidate_budget_is_applied_after_cheap_geometry_filters(monkeypatch):
         [_candidate(index) for index in range(6)],
         PlannerSceneGeometry(),
         BaseSceneGeometry(),
+        diagnostics=diagnostics,
     )
 
     assert built_indices == list(range(6))
     assert [candidate.index for candidate in ranked] == [3, 4]
+    assert diagnostics.geometry_rejections == {"HEIGHT_OR_APPROACH_REJECTED": 3}
+    assert diagnostics.geometry_surviving_candidates == 3
+    assert diagnostics.ranked_candidates == 3
+    assert diagnostics.truncated_by_candidate_budget == 1
+
+
+def test_fallback_detection_returns_none_without_call_when_service_is_unavailable():
+    client = SimpleNamespace(
+        service_is_ready=lambda: False,
+        call_async=lambda _request: pytest.fail("unavailable fallback service must not be called"),
+    )
+    harness = SimpleNamespace(
+        _detect_client=client,
+        _detect_service="/optional/detect",
+        get_logger=lambda: SimpleNamespace(warning=lambda *_args: None),
+    )
+
+    result = PickExecutorNode._request_fallback_detection_centroid(
+        cast(Any, harness),
+        None,
+        10.0,
+        "banana",
+        "volume",
+        0.1,
+    )
+
+    assert result is None

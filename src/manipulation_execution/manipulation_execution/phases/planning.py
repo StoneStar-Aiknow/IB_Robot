@@ -11,7 +11,7 @@ from rclpy.duration import Duration
 from rclpy.time import Time
 
 from ibrobot_msgs.msg import GraspCandidate
-from ibrobot_msgs.srv import PlanGrasp
+from ibrobot_msgs.srv import DetectSegment, PlanGrasp
 from manipulation_execution.grasp_geometry import (
     build_candidate_plan,
     contact_distance_score,
@@ -21,6 +21,7 @@ from manipulation_execution.grasp_geometry import (
 )
 from manipulation_execution.pick_executor_models import (
     BaseSceneGeometry,
+    CandidateSelectionDiagnostics,
     FlowState,
     PickFlowError,
     PlannerSceneGeometry,
@@ -97,11 +98,44 @@ class PlanningPhase:
         centroid_source: str,
         confidence_threshold: float,
     ) -> tuple[float, float, float] | None:
-        del goal_handle, deadline, target_query, centroid_source, confidence_threshold
-        self.get_logger().warning(
-            "planner response did not contain a centroid; generic perception fallback is unavailable"
+        if not self._detect_client.service_is_ready():
+            self.get_logger().warning(f"fallback detection skipped: service unavailable: {self._detect_service}")
+            return None
+        request = DetectSegment.Request()
+        request.text_prompt = target_query
+        request.confidence_threshold = confidence_threshold
+        try:
+            response = self._wait_future(
+                self._detect_client.call_async(request),
+                goal_handle,
+                deadline,
+                min(float(self._config.get("planner", {}).get("timeout_sec", 120.0)), self._remaining(deadline)),
+                "fallback detection",
+            )
+        except PickFlowError as exc:
+            self.get_logger().warning(f"fallback detection skipped: {exc}")
+            return None
+        if not response.success:
+            self.get_logger().warning(f"fallback detection failed: {response.message}")
+            return None
+        minimum_points = int(self._config.get("candidate_selection", {}).get("min_point_count", 100))
+        matching = [
+            detection
+            for detection in response.detections.detections
+            if target_query.lower() in str(detection.label).lower() and int(detection.point_count) >= minimum_points
+        ]
+        if not matching:
+            return None
+        detection = max(matching, key=lambda item: (float(item.confidence), int(item.point_count)))
+        use_volume = centroid_source == "volume" and float(detection.volume_m3) > 0.0
+        centroid = detection.volume_centroid_xyz if use_volume else detection.centroid_xyz
+        values = (float(centroid.x), float(centroid.y), float(centroid.z))
+        if not all(np.isfinite(value) for value in values):
+            return None
+        self.get_logger().info(
+            f"fallback detection centroid source={'volume' if use_volume else 'surface'} xyz={values}"
         )
-        return None
+        return values
 
     def _lookup_base_transform(self, frame_id: str, stamp=None):
         if not frame_id:
@@ -184,6 +218,8 @@ class PlanningPhase:
         candidates: list[GraspCandidate],
         scene: PlannerSceneGeometry,
         scene_base: BaseSceneGeometry,
+        *,
+        diagnostics: CandidateSelectionDiagnostics | None = None,
     ) -> list[RankedCandidate]:
         selection = self._config.get("candidate_selection", {})
         scoring = self._config.get("execution_scoring", {})
@@ -214,11 +250,17 @@ class PlanningPhase:
         transforms: dict[tuple[str, int], np.ndarray] = {(default_frame, default_stamp_ns): default_transform}
         ranked: list[RankedCandidate] = []
 
+        def reject(code: str) -> None:
+            if diagnostics is not None:
+                diagnostics.reject_geometry(code)
+
         for index, candidate in enumerate(candidates):
             confidence = float(candidate.confidence)
             if confidence < min_confidence:
+                reject("MIN_CONFIDENCE")
                 continue
             if require_collision_free and not bool(candidate.collision_free):
+                reject("COLLISION_NOT_FREE")
                 continue
             frame_id = candidate.header.frame_id or default_frame
             candidate_stamp = candidate.header.stamp
@@ -239,6 +281,7 @@ class PlanningPhase:
                     target_width_max_offset_m=float(candidate.target_width_max_offset_m),
                 )
             except (ValueError, ArithmeticError):
+                reject("CANDIDATE_GEOMETRY_INVALID")
                 continue
             normalized_topdown = max(
                 0.0,
@@ -250,12 +293,15 @@ class PlanningPhase:
                 or plan.approach[2] < min_approach_z
                 or plan.topdown_score < min_topdown_score
             ):
+                reject("HEIGHT_OR_APPROACH_REJECTED")
                 continue
             if any(not xyz_within_workspace(xyz, self._workspace)[0] for xyz in (plan.approach, plan.grasp, plan.lift)):
+                reject("WORKSPACE_REJECTED")
                 continue
             fixed_finger_base_side = None
             if check_fixed_finger_base_side:
                 if plan.target_width_min_base is None or plan.target_width_max_base is None:
+                    reject("FIXED_FINGER_BASE_SIDE_UNAVAILABLE")
                     continue
                 try:
                     fixed_finger_base_side = fixed_finger_base_side_alignment(
@@ -267,8 +313,10 @@ class PlanningPhase:
                         base_side_config.get("reference_point_base", [0.0, 0.0, 0.0]),
                     )
                 except ValueError:
+                    reject("FIXED_FINGER_BASE_SIDE_UNAVAILABLE")
                     continue
                 if fixed_finger_base_side.alignment_cos < minimum_base_side_alignment:
+                    reject("FIXED_FINGER_BASE_SIDE_REJECTED")
                     continue
             contact_distance = None
             contact_score = 0.0
@@ -292,6 +340,9 @@ class PlanningPhase:
                     fixed_finger_base_side=fixed_finger_base_side,
                 )
             )
+
+        if diagnostics is not None:
+            diagnostics.geometry_surviving_candidates = len(ranked)
 
         if bool(self._target_geometry.get("tabletop_filter", False)) and ranked:
             if self._mesh_directory is None or scene_base.table_plane is None:
@@ -317,11 +368,18 @@ class PlanningPhase:
                 )
             except Exception as exc:
                 raise PickFlowError("TARGET_GEOMETRY_FAILED", str(exc)) from exc
+            tabletop_candidates = len(ranked)
             ranked = [
                 item
                 for item, (_, clearance) in zip(ranked, geometry_metrics, strict=True)
                 if clearance is not None and clearance >= minimum_clearance
             ]
+            if diagnostics is not None:
+                for _ in range(tabletop_candidates - len(ranked)):
+                    diagnostics.reject_geometry("TARGET_TABLETOP_COLLISION")
+
+        if diagnostics is not None:
+            diagnostics.ranked_candidates = len(ranked)
 
         ranked.sort(
             key=lambda item: (
@@ -332,6 +390,8 @@ class PlanningPhase:
             )
         )
         if max_candidates > 0:
+            if diagnostics is not None:
+                diagnostics.truncated_by_candidate_budget = max(0, len(ranked) - max_candidates)
             ranked = ranked[:max_candidates]
         if not ranked:
             raise PickFlowError("NO_SAFE_GRASP_CANDIDATES", "no candidate passed geometry and workspace checks")

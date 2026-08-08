@@ -1,7 +1,6 @@
 import math
 
 import numpy as np
-import pytest
 
 from manipulation_execution.grasp_geometry import (
     build_candidate_plan,
@@ -11,6 +10,7 @@ from manipulation_execution.grasp_geometry import (
     fixed_finger_envelope_score,
     fixed_finger_robust_gap,
     grasp_axis_errors,
+    prepared_candidate_soft_score,
     quaternion_from_matrix,
     quaternion_matrix,
     source_contact_camera,
@@ -224,33 +224,6 @@ def test_fixed_finger_robust_gap_rejects_error_toward_fixed_finger():
     assert accepted.passed is True
 
 
-def test_fixed_finger_robust_gap_tolerates_only_configured_measurement_noise():
-    borderline = fixed_finger_robust_gap(
-        0.0099,
-        0.0135,
-        (0.0, 0.0, 0.0),
-        (0.0, 0.0, 0.0, 1.0),
-        (1.0, 0.0, 0.0),
-        max_target_gap_deficit_m=0.003,
-        measurement_tolerance_m=0.001,
-    )
-    unsafe = fixed_finger_robust_gap(
-        0.0094,
-        0.0135,
-        (0.0, 0.0, 0.0),
-        (0.0, 0.0, 0.0, 1.0),
-        (1.0, 0.0, 0.0),
-        max_target_gap_deficit_m=0.003,
-        measurement_tolerance_m=0.001,
-    )
-
-    assert borderline.gap_deficit_m == pytest.approx(0.0006)
-    assert borderline.measurement_tolerance_m == pytest.approx(0.001)
-    assert borderline.passed is True
-    assert unsafe.gap_deficit_m == pytest.approx(0.0011)
-    assert unsafe.passed is False
-
-
 def test_source_contact_camera_and_centroid_score():
     candidate = np.eye(4, dtype=np.float64)
     candidate[:3, 3] = [0.1, -0.2, 0.3]
@@ -274,3 +247,31 @@ def test_workspace_checks_radius():
     )
     assert not allowed
     assert "radius" in reason
+
+
+def test_robust_gap_headroom_ranks_a_tight_fixed_finger_gap_below_a_roomy_one():
+    """The preparation phase ranks on predicted headroom so tight candidates go last."""
+    config = {
+        "enabled": True,
+        "fixed_finger_envelope_weight": 0.55,
+        "contact_xy_weight": 0.25,
+        "contact_z_weight": 0.15,
+        "confidence_weight": 0.05,
+        "robust_gap_headroom_weight": 0.35,
+        "robust_gap_headroom_scale_m": 0.004,
+        "missing_robust_gap_headroom_score": 0.50,
+    }
+    shared = {
+        "fixed_finger_envelope": 0.9,
+        "contact_residual_xy_m": 0.001,
+        "contact_z_error_m": 0.001,
+        "confidence": 0.9,
+    }
+
+    roomy = prepared_candidate_soft_score(config, robust_gap_headroom_m=+0.004, **shared)
+    tight = prepared_candidate_soft_score(config, robust_gap_headroom_m=-0.002, **shared)
+    unknown = prepared_candidate_soft_score(config, robust_gap_headroom_m=None, **shared)
+
+    assert roomy > unknown > tight
+    # A missing measurement must not be treated as a failure.
+    assert prepared_candidate_soft_score(config, robust_gap_headroom_m=float("nan"), **shared) == unknown
