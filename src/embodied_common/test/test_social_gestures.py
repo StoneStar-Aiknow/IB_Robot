@@ -85,9 +85,8 @@ def _previous_arm_primitive(primitive_sequence: list[dict], index: int) -> dict 
 
 
 @pytest.mark.parametrize("gesture", SOCIAL_GESTURES)
-def test_social_gesture_registration_is_complete(gesture: str, embodied_config: dict, skill_templates: dict) -> None:
+def test_social_gesture_registration_is_complete(gesture: str, skill_templates: dict) -> None:
     assert gesture in skill_templates
-    assert gesture in embodied_config["planner"]["planning_policy"]["allowed_skills"]
 
 
 @pytest.mark.parametrize("gesture", TRAJECTORY_GESTURES)

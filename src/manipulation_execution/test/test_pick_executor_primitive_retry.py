@@ -1,8 +1,8 @@
-import time
 from threading import Lock
 from types import SimpleNamespace
 
 import pytest
+from rclpy.clock import Clock
 
 from embodied_common.dispatch_binding import delegated_executor_identity, fill_delegated_executor_identity, new_binding
 from ibrobot_msgs.action import PickObject
@@ -84,6 +84,7 @@ def test_delegated_dispatch_nonce_is_forwarded_to_primitive() -> None:
 
 def test_pick_executor_rejects_identity_mismatch_and_requires_dispatch_nonce() -> None:
     executor = object.__new__(PickExecutorNode)
+    executor._clock = Clock()
     executor._goal_lock = Lock()
     executor._goal_active = False
     executor._dispatch_nonce = ""
@@ -104,7 +105,7 @@ def test_pick_executor_rejects_identity_mismatch_and_requires_dispatch_nonce() -
     goal.dispatch_binding.expected_registry_generation = 1
     goal.dispatch_binding.expected_registry_digest = "digest-1"
     goal.dispatch_binding.task_budget.schema_version = 1
-    now = time.time()
+    now = executor.get_clock().now().nanoseconds / 1_000_000_000
     goal.dispatch_binding.task_budget.started_at.sec = int(now)
     goal.dispatch_binding.task_budget.deadline.sec = int(now + 10.0)
     goal.timeout_sec = 5.0
