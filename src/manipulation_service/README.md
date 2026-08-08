@@ -84,7 +84,9 @@ source .shrc_local && colcon build --symlink-install --merge-install --packages-
 
 ### 1. 单独运行在线 GraspGen 抓取节点
 
-运行前需先通过 robot-config 启动相机和抓取所选的 generic model service。默认使用
+运行前需先通过 robot-config 启动相机，以及抓取配置中每个 named deployment 对应的
+`perception_service/model_service_node`。310P 配置会分别启动 Grounding-DINO 检测和 SAM2
+分割实例；不要再启动已删除的 `grounded_sam2_node` 或 `grounded_sam2_snapshot`。默认使用
 SO101 wrist camera 话题：
 
 ```bash
@@ -165,6 +167,27 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 `robot_config.robot.grasp_execution` 读取服务名称、超时、速度、规划阈值、候选过滤、IK、接触补偿、
 接触重对齐、位姿诊断、目标夹爪几何和执行评分；监督式客户端不能覆盖这些行为参数。因此 GraspGen
 不需要绑定 SO101，新增机器人可在自己的 robot_config 中定义完整执行策略。
+
+### 3. 通过正式执行层抓取
+
+`manipulation_service` 不控制机械臂。完整抓取由 `manipulation_execution/pick_executor_node`
+提供的 `/manipulation/execute_pick` action 执行；它负责目标机器人专用的 IK/workspace、夹爪几何、
+MoveIt 运动、恢复和抓后验证。推荐通过统一 robot-config bringup 启动 planner、verifier 和 executor，
+不要使用历史调试脚本代替机器人执行层。
+
+监督式执行示例：
+
+```bash
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && \
+ros2 run manipulation_execution pick_action_client --prompt marker --mode execute
+```
+
+只验证候选、IK/FK 和安全门禁而不产生运动时使用：
+
+```bash
+source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && \
+ros2 run manipulation_execution pick_action_client --prompt marker --mode plan_only
+```
 
 SO101 执行侧 tabletop sweep 优先使用 `PlanGrasp.execution_table_plane_*`。该平面由服务端直接基于
 completed scene cloud 按执行侧历史采样规则拟合，因此正常运行不再依赖 `scene_cloud.ply`，也不会为了

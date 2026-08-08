@@ -51,6 +51,13 @@ def test_every_bundle_packager_is_an_installed_command():
     assert {name: declared.get(name) for name in _PACKAGERS} == _PACKAGERS
 
 
+def test_removed_grounded_sam2_commands_are_not_installed():
+    declared = _console_scripts()
+
+    assert "grounded_sam2_node" not in declared
+    assert "grounded_sam2_snapshot" not in declared
+
+
 @pytest.mark.parametrize("target", sorted(_PACKAGERS.values()))
 def test_packager_command_targets_resolve(target):
     module_name, attribute = target.split(":")

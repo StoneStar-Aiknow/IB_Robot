@@ -279,13 +279,21 @@ class PreparationPhase:
         deadline: float,
         *,
         ik_client=None,
+        allow_failover: bool = True,
     ) -> tuple[JointState, float | None]:
         limit = self._joint5_abs_max()
         if limit is None:
             return solution, None
 
         def _retry_solver(retry_seed: JointState) -> JointState | None:
-            return self._solve_ik(pose, goal_handle, deadline, retry_seed, client=ik_client)
+            return self._solve_ik(
+                pose,
+                goal_handle,
+                deadline,
+                retry_seed,
+                client=ik_client,
+                allow_failover=allow_failover,
+            )
 
         result = apply_joint5_retry(
             joint_state=solution,
@@ -345,17 +353,32 @@ class PreparationPhase:
         validate_orientation: bool = True,
         ik_client=None,
         fk_client=None,
+        allow_failover: bool = True,
     ) -> IKPayload:
-        joint_state = self._solve_ik(pose, goal_handle, deadline, seed, client=ik_client)
+        joint_state = self._solve_ik(
+            pose,
+            goal_handle,
+            deadline,
+            seed,
+            client=ik_client,
+            allow_failover=allow_failover,
+        )
         joint_state, original_joint5 = self._apply_joint5_retry_if_needed(
             pose,
             joint_state,
             goal_handle,
             deadline,
             ik_client=ik_client,
+            allow_failover=allow_failover,
         )
         self._validate_joint5(joint_state)
-        fk_pose = self._compute_fk(joint_state, goal_handle, deadline, client=fk_client)
+        fk_pose = self._compute_fk(
+            joint_state,
+            goal_handle,
+            deadline,
+            client=fk_client,
+            allow_failover=allow_failover,
+        )
         ee_xyz, ee_quaternion = self._pose_components(fk_pose)
         _, target_quaternion = self._pose_components(pose)
         errors = self._grasp_orientation_errors(target_quaternion, ee_quaternion)
@@ -389,6 +412,7 @@ class PreparationPhase:
         *,
         ik_client=None,
         fk_client=None,
+        allow_failover: bool = True,
     ) -> IKPayload:
         guard = self._orientation_guard()
         if not bool(guard.get("enabled", False)):
@@ -399,6 +423,7 @@ class PreparationPhase:
                 seed,
                 ik_client=ik_client,
                 fk_client=fk_client,
+                allow_failover=allow_failover,
             )
 
         _, target_quaternion = self._pose_components(pose)
@@ -416,6 +441,7 @@ class PreparationPhase:
                 validate_orientation=False,
                 ik_client=ik_client,
                 fk_client=fk_client,
+                allow_failover=allow_failover,
             )
             joint5 = self._joint_position(payload.joint_state, "5")
             approach_error = payload.approach_axis_error_deg
@@ -554,6 +580,7 @@ class PreparationPhase:
         *,
         ik_client=None,
         fk_client=None,
+        allow_failover: bool = True,
     ) -> None:
         """Reject candidates whose approach/lift branch cannot preserve the grasp orientation."""
         check_orientation = bool(self._config.get("ik", {}).get("check_orientation", False))
@@ -576,6 +603,7 @@ class PreparationPhase:
                         grasp_payload.joint_state,
                         ik_client=ik_client,
                         fk_client=fk_client,
+                        allow_failover=allow_failover,
                     )
                     solution = transit_payload.joint_state
                 else:
@@ -586,6 +614,7 @@ class PreparationPhase:
                         deadline,
                         grasp_payload.joint_state,
                         client=ik_client,
+                        allow_failover=allow_failover,
                     )
                 self._validate_joint5_branch_continuity(grasp_payload.joint_state, solution)
             except PickFlowError as exc:
@@ -607,6 +636,7 @@ class PreparationPhase:
         initial_seed: JointState | None = None,
         ik_client=None,
         fk_client=None,
+        allow_failover: bool = True,
     ) -> PreparedCandidate:
         plan = ranked.plan
         compensation = self._config.get("contact_compensation", {})
@@ -627,6 +657,7 @@ class PreparationPhase:
                     seed,
                     ik_client=ik_client,
                     fk_client=fk_client,
+                    allow_failover=allow_failover,
                 )
                 return ContactPrediction(
                     contact_base=self._contact_for_pose(
@@ -677,6 +708,7 @@ class PreparationPhase:
                 initial_seed,
                 ik_client=ik_client,
                 fk_client=fk_client,
+                allow_failover=allow_failover,
             )
             predicted_contact = self._contact_for_pose(
                 self._pose(payload.ee_xyz, payload.ee_quaternion),
@@ -719,6 +751,7 @@ class PreparationPhase:
             deadline,
             ik_client=ik_client,
             fk_client=fk_client,
+            allow_failover=allow_failover,
         )
 
         closing_axis = self._config.get("target_gripper", {}).get("closing_axis_ee", [1.0, 0.0, 0.0])
@@ -989,6 +1022,7 @@ class PreparationPhase:
                         initial_seed=joint_seed,
                         ik_client=self._ik_worker_clients[worker_index],
                         fk_client=self._fk_worker_clients[worker_index],
+                        allow_failover=False,
                     )
                 except PickFlowError as exc:
                     return exc

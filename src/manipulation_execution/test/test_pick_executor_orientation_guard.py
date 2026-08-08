@@ -49,8 +49,10 @@ class _OrientationHarness:
         validate_orientation,
         ik_client=None,
         fk_client=None,
+        allow_failover=True,
     ):
         del validate_orientation, ik_client, fk_client
+        assert allow_failover is True
         self.seeds.append(seed)
         if len(self.seeds) == 1:
             return IKPayload(

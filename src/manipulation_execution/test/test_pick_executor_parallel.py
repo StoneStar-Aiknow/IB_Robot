@@ -69,13 +69,23 @@ def test_parallel_candidate_preparation_balances_shared_queue_and_preserves_rank
         get_logger=lambda: _Logger(),
     )
     harness._verify_ik_worker_pool = lambda *_args: None
-    calls: list[tuple[int, str, str]] = []
+    calls: list[tuple[int, str, str, bool]] = []
 
-    def prepare(candidate, _scene, _goal, _deadline, *, initial_seed, ik_client, fk_client):
+    def prepare(
+        candidate,
+        _scene,
+        _goal,
+        _deadline,
+        *,
+        initial_seed,
+        ik_client,
+        fk_client,
+        allow_failover,
+    ):
         del initial_seed
         if candidate.index == 0:
             time.sleep(0.05)
-        calls.append((candidate.index, ik_client, fk_client))
+        calls.append((candidate.index, ik_client, fk_client, allow_failover))
         return candidate.index
 
     harness._prepare_candidate = prepare
@@ -92,9 +102,43 @@ def test_parallel_candidate_preparation_balances_shared_queue_and_preserves_rank
 
     assert error is None
     assert prepared == list(range(8))
-    assert sorted(index for index, _, _ in calls) == list(range(8))
-    assert all(ik_client.removeprefix("ik_") == fk_client.removeprefix("fk_") for _, ik_client, fk_client in calls)
-    assert any(index % 3 != int(ik_client.removeprefix("ik_")) for index, ik_client, _ in calls)
+    assert sorted(index for index, _, _, _ in calls) == list(range(8))
+    assert all(ik_client.removeprefix("ik_") == fk_client.removeprefix("fk_") for _, ik_client, fk_client, _ in calls)
+    assert all(allow_failover is False for _, _, _, allow_failover in calls)
+    assert any(index % 3 != int(ik_client.removeprefix("ik_")) for index, ik_client, _, _ in calls)
+
+
+def test_grasp_ik_fk_preserves_worker_failover_policy_for_all_subcalls():
+    calls = []
+    joint_state = JointState(name=["1"], position=[0.2])
+    fk_pose = Pose()
+    fk_pose.orientation.w = 1.0
+    harness = SimpleNamespace(
+        _solve_ik=lambda *_args, **kwargs: (calls.append(("ik", kwargs["allow_failover"])), joint_state)[1],
+        _apply_joint5_retry_if_needed=lambda *_args, **kwargs: (
+            calls.append(("joint5_retry", kwargs["allow_failover"])),
+            (joint_state, None),
+        )[1],
+        _validate_joint5=lambda _joint_state: None,
+        _compute_fk=lambda *_args, **kwargs: (calls.append(("fk", kwargs["allow_failover"])), fk_pose)[1],
+        _pose_components=lambda pose: (
+            (pose.position.x, pose.position.y, pose.position.z),
+            (pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w),
+        ),
+        _grasp_orientation_errors=lambda *_args: None,
+    )
+
+    payload = PickExecutorNode._solve_grasp_ik_fk(
+        cast(Any, harness),
+        Pose(),
+        None,
+        time.monotonic() + 5.0,
+        joint_state,
+        allow_failover=False,
+    )
+
+    assert payload.joint_state is joint_state
+    assert calls == [("ik", False), ("joint5_retry", False), ("fk", False)]
 
 
 def test_worker_verification_uses_current_fk_pose_checks_every_worker_and_caches():
