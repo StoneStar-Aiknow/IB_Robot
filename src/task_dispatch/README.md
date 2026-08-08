@@ -69,6 +69,10 @@ VoxPoser planner ─────┘                               │
 | `/{gripper_controller}/follow_joint_trajectory` | `control_msgs/action/FollowJointTrajectory` (Action) | 夹爪控制，由 ros2_control 提供 |
 | `/joint_states` | `sensor_msgs/msg/JointState` (Topic) | 关节状态反馈 |
 
+`moveit_planning.executor` 可配置 `skip_redundant_gripper_open`、`gripper_open_position`、
+`gripper_position_tolerance` 和 `joint_state_max_age_s`。启用后，仅当最近收到的关节反馈足够新、包含夹爪关节，
+且当前位置已在打开目标容差内时，执行器才跳过打开轨迹；关闭命令以及陈旧或缺失反馈仍按原路径执行。
+
 ### 消息定义
 
 **TaskStep.msg** — 任务步骤：

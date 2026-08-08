@@ -11,7 +11,7 @@ from rclpy.duration import Duration
 from rclpy.time import Time
 
 from ibrobot_msgs.msg import GraspCandidate
-from ibrobot_msgs.srv import DetectSegment, PlanGrasp
+from ibrobot_msgs.srv import PlanGrasp
 from manipulation_execution.grasp_geometry import (
     build_candidate_plan,
     contact_distance_score,
@@ -97,41 +97,11 @@ class PlanningPhase:
         centroid_source: str,
         confidence_threshold: float,
     ) -> tuple[float, float, float] | None:
-        request = DetectSegment.Request()
-        request.text_prompt = target_query
-        request.confidence_threshold = confidence_threshold
-        try:
-            response = self._wait_future(
-                self._detect_client.call_async(request),
-                goal_handle,
-                deadline,
-                min(float(self._config.get("planner", {}).get("timeout_sec", 120.0)), self._remaining(deadline)),
-                "fallback detection",
-            )
-        except PickFlowError as exc:
-            self.get_logger().warning(f"fallback detection skipped: {exc}")
-            return None
-        if not response.success:
-            self.get_logger().warning(f"fallback detection failed: {response.message}")
-            return None
-        minimum_points = int(self._config.get("candidate_selection", {}).get("min_point_count", 100))
-        matching = [
-            detection
-            for detection in response.detections.detections
-            if target_query.lower() in str(detection.label).lower() and int(detection.point_count) >= minimum_points
-        ]
-        if not matching:
-            return None
-        detection = max(matching, key=lambda item: (float(item.confidence), int(item.point_count)))
-        use_volume = centroid_source == "volume" and float(detection.volume_m3) > 0.0
-        centroid = detection.volume_centroid_xyz if use_volume else detection.centroid_xyz
-        values = (float(centroid.x), float(centroid.y), float(centroid.z))
-        if not all(np.isfinite(value) for value in values):
-            return None
-        self.get_logger().info(
-            f"fallback detection centroid source={'volume' if use_volume else 'surface'} xyz={values}"
+        del goal_handle, deadline, target_query, centroid_source, confidence_threshold
+        self.get_logger().warning(
+            "planner response did not contain a centroid; generic perception fallback is unavailable"
         )
-        return values
+        return None
 
     def _lookup_base_transform(self, frame_id: str, stamp=None):
         if not frame_id:

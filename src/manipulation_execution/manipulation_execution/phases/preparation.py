@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,11 +18,10 @@ from manipulation_execution.contact_compensation import ContactPrediction, compe
 from manipulation_execution.grasp_geometry import (
     CandidatePlan,
     FixedFingerBaseSide,
-    canonicalize_joint5,
     fixed_finger_base_side_alignment,
     fixed_finger_envelope_score,
+    fixed_finger_robust_gap,
     grasp_axis_errors,
-    joint5_closing_axis_correction,
     prepared_candidate_soft_score,
     xyz_within_workspace,
 )
@@ -35,13 +34,109 @@ from manipulation_execution.pick_executor_models import (
     PreparedCandidate,
     RankedCandidate,
 )
+from manipulation_execution.pipeline_worker import dynamic_worker_map
 from manipulation_execution.so101_geometry import axis_error_deg, gripper_mesh_min_z, tabletop_clearance
+from manipulation_execution.so101_kinematics_guard import (
+    apply_joint5_retry,
+    canonicalize_joint5,
+    joint5_branch_continuity_check,
+    joint5_branch_delta,
+    joint5_branch_filter_check,
+    joint5_closing_axis_correction,
+    joint5_within_abs_limit,
+)
 
 JOINT5_ORIENTATION_MAX_CLOSING_ERROR_DEG = 20.0
 
 
 class PreparationPhase:
     """Convert ranked source candidates into executable target configurations."""
+
+    def _kinematics_worker_index(self, client) -> int | None:
+        for index, (ik_client, fk_client) in enumerate(
+            zip(
+                getattr(self, "_ik_worker_clients", []),
+                getattr(self, "_fk_worker_clients", []),
+                strict=True,
+            )
+        ):
+            if client is ik_client or client is fk_client:
+                return index
+        return None
+
+    def _kinematics_unhealthy_snapshot(self) -> set[int]:
+        unhealthy = getattr(self, "_kinematics_unhealthy_workers", set())
+        lock = getattr(self, "_kinematics_health_lock", None)
+        if lock is None:
+            return set(unhealthy)
+        with lock:
+            return set(unhealthy)
+
+    def _mark_kinematics_worker_unhealthy(self, index: int, reason: str) -> None:
+        unhealthy = getattr(self, "_kinematics_unhealthy_workers", None)
+        if unhealthy is None:
+            unhealthy = set()
+            self._kinematics_unhealthy_workers = unhealthy
+        lock = getattr(self, "_kinematics_health_lock", None)
+        if lock is None:
+            added = index not in unhealthy
+            unhealthy.add(index)
+        else:
+            with lock:
+                added = index not in unhealthy
+                unhealthy.add(index)
+        self._ik_worker_verification = None
+        if added:
+            self.get_logger().warning(f"quarantined IK/FK worker {index} after {reason}")
+
+    def _mark_kinematics_worker_healthy(self, client) -> None:
+        index = self._kinematics_worker_index(client)
+        if index is None:
+            return
+        unhealthy = getattr(self, "_kinematics_unhealthy_workers", None)
+        if unhealthy is None:
+            return
+        lock = getattr(self, "_kinematics_health_lock", None)
+        if lock is None:
+            unhealthy.discard(index)
+        else:
+            with lock:
+                unhealthy.discard(index)
+
+    def _kinematics_client_candidates(self, client, *, service_kind: str, allow_failover: bool):
+        worker_clients = list(self._ik_worker_clients if service_kind == "IK" else self._fk_worker_clients)
+        primary_client = self._ik_client if service_kind == "IK" else self._fk_client
+        if client is primary_client or not allow_failover:
+            selected_client = primary_client if client is None else client
+            return [(self._kinematics_worker_index(selected_client), selected_client)]
+        if not worker_clients:
+            return [(None, primary_client if client is None else client)]
+
+        preferred_index = self._kinematics_worker_index(client) if client is not None else None
+        if client is not None and preferred_index is None:
+            return [(None, client)]
+        start_index = 0 if preferred_index is None else preferred_index
+        unhealthy = self._kinematics_unhealthy_snapshot()
+        candidates = []
+        for offset in range(len(worker_clients)):
+            index = (start_index + offset) % len(worker_clients)
+            if index not in unhealthy:
+                candidates.append((index, worker_clients[index]))
+        if not candidates:
+            raise PickFlowError(
+                "KINEMATICS_WORKERS_UNAVAILABLE",
+                f"no healthy isolated worker remains for {service_kind}",
+                retryable=True,
+            )
+        return candidates
+
+    @staticmethod
+    def _discard_pending_service_request(client, future) -> None:
+        remove_pending_request = getattr(client, "remove_pending_request", None)
+        if remove_pending_request is None:
+            return
+        with suppress(Exception):
+            remove_pending_request(future)
 
     def _solve_ik(
         self,
@@ -51,8 +146,8 @@ class PreparationPhase:
         seed: JointState | None = None,
         *,
         client=None,
+        allow_failover: bool = True,
     ) -> JointState:
-        client = self._ik_client if client is None else client
         ik_config = self._config.get("ik", {})
         request = GetPositionIK.Request()
         request.ik_request.group_name = str(ik_config.get("group_name", "arm"))
@@ -64,23 +159,88 @@ class PreparationPhase:
             request.ik_request.robot_state.joint_state = seed
         ik_timeout = float(ik_config.get("timeout_sec", 2.0))
         request.ik_request.timeout = Duration(seconds=ik_timeout).to_msg()
-        future = client.call_async(request)
-        response = self._wait_future(future, goal_handle, deadline, ik_timeout + 1.0, "IK")
-        if int(response.error_code.val) != 1:
-            raise PickFlowError("IK_FAILED", f"IK failed with code {response.error_code.val}", retryable=True)
-        return response.solution.joint_state
+        last_error: PickFlowError | None = None
+        for worker_index, selected_client in self._kinematics_client_candidates(
+            client,
+            service_kind="IK",
+            allow_failover=allow_failover,
+        ):
+            future = None
+            try:
+                future = selected_client.call_async(request)
+                response = self._wait_future(future, goal_handle, deadline, ik_timeout + 1.0, "IK")
+            except PickFlowError as exc:
+                if future is not None:
+                    self._discard_pending_service_request(selected_client, future)
+                if worker_index is None or exc.code not in {"RPC_TIMEOUT", "RPC_FAILED"}:
+                    raise
+                self._mark_kinematics_worker_unhealthy(worker_index, f"{exc.code}: {exc}")
+                last_error = exc
+                if not allow_failover:
+                    raise
+                continue
+            except Exception as exc:
+                if worker_index is None:
+                    raise PickFlowError("RPC_FAILED", f"IK request failed: {exc}") from exc
+                self._mark_kinematics_worker_unhealthy(worker_index, f"RPC_FAILED: {exc}")
+                last_error = PickFlowError("RPC_FAILED", f"IK request failed: {exc}")
+                if not allow_failover:
+                    raise last_error from exc
+                continue
+            if int(response.error_code.val) != 1:
+                raise PickFlowError("IK_FAILED", f"IK failed with code {response.error_code.val}", retryable=True)
+            return response.solution.joint_state
+        if last_error is not None:
+            raise last_error
+        raise PickFlowError("KINEMATICS_WORKERS_UNAVAILABLE", "no IK service client is available", retryable=True)
 
-    def _compute_fk(self, joint_state: JointState, goal_handle, deadline: float, *, client=None) -> Pose:
-        client = self._fk_client if client is None else client
+    def _compute_fk(
+        self,
+        joint_state: JointState,
+        goal_handle,
+        deadline: float,
+        *,
+        client=None,
+        allow_failover: bool = True,
+    ) -> Pose:
         request = GetPositionFK.Request()
         request.header.frame_id = self._base_frame
         request.fk_link_names = [self._ee_frame]
         request.robot_state.joint_state = joint_state
-        future = client.call_async(request)
-        response = self._wait_future(future, goal_handle, deadline, self._rpc_timeout, "FK")
-        if int(response.error_code.val) != 1 or not response.pose_stamped:
-            raise PickFlowError("FK_FAILED", f"FK failed with code {response.error_code.val}", retryable=True)
-        return response.pose_stamped[0].pose
+        last_error: PickFlowError | None = None
+        for worker_index, selected_client in self._kinematics_client_candidates(
+            client,
+            service_kind="FK",
+            allow_failover=allow_failover,
+        ):
+            future = None
+            try:
+                future = selected_client.call_async(request)
+                response = self._wait_future(future, goal_handle, deadline, self._rpc_timeout, "FK")
+            except PickFlowError as exc:
+                if future is not None:
+                    self._discard_pending_service_request(selected_client, future)
+                if worker_index is None or exc.code not in {"RPC_TIMEOUT", "RPC_FAILED"}:
+                    raise
+                self._mark_kinematics_worker_unhealthy(worker_index, f"{exc.code}: {exc}")
+                last_error = exc
+                if not allow_failover:
+                    raise
+                continue
+            except Exception as exc:
+                if worker_index is None:
+                    raise PickFlowError("RPC_FAILED", f"FK request failed: {exc}") from exc
+                self._mark_kinematics_worker_unhealthy(worker_index, f"RPC_FAILED: {exc}")
+                last_error = PickFlowError("RPC_FAILED", f"FK request failed: {exc}")
+                if not allow_failover:
+                    raise last_error from exc
+                continue
+            if int(response.error_code.val) != 1 or not response.pose_stamped:
+                raise PickFlowError("FK_FAILED", f"FK failed with code {response.error_code.val}", retryable=True)
+            return response.pose_stamped[0].pose
+        if last_error is not None:
+            raise last_error
+        raise PickFlowError("KINEMATICS_WORKERS_UNAVAILABLE", "no FK service client is available", retryable=True)
 
     def _orientation_guard(self) -> dict:
         target_gripper = self._config.get("target_gripper", {})
@@ -103,7 +263,7 @@ class PreparationPhase:
         value = self._joint_position(joint_state, "5")
         if value is None:
             raise PickFlowError("IK_JOINT5_MISSING", "IK result has no joint 5", retryable=True)
-        if abs(value) > limit:
+        if not joint5_within_abs_limit(value, limit):
             raise PickFlowError(
                 "IK_JOINT5_LIMIT",
                 f"joint 5 absolute value {abs(value):.4f} exceeds {limit:.4f}",
@@ -119,27 +279,38 @@ class PreparationPhase:
         deadline: float,
         *,
         ik_client=None,
+        allow_failover: bool = True,
     ) -> tuple[JointState, float | None]:
         limit = self._joint5_abs_max()
         if limit is None:
             return solution, None
-        original_joint5 = self._joint_position(solution, "5")
-        if original_joint5 is None:
-            return solution, None
-        if abs(original_joint5) <= math.pi / 2.0:
-            return solution, None
 
-        bounded_joint5 = canonicalize_joint5(original_joint5)
-        retry_seed = self._joint_state_with_joint5(solution, bounded_joint5)
-        retry_solution = self._solve_ik(pose, goal_handle, deadline, retry_seed, client=ik_client)
-        retry_joint5 = self._joint_position(retry_solution, "5")
-        if retry_joint5 is None or abs(retry_joint5) > limit:
+        def _retry_solver(retry_seed: JointState) -> JointState | None:
+            return self._solve_ik(
+                pose,
+                goal_handle,
+                deadline,
+                retry_seed,
+                client=ik_client,
+                allow_failover=allow_failover,
+            )
+
+        result = apply_joint5_retry(
+            joint_state=solution,
+            safety_limit=limit,
+            solve_ik=_retry_solver,
+            joint_position=self._joint_position,
+            joint_state_with_joint5=self._joint_state_with_joint5,
+        )
+        if not result.retried:
+            return solution, None
+        if not result.passed:
             raise PickFlowError(
                 "IK_JOINT5_RETRY_FAILED",
-                f"joint 5 retry did not enter limit {limit:.4f}: {retry_joint5}",
+                f"joint 5 retry did not enter limit {limit:.4f}: {result.retry_joint5}",
                 retryable=True,
             )
-        return retry_solution, original_joint5
+        return result.joint_state, result.original_joint5
 
     def _grasp_orientation_errors(
         self,
@@ -182,17 +353,32 @@ class PreparationPhase:
         validate_orientation: bool = True,
         ik_client=None,
         fk_client=None,
+        allow_failover: bool = True,
     ) -> IKPayload:
-        joint_state = self._solve_ik(pose, goal_handle, deadline, seed, client=ik_client)
+        joint_state = self._solve_ik(
+            pose,
+            goal_handle,
+            deadline,
+            seed,
+            client=ik_client,
+            allow_failover=allow_failover,
+        )
         joint_state, original_joint5 = self._apply_joint5_retry_if_needed(
             pose,
             joint_state,
             goal_handle,
             deadline,
             ik_client=ik_client,
+            allow_failover=allow_failover,
         )
         self._validate_joint5(joint_state)
-        fk_pose = self._compute_fk(joint_state, goal_handle, deadline, client=fk_client)
+        fk_pose = self._compute_fk(
+            joint_state,
+            goal_handle,
+            deadline,
+            client=fk_client,
+            allow_failover=allow_failover,
+        )
         ee_xyz, ee_quaternion = self._pose_components(fk_pose)
         _, target_quaternion = self._pose_components(pose)
         errors = self._grasp_orientation_errors(target_quaternion, ee_quaternion)
@@ -226,6 +412,7 @@ class PreparationPhase:
         *,
         ik_client=None,
         fk_client=None,
+        allow_failover: bool = True,
     ) -> IKPayload:
         guard = self._orientation_guard()
         if not bool(guard.get("enabled", False)):
@@ -236,6 +423,7 @@ class PreparationPhase:
                 seed,
                 ik_client=ik_client,
                 fk_client=fk_client,
+                allow_failover=allow_failover,
             )
 
         _, target_quaternion = self._pose_components(pose)
@@ -253,6 +441,7 @@ class PreparationPhase:
                 validate_orientation=False,
                 ik_client=ik_client,
                 fk_client=fk_client,
+                allow_failover=allow_failover,
             )
             joint5 = self._joint_position(payload.joint_state, "5")
             approach_error = payload.approach_axis_error_deg
@@ -294,13 +483,45 @@ class PreparationPhase:
             return
         seed_joint5 = self._joint_position(seed, "5")
         solution_joint5 = self._joint_position(solution, "5")
-        if seed_joint5 is None or solution_joint5 is None:
-            return
-        delta = abs(solution_joint5 - seed_joint5)
-        if delta > math.pi / 2.0:
+        if not joint5_branch_continuity_check(seed_joint5, solution_joint5):
+            delta = joint5_branch_delta(seed_joint5, solution_joint5)
             raise PickFlowError(
                 "IK_JOINT5_BRANCH_CHANGED",
                 f"joint 5 branch changed by {delta:.4f} rad ({seed_joint5:.4f} -> {solution_joint5:.4f})",
+                retryable=True,
+            )
+
+    def _joint5_branch_filter_config(self) -> tuple[bool, float]:
+        guard = self._orientation_guard()
+        if not isinstance(guard, dict):
+            return False, math.pi / 2.0
+        if not bool(guard.get("joint5_branch_filter", True)):
+            return False, math.pi / 2.0
+        threshold = float(guard.get("joint5_branch_max_delta_rad", math.pi / 2.0))
+        if not math.isfinite(threshold) or threshold <= 0.0:
+            raise PickFlowError(
+                "INVALID_GRASP_CONFIG",
+                "ik_orientation_guard.joint5_branch_max_delta_rad must be positive",
+            )
+        return True, threshold
+
+    def _filter_joint5_branch_divergence(
+        self,
+        candidate_index: int,
+        seed: JointState | None,
+        solution: JointState,
+    ) -> None:
+        enabled, threshold = self._joint5_branch_filter_config()
+        if not enabled or seed is None:
+            return
+        seed_joint5 = self._joint_position(seed, "5")
+        solution_joint5 = self._joint_position(solution, "5")
+        if joint5_branch_filter_check(seed_joint5, solution_joint5, threshold):
+            delta = joint5_branch_delta(seed_joint5, solution_joint5)
+            raise PickFlowError(
+                "IK_JOINT5_BRANCH_DIVERGENCE",
+                f"candidate {candidate_index}: joint5 {solution_joint5:.4f} diverges from "
+                f"seed {seed_joint5:.4f} by {delta:.4f} rad (threshold={threshold:.4f})",
                 retryable=True,
             )
 
@@ -349,6 +570,60 @@ class PreparationPhase:
             )
         return alignment
 
+    def _validate_candidate_transit_poses(
+        self,
+        candidate_index: int,
+        plan: CandidatePlan,
+        grasp_payload: IKPayload,
+        goal_handle,
+        deadline: float,
+        *,
+        ik_client=None,
+        fk_client=None,
+        allow_failover: bool = True,
+    ) -> None:
+        """Reject candidates whose approach/lift branch cannot preserve the grasp orientation."""
+        check_orientation = bool(self._config.get("ik", {}).get("check_orientation", False))
+        guard_enabled = bool(self._orientation_guard().get("enabled", False))
+        position_only_quaternion = (0.0, 0.0, 0.0, 1.0)
+        for label, xyz in (("approach", plan.approach), ("lift", plan.lift)):
+            allowed, reason = xyz_within_workspace(xyz, self._workspace)
+            if not allowed:
+                raise PickFlowError(
+                    "WORKSPACE_REJECTED",
+                    f"candidate {candidate_index} {label}: {reason}",
+                    retryable=True,
+                )
+            try:
+                if guard_enabled:
+                    transit_payload = self._solve_orientation_consistent_grasp_ik_fk(
+                        self._pose(xyz, plan.quaternion),
+                        goal_handle,
+                        deadline,
+                        grasp_payload.joint_state,
+                        ik_client=ik_client,
+                        fk_client=fk_client,
+                        allow_failover=allow_failover,
+                    )
+                    solution = transit_payload.joint_state
+                else:
+                    ik_quaternion = plan.quaternion if check_orientation else position_only_quaternion
+                    solution = self._solve_ik(
+                        self._pose(xyz, ik_quaternion),
+                        goal_handle,
+                        deadline,
+                        grasp_payload.joint_state,
+                        client=ik_client,
+                        allow_failover=allow_failover,
+                    )
+                self._validate_joint5_branch_continuity(grasp_payload.joint_state, solution)
+            except PickFlowError as exc:
+                raise PickFlowError(
+                    exc.code,
+                    f"candidate {candidate_index} {label}: {exc}",
+                    retryable=exc.retryable,
+                ) from exc
+
     def _prepare_candidate(
         self,
         ranked: RankedCandidate,
@@ -357,13 +632,16 @@ class PreparationPhase:
         deadline: float,
         *,
         apply_compensation: bool = False,
+        enforce_fixed_finger_robust_gap: bool = True,
         initial_seed: JointState | None = None,
         ik_client=None,
         fk_client=None,
+        allow_failover: bool = True,
     ) -> PreparedCandidate:
         plan = ranked.plan
         compensation = self._config.get("contact_compensation", {})
         payload: IKPayload
+        predicted_contact: tuple[float, float, float]
         contact_residual_xy = 0.0
         z_error = 0.0
         compensation_enabled = bool(compensation.get("enabled", True))
@@ -379,6 +657,7 @@ class PreparationPhase:
                     seed,
                     ik_client=ik_client,
                     fk_client=fk_client,
+                    allow_failover=allow_failover,
                 )
                 return ContactPrediction(
                     contact_base=self._contact_for_pose(
@@ -419,6 +698,7 @@ class PreparationPhase:
                 lift=(plan.lift[0] + correction_x, plan.lift[1] + correction_y, plan.lift[2]),
             )
             payload = result.prediction.payload
+            predicted_contact = result.prediction.contact_base
             contact_residual_xy = math.hypot(float(result.residual_x), float(result.residual_y))
         else:
             payload = self._solve_orientation_consistent_grasp_ik_fk(
@@ -428,6 +708,7 @@ class PreparationPhase:
                 initial_seed,
                 ik_client=ik_client,
                 fk_client=fk_client,
+                allow_failover=allow_failover,
             )
             predicted_contact = self._contact_for_pose(
                 self._pose(payload.ee_xyz, payload.ee_quaternion),
@@ -458,22 +739,20 @@ class PreparationPhase:
                 retryable=True,
             )
 
+        self._filter_joint5_branch_divergence(ranked.index, initial_seed, payload.joint_state)
+
         fk_fixed_finger_base_side = self._validate_fk_fixed_finger_base_side(ranked.index, plan, payload)
 
-        check_orientation = bool(self._config.get("ik", {}).get("check_orientation", False))
-        position_only_quaternion = (0.0, 0.0, 0.0, 1.0)
-        for label, xyz in (("approach", plan.approach), ("lift", plan.lift)):
-            allowed, reason = xyz_within_workspace(xyz, self._workspace)
-            if not allowed:
-                raise PickFlowError("WORKSPACE_REJECTED", f"candidate {ranked.index} {label}: {reason}", retryable=True)
-            ik_quaternion = plan.quaternion if check_orientation else position_only_quaternion
-            self._solve_ik(
-                self._pose(xyz, ik_quaternion),
-                goal_handle,
-                deadline,
-                initial_seed,
-                client=ik_client,
-            )
+        self._validate_candidate_transit_poses(
+            ranked.index,
+            plan,
+            payload,
+            goal_handle,
+            deadline,
+            ik_client=ik_client,
+            fk_client=fk_client,
+            allow_failover=allow_failover,
+        )
 
         closing_axis = self._config.get("target_gripper", {}).get("closing_axis_ee", [1.0, 0.0, 0.0])
         closing_error = payload.closing_axis_error_deg
@@ -538,6 +817,41 @@ class PreparationPhase:
                 moving_min_clearance_m=float(prepared_scoring.get("moving_finger_min_clearance_m", 0.003)),
                 fixed_score_weight=float(prepared_scoring.get("fixed_finger_score_weight", 0.80)),
             )
+        predicted_robust_gap_headroom = None
+        if envelope is not None and (
+            bool(robust_gap_config.get("enabled", False))
+            or float(prepared_scoring.get("robust_gap_headroom_weight", 0.0)) > 0.0
+        ):
+            predicted_contact_residual = tuple(
+                float(target) - float(actual)
+                for target, actual in zip(plan.target_contact_base, predicted_contact, strict=True)
+            )
+            predicted_robust_gap = fixed_finger_robust_gap(
+                envelope.fixed_gap_m,
+                envelope.target_gap_m,
+                predicted_contact_residual,
+                payload.ee_quaternion,
+                target_gripper.get("closing_axis_ee", [1.0, 0.0, 0.0]),
+                max_target_gap_deficit_m=float(robust_gap_config.get("max_target_gap_deficit_m", 0.003)),
+                measurement_tolerance_m=float(robust_gap_config.get("measurement_tolerance_m", 0.0)),
+            )
+            predicted_robust_gap_headroom = predicted_robust_gap.effective_gap_m - predicted_robust_gap.required_gap_m
+            if bool(robust_gap_config.get("enabled", False)) and not predicted_robust_gap.passed:
+                message = (
+                    f"candidate {ranked.index}: predicted effective_gap={predicted_robust_gap.effective_gap_m:.4f}m "
+                    f"required_gap={predicted_robust_gap.required_gap_m:.4f}m "
+                    f"gap_deficit={predicted_robust_gap.gap_deficit_m:.4f}m "
+                    f"tolerance={predicted_robust_gap.measurement_tolerance_m:.4f}m"
+                )
+                if enforce_fixed_finger_robust_gap:
+                    raise PickFlowError(
+                        "FIXED_FINGER_ROBUST_GAP_REJECTED",
+                        message,
+                        retryable=True,
+                    )
+                self.get_logger().warning(
+                    f"post-pregrasp fixed-finger robust gap diagnostic failed; continuing descent: {message}"
+                )
         selection_score = prepared_candidate_soft_score(
             prepared_scoring,
             fixed_finger_envelope=None if envelope is None else envelope.score,
@@ -545,6 +859,7 @@ class PreparationPhase:
             contact_z_error_m=abs(z_error),
             confidence=float(ranked.candidate.confidence),
             centroid_distance_m=ranked.contact_distance_m,
+            robust_gap_headroom_m=predicted_robust_gap_headroom,
         )
 
         return PreparedCandidate(
@@ -561,42 +876,112 @@ class PreparationPhase:
             mesh_min_z=mesh_min_z,
             fixed_finger_envelope=envelope,
             fk_fixed_finger_base_side=fk_fixed_finger_base_side,
+            predicted_robust_gap_headroom_m=predicted_robust_gap_headroom,
             selection_score=selection_score,
         )
 
     def _verify_ik_worker_pool(
         self,
-        candidate: RankedCandidate,
         joint_seed: JointState,
         goal_handle,
         deadline: float,
     ) -> None:
         if not self._ik_worker_clients:
             return
-        check_orientation = bool(self._config.get("ik", {}).get("check_orientation", False))
-        quaternion = candidate.plan.quaternion if check_orientation else (0.0, 0.0, 0.0, 1.0)
-        pose = self._pose(candidate.plan.approach, quaternion)
-        primary = self._solve_ik(pose, goal_handle, deadline, joint_seed)
-        worker = self._solve_ik(
-            pose,
+        unhealthy_workers = self._kinematics_unhealthy_snapshot()
+        healthy_workers = [
+            (index, ik_client, self._fk_worker_clients[index])
+            for index, ik_client in enumerate(self._ik_worker_clients)
+            if index not in unhealthy_workers
+        ]
+        if not healthy_workers:
+            raise PickFlowError(
+                "KINEMATICS_WORKERS_UNAVAILABLE",
+                "no healthy isolated IK/FK worker remains",
+                retryable=True,
+            )
+        ik_config = self._config.get("ik", {})
+        verification_key = (
+            id(self._ik_client),
+            id(self._fk_client),
+            tuple((index, id(ik_client), id(fk_client)) for index, ik_client, fk_client in healthy_workers),
+            str(ik_config.get("group_name", "arm")),
+            self._ee_frame,
+            self._base_frame,
+            bool(ik_config.get("avoid_collisions", False)),
+            bool(ik_config.get("check_orientation", False)),
+        )
+        cached = getattr(self, "_ik_worker_verification", None)
+        if cached is not None and cached[0] == verification_key:
+            self.get_logger().info(
+                f"IK worker verification passed: cached=true workers={len(healthy_workers)} "
+                f"max_joint_delta={cached[1]:.12f}"
+            )
+            return
+
+        pose = self._compute_fk(
+            joint_seed,
             goal_handle,
             deadline,
-            joint_seed,
-            client=self._ik_worker_clients[0],
+            client=self._fk_client,
+            allow_failover=False,
         )
+        if not bool(ik_config.get("check_orientation", False)):
+            pose.orientation.x = 0.0
+            pose.orientation.y = 0.0
+            pose.orientation.z = 0.0
+            pose.orientation.w = 1.0
+
+        def solve(endpoint: str, *, client=None) -> JointState:
+            try:
+                result = self._solve_ik(
+                    pose,
+                    goal_handle,
+                    deadline,
+                    joint_seed,
+                    client=client,
+                    allow_failover=False,
+                )
+            except PickFlowError as exc:
+                if exc.code != "RPC_TIMEOUT":
+                    raise
+                self.get_logger().warning(f"IK worker verification retry: endpoint={endpoint} reason=rpc_timeout")
+                result = self._solve_ik(
+                    pose,
+                    goal_handle,
+                    deadline,
+                    joint_seed,
+                    client=client,
+                    allow_failover=False,
+                )
+            self._mark_kinematics_worker_healthy(client)
+            return result
+
+        primary = solve("primary", client=self._ik_client)
         primary_positions = dict(zip(primary.name, primary.position, strict=False))
-        worker_positions = dict(zip(worker.name, worker.position, strict=False))
-        common_names = sorted(primary_positions.keys() & worker_positions.keys())
-        if not common_names:
-            raise PickFlowError("IK_WORKER_MISMATCH", "primary and worker IK returned no common joints")
-        max_delta = max(abs(float(primary_positions[name]) - float(worker_positions[name])) for name in common_names)
-        if max_delta > 1e-8:
-            raise PickFlowError(
-                "IK_WORKER_MISMATCH",
-                f"primary and worker IK differ by {max_delta:.12f} rad",
+        max_delta = 0.0
+        for worker_index, client, _fk_client in healthy_workers:
+            worker = solve(f"worker_{worker_index}", client=client)
+            worker_positions = dict(zip(worker.name, worker.position, strict=False))
+            common_names = sorted(primary_positions.keys() & worker_positions.keys())
+            if not common_names:
+                raise PickFlowError(
+                    "IK_WORKER_MISMATCH",
+                    f"primary and IK worker {worker_index} returned no common joints",
+                )
+            worker_delta = max(
+                abs(float(primary_positions[name]) - float(worker_positions[name])) for name in common_names
             )
+            if worker_delta > 1e-8:
+                raise PickFlowError(
+                    "IK_WORKER_MISMATCH",
+                    f"primary and IK worker {worker_index} differ by {worker_delta:.12f} rad",
+                )
+            max_delta = max(max_delta, worker_delta)
+        self._ik_worker_verification = (verification_key, max_delta)
         self.get_logger().info(
-            f"IK worker verification passed: workers={self._ik_worker_count} max_joint_delta={max_delta:.12f}"
+            f"IK worker verification passed: cached=false workers={len(healthy_workers)} "
+            f"max_joint_delta={max_delta:.12f}"
         )
 
     def _prepare_ranked_candidates(
@@ -624,40 +1009,33 @@ class PreparationPhase:
                 except PickFlowError as exc:
                     results.append(exc)
         else:
-            self._verify_ik_worker_pool(ranked[0], joint_seed, goal_handle, deadline)
+            self._verify_ik_worker_pool(joint_seed, goal_handle, deadline)
             worker_count = min(len(self._ik_worker_clients), len(ranked))
-            partitions: list[list[tuple[int, RankedCandidate]]] = [[] for _ in range(worker_count)]
-            for position, candidate in enumerate(ranked):
-                partitions[position % worker_count].append((position, candidate))
 
-            ordered_results: list[PreparedCandidate | PickFlowError | None] = [None] * len(ranked)
+            def prepare(worker_index: int, candidate: RankedCandidate) -> PreparedCandidate | PickFlowError:
+                try:
+                    return self._prepare_candidate(
+                        candidate,
+                        scene_base,
+                        goal_handle,
+                        deadline,
+                        initial_seed=joint_seed,
+                        ik_client=self._ik_worker_clients[worker_index],
+                        fk_client=self._fk_worker_clients[worker_index],
+                        allow_failover=False,
+                    )
+                except PickFlowError as exc:
+                    return exc
 
-            def prepare_partition(worker_index: int, partition: list[tuple[int, RankedCandidate]]):
-                partition_results = []
-                for position, candidate in partition:
-                    try:
-                        result = self._prepare_candidate(
-                            candidate,
-                            scene_base,
-                            goal_handle,
-                            deadline,
-                            initial_seed=joint_seed,
-                            ik_client=self._ik_worker_clients[worker_index],
-                            fk_client=self._fk_worker_clients[worker_index],
-                        )
-                    except PickFlowError as exc:
-                        result = exc
-                    partition_results.append((position, result))
-                return partition_results
-
-            with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="pick-candidate-ik") as pool:
-                jobs = [pool.submit(prepare_partition, index, partition) for index, partition in enumerate(partitions)]
-                for job in jobs:
-                    for position, result in job.result():
-                        ordered_results[position] = result
-            if any(result is None for result in ordered_results):
-                raise PickFlowError("IK_WORKER_INCOMPLETE", "parallel IK worker pool returned incomplete results")
-            results = [result for result in ordered_results if result is not None]
+            try:
+                results = dynamic_worker_map(
+                    ranked,
+                    worker_count,
+                    prepare,
+                    thread_name_prefix="pick-candidate-ik",
+                )
+            except RuntimeError as exc:
+                raise PickFlowError("IK_WORKER_INCOMPLETE", str(exc)) from exc
             self.get_logger().info(
                 f"PIPELINE_TIMING stage=candidate_ik_fk duration_s={time.monotonic() - started:.3f} "
                 f"workers={worker_count} candidates={len(ranked)}"
@@ -703,6 +1081,7 @@ class PreparationPhase:
                     "fixed_finger_target_gap_m": None if envelope is None else envelope.target_gap_m,
                     "moving_finger_gap_m": None if envelope is None else envelope.moving_gap_m,
                     "moving_finger_gap_score": None if envelope is None else envelope.moving_score,
+                    "predicted_robust_gap_headroom_m": item.predicted_robust_gap_headroom_m,
                     "contact_residual_xy_m": item.contact_residual_xy_m,
                     "contact_z_error_m": item.contact_z_error_m,
                     "ik_fk_approach_axis_error_deg": item.approach_axis_error_deg,

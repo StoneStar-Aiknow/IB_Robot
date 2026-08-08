@@ -15,12 +15,23 @@ from inference_service.backends import RuntimeContext
 from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions import AscendOmModelSession, ModelSession, TorchModelSession
 
-from .model_contracts import validate_image_message, validate_mask_batch, validate_text_batch
+from .graspgen_adapter import GraspGenAdapter
+from .graspgen_session import GraspGenAscendSession
+from .model_contracts import (
+    point_cloud_xyz,
+    rank_detections,
+    validate_detection_batch,
+    validate_image_message,
+    validate_mask_batch,
+    validate_text_batch,
+)
 from .model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
 from .ram_plus_adapter import RAMPlusAdapter
 from .semantic_model_adapters import (
     GroundingDINOAdapter,
+    GroundingDINORawAdapter,
     SAM2Adapter,
+    SAM2PromptAdapter,
     SigLIP2ImageAdapter,
     SigLIP2TextAdapter,
 )
@@ -33,8 +44,9 @@ def _detection_array(bridge, header, records) -> DetectionArray:
         detection.header = header
         detection.confidence = float(getattr(record, "score", getattr(record, "confidence", 0.0)))
         detection.bbox = np.asarray(record.bbox_xyxy, dtype=float).tolist()
-        detection.mask = bridge.cv2_to_imgmsg((record.mask > 0).astype(np.uint8) * 255, encoding="mono8")
-        detection.mask.header = header
+        if record.mask is not None:
+            detection.mask = bridge.cv2_to_imgmsg((record.mask > 0).astype(np.uint8) * 255, encoding="mono8")
+            detection.mask.header = header
         detection.label = str(getattr(record, "label", ""))
         detections.append(detection)
     return DetectionArray(header=header, detections=detections)
@@ -74,16 +86,20 @@ def _load_torch_module(family: str, context: RuntimeContext):
     return module
 
 
+def _ascend_device_id(family: str, adapter, deployment, options, allowed: set[str]) -> int:
+    if deployment.backend != "ascend" or not adapter.compiled_abi_finalized:
+        raise RuntimeError(f"{family} compiled adapter ABI is not finalized; deployment remains not-ready")
+    unknown = sorted(set(options) - allowed)
+    if unknown:
+        raise ValueError(f"unknown Ascend runtime options: {unknown}")
+    return int(options.get("device_id", 0))
+
+
 def _new_session(family: str, adapter, validated, options) -> ModelSession:
     deployment = validated.deployment
     if isinstance(deployment, CompiledDeployment):
-        if deployment.backend != "ascend" or not adapter.compiled_abi_finalized:
-            raise RuntimeError(f"{family} compiled adapter ABI is not finalized; deployment remains not-ready")
-        allowed = {"acl_config_path", "device_id"}
-        unknown = sorted(set(options) - allowed)
-        if unknown:
-            raise ValueError(f"unknown Ascend runtime options: {unknown}")
-        return AscendOmModelSession(device_id=int(options.get("device_id", 0)))
+        device_id = _ascend_device_id(family, adapter, deployment, options, {"acl_config_path", "device_id"})
+        return AscendOmModelSession(device_id=device_id)
     if isinstance(deployment, TorchDeployment):
         if options:
             raise ValueError(
@@ -91,6 +107,20 @@ def _new_session(family: str, adapter, validated, options) -> ModelSession:
             )
         return TorchModelSession(lambda context: _load_torch_module(family, context))
     raise RuntimeError(f"{family} deployment type is unsupported and has no fallback")
+
+
+def _new_graspgen_session(family: str, adapter, validated, options) -> ModelSession:
+    """Build the host-orchestrated GraspGen session.
+
+    GraspGen has no Torch deployment: the eight OM sub-graphs and the host math between
+    them are one contract, so an un-compiled bundle has nothing to fall back to. The extra
+    ``random_seed`` option makes the denoising loop reproducible in tests and replays.
+    """
+    deployment = validated.deployment
+    if not isinstance(deployment, CompiledDeployment):
+        raise RuntimeError(f"{family} requires a compiled Ascend deployment and has no Torch fallback")
+    device_id = _ascend_device_id(family, adapter, deployment, options, {"acl_config_path", "device_id", "random_seed"})
+    return GraspGenAscendSession(device_id=device_id, config=adapter.config)
 
 
 class _SessionPlugin(ModelServicePlugin):
@@ -109,7 +139,9 @@ class _SessionPlugin(ModelServicePlugin):
             )
         self.host = host
         self.validated = validated
-        self.adapter = self.adapter_class.from_bundle(validated.bundle_root, model.semantic_identity)
+        self.adapter = self.adapter_class.from_bundle(
+            validated.bundle_root, model.semantic_identity, model=model, deployment=validated.deployment
+        )
         self.adapter.validate_identity(model.semantic_identity)
         self._closed = False
         self._requests = itertools.count(1)
@@ -266,23 +298,142 @@ class GroundingDetectPlugin(_SessionPlugin):
                 (image, request.text_prompt, float(request.box_threshold), float(request.text_threshold))
             )
         )
-        records = [
-            record
-            for record in self.adapter.postprocess(
-                result,
-                image_shape=image.shape[:2],
-                labels=(request.text_prompt,),
-            )
-            if record.confidence >= (float(request.box_threshold) or 0.35)
-        ]
+        records = rank_detections(
+            [
+                record
+                for record in self.adapter.postprocess(
+                    result,
+                    image_shape=image.shape[:2],
+                    labels=(request.text_prompt,),
+                )
+                if record.confidence >= (float(request.box_threshold) or 0.35)
+            ]
+        )
         response.detections = _detection_array(self.host.bridge, request.image.header, records)
         return f"confirmed {len(records)} detections"
 
 
+class GroundingDINORawDetectPlugin(_SessionPlugin):
+    """Text detection service for a compiled raw Grounding-DINO deployment."""
+
+    service_type = "ibrobot_msgs/srv/GroundingDetect"
+    family = "grounding_dino_raw"
+    adapter_class = GroundingDINORawAdapter
+
+    def handle(self, request, response) -> str:
+        if not request.text_prompt.strip():
+            raise ValueError("text prompt must not be empty")
+        image = self.image_rgb(request.image)
+        result = self._infer(
+            self.adapter.preprocess(
+                (image, request.text_prompt, float(request.box_threshold), float(request.text_threshold))
+            )
+        )
+        records = rank_detections(
+            self.adapter.postprocess(
+                result,
+                image_shape=image.shape[:2],
+                prompt=request.text_prompt,
+                box_threshold=float(request.box_threshold),
+                text_threshold=float(request.text_threshold),
+            )
+        )
+        response.detections = _detection_array(self.host.bridge, request.image.header, records)
+        return f"detected {len(records)} boxes"
+
+
+class SegmentDetectionsPlugin(_SessionPlugin):
+    """Fill masks for detections using a manifest-bound SAM2 box-prompt service."""
+
+    service_type = "ibrobot_msgs/srv/SegmentDetections"
+    family = "sam2_prompt"
+    adapter_class = SAM2PromptAdapter
+
+    def handle(self, request, response) -> str:
+        source = list(request.detections.detections)
+        validate_detection_batch(source)
+        if not source:
+            response.detections = DetectionArray(header=request.image.header, detections=[])
+            return "segmented 0 detections"
+        image = self.image_rgb(request.image)
+        masks = self._segment_in_manifest_batches(image, source)
+        output = []
+        for detection, mask in zip(source, masks, strict=True):
+            record = Detection2D()
+            record.header = request.image.header
+            record.label = detection.label
+            record.confidence = detection.confidence
+            record.bbox = detection.bbox
+            record.mask = self.host.bridge.cv2_to_imgmsg((mask > 0).astype(np.uint8) * 255, encoding="mono8")
+            record.mask.header = request.image.header
+            output.append(record)
+        response.detections = DetectionArray(header=request.image.header, detections=output)
+        return f"segmented {len(output)} detections"
+
+    def _segment_in_manifest_batches(self, image, source) -> list[np.ndarray]:
+        """Segment every detection, one compiled decoder batch at a time.
+
+        The compiled SAM2 decoder accepts a fixed number of box prompts while
+        `GroundingDetect` may legitimately confirm up to `MAX_DETECTIONS` objects, so
+        the service slices the request into manifest-sized chunks and concatenates the
+        masks back in the original detection order instead of truncating the tail.
+        """
+        batch_size = int(getattr(self.adapter, "batch_size", 0)) or len(source)
+        masks: list[np.ndarray] = []
+        for start in range(0, len(source), batch_size):
+            chunk = source[start : start + batch_size]
+            result = self._infer(self.adapter.preprocess((image, [detection.bbox for detection in chunk])))
+            chunk_masks = self.adapter.postprocess(result, image_shape=image.shape[:2], count=len(chunk))
+            if len(chunk_masks) != len(chunk):
+                raise RuntimeError(
+                    f"SAM2 box-prompt deployment returned {len(chunk_masks)} masks for {len(chunk)} detections"
+                )
+            masks.extend(chunk_masks)
+        return masks
+
+
+class GraspGenGenerateGraspsPlugin(_SessionPlugin):
+    service_type = "ibrobot_msgs/srv/GenerateGrasps"
+    family = "graspgen"
+    adapter_class = GraspGenAdapter
+    _session_factory: Callable = staticmethod(_new_graspgen_session)
+
+    def handle(self, request, response) -> str:
+        from ibrobot_msgs.msg import GraspCandidate, GraspCandidateArray
+
+        inputs, object_center = self.adapter.prepare(point_cloud_xyz(request.object_points))
+        result = self._infer(inputs)
+        candidates = self.adapter.postprocess(
+            result,
+            object_center=object_center,
+            max_grasps=int(request.max_grasps),
+            min_confidence=float(request.min_confidence),
+        )
+        header = request.object_points.header
+        # Width and collision fields stay at their defaults: GraspGen scores a pose, it
+        # does not measure the gripper aperture or clear the scene. manipulation_execution
+        # fills those in from its own geometry pass.
+        response.grasps = GraspCandidateArray(
+            header=header,
+            grasps=[
+                GraspCandidate(
+                    header=header,
+                    pose_matrix=candidate.pose_matrix.reshape(16).astype(float).tolist(),
+                    confidence=candidate.confidence,
+                )
+                for candidate in candidates
+            ],
+        )
+        return f"generated {len(candidates)} grasps"
+
+
 __all__ = [
+    "GraspGenGenerateGraspsPlugin",
     "GroundingDetectPlugin",
+    "GroundingDINORawDetectPlugin",
     "RAMPlusRecognizeTagsPlugin",
     "SAM2GenerateMasksPlugin",
+    "SegmentDetectionsPlugin",
     "SigLIP2EncodeEmbeddingsPlugin",
     "SigLIP2EncodeTextPlugin",
 ]

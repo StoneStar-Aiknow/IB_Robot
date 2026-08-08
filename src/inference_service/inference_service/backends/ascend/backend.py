@@ -99,7 +99,9 @@ class AscendBackend(LifecycleBackend):
                 code="incompatible_backend_target",
             )
 
-        expected_execution = ("policy",) if context.policy.policy_type == "act" else ("vlm", "action_expert")
+        expected_execution: tuple[str, ...] = (
+            ("policy",) if context.policy.policy_type == "act" else ("vlm", "action_expert")
+        )
         if deployment.execution != expected_execution:
             raise BackendLoadError(
                 f"Ascend {context.policy.policy_type} requires execution {list(expected_execution)}, got "
@@ -169,6 +171,7 @@ class AscendBackend(LifecycleBackend):
 
         input_overrides: dict[str, dict[int, AclDeviceBuffer]] = {role: {} for role in deployment.execution}
         output_overrides: dict[str, dict[int, AclDeviceBuffer]] = {role: {} for role in deployment.execution}
+        shared_outputs: dict[tuple[str, int], AclDeviceBuffer] = {}
         for link in deployment.device_links:
             producer_binding = self._binding_for_semantic(
                 deployment.bindings[link.producer].outputs, link.semantic, "producer output"
@@ -189,11 +192,15 @@ class AscendBackend(LifecycleBackend):
                     f"({producer_desc.size}) and consumer ({consumer_desc.size})",
                     code="device_link_size_mismatch",
                 )
-            pointer, ret = lease.acl.rt.malloc(producer_desc.size, 0)
-            if ret != 0:
-                raise RuntimeError(f"acl.rt.malloc(device link {link.semantic}) failed with ACL error code {ret}")
-            shared = AclDeviceBuffer(pointer=pointer, size=producer_desc.size)
-            shared_buffers.append(shared)
+            producer_key = (link.producer, int(producer_binding.index))
+            shared = shared_outputs.get(producer_key)
+            if shared is None:
+                pointer, ret = lease.acl.rt.malloc(producer_desc.size, 0)
+                if ret != 0:
+                    raise RuntimeError(f"acl.rt.malloc(device link {link.semantic}) failed with ACL error code {ret}")
+                shared = AclDeviceBuffer(pointer=pointer, size=producer_desc.size)
+                shared_outputs[producer_key] = shared
+                shared_buffers.append(shared)
             output_overrides[link.producer][int(producer_binding.index)] = shared
             input_overrides[link.consumer][int(consumer_binding.index)] = shared
         for role in deployment.execution:

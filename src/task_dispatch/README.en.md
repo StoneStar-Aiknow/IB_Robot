@@ -69,6 +69,11 @@ VoxPoser planner ─────┘                               │
 | `/{gripper_controller}/follow_joint_trajectory` | `control_msgs/action/FollowJointTrajectory` (Action) | Gripper control, provided by ros2_control |
 | `/joint_states` | `sensor_msgs/msg/JointState` (Topic) | Joint state feedback |
 
+`moveit_planning.executor` may define `skip_redundant_gripper_open`, `gripper_open_position`,
+`gripper_position_tolerance`, and `joint_state_max_age_s`. When enabled, an open trajectory is skipped only when
+fresh joint feedback contains the gripper joint and is already within tolerance. Close commands and stale or missing
+feedback always use the normal trajectory path.
+
 ### Message Definitions
 
 **TaskStep.msg** — Task step:

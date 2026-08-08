@@ -144,11 +144,6 @@ robot:
 
   semantic_mapping:
     enabled: false
-    migration:
-      grounded_sam2_node: compatibility
-      grounded_sam2_snapshot: diagnostic_only
-      perception_service_node: general_scene
-      embedded_mapping_backend: disabled
 
   embodied:
     enabled: false
@@ -1152,7 +1147,7 @@ robot:
     port: /dev/ttyACM0
     calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
     joint_names: ["1", "2", "3", "4", "5", "6"]
-    # Reset positions (optional) - uses 'rest' pose from SRDF
+    # Semantic rest pose for upper layers; hardware activation holds the measured position.
     reset_positions:
       "1": 0.0       # shoulder_pan:  centered
       "2": -1.5854   # shoulder_lift: ~-90° (down)

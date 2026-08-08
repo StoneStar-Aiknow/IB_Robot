@@ -60,7 +60,10 @@ ros2 launch robot_moveit so101_ik_workers.launch.py \
 
 每个 worker 是独立 `move_group` 进程和独立 LMA solver 实例，订阅公共 `/joint_states`、`/tf` 和 `/tf_static`。worker 禁用了规划、轨迹执行和 planning-scene 修改 capability，只提供命名空间内的 `compute_ik`/`compute_fk`。
 
-`scripts/test_banana_handeye_pick.py --ik-worker-count 4` 会将静止观察位上的候选准备分片到这些服务。脚本会把同一份 `/joint_states` 快照作为所有 worker 的 IK seed，并按原候选顺序合并结果。最终接触补偿、关节解执行和机器人运动仍使用主 MoveIt 服务串行完成。CLI 默认值为 `0`，SO101 手眼 robot_config 会将其覆盖为 `4`；可显式传 `--ik-worker-count 0` 退回串行。
+`manipulation_execution/pick_executor_node` 会把同一份 `/joint_states` 快照作为所有 worker 的 IK seed，
+让空闲 worker 从共享动态队列领取下一个候选，并按原候选顺序合并结果。最终接触补偿、关节解执行和
+机器人运动仍使用主 MoveIt 服务串行完成。worker 数量只由
+`robot.grasp_execution.ik.worker_count` 控制，监督式客户端不能覆盖。
 
 Hermes 抓取通过 `embodied_pipeline.launch.py` 启动时，会读取
 `robot.grasp_execution.ik.worker_count` 和 `worker_namespace_prefix` 自动包含本 launch；不需要再单独启动
@@ -410,6 +413,7 @@ moveit_simple_controller_manager:
 |--------|----------|------|------|
 | /cmd_pose | geometry_msgs/Pose | 按需 | 目标位姿命令 |
 | /joint_states | sensor_msgs/JointState | 100Hz | 关节状态反馈 |
+| 配置的 `motion_hardware_feedback_topic` | ibrobot_msgs/JointCurrent | 随硬件读取 | 只在成功总线读取后发布的健康心跳 |
 
 ### 发布话题
 
@@ -423,6 +427,12 @@ moveit_simple_controller_manager:
 |--------|------|------|
 | `/moveit_gateway/move_to_pose` | `ibrobot_msgs/srv/MoveToPose` | 由网关求解 IK，再规划并执行目标位姿 |
 | `/moveit_gateway/move_to_configuration` | `ibrobot_msgs/srv/MoveToConfiguration` | 规划并执行调用方提供的已验证 IK 关节解，不重复求解 IK |
+
+运动成功后，网关通过同一个有界完成屏障等待三项证据：MoveIt 进入终态后产生的新硬件读取心跳、
+新关节反馈收敛到目标，以及 `base_link -> ee_link` 的最新 TF 时间戳覆盖该关节样本。SO101 真机由
+robot YAML 将 `motion_hardware_feedback_topic` 指向 `/so101_follower/joint_currents`；仿真不要求硬件
+心跳，但仍要求新关节反馈和 TF 同步。屏障满足后立即返回，因此 `motion_status_hold_s` 默认是 `0.0`；
+该字段只保留为兼容性回退，不再承担正常路径的 TF 同步职责。
 
 `move_to_configuration` 主要用于 5-DOF 抓取接触点补偿。调用方先执行 IK，再对该关节解做 FK，
 根据预测指尖位置修正目标；最终必须执行同一组关节角，否则重新求解 IK 可能改变末端姿态并使补偿失效。

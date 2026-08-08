@@ -1,6 +1,7 @@
 """Package-level tests for standalone semantic mapping launch entries."""
 
 import importlib.util
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -11,9 +12,9 @@ PACKAGE_ROOT = Path(__file__).parents[1]
 ROBOT_CONFIG = PACKAGE_ROOT.parent / "robot_config" / "config" / "robots" / "lekiwi_mapping.yaml"
 
 
+@dataclass
 class _LaunchContext:
-    def __init__(self, configurations: dict[str, str]):
-        self.launch_configurations = configurations
+    launch_configurations: dict[str, str]
 
 
 def _load_launch(name: str):
@@ -124,7 +125,6 @@ def test_embedded_online_launch_starts_no_generic_model_services(tmp_path: Path)
     data = yaml.safe_load(path.read_text(encoding="utf-8"))
     mapping = data["robot"]["semantic_mapping"]
     mapping["perception"].update({"mapping_backend": "embedded", "allow_legacy_embedded": True})
-    mapping["migration"]["embedded_mapping_backend"] = "migration_only"
     data["robot"]["perception_services"] = {"services": []}
     path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 

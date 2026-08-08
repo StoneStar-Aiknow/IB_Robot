@@ -19,6 +19,16 @@ from inference_manifest.paths import normalize_bundle_path
 
 _ROLE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
 _DEPLOYMENT_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+_RETURN_SEMANTICS = frozenset({"action", "grasp.poses", "detection.boxes", "segmentation.masks"})
+
+# Two prefixes carve tensors out of a deployment's external contract, for different reasons.
+# ``internal.`` names a tensor one role produces and a later role consumes, so it must have
+# a declared producer. ``host.`` names a tensor the host computes between roles - a
+# PointNet++ neighbourhood, a diffusion sample, an integrated pose - so it has no in-graph
+# producer by construction, and a deployment that declares one is driven role by role
+# rather than as a single straight-through graph.
+INTERNAL_SEMANTIC_PREFIX = "internal."
+HOST_SEMANTIC_PREFIX = "host."
 
 
 def _validate_sha256(value: str) -> str:
@@ -318,7 +328,7 @@ class CompiledDeployment(DeploymentIdentity):
         produced_internal: dict[str, str] = {}
         for role in self.execution:
             for binding in self.bindings[role].outputs:
-                if binding.semantic.startswith("internal."):
+                if binding.semantic.startswith(INTERNAL_SEMANTIC_PREFIX):
                     produced_internal[binding.semantic] = role
 
         linked_inputs = {(link.consumer, link.semantic) for link in self.device_links}
@@ -333,7 +343,7 @@ class CompiledDeployment(DeploymentIdentity):
             )
         for role in self.execution:
             for binding in self.bindings[role].inputs:
-                if not binding.semantic.startswith("internal."):
+                if not binding.semantic.startswith(INTERNAL_SEMANTIC_PREFIX):
                     continue
                 producer = produced_internal.get(binding.semantic)
                 endpoint = (role, binding.semantic)

@@ -6,6 +6,7 @@ ROS Interfaces:
     Subscriptions:
         /cmd_pose (geometry_msgs/Pose) — fire-and-forget Pose commands
         /joint_states (sensor_msgs/JointState)
+        configured hardware feedback heartbeat (ibrobot_msgs/JointCurrent)
     Publishers:
         /robot_status/ee_pose (geometry_msgs/PoseStamped) — 10 Hz
         /moveit_gateway/motion_status (std_msgs/String) — "idle" | "executing" | "succeeded" | "failed"
@@ -30,6 +31,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Header, String
 
 try:
+    from ibrobot_msgs.msg import JointCurrent
     from ibrobot_msgs.srv import MoveToConfiguration, MoveToPose
 
     _HAS_MOVE_SERVICES = True
@@ -58,7 +60,11 @@ class MoveItGateway(Node):
         self.declare_parameter("motion_start_timeout_s", 5.0)
         self.declare_parameter("motion_execution_timeout_s", 30.0)
         self.declare_parameter("motion_cancel_timeout_s", 5.0)
-        self.declare_parameter("motion_status_hold_s", 0.3)
+        self.declare_parameter("motion_status_hold_s", 0.0)
+        self.declare_parameter("motion_feedback_timeout_s", 0.3)
+        self.declare_parameter("motion_feedback_tolerance_rad", 0.12)
+        self.declare_parameter("motion_require_tf_sync", True)
+        self.declare_parameter("motion_hardware_feedback_topic", "")
 
         self.group_name = self.get_parameter("arm_group_name").value
         self.base_link = self.get_parameter("base_link").value
@@ -69,8 +75,16 @@ class MoveItGateway(Node):
         self._motion_execution_timeout_s = max(float(self.get_parameter("motion_execution_timeout_s").value), 0.0)
         self._motion_cancel_timeout_s = max(float(self.get_parameter("motion_cancel_timeout_s").value), 0.0)
         self._motion_status_hold_s = max(float(self.get_parameter("motion_status_hold_s").value), 0.0)
+        self._motion_feedback_timeout_s = max(float(self.get_parameter("motion_feedback_timeout_s").value), 0.0)
+        self._motion_feedback_tolerance_rad = max(float(self.get_parameter("motion_feedback_tolerance_rad").value), 0.0)
+        self._motion_require_tf_sync = bool(self.get_parameter("motion_require_tf_sync").value)
+        self._motion_hardware_feedback_topic = str(self.get_parameter("motion_hardware_feedback_topic").value).strip()
         self._initialize_motion_coordinator()
 
+        self._joint_state_lock = threading.Lock()
+        self._joint_state_sequence = 0
+        self._hardware_feedback_sequence = 0
+        self._latest_hardware_feedback_stamp_ns = 0
         self.latest_joint_state = None
         self.get_logger().info("Initializing MoveIt Gateway for SO101...")
 
@@ -103,6 +117,16 @@ class MoveItGateway(Node):
             10,
             callback_group=self.callback_group,
         )
+        self.hardware_feedback_sub = None
+        if self._motion_hardware_feedback_topic:
+            self.hardware_feedback_sub = self.create_subscription(
+                JointCurrent,
+                self._motion_hardware_feedback_topic,
+                self.hardware_feedback_callback,
+                10,
+                callback_group=self.callback_group,
+            )
+            self.get_logger().info(f"Post-motion hardware feedback barrier: {self._motion_hardware_feedback_topic}")
 
         self.ee_pose_pub = self.create_publisher(PoseStamped, "/robot_status/ee_pose", 10)
 
@@ -376,10 +400,114 @@ class MoveItGateway(Node):
         return constraint
 
     def joint_state_callback(self, msg):
-        self.latest_joint_state = msg
+        with self._joint_state_lock:
+            self.latest_joint_state = msg
+            self._joint_state_sequence += 1
         # 调试：打印关节状态
         if msg is not None and hasattr(msg, "name") and hasattr(msg, "position"):
             self.get_logger().debug(f"Joint state updated: {list(msg.name)} = {[f'{p:.3f}' for p in msg.position]}")
+
+    @staticmethod
+    def _message_stamp_ns(message) -> int:
+        header = getattr(message, "header", None)
+        stamp = getattr(header, "stamp", None)
+        if stamp is None:
+            return 0
+        return int(getattr(stamp, "sec", 0)) * 1_000_000_000 + int(getattr(stamp, "nanosec", 0))
+
+    def hardware_feedback_callback(self, msg):
+        """Record feedback emitted only after a successful hardware read cycle."""
+        with self._joint_state_lock:
+            self._hardware_feedback_sequence += 1
+            self._latest_hardware_feedback_stamp_ns = self._message_stamp_ns(msg)
+
+    def _tf_has_caught_up(self, joint_state_stamp_ns: int) -> tuple[bool, int]:
+        if not self._motion_require_tf_sync:
+            return True, 0
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.base_link,
+                self.ee_link,
+                rclpy.time.Time(),
+                timeout=rclpy.duration.Duration(seconds=0.0),
+            )
+        except Exception:
+            return False, 0
+        transform_stamp_ns = self._message_stamp_ns(transform)
+        if joint_state_stamp_ns <= 0:
+            return True, transform_stamp_ns
+        return transform_stamp_ns >= joint_state_stamp_ns, transform_stamp_ns
+
+    def _wait_for_post_motion_feedback(self, target_positions: dict[str, float] | None = None) -> bool:
+        """Wait for post-terminal hardware, joint, and corresponding TF feedback."""
+        timeout_s = self._motion_feedback_timeout_s
+        if timeout_s <= 0.0:
+            return True
+
+        started = time.monotonic()
+        deadline = started + timeout_s
+        with self._joint_state_lock:
+            initial_joint_sequence = self._joint_state_sequence
+            initial_hardware_sequence = self._hardware_feedback_sequence
+
+        last_missing: list[str] = []
+        last_max_error = math.inf
+        last_joint_stamp_ns = 0
+        last_hardware_stamp_ns = 0
+        last_tf_stamp_ns = 0
+        accepted_joint_sequence = 0
+        hardware_synchronized = not self._motion_hardware_feedback_topic
+        tf_synchronized = not self._motion_require_tf_sync
+        while time.monotonic() < deadline:
+            with self._joint_state_lock:
+                joint_sequence = self._joint_state_sequence
+                hardware_sequence = self._hardware_feedback_sequence
+                message = self.latest_joint_state
+                last_hardware_stamp_ns = self._latest_hardware_feedback_stamp_ns
+
+            hardware_sequence_advanced = hardware_sequence > initial_hardware_sequence
+            if accepted_joint_sequence == 0 and joint_sequence > initial_joint_sequence and message is not None:
+                last_joint_stamp_ns = self._message_stamp_ns(message)
+                positions_converged = target_positions is None
+                if target_positions is not None:
+                    positions = {
+                        str(name): float(position)
+                        for name, position in zip(message.name, message.position, strict=False)
+                        if math.isfinite(float(position))
+                    }
+                    last_missing = [name for name in target_positions if name not in positions]
+                    if not last_missing:
+                        last_max_error = max(abs(positions[name] - target) for name, target in target_positions.items())
+                        positions_converged = last_max_error <= self._motion_feedback_tolerance_rad
+                if positions_converged:
+                    accepted_joint_sequence = joint_sequence
+
+            if accepted_joint_sequence > 0:
+                hardware_synchronized = not self._motion_hardware_feedback_topic or (
+                    hardware_sequence_advanced
+                    and (last_joint_stamp_ns <= 0 or last_hardware_stamp_ns >= last_joint_stamp_ns)
+                )
+                tf_synchronized, last_tf_stamp_ns = self._tf_has_caught_up(last_joint_stamp_ns)
+                if hardware_synchronized and tf_synchronized:
+                    error_text = "n/a" if target_positions is None else f"{last_max_error:.4f} rad"
+                    self.get_logger().info(
+                        f"Post-motion feedback synchronized in {time.monotonic() - started:.3f}s "
+                        f"(max_joint_error={error_text}, hardware={hardware_synchronized}, "
+                        f"joint_stamp_ns={last_joint_stamp_ns}, tf_stamp_ns={last_tf_stamp_ns})"
+                    )
+                    return True
+            time.sleep(0.01)
+
+        missing_text = ",".join(last_missing) if last_missing else "none"
+        error_text = "unavailable" if not math.isfinite(last_max_error) else f"{last_max_error:.4f}"
+        self.get_logger().warning(
+            f"Post-motion feedback barrier did not converge within {timeout_s:.3f}s "
+            f"(missing={missing_text}, max_joint_error={error_text} rad, "
+            f"hardware={hardware_synchronized}, tf={tf_synchronized}, "
+            f"joint_stamp_ns={last_joint_stamp_ns}, hardware_stamp_ns={last_hardware_stamp_ns}, "
+            f"tf_stamp_ns={last_tf_stamp_ns})"
+        )
+        return False
 
     def cmd_pose_callback(self, msg):
         token = self._claim_motion("cmd_pose")
@@ -729,6 +857,9 @@ class MoveItGateway(Node):
                 response.success, response.message, terminal_confirmed = self._wait_for_motion_completion(
                     token, "MoveToPose"
                 )
+                if response.success and not self._wait_for_post_motion_feedback():
+                    response.success = False
+                    response.message = "Motion completed but fresh joint feedback was not observed"
             else:
                 response.success = False
                 response.message = "IK/planning failed"
@@ -793,6 +924,10 @@ class MoveItGateway(Node):
                 response.success, response.message, terminal_confirmed = self._wait_for_motion_completion(
                     token, "MoveToConfiguration"
                 )
+                arm_feedback_targets = {name: positions_by_name[name] for name in self.joint_names}
+                if response.success and not self._wait_for_post_motion_feedback(arm_feedback_targets):
+                    response.success = False
+                    response.message = "Motion completed but joint feedback did not converge to the target"
             else:
                 response.success = False
                 response.message = "Joint planning failed"

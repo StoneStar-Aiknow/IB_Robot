@@ -2,7 +2,15 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from perception_service.model_contracts import ModelManifest, validate_mask_batch, validate_ready, validate_text_batch
+from perception_service.model_contracts import (
+    MAX_DETECTIONS,
+    ModelManifest,
+    rank_detections,
+    validate_detection_batch,
+    validate_mask_batch,
+    validate_ready,
+    validate_text_batch,
+)
 
 
 @dataclass
@@ -68,6 +76,33 @@ def test_mask_batch_rejects_dimension_and_timestamp_mismatch():
 def test_readiness_fails_closed():
     with pytest.raises(RuntimeError, match="missing model"):
         validate_ready(False, "missing model")
+
+
+@dataclass
+class _Detection:
+    label: str
+    confidence: float
+
+
+def test_detections_are_ranked_by_confidence_and_capped():
+    records = [_Detection(f"query-{index}", index / 100.0) for index in range(900)]
+
+    ranked = rank_detections(records)
+
+    assert len(ranked) == MAX_DETECTIONS
+    assert [record.label for record in ranked[:3]] == ["query-899", "query-898", "query-897"]
+
+
+def test_detection_ranking_is_stable_for_equal_confidence():
+    records = [_Detection("a", 0.5), _Detection("b", 0.9), _Detection("c", 0.5)]
+
+    assert [record.label for record in rank_detections(records, 3)] == ["b", "a", "c"]
+
+
+def test_detection_batch_rejects_more_than_the_service_limit():
+    validate_detection_batch([_Detection("a", 0.5)] * MAX_DETECTIONS)
+    with pytest.raises(ValueError, match="exceeds limit"):
+        validate_detection_batch([_Detection("a", 0.5)] * (MAX_DETECTIONS + 1))
 
 
 def test_text_batch_is_non_empty_bounded_and_contains_text():

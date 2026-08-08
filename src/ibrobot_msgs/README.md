@@ -114,15 +114,14 @@ Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `Vali
 | `volume_m3` | `float32` | 凸包体积，`0.0` 表示点数不足、几何退化或无法计算体积质心 |
 | `point_count` | `int32` | mask 内有效深度点数量 |
 
-### `DetectionArray.msg` / `DetectSegment.srv` 兼容边界
+### `DetectionArray.msg` 与抓取感知服务
 
-`DetectSegment` 是订阅最新相机快照后按文本 prompt 检测的兼容接口。接口 schema 由 `ibrobot_msgs` 维护，
-`perception_service/grounded_sam2_node` 维护运行时兼容实现，`manipulation_service` 维护主抓取消费路径，
-`manipulation_execution` 维护检测回退路径。`grounded_sam2_snapshot` 是诊断消费者。
+抓取感知使用显式图像输入的强类型服务。`GroundingDetect` 返回 bbox、label 和 confidence；当所选 deployment
+不内联分割时，`SegmentDetections` 接收同一图像与检测数组并补齐 `mono8` mask。PC 的组合 Torch deployment
+可直接由 `GroundingDetect` 返回 mask，310P 则使用 `GroundingDetect -> SegmentDetections` 两个 named deployment。
 
-离线语义建图不改变该接口，而使用显式携带图像的 `GenerateMasks`、`RecognizeTags`、
-`EncodeEmbeddings`、`EncodeText` 和 `GroundingDetect`。只有新确认链通过兼容测试且上述消费者全部迁移后，才能在明确的
-发布边界废弃 `DetectSegment`。
+这两个服务不订阅相机或深度 topic。抓取 planner 缓存 RGB-D 与 CameraInfo，用返回 mask 在同一帧深度上计算
+表面质心、体积质心和点数，并通过 `PlanGrasp` 返回几何结果。
 
 ### 显式图像感知服务
 
@@ -133,6 +132,7 @@ Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `Vali
 | `EncodeEmbeddings` | 一张图像最多 8 个 masks 的 SigLIP2 批量编码与候选标签匹配 |
 | `EncodeText` | 最多 16 条文本的 SigLIP2 查询时编码；不携带图像或持久 image embedding |
 | `GroundingDetect` | 显式图像输入的低频目标确认，不参与建图主链 |
+| `SegmentDetections` | 对显式图像和检测 bbox 执行 box-prompt 分割并补齐同尺寸 mask |
 
 所有新服务返回 `ModelRuntimeInfo`。`EncodeText` 返回瞬时、归一化的查询文本向量，供语义地图内部与私有
 image embedding 比较；持久对象 embedding 仍是语义地图私有数据，不进入对象快照消息。
@@ -230,6 +230,7 @@ keyframe readiness、队列深度、收发/丢包计数和最后错误。
 | 字段 | 说明 |
 | --- | --- |
 | `task_id` | 任务 ID |
+| `execution_token` | Gateway 内部执行授权；外部 primitive 请求留空，调用方不得自行构造 |
 | `primitive_name` | 原子动作名，包括 `move_to_named_pose`、`move_to_pose`、`move_to_configuration`、`move_relative_ee`、`move_to_joint_positions`、`move_through_joint_positions`、`open_gripper`、`close_gripper`、`rotate_gripper_cw` 和 `rotate_gripper_ccw` |
 | `pose_name` | 命名位姿（`move_to_named_pose` 使用） |
 | `target_pose` | 动态 base-frame 位姿（`move_to_pose` 使用） |
@@ -253,8 +254,14 @@ keyframe readiness、队列深度、收发/丢包计数和最后错误。
 | --- | --- |
 | `target_query` | 运行时视觉文本查询，不是静态 `named_targets` 键 |
 | `timeout_sec` | 完整规划、执行和验证预算 |
+| `mode` | `MODE_EXECUTE`、`MODE_PLAN_ONLY` 或 `MODE_OBSERVE_ONLY`；测试和 Hermes 共用同一 executor |
+| `release_after_success` | 验证成功后是否由正式 executor 执行安全释放 |
+| `release_drop_height_m` | 非负时先下降到相对抓取位的指定高度再开爪；负值在最终 lift 位释放 |
 | `verification_status` | 未执行、成功、失败或不确定 |
 | `completed_phases` | 已进入的抓取状态机阶段 |
+| `candidate_index` | 正式 pipeline 最终规划或执行的 GraspGen 候选索引，未选择时为 `-1` |
+| `released_after_success` | 成功抓取后是否已经完成正式释放流程 |
+| `pipeline_timings_json` | 正式 executor 返回的阶段耗时 JSON；`phase_*` 是反馈阶段墙钟，`subphase_contact_realign` 是嵌套耗时，供监督测试和批量实验复用 |
 
 ### `ArmReturnHome.action`
 

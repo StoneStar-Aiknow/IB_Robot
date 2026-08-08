@@ -370,6 +370,7 @@ class SkillExecutorNode(Node):
         self._active_audit_context = None
         self._pending_internal_primitive_goals = {}
         self._active_internal_primitive_goals = {}
+        self._internal_pick_handoffs = {}
         self._retained_admission_cleanup = {}
         self._capability_view = build_capability_view(
             self._normalized_gateway_config,
@@ -915,6 +916,54 @@ class SkillExecutorNode(Node):
                 cleanup.confirmed_goal_key = None
         return goal_key
 
+    def _register_internal_pick_handoff(self, goal_id: UUID, admission, task_id: str) -> tuple[str, bytes]:
+        raw_goal_key = self._goal_id_key(goal_id)
+        execution_token = raw_goal_key.hex()
+        cleanup_key = b"pick\x00" + raw_goal_key
+        with self._state_guard():
+            handoffs = getattr(self, "_internal_pick_handoffs", None)
+            if handoffs is None:
+                handoffs = {}
+                self._internal_pick_handoffs = handoffs
+            handoffs[execution_token] = (admission, task_id)
+            cleanup = self._retained_admission_cleanup.setdefault(
+                id(admission),
+                _RetainedAdmissionCleanup(admission=admission, audit_context={}),
+            )
+            if cleanup.admission is admission:
+                cleanup.pending_goal_key = cleanup_key
+                cleanup.confirmed_goal_key = None
+        return execution_token, cleanup_key
+
+    def _internal_pick_admission(self, goal):
+        execution_token = str(getattr(goal, "execution_token", "")).strip()
+        if not execution_token:
+            return None
+        with self._state_guard():
+            handoff = getattr(self, "_internal_pick_handoffs", {}).get(execution_token)
+            if handoff is None or handoff[1] != str(goal.task_id):
+                return None
+            return handoff[0]
+
+    def _forget_internal_pick_handoff(self, execution_token: str) -> None:
+        with self._state_guard():
+            getattr(self, "_internal_pick_handoffs", {}).pop(execution_token, None)
+
+    def _forget_internal_pick_handoffs_for_admission(self, admission) -> None:
+        with self._state_guard():
+            handoffs = getattr(self, "_internal_pick_handoffs", {})
+            stale_tokens = [token for token, handoff in handoffs.items() if handoff[0] is admission]
+            for token in stale_tokens:
+                del handoffs[token]
+
+    def _confirm_internal_pick_cleanup(self, admission, execution_token: str, cleanup_key: bytes) -> None:
+        self._forget_internal_pick_handoff(execution_token)
+        with self._state_guard():
+            cleanup = self._retained_admission_cleanup.get(id(admission))
+            if cleanup is not None and cleanup.admission is admission and cleanup.pending_goal_key == cleanup_key:
+                cleanup.confirmed_goal_key = cleanup_key
+        self._converge_retained_admission(admission)
+
     def _activate_internal_primitive_goal(self, goal_handle):
         goal_id = getattr(goal_handle, "goal_id", None)
         if goal_id is None:
@@ -986,6 +1035,7 @@ class SkillExecutorNode(Node):
             self._active_skill_admission = None
             self._active_skill_owner = None
             self._active_audit_context = None
+            self._forget_internal_pick_handoffs_for_admission(admission)
             del self._retained_admission_cleanup[id(admission)]
 
     def _release_late_external_primitive(self, token) -> None:
@@ -1017,10 +1067,11 @@ class SkillExecutorNode(Node):
         if not hasattr(self, "_gateway_policy"):
             return self._execute_primitive_unchecked(goal_handle)
 
-        goal_key, internal_admission = self._activate_internal_primitive_goal(goal_handle)
+        goal_key, registered_goal_admission = self._activate_internal_primitive_goal(goal_handle)
+        internal_admission = registered_goal_admission or self._internal_pick_admission(goal_handle.request)
         error_code, token = self._admit_primitive(goal_handle.request, internal_admission)
         if error_code:
-            if internal_admission is not None:
+            if registered_goal_admission is not None:
                 self._forget_internal_primitive_goal(goal_key)
             result = PrimitiveCommand.Result()
             result.success = False
@@ -1031,7 +1082,7 @@ class SkillExecutorNode(Node):
             return result
         deferred_goal_handle = _DeferredTerminalGoalHandle(goal_handle)
         late_cleanup_confirmation = _LateCleanupConfirmation()
-        if internal_admission is not None:
+        if registered_goal_admission is not None:
             late_cleanup_confirmation.add_callback(
                 lambda: self._confirm_late_internal_cleanup(internal_admission, goal_key)
             )
@@ -1050,7 +1101,7 @@ class SkillExecutorNode(Node):
             deferred_goal_handle.force_abort()
             return result
         finally:
-            if internal_admission is not None:
+            if registered_goal_admission is not None:
                 self._forget_internal_primitive_goal(goal_key)
         if token is not None and result.error_code != PRIMITIVE_CANCEL_CLEANUP_TIMEOUT:
             try:
@@ -1064,7 +1115,11 @@ class SkillExecutorNode(Node):
                 deferred_goal_handle.force_abort()
                 return result
         committed = deferred_goal_handle.commit()
-        if committed and internal_admission is not None and result.error_code != PRIMITIVE_CANCEL_CLEANUP_TIMEOUT:
+        if (
+            committed
+            and registered_goal_admission is not None
+            and result.error_code != PRIMITIVE_CANCEL_CLEANUP_TIMEOUT
+        ):
             late_cleanup_confirmation.confirm()
         return result
 
@@ -1084,7 +1139,9 @@ class SkillExecutorNode(Node):
                     "ee pose unavailable or stale",
                     goal.pose_name,
                 )
-        if goal.primitive_name == "move_relative_ee":
+        if goal.primitive_name == "move_to_pose":
+            target_pose = goal.target_pose
+        elif goal.primitive_name == "move_relative_ee":
             target_pose = self._pose_from_relative_offset(
                 ee_pose_snapshot.pose,
                 goal.relative_dx,
@@ -1673,10 +1730,17 @@ class SkillExecutorNode(Node):
             self._active_skill_admission = None
             self._active_skill_owner = None
             self._active_audit_context = None
+            self._forget_internal_pick_handoffs_for_admission(admission)
             self._retained_admission_cleanup.pop(id(admission), None)
             return True
 
-    def _execute_pick_skill(self, goal_handle, template: dict) -> SkillCommand.Result:
+    def _execute_pick_skill(
+        self,
+        goal_handle,
+        template: dict,
+        *,
+        canonical_task_id: str | None = None,
+    ) -> SkillCommand.Result:
         goal = goal_handle.request
         result = SkillCommand.Result()
         timeout_sec = float(goal.timeout_sec or template.get("timeout_sec", 180.0))
@@ -1703,42 +1767,124 @@ class SkillExecutorNode(Node):
             goal_handle.publish_feedback(feedback)
 
         pick_goal = PickObject.Goal()
-        pick_goal.task_id = goal.task_id
+        pick_goal.task_id = canonical_task_id if canonical_task_id is not None else str(goal.task_id).strip()
         pick_goal.target_query = goal.target_name
         pick_goal.timeout_sec = timeout_sec
-        send_future = self._pick_client.send_goal_async(pick_goal, feedback_callback=_feedback_cb)
-        if not self._wait_for_future(send_future, timeout_sec=self._rpc_timeout):
-            return self._abort_skill(
-                result,
-                goal_handle,
-                completed_phases,
-                "PICK_GOAL_TIMEOUT",
-                "timed out sending pick goal",
+
+        pick_goal_id = None
+        execution_token = ""
+        cleanup_key = b""
+        late_cleanup_confirmation = None
+        with self._state_guard():
+            admission = getattr(self, "_active_skill_admission", None)
+        if admission is not None:
+            pick_goal_id = UUID(uuid=list(uuid.uuid4().bytes))
+            execution_token, cleanup_key = self._register_internal_pick_handoff(
+                pick_goal_id,
+                admission,
+                str(pick_goal.task_id),
+            )
+            late_cleanup_confirmation = _LateCleanupConfirmation()
+            late_cleanup_confirmation.add_callback(
+                lambda: self._confirm_internal_pick_cleanup(
+                    admission,
+                    execution_token,
+                    cleanup_key,
+                )
             )
 
-        pick_handle = send_future.result()
-        if pick_handle is None or not pick_handle.accepted:
+        try:
+            if pick_goal_id is None:
+                send_future = self._pick_client.send_goal_async(pick_goal, feedback_callback=_feedback_cb)
+            else:
+                send_future = self._pick_client.send_goal_async(
+                    pick_goal,
+                    feedback_callback=_feedback_cb,
+                    goal_uuid=pick_goal_id,
+                )
+        except Exception:
             return self._abort_skill(
                 result,
                 goal_handle,
-                completed_phases,
+                [],
+                SKILL_CANCEL_TIMEOUT,
+                "pick goal send state is unknown",
+            )
+        if not self._wait_for_future(send_future, timeout_sec=self._rpc_timeout):
+            if late_cleanup_confirmation is not None:
+                late_cleanup_confirmation.watch_goal_future(send_future, self._best_effort_cancel_goal)
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [f"grasp_pipeline:{phase}" for phase in completed_phases],
+                SKILL_CANCEL_TIMEOUT if late_cleanup_confirmation is not None else "PICK_GOAL_TIMEOUT",
+                "pick goal cleanup state is unknown"
+                if late_cleanup_confirmation is not None
+                else "timed out sending pick goal",
+            )
+
+        try:
+            pick_handle = send_future.result()
+        except Exception:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [f"grasp_pipeline:{phase}" for phase in completed_phases],
+                SKILL_CANCEL_TIMEOUT if late_cleanup_confirmation is not None else "PICK_GOAL_REJECTED",
+                "pick goal response state is unknown",
+            )
+        if pick_handle is None or not pick_handle.accepted:
+            if late_cleanup_confirmation is not None:
+                late_cleanup_confirmation.confirm()
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [f"grasp_pipeline:{phase}" for phase in completed_phases],
                 "PICK_GOAL_REJECTED",
                 "pick executor rejected the goal",
             )
 
-        result_future = pick_handle.get_result_async()
+        try:
+            result_future = pick_handle.get_result_async()
+        except Exception:
+            self._best_effort_cancel_goal(pick_handle)
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [f"grasp_pipeline:{phase}" for phase in completed_phases],
+                SKILL_CANCEL_TIMEOUT,
+                "pick result state is unknown",
+            )
         deadline = time.monotonic() + timeout_sec
         while rclpy.ok() and not result_future.done():
             if goal_handle.is_cancel_requested:
-                self._cancel_goal(pick_handle, result_future)
-                result.success = False
-                result.error_code = "SKILL_CANCELLED"
-                result.message = "pick skill cancelled"
-                result.executed_primitives = [f"grasp_pipeline:{phase}" for phase in completed_phases]
-                goal_handle.canceled()
-                return result
+                if self._cancel_goal(pick_handle, result_future, late_cleanup_confirmation):
+                    if late_cleanup_confirmation is not None:
+                        late_cleanup_confirmation.confirm()
+                    return self._cancel_skill(
+                        result,
+                        goal_handle,
+                        [f"grasp_pipeline:{phase}" for phase in completed_phases],
+                        goal.skill_name,
+                    )
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [f"grasp_pipeline:{phase}" for phase in completed_phases],
+                    SKILL_CANCEL_TIMEOUT,
+                    "pick cancel cleanup timed out",
+                )
             if time.monotonic() >= deadline:
-                self._cancel_goal(pick_handle, result_future)
+                if not self._cancel_goal(pick_handle, result_future, late_cleanup_confirmation):
+                    return self._abort_skill(
+                        result,
+                        goal_handle,
+                        [f"grasp_pipeline:{phase}" for phase in completed_phases],
+                        SKILL_CANCEL_TIMEOUT,
+                        "pick timeout cleanup timed out",
+                    )
+                if late_cleanup_confirmation is not None:
+                    late_cleanup_confirmation.confirm()
                 return self._abort_skill(
                     result,
                     goal_handle,
@@ -1748,10 +1894,41 @@ class SkillExecutorNode(Node):
                 )
             time.sleep(0.05)
 
-        action_result = result_future.result()
+        if not result_future.done():
+            if not self._cancel_goal(pick_handle, result_future, late_cleanup_confirmation):
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [f"grasp_pipeline:{phase}" for phase in completed_phases],
+                    SKILL_CANCEL_TIMEOUT,
+                    "pick executor shutdown cleanup state is unknown",
+                )
+            if late_cleanup_confirmation is not None:
+                late_cleanup_confirmation.confirm()
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [f"grasp_pipeline:{phase}" for phase in completed_phases],
+                "PICK_ABORTED",
+                "pick executor stopped before returning a result",
+            )
+
+        try:
+            action_result = result_future.result()
+        except Exception:
+            self._best_effort_cancel_goal(pick_handle)
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [f"grasp_pipeline:{phase}" for phase in completed_phases],
+                SKILL_CANCEL_TIMEOUT,
+                "pick result state is unknown",
+            )
         pick_result = action_result.result if action_result is not None else None
         result.executed_primitives = [f"grasp_pipeline:{phase}" for phase in completed_phases]
         if pick_result is None:
+            if late_cleanup_confirmation is not None:
+                late_cleanup_confirmation.confirm()
             return self._abort_skill(
                 result,
                 goal_handle,
@@ -1759,6 +1936,11 @@ class SkillExecutorNode(Node):
                 "MISSING_PICK_RESULT",
                 "pick executor returned no result",
             )
+        if pick_result.error_code in {PRIMITIVE_CANCEL_CLEANUP_TIMEOUT, SKILL_CANCEL_TIMEOUT}:
+            if execution_token:
+                self._forget_internal_pick_handoff(execution_token)
+        elif late_cleanup_confirmation is not None:
+            late_cleanup_confirmation.confirm()
         if not pick_result.success:
             return self._abort_skill(
                 result,
@@ -1935,7 +2117,11 @@ class SkillExecutorNode(Node):
 
         template = self._skill_templates.get(goal.skill_name, {})
         if str(template.get("executor", "")).strip() == "grasp_pipeline":
-            return self._execute_pick_skill(goal_handle, template)
+            return self._execute_pick_skill(
+                goal_handle,
+                template,
+                canonical_task_id=canonical_task_id,
+            )
 
         try:
             primitives: list[PrimitiveSpec] = resolve_skill_primitives(

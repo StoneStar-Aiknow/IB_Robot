@@ -98,12 +98,10 @@ sam_config: configs/sam2.1/sam2.1_hiera_l.yaml
 siglip_model_path: siglip2_so400m_patch14_384/assets/model
 ```
 
-`semantic_mapping.migration` 明确记录旧入口状态：`grounded_sam2_node: compatibility` 继续为现有 grasp
-流水线提供 `DetectSegment`，`grounded_sam2_snapshot: diagnostic_only` 仅用于诊断/fixture，
-`perception_service_node: general_scene` 继续负责通用场景理解。若使用 embedded mapping，必须同时设置
-`allow_legacy_embedded: true` 和 `embedded_mapping_backend: migration_only`；这些开关不会静默改变旧接口。
-embedded 启动不会解析或启动 generic service bundles，也不要求 service semantic identities；它只保留显式迁移所需
-的本地模型参数。service 模式仍严格要求 construction 和 text roles。
+抓取和语义建图都通过顶层 `perception_services.services` 使用 named deployment。抓取使用显式图像的
+`GroundingDetect` / `SegmentDetections`，语义建图使用 construction 和 text roles；两者不共享隐式快照节点。
+若显式选择 embedded mapping，必须设置 `allow_legacy_embedded: true`。embedded 启动不会解析或启动 generic
+service bundles，也不要求 service semantic identities；service 模式仍严格要求 construction 和 text roles。
 
 `global_frame` 必须是 SLAM 提供的持久固定坐标系。FAST-LIO 可使用 `camera_init`；若后续 SLAM 发布标准
 `map` 坐标系，只需修改该参数。

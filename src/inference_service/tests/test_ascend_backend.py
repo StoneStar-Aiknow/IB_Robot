@@ -113,7 +113,7 @@ class FakeAclRT:
         return 0
 
     def memcpy(self, destination, destination_size, source, count, kind):
-        del kind
+        self.owner.memcpy_calls.append((destination, source, count, kind))
         payload = self.owner.read_pointer(source, count)
         if count > destination_size:
             return 1
@@ -257,6 +257,7 @@ class FakeAcl:
         self.model_paths: dict[object, str] = {}
         self.unloaded_models: list[object] = []
         self.executions: list[tuple[str, tuple[object, ...], tuple[object, ...]]] = []
+        self.memcpy_calls: list[tuple[object, object, int, int]] = []
         self.memory: dict[object, bytearray] = {}
         self.freed_pointers: list[object] = []
         self.freed_host_pointers: list[object] = []
@@ -477,6 +478,7 @@ def _pi05_context(
                             "index": 3,
                             "dtype": "float32",
                             "shape": [1, 1, 8, 8],
+                            "layout": "NCHW",
                         },
                     ],
                     "outputs": [

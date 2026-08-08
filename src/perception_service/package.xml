@@ -16,6 +16,9 @@
   <depend>embodied_common</depend>
   <exec_depend>inference_manifest</exec_depend>
   <exec_depend>inference_service</exec_depend>
+  <!-- Bundle packaging only: package_graspgen_ascend_bundle reads compiled OM ABIs
+       through model_utils.inference_manifest_export. The runtime services do not. -->
+  <exec_depend>model_utils</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-opencv</exec_depend>
   <exec_depend>python3-scipy</exec_depend>

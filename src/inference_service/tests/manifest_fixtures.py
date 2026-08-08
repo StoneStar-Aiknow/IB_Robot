@@ -30,15 +30,16 @@ def create_policy_bundle(
     local_tokenizer: bool = False,
     include_weights: bool = True,
 ) -> tuple[str, ...]:
+    features = POLICY_FEATURES
     config: dict[str, Any] = {
         "type": policy_type,
-        **POLICY_FEATURES,
+        **features,
         "device": "cuda",
     }
     preprocessor_steps: list[dict[str, Any]] = [
         {
             "registry_name": "normalizer_processor",
-            "config": {"features": {**POLICY_FEATURES["input_features"], **POLICY_FEATURES["output_features"]}},
+            "config": {"features": {**features["input_features"], **features["output_features"]}},
             "state_file": "policy_preprocessor_step_0_normalizer_processor.safetensors",
         }
     ]
@@ -66,7 +67,7 @@ def create_policy_bundle(
             "steps": [
                 {
                     "registry_name": "unnormalizer_processor",
-                    "config": {"features": POLICY_FEATURES["output_features"]},
+                    "config": {"features": features["output_features"]},
                     "state_file": "policy_postprocessor_step_0_unnormalizer_processor.safetensors",
                 }
             ],
@@ -110,6 +111,7 @@ def make_manifest(
     deployment_name: str = "cpu",
     compiled: bool = False,
     backend: str = "rknn",
+    policy_type: str = "act",
 ) -> dict[str, Any]:
     entries = [BundleFile(path=path) for path in bundle_paths]
     if compiled:

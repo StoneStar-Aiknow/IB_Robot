@@ -25,6 +25,7 @@ Parameters (all loaded from robot_config YAML):
     robot_config_path (str): Path to robot_config YAML
 """
 
+import math
 import threading
 import time
 from pathlib import Path
@@ -76,6 +77,15 @@ class TaskExecutorNode(Node):
         robot_name = self._robot_cfg.get("name", "unknown")
         self.get_logger().info(f"Loaded robot config: {robot_name}")
 
+        self.declare_parameter("skip_redundant_gripper_open", False)
+        self.declare_parameter("gripper_open_position", 1.0)
+        self.declare_parameter("gripper_position_tolerance", 0.05)
+        self.declare_parameter("joint_state_max_age_s", 0.25)
+        self._skip_redundant_gripper_open = bool(self.get_parameter("skip_redundant_gripper_open").value)
+        self._gripper_open_position = float(self.get_parameter("gripper_open_position").value)
+        self._gripper_position_tolerance = max(float(self.get_parameter("gripper_position_tolerance").value), 0.0)
+        self._joint_state_max_age_s = max(float(self.get_parameter("joint_state_max_age_s").value), 0.0)
+
         # Extract gripper joint name and controller action from robot_config
         self._gripper_joint = self._resolve_gripper_joint()
         self._gripper_action_name = self._resolve_gripper_action_name()
@@ -97,6 +107,7 @@ class TaskExecutorNode(Node):
 
         # ---- Subscriber: Joint states (for gripper feedback) ----
         self._latest_joint_state = None
+        self._latest_joint_state_received_at = None
         self._joint_state_lock = threading.Lock()
         self._joint_state_sub = self.create_subscription(
             JointState,
@@ -297,6 +308,10 @@ class TaskExecutorNode(Node):
         """Execute a GRIPPER step via FollowJointTrajectory action."""
         target_position = step.gripper_position
 
+        if self._is_redundant_gripper_open(target_position):
+            self.get_logger().info(f"    Gripper already open at {target_position:.2f}; skipping trajectory")
+            return True, "already at open target"
+
         if not self._gripper_action_client.server_is_ready():
             self.get_logger().info("Waiting for gripper trajectory action server...")
             if not self._gripper_action_client.wait_for_server(timeout_sec=5.0):
@@ -360,6 +375,29 @@ class TaskExecutorNode(Node):
     def _joint_state_cb(self, msg: JointState):
         with self._joint_state_lock:
             self._latest_joint_state = msg
+            self._latest_joint_state_received_at = time.monotonic()
+
+    def _is_redundant_gripper_open(self, target: float, *, now: float | None = None) -> bool:
+        """Return true only when fresh feedback confirms an open-target no-op."""
+        if not self._skip_redundant_gripper_open or not math.isfinite(float(target)):
+            return False
+        tolerance = self._gripper_position_tolerance
+        if abs(float(target) - self._gripper_open_position) > tolerance:
+            return False
+
+        checked_at = time.monotonic() if now is None else float(now)
+        with self._joint_state_lock:
+            joint_state = self._latest_joint_state
+            received_at = self._latest_joint_state_received_at
+        if joint_state is None or received_at is None or checked_at - received_at > self._joint_state_max_age_s:
+            return False
+        if self._gripper_joint not in joint_state.name:
+            return False
+        index = joint_state.name.index(self._gripper_joint)
+        if index >= len(joint_state.position):
+            return False
+        current_position = float(joint_state.position[index])
+        return math.isfinite(current_position) and abs(current_position - float(target)) <= tolerance
 
     def _wait_for_gripper(self, target: float, timeout_s: float = 3.0, tolerance: float = 0.05):
         """Wait until gripper joint reaches target position (best-effort)."""

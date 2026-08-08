@@ -46,6 +46,7 @@ setup(
         "console_scripts": [
             "wait_for_clock = robot_config.wait_for_clock:main",
             "wait_for_controllers = robot_config.wait_for_controllers:main",
+            "controller_spawner = robot_config.controller_spawner:main",
             "topic_relay = robot_config.topic_relay:main",
         ],
     },

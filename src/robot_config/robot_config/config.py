@@ -51,6 +51,7 @@ class CameraConfig:
     enable_pointcloud: bool = False
     enable_sync: bool = True
     align_depth: bool = False
+    direct_topic_remap: bool = False
 
     # USB camera specific parameters
     brightness: int | None = None
@@ -203,7 +204,6 @@ class SemanticMappingConfig:
     lifecycle: dict[str, Any] = field(default_factory=dict)
     target_watch: dict[str, Any] = field(default_factory=dict)
     interfaces: dict[str, Any] = field(default_factory=dict)
-    migration: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

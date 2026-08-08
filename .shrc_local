@@ -82,6 +82,8 @@ for _cann_env in "${_CANN_CANDIDATES[@]}"; do
     fi
 done
 if [ -n "${_CANN_LOADED}" ]; then
+    # set_env.sh 是 CANN 环境的唯一入口：ACT/PI0.5/RAM++/SigLIP2 的 OM runtime 已依赖它提供
+    # PYTHONPATH 与 LD_LIBRARY_PATH，此处不再重复推导，避免混用不同 CANN 版本或遮蔽 venv 依赖。
     _IB_STEPS+=("CANN (${_CANN_LOADED})")
 
     # CANN/ATC 的 TIK C++ 编译阶段可能无法自动找到系统 libstdc++ 头文件。

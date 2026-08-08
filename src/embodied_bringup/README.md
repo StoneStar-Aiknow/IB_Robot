@@ -14,6 +14,8 @@ SSOT YAML 配置，负责把任务入口、规则/VLM planner、任务执行器�
   和 `perception_service` 的启动顺序与参数。
 - 当 `robot.grasp_execution.enabled=true` 时，编排 Grounded-SAM2、GraspGen、抓取验证器和
   `manipulation_execution/pick_executor_node`。
+- 将 `grasp_execution.perception_node/planner_node.host_runtime` 转换为对应节点的进程环境；该块不作为
+  ROS 参数传给业务节点。
 - 当 `robot.grasp_execution.ik.worker_count>0` 时，自动包含 `robot_moveit/so101_ik_workers.launch.py`，
   为 Hermes 启动与监督式抓取脚本相同的并行候选 IK/FK 池。
 - 保持具身业务运行时依赖集中在 bringup 层，避免 `robot_config` 反向依赖业务包。
@@ -103,5 +105,5 @@ override 会原样注入 Gateway；`skill_required_control_mode`、status servic
   override（如 `with_perception:=false`）造成不一致，`embodied_pipeline.launch.py` 会在生成节点前 fail-fast
   拒绝启动，避免生成不一致的运行时节点图。
 - `so101_handeye_realsense_grasp` 可通过显式 `pick_object` 技能从 Hermes 调用完整抓取闭环。
-- 真机端口、相机和手眼标定直接维护在该 robot YAML 中；本 launch 与 `robot_mcp` 应使用同一个
+- 真机端口、相机和手眼标定直接维护在该 robot YAML 中；本 launch 与 `robot-skill` 应使用同一个
   `robot_config` 名称，workspace 外部完整 YAML 才需要显式传 `config_path`。

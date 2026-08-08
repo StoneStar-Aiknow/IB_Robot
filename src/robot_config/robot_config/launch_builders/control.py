@@ -27,13 +27,19 @@ from robot_config.utils import (
 logger = get_colored_logger("robot_config.control")
 
 
-def generate_controller_spawners(controller_names, use_sim=True, controller_manager_name="controller_manager"):
+def generate_controller_spawners(
+    controller_names,
+    use_sim=True,
+    controller_manager_name="controller_manager",
+    controller_manager_timeout=None,
+):
     """Generate controller spawner nodes.
 
     Args:
         controller_names: List of controller names to spawn
         use_sim: Simulation mode (affects timeout and use_sim_time)
         controller_manager_name: Name of controller manager service
+        controller_manager_timeout: Timeout for manager discovery and service calls
 
     Returns:
         List of Node actions for controller spawners
@@ -43,54 +49,63 @@ def generate_controller_spawners(controller_names, use_sim=True, controller_mana
     if not controller_names:
         return []
 
-    timeout = 60 if is_sim else 10
-    switch_timeout = 30 if is_sim else 5
-
+    timeout = float(controller_manager_timeout) if controller_manager_timeout is not None else (60 if is_sim else 10)
+    if timeout <= 0.0:
+        raise ValueError("controller_manager_timeout must be greater than zero")
+    service_call_timeout = min(timeout, 10.0)
+    switch_timeout = min(timeout, 10.0)
     return [
         Node(
-            package="controller_manager",
-            executable="spawner",
-            name=f"spawner_{controller_names[0]}_group",
+            package="robot_config",
+            executable="controller_spawner",
+            name=f"spawner_{controller_name}",
             parameters=[{"use_sim_time": is_sim}],
             arguments=[
-                *controller_names,
+                controller_name,
                 "--controller-manager",
                 controller_manager_name,
                 "--controller-manager-timeout",
                 str(timeout),
+                "--service-call-timeout",
+                str(service_call_timeout),
                 "--switch-timeout",
                 str(switch_timeout),
-                "--activate-as-group",
             ],
             output="screen",
         )
+        for controller_name in controller_names
     ]
 
 
-def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers="true"):
+def generate_ros2_control_nodes(
+    robot_config,
+    use_sim,
+    auto_start_controllers="true",
+    controller_startup_timeout=None,
+):
     """Generate ros2_control nodes from configuration.
 
     Args:
         robot_config: Robot configuration dict
         use_sim: Simulation mode flag (string or bool)
         auto_start_controllers: Whether to automatically start controllers (string or bool)
+        controller_startup_timeout: Timeout used by controller-manager spawners
 
     Returns:
-        Tuple: (nodes, controller_names, deferred_sim_spawners, robot_description)
-        In Gazebo simulation, controller spawners are returned in
-        ``deferred_sim_spawners`` (not included in ``nodes``) so launch can
-        start them after ``ros_gz_sim create`` exits.
+        Tuple: (nodes, controller_names, deferred_spawners, robot_description)
+        Controller spawners are returned in ``deferred_spawners`` so launch can
+        gate them on hardware or simulator readiness.
     """
     is_sim = parse_bool(use_sim, default=False)
     is_auto_start = parse_bool(auto_start_controllers, default=True)
 
     nodes = []
-    deferred_sim_spawners = []
+    deferred_spawners = []
     ros2_control_config = robot_config.get("ros2_control")
 
     if not ros2_control_config:
         logger.warning("No ros2_control configuration found")
-        return nodes, [], deferred_sim_spawners, {}
+        return nodes, [], deferred_spawners, {}
 
     logger.info("Creating ros2_control nodes")
 
@@ -124,7 +139,7 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers="t
     # Build URDF (xacro processing + camera injection) via description layer
     _desc_result = generate_robot_description(robot_config, use_sim)
     if _desc_result is None:
-        return nodes, [], deferred_sim_spawners, {}
+        return nodes, [], deferred_spawners, {}
 
     robot_description_str, robot_description = _desc_result
 
@@ -215,8 +230,12 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers="t
             )
 
             if is_auto_start and controller_names:
-                spawners = generate_controller_spawners(controller_names, use_sim=False)
-                nodes.extend(spawners)
+                deferred_spawners = generate_controller_spawners(
+                    controller_names,
+                    use_sim=False,
+                    controller_manager_timeout=controller_startup_timeout,
+                )
+                logger.info(f"Deferring {len(deferred_spawners)} controller spawners until hardware is active")
     else:
         # Simulation mode
         # gz_ros2_control plugin provides controller_manager, but spawners
@@ -226,7 +245,11 @@ def generate_ros2_control_nodes(robot_config, use_sim, auto_start_controllers="t
         logger.info(f"Controllers to spawn (deferred until after gz spawn): {controller_names}")
 
         if is_auto_start and controller_names:
-            deferred_sim_spawners = generate_controller_spawners(controller_names, use_sim=True)
-            logger.info(f"Deferring {len(deferred_sim_spawners)} controller spawners (handled by caller)")
+            deferred_spawners = generate_controller_spawners(
+                controller_names,
+                use_sim=True,
+                controller_manager_timeout=controller_startup_timeout,
+            )
+            logger.info(f"Deferring {len(deferred_spawners)} controller spawners (handled by caller)")
 
-    return nodes, controller_names, deferred_sim_spawners, robot_description
+    return nodes, controller_names, deferred_spawners, robot_description

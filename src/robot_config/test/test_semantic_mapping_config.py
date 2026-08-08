@@ -48,7 +48,15 @@ def test_disabled_semantic_mapping_contract_is_preserved() -> None:
     assert config.semantic_mapping.enabled is False
     assert config.semantic_mapping.camera["mounting"] == "fixed"
     assert config.semantic_mapping.perception["mapping_backend"] == "service"
-    assert len(config.perception_services.services) == 5
+    assert [service.instance_id for service in config.perception_services.services] == [
+        "semantic_sam2_masks",
+        "semantic_ram_plus_tags",
+        "semantic_siglip2_image",
+        "semantic_siglip2_text",
+        "semantic_gdino_confirmation",
+        "semantic_graspgen_grasps",
+    ]
+    assert config.perception_services.enabled_services == ()
     assert config.semantic_mapping.migration["grounded_sam2_node"] == "compatibility"
 
 

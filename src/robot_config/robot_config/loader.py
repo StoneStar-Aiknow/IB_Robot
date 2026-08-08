@@ -106,38 +106,6 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
     if not isinstance(enabled, bool):
         return ["semantic_mapping.enabled must be a boolean"]
 
-    migration = config.get("migration", {})
-    if migration and not isinstance(migration, dict):
-        errors.append("semantic_mapping.migration must be a mapping")
-        migration = {}
-    migration_states = {
-        "grounded_sam2_node": {"compatibility", "disabled"},
-        "grounded_sam2_snapshot": {"diagnostic_only", "disabled"},
-        "perception_service_node": {"general_scene", "disabled"},
-        "embedded_mapping_backend": {"migration_only", "disabled"},
-    }
-    for key, valid_states in migration_states.items():
-        state = migration.get(key)
-        if state is not None and state not in valid_states:
-            errors.append(f"semantic_mapping.migration.{key} must be one of: {', '.join(sorted(valid_states))}")
-
-    grasp_execution = robot_config.get("grasp_execution", {})
-    if (
-        migration.get("grounded_sam2_node") == "disabled"
-        and isinstance(grasp_execution, dict)
-        and grasp_execution.get("enabled", False)
-        and grasp_execution.get("auto_start_dependencies", True)
-    ):
-        errors.append("semantic_mapping.migration.grounded_sam2_node cannot be disabled while grasp auto-start uses it")
-    embodied_perception = robot_config.get("embodied", {}).get("perception", {})
-    if (
-        migration.get("perception_service_node") == "disabled"
-        and isinstance(embodied_perception, dict)
-        and embodied_perception.get("enabled", False)
-    ):
-        errors.append(
-            "semantic_mapping.migration.perception_service_node cannot be disabled while embodied perception is enabled"
-        )
     if not enabled:
         return errors
 
@@ -226,11 +194,7 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
     if mapping_backend == "service":
         errors.extend(_validate_semantic_service_roles(robot_config, perception))
     elif mapping_backend == "embedded" and not bool(perception.get("allow_legacy_embedded", False)):
-        errors.append("semantic_mapping.perception.allow_legacy_embedded must be true for the migration-only backend")
-    if mapping_backend == "embedded" and migration.get("embedded_mapping_backend") != "migration_only":
-        errors.append(
-            "semantic_mapping.migration.embedded_mapping_backend must be 'migration_only' for the embedded backend"
-        )
+        errors.append("semantic_mapping.perception.allow_legacy_embedded must be true for the embedded backend")
 
     persistence = sections["persistence"]
     for key in ("database_path", "artifact_output_dir"):
@@ -964,6 +928,7 @@ def load_camera_config(data: dict[str, Any]) -> CameraConfig:
         enable_pointcloud=data.get("enable_pointcloud", False),
         enable_sync=data.get("enable_sync", True),
         align_depth=data.get("align_depth", False),
+        direct_topic_remap=data.get("direct_topic_remap", False),
         transform=data.get("transform"),
     )
 
@@ -1093,7 +1058,6 @@ def load_semantic_mapping_config(data: dict[str, Any]) -> SemanticMappingConfig:
         lifecycle=dict(data.get("lifecycle", {})),
         target_watch=dict(data.get("target_watch", {})),
         interfaces=dict(data.get("interfaces", {})),
-        migration=dict(data.get("migration", {})),
     )
 
 
@@ -1350,7 +1314,6 @@ def validate_config(config: RobotConfig) -> list[str]:
         "lifecycle": config.semantic_mapping.lifecycle,
         "target_watch": config.semantic_mapping.target_watch,
         "interfaces": config.semantic_mapping.interfaces,
-        "migration": config.semantic_mapping.migration,
     }
     errors.extend(
         validate_semantic_mapping_config(

@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
+import time
 from types import SimpleNamespace
 
 from geometry_msgs.msg import Pose
@@ -80,9 +81,32 @@ class FakeMoveIt2:
             self.set_state(MoveIt2State.REQUESTING)
 
 
-class RaisingTfBuffer:
+class FakeTfBuffer:
+    def __init__(self):
+        self.stamp_ns = 0
+
+    def set_stamp(self, stamp_ns: int):
+        self.stamp_ns = int(stamp_ns)
+
     def lookup_transform(self, *_args, **_kwargs):
-        raise RuntimeError("transform unavailable in unit test")
+        return SimpleNamespace(header=_header(self.stamp_ns))
+
+
+def _header(stamp_ns: int):
+    return SimpleNamespace(
+        stamp=SimpleNamespace(
+            sec=int(stamp_ns) // 1_000_000_000,
+            nanosec=int(stamp_ns) % 1_000_000_000,
+        )
+    )
+
+
+def _joint_state(stamp_ns: int, positions=(0.1, 0.2)):
+    return SimpleNamespace(header=_header(stamp_ns), name=["1", "2"], position=list(positions))
+
+
+def _hardware_feedback(stamp_ns: int):
+    return SimpleNamespace(header=_header(stamp_ns))
 
 
 def make_gateway():
@@ -92,15 +116,23 @@ def make_gateway():
     gateway._motion_execution_timeout_s = 0.0
     gateway._motion_cancel_timeout_s = 0.2
     gateway._motion_status_hold_s = 0.0
+    gateway._motion_feedback_timeout_s = 0.05
+    gateway._motion_feedback_tolerance_rad = 0.05
+    gateway._motion_require_tf_sync = True
+    gateway._motion_hardware_feedback_topic = "/so101_follower/joint_currents"
     gateway._motion_status = "idle"
     gateway.motion_status_pub = FakePublisher()
     gateway.moveit2 = FakeMoveIt2()
     gateway.joint_names = ["1", "2"]
+    gateway._joint_state_lock = threading.Lock()
+    gateway._joint_state_sequence = 0
+    gateway._hardware_feedback_sequence = 0
+    gateway._latest_hardware_feedback_stamp_ns = 0
     gateway.latest_joint_state = None
     gateway.base_link = "base"
     gateway.ee_link = "gripper"
     gateway.shoulder_link = "shoulder"
-    gateway.tf_buffer = RaisingTfBuffer()
+    gateway.tf_buffer = FakeTfBuffer()
     logger = FakeLogger()
     gateway.get_logger = lambda: logger
     return gateway
@@ -272,3 +304,122 @@ def test_skipped_moveit_dispatch_is_not_reported_as_successful():
         position=[0.1, 0.2],
     )
     assert gateway.solve_and_move(Pose()) is False
+
+
+def test_post_motion_feedback_waits_for_a_fresh_converged_sample():
+    gateway = make_gateway()
+    result = None
+
+    def wait_for_feedback():
+        nonlocal result
+        result = gateway._wait_for_post_motion_feedback({"1": 0.1, "2": 0.2})
+
+    wait_thread = threading.Thread(target=wait_for_feedback)
+    wait_thread.start()
+    time.sleep(0.01)
+    gateway.tf_buffer.set_stamp(2_000_000_000)
+    gateway.hardware_feedback_callback(_hardware_feedback(2_000_000_000))
+    gateway.joint_state_callback(_joint_state(2_000_000_000, positions=(0.11, 0.18)))
+    wait_thread.join(timeout=1.0)
+
+    assert not wait_thread.is_alive()
+    assert result is True
+
+
+def test_post_motion_feedback_does_not_accept_a_stale_sample():
+    gateway = make_gateway()
+    gateway._motion_feedback_timeout_s = 0.02
+    gateway.tf_buffer.set_stamp(2_000_000_000)
+    gateway.hardware_feedback_callback(_hardware_feedback(2_000_000_000))
+    gateway.joint_state_callback(_joint_state(2_000_000_000))
+
+    assert gateway._wait_for_post_motion_feedback({"1": 0.1, "2": 0.2}) is False
+
+
+def test_post_motion_feedback_requires_a_new_hardware_read():
+    gateway = make_gateway()
+    gateway._motion_feedback_timeout_s = 0.03
+    result = None
+
+    def wait_for_feedback():
+        nonlocal result
+        result = gateway._wait_for_post_motion_feedback({"1": 0.1, "2": 0.2})
+
+    wait_thread = threading.Thread(target=wait_for_feedback)
+    wait_thread.start()
+    time.sleep(0.01)
+    gateway.tf_buffer.set_stamp(3_000_000_000)
+    gateway.joint_state_callback(_joint_state(3_000_000_000))
+    wait_thread.join(timeout=1.0)
+
+    assert not wait_thread.is_alive()
+    assert result is False
+
+
+def test_post_motion_feedback_requires_tf_for_the_accepted_joint_sample():
+    gateway = make_gateway()
+    gateway._motion_feedback_timeout_s = 0.03
+    result = None
+
+    def wait_for_feedback():
+        nonlocal result
+        result = gateway._wait_for_post_motion_feedback({"1": 0.1, "2": 0.2})
+
+    wait_thread = threading.Thread(target=wait_for_feedback)
+    wait_thread.start()
+    time.sleep(0.01)
+    gateway.tf_buffer.set_stamp(3_000_000_000)
+    gateway.hardware_feedback_callback(_hardware_feedback(4_000_000_000))
+    gateway.joint_state_callback(_joint_state(4_000_000_000))
+    wait_thread.join(timeout=1.0)
+
+    assert not wait_thread.is_alive()
+    assert result is False
+
+
+def test_post_motion_feedback_rejects_a_queued_hardware_sample_older_than_joint_state():
+    gateway = make_gateway()
+    gateway._motion_feedback_timeout_s = 0.03
+    result = None
+
+    def wait_for_feedback():
+        nonlocal result
+        result = gateway._wait_for_post_motion_feedback({"1": 0.1, "2": 0.2})
+
+    wait_thread = threading.Thread(target=wait_for_feedback)
+    wait_thread.start()
+    time.sleep(0.01)
+    gateway.tf_buffer.set_stamp(5_000_000_000)
+    gateway.hardware_feedback_callback(_hardware_feedback(4_000_000_000))
+    gateway.joint_state_callback(_joint_state(5_000_000_000))
+    wait_thread.join(timeout=1.0)
+
+    assert not wait_thread.is_alive()
+    assert result is False
+
+
+def test_post_motion_feedback_keeps_the_first_fresh_converged_joint_sample_as_sync_target():
+    gateway = make_gateway()
+    gateway._motion_feedback_timeout_s = 0.2
+    result = None
+
+    def wait_for_feedback():
+        nonlocal result
+        result = gateway._wait_for_post_motion_feedback({"1": 0.1, "2": 0.2})
+
+    wait_thread = threading.Thread(target=wait_for_feedback)
+    wait_thread.start()
+    time.sleep(0.01)
+
+    gateway.tf_buffer.set_stamp(1_900_000_000)
+    gateway.hardware_feedback_callback(_hardware_feedback(1_900_000_000))
+    gateway.joint_state_callback(_joint_state(2_000_000_000))
+    time.sleep(0.03)
+
+    gateway.joint_state_callback(_joint_state(3_000_000_000))
+    gateway.tf_buffer.set_stamp(2_000_000_000)
+    gateway.hardware_feedback_callback(_hardware_feedback(2_000_000_000))
+    wait_thread.join(timeout=1.0)
+
+    assert not wait_thread.is_alive()
+    assert result is True

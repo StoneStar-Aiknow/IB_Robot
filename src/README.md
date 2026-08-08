@@ -18,29 +18,48 @@ IB-Robot 采用了 **`robot_config`** 作为全系统的“唯一真理源 (Sing
 ## 系统架构与数据流
 
 ```mermaid
-graph TD
-    %% 配置中心
-    Config[robot_config] -- 1. 分发规格/契约 --> Init[系统初始化]
-    
-    %% 执行层
-    Init --> InfSrv[inference_service]
-    Init --> Dispatch[action_dispatch]
-    Init --> Bridge[tensormsg]
-    
-    %% 数据闭环
-    subgraph "决策与调度 (Decision & Dispatch)"
-        InfSrv -- 预测动作块/张量 --> Dispatch
-        Dispatch -- 高频插值指令 --> Bridge
+flowchart TD
+    Config["robot_config<br/>SSOT"] -->|"规格、契约与节点参数"| Init["系统初始化"]
+
+    subgraph policy_path["策略推理路径"]
+        Sensor["相机 / joint_states"] -->|"ROS observations"| Tensor["tensormsg"]
+        Tensor -->|"契约对齐张量"| InfSrv["inference_service"]
+        InfSrv -->|"预测动作块"| Dispatch["action_dispatch"]
     end
-    
-    subgraph "感知与执行 (Perception & Execution)"
-        Bridge -- 标准控制接口 --> Hardware{ros2_control}
-        Hardware -- 实机驱动 --> Real[so101_hardware]
-        Hardware -- 仿真驱动 --> Sim[Gazebo / Ignition]
-        Sensor[相机/状态反馈] -- 原始数据 --> Bridge
+
+    subgraph skill_path["任务与技能路径"]
+        Hermes["Hermes / Agent"] --> AgentSkill["ibrobot-control"]
+        AgentSkill --> CLI["robot-skill"]
+        CLI --> Gateway["ROS Capability Gateway"]
+        TaskEntry["ASR / VLM / embodied_agent"] --> Skill["skill_library"]
+        Gateway -->|"SkillCommand"| Skill
+        Skill -.->|"feedback / result"| Gateway
+        Skill -->|"ValidateSkill / ValidatePrimitive"| Safety["safety_guard"]
+        Skill -->|"PickObject"| Pick["manipulation_execution"]
+        Pick -->|"PlanGrasp / VerifyGrasp"| GraspServices["perception_service<br/>manipulation_service"]
+        GraspServices -->|"候选、场景几何与验证证据"| Pick
+        Pick -->|"受限 PrimitiveCommand"| Skill
+        Skill -->|"已校验运动 primitive"| Motion["task_dispatch / MoveIt gateway"]
+        Pick -.->|"仅候选 IK/FK，无运动"| MoveIt["MoveIt 2 main + workers"]
+        Motion --> MoveIt
     end
-    
-    Bridge -- 契约对齐的张量 --> InfSrv
+
+    Dispatch -->|"高频关节指令"| Control["ros2_control"]
+    MoveIt -->|"规划轨迹"| Control
+    Control --> Real["so101_hardware"]
+    Control --> Sim["Gazebo / Ignition"]
+    Real -->|"状态反馈"| Sensor
+    Sim -->|"状态反馈"| Sensor
+    Sensor --> GraspServices
+    Sensor --> Pick
+
+    Init -.-> Tensor
+    Init -.-> InfSrv
+    Init -.-> Dispatch
+    Init -.-> Gateway
+    Init -.-> Skill
+    Init -.-> Pick
+    Init -.-> Control
 ```
 
 ---
@@ -109,4 +128,4 @@ graph TD
 
 ## 许可证 (License)
 
-本项目源码遵循 [Apache License 2.0](LICENSE)。
+本项目源码遵循 Apache License 2.0；各 ROS 2 包的许可声明以其 `package.xml` 为准。

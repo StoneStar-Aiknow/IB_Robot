@@ -3,13 +3,12 @@
 # Hardware assumptions:
 # - SO-101 follower arm on /dev/ttyACM0
 # - follower joint calibration at ~/.calibrate/so101_follower_calibrate.json
-# - one RealSense connected to the PC, with the camera bracket mounted on SO101
+# - one RealSense connected to the 310P board, with the camera bracket mounted on SO101
 # - the RealSense moves rigidly with the gripper
 # - no separate top/front fixed camera
 #
-# The camera is named "wrist" by role even though the physical device is a
-# PC-connected RealSense. The USB connection location does not define the hand-eye
-# type; the rigid transform parent does.
+# The camera is named "wrist" by role. The USB connection location does not
+# define the hand-eye type; the rigid transform parent does.
 
 robot:
   name: so101_handeye_realsense_grasp
@@ -32,15 +31,42 @@ robot:
     base_link: base
     ee_link: gripper
     shoulder_link: shoulder
+    # Return as soon as a post-terminal hardware read, converged joint sample,
+    # and the corresponding robot_state_publisher TF are all observable.
+    motion_status_hold_s: 0.0
+    motion_feedback_timeout_s: 0.3
+    motion_feedback_tolerance_rad: 0.12
+    motion_require_tf_sync: true
+    motion_hardware_feedback_topic: /so101_follower/joint_currents
 
   skill_required_control_mode: "moveit_planning"
   semantic_mapping:
     enabled: false
-    migration:
-      grounded_sam2_node: compatibility
-      grounded_sam2_snapshot: diagnostic_only
-      perception_service_node: general_scene
-      embedded_mapping_backend: disabled
+
+  perception_services:
+    services:
+      - id: grasp_grounding
+        enabled: true
+        required: true
+        bundle_path: models/perception/grounding_dino_swint_seq8_1280x720_ascend
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
+        service_type: ibrobot_msgs/srv/GroundingDetect
+        endpoint: /perception/grasp/grounding_detect
+        node_name: grasp_grounding_detect
+        runtime_options:
+          device_id: 0
+      - id: grasp_segmentation
+        enabled: true
+        required: true
+        bundle_path: models/perception/sam2_hiera_tiny_ascend
+        deployment: ascend_310p
+        adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
+        service_type: ibrobot_msgs/srv/SegmentDetections
+        endpoint: /perception/grasp/segment_detections
+        node_name: grasp_segment_detections
+        runtime_options:
+          device_id: 0
 
   grasp_execution:
     enabled: true
@@ -48,7 +74,9 @@ robot:
     auto_start_dependencies: true
     planner_service: /grasp_planner/plan_grasp
     verifier_service: /grasp_verifier/verify_grasp
-    detect_service: /grounded_sam2/detect_and_segment
+    detect_service: /perception/grasp/grounding_detect
+    fallback_detect_service: /grasp_planner/detect_and_segment
+    segment_service: /perception/grasp/segment_detections
     ik_service: /compute_ik
     fk_service: /compute_fk
     joint_state_topic: /joint_states
@@ -63,17 +91,35 @@ robot:
     verification_wait_sec: 0.1
     recover_after_close_failure: true
     recover_after_retention_failure: true
-    max_execution_attempts: 1
+    max_execution_attempts: 3
     approach_distance_m: 0.08
     lift_distance_m: 0.050
-    observe_velocity_scaling: 0.25
-    approach_velocity_scaling: 0.25
-    descend_velocity_scaling: 0.15
-    probe_lift_velocity_scaling: 0.02
-    lift_velocity_scaling: 0.02
-    observe_settle_sec: 0.6
-    open_settle_sec: 0.3
-    hold_sec: 0.8
+    # Validated by the legacy marker test on 310P (5/5 verified grasps): lower
+    # the complete candidate target by 8 mm in base coordinates.
+    candidate_target_offset_base_m: [0.0, 0.0, -0.008]
+    observe_velocity_scaling: 0.40
+    approach_velocity_scaling: 0.35
+    descend_velocity_scaling: 0.20
+    probe_lift_velocity_scaling: 0.05
+    lift_velocity_scaling: 0.08
+    # Post-success release: lower the verified target back onto the table
+    # instead of keeping it in the gripper, so consecutive picks still have
+    # a target. Only used when the goal sets release_after_success.
+    release_velocity_scaling: 0.05
+    release_settle_sec: 0.5
+    observe_settle_sec: 0.4
+    open_settle_sec: 0.2
+    hold_sec: 0.5
+    state_wait:
+      # Fixed task waits are retained on real hardware. Joint-state stability
+      # alone is not a hardware-health signal because broadcasters can republish
+      # stale samples after a ros2_control hardware error.
+      enabled: false
+      minimum_sec: 0.05
+      stable_sec: 0.06
+      joint_delta_rad: 0.004
+      gripper_tolerance_rad: 0.05
+      gripper_joint: "6"
     probe_lift_height_m: 0.03
     camera:
       frame_id: camera_wrist_optical_frame
@@ -84,21 +130,38 @@ robot:
       confidence_threshold: 0.30
       grasp_threshold: 0.20
       timeout_sec: 120.0
-      debug_output_mode: diagnostic
+      debug_output_mode: none
     candidate_selection:
       min_confidence: 0.0
       min_point_count: 100
       require_collision_free: false
-      min_contact_z: -0.045
+      # Coarse bound on how far below the base origin a fingertip contact may
+      # sit. The fitted tabletop plane measures 6 runs at z_base = -0.061 with a
+      # 0.5 mm spread, plus one bad RANSAC fit at -0.069 (6.1 deg tilt); -0.075
+      # clears the worst fit with margin. Sweeping lower adds no candidates.
+      # The real collision gate stays target_geometry.tabletop_filter, which is
+      # measured against the fitted plane and so does not drift with base height.
+      min_contact_z: -0.075
       min_approach_z: 0.04
       min_topdown_score: 0.0
       topdown_min_z: -0.25
       max_candidates: 80
+      # Bound fresh-frame replanning so a failed pick returns promptly.
+      selection_attempts: 3
+      retry_settle_sec: 0.2
       confidence_weight: 1.0
       topdown_weight: 0.35
     ik:
       group_name: arm
+      # PR259-validated solver budget. LMA re-seeds from a random joint
+      # configuration after a failed seeded attempt and keeps retrying until
+      # this timeout expires, which destroys the joint5 seed that the IK
+      # orientation guard writes back between attempts.
       timeout_sec: 0.20
+      # Unreachable LMA requests can take about one second on the 310P host.
+      # Wait on the service well past the solver budget so a loaded host is not
+      # mistaken for an unhealthy IK worker.
+      rpc_timeout_sec: 3.0
       avoid_collisions: false
       check_orientation: false
       worker_count: 4
@@ -119,12 +182,20 @@ robot:
       contact_z_weight: 0.15
       confidence_weight: 0.05
       centroid_distance_weight: 0.50
+      # Rank down candidates whose predicted fixed-finger robust gap would
+      # make the execution phase retreat before closing.
+      robust_gap_headroom_weight: 0.35
       contact_xy_scale_m: 0.030
       contact_z_scale_m: 0.020
       centroid_distance_scale_m: 0.010
+      robust_gap_headroom_scale_m: 0.004
       fixed_finger_gap_sigma_m: 0.006
       missing_fixed_finger_envelope_score: 0.20
+      missing_robust_gap_headroom_score: 0.50
       fixed_finger_score_weight: 0.80
+      # Consumed by fixed_finger_envelope_score via prepared_candidate_scoring.
+      # Keep these here: preparation.py reads them from this block, not from
+      # target_gripper.
       reliable_max_opening_m: 0.072
       moving_finger_min_clearance_m: 0.003
     contact_realign:
@@ -132,21 +203,29 @@ robot:
       tolerance_m: 0.008
       max_iterations: 2
       max_correction_m: 0.030
-      settle_sec: 0.25
+      # MoveIt completion already gates on fresh hardware, joints, and matching TF.
+      settle_sec: 0.0
       pregrasp_enabled: true
       pregrasp_clearance_m: 0.020
     pose_diagnostics:
       enabled: true
-      settle_sec: 0.05
+      settle_sec: 0.0
       grasp_warn_threshold_m: 0.008
       grasp_realign_log_threshold_m: 0.010
       grasp_abort_log_threshold_m: 0.030
     frame_diagnostics:
       enabled: true
-    perception_node:
-      device: cuda
     planner_node:
-      save_debug_outputs: true
+      inference_backend: ascend_local
+      ascend_local_manifest_path: /root/graspgen_310p_bundle
+      ascend_local_deployment_name: ascend_310p
+      ascend_local_device_id: 0
+      ascend_local_random_seed: 0
+      startup_warmup: true
+      host_runtime:
+        omp_threads: 4
+        blas_threads: 1
+      save_debug_outputs: false
       debug_output_dir: outputs/grasp_pipeline
       enable_collision_filter: false
       enable_tabletop_filter: true
@@ -162,6 +241,7 @@ robot:
       sync_max_age_sec: 0.8
       input_buffer_size: 90
       num_grasps: 5000
+      # Bound downstream geometry/IK work after global confidence ranking.
       topk_num_grasps: 1000
     verifier_node:
       gripper_joint: "6"
@@ -169,6 +249,7 @@ robot:
       joint_current_topic: /so101_follower/joint_currents
       wrist_depth_topic: /camera/wrist/aligned_depth_to_color/image_raw
       gripper_closed_position: 0.0
+      # PC-compatible joint-6 position; 0.08 corresponds to the validated raw-tick contact boundary.
       gripper_contact_min_opening: 0.08
       gripper_no_contact_max_opening: 0.03
       current_contact_threshold_a: 0.08
@@ -208,10 +289,37 @@ robot:
       ik_orientation_guard:
         enabled: true
         approach_axis_ee: [0.0, 0.0, 1.0]
-        closing_axis_180_symmetric: true
+        # false because target_gripper.type is asymmetric_single_moving_jaw.
+        # A half turn about the approach axis keeps the closing line but swaps
+        # which jaw is fixed, so target_contact_ee's closing-axis component
+        # changes sign. Accepting a flipped branch feeds an ~11 mm phantom
+        # contact error into contact_realign, which cannot cancel it by
+        # translating and therefore accumulates until max_correction_m trips.
+        closing_axis_180_symmetric: false
+        # PR259 phase contract: bound the canonical joint-5 branch directly.
         joint5_abs_max: 2.0
+        # Enforce joint5 HOME, branch continuity, retry, and closing-axis gates.
+        joint5_constraints_enabled: true
+        # HOME joint5 comes from ros2_control.reset_positions["5"]. Initial
+        # candidates are admitted only inside HOME +/- 90 deg, independent of
+        # the observation-pose joint5 used as the position-only IK seed.
+        joint5_home_max_delta_rad: 1.5707963267948966
+        joint5_limit_epsilon_rad: 0.001
+        # After candidate selection, preserve the chosen branch through
+        # approach/pregrasp/grasp/lift and reject a true half-turn jump.
+        joint5_stage_continuity: true
+        joint5_stage_max_delta_rad: 1.5707963267948966
         max_approach_error_deg: 25.0
         max_closing_error_deg: 20.0
+        # LMA is position-only; MoveIt OrientationConstraint did not create an
+        # extra DOF and converted useful FK diagnostics into NO_IK_SOLUTION.
+        # Keep unconstrained position IK and retain the 25/20 degree FK gate.
+        moveit_orientation_search:
+          enabled: false
+          approach_tolerance_deg: 15.0
+          free_rotation_tolerance_deg: 180.0
+          constraint_weight: 1.0
+          max_attempts: 3
       # Extra offset away from the fixed finger to reduce edge/top-first contact.
       fixed_finger_margin_m: 0.006
       # Narrow targets need more fixed-finger clearance because the fixed jaw cannot sweep the object back.
@@ -227,8 +335,12 @@ robot:
       # Before closing, project the measured low-height contact residual onto
       # the closing axis and reject if it erodes too much of the target gap.
       fixed_finger_robust_gap:
-        enabled: true
+        # Disabled: user opted to skip the post-descend fixed-finger crush check
+        # and grasp on the first attempt without a rejection/retry cycle.
+        enabled: false
         max_target_gap_deficit_m: 0.003
+        # Absorb millimetre-scale IK/FK, TF, and servo uncertainty before descent.
+        measurement_tolerance_m: 0.001
       width_clearance_m: 0.003
       min_width_m: 0.008
       max_width_m: 0.080
@@ -268,6 +380,11 @@ robot:
       executor:
         type: action
         mode: moveit_planning
+        # Do not skip the initial open command from cached joint feedback.
+        skip_redundant_gripper_open: false
+        gripper_open_position: 1.0
+        gripper_position_tolerance: 0.05
+        joint_state_max_age_s: 0.25
 
   voice_asr:
     enabled: false
@@ -340,7 +457,14 @@ robot:
       workspace:
         x: [-0.52, 0.52]
         y: [-0.45, 0.45]
-        z: [0.02, 0.55]
+        # Lower bound follows the table height in base frame. The taller base
+        # puts the tabletop at z_base = -0.061, so an ee origin grasping at the
+        # surface sits at -0.061 + 0.080 = 0.019 and the previous 0.02 floor
+        # rejected it outright. 0.0 keeps the same ~16 mm headroom the 0.02
+        # floor gave when the table was at -0.044.
+        # NOTE: shared by safety_guard, skill_executor, vlm_task_planner and
+        # pick_executor via common_params, so this relaxes every primitive.
+        z: [0.0, 0.55]
         max_radius_m: 0.52
     named_poses:
       home:
@@ -515,6 +639,7 @@ robot:
     port: /dev/ttyACM0
     calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
     joint_names: ["1", "2", "3", "4", "5", "6"]
+    # Semantic rest pose for upper layers; hardware activation holds the measured position.
     reset_positions:
       "1": 0.0
       "2": -1.5854
@@ -533,8 +658,13 @@ robot:
       name: wrist
       driver: realsense
       serial_number: ""
-      width: 1280
-      height: 720
+      # Force a USB hardware reset on every launch so a stale device handle
+      # from a prior unclean shutdown doesn't require a physical replug.
+      initial_reset: true
+      # 640x360 preserves the 16:9 contract shape while keeping aligned
+      # depth and pointcloud processing at the validated 30 Hz rate on 310P.
+      width: 640
+      height: 360
       fps: 30
       pixel_format: bgr8
       align_depth: true
@@ -547,16 +677,16 @@ robot:
         - pointcloud
       frame_id: camera_wrist_link
       optical_frame_id: camera_wrist_optical_frame
-      # Placeholder values. scripts/handeye_calibrator.py updates this block
-      # in place with calibration results for the current physical robot.
+      # Reused from the PC-validated eye-in-hand runtime configuration. This
+      # extrinsic remains valid when the unchanged camera mount moves to 310P.
       transform:
         parent_frame: gripper
-        x: 0.0
-        y: 0.0
-        z: 0.0
-        roll: 0.0
-        pitch: 0.0
-        yaw: 0.0
+        x: -0.03893349096435185
+        y: 0.046093712828857866
+        z: -0.02852409709828743
+        roll: 3.1220710111747603
+        pitch: 1.08946543832224
+        yaw: -1.4382020056359806
 
   contract:
     base_contract: $(find robot_config)/config/contracts/act_grab_pan.yaml
@@ -593,18 +723,6 @@ robot:
           reliability: best_effort
           history: keep_last
           depth: 10
-
-      - key: observation.pointcloud.wrist
-        topic: /camera/wrist/depth/color/points
-        type: sensor_msgs/msg/PointCloud2
-        align:
-          strategy: hold
-          stamp: header
-          tol_ms: 1500
-        qos:
-          reliability: best_effort
-          history: keep_last
-          depth: 5
 
       - key: observation.state
         topic: /joint_states

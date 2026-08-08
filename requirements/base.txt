@@ -7,3 +7,8 @@ soundfile
 # falls through to the Ubuntu apt package python3-jsonschema 3.2.0, breaking
 # ros2 launch with ModuleNotFoundError: No module named 'jsonschema.protocols'.
 jsonschema>=4,<5
+# inference_manifest models the schema-v2 contract with pydantic v2 (model_validate,
+# field_validator, ConfigDict). This is a platform-independent hard dependency of the
+# manifest contract, so it is declared once here instead of per-platform, which would
+# let Ubuntu and openEuler resolve different contract versions.
+pydantic>=2,<3

@@ -100,3 +100,47 @@ def test_prepared_soft_score_balances_centroid_alignment():
     )
 
     assert centered > off_center
+
+
+def test_prepared_soft_score_prefers_robust_gap_headroom_over_near_score() -> None:
+    config = {
+        "confidence_weight": 1.0,
+        "contact_xy_weight": 0.0,
+        "contact_z_weight": 0.0,
+        "fixed_finger_envelope_weight": 0.0,
+        "robust_gap_headroom_weight": 0.35,
+        "robust_gap_headroom_scale_m": 0.004,
+    }
+    higher_source_score = prepared_candidate_soft_score(
+        config,
+        fixed_finger_envelope=1.0,
+        contact_residual_xy_m=0.0,
+        contact_z_error_m=0.0,
+        confidence=0.90,
+        robust_gap_headroom_m=-0.0003,
+    )
+    safer_candidate = prepared_candidate_soft_score(
+        config,
+        fixed_finger_envelope=1.0,
+        contact_residual_xy_m=0.0,
+        contact_z_error_m=0.0,
+        confidence=0.88,
+        robust_gap_headroom_m=0.002,
+    )
+
+    assert safer_candidate > higher_source_score
+
+
+def test_prepared_soft_score_keeps_legacy_result_without_headroom_weight() -> None:
+    config = {"confidence_weight": 1.0, "fixed_finger_envelope_weight": 1.0}
+    inputs = {
+        "fixed_finger_envelope": None,
+        "contact_residual_xy_m": 0.001,
+        "contact_z_error_m": 0.001,
+        "confidence": 0.8,
+    }
+
+    legacy = prepared_candidate_soft_score(config, **inputs)
+    missing_headroom = prepared_candidate_soft_score(config, robust_gap_headroom_m=None, **inputs)
+
+    assert missing_headroom == legacy

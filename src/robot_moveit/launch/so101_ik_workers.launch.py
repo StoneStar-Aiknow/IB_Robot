@@ -42,6 +42,7 @@ def _launch_setup(context):
         .robot_description_semantic(file_path="config/lerobot/so101/so101.srdf")
         .robot_description_kinematics(file_path="config/lerobot/so101/kinematics.yaml")
         .joint_limits(file_path="config/lerobot/so101/joint_limits.yaml")
+        .pilz_cartesian_limits(file_path="config/lerobot/so101/pilz_cartesian_limits.yaml")
         .trajectory_execution(file_path="config/lerobot/so101/moveit_controllers.yaml")
         .planning_pipelines(pipelines=["ompl"])
         .to_moveit_configs()

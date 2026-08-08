@@ -31,26 +31,16 @@
 
 重要：真机启动使用 `robot_config:=so101_handeye_realsense_grasp`。启动前检查该 YAML；
 它可能仍把 `ros2_control.port` 指到 `/dev/ttyACM0`。当 `/dev/ttyACM0`
-是主臂时，主臂会被当作从动臂上电控制，并在启动时移动到 `reset_positions`。
+是主臂时，主臂会被当作从动臂写入 follower 标定并上电保持。硬件激活不会自动执行
+`reset_positions`，但端口选错仍可能损坏标定或导致后续控制指令作用于错误机械臂。
 
 ## 0. 可选：清理残留的机器人节点
 
 仅在之前的启动被中断、ROS 图中存在残留节点时使用。
 
 ```bash
-cd ~/IB_Robot && \
-  source .shrc_local && \
-  export ROS_DOMAIN_ID=218 && \
-  (pkill -f "ros2 launch robot_config robot.launch.py" || true; \
-   pkill -f move_group || true; \
-   pkill -f moveit_gateway.py || true; \
-   pkill -f task_executor_node || true; \
-   pkill -f ros2_control_node || true; \
-   pkill -f realsense2_camera_node || true; \
-   pkill -f robot_state_publisher || true; \
-   pkill -f static_transform_publisher || true; \
-   pkill -f teleop_node || true; \
-   ros2 daemon stop)
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && \
+./scripts/cleanup_ros.sh
 ```
 
 ## 1. 检查眼在手（Eye-In-Hand）前置条件
@@ -300,7 +290,7 @@ Quality check:
 不会作为仓库默认标定结果提交。如果质量检查失败，脚本只写 JSON 报告，不会更新
 `robot_config`。
 
-终端 A 和抓取脚本都应读取同一份
+终端 A 和正式 `pick_executor_node` 都应读取同一份
 `src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml`。
 
 也可打开生成的 JSON 报告查看完整指标：
@@ -309,10 +299,17 @@ Quality check:
 cd ~/IB_Robot && python3 -m json.tool outputs/handeye/wrist_handeye_new.json
 ```
 
-如果抓取命令使用推荐的 robot 配置来源，则不需要复制 JSON，只需在抓取脚本中传：
+不需要复制 JSON，也不再向监督式客户端传手眼文件或 robot-config 路径。重启统一
+pipeline 加载新 YAML 后，先运行 plan-only 验证：
 
-```text
---handeye-source robot-config --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml
+```bash
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
+ros2 run manipulation_execution pick_action_client \
+  --prompt banana \
+  --mode plan_only \
+  --timeout-s 240
 ```
 
-然后重启终端 A 以加载新的相机变换。
+运行上述命令前，必须停止标定期间的终端 A–D，执行第 0 步清理，然后按
+[`so101_banana_pick_pipeline_commands.md`](so101_banana_pick_pipeline_commands.md) 第 2 节重启统一 pipeline，
+以加载新的相机变换。

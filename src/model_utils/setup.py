@@ -38,6 +38,8 @@ setup(
             "pi05-curvature-schedule = model_utils.pi05_export.curvature_schedule:main",
             "pi05-om-dump = model_utils.pi05_om_dump:main",
             "pi05-tune-schedule = model_utils.pi05_export.tune_schedule:main",
+            "graspgen-export-onnx = model_utils.graspgen_export.export_onnx:main",
+            "graspgen-onnx-to-om = model_utils.graspgen_export.onnx2om:main",
         ],
     },
 )

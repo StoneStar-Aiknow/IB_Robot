@@ -1,3 +1,9 @@
+import threading
+from types import SimpleNamespace
+from typing import Any, cast
+
+from sensor_msgs.msg import Image
+
 from manipulation_service.grasp_verification import (
     STATUS_FAILED,
     STATUS_SUCCESS,
@@ -7,6 +13,7 @@ from manipulation_service.grasp_verification import (
     GraspVerificationWeights,
     evaluate_grasp,
 )
+from manipulation_service.grasp_verifier_node import GraspVerifierNode
 
 
 def _input(**overrides):
@@ -38,6 +45,26 @@ def test_success_when_gripper_stops_open_and_current_rises():
     assert result.confidence >= 0.8
     assert any("gripper_contact" in item for item in result.evidence)
     assert any("current_contact" in item for item in result.evidence)
+
+
+def test_success_for_pc_compatible_so101_marker_contact():
+    result = evaluate_grasp(
+        _input(
+            gripper_position=0.12,
+            gripper_current_abs_a=0.702,
+            wrist_depth=DepthVisibilityStats(
+                valid_fraction=0.1,
+                near_fraction=0.9,
+                median_depth_m=0.08,
+                occluded=True,
+            ),
+        )
+    )
+
+    assert result.status == STATUS_SUCCESS
+    assert result.success is True
+    assert result.confidence == 1.0
+    assert "gripper_contact: stopped before fully closing" in result.evidence
 
 
 def test_failed_when_gripper_fully_closes_and_current_is_low():
@@ -83,3 +110,17 @@ def test_custom_weights_can_raise_success_threshold():
 
     assert result.status == STATUS_UNCERTAIN
     assert result.success is False
+
+
+def test_wrist_depth_callback_defers_frame_processing():
+    harness = SimpleNamespace(
+        _lock=threading.Lock(),
+        _latest_wrist_depth=None,
+        _now_ns=lambda: 123,
+    )
+    msg = Image()
+
+    GraspVerifierNode._wrist_depth_cb(cast(Any, harness), msg)
+
+    assert harness._latest_wrist_depth.received_ns == 123
+    assert harness._latest_wrist_depth.value is msg

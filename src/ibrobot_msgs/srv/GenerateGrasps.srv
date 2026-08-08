@@ -1,0 +1,12 @@
+# Generate 6-DoF grasp candidates for a single segmented object.
+# object_points carries the object's XYZ points in the camera frame; the returned
+# grasp poses are camera-frame 4x4 transforms in that same frame.
+sensor_msgs/PointCloud2 object_points
+uint32 max_grasps
+float32 min_confidence
+---
+GraspCandidateArray grasps
+ModelRuntimeInfo model
+float32 inference_time_ms
+bool success
+string message

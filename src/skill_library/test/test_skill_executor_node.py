@@ -184,7 +184,7 @@ def _make_skill_node(send_goal_future) -> SkillExecutorNode:
     node._skill_goal_lock = threading.Lock()
     node._skill_goal_active = False
     node._validate_skill = lambda *_args, **_kwargs: (True, "")
-    node._current_joint_positions = lambda: []
+    node._current_joint_positions = lambda: {}
     node._named_targets = {}
     node._gripper_open = 1.0
     node._gripper_closed = 0.0
@@ -520,10 +520,11 @@ class _ExternalPolicyStub:
 
 
 class _PrimitiveActionGoalHandle:
-    def __init__(self, goal_id, task_id: str = "task-1") -> None:
+    def __init__(self, goal_id, task_id: str = "task-1", execution_token: str = "") -> None:
         self.goal_id = goal_id
         self.request = SimpleNamespace(
             task_id=task_id,
+            execution_token=execution_token,
             primitive_name="open_gripper",
             pose_name="",
         )
@@ -956,6 +957,146 @@ def test_clean_internal_primitive_terminal_converges_later_retained_root():
     assert goal_key not in node._pending_internal_primitive_goals
 
 
+def test_pick_handoff_token_borrows_root_lease_for_pipeline_primitive():
+    node, policy, lease = _make_retained_gateway_node(_Future(done=False))
+    owner = ExecutionOwner.skill_command("task-1")
+    admission = policy.admit(
+        GatewayRequest(task_id="task-1", skill_name="test_skill"),
+        node._runtime_snapshot(),
+        owner,
+    )
+    assert admission.admitted
+    node._active_skill_admission = admission
+    node._active_skill_owner = owner
+    pick_goal_id = skill_executor_node.UUID(uuid=[3] * 16)
+    execution_token, _cleanup_key = node._register_internal_pick_handoff(pick_goal_id, admission, "task-1")
+    downstream_calls = []
+    node._execute_primitive_unchecked = lambda goal_handle: (
+        downstream_calls.append(True)
+        or goal_handle.succeed()
+        or SimpleNamespace(success=True, error_code="", message="")
+    )
+    primitive_goal_handle = _PrimitiveActionGoalHandle(
+        skill_executor_node.UUID(uuid=[4] * 16),
+        execution_token=execution_token,
+    )
+
+    result = node._execute_primitive(primitive_goal_handle)
+
+    assert result.success is True
+    assert downstream_calls == [True]
+    assert primitive_goal_handle.succeeded_count == 1
+    assert lease.owner is owner
+    assert execution_token in node._internal_pick_handoffs
+
+
+def test_unknown_pick_handoff_token_cannot_bypass_busy_root_lease():
+    node, policy, lease = _make_retained_gateway_node(_Future(done=False))
+    owner = ExecutionOwner.skill_command("task-1")
+    admission = policy.admit(
+        GatewayRequest(task_id="task-1", skill_name="test_skill"),
+        node._runtime_snapshot(),
+        owner,
+    )
+    assert admission.admitted
+    node._active_skill_admission = admission
+    node._active_skill_owner = owner
+    downstream_calls = []
+    node._execute_primitive_unchecked = lambda _goal_handle: downstream_calls.append(True)
+    primitive_goal_handle = _PrimitiveActionGoalHandle(
+        skill_executor_node.UUID(uuid=[5] * 16),
+        execution_token="unregistered",
+    )
+
+    result = node._execute_primitive(primitive_goal_handle)
+
+    assert result.error_code == "SKILL_BUSY"
+    assert downstream_calls == []
+    assert primitive_goal_handle.abort_count == 1
+    assert lease.owner is owner
+
+
+def test_pick_skill_registers_goal_uuid_handoff_until_pick_terminal():
+    node, policy, lease = _make_retained_gateway_node(_Future(done=False))
+    owner = ExecutionOwner.skill_command("task-1")
+    admission = policy.admit(
+        GatewayRequest(task_id="task-1", skill_name="test_skill"),
+        node._runtime_snapshot(),
+        owner,
+    )
+    assert admission.admitted
+    node._active_skill_admission = admission
+    node._active_skill_owner = owner
+    node._pick_action_name = "/manipulation/execute_pick"
+    pick_result_future = _Future(
+        done=True,
+        result=SimpleNamespace(result=SimpleNamespace(success=True, error_code="", message="picked")),
+    )
+    pick_handle = SimpleNamespace(accepted=True, get_result_async=lambda: pick_result_future)
+    observed = {}
+
+    class _PickClient:
+        @staticmethod
+        def wait_for_server(**_kwargs):
+            return True
+
+        @staticmethod
+        def send_goal_async(goal, **kwargs):
+            observed["task_id"] = goal.task_id
+            observed["goal_uuid"] = kwargs["goal_uuid"]
+            observed["registered_tokens"] = set(node._internal_pick_handoffs)
+            return _Future(done=True, result=pick_handle)
+
+    node._pick_client = _PickClient()
+    parent_goal_handle = _NoCancelParentGoalHandle()
+    parent_goal_handle.request.target_name = "marker"
+    parent_goal_handle.request.timeout_sec = 1.0
+
+    result = node._execute_pick_skill(
+        parent_goal_handle,
+        {},
+        canonical_task_id="task-1",
+    )
+
+    execution_token = bytes(observed["goal_uuid"].uuid).hex()
+    assert result.success is True
+    assert observed["task_id"] == "task-1"
+    assert observed["registered_tokens"] == {execution_token}
+    assert node._internal_pick_handoffs == {}
+    assert parent_goal_handle.succeeded_count == 1
+    assert lease.owner is owner
+
+
+def test_late_pick_terminal_converges_retained_root_admission():
+    node, policy, lease = _make_retained_gateway_node(_Future(done=False))
+    owner = ExecutionOwner.skill_command("task-1")
+    admission = policy.admit(
+        GatewayRequest(task_id="task-1", skill_name="test_skill"),
+        node._runtime_snapshot(),
+        owner,
+    )
+    assert admission.admitted
+    node._active_skill_admission = admission
+    node._active_skill_owner = owner
+    execution_token, cleanup_key = node._register_internal_pick_handoff(
+        skill_executor_node.UUID(uuid=[6] * 16),
+        admission,
+        "task-1",
+    )
+
+    node._retain_admission_cleanup(admission, {"task_id": "task-1"}, 0.2, 2)
+
+    assert lease.owner is owner
+    assert policy._ledger.query("task-1").state == "active"
+
+    node._confirm_internal_pick_cleanup(admission, execution_token, cleanup_key)
+
+    assert lease.owner is None
+    assert policy._ledger.query("task-1").state == "terminal"
+    assert node._internal_pick_handoffs == {}
+    assert node._retained_admission_cleanup == {}
+
+
 def test_cleanup_unknown_internal_primitive_does_not_confirm_retained_root():
     node, policy, lease = _make_retained_gateway_node(_Future(done=False))
     admission, goal_id, _goal_key = _admit_internal_primitive(node, policy)
@@ -1219,3 +1360,29 @@ def test_execute_primitive_aborts_when_downstream_cancel_cleanup_times_out():
     assert result.error_code == "CANCEL_CLEANUP_TIMEOUT"
     assert goal_handle.abort_count == 1
     assert goal_handle.canceled_count == 0
+
+
+def test_move_to_pose_validation_receives_goal_target_pose():
+    node = object.__new__(SkillExecutorNode)
+    node._debug = False
+    captured = {}
+
+    def validate_primitive(*_args, **kwargs):
+        captured.update(kwargs)
+        return False, "stop after validation"
+
+    node._validate_primitive = validate_primitive
+    goal_handle = _PrimitiveGoalHandle()
+    goal_handle.request.primitive_name = "move_to_pose"
+    goal_handle.request.target_pose = skill_executor_node.Pose()
+    goal_handle.request.target_pose.position.x = 0.12
+    goal_handle.request.target_pose.position.y = -0.20
+    goal_handle.request.target_pose.position.z = 0.05
+    goal_handle.request.target_pose.orientation.w = 1.0
+
+    result = node._execute_primitive_unchecked(goal_handle)
+
+    assert captured["target_pose"] is goal_handle.request.target_pose
+    assert captured["target_pose"].position.z == pytest.approx(0.05)
+    assert result.success is False
+    assert result.error_code == "SAFETY_REJECTED"
