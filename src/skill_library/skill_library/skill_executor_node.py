@@ -57,6 +57,7 @@ from skill_catalog.source import AmentShareSkillSource, DevelopmentStagingSkillS
 from skill_library.gateway_policy import (
     GATEWAY_FINALIZATION_FAILED,
     SKILL_BUSY,
+    TIMEOUT_EXCEEDS_POLICY,
     BoundedRequestLedger,
     ExecutionOwner,
     GatewayPolicy,
@@ -143,6 +144,7 @@ class _WorkflowExecution:
     terminal_recorded: bool = False
     lease_released: bool = False
     runtime_generation_released: bool = False
+    child_results: dict[int, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -501,6 +503,7 @@ class SkillExecutorNode(Node):
             self._gateway_timeout_policy,
             self._skill_requirements,
             parameter_schemas=self._skill_parameter_schemas,
+            skill_timeout_caps={},
             ledger=self._gateway_ledger,
             lease=self._gateway_lease,
         )
@@ -522,11 +525,14 @@ class SkillExecutorNode(Node):
         if not startup_reload.success:
             raise ValueError(f"skill catalog startup failed: {startup_reload.error_code}: {startup_reload.message}")
         startup_bundle = self._runtime_coordinator.current
-        startup_requirements, startup_parameter_schemas = self._snapshot_policy_inputs(startup_bundle.snapshot)
+        startup_requirements, startup_parameter_schemas, startup_timeout_caps = self._snapshot_policy_inputs(
+            startup_bundle.snapshot
+        )
         self._gateway_policy.replace_catalog(
             startup_bundle.snapshot.robot_context.timeout_policy,
             startup_requirements,
             parameter_schemas=startup_parameter_schemas,
+            skill_timeout_caps=startup_timeout_caps,
         )
         self._skill_requirements = startup_requirements
         self._skill_parameter_schemas = startup_parameter_schemas
@@ -732,7 +738,8 @@ class SkillExecutorNode(Node):
         parameter_schemas = {
             str(name): cls._mutable_template_value(schema) for name, schema in snapshot.parameter_schemas.items()
         }
-        return requirements, parameter_schemas
+        timeout_caps = {str(name): float(template["timeout_sec"]) for name, template in snapshot.templates.items()}
+        return requirements, parameter_schemas, timeout_caps
 
     @staticmethod
     def _fill_catalog_diagnostics(response, diagnostics) -> None:
@@ -766,12 +773,17 @@ class SkillExecutorNode(Node):
         self._skill_registry_event_publisher.publish(event)
 
     def _reload_skill_catalog(self, request, response):
+        if request.schema_version != 1:
+            response.success = False
+            response.error_code = "SKILL_SCHEMA_INVALID"
+            response.message = "schema_version must be 1"
+            return response
         result, prepared = self._runtime_coordinator.prepare_reload(
             request.request_id,
             force=bool(request.force),
         )
         if prepared is not None:
-            requirements, parameter_schemas = self._snapshot_policy_inputs(prepared.snapshot)
+            requirements, parameter_schemas, timeout_caps = self._snapshot_policy_inputs(prepared.snapshot)
             templates = self._mutable_templates(prepared.snapshot.templates)
         with self._state_guard():
             if prepared is not None:
@@ -782,6 +794,7 @@ class SkillExecutorNode(Node):
                     bundle.snapshot.robot_context.timeout_policy,
                     requirements,
                     parameter_schemas=parameter_schemas,
+                    skill_timeout_caps=timeout_caps,
                 )
                 self._skill_requirements = requirements
                 self._skill_parameter_schemas = parameter_schemas
@@ -804,6 +817,10 @@ class SkillExecutorNode(Node):
 
     def _get_skill_snapshot(self, request, response):
         response.success = False
+        if request.schema_version != 1 or (request.generation > 0 and not request.registry_epoch):
+            response.error_code = "SKILL_SCHEMA_INVALID"
+            response.message = "schema_version must be 1 and exact generation queries require registry_epoch"
+            return response
         try:
             with self._state_guard():
                 bundle = self._runtime_coordinator.get_snapshot(
@@ -904,9 +921,8 @@ class SkillExecutorNode(Node):
             int(budget.deadline.nanosec),
         )
 
-    @classmethod
-    def _task_budget_duration_sec(cls, binding) -> float:
-        started_sec, started_nanosec, deadline_sec, deadline_nanosec = cls._task_budget_key(binding)
+    def _task_budget_duration_sec(self, binding) -> float:
+        started_sec, started_nanosec, deadline_sec, deadline_nanosec = self._task_budget_key(binding)
         if (
             binding.task_budget.schema_version != 1
             or started_sec < 0
@@ -918,13 +934,12 @@ class SkillExecutorNode(Node):
         started = started_sec + started_nanosec / 1_000_000_000
         deadline = deadline_sec + deadline_nanosec / 1_000_000_000
         duration = deadline - started
-        if not math.isfinite(duration) or duration <= 0.0 or deadline <= time.time():
+        if not math.isfinite(duration) or duration <= 0.0 or deadline <= self._ros_time_sec():
             raise ValueError("task budget is expired or invalid")
         return duration
 
-    @classmethod
-    def _validate_task_budget_schema(cls, binding) -> None:
-        started_sec, started_nanosec, deadline_sec, deadline_nanosec = cls._task_budget_key(binding)
+    def _validate_task_budget_schema(self, binding) -> None:
+        started_sec, started_nanosec, deadline_sec, deadline_nanosec = self._task_budget_key(binding)
         if (
             binding.task_budget.schema_version != 1
             or started_sec < 0
@@ -935,11 +950,10 @@ class SkillExecutorNode(Node):
         ):
             raise ValueError("invalid task budget")
 
-    @classmethod
-    def _remaining_task_budget_sec(cls, binding) -> float:
-        cls._task_budget_duration_sec(binding)
+    def _remaining_task_budget_sec(self, binding) -> float:
+        self._task_budget_duration_sec(binding)
         deadline_sec = binding.task_budget.deadline.sec + binding.task_budget.deadline.nanosec / 1_000_000_000
-        remaining = deadline_sec - time.time()
+        remaining = deadline_sec - self._ros_time_sec()
         if not math.isfinite(remaining) or remaining <= 0.0:
             raise ValueError("task budget is expired or invalid")
         return remaining
@@ -948,14 +962,18 @@ class SkillExecutorNode(Node):
     def _task_budget_is_zero(cls, binding) -> bool:
         return binding.task_budget.schema_version == 0 and cls._task_budget_key(binding) == (0, 0, 0, 0)
 
-    @staticmethod
-    def _set_task_budget(binding, timeout_sec: float) -> None:
-        started = time.time()
+    def _set_task_budget(self, binding, timeout_sec: float) -> None:
+        started = self._ros_time_sec()
         deadline = started + timeout_sec
         binding.task_budget.schema_version = 1
         for target, value in ((binding.task_budget.started_at, started), (binding.task_budget.deadline, deadline)):
             target.sec = int(value)
             target.nanosec = int((value - int(value)) * 1_000_000_000)
+
+    def _ros_time_sec(self) -> float:
+        if not hasattr(self, "_clock"):
+            raise ValueError("ROS clock is unavailable")
+        return self.get_clock().now().nanoseconds / 1_000_000_000
 
     def _prepare_root_binding(self, binding, bundle, *, allow_zero_budget: bool) -> str:
         task_id = str(binding.task_id).strip()
@@ -1124,11 +1142,12 @@ class SkillExecutorNode(Node):
 
             snapshot = self._runtime_snapshot()
             owner = ExecutionOwner.workflow(root_task_id)
-            requirements, parameter_schemas = self._snapshot_policy_inputs(bundle.snapshot)
+            requirements, parameter_schemas, timeout_caps = self._snapshot_policy_inputs(bundle.snapshot)
             workflow_policy = GatewayPolicy(
                 bundle.snapshot.robot_context.timeout_policy,
                 requirements,
                 parameter_schemas=parameter_schemas,
+                skill_timeout_caps=timeout_caps,
                 ledger=self._gateway_ledger,
                 lease=self._gateway_lease,
             )
@@ -1197,7 +1216,7 @@ class SkillExecutorNode(Node):
     def _reap_expired_workflow(self) -> None:
         with self._state_guard():
             active = self._active_workflow
-            if active is None or active.deadline_unix_sec > time.time():
+            if active is None or active.deadline_unix_sec > self._ros_time_sec():
                 return
             active_child = self._active_skill_admission
             if isinstance(active_child, _WorkflowChildAdmission) and active_child.workflow is active:
@@ -2072,7 +2091,9 @@ class SkillExecutorNode(Node):
                 remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
             except ValueError:
                 return "SKILL_SCHEMA_INVALID", None, None, False
-            if goal.timeout_sec <= 0.0 or goal.timeout_sec > remaining_budget:
+            if goal.timeout_sec > remaining_budget:
+                return TIMEOUT_EXCEEDS_POLICY, None, None, False
+            if goal.timeout_sec <= 0.0:
                 goal.timeout_sec = remaining_budget
             borrow = workflow.policy.borrow_workflow_internal(
                 workflow.owner,
@@ -2098,45 +2119,52 @@ class SkillExecutorNode(Node):
                 remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
             except ValueError:
                 return "SKILL_SCHEMA_INVALID", None, None, False
-            if goal.timeout_sec <= 0.0 or goal.timeout_sec > remaining_budget:
+            if goal.timeout_sec > remaining_budget:
+                return TIMEOUT_EXCEEDS_POLICY, None, None, False
+            if goal.timeout_sec <= 0.0:
                 goal.timeout_sec = remaining_budget
             return "", None, internal_admission, delegated_primitive
         coordinator = getattr(self, "_runtime_coordinator", None)
-        bundle = coordinator.current if coordinator is not None else None
         if coordinator is None:
             task_id = _binding_task_id(goal) or f"external-primitive-{uuid.uuid4()}"
             error_code, token = self._gateway_policy.admit_external_primitive(task_id, snapshot)
             return error_code, token, None, False
-        binding_error = self._prepare_root_binding(goal.dispatch_binding, bundle, allow_zero_budget=True)
-        if binding_error:
-            return binding_error, None, None, False
-        try:
-            remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
-        except ValueError:
-            return "SKILL_SCHEMA_INVALID", None, None, False
-        if goal.timeout_sec <= 0.0 or goal.timeout_sec > remaining_budget:
-            goal.timeout_sec = remaining_budget
-        payload_digest = self._primitive_payload_digest(goal)
-        if not goal.dispatch_binding.dispatch_nonce:
-            goal.dispatch_binding.schema_version = 1
-            goal.dispatch_binding.task_id = _binding_task_id(goal) or f"external-primitive-{uuid.uuid4()}"
-            goal.dispatch_binding.root_task_id = goal.dispatch_binding.task_id
-            goal.dispatch_binding.dispatch_nonce = uuid.uuid4().hex
-        task_id = _binding_task_id(goal) or f"external-primitive-{uuid.uuid4()}"
-        error_code, token = self._gateway_policy.admit_external_primitive(task_id, payload_digest, snapshot)
-        if not error_code and token is not None and bundle is not None:
+        with self._state_guard():
+            if coordinator.state != "READY":
+                return "SKILL_RELOAD_IN_PROGRESS", None, None, False
+            bundle = coordinator.current
+            payload_digest = self._primitive_payload_digest(goal)
+            binding_error = self._prepare_root_binding(goal.dispatch_binding, bundle, allow_zero_budget=True)
+            if binding_error:
+                return binding_error, None, None, False
             try:
-                retained_bundle = self._runtime_coordinator.retain(bundle.generation)
-                self._external_admissions[id(token)] = _ExternalPrimitiveAdmission(
-                    task_id=task_id,
-                    payload_digest=payload_digest,
-                    lease_token=token,
-                    bundle=retained_bundle,
-                )
-            except Exception:
-                self._gateway_policy.release_external_primitive(token)
-                return "SKILL_SNAPSHOT_NOT_RETAINED", None, None, False
-        return error_code, token, None, False
+                remaining_budget = self._remaining_task_budget_sec(goal.dispatch_binding)
+            except ValueError:
+                return "SKILL_SCHEMA_INVALID", None, None, False
+            if goal.timeout_sec > remaining_budget:
+                return TIMEOUT_EXCEEDS_POLICY, None, None, False
+            if goal.timeout_sec <= 0.0:
+                goal.timeout_sec = remaining_budget
+            if not goal.dispatch_binding.dispatch_nonce:
+                goal.dispatch_binding.schema_version = 1
+                goal.dispatch_binding.task_id = _binding_task_id(goal) or f"external-primitive-{uuid.uuid4()}"
+                goal.dispatch_binding.root_task_id = goal.dispatch_binding.task_id
+                goal.dispatch_binding.dispatch_nonce = uuid.uuid4().hex
+            task_id = _binding_task_id(goal) or f"external-primitive-{uuid.uuid4()}"
+            error_code, token = self._gateway_policy.admit_external_primitive(task_id, payload_digest, snapshot)
+            if not error_code and token is not None:
+                try:
+                    retained_bundle = self._runtime_coordinator.retain(bundle.generation)
+                    self._external_admissions[id(token)] = _ExternalPrimitiveAdmission(
+                        task_id=task_id,
+                        payload_digest=payload_digest,
+                        lease_token=token,
+                        bundle=retained_bundle,
+                    )
+                except Exception:
+                    self._gateway_policy.release_external_primitive(token)
+                    return "SKILL_SNAPSHOT_NOT_RETAINED", None, None, False
+            return error_code, token, None, False
 
     def _execute_primitive(self, goal_handle):
         # See _execute_skill for the rationale of this test-fixture fallback.
@@ -3090,6 +3118,15 @@ class SkillExecutorNode(Node):
         owner = ExecutionOwner.skill_command(_binding_task_id(goal))
         with self._state_guard():
             coordinator = getattr(self, "_runtime_coordinator", None)
+            if coordinator is not None and coordinator.state != "READY":
+                result = SkillCommand.Result()
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [],
+                    "SKILL_RELOAD_IN_PROGRESS",
+                    "skill catalog reload is in progress",
+                )
             bundle = coordinator.current if coordinator is not None else None
             binding_error = (
                 self._prepare_root_binding(goal.dispatch_binding, bundle, allow_zero_budget=True)
@@ -3312,7 +3349,6 @@ class SkillExecutorNode(Node):
                 or binding.expected_registry_digest != workflow.bundle.snapshot.registry_digest
                 or self._task_budget_key(binding) != workflow.task_budget_key
                 or index != workflow.completed_step_count
-                or workflow.step_terminal_states[index] != WORKFLOW_STEP_PENDING
                 or requested_step != workflow.workflow_steps[index]
             ):
                 return self._abort_skill(
@@ -3321,6 +3357,17 @@ class SkillExecutorNode(Node):
                     [],
                     "SKILL_WORKFLOW_DIGEST_MISMATCH",
                     "workflow child does not match the active execution scope",
+                )
+            if workflow.step_terminal_states[index] != WORKFLOW_STEP_PENDING:
+                replay = workflow.child_results.get(index)
+                if replay is not None:
+                    return replay
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [],
+                    "SKILL_REQUEST_ID_CONFLICT",
+                    "workflow child result is no longer available for replay",
                 )
             child_owner = ExecutionOwner.internal_child(workflow.owner, goal.skill_name)
             decision = workflow.policy.evaluate(
@@ -3380,7 +3427,7 @@ class SkillExecutorNode(Node):
             if not allowed:
                 result = self._abort_skill(result, deferred_goal_handle, [], "SKILL_REJECTED", reason)
             else:
-                remaining_budget = workflow.deadline_unix_sec - time.time()
+                remaining_budget = workflow.deadline_unix_sec - self._ros_time_sec()
                 if remaining_budget <= 0.0:
                     result = self._abort_skill(
                         result,
@@ -3424,6 +3471,8 @@ class SkillExecutorNode(Node):
                     workflow.step_terminal_states[index] = (
                         WORKFLOW_STEP_CANCELED if result.error_code == "SKILL_CANCELLED" else WORKFLOW_STEP_FAILED
                     )
+                if self._active_workflow is workflow:
+                    workflow.child_results[index] = result
                 if not cleanup_unknown:
                     self._active_skill_admission = None
                     self._active_skill_owner = None

@@ -11,8 +11,8 @@ result 必须返回 `actual_executor`。server 在 goal acceptance 时比对自�
 ## 架构位置
 
 ```text
-Hermes / robot_mcp
-  -> /embodied/execute_skill (pick_object)
+Hermes -> ibrobot-control -> robot-skill
+  -> Agent plan / Gateway -> /embodied/execute_skill (pick_object)
   -> skill_library Gateway (admit + canonicalize dispatch_binding, stamp dispatch_nonce)
   -> /manipulation/execute_pick (PickObject, delegated)
   -> pick_executor_node

@@ -366,6 +366,41 @@ def _send_skill_node(client):
     return node
 
 
+def test_send_skill_rejects_success_payload_from_aborted_action():
+    node = _send_skill_node(
+        SimpleNamespace(
+            wait_for_server=lambda **_: True,
+            send_goal_async=lambda _goal: _DoneFuture(
+                SimpleNamespace(
+                    accepted=True,
+                    get_result_async=lambda: _DoneFuture(
+                        SimpleNamespace(
+                            status=6,
+                            result=SimpleNamespace(
+                                success=True,
+                                actual_registry_epoch="epoch",
+                                actual_registry_generation=1,
+                                actual_registry_digest="digest",
+                            ),
+                        )
+                    ),
+                )
+            ),
+        )
+    )
+
+    with pytest.raises(AgentPlanError) as raised:
+        node._send_skill(
+            SimpleNamespace(is_cancel_requested=False),
+            new_binding(task_id="task-1"),
+            CanonicalWorkflowStep(1, "open_gripper_skill", timeout_sec=1.0),
+            time.monotonic() + 1.0,
+            ("epoch", 1, "digest"),
+        )
+
+    assert raised.value.code == "SKILL_EXECUTION_FAILED"
+
+
 def test_send_skill_reports_unknown_when_goal_acceptance_times_out():
     node = _send_skill_node(_UnknownAcceptanceSkillClient())
 
@@ -375,6 +410,7 @@ def test_send_skill_reports_unknown_when_goal_acceptance_times_out():
             new_binding(task_id="task-1"),
             CanonicalWorkflowStep(1, "open_gripper_skill", timeout_sec=1.0),
             time.monotonic() + 1.0,
+            ("epoch", 1, "digest"),
         )
 
     assert raised.value.code == "SKILL_EXECUTION_STATE_UNKNOWN"
@@ -389,6 +425,7 @@ def test_send_skill_requires_cancel_acceptance_and_terminal_result():
             new_binding(task_id="task-1"),
             CanonicalWorkflowStep(1, "open_gripper_skill", timeout_sec=1.0),
             time.monotonic() + 1.0,
+            ("epoch", 1, "digest"),
         )
 
     assert raised.value.code == "SKILL_CANCEL_TIMEOUT"

@@ -48,4 +48,9 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 `authorize_motion` 默认关闭。只有操作员完成现场安全检查后才能在 launch 时显式开启；
 Agent、CLI、YAML 和动态参数都不能代替操作员授权。
 
+生产部署还应启用 SROS 2 caller policy，限制 Agent、plan coordinator、Gateway 和 operator 各自可调用的
+endpoint。先按 `sros2/README.md` 生成部署 keystore 并设置 `ROS_SECURITY_ENABLE=true`、
+`ROS_SECURITY_STRATEGY=Enforce`、`ROS_SECURITY_KEYSTORE`，再追加 `enable_caller_policy:=true`。Hermes/CLI
+使用 `/hermes_cli` enclave，catalog reload 使用 `/operator` enclave。没有 keystore 时不得启用该参数。
+
 `with_perception` 只控制独立感知服务，不恢复已删除的 voice/VLM Planner 流水线。

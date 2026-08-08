@@ -1,5 +1,6 @@
 """Launch the base robot stack plus embodied runtime nodes."""
 
+import os
 from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
@@ -138,6 +139,7 @@ def launch_setup(context, *_args, **_kwargs):
     with_perception_str = context.launch_configurations.get("with_perception", "")
     entry_mode_override = context.launch_configurations.get("entry_mode", "")
     authorize_motion_str = context.launch_configurations.get("authorize_motion", "false")
+    caller_policy_str = context.launch_configurations.get("enable_caller_policy", "false")
 
     config = _load_config(robot_config_name, config_path_override)
     if control_mode_override:
@@ -162,6 +164,17 @@ def launch_setup(context, *_args, **_kwargs):
 
     active_control_mode = config.get("default_control_mode", "moveit_planning")
     motion_authorized = parse_bool(authorize_motion_str, default=False)
+    caller_policy_enabled = parse_bool(caller_policy_str, default=False)
+    if caller_policy_enabled:
+        if os.environ.get("ROS_SECURITY_ENABLE", "").lower() != "true":
+            raise RuntimeError("caller policy requires ROS_SECURITY_ENABLE=true")
+        if os.environ.get("ROS_SECURITY_STRATEGY") != "Enforce":
+            raise RuntimeError("caller policy requires ROS_SECURITY_STRATEGY=Enforce")
+        keystore = Path(os.environ.get("ROS_SECURITY_KEYSTORE", ""))
+        if not keystore.is_dir():
+            raise RuntimeError("caller policy requires an existing ROS_SECURITY_KEYSTORE")
+    elif motion_authorized:
+        raise RuntimeError("authorize_motion:=true requires enable_caller_policy:=true")
     base_launch_path = Path(get_package_share_directory("robot_config")) / "launch" / "robot.launch.py"
     base_launch_arguments = {
         "robot_config": robot_config_name,
@@ -193,6 +206,7 @@ def launch_setup(context, *_args, **_kwargs):
                 config,
                 active_control_mode,
                 motion_authorized=motion_authorized,
+                **({"caller_policy_enabled": caller_policy_enabled} if caller_policy_enabled else {}),
             )
         )
         use_sim = parse_bool(base_launch_arguments["use_sim"], default=False)
@@ -231,6 +245,7 @@ def generate_launch_description():
             DeclareLaunchArgument("with_perception", default_value=""),
             DeclareLaunchArgument("entry_mode", default_value=""),
             DeclareLaunchArgument("authorize_motion", default_value="false"),
+            DeclareLaunchArgument("enable_caller_policy", default_value="false"),
             OpaqueFunction(function=launch_setup),
         ]
     )

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 import threading
-import time
 from pathlib import Path
 
 import rclpy
@@ -245,7 +244,7 @@ class PickExecutorNode(
         started = budget.started_at.sec + budget.started_at.nanosec / 1_000_000_000
         deadline = budget.deadline.sec + budget.deadline.nanosec / 1_000_000_000
         timeout_sec = float(goal_request.timeout_sec)
-        now = time.time()
+        now = self.get_clock().now().nanoseconds / 1_000_000_000
         if (
             budget.started_at.sec < 0
             or budget.deadline.sec < 0

@@ -27,6 +27,7 @@ class CatalogViewSynchronizer:
         self._lock = RLock()
         self._current: VerifiedCatalogView | None = None
         self._desired: CatalogIdentity | None = None
+        self._event_epoch: str | None = None
         self._status_in_flight = False
         self._snapshot_in_flight: tuple[str, int] | None = None
         self._status_client = node.create_client(GetSkillGatewayStatus, status_service)
@@ -84,7 +85,9 @@ class CatalogViewSynchronizer:
             desired = self._desired
             if desired is not None:
                 if identity.registry_epoch != desired.registry_epoch:
-                    return
+                    if self._event_epoch == desired.registry_epoch:
+                        return
+                    self._current = None
                 if identity.registry_epoch == desired.registry_epoch and identity.generation < desired.generation:
                     return
                 if (
@@ -112,6 +115,7 @@ class CatalogViewSynchronizer:
                     return
                 if identity.registry_epoch != desired.registry_epoch:
                     self._current = None
+            self._event_epoch = identity.registry_epoch
         self._select(identity)
 
     def _select(self, identity: CatalogIdentity) -> None:

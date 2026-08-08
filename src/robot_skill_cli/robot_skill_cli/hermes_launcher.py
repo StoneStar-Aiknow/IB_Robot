@@ -185,6 +185,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         hermes_path = _require_binary("hermes")
         robot_skill_path = _require_binary("robot-skill")
         _check_hermes_version(hermes_path)
+        if os.environ.get("ROS_SECURITY_ENABLE", "").lower() == "true":
+            os.environ["ROS_SECURITY_ENCLAVE_OVERRIDE"] = "/hermes_cli"
         config_path = _check_robot_runtime(args.config_name, args.config_path)
         workspace = _prepare_hermes_workspace(_installed_skill_path())
         hermes_arguments = _build_hermes_arguments(hermes_path, args.hermes_args)

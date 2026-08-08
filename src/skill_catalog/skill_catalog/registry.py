@@ -48,6 +48,8 @@ class SkillRegistry:
 
     def get(self, *, registry_epoch: str = "", generation: int = 0) -> SkillRuntimeBundle:
         current = self.current
+        if generation > 0 and not registry_epoch:
+            raise SkillRegistryError("exact snapshot query requires registry epoch", code="SKILL_SCHEMA_INVALID")
         if registry_epoch and registry_epoch != self.registry_epoch:
             raise SkillRegistryError("registry epoch does not match", code="SKILL_REGISTRY_EPOCH_MISMATCH")
         if generation == 0:

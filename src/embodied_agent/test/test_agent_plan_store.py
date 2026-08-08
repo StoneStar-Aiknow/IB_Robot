@@ -117,6 +117,7 @@ def test_plan_lifecycle_binds_identity_and_consumes_confirmation_once():
     store.mark_terminal(
         plan_token=plan.plan_token,
         task_id="task-1",
+        execution_token=accepted.execution_token,
         terminal_message="completed",
         workflow_digest="workflow-digest",
         completed_step_count=1,
@@ -134,6 +135,47 @@ def test_plan_lifecycle_binds_identity_and_consumes_confirmation_once():
     assert replay.newly_accepted is False
     assert replay.workflow_digest == "workflow-digest"
     assert replay.completed_step_count == 1
+
+    with pytest.raises(AgentPlanError) as raised:
+        store.mark_terminal(
+            plan_token=plan.plan_token,
+            task_id="task-1",
+            execution_token=accepted.execution_token,
+            terminal_code="DIFFERENT_RESULT",
+        )
+    assert raised.value.code == "SKILL_REQUEST_ID_CONFLICT"
+
+
+def test_only_execution_owner_can_mark_terminal():
+    store, _ = _store()
+    plan = _create(store)
+    _validate(store, plan)
+    confirmation = store.confirm(
+        plan_token=plan.plan_token,
+        plan_digest=plan.plan_digest,
+        task_id="task-1",
+        registry_epoch="epoch-1",
+        registry_generation=1,
+        registry_digest="digest-1",
+        task_budget_sec=10.0,
+    )
+    store.accept_execution(
+        plan_token=plan.plan_token,
+        confirmation_token=confirmation.confirmation_token,
+        task_id="task-1",
+        registry_epoch="epoch-1",
+        registry_generation=1,
+        registry_digest="digest-1",
+        task_budget_sec=10.0,
+    )
+
+    with pytest.raises(AgentPlanError) as raised:
+        store.mark_terminal(
+            plan_token=plan.plan_token,
+            task_id="task-1",
+            execution_token="x" * 32,
+        )
+    assert raised.value.code == "SKILL_REQUEST_ID_CONFLICT"
 
 
 def test_expiration_does_not_extend_and_reload_fails_closed():
@@ -208,7 +250,11 @@ def test_terminal_replay_expires_without_blocking_new_plans():
         registry_digest="digest-1",
         task_budget_sec=10.0,
     )
-    store.mark_terminal(plan_token=plan.plan_token, task_id="task-1")
+    store.mark_terminal(
+        plan_token=plan.plan_token,
+        task_id="task-1",
+        execution_token=store._records[plan.plan_token].execution_token,  # noqa: SLF001
+    )
     current[0] += 301.0
 
     with pytest.raises(AgentPlanError) as raised:

@@ -504,6 +504,7 @@ class GatewayPolicy:
         skill_requirements: Mapping[str, SkillRequirements],
         *,
         parameter_schemas: Mapping[str, Mapping[str, Any]],
+        skill_timeout_caps: Mapping[str, float] | None = None,
         ledger: BoundedRequestLedger | None = None,
         lease: RootExecutionLease | None = None,
     ) -> None:
@@ -523,6 +524,7 @@ class GatewayPolicy:
         if not isinstance(parameter_schemas, Mapping):
             raise ValueError("parameter_schemas must be a mapping")
         self._parameter_schemas = dict(parameter_schemas)
+        self._skill_timeout_caps = self._validate_timeout_caps(skill_timeout_caps or {})
         self._ledger = ledger
         self._lease = lease
         self._transition_lock = RLock()
@@ -530,7 +532,9 @@ class GatewayPolicy:
 
     def prepare(self, request: GatewayRequest) -> PreparedRequest:
         """Resolve a request's canonical identity and effective timeout."""
-        return build_request_identity(request, default_timeout_sec=self._default_timeout_sec)
+        skill_name = str(request.skill_name).strip()
+        timeout_cap = self._skill_timeout_caps.get(skill_name, self._default_timeout_sec)
+        return build_request_identity(request, default_timeout_sec=timeout_cap)
 
     def replace_catalog(
         self,
@@ -538,6 +542,7 @@ class GatewayPolicy:
         skill_requirements: Mapping[str, SkillRequirements],
         *,
         parameter_schemas: Mapping[str, Mapping[str, Any]],
+        skill_timeout_caps: Mapping[str, float] | None = None,
     ) -> None:
         """Replace immutable admission indexes for the next root request.
 
@@ -558,6 +563,15 @@ class GatewayPolicy:
             self._task_budget_sec = task_budget
             self._skill_requirements = dict(skill_requirements)
             self._parameter_schemas = dict(parameter_schemas)
+            self._skill_timeout_caps = self._validate_timeout_caps(skill_timeout_caps or {})
+
+    def _validate_timeout_caps(self, values: Mapping[str, float]) -> dict[str, float]:
+        if not isinstance(values, Mapping):
+            raise ValueError("skill_timeout_caps must be a mapping")
+        caps = {str(name): _finite_positive(value, f"skill_timeout_caps.{name}") for name, value in values.items()}
+        if any(value > self._task_budget_sec for value in caps.values()):
+            raise ValueError("skill timeout cap must not exceed task_budget_sec")
+        return caps
 
     def evaluate(
         self,
@@ -607,7 +621,8 @@ class GatewayPolicy:
                 message="another root execution is active",
                 **decision_args,
             )
-        if prepared.effective_timeout_sec > self._task_budget_sec:
+        timeout_cap = self._skill_timeout_caps.get(str(prepared.payload["skill_name"]), self._task_budget_sec)
+        if prepared.effective_timeout_sec > timeout_cap or prepared.effective_timeout_sec > self._task_budget_sec:
             return GatewayDecision(admitted=False, error_code=TIMEOUT_EXCEEDS_POLICY, **decision_args)
         if not readiness.ready:
             return GatewayDecision(

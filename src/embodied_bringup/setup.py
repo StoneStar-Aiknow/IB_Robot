@@ -10,6 +10,10 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", ["launch/embodied_pipeline.launch.py"]),
+        (
+            "share/" + package_name + "/sros2",
+            ["sros2/caller_policy.xml", "sros2/governance.xml", "sros2/README.md"],
+        ),
     ],
     install_requires=["setuptools"],
     zip_safe=True,

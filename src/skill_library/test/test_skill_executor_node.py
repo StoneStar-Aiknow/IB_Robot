@@ -248,6 +248,7 @@ def test_delegated_primitive_requires_exact_active_nonce_binding():
     node._state_lock = RLock()
     node._active_delegated_dispatches = {}
     node._runtime_snapshot = lambda: RuntimeSnapshot(True, "cartesian", "cartesian")
+    node._ros_time_sec = lambda: 1.0
     policy = GatewayPolicy(
         {"default_skill_timeout_sec": 5.0, "task_budget_sec": 10.0},
         {"skill": SkillRequirements()},
@@ -513,6 +514,7 @@ def _make_retained_gateway_node(send_goal_future) -> tuple[SkillExecutorNode, Ga
         active_control_mode="gateway_mode",
         required_control_mode="gateway_mode",
     )
+    node._ros_time_sec = lambda: 1.0
     node._audit = lambda *_args, **_kwargs: None
     node.get_logger = lambda: SimpleNamespace(error=lambda _message: None)
     node._active_skill_admission = None

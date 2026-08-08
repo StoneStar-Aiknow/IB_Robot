@@ -48,6 +48,10 @@ class _WorkflowStateUnknown(AgentPlanError):
     """A Begin/Finalize request may have committed remotely; preserve local state."""
 
 
+class _ExecutionAlreadyActive(AgentPlanError):
+    """A retry observed an existing execution and must not mutate its state."""
+
+
 class AgentPlanNode(Node):
     """Own the Agent plan lifecycle and delegate execution to the Gateway."""
 
@@ -77,6 +81,7 @@ class AgentPlanNode(Node):
         if not math.isfinite(self._rpc_timeout) or self._rpc_timeout <= 0.0:
             raise ValueError("rpc_timeout_sec must be finite and positive")
         self._store = AgentPlanStore(
+            wall_clock=lambda: self.get_clock().now().nanoseconds / 1_000_000_000,
             ttl_sec=self.get_parameter("plan_ttl_sec").get_parameter_value().double_value,
             max_records=self.get_parameter("plan_store_max_records").get_parameter_value().integer_value,
         )
@@ -169,7 +174,12 @@ class AgentPlanNode(Node):
         request = GetSkillGatewayStatus.Request()
         request.schema_version = 1
         response = self._call_service(self._status_client, request, self._status_service)
-        if not response.registry_epoch or response.registry_generation <= 0 or not response.registry_digest:
+        if (
+            not response.control_plane_ready
+            or not response.registry_epoch
+            or response.registry_generation <= 0
+            or not response.registry_digest
+        ):
             raise AgentPlanError("SKILL_REGISTRY_NOT_READY")
         return response
 
@@ -245,14 +255,14 @@ class AgentPlanNode(Node):
                     place_name=step.place_name,
                     motion_direction=step.motion_direction.strip().lower(),
                     motion_distance=self._float32(step.motion_distance),
-                    timeout_sec=self._float32(status.default_skill_timeout_sec),
+                    timeout_sec=self._float32(step.timeout_sec),
                 )
                 for step in requested_steps
             )
         except (TypeError, ValueError, OverflowError, struct.error) as exc:
             raise AgentPlanError("SKILL_SCHEMA_INVALID", str(exc)) from exc
-        if any(step.timeout_sec != 0.0 for step in requested_steps):
-            raise AgentPlanError("SKILL_SCHEMA_INVALID", "workflow steps must not set timeout_sec")
+        if any(step.timeout_sec < 0.0 for step in requested_steps):
+            raise AgentPlanError("SKILL_SCHEMA_INVALID", "workflow step timeout must not be negative")
         for step in steps:
             skill_name = step.skill_name
             capability = catalog.capability_view.get(skill_name)
@@ -411,7 +421,14 @@ class AgentPlanNode(Node):
         feedback.workflow_step_index = index
         goal_handle.publish_feedback(feedback)
 
-    def _send_skill(self, goal_handle, binding, step: CanonicalWorkflowStep, execution_deadline: float):
+    def _send_skill(
+        self,
+        goal_handle,
+        binding,
+        step: CanonicalWorkflowStep,
+        execution_deadline: float,
+        expected_identity: tuple[str, int, str],
+    ):
         step_timeout = step.timeout_sec if step.timeout_sec > 0.0 else execution_deadline - time.monotonic()
         child_deadline = min(execution_deadline, time.monotonic() + step_timeout)
         wait_timeout = min(self._rpc_timeout, max(0.0, child_deadline - time.monotonic()))
@@ -424,7 +441,7 @@ class AgentPlanNode(Node):
         goal.place_name = step.place_name
         goal.motion_direction = step.motion_direction
         goal.motion_distance = step.motion_distance
-        goal.timeout_sec = step.timeout_sec if step.timeout_sec > 0.0 else step_timeout
+        goal.timeout_sec = step.timeout_sec
         send_future = self._skill_client.send_goal_async(goal)
         send_timeout = min(self._rpc_timeout, max(0.0, child_deadline - time.monotonic()))
         if send_timeout <= 0.0 or not self._wait_future(send_future, send_timeout):
@@ -459,19 +476,29 @@ class AgentPlanNode(Node):
         if not result_future.done():
             cancel_child("SKILL_TIMEOUT")
         action_result = result_future.result()
-        result = action_result.result if action_result is not None else None
         terminal_status = getattr(action_result, "status", GoalStatus.STATUS_UNKNOWN)
-        if result is None or terminal_status not in {
-            GoalStatus.STATUS_SUCCEEDED,
-            GoalStatus.STATUS_CANCELED,
-            GoalStatus.STATUS_ABORTED,
-        }:
+        result = action_result.result if action_result is not None else None
+        if terminal_status == GoalStatus.STATUS_CANCELED:
+            raise AgentPlanError("SKILL_CANCELLED", getattr(result, "message", "skill was canceled"))
+        if terminal_status == GoalStatus.STATUS_ABORTED:
+            raise AgentPlanError(
+                getattr(result, "error_code", "") or "SKILL_EXECUTION_FAILED",
+                getattr(result, "message", "") or "skill action was aborted",
+            )
+        if result is None or terminal_status != GoalStatus.STATUS_SUCCEEDED:
             raise _ChildStateUnknown("SKILL_EXECUTION_STATE_UNKNOWN", "skill terminal result is unknown")
         if not result.success:
             raise AgentPlanError(
                 result.error_code if result is not None and result.error_code else "SKILL_EXECUTION_FAILED",
                 result.message if result is not None else "skill result missing",
             )
+        actual_identity = (
+            str(result.actual_registry_epoch),
+            int(result.actual_registry_generation),
+            str(result.actual_registry_digest),
+        )
+        if actual_identity != expected_identity:
+            raise AgentPlanError("SKILL_REGISTRY_VERSION_MISMATCH", "skill used a different registry identity")
         return result
 
     def _begin_workflow(self, plan: AgentPlan, binding, steps):
@@ -543,10 +570,13 @@ class AgentPlanNode(Node):
                     goal_handle.abort()
                 return result
             if not execution.newly_accepted:
-                raise AgentPlanError("SKILL_EXECUTION_BUSY", "agent plan execution is already active")
+                raise _ExecutionAlreadyActive("SKILL_EXECUTION_BUSY", "agent plan execution is already active")
             steps = plan.workflow_steps
             deadline_unix = execution.task_budget_deadline[0] + execution.task_budget_deadline[1] / 1_000_000_000
-            remaining_timeout = deadline_unix - time.time()
+            now = self.get_clock().now().nanoseconds / 1_000_000_000
+            if now < execution.clock_at_confirmation:
+                raise AgentPlanError("SKILL_CLOCK_INVALID", "ROS clock moved backwards after confirmation")
+            remaining_timeout = deadline_unix - now
             if remaining_timeout <= 0.0:
                 raise AgentPlanError("SKILL_TIMEOUT", "confirmed task budget expired before execution")
             execution_deadline = time.monotonic() + remaining_timeout
@@ -570,7 +600,13 @@ class AgentPlanNode(Node):
                     child_binding.workflow_step_index = index
                     child_binding.root_lease_nonce = binding.root_lease_nonce
                 self._publish_feedback(goal_handle, "executing", f"executing {step.skill_name}", step.skill_name, index)
-                self._send_skill(goal_handle, child_binding, step, execution_deadline)
+                self._send_skill(
+                    goal_handle,
+                    child_binding,
+                    step,
+                    execution_deadline,
+                    (plan.registry_epoch, plan.registry_generation, plan.registry_digest),
+                )
                 completed += 1
             if workflow_started:
                 finalized = self._finalize_workflow(binding, FinalizeWorkflowExecution.Request.SUCCEEDED, completed)
@@ -586,6 +622,7 @@ class AgentPlanNode(Node):
                 self._store.mark_terminal(
                     plan_token=plan.plan_token,
                     task_id=request.task_id,
+                    execution_token=execution.execution_token,
                     terminal_message="agent plan completed",
                     workflow_digest=binding.workflow_digest,
                     completed_step_count=completed,
@@ -593,7 +630,7 @@ class AgentPlanNode(Node):
             result.success = True
             result.message = "agent plan completed"
             goal_handle.succeed()
-        except (_ChildStateUnknown, _WorkflowStateUnknown) as exc:
+        except (_ChildStateUnknown, _WorkflowStateUnknown, _ExecutionAlreadyActive) as exc:
             # The child may still execute or retain a lease. Keep the plan ACCEPTED and
             # workflow open; finalizing or caching a terminal result would be unsafe.
             result.success = False
@@ -622,6 +659,7 @@ class AgentPlanNode(Node):
                     self._store.mark_terminal(
                         plan_token=plan.plan_token,
                         task_id=request.task_id,
+                        execution_token=execution.execution_token,
                         terminal_code=exc.code,
                         terminal_message=str(exc),
                         workflow_digest=binding.workflow_digest if binding is not None else "",

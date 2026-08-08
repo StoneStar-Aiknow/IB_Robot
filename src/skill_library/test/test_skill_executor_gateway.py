@@ -455,6 +455,7 @@ def _set_root_identity(rig, binding) -> None:
 
 def test_snapshot_service_response_matches_generated_contract(gateway_rig):
     request = GetSkillSnapshot.Request()
+    request.schema_version = 1
     response = _future_result(gateway_rig.snapshot_client.call_async(request))
     assert response.success is True
     assert response.generation > 0
@@ -655,7 +656,7 @@ def test_failed_workflow_child_cannot_be_replayed(gateway_rig, monkeypatch):
     assert failed.success is False
     assert failed.error_code == "SKILL_REJECTED"
     assert replay.success is False
-    assert replay.error_code == "SKILL_WORKFLOW_DIGEST_MISMATCH"
+    assert replay.error_code == failed.error_code
 
     finalize = FinalizeWorkflowExecution.Request()
     finalize.dispatch_binding = copy_binding(binding)
@@ -828,7 +829,7 @@ def test_direct_skill_rejects_incomplete_registry_binding(gateway_rig):
     assert result.error_code == "SKILL_SCHEMA_INVALID"
 
 
-def test_zero_budget_root_accepts_timeout_equal_to_gateway_task_budget(gateway_rig):
+def test_zero_budget_root_rejects_timeout_over_catalog_entry_cap(gateway_rig):
     goal = SkillCommand.Goal()
     goal.dispatch_binding = new_binding(task_id="full-root-budget")
     _set_root_identity(gateway_rig, goal.dispatch_binding)
@@ -838,7 +839,7 @@ def test_zero_budget_root_accepts_timeout_equal_to_gateway_task_budget(gateway_r
     handle = _future_result(gateway_rig.skill_client.send_goal_async(goal))
     result = _future_result(handle.get_result_async()).result
 
-    assert result.error_code != "TIMEOUT_EXCEEDS_POLICY"
+    assert result.error_code == "TIMEOUT_EXCEEDS_POLICY"
 
 
 @pytest.mark.parametrize("gateway_rig", [{"_task_executor": True}], indirect=True)

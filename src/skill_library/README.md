@@ -477,7 +477,7 @@ terminal record。
 | `relative_motion_direction_mapping_json` | `{}` | 相对运动方向映射 |
 | `rpc_timeout_sec` | `5.0` | 启动时固定；等待校验服务 / primitive action 的统一 RPC 超时，并参与 capability digest |
 | `gripper_settle_sec` | `1.5` | 启动时固定；夹爪 goal 接受等待预算的组成部分，并参与 capability digest |
-| `default_skill_timeout_sec` | `30.0` | 启动时固定；Gateway skill 默认超时，并参与 capability digest |
+| `default_skill_timeout_sec` | `30.0` | catalog entry 未声明 timeout 时的 robot fallback；entry cap 优先，并参与 digest |
 | `task_budget_sec` | `180.0` | 启动时固定；canonical root task 预算，zero-budget direct root 由 Gateway stamp，并参与 capability digest |
 | `robot_state_freshness_sec` | `0.5` | 启动时固定；机器人状态新鲜度阈值，并参与 capability digest |
 | `scene_freshness_sec` | `0.5` | 启动时固定；场景新鲜度阈值，并参与 capability digest |

@@ -75,6 +75,7 @@ class SafetyGuardNode(Node):
         self._snapshot_in_flight: set[tuple[str, int]] = set()
         self._desired_current: SnapshotIdentity | None = None
         self._retained_generations: set[int] = set()
+        self._known_identities: dict[tuple[str, int], SnapshotIdentity] = {}
         self._gateway_status_client = self.create_client(GetSkillGatewayStatus, self._skill_gateway_status_service)
         self._snapshot_client = self.create_client(GetSkillSnapshot, self._skill_catalog_snapshot_service)
         registry_qos = QoSProfile(
@@ -155,15 +156,14 @@ class SafetyGuardNode(Node):
                 return
             if desired is not None and current.registry_epoch != desired.registry_epoch:
                 self._snapshot_cache.reconcile(current.registry_epoch, retained)
+                self._known_identities.clear()
             self._desired_current = current
             self._retained_generations = retained
+            self._known_identities[(current.registry_epoch, current.generation)] = current
         for generation in sorted(retained):
-            identity = (
-                current
-                if generation == current.generation
-                else SnapshotIdentity(current.registry_epoch, generation, "")
-            )
-            self._request_snapshot(identity)
+            identity = self._known_identities.get((current.registry_epoch, generation))
+            if identity is not None:
+                self._request_snapshot(identity)
         self._snapshot_cache.reconcile(current.registry_epoch, retained)
 
     def _handle_registry_event(self, event: SkillRegistryEvent) -> None:
@@ -186,8 +186,10 @@ class SafetyGuardNode(Node):
             if desired is not None and identity.registry_epoch != desired.registry_epoch:
                 self._snapshot_cache.reconcile(identity.registry_epoch, {identity.generation})
                 self._retained_generations.clear()
+                self._known_identities.clear()
             self._desired_current = identity
             self._retained_generations.add(identity.generation)
+            self._known_identities[(identity.registry_epoch, identity.generation)] = identity
         self._request_snapshot(identity)
 
     def _request_snapshot(self, identity: SnapshotIdentity) -> None:
@@ -236,6 +238,9 @@ class SafetyGuardNode(Node):
         with self._sync_lock:
             retained = set(self._retained_generations)
             desired = self._desired_current
+            expected = self._known_identities.get(key)
+            if expected is None or response_identity != expected:
+                return
             if response.generation not in retained and response_identity != desired:
                 return
             try:

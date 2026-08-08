@@ -413,7 +413,7 @@ class PickFlowPhase:
             goal.dispatch_binding.task_budget.deadline.sec
             + goal.dispatch_binding.task_budget.deadline.nanosec / 1_000_000_000
         )
-        remaining_budget = task_deadline_unix - time.time()
+        remaining_budget = task_deadline_unix - self.get_clock().now().nanoseconds / 1_000_000_000
         timeout_sec = min(float(goal.timeout_sec), remaining_budget)
         if timeout_sec <= 0.0:
             result = self._result_from_state(state)

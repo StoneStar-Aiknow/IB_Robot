@@ -73,11 +73,13 @@ class AgentPlanExecution:
     task_budget_sec: float = 0.0
     task_budget_started_at: tuple[int, int] = (0, 0)
     task_budget_deadline: tuple[int, int] = (0, 0)
+    clock_at_confirmation: float = 0.0
     terminal_code: str = ""
     terminal_message: str = ""
     workflow_digest: str = ""
     completed_step_count: int = 0
     newly_accepted: bool = False
+    execution_token: str = field(default="", repr=False)
 
 
 @dataclass
@@ -91,10 +93,12 @@ class _PlanRecord:
     task_budget_sec: float = 0.0
     task_budget_started_at: tuple[int, int] = (0, 0)
     task_budget_deadline: tuple[int, int] = (0, 0)
+    clock_at_confirmation: float = 0.0
     terminal_code: str = ""
     terminal_message: str = ""
     workflow_digest: str = ""
     completed_step_count: int = 0
+    execution_token: str = field(default="", repr=False)
 
 
 class AgentPlanStore:
@@ -114,6 +118,7 @@ class AgentPlanStore:
             raise ValueError("max_records and ttl_sec must be positive")
         self._clock = clock or time.monotonic
         self._wall_clock = wall_clock or time.time
+        self._last_wall_time: float | None = None
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
         self._plan_id_factory = plan_id_factory or (lambda: str(uuid.uuid4()))
         self._max_records = max_records
@@ -175,7 +180,7 @@ class AgentPlanStore:
             registry_epoch=registry_epoch,
             registry_generation=registry_generation,
             registry_digest=registry_digest,
-            expires_at=_wall_time(self._wall_clock() + self._ttl_sec),
+            expires_at=_wall_time(self._wall_now() + self._ttl_sec),
         )
         self._records[plan.plan_token] = _PlanRecord(
             plan=plan,
@@ -240,7 +245,7 @@ class AgentPlanStore:
         if record.state != "VALIDATED":
             raise AgentPlanError("SKILL_REJECTED", "plan must be validated before confirmation")
         confirmation_token = _new_opaque_token(self._token_factory)
-        started_at = _wall_time(self._wall_clock())
+        started_at = _wall_time(self._wall_now())
         deadline = _wall_time(started_at[0] + started_at[1] / 1_000_000_000 + normalized_budget)
         record.state = "CONFIRMED"
         record.task_id = task_id
@@ -248,6 +253,7 @@ class AgentPlanStore:
         record.task_budget_sec = normalized_budget
         record.task_budget_started_at = started_at
         record.task_budget_deadline = deadline
+        record.clock_at_confirmation = started_at[0] + started_at[1] / 1_000_000_000
         return PlanConfirmation(
             True,
             confirmation_token,
@@ -291,6 +297,7 @@ class AgentPlanStore:
                 task_budget_sec=record.task_budget_sec,
                 task_budget_started_at=record.task_budget_started_at,
                 task_budget_deadline=record.task_budget_deadline,
+                clock_at_confirmation=record.clock_at_confirmation,
                 terminal_code=record.terminal_code,
                 terminal_message=record.terminal_message,
                 workflow_digest=record.workflow_digest,
@@ -299,6 +306,7 @@ class AgentPlanStore:
         if record.state != "CONFIRMED" or not hmac.compare_digest(record.confirmation_token, confirmation_token):
             raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "plan confirmation is invalid")
         record.state = "ACCEPTED"
+        record.execution_token = _new_opaque_token(self._token_factory)
         return AgentPlanExecution(
             record.plan,
             task_id,
@@ -307,7 +315,9 @@ class AgentPlanStore:
             record.task_budget_sec,
             record.task_budget_started_at,
             record.task_budget_deadline,
+            record.clock_at_confirmation,
             newly_accepted=True,
+            execution_token=record.execution_token,
         )
 
     def mark_terminal(
@@ -315,6 +325,7 @@ class AgentPlanStore:
         *,
         plan_token: str,
         task_id: str,
+        execution_token: str,
         terminal_code: str = "",
         terminal_message: str = "",
         workflow_digest: str = "",
@@ -323,8 +334,32 @@ class AgentPlanStore:
         record = self._get_record(plan_token, allow_terminal=True)
         if record.task_id != task_id:
             raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "plan is bound to a different task")
+        if not record.execution_token or not hmac.compare_digest(record.execution_token, execution_token):
+            raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "execution owner does not match")
         if record.state not in {"ACCEPTED", "TERMINAL"}:
             raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "plan has not been accepted")
+        if record.state == "TERMINAL":
+            if (
+                record.terminal_code,
+                record.terminal_message,
+                record.workflow_digest,
+                record.completed_step_count,
+            ) != (terminal_code, terminal_message, workflow_digest, completed_step_count):
+                raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "terminal result is immutable")
+            return AgentPlanExecution(
+                plan=record.plan,
+                task_id=task_id,
+                state=record.state,
+                confirmation_token=record.confirmation_token,
+                task_budget_sec=record.task_budget_sec,
+                task_budget_started_at=record.task_budget_started_at,
+                task_budget_deadline=record.task_budget_deadline,
+                clock_at_confirmation=record.clock_at_confirmation,
+                terminal_code=record.terminal_code,
+                terminal_message=record.terminal_message,
+                workflow_digest=record.workflow_digest,
+                completed_step_count=record.completed_step_count,
+            )
         record.state = "TERMINAL"
         record.terminal_code = terminal_code
         record.terminal_message = terminal_message
@@ -339,14 +374,29 @@ class AgentPlanStore:
             task_budget_sec=record.task_budget_sec,
             task_budget_started_at=record.task_budget_started_at,
             task_budget_deadline=record.task_budget_deadline,
+            clock_at_confirmation=record.clock_at_confirmation,
             terminal_code=terminal_code,
             terminal_message=terminal_message,
             workflow_digest=workflow_digest,
             completed_step_count=completed_step_count,
         )
 
-    def cancel(self, *, plan_token: str, task_id: str) -> AgentPlanExecution:
-        return self.mark_terminal(plan_token=plan_token, task_id=task_id, terminal_code="SKILL_CANCELLED")
+    def cancel(self, *, plan_token: str, task_id: str, execution_token: str) -> AgentPlanExecution:
+        return self.mark_terminal(
+            plan_token=plan_token,
+            task_id=task_id,
+            execution_token=execution_token,
+            terminal_code="SKILL_CANCELLED",
+        )
+
+    def _wall_now(self) -> float:
+        now = float(self._wall_clock())
+        if not math.isfinite(now) or now < 0.0:
+            raise AgentPlanError("SKILL_CLOCK_INVALID", "ROS clock is invalid")
+        if self._last_wall_time is not None and now < self._last_wall_time:
+            raise AgentPlanError("SKILL_CLOCK_INVALID", "ROS clock moved backwards")
+        self._last_wall_time = now
+        return now
 
     def _get_record(self, plan_token: str, *, allow_terminal: bool = False) -> _PlanRecord:
         self._purge()
