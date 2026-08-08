@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any
+
+from embodied_common.canon import to_canonical_json
 
 
 @dataclass(frozen=True)
@@ -113,8 +114,7 @@ def workflow_digest_preimage(
 
 def compute_workflow_digest(**kwargs: Any) -> str:
     payload = workflow_digest_preimage(**kwargs)
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
-    return hashlib.sha256(encoded.encode()).hexdigest()
+    return hashlib.sha256(to_canonical_json(payload).encode()).hexdigest()
 
 
 def _task_budget_dict(task_budget: Any) -> dict[str, Any]:

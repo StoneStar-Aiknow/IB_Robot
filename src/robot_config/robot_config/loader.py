@@ -13,7 +13,6 @@ import yaml
 from embodied_common.skill_templates import (
     SUPPORTED_PRIMITIVES,
     SUPPORTED_SKILL_EXECUTORS,
-    get_skill_templates,
 )
 from robot_config.config import (
     CameraConfig,
@@ -685,20 +684,6 @@ def _load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
     return resolved_config_path, robot_data
 
 
-def _normalize_skill_templates(skill_templates: dict[str, Any]) -> dict[str, Any]:
-    return get_skill_templates(skill_templates)
-
-
-def _normalize_embodied_config(robot_config: dict[str, Any]) -> dict[str, Any]:
-    embodied = robot_config.get("embodied")
-    if not isinstance(embodied, dict):
-        return robot_config
-    skill_templates = embodied.get("skill_templates")
-    if isinstance(skill_templates, dict) and skill_templates:
-        embodied["skill_templates"] = _normalize_skill_templates(skill_templates)
-    return robot_config
-
-
 _GRIPPER_ONLY_PRIMITIVES = {"open_gripper", "close_gripper"}
 
 
@@ -918,11 +903,7 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
             not isinstance(source_root, str) or not source_root.strip()
         ):
             errors.append("embodied.skill_catalog_source_root is required in development and production modes")
-        if (
-            embodied.get("enabled", False)
-            and "skill_templates" not in embodied
-            and (not isinstance(profile_name, str) or not profile_name.strip())
-        ):
+        if embodied.get("enabled", False) and (not isinstance(profile_name, str) or not profile_name.strip()):
             errors.append("embodied.skill_catalog_profile is required")
         try:
             resolve_embodied_timeout_policy(embodied)
@@ -940,7 +921,6 @@ def load_robot_config_dict(config_path: str | Path | None = None) -> dict[str, A
     """
     resolved_config_path, robot_data = _load_robot_section(resolve_robot_config_path(config_path=config_path))
     robot_config = copy.deepcopy(robot_data)
-    robot_config = _normalize_embodied_config(robot_config)
     validation_errors = validate_grasp_execution_config(robot_config.get("grasp_execution"))
     validation_errors.extend(_validate_embodied_skill_contract(robot_config))
     validation_errors.extend(_validate_skill_gateway_config(robot_config))

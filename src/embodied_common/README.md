@@ -78,8 +78,10 @@ ibrobot_msgs / rclpy
   named pose 坐标及 ROS service/action/topic 名称都不属于该视图。
 - 缺省、显式空值或全部 `disabled: true` 的 `embodied.skill_templates` 都产生零个公开技能。
   `get_skill_templates()` 的禁用过滤在构建视图前生效。
-- digest 是整个公开文档的 SHA-256：JSON 使用排序 key、紧凑分隔符、ASCII 和
-  `allow_nan=False`。因此相同的公开能力、命名位姿名称或 timeout policy 才会得到相同 digest。
+- digest 是整个公开文档的 SHA-256：JSON 使用排序 key、紧凑分隔符、ASCII、
+  `allow_nan=False`，且 `-0.0` 归一化为 `0.0`（由 `embodied_common.canon.to_canonical_json`
+  统一实现，`robot_config`、`embodied_common`、`skill_catalog` 共用同一规范）。因此相同的
+  公开能力、命名位姿名称或 timeout policy 才会得到相同 digest。
 
 `skill_request` 为 Gateway 请求提供同一套规范化规则：技能名和可选字符串会去首尾空白，
 `motion_direction` 会转为小写；`skill_name` 必须非空，`motion_distance`（给出时）必须为有限、

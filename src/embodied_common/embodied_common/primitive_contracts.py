@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
+
+from embodied_common.canon import to_canonical_json
 
 
 @dataclass(frozen=True)
@@ -368,13 +369,7 @@ def primitive_contract_preimage() -> dict[str, Any]:
 
 
 def canonical_json(value: Any) -> str:
-    return json.dumps(
-        _to_json_value(value),
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-        allow_nan=False,
-    )
+    return to_canonical_json(value)
 
 
 PRIMITIVE_CONTRACT_DIGEST = hashlib.sha256(canonical_json(primitive_contract_preimage()).encode()).hexdigest()
