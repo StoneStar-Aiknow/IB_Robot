@@ -133,10 +133,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-s", type=float, default=240.0)
     parser.add_argument("--ready-timeout-s", type=float, default=30.0)
     parser.add_argument("--goal-response-timeout-s", type=float, default=10.0)
-    parser.add_argument("--repeat", type=int, default=1, help="Run multiple sequential goals with one DDS participant")
-    parser.add_argument("--repeat-delay-s", type=float, default=0.0)
-    parser.add_argument("--release-after-success", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--release-drop-height-m", type=float, default=-1.0)
+    parser.add_argument("--release-after-success", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--release-drop-height-m", type=float, default=0.015)
     return parser
 
 
@@ -145,49 +143,26 @@ def main(args=None) -> None:
     rclpy.init(args=None)
     node = PickActionClient(parsed.action_name)
     try:
-        if parsed.repeat < 1:
-            raise ValueError("--repeat must be at least 1")
-        if parsed.repeat_delay_s < 0.0:
-            raise ValueError("--repeat-delay-s must be non-negative")
-
-        iteration_timings: list[float] = []
-        for index in range(parsed.repeat):
-            if parsed.repeat > 1:
-                print(f"PICK_REPEAT iteration={index + 1}/{parsed.repeat}", flush=True)
-            task_id = parsed.task_id
-            if task_id and parsed.repeat > 1:
-                task_id = f"{task_id}-{index + 1:02d}"
-            iteration_started = time.perf_counter()
-            result = node.execute(
-                task_id=task_id,
-                target_query=parsed.prompt,
-                timeout_sec=parsed.timeout_s,
-                mode=parsed.mode,
-                release_after_success=parsed.release_after_success,
-                release_drop_height_m=parsed.release_drop_height_m,
-                ready_timeout_sec=parsed.ready_timeout_s,
-                goal_response_timeout_sec=parsed.goal_response_timeout_s,
-            )
-            iteration_elapsed = time.perf_counter() - iteration_started
-            iteration_timings.append(iteration_elapsed)
-            print(
-                f"PICK_ITERATION_TIMING iteration={index + 1} wall_time_s={iteration_elapsed:.6f} "
-                f"pipeline_timings_json={result.pipeline_timings_json or '{}'}",
-                flush=True,
-            )
-            print(f"FLOW_RESULT success={bool(result.success)} error={result.error_code or '-'}", flush=True)
-            if not result.success:
-                raise RuntimeError(result.message or result.error_code or "pick failed")
-            if index + 1 < parsed.repeat and parsed.repeat_delay_s > 0.0:
-                time.sleep(parsed.repeat_delay_s)
-        if parsed.repeat > 1:
-            print(
-                f"FLOW_BATCH_RESULT success=True completed={parsed.repeat} "
-                f"min_wall_time_s={min(iteration_timings):.6f} "
-                f"max_wall_time_s={max(iteration_timings):.6f} "
-                f"mean_wall_time_s={sum(iteration_timings) / len(iteration_timings):.6f}",
-                flush=True,
-            )
+        action_started = time.perf_counter()
+        result = node.execute(
+            task_id=parsed.task_id,
+            target_query=parsed.prompt,
+            timeout_sec=parsed.timeout_s,
+            mode=parsed.mode,
+            release_after_success=parsed.release_after_success,
+            release_drop_height_m=parsed.release_drop_height_m,
+            ready_timeout_sec=parsed.ready_timeout_s,
+            goal_response_timeout_sec=parsed.goal_response_timeout_s,
+        )
+        action_elapsed = time.perf_counter() - action_started
+        print(
+            f"PICK_ACTION_TIMING wall_time_s={action_elapsed:.6f} "
+            f"pipeline_timings_json={result.pipeline_timings_json or '{}'}",
+            flush=True,
+        )
+        print(f"FLOW_RESULT success={bool(result.success)} error={result.error_code or '-'}", flush=True)
+        if not result.success:
+            raise RuntimeError(result.message or result.error_code or "pick failed")
     finally:
         node.destroy_node()
         rclpy.shutdown()
