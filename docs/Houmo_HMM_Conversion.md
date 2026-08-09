@@ -109,7 +109,7 @@ MODEL_BUNDLE_ROOT=models/smolvla ./scripts/convert_hmm.sh smolvla
 `SMOLVLA_HMM_OUTPUT` 覆盖；ONNX、HMONNX、TCIM 编译缓存和 calibration 等中间产物写入
 `models/_work/<输出名>/`（`SMOLVLA_HMM_WORK` 可覆盖），bundle 只保留 manifest 引用的制品
 和 LeRobot 元数据。还可通过 `SMOLVLA_EXPORT_DEVICE` 和 `HOUMO_IMAGE` 覆盖其他参数。脚本会校验仓库维护的
-LeRobot v0.5.1 patch 分支和 clean 状态，在 Houmo 1.3.0 容器中导出 ONNX、执行 xhquant PTQ、
+LeRobot v0.6.0 patch 分支和 clean 状态，在 Houmo 1.3.0 容器中导出 ONNX、执行 xhquant PTQ、
 调用 TCIM 编译三个 HMM，并通过 strict loader 生成和验证 `inference_manifest.json`。
 
 标准流程优先使用 `transformers==5.3.0`，并在加载策略失败时尝试 `4.57.1`。容器预装的

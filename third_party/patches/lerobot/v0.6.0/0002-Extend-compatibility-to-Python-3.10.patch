@@ -1,0 +1,43 @@
+From eb67fd77e9f94bd74bceefb36ae45f33fbfd1aa6 Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Wed, 15 Apr 2026 23:28:19 +0800
+Subject: [PATCH 02/12] Extend compatibility to Python 3.10
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+---
+ pyproject.toml | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/pyproject.toml b/pyproject.toml
+index cbb83306..1ce5beeb 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -29,7 +29,7 @@ version = "0.6.0"
+ description = "🤗 LeRobot: State-of-the-art Machine Learning for Real-World Robotics in Pytorch"
+ dynamic = ["readme"]
+ license = { text = "Apache-2.0" }
+-requires-python = ">=3.11"
++requires-python = ">=3.10"
+ authors = [
+     { name = "Rémi Cadène", email = "re.cadene@gmail.com" },
+     { name = "Simon Alibert", email = "alibert.sim@gmail.com" },
+@@ -50,6 +50,7 @@ classifiers = [
+     "Intended Audience :: Education",
+     "Intended Audience :: Science/Research",
+     "License :: OSI Approved :: Apache Software License",
++    "Programming Language :: Python :: 3.10",
+     "Programming Language :: Python :: 3.11",
+     "Programming Language :: Python :: 3.12",
+     "Programming Language :: Python :: 3.13",
+@@ -479,7 +480,7 @@ default.extend-ignore-identifiers-re = [
+ # Uncomment [tool.mypy] first, then uncomment individual module overrides as they get proper type annotations
+ 
+ [tool.mypy]
+-python_version = "3.11"
++python_version = "3.10"
+ ignore_missing_imports = true
+ follow_imports = "skip"
+ # warn_return_any = true
+-- 
+2.34.1
+

@@ -28,7 +28,7 @@ fi
 IMAGE_ID="$(docker image inspect --format '{{.Id}}' "${IMAGE}")"
 LEROBOT_BRANCH="$(git -C "${WORKSPACE}/libs/lerobot" branch --show-current)"
 LEROBOT_HEAD="$(git -C "${WORKSPACE}/libs/lerobot" rev-parse HEAD)"
-if [[ "${LEROBOT_BRANCH}" != "ibrobot/lerobot-v0.5.1-patched" ]]; then
+if [[ "${LEROBOT_BRANCH}" != "ibrobot/lerobot-v0.6.0-patched" ]]; then
     printf 'Expected patched LeRobot branch, got %s\n' "${LEROBOT_BRANCH}" >&2
     exit 1
 fi
@@ -37,8 +37,8 @@ if [[ -n "$(git -C "${WORKSPACE}/libs/lerobot" status --short)" ]]; then
     exit 1
 fi
 if ! git -C "${WORKSPACE}/libs/lerobot" merge-base --is-ancestor \
-    1396b9fab7aecddd10006c33c47a487ffdcb54b4 "${LEROBOT_HEAD}"; then
-    printf 'LeRobot HEAD is not based on the manifest-pinned v0.5.1 commit\n' >&2
+    30da8e687a6dfc617fcd94afc367ac7071c376ce "${LEROBOT_HEAD}"; then
+    printf 'LeRobot HEAD is not based on the manifest-pinned v0.6.0 commit\n' >&2
     exit 1
 fi
 

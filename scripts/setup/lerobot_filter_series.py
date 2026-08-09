@@ -4,7 +4,7 @@
 This helper is invoked by ``scripts/setup/lerobot_patches.sh`` from inside the
 workspace virtualenv (which carries PyYAML). It reads:
 
-* ``--manifest``: path to ``third_party/patches/lerobot/v0.5.1/manifest.yaml``.
+* ``--manifest``: path to ``third_party/patches/lerobot/v0.6.0/manifest.yaml``.
 * ``--series``: path to the series file consumed by ``git am`` (e.g.
   ``series.txt`` for the default profile).
 * Environment variables ``IBR_HOST_PYTHON_VERSION`` and

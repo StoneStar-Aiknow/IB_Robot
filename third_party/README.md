@@ -8,15 +8,17 @@
 third_party/
 ├── patches/
 │   ├── lerobot/
-│         ├── INDEX.yaml
-│         └── v0.5.1/
-│             ├── 0001-*.patch
-│             ├── 0002-*.patch
-│             ├── ...
-│             ├── manifest.yaml
-│             ├── series.txt
-│             ├── series.master-parity-candidates.txt
-│   │       └── series.openharmony-5.1.0-musl.txt
+│       ├── INDEX.yaml
+│       ├── v0.6.0/                     # 当前激活 tag（兼容/推理/导出补丁）
+│       │   ├── 0001-*.patch
+│       │   ├── 0002-*.patch
+│       │   ├── ...
+│       │   ├── manifest.yaml
+│       │   ├── series.txt
+│       │   ├── series.master-parity-candidates.txt
+│       │   └── series.openharmony-5.1.0-musl.txt
+│       └── v0.5.1/                      # archived，保留完整训练补丁栈供参考/回退
+│           └── ...
 │   ├── recognize-anything/<commit>/
 │   │   ├── manifest.yaml
 │   │   ├── series.txt
@@ -60,8 +62,8 @@ IB_Robot 的 Torch、Transformers 和 ROS ABI 约束。
 作用：
 
 1. 作为 **LeRobot patch stack 的上层索引**。
-2. 指定当前激活的上游 tag，例如 `active_tag: v0.5.1`。
-3. 将 tag 字符串映射到实际目录，例如 `v0.5.1 -> third_party/patches/lerobot/v0.5.1/`。
+2. 指定当前激活的上游 tag，例如 `active_tag: v0.6.0`。
+3. 将 tag 字符串映射到实际目录，例如 `v0.6.0 -> third_party/patches/lerobot/v0.6.0/`。
 4. 记录该 tag 对应的上游 commit 与默认分支名。
 
 它是整个补丁栈的入口。`scripts/setup/lerobot_patches.sh` 不会直接硬编码某个 tag 目录，而是先通过 `scripts/setup/lerobot_resolve_active.py` 解析 `INDEX.yaml`，再进入对应版本目录。
@@ -178,7 +180,7 @@ LeRobot patch stack 的生效路径大致如下：
 
 1. `scripts/setup/lerobot_patches.sh` 读取 `third_party/patches/lerobot/INDEX.yaml`。
 2. `scripts/setup/lerobot_resolve_active.py` 解析当前激活 tag。
-3. 进入对应目录，例如 `third_party/patches/lerobot/v0.5.1/`。
+3. 进入对应目录，例如 `third_party/patches/lerobot/v0.6.0/`。
 4. 根据目标 profile 选择一条 `series*.txt`。
 5. 使用 `scripts/setup/lerobot_filter_series.py` 按 `manifest.yaml` 中的 `python_min/python_max/profiles` 过滤 patch。
 6. 对保留下来的 patch 按顺序执行 `git am`。
@@ -200,7 +202,7 @@ LeRobot patch stack 的生效路径大致如下：
 
 ## 当前目录的建议理解方式
 
-如果只看 `third_party/patches/lerobot/v0.5.1/`，可以把里面的文件理解为三层：
+如果只看 `third_party/patches/lerobot/v0.6.0/`，可以把里面的文件理解为三层：
 
 1. `000x-*.patch`：真正的代码改动。
 2. `series*.txt`：针对不同场景的 patch 装配清单。
@@ -223,10 +225,11 @@ LeRobot patch stack 的生效路径大致如下：
 ## 相关文件
 
 - `third_party/patches/lerobot/INDEX.yaml`
-- `third_party/patches/lerobot/v0.5.1/manifest.yaml`
-- `third_party/patches/lerobot/v0.5.1/series.txt`
-- `third_party/patches/lerobot/v0.5.1/series.master-parity-candidates.txt`
-- `third_party/patches/lerobot/v0.5.1/series.openharmony-5.1.0-musl.txt`
+- `third_party/patches/lerobot/v0.6.0/manifest.yaml`
+- `third_party/patches/lerobot/v0.6.0/series.txt`
+- `third_party/patches/lerobot/v0.6.0/series.master-parity-candidates.txt`
+- `third_party/patches/lerobot/v0.6.0/series.openharmony-5.1.0-musl.txt`
+- `third_party/patches/lerobot/v0.5.1/` (archived, 完整训练补丁栈)
 - `scripts/setup/lerobot_patches.sh`
 - `scripts/setup/lerobot_resolve_active.py`
 - `scripts/setup/lerobot_filter_series.py`

@@ -1,0 +1,29 @@
+# Default patch series for lerobot v0.6.0.
+#
+# Full migration from v0.5.1: compatibility / inference / export patches
+# plus the training-feature patches (knowledge distillation, mt_act, sample
+# weighting, QAT, TensorBoard logs). Each training patch is a v0.6.0-native
+# adaptation rather than a textual rebase: upstream v0.6.0 restructured the
+# training loop (lerobot.common.train_utils / EpisodeAwareSampler /
+# make_train_eval_datasets / native SampleWeighter) and grew native support
+# for several of the v0.5.1 features, so the ports reuse that infrastructure
+# instead of duplicating it. See manifest.yaml `notes` for per-patch details.
+#
+# Only lerobot_train.py integration of KD training-loop dispatch is still
+# deferred (run KD via the standalone scripts/knowledge_distillation.py).
+#
+# v0.5.1 patch 0017 (diffusion observation histories) and 0015 (groot config
+# init) are dropped: v0.6.0 implements the diffusion history behavior natively
+# and the groot config class was refactored away.
+0001-Patch-Python-3.11-compatibility.patch
+0002-Extend-compatibility-to-Python-3.10.patch
+0003-compat-backport-typing-Unpack-for-py310.patch
+0004-compat-add-npu-device-detection.patch
+0005-smolvla-improve-graph-export-compatibility.patch
+0006-compat-typing-self-and-unpack-v060-new-policies.patch
+0007-feature-knowledge-distillation.patch
+0008-feature-mt-act-model.patch
+0009-train-act-forward-reduction-none-for-sample-weighting.patch
+0010-train-weighted-training-and-qat.patch
+0011-train-tensorboard-scalar-logging.patch
+0012-train-kd-dispatch-in-lerobot-train.py.patch

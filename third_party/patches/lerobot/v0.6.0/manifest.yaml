@@ -1,0 +1,204 @@
+schema_version: 2
+
+# Top-level tag binding. The setup applier resolves the active tag via
+# `third_party/patches/lerobot/INDEX.yaml`; the resolver fails closed if
+# `lerobot_tag` here does not match the INDEX entry, or if the libs/lerobot
+# submodule HEAD prior to patch application falls outside `lerobot_commit_range`.
+lerobot_tag: v0.6.0
+lerobot_commit_range:
+  min: 30da8e687a6dfc617fcd94afc367ac7071c376ce
+  max: 30da8e687a6dfc617fcd94afc367ac7071c376ce
+
+upstream:
+  repo: https://gitcode.com/openharmony-robot/lerobot.git
+
+patch_stack:
+  generated_from_submodule_branch: ibrobot/lerobot-v0.6.0-patched
+  reference_submodule_commit: 530cb949a7e3cf1e3b9ca9df2bb3b0c4b8e5f8d3
+  local_branch_name: ibrobot/lerobot-v0.6.0-patched
+  application_method: git-am
+
+# Top-level profile dictionary (carried over from v0.5.1). The training-related
+# profiles (training, distillation, mt-act, master-parity-candidates) are
+# retained for forward compatibility but are NOT exercised by any v0.6.0 patch
+# in this phased migration.
+profiles:
+  core: General-purpose desktop / development workloads.
+  ros: Hosts that build and run the IB_Robot ROS 2 graph.
+  hardware: Hosts wired up to physical robotic hardware.
+  dev: Developer workstations (Ubuntu desktop) tolerating extra dependencies.
+  openeuler: openEuler Embedded targets (currently 24.03 aarch64).
+  openharmony: OpenHarmony 5.x device targets.
+  ascend: Hosts with Huawei Ascend NPUs.
+  om: Hosts running Ascend OM-format model artefacts.
+  hisilicon: Hisilicon boards using the manifest-driven worker backend.
+  inference: Inference-only deployments (no training requirements).
+  training: Hosts that run policy training, including weighted-training tweaks.
+  distillation: Hosts that perform knowledge distillation across policies.
+  models: Hosts that need extra model families beyond the upstream set.
+  mt-act: Multi-task ACT policy variant.
+  tooling: Auxiliary tooling shared by the model patches.
+  master-parity-candidates: Migration patches tracked outside the default series.
+
+patch_profiles:
+  - name: default
+    branch_name: ibrobot/lerobot-v0.6.0-patched
+    series_file: series.txt
+    purpose:
+      - Default patch series consumed by setup.sh, filtered by the applier
+        against the active host facts and profile set.
+  - name: master-parity-candidates
+    branch_name: ibrobot/lerobot-v0.6.0-master-parity-candidates
+    series_file: series.master-parity-candidates.txt
+    purpose:
+      - Placeholder for feature-scoped migration patches once they are
+        revalidated against the restructured v0.6.0 training loop. Intentionally
+        empty in this phased migration.
+  - name: openharmony-5.1.0-musl
+    branch_name: ibrobot/lerobot-v0.6.0-openharmony-5.1.0-musl
+    series_file: series.openharmony-5.1.0-musl.txt
+    purpose:
+      - Keep upstream Python 3.12 support intact on the OpenHarmony board
+        runtime.
+      - Apply only the board-validated export-compatibility patch required by
+        the shipped SmolVLA checkpoints.
+
+# Per-patch applicability bounds (schema v2). A patch is applied iff every
+# present predicate matches the active host facts.
+patches:
+  - file: 0001-Patch-Python-3.11-compatibility.patch
+    purpose:
+      - Replace Python 3.12-only generic syntax (PEP 695 `class Foo[T]`, `type X = ...`,
+        `def f[T]()`) with Python 3.10/3.11-compatible `TypeVar` / `Generic` constructs.
+      - Lower project metadata from Python 3.12 to Python 3.11 as the first step in the
+        compatibility stack. Adapted to the v0.6.0 module layout.
+    applies_to:
+      python_max: "<3.12"
+      profiles: [core, ros, hardware, dev, openeuler]
+  - file: 0002-Extend-compatibility-to-Python-3.10.patch
+    purpose:
+      - Lower project metadata from Python 3.11 to Python 3.10.
+    applies_to:
+      python_max: "<3.11"
+      profiles: [core, ros, hardware, dev, openeuler]
+  - file: 0003-compat-backport-typing-Unpack-for-py310.patch
+    purpose:
+      - Replace Python 3.11-only `typing.Unpack` imports with a shared compatibility shim.
+      - Add a conditional `typing-extensions` dependency for Python 3.10 runtimes.
+    applies_to:
+      python_max: "<3.11"
+      profiles: [core, ros, hardware, dev, openeuler]
+  - file: 0004-compat-add-npu-device-detection.patch
+    purpose:
+      - Add torch NPU device recognition to the current upstream device utilities.
+    applies_to:
+      profiles: [ros, hardware, dev, openeuler, ascend, inference]
+  - file: 0005-smolvla-improve-graph-export-compatibility.patch
+    purpose:
+      - Normalize SmolVLA expert position IDs without an integer reduction operation.
+      - Cast SmolVLA boolean padding masks to integers before position ID reductions.
+      - Preserve eager semantics while supporting RKNN and HMM graph export.
+    applies_to:
+      profiles: [core]
+  - file: 0006-compat-typing-self-and-unpack-v060-new-policies.patch
+    purpose:
+      - Backport `typing.Self` and route the new v0.6.0 policy imports (evo1
+        `Unpack`, configs/video.py `Self`) through the typing_compat shim so
+        Python 3.10 hosts can import lerobot. Discovered by runtime validation.
+    applies_to:
+      python_max: "<3.11"
+      profiles: [core, ros, hardware, dev, openeuler]
+  - file: 0007-feature-knowledge-distillation.patch
+    purpose:
+      - Add `kd` / `teacher_train_config` / `decoder_out_dim` config fields and
+        the `compute_kd_loss` forward hooks to ACT, Diffusion, and PI05.
+      - Add the standalone `scripts/knowledge_distillation.py` training entrypoint.
+      - Lets v0.6.0 load KD-trained checkpoints for inference. The
+        `lerobot_train.py` loop integration is still deferred (needs the
+        restructured training-loop port); use the standalone script for KD.
+    applies_to:
+      profiles: [core, ros, hardware, dev, openeuler, openharmony, inference, training, distillation]
+  - file: 0008-feature-mt-act-model.patch
+    purpose:
+      - Restore the mt_act multi-task policy family (FiLM language-conditioned ACT).
+      - Register MTACTConfig / MTACTPolicy in factory.py (model_type, get_policy_class,
+        make_policy_config, make_pre_post_processors).
+    applies_to:
+      profiles: [models, mt-act]
+  - file: 0009-train-act-forward-reduction-none-for-sample-weighting.patch
+    purpose:
+      - Add `reduction="mean"|"none"` to ACTPolicy.forward so v0.6.0's native
+        SampleWeighter (RA-BC) can reweight ACT batches via per-sample losses.
+      - Only the non-redundant core of v0.5.1 0009; v0.6.0 already ships
+        SampleWeighter / SampleWeightingConfig / make_train_eval_datasets.
+    applies_to:
+      profiles: [core, ros, hardware, dev, openeuler, training]
+  - file: 0010-train-weighted-training-and-qat.patch
+    purpose:
+      - Port QuantConstraint (Hisilicon quantization-aware weight clipping) as
+        utils/qat.py, wired into lerobot_train.py behind cfg.weight_clipping.
+      - Add a `custom` SampleWeighter type that loads the dataset `training_weight`
+        column (written by frame_detector) via batch['index'] for static per-frame
+        loss reweighting.
+      - Config knobs weight_clipping / clipping_min / clipping_max.
+    applies_to:
+      profiles: [training, hisilicon, distillation]
+  - file: 0011-train-tensorboard-scalar-logging.patch
+    purpose:
+      - Add a local torch.utils.tensorboard SummaryWriter under
+        cfg.output_dir/tensorboard recording train metrics on log steps and
+        eval_loss on eval steps (v0.6.0 only ships wandb).
+    applies_to:
+      profiles: [core, dev, training, distillation]
+  - file: 0012-train-kd-dispatch-in-lerobot-train.py.patch
+    purpose:
+      - Integrate the KD dispatch into lerobot_train.py update_policy — add a
+        teacher_policy param, dispatch the student forward through the policy
+        teacher hooks (diffusion via teacher_feature, others via teacher_policy),
+        and backward through output_dict['total_kd_loss']. Build the frozen
+        teacher in train() when cfg.policy.kd is set and pass it through.
+      - Completes the v0.5.1 0011 KD migration (0007 added the policy hooks,
+        0012 adds the training-loop dispatch). KD now runs via lerobot-train
+        (with cfg.policy.kd) and via the standalone compression() script.
+    applies_to:
+      profiles: [training, distillation]
+
+notes:
+  - Full migration from v0.5.1. Ports compatibility / inference / export
+    patches plus the training-feature patches (KD, mt_act, sample weighting,
+    QAT, TensorBoard logs). All exported patches were re-validated by `git am`
+    on a clean v0.6.0 checkout (round-trip clean) and the KD checkpoint load
+    + e2e inference were validated on py3.10. Training-runtime regression is
+    left to a dedicated verifier (the ports are v0.6.0-native adaptations).
+  - Training patches are SEMANTIC ports, not textual rebases — upstream v0.6.0
+    restructured the training loop and grew native support for several v0.5.1
+    features, so the ports reuse v0.6.0 infrastructure instead of duplicating
+    it. Per-patch — 0009 reuses the native SampleWeighter (only adds ACT
+    forward reduction='none'); 0010 reuses SampleWeighter for custom weights
+    (adds a 'custom' type) and ports QuantConstraint as a new qat.py; 0011
+    layers TensorBoard add_scalar hooks on v0.6.0's native eval/log path
+    instead of the dropped v0.5.1 val_loader rewrite.
+  - Knowledge distillation is now FULLY ported — 0007 adds the policy-level
+    KD config fields + compute_kd_loss forward hooks + the standalone
+    `knowledge_distillation.py` entry, and 0012 adds the lerobot_train.py
+    update_policy dispatch (teacher_policy param, forward dispatch, total_kd_loss
+    backward, frozen-teacher construction). KD runs via lerobot-train with
+    cfg.policy.kd and via the standalone compression() script.
+  - v0.5.1 patch 0017 (diffusion accept observation histories) is dropped —
+    upstream v0.6.0 implements the same online/offline observation-history
+    behavior natively in `DiffusionPolicy.predict_action_chunk`.
+  - v0.5.1 patch 0015 (groot config generated init) is dropped — the target
+    `GR00TN15Config` dataclass (all `field(init=False)`) was refactored away;
+    the new `GrootConfig` uses normal init fields and does not need the fix.
+  - Patches 0001-0003 are down-grade patches (Python 3.12/3.11 to 3.10); they
+    declare an upper bound and MUST be skipped on hosts whose Python is already
+    3.11 or newer (openEuler 24.03 default 3.11, OpenHarmony 3.12).
+  - Patch 0004 (NPU device detection) is a silent no-op on non-Ascend hosts and
+    is profile-gated (ascend / hardware / inference). The OpenHarmony board
+    series intentionally omits it, matching the v0.5.1 board policy.
+  - The archived v0.5.1 stack under `third_party/patches/lerobot/v0.5.1/`
+    retains the full training patch set for reference and fallback until the
+    training features are re-ported.
+  - The reference_submodule_commit records the current local development
+    result; repeated git-am application produces different commit hashes unless
+    committer identity and dates are reproduced exactly.

@@ -86,8 +86,16 @@ install_lerobot_editable() {
     check_lerobot_ros_numpy_compat
 
     # [smolvla,pi] extras pull in policy-specific deps; kinematics pulls in
-    # placo for SO-101 Placo Cartesian teleop. See libs/lerobot/pyproject.toml.
-    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot[smolvla,pi,kinematics]"
+    # placo for SO-101 Placo Cartesian teleop; diffusion pulls in diffusers
+    # for Diffusion Policy training/inference; dataset pulls in datasets +
+    # torchcodec (video decoding) for training/dataset loading; deepdiff-dep
+    # supplies the deepdiff package lerobot's motors_bus needs (v0.6.0+). We
+    # deliberately use deepdiff-dep rather than the feetech extra because
+    # so101_hardware already provides the Python feetech-servo-sdk via its
+    # setup.py install_requires, and the C++ ftservo_sdk is built by
+    # so101_hardware's CMake for the ros2_control node — neither should be
+    # re-installed via pip here. See libs/lerobot/pyproject.toml.
+    "${pip_runner[@]}" install -e "${WORKSPACE}/libs/lerobot[smolvla,pi,kinematics,diffusion,dataset,deepdiff-dep]"
 }
 
 setup_python_venv() {

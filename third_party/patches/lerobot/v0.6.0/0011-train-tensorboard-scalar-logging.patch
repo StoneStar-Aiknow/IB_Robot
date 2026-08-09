@@ -1,0 +1,68 @@
+From 30f768a7b2bcea8092286f293c67d0d14e16fc96 Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Sat, 8 Aug 2026 18:13:20 +0800
+Subject: [PATCH 11/12] train: add TensorBoard scalar logging (v0.5.1 patch
+ 0014 port)
+
+Port the non-redundant part of v0.5.1 patch 0014 onto v0.6.0. v0.6.0 only
+ships wandb logging; this adds a local torch.utils.tensorboard SummaryWriter
+under cfg.output_dir/tensorboard that records train metrics on log steps and
+eval_loss on eval steps, alongside the existing wandb logger.
+
+The v0.5.1 eval-block rewrite (val_loader/best_eval_loss/best_eval_sign) is
+intentionally dropped: v0.6.0 already has a native eval_dataloader + eval_loss
+path; only the TensorBoard add_scalar hooks are layered on top of it.
+---
+ src/lerobot/scripts/lerobot_train.py | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/src/lerobot/scripts/lerobot_train.py b/src/lerobot/scripts/lerobot_train.py
+index 61b6d93a..db0d22d6 100644
+--- a/src/lerobot/scripts/lerobot_train.py
++++ b/src/lerobot/scripts/lerobot_train.py
+@@ -32,6 +32,7 @@ if TYPE_CHECKING:
+ import torch
+ from termcolor import colored
+ from torch.optim import Optimizer
++from torch.utils.tensorboard import SummaryWriter
+ from tqdm import tqdm
+ 
+ from lerobot.common.train_utils import (
+@@ -406,6 +407,14 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
+     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
+     num_total_params = sum(p.numel() for p in policy.parameters())
+ 
++    # TensorBoard scalar logging (v0.5.1 patch 0014 port). v0.6.0 only ships
++    # wandb; this adds a local SummaryWriter alongside it.
++    writer = None
++    if is_main_process:
++        tb_log_dir = cfg.output_dir / "tensorboard"
++        tb_log_dir.mkdir(parents=True, exist_ok=True)
++        writer = SummaryWriter(log_dir=str(tb_log_dir))
++
+     if is_main_process:
+         logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
+         if cfg.env is not None:
+@@ -620,6 +629,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
+                 if step_time > 0:
+                     train_tracker.samples_per_s = effective_batch_size / step_time
+                 logging.info(train_tracker)
++                if writer is not None:
++                    for metric_name, metric_value in train_tracker.to_dict().items():
++                        if metric_name in train_tracker.metrics:
++                            writer.add_scalar(f"{metric_name}/step", metric_value, step)
+                 if wandb_logger:
+                     wandb_log_dict = train_tracker.to_dict()
+                     if output_dict:
+@@ -651,6 +664,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
+ 
+             if is_main_process:
+                 logging.info(f"step {step}: eval_loss={eval_loss:.4f}")
++                if writer is not None:
++                    writer.add_scalar("Loss/eval", eval_loss, step)
+                 if wandb_logger:
+                     wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
+ 
+-- 
+2.34.1
+

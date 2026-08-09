@@ -1,0 +1,64 @@
+From 8b96f24bc5f6351cc71cb29a8bf69ed20fc13ee0 Mon Sep 17 00:00:00 2001
+From: XiaoqiangWu <wuxiaoqiang.rtos@huawei.com>
+Date: Wed, 5 Aug 2026 09:42:07 +0800
+Subject: [PATCH 06/12] compat: backport typing.Self and Unpack for v0.6.0 new
+ policies
+
+v0.6.0 introduces new policies (evo1) and configs/video.py that import
+typing.Unpack / typing.Self directly. These are Python 3.11+ symbols.
+Extend the typing_compat shim to also export Self, and route the new
+imports through it so py3.10 hosts can import lerobot.
+---
+ src/lerobot/configs/video.py               | 4 +++-
+ src/lerobot/policies/evo1/modeling_evo1.py | 4 +++-
+ src/lerobot/utils/typing_compat.py         | 7 ++++++-
+ 3 files changed, 12 insertions(+), 3 deletions(-)
+
+diff --git a/src/lerobot/configs/video.py b/src/lerobot/configs/video.py
+index 4b956f30..2abae0f5 100644
+--- a/src/lerobot/configs/video.py
++++ b/src/lerobot/configs/video.py
+@@ -20,7 +20,9 @@ from __future__ import annotations
+ 
+ import logging
+ from dataclasses import dataclass, field
+-from typing import Any, ClassVar, Self
++from typing import Any, ClassVar
++
++from lerobot.utils.typing_compat import Self
+ 
+ import numpy as np
+ 
+diff --git a/src/lerobot/policies/evo1/modeling_evo1.py b/src/lerobot/policies/evo1/modeling_evo1.py
+index a81a0705..ac6401e2 100644
+--- a/src/lerobot/policies/evo1/modeling_evo1.py
++++ b/src/lerobot/policies/evo1/modeling_evo1.py
+@@ -18,7 +18,9 @@ import builtins
+ from collections import deque
+ from contextlib import nullcontext
+ from pathlib import Path
+-from typing import TypedDict, Unpack
++from typing import TypedDict
++
++from lerobot.utils.typing_compat import Unpack
+ 
+ import torch
+ from torch import Tensor
+diff --git a/src/lerobot/utils/typing_compat.py b/src/lerobot/utils/typing_compat.py
+index e02ffcb0..c19b5744 100644
+--- a/src/lerobot/utils/typing_compat.py
++++ b/src/lerobot/utils/typing_compat.py
+@@ -5,4 +5,9 @@ try:
+ except ImportError:
+     from typing_extensions import Unpack
+ 
+-__all__ = ["Unpack"]
++try:
++    from typing import Self
++except ImportError:
++    from typing_extensions import Self
++
++__all__ = ["Unpack", "Self"]
+-- 
+2.34.1
+
