@@ -260,7 +260,6 @@ _SCHEMA: dict[str, Any] = {
             "enabled": _bool(),
             "approach_axis_ee": _vector(nonzero=True),
             "closing_axis_180_symmetric": _bool(),
-            "joint5_abs_max": _POSITIVE,
             "joint5_constraints_enabled": _bool(),
             "joint5_home_max_delta_rad": _number(0.0, math.pi, exclusive_minimum=True),
             "joint5_limit_epsilon_rad": _NON_NEGATIVE,
