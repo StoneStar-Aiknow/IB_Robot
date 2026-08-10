@@ -265,8 +265,8 @@ effective_center = fixed_finger_contact_ee
 因此固定指必须位于物体朝机器人一侧，移动指从外侧闭合。无法获得可靠目标宽度区间时也会拒绝，
 避免在固定指方向未知时继续执行。
 
-`target_gripper.fixed_finger_robust_gap` 在候选 IK/FK 准备阶段执行硬检查。它把预测接触点残差投影到
-实际闭合轴，并计算：
+候选 IK/FK 准备阶段会把预测接触点残差投影到实际闭合轴，并按
+`target_gripper.fixed_finger_robust_gap` 的参数计算预测余量：
 
 ```text
 effective_gap = fixed_finger_gap_m + contact_error_along_closing_axis_m
@@ -275,13 +275,11 @@ gap_deficit = max(0, required_gap - effective_gap)
 pass = gap_deficit <= measurement_tolerance_m
 ```
 
-朝固定指方向的误差为负，会缩小 `effective_gap`。SO101 默认最多允许相对目标间隙损失 `0.003 m`，并给
-IK/FK、TF 和舵机误差保留 `0.001 m` 容差；超过该范围的候选在 approach/descend 之前拒绝。候选准备阶段的
-`robust_gap_headroom` 仍记录未经容差放宽的原始余量用于排序。
-
-下降运动成功即进入 commit-to-grasp 状态：`close_gripper` 是下降后的第一条动作；低位实测在闭爪后继续以
-best-effort 方式写入 pose diagnostics，诊断异常不会阻止闭爪或后续验证。执行器不再退回 pregrasp 或切换
-候选。这样所有可恢复的候选淘汰都发生在低位运动之前，避免机械臂到达物体后因边界测量噪声突然上升。
+朝固定指方向的误差为负，会缩小 `effective_gap`。准备阶段不会据此执行硬拒绝，而是把未经容差放宽的
+`robust_gap_headroom` 交给 `prepared_candidate_scoring` 做软排序。启用
+`target_gripper.fixed_finger_robust_gap.enabled` 时，执行器在下降完成后、闭爪前用低位实测接触残差再次执行
+同一计算；测量不可用或门禁失败会先撤回 pregrasp，再以 `FIXED_FINGER_ROBUST_GAP_REJECTED` 切换候选。
+当前两个 SO101 RealSense 抓取 profile 都将该开关设为 `false`，因此下降后直接闭爪。
 
 `candidate_target_offset_base_m` 是候选目标在 `base_frame` 中的三轴平移补偿。它统一作用于 grasp、approach、
 lift 和规划接触点，不改变相机测得的物体宽度端点。SO101 hand-eye profile 使用旧 310P marker test
@@ -296,7 +294,7 @@ lift 和规划接触点，不改变相机测得的物体宽度端点。SO101 han
 ik_orientation_guard:
   enabled: true
   approach_axis_ee: [0.0, 0.0, 1.0]
-  closing_axis_180_symmetric: true
+  closing_axis_180_symmetric: false
   joint5_home_max_delta_rad: 1.5707963267948966
   joint5_limit_epsilon_rad: 0.001
   joint5_stage_continuity: true
@@ -304,7 +302,7 @@ ik_orientation_guard:
   max_approach_error_deg: 25.0
   max_closing_error_deg: 20.0
   moveit_orientation_search:
-    enabled: true
+    enabled: false
     approach_tolerance_deg: 15.0
     free_rotation_tolerance_deg: 180.0
     constraint_weight: 1.0
@@ -316,8 +314,8 @@ HOME joint5 由同一 robot YAML 的 `ros2_control.reset_positions["5"]` 提供�
 joint5 当作抓取安全原点；候选选定以后，approach、pregrasp、grasp 和 lift 才使用阶段连续性门阻止真正的
 半圈翻腕。Hermes 与监督式客户端都向同一个 `/manipulation/execute_pick` 发送 `PickObject` goal。
 
-MoveIt LMA 仍使用 `position_only_ik: true`。只有初始 FK 接近轴超过 25°硬阈值时，执行器才把上述
-当前 SO101 profile 不启用 `moveit_orientation_search`。LMA 已配置为 position-only，OrientationConstraint
+MoveIt LMA 仍使用 `position_only_ik: true`。当前 SO101 profile 不启用
+`moveit_orientation_search`。OrientationConstraint
 不会为 5-DOF 机械臂创造额外自由度，反而可能把本应由最终 FK 门禁解释的姿态误差变成 `NO_IK_SOLUTION`。
 最终 IK/FK 结果仍必须通过 25°/20° 硬门禁。
 
@@ -374,7 +372,8 @@ moveit:
 候选规划姿态计算固定指到目标前缘的间隙，并以动态 margin 为期望值计算包络分数。该分数与
 接触点 XY/Z 质量、目标体积质心距离和 GraspGen 置信度加权。`robust_gap_headroom_weight` 和
 `robust_gap_headroom_scale_m` 进一步把 IK/FK 预测接触残差对应的安全间隙余量归一化后纳入排序；
-软排序本身只改变执行顺序；启用 `fixed_finger_robust_gap` 时，同一预测余量还会在运动前执行独立硬门禁。
+软排序本身只改变执行顺序。启用 `fixed_finger_robust_gap` 时，独立硬门禁使用下降后的低位实测残差，
+不直接使用准备阶段的预测余量。
 
 ## 控制模式配置
 
@@ -427,43 +426,6 @@ robot:
 多设备遥操作时，`active_devices` 按名称选择 `devices` 中的多个输入设备。每个
 设备可通过 `target` 指定要控制的关节组和控制器命令话题；未指定时回退到机器人级
 `joints.arm` / `joints.gripper` 以及默认单臂控制器话题。
-`target.arm_command_topic` 与 `target.gripper_command_topic` 同时构成控制权边界：每个
-活动设备必须独占它实际发布的手臂和夹爪控制器话题，任一话题被两个活动设备共享都会在
-启动前报错。SO-101 VR 的夹爪话题由 `vr_config.so101_gripper_topic` 指定；其 Placo 手臂
-输出当前使用标准 `/arm_position_controller/commands`。因此双臂等多设备配置必须同时拆分
-arm 和 gripper 两类话题，不能只拆分手臂话题。
-当前 SO-101 Placo 是按目标手臂唯一的执行资源，同一 launch 最多选择一个 Phone、
-SO-101 VR 或 Xbox Cartesian 输入；多个 leader 等非 Cartesian 输入不受此限制。
-
-手机设备只使用内置 WebPhone；显式配置时 `phone_config.backend` 必须为 `webphone`。HTTPS/WSS
-端口、TLS 文件和 `command_stale_s` 必须定义在 `phone_config.web` 中；启动构建器会
-校验端口、超时和证书/密钥配对，并将设备级 `control_frequency` 原样传给节点。
-WebPhone 还要求 `command_stale_s + 1 / control_frequency <= 0.22s`；该式约束
-“检测并发起 stop 请求”的时间，不是机械臂物理停止的硬实时保证。默认 stale 为
-0.18s，50Hz 配置可显式使用 0.2s。
-WebPhone 统一使用 Placo clutch 相对位姿契约：浏览器可提供 WebXR AR 位姿，或在不支持
-WebXR 时提供光流虚拟位姿；两条跟踪路径都不再把位姿微分成速度。
-Phone 因此要求 `teleoperation.cartesian.solver: placo_servo`，不提供速度模式
-开关；旧配置中 `input_mode: pose` 仍可读取，`velocity` 会在启动前报错。Phone 使用相对
-基线位姿，因此 `end_effector_bounds` 的每个轴必须严格满足 `min < 0 < max`。
-手机使用的 Placo `position_only` 位于
-`teleoperation.cartesian.placo_servo.position_only`；launch 会把解析后的配置传给手机的
-Placo 链路。遥操作 Home 的唯一目标来自 `ros2_control.reset_positions`；launch 按所选手臂
-关节顺序校验并注入 Placo。Phone 与 SO-101 VR 都调用同一个
-`/so101_placo_servo_node/return_home` Action，并等待新鲜 `/joint_states` 的最大关节误差连续
-稳定后得到终态，不再使用 Cartesian named pose、状态话题或固定等待时间。launch 还会将
-`command_stale_s` 注入 Phone 专用 Placo 命令租约；VR/Xbox 的 YAML 默认租约为关闭。
-该租约只在 Phone 本周期取得有效控制命令或正在执行受控 Home 时续租；空输入、传输/转换
-异常不会用“进程仍存活”冒充有效命令。Home 要求 `reset_positions` 覆盖全部选中手臂关节、
-数值有限且位于 Placo 关节限位内；Phone 启动会拒绝 MoveIt Servo，因为 Phone 固定使用
-Placo pose 且 Home 由 Placo 执行。Home 终态后仍要求
-deadman 松开再按，运行期间夹爪保持最后目标。launch 还会把 `safety.estop_topic` 同时注入
-Placo 与独立 VR 节点，使该路径满足 `E-stop > Home/start/pose/twist`，不依赖 `TeleopNode` 转发急停。
-手机 pose 模式还必须至少启用 WebXR AR 或光流降级之一。
-
-WebPhone 不提供账号鉴权，仅支持受信内部网络。Origin 和单客户端限制不等于身份认证；
-禁止公网映射、反向/云隧道、访客 Wi-Fi 和不可信 VPN，建议通过独立控制网段及防火墙限制
-HTTP/WSS 端口来源，并在不使用遥操时停止服务。
 
 **启动命令：**
 ```bash

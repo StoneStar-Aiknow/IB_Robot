@@ -87,7 +87,7 @@ def test_missing_goal_response_recovers_result_by_original_uuid(monkeypatch):
     assert observed["accepted"] is True
 
 
-def test_repeat_reuses_one_action_client(monkeypatch):
+def test_main_sends_exactly_one_goal(monkeypatch):
     instances = []
 
     class FakePickActionClient:
@@ -107,25 +107,25 @@ def test_repeat_reuses_one_action_client(monkeypatch):
     monkeypatch.setattr(pick_action_client, "PickActionClient", FakePickActionClient)
     monkeypatch.setattr(pick_action_client.rclpy, "init", lambda args=None: None)
     monkeypatch.setattr(pick_action_client.rclpy, "shutdown", lambda: None)
-    monkeypatch.setattr(pick_action_client.time, "sleep", lambda _seconds: None)
 
     pick_action_client.main(
         [
             "--prompt",
             "marker",
             "--task-id",
-            "repeat-test",
-            "--repeat",
-            "3",
-            "--repeat-delay-s",
-            "0.5",
+            "single-test",
         ]
     )
 
     assert len(instances) == 1
-    assert [call["task_id"] for call in instances[0].calls] == [
-        "repeat-test-01",
-        "repeat-test-02",
-        "repeat-test-03",
-    ]
+    assert [call["task_id"] for call in instances[0].calls] == ["single-test"]
     assert instances[0].destroyed is True
+
+
+def test_parser_does_not_expose_repeat_options():
+    option_strings = {
+        option for action in pick_action_client.build_parser()._actions for option in action.option_strings
+    }
+
+    assert "--repeat" not in option_strings
+    assert "--repeat-delay-s" not in option_strings

@@ -53,6 +53,8 @@ def test_joint5_helpers_select_equivalent_closing_axis_branch():
 
     assert math.isclose(correction, math.pi / 3.0, abs_tol=1e-8)
     assert math.isclose(canonicalize_joint5(2.0 * math.pi / 3.0), -math.pi / 3.0, abs_tol=1e-8)
+    assert math.isclose(canonicalize_joint5(1.2, center=0.5), 1.2, abs_tol=1e-8)
+    assert math.isclose(canonicalize_joint5(2.2, center=0.5), 2.2 - math.pi, abs_tol=1e-8)
 
 
 @pytest.mark.parametrize(
@@ -100,6 +102,19 @@ def test_joint5_branch_continuity_uses_same_branch_policy():
 )
 def test_joint5_within_abs_limit(joint5, limit, expected):
     assert joint5_within_abs_limit(joint5, limit) is expected
+
+
+def test_joint5_home_limit_allows_epsilon_at_configured_2_rad():
+    limit = 2.0
+
+    assert joint5_within_abs_limit(limit + 0.0005, limit, epsilon=0.001)
+    assert joint5_within_abs_limit(-limit - 0.0005, limit, epsilon=0.001)
+    assert not joint5_within_abs_limit(limit + 0.002, limit, epsilon=0.001)
+
+
+def test_joint5_home_limit_uses_configured_center():
+    assert joint5_within_abs_limit(0.6, 0.2, center=0.5)
+    assert not joint5_within_abs_limit(0.8, 0.2, center=0.5)
 
 
 def test_apply_joint5_retry_skips_when_guard_is_inactive_or_branch_is_already_bounded():
@@ -206,3 +221,38 @@ def test_apply_joint5_retry_respects_custom_flip_threshold():
 
     assert not skipped.retried
     assert retried.retried and retried.passed
+
+
+def test_apply_joint5_retry_does_not_retry_exact_limit_plus_epsilon_boundary():
+    center = 0.4
+    limit = 2.0
+    epsilon = 0.001
+    solution = _joint_state(center + limit + epsilon)
+
+    result = apply_joint5_retry(
+        joint_state=solution,
+        safety_limit=limit,
+        solve_ik=lambda _seed: pytest.fail("accepted boundary must not retry"),
+        joint_position=_joint_position,
+        joint_state_with_joint5=_joint_state_with_joint5,
+        flip_threshold=limit + epsilon,
+        safety_center=center,
+        safety_epsilon=epsilon,
+    )
+
+    assert not result.retried
+    assert result.passed
+
+
+def test_apply_joint5_retry_canonicalizes_around_home_center():
+    result = apply_joint5_retry(
+        joint_state=_joint_state(2.2),
+        safety_limit=math.pi / 2.0,
+        solve_ik=lambda seed: seed,
+        joint_position=_joint_position,
+        joint_state_with_joint5=_joint_state_with_joint5,
+        safety_center=0.5,
+    )
+
+    assert result.retried and result.passed
+    assert result.retry_joint5 == pytest.approx(2.2 - math.pi)

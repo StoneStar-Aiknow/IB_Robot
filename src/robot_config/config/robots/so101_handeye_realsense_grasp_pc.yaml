@@ -261,7 +261,7 @@ robot:
       tabletop_filter: true
       # Matches the proven supervised banana-pick command while retaining a
       # hard fail-closed mesh check when the fitted plane is unavailable.
-      tabletop_clearance_m: -0.020
+      tabletop_clearance_m: -0.025
       tabletop_sweep_steps: 5
       mesh_package: robot_description
       mesh_directory: meshes/lerobot/so101
@@ -287,8 +287,6 @@ robot:
         # contact error into contact_realign, which cannot cancel it by
         # translating and therefore accumulates until max_correction_m trips.
         closing_axis_180_symmetric: false
-        # PR259 phase contract: bound the canonical joint-5 branch directly.
-        joint5_abs_max: 2.0
         # Enforce joint5 HOME, branch continuity, retry, and closing-axis gates.
         joint5_constraints_enabled: true
         # HOME joint5 comes from ros2_control.reset_positions["5"]. Initial
@@ -330,7 +328,7 @@ robot:
         # and grasp on the first attempt without a rejection/retry cycle.
         enabled: false
         max_target_gap_deficit_m: 0.003
-        # Absorb millimetre-scale IK/FK, TF, and servo uncertainty before descent.
+        # Absorb millimetre-scale IK/FK, TF, and servo uncertainty before closing.
         measurement_tolerance_m: 0.001
       width_clearance_m: 0.003
       min_width_m: 0.008
@@ -464,7 +462,7 @@ robot:
         position: {x: 0.020030733201442157, y: -0.11809839488683391, z: 0.13887055751050842}
         orientation: {x: -0.26790866048257905, y: -0.2622185975709204, z: -0.6525133891660432, w: 0.6585534402654153}
       observe_table:
-        position: {x: 0.10, y: -0.16, z: 0.22}
+        position: {x: 0.0, y: -0.18, z: 0.22}
         orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}
       zero:
         position: {x: 0.0210077843415008, y: -0.278950111258735, z: 0.24858389783148477}

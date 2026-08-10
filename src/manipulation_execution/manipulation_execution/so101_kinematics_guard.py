@@ -31,15 +31,16 @@ def _normalized_axis(value: Iterable[float]) -> np.ndarray:
     return vector / norm
 
 
-def canonicalize_joint5(joint5: float) -> float:
-    """Map SO101 joint5 onto the equivalent half-turn branch nearest zero."""
+def canonicalize_joint5(joint5: float, center: float = 0.0) -> float:
+    """Map SO101 joint5 onto the equivalent half-turn branch nearest ``center``."""
 
-    value = float(joint5)
+    center_value = float(center)
+    value = float(joint5) - center_value
     while value > math.pi / 2.0:
         value -= math.pi
     while value < -math.pi / 2.0:
         value += math.pi
-    return value
+    return value + center_value
 
 
 def joint5_closing_axis_correction(
@@ -105,12 +106,20 @@ def joint5_branch_continuity_check(
     return not joint5_branch_filter_check(seed_joint5, solution_joint5, threshold)
 
 
-def joint5_within_abs_limit(joint5: float | None, limit: float | None) -> bool:
-    """Return whether joint5 is within the grasp-specific absolute execution limit."""
+def joint5_within_abs_limit(
+    joint5: float | None,
+    limit: float | None,
+    *,
+    center: float = 0.0,
+    epsilon: float = 0.0,
+) -> bool:
+    """Return whether joint5 is within ``limit`` of the configured HOME center."""
 
     if limit is None or joint5 is None:
         return True
-    return abs(float(joint5)) <= float(limit)
+    delta = abs(float(joint5) - float(center))
+    boundary = float(limit) + max(0.0, float(epsilon))
+    return delta <= boundary or math.isclose(delta, boundary, rel_tol=0.0, abs_tol=1e-12)
 
 
 @dataclass(frozen=True)
@@ -133,23 +142,41 @@ def apply_joint5_retry(
     joint_position: Callable[[JointState, str], float | None],
     joint_state_with_joint5: Callable[[JointState, float], JointState],
     flip_threshold: float = math.pi / 2.0,
+    safety_center: float = 0.0,
+    safety_epsilon: float = 0.0,
 ) -> Joint5RetryResult:
-    """Retry IK after canonicalizing a branch-flipped SO101 joint5 seed."""
+    """Retry IK after canonicalizing a branch-flipped SO101 joint5 seed around HOME."""
 
     if safety_limit is None:
         return Joint5RetryResult(joint_state, None, False, None, None, True)
 
     original_joint5 = joint_position(joint_state, "5")
-    if original_joint5 is None or abs(original_joint5) <= float(flip_threshold):
+    original_delta = None if original_joint5 is None else abs(original_joint5 - float(safety_center))
+    threshold = float(flip_threshold)
+    if (
+        original_delta is None
+        or original_delta <= threshold
+        or math.isclose(
+            original_delta,
+            threshold,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
         return Joint5RetryResult(joint_state, None, False, None, None, True)
 
-    retry_seed = joint_state_with_joint5(joint_state, canonicalize_joint5(original_joint5))
+    retry_seed = joint_state_with_joint5(joint_state, canonicalize_joint5(original_joint5, safety_center))
     retry_solution = solve_ik(retry_seed)
     if retry_solution is None:
         return Joint5RetryResult(joint_state, original_joint5, True, None, None, False)
 
     retry_joint5 = joint_position(retry_solution, "5")
-    passed = retry_joint5 is not None and joint5_within_abs_limit(retry_joint5, safety_limit)
+    passed = retry_joint5 is not None and joint5_within_abs_limit(
+        retry_joint5,
+        safety_limit,
+        center=safety_center,
+        epsilon=safety_epsilon,
+    )
     return Joint5RetryResult(
         retry_solution if passed else joint_state,
         original_joint5,
