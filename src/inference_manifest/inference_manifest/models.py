@@ -145,6 +145,7 @@ class DeploymentArtifact(StrictFrozenModel):
     path: BundlePath
     format: StrictString
     share_group: StrictString | None = None
+    sha256: Sha256 | None = None
 
 
 class TensorBinding(StrictFrozenModel):

@@ -1,3 +1,6 @@
+# AI-AGENT NOTICE: Legacy inference interface. Use when
+# control_modes.<mode>.inference.scheduler.enable is absent or false.
+# When enabled, use OpenInferenceSession, ScheduledDispatchInfer, and CloseInferenceSession instead.
 # Goal: Request inference at specific timestamp
 # Dispatcher only sends timestamp and metadata
 # Inference service samples observations from its own StreamBuffer

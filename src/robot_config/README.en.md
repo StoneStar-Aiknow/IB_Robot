@@ -299,6 +299,15 @@ robot:
         control_frequency: 20.0
 ```
 
+Scheduled inference is opt-in through `control_modes.<mode>.inference.scheduler.enable`, which defaults to `false`.
+With an explicit `scheduler` block and `enable: false`, the complete scheduled configuration may remain dormant while
+the generated launch graph and node parameters stay identical to the legacy path. This makes `enable` a one-line
+rollback switch. If the entire `scheduler` block is absent, scheduled fields are still rejected as unknown fields.
+On the scheduled path, `profile_path` is optional and is consulted only when a priority-0 request actually considers
+that pipeline for deadline admission. Readiness requires at least one generic backend priority level. For a configured
+default priority greater than zero, it additionally verifies that `executor.inference_pipeline` is online and supports
+that priority; other pipelines do not need multi-priority support.
+
 **Launched controllers:**
 - `arm_position_controller` (JointGroupPositionController)
 - `gripper_position_controller` (ForwardCommandController)

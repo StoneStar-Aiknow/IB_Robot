@@ -69,12 +69,14 @@ def _request(
     prompt: str | None = None,
     deadline: datetime | None = None,
     value: float = 1.0,
+    priority: int = 0,
 ) -> InferenceRequest:
     return InferenceRequest(
         request_id=request_id,
         inputs={"observation.state": np.full((1, 6), value, dtype=np.float32)},
         prompt=prompt,
         deadline=deadline,
+        priority=priority,
     )
 
 
@@ -295,6 +297,16 @@ def test_native_pipeline_loads_hooks_passes_canonical_inputs_and_standardizes_re
     assert diagnostics.metadata["bundle"] == "test-cpu"
     pipeline.close()
     assert trace[-3:] == ["close:backend", "close:postprocessor", "close:preprocessor"]
+
+
+def test_pipeline_preserves_request_priority_for_backend(tmp_path):
+    pipeline, backend = _native_pipeline(tmp_path / "bundle", "policy")
+    pipeline.load()
+
+    pipeline.infer(_request(priority=7))
+
+    assert backend.requests[0].priority == 7
+    pipeline.close()
 
 
 def test_pipeline_merges_control_inputs_after_preprocessing_and_captures_raw_action(tmp_path):
@@ -1131,10 +1143,51 @@ def test_backend_inference_failure_moves_pipeline_to_failed(tmp_path):
     backend.result_factory = fail
     pipeline.load()
 
-    with pytest.raises(BackendInferenceError, match="device lost"):
+    with pytest.raises(BackendInferenceError, match="device lost") as error:
         pipeline.infer(_request())
 
+    assert error.value.operation_started is True
+    assert error.value.outcome_known is True
     assert pipeline.state is PipelineState.FAILED
+    pipeline.close()
+
+
+def test_preprocessor_failure_is_reported_before_backend_execution(tmp_path):
+    class FailingProcessor(RecordingProcessor):
+        def __call__(self, inputs):
+            raise ValueError("invalid observation")
+
+    pipeline, _backend = _native_pipeline(
+        tmp_path / "bundle",
+        "policy",
+        preprocessor=FailingProcessor("preprocessor"),
+    )
+    pipeline.load()
+
+    with pytest.raises(ValueError, match="invalid observation") as error:
+        pipeline.infer(_request())
+
+    assert error.value.operation_started is False
+    assert error.value.outcome_known is True
+    pipeline.close()
+
+
+def test_backend_admission_rejection_preserves_nonrecoverable_certainty(tmp_path):
+    class RejectingBackend(MockBackend):
+        def _validate_request(self, request: InferenceRequest) -> None:
+            raise BackendAdmissionError("priority unsupported", code="unsupported_priority")
+
+    backend = RejectingBackend("rejecting")
+    pipeline, _ = _native_pipeline(tmp_path / "bundle", "policy", backend=backend)
+    pipeline.load()
+
+    with pytest.raises(BackendAdmissionError, match="priority unsupported") as error:
+        pipeline.infer(_request(priority=8))
+
+    assert error.value.operation_started is False
+    assert error.value.outcome_known is True
+    assert error.value.recoverable is False
+    assert pipeline.state is PipelineState.READY
     pipeline.close()
 
 

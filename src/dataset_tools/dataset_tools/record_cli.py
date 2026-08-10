@@ -26,6 +26,7 @@ class RecordCLI(Node):
 
         self.declare_parameter("dispatcher_reset_service", "/action_dispatcher/reset")
         self.declare_parameter("policy_reset_service", "/inference/policy/reset")
+        self.declare_parameter("restart_session_service", "")
         self.declare_parameter("reset_timeout_sec", 2.0)
         self.declare_parameter("control_mode", "teleop")
         self.declare_parameter("reset_before_episode", "auto")
@@ -49,6 +50,8 @@ class RecordCLI(Node):
             Trigger,
             self.get_parameter("policy_reset_service").value,
         )
+        restart_service = str(self.get_parameter("restart_session_service").value)
+        self._restart_session_client = self.create_client(Trigger, restart_service) if restart_service else None
         # Service client to get dataset info
         self._info_client = self.create_client(Trigger, "record_episode/get_info")
         self._last_episode_client = self.create_client(Trigger, "record_episode/get_last_episode")
@@ -63,8 +66,11 @@ class RecordCLI(Node):
         self._goal_rejected_evt.clear()
         self._last_result_success = False
         self._last_result_message = ""
-        if self._should_reset_before_episode():
-            self.prepare_new_episode()
+        if self._should_reset_before_episode() and not self.prepare_new_episode():
+            self._last_result_message = "inference session restart failed"
+            self._goal_rejected_evt.set()
+            self._episode_finished_evt.set()
+            return
 
         goal_msg = RecordEpisode.Goal()
         goal_msg.prompt = prompt_text
@@ -136,15 +142,54 @@ class RecordCLI(Node):
         except Exception as e:
             self.get_logger().error(f"Cancel service call failed: {e}")
 
-    def prepare_new_episode(self):
-        """Best-effort reset so a new episode reuses clean policy/dispatcher state."""
-        # Prefer dispatcher reset because it clears queued action chunks and then
-        # asks inference_service to clear policy-local caches. The direct policy
-        # reset remains a fallback for deployments that start record_cli without
-        # action_dispatch.
+    def prepare_new_episode(self) -> bool:
+        """Best-effort reset so a new episode reuses clean inference/dispatcher state.
+
+        When the inference scheduler is enabled, record_cli must call the
+        ScheduledActionDispatcher restart_session service (safe-stop + Close
+        old session + Open new UUID) and must NOT call the direct policy reset
+        fallback, so it cannot bypass the Close barrier. When the scheduler is
+        disabled/absent, the legacy dispatcher-reset -> policy-reset chain is kept.
+        The scheduled endpoint must be passed explicitly by a scheduler-enabled
+        launch. Its empty default preserves the legacy call sequence and timing.
+        """
+        if self._restart_session_client is not None:
+            if self._restart_session():
+                return True
+            # restart_session failed: do not fall through to direct policy reset
+            # on the scheduled path (would bypass Close). Surface the failure.
+            self.get_logger().error("restart_session failed; not falling back to direct policy reset on scheduled path")
+            return False
+        # legacy/disabled branch
         if self._reset_dispatcher_state():
-            return
+            return True
         self._reset_policy_state()
+        return True
+
+    def _restart_session(self) -> bool:
+        assert self._restart_session_client is not None
+        if not self._restart_session_client.wait_for_service(timeout_sec=self._reset_timeout_s):
+            self.get_logger().warning("restart_session service disappeared mid-call")
+            return False
+        try:
+            future = self._restart_session_client.call_async(Trigger.Request())
+        except Exception as e:
+            self.get_logger().warning(f"restart_session call failed: {e}")
+            return False
+        if not self._wait_for_future(future, timeout_sec=self._reset_timeout_s):
+            self.get_logger().warning("restart_session call timed out.")
+            return False
+        try:
+            response = future.result()
+        except Exception as e:
+            self.get_logger().warning(f"restart_session call failed: {e}")
+            return False
+        if response is not None and response.success:
+            self.get_logger().info("Inference session restarted for new episode.")
+            return True
+        message = response.message if response is not None else ""
+        self.get_logger().warning(f"restart_session failed. {message}")
+        return False
 
     def _should_reset_before_episode(self) -> bool:
         override = str(self.get_parameter("reset_before_episode").value).strip().lower()

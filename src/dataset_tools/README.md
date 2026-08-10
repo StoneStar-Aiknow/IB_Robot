@@ -170,7 +170,25 @@ Prompt > q          # 退出
 ros2 run dataset_tools record_cli --ros-args -p control_mode:=model_inference
 ```
 
-此时每个 episode 开始前会优先调用 `/action_dispatcher/reset` 清理动作队列，并由 `action_dispatcher` best-effort 触发推理侧 policy 状态重置。可通过 `reset_before_episode`、`dispatcher_reset_service`、`policy_reset_service` 和 `reset_timeout_sec` 参数覆写对应行为、服务名和等待时间。
+此时每个 episode 开始前会重置推理/分发器状态。`robot.launch.py` 在 episodic 模式下会打印与当前 scheduler
+分支匹配的完整 `record_cli` 命令；客户端不通过 ROS service 是否存在来猜测：
+
+- **调度启用路径**：显式传入
+  `-p restart_session_service:=/action_dispatcher/restart_session`。record_cli 调用它执行 safe-stop + Close 旧
+  session + Open 新 UUID；失败时不会回退到 direct policy reset，避免绕过 Close 屏障。
+- **legacy/关闭路径**：`restart_session_service` 默认为空。record_cli 优先调用
+  `/action_dispatcher/reset` 清理动作队列，并由 legacy dispatcher best-effort 触发 pipeline `/reset`；无
+  dispatcher 时回退到 direct policy reset。
+
+Scheduler-enabled 录制命令：
+
+```bash
+ros2 run dataset_tools record_cli --ros-args \
+  -p control_mode:=model_inference \
+  -p restart_session_service:=/action_dispatcher/restart_session
+```
+
+可通过 `reset_before_episode`、`dispatcher_reset_service`、`policy_reset_service`、`restart_session_service` 和 `reset_timeout_sec` 参数覆写对应行为、服务名和等待时间。
 
 录制完成后，推荐直接把整个 dataset 根目录转换成 LeRobot v3 数据集：
 

@@ -1,0 +1,22 @@
+# AI-AGENT NOTICE: Scheduled-only interface. Use only when
+# control_modes.<mode>.inference.scheduler.enable=true. Do not use on the legacy inference path.
+# Goal: Open a product inference session or a pipeline-local binding.
+# session_id is a caller-generated UUID4. Routing belongs exclusively to each
+# ScheduledDispatchInfer request; Open never selects a model or fallback chain.
+string<=36 session_id
+builtin_interfaces/Time deadline
+---
+# Result. Global logical Open leaves pipeline identity fields empty. A
+# pipeline-scoped Open fills them for Global's private binding validation.
+bool success
+string<=36 session_id
+string<=63 actual_pipeline_id
+uint64 session_generation
+string<=64 deployment_fingerprint
+string<=64 runtime_policy_fingerprint
+builtin_interfaces/Time lease_expires_at
+ibrobot_msgs/InferenceOutcome outcome
+ibrobot_msgs/ScheduledInferenceError error
+---
+# Feedback (not used for correctness)
+string<=128 status

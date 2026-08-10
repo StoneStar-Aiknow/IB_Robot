@@ -1,0 +1,37 @@
+# AI-AGENT NOTICE: Scheduled-only interface. Use only when
+# control_modes.<mode>.inference.scheduler.enable=true. Do not use on the legacy inference path.
+# Goal: Scheduled action dispatch within an active session.
+# request_id is a session-unique UUID4. priority is a backend-agnostic non-negative
+# int32: 0 is highest priority, and larger values are lower priority. Backends expose
+# their supported level count; a single-priority backend accepts only 0.
+# Global applies fallback_chain and the caller deadline only when priority is 0.
+# Non-zero, lower-priority requests dispatch target_pipeline_id directly under an internal timeout.
+# negative rejected at Scheduler and pipeline. Zero obs_timestamp means the target
+# pipeline captures its own observation clock on goal receipt.
+builtin_interfaces/Time obs_timestamp
+string<=4096 prompt
+string<=36 request_id
+string<=36 session_id
+uint64 session_generation
+string<=63 target_pipeline_id
+string<=63[<=32] fallback_chain
+builtin_interfaces/Time deadline
+int32 priority
+---
+# Result
+ibrobot_msgs/VariantsList action_chunk
+int32 chunk_size
+bool success
+float64 inference_latency_ms
+string<=63 pipeline_id
+string<=36 session_id
+uint64 session_generation
+string<=36 request_id
+string<=64 deployment_fingerprint
+string<=64 runtime_policy_fingerprint
+float64 backend_latency_ms
+ibrobot_msgs/InferenceOutcome outcome
+ibrobot_msgs/ScheduledInferenceError error
+---
+# Feedback (not used for correctness)
+string<=128 status

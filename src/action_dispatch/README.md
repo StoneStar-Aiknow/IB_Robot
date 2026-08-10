@@ -6,6 +6,27 @@
 
 本包提供了一个高效的动作分发机制，用于将具身智能模型输出的动作分发给机器人控制器。支持 Action Chunking 模型（如 ACT、Diffusion Policy）的跨帧平滑功能，确保连续推理输出之间的平滑过渡。
 
+本包包含两个互斥 executable，具体选择只来自
+`control_modes.<mode>.inference.scheduler.enable`：
+
+- 缺失或 `false`：启动 `action_dispatcher_node`，沿
+  `executor.inference_pipeline -> DispatchInfer /dispatch + /reset` 工作，行为与原路径一致。
+- `true`：启动 `scheduled_action_dispatcher_node`，等待 Global readiness 后依次使用
+  `OpenInferenceSession`、`ScheduledDispatchInfer` 和 `CloseInferenceSession`。Open 只建立逻辑 session，
+  不携带模型或 fallback；dispatcher 拥有单个 product session，
+  校验所有结果 identity；terminal failure 或 `UNKNOWN` 会先清空队列/平滑器并发布 safe-stop，再 Close 并进入
+  `FAILED`。每次 Dispatch 都显式携带 target、priority 和新的绝对 deadline；priority-0 还携带 fallback chain。
+  只有适合重试的 recoverable `NOT_STARTED` 才使用新 request UUID 且复用原 deadline 做有界重试；deadline
+  不可行、容量已满和 ingress 拒绝会直接 safe-stop/Close；Global 为 priority-0 保留独立进入容量，低优先级
+  请求不能将其耗尽。Stop/Restart 会等待未决 Open 后用实际
+  generation Close；SIGINT/SIGTERM 退出时保持 executor 和 ROS context 存活到 safe-stop/Close 完成或超时。
+  新 action chunk 会校验 tensor step 数与 result `chunk_size` 一致，再按推理期间已执行的动作数对齐；队列暂时
+  耗尽时持续发布最后动作保持控制输出。safe-stop 的 joint snapshot freshness 使用本进程 monotonic receive
+  time，不依赖 ROS/sim time 或消息 header stamp。
+
+两个节点都使用 `/action_dispatcher` 名称并保留 start/stop/status/toggle-smoothing 接口，launch graph 不会让它们
+共存。Scheduled dispatcher 消费 Global 返回的 whole-graph action chunk。
+
 ## 系统架构
 
 ### 组件架构图
@@ -414,7 +435,9 @@ control_modes:
 
 | 方向 | 话题/Action | 消息类型 | 说明 |
 |------|-------------|----------|------|
-| 请求 | `/inference/policy/dispatch` | `ibrobot_msgs/action/DispatchInfer` | 向默认 `policy` pipeline 发送推理请求；实际 endpoint 可由 robot_config 覆盖 |
+| legacy 请求 | `/inference/policy/dispatch` | `ibrobot_msgs/action/DispatchInfer` | scheduler 缺失/false 时向 `executor.inference_pipeline` 发送推理请求 |
+| scheduled session | `/inference/session/open`、`/inference/session/close` | `OpenInferenceSession`、`CloseInferenceSession` | scheduler true 时只访问 Global endpoint；Open 不参与模型路由 |
+| scheduled 请求 | `/inference/dispatch` | `ScheduledDispatchInfer` | scheduler true 时携带 session/generation/request/target/priority/deadline；priority-0 另带 fallback chain |
 | 响应 | `result.action_chunk` | `ibrobot_msgs/msg/VariantsList` | 接收动作块 (Tensor) |
 
 ### 发布话题
@@ -434,11 +457,12 @@ control_modes:
 
 | 服务 | 类型 | 说明 |
 |------|------|------|
-| `~/reset` | `std_srvs/Empty` | 重置队列和状态；同时 best-effort 调用 `inference_reset_service` 重置推理侧 policy 状态 |
+| `~/reset` | `std_srvs/Empty` | （仅 legacy/关闭分支）重置队列和状态；同时 best-effort 调用 `inference_reset_service` 重置推理侧 policy 状态。调度启用路径不使用本服务，改用 `~/restart_session` |
 | `~/toggle_smoothing` | `std_srvs/Empty` | 切换平滑开关 |
 | `~/start_evaluate` | `std_srvs/Trigger` | 恢复 dispatcher 执行 |
 | `~/stop_evaluate` | `std_srvs/Trigger` | 暂停 dispatcher 执行；`navigation_mode=true` 时额外停止底盘 |
-| `~/get_status` | `std_srvs/Trigger` | 获取运行状态（running/stopped） |
+| `~/get_status` | `std_srvs/Trigger` | 获取运行状态；scheduled 路径返回 session state machine 状态 |
+| `~/restart_session` | `std_srvs/Trigger` | 仅 scheduled executable：safe-stop、Close、清理本地状态并用新 UUID Open |
 
 ### 与 ros2_control 通信
 

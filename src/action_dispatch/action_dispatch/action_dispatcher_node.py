@@ -32,6 +32,7 @@ from robot_config.contract_utils import iter_specs
 from robot_config.tracing_utils import create_trace_logger
 from tensormsg.converter import TensorMsgConverter
 
+from .action_chunk import normalize_action_chunk
 from .temporal_smoother import (
     TemporalSmootherManager,
 )
@@ -39,18 +40,8 @@ from .topic_executor import TopicExecutor
 
 _trace = create_trace_logger("ib_trace.dispatch")
 
-
-def _normalize_action_chunk(action_chunk):
-    """Return an action chunk shaped as (steps, action_dim)."""
-    action_chunk_tensor = action_chunk if hasattr(action_chunk, "detach") else torch.from_numpy(action_chunk)
-    action_chunk_np = action_chunk_tensor.detach().cpu().numpy() if hasattr(action_chunk, "detach") else action_chunk
-    if action_chunk_np.ndim == 3 and action_chunk_np.shape[0] == 1:
-        action_chunk_np = action_chunk_np[0]
-        action_chunk_tensor = action_chunk_tensor[0]
-    if action_chunk_np.ndim == 1:
-        action_chunk_np = action_chunk_np.reshape(1, -1)
-        action_chunk_tensor = action_chunk_tensor.reshape(1, -1)
-    return action_chunk_tensor, action_chunk_np
+# Preserve the private helper used by the legacy dispatcher and its callers.
+_normalize_action_chunk = normalize_action_chunk
 
 
 class ActionDispatcherNode(Node):

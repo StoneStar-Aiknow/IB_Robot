@@ -144,7 +144,11 @@ class AclModel:
             raise
 
     def execute(
-        self, inputs: BoundInputs | dict[int, np.ndarray], *, read_outputs: set[int] | None = None
+        self,
+        inputs: BoundInputs | dict[int, np.ndarray],
+        *,
+        read_outputs: set[int] | None = None,
+        stream: object | None = None,
     ) -> dict[int, np.ndarray]:
         if self.input_dataset is None or self.output_dataset is None or self.model_id is None:
             raise BackendInferenceError(f"Ascend role {self.role!r} is not fully loaded", code="runtime_not_loaded")
@@ -173,10 +177,28 @@ class AclModel:
                 f"acl.rt.memcpy H2D({self.role} input {descriptor.index})",
             )
 
-        check_acl_ret(
-            self._acl.mdl.execute(self.model_id, self.input_dataset, self.output_dataset),
-            f"acl.mdl.execute({self.role})",
-        )
+        if stream is None:
+            check_acl_ret(
+                self._acl.mdl.execute(self.model_id, self.input_dataset, self.output_dataset),
+                f"acl.mdl.execute({self.role})",
+            )
+        else:
+            try:
+                check_acl_ret(
+                    self._acl.mdl.execute_async(self.model_id, self.input_dataset, self.output_dataset, stream),
+                    f"acl.mdl.execute_async({self.role})",
+                )
+                check_acl_ret(
+                    self._acl.rt.synchronize_stream(stream),
+                    f"acl.rt.synchronize_stream({self.role})",
+                )
+            except Exception as exc:
+                raise BackendInferenceError(
+                    str(exc),
+                    code="async_execution_uncertain",
+                    operation_started=True,
+                    outcome_known=False,
+                ) from exc
         selected = read_outputs if read_outputs is not None else set(range(len(self.output_descriptors)))
         outputs: dict[int, np.ndarray] = {}
         for descriptor, buffer, host_buffer in zip(

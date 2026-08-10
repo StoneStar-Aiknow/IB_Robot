@@ -82,8 +82,19 @@ class RKNNSession:
 class RKNNBackend(LifecycleBackend):
     """Execute ACT and SmolVLA through manifest-declared RKNN modules."""
 
-    def __init__(self, *, rknn_loader: Callable[[], type] | None = None) -> None:
-        super().__init__("rknn", BackendCapabilities(max_in_flight_per_instance=1))
+    def __init__(
+        self,
+        *,
+        rknn_loader: Callable[[], type] | None = None,
+        expose_hardware_identity: bool = False,
+    ) -> None:
+        super().__init__(
+            "rknn",
+            BackendCapabilities(
+                max_in_flight_per_instance=1,
+                hardware_resource_id="rknn:0" if expose_hardware_identity else None,
+            ),
+        )
         self._rknn_loader = rknn_loader or self._import_rknn_type
         self._sessions: dict[str, RKNNSession] = {}
         self._owned_sessions: tuple[RKNNSession, ...] = ()
@@ -1116,4 +1127,4 @@ def create_backend(context: RuntimeContext) -> RKNNBackend:
     if not isinstance(deployment, CompiledDeployment) or deployment.backend != "rknn":
         raise BackendLoadError("RKNNBackend requires a compiled rknn deployment", code="invalid_deployment")
     RKNNBackend._validate_runtime_options(context.runtime_options)
-    return RKNNBackend()
+    return RKNNBackend(expose_hardware_identity=context.priority_scheduling)

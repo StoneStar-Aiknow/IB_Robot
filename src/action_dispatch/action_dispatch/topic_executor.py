@@ -93,3 +93,35 @@ class TopicExecutor:
                 queue_size,
             )
         return True
+
+    def execute_channel(self, topic: str, action: np.ndarray) -> bool:
+        """Publish one already-sliced contract channel.
+
+        Safe-stop uses this entrypoint so zeros and hold channels can be sent in
+        the required order without re-slicing a partial vector as a full action.
+        """
+        info = self._publishers.get(topic)
+        if info is None:
+            raise ValueError(f"no TopicExecutor publisher for {topic!r}")
+        expected = len(info["spec"].names) if info["spec"].names else 0
+        flat = np.asarray(action).reshape(-1)
+        if expected and len(flat) != expected:
+            raise ValueError(f"channel {topic!r} expects {expected} values, got {len(flat)}")
+        data_list = [float(x) for x in flat.ravel()]
+        if info["type"] == "float":
+            info["pub"].publish(Float64MultiArray(data=data_list))
+        elif info["type"] == "trajectory":
+            trajectory = JointTrajectory()
+            point = JointTrajectoryPoint(positions=data_list)
+            point.time_from_start.nanosec = 10000000  # 10ms
+            trajectory.points.append(point)
+            info["pub"].publish(trajectory)
+        _trace.info(
+            "[action_topic_publish] request_id=%s index=%d topic=%s values=%d queue_size=%d",
+            "safe_stop",
+            -1,
+            topic,
+            len(data_list),
+            0,
+        )
+        return True

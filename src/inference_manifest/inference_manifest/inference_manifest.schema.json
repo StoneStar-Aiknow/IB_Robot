@@ -154,6 +154,9 @@
         },
         "share_group": {
           "$ref": "#/$defs/non_empty_string"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
         }
       }
     },

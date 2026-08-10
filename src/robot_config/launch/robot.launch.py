@@ -93,6 +93,8 @@ from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch_ros.actions import Node
 
+from robot_config.inference_config import scheduler_enabled_from_raw_config
+
 # Import node generators from launch_builders modules
 from robot_config.launch_builders.control import generate_ros2_control_nodes
 from robot_config.launch_builders.execution import generate_execution_nodes
@@ -428,6 +430,7 @@ def launch_setup(context, *args, **kwargs):
         logger.info("Teleop mode: forcing with_inference=False")
 
     logger.info(f"Final with_inference={with_inference}")
+    scheduler_enabled = with_inference and scheduler_enabled_from_raw_config(robot_config, active_control_mode)
 
     # ========== 4. Generate Control System Nodes ==========
     logger.info("========== Generating Control Nodes ==========")
@@ -481,12 +484,19 @@ def launch_setup(context, *args, **kwargs):
             if sim_platform == "mujoco" and scene_name == "pick_banana":
                 from launch_ros.actions import Node as LaunchNode  # noqa: PLC0415
 
+                restart_service = "/action_dispatcher/restart_session" if scheduler_enabled else ""
+
                 actions.append(
                     LaunchNode(
                         package="sim_models",
                         executable="pick_banana_task_node",
                         name="pick_banana_task_node",
-                        parameters=[{"use_sim_time": True}],
+                        parameters=[
+                            {
+                                "use_sim_time": True,
+                                "restart_session_service": restart_service,
+                            }
+                        ],
                         output="screen",
                     )
                 )
@@ -767,7 +777,12 @@ def launch_setup(context, *args, **kwargs):
             logger.info(f"========== Setting up Recording (mode: {record_mode}) ==========")
 
             # Generate recording nodes using the recording builder
-            recording_nodes = generate_recording_nodes(robot_config, active_control_mode, record_mode)
+            recording_nodes = generate_recording_nodes(
+                robot_config,
+                active_control_mode,
+                record_mode,
+                scheduler_enabled=scheduler_enabled,
+            )
             actions.extend(recording_nodes)
             logger.info(f"Added {len(recording_nodes)} recording node(s)")
         else:

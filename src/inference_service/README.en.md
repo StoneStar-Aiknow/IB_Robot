@@ -133,6 +133,33 @@ Default endpoints:
 | distributed result | `/inference/<pipeline_id>/result` |
 | distributed heartbeat | `/inference/<pipeline_id>/heartbeat` |
 
+### Scheduled Control Plane
+
+`control_modes.<mode>.inference.scheduler.enable` is the only scheduler switch and defaults to `false`. When enabled,
+the launch graph uses Global Open/Dispatch/Close actions and the scheduled action dispatcher; only monolithic
+whole-graph pipelines are supported.
+
+When the switch is `false`, a complete scheduled configuration may remain in the SSOT as dormant configuration; the
+launch graph, node parameters, endpoints, executor sizing, and backend execution still use the legacy path. When the
+entire `scheduler` block is absent, scheduled fields remain unknown so legacy configurations keep strict typo checking.
+
+Priority `0` is highest and is the only priority that performs deadline admission and tries the request fallback chain.
+The per-pipeline `profile_path` is optional. A missing or invalid profile does not fail readiness or affect non-zero
+priorities; when a priority-0 request actually considers that pipeline, the candidate fails closed and routing continues
+to the next fallback. The request returns `no_feasible_deadline/NOT_STARTED` when no candidate has valid measurements
+and sufficient deadline budget.
+
+Offline measurements define a p99 admission SLA rather than an absolute completion guarantee. Action-generation
+profiles must match the pipeline input-contract fingerprint and declare `prompt_bytes_max`; Global selects the smallest
+profile bucket that covers the current prompt, adds the configured safety margins, and fails closed outside calibrated
+coverage. Profile identity is independent of endpoint names and routing membership.
+
+Serving readiness requires every required pipeline to report at least one generic priority level. If the configured
+default priority is greater than zero, readiness additionally requires the configured default target pipeline to be
+online and expose that priority. Other pipelines are not required to support multiple priorities. Backends without an
+explicit generic-to-native mapping accept priority `0` only; Ascend currently maps generic priorities `[0, 7]` one to
+one to ACL stream priorities.
+
 ## Robot Configuration
 
 Inference is configured directly under `control_modes.<mode>.inference.pipelines`:

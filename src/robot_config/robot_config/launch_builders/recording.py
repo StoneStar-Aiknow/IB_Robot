@@ -34,10 +34,19 @@ def _sanitize_dataset_name(value: str) -> str:
 logger = get_colored_logger("robot_config.recording")
 
 
+def _record_cli_command(active_control_mode: str, *, scheduler_enabled: bool = False) -> str:
+    command = f"ros2 run dataset_tools record_cli --ros-args -p control_mode:={active_control_mode}"
+    if scheduler_enabled:
+        command += " -p restart_session_service:=/action_dispatcher/restart_session"
+    return command
+
+
 def generate_recording_nodes(
     robot_config: dict,
     active_control_mode: str,
     record_mode: str = "continuous",
+    *,
+    scheduler_enabled: bool = False,
 ) -> list[Node | ExecuteProcess]:
     """
     Generate recording nodes based on robot configuration and recording mode.
@@ -67,10 +76,14 @@ def generate_recording_nodes(
 
         # Episodic recording (requires manual record_cli in separate terminal)
         ros2 launch robot_config robot.launch.py record:=true record_mode:=episodic
-        # Then in another terminal: ros2 run dataset_tools record_cli
+        # Then use the record_cli command printed by the launch process.
     """
     if record_mode == "episodic":
-        return generate_episodic_recording_node(robot_config, active_control_mode)
+        return generate_episodic_recording_node(
+            robot_config,
+            active_control_mode,
+            scheduler_enabled=scheduler_enabled,
+        )
     else:
         return generate_continuous_recording_action(robot_config)
 
@@ -116,7 +129,12 @@ def generate_continuous_recording_action(robot_config: dict) -> list[ExecuteProc
     return [recording_action]
 
 
-def generate_episodic_recording_node(robot_config: dict, active_control_mode: str) -> list[Node]:
+def generate_episodic_recording_node(
+    robot_config: dict,
+    active_control_mode: str,
+    *,
+    scheduler_enabled: bool = False,
+) -> list[Node]:
     """
     Generate episodic recording node using episode_recorder Action Server.
 
@@ -202,7 +220,7 @@ def generate_episodic_recording_node(robot_config: dict, active_control_mode: st
     logger.info("")
     logger.info("=" * 70)
     logger.warning("IMPORTANT: Use SEPARATE TERMINAL to trigger recordings:")
-    logger.info("    ros2 run dataset_tools record_cli")
+    logger.info(f"    {_record_cli_command(active_control_mode, scheduler_enabled=scheduler_enabled)}")
     logger.info("Convert later with:")
     logger.info(
         f"    ros2 run dataset_tools bag_to_lerobot --bags-dir {dataset_root} "

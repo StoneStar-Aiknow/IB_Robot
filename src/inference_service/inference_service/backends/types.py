@@ -51,6 +51,28 @@ class BackendAdmissionEvidence:
 
 
 @dataclass(frozen=True)
+class BackendPriorityMapping:
+    """Backend-owned mapping from generic priorities to native priorities."""
+
+    native_priorities: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if len(self.native_priorities) < 2:
+            raise ValueError("multi-priority mapping must expose at least two priorities")
+        if any(type(priority) is not int or priority < 0 for priority in self.native_priorities):
+            raise ValueError("native priorities must be non-negative integers")
+
+    @property
+    def generic_level_count(self) -> int:
+        return len(self.native_priorities)
+
+    def map_generic(self, priority: int) -> int:
+        if type(priority) is not int or priority < 0 or priority >= len(self.native_priorities):
+            raise ValueError(f"generic priority must be in [0, {len(self.native_priorities) - 1}], got {priority!r}")
+        return self.native_priorities[priority]
+
+
+@dataclass(frozen=True)
 class BackendCapabilities:
     resettable: bool = False
     stateful: bool = False
@@ -62,6 +84,14 @@ class BackendCapabilities:
     supports_attention: bool = False
     supports_cancellation: bool = False
     admission_evidence: BackendAdmissionEvidence | None = None
+    # New scheduler fields stay after every legacy field so positional callers
+    # retain the pre-scheduler BackendCapabilities constructor contract.
+    # Physical runtime identity is distinct from resource_domain, which only
+    # controls process-local admission.
+    hardware_resource_id: str | None = None
+    # None means the backend is single-priority and accepts only generic 0.
+    # Multi-priority backends own validation and generic-to-native mapping.
+    priority_mapping: BackendPriorityMapping | None = None
 
     def __post_init__(self) -> None:
         if self.max_in_flight_per_instance < 1:
@@ -77,6 +107,8 @@ class BackendCapabilities:
                 "deterministic_cleanup",
             )
 
+        if self.hardware_resource_id is not None and not self.hardware_resource_id.strip():
+            raise ValueError("hardware_resource_id must be a non-empty string when provided")
         if self.resource_domain is not None and not self.resource_domain.strip():
             raise ValueError("resource_domain must be a non-empty string when provided")
         if self.resource_domain is None and self.max_in_flight_per_resource_domain is not None:
@@ -113,9 +145,12 @@ class RuntimeContext:
 
     validated_manifest: ValidatedManifest
     runtime_options: Mapping[str, object] = field(default_factory=dict)
+    priority_scheduling: bool = False
     resolved_artifacts: Mapping[str, Path] = field(init=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.priority_scheduling, bool):
+            raise TypeError("priority_scheduling must be a bool")
         deployment = self.validated_manifest.deployment
         artifacts: dict[str, Path] = {}
         if isinstance(deployment, CompiledDeployment):
@@ -162,10 +197,14 @@ class InferenceRequest:
     prompt: str | None = None
     deadline: datetime | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
+    # Keep priority after the legacy metadata field for positional compatibility.
+    priority: int = 0
 
     def __post_init__(self) -> None:
         if not self.request_id:
             raise ValueError("request_id must be non-empty")
+        if isinstance(self.priority, bool) or not isinstance(self.priority, int) or self.priority < 0:
+            raise ValueError("priority must be a non-negative integer")
         object.__setattr__(self, "inputs", _immutable_mapping(self.inputs))
         object.__setattr__(self, "metadata", _immutable_mapping(self.metadata))
 
@@ -223,3 +262,16 @@ class InferenceBackend(Protocol):
     def recover(self) -> None: ...
 
     def close(self) -> None: ...
+
+
+__all__ = [
+    "BackendAdmissionEvidence",
+    "BackendCapabilities",
+    "BackendHealth",
+    "BackendPriorityMapping",
+    "BackendResult",
+    "BackendState",
+    "InferenceBackend",
+    "InferenceRequest",
+    "RuntimeContext",
+]
