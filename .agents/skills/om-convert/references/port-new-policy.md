@@ -1,8 +1,8 @@
-# Port A New LeRobot Policy To Ascend OM
+# Experimentally Implement Ascend OM Support For A New LeRobot Policy
 
-Use this workflow only when the current LeRobot revision supports the policy family and IB-Robot has
-no complete Ascend OM conversion/runtime workflow for it. The policy bundle must ultimately produce
-robot `action`.
+This is a development workflow, not an existing generic converter. Use it only when the current LeRobot
+revision supports the policy family and IB-Robot has no complete Ascend OM conversion/runtime workflow
+for it. The policy bundle must ultimately produce robot `action`.
 
 ## Entry Contract
 

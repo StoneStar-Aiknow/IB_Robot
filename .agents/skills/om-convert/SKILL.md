@@ -1,6 +1,6 @@
 ---
 name: om-convert
-description: "Unified Ascend OM conversion and optimization entry point for LeRobot policy bundles. Use whenever users mention 'convert to OM', 'Ascend OM', 'ATC', 'OM performance', '转OM', '转换OM', '昇腾模型转换', or '优化OM'. Supports existing ACT/PI0.5 workflows and exploratory ports for policy families supported by LeRobot but not yet by IB-Robot. Collects decisions up front, validates the bundle and target SoC, creates an isolated worktree for new ports, coordinates multi-host accuracy validation, and optionally performs measured optimization."
+description: "Unified Ascend OM conversion and optimization entry point for LeRobot policy bundles. Use whenever users mention 'convert to OM', 'Ascend OM', 'ATC', 'OM performance', '转OM', '转换OM', '昇腾模型转换', or '优化OM'. Runs existing ACT/PI0.5 workflows, guides experimental development of support for other LeRobot policies, and optionally performs measured optimization."
 ---
 
 # Ascend OM Conversion And Optimization
@@ -8,7 +8,8 @@ description: "Unified Ascend OM conversion and optimization entry point for LeRo
 This is the only user-facing Ascend OM skill. It supports:
 
 1. converting a policy with an existing IB-Robot Ascend workflow;
-2. porting a LeRobot-supported policy family that IB-Robot cannot yet convert to OM;
+2. guiding experimental development of Ascend support for a LeRobot policy family not yet supported by
+   IB-Robot;
 3. optionally optimizing a validated Ascend deployment.
 
 The supported input is a LeRobot policy bundle whose final output is robot `action`. A new policy must
@@ -23,7 +24,7 @@ Read only the references needed for the selected route:
 |---------|-----------|
 | Existing ACT conversion | `references/act.md` |
 | Existing PI0.5 conversion | `references/pi05.md` |
-| New LeRobot policy port | `references/port-new-policy.md` |
+| Experimental development for a new LeRobot policy | `references/port-new-policy.md` |
 | Multi-host target workflow | `references/multi-host-validation.md` |
 | Accuracy gates | `references/accuracy.md` |
 | Precision drift troubleshooting and proven fixes | `references/precision-troubleshooting.md` |
@@ -51,7 +52,7 @@ Collect:
 | Policy family | User-selected family; a path-only request still requires confirmation after reading `config.json.type`. |
 | Bundle path | Explicit user-provided path; never discover or choose a checkpoint automatically. |
 | Target SoC | Exact ATC `soc_version`, resolved through the platform probe below. |
-| Accuracy limits | Torch-vs-ONNX maximum absolute error, mean L1, and minimum cosine; Torch-vs-OM mean L1 and minimum cosine; or explicit `report only`. |
+| Accuracy contract | Limits supported by the selected executable workflow, or explicit `report only`; PI05 currently uses the fixed gate documented in `pi05.md`. |
 | Observation source | Existing versioned batch, local LeRobot dataset, or deterministic random smoke input. |
 | Torch host | Local/remote, SSH target when remote, IB-Robot path, bundle path, deployment, and device. |
 | Conversion host | Local/remote, SSH target when remote, IB-Robot path, bundle path, and experiment directory. |
@@ -74,8 +75,9 @@ ssh -o BatchMode=yes "RESOLVED_USER@RESOLVED_HOST" true
 Never weaken the remote SSH configuration, request credentials, or assume password login is enabled.
 
 For PI05 also collect its PaliGemma asset, pipeline, FastGELU, and schedule choices from `pi05.md` in
-the same upfront intake. For a new policy, collect whether source/runtime changes may include a new
-codec and Ascend execution strategy; this is allowed by default in autonomous mode.
+the same upfront intake. Never invent CLI flags to express a limit the current route cannot enforce.
+For experimental new-policy development, collect whether source/runtime changes may include a new codec
+and Ascend execution strategy; this is allowed by default in autonomous mode.
 
 ### Decision Mode
 
@@ -132,8 +134,8 @@ Classify IB-Robot support separately from LeRobot support:
 | Family status | Action |
 |---------------|--------|
 | IB-Robot supports Torch and Ascend OM | Use the existing ACT/PI05 workflow. |
-| IB-Robot supports Torch but not Ascend OM | Reuse the production codec, Torch deployment, bundle processors, and already-vendored assets; add only exporter/Ascend support through `port-new-policy.md`. |
-| LeRobot supports it but IB-Robot has no production Torch support | Use `port-new-policy.md`, first adding the smallest production Torch codec/registration needed to generate targets, then add OM support. |
+| IB-Robot supports Torch but not Ascend OM | Start experimental port development through `port-new-policy.md`; reuse the production codec, deployment, processors, and bundle assets while implementing exporter/Ascend support. |
+| LeRobot supports it but IB-Robot has no production Torch support | Start experimental port development through `port-new-policy.md`; first implement the smallest production Torch codec/registration needed to generate targets, then implement OM support. |
 | LeRobot does not support it | Stop as out of scope. |
 
 Do not redownload a dependency already resolved inside the supplied bundle. A Torch-supported bundle
@@ -203,28 +205,12 @@ evidence, ATC version, target, and resolution source.
   passes, optionally compile the ATC-default `fp16` candidate to look for additional performance, using
   the same authoritative Torch targets. The accepted workflow values are `origin` and `fp16`; do not pass
   the literal value `default`, and never use the legacy `precision_mode` option.
-- On Ascend310P, prefer ONNX opset 17 unless the installed exporter/ATC combination proves it invalid.
-  Verify that standard `LayerNormalization` nodes survive export and map to AI Core; opset <=16 may
-  decompose them into slow AI CPU primitives.
-- On Ascend310P, keep ONNX and OM end-to-end FP16 wherever accuracy permits. FP32 QK/PV and other
-  MatMul islands commonly miss high-priority kernels. Retain FP32 only for islands proven necessary by
-  final-action accuracy, such as sensitive masks, reductions, or Softmax.
-- Give PromptFlashAttention low priority on Ascend310P. Warn that P1/P3 deployments commonly cannot use
-  it through a portable ONNX path; the available parser may require private `NPUPromptFlashAttention`.
-  Prefer standard-ONNX BMM rewrites.
-- Treat prior no-gain or regression results as ranking evidence, not universal prohibitions. Reconsider
-  them when policy family, tensor shape, compiler, or exact SoC changes. In particular, test multi-camera
-  vision batching when duplicate encoders underutilize cores; PI05 has shown useful gains, and the extra
-  cores on Ascend310P1 may make batching more valuable than an Ascend310P3 result suggests.
-- For serial OM roles, connect producer outputs directly to consumer inputs with shared ACL device
-  buffers, following the PI05 VLM-to-Action-Expert device-link pattern. Do not round-trip internal
-  handoff tensors through the host.
-- Do not recommend unrolling all denoising steps into one OM as a normal performance tactic. It fixes
-  step count, makes schedule changes inconvenient, and can multiply graph/artifact size. Optimize the
-  reusable single-step Expert and prefer a runtime-managed device loop when explicitly requested.
+- During optional optimization, load `optimize.md` and the platform-specific experience reference only
+  after the validated baseline identifies a bottleneck. Keep those measured patterns out of the stable
+  entry contract.
 - Quantization is never a default conversion step.
-- For a new policy, all exploratory source edits must occur in a dedicated worktree created according
-  to `port-new-policy.md`.
+- For experimental new-policy development, all source edits must occur in a dedicated worktree created
+  according to `port-new-policy.md`.
 - Do not create a permanent deployment for every optimization candidate. Preserve reports and
   reproduction commands; publish only the selected result.
 - Keep only one active large candidate. Check experiment size during work, delete rejected ONNX/OM,
@@ -239,9 +225,10 @@ evidence, ATC version, target, and resolution source.
   profile and experiment results, and present the remaining applicable experiences before proposing new
   speculative work. Preserve all hard approval gates.
 
-## Default Stop Point
+## Experimental Port Stop Point
 
-For a LeRobot-supported policy not previously supported by IB-Robot, the default task ends after:
+For experimental development of a LeRobot-supported policy not previously supported by IB-Robot, the
+default task ends after:
 
 1. an isolated worktree contains the required exporter/runtime changes;
 2. IB-Robot runs the original Torch deployment and generates reusable targets;

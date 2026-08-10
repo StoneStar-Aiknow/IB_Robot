@@ -85,6 +85,7 @@ source .shrc_local
 source install/setup.sh
 ros2 run model_utils observation-batch dataset \
     --dataset-root "RESOLVED_DATASET_ROOT" \
+    --policy-path "RESOLVED_TORCH_BUNDLE" \
     --output "RESOLVED_INPUT_DIR/observations.safetensors" \
     --samples "RESOLVED_SAMPLE_COUNT" \
     --sampling episode-stratified \

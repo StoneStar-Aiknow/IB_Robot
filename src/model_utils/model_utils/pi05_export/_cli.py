@@ -87,6 +87,12 @@ STEPS: list[StepSpec] = [
         step_deps=("vlm_onnx",),  # needs the VLM->AE handoff tensors
     ),
     StepSpec(
+        "verify",
+        "Run split-vs-monolithic equivalence verification (needs --task and --batch-path)",
+        param_deps=("task", "batch_path"),
+        step_deps=("vlm_onnx", "ae_onnx"),
+    ),
+    StepSpec(
         "vlm_quant",
         "Quantize the VLM ONNX to W8A8 (needs --batch-path)",
         param_deps=("batch_path",),
@@ -120,12 +126,6 @@ STEPS: list[StepSpec] = [
         "Compile the Action Expert W8A8 ONNX to OM via ATC",
         param_deps=("soc_version",),
         step_deps=("ae_quant",),
-    ),
-    StepSpec(
-        "verify",
-        "Run split-vs-monolithic equivalence verification (needs --task)",
-        param_deps=("task",),
-        step_deps=("vlm_onnx", "ae_onnx"),
     ),
 ]
 STEPS_BY_NAME = {s.name: s for s in STEPS}

@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from model_utils.observation_batch import (
     FieldSpec,
     extract_lerobot_observations,
@@ -17,17 +19,33 @@ from model_utils.observation_batch import (
 
 
 def parse_field(value: str) -> FieldSpec:
-    """Parse NAME=SHAPE,DTYPE,MIN,MAX, where SHAPE uses ``x`` separators."""
+    """Parse a tensor or image field specification, where SHAPE uses ``x`` separators."""
     try:
         name, body = value.split("=", 1)
-        shape_text, dtype, minimum, maximum = body.rsplit(",", 3)
+        parts = body.split(",")
+        if len(parts) == 4:
+            shape_text, dtype, minimum, maximum = parts
+            semantic, layout = "tensor", ""
+        elif len(parts) == 6:
+            shape_text, dtype, minimum, maximum, semantic, layout = parts
+        else:
+            raise ValueError
         shape = tuple(int(part) for part in shape_text.lower().split("x") if part)
         if not name or not shape:
             raise ValueError
-        return FieldSpec(name=name, shape=shape, dtype=dtype, minimum=float(minimum), maximum=float(maximum))
+        return FieldSpec(
+            name=name,
+            shape=shape,
+            dtype=dtype,
+            minimum=float(minimum),
+            maximum=float(maximum),
+            semantic=semantic,
+            layout=layout,
+        )
     except ValueError as exc:
         raise argparse.ArgumentTypeError(
-            "field must use NAME=SHAPE,DTYPE,MIN,MAX (for example state=6,float32,-1,1)"
+            "field must use NAME=SHAPE,DTYPE,MIN,MAX[,SEMANTIC,LAYOUT] "
+            "(for example state=6,float32,-1,1 or image=3x224x224,float32,0,1,image,CHW)"
         ) from exc
 
 
@@ -59,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     dataset_parser = subparsers.add_parser("dataset", help="Extract observations from a local LeRobot dataset")
     dataset_parser.add_argument("--dataset-root", required=True)
+    dataset_parser.add_argument("--policy-path", required=True)
     dataset_parser.add_argument("--output", required=True)
     dataset_parser.add_argument("--samples", type=int, required=True)
     dataset_parser.add_argument("--field", dest="fields", action="append")
@@ -86,20 +105,27 @@ def main(argv: list[str] | None = None) -> int:
             save_observation_batch(
                 args.output,
                 samples,
+                field_specs=specs,
                 force=args.force,
                 provenance={"source": "random", "seed": args.seed},
             )
         elif args.command == "dataset":
-            samples, provenance, sample_provenance = extract_lerobot_observations(
+            samples, specs, provenance, sample_provenance = extract_lerobot_observations(
                 args.dataset_root,
                 args.samples,
+                policy_path=args.policy_path,
                 fields=args.fields,
                 seed=args.seed,
                 strategy=args.strategy,
                 repo_id=args.repo_id or f"local/{Path(args.dataset_root).resolve().name}",
             )
             save_observation_batch(
-                args.output, samples, force=args.force, provenance=provenance, sample_provenance=sample_provenance
+                args.output,
+                samples,
+                field_specs=specs,
+                force=args.force,
+                provenance=provenance,
+                sample_provenance=sample_provenance,
             )
         else:
             batch = load_observation_batch(args.path)
@@ -107,6 +133,15 @@ def main(argv: list[str] | None = None) -> int:
                 "samples": len(batch),
                 "fields": batch.fields,
                 "provenance": batch.provenance,
+                "sample_provenance": {
+                    name: {
+                        "dtype": values.dtype.name,
+                        "shape": list(values.shape),
+                        "min": np.min(values).item(),
+                        "max": np.max(values).item(),
+                    }
+                    for name, values in batch.sample_provenance.items()
+                },
             }
             print(json.dumps(output, indent=2, sort_keys=True))
     except (FileExistsError, KeyError, RuntimeError, TypeError, ValueError) as exc:

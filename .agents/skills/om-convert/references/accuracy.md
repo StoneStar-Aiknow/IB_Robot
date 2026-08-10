@@ -9,19 +9,24 @@ Do not add hardware-mock, tracing, or task-success gates here.
 
 ## Limits Collected Up Front
 
-Before export, collect separate limits for both comparisons:
+Before export, collect the accuracy contract supported by the selected executable route:
 
-| Comparison | Limits |
-|------------|--------|
-| Torch vs ONNX | `max_abs_max`, `mean_l1_max`, and `cosine_min`. |
+| Comparison | Contract |
+|------------|----------|
+| Torch vs ONNX, configurable routes | `max_abs_max`, `mean_l1_max`, and `cosine_min`. |
+| Torch vs ONNX, current PI05 route | Fixed action-cosine gate from `pi05.md`; max-abs, mean-L1, KV, and mask results are diagnostics only. |
 | Torch vs Ascend OM | `mean_l1_max` and `cosine_min`, matching the current `loss_compare` metrics. |
+
+Do not invent PI05 CLI parameters or claim that its fixed Torch-vs-ONNX gate enforced user-defined
+max-abs or mean-L1 limits. Record the effective fixed contract in `reports/accuracy-limits.json`.
 
 The user may select `report only`. In that mode compute all metrics but use verdict
 `needs-user-acceptance`, not `pass`. Do not enter optional optimization until the user accepts the
 baseline.
 
-Record limits in `reports/accuracy-limits.json`. A later optimization may tighten limits but must not
-silently relax them. Relaxation is a hard user-approval gate even in autonomous mode.
+Record configurable limits or the effective fixed contract in `reports/accuracy-limits.json`. A later
+optimization may tighten limits but must not silently relax them. Relaxation is a hard user-approval gate
+even in autonomous mode.
 
 ## Canonical Inputs
 

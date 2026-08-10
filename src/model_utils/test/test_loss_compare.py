@@ -9,7 +9,7 @@ import pytest
 import torch
 
 import model_utils.loss_compare as loss_compare
-from model_utils.observation_batch import save_observation_batch
+from model_utils.observation_batch import FieldSpec, save_observation_batch
 
 
 class _FakeEngine:
@@ -235,6 +235,11 @@ def test_load_batches_normalizes_safetensors_observations(monkeypatch, tmp_path)
                 "observation.images.hand_view": np.zeros((2, 3, 3), dtype=np.uint8),
                 "task": "pick",
             }
+        ],
+        field_specs=[
+            FieldSpec("observation.state", (6,), "float32"),
+            FieldSpec("observation.images.top_view", (2, 3, 3), "uint8", semantic="image", layout="HWC"),
+            FieldSpec("observation.images.hand_view", (2, 3, 3), "uint8", semantic="image", layout="HWC"),
         ],
     )
     monkeypatch.setattr(loss_compare, "np", np)

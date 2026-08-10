@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from model_utils.observation_batch import save_observation_batch
+from model_utils.observation_batch import FieldSpec, save_observation_batch
 from model_utils.pi05_om_dump import dump_pi05_om
 
 
@@ -123,6 +123,10 @@ def test_dump_accepts_safetensors_batch(tmp_path):
                 "observation.state": np.array([1, 2], dtype=np.float32),
                 "observation.images.top_view": np.array([[[255, 0, 0]]], dtype=np.uint8),
             }
+        ],
+        field_specs=[
+            FieldSpec("observation.state", (2,), "float32"),
+            FieldSpec("observation.images.top_view", (1, 1, 3), "uint8", semantic="image", layout="HWC"),
         ],
     )
     engines = []

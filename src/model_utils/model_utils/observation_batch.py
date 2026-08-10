@@ -40,7 +40,7 @@ _SUPPORTED_DTYPES = {
 
 @dataclass(frozen=True)
 class FieldSpec:
-    """Description used for deterministic random observation generation."""
+    """Explicit numeric field contract and optional random generation range."""
 
     name: str
     shape: tuple[int, ...]
@@ -58,6 +58,7 @@ class ObservationBatch:
     samples: list[dict[str, Any]]
     fields: dict[str, dict[str, Any]]
     provenance: dict[str, Any]
+    sample_provenance: dict[str, np.ndarray]
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
         return iter(self.samples)
@@ -82,24 +83,57 @@ def _dtype_name(dtype: np.dtype[Any]) -> str:
     return name
 
 
-def _is_image(name: str, array: np.ndarray) -> bool:
-    lowered = name.lower()
-    return array.ndim == 3 and ("image" in lowered or "camera" in lowered or lowered.endswith("rgb"))
+def _field_spec_map(
+    fields: Sequence[FieldSpec | Mapping[str, Any]], *, require_fields: bool = True
+) -> dict[str, FieldSpec]:
+    specs = [field if isinstance(field, FieldSpec) else FieldSpec(**field) for field in fields]
+    if require_fields and not specs:
+        raise ValueError("fields must contain at least one specification")
+    if len({spec.name for spec in specs}) != len(specs):
+        raise ValueError("fields must contain unique names")
+    for spec in specs:
+        if (
+            not isinstance(spec.name, str)
+            or not spec.name
+            or spec.name.startswith(_RESERVED_PREFIX)
+            or not isinstance(spec.shape, tuple | list)
+            or any(type(dimension) is not int or dimension <= 0 for dimension in spec.shape)
+            or spec.dtype not in _SUPPORTED_DTYPES
+        ):
+            raise ValueError(f"Invalid field specification: {spec.name!r}")
+        dtype = _SUPPORTED_DTYPES[spec.dtype]
+        if spec.semantic == "image":
+            if spec.layout not in ("CHW", "HWC"):
+                raise ValueError(f"Image field {spec.name!r} must declare layout CHW or HWC")
+            channel_axis = 0 if spec.layout == "CHW" else -1
+            if len(spec.shape) != 3 or spec.shape[channel_axis] not in (1, 3, 4):
+                raise ValueError(f"Image field {spec.name!r} must have 1, 3, or 4 channels in {spec.layout} layout")
+            if dtype != np.dtype("uint8") and not np.issubdtype(dtype, np.floating):
+                raise ValueError(f"Image field {spec.name!r} must use a floating-point or uint8 dtype")
+        elif spec.semantic != "tensor" or spec.layout:
+            raise ValueError(f"Non-image field {spec.name!r} must use semantic='tensor' and an empty layout")
+    return {spec.name: spec for spec in specs}
 
 
-def _canonical_image(array: np.ndarray) -> np.ndarray:
-    if array.ndim != 3:
-        raise ValueError(f"Images must have three dimensions, got {array.shape}")
-    if array.shape[0] in (1, 3, 4) and (np.issubdtype(array.dtype, np.floating) or array.shape[-1] not in (1, 3, 4)):
+def _validate_declared_array(name: str, array: np.ndarray, spec: FieldSpec) -> None:
+    if array.shape != tuple(spec.shape) or array.dtype != _SUPPORTED_DTYPES[spec.dtype]:
+        raise ValueError(
+            f"Field {name!r} does not match declared shape/dtype: expected {tuple(spec.shape)} {spec.dtype}, "
+            f"got {array.shape} {array.dtype}"
+        )
+    if (
+        spec.semantic == "image"
+        and np.issubdtype(array.dtype, np.floating)
+        and (not np.all(np.isfinite(array)) or np.any(array < 0) or np.any(array > 1))
+    ):
+        raise ValueError(f"Floating-point image field {name!r} must contain finite values in [0, 1]")
+
+
+def _canonical_image(array: np.ndarray, layout: str) -> np.ndarray:
+    if layout == "CHW":
         array = np.moveaxis(array, 0, -1)
-    if array.shape[-1] not in (1, 3, 4):
-        raise ValueError(f"Images must be HWC or CHW with 1, 3, or 4 channels, got {array.shape}")
     if np.issubdtype(array.dtype, np.floating):
-        if not np.all(np.isfinite(array)) or np.any(array < 0) or np.any(array > 1):
-            raise ValueError("Floating-point images must contain finite values in [0, 1]")
         array = np.rint(array * 255)
-    elif array.dtype != np.uint8:
-        raise ValueError(f"Integer images must use uint8, got {array.dtype}")
     return np.ascontiguousarray(array, dtype=np.uint8)
 
 
@@ -135,6 +169,7 @@ def save_observation_batch(
     path: str | os.PathLike[str],
     samples: Iterable[Mapping[str, Any]],
     *,
+    field_specs: Sequence[FieldSpec | Mapping[str, Any]],
     force: bool = False,
     provenance: Mapping[str, Any] | None = None,
     sample_provenance: Mapping[str, Sequence[int]] | None = None,
@@ -150,13 +185,17 @@ def save_observation_batch(
         raise FileExistsError(f"Refusing to overwrite existing file: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     rows, names = _normalize_samples(samples)
+    specs = _field_spec_map(field_specs, require_fields=False)
     tensors: dict[str, np.ndarray] = {}
     descriptors: dict[str, dict[str, Any]] = {}
     task_values: list[str] | None = None
+    numeric_fields: set[str] = set()
 
     for name in names:
         values = [row[name] for row in rows]
         if all(isinstance(value, str) for value in values):
+            if name in specs:
+                raise ValueError(f"Field spec {name!r} describes a string field")
             encoded, table = _string_tensor(values)
             if name == "task":
                 task_values = table
@@ -181,23 +220,30 @@ def save_observation_batch(
             continue
         if any(isinstance(value, str) for value in values):
             raise ValueError(f"Field {name!r} mixes strings and tensors")
+        if name not in specs:
+            raise ValueError(f"Numeric field {name!r} requires an explicit field spec")
+        spec = specs[name]
+        numeric_fields.add(name)
         arrays = [_numpy(value) for value in values]
-        semantic = "image" if _is_image(name, arrays[0]) else "tensor"
-        if semantic == "image":
-            arrays = [_canonical_image(array) for array in arrays]
-        shape = arrays[0].shape
-        dtype = arrays[0].dtype
-        if any(array.shape != shape or array.dtype != dtype for array in arrays):
-            raise ValueError(f"Field {name!r} has inconsistent shape or dtype")
-        dtype_name = _dtype_name(dtype)
+        for array in arrays:
+            _validate_declared_array(name, array, spec)
+        if spec.semantic == "image":
+            arrays = [_canonical_image(array, spec.layout) for array in arrays]
+            shape = arrays[0].shape
+            dtype_name = "uint8"
+        else:
+            shape = tuple(spec.shape)
+            dtype_name = spec.dtype
         tensors[name] = np.ascontiguousarray(np.stack(arrays))
         descriptors[name] = {
             "shape": list(shape),
             "dtype": dtype_name,
-            "semantic": semantic,
-            "layout": "HWC" if semantic == "image" else "",
-            "value_encoding": "uint8-0-255" if semantic == "image" else "raw",
+            "semantic": spec.semantic,
+            "layout": "HWC" if spec.semantic == "image" else "",
+            "value_encoding": "uint8-0-255" if spec.semantic == "image" else "raw",
         }
+    if set(specs) != numeric_fields:
+        raise ValueError(f"Field specs do not match numeric sample fields: {sorted(set(specs) - numeric_fields)}")
 
     provenance_tensors = (
         ("dataset_index", DATASET_INDEX_TENSOR),
@@ -240,7 +286,7 @@ def _load_legacy_json(path: Path) -> ObservationBatch:
         payload = payload.get("samples", payload.get("observations"))
     if not isinstance(payload, list) or not all(isinstance(sample, dict) for sample in payload):
         raise ValueError("Legacy JSON must be a sample list or an object containing 'samples'")
-    return ObservationBatch(samples=payload, fields={}, provenance=provenance)
+    return ObservationBatch(samples=payload, fields={}, provenance=provenance, sample_provenance={})
 
 
 def load_observation_batch(path: str | os.PathLike[str]) -> ObservationBatch:
@@ -319,12 +365,17 @@ def load_observation_batch(path: str | os.PathLike[str]) -> ObservationBatch:
             expected_shape = tuple(descriptor["shape"])
             if tensor.shape[1:] != expected_shape or _dtype_name(tensor.dtype) != descriptor["dtype"]:
                 raise ValueError(f"Tensor {name!r} does not match its shape/dtype metadata")
-            if descriptor["semantic"] == "image" and (
-                descriptor["layout"] != "HWC"
-                or descriptor["dtype"] != "uint8"
-                or descriptor["value_encoding"] != "uint8-0-255"
-            ):
-                raise ValueError(f"Image field {name!r} is not canonical HWC uint8")
+            if descriptor["semantic"] == "image":
+                if (
+                    descriptor["layout"] != "HWC"
+                    or descriptor["dtype"] != "uint8"
+                    or descriptor["value_encoding"] != "uint8-0-255"
+                    or len(expected_shape) != 3
+                    or expected_shape[-1] not in (1, 3, 4)
+                ):
+                    raise ValueError(f"Image field {name!r} is not canonical HWC uint8")
+            elif descriptor["semantic"] != "tensor" or descriptor["layout"] or encoding != "raw":
+                raise ValueError(f"Non-image field {name!r} is not a raw tensor with empty layout")
             columns[name] = tensor
         else:
             raise ValueError(f"Unknown value encoding for field {name!r}: {encoding!r}")
@@ -337,11 +388,26 @@ def load_observation_batch(path: str | os.PathLike[str]) -> ObservationBatch:
     }
     if set(tensors) - known_tensors:
         raise ValueError(f"Undeclared tensors: {sorted(set(tensors) - known_tensors)}")
-    for name, tensor in tensors.items():
-        if tensor.shape[0] != sample_count:
-            raise ValueError(f"Provenance tensor {name!r} has an invalid leading dimension")
+    sample_provenance: dict[str, np.ndarray] = {}
+    provenance_tensors = (
+        ("dataset_index", DATASET_INDEX_TENSOR),
+        ("episode_index", EPISODE_INDEX_TENSOR),
+        ("frame_index", FRAME_INDEX_TENSOR),
+    )
+    for key, tensor_name in provenance_tensors:
+        if tensor_name not in tensors:
+            continue
+        tensor = tensors[tensor_name]
+        if tensor.dtype != np.int64 or tensor.shape != (sample_count,):
+            raise ValueError(f"Provenance tensor {tensor_name!r} must be int64 with shape ({sample_count},)")
+        sample_provenance[key] = tensor
     samples = [{name: values[index] for name, values in columns.items()} for index in range(sample_count or 0)]
-    return ObservationBatch(samples=samples, fields=fields, provenance=provenance)
+    return ObservationBatch(
+        samples=samples,
+        fields=fields,
+        provenance=provenance,
+        sample_provenance=sample_provenance,
+    )
 
 
 def iter_observation_batch(path: str | os.PathLike[str]) -> Iterator[dict[str, Any]]:
@@ -355,17 +421,15 @@ def generate_random_observations(
     """Generate deterministic tensors from field shapes, dtypes, and inclusive ranges."""
     if num_samples <= 0:
         raise ValueError("num_samples must be positive")
-    specs = [field if isinstance(field, FieldSpec) else FieldSpec(**field) for field in fields]
-    if not specs or len({spec.name for spec in specs}) != len(specs):
-        raise ValueError("fields must contain unique names")
+    specs = list(_field_spec_map(fields).values())
     rng = np.random.default_rng(seed)
     columns: dict[str, np.ndarray] = {}
     for spec in specs:
-        if spec.name.startswith(_RESERVED_PREFIX) or any(dimension <= 0 for dimension in spec.shape):
-            raise ValueError(f"Invalid field specification: {spec.name!r}")
         dtype = _SUPPORTED_DTYPES.get(spec.dtype)
         if dtype is None or spec.minimum > spec.maximum:
             raise ValueError(f"Invalid dtype or range for field {spec.name!r}")
+        if spec.semantic == "image" and np.issubdtype(dtype, np.floating) and (spec.minimum < 0 or spec.maximum > 1):
+            raise ValueError(f"Floating-point image range for {spec.name!r} must be within [0, 1]")
         size = (num_samples, *spec.shape)
         if np.issubdtype(dtype, np.integer):
             info = np.iinfo(dtype)
@@ -466,23 +530,67 @@ def extract_lerobot_observations(
     root: str | os.PathLike[str],
     num_samples: int,
     *,
+    policy_path: str | os.PathLike[str],
     fields: Sequence[str] | None = None,
     seed: int = 0,
     strategy: str = "episode-stratified",
     repo_id: str = "local/observation-batch",
-) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, list[int]]]:
+) -> tuple[list[dict[str, Any]], list[FieldSpec], dict[str, Any], dict[str, list[int]]]:
     """Extract selected raw fields from a local LeRobot dataset using explicit PyAV decoding."""
     try:
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
     except ImportError as exc:
         raise RuntimeError("LeRobot extraction requires the lerobot package") from exc
+    policy_root = Path(policy_path).resolve()
+    config_path = policy_root / "config.json"
+    try:
+        with config_path.open(encoding="utf-8") as stream:
+            config = json.load(stream)
+    except FileNotFoundError as exc:
+        raise ValueError(f"Policy bundle is missing config.json: {config_path}") from exc
+    input_features = config.get("input_features") if isinstance(config, dict) else None
+    if not isinstance(input_features, dict) or not input_features:
+        raise ValueError(f"Policy config must contain a non-empty input_features object: {config_path}")
+    policy_specs: list[FieldSpec] = []
+    for name, feature in input_features.items():
+        if not isinstance(name, str) or not name or not isinstance(feature, dict):
+            raise ValueError(f"Invalid policy input feature in {config_path}: {name!r}")
+        feature_type = feature.get("type")
+        shape = feature.get("shape")
+        if not isinstance(feature_type, str) or not isinstance(shape, list):
+            raise ValueError(f"Policy input feature {name!r} must declare type and shape")
+        normalized_type = feature_type.upper()
+        if normalized_type not in {"VISUAL", "STATE", "ENV", "ACTION"}:
+            raise ValueError(f"Unsupported policy input feature type for {name!r}: {feature_type!r}")
+        is_visual = normalized_type == "VISUAL"
+        policy_specs.append(
+            FieldSpec(
+                name=name,
+                shape=tuple(shape),
+                dtype="float32",
+                semantic="image" if is_visual else "tensor",
+                layout="CHW" if is_visual else "",
+            )
+        )
+    policy_spec_map = _field_spec_map(policy_specs)
+    if fields is not None:
+        selected = list(fields)
+        if not selected or len(set(selected)) != len(selected):
+            raise ValueError("Explicit fields must contain unique names")
+        unknown = set(selected) - set(policy_spec_map) - {"task"}
+        if unknown:
+            raise ValueError(f"Selected fields are not policy input features: {sorted(unknown)}")
+    else:
+        selected = list(policy_spec_map)
+    selected_specs = [policy_spec_map[name] for name in selected if name != "task"]
+
     dataset = LeRobotDataset(repo_id=repo_id, root=Path(root), video_backend="pyav")
     indices = select_dataset_indices(_episode_groups(dataset), num_samples, seed=seed, strategy=strategy)
     samples: list[dict[str, Any]] = []
     episode_indices: list[int] = []
     frame_indices: list[int] = []
     dataset_indices: list[int] = []
-    selected = list(fields or ())
+    include_default_task: bool | None = None
     for index in indices:
         item = dataset[index]
         if isinstance(item, tuple):
@@ -492,18 +600,27 @@ def extract_lerobot_observations(
         episode_indices.append(_scalar(item.get("episode_index", -1)))
         frame_indices.append(_scalar(item.get("frame_index", index)))
         dataset_indices.append(_scalar(item.get("index", index)))
-        excluded = {"action", "index", "episode_index", "frame_index", "task", "task_index", "timestamp"}
-        names = selected or [name for name in item if name not in excluded]
+        names = selected
+        if fields is None:
+            has_task = "task" in item
+            if include_default_task is None:
+                include_default_task = has_task
+            elif has_task != include_default_task:
+                raise KeyError("Dataset items have inconsistent task fields")
+            if include_default_task:
+                names = [*selected, "task"]
         missing = set(names) - set(item)
         if missing:
             raise KeyError(f"Dataset item is missing selected fields: {sorted(missing)}")
         sample = {name: item[name] for name in names}
-        if "task" in item:
-            sample["task"] = item["task"]
+        for name, spec in policy_spec_map.items():
+            if name in sample:
+                _validate_declared_array(name, _numpy(sample[name]), spec)
         samples.append(sample)
     provenance = {
         "source": "lerobot-local",
         "root": str(Path(root).resolve()),
+        "policy_path": str(policy_root),
         "repo_id": repo_id,
         "sampling_strategy": strategy,
         "seed": seed,
@@ -512,6 +629,7 @@ def extract_lerobot_observations(
     }
     return (
         samples,
+        selected_specs,
         provenance,
         {
             "dataset_index": dataset_indices,

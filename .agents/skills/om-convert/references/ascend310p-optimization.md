@@ -1,8 +1,9 @@
 # Ascend310P Optimization Patterns
 
-Read this reference when converting or optimizing for an exact `Ascend310P*` target. These patterns were
-measured on CANN 8.1 RC1/Ascend310P3 while porting SmolVLA, and must be revalidated on the user's exact
-P1/P3 toolchain and graph.
+Read this experience reference only during optional optimization for an exact `Ascend310P*` target,
+after the conservative conversion baseline identifies a bottleneck. These patterns were measured on CANN
+8.1 RC1/Ascend310P3 while porting SmolVLA and must be revalidated on the user's exact P1/P3 toolchain and
+graph.
 
 ## Default Priorities
 

@@ -20,17 +20,18 @@ available steps are:
 
     vlm_onnx   Export the VLM (gemma_2b) to ONNX
     ae_onnx    Export the Action Expert (gemma_300m) to ONNX
+    verify     Split-vs-monolithic equivalence check   (needs --task and --batch-path)
     vlm_quant  Quantize the VLM ONNX to W8A8           (needs --batch-path)
     ae_quant   Quantize the Action Expert ONNX to W8A8 (calib = runtime_save)
     vlm_om     Compile the VLM ONNX to OM via ATC      (needs --soc-version)
     ae_om      Compile the Action Expert ONNX to OM    (needs --soc-version)
     vlm_quant_om  Compile the VLM W8A8 ONNX to OM      (needs --soc-version)
     ae_quant_om   Compile the AE W8A8 ONNX to OM       (needs --soc-version)
-    verify     Split-vs-monolithic equivalence check   (needs --task)
 
 Default ``--steps`` = ``vlm_onnx,ae_onnx,vlm_om,ae_om`` (export both segments
 and compile both OMs). Quantization and verification are opt-in by listing the
-corresponding step.
+corresponding step. The default produces artifacts but is not an accuracy-validated complete conversion;
+the ``om-convert`` workflow explicitly includes ``verify`` with a canonical observation batch.
 
 Step semantics
 --------------
@@ -389,6 +390,8 @@ def _run_verify(ctx: Ctx) -> None:
             str(ctx.vlm_onnx),
             "--ae-onnx-path",
             str(ctx.ae_onnx),
+            "--batch-path",
+            str(Path(a.batch_path).expanduser()),
             "--task",
             a.task,
             "--device",

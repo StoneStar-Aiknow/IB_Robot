@@ -471,7 +471,13 @@ mapping。`abi_format` 为 `runtime` 或 `tcim`。
 `model_utils` 使用版本化 Safetensors 保存可复用的原始 observation batch。图像统一为 HWC
 `uint8 [0,255]`，其他字段保留原始数值 dtype；所有 tensor 的第一维都是 sample 维。该格式不包含
 policy normalization、tokenization 或其他 model-ready 变换。旧 `.json` batch 仍可读取，但新 batch
-应使用 Safetensors。
+应使用 Safetensors。`safetensors>=0.4.3,<1.0.0` 由项目统一的 `requirements/base.txt` 安装；
+`model_utils` 的 Python package metadata 声明相同约束。当前 rosdep 数据库没有可用的
+`python3-safetensors` key，因此 `package.xml` 不声明无法解析的 ROS 依赖。
+
+保存数值字段时必须提供显式 `FieldSpec`。图像字段必须声明 `semantic=image` 及输入 layout
+`CHW` 或 `HWC`，并严格匹配声明的 shape/dtype；保存层只执行确定性的 CHW-to-HWC 规范化，
+不会根据字段名、shape 或 dtype 猜测布局。
 
 随机生成适合 shape/runtime smoke test，不适合量化校准：
 
@@ -481,15 +487,17 @@ ros2 run model_utils observation-batch random \
     --samples 32 \
     --seed 42 \
     --field 'observation.state=6,float32,-100,100' \
-    --field 'observation.images.top=480x640x3,uint8,0,255' \
-    --field 'observation.images.wrist=480x640x3,uint8,0,255'
+    --field 'observation.images.top=480x640x3,uint8,0,255,image,HWC' \
+    --field 'observation.images.wrist=480x640x3,uint8,0,255,image,HWC'
 ```
 
-从本地 LeRobot dataset 进行 episode 分层抽样，使用 PyAV 解码视频，并保存 task 与来源索引：
+从本地 LeRobot dataset 进行 episode 分层抽样，使用 PyAV 解码视频，并由 policy bundle 的
+`config.json.input_features` 提供字段 semantic、shape 和 VISUAL CHW layout 契约：
 
 ```bash
 ros2 run model_utils observation-batch dataset \
     --dataset-root /path/to/lerobot_dataset \
+    --policy-path /path/to/policy_bundle \
     --output /tmp/calibration.observations.safetensors \
     --samples 256 \
     --seed 42 \
@@ -501,6 +509,10 @@ ros2 run model_utils observation-batch dataset \
 ros2 run model_utils observation-batch inspect \
     /tmp/calibration.observations.safetensors
 ```
+
+显式传入 `--field` 时，它是严格白名单；需要 task 时必须同时传 `--field task`。未传任何
+`--field` 时，命令选择 policy 的全部 input feature，并在 dataset 提供 task 时保留它。
+`inspect` 会显示 dataset/frame/episode 的样本级 provenance dtype、shape 和范围摘要。
 
 ## loss_compare
 

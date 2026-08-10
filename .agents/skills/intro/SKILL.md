@@ -39,7 +39,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 
 | Skill | 一句话描述 |
 | :--- | :--- |
-| **om-convert** | Ascend OM 唯一入口，支持已有/新 LeRobot policy 转换、跨机器精度验证、ais_bench 基线和可选性能优化 |
+| **om-convert** | Ascend OM 唯一入口，执行 ACT/PI05 转换并指导新 policy 的实验性支持开发和可选优化 |
 | **rknn-convert** | 将 ONNX 模型转换为 RKNN，并明确主 venv 导出 ONNX、`.venv-rknn` 转 RKNN 的分层流程 |
 | **hmm-convert** | 将 PI0.5 / SmolVLA 编译产物打包为后摩 HMM deployment（xh2 NPU）；ACT HMM 不支持 |
 
@@ -101,7 +101,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 把模型转成 Ascend OM             → om-convert（询问模型类型和路径）
 把 /path/to/act 转成 OM          → om-convert（内部 ACT 流程）
 把 PI0.5 转成 Ascend OM          → om-convert（内部 PI05 流程）
-把新的 LeRobot policy 转成 OM    → om-convert（独立 worktree 移植）
+为新的 LeRobot policy 开发 OM 支持 → om-convert（独立 worktree 实验性开发）
 优化 Ascend OM 性能              → om-convert（精度门禁后可选优化）
 把 PI0.5/SmolVLA 打包成后摩 HMM  → hmm-convert
 把 usb_cam 移植到板端            → oh-cross-build-ros-pkg
