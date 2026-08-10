@@ -12,10 +12,17 @@
 # follow the same shape.
 
 # --- Goal ---
+uint8 MODE_EXECUTE=0
+uint8 MODE_PLAN_ONLY=1
+uint8 MODE_OBSERVE_ONLY=2
+
 DispatchBinding dispatch_binding
 string target_query
 float32 timeout_sec
 DelegatedExecutorIdentity expected_executor
+uint8 mode
+bool release_after_success
+float32 release_drop_height_m
 ---
 # --- Result ---
 uint8 VERIFICATION_NOT_RUN=0
@@ -32,6 +39,9 @@ float32 verification_confidence
 string debug_output_dir
 string[] completed_phases
 DelegatedExecutorIdentity actual_executor
+int32 candidate_index
+bool released_after_success
+string pipeline_timings_json
 ---
 # --- Feedback ---
 string phase

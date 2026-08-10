@@ -15,6 +15,11 @@ Hermes / robot-skill
 `agent_plan_node` 只负责任务生命周期和 Workflow 编排，不直接执行 primitive。
 `skill_executor_node` 是唯一拥有 motion admission、root lease、ledger 和物理下发权的节点。
 
+启用 `robot.grasp_execution` 后，`pick_object` 由 Gateway 构造版本化 delegated `PickObject` goal，
+再进入 `manipulation_execution/pick_executor_node`。该执行器统一承载 execute、plan-only 和
+observe-only 三种模式，并通过隔离的并行 IK/FK worker 准备候选；所有实际运动仍逐步回到
+`skill_library` 的 `PrimitiveCommand` 安全边界。
+
 ## 已移除路径
 
 `/voice_command` 不再是机器人运动入口。`perception_service` 仍可作为独立场景感知

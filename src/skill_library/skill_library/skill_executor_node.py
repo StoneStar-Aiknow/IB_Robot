@@ -2285,7 +2285,9 @@ class SkillExecutorNode(Node):
                     "ee pose unavailable or stale",
                     goal.pose_name,
                 )
-        if goal.primitive_name == "move_relative_ee":
+        if goal.primitive_name == "move_to_pose":
+            target_pose = goal.target_pose
+        elif goal.primitive_name == "move_relative_ee":
             target_pose = self._pose_from_relative_offset(
                 ee_pose_snapshot.pose,
                 goal.relative_dx,
@@ -2949,6 +2951,13 @@ class SkillExecutorNode(Node):
         )
         pick_goal.target_query = goal.target_name
         pick_goal.timeout_sec = timeout_sec
+        # SkillCommand is the only public motion boundary. The Gateway owns
+        # delegated PickObject policy and deliberately exposes the canonical
+        # execute path only; diagnostic modes and post-success release are not
+        # caller-controlled fields in the v1 catalog contract.
+        pick_goal.mode = PickObject.Goal.MODE_EXECUTE
+        pick_goal.release_after_success = False
+        pick_goal.release_drop_height_m = -1.0
         delegated_admission = self._active_skill_admission
         delegated_nonce = pick_goal.dispatch_binding.dispatch_nonce
         cleanup_key = self._register_delegated_dispatch(

@@ -201,7 +201,7 @@ def _make_skill_node(send_goal_future) -> SkillExecutorNode:
     node._skill_goal_lock = threading.Lock()
     node._skill_goal_active = False
     node._validate_skill = lambda *_args, **_kwargs: (True, "")
-    node._current_joint_positions = lambda: []
+    node._current_joint_positions = lambda: {}
     node._named_targets = {}
     node._gripper_open = 1.0
     node._gripper_closed = 0.0
@@ -270,6 +270,65 @@ def test_delegated_primitive_requires_exact_active_nonce_binding():
     assert node._admit_primitive(goal, None) == ("", None, admission, True)
     goal.dispatch_binding.root_task_id = "tampered"
     assert node._admit_primitive(goal, None)[0] == "SKILL_BUSY"
+
+
+def test_pick_skill_sets_internal_execute_policy(monkeypatch):
+    sent_goals = []
+
+    class PickClient:
+        @staticmethod
+        def wait_for_server(**_kwargs):
+            return True
+
+        @staticmethod
+        def send_goal_async(goal, **_kwargs):
+            sent_goals.append(goal)
+            raise RuntimeError("stop after inspecting the delegated goal")
+
+    expected_executor = {
+        "name": "grasp_pipeline",
+        "contract_version": "1",
+        "endpoint_kind": "ros_action",
+        "endpoint_name": "/manipulation/execute_pick",
+        "configuration_digest": "a" * 64,
+        "model_deployment_name": "graspgen",
+        "model_fingerprint": "b" * 64,
+        "model_bundle_digest": "c" * 64,
+    }
+    executor = SimpleNamespace(**expected_executor)
+    node = object.__new__(SkillExecutorNode)
+    node._pick_client = PickClient()
+    node._rpc_timeout = 0.01
+    node._active_runtime_bundle = SimpleNamespace(
+        snapshot=SimpleNamespace(delegated_executors={"grasp_pipeline": executor})
+    )
+    node._active_skill_admission = object()
+    node._register_delegated_dispatch = lambda *_args: b"cleanup"
+    node._confirm_delegated_terminal = lambda *_args: None
+    node._abort_skill = lambda result, _handle, _phases, code, message: SimpleNamespace(
+        success=False, error_code=code, message=message
+    )
+    node.get_logger = lambda: SimpleNamespace(error=lambda _message: None)
+    goal_handle = SimpleNamespace(
+        request=_BoundRequest(
+            task_id="pick-1",
+            skill_name="pick_object",
+            target_name="banana",
+            place_name="",
+            motion_direction="",
+            motion_distance=0.0,
+            timeout_sec=10.0,
+        )
+    )
+
+    result = node._execute_pick_skill(goal_handle, {"timeout_sec": 10.0})
+
+    assert result.success is False
+    assert result.error_code == skill_executor_node.PRIMITIVE_CANCEL_CLEANUP_TIMEOUT
+    assert len(sent_goals) == 1
+    assert sent_goals[0].mode == skill_executor_node.PickObject.Goal.MODE_EXECUTE
+    assert sent_goals[0].release_after_success is False
+    assert sent_goals[0].release_drop_height_m == pytest.approx(-1.0)
 
 
 def test_fresh_ee_pose_snapshot_is_independent_and_rejects_stale_pose(monkeypatch):
@@ -567,10 +626,11 @@ class _ExternalPolicyStub:
 
 
 class _PrimitiveActionGoalHandle:
-    def __init__(self, goal_id, task_id: str = "task-1", binding=None) -> None:
+    def __init__(self, goal_id, task_id: str = "task-1", binding=None, execution_token: str = "") -> None:
         self.goal_id = goal_id
         self.request = _BoundRequest(
             task_id=task_id,
+            execution_token=execution_token,
             primitive_name="open_gripper",
             pose_name="",
         )
@@ -1314,3 +1374,29 @@ def test_execute_primitive_aborts_when_downstream_cancel_cleanup_times_out():
     assert result.error_code == "CANCEL_CLEANUP_TIMEOUT"
     assert goal_handle.abort_count == 1
     assert goal_handle.canceled_count == 0
+
+
+def test_move_to_pose_validation_receives_goal_target_pose():
+    node = object.__new__(SkillExecutorNode)
+    node._debug = False
+    captured = {}
+
+    def validate_primitive(*_args, **kwargs):
+        captured.update(kwargs)
+        return False, "stop after validation"
+
+    node._validate_primitive = validate_primitive
+    goal_handle = _PrimitiveGoalHandle()
+    goal_handle.request.primitive_name = "move_to_pose"
+    goal_handle.request.target_pose = skill_executor_node.Pose()
+    goal_handle.request.target_pose.position.x = 0.12
+    goal_handle.request.target_pose.position.y = -0.20
+    goal_handle.request.target_pose.position.z = 0.05
+    goal_handle.request.target_pose.orientation.w = 1.0
+
+    result = node._execute_primitive_unchecked(goal_handle)
+
+    assert captured["target_pose"] is goal_handle.request.target_pose
+    assert captured["target_pose"].position.z == pytest.approx(0.05)
+    assert result.success is False
+    assert result.error_code == "SAFETY_REJECTED"

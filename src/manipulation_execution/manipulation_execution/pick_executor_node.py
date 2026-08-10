@@ -25,7 +25,7 @@ from embodied_common.dispatch_binding import (
     load_delegated_model_identity,
 )
 from ibrobot_msgs.action import PickObject, PrimitiveCommand
-from ibrobot_msgs.srv import DetectSegment, MoveToConfiguration, PlanGrasp, VerifyGrasp
+from ibrobot_msgs.srv import MoveToConfiguration, PlanGrasp, VerifyGrasp
 from manipulation_execution.phases.execution import ExecutionPhase
 from manipulation_execution.phases.flow import PickFlowPhase
 from manipulation_execution.phases.planning import PlanningPhase
@@ -33,7 +33,6 @@ from manipulation_execution.phases.preparation import PreparationPhase
 from manipulation_execution.pick_executor_helpers import PickExecutorHelpers
 from manipulation_execution.pick_executor_models import (
     BaseSceneGeometry,
-    CandidateSelectionDiagnostics,
     FlowState,
     IKPayload,
     PickCancelled,
@@ -45,7 +44,6 @@ from manipulation_execution.pick_executor_models import (
 
 __all__ = [
     "BaseSceneGeometry",
-    "CandidateSelectionDiagnostics",
     "FlowState",
     "IKPayload",
     "PickCancelled",
@@ -83,6 +81,7 @@ class PickExecutorNode(
         "verify_probe": 0.84,
         "lift": 0.92,
         "verify_lift": 0.97,
+        "release": 0.99,
         "completed": 1.0,
     }
 
@@ -92,7 +91,6 @@ class PickExecutorNode(
         self.declare_parameter("primitive_action_name", "/embodied/execute_primitive")
         self.declare_parameter("grasp_execution_json", "{}")
         self.declare_parameter("workspace_json", "{}")
-        self.declare_parameter("home_joint_positions_json", "{}")
         self.declare_parameter("arm_joint_names_json", "[]")
         self.declare_parameter("gripper_open_position", 1.0)
         self.declare_parameter("gripper_closed_position", 0.0)
@@ -110,10 +108,6 @@ class PickExecutorNode(
             **load_delegated_model_identity(self._config),
         )
         self._workspace = self._load_json_object(self.get_parameter("workspace_json").value)
-        self._home_joint_positions = {
-            str(name): float(value)
-            for name, value in self._load_json_object(self.get_parameter("home_joint_positions_json").value).items()
-        }
         self._arm_joint_names = self._load_json_list(self.get_parameter("arm_joint_names_json").value)
         self._gripper_open = float(self.get_parameter("gripper_open_position").value)
         self._gripper_closed = float(self.get_parameter("gripper_closed_position").value)
@@ -130,12 +124,6 @@ class PickExecutorNode(
 
         self._planner_service = str(self._config.get("planner_service", "/grasp_planner/plan_grasp"))
         self._verifier_service = str(self._config.get("verifier_service", "/grasp_verifier/verify_grasp"))
-        self._detect_service = str(
-            self._config.get(
-                "fallback_detect_service",
-                self._config.get("detect_service", "/grounded_sam2/detect_and_segment"),
-            )
-        )
         self._move_configuration_service = str(
             self._config.get("move_configuration_service", "/moveit_gateway/move_to_configuration")
         )
@@ -157,6 +145,9 @@ class PickExecutorNode(
         callback_group = ReentrantCallbackGroup()
         self._joint_state_lock = threading.Lock()
         self._latest_joint_state: JointState | None = None
+        self._ik_worker_verification: tuple[tuple[object, ...], float] | None = None
+        self._kinematics_health_lock = threading.Lock()
+        self._kinematics_unhealthy_workers: set[int] = set()
         self.create_subscription(
             JointState,
             self._joint_state_topic,
@@ -170,7 +161,6 @@ class PickExecutorNode(
             self._verifier_service,
             callback_group=callback_group,
         )
-        self._detect_client = self.create_client(DetectSegment, self._detect_service, callback_group=callback_group)
         self._move_configuration_client = self.create_client(
             MoveToConfiguration,
             self._move_configuration_service,
@@ -257,6 +247,14 @@ class PickExecutorNode(
             or not math.isfinite(timeout_sec)
             or timeout_sec <= 0.0
         ):
+            return GoalResponse.REJECT
+        if int(goal_request.mode) not in {
+            PickObject.Goal.MODE_EXECUTE,
+            PickObject.Goal.MODE_PLAN_ONLY,
+            PickObject.Goal.MODE_OBSERVE_ONLY,
+        }:
+            return GoalResponse.REJECT
+        if not math.isfinite(float(goal_request.release_drop_height_m)):
             return GoalResponse.REJECT
         with self._goal_lock:
             if self._goal_active:

@@ -10,16 +10,19 @@ from manipulation_execution.pick_executor_node import PickExecutorNode, PickFlow
 
 
 class _PrimitiveClient:
-    def __init__(self):
+    def __init__(self) -> None:
         self.goals = []
+        self.goal = None
 
     def send_goal_async(self, goal):
         self.goals.append(goal)
+        self.goal = goal
         return object()
 
 
 class _PrimitiveHarness:
     _run_primitive = PickExecutorNode._run_primitive
+    _execution_token = staticmethod(PickExecutorNode._execution_token)
 
     def __init__(self, *, success: bool = False) -> None:
         self._primitive_client = _PrimitiveClient()
@@ -111,3 +114,12 @@ def test_pick_executor_rejects_identity_mismatch_and_requires_dispatch_nonce() -
     goal.timeout_sec = 5.0
     assert executor._handle_goal(goal).name == "ACCEPT"
     assert executor._dispatch_nonce == "nonce-1"
+
+
+def test_pick_goal_uuid_is_forwarded_as_internal_execution_token() -> None:
+    executor = _PrimitiveHarness(success=True)
+    goal_handle = SimpleNamespace(goal_id=SimpleNamespace(uuid=[7] * 16))
+
+    executor._run_primitive(goal_handle, 1.0, "task", "open_gripper")
+
+    assert executor._primitive_client.goal.execution_token == bytes([7] * 16).hex()

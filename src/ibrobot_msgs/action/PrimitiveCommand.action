@@ -12,6 +12,9 @@
 
 # --- Goal ---
 DispatchBinding dispatch_binding
+# Correlation token derived from the parent PickObject goal UUID. Authorization
+# is always decided from dispatch_binding; callers must not use this as a lease.
+string execution_token
 string primitive_name
 string pose_name
 geometry_msgs/Pose target_pose

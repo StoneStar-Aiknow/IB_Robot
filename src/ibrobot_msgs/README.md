@@ -141,15 +141,14 @@ Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `Vali
 | `volume_m3` | `float32` | 凸包体积，`0.0` 表示点数不足、几何退化或无法计算体积质心 |
 | `point_count` | `int32` | mask 内有效深度点数量 |
 
-### `DetectionArray.msg` / `DetectSegment.srv` 兼容边界
+### `DetectionArray.msg` 与抓取感知服务
 
-`DetectSegment` 是订阅最新相机快照后按文本 prompt 检测的兼容接口。接口 schema 由 `ibrobot_msgs` 维护，
-`perception_service/grounded_sam2_node` 维护运行时兼容实现，`manipulation_service` 维护主抓取消费路径，
-`manipulation_execution` 维护检测回退路径。`grounded_sam2_snapshot` 是诊断消费者。
+抓取感知使用显式图像输入的强类型服务。`GroundingDetect` 返回 bbox、label 和 confidence；当所选 deployment
+不内联分割时，`SegmentDetections` 接收同一图像与检测数组并补齐 `mono8` mask。PC 的组合 Torch deployment
+可直接由 `GroundingDetect` 返回 mask，310P 则使用 `GroundingDetect -> SegmentDetections` 两个 named deployment。
 
-离线语义建图不改变该接口，而使用显式携带图像的 `GenerateMasks`、`RecognizeTags`、
-`EncodeEmbeddings`、`EncodeText` 和 `GroundingDetect`。只有新确认链通过兼容测试且上述消费者全部迁移后，才能在明确的
-发布边界废弃 `DetectSegment`。
+这两个服务不订阅相机或深度 topic。抓取 planner 缓存 RGB-D 与 CameraInfo，用返回 mask 在同一帧深度上计算
+表面质心、体积质心和点数，并通过 `PlanGrasp` 返回几何结果。
 
 ### 显式图像感知服务
 
@@ -160,6 +159,7 @@ Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `Vali
 | `EncodeEmbeddings` | 一张图像最多 8 个 masks 的 SigLIP2 批量编码与候选标签匹配 |
 | `EncodeText` | 最多 16 条文本的 SigLIP2 查询时编码；不携带图像或持久 image embedding |
 | `GroundingDetect` | 显式图像输入的低频目标确认，不参与建图主链 |
+| `SegmentDetections` | 对显式图像和检测 bbox 执行 box-prompt 分割并补齐同尺寸 mask |
 
 所有新服务返回 `ModelRuntimeInfo`。`EncodeText` 返回瞬时、归一化的查询文本向量，供语义地图内部与私有
 image embedding 比较；持久对象 embedding 仍是语义地图私有数据，不进入对象快照消息。
@@ -371,6 +371,7 @@ identity；direct root `SkillCommand` 的 `root_lease_nonce` 与 `dispatch_nonce
 | 字段 | 说明 |
 | --- | --- |
 | `dispatch_binding` | 完整任务/版本信封；外部 root Primitive 由 Gateway 在取得 root lease 后 canonicalize |
+| `execution_token` | 父 `PickObject` goal UUID 派生的关联 token；授权始终以 `dispatch_binding` 为准 |
 | `primitive_name` | 原子动作名，包括 `move_to_named_pose`、`move_to_pose`、`move_to_configuration`、`move_relative_ee`、`move_to_joint_positions`、`move_through_joint_positions`、`open_gripper`、`close_gripper`、`rotate_gripper_cw` 和 `rotate_gripper_ccw` |
 | `pose_name` | 命名位姿（`move_to_named_pose` 使用） |
 | `target_pose` | 动态 base-frame 位姿（`move_to_pose` 使用） |
@@ -420,6 +421,9 @@ identity，不匹配时返回稳定 contract-version 错误，且不得仅凭 en
 | `target_query` | 运行时视觉文本查询，不是静态 `named_targets` 键 |
 | `timeout_sec` | per-entry 超时上限，受 `task_budget` 剩余预算约束 |
 | `expected_executor` | `DelegatedExecutorIdentity`，调用方声明的期望 executor identity |
+| `mode` | `MODE_EXECUTE`、`MODE_PLAN_ONLY` 或 `MODE_OBSERVE_ONLY` |
+| `release_after_success` | 验证成功后是否由正式 executor 执行安全释放 |
+| `release_drop_height_m` | 非负时先下降到指定高度再开爪；负值在最终 lift 位释放 |
 
 **Result 字段**
 
@@ -434,6 +438,9 @@ identity，不匹配时返回稳定 contract-version 错误，且不得仅凭 en
 | `debug_output_dir` | 调试输出目录；未写文件时为空 |
 | `completed_phases` | 已进入的抓取状态机阶段 |
 | `actual_executor` | `DelegatedExecutorIdentity`，server 实际 identity |
+| `candidate_index` | 最终规划或执行的候选索引，未选择时为 `-1` |
+| `released_after_success` | 是否完成正式释放流程 |
+| `pipeline_timings_json` | 正式 executor 返回的阶段耗时 JSON |
 
 **Feedback 字段**
 

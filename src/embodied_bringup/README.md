@@ -11,6 +11,13 @@ SSOT YAML，启动 Agent plan、安全校验、Skill Gateway 以及可选感知�
 - 从 `robot_config` 加载机器人配置并向下游注入参数。
 - 启动 `agent_plan_node`、`safety_guard_node` 和 `skill_executor_node`。
 - 按配置启动独立 `perception_service` 与抓取执行依赖。
+- 当 `robot.grasp_execution.enabled=true` 时，编排 Grounded-SAM2、GraspGen、抓取验证器和
+  `manipulation_execution/pick_executor_node`。
+- 将 `grasp_execution.perception_node/planner_node.host_runtime` 转换为对应节点的进程环境；该块不作为
+  ROS 参数传给业务节点。
+- 当 `robot.grasp_execution.ik.worker_count>0` 时，自动包含 `robot_moveit/so101_ik_workers.launch.py`，
+  为 Hermes 启动与监督式抓取脚本相同的并行候选 IK/FK 池。
+- 保持具身业务运行时依赖集中在 bringup 层，避免 `robot_config` 反向依赖业务包。
 
 本包不负责：
 
@@ -54,3 +61,24 @@ endpoint。先按 `sros2/README.md` 生成部署 keystore 并设置 `ROS_SECURIT
 使用 `/hermes_cli` enclave，catalog reload 使用 `/operator` enclave。没有 keystore 时不得启用该参数。
 
 `with_perception` 只控制独立感知服务，不恢复已删除的 voice/VLM Planner 流水线。
+
+主要参数：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `robot_config` | `so101_single_arm` | robot_config 中的机器人配置名 |
+| `config_path` | 空 | 可选的 YAML 绝对路径覆盖 |
+| `control_mode` | `moveit_planning` | 具身闭环当前要求 MoveIt 兼容控制模式 |
+| `use_sim` | `false` | 是否启动仿真路径 |
+| `with_moveit` | 空 | 传递给基础 robot launch 的 MoveIt 覆盖参数 |
+| `moveit_display` | `false` | 是否启动 MoveIt RViz |
+| `with_embodied` | `true` | 是否启动具身运行时节点 |
+| `with_perception` | 空 | 覆盖 `robot.embodied.perception.enabled` |
+| `authorize_motion` | `false` | 操作员运动授权；唯一运行时授权来源 |
+
+## 已知限制
+
+- 当前具身闭环要求 `control_mode:=moveit_planning` 或名称中包含 `moveit` 的兼容控制模式。
+- `so101_handeye_realsense_grasp` 可通过显式 `pick_object` 技能从 Hermes 调用完整抓取闭环。
+- 真机端口、相机和手眼标定直接维护在该 robot YAML 中；本 launch 与 `robot-skill` 应使用同一个
+  `robot_config` 名称，workspace 外部完整 YAML 才需要显式传 `config_path`。

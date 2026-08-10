@@ -2,9 +2,11 @@ import json
 from pathlib import Path
 
 import pytest
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, EmitEvent
+from launch_ros.actions import Node
 
 from embodied_bringup.launch_builders.embodied import _resolve_development_source_root, generate_embodied_nodes
+from robot_config.launch_builders.perception_models import generate_perception_model_nodes
 from robot_config.loader import load_robot_config_dict
 
 
@@ -44,6 +46,15 @@ def _skill_executor_params(nodes):
         and node.__dict__.get("_Node__node_executable") == "skill_executor_node"
     )
     return _normalize_launch_param_mapping(skill_executor._Node__parameters[0])
+
+
+def _normalize_launch_environment(node):
+    return {
+        "".join(getattr(item, "text", str(item)) for item in key): "".join(
+            getattr(item, "text", str(item)) for item in value
+        )
+        for key, value in node.additional_env
+    }
 
 
 def test_hermes_entry_does_not_launch_voice_routing_node():
@@ -347,7 +358,50 @@ def test_handeye_grasp_config_launches_pick_pipeline():
     assert ("manipulation_execution", "pick_executor_node") in executables
     assert ("manipulation_service", "grasp_planner_node") in executables
     assert ("manipulation_service", "grasp_verifier_node") in executables
-    assert ("perception_service", "grounded_sam2_node") in executables
+    assert ("perception_service", "grounded_sam2_node") not in executables
+
+    model_nodes = generate_perception_model_nodes(config)
+    assert {vars(node).get("_Node__node_name") for node in model_nodes} == {
+        "grasp_grounding_detect",
+        "grasp_segment_detections",
+    }
+    model_params = {
+        vars(node).get("_Node__node_name"): _normalize_launch_param_mapping(node._Node__parameters[0])
+        for node in model_nodes
+    }
+    assert _decode_launch_string(str(model_params["grasp_grounding_detect"]["service_type"])) == (
+        "ibrobot_msgs/srv/GroundingDetect"
+    )
+    assert _decode_launch_string(str(model_params["grasp_grounding_detect"]["service_endpoint"])) == (
+        "/perception/grasp/grounding_detect"
+    )
+    assert _decode_launch_string(str(model_params["grasp_segment_detections"]["service_type"])) == (
+        "ibrobot_msgs/srv/SegmentDetections"
+    )
+    assert _decode_launch_string(str(model_params["grasp_segment_detections"]["service_endpoint"])) == (
+        "/perception/grasp/segment_detections"
+    )
+
+    planner = next(node for node in nodes if vars(node).get("_Node__node_name") == "grasp_planner")
+    planner_params = _normalize_launch_param_mapping(planner._Node__parameters[0])
+    assert str(planner_params["inference_backend"]).splitlines()[0] == "ascend_local"
+    assert str(planner_params["ascend_local_manifest_path"]).splitlines()[0] == "/root/graspgen_310p_bundle"
+    assert planner_params["startup_warmup"] is True
+    assert _decode_launch_string(str(planner_params["legacy_detect_service"])) == ("/grasp_planner/detect_and_segment")
+    assert "remote_310p_host" not in planner_params
+    assert "host_runtime" not in planner_params
+    assert _normalize_launch_environment(planner) == {
+        "GOMP_SPINCOUNT": "0",
+        "OMP_DYNAMIC": "FALSE",
+        "OMP_NUM_THREADS": "4",
+        "OMP_WAIT_POLICY": "PASSIVE",
+        "OPENBLAS_NUM_THREADS": "1",
+    }
+
+    pick_executor = next(node for node in nodes if vars(node).get("_Node__node_name") == "pick_executor_node")
+    pick_executor_params = _normalize_launch_param_mapping(pick_executor._Node__parameters[0])
+    home_joint_positions = _decode_launch_json_string(str(pick_executor_params["home_joint_positions_json"]))
+    assert home_joint_positions["5"] == 0.0
 
 
 def test_handeye_grasp_launch_auto_starts_parallel_ik_workers(monkeypatch, tmp_path):
@@ -383,3 +437,37 @@ def test_source_workspace_profile_uses_absolute_development_catalog_root():
     assert source_root.is_absolute()
     assert source_root == Path(__file__).parents[3] / "src" / "skill_catalog"
     assert _decode_launch_string(params["skill_catalog_profile"]) == "so101_single_arm"
+
+
+def test_embodied_runtime_waits_for_required_controllers():
+    module = _load_launch_module()
+    config = {
+        "controller_startup_timeout": {"hardware": 30.0},
+        "control_modes": {
+            "moveit_planning": {
+                "controllers": [
+                    "joint_state_broadcaster",
+                    "arm_trajectory_controller",
+                    "gripper_trajectory_controller",
+                ]
+            }
+        },
+    }
+
+    waiter = module._controller_ready_waiter(config, "moveit_planning", use_sim=False, auto_start=True)
+
+    assert isinstance(waiter, Node)
+    assert waiter.node_package == "robot_config"
+    assert waiter.node_executable == "wait_for_controllers"
+    assert "arm_trajectory_controller" in [_decode_launch_string(str(arg)) for arg in waiter._Node__arguments]
+
+
+def test_embodied_runtime_readiness_handler_starts_only_after_success():
+    module = _load_launch_module()
+    runtime_actions = [object(), object()]
+    handler = module._start_runtime_after_controller_readiness(runtime_actions)
+
+    assert handler(type("Event", (), {"returncode": 0})(), None) == runtime_actions
+    failure_actions = handler(type("Event", (), {"returncode": 1})(), None)
+    assert len(failure_actions) == 1
+    assert isinstance(failure_actions[0], EmitEvent)
