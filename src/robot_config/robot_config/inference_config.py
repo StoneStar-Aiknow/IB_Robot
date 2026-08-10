@@ -9,6 +9,7 @@ import os
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal
@@ -179,7 +180,9 @@ class InferencePipelineConfig:
     hardware_resource_id: str | None = None
     hardware_profile_fingerprint: str | None = None
     profile_path: Path | None = None
-    public_capacity: Mapping[str, InferenceWorkCapacityConfig] = MappingProxyType({})
+    public_capacity: Mapping[str, InferenceWorkCapacityConfig] = dataclass_field(
+        default_factory=lambda: MappingProxyType({})
+    )
     # Canonical runtime policy (session/ingress/transport identity) built by
     # _build_runtime_policy_json; None when scheduler disabled.
     runtime_policy_json: str | None = None
@@ -254,7 +257,7 @@ class ControlModeInferenceConfig:
     inference_pipeline: str | None = None
     inference_fallback_chain: tuple[str, ...] = ()
     inference_priority: int = 0
-    inference_retry: Mapping[str, int] = MappingProxyType({})
+    inference_retry: Mapping[str, int] = dataclass_field(default_factory=lambda: MappingProxyType({}))
 
 
 def scheduler_enabled_from_raw_config(robot_config: Mapping[str, Any], control_mode: str) -> bool:
