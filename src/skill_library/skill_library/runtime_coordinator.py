@@ -1,6 +1,6 @@
 """Runtime ownership of immutable skill catalog bundles.
 
-The coordinator deliberately contains no ROS types or execution leases.  It
+The owner deliberately contains no ROS types or execution leases.  It
 serializes catalog activation and keeps the registry's version identity in one
 place so the ROS node can expose the same state through status, reload, and
 snapshot services.
@@ -12,6 +12,7 @@ from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import RLock
+from typing import Protocol
 
 from skill_catalog.models import (
     SkillDiagnostic,
@@ -24,6 +25,12 @@ from skill_catalog.registry import RegistryActivation, SkillRegistry
 SKILL_REQUEST_ID_CONFLICT = "SKILL_REQUEST_ID_CONFLICT"
 SKILL_RELOAD_IN_PROGRESS = "SKILL_RELOAD_IN_PROGRESS"
 SKILL_SNAPSHOT_DIGEST_MISMATCH = "SKILL_SNAPSHOT_DIGEST_MISMATCH"
+
+
+class _Lock(Protocol):
+    def __enter__(self): ...
+
+    def __exit__(self, exc_type, exc_value, traceback): ...
 
 
 @dataclass(frozen=True)
@@ -55,7 +62,7 @@ class PreparedReload:
     old_bundle: SkillRuntimeBundle | None
 
 
-class SkillRuntimeCoordinator:
+class SkillRegistryOwner:
     """Own the active catalog bundle and its process-local lifecycle."""
 
     def __init__(
@@ -65,6 +72,7 @@ class SkillRuntimeCoordinator:
         registry_epoch: str | None = None,
         request_history_capacity: int = 64,
         max_unretained_history: int = 2,
+        state_lock: _Lock | None = None,
     ) -> None:
         if request_history_capacity <= 0:
             raise ValueError("request_history_capacity must be positive")
@@ -73,7 +81,7 @@ class SkillRuntimeCoordinator:
             registry_epoch=registry_epoch,
             max_unretained_history=max_unretained_history,
         )
-        self._lock = RLock()
+        self._lock = state_lock or RLock()
         self._request_history_capacity = request_history_capacity
         self._request_history: OrderedDict[str, tuple[bool, ReloadResult]] = OrderedDict()
         self._current: SkillRuntimeBundle | None = None

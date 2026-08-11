@@ -31,15 +31,15 @@ def test_status_preflight_timeout_has_hardware_discovery_floor():
     from robot_skill_cli.cli import _plan_rpc_timeout, _status_preflight_timeout
 
     context = type("Context", (), {"view": {"timeout_policy": {"rpc_timeout_sec": 5.0}}})()
-    assert _plan_rpc_timeout(context) == 15.0
-    assert _status_preflight_timeout(context) == 15.0
+    assert _plan_rpc_timeout(context) == 30.0
+    assert _status_preflight_timeout(context) == 30.0
 
 
 def test_agent_control_timeout_preserves_larger_configured_value():
     from robot_skill_cli.cli import _plan_rpc_timeout
 
-    context = type("Context", (), {"view": {"timeout_policy": {"rpc_timeout_sec": 20.0}}})()
-    assert _plan_rpc_timeout(context) == 20.0
+    context = type("Context", (), {"view": {"timeout_policy": {"rpc_timeout_sec": 40.0}}})()
+    assert _plan_rpc_timeout(context) == 40.0
 
 
 def test_load_catalog_uses_exported_config_resolver(monkeypatch):
@@ -256,6 +256,23 @@ def test_agent_plan_parser_uses_typed_workflow_option_and_lifecycle_commands():
     assert plan.workflow_json == '[{"skill_name":"open_gripper_skill"}]'
     assert plan.request_id == "request-1"
     assert confirm.command == "confirm-plan"
+
+
+@pytest.mark.parametrize(
+    ("error_code", "exit_code"),
+    [
+        ("SKILL_PACKAGE_NOT_FOUND", 10),
+        ("SKILL_SCHEMA_INVALID", 11),
+        ("SKILL_WORKFLOW_LEASE_MISMATCH", 13),
+        ("SERVER_UNAVAILABLE", 14),
+        ("SKILL_TASK_DEADLINE_EXPIRED", 15),
+        ("SKILL_CANCEL_TIMEOUT", 15),
+    ],
+)
+def test_agent_plan_error_codes_use_v1_exit_groups(error_code: str, exit_code: int) -> None:
+    from robot_skill_cli.cli import _agent_error_exit_code
+
+    assert _agent_error_exit_code(error_code) == exit_code
 
 
 def test_runtime_capability_view_rejects_tampered_snapshot() -> None:
@@ -489,7 +506,7 @@ def test_status_command_uses_hardware_discovery_timeout_floor(monkeypatch, capsy
     assert cli.main(["--config-path", str(CONFIG_PATH), "status"]) == 0
 
     assert json.loads(capsys.readouterr().out)["ok"] is True
-    assert bridge.status_timeouts == [15.0]
+    assert bridge.status_timeouts == [30.0]
 
 
 def test_reload_catalog_command_uses_bound_gateway_source(monkeypatch, capsys):

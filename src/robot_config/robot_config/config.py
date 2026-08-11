@@ -124,7 +124,7 @@ class SkillGatewayRuntimeConfig:
     # SSOT-check required_control_mode membership instead of rebuilding the set
     # from the module-level _SUPPORTED_CONTROL_MODES constant.
     control_modes: tuple[str, ...] = ()
-    default_skill_timeout_sec: float = 30.0
+    default_skill_timeout_sec: float = 120.0
     robot_state_freshness_sec: float = 0.5
     task_budget_sec: float = 180.0
     rpc_timeout_sec: float = 5.0
@@ -151,7 +151,7 @@ class EmbodiedConfig:
     skill_catalog_profile: str = ""
     default_target_name: str = "demo_object"
     default_place_name: str = "tray_right"
-    skill_timeout_sec: float = 30.0
+    skill_timeout_sec: float = 120.0
     primitive_timeout_sec: float = 5.0
     primitive_wait_sec: float = 1.0
     timeouts: dict[str, Any] = field(default_factory=dict)

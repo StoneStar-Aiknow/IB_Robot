@@ -7,7 +7,7 @@ from typing import Any
 
 DEFAULT_EMBODIED_TIMEOUT_POLICY: dict[str, float] = {
     "task_budget_sec": 180.0,
-    "default_skill_timeout_sec": 30.0,
+    "default_skill_timeout_sec": 120.0,
     "robot_state_freshness_sec": 0.5,
     "scene_freshness_sec": 0.5,
     "model_idle_timeout_sec": 120.0,

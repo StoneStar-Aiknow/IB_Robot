@@ -138,7 +138,7 @@ def test_missing_or_wrong_exact_identity_fails_closed() -> None:
     assert stale.value.code == "SKILL_REGISTRY_VERSION_MISMATCH"
 
 
-def test_reconcile_keeps_only_current_and_gateway_retained_generations() -> None:
+def test_reconcile_keeps_gateway_retained_and_two_recent_generations() -> None:
     cache = SafetySnapshotCache()
     snapshots = [_snapshot(f"skill-{generation}") for generation in range(1, 5)]
     for generation, snapshot in enumerate(snapshots, start=1):
@@ -148,12 +148,12 @@ def test_reconcile_keeps_only_current_and_gateway_retained_generations() -> None
 
     assert cache.get(SnapshotIdentity("epoch-1", 1, snapshots[0].registry_digest))
     assert cache.get(SnapshotIdentity("epoch-1", 4, snapshots[3].registry_digest))
-    for generation in (2, 3):
-        with pytest.raises(SnapshotCacheError):
-            cache.get(SnapshotIdentity("epoch-1", generation, snapshots[generation - 1].registry_digest))
+    with pytest.raises(SnapshotCacheError):
+        cache.get(SnapshotIdentity("epoch-1", 2, snapshots[1].registry_digest))
+    assert cache.get(SnapshotIdentity("epoch-1", 3, snapshots[2].registry_digest))
 
 
-def test_reconcile_drops_current_when_gateway_no_longer_retains_it() -> None:
+def test_reconcile_keeps_recent_current_after_gateway_releases_it() -> None:
     cache = SafetySnapshotCache()
     old = _snapshot("old")
     new = _snapshot("new")
@@ -162,9 +162,8 @@ def test_reconcile_drops_current_when_gateway_no_longer_retains_it() -> None:
 
     cache.reconcile("epoch-1", {2})
 
-    assert cache.current_identity is None
-    with pytest.raises(SnapshotCacheError):
-        cache.get(SnapshotIdentity("epoch-1", 1, old.registry_digest))
+    assert cache.current_identity == SnapshotIdentity("epoch-1", 1, old.registry_digest)
+    assert cache.get(SnapshotIdentity("epoch-1", 1, old.registry_digest))
 
 
 def test_validate_skill_uses_exact_cached_snapshot_and_reports_current_on_miss() -> None:

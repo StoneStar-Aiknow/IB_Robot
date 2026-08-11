@@ -496,6 +496,9 @@ Hermes -> ibrobot-control Agent Skill -> robot-skill -> ROS Capability Gateway
 
 `robot_mcp` 兼容层已移除，统一通过 `robot-skill` 访问 Capability Gateway。
 
+SO-101 真机从启动、控制器检查、Hermes 自然语言确认执行到回原位和关闭的完整操作流程，见
+[`docs/hermes_so101_real_robot_manual_validation_zh.md`](docs/hermes_so101_real_robot_manual_validation_zh.md)。
+
 ### 发送 Agent 计划
 
 ```bash

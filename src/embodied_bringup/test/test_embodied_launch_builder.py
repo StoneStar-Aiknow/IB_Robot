@@ -259,29 +259,6 @@ def test_authorize_motion_launch_argument_defaults_to_false():
     assert authorize_motion.default_value[0].text == "false"
 
 
-def test_caller_policy_requires_security_and_motion_authorization(monkeypatch, tmp_path):
-    module = _load_launch_module()
-    module._load_config = lambda *_args, **_kwargs: {
-        "default_control_mode": "moveit_planning",
-        "embodied": {"enabled": True, "perception": {"enabled": False}},
-    }
-    monkeypatch.setenv("ROS_SECURITY_ENABLE", "true")
-    monkeypatch.setenv("ROS_SECURITY_STRATEGY", "Enforce")
-    monkeypatch.setenv("ROS_SECURITY_KEYSTORE", str(tmp_path))
-    context = _FakeLaunchContext(
-        {
-            "robot_config": "so101_single_arm",
-            "with_embodied": "true",
-            "authorize_motion": "true",
-            "enable_caller_policy": "true",
-        }
-    )
-    monkeypatch.setattr(module, "get_package_share_directory", lambda package: "/tmp")
-
-    actions = module.launch_setup(context)
-    assert actions
-
-
 def test_launch_setup_aborts_when_game_enabled_but_perception_disabled():
     """with_perception:=false while a game is enabled must fail the launch, not
     start a node graph that routes the game to a dead topic. The validation gate
@@ -321,8 +298,7 @@ def test_launch_setup_passes_operator_motion_authorization(monkeypatch, authoriz
     monkeypatch.setattr(module, "get_package_share_directory", lambda package: f"/tmp/{package}")
     generated = []
 
-    def capture_nodes(robot_config, active_control_mode, *, motion_authorized=False, caller_policy_enabled=False):
-        del caller_policy_enabled
+    def capture_nodes(robot_config, active_control_mode, *, motion_authorized=False):
         generated.append((robot_config, active_control_mode, motion_authorized))
         return []
 
@@ -334,10 +310,6 @@ def test_launch_setup_passes_operator_motion_authorization(monkeypatch, authoriz
     }
     if authorize_motion is not None:
         launch_configurations["authorize_motion"] = authorize_motion
-        launch_configurations["enable_caller_policy"] = "true"
-        monkeypatch.setenv("ROS_SECURITY_ENABLE", "true")
-        monkeypatch.setenv("ROS_SECURITY_STRATEGY", "Enforce")
-        monkeypatch.setenv("ROS_SECURITY_KEYSTORE", "/tmp")
 
     module.launch_setup(_FakeLaunchContext(launch_configurations))
 

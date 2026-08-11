@@ -286,7 +286,7 @@ def test_confirm_requires_successful_validation_state():
             task_budget_sec=10.0,
         )
 
-    assert raised.value.code == "SKILL_REJECTED"
+    assert raised.value.code == "SKILL_REQUEST_ID_CONFLICT"
     _validate(store, plan)
     assert store.confirm(
         plan_token=plan.plan_token,

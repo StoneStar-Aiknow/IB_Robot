@@ -124,9 +124,9 @@ def _write_skill_capability_config(tmp_path, capability, *, global_control_mode=
     return config_path
 
 
-def test_default_skill_timeout_is_thirty_seconds():
-    assert EmbodiedConfig().skill_timeout_sec == 30.0
-    assert load_embodied_config({}).skill_timeout_sec == 30.0
+def test_default_skill_timeout_is_two_minutes():
+    assert EmbodiedConfig().skill_timeout_sec == 120.0
+    assert load_embodied_config({}).skill_timeout_sec == 120.0
 
 
 def test_loader_rejects_removed_inline_skill_templates(tmp_path):
@@ -546,11 +546,11 @@ def test_load_single_arm_config():
     assert config.voice_asr.exit_on_init_failure is True
     assert config.skill_gateway.status_service == "/embodied/get_skill_gateway_status"
     assert config.skill_gateway.required_control_mode == "moveit_planning"
-    assert config.skill_gateway.default_skill_timeout_sec == 30.0
+    assert config.skill_gateway.default_skill_timeout_sec == 120.0
     assert config.skill_gateway.robot_state_freshness_sec == 0.5
     assert config.skill_gateway.task_budget_sec == 180.0
     assert config.skill_gateway.rpc_timeout_sec == 5.0
-    assert config.embodied.timeouts["default_skill_timeout_sec"] == 30.0
+    assert config.embodied.timeouts["default_skill_timeout_sec"] == 120.0
     assert config.embodied.timeouts["robot_state_freshness_sec"] == 0.5
 
     # Check cameras

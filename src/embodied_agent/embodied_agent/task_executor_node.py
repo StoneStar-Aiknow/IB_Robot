@@ -13,6 +13,7 @@ from embodied_agent.task_context import TIMEOUT_CONTEXT_KEY, load_task_context, 
 from embodied_common.dispatch_binding import binding_task_id, copy_binding
 from embodied_common.skill_request import derive_skill_task_id
 from embodied_common.workflow_contracts import compute_workflow_digest
+from embodied_common.workflow_lifecycle import WorkflowLifecycleClient, WorkflowLifecycleError
 from ibrobot_msgs.action import SkillCommand
 from ibrobot_msgs.msg import TaskCommand, TaskStatus
 from ibrobot_msgs.srv import BeginWorkflowExecution, FinalizeWorkflowExecution, GetSkillGatewayStatus
@@ -59,6 +60,13 @@ class TaskExecutorNode(BaseTaskNode):
         self._gateway_status_client = self.create_client(GetSkillGatewayStatus, self._gateway_status_service)
         self._begin_workflow_client = self.create_client(BeginWorkflowExecution, self._begin_workflow_service)
         self._finalize_workflow_client = self.create_client(FinalizeWorkflowExecution, self._finalize_workflow_service)
+        self._workflow_lifecycle = WorkflowLifecycleClient(
+            self._call_service,
+            self._begin_workflow_client,
+            self._begin_workflow_service,
+            self._finalize_workflow_client,
+            self._finalize_workflow_service,
+        )
         self.create_subscription(TaskCommand, self._input_topic, self._handle_planned_task, 10)
 
         self.get_logger().info(
@@ -203,30 +211,37 @@ class TaskExecutorNode(BaseTaskNode):
         if binding.workflow_digest and binding.workflow_digest != expected_workflow_digest:
             raise RuntimeError("SKILL_WORKFLOW_DIGEST_MISMATCH")
         binding.workflow_digest = expected_workflow_digest
-        begin_request = BeginWorkflowExecution.Request()
-        begin_request.dispatch_binding = binding
-        begin_request.workflow_steps = list(workflow_steps)
         try:
-            response = self._call_service(self._begin_workflow_client, begin_request, self._begin_workflow_service)
-        except RuntimeError as exc:
-            raise _WorkflowStateUnknown("workflow admission state is unknown") from exc
-        if not response.success or not response.root_lease_nonce:
-            raise RuntimeError(f"{response.error_code or 'SKILL_REJECTED'}: {response.message}")
-        if response.workflow_digest != binding.workflow_digest:
-            raise RuntimeError("SKILL_WORKFLOW_DIGEST_MISMATCH")
-        binding.root_lease_nonce = response.root_lease_nonce
-        return binding
+            lifecycle = getattr(self, "_workflow_lifecycle", None) or WorkflowLifecycleClient(
+                self._call_service,
+                self._begin_workflow_client,
+                self._begin_workflow_service,
+                self._finalize_workflow_client,
+                self._finalize_workflow_service,
+            )
+            return lifecycle.begin(binding, workflow_steps)
+        except WorkflowLifecycleError as exc:
+            if exc.code == "SKILL_CANCEL_TIMEOUT":
+                raise _WorkflowStateUnknown(str(exc)) from exc
+            raise RuntimeError(f"{exc.code}: {exc}") from exc
 
     def _finalize_workflow(self, binding, terminal_state: int, completed_step_count: int) -> bool:
-        request = FinalizeWorkflowExecution.Request()
-        request.dispatch_binding = binding
-        request.terminal_state = terminal_state
-        request.completed_step_count = completed_step_count
         try:
-            response = self._call_service(self._finalize_workflow_client, request, self._finalize_workflow_service)
-        except RuntimeError as exc:
-            raise _WorkflowStateUnknown("workflow finalization state is unknown") from exc
-        return bool(response.success)
+            lifecycle = getattr(self, "_workflow_lifecycle", None) or WorkflowLifecycleClient(
+                self._call_service,
+                self._begin_workflow_client,
+                self._begin_workflow_service,
+                self._finalize_workflow_client,
+                self._finalize_workflow_service,
+            )
+            response = lifecycle.finalize(binding, terminal_state, completed_step_count)
+            if not response.success and response.error_code != "GATEWAY_FINALIZATION_FAILED":
+                raise RuntimeError(f"{response.error_code}: {response.message}")
+            return bool(response.success)
+        except WorkflowLifecycleError as exc:
+            if exc.code == "SKILL_CANCEL_TIMEOUT":
+                raise _WorkflowStateUnknown(str(exc)) from exc
+            raise RuntimeError(f"{exc.code}: {exc}") from exc
 
     def _execute_task(self, msg: TaskCommand) -> None:
         completed_skills: list[str] = []
@@ -290,7 +305,7 @@ class TaskExecutorNode(BaseTaskNode):
                     state="failed",
                     success=False,
                     message="skill action server not available",
-                    error_code="SKILL_SERVER_UNAVAILABLE",
+                    error_code="CAPABILITY_NOT_READY",
                     recoverable=True,
                     replan_requested=True,
                 )

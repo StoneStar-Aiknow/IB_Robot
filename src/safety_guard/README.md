@@ -41,8 +41,8 @@ Task / Skill request
    应查询哪个 `(epoch, new_generation, registry_digest)`。收到事件后立即请求对应 snapshot。
 2. **`GetSkillGatewayStatus` 周期轮询**（`/embodied/get_skill_gateway_status`，周期
    `snapshot_sync_period_sec`，默认 `1.0`）：获取当前 identity 和 `retained_generations`，对每个 retained
-   generation 请求缺失的 snapshot，并 `reconcile` 本地缓存。缓存只保留 Gateway 明确声明的
-   `retained_generations` 和 current generation，不自行延长已释放 generation 的安全可用期。
+   generation 请求缺失的 snapshot，并 `reconcile` 本地缓存。缓存保留 Gateway 声明的
+   `retained_generations`，并额外保留当前 epoch 最近两个 generation，以覆盖 reload 期间的活动校验。
 3. **`GetSkillSnapshot` 拉取**（`/embodied/get_skill_snapshot`）：按 `(epoch, generation)` 精确查询，
    `generation>0` 必须精确匹配，不静默升级到更新版本；已被回收返回 `SKILL_SNAPSHOT_NOT_RETAINED`。
 
@@ -161,9 +161,9 @@ digest、期望 index 和完整 step payload 的权威校验只在后续 Gateway
 - 缓存的 snapshot digest 与请求期望不一致：`error_code=SKILL_REGISTRY_VERSION_MISMATCH`。
 - snapshot payload 校验失败：`error_code=SKILL_SCHEMA_INVALID` 或 `SKILL_SNAPSHOT_DIGEST_MISMATCH`。
 - 校验通过且白名单/工作空间/关节限位全部满足：`allowed=true`、`error_code=""`。
-- 校验通过但规则不满足：`allowed=false`，skill 返回 `SKILL_LIMIT_VIOLATION`，primitive 返回
-  `PRIMITIVE_LIMIT_VIOLATION`。
-- 任一异常被捕获后返回 `allowed=false` 和内部错误消息，绝不静默放行。
+- 校验通过但规则不满足：`allowed=false`，skill 和 primitive 均返回 `SKILL_LIMIT_VIOLATION`。
+- 输入/Schema 异常返回 `SKILL_SCHEMA_INVALID`；内部异常 fail closed，返回
+  `CAPABILITY_NOT_READY` 和固定消息，完整异常只写日志。
 
 ## 5. 当前内置规则
 

@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import os
 import re
 from pathlib import Path
 from typing import Any
 
+from embodied_common.canon import sha256_text, to_canonical_json
 from ibrobot_msgs.msg import DelegatedExecutorIdentity, DispatchBinding, WorkflowStep
 
 
@@ -48,17 +47,15 @@ def delegated_executor_identity(
     model_fingerprint: str = "",
     model_bundle_digest: str = "",
 ) -> dict[str, str]:
-    configuration_digest = hashlib.sha256(
-        json.dumps(
+    configuration_digest = sha256_text(
+        to_canonical_json(
             {
                 "endpoint_kind": endpoint_kind,
                 "endpoint_name": endpoint_name,
                 "configuration": configuration if configuration is not None else {},
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    ).hexdigest()
+            }
+        )
+    )
     model_fields = (model_deployment_name, model_fingerprint, model_bundle_digest)
     if any(model_fields) and not all(model_fields):
         raise ValueError("model identity fields must be all present or all empty")

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import math
 import secrets
@@ -13,7 +12,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from embodied_common.primitive_contracts import canonical_json
+from embodied_common.canon import sha256_text, to_canonical_json
 from embodied_common.workflow_contracts import CanonicalWorkflowStep, normalize_workflow_steps
 
 MAX_PLAN_STEPS = 16
@@ -243,7 +242,7 @@ class AgentPlanStore:
         if isinstance(task_budget_sec, bool) or not math.isfinite(normalized_budget) or normalized_budget <= 0.0:
             raise AgentPlanError("SKILL_SCHEMA_INVALID", "task_budget_sec must be finite and positive")
         if record.state != "VALIDATED":
-            raise AgentPlanError("SKILL_REJECTED", "plan must be validated before confirmation")
+            raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "plan must be validated before confirmation")
         confirmation_token = _new_opaque_token(self._token_factory)
         started_at = _wall_time(self._wall_now())
         deadline = _wall_time(started_at[0] + started_at[1] / 1_000_000_000 + normalized_budget)
@@ -392,9 +391,9 @@ class AgentPlanStore:
     def _wall_now(self) -> float:
         now = float(self._wall_clock())
         if not math.isfinite(now) or now < 0.0:
-            raise AgentPlanError("SKILL_CLOCK_INVALID", "ROS clock is invalid")
+            raise AgentPlanError("CAPABILITY_NOT_READY", "ROS clock is invalid")
         if self._last_wall_time is not None and now < self._last_wall_time:
-            raise AgentPlanError("SKILL_CLOCK_INVALID", "ROS clock moved backwards")
+            raise AgentPlanError("CAPABILITY_NOT_READY", "ROS clock moved backwards")
         self._last_wall_time = now
         return now
 
@@ -459,7 +458,7 @@ def compute_plan_digest(
         "registry_generation": registry_generation,
         "registry_digest": registry_digest,
     }
-    return hashlib.sha256(canonical_json(preimage).encode("utf-8")).hexdigest()
+    return sha256_text(to_canonical_json(preimage))
 
 
 def _plan_payload_matches(

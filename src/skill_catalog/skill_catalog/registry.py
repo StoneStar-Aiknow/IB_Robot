@@ -17,6 +17,8 @@ class RegistryActivation:
 
 class SkillRegistry:
     def __init__(self, *, registry_epoch: str | None = None, max_unretained_history: int = 2) -> None:
+        if max_unretained_history < 1:
+            raise ValueError("max_unretained_history must be at least 1")
         self.registry_epoch = registry_epoch or str(uuid.uuid4())
         self.max_unretained_history = max_unretained_history
         self._current: SkillRuntimeBundle | None = None

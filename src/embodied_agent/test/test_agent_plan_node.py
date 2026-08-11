@@ -298,7 +298,7 @@ def test_confirm_plan_rejects_plan_that_was_not_validated(plan_rig):
     confirmed = _future_result(plan_rig.confirm_client.call_async(confirm_request))
 
     assert confirmed.confirmed is False
-    assert confirmed.error_code == "SKILL_REJECTED"
+    assert confirmed.error_code == "SKILL_REQUEST_ID_CONFLICT"
 
 
 def test_validate_plan_rejects_mismatched_safety_identity(plan_rig):
@@ -398,7 +398,7 @@ def test_send_skill_rejects_success_payload_from_aborted_action():
             ("epoch", 1, "digest"),
         )
 
-    assert raised.value.code == "SKILL_EXECUTION_FAILED"
+    assert raised.value.code == "CAPABILITY_NOT_READY"
 
 
 def test_send_skill_reports_unknown_when_goal_acceptance_times_out():
@@ -413,7 +413,7 @@ def test_send_skill_reports_unknown_when_goal_acceptance_times_out():
             ("epoch", 1, "digest"),
         )
 
-    assert raised.value.code == "SKILL_EXECUTION_STATE_UNKNOWN"
+    assert raised.value.code == "SKILL_CANCEL_TIMEOUT"
 
 
 def test_send_skill_requires_cancel_acceptance_and_terminal_result():

@@ -1,7 +1,6 @@
 """Skill and primitive execution node for the embodied minimal closure."""
 
 import copy
-import hashlib
 import json
 import math
 import threading
@@ -28,6 +27,7 @@ from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from unique_identifier_msgs.msg import UUID
 
+from embodied_common.canon import sha256_text, to_canonical_json
 from embodied_common.dispatch_binding import (
     copy_binding,
     delegated_executor_identity,
@@ -67,7 +67,7 @@ from skill_library.gateway_policy import (
     SkillRequirements,
 )
 from skill_library.resolver import PrimitiveSpec, load_json_mapping, resolve_skill_primitives
-from skill_library.runtime_coordinator import SkillRuntimeCoordinator
+from skill_library.runtime_coordinator import SkillRegistryOwner
 
 EE_POSITION_TOLERANCE_M = 0.02
 SKILL_CANCEL_TIMEOUT = "SKILL_CANCEL_TIMEOUT"
@@ -371,7 +371,7 @@ class SkillExecutorNode(Node):
         self.declare_parameter("skill_catalog_source_root", "")
         self.declare_parameter("skill_catalog_profile", "")
         self.declare_parameter("robot_name", "unknown", descriptor=startup_descriptor)
-        self.declare_parameter("default_skill_timeout_sec", 30.0, descriptor=startup_descriptor)
+        self.declare_parameter("default_skill_timeout_sec", 120.0, descriptor=startup_descriptor)
         self.declare_parameter("task_budget_sec", 180.0, descriptor=startup_descriptor)
         self.declare_parameter("robot_state_freshness_sec", 0.5, descriptor=startup_descriptor)
         self.declare_parameter("scene_freshness_sec", 0.5, descriptor=startup_descriptor)
@@ -520,7 +520,10 @@ class SkillExecutorNode(Node):
         self._terminal_workflows: dict[str, _TerminalWorkflow] = {}
         self._external_admissions: dict[int, _ExternalPrimitiveAdmission] = {}
         self._robot_config_digest = self.get_parameter("config_digest").get_parameter_value().string_value
-        self._runtime_coordinator = SkillRuntimeCoordinator(self._compile_runtime_snapshot)
+        self._runtime_coordinator = SkillRegistryOwner(
+            self._compile_runtime_snapshot,
+            state_lock=self._state_lock,
+        )
         startup_reload = self._runtime_coordinator.reload("startup")
         if not startup_reload.success:
             raise ValueError(f"skill catalog startup failed: {startup_reload.error_code}: {startup_reload.message}")
@@ -1060,8 +1063,7 @@ class SkillExecutorNode(Node):
             "waypoint_duration_sec": float(goal.waypoint_duration_sec),
             "timeout_sec": float(goal.timeout_sec),
         }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-        return hashlib.sha256(encoded).hexdigest()
+        return sha256_text(to_canonical_json(payload))
 
     @staticmethod
     def _set_begin_failure(response, error_code: str, message: str = ""):
@@ -1155,7 +1157,7 @@ class SkillExecutorNode(Node):
                 if step.timeout_sec > 0.0 and step.timeout_sec > duration_sec:
                     return self._set_begin_failure(
                         response,
-                        "SKILL_TIMEOUT_OUT_OF_RANGE",
+                        "SKILL_TASK_BUDGET_MISMATCH",
                         f"workflow step {index} timeout exceeds root task budget",
                     )
                 decision = workflow_policy.evaluate(
@@ -1225,7 +1227,7 @@ class SkillExecutorNode(Node):
                 self._record_workflow_terminal(
                     active,
                     FinalizeWorkflowExecution.Request.FAILED,
-                    error_code="SKILL_WORKFLOW_DEADLINE_EXCEEDED",
+                    error_code="SKILL_TASK_DEADLINE_EXPIRED",
                 )
                 if not self._cleanup_terminal_workflow(active):
                     return
@@ -1296,10 +1298,8 @@ class SkillExecutorNode(Node):
             binding.schema_version != 1
             or not root_task_id
             or binding.task_id != root_task_id
-            or binding.workflow_step_index != 0
             or not binding.workflow_digest
             or not binding.root_lease_nonce
-            or binding.dispatch_nonce
             or request.terminal_state
             not in {
                 FinalizeWorkflowExecution.Request.SUCCEEDED,
@@ -1308,12 +1308,16 @@ class SkillExecutorNode(Node):
             }
         ):
             return self._set_finalize_failure(response, "SKILL_SCHEMA_INVALID")
+        if binding.workflow_step_index != 0:
+            return self._set_finalize_failure(response, "SKILL_WORKFLOW_STEP_MISMATCH")
+        if binding.dispatch_nonce:
+            return self._set_finalize_failure(response, "SKILL_DISPATCH_NOT_AUTHORIZED")
         with self._state_guard():
             active = self._active_workflow
             if active is None:
                 terminal = self._terminal_workflows.get(root_task_id)
                 if terminal is None:
-                    return self._set_finalize_failure(response, "SKILL_WORKFLOW_NOT_FOUND")
+                    return self._set_finalize_failure(response, "SKILL_WORKFLOW_LEASE_MISMATCH")
                 try:
                     recomputed_digest = compute_workflow_digest(
                         root_task_id=root_task_id,
@@ -1325,15 +1329,21 @@ class SkillExecutorNode(Node):
                     )
                 except (TypeError, ValueError) as exc:
                     return self._set_finalize_failure(response, "SKILL_SCHEMA_INVALID", str(exc))
+                if terminal.registry_epoch != binding.expected_registry_epoch:
+                    return self._set_finalize_failure(response, "SKILL_REGISTRY_EPOCH_MISMATCH")
                 if (
-                    recomputed_digest != binding.workflow_digest
-                    or terminal.workflow_digest != binding.workflow_digest
-                    or terminal.root_lease_nonce != binding.root_lease_nonce
-                    or terminal.registry_epoch != binding.expected_registry_epoch
-                    or terminal.registry_generation != binding.expected_registry_generation
+                    terminal.registry_generation != binding.expected_registry_generation
                     or terminal.registry_digest != binding.expected_registry_digest
-                    or terminal.task_budget_key != self._task_budget_key(binding)
-                    or terminal.terminal_state != request.terminal_state
+                ):
+                    return self._set_finalize_failure(response, "SKILL_REGISTRY_VERSION_MISMATCH")
+                if recomputed_digest != binding.workflow_digest or terminal.workflow_digest != binding.workflow_digest:
+                    return self._set_finalize_failure(response, "SKILL_WORKFLOW_DIGEST_MISMATCH")
+                if terminal.root_lease_nonce != binding.root_lease_nonce:
+                    return self._set_finalize_failure(response, "SKILL_WORKFLOW_LEASE_MISMATCH")
+                if terminal.task_budget_key != self._task_budget_key(binding):
+                    return self._set_finalize_failure(response, "SKILL_TASK_BUDGET_MISMATCH")
+                if (
+                    terminal.terminal_state != request.terminal_state
                     or terminal.completed_step_count != request.completed_step_count
                 ):
                     return self._set_finalize_failure(response, "SKILL_REQUEST_ID_CONFLICT")
@@ -1352,21 +1362,25 @@ class SkillExecutorNode(Node):
                 )
             except (TypeError, ValueError) as exc:
                 return self._set_finalize_failure(response, "SKILL_SCHEMA_INVALID", str(exc))
+            if active.root_task_id != root_task_id:
+                return self._set_finalize_failure(response, "SKILL_WORKFLOW_LEASE_MISMATCH")
+            if binding.expected_registry_epoch != active.bundle.registry_epoch:
+                return self._set_finalize_failure(response, "SKILL_REGISTRY_EPOCH_MISMATCH")
             if (
-                active.root_task_id != root_task_id
-                or recomputed_digest != binding.workflow_digest
-                or active.workflow_digest != binding.workflow_digest
-                or active.root_lease_nonce != binding.root_lease_nonce
-                or active.task_budget_key != self._task_budget_key(binding)
-                or binding.expected_registry_epoch != active.bundle.registry_epoch
-                or binding.expected_registry_generation != active.bundle.generation
+                binding.expected_registry_generation != active.bundle.generation
                 or binding.expected_registry_digest != active.bundle.snapshot.registry_digest
             ):
-                return self._set_finalize_failure(response, "SKILL_REQUEST_ID_CONFLICT")
+                return self._set_finalize_failure(response, "SKILL_REGISTRY_VERSION_MISMATCH")
+            if recomputed_digest != binding.workflow_digest or active.workflow_digest != binding.workflow_digest:
+                return self._set_finalize_failure(response, "SKILL_WORKFLOW_DIGEST_MISMATCH")
+            if active.root_lease_nonce != binding.root_lease_nonce:
+                return self._set_finalize_failure(response, "SKILL_WORKFLOW_LEASE_MISMATCH")
+            if active.task_budget_key != self._task_budget_key(binding):
+                return self._set_finalize_failure(response, "SKILL_TASK_BUDGET_MISMATCH")
             active_child = self._active_skill_admission
             if isinstance(active_child, _WorkflowChildAdmission) and active_child.workflow is active:
                 return self._set_finalize_failure(
-                    response, GATEWAY_FINALIZATION_FAILED, "workflow child cleanup pending"
+                    response, "SKILL_WORKFLOW_LEASE_MISMATCH", "workflow child cleanup pending"
                 )
             if request.completed_step_count != active.completed_step_count:
                 return self._set_finalize_failure(response, "SKILL_REQUEST_ID_CONFLICT")
@@ -1408,7 +1422,7 @@ class SkillExecutorNode(Node):
                 else (
                     "SKILL_CANCELLED"
                     if request.terminal_state == FinalizeWorkflowExecution.Request.CANCELED
-                    else "SKILL_EXECUTION_FAILED"
+                    else "CAPABILITY_NOT_READY"
                 )
             )
             try:
@@ -2934,7 +2948,13 @@ class SkillExecutorNode(Node):
         bundle = self._active_runtime_bundle
         executor = bundle.snapshot.delegated_executors.get("grasp_pipeline")
         if executor is None:
-            return self._abort_skill(result, goal_handle, [], "PICK_EXECUTOR_IDENTITY_MISSING", "pick executor missing")
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SKILL_EXECUTOR_IDENTITY_MISMATCH",
+                "pick executor missing",
+            )
         expected_executor = {
             "name": executor.name,
             "contract_version": executor.contract_version,
@@ -3075,7 +3095,7 @@ class SkillExecutorNode(Node):
                 result,
                 goal_handle,
                 result.executed_primitives,
-                "PICK_EXECUTOR_VERSION_MISMATCH",
+                "SKILL_EXECUTOR_IDENTITY_MISMATCH",
                 "pick executor identity does not match the registry snapshot",
             )
         if not pick_result.success:
@@ -3234,7 +3254,7 @@ class SkillExecutorNode(Node):
             )
             if not allowed:
                 result = SkillCommand.Result()
-                result = self._abort_skill(result, deferred_goal_handle, [], "SKILL_REJECTED", reason)
+                result = self._abort_skill(result, deferred_goal_handle, [], "CAPABILITY_NOT_READY", reason)
             else:
                 if coordinator is not None:
                     try:
@@ -3270,7 +3290,7 @@ class SkillExecutorNode(Node):
                 result,
                 deferred_goal_handle,
                 [],
-                "SKILL_REJECTED",
+                "CAPABILITY_NOT_READY",
                 f"gateway execution failed: {exc}",
             )
         finally:
@@ -3341,31 +3361,61 @@ class SkillExecutorNode(Node):
         with self._state_guard():
             workflow = self._active_workflow
             if workflow is None:
-                return self._abort_skill(result, goal_handle, [], "SKILL_WORKFLOW_NOT_FOUND", "workflow is not active")
+                return self._abort_skill(
+                    result, goal_handle, [], "SKILL_WORKFLOW_LEASE_MISMATCH", "workflow is not active"
+                )
             index = int(binding.workflow_step_index)
-            expected_task_id = (
-                derive_skill_task_id(workflow.root_task_id, index) if 0 <= index < len(workflow.workflow_steps) else ""
-            )
+            if binding.schema_version != 1:
+                return self._abort_skill(
+                    result, goal_handle, [], "SKILL_SCHEMA_INVALID", "invalid dispatch binding schema"
+                )
+            if binding.dispatch_nonce:
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    [],
+                    "SKILL_DISPATCH_NOT_AUTHORIZED",
+                    "workflow child dispatch nonce must be empty",
+                )
+            if binding.root_task_id != workflow.root_task_id or not binding.root_task_id:
+                return self._abort_skill(
+                    result, goal_handle, [], "SKILL_WORKFLOW_LEASE_MISMATCH", "workflow root lease does not match"
+                )
+            if index < 0 or index >= len(workflow.workflow_steps):
+                return self._abort_skill(
+                    result, goal_handle, [], "SKILL_WORKFLOW_STEP_MISMATCH", "workflow step index is out of range"
+                )
+            expected_task_id = derive_skill_task_id(workflow.root_task_id, index)
+            if binding.task_id != expected_task_id or binding.root_lease_nonce != workflow.root_lease_nonce:
+                return self._abort_skill(
+                    result, goal_handle, [], "SKILL_WORKFLOW_LEASE_MISMATCH", "workflow child lease does not match"
+                )
+            if binding.expected_registry_epoch != workflow.bundle.registry_epoch:
+                return self._abort_skill(
+                    result, goal_handle, [], "SKILL_REGISTRY_EPOCH_MISMATCH", "workflow registry epoch does not match"
+                )
             if (
-                binding.schema_version != 1
-                or binding.root_task_id != workflow.root_task_id
-                or binding.task_id != expected_task_id
-                or binding.workflow_digest != workflow.workflow_digest
-                or binding.root_lease_nonce != workflow.root_lease_nonce
-                or binding.dispatch_nonce
-                or binding.expected_registry_epoch != workflow.bundle.registry_epoch
-                or binding.expected_registry_generation != workflow.bundle.generation
+                binding.expected_registry_generation != workflow.bundle.generation
                 or binding.expected_registry_digest != workflow.bundle.snapshot.registry_digest
-                or self._task_budget_key(binding) != workflow.task_budget_key
-                or index != workflow.completed_step_count
-                or requested_step != workflow.workflow_steps[index]
             ):
                 return self._abort_skill(
                     result,
                     goal_handle,
                     [],
-                    "SKILL_WORKFLOW_DIGEST_MISMATCH",
-                    "workflow child does not match the active execution scope",
+                    "SKILL_REGISTRY_VERSION_MISMATCH",
+                    "workflow registry version does not match",
+                )
+            if self._task_budget_key(binding) != workflow.task_budget_key:
+                return self._abort_skill(
+                    result, goal_handle, [], "SKILL_TASK_BUDGET_MISMATCH", "workflow task budget does not match"
+                )
+            if binding.workflow_digest != workflow.workflow_digest:
+                return self._abort_skill(
+                    result, goal_handle, [], "SKILL_WORKFLOW_DIGEST_MISMATCH", "workflow digest does not match"
+                )
+            if index != workflow.completed_step_count or requested_step != workflow.workflow_steps[index]:
+                return self._abort_skill(
+                    result, goal_handle, [], "SKILL_WORKFLOW_STEP_MISMATCH", "workflow step does not match"
                 )
             if workflow.step_terminal_states[index] != WORKFLOW_STEP_PENDING:
                 replay = workflow.child_results.get(index)
@@ -3442,7 +3492,7 @@ class SkillExecutorNode(Node):
                         result,
                         deferred_goal_handle,
                         [],
-                        "SKILL_TIMEOUT",
+                        "SKILL_TASK_DEADLINE_EXPIRED",
                         "workflow task budget expired",
                     )
                 elif goal_handle.request.timeout_sec > 0.0 and goal_handle.request.timeout_sec > remaining_budget:
@@ -3450,7 +3500,7 @@ class SkillExecutorNode(Node):
                         result,
                         deferred_goal_handle,
                         [],
-                        "SKILL_TIMEOUT_OUT_OF_RANGE",
+                        "SKILL_TASK_BUDGET_MISMATCH",
                         "workflow step timeout exceeds remaining task budget",
                     )
                 else:

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -34,17 +33,19 @@ def test_load_delegated_model_identity_uses_strict_manifest(monkeypatch):
     }
 
 
-def test_checked_in_grasp_manifest_is_valid(monkeypatch):
-    from inference_manifest import load_inference_manifest
-
-    validated = load_inference_manifest("models/grasp", "torch_cuda")
-
-    assert validated.manifest.model.family == "graspgen"
-    assert len(validated.fingerprint) == 64
-    assert json.loads((validated.bundle_root / "model-source.json").read_text(encoding="utf-8"))["repository"]
-
-    monkeypatch.setenv("WORKSPACE", str(validated.bundle_root.parents[1]))
-    identity = load_delegated_model_identity(
-        {"model_bundle_path": "$(env WORKSPACE)/models/grasp", "model_deployment": "torch_cuda"}
+def test_manifest_identity_loader_uses_user_supplied_bundle(monkeypatch, tmp_path):
+    validated = SimpleNamespace(
+        deployment_name="torch_cuda",
+        fingerprint="a" * 64,
+        manifest=SimpleNamespace(bundle=SimpleNamespace(digest=SimpleNamespace(value="b" * 64))),
     )
+    monkeypatch.setattr("inference_manifest.load_inference_manifest", lambda *_args: validated)
+    bundle = tmp_path / "grasp"
+    bundle.mkdir()
+    monkeypatch.setenv("WORKSPACE", str(tmp_path))
+
+    identity = load_delegated_model_identity(
+        {"model_bundle_path": "$(env WORKSPACE)/grasp", "model_deployment": "torch_cuda"}
+    )
+
     assert identity["model_fingerprint"] == validated.fingerprint

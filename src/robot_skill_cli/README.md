@@ -150,6 +150,12 @@ reason（没有冒号时两者都是该 code）。因此调用方应按 `error.c
 | `130` | SIGINT 取消已收敛到 terminal |
 | `143` | SIGTERM 取消已收敛到 terminal |
 
+上述 `3/4/124/130/143` 是 direct `validate/execute/cancel` 的兼容契约。Agent plan
+命令（`plan-workflow`、`validate-plan`、`confirm-plan`、`execute-plan`、`cancel-plan`）使用
+以下稳定分组：`10` 表示 package/profile/implementation 不存在，`11` 表示 schema/reference/limit
+校验失败，`13` 表示 registry/workflow/admission/finalization 状态错误，`14` 表示 ROS transport
+不可达，`15` 表示 timeout/budget/deadline 或停止状态未知。
+
 ## 授权边界
 
 `authorize_motion` 是唯一运行时运动授权来源，launch 默认值为 `false`。CLI 和 Agent 不能启动或重启
@@ -170,3 +176,6 @@ hermes-robot --config-name so101_single_arm
 `ibrobot-control`、目标 robot config、Gateway control-plane status 以及全部 Agent plan service/action。
 `motion_authorized=false` 不阻止 Hermes 启动，只会继续由 Gateway 拒绝运动。启动器仅设置精确
 `ROBOT_CONFIG` 并预加载 `ibrobot-control`；它不会启动/重启 pipeline、修改 ROS 参数或开启运动授权。
+
+SO-101 真机的完整手动验证步骤见
+[`docs/hermes_so101_real_robot_manual_validation_zh.md`](../../docs/hermes_so101_real_robot_manual_validation_zh.md)。

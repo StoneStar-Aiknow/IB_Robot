@@ -650,7 +650,7 @@ exact registry identity 和非空 `dispatch_nonce`；server 在已验证的 exac
 | --- | --- |
 | `allowed` | 是否允许执行 |
 | `reason` | 不允许时的原因 |
-| `error_code` | 稳定错误码（如 `SKILL_SCHEMA_INVALID`、`SKILL_SNAPSHOT_NOT_RETAINED`、`SKILL_REGISTRY_VERSION_MISMATCH`、`PRIMITIVE_LIMIT_VIOLATION`） |
+| `error_code` | 稳定错误码（如 `SKILL_SCHEMA_INVALID`、`SKILL_SNAPSHOT_NOT_RETAINED`、`SKILL_REGISTRY_VERSION_MISMATCH`、`SKILL_LIMIT_VIOLATION`） |
 | `actual_registry_epoch` | 实际使用的 registry epoch |
 | `actual_registry_generation` | 实际使用的 registry generation |
 | `actual_registry_digest` | 实际使用的 registry digest |

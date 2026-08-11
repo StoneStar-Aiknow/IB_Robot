@@ -1139,7 +1139,7 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         skill_catalog_profile=data.get("skill_catalog_profile", ""),
         default_target_name=data.get("default_target_name", "demo_object"),
         default_place_name=data.get("default_place_name", "tray_right"),
-        skill_timeout_sec=execution.get("skill_timeout_sec", 30.0),
+        skill_timeout_sec=execution.get("skill_timeout_sec", 120.0),
         primitive_timeout_sec=execution.get("primitive_timeout_sec", 5.0),
         primitive_wait_sec=execution.get("primitive_wait_sec", 1.0),
         timeouts=timeout_policy,

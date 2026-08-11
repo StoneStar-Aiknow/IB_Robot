@@ -584,7 +584,7 @@ def test_typed_workflow_begin_ordered_children_and_finalize_are_idempotent(gatew
 
     out_of_order = send_child(1)
     assert out_of_order.success is False
-    assert out_of_order.error_code == "SKILL_WORKFLOW_DIGEST_MISMATCH"
+    assert out_of_order.error_code == "SKILL_WORKFLOW_STEP_MISMATCH"
     assert send_child(0).success is True
     assert send_child(1).success is True
 
@@ -750,9 +750,11 @@ def test_expired_workflow_is_reaped_when_executor_does_not_finalize(gateway_rig)
     began = _future_result(gateway_rig.begin_workflow_client.call_async(request))
     assert began.success is True
     _wait_for(lambda: _get_status(gateway_rig, task_id=root_task_id).request_state == "terminal", timeout_sec=2.0)
-    status = _get_status(gateway_rig, task_id=root_task_id)
+    status = _get_status(gateway_rig, task_id=root_task_id, payload_hash=binding.workflow_digest)
+    terminal_record = gateway_rig.executor_node._gateway_ledger.get(root_task_id)
     assert status.active_owner_kind == ""
     assert status.request_state == "terminal"
+    assert terminal_record.error_code == "SKILL_TASK_DEADLINE_EXPIRED"
 
 
 def _status_snapshot(**overrides) -> RuntimeSnapshot:

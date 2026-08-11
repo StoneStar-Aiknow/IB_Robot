@@ -37,7 +37,7 @@ Hermes / robot-skill
 versioned skill catalog runtime owner：启动时通过 `SkillCatalogCompiler` 从配置的 source
 （`skill_catalog_source_mode` = `installed` / `development` / `production`，root 由
 `skill_catalog_source_root` 指定，profile 由 `skill_catalog_profile` 指定）编译出 immutable
-`RuntimeSnapshot`，并由 `SkillRuntimeCoordinator` 管理 epoch/generation 生命周期。
+`RuntimeSnapshot`，并由 `SkillRegistryOwner` 管理 epoch/generation 生命周期。
 
 每个 snapshot 携带 exact registry identity 三元组 `(registry_epoch, generation, registry_digest)`，
 以及 `capability_digest`、`source_release_digest`、`provenance_digest`、`primitive_contract_digest`
@@ -436,7 +436,7 @@ Workflow step 状态为 `pending` / `active` / `succeeded` / `failed` / `cancele
 幂等终态化（ledger terminal record 先写、再释放 root lease 与 bundle retention）。这避免在下游清理状态
 未知时把 root lease 交给下一个请求，但要求显式终态化才能恢复。
 
-deadline 超时的 Workflow 由后台 reaper 读取：先原子写 ledger terminal record（`SKILL_WORKFLOW_DEADLINE_EXCEEDED`），
+deadline 超时的 Workflow 由后台 reaper 读取：先原子写 ledger terminal record（`SKILL_TASK_DEADLINE_EXPIRED`），
 再释放 bundle retention 与 root lease；写 record 与释放的顺序保证 cleanup 后相同 root ID 的重试能命中
 terminal record。
 

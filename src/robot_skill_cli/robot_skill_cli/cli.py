@@ -30,7 +30,38 @@ from robot_skill_cli.output import (
 
 _STATUS_PREFLIGHT_TIMEOUT_FLOOR_SEC = 15.0
 _CATALOG_RELOAD_TIMEOUT_FLOOR_SEC = 60.0
-_AGENT_CONTROL_TIMEOUT_FLOOR_SEC = 15.0
+_AGENT_CONTROL_TIMEOUT_FLOOR_SEC = 30.0
+
+_AGENT_NOT_FOUND_CODES = {
+    "SKILL_PROFILE_NOT_FOUND",
+    "SKILL_PACKAGE_NOT_FOUND",
+    "SKILL_IMPLEMENTATION_NOT_FOUND",
+}
+_AGENT_SCHEMA_CODES = {
+    "SKILL_SCHEMA_INVALID",
+    "SKILL_REFERENCE_MISSING",
+    "SKILL_UNKNOWN_PRIMITIVE",
+    "SKILL_UNKNOWN_EXECUTOR",
+    "SKILL_LIMIT_VIOLATION",
+}
+_AGENT_TIMEOUT_CODES = {
+    "TIMEOUT_EXCEEDS_POLICY",
+    "SKILL_TASK_BUDGET_MISMATCH",
+    "SKILL_TASK_DEADLINE_EXPIRED",
+    "SKILL_CANCEL_TIMEOUT",
+}
+
+
+def _agent_error_exit_code(error_code: str) -> int:
+    if error_code in _AGENT_NOT_FOUND_CODES:
+        return 10
+    if error_code in _AGENT_SCHEMA_CODES:
+        return 11
+    if error_code in _AGENT_TIMEOUT_CODES or "TIMEOUT" in error_code:
+        return 15
+    if error_code in {"SERVER_UNAVAILABLE", "ROS_TRANSPORT_ERROR"}:
+        return 14
+    return 13
 
 
 class _CliArgumentError(ValueError):
@@ -326,13 +357,15 @@ def _run_plan_workflow(args: argparse.Namespace, context, bridge) -> dict[str, A
         workflow_steps=workflow_steps,
         timeout_sec=_plan_rpc_timeout(context),
     )
-    _raise_plan_error(result, default_code="SKILL_SCHEMA_INVALID", exit_code=EXIT_GATEWAY_REJECTED)
+    code = str(result.get("error_code") or "SKILL_SCHEMA_INVALID")
+    _raise_plan_error(result, default_code=code, exit_code=_agent_error_exit_code(code))
     return result
 
 
 def _run_validate_plan(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
     result = bridge.validate_agent_plan(plan_token=args.plan_token, timeout_sec=_plan_rpc_timeout(context))
-    _raise_plan_error(result, default_code="SKILL_SCHEMA_INVALID", exit_code=EXIT_GATEWAY_REJECTED)
+    code = str(result.get("error_code") or "SKILL_SCHEMA_INVALID")
+    _raise_plan_error(result, default_code=code, exit_code=_agent_error_exit_code(code))
     return result
 
 
@@ -353,7 +386,8 @@ def _run_confirm_plan(args: argparse.Namespace, context, bridge) -> dict[str, An
         task_budget_sec=task_budget_sec,
         timeout_sec=timeout_sec,
     )
-    _raise_plan_error(result, default_code="SKILL_REQUEST_ID_CONFLICT", exit_code=EXIT_GATEWAY_REJECTED)
+    code = str(result.get("error_code") or "SKILL_REQUEST_ID_CONFLICT")
+    _raise_plan_error(result, default_code=code, exit_code=_agent_error_exit_code(code))
     return {"task_id": task_id, "registry": status, **result}
 
 
@@ -474,7 +508,7 @@ def _run_execute_plan(args: argparse.Namespace, context, bridge) -> _CommandExit
             return _CommandExit(EXIT_TIMEOUT)
         data = terminal["result"]
         emit_result(data)
-        return _CommandExit(_result_exit_code(data))
+        return _CommandExit(_result_exit_code(data, agent=True))
     goal_handle = goal_future.result()
     if goal_handle is None or not goal_handle.accepted:
         data = {
@@ -490,7 +524,7 @@ def _run_execute_plan(args: argparse.Namespace, context, bridge) -> _CommandExit
             "actual_registry_digest": "",
         }
         emit_result(data)
-        return _CommandExit(EXIT_GATEWAY_REJECTED)
+        return _CommandExit(13)
     result_future = goal_handle.get_result_async()
     deadline = time.monotonic() + timeout_sec + rpc_timeout
     while not result_future.done() and time.monotonic() < deadline:
@@ -509,11 +543,11 @@ def _run_execute_plan(args: argparse.Namespace, context, bridge) -> _CommandExit
             "actual_registry_digest": "",
         }
         emit_result(data)
-        return _CommandExit(EXIT_TIMEOUT)
+        return _CommandExit(15)
     result = result_future.result()
     data = _public_agent_plan_result(result.result)
     emit_result(data)
-    return _CommandExit(_result_exit_code(data))
+    return _CommandExit(_result_exit_code(data, agent=True))
 
 
 def _run_cancel_plan(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
@@ -523,13 +557,13 @@ def _run_cancel_plan(args: argparse.Namespace, context, bridge) -> dict[str, Any
     timeout_sec = _plan_rpc_timeout(context)
     cancel = bridge.cancel_agent_plan(task_id, timeout_sec=timeout_sec)
     if not cancel["accepted"]:
-        raise _CommandError("GOAL_NOT_FOUND", "agent plan goal was not active", exit_code=EXIT_GATEWAY_REJECTED)
+        raise _CommandError("GOAL_NOT_FOUND", "agent plan goal was not active", exit_code=13)
     terminal = bridge.get_agent_plan_result(
         task_id,
         timeout_sec=context.view["timeout_policy"]["task_budget_sec"] + timeout_sec,
     )
     if int(terminal.get("status", 0)) not in {4, 5, 6}:
-        raise _CommandError("SKILL_CANCEL_TIMEOUT", "robot stop state is unknown", exit_code=EXIT_TIMEOUT)
+        raise _CommandError("SKILL_CANCEL_TIMEOUT", "robot stop state is unknown", exit_code=15)
     return {
         "task_id": task_id,
         "accepted": True,
@@ -555,9 +589,11 @@ def _print_result(task_id: str, payload_hash: str, data: dict[str, Any]) -> None
     print(json_dumps(result_event(task_id, payload_hash, **data)), flush=True)
 
 
-def _result_exit_code(data: dict[str, Any]) -> int:
+def _result_exit_code(data: dict[str, Any], *, agent: bool = False) -> int:
     if data["success"]:
         return EXIT_SUCCESS
+    if agent:
+        return _agent_error_exit_code(str(data.get("error_code") or "CAPABILITY_NOT_READY"))
     if "TIMEOUT" in data["error_code"]:
         return EXIT_TIMEOUT
     return EXIT_GATEWAY_REJECTED

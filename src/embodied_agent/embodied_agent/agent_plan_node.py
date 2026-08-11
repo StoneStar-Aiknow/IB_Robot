@@ -24,6 +24,7 @@ from embodied_common.workflow_contracts import (
     compute_workflow_digest,
     normalize_workflow_steps,
 )
+from embodied_common.workflow_lifecycle import WorkflowLifecycleClient, WorkflowLifecycleError
 from ibrobot_msgs.action import ExecuteAgentPlan, SkillCommand
 from ibrobot_msgs.msg import AgentPlan as AgentPlanMsg
 from ibrobot_msgs.msg import SkillDiagnostic
@@ -50,6 +51,48 @@ class _WorkflowStateUnknown(AgentPlanError):
 
 class _ExecutionAlreadyActive(AgentPlanError):
     """A retry observed an existing execution and must not mutate its state."""
+
+
+_STABLE_EXECUTION_CODES = {
+    "CAPABILITY_NOT_READY",
+    "CONTROL_MODE_MISMATCH",
+    "GATEWAY_FINALIZATION_FAILED",
+    "GOAL_NOT_FOUND",
+    "MOTION_NOT_AUTHORIZED",
+    "SKILL_BUSY",
+    "SKILL_CANCELLED",
+    "SKILL_CANCEL_TIMEOUT",
+    "SKILL_DISPATCH_NOT_AUTHORIZED",
+    "SKILL_EXECUTION_BUSY",
+    "SKILL_EXECUTOR_IDENTITY_MISMATCH",
+    "SKILL_LIMIT_VIOLATION",
+    "SKILL_REGISTRY_EPOCH_MISMATCH",
+    "SKILL_REGISTRY_NOT_READY",
+    "SKILL_REGISTRY_VERSION_MISMATCH",
+    "SKILL_REQUEST_ID_CONFLICT",
+    "SKILL_SCHEMA_INVALID",
+    "SKILL_SNAPSHOT_DIGEST_MISMATCH",
+    "SKILL_SNAPSHOT_NOT_RETAINED",
+    "SKILL_TASK_BUDGET_MISMATCH",
+    "SKILL_TASK_DEADLINE_EXPIRED",
+    "SKILL_WORKFLOW_DIGEST_MISMATCH",
+    "SKILL_WORKFLOW_LEASE_MISMATCH",
+    "SKILL_WORKFLOW_STEP_MISMATCH",
+    "TIMEOUT_EXCEEDS_POLICY",
+}
+
+
+def _stable_execution_error_code(error_code: str) -> str:
+    code = str(error_code).strip()
+    if code in _STABLE_EXECUTION_CODES:
+        return code
+    if code == "CANCEL_CLEANUP_TIMEOUT":
+        return "SKILL_CANCEL_TIMEOUT"
+    if "TIMEOUT" in code:
+        return "SKILL_TASK_DEADLINE_EXPIRED"
+    if "EXECUTOR" in code and ("IDENTITY" in code or "VERSION" in code):
+        return "SKILL_EXECUTOR_IDENTITY_MISMATCH"
+    return "CAPABILITY_NOT_READY"
 
 
 class AgentPlanNode(Node):
@@ -102,6 +145,13 @@ class AgentPlanNode(Node):
         )
         self._finalize_workflow_client = self.create_client(
             FinalizeWorkflowExecution, self._finalize_workflow_service, callback_group=callback_group
+        )
+        self._workflow_lifecycle = WorkflowLifecycleClient(
+            self._call_service,
+            self._begin_workflow_client,
+            self._begin_workflow_service,
+            self._finalize_workflow_client,
+            self._finalize_workflow_service,
         )
         self._skill_client = ActionClient(self, SkillCommand, self._skill_action_name, callback_group=callback_group)
         self._plan_server = self.create_service(
@@ -161,14 +211,14 @@ class AgentPlanNode(Node):
 
     def _call_service(self, client, request, service_name: str):
         if not client.wait_for_service(timeout_sec=self._rpc_timeout):
-            raise AgentPlanError("SKILL_SERVER_UNAVAILABLE", f"service unavailable: {service_name}")
+            raise AgentPlanError("CAPABILITY_NOT_READY", f"service unavailable: {service_name}")
         future = client.call_async(request)
         if not self._wait_future(future, self._rpc_timeout):
-            raise AgentPlanError("SKILL_SERVER_UNAVAILABLE", f"service timed out: {service_name}")
+            raise AgentPlanError("CAPABILITY_NOT_READY", f"service timed out: {service_name}")
         try:
             return future.result()
         except Exception as exc:
-            raise AgentPlanError("SKILL_SERVER_UNAVAILABLE", f"service failed: {service_name}") from exc
+            raise AgentPlanError("CAPABILITY_NOT_READY", f"service failed: {service_name}") from exc
 
     def _gateway_status(self):
         request = GetSkillGatewayStatus.Request()
@@ -271,7 +321,7 @@ class AgentPlanNode(Node):
                 or capability is None
                 or capability.get("semantic_level") not in {"atomic_operator", "skill"}
             ):
-                raise AgentPlanError("SKILL_UNKNOWN", f"skill is not planner-visible: {skill_name}")
+                raise AgentPlanError("SKILL_REFERENCE_MISSING", f"skill is not planner-visible: {skill_name}")
         return steps
 
     def _plan_command(self, request, response):
@@ -342,7 +392,7 @@ class AgentPlanNode(Node):
                     first_error_code = "SKILL_REGISTRY_VERSION_MISMATCH"
                     first_error_message = "validation used a different registry identity"
                 elif not validation.allowed and not first_error_code:
-                    first_error_code = validation.error_code or "SKILL_REJECTED"
+                    first_error_code = validation.error_code or "CAPABILITY_NOT_READY"
                     first_error_message = validation.reason or first_error_code
             if first_error_code:
                 response.allowed = False
@@ -433,7 +483,7 @@ class AgentPlanNode(Node):
         child_deadline = min(execution_deadline, time.monotonic() + step_timeout)
         wait_timeout = min(self._rpc_timeout, max(0.0, child_deadline - time.monotonic()))
         if wait_timeout <= 0.0 or not self._skill_client.wait_for_server(timeout_sec=wait_timeout):
-            raise AgentPlanError("SKILL_SERVER_UNAVAILABLE")
+            raise AgentPlanError("CAPABILITY_NOT_READY")
         goal = SkillCommand.Goal()
         goal.dispatch_binding = binding
         goal.skill_name = step.skill_name
@@ -445,10 +495,10 @@ class AgentPlanNode(Node):
         send_future = self._skill_client.send_goal_async(goal)
         send_timeout = min(self._rpc_timeout, max(0.0, child_deadline - time.monotonic()))
         if send_timeout <= 0.0 or not self._wait_future(send_future, send_timeout):
-            raise _ChildStateUnknown("SKILL_EXECUTION_STATE_UNKNOWN", "skill goal acceptance state is unknown")
+            raise _ChildStateUnknown("SKILL_CANCEL_TIMEOUT", "skill goal acceptance state is unknown")
         child_handle = send_future.result()
         if child_handle is None or not child_handle.accepted:
-            raise AgentPlanError("SKILL_REJECTED", "skill goal rejected")
+            raise AgentPlanError("CAPABILITY_NOT_READY", "skill goal rejected")
         result_future = child_handle.get_result_async()
         deadline = child_deadline
 
@@ -474,7 +524,7 @@ class AgentPlanNode(Node):
                 cancel_child("SKILL_CANCELLED")
             time.sleep(0.02)
         if not result_future.done():
-            cancel_child("SKILL_TIMEOUT")
+            cancel_child("SKILL_TASK_DEADLINE_EXPIRED")
         action_result = result_future.result()
         terminal_status = getattr(action_result, "status", GoalStatus.STATUS_UNKNOWN)
         result = action_result.result if action_result is not None else None
@@ -482,14 +532,14 @@ class AgentPlanNode(Node):
             raise AgentPlanError("SKILL_CANCELLED", getattr(result, "message", "skill was canceled"))
         if terminal_status == GoalStatus.STATUS_ABORTED:
             raise AgentPlanError(
-                getattr(result, "error_code", "") or "SKILL_EXECUTION_FAILED",
+                _stable_execution_error_code(getattr(result, "error_code", "")),
                 getattr(result, "message", "") or "skill action was aborted",
             )
         if result is None or terminal_status != GoalStatus.STATUS_SUCCEEDED:
-            raise _ChildStateUnknown("SKILL_EXECUTION_STATE_UNKNOWN", "skill terminal result is unknown")
+            raise _ChildStateUnknown("SKILL_CANCEL_TIMEOUT", "skill terminal result is unknown")
         if not result.success:
             raise AgentPlanError(
-                result.error_code if result is not None and result.error_code else "SKILL_EXECUTION_FAILED",
+                _stable_execution_error_code(result.error_code if result is not None else ""),
                 result.message if result is not None else "skill result missing",
             )
         actual_identity = (
@@ -510,28 +560,43 @@ class AgentPlanNode(Node):
             expected_registry_digest=plan.registry_digest,
             workflow_steps=steps,
         )
-        request = BeginWorkflowExecution.Request()
-        request.dispatch_binding = binding
-        request.workflow_steps = [self._to_workflow_step_message(step) for step in steps]
         try:
-            response = self._call_service(self._begin_workflow_client, request, self._begin_workflow_service)
-        except AgentPlanError as exc:
-            raise _WorkflowStateUnknown("SKILL_EXECUTION_STATE_UNKNOWN", "workflow admission state is unknown") from exc
-        if not response.success:
-            raise AgentPlanError(response.error_code or "SKILL_REJECTED", response.message)
-        if response.workflow_digest != binding.workflow_digest or not response.root_lease_nonce:
-            raise AgentPlanError("SKILL_WORKFLOW_DIGEST_MISMATCH")
-        return response.root_lease_nonce
+            lifecycle = getattr(self, "_workflow_lifecycle", None) or WorkflowLifecycleClient(
+                self._call_service,
+                self._begin_workflow_client,
+                self._begin_workflow_service,
+                self._finalize_workflow_client,
+                self._finalize_workflow_service,
+            )
+            return lifecycle.begin(
+                binding,
+                [self._to_workflow_step_message(step) for step in steps],
+            ).root_lease_nonce
+        except WorkflowLifecycleError as exc:
+            if exc.code == "SKILL_CANCEL_TIMEOUT":
+                raise _WorkflowStateUnknown(exc.code, str(exc)) from exc
+            raise AgentPlanError(exc.code, str(exc)) from exc
 
     def _finalize_workflow(self, binding, terminal_state: int, completed_step_count: int):
-        request = FinalizeWorkflowExecution.Request()
-        request.dispatch_binding = binding
-        request.terminal_state = terminal_state
-        request.completed_step_count = completed_step_count
         try:
-            return self._call_service(self._finalize_workflow_client, request, self._finalize_workflow_service)
-        except Exception as exc:
-            raise _WorkflowStateUnknown("SKILL_CANCEL_TIMEOUT", "workflow finalization state is unknown") from exc
+            lifecycle = getattr(self, "_workflow_lifecycle", None) or WorkflowLifecycleClient(
+                self._call_service,
+                self._begin_workflow_client,
+                self._begin_workflow_service,
+                self._finalize_workflow_client,
+                self._finalize_workflow_service,
+            )
+            response = lifecycle.finalize(binding, terminal_state, completed_step_count)
+            if not response.success and response.error_code != "GATEWAY_FINALIZATION_FAILED":
+                raise AgentPlanError(
+                    response.error_code or "GATEWAY_FINALIZATION_FAILED",
+                    response.message or "workflow finalization failed",
+                )
+            return response
+        except WorkflowLifecycleError as exc:
+            if exc.code in {"SKILL_CANCEL_TIMEOUT", "GATEWAY_FINALIZATION_FAILED"}:
+                raise _WorkflowStateUnknown(exc.code, str(exc)) from exc
+            raise AgentPlanError(exc.code, str(exc)) from exc
 
     def _execute_plan(self, goal_handle):
         request = goal_handle.request
@@ -575,10 +640,10 @@ class AgentPlanNode(Node):
             deadline_unix = execution.task_budget_deadline[0] + execution.task_budget_deadline[1] / 1_000_000_000
             now = self.get_clock().now().nanoseconds / 1_000_000_000
             if now < execution.clock_at_confirmation:
-                raise AgentPlanError("SKILL_CLOCK_INVALID", "ROS clock moved backwards after confirmation")
+                raise AgentPlanError("CAPABILITY_NOT_READY", "ROS clock is not monotonic")
             remaining_timeout = deadline_unix - now
             if remaining_timeout <= 0.0:
-                raise AgentPlanError("SKILL_TIMEOUT", "confirmed task budget expired before execution")
+                raise AgentPlanError("SKILL_TASK_DEADLINE_EXPIRED", "confirmed task budget expired before execution")
             execution_deadline = time.monotonic() + remaining_timeout
             binding = self._root_binding(plan, request.task_id, execution)
             if len(steps) > 1:
@@ -613,10 +678,7 @@ class AgentPlanNode(Node):
                 if not finalized.success:
                     finalized = self._finalize_workflow(binding, FinalizeWorkflowExecution.Request.SUCCEEDED, completed)
                 if not finalized.success:
-                    raise _WorkflowStateUnknown(
-                        finalized.error_code or "SKILL_FINALIZATION_FAILED",
-                        finalized.message or "workflow finalization state is unknown",
-                    )
+                    raise _WorkflowStateUnknown("GATEWAY_FINALIZATION_FAILED", "workflow finalization failed")
                 workflow_started = False
             with self._store_lock:
                 self._store.mark_terminal(

@@ -1,6 +1,8 @@
-"""Tests for the ROS-independent skill runtime coordinator."""
+"""Tests for the ROS-independent skill registry owner."""
 
 from __future__ import annotations
+
+from threading import RLock
 
 import pytest
 
@@ -11,7 +13,7 @@ from skill_catalog.models import (
 )
 from skill_library.runtime_coordinator import (
     SKILL_REQUEST_ID_CONFLICT,
-    SkillRuntimeCoordinator,
+    SkillRegistryOwner,
 )
 
 
@@ -65,7 +67,7 @@ def _snapshot(name: str = "wave_hello") -> SkillSnapshot:
 
 def test_initial_activation_and_reload_increment_generation() -> None:
     snapshots = [_snapshot(), _snapshot("wave_hello_v2")]
-    coordinator = SkillRuntimeCoordinator(lambda: snapshots.pop(0), registry_epoch="epoch-1")
+    coordinator = SkillRegistryOwner(lambda: snapshots.pop(0), registry_epoch="epoch-1")
 
     initial = coordinator.reload("initial")
     assert initial.success is True
@@ -80,7 +82,7 @@ def test_initial_activation_and_reload_increment_generation() -> None:
 
 
 def test_reload_request_id_is_idempotent_and_conflicts_on_field_change() -> None:
-    coordinator = SkillRuntimeCoordinator(lambda: _snapshot(), registry_epoch="epoch-1")
+    coordinator = SkillRegistryOwner(lambda: _snapshot(), registry_epoch="epoch-1")
 
     first = coordinator.reload("request-1", force=False)
     assert coordinator.reload("request-1", force=False) == first
@@ -94,7 +96,7 @@ def test_reload_failure_is_fail_closed_before_initial_activation() -> None:
     def compile_snapshot():
         raise ValueError("invalid catalog")
 
-    coordinator = SkillRuntimeCoordinator(compile_snapshot)
+    coordinator = SkillRegistryOwner(compile_snapshot)
     result = coordinator.reload("request-1")
 
     assert result.success is False
@@ -105,11 +107,11 @@ def test_reload_failure_is_fail_closed_before_initial_activation() -> None:
 
 
 def test_retained_generation_survives_reload_until_execution_scope_releases_it() -> None:
-    snapshots = [_snapshot("v1"), _snapshot("v2")]
-    coordinator = SkillRuntimeCoordinator(
+    snapshots = [_snapshot("v1"), _snapshot("v2"), _snapshot("v3")]
+    coordinator = SkillRegistryOwner(
         lambda: snapshots.pop(0),
         registry_epoch="epoch-1",
-        max_unretained_history=0,
+        max_unretained_history=1,
     )
     assert coordinator.reload("initial").success
 
@@ -118,5 +120,24 @@ def test_retained_generation_survives_reload_until_execution_scope_releases_it()
     assert coordinator.get_snapshot(registry_epoch="epoch-1", generation=1) is retained
 
     coordinator.release(1)
+    assert coordinator.reload("reload-again").success
     with pytest.raises(SkillRegistryError, match="not retained"):
         coordinator.get_snapshot(registry_epoch="epoch-1", generation=1)
+
+
+@pytest.mark.parametrize("history", [0, -1])
+def test_history_retention_must_keep_at_least_one_generation(history: int) -> None:
+    with pytest.raises(ValueError, match="at least 1"):
+        SkillRegistryOwner(lambda: _snapshot(), max_unretained_history=history)
+
+
+def test_coordinator_uses_injected_executor_state_lock() -> None:
+    state_lock = RLock()
+    coordinator = SkillRegistryOwner(
+        lambda: _snapshot(),
+        registry_epoch="epoch-1",
+        state_lock=state_lock,
+    )
+
+    assert coordinator._lock is state_lock  # noqa: SLF001
+    assert coordinator.reload("initial").success is True

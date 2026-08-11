@@ -59,7 +59,6 @@ def generate_embodied_nodes(
     active_control_mode: str,
     *,
     motion_authorized: bool = False,
-    caller_policy_enabled: bool = False,
 ) -> list[Node]:
     """Generate embodied minimum-closure nodes from robot_config YAML."""
     embodied_config = robot_config.get("embodied", {})
@@ -153,12 +152,6 @@ def generate_embodied_nodes(
             "move_configuration_service", "/moveit_gateway/move_to_configuration"
         ),
     }
-    enclave_arguments = {
-        "safety_guard": ["--enclave", "/safety_guard_node"],
-        "skill_library": ["--enclave", "/skill_executor_node"],
-        "embodied_agent": ["--enclave", "/agent_plan_node"],
-    }
-
     perception_node = None
     if perception.get("enabled", False):
         perception_node = Node(
@@ -213,7 +206,6 @@ def generate_embodied_nodes(
             name="safety_guard_node",
             output="screen",
             parameters=[common_params],
-            ros_arguments=enclave_arguments["safety_guard"] if caller_policy_enabled else [],
         ),
         Node(
             package="skill_library",
@@ -221,7 +213,6 @@ def generate_embodied_nodes(
             name="skill_executor_node",
             output="screen",
             parameters=[common_params],
-            ros_arguments=enclave_arguments["skill_library"] if caller_policy_enabled else [],
         ),
         Node(
             package="embodied_agent",
@@ -245,7 +236,6 @@ def generate_embodied_nodes(
                     "execute_plan_action": embodied_config.get("execute_plan_action", "/embodied/execute_agent_plan"),
                 }
             ],
-            ros_arguments=enclave_arguments["embodied_agent"] if caller_policy_enabled else [],
         ),
     ]
     if perception_node is not None:

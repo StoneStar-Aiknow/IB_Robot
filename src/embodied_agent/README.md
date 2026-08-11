@@ -9,7 +9,7 @@
 | --- | --- |
 | `agent_plan_node` | plan / validate / confirm / execute 生命周期，按顺序调用 Skill Gateway |
 | `task_entry_node` | 遗留 voice adapter，当前不由 bringup 启动 |
-| `task_executor_node` | 遗留 planned-task executor，当前不由 bringup 启动 |
+| `task_executor_node` | 遗留 planned-task executor，当前不由 bringup 启动；Workflow lifecycle 仅作兼容入口 |
 
 规则 `task_planner_node` 已删除；`vlm_task_planner` 也已删除。运行时唯一公开入口模式为
 `embodied.entry_mode: hermes`。

@@ -166,14 +166,16 @@ class SafetySnapshotCache:
             self._current_key = (identity.registry_epoch, identity.generation)
 
     def reconcile(self, registry_epoch: str, retained_generations: set[int], *, keep_recent: int = 2) -> None:
-        del keep_recent
+        if keep_recent < 0:
+            raise ValueError("keep_recent must be non-negative")
         with self._lock:
-            if self._current_key is not None and (
-                self._current_key[0] != registry_epoch or self._current_key[1] not in retained_generations
-            ):
+            local_generations = sorted(
+                (generation for epoch, generation in self._snapshots if epoch == registry_epoch), reverse=True
+            )
+            keep = set(retained_generations)
+            keep.update(local_generations[:keep_recent])
+            if self._current_key is not None and self._current_key[0] != registry_epoch:
                 self._current_key = None
             self._snapshots = {
-                key: value
-                for key, value in self._snapshots.items()
-                if key[0] == registry_epoch and key[1] in retained_generations
+                key: value for key, value in self._snapshots.items() if key[0] == registry_epoch and key[1] in keep
             }

@@ -305,7 +305,12 @@ class SafetyGuardNode(Node):
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in skill validation: {exc}")
-            allowed, reason = False, f"internal error: {exc}"
+            response.allowed = False
+            response.reason = "safety validation is temporarily unavailable"
+            response.error_code = "CAPABILITY_NOT_READY"
+            self._set_actual_identity(response, snapshot.identity)
+            response.diagnostics = []
+            return response
         response.allowed = allowed
         response.reason = reason
         response.error_code = "" if allowed else "SKILL_LIMIT_VIOLATION"
@@ -376,10 +381,15 @@ class SafetyGuardNode(Node):
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in primitive validation: {exc}")
-            allowed, reason = False, f"internal error: {exc}"
+            response.allowed = False
+            response.reason = "safety validation is temporarily unavailable"
+            response.error_code = "CAPABILITY_NOT_READY"
+            self._set_actual_identity(response, snapshot.identity)
+            response.diagnostics = []
+            return response
         response.allowed = allowed
         response.reason = reason
-        response.error_code = "" if allowed else "PRIMITIVE_LIMIT_VIOLATION"
+        response.error_code = "" if allowed else "SKILL_LIMIT_VIOLATION"
         self._set_actual_identity(response, snapshot.identity)
         response.diagnostics = []
         if self._debug:
