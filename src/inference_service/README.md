@@ -448,10 +448,6 @@ Canonical backend 只有以下五个：
 Ascend compiled deployment 可通过 manifest `device_links` 把 producer output buffer 直接绑定到 consumer input。
 `AscendOmModelSession` 按 `execution` 顺序调度这些 role，只把公开输出以及未声明 device link 的 host-routed 中间
 tensor 复制回主机；设备生命周期、buffer ownership 和串行准入仍由 shared runtime 统一管理。
-对 flow matching、ODE 等需要由模型家族 adapter 在主机侧重复调用同一个 role 的 pipeline，公开的
-`AscendOmRoleSession` 提供单 role 的 manifest ABI 校验、常驻模型资源、语义名 I/O 和共享 ACL lease；调用方
-不能访问 `AscendOmModelSession` 私有模型字典，也不能重复初始化进程级 ACL。ACL 对符号输出错误报告 0-byte
-buffer 时，只有 manifest 声明完全固定 shape 才允许据此分配精确 buffer，动态 shape 仍明确拒绝。
 
 以下支持矩阵在启动时强制校验，不在表中的组合会被拒绝：
 

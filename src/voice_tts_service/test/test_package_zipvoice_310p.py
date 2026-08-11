@@ -50,8 +50,7 @@ def test_packager_creates_valid_scalar_abi_bundle_from_verified_delivery(tmp_pat
     assert validated.deployment.bindings["text_encoder"].outputs[0].runtime_name == "/Where_5:0:text_condition"
     assert validated.deployment.bindings["flow_decoder_1537"].outputs[0].shape == (1, 1537, 100)
     assert validated.deployment.bindings["flow_decoder_1537"].outputs[0].runtime_name.endswith(":0:v")
-    adapter = json.loads((destination / "assets/adapter.json").read_text(encoding="utf-8"))
-    assert adapter["om_backend_factory"].endswith(":create_ascend_backend")
+    assert not (destination / "assets/adapter.json").exists()
     assert not (destination / "assets/vendor").exists()
     runtime = json.loads((destination / "assets/zipvoice_310p.json").read_text(encoding="utf-8"))
     assert "vendor_python_path" not in runtime

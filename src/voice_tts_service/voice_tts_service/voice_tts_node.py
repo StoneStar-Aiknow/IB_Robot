@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import gc
 import logging
 import threading
 from array import array
@@ -17,48 +16,36 @@ from std_srvs.srv import Trigger
 
 from ibrobot_msgs.msg import ModelRuntimeInfo, SynthesizedAudio
 from ibrobot_msgs.srv import SynthesizeSpeech
-from voice_tts_service.ascend_om_backend import AscendOmBackend
+from inference_service.backends import BackendError, RuntimeContext
 from voice_tts_service.defaults import VOICE_TTS_DEFAULTS
 from voice_tts_service.errors import TTSError
-from voice_tts_service.model_manager import TTSBundle, deployment_backend, load_tts_bundle
+from voice_tts_service.model_manager import TTSBundle, load_tts_bundle
 from voice_tts_service.service_core import TTSLimits, TTSServiceCore
-from voice_tts_service.torch_backend import TorchZipVoiceBackend
+from voice_tts_service.zipvoice_310p_adapter import ZipVoiceAscendSession
 
 
 class VoiceTTSNode(Node):
-    """Own one ZipVoice backend and serialize bounded synthesis requests."""
+    """Keep one shared ZipVoice model session resident until explicit unload."""
 
     def __init__(self) -> None:
         super().__init__("voice_tts_node")
         self._declare_parameters()
         self._bundle: TTSBundle | None = None
-        self._backend = None
-        self._runtime_state = "unloaded"
+        self._session = None
         self._init_error = ""
-        self._backend_lock = threading.Lock()
-        self._admission = threading.BoundedSemaphore(self._max_queue_size + 1)
+        self._session_lock = threading.RLock()
         self._core = TTSServiceCore(None, self._limits)
         self._prepare_bundle()
         if self._load_on_startup:
-            with self._backend_lock:
+            with self._session_lock:
                 self._load_model_locked()
+        group = ReentrantCallbackGroup()
         self._service = self.create_service(
-            SynthesizeSpeech,
-            self._service_name,
-            self._on_synthesize,
-            callback_group=ReentrantCallbackGroup(),
+            SynthesizeSpeech, self._service_name, self._on_synthesize, callback_group=group
         )
-        self._load_service = self.create_service(
-            Trigger,
-            self._load_service_name,
-            self._on_load,
-            callback_group=ReentrantCallbackGroup(),
-        )
+        self._load_service = self.create_service(Trigger, self._load_service_name, self._on_load, callback_group=group)
         self._unload_service = self.create_service(
-            Trigger,
-            self._unload_service_name,
-            self._on_unload,
-            callback_group=ReentrantCallbackGroup(),
+            Trigger, self._unload_service_name, self._on_unload, callback_group=group
         )
         self.get_logger().info(f"Voice TTS service ready at {self._service_name}")
 
@@ -84,9 +71,6 @@ class VoiceTTSNode(Node):
             raise ValueError("prompt_profile must be non-empty")
         self._device_id = int(self.get_parameter("device_id").value)
         self._exit_on_init_failure = bool(self.get_parameter("exit_on_init_failure").value)
-        self._max_queue_size = int(self.get_parameter("max_queue_size").value)
-        if self._max_queue_size < 0:
-            raise ValueError("max_queue_size must be non-negative")
         self._limits = TTSLimits(
             segment_max_chars=int(self.get_parameter("segment_max_chars").value),
             segment_pause_ms=int(self.get_parameter("segment_pause_ms").value),
@@ -112,75 +96,62 @@ class VoiceTTSNode(Node):
             raise ValueError("segment_pause_ms must be non-negative")
 
     def _prepare_bundle(self) -> None:
-        """Validate model identity and files without allocating model runtime memory."""
-
         try:
             self._bundle = load_tts_bundle(self._bundle_path, self._deployment)
-            self._runtime_state = "unloaded"
             self._init_error = ""
         except Exception as exc:
             self._bundle = None
-            self._runtime_state = "failed"
             self._init_error = str(exc)
             self.get_logger().error(f"Voice TTS bundle validation failed: {exc}")
             if self._exit_on_init_failure:
                 raise
 
-    def _load_model_locked(self) -> bool:
-        """Load the configured backend once; caller must hold ``_backend_lock``."""
+    def _new_session(self):
+        if self._bundle is None:
+            self._bundle = load_tts_bundle(self._bundle_path, self._deployment)
+        if self._bundle.validated.deployment.backend != "ascend":
+            raise RuntimeError("Voice TTS currently requires an Ascend deployment")
+        session = ZipVoiceAscendSession(device_id=self._device_id, prompt_profile=self._prompt_profile)
+        session.load(
+            RuntimeContext(
+                validated_manifest=self._bundle.validated,
+                runtime_options={"device_id": self._device_id},
+            )
+        )
+        return session
 
-        if self._backend is not None:
+    def _load_model_locked(self) -> bool:
+        if self._session is not None:
             return False
-        backend = None
+        session = None
         try:
-            if self._bundle is None:
-                self._bundle = load_tts_bundle(self._bundle_path, self._deployment)
-            backend_name = deployment_backend(self._bundle)
-            if backend_name == "torch":
-                backend = TorchZipVoiceBackend(self._bundle, {"prompt_profile": self._prompt_profile})
-            else:
-                backend = AscendOmBackend(
-                    self._bundle,
-                    {"device_id": self._device_id, "prompt_profile": self._prompt_profile},
-                )
-            backend.load()
-            self._backend = backend
-            self._core.backend = backend
-            self._runtime_state = "ready"
+            session = self._new_session()
+            self._session = session
+            self._core.infer = session.infer
             self._init_error = ""
-            self.get_logger().info(f"Loaded Voice TTS deployment {self._deployment!r} using {backend_name} backend")
+            self.get_logger().info(f"Loaded Voice TTS deployment {self._deployment!r}")
             return True
         except Exception as exc:
             self._init_error = str(exc)
-            self._runtime_state = "failed"
-            self.get_logger().error(f"Voice TTS model initialization failed: {exc}")
-            if backend is not None:
+            if session is not None:
                 with suppress(Exception):
-                    backend.close()
-            self._backend = None
-            self._core.backend = None
+                    session.close()
             raise
 
     def _unload_model_locked(self) -> bool:
-        """Release all model resources; caller must hold ``_backend_lock``."""
-
-        backend = self._backend
-        if backend is None:
-            self._runtime_state = "unloaded"
+        session = self._session
+        if session is None:
             self._init_error = ""
-            self._core.backend = None
+            self._core.infer = None
             return False
         try:
-            backend.close()
+            session.close()
         except Exception as exc:
-            self._runtime_state = "failed"
             self._init_error = str(exc)
             raise
         finally:
-            self._backend = None
-            self._core.backend = None
-            gc.collect()
-        self._runtime_state = "unloaded"
+            self._session = None
+            self._core.infer = None
         self._init_error = ""
         self.get_logger().info(f"Unloaded Voice TTS deployment {self._deployment!r}")
         return True
@@ -188,7 +159,6 @@ class VoiceTTSNode(Node):
     def _runtime_info(self) -> ModelRuntimeInfo:
         result = ModelRuntimeInfo()
         result.instance_id = self.get_name()
-        result.configuration_generation = 0
         if self._bundle is not None:
             validated = self._bundle.validated
             result.model_name = validated.manifest.bundle.name
@@ -197,11 +167,17 @@ class VoiceTTSNode(Node):
             result.deployment_name = validated.deployment_name
             result.deployment_fingerprint = validated.fingerprint
             result.backend = validated.deployment.backend
-        result.runtime_version = str(getattr(self._backend, "runtime_version", ""))
-        result.ready = self._backend is not None and self._runtime_state == "ready"
-        result.runtime_state = self._runtime_state
-        result.failure_reason = self._init_error
-        result.message = self._init_error
+        session = self._session
+        if session is None:
+            result.runtime_state = "failed" if self._init_error else "unloaded"
+            result.failure_reason = self._init_error
+        else:
+            health = session.health()
+            result.runtime_state = health.state.value
+            result.ready = health.ready
+            result.failure_reason = health.message or health.reason_code or ""
+            result.runtime_version = session.runtime_version
+        result.message = result.failure_reason
         return result
 
     def _failure(self, response, code: str, message: str):
@@ -215,16 +191,11 @@ class VoiceTTSNode(Node):
         return response
 
     def _on_synthesize(self, request, response):
-        if not self._admission.acquire(blocking=False):
-            return self._failure(response, "BUSY", "Voice TTS request queue is full")
         try:
             prepared = self._core.prepare_request(
-                request.text,
-                request.prompt_audio,
-                request.prompt_audio_format,
-                request.prompt_text,
+                request.text, request.prompt_audio, request.prompt_audio_format, request.prompt_text
             )
-            with self._backend_lock:
+            with self._session_lock:
                 self._load_model_locked()
                 output = self._core.synthesize_prepared(prepared)
             response.audio_segments = [
@@ -249,17 +220,17 @@ class VoiceTTSNode(Node):
             response.model = self._runtime_info()
             return response
         except TTSError as exc:
-            self.get_logger().warning(f"Voice TTS request rejected [{exc.code}]: {exc}")
             return self._failure(response, exc.code, str(exc))
+        except BackendError as exc:
+            code = "UNSUPPORTED_PROMPT" if exc.code == "unsupported_prompt" else "INFERENCE_FAILED"
+            return self._failure(response, code, str(exc))
         except Exception as exc:
             self.get_logger().error(f"Voice TTS internal error: {exc}")
             return self._failure(response, "INTERNAL_ERROR", str(exc))
-        finally:
-            self._admission.release()
 
     def _on_load(self, _request, response):
         try:
-            with self._backend_lock:
+            with self._session_lock:
                 loaded = self._load_model_locked()
             response.success = True
             response.message = "Voice TTS model loaded" if loaded else "Voice TTS model is already loaded"
@@ -270,7 +241,7 @@ class VoiceTTSNode(Node):
 
     def _on_unload(self, _request, response):
         try:
-            with self._backend_lock:
+            with self._session_lock:
                 unloaded = self._unload_model_locked()
             response.success = True
             response.message = "Voice TTS model unloaded" if unloaded else "Voice TTS model is already unloaded"
@@ -280,8 +251,8 @@ class VoiceTTSNode(Node):
         return response
 
     def destroy_node(self):
-        if hasattr(self, "_backend_lock"):
-            with suppress(Exception), self._backend_lock:
+        if hasattr(self, "_session_lock"):
+            with suppress(Exception), self._session_lock:
                 self._unload_model_locked()
         return super().destroy_node()
 
@@ -295,8 +266,7 @@ def main(args=None):
         if rclpy.ok():
             rclpy.shutdown()
         return 1
-
-    executor = MultiThreadedExecutor(num_threads=max(4, node._max_queue_size + 2))
+    executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
         executor.spin()
@@ -312,4 +282,4 @@ def main(args=None):
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

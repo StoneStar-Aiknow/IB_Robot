@@ -68,41 +68,34 @@ def _build_manifest(destination: Path, bundle_uuid: str, deployment_uuid: str) -
     )
     bundle_name = "zipvoice-distill-310p1-fixed-prompt"
     model_inputs = [
-        {"semantic": "tts.tokens", "dtype": "int64", "shape": [1, 256]},
-        {"semantic": "tts.tokens_len", "dtype": "int64", "shape": []},
-        {"semantic": "tts.prompt_tokens", "dtype": "int64", "shape": [1, 29]},
-        {"semantic": "tts.prompt_features_len", "dtype": "int64", "shape": []},
-        {"semantic": "tts.speed", "dtype": "float32", "shape": []},
-        {"semantic": "tts.t", "dtype": "float32", "shape": []},
-        {"semantic": "tts.flow_x", "dtype": "float32", "shape": [1, 1537, 100]},
-        {"semantic": "tts.flow_text_condition", "dtype": "float32", "shape": [1, 1537, 100]},
-        {"semantic": "tts.speech_condition", "dtype": "float32", "shape": [1, 1537, 100]},
-        {"semantic": "tts.flow_padding_mask", "dtype": "bool", "shape": [1, 1537]},
-        {"semantic": "tts.guidance_scale", "dtype": "float32", "shape": []},
+        {"semantic": "tts.text", "dtype": "uint8", "shape": [-1]},
+        {"semantic": "tts.prompt_audio", "dtype": "float32", "shape": [-1]},
+        {"semantic": "tts.prompt_sample_rate", "dtype": "int64", "shape": []},
+        {"semantic": "tts.prompt_text", "dtype": "uint8", "shape": [-1]},
     ]
     text_inputs = [
-        _binding("tts.tokens", "tokens", 0, "int64", [1, 256]),
-        _binding("tts.tokens_len", "tokens_len", 1, "int64", []),
-        _binding("tts.prompt_tokens", "prompt_tokens", 2, "int64", [1, 29]),
-        _binding("tts.prompt_features_len", "prompt_features_len", 3, "int64", []),
-        _binding("tts.speed", "speed", 4, "float32", []),
+        _binding("host.zipvoice.tokens", "tokens", 0, "int64", [1, 256]),
+        _binding("host.zipvoice.tokens_len", "tokens_len", 1, "int64", []),
+        _binding("host.zipvoice.prompt_tokens", "prompt_tokens", 2, "int64", [1, 29]),
+        _binding("host.zipvoice.prompt_features_len", "prompt_features_len", 3, "int64", []),
+        _binding("host.zipvoice.speed", "speed", 4, "float32", []),
     ]
     text_outputs = [
-        _binding("internal.text_condition", "/Where_5:0:text_condition", 0, "float32", [1, 3072, 100]),
-        _binding("internal.features_len", "/Reshape_7:0:features_len", 1, "int64", []),
-        _binding("internal.padding_mask", "/Unsqueeze_3:0:padding_mask", 2, "bool", [1, 3072]),
+        _binding("host.zipvoice.text_condition", "/Where_5:0:text_condition", 0, "float32", [1, 3072, 100]),
+        _binding("host.zipvoice.features_len", "/Reshape_7:0:features_len", 1, "int64", []),
+        _binding("host.zipvoice.padding_mask", "/Unsqueeze_3:0:padding_mask", 2, "bool", [1, 3072]),
     ]
     flow_inputs = [
-        _binding("tts.t", "t", 0, "float32", []),
-        _binding("tts.flow_x", "x", 1, "float32", [1, 1537, 100]),
-        _binding("tts.flow_text_condition", "text_condition", 2, "float32", [1, 1537, 100]),
-        _binding("tts.speech_condition", "speech_condition", 3, "float32", [1, 1537, 100]),
-        _binding("tts.flow_padding_mask", "padding_mask", 4, "bool", [1, 1537]),
-        _binding("tts.guidance_scale", "guidance_scale", 5, "float32", []),
+        _binding("host.zipvoice.t", "t", 0, "float32", []),
+        _binding("host.zipvoice.flow_x", "x", 1, "float32", [1, 1537, 100]),
+        _binding("host.zipvoice.flow_text_condition", "text_condition", 2, "float32", [1, 1537, 100]),
+        _binding("host.zipvoice.speech_condition", "speech_condition", 3, "float32", [1, 1537, 100]),
+        _binding("host.zipvoice.flow_padding_mask", "padding_mask", 4, "bool", [1, 1537]),
+        _binding("host.zipvoice.guidance_scale", "guidance_scale", 5, "float32", []),
     ]
     flow_outputs = [
         _binding(
-            "tts.velocity",
+            "host.zipvoice.velocity",
             "PartitionedCall_/fm_decoder/Transpose_1_Transpose_2643:0:v",
             0,
             "float32",
@@ -126,7 +119,7 @@ def _build_manifest(destination: Path, bundle_uuid: str, deployment_uuid: str) -
             "kind": "generic",
             "family": "zipvoice",
             "inputs": model_inputs,
-            "outputs": [{"semantic": "tts.velocity", "dtype": "float32", "shape": [1, 1537, 100]}],
+            "outputs": [{"semantic": "tts.audio", "dtype": "float32", "shape": [-1]}],
             "semantic_identity": {
                 "logical_model_revision": "zipvoice-distill-310p1-bucket-2026-08-03",
                 "preprocessing_contract": "emilia-zh-cn2an-jieba-pypinyin-fixed-golden-prompt-v1",
@@ -187,8 +180,6 @@ def package_bundle(source: Path, destination: Path) -> Path:
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez(prompt_path, prompt_tokens=prompt_tokens, prompt_features=prompt_features)
 
-    adapter = {"om_backend_factory": "voice_tts_service.zipvoice_310p_adapter:create_ascend_backend"}
-    (destination / "assets/adapter.json").write_text(json.dumps(adapter, indent=2) + "\n", encoding="utf-8")
     runtime = {
         "text_role": "text_encoder",
         "flow_role": "flow_decoder_1537",

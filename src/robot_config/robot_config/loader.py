@@ -1119,7 +1119,6 @@ def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
         max_prompt_duration_sec=data.get("max_prompt_duration_sec", defaults.max_prompt_duration_sec),
         max_segments=data.get("max_segments", defaults.max_segments),
         max_response_audio_bytes=data.get("max_response_audio_bytes", defaults.max_response_audio_bytes),
-        max_queue_size=data.get("max_queue_size", defaults.max_queue_size),
         device_id=data.get("device_id", defaults.device_id),
         exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
     )
@@ -1531,8 +1530,8 @@ def validate_config(config: RobotConfig) -> list[str]:
         for name, value in positive_limits.items():
             if value <= 0:
                 errors.append(f"voice_tts.{name} must be positive")
-        if config.voice_tts.segment_pause_ms < 0 or config.voice_tts.max_queue_size < 0:
-            errors.append("voice_tts.segment_pause_ms and max_queue_size must be non-negative")
+        if config.voice_tts.segment_pause_ms < 0:
+            errors.append("voice_tts.segment_pause_ms must be non-negative")
 
     if config.embodied.enabled:
         valid_directions = {"forward", "backward", "left", "right", "up", "down"}

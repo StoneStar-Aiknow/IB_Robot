@@ -16,7 +16,7 @@ ZipVoice deployment，返回一个或多个可独立播放的单声道 WAV PCM16
 3. 管理模型的首次加载、常驻复用、显式预热和卸载。
 4. 对长文本进行有界分段，并把模型输出统一封装为 WAV PCM16。
 5. 在 Ascend 310P 上编排 Text Encoder OM、Flow Decoder OM 和 CPU Vocos。
-6. 对请求大小、排队数量、分段数量和响应音频大小设置明确上限。
+6. 对请求大小、分段数量和响应音频大小设置明确上限。
 
 不属于本包的职责：
 
@@ -70,8 +70,7 @@ SynthesizeSpeech 请求
   -> SynthesizedAudio[] 响应
 ```
 
-所有模型实例串行推理。服务允许一个执行中的请求和有限数量的等待请求，超出容量时返回 `BUSY`，避免
-并发请求耗尽 NPU 或主机内存。
+公共 `ModelSession` 串行执行模型推理，并统一管理准入、健康状态、失败状态和关闭等待。
 
 ## 4. ROS 接口
 
@@ -136,7 +135,8 @@ ros2 service call /voice_tts/load std_srvs/srv/Trigger "{}"
 ros2 service call /voice_tts/unload std_srvs/srv/Trigger "{}"
 ```
 
-`load`、`synthesize` 和 `unload` 共用模型锁，因此卸载不会与正在执行的推理同时操作同一组资源。
+`load`、`synthesize` 和 `unload` 只协调 session 的创建和替换；模型准入与资源释放由公共
+`ModelSession` 管理，卸载会等待当前推理结束后再关闭 session。
 
 ## 5. 模型 bundle 与 deployment
 
@@ -154,7 +154,6 @@ deployment: ascend_310p
 $WORKSPACE/models/voice_tts/zipvoice/
 ├── inference_manifest.json
 ├── assets/
-│   ├── adapter.json
 │   └── ...
 └── artifacts/
     └── ...
@@ -166,7 +165,6 @@ bundle 必须满足：
 - `model.kind` 为 `generic`。
 - `model.family` 为 `zipvoice`。
 - `deployment` 必须是 manifest 中存在的命名 deployment。
-- `assets/adapter.json` 必须声明相应后端 factory。
 
 manifest 的 bundle digest 和 deployment fingerprint 用于结构身份与部署一致性，不读取模型文件内容，
 也不提供运行时防篡改。310P 打包工具会在复制前校验已知来源的 OM、Vocos checkpoint、token table
@@ -218,7 +216,6 @@ voice_tts:
   max_prompt_duration_sec: 30.0
   max_segments: 32
   max_response_audio_bytes: 67108864
-  max_queue_size: 2
 
   device_id: 0
   exit_on_init_failure: true
@@ -236,7 +233,6 @@ voice_tts:
 | `segment_max_chars` | 单个公共文本段的最大字符数 |
 | `max_request_chars` | 单次请求的最大字符数 |
 | `max_segments` | 单次响应允许的最大音频段数量 |
-| `max_queue_size` | 等待队列容量 |
 | `device_id` | Ascend 设备编号 |
 | `exit_on_init_failure` | bundle 初始化失败时是否退出节点 |
 
@@ -255,7 +251,8 @@ voice_tts:
 - ASCII 英文单词会明确失败。
 - 使用 bundle 中的固定默认 prompt，不支持请求级音色克隆。
 
-Ascend adapter 复用 `inference_service` 的共享 ACL/session 生命周期，不会在同一进程中重复初始化全局 ACL。
+`ZipVoiceAscendSession` 继承公共 `AscendOmModelSession`，通过标准 `session.infer()` 复用 ACL lease、OM 资源、
+准入、健康状态和关闭等待，不会在同一进程中重复初始化全局 ACL。
 
 ## 8. 稳定错误码
 
@@ -267,8 +264,7 @@ Ascend adapter 复用 `inference_service` 的共享 ACL/session 生命周期，�
 | `PROMPT_TOO_LARGE` | 参考音频超过字节数或时长上限 |
 | `REQUEST_TOO_LARGE` | 文本或分段数量超过请求上限 |
 | `RESPONSE_TOO_LARGE` | 合成音频超过响应字节上限 |
-| `MODEL_NOT_READY` | bundle、deployment、运行时或 adapter 加载失败 |
-| `BUSY` | 有界请求队列已满 |
+| `MODEL_NOT_READY` | bundle、deployment 或模型 session 加载失败 |
 | `INFERENCE_FAILED` | 模型推理失败 |
 | `INVALID_AUDIO_OUTPUT` | 模型输出为空或包含 NaN/Inf |
 | `UNSUPPORTED_PROMPT` | 所选 deployment 不支持请求级音色克隆 |

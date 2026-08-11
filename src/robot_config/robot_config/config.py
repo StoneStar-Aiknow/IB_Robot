@@ -212,7 +212,6 @@ class VoiceTTSConfig:
     max_prompt_duration_sec: float = 30.0
     max_segments: int = 32
     max_response_audio_bytes: int = 64 * 1024 * 1024
-    max_queue_size: int = 2
     device_id: int = 0
     exit_on_init_failure: bool = True
 

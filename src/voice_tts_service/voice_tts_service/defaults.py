@@ -16,7 +16,6 @@ VOICE_TTS_DEFAULTS = {
     "max_prompt_duration_sec": 30.0,
     "max_segments": 32,
     "max_response_audio_bytes": 64 * 1024 * 1024,
-    "max_queue_size": 2,
     "device_id": 0,
     "exit_on_init_failure": True,
 }

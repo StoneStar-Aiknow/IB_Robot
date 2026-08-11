@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from inference_manifest import BundleFile, TensorBinding, canonical_bundle_digest, load_inference_manifest
+from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
 from inference_service.backends import (
     BackendCapabilityError,
     BackendInferenceError,
@@ -21,9 +21,8 @@ from inference_service.backends import (
     ResourceDomainAdmissions,
     RuntimeContext,
 )
-from inference_service.backends.ascend.model import AclModel, AclTensorDescriptor
 from inference_service.generic_runtime import NamedTensorRequest
-from inference_service.model_sessions import AscendOmModelSession, AscendOmRoleSession, TorchModelSession
+from inference_service.model_sessions import AscendOmModelSession, TorchModelSession
 from tests.manifest_fixtures import (
     TEST_BUNDLE_UUID,
     TEST_DEPLOYMENT_UUID,
@@ -299,72 +298,6 @@ def test_ascend_session_validates_abi_executes_named_outputs_and_closes_once(tmp
     assert result.deployment.backend == "ascend"
     assert result.deployment.deployment_fingerprint == context.deployment_fingerprint
     assert _FakeAclModel.instances[0].execute_calls == 1
-
-    session.close()
-    session.close()
-    assert _FakeAclModel.instances[0].close_calls == 1
-    assert manager.lease.close_calls == 1
-
-
-def test_ascend_role_session_rejects_wrong_input_dtype_before_acl_execution(tmp_path) -> None:
-    _FakeAclModel.instances = []
-    _FakeAclModel.fail_role = None
-    context = _ascend_context(tmp_path)
-    session = AscendOmRoleSession(
-        context.validated_manifest,
-        "model",
-        runtime_manager=_FakeRuntimeManager(),
-        model_factory=_FakeAclModel,
-    )
-    session.load()
-
-    with pytest.raises(BackendInferenceError, match="dtype"):
-        session.infer({"observation.image": np.zeros((1, 3, 384, 384), dtype=np.float64)})
-
-    assert _FakeAclModel.instances[0].execute_calls == 0
-    session.close()
-
-
-def test_acl_model_resolves_symbolic_zero_size_only_from_fixed_manifest_shape() -> None:
-    model = object.__new__(AclModel)
-    model.role = "flow"
-    descriptor = AclTensorDescriptor(index=0, name="v", dtype=np.dtype("float32"), shape=(-1, -1, 100), size=0)
-    fixed = TensorBinding(
-        semantic="velocity",
-        runtime_name="v",
-        index=0,
-        dtype="float32",
-        shape=(1, 1537, 100),
-    )
-
-    resolved = model._resolve_zero_sizes("output", (fixed,), (descriptor,))
-
-    assert resolved[0].size == 1 * 1537 * 100 * 4
-    dynamic = fixed.model_copy(update={"shape": (-1, 1537, 100)})
-    with pytest.raises(BackendLoadError, match="fully fixed shape"):
-        model._resolve_zero_sizes("output", (dynamic,), (descriptor,))
-
-
-def test_ascend_role_session_reuses_one_loaded_role_for_iterative_execution(tmp_path) -> None:
-    _FakeAclModel.instances = []
-    _FakeAclModel.fail_role = None
-    manager = _FakeRuntimeManager()
-    context = _ascend_context(tmp_path)
-    session = AscendOmRoleSession(
-        context.validated_manifest,
-        "model",
-        runtime_manager=manager,
-        model_factory=_FakeAclModel,
-    )
-
-    session.load()
-    first = session.infer({"observation.image": np.zeros((1, 3, 384, 384), dtype=np.float32)})
-    second = session.infer({"observation.image": np.ones((1, 3, 384, 384), dtype=np.float32)})
-
-    assert first["tag_logits"].shape == (1, 4585)
-    assert second["tag_logits"].shape == (1, 4585)
-    assert _FakeAclModel.instances[0].execute_calls == 2
-    assert manager.acquire_calls == [(0, None)]
 
     session.close()
     session.close()

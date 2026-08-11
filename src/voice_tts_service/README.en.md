@@ -18,7 +18,7 @@ The package:
 3. Manages first-use loading, resident model reuse, explicit preloading, and unloading.
 4. Applies bounded long-text segmentation and wraps model output as WAV PCM16.
 5. Orchestrates the Text Encoder OM, Flow Decoder OM, and CPU Vocos on Ascend 310P.
-6. Enforces request, queue, segment-count, and response-size limits.
+6. Enforces request, segment-count, and response-size limits.
 
 It does not manage microphone capture, ASR, speaker playback, dialogue state, business workflows, backend
 fallback, or runtime inference through SSH.
@@ -67,8 +67,7 @@ SynthesizeSpeech request
   -> SynthesizedAudio[] response
 ```
 
-One model instance executes requests serially. A bounded admission queue returns `BUSY` instead of allowing
-concurrent requests to exhaust NPU or host memory.
+The shared `ModelSession` serializes inference and owns admission, health, failure state, and close waiting.
 
 ## 4. ROS Interfaces
 
@@ -125,7 +124,8 @@ Release model memory while leaving the ROS node and endpoints alive:
 ros2 service call /voice_tts/unload std_srvs/srv/Trigger "{}"
 ```
 
-Load, synthesize, and unload share one model lock, so resources cannot be unloaded during active inference.
+Load, synthesize, and unload coordinate session creation and replacement. The shared `ModelSession` owns model
+admission and cleanup, and unload waits for active inference before closing the session.
 
 ## 5. Model Bundle and Deployment
 
@@ -137,11 +137,11 @@ bundle_path: models/voice_tts/zipvoice
 deployment: ascend_310p
 ```
 
-This selects `$WORKSPACE/models/voice_tts/zipvoice`. The bundle contains `inference_manifest.json`,
-`assets/adapter.json`, deployment artifacts, tokenizer assets, prompt profiles, and the vocoder checkpoint.
+This selects `$WORKSPACE/models/voice_tts/zipvoice`. The bundle contains `inference_manifest.json`, deployment
+artifacts, tokenizer assets, prompt profiles, and the vocoder checkpoint.
 
-The bundle must use manifest schema v2, declare `model.kind=generic` and `model.family=zipvoice`, contain the
-selected named deployment, and declare the matching factory in `assets/adapter.json`.
+The bundle must use manifest schema v2, declare `model.kind=generic` and `model.family=zipvoice`, and contain the
+selected named deployment.
 
 The bundle digest and deployment fingerprint identify structure and deployment consistency; they do not read
 model contents or provide runtime tamper protection. Before copying, the 310P packager verifies the SHA-256 of
@@ -195,7 +195,6 @@ voice_tts:
   max_prompt_duration_sec: 30.0
   max_segments: 32
   max_response_audio_bytes: 67108864
-  max_queue_size: 2
 
   device_id: 0
   exit_on_init_failure: true
@@ -217,8 +216,8 @@ The current `ascend_310p` deployment:
 - Rejects ASCII English words explicitly.
 - Uses a fixed bundle prompt and does not support request-scoped voice cloning.
 
-The adapter reuses the shared `inference_service` ACL/session lifecycle and does not initialize a second global
-ACL runtime in the same process.
+`ZipVoiceAscendSession` subclasses the shared `AscendOmModelSession` and uses standard `session.infer()` to reuse
+the ACL lease, OM resources, admission, health, and close waiting without initializing a second global ACL runtime.
 
 ## 8. Stable Error Codes
 
@@ -230,8 +229,7 @@ ACL runtime in the same process.
 | `PROMPT_TOO_LARGE` | The prompt exceeds its byte or duration limit |
 | `REQUEST_TOO_LARGE` | Text or segment count exceeds request limits |
 | `RESPONSE_TOO_LARGE` | Synthesized audio exceeds the response-byte limit |
-| `MODEL_NOT_READY` | Bundle, deployment, runtime, or adapter loading failed |
-| `BUSY` | The bounded admission queue is full |
+| `MODEL_NOT_READY` | Bundle, deployment, or model-session loading failed |
 | `INFERENCE_FAILED` | Model inference failed |
 | `INVALID_AUDIO_OUTPUT` | Model output is empty or contains NaN/Inf |
 | `UNSUPPORTED_PROMPT` | The selected deployment does not support request-scoped voice cloning |

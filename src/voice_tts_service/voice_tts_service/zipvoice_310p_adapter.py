@@ -5,15 +5,21 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from voice_tts_service.backend import AudioResult
-from voice_tts_service.errors import BackendInferenceError, BackendLoadError, TTSError
-from voice_tts_service.prompt_audio import PromptAudio
+from inference_manifest import CompiledDeployment
+from inference_service.backends import RuntimeContext
+from inference_service.backends.errors import BackendInferenceError as SessionInferenceError
+from inference_service.backends.errors import BackendLoadError as SessionLoadError
+from inference_service.backends.lifecycle import PartialLoadRollback
+from inference_service.generic_runtime import NamedTensorRequest
+from inference_service.model_sessions import AscendOmModelSession
+from voice_tts_service.errors import BackendInferenceError, BackendLoadError
 
 _PINYIN_TAG = re.compile(r"<([A-Za-z]+[1-5])>")
 _ASCII_LETTER = re.compile(r"[A-Za-z]")
@@ -161,18 +167,16 @@ class _ChineseTokenizer:
         return chunks
 
 
-class ZipVoice310PAdapter:
-    """Run pad-aware text OM, iterative flow OM, and CPU Vocos."""
+class ZipVoiceAscendSession(AscendOmModelSession):
+    """Run the complete ZipVoice host-orchestrated pipeline in one model session."""
 
-    runtime_version = "ascend-acl"
-
-    def __init__(self, validated_manifest, runtime_options: dict[str, Any]) -> None:
-        self._validated = validated_manifest
-        self._root = validated_manifest.bundle_root
-        self._runtime_options = dict(runtime_options)
-        self._config = self._load_json(self._root / "assets" / "zipvoice_310p.json")
-        self._text_session = None
-        self._flow_session = None
+    def __init__(self, device_id: int = 0, *, prompt_profile: str = "default", **kwargs) -> None:
+        super().__init__(device_id, **kwargs)
+        self._root: Path | None = None
+        self._prompt_profile = prompt_profile
+        self._config: dict[str, Any] = {}
+        self._text_role = ""
+        self._flow_role = ""
         self._tokenizer = None
         self._prompt = None
         self._vocos = None
@@ -201,41 +205,30 @@ class ZipVoice310PAdapter:
             raise BackendLoadError(f"ZipVoice asset is unavailable: {path}")
         return path
 
-    def load(self) -> None:
-        try:
-            from inference_service.model_sessions import AscendOmRoleSession
-        except (ImportError, OSError) as exc:
-            raise BackendLoadError(f"shared Ascend role session is unavailable: {exc}") from exc
-        deployment = self._validated.deployment
+    def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+        deployment = context.deployment
+        model = context.validated_manifest.manifest.model
+        if model.kind != "generic" or model.family != "zipvoice":
+            raise SessionLoadError("ZipVoice session requires model.kind=generic and model.family=zipvoice")
+        if not isinstance(deployment, CompiledDeployment) or deployment.backend != "ascend":
+            raise SessionLoadError("ZipVoice Ascend session requires a compiled Ascend deployment")
         if deployment.target.soc != "Ascend310P1":
-            raise BackendLoadError(f"verified ZipVoice OM requires Ascend310P1, got {deployment.target.soc!r}")
+            raise SessionLoadError(f"verified ZipVoice OM requires Ascend310P1, got {deployment.target.soc!r}")
+        self._root = context.validated_manifest.bundle_root
+        self._config = self._load_json(self._root / "assets" / "zipvoice_310p.json")
         text_role = str(self._config.get("text_role", "text_encoder"))
         flow_role = str(self._config.get("flow_role", "flow_decoder_1537"))
-        device_id = int(self._runtime_options.get("device_id", 0))
-        acl_config_path = self._runtime_options.get("acl_config_path")
-        self._text_session = AscendOmRoleSession(
-            self._validated,
-            text_role,
-            device_id=device_id,
-            acl_config_path=acl_config_path,
-        )
-        self._flow_session = AscendOmRoleSession(
-            self._validated,
-            flow_role,
-            device_id=device_id,
-            acl_config_path=acl_config_path,
-        )
-        try:
-            self._text_session.load()
-            self._flow_session.load()
-            self.runtime_version = self._flow_session.runtime_version or "ascend-acl"
-            self._load_assets()
-        except Exception:
-            self.close()
-            raise
+        unknown_roles = sorted({text_role, flow_role} - set(deployment.execution))
+        if unknown_roles:
+            raise SessionLoadError(f"ZipVoice config references undeclared Ascend roles: {unknown_roles}")
+        self._text_role = text_role
+        self._flow_role = flow_role
+        super()._load(context, rollback)
+        rollback.defer(self._release_assets)
+        self._load_assets()
 
     def _load_assets(self) -> None:
-        profile_name = str(self._runtime_options.get("prompt_profile", "default"))
+        profile_name = self._prompt_profile
         profiles = self._config.get("prompt_profiles", {})
         if not isinstance(profiles, dict) or profile_name not in profiles:
             raise BackendLoadError(f"unknown ZipVoice prompt profile {profile_name!r}")
@@ -313,14 +306,21 @@ class ZipVoice310PAdapter:
             result = np.concatenate([result[:-count], merged, wave[count:]])
         return result
 
-    def synthesize(self, text: str, prompt_audio: PromptAudio | None, prompt_text: str) -> AudioResult:
-        if prompt_audio is not None or prompt_text.strip():
-            raise TTSError(
-                "UNSUPPORTED_PROMPT",
+    def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
+        if any(value is None for value in (self._tokenizer, self._prompt, self._torch, self._vocos)):
+            raise SessionInferenceError("ZipVoice 310P session assets are not loaded")
+        try:
+            text = np.asarray(request.inputs["tts.text"], dtype=np.uint8).tobytes().decode("utf-8")
+        except (KeyError, UnicodeDecodeError, ValueError) as exc:
+            raise SessionInferenceError("ZipVoice request text is not valid UTF-8", code="invalid_text") from exc
+        if (
+            np.asarray(request.inputs.get("tts.prompt_audio", ())).size
+            or np.asarray(request.inputs.get("tts.prompt_text", ()), dtype=np.uint8).size
+        ):
+            raise SessionInferenceError(
                 "the verified Ascend310P1 deployment uses a fixed prompt profile and does not support request prompts",
+                code="unsupported_prompt",
             )
-        if any(value is None for value in (self._text_session, self._flow_session, self._tokenizer, self._prompt)):
-            raise BackendInferenceError("ZipVoice 310P adapter is not loaded")
         config = self._config
         text_capacity = int(config.get("text_capacity", 256))
         flow_frames = int(config.get("flow_frames", 1537))
@@ -342,11 +342,11 @@ class ZipVoice310PAdapter:
         rng = np.random.default_rng(int(config.get("seed", 42)))
         waves = [self._synthesize_chunk(chunk, rng, timesteps) for chunk in chunks]
         if not waves:
-            raise BackendInferenceError("ZipVoice frontend produced no token chunks")
+            raise SessionInferenceError("ZipVoice frontend produced no token chunks")
         wave = self._cross_fade_concat(waves, sample_rate, float(config.get("cross_fade_sec", 0.1)))
         if wave.size == 0 or not np.isfinite(wave).all():
-            raise BackendInferenceError("ZipVoice produced invalid audio")
-        return AudioResult(samples=np.clip(wave, -1.0, 1.0), sample_rate=sample_rate)
+            raise SessionInferenceError("ZipVoice produced invalid audio")
+        return {"tts.audio": np.ascontiguousarray(np.clip(wave, -1.0, 1.0), dtype=np.float32)}
 
     def _synthesize_chunk(self, tokens: list[str], rng, timesteps: np.ndarray) -> np.ndarray:
         config = self._config
@@ -356,20 +356,20 @@ class ZipVoice310PAdapter:
         ids = self._tokenizer.tokens_to_ids(tokens)
         padded = np.full((1, text_capacity), self._tokenizer.pad_id, dtype=np.int64)
         padded[0, : len(ids)] = ids
-        text_outputs = self._text_session.infer(
-            {
-                "tts.tokens": padded,
-                "tts.tokens_len": np.asarray(len(ids), dtype=np.int64),
-                "tts.prompt_tokens": prompt.tokens,
-                "tts.prompt_features_len": np.asarray(prompt.frame_count, dtype=np.int64),
-                "tts.speed": np.asarray(float(config.get("speed", 1.0)), dtype=np.float32),
-            }
-        )
-        text_full = np.asarray(text_outputs["internal.text_condition"], dtype=np.float32).reshape(1, -1, 100)
-        features_len = int(np.asarray(text_outputs["internal.features_len"]).reshape(()))
-        mask_full = np.asarray(text_outputs["internal.padding_mask"], dtype=np.bool_).reshape(1, -1)
+        text_inputs = {
+            "host.zipvoice.tokens": padded,
+            "host.zipvoice.tokens_len": np.asarray(len(ids), dtype=np.int64),
+            "host.zipvoice.prompt_tokens": prompt.tokens,
+            "host.zipvoice.prompt_features_len": np.asarray(prompt.frame_count, dtype=np.int64),
+            "host.zipvoice.speed": np.asarray(float(config.get("speed", 1.0)), dtype=np.float32),
+        }
+        values: dict[str, object] = dict(text_inputs)
+        text_outputs = self._run_role(0, self._text_role, values)
+        text_full = np.asarray(text_outputs["host.zipvoice.text_condition"], dtype=np.float32).reshape(1, -1, 100)
+        features_len = int(np.asarray(text_outputs["host.zipvoice.features_len"]).reshape(()))
+        mask_full = np.asarray(text_outputs["host.zipvoice.padding_mask"], dtype=np.bool_).reshape(1, -1)
         if not prompt.frame_count < features_len <= flow_frames:
-            raise BackendInferenceError(
+            raise SessionInferenceError(
                 f"ZipVoice chunk requires {features_len} frames outside supported range "
                 f"({prompt.frame_count + 1}..{flow_frames})"
             )
@@ -384,44 +384,38 @@ class ZipVoice310PAdapter:
         speech_condition[:, : prompt.frame_count] = prompt.features
         x = rng.standard_normal((1, flow_frames, 100), dtype=np.float32)
         for step in range(len(timesteps) - 1):
-            outputs = self._flow_session.infer(
+            values.update(
                 {
-                    "tts.t": np.asarray(timesteps[step], dtype=np.float32),
-                    "tts.flow_x": x,
-                    "tts.flow_text_condition": text_condition,
-                    "tts.speech_condition": speech_condition,
-                    "tts.flow_padding_mask": padding_mask,
-                    "tts.guidance_scale": np.asarray(float(config.get("guidance_scale", 3.0)), dtype=np.float32),
+                    "host.zipvoice.t": np.asarray(timesteps[step], dtype=np.float32),
+                    "host.zipvoice.flow_x": x,
+                    "host.zipvoice.flow_text_condition": text_condition,
+                    "host.zipvoice.speech_condition": speech_condition,
+                    "host.zipvoice.flow_padding_mask": padding_mask,
+                    "host.zipvoice.guidance_scale": np.asarray(
+                        float(config.get("guidance_scale", 3.0)), dtype=np.float32
+                    ),
                 }
             )
-            velocity = np.asarray(outputs["tts.velocity"], dtype=np.float32).reshape(x.shape)
+            outputs = self._run_role(1, self._flow_role, values)
+            velocity = np.asarray(outputs["host.zipvoice.velocity"], dtype=np.float32).reshape(x.shape)
             if not np.isfinite(velocity).all():
-                raise BackendInferenceError("ZipVoice flow decoder produced NaN or Inf")
+                raise SessionInferenceError("ZipVoice flow decoder produced NaN or Inf")
             x += velocity * np.float32(timesteps[step + 1] - timesteps[step])
         generated = x[:, prompt.frame_count : features_len, :]
         features = np.transpose(generated, (0, 2, 1)) / np.float32(config.get("feature_scale", 0.1))
         with self._torch.inference_mode():
             return self._vocos(self._torch.from_numpy(features)).cpu().numpy()[0]
 
-    def close(self) -> None:
-        errors: list[Exception] = []
-        for session in (self._flow_session, self._text_session):
-            if session is not None:
-                try:
-                    session.close()
-                except Exception as exc:
-                    errors.append(exc)
-        self._flow_session = None
-        self._text_session = None
+    def _release_assets(self) -> None:
         self._vocos = None
         self._torch = None
         self._prompt = None
         self._tokenizer = None
-        if errors:
-            raise RuntimeError("; ".join(str(error) for error in errors))
 
-
-def create_ascend_backend(*, validated_manifest, runtime_options: dict[str, Any]) -> ZipVoice310PAdapter:
-    """Bundle adapter factory referenced by ``assets/adapter.json``."""
-
-    return ZipVoice310PAdapter(validated_manifest, runtime_options)
+    def _close(self) -> None:
+        self._release_assets()
+        self._root = None
+        self._config = {}
+        self._text_role = ""
+        self._flow_role = ""
+        super()._close()
