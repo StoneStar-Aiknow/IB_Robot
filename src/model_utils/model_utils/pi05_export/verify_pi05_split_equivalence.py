@@ -408,7 +408,7 @@ def remap_batch_keys(
 
 
 def preprocess_real_batches(
-    raw_batches: list[dict[str, np.ndarray]],
+    raw_batches: list[dict[str, Any]],
     policy_path: str,
     full_policy,
     device: torch.device,
@@ -448,7 +448,8 @@ def preprocess_real_batches(
     result: list[dict[str, Tensor]] = []
     for raw_batch in raw_batches:
         obs = copy(raw_batch)  # avoid mutating the original
-        obs = prepare_observation_for_inference(obs, device, task)
+        batch_task = obs.pop("task", "")
+        obs = prepare_observation_for_inference(obs, device, task or batch_task)
         obs = preprocessor(obs)
         # The preprocessor's DeviceProcessorStep may move tensors to the
         # device stored in the checkpoint config (e.g. cuda:0).  Ensure
