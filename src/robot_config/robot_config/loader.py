@@ -1108,9 +1108,6 @@ def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
         bundle_path=resolve_ros_path(bundle_path) if bundle_path else "",
         deployment=data.get("deployment", defaults.deployment),
         service_name=data.get("service_name", defaults.service_name),
-        load_service_name=data.get("load_service_name", defaults.load_service_name),
-        unload_service_name=data.get("unload_service_name", defaults.unload_service_name),
-        load_on_startup=data.get("load_on_startup", defaults.load_on_startup),
         prompt_profile=data.get("prompt_profile", defaults.prompt_profile),
         segment_max_chars=data.get("segment_max_chars", defaults.segment_max_chars),
         segment_pause_ms=data.get("segment_pause_ms", defaults.segment_pause_ms),
@@ -1513,10 +1510,6 @@ def validate_config(config: RobotConfig) -> list[str]:
             errors.append("voice_tts.deployment is required when voice_tts.enabled is true")
         if not config.voice_tts.service_name.startswith("/"):
             errors.append("voice_tts.service_name must be an absolute ROS service name")
-        if not config.voice_tts.load_service_name.startswith("/"):
-            errors.append("voice_tts.load_service_name must be an absolute ROS service name")
-        if not config.voice_tts.unload_service_name.startswith("/"):
-            errors.append("voice_tts.unload_service_name must be an absolute ROS service name")
         if not config.voice_tts.prompt_profile:
             errors.append("voice_tts.prompt_profile must be non-empty")
         positive_limits = {

@@ -13,3 +13,4 @@ SynthesizedAudio[] audio_segments
 float32 total_duration_sec
 float32 total_inference_time_ms
 ModelRuntimeInfo model
+float32 inference_time_ms

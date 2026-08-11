@@ -9,9 +9,9 @@ import numpy as np
 from inference_service.backends import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
 from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.generic_runtime import NamedTensorRequest, NamedTensorResult
+from inference_service.model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
 from inference_service.model_sessions import ModelSession
 
-from .model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
 from .perception_adapter import AdapterIdentity, PerceptionAdapter
 
 

@@ -18,7 +18,7 @@ def generate_perception_model_nodes(
     runtime = parse_perception_runtime_config(robot_config)
     return [
         Node(
-            package="perception_service",
+            package="inference_service",
             executable="model_service_node",
             name=service.node_name,
             output="screen",

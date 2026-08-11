@@ -10,9 +10,9 @@ from inference_service.backends import BackendCapabilities
 from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import RuntimeContext
 from inference_service.generic_runtime import NamedTensorRequest
+from inference_service.model_service_node import _runtime_info
+from inference_service.model_service_plugin import ModelServicePlugin
 from inference_service.model_sessions import AscendOmModelSession, ModelSession
-from perception_service.model_service_node import _runtime_info
-from perception_service.model_service_plugin import ModelServicePlugin
 from perception_service.model_service_plugins import (
     GroundingDetectPlugin,
     RAMPlusRecognizeTagsPlugin,

@@ -201,9 +201,6 @@ class VoiceTTSConfig:
     bundle_path: str = "models/voice_tts/zipvoice"
     deployment: str = ""
     service_name: str = "/voice_tts/synthesize"
-    load_service_name: str = "/voice_tts/load"
-    unload_service_name: str = "/voice_tts/unload"
-    load_on_startup: bool = False
     prompt_profile: str = "default"
     segment_max_chars: int = 200
     segment_pause_ms: int = 150

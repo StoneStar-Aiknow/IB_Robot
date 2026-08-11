@@ -29,9 +29,9 @@ from conftest import FakeAclModel, FakeAclRuntimeManager
 from sensor_msgs.msg import PointCloud2, PointField
 
 from inference_manifest import load_inference_manifest
+from inference_service.model_service_plugin import ModelServicePlugin
 from perception_service.graspgen_adapter import GraspGenAdapter
 from perception_service.graspgen_session import GraspGenAscendSession
-from perception_service.model_service_plugin import ModelServicePlugin
 from perception_service.model_service_plugins import (
     GraspGenGenerateGraspsPlugin,
     _new_graspgen_session,

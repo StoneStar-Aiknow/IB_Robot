@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 
 from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
+from inference_service.model_service_node import _instantiate_plugin, _validate_service_contract
 from perception_service.echo_adapter import EchoAdapter, EchoServicePlugin
-from perception_service.model_service_node import _instantiate_plugin, _validate_service_contract
 
 
 def _bundle(root: Path) -> Path:

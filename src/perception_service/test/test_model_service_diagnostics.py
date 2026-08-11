@@ -7,7 +7,7 @@ from inference_manifest import (
     canonical_semantic_identity_json,
     semantic_identity_fingerprint,
 )
-from perception_service.model_service_node import (
+from inference_service.model_service_node import (
     ModelServiceNode,
     _instantiate_plugin,
     _runtime_info,
@@ -117,7 +117,7 @@ def test_plugin_initialization_honors_required_failure_policy(monkeypatch, requi
         get_logger=lambda: Logger(),
     )
     monkeypatch.setattr(
-        "perception_service.model_service_node.load_inference_manifest",
+        "inference_service.model_service_node.load_inference_manifest",
         lambda *_args: (_ for _ in ()).throw(RuntimeError("bundle unavailable")),
     )
 
@@ -150,7 +150,7 @@ def test_plugin_initialization_can_require_semantic_identity(monkeypatch):
         get_parameter=lambda name: SimpleNamespace(value=parameters[name]),
         get_logger=lambda: Logger(),
     )
-    monkeypatch.setattr("perception_service.model_service_node.load_inference_manifest", lambda *_args: validated)
+    monkeypatch.setattr("inference_service.model_service_node.load_inference_manifest", lambda *_args: validated)
 
     ModelServiceNode._initialize_plugin(host, "test_msgs/srv/Echo")
 

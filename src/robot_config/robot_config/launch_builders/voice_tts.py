@@ -1,5 +1,6 @@
 """Voice TTS launch builder for robot_config."""
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -42,7 +43,7 @@ def resolve_voice_tts_path(path: str) -> str:
 
 
 def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
-    """Generate one Voice TTS node and leave bundle validation to that node."""
+    """Generate the shared model-service host for the ZipVoice plugin."""
 
     config = robot_config.get("voice_tts", {})
     if not config.get("enabled", False):
@@ -54,18 +55,38 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
     deployment = str(config.get("deployment", ""))
     if not bundle_path or not deployment:
         raise ValueError("voice_tts.bundle_path and voice_tts.deployment are required when enabled")
-    node_params = {
+    runtime_options = {
         name: config.get(name, default)
         for name, default in defaults.items()
-        if name not in {"enabled", "bundle_path", "deployment"}
+        if name
+        in {
+            "device_id",
+            "prompt_profile",
+            "segment_max_chars",
+            "segment_pause_ms",
+            "max_request_chars",
+            "max_prompt_audio_bytes",
+            "max_prompt_duration_sec",
+            "max_segments",
+            "max_response_audio_bytes",
+        }
     }
-    node_params.update({"bundle_path": bundle_path, "deployment": deployment})
-    node_name = str(config.get("node_name", "voice_tts_node"))
+    node_params = {
+        "instance_id": str(config.get("instance_id", "voice_tts")),
+        "bundle_path": bundle_path,
+        "deployment": deployment,
+        "adapter_class": "voice_tts_service.model_service_plugin:ZipVoiceSynthesizePlugin",
+        "service_type": "ibrobot_msgs/srv/SynthesizeSpeech",
+        "service_endpoint": str(config.get("service_name", defaults.get("service_name", "/voice_tts/synthesize"))),
+        "required": bool(config.get("exit_on_init_failure", defaults.get("exit_on_init_failure", True))),
+        "runtime_options_json": json.dumps(runtime_options, sort_keys=True),
+    }
+    node_name = str(config.get("node_name", "model_service_voice_tts"))
     logger.info(f"Voice TTS enabled, launching node {node_name!r} with deployment {deployment!r}")
     return [
         Node(
-            package="voice_tts_service",
-            executable="voice_tts_node",
+            package="inference_service",
+            executable="model_service_node",
             name=node_name,
             output="screen",
             parameters=[node_params],

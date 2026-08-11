@@ -598,3 +598,11 @@ pytest -q src/inference_service/tests
 ```
 
 只对本次修改的 Python 文件执行 Ruff。项目或 ROS 命令前必须先加载 `.shrc_local`。
+## Typed Model Services
+
+`model_service_node` is the family-neutral host for strongly typed model services. Each process loads one schema-v2
+bundle, one named deployment, and one `ModelServicePlugin`; the plugin owns domain request/response mapping while the
+shared `ModelSession` owns admission, health, accelerator lifetime, and cleanup.
+
+`robot_config` launches the same host for RAM++, SigLIP2, GraspGen, and ZipVoice TTS. Model packages provide plugins;
+they must not implement parallel ROS nodes or duplicate `ModelRuntimeInfo` projection.

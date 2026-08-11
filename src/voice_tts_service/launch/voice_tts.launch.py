@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone launch entry for debugging the Voice TTS node."""
+"""Standalone launch entry for debugging the shared ZipVoice model service."""
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo
@@ -20,15 +20,19 @@ def generate_launch_description():
                 )
             ),
             Node(
-                package="voice_tts_service",
-                executable="voice_tts_node",
-                name="voice_tts_node",
+                package="inference_service",
+                executable="model_service_node",
+                name="model_service_voice_tts",
                 output="screen",
                 parameters=[
                     {
                         "bundle_path": LaunchConfiguration("bundle_path"),
                         "deployment": LaunchConfiguration("deployment"),
-                        "service_name": LaunchConfiguration("service_name"),
+                        "instance_id": "voice_tts",
+                        "adapter_class": "voice_tts_service.model_service_plugin:ZipVoiceSynthesizePlugin",
+                        "service_type": "ibrobot_msgs/srv/SynthesizeSpeech",
+                        "service_endpoint": LaunchConfiguration("service_name"),
+                        "runtime_options_json": "{}",
                     }
                 ],
             ),

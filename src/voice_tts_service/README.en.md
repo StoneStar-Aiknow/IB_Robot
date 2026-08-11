@@ -2,7 +2,8 @@
 
 [中文](README.md)
 
-`voice_tts_service` is IB-Robot's general-purpose ROS 2 text-to-speech service. It accepts text and an optional
+`voice_tts_service` is IB-Robot's ZipVoice model-service plugin. It is hosted by the shared
+`inference_service/model_service_node`, accepts text and an optional
 voice prompt, invokes an explicitly selected ZipVoice deployment, and returns one or more independently playable
 mono WAV PCM16 audio segments.
 
@@ -15,7 +16,7 @@ The package:
 
 1. Exposes a unified ROS 2 TTS service contract.
 2. Validates the ZipVoice model bundle, manifest, and named deployment.
-3. Manages first-use loading, resident model reuse, explicit preloading, and unloading.
+3. Uses the shared model-service host for loading, resident model reuse, and cleanup.
 4. Applies bounded long-text segmentation and wraps model output as WAV PCM16.
 5. Orchestrates the Text Encoder OM, Flow Decoder OM, and CPU Vocos on Ascend 310P.
 6. Enforces request, segment-count, and response-size limits.
@@ -27,11 +28,12 @@ fallback, or runtime inference through SSH.
 
 | Item | Path or entry point |
 | --- | --- |
-| ROS node | `voice_tts_service/voice_tts_node.py` |
+| Shared ROS host | `inference_service/inference_service/model_service_node.py` |
+| TTS plugin | `voice_tts_service/voice_tts_service/model_service_plugin.py` |
 | 310P adapter | `voice_tts_service/zipvoice_310p_adapter.py` |
 | Bundle packager | `voice_tts_service/package_zipvoice_310p.py` |
 | Debug launch | `launch/voice_tts.launch.py` |
-| Console entry | `voice_tts_node = voice_tts_service.voice_tts_node:main` |
+| Console entry | `model_service_node = inference_service.model_service_node:main` |
 | Packager entry | `package_zipvoice_310p = voice_tts_service.package_zipvoice_310p:main` |
 
 Production startup uses `robot_config`, whose robot YAML is the single source of truth:
@@ -97,35 +99,21 @@ voice cloning. It returns `UNSUPPORTED_PROMPT` when prompt fields are supplied.
 
 ### 4.2 Model lifecycle
 
-| Service | Type | Behavior |
+| Stage | Owner | Behavior |
 | --- | --- | --- |
-| `/voice_tts/load` | `std_srvs/srv/Trigger` | Explicitly load and pre-warm the model; idempotent |
-| `/voice_tts/unload` | `std_srvs/srv/Trigger` | Wait for active synthesis, then release the model; idempotent |
+| Node startup | Shared model-service host | Validate the bundle and load the plugin/session |
+| Node shutdown | Shared model-service host | Close the plugin/session and release model resources |
 
-With the default `load_on_startup=false`:
+The shared model-service host loads the named deployment at node startup:
 
 ```text
-node startup -> validate the bundle without allocating model runtime memory
-first synthesize -> load the model and synthesize
-later synthesize calls -> reuse the resident model
-unload -> release OM sessions, ACL leases, Vocos, tokenizer, and prompt
-next synthesize -> load automatically again
+node startup -> validate the bundle and load the plugin/session
+synthesize -> reuse the resident model
+node shutdown -> release OM sessions, ACL leases, Vocos, tokenizer, and prompt
 ```
 
-Pre-warm when the first synthesis must not pay the load latency:
-
-```bash
-ros2 service call /voice_tts/load std_srvs/srv/Trigger "{}"
-```
-
-Release model memory while leaving the ROS node and endpoints alive:
-
-```bash
-ros2 service call /voice_tts/unload std_srvs/srv/Trigger "{}"
-```
-
-Load, synthesize, and unload coordinate session creation and replacement. The shared `ModelSession` owns model
-admission and cleanup, and unload waits for active inference before closing the session.
+The shared `ModelSession` owns model admission and cleanup. Host shutdown waits for active inference before closing
+the session.
 
 ## 5. Model Bundle and Deployment
 
@@ -183,9 +171,6 @@ voice_tts:
   deployment: ascend_310p
 
   service_name: /voice_tts/synthesize
-  load_service_name: /voice_tts/load
-  unload_service_name: /voice_tts/unload
-  load_on_startup: false
 
   prompt_profile: default
   segment_max_chars: 200

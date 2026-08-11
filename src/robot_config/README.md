@@ -706,11 +706,10 @@ ros2 launch robot_config robot.launch.py \
 TTS 对外提供 `/voice_tts/synthesize` typed service。请求和响应携带音频字节而不是服务端文件路径，
 并通过文本、prompt、分段数和响应字节上限约束单个 DDS response。真实模型未就绪时服务返回
 `MODEL_NOT_READY`；部署身份和 readiness 由响应中的 `ModelRuntimeInfo` 报告。
-launch builder 只解析配置和创建节点，不提前打开模型 bundle。节点启动时校验 bundle，因而
-`exit_on_init_failure=false` 能在模型存储暂不可用时保留服务并返回 `MODEL_NOT_READY`。默认不把模型载入
-内存，首次有效调用 `/voice_tts/synthesize` 时自动加载并常驻；
-`/voice_tts/load` 可提前预热，`/voice_tts/unload` 会等待当前合成结束后释放模型资源，节点和服务仍保持运行，
-下次合成再自动加载。将 `load_on_startup` 设为 `true` 可恢复节点启动时立即加载的行为。
+launch builder 只解析配置和创建节点，不提前打开模型 bundle。节点启动时校验 bundle 并加载 session，因而
+`exit_on_init_failure=false` 能在模型存储暂不可用时保留服务并返回 `MODEL_NOT_READY`；
+TTS 由通用 `inference_service/model_service_node` 承载，节点启动时加载 named deployment，节点退出时等待当前
+合成结束并释放模型资源。
 相对 `bundle_path` 以 `.shrc_local` 设置的绝对 `WORKSPACE` 为根目录解析，例如默认值对应
 `$WORKSPACE/models/voice_tts/zipvoice`。
 当前经 310P1 真机核查的 `ascend_310p` deployment 支持固定 bundle prompt、中文/数字/常用标点和 24 kHz
