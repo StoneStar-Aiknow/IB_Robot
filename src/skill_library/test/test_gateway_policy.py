@@ -155,6 +155,21 @@ def test_policy_rejects_timeout_over_budget_without_truncating_effective_timeout
     assert decision.effective_timeout_sec == 10.1
 
 
+def test_workflow_root_lease_issues_only_internal_child_borrows() -> None:
+    policy, _ledger, lease = _atomic_policy()
+    owner = ExecutionOwner.workflow("workflow-1")
+
+    error_code, token = policy.admit_workflow(owner, _snapshot(), timeout_sec=8.0)
+
+    assert error_code == ""
+    assert token is not None
+    assert lease.owner is owner
+    assert policy.borrow_workflow_internal(owner, token, "workflow-1/skill/0001", "relative") is not None
+    assert policy.borrow_workflow_internal(owner, object(), "workflow-1/skill/0001", "relative") is None
+    assert policy.release_workflow(owner, token) is True
+    assert lease.owner is None
+
+
 @pytest.mark.parametrize(
     ("snapshot", "timeout_sec", "expected_reason"),
     [
@@ -360,8 +375,8 @@ def test_policy_borrow_internal_requires_exact_active_admission_and_keeps_root_l
 def test_policy_externally_admits_and_releases_primitive_lease_atomically():
     policy, _ledger, lease = _atomic_policy()
 
-    error_code, token = policy.admit_external_primitive("manual-task", _snapshot())
-    second_error_code, second_token = policy.admit_external_primitive("second-task", _snapshot())
+    error_code, token = policy.admit_external_primitive("manual-task", "payload-1", _snapshot())
+    second_error_code, second_token = policy.admit_external_primitive("second-task", "payload-2", _snapshot())
 
     assert error_code == ""
     assert token is not None
@@ -370,6 +385,21 @@ def test_policy_externally_admits_and_releases_primitive_lease_atomically():
     assert second_token is None
     assert policy.release_external_primitive(token)
     assert lease.owner is None
+
+
+def test_external_primitive_ledger_rejects_duplicate_and_payload_conflict():
+    policy, ledger, lease = _atomic_policy()
+    error, token = policy.admit_external_primitive("primitive-1", "digest-1", _snapshot())
+
+    assert error == ""
+    assert ledger.query("primitive-1").state == "active"
+    assert policy.admit_external_primitive("primitive-1", "digest-1", _snapshot())[0] == gateway_policy.SKILL_BUSY
+    policy.terminal_external_primitive("primitive-1", "digest-1", token, error_code="")
+    assert policy.release_external_primitive(token)
+    assert (
+        policy.admit_external_primitive("primitive-1", "digest-1", _snapshot())[0] == gateway_policy.DUPLICATE_TASK_ID
+    )
+    assert policy.admit_external_primitive("primitive-1", "digest-2", _snapshot())[0] == gateway_policy.TASK_ID_CONFLICT
 
 
 def test_finalize_accepts_only_the_original_admission_object():

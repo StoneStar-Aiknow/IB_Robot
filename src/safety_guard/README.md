@@ -22,41 +22,48 @@ Task / Skill request
 
 更具体地说：
 
-- `skill_library` 在执行 `SkillCommand` 前，会先调用 `/embodied/validate_skill`
-- `skill_library` 在执行 `PrimitiveCommand` 前，会先调用 `/embodied/validate_primitive`
+- `skill_library` 在执行 `SkillCommand` 前，会先调用 `/embodied/validate_skill`（请求携带 `dispatch_binding`）
+- `skill_library` 在执行 `PrimitiveCommand` 前，会先调用 `/embodied/validate_primitive`（请求携带 `dispatch_binding` 和 `dispatch_nonce`）
 - 校验失败会直接中止当前 skill 或 primitive，而不是静默跳过
+- validate 是只读 preflight，不查询 coordinator；exact snapshot、nonce、digest、step payload 的权威校验
+  在后续 Gateway action admission 完成
 
-## 2. 配置来源
+## 2. 配置来源：exact snapshot synchronization
 
-`safety_guard` 不自己维护独立 YAML。
-它读取的是 `robot_config` 注入的 `robot.embodied` 相关配置，主要包括：
+`safety_guard` 不再从 `robot_config` 注入的 `skill_templates_json` 读取模板，也不维护独立 YAML。
+它通过 **exact registry snapshot synchronization** 从 `skill_library` Gateway 拉取与当前 runtime 完全
+一致的 verified snapshot，校验在本地内存中完成，**不执行任何 ROS I/O**。
 
-- `named_poses`
-- `named_targets`
-- `safety.workspace`
-- `joints.arm`
-- `teleoperation.safety.joint_limits`
+同步机制（均在节点内异步完成，不阻塞 validate 调用）：
 
-运行时这些内容以 JSON 参数形式传入：
+1. **`SkillRegistryEvent` 订阅**（`/embodied/skill_registry_events`，QoS 固定为
+   RELIABLE / TRANSIENT_LOCAL / KEEP_LAST / depth 1）：成功 reload 后由 Gateway 发布，告知晚加入者
+   应查询哪个 `(epoch, new_generation, registry_digest)`。收到事件后立即请求对应 snapshot。
+2. **`GetSkillGatewayStatus` 周期轮询**（`/embodied/get_skill_gateway_status`，周期
+   `snapshot_sync_period_sec`，默认 `1.0`）：获取当前 identity 和 `retained_generations`，对每个 retained
+   generation 请求缺失的 snapshot，并 `reconcile` 本地缓存。缓存保留 Gateway 声明的
+   `retained_generations`，并额外保留当前 epoch 最近两个 generation，以覆盖 reload 期间的活动校验。
+3. **`GetSkillSnapshot` 拉取**（`/embodied/get_skill_snapshot`）：按 `(epoch, generation)` 精确查询，
+   `generation>0` 必须精确匹配，不静默升级到更新版本；已被回收返回 `SKILL_SNAPSHOT_NOT_RETAINED`。
 
-| 参数 | 说明 |
-| --- | --- |
-| `named_poses_json` | 命名位姿字典 |
-| `named_targets_json` | 命名目标字典 |
-| `workspace_json` | 工作空间边界 |
-| `arm_joint_names_json` | 手臂关节名顺序 |
-| `joint_limits_json` | 关节限位字典 |
+拉取到的 `snapshot_json` 进入 `SafetySnapshotCache` 前必须通过完整校验：必须是 canonical JSON、
+`schema_version=1`、字段集严格等于 `snapshot_payload_v1`；本地重算 `registry_digest`、`capability_digest`、
+`provenance_digest` 必须与响应一致；`primitive_contract_digest` 必须等于本地 SSOT
+`PRIMITIVE_CONTRACT_DIGEST`；skill 名称必须唯一非空。任一校验失败以 `SKILL_SNAPSHOT_DIGEST_MISMATCH`
+或 `SKILL_SCHEMA_INVALID` 拒绝并丢弃，不更新 current 指针。
 
-这保证了安全规则仍然受 `robot_config` 统一管理。
+校验时 robot context（`named_poses`、`named_targets`、`workspace_limits`、`arm_joint_names`、`joint_limits`）
+和 `skill_templates` 全部来自 verified snapshot，不再来自节点启动参数。启动参数 `named_poses_json` 等
+仍声明并加载到实例属性，但 validate 处理器不再读取它们。`skill_templates_json` 参数已移除。
 
 ## 3. safety_guard_node
 
 ### 作用
 
-1. 暴露技能级校验服务。
-2. 暴露原子动作级校验服务。
-3. 对当前最小闭环中的有限技能和原子动作做白名单限制。
-4. 对位姿目标执行工作空间边界检查。
+1. 暴露技能级只读 preflight 校验服务。
+2. 暴露原子动作级只读 preflight 校验服务。
+3. 在已验证的 exact snapshot 上做白名单 + 工作空间 + 关节限位静态校验。
+4. 维护 `SafetySnapshotCache`，按 `(epoch, generation)` 索引 verified snapshot，并随 Gateway 同步。
 5. 在 `debug_tracing=true` 时打印每次校验的决策日志。
 
 ### 主要参数
@@ -65,26 +72,36 @@ Task / Skill request
 | --- | --- | --- |
 | `validate_skill_service` | `/embodied/validate_skill` | 技能校验服务名 |
 | `validate_primitive_service` | `/embodied/validate_primitive` | 原子动作校验服务名 |
-| `named_poses_json` | `{}` | 命名位姿 |
-| `named_targets_json` | `{}` | 命名目标 |
-| `workspace_json` | `{}` | 工作空间边界 |
-| `arm_joint_names_json` | `[]` | 手臂关节名顺序 |
-| `joint_limits_json` | `{}` | 关节限位字典 |
+| `skill_gateway_status_service` | `/embodied/get_skill_gateway_status` | Gateway 状态服务名（轮询同步） |
+| `skill_catalog_snapshot_service` | `/embodied/get_skill_snapshot` | exact snapshot 查询服务名 |
+| `skill_registry_event_topic` | `/embodied/skill_registry_events` | registry 事件 topic |
+| `snapshot_sync_period_sec` | `1.0` | 状态轮询周期，必须为正 |
+| `named_poses_json` | `{}` | 启动时加载，不再驱动 validate（snapshot `robot_context` 为准） |
+| `named_targets_json` | `{}` | 启动时加载，不再驱动 validate |
+| `workspace_json` | `{}` | 启动时加载，不再驱动 validate |
+| `arm_joint_names_json` | `[]` | 启动时加载，不再驱动 validate |
+| `joint_limits_json` | `{}` | 启动时加载，不再驱动 validate |
 | `debug_tracing` | `false` | 是否输出调试日志 |
 
 ## 4. 当前 ROS 服务接口
 
 ### `/embodied/validate_skill`
 
-类型：`ibrobot_msgs/srv/ValidateSkill`
+类型：`ibrobot_msgs/srv/ValidateSkill`。只读 preflight：校验 exact snapshot、entry 参数和当前机器人状态，
+但不查询或修改 coordinator，也不得把存在 `root_lease_nonce` 解释为执行授权。Workflow root、nonce、
+digest、期望 index 和完整 step payload 的权威校验只在后续 Gateway action admission 发生，因此 validation
+通过不保证 admission 成功。
 
 **请求字段**
 
 | 字段 | 说明 |
 | --- | --- |
+| `dispatch_binding` | `DispatchBinding`，必须携带完整期望 registry identity；`root_lease_nonce` 仅用于关联，不视为授权；`dispatch_nonce` 必须为空 |
 | `skill_name` | 待执行技能名 |
 | `target_name` | 命名目标 |
 | `place_name` | 命名放置位 |
+| `motion_direction` | 相对运动方向 |
+| `motion_distance` | 相对运动距离 |
 
 **响应字段**
 
@@ -92,19 +109,27 @@ Task / Skill request
 | --- | --- |
 | `allowed` | 是否允许 |
 | `reason` | 不允许时的原因 |
+| `error_code` | 稳定错误码 |
+| `actual_registry_epoch` | 实际使用的 registry epoch |
+| `actual_registry_generation` | 实际使用的 registry generation |
+| `actual_registry_digest` | 实际使用的 registry digest |
+| `diagnostics` | `SkillDiagnostic[]` 结构化诊断 |
 
 ### `/embodied/validate_primitive`
 
-类型：`ibrobot_msgs/srv/ValidatePrimitive`
+类型：`ibrobot_msgs/srv/ValidatePrimitive`。请求必须携带 exact registry identity 和非空 `dispatch_nonce`。
 
 **请求字段**
 
 | 字段 | 说明 |
 | --- | --- |
+| `dispatch_binding` | `DispatchBinding`，必须携带完整期望 registry identity 和非空 `dispatch_nonce` |
 | `primitive_name` | 原子动作名 |
 | `pose_name` | 命名位姿名 |
 | `relative_dx/dy/dz` | 相对位移增量 |
 | `target_x/y/z` | 执行层解析出的目标末端位置 |
+| `target_qx/qy/qz/qw` | 执行层解析出的目标末端姿态四元数 |
+| `velocity_scaling` | MoveIt 速度比例 |
 | `gripper_position` | 夹爪目标开合量 |
 | `joint_names` | 关节名列表 |
 | `joint_positions` | 单个关节目标位置 |
@@ -119,19 +144,34 @@ Task / Skill request
 | --- | --- |
 | `allowed` | 是否允许 |
 | `reason` | 不允许时的原因 |
+| `error_code` | 稳定错误码 |
+| `actual_registry_epoch` | 实际使用的 registry epoch |
+| `actual_registry_generation` | 实际使用的 registry generation |
+| `actual_registry_digest` | 实际使用的 registry digest |
+| `diagnostics` | `SkillDiagnostic[]` 结构化诊断 |
+
+### Fail-closed 行为
+
+两个 validate 服务均 fail closed：
+
+- `dispatch_binding.schema_version != 1` 或期望 identity 不完整（epoch 空、generation<=0、digest 空）：
+  `allowed=false`、`error_code=SKILL_SCHEMA_INVALID`，`actual_*` 取当前缓存 identity（可能为空）。
+  `ValidatePrimitive` 还要求 `dispatch_nonce` 非空。
+- exact snapshot 未缓存（已被回收）：`error_code=SKILL_SNAPSHOT_NOT_RETAINED`。
+- 缓存的 snapshot digest 与请求期望不一致：`error_code=SKILL_REGISTRY_VERSION_MISMATCH`。
+- snapshot payload 校验失败：`error_code=SKILL_SCHEMA_INVALID` 或 `SKILL_SNAPSHOT_DIGEST_MISMATCH`。
+- 校验通过且白名单/工作空间/关节限位全部满足：`allowed=true`、`error_code=""`。
+- 校验通过但规则不满足：`allowed=false`，skill 和 primitive 均返回 `SKILL_LIMIT_VIOLATION`。
+- 输入/Schema 异常返回 `SKILL_SCHEMA_INVALID`；内部异常 fail closed，返回
+  `CAPABILITY_NOT_READY` 和固定消息，完整异常只写日志。
 
 ## 5. 当前内置规则
 
 ### 技能白名单
 
-技能白名单由 `get_skill_templates()` 选择：
-
-- `skill_templates_json` 非空时，使用当前机器人 YAML 注入并过滤 `disabled: true` 后的启用
-  `embodied.skill_templates` 集合
-- 未提供机器人模板时，回退到 `embodied_common.skill_templates` 的默认模板
-
-机器人模板非空时替代默认模板，两套模板不会自动合并。请求技能必须存在于当前选中的模板集合中。
-安全守卫随后按顺序校验每个 primitive，任何未知技能、未知 primitive 或参数越界都会被拒绝。
+技能白名单来自 verified snapshot 的 `templates`（由 `SkillCatalogCompiler` 编译）。请求技能必须存在于
+当前选中的 snapshot 模板集合中。安全守卫随后按顺序校验每个 primitive，任何未知技能、未知 primitive 或
+参数越界都会被拒绝。不存在「默认模板回退」路径——snapshot 未就绪时 validate 直接 fail closed。
 
 ### 技能依赖检查
 
@@ -142,7 +182,7 @@ Task / Skill request
 | `inspect_scene` | 必须存在 `observe_table` 命名位姿 |
 | `recover_safe_pose` | 必须存在 `home` 命名位姿 |
 | `recover_zero_pose` | 必须存在 `zero` 命名位姿 |
-| YAML 派生技能 | 必须存在于 `skill_templates_json`，并通过其全部 primitive 校验 |
+| catalog 派生技能 | 必须存在于当前 verified snapshot `templates`，并通过其全部 primitive 校验 |
 
 ### 原子动作白名单
 
@@ -163,19 +203,19 @@ Task / Skill request
 
 会检查：
 
-1. `pose_name` 是否存在
+1. `pose_name` 是否存在（snapshot `robot_context.named_poses`）
 2. 位姿是否包含 `position.x/y/z`
-3. 位姿是否落在 `workspace` 指定边界内
+3. 位姿是否落在 `workspace_limits` 指定边界内
 
 #### `move_relative_ee`
 
 会检查：
 
 1. 相对位移增量不能全为 0
-2. 由执行层计算得到的目标位姿是否仍落在 `workspace` 内
+2. 由执行层计算得到的目标位姿是否仍落在 `workspace_limits` 内
 3. 技能层传下来的方向和步长是否合法
 
-如果机械臂当前已经贴近边界，则部分方向会被拒绝；`workspace` 需要覆盖机器人默认启动姿态，否则第一条相对移动也会被直接拦截。
+如果机械臂当前已经贴近边界，则部分方向会被拒绝；`workspace_limits` 需要覆盖机器人默认启动姿态，否则第一条相对移动也会被直接拦截。
 
 #### `open_gripper` / `close_gripper`
 
@@ -188,9 +228,9 @@ Task / Skill request
 会检查：
 
 1. `joint_names` 必须存在，且与 `joint_positions` 数量一致
-2. 如果配置了 `arm_joint_names_json`，请求必须按完整手臂关节顺序下发
+2. 如果 snapshot `robot_context.arm_joint_names` 非空，请求必须按完整手臂关节顺序下发
 3. `primitive_duration_sec` 必须大于 0
-4. 每个关节目标必须落在 `joint_limits_json` 范围内
+4. 每个关节目标必须落在 `robot_context.joint_limits` 范围内
 
 #### `move_through_joint_positions`
 
@@ -204,10 +244,10 @@ Task / Skill request
 
 ## 6. 工作空间定义
 
-当前 `workspace_json` 使用简单的轴对齐范围：
+`workspace_limits`（snapshot `robot_context` 中）使用简单的轴对齐范围：
 
 ```yaml
-workspace:
+workspace_limits:
   x: [min, max]
   y: [min, max]
   z: [min, max]
@@ -229,11 +269,19 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.sh
 ros2 service list | grep embodied
 ```
 
-也可以手工调用服务验证一条技能：
+`validate_skill` / `validate_primitive` 请求必须携带完整 `dispatch_binding`（exact registry identity），
+手工构造较繁琐。推荐使用 `robot-skill validate`，CLI 会查询 `GetSkillGatewayStatus` 取回当前 identity
+并构造只读 preflight 请求：
 
 ```bash
-ros2 service call /embodied/validate_skill ibrobot_msgs/srv/ValidateSkill \
-  "{skill_name: inspect_scene, target_name: '', place_name: ''}"
+source .shrc_local && export ROS_DOMAIN_ID=42 && \
+robot-skill validate inspect_scene
+```
+
+也可以监听 registry 事件观察 snapshot 同步：
+
+```bash
+ros2 topic echo /embodied/skill_registry_events
 ```
 
 ## 8. 当前限制
@@ -241,3 +289,5 @@ ros2 service call /embodied/validate_skill ibrobot_msgs/srv/ValidateSkill \
 - 目前只做**白名单 + 工作空间 + 关节限位**级别的静态校验。
 - 还没有碰撞检测、动力学约束、实时状态联动等更复杂安全能力。
 - 也没有引入独立安全状态机；当前是同步请求-响应式安全判断。
+- validate 是只读 preflight，不查询或修改 coordinator；通过 validate 不保证后续 Gateway action admission
+  成功。

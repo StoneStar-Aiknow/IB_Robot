@@ -136,6 +136,7 @@ def launch_setup(context, *_args, **_kwargs):
     control_mode_override = context.launch_configurations.get("control_mode", "")
     with_embodied_str = context.launch_configurations.get("with_embodied", "true")
     with_perception_str = context.launch_configurations.get("with_perception", "")
+    entry_mode_override = context.launch_configurations.get("entry_mode", "")
     authorize_motion_str = context.launch_configurations.get("authorize_motion", "false")
 
     config = _load_config(robot_config_name, config_path_override)
@@ -144,6 +145,8 @@ def launch_setup(context, *_args, **_kwargs):
 
     embodied_config = config.setdefault("embodied", {})
     embodied_config["enabled"] = parse_bool(with_embodied_str, default=True)
+    if entry_mode_override:
+        embodied_config["entry_mode"] = entry_mode_override
     if with_perception_str != "":
         perception_config = embodied_config.setdefault("perception", {})
         perception_config["enabled"] = parse_bool(with_perception_str, default=False)
@@ -226,6 +229,7 @@ def generate_launch_description():
             DeclareLaunchArgument("moveit_display", default_value="false"),
             DeclareLaunchArgument("with_embodied", default_value="true"),
             DeclareLaunchArgument("with_perception", default_value=""),
+            DeclareLaunchArgument("entry_mode", default_value=""),
             DeclareLaunchArgument("authorize_motion", default_value="false"),
             OpaqueFunction(function=launch_setup),
         ]

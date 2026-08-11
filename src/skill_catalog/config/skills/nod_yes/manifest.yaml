@@ -1,0 +1,48 @@
+schema_version: 1
+name: nod_yes
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Nod 'yes' (agreement) with small wrist flexion motion.
+  category: social_affirmation
+  when_to_use:
+  - agree
+  - say yes
+  - confirm
+  - nod
+  do_not_use:
+  - condition: disagree or say no
+    instead_use: shake_no
+  - condition: greet someone
+    instead_use: wave_hello
+  aliases_zh:
+  - 点头
+  - 同意
+  - 是的
+  - 点头表示同意
+  aliases_en:
+  - 'yes'
+  - agree
+  - nod
+  - confirm
+  motion_scope:
+  - wrist
+  anchor_pose: home
+  intensity: subtle
+  duration_sec_estimate: 7.0
+  requires_motion_params: false
+  rule_entry: true
+capability:
+  schema_version: 1
+  summary: Perform a gesture indicating agreement.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  so101_arm_v1: implementations/so101_arm_v1.yaml

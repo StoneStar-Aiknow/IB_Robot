@@ -3,29 +3,32 @@ from pathlib import Path
 import pytest
 import yaml
 
-from embodied_common.skill_templates import get_skill_templates
 from robot_config.loader import (
     load_robot_config,
     load_robot_config_dict,
     validate_config,
     validate_embodied_launch_dict,
 )
+from robot_skill_cli.catalog import compile_local_snapshot
 
 GRIPPER_TRAJECTORY_DURATION_SEC = 1.0
+
+
+def _snapshot(config_path: Path):
+    return compile_local_snapshot(load_robot_config_dict(config_path), config_path)
 
 
 @pytest.mark.parametrize(
     "config_name",
     ["so101_single_arm"],
 )
-def test_loaded_embodied_skill_templates_include_dance_basic(config_name):
+def test_compiled_profile_includes_dance_basic(config_name):
     config_path = Path(__file__).parent.parent / "config" / "robots" / f"{config_name}.yaml"
 
     if not config_path.exists():
         pytest.skip(f"Config file not found: {config_path}")
 
-    config = load_robot_config_dict(config_path)
-    skill_templates = config["embodied"]["skill_templates"]
+    skill_templates = _snapshot(config_path).templates
 
     assert "dance_basic" in skill_templates
     primitive_sequence = skill_templates["dance_basic"]["primitive_sequence"]
@@ -73,32 +76,25 @@ def test_so101_skill_gateway_control_mode_is_global_and_safety_has_no_motion_aut
     assert raw_config["skill_required_control_mode"] == "moveit_planning"
     assert raw_config["skill_required_control_mode"] in raw_config["control_modes"]
     assert "motion_authorized" not in embodied["safety"]
-    assert all("skill_required_control_mode" not in skill for skill in embodied["skill_templates"].values())
+    assert "skill_templates" not in embodied
 
     typed_config = load_robot_config(config_path)
     assert not hasattr(typed_config.embodied, "motion_authorized")
 
 
-def test_loaded_skill_templates_match_current_enabled_template_set():
+def test_compiled_skills_match_profile_enabled_set():
     config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
-    config = load_robot_config_dict(config_path)
-    raw_templates = yaml.safe_load(config_path.read_text(encoding="utf-8"))["robot"]["embodied"]["skill_templates"]
+    profile_path = config_path.parents[3] / "skill_catalog" / "config" / "profiles" / "so101_single_arm.yaml"
+    expected = {entry["name"] for entry in yaml.safe_load(profile_path.read_text(encoding="utf-8"))["enabled_skills"]}
 
-    assert set(config["embodied"]["skill_templates"]) == set(get_skill_templates(raw_templates))
+    assert set(_snapshot(config_path).enabled_skill_names) == expected
 
 
-def test_loader_requires_capability_summary_in_copied_so101_config(tmp_path):
+def test_production_robot_yaml_has_no_inline_skill_catalog():
     source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
-    copied_config = yaml.safe_load(source_path.read_text(encoding="utf-8"))
-    capability = copied_config["robot"]["embodied"]["skill_templates"]["recover_safe_pose"].setdefault("capability", {})
-    capability.pop("summary", None)
-    config_path = tmp_path / "robot.yaml"
-    config_path.write_text(yaml.safe_dump(copied_config), encoding="utf-8")
-
-    with pytest.raises(ValueError) as exc_info:
-        load_robot_config_dict(config_path)
-
-    assert str(exc_info.value).endswith("embodied.skill_templates.recover_safe_pose.capability.summary is required")
+    embodied = yaml.safe_load(source_path.read_text(encoding="utf-8"))["robot"]["embodied"]
+    assert "skill_templates" not in embodied
+    assert embodied["skill_catalog_profile"] == "so101_single_arm"
 
 
 def test_embodied_entry_visual_games_typed():
@@ -151,15 +147,17 @@ def test_launch_dict_enabled_game_without_perception_is_rejected():
     assert any("visual_games" in error for error in errors)
 
 
-def test_launch_dict_enabled_game_with_perception_is_ok():
+def test_launch_dict_enabled_game_with_perception_is_rejected_in_hermes_mode():
     config = {
         "embodied": {
             "enabled": True,
+            "entry_mode": "hermes",
             "perception": {"enabled": True},
             "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
         }
     }
-    assert validate_embodied_launch_dict(config) == []
+    errors = validate_embodied_launch_dict(config)
+    assert any("voice entry mode" in error for error in errors)
 
 
 def test_launch_dict_skips_when_embodied_disabled():
@@ -176,8 +174,7 @@ def test_launch_dict_skips_when_embodied_disabled():
 
 def test_embodied_config_keeps_only_supported_direct_skills():
     config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
-    config = load_robot_config_dict(config_path)
-    skill_templates = config["embodied"]["skill_templates"]
+    skill_templates = _snapshot(config_path).templates
 
     assert "dance_basic" in skill_templates
     assert "pick_named_target" not in skill_templates
@@ -196,12 +193,11 @@ def test_embodied_config_keeps_only_supported_direct_skills():
 def test_embodied_named_pose_skills_map_to_configured_poses(skill_name, pose_name):
     config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
     config = load_robot_config_dict(config_path)
-    skill_templates = config["embodied"]["skill_templates"]
+    skill_templates = _snapshot(config_path).templates
 
     assert pose_name in config["embodied"]["named_poses"]
-    assert skill_templates[skill_name]["primitive_sequence"] == [
-        {"primitive_name": "move_to_named_pose", "pose_name": pose_name}
-    ]
+    step = skill_templates[skill_name]["primitive_sequence"][0]
+    assert dict(step) == {"primitive_name": "move_to_named_pose", "pose_name": pose_name}
 
 
 def test_enabled_embodied_config_uses_configured_default_place_pose():
@@ -220,7 +216,9 @@ def test_enabled_embodied_config_uses_configured_default_place_pose():
 )
 def test_social_gesture_duration_estimate_covers_configured_motion(skill_name):
     config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
-    skill = load_robot_config_dict(config_path)["embodied"]["skill_templates"][skill_name]
+    skill = _snapshot(config_path).templates[skill_name]
+    manifest_path = config_path.parents[3] / "skill_catalog" / "config" / "skills" / skill_name / "manifest.yaml"
+    description = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))["description"]
 
     configured_duration = 0.0
     if skill.get("initial_gripper_state") in {"open", "closed"}:
@@ -234,4 +232,4 @@ def test_social_gesture_duration_estimate_covers_configured_motion(skill_name):
         elif primitive_name in {"open_gripper", "close_gripper"}:
             configured_duration += GRIPPER_TRAJECTORY_DURATION_SEC
 
-    assert float(skill["description"]["duration_sec_estimate"]) >= configured_duration
+    assert float(description["duration_sec_estimate"]) >= configured_duration

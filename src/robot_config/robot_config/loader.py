@@ -1,6 +1,8 @@
 """Configuration loader and validator for robot_config."""
 
 import copy
+import hashlib
+import json
 import logging
 import math
 from pathlib import Path
@@ -11,7 +13,6 @@ import yaml
 from embodied_common.skill_templates import (
     SUPPORTED_PRIMITIVES,
     SUPPORTED_SKILL_EXECUTORS,
-    get_skill_templates,
 )
 from robot_config.config import (
     CameraConfig,
@@ -25,6 +26,7 @@ from robot_config.config import (
     SemanticMappingConfig,
     SkillGatewayRuntimeConfig,
     VoiceASRConfig,
+    VoiceTTSConfig,
 )
 from robot_config.grasp_execution_config import validate_grasp_execution_config
 from robot_config.observation_transport import (
@@ -52,6 +54,94 @@ _PARAMETER_SCHEMA_FIELDS = {"type", "additionalProperties", "properties", "requi
 _STRING_PARAMETER_FIELDS = {"type", "enum", "freeform"}
 _DISTANCE_PARAMETER_FIELDS = {"type", "exclusiveMinimum", "unit"}
 _VALID_DISTANCE_UNITS = {"meters", "degrees"}
+
+
+def _normalize_digest_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("digest preimage mapping keys must be strings")
+        return {key: _normalize_digest_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_normalize_digest_value(item) for item in value]
+    if isinstance(value, bool) or value is None or isinstance(value, str | int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("NaN and Infinity are not allowed in digest preimages")
+        return 0.0 if value == 0.0 else value
+    raise TypeError(f"unsupported type in digest preimage: {type(value).__name__}")
+
+
+def _canonical_digest_json(value: Any) -> str:
+    return json.dumps(
+        _normalize_digest_value(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+
+
+def robot_config_digest(robot_config: dict[str, Any]) -> str:
+    """Return the digest of the closed skill execution context preimage.
+
+    This is deliberately not a digest of the YAML document.  Catalog source
+    selection, profile selection and unrelated robot configuration must not
+    change the identity used by catalog consumers.
+    """
+    embodied = robot_config.get("embodied", {})
+    execution = embodied.get("execution", {}) if isinstance(embodied, dict) else {}
+    safety = embodied.get("safety", {}) if isinstance(embodied, dict) else {}
+    if not isinstance(execution, dict):
+        execution = {}
+    if not isinstance(safety, dict):
+        safety = {}
+    joints = robot_config.get("joints", {})
+    if not isinstance(joints, dict):
+        joints = {}
+    teleoperation = robot_config.get("teleoperation", {})
+    if not isinstance(teleoperation, dict):
+        teleoperation = {}
+    teleop_safety = teleoperation.get("safety", {})
+    if not isinstance(teleop_safety, dict):
+        teleop_safety = {}
+    preimage = {
+        "context_schema_version": 1,
+        "robot_name": robot_config.get("name"),
+        "named_poses": embodied.get("named_poses", {}) if isinstance(embodied, dict) else {},
+        "named_targets": embodied.get("named_targets", {}) if isinstance(embodied, dict) else {},
+        "arm_joint_names": joints.get("arm", []),
+        "joint_limits": teleop_safety.get("joint_limits", {}),
+        "workspace_limits": safety.get("workspace", {}),
+        "required_control_mode": robot_config.get("skill_required_control_mode"),
+        "timeout_policy": resolve_embodied_timeout_policy(embodied if isinstance(embodied, dict) else {}),
+        "relative_motion_reference_frame": execution.get("relative_motion_reference_frame", "base"),
+        "relative_motion_step_m": execution.get("relative_motion_step_m", 0.03),
+        "relative_motion_direction_mapping": execution.get("relative_motion_direction_mapping", {}),
+        "gripper_open_position": execution.get("gripper_open_position", 1.0),
+        "gripper_closed_position": execution.get("gripper_closed_position", 0.0),
+        "execution_endpoints": {
+            "skill_action": embodied.get("skill_action_name", "/embodied/execute_skill"),
+            "primitive_action": embodied.get("primitive_action_name", "/embodied/execute_primitive"),
+            "validate_skill_service": embodied.get("validate_skill_service", "/embodied/validate_skill"),
+            "validate_primitive_service": embodied.get("validate_primitive_service", "/embodied/validate_primitive"),
+            "gateway_status_service": embodied.get(
+                "skill_gateway_status_service", "/embodied/get_skill_gateway_status"
+            ),
+            "begin_workflow_service": embodied.get("begin_workflow_service", "/embodied/begin_workflow_execution"),
+            "finalize_workflow_service": embodied.get(
+                "finalize_workflow_service", "/embodied/finalize_workflow_execution"
+            ),
+            "task_executor_action": execution.get("task_executor_action_name", "/task_executor/execute_task_plan"),
+            "arm_trajectory_action": execution.get(
+                "arm_trajectory_action_name", "/arm_trajectory_controller/follow_joint_trajectory"
+            ),
+            "move_configuration_service": execution.get(
+                "move_configuration_service", "/moveit_gateway/move_to_configuration"
+            ),
+        },
+    }
+    return hashlib.sha256(_canonical_digest_json(preimage).encode("utf-8")).hexdigest()
 
 
 def _is_finite_number(value: Any) -> bool:
@@ -595,20 +685,6 @@ def _load_robot_section(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
     return resolved_config_path, robot_data
 
 
-def _normalize_skill_templates(skill_templates: dict[str, Any]) -> dict[str, Any]:
-    return get_skill_templates(skill_templates)
-
-
-def _normalize_embodied_config(robot_config: dict[str, Any]) -> dict[str, Any]:
-    embodied = robot_config.get("embodied")
-    if not isinstance(embodied, dict):
-        return robot_config
-    skill_templates = embodied.get("skill_templates")
-    if isinstance(skill_templates, dict) and skill_templates:
-        embodied["skill_templates"] = _normalize_skill_templates(skill_templates)
-    return robot_config
-
-
 _GRIPPER_ONLY_PRIMITIVES = {"open_gripper", "close_gripper"}
 
 
@@ -789,46 +865,14 @@ def _validate_skill_primitive_sequence(
 
 
 def _validate_embodied_skill_contract(robot_config: dict[str, Any]) -> list[str]:
-    errors: list[str] = []
     embodied = robot_config.get("embodied", {})
     if not isinstance(embodied, dict):
-        return errors
-
-    skill_templates = embodied.get("skill_templates", {})
-    if not isinstance(skill_templates, dict):
-        return ["embodied.skill_templates must be a mapping"]
-
-    valid_skills = set(skill_templates)
-    named_poses = embodied.get("named_poses", {})
-    if not isinstance(named_poses, dict):
-        named_poses = {}
-    gateway_control_mode = robot_config.get("skill_required_control_mode")
-    if not isinstance(gateway_control_mode, str) or not gateway_control_mode.strip():
-        gateway_control_mode = None
-    for skill_name, template in skill_templates.items():
-        if not isinstance(template, dict):
-            errors.append(f"embodied.skill_templates.{skill_name} must be a mapping")
-            continue
-        disabled = template.get("disabled")
-        if disabled is not None and not isinstance(disabled, bool):
-            errors.append(f"embodied.skill_templates.{skill_name}.disabled must be a boolean when present")
-        if disabled is not True:
-            _validate_skill_capability(skill_name, template.get("capability"), gateway_control_mode, errors)
-        _validate_skill_description(skill_name, template.get("description"), valid_skills, named_poses, errors)
-        _validate_skill_primitive_sequence(skill_name, template, named_poses, errors)
-
-    planner = embodied.get("planner", {})
-    planning_policy = planner.get("planning_policy", {}) if isinstance(planner, dict) else {}
-    allowed_skills = planning_policy.get("allowed_skills", []) if isinstance(planning_policy, dict) else []
-    if isinstance(allowed_skills, list):
-        unknown = sorted(str(skill) for skill in allowed_skills if skill not in valid_skills)
-        if unknown:
-            errors.append(
-                "embodied.planner.planning_policy.allowed_skills contains unsupported skill(s): " + ", ".join(unknown)
-            )
-
-    _validate_absolute_joint_trajectory_entries(skill_templates, errors)
-    return errors
+        return []
+    return (
+        ["embodied.skill_templates is removed; use embodied.skill_catalog_profile"]
+        if "skill_templates" in embodied
+        else []
+    )
 
 
 def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
@@ -836,10 +880,9 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     required_control_mode = robot_config.get("skill_required_control_mode")
     embodied = robot_config.get("embodied", {})
-    skill_templates = embodied.get("skill_templates", {}) if isinstance(embodied, dict) else {}
-    gateway_enabled = isinstance(skill_templates, dict) and bool(skill_templates)
+    gateway_enabled = isinstance(embodied, dict) and bool(embodied.get("skill_catalog_profile"))
     if gateway_enabled and (not isinstance(required_control_mode, str) or not required_control_mode.strip()):
-        errors.append("skill_required_control_mode is required when embodied.skill_templates is non-empty")
+        errors.append("skill_required_control_mode is required when embodied.skill_catalog_profile is configured")
     elif required_control_mode is not None:
         if not isinstance(required_control_mode, str) or not required_control_mode.strip():
             errors.append("skill_required_control_mode must be a non-empty control_modes member")
@@ -852,6 +895,17 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
         status_service = embodied.get("skill_gateway_status_service")
         if status_service is not None and (not isinstance(status_service, str) or not status_service.strip()):
             errors.append("embodied.skill_gateway_status_service must be a non-empty string")
+        source_mode = embodied.get("skill_catalog_source_mode", "installed")
+        source_root = embodied.get("skill_catalog_source_root", "")
+        profile_name = embodied.get("skill_catalog_profile", "")
+        if source_mode not in {"installed", "development", "production"}:
+            errors.append("embodied.skill_catalog_source_mode must be installed, development, or production")
+        elif source_mode in {"development", "production"} and (
+            not isinstance(source_root, str) or not source_root.strip()
+        ):
+            errors.append("embodied.skill_catalog_source_root is required in development and production modes")
+        if embodied.get("enabled", False) and (not isinstance(profile_name, str) or not profile_name.strip()):
+            errors.append("embodied.skill_catalog_profile is required")
         try:
             resolve_embodied_timeout_policy(embodied)
         except ValueError as exc:
@@ -868,7 +922,6 @@ def load_robot_config_dict(config_path: str | Path | None = None) -> dict[str, A
     """
     resolved_config_path, robot_data = _load_robot_section(resolve_robot_config_path(config_path=config_path))
     robot_config = copy.deepcopy(robot_data)
-    robot_config = _normalize_embodied_config(robot_config)
     validation_errors = validate_grasp_execution_config(robot_config.get("grasp_execution"))
     validation_errors.extend(_validate_embodied_skill_contract(robot_config))
     validation_errors.extend(_validate_skill_gateway_config(robot_config))
@@ -1045,6 +1098,32 @@ def load_voice_asr_config(data: dict[str, Any]) -> VoiceASRConfig:
     )
 
 
+def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
+    """Load Voice TTS configuration without selecting a backend implicitly."""
+
+    defaults = VoiceTTSConfig()
+    bundle_path = data.get("bundle_path", defaults.bundle_path)
+    return VoiceTTSConfig(
+        enabled=data.get("enabled", defaults.enabled),
+        bundle_path=resolve_ros_path(bundle_path) if bundle_path else "",
+        deployment=data.get("deployment", defaults.deployment),
+        service_name=data.get("service_name", defaults.service_name),
+        load_service_name=data.get("load_service_name", defaults.load_service_name),
+        unload_service_name=data.get("unload_service_name", defaults.unload_service_name),
+        load_on_startup=data.get("load_on_startup", defaults.load_on_startup),
+        prompt_profile=data.get("prompt_profile", defaults.prompt_profile),
+        segment_max_chars=data.get("segment_max_chars", defaults.segment_max_chars),
+        segment_pause_ms=data.get("segment_pause_ms", defaults.segment_pause_ms),
+        max_request_chars=data.get("max_request_chars", defaults.max_request_chars),
+        max_prompt_audio_bytes=data.get("max_prompt_audio_bytes", defaults.max_prompt_audio_bytes),
+        max_prompt_duration_sec=data.get("max_prompt_duration_sec", defaults.max_prompt_duration_sec),
+        max_segments=data.get("max_segments", defaults.max_segments),
+        max_response_audio_bytes=data.get("max_response_audio_bytes", defaults.max_response_audio_bytes),
+        device_id=data.get("device_id", defaults.device_id),
+        exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
+    )
+
+
 def load_semantic_mapping_config(data: dict[str, Any]) -> SemanticMappingConfig:
     """Load the standalone semantic mapping section without flattening its contracts."""
     return SemanticMappingConfig(
@@ -1066,7 +1145,6 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
     execution = data.get("execution", {})
     safety = data.get("safety", {})
     direction_mapping = execution.get("relative_motion_direction_mapping", {})
-    planner = data.get("planner", {})
     perception = data.get("perception", {})
     entry = data.get("entry", {})
     timeout_policy = resolve_embodied_timeout_policy(data)
@@ -1083,16 +1161,18 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         validate_skill_service=data.get("validate_skill_service", "/embodied/validate_skill"),
         validate_primitive_service=data.get("validate_primitive_service", "/embodied/validate_primitive"),
         skill_gateway_status_service=data.get("skill_gateway_status_service", "/embodied/get_skill_gateway_status"),
+        skill_catalog_source_mode=data.get("skill_catalog_source_mode", "installed"),
+        skill_catalog_source_root=data.get("skill_catalog_source_root", ""),
+        skill_catalog_profile=data.get("skill_catalog_profile", ""),
         default_target_name=data.get("default_target_name", "demo_object"),
         default_place_name=data.get("default_place_name", "tray_right"),
-        skill_timeout_sec=execution.get("skill_timeout_sec", 30.0),
+        skill_timeout_sec=execution.get("skill_timeout_sec", 120.0),
         primitive_timeout_sec=execution.get("primitive_timeout_sec", 5.0),
         primitive_wait_sec=execution.get("primitive_wait_sec", 1.0),
         timeouts=timeout_policy,
         relative_motion_step_m=execution.get("relative_motion_step_m", 0.03),
         relative_motion_reference_frame=execution.get("relative_motion_reference_frame", "base"),
         relative_motion_direction_mapping=direction_mapping,
-        planner=planner,
         perception=perception,
         entry=entry,
         gripper_open_position=execution.get("gripper_open_position", 1.0),
@@ -1153,6 +1233,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
     contract = load_contract_config(contract_data)
 
     voice_asr = load_voice_asr_config(robot_data.get("voice_asr", {}))
+    voice_tts = load_voice_tts_config(robot_data.get("voice_tts", {}))
     embodied = load_embodied_config(robot_data.get("embodied", {}))
     skill_gateway = SkillGatewayRuntimeConfig(
         status_service=embodied.skill_gateway_status_service,
@@ -1176,6 +1257,7 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         peripherals=peripherals,
         contract=contract,
         voice_asr=voice_asr,
+        voice_tts=voice_tts,
         embodied=embodied,
         skill_gateway=skill_gateway,
         semantic_mapping=semantic_mapping,
@@ -1249,7 +1331,12 @@ def _validate_vlm_runtime_config(
         errors.append("embodied.timeouts.model_idle_timeout_sec must be greater than zero")
 
 
-def validate_visual_games_consistency(entry: dict[str, Any], perception: dict[str, Any]) -> list[str]:
+def validate_visual_games_consistency(
+    entry: dict[str, Any],
+    perception: dict[str, Any],
+    *,
+    entry_mode: str = "hermes",
+) -> list[str]:
     """Check the visual-games <-> perception enable consistency rule.
 
     Any enabled ``embodied.entry.visual_games.<name>`` routes its trigger to
@@ -1269,6 +1356,11 @@ def validate_visual_games_consistency(entry: dict[str, Any], perception: dict[st
                 "embodied.entry.visual_games requires "
                 "embodied.perception.enabled: true when any game is enabled "
                 f"({enabled_games})"
+            )
+        if enabled_games and entry_mode == "hermes":
+            errors.append(
+                "embodied.entry.visual_games requires a voice entry mode, which is not supported "
+                f"when any game is enabled ({enabled_games})"
             )
     return errors
 
@@ -1292,7 +1384,12 @@ def validate_embodied_launch_dict(config: dict[str, Any]) -> list[str]:
         return []
     entry = embodied.get("entry", {}) or {}
     perception = embodied.get("perception", {}) or {}
-    return validate_visual_games_consistency(entry, perception)
+    entry_mode = str(embodied.get("entry_mode", "hermes")).lower()
+    errors = []
+    if entry_mode != "hermes":
+        errors.append("embodied.entry_mode must be hermes")
+    errors.extend(validate_visual_games_consistency(entry, perception, entry_mode=entry_mode))
+    return errors
 
 
 def validate_config(config: RobotConfig) -> list[str]:
@@ -1409,9 +1506,37 @@ def validate_config(config: RobotConfig) -> list[str]:
     if config.voice_asr.enabled and not config.voice_asr.model_path and not config.voice_asr.auto_download_model:
         errors.append("voice_asr.model_path is required when voice_asr.enabled is true")
 
+    if config.voice_tts.enabled:
+        if not config.voice_tts.bundle_path:
+            errors.append("voice_tts.bundle_path is required when voice_tts.enabled is true")
+        if not config.voice_tts.deployment:
+            errors.append("voice_tts.deployment is required when voice_tts.enabled is true")
+        if not config.voice_tts.service_name.startswith("/"):
+            errors.append("voice_tts.service_name must be an absolute ROS service name")
+        if not config.voice_tts.load_service_name.startswith("/"):
+            errors.append("voice_tts.load_service_name must be an absolute ROS service name")
+        if not config.voice_tts.unload_service_name.startswith("/"):
+            errors.append("voice_tts.unload_service_name must be an absolute ROS service name")
+        if not config.voice_tts.prompt_profile:
+            errors.append("voice_tts.prompt_profile must be non-empty")
+        positive_limits = {
+            "segment_max_chars": config.voice_tts.segment_max_chars,
+            "max_request_chars": config.voice_tts.max_request_chars,
+            "max_prompt_audio_bytes": config.voice_tts.max_prompt_audio_bytes,
+            "max_prompt_duration_sec": config.voice_tts.max_prompt_duration_sec,
+            "max_segments": config.voice_tts.max_segments,
+            "max_response_audio_bytes": config.voice_tts.max_response_audio_bytes,
+        }
+        for name, value in positive_limits.items():
+            if value <= 0:
+                errors.append(f"voice_tts.{name} must be positive")
+        if config.voice_tts.segment_pause_ms < 0:
+            errors.append("voice_tts.segment_pause_ms must be non-negative")
+
     if config.embodied.enabled:
         valid_directions = {"forward", "backward", "left", "right", "up", "down"}
-        valid_planner_modes = {"rule", "vlm_api", "hybrid"}
+        if config.embodied.entry_mode != "hermes":
+            errors.append("embodied.entry_mode must be hermes")
         required_pose_names = {"home", "observe_table", "zero"}
         missing_pose_names = sorted(p for p in required_pose_names if p not in config.embodied.named_poses)
         if missing_pose_names:
@@ -1421,32 +1546,15 @@ def validate_config(config: RobotConfig) -> list[str]:
                 f"embodied.default_place_name references undefined pose: {config.embodied.default_place_name}"
             )
 
-        skill_templates = config.embodied.skill_templates or {}
-        try:
-            normalized_skill_templates = _normalize_skill_templates(skill_templates)
-        except ValueError as exc:
-            errors.append(f"embodied.skill_templates contains invalid trajectory template: {exc}")
-        else:
-            typed_robot_config = {
-                "embodied": {
-                    "skill_templates": normalized_skill_templates,
-                    "named_poses": config.embodied.named_poses,
-                    "planner": config.embodied.planner,
-                }
-            }
-            if normalized_skill_templates:
-                typed_robot_config["skill_required_control_mode"] = config.skill_gateway.required_control_mode
-                # Use the YAML-declared control_modes keys retained on SkillGatewayRuntimeConfig
-                # so _validate_skill_gateway_config can fully SSOT-check required_control_mode
-                # membership. Fall back to the supported-mode set only when the typed config
-                # was constructed without control_modes (e.g. unit-test fixtures).
-                if config.skill_gateway.control_modes:
-                    typed_robot_config["control_modes"] = {mode: {} for mode in config.skill_gateway.control_modes}
-                else:
-                    typed_robot_config["control_modes"] = {mode: {} for mode in _SUPPORTED_CONTROL_MODES}
-            errors.extend(_validate_embodied_skill_contract(typed_robot_config))
-            if normalized_skill_templates:
-                errors.extend(_validate_skill_gateway_config(typed_robot_config))
+        if config.embodied.skill_templates:
+            errors.append("embodied.skill_templates is removed; use embodied.skill_catalog_profile")
+        if not config.embodied.skill_catalog_profile:
+            errors.append("embodied.skill_catalog_profile is required when embodied is enabled")
+        required_control_mode = config.skill_gateway.required_control_mode
+        if not isinstance(required_control_mode, str) or not required_control_mode.strip():
+            errors.append("skill_required_control_mode is required when embodied.skill_catalog_profile is configured")
+        elif config.skill_gateway.control_modes and required_control_mode not in config.skill_gateway.control_modes:
+            errors.append("skill_required_control_mode must be a control_modes member")
 
         for axis in ("x", "y", "z"):
             axis_limits = config.embodied.workspace.get(axis)
@@ -1499,7 +1607,6 @@ def validate_config(config: RobotConfig) -> list[str]:
                         f"embodied.execution.relative_motion_direction_mapping.{direction} must not be a zero vector"
                     )
 
-        planner = config.embodied.planner or {}
         try:
             timeout_policy = resolve_embodied_timeout_policy(
                 {
@@ -1508,7 +1615,6 @@ def validate_config(config: RobotConfig) -> list[str]:
                         "primitive_timeout_sec": config.embodied.primitive_timeout_sec,
                         "primitive_wait_sec": config.embodied.primitive_wait_sec,
                     },
-                    "planner": planner,
                     "perception": config.embodied.perception or {},
                     "timeouts": config.embodied.timeouts or {},
                 }
@@ -1516,33 +1622,7 @@ def validate_config(config: RobotConfig) -> list[str]:
         except ValueError as exc:
             errors.append(str(exc))
             timeout_policy = {}
-        planner_mode = str(planner.get("mode", "rule")).lower()
         valid_vlm_api_providers = {"kimicode", "openai_compatible"}
-        if planner_mode not in valid_planner_modes:
-            errors.append("embodied.planner.mode must be one of: " + ", ".join(sorted(valid_planner_modes)))
-
-        if planner_mode in {"vlm_api", "hybrid"}:
-            _validate_vlm_runtime_config(
-                errors,
-                "embodied.planner",
-                planner,
-                timeout_policy,
-                valid_vlm_api_providers,
-                "planner.mode uses VLM",
-            )
-
-        planning_policy = planner.get("planning_policy", {})
-        allowed_skills = planning_policy.get("allowed_skills", [])
-        if planner_mode in {"vlm_api", "hybrid"}:
-            if not isinstance(allowed_skills, list) or not allowed_skills:
-                errors.append(
-                    "embodied.planner.planning_policy.allowed_skills must be a non-empty list "
-                    "when planner.mode uses VLM"
-                )
-            min_confidence = float(planning_policy.get("min_confidence", 0.7))
-            if min_confidence < 0.0 or min_confidence > 1.0:
-                errors.append("embodied.planner.planning_policy.min_confidence must be in [0.0, 1.0]")
-
         perception = config.embodied.perception or {}
         if perception.get("enabled", False):
             if not str(perception.get("request_topic", "")).strip():

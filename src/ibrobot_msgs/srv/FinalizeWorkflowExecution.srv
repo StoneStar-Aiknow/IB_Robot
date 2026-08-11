@@ -1,0 +1,32 @@
+# FinalizeWorkflowExecution.srv - Internal execution-scope service between the
+# embodied_agent task executor and the ExecutionCoordinator.
+#
+# See docs/lightweight_skill_package_registry_design_zh.md sections 10.5, 11.
+# Not an Agent/CLI/user-discoverable capability; deployment policy must
+# restrict callers.
+#
+# Idempotent: repeated identical (root_task_id, workflow_digest,
+# root_lease_nonce) requests return the existing terminal result; nonce or
+# digest conflicts are rejected and must not release another execution. The
+# request must satisfy task_id == root_task_id, carry the Begin-returned
+# root_lease_nonce and the same workflow_digest/identity/budget,
+# workflow_step_index=0 and an empty dispatch_nonce. The coordinator's ledger
+# completed index is authoritative; caller count is only used for conflict
+# detection. Different terminal state or count returns
+# SKILL_REQUEST_ID_CONFLICT; different digest or nonce returns the
+# corresponding workflow digest / lease error; any conflict must not release
+# the lease.
+
+uint8 SUCCEEDED=1
+uint8 FAILED=2
+uint8 CANCELED=3
+
+DispatchBinding dispatch_binding
+uint8 terminal_state
+uint32 completed_step_count
+---
+bool success
+uint8 actual_terminal_state
+uint32 actual_completed_step_count
+string error_code
+string message

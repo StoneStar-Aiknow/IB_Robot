@@ -1,0 +1,20 @@
+# ValidateAgentPlan.srv - Read-only exact-snapshot preflight for an Agent plan,
+# shown to the user before explicit confirmation.
+#
+# See docs/lightweight_skill_package_registry_design_zh.md section 11.6.
+#
+# Runs an exact-snapshot read-only preflight per step in order and returns the
+# full diagnostics. Does not create a root lease, does not reserve a step, does
+# not refresh the plan-token TTL. Any step failing makes the overall
+# allowed=false. A successful validation does not guarantee a later action
+# admission success. schema_version is 1 in v1.
+
+uint32 schema_version
+string plan_token
+---
+bool allowed
+string plan_id
+string plan_digest
+string error_code
+string message
+SkillDiagnostic[] diagnostics

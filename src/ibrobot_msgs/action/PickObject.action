@@ -1,14 +1,30 @@
+# PickObject.action - Grasp closed-loop action served by
+# manipulation_execution/pick_executor_node at /manipulation/execute_pick.
+#
+# See docs/lightweight_skill_package_registry_design_zh.md section 11.5.
+#
+# This is a delegated action: it must carry DispatchBinding and
+# DelegatedExecutorIdentity expected_executor in the goal and return
+# actual_executor in the result. The delegated server must compare its own
+# actual identity before accepting the request; on mismatch it returns a
+# stable contract-version error and must not rely on the endpoint name alone.
+# task_id is moved into dispatch_binding. Future delegated actions/services
+# follow the same shape.
+
+# --- Goal ---
 uint8 MODE_EXECUTE=0
 uint8 MODE_PLAN_ONLY=1
 uint8 MODE_OBSERVE_ONLY=2
 
-string task_id
+DispatchBinding dispatch_binding
 string target_query
 float32 timeout_sec
+DelegatedExecutorIdentity expected_executor
 uint8 mode
 bool release_after_success
 float32 release_drop_height_m
 ---
+# --- Result ---
 uint8 VERIFICATION_NOT_RUN=0
 uint8 VERIFICATION_SUCCESS=1
 uint8 VERIFICATION_FAILED=2
@@ -22,10 +38,12 @@ uint8 verification_status
 float32 verification_confidence
 string debug_output_dir
 string[] completed_phases
+DelegatedExecutorIdentity actual_executor
 int32 candidate_index
 bool released_after_success
 string pipeline_timings_json
 ---
+# --- Feedback ---
 string phase
 float32 progress
 uint32 attempt

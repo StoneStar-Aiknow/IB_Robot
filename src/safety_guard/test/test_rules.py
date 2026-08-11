@@ -1,10 +1,9 @@
 import os
-from types import SimpleNamespace
 
 import pytest
 import rclpy
-from rclpy.parameter import Parameter
 
+from ibrobot_msgs.srv import ValidateSkill
 from safety_guard.rules import validate_primitive_request, validate_skill_request
 from safety_guard.safety_guard_node import SafetyGuardNode
 
@@ -158,31 +157,16 @@ def test_validate_skill_rejects_default_skill_with_explicitly_empty_templates():
     assert "unsupported skill" in reason
 
 
-def test_safety_guard_node_distinguishes_omitted_and_explicitly_empty_skill_templates():
+def test_safety_guard_node_rejects_validation_without_exact_snapshot_identity():
     _assert_test_ros_environment()
-    shared_overrides = [Parameter("named_poses_json", value='{"observe_table": {}}')]
-    request = SimpleNamespace(
-        skill_name="inspect_scene",
-        target_name="",
-        place_name="",
-        motion_direction="",
-        motion_distance=0.0,
-    )
+    node = SafetyGuardNode()
+    try:
+        response = node._handle_validate_skill(ValidateSkill.Request(), ValidateSkill.Response())
+    finally:
+        node.destroy_node()
 
-    def validate_skill(parameter_overrides):
-        node = SafetyGuardNode(parameter_overrides=parameter_overrides)
-        try:
-            return node._handle_validate_skill(request, SimpleNamespace())
-        finally:
-            node.destroy_node()
-
-    default_response = validate_skill(shared_overrides)
-    explicit_empty_response = validate_skill([*shared_overrides, Parameter("skill_templates_json", value="{}")])
-
-    assert default_response.allowed is True
-    assert default_response.reason == ""
-    assert explicit_empty_response.allowed is False
-    assert "unsupported skill" in explicit_empty_response.reason
+    assert response.allowed is False
+    assert response.error_code == "SKILL_SCHEMA_INVALID"
 
 
 def test_validate_skill_rejects_disabled_skill():

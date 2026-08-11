@@ -1,0 +1,9 @@
+# ZipVoice Chinese frontend versions verified against the 310P delivery.
+cn2an==0.5.23
+proces==0.1.7
+jieba==0.42.1
+pypinyin==0.55.0
+
+# The ZipVoice Vocos checkpoint uses the project-pinned implementation in
+# voice_tts_service.vocos_backend.  Do not install PyPI vocos: its dependency
+# metadata can replace the workspace Torch/torchaudio ABI.

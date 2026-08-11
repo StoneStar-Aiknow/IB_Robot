@@ -18,7 +18,7 @@ GraspGen -> MoveIt -> 可选抓取验证。两个平台使用相同硬件（SO10
 - 抓取规划服务：`/grasp_planner/plan_grasp`
 - 抓取验证服务：`/grasp_verifier/verify_grasp`
 - 统一执行入口：`/manipulation/execute_pick`（`manipulation_execution/pick_executor_node`）
-- 监督式客户端：`ros2 run manipulation_execution pick_action_client`
+- 外部抓取入口：`robot-skill execute pick_object`（Capability Gateway）
 - Hermes 控制面：`ibrobot-control` Agent Skill -> `robot-skill` -> ROS Capability Gateway
 - Hermes 抓取技能：`pick_object`，不要写成 `pick-object`
 
@@ -32,18 +32,11 @@ GraspGen -> MoveIt -> 可选抓取验证。两个平台使用相同硬件（SO10
 | 感知 service | `GroundingDINORawDetectPlugin` + `SegmentDetectionsPlugin` 分开 | `GroundingDetectPlugin` 合并 |
 | segment_service | `/perception/grasp/segment_detections` | `""`（inline，不需要单独 service） |
 
-相机流、话题 remap/relay 和 `PointCloud2` 拓扑必须以所选 robot YAML 为准，不允许在启动命令或测试脚本中
-另建第二套配置。启动前必须检查对应 YAML 中的 `ros2_control.port`、相机序列号和手眼标定值。
+抓取配置只发布 RGB、对齐深度和 CameraInfo。GraspGen 会从对齐深度直接构造目标点云，因此不再启动
+未被抓取链消费的 ROS `PointCloud2` 发布/转发；大尺寸 RGB-D 消息由 RealSense 节点直接 remap 到稳定话题，
+避免多次冷启动后 Python relay 与 Fast DDS UDP 队列叠加。
 
-> **已验证配置注意事项：** 310P 的 RealSense 分辨率/帧率、`align_depth`、`enable_pointcloud`、`streams`、
-> 稳定话题以及 `named_poses.observe_table` 都属于 robot YAML SSOT，不能因单帧或单轮失败轻易修改。wrist
-> 手眼变换必须由用户针对实际机械臂、相机和安装支架自行标定；相机或支架重新安装后必须重新标定。有效
-> 标定结果写入 YAML 后，不得再根据单帧抓取偏差手工试调。现场复测在正确 `observe_table` 下得到约
-> `95.7%` 的 marker 有效深度、约 `99.4%` 的桌面
-> 内点率和约 `16.19 mm` 的 marker 高度，已恢复到成功样本水平；但整帧有效深度仍只有约 `75.64%`，
-> 下半幅深度缺失和 RealSense UVC 超时仍然存在。因此排障时必须先确认机械臂已到同一观测位并保存完整
-> 深度诊断，不得把姿态不同或单次坏帧直接归因于相机配置，也不得据此随意切换 PointCloud、relay/remap、
-> 对齐、分辨率、帧率、话题或手眼参数。确需修改时，应先保留原配置，经现场确认后再构建、重启和复测。
+启动前必须检查对应 YAML 中的 `ros2_control.port`、相机序列号和手眼标定值。
 
 常用命令都从仓库根目录执行：
 
@@ -60,12 +53,11 @@ cd ~/IB_Robot
 ./scripts/download_perception_models.sh
 ```
 
-使用平台感知脚本做干净构建。openEuler 默认构建 310P 抓取与 Hermes 调用链，包括
-`perception_service`、`manipulation_service` 和 `embodied_bringup`；SO101 板端默认跳过不相关且需要
-在线拉取 FTServo SDK 的 LeKiwi 包，以及板端不可用的仿真包：
+构建完整抓取与 Hermes 调用链：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && ./scripts/build.sh --clean
+cd ~/IB_Robot && source .shrc_local && colcon build --symlink-install --merge-install --packages-up-to \
+  embodied_bringup robot_skill_cli perception_service manipulation_execution
 ```
 
 在 `src/robot_config/config/robots/``so101_handeye_realsense_grasp.yaml` 或
@@ -243,14 +235,16 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ON
 
 ## 4. 只移动到观测姿态
 
+公开 Gateway 已提供 `inspect_scene`，可用它移动到同一 SSOT 定义的观测位姿：
+
 ```bash
 cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
-  ros2 run manipulation_execution pick_action_client \
-  --prompt banana \
-  --mode observe_only
+  robot-skill --config-name so101_handeye_realsense_grasp execute inspect_scene \
+  --task-id inspect-scene-001 --timeout-sec 30
 ```
 
-观测位姿和速度来自正在运行的 robot config（310P 或 PC），不允许由测试客户端覆盖。
+PC 端把配置名改为 `so101_handeye_realsense_grasp_pc`。观测位姿和速度来自正在运行的 robot config，
+不允许由测试客户端覆盖。
 
 ## 5. 冒烟测试
 
@@ -270,79 +264,43 @@ cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ON
 
 ## 6. 仅规划，不抓取
 
-会移动到观测姿态、检测、规划、做 IK/执行侧筛选，抓取前退出。
-
-```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
-  ros2 run manipulation_execution pick_action_client \
-  --prompt banana \
-  --mode plan_only \
-  --timeout-s 240
-```
-
-通过标志：
-
-```text
-PICK_FEEDBACK phase=planning ...
-PICK_FEEDBACK phase=selecting ...
-PICK_ACTION_RESULT success=True ... candidate=<index> ...
-FLOW_RESULT success=True
-```
-
-默认 `planner.debug_output_mode: none`，因此 plan-only 以终端日志、`PICK_ACTION_RESULT` 和其
-`pipeline_timings_json` 为准。如果启动前已把 debug 模式改为 `diagnostic` 或 `full`，再检查
-`PICK_ACTION_RESULT.debug_output_dir` 指向的目录：
-
-- `grasp_result.json`
-- `pick_frame_diagnostics.json`
-- `prepared_candidate_ranking.json`
-
-plan-only result 的 `candidate_index` 只表示正式 pipeline 已完成候选准备，不能把它误认为已经执行过真实抓取。
-
-如果出现 `NO_SAFE_GRASP_CANDIDATES`、`TARGET_TABLETOP_UNAVAILABLE`、
-`TARGET_GEOMETRY_FAILED`，或候选明显在桌面下，不要继续完整抓取。
-
-正式配置中的 `target_geometry.tabletop_filter` 优先使用 PlanGrasp 响应中的 execution table plane，不需要为了正常抓取
-生成完整 PLY 和 HTML/SVG/PNG 预览。如果响应中没有可用平面，候选会 fail closed 并以
-`TARGET_TABLETOP_UNAVAILABLE` 拒绝，不会静默放行。只有排查点云或夹爪几何时，才临时把
-`robot.grasp_execution.planner.debug_output_mode` 改为 `full`，并重启正式 executor。
-
-同时检查终端日志中的：
-
-- `PlanGrasp('banana'): <n> grasps, ...`：候选生成成功且数量非零。
-- `PIPELINE_TIMING stage=candidate_geometry_ranking`：源排序与 SO101 廉价几何门禁已完成。
-- `prepared candidate rank: ...`：`execution_scoring.centroid_source: volume` 已参与候选排序。
+`PickObject.MODE_PLAN_ONLY` 是 Gateway 内部 delegated action 的诊断模式，当前 v1 catalog 没有把它作为
+外部参数公开。调用方不得自行伪造 `dispatch_binding`、`dispatch_nonce` 或 `expected_executor` 来直连该
+action。需要无运动排障时，先保持 `authorize_motion:=false`，使用第 5 节的感知/规划服务；如需把完整候选
+筛选作为公开能力，必须先给 catalog、`SkillCommand` 和 Gateway 增加版本化参数契约。
 
 ## 7. 完整抓取
 
-只在第 6 步正常后执行。
+只在第 5–6 步正常、现场安全检查完成且 pipeline 已由操作员显式授权后执行。先做只读校验：
 
 ```bash
 cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
-  ros2 run manipulation_execution pick_action_client \
-  --prompt banana \
-  --mode execute \
-  --timeout-s 240
+  robot-skill --config-name so101_handeye_realsense_grasp validate pick_object \
+  --target-name banana --timeout-sec 240
+```
+
+校验成功后，用全新 task ID 通过 Gateway 执行：
+
+```bash
+cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
+  robot-skill --config-name so101_handeye_realsense_grasp execute pick_object \
+  --task-id pick-banana-001 --target-name banana --timeout-sec 240
 ```
 
 候选阈值、IK worker 数、接触补偿、恢复、速度和验证策略全部来自启动正式 executor 时使用的
-`robot.grasp_execution`，客户端不再维护第二套参数。
+`robot.grasp_execution`，Gateway 客户端不维护第二套参数。PC 端把配置名改为
+`so101_handeye_realsense_grasp_pc`。
 
-固定指 robust-gap 的 IK/FK 预测余量用于候选软排序。启用
-`target_gripper.fixed_finger_robust_gap.enabled` 时，候选下降完成后、闭爪前还会用低位实测残差执行
-hard gate；测量不可用或门禁失败会撤回 pregrasp 并切换候选，只有通过后才闭爪。当前 SO101 profile
-将该开关设为 `false`，因此现场若不改配置，下降后会直接闭爪。
+固定指 robust-gap 只在批量候选准备阶段作为 hard gate。候选已经到达 pregrasp 并完成在线接触补偿后，
+复算结果仅记录诊断，不会再在下降闭爪前撤回或切换候选。
 
-通过标志：
+通过标志包括 Gateway JSONL feedback 和唯一 terminal result，以及 executor 日志中的内部阶段：
 
 ```text
-PICK_FEEDBACK phase=planning ...
-PICK_FEEDBACK phase=selecting ...
-PICK_FEEDBACK phase=close ...
-PICK_FEEDBACK phase=verify_probe ...
-PICK_FEEDBACK phase=verify_lift ...
-PICK_ACTION_RESULT success=True ... candidate=<index> ...
-FLOW_RESULT success=True
+{"event":"feedback", ...}
+{"event":"result","data":{"success":true,...},...}
+PIPELINE_TIMING stage=graspgen_request ...
+grasp verification phase=verify_lift ...
 ```
 
 如果 planner debug 模式为 `diagnostic` 或 `full`，执行后重点看同目录的：
@@ -362,24 +320,23 @@ FLOW_RESULT success=True
 - `PIPELINE_TIMING stage=candidate_geometry_ranking`：源排序、SO101 adapter、workspace/height/tabletop
   等廉价几何门禁的合并耗时。
 - `PIPELINE_TIMING stage=candidate_ik_fk`：候选 IK/FK 准备耗时；同行的 `workers` 和 `candidates`
-  表示固定 round-robin 分区使用的 worker 数和候选数。
-- `IK worker verification passed`：主 MoveIt 与全部 worker 在当前 `/joint_states` 的 FK 可达位姿上
-  使用共同 seed 得到一致结果。
+  表示动态工作队列规模。
+- `IK worker verification passed`：主 MoveIt 与全部 worker 在共同 seed/验证位姿上结果一致；
+  `cached=true` 表示命中进程内缓存。
 - `pick candidate preparation failed ... code=...`：候选在 IK/FK、接触补偿、joint5、固定指侧或
   最终网格门禁失败。
 - `prepared candidate rank: ...`：按固定爪包络、体积质心距离、IK/FK 接触误差、
   robust-gap headroom 和 confidence 的综合软分排列执行顺序。
 - `contact realign phase=approach|pregrasp`：安全高度的接触点对齐 residual。
 - `grasp prediction candidate=...`：最终下降使用的 IK/FK 预测位姿、闭合轴误差和接触 residual。
-- `PICK_FEEDBACK phase=descend` 后会先记录 `pose diagnostic label=grasp`。启用 robust-gap 时，日志中的
-  `continue_fixed_finger_robust_gap_passed` 表示可继续闭爪；`retreat_fixed_finger_robust_gap_rejected` 表示
-  已撤回并切换候选。禁用 robust-gap 时才会从下降直接进入 `phase=close`。
+- executor 的 `phase=descend` 后必须直接出现 `phase=close`；`close_gripper` 是下降成功后的第一条动作。
+- `pose diagnostic label=grasp ... action=...`：闭爪后以 best-effort 记录低位 residual；`log_only_*` 不触发
+  横向 realign、候选切换，也不能中断闭爪或抓后验证。
 - `grasp verification phase=verify_close|verify_probe|verify_lift`：三阶段抓后验证证据。
 - `pick candidate failed ... code=...`：当前物理执行候选失败；`retryable=true` 时才可切换到下一个
   已准备候选。
-- `released target after success`：成功验证后的低位释放已完成。
-- `PICK_ACTION_RESULT ... pipeline_timings_json=...`：客户端收到的最终结果、候选、尝试数、
-  验证状态和分阶段计时。
+- `post-success release completed`：成功验证后的低位释放已完成。
+- `pipeline_timings_json`：delegated executor 返回给 Gateway 的候选、尝试数、验证状态和分阶段计时。
 
 `prepared_candidate_ranking.json` 是上述软排序的结构化明细，仅在 planner debug 模式为
 `diagnostic` 或 `full` 时写出。
@@ -432,33 +389,17 @@ debug 模式为 `diagnostic` 或 `full` 时，正式 executor 会同时把完整
 所有会改变候选、安全门禁、IK/FK、速度、恢复或验证结果的参数都必须修改
 `src/robot_config/config/robots/` 下对应平台的 YAML（`so101_handeye_realsense_grasp.yaml` 或
 `so101_handeye_realsense_grasp_pc.yaml`）的 `robot.grasp_execution`，然后重启
-正式 executor。监督式 action 客户端只允许选择目标、运行模式、预算和是否在成功后释放，禁止再用 CLI
+正式 executor。外部调用方只允许通过 Gateway catalog 选择目标和预算，禁止直连 delegated action 或用 CLI
 构造第二套运行配置。
 
-目标位置出现固定偏差时，不再通过监督式 CLI 注入单次 base-frame offset。先用 `plan_only` 和
-`pick_pose_diagnostics.json` 判断偏差来自手眼标定、目标夹爪接触几何还是 IK/FK residual，再修改对应的
-robot YAML SSOT，并重启 executor。不要根据单个目标的一次结果写入全局修正。
+目标位置出现固定偏差时，不再通过监督式 CLI 注入单次 base-frame offset。保持未授权状态，通过第 5 节
+规划服务和 debug 输出判断偏差来自手眼标定、目标夹爪接触几何还是 IK/FK residual，再修改对应的 robot
+YAML SSOT 并重启 executor。不要根据单个目标的一次结果写入全局修正。
 
-需要在成功后低位释放目标时，每条命令只执行一次抓取：
-
-```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
-ros2 run manipulation_execution pick_action_client \
-  --prompt marker \
-  --mode execute \
-  --release-after-success \
-  --release-drop-height-m 0.015
-```
-
-正式 executor 会先完成 close、probe lift 和 final lift 三阶段验证，再下降到抓取位姿上方 `15 mm` 打开夹爪。
-低位释放可以减少目标从 `5 cm` 高度直接掉落后的弹跳。close 验证失败会保持闭合并撤回到安全高度后
-打开；probe/final retention 验证失败会在当前抬升位打开，再返回观察位。
-
-`pick_action_client` 不提供批量 repeat 功能，也不要用 shell 循环自动连续下发真实运动。需要多次验证时，
-必须等待上一条命令完成并检查目标、机械臂和工作空间后，再人工执行下一次命令。若日志出现
-`PICK_ACTION_GOAL_RESPONSE_RECOVERY`，表示本次 goal 已按原 UUID 查询结果，客户端不会重发动作。
-单次端到端耗时由 `PICK_ACTION_TIMING wall_time_s=...` 输出，各阶段耗时仍在同一行的
-`pipeline_timings_json` 中。
+当前 v1 `pick_object` catalog 不公开连续重复、plan-only 或成功后低位释放。每次真机执行必须重新确认现场
+安全并使用全新 task ID；失败、timeout 或停止状态未知时不得自动重试。若确需 post-success release，应先
+扩展 catalog/`SkillCommand` 的版本化参数和 Gateway 转换，再由 Gateway 构造 delegated goal；不能直接填充
+`PickObject.release_after_success` 绕过准入链。
 
 最终抓取 X/Y 方向受 5-DOF 姿态误差影响时，优先在 robot YAML 中使用动态 IK/FK 接触点补偿，
 不要在监督式客户端中维护一次性 X/Y 偏移：
@@ -483,7 +424,7 @@ IK 解的 FK 姿态重新检查 SO101 网格桌面间隙。
 candidate_selection:
   min_contact_z: -0.045
 target_geometry:
-  tabletop_clearance_m: -0.025
+  tabletop_clearance_m: -0.020
 ```
 
 GraspGen 候选：
@@ -502,8 +443,7 @@ candidate_selection:
 拒绝而丢掉后续可执行候选；`<=0` 时会检查全部通过廉价门限的候选。
 
 `robot.grasp_execution.ik.worker_count: 4` 只并行候选准备。正式 executor 先从 `/joint_states` 固定一份共同
-IK seed，按候选排名将任务固定 round-robin 分配给 4 个独立 MoveIt worker，最后按原候选顺序汇总。
-最终抓取前的接触补偿、
+IK seed，4 个独立 MoveIt worker 从共享动态队列领取候选，最后按原候选顺序汇总。最终抓取前的接触补偿、
 `move_to_configuration` 和所有运动仍走主 MoveIt 串行链路。设为 `0` 时退回主 `/compute_ik`、
 `/compute_fk` 服务串行准备。
 

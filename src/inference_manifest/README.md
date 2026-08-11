@@ -50,6 +50,7 @@ revision 和轻量结构摘要，并允许 compiled artifact 声明内容 SHA-25
 ```
 
 实际 compiled deployment 必须提供完整 `bindings`；示例省略了 tensor 内容。
+张量 `shape` 使用 ONNX/ACL 语义：空数组 `[]` 表示 rank-0 scalar，`-1` 表示动态维度。
 
 ## Identity
 

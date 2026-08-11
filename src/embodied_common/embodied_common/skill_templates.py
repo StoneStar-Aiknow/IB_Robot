@@ -5,23 +5,11 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+from embodied_common.primitive_contracts import SUPPORTED_PRIMITIVES as SUPPORTED_PRIMITIVES
 from embodied_common.trajectory_templates import expand_trajectory_template
 
 # Must stay consistent with skill_library.resolver move_through_joint_positions default.
 DEFAULT_WAYPOINT_DURATION_SEC = 0.08
-
-SUPPORTED_PRIMITIVES = {
-    "move_to_named_pose",
-    "move_to_pose",
-    "move_to_configuration",
-    "move_relative_ee",
-    "move_to_joint_positions",
-    "move_through_joint_positions",
-    "open_gripper",
-    "close_gripper",
-    "rotate_gripper_cw",
-    "rotate_gripper_ccw",
-}
 
 DEFAULT_SKILL_TEMPLATES: dict[str, dict[str, Any]] = {
     "inspect_scene": {

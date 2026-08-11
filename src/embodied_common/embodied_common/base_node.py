@@ -23,6 +23,7 @@ class BaseTaskNode(Node):
         replan_requested: bool = False,
     ) -> None:
         status = TaskStatus()
+        status.schema_version = 1
         status.task_id = task_id
         status.state = state
         status.success = success

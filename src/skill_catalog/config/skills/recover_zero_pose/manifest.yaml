@@ -1,0 +1,52 @@
+schema_version: 1
+name: recover_zero_pose
+version: 1.0.0
+semantic_level: atomic_operator
+description:
+  summary: Return the arm to the calibration 'zero' pose (all joints at 0).
+  category: recovery
+  when_to_use:
+  - go to the zero/calibration pose
+  - fully retract to factory zero
+  do_not_use:
+  - condition: just return to a comfortable rest pose
+    instead_use: recover_safe_pose
+  aliases_zh:
+  - 零点
+  - 零位
+  - 回零点
+  - 到零点
+  aliases_en:
+  - zero
+  - calibration pose
+  motion_scope:
+  - arm
+  anchor_pose: zero
+  intensity: moderate
+  duration_sec_estimate: 3.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Return the arm to its calibration pose.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  so101_handeye_realsense_grasp: implementations/so101_handeye_realsense_grasp.yaml
+  so101_arm_v1: implementations/so101_arm_v1.yaml
+description_variants:
+  so101_handeye_realsense_grasp:
+    summary: Return the arm to the calibration zero pose.
+    category: recovery
+    when_to_use:
+    - return to the calibration pose
+    - fully retract the arm
+    motion_scope:
+    - arm
+    intensity: moderate

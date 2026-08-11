@@ -39,7 +39,7 @@ def _normalized_config():
                 "tray": {"position": {"x": 0.4, "y": 0.5, "z": 0.6}},
             },
             "named_targets": {"cup": {"grasp_pose": "home"}, "block": {"grasp_pose": "tray"}},
-            "timeouts": {"task_budget_sec": 45.0, "rpc_timeout_sec": 5.0},
+            "timeouts": {"task_budget_sec": 45.0, "default_skill_timeout_sec": 30.0, "rpc_timeout_sec": 5.0},
             "skill_templates": {
                 "place": {
                     "description": _description("Place an item at a configured location."),

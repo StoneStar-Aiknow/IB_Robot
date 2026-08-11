@@ -1,3 +1,4 @@
+DispatchBinding dispatch_binding
 string primitive_name
 string pose_name
 float32 relative_dx
@@ -21,3 +22,8 @@ float32 waypoint_duration_sec
 ---
 bool allowed
 string reason
+string error_code
+string actual_registry_epoch
+uint64 actual_registry_generation
+string actual_registry_digest
+SkillDiagnostic[] diagnostics

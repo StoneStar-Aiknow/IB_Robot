@@ -545,6 +545,8 @@ def test_launch_setup_uses_mock_sim_backend_without_controllers(tmp_path):
     src_config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_single_arm.yaml"
     robot_config = load_robot_config_dict(src_config_path)
     robot_config.pop("_config_path", None)
+    bundle = _create_inference_bundle(tmp_path / "model")
+    robot_config["control_modes"]["model_inference"]["inference"]["pipelines"]["policy"]["model_path"] = str(bundle)
 
     config_path = tmp_path / "so101_mock.yaml"
     config_path.write_text(yaml.safe_dump({"robot": robot_config}, sort_keys=False), encoding="utf-8")

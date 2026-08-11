@@ -697,6 +697,26 @@ ros2 launch robot_config robot.launch.py \
 `voice_asr_service` 的包级默认值与 `robot_config` 中的 `VoiceASRConfig` 默认值保持同步；
 具体机器人仍应以 `config/robots/<robot>.yaml` 中的 `robot.voice_asr` 为准。
 
+### Voice TTS（语音合成）
+
+`robot_config` 通过 `robot.voice_tts` 启停 `voice_tts_service`。启用时必须显式提供 ZipVoice
+`bundle_path` 和 manifest 中的 named `deployment`；不接受独立的 `backend` 或 `device` 选择，
+也不会在加载失败后切换后端。完整系统从 `robot.launch.py` 启动，包级 launch 仅用于调试。
+
+TTS 对外提供 `/voice_tts/synthesize` typed service。请求和响应携带音频字节而不是服务端文件路径，
+并通过文本、prompt、分段数和响应字节上限约束单个 DDS response。真实模型未就绪时服务返回
+`MODEL_NOT_READY`；部署身份和 readiness 由响应中的 `ModelRuntimeInfo` 报告。
+launch builder 只解析配置和创建节点，不提前打开模型 bundle。节点启动时校验 bundle，因而
+`exit_on_init_failure=false` 能在模型存储暂不可用时保留服务并返回 `MODEL_NOT_READY`。默认不把模型载入
+内存，首次有效调用 `/voice_tts/synthesize` 时自动加载并常驻；
+`/voice_tts/load` 可提前预热，`/voice_tts/unload` 会等待当前合成结束后释放模型资源，节点和服务仍保持运行，
+下次合成再自动加载。将 `load_on_startup` 设为 `true` 可恢复节点启动时立即加载的行为。
+相对 `bundle_path` 以 `.shrc_local` 设置的绝对 `WORKSPACE` 为根目录解析，例如默认值对应
+`$WORKSPACE/models/voice_tts/zipvoice`。
+当前经 310P1 真机核查的 `ascend_310p` deployment 支持固定 bundle prompt、中文/数字/常用标点和 24 kHz
+WAV；它尚不支持请求级 prompt，调用时返回 `UNSUPPORTED_PROMPT`。该限制属于 deployment capability，
+不是 `robot_config` 的隐式后端选择。
+
 ### 真机手眼配置
 
 SO101 抓取使用同级独立配置 `config/robots/so101_handeye_realsense_grasp.yaml`。用户应直接在
@@ -792,49 +812,13 @@ robot:
       home:           {position: {x: 0.15, y: 0.0, z: 0.30}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
       observe_table:  {position: {x: 0.20, y: 0.0, z: 0.35}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
 
-    skill_templates:
-      wave_hello:
-        description:
-          summary: "Wave hello or goodbye with the wrist."   # ≤120 字符
-          category: social_greeting                            # 任意非空字符串
-          when_to_use: ["greet someone", "say hi or bye"]    # 非空字符串列表
-          aliases_zh: ["打招呼", "挥手"]                      # description / 规则解析器元数据，不属于公开 catalog
-          aliases_en: ["hello", "wave"]
-          motion_scope: [wrist]                                # base|shoulder|elbow|wrist|gripper|arm
-          anchor_pose: home                                    # 必须在 named_poses 中已定义，或 "none"
-          intensity: moderate                                  # subtle|moderate|large
-          duration_sec_estimate: 8.0                           # 含 1.0 秒初始夹爪归一化并留有余量
-          requires_motion_params: false                        # 布尔
-          rule_entry: true                                     # 是否把 aliases_zh 注入规则解析器
-        capability:
-          schema_version: 1
-          summary: "Wave hello or goodbye with the wrist."
-          domain: social_greeting
-          moves_robot: true
-          required_control_mode: moveit_planning
-          parameters:
-            type: object
-            additionalProperties: false
-            properties: {}
-            required: []
-          recovery_policy: never_retry
-        initial_gripper_state: closed
-        primitive_sequence:
-          - primitive_name: move_to_joint_positions
-            joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
-            duration_sec: 2.0
-          - primitive_name: move_through_joint_positions
-            trajectory_template:
-              type: single_joint_wave_v1
-              waypoint_duration_sec: 0.05
-              active_waypoint_count: 16
-              repeat_count: 3
-              base_pose: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
-              joint: "5"
-              amplitude: 0.35
-          - primitive_name: move_to_joint_positions
-            joint_positions: {"1": 0.02, "2": 0.54, "3": -0.82, "4": -0.18, "5": 0.02}
-            duration_sec: 2.0
+    # Skill manifests / implementation bodies / capability schemas / primitive
+    # sequences are owned by `skill_catalog` (config/skills/<name>/manifest.yaml
+    # + implementations/<implementation>.yaml). Robot YAML only selects the
+    # source, profile, and runtime Gateway wiring:
+    skill_catalog_source_mode: development          # installed | development | production
+    skill_catalog_source_root: src/skill_catalog   # required in development/production
+    skill_catalog_profile: so101_single_arm         # required when embodied.enabled is true
 
     named_targets:
       demo_object:
@@ -844,57 +828,32 @@ robot:
         lift_pose:     {position: {x: 0.25, y: 0.0, z: 0.25}, orientation: {x: 0.0, y: 1.0, z: 0.0, w: 0.0}}
 ```
 
-#### Capability Gateway 公开契约
+#### Capability Gateway 接线契约
 
-`robot.embodied.skill_templates.<skill>.capability` 是 Capability Gateway 的公开 SSOT；它不是从
-`description` 或 primitive sequence 派生。所有未禁用的模板都必须声明 `schema_version: 1` 以及
-`summary`、`domain`、`moves_robot`、`required_control_mode`、`parameters` 和 `recovery_policy`。
+`robot_config` 不再承载技能执行 SSOT。`robot.embodied.skill_templates` 已移除；`load_robot_config_dict()`
+检测到该键时直接报错，要求改用 `embodied.skill_catalog_profile`。技能的 `manifest`、
+`capability` schema、`description` 与 `primitive_sequence` 全部由 `skill_catalog`
+（`config/skills/<name>/manifest.yaml` + `implementations/<implementation>.yaml`）持有并校验，
+公开 catalog 字段、命名位姿名称、timeout policy 和 digest 由 `skill_catalog` 编译器输出。
 
-| 字段 | 校验规则 |
-| --- | --- |
-| `summary` / `domain` | 非空字符串 |
-| `moves_robot` | 布尔值 |
-| `required_control_mode` | `teleop`、`model_inference` 或 `moveit_planning`，且必须等于机器人级 `skill_required_control_mode` |
-| `parameters` | 严格 object schema：`type: object`、`additionalProperties: false`；只允许 `target_name`、`place_name`、`motion_direction`、`motion_distance` 属性，`required` 必须唯一且引用已声明属性 |
-| `recovery_policy` | `never_retry`、`ask_user` 或 `recover_safe_pose` |
+`load_robot_config_dict()` 是 launch、CLI 和 catalog 共用的规范化加载入口；它在返回配置前仅执行
+Gateway 接线一致性校验，不重复 manifest/capability 校验。配置 `embodied.skill_catalog_profile`
+时 `skill_required_control_mode` 必须是 `control_modes` 的非空成员；`embodied.enabled: true`
+时 `embodied.skill_catalog_profile` 必须非空。`skill_catalog_source_mode` 只接受
+`installed`、`development`、`production`；后两者要求 `skill_catalog_source_root` 指向有效目录。
 
-字符串参数只能使用 `type` 与非空 `enum`；`motion_direction` 的 enum 只能包含六个方向
-`forward`、`backward`、`left`、`right`、`up`、`down`。`motion_distance` 必须是 `type: number`、
-`exclusiveMinimum: 0`，并以 `meters` 或 `degrees` 标明 `unit`。其他 schema key 或请求属性会在加载时被拒绝。
-
-`load_robot_config_dict()` 是 launch、CLI 和 catalog 共用的规范化加载入口；它会在返回配置前执行上述
-capability、模板和 Gateway 一致性校验。若 `embodied.skill_templates` 非空，
-`skill_required_control_mode` 必须是 `control_modes` 的非空成员；每个启用能力的
-`required_control_mode` 必须与它完全相等。
+`robot_config.loader.robot_config_digest` 是传入 `skill_catalog` 编译器的 canonical execution-context
+digest；它刻意排除 `skill_catalog_source_mode` / `skill_catalog_source_root` / `skill_catalog_profile`、
+解析后的 config 路径以及无关机器人配置，仅覆盖命名位姿/目标、关节限位、工作空间、控制模式、timeout policy、
+相对运动语义和 execution endpoints。仅切换 source/profile/path 不改变执行身份；切换上述执行语义字段才会
+触发新的 registry generation。
 
 共享配置解析的选择顺序为：显式 `config_path`、显式 `config_name`、`ROBOT_CONFIG`、`ROBOT_NAME`、
 默认 `so101_single_arm`。按名称查找时先查已安装 `robot_config` 的 `config/robots/`，再查源码树的
-`config/robots/`；显式路径必须存在。公开 catalog 仅输出 capability 字段、命名位姿名称、timeout policy
-和 digest。primitive sequence、关节/笛卡尔坐标、目标绑定、ROS service/action/topic 名称仍是私有实现数据。
+`config/robots/`；显式路径必须存在。primitive sequence、关节/笛卡尔坐标和目标绑定仍是 `skill_catalog`
+私有实现数据；运行时 ROS service/action endpoint 则由 `robot_config` 配置并进入 canonical execution context。
 
-#### skill_templates 与 description 契约
-
-`embodied.skill_templates` 是技能执行的单一事实来源。每个 skill 模板可挂一个
-结构化 `description` 块，用于人类可读的发现信息与中文别名；公开 catalog 的字段以相邻的
-`capability` 块为准，且不包含 `description` 或其中的 aliases。
-`aliases_zh` 是 description 与规则解析器元数据，不会出现在 `robot-skill` 或其他公开 capability catalog 中。
-仅当 `rule_entry: true` 且 `requires_motion_params: false` 时，launch 才会把这些别名注入规则解析器。
-`robot_config.loader._validate_skill_description` 在加载时强校验字段类型与受控词表。
-
-受控词表：
-- `motion_scope`：`base` / `shoulder` / `elbow` / `wrist` / `gripper` / `arm`
-- `intensity`：`subtle` / `moderate` / `large`
-- `anchor_pose`：必须引用 `named_poses` 中已定义的位姿，或填 `"none"`
-- `rule_entry`：可选布尔值；设为 `true` 时允许无动态运动参数的技能进入确定性规则入口
-- `disabled`：可选布尔值；设为 `true` 时从 planner allowlist、规则入口、resolver、safety guard
-  和 `robot-skill` catalog/validate/execute 的启用技能集合中统一排除
-- `duration_sec_estimate`：必须为正数，并覆盖确定性手臂 motion/wait 总时长、`open`/`closed`
-  初始夹爪归一化的 1.0 秒，以及每个显式 `open_gripper`/`close_gripper` primitive 的 1.0 秒，且保留执行余量
-
-绝对关节轨迹必须在 `move_through_joint_positions` 前显式使用
-`move_to_joint_positions` 进入首个 waypoint，并在需要时用另一条带正数
-`duration_sec` 的 `move_to_joint_positions` 显式返回手势基位。trajectory generator
-不会消费 `return_to_base` 一类隐式返回字段。
+#### entry.visual_games 一致性
 
 `embodied.entry.visual_games` 声明入口层视觉趣味游戏（如分院帽）的触发别名与开关；
 camera/VLM/timeout 仍由 `embodied.perception` 统一管理。`validate_config()` 强制一致性：
@@ -902,7 +861,6 @@ camera/VLM/timeout 仍由 `embodied.perception` 统一管理。`validate_config(
 
 更多具身节点说明，详见各子包 README：
 - [`embodied_agent`](../embodied_agent/README.md)
-- [`vlm_task_planner`](../vlm_task_planner/README.md)
 - [`perception_service`](../perception_service/README.md)
 - [`skill_library`](../skill_library/README.md)
 - [`safety_guard`](../safety_guard/README.md)

@@ -352,7 +352,10 @@ def reset_gazebo_env(gazebo_env):
         f'name: "lekiwi", position: {{x: {SPAWN_X}, y: {SPAWN_Y}, z: 0.01}}, orientation: {{w: 1.0}}',
     ]
     for gz_cmd in [["gz", "service"] + teleport_args, ["ign", "service"] + teleport_args]:
-        result = subprocess.run(gz_cmd, capture_output=True, timeout=5)
+        try:
+            result = subprocess.run(gz_cmd, capture_output=True, timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
         if result.returncode == 0:
             break
     time.sleep(2.0)

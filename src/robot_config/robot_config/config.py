@@ -124,7 +124,7 @@ class SkillGatewayRuntimeConfig:
     # SSOT-check required_control_mode membership instead of rebuilding the set
     # from the module-level _SUPPORTED_CONTROL_MODES constant.
     control_modes: tuple[str, ...] = ()
-    default_skill_timeout_sec: float = 30.0
+    default_skill_timeout_sec: float = 120.0
     robot_state_freshness_sec: float = 0.5
     task_budget_sec: float = 180.0
     rpc_timeout_sec: float = 5.0
@@ -135,6 +135,7 @@ class EmbodiedConfig:
     """Minimum embodied claw closure configuration."""
 
     enabled: bool = False
+    entry_mode: str = "hermes"
     debug_tracing: bool = True
     task_input_topic: str = "/voice_command"
     task_command_topic: str = "/embodied/task_command"
@@ -145,16 +146,18 @@ class EmbodiedConfig:
     validate_skill_service: str = "/embodied/validate_skill"
     validate_primitive_service: str = "/embodied/validate_primitive"
     skill_gateway_status_service: str = "/embodied/get_skill_gateway_status"
+    skill_catalog_source_mode: str = "installed"
+    skill_catalog_source_root: str = ""
+    skill_catalog_profile: str = ""
     default_target_name: str = "demo_object"
     default_place_name: str = "tray_right"
-    skill_timeout_sec: float = 30.0
+    skill_timeout_sec: float = 120.0
     primitive_timeout_sec: float = 5.0
     primitive_wait_sec: float = 1.0
     timeouts: dict[str, Any] = field(default_factory=dict)
     relative_motion_step_m: float = 0.03
     relative_motion_reference_frame: str = "base"
     relative_motion_direction_mapping: dict[str, Any] = field(default_factory=dict)
-    planner: dict[str, Any] = field(default_factory=dict)
     perception: dict[str, Any] = field(default_factory=dict)
     entry: dict[str, Any] = field(default_factory=dict)
     gripper_open_position: float = 1.0
@@ -187,6 +190,29 @@ class VoiceASRConfig:
     buffer_seconds: float = 5.0
     device_index: int = -1
     device_name: str = ""
+    exit_on_init_failure: bool = True
+
+
+@dataclass
+class VoiceTTSConfig:
+    """Typed Voice TTS service configuration managed by robot_config."""
+
+    enabled: bool = False
+    bundle_path: str = "models/voice_tts/zipvoice"
+    deployment: str = ""
+    service_name: str = "/voice_tts/synthesize"
+    load_service_name: str = "/voice_tts/load"
+    unload_service_name: str = "/voice_tts/unload"
+    load_on_startup: bool = False
+    prompt_profile: str = "default"
+    segment_max_chars: int = 200
+    segment_pause_ms: int = 150
+    max_request_chars: int = 4000
+    max_prompt_audio_bytes: int = 10 * 1024 * 1024
+    max_prompt_duration_sec: float = 30.0
+    max_segments: int = 32
+    max_response_audio_bytes: int = 64 * 1024 * 1024
+    device_id: int = 0
     exit_on_init_failure: bool = True
 
 
@@ -224,6 +250,7 @@ class RobotConfig:
     peripherals: list[CameraConfig | PeripheralConfig] = field(default_factory=list)
     contract: ContractExtensionConfig = field(default_factory=ContractExtensionConfig)
     voice_asr: VoiceASRConfig = field(default_factory=VoiceASRConfig)
+    voice_tts: VoiceTTSConfig = field(default_factory=VoiceTTSConfig)
     embodied: EmbodiedConfig = field(default_factory=EmbodiedConfig)
     skill_gateway: SkillGatewayRuntimeConfig = field(default_factory=SkillGatewayRuntimeConfig)
     semantic_mapping: SemanticMappingConfig = field(default_factory=SemanticMappingConfig)

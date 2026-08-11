@@ -1,3 +1,20 @@
+# ValidateSkill.srv - Read-only preflight owned by safety_guard. Endpoint
+# /embodied/validate_skill.
+#
+# See docs/lightweight_skill_package_registry_design_zh.md section 11.5.
+#
+# This is a read-only preflight: it validates the exact snapshot, entry
+# parameters and current robot state, but does not query or modify the
+# coordinator and must not interpret a present root_lease_nonce as execution
+# authorization. Workflow root, nonce, digest, expected index and full step
+# payload authoritative validation happens only in the later Gateway action
+# admission, so a successful validation does not guarantee admission success.
+# The dispatch_binding must provide complete expected identity on planned
+# TaskCommand / SkillCommand validation. Workflow child validation may carry
+# root_lease_nonce for correlation, but safety_guard must not treat it as
+# authorization. dispatch_nonce must be empty here. schema_version is 1 in v1.
+
+DispatchBinding dispatch_binding
 string skill_name
 string target_name
 string place_name
@@ -6,3 +23,8 @@ float32 motion_distance
 ---
 bool allowed
 string reason
+string error_code
+string actual_registry_epoch
+uint64 actual_registry_generation
+string actual_registry_digest
+SkillDiagnostic[] diagnostics

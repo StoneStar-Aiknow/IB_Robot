@@ -1,7 +1,7 @@
 # embodied_common 架构契约
 
 `embodied_common` 是具身管线的中立共享包，只承载无业务副作用的公共 helper 与默认 fallback 数据。
-它用于消除 `embodied_agent`、`perception_service`、`vlm_task_planner`、`safety_guard`、`skill_library` 之间的重复实现和反向依赖。
+它用于消除 `embodied_agent`、`perception_service`、`safety_guard`、`skill_library` 之间的重复实现和反向依赖。
 
 ## 职责边界
 
@@ -9,7 +9,7 @@
 
 - 不启动 ROS 节点、不创建 action/service/client 的纯工具函数。
 - 被多个具身包共同使用的轻量数据规整逻辑。
-- 作为 fallback 的默认 skill / primitive 描述。
+- Primitive canonical descriptor 和仅供兼容测试使用的默认 fallback 数据。
 - 不依赖具体业务包内部实现的基础节点 helper。
 
 不应放入本包的内容：
@@ -17,7 +17,7 @@
 - 依赖感知、规划、安全或执行节点运行状态的业务逻辑。
 - 机器人型号、相机 topic、命名位姿、工作空间等应由 `robot_config` 管理的 SSOT 配置。
 - `ibrobot_msgs` 已经表达的 ROS msg/srv/action 契约。
-- 对 `perception_service`、`vlm_task_planner`、`safety_guard`、`skill_library`、`embodied_agent` 的反向 import。
+- 对 `perception_service`、`safety_guard`、`skill_library`、`embodied_agent` 的反向 import。
 
 ## 依赖方向
 
@@ -26,7 +26,6 @@
 ```text
 embodied_agent
 perception_service
-vlm_task_planner
 safety_guard
 skill_library
         ↓
@@ -47,16 +46,12 @@ ibrobot_msgs / rclpy
 - `embodied_common.json_utils.load_json_list`
 - `embodied_common.json_utils.string_list`
 - `embodied_common.json_utils.parse_confidence`
-- `embodied_common.command_parser.parse_text_command`
-- `embodied_common.command_parser.extract_skill_aliases`
-- `embodied_common.command_parser.load_skill_aliases`
 - `embodied_common.skill_templates.SUPPORTED_PRIMITIVES`
-- `embodied_common.skill_templates.DEFAULT_SKILL_TEMPLATES`
-- `embodied_common.skill_templates.DEFAULT_ALLOWED_SKILLS`
+- `embodied_common.skill_templates.DEFAULT_SKILL_TEMPLATES`（legacy fallback，不是运行时 SSOT）
+- `embodied_common.skill_templates.DEFAULT_ALLOWED_SKILLS`（legacy fallback，不是运行时 SSOT）
 - `embodied_common.skill_templates.DEFAULT_WAYPOINT_DURATION_SEC`
 - `embodied_common.skill_templates.is_skill_disabled`
 - `embodied_common.skill_templates.get_skill_templates`
-- `embodied_common.capability_view.build_capability_view`
 - `embodied_common.skill_request.canonical_skill_payload`
 - `embodied_common.skill_request.skill_payload_hash`
 - `embodied_common.skill_request.skill_goal_uuid`
@@ -69,7 +64,8 @@ ibrobot_msgs / rclpy
 
 ## Capability Gateway 公开视图
 
-`capability_view.build_capability_view()` 从已经归一化的机器人配置构建 ROS 无关的公开能力文档。
+`capability_view.build_capability_view()` 只保留为 legacy/config 单元测试兼容接口。生产 Gateway、CLI、Planner
+和 Safety 的公开能力必须来自 `skill_catalog` 已验证 exact snapshot，不能从 inline robot YAML 重建第二份视图。
 它只包含 `robot_name`、排序后的技能、排序后的命名位姿名称、完整的已解析 timeout policy
 和 `capability_digest`，不启动节点，也不读取 ROS 运行状态。
 
@@ -82,8 +78,10 @@ ibrobot_msgs / rclpy
   named pose 坐标及 ROS service/action/topic 名称都不属于该视图。
 - 缺省、显式空值或全部 `disabled: true` 的 `embodied.skill_templates` 都产生零个公开技能。
   `get_skill_templates()` 的禁用过滤在构建视图前生效。
-- digest 是整个公开文档的 SHA-256：JSON 使用排序 key、紧凑分隔符、ASCII 和
-  `allow_nan=False`。因此相同的公开能力、命名位姿名称或 timeout policy 才会得到相同 digest。
+- digest 是整个公开文档的 SHA-256：JSON 使用排序 key、紧凑分隔符、ASCII、
+  `allow_nan=False`，且 `-0.0` 归一化为 `0.0`（由 `embodied_common.canon.to_canonical_json`
+  统一实现，`robot_config`、`embodied_common`、`skill_catalog` 共用同一规范）。因此相同的
+  公开能力、命名位姿名称或 timeout policy 才会得到相同 digest。
 
 `skill_request` 为 Gateway 请求提供同一套规范化规则：技能名和可选字符串会去首尾空白，
 `motion_direction` 会转为小写；`skill_name` 必须非空，`motion_distance`（给出时）必须为有限、

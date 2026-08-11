@@ -171,22 +171,25 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && ro
 ### 3. 通过正式执行层抓取
 
 `manipulation_service` 不控制机械臂。完整抓取由 `manipulation_execution/pick_executor_node`
-提供的 `/manipulation/execute_pick` action 执行；它负责目标机器人专用的 IK/workspace、夹爪几何、
+提供的 `/manipulation/execute_pick` delegated action 执行；它负责目标机器人专用的 IK/workspace、夹爪几何、
 MoveIt 运动、恢复和抓后验证。推荐通过统一 robot-config bringup 启动 planner、verifier 和 executor，
-不要使用历史调试脚本代替机器人执行层。
+不要使用历史调试脚本代替机器人执行层。外部调用必须通过 Capability Gateway 的 `pick_object` 入口，
+不得直接构造 delegated action goal。
 
 监督式执行示例：
 
 ```bash
 source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && \
-ros2 run manipulation_execution pick_action_client --prompt marker --mode execute
+robot-skill --config-name so101_handeye_realsense_grasp execute pick_object \
+  --task-id pick-marker-001 --target-name marker --timeout-sec 240
 ```
 
-只验证候选、IK/FK 和安全门禁而不产生运动时使用：
+只验证感知和规划而不产生运动时，保持 `authorize_motion:=false` 并调用规划服务：
 
 ```bash
 source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && \
-ros2 run manipulation_execution pick_action_client --prompt marker --mode plan_only
+ros2 service call /grasp_planner/plan_grasp ibrobot_msgs/srv/PlanGrasp \
+  "{text_prompt: 'marker', confidence_threshold: 0.1, grasp_threshold: 0.5, debug_output_mode: 'diagnostic'}"
 ```
 
 SO101 执行侧 tabletop sweep 优先使用 `PlanGrasp.execution_table_plane_*`。该平面由服务端直接基于
@@ -537,9 +540,9 @@ test -d "$fixture_dir" && source .shrc_local && \
 - `grasp_preview.png`：离线预览截图。
 
 注意：离线预览中的编号仍是 GraspGen 服务返回顺序，不包含 SO101 正式执行层的
-接触点质心重排、动态宽度补偿或 IK/workspace 过滤结果。若要确认最终会抓哪个候选，
-使用 `pick_action_client --mode plan_only`，以 `PickObject.Result.candidate_index` 和
-`prepared_candidate_ranking.json` 为准。
+接触点质心重排、动态宽度补偿或 IK/workspace 过滤结果。`PickObject.MODE_PLAN_ONLY` 是 Gateway 内部
+诊断字段，当前 v1 catalog 未对外公开；若要提供完整候选筛选的无运动入口，必须先扩展版本化 catalog 和
+`SkillCommand` 参数契约，不能直接调用 delegated action。
 
 ## 常见调试路径
 

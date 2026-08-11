@@ -99,8 +99,7 @@ IB_Robot/                           # 主工作空间 (本仓库)
 │   ├── voice_asr_service/          # 语音识别服务
 │   ├── workflows/                  # CI/CD 配置
 │   │
-│   ├── embodied_agent/             # 具身 AI 任务入口与编排 (task_entry / planner / executor)
-│   ├── vlm_task_planner/           # VLM 视觉语言任务规划器 (多模态场景理解 + 技能规划)
+│   ├── embodied_agent/             # Hermes Agent plan 生命周期与执行编排
 │   ├── perception_service/         # 连续场景理解服务 (RGB-D / 多视角感知)
 │   ├── skill_library/              # 技能执行层 (skill → primitive → MoveIt)
 │   └── safety_guard/               # 显式安全校验层 (白名单 + 工作空间边界)
@@ -456,15 +455,13 @@ bag 目录组织、`dataset.yaml` 元信息和更多转换参数，详见 `src/d
 
 ## 四、具身 AI 流水线
 
-IB-Robot 内置了一条完整的**具身 AI 执行链路**，以自然语言（或 `/voice_command` 话题）为入口，经 VLM 视觉语言理解和技能规划后，驱动 MoveIt 2 执行真实动作。该链路在 `moveit_planning` 控制模式下可用。
+IB-Robot 内置了一条 Hermes Agent 具身执行链路，Agent 通过结构化技能计划驱动 MoveIt 2 执行真实动作。该链路在 `moveit_planning` 控制模式下可用。
 
 ### 链路结构
 
 ```text
-/voice_command
-  → task_entry_node         # 任务入口，优先规则直达
-  → vlm_task_planner_node   # VLM 视觉语言任务规划（场景理解 + 技能选择）
-  → task_executor_node      # 技能序列编排
+Hermes / robot-skill
+  → agent_plan_node         # Agent plan / validate / confirm / execute
   → skill_executor_node     # 技能 → primitive 分解
   → safety_guard_node       # 安全校验（白名单 + 工作空间边界）
   → moveit_gateway          # MoveIt 2 运动规划执行
@@ -499,37 +496,20 @@ Hermes -> ibrobot-control Agent Skill -> robot-skill -> ROS Capability Gateway
 
 `robot_mcp` 兼容层已移除，统一通过 `robot-skill` 访问 Capability Gateway。
 
-### 发送自然语言命令
+SO-101 真机从启动、控制器检查、Hermes 自然语言确认执行到回原位和关闭的完整操作流程，见
+[`docs/hermes_so101_real_robot_manual_validation_zh.md`](docs/hermes_so101_real_robot_manual_validation_zh.md)。
+
+### 发送 Agent 计划
 
 ```bash
-# 场景理解（纯视觉分析，不触发机械臂移动）
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '当前摄像头中可以看到什么'}"
-
-# 相对移动
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '夹爪往前一点'}"
-
-# 回安全位
-ros2 topic pub --once /voice_command std_msgs/msg/String "{data: '回原位'}"
-```
-
-### VLM 配置
-
-具身链路默认对接本地 OpenAI-compatible 服务（如 vLLM / Ollama）：
-
-```yaml
-embodied:
-  planner:
-    mode: vlm_api          # rule / vlm_api / hybrid
-    vlm_api:
-      provider: openai_compatible
-      base_url: http://localhost:8000/v1
-      model: Qwen3.5-9B
-      api_key_env: ""      # 本地服务无需 key
+# Hermes 通过 robot-skill 提交 Agent 计划
+robot-skill --config-name so101_single_arm plan-workflow \
+  --request-id plan-request-001 --text "打开夹爪" \
+  --workflow-json '[{"skill_name":"open_gripper_skill"}]'
 ```
 
 更多配置说明见：
 - [`src/embodied_agent/README.md`](src/embodied_agent/README.md) — 任务入口与编排
-- [`src/vlm_task_planner/README.md`](src/vlm_task_planner/README.md) — VLM 规划器
 - [`src/perception_service/README.md`](src/perception_service/README.md) — 场景感知服务
 - [`src/skill_library/README.md`](src/skill_library/README.md) — 技能执行层
 - [`src/safety_guard/README.md`](src/safety_guard/README.md) — 安全校验层
@@ -734,22 +714,16 @@ export DISPLAY=:1
 | `release_at_named_pose` | 同上 |
 
 **涉及变更的模块**：
-- `embodied_agent/command_parser.py`：删除硬编码的目标名解析和上述技能的文本路由
+- `embodied_agent`：删除旧的目标名文本路由和规则 Planner ROS 节点
 - `embodied_common/skill_templates.py`：删除 8 个技能的模板定义
-- `vlm_task_planner/prompt_builder.py`：在 system prompt 中声明抓取/放置类技能已禁用
-- `vlm_task_planner/response_parser.py`：新增 `DISABLED_SKILLS` 集合，planner 若选中被禁用技能则报错
 - `robot_config/config/robots/so101_single_arm.yaml`：删除 `entry` 路由配置、`named_targets` 定义、被移除技能的 `allowed_skills` 和 `skill_templates`
 - `robot_config/robot_config/loader.py`：精简配置校验逻辑，移除 `target_pose_key` / `place_name_from_request` 等间接引用
 - `robot_config/robot_config/launch_builders/embodied.py`：移除 entry 参数注入
 
-#### 夹爪执行路径规划器（gripper_path.py）
-
-新增 `vlm_task_planner/gripper_path.py` 模块：根据任务描述和命名目标，生成夹爪执行路径（坐标接地 + 可达性检查），参考 Code as Policies + SayCan 模式设计。已集成到 `vlm_task_planner_node` 的 plan context 中。
-
 #### 测试
 
 - 新增 `test_object_parser.py`、`test_grounding_3d_fixture.py`、`test_perception_node_observation.py`、`test_realsense_rgbd_fixture.py`
-- 更新 `test_response_parser.py`、`test_prompt_builder.py`、`test_command_parser.py` 适配技能清理
+- 更新 Agent workflow 与 catalog contract 测试适配 Hermes-only 运行时
 - **全部 16 项测试通过**，ruff lint 通过，3 个 ROS 包构建成功
 
 ---

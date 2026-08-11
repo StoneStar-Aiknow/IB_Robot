@@ -1,0 +1,25 @@
+# BeginWorkflowExecution.srv - Internal execution-scope service between the
+# embodied_agent task executor and the ExecutionCoordinator.
+#
+# See docs/lightweight_skill_package_registry_design_zh.md sections 10.5, 11.
+# Not an Agent/CLI/user-discoverable capability; deployment policy must
+# restrict callers.
+#
+# The request must satisfy task_id == root_task_id, non-empty steps, complete
+# expected identity, non-empty workflow_digest, workflow_step_index=0 and both
+# nonces empty. The coordinator recomputes the digest, captures the current
+# bundle and atomically acquires the root lease. A retry with the same root ID,
+# digest, identity and budget returns the same active nonce; any field conflict
+# returns SKILL_REQUEST_ID_CONFLICT and must not replace the existing root.
+
+DispatchBinding dispatch_binding
+WorkflowStep[] workflow_steps
+---
+bool success
+string root_lease_nonce
+string workflow_digest
+string actual_registry_epoch
+uint64 actual_registry_generation
+string actual_registry_digest
+string error_code
+string message

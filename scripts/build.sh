@@ -302,6 +302,15 @@ if [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
     if [[ "${IBR_BUILD_INCLUDE_SIM_MODELS_ON_OPENEULER:-0}" != "1" ]]; then
         OPENEULER_SKIP_PACKAGES+=("sim_models")
     fi
+    if [[ "${IBR_BUILD_INCLUDE_PERCEPTION_SERVICE_ON_OPENEULER:-0}" != "1" ]]; then
+        OPENEULER_SKIP_PACKAGES+=("perception_service" "semantic_mapping")
+    fi
+    if [[ "${IBR_BUILD_INCLUDE_MANIPULATION_SERVICE_ON_OPENEULER:-0}" != "1" ]]; then
+        OPENEULER_SKIP_PACKAGES+=("manipulation_service")
+    fi
+    if [[ "${IBR_BUILD_INCLUDE_EMBODIED_BRINGUP_ON_OPENEULER:-0}" != "1" ]]; then
+        OPENEULER_SKIP_PACKAGES+=("embodied_bringup")
+    fi
     if [[ ${#OPENEULER_SKIP_PACKAGES[@]} -gt 0 ]]; then
         log_info "openEuler detected: skipping unavailable runtime packages: ${OPENEULER_SKIP_PACKAGES[*]}."
         PLATFORM_ARGS+=("--packages-ignore" "${OPENEULER_SKIP_PACKAGES[@]}")

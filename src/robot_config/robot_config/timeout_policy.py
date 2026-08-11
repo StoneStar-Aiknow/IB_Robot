@@ -7,7 +7,7 @@ from typing import Any
 
 DEFAULT_EMBODIED_TIMEOUT_POLICY: dict[str, float] = {
     "task_budget_sec": 180.0,
-    "default_skill_timeout_sec": 30.0,
+    "default_skill_timeout_sec": 120.0,
     "robot_state_freshness_sec": 0.5,
     "scene_freshness_sec": 0.5,
     "model_idle_timeout_sec": 120.0,
@@ -50,21 +50,16 @@ def resolve_embodied_timeout_policy(embodied_config: dict[str, Any]) -> dict[str
     """Resolve a compact timeout policy while keeping legacy fields compatible."""
 
     execution = _mapping(embodied_config.get("execution", {}), "embodied.execution")
-    planner = _mapping(embodied_config.get("planner", {}), "embodied.planner")
-    planner_scene_sources = _mapping(planner.get("scene_sources", {}), "embodied.planner.scene_sources")
-    planner_vlm_api = _mapping(planner.get("vlm_api", {}), "embodied.planner.vlm_api")
     perception = _mapping(embodied_config.get("perception", {}), "embodied.perception")
     perception_scene_sources = _mapping(perception.get("scene_sources", {}), "embodied.perception.scene_sources")
     perception_vlm_api = _mapping(perception.get("vlm_api", {}), "embodied.perception.vlm_api")
     configured = _mapping(embodied_config.get("timeouts", {}), "embodied.timeouts")
 
-    scene_freshness_fallback = planner_scene_sources.get(
-        "max_scene_age_sec",
-        perception_scene_sources.get("max_scene_age_sec", DEFAULT_EMBODIED_TIMEOUT_POLICY["scene_freshness_sec"]),
+    scene_freshness_fallback = perception_scene_sources.get(
+        "max_scene_age_sec", DEFAULT_EMBODIED_TIMEOUT_POLICY["scene_freshness_sec"]
     )
-    model_idle_fallback = planner_vlm_api.get(
-        "timeout_sec",
-        perception_vlm_api.get("timeout_sec", DEFAULT_EMBODIED_TIMEOUT_POLICY["model_idle_timeout_sec"]),
+    model_idle_fallback = perception_vlm_api.get(
+        "timeout_sec", DEFAULT_EMBODIED_TIMEOUT_POLICY["model_idle_timeout_sec"]
     )
 
     policy = {

@@ -1,15 +1,20 @@
 """Safety validation node for the embodied minimal closure."""
 
+from collections.abc import Mapping
+from threading import RLock
+
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
-from embodied_common.skill_templates import get_skill_templates
-from ibrobot_msgs.srv import ValidatePrimitive, ValidateSkill
+from ibrobot_msgs.msg import SkillRegistryEvent
+from ibrobot_msgs.srv import GetSkillGatewayStatus, GetSkillSnapshot, ValidatePrimitive, ValidateSkill
 from safety_guard.rules import (
     load_json_mapping,
     validate_primitive_request,
     validate_skill_request,
 )
+from safety_guard.snapshot_cache import SafetySnapshotCache, SnapshotCacheError, SnapshotIdentity
 
 
 class SafetyGuardNode(Node):
@@ -19,9 +24,12 @@ class SafetyGuardNode(Node):
         super().__init__("safety_guard_node", parameter_overrides=parameter_overrides)
         self.declare_parameter("validate_skill_service", "/embodied/validate_skill")
         self.declare_parameter("validate_primitive_service", "/embodied/validate_primitive")
+        self.declare_parameter("skill_gateway_status_service", "/embodied/get_skill_gateway_status")
+        self.declare_parameter("skill_catalog_snapshot_service", "/embodied/get_skill_snapshot")
+        self.declare_parameter("skill_registry_event_topic", "/embodied/skill_registry_events")
+        self.declare_parameter("snapshot_sync_period_sec", 1.0)
         self.declare_parameter("named_poses_json", "{}")
         self.declare_parameter("named_targets_json", "{}")
-        self.declare_parameter("skill_templates_json", "")
         self.declare_parameter("workspace_json", "{}")
         self.declare_parameter("arm_joint_names_json", "[]")
         self.declare_parameter("joint_limits_json", "{}")
@@ -31,13 +39,23 @@ class SafetyGuardNode(Node):
         self._validate_primitive_service = (
             self.get_parameter("validate_primitive_service").get_parameter_value().string_value
         )
+        self._skill_gateway_status_service = (
+            self.get_parameter("skill_gateway_status_service").get_parameter_value().string_value
+        )
+        self._skill_catalog_snapshot_service = (
+            self.get_parameter("skill_catalog_snapshot_service").get_parameter_value().string_value
+        )
+        self._skill_registry_event_topic = (
+            self.get_parameter("skill_registry_event_topic").get_parameter_value().string_value
+        )
+        self._snapshot_sync_period_sec = (
+            self.get_parameter("snapshot_sync_period_sec").get_parameter_value().double_value
+        )
+        if self._snapshot_sync_period_sec <= 0.0:
+            raise ValueError("snapshot_sync_period_sec must be positive")
         self._named_poses = load_json_mapping(self.get_parameter("named_poses_json").get_parameter_value().string_value)
         self._named_targets = load_json_mapping(
             self.get_parameter("named_targets_json").get_parameter_value().string_value
-        )
-        raw_skill_templates_json = self.get_parameter("skill_templates_json").get_parameter_value().string_value
-        self._skill_templates = get_skill_templates(
-            load_json_mapping(raw_skill_templates_json) if raw_skill_templates_json.strip() else None
         )
         self._workspace = load_json_mapping(self.get_parameter("workspace_json").get_parameter_value().string_value)
         arm_joint_names = load_json_mapping(
@@ -51,6 +69,29 @@ class SafetyGuardNode(Node):
         )
         self._debug = self.get_parameter("debug_tracing").get_parameter_value().bool_value
 
+        self._snapshot_cache = SafetySnapshotCache()
+        self._sync_lock = RLock()
+        self._status_in_flight = False
+        self._snapshot_in_flight: set[tuple[str, int]] = set()
+        self._desired_current: SnapshotIdentity | None = None
+        self._retained_generations: set[int] = set()
+        self._known_identities: dict[tuple[str, int], SnapshotIdentity] = {}
+        self._gateway_status_client = self.create_client(GetSkillGatewayStatus, self._skill_gateway_status_service)
+        self._snapshot_client = self.create_client(GetSkillSnapshot, self._skill_catalog_snapshot_service)
+        registry_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(
+            SkillRegistryEvent,
+            self._skill_registry_event_topic,
+            self._handle_registry_event,
+            registry_qos,
+        )
+        self.create_timer(self._snapshot_sync_period_sec, self._sync_gateway_status)
+
         self.create_service(ValidateSkill, self._validate_skill_service, self._handle_validate_skill)
         self.create_service(ValidatePrimitive, self._validate_primitive_service, self._handle_validate_primitive)
 
@@ -60,7 +101,195 @@ class SafetyGuardNode(Node):
             f"validate_primitive_service={self._validate_primitive_service}"
         )
 
+    @staticmethod
+    def _thaw(value):
+        if isinstance(value, Mapping):
+            return {str(key): SafetyGuardNode._thaw(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return [SafetyGuardNode._thaw(item) for item in value]
+        return value
+
+    def _sync_gateway_status(self) -> None:
+        with self._sync_lock:
+            if self._status_in_flight or not self._gateway_status_client.service_is_ready():
+                return
+            self._status_in_flight = True
+        request = GetSkillGatewayStatus.Request()
+        request.schema_version = 1
+        try:
+            future = self._gateway_status_client.call_async(request)
+        except Exception:
+            with self._sync_lock:
+                self._status_in_flight = False
+            return
+        future.add_done_callback(self._handle_status_future)
+
+    def _handle_status_future(self, future) -> None:
+        with self._sync_lock:
+            self._status_in_flight = False
+        try:
+            response = future.result()
+        except Exception:
+            return
+        if (
+            response is None
+            or response.schema_version != 1
+            or not response.registry_epoch
+            or response.registry_generation <= 0
+            or not response.registry_digest
+        ):
+            return
+        current = SnapshotIdentity(
+            response.registry_epoch,
+            int(response.registry_generation),
+            response.registry_digest,
+        )
+        retained = {int(value) for value in response.retained_generations if int(value) > 0}
+        retained.add(current.generation)
+        with self._sync_lock:
+            desired = self._desired_current
+            if (
+                desired is not None
+                and current.registry_epoch == desired.registry_epoch
+                and current.generation < desired.generation
+            ):
+                return
+            if desired is not None and current.registry_epoch != desired.registry_epoch:
+                self._snapshot_cache.reconcile(current.registry_epoch, retained)
+                self._known_identities.clear()
+            self._desired_current = current
+            self._retained_generations = retained
+            self._known_identities[(current.registry_epoch, current.generation)] = current
+        for generation in sorted(retained):
+            identity = self._known_identities.get((current.registry_epoch, generation))
+            if identity is not None:
+                self._request_snapshot(identity)
+        self._snapshot_cache.reconcile(current.registry_epoch, retained)
+
+    def _handle_registry_event(self, event: SkillRegistryEvent) -> None:
+        if (
+            event.schema_version != 1
+            or not event.registry_epoch
+            or event.new_generation <= 0
+            or not event.registry_digest
+        ):
+            return
+        identity = SnapshotIdentity(event.registry_epoch, int(event.new_generation), event.registry_digest)
+        with self._sync_lock:
+            desired = self._desired_current
+            if (
+                desired is not None
+                and identity.registry_epoch == desired.registry_epoch
+                and identity.generation <= desired.generation
+            ):
+                return
+            if desired is not None and identity.registry_epoch != desired.registry_epoch:
+                self._snapshot_cache.reconcile(identity.registry_epoch, {identity.generation})
+                self._retained_generations.clear()
+                self._known_identities.clear()
+            self._desired_current = identity
+            self._retained_generations.add(identity.generation)
+            self._known_identities[(identity.registry_epoch, identity.generation)] = identity
+        self._request_snapshot(identity)
+
+    def _request_snapshot(self, identity: SnapshotIdentity) -> None:
+        if identity.registry_digest:
+            try:
+                self._snapshot_cache.get(identity)
+                with self._sync_lock:
+                    if self._desired_current == identity:
+                        self._snapshot_cache.mark_current(identity)
+                return
+            except SnapshotCacheError:
+                pass
+        key = (identity.registry_epoch, identity.generation)
+        with self._sync_lock:
+            if key in self._snapshot_in_flight or not self._snapshot_client.service_is_ready():
+                return
+            self._snapshot_in_flight.add(key)
+        request = GetSkillSnapshot.Request()
+        request.schema_version = 1
+        request.registry_epoch = identity.registry_epoch
+        request.generation = identity.generation
+        try:
+            future = self._snapshot_client.call_async(request)
+        except Exception:
+            with self._sync_lock:
+                self._snapshot_in_flight.discard(key)
+            return
+        future.add_done_callback(
+            lambda completed, request_key=key: self._handle_snapshot_future(request_key, completed)
+        )
+
+    def _handle_snapshot_future(self, key: tuple[str, int], future) -> None:
+        with self._sync_lock:
+            self._snapshot_in_flight.discard(key)
+        try:
+            response = future.result()
+        except Exception:
+            return
+        if response is None or not response.success or (response.registry_epoch, int(response.generation)) != key:
+            return
+        response_identity = SnapshotIdentity(
+            response.registry_epoch,
+            int(response.generation),
+            response.registry_digest,
+        )
+        with self._sync_lock:
+            retained = set(self._retained_generations)
+            desired = self._desired_current
+            expected = self._known_identities.get(key)
+            if expected is None or response_identity != expected:
+                return
+            if response.generation not in retained and response_identity != desired:
+                return
+            try:
+                self._snapshot_cache.activate(
+                    registry_epoch=response.registry_epoch,
+                    generation=int(response.generation),
+                    registry_digest=response.registry_digest,
+                    capability_digest=response.capability_digest,
+                    provenance_digest=response.provenance_digest,
+                    snapshot_json=response.snapshot_json,
+                    make_current=response_identity == desired,
+                )
+            except SnapshotCacheError as exc:
+                self.get_logger().error(f"safety snapshot rejected: {exc.code}: {exc}")
+                return
+            self._snapshot_cache.reconcile(response.registry_epoch, retained)
+
+    @staticmethod
+    def _set_actual_identity(response, identity: SnapshotIdentity | None) -> None:
+        response.actual_registry_epoch = identity.registry_epoch if identity else ""
+        response.actual_registry_generation = identity.generation if identity else 0
+        response.actual_registry_digest = identity.registry_digest if identity else ""
+
     def _handle_validate_skill(self, request, response):
+        expected = SnapshotIdentity(
+            request.dispatch_binding.expected_registry_epoch,
+            int(request.dispatch_binding.expected_registry_generation),
+            request.dispatch_binding.expected_registry_digest,
+        )
+        if (
+            request.dispatch_binding.schema_version != 1
+            or not all((expected.registry_epoch, expected.generation > 0, expected.registry_digest))
+            or request.dispatch_binding.dispatch_nonce
+        ):
+            response.allowed = False
+            response.reason = "planned validation requires exact identity and an empty dispatch nonce"
+            response.error_code = "SKILL_SCHEMA_INVALID"
+            self._set_actual_identity(response, self._snapshot_cache.current_identity)
+            return response
+        try:
+            snapshot = self._snapshot_cache.get(expected)
+        except SnapshotCacheError as exc:
+            response.allowed = False
+            response.reason = str(exc)
+            response.error_code = exc.code
+            self._set_actual_identity(response, self._snapshot_cache.current_identity)
+            return response
+        robot_context = self._thaw(snapshot.robot_context)
+        skill_templates = self._thaw(snapshot.templates)
         try:
             allowed, reason = validate_skill_request(
                 request.skill_name,
@@ -68,17 +297,25 @@ class SafetyGuardNode(Node):
                 request.place_name,
                 request.motion_direction,
                 request.motion_distance,
-                self._named_poses,
-                self._named_targets,
-                self._skill_templates,
-                self._arm_joint_names,
-                self._joint_limits,
+                robot_context.get("named_poses", {}),
+                robot_context.get("named_targets", {}),
+                skill_templates,
+                robot_context.get("arm_joint_names", []),
+                robot_context.get("joint_limits", {}),
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in skill validation: {exc}")
-            allowed, reason = False, f"internal error: {exc}"
+            response.allowed = False
+            response.reason = "safety validation is temporarily unavailable"
+            response.error_code = "CAPABILITY_NOT_READY"
+            self._set_actual_identity(response, snapshot.identity)
+            response.diagnostics = []
+            return response
         response.allowed = allowed
         response.reason = reason
+        response.error_code = "" if allowed else "SKILL_LIMIT_VIOLATION"
+        self._set_actual_identity(response, snapshot.identity)
+        response.diagnostics = []
         if self._debug:
             self.get_logger().info(
                 "[embodied-debug] safety_guard skill_check "
@@ -89,6 +326,32 @@ class SafetyGuardNode(Node):
         return response
 
     def _handle_validate_primitive(self, request, response):
+        expected = SnapshotIdentity(
+            request.dispatch_binding.expected_registry_epoch,
+            int(request.dispatch_binding.expected_registry_generation),
+            request.dispatch_binding.expected_registry_digest,
+        )
+        if (
+            request.dispatch_binding.schema_version != 1
+            or not expected.registry_epoch
+            or expected.generation <= 0
+            or not expected.registry_digest
+            or not request.dispatch_binding.dispatch_nonce
+        ):
+            response.allowed = False
+            response.reason = "primitive validation requires exact identity and dispatch nonce"
+            response.error_code = "SKILL_SCHEMA_INVALID"
+            self._set_actual_identity(response, self._snapshot_cache.current_identity)
+            return response
+        try:
+            snapshot = self._snapshot_cache.get(expected)
+        except SnapshotCacheError as exc:
+            response.allowed = False
+            response.reason = str(exc)
+            response.error_code = exc.code
+            self._set_actual_identity(response, self._snapshot_cache.current_identity)
+            return response
+        robot_context = self._thaw(snapshot.robot_context)
         try:
             allowed, reason = validate_primitive_request(
                 request.primitive_name,
@@ -100,14 +363,14 @@ class SafetyGuardNode(Node):
                 request.target_y,
                 request.target_z,
                 request.gripper_position,
-                self._named_poses,
-                self._workspace,
+                robot_context.get("named_poses", {}),
+                robot_context.get("workspace_limits", {}),
                 list(request.joint_names),
                 list(request.joint_positions),
                 list(request.joint_waypoints),
                 request.joint_waypoint_count,
-                self._arm_joint_names,
-                self._joint_limits,
+                robot_context.get("arm_joint_names", []),
+                robot_context.get("joint_limits", {}),
                 request.primitive_duration_sec,
                 request.waypoint_duration_sec,
                 request.target_qx,
@@ -118,9 +381,17 @@ class SafetyGuardNode(Node):
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in primitive validation: {exc}")
-            allowed, reason = False, f"internal error: {exc}"
+            response.allowed = False
+            response.reason = "safety validation is temporarily unavailable"
+            response.error_code = "CAPABILITY_NOT_READY"
+            self._set_actual_identity(response, snapshot.identity)
+            response.diagnostics = []
+            return response
         response.allowed = allowed
         response.reason = reason
+        response.error_code = "" if allowed else "SKILL_LIMIT_VIOLATION"
+        self._set_actual_identity(response, snapshot.identity)
+        response.diagnostics = []
         if self._debug:
             self.get_logger().info(
                 "[embodied-debug] safety_guard primitive_check "

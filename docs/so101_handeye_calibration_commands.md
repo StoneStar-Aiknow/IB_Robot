@@ -300,15 +300,16 @@ cd ~/IB_Robot && python3 -m json.tool outputs/handeye/wrist_handeye_new.json
 ```
 
 不需要复制 JSON，也不再向监督式客户端传手眼文件或 robot-config 路径。重启统一
-pipeline 加载新 YAML 后，先运行 plan-only 验证：
+pipeline 加载新 YAML 后，保持 `authorize_motion:=false`，先通过正式规划服务做无运动验证：
 
 ```bash
 cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && source install/setup.bash && \
-ros2 run manipulation_execution pick_action_client \
-  --prompt banana \
-  --mode plan_only \
-  --timeout-s 240
+ros2 service call /grasp_planner/plan_grasp ibrobot_msgs/srv/PlanGrasp \
+  "{text_prompt: 'banana', confidence_threshold: 0.1, grasp_threshold: 0.5, debug_output_mode: 'diagnostic'}"
 ```
+
+`PickObject.MODE_PLAN_ONLY` 是 Gateway 内部诊断字段，当前 v1 catalog 未对外公开，不能自行构造
+delegated action goal 绕过 Gateway。
 
 运行上述命令前，必须停止标定期间的终端 A–D，执行第 0 步清理，然后按
 [`so101_banana_pick_pipeline_commands.md`](so101_banana_pick_pipeline_commands.md) 第 2 节重启统一 pipeline，

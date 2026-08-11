@@ -1,0 +1,49 @@
+# ExecuteAgentPlan.action - embodied_agent public high-level action for the
+# Hermes natural-language flow. Endpoint name is fixed: /embodied/execute_agent_plan.
+#
+# See docs/lightweight_skill_package_registry_design_zh.md section 11.6.
+#
+# Reads the immutable plan by token, re-validates TTL, exact identity, task id
+# and the task budget frozen by ConfirmAgentPlan, and re-runs the necessary
+# Gateway / safety checks at action admission time.
+#   1. A single step uses a direct root SkillCommand; workflow_digest is empty.
+#   2. Two or more steps compute one typed workflow_digest and run Gateway
+#      Begin / ordered child SkillCommand / Finalize. Hermes and robot-skill
+#      never touch the root lease nonce.
+#   3. First accepted execution of a token must carry an unconsumed
+#      confirmation_token and bind the task id; retries with the same token /
+#      task id may idempotently return the existing active/terminal record,
+#      while a different task id returns SKILL_REQUEST_ID_CONFLICT. The
+#      confirmation token admits exactly one new admission.
+#   4. Action cancel must propagate to the current direct Skill or Workflow
+#      child and wait for cleanup and the terminal result; receiving only
+#      cancel accepted does not mean the robot has stopped.
+#   5. On any step failure, cancel, timeout or unknown stop state, no further
+#      step runs and no new token / task id is auto-created.
+# robot-skill cancel-plan --task-id ID cancels this action's root goal via the
+# standard CancelGoal interface. schema_version is 1 in v1.
+
+# --- Goal ---
+uint32 schema_version
+string plan_token
+string confirmation_token
+string task_id
+float32 timeout_sec
+---
+# --- Result ---
+bool success
+string plan_id
+string plan_digest
+string workflow_digest
+uint32 completed_step_count
+string error_code
+string message
+string actual_registry_epoch
+uint64 actual_registry_generation
+string actual_registry_digest
+---
+# --- Feedback ---
+string state
+string current_skill
+uint32 workflow_step_index
+string detail

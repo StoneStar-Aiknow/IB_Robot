@@ -15,7 +15,10 @@ SO-101 机械臂的硬件驱动包，提供高性能 C++ ros2_control 接口和 
 - **启动位置保护**：支持配置 `reset_positions`，防止机械臂在启动时因回零产生剧烈跳动（对机器狗背负式机械臂尤为重要）。
 - **生命周期管理**：支持标准的 `on_configure`, `on_activate`, `on_deactivate` 生命周期。
 - **电流反馈**：C++ 插件和 Python 桥接脚本会按 STS3215 `1 LSB = 6.5mA` 把 Feetech `Present_Current` 转为安培，并通过 `/so101_follower/joint_currents` 或 `/so101_leader/joint_currents` 发布 `ibrobot_msgs/msg/JointCurrent`，供数据集转换生成 `observation.current`。
-- **安全保障**：在节点关闭时自动卸载舵机力矩（Torque Off）。
+- **安全保障**：节点关闭时自动卸载舵机力矩（Torque Off）；`on_activate` 失败回滚时先对所有舵机
+  fail-closed 卸力矩，再尝试 relock 任何处于解锁状态的 EPROM，最后才关闭串口，并对两类失败给出独立诊断。
+  该回滚保护覆盖整个激活流程，包括最后的初始同步读（initial sync read）：只要 sync-read 发送或任意一个
+  舵机返回包失败，激活立即中止并走同一条回滚路径。
 
 ## 架构
 
@@ -98,6 +101,46 @@ ros2 run so101_hardware leader_arm_pub --port /dev/ttyACM0 --publish_rate 50.0
 插件内部自动处理步数 (Steps) 与弧度 (Radians) 的转换：
 - **读取**：`radians = ((steps - range_min) / range - 0.5) * 2.0 * PI`
 - **写入**：`steps = (radians / (2.0 * PI) + 0.5) * range + range_min`
+
+### 激活回滚 (Activation Rollback)
+`on_activate` 在配置舵机过程中失败时执行 fail-closed 回滚，由 `detail::rollback_activation` 完成：
+
+1. **先卸力矩**：对所有 `motor_ids_` 执行 `EnableTorque(id, 0)`（带重试），这是安全默认动作，独立于
+   EPROM 状态。卸力矩优先于 relock，因为部分 Feetech 舵机仅在力矩关闭时才接受 EPROM 锁定指令。
+2. **再 relock EPROM**：仅对回滚开始时仍处于解锁状态（`unlocked_motors` 集合）的舵机尝试
+   `LockEprom(id)`（带重试），在**关闭串口之前**完成。正常流程中每完成一个舵机的配置就会把它从
+   解锁集合移除，因此只有中途失败时仍解锁的舵机才会进入 relock。
+3. **最后关闭串口**：`sms_sts_.end()`。
+
+两类结果独立汇报，互不掩盖：
+- 力矩卸载失败 → `Failed to disable torque for one or more motors during activation abort`；
+- EPROM relock 失败 → `Failed to relock EPROM for N motor(s) during activation abort; persistent parameters may be unprotected`，
+  并在 `relock_failures` 中列出具体舵机 ID。
+
+即使力矩卸载失败，relock 仍会被尝试（均为 best-effort、fail-closed 语义），调用方可据此判断是否需要
+人工复位持久参数。
+
+### 初始同步读 (Initial Sync Read)
+
+`on_activate` 在使能力矩之后，会做一次 sync-read 把真实反馈写入
+`hw_commands_/hw_positions_/hw_velocities_/hw_currents_`。该步骤**同样受上面的激活回滚保护**
+（fail-closed），由 `detail::perform_initial_sync_feedback` 实现：
+
+1. **发送/总线应答（syncReadPacketTx）**：返回收到 SDK 缓冲区的字节数；`<= 0` 表示发送失败或无应答
+   （超时）。`syncReadBegin` 仅返回 `void`（分配 SDK 接收缓冲区、记录超时），不是 fail-closed 门禁，
+   真正的门禁是这里的 Tx 返回值。
+2. **每个舵机返回包（syncReadPacketRx）**：返回内存字节数表示成功、`0` 表示失败。**必须全部舵机**
+   都返回完整且 CRC 校验通过的包，才会初始化状态并 dismiss 回滚守卫返回 SUCCESS。
+
+任何一个门禁失败，`on_activate` 立即调用 `abort_activation()`（力矩 off / EPROM relock / 关闭串口），
+绝不会在 `hw_commands_/positions/velocities/currents` 未完整初始化的情况下解除回滚守卫。失败日志：
+
+- 发送/总线失败 → `Initial sync read transmit failed; aborting activation`；
+- 某舵机 Rx 失败 → `Initial sync read for motor ID <id> failed; aborting activation`，`<id>` 为
+  第一个返回包失败的舵机 ID（与 EPROM relock 的 `relock_failures` 相互独立）。
+
+该 helper 以回调形式注入 sync-read 操作（Tx/Rx），因此可在不接真机的情况下用 gtest 覆盖 Tx 失败、
+某舵机 Rx 失败以及全部成功的路径。
 
 ## 对比：C++ 插件 vs Python 工具
 

@@ -19,8 +19,8 @@ setup(
     entry_points={
         "console_scripts": [
             "task_entry_node = embodied_agent.task_entry_node:main",
-            "task_planner_node = embodied_agent.task_planner_node:main",
             "task_executor_node = embodied_agent.task_executor_node:main",
+            "agent_plan_node = embodied_agent.agent_plan_node:main",
         ],
     },
 )

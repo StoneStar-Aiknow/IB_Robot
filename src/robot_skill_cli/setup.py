@@ -9,6 +9,7 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
+        ("share/" + package_name + "/skills/ibrobot-control", ["resource/ibrobot-control/SKILL.md"]),
     ],
     install_requires=["setuptools"],
     zip_safe=True,
@@ -16,5 +17,10 @@ setup(
     maintainer_email="liuweihong8@huawei.com",
     description="Stable JSON command-line adapter for the IB-Robot Capability Gateway.",
     license="Apache-2.0",
-    entry_points={"console_scripts": ["robot-skill = robot_skill_cli.cli:main"]},
+    entry_points={
+        "console_scripts": [
+            "robot-skill = robot_skill_cli.cli:main",
+            "hermes-robot = robot_skill_cli.hermes_launcher:main",
+        ]
+    },
 )

@@ -1,0 +1,48 @@
+schema_version: 1
+name: shake_no
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Shake 'no' (disagreement) with a small base-joint motion.
+  category: social_affirmation
+  when_to_use:
+  - disagree
+  - say no
+  - decline
+  - shake head
+  do_not_use:
+  - condition: agree or say yes
+    instead_use: nod_yes
+  - condition: greet someone
+    instead_use: wave_hello
+  aliases_zh:
+  - 摇头
+  - 不同意
+  - 不是
+  - 摇头表示否定
+  aliases_en:
+  - 'no'
+  - disagree
+  - decline
+  - shake head
+  motion_scope:
+  - base
+  anchor_pose: home
+  intensity: subtle
+  duration_sec_estimate: 8.0
+  requires_motion_params: false
+  rule_entry: true
+capability:
+  schema_version: 1
+  summary: Perform a gesture indicating disagreement.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  so101_arm_v1: implementations/so101_arm_v1.yaml

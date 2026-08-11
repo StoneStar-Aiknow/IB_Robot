@@ -1,0 +1,7 @@
+schema_version: 1
+kind: primitive_sequence
+robot: so101_arm_v1
+initial_gripper_state: none
+timeout_sec: 120.0
+primitive_sequence:
+- primitive_name: open_gripper

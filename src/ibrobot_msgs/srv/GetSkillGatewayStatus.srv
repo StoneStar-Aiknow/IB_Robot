@@ -1,3 +1,34 @@
+# GetSkillGatewayStatus.srv - High-level Gateway status boundary.
+#
+# See docs/lightweight_skill_package_registry_design_zh.md section 11.5.
+#
+# Status must never expose either nonce. active_owner_kind is only empty,
+# "catalog_entry" or "workflow"; with no active Workflow, active_workflow_digest
+# is empty and active_workflow_step_index is -1.
+#
+# control_plane_ready=true only when: the status response is reachable; the
+# current registry snapshot is fully synced with all three digests locally
+# recomputable; primitive_contract_digest, robot context and executor identity
+# checks pass; and the Agent plan store plan/validate/confirm/execute endpoint
+# is reachable; and the system is not in initial compile, registry resync or
+# reload transaction. control_plane_state is one of STARTING, SYNCING, READY,
+# RELOADING, FAILED; on failure control_plane_error_code is a stable code,
+# typically SKILL_REGISTRY_NOT_READY, SKILL_RELOAD_IN_PROGRESS,
+# SKILL_SNAPSHOT_DIGEST_MISMATCH or SKILL_EXECUTOR_IDENTITY_MISMATCH.
+#
+# control_plane_ready does NOT include motion_authorized, a single capability
+# ready, busy, control mode or workspace safety conditions. This lets
+# hermes-robot keep running with control_plane_state=READY and
+# motion_authorized=false so catalog/plan/validate work and the Gateway returns
+# MOTION_NOT_AUTHORIZED at actual action admission. request_state and
+# request_error_code only express the request task ledger query and must not be
+# treated as control-plane readiness by the launcher.
+#
+# config_digest is the legacy field name and must byte-for-byte equal
+# capability_digest; updated consumers key off capability_digest. Removing the
+# alias requires a separate breaking IDL release. schema_version is 1 in v1.
+
+uint32 schema_version
 string task_id
 string payload_hash
 ---
@@ -7,10 +38,24 @@ bool motion_authorized
 string active_control_mode
 bool busy
 string active_task_id
+string active_owner_kind
+string active_workflow_digest
+int32 active_workflow_step_index
+bool control_plane_ready
+string control_plane_state
+string control_plane_error_code
 float32 default_skill_timeout_sec
 float32 task_budget_sec
 float32 rpc_timeout_sec
 string config_digest
+string capability_digest
+string registry_epoch
+uint64 registry_generation
+string registry_digest
+string primitive_contract_digest
+string source_release_digest
+string provenance_digest
+uint64[] retained_generations
 string request_state
 string request_error_code
 SkillCapabilityStatus[] capabilities

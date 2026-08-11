@@ -26,13 +26,14 @@ def bridge_rig():
 
     from ibrobot_msgs.action import SkillCommand
     from ibrobot_msgs.msg import SkillCapabilityStatus
-    from ibrobot_msgs.srv import GetSkillGatewayStatus, ValidateSkill
+    from ibrobot_msgs.srv import GetSkillGatewayStatus, ReloadSkillCatalog, ValidateSkill
 
     if not rclpy.ok():
         rclpy.init()
     suffix = f"cli_{os.getpid()}_{uuid.uuid4().hex}"
     names = {
         "status": f"/{suffix}/gateway_status",
+        "reload": f"/{suffix}/reload_catalog",
         "validate": f"/{suffix}/validate_skill",
         "action": f"/{suffix}/execute_skill",
     }
@@ -54,12 +55,16 @@ def bridge_rig():
         response.task_budget_sec = 90.0
         response.rpc_timeout_sec = 2.0
         response.config_digest = "digest-1"
+        response.capability_digest = "digest-1"
         response.request_state, response.request_error_code = status_control["queries"].get(
             (request.task_id, request.payload_hash),
             ("active" if request.task_id else "", "DUPLICATE_TASK_ID" if request.payload_hash else ""),
         )
         capability = SkillCapabilityStatus()
         capability.name = "move_relative_ee"
+        capability.schema_version = 1
+        capability.semantic_level = "skill"
+        capability.planner_visible = True
         capability.ready = False
         capability.reason = "SKILL_BUSY"
         capability.required_control_mode = "moveit_planning"
@@ -73,6 +78,21 @@ def bridge_rig():
         return response
 
     server_node.create_service(GetSkillGatewayStatus, names["status"], get_status)
+
+    def reload_catalog(_request, response):
+        response.success = True
+        response.registry_epoch = "epoch-2"
+        response.old_generation = 1
+        response.generation = 2
+        response.registry_digest = "registry-digest-2"
+        response.capability_digest = "capability-digest-2"
+        response.source_release_digest = "source-release-2"
+        response.provenance_digest = "provenance-2"
+        response.message = "reloaded"
+        response.changed_skills = ["nod_yes"]
+        return response
+
+    server_node.create_service(ReloadSkillCatalog, names["reload"], reload_catalog)
     server_node.create_service(ValidateSkill, names["validate"], validate_skill)
 
     def goal_callback(_goal_request):
@@ -118,6 +138,7 @@ def bridge_rig():
     spin_thread.start()
     bridge = RosBridge(
         status_service=names["status"],
+        reload_service=names["reload"],
         validate_skill_service=names["validate"],
         skill_action=names["action"],
     )
@@ -155,12 +176,35 @@ def test_status_preserves_gateway_contract_fields(bridge_rig):
         "capabilities": [
             {
                 "name": "move_relative_ee",
+                "semantic_level": "skill",
+                "planner_visible": True,
                 "ready": False,
                 "reason": "SKILL_BUSY",
                 "required_control_mode": "moveit_planning",
             }
         ],
+        "capability_digest": "digest-1",
+        "registry_epoch": "",
+        "registry_generation": 0,
+        "registry_digest": "",
+        "primitive_contract_digest": "",
+        "source_release_digest": "",
+        "provenance_digest": "",
+        "control_plane_ready": False,
+        "control_plane_state": "",
+        "control_plane_error_code": "",
     }
+
+
+def test_reload_catalog_returns_generation_and_changed_skills(bridge_rig):
+    bridge, _names, _requests, _status_control, _action_control = bridge_rig
+
+    result = bridge.reload_skill_catalog(request_id="reload-1", force=True, timeout_sec=1.0)
+
+    assert result["success"] is True
+    assert result["old_generation"] == 1
+    assert result["generation"] == 2
+    assert result["changed_skills"] == ["nod_yes"]
 
 
 def test_validate_skill_passes_all_fixed_request_fields(bridge_rig):
@@ -176,7 +220,15 @@ def test_validate_skill_passes_all_fixed_request_fields(bridge_rig):
 
     result = bridge.validate_skill(payload, timeout_sec=1.0)
 
-    assert result == {"allowed": True, "reason": "allowed"}
+    assert result == {
+        "allowed": True,
+        "reason": "allowed",
+        "error_code": "",
+        "actual_registry_epoch": "",
+        "actual_registry_generation": 0,
+        "actual_registry_digest": "",
+        "diagnostics": [],
+    }
     assert len(requests) == 1
     request = requests[0]
     assert request.skill_name == "move_relative_ee"

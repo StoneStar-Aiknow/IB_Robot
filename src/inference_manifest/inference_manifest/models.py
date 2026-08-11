@@ -54,8 +54,6 @@ def _validate_role(value: str) -> str:
 
 
 def _validate_shape(value: tuple[int, ...]) -> tuple[int, ...]:
-    if not value:
-        raise ValueError("must contain at least one dimension")
     if any(dimension == 0 or dimension < -1 for dimension in value):
         raise ValueError("dimensions must be positive integers or -1 for dynamic dimensions")
     return value

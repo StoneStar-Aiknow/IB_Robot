@@ -87,8 +87,9 @@ robot:
 
 ## Capability Gateway Public Contract
 
-`robot.embodied.skill_templates.<skill>.capability` is the public Capability Gateway SSOT. It is explicit metadata,
-not a schema derived from `description` or a primitive sequence. Every enabled template must declare
+Versioned packages under `skill_catalog/config/skills/` are the public Capability Gateway SSOT. Robot YAML selects an
+exact catalog source/profile and retains only robot execution context such as poses, limits, timeouts, and endpoints.
+Capability metadata is explicit and is not derived from a primitive sequence. Every enabled catalog package must declare
 `schema_version: 1`, `summary`, `domain`, `moves_robot`, `required_control_mode`, `parameters`, and
 `recovery_policy`.
 
@@ -104,10 +105,11 @@ String parameter definitions permit only `type` and a non-empty `enum`; a `motio
 `forward`, `backward`, `left`, `right`, `up`, and `down`. `motion_distance` must be a `number` with
 `exclusiveMinimum: 0` and a `meters` or `degrees` `unit`. Any other schema key or public request property is rejected.
 
-`load_robot_config_dict()` is the canonical normalized loader used by launch, CLI, and catalog consumers. It validates
-the capability, template, and Gateway invariants before returning a config. When `embodied.skill_templates` is
-non-empty, `skill_required_control_mode` must be a non-empty member of `control_modes`, and every enabled capability
-must match it exactly.
+`load_robot_config_dict()` is the canonical normalized loader for robot execution context. `skill_catalog` compiles the
+selected profile and validates capability, implementation, delegated-executor, and Gateway invariants. Inline
+`embodied.skill_templates` is not a runtime source of skill identity. Model-driven delegated executors additionally
+declare `model_bundle_path` and `model_deployment`; all runtime participants load the same strict
+`inference_manifest.json`, and startup/catalog compilation fails if that identity cannot be verified.
 
 Shared config selection is ordered as explicit `config_path`, explicit `config_name`, `ROBOT_CONFIG`, `ROBOT_NAME`,
 then `so101_single_arm`. A name resolves first from the installed `robot_config/config/robots/` directory and then
@@ -587,6 +589,28 @@ ros2 control list_controllers | grep trajectory
 For more details, see:
 - [action_dispatch README](../action_dispatch/README.md) - Detailed executor documentation
 - [docs/architecture.md](../../docs/architecture.md) - System architecture overview
+
+### Voice TTS
+
+`robot.voice_tts` is the robot-level single source of truth for enabling and configuring the optional
+`voice_tts_service` package. Enabling it requires an explicit ZipVoice `bundle_path` and a named manifest
+`deployment`; configuration never selects a separate backend or silently falls back after a load failure. The
+full system starts TTS through `robot.launch.py`, while the package launch remains a standalone debugging entry.
+
+The public typed service is `/voice_tts/synthesize`. Requests and responses carry audio bytes rather than
+server-local paths and bound text, prompt, segment count, and response size. The launch builder resolves
+configuration and creates the node but does not open the model bundle. The node validates the bundle at startup,
+so `exit_on_init_failure=false` can keep the endpoints alive and report `MODEL_NOT_READY` when model storage is
+temporarily unavailable.
+
+With `load_on_startup=false`, the first valid synthesis request loads the model and later requests reuse it in
+memory. `/voice_tts/load` pre-warms the model, while `/voice_tts/unload` waits for active synthesis and then
+releases model resources without stopping the ROS endpoints. Relative `bundle_path` values resolve from the
+absolute `WORKSPACE` set by `.shrc_local`.
+
+The verified `ascend_310p` deployment uses the fixed bundle prompt, accepts Chinese, numbers, and common
+punctuation, and returns 24 kHz mono WAV. Request-scoped prompts are currently rejected with
+`UNSUPPORTED_PROMPT`; this is a deployment capability rather than an implicit backend choice.
 
 
 ## Usage

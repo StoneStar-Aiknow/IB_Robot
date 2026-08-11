@@ -1,0 +1,53 @@
+schema_version: 1
+name: close_gripper_skill
+version: 1.0.0
+semantic_level: atomic_operator
+description:
+  summary: Close the gripper to its closed position.
+  category: gripper
+  when_to_use:
+  - close or grasp with the gripper
+  - pick an object
+  do_not_use:
+  - condition: open or release
+    instead_use: open_gripper_skill
+  aliases_zh:
+  - 关闭夹爪
+  - 合拢夹爪
+  - 夹爪关闭
+  - 夹爪合拢
+  - 夹紧
+  - 闭爪
+  aliases_en:
+  - close gripper
+  - grasp
+  motion_scope:
+  - gripper
+  anchor_pose: none
+  intensity: subtle
+  duration_sec_estimate: 1.0
+  requires_motion_params: false
+capability:
+  schema_version: 1
+  summary: Close the gripper.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties: {}
+    required: []
+  recovery_policy: never_retry
+implementations:
+  so101_handeye_realsense_grasp: implementations/so101_handeye_realsense_grasp.yaml
+  so101_arm_v1: implementations/so101_arm_v1.yaml
+description_variants:
+  so101_handeye_realsense_grasp:
+    summary: Close the gripper.
+    category: gripper
+    when_to_use:
+    - close or hold with the gripper
+    motion_scope:
+    - arm
+    intensity: moderate

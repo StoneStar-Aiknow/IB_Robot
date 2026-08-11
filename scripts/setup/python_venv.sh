@@ -289,6 +289,13 @@ opencv-python<4.12
 opencv-python-headless<4.12
 EOF
 
+    # Install the ZipVoice frontend after creating the ROS ABI constraints.
+    # Vocos itself is maintained in voice_tts_service.vocos_backend because
+    # the PyPI package can replace the workspace Torch/torchaudio ABI.
+    log_info "Installing voice TTS frontend dependencies..."
+    run_cmd "${pip_install[@]}" --constraint "${ros_abi_constraints}" \
+        -r "${WORKSPACE}/requirements/voice-tts.txt" --quiet
+
     # Optional perception and manipulation dependencies are installed after the
     # core dependency set and ABI pins so later setup steps cannot overwrite them.
     if [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then

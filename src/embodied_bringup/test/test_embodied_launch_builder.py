@@ -5,7 +5,7 @@ import pytest
 from launch.actions import DeclareLaunchArgument, EmitEvent
 from launch_ros.actions import Node
 
-from embodied_bringup.launch_builders.embodied import generate_embodied_nodes
+from embodied_bringup.launch_builders.embodied import _resolve_development_source_root, generate_embodied_nodes
 from robot_config.launch_builders.perception_models import generate_perception_model_nodes
 from robot_config.loader import load_robot_config_dict
 
@@ -57,10 +57,11 @@ def _normalize_launch_environment(node):
     }
 
 
-def test_task_entry_launch_params_do_not_include_unused_routing_config():
+def test_hermes_entry_does_not_launch_voice_routing_node():
     robot_config = {
         "embodied": {
             "enabled": True,
+            "entry_mode": "hermes",
             "execution": {},
             "entry": {},
             "named_poses": {},
@@ -73,34 +74,15 @@ def test_task_entry_launch_params_do_not_include_unused_routing_config():
     }
 
     nodes = generate_embodied_nodes(robot_config, active_control_mode="moveit_planning")
-    task_entry = next(node for node in nodes if vars(node)["_Node__node_name"] == "task_entry_node")
-    params = {}
-    for group in vars(task_entry)["_Node__parameters"]:
-        if isinstance(group, dict):
-            for key, value in group.items():
-                normalized_key = key[0].text if isinstance(key, tuple) else key.text
-                normalized_value = value[0] if isinstance(value, tuple) else value
-                if hasattr(normalized_value, "text"):
-                    normalized_value = normalized_value.text
-                params[normalized_key] = normalized_value
-
-    assert "forward_unmatched_to_planner" not in params
-    assert "reject_invalid_only" not in params
-    assert "direct_skill_whitelist_json" not in params
-    assert "planner_route_keywords_json" not in params
+    node_names = {vars(node)["_Node__node_name"] for node in nodes}
+    assert "task_entry_node" not in node_names
+    assert "task_executor_node" not in node_names
 
 
-@pytest.mark.parametrize(
-    ("skill_templates", "expected"),
-    [
-        (None, "{}"),
-        ({}, "{}"),
-        ({"disabled_skill": {"disabled": True}}, '{"disabled_skill": {"disabled": true}}'),
-    ],
-)
-def test_launch_preserves_skill_templates_absent_vs_explicit_empty(skill_templates, expected):
+def test_launch_does_not_inject_legacy_skill_templates():
     embodied = {
         "enabled": True,
+        "entry_mode": "hermes",
         "execution": {},
         "entry": {},
         "named_poses": {},
@@ -109,16 +91,9 @@ def test_launch_preserves_skill_templates_absent_vs_explicit_empty(skill_templat
         "planner": {},
         "perception": {},
     }
-    if skill_templates is not None:
-        embodied["skill_templates"] = skill_templates
-
     nodes = generate_embodied_nodes({"embodied": embodied}, active_control_mode="moveit_planning")
     params = _skill_executor_params(nodes)
-    actual = params["skill_templates_json"].strip()
-    if len(actual) >= 2 and actual[0] == actual[-1] and actual[0] in {"'", '"'}:
-        actual = actual[1:-1]
-
-    assert actual == expected
+    assert "skill_templates_json" not in params
 
 
 @pytest.mark.parametrize("config_name", ["so101_single_arm"])
@@ -179,6 +154,22 @@ def test_launch_injects_gateway_startup_params_from_runtime_and_ssot():
     assert params["gripper_settle_sec"] == 0.8
 
 
+def test_installed_profile_falls_back_to_ament_skill_catalog_source():
+    robot_config = {
+        "_config_path": "/opt/ibrobot/install/robot_config/share/robot_config/config/robots/robot.yaml",
+        "embodied": {
+            "enabled": True,
+            "skill_catalog_source_mode": "development",
+            "skill_catalog_source_root": "src/skill_catalog",
+        },
+    }
+
+    params = _skill_executor_params(generate_embodied_nodes(robot_config, "moveit_planning"))
+
+    assert _decode_launch_string(params["skill_catalog_source_mode"]) == "installed"
+    assert _decode_launch_string(params["skill_catalog_source_root"]) == ""
+
+
 def test_direct_builder_defaults_gateway_motion_authorization_to_false():
     nodes = generate_embodied_nodes(
         {"embodied": {"enabled": True, "safety": {"motion_authorized": True}}},
@@ -190,34 +181,13 @@ def test_direct_builder_defaults_gateway_motion_authorization_to_false():
     assert params["motion_authorized"] is False
 
 
-def test_launch_injects_only_rule_entry_skill_aliases():
-    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
-    config = load_robot_config_dict(config_path)
-    config["embodied"]["enabled"] = True
-    nodes = generate_embodied_nodes(config, "moveit_planning")
-    task_entry = next(node for node in nodes if vars(node)["_Node__node_name"] == "task_entry_node")
-    params = _normalize_launch_param_mapping(task_entry._Node__parameters[0])
-    aliases = _decode_launch_json_string(params["skill_aliases_json"])
-
-    assert set(aliases) == {
-        "dance_basic",
-        "wave_hello",
-        "nod_yes",
-        "shake_no",
-        "celebrate",
-        "greet_observe_raise",
-        "act_cute",
-        "happy_spin_upright",
-    }
-
-
 def test_no_interaction_skills_node_is_generated():
     robot_config = {
         "embodied": {
             "enabled": True,
+            "entry_mode": "hermes",
             "execution": {},
             "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
-            "planner": {},
             "perception": {"enabled": True},
         }
     }
@@ -227,13 +197,38 @@ def test_no_interaction_skills_node_is_generated():
     node_names = [vars(node)["_Node__node_name"] for node in nodes]
     assert "interaction_skills_node" not in node_names
 
-    task_entry = next(node for node in nodes if vars(node)["_Node__node_name"] == "task_entry_node")
-    params = _normalize_launch_param_mapping(task_entry._Node__parameters[0])
-    assert "perception_request_topic" in params
-    assert "entry_visual_games_json" in params
-    games = _decode_launch_json_string(params["entry_visual_games_json"])
-    assert games["sorting_hat"]["enabled"] is True
-    assert params["perception_enabled"] is True
+    node_names = {vars(node)["_Node__node_name"] for node in nodes}
+    assert "task_entry_node" not in node_names
+    assert "perception_service_node" in node_names
+
+
+def test_hermes_entry_mode_omits_voice_pipeline_nodes():
+    nodes = generate_embodied_nodes(
+        {"embodied": {"enabled": True, "entry_mode": "hermes"}},
+        active_control_mode="moveit_planning",
+    )
+
+    node_names = {vars(node)["_Node__node_name"] for node in nodes}
+    assert {"safety_guard_node", "skill_executor_node", "agent_plan_node"} <= node_names
+    assert {"task_entry_node", "task_executor_node"}.isdisjoint(node_names)
+
+
+def test_development_catalog_resolves_from_source_module_when_config_is_installed():
+    installed_config = Path(__file__).parents[3] / "install/share/robot_config/config/robots/robot.yaml"
+
+    resolved = _resolve_development_source_root(installed_config, "src/skill_catalog")
+
+    assert resolved == (Path(__file__).parents[3] / "src/skill_catalog").resolve()
+
+
+def test_non_hermes_entry_mode_is_rejected():
+    import pytest
+
+    with pytest.raises(ValueError, match="entry_mode must be hermes"):
+        generate_embodied_nodes(
+            {"embodied": {"enabled": True, "entry_mode": "voice"}},
+            active_control_mode="moveit_planning",
+        )
 
 
 class _FakeLaunchContext:
@@ -400,6 +395,20 @@ def test_handeye_grasp_launch_auto_starts_parallel_ik_workers(monkeypatch, tmp_p
 
     assert action is not None
     assert action.__class__.__name__ == "IncludeLaunchDescription"
+
+
+def test_source_workspace_profile_uses_absolute_development_catalog_root():
+    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
+    config = load_robot_config_dict(config_path)
+    config["embodied"]["enabled"] = True
+
+    params = _skill_executor_params(generate_embodied_nodes(config, active_control_mode="moveit_planning"))
+
+    assert _decode_launch_string(params["skill_catalog_source_mode"]) == "development"
+    source_root = Path(_decode_launch_string(params["skill_catalog_source_root"]))
+    assert source_root.is_absolute()
+    assert source_root == Path(__file__).parents[3] / "src" / "skill_catalog"
+    assert _decode_launch_string(params["skill_catalog_profile"]) == "so101_single_arm"
 
 
 def test_embodied_runtime_waits_for_required_controllers():

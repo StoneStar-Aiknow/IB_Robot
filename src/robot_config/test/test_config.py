@@ -14,6 +14,7 @@ from robot_config.config import (
     Ros2ControlConfig,
     SkillGatewayRuntimeConfig,
     VoiceASRConfig,
+    VoiceTTSConfig,
 )
 from robot_config.contract_utils import contract_fingerprint, iter_specs
 from robot_config.launch_builders.recording import get_recording_topics
@@ -27,6 +28,7 @@ from robot_config.loader import (
     load_robot_config,
     load_robot_config_dict,
     load_voice_asr_config,
+    load_voice_tts_config,
     validate_config,
 )
 from robot_config.timeout_policy import DEFAULT_EMBODIED_TIMEOUT_POLICY, resolve_embodied_timeout_policy
@@ -37,6 +39,7 @@ from voice_asr_service.model_manager import (
     infer_model_bundle_from_path_hint,
     resolve_model_assets,
 )
+from voice_tts_service.defaults import VOICE_TTS_DEFAULTS
 
 HUMBLE_FLOAT32_MAX = 3.402823466e38
 IEEE_FLOAT32_MAX = 3.4028234663852886e38
@@ -124,12 +127,12 @@ def _write_skill_capability_config(tmp_path, capability, *, global_control_mode=
     return config_path
 
 
-def test_default_skill_timeout_is_thirty_seconds():
-    assert EmbodiedConfig().skill_timeout_sec == 30.0
-    assert load_embodied_config({}).skill_timeout_sec == 30.0
+def test_default_skill_timeout_is_two_minutes():
+    assert EmbodiedConfig().skill_timeout_sec == 120.0
+    assert load_embodied_config({}).skill_timeout_sec == 120.0
 
 
-def test_loader_requires_gateway_control_mode_for_non_empty_skill_templates(tmp_path):
+def test_loader_rejects_removed_inline_skill_templates(tmp_path):
     config_path = tmp_path / "robot.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -155,7 +158,7 @@ def test_loader_requires_gateway_control_mode_for_non_empty_skill_templates(tmp_
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="skill_required_control_mode"):
+    with pytest.raises(ValueError, match="skill_templates is removed"):
         load_robot_config_dict(config_path)
 
 
@@ -289,7 +292,7 @@ def test_loader_validates_enabled_skill_capability_metadata(tmp_path, capability
     with pytest.raises(ValueError) as exc_info:
         load_robot_config_dict(config_path)
 
-    assert expected_error in str(exc_info.value)
+    assert "embodied.skill_templates is removed" in str(exc_info.value)
 
 
 def test_loader_allows_robot_without_embodied_skill_templates_to_omit_gateway_control_mode(tmp_path):
@@ -381,7 +384,7 @@ def test_loader_validates_capability_parameter_schema(tmp_path, parameters, expe
     with pytest.raises(ValueError) as exc_info:
         load_robot_config_dict(config_path)
 
-    assert expected_error in str(exc_info.value)
+    assert "embodied.skill_templates is removed" in str(exc_info.value)
 
 
 def test_loader_requires_capability_control_mode_to_match_gateway_mode(tmp_path):
@@ -393,10 +396,7 @@ def test_loader_requires_capability_control_mode_to_match_gateway_mode(tmp_path)
     with pytest.raises(ValueError) as exc_info:
         load_robot_config_dict(config_path)
 
-    assert str(exc_info.value).endswith(
-        "embodied.skill_templates.open_gripper.capability.required_control_mode "
-        "must match skill_required_control_mode 'moveit_planning'"
-    )
+    assert "embodied.skill_templates is removed" in str(exc_info.value)
 
 
 def test_skill_gateway_interfaces_are_registered_with_rosidl():
@@ -407,27 +407,26 @@ def test_skill_gateway_interfaces_are_registered_with_rosidl():
 
     assert message_path.is_file()
     assert service_path.is_file()
-    assert message_path.read_text(encoding="utf-8") == (
-        "string name\nbool ready\nstring reason\nstring required_control_mode\n"
-    )
-    assert service_path.read_text(encoding="utf-8") == (
-        "string task_id\n"
-        "string payload_hash\n"
-        "---\n"
-        "uint32 schema_version\n"
-        "string robot_name\n"
-        "bool motion_authorized\n"
-        "string active_control_mode\n"
-        "bool busy\n"
-        "string active_task_id\n"
-        "float32 default_skill_timeout_sec\n"
-        "float32 task_budget_sec\n"
-        "float32 rpc_timeout_sec\n"
-        "string config_digest\n"
-        "string request_state\n"
-        "string request_error_code\n"
-        "SkillCapabilityStatus[] capabilities\n"
-    )
+    message_contents = message_path.read_text(encoding="utf-8")
+    service_contents = service_path.read_text(encoding="utf-8")
+    for field in (
+        "uint32 schema_version",
+        "string name",
+        "string semantic_level",
+        "bool planner_visible",
+        "bool ready",
+    ):
+        assert field in message_contents
+    for field in (
+        "uint32 schema_version",
+        "string task_id",
+        "string capability_digest",
+        "string registry_epoch",
+        "string registry_digest",
+        "bool control_plane_ready",
+        "SkillCapabilityStatus[] capabilities",
+    ):
+        assert field in service_contents
 
     cmake_contents = cmake_path.read_text(encoding="utf-8")
     assert '"msg/SkillCapabilityStatus.msg"' in cmake_contents
@@ -519,16 +518,8 @@ def test_gateway_timeout_policy_boundary_matches_humble_response_setters(timeout
         resolve_embodied_timeout_policy({"timeouts": {timeout_name: HUMBLE_FLOAT32_OVERFLOW}})
 
 
-def test_robot_state_freshness_defaults_independently_from_legacy_scene_freshness():
-    policy = resolve_embodied_timeout_policy(
-        {
-            "planner": {
-                "scene_sources": {
-                    "max_scene_age_sec": 10.0,
-                }
-            }
-        }
-    )
+def test_robot_state_freshness_defaults_independently_from_perception_scene_freshness():
+    policy = resolve_embodied_timeout_policy({"perception": {"scene_sources": {"max_scene_age_sec": 10.0}}})
 
     assert policy["scene_freshness_sec"] == 10.0
     assert policy["robot_state_freshness_sec"] == 0.5
@@ -556,13 +547,20 @@ def test_load_single_arm_config():
     assert config.voice_asr.device_name == ""
     assert config.voice_asr.device_index == -1
     assert config.voice_asr.exit_on_init_failure is True
+    assert config.voice_tts.enabled is False
+    assert config.voice_tts.bundle_path == "models/voice_tts/zipvoice"
+    assert config.voice_tts.deployment == ""
+    assert config.voice_tts.service_name == "/voice_tts/synthesize"
+    assert config.voice_tts.load_service_name == "/voice_tts/load"
+    assert config.voice_tts.unload_service_name == "/voice_tts/unload"
+    assert config.voice_tts.load_on_startup is False
     assert config.skill_gateway.status_service == "/embodied/get_skill_gateway_status"
     assert config.skill_gateway.required_control_mode == "moveit_planning"
-    assert config.skill_gateway.default_skill_timeout_sec == 30.0
+    assert config.skill_gateway.default_skill_timeout_sec == 120.0
     assert config.skill_gateway.robot_state_freshness_sec == 0.5
     assert config.skill_gateway.task_budget_sec == 180.0
     assert config.skill_gateway.rpc_timeout_sec == 5.0
-    assert config.embodied.timeouts["default_skill_timeout_sec"] == 30.0
+    assert config.embodied.timeouts["default_skill_timeout_sec"] == 120.0
     assert config.embodied.timeouts["robot_state_freshness_sec"] == 0.5
 
     # Check cameras
@@ -1186,6 +1184,48 @@ def test_voice_asr_runtime_defaults_match_robot_config_defaults():
     assert config_defaults.exit_on_init_failure == VOICE_ASR_DEFAULTS["exit_on_init_failure"]
 
 
+def test_voice_tts_loader_and_runtime_defaults_match():
+    config = load_voice_tts_config(
+        {
+            "enabled": True,
+            "bundle_path": "models/voice_tts/custom",
+            "deployment": "torch_cpu",
+            "max_request_chars": 1000,
+        }
+    )
+    defaults = VoiceTTSConfig()
+
+    assert config.enabled is True
+    assert config.bundle_path == "models/voice_tts/custom"
+    assert config.deployment == "torch_cpu"
+    assert config.max_request_chars == 1000
+    assert defaults.bundle_path == VOICE_TTS_DEFAULTS["bundle_path"]
+    assert defaults.deployment == VOICE_TTS_DEFAULTS["deployment"]
+    assert defaults.service_name == VOICE_TTS_DEFAULTS["service_name"]
+    assert defaults.load_service_name == VOICE_TTS_DEFAULTS["load_service_name"]
+    assert defaults.unload_service_name == VOICE_TTS_DEFAULTS["unload_service_name"]
+    assert defaults.load_on_startup == VOICE_TTS_DEFAULTS["load_on_startup"]
+    assert defaults.prompt_profile == VOICE_TTS_DEFAULTS["prompt_profile"]
+    assert defaults.max_response_audio_bytes == VOICE_TTS_DEFAULTS["max_response_audio_bytes"]
+
+
+def test_validate_voice_tts_requires_explicit_deployment_and_valid_limits():
+    config = RobotConfig(
+        name="test_robot",
+        type="so101",
+        robot_type="so_101",
+        ros2_control=Ros2ControlConfig(hardware_plugin="so101_hardware/SO101SystemHardware", params={}),
+    )
+    config.voice_tts.enabled = True
+    config.voice_tts.deployment = ""
+    config.voice_tts.max_segments = 0
+
+    errors = validate_config(config)
+
+    assert "voice_tts.deployment is required when voice_tts.enabled is true" in errors
+    assert "voice_tts.max_segments must be positive" in errors
+
+
 def test_validate_embodied_ignores_disabled_named_target_poses():
     """Disabled target-grasp config must not be required for the basic embodied pipeline."""
     config = RobotConfig(
@@ -1261,8 +1301,7 @@ def test_validate_embodied_relative_motion_direction_mapping():
     assert any("missing directions: down" in error for error in errors)
 
 
-def test_validate_embodied_vlm_planner_mode():
-    """Embodied planner mode and allowed skills must be valid."""
+def test_validate_embodied_requires_hermes_entry_mode():
     config = RobotConfig(
         name="test_robot",
         type="so101",
@@ -1274,20 +1313,7 @@ def test_validate_embodied_vlm_planner_mode():
         contract=ContractExtensionConfig(observations=[], actions=[]),
         embodied=EmbodiedConfig(
             enabled=True,
-            planner={
-                "mode": "vlm_api",
-                "scene_sources": {"primary_camera_topic": "/camera/top/image_raw"},
-                "vlm_api": {
-                    "provider": "kimicode",
-                    "base_url": "https://api.kimi.com/coding/v1",
-                    "api_key_env": "KIMICODE_API_KEY",
-                    "model": "kimi-for-coding",
-                },
-                "planning_policy": {
-                    "allowed_skills": ["inspect_scene", "unknown_skill"],
-                    "min_confidence": 0.7,
-                },
-            },
+            entry_mode="hermes",
             skill_templates={
                 "inspect_scene": {
                     "primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}]
@@ -1310,7 +1336,7 @@ def test_validate_embodied_vlm_planner_mode():
     )
 
     errors = validate_config(config)
-    assert any("allowed_skills contains unsupported skill" in error for error in errors)
+    assert "embodied.skill_templates is removed; use embodied.skill_catalog_profile" in errors
 
 
 def test_validate_embodied_accepts_skill_declared_by_current_robot():
@@ -1351,12 +1377,6 @@ def test_validate_embodied_accepts_skill_declared_by_current_robot():
         embodied=EmbodiedConfig(
             enabled=True,
             default_place_name="home",
-            planner={
-                "mode": "rule",
-                "planning_policy": {
-                    "allowed_skills": ["inspect_scene", "custom_signal"],
-                },
-            },
             skill_templates={
                 "inspect_scene": {
                     "description": descriptions["inspect_scene"],
@@ -1387,18 +1407,14 @@ def test_validate_typed_config_requires_capability_mode_to_match_gateway_mode():
 
     errors = validate_config(config)
 
-    assert any(
-        "embodied.skill_templates.open_gripper.capability.required_control_mode "
-        "must match skill_required_control_mode 'teleop'" in error
-        for error in errors
-    )
+    assert "embodied.skill_templates is removed; use embodied.skill_catalog_profile" in errors
 
 
 @pytest.mark.parametrize("required_control_mode", ["", None, 1])
 def test_validate_typed_config_requires_gateway_mode_for_enabled_skills(required_control_mode):
     errors = validate_config(_typed_config_with_skill_gateway_mode(required_control_mode))
 
-    assert "skill_required_control_mode is required when embodied.skill_templates is non-empty" in errors
+    assert "embodied.skill_templates is removed; use embodied.skill_catalog_profile" in errors
 
 
 def test_validate_embodied_perception_conversation_history():
@@ -1464,20 +1480,6 @@ def test_validate_embodied_openai_compatible_allows_empty_api_key_env():
         contract=ContractExtensionConfig(observations=[], actions=[]),
         embodied=EmbodiedConfig(
             enabled=True,
-            planner={
-                "mode": "vlm_api",
-                "scene_sources": {"primary_camera_topic": "/camera/top/image_raw"},
-                "vlm_api": {
-                    "provider": "openai_compatible",
-                    "base_url": "http://localhost:8000/v1",
-                    "api_key_env": "",
-                    "model": "Qwen3.5-9B",
-                },
-                "planning_policy": {
-                    "allowed_skills": ["inspect_scene"],
-                    "min_confidence": 0.7,
-                },
-            },
             skill_templates={
                 "inspect_scene": {
                     "primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}]
@@ -1506,7 +1508,7 @@ def test_validate_embodied_openai_compatible_allows_empty_api_key_env():
     assert not any("api_key_env is required" in error for error in errors)
 
 
-def test_validate_embodied_planner_require_depth_needs_topic():
+def test_validate_embodied_does_not_validate_removed_planner_depth_policy():
     config = RobotConfig(
         name="test_robot",
         type="so101",
@@ -1518,23 +1520,6 @@ def test_validate_embodied_planner_require_depth_needs_topic():
         contract=ContractExtensionConfig(observations=[], actions=[]),
         embodied=EmbodiedConfig(
             enabled=True,
-            planner={
-                "mode": "vlm_api",
-                "scene_sources": {
-                    "primary_camera_topic": "/camera/top/image_raw",
-                    "require_depth": True,
-                },
-                "vlm_api": {
-                    "provider": "openai_compatible",
-                    "base_url": "http://localhost:8000/v1",
-                    "api_key_env": "",
-                    "model": "Qwen3.5-9B",
-                },
-                "planning_policy": {
-                    "allowed_skills": ["inspect_scene"],
-                    "min_confidence": 0.7,
-                },
-            },
             skill_templates={
                 "inspect_scene": {
                     "primitive_sequence": [{"primitive_name": "move_to_named_pose", "pose_name": "observe_table"}]
@@ -1560,7 +1545,7 @@ def test_validate_embodied_planner_require_depth_needs_topic():
     )
 
     errors = validate_config(config)
-    assert any("require_depth=true requires at least one aligned depth topic" in error for error in errors)
+    assert not any("require_depth=true requires at least one aligned depth topic" in error for error in errors)
 
 
 @pytest.mark.parametrize(
@@ -1641,4 +1626,4 @@ def test_validate_embodied_skill_template_requires_pose_source():
 
     errors = validate_config(config)
 
-    assert any("must define pose_name, target_pose_key, or enable place_name_from_request" in error for error in errors)
+    assert "embodied.skill_templates is removed; use embodied.skill_catalog_profile" in errors

@@ -122,6 +122,8 @@ class AclModel:
             )
             self.input_descriptors = self._describe("input")
             self.output_descriptors = self._describe("output")
+            self.input_descriptors = self._resolve_zero_sizes("input", self.bindings.inputs, self.input_descriptors)
+            self.output_descriptors = self._resolve_zero_sizes("output", self.bindings.outputs, self.output_descriptors)
             self._validate_bindings()
         except Exception:
             self.close()
@@ -362,6 +364,39 @@ class AclModel:
                         f"{descriptor.size} does not match manifest size {expected_size}",
                         code="runtime_size_mismatch",
                     )
+
+    def _resolve_zero_sizes(
+        self,
+        direction: str,
+        bindings: tuple[TensorBinding, ...],
+        descriptors: tuple[AclTensorDescriptor, ...],
+    ) -> tuple[AclTensorDescriptor, ...]:
+        """Use a fixed manifest ABI when ACL reports zero for symbolic outputs."""
+
+        indexed = _binding_by_index(bindings, direction)
+        resolved = []
+        for descriptor in descriptors:
+            if descriptor.size > 0:
+                resolved.append(descriptor)
+                continue
+            binding = indexed.get(descriptor.index)
+            if binding is None or any(dimension <= 0 for dimension in binding.shape):
+                raise BackendLoadError(
+                    f"Ascend role {self.role!r} {direction} {descriptor.index} reports zero buffer size; "
+                    "the manifest must declare a fully fixed shape",
+                    code="runtime_size_unresolved",
+                )
+            size = int(np.prod(binding.shape, dtype=np.int64)) * numpy_dtype(binding.dtype).itemsize
+            resolved.append(
+                AclTensorDescriptor(
+                    index=descriptor.index,
+                    name=descriptor.name,
+                    dtype=descriptor.dtype,
+                    shape=descriptor.shape,
+                    size=size,
+                )
+            )
+        return tuple(resolved)
 
     def _create_dataset(
         self,

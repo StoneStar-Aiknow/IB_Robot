@@ -12,6 +12,7 @@ from types import MappingProxyType
 from typing import Any
 
 from embodied_common import skill_request
+from embodied_common.primitive_contracts import PRIMITIVE_DESCRIPTORS
 
 MOTION_NOT_AUTHORIZED = "MOTION_NOT_AUTHORIZED"
 CONTROL_MODE_MISMATCH = "CONTROL_MODE_MISMATCH"
@@ -24,7 +25,7 @@ INVALID_ARGUMENT = "INVALID_ARGUMENT"
 SKILL_REJECTED = "SKILL_REJECTED"
 GATEWAY_FINALIZATION_FAILED = "GATEWAY_FINALIZATION_FAILED"
 
-_ROOT_OWNER_KINDS = {"skill_command", "external_primitive"}
+_ROOT_OWNER_KINDS = {"skill_command", "workflow", "external_primitive"}
 _CAPABILITY_ORDER = (
     "validate_skill",
     "task_executor",
@@ -117,18 +118,6 @@ class SkillRequirements:
     fresh_ee_pose: bool = False
 
 
-_PRIMITIVE_CAPABILITY_MAP: dict[str, SkillRequirements] = {
-    "move_to_named_pose": SkillRequirements(validate_skill=True, task_executor=True),
-    "open_gripper": SkillRequirements(validate_skill=True, task_executor=True),
-    "close_gripper": SkillRequirements(validate_skill=True, task_executor=True),
-    "move_relative_ee": SkillRequirements(validate_skill=True, task_executor=True, fresh_ee_pose=True),
-    "rotate_gripper_cw": SkillRequirements(validate_skill=True, task_executor=True, fresh_ee_pose=True),
-    "rotate_gripper_ccw": SkillRequirements(validate_skill=True, task_executor=True, fresh_ee_pose=True),
-    "move_to_joint_positions": SkillRequirements(validate_skill=True, arm_trajectory=True),
-    "move_through_joint_positions": SkillRequirements(validate_skill=True, arm_trajectory=True),
-}
-
-
 @dataclass(frozen=True)
 class ReadinessReason:
     """A stable, ordered explanation of a skill's capability readiness."""
@@ -190,6 +179,11 @@ class ExecutionOwner:
     def external_primitive(cls, task_id: str) -> ExecutionOwner:
         """Create the owner for a primitive requested outside a SkillCommand."""
         return cls(root_task_id=task_id, kind="external_primitive")
+
+    @classmethod
+    def workflow(cls, task_id: str) -> ExecutionOwner:
+        """Create the owner for one typed Workflow root."""
+        return cls(root_task_id=task_id, kind="workflow")
 
     @classmethod
     def internal_child(cls, root_owner: ExecutionOwner, name: str) -> ExecutionOwner:
@@ -387,6 +381,11 @@ class BoundedRequestLedger:
                 return LedgerQuery(state=record.state, error_code=DUPLICATE_TASK_ID)
             return LedgerQuery(state=record.state, error_code=TASK_ID_CONFLICT)
 
+    def get(self, task_id: str) -> LedgerRecord | None:
+        """Return the immutable record for internal replay bookkeeping."""
+        with self._lock:
+            return self._record_for(task_id)
+
     def _record_for(self, task_id: str) -> LedgerRecord | None:
         return self._active.get(task_id) or self._terminal.get(task_id)
 
@@ -433,11 +432,11 @@ def build_skill_requirements(expanded_skill_templates: Mapping[str, Any]) -> dic
             if not isinstance(step, Mapping):
                 raise ValueError(f"skill template '{skill_name}' contains a non-object step")
             primitive_name = str(step.get("primitive_name", "")).strip()
-            requirements_for_primitive = _PRIMITIVE_CAPABILITY_MAP.get(primitive_name)
-            if requirements_for_primitive is None:
+            descriptor = PRIMITIVE_DESCRIPTORS.get(primitive_name)
+            if descriptor is None:
                 raise ValueError(f"skill template '{skill_name}' uses unknown primitive '{primitive_name}'")
-            for field_name in ("validate_skill", "task_executor", "arm_trajectory", "fresh_ee_pose"):
-                if getattr(requirements_for_primitive, field_name):
+            for field_name in descriptor.required_runtime_capabilities:
+                if field_name in merged:
                     merged[field_name] = True
 
         requirements[str(skill_name)] = SkillRequirements(
@@ -505,6 +504,7 @@ class GatewayPolicy:
         skill_requirements: Mapping[str, SkillRequirements],
         *,
         parameter_schemas: Mapping[str, Mapping[str, Any]],
+        skill_timeout_caps: Mapping[str, float] | None = None,
         ledger: BoundedRequestLedger | None = None,
         lease: RootExecutionLease | None = None,
     ) -> None:
@@ -524,6 +524,7 @@ class GatewayPolicy:
         if not isinstance(parameter_schemas, Mapping):
             raise ValueError("parameter_schemas must be a mapping")
         self._parameter_schemas = dict(parameter_schemas)
+        self._skill_timeout_caps = self._validate_timeout_caps(skill_timeout_caps or {})
         self._ledger = ledger
         self._lease = lease
         self._transition_lock = RLock()
@@ -531,7 +532,46 @@ class GatewayPolicy:
 
     def prepare(self, request: GatewayRequest) -> PreparedRequest:
         """Resolve a request's canonical identity and effective timeout."""
-        return build_request_identity(request, default_timeout_sec=self._default_timeout_sec)
+        skill_name = str(request.skill_name).strip()
+        timeout_cap = self._skill_timeout_caps.get(skill_name, self._default_timeout_sec)
+        return build_request_identity(request, default_timeout_sec=timeout_cap)
+
+    def replace_catalog(
+        self,
+        timeout_policy: Mapping[str, Any],
+        skill_requirements: Mapping[str, SkillRequirements],
+        *,
+        parameter_schemas: Mapping[str, Mapping[str, Any]],
+        skill_timeout_caps: Mapping[str, float] | None = None,
+    ) -> None:
+        """Replace immutable admission indexes for the next root request.
+
+        Active admissions retain their prepared identity and lease.  The node
+        must keep their execution template separately until finalization.
+        """
+        default_timeout = _finite_positive(
+            timeout_policy.get("default_skill_timeout_sec"),
+            "timeout_policy.default_skill_timeout_sec",
+        )
+        task_budget = _finite_positive(timeout_policy.get("task_budget_sec"), "timeout_policy.task_budget_sec")
+        if default_timeout > task_budget:
+            raise ValueError("timeout_policy.default_skill_timeout_sec must be <= task_budget_sec")
+        if not isinstance(parameter_schemas, Mapping):
+            raise ValueError("parameter_schemas must be a mapping")
+        with self._transition_lock:
+            self._default_timeout_sec = default_timeout
+            self._task_budget_sec = task_budget
+            self._skill_requirements = dict(skill_requirements)
+            self._parameter_schemas = dict(parameter_schemas)
+            self._skill_timeout_caps = self._validate_timeout_caps(skill_timeout_caps or {})
+
+    def _validate_timeout_caps(self, values: Mapping[str, float]) -> dict[str, float]:
+        if not isinstance(values, Mapping):
+            raise ValueError("skill_timeout_caps must be a mapping")
+        caps = {str(name): _finite_positive(value, f"skill_timeout_caps.{name}") for name, value in values.items()}
+        if any(value > self._task_budget_sec for value in caps.values()):
+            raise ValueError("skill timeout cap must not exceed task_budget_sec")
+        return caps
 
     def evaluate(
         self,
@@ -581,7 +621,8 @@ class GatewayPolicy:
                 message="another root execution is active",
                 **decision_args,
             )
-        if prepared.effective_timeout_sec > self._task_budget_sec:
+        timeout_cap = self._skill_timeout_caps.get(str(prepared.payload["skill_name"]), self._task_budget_sec)
+        if prepared.effective_timeout_sec > timeout_cap or prepared.effective_timeout_sec > self._task_budget_sec:
             return GatewayDecision(admitted=False, error_code=TIMEOUT_EXCEEDS_POLICY, **decision_args)
         if not readiness.ready:
             return GatewayDecision(
@@ -691,18 +732,99 @@ class GatewayPolicy:
                 return None
             return lease.reuse(ExecutionOwner.internal_child(root_owner, child_name), token)
 
-    def admit_external_primitive(self, task_id: str, snapshot: RuntimeSnapshot) -> tuple[str, object | None]:
-        """Atomically admit an external primitive without adding it to the skill ledger."""
-        _ledger, lease = self._atomic_resources()
+    def admit_external_primitive(
+        self, task_id: str, payload_hash: str | RuntimeSnapshot, snapshot: RuntimeSnapshot | None = None
+    ) -> tuple[str, object | None]:
+        """Atomically ledger and lease an external primitive root."""
+        if snapshot is None:
+            snapshot = payload_hash
+            payload_hash = f"external:{task_id}"
+        if not isinstance(snapshot, RuntimeSnapshot):
+            raise TypeError("snapshot is required")
+        ledger, lease = self._atomic_resources()
         with self._transition_lock:
             if not snapshot.motion_authorized:
                 return MOTION_NOT_AUTHORIZED, None
             if snapshot.active_control_mode != snapshot.required_control_mode:
                 return CONTROL_MODE_MISMATCH, None
+            if lease.owner is not None:
+                return SKILL_BUSY, None
+            if snapshot.is_busy:
+                return SKILL_BUSY, None
+            duplicate = ledger.query(task_id, payload_hash)
+            if duplicate.error_code:
+                return duplicate.error_code, None
             token = lease.acquire(ExecutionOwner.external_primitive(task_id))
             if token is None:
                 return SKILL_BUSY, None
+            try:
+                ledger.begin(task_id, payload_hash)
+            except Exception:
+                lease.release(token)
+                raise
             return "", token
+
+    def terminal_external_primitive(
+        self, task_id: str, payload_hash: str, token: object, *, error_code: str, terminal_metadata=None
+    ) -> LedgerRecord:
+        """Record external terminal identity while deliberately retaining the lease."""
+        ledger, lease = self._atomic_resources()
+        with self._transition_lock:
+            if not lease.holds(token):
+                raise ValueError("external primitive lease is not active")
+            return ledger.terminal(
+                task_id,
+                payload_hash,
+                error_code=error_code,
+                terminal_metadata=terminal_metadata,
+            )
+
+    def admit_workflow(
+        self,
+        owner: ExecutionOwner,
+        snapshot: RuntimeSnapshot,
+        *,
+        timeout_sec: float,
+    ) -> tuple[str, object | None]:
+        """Atomically acquire the root lease for a prevalidated typed Workflow."""
+        _ledger, lease = self._atomic_resources()
+        with self._transition_lock:
+            if owner.kind != "workflow" or not owner.root_task_id:
+                return SKILL_REJECTED, None
+            if not snapshot.motion_authorized:
+                return MOTION_NOT_AUTHORIZED, None
+            if snapshot.active_control_mode != snapshot.required_control_mode:
+                return CONTROL_MODE_MISMATCH, None
+            if snapshot.is_busy and not _is_active_owner(owner, snapshot.active_task_id):
+                return SKILL_BUSY, None
+            if timeout_sec > self._task_budget_sec:
+                return TIMEOUT_EXCEEDS_POLICY, None
+            token = lease.acquire(owner)
+            if token is None:
+                return SKILL_BUSY, None
+            return "", token
+
+    def borrow_workflow_internal(
+        self,
+        root_owner: ExecutionOwner,
+        lease_token: object,
+        task_id: str,
+        child_name: str,
+    ) -> object | None:
+        """Issue a non-releasable borrow for one Workflow child dispatch."""
+        _ledger, lease = self._atomic_resources()
+        with self._transition_lock:
+            if root_owner.kind != "workflow" or lease.owner is not root_owner or not task_id:
+                return None
+            return lease.reuse(ExecutionOwner.internal_child(root_owner, child_name), lease_token)
+
+    def release_workflow(self, owner: ExecutionOwner, lease_token: object) -> bool:
+        """Release only the exact currently active Workflow root lease."""
+        _ledger, lease = self._atomic_resources()
+        with self._transition_lock:
+            if owner.kind != "workflow" or lease.owner is not owner:
+                return False
+            return lease.release(lease_token)
 
     def release_external_primitive(self, token: object) -> bool:
         """Release a successfully cleaned-up external primitive lease."""

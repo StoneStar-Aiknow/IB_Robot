@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import rclpy
 
+from embodied_common.dispatch_binding import copy_binding, new_binding
 from skill_library import skill_executor_node
 from skill_library.gateway_policy import (
     BoundedRequestLedger,
@@ -88,7 +89,7 @@ class _ParentGoalHandle:
     def __init__(self, events=None) -> None:
         self.events = events if events is not None else []
         self.feedback = []
-        self.request = SimpleNamespace(
+        self.request = _BoundRequest(
             task_id="task-1",
             skill_name="test_skill",
             target_name="",
@@ -125,7 +126,7 @@ class _ParentGoalHandle:
 
 class _PrimitiveGoalHandle:
     def __init__(self) -> None:
-        self.request = SimpleNamespace(
+        self.request = _BoundRequest(
             primitive_name="move_to_joint_positions",
             pose_name="",
             relative_dx=0.0,
@@ -179,6 +180,22 @@ class _ManualCancelParentGoalHandle(_ParentGoalHandle):
         return self.cancel_requested
 
 
+class _BoundRequest(SimpleNamespace):
+    """Test request with the typed binding and a legacy test-only alias."""
+
+    def __init__(self, *, task_id: str, **fields) -> None:
+        fields.setdefault("timeout_sec", 0.0)
+        super().__init__(dispatch_binding=new_binding(task_id=task_id), **fields)
+
+    @property
+    def task_id(self) -> str:
+        return self.dispatch_binding.task_id
+
+    @task_id.setter
+    def task_id(self, value: str) -> None:
+        self.dispatch_binding.task_id = str(value)
+
+
 def _make_skill_node(send_goal_future) -> SkillExecutorNode:
     node = object.__new__(SkillExecutorNode)
     node._skill_goal_lock = threading.Lock()
@@ -224,6 +241,94 @@ def test_best_effort_cancel_audits_propagation_once():
     node._best_effort_cancel_goal(goal_handle)
 
     assert events == ["audit", "cancel"]
+
+
+def test_delegated_primitive_requires_exact_active_nonce_binding():
+    node = object.__new__(SkillExecutorNode)
+    node._state_lock = RLock()
+    node._active_delegated_dispatches = {}
+    node._runtime_snapshot = lambda: RuntimeSnapshot(True, "cartesian", "cartesian")
+    node._ros_time_sec = lambda: 1.0
+    policy = GatewayPolicy(
+        {"default_skill_timeout_sec": 5.0, "task_budget_sec": 10.0},
+        {"skill": SkillRequirements()},
+        parameter_schemas={"skill": {"type": "object", "properties": {}, "required": []}},
+        ledger=BoundedRequestLedger(2),
+        lease=RootExecutionLease(),
+    )
+    node._gateway_policy = policy
+    owner = ExecutionOwner.skill_command("task-1")
+    admission = policy.admit(GatewayRequest("task-1", "skill"), node._runtime_snapshot(), owner)
+    binding = new_binding(task_id="task-1")
+    binding.task_budget.schema_version = 1
+    binding.task_budget.started_at.sec = 1
+    binding.task_budget.deadline.sec = 2_000_000_000
+    binding.dispatch_nonce = "delegated-nonce"
+    node._active_delegated_dispatches[binding.dispatch_nonce] = (admission, copy_binding(binding))
+    goal = SimpleNamespace(dispatch_binding=binding, primitive_name="move_to_named_pose", timeout_sec=0.0)
+
+    assert node._admit_primitive(goal, None) == ("", None, admission, True)
+    goal.dispatch_binding.root_task_id = "tampered"
+    assert node._admit_primitive(goal, None)[0] == "SKILL_BUSY"
+
+
+def test_pick_skill_sets_internal_execute_policy(monkeypatch):
+    sent_goals = []
+
+    class PickClient:
+        @staticmethod
+        def wait_for_server(**_kwargs):
+            return True
+
+        @staticmethod
+        def send_goal_async(goal, **_kwargs):
+            sent_goals.append(goal)
+            raise RuntimeError("stop after inspecting the delegated goal")
+
+    expected_executor = {
+        "name": "grasp_pipeline",
+        "contract_version": "1",
+        "endpoint_kind": "ros_action",
+        "endpoint_name": "/manipulation/execute_pick",
+        "configuration_digest": "a" * 64,
+        "model_deployment_name": "graspgen",
+        "model_fingerprint": "b" * 64,
+        "model_bundle_digest": "c" * 64,
+    }
+    executor = SimpleNamespace(**expected_executor)
+    node = object.__new__(SkillExecutorNode)
+    node._pick_client = PickClient()
+    node._rpc_timeout = 0.01
+    node._active_runtime_bundle = SimpleNamespace(
+        snapshot=SimpleNamespace(delegated_executors={"grasp_pipeline": executor})
+    )
+    node._active_skill_admission = object()
+    node._register_delegated_dispatch = lambda *_args: b"cleanup"
+    node._confirm_delegated_terminal = lambda *_args: None
+    node._abort_skill = lambda result, _handle, _phases, code, message: SimpleNamespace(
+        success=False, error_code=code, message=message
+    )
+    node.get_logger = lambda: SimpleNamespace(error=lambda _message: None)
+    goal_handle = SimpleNamespace(
+        request=_BoundRequest(
+            task_id="pick-1",
+            skill_name="pick_object",
+            target_name="banana",
+            place_name="",
+            motion_direction="",
+            motion_distance=0.0,
+            timeout_sec=10.0,
+        )
+    )
+
+    result = node._execute_pick_skill(goal_handle, {"timeout_sec": 10.0})
+
+    assert result.success is False
+    assert result.error_code == skill_executor_node.PRIMITIVE_CANCEL_CLEANUP_TIMEOUT
+    assert len(sent_goals) == 1
+    assert sent_goals[0].mode == skill_executor_node.PickObject.Goal.MODE_EXECUTE
+    assert sent_goals[0].release_after_success is False
+    assert sent_goals[0].release_drop_height_m == pytest.approx(-1.0)
 
 
 def test_fresh_ee_pose_snapshot_is_independent_and_rejects_stale_pose(monkeypatch):
@@ -468,6 +573,7 @@ def _make_retained_gateway_node(send_goal_future) -> tuple[SkillExecutorNode, Ga
         active_control_mode="gateway_mode",
         required_control_mode="gateway_mode",
     )
+    node._ros_time_sec = lambda: 1.0
     node._audit = lambda *_args, **_kwargs: None
     node.get_logger = lambda: SimpleNamespace(error=lambda _message: None)
     node._active_skill_admission = None
@@ -520,14 +626,16 @@ class _ExternalPolicyStub:
 
 
 class _PrimitiveActionGoalHandle:
-    def __init__(self, goal_id, task_id: str = "task-1", execution_token: str = "") -> None:
+    def __init__(self, goal_id, task_id: str = "task-1", binding=None, execution_token: str = "") -> None:
         self.goal_id = goal_id
-        self.request = SimpleNamespace(
+        self.request = _BoundRequest(
             task_id=task_id,
             execution_token=execution_token,
             primitive_name="open_gripper",
             pose_name="",
         )
+        if binding is not None:
+            self.request.dispatch_binding = copy_binding(binding)
         self.abort_count = 0
         self.canceled_count = 0
         self.succeeded_count = 0
@@ -739,7 +847,7 @@ def test_revoked_internal_uuid_cannot_borrow_after_send_future_exception(monkeyp
     result = node._execute_skill(_NoCancelParentGoalHandle())
     late_goal_handle = SimpleNamespace(
         goal_id=sent_goals["goal_id"],
-        request=SimpleNamespace(
+        request=_BoundRequest(
             task_id="task-1",
             primitive_name="open_gripper",
             pose_name="",
@@ -924,25 +1032,41 @@ def _admit_internal_primitive(node, policy):
     node._active_skill_owner = owner
     node._active_audit_context = {"task_id": "task-1"}
     goal_id = skill_executor_node.UUID(uuid=[1] * 16)
-    goal_key = node._register_internal_primitive_goal(goal_id, admission, "task-1")
-    return admission, goal_id, goal_key
+    binding = new_binding(task_id="task-1")
+    binding.expected_registry_epoch = "epoch-1"
+    binding.expected_registry_generation = 1
+    binding.expected_registry_digest = "digest-1"
+    binding.task_budget.schema_version = 1
+    binding.task_budget.started_at.sec = 1
+    binding.task_budget.deadline.sec = 2_000_000_000
+    binding.dispatch_nonce = "nonce-1"
+    goal_key = node._register_internal_primitive_goal(goal_id, admission, binding)
+    return admission, goal_id, goal_key, binding
 
 
 def test_clean_internal_primitive_terminal_converges_later_retained_root():
     node, policy, lease = _make_retained_gateway_node(_Future(done=False))
-    admission, goal_id, goal_key = _admit_internal_primitive(node, policy)
+    admission, goal_id, goal_key, binding = _admit_internal_primitive(node, policy)
     node._execute_primitive_unchecked = lambda goal_handle: (
-        goal_handle.succeed() or SimpleNamespace(success=True, error_code="", message="")
+        goal_handle.succeed()
+        or SimpleNamespace(
+            success=True,
+            error_code="",
+            message="",
+            actual_registry_epoch="epoch-1",
+            actual_registry_generation=1,
+            actual_registry_digest="digest-1",
+        )
     )
-    child_goal_handle = _PrimitiveActionGoalHandle(goal_id)
+    child_goal_handle = _PrimitiveActionGoalHandle(goal_id, binding=binding)
 
     result = node._execute_primitive(child_goal_handle)
 
     assert result.success is True
     assert child_goal_handle.succeeded_count == 1
     cleanup = node._retained_admission_cleanup[id(admission)]
-    assert getattr(cleanup, "pending_goal_key", None) == goal_key
-    assert getattr(cleanup, "confirmed_goal_key", None) == goal_key
+    assert cleanup.pending_goal_keys == {goal_key}
+    assert cleanup.confirmed_goal_keys == {goal_key}
     assert node._pending_internal_primitive_goals == {}
     assert node._active_internal_primitive_goals == {}
     assert lease.owner == ExecutionOwner.skill_command("task-1")
@@ -957,186 +1081,76 @@ def test_clean_internal_primitive_terminal_converges_later_retained_root():
     assert goal_key not in node._pending_internal_primitive_goals
 
 
-def test_pick_handoff_token_borrows_root_lease_for_pipeline_primitive():
-    node, policy, lease = _make_retained_gateway_node(_Future(done=False))
-    owner = ExecutionOwner.skill_command("task-1")
-    admission = policy.admit(
-        GatewayRequest(task_id="task-1", skill_name="test_skill"),
-        node._runtime_snapshot(),
-        owner,
-    )
-    assert admission.admitted
-    node._active_skill_admission = admission
-    node._active_skill_owner = owner
-    pick_goal_id = skill_executor_node.UUID(uuid=[3] * 16)
-    execution_token, _cleanup_key = node._register_internal_pick_handoff(pick_goal_id, admission, "task-1")
-    downstream_calls = []
-    node._execute_primitive_unchecked = lambda goal_handle: (
-        downstream_calls.append(True)
-        or goal_handle.succeed()
-        or SimpleNamespace(success=True, error_code="", message="")
-    )
-    primitive_goal_handle = _PrimitiveActionGoalHandle(
-        skill_executor_node.UUID(uuid=[4] * 16),
-        execution_token=execution_token,
-    )
-
-    result = node._execute_primitive(primitive_goal_handle)
-
-    assert result.success is True
-    assert downstream_calls == [True]
-    assert primitive_goal_handle.succeeded_count == 1
-    assert lease.owner is owner
-    assert execution_token in node._internal_pick_handoffs
-
-
-def test_unknown_pick_handoff_token_cannot_bypass_busy_root_lease():
-    node, policy, lease = _make_retained_gateway_node(_Future(done=False))
-    owner = ExecutionOwner.skill_command("task-1")
-    admission = policy.admit(
-        GatewayRequest(task_id="task-1", skill_name="test_skill"),
-        node._runtime_snapshot(),
-        owner,
-    )
-    assert admission.admitted
-    node._active_skill_admission = admission
-    node._active_skill_owner = owner
-    downstream_calls = []
-    node._execute_primitive_unchecked = lambda _goal_handle: downstream_calls.append(True)
-    primitive_goal_handle = _PrimitiveActionGoalHandle(
-        skill_executor_node.UUID(uuid=[5] * 16),
-        execution_token="unregistered",
-    )
-
-    result = node._execute_primitive(primitive_goal_handle)
-
-    assert result.error_code == "SKILL_BUSY"
-    assert downstream_calls == []
-    assert primitive_goal_handle.abort_count == 1
-    assert lease.owner is owner
-
-
-def test_pick_skill_registers_goal_uuid_handoff_until_pick_terminal():
-    node, policy, lease = _make_retained_gateway_node(_Future(done=False))
-    owner = ExecutionOwner.skill_command("task-1")
-    admission = policy.admit(
-        GatewayRequest(task_id="task-1", skill_name="test_skill"),
-        node._runtime_snapshot(),
-        owner,
-    )
-    assert admission.admitted
-    node._active_skill_admission = admission
-    node._active_skill_owner = owner
-    node._pick_action_name = "/manipulation/execute_pick"
-    pick_result_future = _Future(
-        done=True,
-        result=SimpleNamespace(result=SimpleNamespace(success=True, error_code="", message="picked")),
-    )
-    pick_handle = SimpleNamespace(accepted=True, get_result_async=lambda: pick_result_future)
-    observed = {}
-
-    class _PickClient:
-        @staticmethod
-        def wait_for_server(**_kwargs):
-            return True
-
-        @staticmethod
-        def send_goal_async(goal, **kwargs):
-            observed["task_id"] = goal.task_id
-            observed["goal_uuid"] = kwargs["goal_uuid"]
-            observed["registered_tokens"] = set(node._internal_pick_handoffs)
-            return _Future(done=True, result=pick_handle)
-
-    node._pick_client = _PickClient()
-    parent_goal_handle = _NoCancelParentGoalHandle()
-    parent_goal_handle.request.target_name = "marker"
-    parent_goal_handle.request.timeout_sec = 1.0
-
-    result = node._execute_pick_skill(
-        parent_goal_handle,
-        {},
-        canonical_task_id="task-1",
-    )
-
-    execution_token = bytes(observed["goal_uuid"].uuid).hex()
-    assert result.success is True
-    assert observed["task_id"] == "task-1"
-    assert observed["registered_tokens"] == {execution_token}
-    assert node._internal_pick_handoffs == {}
-    assert parent_goal_handle.succeeded_count == 1
-    assert lease.owner is owner
-
-
-def test_late_pick_terminal_converges_retained_root_admission():
-    node, policy, lease = _make_retained_gateway_node(_Future(done=False))
-    owner = ExecutionOwner.skill_command("task-1")
-    admission = policy.admit(
-        GatewayRequest(task_id="task-1", skill_name="test_skill"),
-        node._runtime_snapshot(),
-        owner,
-    )
-    assert admission.admitted
-    node._active_skill_admission = admission
-    node._active_skill_owner = owner
-    execution_token, cleanup_key = node._register_internal_pick_handoff(
-        skill_executor_node.UUID(uuid=[6] * 16),
-        admission,
-        "task-1",
-    )
-
-    node._retain_admission_cleanup(admission, {"task_id": "task-1"}, 0.2, 2)
-
-    assert lease.owner is owner
-    assert policy._ledger.query("task-1").state == "active"
-
-    node._confirm_internal_pick_cleanup(admission, execution_token, cleanup_key)
-
-    assert lease.owner is None
-    assert policy._ledger.query("task-1").state == "terminal"
-    assert node._internal_pick_handoffs == {}
-    assert node._retained_admission_cleanup == {}
-
-
 def test_cleanup_unknown_internal_primitive_does_not_confirm_retained_root():
     node, policy, lease = _make_retained_gateway_node(_Future(done=False))
-    admission, goal_id, _goal_key = _admit_internal_primitive(node, policy)
+    admission, goal_id, _goal_key, binding = _admit_internal_primitive(node, policy)
     node._execute_primitive_unchecked = lambda goal_handle: (
         goal_handle.abort()
-        or SimpleNamespace(success=False, error_code="CANCEL_CLEANUP_TIMEOUT", message="cleanup unknown")
+        or SimpleNamespace(
+            success=False,
+            error_code="CANCEL_CLEANUP_TIMEOUT",
+            message="cleanup unknown",
+            actual_registry_epoch="epoch-1",
+            actual_registry_generation=1,
+            actual_registry_digest="digest-1",
+        )
     )
 
-    result = node._execute_primitive(_PrimitiveActionGoalHandle(goal_id))
+    result = node._execute_primitive(_PrimitiveActionGoalHandle(goal_id, binding=binding))
 
     assert result.error_code == "CANCEL_CLEANUP_TIMEOUT"
     cleanup = node._retained_admission_cleanup[id(admission)]
-    assert cleanup.pending_goal_key is not None
-    assert cleanup.confirmed_goal_key is None
+    assert cleanup.pending_goal_keys
+    assert cleanup.confirmed_goal_keys == set()
 
     node._retain_admission_cleanup(admission, {"task_id": "task-1"}, 0.1, 1)
 
     assert policy._ledger.query("task-1").state == "active"
     assert lease.owner == ExecutionOwner.skill_command("task-1")
-    assert node._retained_admission_cleanup[id(admission)].confirmed_goal_key is None
+    assert node._retained_admission_cleanup[id(admission)].confirmed_goal_keys == set()
 
 
 def test_only_current_internal_goal_cleanup_can_converge_retained_root():
     node, policy, lease = _make_retained_gateway_node(_Future(done=False))
-    admission, first_goal_id, first_goal_key = _admit_internal_primitive(node, policy)
+    admission, first_goal_id, first_goal_key, first_binding = _admit_internal_primitive(node, policy)
     node._execute_primitive_unchecked = lambda goal_handle: (
-        goal_handle.succeed() or SimpleNamespace(success=True, error_code="", message="")
+        goal_handle.succeed()
+        or SimpleNamespace(
+            success=True,
+            error_code="",
+            message="",
+            actual_registry_epoch="epoch-1",
+            actual_registry_generation=1,
+            actual_registry_digest="digest-1",
+        )
     )
 
-    first_result = node._execute_primitive(_PrimitiveActionGoalHandle(first_goal_id))
+    first_result = node._execute_primitive(_PrimitiveActionGoalHandle(first_goal_id, binding=first_binding))
 
     assert first_result.success is True
     second_goal_id = skill_executor_node.UUID(uuid=[2] * 16)
-    second_goal_key = node._register_internal_primitive_goal(second_goal_id, admission, "task-1")
+    second_binding = new_binding(task_id="task-1")
+    second_binding.expected_registry_epoch = "epoch-1"
+    second_binding.expected_registry_generation = 1
+    second_binding.expected_registry_digest = "digest-1"
+    second_binding.task_budget.schema_version = 1
+    second_binding.task_budget.started_at.sec = 1
+    second_binding.task_budget.deadline.sec = 2_000_000_000
+    second_binding.dispatch_nonce = "nonce-2"
+    second_goal_key = node._register_internal_primitive_goal(second_goal_id, admission, second_binding)
     node._execute_primitive_unchecked = lambda goal_handle: (
         goal_handle.abort()
-        or SimpleNamespace(success=False, error_code="CANCEL_CLEANUP_TIMEOUT", message="cleanup unknown")
+        or SimpleNamespace(
+            success=False,
+            error_code="CANCEL_CLEANUP_TIMEOUT",
+            message="cleanup unknown",
+            actual_registry_epoch="epoch-1",
+            actual_registry_generation=1,
+            actual_registry_digest="digest-1",
+        )
     )
 
-    second_result = node._execute_primitive(_PrimitiveActionGoalHandle(second_goal_id))
+    second_result = node._execute_primitive(_PrimitiveActionGoalHandle(second_goal_id, binding=second_binding))
     node._retain_admission_cleanup(admission, {"task_id": "task-1"}, 0.1, 2)
 
     assert second_result.error_code == "CANCEL_CLEANUP_TIMEOUT"

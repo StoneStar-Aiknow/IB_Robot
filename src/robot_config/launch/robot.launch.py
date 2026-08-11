@@ -6,6 +6,7 @@ This launch file loads robot configuration from YAML and dynamically generates:
 - Camera drivers (usb_cam, realsense2_camera)
 - Static TF publishers for camera frames
 - Voice ASR node (optional, configured from robot.voice_asr)
+- Voice TTS service (optional, configured from robot.voice_tts)
 - Inference service and action dispatcher (optional, auto-detected)
 - MoveIt motion planning (optional, auto-detected)
 
@@ -644,7 +645,20 @@ def launch_setup(context, *args, **kwargs):
             logger.error(f"generating voice ASR nodes: {e}")
             raise
 
-    # ========== 9. Generate Navigation Nodes ==========
+    # ========== 9. Generate Voice TTS Nodes ==========
+    logger.info("========== Checking Voice TTS ==========")
+    try:
+        from robot_config.launch_builders.voice_tts import generate_voice_tts_nodes
+
+        voice_tts_nodes = generate_voice_tts_nodes(robot_config)
+        actions.extend(voice_tts_nodes)
+        if voice_tts_nodes:
+            logger.info(f"Added {len(voice_tts_nodes)} voice TTS node(s)")
+    except Exception as e:
+        logger.error(f"generating voice TTS nodes: {e}")
+        raise
+
+    # ========== 10. Generate Navigation Nodes ==========
     logger.info("========== Checking Navigation ==========")
     if mock_mode_skips_subsystem(mock_backend_active, "navigation"):
         logger.info("hardware_mock active: skipping navigation nodes (out of mock scope)")

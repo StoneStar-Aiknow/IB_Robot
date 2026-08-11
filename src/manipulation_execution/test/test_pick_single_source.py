@@ -1,19 +1,20 @@
-import ast
 from pathlib import Path
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
 
-def test_supervised_script_is_only_a_canonical_action_client_wrapper():
+def test_legacy_supervised_script_does_not_exist():
     script_path = _REPOSITORY_ROOT / "scripts" / "test_banana_handeye_pick.py"
-    source = script_path.read_text(encoding="utf-8")
-    module = ast.parse(source)
 
-    imports = [node for node in module.body if isinstance(node, ast.ImportFrom)]
-    assert len(imports) == 1
-    assert imports[0].module == "manipulation_execution.pick_action_client"
-    assert [alias.name for alias in imports[0].names] == ["main"]
-    assert len(source.splitlines()) <= 10
+    assert not script_path.exists()
+
+
+def test_direct_pick_action_client_does_not_exist():
+    package_dir = _REPOSITORY_ROOT / "src" / "manipulation_execution"
+
+    assert not (package_dir / "manipulation_execution" / "pick_action_client.py").exists()
+    setup_source = (package_dir / "setup.py").read_text(encoding="utf-8")
+    assert "pick_action_client" not in setup_source
 
 
 def test_legacy_supervised_executor_does_not_exist():

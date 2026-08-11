@@ -1,0 +1,15 @@
+# Complete text to synthesize. The service applies configured segmentation.
+string text
+
+# Optional request-scoped voice clone prompt. Both fields must be provided together.
+uint8[] prompt_audio
+string prompt_audio_format
+string prompt_text
+---
+bool success
+string error_code
+string message
+SynthesizedAudio[] audio_segments
+float32 total_duration_sec
+float32 total_inference_time_ms
+ModelRuntimeInfo model
