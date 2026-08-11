@@ -12,7 +12,7 @@ from cv_bridge import CvBridge
 
 from ibrobot_msgs.msg import Detection2D, DetectionArray
 from inference_manifest import CompiledDeployment, TorchDeployment
-from inference_service.backends import RuntimeContext
+from inference_service.backends import BACKEND_REGISTRY, BackendRegistry, RuntimeContext
 from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
 from inference_service.model_sessions import AscendOmModelSession, ModelSession, TorchModelSession
@@ -129,6 +129,7 @@ class _SessionPlugin(ModelServicePlugin):
     family = ""
     adapter_class = None
     _session_factory: Callable = staticmethod(_new_session)
+    _registry: BackendRegistry = BACKEND_REGISTRY
 
     def __init__(self, host, validated, options) -> None:
         model = validated.manifest.model
@@ -147,11 +148,16 @@ class _SessionPlugin(ModelServicePlugin):
         self.adapter.validate_identity(model.semantic_identity)
         self._closed = False
         self._requests = itertools.count(1)
+        context = RuntimeContext(validated_manifest=validated, runtime_options=options)
+        self._registry.validate(
+            context,
+            allowed_deployments=self.adapter.identity.supported_deployments,
+        )
         self.session = self._session_factory(self.family, self.adapter, validated, options)
         if not isinstance(self.session, ModelSession):
             raise TypeError("perception plugins require a ModelSession")
         try:
-            self.session.load(RuntimeContext(validated_manifest=validated, runtime_options=options))
+            self.session.load(context)
         except Exception:
             self.session.close()
             self._closed = True

@@ -100,6 +100,9 @@ class PureInferenceEngine:
         runtime_options: Mapping[str, object] | None = None,
         priority_scheduling: bool = False,
         registry: BackendRegistry = BACKEND_REGISTRY,
+        model_session_factory=None,
+        pi05_diagnostic_schedule=None,
+        pi05_diagnostic_schedule_source: str | None = None,
     ) -> None:
         validated_manifest = load_inference_manifest(model_path, deployment)
         self._pipeline_id = pipeline_id
@@ -113,6 +116,9 @@ class PureInferenceEngine:
             runtime_options=runtime_options,
             priority_scheduling=priority_scheduling,
             registry=registry,
+            model_session_factory=model_session_factory,
+            pi05_diagnostic_schedule=pi05_diagnostic_schedule,
+            pi05_diagnostic_schedule_source=pi05_diagnostic_schedule_source,
         )
 
     def __call__(

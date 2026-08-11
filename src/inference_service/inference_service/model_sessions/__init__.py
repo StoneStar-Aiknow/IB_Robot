@@ -1,7 +1,16 @@
 """Model-neutral execution sessions for validated inference deployments."""
 
 from inference_service.model_sessions.ascend import AscendOmModelSession
-from inference_service.model_sessions.base import ModelSession
+from inference_service.model_sessions.base import ModelSession, ModelSessionExecution
+from inference_service.model_sessions.hmm import HMMModelSession
+from inference_service.model_sessions.rknn import RKNNModelSession
 from inference_service.model_sessions.torch import TorchModelSession
 
-__all__ = ["AscendOmModelSession", "ModelSession", "TorchModelSession"]
+__all__ = [
+    "AscendOmModelSession",
+    "HMMModelSession",
+    "ModelSession",
+    "ModelSessionExecution",
+    "RKNNModelSession",
+    "TorchModelSession",
+]

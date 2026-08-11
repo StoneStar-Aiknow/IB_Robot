@@ -95,7 +95,7 @@ def dump_pi05_om(
     capture = DiagnosticCapture(output_dir)
     registry_module = None
     if engine_factory is None:
-        from inference_service.backends import BackendDescriptor, BackendRegistry
+        from inference_service.backends import BackendDescriptor, BackendRegistry, ConformanceEvidence
         from inference_service.backends.ascend import AscendBackend
         from inference_service.core import PureInferenceEngine
 
@@ -113,6 +113,7 @@ def dump_pi05_om(
                     name="ascend",
                     factory=f"{registry_module.__name__}:create_backend",
                     supported_policy_families=frozenset({"pi05"}),
+                    conformance_evidence=frozenset({ConformanceEvidence("policy", "pi05")}),
                     target_validator=lambda deployment: None,
                 )
             }

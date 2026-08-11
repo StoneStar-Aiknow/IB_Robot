@@ -1,21 +1,29 @@
-"""Composable named inference pipeline with strict lifecycle and diagnostics."""
+"""Policy compatibility facade over the unified GenericModelPipeline runtime.
+
+``InferencePipeline`` preserves the existing policy request/result contract and
+stateful error semantics while delegating lifecycle, admission, deadline, and
+execution to :class:`GenericModelPipeline`.  All control-plane state lives in
+``PipelineRuntimeCore``; this module only owns policy-specific preprocessing,
+codec binding, action validation, and structured error mapping.
+"""
 
 from __future__ import annotations
 
 import copy
+import json
 import math
-import threading
 import time
 from collections.abc import Callable, Mapping
-from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from itertools import pairwise
+from pathlib import Path
 from types import MappingProxyType
+
+import numpy as np
 
 from inference_manifest import CompiledDeployment
 from inference_service.backends import (
     BackendAdmissionError,
-    BackendCancellationError,
-    BackendCapabilities,
     BackendHealth,
     BackendResult,
     BackendState,
@@ -24,14 +32,24 @@ from inference_service.backends import (
     RuntimeContext,
 )
 from inference_service.codecs import CodecRequest, CodecResult, ExecutionPlan, PolicyCodec, build_execution_plan
+from inference_service.generic_runtime import NamedTensorRequest
+from inference_service.pi05_schedule import PI05DenoisingSchedule
 from inference_service.pipeline.errors import (
+    PipelineCanceledError,
     PipelineConfigurationError,
     PipelineLifecycleError,
     PipelineNotReadyError,
     PipelineTimeoutError,
     PipelineValidationError,
 )
-from inference_service.pipeline.state import PipelineState, PipelineStateMachine
+from inference_service.pipeline.runtime_core import (
+    ExecutionControl,
+    ExecutionError,
+    GenericModelPipeline,
+    ModelExecutor,
+    StageFrame,
+)
+from inference_service.pipeline.stages import InferenceStage
 from inference_service.pipeline.types import PipelineDiagnostics, PipelineResult
 from inference_service.pipeline.validation import validate_action_output
 
@@ -47,33 +65,571 @@ def _identity_postprocessor(action: object) -> object:
     return action
 
 
-def _annotate_execution_certainty(
-    error: Exception,
-    *,
-    operation_started: bool,
-    outcome_known: bool = True,
-) -> None:
-    """Attach the pipeline boundary evidence consumed by scheduled transport."""
+def _snapshot_action(action: object) -> object:
+    detached = getattr(action, "detach", None)
+    candidate = detached() if callable(detached) else action
+    clone = getattr(candidate, "clone", None)
+    if callable(clone):
+        return clone()
+    return copy.deepcopy(candidate)
 
-    error.operation_started = bool(getattr(error, "operation_started", operation_started))
-    error.outcome_known = bool(getattr(error, "outcome_known", outcome_known))
+
+def _chunk_size_from_action(action: np.ndarray) -> int:
+    if action.ndim < 2 or action.shape[-2] < 1:
+        raise PipelineValidationError(
+            f"PI0.5 session action output has invalid shape {action.shape}",
+            pipeline_id="pi05",
+            code="invalid_action_shape",
+        )
+    return int(action.shape[-2])
+
+
+class _PolicyRequest:
+    """Carry policy execution parameters through the unified pipeline boundary."""
+
+    __slots__ = ("_request", "control_inputs", "capture_raw_action")
+
+    def __init__(
+        self,
+        request: InferenceRequest,
+        *,
+        control_inputs: Mapping[str, object] | None,
+        capture_raw_action: bool,
+    ) -> None:
+        self._request = request
+        self.control_inputs = control_inputs
+        self.capture_raw_action = capture_raw_action
+
+    @property
+    def request_id(self) -> str:
+        return self._request.request_id
+
+    @property
+    def inner(self) -> InferenceRequest:
+        return self._request
+
+
+class _PolicyPreprocessStage:
+    """Policy preprocess: prompt selection, processor, control-input merge, deadline gate."""
+
+    def __init__(self, facade: InferencePipeline) -> None:
+        self._facade = facade
+
+    def execute(self, frame: StageFrame, *, deadline: datetime | None) -> None:
+        policy_request = frame.request
+        request = policy_request.inner
+        selected_prompt = request.prompt if request.prompt is not None else self._facade._default_task
+        processor_inputs = dict(request.inputs)
+        if selected_prompt is not None:
+            processor_inputs["task"] = selected_prompt
+
+        frame.control.raise_if_canceled("preprocess")
+
+        preprocess_start = time.perf_counter()
+        canonical_inputs = self._facade._preprocessor(processor_inputs)
+        preprocess_latency_ms = (time.perf_counter() - preprocess_start) * 1000.0
+        if not isinstance(canonical_inputs, Mapping):
+            raise PipelineValidationError(
+                f"pipeline {self._facade.pipeline_id!r} preprocessor must return a mapping",
+                pipeline_id=self._facade.pipeline_id,
+                details={"returned_type": type(canonical_inputs).__name__},
+            )
+        canonical_inputs = dict(canonical_inputs)
+        control_inputs = policy_request.control_inputs
+        if control_inputs:
+            collisions = sorted(set(canonical_inputs) & set(control_inputs))
+            if collisions:
+                raise PipelineValidationError(
+                    f"pipeline {self._facade.pipeline_id!r} control inputs conflict with preprocessor "
+                    f"outputs: {collisions}",
+                    pipeline_id=self._facade.pipeline_id,
+                    details={"conflicting_inputs": tuple(collisions)},
+                )
+            canonical_inputs.update(control_inputs)
+        self._facade._raise_if_expired(deadline, phase="preprocess", backend_completed=False)
+
+        frame.values["_canonical_inputs"] = canonical_inputs
+        frame.values["_selected_prompt"] = selected_prompt
+        frame.values["_preprocess_latency_ms"] = preprocess_latency_ms
+
+
+class _PolicyBackendStage:
+    """Backend delegated model stage: codec-bound backend invocation and readiness gate."""
+
+    def __init__(self, facade: InferencePipeline) -> None:
+        self._facade = facade
+
+    def execute(self, frame: StageFrame, *, deadline: datetime | None) -> None:
+        frame.control.raise_if_canceled("backend")
+        request = frame.request.inner
+        backend_inputs = self._facade._prepare_backend_inputs(frame.values["_canonical_inputs"])
+        backend_request = InferenceRequest(
+            request_id=request.request_id,
+            inputs=backend_inputs,
+            prompt=frame.values["_selected_prompt"],
+            deadline=deadline,
+            priority=request.priority,
+            metadata={
+                **request.metadata,
+                "pipeline_id": self._facade.pipeline_id,
+                "deployment": self._facade._context.deployment_name,
+                "deployment_fingerprint": self._facade._context.deployment_fingerprint,
+            },
+        )
+        try:
+            frame.values["_backend_started"] = True
+            backend_result = self._facade._backend.infer(backend_request)
+        except BackendAdmissionError as exc:
+            if exc.code != "deadline_exceeded":
+                raise
+            raise self._facade._timeout_error("backend_admission", backend_completed=False) from exc
+        if not isinstance(backend_result, BackendResult):
+            raise PipelineValidationError(
+                f"pipeline {self._facade.pipeline_id!r} backend returned {type(backend_result).__name__}, "
+                "expected BackendResult",
+                pipeline_id=self._facade.pipeline_id,
+            )
+        self._facade._raise_if_expired(deadline, phase="backend", backend_completed=True)
+        self._facade._ensure_backend_ready_after_call()
+
+        frame.values["_backend_result"] = backend_result
+
+
+class _RawActionResultAdapter:
+    """Expose the iterative final action semantic as the executor result."""
+
+    def __init__(self, action_semantic: str = "action") -> None:
+        self._action_semantic = action_semantic
+
+    def adapt(self, frame: StageFrame) -> object:
+        return frame.values[self._action_semantic]
+
+    def adapt_error(self, error: ExecutionError) -> object:
+        if error.cause is not None:
+            raise error.cause
+        raise RuntimeError(error.message)
+
+
+class _PI05SessionStage:
+    """Session-driven iterative PI0.5 execution replacing the legacy backend stage.
+
+    Binds canonical policy inputs to manifest role semantics, drives the shared
+    ``IterativeStage`` over an :class:`AscendOmModelSession`, and publishes a
+    ``BackendResult`` for the shared decode/postprocess stages.
+    """
+
+    def __init__(
+        self,
+        facade: InferencePipeline,
+        session_executor,
+        action_semantic: str,
+        denoising_schedule_metadata: Mapping[str, object] | None,
+    ) -> None:
+        self._facade = facade
+        self._session_executor = session_executor
+        self._action_semantic = action_semantic
+        self._denoising_schedule_metadata = denoising_schedule_metadata
+
+    def execute(self, frame: StageFrame, *, deadline: datetime | None) -> None:
+        frame.control.raise_if_canceled("pi05.session")
+        canonical_inputs = frame.values["_canonical_inputs"]
+        role_inputs = self._facade._encode_role_inputs(canonical_inputs)
+        semantic_values: dict[str, object] = {}
+        for bound_inputs in role_inputs.values():
+            for tensor in bound_inputs.tensors:
+                semantic_values[tensor.semantic] = tensor.value
+        named_request = NamedTensorRequest(
+            frame.request.inner.request_id,
+            MappingProxyType(semantic_values),
+            deadline=deadline,
+            priority=frame.request.inner.priority,
+        )
+        backend_started = True
+        try:
+            raw_action = self._session_executor.execute(named_request, deadline=deadline, control=frame.control)
+            frame.values["_backend_started"] = backend_started
+        except PipelineCanceledError:
+            raise
+        except Exception:
+            frame.values["_backend_started"] = backend_started
+            raise
+        if not isinstance(raw_action, np.ndarray):
+            raise PipelineValidationError(
+                f"pipeline {self._facade.pipeline_id!r} PI0.5 session returned "
+                f"{type(raw_action).__name__}, expected a NumPy action array",
+                pipeline_id=self._facade.pipeline_id,
+            )
+        self._facade._raise_if_expired(deadline, phase="backend", backend_completed=True)
+        self._facade._ensure_session_ready_after_call()
+        chunk_size = _chunk_size_from_action(raw_action)
+        metadata = {
+            "request_id": frame.request.inner.request_id,
+            "deployment_name": self._facade._context.deployment_name,
+            "deployment_fingerprint": self._facade._context.deployment_fingerprint,
+        }
+        if self._denoising_schedule_metadata is not None:
+            metadata["denoising_schedule"] = self._denoising_schedule_metadata
+        frame.values["_backend_result"] = BackendResult(
+            action=raw_action,
+            actual_chunk_size=chunk_size,
+            backend_latency_ms=0.0,
+            metadata=metadata,
+        )
+
+
+class _PolicyDecodeStage:
+    """Decode/validate/raw-capture stage: action decode, validation, optional raw snapshot."""
+
+    def __init__(self, facade: InferencePipeline) -> None:
+        self._facade = facade
+
+    def execute(self, frame: StageFrame, *, deadline: datetime | None) -> None:
+        del deadline
+        frame.control.raise_if_canceled("decode")
+        backend_result = frame.values["_backend_result"]
+
+        semantic_action = self._facade._decode_backend_action(backend_result)
+        validate_action_output(
+            semantic_action,
+            actual_chunk_size=backend_result.actual_chunk_size,
+            action_dimension=self._facade._action_dimension,
+            pipeline_id=self._facade.pipeline_id,
+            phase="backend",
+        )
+        raw_action = _snapshot_action(semantic_action) if frame.request.capture_raw_action else None
+
+        frame.values["_semantic_action"] = semantic_action
+        frame.values["_raw_action"] = raw_action
+
+
+class _PolicyPostprocessStage:
+    """Postprocess/validate stage: postprocessor, validation, postprocess deadline gate."""
+
+    def __init__(self, facade: InferencePipeline) -> None:
+        self._facade = facade
+
+    def execute(self, frame: StageFrame, *, deadline: datetime | None) -> None:
+        frame.control.raise_if_canceled("postprocess")
+        backend_result = frame.values["_backend_result"]
+
+        postprocess_start = time.perf_counter()
+        action = self._facade._postprocessor(frame.values["_semantic_action"])
+        postprocess_latency_ms = (time.perf_counter() - postprocess_start) * 1000.0
+        validate_action_output(
+            action,
+            actual_chunk_size=backend_result.actual_chunk_size,
+            action_dimension=self._facade._action_dimension,
+            pipeline_id=self._facade.pipeline_id,
+            phase="postprocessor",
+        )
+        self._facade._raise_if_expired(deadline, phase="postprocess", backend_completed=True)
+
+        frame.values["_action"] = action
+        frame.values["_postprocess_latency_ms"] = postprocess_latency_ms
+
+
+class _PolicyResultAdapter:
+    """Result adapter: assemble the policy PipelineResult from the completed stage frame."""
+
+    def __init__(self, facade: InferencePipeline) -> None:
+        self._facade = facade
+
+    def adapt(self, frame: StageFrame) -> PipelineResult:
+        backend_result = frame.values["_backend_result"]
+        total_latency_ms = (time.perf_counter() - frame.values["_total_start"]) * 1000.0
+        preprocess_latency_ms = frame.values["_preprocess_latency_ms"]
+        postprocess_latency_ms = frame.values["_postprocess_latency_ms"]
+        latency_metadata = MappingProxyType(
+            {
+                "total": total_latency_ms,
+                "preprocess": preprocess_latency_ms,
+                "backend": backend_result.backend_latency_ms,
+                "postprocess": postprocess_latency_ms,
+            }
+        )
+        manifest = self._facade._context.validated_manifest.manifest
+        deployment = self._facade._context.deployment
+        return PipelineResult(
+            action=frame.values["_action"],
+            actual_chunk_size=backend_result.actual_chunk_size,
+            pipeline_id=self._facade.pipeline_id,
+            bundle=manifest.bundle.name,
+            bundle_uuid=manifest.bundle.uuid,
+            bundle_revision=manifest.bundle.revision,
+            deployment=self._facade._context.deployment_name,
+            deployment_uuid=deployment.uuid,
+            deployment_revision=deployment.revision,
+            deployment_fingerprint=self._facade._context.deployment_fingerprint,
+            backend=self._facade._backend_name(),
+            state=self._facade._pipeline.state,
+            total_latency_ms=total_latency_ms,
+            preprocess_latency_ms=preprocess_latency_ms,
+            backend_latency_ms=backend_result.backend_latency_ms,
+            postprocess_latency_ms=postprocess_latency_ms,
+            raw_action=frame.values["_raw_action"],
+            metadata={
+                **backend_result.metadata,
+                "pipeline_id": self._facade.pipeline_id,
+                "bundle": manifest.bundle.name,
+                "bundle_uuid": manifest.bundle.uuid,
+                "bundle_revision": manifest.bundle.revision,
+                "deployment": self._facade._context.deployment_name,
+                "deployment_uuid": deployment.uuid,
+                "deployment_revision": deployment.revision,
+                "deployment_fingerprint": self._facade._context.deployment_fingerprint,
+                "backend": self._facade._backend_name(),
+                "state": self._facade._pipeline.state.value,
+                "latency_ms": latency_metadata,
+            },
+        )
+
+    def adapt_error(self, error: ExecutionError) -> PipelineResult:
+        if error.cause is not None:
+            raise error.cause
+        raise RuntimeError(error.message)
+
+
+class _PolicySequentialExecutor(ModelExecutor):
+    """Stage-composed policy executor driving ordered InferenceStage execution."""
+
+    def __init__(self, facade: InferencePipeline) -> None:
+        self._facade = facade
+        self._stages: tuple[InferenceStage, ...] = (
+            _PolicyPreprocessStage(facade),
+            _PolicyBackendStage(facade),
+            _PolicyDecodeStage(facade),
+            _PolicyPostprocessStage(facade),
+        )
+        self._result_adapter = _PolicyResultAdapter(facade)
+
+    def load(self, context: RuntimeContext) -> None:
+        self._facade._load_executor(context)
+
+    def execute(self, request: object, *, deadline: datetime | None, control: ExecutionControl) -> PipelineResult:
+        if not isinstance(request, _PolicyRequest):
+            raise TypeError("policy executor requires a _PolicyRequest")
+        frame = StageFrame(request, values={"_total_start": time.perf_counter()}, control=control)
+        try:
+            for stage in self._stages:
+                stage.execute(frame, deadline=deadline)
+            return self._result_adapter.adapt(frame)
+        except PipelineCanceledError:
+            raise
+        except Exception as exc:
+            self._facade._record_policy_failure(exc, bool(frame.values.get("_backend_started", False)))
+            raise
+        finally:
+            frame.close()
+
+    def cancel(self, request_id: str, deadline: datetime | None = None) -> None:
+        # Cancellable backends delegate to backend.cancel and preserve its structured
+        # admission/cancellation errors and stateful fail-closed behavior. Non-cancellable
+        # backends are not interrupted here; the shared ExecutionControl flag marks the
+        # in-flight request so the completed result is discarded as a late cancellation.
+        if self._facade._backend.capabilities.supports_cancellation:
+            self._facade._backend.cancel(request_id, deadline=deadline)
+
+    def adapt_error(self, error: ExecutionError) -> PipelineResult:
+        return self._result_adapter.adapt_error(error)
+
+    def health(self) -> BackendHealth:
+        return self._facade._executor_health()
+
+    def reset(self, deadline: datetime | None = None) -> None:
+        self._facade._reset_executor(deadline)
+
+    def close(self) -> None:
+        self._facade._close_executor()
+
+
+class _PI05PolicyExecutor(ModelExecutor):
+    """Drive a session-backed PI0.5 iterative executor behind the policy facade.
+
+    Composes the shared preprocess/decode/postprocess/result stages with a
+    :class:`_PI05SessionStage` that delegates iterative execution to
+    :func:`create_pi05_executor`. Lifecycle, health, and resource ownership are
+    delegated to the session executor so the facade never loads a second backend.
+    """
+
+    def __init__(
+        self,
+        facade: InferencePipeline,
+        handle: _PI05SessionHandle,
+    ) -> None:
+        self._facade = facade
+        self._handle = handle
+        self._session_executor = handle.session_executor
+        self._capabilities = handle.capabilities
+        self._curvature_log_path = handle.curvature_log_path
+        self._velocity_trace = handle.velocity_trace
+        self._stages: tuple[InferenceStage, ...] = (
+            _PolicyPreprocessStage(facade),
+            _PI05SessionStage(facade, handle.session_executor, handle.action_semantic, handle.schedule_metadata),
+            _PolicyDecodeStage(facade),
+            _PolicyPostprocessStage(facade),
+        )
+        self._result_adapter = _PolicyResultAdapter(facade)
+
+    @property
+    def capabilities(self):
+        return self._capabilities
+
+    def load(self, context: RuntimeContext) -> None:
+        if self._facade._preprocessor is not None:
+            self._facade._load_component(self._facade._preprocessor)
+        if self._facade._postprocessor is not None:
+            self._facade._load_component(self._facade._postprocessor)
+        self._facade._bind_backend_processors()
+        self._session_executor.load(self._handle.session_context)
+        health = self._session_executor.health()
+        if not health.ready:
+            raise PipelineNotReadyError(
+                f"pipeline {self._facade.pipeline_id!r} PI0.5 session did not become ready after load",
+                pipeline_id=self._facade.pipeline_id,
+                state=health.state.value,
+            )
+
+    def execute(self, request: object, *, deadline: datetime | None, control: ExecutionControl) -> PipelineResult:
+        if not isinstance(request, _PolicyRequest):
+            raise TypeError("PI0.5 policy executor requires a _PolicyRequest")
+        frame = StageFrame(request, values={"_total_start": time.perf_counter()}, control=control)
+        try:
+            for stage in self._stages:
+                stage.execute(frame, deadline=deadline)
+            result = self._result_adapter.adapt(frame)
+            self._write_curvature_log()
+            return result
+        except PipelineCanceledError:
+            raise
+        except Exception as exc:
+            self._facade._record_policy_failure(exc, bool(frame.values.get("_backend_started", False)))
+            raise
+        finally:
+            frame.close()
+
+    def _write_curvature_log(self) -> None:
+        if self._curvature_log_path is None or not self._velocity_trace:
+            return
+        scores = _curvature_scores(self._velocity_trace)
+        record: dict[str, object] = {"curvature_scores": scores}
+        if self._handle.schedule is not None:
+            record["schedule"] = self._handle.schedule.to_dict()
+        path = Path(str(self._curvature_log_path)).expanduser().resolve()
+        try:
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, allow_nan=False, separators=(",", ":")) + "\n")
+        except (OSError, ValueError) as exc:
+            raise PipelineValidationError(
+                f"pipeline {self._facade.pipeline_id!r} unable to write PI0.5 curvature log {path}: {exc}",
+                pipeline_id=self._facade.pipeline_id,
+                code="curvature_log_failed",
+            ) from exc
+
+    def cancel(self, request_id: str, deadline: datetime | None = None) -> None:
+        cancel = getattr(self._session_executor, "cancel", None)
+        capabilities = getattr(self._session_executor, "capabilities", None)
+        if callable(cancel) and getattr(capabilities, "supports_cancellation", False):
+            cancel(request_id, deadline=deadline)
+
+    def adapt_error(self, error: ExecutionError) -> PipelineResult:
+        return self._result_adapter.adapt_error(error)
+
+    def health(self) -> BackendHealth:
+        if self._facade._policy_failure is not None:
+            return self._facade._policy_failure
+        return self._session_executor.health()
+
+    def reset(self, deadline: datetime | None = None) -> None:
+        self._session_executor.reset(deadline=deadline)
+
+    def close(self) -> None:
+        errors: list[Exception] = []
+        components: list[object] = []
+        if self._facade._owns_postprocessor and self._facade._postprocessor is not None:
+            components.append(self._facade._postprocessor)
+        if self._facade._owns_preprocessor and self._facade._preprocessor is not None:
+            components.append(self._facade._preprocessor)
+        components.append(self._session_executor)
+        seen: set[int] = set()
+        for component in components:
+            if id(component) in seen:
+                continue
+            seen.add(id(component))
+            close = getattr(component, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise PipelineLifecycleError(
+                f"pipeline {self._facade.pipeline_id!r} close failed: " + "; ".join(str(error) for error in errors),
+                pipeline_id=self._facade.pipeline_id,
+                code="close_failed",
+                details={"errors": tuple(str(error) for error in errors)},
+            )
+
+
+class _PI05SessionHandle:
+    """Configuration bundle the factory passes so the facade can build the executor."""
+
+    def __init__(
+        self,
+        session_executor,
+        session_context: RuntimeContext,
+        action_semantic: str,
+        schedule_metadata: Mapping[str, object] | None,
+        schedule: PI05DenoisingSchedule | None,
+        capabilities,
+        curvature_log_path: str | None,
+        velocity_trace: list | None,
+    ) -> None:
+        self.session_executor = session_executor
+        self.session_context = session_context
+        self.action_semantic = action_semantic
+        self.schedule_metadata = schedule_metadata
+        self.schedule = schedule
+        self.capabilities = capabilities
+        self.curvature_log_path = curvature_log_path
+        self.velocity_trace = velocity_trace
+
+
+def _curvature_scores(velocities: list, eps: float = 1e-6) -> list[float]:
+    if not velocities:
+        return []
+    if len(velocities) == 1:
+        return [0.0]
+    scores = []
+    for current, following in pairwise(velocities):
+        current_flat = np.asarray(current).reshape(np.asarray(current).shape[0], -1).astype(np.float32, copy=False)
+        following_flat = (
+            np.asarray(following).reshape(np.asarray(following).shape[0], -1).astype(np.float32, copy=False)
+        )
+        difference = np.linalg.norm(following_flat - current_flat, axis=1)
+        magnitude = np.linalg.norm(current_flat, axis=1) + eps
+        scores.append(float(np.mean(difference / magnitude)))
+    scores.append(scores[-1])
+    return scores
 
 
 class InferencePipeline:
-    """Own one processor/backend instance and expose one named inference route.
+    """Policy compatibility facade over :class:`GenericModelPipeline`.
 
-    Deadlines are cooperative and never implemented with detached worker threads.
-    Backend admission observes the absolute deadline before execution. If an
-    uncancellable backend call itself overruns, it is allowed to return and the
-    late result is deterministically discarded.
+    Preserves ``InferenceRequest``/``PipelineResult``, ``cancel()``, structured
+    error mapping, prompt/control inputs, raw-action capture, codec/action
+    validation, and stateful fail-closed semantics without owning any
+    independent lifecycle, admission, or deadline state.
     """
 
     def __init__(
         self,
         pipeline_id: str,
         runtime_context: RuntimeContext,
-        backend: InferenceBackend,
+        backend: InferenceBackend | None = None,
         *,
+        executor: ModelExecutor | None = None,
+        pi05_handle: _PI05SessionHandle | None = None,
         preprocessor: Processor | None = None,
         postprocessor: Postprocessor | None = None,
         codec: PolicyCodec | None = None,
@@ -96,10 +652,20 @@ class InferencePipeline:
                 pipeline_id=pipeline_id,
                 details={"request_timeout": request_timeout},
             )
+        construction_sources = sum(1 for source in (backend, executor, pi05_handle) if source is not None)
+        if construction_sources != 1:
+            raise PipelineConfigurationError(
+                f"pipeline {pipeline_id!r} requires exactly one of backend, executor, or pi05_handle",
+                pipeline_id=pipeline_id,
+                code="invalid_pipeline_construction",
+            )
 
         self._pipeline_id = pipeline_id
         self._context = runtime_context
         self._backend = backend
+        self._executor = executor
+        self._owns_executor = executor is not None
+        self._pi05_handle = pi05_handle
         self._preprocessor = preprocessor
         self._postprocessor = postprocessor
         self._owns_preprocessor = preprocessor is not None
@@ -108,76 +674,51 @@ class InferencePipeline:
         self._request_timeout = request_timeout
         self._default_task = default_task
         self._execution_mode = execution_mode
-        self._state_machine = PipelineStateMachine()
-        self._condition = threading.Condition(threading.RLock())
-        self._active_requests = 0
-        self._active_controls = 0
-        self._control_lock = threading.Lock()
-        self._loading = False
-        self._resetting = False
         self._execution_plan: ExecutionPlan | None = None
         self._action_output_role: str | None = None
+        self._policy_failure: BackendHealth | None = None
+        self._executor_closed = False
+        self._prepare_execution()
+
+        if pi05_handle is not None:
+            resolved_executor: ModelExecutor = _PI05PolicyExecutor(self, pi05_handle)
+        elif executor is not None:
+            resolved_executor = executor
+        else:
+            resolved_executor = _PolicySequentialExecutor(self)
+        self._pipeline = GenericModelPipeline(
+            pipeline_id,
+            runtime_context,
+            resolved_executor,
+            request_timeout=request_timeout,
+        )
 
     @property
     def pipeline_id(self) -> str:
         return self._pipeline_id
 
     @property
-    def state(self) -> PipelineState:
-        with self._condition:
-            return self._state_machine.state
+    def state(self):
+        return self._pipeline.state
 
     @property
     def runtime_context(self) -> RuntimeContext:
         return self._context
 
     @property
-    def capabilities(self) -> BackendCapabilities:
-        return self._backend.capabilities
+    def capabilities(self):
+        if self._backend is not None:
+            return self._backend.capabilities
+        if self._pi05_handle is not None:
+            return self._pi05_handle.capabilities
+        if self._executor is not None and hasattr(self._executor, "capabilities"):
+            return self._executor.capabilities
+        raise PipelineConfigurationError(
+            f"pipeline {self.pipeline_id!r} has no capability source", pipeline_id=self.pipeline_id
+        )
 
     def load(self) -> None:
-        with self._condition:
-            if self._state_machine.state is not PipelineState.CREATED:
-                raise PipelineLifecycleError(
-                    f"pipeline {self.pipeline_id!r} cannot load from state {self._state_machine.state.value}",
-                    pipeline_id=self.pipeline_id,
-                    code="invalid_load_state",
-                )
-            self._state_machine.transition(PipelineState.LOADING)
-            self._loading = True
-
-        try:
-            self._prepare_execution()
-            if self._preprocessor is not None:
-                self._load_component(self._preprocessor)
-            if self._postprocessor is not None:
-                self._load_component(self._postprocessor)
-            self._backend.load(self._context)
-            self._bind_backend_processors()
-            health = self._backend.health()
-            if not health.ready:
-                raise PipelineNotReadyError(
-                    f"pipeline {self.pipeline_id!r} backend did not become ready after load",
-                    pipeline_id=self.pipeline_id,
-                    state=health.state.value,
-                )
-            with self._condition:
-                if self._state_machine.state is PipelineState.CLOSING:
-                    raise PipelineLifecycleError(
-                        f"pipeline {self.pipeline_id!r} load was interrupted by close",
-                        pipeline_id=self.pipeline_id,
-                        code="load_interrupted",
-                    )
-                self._state_machine.transition(PipelineState.READY)
-        except Exception:
-            with self._condition:
-                if self._state_machine.state not in {PipelineState.CLOSING, PipelineState.CLOSED}:
-                    self._state_machine.transition(PipelineState.FAILED)
-            raise
-        finally:
-            with self._condition:
-                self._loading = False
-                self._condition.notify_all()
+        self._pipeline.load()
 
     def infer(
         self,
@@ -186,203 +727,77 @@ class InferencePipeline:
         control_inputs: Mapping[str, object] | None = None,
         capture_raw_action: bool = False,
     ) -> PipelineResult:
-        deadline = self._effective_deadline(request.deadline)
-        with self._condition:
-            self._synchronize_backend_health_locked()
-            self._require_ready_locked("infer")
-            self._raise_if_expired(deadline, phase="admission", backend_completed=False)
-            self._active_requests += 1
-
-        total_start = time.perf_counter()
-        backend_execution_started = False
-        try:
-            selected_prompt = request.prompt if request.prompt is not None else self._default_task
-            processor_inputs = dict(request.inputs)
-            if selected_prompt is not None:
-                processor_inputs["task"] = selected_prompt
-
-            preprocess_start = time.perf_counter()
-            canonical_inputs = self._preprocessor(processor_inputs)
-            preprocess_latency_ms = (time.perf_counter() - preprocess_start) * 1000.0
-            if not isinstance(canonical_inputs, Mapping):
-                raise PipelineValidationError(
-                    f"pipeline {self.pipeline_id!r} preprocessor must return a mapping",
-                    pipeline_id=self.pipeline_id,
-                    details={"returned_type": type(canonical_inputs).__name__},
-                )
-            canonical_inputs = dict(canonical_inputs)
-            if control_inputs:
-                collisions = sorted(set(canonical_inputs) & set(control_inputs))
-                if collisions:
-                    raise PipelineValidationError(
-                        f"pipeline {self.pipeline_id!r} control inputs conflict with preprocessor outputs: {collisions}",
-                        pipeline_id=self.pipeline_id,
-                        details={"conflicting_inputs": tuple(collisions)},
-                    )
-                canonical_inputs.update(control_inputs)
-            self._raise_if_expired(deadline, phase="preprocess", backend_completed=False)
-
-            backend_inputs = self._prepare_backend_inputs(canonical_inputs)
-            backend_request = InferenceRequest(
-                request_id=request.request_id,
-                inputs=backend_inputs,
-                prompt=selected_prompt,
-                deadline=deadline,
-                priority=request.priority,
-                metadata={
-                    **request.metadata,
-                    "pipeline_id": self.pipeline_id,
-                    "deployment": self._context.deployment_name,
-                    "deployment_fingerprint": self._context.deployment_fingerprint,
-                },
-            )
-            try:
-                backend_execution_started = True
-                backend_result = self._backend.infer(backend_request)
-            except BackendAdmissionError as exc:
-                if exc.code != "deadline_exceeded":
-                    raise
-                raise self._timeout_error("backend_admission", backend_completed=False) from exc
-            if not isinstance(backend_result, BackendResult):
-                raise PipelineValidationError(
-                    f"pipeline {self.pipeline_id!r} backend returned {type(backend_result).__name__}, "
-                    "expected BackendResult",
-                    pipeline_id=self.pipeline_id,
-                )
-            self._raise_if_expired(deadline, phase="backend", backend_completed=True)
-            self._ensure_backend_ready_after_call()
-
-            semantic_action = self._decode_backend_action(backend_result)
-            validate_action_output(
-                semantic_action,
-                actual_chunk_size=backend_result.actual_chunk_size,
-                action_dimension=self._action_dimension,
+        policy_request = _PolicyRequest(
+            request,
+            control_inputs=control_inputs,
+            capture_raw_action=capture_raw_action,
+        )
+        result = self._pipeline.execute(policy_request, deadline=request.deadline)
+        if not isinstance(result, PipelineResult):
+            raise PipelineValidationError(
+                f"pipeline {self.pipeline_id!r} executor returned {type(result).__name__}, expected PipelineResult",
                 pipeline_id=self.pipeline_id,
-                phase="backend",
             )
-            raw_action = _snapshot_action(semantic_action) if capture_raw_action else None
-
-            postprocess_start = time.perf_counter()
-            action = self._postprocessor(semantic_action)
-            postprocess_latency_ms = (time.perf_counter() - postprocess_start) * 1000.0
-            validate_action_output(
-                action,
-                actual_chunk_size=backend_result.actual_chunk_size,
-                action_dimension=self._action_dimension,
-                pipeline_id=self.pipeline_id,
-                phase="postprocessor",
-            )
-            self._raise_if_expired(deadline, phase="postprocess", backend_completed=True)
-
-            total_latency_ms = (time.perf_counter() - total_start) * 1000.0
-            with self._condition:
-                self._require_ready_locked("publish inference result")
-                result_state = self._state_machine.state
-            latency_metadata = MappingProxyType(
-                {
-                    "total": total_latency_ms,
-                    "preprocess": preprocess_latency_ms,
-                    "backend": backend_result.backend_latency_ms,
-                    "postprocess": postprocess_latency_ms,
-                }
-            )
-            return PipelineResult(
-                action=action,
-                actual_chunk_size=backend_result.actual_chunk_size,
-                pipeline_id=self.pipeline_id,
-                bundle=self._context.validated_manifest.manifest.bundle.name,
-                bundle_uuid=self._context.validated_manifest.manifest.bundle.uuid,
-                bundle_revision=self._context.validated_manifest.manifest.bundle.revision,
-                deployment=self._context.deployment_name,
-                deployment_uuid=self._context.deployment.uuid,
-                deployment_revision=self._context.deployment.revision,
-                deployment_fingerprint=self._context.deployment_fingerprint,
-                backend=self._backend.name,
-                state=result_state,
-                total_latency_ms=total_latency_ms,
-                preprocess_latency_ms=preprocess_latency_ms,
-                backend_latency_ms=backend_result.backend_latency_ms,
-                postprocess_latency_ms=postprocess_latency_ms,
-                raw_action=raw_action,
-                metadata={
-                    **backend_result.metadata,
-                    "pipeline_id": self.pipeline_id,
-                    "bundle": self._context.validated_manifest.manifest.bundle.name,
-                    "bundle_uuid": self._context.validated_manifest.manifest.bundle.uuid,
-                    "bundle_revision": self._context.validated_manifest.manifest.bundle.revision,
-                    "deployment": self._context.deployment_name,
-                    "deployment_uuid": self._context.deployment.uuid,
-                    "deployment_revision": self._context.deployment.revision,
-                    "deployment_fingerprint": self._context.deployment_fingerprint,
-                    "backend": self._backend.name,
-                    "state": result_state.value,
-                    "latency_ms": latency_metadata,
-                },
-            )
-        except PipelineTimeoutError as exc:
-            _annotate_execution_certainty(
-                exc,
-                operation_started=bool(exc.details.get("backend_completed")),
-            )
-            with self._condition:
-                if exc.details.get("backend_completed") and self._backend.capabilities.stateful:
-                    if self._state_machine.state is PipelineState.READY:
-                        self._state_machine.transition(PipelineState.FAILED)
-                else:
-                    self._synchronize_backend_health_locked()
-            raise
-        except Exception as exc:
-            _annotate_execution_certainty(exc, operation_started=backend_execution_started)
-            with self._condition:
-                non_mutating_rejection = isinstance(exc, BackendAdmissionError) and not exc.operation_started
-                if backend_execution_started and not non_mutating_rejection and self._backend.capabilities.stateful:
-                    if self._state_machine.state is PipelineState.READY:
-                        self._state_machine.transition(PipelineState.FAILED)
-                else:
-                    self._synchronize_backend_health_locked()
-            raise
-        finally:
-            with self._condition:
-                self._active_requests -= 1
-                self._condition.notify_all()
+        return result
 
     def reset(self, deadline: datetime | None = None) -> None:
-        deadline = self._effective_deadline(deadline)
-        with self._control_operation("reset", deadline):
-            self._reset(deadline)
+        self._pipeline.reset(deadline)
 
-    def _reset(self, deadline: datetime | None) -> None:
-        with self._condition:
-            if self._backend.capabilities.stateful and not self._backend.capabilities.resettable:
-                raise PipelineLifecycleError(
-                    f"pipeline {self.pipeline_id!r} backend is stateful but does not support reset",
-                    pipeline_id=self.pipeline_id,
-                    code="reset_unsupported",
-                )
-            self._state_machine.transition(PipelineState.RESETTING)
-            self._resetting = True
-            completed = self._condition.wait_for(
-                lambda: self._active_requests == 0,
-                timeout=self._remaining_seconds(deadline),
+    def cancel(self, request_id: str, deadline: datetime | None = None) -> None:
+        self._pipeline.cancel(request_id, deadline)
+
+    def diagnostics(self) -> PipelineDiagnostics:
+        runtime_diag = self._pipeline.diagnostics()
+        identity = runtime_diag.deployment
+        return PipelineDiagnostics(
+            pipeline_id=runtime_diag.pipeline_id,
+            bundle=identity.bundle,
+            bundle_uuid=identity.bundle_uuid,
+            bundle_revision=identity.bundle_revision,
+            deployment=identity.deployment,
+            deployment_uuid=identity.deployment_uuid,
+            deployment_revision=identity.deployment_revision,
+            deployment_fingerprint=identity.deployment_fingerprint,
+            backend=identity.backend,
+            state=runtime_diag.state,
+            backend_health=runtime_diag.executor_health,
+            active_requests=runtime_diag.active_requests,
+            request_timeout=runtime_diag.request_timeout,
+            default_task_configured=self._default_task is not None,
+        )
+
+    def health(self) -> PipelineDiagnostics:
+        return self.diagnostics()
+
+    def close(self) -> None:
+        self._pipeline.close()
+
+    # ------------------------------------------------------------------
+    # Executor hooks (called by _PolicySequentialExecutor)
+    # ------------------------------------------------------------------
+
+    def _load_executor(self, context: RuntimeContext) -> None:
+        if self._preprocessor is not None:
+            self._load_component(self._preprocessor)
+        if self._postprocessor is not None:
+            self._load_component(self._postprocessor)
+        self._backend.load(context)
+        self._bind_backend_processors()
+        health = self._backend.health()
+        if not health.ready:
+            raise PipelineNotReadyError(
+                f"pipeline {self.pipeline_id!r} backend did not become ready after load",
+                pipeline_id=self.pipeline_id,
+                state=health.state.value,
             )
-            if not completed:
-                if self._state_machine.state is PipelineState.RESETTING:
-                    health = self._backend.health()
-                    if health.ready:
-                        self._state_machine.transition(PipelineState.READY)
-                    else:
-                        self._transition_from_backend_failure_locked(health)
-                self._resetting = False
-                self._condition.notify_all()
-                raise self._timeout_error("reset admission", backend_completed=False)
-            if self._state_machine.state is not PipelineState.RESETTING:
-                self._resetting = False
-                self._condition.notify_all()
-                raise PipelineLifecycleError(
-                    f"pipeline {self.pipeline_id!r} reset was interrupted by close",
-                    pipeline_id=self.pipeline_id,
-                    code="reset_interrupted",
-                )
+
+    def _reset_executor(self, deadline: datetime | None) -> None:
+        if self._backend.capabilities.stateful and not self._backend.capabilities.resettable:
+            raise PipelineLifecycleError(
+                f"pipeline {self.pipeline_id!r} backend is stateful but does not support reset",
+                pipeline_id=self.pipeline_id,
+                code="reset_unsupported",
+            )
 
         backend_reset_error: Exception | None = None
         if self._backend.capabilities.resettable:
@@ -413,20 +828,15 @@ class InferencePipeline:
                         processor_reset_error = exc
                     break
         reset_error = backend_reset_error or processor_reset_error
-        with self._condition:
-            health = self._backend.health()
-            if self._state_machine.state is PipelineState.RESETTING:
-                if (processor_reset_error is not None and (processor_reset_started or reset_mutated_state)) or (
-                    backend_reset_error is not None and not health.ready
-                ):
-                    self._state_machine.transition(PipelineState.FAILED)
-                elif health.ready:
-                    self._state_machine.transition(PipelineState.READY)
-                else:
-                    self._transition_from_backend_failure_locked(health)
-            self._resetting = False
-            self._condition.notify_all()
-
+        if (processor_reset_error is not None and (processor_reset_started or reset_mutated_state)) or (
+            backend_reset_error is not None and not self._backend.health().ready
+        ):
+            self._policy_failure = BackendHealth(
+                state=BackendState.FAILED,
+                ready=False,
+                reason_code="reset_failed",
+                message=str(reset_error) if reset_error is not None else "reset failed",
+            )
         if reset_error is not None:
             raise reset_error
         health = self._backend.health()
@@ -437,89 +847,10 @@ class InferencePipeline:
                 state=health.state.value,
             )
 
-    def cancel(self, request_id: str, deadline: datetime | None = None) -> None:
-        deadline = self._effective_deadline(deadline)
-        with self._control_operation("cancel", deadline):
-            try:
-                self._backend.cancel(request_id, deadline=deadline)
-            except (BackendAdmissionError, BackendCancellationError) as exc:
-                with self._condition:
-                    if (
-                        exc.operation_started
-                        and not getattr(exc, "outcome_known", False)
-                        and self._backend.capabilities.stateful
-                        and self._state_machine.state is PipelineState.READY
-                    ):
-                        self._state_machine.transition(PipelineState.FAILED)
-                    else:
-                        self._synchronize_backend_health_locked()
-                raise
-            with self._condition:
-                self._synchronize_backend_health_locked()
-                self._require_ready_locked("complete cancellation")
-
-    def diagnostics(self) -> PipelineDiagnostics:
-        with self._condition:
-            health = self._backend.health()
-            self._synchronize_backend_health_locked(health)
-            return PipelineDiagnostics(
-                pipeline_id=self.pipeline_id,
-                bundle=self._context.validated_manifest.manifest.bundle.name,
-                bundle_uuid=self._context.validated_manifest.manifest.bundle.uuid,
-                bundle_revision=self._context.validated_manifest.manifest.bundle.revision,
-                deployment=self._context.deployment_name,
-                deployment_uuid=self._context.deployment.uuid,
-                deployment_revision=self._context.deployment.revision,
-                deployment_fingerprint=self._context.deployment_fingerprint,
-                backend=self._backend.name,
-                state=self._state_machine.state,
-                backend_health=health,
-                active_requests=self._active_requests,
-                request_timeout=self._request_timeout,
-                default_task_configured=self._default_task is not None,
-            )
-
-    def health(self) -> PipelineDiagnostics:
-        return self.diagnostics()
-
-    @contextmanager
-    def _control_operation(self, operation: str, deadline: datetime | None):
-        timeout = self._remaining_seconds(deadline)
-        acquired = self._control_lock.acquire() if timeout is None else self._control_lock.acquire(timeout=timeout)
-        if not acquired:
-            raise self._timeout_error(f"{operation} admission", backend_completed=False)
-        registered = False
-        try:
-            with self._condition:
-                self._synchronize_backend_health_locked()
-                self._require_ready_locked(operation)
-                self._active_controls += 1
-                registered = True
-            yield
-        finally:
-            if registered:
-                with self._condition:
-                    self._active_controls -= 1
-                    self._condition.notify_all()
-            self._control_lock.release()
-
-    def close(self) -> None:
-        with self._condition:
-            if self._state_machine.state is PipelineState.CLOSED:
-                return
-            if self._state_machine.state is PipelineState.CLOSING:
-                self._condition.wait_for(lambda: self._state_machine.state is PipelineState.CLOSED)
-                return
-            self._state_machine.transition(PipelineState.CLOSING)
-            self._condition.wait_for(
-                lambda: (
-                    not self._loading
-                    and not self._resetting
-                    and self._active_requests == 0
-                    and self._active_controls == 0
-                )
-            )
-
+    def _close_executor(self) -> None:
+        if self._executor_closed:
+            return
+        self._executor_closed = True
         errors: list[Exception] = []
         for component in self._owned_components_in_close_order():
             close = getattr(component, "close", None)
@@ -529,10 +860,6 @@ class InferencePipeline:
                 close()
             except Exception as exc:
                 errors.append(exc)
-
-        with self._condition:
-            self._state_machine.transition(PipelineState.CLOSED)
-            self._condition.notify_all()
         if errors:
             raise PipelineLifecycleError(
                 f"pipeline {self.pipeline_id!r} close failed: " + "; ".join(str(error) for error in errors),
@@ -541,9 +868,23 @@ class InferencePipeline:
                 details={"errors": tuple(str(error) for error in errors)},
             )
 
+    def _executor_health(self) -> BackendHealth:
+        if self._policy_failure is not None:
+            return self._policy_failure
+        return self._backend.health()
+
+    # ------------------------------------------------------------------
+    # Policy helpers (preserved from the original implementation)
+    # ------------------------------------------------------------------
+
     @property
     def _action_dimension(self) -> int:
         return self._context.policy.output_features["action"].shape[-1]
+
+    def _backend_name(self) -> str:
+        if self._backend is not None:
+            return self._backend.name
+        return self._context.deployment.backend
 
     def _prepare_execution(self) -> None:
         deployment = self._context.deployment
@@ -600,6 +941,33 @@ class InferencePipeline:
             "execution_plan": self._execution_plan,
             "role_inputs": MappingProxyType(dict(role_inputs)),
         }
+
+    def _encode_role_inputs(self, canonical_inputs: Mapping[str, object]) -> Mapping[str, object]:
+        assert self._codec is not None
+        assert self._execution_plan is not None
+        encode_execution = getattr(self._codec, "encode_execution", None)
+        if callable(encode_execution):
+            return encode_execution(CodecRequest(canonical_inputs), self._execution_plan)
+        if len(self._execution_plan.roles) == 1:
+            role = self._execution_plan.roles[0]
+            return {role.name: self._codec.encode_inputs(CodecRequest(canonical_inputs), role.bindings)}
+        raise PipelineConfigurationError(
+            f"compiled pipeline {self.pipeline_id!r} requires an execution-aware codec for multiple roles",
+            pipeline_id=self.pipeline_id,
+            code="execution_codec_required",
+            details={"roles": self._execution_plan.role_names},
+        )
+
+    def _ensure_session_ready_after_call(self) -> None:
+        if self._executor is None:
+            return
+        health = self._executor.health()
+        if not health.ready:
+            raise PipelineNotReadyError(
+                f"pipeline {self.pipeline_id!r} session left READY during inference",
+                pipeline_id=self.pipeline_id,
+                state=health.state.value,
+            )
 
     def _decode_backend_action(self, result: BackendResult) -> object:
         deployment = self._context.deployment
@@ -661,28 +1029,6 @@ class InferencePipeline:
             unique.append(component)
         return tuple(unique)
 
-    def _effective_deadline(self, request_deadline: datetime | None) -> datetime | None:
-        now = datetime.now(timezone.utc)
-        configured_deadline = None
-        if self._request_timeout is not None:
-            configured_deadline = now + timedelta(seconds=self._request_timeout)
-        if request_deadline is None:
-            return configured_deadline
-        if request_deadline.tzinfo is None:
-            raise PipelineConfigurationError(
-                f"pipeline {self.pipeline_id!r} request deadline must be timezone-aware",
-                pipeline_id=self.pipeline_id,
-                code="invalid_deadline",
-            )
-        normalized = request_deadline.astimezone(timezone.utc)
-        return normalized if configured_deadline is None else min(normalized, configured_deadline)
-
-    @staticmethod
-    def _remaining_seconds(deadline: datetime | None) -> float | None:
-        if deadline is None:
-            return None
-        return max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
-
     def _raise_if_expired(self, deadline: datetime | None, *, phase: str, backend_completed: bool) -> None:
         if deadline is not None and datetime.now(timezone.utc) >= deadline:
             raise self._timeout_error(phase, backend_completed=backend_completed)
@@ -698,50 +1044,30 @@ class InferencePipeline:
         )
 
     def _ensure_backend_ready_after_call(self) -> None:
-        with self._condition:
-            health = self._backend.health()
-            self._synchronize_backend_health_locked(health)
-            if not health.ready:
-                raise PipelineNotReadyError(
-                    f"pipeline {self.pipeline_id!r} backend left READY during inference",
-                    pipeline_id=self.pipeline_id,
-                    state=health.state.value,
-                )
-
-    def _synchronize_backend_health_locked(self, health: BackendHealth | None = None) -> None:
-        state = self._state_machine.state
-        if state not in {PipelineState.READY, PipelineState.RESETTING, PipelineState.DEGRADED}:
-            return
-        current_health = health or self._backend.health()
-        if current_health.ready:
-            if state is PipelineState.DEGRADED:
-                self._state_machine.transition(PipelineState.READY)
-            return
-        self._transition_from_backend_failure_locked(current_health)
-
-    def _transition_from_backend_failure_locked(self, health: BackendHealth) -> None:
-        target = (
-            PipelineState.DEGRADED
-            if health.state in {BackendState.DEGRADED, BackendState.RECOVERING}
-            else PipelineState.FAILED
-        )
-        if self._state_machine.state is target:
-            return
-        self._state_machine.transition(target)
-
-    def _require_ready_locked(self, operation: str) -> None:
-        if self._state_machine.state is not PipelineState.READY:
+        health = self._backend.health()
+        if not health.ready:
             raise PipelineNotReadyError(
-                f"pipeline {self.pipeline_id!r} cannot {operation} while state is {self._state_machine.state.value}",
+                f"pipeline {self.pipeline_id!r} backend left READY during inference",
                 pipeline_id=self.pipeline_id,
-                state=self._state_machine.state.value,
+                state=health.state.value,
             )
 
-
-def _snapshot_action(action: object) -> object:
-    detached = getattr(action, "detach", None)
-    candidate = detached() if callable(detached) else action
-    clone = getattr(candidate, "clone", None)
-    if callable(clone):
-        return clone()
-    return copy.deepcopy(candidate)
+    def _record_policy_failure(self, exc: Exception, backend_execution_started: bool) -> None:
+        capabilities = self.capabilities
+        if isinstance(exc, PipelineTimeoutError):
+            if exc.details.get("backend_completed") and capabilities.stateful:
+                self._policy_failure = BackendHealth(
+                    state=BackendState.FAILED,
+                    ready=False,
+                    reason_code="deadline_exceeded",
+                    message=str(exc),
+                )
+            return
+        non_mutating_rejection = isinstance(exc, BackendAdmissionError) and not exc.operation_started
+        if backend_execution_started and not non_mutating_rejection and capabilities.stateful:
+            self._policy_failure = BackendHealth(
+                state=BackendState.FAILED,
+                ready=False,
+                reason_code=getattr(exc, "code", "execution_failed"),
+                message=str(exc),
+            )

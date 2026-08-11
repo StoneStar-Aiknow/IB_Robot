@@ -12,13 +12,10 @@ from inference_service.backends import (
     BACKEND_REGISTRY,
     BackendCapabilityError,
     BackendLoadError,
-    BackendState,
     InferenceRequest,
     RuntimeContext,
 )
 from inference_service.backends.hmm import HMMBackend, create_backend
-from inference_service.codecs import create_policy_codec
-from inference_service.pipeline import InferencePipeline
 from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID, create_policy_bundle, write_manifest
 
 
@@ -256,6 +253,8 @@ def _binding(
     *,
     layout: str | None = None,
 ) -> dict[str, object]:
+    if layout is None and len(shape) == 4:
+        layout = "NCHW"
     result: dict[str, object] = {
         "semantic": semantic,
         "runtime_name": name,
@@ -660,12 +659,33 @@ def _smolvla_environment(context: RuntimeContext, observed_times: list[float]) -
     )
 
 
-def test_hmm_pi05_pipeline_uses_prefill_output_cache_and_all_projection_modules(tmp_path):
+def test_hmm_pi05_pipeline_uses_prefill_output_cache_and_all_projection_modules(tmp_path, monkeypatch):
+    from inference_service import pipeline as pipeline_module
+    from inference_service.model_sessions import HMMModelSession
+    from inference_service.pipeline import create_inference_pipeline
+
+    monkeypatch.setattr(
+        pipeline_module.factory,
+        "create_lerobot_processor_views",
+        lambda: (lambda inputs: inputs, lambda action: action),
+    )
+
     context = _pi05_context(tmp_path, runtime_options={"device_id": 0, "random_seed": 7})
     observed_times: list[float] = []
     environment = _pi05_environment(context, observed_times)
-    backend = HMMBackend(0, runtime_loader=lambda: environment.runtime)
-    pipeline = InferencePipeline("pi05", context, backend, codec=create_policy_codec(context.policy))
+
+    def session_factory(ctx, options):
+        return HMMModelSession(
+            device_id=int(options["device_id"]),
+            runtime_loader=lambda: environment.runtime,
+        )
+
+    pipeline = create_inference_pipeline(
+        "pi05",
+        context.validated_manifest,
+        runtime_options={"device_id": 0, "random_seed": 7},
+        model_session_factory=session_factory,
+    )
     pipeline.load()
 
     result = pipeline.infer(
@@ -682,7 +702,7 @@ def test_hmm_pi05_pipeline_uses_prefill_output_cache_and_all_projection_modules(
 
     np.testing.assert_array_equal(result.action, np.full((1, 2, 6), -1.0, dtype=np.float16))
     assert result.actual_chunk_size == 2
-    assert backend.health().state is BackendState.READY
+    assert pipeline.state.value == "ready"
     paths = {role: str(path) for role, path in context.resolved_artifacts.items()}
     assert environment.modules[paths["prefill"]].runs == 1
     for role in ("action_in_proj", "time_mlp", "decode", "action_out_proj"):
@@ -707,12 +727,41 @@ def test_hmm_pi05_pipeline_uses_prefill_output_cache_and_all_projection_modules(
     assert environment.weight_manager_releases == 1
 
 
-def test_hmm_smolvla_pipeline_uses_output_cache_state_projection_and_runtime_dtypes(tmp_path):
-    context = _smolvla_context(tmp_path, runtime_options={"random_seed": 7})
+def _patch_identity_processors(monkeypatch):
+    from inference_service import pipeline as pipeline_module
+
+    monkeypatch.setattr(
+        pipeline_module.factory,
+        "create_lerobot_processor_views",
+        lambda: (lambda inputs: inputs, lambda action: action),
+    )
+
+
+def _smolvla_session_factory(environment):
+    from inference_service.model_sessions import HMMModelSession
+
+    def factory(ctx, options):
+        return HMMModelSession(
+            device_id=int(options["device_id"]),
+            runtime_loader=lambda: environment.runtime,
+        )
+
+    return factory
+
+
+def test_hmm_smolvla_pipeline_runs_through_session_with_device_links_and_host_embedding(tmp_path, monkeypatch):
+    from inference_service.pipeline import create_inference_pipeline
+
+    _patch_identity_processors(monkeypatch)
+    context = _smolvla_context(tmp_path, runtime_options={"device_id": 0, "random_seed": 7})
     observed_times: list[float] = []
     environment = _smolvla_environment(context, observed_times)
-    backend = HMMBackend(runtime_loader=lambda: environment.runtime)
-    pipeline = InferencePipeline("smolvla", context, backend, codec=create_policy_codec(context.policy))
+    pipeline = create_inference_pipeline(
+        "smolvla",
+        context.validated_manifest,
+        runtime_options={"device_id": 0, "random_seed": 7},
+        model_session_factory=_smolvla_session_factory(environment),
+    )
     pipeline.load()
 
     result = pipeline.infer(
@@ -729,9 +778,13 @@ def test_hmm_smolvla_pipeline_uses_output_cache_state_projection_and_runtime_dty
     )
 
     np.testing.assert_array_equal(result.action, np.full((1, 2, 6), -1.0, dtype=np.float16))
+    assert result.actual_chunk_size == 2
     assert observed_times == [1.0, 0.5]
-    assert all(link[2].direction == "output" for link in environment.device_links)
     paths = {role: str(path) for role, path in context.resolved_artifacts.items()}
+    assert environment.modules[paths["prefill"]].runs == 1
+    assert environment.modules[paths["action"]].runs == 2
+    # HMM device links stay device-resident: KV handles are producer outputs.
+    assert all(link[2].direction == "output" for link in environment.device_links)
     prefill_inputs = environment.modules[paths["prefill"]].set_inputs
     np.testing.assert_allclose(
         prefill_inputs["prefix_embs"][0, 5],
@@ -744,25 +797,35 @@ def test_hmm_smolvla_pipeline_uses_output_cache_state_projection_and_runtime_dty
     assert environment.weight_manager_releases == 1
 
 
-def test_hmm_partial_load_failure_releases_loaded_modules_and_weight_manager(tmp_path):
-    context = _smolvla_context(tmp_path)
+def test_hmm_smolvla_partial_load_failure_releases_loaded_resources(tmp_path, monkeypatch):
+    from inference_service.pipeline import create_inference_pipeline
+
+    _patch_identity_processors(monkeypatch)
+    context = _smolvla_context(tmp_path, runtime_options={"device_id": 0, "random_seed": 7})
     environment = _smolvla_environment(context, [])
     action_path = str(context.resolved_artifacts["action"])
     environment.fail_paths.add(action_path)
-    backend = HMMBackend(runtime_loader=lambda: environment.runtime)
+    pipeline = create_inference_pipeline(
+        "smolvla",
+        context.validated_manifest,
+        runtime_options={"device_id": 0, "random_seed": 7},
+        model_session_factory=_smolvla_session_factory(environment),
+    )
 
     with pytest.raises(BackendLoadError, match="fake TCIM load failure"):
-        backend.load(context)
+        pipeline.load()
 
-    assert backend.health().state is BackendState.FAILED
     paths = {role: str(path) for role, path in context.resolved_artifacts.items()}
     assert environment.release_order == [paths["prefill"], paths["vision_top"]]
     assert environment.weight_manager_releases == 1
-    backend.close()
+    pipeline.close()
 
 
-def test_hmm_rejects_runtime_descriptor_mismatch_before_inference(tmp_path):
-    context = _smolvla_context(tmp_path)
+def test_hmm_smolvla_rejects_runtime_descriptor_mismatch_before_inference(tmp_path, monkeypatch):
+    from inference_service.pipeline import create_inference_pipeline
+
+    _patch_identity_processors(monkeypatch)
+    context = _smolvla_context(tmp_path, runtime_options={"device_id": 0})
     environment = _smolvla_environment(context, [])
     vision_path = str(context.resolved_artifacts["vision_top"])
     spec = environment.model_specs[vision_path]
@@ -771,14 +834,102 @@ def test_hmm_rejects_runtime_descriptor_mismatch_before_inference(tmp_path):
         outputs=spec.outputs,
         callback=spec.callback,
     )
-    backend = HMMBackend(runtime_loader=lambda: environment.runtime)
+    pipeline = create_inference_pipeline(
+        "smolvla",
+        context.validated_manifest,
+        runtime_options={"device_id": 0},
+        model_session_factory=_smolvla_session_factory(environment),
+    )
 
     with pytest.raises(BackendLoadError) as error:
+        pipeline.load()
+
+    assert error.value.code == "runtime_name_mismatch"
+    pipeline.close()
+
+
+def test_hmm_backend_fails_closed_for_smolvla_after_factory_cutover(tmp_path):
+    context = _smolvla_context(tmp_path)
+    environment = _smolvla_environment(context, [])
+    backend = HMMBackend(0, runtime_loader=lambda: environment.runtime)
+
+    with pytest.raises(BackendLoadError, match="no longer hosts SmolVLA") as error:
         backend.load(context)
 
-    assert error.value.code == "runtime_load_failed"
-    assert "runtime_name_mismatch" not in str(error.value)
+    assert error.value.code == "unsupported_policy_backend_pair"
     backend.close()
+
+
+def test_hmm_smolvla_repeated_inference_is_deterministic_with_seed(tmp_path, monkeypatch):
+    from inference_service.pipeline import create_inference_pipeline
+
+    _patch_identity_processors(monkeypatch)
+    context = _smolvla_context(tmp_path, runtime_options={"device_id": 0, "random_seed": 42})
+    environment = _smolvla_environment(context, [])
+    pipeline = create_inference_pipeline(
+        "smolvla",
+        context.validated_manifest,
+        runtime_options={"device_id": 0, "random_seed": 42},
+        model_session_factory=_smolvla_session_factory(environment),
+    )
+    pipeline.load()
+
+    request = InferenceRequest(
+        request_id="smolvla",
+        inputs={
+            "observation.state": np.arange(1, 7, dtype=np.float32),
+            "observation.images.top": np.ones((3, 4, 4), dtype=np.float32),
+            "observation.language.tokens": np.array([1, 2, 3], dtype=np.int64),
+            "observation.language.attention_mask": np.array([True, True, False]),
+            "noise": np.zeros((1, 2, 8), dtype=np.float32),
+        },
+    )
+
+    first = pipeline.infer(request)
+    second = pipeline.infer(request)
+
+    np.testing.assert_array_equal(first.action, second.action)
+    assert first.actual_chunk_size == second.actual_chunk_size
+    pipeline.close()
+
+
+def test_hmm_smolvla_seed_reproduces_sampled_noise_across_instances(tmp_path, monkeypatch):
+    from inference_service.pipeline import create_inference_pipeline
+
+    _patch_identity_processors(monkeypatch)
+
+    counter = 0
+
+    def build_and_infer(seed: int) -> np.ndarray:
+        nonlocal counter
+        counter += 1
+        root = tmp_path / f"seed-{seed}-{counter}"
+        context = _smolvla_context(root, runtime_options={"device_id": 0, "random_seed": seed})
+        environment = _smolvla_environment(context, [])
+        pipeline = create_inference_pipeline(
+            "smolvla",
+            context.validated_manifest,
+            runtime_options={"device_id": 0, "random_seed": seed},
+            model_session_factory=_smolvla_session_factory(environment),
+        )
+        pipeline.load()
+        try:
+            result = pipeline.infer(
+                InferenceRequest(
+                    request_id="smolvla",
+                    inputs={
+                        "observation.state": np.arange(1, 7, dtype=np.float32),
+                        "observation.images.top": np.ones((3, 4, 4), dtype=np.float32),
+                        "observation.language.tokens": np.array([1, 2, 3], dtype=np.int64),
+                        "observation.language.attention_mask": np.array([True, True, False]),
+                    },
+                )
+            )
+            return np.asarray(result.action)
+        finally:
+            pipeline.close()
+
+    np.testing.assert_array_equal(build_and_infer(42), build_and_infer(42))
 
 
 def test_hmm_registry_factory_is_lazy_and_reset_is_unsupported(tmp_path):
@@ -806,3 +957,61 @@ def test_hmm_rejects_invalid_runtime_options(tmp_path, runtime_options):
         create_backend(context)
 
     assert error.value.code == "invalid_runtime_options"
+
+
+def test_hmm_backend_fails_closed_for_pi05_after_factory_cutover(tmp_path):
+    context = _pi05_context(tmp_path)
+    environment = _pi05_environment(context, [])
+    backend = HMMBackend(0, runtime_loader=lambda: environment.runtime)
+
+    with pytest.raises(BackendLoadError, match="no longer hosts PI0.5") as error:
+        backend.load(context)
+
+    assert error.value.code == "unsupported_policy_backend_pair"
+    backend.close()
+
+
+def test_hmm_pi05_repeated_inference_is_deterministic_with_seed(tmp_path, monkeypatch):
+    from inference_service import pipeline as pipeline_module
+    from inference_service.model_sessions import HMMModelSession
+    from inference_service.pipeline import create_inference_pipeline
+
+    monkeypatch.setattr(
+        pipeline_module.factory,
+        "create_lerobot_processor_views",
+        lambda: (lambda inputs: inputs, lambda action: action),
+    )
+
+    context = _pi05_context(tmp_path, runtime_options={"device_id": 0, "random_seed": 42})
+    environment = _pi05_environment(context, [])
+
+    def session_factory(ctx, options):
+        return HMMModelSession(
+            device_id=int(options["device_id"]),
+            runtime_loader=lambda: environment.runtime,
+        )
+
+    pipeline = create_inference_pipeline(
+        "pi05",
+        context.validated_manifest,
+        runtime_options={"device_id": 0, "random_seed": 42},
+        model_session_factory=session_factory,
+    )
+    pipeline.load()
+
+    request = InferenceRequest(
+        request_id="pi05",
+        inputs={
+            "observation.images.top": np.ones((3, 4, 4), dtype=np.float32),
+            "observation.language.tokens": np.array([1, 2, 3], dtype=np.int64),
+            "observation.language.attention_mask": np.array([True, True, False]),
+            "noise": np.zeros((1, 2, 8), dtype=np.float32),
+        },
+    )
+
+    first = pipeline.infer(request)
+    second = pipeline.infer(request)
+
+    np.testing.assert_array_equal(first.action, second.action)
+    assert first.actual_chunk_size == second.actual_chunk_size
+    pipeline.close()

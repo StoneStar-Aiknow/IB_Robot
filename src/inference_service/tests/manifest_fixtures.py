@@ -187,6 +187,7 @@ def make_non_policy_manifest(
     bundle_paths: tuple[str, ...],
     *,
     deployment_name: str = "ascend",
+    family: str = "ram_plus",
     output_semantic: str = "tag_logits",
 ) -> dict[str, Any]:
     entries = [BundleFile(path=path) for path in bundle_paths]
@@ -209,7 +210,7 @@ def make_non_policy_manifest(
         },
         "model": {
             "kind": "perception",
-            "family": "ram_plus",
+            "family": family,
             "inputs": [
                 {
                     "semantic": "observation.image",

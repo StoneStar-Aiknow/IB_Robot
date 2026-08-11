@@ -28,6 +28,7 @@ from inference_service.backends import (
     BackendRegistryError,
     BackendResult,
     BackendState,
+    ConformanceEvidence,
     InferenceRequest,
     LifecycleBackend,
     PartialLoadRollback,
@@ -233,10 +234,10 @@ def _request(request_id: str = "request-1") -> InferenceRequest:
     return InferenceRequest(request_id=request_id, inputs={"value": 1.0}, metadata={"source": "test"})
 
 
-def _make_non_policy_context(root: Path) -> RuntimeContext:
+def _make_non_policy_context(root: Path, *, family: str = "ram_plus") -> RuntimeContext:
     root.mkdir()
     bundle_paths = create_non_policy_bundle(root)
-    write_manifest(root, make_non_policy_manifest(root, bundle_paths))
+    write_manifest(root, make_non_policy_manifest(root, bundle_paths, family=family))
     return RuntimeContext(load_inference_manifest(root, "ascend"))
 
 
@@ -571,6 +572,7 @@ def test_registry_validation_is_lazy_and_fake_factory_is_loaded_only_on_create(m
                 name="torch",
                 factory="tests.fake_backend_factory:create_backend",
                 supported_policy_families=frozenset({"act"}),
+                conformance_evidence=frozenset({ConformanceEvidence("policy", "act")}),
                 target_validator=lambda deployment: None,
             )
         }
@@ -590,6 +592,7 @@ def test_registry_does_not_instantiate_unavailable_backend_during_validation(tmp
                 name="rknn",
                 factory="tests.unavailable_backend_factory:create_backend",
                 supported_policy_families=frozenset({"act"}),
+                conformance_evidence=frozenset({ConformanceEvidence("policy", "act")}),
                 target_validator=lambda deployment: None,
             )
         }
@@ -646,6 +649,7 @@ def test_registry_accepts_non_policy_model_family_support(tmp_path):
                 factory="tests.fake_backend_factory:create_backend",
                 target_validator=lambda deployment: None,
                 supported_model_families=frozenset({"ram_plus"}),
+                conformance_evidence=frozenset({ConformanceEvidence("perception", "ram_plus")}),
             )
         }
     )
@@ -665,6 +669,8 @@ def test_registry_accepts_non_policy_model_kind_support(tmp_path):
                 factory="tests.fake_backend_factory:create_backend",
                 target_validator=lambda deployment: None,
                 supported_model_kinds=frozenset({"perception"}),
+                supported_model_families=frozenset({"ram_plus"}),
+                conformance_evidence=frozenset({ConformanceEvidence("perception", "ram_plus")}),
             )
         }
     )
@@ -673,9 +679,9 @@ def test_registry_accepts_non_policy_model_kind_support(tmp_path):
 
 
 def test_registry_rejects_undeclared_non_policy_model_support(tmp_path):
-    context = _make_non_policy_context(tmp_path / "bundle")
+    context = _make_non_policy_context(tmp_path / "bundle", family="siglip2")
 
-    with pytest.raises(BackendCompatibilityError, match=r"ascend.*ram_plus") as error:
+    with pytest.raises(BackendCompatibilityError, match=r"ascend.*siglip2") as error:
         BACKEND_REGISTRY.validate(context)
 
     assert error.value.code == "unsupported_model_backend_pair"
@@ -690,6 +696,123 @@ def test_descriptor_can_declare_model_support_without_policy_support():
     )
 
     descriptor.validate_definition()
+
+
+def _make_perception_context(
+    root: Path,
+    *,
+    backend: str = "ascend",
+    family: str = "ram_plus",
+    deployment_name: str = "ascend",
+) -> RuntimeContext:
+    root.mkdir()
+    bundle_paths = create_non_policy_bundle(root)
+    manifest = make_non_policy_manifest(root, bundle_paths, family=family)
+    if backend == "torch":
+        manifest["deployments"][deployment_name] = {
+            "uuid": "123e4567-e89b-42d3-a456-426614174001",
+            "revision": 1,
+            "backend": "torch",
+            "device": "cpu",
+        }
+    else:
+        manifest["deployments"][deployment_name] = manifest["deployments"]["ascend"]
+    write_manifest(root, manifest)
+    return RuntimeContext(load_inference_manifest(root, deployment_name))
+
+
+@pytest.mark.parametrize("backend", ["torch", "ascend", "hisilicon", "rknn", "hmm"])
+def test_static_registry_evidence_matches_declared_policy_matrix(backend):
+    descriptor = BACKEND_REGISTRY.descriptor(backend)
+    declared = descriptor.supported_policy_families
+    evidenced = {family for kind, family in descriptor.evidence_pairs if kind == "policy"}
+    assert declared == evidenced
+
+
+@pytest.mark.parametrize(
+    ("family", "backend"),
+    [
+        ("ram_plus", "torch"),
+        ("sam2", "torch"),
+        ("siglip2", "torch"),
+        ("grounding_dino", "torch"),
+        ("dummy_echo", "torch"),
+        ("ram_plus", "ascend"),
+    ],
+)
+def test_registry_supports_declared_perception_deployments(tmp_path, family, backend):
+    context = _make_perception_context(tmp_path / "bundle", backend=backend, family=family)
+
+    assert BACKEND_REGISTRY.validate(context).name == backend
+
+
+@pytest.mark.parametrize("family", ["sam2", "siglip2", "grounding_dino"])
+def test_registry_rejects_compiled_perception_family_on_ascend(tmp_path, family):
+    context = _make_perception_context(tmp_path / "bundle", backend="ascend", family=family)
+
+    with pytest.raises(BackendCompatibilityError, match="does not support") as error:
+        BACKEND_REGISTRY.validate(context)
+    assert error.value.code == "unsupported_model_backend_pair"
+
+
+def test_registry_validate_fails_closed_when_evidence_absent(tmp_path):
+    context = _make_perception_context(tmp_path / "bundle", backend="ascend", family="ram_plus")
+    registry = BackendRegistry(
+        {
+            "ascend": BackendDescriptor(
+                name="ascend",
+                factory="tests.fake_backend_factory:create_backend",
+                target_validator=lambda deployment: None,
+                supported_model_families=frozenset({"ram_plus"}),
+            )
+        }
+    )
+
+    with pytest.raises(BackendCompatibilityError, match="lacks conformance evidence") as error:
+        registry.validate(context)
+    assert error.value.code == "missing_conformance_evidence"
+
+
+def test_registry_validate_rejects_adapter_deployment_mismatch(tmp_path):
+    context = _make_perception_context(tmp_path / "bundle", backend="ascend", family="ram_plus")
+
+    with pytest.raises(BackendCompatibilityError, match="not in the adapter supported deployments") as error:
+        BACKEND_REGISTRY.validate(context, allowed_deployments=frozenset({"torch_cpu"}))
+    assert error.value.code == "adapter_deployment_mismatch"
+
+
+def test_descriptor_definition_rejects_evidence_overclaiming_support():
+    with pytest.raises(BackendRegistryError, match="claims undeclared policy family") as error:
+        BackendDescriptor(
+            name="ascend",
+            factory="tests.fake_backend_factory:create_backend",
+            target_validator=lambda deployment: None,
+            supported_policy_families=frozenset({"act"}),
+            conformance_evidence=frozenset({ConformanceEvidence("policy", "pi05")}),
+        ).validate_definition()
+    assert error.value.code == "evidence_overclaims_support"
+
+
+def test_descriptor_definition_rejects_non_policy_evidence_without_kind_or_family():
+    with pytest.raises(BackendRegistryError, match="claims undeclared model") as error:
+        BackendDescriptor(
+            name="ascend",
+            factory="tests.fake_backend_factory:create_backend",
+            target_validator=lambda deployment: None,
+            supported_model_families=frozenset({"ram_plus"}),
+            conformance_evidence=frozenset({ConformanceEvidence("perception", "sam2")}),
+        ).validate_definition()
+    assert error.value.code == "evidence_overclaims_support"
+
+
+def test_evidence_coherence_accepts_kind_backed_non_policy_evidence():
+    BackendDescriptor(
+        name="ascend",
+        factory="tests.fake_backend_factory:create_backend",
+        target_validator=lambda deployment: None,
+        supported_model_kinds=frozenset({"perception"}),
+        conformance_evidence=frozenset({ConformanceEvidence("perception", "ram_plus")}),
+    ).validate_definition()
 
 
 @pytest.mark.parametrize("alias", ["ascend_om", "ascend_om_3403", "3403", "om"])

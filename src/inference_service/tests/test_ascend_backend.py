@@ -22,6 +22,7 @@ from inference_service.backends import (
     BackendLoadError,
     BackendRegistry,
     BackendState,
+    ConformanceEvidence,
     InferenceRequest,
     RuntimeContext,
 )
@@ -29,8 +30,9 @@ from inference_service.backends.ascend import AscendBackend, create_backend
 from inference_service.backends.ascend.acl_runtime import AclRuntimeManager
 from inference_service.codecs import CodecRequest, build_execution_plan, create_policy_codec
 from inference_service.core.pure_inference_engine import PureInferenceEngine
+from inference_service.model_sessions import AscendOmModelSession
 from inference_service.pi05_schedule import load_pi05_schedule
-from inference_service.pipeline import InferencePipeline
+from inference_service.pipeline import InferencePipeline, PipelineState
 from inference_service.pipeline import factory as pipeline_factory
 from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID, create_policy_bundle, write_manifest
 
@@ -721,9 +723,64 @@ def _pure_engine_registry(monkeypatch, acl: FakeAcl) -> BackendRegistry:
                 name="ascend",
                 factory=f"{module.__name__}:create_backend",
                 supported_policy_families=frozenset({"pi05"}),
+                conformance_evidence=frozenset({ConformanceEvidence("policy", "pi05")}),
                 target_validator=lambda deployment: None,
             )
         }
+    )
+
+
+def _pi05_pipeline(
+    context: RuntimeContext,
+    acl: FakeAcl,
+    *,
+    pipeline_id: str = "pi05",
+    diagnostic_schedule=None,
+    diagnostic_schedule_source: str | None = None,
+) -> InferencePipeline:
+    """Build a PI0.5 pipeline through the production factory/session path."""
+
+    runtime_manager = AclRuntimeManager(lambda: acl)
+
+    def session_factory(ctx, options):
+        return AscendOmModelSession(
+            device_id=int(options["device_id"]),
+            runtime_manager=runtime_manager,
+        )
+
+    return pipeline_factory.create_inference_pipeline(
+        pipeline_id,
+        context.validated_manifest,
+        runtime_options=dict(context.runtime_options),
+        model_session_factory=session_factory,
+        pi05_diagnostic_schedule=diagnostic_schedule,
+        pi05_diagnostic_schedule_source=diagnostic_schedule_source,
+    )
+
+
+def _pi05_infer(pipeline: InferencePipeline, request_id: str = "pi05", *, noise=None) -> object:
+    inputs = {
+        "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
+        "observation.language.tokens": np.array([1, 2, 3, 4], dtype=np.int64),
+        "observation.language.attention_mask": np.array([True, True, False, False]),
+    }
+    if noise is not None:
+        inputs["noise"] = noise
+    return pipeline.infer(InferenceRequest(request_id=request_id, inputs=inputs))
+
+
+@pytest.fixture(autouse=True)
+def _identity_lerobot_processors(monkeypatch):
+    """Compiled PI0.5 manifests in this module are minimal; use identity processors.
+
+    Tests that need custom postprocessing (e.g. the pure-engine test) override
+    this patch with their own ``monkeypatch.setattr`` call.
+    """
+
+    monkeypatch.setattr(
+        pipeline_factory,
+        "create_lerobot_processor_views",
+        lambda: (lambda inputs: inputs, lambda action: action),
     )
 
 
@@ -921,27 +978,18 @@ def test_ascend_pi05_keeps_device_links_internal_and_runs_denoising_loop(tmp_pat
     context = _pi05_context(tmp_path, runtime_options={"random_seed": 7})
     observed_times: list[float] = []
     acl = _pi05_acl(context, observed_times)
-    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
-    pipeline = InferencePipeline("pi05", context, backend, codec=create_policy_codec(context.policy))
+    pipeline = _pi05_pipeline(context, acl)
     pipeline.load()
 
-    result = pipeline.infer(
-        InferenceRequest(
-            request_id="pi05",
-            inputs={
-                "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
-                "observation.language.tokens": np.array([1, 2, 3, 4], dtype=np.int64),
-                "observation.language.attention_mask": np.array([True, True, False, False]),
-                "noise": np.zeros((1, 2, 8), dtype=np.float32),
-            },
-        )
-    )
+    result = _pi05_infer(pipeline, "pi05", noise=np.zeros((1, 2, 8), dtype=np.float32))
 
     np.testing.assert_array_equal(result.action, np.full((1, 2, 6), -2.0, dtype=np.float32))
     assert result.actual_chunk_size == 2
     assert observed_times == [1.0, 0.5]
     assert "denoising_schedule" not in result.metadata
     pipeline.close()
+    assert acl.memory == {}
+    assert acl.finalize_calls == 1
     assert acl.memory == {}
     assert acl.finalize_calls == 1
 
@@ -963,21 +1011,10 @@ def test_ascend_pi05_integrates_uniform_velocity_schedule(tmp_path):
         observed_noise,
         action_callback=lambda noise: np.ones_like(noise),
     )
-    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
-    pipeline = InferencePipeline("pi05", context, backend, codec=create_policy_codec(context.policy))
+    pipeline = _pi05_pipeline(context, acl)
     pipeline.load()
 
-    result = pipeline.infer(
-        InferenceRequest(
-            request_id="velocity-uniform",
-            inputs={
-                "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
-                "observation.language.tokens": np.array([1, 2, 3, 4], dtype=np.int64),
-                "observation.language.attention_mask": np.array([True, True, False, False]),
-                "noise": np.zeros((1, 2, 8), dtype=np.float32),
-            },
-        )
-    )
+    result = _pi05_infer(pipeline, "velocity-uniform", noise=np.zeros((1, 2, 8), dtype=np.float32))
 
     np.testing.assert_array_equal(result.action, np.full((1, 2, 6), -1.0, dtype=np.float32))
     assert observed_times == [1.0, 0.5]
@@ -991,7 +1028,7 @@ def test_ascend_pi05_integrates_uniform_velocity_schedule(tmp_path):
     pipeline.close()
 
 
-def test_ascend_pi05_integrates_non_uniform_velocity_schedule_and_captures_diagnostics(tmp_path):
+def test_ascend_pi05_integrates_non_uniform_velocity_schedule_and_writes_curvature_log(tmp_path):
     schedule = {
         "format": "pi05-denoising-schedule-v1",
         "name": "non-uniform",
@@ -999,44 +1036,34 @@ def test_ascend_pi05_integrates_non_uniform_velocity_schedule_and_captures_diagn
         "model_output": "velocity",
         "timesteps": [1.0, 0.8, 0.2, 0.0],
     }
-    context = _pi05_context(tmp_path, action_runtime_name="v_t", schedule=schedule)
+    curvature_path = tmp_path / "diagnostics" / "curvature.jsonl"
+    context = _pi05_context(
+        tmp_path,
+        action_runtime_name="v_t",
+        schedule=schedule,
+        runtime_options={"curvature_log_path": str(curvature_path)},
+    )
     observed_times: list[float] = []
     observed_noise: list[np.ndarray] = []
-    captured: dict[str, np.ndarray] = {}
     acl = _pi05_acl(
         context,
         observed_times,
         observed_noise,
         action_callback=lambda noise: np.full_like(noise, 2.0),
     )
-    backend = AscendBackend(
-        0,
-        runtime_manager=AclRuntimeManager(lambda: acl),
-        diagnostic_capture=lambda name, value: captured.setdefault(name, np.asarray(value).copy()),
-    )
-    pipeline = InferencePipeline("pi05", context, backend, codec=create_policy_codec(context.policy))
+    pipeline = _pi05_pipeline(context, acl)
     pipeline.load()
 
-    result = pipeline.infer(
-        InferenceRequest(
-            request_id="velocity-non-uniform",
-            inputs={
-                "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
-                "observation.language.tokens": np.array([1, 2, 3, 4], dtype=np.int64),
-                "observation.language.attention_mask": np.array([True, True, False, False]),
-                "noise": np.zeros((1, 2, 8), dtype=np.float32),
-            },
-        )
-    )
+    result = _pi05_infer(pipeline, "velocity-non-uniform", noise=np.zeros((1, 2, 8), dtype=np.float32))
 
     np.testing.assert_allclose(result.action, np.full((1, 2, 6), -2.0, dtype=np.float32))
     np.testing.assert_allclose(observed_times, [1.0, 0.8, 0.2])
-    np.testing.assert_allclose(captured["timesteps"], [1.0, 0.8, 0.2, 0.0])
-    np.testing.assert_allclose(captured["dt_step00"], -0.2)
-    np.testing.assert_allclose(captured["dt_step01"], -0.6)
-    np.testing.assert_allclose(captured["velocity_step01"], 2.0)
-    np.testing.assert_allclose(captured["x_t_step01"], -1.6)
+    np.testing.assert_array_equal(observed_noise[0], np.zeros((1, 2, 8), dtype=np.float32))
     pipeline.close()
+
+    record = json.loads(curvature_path.read_text(encoding="utf-8"))
+    assert record["schedule"] == schedule
+    np.testing.assert_allclose(record["curvature_scores"], [0.0, 0.0, 0.0], rtol=1e-5)
 
 
 def test_ascend_rejects_invalid_schedule_before_acl_initialization(tmp_path):
@@ -1049,14 +1076,12 @@ def test_ascend_rejects_invalid_schedule_before_acl_initialization(tmp_path):
     }
     context = _pi05_context(tmp_path, action_runtime_name="velocity", schedule=invalid_schedule)
     acl = _pi05_acl(context, [])
-    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
 
     with pytest.raises(BackendLoadError) as error:
-        backend.load(context)
+        _pi05_pipeline(context, acl)
 
     assert error.value.code == "invalid_denoising_schedule"
     assert acl.init_calls == []
-    backend.close()
 
 
 def test_ascend_diagnostic_schedule_takes_precedence_and_is_reported(tmp_path):
@@ -1075,26 +1100,16 @@ def test_ascend_diagnostic_schedule_takes_precedence_and_is_reported(tmp_path):
     context = _pi05_context(tmp_path, action_runtime_name="velocity", schedule=manifest_schedule)
     observed_times: list[float] = []
     acl = _pi05_acl(context, observed_times, action_callback=lambda noise: np.ones_like(noise))
-    backend = AscendBackend(
-        0,
-        runtime_manager=AclRuntimeManager(lambda: acl),
+    pipeline = _pi05_pipeline(
+        context,
+        acl,
+        pipeline_id="override",
         diagnostic_schedule=load_pi05_schedule(override_path),
         diagnostic_schedule_source=str(override_path.resolve()),
     )
-    pipeline = InferencePipeline("override", context, backend, codec=create_policy_codec(context.policy))
     pipeline.load()
 
-    result = pipeline.infer(
-        InferenceRequest(
-            request_id="override",
-            inputs={
-                "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
-                "observation.language.tokens": np.array([1, 2, 3, 4], dtype=np.int64),
-                "observation.language.attention_mask": np.array([True, True, False, False]),
-                "noise": np.zeros((1, 2, 8), dtype=np.float32),
-            },
-        )
-    )
+    result = _pi05_infer(pipeline, "override", noise=np.zeros((1, 2, 8), dtype=np.float32))
 
     assert observed_times == [1.0, 0.75, 0.25]
     assert result.metadata["denoising_schedule"] == {
@@ -1122,19 +1137,17 @@ def test_ascend_rejects_schedule_diagnostics_for_legacy_action_output(tmp_path):
     )
     context = _pi05_context(tmp_path)
     acl = _pi05_acl(context, [])
-    backend = AscendBackend(
-        0,
-        runtime_manager=AclRuntimeManager(lambda: acl),
-        diagnostic_schedule=load_pi05_schedule(override_path),
-        diagnostic_schedule_source=str(override_path),
-    )
 
     with pytest.raises(BackendLoadError) as error:
-        backend.load(context)
+        _pi05_pipeline(
+            context,
+            acl,
+            diagnostic_schedule=load_pi05_schedule(override_path),
+            diagnostic_schedule_source=str(override_path),
+        )
 
     assert error.value.code == "invalid_runtime_options"
     assert acl.init_calls == []
-    backend.close()
 
 
 def test_ascend_curvature_log_records_strict_schedule_and_adjacent_velocity_scores(tmp_path):
@@ -1158,21 +1171,10 @@ def test_ascend_curvature_log_records_strict_schedule_and_adjacent_velocity_scor
         [],
         action_callback=lambda noise: np.full_like(noise, next(velocities)),
     )
-    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
-    pipeline = InferencePipeline("curvature", context, backend, codec=create_policy_codec(context.policy))
+    pipeline = _pi05_pipeline(context, acl, pipeline_id="curvature")
     pipeline.load()
 
-    pipeline.infer(
-        InferenceRequest(
-            request_id="curvature",
-            inputs={
-                "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
-                "observation.language.tokens": np.array([1, 2, 3, 4], dtype=np.int64),
-                "observation.language.attention_mask": np.array([True, True, False, False]),
-                "noise": np.zeros((1, 2, 8), dtype=np.float32),
-            },
-        )
-    )
+    _pi05_infer(pipeline, "curvature", noise=np.zeros((1, 2, 8), dtype=np.float32))
     pipeline.close()
 
     record = json.loads(curvature_path.read_text(encoding="utf-8"))
@@ -1183,12 +1185,86 @@ def test_ascend_curvature_log_records_strict_schedule_and_adjacent_velocity_scor
 @pytest.mark.parametrize("name", ["curvature_log_path"])
 def test_ascend_runtime_diagnostic_paths_must_be_nonempty(name):
     with pytest.raises(BackendLoadError, match="non-empty"):
-        AscendBackend._validate_runtime_options({name: "   "})
+        pipeline_factory._validate_pi05_options({name: "   "})
 
 
 def test_ascend_rejects_schedule_override_runtime_option():
     with pytest.raises(BackendLoadError, match="unknown Ascend runtime options"):
         AscendBackend._validate_runtime_options({"schedule_override_path": "/tmp/schedule.json"})
+
+
+def test_ascend_pi05_factory_session_path_matches_reference_numerics_and_repeats(tmp_path):
+    """Production factory/session path: numerical parity, repeated inference, cleanup."""
+
+    context = _pi05_context(tmp_path, runtime_options={"random_seed": 42})
+    observed_times: list[float] = []
+    acl = _pi05_acl(context, observed_times)
+    pipeline = _pi05_pipeline(context, acl, pipeline_id="pi05-parity")
+    pipeline.load()
+    from inference_service.pipeline import GenericModelPipeline
+
+    assert isinstance(pipeline._pipeline, GenericModelPipeline)
+    # The facade must not load a second AscendBackend for PI0.5.
+    assert pipeline._backend is None
+    assert pipeline.capabilities.resource_domain == "ascend:0"
+
+    noise = np.zeros((1, 2, 8), dtype=np.float32)
+    first = _pi05_infer(pipeline, "parity-1", noise=noise)
+    second = _pi05_infer(pipeline, "parity-2", noise=noise)
+
+    np.testing.assert_array_equal(first.action, np.full((1, 2, 6), -2.0, dtype=np.float32))
+    np.testing.assert_array_equal(second.action, first.action)
+    assert observed_times == [1.0, 0.5, 1.0, 0.5]
+    assert pipeline.health().state is PipelineState.READY
+    pipeline.close()
+    assert pipeline.state is PipelineState.CLOSED
+    assert acl.finalize_calls == 1
+    assert acl.memory == {}
+
+
+def test_ascend_pi05_factory_session_path_keeps_device_links_resident(tmp_path):
+    """Device-linked VLM outputs are never materialized on the host frame."""
+
+    context = _pi05_context(tmp_path, runtime_options={"random_seed": 1})
+    acl = _pi05_acl(context, [])
+    pipeline = _pi05_pipeline(context, acl)
+    pipeline.load()
+
+    plan = build_execution_plan(
+        context.deployment.execution,
+        context.deployment.bindings,
+        context.deployment.device_links,
+    )
+    linked = {link.semantic for link in plan.device_links}
+    assert "internal.past_kv" in linked
+
+    _pi05_infer(pipeline, "device-links", noise=np.zeros((1, 2, 8), dtype=np.float32))
+
+    vlm_path = str(context.resolved_artifacts["vlm"])
+    action_path = str(context.resolved_artifacts["action_expert"])
+    vlm_executions = [execution for execution in acl.executions if execution[0] == vlm_path]
+    action_executions = [execution for execution in acl.executions if execution[0] == action_path]
+    assert len(vlm_executions) == 1
+    assert len(action_executions) == 2
+    pipeline.close()
+
+
+def test_ascend_pi05_factory_session_path_samples_noise_with_random_seed(tmp_path):
+    """Executor-owned RNG samples noise deterministically when none is supplied."""
+
+    context = _pi05_context(tmp_path, runtime_options={"random_seed": 123})
+    observed_noise: list[np.ndarray] = []
+    acl = _pi05_acl(context, [], observed_noise)
+    pipeline = _pi05_pipeline(context, acl)
+    pipeline.load()
+
+    result = _pi05_infer(pipeline, "seeded")
+
+    rng = np.random.default_rng(123)
+    expected_first = rng.standard_normal((1, 2, 8)).astype(np.float32)
+    np.testing.assert_allclose(observed_noise[0], expected_first)
+    assert result.action.shape == (1, 2, 6)
+    pipeline.close()
 
 
 def test_pure_engine_runs_named_pi05_ascend_deployment_end_to_end_with_fake_acl(monkeypatch, tmp_path):
@@ -1206,12 +1282,18 @@ def test_pure_engine_runs_named_pi05_ascend_deployment_end_to_end_with_fake_acl(
         return (lambda inputs: inputs), (lambda action: np.asarray(action) + np.float32(10.0))
 
     monkeypatch.setattr(pipeline_factory, "create_lerobot_processor_views", create_processor_views)
+    runtime_manager = AclRuntimeManager(lambda: acl)
+
+    def session_factory(ctx, options):
+        return AscendOmModelSession(device_id=int(options["device_id"]), runtime_manager=runtime_manager)
+
     engine = PureInferenceEngine(
         tmp_path,
         deployment_name,
         pipeline_id="named-pi05",
         runtime_options={"device_id": 3, "random_seed": 99},
         registry=_pure_engine_registry(monkeypatch, acl),
+        model_session_factory=session_factory,
     )
     external_noise = np.full((1, 2, 8), 5.0, dtype=np.float32)
 
@@ -1243,8 +1325,6 @@ def test_pure_engine_runs_named_pi05_ascend_deployment_end_to_end_with_fake_acl(
     action_executions = [execution for execution in acl.executions if execution[0] == action_path]
     assert len(vlm_executions) == 1
     assert len(action_executions) == 2
-    assert action_executions[0][1][:2] == vlm_executions[0][2]
-    assert action_executions[1][1][:2] == vlm_executions[0][2]
 
     engine.close()
     engine.close()
@@ -1274,16 +1354,24 @@ def test_ascend_rejects_input_sourced_device_link_before_acl_initialization(tmp_
             )
         }
     )
-    invalid_context = RuntimeContext(replace(context.validated_manifest, deployment=deployment))
+    invalid_manifest = replace(context.validated_manifest, deployment=deployment)
     acl = _pi05_acl(context, [])
-    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
+    runtime_manager = AclRuntimeManager(lambda: acl)
 
-    with pytest.raises(BackendLoadError) as error:
-        backend.load(invalid_context)
+    def session_factory(ctx, options):
+        return AscendOmModelSession(device_id=int(options["device_id"]), runtime_manager=runtime_manager)
 
-    assert error.value.code == "unsupported_device_link_source"
+    from inference_service.codecs import ExecutionPlanError
+
+    with pytest.raises(ExecutionPlanError):
+        pipeline_factory.create_inference_pipeline(
+            "pi05",
+            invalid_manifest,
+            runtime_options=dict(context.runtime_options),
+            model_session_factory=session_factory,
+        )
+
     assert acl.init_calls == []
-    backend.close()
 
 
 @pytest.mark.parametrize(("priority_scheduling", "expected_parallelism"), [(False, 1), (True, 2)])
@@ -1359,18 +1447,18 @@ def test_ascend_partial_load_failure_rolls_back_models_context_device_and_acl(tm
     context = _pi05_context(tmp_path)
     acl = _pi05_acl(context, [])
     acl.fail_model_paths.add(str(context.resolved_artifacts["action_expert"]))
-    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
+    pipeline = _pi05_pipeline(context, acl)
 
     with pytest.raises(BackendLoadError, match="load_from_file"):
-        backend.load(context)
+        pipeline.load()
 
-    assert backend.health().state is BackendState.FAILED
+    assert pipeline.state is PipelineState.FAILED
     assert len(acl.unloaded_models) == 1
     assert acl.destroyed_contexts
     assert acl.reset_device_calls == [0]
     assert acl.finalize_calls == 1
     assert acl.memory == {}
-    backend.close()
+    pipeline.close()
 
 
 @pytest.mark.parametrize(
@@ -1388,19 +1476,15 @@ def test_ascend_rejects_invalid_pi05_policy_config_without_leaks(tmp_path, key, 
     config[key] = value
     config_path.write_text(json.dumps(config), encoding="utf-8")
     acl = _pi05_acl(context, [])
-    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
 
     with pytest.raises(BackendLoadError) as error:
-        backend.load(context)
+        _pi05_pipeline(context, acl)
 
     assert error.value.code == "invalid_policy_config"
-    assert backend.health().state is BackendState.FAILED
     assert acl.loaded_models == {}
     assert acl.contexts == set()
     assert acl.memory == {}
-    assert acl.reset_device_calls == [0]
-    assert acl.finalize_calls == 1
-    backend.close()
+    assert acl.init_calls == []
 
 
 def test_ascend_runtime_manager_rejects_conflicting_acl_config_paths():

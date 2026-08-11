@@ -21,6 +21,12 @@ def test_uniform_schedule_round_trip(tmp_path):
     assert schedule.step_count == 4
     assert load_pi05_schedule(path) == schedule
     assert json.loads(path.read_text(encoding="utf-8")) == schedule.to_dict()
+    assert [(step.index, step.timestep, step.delta) for step in schedule.iteration_steps()] == [
+        (0, 1.0, -0.25),
+        (1, 0.75, -0.25),
+        (2, 0.5, -0.25),
+        (3, 0.25, -0.25),
+    ]
 
 
 @pytest.mark.parametrize(

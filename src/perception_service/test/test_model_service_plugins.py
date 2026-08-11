@@ -6,7 +6,12 @@ import pytest
 from sensor_msgs.msg import Image
 
 from inference_manifest import BundleFile, CompiledDeployment, canonical_bundle_digest, load_inference_manifest
-from inference_service.backends import BackendCapabilities
+from inference_service.backends import (
+    BackendCapabilities,
+    BackendCompatibilityError,
+    BackendDescriptor,
+    BackendRegistry,
+)
 from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import RuntimeContext
 from inference_service.generic_runtime import NamedTensorRequest
@@ -333,6 +338,9 @@ def test_siglip_image_and_text_use_independent_sessions_and_execute_named_reques
     text_plugin.handle(SimpleNamespace(texts=["cup", "table"]), text_response)
 
     assert image_plugin.session is not text_plugin.session
+    assert type(image_plugin.adapter) is SigLIP2ImageAdapter
+    assert type(text_plugin.adapter) is SigLIP2TextAdapter
+    assert image_plugin.adapter.identity.family == text_plugin.adapter.identity.family == "siglip2"
     assert image_identity == text_identity
     assert image_identity.embedding_space_id == "siglip2-test-space"
     assert image_identity.dimension == 4
@@ -443,3 +451,46 @@ def test_conformant_ram_plus_compiled_deployment_selects_ascend_session() -> Non
 
     assert isinstance(session, AscendOmModelSession)
     session.close()
+
+
+def test_plugin_rejects_deployment_absent_from_adapter_supported_deployments(tmp_path) -> None:
+    validated = _write_bundle(tmp_path / "ram_plus", "ram_plus")
+    renamed = SimpleNamespace(
+        manifest=validated.manifest,
+        bundle_root=validated.bundle_root,
+        deployment=validated.deployment,
+        deployment_name="torch_unknown",
+        fingerprint=validated.fingerprint,
+        policy=None,
+    )
+
+    with pytest.raises(BackendCompatibilityError, match="not in the adapter supported deployments") as error:
+        RAMPlusRecognizeTagsPlugin(_host(), renamed, {})
+    assert error.value.code == "adapter_deployment_mismatch"
+
+
+def test_plugin_fails_closed_when_registry_lacks_conformance_evidence(tmp_path, monkeypatch) -> None:
+    validated = _write_bundle(tmp_path / "sam2", "sam2")
+    evidence_free_registry = BackendRegistry(
+        {
+            "torch": BackendDescriptor(
+                name="torch",
+                factory="tests.fake_backend_factory:create_backend",
+                target_validator=lambda deployment: None,
+                supported_model_families=frozenset({"sam2"}),
+            )
+        }
+    )
+    monkeypatch.setattr(_SessionPlugin, "_registry", evidence_free_registry)
+
+    with pytest.raises(BackendCompatibilityError, match="lacks conformance evidence") as error:
+        SAM2GenerateMasksPlugin(_host(), validated, {})
+    assert error.value.code == "missing_conformance_evidence"
+
+
+def test_plugin_validates_registry_support_before_session_load(tmp_path) -> None:
+    validated = _write_bundle(tmp_path / "ram_plus", "ram_plus")
+    plugin = RAMPlusRecognizeTagsPlugin(_host(), validated, {})
+
+    assert plugin.session.health().ready
+    plugin.close()

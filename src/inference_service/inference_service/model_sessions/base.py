@@ -7,11 +7,12 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 import numpy as np
 
-from inference_manifest import SemanticTensor
+from inference_manifest import CompiledDeployment, SemanticTensor
 from inference_service.backends.admission import BackendAdmission, ResourceDomainAdmissions
 from inference_service.backends.errors import (
     BackendAdmissionError,
@@ -26,6 +27,40 @@ from inference_service.backends.errors import (
 from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.backends.types import BackendCapabilities, BackendHealth, BackendState, RuntimeContext
 from inference_service.generic_runtime import DeploymentIdentity, NamedTensorRequest, NamedTensorResult, RuntimeLatency
+
+
+@dataclass
+class ModelSessionExecution:
+    """One admitted request scope for manifest role execution."""
+
+    _session: ModelSession
+    request: NamedTensorRequest
+
+    def invoke(self, role: str, inputs: Mapping[str, object]) -> Mapping[str, object]:
+        self._session._raise_if_deadline_expired(self.request.deadline)
+        try:
+            outputs = self._session._execute_role(role, inputs, self.request)
+            self._session._validate_role_values(role, inputs, outputs)
+            self._session._raise_if_deadline_expired(self.request.deadline)
+        except BackendAdmissionError as exc:
+            if exc.operation_started:
+                raise
+            raise BackendAdmissionError(str(exc), code=exc.code, operation_started=True) from exc
+        except Exception as exc:
+            error = (
+                exc
+                if isinstance(exc, BackendError)
+                else BackendInferenceError(f"model session {self._session.name!r} runtime failure: {exc}")
+            )
+            with self._session._condition:
+                self._session._record_failure(error)
+            if error is exc:
+                raise
+            raise error from exc
+        else:
+            with self._session._condition:
+                self._session._last_successful_inference_time = datetime.now(timezone.utc)
+            return outputs
 
 
 class ModelSession(ABC):
@@ -59,6 +94,17 @@ class ModelSession(ABC):
     @property
     def capabilities(self) -> BackendCapabilities:
         return self._capabilities
+
+    def _update_loaded_capabilities(self, **changes: object) -> None:
+        """Refine observational capabilities while the session is loading."""
+
+        with self._condition:
+            if self._state is not BackendState.LOADING:
+                raise BackendLifecycleError(
+                    f"model session {self.name!r} can update capabilities only while loading",
+                    code="invalid_capability_update_state",
+                )
+            self._capabilities = replace(self._capabilities, **changes)
 
     @property
     def runtime_version(self) -> str:
@@ -144,7 +190,9 @@ class ModelSession(ABC):
                 if not execution_started:
                     raise
                 if isinstance(exc, BackendAdmissionError):
-                    raise
+                    if exc.operation_started:
+                        raise
+                    raise BackendAdmissionError(str(exc), code=exc.code, operation_started=True) from exc
                 error = (
                     exc
                     if isinstance(exc, BackendError)
@@ -159,6 +207,29 @@ class ModelSession(ABC):
                 with self._condition:
                     self._last_successful_inference_time = datetime.now(timezone.utc)
                 return result
+            finally:
+                with self._condition:
+                    self._active_operations -= 1
+                    self._condition.notify_all()
+
+    @contextmanager
+    def execution(self, request: NamedTensorRequest):
+        """Admit one request across multiple manifest role invocations."""
+
+        if not isinstance(request, NamedTensorRequest):
+            raise TypeError("model sessions require a NamedTensorRequest")
+        self._require_ready()
+        with self._admission.admit(request.deadline):
+            with self._condition:
+                self._require_ready_locked()
+                self._active_operations += 1
+            try:
+                self._raise_if_deadline_expired(request.deadline)
+                context = self._require_context()
+                model_inputs = context.validated_manifest.manifest.model.inputs
+                if model_inputs:
+                    self._validate_values(request.inputs, model_inputs, "input")
+                yield ModelSessionExecution(self, request)
             finally:
                 with self._condition:
                     self._active_operations -= 1
@@ -314,6 +385,16 @@ class ModelSession(ABC):
     @abstractmethod
     def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]: ...
 
+    def _execute_role(
+        self,
+        role: str,
+        inputs: Mapping[str, object],
+        request: NamedTensorRequest,
+    ) -> Mapping[str, object]:
+        raise BackendCapabilityError(
+            f"model session {self.name!r} does not implement manifest role {role!r}", capability="role_execution"
+        )
+
     @abstractmethod
     def _close(self) -> None: ...
 
@@ -333,6 +414,34 @@ class ModelSession(ABC):
         if self._context is None:
             raise BackendInferenceError("model session is not fully loaded", code="runtime_not_loaded")
         return self._context
+
+    def _validate_role_values(
+        self,
+        role: str,
+        inputs: Mapping[str, object],
+        outputs: Mapping[str, object],
+    ) -> None:
+        deployment = self._require_context().deployment
+        if not isinstance(deployment, CompiledDeployment):
+            raise BackendInferenceError("role execution requires a compiled deployment", code="invalid_deployment")
+        try:
+            bindings = deployment.bindings[role]
+        except KeyError as exc:
+            raise BackendInferenceError(f"unknown execution role {role!r}", code="unknown_execution_role") from exc
+        linked_inputs = {
+            link.semantic
+            for link in deployment.device_links
+            if link.consumer == role and link.transport == "device_pointer"
+        }
+        host_inputs = tuple(binding for binding in bindings.inputs if binding.semantic not in linked_inputs)
+        linked_outputs = {
+            link.semantic
+            for link in deployment.device_links
+            if link.producer == role and link.transport == "device_pointer"
+        }
+        host_outputs = tuple(binding for binding in bindings.outputs if binding.semantic not in linked_outputs)
+        self._validate_values(inputs, host_inputs, f"role_{role}_input")
+        self._validate_values(outputs, host_outputs, f"role_{role}_output")
 
     def _require_ready(self) -> None:
         with self._condition:

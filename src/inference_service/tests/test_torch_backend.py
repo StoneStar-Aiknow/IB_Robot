@@ -254,6 +254,40 @@ def test_torch_backend_loads_original_bundle_and_preserves_native_inference_cont
     assert backend.health().state is BackendState.CLOSED
 
 
+@pytest.mark.parametrize("policy_type", ["act", "diffusion", "pi05", "smolvla"])
+def test_torch_policy_families_delegate_one_action_chunk_call(monkeypatch, tmp_path, policy_type):
+    torch = pytest.importorskip("torch")
+    from inference_service.pipeline import create_inference_pipeline
+
+    calls = {}
+    _install_fake_lerobot(monkeypatch, torch, calls)
+    context = _make_context(tmp_path / policy_type, policy_type=policy_type)
+    pipeline = create_inference_pipeline(policy_type, context.validated_manifest)
+    pipeline.load()
+    policy = calls["policy"]
+    action_calls = 0
+
+    def recording_chunk(batch, noise=None):
+        nonlocal action_calls
+        del batch, noise
+        action_calls += 1
+        return torch.zeros((1, 2, 6), dtype=torch.float32)
+
+    policy.predict_action_chunk = recording_chunk
+    result = pipeline.infer(
+        InferenceRequest(
+            request_id=f"{policy_type}-delegated",
+            inputs={"observation.state": torch.zeros((1, 3))},
+        )
+    )
+
+    assert action_calls == 1
+    assert result.metadata["policy_type"] == policy_type
+    assert result.metadata["action_method"] == "predict_action_chunk"
+    assert pipeline._pi05_handle is None
+    pipeline.close()
+
+
 def test_torch_backend_places_noise_at_action_projection_dtype():
     torch = pytest.importorskip("torch")
     from inference_service.backends.torch import TorchBackend

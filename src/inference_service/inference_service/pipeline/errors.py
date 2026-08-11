@@ -101,6 +101,18 @@ class PipelineTimeoutError(PipelineError):
         )
 
 
+class PipelineCanceledError(PipelineError):
+    def __init__(self, request_id: str, *, stage: str = "pipeline") -> None:
+        super().__init__(
+            f"inference request {request_id!r} was canceled",
+            code="request_canceled",
+            details={"request_id": request_id, "stage": stage},
+        )
+        self.request_id = request_id
+        self.stage = stage
+        self.recoverable = True
+
+
 class PipelineNotFoundError(PipelineError):
     def __init__(self, pipeline_id: str, available: tuple[str, ...]) -> None:
         super().__init__(

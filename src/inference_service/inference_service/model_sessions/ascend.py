@@ -8,11 +8,26 @@ import numpy as np
 
 from inference_manifest import INTERNAL_SEMANTIC_PREFIX, CompiledDeployment, TensorBinding
 from inference_service.backends.admission import ResourceDomainAdmissions
-from inference_service.backends.ascend.acl_runtime import ACL_RUNTIME_MANAGER, AclRuntimeLease, AclRuntimeManager
+from inference_service.backends.ascend.acl_runtime import (
+    ACL_RUNTIME_MANAGER,
+    AclPriorityStreamPool,
+    AclRuntimeLease,
+    AclRuntimeManager,
+)
 from inference_service.backends.ascend.model import AclModel
-from inference_service.backends.errors import BackendInferenceError, BackendLifecycleError, BackendLoadError
+from inference_service.backends.errors import (
+    BackendAdmissionError,
+    BackendInferenceError,
+    BackendLifecycleError,
+    BackendLoadError,
+)
 from inference_service.backends.lifecycle import PartialLoadRollback
-from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
+from inference_service.backends.types import (
+    BackendAdmissionEvidence,
+    BackendCapabilities,
+    BackendPriorityMapping,
+    RuntimeContext,
+)
 from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.base import ModelSession
 
@@ -31,16 +46,20 @@ class AscendOmModelSession(ModelSession):
         runtime_manager: AclRuntimeManager = ACL_RUNTIME_MANAGER,
         model_factory=AclModel,
         domains: ResourceDomainAdmissions | None = None,
+        priority_scheduling: bool = False,
     ) -> None:
         if type(device_id) is not int or device_id < 0:
             raise ValueError("device_id must be a non-negative integer")
+        if not isinstance(priority_scheduling, bool):
+            raise TypeError("priority_scheduling must be a bool")
         super().__init__(
             "model-session:ascend",
             BackendCapabilities(
                 max_in_flight_per_instance=1,
                 supports_multiple_instances=True,
-                resource_domain=f"ascend:{device_id}",
-                max_in_flight_per_resource_domain=1,
+                hardware_resource_id=f"ascend:{device_id}" if priority_scheduling else None,
+                resource_domain=None if priority_scheduling else f"ascend:{device_id}",
+                max_in_flight_per_resource_domain=None if priority_scheduling else 1,
                 admission_evidence=BackendAdmissionEvidence(
                     sdk_initialization=True,
                     multi_instance_execution=True,
@@ -51,9 +70,11 @@ class AscendOmModelSession(ModelSession):
             domains=domains,
         )
         self._device_id = device_id
+        self._priority_scheduling = priority_scheduling
         self._runtime_manager = runtime_manager
         self._model_factory = model_factory
         self._lease: AclRuntimeLease | None = None
+        self._priority_streams: AclPriorityStreamPool | None = None
         self._models: dict[str, AclModel] = {}
         self._linked_inputs: frozenset[tuple[str, str]] = frozenset()
 
@@ -62,6 +83,11 @@ class AscendOmModelSession(ModelSession):
         return self._runtime_version(None if self._lease is None else self._lease.acl)
 
     def _load(self, context: RuntimeContext, rollback: PartialLoadRollback) -> None:
+        if context.priority_scheduling != self._priority_scheduling:
+            raise BackendLoadError(
+                "Ascend model-session priority mode differs from its runtime context",
+                code="deployment_context_mismatch",
+            )
         deployment = context.deployment
         if not isinstance(deployment, CompiledDeployment) or deployment.backend != "ascend":
             raise BackendLoadError(
@@ -92,6 +118,9 @@ class AscendOmModelSession(ModelSession):
             raise BackendLoadError("acl_config_path must be a non-empty string", code="invalid_runtime_options")
         lease = self._runtime_manager.acquire(self._device_id, config_path)
         rollback.defer(lease.close)
+        priority_streams = AclPriorityStreamPool.create(lease) if self._priority_scheduling else None
+        if priority_streams is not None:
+            rollback.defer(priority_streams.close)
         models: dict[str, AclModel] = {}
 
         def close_models() -> None:
@@ -134,15 +163,23 @@ class AscendOmModelSession(ModelSession):
                 input_overrides[int(consumer_binding.index)] = producer_buffer
             models[role].prepare_datasets(input_overrides=input_overrides)
         self._lease = lease
+        self._priority_streams = priority_streams
         self._models = models
         self._linked_inputs = frozenset(linked_inputs)
+        self._update_loaded_capabilities(
+            priority_mapping=(
+                BackendPriorityMapping(tuple(range(priority_streams.level_count)))
+                if priority_streams is not None
+                else None
+            )
+        )
 
     def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
         deployment = self._loaded_deployment()
         values = dict(request.inputs)
         public_outputs: dict[str, object] = {}
         for role_index, role in enumerate(deployment.execution):
-            for semantic, output in self._run_role(role_index, role, values).items():
+            for semantic, output in self._run_role(role_index, role, values, request=request).items():
                 if not semantic.startswith(INTERNAL_SEMANTIC_PREFIX):
                     public_outputs[semantic] = output
         return public_outputs
@@ -153,7 +190,14 @@ class AscendOmModelSession(ModelSession):
             raise BackendInferenceError("Ascend OM model session is not loaded", code="runtime_not_loaded")
         return deployment
 
-    def _run_role(self, role_index: int, role: str, values: dict[str, object]) -> dict[str, np.ndarray]:
+    def _run_role(
+        self,
+        role_index: int,
+        role: str,
+        values: dict[str, object],
+        *,
+        request: NamedTensorRequest,
+    ) -> dict[str, np.ndarray]:
         """Execute one manifest role and write its outputs back into ``values``.
 
         Sessions whose roles are joined by the compiled graph alone walk ``execution``
@@ -165,6 +209,7 @@ class AscendOmModelSession(ModelSession):
         runtime_outputs = self._models[role].execute(
             self._role_inputs(role, values),
             read_outputs=self._role_read_indices(role_index, role),
+            stream=self._request_stream(request),
         )
         outputs: dict[str, np.ndarray] = {}
         for binding in self._loaded_deployment().bindings[role].outputs:
@@ -225,13 +270,61 @@ class AscendOmModelSession(ModelSession):
         }
         return public_indices | host_internal_indices
 
+    def _execute_role(
+        self,
+        role: str,
+        inputs: Mapping[str, object],
+        request: NamedTensorRequest,
+    ) -> Mapping[str, object]:
+        deployment = self._loaded_deployment()
+        try:
+            role_index = deployment.execution.index(role)
+        except ValueError as exc:
+            raise BackendInferenceError(
+                f"unknown or unloaded Ascend role {role!r}", code="unknown_execution_role"
+            ) from exc
+        return self._run_role(role_index, role, dict(inputs), request=request)
+
+    def _request_stream(self, request: NamedTensorRequest) -> object | None:
+        streams = self._priority_streams
+        if streams is None:
+            if request.priority != 0:
+                raise BackendAdmissionError(
+                    "non-zero Ascend priority requires scheduler-enabled priority streams",
+                    code="hardware_priority_unavailable",
+                )
+            return None
+        mapping = self.capabilities.priority_mapping
+        if mapping is None:
+            raise BackendAdmissionError(
+                "Ascend priority mapping is unavailable",
+                code="hardware_priority_unavailable",
+            )
+        try:
+            native_priority = mapping.map_generic(request.priority)
+        except ValueError as exc:
+            raise BackendAdmissionError(str(exc), code="unsupported_priority") from exc
+        if not streams.supports(native_priority):
+            raise BackendAdmissionError(
+                f"Ascend hardware does not expose native priority {native_priority}",
+                code="hardware_priority_unavailable",
+            )
+        return streams.select(native_priority)
+
     def _close(self) -> None:
         models = self._models
         lease = self._lease
+        priority_streams = self._priority_streams
         self._models = {}
         self._lease = None
+        self._priority_streams = None
         self._linked_inputs = frozenset()
         errors: list[Exception] = []
+        if priority_streams is not None:
+            try:
+                priority_streams.close()
+            except Exception as exc:
+                errors.append(exc)
         for model in reversed(tuple(models.values())):
             try:
                 model.close()

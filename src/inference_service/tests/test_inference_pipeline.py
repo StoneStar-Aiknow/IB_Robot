@@ -1268,3 +1268,183 @@ def test_close_is_terminal_idempotent_and_prevents_load_or_infer(tmp_path):
     with pytest.raises(PipelineNotReadyError) as infer_error:
         pipeline.infer(_request())
     assert infer_error.value.details["state"] == "closed"
+
+
+# ---------------------------------------------------------------------------
+# Compatibility facade architecture tests (task 2.6)
+# ---------------------------------------------------------------------------
+
+
+def test_facade_delegates_lifecycle_to_generic_pipeline_without_independent_state(tmp_path):
+    """InferencePipeline wraps GenericModelPipeline and delegates all lifecycle state."""
+    from inference_service.pipeline import GenericModelPipeline
+
+    pipeline, backend = _native_pipeline(tmp_path / "bundle", "policy")
+    assert isinstance(pipeline._pipeline, GenericModelPipeline)
+    assert not hasattr(pipeline, "_state_machine")
+    assert not hasattr(pipeline, "_condition")
+    assert not hasattr(pipeline, "_active_requests")
+
+    pipeline.load()
+    assert pipeline.state is pipeline._pipeline.state
+    assert pipeline.state is PipelineState.READY
+
+    pipeline.close()
+    assert pipeline.state is PipelineState.CLOSED
+    assert backend.close_calls == 1
+
+
+def test_facade_diagnostics_reflect_unified_runtime_state(tmp_path):
+    """Diagnostics are mapped from PipelineRuntimeDiagnostics, not independent state."""
+    pipeline, backend = _native_pipeline(tmp_path / "bundle", "policy")
+    pipeline.load()
+
+    runtime_diag = pipeline._pipeline.diagnostics()
+    pipeline_diag = pipeline.diagnostics()
+
+    assert pipeline_diag.pipeline_id == runtime_diag.pipeline_id
+    assert pipeline_diag.state is runtime_diag.state
+    assert pipeline_diag.backend_health == runtime_diag.executor_health
+    assert pipeline_diag.active_requests == runtime_diag.active_requests
+    assert pipeline_diag.deployment_fingerprint == runtime_diag.deployment.deployment_fingerprint
+    assert pipeline_diag.backend == runtime_diag.deployment.backend
+    assert pipeline_diag.default_task_configured is False
+    pipeline.close()
+
+
+def test_facade_cancel_delegates_to_unified_request_control_path(tmp_path):
+    """cancel() marks the core control, delegates backend cancel, and discards the late result as request_canceled."""
+    backend = MockBackend(
+        "cancellable",
+        capabilities=BackendCapabilities(resettable=True, stateful=True, supports_cancellation=True),
+        domains=ResourceDomainAdmissions(),
+    )
+    pipeline, backend = _native_pipeline(tmp_path / "bundle", "policy", backend=backend)
+    pipeline.load()
+
+    infer_started = threading.Event()
+    infer_release = threading.Event()
+
+    def slow_result(request: InferenceRequest) -> BackendResult:
+        infer_started.set()
+        infer_release.wait(timeout=2.0)
+        return BackendResult(
+            action=np.zeros((1, 2, 6), dtype=np.float32),
+            actual_chunk_size=2,
+            backend_latency_ms=10.0,
+        )
+
+    backend.result_factory = slow_result
+
+    errors: list[BaseException] = []
+
+    def run_infer():
+        try:
+            pipeline.infer(_request("cancel-target"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_infer)
+    thread.start()
+    assert infer_started.wait(timeout=2.0)
+
+    core = pipeline._pipeline._core
+    assert "cancel-target" in core._request_controls
+
+    pipeline.cancel("cancel-target")
+    infer_release.set()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert "cancel-target" not in core._request_controls
+    assert backend.cancel_calls == ["cancel-target"]
+    assert len(errors) == 1
+    assert getattr(errors[0], "code", None) == "request_canceled"
+    assert pipeline.state is PipelineState.READY
+    pipeline.close()
+
+
+def test_facade_cancel_non_cancellable_backend_discards_late_result_without_backend_cancel(tmp_path):
+    """Non-cancellable backends are not interrupted; the late result is discarded as request_canceled."""
+    pipeline, backend = _native_pipeline(tmp_path / "bundle", "policy")
+    pipeline.load()
+    assert backend.capabilities.supports_cancellation is False
+
+    infer_started = threading.Event()
+    infer_release = threading.Event()
+
+    def slow_result(request: InferenceRequest) -> BackendResult:
+        infer_started.set()
+        infer_release.wait(timeout=2.0)
+        return BackendResult(
+            action=np.zeros((1, 2, 6), dtype=np.float32),
+            actual_chunk_size=2,
+            backend_latency_ms=10.0,
+        )
+
+    backend.result_factory = slow_result
+
+    errors: list[BaseException] = []
+
+    def run_infer():
+        try:
+            pipeline.infer(_request("non-cancellable-target"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_infer)
+    thread.start()
+    assert infer_started.wait(timeout=2.0)
+
+    core = pipeline._pipeline._core
+    assert "non-cancellable-target" in core._request_controls
+
+    pipeline.cancel("non-cancellable-target")
+    infer_release.set()
+    thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert "non-cancellable-target" not in core._request_controls
+    assert backend.cancel_calls == []
+    assert len(errors) == 1
+    assert getattr(errors[0], "code", None) == "request_canceled"
+    assert pipeline.state is PipelineState.READY
+    pipeline.close()
+
+
+def test_facade_preserves_deployment_identity_in_result_metadata(tmp_path):
+    """Result deployment identity matches RuntimeContext, not an independent copy."""
+    pipeline, backend = _native_pipeline(tmp_path / "bundle", "policy")
+    pipeline.load()
+
+    result = pipeline.infer(_request())
+    context = pipeline.runtime_context
+
+    assert result.bundle == context.validated_manifest.manifest.bundle.name
+    assert result.bundle_uuid == context.validated_manifest.manifest.bundle.uuid
+    assert result.deployment == context.deployment_name
+    assert result.deployment_uuid == context.deployment.uuid
+    assert result.deployment_fingerprint == context.deployment_fingerprint
+    assert result.backend == backend.name
+    assert result.metadata["deployment_fingerprint"] == context.deployment_fingerprint
+    assert result.metadata["backend"] == backend.name
+    pipeline.close()
+
+
+def test_facade_adapt_error_preserves_structured_policy_exception(tmp_path):
+    """Policy executor adapt_error re-raises the original exception, not a fabricated result."""
+    backend = MockBackend("failing", domains=ResourceDomainAdmissions())
+
+    def fail(request: InferenceRequest) -> BackendResult:
+        raise BackendInferenceError("device lost", code="device_lost")
+
+    backend.result_factory = fail
+    pipeline, backend = _native_pipeline(tmp_path / "bundle", "policy", backend=backend)
+    pipeline.load()
+
+    with pytest.raises(BackendInferenceError, match="device lost") as exc_info:
+        pipeline.infer(_request())
+
+    assert exc_info.value.code == "device_lost"
+    assert pipeline.state is PipelineState.FAILED
+    pipeline.close()

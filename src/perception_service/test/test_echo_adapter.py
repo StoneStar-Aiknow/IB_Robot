@@ -59,6 +59,8 @@ def test_echo_plugin_preserves_typed_request_and_runtime_identity(tmp_path: Path
     assert response.value == [1.25, -2.5]
     assert plugin.runtime_status().ready
     assert plugin.session.health().failure_count == 0
+    assert plugin.runtime_status().metadata["deployment"] == "cpu"
+    assert plugin.runtime_status().metadata["backend"] == "torch"
     plugin.close()
     plugin.close()
     assert plugin.runtime_status().state == "closed"

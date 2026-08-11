@@ -357,6 +357,7 @@ def _smolvla_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
                         "index": 0,
                         "dtype": "float32",
                         "shape": [1, 8, 1, 2],
+                        "layout": "NCHW",
                     },
                     {
                         "semantic": "internal.past_value.0",
@@ -364,6 +365,7 @@ def _smolvla_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
                         "index": 1,
                         "dtype": "float32",
                         "shape": [1, 8, 1, 2],
+                        "layout": "NCHW",
                     },
                 ],
             },
@@ -396,6 +398,7 @@ def _smolvla_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
                         "index": 3,
                         "dtype": "float32",
                         "shape": [1, 8, 1, 2],
+                        "layout": "NCHW",
                     },
                     {
                         "semantic": "internal.past_value.0",
@@ -403,6 +406,7 @@ def _smolvla_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
                         "index": 4,
                         "dtype": "float32",
                         "shape": [1, 8, 1, 2],
+                        "layout": "NCHW",
                     },
                 ],
                 "outputs": [
@@ -457,7 +461,30 @@ def test_rknn_act_pipeline_uses_only_manifest_artifact_and_nhwc_binding(tmp_path
     assert environment.release_calls == [model_path]
 
 
-def test_rknn_smolvla_loads_prefill_first_reuses_vision_and_runs_host_links(tmp_path):
+def _patch_identity_processors(monkeypatch):
+    from inference_service import pipeline as pipeline_module
+
+    monkeypatch.setattr(
+        pipeline_module.factory,
+        "create_lerobot_processor_views",
+        lambda: (lambda inputs: inputs, lambda action: action),
+    )
+
+
+def _rknn_smolvla_session_factory(environment):
+    from inference_service.model_sessions import RKNNModelSession
+
+    def factory(ctx, options):
+        del ctx, options
+        return RKNNModelSession(rknn_loader=environment.runtime_type)
+
+    return factory
+
+
+def test_rknn_smolvla_pipeline_runs_through_session_with_host_links_and_shared_vision(tmp_path, monkeypatch):
+    from inference_service.pipeline import create_inference_pipeline
+
+    _patch_identity_processors(monkeypatch)
     context = _smolvla_context(tmp_path, runtime_options={"random_seed": 7})
     paths = {role: str(path) for role, path in context.resolved_artifacts.items()}
     observed_times: list[float] = []
@@ -496,8 +523,12 @@ def test_rknn_smolvla_loads_prefill_first_reuses_vision_and_runs_host_links(tmp_
             paths["action"]: FakeRKNNModel(execute_action),
         }
     )
-    backend = RKNNBackend(rknn_loader=environment.runtime_type)
-    pipeline = InferencePipeline("smolvla", context, backend, codec=create_policy_codec(context.policy))
+    pipeline = create_inference_pipeline(
+        "smolvla",
+        context.validated_manifest,
+        runtime_options={"random_seed": 7},
+        model_session_factory=_rknn_smolvla_session_factory(environment),
+    )
     pipeline.load()
 
     result = pipeline.infer(
@@ -516,7 +547,8 @@ def test_rknn_smolvla_loads_prefill_first_reuses_vision_and_runs_host_links(tmp_
 
     np.testing.assert_array_equal(result.action, np.full((1, 2, 6), -1.0, dtype=np.float32))
     assert result.actual_chunk_size == 2
-    assert environment.load_order == [paths["prefill"], paths["vision_top"], paths["action"]]
+    # RKNN host links: prefill KV caches are materialized on host for action.
+    assert environment.load_order == [paths["vision_top"], paths["prefill"], paths["action"]]
     assert environment.inference_formats[paths["vision_top"]] == ["nhwc", "nhwc"]
     assert environment.inference_formats[paths["prefill"]] == [None]
     assert environment.inference_formats[paths["action"]] == [None, None]
@@ -525,7 +557,7 @@ def test_rknn_smolvla_loads_prefill_first_reuses_vision_and_runs_host_links(tmp_
     assert len(observed_prefix) == 1
     np.testing.assert_allclose(observed_prefix[0][0, -1], np.array([1.25, 2.5, 3.75, 5.0], dtype=np.float32))
     pipeline.close()
-    assert environment.release_calls == [paths["action"], paths["vision_top"], paths["prefill"]]
+    assert environment.release_calls == [paths["action"], paths["prefill"], paths["vision_top"]]
 
 
 def test_rknn_converts_bfloat16_embedding_weights_to_float32(tmp_path):
@@ -538,8 +570,11 @@ def test_rknn_converts_bfloat16_embedding_weights_to_float32(tmp_path):
     np.testing.assert_allclose(converted, np.array([[1.25, -2.5]], dtype=np.float32))
 
 
-def test_rknn_partial_smolvla_load_failure_releases_every_created_runtime(tmp_path):
-    context = _smolvla_context(tmp_path)
+def test_rknn_smolvla_partial_load_failure_releases_every_created_runtime(tmp_path, monkeypatch):
+    from inference_service.pipeline import create_inference_pipeline
+
+    _patch_identity_processors(monkeypatch)
+    context = _smolvla_context(tmp_path, runtime_options={"random_seed": 7})
     paths = {role: str(path) for role, path in context.resolved_artifacts.items()}
     environment = FakeRKNNEnvironment(
         {
@@ -549,20 +584,27 @@ def test_rknn_partial_smolvla_load_failure_releases_every_created_runtime(tmp_pa
         }
     )
     environment.fail_init_paths.add(paths["action"])
-    backend = RKNNBackend(rknn_loader=environment.runtime_type)
+    pipeline = create_inference_pipeline(
+        "smolvla",
+        context.validated_manifest,
+        runtime_options={"random_seed": 7},
+        model_session_factory=_rknn_smolvla_session_factory(environment),
+    )
 
     with pytest.raises(BackendLoadError, match="init_runtime"):
-        backend.load(context)
+        pipeline.load()
 
-    assert backend.health().state is BackendState.FAILED
-    assert environment.load_order == [paths["prefill"], paths["vision_top"], paths["action"]]
-    assert environment.release_calls == [paths["action"], paths["vision_top"], paths["prefill"]]
+    assert environment.load_order == [paths["vision_top"], paths["prefill"], paths["action"]]
+    assert environment.release_calls == [paths["action"], paths["prefill"], paths["vision_top"]]
     assert all(instance.released for instance in environment.instances)
-    backend.close()
+    pipeline.close()
 
 
-def test_rknn_rejects_device_pointer_links_before_loading_sdk(tmp_path):
-    context = _smolvla_context(tmp_path)
+def test_rknn_smolvla_rejects_device_pointer_links_before_loading_sdk(tmp_path, monkeypatch):
+    from inference_service.pipeline import create_inference_pipeline
+
+    _patch_identity_processors(monkeypatch)
+    context = _smolvla_context(tmp_path, runtime_options={"target": "rk3588", "core_mask": "0"})
     deployment = context.deployment.model_copy(
         update={
             "device_links": (
@@ -578,22 +620,89 @@ def test_rknn_rejects_device_pointer_links_before_loading_sdk(tmp_path):
         }
     )
     validated = replace(context.validated_manifest, deployment=deployment)
-    invalid_context = RuntimeContext(validated)
     sdk_loaded = False
 
     def load_sdk():
         nonlocal sdk_loaded
         sdk_loaded = True
-        raise AssertionError("RKNN SDK must not load for an unsupported execution plan")
+        raise AssertionError("RKNN SDK must not load when device links are declared")
 
-    backend = RKNNBackend(rknn_loader=load_sdk)
+    def factory(ctx, options):
+        del ctx, options
+        from inference_service.model_sessions import RKNNModelSession
+
+        return RKNNModelSession(rknn_loader=load_sdk)
+
+    pipeline = create_inference_pipeline(
+        "smolvla",
+        validated,
+        runtime_options={"target": "rk3588", "core_mask": "0"},
+        model_session_factory=factory,
+    )
 
     with pytest.raises(BackendLoadError) as error:
-        backend.load(invalid_context)
+        pipeline.load()
 
     assert error.value.code == "unsupported_device_links"
     assert sdk_loaded is False
+    pipeline.close()
+
+
+def test_rknn_backend_fails_closed_for_smolvla_after_factory_cutover(tmp_path):
+    context = _smolvla_context(tmp_path)
+    backend = RKNNBackend(rknn_loader=lambda: FakeRKNNEnvironment({}).runtime_type())
+
+    with pytest.raises(BackendLoadError, match="no longer hosts SmolVLA") as error:
+        backend.load(context)
+
+    assert error.value.code == "unsupported_policy_backend_pair"
     backend.close()
+
+
+def test_rknn_smolvla_repeated_inference_is_deterministic_with_seed(tmp_path, monkeypatch):
+    from inference_service.pipeline import create_inference_pipeline
+
+    _patch_identity_processors(monkeypatch)
+    context = _smolvla_context(tmp_path, runtime_options={"random_seed": 42})
+    paths = {role: str(path) for role, path in context.resolved_artifacts.items()}
+    environment = FakeRKNNEnvironment(
+        {
+            paths["vision_top"]: FakeRKNNModel(lambda inputs: [np.zeros((1, 2, 4), dtype=np.float32)]),
+            paths["prefill"]: FakeRKNNModel(
+                lambda inputs: [
+                    np.zeros((1, 8, 1, 2), dtype=np.float32),
+                    np.zeros((1, 8, 1, 2), dtype=np.float32),
+                ]
+            ),
+            paths["action"]: FakeRKNNModel(lambda inputs: [np.ones((1, 2, 8), dtype=np.float32)]),
+        }
+    )
+    pipeline = create_inference_pipeline(
+        "smolvla",
+        context.validated_manifest,
+        runtime_options={"random_seed": 42},
+        model_session_factory=_rknn_smolvla_session_factory(environment),
+    )
+    pipeline.load()
+
+    request = InferenceRequest(
+        request_id="smolvla",
+        inputs={
+            "observation.state": np.arange(1, 7, dtype=np.float32),
+            "observation.images.top": np.ones((3, 2, 4), dtype=np.float32),
+            "observation.images.wrist": np.full((3, 2, 4), 2.0, dtype=np.float32),
+            "observation.language.tokens": np.array([1, 2, 3], dtype=np.int64),
+            "observation.language.attention_mask": np.array([True, True, False]),
+            "noise": np.zeros((1, 2, 8), dtype=np.float32),
+        },
+    )
+
+    first = pipeline.infer(request)
+    second = pipeline.infer(request)
+
+    np.testing.assert_array_equal(first.action, second.action)
+    assert first.actual_chunk_size == second.actual_chunk_size
+    pipeline.close()
 
 
 def test_rknn_rejects_runtime_output_shape_mismatch(tmp_path):
