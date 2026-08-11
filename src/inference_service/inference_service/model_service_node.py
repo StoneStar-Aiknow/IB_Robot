@@ -169,9 +169,8 @@ class ModelServiceNode(Node):
                 response.success = True
                 self.failure_reason = ""
             except Exception as exc:
-                self.failure_reason = str(exc)
                 response.success = False
-                response.message = self.failure_reason
+                response.message = str(exc)
                 if hasattr(response, "error_code"):
                     response.error_code = (
                         "MODEL_NOT_READY" if status is not None and not status.ready else "INFERENCE_FAILED"

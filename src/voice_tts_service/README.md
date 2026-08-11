@@ -125,6 +125,10 @@ synthesize -> 复用常驻模型
 
 模型准入与资源释放由公共 `ModelSession` 管理，宿主关闭 plugin 时等待推理结束并释放 session。
 
+`exit_on_init_failure=false`（对应通用宿主的 `required=false`）只保证初始化失败后 typed endpoint 继续在线并
+返回 `MODEL_NOT_READY`。当前宿主不会在后续请求中自动重试初始化；修复 bundle、依赖或设备后必须重启节点。
+`INVALID_TEXT`、`UNSUPPORTED_PROMPT` 等请求级错误不会改变 session 健康状态，也不会阻塞后续有效请求。
+
 ## 5. 模型 bundle 与 deployment
 
 模型路径不写死在代码中，由 `robot_config` 的 `bundle_path` 指定。相对路径以 `.shrc_local` 设置的绝对

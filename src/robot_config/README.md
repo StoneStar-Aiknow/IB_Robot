@@ -710,6 +710,7 @@ launch builder 只解析配置和创建节点，不提前打开模型 bundle。�
 `exit_on_init_failure=false` 能在模型存储暂不可用时保留服务并返回 `MODEL_NOT_READY`；
 TTS 由通用 `inference_service/model_service_node` 承载，节点启动时加载 named deployment，节点退出时等待当前
 合成结束并释放模型资源。
+该配置不会启用请求级初始化重试；修复 bundle、依赖或设备后必须重启 TTS 节点才能恢复。
 相对 `bundle_path` 以 `.shrc_local` 设置的绝对 `WORKSPACE` 为根目录解析，例如默认值对应
 `$WORKSPACE/models/voice_tts/zipvoice`。
 当前经 310P1 真机核查的 `ascend_310p` deployment 支持固定 bundle prompt、中文/数字/常用标点和 24 kHz

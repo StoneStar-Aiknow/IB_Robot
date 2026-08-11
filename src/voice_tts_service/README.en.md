@@ -115,6 +115,11 @@ node shutdown -> release OM sessions, ACL leases, Vocos, tokenizer, and prompt
 The shared `ModelSession` owns model admission and cleanup. Host shutdown waits for active inference before closing
 the session.
 
+`exit_on_init_failure=false` (the shared host's `required=false`) only keeps the typed endpoint online and reports
+`MODEL_NOT_READY` after initialization failure. The host does not retry initialization on later requests; restart the
+node after repairing the bundle, dependency, or device. Request-scoped errors such as `INVALID_TEXT` and
+`UNSUPPORTED_PROMPT` do not change session health or block later valid requests.
+
 ## 5. Model Bundle and Deployment
 
 The model path is configured through `robot_config.bundle_path`; it is never hard-coded. Relative paths resolve

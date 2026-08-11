@@ -607,6 +607,8 @@ TTS is hosted by the shared `inference_service/model_service_node`. The named de
 later requests reuse it, and node shutdown waits for active synthesis and then
 releases model resources without stopping the ROS endpoints. Relative `bundle_path` values resolve from the
 absolute `WORKSPACE` set by `.shrc_local`.
+This mode does not retry initialization on requests; restart the TTS node after repairing the bundle, dependency,
+or device.
 
 The verified `ascend_310p` deployment uses the fixed bundle prompt, accepts Chinese, numbers, and common
 punctuation, and returns 24 kHz mono WAV. Request-scoped prompts are currently rejected with
