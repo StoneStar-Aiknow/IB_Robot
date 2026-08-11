@@ -599,14 +599,16 @@ full system starts TTS through `robot.launch.py`, while the package launch remai
 
 The public typed service is `/voice_tts/synthesize`. Requests and responses carry audio bytes rather than
 server-local paths and bound text, prompt, segment count, and response size. The launch builder resolves
-configuration and creates the node but does not open the model bundle. The node validates the bundle at startup,
-so `exit_on_init_failure=false` can keep the endpoints alive and report `MODEL_NOT_READY` when model storage is
-temporarily unavailable.
+configuration and creates the node but does not open the model bundle. The shared host validates the bundle and
+loads the session at startup, while `exit_on_init_failure=false` can keep the endpoint alive and report
+`MODEL_NOT_READY` when model storage is temporarily unavailable.
 
-With `load_on_startup=false`, the first valid synthesis request loads the model and later requests reuse it in
-memory. `/voice_tts/load` pre-warms the model, while `/voice_tts/unload` waits for active synthesis and then
+TTS is hosted by the shared `inference_service/model_service_node`. The named deployment is loaded at node startup;
+later requests reuse it, and node shutdown waits for active synthesis and then
 releases model resources without stopping the ROS endpoints. Relative `bundle_path` values resolve from the
 absolute `WORKSPACE` set by `.shrc_local`.
+This mode does not retry initialization on requests; restart the TTS node after repairing the bundle, dependency,
+or device.
 
 The verified `ascend_310p` deployment uses the fixed bundle prompt, accepts Chinese, numbers, and common
 punctuation, and returns 24 kHz mono WAV. Request-scoped prompts are currently rejected with

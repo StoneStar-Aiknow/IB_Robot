@@ -2,7 +2,8 @@
 
 [English](README.en.md)
 
-`voice_tts_service` 是 IB-Robot 的通用 ROS 2 语音合成服务。它接收文本和可选参考音色，调用显式选择的
+`voice_tts_service` 是 IB-Robot 的 ZipVoice 模型服务 plugin。它由 `inference_service` 的通用
+`model_service_node` 承载，接收文本和可选参考音色，调用显式选择的
 ZipVoice deployment，返回一个或多个可独立播放的单声道 WAV PCM16 音频段。
 
 本包只负责“文本转音频”，不负责扬声器播放、ASR、业务编排或通过 SSH 调用远端推理。
@@ -13,7 +14,7 @@ ZipVoice deployment，返回一个或多个可独立播放的单声道 WAV PCM16
 
 1. 提供统一的 ROS 2 TTS 服务接口。
 2. 校验 ZipVoice 模型 bundle、manifest 和 named deployment。
-3. 管理模型的首次加载、常驻复用、显式预热和卸载。
+3. 通过通用模型服务宿主管理模型加载、常驻复用和关闭。
 4. 对长文本进行有界分段，并把模型输出统一封装为 WAV PCM16。
 5. 在 Ascend 310P 上编排 Text Encoder OM、Flow Decoder OM 和 CPU Vocos。
 6. 对请求大小、分段数量和响应音频大小设置明确上限。
@@ -30,11 +31,12 @@ ZipVoice deployment，返回一个或多个可独立播放的单声道 WAV PCM16
 
 | 项目 | 路径或入口 |
 | --- | --- |
-| ROS 节点 | `voice_tts_service/voice_tts_node.py` |
+| 通用 ROS 宿主 | `inference_service/inference_service/model_service_node.py` |
+| TTS plugin | `voice_tts_service/voice_tts_service/model_service_plugin.py` |
 | 310P adapter | `voice_tts_service/zipvoice_310p_adapter.py` |
 | 模型 bundle 工具 | `voice_tts_service/package_zipvoice_310p.py` |
 | 调试 launch | `launch/voice_tts.launch.py` |
-| 控制台入口 | `voice_tts_node = voice_tts_service.voice_tts_node:main` |
+| 控制台入口 | `model_service_node = inference_service.model_service_node:main` |
 | 模型打包入口 | `package_zipvoice_310p = voice_tts_service.package_zipvoice_310p:main` |
 
 完整机器人系统应通过 `robot_config` 启动，机器人 YAML 是 TTS 配置的单一事实来源：
@@ -60,7 +62,7 @@ ros2 launch voice_tts_service voice_tts.launch.py \
 ```text
 SynthesizeSpeech 请求
   -> 请求校验与文本分段
-  -> 首次调用时加载所选 deployment
+  -> 通用宿主加载所选 deployment
   -> ZipVoice tokenizer
   -> Text Encoder OM
   -> Flow Decoder OM（主机侧 4-step Euler）
@@ -108,35 +110,24 @@ ros2 service call /voice_tts/synthesize ibrobot_msgs/srv/SynthesizeSpeech \
 
 ### 4.2 模型生命周期
 
-| 服务 | 类型 | 行为 |
+| 阶段 | 类型 | 行为 |
 | --- | --- | --- |
-| `/voice_tts/load` | `std_srvs/srv/Trigger` | 显式加载并预热模型；重复调用幂等 |
-| `/voice_tts/unload` | `std_srvs/srv/Trigger` | 等待当前合成完成后释放模型；重复调用幂等 |
+| 节点启动 | 通用 model service host | 校验 bundle 并加载 plugin/session |
+| 节点退出 | 通用 model service host | 关闭 plugin/session 并释放模型资源 |
 
-默认 `load_on_startup=false`，生命周期如下：
+生命周期如下：
 
 ```text
-节点启动 -> 校验 bundle，但不占用模型运行内存
-首次 synthesize -> 加载模型并完成合成
-后续 synthesize -> 复用常驻模型
-unload -> 释放 OM、ACL lease、Vocos、tokenizer 和 prompt
-再次 synthesize -> 自动重新加载
+节点启动 -> 通用宿主校验 bundle 并加载 plugin/session
+synthesize -> 复用常驻模型
+节点退出 -> 释放 OM、ACL lease、Vocos、tokenizer 和 prompt
 ```
 
-需要避免首次合成承担加载延迟时，可以提前预热：
+模型准入与资源释放由公共 `ModelSession` 管理，宿主关闭 plugin 时等待推理结束并释放 session。
 
-```bash
-ros2 service call /voice_tts/load std_srvs/srv/Trigger "{}"
-```
-
-不再需要 TTS 时释放模型内存，ROS 节点和服务仍保持运行：
-
-```bash
-ros2 service call /voice_tts/unload std_srvs/srv/Trigger "{}"
-```
-
-`load`、`synthesize` 和 `unload` 只协调 session 的创建和替换；模型准入与资源释放由公共
-`ModelSession` 管理，卸载会等待当前推理结束后再关闭 session。
+`exit_on_init_failure=false`（对应通用宿主的 `required=false`）只保证初始化失败后 typed endpoint 继续在线并
+返回 `MODEL_NOT_READY`。当前宿主不会在后续请求中自动重试初始化；修复 bundle、依赖或设备后必须重启节点。
+`INVALID_TEXT`、`UNSUPPORTED_PROMPT` 等请求级错误不会改变 session 健康状态，也不会阻塞后续有效请求。
 
 ## 5. 模型 bundle 与 deployment
 
@@ -204,9 +195,6 @@ voice_tts:
   deployment: ascend_310p
 
   service_name: /voice_tts/synthesize
-  load_service_name: /voice_tts/load
-  unload_service_name: /voice_tts/unload
-  load_on_startup: false
 
   prompt_profile: default
   segment_max_chars: 200
@@ -228,7 +216,6 @@ voice_tts:
 | `enabled` | 是否由统一 `robot.launch.py` 启动 TTS 节点 |
 | `bundle_path` | ZipVoice bundle 路径 |
 | `deployment` | manifest 中的命名部署 |
-| `load_on_startup` | 是否在节点启动时立即加载模型；默认首次调用时加载 |
 | `prompt_profile` | 默认音色 profile |
 | `segment_max_chars` | 单个公共文本段的最大字符数 |
 | `max_request_chars` | 单次请求的最大字符数 |

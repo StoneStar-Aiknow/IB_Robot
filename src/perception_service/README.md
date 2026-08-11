@@ -175,7 +175,7 @@ embodied:
 
 ## 7. 抓取检测与分割
 
-抓取链使用 `model_service_node` 承载强类型服务，不包含订阅相机快照的专用兼容节点。首次使用 PC Torch
+抓取链使用 `inference_service.model_service_node` 承载强类型服务，不包含订阅相机快照的专用兼容节点。首次使用 PC Torch
 deployment 前安装可选依赖并下载模型：
 
 ```bash
@@ -226,7 +226,7 @@ Grounded-SAM2 Torch deployment，通过 `GroundingDetect` 一次返回 bbox 和 
 
 ## 8. Generic Model Services
 
-`model_service_node` 是强类型模型服务的通用宿主。每个实例从 robot-config SSOT 读取 bundle、命名 deployment、
+`inference_service.model_service_node` 是强类型模型服务的通用宿主。每个实例从 robot-config SSOT 读取 bundle、命名 deployment、
 plugin class、具体 ROS service type、endpoint 和 runtime options。宿主不包含模型家族到 executable 的映射，也
 不通过一个匿名 tensor service 暴露推理。
 

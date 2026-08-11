@@ -19,7 +19,6 @@ setup(
     entry_points={
         "console_scripts": [
             "perception_service_node = perception_service.perception_service_node:main",
-            "model_service_node = perception_service.model_service_node:main",
             "package_perception_bundles = perception_service.package_perception_bundles:main",
             "package_ascend_perception_bundles = perception_service.package_ascend_perception_bundles:main",
             "package_graspgen_ascend_bundle = perception_service.package_graspgen_ascend_bundle:main",

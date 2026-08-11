@@ -551,9 +551,6 @@ def test_load_single_arm_config():
     assert config.voice_tts.bundle_path == "models/voice_tts/zipvoice"
     assert config.voice_tts.deployment == ""
     assert config.voice_tts.service_name == "/voice_tts/synthesize"
-    assert config.voice_tts.load_service_name == "/voice_tts/load"
-    assert config.voice_tts.unload_service_name == "/voice_tts/unload"
-    assert config.voice_tts.load_on_startup is False
     assert config.skill_gateway.status_service == "/embodied/get_skill_gateway_status"
     assert config.skill_gateway.required_control_mode == "moveit_planning"
     assert config.skill_gateway.default_skill_timeout_sec == 120.0
@@ -1202,9 +1199,6 @@ def test_voice_tts_loader_and_runtime_defaults_match():
     assert defaults.bundle_path == VOICE_TTS_DEFAULTS["bundle_path"]
     assert defaults.deployment == VOICE_TTS_DEFAULTS["deployment"]
     assert defaults.service_name == VOICE_TTS_DEFAULTS["service_name"]
-    assert defaults.load_service_name == VOICE_TTS_DEFAULTS["load_service_name"]
-    assert defaults.unload_service_name == VOICE_TTS_DEFAULTS["unload_service_name"]
-    assert defaults.load_on_startup == VOICE_TTS_DEFAULTS["load_on_startup"]
     assert defaults.prompt_profile == VOICE_TTS_DEFAULTS["prompt_profile"]
     assert defaults.max_response_audio_bytes == VOICE_TTS_DEFAULTS["max_response_audio_bytes"]
 

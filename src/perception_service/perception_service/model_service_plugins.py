@@ -8,11 +8,13 @@ import json
 from collections.abc import Callable
 
 import numpy as np
+from cv_bridge import CvBridge
 
 from ibrobot_msgs.msg import Detection2D, DetectionArray
 from inference_manifest import CompiledDeployment, TorchDeployment
 from inference_service.backends import RuntimeContext
 from inference_service.generic_runtime import NamedTensorRequest
+from inference_service.model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
 from inference_service.model_sessions import AscendOmModelSession, ModelSession, TorchModelSession
 
 from .graspgen_adapter import GraspGenAdapter
@@ -25,7 +27,6 @@ from .model_contracts import (
     validate_mask_batch,
     validate_text_batch,
 )
-from .model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
 from .ram_plus_adapter import RAMPlusAdapter
 from .semantic_model_adapters import (
     GroundingDINOAdapter,
@@ -138,6 +139,7 @@ class _SessionPlugin(ModelServicePlugin):
                 "plugins accept only a validated named deployment; raw backend/device/fallback is forbidden"
             )
         self.host = host
+        self.bridge = CvBridge()
         self.validated = validated
         self.adapter = self.adapter_class.from_bundle(
             validated.bundle_root, model.semantic_identity, model=model, deployment=validated.deployment
@@ -166,7 +168,7 @@ class _SessionPlugin(ModelServicePlugin):
 
     def image_rgb(self, image):
         validate_image_message(image)
-        return np.asarray(self.host.bridge.imgmsg_to_cv2(image, desired_encoding="rgb8"), dtype=np.uint8)
+        return np.asarray(self.bridge.imgmsg_to_cv2(image, desired_encoding="rgb8"), dtype=np.uint8)
 
     def runtime_status(self) -> PluginRuntimeStatus:
         health = self.session.health()
@@ -221,7 +223,7 @@ class SAM2GenerateMasksPlugin(_SessionPlugin):
             max(0.0, float(request.min_mask_area_ratio)),
             max(0.0, float(request.max_overlap_ratio)),
         )
-        response.detections = _detection_array(self.host.bridge, request.image.header, records)
+        response.detections = _detection_array(self.bridge, request.image.header, records)
         return f"generated {len(records)} masks"
 
 
@@ -239,7 +241,7 @@ class SigLIP2EncodeEmbeddingsPlugin(_SessionPlugin):
         if any(not label.strip() for label in request.candidate_labels):
             raise ValueError("candidate labels must not be empty")
         image = self.image_rgb(request.image)
-        masks = [self.host.bridge.imgmsg_to_cv2(mask, desired_encoding="mono8") for mask in request.masks]
+        masks = [self.bridge.imgmsg_to_cv2(mask, desired_encoding="mono8") for mask in request.masks]
         labels = list(request.candidate_labels)
         result = self._infer(self.adapter.preprocess((image, masks, labels)))
         records = self.adapter.postprocess(result, candidate_labels=labels)
@@ -309,7 +311,7 @@ class GroundingDetectPlugin(_SessionPlugin):
                 if record.confidence >= (float(request.box_threshold) or 0.35)
             ]
         )
-        response.detections = _detection_array(self.host.bridge, request.image.header, records)
+        response.detections = _detection_array(self.bridge, request.image.header, records)
         return f"confirmed {len(records)} detections"
 
 
@@ -338,7 +340,7 @@ class GroundingDINORawDetectPlugin(_SessionPlugin):
                 text_threshold=float(request.text_threshold),
             )
         )
-        response.detections = _detection_array(self.host.bridge, request.image.header, records)
+        response.detections = _detection_array(self.bridge, request.image.header, records)
         return f"detected {len(records)} boxes"
 
 
@@ -364,7 +366,7 @@ class SegmentDetectionsPlugin(_SessionPlugin):
             record.label = detection.label
             record.confidence = detection.confidence
             record.bbox = detection.bbox
-            record.mask = self.host.bridge.cv2_to_imgmsg((mask > 0).astype(np.uint8) * 255, encoding="mono8")
+            record.mask = self.bridge.cv2_to_imgmsg((mask > 0).astype(np.uint8) * 255, encoding="mono8")
             record.mask.header = request.image.header
             output.append(record)
         response.detections = DetectionArray(header=request.image.header, detections=output)

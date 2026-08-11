@@ -24,6 +24,7 @@
 
   <depend>ibrobot_msgs</depend>
   <depend>inference_manifest</depend>
+  <exec_depend>python3-numpy</exec_depend>
   <depend>tensormsg</depend>
   <depend>robot_config</depend>
 

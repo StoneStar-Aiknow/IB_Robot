@@ -86,7 +86,7 @@ def test_generic_model_service_process_serves_typed_echo_request(tmp_path: Path)
         [
             sys.executable,
             "-m",
-            "perception_service.model_service_node",
+            "inference_service.model_service_node",
             "--ros-args",
             "-p",
             f"instance_id:={instance_id}",
