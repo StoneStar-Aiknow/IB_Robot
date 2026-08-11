@@ -133,24 +133,22 @@ def test_chinese_frontend_rejects_ascii_before_loading_optional_dependencies(tmp
         "pypinyin": fake_pypinyin,
         "pypinyin.contrib.tone_convert": fake_tone,
     }
-    monkeypatch.setattr("importlib.import_module", lambda name: modules[name])
-    tokenizer = _ChineseTokenizer(token_file, tmp_path)
-
-    assert str(tmp_path) not in sys.path
+    monkeypatch.setitem(sys.modules, "pypinyin.contrib", SimpleNamespace(tone_convert=fake_tone))
+    for name, module in modules.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    tokenizer = _ChineseTokenizer(token_file)
 
     with pytest.raises(BackendInferenceError, match="not English words"):
         tokenizer.text_to_tokens("hello")
 
 
-def test_vendor_import_path_is_restored_after_import_failure(tmp_path, monkeypatch):
+def test_frontend_import_failure_is_reported(tmp_path, monkeypatch):
     token_file = tmp_path / "tokens.txt"
     token_file.write_text("_\t0\n", encoding="utf-8")
-    monkeypatch.setattr("importlib.import_module", lambda _name: (_ for _ in ()).throw(ImportError("missing")))
+    monkeypatch.setitem(sys.modules, "cn2an", None)
 
     with pytest.raises(BackendLoadError, match="dependency is unavailable"):
-        _ChineseTokenizer(token_file, tmp_path)
-
-    assert str(tmp_path) not in sys.path
+        _ChineseTokenizer(token_file)
 
 
 def test_ellipsis_is_treated_as_sentence_punctuation():

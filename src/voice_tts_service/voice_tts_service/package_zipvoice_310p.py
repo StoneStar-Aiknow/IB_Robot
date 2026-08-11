@@ -50,17 +50,6 @@ def _require_source(root: Path, relative: str) -> Path:
     return path
 
 
-def _copy_tree(source: Path, destination: Path) -> None:
-    if not source.is_dir():
-        raise FileNotFoundError(f"required ZipVoice source directory is unavailable: {source}")
-    shutil.copytree(
-        source,
-        destination,
-        dirs_exist_ok=True,
-        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*_test.py", "test_*"),
-    )
-
-
 def _binding(semantic: str, name: str, index: int, dtype: str, shape: list[int]) -> dict[str, object]:
     return {
         "semantic": semantic,
@@ -187,8 +176,6 @@ def package_bundle(source: Path, destination: Path) -> Path:
     )
     _copy(_require_source(source, TOKENS), destination / "assets/tokens.txt")
     _copy(_require_source(source, VOCOS_CHECKPOINT), destination / "assets/vocos/pytorch_model.bin")
-    _copy_tree(source / "zipvoice_310p/vendor/python", destination / "assets/vendor/python")
-    _copy_tree(source / "zipvoice_310p/vendor/vocos", destination / "assets/vendor/vocos")
 
     with np.load(_require_source(source, TEXT_GOLDEN), allow_pickle=False) as text_fixture:
         prompt_tokens = np.asarray(text_fixture["prompt_tokens"], dtype=np.int64)
@@ -206,8 +193,6 @@ def package_bundle(source: Path, destination: Path) -> Path:
         "text_role": "text_encoder",
         "flow_role": "flow_decoder_1537",
         "tokens_path": "assets/tokens.txt",
-        "vendor_python_path": "assets/vendor/python",
-        "vocos_vendor_path": "assets/vendor/vocos",
         "vocos_checkpoint_path": "assets/vocos/pytorch_model.bin",
         "prompt_profiles": {"default": "assets/prompts/default.npz"},
         "text_capacity": 256,

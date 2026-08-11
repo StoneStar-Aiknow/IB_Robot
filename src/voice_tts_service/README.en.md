@@ -162,9 +162,15 @@ ros2 run voice_tts_service package_zipvoice_310p \
   --destination "$WORKSPACE/models/voice_tts/zipvoice"
 ```
 
-The packager validates the Text Encoder OM, Flow Decoder OM, Vocos checkpoint, token table, Chinese frontend,
-and default prompt before creating the `ascend_310p` deployment. Device addresses and source checkout paths are
-not runtime configuration values.
+The packager validates the Text Encoder OM, Flow Decoder OM, Vocos checkpoint, token table, and default prompt
+before creating the `ascend_310p` deployment. Chinese frontend packages are installed from the pinned
+`requirements/voice-tts.txt`; the checkpoint-compatible Vocos inference subset is versioned in
+`voice_tts_service.vocos_backend`. The model bundle contains weights and configuration only, never executable
+Python source. Device addresses and source checkout paths are not runtime configuration values.
+
+The controlled Vocos implementation is recorded as `0.1.0-zipvoice-310p-delivery`; source SHA-256 values are
+kept as module constants. It uses the workspace Torch, NumPy, and SciPy stack and intentionally does not install
+the PyPI `vocos` package, whose transitive dependencies could replace the ROS/Ascend ABI.
 
 ## 6. `robot_config` Configuration
 

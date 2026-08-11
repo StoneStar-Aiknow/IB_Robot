@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 import logging
 import re
-import sys
-from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -23,19 +20,6 @@ _ASCII_LETTER = re.compile(r"[A-Za-z]")
 _PUNCTUATION = {";", ":", ",", ".", "!", "?", "…"}
 
 
-@contextmanager
-def _temporary_sys_path(path: Path):
-    """Temporarily prioritize a bundle-vendored import path."""
-
-    entry = str(path)
-    sys.path.insert(0, entry)
-    try:
-        yield
-    finally:
-        with suppress(ValueError):
-            sys.path.remove(entry)
-
-
 @dataclass(frozen=True)
 class _PromptProfile:
     tokens: np.ndarray
@@ -47,18 +31,18 @@ class _PromptProfile:
 
 
 class _ChineseTokenizer:
-    """ZipVoice Emilia-style Chinese frontend with bundle-vendored dependencies."""
+    """ZipVoice Emilia-style Chinese frontend using project dependencies."""
 
-    def __init__(self, token_file: Path, vendor_python: Path) -> None:
+    def __init__(self, token_file: Path) -> None:
         try:
-            import_context = _temporary_sys_path(vendor_python) if vendor_python.is_dir() else nullcontext()
-            with import_context:
-                self._cn2an = importlib.import_module("cn2an")
-                self._jieba = importlib.import_module("jieba")
-                pypinyin = importlib.import_module("pypinyin")
-                tone_convert = importlib.import_module("pypinyin.contrib.tone_convert")
+            import cn2an
+            import jieba
+            import pypinyin
+            from pypinyin.contrib import tone_convert
         except (ImportError, OSError) as exc:
             raise BackendLoadError(f"ZipVoice Chinese frontend dependency is unavailable: {exc}") from exc
+        self._cn2an = cn2an
+        self._jieba = jieba
         self._style = pypinyin.Style
         self._lazy_pinyin = pypinyin.lazy_pinyin
         self._to_finals_tone3 = tone_convert.to_finals_tone3
@@ -274,34 +258,17 @@ class ZipVoice310PAdapter:
         if features.shape[2] != 100 or not np.isfinite(features).all():
             raise BackendLoadError("ZipVoice prompt profile features are invalid")
         self._prompt = _PromptProfile(tokens=tokens, features=features)
-        self._tokenizer = _ChineseTokenizer(self._asset("tokens_path"), self._asset("vendor_python_path"))
+        self._tokenizer = _ChineseTokenizer(self._asset("tokens_path"))
         self._load_vocos()
 
     def _load_vocos(self) -> None:
-        vendor_root = self._asset("vocos_vendor_path").parent
         try:
-            with _temporary_sys_path(vendor_root):
-                torch = importlib.import_module("torch")
-                heads = importlib.import_module("vocos.heads")
-                models = importlib.import_module("vocos.models")
+            import torch
+
+            from voice_tts_service.vocos_backend import ZipVoiceVocos
         except (ImportError, OSError) as exc:
             raise BackendLoadError(f"ZipVoice Vocos dependency is unavailable: {exc}") from exc
-
-        class VocosDecoder(torch.nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.backbone = models.VocosBackbone(
-                    input_channels=100,
-                    dim=512,
-                    intermediate_dim=1536,
-                    num_layers=8,
-                )
-                self.head = heads.ISTFTHead(dim=512, n_fft=1024, hop_length=256, padding="center")
-
-            def forward(self, features):
-                return self.head(self.backbone(features))
-
-        vocos = VocosDecoder()
+        vocos = ZipVoiceVocos()
         checkpoint = torch.load(self._asset("vocos_checkpoint_path"), map_location="cpu", weights_only=True)
         incompatible = vocos.load_state_dict(checkpoint, strict=False)
         if incompatible.missing_keys:

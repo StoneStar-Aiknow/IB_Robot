@@ -41,9 +41,6 @@ def test_packager_creates_valid_scalar_abi_bundle_from_verified_delivery(tmp_pat
         "EXPECTED_SHA256",
         {relative: hashlib.sha256(data).hexdigest() for relative, data in payloads.items()},
     )
-    _write(source, "zipvoice_310p/vendor/python/cn2an/__init__.py", b"")
-    _write(source, "zipvoice_310p/vendor/vocos/__init__.py", b"")
-
     manifest_path = packager.package_bundle(source, destination)
     validated = load_inference_manifest(destination, "ascend_310p")
 
@@ -55,6 +52,10 @@ def test_packager_creates_valid_scalar_abi_bundle_from_verified_delivery(tmp_pat
     assert validated.deployment.bindings["flow_decoder_1537"].outputs[0].runtime_name.endswith(":0:v")
     adapter = json.loads((destination / "assets/adapter.json").read_text(encoding="utf-8"))
     assert adapter["om_backend_factory"].endswith(":create_ascend_backend")
+    assert not (destination / "assets/vendor").exists()
+    runtime = json.loads((destination / "assets/zipvoice_310p.json").read_text(encoding="utf-8"))
+    assert "vendor_python_path" not in runtime
+    assert "vocos_vendor_path" not in runtime
 
 
 def test_packager_rejects_unverified_same_name_asset(tmp_path, monkeypatch):

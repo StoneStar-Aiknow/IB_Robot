@@ -187,8 +187,13 @@ ros2 run voice_tts_service package_zipvoice_310p \
   --destination "$WORKSPACE/models/voice_tts/zipvoice"
 ```
 
-打包工具会校验 Text Encoder OM、Flow Decoder OM、Vocos checkpoint、token table、中文前端依赖和默认
-prompt，并生成 `ascend_310p` deployment。设备地址和模型原始源码目录都不会成为运行时配置。
+打包工具会校验 Text Encoder OM、Flow Decoder OM、Vocos checkpoint、token table 和默认 prompt，并生成
+`ascend_310p` deployment。中文前端依赖由项目 `requirements/voice-tts.txt` 固定安装，Vocos 推理实现由
+`voice_tts_service.vocos_backend` 版本控制；模型 bundle 只包含权重和配置，不携带可执行 Python 源码。
+设备地址和模型原始源码目录都不会成为运行时配置。
+
+当前受控 Vocos 实现记录为 `0.1.0-zipvoice-310p-delivery`，其来源文件 SHA-256 写在模块常量中。
+该交付实现使用项目现有 Torch、NumPy 和 SciPy，不安装 PyPI `vocos`，避免其传递依赖替换 ROS/Ascend ABI。
 
 ## 6. `robot_config` 配置
 
