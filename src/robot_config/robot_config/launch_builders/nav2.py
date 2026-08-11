@@ -15,6 +15,29 @@ from robot_config.utils import resolve_ros_path
 
 logger = get_colored_logger("robot_config.nav2")
 
+BASE_NAV_ARGS = {
+    "controller_plugin": "dwb_core::DWBLocalPlanner",
+    "local_costmap_plugin": "nav2_costmap_2d::ObstacleLayer",
+    "observation_sources": "scan",
+    "use_collision_monitor": "false",
+    "dwb_critics_key": "critics",
+    "mppi_critics_key": "mppi_critics",
+}
+
+DYN_AVOID_ARGS = {
+    "controller_plugin": "nav2_mppi_controller::MPPIController",
+    "local_costmap_plugin": "nav2_costmap_2d::VoxelLayer",
+    "observation_sources": "pointcloud",
+    "use_collision_monitor": "true",
+    "dwb_critics_key": "dwb_critics",
+    "mppi_critics_key": "critics",
+}
+
+
+def get_avoidance_launch_arguments(dynamic_enabled: bool) -> dict[str, str]:
+    """Map the short user switch to the validated baseline or dynamic chain."""
+    return (DYN_AVOID_ARGS if dynamic_enabled else BASE_NAV_ARGS).copy()
+
 
 def generate_nav2_nodes(
     nav_config: dict[str, Any],
@@ -62,7 +85,10 @@ def generate_nav2_nodes(
             "namespace": "",
             "use_namespace": "false",
             "use_composition": "False",
+            "use_amcl": str(nav2_config.get("use_amcl", False)).lower(),
+            "auto_global_localization": str(nav2_config.get("auto_global_localization", False)).lower(),
         }
+        launch_args.update(get_avoidance_launch_arguments(nav2_config.get("dyn_avoid_enabled", False)))
         if params_file:
             launch_args["params_file"] = params_file
 
@@ -75,6 +101,7 @@ def generate_nav2_nodes(
         logger.info(f"Added Nav2 bringup (map: {map_file}, sim: {use_sim})")
 
     except Exception as e:
-        logger.warning(f"Could not add Nav2 bringup: {e}")
+        logger.error(f"Failed to add required Nav2 bringup: {e}")
+        raise
 
     return nodes

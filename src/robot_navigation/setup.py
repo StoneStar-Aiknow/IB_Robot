@@ -44,6 +44,10 @@ setup(
             "voice_control = robot_navigation.voice_control:main",
             # Save RTAB-Map occupancy grid through nav2_map_server
             "save_rtabmap_map = robot_navigation.save_rtabmap_map:main",
+            "amcl_global_localization = robot_navigation.amcl_global_localization:main",
+            "save_lidar_map = robot_navigation.save_lidar_map:main",
+            # Normalize official FAST-LIO odometry for navigation consumers.
+            "fast_lio_odom_bridge = robot_navigation.fast_lio_odom_bridge:main",
         ],
     },
 )

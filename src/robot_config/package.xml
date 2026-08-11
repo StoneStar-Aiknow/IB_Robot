@@ -29,6 +29,11 @@
   <exec_depend>rtabmap_launch</exec_depend>
   <exec_depend>depthimage_to_laserscan</exec_depend>
   <exec_depend>ldlidar_ros2</exec_depend>
+  <exec_depend>pointcloud_to_laserscan</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>livox_ros_driver2</exec_depend>
+  <exec_depend>fast_lio</exec_depend>
+  <exec_depend>rviz2</exec_depend>
   <exec_depend>joy</exec_depend>
   <exec_depend>joy_teleop</exec_depend>
   <exec_depend>robot_localization</exec_depend>

@@ -110,8 +110,15 @@ def _generate_real_navigation(
         logger.info("Navigation disabled, skipping")
         return []
 
+    if "nav_stage" in robot_config:
+        _validate_global_localization_provider(robot_config["nav_stage"], navigation_config)
+
     logger.info("Navigation enabled, generating nodes...")
     nodes = []
+
+    from robot_config.launch_builders.fast_lio import generate_fast_lio_nodes
+
+    nodes.extend(generate_fast_lio_nodes(navigation_config, use_sim=use_sim))
 
     # Lazy imports for sub-builders (only needed in real-hardware mode)
     from robot_config.launch_builders.cmd_vel import generate_cmd_vel_nodes
@@ -176,6 +183,24 @@ def _generate_real_navigation(
     return nodes
 
 
+def _validate_global_localization_provider(nav_stage: str, navigation_config: dict[str, Any]) -> None:
+    """Require exactly one stage-appropriate map-to-odom authority."""
+    slam_enabled = navigation_config.get("slam_toolbox", {}).get("enabled", False)
+    nav2_config = navigation_config.get("nav2_bringup", {})
+    nav2_enabled = nav2_config.get("enabled", False)
+    amcl_enabled = nav2_enabled and nav2_config.get("use_amcl", False)
+    valid = {
+        "mapping": slam_enabled and not nav2_enabled,
+        "navigation": not slam_enabled and amcl_enabled,
+    }
+
+    if not valid.get(nav_stage, False):
+        raise ValueError(
+            f"nav_stage '{nav_stage}' must enable exactly one matching global localization provider "
+            "(mapping=slam_toolbox, navigation=Nav2 AMCL)"
+        )
+
+
 def _generate_rviz_nodes(rviz_config: dict[str, Any], use_sim: bool = False) -> list:
     """Generate RViz2 visualization node."""
     import os
@@ -189,6 +214,8 @@ def _generate_rviz_nodes(rviz_config: dict[str, Any], use_sim: bool = False) -> 
             rviz_config_file = os.path.join(robot_navigation_share, "config", "config.rviz")
         except Exception:
             rviz_config_file = ""
+    else:
+        rviz_config_file = resolve_ros_path(rviz_config_file)
 
     if not rviz_config_file:
         return []

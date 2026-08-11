@@ -41,6 +41,9 @@ def generate_cmd_vel_nodes(
     motion_mode_enabled = bool(motion_mode_config.get("enabled", False))
     if motion_mode_enabled and "navigation_enabled_on_startup" not in motion_mode_config:
         raise ValueError("robot.motion_mode.navigation_enabled_on_startup is required when motion_mode is enabled")
+    bridge_publish_odom = bridge_config.get("publish_odom", True)
+    dynamic_enabled = nav_config.get("nav2_bringup", {}).get("dyn_avoid_enabled", False)
+    cmd_vel_topic = "/cmd_vel_safe" if dynamic_enabled else "/cmd_vel"
 
     bridge_params = {
         "wheel_radius": bridge_config.get("wheel_radius", 0.05),
@@ -49,9 +52,10 @@ def generate_cmd_vel_nodes(
         "odom_frame": bridge_config.get("odom_frame", "odom"),
         "base_frame": bridge_config.get("base_frame", "base_link"),
         "publish_tf": bridge_publish_tf,
+        "publish_odom": bridge_publish_odom,
         "control_frequency": bridge_config.get("control_frequency", 50.0),
         "cmd_timeout": bridge_config.get("cmd_timeout", 0.5),
-        "cmd_vel_topic": bridge_config.get("cmd_vel_topic", "/cmd_vel"),
+        "cmd_vel_topic": cmd_vel_topic,
         "joint_states_topic": bridge_config.get("joint_states_topic", "/joint_states"),
         "odom_topic": bridge_config.get("odom_topic", "/odom"),
         "use_sim_time": use_sim,
@@ -74,6 +78,6 @@ def generate_cmd_vel_nodes(
             parameters=[bridge_params],
         )
     )
-    logger.info(f"Added cmd_vel_bridge node (publish_tf: {bridge_publish_tf})")
+    logger.info(f"Added cmd_vel_bridge node (publish_tf: {bridge_publish_tf}, publish_odom: {bridge_publish_odom})")
 
     return nodes

@@ -1,0 +1,16 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 88b7d5d..7199b46 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -231,10 +231,7 @@ else(ROS_EDITION STREQUAL "ROS2")
+   # check apr
+   find_package(PkgConfig)
+   pkg_check_modules(APR apr-1)
+-  if (APR_FOUND)
+-    message(${APR_INCLUDE_DIRS})
+-    message(${APR_LIBRARIES})
+-  endif (APR_FOUND)
++
+
+   # generate custom msg headers
+   set(LIVOX_INTERFACES livox_interfaces2)

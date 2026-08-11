@@ -78,7 +78,7 @@ Nav2 使用静态地图与 RTAB-Map 提供的 `map → odom` 定位结果，不�
 | 验证完整 Gazebo/Nav2 仿真 | [测试验证](#测试验证) | `NAV_TEST_PROFILE=full colcon test --packages-select robot_config ...` |
 | 实机建图 | [建图流程](#建图流程) | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_mapping` |
 | 实机导航 | [导航流程](#导航流程) | `ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=teleop` |
-| PC 端观察 | [PC 端 RViz 观察](#pc-端-rviz-观察) | `lekiwi_mapping_rviz.launch.py` / `lekiwi_navigation_rviz.launch.py` |
+| PC 端观察 | [PC 端 RViz 观察](#pc-端-rviz-观察) | `lekiwi_lidar_mapping_rviz.launch.py` / `lekiwi_lidar_navigation_rviz.launch.py` |
 | 单独调试导航节点 | [底层调试入口](#底层调试入口) | `ros2 run robot_navigation ...` |
 
 `robot_config` 的优势：YAML 单一数据源，自动启动控制器、相机、TF、定位、Nav2 和导航节点，并通过 `control_mode` 切换运行模式。
@@ -220,6 +220,32 @@ ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_nav
 
 ## PC 端 RViz 观察
 
+LiDAR 和 RealSense/RTAB-Map 使用明确分开的 RViz 配置，不能混用：
+
+LiDAR 使用一个简短的动态避障开关：
+
+```yaml
+dyn_avoid_enabled: false  # DWB + LaserScan + /cmd_vel
+dyn_avoid_enabled: true   # MPPI + PointCloud2 + Collision Monitor + /cmd_vel_safe
+```
+
+该开关由 `lekiwi_lidar` 的 navigation stage 设置，用户不需要同时维护
+controller、costmap、Collision Monitor 和底盘速度 topic。
+
+```bash
+# LiDAR 建图
+ros2 launch robot_navigation lekiwi_lidar_mapping_rviz.launch.py
+
+# LiDAR 导航
+ros2 launch robot_navigation lekiwi_lidar_navigation_rviz.launch.py
+
+# RealSense/RTAB-Map 建图
+ros2 launch robot_navigation lekiwi_realsense_mapping_rviz.launch.py
+
+# RealSense/RTAB-Map 导航
+ros2 launch robot_navigation lekiwi_realsense_navigation_rviz.launch.py
+```
+
 开发板上已经启动 `lekiwi_mapping` 或 `lekiwi_navi` 后，PC 端不需要在板端本地打开 RViz。只要网络互通且 `ROS_DOMAIN_ID` 一致，PC 可以直接观察远端 ROS 图。
 
 PC 端同样需要先加载 ROS 和工作区环境，具体方式参考 IB Robot 仓主目录下的 README。如果 PC 本地也有同一份工作区，并希望使用工作区里的 launch/config，再 source 该 overlay。两端 `ROS_DOMAIN_ID` 必须一致，例如 `<your_id>`。
@@ -234,7 +260,7 @@ ros2 topic echo /tf
 建图观察：
 
 ```bash
-ros2 launch robot_navigation lekiwi_mapping_rviz.launch.py
+ros2 launch robot_navigation lekiwi_lidar_mapping_rviz.launch.py
 ```
 
 该预设打开 `TF`、`RobotModel`、`/rtabmap/map`、`/rtabmap/cloud_map`。
@@ -242,7 +268,7 @@ ros2 launch robot_navigation lekiwi_mapping_rviz.launch.py
 导航观察：
 
 ```bash
-ros2 launch robot_navigation lekiwi_navigation_rviz.launch.py
+ros2 launch robot_navigation lekiwi_lidar_navigation_rviz.launch.py
 ```
 
 该预设打开 `TF`、`RobotModel`、`/map`、`/plan`。
@@ -250,7 +276,7 @@ ros2 launch robot_navigation lekiwi_navigation_rviz.launch.py
 自定义 RViz 配置：
 
 ```bash
-ros2 launch robot_navigation lekiwi_mapping_rviz.launch.py rviz_config:=/path/to/custom.rviz
+ros2 launch robot_navigation lekiwi_lidar_mapping_rviz.launch.py rviz_config:=/path/to/custom.rviz
 ```
 
 ## 单点验证
@@ -319,10 +345,10 @@ ros2 launch robot_navigation nav2_bringup.launch.py
 ros2 launch robot_navigation nav2_bringup.launch.py map:=/path/to/rtabmap.yaml
 
 # PC 端打开建图观察 RViz 预设
-ros2 launch robot_navigation lekiwi_mapping_rviz.launch.py
+ros2 launch robot_navigation lekiwi_lidar_mapping_rviz.launch.py
 
 # PC 端打开导航观察 RViz 预设
-ros2 launch robot_navigation lekiwi_navigation_rviz.launch.py
+ros2 launch robot_navigation lekiwi_lidar_navigation_rviz.launch.py
 
 # 单独运行节点
 ros2 run robot_navigation voice_control
@@ -576,8 +602,10 @@ RTAB-Map 以定位模式运行（`localization: true`），通过视觉 SLAM 发
 |------|---------|
 | `nav2_bringup.launch.py` | Nav2 子系统：map_server + Nav2 navigation_launch.py |
 | `ekf_rtabmap_launch.py` | Legacy/debug-only RTAB-Map + EKF 入口；正式 LeKiwi 实机链路由 `robot_config` 启动 |
-| `lekiwi_mapping_rviz.launch.py` | PC 端建图观察 RViz 预设 |
-| `lekiwi_navigation_rviz.launch.py` | PC 端导航观察 RViz 预设 |
+| `lekiwi_lidar_mapping_rviz.launch.py` | PC 端 LiDAR 建图观察 RViz 预设 |
+| `lekiwi_lidar_navigation_rviz.launch.py` | PC 端 LiDAR 导航观察 RViz 预设 |
+| `lekiwi_realsense_mapping_rviz.launch.py` | RealSense/RTAB-Map 建图 RViz 预设 |
+| `lekiwi_realsense_navigation_rviz.launch.py` | RealSense/RTAB-Map 导航 RViz 预设 |
 
 ## 目录结构
 
@@ -591,8 +619,10 @@ robot_navigation/
 ├── launch/
 │   ├── nav2_bringup.launch.py     # Nav2 子系统入口
 │   ├── ekf_rtabmap_launch.py      # Legacy/debug-only EKF + RTAB-Map
-│   ├── lekiwi_mapping_rviz.launch.py
-│   └── lekiwi_navigation_rviz.launch.py
+│   ├── lekiwi_lidar_mapping_rviz.launch.py
+│   ├── lekiwi_lidar_navigation_rviz.launch.py
+│   ├── lekiwi_realsense_mapping_rviz.launch.py
+│   └── lekiwi_realsense_navigation_rviz.launch.py
 ├── robot_navigation/
 │   ├── voice_control.py           # 语音关键词匹配 + 导航桥接
 │   ├── nav2_goal_client.py        # Nav2 Action 客户端 + 评估触发

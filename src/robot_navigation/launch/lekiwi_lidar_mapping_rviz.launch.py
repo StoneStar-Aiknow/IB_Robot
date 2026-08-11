@@ -9,14 +9,14 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     pkg_dir = FindPackageShare(package="robot_navigation").find("robot_navigation")
-    default_rviz_config = os.path.join(pkg_dir, "config", "lekiwi_navigation.rviz")
+    default_rviz_config = os.path.join(pkg_dir, "config", "lekiwi_lidar_mapping.rviz")
     rviz_config = LaunchConfiguration("rviz_config")
     use_sim_time = LaunchConfiguration("use_sim_time")
 
     rviz_node = Node(
         package="rviz2",
         executable="rviz2",
-        name="rviz2",
+        name="lekiwi_lidar_mapping_rviz",
         arguments=["-d", rviz_config],
         parameters=[{"use_sim_time": use_sim_time}],
         output="screen",

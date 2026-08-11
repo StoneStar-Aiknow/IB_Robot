@@ -68,6 +68,7 @@ Launch Arguments:
     sim_platform: Optional CLI override for robot YAML simulation.platform
     auto_start_controllers: Automatically spawn controllers (default: true, set to false for debugging)
     control_mode: Override control mode from YAML (teleop, model_inference, moveit_planning, etc.). If empty, uses default_control_mode from config file
+    nav_stage: Select a navigation workflow stage (mapping or navigation)
     with_inference: Enable inference pipeline. If empty, auto-detects from control mode config
     inference_pipeline: Pipeline ID targeted by inference launch overrides
     inference_execution_mode: Override the targeted pipeline mode (monolithic or distributed)
@@ -129,7 +130,7 @@ from robot_config.utils import parse_bool
 logger = get_colored_logger("robot_config.launch")
 
 
-def load_robot_config(robot_config_name, config_path_override=None):
+def load_robot_config(robot_config_name, config_path_override=None, nav_stage=""):
     """Load robot configuration from YAML file.
 
     Args:
@@ -154,7 +155,7 @@ def load_robot_config(robot_config_name, config_path_override=None):
     logger.info(f"Loading config from: {config_path}")
     logger.info(f"Config exists: {config_path.exists()}")
 
-    robot_config = load_robot_config_dict(config_path)
+    robot_config = load_robot_config_dict(config_path, nav_stage=nav_stage)
     logger.info(f"Loaded robot: {robot_config.get('name', 'UNKNOWN')}")
     logger.info(f"Peripherals: {len(robot_config.get('peripherals', []))}")
 
@@ -330,6 +331,7 @@ def launch_setup(context, *args, **kwargs):
     sim_platform_override = context.launch_configurations.get("sim_platform", "").strip().lower()
     auto_start_controllers = context.launch_configurations.get("auto_start_controllers", "true")
     control_mode_override = context.launch_configurations.get("control_mode", "")
+    nav_stage = context.launch_configurations.get("nav_stage", "").strip()
     voice_asr_auto_start_str = context.launch_configurations.get("voice_asr_auto_start", "")
     with_embodied_str = context.launch_configurations.get("with_embodied", "")
     with_perception_str = context.launch_configurations.get("with_perception", "")
@@ -343,13 +345,18 @@ def launch_setup(context, *args, **kwargs):
     logger.info(f"sim_platform: {sim_platform_override if sim_platform_override else '(from config)'}")
     logger.info(f"auto_start_controllers: {auto_start_controllers}")
     logger.info(f"control_mode: {control_mode_override if control_mode_override else '(from config)'}")
+    logger.info(f"nav_stage: {nav_stage if nav_stage else '(from config)'}")
     logger.info(f"voice_asr_auto_start: {voice_asr_auto_start_str}")
     logger.info(f"with_embodied: {with_embodied_str if with_embodied_str else '(from config)'}")
     logger.info(f"with_perception: {with_perception_str if with_perception_str else '(from config)'}")
 
     # ========== 2. Load robot configuration ==========
     try:
-        robot_config = load_robot_config(robot_config_name, config_path_override if config_path_override else None)
+        robot_config = load_robot_config(
+            robot_config_name,
+            config_path_override if config_path_override else None,
+            nav_stage,
+        )
     except Exception as e:
         logger.error(f"loading config: {e}")
         raise
@@ -884,6 +891,13 @@ def generate_launch_description():
                 "control_mode",
                 default_value="",
                 description="Override control mode from YAML (teleop, model_inference, or moveit_planning). If empty, uses default_control_mode from config file",
+            ),
+            DeclareLaunchArgument(
+                "nav_stage",
+                default_value="",
+                description=(
+                    "Select a navigation workflow stage: mapping or navigation. Empty uses default_nav_stage."
+                ),
             ),
             DeclareLaunchArgument(
                 "voice_asr_device_index",

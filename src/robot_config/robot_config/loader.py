@@ -36,6 +36,7 @@ from robot_config.observation_transport import (
 )
 from robot_config.perception_runtime_config import PerceptionRuntimeConfigError, parse_perception_runtime_config
 from robot_config.placement_execution_config import validate_placement_execution_config
+from robot_config.sensor_mount import apply_mid360_mount, normalize_mid360_mount
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 from .config_path import resolve_robot_config_path
@@ -55,6 +56,42 @@ _PARAMETER_SCHEMA_FIELDS = {"type", "additionalProperties", "properties", "requi
 _STRING_PARAMETER_FIELDS = {"type", "enum", "freeform"}
 _DISTANCE_PARAMETER_FIELDS = {"type", "exclusiveMinimum", "unit"}
 _VALID_DISTANCE_UNITS = {"meters", "degrees"}
+_NAV_STAGES = frozenset({"mapping", "navigation"})
+
+
+def _deep_merge_config(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Merge a mode overlay without sharing mutable values with the source YAML."""
+    result = copy.deepcopy(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_config(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _resolve_nav_stage(robot_config: dict[str, Any], nav_stage: str) -> dict[str, Any]:
+    """Resolve the selected stage in a declared navigation workflow."""
+    stage_configs = robot_config.get("nav_stages")
+    if stage_configs is None:
+        if nav_stage:
+            raise ValueError("nav_stage is only supported by configs that declare nav_stages")
+        return robot_config
+    if not isinstance(stage_configs, dict) or set(stage_configs) != _NAV_STAGES:
+        raise ValueError(f"nav_stages must contain exactly {sorted(_NAV_STAGES)}")
+    if any(not isinstance(config, dict) for config in stage_configs.values()):
+        raise ValueError("each nav_stages entry must be a mapping")
+
+    default_stage = robot_config.get("default_nav_stage", "navigation")
+    resolved_stage = nav_stage or default_stage
+    if resolved_stage not in _NAV_STAGES:
+        raise ValueError(f"Unsupported nav_stage {resolved_stage!r}; expected one of {sorted(_NAV_STAGES)}")
+
+    base = copy.deepcopy(robot_config)
+    del base["nav_stages"]
+    resolved = _deep_merge_config(base, stage_configs[resolved_stage])
+    resolved["nav_stage"] = resolved_stage
+    return resolved
 
 
 def _normalize_digest_value(value: Any) -> Any:
@@ -1003,7 +1040,11 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
     return errors
 
 
-def load_robot_config_dict(config_path: str | Path | None = None) -> dict[str, Any]:
+def load_robot_config_dict(
+    config_path: str | Path | None = None,
+    *,
+    nav_stage: str = "",
+) -> dict[str, Any]:
     """Load robot configuration as a complete dict.
 
     This is the canonical loader for launch/builders/runtime consumers. It preserves
@@ -1011,7 +1052,12 @@ def load_robot_config_dict(config_path: str | Path | None = None) -> dict[str, A
     downstream users that need provenance.
     """
     resolved_config_path, robot_data = _load_robot_section(resolve_robot_config_path(config_path=config_path))
-    robot_config = copy.deepcopy(robot_data)
+    robot_config = _resolve_nav_stage(copy.deepcopy(robot_data), nav_stage.strip())
+    mount_file = robot_config.get("mid360_mount_file")
+    if mount_file:
+        mount_path = Path(resolve_ros_path(mount_file)).expanduser()
+        with mount_path.open("r", encoding="utf-8") as stream:
+            robot_config = apply_mid360_mount(robot_config, normalize_mid360_mount(yaml.safe_load(stream) or {}))
     validation_errors = validate_grasp_execution_config(robot_config.get("grasp_execution"))
     validation_errors.extend(validate_placement_execution_config(robot_config.get("placement_execution")))
     validation_errors.extend(validate_motion_mode_config(robot_config))

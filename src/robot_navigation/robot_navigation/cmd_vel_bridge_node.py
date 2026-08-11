@@ -97,6 +97,7 @@ class CmdVelBridgeNode(Node):
         self.declare_parameter("odom_frame", "odom")
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("publish_tf", True)
+        self.declare_parameter("publish_odom", True)
         self.declare_parameter("control_frequency", 50.0)
         self.declare_parameter("cmd_timeout", 0.5)
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
@@ -114,6 +115,7 @@ class CmdVelBridgeNode(Node):
         self.odom_frame = self.get_parameter("odom_frame").value
         self.base_frame = self.get_parameter("base_frame").value
         self.publish_tf = self.get_parameter("publish_tf").value
+        self.publish_odom = self.get_parameter("publish_odom").value
         control_freq = self.get_parameter("control_frequency").value
         self.cmd_timeout = self.get_parameter("cmd_timeout").value
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
@@ -167,12 +169,14 @@ class CmdVelBridgeNode(Node):
             qos_reliable,
         )
 
-        self.joint_states_sub = self.create_subscription(
-            JointState,
-            joint_states_topic,
-            self.joint_states_callback,
-            qos_best_effort,
-        )
+        self.joint_states_sub = None
+        if self.publish_odom:
+            self.joint_states_sub = self.create_subscription(
+                JointState,
+                joint_states_topic,
+                self.joint_states_callback,
+                qos_best_effort,
+            )
 
         self.navigation_mode_sub = None
         self.navigation_mode_ack_pub = None
@@ -198,11 +202,9 @@ class CmdVelBridgeNode(Node):
             qos_reliable,
         )
 
-        self.odom_pub = self.create_publisher(
-            Odometry,
-            odom_topic,
-            qos_reliable,
-        )
+        self.odom_pub = None
+        if self.publish_odom:
+            self.odom_pub = self.create_publisher(Odometry, odom_topic, qos_reliable)
 
         # TF broadcaster
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -316,8 +318,8 @@ class CmdVelBridgeNode(Node):
 
         self._publish_wheel_command(wheel_speeds)
 
-        # ---------- FK + Odometry: wheel feedback -> odom ----------
-        if self.wheel_feedback is not None:
+        # ---------- Optional FK + Odometry: wheel feedback -> odom ----------
+        if self.publish_odom and self.wheel_feedback is not None:
             body_vel = _wheel_radps_to_body(
                 self.wheel_feedback,
                 self.wheel_radius,
@@ -368,7 +370,8 @@ class CmdVelBridgeNode(Node):
         odom.twist.twist.angular.y = 0.0
         odom.twist.twist.angular.z = vtheta
 
-        self.odom_pub.publish(odom)
+        if self.odom_pub is not None:
+            self.odom_pub.publish(odom)
 
         # Publish TF
         if self.publish_tf:

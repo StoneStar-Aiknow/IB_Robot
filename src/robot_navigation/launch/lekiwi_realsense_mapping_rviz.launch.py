@@ -9,7 +9,7 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     pkg_dir = FindPackageShare(package="robot_navigation").find("robot_navigation")
-    default_rviz_config = os.path.join(pkg_dir, "config", "lekiwi_mapping.rviz")
+    default_rviz_config = os.path.join(pkg_dir, "config", "lekiwi_realsense_mapping.rviz")
     rviz_config = LaunchConfiguration("rviz_config")
     use_sim_time = LaunchConfiguration("use_sim_time")
 

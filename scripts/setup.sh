@@ -94,6 +94,8 @@ source "${SCRIPT_DIR}/setup/common.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/setup/submodules.sh"
 # shellcheck disable=SC1091
+source "${SCRIPT_DIR}/setup/ros_third_party.sh"
+# shellcheck disable=SC1091
 source "${SCRIPT_DIR}/setup/rosdep.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/setup/python_venv.sh"
@@ -554,6 +556,7 @@ main() {
     # Update submodules
     set_stage "syncing submodules"
     update_submodules
+    ensure_ros_third_party_patch_stacks
 
     if [[ "${ONLY_PATCH}" != true ]]; then
         # Install dependencies
