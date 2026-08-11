@@ -52,6 +52,7 @@ from inference_manifest import (
     SemanticIdentity,
     SemanticTensor,
     TensorBinding,
+    TorchDeployment,
     canonical_bundle_digest,
     graspgen_geometry,
     graspgen_input_semantics,
@@ -224,17 +225,43 @@ def _adapter_assets(onnx_manifest: Mapping[str, object], *, grasp_batch_size: in
         "grasp_batch_size": grasp_batch_size,
         "point_count": point_count,
         "geometry": graspgen_geometry(),
+        "torch_module_loader": "perception_service.torch_model_loaders:load_graspgen",
+        "gripper_config": "assets/graspgen_config.yml",
+        "generator_checkpoint": "assets/generator_checkpoint.pth",
+        "discriminator_checkpoint": "assets/discriminator_checkpoint.pth",
     }
 
 
+def _copy_torch_assets(root: Path, onnx_manifest: Mapping[str, object]) -> None:
+    source = onnx_manifest.get("source")
+    if not isinstance(source, Mapping):
+        raise ValueError("GraspGen ONNX manifest must declare source config and checkpoints")
+    destinations = {
+        "config": root / "assets/graspgen_config.yml",
+        "generator_checkpoint": root / "assets/generator_checkpoint.pth",
+        "discriminator_checkpoint": root / "assets/discriminator_checkpoint.pth",
+    }
+    for name, destination in destinations.items():
+        raw_path = source.get(name)
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise ValueError(f"GraspGen ONNX manifest source.{name} must be a non-empty path")
+        source_path = Path(raw_path).expanduser().resolve()
+        if not source_path.is_file():
+            raise FileNotFoundError(f"GraspGen Torch source asset is unavailable: {source_path}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if not destination.is_file() or _sha256(source_path) != _sha256(destination):
+            destination.write_bytes(source_path.read_bytes())
+
+
 def _model_descriptor(grasp_batch_size: int) -> ModelDescriptor:
+    del grasp_batch_size
     return ModelDescriptor(
         kind="perception",
         family=GraspGenAdapter.identity.family,
         inputs=(SemanticTensor(semantic=GRASPGEN_POINT_CLOUD_SEMANTIC, dtype="float32", shape=(-1, 3)),),
         outputs=(
-            SemanticTensor(semantic=GRASPGEN_POSE_SEMANTIC, dtype="float32", shape=(grasp_batch_size, 4, 4)),
-            SemanticTensor(semantic=GRASPGEN_CONFIDENCE_SEMANTIC, dtype="float32", shape=(grasp_batch_size,)),
+            SemanticTensor(semantic=GRASPGEN_POSE_SEMANTIC, dtype="float32", shape=(-1, 4, 4)),
+            SemanticTensor(semantic=GRASPGEN_CONFIDENCE_SEMANTIC, dtype="float32", shape=(-1,)),
         ),
         semantic_identity=SemanticIdentity(
             logical_model_revision=f"{GraspGenAdapter.identity.family}@v{GRASPGEN_CONTRACT_VERSION}",
@@ -280,6 +307,7 @@ def write_graspgen_ascend_bundle(
     adapter_path = root / "assets" / "adapter.json"
     adapter_path.parent.mkdir(parents=True, exist_ok=True)
     adapter_path.write_text(json.dumps(assets, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _copy_torch_assets(root, onnx_manifest)
     for artifact in roles:
         destination = root / artifact.destination
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -310,6 +338,12 @@ def write_graspgen_ascend_bundle(
         )
         deployment = deployment.model_copy(update={"uuid": previous.uuid, "revision": previous.revision + int(changed)})
 
+    torch_deployment = TorchDeployment(backend="torch", device="cuda")
+    previous_torch = existing.deployments.get("torch_cuda") if existing is not None else None
+    if isinstance(previous_torch, TorchDeployment):
+        torch_deployment = torch_deployment.model_copy(
+            update={"uuid": previous_torch.uuid, "revision": previous_torch.revision}
+        )
     manifest = InferenceManifest(
         schema_version=2,
         bundle=ManifestBundle(
@@ -324,7 +358,11 @@ def write_graspgen_ascend_bundle(
             ),
         ),
         model=model,
-        deployments={**(existing.deployments if existing is not None else {}), deployment_name: deployment},
+        deployments={
+            **(existing.deployments if existing is not None else {}),
+            "torch_cuda": torch_deployment,
+            deployment_name: deployment,
+        },
     )
     try:
         write_inference_manifest(manifest_path, manifest)

@@ -109,7 +109,7 @@ class StageFrame:
         self._session_execution_stack: ExitStack | None = None
         self._closed = False
 
-    def bind_session_execution(self, session: object, execution: object) -> None:
+    def _bind_session_execution(self, session: object, execution: object) -> None:
         self._session_executions[id(session)] = execution
 
     def session_execution(self, session: object) -> object | None:
@@ -131,7 +131,7 @@ class StageFrame:
             priority=getattr(request, "priority", 0),
         )
         entered = self._session_execution_stack.enter_context(execution(scoped_request))
-        self.bind_session_execution(session, entered)
+        self._bind_session_execution(session, entered)
         return entered
 
     def close(self) -> None:
@@ -185,6 +185,7 @@ class PipelineRuntimeCore:
         executor: ModelExecutor,
         *,
         request_timeout: float | None = None,
+        supports_cancellation: bool = False,
     ) -> None:
         if not pipeline_id:
             raise PipelineConfigurationError("pipeline_id must be non-empty")
@@ -198,6 +199,7 @@ class PipelineRuntimeCore:
         self._context = runtime_context
         self._executor = executor
         self._request_timeout = request_timeout
+        self._supports_cancellation = supports_cancellation
         self._state_machine = PipelineStateMachine()
         self._condition = threading.Condition(threading.RLock())
         self._control_lock = threading.Lock()
@@ -474,7 +476,7 @@ class PipelineRuntimeCore:
             pipeline_id=self.pipeline_id,
             phase=phase,
             backend_completed=backend_completed,
-            cancellation_supported=False,
+            cancellation_supported=self._supports_cancellation,
         )
 
     @staticmethod
@@ -560,7 +562,7 @@ class PipelineRuntimeCore:
 
 
 class GenericModelPipeline:
-    """Public model-neutral facade over the sole pipeline runtime core."""
+    """Public model-neutral API over the reusable lifecycle and admission core."""
 
     def __init__(
         self,
@@ -569,12 +571,14 @@ class GenericModelPipeline:
         executor: ModelExecutor,
         *,
         request_timeout: float | None = None,
+        supports_cancellation: bool = False,
     ) -> None:
         self._core = PipelineRuntimeCore(
             pipeline_id,
             runtime_context,
             executor,
             request_timeout=request_timeout,
+            supports_cancellation=supports_cancellation,
         )
 
     @property

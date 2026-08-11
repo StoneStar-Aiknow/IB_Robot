@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
-import sys
 import threading
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
-from types import ModuleType
 
 import numpy as np
 import pytest
@@ -16,20 +14,16 @@ from inference_manifest.models import DeviceLink
 from inference_service.backends import (
     BACKEND_REGISTRY,
     BackendAdmissionError,
-    BackendCapabilityError,
-    BackendDescriptor,
     BackendInferenceError,
     BackendLoadError,
-    BackendRegistry,
-    BackendState,
-    ConformanceEvidence,
+    BackendRegistryError,
     InferenceRequest,
     RuntimeContext,
 )
-from inference_service.backends.ascend import AscendBackend, create_backend
 from inference_service.backends.ascend.acl_runtime import AclRuntimeManager
-from inference_service.codecs import CodecRequest, build_execution_plan, create_policy_codec
+from inference_service.codecs import build_execution_plan
 from inference_service.core.pure_inference_engine import PureInferenceEngine
+from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions import AscendOmModelSession
 from inference_service.pi05_schedule import load_pi05_schedule
 from inference_service.pipeline import InferencePipeline, PipelineState
@@ -708,28 +702,6 @@ def _pi05_acl(
     )
 
 
-def _pure_engine_registry(monkeypatch, acl: FakeAcl) -> BackendRegistry:
-    module = ModuleType("tests.fake_ascend_engine_backend")
-
-    def fake_create_backend(context: RuntimeContext) -> AscendBackend:
-        device_id = context.runtime_options.get("device_id", 0)
-        return AscendBackend(int(device_id), runtime_manager=AclRuntimeManager(lambda: acl))
-
-    module.create_backend = fake_create_backend
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    return BackendRegistry(
-        {
-            "ascend": BackendDescriptor(
-                name="ascend",
-                factory=f"{module.__name__}:create_backend",
-                supported_policy_families=frozenset({"pi05"}),
-                conformance_evidence=frozenset({ConformanceEvidence("policy", "pi05")}),
-                target_validator=lambda deployment: None,
-            )
-        }
-    )
-
-
 def _pi05_pipeline(
     context: RuntimeContext,
     acl: FakeAcl,
@@ -755,6 +727,27 @@ def _pi05_pipeline(
         model_session_factory=session_factory,
         pi05_diagnostic_schedule=diagnostic_schedule,
         pi05_diagnostic_schedule_source=diagnostic_schedule_source,
+    )
+
+
+def _act_pipeline(context: RuntimeContext, acl: FakeAcl, *, pipeline_id: str = "act") -> InferencePipeline:
+    """Build an ACT pipeline through the production factory/session path."""
+
+    runtime_manager = AclRuntimeManager(lambda: acl)
+
+    def session_factory(ctx, options):
+        return AscendOmModelSession(
+            device_id=int(options["device_id"]),
+            runtime_manager=runtime_manager,
+            priority_scheduling=ctx.priority_scheduling,
+        )
+
+    return pipeline_factory.create_inference_pipeline(
+        pipeline_id,
+        context.validated_manifest,
+        runtime_options=dict(context.runtime_options),
+        priority_scheduling=context.priority_scheduling,
+        model_session_factory=session_factory,
     )
 
 
@@ -787,8 +780,7 @@ def _identity_lerobot_processors(monkeypatch):
 def test_ascend_act_pipeline_uses_manifest_bindings_and_matches_reference(tmp_path):
     context = _act_context(tmp_path, runtime_options={"device_id": 0})
     acl = _act_acl(context)
-    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
-    pipeline = InferencePipeline("policy", context, backend, codec=create_policy_codec(context.policy))
+    pipeline = _act_pipeline(context, acl, pipeline_id="policy")
     pipeline.load()
 
     state = np.arange(6, dtype=np.float32)
@@ -804,10 +796,11 @@ def test_ascend_act_pipeline_uses_manifest_bindings_and_matches_reference(tmp_pa
 
     np.testing.assert_array_equal(result.action, np.repeat(state[None, None, :], 4, axis=1))
     assert result.actual_chunk_size == 4
-    assert result.metadata["device_id"] == 0
-    assert backend.health().state is BackendState.READY
-    assert backend.capabilities.hardware_resource_id is None
-    assert backend.capabilities.priority_mapping is None
+    assert result.metadata["backend"] == "ascend"
+    assert pipeline._backend is None
+    assert pipeline.health().state is PipelineState.READY
+    assert pipeline.capabilities.hardware_resource_id is None
+    assert pipeline.capabilities.priority_mapping is None
     pipeline.close()
     pipeline.close()
     assert acl.init_calls == [None]
@@ -821,18 +814,13 @@ def test_ascend_act_pipeline_uses_manifest_bindings_and_matches_reference(tmp_pa
 def test_ascend_priority_mode_maps_requests_to_async_hardware_streams(tmp_path):
     context = _act_context(tmp_path, priority_scheduling=True)
     acl = _act_acl(context)
-    backend = AscendBackend(
-        0,
-        priority_scheduling=True,
-        runtime_manager=AclRuntimeManager(lambda: acl),
-    )
-    pipeline = InferencePipeline("policy", context, backend, codec=create_policy_codec(context.policy))
+    pipeline = _act_pipeline(context, acl, pipeline_id="policy")
     pipeline.load()
 
-    assert backend.capabilities.priority_mapping is not None
-    assert backend.capabilities.priority_mapping.generic_level_count == 8
-    assert backend.capabilities.hardware_resource_id == "ascend:0"
-    assert backend.capabilities.resource_domain is None
+    assert pipeline.capabilities.priority_mapping is not None
+    assert pipeline.capabilities.priority_mapping.generic_level_count == 8
+    assert pipeline.capabilities.hardware_resource_id == "ascend:0"
+    assert pipeline.capabilities.resource_domain is None
     assert [(priority, flag) for priority, flag, _stream in acl.created_streams] == [
         (priority, 1) for priority in range(8)
     ]
@@ -863,10 +851,19 @@ def test_ascend_priority_mode_maps_requests_to_async_hardware_streams(tmp_path):
     ]
 
     with pytest.raises(BackendAdmissionError) as error:
-        backend.infer(InferenceRequest(request_id="out-of-range", inputs={}, priority=8))
+        pipeline.infer(
+            InferenceRequest(
+                request_id="out-of-range",
+                inputs={
+                    "observation.state": np.arange(6, dtype=np.float32),
+                    "observation.images.top": np.ones((3, 16, 24), dtype=np.float32),
+                },
+                priority=8,
+            )
+        )
     assert error.value.code == "unsupported_priority"
     assert error.value.operation_started is False
-    assert backend.health().state is BackendState.READY
+    assert pipeline.health().state is PipelineState.READY
     assert len(acl.async_executions) == 3
 
     pipeline.close()
@@ -879,14 +876,10 @@ def test_ascend_priority_stream_creation_failure_rolls_back_runtime(tmp_path):
     context = _act_context(tmp_path, priority_scheduling=True)
     acl = _act_acl(context)
     acl.fail_stream_priority = 3
-    backend = AscendBackend(
-        0,
-        priority_scheduling=True,
-        runtime_manager=AclRuntimeManager(lambda: acl),
-    )
+    pipeline = _act_pipeline(context, acl)
 
     with pytest.raises(BackendLoadError, match="create_stream_with_config"):
-        backend.load(context)
+        pipeline.load()
 
     assert acl.streams == set()
     assert [priority for priority, _flag, _stream in acl.created_streams] == [0, 1, 2]
@@ -894,7 +887,7 @@ def test_ascend_priority_stream_creation_failure_rolls_back_runtime(tmp_path):
     assert acl.destroyed_contexts
     assert acl.reset_device_calls == [0]
     assert acl.finalize_calls == 1
-    backend.close()
+    pipeline.close()
 
 
 @pytest.mark.parametrize("failure_point", ["execute_async", "synchronize_stream"])
@@ -905,12 +898,7 @@ def test_ascend_priority_execution_failure_has_unknown_outcome(tmp_path, failure
         acl.fail_async_execution = True
     else:
         acl.fail_stream_synchronization = True
-    backend = AscendBackend(
-        0,
-        priority_scheduling=True,
-        runtime_manager=AclRuntimeManager(lambda: acl),
-    )
-    pipeline = InferencePipeline("policy", context, backend, codec=create_policy_codec(context.policy))
+    pipeline = _act_pipeline(context, acl, pipeline_id="policy")
     pipeline.load()
 
     with pytest.raises(BackendInferenceError) as error:
@@ -937,41 +925,33 @@ def test_ascend_priority_stream_creation_failure_preserves_cleanup_errors(tmp_pa
     acl = _act_acl(context)
     acl.fail_stream_priority = 1
     acl.fail_stream_synchronization = True
-    backend = AscendBackend(
-        0,
-        priority_scheduling=True,
-        runtime_manager=AclRuntimeManager(lambda: acl),
-    )
+    pipeline = _act_pipeline(context, acl)
 
     with pytest.raises(BackendLoadError) as error:
-        backend.load(context)
+        pipeline.load()
 
     assert "create_stream_with_config(priority=1)" in str(error.value)
     assert "stream rollback errors" in str(error.value)
     assert "synchronize_stream(priority=0)" in str(error.value)
     assert acl.streams == set()
     assert acl.destroyed_contexts
-    backend.close()
+    pipeline.close()
 
 
 def test_ascend_priority_mode_rejects_incomplete_hardware_range(tmp_path):
     context = _act_context(tmp_path, priority_scheduling=True)
     acl = _act_acl(context)
     acl.least_stream_priority = 0
-    backend = AscendBackend(
-        0,
-        priority_scheduling=True,
-        runtime_manager=AclRuntimeManager(lambda: acl),
-    )
+    pipeline = _act_pipeline(context, acl)
 
     with pytest.raises(BackendLoadError) as error:
-        backend.load(context)
+        pipeline.load()
 
     assert error.value.code == "hardware_priority_unsupported"
     assert acl.created_streams == []
     assert acl.destroyed_contexts
     assert acl.finalize_calls == 1
-    backend.close()
+    pipeline.close()
 
 
 def test_ascend_pi05_keeps_device_links_internal_and_runs_denoising_loop(tmp_path):
@@ -1189,8 +1169,8 @@ def test_ascend_runtime_diagnostic_paths_must_be_nonempty(name):
 
 
 def test_ascend_rejects_schedule_override_runtime_option():
-    with pytest.raises(BackendLoadError, match="unknown Ascend runtime options"):
-        AscendBackend._validate_runtime_options({"schedule_override_path": "/tmp/schedule.json"})
+    with pytest.raises(BackendLoadError, match="unknown Ascend PI0.5 options"):
+        pipeline_factory._validate_pi05_options({"schedule_override_path": "/tmp/schedule.json"})
 
 
 def test_ascend_pi05_factory_session_path_matches_reference_numerics_and_repeats(tmp_path):
@@ -1204,7 +1184,7 @@ def test_ascend_pi05_factory_session_path_matches_reference_numerics_and_repeats
     from inference_service.pipeline import GenericModelPipeline
 
     assert isinstance(pipeline._pipeline, GenericModelPipeline)
-    # The facade must not load a second AscendBackend for PI0.5.
+    # The facade must not create a direct backend for PI0.5.
     assert pipeline._backend is None
     assert pipeline.capabilities.resource_domain == "ascend:0"
 
@@ -1292,7 +1272,6 @@ def test_pure_engine_runs_named_pi05_ascend_deployment_end_to_end_with_fake_acl(
         deployment_name,
         pipeline_id="named-pi05",
         runtime_options={"device_id": 3, "random_seed": 99},
-        registry=_pure_engine_registry(monkeypatch, acl),
         model_session_factory=session_factory,
     )
     external_noise = np.full((1, 2, 8), 5.0, dtype=np.float32)
@@ -1393,33 +1372,35 @@ def test_ascend_multiple_contexts_respect_runtime_priority_mode(tmp_path, priori
     acl = FakeAcl({first_path: spec, second_path: spec})
     acl.execution_delay = 0.05
     manager = AclRuntimeManager(lambda: acl)
-    first = AscendBackend(0, priority_scheduling=priority_scheduling, runtime_manager=manager)
-    second = AscendBackend(0, priority_scheduling=priority_scheduling, runtime_manager=manager)
+    first = AscendOmModelSession(
+        0,
+        priority_scheduling=priority_scheduling,
+        runtime_manager=manager,
+    )
+    second = AscendOmModelSession(
+        0,
+        priority_scheduling=priority_scheduling,
+        runtime_manager=manager,
+    )
     first.load(first_context)
     second.load(second_context)
     errors: list[Exception] = []
 
-    def infer(backend, context, priority):
+    def infer(session, context, priority):
         try:
-            deployment = context.deployment
-            plan = build_execution_plan(deployment.execution, deployment.bindings, deployment.device_links)
-            codec = create_policy_codec(context.policy)
-            bound = codec.encode_inputs(
-                request=CodecRequest(
+            request = NamedTensorRequest(
+                request_id="shared",
+                inputs={"request.scope": np.zeros((1,), dtype=np.float32)},
+                priority=priority,
+            )
+            with session.execution(request) as execution:
+                execution.invoke(
+                    "policy",
                     {
                         "observation.state": np.zeros((1, 6), dtype=np.float32),
                         "observation.images.top": np.zeros((1, 3, 16, 24), dtype=np.float32),
-                    }
-                ),
-                bindings=deployment.bindings["policy"],
-            )
-            backend.infer(
-                InferenceRequest(
-                    request_id="shared",
-                    inputs={"execution_plan": plan, "role_inputs": {"policy": bound}},
-                    priority=priority,
+                    },
                 )
-            )
         except Exception as exc:  # pragma: no cover - asserted below
             errors.append(exc)
 
@@ -1512,25 +1493,25 @@ def test_ascend_runtime_manager_rejects_conflicting_acl_config_paths():
 def test_ascend_rejects_runtime_descriptor_mismatch_before_dataset_allocation(tmp_path, acl_options, code):
     context = _act_context(tmp_path)
     acl = _act_acl(context, **acl_options)
-    backend = AscendBackend(0, runtime_manager=AclRuntimeManager(lambda: acl))
+    pipeline = _act_pipeline(context, acl)
 
     with pytest.raises(BackendLoadError) as error:
-        backend.load(context)
+        pipeline.load()
 
     assert error.value.code == code
     assert acl.memory == {}
     assert acl.finalize_calls == 1
-    backend.close()
+    pipeline.close()
 
 
-def test_ascend_registry_factory_is_lazy_and_reset_is_unsupported(tmp_path):
+def test_ascend_registry_descriptor_is_session_only(tmp_path):
     context = _act_context(tmp_path)
-    backend = BACKEND_REGISTRY.create(context)
+    descriptor = BACKEND_REGISTRY.validate(context)
 
-    assert isinstance(backend, AscendBackend)
-    with pytest.raises(BackendCapabilityError):
-        backend.reset()
-    backend.close()
+    assert descriptor.factory is None
+    with pytest.raises(BackendRegistryError) as error:
+        BACKEND_REGISTRY.create(context)
+    assert error.value.code == "backend_factory_unavailable"
 
 
 @pytest.mark.parametrize(
@@ -1547,6 +1528,10 @@ def test_ascend_rejects_invalid_runtime_options(tmp_path, runtime_options):
     context = _act_context(tmp_path, runtime_options=runtime_options)
 
     with pytest.raises(BackendLoadError) as error:
-        create_backend(context)
+        pipeline_factory.create_inference_pipeline(
+            "act-invalid-options",
+            context.validated_manifest,
+            runtime_options=context.runtime_options,
+        )
 
     assert error.value.code == "invalid_runtime_options"

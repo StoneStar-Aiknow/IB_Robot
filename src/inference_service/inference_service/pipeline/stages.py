@@ -29,6 +29,25 @@ class ResultAdapter(Protocol):
     def adapt_error(self, error: object) -> object: ...
 
 
+@dataclass(frozen=True)
+class ModelResultAdapter:
+    """Return the named-tensor result produced by a :class:`ModelStage`."""
+
+    result_key: str = "_model_result"
+
+    def adapt(self, frame: StageFrame) -> object:
+        try:
+            return frame.values[self.result_key]
+        except KeyError as exc:
+            raise RuntimeError(f"stage frame is missing model result {self.result_key!r}") from exc
+
+    def adapt_error(self, error: object) -> object:
+        cause = getattr(error, "cause", None)
+        if cause is not None:
+            raise cause
+        raise RuntimeError(getattr(error, "message", str(error)))
+
+
 @runtime_checkable
 class IterationStateAdapter(Protocol):
     """Own family-specific loop state without coupling it to a backend."""
@@ -182,14 +201,16 @@ class ModelStage:
     def execute(self, frame: StageFrame, *, deadline: datetime | None) -> None:
         from inference_service.generic_runtime import NamedTensorRequest
 
-        request = frame.request
+        model_request = frame.values.get("_model_request")
+        request = model_request or frame.request
         frame.control.raise_if_canceled(f"model.{self.role}")
         if not isinstance(request, NamedTensorRequest):
             raise TypeError("ModelStage requires a NamedTensorRequest")
         if frame.execution_frame is None:
             from dataclasses import replace
 
-            result = self.session.infer(replace(request, inputs=frame.values, deadline=deadline))
+            inputs = request.inputs if model_request is not None else frame.values
+            result = self.session.infer(replace(request, inputs=inputs, deadline=deadline))
             frame.values["_model_result"] = result
             frame.values.update(result.outputs)
             return
@@ -224,25 +245,6 @@ class ModelStage:
         frame.values.update(
             {semantic: value for semantic, value in outputs.items() if not semantic.startswith("internal.")}
         )
-
-
-@dataclass(frozen=True)
-class BackendStage:
-    """Invoke an existing backend contract as one delegated model stage."""
-
-    backend: object
-
-    def execute(self, frame: StageFrame, *, deadline: datetime | None) -> None:
-        from dataclasses import replace
-
-        from inference_service.backends import InferenceRequest
-
-        request = frame.request
-        frame.control.raise_if_canceled("backend")
-        if not isinstance(request, InferenceRequest):
-            raise TypeError("BackendStage requires an InferenceRequest")
-        result = self.backend.infer(replace(request, inputs=frame.values, deadline=deadline))
-        frame.values["_backend_result"] = result
 
 
 @dataclass(frozen=True)

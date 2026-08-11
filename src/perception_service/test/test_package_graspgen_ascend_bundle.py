@@ -98,7 +98,13 @@ def test_the_model_constants_land_in_the_adapter_asset_the_adapter_reads_back(gr
     assert (config.npoints, config.radii, config.nsamples) == ((256, 64), (0.02, 0.04), (64, 128))
 
     manifest = load_inference_manifest(graspgen_bundle, GRASPGEN_DEPLOYMENT).manifest
-    assert {entry.path for entry in manifest.bundle.files} == {"assets/adapter.json"}
+    assert {entry.path for entry in manifest.bundle.files} == {
+        "assets/adapter.json",
+        "assets/discriminator_checkpoint.pth",
+        "assets/generator_checkpoint.pth",
+        "assets/graspgen_config.yml",
+    }
+    assert set(manifest.deployments) == {"torch_cuda", GRASPGEN_DEPLOYMENT}
 
 
 def test_the_packaged_geometry_drops_the_encoder_heads_null_stage(graspgen_bundle):

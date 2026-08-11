@@ -52,13 +52,10 @@ def test_remote_backend_delegates_one_request_without_local_sampler():
     points = np.zeros((2048, 3), dtype=np.float32)
 
     poses, confidence = wrapper._run_batched_inference(
-        object,
         points,
         grasp_threshold=0.2,
         num_grasps=5000,
         topk_num_grasps=1000,
-        min_grasps=80,
-        max_tries=4,
     )
 
     assert isinstance(poses, torch.Tensor)
@@ -90,13 +87,10 @@ def test_ascend_local_backend_delegates_one_request_without_local_sampler():
     points = np.zeros((2048, 3), dtype=np.float32)
 
     poses, confidence = wrapper._run_batched_inference(
-        object,
         points,
         grasp_threshold=0.2,
         num_grasps=5000,
         topk_num_grasps=1000,
-        min_grasps=80,
-        max_tries=4,
     )
 
     assert isinstance(poses, torch.Tensor)
@@ -166,6 +160,7 @@ def test_ascend_local_backend_runs_distinct_batches_and_applies_global_topk():
 
     client = object.__new__(AscendLocalBackend)
     client._session = FakeSession()
+    client._pipeline = SimpleNamespace(execute=client._session.infer)
     client._adapter = _graspgen_adapter()
     client._sample_lock = graspgen_wrapper.threading.Lock()
     client._ensure_loaded = lambda: None
@@ -200,6 +195,7 @@ def test_ascend_local_backend_limits_a_partial_static_batch():
 
     client = object.__new__(AscendLocalBackend)
     client._session = FakeSession()
+    client._pipeline = SimpleNamespace(execute=client._session.infer)
     client._adapter = _graspgen_adapter()
     client._sample_lock = graspgen_wrapper.threading.Lock()
     client._ensure_loaded = lambda: None
@@ -223,13 +219,14 @@ def test_ascend_local_backend_rejects_empty_manifest_path():
         AscendLocalBackend("")
 
 
-def test_ascend_local_wrapper_warmup_uses_deterministic_synthetic_cloud():
+@pytest.mark.parametrize("backend", ["local_cuda", "ascend_local"])
+def test_local_wrapper_warmup_uses_deterministic_synthetic_cloud(backend):
     class FakeClient:
         def warmup(self, object_pc):
             self.object_pc = object_pc
 
     wrapper = object.__new__(GraspGenWrapper)
-    wrapper.inference_backend = "ascend_local"
+    wrapper.inference_backend = backend
     wrapper._inference_point_count = 32
     wrapper._ascend_local_client = FakeClient()
 
@@ -273,7 +270,7 @@ def test_ascend_local_wrapper_initializes_without_graspgen_source(tmp_path, monk
             self.args = args
             self.kwargs = kwargs
 
-    monkeypatch.setattr(graspgen_wrapper, "AscendLocalBackend", FakeAscendBackend)
+    monkeypatch.setattr(graspgen_wrapper, "LocalPipelineBackend", FakeAscendBackend)
     wrapper = GraspGenWrapper(
         gripper_config=str(config_path),
         inference_backend="ascend_local",

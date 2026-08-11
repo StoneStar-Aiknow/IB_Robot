@@ -119,6 +119,13 @@ The pipeline ID is the stable model-instance and ROS-routing identity. It must m
 - its backend instance, admission state, and lifecycle
 - its action, reset, health, action-output, and distributed transport endpoints
 
+`GenericModelPipeline` is the public model-neutral runtime used by policy, perception, Echo, and future model
+families. It owns lifecycle, admission, deadlines, cancellation, and health. `PipelineRuntimeCore` is its reusable
+internal state-machine and concurrency implementation. `InferencePipeline` is the policy facade that adds LeRobot
+processors, policy codecs, and action adaptation. Compiled models run through a `SequentialModelExecutor` sequence
+of `InferenceStage` objects; iterative families use `IterativeStage` to invoke roles within one shared
+`ModelSessionExecution` device-resource scope.
+
 Default endpoints:
 
 | Interface | Default |
@@ -229,8 +236,8 @@ ROS observations
   -> contract adapter
   -> LeRobot preprocessor
   -> semantic batch
-  -> native policy or policy codec + bindings
-  -> selected backend
+  -> native policy, or policy codec + shared stage executor
+  -> Backend.infer, or ModelSession role execution
   -> semantic action
   -> LeRobot postprocessor
   -> DispatchInfer result and action topic
@@ -368,14 +375,32 @@ The only canonical backend names are:
 | `rknn` | RKNNLite execution of RKNN artifacts |
 | `hmm` | Houmo TCIM execution of HMM multi-module artifacts |
 
-The initial support matrix is normative and enforced at startup:
+Compiled PI0.5 and SmolVLA loops are no longer owned by legacy backend classes. They execute through
+`GenericModelPipeline -> SequentialModelExecutor -> InferenceStage -> ModelSession`; the corresponding
+`AscendBackend`, `HMMBackend`, and `RKNNBackend` fail closed for migrated families. The following matrix is
+normative and enforced at startup:
 
 | Policy family | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |
 | --- | --- | --- | --- | --- | --- |
-| ACT | supported | supported | supported | supported | unsupported |
-| Diffusion Policy | supported | unsupported | unsupported | unsupported | unsupported |
-| PI0.5 | supported | supported | unsupported | unsupported | supported |
-| SmolVLA | supported | unsupported | unsupported | supported | supported |
+| ACT | Backend | Backend | Backend | Backend | unsupported |
+| Diffusion Policy | Backend | unsupported | unsupported | unsupported | unsupported |
+| PI0.5 | Backend | ModelSession | unsupported | unsupported | ModelSession |
+| SmolVLA | Backend | unsupported | unsupported | ModelSession | ModelSession |
+
+`Backend` means direct `*Backend.infer()` execution. `ModelSession` means role execution through a shared family
+executor. The registry-enforced perception matrix is:
+
+| Perception family | `torch` | `ascend` |
+| --- | --- | --- |
+| RAM++ | supported | supported |
+| SAM2 | supported (automatic) | supported (prompt) |
+| SigLIP2 | supported | supported |
+| Grounding DINO | supported (combined) | supported (raw) |
+| GraspGen | supported (CUDA) | supported |
+| Dummy Echo | supported | unsupported |
+
+The registry also requires matching `ConformanceEvidence` for every family/backend declaration; a family listed
+without evidence still fails closed.
 
 ### PI0.5 Ascend Behavior
 

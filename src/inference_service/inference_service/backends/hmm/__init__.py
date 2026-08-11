@@ -1,5 +1,5 @@
-"""Houmo HMM backend loaded lazily by the static backend registry."""
+"""Houmo HMM runtime primitives."""
 
-from inference_service.backends.hmm.backend import HMMBackend, create_backend
+from inference_service.backends.hmm.backend import HMMModule, validate_runtime_options
 
-__all__ = ["HMMBackend", "create_backend"]
+__all__ = ["HMMModule", "validate_runtime_options"]

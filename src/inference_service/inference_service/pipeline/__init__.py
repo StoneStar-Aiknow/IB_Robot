@@ -13,7 +13,12 @@ from inference_service.pipeline.errors import (
     PipelineValidationError,
 )
 from inference_service.pipeline.executor import SequentialModelExecutor
-from inference_service.pipeline.factory import create_inference_pipeline, create_pipeline_manager
+from inference_service.pipeline.factory import (
+    MODEL_SESSION_FACTORY_REGISTRY,
+    ModelSessionFactoryRegistry,
+    create_inference_pipeline,
+    create_pipeline_manager,
+)
 from inference_service.pipeline.manager import InferencePipelineManager
 from inference_service.pipeline.pi05 import PI05Topology, PI05TopologyError, create_pi05_executor, derive_pi05_topology
 from inference_service.pipeline.runtime import InferencePipeline, Postprocessor, Processor
@@ -38,7 +43,6 @@ from inference_service.pipeline.smolvla import (
     validate_smolvla_plan,
 )
 from inference_service.pipeline.stages import (
-    BackendStage,
     DirectIterationStateAdapter,
     EulerIterationStateAdapter,
     HostComputeStage,
@@ -47,6 +51,7 @@ from inference_service.pipeline.stages import (
     IterationStateAdapter,
     IterationStep,
     IterativeStage,
+    ModelResultAdapter,
     ModelStage,
     PostprocessStage,
     PreprocessStage,
@@ -58,7 +63,6 @@ from inference_service.pipeline.validation import ActionValidation, validate_act
 
 __all__ = [
     "ActionValidation",
-    "BackendStage",
     "DirectIterationStateAdapter",
     "ExecutionControl",
     "ExecutionError",
@@ -73,6 +77,9 @@ __all__ = [
     "IterationStep",
     "IterativeStage",
     "ModelExecutor",
+    "ModelSessionFactoryRegistry",
+    "MODEL_SESSION_FACTORY_REGISTRY",
+    "ModelResultAdapter",
     "ModelStage",
     "PipelineConfigurationError",
     "PipelineCanceledError",

@@ -13,14 +13,15 @@ from inference_service.backends import (
     BackendCapabilityError,
     BackendInferenceError,
     BackendLoadError,
+    BackendRegistryError,
     BackendState,
     InferenceRequest,
     RuntimeContext,
 )
-from inference_service.backends.hisilicon.backend import HisiliconBackend
 from inference_service.backends.hisilicon.sd3403_protocol import SD3403Response, SD3403WorkerExitedError
-from inference_service.codecs import create_policy_codec
-from inference_service.pipeline import InferencePipeline, PipelineValidationError
+from inference_service.generic_runtime import NamedTensorRequest
+from inference_service.model_sessions import HisiliconModelSession
+from inference_service.pipeline import PipelineValidationError, create_inference_pipeline
 from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID, create_policy_bundle, write_manifest
 
 
@@ -135,7 +136,23 @@ def clear_protocol_instances():
     FakeProtocol.instances.clear()
 
 
-def test_hisilicon_backend_loads_exact_manifest_artifacts_and_pipeline_uses_bindings(tmp_path):
+def patch_identity_processors(monkeypatch):
+    from inference_service import pipeline as pipeline_module
+
+    monkeypatch.setattr(
+        pipeline_module.factory,
+        "create_lerobot_processor_views",
+        lambda: (lambda inputs: inputs, lambda action: action),
+    )
+
+
+def execute_policy_role(session, request):
+    with session.execution(request) as execution:
+        return execution.invoke("policy", request.inputs)
+
+
+def test_hisilicon_session_loads_exact_manifest_artifacts_and_pipeline_uses_bindings(tmp_path, monkeypatch):
+    patch_identity_processors(monkeypatch)
     context = hisilicon_context(
         tmp_path,
         runtime_options={
@@ -145,8 +162,12 @@ def test_hisilicon_backend_loads_exact_manifest_artifacts_and_pipeline_uses_bind
             "force_close": False,
         },
     )
-    backend = HisiliconBackend(protocol_factory=FakeProtocol)
-    pipeline = InferencePipeline("policy", context, backend, codec=create_policy_codec(context.policy))
+    pipeline = create_inference_pipeline(
+        "policy",
+        context.validated_manifest,
+        runtime_options=context.runtime_options,
+        model_session_factory=lambda ctx, options: HisiliconModelSession(protocol_factory=FakeProtocol),
+    )
     pipeline.load()
 
     result = pipeline.infer(
@@ -176,36 +197,34 @@ def test_hisilicon_backend_loads_exact_manifest_artifacts_and_pipeline_uses_bind
     assert protocol.closed is True
 
 
-def test_hisilicon_backend_worker_exit_is_recoverable_without_request_replay(tmp_path):
+def test_hisilicon_session_worker_exit_is_recoverable_without_request_replay(tmp_path):
     context = hisilicon_context(tmp_path)
-    backend = HisiliconBackend(protocol_factory=FakeProtocol)
-    backend.load(context)
+    session = HisiliconModelSession(protocol_factory=FakeProtocol)
+    session.load(context)
     first = FakeProtocol.instances[0]
     first.error = SD3403WorkerExitedError("worker exited unexpectedly")
 
     with pytest.raises(BackendInferenceError, match="worker exited unexpectedly") as error:
-        backend.infer(
-            InferenceRequest(
+        execute_policy_role(
+            session,
+            NamedTensorRequest(
                 request_id="failed",
-                inputs={
-                    "execution_plan": create_policy_execution_plan(context),
-                    "role_inputs": {"policy": bound_policy_inputs()},
-                },
-            )
+                inputs=bound_policy_inputs(),
+            ),
         )
 
     assert error.value.code == "worker_exited"
     assert error.value.recoverable is True
-    assert backend.health().state is BackendState.DEGRADED
-    backend.recover()
+    assert session.health().state is BackendState.DEGRADED
+    session.recover()
     assert first.closed is True
     assert len(FakeProtocol.instances) == 2
     assert FakeProtocol.instances[1].started is True
-    assert backend.health().state is BackendState.READY
-    backend.close()
+    assert session.health().state is BackendState.READY
+    session.close()
 
 
-def test_hisilicon_backend_load_failure_rolls_back_protocol(tmp_path):
+def test_hisilicon_session_load_failure_rolls_back_protocol(tmp_path):
     context = hisilicon_context(tmp_path)
 
     def failing_factory(worker_path, model_path, **options):
@@ -213,36 +232,36 @@ def test_hisilicon_backend_load_failure_rolls_back_protocol(tmp_path):
         protocol.start_error = RuntimeError("worker startup failed")
         return protocol
 
-    backend = HisiliconBackend(protocol_factory=failing_factory)
+    session = HisiliconModelSession(protocol_factory=failing_factory)
 
     with pytest.raises(BackendLoadError, match="worker startup failed"):
-        backend.load(context)
+        session.load(context)
 
     protocol = FakeProtocol.instances[0]
     assert protocol.close_count == 1
-    assert backend.health().state is BackendState.FAILED
-    backend.close()
+    assert session.health().state is BackendState.FAILED
+    session.close()
     assert protocol.close_count == 1
 
 
-def test_hisilicon_backend_repeated_close_is_idempotent_and_reset_is_unsupported(tmp_path):
+def test_hisilicon_session_repeated_close_is_idempotent_and_reset_is_unsupported(tmp_path):
     context = hisilicon_context(tmp_path)
-    backend = HisiliconBackend(protocol_factory=FakeProtocol)
-    backend.load(context)
+    session = HisiliconModelSession(protocol_factory=FakeProtocol)
+    session.load(context)
 
-    assert backend.capabilities.max_in_flight_per_instance == 1
-    assert backend.capabilities.resettable is False
+    assert session.capabilities.max_in_flight_per_instance == 1
+    assert session.capabilities.resettable is False
     with pytest.raises(BackendCapabilityError) as error:
-        backend.reset()
+        session.reset()
     assert error.value.code == "unsupported_capability"
 
-    backend.close()
-    backend.close()
+    session.close()
+    session.close()
     assert FakeProtocol.instances[0].close_count == 1
-    assert backend.health().state is BackendState.CLOSED
+    assert session.health().state is BackendState.CLOSED
 
 
-def test_hisilicon_backend_serializes_requests_to_one_worker(tmp_path):
+def test_hisilicon_session_serializes_requests_to_one_worker(tmp_path):
     class BlockingProtocol(FakeProtocol):
         entered = threading.Event()
         release = threading.Event()
@@ -263,20 +282,17 @@ def test_hisilicon_backend_serializes_requests_to_one_worker(tmp_path):
                     type(self).active -= 1
 
     context = hisilicon_context(tmp_path)
-    backend = HisiliconBackend(protocol_factory=BlockingProtocol)
-    backend.load(context)
-    request = InferenceRequest(
+    session = HisiliconModelSession(protocol_factory=BlockingProtocol)
+    session.load(context)
+    request = NamedTensorRequest(
         request_id="serialized",
-        inputs={
-            "execution_plan": create_policy_execution_plan(context),
-            "role_inputs": {"policy": bound_policy_inputs()},
-        },
+        inputs=bound_policy_inputs(),
     )
     errors: list[Exception] = []
 
     def infer() -> None:
         try:
-            backend.infer(request)
+            execute_policy_role(session, request)
         except Exception as exc:  # pragma: no cover - asserted through errors below
             errors.append(exc)
 
@@ -295,13 +311,18 @@ def test_hisilicon_backend_serializes_requests_to_one_worker(tmp_path):
     assert not second.is_alive()
     assert errors == []
     assert BlockingProtocol.max_active == 1
-    backend.close()
+    session.close()
 
 
-def test_hisilicon_pipeline_rejects_non_finite_action_output(tmp_path):
+def test_hisilicon_pipeline_rejects_non_finite_action_output(tmp_path, monkeypatch):
+    patch_identity_processors(monkeypatch)
     context = hisilicon_context(tmp_path)
-    backend = HisiliconBackend(protocol_factory=FakeProtocol)
-    pipeline = InferencePipeline("policy", context, backend, codec=create_policy_codec(context.policy))
+    session = HisiliconModelSession(protocol_factory=FakeProtocol)
+    pipeline = create_inference_pipeline(
+        "policy",
+        context.validated_manifest,
+        model_session_factory=lambda ctx, options: session,
+    )
     pipeline.load()
     FakeProtocol.instances[0].outputs = {1: np.full((1, 4, 6), np.nan, dtype=np.float32)}
 
@@ -316,38 +337,27 @@ def test_hisilicon_pipeline_rejects_non_finite_action_output(tmp_path):
             )
         )
 
-    assert backend.health().state is BackendState.READY
+    assert session.health().state is BackendState.READY
     pipeline.close()
 
 
-def create_policy_execution_plan(context: RuntimeContext):
-    from inference_service.codecs import build_execution_plan
-
-    deployment = context.deployment
-    return build_execution_plan(deployment.execution, deployment.bindings, deployment.device_links)
-
-
 def bound_policy_inputs():
-    from inference_service.codecs import BoundInputs, BoundTensor
-
-    return BoundInputs(
-        (
-            BoundTensor("observation.state", "state", 0, np.zeros((1, 6), dtype=np.float32)),
-            BoundTensor("observation.images.top", "camera", 1, np.zeros((1, 3, 16, 24), dtype=np.float32)),
-        )
-    )
+    return {
+        "observation.state": np.zeros((1, 6), dtype=np.float32),
+        "observation.images.top": np.zeros((1, 3, 16, 24), dtype=np.float32),
+    }
 
 
-def test_hisilicon_backend_rejects_non_executable_worker_before_protocol_creation(tmp_path):
+def test_hisilicon_session_rejects_non_executable_worker_before_protocol_creation(tmp_path):
     context = hisilicon_context(tmp_path, executable=False)
-    backend = HisiliconBackend(protocol_factory=FakeProtocol)
+    session = HisiliconModelSession(protocol_factory=FakeProtocol)
 
     with pytest.raises(BackendLoadError, match="not executable") as error:
-        backend.load(context)
+        session.load(context)
 
     assert error.value.code == "worker_not_executable"
     assert FakeProtocol.instances == []
-    backend.close()
+    session.close()
 
 
 @pytest.mark.parametrize(
@@ -359,22 +369,22 @@ def test_hisilicon_backend_rejects_non_executable_worker_before_protocol_creatio
         {"graceful_close_timeout": -1},
     ],
 )
-def test_hisilicon_backend_rejects_invalid_operational_options(tmp_path, runtime_options):
+def test_hisilicon_session_rejects_invalid_operational_options(tmp_path, runtime_options):
     context = hisilicon_context(tmp_path, runtime_options=runtime_options)
-    backend = HisiliconBackend(protocol_factory=FakeProtocol)
+    session = HisiliconModelSession(protocol_factory=FakeProtocol)
 
     with pytest.raises(BackendLoadError) as error:
-        backend.load(context)
+        session.load(context)
 
     assert error.value.code == "invalid_runtime_options"
-    backend.close()
+    session.close()
 
 
-def test_registry_creates_canonical_hisilicon_backend_lazily(tmp_path):
+def test_registry_marks_hisilicon_as_session_only(tmp_path):
     context = hisilicon_context(tmp_path)
 
-    backend = BACKEND_REGISTRY.create(context)
-
-    assert isinstance(backend, HisiliconBackend)
-    assert backend.name == "hisilicon"
-    backend.close()
+    descriptor = BACKEND_REGISTRY.validate(context)
+    assert descriptor.factory is None
+    with pytest.raises(BackendRegistryError) as error:
+        BACKEND_REGISTRY.create(context)
+    assert error.value.code == "backend_factory_unavailable"

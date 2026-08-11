@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from inference_service.model_service_plugin import ModelServiceError, ModelServicePlugin
+from inference_service.model_sessions import MODEL_SESSION_BUILDER_REGISTRY
 from voice_tts_service.errors import TTSError
 from voice_tts_service.model_service_plugin import ZipVoiceSynthesizePlugin
 from voice_tts_service.service_core import SynthesisOutput, SynthesizedSegment
@@ -20,6 +21,12 @@ def _response():
 def test_zipvoice_plugin_implements_the_shared_typed_service_contract():
     assert issubclass(ZipVoiceSynthesizePlugin, ModelServicePlugin)
     assert ZipVoiceSynthesizePlugin.service_type == "ibrobot_msgs/srv/SynthesizeSpeech"
+
+
+def test_zipvoice_session_builder_is_registered_by_manifest_identity():
+    from voice_tts_service.model_session_builders import build_zipvoice_session
+
+    assert MODEL_SESSION_BUILDER_REGISTRY.get("generic", "zipvoice", "", "ascend") is build_zipvoice_session
 
 
 def test_zipvoice_plugin_maps_domain_output_to_the_typed_response():

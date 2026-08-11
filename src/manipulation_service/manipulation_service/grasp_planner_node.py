@@ -929,6 +929,8 @@ class GraspPlannerNode(Node):
         self.declare_parameter("remote_310p_password_env", "GRASPGEN_310P_PASSWORD")
         self.declare_parameter("remote_310p_root", "/root/GraspGen")
         self.declare_parameter("remote_310p_timeout_sec", 120.0)
+        self.declare_parameter("local_manifest_path", "")
+        self.declare_parameter("local_deployment_name", "")
         self.declare_parameter("ascend_local_manifest_path", "")
         self.declare_parameter("ascend_local_deployment_name", "ascend_310p")
         self.declare_parameter("ascend_local_device_id", 0)
@@ -1024,6 +1026,8 @@ class GraspPlannerNode(Node):
             remote_310p_password_env=self.get_parameter("remote_310p_password_env").get_parameter_value().string_value,
             remote_310p_root=self.get_parameter("remote_310p_root").get_parameter_value().string_value,
             remote_310p_timeout_sec=self.get_parameter("remote_310p_timeout_sec").get_parameter_value().double_value,
+            local_manifest_path=self.get_parameter("local_manifest_path").get_parameter_value().string_value,
+            local_deployment_name=self.get_parameter("local_deployment_name").get_parameter_value().string_value,
             ascend_local_manifest_path=self.get_parameter("ascend_local_manifest_path")
             .get_parameter_value()
             .string_value,

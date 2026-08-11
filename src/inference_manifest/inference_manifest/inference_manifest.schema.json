@@ -382,6 +382,9 @@
         "family": {
           "$ref": "#/$defs/non_empty_string"
         },
+        "operation": {
+          "type": "string"
+        },
         "inputs": {
           "type": "array",
           "items": {

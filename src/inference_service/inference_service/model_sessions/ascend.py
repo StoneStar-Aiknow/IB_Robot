@@ -47,11 +47,14 @@ class AscendOmModelSession(ModelSession):
         model_factory=AclModel,
         domains: ResourceDomainAdmissions | None = None,
         priority_scheduling: bool = False,
+        diagnostic_capture=None,
     ) -> None:
         if type(device_id) is not int or device_id < 0:
             raise ValueError("device_id must be a non-negative integer")
         if not isinstance(priority_scheduling, bool):
             raise TypeError("priority_scheduling must be a bool")
+        if diagnostic_capture is not None and not callable(diagnostic_capture):
+            raise TypeError("diagnostic_capture must be callable or None")
         super().__init__(
             "model-session:ascend",
             BackendCapabilities(
@@ -77,6 +80,7 @@ class AscendOmModelSession(ModelSession):
         self._priority_streams: AclPriorityStreamPool | None = None
         self._models: dict[str, AclModel] = {}
         self._linked_inputs: frozenset[tuple[str, str]] = frozenset()
+        self._diagnostic_capture = diagnostic_capture
 
     @property
     def runtime_version(self) -> str:
@@ -167,11 +171,14 @@ class AscendOmModelSession(ModelSession):
         self._models = models
         self._linked_inputs = frozenset(linked_inputs)
         self._update_loaded_capabilities(
+            resettable=False,
+            stateful=False,
+            supports_attention=False,
             priority_mapping=(
                 BackendPriorityMapping(tuple(range(priority_streams.level_count)))
                 if priority_streams is not None
                 else None
-            )
+            ),
         )
 
     def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
@@ -196,7 +203,7 @@ class AscendOmModelSession(ModelSession):
         role: str,
         values: dict[str, object],
         *,
-        request: NamedTensorRequest,
+        request: NamedTensorRequest | None = None,
     ) -> dict[str, np.ndarray]:
         """Execute one manifest role and write its outputs back into ``values``.
 
@@ -206,10 +213,18 @@ class AscendOmModelSession(ModelSession):
         read-selection behaviour per role, so that behaviour lives here rather than in the
         loop that happens to call it.
         """
+        execute_options: dict[str, object] = {
+            "read_outputs": self._role_read_indices(role_index, role),
+        }
+        if request is not None:
+            stream = self._request_stream(request)
+            if stream is not None:
+                execute_options["stream"] = stream
+        role_inputs = self._role_inputs(role, values)
+        self._capture_role_inputs(role, role_inputs)
         runtime_outputs = self._models[role].execute(
-            self._role_inputs(role, values),
-            read_outputs=self._role_read_indices(role_index, role),
-            stream=self._request_stream(request),
+            role_inputs,
+            **execute_options,
         )
         outputs: dict[str, np.ndarray] = {}
         for binding in self._loaded_deployment().bindings[role].outputs:
@@ -218,7 +233,38 @@ class AscendOmModelSession(ModelSession):
             output = self._bound_output(role, binding, runtime_outputs)
             values[binding.semantic] = output
             outputs[binding.semantic] = output
+        self._capture_role_outputs(role, outputs)
         return outputs
+
+    def _capture_role_inputs(self, role: str, inputs: Mapping[int, np.ndarray]) -> None:
+        if self._diagnostic_capture is None:
+            return
+        image_index = 0
+        bindings = {int(binding.index): binding for binding in self._loaded_deployment().bindings[role].inputs}
+        for index, value in sorted(inputs.items()):
+            semantic = bindings[index].semantic
+            if role == "vlm" and semantic.startswith("observation.images."):
+                name = f"vlm_in_image_{image_index}"
+                image_index += 1
+            elif role == "vlm" and semantic == "observation.language.tokens":
+                name = "vlm_in_lang_tokens"
+            elif role == "vlm" and semantic == "observation.language.attention_mask":
+                name = "vlm_in_lang_masks"
+            elif role == "vlm" and semantic == "prefix_att_2d_masks_4d":
+                name = "vlm_in_prefix_mask_4d"
+            else:
+                name = f"{role}_in_{semantic}"
+            self._diagnostic_capture(name, value)
+
+    def _capture_role_outputs(self, role: str, outputs: Mapping[str, object]) -> None:
+        if self._diagnostic_capture is None:
+            return
+        names = {
+            "internal.past_kv": "past_kv_tensor",
+            "internal.prefix_pad_masks": "prefix_pad_masks",
+        }
+        for semantic, value in outputs.items():
+            self._diagnostic_capture(names.get(semantic, f"{role}_out_{semantic}"), value)
 
     def _role_inputs(self, role: str, values: Mapping[str, object]) -> dict[int, np.ndarray]:
         """Gather one role's runtime inputs, skipping the slots a device link already fills."""
@@ -248,6 +294,8 @@ class AscendOmModelSession(ModelSession):
         """
         deployment = self._loaded_deployment()
         bindings = deployment.bindings[role]
+        if self._diagnostic_capture is not None:
+            return {int(binding.index) for binding in bindings.outputs if binding.index is not None}
         public_indices = {
             int(binding.index)
             for binding in bindings.outputs
@@ -310,6 +358,9 @@ class AscendOmModelSession(ModelSession):
                 code="hardware_priority_unavailable",
             )
         return streams.select(native_priority)
+
+    def _validate_request(self, request: NamedTensorRequest) -> None:
+        self._request_stream(request)
 
     def _close(self) -> None:
         models = self._models

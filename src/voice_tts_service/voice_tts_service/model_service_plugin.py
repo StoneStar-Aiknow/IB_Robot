@@ -4,15 +4,15 @@ from __future__ import annotations
 
 from array import array
 
-from inference_manifest import CompiledDeployment
 from inference_service.backends import BackendError, RuntimeContext
 from inference_service.model_service_plugin import ModelServiceError, ModelServicePlugin, PluginRuntimeStatus
-from inference_service.model_sessions import ModelSession
+from inference_service.model_sessions import MODEL_SESSION_BUILDER_REGISTRY, ModelSession
+from inference_service.pipeline import GenericModelPipeline, ModelResultAdapter, ModelStage, SequentialModelExecutor
 
 from .defaults import VOICE_TTS_DEFAULTS
 from .errors import TTSError
+from .model_session_builders import register_zipvoice_session_builder
 from .service_core import TTSLimits, TTSServiceCore
-from .zipvoice_310p_adapter import ZipVoiceAscendSession
 
 
 class ZipVoiceSynthesizePlugin(ModelServicePlugin):
@@ -21,12 +21,10 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
     service_type = "ibrobot_msgs/srv/SynthesizeSpeech"
 
     def __init__(self, _host, validated, options) -> None:
+        register_zipvoice_session_builder()
         model = validated.manifest.model
         if model.kind != "generic" or model.family != "zipvoice":
             raise ValueError("ZipVoice plugin requires model.kind=generic and model.family=zipvoice")
-        deployment = validated.deployment
-        if not isinstance(deployment, CompiledDeployment) or deployment.backend != "ascend":
-            raise ValueError("ZipVoice plugin requires a compiled Ascend deployment")
 
         allowed = {
             "acl_config_path",
@@ -44,13 +42,23 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
         if unknown:
             raise ValueError(f"unknown ZipVoice runtime options: {unknown}")
 
-        device_id = int(options.get("device_id", VOICE_TTS_DEFAULTS["device_id"]))
-        self._session: ModelSession = ZipVoiceAscendSession(
-            device_id=device_id,
-            prompt_profile=str(options.get("prompt_profile", VOICE_TTS_DEFAULTS["prompt_profile"])),
+        context = RuntimeContext(validated_manifest=validated, runtime_options=options)
+        self._session: ModelSession = MODEL_SESSION_BUILDER_REGISTRY.create(context)
+        session_options = {name: options[name] for name in ("acl_config_path", "device_id") if name in options}
+        session_context = RuntimeContext(validated_manifest=validated, runtime_options=session_options)
+        self._pipeline = GenericModelPipeline(
+            "voice-tts-zipvoice",
+            context,
+            SequentialModelExecutor(
+                (ModelStage("model", self._session),),
+                ModelResultAdapter(),
+                components=(self._session,),
+                component_contexts={id(self._session): session_context},
+            ),
+            supports_cancellation=self._session.capabilities.supports_cancellation,
         )
         self._core = TTSServiceCore(
-            self._session.infer,
+            self._pipeline.execute,
             TTSLimits(
                 **{
                     name: options.get(name, VOICE_TTS_DEFAULTS[name])
@@ -60,11 +68,10 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
             ),
         )
         self._closed = False
-        session_options = {name: options[name] for name in ("acl_config_path", "device_id") if name in options}
         try:
-            self._session.load(RuntimeContext(validated_manifest=validated, runtime_options=session_options))
+            self._pipeline.load()
         except Exception:
-            self._session.close()
+            self._pipeline.close()
             self._closed = True
             raise
 
@@ -116,7 +123,7 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
         return f"synthesized {len(output.segments)} audio segment(s)"
 
     def runtime_status(self) -> PluginRuntimeStatus:
-        health = self._session.health()
+        health = self._pipeline.diagnostics().executor_health
         state = health.state.value if hasattr(health.state, "value") else str(health.state)
         runtime_version = self._session.runtime_version
         ready = health.ready and bool(runtime_version)
@@ -136,7 +143,7 @@ class ZipVoiceSynthesizePlugin(ModelServicePlugin):
     def close(self) -> None:
         if not self._closed:
             self._closed = True
-            self._session.close()
+            self._pipeline.close()
 
 
 __all__ = ["ZipVoiceSynthesizePlugin"]

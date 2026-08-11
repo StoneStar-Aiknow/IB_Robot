@@ -5,7 +5,7 @@ modules and declares a synthetic ``embedding`` host role whose outputs feed the
 compiled ``prefill`` and ``decode`` modules.  This module owns the deterministic
 host computation (embedding construction and sinusoidal timestep embedding) and
 the runtime-loaded embedding weights, moving that family logic out of
-:class:`HMMBackend` and into executor-owned stages/resources as required by the
+:class:`HMMModelSession` and into executor-owned stages/resources as required by the
 unified pipeline migration.
 
 The embedding and time-embedding algorithms are extracted from the original
@@ -26,7 +26,22 @@ import numpy as np
 from inference_manifest import ArtifactBindings, CompiledDeployment, TensorBinding
 from inference_manifest.json_utils import load_json_strict
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
-from inference_service.backends.hmm.backend import HMMBackend
+from inference_service.backends.hmm.host_utils import (
+    binding_for_semantic,
+    binding_for_semantics,
+    convert_runtime_value,
+    convert_semantic_outputs,
+    load_torch_mapping,
+    pad_axis_one,
+    require_artifact,
+    static_shape,
+    to_additive_attention,
+    to_numpy_weight,
+    validate_token_ids,
+)
+from inference_service.backends.hmm.host_utils import (
+    validate_pi05_plan as validate_hmm_pi05_plan,
+)
 from inference_service.backends.types import RuntimeContext
 from inference_service.pipeline.stages import HostComputeStage, HostRoleStage, InferenceStage
 
@@ -55,11 +70,11 @@ def load_pi05_embedding_weights(context: RuntimeContext) -> _PI05EmbeddingWeight
             "HMM PI0.5 embedding artifact must use format 'pt' or 'pytorch'", code="invalid_artifact_format"
         )
     embedding_path = _require_artifact(context, "embedding")
-    token_state = HMMBackend._load_torch_mapping(embedding_path, "embedding")
+    token_state = load_torch_mapping(embedding_path, "embedding")
     token_weight = next((token_state.get(key) for key in _TOKEN_KEY_CANDIDATES if key in token_state), None)
     if token_weight is None:
         raise BackendLoadError("HMM PI0.5 embedding artifact does not contain token weights", code="invalid_embedding")
-    return _PI05EmbeddingWeights(token_weight=HMMBackend._to_numpy_weight(token_weight, embedding_path, "weight"))
+    return _PI05EmbeddingWeights(token_weight=to_numpy_weight(token_weight, embedding_path, "weight"))
 
 
 def load_pi05_policy_config(context: RuntimeContext) -> dict[str, object]:
@@ -81,7 +96,7 @@ def validate_pi05_plan(
 ) -> None:
     """Validate the modular HMM PI0.5 execution plan, bindings, and device links."""
 
-    HMMBackend._validate_pi05_plan(deployment, policy_config, _to_backend_weights(embedding))
+    validate_hmm_pi05_plan(deployment, policy_config, embedding.token_weight)
 
 
 def build_embedding_stage(
@@ -108,7 +123,7 @@ def build_time_prep_stage(
     compiled ``time_mlp`` module.
     """
 
-    time_binding = HMMBackend._binding_for_semantics(
+    time_binding = binding_for_semantics(
         deployment.bindings["time_mlp"].inputs,
         frozenset({"time", "timestep", "action.time", "_time"}),
         "time",
@@ -163,32 +178,22 @@ def _embedding_operation(
 ) -> Callable[[Mapping[str, object]], Mapping[str, object]]:
     """Create the deterministic host operation for PI0.5 embedding construction."""
 
-    token_binding = HMMBackend._binding_for_semantics(bindings.inputs, _LANGUAGE_TOKEN_SEMANTICS, "language tokens")
-    mask_binding = HMMBackend._binding_for_semantics(bindings.inputs, _LANGUAGE_MASK_SEMANTICS, "language mask")
+    token_binding = binding_for_semantics(bindings.inputs, _LANGUAGE_TOKEN_SEMANTICS, "language tokens")
+    mask_binding = binding_for_semantics(bindings.inputs, _LANGUAGE_MASK_SEMANTICS, "language mask")
     image_semantics = tuple(
         binding.semantic for binding in bindings.inputs if binding.semantic.startswith("internal.image_embedding.")
     )
-    prefix_binding = HMMBackend._binding_for_semantic(
-        bindings.outputs, "internal.prefix_embeddings", "prefix embeddings"
-    )
-    attention_binding = HMMBackend._binding_for_semantic(
-        bindings.outputs, "internal.prefix_attention", "prefix attention"
-    )
-    decode_attention_binding = HMMBackend._binding_for_semantic(
-        bindings.outputs, "internal.decode_attention", "decode attention"
-    )
-    prefix_positions_binding = HMMBackend._binding_for_semantic(
-        bindings.outputs, "internal.prefix_positions", "prefix positions"
-    )
-    decode_positions_binding = HMMBackend._binding_for_semantic(
-        bindings.outputs, "internal.decode_positions", "decode positions"
-    )
+    prefix_binding = binding_for_semantic(bindings.outputs, "internal.prefix_embeddings", "prefix embeddings")
+    attention_binding = binding_for_semantic(bindings.outputs, "internal.prefix_attention", "prefix attention")
+    decode_attention_binding = binding_for_semantic(bindings.outputs, "internal.decode_attention", "decode attention")
+    prefix_positions_binding = binding_for_semantic(bindings.outputs, "internal.prefix_positions", "prefix positions")
+    decode_positions_binding = binding_for_semantic(bindings.outputs, "internal.decode_positions", "decode positions")
 
     def operation(values: Mapping[str, object]) -> Mapping[str, object]:
         token_weight = token_weight_provider()
         hidden_size = token_weight.shape[1]
         tokens = np.asarray(values[token_binding.semantic], dtype=np.int64)
-        HMMBackend._validate_token_ids(tokens, token_weight.shape[0])
+        validate_token_ids(tokens, token_weight.shape[0])
         language = token_weight[tokens] * math.sqrt(hidden_size)
         language_mask = np.asarray(values[mask_binding.semantic], dtype=bool)
         images = [np.asarray(values[semantic], dtype=language.dtype) for semantic in image_semantics]
@@ -197,8 +202,8 @@ def _embedding_operation(
         prefix_mask = np.concatenate((*image_masks, language_mask), axis=1)
         actual_length = prefix.shape[1]
 
-        prefix = HMMBackend._pad_axis_one(prefix, prefix_binding.shape, 0.0)
-        prefix_mask = HMMBackend._pad_axis_one(prefix_mask, prefix_binding.shape[:2], False)
+        prefix = pad_axis_one(prefix, prefix_binding.shape, 0.0)
+        prefix_mask = pad_axis_one(prefix_mask, prefix_binding.shape[:2], False)
 
         query_length = attention_binding.shape[-2]
         key_length = attention_binding.shape[-1]
@@ -225,16 +230,14 @@ def _embedding_operation(
 
         generated: dict[str, object] = {
             prefix_binding.semantic: prefix,
-            attention_binding.semantic: HMMBackend._to_additive_attention(prefix_attention, attention_binding.dtype),
-            decode_attention_binding.semantic: HMMBackend._to_additive_attention(
-                decode_attention, decode_attention_binding.dtype
-            ),
+            attention_binding.semantic: to_additive_attention(prefix_attention, attention_binding.dtype),
+            decode_attention_binding.semantic: to_additive_attention(decode_attention, decode_attention_binding.dtype),
             prefix_positions_binding.semantic: np.arange(prefix.shape[1], dtype=np.int64)[None, :],
             decode_positions_binding.semantic: np.arange(prefix.shape[1], prefix.shape[1] + chunk_size, dtype=np.int64)[
                 None, :
             ],
         }
-        return HMMBackend._convert_semantic_outputs(bindings.outputs, generated, "embedding")
+        return convert_semantic_outputs(bindings.outputs, generated, "embedding")
 
     return operation
 
@@ -246,7 +249,7 @@ def _time_prep_operation(
 ) -> Callable[[Mapping[str, object]], Mapping[str, object]]:
     """Create the deterministic host operation for sinusoidal timestep embedding."""
 
-    shape = HMMBackend._static_shape(time_binding)
+    shape = static_shape(time_binding)
     if len(shape) != 2 or shape[-1] % 2 != 0:
         raise BackendInferenceError(
             f"PI0.5 time MLP input requires shape (B, even_dimension), got {shape}",
@@ -258,7 +261,8 @@ def _time_prep_operation(
 
     def operation(values: Mapping[str, object]) -> Mapping[str, object]:
         raw = values.get("time")
-        if isinstance(raw, np.ndarray) and raw.shape == () or isinstance(raw, int | float | np.floating | np.integer):
+        is_scalar_array = isinstance(raw, np.ndarray) and raw.shape == ()
+        if is_scalar_array or isinstance(raw, int | float | np.floating | np.integer):
             time_value = float(raw)
         else:
             raise BackendInferenceError(
@@ -268,7 +272,7 @@ def _time_prep_operation(
         value = np.concatenate((np.sin(scaled), np.cos(scaled)))[None, :]
         if shape[0] != 1:
             value = np.broadcast_to(value, shape)
-        return {"time": HMMBackend._convert_runtime_value(time_binding, value, "time_mlp", "input")}
+        return {"time": convert_runtime_value(time_binding, value, "time_mlp", "input")}
 
     return operation
 
@@ -283,16 +287,8 @@ def _positive_config_int(config: Mapping[str, object], key: str) -> int:
     return value
 
 
-def _to_backend_weights(embedding: _PI05EmbeddingWeights):
-    """Adapt to the backend-compatible dataclass for plan validation."""
-
-    from inference_service.backends.hmm.backend import _EmbeddingWeights
-
-    return _EmbeddingWeights(token_weight=embedding.token_weight)
-
-
 def _require_artifact(context: RuntimeContext, role: str) -> Path:
-    return HMMBackend._require_artifact(context, role)
+    return require_artifact(context, role)
 
 
 __all__ = [

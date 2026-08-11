@@ -18,15 +18,16 @@ from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_service_node import _runtime_info
 from inference_service.model_service_plugin import ModelServicePlugin
 from inference_service.model_sessions import AscendOmModelSession, ModelSession
+from inference_service.pipeline import GenericModelPipeline
 from perception_service.model_service_plugins import (
     GroundingDetectPlugin,
     RAMPlusRecognizeTagsPlugin,
     SAM2GenerateMasksPlugin,
     SigLIP2EncodeEmbeddingsPlugin,
     SigLIP2EncodeTextPlugin,
-    _new_session,
     _SessionPlugin,
 )
+from perception_service.model_session_builders import build_perception_session
 from perception_service.ram_plus_adapter import RAMPlusAdapter
 from perception_service.semantic_model_adapters import (
     GroundingDINOAdapter,
@@ -104,17 +105,19 @@ def _descriptors(role):
 def _write_bundle(root, role, *, embedding=True, adapter_preprocessing=None):
     plugin, adapter_type = FAMILIES[role]
     family = plugin.family
+    operation = plugin.operation
     assets = root / "assets"
     assets.mkdir(parents=True)
     identity = adapter_type.identity
+    adapter_record = {
+        "family": family,
+        "preprocessing": adapter_preprocessing or identity.preprocessing,
+        "postprocessing": identity.postprocessing,
+    }
+    if operation:
+        adapter_record["operation"] = operation
     (assets / "adapter.json").write_text(
-        json.dumps(
-            {
-                "family": family,
-                "preprocessing": adapter_preprocessing or identity.preprocessing,
-                "postprocessing": identity.postprocessing,
-            }
-        ),
+        json.dumps(adapter_record),
         encoding="utf-8",
     )
     if role == "ram_plus":
@@ -161,6 +164,7 @@ def _write_bundle(root, role, *, embedding=True, adapter_preprocessing=None):
         "model": {
             "kind": "perception",
             "family": family,
+            "operation": operation,
             "inputs": inputs,
             "outputs": outputs,
             "semantic_identity": semantic_identity,
@@ -287,6 +291,8 @@ def test_concrete_plugins_are_typed_model_session_hosts_with_health_and_idempote
 
     assert isinstance(plugin, ModelServicePlugin)
     assert isinstance(plugin.session, ModelSession)
+    assert isinstance(plugin.pipeline, GenericModelPipeline)
+    assert plugin.pipeline.state.value == "ready"
     assert plugin.runtime_status().ready
     assert plugin.runtime_status().metadata["runtime_version"] == "test-runtime-2.1"
     assert plugin.service_type.startswith("ibrobot_msgs/srv/")
@@ -412,16 +418,22 @@ def test_unfinished_compiled_family_fails_before_session_creation_without_fallba
             },
         }
     )
-    validated = SimpleNamespace(deployment=deployment)
-
     with pytest.raises(RuntimeError, match="ABI is not finalized"):
-        _new_session("sam2", SAM2Adapter(), validated, {})
+        context = SimpleNamespace(
+            model=SimpleNamespace(family="sam2"),
+            deployment=deployment,
+            runtime_options={},
+        )
+        build_perception_session(context, adapter=SAM2Adapter())
 
 
-def test_only_conformant_ram_plus_adapter_promotes_compiled_abi() -> None:
+def test_only_conformant_adapters_promote_compiled_abi() -> None:
     adapters = (RAMPlusAdapter, SAM2Adapter, SigLIP2ImageAdapter, SigLIP2TextAdapter, GroundingDINOAdapter)
 
-    assert {adapter.identity.family for adapter in adapters if adapter.compiled_abi_finalized} == {"ram_plus"}
+    assert {adapter.identity.family for adapter in adapters if adapter.compiled_abi_finalized} == {
+        "ram_plus",
+        "siglip2",
+    }
 
 
 def test_conformant_ram_plus_compiled_deployment_selects_ascend_session() -> None:
@@ -442,12 +454,12 @@ def test_conformant_ram_plus_compiled_deployment_selects_ascend_session() -> Non
         }
     )
 
-    session = _new_session(
-        "ram_plus",
-        SimpleNamespace(compiled_abi_finalized=True),
-        SimpleNamespace(deployment=deployment),
-        {},
+    context = SimpleNamespace(
+        model=SimpleNamespace(family="ram_plus"),
+        deployment=deployment,
+        runtime_options={},
     )
+    session = build_perception_session(context, adapter=SimpleNamespace(compiled_abi_finalized=True))
 
     assert isinstance(session, AscendOmModelSession)
     session.close()
@@ -494,3 +506,100 @@ def test_plugin_validates_registry_support_before_session_load(tmp_path) -> None
 
     assert plugin.session.health().ready
     plugin.close()
+
+
+def test_plugin_pins_operation_so_distinct_service_contracts_do_not_collide(tmp_path) -> None:
+    # The automatic-mask plugin (Torch, operation "automatic") must refuse a manifest that
+    # declares the box-prompt operation, even though both share the "sam2" base family.
+    # The distinct service contract is preserved by the operation guard, not by family name.
+    _write_bundle(tmp_path / "sam2", "sam2")
+    manifest_path = tmp_path / "sam2" / "inference_manifest.json"
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    document["model"]["operation"] = "prompt"
+    manifest_path.write_text(json.dumps(document), encoding="utf-8")
+    mismatched = load_inference_manifest(tmp_path / "sam2", "torch_cpu")
+
+    with pytest.raises(ValueError, match="operation"):
+        SAM2GenerateMasksPlugin(_host(), mismatched, {})
+
+
+def test_ascend_compiled_sam2_and_grounding_bundles_validate_through_static_registry(tmp_path) -> None:
+    # A compiled Ascend bundle now carries the base family (sam2/grounding_dino) plus an
+    # operation (prompt/raw), so it passes the static registry that _SessionPlugin uses,
+    # without minting an unsupported family name.
+    from inference_service.backends import BACKEND_REGISTRY
+    from inference_service.backends.types import RuntimeContext
+
+    for family, operation in (("sam2", "prompt"), ("grounding_dino", "raw")):
+        root = tmp_path / family
+        assets = root / "assets"
+        assets.mkdir(parents=True)
+        (assets / "adapter.json").write_text("{}", encoding="utf-8")
+        artifact = root / "artifacts" / "model.om"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"compiled")
+        files = [BundleFile(path="assets/adapter.json")]
+        manifest = {
+            "schema_version": 2,
+            "bundle": {
+                "uuid": "8fa9838a-2e15-4cf4-a9d5-4fb876c10eb7",
+                "revision": 1,
+                "name": f"{family}-{operation}",
+                "files": [entry.model_dump(mode="json") for entry in files],
+                "digest": {
+                    "algorithm": "sha256",
+                    "scope": "structure",
+                    "value": canonical_bundle_digest(
+                        "8fa9838a-2e15-4cf4-a9d5-4fb876c10eb7", 1, f"{family}-{operation}", files
+                    ),
+                },
+            },
+            "model": {
+                "kind": "perception",
+                "family": family,
+                "operation": operation,
+                "inputs": [{"semantic": "image", "dtype": "float32", "shape": [1, 3, 1024, 1024], "layout": "NCHW"}],
+                "outputs": [
+                    {"semantic": "mask_logits", "dtype": "float32", "shape": [4, 1, 256, 256], "layout": "NCHW"}
+                ],
+            },
+            "deployments": {
+                "ascend_310p": {
+                    "uuid": "26547f4a-1d02-4ea1-b4dc-c887ca557a68",
+                    "revision": 1,
+                    "backend": "ascend",
+                    "target": {"soc": "Ascend310P1", "runtime": "acl"},
+                    "artifacts": {"model": {"path": "artifacts/model.om", "format": "om"}},
+                    "execution": ["model"],
+                    "bindings": {
+                        "model": {
+                            "inputs": [
+                                {
+                                    "semantic": "image",
+                                    "index": 0,
+                                    "dtype": "float32",
+                                    "shape": [1, 3, 1024, 1024],
+                                    "layout": "NCHW",
+                                }
+                            ],
+                            "outputs": [
+                                {
+                                    "semantic": "mask_logits",
+                                    "index": 0,
+                                    "dtype": "float32",
+                                    "shape": [4, 1, 256, 256],
+                                    "layout": "NCHW",
+                                }
+                            ],
+                        }
+                    },
+                }
+            },
+        }
+        (root / "inference_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        validated = load_inference_manifest(root, "ascend_310p")
+        context = RuntimeContext(validated_manifest=validated, runtime_options={"device_id": 0})
+
+        assert BACKEND_REGISTRY.validate(context).name == "ascend"
+        assert validated.manifest.model.family == family
+        assert validated.manifest.model.operation == operation

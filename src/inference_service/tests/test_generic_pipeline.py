@@ -22,7 +22,7 @@ from inference_service.backends import (
     RuntimeContext,
 )
 from inference_service.generic_runtime import NamedTensorRequest
-from inference_service.model_sessions import ModelSession
+from inference_service.model_sessions import ModelSession, ModelSessionBuilderRegistry
 from inference_service.pipeline import (
     ExecutionControl,
     ExecutionError,
@@ -197,8 +197,26 @@ def test_generic_pipeline_rejects_expired_deadline_before_session_execution(tmp_
         pipeline.execute(_request(deadline=datetime.now(timezone.utc) - timedelta(seconds=1)))
 
     assert error.value.code == "deadline_exceeded"
+    assert error.value.details["cancellation_supported"] is False
     assert session.execute_calls == 0
     assert pipeline.health().ready
+    pipeline.close()
+
+
+def test_generic_pipeline_reports_injected_cancellation_capability(tmp_path) -> None:
+    session = _FakeSession()
+    pipeline = GenericModelPipeline(
+        "generic",
+        _context(tmp_path),
+        _SessionExecutor(session),
+        supports_cancellation=True,
+    )
+    pipeline.load()
+
+    with pytest.raises(PipelineTimeoutError) as error:
+        pipeline.execute(_request(deadline=datetime.now(timezone.utc) - timedelta(seconds=1)))
+
+    assert error.value.details["cancellation_supported"] is True
     pipeline.close()
 
 
@@ -340,6 +358,44 @@ def test_sequential_executor_runs_concrete_stages_and_adapts_result(tmp_path) ->
     )
     assert frame_result == np.float32(3.0)
     pipeline.close()
+
+
+def test_direct_model_stage_does_not_nest_model_session_admission(tmp_path) -> None:
+    from inference_service.pipeline import ModelResultAdapter, ModelStage
+
+    session = _FakeSession()
+    executor = SequentialModelExecutor(
+        (ModelStage("model", session),),
+        ModelResultAdapter(),
+        components=(session,),
+    )
+    pipeline = GenericModelPipeline("direct", _context(tmp_path), executor)
+
+    pipeline.load()
+    result = pipeline.execute(_request("direct"))
+
+    assert session.execute_calls == 1
+    assert result.outputs["tag_logits"].shape == (1, 4585)
+    pipeline.close()
+
+
+def test_model_session_builder_registry_validates_and_selects_manifest_key(tmp_path) -> None:
+    context = _context(tmp_path)
+    registry = ModelSessionBuilderRegistry()
+    registry.register("perception", "ram_plus", "", "ascend", lambda _context: _FakeSession())
+
+    session = registry.create(context)
+
+    assert isinstance(session, _FakeSession)
+
+
+def test_model_session_builder_registry_fails_closed_for_missing_builder(tmp_path) -> None:
+    registry = ModelSessionBuilderRegistry()
+
+    with pytest.raises(BackendLoadError) as error:
+        registry.create(_context(tmp_path))
+
+    assert error.value.code == "session_builder_unavailable"
 
 
 def test_sequential_executor_holds_one_session_execution_scope_across_stages() -> None:

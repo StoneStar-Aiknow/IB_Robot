@@ -29,7 +29,17 @@ import numpy as np
 from inference_manifest import ArtifactBindings, CompiledDeployment, TensorBinding
 from inference_manifest.json_utils import load_json_strict
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
-from inference_service.backends.hmm.backend import HMMBackend
+from inference_service.backends.hmm.host_utils import (
+    binding_for_semantic,
+    binding_for_semantics,
+    convert_semantic_outputs,
+    is_image_semantic,
+    load_torch_mapping,
+    pad_axis_one,
+    require_artifact,
+    to_numpy_weight,
+    validate_token_ids,
+)
 from inference_service.backends.types import RuntimeContext
 from inference_service.codecs import ExecutionPlan
 from inference_service.pipeline.executor import SequentialModelExecutor
@@ -540,11 +550,11 @@ def _require_positive_config(config: Mapping[str, object], key: str) -> None:
 def _binding_for_semantics(
     bindings: tuple[TensorBinding, ...], semantics: frozenset[str], description: str
 ) -> TensorBinding:
-    return HMMBackend._binding_for_semantics(bindings, semantics, description)
+    return binding_for_semantics(bindings, semantics, description)
 
 
 def _binding_for_semantic(bindings: tuple[TensorBinding, ...], semantic: str, description: str) -> TensorBinding:
-    return HMMBackend._binding_for_semantic(bindings, semantic, description)
+    return binding_for_semantic(bindings, semantic, description)
 
 
 def _convert_semantic_outputs(
@@ -552,31 +562,31 @@ def _convert_semantic_outputs(
     values: Mapping[str, object],
     role: str,
 ) -> dict[str, np.ndarray]:
-    return HMMBackend._convert_semantic_outputs(bindings, values, role)
+    return convert_semantic_outputs(bindings, values, role)
 
 
 def _pad_axis_one(value: np.ndarray, shape: tuple[int, ...], pad_value: object) -> np.ndarray:
-    return HMMBackend._pad_axis_one(value, shape, pad_value)
+    return pad_axis_one(value, shape, pad_value)
 
 
 def _validate_token_ids(tokens: np.ndarray, vocabulary_size: int) -> None:
-    HMMBackend._validate_token_ids(tokens, vocabulary_size)
+    validate_token_ids(tokens, vocabulary_size)
 
 
 def _load_torch_mapping(path: Path, description: str) -> Mapping[str, object]:
-    return HMMBackend._load_torch_mapping(path, description)
+    return load_torch_mapping(path, description)
 
 
 def _to_numpy_weight(value: object, path: Path, name: str) -> np.ndarray:
-    return HMMBackend._to_numpy_weight(value, path, name)
+    return to_numpy_weight(value, path, name)
 
 
 def _require_artifact(context: RuntimeContext, role: str) -> Path:
-    return HMMBackend._require_artifact(context, role)
+    return require_artifact(context, role)
 
 
 def _is_image_semantic(semantic: str) -> bool:
-    return HMMBackend._is_image_semantic(semantic)
+    return is_image_semantic(semantic)
 
 
 def load_smolvla_policy_config(context: RuntimeContext) -> dict[str, object]:

@@ -8,17 +8,14 @@ from datetime import datetime, timezone
 import numpy as np
 import torch
 
-from inference_manifest import CompiledDeployment, ValidatedManifest
+from inference_manifest import ValidatedManifest
 from inference_service.backends import (
     BACKEND_REGISTRY,
     BackendCapabilities,
     BackendRegistry,
     InferenceRequest,
-    RuntimeContext,
 )
-from inference_service.codecs import create_policy_codec
-from inference_service.pipeline import InferencePipeline, InferencePipelineManager
-from inference_service.pipeline.processors import create_lerobot_processor_views
+from inference_service.pipeline import create_pipeline_manager
 from inference_service.pipeline.validation import validate_action_output
 
 
@@ -90,22 +87,14 @@ class CloudBackendRuntime:
         runtime_options: Mapping[str, object] | None = None,
         registry: BackendRegistry = BACKEND_REGISTRY,
     ) -> None:
-        context = RuntimeContext(validated_manifest, runtime_options=runtime_options or {})
-        backend = registry.create(context)
-        codec = create_policy_codec(context.policy) if isinstance(context.deployment, CompiledDeployment) else None
-        preprocessor, postprocessor = create_lerobot_processor_views()
-        pipeline = InferencePipeline(
-            pipeline_id,
-            context,
-            backend,
-            preprocessor=preprocessor,
-            postprocessor=postprocessor,
-            codec=codec,
-            request_timeout=request_timeout,
-        )
         self.pipeline_id = pipeline_id
-        self._manager = InferencePipelineManager((pipeline,))
-        self._manager.start()
+        self._manager = create_pipeline_manager(
+            pipeline_id,
+            validated_manifest,
+            request_timeout=request_timeout,
+            runtime_options=runtime_options,
+            registry=registry,
+        )
 
     @property
     def capabilities(self) -> BackendCapabilities:

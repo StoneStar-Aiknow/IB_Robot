@@ -133,6 +133,12 @@ def graspgen_export(tmp_path: Path) -> GraspGenExport:
     for role in GRASPGEN_EXECUTION:
         (om_dir / f"{role}.om").write_bytes(f"{role}-om".encode())
         write_json(om_abi_dir / f"{role}.om.abi.json", runtime_abi_json(GRASPGEN_ROLE_ABI[role]))
+    config_path = tmp_path / "graspgen_config.yml"
+    generator_checkpoint = tmp_path / "generator_checkpoint.pth"
+    discriminator_checkpoint = tmp_path / "discriminator_checkpoint.pth"
+    config_path.write_text("data:\n  gripper_name: test_gripper\n  num_points: 2048\n", encoding="utf-8")
+    generator_checkpoint.write_bytes(b"generator")
+    discriminator_checkpoint.write_bytes(b"discriminator")
     return GraspGenExport(
         bundle=bundle,
         onnx_manifest={
@@ -140,6 +146,11 @@ def graspgen_export(tmp_path: Path) -> GraspGenExport:
             "contract_version": GRASPGEN_CONTRACT_VERSION,
             "model_type": "graspgen",
             "backend": "onnx",
+            "source": {
+                "config": str(config_path),
+                "generator_checkpoint": str(generator_checkpoint),
+                "discriminator_checkpoint": str(discriminator_checkpoint),
+            },
             "artifacts": {role: {"onnx": f"{role}.onnx"} for role in GRASPGEN_EXECUTION},
             "execution": list(GRASPGEN_EXECUTION),
             "backend_config": {

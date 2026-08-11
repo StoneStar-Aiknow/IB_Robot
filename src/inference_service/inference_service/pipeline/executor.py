@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime
 
 from inference_service.backends.types import BackendHealth, BackendState, RuntimeContext
-from inference_service.generic_runtime import NamedTensorRequest
+from inference_service.model_sessions.base import ModelSession
 from inference_service.pipeline.runtime_core import ExecutionControl, ExecutionError, ModelExecutor, StageFrame
-from inference_service.pipeline.stages import InferenceStage, ModelStage, ResultAdapter
+from inference_service.pipeline.stages import InferenceStage, ResultAdapter
 
 
 class SequentialModelExecutor(ModelExecutor):
@@ -21,6 +21,10 @@ class SequentialModelExecutor(ModelExecutor):
         *,
         components: Iterable[object] = (),
         execution_plan=None,
+        component_contexts: Mapping[int, RuntimeContext] | None = None,
+        error_handler: Callable[[Exception, bool], None] | None = None,
+        health_override: Callable[[], BackendHealth | None] | None = None,
+        defer_session_execution: bool = False,
     ) -> None:
         self._stages = tuple(stages)
         if not self._stages:
@@ -28,7 +32,27 @@ class SequentialModelExecutor(ModelExecutor):
         self._result_adapter = result_adapter
         self._components = self._unique(tuple(components))
         self._execution_plan = execution_plan
+        self._component_contexts = dict(component_contexts or {})
+        self._error_handler = error_handler
+        self._health_override = health_override
+        self._defer_session_execution = defer_session_execution
         self._context: RuntimeContext | None = None
+
+    @property
+    def stages(self) -> tuple[InferenceStage, ...]:
+        return self._stages
+
+    @property
+    def components(self) -> tuple[object, ...]:
+        return self._components
+
+    @property
+    def execution_plan(self):
+        return self._execution_plan
+
+    @property
+    def component_contexts(self) -> Mapping[int, RuntimeContext]:
+        return self._component_contexts
 
     def load(self, context: RuntimeContext) -> None:
         self._context = context
@@ -37,7 +61,7 @@ class SequentialModelExecutor(ModelExecutor):
             for component in self._components:
                 load = getattr(component, "load", None)
                 if callable(load):
-                    load(context)
+                    load(self._component_contexts.get(id(component), context))
                     loaded.append(component)
         except Exception:
             for component in reversed(loaded):
@@ -47,34 +71,25 @@ class SequentialModelExecutor(ModelExecutor):
             raise
 
     def execute(self, request: object, *, deadline: datetime | None, control: ExecutionControl) -> object:
-        if not isinstance(request, NamedTensorRequest):
-            raise TypeError("SequentialModelExecutor requires a NamedTensorRequest")
-        frame = StageFrame(request, execution_plan=self._execution_plan, values=request.inputs, control=control)
+        inputs = getattr(request, "inputs", None)
+        if not isinstance(inputs, Mapping):
+            raise TypeError("SequentialModelExecutor request must expose mapping inputs")
+        frame = StageFrame(request, execution_plan=self._execution_plan, values=inputs, control=control)
         try:
-            first_model = next(
-                (index for index, stage in enumerate(self._stages) if isinstance(stage, ModelStage)),
-                None,
-            )
-            if first_model is None:
-                self._open_session_executions(frame, request, deadline)
-                for stage in self._stages:
-                    stage.execute(frame, deadline=deadline)
-            else:
-                for stage in self._stages[:first_model]:
-                    stage.execute(frame, deadline=deadline)
-                if frame.execution_frame is not None:
-                    self._open_session_executions(frame, request, deadline)
-                for stage in self._stages[first_model:]:
-                    stage.execute(frame, deadline=deadline)
+            if not self._defer_session_execution:
+                for component in self._components:
+                    if frame.execution_frame is None and isinstance(component, ModelSession):
+                        continue
+                    frame.open_session_execution(component, request, deadline)
+            for stage in self._stages:
+                stage.execute(frame, deadline=deadline)
             return self._result_adapter.adapt(frame)
+        except Exception as exc:
+            if self._error_handler is not None:
+                self._error_handler(exc, bool(frame.values.get("_backend_started", False)))
+            raise
         finally:
             frame.close()
-
-    def _open_session_executions(
-        self, frame: StageFrame, request: NamedTensorRequest, deadline: datetime | None
-    ) -> None:
-        for component in self._components:
-            frame.open_session_execution(component, request, deadline)
 
     def cancel(self, request_id: str, deadline: datetime | None = None) -> None:
         supported = False
@@ -94,6 +109,10 @@ class SequentialModelExecutor(ModelExecutor):
         return self._result_adapter.adapt_error(error)
 
     def health(self) -> BackendHealth:
+        if self._health_override is not None:
+            override = self._health_override()
+            if override is not None:
+                return override
         healths = [component.health() for component in self._components if callable(getattr(component, "health", None))]
         if not healths:
             return BackendHealth(state=BackendState.READY, ready=True)

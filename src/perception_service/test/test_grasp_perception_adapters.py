@@ -53,7 +53,8 @@ def _write_sam2_prompt_bundle(root):
     (assets / "adapter.json").write_text(
         json.dumps(
             {
-                "family": "sam2_prompt",
+                "family": "sam2",
+                "operation": "prompt",
                 "preprocessing": "sam2-longest-side1024-imagenet-box-prompt-v1",
                 "postprocessing": "sam2-mask-logits-iou-v1",
             }
@@ -118,7 +119,8 @@ def _write_grounding_bundle(root):
     (assets / "adapter.json").write_text(
         json.dumps(
             {
-                "family": "grounding_dino_raw",
+                "family": "grounding_dino",
+                "operation": "raw",
                 "preprocessing": "grounding-dino-swint-rgb720x1280-bert-seq8-v1",
                 "postprocessing": "grounding-dino-raw-logits-cxcywh-v1",
             }
@@ -165,7 +167,8 @@ def test_grounding_dino_raw_adapter_derives_abi_shapes_from_manifest(tmp_path):
     _write_grounding_bundle(tmp_path)
     model = ModelDescriptor(
         kind="perception",
-        family="grounding_dino_raw",
+        family="grounding_dino",
+        operation="raw",
         inputs=(
             SemanticTensor(semantic="input_ids", dtype="int64", shape=(1, 8)),
             SemanticTensor(semantic="encoder_tgt", dtype="float32", shape=(1, 900, 256)),
@@ -397,6 +400,7 @@ def _segment_plugin(batch_size: int):
     plugin.adapter = adapter
     plugin.host = SimpleNamespace(bridge=_Bridge())
     plugin.session = _StubSession(batch_size)
+    plugin.pipeline = SimpleNamespace(execute=plugin.session.infer)
     plugin._requests = itertools.count(1)
     return plugin
 

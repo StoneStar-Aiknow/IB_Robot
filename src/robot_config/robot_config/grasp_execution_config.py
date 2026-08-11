@@ -199,6 +199,8 @@ _SCHEMA: dict[str, Any] = {
         "remote_310p_password_env": _string(),
         "remote_310p_root": _string(),
         "remote_310p_timeout_sec": _POSITIVE,
+        "local_manifest_path": _string(),
+        "local_deployment_name": _string(),
         "ascend_local_manifest_path": _string(),
         "ascend_local_deployment_name": _string(),
         "ascend_local_device_id": _integer(0),
@@ -454,6 +456,15 @@ def validate_grasp_execution_config(value: Any) -> list[str]:
     planner_node = value.get("planner_node")
     if isinstance(planner_node, dict):
         planner_backend = planner_node.get("inference_backend")
+        if (
+            planner_backend in {"local_cuda", "ascend_local"}
+            and not str(
+                planner_node.get("local_manifest_path", planner_node.get("ascend_local_manifest_path", ""))
+            ).strip()
+        ):
+            errors.append(
+                "grasp_execution.planner_node.local_manifest_path must not be empty for local pipeline inference"
+            )
         if planner_backend == "ascend_local" and not str(planner_node.get("ascend_local_manifest_path", "")).strip():
             errors.append(
                 "grasp_execution.planner_node.ascend_local_manifest_path must not be empty when using ascend_local"

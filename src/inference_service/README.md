@@ -125,6 +125,12 @@ Pipeline ID 是模型实例和 ROS 路由的稳定标识，必须匹配
 - 后端实例、准入状态和生命周期
 - Action、reset、health、action output 和分布式 transport endpoints
 
+`GenericModelPipeline` 是策略、感知、Echo 等模型共用的公开运行时入口，统一生命周期、准入、
+deadline、cancellation 和 health。`PipelineRuntimeCore` 是其内部可复用的状态机与并发控制实现。
+`InferencePipeline` 是策略模型 facade，在通用运行时之上增加 LeRobot processor、policy codec 和
+action 结果适配。编译模型由 `SequentialModelExecutor` 按 `InferenceStage` 序列执行；循环 family
+通过 `IterativeStage` 驱动多个 role，并在一个 `ModelSessionExecution` scope 中共享设备资源。
+
 默认 endpoint：
 
 | 接口 | 默认值 |
@@ -287,8 +293,8 @@ ROS observations
   -> contract adapter
   -> LeRobot preprocessor
   -> semantic batch
-  -> native policy or policy codec + bindings
-  -> selected deployment backend
+  -> native policy, or policy codec + shared stage executor
+  -> Backend.infer, or ModelSession role execution
   -> semantic action
   -> LeRobot postprocessor
   -> DispatchInfer result and /actions/<pipeline_id>
@@ -449,14 +455,32 @@ Ascend compiled deployment 可通过 manifest `device_links` 把 producer output
 `AscendOmModelSession` 按 `execution` 顺序调度这些 role，只把公开输出以及未声明 device link 的 host-routed 中间
 tensor 复制回主机；设备生命周期、buffer ownership 和串行准入仍由 shared runtime 统一管理。
 
-以下支持矩阵在启动时强制校验，不在表中的组合会被拒绝：
+编译 PI0.5 与 SmolVLA 不再由旧 backend 类持有 family 循环。它们通过
+`GenericModelPipeline -> SequentialModelExecutor -> InferenceStage -> ModelSession` 执行；对应
+`AscendBackend`、`HMMBackend` 和 `RKNNBackend` 对已迁移 family fail-closed。以下矩阵在启动时
+强制校验，不在表中的组合会被拒绝：
 
 | Policy family | `torch` | `ascend` | `hisilicon` | `rknn` | `hmm` |
 | --- | --- | --- | --- | --- | --- |
-| ACT | 支持 | 支持 | 支持 | 支持 | 不支持 |
-| Diffusion Policy | 支持 | 不支持 | 不支持 | 不支持 | 不支持 |
-| PI0.5 | 支持 | 支持 | 不支持 | 不支持 | 支持 |
-| SmolVLA | 支持 | 不支持 | 不支持 | 支持 | 支持 |
+| ACT | Backend | Backend | Backend | Backend | 不支持 |
+| Diffusion Policy | Backend | 不支持 | 不支持 | 不支持 | 不支持 |
+| PI0.5 | Backend | ModelSession | 不支持 | 不支持 | ModelSession |
+| SmolVLA | Backend | 不支持 | 不支持 | ModelSession | ModelSession |
+
+`Backend` 表示直接调用 `*Backend.infer()`；`ModelSession` 表示共享 family executor 按 role 调用
+`*ModelSession`。感知 family 的 registry 支持矩阵如下：
+
+| Perception family | `torch` | `ascend` |
+| --- | --- | --- |
+| RAM++ | 支持 | 支持 |
+| SAM2 | 支持（automatic） | 支持（prompt） |
+| SigLIP2 | 支持 | 支持 |
+| Grounding DINO | 支持（combined） | 支持（raw） |
+| GraspGen | 支持（CUDA） | 支持 |
+| Dummy Echo | 支持 | 不支持 |
+
+Registry 还要求每个 family/backend 声明 `ConformanceEvidence`；仅列出 family 而没有一致的验证证据
+同样会 fail-closed。
 
 ### PI0.5 Ascend 行为
 

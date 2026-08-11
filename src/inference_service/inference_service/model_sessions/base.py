@@ -7,7 +7,7 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timezone
 
 import numpy as np
@@ -29,12 +29,12 @@ from inference_service.backends.types import BackendCapabilities, BackendHealth,
 from inference_service.generic_runtime import DeploymentIdentity, NamedTensorRequest, NamedTensorResult, RuntimeLatency
 
 
-@dataclass
 class ModelSessionExecution:
-    """One admitted request scope for manifest role execution."""
+    """Behavioral request scope coupled to one owning :class:`ModelSession`."""
 
-    _session: ModelSession
-    request: NamedTensorRequest
+    def __init__(self, session: ModelSession, request: NamedTensorRequest) -> None:
+        self._session = session
+        self.request = request
 
     def invoke(self, role: str, inputs: Mapping[str, object]) -> Mapping[str, object]:
         self._session._raise_if_deadline_expired(self.request.deadline)
@@ -95,7 +95,12 @@ class ModelSession(ABC):
     def capabilities(self) -> BackendCapabilities:
         return self._capabilities
 
-    def _update_loaded_capabilities(self, **changes: object) -> None:
+    def _update_loaded_capabilities(
+        self,
+        *,
+        priority_mapping=None,
+        **changes: object,
+    ) -> None:
         """Refine observational capabilities while the session is loading."""
 
         with self._condition:
@@ -104,7 +109,7 @@ class ModelSession(ABC):
                     f"model session {self.name!r} can update capabilities only while loading",
                     code="invalid_capability_update_state",
                 )
-            self._capabilities = replace(self._capabilities, **changes)
+            self._capabilities = replace(self._capabilities, priority_mapping=priority_mapping, **changes)
 
     @property
     def runtime_version(self) -> str:
@@ -160,6 +165,7 @@ class ModelSession(ABC):
         if not isinstance(request, NamedTensorRequest):
             raise TypeError("model sessions require a NamedTensorRequest")
         self._require_ready()
+        self._validate_request(request)
         with self._admission.admit(request.deadline):
             with self._condition:
                 self._require_ready_locked()
@@ -219,6 +225,7 @@ class ModelSession(ABC):
         if not isinstance(request, NamedTensorRequest):
             raise TypeError("model sessions require a NamedTensorRequest")
         self._require_ready()
+        self._validate_request(request)
         with self._admission.admit(request.deadline):
             with self._condition:
                 self._require_ready_locked()
@@ -384,6 +391,9 @@ class ModelSession(ABC):
 
     @abstractmethod
     def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]: ...
+
+    def _validate_request(self, request: NamedTensorRequest) -> None:
+        del request
 
     def _execute_role(
         self,

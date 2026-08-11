@@ -678,13 +678,12 @@ def test_registry_accepts_non_policy_model_kind_support(tmp_path):
     assert registry.validate(context).name == "ascend"
 
 
-def test_registry_rejects_undeclared_non_policy_model_support(tmp_path):
+def test_registry_accepts_declared_non_policy_model_support(tmp_path):
     context = _make_non_policy_context(tmp_path / "bundle", family="siglip2")
 
-    with pytest.raises(BackendCompatibilityError, match=r"ascend.*siglip2") as error:
-        BACKEND_REGISTRY.validate(context)
+    descriptor = BACKEND_REGISTRY.validate(context)
 
-    assert error.value.code == "unsupported_model_backend_pair"
+    assert descriptor.name == "ascend"
 
 
 def test_descriptor_can_declare_model_support_without_policy_support():
@@ -696,6 +695,18 @@ def test_descriptor_can_declare_model_support_without_policy_support():
     )
 
     descriptor.validate_definition()
+
+
+def test_descriptor_rejects_unknown_perception_family():
+    with pytest.raises(BackendRegistryError, match="unknown perception families") as error:
+        BackendDescriptor(
+            name="ascend",
+            factory="tests.fake_backend_factory:create_backend",
+            target_validator=lambda deployment: None,
+            supported_model_families=frozenset({"unknown_perception"}),
+        ).validate_definition()
+
+    assert error.value.code == "unknown_model_family"
 
 
 def _make_perception_context(
@@ -738,6 +749,9 @@ def test_static_registry_evidence_matches_declared_policy_matrix(backend):
         ("grounding_dino", "torch"),
         ("dummy_echo", "torch"),
         ("ram_plus", "ascend"),
+        ("graspgen", "ascend"),
+        ("sam2", "ascend"),
+        ("grounding_dino", "ascend"),
     ],
 )
 def test_registry_supports_declared_perception_deployments(tmp_path, family, backend):
@@ -747,12 +761,10 @@ def test_registry_supports_declared_perception_deployments(tmp_path, family, bac
 
 
 @pytest.mark.parametrize("family", ["sam2", "siglip2", "grounding_dino"])
-def test_registry_rejects_compiled_perception_family_on_ascend(tmp_path, family):
+def test_registry_accepts_perception_family_with_compiled_ascend_support(tmp_path, family):
     context = _make_perception_context(tmp_path / "bundle", backend="ascend", family=family)
 
-    with pytest.raises(BackendCompatibilityError, match="does not support") as error:
-        BACKEND_REGISTRY.validate(context)
-    assert error.value.code == "unsupported_model_backend_pair"
+    assert BACKEND_REGISTRY.validate(context).name == "ascend"
 
 
 def test_registry_validate_fails_closed_when_evidence_absent(tmp_path):

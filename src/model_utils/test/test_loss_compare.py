@@ -141,7 +141,8 @@ def test_prepare_policy_forwards_transient_ascend_diagnostics(monkeypatch, tmp_p
     loss_compare.LossUtils.prepare_policy(SimpleNamespace(args=args))
 
     assert created[0]["runtime_options"] == {"curvature_log_path": "/tmp/curvature.jsonl"}
-    assert created[0]["registry"] is not None
+    assert created[0]["pi05_diagnostic_schedule"].name == "test"
+    assert created[0]["pi05_diagnostic_schedule_source"] == str(schedule_path.resolve())
 
 
 def test_pi05_noise_is_external_and_deterministic_without_noise_dir(monkeypatch, tmp_path):

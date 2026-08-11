@@ -65,7 +65,7 @@ def test_the_identity_names_the_contracts_the_packager_stamps_into_the_bundle():
     assert identity.family == "graspgen"
     assert identity.preprocessing == GRASPGEN_PREPROCESSING
     assert identity.postprocessing == GRASPGEN_POSTPROCESSING
-    assert identity.supported_deployments == frozenset({"ascend_310p", "ascend_310b"})
+    assert identity.supported_deployments == frozenset({"torch_cuda", "ascend_310p", "ascend_310b"})
     assert GraspGenAdapter.compiled_abi_finalized is True
 
 

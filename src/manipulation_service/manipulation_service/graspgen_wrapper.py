@@ -332,15 +332,15 @@ class Remote310PInferenceClient:
             raise RuntimeError("remote GraspGen result contains non-finite values")
 
 
-class AscendLocalBackend:
-    """In-process GraspGen inference via the perception GraspGen session.
+class LocalPipelineBackend:
+    """In-process GraspGen inference through the unified generic pipeline.
 
     GraspGen is a ``kind=perception`` model, so its semantics live in
     ``perception_service.GraspGenAdapter`` (point-cloud preparation and grasp
-    decoding) and its eight-role execution lives in
-    ``perception_service.GraspGenAscendSession``. This class only drives that
-    pair in-process, bypassing the SSH/SFTP transport used by
-    :class:`Remote310PInferenceClient`; it holds no GraspGen semantics of its own.
+    decoding). The selected model session owns either Torch CUDA execution or the
+    eight-role Ascend execution. This class only drives that pair in-process,
+    bypassing the SSH/SFTP transport used by :class:`Remote310PInferenceClient`;
+    it holds no GraspGen semantics of its own.
     """
 
     def __init__(
@@ -352,14 +352,15 @@ class AscendLocalBackend:
         random_seed: int | None = None,
     ):
         if not manifest_path.strip():
-            raise ValueError("ascend_local_manifest_path must not be empty")
+            raise ValueError("local GraspGen manifest_path must not be empty")
         if device_id < 0:
-            raise ValueError("ascend_local_device_id must be a non-negative integer")
+            raise ValueError("local GraspGen device_id must be a non-negative integer")
         self._manifest_path = manifest_path.strip()
         self._deployment_name = deployment_name.strip() or "ascend_310p"
         self._device_id = int(device_id)
         self._random_seed = random_seed
         self._session = None
+        self._pipeline = None
         self._adapter = None
         self._sample_lock = threading.Lock()
 
@@ -368,36 +369,59 @@ class AscendLocalBackend:
             return
         from inference_manifest import load_inference_manifest
         from inference_service.backends.types import RuntimeContext
+        from inference_service.model_sessions import MODEL_SESSION_BUILDER_REGISTRY
+        from inference_service.pipeline import (
+            GenericModelPipeline,
+            ModelResultAdapter,
+            ModelStage,
+            SequentialModelExecutor,
+        )
         from perception_service.graspgen_adapter import GraspGenAdapter
-        from perception_service.graspgen_session import GraspGenAscendSession
+        from perception_service.model_session_builders import register_perception_session_builders
 
         bundle_root = Path(self._manifest_path).expanduser().resolve()
         manifest_root = bundle_root.parent if bundle_root.name == "inference_manifest.json" else bundle_root
         validated = load_inference_manifest(manifest_root, self._deployment_name)
         model = validated.manifest.model
         if model.kind != "perception" or model.family != "graspgen":
-            raise ValueError(f"ascend_local requires a perception/graspgen bundle, got {model.kind!r}/{model.family!r}")
+            raise ValueError(
+                f"local pipeline requires a perception/graspgen bundle, got {model.kind!r}/{model.family!r}"
+            )
         adapter = GraspGenAdapter.from_bundle(validated.bundle_root, model.semantic_identity, model=model)
         adapter.validate_identity(model.semantic_identity)
         adapter.validate_deployment(self._deployment_name)
 
-        runtime_options: dict[str, object] = {"device_id": self._device_id}
-        if self._random_seed is not None:
+        runtime_options: dict[str, object] = {}
+        if validated.deployment.backend == "ascend":
+            runtime_options["device_id"] = self._device_id
+        if self._random_seed is not None and validated.deployment.backend == "ascend":
             runtime_options["random_seed"] = self._random_seed
-        session = GraspGenAscendSession(device_id=self._device_id, config=adapter.config)
-        try:
-            session.load(RuntimeContext(validated_manifest=validated, runtime_options=runtime_options))
-        except Exception:
-            session.close()
-            raise
+        context = RuntimeContext(validated_manifest=validated, runtime_options=runtime_options)
+        register_perception_session_builders()
+        session = MODEL_SESSION_BUILDER_REGISTRY.create(
+            context,
+            allowed_deployments=adapter.identity.supported_deployments,
+            builder_options={"adapter": adapter},
+        )
+        pipeline = GenericModelPipeline(
+            f"manipulation-graspgen-{validated.deployment.backend}-local",
+            context,
+            SequentialModelExecutor(
+                (ModelStage("model", session),),
+                ModelResultAdapter(),
+                components=(session,),
+            ),
+            supports_cancellation=session.capabilities.supports_cancellation,
+        )
+        pipeline.load()
         self._adapter = adapter
         self._session = session
+        self._pipeline = pipeline
         logger.info(
-            "AscendLocalBackend ready (manifest=%s, deployment=%s, device_id=%d, roles=%d, point_count=%d)",
+            "LocalPipelineBackend ready (manifest=%s, deployment=%s, backend=%s, point_count=%d)",
             manifest_root,
             self._deployment_name,
-            self._device_id,
-            len(validated.deployment.execution),
+            validated.deployment.backend,
             adapter.config.point_count,
         )
 
@@ -425,7 +449,7 @@ class AscendLocalBackend:
         batches = _graspgen_inference_batches(num_grasps, _DEFAULT_MAX_INFERENCE_GRASPS_PER_BATCH)
         if len(batches) > 1:
             logger.info(
-                "Running Ascend GraspGen inference in %d batches: total=%d max_batch=%d",
+                "Running local GraspGen inference in %d batches: total=%d max_batch=%d",
                 len(batches),
                 num_grasps,
                 _DEFAULT_MAX_INFERENCE_GRASPS_PER_BATCH,
@@ -440,9 +464,9 @@ class AscendLocalBackend:
         # fresh diffusion noise without resetting the configured seed.
         with self._sample_lock:
             for index, batch_size in enumerate(batches, start=1):
-                result = self._session.infer(
+                result = self._pipeline.execute(
                     NamedTensorRequest(
-                        request_id=f"ascend_local_{uuid.uuid4().hex}",
+                        request_id=f"graspgen_local_{uuid.uuid4().hex}",
                         inputs=inputs,
                     )
                 )
@@ -473,7 +497,7 @@ class AscendLocalBackend:
                     )
                 backend_seconds += result.latency.backend_ms / 1000.0
                 logger.info(
-                    "AscendLocalBackend batch %d/%d kept %d grasps",
+                    "LocalPipelineBackend batch %d/%d kept %d grasps",
                     index,
                     len(batches),
                     len(candidates),
@@ -496,7 +520,7 @@ class AscendLocalBackend:
         poses = poses[order]
         confidence = confidence[order]
         logger.info(
-            "AscendLocalBackend completed: batches=%d grasps=%d wall_s=%.3f backend_s=%.3f denoiser_steps=%d",
+            "LocalPipelineBackend completed: batches=%d grasps=%d wall_s=%.3f backend_s=%.3f denoiser_steps=%d",
             len(batches),
             len(confidence),
             inference_seconds,
@@ -509,7 +533,7 @@ class AscendLocalBackend:
         """Run inference without consuming the configured request random stream."""
         self._ensure_loaded()
         assert self._session is not None
-        random_generator = self._session._random  # noqa: SLF001 - paired session integration.
+        random_generator = getattr(self._session, "_random", None)  # noqa: SLF001 - paired session integration.
         random_state = None if random_generator is None else deepcopy(random_generator.bit_generator.state)
         try:
             self.sample(
@@ -1375,6 +1399,8 @@ class GraspGenWrapper:
         remote_310p_password_env: str = "GRASPGEN_310P_PASSWORD",
         remote_310p_root: str = "/root/GraspGen",
         remote_310p_timeout_sec: float = 120.0,
+        local_manifest_path: str = "",
+        local_deployment_name: str = "",
         ascend_local_manifest_path: str = "",
         ascend_local_deployment_name: str = "ascend_310p",
         ascend_local_device_id: int = 0,
@@ -1402,36 +1428,29 @@ class GraspGenWrapper:
             )
 
         logger.info("Loading GraspGen config from %s", gripper_cfg_path)
-        if backend == "local_cuda":
-            from grasp_gen.grasp_server import load_grasp_cfg
-
-            self._cfg = load_grasp_cfg(str(gripper_cfg_path))
-            self._gripper_name = self._cfg.data.gripper_name
-            self._inference_point_count = int(getattr(self._cfg.data, "num_points", 2048))
-        else:
-            self._cfg = None
-            self._gripper_name, self._inference_point_count = _load_grasp_metadata(gripper_cfg_path)
+        self._cfg = None
+        self._gripper_name, self._inference_point_count = _load_grasp_metadata(gripper_cfg_path)
 
         if backend == "local_cuda":
-            from grasp_gen.grasp_server import GraspGenSampler
-
             if device != "cuda":
                 raise RuntimeError(f"{_LOCAL_BACKEND_REQUIRES_CUDA} Requested device={device!r}.")
             if not torch.cuda.is_available():
                 raise RuntimeError(f"{_LOCAL_BACKEND_REQUIRES_CUDA} CUDA status: {_cuda_status()}.")
             self.device = "cuda"
-            logger.info("Initializing GraspGenSampler on %s ...", self.device)
-            self._sampler = GraspGenSampler(self._cfg)
+            self._sampler = None
             self._remote_client = None
-            self._ascend_local_client = None
-            logger.info("GraspGenSampler ready (gripper=%s)", self._gripper_name)
+            self._ascend_local_client = LocalPipelineBackend(
+                local_manifest_path,
+                deployment_name=local_deployment_name or "torch_cuda",
+            )
+            logger.info("GraspGen Torch pipeline ready (gripper=%s)", self._gripper_name)
         elif backend == "ascend_local":
             self.device = "ascend"
             self._sampler = None
             self._remote_client = None
-            self._ascend_local_client = AscendLocalBackend(
+            self._ascend_local_client = LocalPipelineBackend(
                 ascend_local_manifest_path,
-                deployment_name=ascend_local_deployment_name,
+                deployment_name=local_deployment_name or ascend_local_deployment_name,
                 device_id=ascend_local_device_id,
                 random_seed=ascend_local_random_seed,
             )
@@ -1550,11 +1569,6 @@ class GraspGenWrapper:
         scene_cloud_table_holes_max_points: int = 8000,
     ) -> tuple[list[GraspCandidate], GraspDiagnostic]:
         plan_started = time.perf_counter()
-        grasp_server_cls = None
-        if self.inference_backend == "local_cuda":
-            from grasp_gen.grasp_server import GraspGenSampler
-
-            grasp_server_cls = GraspGenSampler
 
         diag = GraspDiagnostic()
         completion_mode = object_cloud_completion_mode.strip().lower()
@@ -1751,13 +1765,10 @@ class GraspGenWrapper:
         diag.outlier_removal_ms = (time.perf_counter() - stage_started) * 1000.0
         stage_started = time.perf_counter()
         grasps, confidences = self._run_batched_inference(
-            grasp_server_cls,
             object_pc_inference,
             grasp_threshold=grasp_threshold,
             num_grasps=num_grasps,
             topk_num_grasps=topk_num_grasps,
-            min_grasps=min_grasps,
-            max_tries=max_tries,
         )
         diag.model_inference_ms = (time.perf_counter() - stage_started) * 1000.0
         postprocess_started = time.perf_counter()
@@ -2048,14 +2059,11 @@ class GraspGenWrapper:
 
     def _run_batched_inference(
         self,
-        grasp_server_cls,
         object_pc: np.ndarray,
         *,
         grasp_threshold: float,
         num_grasps: int,
         topk_num_grasps: int,
-        min_grasps: int,
-        max_tries: int,
     ):
         if self.inference_backend == "remote_310p":
             poses, confidence, _ = self._remote_client.sample(
@@ -2066,7 +2074,7 @@ class GraspGenWrapper:
             )
             return torch.from_numpy(poses), torch.from_numpy(confidence)
 
-        if self.inference_backend == "ascend_local":
+        if self.inference_backend in {"local_cuda", "ascend_local"}:
             poses, confidence, _ = self._ascend_local_client.sample(
                 object_pc,
                 grasp_threshold=grasp_threshold,
@@ -2074,65 +2082,15 @@ class GraspGenWrapper:
                 topk_num_grasps=topk_num_grasps,
             )
             return torch.from_numpy(poses), torch.from_numpy(confidence)
-
-        batches = _graspgen_inference_batches(num_grasps, _DEFAULT_MAX_INFERENCE_GRASPS_PER_BATCH)
-        if len(batches) > 1:
-            logger.info(
-                "Running GraspGen inference in %d batches: total=%d max_batch=%d",
-                len(batches),
-                num_grasps,
-                _DEFAULT_MAX_INFERENCE_GRASPS_PER_BATCH,
-            )
-
-        all_grasps = []
-        all_confidences = []
-        for index, batch_size in enumerate(batches, start=1):
-            per_batch_topk = -1
-            if grasp_threshold == -1.0 and topk_num_grasps > 0:
-                per_batch_topk = min(topk_num_grasps, batch_size)
-
-            grasps, confidences = grasp_server_cls.run_inference(
-                object_pc,
-                self._sampler,
-                grasp_threshold=grasp_threshold,
-                num_grasps=batch_size,
-                topk_num_grasps=per_batch_topk,
-                min_grasps=min_grasps,
-                max_tries=max_tries,
-            )
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            if len(grasps) == 0:
-                logger.info("GraspGen batch %d/%d returned zero grasps", index, len(batches))
-                continue
-            all_grasps.append(grasps)
-            all_confidences.append(confidences)
-            logger.info(
-                "GraspGen batch %d/%d accepted %d grasps, total accepted=%d",
-                index,
-                len(batches),
-                len(grasps),
-                sum(len(g) for g in all_grasps),
-            )
-
-        if not all_grasps:
-            return torch.tensor([], device=self.device), torch.tensor([], device=self.device)
-
-        grasps = torch.cat(all_grasps, dim=0)
-        confidences = torch.cat(all_confidences, dim=0)
-        if topk_num_grasps > 0 and len(grasps) > topk_num_grasps:
-            order = torch.argsort(confidences, descending=True)[:topk_num_grasps]
-            grasps = grasps[order]
-            confidences = confidences[order]
-        return grasps, confidences
+        raise RuntimeError(f"unsupported GraspGen inference backend {self.inference_backend!r}")
 
     @property
     def gripper_name(self) -> str:
         return self._gripper_name
 
     def warmup(self) -> bool:
-        """Run one deterministic Ascend inference to initialize lazy runtime state."""
-        if self.inference_backend != "ascend_local":
+        """Run one deterministic local inference to initialize lazy runtime state."""
+        if self.inference_backend not in {"local_cuda", "ascend_local"}:
             return False
         assert self._ascend_local_client is not None
         rng = np.random.default_rng(0)
@@ -2191,3 +2149,7 @@ class GraspGenWrapper:
             steps,
         )
         return filtered_grasps, filtered_confidences, min_clearances
+
+
+# Compatibility name for callers that only select the Ascend deployment.
+AscendLocalBackend = LocalPipelineBackend

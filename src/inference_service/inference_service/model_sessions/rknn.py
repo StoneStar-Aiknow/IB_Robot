@@ -10,7 +10,16 @@ from inference_manifest import ArtifactBindings, CompiledDeployment, TensorBindi
 from inference_service.backends.admission import ResourceDomainAdmissions
 from inference_service.backends.errors import BackendInferenceError, BackendLifecycleError, BackendLoadError
 from inference_service.backends.lifecycle import PartialLoadRollback
-from inference_service.backends.rknn.backend import RKNNBackend, RKNNSession
+from inference_service.backends.rknn.runtime import (
+    RKNNSession,
+    convert_runtime_value,
+    import_rknn_type,
+    require_artifact,
+    resolve_core_mask,
+    runtime_data_format,
+    session_cache_key,
+    validate_runtime_options,
+)
 from inference_service.backends.types import BackendAdmissionEvidence, BackendCapabilities, RuntimeContext
 from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.base import ModelSession
@@ -32,10 +41,8 @@ class RKNNModelSession(ModelSession):
 
     Runtime specifics (per-role ``data_format`` from image binding layouts,
     ``share_group`` session reuse, ``core_mask`` resolution, ``target``/``init_runtime``
-    behavior, dtype conversion, device-link rejection) are reused verbatim from
-    :class:`RKNNBackend` so this session stays numerically and operationally
-    identical to the existing backend path. Only the low-level
-    :class:`RKNNSession` is instantiated for device execution.
+    behavior, dtype conversion, and device-link rejection) live in the low-level
+    RKNN runtime module rather than a policy backend.
     """
 
     def __init__(
@@ -60,7 +67,7 @@ class RKNNModelSession(ModelSession):
             ),
             domains=domains,
         )
-        self._rknn_loader = rknn_loader or RKNNBackend._import_rknn_type
+        self._rknn_loader = rknn_loader or import_rknn_type
         self._rknn_type: type | None = None
         self._sessions: dict[str, RKNNSession] = {}
         self._owned_sessions: tuple[RKNNSession, ...] = ()
@@ -81,7 +88,7 @@ class RKNNModelSession(ModelSession):
                 "RKNNLite does not support manifest device-pointer links; declare host-visible internal bindings",
                 code="unsupported_device_links",
             )
-        options = RKNNBackend._validate_runtime_options(context.runtime_options)
+        options = validate_runtime_options(context.runtime_options)
 
         host_roles: list[str] = []
         for role in deployment.execution:
@@ -96,7 +103,7 @@ class RKNNModelSession(ModelSession):
                 )
 
         rknn_type = self._rknn_loader()
-        core_mask = RKNNBackend._resolve_core_mask(rknn_type, options["core_mask"])
+        core_mask = resolve_core_mask(rknn_type, options["core_mask"])
         target = options["target"]
         sessions: dict[str, RKNNSession] = {}
         owned_sessions: list[RKNNSession] = []
@@ -116,13 +123,13 @@ class RKNNModelSession(ModelSession):
         for role in deployment.execution:
             if role in host_roles:
                 continue
-            cache_key = RKNNBackend._session_cache_key(deployment, role)
+            cache_key = session_cache_key(deployment, role)
             existing = shared_sessions.get(cache_key)
             if existing is not None:
                 sessions[role] = existing
                 continue
-            path = RKNNBackend._require_artifact(context, role)
-            data_format = RKNNBackend._runtime_data_format(deployment.bindings[role])
+            path = require_artifact(context, role)
+            data_format = runtime_data_format(deployment.bindings[role])
             try:
                 session = RKNNSession(
                     rknn_type,
@@ -228,9 +235,7 @@ class RKNNModelSession(ModelSession):
                     f"RKNN role {role!r} is missing semantic input {binding.semantic!r}",
                     code="missing_semantic_input",
                 ) from exc
-            indexed[int(binding.index)] = RKNNBackend._convert_runtime_value(
-                binding, value, role=role, direction="input"
-            )
+            indexed[int(binding.index)] = convert_runtime_value(binding, value, role=role, direction="input")
         return indexed
 
     @staticmethod
@@ -248,7 +253,7 @@ class RKNNModelSession(ModelSession):
                 code="invalid_runtime_outputs",
             )
         return {
-            binding.semantic: RKNNBackend._convert_runtime_value(
+            binding.semantic: convert_runtime_value(
                 binding,
                 runtime_outputs[int(binding.index)],
                 role=role,

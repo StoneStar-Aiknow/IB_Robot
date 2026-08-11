@@ -211,6 +211,8 @@ robot:
     planner_node:
       inference_backend: local_cuda
       device: cuda
+      local_manifest_path: models/grasp/graspgen_bundle
+      local_deployment_name: torch_cuda
       startup_warmup: true
       host_runtime:
         omp_threads: 4

@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
-import uuid
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
 import numpy as np
@@ -93,37 +90,21 @@ def dump_pi05_om(
 ) -> Path:
     """Run one PI0.5 OM sample and explicitly capture reproducible diagnostics."""
     capture = DiagnosticCapture(output_dir)
-    registry_module = None
     if engine_factory is None:
-        from inference_service.backends import BackendDescriptor, BackendRegistry, ConformanceEvidence
-        from inference_service.backends.ascend import AscendBackend
         from inference_service.core import PureInferenceEngine
+        from inference_service.model_sessions import AscendOmModelSession
 
-        registry_module = ModuleType(f"model_utils._pi05_dump_backend_{uuid.uuid4().hex}")
-
-        def create_backend(context):
+        def create_session(context, options):
             device_id = context.runtime_options.get("device_id", 0)
-            return AscendBackend(int(device_id), diagnostic_capture=capture)
+            del options
+            return AscendOmModelSession(int(device_id), diagnostic_capture=capture)
 
-        registry_module.create_backend = create_backend
-        sys.modules[registry_module.__name__] = registry_module
-        registry = BackendRegistry(
-            {
-                "ascend": BackendDescriptor(
-                    name="ascend",
-                    factory=f"{registry_module.__name__}:create_backend",
-                    supported_policy_families=frozenset({"pi05"}),
-                    conformance_evidence=frozenset({ConformanceEvidence("policy", "pi05")}),
-                    target_validator=lambda deployment: None,
-                )
-            }
-        )
         engine = PureInferenceEngine(
             model_path=policy_path,
             deployment=deployment,
             pipeline_id="pi05-om-dump",
             runtime_options={},
-            registry=registry,
+            model_session_factory=create_session,
         )
     else:
         engine = engine_factory(
@@ -174,8 +155,6 @@ def dump_pi05_om(
         return capture.output_dir
     finally:
         engine.close()
-        if registry_module is not None:
-            sys.modules.pop(registry_module.__name__, None)
 
 
 def build_parser() -> argparse.ArgumentParser:

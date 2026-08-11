@@ -10,12 +10,13 @@ import pytest
 from inference_manifest import BundleFile, canonical_bundle_digest, load_inference_manifest
 from inference_service.backends import (
     BACKEND_REGISTRY,
-    BackendCapabilityError,
     BackendLoadError,
+    BackendRegistryError,
     InferenceRequest,
     RuntimeContext,
 )
-from inference_service.backends.hmm import HMMBackend, create_backend
+from inference_service.backends.hmm import validate_runtime_options
+from inference_service.backends.hmm.host_utils import to_numpy_weight
 from tests.manifest_fixtures import TEST_BUNDLE_UUID, TEST_DEPLOYMENT_UUID, create_policy_bundle, write_manifest
 
 
@@ -276,7 +277,7 @@ def test_hmm_converts_bfloat16_torch_weights_to_float32(tmp_path):
     torch = pytest.importorskip("torch")
     value = torch.tensor([[1.25, -2.5]], dtype=torch.bfloat16)
 
-    result = HMMBackend._to_numpy_weight(value, tmp_path / "embedding.pt", "weight")
+    result = to_numpy_weight(value, tmp_path / "embedding.pt", "weight")
 
     assert result.dtype == np.float32
     assert result.flags.c_contiguous
@@ -848,18 +849,6 @@ def test_hmm_smolvla_rejects_runtime_descriptor_mismatch_before_inference(tmp_pa
     pipeline.close()
 
 
-def test_hmm_backend_fails_closed_for_smolvla_after_factory_cutover(tmp_path):
-    context = _smolvla_context(tmp_path)
-    environment = _smolvla_environment(context, [])
-    backend = HMMBackend(0, runtime_loader=lambda: environment.runtime)
-
-    with pytest.raises(BackendLoadError, match="no longer hosts SmolVLA") as error:
-        backend.load(context)
-
-    assert error.value.code == "unsupported_policy_backend_pair"
-    backend.close()
-
-
 def test_hmm_smolvla_repeated_inference_is_deterministic_with_seed(tmp_path, monkeypatch):
     from inference_service.pipeline import create_inference_pipeline
 
@@ -932,14 +921,14 @@ def test_hmm_smolvla_seed_reproduces_sampled_noise_across_instances(tmp_path, mo
     np.testing.assert_array_equal(build_and_infer(42), build_and_infer(42))
 
 
-def test_hmm_registry_factory_is_lazy_and_reset_is_unsupported(tmp_path):
+def test_hmm_registry_descriptor_is_session_only(tmp_path):
     context = _smolvla_context(tmp_path)
-    backend = BACKEND_REGISTRY.create(context)
 
-    assert isinstance(backend, HMMBackend)
-    with pytest.raises(BackendCapabilityError):
-        backend.reset()
-    backend.close()
+    descriptor = BACKEND_REGISTRY.validate(context)
+    assert descriptor.factory is None
+    with pytest.raises(BackendRegistryError) as error:
+        BACKEND_REGISTRY.create(context)
+    assert error.value.code == "backend_factory_unavailable"
 
 
 @pytest.mark.parametrize(
@@ -954,21 +943,9 @@ def test_hmm_rejects_invalid_runtime_options(tmp_path, runtime_options):
     context = _smolvla_context(tmp_path, runtime_options=runtime_options)
 
     with pytest.raises(BackendLoadError) as error:
-        create_backend(context)
+        validate_runtime_options(context.runtime_options)
 
     assert error.value.code == "invalid_runtime_options"
-
-
-def test_hmm_backend_fails_closed_for_pi05_after_factory_cutover(tmp_path):
-    context = _pi05_context(tmp_path)
-    environment = _pi05_environment(context, [])
-    backend = HMMBackend(0, runtime_loader=lambda: environment.runtime)
-
-    with pytest.raises(BackendLoadError, match="no longer hosts PI0.5") as error:
-        backend.load(context)
-
-    assert error.value.code == "unsupported_policy_backend_pair"
-    backend.close()
 
 
 def test_hmm_pi05_repeated_inference_is_deterministic_with_seed(tmp_path, monkeypatch):
