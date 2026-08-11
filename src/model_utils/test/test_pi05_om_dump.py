@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 import torch
 
+from model_utils.observation_batch import FieldSpec, save_observation_batch
 from model_utils.pi05_om_dump import dump_pi05_om
 
 
@@ -109,4 +110,45 @@ def test_dump_closes_engine_when_inference_fails(tmp_path):
             engine_factory=factory,
         )
 
+    assert engines[0].closed is True
+
+
+def test_dump_accepts_safetensors_batch(tmp_path):
+    pytest.importorskip("safetensors")
+    batch_path = tmp_path / "batches.safetensors"
+    save_observation_batch(
+        batch_path,
+        [
+            {
+                "observation.state": np.array([1, 2], dtype=np.float32),
+                "observation.images.top_view": np.array([[[255, 0, 0]]], dtype=np.uint8),
+            }
+        ],
+        field_specs=[
+            FieldSpec("observation.state", (2,), "float32"),
+            FieldSpec("observation.images.top_view", (1, 1, 3), "uint8", semantic="image", layout="HWC"),
+        ],
+    )
+    engines = []
+
+    def factory(**kwargs):
+        capture = kwargs.pop("diagnostic_capture")
+        kwargs["runtime_options"] = {"diagnostic_capture": capture}
+        engine = _Engine([], **kwargs)
+        engines.append(engine)
+        return engine
+
+    output = dump_pi05_om(
+        policy_path=str(tmp_path / "bundle"),
+        deployment="ascend",
+        batch_path=str(batch_path),
+        batch_index=0,
+        output_dir=str(tmp_path / "dump-safetensors"),
+        engine_factory=factory,
+    )
+
+    np.testing.assert_array_equal(
+        np.load(output / "input_observation.images.top.npy"),
+        np.array([[[[1]], [[0]], [[0]]]]),
+    )
     assert engines[0].closed is True

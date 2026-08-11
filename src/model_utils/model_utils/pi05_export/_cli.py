@@ -87,6 +87,12 @@ STEPS: list[StepSpec] = [
         step_deps=("vlm_onnx",),  # needs the VLM->AE handoff tensors
     ),
     StepSpec(
+        "verify",
+        "Run split-vs-monolithic equivalence verification (needs --batch-path)",
+        param_deps=("batch_path",),
+        step_deps=("vlm_onnx", "ae_onnx"),
+    ),
+    StepSpec(
         "vlm_quant",
         "Quantize the VLM ONNX to W8A8 (needs --batch-path)",
         param_deps=("batch_path",),
@@ -120,12 +126,6 @@ STEPS: list[StepSpec] = [
         "Compile the Action Expert W8A8 ONNX to OM via ATC",
         param_deps=("soc_version",),
         step_deps=("ae_quant",),
-    ),
-    StepSpec(
-        "verify",
-        "Run split-vs-monolithic equivalence verification (needs --task)",
-        param_deps=("task",),
-        step_deps=("vlm_onnx", "ae_onnx"),
     ),
 ]
 STEPS_BY_NAME = {s.name: s for s in STEPS}
@@ -248,8 +248,9 @@ PARAMS: list[Param] = [
     Param(
         dest="task",
         cli="--task",
-        meaning="Task prompt required by the 'verify' step; must match the deployment default_task",
+        meaning="Optional explicit override for the task stored in the observation batch",
         example='"pick up the cup"',
+        default="",
     ),
     # The two paths below are normally derived from --exp-dir; kept as explicit
     # overrides for non-standard layouts.
@@ -303,7 +304,7 @@ PARAMS: list[Param] = [
     Param(
         dest="batch_path",
         cli="--batch-path",
-        meaning="Real calibration batches JSON (REQUIRED for vlm_quant; random data yields a garbage model)",
+        meaning="Real observation batch (.safetensors or legacy .json; REQUIRED for vlm_quant)",
         in_wizard=False,
     ),
     Param(
@@ -411,7 +412,7 @@ def parse_steps(raw: str | None) -> list[str]:
 # user exactly what to add (and why) rather than just the dest name.
 _PARAM_DEP_HINTS: dict[str, str] = {
     "soc_version": "--soc-version <SoC> (target Ascend SoC, e.g. Ascend310P3; see `npu-smi info`)",
-    "batch_path": "--batch-path <batches.json> (REAL calibration batches; random data yields a garbage model)",
+    "batch_path": "--batch-path <observations.safetensors> (REAL calibration data; random data yields a garbage model)",
     "task": "--task '<prompt>' (the deployment task prompt, must match default_task)",
 }
 

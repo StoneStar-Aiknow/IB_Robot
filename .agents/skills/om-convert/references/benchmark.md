@@ -1,0 +1,116 @@
+# Ascend OM Performance Baseline
+
+The required performance check is `ais_bench --loop 20` for every OM executed by the deployment. Do
+not run hardware mock, LTTng, or the IB-Robot trace-summary workflow. `msprof` is allowed only as an
+optimization diagnostic, not as this baseline's acceptance metric.
+
+Before a performance-only session, do not trust host information from an earlier conversion session.
+Ask again, in one compact intake, for the current Torch host and Ascend host SSH targets, IB-Robot
+workspace paths, bundle/deployment paths, validation package, target/noise locations, processor/
+tokenizer and other bundle-local external-asset paths/hashes, and device IDs.
+Reconfirm non-interactive SSH access. This refresh is required because models, worktrees, deployments,
+and lab machines may have changed between conversion and optimization.
+
+## Preflight
+
+On the Ascend host, record:
+
+- deployment and Manifest fingerprint;
+- exact role order and invocation count per generated action;
+- OM and ABI absolute paths and SHA-256;
+- input shapes and batch size;
+- `npu-smi info`;
+- CANN, ACL, driver, and ais_bench versions;
+- schedule/step count or other values that determine role invocation count.
+
+Only benchmark an OM that has exact ACL ABI and belongs to the deployment under test.
+
+## Per-Role Command
+
+First run one timed smoke inference with the same inputs as the benchmark. Use the installed
+ais_bench version's loop-one form and a SIGINT timeout. On GNU coreutils hosts, the template is:
+
+```bash
+source .shrc_local
+timeout --signal=INT --kill-after=2s 10s \
+    python3 -m ais_bench \
+    --model "RESOLVED_ROLE_OM" \
+    --loop 1 \
+    --debug 0
+```
+
+If the command times out, record it, do not start the 20-loop run, and investigate input shape,
+fallback kernels, and ATC warnings. Distinguish slow model compute from one-time initialization when
+the ais_bench output exposes both; if initialization alone crosses the timeout, perform one explicitly
+recorded warmup and apply the 10-second guard to the next single inference. If GNU `timeout` is absent,
+use an equivalent SIGINT-capable method rather than an unbounded run.
+
+Then run each distinct role OM:
+
+```bash
+source .shrc_local
+python3 -m ais_bench \
+    --model "RESOLVED_ROLE_OM" \
+    --loop 20 \
+    --debug 0
+```
+
+If the model requires explicit inputs that ais_bench cannot generate correctly, create deterministic
+inputs matching the ACL ABI and record the exact ais_bench arguments. Use the same input method for all
+candidates. A role benchmark is invalid if its input shape or dtype differs from production ABI.
+
+Preserve the raw log and parse:
+
+- `NPU_compute_time` min;
+- max;
+- mean;
+- median;
+- p99;
+- throughput.
+
+Do not substitute wall-clock initialization time for NPU compute time.
+
+## Weighted Total
+
+Compute the primary total:
+
+```text
+total_mean_ms = sum(role_mean_ms * role_invocation_count)
+```
+
+Examples:
+
+- single ACT policy: `policy_mean`;
+- PI05: `vlm_mean + action_expert_mean * denoising_steps`.
+
+Also report:
+
+```text
+total_median_estimate = sum(role_median_ms * invocation_count)
+total_p99_upper_estimate = sum(role_p99_ms * invocation_count)
+```
+
+The latter values are weighted estimates, not measured end-to-end percentiles. Label them exactly as
+estimates.
+
+For conditionally executed roles, benchmark each path and report invocation assumptions. Do not hide
+conditional behavior inside one total.
+
+## Report
+
+Write machine-readable JSON and a short Markdown summary under `reports/ais-bench/`. Include:
+
+- environment and artifact identity;
+- exact commands;
+- raw log paths;
+- per-role statistics;
+- invocation counts and source of each count;
+- weighted totals;
+- failures or retries.
+
+For optimization candidates, compare against the same baseline environment and input method. Accept a
+performance candidate only when its accepted accuracy remains valid and `total_mean_ms` improves beyond
+measurement noise. Record candidates that show no additive benefit; PI05 demonstrated that two local
+optimizations can hit the same GEMM/memory floor and fail to stack.
+
+Include the final hits-among-evaluated and catalog-coverage summary from `experience-ledger.md`.

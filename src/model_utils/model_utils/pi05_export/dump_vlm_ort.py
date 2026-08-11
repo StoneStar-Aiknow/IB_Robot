@@ -49,7 +49,7 @@ import torch  # noqa: E402
 LOGGER = logging.getLogger("dump_vlm_ort")
 
 
-# Mirror dump_vlm_pt's defaults so the same batches.json can be fed
+# Mirror dump_vlm_pt's defaults so the same observation batch can be fed
 # straight into either script without extra flags.
 _DEFAULT_KEY_MAP: dict[str, str] = {
     "observation.images.hand_view": "observation.images.wrist",
@@ -242,7 +242,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--policy-path", type=str, required=True, help="Path to pretrained PI05 checkpoint (used for preprocessing)."
     )
-    p.add_argument("--batch-path", type=str, required=True, help="Path to batches.json.")
+    p.add_argument("--batch-path", type=str, required=True, help="Observation batch path.")
     p.add_argument("--batch-index", type=int, default=0, help="Which batch to dump (default: 0).")
     p.add_argument("--onnx-path", type=str, required=True, help="Path to the exported VLM ONNX file.")
     p.add_argument("--out-dir", type=str, required=True, help="Output directory for .npy files.")

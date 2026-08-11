@@ -12,3 +12,4 @@ jsonschema>=4,<5
 # manifest contract, so it is declared once here instead of per-platform, which would
 # let Ubuntu and openEuler resolve different contract versions.
 pydantic>=2,<3
+safetensors>=0.4.3,<1.0.0

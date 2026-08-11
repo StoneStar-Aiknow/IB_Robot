@@ -127,7 +127,7 @@ source .shrc_local
 
 | 技能 | 触发场景 |
 |------|---------|
-| [pi05-om-convert](.agents/skills/pi05-om-convert) | PI0.5/PI05 转 Ascend OM、ATC、FastGELU、profile、hardware_mock 验证 |
+| [om-convert](.agents/skills/om-convert) | Ascend OM 唯一入口、ACT/PI05 转换、新 policy 实验性支持开发及可选性能优化 |
 | [rknn-convert](.agents/skills/rknn-convert) | ONNX 转 RKNN、NPU 部署、模型转换 |
 | [hmm-convert](.agents/skills/hmm-convert) | PI0.5/SmolVLA 后摩 HMM 打包、xh2 编译、tcim、xhquant、LQ50/M50 |
 

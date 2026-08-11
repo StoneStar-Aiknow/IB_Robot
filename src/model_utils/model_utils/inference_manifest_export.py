@@ -258,7 +258,7 @@ def artifact_bindings(
     known_semantics = set(input_semantics.values()) | set(output_semantics.values())
     unexpected_layouts = sorted(set(layouts) - known_semantics)
     if unexpected_layouts:
-        raise ValueError(f"Image layouts reference unknown semantics: {unexpected_layouts}")
+        raise ValueError(f"Layouts reference unknown semantics: {unexpected_layouts}")
     return ArtifactBindings(
         inputs=tuple(_binding(tensor, input_semantics, layouts, "input") for tensor in abi.inputs),
         outputs=tuple(_binding(tensor, output_semantics, layouts, "output") for tensor in abi.outputs),
@@ -686,22 +686,17 @@ def _binding(
         semantic = semantics[tensor.name]
     except KeyError as exc:
         raise ValueError(f"No semantic mapping for runtime {direction} tensor {tensor.name!r}") from exc
-    is_image = (
-        semantic == "observation.image"
-        or semantic.startswith("observation.image.")
-        or semantic.startswith("observation.images.")
-    )
     declared_layout = image_layouts.get(semantic)
     runtime_layout = tensor.layout
     if declared_layout is not None and runtime_layout is not None and declared_layout != runtime_layout:
         raise ValueError(
-            f"Image semantic {semantic!r} declares layout {declared_layout}, but runtime ABI reports {runtime_layout}"
+            f"Semantic {semantic!r} declares layout {declared_layout}, but runtime ABI reports {runtime_layout}"
         )
     layout = runtime_layout or declared_layout
-    if is_image and layout is None:
-        raise ValueError(f"Image semantic {semantic!r} requires an explicit runtime layout")
-    if not is_image and layout is not None:
-        raise ValueError(f"Non-image semantic {semantic!r} cannot declare an image layout")
+    if len(tensor.shape) == 4 and layout is None:
+        raise ValueError(f"Rank-4 semantic {semantic!r} requires an explicit runtime layout")
+    if len(tensor.shape) != 4 and layout is not None:
+        raise ValueError(f"Non-rank-4 semantic {semantic!r} cannot declare a runtime layout")
     return TensorBinding(
         semantic=semantic,
         runtime_name=tensor.name,

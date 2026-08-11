@@ -59,7 +59,6 @@ cosine < 0.999 → ❌ FAIL（模型不等价）
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import time
@@ -367,26 +366,19 @@ def make_dummy_batch(
 # ---------------------------------------------------------------------------
 
 
-def load_real_batches_raw(batch_path: str) -> list[dict[str, np.ndarray]]:
-    """Load batches from a JSON file as numpy float32 dicts.
+def load_real_batches_raw(batch_path: str) -> list[dict[str, Any]]:
+    """Load a standard observation batch or legacy JSON as raw sample dicts.
 
     This returns *raw* numpy arrays — no tensor conversion, no device
     transfer, no tokenization.  Use :func:`preprocess_real_batches` to
     run the full preprocessing pipeline afterwards.
     """
+    from model_utils.observation_batch import load_observation_batch
+
     LOGGER.info("Loading batches from %s …", batch_path)
-    with open(batch_path, encoding="utf-8") as f:
-        raw_batches = json.load(f)
-
-    processed = []
-    for b in raw_batches:
-        batch: dict[str, np.ndarray] = {}
-        for k, v in b.items():
-            batch[k] = np.array(v).astype(np.float32)
-        processed.append(batch)
-
-    LOGGER.info("Loaded %d raw batch(es)", len(processed))
-    return processed
+    samples = load_observation_batch(batch_path).samples
+    LOGGER.info("Loaded %d raw batch(es)", len(samples))
+    return samples
 
 
 def remap_batch_keys(
@@ -416,7 +408,7 @@ def remap_batch_keys(
 
 
 def preprocess_real_batches(
-    raw_batches: list[dict[str, np.ndarray]],
+    raw_batches: list[dict[str, Any]],
     policy_path: str,
     full_policy,
     device: torch.device,
@@ -456,7 +448,8 @@ def preprocess_real_batches(
     result: list[dict[str, Tensor]] = []
     for raw_batch in raw_batches:
         obs = copy(raw_batch)  # avoid mutating the original
-        obs = prepare_observation_for_inference(obs, device, task)
+        batch_task = obs.pop("task", "")
+        obs = prepare_observation_for_inference(obs, device, task or batch_task)
         obs = preprocessor(obs)
         # The preprocessor's DeviceProcessorStep may move tensors to the
         # device stored in the checkpoint config (e.g. cuda:0).  Ensure

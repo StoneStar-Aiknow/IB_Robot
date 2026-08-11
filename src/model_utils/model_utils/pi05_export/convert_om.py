@@ -271,6 +271,7 @@ def write_pi05_ascend_deployment(
                 semantic: "NCHW"
                 for semantic in vlm_input_semantics.values()
                 if semantic.startswith("observation.images.")
+                or semantic in {"prefix_att_2d_masks_4d", "observation.prefix_att_2d_masks_4d"}
             },
         )
     if action_abi is not None:
