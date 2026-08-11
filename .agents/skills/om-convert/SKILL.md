@@ -57,7 +57,7 @@ Collect:
 | Torch host | Local/remote, SSH target when remote, IB-Robot path, bundle path, deployment, and device. |
 | Conversion host | Local/remote, SSH target when remote, IB-Robot path, bundle path, and experiment directory. |
 | Ascend host | Local/remote, SSH target when remote, IB-Robot path, deployed bundle path, deployment, and ACL device ID. |
-| Task and seed | Exact task for language policies and deterministic seed/noise settings. |
+| Task and seed | Task from the versioned batch by default, any explicit experiment override, and deterministic seed/noise settings. |
 | Remote execution | Whether the agent may execute commands over the user's existing SSH setup. Never request credentials. |
 
 If all roles use one host, ask once and record that the topology is shared. Host paths are independent:

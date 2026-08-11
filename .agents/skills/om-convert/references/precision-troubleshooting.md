@@ -103,6 +103,8 @@ error.
 
 Language policies must use the exact task stored in the versioned observation package unless the experiment
 explicitly defines an override. Never let a comparison script silently replace a batch task with a CLI task.
+For PI05 verification, omitting `--task` uses the batch task; passing `--task` explicitly defines and
+must record that experiment override.
 
 Before blaming OM, compare:
 

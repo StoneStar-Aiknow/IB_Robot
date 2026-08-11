@@ -88,8 +88,8 @@ STEPS: list[StepSpec] = [
     ),
     StepSpec(
         "verify",
-        "Run split-vs-monolithic equivalence verification (needs --task and --batch-path)",
-        param_deps=("task", "batch_path"),
+        "Run split-vs-monolithic equivalence verification (needs --batch-path)",
+        param_deps=("batch_path",),
         step_deps=("vlm_onnx", "ae_onnx"),
     ),
     StepSpec(
@@ -248,8 +248,9 @@ PARAMS: list[Param] = [
     Param(
         dest="task",
         cli="--task",
-        meaning="Task prompt required by the 'verify' step; must match the deployment default_task",
+        meaning="Optional explicit override for the task stored in the observation batch",
         example='"pick up the cup"',
+        default="",
     ),
     # The two paths below are normally derived from --exp-dir; kept as explicit
     # overrides for non-standard layouts.

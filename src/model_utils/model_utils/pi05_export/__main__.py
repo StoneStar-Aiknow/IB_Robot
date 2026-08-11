@@ -20,7 +20,7 @@ available steps are:
 
     vlm_onnx   Export the VLM (gemma_2b) to ONNX
     ae_onnx    Export the Action Expert (gemma_300m) to ONNX
-    verify     Split-vs-monolithic equivalence check   (needs --task and --batch-path)
+    verify     Split-vs-monolithic equivalence check   (needs --batch-path)
     vlm_quant  Quantize the VLM ONNX to W8A8           (needs --batch-path)
     ae_quant   Quantize the Action Expert ONNX to W8A8 (calib = runtime_save)
     vlm_om     Compile the VLM ONNX to OM via ATC      (needs --soc-version)
