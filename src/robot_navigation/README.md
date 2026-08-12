@@ -463,6 +463,103 @@ SIM_GUI=1 NAV_TEST_PROFILE=full colcon test --packages-select robot_config --bas
 | `topic_keyword_matched` | `/voice_asr/keyword_matched` | 语音命令话题 |
 | `topic_nav_stop` | `/voice_asr/nav_stop` | 语音停止导航话题 |
 
+### 导航原子命令接口
+
+LiDAR navigation 阶段提供独立于上层任务框架的单线执行接口：
+
+| 类型 | 名称 | 类型 | 说明 |
+|------|------|------|------|
+| Action | `/navigation/execute` | `ibrobot_msgs/action/ExecuteNavigation` | 下发绝对或相对目标，接收阶段、进度和最终结果 |
+| Service | `/navigation/cancel_current` | `std_srvs/srv/Trigger` | 中断当前受管目标并等待最终速度指令归零 |
+
+绝对目标使用 `map` frame。相对目标支持前进、后退、左右横移和左右旋转，并在请求时根据
+`map -> base_link` 固定目标位姿，再交给 Nav2 通过当前动态避障链规划和执行。接口同时只执行
+一个目标；需要改变目标时，调用方先等待 cancel service 成功，再发送新 Action goal。
+
+该接口提供两种调用方式：
+
+- `nav_cmd`：面向人工操作、现场验收和快速诊断的 CLI 包装。
+- `ExecuteNavigation` Action：面向其他 ROS 2 模块的程序化 API。业务模块应复用持久化的
+  `ActionClient`，避免每次启动 ROS CLI 进程产生发现延迟。
+
+#### CLI 用法
+
+CLI 的平移参数单位为米，转向参数单位为度：
+
+```bash
+ros2 run robot_navigation nav_cmd status
+ros2 run robot_navigation nav_cmd forward 0.10
+ros2 run robot_navigation nav_cmd backward 0.10
+ros2 run robot_navigation nav_cmd leftward 0.10
+ros2 run robot_navigation nav_cmd rightward 0.10
+ros2 run robot_navigation nav_cmd turn-left 10
+ros2 run robot_navigation nav_cmd turn-right 10
+ros2 run robot_navigation nav_cmd absolute 1.0 0.5 90
+ros2 run robot_navigation nav_cmd cancel
+```
+
+`status` 同时检查 `/navigation/execute` 和 Nav2 `/navigate_to_pose` 是否可用；`cancel` 会等待
+当前导航任务结束并确认安全速度输出归零。
+
+#### ROS 2 Action API
+
+其他模块可以直接使用 `ibrobot_msgs/action/ExecuteNavigation`，无需启动 CLI 子进程：
+
+```python
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.node import Node
+
+from ibrobot_msgs.action import ExecuteNavigation
+
+
+class NavigationCaller(Node):
+    def __init__(self):
+        super().__init__("navigation_caller")
+        self.client = ActionClient(self, ExecuteNavigation, "/navigation/execute")
+
+    def send_forward(self, distance_m):
+        goal = ExecuteNavigation.Goal()
+        goal.command_type = ExecuteNavigation.Goal.FORWARD
+        goal.value = distance_m
+        return self.client.send_goal_async(goal, feedback_callback=self.on_feedback)
+
+    def on_feedback(self, feedback_message):
+        feedback = feedback_message.feedback
+        self.get_logger().info(
+            f"state={feedback.state}, distance_remaining={feedback.distance_remaining:.3f} m"
+        )
+
+
+rclpy.init()
+node = NavigationCaller()
+node.client.wait_for_server()
+goal_future = node.send_forward(0.5)
+rclpy.spin_until_future_complete(node, goal_future)
+goal_handle = goal_future.result()
+if goal_handle is None or not goal_handle.accepted:
+    raise RuntimeError("navigation goal was rejected")
+
+result_future = goal_handle.get_result_async()
+rclpy.spin_until_future_complete(node, result_future)
+result = result_future.result().result
+if not result.success:
+    raise RuntimeError(f"navigation failed: {result.error_code} {result.message}")
+
+node.destroy_node()
+rclpy.shutdown()
+```
+
+API 中的 `value` 对平移命令使用米，对转向命令使用弧度；例如左转 10 度应设置为
+`math.radians(10.0)`。绝对目标使用 `ABSOLUTE_POSE`，`target_pose.header.frame_id` 必须为
+`map`，并填写 `target_pose.pose`。调用方可以通过 `goal_handle.cancel_goal_async()` 取消当前
+Action，也可以调用 `/navigation/cancel_current`，后者会在速度归零确认后返回。
+
+`ExecuteNavigation.Result` 提供 `success`、`error_code`、`message` 和
+`resolved_target_pose`；执行过程中的 `Feedback` 提供 `state`、`distance_remaining`、
+`estimated_time_remaining` 和 `number_of_recoveries`。接口同时只管理一个导航任务，业务模块在
+发送新目标前应先完成当前目标或等待取消服务成功。
+
 ### cmd_vel_bridge_node
 
 | 类型 | 话题 | 类型 | 方向 | QoS | 说明 |

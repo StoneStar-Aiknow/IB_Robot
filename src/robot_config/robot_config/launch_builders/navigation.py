@@ -124,6 +124,7 @@ def _generate_real_navigation(
     from robot_config.launch_builders.cmd_vel import generate_cmd_vel_nodes
     from robot_config.launch_builders.localization import generate_localization_nodes
     from robot_config.launch_builders.nav2 import generate_nav2_nodes
+    from robot_config.launch_builders.navigation_command import generate_navigation_command_nodes
     from robot_config.launch_builders.static_tf import generate_static_tf_nodes
     from robot_config.launch_builders.voice_nav import generate_voice_nav_nodes
 
@@ -135,6 +136,7 @@ def _generate_real_navigation(
 
     # 3. Nav2 bringup
     nodes.extend(generate_nav2_nodes(navigation_config, use_sim=use_sim))
+    nodes.extend(generate_navigation_command_nodes(navigation_config, use_sim=use_sim))
 
     # 4. CmdVel bridge (needs to know if EKF is running)
     ekf_rtabmap_config = navigation_config.get("ekf_rtabmap", {})

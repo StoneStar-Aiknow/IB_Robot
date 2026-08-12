@@ -154,6 +154,12 @@ robot:
           use_amcl: true
           auto_global_localization: true
           dyn_avoid_enabled: true
+        command_server:
+          enabled: true
+          action_name: /navigation/execute
+          cancel_service_name: /navigation/cancel_current
+          nav2_action_name: /navigate_to_pose
+          stop_velocity_topic: /cmd_vel_safe
         cmd_vel_bridge:
           enabled: true
           publish_odom: false

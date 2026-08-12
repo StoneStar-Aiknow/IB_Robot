@@ -48,6 +48,8 @@ setup(
             "save_lidar_map = robot_navigation.save_lidar_map:main",
             # Normalize official FAST-LIO odometry for navigation consumers.
             "fast_lio_odom_bridge = robot_navigation.fast_lio_odom_bridge:main",
+            "navigation_command_server = robot_navigation.navigation_command_server:main",
+            "nav_cmd = robot_navigation.nav_cmd:main",
         ],
     },
 )

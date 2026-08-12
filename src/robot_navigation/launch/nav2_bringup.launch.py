@@ -1,7 +1,14 @@
 import os
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
+from launch.actions import (
+    DeclareLaunchArgument,
+    ExecuteProcess,
+    GroupAction,
+    IncludeLaunchDescription,
+    SetEnvironmentVariable,
+    TimerAction,
+)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -117,20 +124,43 @@ def generate_launch_description():
         ),
     ]
 
-    navigation_bringup = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(os.path.join(nav2_bringup_dir, "launch", "navigation_launch.py")),
-        launch_arguments={
-            "namespace": namespace,
-            "use_sim_time": use_sim_time,
-            "autostart": autostart,
-            # Pass the rewritten file so profile-specific controller and costmap
-            # parameters reach navigation_launch.py, not only localization nodes.
-            "params_file": configured_params,
-            "use_composition": use_composition,
-            "use_respawn": use_respawn,
-            "container_name": "nav2_container",
-            "log_level": log_level,
-        }.items(),
+    navigation_bringup = GroupAction(
+        scoped=True,
+        actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(os.path.join(nav2_bringup_dir, "launch", "navigation_launch.py")),
+                launch_arguments={
+                    "namespace": namespace,
+                    "use_sim_time": use_sim_time,
+                    "autostart": "false",
+                    # Pass the rewritten file so profile-specific controller and costmap
+                    # parameters reach navigation_launch.py, not only localization nodes.
+                    "params_file": configured_params,
+                    "use_composition": use_composition,
+                    "use_respawn": use_respawn,
+                    "container_name": "nav2_container",
+                    "log_level": log_level,
+                }.items(),
+            )
+        ],
+    )
+
+    navigation_startup = TimerAction(
+        period=10.0,
+        condition=IfCondition(autostart),
+        actions=[
+            ExecuteProcess(
+                cmd=[
+                    "ros2",
+                    "service",
+                    "call",
+                    "/lifecycle_manager_navigation/manage_nodes",
+                    "nav2_msgs/srv/ManageLifecycleNodes",
+                    "{command: 0}",
+                ],
+                output="screen",
+            )
+        ],
     )
 
     collision_monitor_nodes = [
@@ -188,6 +218,7 @@ def generate_launch_description():
             stdout_linebuf_envvar,
             *localization_nodes,
             navigation_bringup,
+            navigation_startup,
             *collision_monitor_nodes,
         ]
     )

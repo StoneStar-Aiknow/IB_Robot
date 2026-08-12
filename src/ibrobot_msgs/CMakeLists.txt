@@ -76,6 +76,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/PlaceObject.action"
   "action/ArmReturnHome.action"
   "action/ExecuteAgentPlan.action"
+  "action/ExecuteNavigation.action"
   "srv/RecognizeFile.srv"
   "srv/SetHotwords.srv"
   "srv/MoveToConfiguration.srv"
