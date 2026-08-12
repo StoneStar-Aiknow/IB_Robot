@@ -58,9 +58,9 @@ def _host_plan_bindings() -> dict[str, ArtifactBindings]:
     }
 
 
-def test_artifact_bindings_accept_rank_four_non_image_layout():
+def test_artifact_bindings_accept_rank_four_non_image_without_layout():
     bindings = ArtifactBindings(
-        inputs=(_tensor("internal.past_key.0", "past_key_0", 0, (1, 4, 1, 2), layout="NCHW"),),
+        inputs=(_tensor("internal.past_key.0", "past_key_0", 0, (1, 4, 1, 2)),),
         outputs=(_tensor("action", "action", 0, (1, 2, 3)),),
     )
 

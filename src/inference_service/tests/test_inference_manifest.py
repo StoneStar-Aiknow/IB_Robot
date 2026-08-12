@@ -700,20 +700,32 @@ def test_vla_visual_bindings_allow_compiled_resize_dimensions(tmp_path, layout):
     assert validated.policy.policy_type == "smolvla"
 
 
-def test_rank_four_layout_validation_is_independent_of_semantic_prefix(tmp_path):
+def test_rank_four_layout_is_scoped_to_image_semantics(tmp_path):
     paths = tuple(path for path in create_policy_bundle(tmp_path) if path != "model.safetensors")
     manifest = make_manifest(tmp_path, paths, deployment_name="rk3588", compiled=True)
     image_binding = manifest["deployments"]["rk3588"]["bindings"]["policy"]["inputs"][1]
-    image_binding["semantic"] = "depth.frame"
-    write_manifest(tmp_path, manifest)
 
+    image_binding["semantic"] = "depth.frame"
+    del image_binding["layout"]
+    write_manifest(tmp_path, manifest)
+    validated = load_inference_manifest(tmp_path, "rk3588")
+    assert validated.deployment.bindings["policy"].inputs[1].layout is None
+
+    image_binding["layout"] = "NCHW"
+    write_manifest(tmp_path, manifest)
     validated = load_inference_manifest(tmp_path, "rk3588")
     assert validated.deployment.bindings["policy"].inputs[1].layout == "NCHW"
 
+    image_binding["semantic"] = "observation.images.top"
     del image_binding["layout"]
     write_manifest(tmp_path, manifest)
     with pytest.raises(ManifestValidationError, match=r"layout.*required"):
         load_inference_manifest(tmp_path, "rk3588")
+
+    image_binding["layout"] = "NCHW"
+    write_manifest(tmp_path, manifest)
+    validated = load_inference_manifest(tmp_path, "rk3588")
+    assert validated.deployment.bindings["policy"].inputs[1].layout == "NCHW"
 
 
 def test_selected_bundle_and_artifact_paths_cannot_duplicate(tmp_path):

@@ -676,6 +676,14 @@ def _tcim_dtype(value: object, name: str, path: Path) -> str:
     raise ValueError(f"TCIM tensor {name!r} has unsupported dtype code={code!r}, bits={bits!r}: {path}")
 
 
+def _is_image_semantic(semantic: str) -> bool:
+    return (
+        semantic == "observation.image"
+        or semantic.startswith("observation.image.")
+        or semantic.startswith("observation.images.")
+    )
+
+
 def _binding(
     tensor: RuntimeTensor,
     semantics: Mapping[str, str],
@@ -693,8 +701,9 @@ def _binding(
             f"Semantic {semantic!r} declares layout {declared_layout}, but runtime ABI reports {runtime_layout}"
         )
     layout = runtime_layout or declared_layout
-    if len(tensor.shape) == 4 and layout is None:
-        raise ValueError(f"Rank-4 semantic {semantic!r} requires an explicit runtime layout")
+    needs_layout = len(tensor.shape) == 4 and _is_image_semantic(semantic)
+    if needs_layout and layout is None:
+        raise ValueError(f"Rank-4 image semantic {semantic!r} requires an explicit runtime layout")
     if len(tensor.shape) != 4 and layout is not None:
         raise ValueError(f"Non-rank-4 semantic {semantic!r} cannot declare a runtime layout")
     return TensorBinding(

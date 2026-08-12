@@ -379,7 +379,6 @@ def _smolvla_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
                         "index": 0,
                         "dtype": "float32",
                         "shape": [1, 8, 1, 2],
-                        "layout": "NCHW",
                     },
                     {
                         "semantic": "internal.past_value.0",
@@ -387,7 +386,6 @@ def _smolvla_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
                         "index": 1,
                         "dtype": "float32",
                         "shape": [1, 8, 1, 2],
-                        "layout": "NCHW",
                     },
                 ],
             },
@@ -420,7 +418,6 @@ def _smolvla_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
                         "index": 3,
                         "dtype": "float32",
                         "shape": [1, 8, 1, 2],
-                        "layout": "NCHW",
                     },
                     {
                         "semantic": "internal.past_value.0",
@@ -428,7 +425,6 @@ def _smolvla_context(tmp_path: Path, *, runtime_options=None) -> RuntimeContext:
                         "index": 4,
                         "dtype": "float32",
                         "shape": [1, 8, 1, 2],
-                        "layout": "NCHW",
                     },
                 ],
                 "outputs": [

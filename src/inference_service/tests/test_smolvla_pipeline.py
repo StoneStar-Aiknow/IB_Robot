@@ -40,7 +40,8 @@ _ACTION_SHAPE = (1, _CHUNK, _STATE_DIM)
 
 
 def _tensor(semantic: str, index: int, dtype: str, shape: tuple[int, ...]) -> TensorBinding:
-    layout = "NCHW" if len(shape) == 4 else None
+    is_image = semantic.startswith("observation.images.") or semantic.startswith("observation.image.")
+    layout = "NCHW" if len(shape) == 4 and is_image else None
     return TensorBinding(semantic=semantic, runtime_name=semantic, index=index, dtype=dtype, shape=shape, layout=layout)
 
 
@@ -338,7 +339,8 @@ def test_smolvla_embedding_operation_matches_reference_and_declared_dtypes():
 def _binding_dict(
     semantic: str, name: str, index: int, dtype: str, shape: list[int], *, layout: str | None = None
 ) -> dict[str, object]:
-    if layout is None and len(shape) == 4:
+    is_image = semantic.startswith("observation.images.") or semantic.startswith("observation.image.")
+    if layout is None and len(shape) == 4 and is_image:
         layout = "NCHW"
     result: dict[str, object] = {
         "semantic": semantic,
