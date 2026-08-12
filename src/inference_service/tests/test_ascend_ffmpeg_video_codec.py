@@ -276,6 +276,7 @@ def test_encoder_command_environment_rtp_and_timestamp_pairing(tmp_path: Path):
     assert _option(command, "-device_id") == "2"
     assert _option(command, "-channel_id") == "3"
     assert _option(command, "-pix_fmt") == "nv12"
+    assert _option(command, "-bf") == "0"
     assert command[-1].startswith("rtp://127.0.0.1:24000?")
     assert kwargs["env"]["LD_LIBRARY_PATH"].startswith(str(prefix / "lib"))
     assert packets[0].capture_timestamp_ns == 987_654
