@@ -1,6 +1,6 @@
 ---
 name: ibrobot-control
-description: "Use when a user asks Hermes or an Agent to discover, validate, execute, cancel, or stop IB-Robot capabilities through the `robot-skill` CLI and ROS Capability Gateway. Covers 'run a robot skill', 'execute robot action', 'cancel motion', 'stop robot', '执行机器人动作', '取消动作', '停止机器人', 'nod', 'wave', 'celebrate', 'look around', or interact with existing high-level robot skills. Requires the exact plan to be presented and flushed before any physical motion; the user aborts a wrong plan with 别动 during execution; never bypasses the Gateway or calls raw ros2 / MoveIt / controller commands directly."
+description: "Use when a user asks Hermes or an Agent to discover, validate, execute, cancel, stop, or query IB-Robot capabilities and visual games through the `robot-skill` CLI and ROS Capability Gateway. Covers 'run a robot skill', 'execute robot action', 'cancel motion', 'stop robot', 'play a visual game', 'query a game result', '执行机器人动作', '取消动作', '停止机器人', '玩视觉游戏', '查询游戏结果', 'nod', 'wave', 'celebrate', 'look around', or interact with existing high-level robot skills. Requires the exact motion plan to be presented and flushed before physical motion; the user aborts a wrong plan with 别动 during execution. Never bypass the Gateway or call raw ros2 / MoveIt / controller commands directly."
 ---
 
 # IB-Robot Control
@@ -62,7 +62,8 @@ exact result and stop; do not retry alternate phrasings and do not split the req
 
 When the operator asks to activate edited robot Skill YAML without restarting the robot, run exactly one
 `robot-skill reload-catalog --request-id REQUEST_ID --force`. This reloads only the Gateway's configured catalog source;
-it does not accept another path. Report `old_generation`, `generation`, `changed_skills`, and diagnostics. Then run
+it does not accept another path and does not reload visual-game configuration or handlers. Report `old_generation`,
+`generation`, `changed_skills`, and diagnostics. Then run
 `robot-skill status` and require its registry identity to match the reload result before creating any new plan. A reload
 timeout has an unknown activation result: stop and ask for a new user request before checking or retrying.
 
@@ -119,6 +120,32 @@ A reference implementation of this loop (catalog discovery, out-of-catalog rejec
 stop-to-definite-terminal, and fresh-state continuation) lives in
 `robot_skill_cli.interactive_control.InteractiveController` and is unit-tested without a ROS stack.
 
+## Visual Games
+
+Visual games are non-motion capabilities with a separate asynchronous control surface:
+
+1. Discover enabled games with `robot-skill list-games`.
+2. Read the selected contract with `robot-skill describe-game GAME`.
+3. Create a fresh caller-owned request ID, then run
+   `robot-skill start-game GAME --request-id ID`.
+4. Poll `robot-skill game-result --request-id ID` about once per second. Stop after the described
+   `timeout_sec`; make one final query and report timeout or uncertainty if no terminal result is available.
+5. Report the terminal structured result to the caller. Do not invoke an Agent TTS tool: when configured, the runtime
+   announcer sends terminal text through `VisualGameEvent`, `/voice_tts/synthesize`, and the existing local
+   `/voice_tts/play` service.
+
+The CLI only starts and queries games. It must not play audio, wait indefinitely inside `start-game`, or retry a failed
+game with a new request ID. If `start-game` loses its service response, querying or repeating the exact same game and
+request ID within the advertised result-retention window is allowed: the Gateway treats that as idempotent recovery and
+does not start a second request while the retained record exists. After retention expires the ID is no longer reserved,
+so callers must not reuse it.
+
+Game discovery exposes every enabled game. Visual games are started only through this Agent control surface; ASR and
+task entry do not trigger them. `PERCEPTION_UNAVAILABLE` means the configured perception request topic has
+no live subscriber; do not launch or restart infrastructure. `GAME_CAPACITY_EXHAUSTED` means the retained-result ledger
+is full; records inside the advertised retention window are never evicted early, so wait for expiry or report the
+capacity failure instead of retrying with a new request ID.
+
 ## Hard Boundaries
 
 - The Agent **must not launch or restart the pipeline**.
@@ -128,7 +155,7 @@ stop-to-definite-terminal, and fresh-state continuation) lives in
 - The Agent **must not call Python, `uuidgen`, `date`, a shell, or another helper tool to generate request/task IDs**.
 - The Agent **must not call primitive, MoveIt, controller, or raw ros2 motion commands**.
 - The Agent must not copy `docs/ib_robot_social_skill.md` as a control Skill.
-- The Agent **must not automatically retry after failure, timeout, or unknown result**, including with a new task ID.
+- The Agent **must not automatically retry after failure, timeout, or unknown result** with a new task/request ID.
 
 ## Quick Reference
 
@@ -136,6 +163,9 @@ stop-to-definite-terminal, and fresh-state continuation) lives in
 |---|---|
 | Catalog-only request | Use catalog commands; no motion confirmation is needed. |
 | Runtime unavailable/unauthorized | Report the CLI error; do not start or alter infrastructure. |
+| Visual-game perception unavailable | Report `PERCEPTION_UNAVAILABLE`; do not launch or restart perception. |
+| Visual-game result ledger full | Report `GAME_CAPACITY_EXHAUSTED`; retained terminal results are not evicted early. |
+| No clearly visible person | Report `NO_PERSON`; do not announce or invent a game result. |
 | Terminal result | Report only public status/error fields. |
 | Stop state unknown | Report uncertainty and send no new motion. |
 

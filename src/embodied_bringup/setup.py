@@ -12,6 +12,7 @@ setup(
         ("share/" + package_name + "/launch", ["launch/embodied_pipeline.launch.py"]),
     ],
     install_requires=["setuptools"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="liuweihong",
     maintainer_email="liuweihong8@huawei.com",

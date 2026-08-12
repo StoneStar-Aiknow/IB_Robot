@@ -24,7 +24,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | **ibrobot-worktree-env** | 在 `git worktree` 中复用主仓库 venv，避免主仓库/worktree 混合环境导致测错分支 |
 | **ibrobot-architecture** | 理解 SSOT 架构设计、配置规范与数据流 |
 | **ibrobot-robot-skill-design** | 交互式设计机器人 skill，明确 anchor、动作空间、安全链路、catalog 暴露和验证计划 |
-| **ibrobot-control** | 通过 `robot-skill` 发现、校验、执行或取消现有机器人高层技能 |
+| **ibrobot-control** | 通过 `robot-skill` 操作现有机器人高层技能或异步视觉游戏 |
 
 ### 🔌 板端（OpenHarmony）
 
@@ -113,6 +113,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 启动机器人仿真或 OpenHarmony 板端运行 → ibrobot-launch
 设计一个新的机器人动作           → ibrobot-robot-skill-design
 让 Hermes 执行一个现有庆祝动作   → ibrobot-control
+让 Agent 玩分院帽视觉游戏         → ibrobot-control
 初始化环境                      → ibrobot-env
 跑一下测试 / pytest             → ibrobot-env（环境前缀由它保证）
 在 worktree 中跑代码             → ibrobot-worktree-env

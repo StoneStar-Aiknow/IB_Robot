@@ -1,7 +1,7 @@
 # robot_skill_cli
 
-`robot_skill_cli` 提供稳定的 `robot-skill` 命令行接口，将 Agent 的技能发现、校验、执行和取消请求限定在
-ROS Capability Gateway 的公开边界内。默认 Agent 控制链路为：
+`robot_skill_cli` 提供稳定的 `robot-skill` 命令行接口，将 Agent 的运动技能请求限定在 ROS Capability
+Gateway 的公开边界内，并为非运动视觉游戏提供独立的异步 start/query 控制面。默认 Agent 控制链路为：
 
 ```text
 Hermes -> ibrobot-control Agent Skill -> robot-skill -> ROS Capability Gateway
@@ -28,6 +28,8 @@ source install/local_setup.sh
 | 命令 | ROS | 用途 |
 |---|---:|---|
 | `list-skills` | 否 | 列出所有启用的高层技能及公开描述 |
+| `list-games` | 否 | 列出配置中已启用且允许 Agent 触发的视觉游戏 |
+| `describe-game GAME` | 否 | 查看视觉游戏输入、结果 schema、timeout 和配置摘要 |
 | `describe SKILL` | 否 | 查看参数 schema、单位、语义描述和 timeout policy |
 | `list-poses` | 否 | 列出公开命名位姿 |
 | `status` | 是 | 读取 Gateway 授权、控制模式、readiness、busy 和 ledger 状态 |
@@ -41,9 +43,11 @@ source install/local_setup.sh
 | `execute-plan ... --plan-id ID --plan-digest DIGEST --registry-* ... --expected-step-count N` | 是 | 执行已确认的 Agent plan，并以展示过的 tuple 校验终态 |
 | `cancel-plan --task-id ID --plan-id ID --plan-digest DIGEST --registry-* ... --expected-step-count N` | 是 | 请求取消并以展示过的 tuple 校验终态 |
 | `robot-skill-closed-loop ...` | 是 | 展示 Workflow 后立即执行，并验证「别动」和安全 continuation 门禁 |
+| `start-game GAME --request-id ID` | 是 | 以调用方 ID 幂等发起视觉游戏 |
+| `game-result --request-id ID` | 是 | 查询视觉游戏的 pending/terminal 结果 |
 
 catalog-only 命令不初始化 `rclpy`，只读取本地归一化配置。runtime 命令只访问 Gateway status、
-`ValidateSkill`、`SkillCommand`、Agent plan services/actions 和标准 `CancelGoal` 接口。
+`ValidateSkill`、`SkillCommand`、Agent plan services/actions 和标准 `CancelGoal` 接口；视觉游戏 runtime 命令只访问 start/result 服务。
 
 ```bash
 robot-skill --config-name so101_single_arm list-skills
@@ -81,6 +85,11 @@ robot-skill --config-name so101_single_arm cancel-plan \
   --task-id agent-task-001 --plan-id PLAN_ID --plan-digest PLAN_DIGEST \
   --registry-epoch REGISTRY_EPOCH --registry-generation REGISTRY_GENERATION \
   --registry-digest REGISTRY_DIGEST --expected-step-count 1
+
+robot-skill --config-name so101_single_arm list-games
+robot-skill --config-name so101_single_arm describe-game sorting_hat
+robot-skill --config-name so101_single_arm start-game sorting_hat --request-id game-20260803-001
+robot-skill --config-name so101_single_arm game-result --request-id game-20260803-001
 ```
 
 可用 typed flags 为 `--target-name`、`--place-name`、`--motion-direction`、`--motion-distance` 和
@@ -90,8 +99,32 @@ robot-skill --config-name so101_single_arm cancel-plan \
 
 `list-skills` 输出 `robot_name`、`config_digest` 和技能数组；每个技能只含 `name`、`summary`、`domain`、
 `moves_robot`、`required_control_mode`。`describe SKILL` 在这些字段之外输出该技能的 `parameters`、
-`recovery_policy`、完整 `timeout_policy` 和 `config_digest`。`list-poses` 只输出命名位姿名称，不输出坐标。
+`recovery_policy`、运动能力 `timeout_policy` 和 `config_digest`。`list-poses` 只输出命名位姿名称，不输出坐标。
 primitive sequence、目标绑定、关节值和 ROS transport 名称不属于 CLI catalog。
+
+`list-games` 只公开已启用游戏的 `name`、`summary`、`result_field` 和视觉游戏 `config_digest`；
+四个视觉游戏命令使用独立的轻量配置上下文，不编译运动 Skill catalog，也不要求 MoveIt 或
+`robot_description` 才能完成发现、启动和查询。
+`describe-game` 进一步公开 required inputs、结果 schema、timeout、retention 与 ledger capacity。视觉游戏不属于运动 capability，因此不进入
+`list-skills`、`ValidateSkill` 或 `SkillCommand`。
+
+### 视觉游戏与 TTS
+
+`start-game` 使用调用方提供的 request ID，通过视觉游戏控制服务幂等发起请求，不等待 VLM 结果；
+在 advertised retention 窗口内，同 ID、同游戏的重复 start 返回原请求且不重复执行，同 ID、不同游戏被拒绝。
+记录过期后 Gateway 不再保留该 ID，也不再保证检测重复；调用方应始终生成全局唯一 ID。`game-result` 按 ID
+查询 Gateway 保存的 pending/terminal 结果；
+pending 超过配置 deadline 会收敛为 `GAME_RESULT_TIMEOUT`。`sorting_hat` 成功终态中的 `scene_summary` 已由
+perception response contract 约束为四学院之一；没有清晰可见的人时 Gateway 返回 `NO_PERSON` 失败终态，
+不会向调用方暴露可播报的 `scene_summary`。Agent 仍应轮询至 `terminal=true` 获取结构化结果，但不得把结果
+再次交给自身 TTS；运行时统一由
+`VisualGameEvent -> visual_game_announcer_node -> /voice_tts/synthesize -> /voice_tts/play`
+完成本机合成和播放。TTS 或播放服务不可用时跳过，CLI 不负责声卡播放。
+`start-game` 的 accepted 仅表示 Gateway 已记账并把请求交给一个在线 subscriber；相机或 VLM 的运行时错误会在
+后续 `game-result` 中作为失败终态返回。
+
+CLI 与运行中 Gateway 必须使用相同的视觉游戏 `config_digest`。start service 响应丢失时，可以查询同一 ID，
+或在 retention 窗口内用完全相同的 game/ID 重发 start 进行幂等恢复；不得换新 ID 自动重试。
 
 ## 调用顺序
 
@@ -193,11 +226,18 @@ pipeline 时显式授权。未授权状态下仍可使用 catalog、`status` 和
 hermes-robot --config-name so101_single_arm
 hermes-robot --config-name lekiwi_handeye_realsense_grasp -- --cli
 hermes-robot --config-name lekiwi_handeye_realsense_grasp_pc -- --cli
+hermes-robot --config-name so101_single_arm --mode visual-games
+hermes-robot --config-name so101_single_arm --mode motion
+hermes-robot --config-name so101_single_arm --mode both
 ```
 
 启动器要求 Hermes Agent `0.16.0` 或更新版本，并在启动前验证 `hermes`、`robot-skill`、安装空间中的
-`ibrobot-control`、目标 robot config、Gateway control-plane status 以及全部 Agent plan service/action。
-启动时会将安装空间中的 `ibrobot-control` 幂等注册到当前 Hermes profile 的 `skills/` 目录；仅更新带有
+`ibrobot-control`、目标 robot config 以及所选控制面的 ROS 接口。`--mode visual-games` 只预检独立的
+`StartVisualGame` / `GetVisualGameResult` service，不要求 MoveIt、Skill Gateway 或 Agent plan interfaces；
+`--mode motion` 预检 Gateway status 和全部 Agent plan service/action；`--mode both` 同时预检两套接口。
+默认 `--mode auto` 按配置能力选择：仅有已启用视觉游戏时预检视觉游戏接口，仅有运动 catalog 时维持运动
+预检，两者都有时预检两套接口。显式 `--mode` 可用于只检查其中一个控制面。启动时会将安装空间中的
+`ibrobot-control` 幂等注册到当前 Hermes profile 的 `skills/` 目录；仅更新带有
 `robot_skill_cli` 所有权标记的副本，遇到同名的用户自管 skill 时会以 `AGENT_SKILL_CONFLICT` 退出。
 `motion_authorized=false` 不阻止 Hermes 启动，只会继续由 Gateway 拒绝运动。启动器仅设置精确
 `ROBOT_CONFIG` 并预加载 `ibrobot-control`；它不会启动/重启 pipeline、修改 ROS 参数或开启运动授权。
@@ -205,6 +245,10 @@ hermes-robot --config-name lekiwi_handeye_realsense_grasp_pc -- --cli
 `--config-path`。自然语言抓取与其他 motion Skill 使用同一套
 `status -> list-skills -> plan-workflow -> describe -> validate-plan -> confirm-plan -> execute-plan` 生命周期；
 抓取计划使用 `pick_object` 和必填的 `target_name`，Gateway 再将其委派给配置绑定的 `grasp_pipeline`。
+
+运动 catalog 的 `reload-catalog` 是显式、受控的运行时 snapshot 切换，不是自动监听文件。视觉游戏当前
+不支持热加载：YAML 配置变更需要重启 pipeline，Python handler 变更需要重新构建并重启；
+`reload-catalog` 不会更新视觉游戏。
 
 SO-101 真机的完整手动验证步骤见
 [`docs/hermes_so101_real_robot_manual_validation_zh.md`](../../docs/hermes_so101_real_robot_manual_validation_zh.md)。

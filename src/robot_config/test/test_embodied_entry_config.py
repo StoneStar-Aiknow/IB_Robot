@@ -9,6 +9,7 @@ from robot_config.loader import (
     validate_config,
     validate_embodied_launch_dict,
 )
+from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from robot_skill_cli.catalog import compile_local_snapshot
 
 GRIPPER_TRAJECTORY_DURATION_SEC = 1.0
@@ -16,6 +17,25 @@ GRIPPER_TRAJECTORY_DURATION_SEC = 1.0
 
 def _snapshot(config_path: Path):
     return compile_local_snapshot(load_robot_config_dict(config_path), config_path)
+
+
+def _sorting_hat_policy(*, enabled: bool, announce: bool = False) -> dict:
+    return {
+        "enabled": enabled,
+        "announce": announce,
+        "handler": "sorting_hat_v1",
+        "summary": "Choose a Hogwarts house.",
+    }
+
+
+def _voice_tts(**overrides) -> dict:
+    return {
+        "enabled": True,
+        "bundle_path": "models/voice_tts/zipvoice",
+        "deployment": "test_deployment",
+        "service_name": "/voice_tts/synthesize",
+        **overrides,
+    }
 
 
 @pytest.mark.parametrize(
@@ -97,15 +117,19 @@ def test_production_robot_yaml_has_no_inline_skill_catalog():
     assert embodied["skill_catalog_profile"] == "so101_single_arm"
 
 
-def test_embodied_entry_visual_games_typed():
-    """entry.visual_games must survive the typed loader (SSOT), not be dropped."""
+def test_embodied_visual_games_are_typed_without_asr_routing_config():
     config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
     config = load_robot_config(config_path)
 
-    games = config.embodied.entry["visual_games"]
+    games = config.embodied.visual_games
     sorting_hat = games["sorting_hat"]
     assert "enabled" in sorting_hat
-    assert sorting_hat["trigger_aliases"]
+    assert sorting_hat["handler"] == "sorting_hat_v1"
+    assert sorting_hat["summary"]
+    assert "trigger_mode" not in sorting_hat
+    assert not hasattr(config.embodied, "entry")
+    assert config.embodied.start_visual_game_service == "/embodied/start_visual_game"
+    assert config.embodied.get_visual_game_result_service == "/embodied/get_visual_game_result"
 
 
 def test_enabled_game_requires_perception_enabled():
@@ -115,7 +139,7 @@ def test_enabled_game_requires_perception_enabled():
 
     config.embodied.enabled = True
     config.embodied.perception = {**config.embodied.perception, "enabled": False}
-    config.embodied.entry = {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}}
+    config.embodied.visual_games = {"sorting_hat": _sorting_hat_policy(enabled=True)}
 
     errors = validate_config(config)
     assert any("visual_games" in error for error in errors)
@@ -128,7 +152,7 @@ def test_disabled_games_do_not_require_perception():
 
     config.embodied.enabled = True
     config.embodied.perception = {**config.embodied.perception, "enabled": False}
-    config.embodied.entry = {"visual_games": {"sorting_hat": {"enabled": False, "trigger_aliases": ["分院帽"]}}}
+    config.embodied.visual_games = {"sorting_hat": _sorting_hat_policy(enabled=False)}
 
     errors = validate_config(config)
     assert not any("visual_games" in error for error in errors)
@@ -140,24 +164,133 @@ def test_launch_dict_enabled_game_without_perception_is_rejected():
         "embodied": {
             "enabled": True,
             "perception": {"enabled": False},
-            "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
+            "visual_games": {"sorting_hat": _sorting_hat_policy(enabled=True, announce=True)},
         }
     }
     errors = validate_embodied_launch_dict(config)
     assert any("visual_games" in error for error in errors)
 
 
-def test_launch_dict_enabled_game_with_perception_is_rejected_in_hermes_mode():
+def test_raw_loader_rejects_enabled_game_without_perception(tmp_path):
+    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    copied_config = yaml.safe_load(source_path.read_text(encoding="utf-8"))
+    copied_config["robot"]["embodied"]["enabled"] = True
+    copied_config["robot"]["embodied"]["perception"]["enabled"] = False
+    copied_config["robot"]["embodied"]["visual_games"]["sorting_hat"]["enabled"] = True
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(yaml.safe_dump(copied_config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="embodied.perception.enabled"):
+        load_robot_config_dict(config_path)
+
+
+def test_launch_dict_enabled_game_with_perception_is_accepted_in_hermes_mode():
+    """Visual games coexist with the Hermes runtime via an independent gateway control plane."""
     config = {
+        "voice_tts": _voice_tts(),
         "embodied": {
             "enabled": True,
             "entry_mode": "hermes",
             "perception": {"enabled": True},
-            "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
-        }
+            "visual_games": {"sorting_hat": _sorting_hat_policy(enabled=True, announce=True)},
+        },
     }
     errors = validate_embodied_launch_dict(config)
-    assert any("voice entry mode" in error for error in errors)
+    assert errors == []
+
+
+def test_launch_dict_rejects_removed_visual_game_trigger_mode():
+    config = {
+        "embodied": {
+            "enabled": True,
+            "perception": {"enabled": True},
+            "visual_games": {"sorting_hat": {**_sorting_hat_policy(enabled=True), "trigger_mode": "asr"}},
+        },
+    }
+    errors = validate_embodied_launch_dict(config)
+    assert any("trigger_mode" in error and "no longer supports" in error for error in errors)
+
+
+@pytest.mark.parametrize("entry", [{}, {"visual_game_aliases": {"sorting_hat": ["分院帽"]}}])
+def test_launch_dict_rejects_removed_visual_game_entry(entry):
+    config = {
+        "embodied": {
+            "enabled": True,
+            "perception": {"enabled": True},
+            "visual_games": {"sorting_hat": _sorting_hat_policy(enabled=True)},
+            "entry": entry,
+        },
+    }
+
+    errors = validate_embodied_launch_dict(config)
+    assert any("embodied.entry is no longer supported" in error for error in errors)
+
+
+def test_launch_dict_rejects_colliding_visual_game_service_names():
+    """Launch overrides that collide start/result services are caught by the raw-dict gate."""
+    config = {
+        "embodied": {
+            "enabled": True,
+            "perception": {"enabled": True},
+            "visual_games": {"sorting_hat": _sorting_hat_policy(enabled=True)},
+            "start_visual_game_service": "/embodied/same",
+            "get_visual_game_result_service": "/embodied/same",
+        },
+    }
+    errors = validate_embodied_launch_dict(config)
+    assert any("must be different" in error for error in errors)
+
+
+def test_launch_dict_rejects_non_positive_visual_game_result_capacity():
+    config = {
+        "embodied": {
+            "enabled": True,
+            "perception": {"enabled": True},
+            "visual_games": {"sorting_hat": _sorting_hat_policy(enabled=True)},
+            "visual_game_result_capacity": 0,
+        },
+    }
+    errors = validate_embodied_launch_dict(config)
+    assert any("result_capacity must be a positive integer" in error for error in errors)
+
+
+def test_launch_dict_enabled_game_does_not_require_tts_runtime():
+    config = {
+        "voice_tts": {"enabled": False},
+        "embodied": {
+            "enabled": True,
+            "perception": {"enabled": True},
+            "visual_games": {"sorting_hat": _sorting_hat_policy(enabled=True, announce=True)},
+        },
+    }
+
+    assert validate_embodied_launch_dict(config) == []
+
+
+def test_typed_enabled_game_does_not_require_complete_tts_config():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config = load_robot_config(config_path)
+    config.embodied.enabled = True
+    config.embodied.perception = {**config.embodied.perception, "enabled": True}
+    config.embodied.visual_games = {"sorting_hat": _sorting_hat_policy(enabled=True, announce=True)}
+    config.voice_tts.enabled = True
+    config.voice_tts.deployment = ""
+
+    errors = validate_config(config)
+    assert "voice_tts.deployment is required when voice_tts.enabled is true" in errors
+    assert not any("when visual games" in error for error in errors)
+
+
+def test_visual_game_timeout_must_exceed_model_idle_timeout():
+    with pytest.raises(ValueError, match="visual_game_timeout_sec.*greater than model_idle_timeout_sec"):
+        resolve_embodied_timeout_policy(
+            {
+                "timeouts": {
+                    "model_idle_timeout_sec": 30.0,
+                    "visual_game_timeout_sec": 30.0,
+                }
+            }
+        )
 
 
 def test_launch_dict_skips_when_embodied_disabled():
@@ -166,10 +299,64 @@ def test_launch_dict_skips_when_embodied_disabled():
         "embodied": {
             "enabled": False,
             "perception": {"enabled": False},
-            "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
+            "visual_games": {"sorting_hat": _sorting_hat_policy(enabled=True, announce=True)},
         }
     }
     assert validate_embodied_launch_dict(config) == []
+
+
+def test_launch_dict_unknown_visual_game_handler_is_rejected():
+    policy = _sorting_hat_policy(enabled=False)
+    policy["handler"] = "missing_v1"
+    errors = validate_embodied_launch_dict(
+        {"embodied": {"enabled": True, "perception": {"enabled": False}, "visual_games": {"bad": policy}}}
+    )
+
+    assert any("unsupported visual game handler" in error for error in errors)
+
+
+def test_raw_loader_rejects_unknown_visual_game_handler_when_embodied_disabled(tmp_path):
+    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    copied_config = yaml.safe_load(source_path.read_text(encoding="utf-8"))
+    copied_config["robot"]["embodied"]["enabled"] = False
+    copied_config["robot"]["embodied"]["visual_games"]["sorting_hat"]["handler"] = "missing_v1"
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(yaml.safe_dump(copied_config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unsupported visual game handler"):
+        load_robot_config_dict(config_path)
+
+
+def test_raw_loader_rejects_removed_entry_scoped_visual_games(tmp_path):
+    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    copied_config = yaml.safe_load(source_path.read_text(encoding="utf-8"))
+    embodied = copied_config["robot"]["embodied"]
+    embodied["entry"] = {"visual_games": {"sorting_hat": {"enabled": False, "trigger_aliases": ["分院帽"]}}}
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(yaml.safe_dump(copied_config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="embodied.entry is no longer supported"):
+        load_robot_config_dict(config_path)
+
+
+def test_visual_game_service_names_must_be_distinct():
+    config_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    config = load_robot_config(config_path)
+    config.embodied.get_visual_game_result_service = config.embodied.start_visual_game_service
+
+    assert any("start and result services must be different" in error for error in validate_config(config))
+
+
+def test_raw_loader_rejects_duplicate_visual_game_service_names(tmp_path):
+    source_path = Path(__file__).parent.parent / "config" / "robots" / "so101_single_arm.yaml"
+    copied_config = yaml.safe_load(source_path.read_text(encoding="utf-8"))
+    embodied = copied_config["robot"]["embodied"]
+    embodied["get_visual_game_result_service"] = embodied["start_visual_game_service"]
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(yaml.safe_dump(copied_config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="start and result services must be different"):
+        load_robot_config_dict(config_path)
 
 
 def test_embodied_config_keeps_only_supported_direct_skills():

@@ -11,7 +11,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-from embodied_common.rgbd_snapshot import KNOWN_REQUIRED_INPUTS
+from embodied_common.perception_contracts import KNOWN_REQUIRED_INPUTS, validate_result_schema
 from ibrobot_msgs.msg import SceneAnalysisRequest, SceneAnalysisResult, SceneObject, SceneObservation
 from perception_service.api_client import VLMAPIClient
 from perception_service.object_parser import attributes_to_json, parse_grounded_objects
@@ -148,28 +148,22 @@ class PerceptionServiceNode(Node):
         Absence of the ``response_contract`` key means there is no contract to
         enforce. If the key is present, the declaration itself must be valid:
         malformed values, missing ``kind``, and unsupported kinds are contract
-        errors. Only ``kind == "enum"`` is supported today.
+        errors. Validation is shared with the visual-game Gateway so supported
+        schema kinds cannot drift between the two boundaries.
         """
         if "response_contract" not in user_context:
             return None
-        contract = user_context.get("response_contract")
-        if not isinstance(contract, dict):
-            return "response_contract must be a JSON object"
-        kind = contract.get("kind")
-        if kind != "enum":
-            return f"unsupported response_contract.kind: {kind!r}"
-        field = contract.get("field")
-        if not isinstance(field, str) or not field:
-            return "response_contract.field must be a non-empty string"
-        allowed = contract.get("allowed_values")
-        if not isinstance(allowed, list) or not allowed:
-            return "response_contract.allowed_values must be a non-empty list"
-        if not hasattr(analysis, field):
-            return f"response_contract references unknown result field: {field!r}"
-        value = getattr(analysis, field)
-        if not isinstance(value, str) or value not in allowed:
-            return f"result field {field!r}={value!r} is not one of the allowed values {allowed}"
-        return None
+        return validate_result_schema(
+            user_context.get("response_contract"),
+            {
+                "scene_summary": analysis.scene_summary,
+                "visible_objects": analysis.visible_objects,
+                "robot_state_summary": analysis.robot_state_summary,
+                "ee_pose_interpretation": analysis.ee_pose_interpretation,
+                "risks": analysis.risks,
+                "confidence": analysis.confidence,
+            },
+        )
 
     def _session_history(self, session_id: str) -> list[dict[str, str]]:
         with self._history_lock:

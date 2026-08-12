@@ -10,6 +10,27 @@ from robot_config.launch_builders.perception_models import generate_perception_m
 from robot_config.loader import load_robot_config_dict
 
 
+def _sorting_hat_game(*, enabled: bool = True, announce: bool = False) -> dict:
+    return {
+        "enabled": enabled,
+        "announce": announce,
+        "handler": "sorting_hat_v1",
+        "summary": "Sort",
+    }
+
+
+def _voice_tts(**overrides) -> dict:
+    return {
+        "enabled": True,
+        "bundle_path": "models/voice_tts/zipvoice",
+        "deployment": "test_deployment",
+        "service_name": "/voice_tts/synthesize",
+        "playback_service_name": "/voice_tts/play",
+        "playback_timeout_sec": 300.0,
+        **overrides,
+    }
+
+
 def _normalize_launch_param_mapping(raw_params):
     normalized = {}
     for raw_key, raw_value in raw_params.items():
@@ -183,19 +204,21 @@ def test_direct_builder_defaults_gateway_motion_authorization_to_false():
 
 def test_no_interaction_skills_node_is_generated():
     robot_config = {
+        "voice_tts": _voice_tts(),
         "embodied": {
             "enabled": True,
             "entry_mode": "hermes",
             "execution": {},
-            "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
+            "visual_games": {"sorting_hat": _sorting_hat_game(announce=True)},
             "perception": {"enabled": True},
-        }
+        },
     }
 
     nodes = generate_embodied_nodes(robot_config, active_control_mode="moveit_planning")
 
     node_names = [vars(node)["_Node__node_name"] for node in nodes]
     assert "interaction_skills_node" not in node_names
+    assert "visual_game_gateway_node" in node_names
 
     node_names = {vars(node)["_Node__node_name"] for node in nodes}
     assert "task_entry_node" not in node_names
@@ -229,6 +252,115 @@ def test_non_hermes_entry_mode_is_rejected():
             {"embodied": {"enabled": True, "entry_mode": "voice"}},
             active_control_mode="moveit_planning",
         )
+
+
+def test_non_moveit_game_launches_only_gateway_and_perception():
+    robot_config = {
+        "name": "test_robot",
+        "voice_tts": _voice_tts(),
+        "embodied": {
+            "enabled": True,
+            "visual_games": {"sorting_hat": _sorting_hat_game()},
+            "perception": {"enabled": True},
+        },
+    }
+
+    nodes = generate_embodied_nodes(robot_config, active_control_mode="model_inference")
+
+    assert {vars(node)["_Node__node_name"] for node in nodes} == {
+        "visual_game_gateway_node",
+        "perception_service_node",
+    }
+
+
+def test_tts_enabled_game_adds_announcer_using_existing_service_config():
+    robot_config = {
+        "name": "test_robot",
+        "voice_tts": _voice_tts(
+            service_name="/custom/tts",
+            playback_service_name="/custom/play",
+            tts_timeout_sec=8.0,
+            playback_timeout_sec=9.0,
+        ),
+        "embodied": {
+            "enabled": True,
+            "visual_games": {"sorting_hat": _sorting_hat_game(announce=True)},
+            "perception": {"enabled": True},
+            "visual_game_event_topic": "/custom/game_events",
+        },
+    }
+
+    nodes = generate_embodied_nodes(robot_config, active_control_mode="model_inference")
+    announcer = next(node for node in nodes if vars(node)["_Node__node_name"] == "visual_game_announcer_node")
+    params = _normalize_launch_param_mapping(announcer._Node__parameters[0])
+
+    assert _decode_launch_string(params["event_topic"]) == "/custom/game_events"
+    assert _decode_launch_string(params["tts_service"]) == "/custom/tts"
+    assert _decode_launch_string(params["playback_service"]) == "/custom/play"
+    assert float(params["tts_timeout_sec"]) == 8.0
+    assert float(params["playback_timeout_sec"]) == 9.0
+
+
+def test_tts_enabled_game_adds_shared_announcer():
+    robot_config = {
+        "name": "test_robot",
+        "voice_tts": _voice_tts(),
+        "embodied": {
+            "enabled": True,
+            "visual_games": {"sorting_hat": _sorting_hat_game(announce=True)},
+            "perception": {"enabled": True},
+        },
+    }
+
+    nodes = generate_embodied_nodes(robot_config, active_control_mode="model_inference")
+
+    assert "visual_game_announcer_node" in {vars(node)["_Node__node_name"] for node in nodes}
+
+
+@pytest.mark.parametrize(
+    "voice_tts",
+    [
+        {"enabled": False},
+        {
+            "enabled": True,
+            "bundle_path": "models/voice_tts/zipvoice",
+            "deployment": "",
+            "service_name": "/voice_tts/synthesize",
+            "playback_service_name": "/voice_tts/play",
+        },
+        {
+            "enabled": True,
+            "bundle_path": "models/voice_tts/zipvoice",
+            "deployment": "test_deployment",
+            "service_name": "/voice_tts/synthesize",
+            "playback_service_name": "",
+        },
+    ],
+)
+def test_enabled_visual_game_without_complete_tts_config_skips_announcer(voice_tts):
+    robot_config = {
+        "voice_tts": voice_tts,
+        "embodied": {
+            "enabled": True,
+            "visual_games": {"sorting_hat": _sorting_hat_game(announce=True)},
+            "perception": {"enabled": True},
+        },
+    }
+
+    nodes = generate_embodied_nodes(robot_config, active_control_mode="model_inference")
+    assert "visual_game_announcer_node" not in {vars(node)["_Node__node_name"] for node in nodes}
+
+
+def test_non_moveit_without_enabled_game_preserves_motion_mode_error():
+    robot_config = {
+        "embodied": {
+            "enabled": True,
+            "visual_games": {"sorting_hat": _sorting_hat_game(enabled=False)},
+        }
+    }
+
+    with pytest.raises(ValueError, match="MoveIt-compatible"):
+        generate_embodied_nodes(robot_config, active_control_mode="model_inference")
 
 
 class _FakeLaunchContext:
@@ -277,11 +409,12 @@ def test_launch_setup_aborts_when_game_enabled_but_perception_disabled():
     module = _load_launch_module()
 
     fake_config = {
+        "voice_tts": _voice_tts(),
         "embodied": {
             "enabled": True,
             "perception": {"enabled": True},
-            "entry": {"visual_games": {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}},
-        }
+            "visual_games": {"sorting_hat": _sorting_hat_game()},
+        },
     }
     module._load_config = lambda *args, **kwargs: fake_config
 
@@ -308,8 +441,25 @@ def test_launch_setup_passes_operator_motion_authorization(monkeypatch, authoriz
     monkeypatch.setattr(module, "get_package_share_directory", lambda package: f"/tmp/{package}")
     generated = []
 
-    def capture_nodes(robot_config, active_control_mode, *, motion_authorized=False):
-        generated.append((robot_config, active_control_mode, motion_authorized))
+    def capture_nodes(
+        robot_config,
+        active_control_mode,
+        *,
+        motion_authorized=False,
+        include_motion=True,
+        include_visual_games=True,
+        include_perception=True,
+    ):
+        generated.append(
+            {
+                "robot_config": robot_config,
+                "active_control_mode": active_control_mode,
+                "motion_authorized": motion_authorized,
+                "include_motion": include_motion,
+                "include_visual_games": include_visual_games,
+                "include_perception": include_perception,
+            }
+        )
         return []
 
     monkeypatch.setattr(module, "generate_embodied_nodes", capture_nodes)
@@ -323,8 +473,58 @@ def test_launch_setup_passes_operator_motion_authorization(monkeypatch, authoriz
 
     module.launch_setup(_FakeLaunchContext(launch_configurations))
 
-    assert len(generated) == 1
-    assert generated[0][1:] == ("moveit_runtime_override", expected)
+    assert len(generated) == 2
+    assert all(item["active_control_mode"] == "moveit_runtime_override" for item in generated)
+    assert all(item["motion_authorized"] is expected for item in generated)
+
+
+def test_moveit_visual_closure_starts_perception_before_controller_readiness(monkeypatch):
+    module = _load_launch_module()
+    config = {
+        "default_control_mode": "moveit_planning",
+        "embodied": {
+            "enabled": True,
+            "perception": {"enabled": True},
+            "visual_games": {"sorting_hat": _sorting_hat_game()},
+        },
+    }
+    module._load_config = lambda *_args, **_kwargs: config
+    monkeypatch.setattr(module, "get_package_share_directory", lambda package: f"/tmp/{package}")
+    generated = []
+
+    def capture_nodes(
+        _robot_config,
+        _active_control_mode,
+        *,
+        motion_authorized=False,
+        include_motion=True,
+        include_visual_games=True,
+        include_perception=True,
+    ):
+        generated.append(
+            {
+                "include_motion": include_motion,
+                "include_visual_games": include_visual_games,
+                "include_perception": include_perception,
+            }
+        )
+        return []
+
+    monkeypatch.setattr(module, "generate_embodied_nodes", capture_nodes)
+    module.launch_setup(
+        _FakeLaunchContext(
+            {
+                "robot_config": "so101_single_arm",
+                "control_mode": "moveit_planning",
+                "with_embodied": "true",
+            }
+        )
+    )
+
+    assert generated == [
+        {"include_motion": False, "include_visual_games": True, "include_perception": True},
+        {"include_motion": True, "include_visual_games": False, "include_perception": False},
+    ]
 
 
 def test_handeye_grasp_config_launches_pick_and_place_pipelines():

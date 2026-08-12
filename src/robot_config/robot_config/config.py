@@ -149,6 +149,10 @@ class EmbodiedConfig:
     skill_catalog_source_mode: str = "installed"
     skill_catalog_source_root: str = ""
     skill_catalog_profile: str = ""
+    start_visual_game_service: str = "/embodied/start_visual_game"
+    get_visual_game_result_service: str = "/embodied/get_visual_game_result"
+    visual_game_event_topic: str = "/embodied/visual_game_events"
+    visual_game_result_capacity: int = 128
     default_target_name: str = "demo_object"
     default_place_name: str = "tray_right"
     skill_timeout_sec: float = 120.0
@@ -159,7 +163,7 @@ class EmbodiedConfig:
     relative_motion_reference_frame: str = "base"
     relative_motion_direction_mapping: dict[str, Any] = field(default_factory=dict)
     perception: dict[str, Any] = field(default_factory=dict)
-    entry: dict[str, Any] = field(default_factory=dict)
+    visual_games: dict[str, Any] = field(default_factory=dict)
     gripper_open_position: float = 1.0
     gripper_closed_position: float = 0.0
     skill_templates: dict[str, Any] = field(default_factory=dict)
@@ -211,6 +215,7 @@ class VoiceTTSConfig:
     max_prompt_duration_sec: float = 30.0
     max_segments: int = 32
     max_response_audio_bytes: int = 64 * 1024 * 1024
+    tts_timeout_sec: float = 15.0
     device_id: int = 0
     exit_on_init_failure: bool = True
 

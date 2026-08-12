@@ -179,7 +179,7 @@ manifest 引用的 artifacts 与 LeRobot 元数据；`_work` 目录可独立归�
 | [ibrobot-launch](.agents/skills/ibrobot-launch) | 分平台启动 Ubuntu/openEuler 工作区或 OpenHarmony 板端机器人、仿真、mock/契约测试、推理、teleop |
 | [ibrobot-architecture](.agents/skills/ibrobot-architecture) | 架构、SSOT、契约、robot_config、数据流 |
 | [ibrobot-robot-skill-design](.agents/skills/ibrobot-robot-skill-design) | 交互式设计/新增机器人 skill、Hermes/Agent 动作、真机验证方案 |
-| [ibrobot-control](.agents/skills/ibrobot-control) | Hermes/Agent 发现、校验、执行或取消现有机器人高层技能 |
+| [ibrobot-control](.agents/skills/ibrobot-control) | Hermes/Agent 操作现有机器人高层技能或异步视觉游戏 |
 
 ### 板端（OpenHarmony）
 

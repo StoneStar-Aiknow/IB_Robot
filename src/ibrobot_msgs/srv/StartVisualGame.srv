@@ -1,0 +1,10 @@
+string request_id
+string game_name
+string expected_config_digest
+---
+bool accepted
+bool duplicate
+string request_id
+string config_digest
+string error_code
+string message

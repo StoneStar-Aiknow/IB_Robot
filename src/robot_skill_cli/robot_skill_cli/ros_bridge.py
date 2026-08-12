@@ -35,6 +35,8 @@ class RosBridge:
         validate_plan_service: str = "/embodied/validate_agent_plan",
         confirm_plan_service: str = "/embodied/confirm_agent_plan",
         execute_plan_action: str = "/embodied/execute_agent_plan",
+        start_visual_game_service: str = "/embodied/start_visual_game",
+        get_visual_game_result_service: str = "/embodied/get_visual_game_result",
     ) -> None:
         self._status_service = status_service
         self._snapshot_service = snapshot_service
@@ -45,6 +47,8 @@ class RosBridge:
         self._validate_plan_service = validate_plan_service
         self._confirm_plan_service = confirm_plan_service
         self._execute_plan_action = execute_plan_action.rstrip("/")
+        self._start_visual_game_service = start_visual_game_service
+        self._get_visual_game_result_service = get_visual_game_result_service
         self._node = None
         self._executor = None
         self._spin_thread = None
@@ -61,6 +65,8 @@ class RosBridge:
         self._cancel_client = None
         self._cancel_plan_client = None
         self._plan_result_client = None
+        self._start_visual_game_client = None
+        self._get_visual_game_result_client = None
         self._GetSkillGatewayStatus = None
         self._GetSkillSnapshot = None
         self._ReloadSkillCatalog = None
@@ -72,6 +78,8 @@ class RosBridge:
         self._ExecuteAgentPlan = None
         self._CancelGoal = None
         self._WorkflowStep = None
+        self._StartVisualGame = None
+        self._GetVisualGameResult = None
 
     def start(self) -> bool:
         try:
@@ -87,8 +95,10 @@ class RosBridge:
                 ConfirmAgentPlan,
                 GetSkillGatewayStatus,
                 GetSkillSnapshot,
+                GetVisualGameResult,
                 PlanAgentCommand,
                 ReloadSkillCatalog,
+                StartVisualGame,
                 ValidateAgentPlan,
                 ValidateSkill,
             )
@@ -154,6 +164,16 @@ class RosBridge:
                 f"{self._execute_plan_action}/_action/get_result",
                 callback_group=callback_group,
             )
+            self._start_visual_game_client = self._node.create_client(
+                StartVisualGame,
+                self._start_visual_game_service,
+                callback_group=callback_group,
+            )
+            self._get_visual_game_result_client = self._node.create_client(
+                GetVisualGameResult,
+                self._get_visual_game_result_service,
+                callback_group=callback_group,
+            )
             self._GetSkillGatewayStatus = GetSkillGatewayStatus
             self._GetSkillSnapshot = GetSkillSnapshot
             self._ReloadSkillCatalog = ReloadSkillCatalog
@@ -165,6 +185,8 @@ class RosBridge:
             self._ExecuteAgentPlan = ExecuteAgentPlan
             self._CancelGoal = CancelGoal
             self._WorkflowStep = WorkflowStep
+            self._StartVisualGame = StartVisualGame
+            self._GetVisualGameResult = GetVisualGameResult
             self._executor = MultiThreadedExecutor(num_threads=2)
             self._executor.add_node(self._node)
             self._spin_thread = threading.Thread(target=self._executor.spin, daemon=True)
@@ -574,6 +596,15 @@ class RosBridge:
             and self._execute_plan_client.wait_for_server(timeout_sec=remaining)
         )
 
+    def wait_for_visual_game_interfaces(self, *, timeout_sec: float) -> bool:
+        """Return whether the independent visual-game start/query services are discoverable."""
+        deadline = time.monotonic() + timeout_sec
+        for client in (self._start_visual_game_client, self._get_visual_game_result_client):
+            remaining = deadline - time.monotonic()
+            if client is None or remaining <= 0.0 or not client.wait_for_service(timeout_sec=remaining):
+                return False
+        return True
+
     def send_agent_plan_goal(
         self, *, plan_token: str, confirmation_token: str, task_id: str, timeout_sec: float, feedback_callback=None
     ):
@@ -715,6 +746,58 @@ class RosBridge:
         return {
             "accepted": int(response.return_code) == 0 and bool(response.goals_canceling),
             "return_code": int(response.return_code),
+        }
+
+    def start_visual_game(
+        self,
+        game_name: str,
+        *,
+        request_id: str,
+        expected_config_digest: str,
+        timeout_sec: float,
+    ) -> dict[str, Any]:
+        if self._StartVisualGame is None:
+            raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
+        request = self._StartVisualGame.Request()
+        request.request_id = request_id
+        request.game_name = game_name
+        request.expected_config_digest = expected_config_digest
+        response = self._call_service(
+            self._start_visual_game_client,
+            request,
+            service_name=self._start_visual_game_service,
+            timeout_sec=timeout_sec,
+        )
+        return {
+            "accepted": bool(response.accepted),
+            "duplicate": bool(response.duplicate),
+            "request_id": response.request_id,
+            "config_digest": response.config_digest,
+            "error_code": response.error_code,
+            "message": response.message,
+        }
+
+    def get_visual_game_result(self, request_id: str, *, timeout_sec: float) -> dict[str, Any]:
+        if self._GetVisualGameResult is None:
+            raise BridgeError("ROS_UNAVAILABLE", "ROS bridge is not started", exit_code=EXIT_ROS_UNAVAILABLE)
+        request = self._GetVisualGameResult.Request()
+        request.request_id = request_id
+        response = self._call_service(
+            self._get_visual_game_result_client,
+            request,
+            service_name=self._get_visual_game_result_service,
+            timeout_sec=timeout_sec,
+        )
+        return {
+            "found": bool(response.found),
+            "terminal": bool(response.terminal),
+            "success": bool(response.success),
+            "game_name": response.game_name,
+            "scene_summary": response.scene_summary,
+            "result_json": response.result_json,
+            "config_digest": response.config_digest,
+            "error_code": response.error_code,
+            "message": response.message,
         }
 
     def cancel_goal(self, goal_handle, result_future, *, timeout_sec: float) -> bool:

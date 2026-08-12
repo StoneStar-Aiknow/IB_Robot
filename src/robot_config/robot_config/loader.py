@@ -14,6 +14,7 @@ from embodied_common.skill_templates import (
     SUPPORTED_PRIMITIVES,
     SUPPORTED_SKILL_EXECUTORS,
 )
+from embodied_common.visual_game_contracts import normalize_visual_game_policies
 from robot_config.config import (
     CameraConfig,
     ContractAction,
@@ -1036,11 +1037,46 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
             errors.append("embodied.skill_catalog_source_root is required in development and production modes")
         if embodied.get("enabled", False) and (not isinstance(profile_name, str) or not profile_name.strip()):
             errors.append("embodied.skill_catalog_profile is required")
+        errors.extend(_validate_visual_game_services(embodied))
         try:
             resolve_embodied_timeout_policy(embodied)
         except ValueError as exc:
             errors.append(str(exc))
     return errors
+
+
+def _validate_visual_game_services(embodied: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    for field_name in ("start_visual_game_service", "get_visual_game_result_service"):
+        service_name = embodied.get(field_name)
+        if service_name is not None and (not isinstance(service_name, str) or not service_name.strip()):
+            errors.append(f"embodied.{field_name} must be a non-empty string")
+    start_service = embodied.get("start_visual_game_service", "/embodied/start_visual_game")
+    result_service = embodied.get("get_visual_game_result_service", "/embodied/get_visual_game_result")
+    if start_service == result_service:
+        errors.append("embodied visual game start and result services must be different")
+    event_topic = embodied.get("visual_game_event_topic", "/embodied/visual_game_events")
+    if not isinstance(event_topic, str) or not event_topic.strip():
+        errors.append("embodied.visual_game_event_topic must be a non-empty string")
+    capacity = embodied.get("visual_game_result_capacity", 128)
+    if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+        errors.append("embodied.visual_game_result_capacity must be a positive integer")
+    return errors
+
+
+def _validate_visual_game_policies(robot_config: dict[str, Any]) -> list[str]:
+    embodied = robot_config.get("embodied", {})
+    if not isinstance(embodied, dict):
+        return []
+    entry = embodied.get("entry")
+    if entry is not None:
+        return ["embodied.entry is no longer supported; visual games are triggered through robot-skill"]
+    try:
+        games = embodied.get("visual_games", {})
+        normalize_visual_game_policies(games)
+    except ValueError as exc:
+        return [str(exc)]
+    return []
 
 
 def _quaternion_multiply(left: list[float], right: list[float]) -> list[float]:
@@ -1138,6 +1174,13 @@ def load_robot_config_dict(
     validation_errors.extend(validate_motion_mode_config(robot_config))
     validation_errors.extend(_validate_embodied_skill_contract(robot_config))
     validation_errors.extend(_validate_skill_gateway_config(robot_config))
+    visual_game_policy_errors = _validate_visual_game_policies(robot_config)
+    validation_errors.extend(visual_game_policy_errors)
+    if not visual_game_policy_errors:
+        try:
+            get_effective_visual_game_policies(robot_config)
+        except ValueError as exc:
+            validation_errors.append(str(exc))
     try:
         parse_perception_runtime_config(robot_config)
     except PerceptionRuntimeConfigError as exc:
@@ -1331,6 +1374,7 @@ def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
         max_prompt_duration_sec=data.get("max_prompt_duration_sec", defaults.max_prompt_duration_sec),
         max_segments=data.get("max_segments", defaults.max_segments),
         max_response_audio_bytes=data.get("max_response_audio_bytes", defaults.max_response_audio_bytes),
+        tts_timeout_sec=data.get("tts_timeout_sec", defaults.tts_timeout_sec),
         device_id=data.get("device_id", defaults.device_id),
         exit_on_init_failure=data.get("exit_on_init_failure", defaults.exit_on_init_failure),
     )
@@ -1360,7 +1404,6 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
     safety = data.get("safety", {})
     direction_mapping = execution.get("relative_motion_direction_mapping", {})
     perception = data.get("perception", {})
-    entry = data.get("entry", {})
     timeout_policy = resolve_embodied_timeout_policy(data)
 
     return EmbodiedConfig(
@@ -1378,6 +1421,10 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         skill_catalog_source_mode=data.get("skill_catalog_source_mode", "installed"),
         skill_catalog_source_root=data.get("skill_catalog_source_root", ""),
         skill_catalog_profile=data.get("skill_catalog_profile", ""),
+        start_visual_game_service=data.get("start_visual_game_service", "/embodied/start_visual_game"),
+        get_visual_game_result_service=data.get("get_visual_game_result_service", "/embodied/get_visual_game_result"),
+        visual_game_event_topic=data.get("visual_game_event_topic", "/embodied/visual_game_events"),
+        visual_game_result_capacity=data.get("visual_game_result_capacity", 128),
         default_target_name=data.get("default_target_name", "demo_object"),
         default_place_name=data.get("default_place_name", "tray_right"),
         skill_timeout_sec=execution.get("skill_timeout_sec", 120.0),
@@ -1388,7 +1435,7 @@ def load_embodied_config(data: dict[str, Any]) -> EmbodiedConfig:
         relative_motion_reference_frame=execution.get("relative_motion_reference_frame", "base"),
         relative_motion_direction_mapping=direction_mapping,
         perception=perception,
-        entry=entry,
+        visual_games=data.get("visual_games", {}),
         gripper_open_position=execution.get("gripper_open_position", 1.0),
         gripper_closed_position=execution.get("gripper_closed_position", 0.0),
         skill_templates=data.get("skill_templates", {}),
@@ -1548,38 +1595,50 @@ def _validate_vlm_runtime_config(
         errors.append("embodied.timeouts.model_idle_timeout_sec must be greater than zero")
 
 
-def validate_visual_games_consistency(
-    entry: dict[str, Any],
-    perception: dict[str, Any],
-    *,
-    entry_mode: str = "hermes",
-) -> list[str]:
+def validate_visual_games_consistency(visual_games: dict[str, Any], perception: dict[str, Any]) -> list[str]:
     """Check the visual-games <-> perception enable consistency rule.
 
-    Any enabled ``embodied.entry.visual_games.<name>`` routes its trigger to
+    Any enabled ``embodied.visual_games.<name>`` routes its request to
     ``perception_service``; if perception is disabled the request lands on a
     topic nobody consumes. This is the single source of truth for that rule,
     shared by both the typed :func:`validate_config` and the raw-dict launch
     entry :func:`validate_embodied_launch_dict`.
     """
     errors: list[str] = []
-    games = entry.get("visual_games", {})
-    if isinstance(games, dict):
-        enabled_games = [
-            name for name, policy in games.items() if isinstance(policy, dict) and policy.get("enabled", False)
-        ]
-        if enabled_games and not perception.get("enabled", False):
-            errors.append(
-                "embodied.entry.visual_games requires "
-                "embodied.perception.enabled: true when any game is enabled "
-                f"({enabled_games})"
-            )
-        if enabled_games and entry_mode == "hermes":
-            errors.append(
-                "embodied.entry.visual_games requires a voice entry mode, which is not supported "
-                f"when any game is enabled ({enabled_games})"
-            )
+    try:
+        normalized_games = normalize_visual_game_policies(visual_games)
+    except ValueError as exc:
+        errors.append(str(exc))
+        return errors
+    enabled_games = [name for name, policy in normalized_games.items() if policy["enabled"]]
+    if enabled_games and not perception.get("enabled", False):
+        errors.append(
+            "embodied.visual_games requires "
+            "embodied.perception.enabled: true when any game is enabled "
+            f"({enabled_games})"
+        )
     return errors
+
+
+def get_effective_visual_game_policies(robot_config: dict[str, Any]) -> dict[str, Any]:
+    """Return visual-game policies available from the configured runtime.
+
+    Visual games are not runtime capabilities while the embodied stack is
+    disabled. When it is enabled, reject policies that require a disabled
+    perception path using the same consistency rule as typed and launch-time
+    validation.
+    """
+    embodied = robot_config.get("embodied", {})
+    if not isinstance(embodied, dict) or not embodied.get("enabled", False):
+        return {}
+    visual_games = embodied.get("visual_games", {})
+    perception = embodied.get("perception", {})
+    if not isinstance(perception, dict):
+        perception = {}
+    errors = validate_visual_games_consistency(visual_games, perception)
+    if errors:
+        raise ValueError("; ".join(errors))
+    return copy.deepcopy(visual_games)
 
 
 def validate_embodied_launch_dict(config: dict[str, Any]) -> list[str]:
@@ -1599,13 +1658,15 @@ def validate_embodied_launch_dict(config: dict[str, Any]) -> list[str]:
     embodied = config.get("embodied", {})
     if not isinstance(embodied, dict) or not embodied.get("enabled", False):
         return []
-    entry = embodied.get("entry", {}) or {}
     perception = embodied.get("perception", {}) or {}
-    entry_mode = str(embodied.get("entry_mode", "hermes")).lower()
-    errors = []
-    if entry_mode != "hermes":
-        errors.append("embodied.entry_mode must be hermes")
-    errors.extend(validate_visual_games_consistency(entry, perception, entry_mode=entry_mode))
+    errors = _validate_visual_game_policies({"embodied": embodied})
+    # Service/capacity fields are independent of game policies: validate them
+    # even when policies are invalid so launch-time overrides (e.g. colliding
+    # start/result service names) surface in the same pass instead of at runtime.
+    errors.extend(_validate_visual_game_services(embodied))
+    if errors:
+        return errors
+    errors = validate_visual_games_consistency(embodied.get("visual_games", {}), perception)
     return errors
 
 
@@ -1616,6 +1677,16 @@ def validate_config(config: RobotConfig) -> list[str]:
         List of error messages (empty if valid)
     """
     errors = []
+    typed_embodied = {
+        "visual_games": config.embodied.visual_games or {},
+        "start_visual_game_service": config.embodied.start_visual_game_service,
+        "get_visual_game_result_service": config.embodied.get_visual_game_result_service,
+        "visual_game_event_topic": config.embodied.visual_game_event_topic,
+        "visual_game_result_capacity": config.embodied.visual_game_result_capacity,
+    }
+    visual_game_policy_errors = _validate_visual_game_policies({"embodied": typed_embodied})
+    errors.extend(visual_game_policy_errors)
+    errors.extend(_validate_visual_game_services(typed_embodied))
 
     errors.extend(validate_placement_execution_config(getattr(config, "placement_execution", None)))
 
@@ -1747,6 +1818,7 @@ def validate_config(config: RobotConfig) -> list[str]:
             "max_prompt_duration_sec": config.voice_tts.max_prompt_duration_sec,
             "max_segments": config.voice_tts.max_segments,
             "max_response_audio_bytes": config.voice_tts.max_response_audio_bytes,
+            "tts_timeout_sec": config.voice_tts.tts_timeout_sec,
         }
         for name, value in positive_limits.items():
             if value <= 0:
@@ -1859,7 +1931,13 @@ def validate_config(config: RobotConfig) -> list[str]:
                 "perception is enabled",
             )
 
-        errors.extend(validate_visual_games_consistency(config.embodied.entry or {}, perception))
+        if not visual_game_policy_errors:
+            errors.extend(
+                validate_visual_games_consistency(
+                    config.embodied.visual_games or {},
+                    perception,
+                )
+            )
 
         if float(timeout_policy.get("task_budget_sec", 0.0)) <= 0.0:
             errors.append("embodied.timeouts.task_budget_sec must be greater than zero")

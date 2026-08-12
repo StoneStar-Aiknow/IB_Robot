@@ -168,6 +168,10 @@ robot:
     validate_skill_service: /embodied/validate_skill
     validate_primitive_service: /embodied/validate_primitive
     skill_gateway_status_service: /embodied/get_skill_gateway_status
+    start_visual_game_service: /embodied/start_visual_game
+    get_visual_game_result_service: /embodied/get_visual_game_result
+    visual_game_event_topic: /embodied/visual_game_events
+    visual_game_result_capacity: 128
     default_target_name: demo_object
     default_place_name: home
     timeouts:
@@ -176,6 +180,8 @@ robot:
       robot_state_freshness_sec: 0.5
       scene_freshness_sec: 0.5
       model_idle_timeout_sec: 120.0
+      visual_game_timeout_sec: 130.0
+      visual_game_result_retention_sec: 300.0
       rpc_timeout_sec: 5.0
       gripper_settle_sec: 1.5
     perception:
@@ -207,14 +213,14 @@ robot:
         jpeg_quality: 70
       conversation:
         max_history_turns: 4
-    entry:
-      # 入口层视觉趣味游戏策略：拥有"何时触发、问什么"；camera/VLM/timeout 仍由
-      # embodied.perception 唯一管理，此处不重复。命中触发词后 task_entry_node
-      # 构造 SceneAnalysisRequest 发给 perception_service，并立即返回。
-      visual_games:
-        sorting_hat:
-          enabled: false  # 趣味游戏默认关；现场启用需同时置 perception.enabled: true
-          trigger_aliases: [分院帽, 奔月帽, 风月帽, 分月帽]
+    # 非运动视觉能力。handler 契约由统一 registry 提供；camera/VLM 与生命周期配置仍分别由
+    # embodied.perception / embodied.timeouts 管理。
+    visual_games:
+      sorting_hat:
+        enabled: false  # 趣味游戏默认关；现场启用需同时置 perception.enabled: true
+        announce: false
+        handler: sorting_hat_v1
+        summary: 根据主相机中的人物形象判断其霍格沃茨学院
     execution:
       relative_motion_step_m: 0.03
       relative_motion_reference_frame: base

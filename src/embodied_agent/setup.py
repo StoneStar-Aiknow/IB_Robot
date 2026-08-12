@@ -11,6 +11,7 @@ setup(
         ("share/" + package_name, ["package.xml"]),
     ],
     install_requires=["setuptools"],
+    extras_require={"test": ["pytest"]},
     zip_safe=True,
     maintainer="liuweihong",
     maintainer_email="liuweihong8@huawei.com",
@@ -21,6 +22,8 @@ setup(
             "task_entry_node = embodied_agent.task_entry_node:main",
             "task_executor_node = embodied_agent.task_executor_node:main",
             "agent_plan_node = embodied_agent.agent_plan_node:main",
+            "visual_game_gateway_node = embodied_agent.visual_game_gateway_node:main",
+            "visual_game_announcer_node = embodied_agent.visual_game_announcer_node:main",
         ],
     },
 )

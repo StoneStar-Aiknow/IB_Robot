@@ -11,6 +11,9 @@ DEFAULT_EMBODIED_TIMEOUT_POLICY: dict[str, float] = {
     "robot_state_freshness_sec": 0.5,
     "scene_freshness_sec": 0.5,
     "model_idle_timeout_sec": 120.0,
+    # visual_game_timeout_sec has no static default: it resolves to
+    # ``model_idle_timeout_sec + 10.0`` so it always exceeds the model deadline.
+    "visual_game_result_retention_sec": 300.0,
     "rpc_timeout_sec": 5.0,
     "gripper_settle_sec": 1.5,
 }
@@ -21,6 +24,7 @@ _GATEWAY_FLOAT32_TIMEOUTS = {
     "task_budget_sec",
     "rpc_timeout_sec",
     "robot_state_freshness_sec",
+    "visual_game_timeout_sec",
 }
 
 
@@ -62,6 +66,7 @@ def resolve_embodied_timeout_policy(embodied_config: dict[str, Any]) -> dict[str
         "timeout_sec", DEFAULT_EMBODIED_TIMEOUT_POLICY["model_idle_timeout_sec"]
     )
 
+    resolved_model_idle_fallback = configured.get("model_idle_timeout_sec", model_idle_fallback)
     policy = {
         "task_budget_sec": configured.get(
             "task_budget_sec",
@@ -76,7 +81,15 @@ def resolve_embodied_timeout_policy(embodied_config: dict[str, Any]) -> dict[str
             DEFAULT_EMBODIED_TIMEOUT_POLICY["robot_state_freshness_sec"],
         ),
         "scene_freshness_sec": configured.get("scene_freshness_sec", scene_freshness_fallback),
-        "model_idle_timeout_sec": configured.get("model_idle_timeout_sec", model_idle_fallback),
+        "model_idle_timeout_sec": resolved_model_idle_fallback,
+        "visual_game_timeout_sec": configured.get(
+            "visual_game_timeout_sec",
+            float(resolved_model_idle_fallback) + 10.0,
+        ),
+        "visual_game_result_retention_sec": configured.get(
+            "visual_game_result_retention_sec",
+            DEFAULT_EMBODIED_TIMEOUT_POLICY["visual_game_result_retention_sec"],
+        ),
         "rpc_timeout_sec": configured.get("rpc_timeout_sec", DEFAULT_EMBODIED_TIMEOUT_POLICY["rpc_timeout_sec"]),
         "gripper_settle_sec": configured.get(
             "gripper_settle_sec",
@@ -86,4 +99,6 @@ def resolve_embodied_timeout_policy(embodied_config: dict[str, Any]) -> dict[str
     resolved_policy = {name: _finite_positive_timeout(name, value) for name, value in policy.items()}
     if resolved_policy["default_skill_timeout_sec"] > resolved_policy["task_budget_sec"]:
         raise ValueError("embodied.timeouts.default_skill_timeout_sec must be <= task_budget_sec")
+    if resolved_policy["visual_game_timeout_sec"] <= resolved_policy["model_idle_timeout_sec"]:
+        raise ValueError("embodied.timeouts.visual_game_timeout_sec must be greater than model_idle_timeout_sec")
     return resolved_policy

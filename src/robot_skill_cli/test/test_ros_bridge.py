@@ -26,7 +26,13 @@ def bridge_rig():
 
     from ibrobot_msgs.action import SkillCommand
     from ibrobot_msgs.msg import SkillCapabilityStatus
-    from ibrobot_msgs.srv import GetSkillGatewayStatus, ReloadSkillCatalog, ValidateSkill
+    from ibrobot_msgs.srv import (
+        GetSkillGatewayStatus,
+        GetVisualGameResult,
+        ReloadSkillCatalog,
+        StartVisualGame,
+        ValidateSkill,
+    )
 
     if not rclpy.ok():
         rclpy.init()
@@ -36,6 +42,8 @@ def bridge_rig():
         "reload": f"/{suffix}/reload_catalog",
         "validate": f"/{suffix}/validate_skill",
         "action": f"/{suffix}/execute_skill",
+        "start_game": f"/{suffix}/start_visual_game",
+        "game_result": f"/{suffix}/get_visual_game_result",
     }
     requests = []
     status_control = {"delay_sec": 0.0, "queries": {}}
@@ -95,6 +103,30 @@ def bridge_rig():
     server_node.create_service(ReloadSkillCatalog, names["reload"], reload_catalog)
     server_node.create_service(ValidateSkill, names["validate"], validate_skill)
 
+    def start_game(request, response):
+        response.accepted = request.game_name == "sorting_hat" and request.expected_config_digest == "game-digest"
+        response.duplicate = False
+        response.request_id = request.request_id if response.accepted else ""
+        response.config_digest = "game-digest"
+        response.error_code = "" if response.accepted else "GAME_NOT_ENABLED"
+        response.message = "accepted" if response.accepted else "disabled"
+        return response
+
+    def get_game_result(request, response):
+        response.found = request.request_id == "game-test-1"
+        response.terminal = response.found
+        response.success = response.found
+        response.game_name = "sorting_hat" if response.found else ""
+        response.scene_summary = "赫奇帕奇" if response.found else ""
+        response.result_json = '{"scene_summary":"赫奇帕奇"}' if response.found else ""
+        response.config_digest = "game-digest"
+        response.error_code = "" if response.found else "GAME_REQUEST_NOT_FOUND"
+        response.message = "completed" if response.found else "missing"
+        return response
+
+    server_node.create_service(StartVisualGame, names["start_game"], start_game)
+    server_node.create_service(GetVisualGameResult, names["game_result"], get_game_result)
+
     def goal_callback(_goal_request):
         return GoalResponse.REJECT if action_control["reject"] else GoalResponse.ACCEPT
 
@@ -141,6 +173,8 @@ def bridge_rig():
         reload_service=names["reload"],
         validate_skill_service=names["validate"],
         skill_action=names["action"],
+        start_visual_game_service=names["start_game"],
+        get_visual_game_result_service=names["game_result"],
     )
     assert bridge.start() is True
 
@@ -238,6 +272,38 @@ def test_validate_skill_passes_all_fixed_request_fields(bridge_rig):
     assert request.place_name == "home"
     assert request.motion_direction == "forward"
     assert request.motion_distance == pytest.approx(0.03)
+
+
+def test_visual_game_services_preserve_request_and_result_fields(bridge_rig):
+    bridge, _names, _requests, _status_control, _action_control = bridge_rig
+
+    started = bridge.start_visual_game(
+        "sorting_hat",
+        request_id="game-test-1",
+        expected_config_digest="game-digest",
+        timeout_sec=1.0,
+    )
+    result = bridge.get_visual_game_result(started["request_id"], timeout_sec=1.0)
+
+    assert started == {
+        "accepted": True,
+        "duplicate": False,
+        "request_id": "game-test-1",
+        "config_digest": "game-digest",
+        "error_code": "",
+        "message": "accepted",
+    }
+    assert result == {
+        "found": True,
+        "terminal": True,
+        "success": True,
+        "game_name": "sorting_hat",
+        "scene_summary": "赫奇帕奇",
+        "result_json": '{"scene_summary":"赫奇帕奇"}',
+        "config_digest": "game-digest",
+        "error_code": "",
+        "message": "completed",
+    }
 
 
 def test_unavailable_service_maps_to_server_unavailable(bridge_rig):

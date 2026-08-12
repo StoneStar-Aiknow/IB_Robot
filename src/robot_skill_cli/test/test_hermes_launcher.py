@@ -110,6 +110,184 @@ def test_runtime_check_allows_unauthorized_motion_but_requires_agent_interfaces(
     assert bridge.timeouts == [15.0, 15.0]
 
 
+def test_runtime_check_visual_game_mode_does_not_require_motion_plan_interfaces(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text("robot:\n  name: test\n", encoding="utf-8")
+
+    class Bridge:
+        def __init__(self):
+            self.closed = False
+            self.called = False
+
+        def start(self):
+            return True
+
+        def wait_for_visual_game_interfaces(self, **_kwargs):
+            self.called = True
+            return True
+
+        def close(self):
+            self.closed = True
+
+    bridge = Bridge()
+    monkeypatch.setattr(hermes_launcher, "resolve_robot_config_path", lambda **_kwargs: config_path)
+    monkeypatch.setattr(
+        hermes_launcher,
+        "load_runtime_context",
+        lambda **_kwargs: (SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0}}), object()),
+    )
+    monkeypatch.setattr(
+        hermes_launcher,
+        "load_visual_game_runtime_context",
+        lambda **_kwargs: (SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0}}), object()),
+    )
+    monkeypatch.setattr(hermes_launcher, "_resolve_preflight_mode", lambda *_args: "visual-games")
+    monkeypatch.setattr(hermes_launcher, "_create_bridge", lambda _transport: bridge)
+
+    assert hermes_launcher._check_robot_runtime("test", None) == config_path
+    assert bridge.called is True
+    assert bridge.closed is True
+
+
+def test_runtime_check_both_mode_requires_motion_and_visual_interfaces(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text("robot:\n  name: test\n", encoding="utf-8")
+
+    class Bridge:
+        def __init__(self):
+            self.calls = []
+
+        def start(self):
+            return True
+
+        def get_status(self, **_kwargs):
+            self.calls.append("status")
+            return {"control_plane_ready": True, "control_plane_error_code": ""}
+
+        def wait_for_agent_plan_interfaces(self, **_kwargs):
+            self.calls.append("motion")
+            return True
+
+        def wait_for_visual_game_interfaces(self, **_kwargs):
+            self.calls.append("visual-games")
+            return True
+
+        def close(self):
+            self.calls.append("close")
+
+    bridge = Bridge()
+    monkeypatch.setattr(hermes_launcher, "resolve_robot_config_path", lambda **_kwargs: config_path)
+    monkeypatch.setattr(
+        hermes_launcher,
+        "load_runtime_context",
+        lambda **_kwargs: (SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0}}), object()),
+    )
+    monkeypatch.setattr(hermes_launcher, "_resolve_preflight_mode", lambda *_args: "both")
+    monkeypatch.setattr(hermes_launcher, "_create_bridge", lambda _transport: bridge)
+
+    assert hermes_launcher._check_robot_runtime("test", None) == config_path
+    assert bridge.calls == ["visual-games", "status", "motion", "close"]
+
+
+def test_auto_preflight_selects_both_for_motion_and_visual_game_config(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text(
+        """robot:
+  name: test
+  default_control_mode: moveit_planning
+  embodied:
+    visual_games:
+      sorting_hat:
+        enabled: true
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        hermes_launcher,
+        "load_robot_config_dict",
+        lambda _path: {
+            "skill_required_control_mode": "moveit_planning",
+            "embodied": {
+                "enabled": True,
+                "perception": {"enabled": True},
+                "skill_catalog_profile": "so101_single_arm",
+                "visual_games": {"sorting_hat": {"enabled": True}},
+            },
+        },
+    )
+
+    assert hermes_launcher._resolve_preflight_mode("auto", config_path) == "both"
+
+
+def test_auto_preflight_selects_visual_games_for_visual_only_config(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text("robot:\n  name: test\n", encoding="utf-8")
+    monkeypatch.setattr(
+        hermes_launcher,
+        "load_robot_config_dict",
+        lambda _path: {
+            "embodied": {
+                "enabled": True,
+                "perception": {"enabled": True},
+                "visual_games": {"sorting_hat": {"enabled": True}},
+            },
+        },
+    )
+
+    assert hermes_launcher._resolve_preflight_mode("auto", config_path) == "visual-games"
+
+
+def test_auto_preflight_ignores_visual_games_when_embodied_is_disabled(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text("robot:\n  name: test\n", encoding="utf-8")
+    monkeypatch.setattr(
+        hermes_launcher,
+        "load_robot_config_dict",
+        lambda _path: {
+            "embodied": {
+                "enabled": False,
+                "perception": {"enabled": True},
+                "visual_games": {"sorting_hat": {"enabled": True}},
+            },
+        },
+    )
+
+    assert hermes_launcher._resolve_preflight_mode("auto", config_path) == "motion"
+
+
+def test_auto_preflight_rejects_visual_game_without_perception(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text("robot:\n  name: test\n", encoding="utf-8")
+    monkeypatch.setattr(
+        hermes_launcher,
+        "load_robot_config_dict",
+        lambda _path: {
+            "embodied": {
+                "enabled": True,
+                "perception": {"enabled": False},
+                "visual_games": {"sorting_hat": {"enabled": True}},
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="embodied.perception.enabled"):
+        hermes_launcher._resolve_preflight_mode("auto", config_path)
+
+
+def test_auto_preflight_keeps_motion_when_no_visual_game(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "robot.yaml"
+    config_path.write_text("robot:\n  name: test\n", encoding="utf-8")
+    monkeypatch.setattr(
+        hermes_launcher,
+        "load_robot_config_dict",
+        lambda _path: {
+            "skill_required_control_mode": "moveit_planning",
+            "embodied": {"skill_catalog_profile": "so101_single_arm"},
+        },
+    )
+    assert hermes_launcher._resolve_preflight_mode("auto", config_path) == "motion"
+
+
 def test_launcher_passes_hermes_chat_arguments_after_separator(tmp_path, monkeypatch) -> None:
     config_path = tmp_path / "robot.yaml"
     config_path.write_text("robot:\n  name: test\n", encoding="utf-8")

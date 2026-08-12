@@ -94,6 +94,9 @@ def _build_parser() -> argparse.ArgumentParser:
     config_group.add_argument("--config-path", help="explicit robot_config YAML path")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("list-skills", help="list enabled high-level skills")
+    subparsers.add_parser("list-games", help="list enabled visual games")
+    describe_game_parser = subparsers.add_parser("describe-game", help="describe one enabled visual game")
+    describe_game_parser.add_argument("game")
     describe_parser = subparsers.add_parser("describe", help="describe one enabled skill")
     describe_parser.add_argument("skill")
     subparsers.add_parser("list-poses", help="list configured named poses")
@@ -130,6 +133,11 @@ def _build_parser() -> argparse.ArgumentParser:
     cancel_plan_parser = subparsers.add_parser("cancel-plan", help="cancel an active Agent plan by task ID")
     cancel_plan_parser.add_argument("--task-id", required=True)
     _add_agent_terminal_expectation(cancel_plan_parser)
+    start_game_parser = subparsers.add_parser("start-game", help="start one visual game")
+    start_game_parser.add_argument("game")
+    start_game_parser.add_argument("--request-id", required=True)
+    game_result_parser = subparsers.add_parser("game-result", help="query one visual game request")
+    game_result_parser.add_argument("--request-id", required=True)
     return parser
 
 
@@ -151,15 +159,23 @@ def _add_agent_terminal_expectation(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expected-step-count", required=True, type=int)
 
 
-def _run_catalog_command(args: argparse.Namespace, view: dict[str, Any]) -> dict:
+def _run_catalog_command(args: argparse.Namespace, context) -> dict:
     from robot_skill_cli.catalog import describe_skill, list_poses, list_skills
 
     if args.command == "list-skills":
-        return list_skills(view)
+        return list_skills(context.view)
+    if args.command == "list-games":
+        from robot_skill_cli.catalog import list_games
+
+        return list_games(context.game_view)
+    if args.command == "describe-game":
+        from robot_skill_cli.catalog import describe_game
+
+        return describe_game(context.game_view, args.game)
     if args.command == "describe":
-        return describe_skill(view, args.skill)
+        return describe_skill(context.view, args.skill)
     if args.command == "list-poses":
-        return list_poses(view)
+        return list_poses(context.view)
     raise _CliArgumentError(f"unsupported command: {args.command}")
 
 
@@ -176,6 +192,8 @@ def _create_bridge(transport):
         validate_plan_service=transport.validate_plan_service,
         confirm_plan_service=transport.confirm_plan_service,
         execute_plan_action=transport.execute_plan_action,
+        start_visual_game_service=transport.start_visual_game_service,
+        get_visual_game_result_service=transport.get_visual_game_result_service,
     )
 
 
@@ -1049,9 +1067,65 @@ def _run_cancel(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
     )
 
 
+def _run_start_game(args: argparse.Namespace, context, bridge, *, game: dict[str, Any] | None = None) -> dict[str, Any]:
+    from robot_skill_cli.catalog import require_enabled_game
+
+    if game is None:
+        game = require_enabled_game(context.game_view, args.game)
+    request_id = args.request_id.strip()
+    if not request_id:
+        raise _CliArgumentError("request_id must be non-empty")
+    timeout_sec = context.view["timeout_policy"]["rpc_timeout_sec"]
+    result = bridge.start_visual_game(
+        game["name"],
+        request_id=request_id,
+        expected_config_digest=context.game_view["config_digest"],
+        timeout_sec=timeout_sec,
+    )
+    if not result["accepted"]:
+        raise _CommandError(
+            result["error_code"] or "GAME_REJECTED",
+            result["message"] or "visual game request rejected",
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
+    if result["config_digest"] != context.game_view["config_digest"]:
+        raise _CommandError(
+            "CONFIG_MISMATCH",
+            "local visual game configuration does not match the running gateway",
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
+    return result
+
+
+def _run_game_result(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
+    request_id = args.request_id.strip()
+    if not request_id:
+        raise _CliArgumentError("request_id must be non-empty")
+    timeout_sec = context.view["timeout_policy"]["rpc_timeout_sec"]
+    result = bridge.get_visual_game_result(request_id, timeout_sec=timeout_sec)
+    if result["config_digest"] != context.game_view["config_digest"]:
+        raise _CommandError(
+            "CONFIG_MISMATCH",
+            "local visual game configuration does not match the running gateway",
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
+    if not result["found"]:
+        raise _CommandError(
+            result["error_code"] or "GAME_REQUEST_NOT_FOUND",
+            result["message"] or f"visual game request not found: {request_id}",
+            exit_code=EXIT_GATEWAY_REJECTED,
+        )
+    return {"request_id": request_id, **result}
+
+
 def _run_runtime_command(args: argparse.Namespace, context, transport) -> dict[str, Any] | _CommandExit:
     from robot_skill_cli.ros_bridge import BridgeError
 
+    game = None
+    if args.command == "start-game":
+        from robot_skill_cli.catalog import require_enabled_game
+
+        game = require_enabled_game(context.game_view, args.game)
     bridge = _create_bridge(transport)
     if not bridge.start():
         raise BridgeError("ROS_UNAVAILABLE", "failed to initialize ROS bridge", exit_code=EXIT_ROS_UNAVAILABLE)
@@ -1076,6 +1150,10 @@ def _run_runtime_command(args: argparse.Namespace, context, transport) -> dict[s
             return _run_execute_plan(args, context, bridge)
         if args.command == "cancel-plan":
             return _run_cancel_plan(args, context, bridge)
+        if args.command == "start-game":
+            return _run_start_game(args, context, bridge, game=game)
+        if args.command == "game-result":
+            return _run_game_result(args, context, bridge)
         raise _CliArgumentError(f"unsupported command: {args.command}")
     finally:
         bridge.close()
@@ -1087,11 +1165,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = parser.parse_args(argv)
         command = args.command
-        from robot_skill_cli.catalog import load_catalog_context, load_runtime_context
+        from robot_skill_cli.catalog import (
+            load_catalog_context,
+            load_runtime_context,
+            load_visual_game_context,
+            load_visual_game_runtime_context,
+        )
 
-        if command in {"list-skills", "describe", "list-poses"}:
+        if command in {"list-games", "describe-game"}:
+            context = load_visual_game_context(config_name=args.config_name, config_path=args.config_path)
+            data = _run_catalog_command(args, context)
+        elif command in {"start-game", "game-result"}:
+            context, transport = load_visual_game_runtime_context(
+                config_name=args.config_name,
+                config_path=args.config_path,
+            )
+            data = _run_runtime_command(args, context, transport)
+        elif command in {"list-skills", "describe", "list-poses"}:
             context = load_catalog_context(config_name=args.config_name, config_path=args.config_path)
-            data = _run_catalog_command(args, context.view)
+            data = _run_catalog_command(args, context)
         else:
             context, transport = load_runtime_context(config_name=args.config_name, config_path=args.config_path)
             data = _run_runtime_command(args, context, transport)

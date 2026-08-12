@@ -187,6 +187,18 @@ def launch_setup(context, *_args, **_kwargs):
     ]
     if embodied_config["enabled"]:
         logger.info("Preparing embodied runtime nodes from embodied_bringup")
+        visual_games = embodied_config.get("visual_games", {})
+        visual_games_enabled = isinstance(visual_games, dict) and any(
+            isinstance(policy, dict) and policy.get("enabled") is True for policy in visual_games.values()
+        )
+        visual_actions = generate_embodied_nodes(
+            config,
+            active_control_mode,
+            motion_authorized=motion_authorized,
+            include_motion=False,
+            include_perception=visual_games_enabled,
+        )
+        actions.extend(visual_actions)
         runtime_actions = []
         worker_action = _parallel_ik_worker_action(config, base_launch_arguments["use_sim"])
         if worker_action is not None:
@@ -196,6 +208,8 @@ def launch_setup(context, *_args, **_kwargs):
                 config,
                 active_control_mode,
                 motion_authorized=motion_authorized,
+                include_visual_games=False,
+                include_perception=not visual_games_enabled,
             )
         )
         use_sim = parse_bool(base_launch_arguments["use_sim"], default=False)
@@ -213,7 +227,10 @@ def launch_setup(context, *_args, **_kwargs):
                 )
             )
             actions.append(ready_waiter)
-            logger.info(f"Deferring {len(runtime_actions)} embodied runtime action(s) until controllers are active")
+            logger.info(
+                f"Started {len(visual_actions)} visual runtime action(s); "
+                f"deferring {len(runtime_actions)} motion runtime action(s) until controllers are active"
+            )
     else:
         logger.info("Embodied runtime disabled by with_embodied:=false")
     return actions

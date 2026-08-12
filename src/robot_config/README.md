@@ -814,6 +814,8 @@ robot:
       task_budget_sec: 180.0         # 任务端到端总预算
       scene_freshness_sec: 0.5       # 图像/深度新鲜度门槛
       model_idle_timeout_sec: 120.0  # 大模型输出空闲超时
+      visual_game_timeout_sec: 130.0  # 视觉游戏 accepted 到 terminal 的总 deadline
+      visual_game_result_retention_sec: 300.0  # terminal 查询记录最长保留时间
       rpc_timeout_sec: 5.0           # action/server/service 统一 RPC 超时
       gripper_settle_sec: 1.5        # 夹爪稳定等待时间
 
@@ -834,11 +836,13 @@ robot:
         model: Qwen3.5-9B
         api_key_env: ""
 
-    entry:
-      visual_games:
-        sorting_hat:
-          enabled: false        # 趣味视觉游戏默认关闭
-          trigger_aliases: [分院帽, 奔月帽, 风月帽, 分月帽]
+    visual_game_result_capacity: 128  # ledger 满时拒绝新请求，不提前驱逐 retention 内结果
+    visual_game_event_topic: /embodied/visual_game_events
+    visual_games:
+      sorting_hat:
+        enabled: false        # 趣味视觉游戏默认关闭
+        handler: sorting_hat_v1
+        summary: 根据主相机中的人物形象判断其霍格沃茨学院
 
     execution:
       relative_motion_reference_frame: base
@@ -902,11 +906,37 @@ digest；它刻意排除 `skill_catalog_source_mode` / `skill_catalog_source_roo
 `config/robots/`；显式路径必须存在。primitive sequence、关节/笛卡尔坐标和目标绑定仍是 `skill_catalog`
 私有实现数据；运行时 ROS service/action endpoint 则由 `robot_config` 配置并进入 canonical execution context。
 
-#### entry.visual_games 一致性
+#### visual_games 一致性
 
-`embodied.entry.visual_games` 声明入口层视觉趣味游戏（如分院帽）的触发别名与开关；
-camera/VLM/timeout 仍由 `embodied.perception` 统一管理。`validate_config()` 强制一致性：
-任一游戏 `enabled=true` 而 `embodied.perception.enabled=false` 时返回错误，配置阶段即拦截。
+`embodied.visual_games` 声明非运动视觉能力（如分院帽）的 handler、公开描述、播报策略与开关。
+视觉游戏只通过 Agent 的 `robot-skill start-game` 控制面触发；`trigger_mode`、`trigger_aliases` 和
+`embodied.entry` 已移除，loader 遇到这些旧字段会明确拒绝配置，避免形成不可见的失效入口。
+camera/VLM 由 `embodied.perception` 管理，游戏 deadline/retention 由 `embodied.timeouts` 管理。启用
+`announce: true` 的视觉游戏会在 TTS service 可用时由 announcer 调用该 service；未配置或不可用时跳过播报，游戏控制面不受影响。
+静默游戏不依赖 TTS。需要播报的终态统一由 announcer 消费事件后调用该 service，调用方不得重复播报。
+`validate_config()` 强制一致性：
+任一游戏 `enabled=true` 而 perception 条件不满足时返回错误，配置阶段即拦截。
+`start_visual_game_service` 与 `get_visual_game_result_service` 声明 Agent 的异步 start/query 控制面，
+`visual_game_event_topic` 声明供 TTS/UI/日志订阅的 accepted/terminal 事件边界；
+`summary` 是公开描述，`handler` 必须引用共享 visual-game registry 中存在的实现契约。loader 同时校验
+enabled、summary 和 handler，并拒绝不受支持的游戏。游戏 capability digest 覆盖启用的
+游戏契约、timeout/retention、ledger capacity 和服务名，与运动 capability digest 相互独立。已知游戏缺省
+handler/summary 由统一 registry 补齐。视觉游戏只读取上述规范字段。
+
+触发入口固定为 Agent：使用 `robot-skill start-game GAME --request-id ID` 发起，并通过
+`robot-skill game-result --request-id ID` 查询终态。修改游戏 YAML 后需重启 pipeline。
+
+#### skill 加载与热更新边界
+
+这里的“热加载”指进程不重启时更新运行时定义。运动 Skill catalog 支持受控的显式热加载：
+`robot-skill reload-catalog --request-id ID --force` 请求 Gateway 从当前配置的 catalog source 重新编译，
+并原子激活完整的新 snapshot。它不是文件系统自动监听，不会重新加载 ROS interface、robot config、节点参数
+或 Python 实现；这些变化仍需重新构建并重启对应 pipeline。Hermes 的 `/reload-skills` 只更新 Agent 指令文件，
+也不更新运动 catalog。
+
+视觉游戏当前不支持热加载。`visual_games_json`、timeout policy、game capability digest 和 handler
+registry 都在相关节点启动时冻结。修改机器人 YAML 后需重启 pipeline；修改 Python handler 后需重新构建并
+重启。`robot-skill reload-catalog` 不会影响视觉游戏。
 
 更多具身节点说明，详见各子包 README：
 - [`embodied_agent`](../embodied_agent/README.md)

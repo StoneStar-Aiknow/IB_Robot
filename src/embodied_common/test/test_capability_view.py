@@ -165,7 +165,10 @@ def test_capability_view_exposes_only_explicit_capability_metadata_and_request_s
 
     assert view["robot_name"] == "test_robot"
     assert view["pose_names"] == ["home", "tray"]
-    assert view["timeout_policy"] == resolve_embodied_timeout_policy(config["embodied"])
+    resolved = resolve_embodied_timeout_policy(config["embodied"])
+    assert view["timeout_policy"] == {
+        name: value for name, value in resolved.items() if not name.startswith("visual_game_")
+    }
     assert [skill["name"] for skill in view["skills"]] == ["nudge", "place", "rotate", "target_pose"]
 
     assert _skill(view, "place")["parameters"] == {}
@@ -383,7 +386,9 @@ def test_capability_view_uses_resolved_timeout_policy_for_digest():
     explicit_view = _build_capability_view(explicit_defaults, explicit_policy)
 
     assert omitted_policy == explicit_policy
-    assert omitted_view["timeout_policy"] == omitted_policy
+    assert omitted_view["timeout_policy"] == {
+        name: value for name, value in omitted_policy.items() if not name.startswith("visual_game_")
+    }
     assert omitted_view["capability_digest"] == explicit_view["capability_digest"]
 
 

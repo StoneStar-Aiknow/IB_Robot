@@ -20,16 +20,18 @@ from embodied_common.depth_context import (
     summarize_depth_frame,
     summarize_pointcloud_metadata,
 )
+from embodied_common.perception_contracts import (
+    EE_POSE_INPUT,
+    JOINT_STATE_INPUT,
+    KNOWN_REQUIRED_INPUTS,
+    PRIMARY_IMAGE_INPUT,
+)
 
 # Generic snapshot input keys a request may declare via ``required_inputs``.
 # A request that omits ``required_inputs`` keeps the historical strict behavior
 # (primary image + EE pose + joint state all required); a request that names a
 # subset only blocks on those inputs, letting pure-vision requests succeed with
 # EE pose / joint state offline. Unknown keys are ignored by callers.
-PRIMARY_IMAGE_INPUT = "primary_image"
-EE_POSE_INPUT = "ee_pose"
-JOINT_STATE_INPUT = "joint_state"
-KNOWN_REQUIRED_INPUTS = frozenset({PRIMARY_IMAGE_INPUT, EE_POSE_INPUT, JOINT_STATE_INPUT})
 _DEFAULT_REQUIRED_INPUTS = KNOWN_REQUIRED_INPUTS
 
 

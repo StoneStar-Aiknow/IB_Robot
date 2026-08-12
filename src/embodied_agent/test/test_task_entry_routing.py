@@ -1,94 +1,89 @@
-"""Node-level routing tests for task_entry_node.
+"""Node-level routing tests for the generic ASR task entry."""
 
-Asserts the mutual-exclusion guarantee: one utterance belongs to exactly one
-business domain. A matched visual-game trigger produces exactly one
-SceneAnalysisRequest and zero TaskCommand / planned_task / task_status, while a
-normal motion command keeps the original planning route and produces no game
-request.
-
-Follows the repo's single-node test idiom (see
-perception_service/test/test_perception_node_observation.py): construct the real
-node with parameter overrides, mock its publishers to collect messages, then
-drive the handler directly.
-"""
-
-import json
 from unittest.mock import Mock
 
 import rclpy
-from rclpy.parameter import Parameter
 from std_msgs.msg import String
 
 from embodied_agent.task_entry_node import TaskEntryNode
 
-_SORTING_HAT_GAMES = json.dumps(
-    {"sorting_hat": {"enabled": True, "trigger_aliases": ["分院帽"]}}
-)
 
-
-def _make_node(*, perception_enabled: bool) -> tuple[TaskEntryNode, dict]:
-    node = TaskEntryNode(
-        parameter_overrides=[
-            Parameter("entry_visual_games_json", Parameter.Type.STRING, _SORTING_HAT_GAMES),
-            Parameter("perception_enabled", Parameter.Type.BOOL, perception_enabled),
-        ]
-    )
-    collected = {"task": [], "planned": [], "status": [], "perception": []}
+def _make_node() -> tuple[TaskEntryNode, list]:
+    node = TaskEntryNode()
+    collected = []
     node._publisher = Mock()  # noqa: SLF001
-    node._publisher.publish.side_effect = collected["task"].append  # noqa: SLF001
-    node._planned_publisher = Mock()  # noqa: SLF001
-    node._planned_publisher.publish.side_effect = collected["planned"].append  # noqa: SLF001
-    node._status_publisher = Mock()  # noqa: SLF001
-    node._status_publisher.publish.side_effect = collected["status"].append  # noqa: SLF001
-    node._perception_publisher = Mock()  # noqa: SLF001
-    node._perception_publisher.publish.side_effect = collected["perception"].append  # noqa: SLF001
+    node._publisher.publish.side_effect = collected.append  # noqa: SLF001
     return node, collected
 
 
-def test_game_trigger_produces_only_perception_request():
+def test_asr_text_is_forwarded_as_an_unplanned_task():
     rclpy.init()
+    node = None
     try:
-        node, collected = _make_node(perception_enabled=True)
-        node._handle_text_command(String(data="来玩分院帽"))  # noqa: SLF001
-
-        assert len(collected["perception"]) == 1
-        assert collected["perception"][0].source == "game.sorting_hat"
-        # Mutually exclusive: no task planning artifacts for the same utterance.
-        assert collected["task"] == []
-        assert collected["planned"] == []
-        assert collected["status"] == []
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
-
-def test_motion_command_keeps_task_route_and_emits_no_game():
-    rclpy.init()
-    try:
-        node, collected = _make_node(perception_enabled=True)
+        node, collected = _make_node()
         node._handle_text_command(String(data="向前移动"))  # noqa: SLF001
 
-        assert collected["perception"] == []
-        # A recognized motion command routes to the planned-task path; either way
-        # it must reach the task domain, never the game domain.
-        assert (len(collected["planned"]) + len(collected["task"])) == 1
+        assert len(collected) == 1
+        assert collected[0].source == "voice_asr"
+        assert collected[0].raw_command == "向前移动"
+        assert collected[0].task_type == "unplanned"
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
         rclpy.shutdown()
 
 
-def test_game_dropped_when_perception_disabled():
+def test_sorting_hat_text_has_no_visual_game_route():
     rclpy.init()
+    node = None
     try:
-        node, collected = _make_node(perception_enabled=False)
+        node, collected = _make_node()
         node._handle_text_command(String(data="分院帽"))  # noqa: SLF001
 
-        # Matched trigger returns early; perception is off so nothing is published,
-        # and the utterance must not fall through to task planning either.
-        assert collected["perception"] == []
-        assert collected["task"] == []
-        assert collected["planned"] == []
-        assert collected["status"] == []
+        assert len(collected) == 1
+        assert collected[0].source == "voice_asr"
+        assert collected[0].raw_command == "分院帽"
+        assert not hasattr(node, "_visual_game_client")
+        assert not hasattr(node, "_perception_publisher")
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_empty_asr_text_is_ignored():
+    rclpy.init()
+    node = None
+    try:
+        node, collected = _make_node()
+        node._handle_text_command(String(data="  "))  # noqa: SLF001
+
+        assert collected == []
+    finally:
+        if node is not None:
+            node.destroy_node()
+        rclpy.shutdown()
+
+
+def test_visual_game_routing_parameters_are_removed():
+    rclpy.init()
+    node = None
+    try:
+        node, _ = _make_node()
+
+        for parameter_name in (
+            "entry_visual_games_json",
+            "perception_enabled",
+            "perception_request_topic",
+            "visual_games_json",
+            "visual_game_aliases_json",
+            "visual_game_start_service",
+            "visual_game_config_digest",
+        ):
+            assert not node.has_parameter(parameter_name)
+        assert node.has_parameter("output_topic")
+        assert node.has_parameter("default_task_timeout_sec")
+    finally:
+        if node is not None:
+            node.destroy_node()
         rclpy.shutdown()

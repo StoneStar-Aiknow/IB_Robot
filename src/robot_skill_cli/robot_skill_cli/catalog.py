@@ -9,10 +9,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from embodied_common.dispatch_binding import delegated_executor_identity, load_delegated_model_identity
+from embodied_common.capability_view import project_capability_timeout_policy
+from embodied_common.dispatch_binding import (
+    delegated_executor_identity,
+    load_delegated_model_identity,
+)
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
+from embodied_common.visual_game_contracts import build_visual_game_capability_view
 from robot_config.config_path import resolve_robot_config_path
-from robot_config.loader import load_robot_config_dict, robot_config_digest
+from robot_config.loader import get_effective_visual_game_policies, load_robot_config_dict, robot_config_digest
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 from skill_catalog.compiler import compile_skill_catalog
 from skill_catalog.digest import (
@@ -42,9 +47,20 @@ class UnknownSkillError(ValueError):
         super().__init__(f"unknown skill: {skill_name}")
 
 
+class UnknownGameError(ValueError):
+    """Raised when a visual game is absent or disabled in robot_config."""
+
+    code = "UNKNOWN_GAME"
+
+    def __init__(self, game_name: str) -> None:
+        self.game_name = game_name
+        super().__init__(f"unknown or disabled visual game: {game_name}")
+
+
 @dataclass(frozen=True)
 class CatalogContext:
     view: dict[str, Any]
+    game_view: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -58,6 +74,23 @@ class GatewayTransport:
     validate_plan_service: str = "/embodied/validate_agent_plan"
     confirm_plan_service: str = "/embodied/confirm_agent_plan"
     execute_plan_action: str = "/embodied/execute_agent_plan"
+    start_visual_game_service: str = "/embodied/start_visual_game"
+    get_visual_game_result_service: str = "/embodied/get_visual_game_result"
+
+
+def _game_view(robot_config: dict[str, Any], timeout_policy: dict[str, float]) -> dict[str, Any]:
+    embodied = robot_config.get("embodied", {})
+    games = get_effective_visual_game_policies(robot_config)
+    return build_visual_game_capability_view(
+        str(robot_config.get("name", "")),
+        games,
+        timeout_sec=timeout_policy["visual_game_timeout_sec"],
+        result_retention_sec=timeout_policy["visual_game_result_retention_sec"],
+        result_capacity=embodied.get("visual_game_result_capacity", 128),
+        start_service=embodied.get("start_visual_game_service", "/embodied/start_visual_game"),
+        result_service=embodied.get("get_visual_game_result_service", "/embodied/get_visual_game_result"),
+        event_topic=embodied.get("visual_game_event_topic", "/embodied/visual_game_events"),
+    )
 
 
 def load_catalog_context(
@@ -68,7 +101,12 @@ def load_catalog_context(
     """Load one normalized config for public catalog use (ROS-independent)."""
     resolved_path = resolve_robot_config_path(config_name=config_name, config_path=config_path)
     robot_config = load_robot_config_dict(resolved_path)
-    return CatalogContext(view=_snapshot_capability_view(compile_local_snapshot(robot_config, resolved_path)))
+    embodied = robot_config.get("embodied", {})
+    timeout_policy = resolve_embodied_timeout_policy(embodied)
+    return CatalogContext(
+        view=_snapshot_capability_view(compile_local_snapshot(robot_config, resolved_path)),
+        game_view=_game_view(robot_config, timeout_policy),
+    )
 
 
 def load_runtime_context(
@@ -80,18 +118,62 @@ def load_runtime_context(
     resolved_path = resolve_robot_config_path(config_name=config_name, config_path=config_path)
     robot_config = load_robot_config_dict(resolved_path)
     embodied = robot_config.get("embodied", {})
+    timeout_policy = resolve_embodied_timeout_policy(embodied)
     return (
-        CatalogContext(view=_snapshot_capability_view(compile_local_snapshot(robot_config, resolved_path))),
-        GatewayTransport(
-            status_service=embodied.get("skill_gateway_status_service", "/embodied/get_skill_gateway_status"),
-            snapshot_service=embodied.get("skill_catalog_snapshot_service", "/embodied/get_skill_snapshot"),
-            reload_service=embodied.get("skill_catalog_reload_service", "/embodied/reload_skill_catalog"),
-            validate_skill_service=embodied.get("validate_skill_service", "/embodied/validate_skill"),
-            skill_action_name=embodied.get("skill_action_name", "/embodied/execute_skill"),
-            plan_service=embodied.get("plan_service", "/embodied/plan_agent_command"),
-            validate_plan_service=embodied.get("validate_plan_service", "/embodied/validate_agent_plan"),
-            confirm_plan_service=embodied.get("confirm_plan_service", "/embodied/confirm_agent_plan"),
-            execute_plan_action=embodied.get("execute_plan_action", "/embodied/execute_agent_plan"),
+        CatalogContext(
+            view=_snapshot_capability_view(compile_local_snapshot(robot_config, resolved_path)),
+            game_view=_game_view(robot_config, timeout_policy),
+        ),
+        _gateway_transport(embodied),
+    )
+
+
+def load_visual_game_context(
+    *,
+    config_name: str | None = None,
+    config_path: str | Path | None = None,
+) -> CatalogContext:
+    """Load visual-game metadata without compiling the motion Skill catalog."""
+    resolved_path = resolve_robot_config_path(config_name=config_name, config_path=config_path)
+    robot_config = load_robot_config_dict(resolved_path)
+    return _visual_game_context(robot_config)
+
+
+def load_visual_game_runtime_context(
+    *,
+    config_name: str | None = None,
+    config_path: str | Path | None = None,
+) -> tuple[CatalogContext, GatewayTransport]:
+    """Load visual-game metadata and ROS transport without motion dependencies."""
+    resolved_path = resolve_robot_config_path(config_name=config_name, config_path=config_path)
+    robot_config = load_robot_config_dict(resolved_path)
+    embodied = robot_config.get("embodied", {})
+    return _visual_game_context(robot_config), _gateway_transport(embodied)
+
+
+def _visual_game_context(robot_config: dict[str, Any]) -> CatalogContext:
+    embodied = robot_config.get("embodied", {})
+    timeout_policy = resolve_embodied_timeout_policy(embodied)
+    return CatalogContext(
+        view={"robot_name": robot_config["name"], "timeout_policy": timeout_policy},
+        game_view=_game_view(robot_config, timeout_policy),
+    )
+
+
+def _gateway_transport(embodied: dict[str, Any]) -> GatewayTransport:
+    return GatewayTransport(
+        status_service=embodied.get("skill_gateway_status_service", "/embodied/get_skill_gateway_status"),
+        snapshot_service=embodied.get("skill_catalog_snapshot_service", "/embodied/get_skill_snapshot"),
+        reload_service=embodied.get("skill_catalog_reload_service", "/embodied/reload_skill_catalog"),
+        validate_skill_service=embodied.get("validate_skill_service", "/embodied/validate_skill"),
+        skill_action_name=embodied.get("skill_action_name", "/embodied/execute_skill"),
+        plan_service=embodied.get("plan_service", "/embodied/plan_agent_command"),
+        validate_plan_service=embodied.get("validate_plan_service", "/embodied/validate_agent_plan"),
+        confirm_plan_service=embodied.get("confirm_plan_service", "/embodied/confirm_agent_plan"),
+        execute_plan_action=embodied.get("execute_plan_action", "/embodied/execute_agent_plan"),
+        start_visual_game_service=embodied.get("start_visual_game_service", "/embodied/start_visual_game"),
+        get_visual_game_result_service=embodied.get(
+            "get_visual_game_result_service", "/embodied/get_visual_game_result"
         ),
     )
 
@@ -154,7 +236,7 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
         joint_limits=robot_config.get("teleoperation", {}).get("safety", {}).get("joint_limits", {}),
         workspace_limits=embodied.get("safety", {}).get("workspace", {}),
         required_control_mode=robot_config["skill_required_control_mode"],
-        timeout_policy=resolve_embodied_timeout_policy(embodied),
+        timeout_policy=project_capability_timeout_policy(resolve_embodied_timeout_policy(embodied)),
         relative_motion_reference_frame=execution.get("relative_motion_reference_frame", "base"),
         relative_motion_step_m=execution.get("relative_motion_step_m", 0.03),
         relative_motion_direction_mapping=execution.get("relative_motion_direction_mapping", {}),
@@ -205,7 +287,7 @@ def _snapshot_capability_view(snapshot):
         "robot_name": snapshot.robot_name,
         "skills": [thaw(snapshot.capability_view[name]) for name in sorted(snapshot.capability_view)],
         "pose_names": sorted(snapshot.robot_context.named_poses),
-        "timeout_policy": thaw(snapshot.robot_context.timeout_policy),
+        "timeout_policy": project_capability_timeout_policy(snapshot.robot_context.timeout_policy),
         "capability_digest": snapshot.capability_digest,
         "profile_name": snapshot.profile_name,
     }
@@ -260,7 +342,7 @@ def capability_view_from_snapshot(snapshot: dict[str, Any], status: dict[str, An
         "robot_name": capability_preimage["robot_name"],
         "skills": [copy.deepcopy(capability_mapping[name]) for name in sorted(capability_mapping)],
         "pose_names": list(capability_preimage["named_pose_names"]),
-        "timeout_policy": copy.deepcopy(capability_preimage["timeout_policy"]),
+        "timeout_policy": project_capability_timeout_policy(capability_preimage["timeout_policy"]),
         "capability_digest": snapshot["capability_digest"],
         "profile_name": capability_preimage["profile_name"],
     }
@@ -308,4 +390,42 @@ def list_poses(view: dict[str, Any]) -> dict[str, Any]:
         "robot_name": view["robot_name"],
         "config_digest": view["capability_digest"],
         "poses": list(view["pose_names"]),
+    }
+
+
+def list_games(game_view: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "robot_name": game_view["robot_name"],
+        "config_digest": game_view["config_digest"],
+        "games": [
+            {
+                "name": game["name"],
+                "summary": game["summary"],
+                "result_field": game["result_schema"]["field"],
+            }
+            for game in game_view["games"]
+        ],
+    }
+
+
+def require_enabled_game(game_view: dict[str, Any], game_name: str) -> dict[str, Any]:
+    normalized_name = game_name.strip()
+    for game in game_view["games"]:
+        if game["name"] == normalized_name:
+            return copy.deepcopy(game)
+    raise UnknownGameError(normalized_name)
+
+
+def describe_game(game_view: dict[str, Any], game_name: str) -> dict[str, Any]:
+    game = require_enabled_game(game_view, game_name)
+    return {
+        "robot_name": game_view["robot_name"],
+        "name": game["name"],
+        "summary": game["summary"],
+        "required_inputs": game["required_inputs"],
+        "result_schema": game["result_schema"],
+        "timeout_sec": game_view["timeout_sec"],
+        "result_retention_sec": game_view["result_retention_sec"],
+        "result_capacity": game_view["result_capacity"],
+        "config_digest": game_view["config_digest"],
     }

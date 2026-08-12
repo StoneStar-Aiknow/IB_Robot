@@ -13,10 +13,12 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
+import yaml
 from ament_index_python.packages import get_package_share_directory
 
 from robot_config.config_path import resolve_robot_config_path
-from robot_skill_cli.catalog import load_runtime_context
+from robot_config.loader import get_effective_visual_game_policies, load_robot_config_dict
+from robot_skill_cli.catalog import load_runtime_context, load_visual_game_runtime_context
 from robot_skill_cli.cli import _create_bridge
 from robot_skill_cli.ros_bridge import BridgeError
 
@@ -42,6 +44,12 @@ def _build_parser() -> argparse.ArgumentParser:
     config_group = parser.add_mutually_exclusive_group()
     config_group.add_argument("--config-name")
     config_group.add_argument("--config-path")
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "motion", "visual-games", "both"),
+        default="auto",
+        help="Hermes runtime preflight mode (default: auto)",
+    )
     parser.add_argument("hermes_args", nargs=argparse.REMAINDER, help="arguments passed to Hermes after --")
     return parser
 
@@ -219,9 +227,38 @@ def _prepare_robot_skill_wrapper(
     return wrapper_dir
 
 
-def _check_robot_runtime(config_name: str | None, config_path: str | None) -> Path:
+def _resolve_preflight_mode(mode: str, config_path: Path) -> str:
+    if mode != "auto":
+        return mode
+    try:
+        config = load_robot_config_dict(config_path)
+    except (OSError, ValueError):
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        config = raw.get("robot", raw) if isinstance(raw, dict) else {}
+    embodied = config.get("embodied", {}) if isinstance(config, dict) else {}
+    games = get_effective_visual_game_policies(config)
+    has_visual_games = (
+        any(isinstance(policy, dict) and policy.get("enabled") is True for policy in games.values())
+        if isinstance(games, dict)
+        else False
+    )
+    has_motion_skills = bool(
+        isinstance(embodied, dict)
+        and str(embodied.get("skill_catalog_profile", "")).strip()
+        and str(config.get("skill_required_control_mode", "")).strip()
+    )
+    if has_visual_games and has_motion_skills:
+        return "both"
+    if has_visual_games:
+        return "visual-games"
+    return "motion"
+
+
+def _check_robot_runtime(config_name: str | None, config_path: str | None, mode: str = "auto") -> Path:
     resolved = resolve_robot_config_path(config_name=config_name, config_path=config_path)
-    context, transport = load_runtime_context(config_name=config_name, config_path=config_path)
+    preflight_mode = _resolve_preflight_mode(mode, resolved)
+    context_loader = load_visual_game_runtime_context if preflight_mode == "visual-games" else load_runtime_context
+    context, transport = context_loader(config_name=config_name, config_path=config_path)
     timeout_sec = max(float(context.view["timeout_policy"]["rpc_timeout_sec"]), _PREFLIGHT_TIMEOUT_FLOOR_SEC)
     last_bridge_error = None
     for attempt in range(_PREFLIGHT_ATTEMPTS):
@@ -229,14 +266,22 @@ def _check_robot_runtime(config_name: str | None, config_path: str | None) -> Pa
         if not bridge.start():
             raise LauncherError("ROS_UNAVAILABLE", "failed to initialize the robot Gateway bridge")
         try:
-            status = bridge.get_status(timeout_sec=timeout_sec)
-            if not status["control_plane_ready"]:
+            if preflight_mode in {"visual-games", "both"} and not bridge.wait_for_visual_game_interfaces(
+                timeout_sec=timeout_sec
+            ):
                 raise LauncherError(
-                    status["control_plane_error_code"] or "SKILL_REGISTRY_NOT_READY",
-                    "robot Gateway control plane is not ready",
+                    "VISUAL_GAME_INTERFACES_UNAVAILABLE",
+                    "visual-game start/result services are not discoverable",
                 )
-            if not bridge.wait_for_agent_plan_interfaces(timeout_sec=timeout_sec):
-                raise LauncherError("AGENT_PLAN_UNAVAILABLE", "Agent plan services/action are not discoverable")
+            if preflight_mode in {"motion", "both"}:
+                status = bridge.get_status(timeout_sec=timeout_sec)
+                if not status["control_plane_ready"]:
+                    raise LauncherError(
+                        status["control_plane_error_code"] or "SKILL_REGISTRY_NOT_READY",
+                        "robot Gateway control plane is not ready",
+                    )
+                if not bridge.wait_for_agent_plan_interfaces(timeout_sec=timeout_sec):
+                    raise LauncherError("AGENT_PLAN_UNAVAILABLE", "Agent plan services/action are not discoverable")
             return resolved
         except BridgeError as exc:
             last_bridge_error = exc
@@ -253,7 +298,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         hermes_path = _require_binary("hermes")
         robot_skill_path = _require_binary("robot-skill")
         _check_hermes_version(hermes_path)
-        config_path = _check_robot_runtime(args.config_name, args.config_path)
+        if args.mode == "auto":
+            config_path = _check_robot_runtime(args.config_name, args.config_path)
+        else:
+            config_path = _check_robot_runtime(args.config_name, args.config_path, args.mode)
         workspace = _prepare_hermes_workspace()
         skills_directory = _hermes_skills_directory(hermes_path)
         _register_hermes_skill(_installed_skill_path(), skills_directory)

@@ -52,15 +52,32 @@ ibrobot_msgs / rclpy
 - `embodied_common.skill_templates.DEFAULT_WAYPOINT_DURATION_SEC`
 - `embodied_common.skill_templates.is_skill_disabled`
 - `embodied_common.skill_templates.get_skill_templates`
+- `embodied_common.capability_view.build_capability_view`
+- `embodied_common.visual_game_contracts.normalize_visual_game_policies`
+- `embodied_common.visual_game_contracts.load_visual_game_policies_json`
+- `embodied_common.visual_game_contracts.get_visual_game_handler`
+- `embodied_common.visual_game_contracts.get_default_visual_game_handler`
+- `embodied_common.visual_game_contracts.get_visual_game_prompt`
+- `embodied_common.visual_game_contracts.build_visual_game_capability_view`
+- `embodied_common.perception_contracts.validate_result_schema`
+- `embodied_common.visual_game_contracts.validate_visual_game_result`
+- `embodied_common.visual_game_contracts.get_visual_game_terminal_error`
 - `embodied_common.skill_request.canonical_skill_payload`
 - `embodied_common.skill_request.skill_payload_hash`
 - `embodied_common.skill_request.skill_goal_uuid`
 - `embodied_common.skill_request.derive_skill_task_id`
-- `embodied_common.rgbd_snapshot.KNOWN_REQUIRED_INPUTS`
+- `embodied_common.perception_contracts.KNOWN_REQUIRED_INPUTS`
+- `embodied_common.perception_contracts.SCENE_ANALYSIS_RESULT_FIELD_KINDS`
 - `embodied_common.rgbd_snapshot.RGBDSnapshotBuffer.build_snapshot`
 - `embodied_common.vlm_api_client.VLMAPIClient.analyze`（原有底层接口，返回 `(str, dict)`，向后兼容）
 - `embodied_common.vlm_api_client.VLMAPIClient.complete`（底层扩展接口，返回结构化 dict）
 - `embodied_common.vlm_api_client.VLMClient`（高层客户端，一行式多模型调用，自动路由 / 建图 / 上下文）
+
+视觉游戏 JSON loader 供 `embodied_agent.visual_game_gateway_node` 解析 ROS 参数；
+`get_default_visual_game_handler` 供
+`embodied_agent.visual_games` 解析默认 handler；`perception_contracts.validate_result_schema` 供
+`perception_service.perception_service_node` 与视觉游戏 Gateway 共享业务中立的结果 schema 校验；
+`get_visual_game_terminal_error` 供 `embodied_agent.visual_game_gateway_node` 映射声明的终态错误。
 
 ## Capability Gateway 公开视图
 
@@ -92,6 +109,12 @@ float32 字段对齐）。`canonical_skill_payload()` 在未给出 timeout 时�
 `uuid.NAMESPACE_URL` 下的 `ibrobot:{task_id}`。`derive_skill_task_id(parent_task_id, skill_index)`
 派生 `<parent>/skill/<1-based index>` 形式的 child task ID，供 task_executor 与未来消费者共用。
 这些 helper 不包含 primitive 或 ROS transport 数据。
+
+视觉游戏 handler definition 同样保持 ROS 无关。部署策略只包含 `enabled`、`announce`、`handler`
+与公开 `summary`；共享 registry 是 required inputs、结果 schema 和运行时 prompt 的唯一声明源。
+公共 capability 只投影契约字段，不暴露 prompt；`embodied_agent` 通过 accessor 读取同一 definition 的 prompt，
+不再维护第二份 handler/prompt 映射。
+视觉游戏只通过 Agent 的 `robot-skill` 控制面触发，不声明或解析 ASR aliases。
 
 ## 输入前置条件（required_inputs）
 

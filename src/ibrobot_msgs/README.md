@@ -126,6 +126,21 @@ Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `Vali
 | `objects_json` | `string` | 检测到的物体列表（JSON） |
 | `error_message` | `string` | 失败时的错误信息 |
 
+### 视觉游戏控制服务
+
+`StartVisualGame.srv` 按调用方 `request_id`、`game_name` 和 `expected_config_digest` 幂等发起视觉游戏，
+并返回 `accepted`、`duplicate`、实际 `config_digest` 和错误字段；
+`GetVisualGameResult.srv` 按 `request_id` 返回 `found`、`terminal`、`success`、`game_name`、
+通用 `result_json`、常用结果便捷字段 `scene_summary`、`config_digest` 和错误字段。两者是 Agent/CLI 的纯控制面，
+不传图像、raw response 或音频，
+也不负责 TTS。
+
+`VisualGameEvent.msg` 是视觉游戏的异步事件通知边界，发布到
+`/embodied/visual_game_events`。它包含调用方 `request_id`、每次真实准入生成的 `execution_id`、游戏名、版本化 handler、是否要求播报（`announce`）、
+`accepted`/`succeeded`/`failed` 状态、结果摘要、错误码和配置摘要，供 TTS、UI 或日志消费者订阅。
+执行 TTS 等外部副作用的消费者应使用 live-only 订阅，并按 `execution_id` 去重，不能在重启后回放旧事件；
+同一 request ID 在 ledger retention 过期后重新准入时会得到新的 execution ID。
+
 ### `Detection2D.msg`
 
 二维检测、mask 和由深度反投影得到的 3D 目标几何信息。
