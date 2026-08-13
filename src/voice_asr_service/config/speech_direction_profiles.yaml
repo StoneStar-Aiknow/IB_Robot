@@ -1,0 +1,12 @@
+# speech_direction 平台差异覆盖。
+# 公共算法、阵列、门控、时序和诊断参数只维护在 speech_direction.yaml。
+profiles:
+  ascend_310p: {}
+  ubuntu_cuda:
+    silero_vad_backend: "onnx"
+    # Silero VAD ONNX（官方最新版，input/state/sr 三输入，state [2,1,128]）；
+    # 用官方默认文件名，升级只换 models/voice_asr/silero-vad/silero_vad.onnx 不改代码。
+    silero_vad_model_path: "voice_asr/silero-vad/silero_vad.onnx"
+    fullsubnet_backend: "stateful_torch_cuda"
+    fullsubnet_device: "cuda"
+  custom: {}

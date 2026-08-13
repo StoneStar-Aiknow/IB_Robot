@@ -4,13 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
 from inference_manifest import ArtifactBindings, TensorBinding
 from inference_service.backends.ascend.acl_runtime import AclRuntimeLease, check_acl_ret
 from inference_service.backends.errors import BackendInferenceError, BackendLoadError
-from inference_service.codecs import BoundInputs
+
+if TYPE_CHECKING:
+    from inference_service.codecs import BoundInputs
+else:
+    BoundInputs = Any
 
 ACL_MEM_MALLOC_HUGE_FIRST = 0
 ACL_MEMCPY_HOST_TO_DEVICE = 1
@@ -89,7 +94,20 @@ class _DatasetBuffer:
 
 
 class AclModel:
-    """One loaded OM model with deterministic datasets, buffers, and host staging."""
+    """One loaded OM model with deterministic datasets, buffers, and host staging.
+
+    并发契约:
+
+    同一个 ``AclModel`` 实例的 ``execute()`` 与 ``execute_bank()`` **不可并发调用**
+    ——两者共享 ``self.model_id`` 与 ACL 上下文，并发会破坏 dataset 状态。
+    调用方负责串行化：legacy 单 dataset 路径由 ``AscendOmModelSession._run_role``
+    经 admission control 串行；stateful 双 bank 路径由 ``SileroVadAclRunner`` /
+    ``StatefulAclFullSubNetRunner`` 持 ``self._lock`` 保证 ``execute_bank`` 串行。
+
+    ``prepare_dataset_banks`` 与 legacy ``prepare_datasets`` 互斥：前者构建
+    ``_dataset_banks`` 后，``execute()``（走 legacy ``input_dataset``）不再可用，
+    调用方须全程用 ``execute_bank``。两条路径不会在同一实例上混用。
+    """
 
     def __init__(self, lease: AclRuntimeLease, role: str, path: Path, bindings: ArtifactBindings) -> None:
         self._lease = lease
@@ -106,6 +124,12 @@ class AclModel:
         self.input_buffers: list[_DatasetBuffer] = []
         self.output_buffers: list[_DatasetBuffer] = []
         self.output_host_buffers: list[object | None] = []
+        # Stateful 推理路径使用预创建的多 dataset 做 hidden/cell ping-pong，
+        # 避免 recurrent state 在 Host/Device 间反复拷贝。
+        self._dataset_banks: list[tuple[object, list[_DatasetBuffer], object, list[_DatasetBuffer]]] = []
+        self._dataset_bank_host_buffers: list[list[object | None]] = []
+        self._host_output_indices: set[int] = set()
+        self._owned_device_buffers: list[_DatasetBuffer] = []
         self._closed = False
 
     def load_descriptor(self) -> None:
@@ -144,6 +168,96 @@ class AclModel:
         except Exception:
             self.close()
             raise
+
+    def prepare_dataset_banks(
+        self,
+        input_overrides: tuple[dict[int, AclDeviceBuffer], ...],
+        output_overrides: tuple[dict[int, AclDeviceBuffer], ...],
+        *,
+        host_output_indices: set[int],
+    ) -> None:
+        """一次创建多套静态dataset，供stateful模型轮换Device状态。"""
+        if not self.input_descriptors or not self.output_descriptors:
+            raise ValueError("prepare_dataset_banks 前必须先调用 load_descriptor() 完成 IO 描述")
+        if len(input_overrides) != len(output_overrides) or not input_overrides:
+            raise ValueError("dataset bank的输入/输出override数量必须一致且非空")
+        try:
+            self._host_output_indices = set(host_output_indices)
+            for input_bank, output_bank in zip(input_overrides, output_overrides, strict=True):
+                input_dataset, input_buffers = self._create_dataset(self.input_descriptors, input_bank)
+                output_dataset, output_buffers = self._create_dataset(self.output_descriptors, output_bank)
+                host_buffers: list[object | None] = []
+                for descriptor in self.output_descriptors:
+                    if descriptor.index in self._host_output_indices:
+                        host_buffer, ret = self._acl.rt.malloc_host(descriptor.size)
+                        check_acl_ret(ret, f"acl.rt.malloc_host({self.role} output {descriptor.index})")
+                        host_buffers.append(host_buffer)
+                    else:
+                        host_buffers.append(None)
+                self._dataset_banks.append((input_dataset, input_buffers, output_dataset, output_buffers))
+                self._dataset_bank_host_buffers.append(host_buffers)
+        except Exception:
+            self._close_dataset_banks()
+            raise
+
+    def execute_bank(self, bank: int, inputs: BoundInputs | dict[int, np.ndarray]) -> dict[int, np.ndarray]:
+        """执行指定静态dataset；非owned输入（包括hidden/cell）绝不H2D。"""
+        if not self._dataset_banks:
+            raise BackendInferenceError(f"Ascend role {self.role!r}没有dataset bank", code="runtime_not_loaded")
+        try:
+            input_dataset, input_buffers, output_dataset, output_buffers = self._dataset_banks[bank]
+            host_buffers = self._dataset_bank_host_buffers[bank]
+        except IndexError as exc:
+            raise BackendInferenceError(f"Ascend role {self.role!r} bank索引无效", code="invalid_bank") from exc
+        self._lease.bind_current_thread()
+        values = self._indexed_inputs(inputs)
+        for descriptor, buffer in zip(self.input_descriptors, input_buffers, strict=True):
+            if not buffer.owned:
+                continue
+            if descriptor.index not in values:
+                raise BackendInferenceError(f"缺少{self.role}输入{descriptor.index}", code="missing_runtime_input")
+            payload = np.ascontiguousarray(values[descriptor.index]).tobytes()
+            if len(payload) != buffer.size:
+                raise BackendInferenceError(
+                    f"{self.role}输入{descriptor.index}字节数不匹配", code="input_size_mismatch"
+                )
+            source = self._acl.util.bytes_to_ptr(payload)
+            check_acl_ret(
+                self._acl.rt.memcpy(buffer.pointer, buffer.size, source, len(payload), ACL_MEMCPY_HOST_TO_DEVICE),
+                f"acl.mdl.execute H2D({self.role})",
+            )
+        check_acl_ret(
+            self._acl.mdl.execute(self.model_id, input_dataset, output_dataset), f"acl.mdl.execute({self.role})"
+        )
+        result: dict[int, np.ndarray] = {}
+        for descriptor, buffer, host_buffer in zip(self.output_descriptors, output_buffers, host_buffers, strict=True):
+            if descriptor.index not in self._host_output_indices:
+                continue
+            if host_buffer is None:
+                raise BackendInferenceError(
+                    f"{self.role}输出{descriptor.index}没有Host staging", code="missing_host_staging"
+                )
+            check_acl_ret(
+                self._acl.rt.memcpy(host_buffer, buffer.size, buffer.pointer, buffer.size, ACL_MEMCPY_DEVICE_TO_HOST),
+                f"acl.mdl.execute D2H({self.role})",
+            )
+            dtype = descriptor.dtype or np.dtype("float32")
+            value = np.frombuffer(self._acl.util.ptr_to_bytes(host_buffer, buffer.size), dtype=dtype).copy()
+            if descriptor.shape is not None and all(d > 0 for d in descriptor.shape):
+                value = value.reshape(descriptor.shape)
+            result[descriptor.index] = value
+        return result
+
+    def _close_dataset_banks(self) -> None:
+        for host_buffers in reversed(self._dataset_bank_host_buffers):
+            for host_buffer in reversed(host_buffers):
+                if host_buffer is not None:
+                    self._acl.rt.free_host(host_buffer)
+        self._dataset_bank_host_buffers.clear()
+        for input_dataset, input_buffers, output_dataset, output_buffers in reversed(self._dataset_banks):
+            self._destroy_dataset(output_dataset, output_buffers)
+            self._destroy_dataset(input_dataset, input_buffers)
+        self._dataset_banks.clear()
 
     def execute(
         self,
@@ -224,6 +338,27 @@ class AclModel:
             outputs[descriptor.index] = value
         return outputs
 
+    def allocate_device_buffer(self, size: int) -> AclDeviceBuffer:
+        """申请由模型持有的常驻Device buffer，供dataset bank复用。"""
+        pointer, ret = self._acl.rt.malloc(size, ACL_MEM_MALLOC_HUGE_FIRST)
+        check_acl_ret(ret, f"acl.rt.malloc({self.role} shared state)")
+        buffer = _DatasetBuffer(pointer, None, size, True)
+        self._owned_device_buffers.append(buffer)
+        return AclDeviceBuffer(pointer=pointer, size=size)
+
+    def zero_device_buffer(self, buffer: AclDeviceBuffer) -> None:
+        """清零常驻状态；优先使用ACL memset，兼容测试runtime则一次H2D零值。"""
+        memset = getattr(self._acl.rt, "memset", None)
+        if callable(memset):
+            check_acl_ret(memset(buffer.pointer, buffer.size, 0, buffer.size), f"acl.rt.memset({self.role})")
+            return
+        payload = bytes(buffer.size)
+        source = self._acl.util.bytes_to_ptr(payload)
+        check_acl_ret(
+            self._acl.rt.memcpy(buffer.pointer, buffer.size, source, buffer.size, ACL_MEMCPY_HOST_TO_DEVICE),
+            f"acl.rt.memcpy zero H2D({self.role})",
+        )
+
     def output_buffer(self, index: int) -> AclDeviceBuffer:
         try:
             buffer = self.output_buffers[index]
@@ -240,6 +375,7 @@ class AclModel:
         self._closed = True
         acl = self._acl
         self._lease.bind_current_thread()
+        self._close_dataset_banks()
         for host_buffer in reversed(self.output_host_buffers):
             if host_buffer is not None:
                 acl.rt.free_host(host_buffer)
@@ -248,6 +384,9 @@ class AclModel:
         self._destroy_dataset(self.input_dataset, self.input_buffers)
         self.output_dataset = None
         self.input_dataset = None
+        for buffer in reversed(self._owned_device_buffers):
+            acl.rt.free(buffer.pointer)
+        self._owned_device_buffers.clear()
         if self.model_desc is not None:
             acl.mdl.destroy_desc(self.model_desc)
             self.model_desc = None
@@ -449,10 +588,19 @@ class AclModel:
             self._acl.mdl.destroy_dataset(dataset)
 
     @staticmethod
-    def _indexed_inputs(inputs: BoundInputs | dict[int, np.ndarray]) -> dict[int, np.ndarray]:
-        if isinstance(inputs, BoundInputs):
-            return {int(tensor.index): tensor.value for tensor in inputs.tensors if tensor.index is not None}
-        return inputs
+    def _indexed_inputs(inputs: object | dict[int, np.ndarray]) -> dict[int, np.ndarray]:
+        # BoundInputs 在运行时因避免循环导入退化为 Any（见文件头 TYPE_CHECKING
+        # 块），这里在入口守住契约边界——dict 走 legacy 索引化，否则要求对象有
+        # .tensors 属性（BoundInputs 协议）；传错在此早报错而非深入 ACL
+        # memcpy 时才抛 AttributeError。
+        if isinstance(inputs, dict):
+            return inputs
+        tensors = getattr(inputs, "tensors", None)
+        if tensors is None:
+            raise TypeError(
+                f"inputs 必须是 dict[int, np.ndarray] 或 BoundInputs（带 .tensors 属性），得到 {type(inputs).__name__}"
+            )
+        return {int(tensor.index): tensor.value for tensor in tensors if tensor.index is not None}
 
     @staticmethod
     def _shapes_compatible(manifest_shape: tuple[int, ...], runtime_shape: tuple[int, ...]) -> bool:

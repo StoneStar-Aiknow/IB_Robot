@@ -33,6 +33,7 @@ class SessionManifest:
         save_enh4ch: bool,
         save_frame_metrics: bool,
         save_gray_events: bool,
+        thresholds: dict[str, float] | None = None,
     ) -> None:
         self._session_dir = Path(session_dir)
         self._manifest_path = self._session_dir / "manifest.json"
@@ -71,6 +72,7 @@ class SessionManifest:
             "sample_rate": sample_rate,
             "rollover_seconds": rollover_seconds,
             "audio_format": dict(_AUDIO_FORMAT),
+            "thresholds": None if thresholds is None else {key: float(value) for key, value in thresholds.items()},
             "streams": {
                 "raw6ch": {
                     "enabled": save_raw6ch,
@@ -87,6 +89,14 @@ class SessionManifest:
                     "volumes": [],
                 },
             },
+            "capture": {
+                "frames_captured": 0,
+                "ring_capacity_frames": 0,
+                "ring_overwrite_events": 0,
+                "ring_overwritten_frames": 0,
+                "pipeline_gap_count": 0,
+                "pipeline_gap_frames": 0,
+            },
             "gray_events": {
                 "enabled": save_gray_events,
                 "path": "events/gray_events.jsonl",
@@ -98,6 +108,12 @@ class SessionManifest:
                 "disabled_session_sample": None,
                 "disabled_session_seconds": None,
                 "dropped_count": 0,
+                "raw_ingest": {
+                    "packets_accepted": 0,
+                    "frames_accepted": 0,
+                    "packets_dropped": 0,
+                    "frames_dropped": 0,
+                },
             },
         }
         self._persist(document)
@@ -129,6 +145,23 @@ class SessionManifest:
         if wav_format is not None:
             volume["wav_format"] = copy.deepcopy(wav_format)
         candidate["streams"][stream]["volumes"].append(volume)
+        self._commit(candidate)
+
+    def set_capture_stats(self, stats: dict[str, int]) -> None:
+        """记录采集、Ring覆盖和pipeline gap终态统计。"""
+        candidate = copy.deepcopy(self._document)
+        for key in candidate["capture"]:
+            if key in stats:
+                candidate["capture"][key] = int(stats[key])
+        self._commit(candidate)
+
+    def set_raw_ingest_stats(self, stats: dict[str, int]) -> None:
+        """记录采集raw旁路接受和丢弃的包/帧数。"""
+        candidate = copy.deepcopy(self._document)
+        target = candidate["recorder"]["raw_ingest"]
+        for key in target:
+            if key in stats:
+                target[key] = int(stats[key])
         self._commit(candidate)
 
     def set_gray_event_count(self, count: int) -> None:

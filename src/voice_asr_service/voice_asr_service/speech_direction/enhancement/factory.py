@@ -1,0 +1,71 @@
+"""FullSubNet stateful executor 与公共 Host 增强器装配。"""
+
+from __future__ import annotations
+
+from contextlib import suppress
+
+from .fullsubnet_stateful import StatefulFullSubNetEnhancer
+
+
+def build_stateful_fullsubnet(
+    *,
+    backend: str,
+    repo_dir: str = "",
+    checkpoint_path: str = "",
+    manifest_path: str = "",
+    fb_om_path: str = "",
+    sb_om_path: str = "",
+    device: str = "cuda",
+    device_id: int = 0,
+    acl_config_path: str = "",
+    timing_enabled: bool = False,
+) -> StatefulFullSubNetEnhancer:
+    """仅在此选择模型执行器；两个平台随后共用同一 Host 算法实现。"""
+    canonical = {
+        "stateful_om": "stateful_raw_acl",
+        "stateful_raw_acl": "stateful_raw_acl",
+        "stateful_torch": "stateful_torch_cuda",
+        "stateful_torch_cuda": "stateful_torch_cuda",
+        "stateful_torch_cpu": "stateful_torch_cpu",
+    }.get(backend, backend)
+
+    executor = None
+    try:
+        if canonical == "stateful_raw_acl":
+            from .fullsubnet_stateful_acl import StatefulAclFullSubNetRunner
+
+            executor = StatefulAclFullSubNetRunner(
+                fb_om_path,
+                sb_om_path,
+                device_id=device_id,
+                acl_config_path=acl_config_path,
+                timing_enabled=timing_enabled,
+            )
+        elif canonical in {"stateful_torch_cuda", "stateful_torch_cpu"}:
+            from .fullsubnet_stateful_torch import StatefulTorchFullSubNetExecutor
+
+            requested_device = "cpu" if canonical.endswith("_cpu") else device
+            if canonical == "stateful_torch_cuda" and requested_device != "cuda":
+                raise ValueError("stateful_torch_cuda 必须配置 fullsubnet_device=cuda")
+            executor = StatefulTorchFullSubNetExecutor(
+                repo_dir,
+                checkpoint_path,
+                manifest_path,
+                device=requested_device,
+                timing_enabled=timing_enabled,
+            )
+        else:
+            raise ValueError(f"不支持的 stateful FullSubNet backend: {backend}")
+        return StatefulFullSubNetEnhancer(
+            executor,
+            manifest_path=manifest_path,
+            timing_enabled=timing_enabled,
+        )
+    except Exception:
+        if executor is not None:
+            with suppress(Exception):
+                executor.close()
+        raise
+
+
+__all__ = ["build_stateful_fullsubnet"]

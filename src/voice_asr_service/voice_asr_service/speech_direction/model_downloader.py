@@ -4,10 +4,15 @@
 对齐 perception_service/grounded_sam2_wrapper.py 的风格:节点启动时校验模型,
 缺失则抛 FileNotFoundError 并提示运行下载脚本,节点直接退出(不降级保持运行)。
 
-需要的模型(均不入库,放 models/ 下,通过 scripts/download_speech_direction_models.sh 下载):
-  1. Silero VAD v5 ONNX    — models/voice_asr/silero-vad/silero_vad_v5.onnx(与 voice_asr 共用)
-  2. FullSubNet 源码仓      — models/fullsubnet_repo/(git clone,需 model.py)
-  3. FullSubNet ckpt        — models/fullsubnet/fullsubnet_best_model_58epochs.tar(~67MB)
+生产路径使用 require_configured_models():从 speech_direction.yaml 读取实际模型路径
+校验,与平台 profile 一致。下方的旧常量/resolve_assets()/require_models() 仅供 CLI
+自检与兼容入口,不再代表生产资产清单。
+
+生产资产(均不入库,放 models/ 下,通过 python3 scripts/verify_speech_direction_assets.py 校验):
+  1. Silero VAD OM/ONNX — 310P raw_acl 用 OM;Ubuntu 用 ONNX(与 voice_asr 共用目录)
+  2. FullSubNet 源码仓     — models/fullsubnet_repo/(Ubuntu Torch 后端需 model.py)
+  3. FullSubNet cumulative ckpt — models/fullsubnet/cum_fullsubnet_best_model_218epochs.tar
+  4. stateful FB/SB 拆分 OM + manifest(310P raw_acl 专用,由 HF 脚本拉取)
 """
 
 from __future__ import annotations
@@ -18,24 +23,21 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# 工作区根目录(voice_asr_service 包向上 3 级到 IB_Robot/)
+# 工作区根目录(voice_asr_service/speech_direction/model_downloader.py 向上 5 级到 IB_Robot/)
 _WORKSPACE_ROOT = Path(__file__).resolve().parents[4]
 _DEFAULT_MODELS_ROOT = _WORKSPACE_ROOT / "models"
 
-# Silero VAD v5(与 voice_asr_service 共用)
-SILERO_VAD_REL = "voice_asr/silero-vad/silero_vad_v5.onnx"
+# Silero VAD(与 voice_asr_service 共用目录);310P 用 OM,Ubuntu 用 ONNX,具体文件名由 yaml 指定。
+SILERO_VAD_REL = "voice_asr/silero-vad/silero_vad.onnx"
 
 # FullSubNet 源码仓(git clone 产物,只需 recipes/dns_interspeech_2020/fullsubnet/model.py)
+# 源仓 clone 地址与 checkpoint 下载源由 scripts/ 下脚本各管各的，本模块只做路径校验，
+# 不持有可能过期的下载 URL（218epochs cumulative ckpt 的真实交付源是 HF manifest）。
 FULLSUBNET_REPO_REL = "fullsubnet_repo"
 FULLSUBNET_MODEL_REL = "recipes/dns_interspeech_2020/fullsubnet/model.py"
-FULLSUBNET_REPO_URL = "https://github.com/Audio-WestlakeU/FullSubNet.git"
 
-# FullSubNet ckpt(67MB,不入库)
-# 官方下载源:Audio-WestlakeU/FullSubNet v0.2 release(文件名匹配 58epochs 预训练版本)
-FULLSUBNET_CKPT_REL = "fullsubnet/fullsubnet_best_model_58epochs.tar"
-FULLSUBNET_CKPT_URL = (
-    "https://github.com/Audio-WestlakeU/FullSubNet/releases/download/v0.2/fullsubnet_best_model_58epochs.tar"
-)
+# FullSubNet cumulative ckpt(218epochs,两平台共用同一权重)
+FULLSUBNET_CKPT_REL = "fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
 
 
 @dataclass(frozen=True)
@@ -78,7 +80,7 @@ def resolve_assets(models_root: Path | None = None) -> ModelStatus:
     root = models_root or _DEFAULT_MODELS_ROOT
     return ModelStatus(
         silero_vad=ModelAsset(
-            name="Silero VAD v5",
+            name="Silero VAD",
             path=root / SILERO_VAD_REL,
             required_for="人声门控(Silero VAD 推理)",
         ),
@@ -103,7 +105,7 @@ def resolve_configured_assets(
     """按 ROS 配置给出的最终路径构造模型资产状态。"""
     return ModelStatus(
         silero_vad=ModelAsset(
-            name="Silero VAD v5",
+            name="Silero VAD",
             path=Path(silero_vad_path),
             required_for="人声门控(Silero VAD 推理)",
         ),
@@ -130,7 +132,7 @@ def _raise_missing(status: ModelStatus, location_summary: str) -> None:
     detail = "\n".join(f"{asset.name} not found: {asset.path}" for asset in missing)
     raise FileNotFoundError(
         f"speech_direction 模型缺失(共 {len(missing)} 项):\n{detail}\n"
-        "Run: ./scripts/download_speech_direction_models.sh\n"
+        "Run: python3 scripts/verify_speech_direction_assets.py（仅校验；310P 资产需从 NAS 手动获取）\n"
         f"模型位置: {location_summary}"
     )
 
@@ -139,14 +141,100 @@ def require_configured_models(
     silero_vad_path: str | Path,
     fullsubnet_repo_dir: str | Path,
     fullsubnet_ckpt_path: str | Path,
+    *,
+    silero_backend: str = "om",
+    fullsubnet_backend: str = "om",
+    fullsubnet_om_path: str | Path = "",
+    fullsubnet_stateful_fb_om_path: str | Path = "",
+    fullsubnet_stateful_sb_om_path: str | Path = "",
+    fullsubnet_stateful_manifest_path: str | Path = "",
 ) -> None:
-    """校验 ROS 参数指定的三个最终模型资产路径。"""
-    status = resolve_configured_assets(
-        silero_vad_path,
-        fullsubnet_repo_dir,
-        fullsubnet_ckpt_path,
-    )
-    _raise_missing(status, "来自 speech_direction ROS 参数")
+    """校验 ROS 参数指定的模型资产路径。
+
+    om 后端(默认,310P1 部署形态):
+      - silero 校验 silero_vad_path 指向的 .om 文件
+      - fullsubnet 校验 fullsubnet_om_path 指向的 .om 文件(repo_dir/ckpt 可省)
+    torch/onnx 后端(回归基线):
+      - 校验 silero .onnx、fullsubnet_repo model.py、fullsubnet ckpt 三件套
+    """
+    # 构造待校验资产列表(按后端决定校验哪些)
+    assets = []
+
+    # Silero VAD:raw_acl/兼容om校验 .om，onnx 校验 .onnx。
+    silero_path = Path(silero_vad_path)
+    if silero_backend in {"om", "raw_acl"}:
+        assets.append(
+            ModelAsset(
+                name="Silero VAD om",
+                path=silero_path,
+                required_for="人声门控(Silero VAD om 推理,NPU)",
+            )
+        )
+    else:
+        assets.append(
+            ModelAsset(
+                name="Silero VAD ONNX",
+                path=silero_path,
+                required_for="人声门控(Silero VAD onnx 推理,CPU 基线)",
+            )
+        )
+
+    # FullSubNet:raw ACL 校验 FB/SB/manifest；stateful Torch 校验 repo/ckpt/manifest。
+    if fullsubnet_backend in {"stateful_om", "stateful_raw_acl"}:
+        for name, path, purpose in (
+            ("FullSubNet cumulative FB stateful om", fullsubnet_stateful_fb_om_path, "FB stateful推理"),
+            ("FullSubNet cumulative SB stateful om", fullsubnet_stateful_sb_om_path, "SB stateful推理"),
+            ("FullSubNet cumulative manifest", fullsubnet_stateful_manifest_path, "checkpoint/norm契约校验"),
+        ):
+            if not path:
+                raise ValueError(f"fullsubnet stateful raw ACL 后端未提供{name}")
+            assets.append(ModelAsset(name=name, path=Path(path), required_for=purpose))
+    elif fullsubnet_backend in {"om", "legacy_om"}:
+        if not fullsubnet_om_path:
+            raise ValueError("fullsubnet_backend=om 但未提供 fullsubnet_om_path")
+        assets.append(
+            ModelAsset(
+                name="FullSubNet om",
+                path=Path(fullsubnet_om_path),
+                required_for="语音增强(FullSubNet om 推理,NPU)",
+            )
+        )
+    else:
+        # stateful Torch 与 legacy Torch 都先校验 repo/ckpt；真正的算法选择由 factory 完成。
+        repo_path = Path(fullsubnet_repo_dir) / FULLSUBNET_MODEL_REL
+        assets.append(
+            ModelAsset(
+                name="FullSubNet 源码模型入口",
+                path=repo_path,
+                required_for="语音增强(FullSubNet Model 定义)",
+            )
+        )
+        assets.append(
+            ModelAsset(
+                name="FullSubNet ckpt",
+                path=Path(fullsubnet_ckpt_path),
+                required_for="语音增强(模型权重)",
+            )
+        )
+        if fullsubnet_backend in {"stateful_torch", "stateful_torch_cuda", "stateful_torch_cpu"}:
+            if not fullsubnet_stateful_manifest_path:
+                raise ValueError("stateful Torch 后端未提供 cumulative manifest")
+            assets.append(
+                ModelAsset(
+                    name="FullSubNet cumulative manifest",
+                    path=Path(fullsubnet_stateful_manifest_path),
+                    required_for="checkpoint/norm契约校验",
+                )
+            )
+
+    missing = [a for a in assets if not a.exists()]
+    if missing:
+        detail = "\n".join(f"{a.name} not found: {a.path}" for a in missing)
+        raise FileNotFoundError(
+            f"speech_direction 模型缺失(共 {len(missing)} 项):\n{detail}\n"
+            "Run: python3 scripts/verify_speech_direction_assets.py（仅校验；310P 资产需从 NAS 手动获取）\n"
+            "模型位置: 来自 speech_direction ROS 参数"
+        )
 
 
 def require_models(models_root: Path | None = None) -> None:
@@ -193,7 +281,7 @@ def main() -> int:
         return 0
 
     print("Missing models detected. Run:")
-    print("  ./scripts/download_speech_direction_models.sh")
+    print("  python3 scripts/verify_speech_direction_assets.py（仅校验；310P 资产需从 NAS 手动获取）")
     return 1
 
 

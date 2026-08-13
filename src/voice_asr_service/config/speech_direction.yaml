@@ -2,11 +2,19 @@ speech_direction_node:
   ros__parameters:
     # 音频输入与麦克风设备参数仅归 voice_asr_service 所有。
     device_name_contains: "ReSpeaker"
+    # 310P 上已验证正常的 ALSA 直采设备；在线采集不再经过 PyAudio。
+    arecord_device: "hw:0,0"
     sample_rate: 16000
     channel_indices: [1, 2, 3, 4]
 
     # 阵列安装偏角和四麦二维坐标；ROS 2 参数使用一维浮点数组。
     mount_yaw_deg: 0.0
+    # SRP-PHAT 扫描角度步长(度)。生成 0~360 的候选角度序列并预计算导向相位矩阵，
+    # 最终 DOA 只能为该步长的整数倍。必须为 360 的正整数约数(1/2/3/4/5/6/8/9/10/...)。
+    # 默认 5(对应回归基线 max err ~15°)。可调更细(如 1/2)，但 4 麦小阵列的物理角度
+    # 分辨率有限(空间谱主瓣宽，相邻角度 score 接近，argmax 易在主瓣顶部抖动)，
+    # 步长小于阵列分辨能力后，输出精度不再随之提升，仅增加计算量与噪声敏感度。
+    angle_step_degree: 5
     mic_positions: [
       0.02285, 0.02285,
       -0.02285, 0.02285,
@@ -15,18 +23,30 @@ speech_direction_node:
     ]
 
     input_source: "device"
+    # 在线模式不读取离线 WAV；保留空路径供参数契约使用。
     wav_path: ""
     wav_replay_rate: 1.0
 
-    silero_vad_model_path: "voice_asr/silero-vad/silero_vad_v5.onnx"
+    # 生产后端:stateful_raw_acl(310P) 或 stateful_torch_cuda(Ubuntu);旧值仅兼容映射。
+    silero_vad_backend: "raw_acl"
+    silero_vad_model_path: "voice_asr/silero-vad/silero_vad_v6_310p_mixed16.om"
+    fullsubnet_backend: "stateful_raw_acl"
+    # 生产模式固定使用 raw ACL，hidden/cell 在 Device 双 bank 常驻。
+    fullsubnet_device_id: 0
+    fullsubnet_acl_config_path: ""
+    fullsubnet_stateful_fb_om_path: "fullsubnet/fullsubnet_cum_stateful_fb_b4_t2_fp16.om"
+    fullsubnet_stateful_sb_om_path: "fullsubnet/fullsubnet_cum_stateful_sb_b4_t2_fp16.om"
+    fullsubnet_stateful_manifest_path: "fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json"
+    # 旧静态OM回退路径，stateful门禁失败时不自动切换
+    fullsubnet_om_path: "fullsubnet/fullsubnet_v6_310p_mixed16.om"
+    # Ubuntu stateful Torch 使用同一个 218epochs cumulative checkpoint。
     fullsubnet_repo_dir: "fullsubnet_repo"
-    fullsubnet_ckpt: "fullsubnet/fullsubnet_best_model_58epochs.tar"
-    fullsubnet_device: "auto"
+    fullsubnet_ckpt: "fullsubnet/cum_fullsubnet_best_model_218epochs.tar"
+    fullsubnet_device: "cuda"
 
-    speech_direction_max_age_ms: 1100
+    speech_direction_max_age_ms: 1300
 
-    # 高通量离线维测参数；默认关闭(总开关 false),现场诊断时显式开启。
-    # 子开关 save_* 在总开关开启时表示默认保存哪些流,总开关关闭时一律不写盘。
+    # 高通量离线维测参数；默认关闭避免部署即写盘到磁盘满，现场诊断时显式开启。
     diagnostics_high_throughput_enabled: false
     diagnostics_rollover_seconds: 300
     diagnostics_save_raw6ch: true
@@ -35,3 +55,5 @@ speech_direction_node:
     diagnostics_save_gray_events: true
     diagnostics_queue_size: 128
     diagnostics_drop_when_full: true
+    # FullSubNet STFT/FB/SB/postprocess 分阶段 timing；仅性能分析时开启。
+    fullsubnet_timing_enabled: false

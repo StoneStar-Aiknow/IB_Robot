@@ -41,14 +41,16 @@ if str(_SRC) not in sys.path:
 
 from voice_asr_service.speech_direction.config import SpeechDirectionConfig  # noqa: E402
 from voice_asr_service.speech_direction.doa.srp_phat import StftSrpPhat  # noqa: E402
-from voice_asr_service.speech_direction.enhancement.fullsubnet import (  # noqa: E402
-    FullSubNetEnhancer,
+from voice_asr_service.speech_direction.enhancement.factory import (  # noqa: E402
+    build_stateful_fullsubnet,
 )
 from voice_asr_service.speech_direction.pipeline import (  # noqa: E402
     DoaState,
-    PipelineParams,
-    SpeechDirectionPipeline,
     VadState,
+)
+from voice_asr_service.speech_direction.pipeline_streaming import (  # noqa: E402
+    StreamingPipelineParams,
+    StreamingSpeechDirectionPipeline,
 )
 from voice_asr_service.speech_direction.runtime import (  # noqa: E402
     SpeechDirectionRuntime,
@@ -98,24 +100,40 @@ _REAL_AUDIO_REQUIRED = pytest.mark.skipif(
 
 
 def _build_pipeline():
-    """构造与 node.py 一致的算法链(FullSubNet + SpeechGate + SRP + Pipeline)。
-
-    需要 FullSubNet 模型就绪(已通过 scripts/download_speech_direction_models.sh 下载),
-    否则跳过整个测试。
-    """
+    """构造与 310P 相同的 cumulative stateful + temporal gate + 新 SRP 主流程。"""
     cfg = SpeechDirectionConfig()
+    # Ubuntu 仅替换模型执行后端，算法编排和 256/512/4096/512 时序不变。
+    cfg.fullnet.backend = "stateful_torch_cuda"
+    cfg.fullnet.device = "cuda"
+    cfg.fullnet.repo_dir = str(_SRC.parents[1] / "models/fullsubnet_repo")
+    cfg.fullnet.ckpt = str(_SRC.parents[1] / "models/fullsubnet/cum_fullsubnet_best_model_218epochs.tar")
+    cfg.fullnet.stateful_manifest_path = str(
+        _SRC.parents[1] / "models/fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json"
+    )
+    cfg.vad.backend = "onnx"
+    cfg.vad.model_path = str(_SRC.parents[1] / "models/voice_asr/silero-vad/silero_vad.onnx")
+    if not __import__("torch").cuda.is_available():
+        pytest.skip("Ubuntu 主流程回归要求 CUDA，不允许静默回退 CPU")
 
-    # 模型缺失则跳过(require_models 会 raise,这里提前检查)
-    from voice_asr_service.speech_direction.model_downloader import require_models
+    from voice_asr_service.speech_direction.model_downloader import require_configured_models
 
     try:
-        require_models()
-    except FileNotFoundError as e:
-        pytest.skip(f"模型未就绪,跳过回归测试: {e}")
+        require_configured_models(
+            cfg.vad.model_path,
+            cfg.fullnet.repo_dir,
+            cfg.fullnet.ckpt,
+            silero_backend=cfg.vad.backend,
+            fullsubnet_backend=cfg.fullnet.backend,
+            fullsubnet_stateful_manifest_path=cfg.fullnet.stateful_manifest_path,
+        )
+    except FileNotFoundError as exc:
+        pytest.skip(f"cumulative stateful 模型未就绪，跳过回归测试: {exc}")
 
-    fullnet = FullSubNetEnhancer(
+    fullnet = build_stateful_fullsubnet(
+        backend=cfg.fullnet.backend,
         repo_dir=cfg.fullnet.repo_dir,
-        ckpt=cfg.fullnet.ckpt,
+        checkpoint_path=cfg.fullnet.ckpt,
+        manifest_path=cfg.fullnet.stateful_manifest_path,
         device=cfg.fullnet.device,
     )
     speech_gate = SpeechGate(
@@ -123,6 +141,7 @@ def _build_pipeline():
         sample_rate=cfg.vad.sample_rate,
         vad_threshold=cfg.gray_region.vad_threshold,
         rms_threshold=cfg.gray_region.rms_threshold,
+        backend=cfg.vad.backend,
     )
     angles = np.arange(0, 360, cfg.doa.angle_step_degree, dtype=np.float32)
     srp = StftSrpPhat(
@@ -136,32 +155,39 @@ def _build_pipeline():
         freq_hi=cfg.doa.freq_band_hz[1],
         diag_freq_hi=cfg.doa.diag_pair_freq_max_hz,
     )
-    params = PipelineParams(
+    params = StreamingPipelineParams(
         sample_rate=cfg.pipeline.sample_rate,
-        frame_size=cfg.pipeline.frame_size,
-        hop_size=cfg.pipeline.hop_size,
-        input_channels=cfg.pipeline.input_channels,
-        seg_end_gap_s=cfg.gray_region.seg_end_gap_s,
-        min_seg_dur_s=cfg.gray_region.min_seg_dur_s,
-        min_accum_frames=cfg.gray_region.min_accum_frames,
-        max_accum_dur_s=cfg.gray_region.max_accum_dur_s,
-        seg_max_rms_threshold=cfg.gray_region.seg_max_rms_threshold,
+        processing_samples=cfg.pipeline.processing_hop_samples,
+        model_batch_samples=cfg.pipeline.model_batch_samples,
+        input_channels=tuple(cfg.pipeline.input_channels),
+        srp_frame_samples=cfg.doa.frame_size,
+        srp_hop_samples=cfg.doa.hop_size,
+        candidate_window_samples=round(0.064 * cfg.pipeline.sample_rate),
+        segment_end_gap_samples=round(cfg.gray_region.seg_end_gap_s * cfg.pipeline.sample_rate),
+        min_segment_samples=round(cfg.gray_region.min_seg_dur_s * cfg.pipeline.sample_rate),
+        min_accum_samples=cfg.gray_region.min_accum_frames * cfg.doa.hop_size,
+        max_accum_samples=round(cfg.gray_region.max_accum_dur_s * cfg.pipeline.sample_rate),
+        segment_max_rms_threshold=cfg.gray_region.seg_max_rms_threshold,
     )
-    vad_state = VadState()
-    doa_state = DoaState()
-    pipeline = SpeechDirectionPipeline(fullnet, speech_gate, srp, params, vad_state, doa_state)
-
-    # 离线模式:enable_capture=False,无采集设备,靠 feed_audio 灌数据
+    pipeline = StreamingSpeechDirectionPipeline(
+        fullnet,
+        speech_gate.silero,
+        srp,
+        params,
+        VadState(),
+        DoaState(),
+        vad_threshold=cfg.gray_region.vad_threshold,
+        rms_threshold=cfg.gray_region.rms_threshold,
+    )
     runtime = SpeechDirectionRuntime(cfg, pipeline, enable_capture=False)
     return runtime, pipeline
 
 
-def _feed_wav(runtime: SpeechDirectionRuntime, wav_path: Path, chunk: int = 2048) -> None:
-    """把 6ch wav 灌入 runtime(按 chunk=hop 节奏,让 worker 实时处理)。
+def _feed_wav(runtime: SpeechDirectionRuntime, wav_path: Path, chunk: int = 256) -> None:
+    """把 6ch WAV 按统一 processing tick 灌入 runtime。
 
-    每次写一个 hop 的 6ch int16 bytes,按真实 hop 节奏(chunk/sr=128ms)sleep,
-    让 worker 实时跟随不堆积。
-    不用加速系数——会让 hop 间隔 > seg_end_gap(150ms)误切段。
+    每次写一个 256-sample tick 的 6ch int16 PCM，并按 16ms 真实节奏喂入，
+    让 worker 不堆积且不会因测试端停顿形成错误的采样缺口。
     """
     audio, sr = sf.read(str(wav_path), always_2d=True, dtype="float32")
     if sr != 16000:
@@ -246,6 +272,37 @@ class TestOfflineRegression:
         # 打印通过信息(调试用,-s 时可见)
         for fname_, seg_i, angle, gt, err, seg_type in errors:
             print(f"    {fname_} 段{seg_i}({seg_type}): DOA={angle}° GT={gt}° err={err:.0f}° [PASS]")
+
+        # 时延回归:在真实生产路径(worker 线程→ringbuf→process_block)下,
+        # 断言单次 model_batch(512 样本 = 32ms 预算)处理耗时满足实时性。
+        # reset 在用例开头已清空 _block_latency_ms,此处仅本文件样本。
+        latency_ms = runtime.pipeline.get_block_latency_ms()
+        _assert_block_latency(fname, latency_ms)
+
+
+def _assert_block_latency(fname: str, latency_ms: list[float]) -> None:
+    """断言单次块处理时延满足 32ms 实时预算,打印分布供排查。
+
+    生产链路每 512 样本(32ms)调度一次 fullnet+vad+srp,处理耗时须 < 32ms
+    才能跟上实时回放;p99 与 max 均须达标,p99 反映稳态、max 反映最坏抖动。
+    样本过少(极短音频)时不断言,只打印,避免统计无意义。
+    """
+    # block 预算:512 样本 / 16000 Hz = 32ms
+    BLOCK_BUDGET_MS = 32.0
+    MIN_SAMPLES = 10  # 样本过少时统计无意义,只打印不断言
+    if not latency_ms:
+        pytest.fail(f"{fname}: 未收集到块处理时延样本(process_block 未执行 fullnet)")
+    arr = np.asarray(latency_ms, dtype=np.float64)
+    p50 = float(np.percentile(arr, 50))
+    p99 = float(np.percentile(arr, 99))
+    mx = float(arr.max())
+    print(f"    {fname} 时延: n={len(arr)} p50={p50:.2f}ms p99={p99:.2f}ms max={mx:.2f}ms (预算 {BLOCK_BUDGET_MS}ms)")
+    if len(arr) < MIN_SAMPLES:
+        return
+    if p99 > BLOCK_BUDGET_MS:
+        pytest.fail(f"{fname}: 块处理 p99={p99:.2f}ms > {BLOCK_BUDGET_MS}ms 预算,无法实时回放")
+    if mx > BLOCK_BUDGET_MS:
+        pytest.fail(f"{fname}: 块处理 max={mx:.2f}ms > {BLOCK_BUDGET_MS}ms 预算,最坏抖动超标")
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ class AudioConfig:
 
     device_name: str = "ReSpeaker"
     device_index: int = -1  # -1 表示按名称自动搜索
+    arecord_device: str = "hw:0,0"  # 310P 已验证可用的 ALSA 直采设备
     sample_rate: int = 16000  # 硬件固定
     channels: int = 6  # 6_channels_firmware
     chunk_size: int = 160  # 10ms @ 16kHz
@@ -37,11 +38,14 @@ class AudioConfig:
 
 @dataclass
 class PipelineConfig:
-    """神经 pipeline 参数(STFT/SRP 帧长与 hop)。"""
+    """统一流式 pipeline 的显式时序参数。"""
 
     sample_rate: int = 16000
-    frame_size: int = 4096  # STFT/SRP 帧长
-    hop_size: int = 2048  # hop = frame/2,50% overlap,每 hop=128ms 处理一次
+    # runtime 每 256 samples 调度一次；两个 tick 聚合为一次 T=2 模型调用。
+    processing_hop_samples: int = 256
+    model_batch_samples: int = 512
+    frame_size: int = 4096  # 兼容旧调用方，语义等同 srp_frame_samples
+    hop_size: int = 512  # 兼容旧调用方，语义等同 srp_hop_samples，禁止作为 processing tick
     fft_size: int = 4096
     window: str = "hann"
     input_channels: list[int] = field(default_factory=lambda: [1, 2, 3, 4])
@@ -53,8 +57,25 @@ class FullSubNetConfig:
 
     # 模型路径用绝对路径(基于工作区根推算),避免相对路径 cwd 敏感
     repo_dir: str = field(default_factory=lambda: _model_path("fullsubnet_repo"))
-    ckpt: str = field(default_factory=lambda: _model_path("fullsubnet/fullsubnet_best_model_58epochs.tar"))
-    device: str = "auto"  # auto=优先 CUDA,无 CUDA 提示风险退 CPU
+    # cumulative stateful checkpoint；Ubuntu CUDA 与 310P OM 必须来自同一权重。
+    ckpt: str = field(default_factory=lambda: _model_path("fullsubnet/cum_fullsubnet_best_model_218epochs.tar"))
+    # FullSubNet 静态 om(旧8192/2048回退链路,文件名为 fullsubnet_v6_310p_mixed16.om)
+    om_path: str = field(default_factory=lambda: _model_path("fullsubnet/fullsubnet_v6_310p_mixed16.om"))
+    # cumulative stateful T=2 拆分 OM；每次处理512 samples并显式续传FB/SB h/c。
+    stateful_fb_om_path: str = field(
+        default_factory=lambda: _model_path("fullsubnet/fullsubnet_cum_stateful_fb_b4_t2_fp16.om")
+    )
+    stateful_sb_om_path: str = field(
+        default_factory=lambda: _model_path("fullsubnet/fullsubnet_cum_stateful_sb_b4_t2_fp16.om")
+    )
+    stateful_manifest_path: str = field(
+        default_factory=lambda: _model_path("fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json")
+    )
+    device_id: int = 0
+    acl_config_path: str = ""
+    device: str = "cuda"  # Ubuntu stateful Torch 固定 CUDA；禁止静默回退 CPU
+    # canonical 后端:stateful_raw_acl / stateful_torch_cuda
+    backend: str = "stateful_raw_acl"
     num_freqs: int = 257
     n_fft: int = 512  # FullSubNet 内部 STFT(固定)
     hop: int = 256
@@ -65,11 +86,13 @@ class FullSubNetConfig:
 class VadConfig:
     """Silero VAD 参数。"""
 
-    # Silero VAD v5 ONNX(与 IB-Robot 现有 models/voice_asr/silero-vad/ 下的文件名一致)
-    model_path: str = field(default_factory=lambda: _model_path("voice_asr/silero-vad/silero_vad_v5.onnx"))
+    # Silero VAD OM 在 310P 使用 raw ACL(文件名 silero_vad_v6_310p_mixed16.om);ONNX 用于 Ubuntu 的相同门控流程。
+    model_path: str = field(default_factory=lambda: _model_path("voice_asr/silero-vad/silero_vad_v6_310p_mixed16.om"))
     sample_rate: int = 16000
     frame_size: int = 512  # Silero 子帧 = 32ms @ 16kHz
     input_source: str = "enh_mic1_mono"  # 增强 ch1 单麦
+    # 推理后端:raw_acl(Ascend NPU,默认) 或 onnx(Ubuntu)
+    backend: str = "raw_acl"
 
 
 @dataclass
@@ -80,7 +103,7 @@ class GrayRegionConfig:
     rms_threshold: float = 0.002  # 灰区 RMS 门限(增强 ch1 RMS,真语音段约 0.02 量级)
     seg_end_gap_s: float = 0.15  # 非灰区持续多久判段结束(等价算法基线 merge_gap)
     min_seg_dur_s: float = 0.10  # 最短段时长(短于此丢弃)
-    min_accum_frames: int = 3  # 最少累积帧数才输出 DOA
+    min_accum_frames: int = 3  # 3×512=96ms；保留已验证真实音频中的短语音段
     max_accum_dur_s: float = 1.0  # 长段中间输出阈值(累积到此先出一次 DOA 再清缓冲)
     seg_max_rms_threshold: float = 0.005  # 段内子帧 max RMS 门限(<此值丢弃,真语音段 max>0.025)
 
@@ -92,7 +115,7 @@ class DoaConfig:
     sample_rate: int = 16000
     input_channels: list[int] = field(default_factory=lambda: [1, 2, 3, 4])
     frame_size: int = 4096
-    hop_size: int = 2048
+    hop_size: int = 512
     fft_size: int = 4096
     freq_band_hz: tuple[float, float] = (300.0, 3400.0)  # 边相邻对频段
     diag_pair_freq_max_hz: float = 2600.0  # 对角对上限(防空间混叠栅瓣)
@@ -107,16 +130,14 @@ class DoaConfig:
             [0.02285, -0.02285],  # Mic4/ch4 右下
         ]
     )
-    max_age_ms: int = 1100  # age 门限:对齐 max_accum_dur(1.0s)+100ms 余量
+    max_age_ms: int = 1300  # 1s段累计+状态机与look-ahead余量
 
 
 @dataclass
 class DiagnosticsConfig:
     """高通量离线维测参数。"""
 
-    # 默认关闭(总开关 false),现场诊断时显式开启。
-    # 子开关 save_* 在总开关开启时表示默认保存哪些流,总开关关闭时一律不写盘。
-    high_throughput_enabled: bool = False
+    high_throughput_enabled: bool = False  # 默认关闭，避免部署即写盘到磁盘满
     rollover_seconds: int = 300
     save_raw6ch: bool = True
     save_enh4ch: bool = True
@@ -124,6 +145,8 @@ class DiagnosticsConfig:
     save_gray_events: bool = True
     queue_size: int = 128
     drop_when_full: bool = True
+    # FullSubNet 分阶段 timing 会增加热路径计时与低频日志，生产默认关闭。
+    fullsubnet_timing_enabled: bool = False
 
 
 @dataclass
@@ -143,7 +166,7 @@ class SpeechDirectionConfig:
     wav_path: str = ""
     wav_replay_rate: float = 1.0
     mount_yaw_deg: float = 0.0  # 阵列安装偏角(度)
-    speech_direction_max_age_ms: int = 1100
+    speech_direction_max_age_ms: int = 1300
 
 
 __all__ = [
