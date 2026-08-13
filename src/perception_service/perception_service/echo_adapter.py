@@ -11,6 +11,14 @@ from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.generic_runtime import NamedTensorRequest, NamedTensorResult
 from inference_service.model_service_plugin import ModelServicePlugin, PluginRuntimeStatus
 from inference_service.model_sessions import ModelSession
+from inference_service.pipeline import (
+    ExecutionError,
+    GenericModelPipeline,
+    ModelStage,
+    PreprocessStage,
+    SequentialModelExecutor,
+    StageFrame,
+)
 
 from .perception_adapter import AdapterIdentity, PerceptionAdapter
 
@@ -79,29 +87,63 @@ class EchoServicePlugin(ModelServicePlugin):
         self.adapter = EchoAdapter()
         self.adapter.validate_deployment(validated.deployment_name)
         self.session = _EchoSession()
-        self.session.load(RuntimeContext(validated))
+        context = RuntimeContext(validated)
+
+        class _EchoResultAdapter:
+            def adapt(_self, frame: StageFrame) -> list[float]:
+                result = frame.values["_model_result"]
+                if not isinstance(result, NamedTensorResult):
+                    raise TypeError("dummy echo model stage did not return a NamedTensorResult")
+                return self.adapter.postprocess(result)
+
+            def adapt_error(_self, error: ExecutionError) -> object:
+                if error.cause is not None:
+                    raise error.cause
+                raise RuntimeError(error.message)
+
+        def preprocess(values):
+            result = self.adapter.preprocess(values["value"])
+            values.clear()
+            return result
+
+        executor = SequentialModelExecutor(
+            (
+                PreprocessStage(preprocess),
+                ModelStage("model", self.session),
+            ),
+            _EchoResultAdapter(),
+            components=(self.session,),
+        )
+        self.pipeline = GenericModelPipeline("dummy-echo", context, executor)
+        self.pipeline.load()
 
     def handle(self, request, response) -> str:
-        result = self.session.infer(
+        response.value = self.pipeline.execute(
             NamedTensorRequest(
                 request_id=str(request.request_id),
-                inputs=self.adapter.preprocess(request.value),
+                inputs={"value": request.value},
             )
         )
-        response.value = self.adapter.postprocess(result)
         return "echoed 2 values"
 
     def runtime_status(self) -> PluginRuntimeStatus:
-        health = self.session.health()
+        diagnostics = self.pipeline.diagnostics()
         return PluginRuntimeStatus(
-            state=health.state.value,
-            ready=health.ready,
-            failure_reason=health.message or "",
-            metadata={"runtime_version": "dummy-echo-v1"},
+            state=diagnostics.state.value,
+            ready=diagnostics.ready,
+            failure_reason=diagnostics.executor_health.message or "",
+            metadata={
+                "runtime_version": "dummy-echo-v1",
+                "pipeline_id": diagnostics.pipeline_id,
+                "bundle": diagnostics.deployment.bundle,
+                "deployment": diagnostics.deployment.deployment,
+                "backend": diagnostics.deployment.backend,
+                "deployment_fingerprint": diagnostics.deployment.deployment_fingerprint,
+            },
         )
 
     def close(self) -> None:
-        self.session.close()
+        self.pipeline.close()
 
 
 __all__ = ["EchoAdapter", "EchoServicePlugin"]

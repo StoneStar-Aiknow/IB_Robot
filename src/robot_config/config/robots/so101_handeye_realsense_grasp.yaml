@@ -219,6 +219,8 @@ robot:
       enabled: true
     planner_node:
       inference_backend: ascend_local
+      local_manifest_path: /root/graspgen_310p_bundle
+      local_deployment_name: ascend_310p
       ascend_local_manifest_path: /root/graspgen_310p_bundle
       ascend_local_deployment_name: ascend_310p
       ascend_local_device_id: 0

@@ -15,19 +15,43 @@ from inference_service.backends.types import InferenceBackend, RuntimeContext
 CANONICAL_BACKENDS = ("torch", "ascend", "hisilicon", "rknn", "hmm")
 POLICY_FAMILIES = frozenset({"act", "diffusion", "pi05", "smolvla"})
 NON_POLICY_MODEL_KINDS = frozenset({"perception", "generic"})
+MODEL_FAMILIES = frozenset({"ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo", "zipvoice"})
+# Kept as a public name for callers that classify the original perception families.
+PERCEPTION_FAMILIES = frozenset({"ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo"})
+# Canonical service-contract operations. A family's distinct contracts are carved out by
+# operation rather than by minting a second family name, so the registry still validates a
+# small, coherent set of base families while the adapter/plugin layer pins the operation.
+# SAM2: "automatic" (Torch automatic mask generation) vs "prompt" (Ascend box-prompt).
+# Grounding DINO: "combined" (grounded SAM2, Torch) vs "raw" (Ascend raw logits). Single-
+# contract families (ram_plus, siglip2, graspgen, dummy_echo) use the empty default.
+PERCEPTION_OPERATIONS = frozenset({"", "automatic", "prompt", "combined", "raw"})
 _FACTORY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
 
 TargetValidator = Callable[[Deployment], str | None]
 
 
 @dataclass(frozen=True)
+class ConformanceEvidence:
+    """Immutable record that one kind/family/backend pair passed support conformance."""
+
+    kind: str
+    family: str
+    reference: str = ""
+
+
+@dataclass(frozen=True)
 class BackendDescriptor:
     name: str
-    factory: str
     target_validator: TargetValidator
+    factory: str | None = None
     supported_policy_families: frozenset[str] = frozenset()
     supported_model_kinds: frozenset[str] = frozenset()
     supported_model_families: frozenset[str] = frozenset()
+    conformance_evidence: frozenset[ConformanceEvidence] = frozenset()
+
+    @property
+    def evidence_pairs(self) -> frozenset[tuple[str, str]]:
+        return frozenset((evidence.kind, evidence.family) for evidence in self.conformance_evidence)
 
     def validate_definition(self) -> None:
         if self.name not in CANONICAL_BACKENDS:
@@ -35,7 +59,7 @@ class BackendDescriptor:
                 f"backend descriptor uses non-canonical name {self.name!r}",
                 code="non_canonical_backend",
             )
-        if not _FACTORY_PATTERN.fullmatch(self.factory):
+        if self.factory is not None and not _FACTORY_PATTERN.fullmatch(self.factory):
             raise BackendRegistryError(
                 f"backend {self.name!r} has invalid factory import string {self.factory!r}",
                 code="invalid_factory",
@@ -63,11 +87,35 @@ class BackendDescriptor:
                 f"backend {self.name!r} declares empty model families",
                 code="invalid_model_family",
             )
+        unsupported_families = self.supported_model_families - MODEL_FAMILIES
+        if unsupported_families:
+            raise BackendRegistryError(
+                f"backend {self.name!r} declares unknown model families: {sorted(unsupported_families)}",
+                code="unknown_model_family",
+            )
         if not callable(self.target_validator):
             raise BackendRegistryError(
                 f"backend {self.name!r} target validator is not callable",
                 code="invalid_target_validator",
             )
+        self._validate_evidence_coherence()
+
+    def _validate_evidence_coherence(self) -> None:
+        for evidence in self.conformance_evidence:
+            if evidence.kind == "policy":
+                if evidence.family not in self.supported_policy_families:
+                    raise BackendRegistryError(
+                        f"backend {self.name!r} conformance evidence claims undeclared policy "
+                        f"family {evidence.family!r}",
+                        code="evidence_overclaims_support",
+                    )
+                continue
+            if evidence.kind not in self.supported_model_kinds and evidence.family not in self.supported_model_families:
+                raise BackendRegistryError(
+                    f"backend {self.name!r} conformance evidence claims undeclared model "
+                    f"kind/family ({evidence.kind!r}, {evidence.family!r})",
+                    code="evidence_overclaims_support",
+                )
 
 
 class BackendRegistry:
@@ -105,7 +153,12 @@ class BackendRegistry:
                 code="backend_not_registered",
             ) from exc
 
-    def validate(self, context: RuntimeContext) -> BackendDescriptor:
+    def validate(
+        self,
+        context: RuntimeContext,
+        *,
+        allowed_deployments: frozenset[str] | None = None,
+    ) -> BackendDescriptor:
         deployment = context.deployment
         descriptor = self.descriptor(deployment.backend)
         model = context.model
@@ -122,6 +175,7 @@ class BackendRegistry:
                     f"for deployment {context.deployment_name!r}",
                     code="unsupported_policy_backend_pair",
                 )
+            kind, family = "policy", policy_family
         elif (
             model.kind not in descriptor.supported_model_kinds
             and model.family not in descriptor.supported_model_families
@@ -131,6 +185,14 @@ class BackendRegistry:
                 f"(kind {model.kind!r}) for deployment {context.deployment_name!r}",
                 code="unsupported_model_backend_pair",
             )
+        else:
+            kind, family = model.kind, model.family
+        if (kind, family) not in descriptor.evidence_pairs:
+            raise BackendCompatibilityError(
+                f"backend {descriptor.name!r} declares support for family {family!r} (kind {kind!r}) "
+                f"but lacks conformance evidence for deployment {context.deployment_name!r}",
+                code="missing_conformance_evidence",
+            )
         incompatibility = descriptor.target_validator(deployment)
         if incompatibility is not None:
             raise BackendCompatibilityError(
@@ -138,10 +200,21 @@ class BackendRegistry:
                 f"{incompatibility}",
                 code="incompatible_backend_target",
             )
+        if allowed_deployments is not None and context.deployment_name not in allowed_deployments:
+            raise BackendCompatibilityError(
+                f"deployment {context.deployment_name!r} is not in the adapter supported deployments "
+                f"{sorted(allowed_deployments)} for backend {descriptor.name!r}",
+                code="adapter_deployment_mismatch",
+            )
         return descriptor
 
     def create(self, context: RuntimeContext) -> InferenceBackend:
         descriptor = self.validate(context)
+        if descriptor.factory is None:
+            raise BackendRegistryError(
+                f"backend {descriptor.name!r} is session-only and has no legacy backend factory",
+                code="backend_factory_unavailable",
+            )
         factory = self._load_factory(descriptor)
         try:
             backend = factory(context)
@@ -164,6 +237,11 @@ class BackendRegistry:
 
     @staticmethod
     def _load_factory(descriptor: BackendDescriptor) -> Callable[[RuntimeContext], InferenceBackend]:
+        if descriptor.factory is None:
+            raise BackendRegistryError(
+                f"backend {descriptor.name!r} has no backend factory",
+                code="backend_factory_unavailable",
+            )
         module_name, attribute = descriptor.factory.split(":", maxsplit=1)
         try:
             module = importlib.import_module(module_name)
@@ -252,36 +330,57 @@ def _validate_hmm(deployment: Deployment) -> str | None:
     return None
 
 
+def _policy_evidence(*families: str) -> frozenset[ConformanceEvidence]:
+    return frozenset(ConformanceEvidence("policy", family, reference="software-conformance") for family in families)
+
+
+def _perception_evidence(*families: str) -> frozenset[ConformanceEvidence]:
+    return frozenset(ConformanceEvidence("perception", family, reference="software-conformance") for family in families)
+
+
+def _generic_evidence(*families: str) -> frozenset[ConformanceEvidence]:
+    return frozenset(ConformanceEvidence("generic", family, reference="software-conformance") for family in families)
+
+
 STATIC_BACKEND_DESCRIPTORS: Mapping[str, BackendDescriptor] = MappingProxyType(
     {
         "torch": BackendDescriptor(
             name="torch",
-            factory="inference_service.backends.torch:create_backend",
             supported_policy_families=frozenset({"act", "diffusion", "pi05", "smolvla"}),
+            supported_model_families=frozenset(
+                {"ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo"}
+            ),
+            conformance_evidence=_policy_evidence("act", "diffusion", "pi05", "smolvla")
+            | _perception_evidence("ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo"),
             target_validator=_validate_torch,
         ),
         "ascend": BackendDescriptor(
             name="ascend",
-            factory="inference_service.backends.ascend:create_backend",
             supported_policy_families=frozenset({"act", "pi05"}),
+            supported_model_families=frozenset(
+                {"ram_plus", "graspgen", "sam2", "siglip2", "grounding_dino", "zipvoice"}
+            ),
+            conformance_evidence=_policy_evidence("act", "pi05")
+            | _perception_evidence("ram_plus", "graspgen", "sam2", "siglip2", "grounding_dino")
+            | _generic_evidence("zipvoice"),
             target_validator=_validate_ascend,
         ),
         "hisilicon": BackendDescriptor(
             name="hisilicon",
-            factory="inference_service.backends.hisilicon:create_backend",
             supported_policy_families=frozenset({"act"}),
+            conformance_evidence=_policy_evidence("act"),
             target_validator=_validate_hisilicon,
         ),
         "rknn": BackendDescriptor(
             name="rknn",
-            factory="inference_service.backends.rknn:create_backend",
             supported_policy_families=frozenset({"act", "smolvla"}),
+            conformance_evidence=_policy_evidence("act", "smolvla"),
             target_validator=_validate_rknn,
         ),
         "hmm": BackendDescriptor(
             name="hmm",
-            factory="inference_service.backends.hmm:create_backend",
             supported_policy_families=frozenset({"pi05", "smolvla"}),
+            conformance_evidence=_policy_evidence("pi05", "smolvla"),
             target_validator=_validate_hmm,
         ),
     }

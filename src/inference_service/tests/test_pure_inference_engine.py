@@ -19,6 +19,7 @@ from inference_service.backends import (
     BackendDescriptor,
     BackendRegistry,
     BackendResult,
+    ConformanceEvidence,
     InferenceRequest,
     LifecycleBackend,
     PartialLoadRollback,
@@ -993,6 +994,7 @@ def _registry(monkeypatch, created: list[_FacadeBackend]) -> BackendRegistry:
                 name="torch",
                 factory="tests.pure_facade_backend:create_backend",
                 supported_policy_families=frozenset({"act"}),
+                conformance_evidence=frozenset({ConformanceEvidence("policy", "act")}),
                 target_validator=lambda deployment: None,
             )
         }

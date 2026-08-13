@@ -31,6 +31,11 @@ def _read_adapter_identity(root: Path, expected: AdapterIdentity) -> None:
     }
     if any(value.get(name) != expected_value for name, expected_value in required.items()):
         raise ValueError(f"{expected.family} adapter identity mismatch: expected {required}, got {value}")
+    declared_operation = value.get("operation", "")
+    if declared_operation != expected.operation:
+        raise ValueError(
+            f"{expected.family} adapter operation mismatch: expected {expected.operation!r}, got {declared_operation!r}"
+        )
 
 
 def _load_siglip2_tokenizer(model_path: Path):
@@ -84,7 +89,7 @@ class SegmentationMask:
 
 class SAM2Adapter(PerceptionAdapter):
     identity = AdapterIdentity(
-        "sam2", "sam2-rgb-uint8-v1", "automatic-masks-v1", frozenset({"torch_cpu", "torch_cuda"})
+        "sam2", "sam2-rgb-uint8-v1", "automatic-masks-v1", frozenset({"torch_cpu", "torch_cuda"}), operation="automatic"
     )
     compiled_abi_finalized = False
 
@@ -134,7 +139,7 @@ class MaskEncoding:
 
 
 class _SigLIP2Adapter(PerceptionAdapter):
-    compiled_abi_finalized = False
+    compiled_abi_finalized = True
 
     def __init__(self, dimension: int, tokenizer) -> None:
         self.dimension = dimension
@@ -180,7 +185,7 @@ class SigLIP2ImageAdapter(_SigLIP2Adapter):
         "siglip2",
         "siglip2-dual-encoder-v2",
         "normalized-embedding-v1",
-        frozenset({"torch_cpu", "torch_cuda"}),
+        frozenset({"torch_cpu", "torch_cuda", "ascend_310p", "ascend_310b"}),
     )
 
     def preprocess(self, value: object) -> dict[str, np.ndarray]:
@@ -229,7 +234,7 @@ class SigLIP2TextAdapter(_SigLIP2Adapter):
         "siglip2",
         "siglip2-dual-encoder-v2",
         "normalized-embedding-v1",
-        frozenset({"torch_cpu", "torch_cuda"}),
+        frozenset({"torch_cpu", "torch_cuda", "ascend_310p", "ascend_310b"}),
     )
 
     def preprocess(self, texts: object) -> dict[str, np.ndarray]:
@@ -261,6 +266,7 @@ class GroundingDINOAdapter(PerceptionAdapter):
         "grounded-sam2-rgb-text-thresholds-v2",
         "boxes-scores-labels-masks-v1",
         frozenset({"torch_cpu", "torch_cuda"}),
+        operation="combined",
     )
     compiled_abi_finalized = False
 
@@ -368,10 +374,11 @@ class GroundingDINORawAdapter(PerceptionAdapter):
     """Manifest adapter for the 310P raw Grounding-DINO execution graph."""
 
     identity = AdapterIdentity(
-        "grounding_dino_raw",
+        "grounding_dino",
         "grounding-dino-swint-rgb720x1280-bert-seq8-v1",
         "grounding-dino-raw-logits-cxcywh-v1",
         frozenset({"ascend_310p"}),
+        operation="raw",
     )
     compiled_abi_finalized = True
 
@@ -501,10 +508,11 @@ class SAM2PromptAdapter(PerceptionAdapter):
     """Manifest adapter for box-prompt SAM2 execution on Ascend 310P."""
 
     identity = AdapterIdentity(
-        "sam2_prompt",
+        "sam2",
         "sam2-longest-side1024-imagenet-box-prompt-v1",
         "sam2-mask-logits-iou-v1",
         frozenset({"ascend_310p", "ascend_310b"}),
+        operation="prompt",
     )
     compiled_abi_finalized = True
 

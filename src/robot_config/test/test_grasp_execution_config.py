@@ -201,6 +201,8 @@ def test_grasp_execution_config_accepts_local_ascend_full_pipeline(tmp_path: Pat
         config["planner_node"].update(
             {
                 "inference_backend": "ascend_local",
+                "local_manifest_path": "/root/models/graspgen",
+                "local_deployment_name": "ascend",
                 "ascend_local_manifest_path": "/root/models/graspgen",
                 "ascend_local_deployment_name": "ascend_310p",
                 "ascend_local_device_id": 0,
@@ -223,7 +225,10 @@ def test_grasp_execution_config_accepts_unbounded_candidate_pool(tmp_path: Path)
 
 
 def test_grasp_execution_config_requires_local_ascend_graspgen_bundle(tmp_path: Path) -> None:
-    path = _write_config(tmp_path, lambda config: config["planner_node"].update({"ascend_local_manifest_path": ""}))
+    path = _write_config(
+        tmp_path,
+        lambda config: config["planner_node"].update({"local_manifest_path": "", "ascend_local_manifest_path": ""}),
+    )
 
-    with pytest.raises(ValueError, match="ascend_local_manifest_path"):
+    with pytest.raises(ValueError, match="local_manifest_path"):
         load_robot_config_dict(path)

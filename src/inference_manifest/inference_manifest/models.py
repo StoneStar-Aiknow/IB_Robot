@@ -59,14 +59,25 @@ def _validate_shape(value: tuple[int, ...]) -> tuple[int, ...]:
     return value
 
 
+_IMAGE_SEMANTIC_PREFIXES = ("observation.image.", "observation.images.")
+
+
+def _is_image_semantic(semantic: str) -> bool:
+    return semantic == "observation.image" or semantic.startswith(_IMAGE_SEMANTIC_PREFIXES)
+
+
 def _validate_layout(shape: tuple[int, ...], layout: str | None, semantic: str) -> None:
-    if len(shape) == 4 and layout is None:
-        raise ValueError(f"rank-4 tensor {semantic!r} requires NCHW or NHWC layout")
+    needs_layout = len(shape) == 4 and _is_image_semantic(semantic)
+    if needs_layout and layout is None:
+        raise ValueError(f"rank-4 image tensor {semantic!r} requires NCHW or NHWC layout")
     if len(shape) != 4 and layout is not None:
         raise ValueError(f"non-rank-4 tensor {semantic!r} must omit layout")
 
 
 StrictString: TypeAlias = Annotated[str, StringConstraints(strict=True, min_length=1)]
+# Operation may be empty for single-contract families (ram_plus, siglip2, ...), so it
+# cannot reuse StrictString's min_length=1 constraint; it stays strict to avoid coercion.
+OperationString: TypeAlias = Annotated[str, StringConstraints(strict=True)]
 BundlePath: TypeAlias = Annotated[
     str,
     StringConstraints(strict=True, min_length=1),
@@ -196,6 +207,11 @@ class SemanticIdentity(StrictFrozenModel):
 class ModelDescriptor(StrictFrozenModel):
     kind: Literal["policy", "perception", "generic"] = "policy"
     family: StrictString = "lerobot"
+    # ``operation`` carves a distinct service contract out of one family without minting a
+    # second family name. SAM2 exposes "automatic" (Torch) and "prompt" (Ascend); Grounding
+    # DINO exposes "combined" (grounded SAM2, Torch) and "raw" (Ascend). Single-contract
+    # families leave it empty, so the field is optional and defaults to the empty string.
+    operation: OperationString = ""
     inputs: tuple[SemanticTensor, ...] = ()
     outputs: tuple[SemanticTensor, ...] = ()
     semantic_identity: SemanticIdentity | None = None

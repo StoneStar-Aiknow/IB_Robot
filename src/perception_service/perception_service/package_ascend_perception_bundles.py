@@ -18,6 +18,7 @@ from inference_manifest import (
     DeploymentTarget,
     DeviceLink,
     Digest,
+    EmbeddingMetadata,
     InferenceManifest,
     ManifestBundle,
     ModelDescriptor,
@@ -56,6 +57,8 @@ class BundleSpec:
     postprocessing: str
     deployments: tuple[DeploymentSpec, ...]
     assets: tuple[tuple[str, str], ...] = ()
+    operation: str = ""
+    embedding: EmbeddingMetadata | None = None
 
 
 def _semantic(semantic: str, dtype: str, shape: tuple[int, ...], layout: str | None = None) -> SemanticTensor:
@@ -177,10 +180,10 @@ def _siglip_deployment(name: str, soc: str, candidate: str, text_name: str, visi
         "vision",
         f"siglip2_so400m_patch14_384/model_utils_work/candidates/{candidate}/{vision_name}",
         _bindings(
-            (_binding("image", 0, "float32", (1, 3, 384, 384), "NCHW", "image"),),
+            (_binding("host.siglip2.image", 0, "float32", (1, 3, 384, 384), "NCHW", "image"),),
             (
-                _binding("internal.image_tokens", 0, "float32", (1, 729, 1152), runtime_name="image_features"),
-                _binding("image_embedding", 1, "float32", (1, 1152)),
+                _binding("internal.image_tokens", 0, "float32", (1, 729, 1152)),
+                _binding("host.siglip2.image_embedding", 1, "float32", (1, 1152)),
             ),
         ),
     )
@@ -188,10 +191,10 @@ def _siglip_deployment(name: str, soc: str, candidate: str, text_name: str, visi
         "text",
         f"siglip2_so400m_patch14_384/model_utils_work/candidates/{candidate}/{text_name}",
         _bindings(
-            (_binding("input_ids", 0, "int64", (batch, 64), runtime_name="input_ids"),),
+            (_binding("host.siglip2.input_ids", 0, "int64", (batch, 64), runtime_name="input_ids"),),
             (
-                _binding("internal.text_tokens", 0, "float32", (batch, 64, 1152), runtime_name="text_features"),
-                _binding("text_embeddings", 1, "float32", (batch, 1152)),
+                _binding("internal.text_tokens", 0, "float32", (batch, 64, 1152)),
+                _binding("host.siglip2.text_embeddings", 1, "float32", (batch, 1152)),
             ),
         ),
     )
@@ -371,7 +374,8 @@ def _specs() -> dict[str, BundleSpec]:
     return {
         "sam2": BundleSpec(
             name="sam2_hiera_tiny_ascend",
-            family="sam2_prompt",
+            family="sam2",
+            operation="prompt",
             inputs=(
                 _semantic("image", "float32", (1, 3, 1024, 1024), "NCHW"),
                 _semantic("point_coords", "float32", (-1, 2, 2)),
@@ -393,17 +397,25 @@ def _specs() -> dict[str, BundleSpec]:
         ),
         "siglip2": BundleSpec(
             name="siglip2_so400m_patch14_384_ascend",
-            family="siglip2_dual_encoder",
+            family="siglip2",
             inputs=(
-                _semantic("image", "float32", (1, 3, 384, 384), "NCHW"),
-                _semantic("input_ids", "int64", (-1, 64)),
+                _semantic("masked_images", "float32", (-1, 3, 384, 384), "NCHW"),
+                _semantic("text_tokens", "int64", (-1, 64)),
+                _semantic("text_attention_mask", "int64", (-1, 64)),
             ),
             outputs=(
-                _semantic("image_embedding", "float32", (1, 1152)),
+                _semantic("image_embeddings", "float32", (-1, 1152)),
                 _semantic("text_embeddings", "float32", (-1, 1152)),
             ),
-            preprocessing="siglip2-resize384-normalize0.5-token64-v1",
-            postprocessing="siglip2-pooled-embeddings-v1",
+            preprocessing="siglip2-dual-encoder-v2",
+            postprocessing="normalized-embedding-v1",
+            embedding=EmbeddingMetadata(
+                embedding_space_id="google/siglip2-so400m-patch14-384@main",
+                dimension=1152,
+                normalization="l2",
+                image_preprocessing="masked-crop-gray127-resize384-bilinear-normalize0.5-v1",
+                text_preprocessing="photo-template-gemma-tokenizer-max64-v1",
+            ),
             deployments=(
                 _siglip_deployment(
                     "ascend_310p",
@@ -422,10 +434,23 @@ def _specs() -> dict[str, BundleSpec]:
                     5,
                 ),
             ),
+            assets=(
+                ("siglip2_so400m_patch14_384/assets/model/tokenizer.json", "assets/model/tokenizer.json"),
+                (
+                    "siglip2_so400m_patch14_384/assets/model/tokenizer_config.json",
+                    "assets/model/tokenizer_config.json",
+                ),
+                (
+                    "siglip2_so400m_patch14_384/assets/model/special_tokens_map.json",
+                    "assets/model/special_tokens_map.json",
+                ),
+                ("siglip2_so400m_patch14_384/assets/model/config.json", "assets/model/config.json"),
+            ),
         ),
         "grounding_dino": BundleSpec(
             name="grounding_dino_swint_seq8_1280x720_ascend",
-            family="grounding_dino_raw",
+            family="grounding_dino",
+            operation="raw",
             inputs=(
                 _semantic("image", "float32", (1, 3, 720, 1280), "NCHW"),
                 _semantic("input_ids", "int64", (1, 8)),
@@ -484,9 +509,16 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
         existing = load_inference_manifest(root, name).manifest
     adapter = root / "assets/adapter.json"
     adapter.parent.mkdir(parents=True, exist_ok=True)
+    adapter_identity = {
+        "family": spec.family,
+        "preprocessing": spec.preprocessing,
+        "postprocessing": spec.postprocessing,
+    }
+    if spec.operation:
+        adapter_identity["operation"] = spec.operation
     adapter.write_text(
         json.dumps(
-            {"family": spec.family, "preprocessing": spec.preprocessing, "postprocessing": spec.postprocessing},
+            adapter_identity,
             indent=2,
             sort_keys=True,
         )
@@ -518,12 +550,14 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
     model = ModelDescriptor(
         kind="perception",
         family=spec.family,
+        operation=spec.operation,
         inputs=spec.inputs,
         outputs=spec.outputs,
         semantic_identity=SemanticIdentity(
             logical_model_revision=f"{spec.family}@v1",
             preprocessing_contract=spec.preprocessing,
             output_semantics=spec.postprocessing,
+            embedding=spec.embedding,
         ),
     )
     structure_changed = existing is not None and (

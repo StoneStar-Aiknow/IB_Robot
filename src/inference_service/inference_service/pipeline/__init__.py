@@ -1,6 +1,7 @@
 """Named inference pipeline composition, lifecycle, routing, and diagnostics."""
 
 from inference_service.pipeline.errors import (
+    PipelineCanceledError,
     PipelineConfigurationError,
     PipelineError,
     PipelineLifecycleError,
@@ -11,18 +12,77 @@ from inference_service.pipeline.errors import (
     PipelineTransitionError,
     PipelineValidationError,
 )
-from inference_service.pipeline.factory import create_inference_pipeline, create_pipeline_manager
+from inference_service.pipeline.executor import SequentialModelExecutor
+from inference_service.pipeline.factory import (
+    MODEL_SESSION_FACTORY_REGISTRY,
+    ModelSessionFactoryRegistry,
+    create_inference_pipeline,
+    create_pipeline_manager,
+)
 from inference_service.pipeline.manager import InferencePipelineManager
+from inference_service.pipeline.pi05 import PI05Topology, PI05TopologyError, create_pi05_executor, derive_pi05_topology
 from inference_service.pipeline.runtime import InferencePipeline, Postprocessor, Processor
+from inference_service.pipeline.runtime_core import (
+    ExecutionControl,
+    ExecutionError,
+    GenericModelPipeline,
+    ModelExecutor,
+    PipelineRuntimeCore,
+    PipelineRuntimeDiagnostics,
+    StageFrame,
+)
+from inference_service.pipeline.smolvla import (
+    SmolVLAEmbeddingWeights,
+    SmolVLAFamilyResource,
+    SmolVLATopology,
+    SmolVLATopologyError,
+    create_smolvla_executor,
+    derive_smolvla_topology,
+    load_smolvla_embedding_weights,
+    load_smolvla_policy_config,
+    validate_smolvla_plan,
+)
+from inference_service.pipeline.stages import (
+    DirectIterationStateAdapter,
+    EulerIterationStateAdapter,
+    HostComputeStage,
+    HostRoleStage,
+    InferenceStage,
+    IterationStateAdapter,
+    IterationStep,
+    IterativeStage,
+    ModelResultAdapter,
+    ModelStage,
+    PostprocessStage,
+    PreprocessStage,
+    ResultAdapter,
+)
 from inference_service.pipeline.state import PipelineState, PipelineStateMachine
 from inference_service.pipeline.types import PipelineDiagnostics, PipelineResult
 from inference_service.pipeline.validation import ActionValidation, validate_action_output
 
 __all__ = [
     "ActionValidation",
+    "DirectIterationStateAdapter",
+    "ExecutionControl",
+    "ExecutionError",
+    "EulerIterationStateAdapter",
+    "GenericModelPipeline",
+    "HostComputeStage",
+    "HostRoleStage",
     "InferencePipeline",
     "InferencePipelineManager",
+    "InferenceStage",
+    "IterationStateAdapter",
+    "IterationStep",
+    "IterativeStage",
+    "ModelExecutor",
+    "ModelSessionFactoryRegistry",
+    "MODEL_SESSION_FACTORY_REGISTRY",
+    "ModelResultAdapter",
+    "ModelStage",
     "PipelineConfigurationError",
+    "PipelineCanceledError",
     "PipelineDiagnostics",
     "PipelineError",
     "PipelineLifecycleError",
@@ -30,14 +90,34 @@ __all__ = [
     "PipelineNotFoundError",
     "PipelineNotReadyError",
     "PipelineResult",
+    "PipelineRuntimeCore",
+    "PipelineRuntimeDiagnostics",
     "PipelineState",
     "PipelineStateMachine",
     "PipelineTimeoutError",
+    "PI05Topology",
+    "PI05TopologyError",
     "PipelineTransitionError",
     "PipelineValidationError",
+    "SequentialModelExecutor",
+    "SmolVLAEmbeddingWeights",
+    "SmolVLAFamilyResource",
+    "SmolVLATopology",
+    "SmolVLATopologyError",
     "Postprocessor",
+    "PostprocessStage",
+    "PreprocessStage",
     "Processor",
+    "ResultAdapter",
+    "StageFrame",
     "validate_action_output",
     "create_inference_pipeline",
+    "create_pi05_executor",
     "create_pipeline_manager",
+    "create_smolvla_executor",
+    "derive_pi05_topology",
+    "derive_smolvla_topology",
+    "load_smolvla_embedding_weights",
+    "load_smolvla_policy_config",
+    "validate_smolvla_plan",
 ]

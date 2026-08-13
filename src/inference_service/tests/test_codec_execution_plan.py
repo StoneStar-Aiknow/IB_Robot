@@ -13,6 +13,7 @@ from inference_service.codecs import (
     ExecutionPlanError,
     build_execution_plan,
 )
+from inference_service.codecs.bindings import validate_artifact_bindings
 
 
 def _tensor(
@@ -57,6 +58,15 @@ def _host_plan_bindings() -> dict[str, ArtifactBindings]:
     }
 
 
+def test_artifact_bindings_accept_rank_four_non_image_without_layout():
+    bindings = ArtifactBindings(
+        inputs=(_tensor("internal.past_key.0", "past_key_0", 0, (1, 4, 1, 2)),),
+        outputs=(_tensor("action", "action", 0, (1, 2, 3)),),
+    )
+
+    validate_artifact_bindings(bindings)
+
+
 def test_host_internal_links_preserve_role_order_and_last_consumer_lifetime():
     plan = build_execution_plan(("vision", "prefill", "action"), _host_plan_bindings())
 
@@ -97,6 +107,37 @@ def test_execution_frame_rejects_role_order_and_missing_producer_output():
     with pytest.raises(ExecutionPlanError, match="did not provide host-visible output"):
         frame.finish_role("vision")
     assert frame.live_host_semantics == ()
+
+
+def test_execution_frame_repeats_bounded_loop_and_retains_pre_loop_host_value():
+    plan = build_execution_plan(("vision", "prefill", "action"), _host_plan_bindings())
+    frame = ExecutionFrame(plan)
+
+    frame.begin_role("vision")
+    frame.finish_role("vision", {"internal.vision_features": np.ones((1, 4, 8), dtype=np.float32)})
+    frame.begin_role("prefill")
+    frame.finish_role("prefill", {"internal.hidden": np.ones((1, 2, 8), dtype=np.float32)})
+    frame.configure_loop(("action",), 2)
+
+    assert set(frame.begin_role("action")) == {"internal.hidden", "internal.vision_features"}
+    frame.finish_role("action")
+    assert frame.live_host_semantics == ("internal.hidden", "internal.vision_features")
+    assert set(frame.begin_role("action")) == {"internal.hidden", "internal.vision_features"}
+    frame.finish_role("action")
+    assert frame.live_host_semantics == ()
+
+    with pytest.raises(ExecutionPlanError, match="no remaining roles"):
+        frame.begin_role("action")
+
+
+def test_execution_frame_rejects_invalid_loop_region():
+    plan = build_execution_plan(("vision", "prefill", "action"), _host_plan_bindings())
+    frame = ExecutionFrame(plan)
+
+    with pytest.raises(ExecutionPlanError, match="positive integer"):
+        frame.configure_loop(("vision",), 0)
+    with pytest.raises(ExecutionPlanError, match="next contiguous"):
+        frame.configure_loop(("prefill", "action"), 2)
 
 
 def test_device_only_link_is_descriptive_and_not_materialized_in_host_frame():

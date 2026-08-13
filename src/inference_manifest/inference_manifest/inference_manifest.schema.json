@@ -230,12 +230,23 @@
         }
       ],
       "if": {
-        "properties": {
-          "shape": {
-            "minItems": 4,
-            "maxItems": 4
+        "allOf": [
+          {
+            "properties": {
+              "shape": {
+                "minItems": 4,
+                "maxItems": 4
+              }
+            }
+          },
+          {
+            "properties": {
+              "semantic": {
+                "pattern": "^observation\\.images?(\\.|$)"
+              }
+            }
           }
-        }
+        ]
       },
       "then": {
         "required": [
@@ -243,10 +254,21 @@
         ]
       },
       "else": {
-        "not": {
-          "required": [
-            "layout"
-          ]
+        "if": {
+          "properties": {
+            "shape": {
+              "minItems": 4,
+              "maxItems": 4
+            }
+          }
+        },
+        "then": true,
+        "else": {
+          "not": {
+            "required": [
+              "layout"
+            ]
+          }
         }
       }
     },
@@ -290,12 +312,23 @@
         }
       },
       "if": {
-        "properties": {
-          "shape": {
-            "minItems": 4,
-            "maxItems": 4
+        "allOf": [
+          {
+            "properties": {
+              "shape": {
+                "minItems": 4,
+                "maxItems": 4
+              }
+            }
+          },
+          {
+            "properties": {
+              "semantic": {
+                "pattern": "^observation\\.images?(\\.|$)"
+              }
+            }
           }
-        }
+        ]
       },
       "then": {
         "required": [
@@ -303,10 +336,21 @@
         ]
       },
       "else": {
-        "not": {
-          "required": [
-            "layout"
-          ]
+        "if": {
+          "properties": {
+            "shape": {
+              "minItems": 4,
+              "maxItems": 4
+            }
+          }
+        },
+        "then": true,
+        "else": {
+          "not": {
+            "required": [
+              "layout"
+            ]
+          }
         }
       }
     },
@@ -381,6 +425,9 @@
         },
         "family": {
           "$ref": "#/$defs/non_empty_string"
+        },
+        "operation": {
+          "type": "string"
         },
         "inputs": {
           "type": "array",

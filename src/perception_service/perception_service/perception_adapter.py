@@ -18,6 +18,9 @@ class AdapterIdentity:
     preprocessing: str
     postprocessing: str
     supported_deployments: frozenset[str]
+    # ``operation`` distinguishes one service contract of a family from another (SAM2
+    # automatic vs prompt, Grounding combined vs raw). Empty for single-contract families.
+    operation: str = ""
 
 
 class PerceptionAdapter(ABC):

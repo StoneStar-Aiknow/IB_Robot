@@ -7,8 +7,12 @@ import math
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from inference_manifest.json_utils import load_json_strict
+
+if TYPE_CHECKING:
+    from inference_service.pipeline.stages import IterationStep
 
 PI05_SCHEDULE_FORMAT = "pi05-denoising-schedule-v1"
 PI05_SCHEDULE_ALGORITHM = "euler"
@@ -52,6 +56,14 @@ class PI05DenoisingSchedule:
     @property
     def step_count(self) -> int:
         return len(self.timesteps) - 1
+
+    def iteration_steps(self) -> tuple[IterationStep, ...]:
+        from inference_service.pipeline.stages import IterationStep
+
+        return tuple(
+            IterationStep(index=index, timestep=current, delta=following - current)
+            for index, (current, following) in enumerate(pairwise(self.timesteps))
+        )
 
     def to_dict(self) -> dict[str, object]:
         return {

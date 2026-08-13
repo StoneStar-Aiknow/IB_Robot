@@ -29,13 +29,13 @@ from conftest import FakeAclModel, FakeAclRuntimeManager
 from sensor_msgs.msg import PointCloud2, PointField
 
 from inference_manifest import load_inference_manifest
+from inference_service.backends import RuntimeContext
 from inference_service.model_service_plugin import ModelServicePlugin
+from inference_service.model_sessions import TorchModelSession
 from perception_service.graspgen_adapter import GraspGenAdapter
 from perception_service.graspgen_session import GraspGenAscendSession
-from perception_service.model_service_plugins import (
-    GraspGenGenerateGraspsPlugin,
-    _new_graspgen_session,
-)
+from perception_service.model_service_plugins import GraspGenGenerateGraspsPlugin
+from perception_service.model_session_builders import build_graspgen_session
 
 GRASPGEN_DEPLOYMENT = "ascend_310p"
 
@@ -213,17 +213,18 @@ def test_a_cloud_that_is_not_a_point_cloud_is_refused_before_the_device(plugin):
         plugin.handle(SimpleNamespace(object_points=cloud, max_grasps=1, min_confidence=0.0), _response())
 
 
-def test_the_session_factory_refuses_a_bundle_that_was_never_compiled(graspgen_bundle):
-    """The eight OMs and the host math between them are one contract; there is no fallback."""
+def test_the_session_factory_rejects_an_unknown_graspgen_deployment_type(graspgen_bundle):
     validated = load_inference_manifest(graspgen_bundle, GRASPGEN_DEPLOYMENT)
     torch_deployment = SimpleNamespace(backend="torch", device="cpu")
 
-    with pytest.raises(RuntimeError, match="requires a compiled Ascend deployment and has no Torch fallback"):
-        _new_graspgen_session(
-            "graspgen",
-            GraspGenAdapter.from_bundle(graspgen_bundle),
-            SimpleNamespace(deployment=torch_deployment, manifest=validated.manifest),
-            {},
+    with pytest.raises(RuntimeError, match="requires a Torch CUDA or compiled Ascend deployment"):
+        build_graspgen_session(
+            SimpleNamespace(
+                model=validated.manifest.model,
+                deployment=torch_deployment,
+                runtime_options={},
+            ),
+            adapter=GraspGenAdapter.from_bundle(graspgen_bundle),
         )
 
 
@@ -232,11 +233,25 @@ def test_the_session_factory_accepts_a_seed_but_still_closes_the_option_set(gras
     validated = load_inference_manifest(graspgen_bundle, GRASPGEN_DEPLOYMENT)
     adapter = GraspGenAdapter.from_bundle(graspgen_bundle)
 
-    session = _new_graspgen_session("graspgen", adapter, validated, {"random_seed": 7, "device_id": 3})
+    session = build_graspgen_session(
+        RuntimeContext(validated, runtime_options={"random_seed": 7, "device_id": 3}),
+        adapter=adapter,
+    )
     assert isinstance(session, GraspGenAscendSession)
 
     with pytest.raises(ValueError, match=r"unknown Ascend runtime options: \['curvature_log_path'\]"):
-        _new_graspgen_session("graspgen", adapter, validated, {"curvature_log_path": "x"})
+        build_graspgen_session(RuntimeContext(validated, runtime_options={"curvature_log_path": "x"}), adapter=adapter)
+
+
+def test_the_session_factory_selects_torch_cuda_without_runtime_options(graspgen_bundle):
+    validated = load_inference_manifest(graspgen_bundle, "torch_cuda")
+    adapter = GraspGenAdapter.from_bundle(graspgen_bundle)
+
+    session = build_graspgen_session(RuntimeContext(validated), adapter=adapter)
+
+    assert isinstance(session, TorchModelSession)
+    with pytest.raises(ValueError, match="does not accept runtime options"):
+        build_graspgen_session(RuntimeContext(validated, runtime_options={"device_id": 0}), adapter=adapter)
 
 
 def test_the_plugin_refuses_a_raw_backend_selection(graspgen_bundle):

@@ -120,7 +120,8 @@ class _PreprocessorView:
     def __call__(self, inputs: Mapping[str, object]) -> Mapping[str, object]:
         return self._pair.preprocess(inputs)
 
-    def reset(self) -> None:
+    def reset(self, deadline=None) -> None:
+        del deadline
         self._pair.reset()
 
     def close(self) -> None:

@@ -15,10 +15,12 @@ from inference_manifest import load_inference_manifest
 from inference_service.backends import (
     BACKEND_REGISTRY,
     BackendLoadError,
+    BackendRegistryError,
     BackendState,
     InferenceRequest,
     RuntimeContext,
 )
+from inference_service.pipeline import MODEL_SESSION_FACTORY_REGISTRY
 from tests.manifest_fixtures import create_policy_bundle, make_manifest, write_manifest
 
 
@@ -117,13 +119,13 @@ def _install_fake_lerobot(monkeypatch, torch_module, calls, *, attention: bool =
         def predict_action_chunk(self, batch, noise=None):
             self.last_batch = batch
             self.last_noise = noise
-            return torch_module.arange(6, dtype=torch_module.float32, device=self.model.parameter.device).reshape(
-                1, 2, 3
+            return torch_module.arange(12, dtype=torch_module.float32, device=self.model.parameter.device).reshape(
+                1, 2, 6
             )
 
         def select_action(self, batch):
             self.last_batch = batch
-            return torch_module.arange(3, dtype=torch_module.float32, device=self.model.parameter.device).reshape(1, 3)
+            return torch_module.arange(6, dtype=torch_module.float32, device=self.model.parameter.device).reshape(1, 6)
 
     if reset:
 
@@ -161,10 +163,36 @@ def _install_fake_lerobot(monkeypatch, torch_module, calls, *, attention: bool =
     monkeypatch.setitem(sys.modules, "lerobot.policies.factory", factory_module)
 
 
+def _make_pipeline(context):
+    from inference_service.pipeline import create_inference_pipeline
+
+    return create_inference_pipeline(
+        context.policy.policy_type,
+        context.validated_manifest,
+        runtime_options=dict(context.runtime_options),
+    )
+
+
+def _pipeline_session(pipeline):
+    return pipeline._session_handle._capability_source
+
+
+def test_policy_facade_uses_one_flat_sequential_executor(monkeypatch, tmp_path):
+    torch = pytest.importorskip("torch")
+    context = _make_context(tmp_path / "bundle", policy_type="pi05")
+    _install_fake_lerobot(monkeypatch, torch, {})
+
+    pipeline = _make_pipeline(context)
+    executor = pipeline._pipeline._core._executor
+
+    from inference_service.pipeline import SequentialModelExecutor
+
+    assert isinstance(executor, SequentialModelExecutor)
+    assert all(not isinstance(component, SequentialModelExecutor) for component in executor.components)
+
+
 def test_torch_backend_loads_original_bundle_and_preserves_native_inference_contract(monkeypatch, tmp_path):
     torch = pytest.importorskip("torch")
-    from inference_service.backends.torch import create_backend
-
     context = _make_context(tmp_path / "bundle", policy_type="pi05")
     config_path = context.validated_manifest.bundle_root / "config.json"
     original_config = config_path.read_bytes()
@@ -172,14 +200,15 @@ def test_torch_backend_loads_original_bundle_and_preserves_native_inference_cont
     _install_fake_lerobot(monkeypatch, torch, calls)
 
     def fail_tempdir(*args, **kwargs):
-        raise AssertionError(f"TorchBackend attempted temporary materialization: {args}, {kwargs}")
+        raise AssertionError(f"Torch session attempted temporary materialization: {args}, {kwargs}")
 
     monkeypatch.setattr(tempfile, "mkdtemp", fail_tempdir)
     monkeypatch.setattr(tempfile, "NamedTemporaryFile", fail_tempdir)
     monkeypatch.setattr(tempfile, "TemporaryDirectory", fail_tempdir)
-    backend = create_backend(context)
-    assert backend.capabilities.resettable is False
-    backend.load(context)
+    pipeline = _make_pipeline(context)
+    session = _pipeline_session(pipeline)
+    assert session.capabilities.resettable is False
+    pipeline.load()
 
     bundle_path = str(context.validated_manifest.bundle_root)
     assert calls["config_path"] == bundle_path
@@ -194,22 +223,20 @@ def test_torch_backend_loads_original_bundle_and_preserves_native_inference_cont
     assert config_path.read_bytes() == original_config
     assert calls["policy"].to_devices == ["cpu"]
     assert calls["policy"].eval_calls == 1
-    assert backend.policy_config.type == "pi05"
-    assert backend.preprocessor is calls["preprocessor"]
-    assert backend.postprocessor is calls["postprocessor"]
-    assert backend.health().state is BackendState.READY
-    assert backend.capabilities.resettable is True
-    assert backend.capabilities.stateful is True
-    assert backend.capabilities.supports_attention is True
-    assert backend.capabilities.supports_cancellation is False
-    assert backend.capabilities.thread_safe is False
-    assert backend.capabilities.max_in_flight_per_instance == 1
-    assert backend.capabilities.supports_multiple_instances is True
-    assert backend.capabilities.resource_domain == "torch:cpu"
-    assert backend.capabilities.resource_domain_limit == 1
+    assert session.policy_config.type == "pi05"
+    assert session.health().state is BackendState.READY
+    assert session.capabilities.resettable is True
+    assert session.capabilities.stateful is True
+    assert session.capabilities.supports_attention is True
+    assert session.capabilities.supports_cancellation is False
+    assert session.capabilities.thread_safe is False
+    assert session.capabilities.max_in_flight_per_instance == 1
+    assert session.capabilities.supports_multiple_instances is True
+    assert session.capabilities.resource_domain == "torch:cpu"
+    assert session.capabilities.resource_domain_limit == 1
 
     noise = torch.ones((1, 2, 3), dtype=torch.float64)
-    result = backend.infer(
+    result = pipeline.infer(
         InferenceRequest(
             request_id="chunk",
             inputs={
@@ -221,7 +248,7 @@ def test_torch_backend_loads_original_bundle_and_preserves_native_inference_cont
         )
     )
 
-    assert tuple(result.action.shape) == (2, 3)
+    assert tuple(result.action.shape) == (2, 6)
     assert result.actual_chunk_size == 2
     assert result.backend_latency_ms >= 0
     assert result.metadata["request_id"] == "chunk"
@@ -230,54 +257,86 @@ def test_torch_backend_loads_original_bundle_and_preserves_native_inference_cont
     assert result.metadata["action_method"] == "predict_action_chunk"
     assert result.metadata["deployment_fingerprint"] == context.deployment_fingerprint
     assert result.metadata["external_noise"] is True
-    assert calls["policy"].last_batch["task"] == "canonical task"
+    assert calls["policy"].last_batch["task"] == "request prompt"
     assert "_noise" not in calls["policy"].last_batch
     assert calls["policy"].last_noise.dtype == calls["policy"].model.parameter.dtype
     assert calls["policy"].last_noise.device == calls["policy"].model.parameter.device
 
-    selected = backend.infer(
+    selected = pipeline.infer(
         InferenceRequest(
             request_id="single",
             inputs={"observation.state": torch.zeros((1, 3)), "task": "canonical task"},
             metadata={"action_method": "select_action"},
         )
     )
-    assert tuple(selected.action.shape) == (3,)
+    assert tuple(selected.action.shape) == (6,)
     assert selected.actual_chunk_size == 1
     assert calls["policy"].last_batch["task"] == "canonical task"
 
-    backend.reset()
+    pipeline.reset()
     assert calls["policy"].reset_calls == 1
-    backend.close()
-    assert backend.policy is None
-    assert backend.policy_config is None
-    assert backend.health().state is BackendState.CLOSED
+    pipeline.close()
+    assert session.policy is None
+    assert session.policy_config is None
+    assert session.health().state is BackendState.CLOSED
+
+
+@pytest.mark.parametrize("policy_type", ["act", "diffusion", "pi05", "smolvla"])
+def test_torch_policy_families_delegate_one_action_chunk_call(monkeypatch, tmp_path, policy_type):
+    torch = pytest.importorskip("torch")
+    from inference_service.pipeline import create_inference_pipeline
+
+    calls = {}
+    _install_fake_lerobot(monkeypatch, torch, calls)
+    context = _make_context(tmp_path / policy_type, policy_type=policy_type)
+    pipeline = create_inference_pipeline(policy_type, context.validated_manifest)
+    pipeline.load()
+    policy = calls["policy"]
+    action_calls = 0
+
+    def recording_chunk(batch, noise=None):
+        nonlocal action_calls
+        del batch, noise
+        action_calls += 1
+        return torch.zeros((1, 2, 6), dtype=torch.float32)
+
+    policy.predict_action_chunk = recording_chunk
+    result = pipeline.infer(
+        InferenceRequest(
+            request_id=f"{policy_type}-delegated",
+            inputs={"observation.state": torch.zeros((1, 3))},
+        )
+    )
+
+    assert action_calls == 1
+    assert result.metadata["policy_type"] == policy_type
+    assert result.metadata["action_method"] == "predict_action_chunk"
+    assert pipeline._pi05_handle is None
+    pipeline.close()
 
 
 def test_torch_backend_places_noise_at_action_projection_dtype():
     torch = pytest.importorskip("torch")
-    from inference_service.backends.torch import TorchBackend
+    from inference_service.model_sessions import LeRobotTorchModelSession
 
-    backend = TorchBackend("cpu")
-    backend._device = torch.device("cpu")
-    backend._policy = SimpleNamespace(
+    session = LeRobotTorchModelSession("cpu")
+    session._device = torch.device("cpu")
+    session._policy = SimpleNamespace(
         model=SimpleNamespace(
             action_in_proj=SimpleNamespace(weight=torch.ones(1, dtype=torch.float32)),
             parameter=torch.ones(1, dtype=torch.bfloat16),
         )
     )
 
-    placed = backend._place_noise(torch.ones((1, 2, 3), dtype=torch.bfloat16))
+    placed = session._place_noise(torch.ones((1, 2, 3), dtype=torch.bfloat16))
 
     assert placed.dtype == torch.float32
-    assert placed.device == backend._policy.model.action_in_proj.weight.device
-    backend.close()
+    assert placed.device == session._policy.model.action_in_proj.weight.device
+    session.close()
 
 
 def test_torch_backend_resolves_local_semantic_assets_without_rewriting_bundle(monkeypatch, tmp_path):
     torch = pytest.importorskip("torch")
-    from inference_service.backends.torch import create_backend
-
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     bundle_paths = create_policy_bundle(bundle, policy_type="smolvla", local_tokenizer=True)
@@ -288,8 +347,8 @@ def test_torch_backend_resolves_local_semantic_assets_without_rewriting_bundle(m
     calls = {}
     _install_fake_lerobot(monkeypatch, torch, calls)
 
-    backend = create_backend(context)
-    backend.load(context)
+    pipeline = _make_pipeline(context)
+    pipeline.load()
 
     tokenizer_path = str((bundle / "tokenizer").resolve())
     assert calls["policy_kwargs"]["config"].vlm_model_name == tokenizer_path
@@ -302,7 +361,7 @@ def test_torch_backend_resolves_local_semantic_assets_without_rewriting_bundle(m
     }
     assert (bundle / "config.json").read_bytes() == original_config
     assert (bundle / "policy_preprocessor.json").read_bytes() == original_preprocessor
-    backend.close()
+    pipeline.close()
 
 
 @pytest.mark.parametrize(
@@ -311,27 +370,25 @@ def test_torch_backend_resolves_local_semantic_assets_without_rewriting_bundle(m
 )
 def test_torch_backend_applies_validated_model_dtype_runtime_option(monkeypatch, tmp_path, model_dtype, expected_dtype):
     torch = pytest.importorskip("torch")
-    from inference_service.backends.torch import create_backend
-
     calls = {}
     _install_fake_lerobot(monkeypatch, torch, calls)
     context = _make_context(
         tmp_path / "bundle",
         runtime_options={"model_dtype": model_dtype},
     )
-    backend = create_backend(context)
-    backend.load(context)
+    pipeline = _make_pipeline(context)
+    pipeline.load()
 
     assert str(calls["policy"].model.parameter.dtype).removeprefix("torch.") == expected_dtype
     assert calls["policy"].eval_calls == 1
-    result = backend.infer(
+    result = pipeline.infer(
         InferenceRequest(
             request_id="dtype",
             inputs={"observation.state": torch.zeros((1, 3))},
         )
     )
     assert result.metadata["model_dtype"] == model_dtype
-    backend.close()
+    pipeline.close()
 
 
 @pytest.mark.parametrize(
@@ -340,29 +397,31 @@ def test_torch_backend_applies_validated_model_dtype_runtime_option(monkeypatch,
 )
 def test_torch_backend_rejects_invalid_runtime_options(monkeypatch, tmp_path, runtime_options):
     torch = pytest.importorskip("torch")
-    from inference_service.backends.torch import create_backend
-
     calls = {}
     _install_fake_lerobot(monkeypatch, torch, calls)
     context = _make_context(tmp_path / "bundle", runtime_options=runtime_options)
-    backend = create_backend(context)
-
     with pytest.raises(BackendLoadError) as error:
-        backend.load(context)
+        _make_pipeline(context)
 
     assert error.value.code == "invalid_runtime_options"
-    backend.close()
 
 
-def test_static_registry_creates_lazy_torch_factory_without_loading_policy(tmp_path):
+def test_static_registry_marks_torch_as_session_only(tmp_path):
     context = _make_context(tmp_path / "bundle")
 
-    backend = BACKEND_REGISTRY.create(context)
+    descriptor = BACKEND_REGISTRY.validate(context)
 
-    assert backend.name == "torch"
-    assert backend.health().state is BackendState.CREATED
-    assert backend.policy is None
-    backend.close()
+    assert descriptor.factory is None
+    with pytest.raises(BackendRegistryError) as error:
+        BACKEND_REGISTRY.create(context)
+    assert error.value.code == "backend_factory_unavailable"
+
+
+def test_model_session_factory_registry_routes_torch_policy_without_backend_creation(tmp_path):
+    builder = MODEL_SESSION_FACTORY_REGISTRY.get("act", "torch")
+
+    assert builder is not None
+    assert MODEL_SESSION_FACTORY_REGISTRY.get("unknown", "torch") is None
 
 
 def test_two_cpu_torch_pipelines_construct_and_serialize_shared_device_domain(monkeypatch, tmp_path):
@@ -396,8 +455,8 @@ def test_two_cpu_torch_pipelines_construct_and_serialize_shared_device_domain(mo
             with lock:
                 active -= 1
 
-    first._backend.policy.predict_action_chunk = blocking_chunk
-    second._backend.policy.predict_action_chunk = blocking_chunk
+    _pipeline_session(first).policy.predict_action_chunk = blocking_chunk
+    _pipeline_session(second).policy.predict_action_chunk = blocking_chunk
     errors = []
 
     def infer(pipeline, request_id):
@@ -430,22 +489,21 @@ def test_two_cpu_torch_pipelines_construct_and_serialize_shared_device_domain(mo
 
 def test_torch_backend_reports_non_resettable_policy_and_unobservable_attention(monkeypatch, tmp_path):
     torch = pytest.importorskip("torch")
-    from inference_service.backends.torch import create_backend
-
     calls = {}
     _install_fake_lerobot(monkeypatch, torch, calls, attention=False, reset=False)
     context = _make_context(tmp_path / "bundle")
-    backend = create_backend(context)
-    backend.load(context)
+    pipeline = _make_pipeline(context)
+    session = _pipeline_session(pipeline)
+    pipeline.load()
 
-    assert backend.capabilities.resettable is False
-    assert backend.capabilities.stateful is False
-    assert backend.capabilities.supports_attention is False
-    backend.close()
+    assert session.capabilities.resettable is False
+    assert session.capabilities.stateful is False
+    assert session.capabilities.supports_attention is False
+    pipeline.close()
 
 
 def test_torch_backend_detects_hookable_act_decoder_attention():
-    from inference_service.backends.torch import TorchBackend
+    from inference_service.model_sessions import LeRobotTorchModelSession
 
     policy = SimpleNamespace(
         model=SimpleNamespace(
@@ -453,17 +511,17 @@ def test_torch_backend_detects_hookable_act_decoder_attention():
         )
     )
 
-    assert TorchBackend._observes_attention(policy) is True
+    assert LeRobotTorchModelSession.observes_attention(policy) is True
 
 
 def test_torch_backend_does_not_import_accelerator_extension_for_cpu(monkeypatch, tmp_path):
     torch = pytest.importorskip("torch")
-    import inference_service.backends.torch as torch_backend_module
+    import inference_service.model_sessions.lerobot_torch as session_module
 
     calls = {}
     _install_fake_lerobot(monkeypatch, torch, calls)
     imported = []
-    original_import = torch_backend_module.importlib.import_module
+    original_import = session_module.importlib.import_module
 
     def guarded_import(name):
         imported.append(name)
@@ -471,37 +529,37 @@ def test_torch_backend_does_not_import_accelerator_extension_for_cpu(monkeypatch
             raise AssertionError("CPU backend imported torch_npu")
         return original_import(name)
 
-    monkeypatch.setattr(torch_backend_module.importlib, "import_module", guarded_import)
+    monkeypatch.setattr(session_module.importlib, "import_module", guarded_import)
     context = _make_context(tmp_path / "bundle")
-    backend = torch_backend_module.create_backend(context)
-    backend.load(context)
-    backend.close()
+    session = session_module.LeRobotTorchModelSession("cpu")
+    session.load(context)
+    session.close()
 
     assert "torch_npu" not in imported
 
 
 def test_torch_backend_reports_missing_torch_dependency(monkeypatch, tmp_path):
-    import inference_service.backends.torch as torch_backend_module
+    import inference_service.model_sessions.lerobot_torch as session_module
 
     def unavailable(name):
         if name == "torch":
             raise ImportError("not installed")
         return __import__(name)
 
-    monkeypatch.setattr(torch_backend_module.importlib, "import_module", unavailable)
+    monkeypatch.setattr(session_module.importlib, "import_module", unavailable)
     context = _make_context(tmp_path / "bundle")
-    backend = torch_backend_module.create_backend(context)
+    session = session_module.LeRobotTorchModelSession("cpu")
     with pytest.raises(BackendLoadError, match="PyTorch.*unavailable") as error:
-        backend.load(context)
+        session.load(context)
     assert error.value.code == "missing_dependency"
-    backend.close()
+    session.close()
 
 
 def test_torch_backend_reports_missing_lerobot_dependency(monkeypatch, tmp_path):
     torch = pytest.importorskip("torch")
-    import inference_service.backends.torch as torch_backend_module
+    import inference_service.model_sessions.lerobot_torch as session_module
 
-    original_import = torch_backend_module.importlib.import_module
+    original_import = session_module.importlib.import_module
 
     def unavailable(name):
         if name == "torch":
@@ -510,17 +568,17 @@ def test_torch_backend_reports_missing_lerobot_dependency(monkeypatch, tmp_path)
             raise ImportError("not installed")
         return original_import(name)
 
-    monkeypatch.setattr(torch_backend_module.importlib, "import_module", unavailable)
+    monkeypatch.setattr(session_module.importlib, "import_module", unavailable)
     context = _make_context(tmp_path / "bundle")
-    backend = torch_backend_module.create_backend(context)
+    session = session_module.LeRobotTorchModelSession("cpu")
     with pytest.raises(BackendLoadError, match="LeRobot.*unavailable") as error:
-        backend.load(context)
+        session.load(context)
     assert error.value.code == "missing_dependency"
-    backend.close()
+    session.close()
 
 
 def test_torch_backend_rejects_unavailable_cuda_before_lerobot_import(monkeypatch, tmp_path):
-    import inference_service.backends.torch as torch_backend_module
+    import inference_service.model_sessions.lerobot_torch as session_module
 
     fake_torch = SimpleNamespace(
         cuda=SimpleNamespace(is_available=lambda: False),
@@ -535,18 +593,18 @@ def test_torch_backend_rejects_unavailable_cuda_before_lerobot_import(monkeypatc
             return fake_torch
         raise AssertionError(f"unexpected import after unavailable device: {name}")
 
-    monkeypatch.setattr(torch_backend_module.importlib, "import_module", fake_import)
+    monkeypatch.setattr(session_module.importlib, "import_module", fake_import)
     context = _make_context(tmp_path / "bundle", device="cuda")
-    backend = torch_backend_module.create_backend(context)
+    session = session_module.LeRobotTorchModelSession("cuda")
     with pytest.raises(BackendLoadError, match="cuda.*not available") as error:
-        backend.load(context)
+        session.load(context)
     assert error.value.code == "device_unavailable"
     assert imported == ["torch"]
-    backend.close()
+    session.close()
 
 
 def test_torch_backend_imports_torch_npu_only_when_npu_is_selected(monkeypatch, tmp_path):
-    import inference_service.backends.torch as torch_backend_module
+    import inference_service.model_sessions.lerobot_torch as session_module
 
     fake_torch = SimpleNamespace(device=lambda name: name)
     imported = []
@@ -559,14 +617,14 @@ def test_torch_backend_imports_torch_npu_only_when_npu_is_selected(monkeypatch, 
             raise ImportError("not installed")
         raise AssertionError(f"unexpected import: {name}")
 
-    monkeypatch.setattr(torch_backend_module.importlib, "import_module", fake_import)
+    monkeypatch.setattr(session_module.importlib, "import_module", fake_import)
     context = _make_context(tmp_path / "bundle", device="npu")
-    backend = torch_backend_module.create_backend(context)
+    session = session_module.LeRobotTorchModelSession("npu")
     with pytest.raises(BackendLoadError, match="torch_npu.*unavailable") as error:
-        backend.load(context)
+        session.load(context)
     assert error.value.code == "missing_dependency"
     assert imported == ["torch", "torch_npu"]
-    backend.close()
+    session.close()
 
 
 @pytest.mark.parametrize("device", ["cuda", "mps", "npu"])
@@ -583,11 +641,11 @@ def test_torch_backend_optional_accelerator_load(monkeypatch, tmp_path, device):
 
     calls = {}
     _install_fake_lerobot(monkeypatch, torch, calls)
-    from inference_service.backends.torch import create_backend
+    from inference_service.model_sessions import LeRobotTorchModelSession
 
     context = _make_context(tmp_path / "bundle", device=device)
-    backend = create_backend(context)
-    backend.load(context)
+    session = LeRobotTorchModelSession(device)
+    session.load(context)
     assert calls["policy"].to_devices == [device]
-    assert backend.capabilities.resettable is True
-    backend.close()
+    assert session.capabilities.resettable is True
+    session.close()

@@ -88,6 +88,7 @@ def _specs() -> dict[str, BundleSpec]:
             name="sam2.1_hiera_tiny",
             adapter={
                 "family": "sam2",
+                "operation": "automatic",
                 "preprocessing": SAM2Adapter.identity.preprocessing,
                 "postprocessing": SAM2Adapter.identity.postprocessing,
                 "torch_module_loader": "perception_service.torch_model_loaders:load_sam2",
@@ -98,6 +99,7 @@ def _specs() -> dict[str, BundleSpec]:
             model=ModelDescriptor(
                 kind="perception",
                 family="sam2",
+                operation="automatic",
                 inputs=(_tensor("observation.image", "uint8", (-1, -1, 3)),),
                 outputs=(
                     _tensor("masks", "uint8", (-1, -1, -1)),
@@ -192,6 +194,7 @@ def _specs() -> dict[str, BundleSpec]:
             name="grounded_sam2_swint_ogc",
             adapter={
                 "family": "grounding_dino",
+                "operation": "combined",
                 "preprocessing": GroundingDINOAdapter.identity.preprocessing,
                 "postprocessing": GroundingDINOAdapter.identity.postprocessing,
                 "torch_module_loader": "perception_service.torch_model_loaders:load_grounded_sam2",
@@ -203,6 +206,7 @@ def _specs() -> dict[str, BundleSpec]:
             model=ModelDescriptor(
                 kind="perception",
                 family="grounding_dino",
+                operation="combined",
                 inputs=(
                     _tensor("observation.image", "uint8", (-1, -1, 3)),
                     _tensor("text_prompt", "uint8", (-1,)),

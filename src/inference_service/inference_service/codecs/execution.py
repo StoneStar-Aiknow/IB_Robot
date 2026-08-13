@@ -252,10 +252,36 @@ class ExecutionFrame:
         self._next_position = 0
         self._active_role: str | None = None
         self._host_tensors: dict[str, np.ndarray] = {}
+        self._loop_start: int | None = None
+        self._loop_end: int | None = None
+        self._loop_iterations = 0
+        self._completed_loop_iterations = 0
 
     @property
     def live_host_semantics(self) -> tuple[str, ...]:
         return tuple(sorted(self._host_tensors))
+
+    def configure_loop(self, roles: Sequence[str], iteration_count: int) -> None:
+        """Allow one contiguous role region to repeat a bounded number of times."""
+
+        if self._active_role is not None or self._loop_start is not None:
+            raise ExecutionPlanError("execution frame loop region is already active or configured")
+        if type(iteration_count) is not int or iteration_count < 1:
+            raise ExecutionPlanError("execution frame loop iteration_count must be a positive integer")
+        loop_roles = tuple(roles)
+        if not loop_roles:
+            raise ExecutionPlanError("execution frame loop region requires at least one role")
+        if self._next_position >= len(self._plan.roles):
+            raise ExecutionPlanError("execution frame has no remaining roles for a loop region")
+        end = self._next_position + len(loop_roles)
+        declared = self._plan.role_names[self._next_position : end]
+        if declared != loop_roles:
+            raise ExecutionPlanError(
+                f"execution frame loop roles must be the next contiguous plan region; expected {declared!r}"
+            )
+        self._loop_start = self._next_position
+        self._loop_end = end - 1
+        self._loop_iterations = iteration_count
 
     def begin_role(self, role: str) -> Mapping[str, np.ndarray]:
         if self._active_role is not None:
@@ -295,11 +321,25 @@ class ExecutionFrame:
         self._host_tensors.update(produced_values)
 
         for link in self._plan.host_links:
-            if link.last_consumer_position == position:
+            if link.last_consumer_position == position and not self._retain_for_later_loop_iteration(link):
                 self._host_tensors.pop(link.semantic, None)
 
         self._active_role = None
-        self._next_position += 1
+        if self._loop_end == position:
+            self._completed_loop_iterations += 1
+            if self._completed_loop_iterations < self._loop_iterations:
+                self._next_position = self._loop_start
+            else:
+                self._next_position += 1
+        else:
+            self._next_position += 1
+
+    def _retain_for_later_loop_iteration(self, link: HostInternalLink) -> bool:
+        if self._loop_start is None or self._loop_end is None:
+            return False
+        if self._completed_loop_iterations >= self._loop_iterations - 1:
+            return False
+        return link.producer_position < self._loop_start <= link.last_consumer_position <= self._loop_end
 
     def close(self) -> None:
         self._host_tensors.clear()

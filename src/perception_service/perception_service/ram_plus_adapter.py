@@ -59,6 +59,11 @@ class RAMPlusAdapter(PerceptionAdapter):
         }
         if any(identity.get(name) != value for name, value in expected.items()):
             raise ValueError(f"RAM++ adapter identity mismatch: expected {expected}, got {identity}")
+        if identity.get("operation", "") != cls.identity.operation:
+            raise ValueError(
+                f"RAM++ adapter operation mismatch: expected {cls.identity.operation!r}, "
+                f"got {identity.get('operation', '')!r}"
+            )
         labels = (root / "assets" / "ram_tag_list.txt").read_text(encoding="utf-8").splitlines()
         thresholds = np.loadtxt(root / "assets" / "ram_tag_list_threshold.txt", dtype=np.float32)
         return cls(labels, thresholds)

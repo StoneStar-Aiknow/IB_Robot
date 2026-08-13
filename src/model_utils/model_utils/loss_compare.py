@@ -14,20 +14,6 @@ np = None  # type: ignore
 torch = None  # type: ignore
 tqdm = None  # type: ignore
 PureInferenceEngine = None  # type: ignore
-_DIAGNOSTIC_ASCEND_OPTIONS = None
-
-
-def _diagnostic_ascend_backend(context):
-    from inference_service.backends.ascend.backend import AscendBackend
-
-    if _DIAGNOSTIC_ASCEND_OPTIONS is None:
-        raise RuntimeError("diagnostic Ascend schedule was not configured")
-    schedule, source = _DIAGNOSTIC_ASCEND_OPTIONS
-    return AscendBackend(
-        int(context.runtime_options.get("device_id", 0)),
-        diagnostic_schedule=schedule,
-        diagnostic_schedule_source=source,
-    )
 
 
 def generate_pi05_noise(shape: tuple[int, ...], seed: int):
@@ -263,31 +249,23 @@ class LossUtils:
             value = getattr(self.args, option, None)
             if value is not None:
                 runtime_options[option] = value
-        registry = None
+        diagnostic_options = {}
         schedule_override_path = getattr(self.args, "schedule_override_path", None)
         if schedule_override_path is not None:
-            from inference_service.backends import BACKEND_REGISTRY, BackendRegistry
             from inference_service.pi05_schedule import load_pi05_schedule
 
             schedule_path = Path(schedule_override_path).expanduser().resolve(strict=True)
             schedule = load_pi05_schedule(schedule_path)
-            descriptors = {name: BACKEND_REGISTRY.descriptor(name) for name in BACKEND_REGISTRY.names}
-            ascend = descriptors["ascend"]
-            descriptors["ascend"] = ascend.__class__(
-                name=ascend.name,
-                factory="model_utils.loss_compare:_diagnostic_ascend_backend",
-                supported_policy_families=ascend.supported_policy_families,
-                target_validator=ascend.target_validator,
-            )
-            global _DIAGNOSTIC_ASCEND_OPTIONS
-            _DIAGNOSTIC_ASCEND_OPTIONS = (schedule, str(schedule_path))
-            registry = BackendRegistry(descriptors)
+            diagnostic_options = {
+                "pi05_diagnostic_schedule": schedule,
+                "pi05_diagnostic_schedule_source": str(schedule_path),
+            }
         engine = PureInferenceEngine(
             model_path=self.args.policy_path,
             deployment=self.args.deployment,
             pipeline_id="loss_compare",
             runtime_options=runtime_options,
-            **({"registry": registry} if registry is not None else {}),
+            **diagnostic_options,
         )
         print(
             f"model loaded: {self.args.policy_path} "

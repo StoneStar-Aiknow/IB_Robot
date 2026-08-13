@@ -17,9 +17,11 @@ from inference_service.backends.lifecycle import LifecycleBackend, PartialLoadRo
 from inference_service.backends.registry import (
     BACKEND_REGISTRY,
     CANONICAL_BACKENDS,
+    PERCEPTION_FAMILIES,
     STATIC_BACKEND_DESCRIPTORS,
     BackendDescriptor,
     BackendRegistry,
+    ConformanceEvidence,
 )
 from inference_service.backends.types import (
     BackendAdmissionEvidence,
@@ -36,6 +38,8 @@ from inference_service.backends.types import (
 __all__ = [
     "BACKEND_REGISTRY",
     "CANONICAL_BACKENDS",
+    "ConformanceEvidence",
+    "PERCEPTION_FAMILIES",
     "STATIC_BACKEND_DESCRIPTORS",
     "BackendAdmission",
     "BackendAdmissionError",

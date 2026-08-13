@@ -248,4 +248,53 @@ def load_grounded_sam2(context):
     return _GroundedSAM2Module(wrapper)
 
 
-__all__ = ["load_grounded_sam2", "load_ram_plus", "load_sam2", "load_siglip2"]
+class _GraspGenModule:
+    def __init__(self, sampler, config, torch_module) -> None:
+        self.sampler = sampler
+        self.config = config
+        self.torch = torch_module
+
+    def __call__(self, inputs):
+        from grasp_gen.grasp_server import GraspGenSampler
+
+        # The shared adapter has already centred and kappa-scaled the cloud. The upstream
+        # CUDA sampler consumes centred metric points and owns its own internal scaling.
+        points = inputs["observation.object_points"]
+        detach = getattr(points, "detach", None)
+        if callable(detach):
+            points = detach()
+        cpu = getattr(points, "cpu", None)
+        if callable(cpu):
+            points = cpu()
+        numpy = getattr(points, "numpy", None)
+        if callable(numpy):
+            points = numpy()
+        points = np.ascontiguousarray(np.asarray(points, dtype=np.float32) / float(self.config.kappa))
+        poses, confidence = GraspGenSampler.run_inference(
+            points,
+            self.sampler,
+            grasp_threshold=-1.0,
+            num_grasps=int(self.config.grasp_batch_size),
+            topk_num_grasps=-1,
+            min_grasps=0,
+            max_tries=1,
+        )
+        return {
+            "grasp.poses": poses.to(self.torch.float32),
+            "grasp.confidence": confidence.to(self.torch.float32),
+        }
+
+
+def load_graspgen(context):
+    from grasp_gen.grasp_server import GraspGenSampler, load_grasp_cfg
+
+    from .graspgen_adapter import GraspGenConfig
+
+    root, assets = _configuration(context)
+    config = load_grasp_cfg(str(root / assets["gripper_config"]))
+    config.eval.checkpoint = str(root / assets["generator_checkpoint"])
+    config.discriminator.checkpoint = str(root / assets["discriminator_checkpoint"])
+    return _GraspGenModule(GraspGenSampler(config), GraspGenConfig.from_assets(assets), __import__("torch"))
+
+
+__all__ = ["load_graspgen", "load_grounded_sam2", "load_ram_plus", "load_sam2", "load_siglip2"]

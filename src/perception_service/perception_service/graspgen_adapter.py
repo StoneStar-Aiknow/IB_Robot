@@ -81,7 +81,7 @@ class GraspGenAdapter(PerceptionAdapter):
         family="graspgen",
         preprocessing=GRASPGEN_PREPROCESSING,
         postprocessing=GRASPGEN_POSTPROCESSING,
-        supported_deployments=frozenset({"ascend_310p", "ascend_310b"}),
+        supported_deployments=frozenset({"torch_cuda", "ascend_310p", "ascend_310b"}),
     )
 
     compiled_abi_finalized = True
@@ -101,6 +101,11 @@ class GraspGenAdapter(PerceptionAdapter):
         }
         if any(assets.get(name) != value for name, value in expected.items()):
             raise ValueError(f"GraspGen adapter identity mismatch: expected {expected}, got {assets}")
+        if assets.get("operation", "") != cls.identity.operation:
+            raise ValueError(
+                f"GraspGen adapter operation mismatch: expected {cls.identity.operation!r}, "
+                f"got {assets.get('operation', '')!r}"
+            )
         return cls(GraspGenConfig.from_assets(assets))
 
     def preprocess(self, points_xyz: np.ndarray) -> dict[str, np.ndarray]:

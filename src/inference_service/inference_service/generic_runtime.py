@@ -88,6 +88,7 @@ class NamedTensorRequest:
     inputs: Mapping[str, object]
     deadline: datetime | None = None
     metadata: Mapping[str, object] = field(default_factory=dict)
+    priority: int = 0
 
     def __post_init__(self) -> None:
         if not self.request_id:
@@ -96,6 +97,8 @@ class NamedTensorRequest:
             raise ValueError("inputs must contain at least one named value")
         if any(not isinstance(name, str) or not name for name in self.inputs):
             raise ValueError("input names must be non-empty strings")
+        if isinstance(self.priority, bool) or not isinstance(self.priority, int) or self.priority < 0:
+            raise ValueError("priority must be a non-negative integer")
         object.__setattr__(self, "inputs", _immutable_mapping(self.inputs))
         object.__setattr__(self, "metadata", _immutable_mapping(self.metadata))
 
@@ -107,6 +110,7 @@ class NamedTensorRequest:
             inputs=self.inputs,
             deadline=self.deadline,
             metadata=self.metadata,
+            priority=self.priority,
         )
 
 

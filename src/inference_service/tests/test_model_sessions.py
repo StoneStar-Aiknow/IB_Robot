@@ -369,6 +369,69 @@ def test_ascend_session_routes_device_links_without_host_round_trip(tmp_path) ->
     session.close()
 
 
+def test_ascend_session_executes_linked_roles_individually(tmp_path) -> None:
+    _FakeAclModel.instances = []
+    _FakeAclModel.fail_role = None
+    bundle_files = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, bundle_files)
+    (tmp_path / "artifacts/consumer.om").write_bytes(b"consumer")
+    manifest["model"] = {
+        "kind": "generic",
+        "family": "linked",
+        "inputs": [
+            {"semantic": "features", "dtype": "float32", "shape": [1, 2]},
+            {"semantic": "bias", "dtype": "float32", "shape": [1, 2]},
+        ],
+        "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1, 2]}],
+    }
+    deployment = manifest["deployments"]["ascend"]
+    deployment["artifacts"] = {
+        "producer": {"path": "artifacts/ram_plus.om", "format": "om"},
+        "consumer": {"path": "artifacts/consumer.om", "format": "om"},
+    }
+    deployment["execution"] = ["producer", "consumer"]
+    deployment["bindings"] = {
+        "producer": {
+            "inputs": [{"semantic": "features", "index": 0, "dtype": "float32", "shape": [1, 2]}],
+            "outputs": [{"semantic": "internal.hidden", "index": 0, "dtype": "float32", "shape": [1, 2]}],
+        },
+        "consumer": {
+            "inputs": [
+                {"semantic": "internal.hidden", "index": 0, "dtype": "float32", "shape": [1, 2]},
+                {"semantic": "bias", "index": 1, "dtype": "float32", "shape": [1, 2]},
+            ],
+            "outputs": [{"semantic": "scores", "index": 0, "dtype": "float32", "shape": [1, 2]}],
+        },
+    }
+    deployment["device_links"] = [
+        {
+            "semantic": "internal.hidden",
+            "producer": "producer",
+            "consumer": "consumer",
+            "transport": "device_pointer",
+            "owner": "producer",
+        }
+    ]
+    write_manifest(tmp_path, manifest)
+    session = AscendOmModelSession(runtime_manager=_FakeRuntimeManager(), model_factory=_FakeAclModel)
+    session.load(RuntimeContext(load_inference_manifest(tmp_path, "ascend")))
+    request = NamedTensorRequest(
+        "linked-roles",
+        {"features": np.zeros((1, 2), dtype=np.float32), "bias": np.ones((1, 2), dtype=np.float32)},
+    )
+
+    with session.execution(request) as execution:
+        assert execution.invoke("producer", {"features": request.inputs["features"]}) == {}
+        outputs = execution.invoke("consumer", {"bias": request.inputs["bias"]})
+
+    producer, consumer = _FakeAclModel.instances
+    assert outputs["scores"].shape == (1, 2)
+    assert producer.read_outputs == set()
+    assert consumer.input_overrides[0] is producer.output_buffer(0)
+    assert producer.execute_calls == consumer.execute_calls == 1
+    session.close()
+
+
 def test_ascend_close_reports_structured_lifecycle_error_after_releasing_all_resources(tmp_path) -> None:
     class FailingLease(_FakeLease):
         def close(self) -> None:
