@@ -428,6 +428,7 @@ class AscendFfmpegH264Encoder(_AscendProcessCodec, VideoEncoder):
         device_id: int = 0,
         channel_id: int = 0,
         io_timeout_s: float = 1.0,
+        drain_timeout_s: float = 0.05,
         ffmpeg_path: str | None = None,
         process_factory: Callable[..., Any] = subprocess.Popen,
         socket_factory: Callable[..., Any] = socket.socket,
@@ -440,6 +441,8 @@ class AscendFfmpegH264Encoder(_AscendProcessCodec, VideoEncoder):
             raise ValueError("Ascend encoder input_pixel_format must be rgb24 or bgr24")
         if profile not in {"baseline", "main", "high"}:
             raise ValueError("Ascend encoder profile must be baseline, main, or high")
+        if drain_timeout_s <= 0:
+            raise ValueError("drain_timeout_s must be positive")
         super().__init__(ffmpeg_path=ffmpeg_path, process_factory=process_factory, environ=environ)
         self._width = int(width)
         self._height = int(height)
@@ -451,6 +454,7 @@ class AscendFfmpegH264Encoder(_AscendProcessCodec, VideoEncoder):
         self._device_id = int(device_id)
         self._channel_id = int(channel_id)
         self._io_timeout_s = float(io_timeout_s)
+        self._drain_timeout_s = float(drain_timeout_s)
         self._socket_factory = socket_factory
         self._socket: Any = None
         self._depacketizer = H264Depacketizer()
@@ -526,7 +530,7 @@ class AscendFfmpegH264Encoder(_AscendProcessCodec, VideoEncoder):
             )
             self._write(nv12.tobytes())
             self._timestamps.append(frame.capture_timestamp_ns)
-            packet = self._receive_access_unit()
+            packets = self._drain_access_units(self._drain_timeout_s)
         except VideoCodecError:
             raise
         except Exception as exc:
@@ -534,38 +538,53 @@ class AscendFfmpegH264Encoder(_AscendProcessCodec, VideoEncoder):
         self._metrics = replace(
             self._metrics,
             input_frames=self._metrics.input_frames + 1,
-            output_frames=self._metrics.output_frames + 1,
-            output_packets=self._metrics.output_packets + 1,
+            output_frames=self._metrics.output_frames + len(packets),
+            output_packets=self._metrics.output_packets + len(packets),
         )
-        return [packet]
+        return packets
 
-    def _receive_access_unit(self) -> EncodedPacket:
-        deadline = time.monotonic() + self._io_timeout_s
+    def _drain_access_units(self, timeout_s: float) -> list[EncodedPacket]:
+        """Collect encoded access units within *timeout_s*.
+
+        The Ascend DVPP hardware encoder has an internal pipeline delay:
+        output for frame N typically arrives only after frame N+1 has been
+        submitted.  This method uses a short non-blocking drain so that the
+        caller can continue feeding frames without deadlocking.  When no
+        output is ready (e.g. the very first frame), an empty list is
+        returned and the delayed output surfaces on the next call.
+        """
+        packets: list[EncodedPacket] = []
+        deadline = time.monotonic() + timeout_s
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                self._fail("encode_timeout", "timed out waiting for encoded RTP access unit")
+                break
             self._socket.settimeout(remaining)
             try:
                 datagram = self._socket.recvfrom(65535)[0]
                 access_unit, _lost = self._depacketizer.push(RtpPacket.from_bytes(datagram))
-            except TimeoutError as exc:
-                self._fail("encode_timeout", "timed out waiting for encoded RTP access unit", cause=exc)
+            except TimeoutError:
+                break
             except (OSError, ValueError) as exc:
                 self._fail("invalid_rtp", str(exc), cause=exc)
             if access_unit is not None:
                 if not self._timestamps:
                     self._fail("timestamp_underflow", "encoded output has no input timestamp")
                 capture_timestamp_ns = self._timestamps.popleft()
-                return EncodedPacket(
-                    access_unit.payload,
-                    access_unit.timestamp,
-                    capture_timestamp_ns,
-                    keyframe=access_unit.keyframe,
+                packets.append(
+                    EncodedPacket(
+                        access_unit.payload,
+                        access_unit.timestamp,
+                        capture_timestamp_ns,
+                        keyframe=access_unit.keyframe,
+                    )
                 )
+        return packets
 
     def reset(self) -> None:
         self._require_not_closed()
+        with suppress(Exception):
+            self._drain_access_units(self._drain_timeout_s)
         self._stop_process(self._io_timeout_s)
         if self._socket is not None:
             self._socket.close()
