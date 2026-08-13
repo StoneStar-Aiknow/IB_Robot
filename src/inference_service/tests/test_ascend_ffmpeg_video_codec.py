@@ -529,3 +529,93 @@ def _private_ffmpeg(tmp_path: Path):
 
 def _option(command: list[str], name: str) -> str:
     return command[command.index(name) + 1]
+
+
+def test_encoder_pipeline_delay_first_frame_empty_second_frame_yields_delayed_output(tmp_path: Path):
+    """Ascend DVPP has a 1-frame pipeline delay: frame N output arrives only
+    after frame N+1 is submitted.  encode() must return [] for the first
+    frame instead of blocking until timeout."""
+    ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
+    fake_socket = _FakeSocket()
+    spawned = []
+
+    def process_factory(_command, **_kwargs):
+        process = _FakeProcess()
+        spawned.append(process)
+        return process
+
+    encoder = AscendFfmpegH264Encoder(
+        width=4,
+        height=2,
+        frame_rate_hz=10,
+        bitrate_bps=1000,
+        gop_frames=2,
+        drain_timeout_s=0.01,
+        ffmpeg_path=str(ffmpeg),
+        environ=environment,
+        process_factory=process_factory,
+        socket_factory=lambda *_args: fake_socket,
+    )
+    image = np.full((2, 4, 3), 30, dtype=np.uint8)
+
+    # Frame 1: no datagram available yet → should return [] (pipeline priming)
+    packets1 = encoder.encode(VideoFrame(image, 1_000, 1_000, 4, 2, "rgb24"))
+    assert packets1 == [], "first frame should return empty due to pipeline delay"
+    assert encoder.metrics.input_frames == 1
+    assert encoder.metrics.output_frames == 0
+
+    # Frame 2: datagram for frame 1 arrives → should return delayed packet
+    fake_socket.datagrams.append(RtpPacket(96, True, 7, 100, 1, b"\x65frame1").to_bytes())
+    packets2 = encoder.encode(VideoFrame(image, 2_000, 2_000, 4, 2, "rgb24"))
+    assert len(packets2) == 1, "second frame should yield the delayed first-frame output"
+    assert packets2[0].capture_timestamp_ns == 1_000
+    assert packets2[0].keyframe is True
+    assert encoder.metrics.input_frames == 2
+    assert encoder.metrics.output_frames == 1
+
+    encoder.close()
+
+
+def test_encoder_steady_state_drains_one_packet_per_call(tmp_path: Path):
+    """In steady state each encode() call drains the previous frame's
+    delayed output, yielding one packet per call after the first."""
+    ffmpeg, _prefix, environment = _private_ffmpeg(tmp_path)
+    fake_socket = _FakeSocket()
+    spawned = []
+
+    def process_factory(_command, **_kwargs):
+        process = _FakeProcess()
+        spawned.append(process)
+        return process
+
+    encoder = AscendFfmpegH264Encoder(
+        width=4,
+        height=2,
+        frame_rate_hz=10,
+        bitrate_bps=1000,
+        gop_frames=2,
+        drain_timeout_s=0.01,
+        ffmpeg_path=str(ffmpeg),
+        environ=environment,
+        process_factory=process_factory,
+        socket_factory=lambda *_args: fake_socket,
+    )
+    image = np.full((2, 4, 3), 30, dtype=np.uint8)
+    total_output = 0
+
+    for i in range(5):
+        # Pre-load the delayed output for the previous frame
+        if i > 0:
+            fake_socket.datagrams.append(RtpPacket(96, True, 7, 100 + i, 1, f"\x65frame{i - 1}".encode()).to_bytes())
+        packets = encoder.encode(VideoFrame(image, i * 1_000, i * 1_000, 4, 2, "rgb24"))
+        if i == 0:
+            assert packets == [], "first frame should prime the pipeline"
+        else:
+            assert len(packets) == 1, f"frame {i} should yield delayed output"
+            assert packets[0].capture_timestamp_ns == (i - 1) * 1_000
+        total_output += len(packets)
+
+    assert total_output == 4, "5 frames, 1 priming delay → 4 output packets"
+    assert encoder.metrics.input_frames == 5
+    assert encoder.metrics.output_frames == 4
+    encoder.close()
