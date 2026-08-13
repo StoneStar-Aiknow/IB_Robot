@@ -12,6 +12,80 @@ class ObjectGeometry:
     size: np.ndarray
 
 
+def is_ground_object(
+    geometry: ObjectGeometry,
+    ground_height: float | None,
+    *,
+    max_bottom_clearance_m: float,
+    max_object_height_m: float,
+    max_footprint_m: float,
+    reference_position_xy: np.ndarray | None = None,
+    max_horizontal_distance_m: float | None = None,
+) -> bool:
+    """Return whether a world-frame geometry is a bounded object supported by the floor."""
+    if ground_height is None:
+        return False
+    lower, upper = np.percentile(geometry.points, [2.0, 98.0], axis=0)
+    supported = bool(
+        lower[2] <= ground_height + max_bottom_clearance_m
+        and upper[2] <= ground_height + max_object_height_m
+        and max(upper[0] - lower[0], upper[1] - lower[1]) <= max_footprint_m
+    )
+    if not supported or max_horizontal_distance_m is None:
+        return supported
+    if reference_position_xy is None or np.asarray(reference_position_xy).shape != (2,):
+        raise ValueError("reference_position_xy must contain the reference frame x/y position")
+    return bool(np.linalg.norm(geometry.centroid[:2] - reference_position_xy) <= max_horizontal_distance_m)
+
+
+def select_geometry_mask_indices(
+    detections,
+    mask_to_array,
+    depth_image: np.ndarray,
+    camera_intrinsics: np.ndarray,
+    depth_scale: float,
+    depth_trunc_m: float,
+    min_points: int,
+    translation: np.ndarray,
+    rotation: np.ndarray,
+    ground_height: float | None,
+    reference_position_xy: np.ndarray,
+    *,
+    enabled: bool,
+    max_bottom_clearance_m: float,
+    max_object_height_m: float,
+    max_footprint_m: float,
+    max_horizontal_distance_m: float,
+) -> list[int]:
+    """Select SAM masks that are valid bounded objects near the robot base."""
+    if not enabled:
+        return list(range(len(detections)))
+    accepted = []
+    for index, detection in enumerate(detections):
+        geometry = project_masked_depth(
+            mask_to_array(detection.mask),
+            depth_image,
+            camera_intrinsics,
+            depth_scale,
+            depth_trunc_m,
+            min_points,
+        )
+        if geometry is None:
+            continue
+        world_geometry = transform_geometry(geometry, translation, rotation)
+        if is_ground_object(
+            world_geometry,
+            ground_height,
+            max_bottom_clearance_m=max_bottom_clearance_m,
+            max_object_height_m=max_object_height_m,
+            max_footprint_m=max_footprint_m,
+            reference_position_xy=reference_position_xy,
+            max_horizontal_distance_m=max_horizontal_distance_m,
+        ):
+            accepted.append(index)
+    return accepted
+
+
 def project_masked_depth(
     mask: np.ndarray,
     depth_image: np.ndarray,

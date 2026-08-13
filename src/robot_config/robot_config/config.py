@@ -225,6 +225,8 @@ class SemanticMappingConfig:
     filtering: dict[str, Any] = field(default_factory=dict)
     queue: dict[str, Any] = field(default_factory=dict)
     lifecycle: dict[str, Any] = field(default_factory=dict)
+    labels: dict[str, Any] = field(default_factory=dict)
+    label_refinement: dict[str, Any] = field(default_factory=dict)
     target_watch: dict[str, Any] = field(default_factory=dict)
     interfaces: dict[str, Any] = field(default_factory=dict)
 

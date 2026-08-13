@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 from tf2_ros import TransformException
 
-from semantic_mapping.offline_bag import OfflineBagSource, OfflineTopicContract, create_run_manifest
+from semantic_mapping.offline_bag import OfflineBagSource, OfflineTopicContract, create_run_manifest, uniform_sample
 
 
 def _identities():
@@ -111,6 +111,12 @@ def test_frame_without_historical_tf_is_counted_and_not_emitted(topics):
 
     assert list(source.frames(_Buffer(missing_stamps={1_000_000_000}))) == []
     assert source.diagnostics.rejected_tf == 1
+
+
+def test_uniform_sample_spans_first_and_last_items():
+    assert uniform_sample(range(10), 4) == [0, 3, 6, 9]
+    assert uniform_sample(range(3), 5) == [0, 1, 2]
+    assert uniform_sample(range(5), 1) == [0]
 
 
 def test_run_manifest_records_bag_topics_and_requires_map_identity(topics, tmp_path):

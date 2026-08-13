@@ -57,6 +57,8 @@ def test_disabled_semantic_mapping_contract_is_preserved() -> None:
         "semantic_graspgen_grasps",
     ]
     assert config.perception_services.enabled_services == ()
+    assert config.semantic_mapping.label_refinement["enabled"] is False
+    assert "sky" in config.semantic_mapping.labels["excluded_labels"]
     assert config.semantic_mapping.migration["grounded_sam2_node"] == "compatibility"
 
 
@@ -65,6 +67,7 @@ def test_enabled_semantic_mapping_contract_loads_and_validates(tmp_path: Path) -
 
     assert config.semantic_mapping.enabled is True
     assert config.semantic_mapping.camera["peripheral"] == "realsense"
+    assert "sky" in config.semantic_mapping.labels["excluded_labels"]
     assert validate_config(config) == []
 
 
@@ -88,6 +91,10 @@ def test_enabled_semantic_mapping_contract_loads_and_validates(tmp_path: Path) -
             "max_masks_per_batch must be <= 8",
         ),
         (
+            lambda config: config["semantic_mapping"]["filtering"].update({"max_object_distance_m": 0.0}),
+            "max_object_distance_m must be a finite number greater than zero",
+        ),
+        (
             lambda config: config["semantic_mapping"]["perception"]["semantic_roles"].update(
                 {"siglip2_image": "missing"}
             ),
@@ -104,6 +111,14 @@ def test_enabled_semantic_mapping_contract_loads_and_validates(tmp_path: Path) -
                 {"mapping_backend": "embedded", "allow_legacy_embedded": False}
             ),
             "allow_legacy_embedded must be true",
+        ),
+        (
+            lambda config: config["semantic_mapping"]["labels"].update({"min_confidence": 1.1}),
+            "labels.min_confidence must be in",
+        ),
+        (
+            lambda config: config["semantic_mapping"]["labels"].update({"excluded_labels": "sky"}),
+            "labels.excluded_labels must be a list",
         ),
         (
             lambda config: config["semantic_mapping"].update(

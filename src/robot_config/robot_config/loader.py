@@ -207,6 +207,8 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
         "filtering",
         "queue",
         "lifecycle",
+        "labels",
+        "label_refinement",
         "target_watch",
         "interfaces",
     )
@@ -302,11 +304,29 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
         "max_mask_overlap_ratio",
     ):
         _unit_interval(filtering, key, filtering_path, errors)
+    if "ground_filter_enabled" in filtering and not isinstance(filtering["ground_filter_enabled"], bool):
+        errors.append("semantic_mapping.filtering.ground_filter_enabled must be a boolean")
+    if "ground_reference_frame" in filtering:
+        _required_string(filtering, "ground_reference_frame", filtering_path, errors)
+    if "ground_height_offset_m" in filtering:
+        offset = filtering["ground_height_offset_m"]
+        if isinstance(offset, bool) or not isinstance(offset, int | float):
+            errors.append("semantic_mapping.filtering.ground_height_offset_m must be a number")
+    for key in (
+        "ground_max_bottom_clearance_m",
+        "ground_max_object_height_m",
+        "ground_max_footprint_m",
+        "max_object_distance_m",
+    ):
+        if key in filtering:
+            _positive_number(filtering, key, filtering_path, errors)
 
     queue = sections["queue"]
     queue_path = "semantic_mapping.queue"
     for key in ("sync_queue_size", "frame_capacity", "max_masks_per_batch"):
         _positive_integer(queue, key, queue_path, errors)
+    if "max_masks_per_frame" in queue:
+        _positive_integer(queue, "max_masks_per_frame", queue_path, errors)
     for key in ("sync_slop_sec", "tf_timeout_sec", "processing_interval_sec"):
         _positive_number(queue, key, queue_path, errors)
     if queue.get("policy") not in {"drop_oldest", "drop_newest", "backpressure"}:
@@ -322,6 +342,27 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
     _positive_integer(lifecycle, "move_confirmations", lifecycle_path, errors)
     for key in ("association_position_weight", "embedding_similarity_threshold"):
         _unit_interval(lifecycle, key, lifecycle_path, errors)
+
+    labels = sections["labels"]
+    labels_path = "semantic_mapping.labels"
+    _unit_interval(labels, "min_confidence", labels_path, errors)
+    _positive_integer(labels, "max_candidates_per_mask", labels_path, errors)
+    excluded_labels = labels.get("excluded_labels")
+    if not isinstance(excluded_labels, list) or any(
+        not isinstance(label, str) or not label.strip() for label in excluded_labels
+    ):
+        errors.append(f"{labels_path}.excluded_labels must be a list of non-empty strings")
+
+    label_refinement = sections["label_refinement"]
+    refinement_path = "semantic_mapping.label_refinement"
+    if not isinstance(label_refinement.get("enabled"), bool):
+        errors.append(f"{refinement_path}.enabled must be a boolean")
+    if label_refinement.get("enabled") is True:
+        for key in ("model", "model_identity", "prompt"):
+            _required_string(label_refinement, key, refinement_path, errors)
+    _unit_interval(label_refinement, "min_confidence", refinement_path, errors)
+    _unit_interval(label_refinement, "trigger_below_confidence", refinement_path, errors)
+    _positive_integer(label_refinement, "min_observations", refinement_path, errors)
 
     target_watch = sections["target_watch"]
     target_watch_path = "semantic_mapping.target_watch"
@@ -1132,6 +1173,8 @@ def load_semantic_mapping_config(data: dict[str, Any]) -> SemanticMappingConfig:
         filtering=dict(data.get("filtering", {})),
         queue=dict(data.get("queue", {})),
         lifecycle=dict(data.get("lifecycle", {})),
+        labels=dict(data.get("labels", {})),
+        label_refinement=dict(data.get("label_refinement", {})),
         target_watch=dict(data.get("target_watch", {})),
         interfaces=dict(data.get("interfaces", {})),
     )
@@ -1406,6 +1449,8 @@ def validate_config(config: RobotConfig) -> list[str]:
         "filtering": config.semantic_mapping.filtering,
         "queue": config.semantic_mapping.queue,
         "lifecycle": config.semantic_mapping.lifecycle,
+        "labels": config.semantic_mapping.labels,
+        "label_refinement": config.semantic_mapping.label_refinement,
         "target_watch": config.semantic_mapping.target_watch,
         "interfaces": config.semantic_mapping.interfaces,
     }

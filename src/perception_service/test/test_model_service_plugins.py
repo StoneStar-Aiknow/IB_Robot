@@ -211,8 +211,9 @@ class _FakeSession(ModelSession):
                 "stability_scores": np.asarray([0.8], dtype=np.float32),
             }
         if isinstance(self.adapter, RAMPlusAdapter):
-            logits = np.full((1, 4585), -80.0, dtype=np.float32)
-            logits[0, :2] = [1.0, 2.0]
+            count = request.inputs["observation.image"].shape[0]
+            logits = np.full((count, 4585), -80.0, dtype=np.float32)
+            logits[:, :2] = [1.0, 2.0]
             return {"tag_logits": logits}
         if isinstance(self.adapter, SigLIP2ImageAdapter):
             count = len(request.inputs["masked_images"])
@@ -254,7 +255,7 @@ class _Bridge:
 
 
 def _host():
-    return SimpleNamespace(bridge=_Bridge())
+    return SimpleNamespace()
 
 
 def _image(encoding="rgb8"):
@@ -327,6 +328,54 @@ def test_plugin_fails_closed_when_loaded_runtime_exposes_no_version(tmp_path) ->
     plugin.close()
 
 
+def test_ram_plus_returns_flattened_top_entity_candidates_per_mask(tmp_path) -> None:
+    manifest = _write_bundle(tmp_path / "ram", "ram_plus")
+    plugin = RAMPlusRecognizeTagsPlugin(_host(), manifest, {})
+    image = _image()
+    mask = Image(height=4, width=4, encoding="mono8", step=4, data=np.ones((4, 4), dtype=np.uint8).tobytes())
+    mask.header.stamp = image.header.stamp
+    response = SimpleNamespace(tags=[], scores=[], mask_tag_counts=[], mask_tags=[], mask_scores=[])
+
+    plugin.handle(
+        SimpleNamespace(
+            image=image,
+            masks=[mask],
+            include_image=False,
+            score_threshold=0.0,
+            excluded_labels=[],
+            max_mask_candidates=5,
+        ),
+        response,
+    )
+
+    assert response.mask_tag_counts == [2]
+    assert response.mask_tags == ["table", "cup"]
+    assert len(response.mask_scores) == 2
+    plugin.close()
+
+
+def test_ram_plus_preserves_whole_image_behavior_when_masks_are_empty(tmp_path) -> None:
+    manifest = _write_bundle(tmp_path / "ram", "ram_plus")
+    plugin = RAMPlusRecognizeTagsPlugin(_host(), manifest, {})
+    response = SimpleNamespace(tags=[], scores=[], mask_tag_counts=[], mask_tags=[], mask_scores=[])
+
+    plugin.handle(
+        SimpleNamespace(
+            image=_image(),
+            masks=[],
+            include_image=False,
+            score_threshold=0.0,
+            excluded_labels=[],
+            max_mask_candidates=0,
+        ),
+        response,
+    )
+
+    assert response.tags == ["table", "cup"]
+    assert response.mask_tag_counts == []
+    plugin.close()
+
+
 def test_siglip_image_and_text_use_independent_sessions_and_execute_named_requests(tmp_path) -> None:
     image_manifest = _write_bundle(tmp_path / "image", "siglip2_image")
     text_manifest = _write_bundle(tmp_path / "text", "siglip2_text")
@@ -369,6 +418,19 @@ def test_siglip_image_and_text_use_independent_sessions_and_execute_named_reques
     image_plugin.close()
     assert text_plugin.runtime_status().ready
     text_plugin.close()
+
+
+def test_siglip_image_accepts_empty_mask_batch_without_model_inference(tmp_path) -> None:
+    image_manifest = _write_bundle(tmp_path / "image", "siglip2_image")
+    plugin = SigLIP2EncodeEmbeddingsPlugin(_host(), image_manifest, {})
+    response = SimpleNamespace(results=[])
+
+    message = plugin.handle(SimpleNamespace(image=_image(), masks=[], candidate_labels=[]), response)
+
+    assert message == "encoded 0 masks"
+    assert response.results == []
+    assert plugin.session.requests == []
+    plugin.close()
 
 
 def test_plugins_reject_raw_selection_identity_drift_and_missing_siglip_metadata(tmp_path) -> None:

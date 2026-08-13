@@ -28,6 +28,7 @@ setup(
             "semantic_mapping_node = semantic_mapping.semantic_mapping_node:main",
             "offline_mapping_node = semantic_mapping.offline_mapping_node:main",
             "semantic_map_migrate = semantic_mapping.migrate_database:main",
+            "semantic_map_render_labels = semantic_mapping.final_label_visualization:main",
         ],
     },
 )

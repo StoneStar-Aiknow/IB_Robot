@@ -55,9 +55,9 @@ class CompiledSpec:
 
 RAM_PLUS_BINDINGS = ArtifactBindings(
     inputs=(
-        TensorBinding(semantic="observation.image", index=0, dtype="float32", shape=(1, 3, 384, 384), layout="NCHW"),
+        TensorBinding(semantic="observation.image", index=0, dtype="float32", shape=(-1, 3, 384, 384), layout="NCHW"),
     ),
-    outputs=(TensorBinding(semantic="tag_logits", index=0, dtype="float32", shape=(1, 4585)),),
+    outputs=(TensorBinding(semantic="tag_logits", index=0, dtype="float32", shape=(-1, 4585)),),
 )
 
 
@@ -94,7 +94,10 @@ def _specs() -> dict[str, BundleSpec]:
                 "torch_module_loader": "perception_service.torch_model_loaders:load_sam2",
                 "checkpoint": "assets/sam2.1_hiera_tiny.pt",
                 "config": "configs/sam2.1/sam2.1_hiera_t.yaml",
-                "points_per_batch": 64,
+                "points_per_batch": 16,
+                "points_per_side": 64,
+                "pred_iou_thresh": 0.72,
+                "stability_score_thresh": 0.90,
             },
             model=ModelDescriptor(
                 kind="perception",
@@ -129,8 +132,8 @@ def _specs() -> dict[str, BundleSpec]:
             model=ModelDescriptor(
                 kind="perception",
                 family="ram_plus",
-                inputs=(_tensor("observation.image", "float32", (1, 3, 384, 384), "NCHW"),),
-                outputs=(_tensor("tag_logits", "float32", (1, 4585)),),
+                inputs=(_tensor("observation.image", "float32", (-1, 3, 384, 384), "NCHW"),),
+                outputs=(_tensor("tag_logits", "float32", (-1, 4585)),),
                 semantic_identity=_identity(
                     "ram-plus-swin-large-14m@v1", RAM_PLUS_PREPROCESSING, RAM_PLUS_POSTPROCESSING
                 ),

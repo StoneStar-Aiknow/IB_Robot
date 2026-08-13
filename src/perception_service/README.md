@@ -267,6 +267,11 @@ SigLIP2 image/text 服务共享同一 bundle 与 embedding identity，但仍由�
 bundle 的 `model_utils_work/`，通过 conformance 与 promotion 后才可复制到不可变
 `artifacts/<backend>/<deployment>/generations/<uuid>/` 并注册为 named deployment。
 
+`RecognizeTags` 的 mask 输出按 mask 顺序扁平化，`mask_tag_counts` 描述每个 mask 对应的 slice。Adapter 固定过滤
+RAM++ 颜色属性；调用方通过请求中的 `excluded_labels` 提供场景策略，服务在过滤后按 `max_mask_candidates`
+截断置信度有序候选。generic host 不读取 robot_config，也不内置办公室或实验室业务 blacklist。整图 tags 仅用于
+帧级诊断，不用于替代局部物体标签。
+
 经 ABI 审核的 compiled-only 资产由 `perception_service.package_ascend_perception_bundles` 从
 `model_utils_work/candidates/ascend_*` 打包。SAM2 和 SigLIP2 提供 `ascend_310p`、`ascend_310b` deployment；
 Grounding DINO 当前只提供固定 720x1280、文本长度 8 的 `ascend_310p` deployment。多 OM pipeline 的中间 tensor

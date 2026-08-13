@@ -6,12 +6,16 @@
 ## Data Flow
 
 1. 使用 `ApproximateTimeSynchronizer` 同步彩色图、对齐深度图和 `CameraInfo`。
-2. 默认通过服务并发运行 SAM2 盲扫和 RAM++ 打标，再批量调用 SigLIP2 编码与标签匹配。
+2. 默认通过服务并发运行 SAM2 盲扫和 RAM++ 打标，再批量调用 SigLIP2 为各 mask 生成视觉特征。
 3. 将 mask 内有效深度像素反投影至相机光学坐标系，并过滤深度离群点。
 4. 按 RGB 图像时间戳查询 `global_frame -> camera optical frame` TF。
 5. 将物体点云、中心点和世界坐标轴包围盒转换至 `global_frame`。
-6. 使用类别、世界坐标距离和 SigLIP 余弦相似度关联持久目标。
-7. 将目标状态和 SigLIP 特征写入独立 SQLite 数据库。
+6. 最终类别由 RAM++ 决定：服务端先应用颜色过滤和 SSOT 场景排除列表，再返回 top-5 候选，建图选择最高分局部标签；
+   没有局部候选时标记为 `unlabeled`，不回退到全图场景标签。
+7. 使用类别、世界坐标距离和 SigLIP 余弦相似度关联持久目标；SigLIP 不覆盖 RAM++ 标签。
+8. 将目标状态和 SigLIP 特征写入独立 SQLite 数据库。
+9. 可选的 `label_refinement` 对 `unlabeled`、低置信或场景排除类别选择代表视图，异步调用外部云端 VLM
+   返回严格 JSON 标签；失败时保留 RAM++ 标签，成功时记录模型、候选、旧标签和时间 provenance。
 
 ## Public Interfaces
 
@@ -59,12 +63,57 @@ semantic_mapping:
       gdino_confirmation: semantic_gdino_confirmation
 ```
 
-完整配置包含 persistence、mask/depth filtering、bounded queue/batch、lifecycle、target-watch 和 public interface
+完整配置包含 persistence、mask/depth filtering、bounded queue/batch、lifecycle、labels、target-watch 和 public interface
 参数，参考 `robot_config/config/robots/lekiwi_mapping.yaml`。模型 endpoint 的唯一配置源是顶层
 `perception_services.services`；每个 role 指向一个 enabled service ID，不再直接配置 backend、endpoint 或模型
 identity。service 模式下 loader 从 schema-v2 bundle manifest 取得 semantic identity，验证精确 service type 和 required/optional
 policy，并拒绝 SigLIP2 image/text embedding metadata 不兼容的配置。检查入库的 service entries 是 disabled
 templates，因此没有 production model assets 时 YAML 仍可加载；启用建图时必须提供有效 bundle 和 named deployment。
+
+`filtering` 默认启用 map-frame 地面物体过滤。节点使用地面支撑的 `base_link` TF 高度和水平位置作为每帧参考，
+只保留底部接近地面、顶部高度、水平 footprint 和本体距离在配置范围内的几何体，以排除天花板、墙面、
+远处物体和覆盖整片地面的 mask。service backend 在 SAM2 后、局部 RAM++ 和 SigLIP2 前执行该筛选，减少后续
+模型计算；其他底盘可通过 reference frame 和 offset 校准地面高度：
+
+```yaml
+filtering:
+  ground_filter_enabled: true
+  ground_reference_frame: base_link
+  ground_height_offset_m: 0.0
+  ground_max_bottom_clearance_m: 0.15
+  ground_max_object_height_m: 0.75
+  ground_max_footprint_m: 1.2
+  max_object_distance_m: 2.5
+```
+
+`labels` 是基础标签策略，不依赖云端复核是否启用。`excluded_labels` 在 RAM++ 服务截断候选前应用，
+`min_confidence` 决定局部标签是否降级为 `unlabeled`，`max_candidates_per_mask` 控制每个 mask 返回的候选数量：
+
+```yaml
+labels:
+  min_confidence: 0.2
+  max_candidates_per_mask: 5
+  excluded_labels: [sky, traffic light, food, fruit, container]
+```
+
+云端标签复核默认关闭，不是建图或查询 readiness gate。在线请求由独立 worker 执行，不阻塞 ROS executor；
+离线请求在帧融合结束后执行。基础 `labels.excluded_labels` 同时作为复核触发和响应禁止列表，低置信标签由
+`trigger_below_confidence` 触发：
+
+```yaml
+label_refinement:
+  enabled: false
+  model: gpt-5.6-sol
+  model_identity: xunxing/gpt-5.6-sol@az.gptplus5.com
+  prompt: <complete scene-specific review instructions>
+  min_confidence: 0.8
+  trigger_below_confidence: 0.7
+  min_observations: 1
+```
+
+启用前需按 `embodied_common/vlm_models.yaml` 配置多模态模型并设置对应 API key 环境变量。例如当前
+`gpt-5.6-sol` 的 Xunxing 路由使用 `XUNXING_API_KEY`；key 只允许通过环境变量提供，禁止写入 YAML。
+外部模型必须仅返回 `label` 和 `confidence` 两个 JSON 字段；`candidate_match` 由节点根据实际候选本地推导。
 
 在线和离线建图均有独立 launch 入口，不会启动 embodied runtime。在线入口按 role list 启动所有 enabled、
 referenced generic model services；离线入口只启动 SAM2、RAM++ 和 SigLIP2 image construction services。两者把
@@ -85,8 +134,15 @@ source .shrc_local
 export ROS_DOMAIN_ID=42
 ros2 launch semantic_mapping offline_mapping.launch.py \
   config_path:=/path/to/enabled-lekiwi-mapping.yaml \
-  bag_path:=/path/to/rosbag
+  bag_path:=/path/to/rosbag \
+  max_frames:=100 frame_sampling:=uniform
 ```
+
+`frame_sampling:=uniform` 在全部可用 RGB-D/TF 帧中均匀选择 `max_frames`，而默认 `sequential` 从开头连续处理。
+诊断指定时段时可使用 `start_frame` 跳过对应数量的可用帧。
+
+每帧候选总量和模型单批上限分别由 `queue.max_masks_per_frame` 与 `queue.max_masks_per_batch` 控制。默认保留
+32 个 SAM2 候选，并由流水线拆成最多 8 个 mask 的 RAM++/SigLIP2 请求，以提高地面小目标召回而不突破模型 ABI。
 
 旧 embedded mapping 路径仍支持 Hugging Face 格式的本地 Grounding DINO，但只用于显式迁移兼容：
 

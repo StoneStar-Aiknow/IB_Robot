@@ -155,7 +155,7 @@ Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `Vali
 | 服务 | 职责 |
 | --- | --- |
 | `GenerateMasks` | SAM2 无 prompt 盲扫，返回与输入同尺寸的 `mono8` masks |
-| `RecognizeTags` | RAM++ 整图打标，不把标签直接绑定到某个 mask |
+| `RecognizeTags` | RAM++ 整图诊断标签；mask 请求按调用方 `excluded_labels` 过滤后返回 `max_mask_candidates` 个候选 |
 | `EncodeEmbeddings` | 一张图像最多 8 个 masks 的 SigLIP2 批量编码与候选标签匹配 |
 | `EncodeText` | 最多 16 条文本的 SigLIP2 查询时编码；不携带图像或持久 image embedding |
 | `GroundingDetect` | 显式图像输入的低频目标确认，不参与建图主链 |
@@ -163,6 +163,8 @@ Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `Vali
 
 所有新服务返回 `ModelRuntimeInfo`。`EncodeText` 返回瞬时、归一化的查询文本向量，供语义地图内部与私有
 image embedding 比较；持久对象 embedding 仍是语义地图私有数据，不进入对象快照消息。
+`RecognizeTags` 在 masks 为空时维持整图识别语义，即使 `include_image=false`，以兼容原有整图调用方；
+有 masks 时调用方可关闭整图识别，仅请求局部候选。
 
 ### `GraspCandidate.msg`
 

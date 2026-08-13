@@ -1,6 +1,6 @@
 import numpy as np
 
-from semantic_mapping.geometry import project_masked_depth, transform_geometry
+from semantic_mapping.geometry import ObjectGeometry, is_ground_object, project_masked_depth, transform_geometry
 
 
 def test_project_masked_depth_backprojects_into_optical_frame():
@@ -38,3 +38,48 @@ def test_project_masked_depth_rejects_unsynchronized_dimensions():
             3.0,
             1,
         )
+
+
+def _geometry(points):
+    values = np.asarray(points, dtype=np.float32)
+    return ObjectGeometry(values, np.median(values, axis=0), np.ptp(values, axis=0))
+
+
+def test_ground_object_filter_keeps_supported_bounded_geometry():
+    geometry = _geometry([[0.0, 0.0, 0.01], [0.2, 0.2, 0.3], [0.1, 0.1, 0.15]])
+
+    assert is_ground_object(
+        geometry,
+        0.0,
+        max_bottom_clearance_m=0.15,
+        max_object_height_m=0.75,
+        max_footprint_m=1.2,
+    )
+
+
+def test_ground_object_filter_rejects_elevated_and_floor_spanning_geometry():
+    elevated = _geometry([[0.0, 0.0, 0.5], [0.2, 0.2, 0.7], [0.1, 0.1, 0.6]])
+    floor = _geometry([[-2.0, -2.0, 0.0], [2.0, 2.0, 0.03], [0.0, 0.0, 0.01]])
+    options = {
+        "max_bottom_clearance_m": 0.15,
+        "max_object_height_m": 0.75,
+        "max_footprint_m": 1.2,
+    }
+
+    assert not is_ground_object(elevated, 0.0, **options)
+    assert not is_ground_object(floor, 0.0, **options)
+
+
+def test_ground_object_filter_rejects_geometry_far_from_reference_frame():
+    nearby = _geometry([[1.0, 1.0, 0.01], [1.2, 1.2, 0.3], [1.1, 1.1, 0.15]])
+    options = {
+        "max_bottom_clearance_m": 0.15,
+        "max_object_height_m": 0.75,
+        "max_footprint_m": 1.2,
+        "reference_position_xy": np.array([0.0, 0.0]),
+        "max_horizontal_distance_m": 1.0,
+    }
+
+    assert not is_ground_object(nearby, 0.0, **options)
+    options["max_horizontal_distance_m"] = 2.0
+    assert is_ground_object(nearby, 0.0, **options)

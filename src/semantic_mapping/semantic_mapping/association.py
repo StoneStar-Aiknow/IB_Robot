@@ -51,6 +51,7 @@ class SemanticObservation:
     semantic_identities: dict = field(default_factory=dict)
     deployment_provenance: dict = field(default_factory=dict)
     mapping_run_id: str = ""
+    label_candidates: tuple[tuple[str, float], ...] = ()
 
 
 @dataclass
@@ -134,7 +135,13 @@ class SemanticTracker:
                 first_seen_ns=observation.stamp_ns,
                 last_seen_ns=observation.stamp_ns,
                 embedding=observation.embedding,
-                attributes=dict(observation.attributes),
+                attributes={
+                    **observation.attributes,
+                    "label_evidence": {observation.label.casefold(): 1},
+                    "label_score_evidence": {observation.label.casefold(): float(observation.confidence)},
+                    "label_max_confidence": {observation.label.casefold(): float(observation.confidence)},
+                    "label_candidate_evidence": self._candidate_evidence(observation.label_candidates),
+                },
                 canonical_label=observation.canonical_label or observation.label.casefold(),
                 map_version=observation.map_version,
                 session_id=observation.session_id,
@@ -148,7 +155,6 @@ class SemanticTracker:
         alpha = 1.0 / min(match.observation_count + 1, 5)
         match.position = (1.0 - alpha) * match.position + alpha * observation.position
         match.size = (1.0 - alpha) * match.size + alpha * observation.size
-        match.confidence = max(match.confidence * 0.9, observation.confidence)
         match.point_count = observation.point_count
         match.last_seen_ns = observation.stamp_ns
         match.observation_count += 1
@@ -157,7 +163,37 @@ class SemanticTracker:
             OBSERVED,
             LifecycleEvidence(identity_confirmed=True, geometry_confirmed=True, details={"source": "association"}),
         )
+        label_evidence = dict(match.attributes.get("label_evidence", {}))
+        label_score_evidence = dict(match.attributes.get("label_score_evidence", {}))
+        label_max_confidence = dict(match.attributes.get("label_max_confidence", {}))
+        normalized_observation_label = observation.label.casefold()
+        label_evidence[normalized_observation_label] = int(label_evidence.get(normalized_observation_label, 0)) + 1
+        label_score_evidence[normalized_observation_label] = float(
+            label_score_evidence.get(normalized_observation_label, 0.0)
+        ) + float(observation.confidence)
+        label_max_confidence[normalized_observation_label] = max(
+            float(label_max_confidence.get(normalized_observation_label, 0.0)), float(observation.confidence)
+        )
+        candidate_evidence = dict(match.attributes.get("label_candidate_evidence", {}))
+        self._merge_candidate_evidence(candidate_evidence, observation.label_candidates)
         match.attributes.update(observation.attributes)
+        match.attributes["label_evidence"] = label_evidence
+        match.attributes["label_score_evidence"] = label_score_evidence
+        match.attributes["label_max_confidence"] = label_max_confidence
+        match.attributes["label_candidate_evidence"] = candidate_evidence
+        if not isinstance(match.attributes.get("label_refinement"), dict):
+            winner = max(
+                label_evidence,
+                key=lambda label: (
+                    float(label_max_confidence.get(label, 0.0)),
+                    float(label_score_evidence.get(label, 0.0)),
+                    int(label_evidence[label]),
+                    label,
+                ),
+            )
+            match.label = winner
+            match.canonical_label = winner
+            match.confidence = float(label_score_evidence[winner]) / int(label_evidence[winner])
         match.object_version += 1
         match.map_version = observation.map_version or match.map_version
         match.session_id = observation.session_id or match.session_id
@@ -170,6 +206,46 @@ class SemanticTracker:
             else:
                 match.embedding = normalize_embedding((1.0 - alpha) * match.embedding + alpha * observation.embedding)
         return match
+
+    @staticmethod
+    def _candidate_evidence(candidates: tuple[tuple[str, float], ...]) -> dict:
+        evidence: dict = {}
+        SemanticTracker._merge_candidate_evidence(evidence, candidates)
+        return evidence
+
+    @staticmethod
+    def _merge_candidate_evidence(evidence: dict, candidates: tuple[tuple[str, float], ...]) -> None:
+        for label, score in candidates:
+            normalized = str(label).strip().casefold()
+            if not normalized:
+                continue
+            current = evidence.get(normalized, {})
+            evidence[normalized] = {
+                "count": int(current.get("count", 0)) + 1,
+                "score_sum": float(current.get("score_sum", 0.0)) + float(score),
+                "max_score": max(float(current.get("max_score", 0.0)), float(score)),
+            }
+
+    @staticmethod
+    def aggregated_label_candidates(
+        track: SemanticTrack, limit: int = 5, excluded_labels=()
+    ) -> tuple[tuple[str, float], ...]:
+        """Return track-level candidates ranked by recurrence and mean confidence."""
+        evidence = track.attributes.get("label_candidate_evidence", {})
+        excluded = {str(value).strip().casefold() for value in excluded_labels}
+        ranked = sorted(
+            ((label, values) for label, values in evidence.items() if label.casefold() not in excluded),
+            key=lambda item: (
+                -int(item[1].get("count", 0)),
+                -(float(item[1].get("score_sum", 0.0)) / max(1, int(item[1].get("count", 0)))),
+                -float(item[1].get("max_score", 0.0)),
+                item[0],
+            ),
+        )
+        return tuple(
+            (label, float(values.get("score_sum", 0.0)) / max(1, int(values.get("count", 0))))
+            for label, values in ranked[:limit]
+        )
 
     def mark_stale(self, now_ns: int | None = None) -> bool:
         now_ns = time.time_ns() if now_ns is None else now_ns
@@ -229,12 +305,16 @@ class SemanticTracker:
         for track in self.tracks.values():
             if track.object_id in excluded_object_ids:
                 continue
-            if track.label.casefold() != observation.label.casefold():
-                continue
+            association_labels = {track.label.casefold()}
+            refinement = track.attributes.get("label_refinement", {})
+            if isinstance(refinement, dict) and refinement.get("previous_label"):
+                association_labels.add(str(refinement["previous_label"]).casefold())
             distance = float(np.linalg.norm(track.position - observation.position))
             if distance > self.association_distance_m:
                 continue
             similarity = cosine_similarity(track.embedding, observation.embedding)
+            if observation.label.casefold() not in association_labels and similarity is None:
+                continue
             if similarity is not None and similarity < self.embedding_similarity_threshold:
                 continue
             distance_score = 1.0 - distance / self.association_distance_m

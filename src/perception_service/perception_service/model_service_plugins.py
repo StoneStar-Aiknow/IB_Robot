@@ -25,7 +25,7 @@ from .model_contracts import (
     validate_text_batch,
 )
 from .model_session_builders import register_perception_session_builders
-from .ram_plus_adapter import RAMPlusAdapter
+from .ram_plus_adapter import RAMPlusAdapter, masked_image_crop, select_mask_tags
 from .semantic_model_adapters import (
     GroundingDINOAdapter,
     GroundingDINORawAdapter,
@@ -175,11 +175,38 @@ class RAMPlusRecognizeTagsPlugin(_SessionPlugin):
     adapter_class = RAMPlusAdapter
 
     def handle(self, request, response) -> str:
-        result = self._infer(self.adapter.preprocess(self.image_rgb(request.image)))
-        tags = self.adapter.postprocess(result, score_threshold=float(request.score_threshold))
+        image = self.image_rgb(request.image)
+        if request.masks:
+            validate_mask_batch(request.image, request.masks)
+        masks = [self.bridge.imgmsg_to_cv2(mask, desired_encoding="mono8") > 0 for mask in request.masks]
+        crops = [masked_image_crop(image, mask) for mask in masks]
+        tags = []
+        include_image = bool(request.include_image or not crops)
+        if include_image:
+            result = self._infer(self.adapter.preprocess(image))
+            tags = self.adapter.postprocess(result, score_threshold=float(request.score_threshold))
+        mask_tags = []
+        mask_scores = []
+        mask_tag_counts = []
+        if crops:
+            batch_result = self.adapter.preprocess_batch(crops)
+            batch = self._infer(batch_result)
+            per_mask = self.adapter.postprocess_batch(batch, score_threshold=float(request.score_threshold))
+            for values in per_mask:
+                candidates = select_mask_tags(
+                    values,
+                    excluded_labels=request.excluded_labels,
+                    limit=int(request.max_mask_candidates),
+                )
+                mask_tag_counts.append(len(candidates))
+                mask_tags.extend(value.label for value in candidates)
+                mask_scores.extend(value.score for value in candidates)
         response.tags = [tag.label for tag in tags]
         response.scores = [tag.score for tag in tags]
-        return f"recognized {len(tags)} tags"
+        response.mask_tag_counts = mask_tag_counts
+        response.mask_tags = mask_tags
+        response.mask_scores = mask_scores
+        return f"recognized {len(tags)} image tags and {len(mask_tags)} mask candidates"
 
 
 class SAM2GenerateMasksPlugin(_SessionPlugin):
@@ -211,11 +238,15 @@ class SigLIP2EncodeEmbeddingsPlugin(_SessionPlugin):
     def handle(self, request, response) -> str:
         from ibrobot_msgs.msg import MaskEmbedding
 
-        validate_mask_batch(request.image, request.masks)
         if len(request.candidate_labels) > 16:
             raise ValueError("candidate-label batch exceeds limit 16")
         if any(not label.strip() for label in request.candidate_labels):
             raise ValueError("candidate labels must not be empty")
+        if not request.masks:
+            validate_image_message(request.image)
+            response.results = []
+            return "encoded 0 masks"
+        validate_mask_batch(request.image, request.masks)
         image = self.image_rgb(request.image)
         masks = [self.bridge.imgmsg_to_cv2(mask, desired_encoding="mono8") for mask in request.masks]
         labels = list(request.candidate_labels)

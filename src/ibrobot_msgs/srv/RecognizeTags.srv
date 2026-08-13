@@ -1,8 +1,16 @@
 sensor_msgs/Image image
+sensor_msgs/Image[] masks
+bool include_image
 float32 score_threshold
+string[] excluded_labels
+uint32 max_mask_candidates
 ---
 string[] tags
 float32[] scores
+# Per-mask non-color candidates flattened in mask order. mask_tag_counts describes each slice.
+uint32[] mask_tag_counts
+string[] mask_tags
+float32[] mask_scores
 ModelRuntimeInfo model
 float32 inference_time_ms
 bool success

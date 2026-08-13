@@ -56,6 +56,9 @@ def load_sam2(context):
         checkpoint=str(root / config["checkpoint"]),
         config=config["config"],
         points_per_batch=int(config.get("points_per_batch", 64)),
+        points_per_side=int(config.get("points_per_side", 32)),
+        pred_iou_thresh=float(config.get("pred_iou_thresh", 0.8)),
+        stability_score_thresh=float(config.get("stability_score_thresh", 0.95)),
     )
     return _SAM2Module(wrapper)
 

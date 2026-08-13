@@ -17,12 +17,52 @@ RAM_PLUS_CLASS_COUNT = 4585
 RAM_PLUS_IMAGE_SIZE = 384
 RAM_PLUS_PREPROCESSING = "resize384-rgb-imagenet-bilinear-v1"
 RAM_PLUS_POSTPROCESSING = "sigmoid-per-class-threshold-score-label-v1"
+RAM_PLUS_COLOR_LABELS = frozenset(
+    {
+        "black",
+        "blue",
+        "brown",
+        "gray",
+        "green",
+        "grey",
+        "orange",
+        "pink",
+        "purple",
+        "red",
+        "white",
+        "yellow",
+    }
+)
+_BILINEAR = getattr(Image, "Resampling", Image).BILINEAR
 
 
 @dataclass(frozen=True)
 class RecognizedTag:
     label: str
     score: float
+
+
+def select_mask_tags(values, *, excluded_labels=(), limit: int = 0) -> list[RecognizedTag]:
+    """Apply caller policy before truncating ranked RAM++ mask candidates."""
+    excluded = RAM_PLUS_COLOR_LABELS | {str(label).strip().casefold() for label in excluded_labels}
+    candidates = [value for value in values if value.label.casefold() not in excluded]
+    return candidates if limit <= 0 else candidates[:limit]
+
+
+def masked_image_crop(image: np.ndarray, mask: np.ndarray, *, padding_ratio: float = 0.15) -> np.ndarray:
+    """Crop one masked object with stable padding and a neutral background."""
+    if mask.shape != image.shape[:2] or not np.any(mask):
+        raise ValueError("RAM++ mask must be non-empty and match the image dimensions")
+    ys, xs = np.where(mask)
+    x1, x2 = int(xs.min()), int(xs.max()) + 1
+    y1, y2 = int(ys.min()), int(ys.max()) + 1
+    pad_x = max(2, int((x2 - x1) * padding_ratio))
+    pad_y = max(2, int((y2 - y1) * padding_ratio))
+    x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+    x2, y2 = min(image.shape[1], x2 + pad_x), min(image.shape[0], y2 + pad_y)
+    crop = image[y1:y2, x1:x2].copy()
+    crop[~mask[y1:y2, x1:x2]] = 127
+    return crop
 
 
 class RAMPlusAdapter(PerceptionAdapter):
@@ -69,33 +109,52 @@ class RAMPlusAdapter(PerceptionAdapter):
         return cls(labels, thresholds)
 
     def preprocess(self, image_rgb: np.ndarray) -> dict[str, np.ndarray]:
-        if image_rgb.ndim != 3 or image_rgb.shape[2] != 3 or image_rgb.dtype != np.uint8:
-            raise ValueError("image must be an RGB uint8 HxWx3 array")
-        image = Image.fromarray(image_rgb, mode="RGB").resize(
-            (RAM_PLUS_IMAGE_SIZE, RAM_PLUS_IMAGE_SIZE), Image.Resampling.BILINEAR
-        )
-        value = np.asarray(image, dtype=np.float32) / np.float32(255.0)
+        return self.preprocess_batch([image_rgb])
+
+    def preprocess_batch(self, images_rgb) -> dict[str, np.ndarray]:
+        if not images_rgb:
+            raise ValueError("at least one image is required")
+        tensors = []
+        for image_rgb in images_rgb:
+            if image_rgb.ndim != 3 or image_rgb.shape[2] != 3 or image_rgb.dtype != np.uint8:
+                raise ValueError("image must be an RGB uint8 HxWx3 array")
+            image = Image.fromarray(image_rgb, mode="RGB").resize((RAM_PLUS_IMAGE_SIZE, RAM_PLUS_IMAGE_SIZE), _BILINEAR)
+            tensors.append(np.asarray(image, dtype=np.float32) / np.float32(255.0))
+        value = np.stack(tensors)
         mean = np.asarray([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.asarray([0.229, 0.224, 0.225], dtype=np.float32)
         value = (value - mean) / std
-        tensor = np.ascontiguousarray(value.transpose(2, 0, 1)[None], dtype=np.float32)
-        return {"observation.image": tensor}
+        return {"observation.image": np.ascontiguousarray(value.transpose(0, 3, 1, 2), dtype=np.float32)}
 
-    def postprocess(self, result: NamedTensorResult, *, score_threshold: float = 0.0) -> list[RecognizedTag]:
+    def _scores(self, result: NamedTensorResult) -> np.ndarray:
         try:
-            logits = np.asarray(result.outputs["tag_logits"], dtype=np.float32).reshape(-1)
+            logits = np.asarray(result.outputs["tag_logits"], dtype=np.float32)
         except KeyError as exc:
             raise RuntimeError("RAM++ runtime result is missing 'tag_logits'") from exc
-        if logits.shape != (self.class_count,):
-            raise RuntimeError(f"RAM++ logits must contain {self.class_count} values, got {logits.shape}")
+        if logits.ndim == 1:
+            logits = logits[None]
+        if logits.ndim != 2 or logits.shape[1] != self.class_count:
+            raise RuntimeError(f"RAM++ logits must have shape [batch, {self.class_count}], got {logits.shape}")
         if not np.isfinite(logits).all():
             raise RuntimeError("RAM++ logits contain non-finite values")
-        scores = 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+        return 1.0 / (1.0 + np.exp(-np.clip(logits, -80.0, 80.0)))
+
+    def postprocess_batch(self, result: NamedTensorResult, *, score_threshold: float = 0.0):
+        scores = self._scores(result)
         thresholds = self.thresholds
         if score_threshold > 0.0:
-            thresholds = np.full_like(scores, score_threshold)
-        indices = [
-            int(index) for index in np.flatnonzero(scores > thresholds) if int(index) not in self.deleted_indices
-        ]
-        indices.sort(key=lambda index: (-float(scores[index]), str(self.labels[index])))
-        return [RecognizedTag(str(self.labels[index]), float(scores[index])) for index in indices]
+            thresholds = np.full_like(self.thresholds, score_threshold)
+        output = []
+        for row in scores:
+            indices = [
+                int(index) for index in np.flatnonzero(row > thresholds) if int(index) not in self.deleted_indices
+            ]
+            indices.sort(key=lambda index: (-float(row[index]), str(self.labels[index])))
+            output.append([RecognizedTag(str(self.labels[index]), float(row[index])) for index in indices])
+        return output
+
+    def postprocess(self, result: NamedTensorResult, *, score_threshold: float = 0.0) -> list[RecognizedTag]:
+        values = self.postprocess_batch(result, score_threshold=score_threshold)
+        if len(values) != 1:
+            raise RuntimeError("RAM++ single-image postprocess received batched output")
+        return values[0]

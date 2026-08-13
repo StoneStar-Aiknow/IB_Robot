@@ -23,7 +23,7 @@ from .model_contracts import (
     validate_mask_batch,
     validate_text_batch,
 )
-from .ram_plus_adapter import RAM_PLUS_PREPROCESSING
+from .ram_plus_adapter import RAM_PLUS_PREPROCESSING, masked_image_crop, select_mask_tags
 from .ram_plus_wrapper import RAMPlusWrapper
 from .sam2_wrapper import SAM2Wrapper, SegmentationMask
 from .semantic_model_adapters import GroundingDINOAdapter, SAM2Adapter, SigLIP2ImageAdapter
@@ -252,11 +252,30 @@ class RAMPlusServiceNode(_ModelServiceNode):
             response.message = self._load_error
             return response
         try:
-            results = self._wrapper.recognize(self._image_rgb(request.image), float(request.score_threshold))
+            image = self._image_rgb(request.image)
+            include_image = bool(request.include_image or not request.masks)
+            results = self._wrapper.recognize(image, float(request.score_threshold)) if include_image else []
+            mask_results = [
+                masked_image_crop(image, self._bridge.imgmsg_to_cv2(mask, desired_encoding="mono8") > 0)
+                for mask in request.masks
+            ]
+            if mask_results:
+                mask_results = self._wrapper.recognize_batch(mask_results, float(request.score_threshold))
             response.tags = [result.label for result in results]
             response.scores = [result.score for result in results]
+            mask_candidates = [
+                select_mask_tags(
+                    values,
+                    excluded_labels=request.excluded_labels,
+                    limit=int(request.max_mask_candidates),
+                )
+                for values in mask_results
+            ]
+            response.mask_tag_counts = [len(values) for values in mask_candidates]
+            response.mask_tags = [value.label for values in mask_candidates for value in values]
+            response.mask_scores = [value.score for values in mask_candidates for value in values]
             response.success = True
-            response.message = f"recognized {len(results)} tags"
+            response.message = f"recognized {len(results)} image tags and {len(response.mask_tags)} mask candidates"
         except Exception as exc:
             response.message = str(exc)
         response.inference_time_ms = (time.perf_counter() - started) * 1000.0

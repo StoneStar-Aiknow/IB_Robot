@@ -29,6 +29,9 @@ class SAM2Wrapper:
         config: str = "configs/sam2.1/sam2.1_hiera_t.yaml",
         model_dir: str | None = None,
         points_per_batch: int = 64,
+        points_per_side: int = 32,
+        pred_iou_thresh: float = 0.8,
+        stability_score_thresh: float = 0.95,
         automatic_generator=None,
         image_predictor=None,
     ):
@@ -64,6 +67,9 @@ class SAM2Wrapper:
         self._automatic_generator = SAM2AutomaticMaskGenerator(
             model,
             points_per_batch=points_per_batch,
+            points_per_side=points_per_side,
+            pred_iou_thresh=pred_iou_thresh,
+            stability_score_thresh=stability_score_thresh,
             output_mode="binary_mask",
         )
         self._image_predictor = SAM2ImagePredictor(model)

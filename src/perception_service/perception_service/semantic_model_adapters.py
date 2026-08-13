@@ -15,6 +15,8 @@ from .grounding_dino_tokenizer import BertWordPieceTokenizer
 from .model_contracts import MAX_MASK_BATCH, MAX_TEXT_BATCH
 from .perception_adapter import AdapterIdentity, PerceptionAdapter
 
+_BILINEAR = getattr(Image, "Resampling", Image).BILINEAR
+
 
 def _read_adapter_identity(root: Path, expected: AdapterIdentity) -> None:
     import json
@@ -73,7 +75,7 @@ def _normalize(rows: np.ndarray, dimension: int) -> np.ndarray:
 def _resize_rgb_batch(images: list[Image.Image], size: int) -> np.ndarray:
     rows = []
     for image in images:
-        value = np.asarray(image.convert("RGB").resize((size, size), Image.Resampling.BILINEAR), dtype=np.float32)
+        value = np.asarray(image.convert("RGB").resize((size, size), _BILINEAR), dtype=np.float32)
         rows.append(value.transpose(2, 0, 1) / np.float32(127.5) - np.float32(1.0))
     return np.ascontiguousarray(rows, dtype=np.float32)
 

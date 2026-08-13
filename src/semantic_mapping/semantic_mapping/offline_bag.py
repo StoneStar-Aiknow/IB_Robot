@@ -49,6 +49,16 @@ def message_stamp_ns(message) -> int:
     return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
 
 
+def uniform_sample(items, count: int):
+    values = list(items)
+    if count <= 0 or count >= len(values):
+        return values
+    if count == 1:
+        return values[:1]
+    last = len(values) - 1
+    return [values[round(index * last / (count - 1))] for index in range(count)]
+
+
 def create_run_manifest(
     *,
     global_frame: str,
