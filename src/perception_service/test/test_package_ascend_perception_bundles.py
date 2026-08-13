@@ -1,5 +1,6 @@
 from inference_manifest import load_inference_manifest
 from perception_service.package_ascend_perception_bundles import _specs, package_bundle
+from perception_service.semantic_model_adapters import SigLIP2ImageAdapter
 
 
 def _write_sources(root, spec):
@@ -27,6 +28,30 @@ def test_compiled_ascend_bundle_specs_validate(tmp_path):
             assert len(validated.deployment.execution) == 12
             assert validated.deployment.device_links
             assert (manifest_path.parent / "assets/bert-base-uncased/vocab.txt").read_bytes() == b"asset"
+
+
+def test_siglip2_ascend_bundle_declares_loadable_embedding_identity(tmp_path, monkeypatch):
+    spec = _specs()["siglip2"]
+    _write_sources(tmp_path, spec)
+    manifest_path = package_bundle(tmp_path, spec)
+    validated = load_inference_manifest(manifest_path.parent, "ascend_310b")
+    monkeypatch.setattr(
+        "perception_service.semantic_model_adapters._load_siglip2_tokenizer",
+        lambda _path: object(),
+    )
+
+    adapter = SigLIP2ImageAdapter.from_bundle(
+        manifest_path.parent,
+        validated.manifest.model.semantic_identity,
+        model=validated.manifest.model,
+        deployment=validated.deployment,
+    )
+
+    assert adapter.dimension == 1152
+    assert validated.deployment.bindings["vision"].inputs[0].runtime_name == "image"
+    assert validated.deployment.bindings["text"].inputs[0].runtime_name == "input_ids"
+    assert validated.deployment.bindings["vision"].outputs[0].runtime_name is None
+    assert validated.deployment.bindings["text"].outputs[0].runtime_name is None
 
 
 def test_compiled_ascend_bundle_revisions_follow_artifact_content(tmp_path):

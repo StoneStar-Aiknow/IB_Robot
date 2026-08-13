@@ -250,7 +250,7 @@ def _native_pipeline(
     pipeline = InferencePipeline(
         pipeline_id,
         _context(root),
-        runtime_backend,
+        executor=runtime_backend,
         preprocessor=preprocessor,
         postprocessor=postprocessor,
         request_timeout=request_timeout,
@@ -387,7 +387,7 @@ def test_compiled_pipeline_uses_selected_bindings_codec_and_execution_plan(tmp_p
     pipeline = InferencePipeline(
         "compiled_policy",
         context,
-        backend,
+        executor=backend,
         codec=BindingPolicyCodec(),
     )
     pipeline.load()
@@ -868,7 +868,7 @@ def test_stateful_protocol_backend_exception_fails_closed_even_if_health_stays_r
         def close(self) -> None:
             return None
 
-    pipeline = InferencePipeline("policy", _context(tmp_path / "bundle"), MisreportingBackend())
+    pipeline = InferencePipeline("policy", _context(tmp_path / "bundle"), executor=MisreportingBackend())
     pipeline.load()
 
     with pytest.raises(RuntimeError, match="state mutated before failure"):

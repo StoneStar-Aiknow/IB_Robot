@@ -101,9 +101,9 @@ class SequentialModelExecutor(ModelExecutor):
             supported = True
             cancel(request_id, deadline=deadline)
         if not supported:
-            from inference_service.backends import BackendCapabilityError
-
-            raise BackendCapabilityError("executor does not support cancellation", capability="cancellation")
+            # The request control is still honored by execute(); cancellation
+            # is best-effort when the underlying session cannot interrupt work.
+            return
 
     def adapt_error(self, error: ExecutionError) -> object:
         return self._result_adapter.adapt_error(error)
@@ -142,7 +142,12 @@ class SequentialModelExecutor(ModelExecutor):
         for component in self._components:
             reset = getattr(component, "reset", None)
             if callable(reset):
-                reset(deadline=deadline)
+                try:
+                    reset(deadline=deadline)
+                except TypeError as exc:
+                    if "deadline" not in str(exc):
+                        raise
+                    reset()
 
     def close(self) -> None:
         errors: list[Exception] = []

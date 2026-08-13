@@ -435,6 +435,24 @@ def test_sequential_executor_holds_one_session_execution_scope_across_stages() -
     assert events == ["enter:scoped", "first", "second", "exit:scoped"]
 
 
+def test_session_execution_uses_request_inputs_instead_of_internal_frame_values() -> None:
+    entered_inputs: list[Mapping[str, object]] = []
+
+    class Session:
+        @contextmanager
+        def execution(self, request: NamedTensorRequest):
+            entered_inputs.append(request.inputs)
+            yield object()
+
+    request = NamedTensorRequest("scoped", {"observation.state": np.zeros((1, 6), dtype=np.float32)})
+    frame = StageFrame(request, values={**request.inputs, "_backend_started": True})
+
+    frame.open_session_execution(Session(), request, None)
+    frame.close()
+
+    assert list(entered_inputs[0]) == ["observation.state"]
+
+
 def test_iterative_stage_preserves_step_order_and_updates(tmp_path) -> None:
     events: list[object] = []
 

@@ -28,10 +28,7 @@ logger = logging.getLogger(__name__)
 _VALID_TABLETOP_FILTER_MODES = {"strict", "adaptive", "soft", "diagnostic"}
 DEFAULT_ENABLE_SOURCE_GRIPPER_TABLETOP_SWEEP = False
 
-_LOCAL_BACKEND_REQUIRES_CUDA = (
-    "GraspGen local backend requires CUDA. The upstream GraspGenSampler "
-    "moves the model and point cloud tensors to CUDA internally."
-)
+_LOCAL_BACKEND_REQUIRES_CUDA = "GraspGen local backend requires CUDA for the manifest-selected Torch deployment."
 _DEFAULT_MAX_INFERENCE_GRASPS_PER_BATCH = 1000
 _EXECUTION_TABLE_SCENE_MAX_POINTS = 30000
 _EXECUTION_TABLE_OBJECT_MAX_POINTS = 16000
@@ -432,6 +429,8 @@ class LocalPipelineBackend:
         grasp_threshold: float,
         num_grasps: int,
         topk_num_grasps: int,
+        min_grasps: int = 80,
+        max_tries: int = 4,
     ) -> tuple[np.ndarray, np.ndarray, float]:
         self._ensure_loaded()
         from inference_manifest import GRASPGEN_CONFIDENCE_SEMANTIC, GRASPGEN_POSE_SEMANTIC
@@ -464,44 +463,55 @@ class LocalPipelineBackend:
         # fresh diffusion noise without resetting the configured seed.
         with self._sample_lock:
             for index, batch_size in enumerate(batches, start=1):
-                result = self._pipeline.execute(
-                    NamedTensorRequest(
-                        request_id=f"graspgen_local_{uuid.uuid4().hex}",
-                        inputs=inputs,
+                batch_poses = []
+                batch_confidence = []
+                target_count = min(min_grasps, batch_size)
+                for attempt in range(1, max_tries + 1):
+                    result = self._pipeline.execute(
+                        NamedTensorRequest(
+                            request_id=f"graspgen_local_{uuid.uuid4().hex}",
+                            inputs=inputs,
+                        )
                     )
-                )
-                # Current GraspGen OM files have a static batch of 1000. For a
-                # partial final batch, retain only the requested number of raw
-                # samples so num_grasps keeps the same meaning as the CUDA path.
-                # Slicing happens before decoding because postprocess sorts.
-                if batch_size < len(np.asarray(result.outputs[GRASPGEN_CONFIDENCE_SEMANTIC]).reshape(-1)):
-                    result = replace(
+                    # Current GraspGen OM files have a static batch of 1000. For a
+                    # partial final batch, retain only the requested number of raw
+                    # samples so num_grasps keeps the same meaning as the CUDA path.
+                    if batch_size < len(np.asarray(result.outputs[GRASPGEN_CONFIDENCE_SEMANTIC]).reshape(-1)):
+                        result = replace(
+                            result,
+                            outputs={
+                                GRASPGEN_POSE_SEMANTIC: np.asarray(result.outputs[GRASPGEN_POSE_SEMANTIC])[:batch_size],
+                                GRASPGEN_CONFIDENCE_SEMANTIC: np.asarray(
+                                    result.outputs[GRASPGEN_CONFIDENCE_SEMANTIC]
+                                ).reshape(-1)[:batch_size],
+                            },
+                        )
+                    candidates = self._adapter.postprocess(
                         result,
-                        outputs={
-                            GRASPGEN_POSE_SEMANTIC: np.asarray(result.outputs[GRASPGEN_POSE_SEMANTIC])[:batch_size],
-                            GRASPGEN_CONFIDENCE_SEMANTIC: np.asarray(
-                                result.outputs[GRASPGEN_CONFIDENCE_SEMANTIC]
-                            ).reshape(-1)[:batch_size],
-                        },
+                        object_center=object_center,
+                        max_grasps=0,
+                        min_confidence=float(grasp_threshold),
                     )
-                candidates = self._adapter.postprocess(
-                    result,
-                    object_center=object_center,
-                    max_grasps=0,
-                    min_confidence=float(grasp_threshold),
-                )
-                if candidates:
-                    all_poses.append(np.stack([candidate.pose_matrix for candidate in candidates]))
-                    all_confidence.append(
-                        np.asarray([candidate.confidence for candidate in candidates], dtype=np.float32)
+                    if candidates:
+                        batch_poses.append(np.stack([candidate.pose_matrix for candidate in candidates]))
+                        batch_confidence.append(
+                            np.asarray([candidate.confidence for candidate in candidates], dtype=np.float32)
+                        )
+                    backend_seconds += result.latency.backend_ms / 1000.0
+                    accepted = sum(len(values) for values in batch_poses)
+                    logger.info(
+                        "LocalPipelineBackend batch %d/%d attempt %d/%d kept %d grasps, total=%d",
+                        index,
+                        len(batches),
+                        attempt,
+                        max_tries,
+                        len(candidates),
+                        accepted,
                     )
-                backend_seconds += result.latency.backend_ms / 1000.0
-                logger.info(
-                    "LocalPipelineBackend batch %d/%d kept %d grasps",
-                    index,
-                    len(batches),
-                    len(candidates),
-                )
+                    if accepted >= target_count:
+                        break
+                all_poses.extend(batch_poses)
+                all_confidence.extend(batch_confidence)
 
         inference_seconds = time.perf_counter() - started
         if not all_poses:
@@ -1769,6 +1779,8 @@ class GraspGenWrapper:
             grasp_threshold=grasp_threshold,
             num_grasps=num_grasps,
             topk_num_grasps=topk_num_grasps,
+            min_grasps=min_grasps,
+            max_tries=max_tries,
         )
         diag.model_inference_ms = (time.perf_counter() - stage_started) * 1000.0
         postprocess_started = time.perf_counter()
@@ -2064,6 +2076,8 @@ class GraspGenWrapper:
         grasp_threshold: float,
         num_grasps: int,
         topk_num_grasps: int,
+        min_grasps: int = 80,
+        max_tries: int = 4,
     ):
         if self.inference_backend == "remote_310p":
             poses, confidence, _ = self._remote_client.sample(
@@ -2074,12 +2088,25 @@ class GraspGenWrapper:
             )
             return torch.from_numpy(poses), torch.from_numpy(confidence)
 
-        if self.inference_backend in {"local_cuda", "ascend_local"}:
+        if self.inference_backend == "ascend_local":
             poses, confidence, _ = self._ascend_local_client.sample(
                 object_pc,
                 grasp_threshold=grasp_threshold,
                 num_grasps=num_grasps,
                 topk_num_grasps=topk_num_grasps,
+                min_grasps=min_grasps,
+                max_tries=max_tries,
+            )
+            return torch.from_numpy(poses), torch.from_numpy(confidence)
+
+        if self.inference_backend == "local_cuda":
+            poses, confidence, _ = self._ascend_local_client.sample(
+                object_pc,
+                grasp_threshold=grasp_threshold,
+                num_grasps=num_grasps,
+                topk_num_grasps=topk_num_grasps,
+                min_grasps=min_grasps,
+                max_tries=max_tries,
             )
             return torch.from_numpy(poses), torch.from_numpy(confidence)
         raise RuntimeError(f"unsupported GraspGen inference backend {self.inference_backend!r}")

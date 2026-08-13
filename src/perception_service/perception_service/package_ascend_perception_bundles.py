@@ -18,6 +18,7 @@ from inference_manifest import (
     DeploymentTarget,
     DeviceLink,
     Digest,
+    EmbeddingMetadata,
     InferenceManifest,
     ManifestBundle,
     ModelDescriptor,
@@ -57,6 +58,7 @@ class BundleSpec:
     deployments: tuple[DeploymentSpec, ...]
     assets: tuple[tuple[str, str], ...] = ()
     operation: str = ""
+    embedding: EmbeddingMetadata | None = None
 
 
 def _semantic(semantic: str, dtype: str, shape: tuple[int, ...], layout: str | None = None) -> SemanticTensor:
@@ -180,7 +182,7 @@ def _siglip_deployment(name: str, soc: str, candidate: str, text_name: str, visi
         _bindings(
             (_binding("host.siglip2.image", 0, "float32", (1, 3, 384, 384), "NCHW", "image"),),
             (
-                _binding("internal.image_tokens", 0, "float32", (1, 729, 1152), runtime_name="image_features"),
+                _binding("internal.image_tokens", 0, "float32", (1, 729, 1152)),
                 _binding("host.siglip2.image_embedding", 1, "float32", (1, 1152)),
             ),
         ),
@@ -191,7 +193,7 @@ def _siglip_deployment(name: str, soc: str, candidate: str, text_name: str, visi
         _bindings(
             (_binding("host.siglip2.input_ids", 0, "int64", (batch, 64), runtime_name="input_ids"),),
             (
-                _binding("internal.text_tokens", 0, "float32", (batch, 64, 1152), runtime_name="text_features"),
+                _binding("internal.text_tokens", 0, "float32", (batch, 64, 1152)),
                 _binding("host.siglip2.text_embeddings", 1, "float32", (batch, 1152)),
             ),
         ),
@@ -407,6 +409,13 @@ def _specs() -> dict[str, BundleSpec]:
             ),
             preprocessing="siglip2-dual-encoder-v2",
             postprocessing="normalized-embedding-v1",
+            embedding=EmbeddingMetadata(
+                embedding_space_id="google/siglip2-so400m-patch14-384@main",
+                dimension=1152,
+                normalization="l2",
+                image_preprocessing="masked-crop-gray127-resize384-bilinear-normalize0.5-v1",
+                text_preprocessing="photo-template-gemma-tokenizer-max64-v1",
+            ),
             deployments=(
                 _siglip_deployment(
                     "ascend_310p",
@@ -548,6 +557,7 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
             logical_model_revision=f"{spec.family}@v1",
             preprocessing_contract=spec.preprocessing,
             output_semantics=spec.postprocessing,
+            embedding=spec.embedding,
         ),
     )
     structure_changed = existing is not None and (

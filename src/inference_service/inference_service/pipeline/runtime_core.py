@@ -124,12 +124,9 @@ class StageFrame:
             return None
         if self._session_execution_stack is None:
             self._session_execution_stack = ExitStack()
-        scoped_request = NamedTensorRequest(
-            request.request_id,
-            self.values,
-            deadline=deadline,
-            priority=getattr(request, "priority", 0),
-        )
+        if not isinstance(request, NamedTensorRequest):
+            raise TypeError("session execution requires a NamedTensorRequest")
+        scoped_request = replace(request, deadline=deadline)
         entered = self._session_execution_stack.enter_context(execution(scoped_request))
         self._bind_session_execution(session, entered)
         return entered
@@ -291,7 +288,8 @@ class PipelineRuntimeCore:
                     self._synchronize_executor_health_locked()
                 normalized = exc
                 if isinstance(exc, BackendAdmissionError) and exc.code == "deadline_exceeded":
-                    normalized = self._timeout_error("executor", backend_completed=exc.operation_started)
+                    phase = "backend_admission" if not exc.operation_started else "executor"
+                    normalized = self._timeout_error(phase, backend_completed=exc.operation_started)
                 return self._executor.adapt_error(self._execution_error(normalized, request_id))
             total_ms = (time.perf_counter() - started) * 1000.0
             with self._condition:
@@ -339,9 +337,12 @@ class PipelineRuntimeCore:
             try:
                 self._executor.reset(deadline=effective_deadline)
                 self._raise_if_expired(effective_deadline, phase="reset", backend_completed=True)
-            except Exception:
+            except Exception as exc:
                 with self._condition:
                     self._synchronize_executor_health_locked()
+                    non_mutating_rejection = isinstance(exc, BackendAdmissionError) and not exc.operation_started
+                    if not non_mutating_rejection and self._state_machine.state is PipelineState.RESETTING:
+                        self._state_machine.transition(PipelineState.FAILED)
                 raise
             finally:
                 with self._condition:

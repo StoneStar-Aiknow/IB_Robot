@@ -102,7 +102,46 @@ def test_ascend_local_backend_delegates_one_request_without_local_sampler():
         "grasp_threshold": 0.2,
         "num_grasps": 5000,
         "topk_num_grasps": 1000,
+        "min_grasps": 80,
+        "max_tries": 4,
     }
+
+
+def test_local_cuda_pipeline_delegates_to_manifest_client():
+    class FakeClient:
+        def sample(self, object_pc, **kwargs):
+            self.object_pc = object_pc
+            self.kwargs = kwargs
+            return np.eye(4, dtype=np.float32)[None], np.asarray([0.8], dtype=np.float32), 0.1
+
+    wrapper = object.__new__(GraspGenWrapper)
+    wrapper.inference_backend = "local_cuda"
+    wrapper._ascend_local_client = FakeClient()
+    points = np.zeros((2048, 3), dtype=np.float32)
+
+    poses, confidence = wrapper._run_batched_inference(
+        points,
+        grasp_threshold=0.2,
+        num_grasps=1000,
+        topk_num_grasps=300,
+        min_grasps=80,
+        max_tries=4,
+    )
+
+    assert poses.shape == (1, 4, 4)
+    assert confidence.tolist() == pytest.approx([0.8])
+    assert wrapper._ascend_local_client.kwargs == {
+        "grasp_threshold": 0.2,
+        "num_grasps": 1000,
+        "topk_num_grasps": 300,
+        "min_grasps": 80,
+        "max_tries": 4,
+    }
+
+
+def test_local_cuda_rejects_empty_manifest_path():
+    with pytest.raises(ValueError, match="manifest_path"):
+        AscendLocalBackend("", deployment_name="torch_cuda")
 
 
 @dataclass(frozen=True)
