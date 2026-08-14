@@ -1,0 +1,6 @@
+# Absolute path to a WAV file on the machine that hosts the playback service.
+string file_path
+---
+bool success
+string error_code
+string message

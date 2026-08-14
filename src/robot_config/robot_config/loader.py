@@ -1151,6 +1151,8 @@ def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
         bundle_path=resolve_ros_path(bundle_path) if bundle_path else "",
         deployment=data.get("deployment", defaults.deployment),
         service_name=data.get("service_name", defaults.service_name),
+        playback_service_name=data.get("playback_service_name", defaults.playback_service_name),
+        playback_timeout_sec=data.get("playback_timeout_sec", defaults.playback_timeout_sec),
         prompt_profile=data.get("prompt_profile", defaults.prompt_profile),
         segment_max_chars=data.get("segment_max_chars", defaults.segment_max_chars),
         segment_pause_ms=data.get("segment_pause_ms", defaults.segment_pause_ms),
@@ -1562,6 +1564,10 @@ def validate_config(config: RobotConfig) -> list[str]:
             errors.append("voice_tts.deployment is required when voice_tts.enabled is true")
         if not config.voice_tts.service_name.startswith("/"):
             errors.append("voice_tts.service_name must be an absolute ROS service name")
+        if not config.voice_tts.playback_service_name.startswith("/"):
+            errors.append("voice_tts.playback_service_name must be an absolute ROS service name")
+        if config.voice_tts.playback_timeout_sec <= 0:
+            errors.append("voice_tts.playback_timeout_sec must be positive")
         if not config.voice_tts.prompt_profile:
             errors.append("voice_tts.prompt_profile must be non-empty")
         positive_limits = {

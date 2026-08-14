@@ -788,6 +788,11 @@ IK/FK 验证的 `sensor_msgs/JointState`，网关直接规划到同一组机械�
 请求级 prompt 的可用性由 named deployment 的真实能力决定；不支持时返回 `UNSUPPORTED_PROMPT`，不会
 静默忽略 prompt。
 
+### `PlayAudioFile.srv`
+
+播放端本机 WAV 文件服务，由 `voice_tts_service` 提供。请求必须传入播放服务所在机器上的绝对路径；
+响应返回 `success`、稳定 `error_code` 和可诊断消息。接口同步等待播放完成，不负责跨主机传输音频文件。
+
 ---
 
 ## 4. 推理调度接口

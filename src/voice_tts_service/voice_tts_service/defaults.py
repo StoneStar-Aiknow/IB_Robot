@@ -5,6 +5,8 @@ VOICE_TTS_DEFAULTS = {
     "bundle_path": "models/voice_tts/zipvoice",
     "deployment": "",
     "service_name": "/voice_tts/synthesize",
+    "playback_service_name": "/voice_tts/play",
+    "playback_timeout_sec": 300.0,
     "prompt_profile": "default",
     "segment_max_chars": 200,
     "segment_pause_ms": 150,

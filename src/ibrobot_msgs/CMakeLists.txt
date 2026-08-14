@@ -104,6 +104,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/GetSemanticObjects.srv"
   "srv/ResolveSemanticTarget.srv"
   "srv/SynthesizeSpeech.srv"
+  "srv/PlayAudioFile.srv"
   DEPENDENCIES std_msgs action_msgs builtin_interfaces geometry_msgs sensor_msgs
 )
 

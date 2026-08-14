@@ -551,6 +551,8 @@ def test_load_single_arm_config():
     assert config.voice_tts.bundle_path == "models/voice_tts/zipvoice"
     assert config.voice_tts.deployment == ""
     assert config.voice_tts.service_name == "/voice_tts/synthesize"
+    assert config.voice_tts.playback_service_name == "/voice_tts/play"
+    assert config.voice_tts.playback_timeout_sec == 300.0
     assert config.skill_gateway.status_service == "/embodied/get_skill_gateway_status"
     assert config.skill_gateway.required_control_mode == "moveit_planning"
     assert config.skill_gateway.default_skill_timeout_sec == 120.0
@@ -1199,6 +1201,8 @@ def test_voice_tts_loader_and_runtime_defaults_match():
     assert defaults.bundle_path == VOICE_TTS_DEFAULTS["bundle_path"]
     assert defaults.deployment == VOICE_TTS_DEFAULTS["deployment"]
     assert defaults.service_name == VOICE_TTS_DEFAULTS["service_name"]
+    assert defaults.playback_service_name == VOICE_TTS_DEFAULTS["playback_service_name"]
+    assert defaults.playback_timeout_sec == VOICE_TTS_DEFAULTS["playback_timeout_sec"]
     assert defaults.prompt_profile == VOICE_TTS_DEFAULTS["prompt_profile"]
     assert defaults.max_response_audio_bytes == VOICE_TTS_DEFAULTS["max_response_audio_bytes"]
 
@@ -1212,11 +1216,15 @@ def test_validate_voice_tts_requires_explicit_deployment_and_valid_limits():
     )
     config.voice_tts.enabled = True
     config.voice_tts.deployment = ""
+    config.voice_tts.playback_service_name = "voice_tts/play"
+    config.voice_tts.playback_timeout_sec = 0.0
     config.voice_tts.max_segments = 0
 
     errors = validate_config(config)
 
     assert "voice_tts.deployment is required when voice_tts.enabled is true" in errors
+    assert "voice_tts.playback_service_name must be an absolute ROS service name" in errors
+    assert "voice_tts.playback_timeout_sec must be positive" in errors
     assert "voice_tts.max_segments must be positive" in errors
 
 

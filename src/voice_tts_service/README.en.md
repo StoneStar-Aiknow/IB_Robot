@@ -4,11 +4,11 @@
 
 `voice_tts_service` is IB-Robot's ZipVoice model-service plugin. It is hosted by the shared
 `inference_service/model_service_node`, accepts text and an optional
-voice prompt, invokes an explicitly selected ZipVoice deployment, and returns one or more independently playable
-mono WAV PCM16 audio segments.
+voice prompt, invokes an explicitly selected ZipVoice deployment, returns independently playable mono WAV PCM16
+audio segments, and exposes local speaker playback on the machine hosting the service.
 
-This package is responsible only for converting text to audio. Speaker playback, ASR, business orchestration,
-and remote inference over SSH are outside its boundary.
+This package converts text to audio and plays a server-local WAV file. ASR, business orchestration, remote file
+transfer, and remote inference over SSH are outside its boundary.
 
 ## 1. Responsibilities
 
@@ -20,9 +20,10 @@ The package:
 4. Applies bounded long-text segmentation and wraps model output as WAV PCM16.
 5. Orchestrates the Text Encoder OM, Flow Decoder OM, and CPU Vocos on Ascend 310P.
 6. Enforces request, segment-count, and response-size limits.
+7. Plays validated local WAV files through ALSA's system-default output and reports a stable result.
 
-It does not manage microphone capture, ASR, speaker playback, dialogue state, business workflows, backend
-fallback, or runtime inference through SSH.
+It does not manage microphone capture, device discovery, hotplug, mixing, ASR, dialogue state, business workflows,
+backend fallback, or runtime inference through SSH.
 
 ## 2. Entry Points
 
@@ -30,6 +31,7 @@ fallback, or runtime inference through SSH.
 | --- | --- |
 | Shared ROS host | `inference_service/inference_service/model_service_node.py` |
 | TTS plugin | `voice_tts_service/voice_tts_service/model_service_plugin.py` |
+| Audio playback node | `voice_tts_service/voice_tts_service/audio_playback_node.py` |
 | 310P adapter | `voice_tts_service/zipvoice_310p_adapter.py` |
 | Bundle packager | `voice_tts_service/package_zipvoice_310p.py` |
 | Debug launch | `launch/voice_tts.launch.py` |
@@ -69,6 +71,15 @@ SynthesizeSpeech request
   -> SynthesizedAudio[] response
 ```
 
+Playback is independent of model inference:
+
+```text
+PlayAudioFile request (absolute path on the playback host)
+  -> validate WAV file
+  -> ALSA aplay
+  -> success / error_code / message
+```
+
 The shared `ModelSession` serializes inference and owns admission, health, failure state, and close waiting.
 
 ## 4. ROS Interfaces
@@ -97,7 +108,24 @@ ros2 service call /voice_tts/synthesize ibrobot_msgs/srv/SynthesizeSpeech \
 The currently verified `ascend_310p` deployment uses a fixed prompt profile and does not support request-scoped
 voice cloning. It returns `UNSUPPORTED_PROMPT` when prompt fields are supplied.
 
-### 4.2 Model lifecycle
+### 4.2 Audio playback
+
+| Item | Value |
+| --- | --- |
+| Service | `/voice_tts/play` |
+| Type | `ibrobot_msgs/srv/PlayAudioFile` |
+| Input | Absolute WAV path on the machine hosting the playback service |
+
+The call blocks until playback completes and then returns `success=true`. A missing path, invalid WAV, unavailable
+ALSA device, timeout, or nonzero `aplay` exit status returns `success=false` with a stable `error_code` and message.
+The service does not fetch files over SSH or interpret a path from the caller's machine.
+
+```bash
+ros2 service call /voice_tts/play ibrobot_msgs/srv/PlayAudioFile \
+  "{file_path: '/tmp/voice_tts/output.wav'}"
+```
+
+### 4.3 Model lifecycle
 
 | Stage | Owner | Behavior |
 | --- | --- | --- |
@@ -176,6 +204,8 @@ voice_tts:
   deployment: ascend_310p
 
   service_name: /voice_tts/synthesize
+  playback_service_name: /voice_tts/play
+  playback_timeout_sec: 300.0
 
   prompt_profile: default
   segment_max_chars: 200
@@ -224,6 +254,9 @@ the ACL lease, OM resources, admission, health, and close waiting without initia
 | `INVALID_AUDIO_OUTPUT` | Model output is empty or contains NaN/Inf |
 | `UNSUPPORTED_PROMPT` | The selected deployment does not support request-scoped voice cloning |
 | `INTERNAL_ERROR` | An unclassified internal service failure |
+
+The playback endpoint additionally returns `INVALID_PATH`, `FILE_NOT_FOUND`, `NOT_A_FILE`, `UNSUPPORTED_FORMAT`,
+`INVALID_AUDIO_FILE`, `PLAYER_NOT_FOUND`, `PLAYBACK_TIMEOUT`, or `PLAYBACK_FAILED`.
 
 ## 9. Tests and Build
 

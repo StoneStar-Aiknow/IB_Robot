@@ -725,6 +725,8 @@ ros2 launch robot_config robot.launch.py \
 TTS 对外提供 `/voice_tts/synthesize` typed service。请求和响应携带音频字节而不是服务端文件路径，
 并通过文本、prompt、分段数和响应字节上限约束单个 DDS response。真实模型未就绪时服务返回
 `MODEL_NOT_READY`；部署身份和 readiness 由响应中的 `ModelRuntimeInfo` 报告。
+同一配置还启动 `/voice_tts/play` 服务，接收播放端本机 WAV 绝对路径，通过 ALSA 同步播放并返回明确的
+成功状态、错误码和消息；该播放节点不依赖模型 session。
 launch builder 只解析配置和创建节点，不提前打开模型 bundle。节点启动时校验 bundle 并加载 session，因而
 `exit_on_init_failure=false` 能在模型存储暂不可用时保留服务并返回 `MODEL_NOT_READY`；
 TTS 由通用 `inference_service/model_service_node` 承载，节点启动时加载 named deployment，节点退出时等待当前

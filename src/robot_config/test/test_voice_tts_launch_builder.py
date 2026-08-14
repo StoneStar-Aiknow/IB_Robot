@@ -21,4 +21,4 @@ def test_voice_tts_builder_does_not_open_bundle_before_node_start(monkeypatch, t
         }
     )
 
-    assert len(nodes) == 1
+    assert len(nodes) == 2
