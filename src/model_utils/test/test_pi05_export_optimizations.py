@@ -7,6 +7,9 @@ import torch
 
 from model_utils.pi05_export.ascend_export_patches import (
     _build_patch_registry,
+    _exact_fused_geglu,
+    _fused_up_gate_weight,
+    _patch_gemma_geglu_donor,
     _patch_gemma_geglu_npu,
     _patch_pytorch_gelu_tanh_npu,
 )
@@ -165,8 +168,50 @@ def test_gelu_patch_registry_precedence(use_npu_ops, fast_gelu, expected, unexpe
     assert unexpected not in patch_fns
 
 
+def test_gelu_patch_registry_can_disable_npu_geglu():
+    patch_fns = {patch_fn for _, patch_fn in _build_patch_registry(use_npu_ops=True, fast_gelu=False, npu_geglu=False)}
+
+    assert _patch_gemma_geglu_npu not in patch_fns
+    assert _patch_pytorch_gelu_tanh_npu not in patch_fns
+
+
 def test_gelu_patch_registry_has_no_npu_gelu_off_npu():
     patch_fns = {patch_fn for _, patch_fn in _build_patch_registry(use_npu_ops=False)}
 
     assert _patch_gemma_geglu_npu not in patch_fns
     assert _patch_pytorch_gelu_tanh_npu not in patch_fns
+
+
+def test_fused_geglu_donor_registry_is_ort_only():
+    patch_fns = {patch_fn for _, patch_fn in _build_patch_registry(use_npu_ops=False, fused_geglu_donor=True)}
+
+    assert _patch_gemma_geglu_donor in patch_fns
+    assert _patch_gemma_geglu_npu not in patch_fns
+    assert _patch_pytorch_gelu_tanh_npu not in patch_fns
+
+
+def test_exact_fused_geglu_uses_up_then_gate_order():
+    up = torch.tensor([[1.0, 2.0]])
+    gate = torch.tensor([[0.5, -1.0]])
+
+    actual = _exact_fused_geglu(torch.cat([up, gate], dim=-1))
+    expected = up * torch.nn.functional.gelu(gate, approximate="tanh")
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_fused_up_gate_weight_concatenates_distinct_projections():
+    module = SimpleNamespace(
+        up_proj=SimpleNamespace(weight=torch.tensor([[1.0], [2.0]])),
+        gate_proj=SimpleNamespace(weight=torch.tensor([[3.0], [4.0]])),
+    )
+
+    fused = _fused_up_gate_weight(module)
+
+    torch.testing.assert_close(fused, torch.tensor([[1.0], [2.0], [3.0], [4.0]]))
+
+
+def test_fused_up_gate_weight_falls_back_for_wrapped_projection():
+    module = SimpleNamespace(up_proj=SimpleNamespace(linear=object()), gate_proj=SimpleNamespace(weight=torch.ones(1)))
+
+    assert _fused_up_gate_weight(module) is None

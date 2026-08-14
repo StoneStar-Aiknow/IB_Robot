@@ -17,10 +17,10 @@ two tools share one mental model:
 - **Param metadata** (one source of truth): name, help, example, default, type.
   Reused by ``--help``, the interactive wizard, and config validation, so the
   meaning of each flag is documented in exactly one place.
-- **YAML config** at ``~/.config/model_utils/pi05_export.yaml`` with three
-  sections: ``defaults`` (shared), ``profiles`` (named param groups), and
-  ``_last`` (auto-written after each run — replaces a separate "remember last
-  args" cache).
+- **YAML config** at ``~/.config/model_utils/pi05_export.yaml`` with
+  ``defaults`` (shared), ``profiles`` (named run parameter groups), optional
+  ``quantization_profiles`` (versioned node-selection strategies), and ``_last``
+  (auto-written after each run — replaces a separate "remember last args" cache).
 - **Merge precedence** (high -> low):
   ``CLI > --profile > defaults > _last (only when no --profile) > builtin``.
 - **Derived paths**: a single ``--exp-dir`` expands to ``onnx/`` (ONNX output),
@@ -42,6 +42,12 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import yaml
+
+from model_utils.pi05_export.quant.profiles import (
+    QuantizationProfile,
+    available_quantization_profiles,
+    resolve_quantization_profile,
+)
 
 CONFIG_ENV = "PI05_EXPORT_CONFIG"
 DEFAULT_CONFIG_PATH = os.path.expanduser("~/.config/model_utils/pi05_export.yaml")
@@ -217,6 +223,12 @@ PARAMS: list[Param] = [
         in_wizard=False,
     ),
     Param(
+        dest="quant_profile",
+        cli="--quant-profile",
+        meaning="Named reusable quantization strategy from bundled YAML or quantization_profiles",
+        in_wizard=False,
+    ),
+    Param(
         dest="abi_device_id",
         cli="--abi-device-id",
         meaning="Ascend device used to inspect compiled OM runtime ABI",
@@ -242,6 +254,14 @@ PARAMS: list[Param] = [
         cli="--fast-gelu",
         meaning="Use Ascend NPUFastGelu for gelu_pytorch_tanh during NPU export; faster but approximate",
         default=False,
+        bool_optional=True,
+        in_wizard=False,
+    ),
+    Param(
+        dest="npu_geglu",
+        cli="--npu-geglu",
+        meaning="Fuse Gemma gate/up projections into NPUGeglu; disable for separate exact projections",
+        default=True,
         bool_optional=True,
         in_wizard=False,
     ),
@@ -337,6 +357,20 @@ PARAMS: list[Param] = [
         type=int,
         in_wizard=False,
     ),
+    Param(
+        dest="amp_rank_samples",
+        cli="--amp-rank-samples",
+        meaning="Number of real calibration samples used to rank AMP fallback layers",
+        default=1,
+        type=int,
+        in_wizard=False,
+    ),
+    Param(
+        dest="amp_scratch_dir",
+        cli="--amp-scratch-dir",
+        meaning="Disk-backed scratch directory for multi-sample AMP ranking",
+        in_wizard=False,
+    ),
 ]
 
 PARAMS_BY_DEST = {p.dest: p for p in PARAMS}
@@ -349,6 +383,7 @@ _META_KEYS = {
     "save_as",
     "init",
     "list_profiles",
+    "list_quant_profiles",
 }
 
 
@@ -360,6 +395,7 @@ class ResolvedConfig:
     sources: dict[str, str] = field(default_factory=dict)
     config_path: str = DEFAULT_CONFIG_PATH
     profile: str | None = None
+    quantization_profile: QuantizationProfile | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +474,39 @@ def _validate_step_param_deps(chosen_steps: list[str], merged: dict[str, Any]) -
         )
 
 
+def _validate_quantization_profile(
+    profile: QuantizationProfile,
+    chosen_steps: list[str],
+    merged: dict[str, Any],
+) -> None:
+    """Fail early when requested quantization steps contradict the selected strategy."""
+    role_steps = {
+        "vlm": {"vlm_quant", "vlm_quant_om"},
+        "ae": {"ae_quant", "ae_quant_om"},
+    }
+    chosen = set(chosen_steps)
+    if not any(chosen & steps for steps in role_steps.values()):
+        return
+    problems: list[str] = []
+    for role, steps in role_steps.items():
+        if chosen & steps and not profile.role(role).enabled:
+            problems.append(f"profile {profile.name!r} disables {role} quantization")
+    for setting in ("npu_geglu", "fast_gelu"):
+        required = getattr(profile, setting)
+        if required is not None and merged.get(setting) != required:
+            problems.append(f"profile {profile.name!r} requires {setting}={required}")
+    for setting, required in (("device", profile.export_device), ("donor_device", profile.donor_device)):
+        actual = merged.get(setting)
+        if required is not None and (not actual or actual.split(":", 1)[0] != required):
+            problems.append(f"profile {profile.name!r} requires {setting}={required}")
+    if (profile.npu_geglu is True or profile.vlm.fused_geglu_donor is True) and merged.get("fast_gelu"):
+        problems.append(f"profile {profile.name!r} requires fast_gelu=False for NPU GeGLU")
+    if profile.target_soc and merged.get("soc_version") and merged["soc_version"] != profile.target_soc:
+        problems.append(f"profile {profile.name!r} requires soc_version={profile.target_soc}")
+    if problems:
+        raise SystemExit("Quantization profile is incompatible with this run:\n  - " + "\n  - ".join(problems))
+
+
 # ---------------------------------------------------------------------------
 # argparse construction (help text comes from the param table)
 # ---------------------------------------------------------------------------
@@ -475,6 +544,12 @@ def build_parser() -> argparse.ArgumentParser:
     meta.add_argument("--init", action="store_true", help="Force interactive wizard (first-time setup)")
     meta.add_argument(
         "--list-profiles", dest="list_profiles", action="store_true", help="List available profiles and exit"
+    )
+    meta.add_argument(
+        "--list-quant-profiles",
+        dest="list_quant_profiles",
+        action="store_true",
+        help="List bundled and configured quantization profiles and exit",
     )
     return parser
 
@@ -576,6 +651,15 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
             for name, vals in profiles.items():
                 print(f"  - {name}: {_clean_run_params(vals)}")
         raise SystemExit(0)
+    if ns.list_quant_profiles:
+        try:
+            quant_profiles = available_quantization_profiles(config)
+        except ValueError as exc:
+            raise SystemExit(f"Invalid quantization profile config: {exc}") from exc
+        print(f"quantization profiles in {config_path} (plus bundled YAML):")
+        for name, profile in quant_profiles.items():
+            print(f"  - {name}: status={profile.status}, hash={profile.digest[:12]}")
+        raise SystemExit(0)
 
     # CLI-provided run params (non-None means user passed it).
     cli_values = {p.dest: getattr(ns, p.dest) for p in PARAMS}
@@ -644,6 +728,13 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
     chosen_steps = parse_steps(merged.get("steps"))
     merged["steps"] = ",".join(chosen_steps)
 
+    try:
+        quantization_profile = resolve_quantization_profile(merged.get("quant_profile"), config)
+    except ValueError as exc:
+        raise SystemExit(f"Invalid --quant-profile: {exc}. Use --list-quant-profiles.") from exc
+    if quantization_profile is not None:
+        _validate_quantization_profile(quantization_profile, chosen_steps, merged)
+
     # Validate required-for-run params.
     missing = [p.cli for p in PARAMS if p.required_for_run and not merged.get(p.dest)]
     if missing:
@@ -672,7 +763,13 @@ def resolve(argv: list[str] | None = None) -> ResolvedConfig:
         save_config(config_path, config)
         print(f"✓ Profile '{ns.save_as}' saved to {config_path}")
 
-    return ResolvedConfig(args=final, sources=sources, config_path=config_path, profile=ns.profile)
+    return ResolvedConfig(
+        args=final,
+        sources=sources,
+        config_path=config_path,
+        profile=ns.profile,
+        quantization_profile=quantization_profile,
+    )
 
 
 def print_effective(resolved: ResolvedConfig) -> None:
@@ -688,14 +785,18 @@ def print_effective(resolved: ResolvedConfig) -> None:
         "dtype",
         "device",
         "fast_gelu",
+        "npu_geglu",
         "soc_version",
         "schedule_file",
+        "quant_profile",
         "steps",
         "batch_path",
         "donor_device",
         "calib_dir",
         "num_calib",
         "amp_num",
+        "amp_rank_samples",
+        "amp_scratch_dir",
         "task",
         "log_level",
     ]
@@ -707,6 +808,9 @@ def print_effective(resolved: ResolvedConfig) -> None:
         arrow = "  → " if origin.startswith("derived") else "  "
         print(f"{arrow}{dest:18s}= {val}   ({origin})")
     print(f"  config: {resolved.config_path}")
+    if resolved.quantization_profile is not None:
+        profile = resolved.quantization_profile
+        print(f"  quant profile: {profile.name} ({profile.status}, {profile.digest[:12]})")
 
 
 # Run params that are transient per-invocation flow switches — useful to pass

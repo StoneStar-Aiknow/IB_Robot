@@ -453,6 +453,7 @@ def _resolved(tmp_path: Path, steps: str) -> SimpleNamespace:
         device="cpu",
         donor_device="cpu",
         fast_gelu=False,
+        npu_geglu=True,
         soc_version="Ascend310P3",
         schedule_file=None,
         deployment="ascend",
@@ -464,6 +465,8 @@ def _resolved(tmp_path: Path, steps: str) -> SimpleNamespace:
         calib_dir=None,
         num_calib=2,
         amp_num=0,
+        amp_rank_samples=1,
+        amp_scratch_dir=None,
         task="pick",
         log_level="INFO",
     )

@@ -55,6 +55,7 @@ from pathlib import Path
 import numpy as np
 
 from model_utils.pi05_export.quant import w8a8_common as common
+from model_utils.pi05_export.quant.profiles import write_quantization_metadata
 
 LOGGER = logging.getLogger("quantize_ae")
 
@@ -273,6 +274,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     common.add_common_quant_args(p)
+    p.add_argument("--policy-path", type=str, default=None, help="PI05 policy bundle (required for profile metadata).")
     p.add_argument(
         "--calib-dir",
         type=str,
@@ -315,6 +317,14 @@ def main() -> int:
         disable_convs=not args.quantize_convs,
         disable_index_below=args.disable_index_below,
     )
+    selection = common.select_quantizable_nodes(
+        quantizable,
+        disable_names,
+        args.quantize_regex,
+        expected_regex_matches=args.quantize_regex_expected,
+        expected_selected_nodes=args.expected_selected_nodes,
+    )
+    disable_names = list(selection.disabled_names)
 
     if args.list_nodes:
         common.list_nodes_and_exit(quantizable, disable_names, disable_regexes)
@@ -327,6 +337,11 @@ def main() -> int:
         return 1
 
     output_path = common.resolve_output_path(args.output_path, onnx_path)
+    profile_fields = (args.quant_profile_name, args.quant_profile_hash, args.quant_role, args.quant_metadata_path)
+    if any(profile_fields) and not all(profile_fields):
+        raise ValueError("Quantization metadata requires profile name, hash, role, and output path")
+    if args.quant_metadata_path and not args.policy_path:
+        raise ValueError("--policy-path is required when writing quantization profile metadata")
 
     npu_graph_path = None
     if args.npu_onnx_path:
@@ -344,17 +359,45 @@ def main() -> int:
         num_calib=args.num_calib,
     )
 
-    common.run_msmodelslim_w8a8(
-        input_onnx=onnx_path,
-        output_onnx=output_path,
-        calib_data=calib_data,
-        disable_names=disable_names,
-        amp_num=args.amp_num,
-        npu_graph=npu_graph_path,
-    )
-    if not output_path.is_file():
-        raise RuntimeError(f"msModelSlim reported success but did not produce {output_path}")
-    common.load_onnx(output_path)
+    if args.quant_metadata_path:
+        args.quant_metadata_path.unlink(missing_ok=True)
+    try:
+        actual_quantized_nodes = common.run_msmodelslim_w8a8(
+            input_onnx=onnx_path,
+            output_onnx=output_path,
+            calib_data=calib_data,
+            disable_names=disable_names,
+            amp_num=args.amp_num,
+            amp_rank_samples=args.amp_rank_samples,
+            amp_scratch_dir=args.amp_scratch_dir,
+            npu_graph=npu_graph_path,
+        )
+        if args.expected_quantized_nodes is not None and actual_quantized_nodes != args.expected_quantized_nodes:
+            raise RuntimeError(
+                f"Final ONNX contains {actual_quantized_nodes} quantized node(s), "
+                f"expected {args.expected_quantized_nodes}"
+            )
+        if not output_path.is_file():
+            raise RuntimeError(f"msModelSlim reported success but did not produce {output_path}")
+        common.load_onnx(output_path)
+        if args.quant_metadata_path:
+            write_quantization_metadata(
+                path=args.quant_metadata_path,
+                profile_name=args.quant_profile_name,
+                profile_hash=args.quant_profile_hash,
+                role=args.quant_role,
+                policy_path=Path(args.policy_path).expanduser().resolve(),
+                donor_onnx=onnx_path,
+                npu_onnx=npu_graph_path,
+                output_onnx=output_path,
+                selected_nodes=list(selection.selected_names),
+                actual_quantized_nodes=actual_quantized_nodes,
+            )
+    except Exception:
+        if args.quant_metadata_path:
+            common.remove_onnx_external_pair(output_path)
+            args.quant_metadata_path.unlink(missing_ok=True)
+        raise
 
     LOGGER.info(
         "Done. Next: ATC-compile %s on the board, then run the AE per-step "

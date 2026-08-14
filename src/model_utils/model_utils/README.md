@@ -299,6 +299,31 @@ ros2 run model_utils pi05-export \
     --steps vlm_onnx,ae_onnx,vlm_quant,ae_quant,vlm_quant_om,ae_quant_om
 ```
 
+量化策略可以保存为版本化 `quantization_profiles`，顶层 CLI 只通过 `--quant-profile` 选择策略，
+不直接暴露节点正则。随包提供的 YAML `pi05-q40-v1` 固化当前在 Ascend310P3 上验证过的 136 个 VLM
+INT8 MatMul；它要求 NPU VLM export、CPU donor、精确 GeGLU，并明确保持 Action Expert 为 FP16：
+
+```bash
+ros2 run model_utils pi05-export \
+    --policy-path /path/to/pi05_bundle \
+    --exp-dir /path/to/q40-run \
+    --soc-version Ascend310P3 \
+    --device npu \
+    --donor-device cpu \
+    --batch-path /path/to/calibration_batches.json \
+    --quant-profile pi05-q40-v1 \
+    --steps vlm_onnx,vlm_quant,vlm_quant_om
+```
+
+可用 `--list-quant-profiles` 查看随包 YAML 和配置文件中的策略。运行 profile 可保存
+`quant_profile: pi05-q40-v1` 引用；自定义策略放在同一 YAML 的 `quantization_profiles` 下，格式为
+`pi05-quant-profile-v1`，并为每组 selector 声明 regex 和预期匹配数量。显式执行 `vlm_quant` 会始终
+重新校准；只执行 `vlm_quant_om` 时，工具会检查相邻的 `.quant.json`，拒绝复用来自其他 profile
+或 policy bundle 的 W8A8 ONNX。
+
+量化 profile 只描述节点选择，不携带权重、scale 或 OM。将 q40 用于另一个 PI05 checkpoint 时仍需
+重新量化，并重新执行独立精度与性能验证；q40 YAML 不允许 `ae_quant`/`ae_quant_om`。
+
 请求的步骤会先删除该步骤的旧输出，并在子工具返回后确认新输出确实存在，因此失败的导出或
 ATC 调用不会把 stale ONNX/OM/ABI 当作本次成功。只重跑 `vlm_om` 或 `ae_om` 时，另一角色
 使用磁盘上的现有 OM/ABI，并重新严格校验和更新完整 deployment；缺少任一角色时不会写入

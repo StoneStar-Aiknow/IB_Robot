@@ -672,13 +672,12 @@ def _patch_gemma_geglu_npu() -> list[tuple[Any, str, Any]]:
         def symbolic(g, x):
             return g.op("npu::NPUGeglu", x, dim_i=-1, approximate_i=1, activate_left_i=0)
 
-    def _make_forward(geglu):
+    def _make_forward(geglu, original_forward):
         def _geglu_forward(self, x):
             # ATC computes left * gelu(right), so concatenate [up, gate].
-            fused = getattr(self, "_npu_up_gate_weight", None)
+            fused = _fused_up_gate_weight(self)
             if fused is None:
-                fused = _torch.cat([self.up_proj.weight, self.gate_proj.weight], dim=0)
-                self._npu_up_gate_weight = fused
+                return original_forward(self, x)
             up_gate = _F.linear(x, fused)
             return self.down_proj(geglu.apply(up_gate))
 
@@ -698,9 +697,72 @@ def _patch_gemma_geglu_npu() -> list[tuple[Any, str, Any]]:
         if cls is None:
             continue
         orig_forward = cls.forward
-        cls.forward = _make_forward(_NpuGeglu)
+        cls.forward = _make_forward(_NpuGeglu, orig_forward)
         undo_log.append((cls, "forward", orig_forward))
         LOGGER.info("Patched %s.%s.forward (fused gate_up + NPUGeglu, tanh GeGLU)", mod_path, cls_name)
+
+    return undo_log
+
+
+def _exact_fused_geglu(up_gate: torch.Tensor) -> torch.Tensor:
+    """Apply Gemma's exact tanh GeGLU to a fused ``[up, gate]`` projection."""
+    up, gate = up_gate.chunk(2, dim=-1)
+    return up * torch.nn.functional.gelu(gate, approximate="tanh")
+
+
+def _fused_up_gate_weight(module) -> torch.Tensor | None:  # noqa: ANN001
+    """Return ``cat([up, gate])`` for plain projections, else request fallback."""
+    up_weight = getattr(getattr(module, "up_proj", None), "weight", None)
+    gate_weight = getattr(getattr(module, "gate_proj", None), "weight", None)
+    if up_weight is None or gate_weight is None:
+        return None
+    return torch.cat([up_weight, gate_weight], dim=0)
+
+
+def _patch_gemma_geglu_donor() -> list[tuple[Any, str, Any]]:
+    """Fuse gate/up MatMuls while keeping an ORT-runnable exact GeGLU.
+
+    The fused MatMul is identical to the NPU graph produced by
+    :func:`_patch_gemma_geglu_npu`; only the following activation differs:
+    standard ONNX operators replace ``NPUGeglu`` so ModelSlim can calibrate the
+    graph on CPU. Route A can then transplant the quantized fused MatMul onto
+    the NPU graph by its shared module-scope node name.
+    """
+    import importlib
+
+    import torch.nn.functional as _F
+
+    undo_log: list[tuple[Any, str, Any]] = []
+    targets = [
+        ("transformers.models.gemma.modeling_gemma", "GemmaMLP"),
+        ("transformers.models.gemma2.modeling_gemma2", "Gemma2MLP"),
+        ("transformers.models.gemma3.modeling_gemma3", "Gemma3MLP"),
+    ]
+    try:
+        for mod_path, cls_name in targets:
+            try:
+                mod = importlib.import_module(mod_path)
+            except ImportError:
+                continue
+            cls = getattr(mod, cls_name, None)
+            if cls is None:
+                continue
+            orig_forward = cls.forward
+
+            def _fused_forward(self, x, _original_forward=orig_forward):
+                # Ascend NPUGeglu computes left * gelu(right), hence [up, gate].
+                fused = _fused_up_gate_weight(self)
+                if fused is None:
+                    return _original_forward(self, x)
+                return self.down_proj(_exact_fused_geglu(_F.linear(x, fused)))
+
+            cls.forward = _fused_forward
+            undo_log.append((cls, "forward", orig_forward))
+            LOGGER.info("Patched %s.%s.forward (fused gate_up + exact ORT GeGLU donor)", mod_path, cls_name)
+    except Exception:
+        for cls, attr, original in reversed(undo_log):
+            setattr(cls, attr, original)
+        raise
 
     return undo_log
 
@@ -1834,6 +1896,8 @@ def _build_patch_registry(
     softmax_in_model_dtype: bool = False,
     mqa_broadcast: bool = False,
     fast_gelu: bool = False,
+    npu_geglu: bool = True,
+    fused_geglu_donor: bool = False,
 ) -> list[tuple[str, Any]]:
     """Return the active patch registry for the requested export mode.
 
@@ -1907,11 +1971,13 @@ def _build_patch_registry(
         # disabled on 310P (see above), so qkv fusion has no upside here.
         # ("fused qkv projection", _patch_gemma_fused_qkv),
     ]
-    if use_npu_ops and fast_gelu:
+    if fused_geglu_donor:
+        registry.append(("GemmaMLP fused gate_up (exact ORT GeGLU donor)", _patch_gemma_geglu_donor))
+    elif use_npu_ops and fast_gelu:
         registry.append(("gelu_pytorch_tanh (torch_npu.fast_gelu -> NPUFastGelu)", _patch_pytorch_gelu_tanh_npu))
     # NPUGeglu is the accuracy-preserving NPU default. An explicit fast_gelu
     # request takes precedence for every gelu_pytorch_tanh site, including Gemma.
-    if use_npu_ops and not fast_gelu:
+    if use_npu_ops and npu_geglu and not fast_gelu and not fused_geglu_donor:
         registry.append(("GemmaMLP gelu(gate)*up (torch_npu.npu_geglu -> NPUGeglu)", _patch_gemma_geglu_npu))
     return registry
 
@@ -1928,6 +1994,8 @@ def ascend_onnx_export_patches(
     softmax_in_model_dtype: bool = False,
     mqa_broadcast: bool = False,
     fast_gelu: bool = False,
+    npu_geglu: bool = True,
+    fused_geglu_donor: bool = False,
 ):
     """Context manager that applies **all** registered Ascend patches.
 
@@ -1949,6 +2017,11 @@ def ascend_onnx_export_patches(
             multi-query layers and rely on matmul broadcasting instead.
         fast_gelu: Route gelu_pytorch_tanh to NPUFastGelu. Disabled by default
             because it is an approximation and can degrade PI05 action accuracy.
+        npu_geglu: Fuse Gemma gate/up projections into ``NPUGeglu`` on NPU.
+            Disable to retain separate projections and exact standard tanh GELU.
+        fused_geglu_donor: Fuse Gemma gate/up projections into the same
+            ``[up, gate]`` MatMul used by the NPU graph, but keep the exact GeGLU
+            in standard ONNX operators so ModelSlim can run it on CPU.
 
     On NPU, the Gemma text MLP gelu(gate)*up is fused into one NPUGeglu by
     default (GeGluV2, numerically exact tanh). When ``fast_gelu`` is true,
@@ -1960,6 +2033,9 @@ def ascend_onnx_export_patches(
         with ascend_onnx_export_patches():
             torch.onnx.export(model, ...)
     """
+    if fused_geglu_donor and (use_npu_ops or fast_gelu):
+        raise ValueError("fused_geglu_donor requires an ORT-runnable non-NPU export with fast_gelu disabled")
+
     all_undo: list[tuple[Any, str, Any]] = []
     applied: list[str] = []
 
@@ -1968,13 +2044,21 @@ def ascend_onnx_export_patches(
         softmax_in_model_dtype=softmax_in_model_dtype,
         mqa_broadcast=mqa_broadcast,
         fast_gelu=fast_gelu,
+        npu_geglu=npu_geglu,
+        fused_geglu_donor=fused_geglu_donor,
     ):
         try:
             undo = patch_fn()
+            if fused_geglu_donor and patch_fn is _patch_gemma_geglu_donor and not undo:
+                raise RuntimeError("fused GeGLU donor patch found no supported Gemma MLP class")
             all_undo.extend(undo)
             if undo:
                 applied.append(label)
         except Exception as exc:
+            if fused_geglu_donor and patch_fn is _patch_gemma_geglu_donor:
+                for mod, attr, orig in reversed(all_undo):
+                    setattr(mod, attr, orig)
+                raise RuntimeError("Could not install the required fused GeGLU donor patch") from exc
             LOGGER.warning("Failed to apply patch '%s': %s", label, exc)
 
     if applied:

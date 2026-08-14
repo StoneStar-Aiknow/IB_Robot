@@ -67,6 +67,11 @@ from pathlib import Path
 
 from model_utils.pi05_export import _cli
 from model_utils.pi05_export._cli_ui import Stage, build_onnx_suffix, print_summary, setup_logging
+from model_utils.pi05_export.quant.profiles import (
+    QuantizationProfile,
+    metadata_path,
+    validate_quantization_metadata,
+)
 
 LOGGER = logging.getLogger("pi05_export.pipeline")
 
@@ -104,6 +109,7 @@ class Ctx:
     ae_quant_om: Path
     calib_dir: Path
     chosen: set[str]  # steps explicitly requested in --steps
+    quantization_profile: QuantizationProfile | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -148,8 +154,50 @@ def _is_donor_onnx(path: Path) -> bool:
     return tag in {"cpu", "cuda", "donor"}
 
 
+def _uses_fused_vlm_donor(ctx: Ctx) -> bool:
+    profile = getattr(ctx, "quantization_profile", None)
+    if profile is not None and profile.vlm.fused_geglu_donor is not None:
+        return profile.vlm.fused_geglu_donor
+    return False
+
+
+def _quant_profile_args(ctx: Ctx, *, role: str, output_onnx: Path) -> list[str]:
+    profile = getattr(ctx, "quantization_profile", None)
+    if profile is None:
+        return []
+    role_profile = profile.role(role)
+    args = [
+        "--disable-regex",
+        *role_profile.disable_regex,
+        "--quantize-regex",
+        *(selector.regex for selector in role_profile.selectors),
+        "--quantize-regex-expected",
+        *(str(selector.expected) for selector in role_profile.selectors),
+        "--quant-profile-name",
+        profile.name,
+        "--quant-profile-hash",
+        profile.digest,
+        "--quant-role",
+        role,
+        "--quant-metadata-path",
+        str(metadata_path(output_onnx)),
+    ]
+    if role_profile.expected_selected_nodes is not None:
+        args.extend(["--expected-selected-nodes", str(role_profile.expected_selected_nodes)])
+    if role_profile.expected_quantized_nodes is not None:
+        args.extend(["--expected-quantized-nodes", str(role_profile.expected_quantized_nodes)])
+    if role_profile.quantize_convs:
+        args.append("--quantize-convs")
+    if role == "vlm" and profile.npu_geglu is True:
+        args.append("--require-npu-geglu")
+        if role_profile.expected_npu_geglu_nodes is not None:
+            args.extend(["--expected-npu-geglu-nodes", str(role_profile.expected_npu_geglu_nodes)])
+    return args
+
+
 def _run_vlm_donor_onnx(ctx: Ctx) -> None:
     a = ctx.args
+    fused_donor = _uses_fused_vlm_donor(ctx)
     _run_module(
         "model_utils.pi05_export.convert_onnx_vlm",
         [
@@ -157,12 +205,16 @@ def _run_vlm_donor_onnx(ctx: Ctx) -> None:
             str(ctx.policy_path),
             "--output-dir",
             str(ctx.output_dir),
+            "--output",
+            str(ctx.output_dir / ("pi05-vlm_fused-geglu.onnx" if fused_donor else "pi05-vlm.onnx")),
             "--runtime-save-dir",
             str(ctx.runtime_save_dir),
             "--dtype",
             a.dtype,
             "--device",
             a.donor_device,
+            *(["--fused-geglu-donor"] if fused_donor else []),
+            "--skip-runtime-save",
             "--log-level",
             a.log_level,
         ],
@@ -207,7 +259,8 @@ def _quant_inputs(ctx: Ctx, *, role: str) -> tuple[Path, Path | None]:
 
     if _is_npu_onnx(deploy_onnx):
         LOGGER.info("%s quant: deployment ONNX is NPU graph: %s", role_label, deploy_onnx)
-        refresh_donor = f"{role}_onnx" in ctx.chosen
+        fused_donor = role == "vlm" and _uses_fused_vlm_donor(ctx)
+        refresh_donor = f"{role}_onnx" in ctx.chosen or fused_donor
         if donor_onnx.is_file() and not refresh_donor:
             LOGGER.info("%s quant: reusing donor ONNX: %s", role_label, donor_onnx)
         else:
@@ -256,6 +309,7 @@ def _run_vlm_onnx(ctx: Ctx) -> None:
             "--device",
             a.device,
             *(["--fast-gelu"] if a.fast_gelu else []),
+            *(["--no-npu-geglu"] if not a.npu_geglu else []),
             "--log-level",
             a.log_level,
         ],
@@ -304,10 +358,16 @@ def _run_vlm_quant(ctx: Ctx) -> None:
             str(a.num_calib),
             "--amp-num",
             str(a.amp_num),
+            "--amp-rank-samples",
+            str(a.amp_rank_samples),
+            *(["--amp-scratch-dir", str(Path(a.amp_scratch_dir).expanduser())] if a.amp_scratch_dir else []),
             "--device",
             a.device,
             *(["--task", a.task] if a.task else []),
+            *(["--fused-geglu-donor"] if npu_onnx is not None and _uses_fused_vlm_donor(ctx) else []),
+            *(["--unfused-geglu-deployment"] if npu_onnx is not None and not a.npu_geglu else []),
             *(["--npu-onnx-path", str(npu_onnx)] if npu_onnx else []),
+            *_quant_profile_args(ctx, role="vlm", output_onnx=ctx.vlm_w8a8),
             "--log-level",
             a.log_level,
         ],
@@ -324,13 +384,19 @@ def _run_ae_quant(ctx: Ctx) -> None:
             str(donor_onnx),
             "--output-path",
             str(ctx.ae_w8a8),
+            "--policy-path",
+            str(ctx.policy_path),
             "--calib-dir",
             str(ctx.calib_dir),
             "--num-calib",
             str(a.num_calib),
             "--amp-num",
             str(a.amp_num),
+            "--amp-rank-samples",
+            str(a.amp_rank_samples),
+            *(["--amp-scratch-dir", str(Path(a.amp_scratch_dir).expanduser())] if a.amp_scratch_dir else []),
             *(["--npu-onnx-path", str(npu_onnx)] if npu_onnx else []),
+            *_quant_profile_args(ctx, role="ae", output_onnx=ctx.ae_w8a8),
             "--log-level",
             a.log_level,
         ],
@@ -372,10 +438,12 @@ def _run_ae_om(ctx: Ctx) -> None:
 
 
 def _run_vlm_quant_om(ctx: Ctx) -> None:
+    _validate_quantized_profile_dependencies(ctx, ["vlm_quant_om"])
     _run_om(ctx, role="vlm", onnx_path=ctx.vlm_w8a8, om_path=ctx.vlm_quant_om)
 
 
 def _run_ae_quant_om(ctx: Ctx) -> None:
+    _validate_quantized_profile_dependencies(ctx, ["ae_quant_om"])
     _run_om(ctx, role="ae", onnx_path=ctx.ae_w8a8, om_path=ctx.ae_quant_om)
 
 
@@ -487,7 +555,8 @@ def _validate_quant_preflight(ctx: Ctx, chosen: list[str]) -> None:
             return
 
         LOGGER.info("%s quant preflight: deployment ONNX is NPU graph: %s", role_label, deploy)
-        refresh_donor = f"{role}_onnx" in chosen
+        fused_donor = role == "vlm" and _uses_fused_vlm_donor(ctx)
+        refresh_donor = f"{role}_onnx" in chosen or fused_donor
         if donor.is_file() and not refresh_donor:
             LOGGER.info("%s quant preflight: donor ONNX exists and will be reused: %s", role_label, donor)
             return
@@ -550,6 +619,44 @@ def _validate_quant_preflight(ctx: Ctx, chosen: list[str]) -> None:
         raise SystemExit("Quantization preflight failed:\n" + "\n".join(problems))
 
 
+def _validate_quantized_profile_dependencies(ctx: Ctx, chosen: list[str]) -> None:
+    """Reject stale profiled W8A8 ONNX files before compiling them."""
+    profile = ctx.quantization_profile
+    if profile is None:
+        return
+    checks = (
+        ("vlm", "vlm_quant", "vlm_quant_om", ctx.vlm_w8a8),
+        ("ae", "ae_quant", "ae_quant_om", ctx.ae_w8a8),
+    )
+    for role, quant_step, om_step, output_onnx in checks:
+        if om_step not in chosen or quant_step in chosen:
+            continue
+        deploy_onnx = ctx.vlm_onnx if role == "vlm" else ctx.ae_onnx
+        if _is_npu_onnx(deploy_onnx):
+            donor_onnx = ctx.vlm_donor_onnx if role == "vlm" else ctx.ae_donor_onnx
+            npu_onnx = deploy_onnx
+        else:
+            donor_onnx = deploy_onnx
+            npu_onnx = None
+        try:
+            validate_quantization_metadata(
+                path=metadata_path(output_onnx),
+                profile=profile,
+                role=role,
+                policy_path=ctx.policy_path,
+                donor_onnx=donor_onnx,
+                npu_onnx=npu_onnx,
+                output_onnx=output_onnx,
+            )
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"Cannot reuse {output_onnx}: {exc}") from exc
+
+
+def _remove_quantized_onnx(path: Path) -> None:
+    for candidate in (path, path.with_name(path.name + ".data"), metadata_path(path)):
+        candidate.unlink(missing_ok=True)
+
+
 def main() -> int:
     resolved = _cli.resolve()
     args = resolved.args
@@ -569,6 +676,10 @@ def main() -> int:
     suffix = build_onnx_suffix(dtype=args.dtype, device=device_tag)
     donor_device_tag = args.donor_device.split(":", 1)[0]
     donor_suffix = build_onnx_suffix(dtype=args.dtype, device=donor_device_tag)
+    quantization_profile = getattr(resolved, "quantization_profile", None)
+    fused_vlm_donor = False
+    if quantization_profile is not None and quantization_profile.vlm.fused_geglu_donor is not None:
+        fused_vlm_donor = quantization_profile.vlm.fused_geglu_donor
     vlm_onnx = output_dir / f"pi05-vlm{suffix}.onnx"
     ae_onnx = output_dir / f"pi05-action_expert{suffix}.onnx"
     vlm_w8a8 = vlm_onnx.with_name(vlm_onnx.stem + "_w8a8.onnx")
@@ -583,7 +694,7 @@ def main() -> int:
         om_dir=om_dir,
         vlm_onnx=vlm_onnx,
         ae_onnx=ae_onnx,
-        vlm_donor_onnx=output_dir / f"pi05-vlm{donor_suffix}.onnx",
+        vlm_donor_onnx=output_dir / f"pi05-vlm{'_fused-geglu' if fused_vlm_donor else ''}{donor_suffix}.onnx",
         ae_donor_onnx=output_dir / f"pi05-action_expert{donor_suffix}.onnx",
         vlm_w8a8=vlm_w8a8,
         ae_w8a8=ae_w8a8,
@@ -593,6 +704,7 @@ def main() -> int:
         ae_quant_om=om_dir / ae_w8a8.with_suffix(".om").name,
         calib_dir=(Path(args.calib_dir).expanduser() if args.calib_dir else runtime_save_dir),
         chosen=set(chosen),
+        quantization_profile=quantization_profile,
     )
 
     # Fail fast on missing upstream artifacts before doing any work.
@@ -613,14 +725,22 @@ def main() -> int:
         if prod is not None and prod.is_file():
             LOGGER.info("● [%d/%d] %s — rebuilding (requested; existing %s)", step_no, total, _TITLES[name], prod)
         if prod is not None:
-            prod.unlink(missing_ok=True)
+            if name in {"vlm_quant", "ae_quant"}:
+                _remove_quantized_onnx(prod)
+            else:
+                prod.unlink(missing_ok=True)
             if name.endswith("_om"):
                 Path(f"{prod}.abi.json").unlink(missing_ok=True)
         if name == "vlm_onnx":
             (ctx.runtime_save_dir / "past_kv_tensor.pth").unlink(missing_ok=True)
             (ctx.runtime_save_dir / "prefix_pad_masks.pth").unlink(missing_ok=True)
-        with Stage(_TITLES[name], index=step_no, total=total):
-            _RUNNERS[name](ctx)
+        try:
+            with Stage(_TITLES[name], index=step_no, total=total):
+                _RUNNERS[name](ctx)
+        except Exception:
+            if prod is not None and name in {"vlm_quant", "ae_quant"}:
+                _remove_quantized_onnx(prod)
+            raise
         if prod is not None and not prod.is_file():
             raise RuntimeError(f"Step {name!r} completed without producing {prod}")
         _validate_step_outputs(ctx, name)
