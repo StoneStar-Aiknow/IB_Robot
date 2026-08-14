@@ -1,0 +1,15 @@
+schema_version: "1.0"
+calibration_version: UNMEASURED
+status: candidate
+device:
+  name: front_camera
+  serial: REPLACE_WITH_CAMERA_SERIAL
+camera_info:
+  frame_id: camera_front_optical_frame
+  width: 640
+  height: 480
+  distortion_model: plumb_bob
+  d: [0.0, 0.0, 0.0, 0.0, 0.0]
+  k: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+  r: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+  p: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]

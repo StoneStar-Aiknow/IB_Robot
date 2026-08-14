@@ -299,6 +299,9 @@ detect_host_metadata
 SETUP_PLATFORM_ID="$(detect_platform_id)"
 if [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
     OPENEULER_SKIP_PACKAGES=()
+    if [[ "${IBR_BUILD_INCLUDE_FAST_CALIB_ON_OPENEULER:-0}" != "1" ]]; then
+        OPENEULER_SKIP_PACKAGES+=("fast_calib")
+    fi
     if [[ "${IBR_BUILD_INCLUDE_SIM_MODELS_ON_OPENEULER:-0}" != "1" ]]; then
         OPENEULER_SKIP_PACKAGES+=("sim_models")
     fi

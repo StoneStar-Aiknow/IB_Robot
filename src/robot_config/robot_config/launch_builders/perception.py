@@ -547,6 +547,21 @@ def generate_tf_nodes(robot_config, use_sim=False):
         roll = transform.get("roll", 0.0)
         pitch = transform.get("pitch", 0.0)
         yaw = transform.get("yaw", 0.0)
+        quaternion = [transform.get(key) for key in ("qx", "qy", "qz", "qw")]
+
+        if all(value is not None for value in quaternion):
+            rotation_arguments = [
+                "--qx",
+                str(quaternion[0]),
+                "--qy",
+                str(quaternion[1]),
+                "--qz",
+                str(quaternion[2]),
+                "--qw",
+                str(quaternion[3]),
+            ]
+        else:
+            rotation_arguments = ["--roll", str(roll), "--pitch", str(pitch), "--yaw", str(yaw)]
 
         # Main frame TF
         nodes.append(
@@ -561,12 +576,7 @@ def generate_tf_nodes(robot_config, use_sim=False):
                     str(y),
                     "--z",
                     str(z),
-                    "--roll",
-                    str(roll),
-                    "--pitch",
-                    str(pitch),
-                    "--yaw",
-                    str(yaw),
+                    *rotation_arguments,
                     "--frame-id",
                     parent_frame,
                     "--child-frame-id",

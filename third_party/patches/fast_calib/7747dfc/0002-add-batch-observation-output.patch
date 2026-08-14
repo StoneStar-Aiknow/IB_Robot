@@ -1,0 +1,80 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index 09f404c..5147836 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -6,11 +6,38 @@ which is included as part of this source code package.
+ */
+ #include <pcl_conversions/pcl_conversions.h>
+ #include <rclcpp/rclcpp.hpp>
++#include <fstream>
+ 
+ #include "qr_detect.hpp"
+ #include "lidar_detect.hpp"
+ #include "data_preprocess.hpp"
+ 
++static bool saveObservation(const Params &params,
++                            const pcl::PointCloud<pcl::PointXYZ>::Ptr &camera_centers,
++                            const pcl::PointCloud<pcl::PointXYZ>::Ptr &lidar_centers)
++{
++  if (params.scene_id.empty())
++  {
++    return false;
++  }
++  std::string output_dir = params.output_path;
++  if (output_dir.back() != '/') output_dir += '/';
++  std::ofstream stream(output_dir + "observation.yaml");
++  if (!stream.is_open()) return false;
++  const auto write_centers = [&stream](const char *name, const pcl::PointCloud<pcl::PointXYZ>::Ptr &centers) {
++    stream << name << ":\n";
++    for (const auto &point : centers->points)
++      stream << "  - [" << point.x << ", " << point.y << ", " << point.z << "]\n";
++  };
++  stream << "schema_version: \"1.0\"\n"
++         << "scene_id: " << params.scene_id << "\n"
++         << "source_frame: body\n"
++         << "target_frame: camera_front_optical_frame\n";
++  write_centers("camera_centers", camera_centers);
++  write_centers("lidar_centers", lidar_centers);
++  return stream.good();
++}
++
+ int main(int argc, char **argv)
+ {
+   rclcpp::init(argc, argv);
+@@ -43,6 +70,29 @@ int main(int argc, char **argv)
+   lidar_center_cloud->reserve(4);
+   lidarDetectPtr->detect_lidar(cloud_input, lidar_center_cloud);
+ 
++  if (qr_center_cloud->size() != 4 || lidar_center_cloud->size() != 4)
++  {
++    RCLCPP_ERROR(node->get_logger(),
++                 "Calibration aborted: expected 4 camera centers and 4 LiDAR centers, got %zu and %zu.",
++                 qr_center_cloud->size(), lidar_center_cloud->size());
++    rclcpp::shutdown();
++    return 2;
++  }
++  if (params.observation_only)
++  {
++    for (const auto &point : qr_center_cloud->points)
++      RCLCPP_INFO(node->get_logger(), "Camera center: (%.6f, %.6f, %.6f)", point.x, point.y, point.z);
++    if (!saveObservation(params, qr_center_cloud, lidar_center_cloud))
++    {
++      RCLCPP_ERROR(node->get_logger(), "Failed to write observation.yaml; scene_id and output_path are required.");
++      rclcpp::shutdown();
++      return 2;
++    }
++    RCLCPP_INFO(node->get_logger(), "Observation saved to %s/observation.yaml", params.output_path.c_str());
++    rclcpp::shutdown();
++    return 0;
++  }
++
+   // 对 QR 和 LiDAR 检测到的圆心进行排序
+   PointCloud<PointXYZ>::Ptr qr_centers(new PointCloud<PointXYZ>);
+   PointCloud<PointXYZ>::Ptr lidar_centers(new PointCloud<PointXYZ>);
+@@ -142,4 +192,4 @@ int main(int argc, char **argv)
+ 
+   rclcpp::shutdown();
+   return 0;
+-}
+\ No newline at end of file
++}

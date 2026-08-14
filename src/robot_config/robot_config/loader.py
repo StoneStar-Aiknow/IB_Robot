@@ -6,7 +6,7 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -1040,6 +1040,74 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _quaternion_multiply(left: list[float], right: list[float]) -> list[float]:
+    lx, ly, lz, lw = left
+    rx, ry, rz, rw = right
+    return [
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+        lw * rw - lx * rx - ly * ry - lz * rz,
+    ]
+
+
+def _normalized_quaternion(quaternion: list[float]) -> list[float]:
+    norm = math.sqrt(sum(value * value for value in quaternion))
+    if norm <= 1e-12:
+        raise ValueError("calibration rotation quaternion must be non-zero")
+    return [value / norm for value in quaternion]
+
+
+def _apply_approved_camera_calibration(robot_config: dict[str, Any]) -> None:
+    calibration = robot_config.get("sensor_calibration", {})
+    artifacts = calibration.get("artifacts", {}) if isinstance(calibration, dict) else {}
+    artifact_value = artifacts.get("base_to_front_camera") if isinstance(artifacts, dict) else None
+    if not artifact_value:
+        return
+
+    artifact_path = Path(resolve_ros_path(artifact_value)).expanduser()
+    if not artifact_path.is_file():
+        logger.info("Approved camera calibration is not installed: %s", artifact_path)
+        return
+    try:
+        document = yaml.safe_load(artifact_path.read_bytes()) or {}
+        transform = document.get("transform", {})
+        if document.get("status") != "approved" or not isinstance(transform, dict):
+            raise ValueError("artifact is not an approved transform")
+        if transform.get("parent_frame") != "base_link":
+            raise ValueError("artifact parent_frame must be base_link")
+        translation = transform.get("translation")
+        rotation = transform.get("rotation_xyzw")
+        if not isinstance(translation, list) or len(translation) != 3:
+            raise ValueError("artifact translation must contain three values")
+        if not isinstance(rotation, list) or len(rotation) != 4:
+            raise ValueError("artifact rotation_xyzw must contain four values")
+        translation_values = cast(list[float], translation)
+        rotation_values = cast(list[float], rotation)
+        optical_inverse = [0.5, -0.5, 0.5, 0.5]
+        link_rotation = _normalized_quaternion(
+            _quaternion_multiply([float(value) for value in rotation_values], optical_inverse)
+        )
+        for camera in robot_config.get("peripherals", []):
+            if camera.get("type") == "camera" and camera.get("optical_frame_id") == transform.get("child_frame"):
+                camera["transform"].update(
+                    {
+                        "x": float(translation_values[0]),
+                        "y": float(translation_values[1]),
+                        "z": float(translation_values[2]),
+                        "qx": link_rotation[0],
+                        "qy": link_rotation[1],
+                        "qz": link_rotation[2],
+                        "qw": link_rotation[3],
+                    }
+                )
+                logger.info("Using approved camera calibration: %s", artifact_path)
+                return
+        raise ValueError("artifact child_frame does not match a configured camera optical frame")
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        raise ValueError(f"Invalid approved camera calibration {artifact_path}: {exc}") from exc
+
+
 def load_robot_config_dict(
     config_path: str | Path | None = None,
     *,
@@ -1058,6 +1126,7 @@ def load_robot_config_dict(
         mount_path = Path(resolve_ros_path(mount_file)).expanduser()
         with mount_path.open("r", encoding="utf-8") as stream:
             robot_config = apply_mid360_mount(robot_config, normalize_mid360_mount(yaml.safe_load(stream) or {}))
+    _apply_approved_camera_calibration(robot_config)
     validation_errors = validate_grasp_execution_config(robot_config.get("grasp_execution"))
     validation_errors.extend(validate_placement_execution_config(robot_config.get("placement_execution")))
     validation_errors.extend(validate_motion_mode_config(robot_config))

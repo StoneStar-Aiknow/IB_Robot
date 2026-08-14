@@ -1,0 +1,251 @@
+diff --git a/include/common_lib.h b/include/common_lib.h
+index 7e76356..9e0d51f 100755
+--- a/include/common_lib.h
++++ b/include/common_lib.h
+@@ -69,7 +69,14 @@ struct Params
+   double fx, fy, cx, cy, k1, k2, p1, p2;
+   double marker_size, delta_width_qr_center, delta_height_qr_center;
+   double delta_width_circles, delta_height_circles, circle_radius;
++  double plane_distance_threshold, plane_eps_angle;
++  double normal_search_radius, boundary_search_radius;
++  double cluster_tolerance, circle_fit_distance_threshold, circle_fit_error_threshold;
++  int min_cluster_size;
++  bool prefer_vertical_plane;
+   int min_detected_markers;
++  bool observation_only;
++  string scene_id;
+   string image_path;
+   string bag_path;
+   string lidar_topic;
+@@ -95,6 +102,17 @@ Params loadParameters(rclcpp::Node::SharedPtr node)
+   node->declare_parameter("delta_height_circles", 0.4);
+   node->declare_parameter("min_detected_markers", 3);
+   node->declare_parameter("circle_radius", 0.12);
++  node->declare_parameter("prefer_vertical_plane", false);
++  node->declare_parameter("plane_distance_threshold", 0.01);
++  node->declare_parameter("plane_eps_angle", 0.35);
++  node->declare_parameter("normal_search_radius", 0.03);
++  node->declare_parameter("boundary_search_radius", 0.03);
++  node->declare_parameter("cluster_tolerance", 0.02);
++  node->declare_parameter("min_cluster_size", 50);
++  node->declare_parameter("circle_fit_distance_threshold", 0.01);
++  node->declare_parameter("circle_fit_error_threshold", 0.02);
++  node->declare_parameter("observation_only", false);
++  node->declare_parameter("scene_id", string(""));
+   node->declare_parameter("image_path", string("/home/chunran/calib_ws/src/fast_calib/data/image.png"));
+   node->declare_parameter("bag_path", string("/home/chunran/calib_ws/src/fast_calib/data/input.bag"));
+   node->declare_parameter("lidar_topic", string("/livox/lidar"));
+@@ -121,6 +139,17 @@ Params loadParameters(rclcpp::Node::SharedPtr node)
+   node->get_parameter_or("delta_height_circles", params.delta_height_circles, 0.4);
+   node->get_parameter_or("min_detected_markers", params.min_detected_markers, 3);
+   node->get_parameter_or("circle_radius", params.circle_radius, 0.12);
++  node->get_parameter_or("prefer_vertical_plane", params.prefer_vertical_plane, false);
++  node->get_parameter_or("plane_distance_threshold", params.plane_distance_threshold, 0.01);
++  node->get_parameter_or("plane_eps_angle", params.plane_eps_angle, 0.35);
++  node->get_parameter_or("normal_search_radius", params.normal_search_radius, 0.03);
++  node->get_parameter_or("boundary_search_radius", params.boundary_search_radius, 0.03);
++  node->get_parameter_or("cluster_tolerance", params.cluster_tolerance, 0.02);
++  node->get_parameter_or("min_cluster_size", params.min_cluster_size, 50);
++  node->get_parameter_or("circle_fit_distance_threshold", params.circle_fit_distance_threshold, 0.01);
++  node->get_parameter_or("circle_fit_error_threshold", params.circle_fit_error_threshold, 0.02);
++  node->get_parameter_or("observation_only", params.observation_only, false);
++  node->get_parameter_or("scene_id", params.scene_id, string(""));
+   node->get_parameter_or("image_path", params.image_path, string("/home/chunran/calib_ws/src/fast_calib/data/image.png"));
+   node->get_parameter_or("bag_path", params.bag_path, string("/home/chunran/calib_ws/src/fast_calib/data/input.bag"));
+   node->get_parameter_or("lidar_topic", params.lidar_topic, string("/livox/lidar"));
+diff --git a/src/lidar_detect.hpp b/src/lidar_detect.hpp
+index 19bd0fd..1118f95 100644
+--- a/src/lidar_detect.hpp
++++ b/src/lidar_detect.hpp
+@@ -29,6 +29,12 @@ class LidarDetect
+ private:
+     double x_min_, x_max_, y_min_, y_max_, z_min_, z_max_;
+     double circle_radius_;
++    double circle_pattern_width_, circle_pattern_height_;
++    double plane_distance_threshold_, plane_eps_angle_;
++    double normal_search_radius_, boundary_search_radius_;
++    double cluster_tolerance_, circle_fit_distance_threshold_, circle_fit_error_threshold_;
++    int min_cluster_size_;
++    bool prefer_vertical_plane_;
+     rclcpp::Node::SharedPtr node_;
+     std::string output_path_;
+ 
+@@ -62,6 +68,17 @@ public:
+         z_min_ = params.z_min;
+         z_max_ = params.z_max;
+         circle_radius_ = params.circle_radius;
++        circle_pattern_width_ = params.delta_width_circles;
++        circle_pattern_height_ = params.delta_height_circles;
++        prefer_vertical_plane_ = params.prefer_vertical_plane;
++        plane_distance_threshold_ = params.plane_distance_threshold;
++        plane_eps_angle_ = params.plane_eps_angle;
++        normal_search_radius_ = params.normal_search_radius;
++        boundary_search_radius_ = params.boundary_search_radius;
++        cluster_tolerance_ = params.cluster_tolerance;
++        min_cluster_size_ = params.min_cluster_size;
++        circle_fit_distance_threshold_ = params.circle_fit_distance_threshold;
++        circle_fit_error_threshold_ = params.circle_fit_error_threshold;
+         output_path_ = params.output_path + "/";
+ 
+         filtered_pub_ = node->create_publisher<sensor_msgs::msg::PointCloud2>("filtered_cloud", 1);
+@@ -109,12 +126,27 @@ public:
+         pcl::ModelCoefficients::Ptr plane_coefficients(new pcl::ModelCoefficients);
+         pcl::PointIndices::Ptr plane_inliers(new pcl::PointIndices);
+         pcl::SACSegmentation<pcl::PointXYZ> plane_segmentation;
+-        plane_segmentation.setModelType(pcl::SACMODEL_PLANE);
++        if (prefer_vertical_plane_)
++        {
++            plane_segmentation.setModelType(pcl::SACMODEL_PARALLEL_PLANE);
++            plane_segmentation.setAxis(Eigen::Vector3f::UnitZ());
++            plane_segmentation.setEpsAngle(plane_eps_angle_);
++        }
++        else
++        {
++            plane_segmentation.setModelType(pcl::SACMODEL_PLANE);
++        }
+         plane_segmentation.setMethodType(pcl::SAC_RANSAC);
+-        plane_segmentation.setDistanceThreshold(0.01); // 平面分割阈值
++        plane_segmentation.setDistanceThreshold(plane_distance_threshold_);
+         plane_segmentation.setInputCloud(filtered_cloud_);
+         plane_segmentation.segment(*plane_inliers, *plane_coefficients);
+ 
++        if (plane_inliers->indices.empty() || plane_coefficients->values.size() < 4)
++        {
++            RCLCPP_ERROR(node_->get_logger(), "No target plane found in the configured ROI.");
++            return;
++        }
++
+         pcl::ExtractIndices<pcl::PointXYZ> extract;
+         extract.setInputCloud(filtered_cloud_);
+         extract.setIndices(plane_inliers);
+@@ -155,14 +187,14 @@ public:
+         pcl::NormalEstimation<pcl::PointXYZ, pcl::Normal> normal_estimator;
+         pcl::PointCloud<pcl::Normal>::Ptr normals(new pcl::PointCloud<pcl::Normal>);
+         normal_estimator.setInputCloud(aligned_cloud_);
+-        normal_estimator.setRadiusSearch(0.03); // 设置法线估计的搜索半径
++        normal_estimator.setRadiusSearch(normal_search_radius_);
+         normal_estimator.compute(*normals);
+ 
+         pcl::PointCloud<pcl::Boundary> boundaries;
+         pcl::BoundaryEstimation<pcl::PointXYZ, pcl::Normal, pcl::Boundary> boundary_estimator;
+         boundary_estimator.setInputCloud(aligned_cloud_);
+         boundary_estimator.setInputNormals(normals);
+-        boundary_estimator.setRadiusSearch(0.03);       // 设置边界检测的搜索半径
++        boundary_estimator.setRadiusSearch(boundary_search_radius_);
+         boundary_estimator.setAngleThreshold(M_PI / 4); // 设置角度阈值
+         boundary_estimator.compute(boundaries);
+ 
+@@ -181,8 +213,8 @@ public:
+ 
+         std::vector<pcl::PointIndices> cluster_indices;
+         pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+-        ec.setClusterTolerance(0.02); // 设置聚类距离阈值
+-        ec.setMinClusterSize(50);     // 最小点数
++        ec.setClusterTolerance(cluster_tolerance_);
++        ec.setMinClusterSize(min_cluster_size_);
+         ec.setMaxClusterSize(1000);   // 最大点数
+         ec.setSearchMethod(tree);
+         ec.setInputCloud(edge_cloud_);
+@@ -210,7 +242,7 @@ public:
+             seg.setOptimizeCoefficients(true);
+             seg.setModelType(pcl::SACMODEL_CIRCLE2D);
+             seg.setMethodType(pcl::SAC_RANSAC);
+-            seg.setDistanceThreshold(0.01); // 设置距离阈值
++            seg.setDistanceThreshold(circle_fit_distance_threshold_);
+             seg.setMaxIterations(1000);     // 设置最大迭代次数
+             seg.setInputCloud(cluster);
+             seg.segment(*inliers, *coefficients);
+@@ -229,8 +261,11 @@ public:
+                 error /= inliers->indices.size();
+ 
+                 // 如果拟合误差较小，则认为是一个圆洞
+-                std::cout << "inliers->indices.size() " << inliers->indices.size() << " " << error << std::endl;
+-                if (error < 0.02)
++                std::cout << "circle candidate: inliers=" << inliers->indices.size()
++                          << " center=(" << coefficients->values[0] << ", " << coefficients->values[1]
++                          << ") radius=" << coefficients->values[2] << " expected_radius_error=" << error
++                          << std::endl;
++                if (error < circle_fit_error_threshold_)
+                 {
+                     // 将恢复后的圆心坐标添加到点云中
+                     pcl::PointXYZ center_point;
+@@ -248,8 +283,72 @@ public:
+                     center_point_origin.y = original_point.y();
+                     center_point_origin.z = original_point.z();
+                     center_cloud->points.push_back(center_point_origin);
++                    std::cout << "accepted LiDAR center: (" << center_point_origin.x << ", "
++                              << center_point_origin.y << ", " << center_point_origin.z << ")" << std::endl;
++                }
++            }
++        }
++
++        // A solid-state LiDAR may miss one rim at long range. Recover a single missing
++        // center only when three measured centers form the configured L shape.
++        if (center_cloud->size() == 3)
++        {
++            const double tolerance = 0.06;
++            pcl::PointCloud<pcl::PointXYZ> recovered_pattern;
++            size_t matching_patterns = 0;
++            for (size_t i = 0; i < center_cloud->size(); ++i)
++            {
++                for (size_t j = 0; j < center_cloud->size(); ++j)
++                {
++                    if (j == i) continue;
++                    for (size_t k = j + 1; k < center_cloud->size(); ++k)
++                    {
++                        if (k == i) continue;
++                        const auto &pi = center_cloud->points[i];
++                        const auto &pj = center_cloud->points[j];
++                        const auto &pk = center_cloud->points[k];
++                        const auto distance = [](const pcl::PointXYZ &a, const pcl::PointXYZ &b) {
++                            const double dx = a.x - b.x;
++                            const double dy = a.y - b.y;
++                            const double dz = a.z - b.z;
++                            return std::sqrt(dx * dx + dy * dy + dz * dz);
++                        };
++                        const double dij = distance(pi, pj);
++                        const double dik = distance(pi, pk);
++                        const bool matches =
++                            (std::abs(dij - circle_pattern_width_) < tolerance &&
++                             std::abs(dik - circle_pattern_height_) < tolerance) ||
++                            (std::abs(dij - circle_pattern_height_) < tolerance &&
++                             std::abs(dik - circle_pattern_width_) < tolerance);
++                        if (!matches) continue;
++
++                        pcl::PointXYZ inferred;
++                        inferred.x = pj.x + pk.x - pi.x;
++                        inferred.y = pj.y + pk.y - pi.y;
++                        inferred.z = pj.z + pk.z - pi.z;
++                        recovered_pattern.clear();
++                        recovered_pattern.push_back(pi);
++                        recovered_pattern.push_back(pj);
++                        recovered_pattern.push_back(pk);
++                        recovered_pattern.push_back(inferred);
++                        matching_patterns++;
++                    }
+                 }
+             }
++            if (matching_patterns == 1)
++            {
++                *center_cloud = recovered_pattern;
++                const auto &inferred = center_cloud->points.back();
++                RCLCPP_WARN(node_->get_logger(),
++                            "Recovered one missing hole center from a unique measured L pattern: (%.3f, %.3f, %.3f)",
++                            inferred.x, inferred.y, inferred.z);
++            }
++            else if (center_cloud->size() != 4)
++            {
++                RCLCPP_ERROR(node_->get_logger(),
++                             "Unable to recover a unique four-hole pattern from %zu candidates (%zu matches).",
++                             center_cloud->size(), matching_patterns);
++            }
+         }
+     }
+ 
+@@ -263,4 +362,4 @@ public:
+ 
+ typedef std::shared_ptr<LidarDetect> LidarDetectPtr;
+ 
+-#endif
+\ No newline at end of file
++#endif

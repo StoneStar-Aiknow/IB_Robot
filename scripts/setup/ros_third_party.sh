@@ -57,12 +57,53 @@ _migrate_fast_lio_build_patch() {
     esac
 }
 
+_ensure_fast_calib_patch_stack() {
+    local source_dir="$1"
+    local patch_dir="$2"
+    local expected_diff_sha256="4192e3430e1ddc3d5a7de6fdeb4d1b6a07d56af1f8359e28810e5f25fdfd5503"
+    local actual_diff_sha256
+
+    actual_diff_sha256="$(git -C "${source_dir}" diff --cached --binary | sha256sum | cut -d' ' -f1)"
+    if [[ "${actual_diff_sha256}" == "${expected_diff_sha256}" ]]; then
+        if ! git -C "${source_dir}" diff --quiet || \
+            [[ -n "$(git -C "${source_dir}" ls-files --others --exclude-standard)" ]]; then
+            log_error "FAST-Calib has changes outside the verified patch stack"
+            return 1
+        fi
+        return 0
+    fi
+    if [[ -n "$(git -C "${source_dir}" status --porcelain)" ]]; then
+        log_error "FAST-Calib has a partial or unexpected local patch state"
+        log_error "Expected complete diff SHA-256: ${expected_diff_sha256}"
+        return 1
+    fi
+
+    local patch
+    while IFS= read -r patch; do
+        [[ -n "${patch}" ]] || continue
+        log_info "Applying ${patch}"
+        if ! git -C "${source_dir}" apply --index "${patch_dir}/${patch}"; then
+            log_error "FAST-Calib patch does not match the pinned source: ${patch}"
+            return 1
+        fi
+    done < "${patch_dir}/series.txt"
+
+    actual_diff_sha256="$(git -C "${source_dir}" diff --cached --binary | sha256sum | cut -d' ' -f1)"
+    if [[ "${actual_diff_sha256}" != "${expected_diff_sha256}" ]]; then
+        log_error "FAST-Calib patch-stack provenance mismatch"
+        log_error "Expected ${expected_diff_sha256}, got ${actual_diff_sha256}"
+        return 1
+    fi
+}
+
 ensure_ros_third_party_patch_stacks() {
     local livox_sdk_src="${WORKSPACE}/libs/Livox-SDK2"
     local livox_driver_src="${WORKSPACE}/src/livox_ros_driver2"
     local fast_lio_src="${WORKSPACE}/src/fast_lio"
+    local fast_calib_src="${WORKSPACE}/src/fast_calib"
     local ikd_tree_src="${fast_lio_src}/include/ikd-Tree"
     local fast_lio_patch_dir="${WORKSPACE}/third_party/patches/fast_lio"
+    local fast_calib_patch_dir="${WORKSPACE}/third_party/patches/fast_calib/7747dfc"
     local livox_sdk_patch_dir="${WORKSPACE}/third_party/patches/livox_sdk2"
     local livox_driver_patch_dir="${WORKSPACE}/third_party/patches/livox_ros_driver2"
 
@@ -72,6 +113,8 @@ ensure_ros_third_party_patch_stacks() {
         "${livox_driver_src}" "13eb05e4e6dd7a765b934d0c5fd6236676a57b49" "livox_ros_driver2" || return 1
     _require_ros_submodule_commit \
         "${fast_lio_src}" "a4743b095409588842a5b30ddfa27e29d2f99164" "FAST-LIO" || return 1
+    _require_ros_submodule_commit \
+        "${fast_calib_src}" "7747dfc6109c04b4bf81d2e3661e41626c8392e1" "FAST-Calib" || return 1
     _require_ros_submodule_commit \
         "${ikd_tree_src}" "e2e3f4e9d3b95a9e66b1ba83dc98d4a05ed8a3c4" "ikd-Tree" || return 1
 
@@ -90,5 +133,6 @@ ensure_ros_third_party_patch_stacks() {
         "${fast_lio_src}" "${fast_lio_patch_dir}/a4743b-build.patch" || return 1
     _apply_ros_patch_once \
         "${fast_lio_src}" "${fast_lio_patch_dir}/a4743b-runtime.patch" || return 1
+    _ensure_fast_calib_patch_stack "${fast_calib_src}" "${fast_calib_patch_dir}" || return 1
     log_done "ROS LiDAR third-party sources are ready"
 }

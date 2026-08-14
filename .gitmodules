@@ -28,3 +28,7 @@
 	url = https://github.com/hku-mars/FAST_LIO.git
 	branch = ROS2
 	ignore = dirty
+[submodule "src/fast_calib"]
+	path = src/fast_calib
+	url = https://github.com/TommyBrownson/FAST-Calib_Ros2.git
+	ignore = dirty

@@ -1,0 +1,11 @@
+schema_version: "1.0"
+calibration_version: UNMEASURED
+status: candidate
+device:
+  name: front_camera
+  serial: REPLACE_WITH_CAMERA_SERIAL
+transform:
+  parent_frame: base_link
+  child_frame: camera_front_optical_frame
+  translation: [0.0, 0.0, 0.0]
+  rotation_xyzw: [0.0, 0.0, 0.0, 1.0]
