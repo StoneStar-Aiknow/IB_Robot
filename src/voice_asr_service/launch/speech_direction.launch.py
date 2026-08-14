@@ -30,6 +30,7 @@ _MODEL_PATH_KEYS = (
     "fullsubnet_stateful_fb_om_path",
     "fullsubnet_stateful_sb_om_path",
     "fullsubnet_stateful_manifest_path",
+    "speech_direction_inference_bundle",
 )
 
 

@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import asdict
 
 import numpy as np
@@ -182,7 +183,9 @@ class StatefulFullSubNetEnhancer:
         with self._lock:
             if self._closed:
                 raise RuntimeError("stateful FullSubNet 增强器已关闭")
-            return self._process_4ch_locked(audio4)
+            scope = getattr(self._executor, "execution_scope", None)
+            with scope() if callable(scope) else nullcontext():
+                return self._process_4ch_locked(audio4)
 
     def _process_4ch_locked(self, audio4: np.ndarray) -> np.ndarray | None:
         """锁内推进全部 Host 与 executor 状态，禁止 reset/close 交叉。"""

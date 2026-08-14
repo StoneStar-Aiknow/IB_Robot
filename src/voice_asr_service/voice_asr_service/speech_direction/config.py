@@ -71,6 +71,7 @@ class FullSubNetConfig:
     stateful_manifest_path: str = field(
         default_factory=lambda: _model_path("fullsubnet/cum_fullsubnet_best_model_218epochs.manifest.json")
     )
+    inference_bundle: str = field(default_factory=lambda: _model_path("voice_asr"))
     device_id: int = 0
     acl_config_path: str = ""
     device: str = "cuda"  # Ubuntu stateful Torch 固定 CUDA；禁止静默回退 CPU

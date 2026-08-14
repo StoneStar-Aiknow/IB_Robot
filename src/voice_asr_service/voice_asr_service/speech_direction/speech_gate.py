@@ -199,6 +199,7 @@ class SpeechGate:
         vad_threshold: float = 0.65,
         rms_threshold: float = 0.002,
         backend: str = "raw_acl",
+        silero_engine=None,
     ):
         """
         Args:
@@ -208,7 +209,7 @@ class SpeechGate:
             rms_threshold: 灰区 RMS 门限(增强 ch1 RMS,真语音段约 0.02 量级)
             backend: 推理后端 "raw_acl"(NPU,默认) 或 "onnx"(CPU 基线)；"om" 归一化为 "raw_acl"
         """
-        self.silero = SileroVadEngine(model_path=model_path, sample_rate=sample_rate, backend=backend)
+        self.silero = silero_engine or SileroVadEngine(model_path=model_path, sample_rate=sample_rate, backend=backend)
         self.vad_threshold = vad_threshold
         self.rms_threshold = rms_threshold
         self.silero_frame = SILERO_FRAME_SIZE

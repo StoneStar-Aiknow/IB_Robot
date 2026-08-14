@@ -166,7 +166,33 @@
         "fullsubnet_fb",
         "fullsubnet_sb"
       ],
-      "revision": 1,
+      "revision": 2,
+      "state_links": {
+        "fullsubnet_fb": [
+          {
+            "input_semantic": "host.fullsubnet.fb_hidden_in",
+            "output_semantic": "host.fullsubnet.fb_hidden_out",
+            "initialization": "zero"
+          },
+          {
+            "input_semantic": "host.fullsubnet.fb_cell_in",
+            "output_semantic": "host.fullsubnet.fb_cell_out",
+            "initialization": "zero"
+          }
+        ],
+        "fullsubnet_sb": [
+          {
+            "input_semantic": "host.fullsubnet.sb_hidden_in",
+            "output_semantic": "host.fullsubnet.sb_hidden_out",
+            "initialization": "zero"
+          },
+          {
+            "input_semantic": "host.fullsubnet.sb_cell_in",
+            "output_semantic": "host.fullsubnet.sb_cell_out",
+            "initialization": "zero"
+          }
+        ]
+      },
       "target": {
         "runtime": "raw_acl",
         "soc": "Ascend310P1"
@@ -231,7 +257,16 @@
       "execution": [
         "silero_vad"
       ],
-      "revision": 1,
+      "revision": 2,
+      "state_links": {
+        "silero_vad": [
+          {
+            "input_semantic": "host.silero.state_in",
+            "output_semantic": "host.silero.state_out",
+            "initialization": "zero"
+          }
+        ]
+      },
       "target": {
         "runtime": "raw_acl",
         "soc": "Ascend310P1"

@@ -19,6 +19,7 @@ def build_stateful_fullsubnet(
     device_id: int = 0,
     acl_config_path: str = "",
     timing_enabled: bool = False,
+    executor=None,
 ) -> StatefulFullSubNetEnhancer:
     """仅在此选择模型执行器；两个平台随后共用同一 Host 算法实现。"""
     canonical = {
@@ -29,9 +30,11 @@ def build_stateful_fullsubnet(
         "stateful_torch_cpu": "stateful_torch_cpu",
     }.get(backend, backend)
 
-    executor = None
+    owned_executor = executor is None
     try:
-        if canonical == "stateful_raw_acl":
+        if executor is not None:
+            pass
+        elif canonical == "stateful_raw_acl":
             from .fullsubnet_stateful_acl import StatefulAclFullSubNetRunner
 
             executor = StatefulAclFullSubNetRunner(
@@ -62,7 +65,7 @@ def build_stateful_fullsubnet(
             timing_enabled=timing_enabled,
         )
     except Exception:
-        if executor is not None:
+        if owned_executor and executor is not None:
             with suppress(Exception):
                 executor.close()
         raise

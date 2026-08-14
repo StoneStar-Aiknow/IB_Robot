@@ -20,6 +20,7 @@ import math
 import os
 import threading
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -30,12 +31,17 @@ from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from ibrobot_msgs.msg import SpeechDirection
+from inference_manifest import load_inference_manifest
+from inference_service.backends import RuntimeContext
+from inference_service.model_sessions import MODEL_SESSION_BUILDER_REGISTRY
 
+from ..model_session_builders import register_speech_direction_session_builder
 from .config import SpeechDirectionConfig
 from .diagnostics import DiagnosticsRecorder, RecorderStatus
 from .doa.srp_phat import StftSrpPhat
 from .enhancement.factory import build_stateful_fullsubnet
 from .enhancement.fullsubnet import FullSubNetEnhancer
+from .model_sessions import SpeechDirectionRoleRunner
 from .pipeline import DoaState, PipelineParams, SpeechDirectionPipeline, VadState
 from .pipeline_streaming import StreamingPipelineParams, StreamingSpeechDirectionPipeline
 from .runtime import SpeechDirectionRuntime
@@ -64,6 +70,7 @@ _PARAMETER_TYPES = {
     "fullsubnet_stateful_fb_om_path": Parameter.Type.STRING,
     "fullsubnet_stateful_sb_om_path": Parameter.Type.STRING,
     "fullsubnet_stateful_manifest_path": Parameter.Type.STRING,
+    "speech_direction_inference_bundle": Parameter.Type.STRING,
     "fullsubnet_device_id": Parameter.Type.INTEGER,
     "fullsubnet_acl_config_path": Parameter.Type.STRING,
     "silero_vad_backend": Parameter.Type.STRING,
@@ -281,6 +288,7 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     cfg.fullnet.stateful_fb_om_path = stateful_fb_path
     cfg.fullnet.stateful_sb_om_path = stateful_sb_path
     cfg.fullnet.stateful_manifest_path = stateful_manifest
+    cfg.fullnet.inference_bundle = _require_non_empty_string(values, "speech_direction_inference_bundle")
     cfg.fullnet.device_id = fullsubnet_device_id
     cfg.fullnet.acl_config_path = fullsubnet_acl_config_path
     cfg.vad.backend = silero_backend
@@ -329,6 +337,7 @@ class SpeechDirectionNode(Node):
 
         # ============================ 构建算法链(可能失败 → 降级)============================
         self._runtime: SpeechDirectionRuntime | None = None
+        self._model_sessions = []
         self._wav_input: WavInput | None = None
         self._diagnostics_recorder: DiagnosticsRecorder | None = None
         self._diagnostics_status = RecorderStatus(False, "disabled", None, None, 0)
@@ -404,18 +413,22 @@ class SpeechDirectionNode(Node):
 
         # 两个平台仅在 executor 选择上分叉，随后共用 cumulative Host 增强器。
         stateful_backend = cfg.fullnet.backend.startswith("stateful_")
-        if stateful_backend:
+        if cfg.fullnet.backend == "stateful_raw_acl":
+            register_speech_direction_session_builder()
+            bundle = Path(cfg.fullnet.inference_bundle)
+            fullsubnet_manifest = load_inference_manifest(bundle, "ascend_310p_fullsubnet")
+            fullsubnet_context = RuntimeContext(
+                fullsubnet_manifest,
+                {"device_id": cfg.fullnet.device_id, "acl_config_path": cfg.fullnet.acl_config_path},
+            )
+            fullsubnet_session = MODEL_SESSION_BUILDER_REGISTRY.create(fullsubnet_context)
+            fullsubnet_session.load(fullsubnet_context)
+            self._model_sessions.append(fullsubnet_session)
             fullnet = build_stateful_fullsubnet(
                 backend=cfg.fullnet.backend,
-                repo_dir=cfg.fullnet.repo_dir,
-                checkpoint_path=cfg.fullnet.ckpt,
                 manifest_path=cfg.fullnet.stateful_manifest_path,
-                fb_om_path=cfg.fullnet.stateful_fb_om_path,
-                sb_om_path=cfg.fullnet.stateful_sb_om_path,
-                device=cfg.fullnet.device,
-                device_id=cfg.fullnet.device_id,
-                acl_config_path=cfg.fullnet.acl_config_path,
                 timing_enabled=cfg.diagnostics.fullsubnet_timing_enabled,
+                executor=SpeechDirectionRoleRunner(fullsubnet_session, fullsubnet_context),
             )
         else:
             # legacy 仅保留显式对照，不允许 stateful 构造失败后自动进入此分支。
@@ -425,6 +438,18 @@ class SpeechDirectionNode(Node):
                 device=cfg.fullnet.device,
             )
 
+        vad_runner = None
+        if cfg.fullnet.backend == "stateful_raw_acl" and cfg.vad.backend == "raw_acl":
+            vad_manifest = load_inference_manifest(Path(cfg.fullnet.inference_bundle), "ascend_310p_silero")
+            vad_context = RuntimeContext(
+                vad_manifest,
+                {"device_id": cfg.fullnet.device_id, "acl_config_path": cfg.fullnet.acl_config_path},
+            )
+            vad_session = MODEL_SESSION_BUILDER_REGISTRY.create(vad_context)
+            vad_session.load(vad_context)
+            self._model_sessions.append(vad_session)
+            vad_runner = SpeechDirectionRoleRunner(vad_session, vad_context)
+
         # 人声门控(复用 common/vad/silero)
         speech_gate = SpeechGate(
             model_path=cfg.vad.model_path,
@@ -432,6 +457,7 @@ class SpeechDirectionNode(Node):
             vad_threshold=cfg.gray_region.vad_threshold,
             rms_threshold=cfg.gray_region.rms_threshold,
             backend=cfg.vad.backend,
+            silero_engine=vad_runner,
         )
 
         # SRP-PHAT(阵列几何与声学参数从配置传入,配置驱动)
@@ -742,6 +768,12 @@ class SpeechDirectionNode(Node):
             if self._runtime is not None:
                 try:
                     self._runtime.stop()
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+            for session in self._model_sessions:
+                try:
+                    session.close()
                 except Exception as exc:
                     if cleanup_error is None:
                         cleanup_error = exc
