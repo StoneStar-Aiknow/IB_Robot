@@ -1,11 +1,10 @@
 """RAM++ scene-tag recognition wrapper."""
 
-import sys
 from contextlib import nullcontext
 
 import numpy as np
 
-from .model_utils import WORKSPACE_ROOT, inspect_backend, resolve_model_path
+from .model_utils import inspect_backend, resolve_model_path
 from .ram_plus_adapter import RecognizedTag
 
 
@@ -38,9 +37,6 @@ class RAMPlusWrapper:
         if not self.checkpoint_path.is_file():
             raise FileNotFoundError(f"RAM++ checkpoint not found: {self.checkpoint_path}")
 
-        ram_root = WORKSPACE_ROOT / "ram_models" / "recognize-anything"
-        if str(ram_root) not in sys.path:
-            sys.path.insert(0, str(ram_root))
         try:
             import torch
             import torch.nn.functional as functional

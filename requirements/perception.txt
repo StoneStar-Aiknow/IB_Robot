@@ -1,11 +1,9 @@
-# Optional dependencies for Grounding-DINO, SAM2, and SigLIP2 perception.
+# Optional dependencies for Grounding-DINO, SAM2, RAM++, and SigLIP2 perception.
 # Install with:
 #   ./scripts/setup.sh --with-perception
-# or:
-#   python3 -m pip install -r requirements/perception.txt
+# The setup script also installs the audited RAM++ wheel from third_party/.
 
 sam2==1.1.0
 git+https://github.com/IDEA-Research/GroundingDINO.git@313392a91d987567198fea1279488370fe49d5d8#egg=groundingdino
-
-# RAM++ also requires the workspace source tree at
-# ram_models/recognize-anything and its checkpoint under models/perception.
+timm>=1.0.15,<1.1.0
+fairscale==0.4.13

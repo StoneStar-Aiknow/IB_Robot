@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
-
-from .model_utils import WORKSPACE_ROOT
 
 
 def _configuration(context) -> tuple[Path, dict]:
@@ -100,56 +97,8 @@ class _RAMPlusModule:
 
 def load_ram_plus(context):
     root, config = _configuration(context)
-    source_root = WORKSPACE_ROOT / "ram_models" / "recognize-anything"
-    if str(source_root) not in sys.path:
-        sys.path.insert(0, str(source_root))
     import torch
-    from transformers import BertTokenizer, modeling_utils, pytorch_utils
-
-    # RAM++ vendors a BERT fork that imports these helpers from their Transformers 4 location.
-    modeling_utils.apply_chunking_to_forward = pytorch_utils.apply_chunking_to_forward
-    modeling_utils.prune_linear_layer = pytorch_utils.prune_linear_layer
-    if not hasattr(modeling_utils, "find_pruneable_heads_and_indices"):
-
-        def find_pruneable_heads_and_indices(heads, number_of_heads, head_size, already_pruned_heads):
-            mask = torch.ones(number_of_heads, head_size)
-            heads = set(heads) - already_pruned_heads
-            for head in heads:
-                adjusted = head - sum(1 for pruned in already_pruned_heads if pruned < head)
-                mask[adjusted] = 0
-            index = torch.arange(mask.numel())[mask.view(-1).eq(1)].long()
-            return heads, index
-
-        modeling_utils.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
-    if not hasattr(BertTokenizer, "additional_special_tokens_ids"):
-        BertTokenizer.additional_special_tokens_ids = property(
-            lambda tokenizer: [tokenizer.convert_tokens_to_ids("[ENC]")]
-        )
     from ram.models import ram_plus
-    from ram.models.bert import BertPreTrainedModel
-
-    original_init_weights = modeling_utils.PreTrainedModel.init_weights
-
-    def compatible_init_weights(model):
-        if not hasattr(model, "all_tied_weights_keys"):
-            model.all_tied_weights_keys = model.get_expanded_tied_weights_keys(all_submodels=False)
-        return original_init_weights(model)
-
-    def get_head_mask(model, head_mask, number_of_layers, is_attention_chunked=False):
-        if head_mask is None:
-            return [None] * number_of_layers
-        if head_mask.dim() == 1:
-            head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            head_mask = head_mask.expand(number_of_layers, -1, -1, -1, -1)
-        elif head_mask.dim() == 2:
-            head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
-        if head_mask.dim() != 5:
-            raise ValueError(f"head_mask.dim != 5, instead {head_mask.dim()}")
-        head_mask = head_mask.to(dtype=model.dtype)
-        return head_mask.unsqueeze(-1) if is_attention_chunked else head_mask
-
-    BertPreTrainedModel.init_weights = compatible_init_weights
-    BertPreTrainedModel.get_head_mask = get_head_mask
 
     model = ram_plus(
         pretrained=str(root / config["checkpoint"]),

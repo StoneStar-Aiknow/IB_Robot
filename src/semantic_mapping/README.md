@@ -179,7 +179,7 @@ models/
 └── grounded_sam2_swint_ogc/{inference_manifest.json,assets/,model_utils_work/}
 ```
 
-RAM++ 还需要 `ram_models/recognize-anything/` 上游源码树供 runtime 导入 `ram` 包；源码与权重分开管理。
+RAM++ runtime 由 `third_party/wheels/recognize-anything/` 中受控的 `ibrobot-ram` wheel 提供；源码与权重分开管理。
 `model_utils_work/` 下的转换产物不是 production deployment。只有 manifest 声明并通过对应 conformance 的
 named deployment 才能在 production SSOT 中启用。
 

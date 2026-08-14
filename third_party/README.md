@@ -2,12 +2,12 @@
 
 本目录用于存放 **IB_Robot 对上游第三方依赖的受控定制内容**。
 
-当前目录下主要维护的是 LeRobot 的补丁栈：
+当前目录维护 LeRobot 补丁栈，以及由固定上游版本和补丁构建的第三方 wheel：
 
 ```text
 third_party/
-└── patches/
-    └── lerobot/
+├── patches/
+│   ├── lerobot/
         ├── INDEX.yaml
         └── v0.5.1/
             ├── 0001-*.patch
@@ -16,8 +16,20 @@ third_party/
             ├── manifest.yaml
             ├── series.txt
             ├── series.master-parity-candidates.txt
-            └── series.openharmony-5.1.0-musl.txt
+│   │       └── series.openharmony-5.1.0-musl.txt
+│   └── recognize-anything/<commit>/
+│       ├── manifest.yaml
+│       ├── series.txt
+│       └── 0001-*.patch
+└── wheels/
+    └── recognize-anything/<commit>/
+        ├── ibrobot_ram-*.whl
+        └── SHA256SUMS
 ```
+
+RAM++ wheel 通过 `scripts/build_ram_plus_wheel.sh` 从 manifest 固定的上游 commit 重建。setup 使用
+`--no-deps` 安装该 wheel，Python runtime 依赖仍由 `requirements/perception.txt` 统一解析，避免第三方元数据覆盖
+IB_Robot 的 Torch、Transformers 和 ROS ABI 约束。
 
 ## 设计目标
 

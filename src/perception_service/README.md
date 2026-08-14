@@ -262,8 +262,9 @@ deployment，节点不会自动切换 backend。
 Grounding DINO Swin-T OGC 的网络结构配置由 `perception_service.grounding_dino_config` 常量绑定到软件版本，
 不作为模型资产复制进 bundle；bundle 仅保存 checkpoint、文本编码器和 SAM2 checkpoint 等运行资产。
 
-SigLIP2 image/text 服务共享同一 bundle 与 embedding identity，但仍由独立进程加载独立 session。RAM++ 仍从
-`ram_models/recognize-anything/` 导入上游 `ram` 源码；源码不是模型资产。ONNX、OM 等未验证转换结果只能放在
+SigLIP2 image/text 服务共享同一 bundle 与 embedding identity，但仍由独立进程加载独立 session。RAM++ runtime
+由 `third_party/wheels/recognize-anything/` 中固定上游 commit 和补丁构建的 `ibrobot-ram` wheel 提供；源码不是模型
+资产。ONNX、OM 等未验证转换结果只能放在
 bundle 的 `model_utils_work/`，通过 conformance 与 promotion 后才可复制到不可变
 `artifacts/<backend>/<deployment>/generations/<uuid>/` 并注册为 named deployment。
 

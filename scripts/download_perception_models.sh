@@ -223,13 +223,17 @@ prepare_bundle_metadata() {
                 "Grounded-SAM2 SAM 2.1 Hiera Tiny"
             ;;
         ram_plus)
-            local ram_data="${WORKSPACE}/ram_models/recognize-anything/ram/data"
-            if [[ ! -s "${ram_data}/ram_tag_list.txt" ]] || [[ ! -s "${ram_data}/ram_tag_list_threshold.txt" ]]; then
-                echo "Error: RAM++ vocabulary assets are missing under ${ram_data}"
-                exit 1
-            fi
-            cp "${ram_data}/ram_tag_list.txt" "${MODEL_DIR}/${RAM_DIR}/ram_tag_list.txt"
-            cp "${ram_data}/ram_tag_list_threshold.txt" "${MODEL_DIR}/${RAM_DIR}/ram_tag_list_threshold.txt"
+            "${PYTHON_BIN}" - "${MODEL_DIR}/${RAM_DIR}" <<'PY'
+import sys
+from importlib.resources import as_file, files
+from pathlib import Path
+from shutil import copyfile
+
+destination = Path(sys.argv[1])
+for name in ("ram_tag_list.txt", "ram_tag_list_threshold.txt"):
+    with as_file(files("ram").joinpath("data", name)) as source:
+        copyfile(source, destination / name)
+PY
             download_bert_text_encoder "${MODEL_DIR}/${RAM_BERT_DIR}"
             ;;
         siglip2)

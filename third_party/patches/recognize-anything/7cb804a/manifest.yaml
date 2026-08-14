@@ -1,0 +1,19 @@
+upstream:
+  repository: https://github.com/xinyu1205/recognize-anything.git
+  commit: 7cb804a8609e9f4b1a50b7f31436d2df40bb9481
+distribution:
+  name: ibrobot-ram
+  version: 0.0.1+ibrobot.1
+  import_package: ram
+  wheel: ../../../wheels/recognize-anything/7cb804a/ibrobot_ram-0.0.1+ibrobot.1-py3-none-any.whl
+build:
+  python: ">=3.10"
+  source_date_epoch: 1739846159
+  command: scripts/build_ram_plus_wheel.sh
+runtime:
+  transformers: 5.3.0
+  timm: ">=1.0.15,<1.1.0"
+  fairscale: 0.4.13
+patches:
+  - file: 0001-transformers-5-runtime-compat.patch
+    purpose: Support the IB_Robot Transformers runtime without global monkey patches.

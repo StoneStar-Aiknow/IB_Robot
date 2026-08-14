@@ -1,0 +1,92 @@
+diff --git a/ram/models/bert.py b/ram/models/bert.py
+index cb90b79..682cfd6 100644
+--- a/ram/models/bert.py
++++ b/ram/models/bert.py
+@@ -36,12 +36,8 @@ from transformers.modeling_outputs import (
+     SequenceClassifierOutput,
+     TokenClassifierOutput,
+ )
+-from transformers.modeling_utils import (
+-    PreTrainedModel,
+-    apply_chunking_to_forward,
+-    find_pruneable_heads_and_indices,
+-    prune_linear_layer,
+-)
++from transformers.modeling_utils import PreTrainedModel
++from transformers.pytorch_utils import apply_chunking_to_forward, prune_linear_layer
+ from transformers.utils import logging
+ from transformers.models.bert.configuration_bert import BertConfig
+ 
+@@ -49,6 +45,16 @@ from transformers.models.bert.configuration_bert import BertConfig
+ logger = logging.get_logger(__name__)
+ 
+ 
++def find_pruneable_heads_and_indices(heads, number_of_heads, head_size, already_pruned_heads):
++    mask = torch.ones(number_of_heads, head_size)
++    heads = set(heads) - already_pruned_heads
++    for head in heads:
++        adjusted_head = head - sum(1 for pruned_head in already_pruned_heads if pruned_head < head)
++        mask[adjusted_head] = 0
++    index = torch.arange(mask.numel())[mask.view(-1).eq(1)].long()
++    return heads, index
++
++
+ class BertEmbeddings_nopos(nn.Module):
+     """Construct the embeddings from word and position embeddings."""
+ 
+@@ -630,6 +636,24 @@ class BertPreTrainedModel(PreTrainedModel):
+     base_model_prefix = "bert"
+     _keys_to_ignore_on_load_missing = [r"position_ids"]
+ 
++    def init_weights(self):
++        if not hasattr(self, "all_tied_weights_keys"):
++            self.all_tied_weights_keys = self.get_expanded_tied_weights_keys(all_submodels=False)
++        return super().init_weights()
++
++    def get_head_mask(self, head_mask, number_of_layers, is_attention_chunked=False):
++        if head_mask is None:
++            return [None] * number_of_layers
++        if head_mask.dim() == 1:
++            head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
++            head_mask = head_mask.expand(number_of_layers, -1, -1, -1, -1)
++        elif head_mask.dim() == 2:
++            head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
++        if head_mask.dim() != 5:
++            raise ValueError(f"head_mask.dim != 5, instead {head_mask.dim()}")
++        head_mask = head_mask.to(dtype=self.dtype)
++        return head_mask.unsqueeze(-1) if is_attention_chunked else head_mask
++
+     def _init_weights(self, module):
+         """ Initialize the weights """
+         if isinstance(module, (nn.Linear, nn.Embedding)):
+@@ -1032,4 +1056,3 @@ class BertLMHeadModel(BertPreTrainedModel):
+             reordered_past += (tuple(past_state.index_select(0, beam_idx) for past_state in layer_past),)
+         return reordered_past
+ 
+-
+diff --git a/ram/models/utils.py b/ram/models/utils.py
+index 1a64765..e87fd3f 100644
+--- a/ram/models/utils.py
++++ b/ram/models/utils.py
+@@ -131,7 +131,7 @@ def init_tokenizer(text_encoder_type='bert-base-uncased'):
+     tokenizer = BertTokenizer.from_pretrained(text_encoder_type)
+     tokenizer.add_special_tokens({'bos_token': '[DEC]'})
+     tokenizer.add_special_tokens({'additional_special_tokens': ['[ENC]']})
+-    tokenizer.enc_token_id = tokenizer.additional_special_tokens_ids[0]
++    tokenizer.enc_token_id = tokenizer.convert_tokens_to_ids('[ENC]')
+     return tokenizer
+ 
+ 
+diff --git a/setup.cfg b/setup.cfg
+index b8b5305..d0aa75f 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -1,6 +1,6 @@
+ [metadata]
+-name = ram
+-version = 0.0.1
++name = ibrobot-ram
++version = 0.0.1+ibrobot.1
+ description = Recognize Anything Plus Model, Recognize Anything Model and Tag2Text Model
+ 
+ [options]

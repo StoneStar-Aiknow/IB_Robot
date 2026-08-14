@@ -301,10 +301,17 @@ EOF
     if [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
         log_info "Skipping Torch perception source packages on openEuler; the Ascend OM path uses core dependencies."
     elif [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true ]]; then
-        log_info "Installing optional perception dependencies (SAM2, Grounding-DINO)..."
+        local ram_wheel_root="${WORKSPACE}/third_party/wheels/recognize-anything/7cb804a"
+        local ram_wheel="${ram_wheel_root}/ibrobot_ram-0.0.1+ibrobot.1-py3-none-any.whl"
+        log_info "Installing optional perception dependencies (SAM2, Grounding-DINO, RAM++, SigLIP2)..."
         run_cmd env SAM2_BUILD_CUDA="${SAM2_BUILD_CUDA:-0}" SAM2_BUILD_ALLOW_ERRORS=1 \
             "${pip_install[@]}" --no-build-isolation --constraint "${ros_abi_constraints}" \
             -r "${WORKSPACE}/requirements/perception.txt" --quiet
+        if ! (cd "${ram_wheel_root}" && sha256sum --check SHA256SUMS); then
+            log_error "RAM++ wheel checksum verification failed."
+            exit 1
+        fi
+        run_cmd "${pip_install[@]}" --no-deps "${ram_wheel}" --quiet
         installed_perception_deps=true
     else
         log_info "Skipping optional perception dependencies. Re-run setup with --with-perception if needed."
@@ -351,11 +358,18 @@ print(f"NumPy/OpenCV smoke test passed: numpy={numpy.__version__}, cv2={cv2.__ve
 PY
     if [[ "${installed_perception_deps}" == true ]]; then
         PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
+import importlib.metadata
+import importlib.resources
 import importlib.util
 
-missing = [name for name in ("groundingdino", "sam2") if importlib.util.find_spec(name) is None]
+missing = [name for name in ("groundingdino", "sam2", "ram") if importlib.util.find_spec(name) is None]
 if missing:
     raise SystemExit(f"Missing perception modules after optional install: {', '.join(missing)}")
+if importlib.metadata.version("ibrobot-ram") != "0.0.1+ibrobot.1":
+    raise SystemExit("Unexpected ibrobot-ram distribution version")
+for resource in ("ram_tag_list.txt", "ram_tag_list_threshold.txt"):
+    if not importlib.resources.files("ram").joinpath("data", resource).is_file():
+        raise SystemExit(f"Missing RAM++ package resource: {resource}")
 print("Perception optional dependencies smoke test passed")
 PY
     fi
