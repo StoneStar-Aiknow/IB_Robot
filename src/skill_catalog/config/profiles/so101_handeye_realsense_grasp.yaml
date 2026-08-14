@@ -17,6 +17,9 @@ enabled_skills:
 - name: pick_object
   implementation: so101_handeye_realsense_grasp
   planner_visible: true
+- name: place_in_container
+  implementation: so101_handeye_realsense_grasp
+  planner_visible: true
 - name: recover_safe_pose
   implementation: so101_handeye_realsense_grasp
   planner_visible: true

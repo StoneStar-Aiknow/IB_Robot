@@ -35,6 +35,7 @@ from robot_config.observation_transport import (
     validate_robot_config_observation_transports,
 )
 from robot_config.perception_runtime_config import PerceptionRuntimeConfigError, parse_perception_runtime_config
+from robot_config.placement_execution_config import validate_placement_execution_config
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 from .config_path import resolve_robot_config_path
@@ -964,6 +965,7 @@ def load_robot_config_dict(config_path: str | Path | None = None) -> dict[str, A
     resolved_config_path, robot_data = _load_robot_section(resolve_robot_config_path(config_path=config_path))
     robot_config = copy.deepcopy(robot_data)
     validation_errors = validate_grasp_execution_config(robot_config.get("grasp_execution"))
+    validation_errors.extend(validate_placement_execution_config(robot_config.get("placement_execution")))
     validation_errors.extend(_validate_embodied_skill_contract(robot_config))
     validation_errors.extend(_validate_skill_gateway_config(robot_config))
     try:
@@ -1302,6 +1304,9 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         skill_gateway=skill_gateway,
         semantic_mapping=semantic_mapping,
         perception_services=perception_services,
+        placement_execution=robot_data.get("placement_execution", {})
+        if isinstance(robot_data.get("placement_execution", {}), dict)
+        else {},
     )
 
 
@@ -1439,6 +1444,8 @@ def validate_config(config: RobotConfig) -> list[str]:
         List of error messages (empty if valid)
     """
     errors = []
+
+    errors.extend(validate_placement_execution_config(getattr(config, "placement_execution", None)))
 
     semantic_mapping_dict = {
         "enabled": config.semantic_mapping.enabled,

@@ -254,6 +254,7 @@ class RobotConfig:
     skill_gateway: SkillGatewayRuntimeConfig = field(default_factory=SkillGatewayRuntimeConfig)
     semantic_mapping: SemanticMappingConfig = field(default_factory=SemanticMappingConfig)
     perception_services: "PerceptionRuntimeConfig | None" = None
+    placement_execution: dict[str, Any] = field(default_factory=dict)
 
     def get_camera(self, name: str) -> CameraConfig | None:
         """Get camera configuration by name."""

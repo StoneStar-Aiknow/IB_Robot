@@ -1,0 +1,8 @@
+schema_version: 1
+kind: delegated_executor
+robot: so101_handeye_realsense_grasp_pc
+executor: placement_pipeline
+required_args:
+- target_name
+- container_name
+timeout_sec: 60.0
