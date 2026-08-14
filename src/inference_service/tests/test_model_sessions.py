@@ -22,7 +22,12 @@ from inference_service.backends import (
     RuntimeContext,
 )
 from inference_service.generic_runtime import NamedTensorRequest
-from inference_service.model_sessions import AscendOmModelSession, TorchModelSession
+from inference_service.model_sessions import (
+    AscendOmModelSession,
+    StatefulAscendOmModelSession,
+    TorchModelSession,
+    build_ascend_model_session,
+)
 from tests.manifest_fixtures import (
     TEST_BUNDLE_UUID,
     TEST_DEPLOYMENT_UUID,
@@ -305,6 +310,37 @@ def test_ascend_session_validates_abi_executes_named_outputs_and_closes_once(tmp
     assert manager.lease.close_calls == 1
 
 
+def test_ascend_session_builder_selects_execution_mode_from_manifest(tmp_path) -> None:
+    stateless_context = _ascend_context(tmp_path / "stateless")
+    assert type(build_ascend_model_session(stateless_context)) is AscendOmModelSession
+
+    root = tmp_path / "stateful"
+    bundle_files = create_non_policy_bundle(root)
+    manifest = make_non_policy_manifest(root, bundle_files, family="stateful_test", output_semantic="scores")
+    deployment = manifest["deployments"]["ascend"]
+    deployment["bindings"]["model"] = {
+        "inputs": [
+            {"semantic": "features", "index": 0, "dtype": "float32", "shape": [1, 2]},
+            {"semantic": "host.state_in", "index": 1, "dtype": "float32", "shape": [1, 4]},
+        ],
+        "outputs": [
+            {"semantic": "scores", "index": 0, "dtype": "float32", "shape": [1, 2]},
+            {"semantic": "host.state_out", "index": 1, "dtype": "float32", "shape": [1, 4]},
+        ],
+    }
+    deployment["state_links"] = {"model": [{"input_semantic": "host.state_in", "output_semantic": "host.state_out"}]}
+    manifest["model"] = {
+        "kind": "perception",
+        "family": "stateful_test",
+        "inputs": [{"semantic": "features", "dtype": "float32", "shape": [1, 2]}],
+        "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1, 2]}],
+    }
+    write_manifest(root, manifest)
+    stateful_context = RuntimeContext(load_inference_manifest(root, "ascend"))
+
+    assert isinstance(build_ascend_model_session(stateful_context), StatefulAscendOmModelSession)
+
+
 def test_ascend_session_routes_device_links_without_host_round_trip(tmp_path) -> None:
     _FakeAclModel.instances = []
     _FakeAclModel.fail_role = None
@@ -429,6 +465,105 @@ def test_ascend_session_executes_linked_roles_individually(tmp_path) -> None:
     assert producer.read_outputs == set()
     assert consumer.input_overrides[0] is producer.output_buffer(0)
     assert producer.execute_calls == consumer.execute_calls == 1
+    session.close()
+
+
+def test_stateful_ascend_session_accepts_raw_acl_and_manages_device_state_banks(tmp_path) -> None:
+    class StatefulModel(_FakeAclModel):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            self.allocated = []
+            self.zero_calls = []
+            self.bank_calls = []
+            self.fail_next = False
+
+        def allocate_device_buffer(self, size):
+            buffer = SimpleNamespace(pointer=(self.role, len(self.allocated)), size=size)
+            self.allocated.append(buffer)
+            return buffer
+
+        def prepare_dataset_banks(self, input_banks, output_banks, *, host_output_indices):
+            self.input_banks = input_banks
+            self.output_banks = output_banks
+            self.host_output_indices = host_output_indices
+
+        def zero_device_buffer(self, buffer):
+            self.zero_calls.append(buffer)
+
+        def execute_bank(self, bank, inputs):
+            self.bank_calls.append((bank, inputs))
+            if self.fail_next:
+                self.fail_next = False
+                raise RuntimeError("state outcome unknown")
+            return {
+                int(binding.index): np.full(binding.shape, 0.25, dtype=np.dtype(binding.dtype))
+                for binding in self.bindings.outputs
+                if binding.index == 0
+            }
+
+    StatefulModel.instances = []
+    bundle_files = create_non_policy_bundle(tmp_path)
+    manifest = make_non_policy_manifest(tmp_path, bundle_files, family="stateful_test", output_semantic="features")
+    deployment = manifest["deployments"]["ascend"]
+    deployment["target"]["runtime"] = "raw_acl"
+    deployment["bindings"]["model"] = {
+        "inputs": [
+            {"semantic": "features", "index": 0, "dtype": "float32", "shape": [1, 2]},
+            {"semantic": "host.state_in", "index": 1, "dtype": "float32", "shape": [1, 4]},
+        ],
+        "outputs": [
+            {"semantic": "scores", "index": 0, "dtype": "float32", "shape": [1, 2]},
+            {"semantic": "host.state_out", "index": 1, "dtype": "float32", "shape": [1, 4]},
+        ],
+    }
+    deployment["state_links"] = {
+        "model": [
+            {
+                "input_semantic": "host.state_in",
+                "output_semantic": "host.state_out",
+                "initialization": "zero",
+            }
+        ]
+    }
+    manifest["model"] = {
+        "kind": "perception",
+        "family": "stateful_test",
+        "inputs": [{"semantic": "features", "dtype": "float32", "shape": [1, 2]}],
+        "outputs": [{"semantic": "scores", "dtype": "float32", "shape": [1, 2]}],
+    }
+    write_manifest(tmp_path, manifest)
+    session = StatefulAscendOmModelSession(runtime_manager=_FakeRuntimeManager(), model_factory=StatefulModel)
+    session.load(RuntimeContext(load_inference_manifest(tmp_path, "ascend")))
+    request = NamedTensorRequest("stateful", {"features": np.zeros((1, 2), dtype=np.float32)})
+
+    first = session.execute_role("model", request.inputs, request)
+    second = session.execute_role("model", request.inputs, request)
+
+    model = StatefulModel.instances[0]
+    np.testing.assert_array_equal(first["scores"], np.full((1, 2), 0.25, dtype=np.float32))
+    np.testing.assert_array_equal(second["scores"], np.full((1, 2), 0.25, dtype=np.float32))
+    assert [call[0] for call in model.bank_calls] == [0, 1]
+    assert model.host_output_indices == {0}
+    assert len(model.allocated) == 2
+    assert len(model.zero_calls) == 2
+
+    session.reset()
+    assert len(model.zero_calls) == 4
+    session.execute_role("model", request.inputs, request)
+    assert model.bank_calls[-1][0] == 0
+
+    model.fail_next = True
+    with pytest.raises(BackendInferenceError, match="requires recovery"):
+        session.execute_role("model", request.inputs, request)
+    assert session.health().state is BackendState.DEGRADED
+    assert session.health().recoverable
+
+    zero_calls_before_recovery = len(model.zero_calls)
+    session.recover()
+    assert session.health().state is BackendState.READY
+    assert len(model.zero_calls) == zero_calls_before_recovery + 2
+    session.execute_role("model", request.inputs, request)
+    assert model.bank_calls[-1][0] == 0
     session.close()
 
 

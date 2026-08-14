@@ -559,6 +559,28 @@
         }
       ]
     },
+    "state_link": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "input_semantic",
+        "output_semantic"
+      ],
+      "properties": {
+        "input_semantic": {
+          "type": "string",
+          "pattern": "^host\\.[A-Za-z0-9_.-]+$"
+        },
+        "output_semantic": {
+          "type": "string",
+          "pattern": "^host\\.[A-Za-z0-9_.-]+$"
+        },
+        "initialization": {
+          "const": "zero",
+          "default": "zero"
+        }
+      }
+    },
     "torch_deployment": {
       "type": "object",
       "additionalProperties": false,
@@ -650,6 +672,20 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/device_link"
+          }
+        },
+        "state_links": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/role"
+          },
+          "additionalProperties": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/$defs/state_link"
+            }
           }
         }
       }

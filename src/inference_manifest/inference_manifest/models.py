@@ -268,6 +268,14 @@ class DeviceLink(StrictFrozenModel):
         return self
 
 
+class StateLink(StrictFrozenModel):
+    """Pair one recurrent model output with the next invocation's input."""
+
+    input_semantic: Annotated[str, StringConstraints(strict=True, pattern=r"^host\.[A-Za-z0-9_.-]+$")]
+    output_semantic: Annotated[str, StringConstraints(strict=True, pattern=r"^host\.[A-Za-z0-9_.-]+$")]
+    initialization: Literal["zero"] = "zero"
+
+
 class DeploymentIdentity(StrictFrozenModel):
     uuid: ManifestUUID = Field(default_factory=lambda: str(uuid4()))
     revision: Revision = 1
@@ -285,6 +293,7 @@ class CompiledDeployment(DeploymentIdentity):
     execution: tuple[ExecutionRole, ...] = Field(min_length=1)
     bindings: dict[ExecutionRole, ArtifactBindings] = Field(min_length=1)
     device_links: tuple[DeviceLink, ...] = ()
+    state_links: dict[ExecutionRole, tuple[StateLink, ...]] | None = None
 
     @model_validator(mode="after")
     def validate_execution_graph(self) -> CompiledDeployment:
@@ -303,6 +312,43 @@ class CompiledDeployment(DeploymentIdentity):
                 "binding roles must exactly match execution roles "
                 f"(missing={sorted(execution_roles - binding_roles)}, unexpected={sorted(binding_roles - execution_roles)})"
             )
+        if self.state_links is not None:
+            if not self.state_links:
+                raise ValueError("state_links must be omitted instead of empty")
+            if self.device_links:
+                raise ValueError("state_links cannot be combined with device_links")
+            state_roles = set(self.state_links)
+            if not state_roles.issubset(execution_roles):
+                raise ValueError(
+                    f"state_links reference unknown execution roles: {sorted(state_roles - execution_roles)}"
+                )
+            for role, links in self.state_links.items():
+                if not links:
+                    raise ValueError(f"state_links for role {role!r} must not be empty")
+                role_bindings = self.bindings[role]
+                inputs = {binding.semantic: binding for binding in role_bindings.inputs}
+                outputs = {binding.semantic: binding for binding in role_bindings.outputs}
+                seen_inputs: set[str] = set()
+                seen_outputs: set[str] = set()
+                for link in links:
+                    if link.input_semantic in seen_inputs or link.output_semantic in seen_outputs:
+                        raise ValueError(f"state_links for role {role!r} reuse a state input or output")
+                    seen_inputs.add(link.input_semantic)
+                    seen_outputs.add(link.output_semantic)
+                    input_binding = inputs.get(link.input_semantic)
+                    output_binding = outputs.get(link.output_semantic)
+                    if input_binding is None or output_binding is None:
+                        raise ValueError(
+                            f"state link for role {role!r} must reference declared input/output semantics "
+                            f"({link.input_semantic!r}, {link.output_semantic!r})"
+                        )
+                    if input_binding.index is None or output_binding.index is None:
+                        raise ValueError(f"state link for role {role!r} requires explicit runtime indices")
+                    if input_binding.dtype != output_binding.dtype or input_binding.shape != output_binding.shape:
+                        raise ValueError(
+                            f"state link for role {role!r} changes dtype or shape between "
+                            f"{link.input_semantic!r} and {link.output_semantic!r}"
+                        )
 
         roles_by_path: dict[str, list[str]] = {}
         for role, artifact in self.artifacts.items():

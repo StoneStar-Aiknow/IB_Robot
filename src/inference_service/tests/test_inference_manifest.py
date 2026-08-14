@@ -16,6 +16,7 @@ from inference_manifest import (
     ManifestPathError,
     ManifestValidationError,
     SemanticIdentity,
+    StateLink,
     canonical_bundle_digest,
     canonical_manifest_bytes,
     canonical_semantic_identity_json,
@@ -122,6 +123,136 @@ def test_schema_v1_requires_regeneration(tmp_path):
 
     with pytest.raises(ManifestValidationError, match="unsupported.*rerun the owning exporter or packager"):
         load_inference_manifest(tmp_path, "rk3588")
+
+
+def test_historical_v2_deployment_fingerprint_is_stable_without_state_links() -> None:
+    deployment = CompiledDeployment.model_validate_json(
+        json.dumps(
+            {
+                "uuid": "123e4567-e89b-42d3-a456-426614174001",
+                "revision": 1,
+                "backend": "ascend",
+                "target": {"soc": "Ascend310P1", "runtime": "raw_acl"},
+                "artifacts": {"model": {"path": "artifacts/model.om", "format": "om"}},
+                "execution": ["model"],
+                "bindings": {
+                    "model": {
+                        "inputs": [{"semantic": "features", "index": 0, "dtype": "float32", "shape": [1, 2]}],
+                        "outputs": [{"semantic": "scores", "index": 0, "dtype": "float32", "shape": [1, 2]}],
+                    }
+                },
+            }
+        )
+    )
+
+    assert deployment.state_links is None
+    assert "state_links" not in deployment.model_dump(mode="json", exclude_none=True)
+    assert (
+        deployment_fingerprint(2, "0" * 64, "ascend", deployment)
+        == "1e7fa50bcf609ff928aa0386872a0aec23ad3f33419f5b607758289b8dc96888"
+    )
+
+
+def _stateful_deployment() -> dict:
+    return {
+        "uuid": "123e4567-e89b-42d3-a456-426614174001",
+        "revision": 1,
+        "backend": "ascend",
+        "target": {"soc": "Ascend310P1", "runtime": "raw_acl"},
+        "artifacts": {"model": {"path": "artifacts/model.om", "format": "om"}},
+        "execution": ["model"],
+        "bindings": {
+            "model": {
+                "inputs": [
+                    {"semantic": "features", "index": 0, "dtype": "float32", "shape": [1, 2]},
+                    {"semantic": "host.state_in", "index": 1, "dtype": "float32", "shape": [1, 4]},
+                ],
+                "outputs": [
+                    {"semantic": "scores", "index": 0, "dtype": "float32", "shape": [1, 2]},
+                    {"semantic": "host.state_out", "index": 1, "dtype": "float32", "shape": [1, 4]},
+                ],
+            }
+        },
+        "state_links": {
+            "model": [
+                {
+                    "input_semantic": "host.state_in",
+                    "output_semantic": "host.state_out",
+                    "initialization": "zero",
+                }
+            ]
+        },
+    }
+
+
+def test_state_links_pair_host_state_by_semantic() -> None:
+    deployment = CompiledDeployment.model_validate_json(json.dumps(_stateful_deployment()))
+
+    assert deployment.state_links == {
+        "model": (
+            StateLink(
+                input_semantic="host.state_in",
+                output_semantic="host.state_out",
+                initialization="zero",
+            ),
+        )
+    }
+
+
+def test_state_links_may_cover_only_stateful_execution_roles() -> None:
+    value = _stateful_deployment()
+    value["artifacts"]["stateless"] = {"path": "artifacts/stateless.om", "format": "om"}
+    value["execution"].append("stateless")
+    value["bindings"]["stateless"] = {
+        "inputs": [{"semantic": "host.derived", "index": 0, "dtype": "float32", "shape": [1, 2]}],
+        "outputs": [{"semantic": "host.result", "index": 0, "dtype": "float32", "shape": [1, 2]}],
+    }
+
+    deployment = CompiledDeployment.model_validate_json(json.dumps(value))
+
+    assert set(deployment.state_links) == {"model"}
+    assert deployment.execution == ("model", "stateless")
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected"),
+    [
+        (lambda value: value.update(state_links={}), "must be omitted instead of empty"),
+        (lambda value: value["state_links"].update(unknown=value["state_links"].pop("model")), "unknown execution"),
+        (
+            lambda value: value["state_links"]["model"][0].update(input_semantic="host.missing"),
+            "declared input/output semantics",
+        ),
+        (
+            lambda value: value["bindings"]["model"]["outputs"][1].update(shape=[1, 8]),
+            "changes dtype or shape",
+        ),
+        (
+            lambda value: value["state_links"]["model"].append(value["state_links"]["model"][0].copy()),
+            "reuse a state input or output",
+        ),
+        (
+            lambda value: value.update(
+                device_links=[
+                    {
+                        "semantic": "internal.state",
+                        "producer": "model",
+                        "consumer": "model",
+                        "transport": "device_pointer",
+                        "owner": "producer",
+                    }
+                ]
+            ),
+            "cannot be combined with device_links",
+        ),
+    ],
+)
+def test_state_links_reject_invalid_contracts(mutation, expected) -> None:
+    value = _stateful_deployment()
+    mutation(value)
+
+    with pytest.raises(Exception, match=expected):
+        CompiledDeployment.model_validate_json(json.dumps(value))
 
 
 def test_missing_manifest_fails_before_bundle_metadata_loading(tmp_path):

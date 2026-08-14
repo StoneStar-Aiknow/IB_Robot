@@ -107,7 +107,11 @@ class AscendOmModelSession(ModelSession):
             raise BackendLoadError("Ascend device_id does not match the session", code="deployment_context_mismatch")
         if any(deployment.artifacts[role].format != "om" for role in deployment.execution):
             raise BackendLoadError("Ascend execution artifacts must use format 'om'", code="invalid_artifact_format")
-        if not (deployment.target.runtime.startswith("acl") or deployment.target.runtime.startswith("ascend")):
+        if not (
+            deployment.target.runtime == "raw_acl"
+            or deployment.target.runtime.startswith("acl")
+            or deployment.target.runtime.startswith("ascend")
+        ):
             raise BackendLoadError(
                 f"Ascend target runtime {deployment.target.runtime!r} is not ACL-compatible",
                 code="incompatible_backend_target",
@@ -140,6 +144,25 @@ class AscendOmModelSession(ModelSession):
             models[role] = model
             model.load_descriptor()
         linked_inputs = {(link.consumer, link.semantic) for link in deployment.device_links}
+        self._prepare_models(deployment, models)
+        self._lease = lease
+        self._priority_streams = priority_streams
+        self._models = models
+        self._linked_inputs = frozenset(linked_inputs)
+        self._update_loaded_capabilities(
+            resettable=False,
+            stateful=False,
+            supports_attention=False,
+            priority_mapping=(
+                BackendPriorityMapping(tuple(range(priority_streams.level_count)))
+                if priority_streams is not None
+                else None
+            ),
+        )
+
+    def _prepare_models(self, deployment: CompiledDeployment, models: Mapping[str, AclModel]) -> None:
+        """Prepare role datasets after every model descriptor has been loaded."""
+
         for role in deployment.execution:
             input_overrides = {}
             for link in deployment.device_links:
@@ -166,20 +189,6 @@ class AscendOmModelSession(ModelSession):
                     )
                 input_overrides[int(consumer_binding.index)] = producer_buffer
             models[role].prepare_datasets(input_overrides=input_overrides)
-        self._lease = lease
-        self._priority_streams = priority_streams
-        self._models = models
-        self._linked_inputs = frozenset(linked_inputs)
-        self._update_loaded_capabilities(
-            resettable=False,
-            stateful=False,
-            supports_attention=False,
-            priority_mapping=(
-                BackendPriorityMapping(tuple(range(priority_streams.level_count)))
-                if priority_streams is not None
-                else None
-            ),
-        )
 
     def _execute(self, request: NamedTensorRequest) -> Mapping[str, object]:
         deployment = self._loaded_deployment()
@@ -409,3 +418,25 @@ class AscendOmModelSession(ModelSession):
                 code="invalid_device_link",
             )
         return matches[0]
+
+
+def build_ascend_model_session(context: RuntimeContext) -> AscendOmModelSession:
+    """Select the Ascend session execution mode from the deployment contract."""
+
+    deployment = context.deployment
+    if not isinstance(deployment, CompiledDeployment) or deployment.backend != "ascend":
+        raise BackendLoadError(
+            "Ascend session construction requires a compiled Ascend deployment", code="invalid_deployment"
+        )
+    device_id = context.runtime_options.get("device_id", 0)
+    if type(device_id) is not int or device_id < 0:
+        raise BackendLoadError("Ascend device_id must be a non-negative integer", code="invalid_runtime_options")
+    session_type = AscendOmModelSession
+    if deployment.state_links:
+        from inference_service.model_sessions.ascend_stateful import StatefulAscendOmModelSession
+
+        session_type = StatefulAscendOmModelSession
+    return session_type(
+        device_id=device_id,
+        priority_scheduling=context.priority_scheduling,
+    )

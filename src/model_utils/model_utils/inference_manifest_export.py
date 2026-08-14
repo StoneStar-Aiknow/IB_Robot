@@ -28,6 +28,7 @@ from inference_manifest import (
     Digest,
     InferenceManifest,
     ManifestBundle,
+    StateLink,
     TensorBinding,
     ValidatedManifest,
     canonical_bundle_digest,
@@ -333,6 +334,7 @@ def compiled_deployment(
     execution: Sequence[str],
     bindings: Mapping[str, ArtifactBindings],
     device_links: Sequence[DeviceLink] = (),
+    state_links: Mapping[str, Sequence[StateLink]] | None = None,
     artifact_share_groups: Mapping[str, str] | None = None,
 ) -> CompiledDeployment:
     """Build a typed compiled deployment from structural artifact descriptors."""
@@ -353,6 +355,7 @@ def compiled_deployment(
         execution=tuple(execution),
         bindings=dict(bindings),
         device_links=tuple(device_links),
+        state_links=None if state_links is None else {role: tuple(links) for role, links in state_links.items()},
     )
 
 

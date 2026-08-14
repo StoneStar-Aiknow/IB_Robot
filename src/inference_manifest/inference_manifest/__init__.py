@@ -69,6 +69,7 @@ from inference_manifest.models import (
     Revision,
     SemanticIdentity,
     SemanticTensor,
+    StateLink,
     TensorBinding,
     TorchDeployment,
 )
@@ -206,6 +207,7 @@ __all__ = [
     "SPEECH_DIRECTION_VAD_PROB_SEMANTIC",
     "SemanticIdentity",
     "SemanticTensor",
+    "StateLink",
     "TensorBinding",
     "TorchDeployment",
     "ValidatedManifest",
