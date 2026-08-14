@@ -72,11 +72,50 @@ Changing `nod_yes` implementation or manifest YAML requires `reload-catalog`, no
 
 ## Cancellation
 
-- For the currently running execute process, send SIGINT/SIGTERM and wait for its terminal JSONL `result`.
-- Outside that process, use `robot-skill cancel --task-id ID`, then wait for terminal task state.
-- For Agent plans, use `robot-skill cancel-plan --task-id ID`.
+Stop the right goal with the right command. The two executors are different actions; the wrong command cannot
+reach the active goal and will time out as `SKILL_CANCEL_TIMEOUT` while the robot keeps moving.
+
+- For an executing **Agent plan** (`execute-plan`): issue `robot-skill cancel-plan --task-id ID`, then wait for a
+  terminal `GoalStatus` ∈ {succeeded=4, canceled=5, aborted=6}. This is the only command that cancels the
+  `/embodied/execute_agent_plan` goal. **Never** use `cancel` for an Agent plan — it targets the wrong action.
+- `robot-skill cancel --task-id ID` cancels **only** a legacy single-skill `execute` goal
+  (`/embodied/execute_skill`). Do not use it for `execute-plan`.
+- Sending SIGINT/SIGTERM to the `execute-plan` process only kills the CLI; it does **not** reliably cancel the
+  Gateway goal. Always issue `cancel-plan` to actually stop an Agent plan.
 - **Cancellation requested is not robot stopped.** `SKILL_CANCEL_TIMEOUT`, transport failure, or an unknown result means
   the stop state is unknown; dispatch no further motion.
+
+## Interactive Closed Loop: 别动 / 继续
+
+Within one Hermes session the catalog query, plan/confirm/execute, stop, and continue steps form one closed loop.
+Drive them with the closed vocabulary only; free text outside the grammar never acts.
+
+1. **Discover (read-only).** `robot-skill status` then `robot-skill list-skills`. Do not plan or move.
+2. **Reject out-of-catalog.** Any requested `skill_name` not in the current `planner_visible_names` is refused with
+   `SKILL_REFERENCE_MISSING` before planning. Do not substitute or invent a skill.
+3. **Prepare + present + confirm in session.** `plan-workflow` once, show the ordered steps, plan digest, registry
+   identity, and a fresh task ID, then accept only the closed confirmation grammar
+   (`确认执行当前计划` / `确认` / `确认执行` / `执行吧` / `好` / `好的` / `可以` / `是的` / `confirm`).
+   Bind that single pending plan with `confirm-plan`. The session binds the sole unexpired pending plan; never accept a
+   pending ID from the user or model.
+4. **别动 → definite terminal.** On a stop phrase (`别动` / `停` / `停止` / `停下` / `stop` / `halt`), cancel the
+   active plan with `cancel-plan` and wait for a terminal `GoalStatus` ∈ {succeeded=4, canceled=5, aborted=6}. Only a
+   terminal result is a definite stopped state. `SKILL_CANCEL_TIMEOUT` or an unknown result means the stop state is
+   unknown — report uncertainty and send no further motion.
+5. **继续 → fresh-state continuation (breakpoint resume).** A continue phrase (`继续` / `继续吧` / `go on` / `continue`)
+   is a **new user request**, not a retry. It is permitted only after a definite terminal (succeeded / canceled /
+   aborted); `UNKNOWN` is refused and no motion is dispatched. Re-query `status` and `list-skills` on the fresh
+   registry identity. Then resume from the breakpoint: read the prior terminal's `completed_step_count`, slice the
+   original ordered steps to `original_steps[completed_step_count:]`, re-validate those remaining steps against the
+   fresh catalog, and run a brand-new `plan-workflow` + `confirm-plan` + `execute-plan` on **only the remaining steps**
+   with a **new `request_id` and `task_id`**. Fully-completed steps are skipped; the step that was interrupted
+   mid-execution is re-run from its start (never resumed mid-skill). Never reuse the prior `plan_token`,
+   `confirmation_token`, or `task_id`. If `completed_step_count` already equals the full step count, the plan is
+   already complete — do not plan again; ask the user for a new request.
+
+A reference implementation of this loop (catalog discovery, out-of-catalog rejection, in-session prepare/confirm,
+stop-to-definite-terminal, and fresh-state continuation) lives in
+`robot_skill_cli.interactive_control.InteractiveController` and is unit-tested without a ROS stack.
 
 ## Hard Boundaries
 
@@ -118,3 +157,5 @@ required workflow.
 | Treating accepted cancellation as physical stop | Wait for a terminal result or task ledger terminal state. |
 | Treating command approval as motion confirmation | Wait for an explicit response confirming the displayed plan. |
 | Retrying after checking idle | Require a new user request and repeat the entire workflow; never retry automatically. |
+| Continuing after an unknown stop | `继续` needs a definite terminal (4/5/6). Unknown stop → refuse continuation, send no motion. |
+| Re-running completed steps on `继续` | Resume from the breakpoint: plan only `original_steps[completed_step_count:]` with new IDs; skip fully-done steps, re-run the interrupted step from its start. |

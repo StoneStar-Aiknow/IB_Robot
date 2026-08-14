@@ -20,6 +20,7 @@ setup(
     entry_points={
         "console_scripts": [
             "robot-skill = robot_skill_cli.cli:main",
+            "robot-skill-closed-loop = robot_skill_cli.closed_loop_runner:main",
             "hermes-robot = robot_skill_cli.hermes_launcher:main",
         ]
     },

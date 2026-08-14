@@ -485,6 +485,13 @@ def _run_execute_plan(args: argparse.Namespace, context, bridge) -> _CommandExit
         raise _CommandError(
             "SERVER_UNAVAILABLE", "agent plan action server unavailable", exit_code=EXIT_ROS_UNAVAILABLE
         )
+    interrupted = {"signal": None}
+
+    def _handle_signal(signum, _frame) -> None:
+        interrupted["signal"] = signum
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
     goal_future = bridge.send_agent_plan_goal(
         plan_token=args.plan_token,
         confirmation_token=args.confirmation_token,
@@ -531,7 +538,31 @@ def _run_execute_plan(args: argparse.Namespace, context, bridge) -> _CommandExit
     result_future = goal_handle.get_result_async()
     deadline = time.monotonic() + timeout_sec + rpc_timeout
     while not result_future.done() and time.monotonic() < deadline:
+        if interrupted["signal"] is not None:
+            break
         time.sleep(0.02)
+    if interrupted["signal"] is not None:
+        terminal = _converge_unknown_agent_goal(bridge, task_id, rpc_timeout)
+        if terminal is not None:
+            data = dict(terminal["result"])
+            data.setdefault("error_code", "SKILL_CANCELLED")
+            data.setdefault("message", "task reached terminal after signal cancellation")
+            emit_result(data)
+            return _CommandExit(EXIT_SIGINT if interrupted["signal"] == signal.SIGINT else EXIT_SIGTERM)
+        data = {
+            "success": False,
+            "plan_id": "",
+            "plan_digest": "",
+            "workflow_digest": "",
+            "completed_step_count": 0,
+            "error_code": "SKILL_CANCEL_TIMEOUT",
+            "message": "robot stop state is unknown",
+            "actual_registry_epoch": "",
+            "actual_registry_generation": 0,
+            "actual_registry_digest": "",
+        }
+        emit_result(data)
+        return _CommandExit(EXIT_TIMEOUT)
     if not result_future.done() and not bridge.cancel_goal(goal_handle, result_future, timeout_sec=rpc_timeout):
         data = {
             "success": False,
