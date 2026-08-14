@@ -1068,6 +1068,9 @@ def _apply_approved_camera_calibration(robot_config: dict[str, Any]) -> None:
     artifact_path = Path(resolve_ros_path(artifact_value)).expanduser()
     if not artifact_path.is_file():
         logger.info("Approved camera calibration is not installed: %s", artifact_path)
+        for camera in robot_config.get("peripherals", []):
+            if camera.get("type") == "camera" and camera.get("skip_urdf_without_transform", False):
+                camera.pop("transform", None)
         return
     try:
         document = yaml.safe_load(artifact_path.read_bytes()) or {}

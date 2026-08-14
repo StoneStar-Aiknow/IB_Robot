@@ -3,6 +3,80 @@
 `semantic_mapping` 基于固定安装在底盘上的 D435 同步 RGB-D 数据构建独立、持久化的 3D 语义目标地图。它只依赖
 时间戳对应的 TF，不依赖 FAST-LIO、FAST-LIVO2 或其他 SLAM 的内部地图表示。
 
+## RGB-D LiDAR Dataset Capture
+
+联合采集使用独立 profile，不改变纯雷达 `lekiwi_lidar.yaml`：
+
+```bash
+ros2 launch robot_config robot.launch.py \
+  robot_config:=lekiwi_semantic_mapping
+```
+
+该 profile 直接启用 MID-360、FAST-LIO、slam_toolbox、D435i 和 continuous MCAP 录制，不需要额外选择
+navigation stage 或录制开关，也不支持 episodic 录制。
+
+在同一 ROS domain 的 PC 端启动低带宽 RViz 预览：
+
+```bash
+ros2 launch semantic_mapping lekiwi_semantic_mapping_rviz.launch.py
+```
+
+310P 在本地将 RealSense RGB 压缩为 8 FPS、JPEG quality 70，并将 MID-360 registered cloud 限制为每帧
+6000 点；PC 只订阅 `/semantic_mapping/preview/*`。RViz 不订阅 raw RGB、depth 或完整 registered cloud。
+
+完成同一条建图轨迹后，在 launch 仍运行时执行一个保存命令：
+
+```bash
+ros2 run semantic_mapping save_semantic_map
+```
+
+该命令停止 recorder、保存当前 slam_toolbox 地图、执行 MCAP reindex、生成标定快照和根目录元数据、
+校验 `SHA256SUMS` 与离线 RGB-D/历史 TF，最后以 gzip level 1 流式创建同名 `.tar.gz`。压缩过程不会先生成
+同尺寸的临时 `.tar`；任一步失败都会返回非零状态。
+
+recorder 在 rosbag 启动前固定 MID-360 mount YAML 和当时存在的 approved camera artifact 字节与 SHA-256；
+finalizer 只读取这些 pinned bytes，不会重新读取可能已被替换的 `current/` 源文件。camera artifact 缺失时仍生成
+bag、manifest、checksum 和压缩归档，但状态明确为 `calibration_incomplete`，且该 profile 不发布零值
+`base_link -> camera` 替代 TF。
+
+输出位于 `SESSION_ROOT` 指向的目录：
+
+```text
+bag/*.mcap
+bag/metadata.yaml
+bag/calibration_snapshot.json
+map/map.yaml
+map/map.pgm
+manifest.json
+SHA256SUMS
+README.md
+```
+
+20 秒静止烟测只验证工程闭环，不评价地图质量：
+
+```bash
+# Terminal A: leave this launch running for the map save service.
+ros2 launch robot_config robot.launch.py \
+  robot_config:=lekiwi_semantic_mapping
+
+# Terminal B: wait about 20 seconds, then save and validate everything.
+sleep 20
+ros2 run semantic_mapping save_semantic_map
+```
+
+如果静止场景无法产生可保存地图，应保持 launch 运行并在 slam_toolbox 保存服务成功后再执行同一收尾命令；
+收尾流程只验证地图文件存在，不评价地图覆盖质量。烟测不运行任何语义模型。
+
+reindex 后的 `metadata.yaml` 是 topic/type/count 的唯一事实源。LiDAR、IMU、FAST-LIO raw/filtered odometry、
+registered cloud、scan、map、RGB、raw/aligned depth、三路 CameraInfo、`/tf` 和 `/tf_static` 必须类型匹配且非零。
+当前 mapping profile 禁止 cmd bridge 发布另一套 wheel odometry，且 20 秒静止烟测可以没有操作员命令，因此
+`/wheel/odom` 和 `/cmd_vel` 只做 reported/optional，不会造成无害的静止烟测失败；`/diagnostics` 不录制也不检查。
+metadata 有 per-file 时间时，顶层 start/duration 必须覆盖所有 split；旧 Humble metadata 没有 per-file 时间时只记录
+coverage unavailable。
+
+保存命令在同一个同步 RGB 时间戳验证 `map -> camera frame` 和 `map -> base_link`。若 snapshot 为
+`calibration_incomplete`，数据产物仍会保留用于诊断，但保存命令返回失败，不把它报告为可用语义地图。
+
 ## Data Flow
 
 1. 使用 `ApproximateTimeSynchronizer` 同步彩色图、对齐深度图和 `CameraInfo`。

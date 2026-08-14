@@ -114,6 +114,7 @@ from robot_config.launch_builders.perception_models import generate_perception_m
 from robot_config.launch_builders.recording import (
     generate_recording_nodes,
     generate_rerun_viewer_node,
+    resolve_recording_launch,
 )
 from robot_config.launch_builders.sim_backend import get_backend_caps, get_sim_backend
 from robot_config.launch_builders.teleop import generate_teleop_nodes
@@ -786,15 +787,17 @@ def launch_setup(context, *args, **kwargs):
         logger.error(f"generating required task executor: {e}")
         raise RuntimeError("MoveIt task executor setup failed; refusing to start an incomplete motion stack") from e
 
-    # ========== 12. Automatic Recording (if record:=true) ==========
+    # ========== 12. Automatic Recording ==========
     try:
         record_str = context.launch_configurations.get("record", "false")
-        record_enabled = parse_bool(record_str, default=False)
+        record_mode = context.launch_configurations.get("record_mode", "continuous")
+        record_enabled, record_mode = resolve_recording_launch(
+            robot_config,
+            requested=parse_bool(record_str, default=False),
+            mode=record_mode,
+        )
 
         if record_enabled:
-            # Get recording mode (continuous or episodic)
-            record_mode = context.launch_configurations.get("record_mode", "continuous")
-
             logger.info(f"========== Setting up Recording (mode: {record_mode}) ==========")
 
             # Generate recording nodes using the recording builder
@@ -810,7 +813,10 @@ def launch_setup(context, *args, **kwargs):
             logger.info(f"Recording disabled (record:={record_str})")
     except Exception as e:
         logger.error(f"setting up recording: {e}")
-        logger.info("Continuing without recording...")
+        if robot_config.get("recording", {}).get("semantic_dataset", False):
+            actions.append(EmitEvent(event=Shutdown(reason=f"semantic dataset recording setup failed: {e}")))
+        else:
+            logger.info("Continuing without recording...")
 
     # ========== 12. Recording Visualizer (optional rerun sidecar) ==========
     try:

@@ -185,6 +185,11 @@ def generate_camera_nodes(robot_config, use_sim=False):
                 "unite_imu_method": 0,
             }
 
+            if "color_format" in periph:
+                driver_params["rgb_camera.color_format"] = periph["color_format"]
+            if "depth_format" in periph:
+                driver_params["depth_module.depth_format"] = periph["depth_format"]
+
             if "depth_width" in periph:
                 depth_w = periph["depth_width"]
                 depth_h = periph["depth_height"]
@@ -195,17 +200,16 @@ def generate_camera_nodes(robot_config, use_sim=False):
 
             logger.info(f"  RealSense driver params: {driver_params}")
 
-            depth_source_topic = (
-                f"{driver_topic_prefix}/aligned_depth_to_color/image_raw"
-                if align_depth
-                else f"{driver_topic_prefix}/depth/image_rect_raw"
+            raw_depth_source_topic = f"{driver_topic_prefix}/depth/image_rect_raw"
+            aligned_depth_source_topic = (
+                f"{driver_topic_prefix}/aligned_depth_to_color/image_raw" if align_depth else raw_depth_source_topic
             )
-            depth_target_topic = (
+            aligned_depth_target_topic = (
                 f"/camera/{name}/aligned_depth_to_color/image_raw"
                 if align_depth
                 else f"/camera/{name}/depth/image_rect_raw"
             )
-            depth_camera_info_source_topic = (
+            aligned_camera_info_source_topic = (
                 f"{driver_topic_prefix}/aligned_depth_to_color/camera_info"
                 if align_depth
                 else f"{driver_topic_prefix}/depth/camera_info"
@@ -219,9 +223,11 @@ def generate_camera_nodes(robot_config, use_sim=False):
                 driver_remappings.extend(
                     [
                         (f"{driver_topic_prefix}/color/image_raw", f"/camera/{name}/image_raw"),
-                        (depth_source_topic, depth_target_topic),
+                        (raw_depth_source_topic, f"/camera/{name}/depth/image_rect_raw"),
                     ]
                 )
+                if align_depth:
+                    driver_remappings.append((aligned_depth_source_topic, aligned_depth_target_topic))
                 if "pointcloud" in streams:
                     driver_remappings.append(
                         (
@@ -256,17 +262,23 @@ def generate_camera_nodes(robot_config, use_sim=False):
                     periph.get("optical_frame_id"),
                 ),
                 (
-                    depth_camera_info_source_topic,
-                    (
-                        f"/camera/{name}/aligned_depth_to_color/camera_info"
-                        if align_depth
-                        else f"/camera/{name}/depth/camera_info"
-                    ),
-                    f"{name}_{'aligned_depth_' if align_depth else 'depth_'}camera_info_relay",
+                    f"{driver_topic_prefix}/depth/camera_info",
+                    f"/camera/{name}/depth/camera_info",
+                    f"{name}_depth_camera_info_relay",
                     "sensor_msgs/msg/CameraInfo",
                     periph.get("optical_frame_id"),
                 ),
             ]
+            if align_depth:
+                relay_topics.append(
+                    (
+                        aligned_camera_info_source_topic,
+                        f"/camera/{name}/aligned_depth_to_color/camera_info",
+                        f"{name}_aligned_depth_camera_info_relay",
+                        "sensor_msgs/msg/CameraInfo",
+                        periph.get("optical_frame_id"),
+                    )
+                )
             if not direct_topic_remap:
                 relay_topics.extend(
                     [
@@ -278,7 +290,7 @@ def generate_camera_nodes(robot_config, use_sim=False):
                             periph.get("optical_frame_id"),
                         ),
                         (
-                            depth_source_topic,
+                            raw_depth_source_topic,
                             f"/camera/{name}/depth/image_rect_raw",
                             f"{name}_depth_image_relay",
                             "sensor_msgs/msg/Image",
@@ -289,8 +301,8 @@ def generate_camera_nodes(robot_config, use_sim=False):
                 if align_depth:
                     relay_topics.append(
                         (
-                            depth_source_topic,
-                            depth_target_topic,
+                            aligned_depth_source_topic,
+                            aligned_depth_target_topic,
                             f"{name}_aligned_depth_image_relay",
                             "sensor_msgs/msg/Image",
                             periph.get("optical_frame_id"),
@@ -307,6 +319,8 @@ def generate_camera_nodes(robot_config, use_sim=False):
                     )
                 )
             for source_topic, target_topic, relay_name, message_type, target_frame_id in relay_topics:
+                if source_topic == target_topic:
+                    continue
                 relay_args = [source_topic, target_topic, message_type]
                 if target_frame_id:
                     relay_args.append(target_frame_id)

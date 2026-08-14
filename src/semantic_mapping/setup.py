@@ -12,12 +12,13 @@ setup(
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
         ("share/" + package_name + "/launch", glob("launch/*.launch.py")),
+        ("share/" + package_name + "/rviz", glob("rviz/*.rviz")),
         (
             "share/" + package_name + "/scripts",
             ["scripts/publish_rgbd_fixture.py", "scripts/verify_rgbd_fixture.py"],
         ),
     ],
-    install_requires=["setuptools"],
+    install_requires=["setuptools", "pyyaml"],
     zip_safe=True,
     maintainer="IB-Robot Developers",
     maintainer_email="dev@openeuler.org",
@@ -29,6 +30,7 @@ setup(
             "offline_mapping_node = semantic_mapping.offline_mapping_node:main",
             "semantic_map_migrate = semantic_mapping.migrate_database:main",
             "semantic_map_render_labels = semantic_mapping.final_label_visualization:main",
+            "save_semantic_map = semantic_mapping.dataset_capture:main",
         ],
     },
 )

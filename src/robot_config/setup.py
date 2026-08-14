@@ -48,6 +48,7 @@ setup(
             "wait_for_controllers = robot_config.wait_for_controllers:main",
             "controller_spawner = robot_config.controller_spawner:main",
             "topic_relay = robot_config.topic_relay:main",
+            "semantic_mapping_recorder = robot_config.semantic_mapping_recorder:main",
         ],
     },
 )

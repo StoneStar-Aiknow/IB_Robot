@@ -303,7 +303,7 @@ def test_realsense_camera_topics_are_remapped_to_robot_config_contract_names():
         "/camera/wrist/camera_info",
     ) in relay_pairs
     assert (
-        "/camera/wrist_camera/aligned_depth_to_color/image_raw",
+        "/camera/wrist_camera/depth/image_rect_raw",
         "/camera/wrist/depth/image_rect_raw",
     ) in relay_pairs
     assert (
@@ -344,6 +344,7 @@ def test_realsense_direct_topic_remap_avoids_large_payload_relays():
     driver = next(node for node in nodes if getattr(node, "_Node__package", None) == "realsense2_camera")
     assert _node_remappings(driver) == [
         ("/camera/wrist_camera/color/image_raw", "/camera/wrist/image_raw"),
+        ("/camera/wrist_camera/depth/image_rect_raw", "/camera/wrist/depth/image_rect_raw"),
         (
             "/camera/wrist_camera/aligned_depth_to_color/image_raw",
             "/camera/wrist/aligned_depth_to_color/image_raw",
@@ -352,6 +353,7 @@ def test_realsense_direct_topic_remap_avoids_large_payload_relays():
     relay_pairs = _relay_targets(nodes)
     assert relay_pairs == [
         ("/camera/wrist_camera/color/camera_info", "/camera/wrist/camera_info"),
+        ("/camera/wrist_camera/depth/camera_info", "/camera/wrist/depth/camera_info"),
         (
             "/camera/wrist_camera/aligned_depth_to_color/camera_info",
             "/camera/wrist/aligned_depth_to_color/camera_info",
