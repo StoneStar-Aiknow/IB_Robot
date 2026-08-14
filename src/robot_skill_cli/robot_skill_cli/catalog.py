@@ -117,16 +117,30 @@ def compile_local_snapshot(robot_config: dict[str, Any], config_path: Path):
         source = DirectoryReleaseSkillSource(source_root)
     else:
         source = AmentShareSkillSource()
-    grasp_execution = robot_config.get("grasp_execution", {})
-    endpoint = grasp_execution.get("action_name", "/manipulation/execute_pick")
+    # Keep the ROS-independent CLI catalog context aligned with the runtime
+    # SkillExecutorNode.  Delegated executors are selected by the enabled
+    # execution configuration, not by one particular profile name; otherwise
+    # the PC grasp profile cannot validate its own ``grasp_pipeline`` entry.
     delegated = {}
-    if embodied.get("skill_catalog_profile") == "so101_handeye_realsense_grasp":
+    grasp_execution = robot_config.get("grasp_execution", {})
+    if grasp_execution.get("enabled", False):
         descriptor = DelegatedExecutorDescriptor(
             **delegated_executor_identity(
                 name="grasp_pipeline",
-                endpoint_name=endpoint,
+                endpoint_name=grasp_execution.get("action_name", "/manipulation/execute_pick"),
                 configuration=grasp_execution,
                 **load_delegated_model_identity(grasp_execution),
+            )
+        )
+        delegated[descriptor.name] = descriptor
+
+    placement_execution = robot_config.get("placement_execution", {})
+    if placement_execution.get("enabled", False):
+        descriptor = DelegatedExecutorDescriptor(
+            **delegated_executor_identity(
+                name="placement_pipeline",
+                endpoint_name=placement_execution.get("action_name", "/manipulation/execute_place"),
+                configuration=placement_execution,
             )
         )
         delegated[descriptor.name] = descriptor

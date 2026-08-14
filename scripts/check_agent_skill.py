@@ -45,6 +45,20 @@ REQUIRED_RULES = {
     "on any nonzero exit, report the exact cli error and stop": "missing truthful nonzero-exit reporting rule",
     "call `plan-workflow` exactly once with the user's original wording": "missing single-attempt workflow planning rule",
     "do not retry alternate phrasings": "missing prohibition: alternate workflow paraphrase retries",
+    "skill arguments are top-level fields": "missing flat WorkflowStep argument rule",
+    "by default, omit `--timeout-sec` from both commands": "missing default task-budget omission rule",
+    "do not derive a plan budget from `default_skill_timeout_sec`": "missing skill-timeout/budget distinction rule",
+    "issue another `robot-skill` command in the same user request": (
+        "missing prohibition: follow-up robot-skill command after nonzero exit"
+    ),
+    "construct request ids and task ids directly in the conversation and `robot-skill` arguments": (
+        "missing direct request/task ID construction rule"
+    ),
+    "must not call python, `uuidgen`, `date`, a shell, or another helper tool to generate request/task ids": (
+        "missing prohibition: helper command ID generation"
+    ),
+    "command approval, including session-wide approval": "missing command-approval distinction rule",
+    "is not user motion confirmation": "missing prohibition: command approval as motion confirmation",
 }
 
 

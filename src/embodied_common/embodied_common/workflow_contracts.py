@@ -15,6 +15,7 @@ class CanonicalWorkflowStep:
     schema_version: int
     skill_name: str
     target_name: str = ""
+    container_name: str = ""
     place_name: str = ""
     motion_direction: str = ""
     motion_distance: float = 0.0
@@ -25,7 +26,7 @@ class CanonicalWorkflowStep:
             raise ValueError("WorkflowStep.schema_version must be 1")
         if not self.skill_name.strip():
             raise ValueError("WorkflowStep.skill_name must be non-empty")
-        for field_name in ("target_name", "place_name", "motion_direction"):
+        for field_name in ("target_name", "container_name", "place_name", "motion_direction"):
             if not isinstance(getattr(self, field_name), str):
                 raise TypeError(f"WorkflowStep.{field_name} must be a string")
         for field_name in ("motion_distance", "timeout_sec"):
@@ -40,6 +41,7 @@ class CanonicalWorkflowStep:
             "schema_version": 1,
             "skill_name": self.skill_name.strip(),
             "target_name": self.target_name.strip(),
+            "container_name": self.container_name.strip(),
             "place_name": self.place_name.strip(),
             "motion_direction": self.motion_direction.strip().lower(),
             "motion_distance": _finite_float(self.motion_distance),
@@ -59,6 +61,7 @@ def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
                 "schema_version",
                 "skill_name",
                 "target_name",
+                "container_name",
                 "place_name",
                 "motion_direction",
                 "motion_distance",
@@ -69,6 +72,7 @@ def normalize_workflow_step(step: Any) -> CanonicalWorkflowStep:
         schema_version=int(values.get("schema_version", 0)),
         skill_name=str(values.get("skill_name", "")),
         target_name=str(values.get("target_name", "")),
+        container_name=str(values.get("container_name", "")),
         place_name=str(values.get("place_name", "")),
         motion_direction=str(values.get("motion_direction", "")),
         motion_distance=_finite_float(values.get("motion_distance", 0.0)),

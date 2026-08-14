@@ -302,6 +302,7 @@ class SafetyGuardNode(Node):
                 skill_templates,
                 robot_context.get("arm_joint_names", []),
                 robot_context.get("joint_limits", {}),
+                container_name=request.container_name,
             )
         except Exception as exc:
             self.get_logger().error(f"[safety_guard] uncaught exception in skill validation: {exc}")
@@ -320,6 +321,7 @@ class SafetyGuardNode(Node):
             self.get_logger().info(
                 "[embodied-debug] safety_guard skill_check "
                 f"skill={request.skill_name} target={request.target_name or '-'} "
+                f"container={request.container_name or '-'} "
                 f"place={request.place_name or '-'} motion_direction={request.motion_direction or '-'} "
                 f"motion_distance={request.motion_distance:.3f} allowed={allowed} reason='{reason}'"
             )

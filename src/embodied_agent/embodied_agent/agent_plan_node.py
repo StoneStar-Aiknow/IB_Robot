@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import struct
 import time
+import traceback
 from collections.abc import Sequence
 from contextlib import suppress
 from threading import RLock
@@ -259,6 +260,12 @@ class AgentPlanNode(Node):
         diagnostic.message = message
         return diagnostic
 
+    def _log_unexpected_service_error(self, operation: str, exc: Exception) -> None:
+        self.get_logger().error(
+            f"[agent_plan] unexpected {operation} failure; keeping plan services available: {exc}\n"
+            f"{traceback.format_exc()}"
+        )
+
     @staticmethod
     def _copy_diagnostics(diagnostics: Sequence[SkillDiagnostic]) -> list[SkillDiagnostic]:
         return list(diagnostics)
@@ -288,6 +295,7 @@ class AgentPlanNode(Node):
         return workflow_step(
             skill_name=step.skill_name,
             target_name=step.target_name,
+            container_name=step.container_name,
             place_name=step.place_name,
             motion_direction=step.motion_direction,
             motion_distance=step.motion_distance,
@@ -302,6 +310,7 @@ class AgentPlanNode(Node):
                     schema_version=1,
                     skill_name=step.skill_name,
                     target_name=step.target_name,
+                    container_name=step.container_name,
                     place_name=step.place_name,
                     motion_direction=step.motion_direction.strip().lower(),
                     motion_distance=self._float32(step.motion_distance),
@@ -348,6 +357,12 @@ class AgentPlanNode(Node):
             response.error_code = exc.code
             response.message = str(exc)
             response.diagnostics = [self._diagnostic(exc.code, str(exc))]
+        except Exception as exc:
+            self._log_unexpected_service_error("plan", exc)
+            response.success = False
+            response.error_code = "CAPABILITY_NOT_READY"
+            response.message = "agent plan service is temporarily unavailable"
+            response.diagnostics = [self._diagnostic(response.error_code, response.message)]
         return response
 
     def _validate_step(self, plan: AgentPlan, step: CanonicalWorkflowStep):
@@ -358,6 +373,7 @@ class AgentPlanNode(Node):
         request.dispatch_binding.expected_registry_digest = plan.registry_digest
         request.skill_name = step.skill_name
         request.target_name = step.target_name
+        request.container_name = step.container_name
         request.place_name = step.place_name
         request.motion_direction = step.motion_direction
         request.motion_distance = step.motion_distance
@@ -413,6 +429,12 @@ class AgentPlanNode(Node):
             response.error_code = exc.code
             response.message = str(exc)
             response.diagnostics = [self._diagnostic(exc.code, str(exc))]
+        except Exception as exc:
+            self._log_unexpected_service_error("validation", exc)
+            response.allowed = False
+            response.error_code = "CAPABILITY_NOT_READY"
+            response.message = "agent plan validation is temporarily unavailable"
+            response.diagnostics = [self._diagnostic(response.error_code, response.message)]
         return response
 
     def _confirm_plan(self, request, response):
@@ -451,6 +473,12 @@ class AgentPlanNode(Node):
             response.error_code = exc.code
             response.message = str(exc)
             response.diagnostics = [self._diagnostic(exc.code, str(exc))]
+        except Exception as exc:
+            self._log_unexpected_service_error("confirmation", exc)
+            response.confirmed = False
+            response.error_code = "CAPABILITY_NOT_READY"
+            response.message = "agent plan confirmation is temporarily unavailable"
+            response.diagnostics = [self._diagnostic(response.error_code, response.message)]
         return response
 
     def _root_binding(self, plan: AgentPlan, task_id: str, execution):
@@ -488,6 +516,7 @@ class AgentPlanNode(Node):
         goal.dispatch_binding = binding
         goal.skill_name = step.skill_name
         goal.target_name = step.target_name
+        goal.container_name = step.container_name
         goal.place_name = step.place_name
         goal.motion_direction = step.motion_direction
         goal.motion_distance = step.motion_distance
@@ -751,7 +780,14 @@ def main(args=None) -> None:
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
-        executor.spin()
+        while rclpy.ok():
+            try:
+                executor.spin_once()
+            except Exception as exc:
+                node.get_logger().error(
+                    "[agent_plan] executor callback failed; keeping plan services available: "
+                    f"{exc}\n{traceback.format_exc()}"
+                )
     finally:
         executor.shutdown()
         node.destroy_node()

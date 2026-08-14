@@ -71,6 +71,7 @@ SO101 当前配置示例：
 | 夹爪 | `open_gripper_skill`、`close_gripper_skill` |
 | 社交与娱乐 | `dance_basic`、`wave_hello`、`nod_yes`、`shake_no`、`celebrate`、`greet_observe_raise`、`act_cute`、`happy_spin_upright` |
 | 抓取 | `pick_object`（仅抓取配置，要求显式传入 `target_name`） |
+| 抓取与放置 | `pick_object`、`place_in_container`（固定位置释放，要求显式传入 `target_name` 和 `container_name` 做验证） |
 
 ## 3. 当前支持的 primitive
 
@@ -120,6 +121,13 @@ SO101 当前配置示例：
 `/manipulation/execute_pick`。GraspGen 在运行时生成动态 6-DOF 候选，执行器再通过安全 primitive
 完成 approach、补偿下降、夹爪闭合和 lift。
 
+`place_in_container` 同样只允许从 `/embodied/execute_skill` 进入。Gateway
+将完整 `DispatchBinding` 和 `placement_pipeline` identity 传给
+`/manipulation/execute_place`；放置执行器再把相同 binding 传给受保护的
+`move_to_joint_positions`/`open_gripper` primitive。放置阶段先在 3 号电机 raw 1500 开爪，再移动到 raw 1600
+验证，最后返回 raw 1500；视觉验证失败或不确定时，
+结果会明确保留“已释放/释放状态未知”，不会把它误报为普通未执行失败。
+
 ## 5. 直接控制机械臂的几种用法
 
 ### 5.1 直接发技能 action
@@ -148,6 +156,7 @@ exact identity，再构造 direct root binding（`task_id == root_task_id`、零
 | `dispatch_binding.expected_registry_epoch/generation/digest` | exact snapshot identity |
 | `skill_name` | 技能名，如 `pick_object` |
 | `target_name` | 目标引用；对 `pick_object` 表示运行时视觉文本查询，如 `banana` |
+| `container_name` | 对 `place_in_container` 表示释放后用于视觉验收的容器文本查询，如 `black bowl`；不改变放置轨迹 |
 | `place_name` | 命名放置位，如 `tray_right` |
 | `motion_direction` | 相对运动方向 |
 | `motion_distance` | 相对运动距离 |
@@ -447,7 +456,9 @@ terminal record。
 传给 delegated executor。delegated server 在 goal acceptance 时校验 `dispatch_binding.schema_version=1`、
 非空 `task_id`/`root_task_id`、完整期望 identity、`task_budget.schema_version=1`、deadline 未过期且
 `timeout_sec` 不超过剩余 budget；执行时用 `min(timeout_sec, deadline - now)` 作为实际预算，预算已过期
-返回 `TASK_TIMEOUT` 并 abort。详见 `manipulation_execution` README。
+返回 `TASK_TIMEOUT` 并 abort。Hermes/catalog goal 的 `supervised_direct` 固定为 `false` 且必须有非空
+delegated nonce；只有人工 bring-up client 可使用 `supervised_direct=true` 和空 nonce。详见
+`manipulation_execution` README。
 
 ## 9. 主要参数
 

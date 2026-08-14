@@ -24,6 +24,11 @@ SKILL_TEMPLATES = {
         "required_args": ["target_name"],
         "timeout_sec": 180.0,
     },
+    "place_in_container": {
+        "executor": "placement_pipeline",
+        "required_args": ["target_name", "container_name"],
+        "timeout_sec": 120.0,
+    },
     "move_relative_ee": {
         "primitive_sequence": [
             {
@@ -124,6 +129,58 @@ def test_validate_pick_object_accepts_runtime_target_query():
     )
     assert allowed
     assert reason == ""
+
+
+def test_validate_place_in_container_accepts_runtime_target_query():
+    allowed, reason = validate_skill_request(
+        "place_in_container",
+        "marker",
+        "",
+        "",
+        0.0,
+        {},
+        {},
+        SKILL_TEMPLATES,
+        container_name="black bowl",
+    )
+    assert allowed
+    assert reason == ""
+
+
+def test_validate_place_in_container_requires_container_query():
+    allowed, reason = validate_skill_request(
+        "place_in_container",
+        "marker",
+        "",
+        "",
+        0.0,
+        {},
+        {},
+        SKILL_TEMPLATES,
+    )
+
+    assert not allowed
+    assert reason == "container_name is required"
+
+
+def test_validate_skill_rejects_unknown_delegated_executor():
+    allowed, reason = validate_skill_request(
+        "unknown_delegated_skill",
+        "marker",
+        "",
+        "",
+        0.0,
+        {},
+        {},
+        {
+            "unknown_delegated_skill": {
+                "executor": "unknown_pipeline",
+                "required_args": ["target_name"],
+            }
+        },
+    )
+    assert not allowed
+    assert reason == "unsupported skill executor: unknown_pipeline"
 
 
 def test_validate_skill_uses_default_templates_without_override():

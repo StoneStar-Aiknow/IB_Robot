@@ -170,12 +170,20 @@ pipeline 时显式授权。未授权状态下仍可使用 catalog、`status` 和
 
 ```bash
 hermes-robot --config-name so101_single_arm
+hermes-robot --config-name so101_handeye_realsense_grasp -- --cli
+hermes-robot --config-name so101_handeye_realsense_grasp_pc -- --cli
 ```
 
 启动器要求 Hermes Agent `0.16.0` 或更新版本，并在启动前验证 `hermes`、`robot-skill`、安装空间中的
 `ibrobot-control`、目标 robot config、Gateway control-plane status 以及全部 Agent plan service/action。
+启动时会将安装空间中的 `ibrobot-control` 幂等注册到当前 Hermes profile 的 `skills/` 目录；仅更新带有
+`robot_skill_cli` 所有权标记的副本，遇到同名的用户自管 skill 时会以 `AGENT_SKILL_CONFLICT` 退出。
 `motion_authorized=false` 不阻止 Hermes 启动，只会继续由 Gateway 拒绝运动。启动器仅设置精确
 `ROBOT_CONFIG` 并预加载 `ibrobot-control`；它不会启动/重启 pipeline、修改 ROS 参数或开启运动授权。
+进入 Hermes 会话后只调用启动器注入到 `PATH` 的 `robot-skill`，不得再传 `--config-name` 或
+`--config-path`。自然语言抓取与其他 motion Skill 使用同一套
+`status -> list-skills -> plan-workflow -> describe -> validate-plan -> confirm-plan -> execute-plan` 生命周期；
+抓取计划使用 `pick_object` 和必填的 `target_name`，Gateway 再将其委派给配置绑定的 `grasp_pipeline`。
 
 SO-101 真机的完整手动验证步骤见
 [`docs/hermes_so101_real_robot_manual_validation_zh.md`](../../docs/hermes_so101_real_robot_manual_validation_zh.md)。

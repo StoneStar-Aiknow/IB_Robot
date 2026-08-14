@@ -58,6 +58,21 @@ def test_load_catalog_uses_exported_config_resolver(monkeypatch):
     assert view["robot_name"] == "so101_single_arm"
 
 
+def test_pc_grasp_catalog_registers_enabled_delegated_executors(monkeypatch):
+    from robot_skill_cli.catalog import load_capability_catalog
+
+    pc_config = CONFIG_PATH.parents[2] / "config" / "robots" / "so101_handeye_realsense_grasp_pc.yaml"
+    monkeypatch.setenv("WORKSPACE", str(pc_config.parents[4]))
+
+    view = load_capability_catalog(config_path=pc_config)
+
+    assert view["robot_name"] == "so101_handeye_realsense_grasp_pc"
+    assert load_robot_config_dict(pc_config)["embodied"]["skill_catalog_profile"] == (
+        "so101_handeye_realsense_grasp_pc"
+    )
+    assert {skill["name"] for skill in view["skills"]} >= {"pick_object", "place_in_container"}
+
+
 def test_list_skills_uses_every_profile_enabled_entry_and_only_public_fields():
     from robot_skill_cli.catalog import list_skills, load_capability_catalog
 
@@ -336,6 +351,7 @@ def test_schema_allows_omitted_optional_declared_parameter():
     }
     args = argparse.Namespace(
         target_name=None,
+        container_name=None,
         place_name=None,
         motion_direction="forward",
         motion_distance=None,
@@ -359,6 +375,7 @@ def test_schema_rejects_omitted_declared_required_parameter():
     }
     args = argparse.Namespace(
         target_name=None,
+        container_name=None,
         place_name=None,
         motion_direction=None,
         motion_distance=None,
@@ -382,6 +399,7 @@ def test_schema_validates_supplied_optional_parameter():
     }
     args = argparse.Namespace(
         target_name=None,
+        container_name=None,
         place_name=None,
         motion_direction=None,
         motion_distance=0.0,

@@ -29,6 +29,7 @@ def test_canonical_skill_payload_normalizes_strings_and_uses_default_timeout():
     assert omitted_timeout == {
         "skill_name": "move_relative_ee",
         "target_name": "cup",
+        "container_name": "",
         "place_name": "tray",
         "motion_direction": "left",
         "motion_distance": 0.25,
@@ -43,6 +44,7 @@ def test_canonical_skill_payload_has_exact_fields_and_normalizes_negative_zero()
     assert list(payload) == [
         "skill_name",
         "target_name",
+        "container_name",
         "place_name",
         "motion_direction",
         "motion_distance",

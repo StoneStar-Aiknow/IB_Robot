@@ -4,7 +4,7 @@ import math
 from typing import Any
 
 from embodied_common.json_utils import load_json_mapping
-from embodied_common.skill_templates import SUPPORTED_PRIMITIVES, get_skill_templates
+from embodied_common.skill_templates import SUPPORTED_PRIMITIVES, SUPPORTED_SKILL_EXECUTORS, get_skill_templates
 
 __all__ = [
     "SUPPORTED_PRIMITIVES",
@@ -122,6 +122,7 @@ def validate_skill_request(
     skill_templates: dict[str, Any] | None = None,
     arm_joint_names: list[str] | None = None,
     joint_limits: dict[str, Any] | None = None,
+    container_name: str = "",
 ) -> tuple[bool, str]:
     templates = get_skill_templates(skill_templates)
     template = templates.get(skill_name)
@@ -130,15 +131,19 @@ def validate_skill_request(
 
     executor_name = str(template.get("executor", "")).strip()
     if executor_name:
-        if executor_name != "grasp_pipeline":
+        if executor_name not in SUPPORTED_SKILL_EXECUTORS:
             return False, f"unsupported skill executor: {executor_name}"
         required_args = template.get("required_args", [])
         if "target_name" in required_args and not target_name.strip():
             return False, "target_name is required"
+        if "container_name" in required_args and not container_name.strip():
+            return False, "container_name is required"
+        if container_name and "container_name" not in required_args:
+            return False, f"container_name is not accepted by {skill_name}"
         if place_name:
-            return False, "place_name is not accepted by pick_object"
+            return False, f"place_name is not accepted by {skill_name}"
         if motion_direction or motion_distance:
-            return False, "motion parameters are not accepted by pick_object"
+            return False, f"motion parameters are not accepted by {skill_name}"
         return True, ""
 
     primitive_sequence = template.get("primitive_sequence", [])

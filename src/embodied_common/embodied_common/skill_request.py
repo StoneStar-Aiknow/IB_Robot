@@ -49,6 +49,7 @@ def _finite_float(value: Any, field_name: str, *, positive: bool, float32: bool 
 def canonical_skill_payload(
     skill_name: Any,
     target_name: Any = None,
+    container_name: Any = None,
     place_name: Any = None,
     motion_direction: Any = None,
     motion_distance: Any = None,
@@ -65,6 +66,7 @@ def canonical_skill_payload(
     return {
         "skill_name": _normalized_string(skill_name, "skill_name", required=True),
         "target_name": _normalized_string(target_name, "target_name"),
+        "container_name": _normalized_string(container_name, "container_name"),
         "place_name": _normalized_string(place_name, "place_name"),
         "motion_direction": _normalized_string(motion_direction, "motion_direction", lowercase=True),
         "motion_distance": normalized_distance,

@@ -132,6 +132,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _add_skill_parameters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--target-name")
+    parser.add_argument("--container-name")
     parser.add_argument("--place-name")
     parser.add_argument("--motion-direction")
     parser.add_argument("--motion-distance", type=float)
@@ -172,6 +173,7 @@ def _validate_schema(skill: dict[str, Any], args: argparse.Namespace) -> None:
     required = set(parameters["required"])
     values = {
         "target_name": args.target_name,
+        "container_name": getattr(args, "container_name", None),
         "place_name": args.place_name,
         "motion_direction": args.motion_direction,
         "motion_distance": args.motion_distance,
@@ -247,6 +249,7 @@ def _prepare_request(
     payload = canonical_skill_payload(
         skill["name"],
         target_name=args.target_name,
+        container_name=args.container_name,
         place_name=args.place_name,
         motion_direction=args.motion_direction,
         motion_distance=0.0 if args.motion_distance is None else args.motion_distance,

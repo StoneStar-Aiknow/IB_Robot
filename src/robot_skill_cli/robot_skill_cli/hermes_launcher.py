@@ -25,6 +25,9 @@ _VERSION_PATTERN = re.compile(r"Hermes Agent v(\d+)\.(\d+)\.(\d+)")
 _PREFLIGHT_TIMEOUT_FLOOR_SEC = 15.0
 _PREFLIGHT_ATTEMPTS = 2
 _PREFLIGHT_RETRY_DELAY_SEC = 0.25
+_HERMES_SKILL_NAME = "ibrobot-control"
+_MANAGED_SKILL_MARKER = ".ibrobot-managed"
+_MANAGED_SKILL_MARKER_CONTENT = "robot_skill_cli:ibrobot-control\n"
 
 
 class LauncherError(RuntimeError):
@@ -64,9 +67,6 @@ def _require_binary(name: str) -> str:
 
 
 def _check_hermes_version(hermes_path: str) -> None:
-    environment = os.environ.copy()
-    environment.pop("PYTHONPATH", None)
-    environment.pop("PYTHONHOME", None)
     try:
         completed = subprocess.run(
             [hermes_path, "--version"],
@@ -74,7 +74,7 @@ def _check_hermes_version(hermes_path: str) -> None:
             capture_output=True,
             text=True,
             timeout=10,
-            env=environment,
+            env=_hermes_environment(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise LauncherError("HERMES_VERSION_UNAVAILABLE", "failed to query Hermes version") from exc
@@ -88,24 +88,92 @@ def _check_hermes_version(hermes_path: str) -> None:
 
 
 def _installed_skill_path() -> Path:
-    skill_path = Path(get_package_share_directory("robot_skill_cli")) / "skills" / "ibrobot-control" / "SKILL.md"
+    skill_path = Path(get_package_share_directory("robot_skill_cli")) / "skills" / _HERMES_SKILL_NAME / "SKILL.md"
     if not skill_path.is_file():
         raise LauncherError("AGENT_SKILL_NOT_FOUND", "installed ibrobot-control skill is missing")
     return skill_path
 
 
-def _prepare_hermes_workspace(skill_path: Path) -> Path:
+def _prepare_hermes_workspace() -> Path:
     cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     workspace = cache_root / "ibrobot" / "hermes-workspace"
-    target_dir = workspace / ".agents" / "skills" / "ibrobot-control"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    target = target_dir / "SKILL.md"
-    source_bytes = skill_path.read_bytes()
-    if not target.is_file() or target.read_bytes() != source_bytes:
-        temporary = target.with_suffix(".tmp")
-        temporary.write_bytes(source_bytes)
-        temporary.replace(target)
+    workspace.mkdir(parents=True, exist_ok=True)
     return workspace
+
+
+def _hermes_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    environment.pop("PYTHONHOME", None)
+    return environment
+
+
+def _hermes_skills_directory(hermes_path: str) -> Path:
+    try:
+        completed = subprocess.run(
+            [hermes_path, "config", "path"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=_hermes_environment(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LauncherError("HERMES_CONFIG_UNAVAILABLE", "failed to query the active Hermes profile") from exc
+    output_lines = [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+    if completed.returncode != 0 or not output_lines:
+        raise LauncherError("HERMES_CONFIG_UNAVAILABLE", "Hermes did not report its active config path")
+    config_path = Path(output_lines[-1]).expanduser()
+    if not config_path.is_absolute() or config_path.name != "config.yaml":
+        raise LauncherError("HERMES_CONFIG_UNAVAILABLE", "Hermes returned an invalid active config path")
+    return config_path.parent / "skills"
+
+
+def _register_hermes_skill(skill_path: Path, skills_directory: Path) -> Path:
+    target_dir = skills_directory / _HERMES_SKILL_NAME
+    target = target_dir / "SKILL.md"
+    marker = target_dir / _MANAGED_SKILL_MARKER
+    source_bytes = skill_path.read_bytes()
+
+    if target_dir.is_symlink() or (target_dir.exists() and not target_dir.is_dir()):
+        raise LauncherError("AGENT_SKILL_CONFLICT", "Hermes ibrobot-control skill path is not a regular directory")
+    if target.is_symlink() or marker.is_symlink():
+        raise LauncherError("AGENT_SKILL_CONFLICT", "Hermes ibrobot-control skill contains an unsupported symlink")
+
+    marker_is_managed = marker.is_file() and marker.read_text(encoding="utf-8") == _MANAGED_SKILL_MARKER_CONTENT
+    if target.is_file() and target.read_bytes() == source_bytes:
+        return target
+    if target_dir.exists() and not marker_is_managed:
+        raise LauncherError(
+            "AGENT_SKILL_CONFLICT",
+            "Hermes already has an unmanaged ibrobot-control skill; remove or rename it before launching",
+        )
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+    temporary_marker = marker.with_suffix(".tmp")
+    temporary_marker.write_text(_MANAGED_SKILL_MARKER_CONTENT, encoding="utf-8")
+    temporary_marker.replace(marker)
+    temporary_target = target.with_suffix(".tmp")
+    temporary_target.write_bytes(source_bytes)
+    temporary_target.replace(target)
+    return target
+
+
+def _check_hermes_skill_discovery(hermes_path: str) -> None:
+    try:
+        completed = subprocess.run(
+            [hermes_path, "skills", "list", "--enabled-only"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_hermes_environment(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LauncherError("AGENT_SKILL_UNAVAILABLE", "failed to query Hermes skills") from exc
+    skill_pattern = rf"(?<![a-z0-9-]){re.escape(_HERMES_SKILL_NAME)}(?![a-z0-9-])"
+    if completed.returncode != 0 or re.search(skill_pattern, completed.stdout, flags=re.IGNORECASE) is None:
+        raise LauncherError("AGENT_SKILL_UNAVAILABLE", "Hermes cannot discover the installed ibrobot-control skill")
 
 
 def _shell_environment_assignment(name: str, value: str | None) -> str:
@@ -186,7 +254,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         robot_skill_path = _require_binary("robot-skill")
         _check_hermes_version(hermes_path)
         config_path = _check_robot_runtime(args.config_name, args.config_path)
-        workspace = _prepare_hermes_workspace(_installed_skill_path())
+        workspace = _prepare_hermes_workspace()
+        skills_directory = _hermes_skills_directory(hermes_path)
+        _register_hermes_skill(_installed_skill_path(), skills_directory)
+        _check_hermes_skill_discovery(hermes_path)
         hermes_arguments = _build_hermes_arguments(hermes_path, args.hermes_args)
     except (FileNotFoundError, ValueError) as exc:
         print(f"hermes-robot: INVALID_ARGUMENT: {exc}", file=sys.stderr)

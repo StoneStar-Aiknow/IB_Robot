@@ -40,6 +40,7 @@ _CAPABILITY_UNAVAILABLE_MESSAGES = {
 }
 _REQUEST_PARAMETER_FIELDS = (
     "target_name",
+    "container_name",
     "place_name",
     "motion_direction",
     "motion_distance",
@@ -82,6 +83,7 @@ class GatewayRequest:
     task_id: Any
     skill_name: Any
     target_name: Any = None
+    container_name: Any = None
     place_name: Any = None
     motion_direction: Any = None
     motion_distance: Any = None
@@ -479,6 +481,7 @@ def build_request_identity(request: GatewayRequest, *, default_timeout_sec: floa
     payload = skill_request.canonical_skill_payload(
         request.skill_name,
         target_name=request.target_name,
+        container_name=request.container_name,
         place_name=request.place_name,
         motion_direction=request.motion_direction,
         motion_distance=request.motion_distance,

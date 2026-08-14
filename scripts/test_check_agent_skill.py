@@ -82,3 +82,61 @@ def test_checker_requires_plan_cancel_and_routing(valid_skill):
 
     assert "missing Agent plan cancel command" in errors
     assert "missing natural-language single-Skill/Workflow routing rule" in errors
+
+
+def test_checker_requires_flat_workflow_steps_and_terminal_nonzero_exit(valid_skill):
+    checker = _load_checker()
+    content = valid_skill.read_text(encoding="utf-8")
+    content = content.replace("Skill arguments are top-level fields", "Skill arguments may be nested")
+    content = content.replace(
+        "issue another `robot-skill` command in the same user request",
+        "continue diagnosing with robot-skill commands",
+    )
+    valid_skill.write_text(content, encoding="utf-8")
+
+    errors = checker.validate_skill(valid_skill)
+
+    assert "missing flat WorkflowStep argument rule" in errors
+    assert "missing prohibition: follow-up robot-skill command after nonzero exit" in errors
+
+
+def test_checker_requires_gateway_task_budget_default(valid_skill):
+    checker = _load_checker()
+    content = valid_skill.read_text(encoding="utf-8")
+    content = content.replace("By default, omit `--timeout-sec` from both commands", "Choose a timeout")
+    content = content.replace(
+        "Do not derive a plan\nbudget from `default_skill_timeout_sec`",
+        "Use the default skill timeout as the plan budget",
+    )
+    valid_skill.write_text(content, encoding="utf-8")
+
+    errors = checker.validate_skill(valid_skill)
+
+    assert "missing default task-budget omission rule" in errors
+    assert "missing skill-timeout/budget distinction rule" in errors
+
+
+def test_checker_requires_direct_ids_and_distinguishes_command_approval(valid_skill):
+    checker = _load_checker()
+    content = valid_skill.read_text(encoding="utf-8")
+    content = content.replace(
+        "Construct request IDs and task IDs directly in the conversation and `robot-skill` arguments.",
+        "Generate identifiers with a helper command.",
+    )
+    content = content.replace(
+        "must not call Python, `uuidgen`, `date`, a shell, or another helper tool to generate request/task IDs",
+        "may call a helper tool to generate request/task IDs",
+    )
+    content = content.replace(
+        "A command approval, including session-wide\napproval, authorizes only that command and is not user motion "
+        "confirmation.",
+        "A command approval also confirms motion.",
+    )
+    valid_skill.write_text(content, encoding="utf-8")
+
+    errors = checker.validate_skill(valid_skill)
+
+    assert "missing direct request/task ID construction rule" in errors
+    assert "missing prohibition: helper command ID generation" in errors
+    assert "missing command-approval distinction rule" in errors
+    assert "missing prohibition: command approval as motion confirmation" in errors

@@ -185,6 +185,7 @@ class _BoundRequest(SimpleNamespace):
 
     def __init__(self, *, task_id: str, **fields) -> None:
         fields.setdefault("timeout_sec", 0.0)
+        fields.setdefault("container_name", "")
         super().__init__(dispatch_binding=new_binding(task_id=task_id), **fields)
 
     @property
@@ -268,6 +269,7 @@ def test_delegated_primitive_requires_exact_active_nonce_binding():
     goal = SimpleNamespace(dispatch_binding=binding, primitive_name="move_to_named_pose", timeout_sec=0.0)
 
     assert node._admit_primitive(goal, None) == ("", None, admission, True)
+    assert goal.timeout_sec > 0.0
     goal.dispatch_binding.root_task_id = "tampered"
     assert node._admit_primitive(goal, None)[0] == "SKILL_BUSY"
 
@@ -327,6 +329,7 @@ def test_pick_skill_sets_internal_execute_policy(monkeypatch):
     assert result.error_code == skill_executor_node.PRIMITIVE_CANCEL_CLEANUP_TIMEOUT
     assert len(sent_goals) == 1
     assert sent_goals[0].mode == skill_executor_node.PickObject.Goal.MODE_EXECUTE
+    assert sent_goals[0].supervised_direct is False
     assert sent_goals[0].release_after_success is False
     assert sent_goals[0].release_drop_height_m == pytest.approx(-1.0)
 

@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 import pytest
-from launch.actions import DeclareLaunchArgument, EmitEvent
+from launch.actions import DeclareLaunchArgument, EmitEvent, SetEnvironmentVariable
 from launch_ros.actions import Node
 
 from embodied_bringup.launch_builders.embodied import _resolve_development_source_root, generate_embodied_nodes
@@ -259,6 +259,16 @@ def test_authorize_motion_launch_argument_defaults_to_false():
     assert authorize_motion.default_value[0].text == "false"
 
 
+def test_pipeline_forces_udp_transport_for_fastdds_service_discovery():
+    module = _load_launch_module()
+    description = module.generate_launch_description()
+    transport = next(entity for entity in description.entities if isinstance(entity, SetEnvironmentVariable))
+    name = "".join(getattr(item, "text", str(item)) for item in transport.name)
+    value = "".join(getattr(item, "text", str(item)) for item in transport.value)
+    assert name == "FASTDDS_BUILTIN_TRANSPORTS"
+    assert value == "UDPv4"
+
+
 def test_launch_setup_aborts_when_game_enabled_but_perception_disabled():
     """with_perception:=false while a game is enabled must fail the launch, not
     start a node graph that routes the game to a dead topic. The validation gate
@@ -317,7 +327,7 @@ def test_launch_setup_passes_operator_motion_authorization(monkeypatch, authoriz
     assert generated[0][1:] == ("moveit_runtime_override", expected)
 
 
-def test_handeye_grasp_config_launches_pick_pipeline():
+def test_handeye_grasp_config_launches_pick_and_place_pipelines():
     config_path = (
         Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_handeye_realsense_grasp.yaml"
     )
@@ -328,6 +338,7 @@ def test_handeye_grasp_config_launches_pick_pipeline():
     nodes = generate_embodied_nodes(config, "moveit_planning")
     executables = {(node.__dict__.get("_Node__package"), node.__dict__.get("_Node__node_executable")) for node in nodes}
     assert ("manipulation_execution", "pick_executor_node") in executables
+    assert ("manipulation_execution", "place_executor_node") in executables
     assert ("manipulation_service", "grasp_planner_node") in executables
     assert ("manipulation_service", "grasp_verifier_node") in executables
     assert ("perception_service", "grounded_sam2_node") not in executables
@@ -356,8 +367,11 @@ def test_handeye_grasp_config_launches_pick_pipeline():
 
     planner = next(node for node in nodes if vars(node).get("_Node__node_name") == "grasp_planner")
     planner_params = _normalize_launch_param_mapping(planner._Node__parameters[0])
+    assert _decode_launch_string(str(planner_params["model_dir"])).endswith("/models/grasp/graspgen_robotiq_2f_140")
     assert str(planner_params["inference_backend"]).splitlines()[0] == "ascend_local"
-    assert str(planner_params["ascend_local_manifest_path"]).splitlines()[0] == "/root/graspgen_310p_bundle"
+    assert _decode_launch_string(str(planner_params["ascend_local_manifest_path"])).endswith(
+        "/models/grasp/graspgen_robotiq_2f_140"
+    )
     assert planner_params["startup_warmup"] is True
     assert _decode_launch_string(str(planner_params["legacy_detect_service"])) == ("/grasp_planner/detect_and_segment")
     assert "remote_310p_host" not in planner_params
@@ -374,6 +388,62 @@ def test_handeye_grasp_config_launches_pick_pipeline():
     pick_executor_params = _normalize_launch_param_mapping(pick_executor._Node__parameters[0])
     home_joint_positions = _decode_launch_json_string(str(pick_executor_params["home_joint_positions_json"]))
     assert home_joint_positions["5"] == 0.0
+    place_executor = next(node for node in nodes if vars(node).get("_Node__node_name") == "placement_executor_node")
+    place_params = _normalize_launch_param_mapping(place_executor._Node__parameters[0])
+    placement_json = _decode_launch_json_string(str(place_params["placement_execution_json"]))
+    assert placement_json["action_name"] == "/manipulation/execute_place"
+    assert placement_json["executor"] == "placement_pipeline"
+    assert placement_json["motion"]["place_pose"] == "place_container"
+    assert placement_json["motion"]["place_joint_names"] == ["1", "2", "3", "4", "5"]
+    assert placement_json["motion"]["place_joint_positions"] == {
+        "1": -0.047553,
+        "2": -0.073631,
+        "3": -0.840621,
+        "4": 1.497165,
+        "5": -1.570790,
+    }
+    assert placement_json["motion"]["place_duration_sec"] == 10.0
+    assert placement_json["motion"]["post_release"] == {
+        "verify_joint_name": "3",
+        "verify_joint_position": -0.687223,
+        "verify_duration_sec": 2.0,
+        "return_duration_sec": 2.0,
+    }
+    assert "observe_pose" not in placement_json["motion"]
+    assert "plan_service" not in placement_json
+    assert "arm_joint_names_json" not in place_params
+    assert "named_poses_json" not in place_params
+    assert _decode_launch_string(str(place_params["gripper_joint_name"])) == "6"
+
+    skill_params = _skill_executor_params(nodes)
+    assert _decode_launch_string(str(skill_params["place_action_name"])) == "/manipulation/execute_place"
+
+
+def test_pc_handeye_grasp_launch_uses_cuda_catalog_and_place_pipeline():
+    config_path = (
+        Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_handeye_realsense_grasp_pc.yaml"
+    )
+    config = load_robot_config_dict(config_path)
+    config["embodied"]["enabled"] = True
+
+    nodes = generate_embodied_nodes(config, "moveit_planning")
+    executables = {(vars(node).get("_Node__package"), vars(node).get("_Node__node_executable")) for node in nodes}
+    assert ("manipulation_execution", "pick_executor_node") in executables
+    assert ("manipulation_execution", "place_executor_node") in executables
+    planner = next(node for node in nodes if vars(node).get("_Node__node_name") == "grasp_planner")
+    planner_params = _normalize_launch_param_mapping(planner._Node__parameters[0])
+    assert _decode_launch_string(str(planner_params["inference_backend"])) == "local_cuda"
+    local_manifest_path = _decode_launch_string(str(planner_params["local_manifest_path"]))
+    assert Path(local_manifest_path).is_absolute()
+    assert local_manifest_path.endswith("/models/grasp/graspgen_robotiq_2f_140")
+    assert "$(env " not in local_manifest_path
+    planner_model_dir = _decode_launch_string(str(planner_params["model_dir"]))
+    assert Path(planner_model_dir).is_absolute()
+    assert planner_model_dir.endswith("/models/grasp/graspgen_robotiq_2f_140")
+    assert "$(env " not in planner_model_dir
+    skill_params = _skill_executor_params(nodes)
+    assert _decode_launch_string(str(skill_params["skill_catalog_profile"])) == ("so101_handeye_realsense_grasp_pc")
+    assert _decode_launch_string(str(skill_params["place_action_name"])) == "/manipulation/execute_place"
 
 
 def test_handeye_grasp_launch_auto_starts_parallel_ik_workers(monkeypatch, tmp_path):

@@ -212,6 +212,7 @@ def test_validate_skill_passes_all_fixed_request_fields(bridge_rig):
     payload = {
         "skill_name": "move_relative_ee",
         "target_name": "banana",
+        "container_name": "black bowl",
         "place_name": "home",
         "motion_direction": "forward",
         "motion_distance": 0.03,
@@ -233,6 +234,7 @@ def test_validate_skill_passes_all_fixed_request_fields(bridge_rig):
     request = requests[0]
     assert request.skill_name == "move_relative_ee"
     assert request.target_name == "banana"
+    assert request.container_name == "black bowl"
     assert request.place_name == "home"
     assert request.motion_direction == "forward"
     assert request.motion_distance == pytest.approx(0.03)
@@ -296,6 +298,7 @@ def test_execute_uses_deterministic_goal_uuid_and_public_feedback(bridge_rig):
     payload = {
         "skill_name": "move_relative_ee",
         "target_name": "",
+        "container_name": "",
         "place_name": "",
         "motion_direction": "forward",
         "motion_distance": 0.03,
@@ -320,6 +323,7 @@ def test_cancel_task_targets_active_goal_by_deterministic_uuid(bridge_rig):
     payload = {
         "skill_name": "move_relative_ee",
         "target_name": "",
+        "container_name": "",
         "place_name": "",
         "motion_direction": "forward",
         "motion_distance": 0.03,
@@ -378,6 +382,7 @@ def test_send_skill_goal_exception_maps_to_ros_unavailable(bridge_rig):
     payload = {
         "skill_name": "move_relative_ee",
         "target_name": "",
+        "container_name": "",
         "place_name": "",
         "motion_direction": "forward",
         "motion_distance": 0.03,

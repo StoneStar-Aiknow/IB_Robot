@@ -22,23 +22,38 @@ Run natural-language motion requests in this order. Replace placeholders with re
 
 1. Query the Gateway: `robot-skill status`.
 2. Discover capabilities: `robot-skill list-skills`.
-3. Generate a typed plan: `robot-skill plan-workflow --request-id REQUEST_ID --text TEXT --workflow-json JSON`.
+3. Construct a fresh request ID directly in the conversation, such as `agent-request-YYYYMMDD-NNN`, then generate a
+   typed plan: `robot-skill plan-workflow --request-id REQUEST_ID --text TEXT --workflow-json JSON`.
 4. Read every selected contract with `robot-skill describe SKILL`, then run
    `robot-skill validate-plan --plan-token TOKEN`.
-5. Show the exact ordered steps, parameters, plan digest, registry identity, and a fresh task ID. Obtain explicit user
+5. Construct the fresh task ID directly from the returned plan ID, such as `agent-task-PLAN_ID`, or use a session-local
+   value such as `agent-task-YYYYMMDD-NNN`. Show the exact ordered steps, parameters, plan digest, registry identity, and
+   that fresh task ID. Obtain explicit user
    motion confirmation. General permission, a prior confirmation, or schedule pressure does not count.
 6. Bind that exact tuple once with
-   `robot-skill confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID --timeout-sec SEC`.
+   `robot-skill confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID`.
 7. Execute only the returned confirmation token with
-   `robot-skill execute-plan --plan-token TOKEN --confirmation-token CONFIRMATION_TOKEN --task-id ID --timeout-sec SEC`.
+   `robot-skill execute-plan --plan-token TOKEN --confirmation-token CONFIRMATION_TOKEN --task-id ID`.
 
-Use the same `SEC` value for confirmation and execution. If both commands omit `--timeout-sec`, both use the current
-Gateway task budget. Never change the budget after confirmation.
+By default, omit `--timeout-sec` from both commands so both use the current Gateway task budget. Do not derive a plan
+budget from `default_skill_timeout_sec`. Only when the user explicitly requests a smaller budget, append the same
+`--timeout-sec SEC` value to both commands. Never change the budget after confirmation.
+
+`workflow-json` is an array of flat `WorkflowStep` objects. Skill arguments are top-level fields, for example
+`[{"skill_name":"pick_object","target_name":"marker"}]`. Never use `skill`, a nested `parameters` object, or a bare
+object. Invoke `plan-workflow` once with all three required options; do not probe it with an incomplete command.
+
+Construct request IDs and task IDs directly in the conversation and `robot-skill` arguments. Do not call Python,
+`uuidgen`, `date`, a shell, or any other helper tool to generate them. A command approval, including session-wide
+approval, authorizes only that command and is not user motion confirmation. Only an explicit user response confirming
+the displayed plan/task tuple permits `confirm-plan`.
 
 Natural-language single-Skill and Workflow requests both use the plan workflow above. For an explicitly selected single
 skill, the direct `describe -> validate -> explicit user motion confirmation -> execute` path remains valid.
 
 Stop on any failure, unavailable/not-ready Gateway, unauthorized motion, rejected validation, or missing confirmation.
+After a nonzero exit, do not run `--help`, inspect or change the environment, alter the JSON or timeout, query status, or
+issue another `robot-skill` command in the same user request. Report the exact returned error instead.
 Do not invent parameters absent from `describe`.
 For an ordered multi-Skill request, call `plan-workflow` exactly once with the user's original wording and typed steps. The returned single
 plan must contain all ordered `workflow_steps`. If planning omits, reorders, or rejects a requested step, report that
@@ -69,6 +84,7 @@ Changing `nod_yes` implementation or manifest YAML requires `reload-catalog`, no
 - The Agent **must not enable motion authorization**; only the operator may set `authorize_motion`.
 - The Agent **must not modify ROS parameters**.
 - The Agent **must not source environment scripts, select a ROS domain, or discover another repository/config**.
+- The Agent **must not call Python, `uuidgen`, `date`, a shell, or another helper tool to generate request/task IDs**.
 - The Agent **must not call primitive, MoveIt, controller, or raw ros2 motion commands**.
 - The Agent must not copy `docs/ib_robot_social_skill.md` as a control Skill.
 - The Agent **must not automatically retry after failure, timeout, or unknown result**, including with a new task ID.
@@ -100,4 +116,5 @@ required workflow.
 | Mistake | Correction |
 |---|---|
 | Treating accepted cancellation as physical stop | Wait for a terminal result or task ledger terminal state. |
+| Treating command approval as motion confirmation | Wait for an explicit response confirming the displayed plan. |
 | Retrying after checking idle | Require a new user request and repeat the entire workflow; never retry automatically. |
