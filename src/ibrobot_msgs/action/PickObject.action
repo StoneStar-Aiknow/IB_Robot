@@ -3,11 +3,13 @@
 #
 # See docs/lightweight_skill_package_registry_design_zh.md section 11.5.
 #
-# This is a delegated action: it must carry DispatchBinding and
-# DelegatedExecutorIdentity expected_executor in the goal and return
-# actual_executor in the result. The delegated server must compare its own
-# actual identity before accepting the request; on mismatch it returns a
-# stable contract-version error and must not rely on the endpoint name alone.
+# This is normally a delegated action: it carries DispatchBinding and
+# DelegatedExecutorIdentity expected_executor in the goal and returns
+# actual_executor in the result. The delegated server compares its own actual
+# identity before accepting the request; on mismatch it rejects the goal and
+# must not rely on the endpoint name alone. The explicit supervised_direct
+# bring-up mode is the only exception and still requires the live registry
+# identity and task budget.
 # task_id is moved into dispatch_binding. Future delegated actions/services
 # follow the same shape.
 
@@ -20,6 +22,9 @@ DispatchBinding dispatch_binding
 string target_query
 float32 timeout_sec
 DelegatedExecutorIdentity expected_executor
+# True only for the explicitly supervised hardware bring-up client. Hermes and
+# all catalog callers must leave this false and use a Gateway delegated nonce.
+bool supervised_direct
 uint8 mode
 bool release_after_success
 float32 release_drop_height_m

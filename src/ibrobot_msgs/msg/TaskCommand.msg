@@ -9,7 +9,7 @@
 # complete version binding and a correct workflow_digest, while
 # root_lease_nonce and dispatch_nonce remain empty. Task executor must use
 # each WorkflowStep's own parameters and must not override all steps with the
-# top-level target_name/place_name/motion_* hints. context_json only carries
+# top-level target_name/container_name/place_name/motion_* hints. context_json only carries
 # non-execution planner/perception annotations: it must not carry registry
 # identity, task budget, skill_sequence or other strongly typed contract
 # fields.
@@ -20,6 +20,7 @@ string raw_command
 string task_type
 WorkflowStep[] workflow_steps
 string target_name
+string container_name
 string place_name
 string motion_direction
 float32 motion_distance

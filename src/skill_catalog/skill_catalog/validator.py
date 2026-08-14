@@ -27,7 +27,9 @@ CONTROL_MODES = frozenset({"teleop", "model_inference", "moveit_planning"})
 RECOVERY_POLICIES = frozenset({"never_retry", "ask_user", "recover_safe_pose"})
 MOTION_SCOPES = frozenset({"base", "shoulder", "elbow", "wrist", "gripper", "arm"})
 INITIAL_GRIPPER_STATES = frozenset({"open", "closed", "hold", "none"})
-CAPABILITY_PARAMETER_NAMES = frozenset({"target_name", "place_name", "motion_direction", "motion_distance"})
+CAPABILITY_PARAMETER_NAMES = frozenset(
+    {"target_name", "container_name", "place_name", "motion_direction", "motion_distance"}
+)
 
 MANIFEST_FIELDS = frozenset(
     {
@@ -698,11 +700,11 @@ def _validate_parameter_schema(schema: Any, diagnostics: list[SkillDiagnostic], 
                     source_relative_path=path,
                     field_path=f"{field_path}.properties.{name}",
                 )
-            if property_schema.get("freeform") is True and name != "target_name":
+            if property_schema.get("freeform") is True and name not in {"target_name", "container_name"}:
                 _error(
                     diagnostics,
                     "SKILL_SCHEMA_INVALID",
-                    "only target_name may be freeform",
+                    "only target_name and container_name may be freeform",
                     source_relative_path=path,
                     field_path=f"{field_path}.properties.{name}",
                 )

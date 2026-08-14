@@ -73,6 +73,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "action/SkillCommand.action"
   "action/PrimitiveCommand.action"
   "action/PickObject.action"
+  "action/PlaceObject.action"
   "action/ArmReturnHome.action"
   "action/ExecuteAgentPlan.action"
   "srv/RecognizeFile.srv"

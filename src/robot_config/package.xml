@@ -19,6 +19,9 @@
   <depend>inference_manifest</depend>
   <depend>ament_index_python</depend>
 
+  <!-- MoveIt task-level execution (launched by launch_builders/task_execution.py) -->
+  <exec_depend>task_dispatch</exec_depend>
+
   <!-- Camera drivers (executed, not linked) -->
   <exec_depend>usb_cam</exec_depend>
   <exec_depend>camera_ros</exec_depend>

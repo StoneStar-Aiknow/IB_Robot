@@ -1,0 +1,34 @@
+# Move to the configured fixed container pose, release the object, move the
+# configured verification joint, verify it inside the visible container, and
+# return to the release pose. This is delegated: only the Capability Gateway
+# may construct an admitted goal.
+DispatchBinding dispatch_binding
+string target_query
+string container_query
+float32 timeout_sec
+DelegatedExecutorIdentity expected_executor
+---
+uint8 RELEASE_NOT_RELEASED=0
+uint8 RELEASE_RELEASED=1
+uint8 RELEASE_UNKNOWN=2
+
+uint8 VERIFICATION_NOT_RUN=0
+uint8 VERIFICATION_SUCCESS=1
+uint8 VERIFICATION_FAILED=2
+uint8 VERIFICATION_UNCERTAIN=3
+
+bool success
+bool place_succeeded
+uint8 release_status
+uint8 verification_status
+string error_code
+string message
+string[] completed_phases
+string[] diagnostic_details
+string pipeline_timings_json
+string debug_output_dir
+DelegatedExecutorIdentity actual_executor
+---
+string phase
+float32 progress
+string detail

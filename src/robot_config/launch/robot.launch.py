@@ -776,8 +776,8 @@ def launch_setup(context, *args, **kwargs):
                     actions.append(task_node)
                 print("[robot_config] Task executor node added")
     except Exception as e:
-        print(f"[robot_config] ERROR generating task executor: {e}")
-        print("[robot_config] Continuing without task executor...")
+        logger.error(f"generating required task executor: {e}")
+        raise RuntimeError("MoveIt task executor setup failed; refusing to start an incomplete motion stack") from e
 
     # ========== 12. Automatic Recording (if record:=true) ==========
     try:

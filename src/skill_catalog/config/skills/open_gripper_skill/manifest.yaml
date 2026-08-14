@@ -41,6 +41,7 @@ capability:
   recovery_policy: never_retry
 implementations:
   so101_handeye_realsense_grasp: implementations/so101_handeye_realsense_grasp.yaml
+  so101_handeye_realsense_grasp_pc: implementations/so101_handeye_realsense_grasp_pc.yaml
   so101_arm_v1: implementations/so101_arm_v1.yaml
 description_variants:
   so101_handeye_realsense_grasp:
@@ -49,6 +50,21 @@ description_variants:
     when_to_use:
     - release an object
     - prepare the gripper for grasping
+    do_not_use:
+    - condition: place a held object into a detected container and verify it
+      instead_use: place_in_container
     motion_scope:
     - arm
+    intensity: moderate
+  so101_handeye_realsense_grasp_pc:
+    summary: Open the gripper.
+    category: gripper
+    when_to_use:
+    - release an object
+    - prepare the gripper for grasping
+    do_not_use:
+    - condition: place a held object into a detected container and verify it
+      instead_use: place_in_container
+    motion_scope:
+    - gripper
     intensity: moderate

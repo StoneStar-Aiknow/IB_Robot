@@ -18,6 +18,7 @@
 | `task_type` | `string` | 规则规划后的任务类型 |
 | `workflow_steps` | `WorkflowStep[]` | 规划后的有序步骤；raw 请求可为空，planned 请求必须非空 |
 | `target_name` | `string` | 顶层目标提示，仅作规划输入，task executor 必须按各 `WorkflowStep` 自身参数执行 |
+| `container_name` | `string` | 顶层容器提示，仅作规划输入，task executor 必须按各 `WorkflowStep` 自身参数执行 |
 | `place_name` | `string` | 顶层放置位提示 |
 | `motion_direction` | `string` | 顶层相对运动方向提示 |
 | `motion_distance` | `float32` | 顶层相对运动距离提示 |
@@ -259,6 +260,7 @@ planned `TaskCommand.dispatch_binding` 的 exact snapshot。`schema_version` v1 
 | `schema_version` | `uint32` | schema 版本，v1 固定为 `1` |
 | `skill_name` | `string` | 兼容字段名，引用 atomic_operator 或 skill catalog entry |
 | `target_name` | `string` | 命名目标 |
+| `container_name` | `string` | 指定容器；对 `place_in_container` 是释放后的视觉检测 query |
 | `place_name` | `string` | 命名放置位 |
 | `motion_direction` | `string` | 相对运动方向 |
 | `motion_distance` | `float32` | 相对运动距离 |
@@ -332,6 +334,7 @@ identity；direct root `SkillCommand` 的 `root_lease_nonce` 与 `dispatch_nonce
 | `dispatch_binding` | 完整任务/版本信封（含 `task_id`、`task_budget` 与 exact registry identity） |
 | `skill_name` | 技能名（如 `pick_object`、`move_relative_ee`） |
 | `target_name` | 命名目标；对 `pick_object` 表示运行时视觉文本查询 |
+| `container_name` | 指定容器；对 `place_in_container` 表示释放后的视觉检测 query，不参与运动规划 |
 | `place_name` | 命名放置位 |
 | `motion_direction` | 相对运动方向（`forward` / `backward` / `left` / `right` / `up` / `down`） |
 | `motion_distance` | 相对运动距离（米） |
@@ -350,6 +353,7 @@ identity；direct root `SkillCommand` 的 `root_lease_nonce` 与 `dispatch_nonce
 | `actual_registry_digest` | 实际使用的 registry digest |
 | `source_release_digest` | source release digest |
 | `provenance_digest` | provenance digest |
+| `debug_output_dir` | delegated executor 产生的可重放证据目录；无调试输出时为空 |
 | `diagnostics` | `SkillDiagnostic[]` 结构化诊断 |
 
 **Feedback 字段**
@@ -410,10 +414,12 @@ identity；direct root `SkillCommand` 的 `root_lease_nonce` 与 `dispatch_nonce
 ### `PickObject.action`
 
 抓取闭环接口，由 `manipulation_execution/pick_executor_node` 提供，默认路径
-`/manipulation/execute_pick`。这是 delegated action：goal 必须携带 `dispatch_binding` 和
+`/manipulation/execute_pick`。通常这是 delegated action：goal 必须携带 `dispatch_binding` 和
 `expected_executor`，result 必须返回 `actual_executor`。delegated server 在接受请求前必须比对自身实际
-identity，不匹配时返回稳定 contract-version 错误，且不得仅凭 endpoint 名判断。`task_id` 移入
-`dispatch_binding`，抓取共享同一 root 的绝对 `task_budget`。
+identity，不匹配时 reject，且不得仅凭 endpoint 名判断。`task_id` 移入 `dispatch_binding`，抓取共享同一
+root 的绝对 `task_budget`。唯一例外是人工真机 bring-up 的 `supervised_direct=true`：它要求空
+`dispatch_nonce`，但仍必须携带从 live Gateway snapshot 取得的 exact registry/executor identity 和有效预算。
+Hermes 与 catalog dispatch 必须保持该字段为 `false` 并使用 Gateway 生成的非空 nonce。
 
 **Goal 字段**
 
@@ -423,6 +429,7 @@ identity，不匹配时返回稳定 contract-version 错误，且不得仅凭 en
 | `target_query` | 运行时视觉文本查询，不是静态 `named_targets` 键 |
 | `timeout_sec` | per-entry 超时上限，受 `task_budget` 剩余预算约束 |
 | `expected_executor` | `DelegatedExecutorIdentity`，调用方声明的期望 executor identity |
+| `supervised_direct` | 仅人工真机测试 client 为 `true`；Hermes/catalog 固定为 `false` |
 | `mode` | `MODE_EXECUTE`、`MODE_PLAN_ONLY` 或 `MODE_OBSERVE_ONLY` |
 | `release_after_success` | 验证成功后是否由正式 executor 执行安全释放 |
 | `release_drop_height_m` | 非负时先下降到指定高度再开爪；负值在最终 lift 位释放 |
@@ -485,6 +492,22 @@ token/task id 的重试可幂等返回既有 active/terminal 记录，不同 tas
 `task_budget_sec`；该值必须为有限正数且不超过 Gateway task budget。成功响应返回
 `confirmation_token`、规范化后的 `confirmed_task_budget_sec` 以及冻结的 `task_budget_started_at/deadline`。
 执行 action 必须复用该精确绝对预算，确认到执行之间的等待会真实消耗预算。
+
+### `PlaceObject.action`
+
+已持物释放和视觉确认接口，由 `manipulation_execution/placement_executor_node` 提供，默认路径
+`/manipulation/execute_place`。该 action 移动到配置的固定容器位，打开夹爪，将配置的验证关节（当前为 3 号）
+移动到验证位进行视觉验证，最后返回固定释放位。
+
+| 字段 | 说明 |
+| --- | --- |
+| `target_query` | 释放后用于视觉检测的物品名称，必填 |
+| `container_query` | 释放后用于视觉检测的指定容器名称，必填；不改变固定释放位 |
+| `release_status` | `NOT_RELEASED`、`RELEASED` 或 `UNKNOWN`；不代表已进入容器 |
+| `verification_status` | 二维分割包含验证的 `SUCCESS`、`FAILED`、`UNCERTAIN` 或 `NOT_RUN` |
+| `place_succeeded` | 仅夹爪确认打开且目标物品连续确认位于容器区域内时为 true |
+| `completed_phases` | 包括 `move_to_place`、`release`、`move_to_verify`、`verify_place` 和 `return_to_place` |
+| `debug_output_dir` | 当前固定放置证据目录；包含版本化 manifest、开爪 JointState、RGB、检测 mask、判定和最终结果，可由 `placement_replay` 离线重放 |
 
 ### `ArmReturnHome.action`
 
@@ -603,6 +626,7 @@ TaskCommand/SkillCommand validation 时必须提供完整期望 identity；Workf
 | `dispatch_binding` | `DispatchBinding`，提供完整期望 registry identity（`root_lease_nonce` 仅用于关联） |
 | `skill_name` | 待执行技能名 |
 | `target_name` | 命名目标 |
+| `container_name` | 指定容器；对放置技能是释放后的视觉检测 query |
 | `place_name` | 命名放置位 |
 | `motion_direction` | `string`，相对运动方向 |
 | `motion_distance` | `float32`，相对运动距离 |

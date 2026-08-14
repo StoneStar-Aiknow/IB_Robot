@@ -1,6 +1,10 @@
 from pathlib import Path
 
+import pytest
+from ament_index_python.packages import PackageNotFoundError
+
 from robot_config.launch_builders import moveit as moveit_builder
+from robot_config.launch_builders import task_execution as task_execution_builder
 from robot_config.launch_builders.task_execution import generate_task_executor_node
 from robot_config.loader import load_robot_config_dict
 
@@ -70,3 +74,15 @@ def test_310p_profile_does_not_skip_the_initial_gripper_open() -> None:
     assert _launch_parameter_value(node, "gripper_open_position") == 1.0
     assert _launch_parameter_value(node, "gripper_position_tolerance") == 0.05
     assert _launch_parameter_value(node, "joint_state_max_age_s") == 0.25
+
+
+def test_moveit_task_executor_fails_before_launch_when_package_is_missing(monkeypatch) -> None:
+    config = load_robot_config_dict(CONFIG)
+
+    def raise_package_not_found(_package_name: str):
+        raise PackageNotFoundError("task_dispatch")
+
+    monkeypatch.setattr(task_execution_builder, "get_package_prefix", raise_package_not_found)
+
+    with pytest.raises(RuntimeError, match="task_dispatch.*not present"):
+        generate_task_executor_node(config, "moveit_planning")

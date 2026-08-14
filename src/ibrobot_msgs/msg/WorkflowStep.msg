@@ -12,6 +12,7 @@
 uint32 schema_version
 string skill_name
 string target_name
+string container_name
 string place_name
 string motion_direction
 float32 motion_distance

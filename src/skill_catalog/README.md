@@ -13,12 +13,16 @@ state, leases, task IDs, authorization, and action execution do not belong here.
 - `config/profiles/<profile>.yaml`: enabled package, selected implementation, and planner visibility.
 
 The current source-workspace profiles are `so101_single_arm`,
-`so101_handeye_realsense_grasp`, and `so101_rtp_distributed`. The shared stable
+`so101_handeye_realsense_grasp`, `so101_handeye_realsense_grasp_pc`, and `so101_rtp_distributed`. The shared stable
 implementation `so101_arm_v1` is selected by every enabled entry in both
 `so101_single_arm` and `so101_rtp_distributed`; the two profiles compile the
 same execution body, so their implementation content cannot drift through
 duplicated files. Registry/capability identity can still differ through the
 canonical robot execution context.
+
+Both hand-eye profiles expose `pick_object` and `place_in_container` through
+the Gateway. 310P binds grasping to the `ascend_310p` manifest deployment;
+the PC profile binds it to the `torch_cuda` manifest deployment.
 
 ## Source Modes
 

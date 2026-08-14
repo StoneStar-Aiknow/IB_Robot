@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 import yaml
 
-from embodied_common.dispatch_binding import load_delegated_model_identity
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
 from robot_config.loader import load_robot_config_dict, robot_config_digest
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
@@ -21,6 +20,7 @@ ROBOT_CONFIG_DIR = ROOT / "robot_config" / "config" / "robots"
 PROFILES = (
     "so101_single_arm",
     "so101_handeye_realsense_grasp",
+    "so101_handeye_realsense_grasp_pc",
     "so101_rtp_distributed",
 )
 
@@ -30,7 +30,7 @@ def _context(config: dict, capability_digest: str) -> SkillCompileContext:
     execution = embodied.get("execution", {})
     endpoint = config.get("grasp_execution", {}).get("action_name", "/manipulation/execute_pick")
     delegated = {}
-    if config["name"] == "so101_handeye_realsense_grasp":
+    if config["name"] in {"so101_handeye_realsense_grasp", "so101_handeye_realsense_grasp_pc"}:
         descriptor = DelegatedExecutorDescriptor(
             name="grasp_pipeline",
             contract_version="1",
@@ -43,9 +43,30 @@ def _context(config: dict, capability_digest: str) -> SkillCompileContext:
                     separators=(",", ":"),
                 ).encode()
             ).hexdigest(),
-            **load_delegated_model_identity(config.get("grasp_execution", {})),
+            # The catalog compiler only needs a complete identity. Runtime launch
+            # performs the strict manifest validation against the selected bundle.
+            model_deployment_name="ascend_310p" if config["name"] == "so101_handeye_realsense_grasp" else "torch_cuda",
+            model_fingerprint="0" * 64,
+            model_bundle_digest="1" * 64,
         )
         delegated[descriptor.name] = descriptor
+        place = DelegatedExecutorDescriptor(
+            name="placement_pipeline",
+            contract_version="1",
+            endpoint_kind="ros_action",
+            endpoint_name=config.get("placement_execution", {}).get("action_name", "/manipulation/execute_place"),
+            configuration_digest=hashlib.sha256(
+                json.dumps(
+                    {"endpoint_kind": "ros_action", "endpoint_name": "/manipulation/execute_place"},
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest(),
+            model_deployment_name="",
+            model_fingerprint="",
+            model_bundle_digest="",
+        )
+        delegated[place.name] = place
     robot = SkillRobotContext(
         robot_name=config["name"],
         context_schema_version=1,
@@ -145,6 +166,17 @@ def test_migrated_profile_preserves_legacy_templates_capabilities_and_visibility
             "open_gripper_skill",
             "close_gripper_skill",
             "pick_object",
+            "place_in_container",
+        },
+        "so101_handeye_realsense_grasp_pc": {
+            "inspect_scene",
+            "recover_safe_pose",
+            "recover_zero_pose",
+            "move_relative_ee",
+            "open_gripper_skill",
+            "close_gripper_skill",
+            "pick_object",
+            "place_in_container",
         },
     }[profile]
     assert set(compiled.enabled_skill_names) == expected_enabled

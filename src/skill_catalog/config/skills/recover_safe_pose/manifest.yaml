@@ -47,6 +47,7 @@ capability:
   recovery_policy: never_retry
 implementations:
   so101_handeye_realsense_grasp: implementations/so101_handeye_realsense_grasp.yaml
+  so101_handeye_realsense_grasp_pc: implementations/so101_handeye_realsense_grasp_pc.yaml
   so101_arm_v1: implementations/so101_arm_v1.yaml
 description_variants:
   so101_handeye_realsense_grasp:
