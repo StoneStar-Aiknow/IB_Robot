@@ -93,11 +93,12 @@ Drive them with the closed vocabulary only; free text outside the grammar never 
 1. **Discover (read-only).** `robot-skill status` then `robot-skill list-skills`. Do not plan or move.
 2. **Reject out-of-catalog.** Any requested `skill_name` not in the current `planner_visible_names` is refused with
    `SKILL_REFERENCE_MISSING` before planning. Do not substitute or invent a skill.
-3. **Prepare + present + confirm in session.** `plan-workflow` once, show the ordered steps, plan digest, registry
-   identity, and a fresh task ID, then accept only the closed confirmation grammar
-   (`确认执行当前计划` / `确认` / `确认执行` / `执行吧` / `好` / `好的` / `可以` / `是的` / `confirm`).
-   Bind that single pending plan with `confirm-plan`. The session binds the sole unexpired pending plan; never accept a
-   pending ID from the user or model.
+3. **Prepare + present + execute immediately (no confirmation gate).** `plan-workflow` once, show the ordered steps,
+   plan digest, registry identity, and a fresh task ID, then run `validate-plan` + `confirm-plan` + `execute-plan`
+   back-to-back without waiting for a `确认` reply — execution starts right after presentation. The user catches a
+   wrong workflow with `别动` (step 4) during execution instead of confirming beforehand. The `确认` grammar
+   (`确认执行当前计划` / `确认` / `confirm` / …) is still honored if the user offers it, but it is no longer a
+   required gate. The session binds the sole unexpired pending plan; never accept a pending ID from the user or model.
 4. **别动 → definite terminal.** On a stop phrase (`别动` / `停` / `停止` / `停下` / `stop` / `halt`), cancel the
    active plan with `cancel-plan` and wait for a terminal `GoalStatus` ∈ {succeeded=4, canceled=5, aborted=6}. Only a
    terminal result is a definite stopped state. `SKILL_CANCEL_TIMEOUT` or an unknown result means the stop state is

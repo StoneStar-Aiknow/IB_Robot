@@ -286,12 +286,17 @@ class InteractiveController:
             "confirm_command": "确认执行当前计划",
         }
 
-    def confirm(self, confirmation_text: str) -> dict[str, Any]:
-        """Feature 3 (confirm): validate then bind the in-session pending plan via the closed NL grammar."""
-        if self._state != PREPARED or self._pending is None:
+    def confirm_plan(self) -> dict[str, Any]:
+        """Internal validate + confirm (no user gate).
+
+        Runs ``validate_agent_plan`` + ``confirm_agent_plan`` on the in-session
+        pending plan so the Gateway can execute it. The user-facing ``确认`` gate
+        is removed: this is called automatically right after presentation so
+        execution starts immediately; the user aborts a wrong workflow with
+        ``别动`` during execution instead of confirming beforehand.
+        """
+        if self._pending is None:
             raise IllegalStateError("ILLEGAL_STATE", "no pending workflow to confirm")
-        if classify(confirmation_text) != INTENT_CONFIRM:
-            raise NotConfirmedError("NOT_CONFIRMED", f"not a confirmation phrase: {confirmation_text!r}")
         validation = self._bridge.validate_agent_plan(
             plan_token=self._pending["plan_token"],
             timeout_sec=self._status_timeout_sec,
@@ -326,6 +331,37 @@ class InteractiveController:
             "task_id": self._confirmed["task_id"],
             "confirmed_task_budget_sec": self._confirmed["task_budget_sec"],
         }
+
+    def confirm(self, confirmation_text: str) -> dict[str, Any]:
+        """Optional gated confirm: bind the pending plan via the closed NL ``确认`` grammar, then confirm_plan()."""
+        if self._state != PREPARED or self._pending is None:
+            raise IllegalStateError("ILLEGAL_STATE", "no pending workflow to confirm")
+        if classify(confirmation_text) != INTENT_CONFIRM:
+            raise NotConfirmedError("NOT_CONFIRMED", f"not a confirmation phrase: {confirmation_text!r}")
+        return self.confirm_plan()
+
+    def run(
+        self,
+        raw_command: str,
+        steps: list[dict[str, Any]],
+        *,
+        stop_event: threading.Event | None = None,
+        feedback_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """No-gate one-shot flow: discover → prepare → auto confirm_plan → execute.
+
+        Removes the user-facing ``确认`` gate: the plan is validated and confirmed
+        internally so execution starts immediately after presentation. The user
+        interrupts a wrong workflow with ``别动`` (``stop_event`` / ``request_stop``)
+        during execution. Callable from ``IDLE`` or any definite terminal.
+        """
+        if self._state not in {IDLE, DISCOVERED, STOPPED, SUCCEEDED, FAILED}:
+            raise IllegalStateError("ILLEGAL_STATE", f"cannot run from state {self._state}")
+        if self._fresh_view is None:
+            self.discover()
+        self.prepare_workflow(raw_command, steps)
+        self.confirm_plan()
+        return self.execute(stop_event=stop_event, feedback_callback=feedback_callback)
 
     def execute(
         self,

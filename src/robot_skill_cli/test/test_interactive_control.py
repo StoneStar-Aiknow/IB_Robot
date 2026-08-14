@@ -281,6 +281,50 @@ def test_execute_success_reaches_succeeded_terminal(rig):
     assert "send_agent_plan_goal" in [m for m, _ in bridge.calls]
 
 
+def test_confirm_plan_runs_without_grammar_gate(rig):
+    controller, bridge = rig
+    controller.discover()
+    controller.prepare_workflow("点个头", [_step("nod_yes")])
+
+    confirmed = controller.confirm_plan()
+
+    assert controller.state == ic.CONFIRMED
+    assert confirmed["task_id"] == "id-2"
+    methods = [m for m, _ in bridge.calls]
+    assert "validate_agent_plan" in methods
+    assert "confirm_agent_plan" in methods
+
+
+def test_run_no_gate_executes_immediately(rig):
+    controller, bridge = rig
+    bridge.result_future = FakeFuture(None, done=True)
+    bridge.plan_result_status = 4
+
+    result = controller.run("点个头", [_step("nod_yes")])
+
+    assert controller.state == ic.SUCCEEDED
+    assert result["state"] == ic.SUCCEEDED
+    methods = [m for m, _ in bridge.calls]
+    # No user 确认 gate: validate+confirm happen automatically, then execute.
+    assert "validate_agent_plan" in methods
+    assert "confirm_agent_plan" in methods
+    assert "send_agent_plan_goal" in methods
+    assert "get_agent_plan_result" in methods
+
+
+def test_run_no_gate_stop_interrupts(rig):
+    controller, bridge = rig
+    bridge.plan_result_status = 5  # canceled -> STOPPED
+    stop_event = threading.Event()
+    stop_event.set()
+
+    result = controller.run("点个头", [_step("nod_yes")], stop_event=stop_event)
+
+    assert controller.state == ic.STOPPED
+    assert result["state"] == ic.STOPPED
+    assert "cancel_agent_plan" in [m for m, _ in bridge.calls]
+
+
 def test_execute_stop_reaches_definite_stopped_terminal(rig):
     controller, bridge = rig
     bridge.plan_result_status = 5  # GoalStatus.CANCELED

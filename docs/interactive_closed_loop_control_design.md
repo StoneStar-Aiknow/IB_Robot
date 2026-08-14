@@ -97,11 +97,17 @@ class InteractiveController:
         # 缓存 _pending = {plan_token, plan_digest, steps, raw_command, registry_identity}
         # 返回展示体：{steps, plan_digest, registry_identity, task_id(预生成), confirm_command}
 
-    # Feature 3：自然语言确认（封闭语法）
+    # Feature 3：确认（两种模式）
+    def confirm_plan(self) -> dict
+        # 无门：内部 validate_agent_plan + confirm_agent_plan（不等用户"确认"）
+        # 用于"纯立即执行"流程：prepare → confirm_plan → execute
     def confirm(self, confirmation_text: str) -> dict
-        # classify_confirm(confirmation_text) 命中封闭语法 → bridge.confirm_agent_plan(...)
-        # 缓存 _confirmed = {confirmation_token, task_id, task_budget_sec}
-        # 否则 raise NotConfirmedError
+        # 可选门：封闭语法校验（确认/confirm…）→ confirm_plan()
+        # 命中语法才 confirm_plan，否则 raise NotConfirmedError
+    def run(self, raw_command, steps, *, stop_event=None, feedback_callback=None) -> dict
+        # 纯立即执行（无确认门）：discover → prepare → confirm_plan → execute
+        # 用户看到 workflow 不对 → 执行中发"别动"经 stop_event/request_stop 中断
+        # Gateway 仍要求 confirmation_token，故 confirm_agent_plan 仍执行（只是自动、非用户门）
 
     # Feature 4：执行；执行期可经 stop_event 中断
     def execute(self, *, stop_event: threading.Event | None = None,

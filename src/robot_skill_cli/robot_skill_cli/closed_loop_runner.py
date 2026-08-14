@@ -130,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 4
         _emit("prepare", controller.prepare_workflow(args.raw_command, first_steps))
-        _emit("confirm", controller.confirm("确认执行当前计划"))
+        _emit("auto_confirm", controller.confirm_plan())
 
         if args.stop_after_sec > 0.0:
 
@@ -153,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
                     args.continue_command or "继续", [_workflow_step(args, args.continue_skill)]
                 )
             _emit("continue_prepare", presentation)
-            _emit("continue_confirm", controller.confirm("确认"))
+            _emit("continue_confirm", controller.confirm_plan())
             _emit("continue_terminal", controller.execute())
         elif args.resume or args.continue_skill:
             _emit(
