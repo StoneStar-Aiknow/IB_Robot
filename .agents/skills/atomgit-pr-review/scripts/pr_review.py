@@ -460,9 +460,9 @@ def main():
     if args.ai_model == "ai":
         print("\n⚠️  警告: 未指定 --ai-model 参数，将使用默认值 'ai'")
         print("   建议指定真实模型名称，例如：")
-        print("   --ai-model claude-sonnet-4")
-        print("   --ai-model gpt-4")
-        print("   --ai-model gemini-pro")
+        print("   --ai-model glm-5.2")
+        print("   --ai-model gpt-5.6-sol")
+        print("   --ai-model claude-fable-5")
         print()
 
     print("\n" + "=" * 60)

@@ -22,6 +22,61 @@ description: "Cross-compile third-party packages for OpenHarmony aarch64 using t
 - 第三方 ROS 2 包（用 `oh-cross-build-ros-pkg`）
 - 内核编译（用 `oh-rebuild-kernel`）
 
+## Internal References
+
+Read only the references needed for the current scenario:
+
+| Purpose | Reference |
+|---------|-----------|
+| 常见踩坑（config.h/autoheader/模块禁用/yodl/Python C 扩展/Rust+Python）及参考 BUILD | `references/pitfalls.md` |
+| Rust/Python 混合包的 maturin/PyO3 交叉编译 BUILD 模板 | `references/rust-python-template.md` |
+
+Do not expose these references as separate skills.
+
+## ⚠️ 构建前必做检查：先查 ohloha 源码是否已支持
+
+**在编译构建任何包之前，必须先拉取最新的 `tools_ohloha_pkgs` 源码，检查仓库中是否已经支持目标包。** 避免重复造轮子。
+
+### 检查步骤
+
+1. **拉取最新代码**：
+
+   ```bash
+   cd <ohloha_pkgs_dir>
+   git pull
+   ```
+
+2. **搜索目标包是否已存在**：
+
+   ```bash
+   # 按包名搜索 BUILD 文件
+   ls */BUILD 2>/dev/null | grep -i <包名>
+   # 或搜索目录
+   find . -maxdepth 2 -iname "*<包名>*" -type d
+   ```
+
+3. **如果已存在**：直接用 `builder.sh <包名>/BUILD` 构建，无需新建。检查已有 BUILD 文件的版本是否满足需求，如需升级版本，在原 BUILD 上修改而非新建。
+
+4. **如果不存在**：需要新增包。新增包时**必须遵循 ohloha 源码仓库中的规范**：
+   - 阅读 ohloha 仓库根目录的 `README.md`，了解包的命名约定、BUILD 文件格式、目录结构要求
+   - 阅读 ohloha 仓库 `.agents/skills/` 目录下的 skill 文档，这些 skill 专门描述了如何为 ohloha 新增包、BUILD 字段语义、hook 编写规范等
+   - 使用 `./pkgs-create.sh <包名>` 生成初始 BUILD 模板，再按规范填充字段
+
+### ohloha 源码仓库中的 skill 位置
+
+```
+tools_ohloha_pkgs/
+├── README.md                    # 仓库说明和快速上手
+├── .agents/skills/              # ohloha 专属 skill 文档
+│   └── ...                      # 新增包、BUILD 编写、hook 使用等规范
+├── pkgs-create.sh               # 创建新包脚手架
+├── builder.sh                   # 构建入口
+└── <已有包>/
+    └── BUILD                    # 已有包的构建规格（参考示例）
+```
+
+新增包前，优先参考仓库中**已有的同类包的 BUILD 文件**作为模板（例如新增 shell 类包参考 `bash/BUILD` 或 `zsh/BUILD`），再查阅 `.agents/skills/` 中的规范文档补充细节。
+
 ## ⚠️ 构建前置条件
 
 ### 1. OHOS_SDK 环境变量
@@ -111,162 +166,17 @@ export PATH=/usr/bin:/bin:$PATH
 | `custom_build` | 构建前 | 自定义构建流程（设 `_custom_build_continue=false` 可跳过默认流程） |
 | `postbuilt_hook` | 构建后 | 后处理 |
 
-## 已知踩坑与修复
+## 已知踩坑
 
-### 坑 1: OH SDK `diff` 损坏 → config.h 不生成
+7 个常见坑及其修复方案详见 `references/pitfalls.md`，覆盖：
 
-**症状**：configure 说 `config.h is unchanged` 但 config.h 不存在，make 报 `No such file`。
-
-**根因**：OH SDK 的 `diff` 对所有输入返回 0，config.status 误判"unchanged"跳过创建。
-
-**修复**：`native_env_hook` 里 `export PATH=/usr/bin:/bin:$PATH`。
-
-### 坑 2: `autoheader` 在 make 阶段删除 config.h
-
-**症状**：configure 成功创建 config.h，但 make 运行 `autoheader` 后 config.h 消失。
-
-**根因**：zsh/vim 等 autotools 项目的 Makefile 在 `headers` target 中调用 `autoheader`，交叉编译下重建 config.h 失败导致被删。
-
-**修复**：configure 前 sed 修改 Makefile.in 禁用 autoheader：
-
-```bash
-sed -i 's/cd \$(sdir) && autoheader/cd $(sdir) \&\& true/' Makefile.in
-```
-
-### 坑 3: 交叉编译下模块/功能被禁用
-
-**症状**：zsh 的 `zsh/regex`、`zsh/system` 模块 `zmodload` 失败；configure 检测不到某些功能。
-
-**根因**：交叉编译下 configure 无法运行 run-test（dlopen、功能探测等），相关模块被设为 `link=no` 或功能被 `#undef`。
-
-**修复**：configure 后手动修改生成文件：
-- zsh: `sed -i 's/link=no/link=static/' config.modules`（把需要的模块改为 static 编进二进制）
-- 其他: 手动编辑 `config.h` 把 `#undef` 改为 `#define`
-
-### 坑 4: GitHub 源码归档不含预生成 configure
-
-**症状**：`builder.sh` 报 `no executable configure file in this project`。
-
-**根因**：GitHub archive 只有 `configure.ac`，没有预生成的 `configure`。
-
-**修复**：`custom_build` 里先 `autoreconf -fi` 生成 configure。
-
-### 坑 5: install.man / install.runhelp 需要 yodl（zsh）
-
-**症状**：`make install` 在 `install.man` 阶段失败。
-
-**根因**：man 页需要 yodl 文档工具生成，主机未安装。
-
-**修复**：设 `pkg_build_autotools_make_install_target="install.bin install.modules install.fns"`（跳过 man/runhelp）。
-
-### 坑 6: Python C 扩展包构建
-
-**症状**：需要交叉编译 `regex`、`numpy` 等 Python C 扩展到 OH musl/aarch64。
-
-**适用模式**：`pkg_build_type="custom"` + `setup_pycrossenv` + `pip install --no-binary :all: .`
-
-**关键点**：
-- `pkg_build_deps` 至少需要 `python3>3.7`
-- `setup_pycrossenv` 会设置 OH 交叉编译环境（CC/CXX/CFLAGS/LDFLAGS + 目标 Python 头文件）
-- `pip install --no-binary :all: .` 在 pycrossenv 中从源码编译 C 扩展
-- 产物在 `${HOST_SITE_PKGS}/` 下，`postbuilt_hook` 需复制到 `${target_root_with_pkgname}/${OHOS_LIBDIR}/python${PY_VERSION}/site-packages/`
-
-**参考 BUILD**：`python3-netifaces/BUILD`（简单 C 扩展）、`python3-regex/BUILD`
-
-### 坑 7: Rust/Python 混合包构建（maturin/PyO3）
-
-**症状**：需要交叉编译 `tokenizers`（HuggingFace）等 Rust+Python 混合包。
-
-**核心挑战**：OH SDK 用 musl+libc++（不是 glibc+libstdc++），Rust 的 `aarch64-unknown-linux-musl` target 与 OH SDK 的 `aarch64-linux-ohos` 存在 C++ ABI 和链接库差异。
-
-**前置条件**：主机需要安装 Rust 工具链：
-```bash
-rustup target add aarch64-unknown-linux-musl
-pip install maturin
-```
-
-**BUILD 模板**（`pkg_build_type="custom"`）：
-
-`custom_build` hook 中需要设置以下环境变量：
-
-```bash
-custom_build() {
-    export PATH="${HOME}/.cargo/bin:${PATH}"
-    rustup target list --installed | grep -qx aarch64-unknown-linux-musl || \
-        rustup target add aarch64-unknown-linux-musl
-    command -v maturin >/dev/null 2>&1 || python3 -m pip install maturin
-
-    setup_pycrossenv
-
-    local ohos_sysroot="${OHOS_SDK}/native/sysroot"
-    local ohos_cc="${OHOS_SDK}/native/llvm/bin/clang"
-    local ohos_cxx_inc="${OHOS_SDK}/native/llvm/include/libcxx-ohos/include/c++/v1"
-    local ohos_libdir="${ohos_sysroot}/usr/lib/aarch64-linux-ohos"
-
-    # Rust musl expects libgcc_s/libstdc++, while OH uses libunwind/libc++.
-    # Create empty compatibility archives only when the SDK does not provide
-    # them; never overwrite existing toolchain libraries.
-    mkdir -p "${ohos_libdir}"
-    if [[ ! -e "${ohos_libdir}/libgcc_s.a" ]]; then
-        "${OHOS_SDK}/native/llvm/bin/llvm-ar" \
-            rcs "${ohos_libdir}/libgcc_s.a"
-    fi
-    if [[ ! -e "${ohos_libdir}/libstdc++.a" ]]; then
-        "${OHOS_SDK}/native/llvm/bin/llvm-ar" \
-            rcs "${ohos_libdir}/libstdc++.a"
-    fi
-
-    # --- Rust linker 配置 ---
-    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="${ohos_cc}"
-    export RUSTFLAGS="-C linker=${ohos_cc} \
-        -C link-arg=--target=aarch64-linux-ohos \
-        -C link-arg=--sysroot=${ohos_sysroot} \
-        -C link-arg=-lpython${PY_VERSION}"
-
-    # --- cc-rs 配置（Rust 的 C/C++ 编译 wrapper） ---
-    # 1. 用 target-specific 变量覆盖编译器，避免 cc-rs 自动加 --target=<rust_target>
-    export CC_aarch64_unknown_linux_musl="${ohos_cc}"
-    export CXX_aarch64_unknown_linux_musl="${OHOS_SDK}/native/llvm/bin/clang++"
-    export CRATE_CC_NO_DEFAULTS=1
-    # 2. C++ 头文件：OH SDK 有两套，libcxx-ohos 目录下才有 __config_site
-    export CFLAGS_aarch64_unknown_linux_musl="--target=aarch64-linux-ohos --sysroot=${ohos_sysroot} -I${ohos_cxx_inc}"
-    export CXXFLAGS_aarch64_unknown_linux_musl="--target=aarch64-linux-ohos --sysroot=${ohos_sysroot} -I${ohos_cxx_inc} -std=c++17"
-    # 3. OH 用 libc++ 不是 libstdc++，cc-rs 默认链接 stdc++，需覆盖
-    export CXXSTDLIB="c++"
-
-    # --- PyO3 交叉编译 ---
-    local host_python=$(which python3)
-    export PYO3_PYTHON="${host_python}"
-    export PYO3_CROSS_PYTHON_VERSION="${PY_VERSION}"
-    export PYO3_CROSS_LIB_DIR="${HOST_PYTHON_DIST}/lib"
-    export PYO3_CROSS_INCLUDE_DIR="${HOST_PYTHON_DIST}/include/python${PY_VERSION}"
-
-    pushd ${current_source_root}
-    # maturin build：用主机 Python 做 metadata，Rust 交叉编译
-    # --skip-auditwheel 跳过共享库打包检查（OH 的 libpython/libc++ 不在主机上）
-    maturin build --interpreter "${host_python}" --target aarch64-unknown-linux-musl --release --skip-auditwheel
-
-    # 主机 pip 无法安装 musllinux wheel，手动解压
-    local wheel_file=$(find ${current_source_root} -name "*.whl" -path "*/wheels/*" 2>/dev/null | head -1)
-    local extract_dir="${current_source_root}/wheel_extracted"
-    rm -rf "${extract_dir}" && mkdir -p "${extract_dir}"
-    python3 -m zipfile -e "${wheel_file}" "${extract_dir}"
-    cp -r "${extract_dir}/<pkg_name>" "${HOST_SITE_PKGS}/"
-    cp -r "${extract_dir}/<pkg_name>-<version>.dist-info" "${HOST_SITE_PKGS}/"
-    popd
-
-    destroy_pycrossenv
-    _custom_build_continue=false
-}
-```
-
-**`libgcc_s` 缺失**：Rust musl target 链接时需要 `-lgcc_s`，但 OH 用
-`libunwind` 替代。模板在 `ohos_sysroot` 定义后创建空兼容 archive，并用
-文件存在检查保护 SDK 中已有的 toolchain library，重复构建不会覆盖它们。
-
-**版本兼容性**：编译的包版本必须满足板上其他 Python 包的版本约束（如 `transformers` 要求 `tokenizers>=0.22.0,<=0.23.0`）。PyPI 某些版本可能没有 sdist（只有 wheel），需要检查 `pip download <pkg>==<ver> --no-binary :all:` 是否可用。
-
-**参考 BUILD**：`python3-tokenizers/BUILD`
+1. OH SDK `diff` 损坏 → config.h 不生成
+2. `autoheader` 在 make 阶段删除 config.h
+3. 交叉编译下模块/功能被禁用
+4. GitHub 源码归档不含预生成 configure
+5. install.man / install.runhelp 需要 yodl（zsh）
+6. Python C 扩展包构建
+7. Rust/Python 混合包构建（详见 `references/rust-python-template.md`）
 
 ## 部署到板子
 
@@ -306,13 +216,3 @@ ssh root@<board> 'cd /data/<pkg> && tar xzf /data/<pkg>-extras.tar.gz && rm /dat
 | zsh | 5.9 | autotools | libncursesw | [#4](https://gitcode.com/openharmony-robot/tools_ohloha_pkgs/pull/4) |
 | python3-regex | 2026.6.28 | custom (C ext) | python3 | [#6](https://gitcode.com/openharmony-robot/tools_ohloha_pkgs/pull/6) |
 | python3-tokenizers | 0.22.2 | custom (Rust) | python3 | 待提交 |
-
-## 参考示例
-
-- **bash/BUILD**: 简单 autotools 包，自带 readline，`--with-curses --without-bash-malloc --disable-nls`
-- **zsh/BUILD**: 复杂 autotools 包，需 autoreconf、禁用 autoheader、改 config.modules 把 regex/system 改 static
-- **vim/BUILD**: autotools 包，需 patch CFLAGS 和 Makefile，`VIMRUNTIMEDIR` 必须设为板端实际路径
-- **libreadline/BUILD**: 简单 autotools 包，`--with-curses`，可作为依赖构建的参考
-- **python3-netifaces/BUILD**: Python C 扩展包，`setup_pycrossenv` + `pip install --no-binary :all: .`
-- **python3-regex/BUILD**: Python C 扩展包（regex），同 netifaces 模式
-- **python3-tokenizers/BUILD**: Rust/Python 混合包（tokenizers），maturin + PyO3 交叉编译，见坑 7

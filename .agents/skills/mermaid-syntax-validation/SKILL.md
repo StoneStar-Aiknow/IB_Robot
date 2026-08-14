@@ -22,81 +22,20 @@ description: "检查、修复并验证 Markdown/Sphinx 文档中的 Mermaid 图�
 
 不要重写架构、重命名概念实体、简化图，或为了让解析通过而删除 label。如果可见文本必须转义，应使用 Mermaid 兼容语法并保留显示含义。
 
+## Internal References
+
+Read only the references needed for the current step:
+
+| Purpose | Reference |
+|---------|-----------|
+| 必做上下文检查的脚本（统计 fence、找含 Mermaid 的 HTML、检查 script 标签） | `references/context-checks.md` |
+| 静态风险扫描脚本、高风险模式表、flowchart/state diagram 修复规则 | `references/static-scan-and-fix-rules.md` |
+
+Do not expose these references as separate skills.
+
 ## 必做上下文检查
 
-1. 确认文档栈：
-   - `docs/source/conf.py`
-   - `extensions` 包含 `myst_parser` 和/或 `sphinxcontrib.mermaid`
-   - 如果 Markdown 使用 ```` ```mermaid ```` fence，应保留 `myst_fence_as_directive = ["mermaid"]`
-   - `mermaid_output_format`、`mermaid_version`、`mermaid_include_elk`、`mermaid_fullscreen`、`mermaid_init_config`
-   - `html_js_files` 中加载浏览器 runtime 的条目，例如 `js/mermaid.min.js`、`js/mermaid-run.js`、`js/mermaid.esm.min.mjs`，或旧的自定义文件如 `js/mermaid-init.js`
-   - 是否有项目自定义 monkey patch 或 override，用于禁用 `sphinxcontrib-mermaid` 自动注入 JavaScript
-2. 确认本地 runtime 资源：
-   - UMD/全局对象 runtime：`docs/source/_static/js/mermaid.min.js` 以及 runner，例如 `docs/source/_static/js/mermaid-run.js`
-   - ESM runtime：`docs/source/_static/js/mermaid.esm.min.mjs` 以及必需的相对 `docs/source/_static/js/chunks/` 目录树
-   - 通过 Sphinx 配置项指定的可选本地依赖，例如 `mermaid_use_local`、`mermaid_elk_use_local`、`mermaid_zenuml_use_local`、`d3_use_local`
-   - 除非用户明确接受在线文档，否则 Mermaid/Panzoom/D3 runtime 不应从 `cdn.jsdelivr.net`、`unpkg.com` 或其他 CDN 拉取
-3. 统计 Mermaid fence（Linux/bash 主路径）：
-   ```bash
-   python3 - <<'PY'
-   from pathlib import Path
-
-   print(sum(1 for path in Path("docs").rglob("*.md") for line in path.read_text(encoding="utf-8").splitlines() if line.strip() == "```mermaid"))
-   PY
-   ```
-   <details><summary>Windows PowerShell 可选扩展</summary>
-
-   ```powershell
-   Get-ChildItem -LiteralPath "docs" -Recurse -File -Filter "*.md" |
-     Select-String -Pattern '^```mermaid\s*$' |
-     Measure-Object |
-     Select-Object -ExpandProperty Count
-   ```
-
-   </details>
-4. 找出生成 HTML 中包含 Mermaid 的页面（Linux/bash 主路径）：
-   ```bash
-   python3 - <<'PY'
-   from pathlib import Path
-   import re
-
-   pattern = re.compile(r'class="mermaid"|class="[^" ]*mermaid')
-   for path in sorted(Path("docs/build/html").rglob("*.html")):
-       if pattern.search(path.read_text(encoding="utf-8", errors="ignore")):
-           print(path)
-   PY
-   ```
-   <details><summary>Windows PowerShell 可选扩展</summary>
-
-   ```powershell
-   Get-ChildItem -LiteralPath "docs/build/html" -Recurse -File -Filter "*.html" |
-     Select-String -Pattern 'class="mermaid"|class="[^" ]*mermaid' |
-     ForEach-Object { $_.Path } |
-     Sort-Object -Unique
-   ```
-
-   </details>
-5. 至少检查一个 Mermaid 较多页面的生成 HTML script 标签（Linux/bash 主路径）：
-   ```bash
-   python3 - <<'PY'
-   from pathlib import Path
-   import re
-
-   pattern = re.compile(r'mermaid\.min\.js|mermaid-run\.js|mermaid\.esm\.min\.mjs|cdn\.jsdelivr\.net|unpkg\.com')
-   for path in sorted(Path("docs/build/html").rglob("*.html")):
-       text = path.read_text(encoding="utf-8", errors="ignore")
-       if pattern.search(text):
-           print(path)
-   PY
-   ```
-   <details><summary>Windows PowerShell 可选扩展</summary>
-
-   ```powershell
-   Select-String -Path "docs/build/html/**/*.html" `
-     -Pattern 'mermaid\.min\.js|mermaid-run\.js|mermaid\.esm\.min\.mjs|cdn\.jsdelivr\.net|unpkg\.com'
-   ```
-
-   </details>
+执行修复前必须完成 5 项上下文检查（确认文档栈、确认本地 runtime 资源、统计 Mermaid fence、找含 Mermaid 的 HTML、检查 script 标签）。详细脚本见 `references/context-checks.md`。
 
 ## Runtime 预期
 
@@ -113,83 +52,7 @@ description: "检查、修复并验证 Markdown/Sphinx 文档中的 Mermaid 图�
 
 ## 静态风险扫描
 
-编辑前先做源文件扫描。该扫描不能替代浏览器验证。
-
-```bash
-python3 - <<'PY'
-from pathlib import Path
-import re
-
-patterns = [
-    r'^\s*\["',
-    r'--?>\s*\["',
-    r'\.->\s*\["',
-    r'^\s*subgraph\s+"[^"]+"\s+\[',
-    r'\s--\s*"',
-    r'\s--"',
-]
-compiled = [re.compile(pattern) for pattern in patterns]
-for path in sorted(Path("docs").rglob("*.md")):
-    for line_number, line in enumerate(path.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
-        if any(pattern.search(line) for pattern in compiled):
-            print(f"{path}:{line_number}:{line}")
-PY
-```
-
-<details><summary>Windows PowerShell 可选扩展</summary>
-
-```powershell
-Get-ChildItem -LiteralPath "docs" -Recurse -File -Filter "*.md" |
-  Select-String -Pattern '^\s*\["','--?>\s*\["','\.->\s*\["','^\s*subgraph\s+"[^"]+"\s+\[','\s--\s*"','\s--"'
-```
-
-</details>
-
-高风险模式：
-
-| 模式 | 失败原因 | 仅语法修复 |
-|---|---|---|
-| `A --> ["label"]` | 匿名节点作为边端点 | 创建稳定节点 id：`A --> node_id["label"]` |
-| `["label"]` 独立声明 | 匿名节点声明 | 创建稳定节点 id：`node_id["label"]` |
-| `subgraph "ID" ["Title"]` | subgraph 写法不兼容 | `subgraph ID["Title"]` |
-| `A -- "label" --> B` | 旧式边 label 可能失败 | `A -->|"label"| B` |
-| `A --> B : "label"` | flowchart 旧式尾随 label | `A -->|"label"| B` |
-| `A -->|/topic (type)| B` | edge label 含未加引号的括号 | `A -->|"/topic (type)"| B` |
-| `B{func(arg)}` | diamond 节点 label 含未加引号的括号 | `B{"func(arg)"}` |
-| `A --> B: file.py:1-2` in `stateDiagram-v2` | transition label 内含额外冒号 | `A --> B: file.py#58;1-2` |
-
-## 修复规则
-
-### Flowchart 边 Label
-
-使用 pipe label 语法。
-
-```mermaid
-A -->|"label with (parentheses), /slashes, or :colon"| B
-```
-
-当 label 含有 `(`、`)`、`/`、`:`、`<`、`>`、`,` 或其他标点时，优先加引号。
-
-### Flowchart 节点 Label
-
-节点形状内的 label 如果包含标点，应加引号。
-
-```mermaid
-B{"get_scene_file(scene_name, platform)"}
-C["/base_velocity_controller/commands (std_msgs/Float64MultiArray)"]
-```
-
-### State Diagram Transition Label
-
-`stateDiagram-v2` 使用 `A --> B: label`。如果 label 自身还需要额外冒号，应把内部冒号转成 Mermaid entity 文本：
-
-```mermaid
-Idle --> GoalEvaluation: handle_goal()<br/>episode_recorder.py#58;277-288
-```
-
-### 保留原内容
-
-除 Mermaid 语法转义外，保持可见 label 不变。例如 `file.py#58;277-288` 应在 Mermaid 中显示为预期的 `file.py:277-288`。
+编辑前先做源文件扫描。该扫描不能替代浏览器验证。扫描脚本、高风险模式表和修复规则见 `references/static-scan-and-fix-rules.md`。
 
 ## 构建验证
 

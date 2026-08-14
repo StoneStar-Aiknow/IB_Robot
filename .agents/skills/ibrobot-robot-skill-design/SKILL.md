@@ -5,7 +5,7 @@ description: "Use when designing, adding, modifying, or validating an IB-Robot e
 
 # IB-Robot Robot Skill Design Guide
 
-This skill is an interactive design workflow for adding or changing robot skills in IB-Robot. It prevents semantic mistakes such as implementing "move around the observation pose" as an unrelated joint-space gesture.
+Interactive design workflow for adding or changing robot skills in IB-Robot. Prevents semantic mistakes such as implementing "move around the observation pose" as an unrelated joint-space gesture.
 
 ## Core Rule
 
@@ -26,6 +26,18 @@ Hermes / Agent / CLI
 ```
 
 Do not add direct hardware, `/task_executor/*`, MoveIt, ros2_control, or controller calls unless the user explicitly asks for an architecture change and an architecture review is performed.
+
+## Internal References
+
+Read only the references needed for the current step:
+
+| Purpose | Reference |
+|---------|-----------|
+| Author/validate the `description:` contract (Step 5) | `references/contract-schema.md` |
+| Concrete YAML starting points for primitives (Step 7) | `references/canonical-templates.md` |
+| Common failure modes to review before real robot execution | `references/failure-modes.md` |
+
+Do not expose these references as separate skills.
 
 ## Mandatory Interaction Flow
 
@@ -91,69 +103,16 @@ For joint gesture patterns:
 
 ### Step 5: Author the Description Contract (Mandatory)
 
-Every new or modified skill MUST carry a `description:` block in the SSOT YAML (co-located with its `primitive_sequence`). This block is the single source of truth for how an Agent/Hermes caller and the rule parser pick THIS skill over its near-synonyms. Omitting it is an architecture violation, not a style choice.
+Every new or modified skill MUST carry a `description:` block in the SSOT YAML. See `references/contract-schema.md` for the full schema, validation rules, and a disambiguation example. Key invariants:
 
-Required schema (validated by `robot_config.loader._validate_skill_description`):
-
-```yaml
-<skill_name>:
-  description:
-    summary: "<= 120 chars, intent-first, not a mechanical description>"
-    category: <observation|recovery|gripper|translation|rotation|dance|social_greeting|social_affirmation|social_emotion|...>
-    when_to_use: [<short phrases describing when to pick this skill>]
-    do_not_use:                             # MANDATORY for any skill with near-synonyms
-      - condition: "<when NOT to pick this one>"
-        instead_use: <existing_skill_name>  # must be a real skill in the same config
-    aliases_zh: [<中文触发词>]               # ALSO drives the rule parser (single keyword source)
-    aliases_en: [<english triggers>]
-    motion_scope: [<base|shoulder|elbow|wrist|gripper|arm>]
-    anchor_pose: <named pose | none>         # must exist in embodied.named_poses unless 'none'
-    intensity: <subtle|moderate|large>       # safety-relevant: large motions near people need care
-    duration_sec_estimate: <float > 0>
-    requires_motion_params: <bool>           # true if it needs motion_direction/distance from the caller
-    rule_entry: <bool>                       # true exposes aliases_zh to the deterministic rule parser
-```
-
-Disambiguation rule (the whole point of this contract):
-
-- Before finalizing a new skill, list its near-synonyms among existing skills and add one `do_not_use` entry per synonym redirecting to the right alternative.
-- Conversely, add反向 redirects on the existing synonym skills pointing at the new one when the boundary changes.
-- `aliases_zh` is the SSOT for Chinese trigger keywords and catalog aliases; do NOT duplicate keyword lists in `embodied_common.command_parser` hardcode.
-- `extract_skill_aliases` injects `aliases_zh` into the deterministic rule parser only when `rule_entry: true` and `requires_motion_params: false`.
-- `summary` must be intent-driven ("Wave hello/goodbye with the wrist"), not mechanical ("Sinusoidal joint-5 motion").
-- `do_not_use.instead_use` must reference a skill that actually exists in the same config — the loader rejects dangling redirects.
-- `duration_sec_estimate` must cover deterministic arm motion plus 1.0 second for an `open`/`closed`
-  `initial_gripper_state` and 1.0 second for every explicit `open_gripper`/`close_gripper` primitive, with margin.
-
-Example (greeting cluster disambiguation):
-
-```yaml
-wave_hello:
-  description:
-    summary: "Wave hello or goodbye with the wrist (casual greeting gesture)."
-    category: social_greeting
-    when_to_use: ["greet someone", "say hi or bye", "wave to a person"]
-    do_not_use:
-      - condition: "agree or say yes"
-        instead_use: nod_yes
-      - condition: "formal raise-hand greet at the observe pose"
-        instead_use: greet_observe_raise
-      - condition: "dance rhythmically"
-        instead_use: dance_basic
-    aliases_zh: ["打招呼", "挥手", "挥挥手", "再见", "嗨"]
-    motion_scope: [wrist]
-    anchor_pose: home
-    intensity: moderate
-    duration_sec_estimate: 8.0
-    requires_motion_params: false
-    rule_entry: true
-```
+- `summary` is intent-first, <= 120 chars.
+- `do_not_use.instead_use` must reference a real skill in the same config.
+- `aliases_zh` is the SSOT for Chinese trigger keywords (also drives the rule parser when `rule_entry: true`).
+- `duration_sec_estimate` must cover arm motion plus gripper primitive overhead with margin.
 
 ### Step 6: Produce A Design Record
 
 Before code changes, show a concise design record and ask for confirmation unless the user explicitly requested full autonomy.
-
-Use this format:
 
 ```markdown
 Skill Design
@@ -185,110 +144,7 @@ For normal robot skill changes, edit the smallest necessary set:
 - Tests under the affected packages.
 - README files when launch commands, catalog usage, or public behavior changes.
 
-Do not add backward-compatibility aliases for removed skill names unless there is persisted data, an external consumer, or an explicit user requirement.
-
-## Canonical Templates
-
-Every template below must additionally carry the `description:` contract from Step 5. It is omitted here for brevity; never ship a skill without it.
-
-### Named Pose Skill
-
-```yaml
-<skill_name>:
-  primitive_sequence:
-    - primitive_name: move_to_named_pose
-      pose_name: observe_table
-```
-
-### Anchored Cartesian Pattern
-
-Use for "move around the observation pose".
-
-```yaml
-<skill_name>:
-  primitive_sequence:
-    - primitive_name: move_to_named_pose
-      pose_name: observe_table
-    - primitive_name: move_relative_ee
-      motion_direction: up
-      motion_distance: 0.04
-    - primitive_name: move_relative_ee
-      motion_direction: down
-      motion_distance: 0.08
-    - primitive_name: move_relative_ee
-      motion_direction: up
-      motion_distance: 0.04
-    - primitive_name: move_to_named_pose
-      pose_name: observe_table
-```
-
-### Request-Parameterized Relative Motion
-
-```yaml
-<skill_name>:
-  primitive_sequence:
-    - primitive_name: move_relative_ee
-      motion_direction_from_request: true
-      motion_distance_from_request: true
-```
-
-### Joint Wave Gesture
-
-```yaml
-<skill_name>:
-  description:
-    summary: "Wave hello or goodbye with the wrist (casual greeting gesture)."
-    category: social_greeting
-    when_to_use: ["greet someone", "say hi or bye"]
-    do_not_use:
-      - condition: "agree or say yes"
-        instead_use: nod_yes
-    aliases_zh: ["打招呼", "挥手"]
-    motion_scope: [wrist]
-    anchor_pose: home
-    intensity: moderate
-    duration_sec_estimate: 8.0
-    requires_motion_params: false
-    rule_entry: true
-  primitive_sequence:
-    - primitive_name: move_to_joint_positions
-      joint_positions:
-        "1": 0.02
-        "2": 0.54
-        "3": -0.82
-        "4": -0.18
-        "5": 0.02
-      duration_sec: 2.0
-    - primitive_name: move_through_joint_positions
-      trajectory_template:
-        type: single_joint_wave_v1
-        waypoint_duration_sec: 0.05
-        active_waypoint_count: 16
-        repeat_count: 3
-        base_pose:
-          "1": 0.02
-          "2": 0.54
-          "3": -0.82
-          "4": -0.18
-          "5": 0.02
-        joint: "5"
-        amplitude: 0.35
-        workspace_limits:
-          model: so101_arm_v1
-          points:
-            ee:
-              x: [-0.32, 0.25]
-              y: [-0.42, 0.00]
-              z: [0.05, 0.55]
-    - primitive_name: move_to_joint_positions
-      joint_positions:
-        "1": 0.02
-        "2": 0.54
-        "3": -0.82
-        "4": -0.18
-        "5": 0.02
-      duration_sec: 2.0
-```
+Concrete YAML templates for each skill type are in `references/canonical-templates.md`. Do not add backward-compatibility aliases for removed skill names unless there is persisted data, an external consumer, or an explicit user requirement.
 
 ## Validation Checklist
 
@@ -307,6 +163,8 @@ Always validate the design before real robot execution:
 - Catalog `doc` is auto-synthesized from the `description:` block; do not hand-maintain per-skill prose.
 - Real robot testing starts with RViz when the user wants visual confirmation.
 - After real robot testing, execute `recover_safe_pose` unless the user explicitly wants to leave the robot at the final pose.
+
+For common mistakes to watch for, see `references/failure-modes.md`.
 
 ## Verification Commands
 
@@ -338,17 +196,3 @@ robot-skill --config-name NAME validate SKILL ARGS
 robot-skill --config-name NAME execute SKILL --task-id ID
 robot-skill --config-name NAME execute recover_safe_pose --task-id ID
 ```
-
-## Common Failure Modes
-
-- Implementing an anchored spatial request as joint `base_pose` motion.
-- Forgetting to add the skill to `planning_policy.allowed_skills` when the planner should generate it.
-- Assuming planner `allowed_skills` controls catalog exposure; the catalog uses the current robot YAML and the template's `disabled` flag.
-- Exposing a skill in the catalog but not updating catalog tests.
-- Adding a new trajectory template when existing `move_relative_ee` primitives are sufficient.
-- Running real robot tests without `ROS_DOMAIN_ID` in the same shell.
-- Leaving RViz/runtime background processes running after verification without telling the user.
-- Adding a skill without a `description:` block, leaving Agent/LLM callers unable to disambiguate it from near-synonyms.
-- Hand-writing per-skill prose instead of the SSOT `description:` block, so the catalog and rule parser drift from the YAML.
-- Declaring `do_not_use.instead_use` pointing at a skill that does not exist (loader will reject) or forgetting反向 redirects on the synonym skills.
-- Duplicating Chinese keywords in `command_parser` hardcode instead of sourcing them from `description.aliases_zh`.

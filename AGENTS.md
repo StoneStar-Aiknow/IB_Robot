@@ -106,6 +106,7 @@ source .shrc_local
 | 技能 | 触发场景 |
 |------|---------|
 | [ibrobot-env](.agents/skills/ibrobot-env) | 环境初始化、source .shrc_local、PYTHONPATH |
+| [ibrobot-worktree-env](.agents/skills/ibrobot-worktree-env) | git worktree 环境复用主仓库 venv、避免主仓库/worktree 混合环境 |
 | [ibrobot-build](.agents/skills/ibrobot-build) | 编译、colcon build、构建错误 |
 | [ibrobot-launch](.agents/skills/ibrobot-launch) | 分平台启动 Ubuntu/openEuler 工作区或 OpenHarmony 板端机器人、仿真、推理、teleop |
 | [ibrobot-architecture](.agents/skills/ibrobot-architecture) | 架构、SSOT、契约、robot_config、数据流 |
@@ -140,6 +141,7 @@ source .shrc_local
 | [ibrobot-docker-verify](.agents/skills/ibrobot-docker-verify) | Ubuntu Docker 验证 setup+build |
 | [ibrobot-docker-verify-oee](.agents/skills/ibrobot-docker-verify-oee) | openEuler aarch64 Docker 验证 |
 | [sync-github](.agents/skills/sync-github) | 同步 AtomGit master 到 GitHub |
+| [skill-creator](.agents/skills/skill-creator) | 新建/重构 Agent skill、编写 SKILL.md、按 agentskills.io 规范校验 |
 
 ### 文档工具
 

@@ -1,6 +1,6 @@
 ---
 name: ibrobot-control
-description: Use when a user asks Hermes or an Agent to discover, validate, execute, cancel, or stop an IB-Robot capability.
+description: "Discover, validate, execute, cancel, or stop IB-Robot capabilities through the `robot-skill` CLI and ROS Capability Gateway. Use when user asks Hermes or an Agent to 'run a robot skill', 'execute robot action', 'cancel motion', 'stop robot', '执行机器人动作', '取消动作', '停止机器人', 'nod', 'wave', 'celebrate', 'look around', or interact with existing high-level robot skills. Requires explicit user motion confirmation before any physical motion; never bypasses the Gateway or calls raw ros2 / MoveIt / controller commands directly."
 ---
 
 # IB-Robot Control

@@ -42,153 +42,74 @@ python3 review_resolution.py --pr 123
 # 直接从链接解析目标 PR
 python3 review_resolution.py --url https://atomgit.com/some-org/some-repo/pull/123
 
-# 直接从链接解析目标 PR
-python3 repair_pr.py --url https://atomgit.com/some-org/some-repo/pull/123
-
 # 步骤2: 你分析评论并生成修复方案
 
 # 步骤3: 人类确认修复方案
 
-# 步骤4: 应用修复方案（⚠️ 必须指定 --ai-model）
-python3 review_resolution.py --pr 123 --apply-fixes ./tmp/ib_robot_pr_123_fix_results.json --ai-model claude-sonnet-4
+# 步骤4: 应用、推送并在远端验证后回复（⚠️ 必须指定 --ai-model）
+python3 review_resolution.py --pr 123 --apply-fixes ./tmp/ib_robot_pr_123_fix_results.json --push --ai-model glm-5.2
+
+# pending_push / pending_replies 后从原子状态文件恢复
+python3 review_resolution.py --resume ./tmp/ib_robot_pr_123_review_resolution_<transaction-id>.json
 ```
-
-### 回复某一条 review 意见
-
-当用户明确要求“只回复某条评论 / 针对 comment_id 回复 / 这条意见单独回一下”时，不需要生成 fixes.json，直接使用单评论回复模式：
-
-```bash
-python3 review_resolution.py --pr 123 --reply-comment 456 --reply-body "已确认，这里按建议补充边界检查。" --ai-model gpt-5.5
-
-# 回复内容较长时，从文件读取，避免 shell 转义导致 Markdown 损坏
-python3 review_resolution.py --pr 123 --reply-comment 456 --reply-file ./tmp/reply_456.md --ai-model gpt-5.5
-
-# 如需显式指定 discussion 下的嵌套回复，可写 threaded（默认就是 threaded）
-python3 review_resolution.py --pr 123 --reply-comment 456 --reply-file ./tmp/reply_456.md --reply-mode threaded --ai-model gpt-5.5
-
-# 只有在明确需要额外发一条页面可见评论时，才显式指定 visible
-python3 review_resolution.py --pr 123 --reply-comment 456 --reply-file ./tmp/reply_456.md --reply-mode visible --ai-model gpt-5.5
-```
-
-脚本默认使用 `--reply-mode threaded`：
-
-- 对已有 review discussion，直接在 **原 review 线程下追加详细回复**
-- 这样可以避免“线程下已有简短回复，同时又额外生成一条顶层/行内评论”的冗余展示
-
-只有在显式指定 `--reply-mode visible` 时，才会：
-
-- 对 PR 总评 / 普通评论，发送 **页面可见的 PR 顶层评论**
-- 对 DiffNote / 行内评论，发送 **页面可见的 inline comment**
-
-`visible` 适合需要额外补一条页面可见评论的场景；常规 review 跟进默认应使用 threaded。
-
-### 审查者复查闭环（开发者已修复 review 意见后）
-
-本 skill 默认面向**被审查者**（修复别人提的 review 意见）。但审查者一方也有闭环需求：开发者按意见更新代码后，审查者需要复查最新提交、确认修复，并把可标记的意见标记为已解决。推荐流程：
-
-1. 用 `atomgit-pr-review` 的 `pr_review.py --pr N` 重新提取最新 PR 上下文，逐条核对开发者是否真的修复了每条意见（看最新 diff 与测试是否同步更新）。
-2. 用 `review_resolution.py --pr N --include-self-comments` 抓取**自己之前提交的**未解决评论——审查者要闭环的正是自己提的意见，而脚本默认会过滤当前用户的评论，**必须加 `--include-self-comments`**。
-3. 对每条已确认修复的意见：
-   - 先用 `--reply-comment <id> --reply-file <回复文件> --reply-mode threaded` 在原线程下回复确认（正文明确写出「已修复并复查确认通过，标记为已解决」）。
-   - 若该条是 `diff_comment`（行内评论），再追加 `--resolve-comment <id> --resolved true` 标记已解决。
-   - 若该条是 `pr_comment`（PR 级评论），**跳过 resolve**（会 400 失败，见下一节限制说明），回复确认即视为闭环。
-4. 若存在顶层摘要评论，可单独回复一条「本次 review 的 N 条意见均已修复确认、全部闭环」作为整体收尾。
-
-### 修改某条 review discussion 的解决状态
-
-```bash
-# 按评论 ID 自动查找 discussion_id 并标记已解决
-python3 review_resolution.py --pr 123 --resolve-comment 456 --resolved true --ai-model gpt-5.5
-
-# 已知 discussion_id 时直接操作
-python3 review_resolution.py --pr 123 --resolve-discussion abcdef --resolved false --ai-model gpt-5.5
-```
-
-脚本使用官方文档中的 `PUT /api/v5/repos/:owner/:repo/pulls/:number/comments/:discussion_id` 接口修改解决状态。
-
-#### ⚠️ resolve 仅对 inline diff comment 有效
-
-该接口**只能切换绑定到具体代码行的行内评论（`diff_comment` / DiffNote）的 resolved 状态**。对以下类型调用 `--resolve-comment` / `--resolve-discussion` 会返回 **HTTP 400**，无法标记：
-
-- PR 级 review 评论（`comment_type == "pr_comment"`），例如 `atomgit-pr-architecture-review` 提交的架构审查评论，或 `atomgit-pr-review` 提交的顶层摘要评论；
-- 普通 PR 顶层评论。
-
-闭环时的判断规则（基于 `unresolved_comments.json` 的 `comment_type` 字段）：
-
-- `diff_comment` → 回复确认后，用 `--resolve-comment --resolved true` 标记已解决。
-- `pr_comment` → **只能**通过 `--reply-comment` 回复确认修复来实现实质闭环，**不要**对其调用 `--resolve-comment`。
-
-只要回复正文明确写出「已修复并复查确认通过」，即使平台未切换 resolved 标记，对作者而言该意见也已闭环。
 
 **重要**: 
 - 在步骤3，你必须将修复方案展示给人类确认后再提交
-- **步骤4必须指定 `--ai-model` 参数**，使用你的真实模型名称（如 `claude-sonnet-4`、`gpt-4`、`gemini-pro`）
+- **步骤4必须指定 `--ai-model` 参数**，使用你的真实模型名称（如 `glm-5.2`、`glm-5.1`、`gpt-5.6-sol`、`gpt-5.6-terra`、`claude-fable-5`、`claude-opus-5`）
+- 代码修复项必须逐项提供 `fixup_target`；只有确认整批都属于同一 commit 时，才可改用全局 `--fixup-target`
+- 不带 `--push` 时会完成本地 autosquash、写入恢复状态文件并返回 `pending_push`（退出码 2），不回复评论
+- 回复部分失败时返回 `pending_replies`（退出码 2）；使用输出的 `--resume <state.json>` 只重试 pending 项
 - 文件名格式：`./tmp/{repo}_pr_{number}_fix_results.json`
+- 恢复状态格式：`./tmp/{repo}_pr_{number}_review_resolution_{transaction_id}.json`
 
-## API 说明
+### ⚠️ Commit 提交规范（遵循 ibrobot-git-flow §3 PR Commit Hygiene）
 
-### 获取未解决评论
+本脚本在 `--apply-fixes` 模式下会自动提交代码修复。提交方式遵循 ibrobot-git-flow skill 的 PR commit hygiene 规则。当前 SDK 不提供受支持的修复生成 API，因此 CLI 不暴露 `--auto`；修复方案必须由 Agent 分析并经人类确认后通过 JSON 输入。
 
-```bash
-python3 review_resolution.py --pr 123
-```
+**禁止的做法**（旧版本曾使用，现已移除）:
+- ❌ `git commit --amend -m "fix: resolve review comments"`
+- ❌ 创建任何形如 `fix: address review comments` / `fix reviewer's意见` / `apply review suggestions` 的噪声 commit
+- ❌ `git add .`（会把无关文件一并暂存）
+- ❌ 无 pathspec 的 `git add -u`（会暂存整个 working tree）
+- ❌ `git add -u .` 全目录暂存回退（`files_fixed` 为空时直接拒绝，不猜测暂存范围）
+- ❌ 在 index 已有用户预先暂存内容时自动提交
+- ❌ 在 tracked worktree 已有 unstaged WIP 时重写历史
+- ❌ 使用可变 branch ref 或裸 `--force-with-lease` 作为安全边界
 
-**输出**: 项目临时目录 `./tmp/{repo}_pr_{number}_unresolved_comments.json`
+**当前实现的元数据绑定工作流**:
 
-补充说明：
+1. 在写文件前读取 PR `base.sha`、`head.sha`、`head.ref`、`head.repo`；要求本地 `HEAD == head.sha`，且 `base.sha` 是 HEAD 的祖先。
+2. 通过 SDK 的 PR 作用域全量评论接口验证每个 `comment_id` 确实属于目标 PR，并保留 `discussion_id` 等元数据；校验发生在任何本地历史重写前。
+3. 先校验全部 fixes；只有存在 code fix 时才要求 index 和 tracked worktree 均干净。纯 `reply_only` 批次不依赖本地 Git 状态。
+4. `code_fix.original_code` 必须非空且在文件中恰好匹配一次。同一文件多项修复默认拒绝；唯一例外是同一 target 的多个 `delete_lines`，它们会合并行号并基于同一快照一次应用。
+5. 按每项解析后的 `fixup_target` SHA 分组，逐组以 literal pathspec 执行 `git add -- <paths>` 和 `git commit --fixup=<sha>`，再仅对不可变 `base.sha` 执行一次 autosquash。同一文件跨多个目标时拒绝并要求拆批。
+6. `base.sha..HEAD` 中存在 merge commit 时拒绝 autosquash，避免普通 rebase 静默线性化 PR 拓扑。
+7. 异常、KeyboardInterrupt、SIGINT/SIGTERM/SIGHUP 会触发事务清理：只 abort 本次启动的 rebase，恢复原 HEAD/index，以及文件内容、存在状态和 mode。
+8. 只接受一个 remote 上唯一、精确匹配 PR source repository 的 push URL；remote 有多个 pushurl，或多个 remote/URL 都匹配时拒绝。push 和 `ls-remote` 均使用这一 URL，并绑定 `--force-with-lease=<ref>:<old-head-sha>`。
+9. autosquash 后立即原子写入恢复状态，记录 old/new HEAD、精确 URL/ref、回复正文/哈希/marker/discussion/status；远端 ref 验证为新 OID 后才发送修复完成回复。
 
-- 脚本会自动抓取 **所有分页评论**，不再受默认 20 条限制
-- 输出按 `discussion_id` 聚合线程，`comments[].thread_comments` 中可看到嵌套回复
-- 默认会过滤当前登录用户自己的评论和 bot 评论；可通过 `--include-self-comments` / `--include-bot-comments` 打开
-- AtomGit / GitCode 当前读取接口**不会稳定返回 resolved 状态**，因此输出文件会在 `metadata.resolved_state_note` 中说明这一点
+**回复评论时序**：代码修复批次只有在 source branch 推送并验证成功后才发送“已修复”回复；本地成功但未推送时返回 `pending_push`，不伪装闭环。每条远端回复后都会原子 checkpoint；恢复时先按隐藏事务 marker/正文哈希对账，只发送 `pending` 项。纯 `reply_only` 批次也使用同一持久化回复账本。
 
-### 应用修复方案
+**本地事务语义**：任一修复项处理失败（字段缺失、路径非法、行号越界、原文不唯一等）时，脚本恢复全部文件到本次运行前状态，不提交代码、不发送任何回复。push/reply 属于不可回滚远端副作用，因此通过状态文件逐阶段 checkpoint 和幂等恢复，而不是伪装成可回滚的“全有或全无”。每个修复项必须携带属于目标 PR 的 `comment_id`。
 
-```bash
-python3 review_resolution.py --pr 123 --apply-fixes ./tmp/ib_robot_pr_123_fix_results.json --ai-model claude-sonnet-4
-```
+**关键 CLI 参数**:
 
-## 修复类型
+- fixes 项中的 `fixup_target`: 每项代码修复要折回的目标 SHA/ref；必须位于 PR `base.sha..HEAD`。
+- `--fixup-target <SHA|ref>`: 仅作为缺少逐项字段时的显式整批 fallback，无默认值。
+- `--push`: 明确授权使用 PR source metadata、唯一精确 push URL 和显式 OID lease 推送；省略时返回 `pending_push`。
+- `--resume <state.json>`: 恢复待推送/待回复事务；验证本地和远端 OID 后，必要时推送并只发送尚未完成的回复。
+- `--base-branch`: 仅保留旧命令兼容，参数值被忽略；安全基线始终来自 PR metadata `base.sha`。
 
-1. **代码修复**: 提供具体的代码修改建议
-2. **回复说明**: 仅需要回复解释，3. **回退文件**: 建议回退整个文件
-4. **删除行**: 建议删除特定行
+完整可复制示例、autosquash 失败行为、PR commit 数量约束见 `references/commit-hygiene-examples.md`。
 
-## 输入格式
+## Internal References
 
-```json
-[
-  {
-    "comment_id": 12345,
-    "file_path": "src/main.py",
-    "line_number": 10,
-    "has_fix": true,
-    "fix_description": "修复说明",
-    "original_code": "old code",
-    "fixed_code": "new code",
-    "reason": "修复原因"
-  }
-]
-```
+Read only the references needed for the current scenario:
 
-## 参数补充
+| Purpose | Reference |
+|---------|-----------|
+| 完整 CLI 参数表、回复单条评论的详细命令与 reply-mode 语义、审查者复查闭环流程、修改 discussion 解决状态、resolve 仅对 inline diff comment 有效的限制说明 | `references/cli-reference.md` |
+| 修复类型、fix_results.json 输入格式 JSON 示例、获取未解决评论 / 应用修复方案 API 说明、SDK / API 设计决策 | `references/json-format-and-sdk.md` |
+| Commit 提交规范的完整示例块（逐项 / 整批 fallback / pending_push / dry-run）、autosquash 失败行为、PR commit 数量约束 | `references/commit-hygiene-examples.md` |
 
-- `--pr`: PR 编号（可由 `--url` 自动解析）
-- `--owner`: 目标仓库 owner（可选，覆盖 `config.json`）
-- `--repo`: 目标仓库 repo（可选，覆盖 `config.json`）
-- `--url`: PR 链接（可选，自动解析 `owner/repo/pr_number`）
-- `--reply-comment`: 回复指定 PR review 评论 ID
-- `--reply-body`: 直接传入回复正文
-- `--reply-file`: 从文件读取回复正文
-- `--reply-mode`: 回复模式，`threaded` 或 `visible`，默认 `threaded`
-- `--resolve-comment`: 按评论 ID 修改其 discussion 解决状态
-- `--resolve-discussion`: 按 discussion ID 修改解决状态
-- `--resolved`: 解决状态，`true` 或 `false`，默认 `true`
-
-## SDK / API 设计决策
-
-保留 PyPI 包 `atomgit-sdk` 提供的 `atomgit_sdk` 导入模块作为唯一 AtomGit API 抽象层；skill 脚本只做工作流编排，不直接散落 HTTP 请求。原因：
-
-1. 单条 review 回复、解决状态、评论编辑/删除等能力会被多个 skill 复用，放在 SDK 中更稳定。
-2. 官方 API 文档目前主要提供 endpoint 标题、HTTP 方法和路径；SDK 已沉淀为 `APICatalog`，常用协作 API 提供 typed wrapper，长尾 API 可通过 `client.call_api(...)` 或 `APICatalog.from_docs()` 使用。
-3. 这样比每个 skill 脚本各自拼 curl 更简洁，也能统一认证、错误处理、重试和 URL 解析。
+Do not expose these references as separate skills.

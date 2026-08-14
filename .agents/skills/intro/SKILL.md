@@ -1,6 +1,7 @@
 ---
 name: intro
-description: 'IB-Robot 技能引导入口。当用户输入"介绍"、"有哪些功能"、"有哪些skill"、"我应该用哪个skill"、"help"、"帮助"、"入门"、"intro"、"getting started"、"what skills"、"list skills"、"available commands"、"能做什么"、"怎么用"或首次接触项目时使用。作为所有其他 skill 的统一导航起点，展示分类列表、使用示例并根据仓库当前状态推荐最合适的 skill。'
+description: >-
+  IB-Robot 技能引导入口。当用户输入「介绍」「有哪些功能」「有哪些skill」「我应该用哪个skill」「help」「帮助」「入门」「intro」「getting started」「what skills」「list skills」「available commands」「能做什么」「怎么用」或首次接触项目时使用。作为所有其他 skill 的统一导航起点，展示分类列表、使用示例并根据仓库当前状态推荐最合适的 skill。
 ---
 
 # 🤖 IB-Robot Copilot Skill 引导中心
@@ -20,6 +21,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | **ibrobot-launch** | 分平台启动 Ubuntu/openEuler 或 OpenHarmony 板端机器人、仿真、推理与遥操作 |
 | **ibrobot-build** | 编译整个工作空间或指定 package（`colcon build`） |
 | **ibrobot-env** | 初始化运行环境，加载 `.shrc_local`、设置 `ROS_DOMAIN_ID` |
+| **ibrobot-worktree-env** | 在 `git worktree` 中复用主仓库 venv，避免主仓库/worktree 混合环境导致测错分支 |
 | **ibrobot-architecture** | 理解 SSOT 架构设计、配置规范与数据流 |
 | **ibrobot-robot-skill-design** | 交互式设计机器人 skill，明确 anchor、动作空间、安全链路、catalog 暴露和验证计划 |
 | **ibrobot-control** | 通过 `robot-skill` 发现、校验、执行或取消现有机器人高层技能 |
@@ -47,11 +49,12 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 
 | Skill | 一句话描述 |
 | :--- | :--- |
-| **ibrobot-git-flow** | 规范提交代码，确保符合 openEuler DCO/Commit 规范，push 后自动同步 PR 描述 |
+| **ibrobot-git-flow** | 规范提交代码（openEuler DCO/Commit 规范、PR commit ≤ 5、review 修复用 fixup+autosquash），push 后自动同步 PR 描述 |
 | **ibrobot-lerobot-patch** | 将 `libs/lerobot` 的本地改动导出为受管 patch，并同步 `series.txt` / `manifest.yaml` / 测试夹具 |
 | **ibrobot-docker-verify** | 在干净 Ubuntu 22.04 Docker 容器中端到端验证 setup.sh + build.sh |
 | **ibrobot-docker-verify-oee** | 在 openEuler Embedded (aarch64) Docker 容器中端到端验证 setup.sh + build.sh |
 | **sync-github** | 将 AtomGit master 分支同步推送到 GitHub |
+| **skill-creator** | 按 agentskills.io 规范新建/重构 Agent skill，编写 SKILL.md，校验 frontmatter 与渐进式披露 |
 
 ### 📚 文档工具
 
@@ -111,12 +114,14 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 设计一个新的机器人动作           → ibrobot-robot-skill-design
 让 Hermes 执行一个现有庆祝动作   → ibrobot-control
 初始化环境                      → ibrobot-env
+在 worktree 中跑代码             → ibrobot-worktree-env
 提交代码                        → ibrobot-git-flow
 把 libs/lerobot 的改动做成 patch  → ibrobot-lerobot-patch
 导出 lerobot patch 并更新 series  → ibrobot-lerobot-patch
 Docker 验证一下 setup 和 build   → ibrobot-docker-verify
 验证 openEuler 构建              → ibrobot-docker-verify-oee
 同步到 GitHub                   → sync-github
+新建或重构一个 skill            → skill-creator
 生成 DeepWiki 配置               → deepwiki-config
 翻译 DeepWiki 文档               → deepwiki-translator
 检查 Mermaid 图语法              → mermaid-syntax-validation

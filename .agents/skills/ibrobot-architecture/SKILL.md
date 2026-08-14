@@ -85,209 +85,28 @@ src/
 └── so101_hardware/      # ros2_control hardware plugin
 ```
 
-### Package Responsibilities
+For package responsibilities, README-as-contract rules, and the full Key Files Reference table, see `references/key-files.md`.
 
-| Package | Primary Responsibility |
-|---------|----------------------|
-| `robot_config` | Configuration management, launch orchestration |
-| `ibrobot_msgs` | Interface definitions (Actions, Messages) |
-| `tensormsg` | ROS↔Tensor protocol conversion |
-| `inference_service` | Policy inference (monolithic/distributed) |
-| `action_dispatch` | Action execution with temporal smoothing |
-| `dataset_tools` | Episode recording and dataset conversion |
-| `robot_teleop` | Teleoperation interfaces |
-| `robot_moveit` | Motion planning integration |
-| `so101_hardware` | Hardware drivers (ros2_control plugin) |
-
-### README as Local Architecture Contract
-
-Each package-level `README.md` is treated as the package's local architecture contract. It should describe the package's responsibilities, public entry points, launch/configuration usage, data flow, dependency boundaries, and known constraints.
-
-When code changes alter any of the following, the package README must be checked and updated if needed:
-
-1. Package responsibilities or prohibited responsibilities
-2. Public APIs, CLIs, launch arguments, topics, services, or actions
-3. Configuration keys, defaults, or SSOT sources
-4. Data flow, tensor/ROS message contracts, or control mode behavior
-5. Cross-package dependencies or layer boundaries
-6. Operational limitations, required hardware, or setup steps
-
-Architecture reviews should flag README drift as an architecture issue when code behavior and documentation diverge. A stale README is not a minor documentation style problem; it invalidates the package contract and makes future architecture reviews unreliable.
-
-## Data Flow Architecture
-
-### Observation Flow (Sensors → Inference)
+## Data Flow Overview
 
 ```
-Camera/JointState → ROS Topic → decode_value() → StreamBuffer → sample() → Preprocessor → Model
+Observation Flow: Camera/JointState → ROS Topic → decode_value() → StreamBuffer → sample() → Preprocessor → Model
+Action Flow:      Model → VariantsList → TemporalSmoother → Queue → TopicExecutor → Controller Topic → Hardware
 ```
 
-**Key Code Paths**:
-1. `_obs_cb(msg, spec)` in `lerobot_policy_node.py:381-397`
-2. `decode_value()` in `contract_utils.py`
-3. `_sample_obs_frame()` in `lerobot_policy_node.py:399-420`
+For detailed code paths, inference execution modes (monolithic / distributed), and temporal smoothing internals, see `references/data-flow.md`.
 
-### Action Flow (Inference → Hardware)
+## Internal References
 
-```
-Model → VariantsList → TemporalSmoother → Queue → TopicExecutor → Controller Topic → Hardware
-```
+Read only the references needed for the current scenario:
 
-**Key Code Paths**:
-1. `_result_cb()` in `action_dispatcher_node.py:232-278`
-2. `TemporalSmoother.update()` in `temporal_smoother.py`
-3. `_control_loop()` in `action_dispatcher_node.py:172-201`
+| Purpose | Reference |
+|---------|-----------|
+| Detailed data flow diagrams, Key Code Paths, Inference Execution Modes (Monolithic + Distributed), Temporal Smoothing | `references/data-flow.md` |
+| Launch System (Modular Launch Builders, Key Launch Arguments), Common Patterns (Launching, Adding New Robot, Debugging Contracts), Troubleshooting (3 Issues) | `references/launch-and-troubleshooting.md` |
+| Package Responsibilities table, README as Local Architecture Contract, Key Files Reference table | `references/key-files.md` |
 
-## Inference Execution Modes
-
-### Monolithic Mode (Default)
-
-All inference components in single process with zero-copy tensor passing:
-
-```
-lerobot_policy_node process:
-  ├─ TensorPreprocessor (CPU)
-  ├─ PureInferenceEngine (GPU)
-  └─ TensorPostprocessor (CPU)
-```
-
-### Distributed Mode (Cloud-Edge)
-
-Edge handles preprocessing/postprocessing, cloud handles GPU inference:
-
-```
-Edge Node                    Cloud Node
-┌─────────────────┐         ┌─────────────────┐
-│ Preprocessor    │ ──────► │ PureInference   │
-│ (CPU)           │         │ Engine (GPU)    │
-│                 │ ◄────── │                 │
-│ Postprocessor   │         └─────────────────┘
-│ (CPU)           │
-└─────────────────┘
-```
-
-**Configuration**:
-```yaml
-inference:
-  mode: distributed  # or monolithic
-  edge_node: true    # for edge node
-```
-
-## Temporal Smoothing
-
-Cross-frame action chunk smoothing for seamless motion:
-
-```
-weight[k] = exp(-temporal_ensemble_coeff * k)
-```
-
-- Default `temporal_ensemble_coeff = 0.01` (from ACT paper)
-- Precomputed weights for fast blending
-- Aligns new chunk with `actions_executed` from previous chunk
-
-**File**: `src/action_dispatch/action_dispatch/temporal_smoother.py`
-
-## Launch System
-
-### Modular Launch Builders
-
-| Builder | Responsibility |
-|---------|---------------|
-| `control.py` | ros2_control setup, controller spawning |
-| `perception.py` | Camera drivers, TF tree |
-| `simulation.py` | Gazebo launch |
-| `execution.py` | Inference and dispatch nodes |
-| `teleop.py` | Teleoperation nodes |
-| `recording.py` | Episode recording |
-
-### Key Launch Arguments
-
-| Argument | Purpose | Default |
-|----------|---------|---------|
-| `robot_config` | Configuration name | `test_cam` |
-| `use_sim` | Enable Gazebo simulation | `false` |
-| `control_mode` | Override control mode | (from YAML) |
-| `with_inference` | Force enable/disable inference | (auto-detect) |
-| `record` | Enable episode recording | `false` |
-
-## Common Patterns
-
-### Launching the System
-
-```bash
-# Standard launch
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm use_sim:=true
-
-# Override control mode
-ros2 launch robot_config robot.launch.py robot_config:=so101_single_arm control_mode:=moveit_planning
-
-# With recording
-ros2 launch robot_config robot.launch.py control_mode:=teleop record:=true
-```
-
-### Adding a New Robot
-
-1. Create YAML: `config/robots/my_robot.yaml`
-2. Define `name`, `joints`, `control_modes`, `models`, `peripherals`
-3. Launch: `ros2 launch robot_config robot.launch.py robot_config:=my_robot`
-
-### Debugging Contracts
-
-```bash
-# View synthesized contract
-cat /tmp/robot_config/contracts/so101_single_arm_teleop.yaml
-
-# Check launch logs
-# [robot_config] ✓ Contract synthesis SUCCESS
-# [robot_config]   Observations: 2
-# [robot_config]   Actions: 6 joints
-```
-
-## Troubleshooting
-
-### Issue: ModuleNotFoundError: lerobot
-
-**Cause**: PYTHONPATH not injected properly
-
-**Check**:
-1. Look for `[robot_config] PYTHONPATH injection:` in launch logs
-2. Verify `AMENT_PREFIX_PATH` includes workspace install directory
-
-### Issue: Wrong controllers running
-
-**Cause**: Control mode mismatch
-
-**Solution**:
-```bash
-# For MoveIt
-ros2 launch robot_config robot.launch.py control_mode:=moveit_planning
-
-# For ACT inference
-ros2 launch robot_config robot.launch.py control_mode:=model_inference
-```
-
-### Issue: Contract synthesis fails
-
-**Common Errors**:
-1. `KeyError: 'robot'` - Use `robot_config['name']` not `robot_config['robot']['name']`
-2. `Observation source not found` - Check `peripherals` matches `observations` sources
-3. `Model not found` - Add model to `models:` section in YAML
-
-## Key Files Reference
-
-| File | Purpose |
-|------|---------|
-| `robot_config/config/robots/so101_single_arm.yaml` | Robot configuration (SSOT) |
-| `robot_config/launch/robot.launch.py` | Main orchestrator |
-| `robot_config/robot_config/loader.py` | Config loading |
-| `robot_config/robot_config/contract_builder.py` | Contract synthesis |
-| `robot_config/robot_config/contract_utils.py` | Contract data structures |
-| `robot_config/robot_config/launch_builders/execution.py` | Inference nodes |
-| `inference_service/lerobot_policy_node.py` | Policy inference |
-| `action_dispatch/action_dispatcher_node.py` | Action dispatch |
-| `action_dispatch/temporal_smoother.py` | Temporal smoothing |
-| `dataset_tools/episode_recorder.py` | Episode recording |
-| `dataset_tools/bag_to_lerobot.py` | Dataset conversion |
+Do not expose these references as separate skills.
 
 ## DeepWiki References
 
