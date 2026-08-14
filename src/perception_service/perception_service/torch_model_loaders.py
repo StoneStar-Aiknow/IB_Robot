@@ -278,10 +278,14 @@ class _GraspGenModule:
             self.sampler,
             grasp_threshold=-1.0,
             num_grasps=int(self.config.grasp_batch_size),
-            topk_num_grasps=-1,
-            min_grasps=0,
+            topk_num_grasps=int(self.config.grasp_batch_size),
+            min_grasps=1,
             max_tries=1,
+            remove_outliers=False,
         )
+        if len(poses) == 0:
+            poses = self.torch.empty((0, 4, 4), dtype=self.torch.float32)
+            confidence = self.torch.empty((0,), dtype=self.torch.float32)
         return {
             "grasp.poses": poses.to(self.torch.float32),
             "grasp.confidence": confidence.to(self.torch.float32),

@@ -326,8 +326,9 @@ python3 -m model_utils.pi05_export.convert_om \
 统一 `inference_manifest.json`。
 
 前两步（导出与编译）是 `model_utils` 的工具，记录在本节；**第 3 步打包由
-`perception_service` 提供**——GraspGen 是 `kind="perception"` 模型，bundle 的读者是
-perception_service 的 adapter 与 typed `GenerateGrasps` service，写者与读者同包。
+`perception_service` 提供**——GraspGen 的业务归属是抓取，模型目录固定在 `models/grasp/`；
+当前通用模型运行时暂时复用 `kind="perception"` 作为兼容分类，bundle 的读者是
+perception_service 中现有的 adapter 与 typed `GenerateGrasps` service。
 bundle 布局、adapter asset、named deployment 与 conformance 见
 `src/perception_service/README.md` 的 GraspGen 章节。GraspGen **不是** policy family，
 不出现在本文件末尾的策略支持矩阵中。
@@ -394,8 +395,9 @@ device 的打包主机上需要提前生成全部 sidecar，并传入 `--no-insp
 runtime index 绑定 GraspGen semantic，并保留 ACL 实际暴露的 tensor name、dtype 和 shape。
 八个角色全部解析成功后才落盘，任一 OM 或 ABI 缺失都不会留下半成品 bundle。
 
-打包产物是 perception bundle，不含任何 LeRobot 资产（没有 `config.json` /
-`policy_preprocessor.json` / `policy_postprocessor.json`）；模型常量写在
+打包产物属于抓取模型域；当前通用运行时 manifest 暂时使用 `kind="perception"` 兼容分类。
+bundle 不含任何 LeRobot 资产（没有 `config.json` / `policy_preprocessor.json` /
+`policy_postprocessor.json`）；模型常量写在
 `assets/adapter.json` 里，由 `perception_service.graspgen_adapter.GraspGenAdapter`
 读回。参数含义与运行时配置见 `src/perception_service/README.md`。
 

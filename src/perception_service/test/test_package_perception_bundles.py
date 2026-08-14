@@ -87,6 +87,8 @@ def test_ram_plus_packager_omits_unavailable_ascend_deployment(tmp_path) -> None
 def test_grounded_sam2_bundle_uses_source_bound_architecture_config() -> None:
     spec = _specs()["grounded_sam2"]
 
+    assert (spec.model.family, spec.model.operation) == ("grounding_dino", "combined")
+    assert (spec.adapter["family"], spec.adapter["operation"]) == ("grounding_dino", "combined")
     assert "gdino_config" not in spec.adapter
     assert all(not path.endswith(".py") for path in spec.required_paths)
 

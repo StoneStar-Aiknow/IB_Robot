@@ -44,11 +44,29 @@ from manipulation_execution.so101_kinematics_guard import (
     joint5_within_abs_limit,
 )
 
-JOINT5_ORIENTATION_MAX_CLOSING_ERROR_DEG = 20.0
+JOINT5_ORIENTATION_MAX_CLOSING_ERROR_DEG = 27.0
 
 
 class PreparationPhase:
     """Convert ranked source candidates into executable target configurations."""
+
+    @classmethod
+    def _load_home_joint_positions(cls, raw_value: str) -> dict[str, float]:
+        positions = cls._load_json_object(raw_value)
+        normalized: dict[str, float] = {}
+        for name, value in positions.items():
+            position = float(value)
+            if not math.isfinite(position):
+                raise ValueError(f"HOME joint position for joint {name} must be finite")
+            normalized[str(name)] = position
+        return normalized
+
+    def _validate_home_joint_config(self) -> None:
+        guard = self._orientation_guard()
+        if bool(guard.get("joint5_constraints_enabled", False)) and "5" not in self._home_joint_positions:
+            raise ValueError(
+                'ros2_control.reset_positions["5"] is required when joint 5 orientation constraints are enabled'
+            )
 
     def _solve_ik(
         self,
@@ -388,12 +406,17 @@ class PreparationPhase:
                 retryable=True,
             ) from exc
         minimum_alignment = max(-1.0, min(1.0, float(base_side_config.get("min_alignment_cos", 0.0))))
+        minimum_fk_inward_offset = max(0.0, float(base_side_config.get("min_fk_inward_offset_m", 0.0)))
+        failures = []
         if alignment.alignment_cos < minimum_alignment:
+            failures.append(f"alignment={alignment.alignment_cos:.3f} < {minimum_alignment:.3f}")
+        if alignment.inward_offset_m < minimum_fk_inward_offset:
+            failures.append(f"inward_offset={alignment.inward_offset_m:.4f}m < {minimum_fk_inward_offset:.4f}m")
+        if failures:
             raise PickFlowError(
                 "FK_FIXED_FINGER_BASE_SIDE_REJECTED",
-                f"candidate {candidate_index}: final FK fixed finger is on the outer side "
-                f"(alignment={alignment.alignment_cos:.3f} < {minimum_alignment:.3f}, "
-                f"inward_offset={alignment.inward_offset_m:.4f}m)",
+                f"candidate {candidate_index}: final FK fixed finger does not have enough inward placement "
+                f"({', '.join(failures)})",
                 retryable=True,
             )
         return alignment
@@ -406,10 +429,12 @@ class PreparationPhase:
         deadline: float,
         *,
         apply_compensation: bool = False,
+        enforce_fixed_finger_robust_gap: bool = True,
         initial_seed: JointState | None = None,
         ik_client=None,
         fk_client=None,
     ) -> PreparedCandidate:
+        del enforce_fixed_finger_robust_gap
         plan = ranked.plan
         compensation = self._config.get("contact_compensation", {})
         payload: IKPayload

@@ -64,6 +64,7 @@ _SCHEMA: dict[str, Any] = {
     "auto_start_dependencies": _bool(),
     "model_bundle_path": _string(),
     "model_deployment": _string(),
+    "planner_model_dir": _string(),
     "planner_service": _string(),
     "verifier_service": _string(),
     "detect_service": _string(),
@@ -287,6 +288,7 @@ _SCHEMA: dict[str, Any] = {
             "enabled": _bool(),
             "reference_point_base": _vector(),
             "min_alignment_cos": _number(-1.0, 1.0),
+            "min_fk_inward_offset_m": _NON_NEGATIVE,
         },
         "fixed_finger_robust_gap": {
             "enabled": _bool(),

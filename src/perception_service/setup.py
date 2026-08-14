@@ -22,6 +22,7 @@ setup(
             "package_perception_bundles = perception_service.package_perception_bundles:main",
             "package_ascend_perception_bundles = perception_service.package_ascend_perception_bundles:main",
             "package_graspgen_ascend_bundle = perception_service.package_graspgen_ascend_bundle:main",
+            "package_graspgen_torch_bundle = perception_service.package_graspgen_torch_bundle:main",
         ],
     },
 )

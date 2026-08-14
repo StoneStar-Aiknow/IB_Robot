@@ -1,3 +1,4 @@
+import json
 from dataclasses import dataclass
 from types import SimpleNamespace
 
@@ -320,6 +321,33 @@ def test_ascend_local_wrapper_initializes_without_graspgen_source(tmp_path, monk
     assert wrapper._inference_point_count == 2048
     assert wrapper._collision_mesh is None
     assert wrapper._collision_vertices is None
+
+
+def test_wrapper_resolves_gripper_config_from_standard_bundle_adapter(tmp_path):
+    bundle = tmp_path / "graspgen_robotiq_2f_140"
+    assets = bundle / "assets"
+    assets.mkdir(parents=True)
+    config_path = assets / "graspgen_config.yml"
+    config_path.write_text("data:\n  gripper_name: robotiq_2f_140\n", encoding="utf-8")
+    (assets / "adapter.json").write_text(
+        json.dumps({"family": "graspgen", "gripper_config": "assets/graspgen_config.yml"}),
+        encoding="utf-8",
+    )
+
+    assert GraspGenWrapper._resolve_config("legacy-name.yml", bundle) == config_path
+
+
+def test_wrapper_rejects_gripper_config_outside_standard_bundle(tmp_path):
+    bundle = tmp_path / "graspgen_robotiq_2f_140"
+    assets = bundle / "assets"
+    assets.mkdir(parents=True)
+    (assets / "adapter.json").write_text(
+        json.dumps({"family": "graspgen", "gripper_config": "../outside.yml"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="escapes the bundle"):
+        GraspGenWrapper._resolve_config("legacy-name.yml", bundle)
 
 
 def test_local_depth_projection_separates_object_from_scene():

@@ -1,6 +1,7 @@
 """Wrapper for GraspGen inference pipeline (ROS-free)."""
 
 import io
+import json
 import logging
 import os
 import shlex
@@ -1515,6 +1516,33 @@ class GraspGenWrapper:
         p = Path(filename)
         if p.is_absolute():
             return p
+
+        bundle_root = model_dir.resolve()
+        adapter_path = bundle_root / "assets" / "adapter.json"
+        if adapter_path.is_file():
+            try:
+                adapter = json.loads(adapter_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ValueError(f"Unable to read GraspGen bundle adapter: {adapter_path}") from exc
+            if not isinstance(adapter, dict):
+                raise ValueError(f"GraspGen bundle adapter must contain a JSON object: {adapter_path}")
+            configured_path = adapter.get("gripper_config")
+            if isinstance(configured_path, str) and configured_path.strip():
+                relative_path = Path(configured_path)
+                if relative_path.is_absolute():
+                    raise ValueError(
+                        f"GraspGen bundle adapter gripper_config must be bundle-relative: {configured_path!r}"
+                    )
+                resolved_path = (bundle_root / relative_path).resolve()
+                try:
+                    resolved_path.relative_to(bundle_root)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"GraspGen bundle adapter gripper_config escapes the bundle: {configured_path!r}"
+                    ) from exc
+                if not resolved_path.is_file():
+                    raise FileNotFoundError(f"GraspGen bundle adapter gripper_config does not exist: {resolved_path}")
+                return resolved_path
 
         candidates = [
             model_dir / "checkpoints" / filename,

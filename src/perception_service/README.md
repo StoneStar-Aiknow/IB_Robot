@@ -394,19 +394,23 @@ outputs = [grasp.poses      float32 [-1, 4, 4],
 `grasp.poses` 是主机积分出来的，不绑定到任何 OM 输出张量。
 
 Runtime options 在通用 Ascend 的 `acl_config_path` / `device_id` 之外多接受一个
-`random_seed`，用于让去噪循环可复现；除此之外选项集合仍然是封闭的。GraspGen 没有 Torch
-deployment——八个 OM 与它们之间的主机数学是一个整体契约，未编译的 bundle 没有可回退的实现，
-`_new_graspgen_session` 会直接拒绝。
+`random_seed`，用于让去噪循环可复现；除此之外选项集合仍然是封闭的。统一 bundle 同时声明
+`torch_cuda` 与 `ascend_310p`；两者共享 adapter、配置和 checkpoint 身份，但运行时必须显式选择
+named deployment。Ascend 的八个 OM 与它们之间的主机数学仍是一个整体契约。
 
 ### 10.3 Bundle 与 promotion
 
-Bundle 是标准 perception bundle，不含任何 LeRobot 资产：
+Bundle 属于抓取模型域，不含任何 LeRobot 资产；当前通用运行时仍以
+`kind="perception"` 作为兼容分类，不代表它应放在 `models/perception/`：
 
 ```
-graspgen_bundle/
+models/grasp/graspgen_robotiq_2f_140/
   inference_manifest.json          # schema v2, model.kind=perception, family=graspgen
   assets/adapter.json              # family/identity + kappa, diffusion_steps,
                                    # grasp_batch_size, point_count, geometry
+  assets/graspgen_config.yml
+  assets/generator_checkpoint.pth
+  assets/discriminator_checkpoint.pth
   artifacts/ascend/ascend_310p/    # 八个 <role>.om
 ```
 

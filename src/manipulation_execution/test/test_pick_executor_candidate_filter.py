@@ -17,6 +17,7 @@ class _ExecutorHarness:
                     "enabled": True,
                     "reference_point_base": [0.0, 0.0, 0.0],
                     "min_alignment_cos": 0.0,
+                    "min_fk_inward_offset_m": 0.003,
                 },
             }
         }
@@ -69,3 +70,19 @@ def test_final_fk_fixed_finger_base_side_rejects_mirrored_pose():
     assert exc_info.value.code == "FK_FIXED_FINGER_BASE_SIDE_REJECTED"
     assert exc_info.value.retryable is True
     assert "alignment=-1.000" in str(exc_info.value)
+
+
+def test_final_fk_fixed_finger_base_side_rejects_edge_pose_with_too_little_inward_offset():
+    executor = _ExecutorHarness()
+    payload = IKPayload(
+        joint_state=JointState(),
+        ee_xyz=(0.2135, 0.0, 0.0),
+        ee_quaternion=(0.0, 0.0, 0.0, 1.0),
+    )
+
+    with pytest.raises(PickFlowError) as exc_info:
+        executor._validate_fk_fixed_finger_base_side(856, _plan(), payload)
+
+    assert exc_info.value.code == "FK_FIXED_FINGER_BASE_SIDE_REJECTED"
+    assert exc_info.value.retryable is True
+    assert "inward_offset=0.0005m < 0.0030m" in str(exc_info.value)

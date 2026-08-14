@@ -124,6 +124,7 @@ class ExecutionPhase:
         task_id: str,
         prepared: PreparedCandidate,
         pregrasp_xyz: tuple[float, float, float],
+        state: FlowState | None = None,
     ) -> None:
         retreat = (
             prepared.plan.grasp[0],
@@ -145,18 +146,28 @@ class ExecutionPhase:
             "open_gripper",
             gripper_position=self._gripper_open,
         )
-        observe_pose = str(self._config.get("observe_pose", "observe_table"))
-        if observe_pose:
-            self._run_primitive(
-                goal_handle,
-                deadline,
-                task_id,
-                "move_to_named_pose",
-                pose_name=observe_pose,
-                velocity_scaling=float(self._config.get("observe_velocity_scaling", 0.05)),
-            )
+        if state is not None:
+            self._move_to_observe(goal_handle, deadline, state, task_id)
+            state.recovery_completed = True
+        else:
+            observe_pose = str(self._config.get("observe_pose", "observe_table"))
+            if observe_pose:
+                self._run_primitive(
+                    goal_handle,
+                    deadline,
+                    task_id,
+                    "move_to_named_pose",
+                    pose_name=observe_pose,
+                    velocity_scaling=float(self._config.get("observe_velocity_scaling", 0.05)),
+                )
 
-    def _recover_after_retention_failure(self, goal_handle, deadline: float, task_id: str) -> None:
+    def _recover_after_retention_failure(
+        self,
+        goal_handle,
+        deadline: float,
+        task_id: str,
+        state: FlowState | None = None,
+    ) -> None:
         self._run_primitive(
             goal_handle,
             deadline,
@@ -164,16 +175,20 @@ class ExecutionPhase:
             "open_gripper",
             gripper_position=self._gripper_open,
         )
-        observe_pose = str(self._config.get("observe_pose", "observe_table"))
-        if observe_pose:
-            self._run_primitive(
-                goal_handle,
-                deadline,
-                task_id,
-                "move_to_named_pose",
-                pose_name=observe_pose,
-                velocity_scaling=float(self._config.get("observe_velocity_scaling", 0.05)),
-            )
+        if state is not None:
+            self._move_to_observe(goal_handle, deadline, state, task_id)
+            state.recovery_completed = True
+        else:
+            observe_pose = str(self._config.get("observe_pose", "observe_table"))
+            if observe_pose:
+                self._run_primitive(
+                    goal_handle,
+                    deadline,
+                    task_id,
+                    "move_to_named_pose",
+                    pose_name=observe_pose,
+                    velocity_scaling=float(self._config.get("observe_velocity_scaling", 0.05)),
+                )
 
     def _recover_after_release_failure(self, goal_handle, deadline: float, task_id: str, plan) -> None:
         """Best-effort cleanup after a verified pick fails during post-success release."""
@@ -426,7 +441,7 @@ class ExecutionPhase:
             if bool(self._config.get("recover_after_retention_failure", True)):
                 recovery_started = time.monotonic()
                 try:
-                    self._recover_after_retention_failure(goal_handle, deadline, task_id)
+                    self._recover_after_retention_failure(goal_handle, deadline, task_id, state)
                 finally:
                     state.add_timing("subphase_recovery", time.monotonic() - recovery_started)
             raise
@@ -524,6 +539,9 @@ class ExecutionPhase:
         target_query: str,
         prepared: PreparedCandidate,
         scene_base: BaseSceneGeometry,
+        *,
+        release_after_success: bool = False,
+        release_drop_height_m: float = -1.0,
     ) -> None:
         prepared = self._prepare_candidate(
             prepared.ranked,
@@ -632,10 +650,34 @@ class ExecutionPhase:
             goal_handle,
             deadline,
             apply_compensation=True,
+            enforce_fixed_finger_robust_gap=False,
             initial_seed=active_joint_state,
         )
         plan = prepared.plan
         active_joint_state = prepared.final_joint_state
+
+        xy_align_delta = math.hypot(
+            plan.grasp[0] - aligned_pregrasp[0],
+            plan.grasp[1] - aligned_pregrasp[1],
+        )
+        align_tolerance = float(self._config.get("contact_compensation", {}).get("xy_tolerance_m", 0.003))
+        if xy_align_delta > align_tolerance:
+            self._publish_feedback(
+                goal_handle,
+                state,
+                "descend",
+                f"aligning XY to compensated grasp ({xy_align_delta:.4f}m at safe height)",
+            )
+            align_payload = self._move_branch_locked_pose(
+                goal_handle,
+                deadline,
+                task_id,
+                (plan.grasp[0], plan.grasp[1], aligned_pregrasp[2]),
+                plan.quaternion,
+                float(self._config.get("descend_velocity_scaling", 0.03)),
+                active_joint_state,
+            )
+            active_joint_state = align_payload.joint_state
 
         self._publish_feedback(goal_handle, state, "descend", "descending to compensated grasp configuration")
         self._run_primitive(
@@ -654,6 +696,18 @@ class ExecutionPhase:
             f"contact_xy_residual_m={prepared.contact_residual_xy_m:.4f} "
             f"contact_z_error_m={prepared.contact_z_error_m:.4f}"
         )
+        self._publish_feedback(goal_handle, state, "close", "closing gripper on target")
+        self._run_primitive(
+            goal_handle,
+            deadline,
+            task_id,
+            "close_gripper",
+            gripper_position=self._gripper_closed,
+        )
+        self._sleep_with_cancel(goal_handle, deadline, float(self._config.get("hold_sec", 0.8)))
+
+        # The grasp pose is now a committed physical state. Record diagnostics
+        # after closing so the measured gap cannot trigger a pre-close retreat.
         grasp_measurement = self._record_pose_diagnostic(
             goal_handle,
             deadline,
@@ -666,9 +720,9 @@ class ExecutionPhase:
         )
         target_gripper = self._config.get("target_gripper", {})
         robust_gap_config = target_gripper.get("fixed_finger_robust_gap", {})
-        if bool(robust_gap_config.get("enabled", False)):
+        if bool(robust_gap_config.get("enabled", False)) and prepared.fixed_finger_envelope is not None:
             robust_gap = None
-            if prepared.fixed_finger_envelope is not None and grasp_measurement is not None:
+            if grasp_measurement is not None:
                 contact_residual, actual_quaternion = grasp_measurement
                 robust_gap = fixed_finger_robust_gap(
                     prepared.fixed_finger_envelope.fixed_gap_m,
@@ -686,11 +740,7 @@ class ExecutionPhase:
                         "fixed_finger_effective_gap_m": robust_gap.effective_gap_m,
                         "fixed_finger_required_gap_m": robust_gap.required_gap_m,
                         "fixed_finger_robust_gap_passed": robust_gap.passed,
-                        "action": (
-                            "continue_fixed_finger_robust_gap_passed"
-                            if robust_gap.passed
-                            else "retreat_fixed_finger_robust_gap_rejected"
-                        ),
+                        "action": "record_fixed_finger_robust_gap",
                     }
                 )
                 if state.debug_output_dir:
@@ -699,39 +749,6 @@ class ExecutionPhase:
                         output_path.write_text(json.dumps(state.pose_diagnostics, indent=2) + "\n", encoding="utf-8")
                     except OSError as exc:
                         self.get_logger().warning(f"failed to write {output_path}: {exc}")
-            if robust_gap is None or not robust_gap.passed:
-                self._run_primitive(
-                    goal_handle,
-                    deadline,
-                    task_id,
-                    "move_to_pose",
-                    pose=self._pose(aligned_pregrasp, plan.quaternion),
-                    velocity_scaling=float(self._config.get("descend_velocity_scaling", 0.03)),
-                )
-                detail = (
-                    "measurement unavailable"
-                    if robust_gap is None
-                    else (
-                        f"effective_gap={robust_gap.effective_gap_m:.4f}m "
-                        f"required_gap={robust_gap.required_gap_m:.4f}m "
-                        f"closing_axis_error={robust_gap.contact_error_along_closing_axis_m:.4f}m"
-                    )
-                )
-                raise PickFlowError(
-                    "FIXED_FINGER_ROBUST_GAP_REJECTED",
-                    f"candidate {prepared.ranked.index}: {detail}",
-                    retryable=True,
-                )
-
-        self._publish_feedback(goal_handle, state, "close", "closing gripper on target")
-        self._run_primitive(
-            goal_handle,
-            deadline,
-            task_id,
-            "close_gripper",
-            gripper_position=self._gripper_closed,
-        )
-        self._sleep_with_cancel(goal_handle, deadline, float(self._config.get("hold_sec", 0.8)))
 
         try:
             self._verify(
@@ -758,7 +775,14 @@ class ExecutionPhase:
             if bool(self._config.get("recover_after_close_failure", True)):
                 recovery_started = time.monotonic()
                 try:
-                    self._recover_after_close_failure(goal_handle, deadline, task_id, prepared, aligned_pregrasp)
+                    self._recover_after_close_failure(
+                        goal_handle,
+                        deadline,
+                        task_id,
+                        prepared,
+                        aligned_pregrasp,
+                        state,
+                    )
                 finally:
                     state.add_timing("subphase_recovery", time.monotonic() - recovery_started)
             raise
@@ -819,14 +843,29 @@ class ExecutionPhase:
             plan.quaternion,
             plan.target_contact_ee,
         )
-        self._release_after_success_with_recovery(
-            goal_handle,
-            deadline,
-            state,
-            task_id,
-            plan,
-            active_joint_state,
-        )
+        if release_after_success:
+            try:
+                self._release_verified_pick(
+                    goal_handle,
+                    deadline,
+                    state,
+                    task_id,
+                    prepared,
+                    active_joint_state,
+                    release_drop_height_m,
+                )
+            except PickCancelled:
+                raise
+            except PickFlowError as exc:
+                self.get_logger().error(f"post-success release failed: {exc.code}: {exc}")
+                recovery_started = time.monotonic()
+                try:
+                    self._recover_after_release_failure(goal_handle, deadline, task_id, plan)
+                except Exception as recovery_exc:
+                    self.get_logger().error(f"release cleanup raised unexpectedly: {recovery_exc}")
+                finally:
+                    state.add_timing("subphase_recovery", time.monotonic() - recovery_started)
+                raise PickFlowError("RELEASE_FAILED", str(exc)) from exc
 
     def _release_after_success(
         self,
@@ -841,12 +880,34 @@ class ExecutionPhase:
         goal = goal_handle.request
         if not bool(goal.release_after_success):
             return
-        drop_height = float(goal.release_drop_height_m)
+        ExecutionPhase._release_verified_pick(
+            self,
+            goal_handle,
+            deadline,
+            state,
+            task_id,
+            plan,
+            active_joint_state,
+            float(goal.release_drop_height_m),
+        )
+
+    def _release_verified_pick(
+        self,
+        goal_handle,
+        deadline: float,
+        state: FlowState,
+        task_id: str,
+        prepared: PreparedCandidate,
+        active_joint_state: JointState | None,
+        drop_height: float,
+    ) -> None:
+        """Release a verified candidate using the supplied post-lift state."""
+        plan = getattr(prepared, "plan", prepared)
         release_xyz = plan.lift
-        if drop_height >= 0.0:
+        if float(drop_height) >= 0.0:
             # Releasing from the full lift height makes the target bounce; drop
             # from just above the grasp pose instead.
-            release_xyz = (plan.lift[0], plan.lift[1], min(plan.lift[2], plan.grasp[2] + drop_height))
+            release_xyz = (plan.lift[0], plan.lift[1], min(plan.lift[2], plan.grasp[2] + float(drop_height)))
         self._publish_feedback(goal_handle, state, "release", f"releasing target at z={release_xyz[2]:.4f}")
         if release_xyz[2] < plan.lift[2] - 1e-6:
             self._move_branch_locked_pose(

@@ -139,5 +139,5 @@ def test_retention_motion_or_verification_failure_runs_recovery(failure_stage: s
         )
 
     assert len(recovery_calls) == 1
-    assert recovery_calls[0][-1] == "pick-test"
+    assert recovery_calls[0][2] == "pick-test"
     assert state.pipeline_timings["subphase_recovery"] >= 0.0

@@ -33,6 +33,43 @@ from manipulation_execution.so101_geometry import gripper_geometry_metrics_batch
 class PlanningPhase:
     """Plan and rank source-gripper candidates before IK preparation."""
 
+    @staticmethod
+    def _planner_failure(response) -> PickFlowError:
+        diagnostics = [str(detail).strip() for detail in response.diagnostic_details]
+        details = "; ".join(detail for detail in diagnostics if detail)
+        message = str(response.message).strip() or "grasp planning failed"
+        failure_stage = next(
+            (detail.split(":", 1)[1].strip() for detail in diagnostics if detail.startswith("failure_stage:")),
+            "",
+        )
+        detection_status = next(
+            (detail.split(":", 1)[1].strip() for detail in diagnostics if detail.startswith("detection_status:")),
+            "",
+        )
+        failure_reason = next(
+            (detail.split(":", 1)[1].strip() for detail in diagnostics if detail.startswith("failure_reason:")),
+            "",
+        )
+        if failure_reason in {"detect_service_unavailable", "segment_service_unavailable"}:
+            return PickFlowError(
+                "SERVICE_UNAVAILABLE",
+                message + (f" ({details})" if details else ""),
+            )
+        if (
+            failure_stage == "detection"
+            or detection_status in {"not_found", "low_confidence"}
+            or "no grasps generated" in message.lower()
+            or "no grasp candidates" in message.lower()
+        ):
+            return PickFlowError(
+                "TARGET_NOT_VISIBLE",
+                f"target is not visible from the observation pose: {message}" + (f" ({details})" if details else ""),
+            )
+        return PickFlowError(
+            "GRASP_PLANNING_FAILED",
+            message + (f" ({details})" if details else ""),
+        )
+
     def _request_grasps(self, goal_handle, deadline: float, state: FlowState, target_query: str):
         self._publish_feedback(goal_handle, state, "planning", f"planning grasps for {target_query!r}")
         planner = self._config.get("planner", {})
@@ -51,10 +88,13 @@ class PlanningPhase:
         )
         state.debug_output_dir = str(response.debug_output_dir)
         if not response.success:
-            raise PickFlowError("GRASP_PLANNING_FAILED", response.message)
+            raise self._planner_failure(response)
         candidates = list(response.grasps.grasps)
         if not candidates:
-            raise PickFlowError("NO_GRASP_CANDIDATES", "GraspGen returned no candidates")
+            raise PickFlowError(
+                "TARGET_NOT_VISIBLE",
+                "target was not detected or no grasp candidate could be generated from the observation frame",
+            )
         scoring = self._config.get("execution_scoring", {})
         centroid_source = str(scoring.get("centroid_source", "volume")).strip().lower()
         use_volume = centroid_source == "volume" and float(response.object_volume_m3) > 0.0
@@ -394,5 +434,13 @@ class PlanningPhase:
                 diagnostics.truncated_by_candidate_budget = max(0, len(ranked) - max_candidates)
             ranked = ranked[:max_candidates]
         if not ranked:
-            raise PickFlowError("NO_SAFE_GRASP_CANDIDATES", "no candidate passed geometry and workspace checks")
+            rejection_counts = diagnostics.geometry_rejections if diagnostics is not None else {}
+            rejected_total = sum(rejection_counts.values())
+            workspace_rejected = rejection_counts.get("WORKSPACE_REJECTED", 0)
+            if rejected_total > 0 and workspace_rejected == rejected_total:
+                raise PickFlowError(
+                    "TARGET_OUTSIDE_WORKSPACE",
+                    f"target is visible but all {workspace_rejected} grasp candidates are outside the robot workspace",
+                )
+            raise PickFlowError("NO_SAFE_GRASP_CANDIDATES", "no candidate passed geometry and safety checks")
         return ranked

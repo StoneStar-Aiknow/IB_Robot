@@ -62,6 +62,10 @@ robot:
     enabled: true
     action_name: /manipulation/execute_pick
     auto_start_dependencies: true
+    # PC and 310P share this bundle and select different named deployments.
+    model_bundle_path: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
+    model_deployment: torch_cuda
+    planner_model_dir: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
     planner_service: /grasp_planner/plan_grasp
     verifier_service: /grasp_verifier/verify_grasp
     detect_service: /perception/grasp/grounding_detect
@@ -82,11 +86,11 @@ robot:
     recover_after_close_failure: true
     recover_after_retention_failure: true
     max_execution_attempts: 3
-    approach_distance_m: 0.08
+    approach_distance_m: 0.09
     lift_distance_m: 0.050
     # Keep the PC planning profile geometrically identical to the validated
     # 310P marker profile.
-    candidate_target_offset_base_m: [0.0, 0.0, -0.008]
+    candidate_target_offset_base_m: [0.0, 0.0, 0.0]
     observe_velocity_scaling: 0.40
     approach_velocity_scaling: 0.35
     descend_velocity_scaling: 0.20
@@ -130,11 +134,11 @@ robot:
       require_collision_free: false
       # Coarse bound on how far below the base origin a fingertip contact may
       # sit. The fitted tabletop plane measures 6 runs at z_base = -0.061 with a
-      # 0.5 mm spread, plus one bad RANSAC fit at -0.069 (6.1 deg tilt); -0.075
+      # 0.5 mm spread, plus one bad RANSAC fit at -0.069 (6.1 deg tilt); -0.08
       # clears the worst fit with margin. Sweeping lower adds no candidates.
       # The real collision gate stays target_geometry.tabletop_filter, which is
       # measured against the fitted plane and so does not drift with base height.
-      min_contact_z: -0.075
+      min_contact_z: -0.07
       min_approach_z: 0.04
       min_topdown_score: 0.0
       topdown_min_z: -0.25
@@ -143,7 +147,7 @@ robot:
       selection_attempts: 3
       retry_settle_sec: 0.2
       confidence_weight: 1.0
-      topdown_weight: 0.35
+      topdown_weight: 0.50
     ik:
       group_name: arm
       # PR259-validated solver budget. LMA re-seeds from a random joint
@@ -195,11 +199,11 @@ robot:
       enabled: true
       tolerance_m: 0.008
       max_iterations: 2
-      max_correction_m: 0.030
+      max_correction_m: 0.040
       # MoveIt completion already gates on fresh hardware, joints, and matching TF.
       settle_sec: 0.0
       pregrasp_enabled: true
-      pregrasp_clearance_m: 0.020
+      pregrasp_clearance_m: 0.030
     pose_diagnostics:
       enabled: true
       settle_sec: 0.0
@@ -211,7 +215,7 @@ robot:
     planner_node:
       inference_backend: local_cuda
       device: cuda
-      local_manifest_path: models/grasp/graspgen_bundle
+      local_manifest_path: "$(env WORKSPACE)/models/grasp/graspgen_robotiq_2f_140"
       local_deployment_name: torch_cuda
       startup_warmup: true
       host_runtime:
@@ -258,7 +262,7 @@ robot:
       confidence_weight: 1.0
       contact_distance_weight: 1.0
       contact_distance_scale_m: 0.06
-      topdown_weight: 0.35
+      topdown_weight: 0.50
     target_geometry:
       tabletop_filter: true
       # Matches the proven supervised banana-pick command while retaining a
@@ -300,11 +304,11 @@ robot:
         # approach/pregrasp/grasp/lift and reject a true half-turn jump.
         joint5_stage_continuity: true
         joint5_stage_max_delta_rad: 1.5707963267948966
-        max_approach_error_deg: 25.0
-        max_closing_error_deg: 20.0
+        max_approach_error_deg: 40.0
+        max_closing_error_deg: 30.0
         # LMA is position-only; MoveIt OrientationConstraint did not create an
         # extra DOF and converted useful FK diagnostics into NO_IK_SOLUTION.
-        # Keep unconstrained position IK and retain the 25/20 degree FK gate.
+        # Keep unconstrained position IK and retain the 40/30 degree FK gate.
         moveit_orientation_search:
           enabled: false
           approach_tolerance_deg: 15.0
@@ -312,9 +316,9 @@ robot:
           constraint_weight: 1.0
           max_attempts: 3
       # Extra offset away from the fixed finger to reduce edge/top-first contact.
-      fixed_finger_margin_m: 0.006
+      fixed_finger_margin_m: 0.010
       # Narrow targets need more fixed-finger clearance because the fixed jaw cannot sweep the object back.
-      fixed_finger_margin_max_m: 0.012
+      fixed_finger_margin_max_m: 0.016
       fixed_finger_margin_width_ref_m: 0.035
       fixed_finger_margin_width_gain: 0.25
       # Reject mirrored grasps that place the fixed jaw on the side away from
@@ -323,6 +327,10 @@ robot:
         enabled: true
         reference_point_base: [0.0, 0.0, 0.0]
         min_alignment_cos: 0.0
+        # Reject final IK/FK poses that technically face inward but leave the
+        # fixed finger on the target edge. Failed candidate 856 had 0.57 mm;
+        # verified marker picks retained at least 10.95 mm.
+        min_fk_inward_offset_m: 0.003
       # Before closing, project the measured low-height contact residual onto
       # the closing axis and reject if it erodes too much of the target gap.
       fixed_finger_robust_gap:
@@ -379,6 +387,54 @@ robot:
         gripper_position_tolerance: 0.05
         joint_state_max_age_s: 0.25
 
+  placement_execution:
+    enabled: true
+    executor: placement_pipeline
+    required_args: [target_name, container_name]
+    action_name: /manipulation/execute_place
+    detect_service: /perception/grasp/grounding_detect
+    segment_service: ""
+    rgb_topic: /camera/wrist/image_raw
+    joint_state_topic: /joint_states
+    debug_output_root: "$(env WORKSPACE)/outputs/placement_pipeline"
+    motion:
+      place_pose: place_container
+      place_joint_names: ["1", "2", "3", "4", "5"]
+      place_joint_positions:
+        "1": -0.047553
+        "2": -0.073631
+        # Joint 3 release pose: raw tick 1500.
+        "3": -0.840621
+        "4": 1.497165
+        "5": -1.570790
+      place_duration_sec: 5.0
+      post_release:
+        # Move only joint 3 to raw tick 1700 before visual verification.
+        verify_joint_name: "3"
+        verify_joint_position: -0.533825
+        verify_duration_sec: 2.0
+        return_duration_sec: 2.0
+    sensor:
+      gripper_feedback_timeout_sec: 1.0
+    verification:
+      required: true
+      confidence_threshold: 0.30
+      post_release_wait_sec: 1.0
+      max_resamples: 3
+      resample_interval_sec: 0.25
+      required_confirmations: 2
+      min_container_mask_pixels: 500
+      min_target_mask_pixels: 100
+      min_inside_mask_fraction: 0.70
+      container_inset_ratio: 0.05
+      # Normalized wrist-camera exclusion for the orange SO-101 gripper.  The
+      # polygon is scaled to each incoming RGB frame (640x360 or 1280x720).
+      target_exclusion:
+        enabled: true
+        mask_path: "$(find robot_config)/config/placement_masks/so101_wrist_gripper_sam_mask.png"
+        min_detection_overlap: 0.35
+        polygons: []
+
   voice_asr:
     enabled: false
     auto_download_model: true
@@ -402,6 +458,10 @@ robot:
 
   embodied:
     enabled: false
+    entry_mode: hermes
+    skill_catalog_source_mode: development
+    skill_catalog_source_root: src/skill_catalog
+    skill_catalog_profile: so101_handeye_realsense_grasp_pc
     debug_tracing: true
     task_input_topic: /voice_command
     task_command_topic: /embodied/task_command
@@ -419,19 +479,6 @@ robot:
       model_idle_timeout_sec: 120.0
       rpc_timeout_sec: 5.0
       gripper_settle_sec: 1.5
-    planner:
-      mode: rule
-      planning_policy:
-        fallback_to_rule_planner: true
-        min_confidence: 0.70
-        allowed_skills:
-          - inspect_scene
-          - recover_safe_pose
-          - recover_zero_pose
-          - move_relative_ee
-          - open_gripper_skill
-          - close_gripper_skill
-          - pick_object
     execution:
       relative_motion_step_m: 0.03
       relative_motion_reference_frame: base
@@ -469,167 +516,9 @@ robot:
       zero:
         position: {x: 0.0210077843415008, y: -0.278950111258735, z: 0.24858389783148477}
         orientation: {x: -0.4740206645801369, y: -0.4668084047044082, z: -0.523033090590171, w: 0.532757645647648}
-    skill_templates:
-      inspect_scene:
-        description:
-          summary: "Move to observe_table and acquire a scene view for planning."
-          category: observation
-          when_to_use: ["look at the table", "update scene understanding"]
-        capability:
-          schema_version: 1
-          summary: "Inspect the workspace from the observation view."
-          domain: manipulation
-          moves_robot: true
-          required_control_mode: moveit_planning
-          parameters:
-            type: object
-            additionalProperties: false
-            properties: {}
-            required: []
-          recovery_policy: never_retry
-        primitive_sequence:
-          - primitive_name: move_to_named_pose
-            pose_name: observe_table
-      recover_safe_pose:
-        description:
-          summary: "Return the arm to the home safe pose."
-          category: recovery
-          when_to_use: ["return to a safe position", "reset between tasks"]
-        capability:
-          schema_version: 1
-          summary: "Return the arm to a safe resting pose."
-          domain: manipulation
-          moves_robot: true
-          required_control_mode: moveit_planning
-          parameters:
-            type: object
-            additionalProperties: false
-            properties: {}
-            required: []
-          recovery_policy: never_retry
-        primitive_sequence:
-          - primitive_name: move_to_named_pose
-            pose_name: home
-      recover_zero_pose:
-        description:
-          summary: "Return the arm to the calibration zero pose."
-          category: recovery
-          when_to_use: ["return to the calibration pose", "fully retract the arm"]
-        capability:
-          schema_version: 1
-          summary: "Return the arm to its calibration pose."
-          domain: manipulation
-          moves_robot: true
-          required_control_mode: moveit_planning
-          parameters:
-            type: object
-            additionalProperties: false
-            properties: {}
-            required: []
-          recovery_policy: never_retry
-        primitive_sequence:
-          - primitive_name: move_to_named_pose
-            pose_name: zero
-      move_relative_ee:
-        description:
-          summary: "Translate the end-effector by a requested direction and distance."
-          category: translation
-          when_to_use: ["make a small corrective end-effector move"]
-        capability:
-          schema_version: 1
-          summary: "Move the end effector in a requested direction by a requested distance."
-          domain: manipulation
-          moves_robot: true
-          required_control_mode: moveit_planning
-          parameters:
-            type: object
-            additionalProperties: false
-            properties:
-              motion_direction:
-                type: string
-                enum: [forward, backward, left, right, up, down]
-              motion_distance:
-                type: number
-                exclusiveMinimum: 0
-                unit: meters
-            required: [motion_direction, motion_distance]
-          recovery_policy: ask_user
-        primitive_sequence:
-          - primitive_name: move_relative_ee
-            motion_direction_from_request: true
-            motion_distance_from_request: true
-      open_gripper_skill:
-        description:
-          summary: "Open the gripper."
-          category: gripper
-          when_to_use: ["release an object", "prepare the gripper for grasping"]
-        capability:
-          schema_version: 1
-          summary: "Open the gripper."
-          domain: manipulation
-          moves_robot: true
-          required_control_mode: moveit_planning
-          parameters:
-            type: object
-            additionalProperties: false
-            properties: {}
-            required: []
-          recovery_policy: never_retry
-        primitive_sequence:
-          - primitive_name: open_gripper
-      close_gripper_skill:
-        description:
-          summary: "Close the gripper."
-          category: gripper
-          when_to_use: ["close or hold with the gripper"]
-        capability:
-          schema_version: 1
-          summary: "Close the gripper."
-          domain: manipulation
-          moves_robot: true
-          required_control_mode: moveit_planning
-          parameters:
-            type: object
-            additionalProperties: false
-            properties: {}
-            required: []
-          recovery_policy: never_retry
-        primitive_sequence:
-          - primitive_name: close_gripper
-      pick_object:
-        executor: grasp_pipeline
-        required_args: [target_name]
-        timeout_sec: 240.0
-        description:
-          summary: "Detect, grasp, verify, and lift the requested object."
-          category: manipulation
-          when_to_use: ["pick up a visible object identified by a text query"]
-          aliases_zh: ["抓取物体", "拿起物体"]
-          aliases_en: ["pick object", "grasp object"]
-          motion_scope: [arm, gripper]
-          anchor_pose: none
-          intensity: moderate
-          duration_sec_estimate: 120.0
-          requires_motion_params: false
-        capability:
-          schema_version: 1
-          summary: "Detect, grasp, verify, and lift the requested object."
-          domain: manipulation
-          moves_robot: true
-          required_control_mode: moveit_planning
-          parameters:
-            type: object
-            additionalProperties: false
-            properties:
-              target_name:
-                type: string
-                freeform: true
-            required: [target_name]
-          recovery_policy: ask_user
-
   ros2_control:
     hardware_plugin: so101_hardware/SO101SystemHardware
-    port: /dev/ttyACM1
+    port: /dev/ttyACM0
     calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
     joint_names: ["1", "2", "3", "4", "5", "6"]
     # Semantic rest pose for upper layers; hardware activation holds the measured position.
@@ -650,7 +539,7 @@ robot:
     - type: camera
       name: wrist
       driver: realsense
-      serial_number: ""
+      serial_number: "349522071345"
       initial_reset: false
       # 640x360 preserves the 16:9 contract shape while keeping aligned
       # depth and pointcloud processing at the validated 30 Hz rate.
@@ -670,14 +559,16 @@ robot:
       optical_frame_id: camera_wrist_optical_frame
       # Reused from the PC-validated eye-in-hand runtime configuration. This
       # extrinsic remains valid when the unchanged camera mount moves to 310P.
+      # Updated from outputs/handeye/wrist_handeye_new.json (method=park,
+      # ee_to_camera_link, reproj_mean=0.437px, rot_rms=4.85deg).
       transform:
         parent_frame: gripper
-        x: -0.03893349096435185
-        y: 0.046093712828857866
-        z: -0.02852409709828743
-        roll: 3.1220710111747603
-        pitch: 1.08946543832224
-        yaw: -1.4382020056359806
+        x: -0.029804122099556248
+        y: 0.0735813073058911
+        z: -0.03849247926512127
+        roll: 3.093836835932143
+        pitch: 1.0039505938496505
+        yaw: -1.6776874824436123
 
   contract:
     base_contract: $(find robot_config)/config/contracts/act_grab_pan.yaml

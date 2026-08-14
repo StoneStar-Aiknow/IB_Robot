@@ -237,6 +237,21 @@ host_runtime:
 worker 使用被动等待，避免 NPU 请求完成后继续抢占 CPU。该配置只影响对应节点进程，不影响 MoveIt、
 相机驱动或其他机器人配置。
 
+## 已持物容器放置 SSOT
+
+支持容器放置验证的机器人在顶层 `robot.placement_execution` 声明唯一运行时配置。该配置维护 placement
+action、固定 1–5 号关节 `place_joint_positions`、移动时长、腕部 RGB topic、检测分割 endpoint、夹爪反馈超时，
+以及二维掩码包含验证的阈值和重采样次数；启用时缺少强制字段会在 launch 前失败。固定放置关节目标由
+`placement_execution.motion` 管理：到达 3 号电机 raw 1500 后开爪，随后只将 3 号电机移动到 raw 1600 做验证，
+最后恢复到 raw 1500。候选放置位规划、
+动态 IK/FK、深度/TF、持物门禁和恢复日志不属于该能力。
+
+公开技能由 `skill_catalog/config/skills/place_in_container` 和对应 profile 暴露，要求显式传入 `target_name` 和
+`container_name`，并通过 `placement_pipeline` 委托到 `/manipulation/execute_place`。执行器依次移动到固定
+`place_container`、打开夹爪、移动 3 号关节到验证位、进行视觉验证，最后返回释放位；`container_name` 只作为
+释放后容器检测 query，不改变固定运动，也不触发候选规划。成功要求夹爪反馈确认打开，并连续确认目标物品的
+二维分割区域位于指定容器区域内。夹爪 6 号关节只在释放阶段通过 `open_gripper` 单独控制。
+
 真机抓取配置可在 robot YAML 的 `robot.grasp_execution.target_gripper` 下声明目标夹爪几何。
 SO101 单动爪使用 `fixed_finger_contact_ee` 作为固定指侧参考点，`closing_axis_ee` 表示从固定指
 指向目标宽度中心的方向。`manipulation_execution/pick_executor_node` 会根据 GraspGen 候选的
@@ -256,8 +271,8 @@ effective_center = fixed_finger_contact_ee
 ```
 
 `fixed_finger_margin_m` 是额外远离固定指的基础安全距离，用于降低固定指先碰物体边缘或上表面的风险。
-当前 SO101 RealSense 抓取配置默认基础值为 `0.006 m`；目标窄于 `fixed_finger_margin_width_ref_m=0.035 m`
-时按 `fixed_finger_margin_width_gain=0.25` 增加安全余量，并由 `fixed_finger_margin_max_m=0.012 m` 封顶。
+当前 SO101 RealSense 抓取配置默认基础值为 `0.010 m`；目标窄于 `fixed_finger_margin_width_ref_m=0.035 m`
+时按 `fixed_finger_margin_width_gain=0.25` 增加安全余量，并由 `fixed_finger_margin_max_m=0.016 m` 封顶。
 
 `target_gripper.fixed_finger_base_side` 是独立的候选硬约束。启用后，执行器在 `base` 坐标系 XY 平面
 计算“目标宽度中心到固定指”与“目标宽度中心到 `reference_point_base`”的夹角余弦；低于
@@ -286,6 +301,10 @@ lift 和规划接触点，不改变相机测得的物体宽度端点。SO101 han
 验证过的 `[0.0, 0.0, -0.008]`；该值属于机器人/手眼执行几何，因此由 robot YAML 管理，action 客户端不提供
 覆盖参数。
 
+`execution_scoring.topdown_weight` 控制垂直向下抓取在源候选排序中的软加分。SO101 hand-eye
+profile 使用 `0.50`；`candidate_selection.topdown_weight` 保持相同值作为兼容回退。该权重只改变候选顺序，
+不跳过 workspace、桌面碰撞、IK/FK 或姿态门禁。
+
 `target_gripper.ik_orientation_guard` 约束 position-only IK 的实际 FK 朝向。SO101 的 joint5 对 TCP 位置
 几乎不产生梯度，因此超出执行门限时会保持在 seed 附近；执行器将超限 joint5 seed 翻转 `±π`，让固定指和
 活动指换侧，再比较 GraspGen 目标和实际 FK 的接近轴、180° 对称闭合轴直线及固定指内侧关系。当前配置使用：
@@ -299,8 +318,8 @@ ik_orientation_guard:
   joint5_limit_epsilon_rad: 0.001
   joint5_stage_continuity: true
   joint5_stage_max_delta_rad: 1.5707963267948966
-  max_approach_error_deg: 25.0
-  max_closing_error_deg: 20.0
+  max_approach_error_deg: 40.0
+  max_closing_error_deg: 30.0
   moveit_orientation_search:
     enabled: false
     approach_tolerance_deg: 15.0
@@ -317,7 +336,7 @@ joint5 当作抓取安全原点；候选选定以后，approach、pregrasp、gra
 MoveIt LMA 仍使用 `position_only_ik: true`。当前 SO101 profile 不启用
 `moveit_orientation_search`。OrientationConstraint
 不会为 5-DOF 机械臂创造额外自由度，反而可能把本应由最终 FK 门禁解释的姿态误差变成 `NO_IK_SOLUTION`。
-最终 IK/FK 结果仍必须通过 25°/20° 硬门禁。
+最终 IK/FK 结果仍必须通过硬门禁；310P 和 PC profile 均使用 40°/30°。
 
 可靠开口参数由 `prepared_candidate_scoring` 声明，因为准备阶段是从这个块里读取它们的：
 

@@ -91,6 +91,7 @@ class PickExecutorNode(
         self.declare_parameter("primitive_action_name", "/embodied/execute_primitive")
         self.declare_parameter("grasp_execution_json", "{}")
         self.declare_parameter("workspace_json", "{}")
+        self.declare_parameter("home_joint_positions_json", "{}")
         self.declare_parameter("arm_joint_names_json", "[]")
         self.declare_parameter("gripper_open_position", 1.0)
         self.declare_parameter("gripper_closed_position", 0.0)
@@ -108,6 +109,9 @@ class PickExecutorNode(
             **load_delegated_model_identity(self._config),
         )
         self._workspace = self._load_json_object(self.get_parameter("workspace_json").value)
+        self._home_joint_positions = self._load_home_joint_positions(
+            self.get_parameter("home_joint_positions_json").value
+        )
         self._arm_joint_names = self._load_json_list(self.get_parameter("arm_joint_names_json").value)
         self._gripper_open = float(self.get_parameter("gripper_open_position").value)
         self._gripper_closed = float(self.get_parameter("gripper_closed_position").value)
@@ -133,6 +137,7 @@ class PickExecutorNode(
         self._ee_frame = str(self._config.get("ee_frame", "gripper"))
         self._verification_policy = str(self._config.get("verification", "required")).lower()
         self._target_geometry = self._config.get("target_geometry", {})
+        self._validate_home_joint_config()
         self._mesh_directory: Path | None = None
         if bool(self._target_geometry.get("tabletop_filter", False)):
             mesh_package = str(self._target_geometry.get("mesh_package", "robot_description"))
@@ -217,7 +222,9 @@ class PickExecutorNode(
         if not delegated_executor_identity_matches(goal_request.expected_executor, self._executor_identity):
             return GoalResponse.REJECT
         dispatch_nonce = str(goal_request.dispatch_binding.dispatch_nonce).strip()
-        if not dispatch_nonce:
+        if bool(goal_request.supervised_direct) and dispatch_nonce:
+            return GoalResponse.REJECT
+        if not bool(goal_request.supervised_direct) and not dispatch_nonce:
             return GoalResponse.REJECT
         binding = goal_request.dispatch_binding
         budget = binding.task_budget
@@ -261,6 +268,8 @@ class PickExecutorNode(
                 return GoalResponse.REJECT
             self._goal_active = True
             self._dispatch_nonce = dispatch_nonce
+            self._supervised_direct = bool(goal_request.supervised_direct)
+            self._direct_primitive_index = 0
             self._dispatch_binding = copy_binding(goal_request.dispatch_binding)
         return GoalResponse.ACCEPT
 
@@ -278,6 +287,11 @@ class PickExecutorNode(
             if self._latest_joint_state is None:
                 return None
             return self._copy_joint_state(self._latest_joint_state)
+
+    def _kinematics_unhealthy_snapshot(self) -> set[int]:
+        """Return a stable copy of the unhealthy IK/FK worker indices."""
+        with self._kinematics_health_lock:
+            return set(self._kinematics_unhealthy_workers)
 
     @staticmethod
     def _handle_cancel(_goal_handle):

@@ -25,6 +25,12 @@ except ModuleNotFoundError:
 logger = logging.getLogger(__name__)
 
 
+def _enable_grounding_dino_autocast() -> None:
+    """Enable the CUDA precision supported by Grounding-DINO's custom ops."""
+
+    torch.autocast(device_type="cuda", dtype=torch.float16).__enter__()
+
+
 def volume_centroid_hull(points: np.ndarray) -> tuple[np.ndarray, float]:
     """Volume centroid of the convex hull enclosing ``points``.
 
@@ -172,7 +178,7 @@ class GroundedSAM2Wrapper:
         self.grounding_model = self._load_grounding_model(gdino_ckpt, text_encoder_type, self.device)
 
         if self.device == "cuda":
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+            _enable_grounding_dino_autocast()
             if torch.cuda.get_device_properties(0).major >= 8:
                 torch.backends.cuda.matmul.allow_tf32 = True
                 torch.backends.cudnn.allow_tf32 = True

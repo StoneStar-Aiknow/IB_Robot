@@ -63,3 +63,21 @@ def test_grounding_model_builds_from_a_copy_of_source_config(monkeypatch, tmp_pa
     assert GROUNDING_DINO_SWINT_OGC_CONFIG["text_encoder_type"] == "bert-base-uncased"
     assert captured["strict"] is False
     assert captured["evaluated"] is True
+
+
+def test_cuda_autocast_uses_fp16_for_grounding_dino_extension(monkeypatch):
+    calls = []
+
+    class FakeAutocast:
+        def __enter__(self):
+            return self
+
+    monkeypatch.setattr(
+        wrapper_module.torch,
+        "autocast",
+        lambda **kwargs: calls.append(kwargs) or FakeAutocast(),
+    )
+
+    wrapper_module._enable_grounding_dino_autocast()
+
+    assert calls == [{"device_type": "cuda", "dtype": wrapper_module.torch.float16}]

@@ -11,7 +11,44 @@ from sensor_msgs.msg import JointState
 
 from embodied_common.dispatch_binding import copy_binding
 from ibrobot_msgs.action import PickObject, PrimitiveCommand
-from manipulation_execution.pick_executor_models import FlowState, PickCancelled, PickFlowError
+from manipulation_execution.pick_executor_models import (
+    CandidateSelectionDiagnostics,
+    FlowState,
+    PickCancelled,
+    PickFlowError,
+)
+
+EXECUTION_RETRYABLE_CODES = frozenset(
+    {
+        "IK_FAILED",
+        "FK_FAILED",
+        "IK_JOINT5_LIMIT",
+        "IK_JOINT5_RETRY_FAILED",
+        "IK_JOINT5_BRANCH_CHANGED",
+        "IK_JOINT5_MISSING",
+        "IK_ORIENTATION_REJECTED",
+        "CONTACT_REALIGN_FAILED",
+        "CONTACT_COMPENSATION_FAILED",
+        "CONTACT_Z_ERROR",
+        "IK_FK_PREDICTED_CONTACT_Z",
+        "WORKSPACE_REJECTED",
+        "FK_FIXED_FINGER_BASE_SIDE_REJECTED",
+        "FK_FIXED_FINGER_BASE_SIDE_UNAVAILABLE",
+        "TARGET_TABLETOP_COLLISION",
+        "TF_UNAVAILABLE",
+        "RPC_TIMEOUT",
+        "RPC_FAILED",
+    }
+)
+
+
+def _is_execution_retryable(error: PickFlowError) -> bool:
+    """Limit generic RPC retries to calls that explicitly declared them safe."""
+    if error.code in {"GRASP_VERIFICATION_FAILED", "GRASP_UNCERTAIN"}:
+        return True
+    if error.code in {"RPC_TIMEOUT", "RPC_FAILED"}:
+        return bool(error.retryable)
+    return error.code in EXECUTION_RETRYABLE_CODES
 
 
 class PickFlowPhase:
@@ -53,17 +90,26 @@ class PickFlowPhase:
         feedback.detail = detail
         goal_handle.publish_feedback(feedback)
 
-    def _wait_future(self, future, goal_handle, deadline: float, timeout_sec: float, label: str):
+    def _wait_future(
+        self,
+        future,
+        goal_handle,
+        deadline: float,
+        timeout_sec: float,
+        label: str,
+        *,
+        retryable: bool = False,
+    ):
         local_deadline = min(deadline, time.monotonic() + max(0.1, timeout_sec))
         while rclpy.ok() and not future.done():
             self._check_cancel(goal_handle)
             if time.monotonic() >= local_deadline:
                 future.cancel()
-                raise PickFlowError("RPC_TIMEOUT", f"{label} timed out")
+                raise PickFlowError("RPC_TIMEOUT", f"{label} timed out", retryable=retryable)
             time.sleep(0.05)
         response = future.result()
         if response is None:
-            raise PickFlowError("RPC_FAILED", f"{label} returned no response")
+            raise PickFlowError("RPC_FAILED", f"{label} returned no response", retryable=retryable)
         return response
 
     def _wait_for_service(self, client, deadline: float, service_name: str, *, required: bool = True) -> bool:
@@ -166,7 +212,13 @@ class PickFlowPhase:
     ) -> None:
         primitive_goal = PrimitiveCommand.Goal()
         primitive_goal.dispatch_binding = copy_binding(self._dispatch_binding)
-        if primitive_goal.dispatch_binding.task_id != task_id:
+        if getattr(self, "_supervised_direct", False):
+            self._direct_primitive_index = int(getattr(self, "_direct_primitive_index", 0)) + 1
+            direct_task_id = f"{task_id}/primitive-{self._direct_primitive_index}"
+            primitive_goal.dispatch_binding.task_id = direct_task_id
+            primitive_goal.dispatch_binding.root_task_id = direct_task_id
+            primitive_goal.dispatch_binding.dispatch_nonce = ""
+        if not getattr(self, "_supervised_direct", False) and primitive_goal.dispatch_binding.task_id != task_id:
             raise PickFlowError("DISPATCH_BINDING_MISMATCH", "delegated primitive task ID mismatch")
         primitive_goal.execution_token = self._execution_token(goal_handle)
         primitive_goal.primitive_name = primitive_name
@@ -185,7 +237,11 @@ class PickFlowPhase:
             primitive_goal.joint_names = list(self._arm_joint_names)
             primitive_goal.joint_positions = [float(position_by_name[name]) for name in self._arm_joint_names]
             primitive_goal.primitive_duration_sec = float(duration_sec)
-        primitive_goal.timeout_sec = float(self._remaining(deadline))
+        # Delegated primitives let the Gateway resolve the remaining root
+        # budget at admission time; a propagated snapshot is already stale.
+        primitive_goal.timeout_sec = (
+            float(self._remaining(deadline)) if getattr(self, "_supervised_direct", False) else 0.0
+        )
 
         send_future = self._primitive_client.send_goal_async(primitive_goal)
         primitive_handle = self._wait_future(send_future, goal_handle, deadline, self._rpc_timeout, primitive_name)
@@ -265,7 +321,6 @@ class PickFlowPhase:
         selection_attempts = max(1, int(selection.get("selection_attempts", 1)))
         retryable_codes = {
             "GRASP_PLANNING_FAILED",
-            "NO_GRASP_CANDIDATES",
             "NO_SAFE_GRASP_CANDIDATES",
             "NO_EXECUTABLE_CANDIDATE",
             "ALL_CANDIDATES_FAILED",
@@ -277,6 +332,8 @@ class PickFlowPhase:
         selection_started = time.monotonic()
 
         for selection_attempt in range(1, selection_attempts + 1):
+            diagnostics = CandidateSelectionDiagnostics(selection_attempt=selection_attempt)
+            diagnostics_recorded = False
             self.get_logger().info(
                 f"grasp selection attempt={selection_attempt}/{selection_attempts} target={target_query!r}"
             )
@@ -312,6 +369,7 @@ class PickFlowPhase:
                 scene_base = self._scene_geometry_base(base_to_camera, scene)
                 self._publish_feedback(goal_handle, state, "selecting", f"evaluating {len(candidates)} candidates")
                 stage_started = time.monotonic()
+                diagnostics.raw_candidates = len(candidates)
                 ranked = self._rank_candidates(
                     default_frame,
                     grasp_header.stamp,
@@ -319,6 +377,7 @@ class PickFlowPhase:
                     candidates,
                     scene,
                     scene_base,
+                    diagnostics=diagnostics,
                 )
                 stage_duration = time.monotonic() - stage_started
                 state.add_timing("candidate_geometry_ranking", stage_duration)
@@ -340,13 +399,25 @@ class PickFlowPhase:
                     candidate_seed,
                     goal_handle,
                     deadline,
+                    diagnostics=diagnostics,
                 )
                 state.add_timing("candidate_ik_fk", time.monotonic() - stage_started)
                 if prepared_candidates:
+                    diagnostics.terminal_code = "ok"
+                    state.candidate_selection_diagnostics.append(diagnostics.as_dict())
+                    diagnostics_recorded = True
                     state.pipeline_timings["candidate_selection_total"] = time.monotonic() - selection_started
                     return prepared_candidates, scene_base
                 if preparation_error is None:
                     raise PickFlowError("NO_EXECUTABLE_CANDIDATE", "no candidate could be prepared")
+                preparation_rejections = diagnostics.preparation_rejections
+                rejected_total = sum(preparation_rejections.values())
+                workspace_rejected = preparation_rejections.get("WORKSPACE_REJECTED", 0)
+                if rejected_total > 0 and workspace_rejected == rejected_total:
+                    raise PickFlowError(
+                        "TARGET_OUTSIDE_WORKSPACE",
+                        f"target is visible but all {workspace_rejected} prepared grasp candidates are outside the robot workspace",
+                    )
                 raise PickFlowError(
                     "ALL_CANDIDATES_FAILED",
                     f"all {len(ranked)} ranked candidates failed preparation; "
@@ -356,6 +427,10 @@ class PickFlowPhase:
                 raise
             except PickFlowError as exc:
                 last_error = exc
+                if not diagnostics_recorded:
+                    diagnostics.terminal_code = exc.code
+                    state.candidate_selection_diagnostics.append(diagnostics.as_dict())
+                    diagnostics_recorded = True
                 if exc.code not in retryable_codes or selection_attempt >= selection_attempts:
                     raise
                 self.get_logger().warning(
@@ -377,6 +452,52 @@ class PickFlowPhase:
         if last_error is None:
             raise PickFlowError("NO_EXECUTABLE_CANDIDATE", "no candidate could be prepared")
         raise last_error
+
+    def _order_prepared_candidates(self, state: FlowState, prepared_candidates: list) -> None:
+        prepared_scoring = self._config.get("prepared_candidate_scoring", {})
+        if bool(prepared_scoring.get("enabled", False)):
+            prepared_candidates.sort(
+                key=lambda item: (
+                    -item.selection_score,
+                    item.contact_z_error_m,
+                    item.contact_residual_xy_m,
+                    -item.ranked.score,
+                    item.ranked.index,
+                )
+            )
+        else:
+            prepared_candidates.sort(
+                key=lambda item: (
+                    item.contact_z_error_m,
+                    item.contact_residual_xy_m,
+                )
+            )
+        self._record_prepared_ranking(state, prepared_candidates)
+        summary_parts = []
+        for item in prepared_candidates[:10]:
+            envelope = item.fixed_finger_envelope
+            fixed_text = "n/a" if envelope is None else f"{envelope.fixed_gap_m:.4f}/{envelope.score:.3f}"
+            headroom_text = (
+                "n/a" if item.predicted_robust_gap_headroom_m is None else f"{item.predicted_robust_gap_headroom_m:.4f}"
+            )
+            base_side_text = (
+                "n/a"
+                if item.ranked.fixed_finger_base_side is None
+                else f"{item.ranked.fixed_finger_base_side.alignment_cos:.3f}"
+            )
+            fk_base_side_text = (
+                "n/a"
+                if item.fk_fixed_finger_base_side is None
+                else f"{item.fk_fixed_finger_base_side.alignment_cos:.3f}"
+            )
+            summary_parts.append(
+                f"{item.ranked.index}:score={item.selection_score:.3f}/fixed={fixed_text}/"
+                f"robust_headroom={headroom_text}/"
+                f"base_side={base_side_text}/fk_base_side={fk_base_side_text}/"
+                f"z={item.contact_z_error_m:.4f}/xy={item.contact_residual_xy_m:.4f}/"
+                f"approach_axis={item.approach_axis_error_deg}/closing_axis={item.closing_axis_error_deg:.1f}"
+            )
+        self.get_logger().info(f"prepared candidate rank: {', '.join(summary_parts)}")
 
     def _execute_pick(self, goal_handle):
         goal = goal_handle.request
@@ -411,64 +532,14 @@ class PickFlowPhase:
                 result.message = "observation pose reached"
                 goal_handle.succeed()
                 return result
-            prepared_candidates, scene_base = self._plan_and_prepare_candidates(
-                goal_handle,
-                deadline,
-                state,
-                target_query,
-            )
-            max_attempts = int(self._config.get("max_execution_attempts", 1))
-            last_error: PickFlowError | None = None
-
-            prepared_scoring = self._config.get("prepared_candidate_scoring", {})
-            if bool(prepared_scoring.get("enabled", False)):
-                prepared_candidates.sort(
-                    key=lambda item: (
-                        -item.selection_score,
-                        item.contact_z_error_m,
-                        item.contact_residual_xy_m,
-                        -item.ranked.score,
-                        item.ranked.index,
-                    )
-                )
-            else:
-                prepared_candidates.sort(
-                    key=lambda item: (
-                        item.contact_z_error_m,
-                        item.contact_residual_xy_m,
-                    )
-                )
-            self._record_prepared_ranking(state, prepared_candidates)
-            summary_parts = []
-            for item in prepared_candidates[:10]:
-                envelope = item.fixed_finger_envelope
-                fixed_text = "n/a" if envelope is None else f"{envelope.fixed_gap_m:.4f}/{envelope.score:.3f}"
-                headroom_text = (
-                    "n/a"
-                    if item.predicted_robust_gap_headroom_m is None
-                    else f"{item.predicted_robust_gap_headroom_m:.4f}"
-                )
-                base_side_text = (
-                    "n/a"
-                    if item.ranked.fixed_finger_base_side is None
-                    else f"{item.ranked.fixed_finger_base_side.alignment_cos:.3f}"
-                )
-                fk_base_side_text = (
-                    "n/a"
-                    if item.fk_fixed_finger_base_side is None
-                    else f"{item.fk_fixed_finger_base_side.alignment_cos:.3f}"
-                )
-                summary_parts.append(
-                    f"{item.ranked.index}:score={item.selection_score:.3f}/fixed={fixed_text}/"
-                    f"robust_headroom={headroom_text}/"
-                    f"base_side={base_side_text}/fk_base_side={fk_base_side_text}/"
-                    f"z={item.contact_z_error_m:.4f}/xy={item.contact_residual_xy_m:.4f}/"
-                    f"approach_axis={item.approach_axis_error_deg}/closing_axis={item.closing_axis_error_deg:.1f}"
-                )
-            summary = ", ".join(summary_parts)
-            self.get_logger().info(f"prepared candidate rank: {summary}")
-
             if mode == PickObject.Goal.MODE_PLAN_ONLY:
+                prepared_candidates, _scene_base = self._plan_and_prepare_candidates(
+                    goal_handle,
+                    deadline,
+                    state,
+                    target_query,
+                )
+                self._order_prepared_candidates(state, prepared_candidates)
                 state.candidate_index = int(prepared_candidates[0].ranked.index)
                 self._publish_feedback(goal_handle, state, "completed", "grasp plan prepared without execution")
                 result = self._result_from_state(state)
@@ -480,19 +551,28 @@ class PickFlowPhase:
                 goal_handle.succeed()
                 return result
 
-            attempt_candidates = (
-                prepared_candidates if max_attempts <= 0 else prepared_candidates[: max(1, max_attempts)]
-            )
-            for attempt, prepared in enumerate(attempt_candidates, start=1):
+            max_attempts = int(self._config.get("max_execution_attempts", 1))
+            execution_attempts = max(1, max_attempts)
+            last_error: PickFlowError | None = None
+            for attempt in range(1, execution_attempts + 1):
+                prepared_candidates, scene_base = self._plan_and_prepare_candidates(
+                    goal_handle,
+                    deadline,
+                    state,
+                    target_query,
+                )
+                self._order_prepared_candidates(state, prepared_candidates)
+                prepared = prepared_candidates[0]
                 state.attempt = attempt
                 candidate = prepared.ranked
                 state.candidate_index = int(candidate.index)
+                state.recovery_completed = False
                 try:
                     self._publish_feedback(
                         goal_handle,
                         state,
                         "selecting",
-                        f"preparing execution candidate {candidate.index} ({attempt}/{len(attempt_candidates)})",
+                        f"preparing execution candidate {candidate.index} ({attempt}/{execution_attempts})",
                     )
                     self._execute_candidate(
                         goal_handle,
@@ -523,13 +603,21 @@ class PickFlowPhase:
                         f"pick candidate failed: attempt={attempt} candidate={candidate.index} "
                         f"code={exc.code} retryable={exc.retryable} message={exc}"
                     )
-                    if not exc.retryable:
+                    if not _is_execution_retryable(exc):
                         raise
+                    if not state.recovery_completed:
+                        recovery_started = time.monotonic()
+                        try:
+                            self._move_to_observe(goal_handle, deadline, state, task_id)
+                            state.recovery_completed = True
+                        finally:
+                            state.add_timing("subphase_recovery", time.monotonic() - recovery_started)
             if last_error is None:
                 raise PickFlowError("NO_EXECUTION_RESULT", "prepared candidates produced no execution result")
             raise PickFlowError(
-                "ALL_CANDIDATES_FAILED",
-                f"all {state.attempt} attempted candidates failed; last={last_error.code}: {last_error}",
+                last_error.code,
+                f"grasp retry budget exhausted after {state.attempt} attempts; "
+                f"last failure: {last_error.code}: {last_error}",
             )
         except PickCancelled as exc:
             result = self._result_from_state(state)
@@ -557,4 +645,6 @@ class PickFlowPhase:
             with self._goal_lock:
                 self._goal_active = False
                 self._dispatch_nonce = ""
+                self._supervised_direct = False
+                self._direct_primitive_index = 0
                 self._dispatch_binding = None
