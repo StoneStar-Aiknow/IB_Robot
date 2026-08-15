@@ -1,0 +1,174 @@
+From 1b88df7734132922ac675d4d1b0c88f3639da733 Mon Sep 17 00:00:00 2001
+From: IB-Robot <ibrobot@openeuler.org>
+Date: Sat, 15 Aug 2026 11:37:49 +0800
+Subject: [PATCH] groundingdino: inline transformers 5 compat and pure-Python
+ fallback
+
+BertModelWarper previously relied on bound methods captured from
+transformers.BertModel in __init__. Transformers 5 dropped
+PreTrainedModel.get_head_mask and removed the device parameter from
+get_extended_attention_mask, so the captured helpers either raised
+AttributeError at construction time or received a torch.device where
+torch.dtype was expected. Define get_extended_attention_mask and
+get_head_mask directly on BertModelWarper so the wrapper stays
+self-contained and works with both Transformers 4 and 5 without any
+runtime monkey-patching of transformers.BertModel.
+
+The compatibility helpers need to forward to the underlying BertModel
+for mask expansion and dtype lookup. Storing the reference via
+``object.__setattr__`` keeps it out of nn.Module sub-module registration
+so the Grounding-DINO checkpoint key contract (``bert.embeddings.*``,
+``bert.encoder.*``, ``bert.pooler.*``) is preserved and saving the model
+does not emit duplicated ``_bert_model.*`` weight paths.
+
+The multi-scale deformable attention CUDA op is gated behind the
+optional groundingdino._C extension. Wrap the import in a try/except
+that records _C=None on failure and extend the forward() branch to
+fall back to the pure-Python implementation when _C is unavailable,
+including on CUDA tensors. This makes it safe to ship and install a
+pure-Python wheel (GROUNDINGDINO_SKIP_CUDA=1 in setup.py) while still
+honoring a separately-built _C extension when present.
+
+Distribution metadata is now controllable via GROUNDINGDINO_PACKAGE_NAME
+so audited builds can rename it to ibrobot-groundingdino without
+re-implementing setup().
+
+Signed-off-by: IB-Robot <ibrobot@openeuler.org>
+---
+ .../models/GroundingDINO/bertwarper.py        | 45 ++++++++++++++++++++-
+ .../models/GroundingDINO/ms_deform_attn.py    |  7 ++--
+ groundingdino/version.py                      |  1 +
+ setup.py                                      | 14 +++++--
+ 4 files changed, 56 insertions(+), 9 deletions(-)
+ create mode 100644 groundingdino/version.py
+
+diff --git a/groundingdino/models/GroundingDINO/bertwarper.py b/groundingdino/models/GroundingDINO/bertwarper.py
+index f0cf977..56ed54b 100644
+--- a/groundingdino/models/GroundingDINO/bertwarper.py
++++ b/groundingdino/models/GroundingDINO/bertwarper.py
+@@ -24,9 +24,49 @@ class BertModelWarper(nn.Module):
+         self.encoder = bert_model.encoder
+         self.pooler = bert_model.pooler
+ 
+-        self.get_extended_attention_mask = bert_model.get_extended_attention_mask
++        # Avoid nn.Module sub-module registration: assigning the full BertModel
++        # via ``self._bert_model = bert_model`` would duplicate every weight
++        # under ``_bert_model.*`` in state_dict and break the Grounding-DINO
++        # checkpoint ABI. Keep the reference outside module registration so
++        # the helpers can still forward to the underlying BertModel.
++        object.__setattr__(self, "_bert_model_ref", bert_model)
+         self.invert_attention_mask = bert_model.invert_attention_mask
+-        self.get_head_mask = bert_model.get_head_mask
++
++    def get_extended_attention_mask(self, attention_mask, input_shape, device=None, dtype=None):
++        """Bridge the Transformers 4 -> 5 signature change.
++
++        Transformers 4 exposed ``BertModel.get_extended_attention_mask(self, attention_mask,
++        input_shape, device=None, dtype=None)``. Transformers 5 dropped the ``device`` parameter
++        and now takes ``(self, attention_mask, input_shape, dtype=None)``. The original
++        BertModelWarper forward called the bound method with ``device`` as a third positional
++        argument. Keep accepting that call shape here and forward only the kwargs that
++        Transformers 5 understands, treating a torch.dtype passed via ``device`` as ``dtype``.
++        """
++        if dtype is None and isinstance(device, torch.dtype):
++            dtype = device
++        return self._bert_model_ref.get_extended_attention_mask(attention_mask, input_shape, dtype=dtype)
++
++    def get_head_mask(self, head_mask, num_hidden_layers, is_attention_chunked=False):
++        """Restore the ``get_head_mask`` helper removed from Transformers 5.
++
++        Transformers 5 dropped ``PreTrainedModel.get_head_mask``; the bound method used to be
++        captured in ``__init__`` no longer exists on ``BertModel`` instances. Define the helper
++        inline so BertModelWarper stays self-contained regardless of the Transformers version.
++        """
++        if head_mask is None:
++            return [None] * num_hidden_layers
++        if head_mask.dim() == 1:
++            head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
++            head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
++        elif head_mask.dim() == 2:
++            head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
++        if head_mask.dim() != 5:
++            raise ValueError(f"head_mask.dim != 5, instead {head_mask.dim()}")
++        head_mask = head_mask.to(dtype=self._bert_model_ref.dtype)
++        if is_attention_chunked:
++            head_mask = head_mask.unsqueeze(-1)
++        return head_mask
++
+ 
+     def forward(
+         self,
+diff --git a/groundingdino/models/GroundingDINO/ms_deform_attn.py b/groundingdino/models/GroundingDINO/ms_deform_attn.py
+index 489d501..08ae208 100644
+--- a/groundingdino/models/GroundingDINO/ms_deform_attn.py
++++ b/groundingdino/models/GroundingDINO/ms_deform_attn.py
+@@ -27,8 +27,9 @@ from torch.nn.init import constant_, xavier_uniform_
+ 
+ try:
+     from groundingdino import _C
+-except:
+-    warnings.warn("Failed to load custom C++ ops. Running on CPU mode Only!")
++except Exception:
++    _C = None
++    warnings.warn("Failed to load custom C++ ops. Falling back to the pure-Python implementation.")
+ 
+ 
+ # helpers
+@@ -327,7 +328,7 @@ class MultiScaleDeformableAttention(nn.Module):
+                 )
+             )
+     
+-        if torch.cuda.is_available() and value.is_cuda:
++        if _C is not None and torch.cuda.is_available() and value.is_cuda:
+             halffloat = False
+             if value.dtype == torch.float16:
+                 halffloat = True
+diff --git a/groundingdino/version.py b/groundingdino/version.py
+new file mode 100644
+index 0000000..ce0d450
+--- /dev/null
++++ b/groundingdino/version.py
+@@ -0,0 +1 @@
++__version__ = '0.1.0+ibrobot.1'
+diff --git a/setup.py b/setup.py
+index 275b6fc..a2cb934 100644
+--- a/setup.py
++++ b/setup.py
+@@ -41,8 +41,8 @@ from setuptools import find_packages, setup
+ from torch.utils.cpp_extension import CUDA_HOME, CppExtension, CUDAExtension
+ 
+ # groundingdino version info
+-version = "0.1.0"
+-package_name = "groundingdino"
++version = "0.1.0+ibrobot.1"
++package_name = os.environ.get("GROUNDINGDINO_PACKAGE_NAME", "groundingdino")
+ cwd = os.path.dirname(os.path.abspath(__file__))
+ 
+ 
+@@ -66,6 +66,12 @@ torch_ver = [int(x) for x in torch.__version__.split(".")[:2]]
+ 
+ 
+ def get_extensions():
++    # IB_Robot ships a portable pure-Python wheel. Skip CUDA extension build when
++    # GROUNDINGDINO_SKIP_CUDA is set so the resulting wheel is `py3-none-any`.
++    # Users who need the optimized CUDA op can build it from source separately.
++    if os.environ.get("GROUNDINGDINO_SKIP_CUDA", "") == "1":
++        print("GROUNDINGDINO_SKIP_CUDA=1: skipping CUDA extension build, shipping pure-Python wheel.")
++        return None
+     this_dir = os.path.dirname(os.path.abspath(__file__))
+     extensions_dir = os.path.join(this_dir, "groundingdino", "models", "GroundingDINO", "csrc")
+ 
+@@ -202,8 +208,8 @@ if __name__ == "__main__":
+     write_version_file()
+ 
+     setup(
+-        name="groundingdino",
+-        version="0.1.0",
++        name=package_name,
++        version=version,
+         author="International Digital Economy Academy, Shilong Liu",
+         url="https://github.com/IDEA-Research/GroundingDINO",
+         description="open-set object detector",
+-- 
+2.34.1
+

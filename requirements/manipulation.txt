@@ -1,6 +1,7 @@
-# Optional dependencies for src/manipulation_service.
-# Install with:
-#   ./scripts/setup.sh --with-grasp
+# Default runtime dependencies for src/manipulation_service.
+# Installed unconditionally by ./scripts/setup.sh on platforms that build the
+# local workspace (Ubuntu). Skipped on openEuler Embedded because GraspGen's
+# pointnet2_ops CUDA extension is not supported there.
 #
 # GraspGen itself is installed by scripts/setup/python_venv.sh from a pinned
 # editable VCS source using --no-deps so it does not overwrite the workspace's

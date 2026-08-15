@@ -64,7 +64,7 @@ CUDA 路径使用 pip 安装的 GraspGen：`manipulation_service` 在同一 Pyth
 
 - 使用 `local_cuda` 时当前环境需有可用 CUDA PyTorch；上游 `GraspGenSampler` 内部会把模型和点云移到 CUDA。
 - 使用 `ascend_local` 时需有可加载的 Ascend GraspGen manifest/OM bundle 和 ACL 运行环境。
-- 已通过 `./scripts/setup.sh --with-grasp` 安装 `grasp_gen` 和 `pointnet2_ops`。
+- 已通过 `./scripts/setup.sh` 默认安装 `grasp_gen` 和 `pointnet2_ops`（Ubuntu 默认安装；openEuler Embedded 因 CUDA 扩展限制跳过）。
 - GraspGen 运行 bundle 位于 `models/grasp/graspgen_robotiq_2f_140/`；其中
   `assets/adapter.json` 声明 bundle-relative 配置和权重路径。旧的
   `models/grasp/checkpoints/` 布局和 `GRASPGEN_MODEL_DIR` 仍作为兼容回退。

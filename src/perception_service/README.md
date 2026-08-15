@@ -176,10 +176,10 @@ embodied:
 ## 7. 抓取检测与分割
 
 抓取链使用 `inference_service.model_service_node` 承载强类型服务，不包含订阅相机快照的专用兼容节点。首次使用 PC Torch
-deployment 前安装可选依赖并下载模型：
+deployment 前安装默认依赖并下载模型：
 
 ```bash
-./scripts/setup.sh --with-perception
+./scripts/setup.sh
 ./scripts/download_perception_models.sh
 ```
 
@@ -263,7 +263,9 @@ Grounding DINO Swin-T OGC 的网络结构配置由 `perception_service.grounding
 不作为模型资产复制进 bundle；bundle 仅保存 checkpoint、文本编码器和 SAM2 checkpoint 等运行资产。
 
 SigLIP2 image/text 服务共享同一 bundle 与 embedding identity，但仍由独立进程加载独立 session。RAM++ runtime
-由 `third_party/wheels/recognize-anything/` 中固定上游 commit 和补丁构建的 `ibrobot-ram` wheel 提供；源码不是模型
+由 `third_party/wheels/recognize-anything/` 中固定上游 commit 和补丁构建的 `ibrobot-ram` wheel 提供；Grounding-DINO
+runtime 由 `third_party/wheels/groundingdino/` 中固定上游 commit 和补丁构建的 `ibrobot-groundingdino` 纯 Python wheel
+提供（Transformers 5 兼容补丁已固化进源码，运行时不再 monkey-patch `transformers.BertModel`）；源码不是模型
 资产。ONNX、OM 等未验证转换结果只能放在
 bundle 的 `model_utils_work/`，通过 conformance 与 promotion 后才可复制到不可变
 `artifacts/<backend>/<deployment>/generations/<uuid>/` 并注册为 named deployment。

@@ -8,27 +8,37 @@
 third_party/
 ├── patches/
 │   ├── lerobot/
-        ├── INDEX.yaml
-        └── v0.5.1/
-            ├── 0001-*.patch
-            ├── 0002-*.patch
-            ├── ...
-            ├── manifest.yaml
-            ├── series.txt
-            ├── series.master-parity-candidates.txt
+│         ├── INDEX.yaml
+│         └── v0.5.1/
+│             ├── 0001-*.patch
+│             ├── 0002-*.patch
+│             ├── ...
+│             ├── manifest.yaml
+│             ├── series.txt
+│             ├── series.master-parity-candidates.txt
 │   │       └── series.openharmony-5.1.0-musl.txt
-│   └── recognize-anything/<commit>/
+│   ├── recognize-anything/<commit>/
+│   │   ├── manifest.yaml
+│   │   ├── series.txt
+│   │   └── 0001-*.patch
+│   └── groundingdino/<commit>/
 │       ├── manifest.yaml
 │       ├── series.txt
 │       └── 0001-*.patch
 └── wheels/
-    └── recognize-anything/<commit>/
-        ├── ibrobot_ram-*.whl
+    ├── recognize-anything/<commit>/
+    │   ├── ibrobot_ram-*.whl
+    │   └── SHA256SUMS
+    └── groundingdino/<commit>/
+        ├── ibrobot_groundingdino-*.whl
         └── SHA256SUMS
 ```
 
-RAM++ wheel 通过 `scripts/build_ram_plus_wheel.sh` 从 manifest 固定的上游 commit 重建。setup 使用
-`--no-deps` 安装该 wheel，Python runtime 依赖仍由 `requirements/perception.txt` 统一解析，避免第三方元数据覆盖
+RAM++ wheel 通过 `scripts/build_ram_plus_wheel.sh` 从 manifest 固定的上游 commit 重建。GroundingDINO wheel 通过
+`scripts/build_groundingdino_wheel.sh` 从 manifest 固定的上游 commit 重建（`GROUNDINGDINO_SKIP_CUDA=1` 跳过 CUDA
+扩展，产出纯 Python wheel；`MultiScaleDeformableAttention` 在 `groundingdino._C` 不可用时回落到纯 PyTorch 实现，
+CUDA 用户如需最优性能可单独构建 `_C` 扩展）。setup 使用 `--no-deps` 安装这些 wheel，Python runtime 依赖仍由
+`requirements/perception.txt` 统一解析，避免第三方元数据覆盖
 IB_Robot 的 Torch、Transformers 和 ROS ABI 约束。
 
 ## 设计目标

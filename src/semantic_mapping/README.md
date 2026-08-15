@@ -165,7 +165,7 @@ service bundles，也不要求 service semantic identities；service 模式仍�
 ## Model Assets
 
 ```bash
-./scripts/setup.sh --with-perception
+./scripts/setup.sh
 ./scripts/download_perception_models.sh
 ```
 
@@ -179,7 +179,8 @@ models/
 └── grounded_sam2_swint_ogc/{inference_manifest.json,assets/,model_utils_work/}
 ```
 
-RAM++ runtime 由 `third_party/wheels/recognize-anything/` 中受控的 `ibrobot-ram` wheel 提供；源码与权重分开管理。
+RAM++ runtime 由 `third_party/wheels/recognize-anything/` 中受控的 `ibrobot-ram` wheel 提供；Grounding-DINO
+runtime 由 `third_party/wheels/groundingdino/` 中受控的 `ibrobot-groundingdino` 纯 Python wheel 提供；源码与权重分开管理。
 `model_utils_work/` 下的转换产物不是 production deployment。只有 manifest 声明并通过对应 conformance 的
 named deployment 才能在 production SSOT 中启用。
 

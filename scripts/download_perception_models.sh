@@ -144,7 +144,7 @@ try:
 except ModuleNotFoundError as exc:
     raise SystemExit(
         "Error: huggingface_hub is required to download bert-base-uncased. "
-        "Install perception dependencies first with ./scripts/setup.sh --with-perception."
+        "Install perception dependencies first with ./scripts/setup.sh."
     ) from exc
 
 repo_id = sys.argv[1]

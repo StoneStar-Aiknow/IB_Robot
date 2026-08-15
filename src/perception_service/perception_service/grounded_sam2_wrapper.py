@@ -1,6 +1,5 @@
 """Wrapper for Grounding-DINO + SAM2 inference pipeline."""
 
-import inspect
 import logging
 import os
 from dataclasses import dataclass, field
@@ -23,6 +22,55 @@ except ModuleNotFoundError:
     box_convert = None
 
 logger = logging.getLogger(__name__)
+
+
+# Keys the official upstream SwinT-OGC release checkpoint carries that the
+# inference model does not own. Calibrated against the real checkpoint
+# (groundingdino_swint_ogc.pth loaded via load_state_dict(strict=False) with
+# the audited wheel + GROUNDING_DINO_SWINT_OGC_CONFIG):
+#   - label_enc.weight: training-time denoising (DN) label embedding; the
+#     inference model has no label_enc submodule (dn_number=0), so this key
+#     always appears in unexpected_keys when loading the official checkpoint.
+#   - bert.embeddings.position_ids: legacy buffer removed in newer transformers.
+#
+# No missing keys are expected with the official checkpoint (measured empty);
+# keep _ALLOWED_MISSING_KEY_PREFIXES strict on purpose.
+_ALLOWED_UNEXPECTED_KEYS = frozenset({"label_enc.weight"})
+_ALLOWED_UNEXPECTED_KEY_PREFIXES = ("bert.",)
+_ALLOWED_MISSING_KEY_PREFIXES = ()
+
+
+def _verify_grounding_dino_checkpoint_compatible(incompatible) -> None:
+    """Reject Grounding-DINO checkpoint keys that fall outside the allow-list.
+
+    ``strict=False`` is required to load the upstream Grounding-DINO SwintOGC
+    checkpoint because the official release carries training-time weights
+    (e.g. ``label_enc.weight``) that the inference model does not own, and
+    newer transformers removes legacy buffers (e.g. ``position_ids``).
+    Silently dropping the returned ``missing_keys`` / ``unexpected_keys`` would
+    let a stale, mismatched, or wrong-architecture checkpoint boot into a model
+    with random weights and surface as an unexplained accuracy regression at
+    inference time. Audit the known-compatible keys here and fail fast on any
+    other structural drift.
+    """
+
+    def _filter_missing(keys, prefixes):
+        return [key for key in keys if not key.startswith(prefixes)]
+
+    def _filter_unexpected(keys, exact, prefixes):
+        return [key for key in keys if key not in exact and not key.startswith(prefixes)]
+
+    missing = _filter_missing(getattr(incompatible, "missing_keys", []) or [], _ALLOWED_MISSING_KEY_PREFIXES)
+    unexpected = _filter_unexpected(
+        getattr(incompatible, "unexpected_keys", []) or [],
+        _ALLOWED_UNEXPECTED_KEYS,
+        _ALLOWED_UNEXPECTED_KEY_PREFIXES,
+    )
+    if missing or unexpected:
+        raise RuntimeError(
+            "Grounding-DINO checkpoint is incompatible with the configured model: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
 
 
 def _enable_grounding_dino_autocast() -> None:
@@ -72,48 +120,6 @@ def volume_centroid_hull(points: np.ndarray) -> tuple[np.ndarray, float]:
     return total_vc / total_v, total_v
 
 
-def _patch_transformers_bert_for_groundingdino() -> None:
-    from transformers import BertModel
-
-    if getattr(BertModel, "_ibrobot_groundingdino_compat", False):
-        return
-
-    sig = inspect.signature(BertModel.get_extended_attention_mask)
-    params = list(sig.parameters.values())
-    if len(params) >= 4 and params[3].name == "dtype":
-        original_get_extended_attention_mask = BertModel.get_extended_attention_mask
-
-        def get_extended_attention_mask(self, attention_mask, input_shape, device=None, dtype=None):
-            if isinstance(device, torch.dtype):
-                dtype = device
-            return original_get_extended_attention_mask(self, attention_mask, input_shape, dtype=dtype)
-
-        BertModel.get_extended_attention_mask = get_extended_attention_mask
-
-    if not hasattr(BertModel, "get_head_mask"):
-
-        def get_head_mask(self, head_mask, num_hidden_layers, is_attention_chunked=False):
-            if head_mask is None:
-                return [None] * num_hidden_layers
-
-            if head_mask.dim() == 1:
-                head_mask = head_mask.unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                head_mask = head_mask.expand(num_hidden_layers, -1, -1, -1, -1)
-            elif head_mask.dim() == 2:
-                head_mask = head_mask.unsqueeze(1).unsqueeze(-1).unsqueeze(-1)
-            if head_mask.dim() != 5:
-                raise ValueError(f"head_mask.dim != 5, instead {head_mask.dim()}")
-
-            head_mask = head_mask.to(dtype=self.dtype)
-            if is_attention_chunked:
-                head_mask = head_mask.unsqueeze(-1)
-            return head_mask
-
-        BertModel.get_head_mask = get_head_mask
-
-    BertModel._ibrobot_groundingdino_compat = True
-
-
 @dataclass
 class Detection:
     label: str
@@ -143,7 +149,7 @@ class GroundedSAM2Wrapper:
         if torch is None or box_convert is None:
             raise ModuleNotFoundError(
                 "The Torch Grounding-DINO/SAM2 backend dependencies are missing. Install them with "
-                "`./scripts/setup.sh --with-perception` or select `inference_backend:=ascend_local`."
+                "`./scripts/setup.sh` or select `inference_backend:=ascend_local`."
             )
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -195,8 +201,6 @@ class GroundedSAM2Wrapper:
         from groundingdino.util.slconfig import SLConfig
         from groundingdino.util.utils import clean_state_dict
 
-        _patch_transformers_bert_for_groundingdino()
-
         args = SLConfig(GROUNDING_DINO_SWINT_OGC_CONFIG.copy())
         args.device = device
         args.text_encoder_type = text_encoder_type
@@ -209,7 +213,8 @@ class GroundedSAM2Wrapper:
             ) from exc
 
         checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
-        model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
+        incompatible = model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
+        _verify_grounding_dino_checkpoint_compatible(incompatible)
         model.eval()
         return model
 

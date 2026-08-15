@@ -5,9 +5,7 @@
 # Usage:
 #   ./scripts/setup.sh                               # Interactive mode
 #   ./scripts/setup.sh --yes                         # Auto-yes mode
-#   ./scripts/setup.sh --with-perception             # Install SAM2/Grounding-DINO deps
 #   ./scripts/setup.sh --with-diagnostics            # Install speech_direction report deps
-#   ./scripts/setup.sh --with-grasp                  # Install GraspGen deps
 #   ./scripts/setup.sh --skip-verify                 # Skip final ROS/Python verification
 #   ./scripts/setup.sh --only-patch                  # Only apply LeRobot patches
 #   ./scripts/setup.sh --platform <id>               # Override detected platform
@@ -53,8 +51,6 @@ PLATFORM_OVERRIDE=""
 
 SKIP_VERIFY=false
 ONLY_PATCH=${ONLY_PATCH:-false}
-INSTALL_PERCEPTION_DEPS="${IBR_SETUP_WITH_PERCEPTION:-false}"
-INSTALL_GRASP_DEPS="${IBR_SETUP_WITH_GRASP:-false}"
 INSTALL_DIAGNOSTICS_DEPS="${IBR_SETUP_WITH_DIAGNOSTICS:-false}"
 CURRENT_STAGE="initializing"
 SYSTEM_DEPS_STATUS="pending"
@@ -197,16 +193,9 @@ Options:
   -y, --yes              Auto-confirm prompts using defaults
       --sudo             Force sudo for privileged operations
       --no-sudo          Never use sudo
-      --with-perception  Install optional SAM2/Grounding-DINO dependencies
-                         for perception_service
-      --with-detection   Alias for --with-perception
       --with-diagnostics Install optional Plotly/Matplotlib dependencies for
-                         the speech_direction_report offline CLI only;
-                         the speech_direction_node runtime does not need them.
-      --with-grasp       Install optional GraspGen dependencies for
-                         manipulation_service from pinned pip VCS sources.
-                         Requires CUDA toolkit and CUDA_HOME/nvcc for
-                         GraspGen pointnet2_ops.
+                          the speech_direction_report offline CLI only;
+                          the speech_direction_node runtime does not need them.
 
       --skip-verify      Skip final ROS/Python verification
       --only-patch       Skip dependency/venv setup and verification; only
@@ -233,9 +222,7 @@ parse_args() {
             --yes|-y) AUTO_YES=true ;;
             --no-sudo) USE_SUDO=false ;;
             --sudo) USE_SUDO=true ;;
-            --with-perception|--with-perception-deps) INSTALL_PERCEPTION_DEPS=true ;;
             --with-diagnostics|--with-diagnostics-deps) INSTALL_DIAGNOSTICS_DEPS=true ;;
-            --with-grasp|--with-graspgen|--with-grasp-deps) INSTALL_GRASP_DEPS=true ;;
 
             --skip-verify) SKIP_VERIFY=true ;;
             --only-patch) ONLY_PATCH=true ;;

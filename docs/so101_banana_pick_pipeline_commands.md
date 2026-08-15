@@ -39,7 +39,7 @@ MoveIt 完成目标检测、抓取规划、执行与验证。
 
 ```bash
 cd ~/IB_Robot
-./scripts/setup.sh --with-perception --with-grasp
+./scripts/setup.sh
 ./scripts/download_perception_models.sh
 source .shrc_local
 colcon build --symlink-install --merge-install --packages-up-to \

@@ -20,9 +20,9 @@ try:
     import torch
 except ModuleNotFoundError as exc:
     raise ModuleNotFoundError(
-        "manipulation_service optional dependencies are missing. Ensure IB-Robot "
-        "GraspGen pip dependencies are installed with "
-        "`./scripts/setup.sh --with-grasp`."
+        "manipulation_service GraspGen dependencies are missing. Ensure IB-Robot "
+        "default setup completed with `./scripts/setup.sh` (GraspGen is installed "
+        "by default on Ubuntu; skipped on openEuler Embedded)."
     ) from exc
 
 logger = logging.getLogger(__name__)

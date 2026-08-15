@@ -19,6 +19,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [[ -z "${BUILD_ROOT}" || "${BUILD_ROOT}" == "/" ]]; then
+    echo "Invalid RAM++ wheel build root: ${BUILD_ROOT}" >&2
+    exit 1
+fi
+
+mkdir -p "${BUILD_ROOT}"
+# source/ and dist/ are script-private scratch directories. Recreate them on
+# every run so a retained RAM_WHEEL_BUILD_ROOT stays reproducible and does
+# not fail on the second `git clone` because of a stale source tree.
+rm -rf "${BUILD_ROOT}/source" "${BUILD_ROOT}/dist"
+
 git clone --quiet "${UPSTREAM_URL}" "${BUILD_ROOT}/source"
 git -C "${BUILD_ROOT}/source" checkout --quiet "${UPSTREAM_COMMIT}"
 while IFS= read -r patch_file; do
