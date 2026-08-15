@@ -125,6 +125,16 @@ download_file() {
     echo "[done] ${desc}"
 }
 
+# snapshot_download leaves .cache/huggingface transfer metadata inside
+# local_dir. Bundles must stay releasable, so drop that residue eagerly.
+prune_snapshot_cache() {
+    local dest="$1"
+    if [[ -d "${dest}/.cache" ]]; then
+        rm -rf "${dest}/.cache"
+        echo "[clean] removed snapshot cache: ${dest}/.cache"
+    fi
+}
+
 download_bert_text_encoder() {
     local dest="$1"
 
@@ -164,6 +174,7 @@ snapshot_download(
     ],
 )
 PY
+    prune_snapshot_cache "${dest}"
     echo "[done] BERT text encoder"
 }
 
@@ -187,6 +198,7 @@ dest = Path(sys.argv[2])
 dest.mkdir(parents=True, exist_ok=True)
 snapshot_download(repo_id=repo_id, local_dir=str(dest))
 PY
+    prune_snapshot_cache "${dest}"
     echo "[done] SigLIP2 encoder"
 }
 
@@ -210,6 +222,7 @@ dest = Path(destination)
 dest.mkdir(parents=True, exist_ok=True)
 snapshot_download(repo_id=repo_id, local_dir=str(dest), allow_patterns=[checkpoint])
 PY
+    prune_snapshot_cache "${dest}"
     echo "[done] RAM++ checkpoint"
 }
 
@@ -243,6 +256,16 @@ PY
 
 finalize_bundle() {
     local family="$1"
+    local bundle_root
+    bundle_root="$("${PYTHON_BIN}" - "${family}" <<'PY'
+import sys
+
+from perception_service.package_perception_bundles import _specs
+
+print(_specs()[sys.argv[1]].name)
+PY
+)"
+    prune_snapshot_cache "${MODEL_DIR}/${bundle_root}/assets"
     PYTHONPATH="${WORKSPACE}/src/perception_service:${WORKSPACE}/src/inference_manifest:${WORKSPACE}/src/inference_service:${PYTHONPATH:-}" \
         "${PYTHON_BIN}" -m perception_service.package_perception_bundles \
         --models-root "${MODEL_DIR}" --family "${family}"
