@@ -1,5 +1,5 @@
 # ValidateAgentPlan.srv - Read-only exact-snapshot preflight for an Agent plan,
-# shown to the user before explicit confirmation.
+# shown and flushed to the user before the internal confirmation binding.
 #
 # See docs/lightweight_skill_package_registry_design_zh.md section 11.6.
 #

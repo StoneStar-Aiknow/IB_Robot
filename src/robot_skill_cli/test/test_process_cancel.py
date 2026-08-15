@@ -50,9 +50,11 @@ class _Future:
 
 
 class _GoalHandle:
-    def __init__(self, *, accepted=True, result=None, result_done=True, result_error=None):
+    def __init__(self, *, accepted=True, result=None, status=4, result_done=True, result_error=None):
         self.accepted = accepted
-        self.result_future = _Future(SimpleNamespace(result=result), done=result_done, error=result_error)
+        self.result_future = _Future(
+            SimpleNamespace(status=status, result=result), done=result_done, error=result_error
+        )
 
     def get_result_async(self):
         return self.result_future
@@ -157,6 +159,76 @@ class _ExecuteBridge:
         self.calls.append("close")
         if self.late_feedback_on_close and self.feedback_callback is not None:
             self.feedback_callback({"state": "executing", "detail": "late private_joint"})
+
+
+class _ExecutePlanBridge:
+    def __init__(self, *, terminal_status=4, success=True, error_code="", result_done=True):
+        self.calls = []
+        self.feedback_callback = None
+        self.wait_hook = None
+        self.server_hook = None
+        self.server_ready = True
+        self.status_hook = None
+        self.result = {
+            "success": success,
+            "plan_id": "plan-1",
+            "plan_digest": "digest-1",
+            "workflow_digest": "",
+            "completed_step_count": 1 if success else 0,
+            "error_code": error_code,
+            "message": "completed" if success else "stopped",
+            "actual_registry_epoch": "epoch-1",
+            "actual_registry_generation": 1,
+            "actual_registry_digest": "registry-1",
+        }
+        result = SimpleNamespace(**self.result)
+        self.result_future = _Future(
+            SimpleNamespace(status=terminal_status, result=result),
+            done=result_done,
+        )
+        self.goal_handle = _GoalHandle(
+            accepted=True,
+            result=result,
+            status=terminal_status,
+            result_done=result_done,
+        )
+        self.goal_handle.result_future = self.result_future
+
+    def start(self):
+        return True
+
+    def get_status(self, **_kwargs):
+        if self.status_hook is not None:
+            self.status_hook()
+        return {"task_budget_sec": 5.0}
+
+    def wait_for_execute_plan_server(self, **_kwargs):
+        if self.server_hook is not None:
+            self.server_hook()
+        return self.server_ready
+
+    def send_agent_plan_goal(self, **kwargs):
+        self.calls.append("send_agent_plan_goal")
+        self.feedback_callback = kwargs["feedback_callback"]
+        return _Future(self.goal_handle)
+
+    def wait_future(self, future, *, interrupt_event=None, **_kwargs):
+        if self.wait_hook is not None:
+            self.wait_hook()
+        if interrupt_event is not None and interrupt_event.is_set() and not future.done():
+            return False
+        return future.done()
+
+    def cancel_agent_plan(self, task_id, **_kwargs):
+        self.calls.append(("cancel_agent_plan", task_id))
+        return {"accepted": True, "return_code": 0}
+
+    def get_agent_plan_result(self, task_id, **_kwargs):
+        self.calls.append(("get_agent_plan_result", task_id))
+        return {"status": self.result_future.value.status, "result": dict(self.result)}
+
+    def close(self):
+        self.calls.append("close")
 
 
 def _status(state, *, error_code=""):
@@ -535,3 +607,346 @@ def test_execute_result_transport_error_cancels_and_emits_stable_result(monkeypa
     assert events[-1]["event"] == "result"
     assert events[-1]["data"]["error_code"] == "ROS_UNAVAILABLE"
     assert events[-1]["data"]["message"] == "terminal result unavailable"
+
+
+def _execute_plan_args():
+    return SimpleNamespace(
+        plan_token="plan-token",
+        confirmation_token="confirmation-token",
+        task_id="agent-task-1",
+        timeout_sec=5.0,
+        plan_id="plan-1",
+        plan_digest="digest-1",
+        registry_epoch="epoch-1",
+        registry_generation=1,
+        registry_digest="registry-1",
+        expected_step_count=1,
+    )
+
+
+def _execute_plan_context():
+    return SimpleNamespace(view={"timeout_policy": {"rpc_timeout_sec": 1.0, "task_budget_sec": 5.0}})
+
+
+def test_execute_plan_restores_signal_handlers(monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge()
+    installed = {signal.SIGINT: object(), signal.SIGTERM: object()}
+    original = dict(installed)
+
+    def install(signum, handler):
+        previous = installed[signum]
+        installed[signum] = handler
+        return previous
+
+    monkeypatch.setattr(cli.signal, "signal", install)
+
+    exit_code = cli._run_execute_plan(_execute_plan_args(), _execute_plan_context(), bridge).exit_code
+
+    events = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+    assert exit_code == 0
+    assert installed == original
+    assert [event["event"] for event in events] == ["result"]
+    assert events[0]["data"]["success"] is True
+
+
+def test_execute_plan_signal_during_acceptance_converges_to_terminal(monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge(terminal_status=5, success=False, error_code="SKILL_CANCELLED")
+    bridge.goal_handle.result_future.completed = False
+    pending_goal = _Future(bridge.goal_handle, done=False)
+    bridge.send_agent_plan_goal = lambda **_kwargs: pending_goal
+    handlers = {}
+
+    def install(signum, handler):
+        previous = handlers.get(signum, signal.SIG_DFL)
+        handlers[signum] = handler
+        return previous
+
+    monkeypatch.setattr(cli.signal, "signal", install)
+    bridge.wait_hook = lambda: handlers[signal.SIGINT](signal.SIGINT, None)
+
+    exit_code = cli._run_execute_plan(_execute_plan_args(), _execute_plan_context(), bridge).exit_code
+
+    events = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
+    assert exit_code == 13
+    assert events[-1]["data"]["success"] is False
+    assert events[-1]["data"]["error_code"] == "SKILL_CANCELLED"
+    assert ("cancel_agent_plan", "agent-task-1") in bridge.calls
+
+
+def test_execute_plan_signal_race_preserves_success_exit(monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge()
+    handlers = {}
+
+    def install(signum, handler):
+        previous = handlers.get(signum, signal.SIG_DFL)
+        handlers[signum] = handler
+        return previous
+
+    monkeypatch.setattr(cli.signal, "signal", install)
+    bridge.wait_hook = lambda: handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    exit_code = cli._run_execute_plan(_execute_plan_args(), _execute_plan_context(), bridge).exit_code
+
+    event = json.loads(capsys.readouterr().out.strip())
+    assert exit_code == 0
+    assert event["data"]["success"] is True
+
+
+def test_execute_plan_signal_before_submission_converges_idempotent_retry(monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge(terminal_status=5, success=False, error_code="SKILL_CANCELLED")
+    handlers = {}
+
+    def install(signum, handler):
+        previous = handlers.get(signum, signal.SIG_DFL)
+        handlers[signum] = handler
+        return previous
+
+    monkeypatch.setattr(cli.signal, "signal", install)
+
+    def signal_twice():
+        handlers[signal.SIGINT](signal.SIGINT, None)
+        handlers[signal.SIGINT](signal.SIGINT, None)
+
+    bridge.server_hook = signal_twice
+
+    exit_code = cli._run_execute_plan(_execute_plan_args(), _execute_plan_context(), bridge).exit_code
+
+    event = json.loads(capsys.readouterr().out.strip())
+    assert exit_code == 13
+    assert event["data"]["error_code"] == "SKILL_CANCELLED"
+    assert "send_agent_plan_goal" not in bridge.calls
+    assert [call for call in bridge.calls if isinstance(call, tuple) and call[0] == "cancel_agent_plan"] == [
+        ("cancel_agent_plan", "agent-task-1")
+    ]
+
+
+def test_execute_plan_signal_during_preflight_converges(monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge(terminal_status=5, success=False, error_code="SKILL_CANCELLED")
+    handlers = {}
+
+    def install(signum, handler):
+        previous = handlers.get(signum, signal.SIG_DFL)
+        handlers[signum] = handler
+        return previous
+
+    monkeypatch.setattr(cli.signal, "signal", install)
+    bridge.status_hook = lambda: handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+    exit_code = cli._run_execute_plan(_execute_plan_args(), _execute_plan_context(), bridge).exit_code
+
+    event = json.loads(capsys.readouterr().out.strip())
+    assert exit_code == 13
+    assert event["data"]["error_code"] == "SKILL_CANCELLED"
+    assert ("cancel_agent_plan", "agent-task-1") in bridge.calls
+
+
+@pytest.mark.parametrize("mode", ["server_unavailable", "goal_rejected"])
+def test_execute_plan_admission_failure_converges_existing_goal(mode, monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge(terminal_status=5, success=False, error_code="SKILL_CANCELLED")
+    if mode == "server_unavailable":
+        bridge.server_ready = False
+    else:
+        bridge.goal_handle.accepted = False
+    monkeypatch.setattr(cli.signal, "signal", lambda _signum, _handler: signal.SIG_DFL)
+
+    exit_code = cli._run_execute_plan(_execute_plan_args(), _execute_plan_context(), bridge).exit_code
+
+    event = json.loads(capsys.readouterr().out.strip())
+    assert exit_code == 13
+    assert event["data"]["error_code"] == "SKILL_CANCELLED"
+    assert ("cancel_agent_plan", "agent-task-1") in bridge.calls
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("plan_id", "other-plan"),
+        ("plan_digest", "other-digest"),
+        ("actual_registry_epoch", "other-epoch"),
+        ("actual_registry_generation", 2),
+        ("actual_registry_digest", "other-registry"),
+        ("completed_step_count", 0),
+    ],
+)
+def test_execute_plan_rejects_mismatched_success_terminal(field, value, monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge()
+    bridge.result[field] = value
+    setattr(bridge.result_future.value.result, field, value)
+    monkeypatch.setattr(cli.signal, "signal", lambda _signum, _handler: signal.SIG_DFL)
+
+    exit_code = cli._run_execute_plan(_execute_plan_args(), _execute_plan_context(), bridge).exit_code
+
+    event = json.loads(capsys.readouterr().out.strip())
+    assert exit_code == 15
+    assert event["data"]["error_code"] == "SKILL_CANCEL_TIMEOUT"
+
+
+@pytest.mark.parametrize(
+    ("error_code", "expected_error"),
+    [
+        ("SKILL_CANCELLED", "SKILL_CANCEL_TIMEOUT"),
+        ("SKILL_CANCEL_TIMEOUT", "SKILL_CANCEL_TIMEOUT"),
+        ("GATEWAY_FINALIZATION_FAILED", "GATEWAY_FINALIZATION_FAILED"),
+        ("SKILL_EXECUTION_BUSY", "SKILL_EXECUTION_BUSY"),
+        ("NEW_CLEANUP_STATE_UNKNOWN", "SKILL_CANCEL_TIMEOUT"),
+    ],
+)
+def test_execute_plan_rejects_unknown_aborted_terminal(error_code, expected_error, monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge(terminal_status=6, success=False, error_code=error_code)
+    monkeypatch.setattr(cli.signal, "signal", lambda _signum, _handler: signal.SIG_DFL)
+
+    exit_code = cli._run_execute_plan(_execute_plan_args(), _execute_plan_context(), bridge).exit_code
+
+    event = json.loads(capsys.readouterr().out.strip())
+    assert exit_code == 15
+    assert event["data"]["error_code"] == expected_error
+
+
+def test_execute_plan_fails_closed_for_unknown_pre_admission_plan(monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge(terminal_status=6, success=False, error_code="SKILL_AGENT_PLAN_NOT_FOUND")
+    for field, value in (
+        ("plan_id", ""),
+        ("plan_digest", ""),
+        ("actual_registry_epoch", ""),
+        ("actual_registry_generation", 0),
+        ("actual_registry_digest", ""),
+    ):
+        bridge.result[field] = value
+        setattr(bridge.result_future.value.result, field, value)
+    monkeypatch.setattr(cli.signal, "signal", lambda _signum, _handler: signal.SIG_DFL)
+
+    exit_code = cli._run_execute_plan(_execute_plan_args(), _execute_plan_context(), bridge).exit_code
+
+    event = json.loads(capsys.readouterr().out.strip())
+    assert exit_code == 15
+    assert event["data"]["error_code"] == "SKILL_CANCEL_TIMEOUT"
+
+
+def test_cancel_plan_queries_terminal_after_not_active():
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge()
+    bridge.cancel_agent_plan = lambda task_id, **_kwargs: {"accepted": False, "return_code": 0}
+
+    result = cli._run_cancel_plan(_execute_plan_args(), _execute_plan_context(), bridge)
+
+    assert result["accepted"] is False
+    assert result["terminal"] is True
+    assert result["goal_status"] == 4
+
+
+def test_execute_plan_nonterminal_result_cancels_once(monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge(terminal_status=2)
+    monkeypatch.setattr(cli.signal, "signal", lambda _signum, _handler: signal.SIG_DFL)
+
+    exit_code = cli._run_execute_plan(_execute_plan_args(), _execute_plan_context(), bridge).exit_code
+
+    event = json.loads(capsys.readouterr().out.strip())
+    assert exit_code == 15
+    assert event["data"]["error_code"] == "SKILL_CANCEL_TIMEOUT"
+    assert [call for call in bridge.calls if isinstance(call, tuple) and call[0] == "cancel_agent_plan"] == [
+        ("cancel_agent_plan", "agent-task-1")
+    ]
+
+
+def test_execute_plan_waits_for_delayed_cancel_terminal(monkeypatch, capsys):
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge(terminal_status=5, success=False, error_code="SKILL_CANCELLED")
+    bridge.result_future.value.status = 2
+    calls = 0
+
+    def delayed_result(task_id, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"status": 2, "result": dict(bridge.result)}
+        return {"status": 5, "result": dict(bridge.result)}
+
+    bridge.get_agent_plan_result = delayed_result
+    monkeypatch.setattr(cli.signal, "signal", lambda _signum, _handler: signal.SIG_DFL)
+
+    exit_code = cli._run_execute_plan(_execute_plan_args(), _execute_plan_context(), bridge).exit_code
+
+    event = json.loads(capsys.readouterr().out.strip())
+    assert exit_code == 13
+    assert event["data"]["error_code"] == "SKILL_CANCELLED"
+    assert calls == 2
+
+
+def test_cancel_plan_mismatched_terminal_is_unknown():
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge()
+    bridge.cancel_agent_plan = lambda task_id, **_kwargs: {"accepted": False, "return_code": 0}
+    bridge.result["plan_digest"] = "other-digest"
+
+    with pytest.raises(cli._CommandError) as exc_info:
+        cli._run_cancel_plan(_execute_plan_args(), _execute_plan_context(), bridge)
+
+    assert exc_info.value.code == "SKILL_CANCEL_TIMEOUT"
+    assert exc_info.value.exit_code == 15
+
+
+def test_cancel_plan_waits_for_delayed_terminal():
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge(terminal_status=5, success=False, error_code="SKILL_CANCELLED")
+    calls = 0
+
+    def delayed_result(task_id, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"status": 2, "result": dict(bridge.result)}
+        return {"status": 5, "result": dict(bridge.result)}
+
+    bridge.get_agent_plan_result = delayed_result
+
+    result = cli._run_cancel_plan(_execute_plan_args(), _execute_plan_context(), bridge)
+
+    assert result["terminal"] is True
+    assert result["goal_status"] == 5
+    assert result["result"]["error_code"] == "SKILL_CANCELLED"
+    assert calls == 2
+
+
+def test_closed_loop_runner_maps_terminal_states_to_process_exit_codes():
+    from robot_skill_cli.closed_loop_runner import _terminal_exit_code
+
+    assert _terminal_exit_code({"state": "succeeded"}) == 0
+    assert _terminal_exit_code({"state": "failed"}) == 13
+    assert _terminal_exit_code({"state": "unknown"}) == 15
+
+
+@pytest.mark.parametrize("error_code", ["GATEWAY_FINALIZATION_FAILED", "SKILL_EXECUTION_BUSY"])
+def test_cancel_plan_preserves_uncertain_terminal_code(error_code):
+    from robot_skill_cli import cli
+
+    bridge = _ExecutePlanBridge(terminal_status=6, success=False, error_code=error_code)
+
+    with pytest.raises(cli._CommandError) as exc_info:
+        cli._run_cancel_plan(_execute_plan_args(), _execute_plan_context(), bridge)
+
+    assert exc_info.value.code == error_code
+    assert exc_info.value.exit_code == 15

@@ -103,6 +103,17 @@ def test_plan_lifecycle_binds_identity_and_consumes_confirmation_once():
     )
     assert repeated.state == "ACCEPTED"
     assert repeated.newly_accepted is False
+    repeated_after_reload = store.accept_execution(
+        plan_token=plan.plan_token,
+        confirmation_token=confirmation.confirmation_token,
+        task_id="task-1",
+        registry_epoch="epoch-2",
+        registry_generation=2,
+        registry_digest="digest-2",
+        task_budget_sec=10.0,
+    )
+    assert repeated_after_reload.state == "ACCEPTED"
+    assert repeated_after_reload.plan.registry_digest == "digest-1"
     with pytest.raises(AgentPlanError) as raised:
         store.accept_execution(
             plan_token=plan.plan_token,
@@ -135,6 +146,16 @@ def test_plan_lifecycle_binds_identity_and_consumes_confirmation_once():
     assert replay.newly_accepted is False
     assert replay.workflow_digest == "workflow-digest"
     assert replay.completed_step_count == 1
+    replay_after_reload = store.accept_execution(
+        plan_token=plan.plan_token,
+        confirmation_token=confirmation.confirmation_token,
+        task_id="task-1",
+        registry_epoch="epoch-2",
+        registry_generation=2,
+        registry_digest="digest-2",
+        task_budget_sec=10.0,
+    )
+    assert replay_after_reload.state == "TERMINAL"
 
     with pytest.raises(AgentPlanError) as raised:
         store.mark_terminal(

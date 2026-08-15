@@ -34,6 +34,6 @@ observe-only 三种模式，并通过隔离的并行 IK/FK worker 准备候选�
 
 1. exact catalog identity 捕获；
 2. `ValidateAgentPlan` 逐步预检；
-3. 用户确认和不可变 task budget；
+3. exact plan 展示后的内部 confirm 和不可变 task budget；
 4. `ExecuteAgentPlan`；
 5. Gateway admission 与 Safety 校验。

@@ -20,7 +20,7 @@
 Hermes / robot-skill
   -> /embodied/plan_agent_command
   -> /embodied/validate_agent_plan
-  -> 用户确认后 /embodied/confirm_agent_plan
+  -> 展示 exact plan 后立即 /embodied/confirm_agent_plan
   -> /embodied/execute_agent_plan
   -> skill_library Gateway
 ```
@@ -33,7 +33,7 @@ PLANNED -> VALIDATED -> CONFIRMED -> ACCEPTED -> TERMINAL
 
 - plan 捕获 exact catalog identity，并保存短时不可变 `AgentPlan`。
 - validate 对每个步骤执行只读 Safety 预检。
-- confirm 绑定 plan digest、task ID、registry identity 和绝对 task budget。
+- confirm 绑定 plan digest、task ID、registry identity 和绝对 task budget；这是内部技术绑定，不是用户二次确认门。
 - execute 复用确认时冻结的预算，通过 Gateway 执行 Skill 或 Workflow。
 - child 接受、取消或终态未知时保持 plan 为 `ACCEPTED`，不得自动重试或释放可能仍有效的 root lease。
 

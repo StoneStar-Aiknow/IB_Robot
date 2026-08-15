@@ -1,9 +1,9 @@
 """Functional-verification driver for the interactive closed loop.
 
 Drives ``InteractiveController`` against the live Capability Gateway (real
-``RosBridge``) to prove the five-feature closed loop end to end: discover,
-reject-out-of-catalog, prepare/confirm, ``别动`` stop to a definite terminal,
-and ``继续`` fresh-state continuation.
+``RosBridge``) to prove the closed loop end to end: discover,
+reject-out-of-catalog, present then execute immediately, ``别动`` stop to a
+definite terminal, and ``继续`` fresh-state continuation.
 
 Install/run inside the built workspace::
 
@@ -13,12 +13,14 @@ Install/run inside the built workspace::
         --stop-after-sec 1.5 \
         --continue-command '继续挥挥手' --continue-skill wave_hand
 
-Breakpoint resume (continue the prior plan's remaining steps after a stop)::
+Breakpoint resume is intentionally rejected on this baseline because the
+Gateway has no server-owned continuation admission contract. A fresh
+continuation may still be requested after a definite cancellation::
 
     robot-skill-closed-loop --config-name so101_single_arm \
         --raw-command '点头两次再摇头最后撒娇' --steps nod_yes,nod_yes,shake_no,act_cute \
         --stop-after-sec 3.0 \
-        --resume --continue-command '继续'
+        --continue-command '继续挥挥手' --continue-skill wave_hello
 
 ``--stop-after-sec`` spawns a daemon thread that calls ``request_stop()`` after
 the delay, simulating the operator saying ``别动`` mid-execution. The driver
@@ -29,17 +31,18 @@ from __future__ import annotations
 
 import argparse
 import threading
-import time
 from typing import Any
 
 from robot_skill_cli.catalog import load_runtime_context
 from robot_skill_cli.interactive_control import (
-    UNKNOWN,
     InteractiveControlError,
     InteractiveController,
 )
 from robot_skill_cli.output import json_dumps
 from robot_skill_cli.ros_bridge import RosBridge
+
+_EXIT_EXECUTION_FAILED = 13
+_EXIT_MOTION_UNKNOWN = 15
 
 
 def _workflow_step(args: argparse.Namespace, skill: str) -> dict[str, Any]:
@@ -59,6 +62,15 @@ def _emit(label: str, payload: Any) -> None:
         print(json_dumps({"event": label, "data": payload}), flush=True)
     else:
         print(f"[{label}] {payload}", flush=True)
+
+
+def _terminal_exit_code(terminal: dict[str, Any]) -> int:
+    state = str(terminal.get("state", ""))
+    if state == "succeeded":
+        return 0
+    if state == "unknown":
+        return _EXIT_MOTION_UNKNOWN
+    return _EXIT_EXECUTION_FAILED
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -86,7 +98,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="continue by resuming the prior plan's remaining steps (breakpoint resume)",
+        help="verify that unsupported breakpoint resume fails closed",
     )
     return parser
 
@@ -115,8 +127,35 @@ def main(argv: list[str] | None = None) -> int:
         return 4
     controller = InteractiveController(bridge, timeout_policy=context.view["timeout_policy"])
     stop_thread = None
+    stop_timer = threading.Event()
+    output_lock = threading.Lock()
+    feedback_phase = {"active": None, "next": 0}
+
+    def emit(label: str, payload: Any) -> None:
+        with output_lock:
+            _emit(label, payload)
+
+    def begin_feedback_phase():
+        with output_lock:
+            feedback_phase["next"] += 1
+            phase = feedback_phase["next"]
+            feedback_phase["active"] = phase
+
+        def feedback(payload: dict[str, Any]) -> None:
+            with output_lock:
+                if feedback_phase["active"] == phase:
+                    _emit("feedback", payload)
+
+        return phase, feedback
+
+    def emit_terminal(label: str, payload: dict[str, Any], phase: int) -> None:
+        with output_lock:
+            if feedback_phase["active"] == phase:
+                feedback_phase["active"] = None
+            _emit(label, payload)
+
     try:
-        _emit("discover", controller.discover())
+        emit("discover", controller.discover())
         if args.steps:
             first_steps = [_workflow_step(args, s.strip()) for s in args.steps.split(",") if s.strip()]
         elif args.skill:
@@ -129,42 +168,59 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
             return 4
-        _emit("prepare", controller.prepare_workflow(args.raw_command, first_steps))
-        _emit("auto_confirm", controller.confirm_plan())
+        emit("prepare", controller.prepare_workflow(args.raw_command, first_steps))
 
         if args.stop_after_sec > 0.0:
 
             def _stop_after():
-                time.sleep(args.stop_after_sec)
-                _emit("stop_phrase", "别动")
+                if stop_timer.wait(args.stop_after_sec):
+                    return
+                emit("stop_phrase", "别动")
                 controller.request_stop()
 
             stop_thread = threading.Thread(target=_stop_after, daemon=True)
             stop_thread.start()
 
-        first_terminal = controller.execute(feedback_callback=lambda fb: _emit("feedback", fb))
-        _emit("execute_terminal", first_terminal)
+        # Presentation was flushed above. Internal validation/confirmation is a
+        # Gateway admission step, not a user-facing confirmation gate.
+        emit("auto_confirm", controller.confirm_plan())
 
-        if (args.resume or args.continue_skill) and first_terminal["state"] != UNKNOWN:
-            if args.resume:
-                presentation = controller.continue_workflow(args.continue_command or "继续", resume=True)
-            else:
-                presentation = controller.continue_workflow(
-                    args.continue_command or "继续", [_workflow_step(args, args.continue_skill)]
-                )
-            _emit("continue_prepare", presentation)
-            _emit("continue_confirm", controller.confirm_plan())
-            _emit("continue_terminal", controller.execute())
-        elif args.resume or args.continue_skill:
-            _emit(
-                "continue_skipped",
-                {"reason": "prior terminal is unknown; refuse to continue", "state": first_terminal["state"]},
+        first_phase, first_feedback = begin_feedback_phase()
+        first_terminal = controller.execute(feedback_callback=first_feedback)
+        emit_terminal("execute_terminal", first_terminal, first_phase)
+        stop_timer.set()
+        if stop_thread is not None:
+            stop_thread.join(timeout=1.0)
+            stop_thread = None
+        exit_code = _terminal_exit_code(first_terminal)
+
+        if args.resume:
+            controller.continue_workflow(args.continue_command or "继续", resume=True)
+            raise RuntimeError("unsupported breakpoint resume was unexpectedly admitted")
+        elif args.continue_skill and first_terminal["state"] == "stopped":
+            presentation = controller.continue_workflow(
+                args.continue_command or "继续", [_workflow_step(args, args.continue_skill)]
             )
-        return 0
+            emit("continue_prepare", presentation)
+            emit("continue_confirm", controller.confirm_plan())
+            continue_phase, continue_feedback = begin_feedback_phase()
+            continue_terminal = controller.execute(feedback_callback=continue_feedback)
+            emit_terminal("continue_terminal", continue_terminal, continue_phase)
+            exit_code = _terminal_exit_code(continue_terminal)
+        elif args.continue_skill:
+            emit(
+                "continue_skipped",
+                {"reason": "only a definite canceled terminal permits continuation", "state": first_terminal["state"]},
+            )
+        return exit_code
     except InteractiveControlError as exc:
         print(json_dumps({"event": "error", "error_code": exc.code, "message": str(exc)}), flush=True)
         return 13
+    except Exception as exc:
+        print(json_dumps({"event": "error", "error_code": "ROS_UNAVAILABLE", "message": str(exc)}), flush=True)
+        return 4
     finally:
+        stop_timer.set()
         if stop_thread is not None:
             stop_thread.join(timeout=1.0)
         bridge.close()

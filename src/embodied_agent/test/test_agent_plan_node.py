@@ -169,6 +169,7 @@ def plan_rig(request):
         yield SimpleNamespace(
             confirm_client=confirm_client,
             execute_client=execute_client,
+            node=plan_node,
             plan_client=plan_client,
             plan_node=plan_node,
             registry=registry,
@@ -233,6 +234,61 @@ def test_plan_validate_confirm_execute_and_terminal_replay(plan_rig):
     assert replay.completed_step_count == 1
 
 
+def test_canceled_terminal_replay_preserves_canceled_goal_status(plan_rig):
+    plan_request = PlanAgentCommand.Request()
+    plan_request.schema_version = 1
+    plan_request.request_id = "request-canceled-replay"
+    plan_request.raw_command = "打开夹爪"
+    _workflow_request(plan_request, "open_gripper_skill")
+    planned = _future_result(plan_rig.plan_client.call_async(plan_request))
+
+    validate_request = ValidateAgentPlan.Request()
+    validate_request.schema_version = 1
+    validate_request.plan_token = planned.plan.plan_token
+    assert _future_result(plan_rig.validate_client.call_async(validate_request)).allowed is True
+
+    confirm_request = ConfirmAgentPlan.Request()
+    confirm_request.schema_version = 1
+    confirm_request.plan_token = planned.plan.plan_token
+    confirm_request.plan_digest = planned.plan.plan_digest
+    confirm_request.task_id = "agent-task-canceled-replay"
+    confirm_request.registry_epoch, confirm_request.registry_generation, confirm_request.registry_digest = (
+        plan_rig.registry
+    )
+    confirm_request.task_budget_sec = 5.0
+    confirmed = _future_result(plan_rig.confirm_client.call_async(confirm_request))
+
+    with plan_rig.node._store_lock:  # noqa: SLF001
+        execution = plan_rig.node._store.accept_execution(  # noqa: SLF001
+            plan_token=planned.plan.plan_token,
+            confirmation_token=confirmed.confirmation_token,
+            task_id=confirm_request.task_id,
+            registry_epoch=planned.plan.registry_epoch,
+            registry_generation=planned.plan.registry_generation,
+            registry_digest=planned.plan.registry_digest,
+            task_budget_sec=5.0,
+        )
+        plan_rig.node._store.mark_terminal(  # noqa: SLF001
+            plan_token=planned.plan.plan_token,
+            task_id=confirm_request.task_id,
+            execution_token=execution.execution_token,
+            terminal_code="SKILL_CANCELLED",
+            terminal_message="canceled",
+        )
+
+    goal = ExecuteAgentPlan.Goal()
+    goal.schema_version = 1
+    goal.plan_token = planned.plan.plan_token
+    goal.confirmation_token = confirmed.confirmation_token
+    goal.task_id = confirm_request.task_id
+    goal.timeout_sec = 5.0
+    handle = _future_result(plan_rig.execute_client.send_goal_async(goal))
+    replay = _future_result(handle.get_result_async())
+
+    assert replay.status == 5
+    assert replay.result.error_code == "SKILL_CANCELLED"
+
+
 def test_execute_rejects_budget_changed_after_confirmation(plan_rig):
     plan_request = PlanAgentCommand.Request()
     plan_request.schema_version = 1
@@ -268,6 +324,13 @@ def test_execute_rejects_budget_changed_after_confirmation(plan_rig):
 
     assert result.success is False
     assert result.error_code == "SKILL_REQUEST_ID_CONFLICT"
+    assert result.plan_id == planned.plan.plan_id
+    assert result.plan_digest == planned.plan.plan_digest
+    assert (result.actual_registry_epoch, result.actual_registry_generation, result.actual_registry_digest) == (
+        planned.plan.registry_epoch,
+        planned.plan.registry_generation,
+        planned.plan.registry_digest,
+    )
 
 
 def test_plan_service_returns_one_typed_ordered_multi_skill_workflow(plan_rig):

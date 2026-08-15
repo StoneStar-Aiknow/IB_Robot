@@ -193,6 +193,11 @@ class AgentPlanStore:
         record = self._get_record(plan_token)
         return record.plan
 
+    def get_for_execution(self, plan_token: str) -> AgentPlan:
+        """Return a plan for admission proof, including immutable terminal records."""
+        record = self._get_record(plan_token, allow_terminal=True)
+        return record.plan
+
     def validate(
         self,
         *,
@@ -275,7 +280,6 @@ class AgentPlanStore:
         task_budget_sec: float,
     ) -> AgentPlanExecution:
         record = self._get_record(plan_token, allow_terminal=True)
-        self._require_identity(record.plan, registry_epoch, registry_generation, registry_digest)
         if record.task_id and record.task_id != task_id:
             raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "plan is bound to a different task")
         if (
@@ -302,6 +306,7 @@ class AgentPlanStore:
                 workflow_digest=record.workflow_digest,
                 completed_step_count=record.completed_step_count,
             )
+        self._require_identity(record.plan, registry_epoch, registry_generation, registry_digest)
         if record.state != "CONFIRMED" or not hmac.compare_digest(record.confirmation_token, confirmation_token):
             raise AgentPlanError("SKILL_REQUEST_ID_CONFLICT", "plan confirmation is invalid")
         record.state = "ACCEPTED"

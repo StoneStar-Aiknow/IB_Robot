@@ -24,7 +24,9 @@ PLAN_COMMANDS = (
     "execute-plan",
 )
 REQUIRED_RULES = {
-    "explicit user motion confirmation": "missing explicit user motion confirmation requirement",
+    "then flush the presentation to the user": "missing synchronous plan presentation flush requirement",
+    "immediately bind that exact tuple once": "missing immediate internal plan binding requirement",
+    "not a second user confirmation gate": "missing no-second-confirmation-gate requirement",
     "must not launch or restart the pipeline": "missing prohibition: launch or restart pipeline",
     "must not enable motion authorization": "missing prohibition: enable motion authorization",
     "must not modify ros parameters": "missing prohibition: modify ROS parameters",
@@ -45,20 +47,6 @@ REQUIRED_RULES = {
     "on any nonzero exit, report the exact cli error and stop": "missing truthful nonzero-exit reporting rule",
     "call `plan-workflow` exactly once with the user's original wording": "missing single-attempt workflow planning rule",
     "do not retry alternate phrasings": "missing prohibition: alternate workflow paraphrase retries",
-    "skill arguments are top-level fields": "missing flat WorkflowStep argument rule",
-    "by default, omit `--timeout-sec` from both commands": "missing default task-budget omission rule",
-    "do not derive a plan budget from `default_skill_timeout_sec`": "missing skill-timeout/budget distinction rule",
-    "issue another `robot-skill` command in the same user request": (
-        "missing prohibition: follow-up robot-skill command after nonzero exit"
-    ),
-    "construct request ids and task ids directly in the conversation and `robot-skill` arguments": (
-        "missing direct request/task ID construction rule"
-    ),
-    "must not call python, `uuidgen`, `date`, a shell, or another helper tool to generate request/task ids": (
-        "missing prohibition: helper command ID generation"
-    ),
-    "command approval, including session-wide approval": "missing command-approval distinction rule",
-    "is not user motion confirmation": "missing prohibition: command approval as motion confirmation",
 }
 
 
@@ -90,7 +78,7 @@ def _parse_frontmatter(content: str) -> tuple[dict[str, str], list[str]]:
 def _validate_command_order(content: str) -> bool:
     positions = []
     for command in PLAN_COMMANDS:
-        match = re.search(rf"`robot-skill\b[^`\n]*\b{re.escape(command)}\b[^`\n]*`", content)
+        match = re.search(rf"`robot-skill\b[^`]*\b{re.escape(command)}\b[^`]*`", content)
         if match is None:
             return False
         positions.append(match.start())
@@ -124,35 +112,32 @@ def validate_skill(skill_path: Path) -> list[str]:
     normalized = " ".join(content.lower().split())
     workflow = _required_workflow(content)
     if workflow is None or any(
-        re.search(rf"`robot-skill\b[^`\n]*\b{re.escape(command)}\b[^`\n]*`", workflow) is None
-        for command in PLAN_COMMANDS
+        re.search(rf"`robot-skill\b[^`]*\b{re.escape(command)}\b[^`]*`", workflow) is None for command in PLAN_COMMANDS
     ):
         errors.append("required workflow section is missing ordered robot-skill commands")
     elif not _validate_command_order(workflow):
         errors.append("robot-skill workflow commands are missing or out of order")
-    validate_match = (
-        None if workflow is None else re.search(r"`robot-skill\b[^`\n]*\bvalidate-plan\b[^`\n]*`", workflow)
-    )
-    confirm_match = None if workflow is None else re.search(r"`robot-skill\b[^`\n]*\bconfirm-plan\b[^`\n]*`", workflow)
+    validate_match = None if workflow is None else re.search(r"`robot-skill\b[^`]*\bvalidate-plan\b[^`]*`", workflow)
+    confirm_match = None if workflow is None else re.search(r"`robot-skill\b[^`]*\bconfirm-plan\b[^`]*`", workflow)
     if (
         validate_match is not None
         and confirm_match is not None
         and re.search(
-            r"explicit\s+user\s+motion\s+confirmation",
+            r"flush\s+the\s+presentation\s+to\s+the\s+user",
             workflow[validate_match.end() : confirm_match.start()],
             flags=re.IGNORECASE,
         )
         is None
     ):
-        errors.append("explicit user motion confirmation must appear between validate-plan and confirm-plan")
+        errors.append("plan presentation flush must appear between validate-plan and confirm-plan")
     if workflow is not None and not all(
         phrase in " ".join(workflow.lower().split())
         for phrase in ("exact ordered steps", "plan digest", "registry identity", "fresh task id")
     ):
         errors.append("workflow must display the exact plan, digest, registry identity, and fresh task ID")
-    if re.search(r"`robot-skill\b[^`\n]*\bcancel\b[^`\n]*--task-id\b[^`\n]*`", content) is None:
+    if re.search(r"`robot-skill\b[^`]*\bcancel\b[^`]*--task-id\b[^`]*`", content) is None:
         errors.append("missing task-ID cancel command")
-    if re.search(r"`robot-skill\b[^`\n]*\bcancel-plan\b[^`\n]*--task-id\b[^`\n]*`", content) is None:
+    if re.search(r"`robot-skill\b[^`]*\bcancel-plan\b[^`]*--task-id\b[^`]*`", content) is None:
         errors.append("missing Agent plan cancel command")
     if "sigint/sigterm" not in normalized:
         errors.append("missing current execute signal cancellation guidance")

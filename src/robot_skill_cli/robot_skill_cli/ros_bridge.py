@@ -175,14 +175,20 @@ class RosBridge:
         return True
 
     @staticmethod
-    def _wait_future(future, timeout_sec: float) -> bool:
+    def _wait_future(future, timeout_sec: float, interrupt_event: threading.Event | None = None) -> bool:
         deadline = time.monotonic() + timeout_sec
-        while not future.done() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        return future.done()
+        while True:
+            if future.done():
+                return True
+            if interrupt_event is not None and interrupt_event.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            time.sleep(min(0.01, remaining))
 
-    def wait_future(self, future, *, timeout_sec: float) -> bool:
-        return self._wait_future(future, timeout_sec)
+    def wait_future(self, future, *, timeout_sec: float, interrupt_event: threading.Event | None = None) -> bool:
+        return self._wait_future(future, timeout_sec, interrupt_event)
 
     def _call_service(self, client, request, *, service_name: str, timeout_sec: float):
         try:

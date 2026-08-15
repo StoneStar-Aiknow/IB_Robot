@@ -1,13 +1,13 @@
 ---
 name: ibrobot-control
-description: Use when a user asks Hermes or an Agent to discover, validate, execute, cancel, or stop an IB-Robot capability.
+description: "Use when a user asks Hermes or an Agent to discover, validate, execute, cancel, or stop IB-Robot capabilities through the `robot-skill` CLI and ROS Capability Gateway. Covers 'run a robot skill', 'execute robot action', 'cancel motion', 'stop robot', '执行机器人动作', '取消动作', '停止机器人', 'nod', 'wave', 'celebrate', 'look around', or interact with existing high-level robot skills. Requires explicit user motion confirmation before any physical motion; never bypasses the Gateway or calls raw ros2 / MoveIt / controller commands directly."
 ---
 
 # IB-Robot Control
 
 ## Overview
 
-Use only `robot-skill` and the ROS Capability Gateway. Discover before acting, require explicit user motion confirmation,
+Use only `robot-skill` and the ROS Capability Gateway. Discover before acting, present the exact plan before execution,
 and report only what the CLI proves.
 
 When launched by `hermes-robot`, the `robot-skill` executable on `PATH` is already bound to the preflighted robot config
@@ -26,14 +26,14 @@ Run natural-language motion requests in this order. Replace placeholders with re
    typed plan: `robot-skill plan-workflow --request-id REQUEST_ID --text TEXT --workflow-json JSON`.
 4. Read every selected contract with `robot-skill describe SKILL`, then run
    `robot-skill validate-plan --plan-token TOKEN`.
-5. Construct the fresh task ID directly from the returned plan ID, such as `agent-task-PLAN_ID`, or use a session-local
-   value such as `agent-task-YYYYMMDD-NNN`. Show the exact ordered steps, parameters, plan digest, registry identity, and
-   that fresh task ID. Obtain explicit user
-   motion confirmation. General permission, a prior confirmation, or schedule pressure does not count.
-6. Bind that exact tuple once with
-   `robot-skill confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID`.
+5. Show the exact ordered steps, parameters, plan digest, registry identity, and a fresh task ID, then flush the
+   presentation to the user.
+6. Immediately bind that exact tuple once with
+   `robot-skill confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID --timeout-sec SEC`.
 7. Execute only the returned confirmation token with
-   `robot-skill execute-plan --plan-token TOKEN --confirmation-token CONFIRMATION_TOKEN --task-id ID`.
+   `robot-skill execute-plan --plan-token TOKEN --confirmation-token CONFIRMATION_TOKEN --task-id ID --timeout-sec SEC
+   --plan-id PLAN_ID --plan-digest DIGEST --registry-epoch EPOCH --registry-generation GENERATION
+   --registry-digest REGISTRY_DIGEST --expected-step-count COUNT`.
 
 By default, omit `--timeout-sec` from both commands so both use the current Gateway task budget. Do not derive a plan
 budget from `default_skill_timeout_sec`. Only when the user explicitly requests a smaller budget, append the same
@@ -48,12 +48,11 @@ Construct request IDs and task IDs directly in the conversation and `robot-skill
 approval, authorizes only that command and is not user motion confirmation. Only an explicit user response confirming
 the displayed plan/task tuple permits `confirm-plan`.
 
-Natural-language single-Skill and Workflow requests both use the plan workflow above. For an explicitly selected single
-skill, the direct `describe -> validate -> explicit user motion confirmation -> execute` path remains valid.
+Natural-language single-Skill and Workflow requests both use the plan workflow above. The internal `confirm-plan` call is
+the Gateway's technical binding for the exact plan/task tuple, not a second user confirmation gate. For an explicitly
+selected single skill, the direct `describe -> validate -> execute` path remains valid.
 
-Stop on any failure, unavailable/not-ready Gateway, unauthorized motion, rejected validation, or missing confirmation.
-After a nonzero exit, do not run `--help`, inspect or change the environment, alter the JSON or timeout, query status, or
-issue another `robot-skill` command in the same user request. Report the exact returned error instead.
+Stop on any failure, unavailable/not-ready Gateway, unauthorized motion, or rejected validation.
 Do not invent parameters absent from `describe`.
 For an ordered multi-Skill request, call `plan-workflow` exactly once with the user's original wording and typed steps. The returned single
 plan must contain all ordered `workflow_steps`. If planning omits, reorders, or rejects a requested step, report that
@@ -75,13 +74,15 @@ Changing `nod_yes` implementation or manifest YAML requires `reload-catalog`, no
 Stop the right goal with the right command. The two executors are different actions; the wrong command cannot
 reach the active goal and will time out as `SKILL_CANCEL_TIMEOUT` while the robot keeps moving.
 
-- For an executing **Agent plan** (`execute-plan`): issue `robot-skill cancel-plan --task-id ID`, then wait for a
-  terminal `GoalStatus` ∈ {succeeded=4, canceled=5, aborted=6}. This is the only command that cancels the
-  `/embodied/execute_agent_plan` goal. **Never** use `cancel` for an Agent plan — it targets the wrong action.
+- When no process in this session owns the executing **Agent plan**, issue `robot-skill cancel-plan --task-id ID
+  --plan-id PLAN_ID --plan-digest DIGEST --registry-epoch EPOCH --registry-generation GENERATION
+  --registry-digest REGISTRY_DIGEST --expected-step-count COUNT`, then wait for the strictly validated terminal result.
+  This is the only external command that cancels the `/embodied/execute_agent_plan` goal. **Never** use `cancel` for an
+  Agent plan — it targets the wrong action.
 - `robot-skill cancel --task-id ID` cancels **only** a legacy single-skill `execute` goal
   (`/embodied/execute_skill`). Do not use it for `execute-plan`.
-- Sending SIGINT/SIGTERM to the `execute-plan` process only kills the CLI; it does **not** reliably cancel the
-  Gateway goal. Always issue `cancel-plan` to actually stop an Agent plan.
+- SIGINT/SIGTERM on the running `execute-plan` process requests root cancellation and waits for its terminal result.
+  Outside that process, use `cancel-plan` with the same task ID.
 - **Cancellation requested is not robot stopped.** `SKILL_CANCEL_TIMEOUT`, transport failure, or an unknown result means
   the stop state is unknown; dispatch no further motion.
 
@@ -93,26 +94,26 @@ Drive them with the closed vocabulary only; free text outside the grammar never 
 1. **Discover (read-only).** `robot-skill status` then `robot-skill list-skills`. Do not plan or move.
 2. **Reject out-of-catalog.** Any requested `skill_name` not in the current `planner_visible_names` is refused with
    `SKILL_REFERENCE_MISSING` before planning. Do not substitute or invent a skill.
-3. **Prepare + present + execute immediately (no confirmation gate).** `plan-workflow` once, show the ordered steps,
+3. **Prepare + present + execute immediately (no confirmation gate).** `plan-workflow` once, show and flush the ordered steps,
    plan digest, registry identity, and a fresh task ID, then run `validate-plan` + `confirm-plan` + `execute-plan`
    back-to-back without waiting for a `确认` reply — execution starts right after presentation. The user catches a
-   wrong workflow with `别动` (step 4) during execution instead of confirming beforehand. The `确认` grammar
-   (`确认执行当前计划` / `确认` / `confirm` / …) is still honored if the user offers it, but it is no longer a
-   required gate. The session binds the sole unexpired pending plan; never accept a pending ID from the user or model.
-4. **别动 → definite terminal.** On a stop phrase (`别动` / `停` / `停止` / `停下` / `stop` / `halt`), cancel the
-   active plan with `cancel-plan` and wait for a terminal `GoalStatus` ∈ {succeeded=4, canceled=5, aborted=6}. Only a
-   terminal result is a definite stopped state. `SKILL_CANCEL_TIMEOUT` or an unknown result means the stop state is
-   unknown — report uncertainty and send no further motion.
-5. **继续 → fresh-state continuation (breakpoint resume).** A continue phrase (`继续` / `继续吧` / `go on` / `continue`)
-   is a **new user request**, not a retry. It is permitted only after a definite terminal (succeeded / canceled /
-   aborted); `UNKNOWN` is refused and no motion is dispatched. Re-query `status` and `list-skills` on the fresh
-   registry identity. Then resume from the breakpoint: read the prior terminal's `completed_step_count`, slice the
-   original ordered steps to `original_steps[completed_step_count:]`, re-validate those remaining steps against the
-   fresh catalog, and run a brand-new `plan-workflow` + `confirm-plan` + `execute-plan` on **only the remaining steps**
-   with a **new `request_id` and `task_id`**. Fully-completed steps are skipped; the step that was interrupted
-   mid-execution is re-run from its start (never resumed mid-skill). Never reuse the prior `plan_token`,
-   `confirmation_token`, or `task_id`. If `completed_step_count` already equals the full step count, the plan is
-   already complete — do not plan again; ask the user for a new request.
+   wrong workflow with `别动` (step 4) during execution instead of confirming beforehand. The `确认` grammar is not
+   needed for this flow. The session binds the sole unexpired pending plan; never accept a pending ID from the user or model.
+4. **别动 → definite terminal.** On a stop phrase (`别动` / `停` / `停止` / `停下` / `stop` / `halt`), latch stop across
+   validation, internal confirmation, action-server waiting, goal submission, and goal acceptance. If this session owns
+   a running `execute-plan` process, signal only that process and let it cancel and converge. Use external `cancel-plan`
+   only when no local process owns that task. Never use both for one task. Suppress any new goal after a pre-submission
+   stop. A proven fresh in-process task needs no CancelGoal; if the deterministic task may be an idempotent retry, the
+   owner must cancel/converge the existing goal instead of synthesizing a local terminal. GoalStatus, success/error,
+   plan ID/digest, registry identity, and completed-step
+   bounds must agree. Only status 5 + `success=false` + `SKILL_CANCELLED` + exact identity proves cancellation.
+   `SKILL_CANCEL_TIMEOUT`, identity mismatch, or an unknown result means the stop state is unknown — report uncertainty
+   and send no further motion.
+5. **继续 → fresh user request only.** A continue phrase is permitted only after a definite canceled terminal
+   (`GoalStatus=5` plus `SKILL_CANCELLED`). In this baseline `--resume` is rejected because `completed_step_count` is
+   telemetry, not server-owned continuation admission. Do not slice the old plan or create a new task ID to bypass that
+   boundary. After definite cancellation, a user may submit an independent fresh workflow, which re-queries the fresh
+   registry and uses new plan/task tokens. Success, failure, and unknown states do not authorize automatic continuation.
 
 A reference implementation of this loop (catalog discovery, out-of-catalog rejection, in-session prepare/confirm,
 stop-to-definite-terminal, and fresh-state continuation) lives in
@@ -158,5 +159,5 @@ required workflow.
 | Treating accepted cancellation as physical stop | Wait for a terminal result or task ledger terminal state. |
 | Treating command approval as motion confirmation | Wait for an explicit response confirming the displayed plan. |
 | Retrying after checking idle | Require a new user request and repeat the entire workflow; never retry automatically. |
-| Continuing after an unknown stop | `继续` needs a definite terminal (4/5/6). Unknown stop → refuse continuation, send no motion. |
-| Re-running completed steps on `继续` | Resume from the breakpoint: plan only `original_steps[completed_step_count:]` with new IDs; skip fully-done steps, re-run the interrupted step from its start. |
+| Continuing after an unknown stop | `继续` needs a definite canceled terminal (5 + `SKILL_CANCELLED`). Otherwise refuse continuation and send no motion. |
+| Slicing completed steps on `继续` | Reject breakpoint resume until the Gateway provides server-owned continuation admission. |

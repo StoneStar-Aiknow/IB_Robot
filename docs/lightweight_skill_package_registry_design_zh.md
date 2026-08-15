@@ -12,7 +12,7 @@
 3. 快照同步使用精确版本标识，而不是仅依赖 `min_generation`。
 4. Skill 请求必须绑定预期的注册表版本。
 5. reload 使用暂存的不可变 catalog 和原子切换，不再直接读取可能被部分修改的实时目录树。
-6. 增加 Hermes 本地 Agent 控制面：自然语言必须先生成 exact-snapshot plan，再经过只读校验、用户确认和
+6. 增加 Hermes 本地 Agent 控制面：自然语言必须先生成 exact-snapshot plan，再经过只读校验、展示后内部 confirm 和
    direct Skill/typed Workflow 执行；Hermes 不拥有机器人启动、授权或底层运动权限。
 
 同时修正文档中的 manifest 示例，使其与当前校验契约保持一致：
@@ -1850,7 +1850,7 @@ Hermes 是本地交互 Agent，不是新的运动执行器。自然语言入口�
   -> local Hermes Agent
   -> ibrobot-control Agent Skill
   -> robot-skill status / list-skills / plan-workflow / describe / validate-plan
-  -> 展示 exact plan + fresh task ID -> 用户明确确认 -> confirm-plan
+  -> 展示并 flush exact plan + fresh task ID -> 立即 confirm-plan（内部技术绑定）
   -> execute-plan；root cancel 单独使用 cancel-plan
   -> embodied_agent Agent plan store / task executor
   -> direct SkillCommand，或 Begin -> ordered child SkillCommand -> Finalize
@@ -1950,9 +1950,10 @@ string message
 SkillDiagnostic[] diagnostics
 ```
 
-`ConfirmAgentPlan` 是确认后的受信 Agent 调用，不是把口头确认变成 `authorize_motion`。Agent 必须先生成 fresh
-`task_id`，向用户展示包含 plan kind、ordered steps、typed parameters、exact snapshot identity 和该 task ID
-的计划；用户明确确认后，CLI 才能调用此 service。Coordinator/plan store 必须原子校验
+`ConfirmAgentPlan` 是展示后的受信 Agent 内部调用，不是用户二次确认门，也不是把口头确认变成
+`authorize_motion`。Agent 必须先生成 fresh `task_id`，向用户展示包含 plan kind、ordered steps、typed
+parameters、exact snapshot identity 和该 task ID 的计划并 flush 输出；随后 CLI 立即调用此 service。
+Coordinator/plan store 必须原子校验
 `(plan_token, plan_digest, task_id, registry_epoch, registry_generation, registry_digest, task_budget_sec)`，将 plan
 从 `VALIDATED` 转为 `CONFIRMED`，并返回绑定同一 tuple 的单次 `confirmation_token`。`task_budget_sec` 必须为有限
 正数且不超过 Gateway task budget，并以 float32 规范化冻结，同时冻结绝对 `started_at/deadline`；
@@ -1994,9 +1995,10 @@ string detail
 `ExecuteAgentPlan` 是 `embodied_agent` 的公开高层 action。它按 token 读取 immutable plan，重新校验 TTL、exact
 identity、task ID 和 timeout，并在 action admission 时重新执行必要的 Gateway/safety 校验：
 
-v1 action 名称固定为 `/embodied/execute_agent_plan`。`robot-skill cancel-plan --task-id ID` 通过该 action 的
-标准 `CancelGoal` 取消 root goal，root executor 再向当前 direct Skill 或 Workflow child 传播取消并轮询唯一
-terminal result；现有 `robot-skill cancel --task-id ID` 仍只针对 `/embodied/execute_skill` 的 direct Skill goal。
+v1 action 名称固定为 `/embodied/execute_agent_plan`。`robot-skill cancel-plan` 使用 task ID 和展示过的
+plan/registry/step-count tuple，通过该 action 的标准 `CancelGoal` 取消 root goal，root executor 再向当前 direct
+Skill 或 Workflow child 传播取消并轮询唯一 terminal result；现有 `robot-skill cancel --task-id ID` 仍只针对
+`/embodied/execute_skill` 的 direct Skill goal。
 Admission race、尚未绑定 child、active child cleanup、root Finalize 和 unknown stop state 都必须由 root ledger
 记录并返回稳定结果，不能用 direct Skill 的 goal UUID 冒充 Agent plan root UUID。
 
@@ -2016,8 +2018,8 @@ Hermes-facing CLI 新增以下稳定命令，且继续输出现有 JSON/JSONL en
 robot-skill --config-name NAME plan-workflow --request-id ID --text TEXT
 robot-skill --config-name NAME validate-plan --plan-token TOKEN
 robot-skill --config-name NAME confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID
-robot-skill --config-name NAME execute-plan --plan-token TOKEN --task-id ID --confirmation-token TOKEN
-robot-skill --config-name NAME cancel-plan --task-id ID
+robot-skill --config-name NAME execute-plan --plan-token TOKEN --task-id ID --confirmation-token TOKEN --plan-id PLAN_ID --plan-digest DIGEST --registry-epoch EPOCH --registry-generation GENERATION --registry-digest REGISTRY_DIGEST --expected-step-count COUNT
+robot-skill --config-name NAME cancel-plan --task-id ID --plan-id PLAN_ID --plan-digest DIGEST --registry-epoch EPOCH --registry-generation GENERATION --registry-digest REGISTRY_DIGEST --expected-step-count COUNT
 ```
 
 目标命令的 CLI public projection 固定为：service response 的 `success/allowed/confirmed` 决定 envelope `ok`，
@@ -2033,7 +2035,7 @@ typed step 或 action result 的必填 public 字段：
 {"command":"confirm-plan","data":{"confirmation_token":"CONFIRMATION_TOKEN","confirmed":true,"diagnostics":[],"error_code":"","message":"","plan_digest":"DIGEST","task_id":"TASK_ID"},"error":null,"ok":true,"schema_version":1}
 {"event":"feedback","data":{"current_skill":"wave_hello","detail":"step 1 of 1","state":"executing","workflow_step_index":0},"payload_hash":"PAYLOAD_HASH","schema_version":1,"task_id":"TASK_ID"}
 {"event":"result","data":{"actual_registry_digest":"REGISTRY_DIGEST","actual_registry_epoch":"EPOCH","actual_registry_generation":1,"completed_step_count":1,"error_code":"","message":"plan completed","plan_digest":"DIGEST","plan_id":"PLAN_ID","success":true,"workflow_digest":""},"payload_hash":"PAYLOAD_HASH","schema_version":1,"task_id":"TASK_ID"}
-{"command":"cancel-plan","data":{"accepted":true,"result":{"actual_registry_digest":"REGISTRY_DIGEST","actual_registry_epoch":"EPOCH","actual_registry_generation":1,"completed_step_count":0,"error_code":"SKILL_CANCELLED","message":"plan canceled","plan_digest":"DIGEST","plan_id":"PLAN_ID","success":false,"workflow_digest":""},"terminal":true},"error":null,"ok":true,"schema_version":1}
+{"command":"cancel-plan","data":{"accepted":true,"goal_status":5,"result":{"actual_registry_digest":"REGISTRY_DIGEST","actual_registry_epoch":"EPOCH","actual_registry_generation":1,"completed_step_count":0,"error_code":"SKILL_CANCELLED","message":"plan canceled","plan_digest":"DIGEST","plan_id":"PLAN_ID","success":false,"workflow_digest":""},"terminal":true},"error":null,"ok":true,"schema_version":1}
 ```
 
 上述五个 Hermes-facing 命令和 `hermes-robot` 已在当前工作区实现；只有完成整套 package build、Gateway/Safety
@@ -2042,10 +2044,10 @@ action，`cancel-plan` 取消 Agent plan root action，两者不能互换。
 
 自然语言请求的 Agent workflow 固定为
 `status -> list-skills -> plan-workflow -> describe(each step) -> validate-plan -> 生成并展示 fresh task ID 和 exact plan ->
-confirm-plan -> execute-plan`。显式单 Skill 请求可继续使用现有 `validate/execute` 路径。确认必须发生在 plan 和
-validation 之后，
-并逐字包含 plan kind、顺序、参数、snapshot identity 和 task ID；“以后都允许”、历史确认、`--yolo` 或用户要求
-跳过确认均无效。Agent 不能启动/重启 pipeline、设置 `authorize_motion`、修改 ROS 参数或调用 raw ROS motion。
+confirm-plan -> execute-plan`。显式单 Skill 请求可继续使用现有 `validate/execute` 路径。展示必须发生在 plan 和
+validation 之后，完整包含 plan kind、顺序、参数、snapshot identity 和 task ID，并在内部 `confirm-plan` 前
+同步 flush；随后立即绑定并执行，不等待用户二次确认。`confirm-plan` 只是 exact tuple 的技术绑定，不修改
+`authorize_motion`。Agent 不能启动/重启 pipeline、设置 `authorize_motion`、修改 ROS 参数或调用 raw ROS motion。
 
 ## 12. Consumer 行为
 
@@ -2508,7 +2510,9 @@ process conformance、使用 fake Gateway 的 ROS integration 和需要仿真的
 - Reload 测试：plan/validate 后 reload，execute 必须返回 `SKILL_REGISTRY_VERSION_MISMATCH` 并要求重新 plan；执行中 reload 时所有后续 child 继续使用 Begin 捕获的 bundle。
 - Agent Skill 静态契约测试：`scripts/check_agent_skill.py` 必须检查自然语言触发、`status -> list/plan-workflow -> describe -> validate-plan -> 展示 task ID/exact plan -> confirm-plan -> execute-plan` 顺序、单 Skill/Workflow 分流、失败即停、`cancel-plan` 和停止未知说明，以及禁止 launch/authorize/raw ROS/Primitive/自动重试。
 - Hermes 边界测试：由 `check_agent_skill.py`、launcher wrapper 测试、CLI plan lifecycle 测试和 Agent plan 节点测试共同覆盖禁止绕过、失败即停、确认绑定与单次执行；真实 Hermes provider 和真机 transcript 作为发布验收，不纳入默认 pytest。
-- Root cancel 测试：`cancel-plan --task-id` 只能取消 `/embodied/execute_agent_plan` root goal，并验证 active child cleanup、Finalize、terminal polling、admission race 和 unknown stop；现有 `cancel --task-id` 仍只覆盖 direct Skill。
+- Root cancel 测试：携带 task ID 和完整展示 tuple 的 `cancel-plan` 只能取消
+  `/embodied/execute_agent_plan` root goal，并验证 active child cleanup、Finalize、terminal polling、admission race
+  和 unknown stop；现有 `cancel --task-id` 仍只覆盖 direct Skill。
 - Compatibility error 测试：baseline direct CLI 保留 `MOTION_NOT_AUTHORIZED`、`CAPABILITY_NOT_READY`、`SKILL_BUSY`、
   `CONTROL_MODE_MISMATCH`、`TIMEOUT_EXCEEDS_POLICY`、`DUPLICATE_TASK_ID`、`TASK_ID_CONFLICT`、`INVALID_ARGUMENT`、
   `GATEWAY_FINALIZATION_FAILED`、`SKILL_CANCELLED`、`SKILL_CANCEL_TIMEOUT` 和 `GOAL_NOT_FOUND` 及其既有 exit
@@ -2542,7 +2546,7 @@ process conformance、使用 fake Gateway 的 ROS integration 和需要仿真的
     使用新 generation。
 11. Workflow 中途失败或取消时先清理 active child，再幂等 Finalize root scope；后续 root 请求可以正常准入。
 12. 在同一已启动的仿真 pipeline 上，执行 `hermes-robot` 后输入单 Skill 自然语言请求，完成
-    `plan-workflow -> validate-plan -> 用户确认 -> execute-plan -> terminal result`；未授权 launch 必须只返回
+    `plan-workflow -> validate-plan -> 展示并 flush -> confirm-plan -> execute-plan -> terminal result`；未授权 launch 必须只返回
     Gateway 拒绝且不产生运动 goal。
 13. 在同一 Agent session 中输入两步自然语言 Workflow，两个 typed steps 按原顺序执行，第二步参数不继承第一步
     的顶层 hint，第一步失败时没有第二步 action goal。
@@ -2816,16 +2820,15 @@ hermes-robot --config-name so101_single_arm
 
 ```text
 用户：请挥挥手
-Hermes：读取 status、生成/展示 wave_hello plan、describe、validate-plan，生成 fresh task ID 并请求明确确认
-用户：确认执行
-Hermes：confirm-plan --plan-token <PLAN_TOKEN> --plan-digest <DIGEST> --task-id <fresh-id>；随后
-execute-plan --plan-token <PLAN_TOKEN> --task-id <fresh-id> --confirmation-token <CONFIRMATION_TOKEN>，等待唯一 terminal result
+Hermes：读取 status、生成/展示并 flush wave_hello plan、describe、validate-plan，生成 fresh task ID；随后立即
+confirm-plan --plan-token <PLAN_TOKEN> --plan-digest <DIGEST> --task-id <fresh-id>；随后执行 execute-plan，并携带
+<PLAN_TOKEN>、<CONFIRMATION_TOKEN>、<fresh-id>、展示过的 plan ID/digest、registry identity 和 step count，等待
+唯一 terminal result
 
 用户：先打开夹爪，然后回到安全位
-Hermes：展示 WORKFLOW 的两个 typed steps、每步参数、snapshot identity、预计顺序和 fresh task ID，完成整体 validate-plan 后请求一次确认
-用户：确认执行这个计划
-Hermes：confirm-plan --plan-token <PLAN_TOKEN> --plan-digest <DIGEST> --task-id <fresh-id>；随后
-execute-plan --plan-token <PLAN_TOKEN> --task-id <fresh-id> --confirmation-token <CONFIRMATION_TOKEN>；首步失败、取消或停止未知时不提交第二步
+Hermes：展示并 flush WORKFLOW 的两个 typed steps、每步参数、snapshot identity、预计顺序和 fresh task ID，完成整体 validate-plan 后立即
+confirm-plan --plan-token <PLAN_TOKEN> --plan-digest <DIGEST> --task-id <fresh-id>；随后执行 execute-plan，并携带
+token、fresh task ID、展示过的 plan/registry identity 和 expected step count；首步失败、取消或停止未知时不提交第二步
 ```
 
 直接运行前必须满足：Gateway control-plane status ready、当前 control mode 满足 Skill、operator 已决定 motion authorization、
@@ -2865,8 +2868,8 @@ Hermes provider 已配置、`ibrobot-control` 版本通过 checker。自然语�
     崩溃时 root deadline cleanup 不会提前放开仍在运动的 lease。
 23. Hermes 单 Skill/Workflow 只通过 immutable AgentPlan token 进入 `embodied_agent`；单 plan 最多 16 个 step，
     token 默认 TTL 300 秒，未确认或已过期的 plan 不得产生 action goal。
-24. Hermes 的每个运动 plan 都需要一次针对 exact plan 的明确用户确认；历史确认、通用授权、`--yolo` 和自动重试
-    均不构成确认。
+24. Hermes 的每个运动 plan 都必须在内部 confirm 前展示并 flush exact plan；`confirm-plan` 只做 exact tuple
+    技术绑定，不是用户二次确认。通用授权、`--yolo` 和自动重试均不能绕过该展示和 Gateway admission。
 25. `hermes-robot`、`plan-workflow`、`validate-plan`、`confirm-plan`、`execute-plan` 和 `cancel-plan` 已实现并遵守
     exact snapshot、一次确认、opaque token 和 fail-closed prerequisite 契约。
 26. 外部 Hermes provider/runtime 不属于 ROS package 或机器人执行 SSOT；兼容版本、provider 和 transcript 测试

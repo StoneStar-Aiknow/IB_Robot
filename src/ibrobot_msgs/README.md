@@ -484,7 +484,8 @@ embodied_agent 对 Hermes 自然语言流程公开的高层 action，端点名�
 不接触 root lease nonce。首次 accepted 执行必须携带未消费的 `confirmation_token` 并绑定 task id；相同
 token/task id 的重试可幂等返回既有 active/terminal 记录，不同 task id 返回 `SKILL_REQUEST_ID_CONFLICT`。
 任一 step 失败、取消、timeout 或 unknown stop 状态后，不再执行下一步，也不自动创建新 token/task id。
-`robot-skill cancel-plan --task-id ID` 通过标准 `CancelGoal` 接口取消本 action 的 root goal。
+`robot-skill cancel-plan` 通过标准 `CancelGoal` 接口取消本 action 的 root goal；CLI 同时要求 task ID、展示过的
+plan/registry identity 和 expected step count，用于校验随后返回的终态。
 
 ### `ConfirmAgentPlan.srv`
 

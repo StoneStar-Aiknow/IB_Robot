@@ -1,9 +1,9 @@
 """Interactive closed-loop controller for the IB-Robot Capability Gateway.
 
-This module is a pure-Python, ROS-free reference implementation of the five-feature
-interactive closed loop (catalog discovery, out-of-catalog rejection, in-process
-workflow prepare/confirm, ``stop`` to a definite terminal, and ``continue`` on fresh
-state). It depends only on an injected ``RosBridge``-like object and the shared
+This module is a pure-Python, ROS-free reference implementation of the interactive
+closed loop (catalog discovery, out-of-catalog rejection, in-process workflow
+prepare/execute, ``stop`` to a definite terminal, and safe fresh-state continuation).
+It depends only on an injected ``RosBridge``-like object and the shared
 catalog/workflow helpers, so it is unit-testable without a ROS stack.
 
 The controller never parses free natural language into structured steps; it only
@@ -14,16 +14,18 @@ Gateway primitives. Structured ``workflow_steps`` remain the caller's responsibi
 from __future__ import annotations
 
 import contextlib
+import struct
 import threading
 import time
 import uuid
 from collections.abc import Callable
 from typing import Any
 
+from embodied_common.agent_terminal_contract import GOAL_CANCELED, TERMINAL_GOAL_STATUSES, classify_agent_terminal
 from embodied_common.workflow_contracts import normalize_workflow_steps
 
-# Closed natural-language grammars. Matched after stripping + lowercasing against
-# either the full string or a recognized prefix; unknown text never acts.
+# Closed natural-language grammars. Motion-enabling intents require an exact match
+# after normalization; unknown text never acts.
 _CONFIRM_PHRASES = (
     "确认执行当前计划",
     "确认然后挥手",
@@ -45,14 +47,9 @@ INTENT_STOP = "stop"
 INTENT_CONTINUE = "continue"
 INTENT_UNKNOWN = "unknown"
 
-# action_msgs/GoalStatus terminal values.
-_GOAL_SUCCEEDED = 4
-_GOAL_CANCELED = 5
-_GOAL_ABORTED = 6
-_TERMINAL_GOAL_STATUSES = {_GOAL_SUCCEEDED, _GOAL_CANCELED, _GOAL_ABORTED}
-
 # Controller states.
 IDLE = "idle"
+STARTING = "starting"
 DISCOVERED = "discovered"
 PREPARED = "prepared"
 CONFIRMED = "confirmed"
@@ -67,6 +64,10 @@ _RPC_TIMEOUT_FLOOR_SEC = 30.0
 _STATUS_PREFLIGHT_FLOOR_SEC = 15.0
 _CANCEL_POLL_INTERVAL_SEC = 0.02
 _EXECUTE_POLL_INTERVAL_SEC = 0.02
+
+
+def _float32(value: Any) -> float:
+    return struct.unpack("!f", struct.pack("!f", float(value)))[0]
 
 
 def _default_view_resolver(snapshot: dict[str, Any], status: dict[str, Any]) -> dict[str, Any]:
@@ -111,11 +112,11 @@ def classify(text: str) -> str:
     normalized = _normalize_text(text)
     if not normalized:
         return INTENT_UNKNOWN
-    if any(normalized == phrase or normalized.startswith(phrase) for phrase in _STOP_PHRASES):
+    if normalized in _STOP_PHRASES:
         return INTENT_STOP
-    if any(normalized == phrase or normalized.startswith(phrase) for phrase in _CONTINUE_PHRASES):
+    if normalized in _CONTINUE_PHRASES:
         return INTENT_CONTINUE
-    if any(normalized == phrase or normalized.startswith(phrase) for phrase in _CONFIRM_PHRASES):
+    if normalized in _CONFIRM_PHRASES:
         return INTENT_CONFIRM
     return INTENT_UNKNOWN
 
@@ -162,10 +163,19 @@ class InteractiveController:
         self._state = IDLE
         self._active_task_id: str | None = None
         self._stop_event: threading.Event | None = None
+        self._stop_requested = threading.Event()
+        self._state_lock = threading.RLock()
+        self._cancel_started = False
+        self._cancel_accepted = False
+        self._goal_future = None
+        self._goal_handle = None
+        self._result_future = None
+        self._submission_started = False
 
     @property
     def state(self) -> str:
-        return self._state
+        with self._state_lock:
+            return self._state
 
     def _rpc(self) -> float:
         return self._rpc_timeout_sec
@@ -188,10 +198,14 @@ class InteractiveController:
             timeout_sec=status.get("rpc_timeout_sec", self._rpc_timeout_sec),
         )
         view = self._resolve_view(snapshot, status)
-        self._fresh_status = status
-        self._fresh_view = view
-        self._fresh_identity = identity
-        self._state = DISCOVERED
+        with self._state_lock:
+            self._fresh_status = status
+            self._fresh_view = view
+            self._fresh_identity = identity
+            if self._stop_requested_now():
+                self._state = STOPPING
+            elif self._state != STARTING:
+                self._state = DISCOVERED
         return {
             "robot_name": view["robot_name"],
             "registry_identity": {
@@ -255,35 +269,69 @@ class InteractiveController:
                 str(result.get("message") or "plan_agent_command failed"),
             )
         plan = result["plan"]
-        self._pending = {
+        plan_steps = [step.to_dict() for step in normalize_workflow_steps(plan.get("workflow_steps", []))]
+        if not self._workflow_steps_match(normalized, plan_steps):
+            raise InteractiveControlError(
+                "SKILL_SNAPSHOT_DIGEST_MISMATCH",
+                "planned workflow differs from the requested workflow",
+            )
+        plan_identity = (
+            str(plan.get("registry_epoch", "")),
+            int(plan.get("registry_generation", 0)),
+            str(plan.get("registry_digest", "")),
+        )
+        if plan_identity != self._fresh_identity:
+            raise InteractiveControlError(
+                "SKILL_SNAPSHOT_DIGEST_MISMATCH",
+                "planned workflow uses a different registry identity",
+            )
+        pending = {
             "plan_token": plan["plan_token"],
             "plan_digest": plan["plan_digest"],
             "plan_id": plan["plan_id"],
+            "plan_kind": int(plan.get("plan_kind", 0)),
             "raw_command": raw_command,
-            "steps": normalized,
-            "registry_identity": self._fresh_identity,
+            "steps": plan_steps,
+            "registry_identity": plan_identity,
             "task_id": task_id,
         }
-        self._confirmed = None
-        self._terminal = None
-        self._state = PREPARED
+        with self._state_lock:
+            self._pending = pending
+            self._confirmed = None
+            self._terminal = None
+            self._state = STOPPING if self._stop_requested_now() else PREPARED
         return self._presentation()
+
+    @staticmethod
+    def _workflow_steps_match(requested: list[dict[str, Any]], planned: list[dict[str, Any]]) -> bool:
+        if len(requested) != len(planned):
+            return False
+        text_fields = ("skill_name", "target_name", "place_name", "motion_direction")
+        for expected, actual in zip(requested, planned, strict=True):
+            if int(actual.get("schema_version", 0)) != int(expected.get("schema_version", 0)):
+                return False
+            if any(str(actual.get(field, "")) != str(expected.get(field, "")) for field in text_fields):
+                return False
+            for field in ("motion_distance", "timeout_sec"):
+                if _float32(actual.get(field, 0.0)) != _float32(expected.get(field, 0.0)):
+                    return False
+        return True
 
     def _presentation(self) -> dict[str, Any]:
         assert self._pending is not None
-        assert self._fresh_identity is not None
+        registry_identity = self._pending["registry_identity"]
         return {
             "state": self._state,
             "steps": list(self._pending["steps"]),
             "plan_digest": self._pending["plan_digest"],
             "plan_id": self._pending["plan_id"],
             "registry_identity": {
-                "registry_epoch": self._fresh_identity[0],
-                "registry_generation": self._fresh_identity[1],
-                "registry_digest": self._fresh_identity[2],
+                "registry_epoch": registry_identity[0],
+                "registry_generation": registry_identity[1],
+                "registry_digest": registry_identity[2],
             },
             "task_id": self._pending["task_id"],
-            "confirm_command": "确认执行当前计划",
+            "execution_mode": "immediate_after_presentation",
         }
 
     def confirm_plan(self) -> dict[str, Any]:
@@ -295,31 +343,75 @@ class InteractiveController:
         execution starts immediately; the user aborts a wrong workflow with
         ``别动`` during execution instead of confirming beforehand.
         """
-        if self._pending is None:
+        if self._pending is None or self._state not in {PREPARED, STOPPING}:
             raise IllegalStateError("ILLEGAL_STATE", "no pending workflow to confirm")
-        validation = self._bridge.validate_agent_plan(
-            plan_token=self._pending["plan_token"],
-            timeout_sec=self._status_timeout_sec,
-        )
+        if self._stop_requested_now():
+            self._state = STOPPING
+            return {
+                "state": self._state,
+                "task_id": self._pending["task_id"],
+                "confirmation_token": "",
+                "stopped_before_execution": True,
+            }
+        try:
+            validation = self._bridge.validate_agent_plan(
+                plan_token=self._pending["plan_token"],
+                timeout_sec=self._status_timeout_sec,
+            )
+        except Exception as exc:
+            with self._state_lock:
+                self._clear_operation()
+                self._state = FAILED
+            raise InteractiveControlError("SERVER_UNAVAILABLE", "plan validation response was unavailable") from exc
         if not validation.get("allowed"):
             raise InteractiveControlError(
                 str(validation.get("error_code") or "SKILL_VALIDATION_FAILED"),
                 str(validation.get("message") or "validate_agent_plan failed"),
             )
+        if self._stop_requested_now():
+            self._state = STOPPING
+            return {
+                "state": self._state,
+                "task_id": self._pending["task_id"],
+                "confirmation_token": "",
+                "stopped_before_execution": True,
+            }
+        expected_plan = (self._pending["plan_id"], self._pending["plan_digest"])
+        actual_plan = (str(validation.get("plan_id", "")), str(validation.get("plan_digest", "")))
+        if actual_plan != expected_plan:
+            raise InteractiveControlError(
+                "SKILL_SNAPSHOT_DIGEST_MISMATCH",
+                "validate_agent_plan returned a different plan identity",
+            )
         task_budget_sec = float(self._fresh_status["task_budget_sec"])
-        result = self._bridge.confirm_agent_plan(
-            plan_token=self._pending["plan_token"],
-            plan_digest=self._pending["plan_digest"],
-            task_id=self._pending["task_id"],
-            status=self._fresh_status,
-            task_budget_sec=task_budget_sec,
-            timeout_sec=self._status_timeout_sec,
-        )
+        try:
+            result = self._bridge.confirm_agent_plan(
+                plan_token=self._pending["plan_token"],
+                plan_digest=self._pending["plan_digest"],
+                task_id=self._pending["task_id"],
+                status=self._fresh_status,
+                task_budget_sec=task_budget_sec,
+                timeout_sec=self._status_timeout_sec,
+            )
+        except Exception as exc:
+            terminal = self._record_unknown(
+                self._pending["task_id"],
+                failure_detail="plan confirmation response was unavailable",
+            )
+            raise InteractiveControlError(terminal["error_code"], terminal["message"]) from exc
         if not result.get("confirmed"):
             raise InteractiveControlError(
                 str(result.get("error_code") or "SKILL_REQUEST_ID_CONFLICT"),
                 str(result.get("message") or "confirm_agent_plan failed"),
             )
+        if self._stop_requested_now():
+            self._state = STOPPING
+            return {
+                "state": self._state,
+                "task_id": self._pending["task_id"],
+                "confirmation_token": result["confirmation_token"],
+                "stopped_before_execution": True,
+            }
         self._confirmed = {
             "confirmation_token": result["confirmation_token"],
             "task_id": self._pending["task_id"],
@@ -345,6 +437,7 @@ class InteractiveController:
         raw_command: str,
         steps: list[dict[str, Any]],
         *,
+        presentation_callback: Callable[[dict[str, Any]], None],
         stop_event: threading.Event | None = None,
         feedback_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
@@ -355,11 +448,51 @@ class InteractiveController:
         interrupts a wrong workflow with ``别动`` (``stop_event`` / ``request_stop``)
         during execution. Callable from ``IDLE`` or any definite terminal.
         """
-        if self._state not in {IDLE, DISCOVERED, STOPPED, SUCCEEDED, FAILED}:
-            raise IllegalStateError("ILLEGAL_STATE", f"cannot run from state {self._state}")
+        with self._state_lock:
+            if self._state not in {IDLE, DISCOVERED, STOPPED, SUCCEEDED, FAILED}:
+                raise IllegalStateError("ILLEGAL_STATE", f"cannot run from state {self._state}")
+            reuse_discovery = self._state == DISCOVERED
+            if not reuse_discovery:
+                self._fresh_status = None
+                self._fresh_view = None
+                self._fresh_identity = None
+            self._pending = None
+            self._confirmed = None
+            self._terminal = None
+            self._active_task_id = None
+            self._cancel_started = False
+            self._cancel_accepted = False
+            self._goal_future = None
+            self._goal_handle = None
+            self._result_future = None
+            self._submission_started = False
+            self._stop_requested.clear()
+            self._stop_event = stop_event
+            self._state = STARTING
+            if stop_event is not None and stop_event.is_set():
+                self._stop_requested.set()
+                self._state = STOPPING
         if self._fresh_view is None:
-            self.discover()
-        self.prepare_workflow(raw_command, steps)
+            try:
+                self.discover()
+            except Exception:
+                with self._state_lock:
+                    self._clear_operation()
+                    self._state = IDLE
+                raise
+        try:
+            presentation = self.prepare_workflow(raw_command, steps)
+        except Exception:
+            with self._state_lock:
+                self._clear_operation()
+                self._state = DISCOVERED if self._fresh_view is not None else IDLE
+            raise
+        try:
+            presentation_callback(presentation)
+        except Exception as exc:
+            task_id = self._pending["task_id"] if self._pending is not None else ""
+            self._record_terminal(task_id, FAILED, "PRESENTATION_FAILED", "plan presentation failed")
+            raise InteractiveControlError("PRESENTATION_FAILED", "plan presentation failed") from exc
         self.confirm_plan()
         return self.execute(stop_event=stop_event, feedback_callback=feedback_callback)
 
@@ -370,59 +503,160 @@ class InteractiveController:
         feedback_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Feature 4: execute the confirmed plan; interruptible via ``stop_event``."""
-        if self._state != CONFIRMED or self._confirmed is None:
-            raise IllegalStateError("ILLEGAL_STATE", "no confirmed workflow to execute")
-        if not self._bridge.wait_for_execute_plan_server(timeout_sec=self._rpc()):
-            raise InteractiveControlError("SERVER_UNAVAILABLE", "agent plan action server unavailable")
-        task_id = self._confirmed["task_id"]
-        timeout_sec = self._confirmed["task_budget_sec"]
-        self._active_task_id = task_id
-        self._stop_event = stop_event
-        self._state = EXECUTING
-        goal_future = self._bridge.send_agent_plan_goal(
-            plan_token=self._pending["plan_token"],
-            confirmation_token=self._confirmed["confirmation_token"],
-            task_id=task_id,
-            timeout_sec=timeout_sec,
-            feedback_callback=feedback_callback,
-        )
-        if not self._bridge.wait_future(goal_future, timeout_sec=self._rpc()):
+        with self._state_lock:
+            if self._state == STOPPING and self._confirmed is None and self._pending is not None:
+                return self._record_local_stop(self._pending["task_id"], "stopped before goal admission")
+            if self._state != CONFIRMED or self._confirmed is None or self._pending is None:
+                raise IllegalStateError("ILLEGAL_STATE", "no confirmed workflow to execute")
+            task_id = self._confirmed["task_id"]
+            timeout_sec = self._confirmed["task_budget_sec"]
+            plan_token = self._pending["plan_token"]
+            confirmation_token = self._confirmed["confirmation_token"]
+            self._stop_event = stop_event or self._stop_event
+            if self._stop_requested_now():
+                return self._record_local_stop(task_id, "stopped before goal admission")
+            self._active_task_id = task_id
+            self._state = EXECUTING
+
+        def guarded_feedback(feedback: dict[str, Any]) -> None:
+            if feedback_callback is None:
+                return
+            with self._state_lock:
+                if self._active_task_id != task_id or self._state not in {EXECUTING, STOPPING}:
+                    return
+                feedback_callback(feedback)
+
+        try:
+            if not self._wait_for_server_interruptibly():
+                if self._stop_requested_now():
+                    return self._record_local_stop(task_id, "stopped before goal admission")
+                return self._record_terminal(
+                    task_id,
+                    FAILED,
+                    "SERVER_UNAVAILABLE",
+                    "agent plan action server unavailable",
+                )
+        except InteractiveControlError:
+            raise
+        except Exception as exc:
+            return self._converge_after_failure(task_id, "agent plan action server unavailable", exc)
+        if self._stop_requested_now():
+            return self._record_local_stop(task_id, "stopped before goal admission")
+        with self._state_lock:
+            if self._state not in {EXECUTING, STOPPING} or self._active_task_id != task_id:
+                raise IllegalStateError("ILLEGAL_STATE", "execution ownership was lost")
+            if self._stop_requested_now():
+                return self._record_local_stop(task_id, "stopped before goal admission")
+            self._submission_started = True
+        try:
+            goal_future = self._bridge.send_agent_plan_goal(
+                plan_token=plan_token,
+                confirmation_token=confirmation_token,
+                task_id=task_id,
+                timeout_sec=timeout_sec,
+                feedback_callback=guarded_feedback,
+            )
+        except Exception as exc:
+            submit_error = exc
+            goal_future = None
+        else:
+            submit_error = None
+            with self._state_lock:
+                self._goal_future = goal_future
+        if submit_error is not None:
+            return self._converge_after_failure(task_id, "goal submission failed", submit_error)
+        try:
+            goal_ready = self._wait_future_interruptibly(goal_future, self._rpc())
+        except Exception as exc:
+            return self._converge_after_failure(task_id, "goal response unavailable", exc)
+        if not goal_ready:
+            if self._stop_requested_now():
+                return self._stop_and_converge(task_id)
             return self._converge_after_failure(task_id, "goal response timed out")
-        goal_handle = goal_future.result()
+        try:
+            goal_handle = goal_future.result()
+        except Exception as exc:
+            return self._converge_after_failure(task_id, "goal response unavailable", exc)
+        with self._state_lock:
+            self._goal_handle = goal_handle
         if goal_handle is None or not getattr(goal_handle, "accepted", False):
-            return self._record_terminal(FAILED, "GOAL_REJECTED", "agent plan goal was rejected")
+            if self._stop_requested_now():
+                return self._record_local_stop(task_id, "stopped before goal acceptance")
+            return self._record_terminal(task_id, FAILED, "GOAL_REJECTED", "agent plan goal was rejected")
         try:
             result_future = goal_handle.get_result_async()
-        except Exception:
-            return self._converge_after_failure(task_id, "result request unavailable")
+        except Exception as exc:
+            return self._converge_after_failure(task_id, "result request unavailable", exc)
+        with self._state_lock:
+            self._result_future = result_future
         deadline = self._monotonic() + timeout_sec + self._rpc_timeout_sec
         while not result_future.done():
-            if self._stop_event is not None and self._stop_event.is_set():
+            if self._stop_requested_now():
                 return self._stop_and_converge(task_id)
             if self._monotonic() >= deadline:
                 return self._stop_and_converge(task_id, deadline_expired=True)
             self._sleep(_EXECUTE_POLL_INTERVAL_SEC)
-        return self._read_terminal(task_id)
+        return self._read_terminal(task_id, cancel_on_nonterminal=True)
 
     def request_stop(self) -> None:
         """Feature 4: thread-safe stop trigger from outside the execute loop."""
-        if self._stop_event is not None:
-            self._stop_event.set()
-        if self._active_task_id is not None:
-            self._state = STOPPING
-            with contextlib.suppress(Exception):
-                self._bridge.cancel_agent_plan(self._active_task_id, timeout_sec=self._rpc())
+        with self._state_lock:
+            self._stop_requested.set()
+            if self._stop_event is not None:
+                self._stop_event.set()
+            if self._state not in {STOPPED, SUCCEEDED, FAILED, UNKNOWN}:
+                self._state = STOPPING
 
     def _stop_and_converge(self, task_id: str, *, deadline_expired: bool = False) -> dict[str, Any]:
         self._state = STOPPING
-        with contextlib.suppress(Exception):
-            self._bridge.cancel_agent_plan(task_id, timeout_sec=self._rpc())
-        return self._read_terminal(task_id, deadline_expired=deadline_expired)
+        self._cancel_once(task_id)
+        return self._read_terminal(task_id, deadline_expired=deadline_expired, cancel_on_nonterminal=True)
 
-    def _converge_after_failure(self, task_id: str, detail: str) -> dict[str, Any]:
+    def _converge_after_failure(self, task_id: str, detail: str, _error: Exception | None = None) -> dict[str, Any]:
+        if not self._submission_started:
+            return self._record_terminal(task_id, FAILED, "SERVER_UNAVAILABLE", detail)
+        self._cancel_once(task_id)
+        return self._read_terminal(task_id, failure_detail=detail, cancel_on_nonterminal=True)
+
+    def _stop_requested_now(self) -> bool:
+        if self._stop_event is not None and self._stop_event.is_set():
+            self._stop_requested.set()
+        return self._stop_requested.is_set()
+
+    def _wait_future_interruptibly(self, future: Any, timeout_sec: float) -> bool:
+        deadline = self._monotonic() + timeout_sec
+        while not future.done():
+            if self._stop_requested_now():
+                return False
+            remaining = deadline - self._monotonic()
+            if remaining <= 0.0:
+                return False
+            wait_timeout = min(remaining, _EXECUTE_POLL_INTERVAL_SEC)
+            ready = self._bridge.wait_future(future, timeout_sec=wait_timeout, interrupt_event=self._stop_requested)
+            if ready and future.done():
+                return True
+        return True
+
+    def _wait_for_server_interruptibly(self) -> bool:
+        deadline = self._monotonic() + self._rpc()
+        while not self._stop_requested_now():
+            remaining = deadline - self._monotonic()
+            if remaining <= 0.0:
+                return False
+            if self._bridge.wait_for_execute_plan_server(timeout_sec=min(remaining, _EXECUTE_POLL_INTERVAL_SEC)):
+                return True
+            self._sleep(min(remaining, _EXECUTE_POLL_INTERVAL_SEC))
+        return False
+
+    def _cancel_once(self, task_id: str, *, retry: bool = False) -> None:
+        with self._state_lock:
+            if self._cancel_accepted or (self._cancel_started and not retry):
+                return
+            self._cancel_started = True
         with contextlib.suppress(Exception):
-            self._bridge.cancel_agent_plan(task_id, timeout_sec=self._rpc())
-        return self._read_terminal(task_id, failure_detail=detail)
+            response = self._bridge.cancel_agent_plan(task_id, timeout_sec=self._rpc())
+            with self._state_lock:
+                self._cancel_accepted = bool(response.get("accepted"))
 
     def _read_terminal(
         self,
@@ -430,55 +664,104 @@ class InteractiveController:
         *,
         deadline_expired: bool = False,
         failure_detail: str = "",
+        cancel_on_nonterminal: bool = False,
     ) -> dict[str, Any]:
         deadline = self._monotonic() + self._rpc_timeout_sec
         terminal = None
         while self._monotonic() < deadline:
             with contextlib.suppress(Exception):
                 terminal = self._bridge.get_agent_plan_result(task_id, timeout_sec=self._rpc())
-            status = int(terminal.get("status", 0)) if terminal else 0
-            if status in _TERMINAL_GOAL_STATUSES:
+            try:
+                status = int(terminal.get("status", 0)) if terminal else 0
+            except (TypeError, ValueError):
+                status = 0
+            if status in TERMINAL_GOAL_STATUSES:
                 return self._record_terminal_result(task_id, terminal)
+            if cancel_on_nonterminal:
+                self._cancel_once(task_id, retry=True)
             self._sleep(_CANCEL_POLL_INTERVAL_SEC)
         return self._record_unknown(task_id, deadline_expired=deadline_expired, failure_detail=failure_detail)
-
-    @staticmethod
-    def _state_for_status(status: int) -> str:
-        if status == _GOAL_SUCCEEDED:
-            return SUCCEEDED
-        if status == _GOAL_CANCELED:
-            return STOPPED
-        return FAILED
 
     def _record_terminal_result(self, task_id: str, terminal: dict[str, Any]) -> dict[str, Any]:
         status = int(terminal.get("status", 0))
         result = terminal.get("result", {}) or {}
+        classification = self._classify_terminal(status, result)
+        if classification is None:
+            return self._record_unknown(task_id, failure_detail="terminal result failed identity or state validation")
+        state, error_code = classification
         return self._record_terminal(
-            self._state_for_status(status),
-            str(result.get("error_code", "")),
+            task_id,
+            state,
+            error_code,
             str(result.get("message", "")),
             result=result,
+            goal_status=status,
         )
+
+    def _classify_terminal(self, status: int, result: dict[str, Any]) -> tuple[str, str] | None:
+        if self._pending is None:
+            return None
+        registry_identity = self._pending["registry_identity"]
+        expectation = {
+            "plan_id": self._pending["plan_id"],
+            "plan_digest": self._pending["plan_digest"],
+            "registry_epoch": registry_identity[0],
+            "registry_generation": registry_identity[1],
+            "registry_digest": registry_identity[2],
+            "step_count": len(self._pending["steps"]),
+        }
+        classification = classify_agent_terminal(status, result, expectation)
+        if classification == "succeeded":
+            return SUCCEEDED, ""
+        if classification == "stopped":
+            return STOPPED, "SKILL_CANCELLED"
+        if classification == "failed":
+            return FAILED, str(result["error_code"])
+        if classification == "unknown":
+            return UNKNOWN, str(result["error_code"])
+        return None
 
     def _record_terminal(
         self,
+        task_id: str,
         state: str,
         error_code: str,
         message: str,
         *,
         result: dict[str, Any] | None = None,
+        goal_status: int | None = None,
     ) -> dict[str, Any]:
-        self._terminal = {
+        terminal = {
             "state": state,
-            "task_id": self._active_task_id,
+            "task_id": task_id,
             "error_code": error_code,
             "message": message,
             "result": result or {},
         }
-        self._state = state
-        self._active_task_id = None
-        self._stop_event = None
-        return dict(self._terminal)
+        if goal_status is not None:
+            terminal["goal_status"] = goal_status
+        with self._state_lock:
+            self._terminal = terminal
+            self._state = state
+            self._clear_operation()
+            self._stop_requested.clear()
+        return dict(terminal)
+
+    def _record_local_stop(self, task_id: str, message: str) -> dict[str, Any]:
+        terminal = {
+            "state": STOPPED,
+            "task_id": task_id,
+            "error_code": "SKILL_CANCELLED",
+            "message": message,
+            "result": {},
+            "stopped_before_execution": True,
+        }
+        with self._state_lock:
+            self._terminal = terminal
+            self._state = STOPPED
+            self._clear_operation()
+            self._stop_requested.clear()
+        return dict(terminal)
 
     def _record_unknown(
         self, task_id: str, *, deadline_expired: bool = False, failure_detail: str = ""
@@ -486,17 +769,30 @@ class InteractiveController:
         message = "robot stop state is unknown"
         if failure_detail:
             message = f"{message}: {failure_detail}"
-        self._terminal = {
+        terminal = {
             "state": UNKNOWN,
             "task_id": task_id,
             "error_code": "SKILL_CANCEL_TIMEOUT",
             "message": message,
             "result": {},
         }
-        self._state = UNKNOWN
+        with self._state_lock:
+            self._terminal = terminal
+            self._state = UNKNOWN
+            self._clear_operation()
+        return dict(terminal)
+
+    def _clear_operation(self) -> None:
+        self._pending = None
+        self._confirmed = None
         self._active_task_id = None
         self._stop_event = None
-        return dict(self._terminal)
+        self._cancel_started = False
+        self._cancel_accepted = False
+        self._goal_future = None
+        self._goal_handle = None
+        self._result_future = None
+        self._submission_started = False
 
     def continue_workflow(
         self,
@@ -510,43 +806,48 @@ class InteractiveController:
         Fresh mode (``resume=False``, default): plan the caller-provided ``steps``
         as a brand-new continuation with a new ``request_id`` / ``task_id``.
 
-        Resume mode (``resume=True``): slice the prior plan's steps to
-        ``prior_steps[completed_step_count:]`` and plan only the remaining steps.
-        Fully-completed steps are skipped; the step interrupted mid-execution is
-        re-run from its start (never resumed mid-skill). Requires a definite prior
-        terminal (STOPPED / SUCCEEDED / FAILED); ``UNKNOWN`` is still refused.
+        Resume mode (``resume=True``) is unavailable in this baseline because it
+        has no server-owned continuation admission contract. Client-side slicing
+        of ``completed_step_count`` is telemetry-based and therefore fails closed.
+
+        Both modes require a definitely canceled prior plan. Success, failure, and
+        unknown-stop states do not authorize continuation.
         """
-        if self._state not in {STOPPED, SUCCEEDED, FAILED}:
-            raise UnknownStopError("SKILL_CANCEL_TIMEOUT", "robot stop state is unknown; refuse to continue")
-        previous_terminal = dict(self._terminal or {})
-        previous_steps = list(self._pending.get("steps", [])) if self._pending else []
-        if resume:
-            if not previous_steps:
-                raise IllegalStateError("ILLEGAL_STATE", "resume requires a prior plan's steps")
-            completed = int((previous_terminal.get("result") or {}).get("completed_step_count", 0))
-            remaining = previous_steps[completed:]
-            if not remaining:
+        with self._state_lock:
+            if self._state != STOPPED:
+                raise UnknownStopError("SKILL_CANCEL_TIMEOUT", "robot stop state is unknown; refuse to continue")
+            previous_terminal = dict(self._terminal or {})
+            result = previous_terminal.get("result") or {}
+            canceled_terminal = (
+                previous_terminal.get("goal_status") == GOAL_CANCELED
+                and result.get("success") is False
+                and result.get("error_code") == "SKILL_CANCELLED"
+            )
+            if not canceled_terminal:
+                raise UnknownStopError("SKILL_CANCEL_TIMEOUT", "robot stop state is unknown; refuse to continue")
+            if resume:
                 raise IllegalStateError(
-                    "PLAN_ALREADY_COMPLETE",
-                    f"prior plan already completed all {len(previous_steps)} step(s); nothing to resume",
+                    "SKILL_CONTINUATION_UNAVAILABLE",
+                    "resume requires a server-owned continuation admission contract",
                 )
-            steps_to_plan = remaining
-            resumed_from_step = completed
-        else:
             if not steps:
                 raise IllegalStateError("ILLEGAL_STATE", "non-resume continuation requires steps")
             steps_to_plan = steps
-            resumed_from_step = None
-        self._fresh_status = None
-        self._fresh_view = None
-        self._fresh_identity = None
-        self._pending = None
-        self._confirmed = None
-        self._state = IDLE
-        self.discover()
-        presentation = self.prepare_workflow(raw_command, steps_to_plan)
+            self._fresh_status = None
+            self._fresh_view = None
+            self._fresh_identity = None
+            self._pending = None
+            self._confirmed = None
+            self._stop_requested.clear()
+            self._state = STARTING
+        try:
+            self.discover()
+            presentation = self.prepare_workflow(raw_command, steps_to_plan)
+        except Exception:
+            with self._state_lock:
+                self._clear_operation()
+                self._state = STOPPED
+            raise
         presentation["continues_from"] = previous_terminal
         presentation["resume"] = resume
-        if resumed_from_step is not None:
-            presentation["resumed_from_step"] = resumed_from_step
         return presentation

@@ -13,11 +13,13 @@ from threading import RLock
 import rclpy
 from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
+from rclpy.action.server import GoalEvent
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from embodied_agent.agent_plan_store import AgentPlan, AgentPlanError, AgentPlanStore
+from embodied_common.agent_terminal_contract import stable_agent_execution_error_code
 from embodied_common.dispatch_binding import new_binding, workflow_step
 from embodied_common.skill_request import derive_skill_task_id
 from embodied_common.workflow_contracts import (
@@ -52,48 +54,6 @@ class _WorkflowStateUnknown(AgentPlanError):
 
 class _ExecutionAlreadyActive(AgentPlanError):
     """A retry observed an existing execution and must not mutate its state."""
-
-
-_STABLE_EXECUTION_CODES = {
-    "CAPABILITY_NOT_READY",
-    "CONTROL_MODE_MISMATCH",
-    "GATEWAY_FINALIZATION_FAILED",
-    "GOAL_NOT_FOUND",
-    "MOTION_NOT_AUTHORIZED",
-    "SKILL_BUSY",
-    "SKILL_CANCELLED",
-    "SKILL_CANCEL_TIMEOUT",
-    "SKILL_DISPATCH_NOT_AUTHORIZED",
-    "SKILL_EXECUTION_BUSY",
-    "SKILL_EXECUTOR_IDENTITY_MISMATCH",
-    "SKILL_LIMIT_VIOLATION",
-    "SKILL_REGISTRY_EPOCH_MISMATCH",
-    "SKILL_REGISTRY_NOT_READY",
-    "SKILL_REGISTRY_VERSION_MISMATCH",
-    "SKILL_REQUEST_ID_CONFLICT",
-    "SKILL_SCHEMA_INVALID",
-    "SKILL_SNAPSHOT_DIGEST_MISMATCH",
-    "SKILL_SNAPSHOT_NOT_RETAINED",
-    "SKILL_TASK_BUDGET_MISMATCH",
-    "SKILL_TASK_DEADLINE_EXPIRED",
-    "SKILL_WORKFLOW_DIGEST_MISMATCH",
-    "SKILL_WORKFLOW_LEASE_MISMATCH",
-    "SKILL_WORKFLOW_STEP_MISMATCH",
-    "TIMEOUT_EXCEEDS_POLICY",
-}
-
-
-def _stable_execution_error_code(error_code: str) -> str:
-    code = str(error_code).strip()
-    if code in _STABLE_EXECUTION_CODES:
-        return code
-    if code == "CANCEL_CLEANUP_TIMEOUT":
-        return "SKILL_CANCEL_TIMEOUT"
-    if "TIMEOUT" in code:
-        return "SKILL_TASK_DEADLINE_EXPIRED"
-    if "EXECUTOR" in code and ("IDENTITY" in code or "VERSION" in code):
-        return "SKILL_EXECUTOR_IDENTITY_MISMATCH"
-    return "CAPABILITY_NOT_READY"
 
 
 class AgentPlanNode(Node):
@@ -202,6 +162,13 @@ class AgentPlanNode(Node):
     @staticmethod
     def _handle_cancel(_goal_handle) -> CancelResponse:
         return CancelResponse.ACCEPT
+
+    @staticmethod
+    def _mark_replayed_canceled(goal_handle) -> None:
+        """Move a fresh idempotent replay through ROS 2's canceling state."""
+        if not goal_handle.is_cancel_requested:
+            goal_handle._update_state(GoalEvent.CANCEL_GOAL)  # noqa: SLF001
+        goal_handle.canceled()
 
     @staticmethod
     def _wait_future(future, timeout_sec: float) -> bool:
@@ -561,14 +528,14 @@ class AgentPlanNode(Node):
             raise AgentPlanError("SKILL_CANCELLED", getattr(result, "message", "skill was canceled"))
         if terminal_status == GoalStatus.STATUS_ABORTED:
             raise AgentPlanError(
-                _stable_execution_error_code(getattr(result, "error_code", "")),
+                stable_agent_execution_error_code(getattr(result, "error_code", "")),
                 getattr(result, "message", "") or "skill action was aborted",
             )
         if result is None or terminal_status != GoalStatus.STATUS_SUCCEEDED:
             raise _ChildStateUnknown("SKILL_CANCEL_TIMEOUT", "skill terminal result is unknown")
         if not result.success:
             raise AgentPlanError(
-                _stable_execution_error_code(result.error_code if result is not None else ""),
+                stable_agent_execution_error_code(result.error_code if result is not None else ""),
                 result.message if result is not None else "skill result missing",
             )
         actual_identity = (
@@ -632,11 +599,13 @@ class AgentPlanNode(Node):
         result = ExecuteAgentPlan.Result()
         completed = 0
         plan = None
+        execution = None
         binding = None
         workflow_started = False
         try:
             status = self._gateway_status()
             with self._store_lock:
+                plan = self._store.get_for_execution(request.plan_token)
                 execution = self._store.accept_execution(
                     plan_token=request.plan_token,
                     confirmation_token=request.confirmation_token,
@@ -660,6 +629,8 @@ class AgentPlanNode(Node):
                 result.actual_registry_digest = plan.registry_digest
                 if result.success:
                     goal_handle.succeed()
+                elif result.error_code == "SKILL_CANCELLED":
+                    self._mark_replayed_canceled(goal_handle)
                 else:
                     goal_handle.abort()
                 return result
@@ -745,7 +716,7 @@ class AgentPlanNode(Node):
                     finalization_converged = False
             if not finalization_converged:
                 exc = AgentPlanError("SKILL_CANCEL_TIMEOUT", "workflow finalization state is unknown")
-            if plan is not None and finalization_converged:
+            if execution is not None and finalization_converged:
                 with self._store_lock, suppress(AgentPlanError):
                     self._store.mark_terminal(
                         plan_token=plan.plan_token,
