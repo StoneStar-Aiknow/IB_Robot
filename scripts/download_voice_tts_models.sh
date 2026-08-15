@@ -249,8 +249,6 @@ manifest["bundle"] = {
     },
 }
 
-ubuntu_onnx_deployment["fingerprint"] = fingerprint
-
 manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 print(f"manifest written to {manifest_path}")
 print(f"bundle uuid: {bundle_uuid}")
