@@ -359,10 +359,11 @@ STATIC_BACKEND_DESCRIPTORS: Mapping[str, BackendDescriptor] = MappingProxyType(
             name="torch",
             supported_policy_families=frozenset({"act", "diffusion", "pi05", "smolvla"}),
             supported_model_families=frozenset(
-                {"ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo"}
+                {"ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo", "zipvoice"}
             ),
             conformance_evidence=_policy_evidence("act", "diffusion", "pi05", "smolvla")
-            | _perception_evidence("ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo"),
+            | _perception_evidence("ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo")
+            | _generic_evidence("zipvoice"),
             target_validator=_validate_torch,
         ),
         "ascend": BackendDescriptor(

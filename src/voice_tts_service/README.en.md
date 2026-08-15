@@ -33,6 +33,7 @@ backend fallback, or runtime inference through SSH.
 | TTS plugin | `voice_tts_service/voice_tts_service/model_service_plugin.py` |
 | Audio playback node | `voice_tts_service/voice_tts_service/audio_playback_node.py` |
 | 310P adapter | `voice_tts_service/zipvoice_310p_adapter.py` |
+| ONNX adapter (Ubuntu) | `voice_tts_service/zipvoice_onnx_adapter.py` |
 | Bundle packager | `voice_tts_service/package_zipvoice_310p.py` |
 | Debug launch | `launch/voice_tts.launch.py` |
 | Console entry | `model_service_node = inference_service.model_service_node:main` |
@@ -54,6 +55,15 @@ export ROS_DOMAIN_ID=42
 ros2 launch voice_tts_service voice_tts.launch.py \
   bundle_path:=/path/to/zipvoice-bundle \
   deployment:=ascend_310p
+```
+
+Ubuntu hosts can use the ONNX backend (onnxruntime + CPU Vocos) without Ascend hardware:
+
+```bash
+source .shrc_local
+ros2 launch voice_tts_service voice_tts.launch.py \
+  bundle_path:=/path/to/zipvoice-bundle \
+  deployment:=ubuntu_onnx
 ```
 
 ## 3. Data Flow

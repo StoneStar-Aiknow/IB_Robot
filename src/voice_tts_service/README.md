@@ -37,6 +37,7 @@ ZipVoice deployment，返回一个或多个可独立播放的单声道 WAV PCM16
 | TTS plugin | `voice_tts_service/voice_tts_service/model_service_plugin.py` |
 | 音频播放节点 | `voice_tts_service/voice_tts_service/audio_playback_node.py` |
 | 310P adapter | `voice_tts_service/zipvoice_310p_adapter.py` |
+| ONNX adapter (Ubuntu) | `voice_tts_service/zipvoice_onnx_adapter.py` |
 | 模型 bundle 工具 | `voice_tts_service/package_zipvoice_310p.py` |
 | 调试 launch | `launch/voice_tts.launch.py` |
 | 控制台入口 | `model_service_node = inference_service.model_service_node:main` |
@@ -58,6 +59,15 @@ export ROS_DOMAIN_ID=42
 ros2 launch voice_tts_service voice_tts.launch.py \
   bundle_path:=/path/to/zipvoice-bundle \
   deployment:=ascend_310p
+```
+
+Ubuntu 主机可使用 ONNX 后端（onnxruntime + CPU Vocos），无需 Ascend 硬件：
+
+```bash
+source .shrc_local
+ros2 launch voice_tts_service voice_tts.launch.py \
+  bundle_path:=/path/to/zipvoice-bundle \
+  deployment:=ubuntu_onnx
 ```
 
 ## 3. 数据流
@@ -185,6 +195,15 @@ bundle 必须满足：
 - `model.kind` 为 `generic`。
 - `model.family` 为 `zipvoice`。
 - `deployment` 必须是 manifest 中存在的命名 deployment。
+
+### 5.1 已验证的 deployment
+
+| deployment | backend | 后端运行时 | 说明 |
+| --- | --- | --- | --- |
+| `ascend_310p` | ascend | ACL + OM | 310P 上编排 Text Encoder OM、Flow Decoder OM 和 CPU Vocos |
+| `ubuntu_onnx` | torch | onnxruntime + CPU | Ubuntu 主机用 onnxruntime 加载上游 ONNX 模型，复用 310P bundle 的 tokens/Vocos/prompt 资产 |
+
+`ubuntu_onnx` deployment 的 ONNX 模型从 [k2-fsa/ZipVoice](https://github.com/k2-fsa/ZipVoice) 上游获取（ModelScope 镜像），通过 `scripts/download_voice_tts_models.sh` 下载。
 
 manifest 的 bundle digest 和 deployment fingerprint 用于结构身份与部署一致性，不读取模型文件内容，
 也不提供运行时防篡改。310P 打包工具会在复制前校验已知来源的 OM、Vocos checkpoint、token table
