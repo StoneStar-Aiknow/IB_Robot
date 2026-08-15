@@ -77,6 +77,91 @@ class CodeReviewer:
             break
         return checks
 
+    @staticmethod
+    def _build_ai_metadata_checks(pr: dict, commits: list[dict]) -> list[dict]:
+        """Flag incomplete or inconsistent openEuler AI contribution metadata."""
+        body = pr.get("body") or ""
+        commit_models = set()
+        for commit in commits:
+            message = commit.get("commit", {}).get("message", "")
+            for line in message.splitlines():
+                if not line.strip().startswith("Co-Authored-By:"):
+                    continue
+                value = line.partition(":")[2].strip()
+                if value and not ("<" in value and ">" in value):
+                    commit_models.add(value)
+
+        ai_declared = "[x] 是" in body.lower() or "[x] yes" in body.lower()
+        if not ai_declared and not commit_models:
+            return []
+
+        required_patterns = {
+            "Agent platform/version": r"Agent平台信息|Agent\s*(?:platform|tool)",
+            "model name/version": r"模型信息|\bModel\b",
+            "Prompt summary": r"Prompt摘要|Prompt\s*Summary",
+            "human review": r"人工审查|human\s*review",
+            "third-party materials/licenses": r"第三方材料|third[- ]party\s*materials?",
+        }
+        missing_fields = [
+            name for name, pattern in required_patterns.items() if re.search(pattern, body, re.IGNORECASE) is None
+        ]
+        checks = []
+        if missing_fields:
+            checks.append(
+                {
+                    "id": "ai_disclosure_incomplete",
+                    "severity": "error",
+                    "blocking_until_reviewed": True,
+                    "file": "PR description",
+                    "message": "AI participation is indicated, but the PR disclosure is missing: "
+                    + ", ".join(missing_fields),
+                }
+            )
+
+        model_match = re.search(
+            r"(?:模型信息\s*(?:\(Model\))?|\bModel\b)\s*[:：]\s*([^\n]+)",
+            body,
+            re.IGNORECASE,
+        )
+        pr_model = model_match.group(1).strip() if model_match else ""
+        if "/" in pr_model or any("/" in model for model in commit_models):
+            checks.append(
+                {
+                    "id": "ai_model_provider_prefix",
+                    "severity": "error",
+                    "blocking_until_reviewed": True,
+                    "file": "PR description and commit messages",
+                    "message": "AI model metadata must contain only the model name and version, without provider prefixes.",
+                }
+            )
+        if not commit_models:
+            checks.append(
+                {
+                    "id": "ai_commit_metadata_missing",
+                    "severity": "error",
+                    "blocking_until_reviewed": True,
+                    "file": "commit messages",
+                    "message": (
+                        "The PR discloses AI participation, but no commit contains "
+                        "Co-Authored-By: <model name and version>."
+                    ),
+                }
+            )
+        elif not pr_model or commit_models != {pr_model}:
+            checks.append(
+                {
+                    "id": "ai_model_metadata_mismatch",
+                    "severity": "error",
+                    "blocking_until_reviewed": True,
+                    "file": "PR description and commit messages",
+                    "message": (
+                        f"PR model disclosure ({pr_model or 'missing'}) must exactly match all Co-Authored-By values "
+                        f"({', '.join(sorted(commit_models))})."
+                    ),
+                }
+            )
+        return checks
+
     def extract_pr_info(self, pr_number: int, include_comments: bool = True) -> dict:
         """提取适合 review 场景的完整 PR 上下文"""
         pr = self.client.get_pull_request(pr_number)
@@ -87,6 +172,7 @@ class CodeReviewer:
         additions = sum(f.get("additions", 0) for f in files)
         deletions = sum(f.get("deletions", 0) for f in files)
         mandatory_review_checks = self._build_mandatory_review_checks(files)
+        mandatory_review_checks.extend(self._build_ai_metadata_checks(pr, commits))
 
         changed_files = []
         for f in files:

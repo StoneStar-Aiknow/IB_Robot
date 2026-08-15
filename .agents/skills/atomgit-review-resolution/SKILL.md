@@ -78,15 +78,16 @@ python3 review_resolution.py --resume ./tmp/ib_robot_pr_123_review_resolution_<t
 
 **当前实现的元数据绑定工作流**:
 
-1. 在写文件前读取 PR `base.sha`、`head.sha`、`head.ref`、`head.repo`；要求本地 `HEAD == head.sha`，且 `base.sha` 是 HEAD 的祖先。
-2. 通过 SDK 的 PR 作用域全量评论接口验证每个 `comment_id` 确实属于目标 PR，并保留 `discussion_id` 等元数据；校验发生在任何本地历史重写前。
-3. 先校验全部 fixes；只有存在 code fix 时才要求 index 和 tracked worktree 均干净。纯 `reply_only` 批次不依赖本地 Git 状态。
-4. `code_fix.original_code` 必须非空且在文件中恰好匹配一次。同一文件多项修复默认拒绝；唯一例外是同一 target 的多个 `delete_lines`，它们会合并行号并基于同一快照一次应用。
-5. 按每项解析后的 `fixup_target` SHA 分组，逐组以 literal pathspec 执行 `git add -- <paths>` 和 `git commit --fixup=<sha>`，再仅对不可变 `base.sha` 执行一次 autosquash。同一文件跨多个目标时拒绝并要求拆批。
-6. `base.sha..HEAD` 中存在 merge commit 时拒绝 autosquash，避免普通 rebase 静默线性化 PR 拓扑。
-7. 异常、KeyboardInterrupt、SIGINT/SIGTERM/SIGHUP 会触发事务清理：只 abort 本次启动的 rebase，恢复原 HEAD/index，以及文件内容、存在状态和 mode。
-8. 只接受一个 remote 上唯一、精确匹配 PR source repository 的 push URL；remote 有多个 pushurl，或多个 remote/URL 都匹配时拒绝。push 和 `ls-remote` 均使用这一 URL，并绑定 `--force-with-lease=<ref>:<old-head-sha>`。
-9. autosquash 后立即原子写入恢复状态，记录 old/new HEAD、精确 URL/ref、回复正文/哈希/marker/discussion/status；远端 ref 验证为新 OID 后才发送修复完成回复。
+1. 在写文件前检查 PR 的 openEuler AI 披露和目标 commit：模型只记录名称及版本，不携带 provider 前缀；PR 模型必须与本次真实 `--ai-model` 一致，每个将接收 AI 修复的目标 commit 必须已有相同的 `Co-Authored-By` trailer。缺失时先调用 `ibrobot-git-flow` 规范化 commit message 和 PR 元数据；不得让 autosquash 把 AI 修改折入一个未披露 AI 参与的 commit。
+2. 在写文件前读取 PR `base.sha`、`head.sha`、`head.ref`、`head.repo`；要求本地 `HEAD == head.sha`，且 `base.sha` 是 HEAD 的祖先。
+3. 通过 SDK 的 PR 作用域全量评论接口验证每个 `comment_id` 确实属于目标 PR，并保留 `discussion_id` 等元数据；校验发生在任何本地历史重写前。
+4. 先校验全部 fixes；只有存在 code fix 时才要求 index 和 tracked worktree 均干净。纯 `reply_only` 批次不依赖本地 Git 状态。
+5. `code_fix.original_code` 必须非空且在文件中恰好匹配一次。同一文件多项修复默认拒绝；唯一例外是同一 target 的多个 `delete_lines`，它们会合并行号并基于同一快照一次应用。
+6. 按每项解析后的 `fixup_target` SHA 分组，逐组以 literal pathspec 执行 `git add -- <paths>` 和 `git commit --fixup=<sha>`，再仅对不可变 `base.sha` 执行一次 autosquash。同一文件跨多个目标时拒绝并要求拆批。
+7. `base.sha..HEAD` 中存在 merge commit 时拒绝 autosquash，避免普通 rebase 静默线性化 PR 拓扑。
+8. 异常、KeyboardInterrupt、SIGINT/SIGTERM/SIGHUP 会触发事务清理：只 abort 本次启动的 rebase，恢复原 HEAD/index，以及文件内容、存在状态和 mode。
+9. 只接受一个 remote 上唯一、精确匹配 PR source repository 的 push URL；remote 有多个 pushurl，或多个 remote/URL 都匹配时拒绝。push 和 `ls-remote` 均使用这一 URL，并绑定 `--force-with-lease=<ref>:<old-head-sha>`。
+10. autosquash 后立即原子写入恢复状态，记录 old/new HEAD、精确 URL/ref、回复正文/哈希/marker/discussion/status；远端 ref 验证为新 OID 后才发送修复完成回复。
 
 **回复评论时序**：代码修复批次只有在 source branch 推送并验证成功后才发送“已修复”回复；本地成功但未推送时返回 `pending_push`，不伪装闭环。每条远端回复后都会原子 checkpoint；恢复时先按隐藏事务 marker/正文哈希对账，只发送 `pending` 项。纯 `reply_only` 批次也使用同一持久化回复账本。
 

@@ -20,13 +20,14 @@
 
 **当前实现的工作流**:
 
-1. 从 PR API 读取不可变 `base.sha`、开始处理时的 `head.sha`、source branch/repository；本地 `HEAD` 必须等于 `head.sha`，且 base 必须是 HEAD 的祖先。
-2. 任何本地改写前验证所有 `comment_id` 属于目标 PR，并拒绝 `base.sha..HEAD` 中的 merge commit。
-3. 按 fixes 中逐项 `fixup_target` 解析后的 SHA 分组；每组使用 `GIT_LITERAL_PATHSPECS=1 git add -- <paths>`、`git commit --fixup=<sha>`，不会把 pathspec magic 展开到其他路径。
-4. `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <base-sha>`：所有临时 fixup 创建后只执行一次 autosquash。
-5. 无 `--push` 时保存原子状态并返回 `pending_push`（退出码 2），不回复评论；用 `--resume <state.json>` 继续。
-6. 有 `--push` 时执行 `git push --force-with-lease=refs/heads/<branch>:<old-head-sha> <exact-push-url> HEAD:refs/heads/<branch>`；`ls-remote` 使用同一 URL 验证远端 ref 后才回复。
-7. 每条回复后原子更新状态；部分失败返回 `pending_replies`，恢复只发送 pending 条目。
+1. 先确认 PR 的 Model 披露只含模型名称及版本、不含 provider 前缀，与本次 `--ai-model` 一致，并确认每个 `fixup_target` 已包含相同的 `Co-Authored-By`。若缺失，先使用 `ibrobot-git-flow` 规范化 commit message 和 PR 描述。
+2. 从 PR API 读取不可变 `base.sha`、开始处理时的 `head.sha`、source branch/repository；本地 `HEAD` 必须等于 `head.sha`，且 base 必须是 HEAD 的祖先。
+3. 任何本地改写前验证所有 `comment_id` 属于目标 PR，并拒绝 `base.sha..HEAD` 中的 merge commit。
+4. 按 fixes 中逐项 `fixup_target` 解析后的 SHA 分组；每组使用 `GIT_LITERAL_PATHSPECS=1 git add -- <paths>`、`git commit --fixup=<sha>`，不会把 pathspec magic 展开到其他路径。
+5. `GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash <base-sha>`：所有临时 fixup 创建后只执行一次 autosquash。
+6. 无 `--push` 时保存原子状态并返回 `pending_push`（退出码 2），不回复评论；用 `--resume <state.json>` 继续。
+7. 有 `--push` 时执行 `git push --force-with-lease=refs/heads/<branch>:<old-head-sha> <exact-push-url> HEAD:refs/heads/<branch>`；`ls-remote` 使用同一 URL 验证远端 ref 后才回复。
+8. 每条回复后原子更新状态；部分失败返回 `pending_replies`，恢复只发送 pending 条目。
 
 ## 完整示例
 

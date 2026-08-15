@@ -23,19 +23,20 @@ Read only the references needed for the current step:
 
 | Purpose | Reference |
 |---------|-----------|
-| IB_Robot 专项审查要求（lerobot gitlink / README 联动 / Verification 门禁 / pre-commit 信任） | `references/ibrobot-mandatory-checks.md` |
+| IB_Robot 专项审查要求（lerobot gitlink / README 联动 / Verification / AI 元数据 / pre-commit 信任） | `references/ibrobot-mandatory-checks.md` |
 | API 参考与 issues.json 格式（提取上下文、提交结果、字段说明） | `references/api-and-issues-format.md` |
 
 Do not expose these references as separate skills.
 
 ## IB_Robot 专项审查要求（摘要）
 
-在 IB_Robot 仓库做 review 时，必须遵守以下 4 项专项要求（详细规则见 `references/ibrobot-mandatory-checks.md`）：
+在 IB_Robot 仓库做 review 时，必须遵守以下 5 项专项要求（详细规则见 `references/ibrobot-mandatory-checks.md`）：
 
 1. **`libs/lerobot` gitlink 强制检查（阻塞性）**：每个 PR 都必须检查 `libs/lerobot` 是否发生 gitlink 指针变化；违规指针变更应提交 severity=error 的阻塞性 issue。
 2. **README / 文档联动检查**：根据变更是否影响用户可见的使用方式决定是否要求同步更新文档，不机械要求所有 PR 都改 README。
 3. **依赖 / setup / build 变更的 Verification 强制门禁**：修改 `package.xml` 依赖声明或全局 setup/build 流程文件时，PR 描述中的双平台 Docker Verification 必填；review 默认只检查声明，不自动执行验证。
 4. **禁止本地重复执行 pre-commit 已覆盖的检查**：信任 pre-commit 已通过的 ruff/format；不要本地复跑 lint/build；静态阅读 diff 始终允许。
+5. **openEuler AI 元数据检查（阻塞性）**：AI 参与时检查 PR 的 Tool/Model/Prompt Summary、人工审查、第三方材料/许可证披露，以及 commit `Co-Authored-By` 与 PR 模型是否完全一致。
 
 ## 快速使用
 

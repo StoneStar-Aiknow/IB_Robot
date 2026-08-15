@@ -173,6 +173,8 @@ When submitting a PR that adds or modifies skills:
 - [ ] No `__pycache__` or temporary files staged
 - [ ] PR description includes Verification section (if scripts/ files changed)
 - [ ] Follow ibrobot-git-flow commit conventions (≤ 5 commits, DCO sign-off)
+- [ ] AI-assisted commits include the real model name/version without a provider prefix in `Co-Authored-By`, before `Signed-off-by`
+- [ ] PR disclosure records Agent platform/version, matching model/version, Prompt summary, human review, and third-party material/license status
 
 ## Common IB-Robot Specific Mistakes
 

@@ -5,6 +5,7 @@
 - 在 IB_Robot 仓库做 PR review 时
 - 提取 PR 上下文后，看到 `.pr.mandatory_review_checks` 含 `lerobot_gitlink_changed` 时
 - 判断 PR 是否触发双平台 Docker Verification 门禁时
+- PR 或 commit 表明存在 AI 辅助贡献时
 
 ## 1. `libs/lerobot` gitlink 强制检查（阻塞性）
 
@@ -73,7 +74,21 @@
 - "review / 审查 / 帮我看看 PR"本身不等于授权执行验证。禁止审查者代替开发者运行 `ibrobot-docker-verify` 或 `ibrobot-docker-verify-oee` 来补齐 PR 描述；只有当用户在当前请求中明确要求 agent 实际执行验证（例如"你来跑一下 Ubuntu/openEuler Docker 验证""帮我实际验证 setup/build"）时，才调用对应验证 skill。
 - 如果 PR 描述缺少任一平台验证说明，或只给出命令但没有结果，或验证没有覆盖 setup/build 两个阶段，都应视为**阻塞性 review 问题**，要求开发者补充。
 
-## 4. 禁止本地重复执行 pre-commit 已覆盖的检查
+## 4. openEuler AI 贡献元数据检查（阻塞性）
+
+- 当 PR 声明 AI 参与，或任一 commit 包含 `Co-Authored-By` 时，必须检查 PR 正文是否完整披露：
+  Agent 平台及版本、模型名称及版本、Prompt 摘要、人工审查情况、第三方材料来源和许可证情况。
+- 每个 AI-assisted commit 必须包含 `Co-Authored-By: <AI 模型名称及版本>`，且所有值必须与 PR
+  的模型信息完全一致。缺失、占位值或不一致均为阻塞性问题。
+- 模型元数据只记录模型名称及版本（如 `gpt-5.6-sol`），不得携带 `xunxing/` 等 provider 前缀。
+- 检查贡献者是否声明已进行人工审查，并关注无法解释或维护的输出、许可证不兼容材料、商业秘密、
+  个人信息、敏感数据、私有代码、内部文档和未公开漏洞信息。
+- 元数据完整不代表代码自动合规；仍需按风险检查正确性、安全性、许可证和必要 Verification。
+- 完整规则见 [openEuler 社区生成式AI工具使用与开源贡献策略](https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/)。
+
+任一必填披露缺失，或 PR/commit 模型不一致时，应提交 `severity=error` 的阻塞性 review issue。
+
+## 5. 禁止本地重复执行 pre-commit 已覆盖的检查
 
 - IB_Robot 的 `.pre-commit-config.yaml` 已把 `ruff --fix` 与 `ruff-format` 作为强制 pre-commit hook，且 `.git/hooks/pre-commit` 随仓库安装；开发者 `git commit` 时必然已通过 ruff 校验，**PR 上线代码不会再有 `ruff check` / `ruff format` 报错**。
 - 因此 review 时**禁止**在本地做以下动作（属于重复劳动，浪费上下文且无新增信息）：

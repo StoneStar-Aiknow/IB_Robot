@@ -56,6 +56,22 @@ IB_Robot/
 Signed-off-by: Name <email>  # 必须，使用 git commit -s
 ```
 
+### AI 辅助贡献规范（openEuler）
+
+当代码、脚本、文档、配置或元数据主要由生成式 AI 生成或自动处理时：
+
+- 人类贡献者必须逐项审查并对正确性、安全性、许可证合规和可维护性承担最终责任。
+- Commit Message 必须在 `Signed-off-by` 之前包含
+  `Co-Authored-By: <AI 模型名称及版本>`；只记录模型本身（如 `gpt-5.6-sol`），不携带
+  `provider/` 前缀，且必须与 PR 披露完全一致。
+- PR 必须披露 Agent 平台及版本、模型名称及版本、Prompt 摘要、人工审查情况，以及第三方材料和
+  许可证信息（没有第三方材料时也要明确说明）。
+- 禁止提交无法解释或维护的 AI 输出、未经授权或许可证不兼容的第三方材料，以及商业秘密、
+  个人信息、敏感数据、私有代码、内部文档或未公开漏洞信息。
+- 必须完成与变更风险匹配的测试、构建、许可证和安全检查；不得由 Agent 无人工实质参与地批量提交。
+
+完整政策：<https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/>
+
 ## 关键约定
 
 ### 环境初始化
