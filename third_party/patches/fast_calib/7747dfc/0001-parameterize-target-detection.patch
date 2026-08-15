@@ -17,10 +17,9 @@ index 7e76356..9e0d51f 100755
    string image_path;
    string bag_path;
    string lidar_topic;
-@@ -95,6 +102,17 @@ Params loadParameters(rclcpp::Node::SharedPtr node)
+@@ -95,3 +102,14 @@ Params loadParameters(rclcpp::Node::SharedPtr node)
    node->declare_parameter("delta_height_circles", 0.4);
    node->declare_parameter("min_detected_markers", 3);
-   node->declare_parameter("circle_radius", 0.12);
 +  node->declare_parameter("prefer_vertical_plane", false);
 +  node->declare_parameter("plane_distance_threshold", 0.01);
 +  node->declare_parameter("plane_eps_angle", 0.35);
@@ -32,13 +31,10 @@ index 7e76356..9e0d51f 100755
 +  node->declare_parameter("circle_fit_error_threshold", 0.02);
 +  node->declare_parameter("observation_only", false);
 +  node->declare_parameter("scene_id", string(""));
-   node->declare_parameter("image_path", string("/home/chunran/calib_ws/src/fast_calib/data/image.png"));
-   node->declare_parameter("bag_path", string("/home/chunran/calib_ws/src/fast_calib/data/input.bag"));
-   node->declare_parameter("lidar_topic", string("/livox/lidar"));
-@@ -121,6 +139,17 @@ Params loadParameters(rclcpp::Node::SharedPtr node)
+   node->declare_parameter("circle_radius", 0.12);
+@@ -121,3 +139,14 @@ Params loadParameters(rclcpp::Node::SharedPtr node)
    node->get_parameter_or("delta_height_circles", params.delta_height_circles, 0.4);
    node->get_parameter_or("min_detected_markers", params.min_detected_markers, 3);
-   node->get_parameter_or("circle_radius", params.circle_radius, 0.12);
 +  node->get_parameter_or("prefer_vertical_plane", params.prefer_vertical_plane, false);
 +  node->get_parameter_or("plane_distance_threshold", params.plane_distance_threshold, 0.01);
 +  node->get_parameter_or("plane_eps_angle", params.plane_eps_angle, 0.35);
@@ -50,9 +46,7 @@ index 7e76356..9e0d51f 100755
 +  node->get_parameter_or("circle_fit_error_threshold", params.circle_fit_error_threshold, 0.02);
 +  node->get_parameter_or("observation_only", params.observation_only, false);
 +  node->get_parameter_or("scene_id", params.scene_id, string(""));
-   node->get_parameter_or("image_path", params.image_path, string("/home/chunran/calib_ws/src/fast_calib/data/image.png"));
-   node->get_parameter_or("bag_path", params.bag_path, string("/home/chunran/calib_ws/src/fast_calib/data/input.bag"));
-   node->get_parameter_or("lidar_topic", params.lidar_topic, string("/livox/lidar"));
+   node->get_parameter_or("circle_radius", params.circle_radius, 0.12);
 diff --git a/src/lidar_detect.hpp b/src/lidar_detect.hpp
 index 19bd0fd..1118f95 100644
 --- a/src/lidar_detect.hpp

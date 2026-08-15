@@ -104,6 +104,7 @@ robot:
       base_frame: base_link
       publish_tf: true
       planar_output: false
+      max_future_skew_sec: 0.1
       respawn: true
     nav2_bringup:
       enabled: false
@@ -141,6 +142,7 @@ robot:
           enabled: true
           publish_odom: false
           publish_tf: false
+          cmd_vel_topic: /cmd_vel
     navigation:
       navigation:
         enabled: true
@@ -159,8 +161,11 @@ robot:
           action_name: /navigation/execute
           cancel_service_name: /navigation/cancel_current
           nav2_action_name: /navigate_to_pose
+          nav2_result_timeout: 300.0
           stop_velocity_topic: /cmd_vel_safe
+          cancel_response_timeout: 2.0
         cmd_vel_bridge:
           enabled: true
           publish_odom: false
           publish_tf: false
+          cmd_vel_topic: /cmd_vel_safe

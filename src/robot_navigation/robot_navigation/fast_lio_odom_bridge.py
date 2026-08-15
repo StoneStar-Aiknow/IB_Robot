@@ -14,6 +14,7 @@ from robot_navigation.fast_lio_odom_contract import (
     project_planar_pose,
     transform_twist,
     validate_odometry_sample,
+    validate_odometry_timestamp,
 )
 
 
@@ -32,6 +33,7 @@ class FastLioOdomBridge(Node):
         self.declare_parameter("body_to_base_rotation", [0.0, 0.0, 0.0, 1.0])
         self.declare_parameter("publish_tf", True)
         self.declare_parameter("planar_output", False)
+        self.declare_parameter("max_future_skew_sec", 0.1)
 
         self._source_odom_frame = str(self.get_parameter("source_odom_frame").value)
         self._source_body_frame = str(self.get_parameter("source_body_frame").value)
@@ -47,6 +49,7 @@ class FastLioOdomBridge(Node):
         output_topic = str(self.get_parameter("output_topic").value)
         self._publish_tf = bool(self.get_parameter("publish_tf").value)
         self._planar_output = bool(self.get_parameter("planar_output").value)
+        self._max_future_skew_sec = float(self.get_parameter("max_future_skew_sec").value)
         self._publisher = self.create_publisher(Odometry, output_topic, 10)
         self._broadcaster = TransformBroadcaster(self)
         self._subscription = self.create_subscription(Odometry, source_topic, self._on_odometry, 10)
@@ -73,6 +76,18 @@ class FastLioOdomBridge(Node):
             if error != self._last_error:
                 self.get_logger().error(f"Rejected FAST-LIO odometry: {error}")
                 self._last_error = error
+            return
+
+        stamp_error = validate_odometry_timestamp(
+            message.header.stamp.sec,
+            message.header.stamp.nanosec,
+            now_sec=self.get_clock().now().nanoseconds / 1_000_000_000.0,
+            max_future_skew_sec=self._max_future_skew_sec,
+        )
+        if stamp_error:
+            if stamp_error != self._last_error:
+                self.get_logger().error(f"Rejected FAST-LIO odometry: {stamp_error}")
+                self._last_error = stamp_error
             return
 
         self._last_error = ""

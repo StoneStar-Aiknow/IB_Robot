@@ -9,6 +9,7 @@ from robot_navigation.fast_lio_odom_contract import (
     project_planar_pose,
     transform_twist,
     validate_odometry_sample,
+    validate_odometry_timestamp,
 )
 
 
@@ -27,6 +28,17 @@ def test_non_finite_fast_lio_sample_is_rejected():
     assert (
         validate_odometry_sample("camera_init", "body", [0.0, float("nan"), 0.0, 1.0])
         == "odometry contains non-finite values"
+    )
+
+
+def test_zero_fast_lio_timestamp_is_rejected():
+    assert validate_odometry_timestamp(0, 0, now_sec=10.0) == "odometry timestamp is zero"
+
+
+def test_fast_lio_timestamp_far_in_the_future_is_rejected():
+    assert (
+        validate_odometry_timestamp(12, 0, now_sec=10.0, max_future_skew_sec=0.1)
+        == "odometry timestamp is too far in the future"
     )
 
 

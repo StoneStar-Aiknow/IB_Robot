@@ -3,9 +3,12 @@
 `semantic_mapping` 基于固定安装在底盘上的 D435 同步 RGB-D 数据构建独立、持久化的 3D 语义目标地图。它只依赖
 时间戳对应的 TF，不依赖 FAST-LIO、FAST-LIVO2 或其他 SLAM 的内部地图表示。
 
-## RGB-D LiDAR Dataset Capture
+## RGB-D LiDAR 数据采集
 
-联合采集使用独立 profile，不改变纯雷达 `lekiwi_lidar.yaml`：
+联合采集使用独立 profile。开始前必须已批准 D435i/MID-360 标定，确保
+`~/.ros/ibrobot/calib/current/base_to_front_camera.yaml` 存在且状态为 `approved`。
+
+开发板终端 A 启动采集主链，并在保存结束前保持运行：
 
 ```bash
 ros2 launch robot_config robot.launch.py \
@@ -15,14 +18,21 @@ ros2 launch robot_config robot.launch.py \
 该 profile 直接启用 MID-360、FAST-LIO、slam_toolbox、D435i 和 continuous MCAP 录制，不需要额外选择
 navigation stage 或录制开关，也不支持 episodic 录制。
 
+开发板终端 B 使用键盘遥控完成建图轨迹：
+
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+```
+
 在同一 ROS domain 的 PC 端启动低带宽 RViz 预览：
 
 ```bash
 ros2 launch semantic_mapping lekiwi_semantic_mapping_rviz.launch.py
 ```
 
-310P 在本地将 RealSense RGB 压缩为 8 FPS、JPEG quality 70，并将 MID-360 registered cloud 限制为每帧
-6000 点；PC 只订阅 `/semantic_mapping/preview/*`。RViz 不订阅 raw RGB、depth 或完整 registered cloud。
+开发板在本地将 RealSense RGB 压缩为 8 FPS、JPEG quality 70，并将 MID-360 registered cloud 限制为每帧
+6000 点。PC 侧 RViz 使用 `/semantic_mapping/preview/*` 观察低带宽图像和点云，同时订阅 `/map`、`/scan`、TF
+和 robot description；它不订阅 raw RGB、depth 或完整 registered cloud。
 
 完成同一条建图轨迹后，在 launch 仍运行时执行一个保存命令：
 
@@ -39,7 +49,14 @@ finalizer 只读取这些 pinned bytes，不会重新读取可能已被替换的
 bag、manifest、checksum 和压缩归档，但状态明确为 `calibration_incomplete`，且该 profile 不发布零值
 `base_link -> camera` 替代 TF。
 
-输出位于 `SESSION_ROOT` 指向的目录：
+默认输出目录和归档为：
+
+```text
+~/.ros/ibrobot/semantic_mapping/lekiwi_semantic_mapping_<timestamp>/
+~/.ros/ibrobot/semantic_mapping/lekiwi_semantic_mapping_<timestamp>.tar.gz
+```
+
+当前 session handoff 保存在 `~/.ros/ibrobot/semantic_mapping/current.json`。session 目录包含：
 
 ```text
 bag/*.mcap
@@ -322,17 +339,15 @@ trip、fusion commit 和 end-to-end 的 P50/P95，同时报告 throughput 和 dr
 模式要求 throughput ≥ 1 frame/s。所有 stage-specific conformance 必须先通过。阈值是初始软件 gate，必须在
 目标硬件上记录实际报告后才能 promotion；当前未验证的 `ascend_om` 仍保持 not-ready。
 
-无需 ROS 或真实设备，可使用仓库中的 RealSense RGB-D fixture 运行真实模型验证：
+无需 ROS 或真实设备，可在 IB-Robot 仓库根目录使用 RealSense RGB-D fixture 运行模型验证：
 
 ```bash
-cd /data/Research/3D_semantic/Grounded-SAM-2
-PYTHONPATH=/home/xqw/Research/IB_Robot/src/semantic_mapping \
-  ../venv/bin/python \
-  /home/xqw/Research/IB_Robot/src/semantic_mapping/scripts/verify_rgbd_fixture.py \
-  --fixture /home/xqw/Research/IB_Robot/src/perception_service/test/fixtures/realsense_rgbd_frame \
-  --grounding-model /data/Research/3D_semantic/models/grounding-dino-tiny \
-  --sam-checkpoint /data/Research/3D_semantic/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt \
-  --siglip-model models/siglip2_so400m_patch14_384/assets/model
+source .shrc_local
+python3 src/semantic_mapping/scripts/verify_rgbd_fixture.py \
+  --fixture src/perception_service/test/fixtures/realsense_rgbd_frame \
+  --grounding-model <grounding-dino-model-path> \
+  --sam-checkpoint <sam2-checkpoint-path> \
+  --siglip-model <siglip2-model-path>
 ```
 
 安装感知依赖后，也可验证 ROS 2 节点的同步订阅、TF、持久化和查询服务。先启动节点：
@@ -368,7 +383,7 @@ librealsense 设备 bag 应通过 `realsense2_camera` 的 `rosbag_filename` 参�
 
 ## Local Verification Evidence
 
-The following checks are reproducible without a 310P board:
+The following checks are reproducible without a development board:
 
 ```bash
 source .shrc_local && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q \
@@ -385,4 +400,4 @@ artifact diagnostics when their production contracts are not finalized.
 Migration evidence is represented by `semantic_mapping.migration_evidence`.
 It separates local gates from board-only gates and refuses a production-default
 switch until hardware conformance and timing evidence are present. No local
-test claims 310P ACL execution, OM numerical conformance, or production latency.
+test claims development-board ACL execution, OM numerical conformance, or production latency.

@@ -25,10 +25,14 @@ def validate_solver_workspace(workspace: Path) -> Path:
     ).stdout
     if hashlib.sha256(diff).hexdigest() != PATCH_DIFF_SHA256:
         raise ValueError("FAST-Calib managed diff does not match the pinned contract")
-    executable = workspace / "install" / "fast_calib" / "lib" / "fast_calib" / "fast_calib"
-    if not os.access(executable, os.X_OK):
-        raise ValueError("FAST-Calib executable is missing")
-    return executable
+    candidates = (
+        workspace / "install" / "lib" / "fast_calib" / "fast_calib",
+        workspace / "install" / "fast_calib" / "lib" / "fast_calib" / "fast_calib",
+    )
+    for executable in candidates:
+        if os.access(executable, os.X_OK):
+            return executable
+    raise ValueError("FAST-Calib executable is missing")
 
 
 def _camera_parameters(camera_info_path: Path) -> dict[str, float]:

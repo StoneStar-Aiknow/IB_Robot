@@ -46,8 +46,10 @@ class NavigationCommandServer(Node):
             "global_frame": "map",
             "base_frame": "base_link",
             "nav2_server_timeout": 5.0,
+            "nav2_result_timeout": 300.0,
             "tf_timeout": 1.0,
             "cancel_timeout": 10.0,
+            "cancel_response_timeout": 2.0,
             "linear_stop_threshold": 0.01,
             "angular_stop_threshold": 0.05,
             "stop_stable_duration": 0.5,
@@ -62,6 +64,9 @@ class NavigationCommandServer(Node):
         self.state = NavigationState.IDLE
         self._generation = 0
         self._nav_goal_handle = None
+        self._cancel_sent = False
+        self._cancel_failed = False
+        self._timeout_cancel_requested = False
         self._cancel_requested = threading.Event()
         self._cancel_complete = threading.Event()
         self._stop_confirmed = threading.Event()
@@ -107,8 +112,7 @@ class NavigationCommandServer(Node):
         return GoalResponse.ACCEPT
 
     def _cancel_callback(self, _goal_handle) -> CancelResponse:
-        self._request_cancel()
-        return CancelResponse.ACCEPT
+        return CancelResponse.ACCEPT if self._request_cancel() else CancelResponse.REJECT
 
     def _handle_cancel_current(self, _request, response):
         with self._lock:
@@ -119,22 +123,46 @@ class NavigationCommandServer(Node):
 
         self._request_cancel()
         timeout = float(self.cancel_timeout) + float(self.stop_confirmation_timeout)
-        response.success = self._cancel_complete.wait(timeout=timeout)
-        response.message = (
-            "Navigation canceled and velocity command is stable at zero"
-            if response.success
-            else f"Navigation cancellation did not complete within {timeout:.1f} seconds"
-        )
+        completed = self._cancel_complete.wait(timeout=timeout)
+        with self._lock:
+            cancel_failed = self._cancel_failed
+        response.success = completed and not cancel_failed
+        if response.success:
+            response.message = "Navigation canceled and velocity command is stable at zero"
+        elif cancel_failed:
+            response.message = "Nav2 cancel response was rejected or timed out"
+        else:
+            response.message = f"Navigation cancellation did not complete within {timeout:.1f} seconds"
         return response
 
-    def _request_cancel(self) -> None:
+    def _request_cancel(self) -> bool:
         self._cancel_requested.set()
         with self._lock:
             nav_goal_handle = self._nav_goal_handle
+            if self._cancel_failed:
+                return False
             if self.state not in (NavigationState.IDLE, NavigationState.FAULT):
                 self.state = NavigationState.CANCELING
-        if nav_goal_handle is not None:
-            nav_goal_handle.cancel_goal_async()
+            should_send = nav_goal_handle is not None and not self._cancel_sent
+            if should_send:
+                self._cancel_sent = True
+        if not should_send:
+            return True
+
+        if nav_goal_handle is None:
+            return True
+        response = self._wait_future(nav_goal_handle.cancel_goal_async(), float(self.cancel_response_timeout))
+        if self._cancel_response_accepted(response):
+            return True
+        with self._lock:
+            self._cancel_failed = True
+            self.state = NavigationState.FAULT
+        self._cancel_complete.set()
+        return False
+
+    @staticmethod
+    def _cancel_response_accepted(response) -> bool:
+        return response is not None and bool(getattr(response, "goals_canceling", ()))
 
     def _stop_velocity_callback(self, msg: Twist) -> None:
         with self._lock:
@@ -156,6 +184,9 @@ class NavigationCommandServer(Node):
             generation = self._generation
             self.state = NavigationState.RESOLVING
             self._nav_goal_handle = None
+            self._cancel_sent = False
+            self._cancel_failed = False
+            self._timeout_cancel_requested = False
         self._cancel_requested.clear()
         self._cancel_complete.clear()
         self._stop_confirmed.clear()
@@ -266,14 +297,58 @@ class NavigationCommandServer(Node):
             if generation == self._generation:
                 self._nav_goal_handle = nav_goal_handle
                 self.state = NavigationState.RUNNING
+        result_future = nav_goal_handle.get_result_async()
         if self._cancel_requested.is_set() or goal_handle.is_cancel_requested:
             self.state = NavigationState.CANCELING
-            nav_goal_handle.cancel_goal_async()
-
-        wrapped_result = self._wait_future(nav_goal_handle.get_result_async(), None)
-        if wrapped_result is None:
+            self._request_cancel()
+        if self._cancel_failed:
             result.error_code = ExecuteNavigation.Result.INTERNAL_ERROR
-            result.message = "Nav2 result wait failed"
+            result.message = "Nav2 cancel response was rejected or timed out"
+            goal_handle.abort()
+            self._finish(generation, NavigationState.FAULT)
+            return result
+
+        wrapped_result, cancel_terminal_timeout = self._wait_result_future(
+            result_future,
+            result_timeout=float(self.nav2_result_timeout),
+            cancel_timeout=float(self.cancel_timeout),
+            cancel_requested=self._cancel_requested,
+        )
+        if wrapped_result is None:
+            if self._cancel_failed:
+                result.error_code = ExecuteNavigation.Result.INTERNAL_ERROR
+                result.message = "Nav2 cancel response was rejected or timed out"
+                goal_handle.abort()
+                self._finish(generation, NavigationState.FAULT)
+                return result
+            if cancel_terminal_timeout:
+                result.error_code = ExecuteNavigation.Result.INTERNAL_ERROR
+                result.message = "Nav2 cancel terminal state timed out"
+                goal_handle.abort()
+                self._finish(generation, NavigationState.FAULT)
+                return result
+            self._timeout_cancel_requested = True
+            if not self._request_cancel():
+                result.error_code = ExecuteNavigation.Result.INTERNAL_ERROR
+                result.message = "Nav2 result timed out and cancel failed"
+                goal_handle.abort()
+                self._finish(generation, NavigationState.FAULT)
+                return result
+            wrapped_result, _ = self._wait_result_future(
+                result_future,
+                result_timeout=float(self.cancel_timeout),
+                cancel_timeout=float(self.cancel_timeout),
+                cancel_requested=self._cancel_requested,
+            )
+            if wrapped_result is None:
+                result.error_code = ExecuteNavigation.Result.INTERNAL_ERROR
+                result.message = "Nav2 result and cancel terminal state timed out"
+                goal_handle.abort()
+                self._finish(generation, NavigationState.FAULT)
+                return result
+        if self._cancel_failed:
+            result.error_code = ExecuteNavigation.Result.INTERNAL_ERROR
+            result.message = "Nav2 cancel response was rejected or timed out"
             goal_handle.abort()
             self._finish(generation, NavigationState.FAULT)
             return result
@@ -285,7 +360,9 @@ class NavigationCommandServer(Node):
             self._finish(generation)
             return result
         if wrapped_result.status == GoalStatus.STATUS_CANCELED:
-            return self._complete_cancellation(goal_handle, result, generation)
+            return self._complete_cancellation(
+                goal_handle, result, generation, timeout_origin=self._timeout_cancel_requested
+            )
 
         result.error_code = ExecuteNavigation.Result.NAVIGATION_ABORTED
         result.message = f"Nav2 navigation ended with status {wrapped_result.status}"
@@ -309,17 +386,22 @@ class NavigationCommandServer(Node):
             self._finish(generation, NavigationState.FAULT)
         return result
 
-    def _complete_cancellation(self, goal_handle, result, generation: int):
+    def _complete_cancellation(self, goal_handle, result, generation: int, *, timeout_origin: bool = False):
         self.state = NavigationState.STOPPING
         self._stop_gate.reset()
         self._stop_confirmed.clear()
         if self._stop_confirmed.wait(timeout=float(self.stop_confirmation_timeout)):
-            result.error_code = ExecuteNavigation.Result.NAVIGATION_CANCELED
-            result.message = "Navigation stopped and velocity command is stable at zero"
-            if goal_handle.is_cancel_requested:
-                goal_handle.canceled()
-            else:
+            if timeout_origin:
+                result.error_code = ExecuteNavigation.Result.NAVIGATION_ABORTED
+                result.message = "Navigation timed out but stopped safely"
                 goal_handle.abort()
+            else:
+                result.error_code = ExecuteNavigation.Result.NAVIGATION_CANCELED
+                result.message = "Navigation stopped and velocity command is stable at zero"
+                if goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                else:
+                    goal_handle.abort()
             self._finish(generation)
             self._cancel_complete.set()
         else:
@@ -352,6 +434,26 @@ class NavigationCommandServer(Node):
             return future.result()
         except Exception:
             return None
+
+    @staticmethod
+    def _wait_result_future(future, *, result_timeout: float, cancel_timeout: float, cancel_requested):
+        completed = threading.Event()
+        future.add_done_callback(lambda _future: completed.set())
+        deadline = time.monotonic() + result_timeout
+        cancel_deadline = None
+        while not completed.is_set():
+            now = time.monotonic()
+            if cancel_requested.is_set() and cancel_deadline is None:
+                cancel_deadline = now + cancel_timeout
+            active_deadline = cancel_deadline if cancel_deadline is not None else deadline
+            remaining = active_deadline - now
+            if remaining <= 0.0:
+                return None, cancel_deadline is not None
+            completed.wait(timeout=min(0.1, remaining))
+        try:
+            return future.result(), False
+        except Exception:
+            return None, cancel_deadline is not None
 
     def _wait_for_nav2_server(self) -> bool:
         deadline = time.monotonic() + float(self.nav2_server_timeout)

@@ -60,7 +60,7 @@ _migrate_fast_lio_build_patch() {
 _ensure_fast_calib_patch_stack() {
     local source_dir="$1"
     local patch_dir="$2"
-    local expected_diff_sha256="4192e3430e1ddc3d5a7de6fdeb4d1b6a07d56af1f8359e28810e5f25fdfd5503"
+    local expected_diff_sha256="e5e807e08fa82fefc257ad5c01ca894143d06a210bb9fb83fe65c6956ad71331"
     local actual_diff_sha256
 
     actual_diff_sha256="$(git -C "${source_dir}" diff --cached --binary | sha256sum | cut -d' ' -f1)"

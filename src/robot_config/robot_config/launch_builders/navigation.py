@@ -112,6 +112,7 @@ def _generate_real_navigation(
 
     if "nav_stage" in robot_config:
         _validate_global_localization_provider(robot_config["nav_stage"], navigation_config)
+    _validate_navigation_velocity_contract(robot_config, navigation_config)
 
     logger.info("Navigation enabled, generating nodes...")
     nodes = []
@@ -201,6 +202,22 @@ def _validate_global_localization_provider(nav_stage: str, navigation_config: di
             f"nav_stage '{nav_stage}' must enable exactly one matching global localization provider "
             "(mapping=slam_toolbox, navigation=Nav2 AMCL)"
         )
+
+
+def _validate_navigation_velocity_contract(robot_config: dict[str, Any], navigation_config: dict[str, Any]) -> None:
+    """Reject only the LiDAR dynamic chain that would bypass Collision Monitor."""
+    if robot_config.get("name") != "lekiwi_lidar":
+        return
+    nav2_config = navigation_config.get("nav2_bringup", {})
+    if not nav2_config.get("dyn_avoid_enabled", False):
+        return
+
+    bridge_topic = navigation_config.get("cmd_vel_bridge", {}).get("cmd_vel_topic", "/cmd_vel")
+    stop_topic = navigation_config.get("command_server", {}).get("stop_velocity_topic", "/cmd_vel_safe")
+    if bridge_topic != "/cmd_vel_safe":
+        raise ValueError("dynamic LiDAR navigation must use cmd_vel_topic=/cmd_vel_safe")
+    if stop_topic != bridge_topic:
+        raise ValueError("dynamic LiDAR navigation stop_velocity_topic must match cmd_vel_topic")
 
 
 def _generate_rviz_nodes(rviz_config: dict[str, Any], use_sim: bool = False) -> list:

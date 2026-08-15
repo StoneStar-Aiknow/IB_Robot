@@ -20,7 +20,7 @@ IB-Robot 的 D435i/MID-360 外参标定工具。`robot_config` 是硬件配置�
 ros2 run robot_calibration calib_capture
 ```
 
-该等待没有自动超时。命令会每 15 秒列出尚未收到消息的必需 topic；310P 冷启动较慢时继续等待即可，
+该等待没有自动超时。命令会每 15 秒列出尚未收到消息的必需 topic；开发板冷启动较慢时继续等待即可，
 需要主动放弃时按 `Ctrl+C`。只有八个必需 topic 都实际收到消息后，才会显示 `scene-01` 的录制提示。
 
 原始数据包默认保存到：
@@ -44,10 +44,10 @@ ros2 run robot_calibration calib_capture
 
 有图形环境时，命令会自动打开采集 RViz，同时显示：
 
-- `/calib/preview/image`：310P 本地限频到 8 Hz 并经 JPEG 传输的 RealSense 预览
-- `/calib/preview/cloud`：310P 本地抽稀后的 MID-360 预览点云
+- `/calib/preview/image`：开发板本地限频到 8 Hz 并经 JPEG 传输的 RealSense 预览
+- `/calib/preview/cloud`：开发板本地抽稀后的 MID-360 预览点云
 
-预览节点在 310P 上订阅原始图像和点云，只发布低带宽观察数据。采集 bag 仍然只记录原始八个必需 topic。
+预览节点在开发板上订阅原始图像和点云，只发布低带宽观察数据。采集 bag 仍然只记录原始八个必需 topic。
 预览和 RViz 使用当前工作区已有的默认 ROS 2 domain、RMW 和 QoS 环境，不要求配置额外 DDS 文件、domain bridge
 或新的环境变量。
 
@@ -80,6 +80,10 @@ scene-04-test
 ros2 run robot_calibration calib_process --input <capture-id>.raw.tar
 ```
 
+默认使用当前 IB-Robot 工作区中的 `src/fast_calib` 和默认 merged install 路径
+`install/lib/fast_calib/fast_calib`。修改 FAST-Calib workspace 时，显式使用 `--workspace <workspace>` 或设置
+`FAST_CALIB_WORKSPACE`；不要在文档或代码中固定个人工作区路径。
+
 无需指定 `--output`。默认保存位置为：
 
 ```text
@@ -89,6 +93,14 @@ ros2 run robot_calibration calib_process --input <capture-id>.raw.tar
 
 第一个目录保存完整的中间结果和诊断信息，第二个路径是需要传回板端的候选标定包。
 命令结束后会打印两个绝对路径，以及复制候选标定包回板端的 `scp` 示例。
+
+查看离线叠加并将候选包发送到开发板：
+
+```bash
+xdg-open ~/.ros/ibrobot/calib/process/<capture-id>/test-overlay.png
+scp ~/.ros/ibrobot/calib/candidates/<capture-id>.candidate.tar \
+  <development-board-host>:~/.ros/ibrobot/calib/candidates/
+```
 
 处理流程包括：
 
@@ -117,21 +129,23 @@ calibration_summary.json
 将 `<capture-id>.candidate.tar` 复制回板端后执行：
 
 ```bash
-ros2 run robot_calibration calib_validate --input <capture-id>.candidate.tar
+ros2 run robot_calibration calib_validate \
+  --input ~/.ros/ibrobot/calib/candidates/<capture-id>.candidate.tar
 ```
 
 验证命令会像 `calib_capture` 一样自动启动并管理 RealSense、MID-360、FAST-LIO、静态 TF 和底盘控制链，
 同时启动实时 RGB/LiDAR 投影和验证 RViz。用户可直接在 RViz 中确认传感器是否正常出图。RViz 显示：
 
-- `/calib/preview/image`：310P 本地限频到 8 Hz 并经 JPEG 传输的 RealSense 预览
-- `/calib/preview/cloud`：310P 本地抽稀后的 MID-360 预览点云
+- `/calib/preview/image`：开发板本地限频到 8 Hz 并经 JPEG 传输的 RealSense 预览
+- `/calib/preview/cloud`：开发板本地抽稀后的 MID-360 预览点云
 - `/calib/overlay`：使用候选外参生成、限频到 5 Hz 并经 JPEG 传输的实时叠加图
 
 检查 LiDAR 投影是否与标定板边缘和孔位一致，并观察不同距离和角度下是否存在固定偏移或旋转误差。
 叠加图将 MID-360 最近 3 帧实测点合并显示，并将投影点放大到 2 像素以便观察对应关系。短时累积要求验证期间
 机器人和周围场景保持静止，避免运动造成拖影。重复执行 `calib_validate` 时，第二个实例会直接拒绝启动，避免两套传感器图造成画面闪烁。
 
-验证命令只在临时目录中解包候选标定，不会写入 `~/.ros/ibrobot/calib/current/`，不会批准候选结果，也不会控制底盘。
+验证命令只在临时目录中解包候选标定，并使用候选包内的相机外参和 MID-360 mount 生成实时叠加。它不会写入
+`~/.ros/ibrobot/calib/current/`，不会批准候选结果，也不会控制底盘。
 验证结束时按 `Ctrl+C`。
 
 ### 5. 批准标定
@@ -139,7 +153,8 @@ ros2 run robot_calibration calib_validate --input <capture-id>.candidate.tar
 确认实时投影正确后执行：
 
 ```bash
-ros2 run robot_calibration calib_approve --input <capture-id>.candidate.tar
+ros2 run robot_calibration calib_approve \
+  --input ~/.ros/ibrobot/calib/candidates/<capture-id>.candidate.tar
 ```
 
 批准流程会：
@@ -155,7 +170,8 @@ ros2 run robot_calibration calib_approve --input <capture-id>.candidate.tar
 ~/.ros/ibrobot/calib/current/front_camera_intrinsics.yaml
 ```
 
-`calib_validate` 不会自动执行批准操作。
+`calib_validate` 不会自动执行批准操作。`calib_approve` 也不会查询先前是否运行过实时验证；操作员必须先完成
+PC 侧叠加检查，再执行批准。
 
 当前允许 `serial: unavailable` 是为了完成现场链路验证，不构成设备绑定证据。下次加载
 `lekiwi_sensor_calib` 配置时，`robot_config` 会读取状态为 `approved` 的 `current` 文件，并将其中
@@ -213,19 +229,13 @@ ros2 run robot_calibration calib_check <robot-config.yaml>
 权威 mount 配置，`front_camera_intrinsics` 只来自独立 holdout 和离线 overlay 使用的
 `scene-04-test/camera_info.yaml`。前三个训练场景仍各自使用其导出的 CameraInfo 进行检测；示例文件不作为测量输入。
 
-## 当前验证证据
+## 人工验收要求
 
-2026-08-14 使用 `calib-20260814-013757` 完成 310P 采集、PC 求解、310P 实时叠加和人工批准：
-
-- 三个训练场景联合 RMSE：`0.0173 m`。
-- 独立 `scene-04-test` RMSE：`0.0187 m`。
-- 对应关系裕量：`0.1439 m`。
-- 传感器基线：`0.2252 m`。
-- 实时叠加使用最近 3 帧点云、2 像素投影点和 5 Hz JPEG；验证期间机器人及场景必须静止。
-- 人工确认叠加方向和密度可接受后，候选在 310P 上转为 `approved`。
-
-该次采集未发现 D435i 序列号，产物保留 `serial: unavailable`。它证明当前实验工作流可运行，
-但不满足设备强绑定。当前启动链已能消费批准外参，设备强绑定仍需恢复 serial 门禁后完成。
+- 三个训练场景和独立 `scene-04-test` 均通过数值门限。
+- 离线 `test-overlay.png` 中投影方向和尺度正确。
+- 实时叠加在不同距离和角度下没有固定平移或旋转偏差。
+- 验证期间机器人和场景保持静止，避免最近 3 帧点云累积产生拖影。
+- 候选包中的设备身份、相机外参、MID-360 mount 和相机内参均符合现场设备。
 
 ## 诊断入口
 

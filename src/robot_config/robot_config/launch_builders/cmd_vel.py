@@ -42,8 +42,7 @@ def generate_cmd_vel_nodes(
     if motion_mode_enabled and "navigation_enabled_on_startup" not in motion_mode_config:
         raise ValueError("robot.motion_mode.navigation_enabled_on_startup is required when motion_mode is enabled")
     bridge_publish_odom = bridge_config.get("publish_odom", True)
-    dynamic_enabled = nav_config.get("nav2_bringup", {}).get("dyn_avoid_enabled", False)
-    cmd_vel_topic = "/cmd_vel_safe" if dynamic_enabled else "/cmd_vel"
+    cmd_vel_topic = bridge_config.get("cmd_vel_topic", "/cmd_vel")
 
     bridge_params = {
         "wheel_radius": bridge_config.get("wheel_radius", 0.05),

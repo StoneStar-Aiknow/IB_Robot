@@ -92,6 +92,35 @@ def test_validation_starts_and_stops_the_sensor_graph(tmp_path, monkeypatch):
     assert stopped == [preview, sensor]
 
 
+def test_validation_uses_candidate_mount_from_archive(tmp_path, monkeypatch):
+    archive = tmp_path / "calib-1.candidate.tar"
+    artifact = tmp_path / "base_to_front_camera.candidate.yaml"
+    artifact.write_text("status: candidate\n", encoding="utf-8")
+    mount = tmp_path / "base_to_mid360.yaml"
+    mount.write_text("calibration_version: candidate-mount\n", encoding="utf-8")
+    import tarfile
+
+    with tarfile.open(archive, "w") as target:
+        target.add(artifact, arcname=artifact.name)
+        target.add(mount, arcname=mount.name)
+
+    captured = {}
+    monkeypatch.setattr(validation, "_start_capture_preview", lambda _log_path: None)
+    monkeypatch.setattr(validation, "_start_sensor_calibration", lambda _log_path: None)
+    monkeypatch.setattr(validation, "_stop_owned_process", lambda _process: None)
+    monkeypatch.setattr(validation, "start_viewer", lambda _mode, _log_path: None)
+
+    def fake_run(command, **_kwargs):
+        mount_path = Path(command[command.index("--mount") + 1])
+        captured["mount"] = mount_path.read_text(encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(validation.subprocess, "run", fake_run)
+
+    assert validation.run_validation(archive) == 0
+    assert captured["mount"] == "calibration_version: candidate-mount\n"
+
+
 def test_validation_lock_rejects_a_second_instance(tmp_path):
     lock_path = tmp_path / "validate.lock"
 

@@ -49,6 +49,7 @@ setup(
             # Normalize official FAST-LIO odometry for navigation consumers.
             "fast_lio_odom_bridge = robot_navigation.fast_lio_odom_bridge:main",
             "navigation_command_server = robot_navigation.navigation_command_server:main",
+            "navigation_lifecycle_coordinator = robot_navigation.navigation_lifecycle_coordinator:main",
             "nav_cmd = robot_navigation.nav_cmd:main",
         ],
     },

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ import yaml
 
 from robot_calibration.detector import prepare_detector_parameters
 from robot_calibration.offline import (
+    PATCH_DIFF_SHA256,
     _matrix_from_quaternion,
     _quaternion_from_matrix,
     create_candidate_artifact,
@@ -76,6 +78,15 @@ OBSERVATIONS = {
         ],
     },
 }
+
+
+def test_setup_and_offline_share_fast_calib_patch_hash():
+    repository = Path(__file__).parents[3]
+    setup_script = (repository / "scripts/setup/ros_third_party.sh").read_text(encoding="utf-8")
+    match = re.search(r'local expected_diff_sha256="([0-9a-f]{64})"', setup_script)
+
+    assert match is not None
+    assert match.group(1) == PATCH_DIFF_SHA256
 
 
 def test_offline_module_exposes_cli_help():

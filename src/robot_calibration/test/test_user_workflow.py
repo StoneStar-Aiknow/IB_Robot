@@ -165,6 +165,12 @@ def test_default_paths_do_not_depend_on_current_directory(tmp_path, monkeypatch)
     assert workflow.default_candidate_dir() == tmp_path / ".ros/ibrobot/calib/candidates"
 
 
+def test_default_fast_calib_workspace_is_repository_relative(monkeypatch):
+    monkeypatch.delenv("FAST_CALIB_WORKSPACE", raising=False)
+
+    assert workflow._default_workspace() == workflow._repo_root()
+
+
 def test_default_mount_is_the_active_robot_profile_source():
     assert workflow._default_mount() == (
         Path(__file__).parents[2] / "robot_config/config/hardware/lekiwi_mid360_mount.yaml"

@@ -2,13 +2,27 @@
 
 机器人导航包，集成了语音识别、Nav2 导航、全向轮底盘桥接和定位融合功能。
 
+## 导航 Profile
+
+本包同时提供 RealSense/RTAB-Map 链路和 MID-360 LiDAR 链路，以下描述按 profile 与 stage 区分：
+
+| Profile | `map -> odom` | `odom -> base_link` | 主要速度链 |
+|---|---|---|---|
+| RealSense mapping | RTAB-Map | cmd_vel bridge | `/cmd_vel -> bridge` |
+| RealSense navigation | RTAB-Map localization | EKF | `/cmd_vel -> bridge` |
+| MID-360 mapping | SLAM Toolbox | FAST-LIO odom bridge | `/cmd_vel -> bridge` |
+| MID-360 navigation | AMCL | FAST-LIO odom bridge | `/cmd_vel -> Collision Monitor -> /cmd_vel_safe -> bridge` |
+
+本文中 RTAB-Map、EKF、DWB 和“不启动 AMCL”的章节仅适用于 RealSense navigation profile；RealSense
+mapping 由 cmd_vel bridge 发布 `odom -> base_link`。LiDAR profile 以 `lekiwi_lidar.yaml` 的 resolved stage 配置为准。
+
 ## 功能特性
 
 - **语音控制**: 基于 `voice_asr_service` (sherpa-onnx 本地 ASR) + `voice_control` 关键词匹配的语音导航
 - **导航控制**: Nav2 导航 Goal 客户端，支持语音触发导航，到达后自动触发机械臂推理
 - **底盘桥接**: `cmd_vel_bridge_node` 通过 IK/FK 将标准 `/cmd_vel` 桥接到 ros2_control 全向轮速度指令 (rad/s)，并发布里程计
 - **定位融合**: EKF (robot_localization) 融合底盘里程计速度，RTAB-Map 视觉 SLAM 提供全局定位修正
-- **建图保存**: `save_rtabmap_map` 包装 Nav2 map_saver，将 `/rtabmap/map` 保存为 `map.yaml/map.pgm`
+- **建图保存**: `save_rtabmap_map` 包装 Nav2 map_saver，将 `/rtabmap/map` 默认保存为 `rtabmap.yaml/rtabmap.pgm`
 - **任务联动**: 语音 → 导航 → 到达 → 触发 action_dispatcher 评估，形成完整任务链
 
 ## 系统架构
@@ -55,7 +69,8 @@ map ──(RTAB-Map)──► odom ──(EKF)──► base_link ──► ... 
 | `map → odom` | RTAB-Map | ~1Hz | 视觉 SLAM 全局定位修正 |
 | `odom → base_link` | EKF | 30Hz | 融合底盘里程计速度，平滑输出 |
 
-注意: `cmd_vel_bridge_node` 仅发布 `/odom` 话题（供 EKF 订阅），不发布 TF（`publish_tf: false`）。
+上图只描述 RealSense navigation。该 profile 的 `cmd_vel_bridge_node` 仅发布 `/odom` 话题（供 EKF 订阅），
+不发布 TF（`publish_tf: false`）；RealSense mapping 不启动 EKF，由 bridge 发布 `odom -> base_link`。
 Nav2 使用静态地图与 RTAB-Map 提供的 `map → odom` 定位结果，不并行启动 AMCL，避免多个节点竞争发布同一全局定位 TF。
 
 ## 节点列表
@@ -65,7 +80,12 @@ Nav2 使用静态地图与 RTAB-Map 提供的 `map → odom` 定位结果，不�
 | `voice_control` | 语音关键词匹配 + 导航桥接 (sherpa-onnx 本地 ASR) | `robot_navigation.voice_control` |
 | `nav2_goal_client` | Nav2 导航 Goal 客户端 + 评估触发 | `robot_navigation.nav2_goal_client` |
 | `cmd_vel_bridge_node` | cmd_vel → ros2_control 桥接 + 里程计发布 | `robot_navigation.cmd_vel_bridge_node` |
+| `fast_lio_odom_bridge` | 规范化 FAST-LIO odometry 与 TF | `robot_navigation.fast_lio_odom_bridge` |
+| `navigation_lifecycle_coordinator` | 在 warm-up 后启动 Nav2 lifecycle | `robot_navigation.navigation_lifecycle_coordinator` |
+| `navigation_command_server` | 提供原子导航 Action 与取消服务 | `robot_navigation.navigation_command_server` |
+| `nav_cmd` | 原子导航命令 CLI | `robot_navigation.nav_cmd` |
 | `save_rtabmap_map` | 保存 RTAB-Map OccupancyGrid 地图 | `robot_navigation.save_rtabmap_map` |
+| `save_lidar_map` | 保存 LiDAR OccupancyGrid 地图 | `robot_navigation.save_lidar_map` |
 
 ## 使用入口
 
@@ -73,6 +93,7 @@ Nav2 使用静态地图与 RTAB-Map 提供的 `map → odom` 定位结果，不�
 
 | 你要做什么 | 看哪一节 | 推荐命令入口 |
 |---|---|---|
+| 按现场顺序完成标定、采集、建图和导航 | [现场直接运行流程](#现场直接运行流程) | `robot_config/robot.launch.py` |
 | 复刻建图与导航环境 | [环境复刻](#环境复刻) | `robot_config:=lekiwi_mapping` / `robot_config:=lekiwi_navi` |
 | 跑本包测试 | [测试验证](#测试验证) | `colcon test --packages-select robot_navigation` |
 | 验证完整 Gazebo/Nav2 仿真 | [测试验证](#测试验证) | `NAV_TEST_PROFILE=full colcon test --packages-select robot_config ...` |
@@ -82,6 +103,242 @@ Nav2 使用静态地图与 RTAB-Map 提供的 `map → odom` 定位结果，不�
 | 单独调试导航节点 | [底层调试入口](#底层调试入口) | `ros2 run robot_navigation ...` |
 
 `robot_config` 的优势：YAML 单一数据源，自动启动控制器、相机、TF、定位、Nav2 和导航节点，并通过 `control_mode` 切换运行模式。
+
+## 现场直接运行流程
+
+本节集中给出标定、语义数据采集、RealSense 建图/导航和 LiDAR 建图/导航的可执行命令。后续章节保留
+架构原理、单点验证、底层调试和故障排除说明。
+
+### 1. 环境与构建
+
+开发板和 PC 侧必须网络互通，并使用相同的 `ROS_DOMAIN_ID`。每个新终端按顺序执行：
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=<domain-id>
+source install/setup.sh
+```
+
+代码修改后从仓库根目录使用统一构建脚本：
+
+```bash
+./scripts/build.sh -- --packages-up-to \
+  ibrobot_msgs robot_calibration semantic_mapping robot_navigation robot_config
+```
+
+两种导航模式使用独立 profile、地图和 RViz 预设：
+
+| 模式 | 工作流 | 开发板 profile | PC 侧 RViz |
+|---|---|---|---|
+| RealSense | 建图 | `robot_config:=lekiwi_mapping` | `lekiwi_realsense_mapping_rviz.launch.py` |
+| RealSense | 导航 | `robot_config:=lekiwi_navi control_mode:=teleop` | `lekiwi_realsense_navigation_rviz.launch.py` |
+| LiDAR | 建图 | `robot_config:=lekiwi_lidar nav_stage:=mapping` | `lekiwi_lidar_mapping_rviz.launch.py` |
+| LiDAR | 导航 | `robot_config:=lekiwi_lidar nav_stage:=navigation` | `lekiwi_lidar_navigation_rviz.launch.py` |
+
+RealSense 模式使用 D435 和 RTAB-Map；LiDAR 模式使用 MID-360、FAST-LIO 和 SLAM Toolbox/AMCL。两种模式
+不能混用地图文件或 RViz 预设。
+
+### 2. D435i/MID-360 标定
+
+详细采集要求和产物契约见 [`robot_calibration/README.md`](../robot_calibration/README.md)。标定期间不要同时启动
+导航主链。开发板执行采集：
+
+```bash
+ros2 run robot_calibration calib_capture
+```
+
+需要移动机器人时，在开发板另一个终端运行键盘遥控；每次录制前停稳机器人：
+
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+```
+
+原始包默认写入 `~/.ros/ibrobot/calib/raw/<capture-id>.raw.tar`。将原始包复制到 PC 后处理：
+
+```bash
+ros2 run robot_calibration calib_process \
+  --input <path-to>/<capture-id>.raw.tar
+
+xdg-open ~/.ros/ibrobot/calib/process/<capture-id>/test-overlay.png
+
+scp ~/.ros/ibrobot/calib/candidates/<capture-id>.candidate.tar \
+  <development-board-host>:~/.ros/ibrobot/calib/candidates/
+```
+
+开发板启动候选实时验证，并保持该进程运行：
+
+```bash
+ros2 run robot_calibration calib_validate \
+  --input ~/.ros/ibrobot/calib/candidates/<capture-id>.candidate.tar
+```
+
+PC 侧在同一 ROS domain 中观察实时叠加：
+
+```bash
+ros2 run robot_calibration calib_view --mode validate
+```
+
+确认投影正确后，在开发板结束验证进程并批准候选：
+
+```bash
+ros2 run robot_calibration calib_approve \
+  --input ~/.ros/ibrobot/calib/candidates/<capture-id>.candidate.tar
+```
+
+批准结果写入 `~/.ros/ibrobot/calib/current/`。`calib_validate` 只验证候选，不会自动批准。
+
+### 3. 3D 语义数据采集
+
+该流程同时启动 MID-360、FAST-LIO、SLAM Toolbox、D435i 和连续 MCAP 录制。详细说明见
+[`semantic_mapping/README.md`](../semantic_mapping/README.md)。
+
+开发板终端 A 启动采集主链，并在保存结束前保持运行：
+
+```bash
+ros2 launch robot_config robot.launch.py \
+  robot_config:=lekiwi_semantic_mapping
+```
+
+开发板终端 B 移动底盘完成采集轨迹：
+
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+```
+
+PC 侧观察低带宽图像、点云和地图预览：
+
+```bash
+ros2 launch semantic_mapping lekiwi_semantic_mapping_rviz.launch.py
+```
+
+采集完成后，在开发板另一个终端执行保存：
+
+```bash
+ros2 run semantic_mapping save_semantic_map
+```
+
+保存命令会停止 recorder、保存地图、校验 MCAP/TF/标定快照并生成 `.tar.gz`。保存成功后再由操作员结束主 launch。
+
+### 4. RealSense 建图
+
+开发板终端 A 启动 D435、RTAB-Map mapping 和底盘桥接：
+
+```bash
+ros2 launch robot_config robot.launch.py \
+  use_sim:=false \
+  robot_config:=lekiwi_mapping
+```
+
+开发板终端 B 启动键盘遥控：
+
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+```
+
+PC 侧启动 RealSense 建图 RViz：
+
+```bash
+ros2 launch robot_navigation lekiwi_realsense_mapping_rviz.launch.py
+```
+
+建图主链保持运行时，在开发板保存地图：
+
+```bash
+ros2 run robot_navigation save_rtabmap_map
+```
+
+占据栅格默认输出到 `~/.ros/ibrobot/maps/rtabmap.yaml` 和 `rtabmap.pgm`；RTAB-Map 运行时数据库写入
+`~/.ros/ibrobot/maps/rtabmap.db`。
+
+### 5. RealSense 导航
+
+开发板启动 RealSense 定位和 Nav2。显式使用 `control_mode:=teleop`，避免启用该 profile 默认的模型推理模式：
+
+```bash
+ros2 launch robot_config robot.launch.py \
+  use_sim:=false \
+  robot_config:=lekiwi_navi \
+  control_mode:=teleop
+```
+
+PC 侧启动 RealSense 导航 RViz：
+
+```bash
+ros2 launch robot_navigation lekiwi_realsense_navigation_rviz.launch.py
+```
+
+在 RViz 中使用 `2D Goal Pose` 或 `Nav2 Goal` 下发目标。该模式加载 `rtabmap.yaml` 和 `rtabmap.db`。
+
+### 6. LiDAR 建图
+
+开发板终端 A 启动 MID-360、FAST-LIO、SLAM Toolbox 和底盘桥接：
+
+```bash
+ros2 launch robot_config robot.launch.py \
+  use_sim:=false \
+  robot_config:=lekiwi_lidar \
+  nav_stage:=mapping
+```
+
+开发板终端 B 启动键盘遥控：
+
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+```
+
+PC 侧启动 LiDAR 建图 RViz：
+
+```bash
+ros2 launch robot_navigation lekiwi_lidar_mapping_rviz.launch.py
+```
+
+建图主链保持运行时，在开发板保存地图：
+
+```bash
+ros2 run robot_navigation save_lidar_map
+```
+
+默认从 `/map` 原子保存到 `~/.ros/ibrobot/maps/map.yaml` 和 `map.pgm`。
+
+### 7. LiDAR 导航
+
+开发板启动 MID-360、FAST-LIO、AMCL、Nav2、Collision Monitor 和原子命令服务：
+
+```bash
+ros2 launch robot_config robot.launch.py \
+  use_sim:=false \
+  robot_config:=lekiwi_lidar \
+  nav_stage:=navigation
+```
+
+PC 侧启动 LiDAR 导航 RViz：
+
+```bash
+ros2 launch robot_navigation lekiwi_lidar_navigation_rviz.launch.py
+```
+
+等待启动 warm-up 完成后，在开发板检查 Action 可发现性：
+
+```bash
+ros2 run robot_navigation nav_cmd status
+```
+
+`status` 不是定位收敛判据。发送运动命令前还应确认地图已加载、Nav2 lifecycle active，并且
+`map -> base_link` 定位稳定。平移和绝对坐标单位为米，CLI 转向角单位为度：
+
+```bash
+ros2 run robot_navigation nav_cmd forward 0.5
+ros2 run robot_navigation nav_cmd backward 0.5
+ros2 run robot_navigation nav_cmd leftward 0.5
+ros2 run robot_navigation nav_cmd rightward 0.5
+ros2 run robot_navigation nav_cmd turn-left 10
+ros2 run robot_navigation nav_cmd turn-right 10
+ros2 run robot_navigation nav_cmd absolute <x> <y> <yaw_deg>
+ros2 run robot_navigation nav_cmd cancel
+```
+
+导航 stage 的速度链是 `/cmd_vel -> Collision Monitor -> /cmd_vel_safe -> cmd_vel_bridge`。导航期间不要另启
+`teleop_twist_keyboard` 或其他直接发布 `/cmd_vel`、`/cmd_vel_safe` 的节点；当前链路没有速度所有权仲裁器。
 
 ## 环境复刻
 
@@ -210,7 +467,8 @@ ros2 run nav2_map_server map_saver_cli -t /rtabmap/map -f ~/.ros/ibrobot/maps/rt
 ros2 launch robot_config robot.launch.py use_sim:=false robot_config:=lekiwi_navi control_mode:=teleop
 ```
 
-RViz 启动后，使用 `2D Goal Pose` 或 `Nav2 Goal` 在地图上点击目标。Nav2 会规划全局路径并通过 `/cmd_vel` 驱动底盘，局部规划器会根据代价地图避障。
+RViz 启动后，使用 `2D Goal Pose` 或 `Nav2 Goal` 在地图上点击目标。Nav2 会规划全局路径并通过配置的速度链驱动底盘；
+MID-360 navigation 使用 `/cmd_vel -> Collision Monitor -> /cmd_vel_safe -> bridge`，局部规划器根据代价地图避障。
 
 如果需要导航评估模式并联动推理链：
 
@@ -263,7 +521,7 @@ ros2 topic echo /tf
 ros2 launch robot_navigation lekiwi_lidar_mapping_rviz.launch.py
 ```
 
-该预设打开 `TF`、`RobotModel`、`/rtabmap/map`、`/rtabmap/cloud_map`。
+该预设打开 `TF`、`RobotModel`、`/map`、`/scan` 和 `/cloud_registered_body`。
 
 导航观察：
 
@@ -271,7 +529,7 @@ ros2 launch robot_navigation lekiwi_lidar_mapping_rviz.launch.py
 ros2 launch robot_navigation lekiwi_lidar_navigation_rviz.launch.py
 ```
 
-该预设打开 `TF`、`RobotModel`、`/map`、`/plan`。
+该预设打开 `TF`、`RobotModel`、`/map`、`/plan`、`/cloud_registered_body` 和 `/cmd_vel_safe`。
 
 自定义 RViz 配置：
 
@@ -369,12 +627,13 @@ ros2 launch robot_navigation ekf_rtabmap_launch.py
 
 ## 测试验证
 
-`colcon test` 用于单点验证某个包或模块的功能，便于把 `robot_navigation` 的 standalone 测试和 `robot_config` 维护的完整仿真测试分开执行。
+构建统一使用仓库脚本；`colcon test` 用于单点验证某个包或模块的功能，便于把 `robot_navigation` 的 standalone
+测试和 `robot_config` 维护的完整仿真测试分开执行。
 
 ### 1. 通用编译
 
 ```bash
-colcon build --packages-up-to robot_config robot_navigation --base-paths src --packages-skip sim_models
+./scripts/build.sh -- --packages-up-to robot_config robot_navigation
 ```
 
 ### 2. robot_navigation standalone 测试
@@ -466,6 +725,10 @@ SIM_GUI=1 NAV_TEST_PROFILE=full colcon test --packages-select robot_config --bas
 ### 导航原子命令接口
 
 LiDAR navigation 阶段提供独立于上层任务框架的单线执行接口：
+
+`ExecuteNavigation` 只负责固定目标和一次性的相对导航命令，不是动态目标 follower，也不提供路径替换协议。
+需要路径级控制时，使用 Nav2 原生 `/compute_path_to_pose`（planner ID `GridBased`）和 `/follow_path`
+（controller ID `FollowPath`）；这些原生接口不包含本 Action 的单任务和速度归零确认语义。
 
 | 类型 | 名称 | 类型 | 说明 |
 |------|------|------|------|
@@ -559,6 +822,11 @@ Action，也可以调用 `/navigation/cancel_current`，后者会在速度归零
 `resolved_target_pose`；执行过程中的 `Feedback` 提供 `state`、`distance_remaining`、
 `estimated_time_remaining` 和 `number_of_recoveries`。接口同时只管理一个导航任务，业务模块在
 发送新目标前应先完成当前目标或等待取消服务成功。
+
+MID-360 navigation 使用 AMCL 发布 `map -> odom`，FAST-LIO odom bridge 发布 `odom -> base_link`，动态避障
+速度链为 `/cmd_vel -> Collision Monitor -> /cmd_vel_safe -> cmd_vel_bridge`。本文后续 RTAB-Map/EKF 和
+不启动 AMCL 的章节只适用于 RealSense legacy profile。navigation stage 运行时不要额外启动未经仲裁的
+`teleop_twist_keyboard` 或其他直接发布速度的节点；本 PR 不提供完整速度仲裁器。
 
 ### cmd_vel_bridge_node
 

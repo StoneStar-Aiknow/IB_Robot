@@ -14,6 +14,10 @@ def test_navigation_command_api_and_cli_are_installed():
 
     content = action.read_text(encoding="utf-8")
     assert "geometry_msgs/PoseStamped target_pose" in content
+    assert "translation commands use meters" in content
+    assert "TURN_LEFT and TURN_RIGHT use radians" in content
+    assert "ABSOLUTE_POSE ignores value" in content
+    assert "relative commands ignore target_pose" in content
     assert "string state" in content
     assert "geometry_msgs/PoseStamped resolved_target_pose" in content
     setup_content = setup.read_text(encoding="utf-8")
@@ -43,9 +47,22 @@ def test_lidar_navigation_stage_enables_command_adapter_on_dynamic_chain():
         "action_name": "/navigation/execute",
         "cancel_service_name": "/navigation/cancel_current",
         "nav2_action_name": "/navigate_to_pose",
+        "nav2_result_timeout": 300.0,
         "stop_velocity_topic": "/cmd_vel_safe",
+        "cancel_response_timeout": 2.0,
     }
     assert "command_server" not in config["nav_stages"]["mapping"]["navigation"]
+
+
+def test_lifecycle_startup_is_ros_native_and_keeps_warmup_boundary():
+    launch_path = ROOT / "src/robot_navigation/launch/nav2_bringup.launch.py"
+    launch_content = launch_path.read_text(encoding="utf-8")
+
+    assert '"autostart": "false"' in launch_content
+    assert "navigation_lifecycle_coordinator" in launch_content
+    assert "ExecuteProcess(" not in launch_content
+    assert "TimerAction(" not in launch_content
+    assert "ros2 service call" not in launch_content
 
 
 def test_real_navigation_allows_slow_board_action_acknowledgements():
@@ -82,9 +99,10 @@ def test_navigation_launch_delays_lifecycle_startup_until_nodes_are_warm():
     launch_content = launch_path.read_text(encoding="utf-8")
 
     assert '"autostart": "false"' in launch_content
-    assert "TimerAction(" in launch_content
-    assert '"/lifecycle_manager_navigation/manage_nodes"' in launch_content
-    assert '"{command: 0}"' in launch_content
+    assert "navigation_lifecycle_coordinator" in launch_content
+    assert "ExecuteProcess(" not in launch_content
+    assert "TimerAction(" not in launch_content
+    assert "ros2 service call" not in launch_content
 
 
 def test_navigation_include_does_not_leak_disabled_autostart_to_sibling_actions():

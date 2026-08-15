@@ -114,14 +114,7 @@ def _default_workspace() -> Path:
     configured = os.environ.get("FAST_CALIB_WORKSPACE")
     if configured:
         return Path(configured).expanduser()
-    candidates = (
-        Path.home() / "Desktop/radar-navigation/fast_calib_7747_patch_verify_ws",
-        _repo_root() / "build/fast_calib_ws",
-    )
-    for candidate in candidates:
-        if (candidate / "install/setup.bash").is_file():
-            return candidate
-    return candidates[0]
+    return _repo_root()
 
 
 def _default_templates() -> Path:

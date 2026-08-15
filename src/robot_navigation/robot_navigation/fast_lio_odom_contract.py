@@ -87,3 +87,21 @@ def validate_odometry_sample(
     if not all(math.isfinite(value) for value in values):
         return "odometry contains non-finite values"
     return None
+
+
+def validate_odometry_timestamp(
+    stamp_sec: int,
+    stamp_nanosec: int,
+    *,
+    now_sec: float,
+    max_future_skew_sec: float = 0.1,
+) -> str | None:
+    """Reject only missing or clearly future-dated source timestamps."""
+    stamp = float(stamp_sec) + float(stamp_nanosec) / 1_000_000_000.0
+    if stamp == 0.0:
+        return "odometry timestamp is zero"
+    if not math.isfinite(stamp):
+        return "odometry timestamp is non-finite"
+    if stamp > now_sec + max_future_skew_sec:
+        return "odometry timestamp is too far in the future"
+    return None

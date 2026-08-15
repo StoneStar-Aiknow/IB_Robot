@@ -53,7 +53,7 @@ bt_navigator:
     robot_base_frame: base_link
     odom_topic: /odometry/filtered
     bt_loop_duration: 10
-    # Allow a loaded 310P up to one second for Nav2 action and service responses.
+    # Allow a loaded development board up to one second for Nav2 action and service responses.
     default_server_timeout: 1000
     wait_for_service_timeout: 1000
     # 'default_nav_through_poses_bt_xml' and 'default_nav_to_pose_bt_xml' are use defaults:

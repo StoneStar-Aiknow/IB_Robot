@@ -3,7 +3,6 @@
 import argparse
 import contextlib
 import fcntl
-import os
 import subprocess
 import sys
 import tarfile
@@ -26,18 +25,6 @@ def validate_artifact_archive(value: Path) -> Path:
     if not path.is_file() or not path.name.endswith(".candidate.tar"):
         raise ValueError(f"artifact input must end with .candidate.tar: {path}")
     return path
-
-
-def _default_mount() -> Path:
-    configured = os.environ.get("ROBOT_CALIBRATION_MOUNT")
-    if configured:
-        return Path(configured).expanduser()
-    try:
-        from ament_index_python.packages import get_package_share_directory
-
-        return Path(get_package_share_directory("robot_calibration")) / "config" / "examples" / "base_to_mid360.yaml"
-    except ImportError:
-        return Path(__file__).parents[1] / "config" / "examples" / "base_to_mid360.yaml"
 
 
 @contextlib.contextmanager
@@ -81,9 +68,9 @@ def run_validation(value: Path, *, mount: Path | None = None, output_topic: str 
             artifact = root / "base_to_front_camera.candidate.yaml"
             if not artifact.is_file():
                 raise ValueError("artifact archive does not contain a candidate camera artifact")
-            mount_path = (mount or _default_mount()).expanduser().absolute()
+            mount_path = (mount or root / "base_to_mid360.yaml").expanduser().absolute()
             if not mount_path.is_file():
-                raise ValueError(f"mount configuration does not exist: {mount_path}")
+                raise ValueError("artifact archive does not contain a candidate MID-360 mount")
             command = [
                 "ros2",
                 "run",

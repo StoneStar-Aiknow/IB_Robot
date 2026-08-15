@@ -57,6 +57,7 @@ def generate_fast_lio_nodes(nav_config: dict[str, Any], use_sim: bool = False) -
                 "body_to_base_rotation": config.get("body_to_base_rotation", [0.0, 0.0, 0.0, 1.0]),
                 "publish_tf": bool(config.get("publish_tf", True)),
                 "planar_output": bool(config.get("planar_output", False)),
+                "max_future_skew_sec": float(config.get("max_future_skew_sec", 0.1)),
             }
         ],
     )

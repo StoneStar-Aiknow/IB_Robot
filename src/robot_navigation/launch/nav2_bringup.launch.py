@@ -3,11 +3,9 @@ import os
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
-    ExecuteProcess,
     GroupAction,
     IncludeLaunchDescription,
     SetEnvironmentVariable,
-    TimerAction,
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -145,21 +143,22 @@ def generate_launch_description():
         ],
     )
 
-    navigation_startup = TimerAction(
-        period=10.0,
+    navigation_startup = Node(
+        package="robot_navigation",
+        executable="navigation_lifecycle_coordinator",
+        name="navigation_lifecycle_coordinator",
+        output="screen",
         condition=IfCondition(autostart),
-        actions=[
-            ExecuteProcess(
-                cmd=[
-                    "ros2",
-                    "service",
-                    "call",
-                    "/lifecycle_manager_navigation/manage_nodes",
-                    "nav2_msgs/srv/ManageLifecycleNodes",
-                    "{command: 0}",
-                ],
-                output="screen",
-            )
+        parameters=[
+            {
+                "startup_delay_sec": 10.0,
+                "service_name": "/lifecycle_manager_navigation/manage_nodes",
+                "namespace": namespace,
+                "service_wait_timeout_sec": 2.0,
+                "request_timeout_sec": 30.0,
+                "retry_count": 3,
+                "retry_interval_sec": 1.0,
+            }
         ],
     )
 
