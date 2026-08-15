@@ -11,8 +11,8 @@
 
 ```bash
 if ! command -v docker >/dev/null 2>&1; then
-  echo "Docker CLI is not installed. Install Docker on the host, then rerun verification."
-  exit 1
+    echo "Docker CLI is not installed. Install Docker on the host, then rerun verification."
+    exit 1
 fi
 
 IMAGE=osrf/ros:humble-desktop-full-jammy
@@ -23,13 +23,43 @@ HOST_GID=$(id -g)
 HOST_PIP_CACHE=${PIP_CACHE_DIR:-"${HOME}/.cache/pip"}
 
 if [ "${HOST_UID}" -eq 0 ]; then
-  echo "Run Ubuntu Docker verification as the non-root workspace owner." >&2
-  exit 1
+    echo "Run Ubuntu Docker verification as the non-root workspace owner." >&2
+    exit 1
 fi
 
 if [ ! -d "${HOST_PIP_CACHE}" ]; then
-  echo "Host pip cache does not exist: ${HOST_PIP_CACHE}"
-  exit 1
+    echo "Host pip cache does not exist: ${HOST_PIP_CACHE}"
+    exit 1
+fi
+
+# GraspGen's pointnet2_ops CUDA extension is now installed by default (no
+# --with-grasp flag). The container needs nvcc to compile it, but does NOT
+# need GPU passthrough (TORCH_CUDA_ARCH_LIST is fixed, no GPU detection).
+# If the host has nvcc, mount the CUDA toolkit read-only so grasp deps can
+# be compiled; if not, setup.sh will gracefully skip grasp install and the
+# verification continues without the grasp smoke test.
+HOST_CUDA_HOME=""
+if command -v nvcc >/dev/null 2>&1; then
+    HOST_CUDA_HOME="$(readlink -f "$(command -v nvcc)")"
+    HOST_CUDA_HOME="$(dirname "$(dirname "${HOST_CUDA_HOME}")")"
+elif [[ -x /usr/local/cuda/bin/nvcc ]]; then
+    HOST_CUDA_HOME="$(readlink -f /usr/local/cuda)"
+fi
+
+# Reject system directories that would break the container if bind-mounted.
+if [[ "${HOST_CUDA_HOME}" == "/" || "${HOST_CUDA_HOME}" == "/usr" || "${HOST_CUDA_HOME}" == "/usr/local" ]]; then
+    echo "Host CUDA toolkit path is a system directory (${HOST_CUDA_HOME}); refusing to bind-mount." >&2
+    echo "Install CUDA toolkit under /usr/local/cuda-<version> instead of apt nvidia-cuda-toolkit." >&2
+    HOST_CUDA_HOME=""
+fi
+
+if [ -z "${HOST_CUDA_HOME}" ] || [ ! -x "${HOST_CUDA_HOME}/bin/nvcc" ]; then
+    echo "Host CUDA toolkit (nvcc) not found; grasp deps will be skipped in verification." >&2
+    echo "setup.sh will warn and skip GraspGen install on this container." >&2
+    HOST_CUDA_HOME=""
+else
+    echo "Host CUDA toolkit: ${HOST_CUDA_HOME}"
+    nvcc --version | head -4
 fi
 
 TOTAL_START=$(date +%s)
@@ -37,6 +67,11 @@ TOTAL_START=$(date +%s)
 
 The source mode is selected in Phase 3. Use the default local workspace copy
 unless the user explicitly asks for a clean remote branch or commit.
+
+The CUDA toolkit is mounted read-only into the container at the same path
+(`/usr/local/cuda-<version>`) so `install_graspgen_pip.sh`'s
+`/usr/local/cuda-${torch_cuda_version}` detection also works when the PyTorch
+CUDA version matches the host toolkit version.
 
 ## Phase 1 — Prepare ROS Desktop-Full Image
 
@@ -58,15 +93,33 @@ runs normally reuse the local image layers.
 
 ```bash
 # 2.1 Remove a stale verification container, then start the ROS-ready image.
+# CUDA toolkit (if available on the host) is mounted read-only so GraspGen's
+# pointnet2_ops can be compiled. --gpus is NOT required: the CUDA arch is
+# fixed via TORCH_CUDA_ARCH_LIST and the smoke test only does find_spec.
+# If no host CUDA toolkit is available, setup.sh will skip grasp install
+# gracefully and the verification continues without the grasp smoke test.
 CONTAINER_START=$(date +%s)
 docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
-docker run -d --name "${CONTAINER}" \
-  --entrypoint /bin/bash \
-  --mount "type=bind,src=${HOST_PIP_CACHE},dst=/var/cache/ibrobot-pip" \
-  -e PIP_CACHE_DIR=/var/cache/ibrobot-pip \
-  -e TZ=Asia/Shanghai \
-  -e DEBIAN_FRONTEND=noninteractive \
-  "${IMAGE}" -c 'sleep infinity'
+
+DOCKER_RUN_ARGS=(
+  -d --name "${CONTAINER}"
+  --entrypoint /bin/bash
+  --mount "type=bind,src=${HOST_PIP_CACHE},dst=/var/cache/ibrobot-pip"
+  -e PIP_CACHE_DIR=/var/cache/ibrobot-pip
+  -e TZ=Asia/Shanghai
+  -e DEBIAN_FRONTEND=noninteractive
+)
+
+if [ -n "${HOST_CUDA_HOME}" ]; then
+    DOCKER_RUN_ARGS+=(
+        --mount "type=bind,src=${HOST_CUDA_HOME},dst=${HOST_CUDA_HOME},readonly"
+        -e CUDA_HOME="${HOST_CUDA_HOME}"
+        -e PATH="${HOST_CUDA_HOME}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        -e LD_LIBRARY_PATH="${HOST_CUDA_HOME}/lib64:/usr/lib/x86_64-linux-gnu"
+    )
+fi
+
+docker run "${DOCKER_RUN_ARGS[@]}" "${IMAGE}" -c 'sleep infinity'
 
 # 2.2 Configure domestic Ubuntu and ROS 2 mirrors before the first apt update,
 # then install container bootstrap tools only. The ROS desktop-full image uses
@@ -133,6 +186,23 @@ docker exec \
     printf "pip cache writable: %s (uid=%s gid=%s)\n" \
       "${PIP_CACHE_DIR}" "$(id -u)" "$(id -g)"
   '
+
+# 2.5 Verify the mounted CUDA toolkit is accessible from the container (only
+# when a host CUDA toolkit was detected in Phase 0). If skipped, setup.sh will
+# warn and skip GraspGen install — the verification continues.
+if [ -n "${HOST_CUDA_HOME}" ]; then
+    docker exec \
+      -u testuser \
+      -e HOME=/home/testuser \
+      "${CONTAINER}" bash -c '
+        set -e
+        test -x "${CUDA_HOME}/bin/nvcc"
+        "${CUDA_HOME}/bin/nvcc" --version | head -1
+        printf "CUDA_HOME=%s\n" "${CUDA_HOME}"
+      '
+else
+    echo "No host CUDA toolkit; grasp deps will be skipped in this verification run."
+fi
 
 CONTAINER_SECONDS=$(( $(date +%s) - CONTAINER_START ))
 ```

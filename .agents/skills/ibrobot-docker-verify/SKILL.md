@@ -51,6 +51,19 @@ the [bootstrap variant](references/bootstrap-variant.md) based on plain `ubuntu:
   inaccessible even when the directory exists.
 - Network access to Aliyun apt mirror, TUNA ROS 2 repo, Huawei pip mirror,
   and `gitcode.com` / `atomgit.com` for lerobot submodule fetch.
+- **NVIDIA GPU + CUDA toolkit on the host (optional)**: GraspGen's
+  `pointnet2_ops` CUDA extension is installed by default when a CUDA toolkit
+  (`nvcc`) is available. If the host has no CUDA toolkit, `setup.sh` will
+  warn and skip GraspGen install gracefully; the verification continues
+  without the grasp smoke test.
+  - Host CUDA toolkit with `nvcc` on PATH or at `/usr/local/cuda/bin/nvcc`.
+    The toolkit directory is mounted read-only into the container at the same
+    path, and `CUDA_HOME` / `PATH` / `LD_LIBRARY_PATH` are set accordingly.
+    System directories (`/`, `/usr`, `/usr/local`) are rejected to prevent
+    accidental bind-mount of the entire system.
+  - `--gpus` passthrough is NOT required for setup+build verification:
+    `pointnet2_ops` compilation uses `TORCH_CUDA_ARCH_LIST` (fixed, not
+    GPU-detected) and the smoke test only does `importlib.util.find_spec`.
 
 ## Core Principle
 
