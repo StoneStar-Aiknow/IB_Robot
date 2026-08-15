@@ -161,6 +161,13 @@ def _uses_fused_vlm_donor(ctx: Ctx) -> bool:
     return False
 
 
+def _donor_dtype(ctx: Ctx, role: str) -> str:
+    profile = getattr(ctx, "quantization_profile", None)
+    if profile is not None and profile.role(role).donor_dtype is not None:
+        return profile.role(role).donor_dtype
+    return ctx.args.dtype
+
+
 def _quant_profile_args(ctx: Ctx, *, role: str, output_onnx: Path) -> list[str]:
     profile = getattr(ctx, "quantization_profile", None)
     if profile is None:
@@ -192,6 +199,8 @@ def _quant_profile_args(ctx: Ctx, *, role: str, output_onnx: Path) -> list[str]:
         args.append("--require-npu-geglu")
         if role_profile.expected_npu_geglu_nodes is not None:
             args.extend(["--expected-npu-geglu-nodes", str(role_profile.expected_npu_geglu_nodes)])
+    if role == "ae" and role_profile.expected_calibration_steps is not None:
+        args.extend(["--expected-calibration-steps", str(role_profile.expected_calibration_steps)])
     return args
 
 
@@ -210,7 +219,7 @@ def _run_vlm_donor_onnx(ctx: Ctx) -> None:
             "--runtime-save-dir",
             str(ctx.runtime_save_dir),
             "--dtype",
-            a.dtype,
+            _donor_dtype(ctx, "vlm"),
             "--device",
             a.donor_device,
             *(["--fused-geglu-donor"] if fused_donor else []),
@@ -235,7 +244,7 @@ def _run_ae_donor_onnx(ctx: Ctx) -> None:
             "--prefix-pad-masks-path",
             str(ctx.runtime_save_dir / "prefix_pad_masks.pth"),
             "--dtype",
-            a.dtype,
+            _donor_dtype(ctx, "ae"),
             "--device",
             a.donor_device,
             "--log-level",
@@ -675,8 +684,11 @@ def main() -> int:
     device_tag = args.device.split(":", 1)[0]
     suffix = build_onnx_suffix(dtype=args.dtype, device=device_tag)
     donor_device_tag = args.donor_device.split(":", 1)[0]
-    donor_suffix = build_onnx_suffix(dtype=args.dtype, device=donor_device_tag)
     quantization_profile = getattr(resolved, "quantization_profile", None)
+    vlm_donor_dtype = quantization_profile.vlm.donor_dtype if quantization_profile else None
+    ae_donor_dtype = quantization_profile.action_expert.donor_dtype if quantization_profile else None
+    vlm_donor_suffix = build_onnx_suffix(dtype=vlm_donor_dtype or args.dtype, device=donor_device_tag)
+    ae_donor_suffix = build_onnx_suffix(dtype=ae_donor_dtype or args.dtype, device=donor_device_tag)
     fused_vlm_donor = False
     if quantization_profile is not None and quantization_profile.vlm.fused_geglu_donor is not None:
         fused_vlm_donor = quantization_profile.vlm.fused_geglu_donor
@@ -694,8 +706,8 @@ def main() -> int:
         om_dir=om_dir,
         vlm_onnx=vlm_onnx,
         ae_onnx=ae_onnx,
-        vlm_donor_onnx=output_dir / f"pi05-vlm{'_fused-geglu' if fused_vlm_donor else ''}{donor_suffix}.onnx",
-        ae_donor_onnx=output_dir / f"pi05-action_expert{donor_suffix}.onnx",
+        vlm_donor_onnx=output_dir / f"pi05-vlm{'_fused-geglu' if fused_vlm_donor else ''}{vlm_donor_suffix}.onnx",
+        ae_donor_onnx=output_dir / f"pi05-action_expert{ae_donor_suffix}.onnx",
         vlm_w8a8=vlm_w8a8,
         ae_w8a8=ae_w8a8,
         vlm_om=om_dir / vlm_onnx.with_suffix(".om").name,

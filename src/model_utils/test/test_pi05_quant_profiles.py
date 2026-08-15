@@ -40,6 +40,7 @@ def _write_policy(policy: Path, model: bytes = b"weights") -> None:
 def test_q40_profile_has_exact_validated_scope():
     profile = bundled_quantization_profiles()["pi05-q40-v1"]
 
+    assert profile.digest == "8afca52b7fd7e5774f8049c81caa98bba9f6980af949f742c498797095daae36"
     assert profile.vlm.enabled
     assert not profile.action_expert.enabled
     assert sum(selector.expected for selector in profile.vlm.selectors) == 136
@@ -47,6 +48,19 @@ def test_q40_profile_has_exact_validated_scope():
     assert profile.vlm.expected_quantized_nodes == 136
     assert profile.vlm.fused_geglu_donor is False
     assert profile.vlm.expected_npu_geglu_nodes == 17
+
+
+def test_ae_attention_profile_requires_complete_trajectory():
+    profile = bundled_quantization_profiles()["pi05-ae-attn-v1"]
+
+    assert profile.status == "validated"
+    assert not profile.vlm.enabled
+    assert profile.action_expert.enabled
+    assert sum(selector.expected for selector in profile.action_expert.selectors) == 72
+    assert profile.action_expert.expected_selected_nodes == 72
+    assert profile.action_expert.expected_quantized_nodes == 72
+    assert profile.action_expert.expected_calibration_steps == 10
+    assert profile.action_expert.donor_dtype == "fp32"
 
 
 def test_q40_profile_selects_exact_nodes_and_rejects_graph_drift():

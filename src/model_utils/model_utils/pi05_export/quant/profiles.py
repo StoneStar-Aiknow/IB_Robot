@@ -35,6 +35,8 @@ class QuantizationRoleProfile:
     quantize_convs: bool = False
     fused_geglu_donor: bool | None = None
     expected_npu_geglu_nodes: int | None = None
+    expected_calibration_steps: int | None = None
+    donor_dtype: str | None = None
 
 
 @dataclass(frozen=True)
@@ -76,7 +78,7 @@ class QuantizationProfile:
 
 
 def _role_as_dict(role: QuantizationRoleProfile) -> dict[str, Any]:
-    return {
+    data = {
         "enabled": role.enabled,
         "selectors": [
             {"name": selector.name, "regex": selector.regex, "expected": selector.expected}
@@ -89,6 +91,11 @@ def _role_as_dict(role: QuantizationRoleProfile) -> dict[str, Any]:
         "fused_geglu_donor": role.fused_geglu_donor,
         "expected_npu_geglu_nodes": role.expected_npu_geglu_nodes,
     }
+    if role.expected_calibration_steps is not None:
+        data["expected_calibration_steps"] = role.expected_calibration_steps
+    if role.donor_dtype is not None:
+        data["donor_dtype"] = role.donor_dtype
+    return data
 
 
 def _require_mapping(value: Any, where: str) -> dict[str, Any]:
@@ -108,6 +115,8 @@ def _parse_role(value: Any, where: str) -> QuantizationRoleProfile:
         "quantize_convs",
         "fused_geglu_donor",
         "expected_npu_geglu_nodes",
+        "expected_calibration_steps",
+        "donor_dtype",
     }
     unknown = sorted(set(data) - allowed)
     if unknown:
@@ -148,8 +157,14 @@ def _parse_role(value: Any, where: str) -> QuantizationRoleProfile:
     quantize_convs = data.get("quantize_convs", False)
     fused_geglu_donor = data.get("fused_geglu_donor")
     expected_npu_geglu_nodes = optional_count("expected_npu_geglu_nodes")
+    expected_calibration_steps = optional_count("expected_calibration_steps")
+    donor_dtype = data.get("donor_dtype")
+    if donor_dtype is not None and donor_dtype not in {"fp16", "fp32", "auto"}:
+        raise ValueError(f"{where}.donor_dtype must be one of fp16, fp32, or auto")
     if expected_npu_geglu_nodes is not None and expected_npu_geglu_nodes == 0:
         raise ValueError(f"{where}.expected_npu_geglu_nodes must be positive")
+    if expected_calibration_steps is not None and expected_calibration_steps == 0:
+        raise ValueError(f"{where}.expected_calibration_steps must be positive")
     if not isinstance(quantize_convs, bool):
         raise ValueError(f"{where}.quantize_convs must be boolean")
     if fused_geglu_donor is not None and not isinstance(fused_geglu_donor, bool):
@@ -168,6 +183,8 @@ def _parse_role(value: Any, where: str) -> QuantizationRoleProfile:
         quantize_convs=quantize_convs,
         fused_geglu_donor=fused_geglu_donor,
         expected_npu_geglu_nodes=expected_npu_geglu_nodes,
+        expected_calibration_steps=expected_calibration_steps,
+        donor_dtype=donor_dtype,
     )
 
 
@@ -224,6 +241,8 @@ def parse_quantization_profile(name: str, value: Any) -> QuantizationProfile:
         raise ValueError(f"quantization profile {name!r} expected_npu_geglu_nodes requires npu_geglu=true")
     if action_expert.fused_geglu_donor is not None or action_expert.expected_npu_geglu_nodes is not None:
         raise ValueError(f"quantization profile {name!r} GeGLU deployment fields apply only to vlm")
+    if vlm.expected_calibration_steps is not None:
+        raise ValueError(f"quantization profile {name!r} expected_calibration_steps applies only to action_expert")
     return QuantizationProfile(
         name=name,
         status=status,

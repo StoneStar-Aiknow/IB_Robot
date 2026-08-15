@@ -195,6 +195,25 @@ def test_q40_profile_forwards_strategy_without_fusing_donor(tmp_path, monkeypatc
     assert len(profile.vlm.selectors) == 7
 
 
+def test_ae_attention_profile_exports_fp32_calibration_donor(tmp_path, monkeypatch):
+    profile = bundled_quantization_profiles()["pi05-ae-attn-v1"]
+    ctx = SimpleNamespace(
+        args=SimpleNamespace(dtype="fp16", donor_device="cpu", log_level="INFO"),
+        policy_path=tmp_path / "bundle",
+        output_dir=tmp_path / "onnx",
+        runtime_save_dir=tmp_path / "runtime",
+        quantization_profile=profile,
+    )
+    calls = []
+    monkeypatch.setattr(pipeline, "_run_module", lambda module, argv: calls.append((module, argv)))
+
+    pipeline._run_ae_donor_onnx(ctx)
+
+    module, argv = calls[0]
+    assert module == "model_utils.pi05_export.convert_onnx_action_expert"
+    assert argv[argv.index("--dtype") + 1] == "fp32"
+
+
 def test_quant_om_revalidates_profile_metadata_immediately_before_compile(monkeypatch):
     events = []
     ctx = SimpleNamespace(vlm_w8a8="vlm.onnx", vlm_quant_om="vlm.om")
