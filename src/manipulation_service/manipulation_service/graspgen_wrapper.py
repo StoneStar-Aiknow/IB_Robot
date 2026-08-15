@@ -1,14 +1,11 @@
 """Wrapper for GraspGen inference pipeline (ROS-free)."""
 
-import io
 import json
 import logging
 import os
-import shlex
 import threading
 import time
 import uuid
-from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -35,7 +32,7 @@ _EXECUTION_TABLE_SCENE_MAX_POINTS = 30000
 _EXECUTION_TABLE_OBJECT_MAX_POINTS = 16000
 _RANSAC_PLANE_CHUNK_SIZE = 64
 _RANSAC_CONFIDENCE = 0.999
-_VALID_INFERENCE_BACKENDS = {"local_cuda", "remote_310p", "ascend_local"}
+_VALID_INFERENCE_BACKENDS = {"local_cuda", "ascend_local"}
 
 
 def _load_grasp_metadata(config_path: Path) -> tuple[str, int]:
@@ -147,197 +144,13 @@ _WORKSPACE_ROOT = _find_workspace_root()
 _DEFAULT_MODEL_DIR = _WORKSPACE_ROOT / "models" / "grasp"
 
 
-class Remote310PInferenceClient:
-    def __init__(
-        self,
-        host: str,
-        *,
-        port: int = 22,
-        username: str = "root",
-        password_env: str = "GRASPGEN_310P_PASSWORD",
-        remote_root: str = "/root/GraspGen",
-        timeout_sec: float = 120.0,
-    ):
-        if not host.strip():
-            raise ValueError("remote_310p_host must not be empty")
-        if port <= 0:
-            raise ValueError("remote_310p_port must be positive")
-        if timeout_sec <= 0:
-            raise ValueError("remote_310p_timeout_sec must be positive")
-        self._host = host.strip()
-        self._port = int(port)
-        self._username = username.strip()
-        self._password_env = password_env.strip()
-        self._remote_root = remote_root.rstrip("/")
-        self._timeout_sec = float(timeout_sec)
-
-    def sample(
-        self,
-        object_pc: np.ndarray,
-        *,
-        grasp_threshold: float,
-        num_grasps: int,
-        topk_num_grasps: int,
-    ) -> tuple[np.ndarray, np.ndarray, float]:
-        try:
-            import paramiko
-        except ModuleNotFoundError as exc:
-            raise RuntimeError("remote_310p backend requires the Python package 'paramiko'") from exc
-
-        points = np.asarray(object_pc, dtype=np.float32)
-        if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
-            raise ValueError(f"object_pc must have shape [N,3] with N > 0, got {points.shape}")
-        if not np.isfinite(points).all():
-            raise ValueError("object_pc contains non-finite values")
-
-        request_id = f"ibrobot_{uuid.uuid4().hex}"
-        request_dir = f"{self._remote_root}/runtime_requests/{request_id}"
-        input_dir = f"{request_dir}/input"
-        output_dir = f"{request_dir}/output"
-        input_path = f"{input_dir}/{request_id}.npy"
-        output_path = f"{output_dir}/{request_id}.npz"
-        error_path = f"{output_dir}/{request_id}.error.txt"
-        script_path = f"{self._remote_root}/watch_offline.sh"
-
-        command = " ".join(
-            [
-                shlex.quote(script_path),
-                "--input-dir",
-                shlex.quote(input_dir),
-                "--output-dir",
-                shlex.quote(output_dir),
-                "--num-grasps",
-                str(int(num_grasps)),
-                "--threshold",
-                str(float(grasp_threshold)),
-                "--topk",
-                str(int(topk_num_grasps)),
-                "--seed 0 --once",
-            ]
-        )
-
-        password = os.environ.get(self._password_env) if self._password_env else None
-        client = self._connect(paramiko, password)
-        sftp = None
-        try:
-            sftp = client.open_sftp()
-
-            _, stdout, stderr = client.exec_command(
-                f"mkdir -p {shlex.quote(input_dir)} {shlex.quote(output_dir)}",
-                timeout=self._timeout_sec,
-            )
-            mkdir_status = stdout.channel.recv_exit_status()
-            mkdir_error = stderr.read().decode("utf-8", errors="replace").strip()
-            if mkdir_status != 0:
-                raise RuntimeError(f"failed to create remote request directory: {mkdir_error}")
-
-            input_buffer = io.BytesIO()
-            np.save(input_buffer, points, allow_pickle=False)
-            input_buffer.seek(0)
-            sftp.putfo(input_buffer, input_path)
-
-            _, stdout, stderr = client.exec_command(command, timeout=self._timeout_sec)
-            stdout_text = stdout.read().decode("utf-8", errors="replace").strip()
-            stderr_text = stderr.read().decode("utf-8", errors="replace").strip()
-            exit_status = stdout.channel.recv_exit_status()
-            if exit_status != 0:
-                remote_error = ""
-                try:
-                    with sftp.open(error_path, "r") as file:
-                        remote_error = file.read().decode("utf-8", errors="replace").strip()
-                except OSError:
-                    pass
-                detail = remote_error or stderr_text or stdout_text or f"exit status {exit_status}"
-                raise RuntimeError(f"remote GraspGen inference failed: {detail}")
-
-            output_buffer = io.BytesIO()
-            sftp.getfo(output_path, output_buffer)
-            output_buffer.seek(0)
-            with np.load(output_buffer, allow_pickle=False) as result:
-                poses = np.asarray(result["poses"], dtype=np.float32)
-                confidence = np.asarray(result["confidence"], dtype=np.float32)
-                inference_seconds = float(np.asarray(result["inference_seconds"]).reshape(()))
-            self._validate_result(poses, confidence)
-            logger.info(
-                "Remote 310P GraspGen completed: host=%s grasps=%d board_inference_s=%.3f output=%s",
-                self._host,
-                len(confidence),
-                inference_seconds,
-                stdout_text,
-            )
-            return poses, confidence, inference_seconds
-        finally:
-            if sftp is not None:
-                for path in (input_path, output_path, error_path):
-                    with suppress(OSError):
-                        sftp.remove(path)
-                for path in (input_dir, output_dir, request_dir):
-                    with suppress(OSError):
-                        sftp.rmdir(path)
-                sftp.close()
-            client.close()
-
-    def _connect(self, paramiko, password: str | None):
-        client = paramiko.SSHClient()
-        client.load_system_host_keys()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        connect_timeout = min(self._timeout_sec, 15.0)
-        try:
-            client.connect(
-                hostname=self._host,
-                port=self._port,
-                username=self._username,
-                password=password,
-                timeout=connect_timeout,
-                banner_timeout=connect_timeout,
-                auth_timeout=connect_timeout,
-                look_for_keys=True,
-                allow_agent=True,
-            )
-            return client
-        except paramiko.AuthenticationException:
-            client.close()
-            if password is None:
-                raise
-
-        transport = paramiko.Transport((self._host, self._port))
-        transport.banner_timeout = connect_timeout
-        transport.auth_timeout = connect_timeout
-        try:
-            transport.start_client(timeout=connect_timeout)
-            transport.auth_interactive(
-                self._username,
-                lambda _title, _instructions, prompts: [password for _prompt, _echo in prompts],
-            )
-        except Exception:
-            transport.close()
-            raise
-
-        client = paramiko.SSHClient()
-        client._transport = transport
-        return client
-
-    @staticmethod
-    def _validate_result(poses: np.ndarray, confidence: np.ndarray) -> None:
-        if poses.ndim != 3 or poses.shape[1:] != (4, 4):
-            raise RuntimeError(f"remote GraspGen poses must have shape [K,4,4], got {poses.shape}")
-        if confidence.ndim != 1 or len(confidence) != len(poses):
-            raise RuntimeError(
-                "remote GraspGen confidence must have shape [K] matching poses, "
-                f"got poses={poses.shape} confidence={confidence.shape}"
-            )
-        if not np.isfinite(poses).all() or not np.isfinite(confidence).all():
-            raise RuntimeError("remote GraspGen result contains non-finite values")
-
-
 class LocalPipelineBackend:
     """In-process GraspGen inference through the unified generic pipeline.
 
     GraspGen is a ``kind=perception`` model, so its semantics live in
     ``perception_service.GraspGenAdapter`` (point-cloud preparation and grasp
     decoding). The selected model session owns either Torch CUDA execution or the
-    eight-role Ascend execution. This class only drives that pair in-process,
-    bypassing the SSH/SFTP transport used by :class:`Remote310PInferenceClient`;
+    eight-role Ascend execution. This class only drives that pair in-process;
     it holds no GraspGen semantics of its own.
     """
 
@@ -1404,12 +1217,6 @@ class GraspGenWrapper:
         device: str = "cuda",
         collision_gripper: str | None = None,
         inference_backend: str = "local_cuda",
-        remote_310p_host: str = "",
-        remote_310p_port: int = 22,
-        remote_310p_username: str = "root",
-        remote_310p_password_env: str = "GRASPGEN_310P_PASSWORD",
-        remote_310p_root: str = "/root/GraspGen",
-        remote_310p_timeout_sec: float = 120.0,
         local_manifest_path: str = "",
         local_deployment_name: str = "",
         ascend_local_manifest_path: str = "",
@@ -1449,7 +1256,6 @@ class GraspGenWrapper:
                 raise RuntimeError(f"{_LOCAL_BACKEND_REQUIRES_CUDA} CUDA status: {_cuda_status()}.")
             self.device = "cuda"
             self._sampler = None
-            self._remote_client = None
             self._ascend_local_client = LocalPipelineBackend(
                 local_manifest_path,
                 deployment_name=local_deployment_name or "torch_cuda",
@@ -1458,7 +1264,6 @@ class GraspGenWrapper:
         elif backend == "ascend_local":
             self.device = "ascend"
             self._sampler = None
-            self._remote_client = None
             self._ascend_local_client = LocalPipelineBackend(
                 ascend_local_manifest_path,
                 deployment_name=local_deployment_name or ascend_local_deployment_name,
@@ -1469,23 +1274,6 @@ class GraspGenWrapper:
                 "Ascend local GraspGen backend ready (manifest=%s, deployment=%s, gripper=%s)",
                 ascend_local_manifest_path,
                 ascend_local_deployment_name,
-                self._gripper_name,
-            )
-        else:
-            self.device = "remote_310p"
-            self._sampler = None
-            self._remote_client = Remote310PInferenceClient(
-                remote_310p_host,
-                port=remote_310p_port,
-                username=remote_310p_username,
-                password_env=remote_310p_password_env,
-                remote_root=remote_310p_root,
-                timeout_sec=remote_310p_timeout_sec,
-            )
-            self._ascend_local_client = None
-            logger.info(
-                "Remote 310P GraspGen backend ready (host=%s, gripper=%s)",
-                remote_310p_host,
                 self._gripper_name,
             )
 
@@ -2107,37 +1895,15 @@ class GraspGenWrapper:
         min_grasps: int = 80,
         max_tries: int = 4,
     ):
-        if self.inference_backend == "remote_310p":
-            poses, confidence, _ = self._remote_client.sample(
-                object_pc,
-                grasp_threshold=grasp_threshold,
-                num_grasps=num_grasps,
-                topk_num_grasps=topk_num_grasps,
-            )
-            return torch.from_numpy(poses), torch.from_numpy(confidence)
-
-        if self.inference_backend == "ascend_local":
-            poses, confidence, _ = self._ascend_local_client.sample(
-                object_pc,
-                grasp_threshold=grasp_threshold,
-                num_grasps=num_grasps,
-                topk_num_grasps=topk_num_grasps,
-                min_grasps=min_grasps,
-                max_tries=max_tries,
-            )
-            return torch.from_numpy(poses), torch.from_numpy(confidence)
-
-        if self.inference_backend == "local_cuda":
-            poses, confidence, _ = self._ascend_local_client.sample(
-                object_pc,
-                grasp_threshold=grasp_threshold,
-                num_grasps=num_grasps,
-                topk_num_grasps=topk_num_grasps,
-                min_grasps=min_grasps,
-                max_tries=max_tries,
-            )
-            return torch.from_numpy(poses), torch.from_numpy(confidence)
-        raise RuntimeError(f"unsupported GraspGen inference backend {self.inference_backend!r}")
+        poses, confidence, _ = self._ascend_local_client.sample(
+            object_pc,
+            grasp_threshold=grasp_threshold,
+            num_grasps=num_grasps,
+            topk_num_grasps=topk_num_grasps,
+            min_grasps=min_grasps,
+            max_tries=max_tries,
+        )
+        return torch.from_numpy(poses), torch.from_numpy(confidence)
 
     @property
     def gripper_name(self) -> str:
@@ -2145,9 +1911,6 @@ class GraspGenWrapper:
 
     def warmup(self) -> bool:
         """Run one deterministic local inference to initialize lazy runtime state."""
-        if self.inference_backend not in {"local_cuda", "ascend_local"}:
-            return False
-        assert self._ascend_local_client is not None
         rng = np.random.default_rng(0)
         point_count = max(20, int(self._inference_point_count))
         object_pc = rng.uniform(
