@@ -48,7 +48,7 @@ robot:
       - id: grasp_grounding
         enabled: true
         required: true
-        bundle_path: models/perception/grounding_dino_swint_seq8_1280x720_ascend
+        bundle_path: models/grounding_dino_swint_seq8_1280x720_ascend
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:GroundingDINORawDetectPlugin
         service_type: ibrobot_msgs/srv/GroundingDetect
@@ -59,7 +59,7 @@ robot:
       - id: grasp_segmentation
         enabled: true
         required: true
-        bundle_path: models/perception/sam2_hiera_tiny_ascend
+        bundle_path: models/sam2_hiera_tiny_ascend
         deployment: ascend_310p
         adapter_class: perception_service.model_service_plugins:SegmentDetectionsPlugin
         service_type: ibrobot_msgs/srv/SegmentDetections

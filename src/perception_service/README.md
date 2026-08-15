@@ -255,9 +255,9 @@ provenance。Ascend OM 只能通过 schema-v2 manifest named deployment 进入 s
 wrapper 的 `backend=ascend_om` 路径不再提供。CUDA 不可用时必须在 SSOT 中选择另一个已经验证的 named
 deployment，节点不会自动切换 backend。
 
-感知模型与 ACT/PI0.5 使用相同的 bundle-first 结构。下载脚本直接生成四个 bundle 根目录：
-`models/perception/sam2.1_hiera_tiny/`、`models/perception/ram_plus_swin_large_14m/`、
-`models/perception/siglip2_so400m_patch14_384/` 和 `models/perception/grounded_sam2_swint_ogc/`。每个目录包含
+感知模型与 ACT/PI0.5 使用相同的 bundle-first 结构。下载脚本直接在 `models/` 顶层生成四个 bundle
+根目录：`models/sam2.1_hiera_tiny/`、`models/ram_plus_swin_large_14m/`、
+`models/siglip2_so400m_patch14_384/` 和 `models/grounded_sam2_swint_ogc/`。每个目录包含
 `inference_manifest.json`、`assets/adapter.json`、模型资产和 `torch_cpu`/`torch_cuda` named deployment。
 Grounding DINO Swin-T OGC 的网络结构配置由 `perception_service.grounding_dino_config` 常量绑定到软件版本，
 不作为模型资产复制进 bundle；bundle 仅保存 checkpoint、文本编码器和 SAM2 checkpoint 等运行资产。
@@ -326,11 +326,11 @@ SAM2 bundle 独立记录 encoder 与固定 batch-4 decoder。GroundingDINO 固�
 perception_services:
   services:
     - id: grasp_grounding
-      bundle_path: models/perception/grounding_dino_swint_seq8_1280x720_ascend
+      bundle_path: models/grounding_dino_swint_seq8_1280x720_ascend
       deployment: ascend_310p
       service_type: ibrobot_msgs/srv/GroundingDetect
     - id: grasp_segmentation
-      bundle_path: models/perception/sam2_hiera_tiny_ascend
+      bundle_path: models/sam2_hiera_tiny_ascend
       deployment: ascend_310p
       service_type: ibrobot_msgs/srv/SegmentDetections
 ```

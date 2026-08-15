@@ -68,8 +68,8 @@ colcon build --symlink-install --merge-install --packages-up-to \
 
 ```bash
 cd /root/IB_Robot
-test -f models/perception/grounding_dino_swint_seq8_1280x720_ascend/inference_manifest.json
-test -f models/perception/sam2_hiera_tiny_ascend/inference_manifest.json
+test -f models/grounding_dino_swint_seq8_1280x720_ascend/inference_manifest.json
+test -f models/sam2_hiera_tiny_ascend/inference_manifest.json
 test -f models/grasp/graspgen_robotiq_2f_140/inference_manifest.json
 ```
 
@@ -78,7 +78,7 @@ PC 使用 CUDA bundle。首次部署或 GraspGen 模型变化后重新生成 man
 ```bash
 cd ~/IB_Robot
 source .shrc_local
-test -f models/perception/grounded_sam2_swint_ogc/inference_manifest.json
+test -f models/grounded_sam2_swint_ogc/inference_manifest.json
 ros2 run perception_service package_graspgen_torch_bundle \
   --source-root models/grasp \
   --bundle-root models/grasp/graspgen_robotiq_2f_140

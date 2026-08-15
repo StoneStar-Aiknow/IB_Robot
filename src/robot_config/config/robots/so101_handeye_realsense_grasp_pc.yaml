@@ -51,7 +51,7 @@ robot:
       - id: grasp_grounding
         enabled: true
         required: true
-        bundle_path: models/perception/grounded_sam2_swint_ogc
+        bundle_path: models/grounded_sam2_swint_ogc
         deployment: torch_cuda
         adapter_class: perception_service.model_service_plugins:GroundingDetectPlugin
         service_type: ibrobot_msgs/srv/GroundingDetect
