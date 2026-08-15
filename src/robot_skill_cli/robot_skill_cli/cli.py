@@ -506,6 +506,21 @@ def _unknown_agent_result() -> dict[str, Any]:
     }
 
 
+def _rejected_agent_result() -> dict[str, Any]:
+    return {
+        "success": False,
+        "plan_id": "",
+        "plan_digest": "",
+        "workflow_digest": "",
+        "completed_step_count": 0,
+        "error_code": "GOAL_REJECTED",
+        "message": "agent plan goal was rejected; the server never created this goal",
+        "actual_registry_epoch": "",
+        "actual_registry_generation": 0,
+        "actual_registry_digest": "",
+    }
+
+
 def _agent_terminal_expectation(args: argparse.Namespace) -> dict[str, Any]:
     expectation = {
         "plan_id": str(args.plan_id).strip(),
@@ -643,6 +658,9 @@ def _run_execute_plan(args: argparse.Namespace, context, bridge) -> _CommandExit
         except Exception:
             return converge_or_unknown()
         if goal_handle is None or not goal_handle.accepted:
+            if not interrupt_event.is_set():
+                emit_result(_rejected_agent_result())
+                return _CommandExit(13)
             return converge_or_unknown()
         try:
             result_future = goal_handle.get_result_async()

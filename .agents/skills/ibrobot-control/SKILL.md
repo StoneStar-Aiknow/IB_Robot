@@ -1,6 +1,6 @@
 ---
 name: ibrobot-control
-description: "Use when a user asks Hermes or an Agent to discover, validate, execute, cancel, or stop IB-Robot capabilities through the `robot-skill` CLI and ROS Capability Gateway. Covers 'run a robot skill', 'execute robot action', 'cancel motion', 'stop robot', '执行机器人动作', '取消动作', '停止机器人', 'nod', 'wave', 'celebrate', 'look around', or interact with existing high-level robot skills. Requires explicit user motion confirmation before any physical motion; never bypasses the Gateway or calls raw ros2 / MoveIt / controller commands directly."
+description: "Use when a user asks Hermes or an Agent to discover, validate, execute, cancel, or stop IB-Robot capabilities through the `robot-skill` CLI and ROS Capability Gateway. Covers 'run a robot skill', 'execute robot action', 'cancel motion', 'stop robot', '执行机器人动作', '取消动作', '停止机器人', 'nod', 'wave', 'celebrate', 'look around', or interact with existing high-level robot skills. Requires the exact plan to be presented and flushed before any physical motion; the user aborts a wrong plan with 别动 during execution; never bypasses the Gateway or calls raw ros2 / MoveIt / controller commands directly."
 ---
 
 # IB-Robot Control
@@ -45,8 +45,8 @@ object. Invoke `plan-workflow` once with all three required options; do not prob
 
 Construct request IDs and task IDs directly in the conversation and `robot-skill` arguments. Do not call Python,
 `uuidgen`, `date`, a shell, or any other helper tool to generate them. A command approval, including session-wide
-approval, authorizes only that command and is not user motion confirmation. Only an explicit user response confirming
-the displayed plan/task tuple permits `confirm-plan`.
+approval, authorizes only that command and is not motion authorization. The displayed plan/task tuple is bound internally
+by `confirm-plan` immediately after the presentation flush.
 
 Natural-language single-Skill and Workflow requests both use the plan workflow above. The internal `confirm-plan` call is
 the Gateway's technical binding for the exact plan/task tuple, not a second user confirmation gate. For an explicitly
@@ -157,7 +157,7 @@ required workflow.
 | Mistake | Correction |
 |---|---|
 | Treating accepted cancellation as physical stop | Wait for a terminal result or task ledger terminal state. |
-| Treating command approval as motion confirmation | Wait for an explicit response confirming the displayed plan. |
+| Treating command approval as motion authorization | Command approval authorizes only that command; motion still requires operator `authorize_motion` and a flushed plan presentation. |
 | Retrying after checking idle | Require a new user request and repeat the entire workflow; never retry automatically. |
 | Continuing after an unknown stop | `继续` needs a definite canceled terminal (5 + `SKILL_CANCELLED`). Otherwise refuse continuation and send no motion. |
 | Slicing completed steps on `继续` | Reject breakpoint resume until the Gateway provides server-owned continuation admission. |

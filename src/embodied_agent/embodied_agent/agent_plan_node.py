@@ -165,9 +165,20 @@ class AgentPlanNode(Node):
 
     @staticmethod
     def _mark_replayed_canceled(goal_handle) -> None:
-        """Move a fresh idempotent replay through ROS 2's canceling state."""
+        """Move a fresh idempotent replay through ROS 2's canceling state.
+
+        Uses ServerGoalHandle._update_state, private in rclpy; verified against
+        Humble at adoption time. Re-verify on rclpy upgrades (see
+        test_agent_plan_node replay-cancel tests).
+        """
         if not goal_handle.is_cancel_requested:
-            goal_handle._update_state(GoalEvent.CANCEL_GOAL)  # noqa: SLF001
+            update = getattr(goal_handle, "_update_state", None)
+            if update is None or not hasattr(goal_handle, "is_cancel_requested"):
+                raise AgentPlanError(
+                    "SKILL_CANCEL_TIMEOUT",
+                    "rclpy goal-handle API changed; replay cancel unavailable",
+                )
+            update(GoalEvent.CANCEL_GOAL)
         goal_handle.canceled()
 
     @staticmethod
