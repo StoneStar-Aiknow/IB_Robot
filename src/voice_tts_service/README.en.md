@@ -174,6 +174,17 @@ artifacts, tokenizer assets, prompt profiles, and the vocoder checkpoint.
 The bundle must use manifest schema v2, declare `model.kind=generic` and `model.family=zipvoice`, and contain the
 selected named deployment.
 
+### 5.1 Verified deployments
+
+| deployment | backend | runtime | description |
+| --- | --- | --- | --- |
+| `ascend_310p` | ascend | ACL + OM | Orchestrates Text Encoder OM, Flow Decoder OM, and CPU Vocos on 310P |
+| `ubuntu_onnx` | torch | onnxruntime + CPU | Loads upstream ONNX models via onnxruntime on Ubuntu, reusing 310P bundle tokens/Vocos/prompt assets |
+
+The `ubuntu_onnx` deployment's ONNX models are fetched from [k2-fsa/ZipVoice](https://github.com/k2-fsa/ZipVoice)
+(ModelScope mirror) via `scripts/download_voice_tts_models.sh`, which also generates `zipvoice_onnx.json` and
+`inference_manifest.json` so the bundle is immediately ready for `deployment:=ubuntu_onnx`.
+
 The bundle digest and deployment fingerprint identify structure and deployment consistency; they do not read
 model contents or provide runtime tamper protection. Before copying, the 310P packager verifies the SHA-256 of
 known source OMs, the Vocos checkpoint, token table, and golden fixtures. Runtime validates the manifest, path
@@ -181,7 +192,7 @@ safety, file presence, and model ABI. Use signed read-only images or verity when
 content authenticity. The runtime never infers a backend from the operating system and never falls back after
 load failure.
 
-### 5.1 Packaging an Ascend 310P delivery
+### 5.2 Packaging an Ascend 310P delivery
 
 Large model files are not committed to Git. Package a prepared ZipVoice delivery into the standard bundle:
 

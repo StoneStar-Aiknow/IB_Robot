@@ -203,7 +203,7 @@ bundle 必须满足：
 | `ascend_310p` | ascend | ACL + OM | 310P 上编排 Text Encoder OM、Flow Decoder OM 和 CPU Vocos |
 | `ubuntu_onnx` | torch | onnxruntime + CPU | Ubuntu 主机用 onnxruntime 加载上游 ONNX 模型，复用 310P bundle 的 tokens/Vocos/prompt 资产 |
 
-`ubuntu_onnx` deployment 的 ONNX 模型从 [k2-fsa/ZipVoice](https://github.com/k2-fsa/ZipVoice) 上游获取（ModelScope 镜像），通过 `scripts/download_voice_tts_models.sh` 下载。
+`ubuntu_onnx` deployment 的 ONNX 模型从 [k2-fsa/ZipVoice](https://github.com/k2-fsa/ZipVoice) 上游获取（ModelScope 镜像），通过 `scripts/download_voice_tts_models.sh` 下载。该脚本同时生成 `zipvoice_onnx.json` 运行时配置和 `inference_manifest.json`（含 `ubuntu_onnx` deployment），使 bundle 可直接用于 `deployment:=ubuntu_onnx`。
 
 manifest 的 bundle digest 和 deployment fingerprint 用于结构身份与部署一致性，不读取模型文件内容，
 也不提供运行时防篡改。310P 打包工具会在复制前校验已知来源的 OM、Vocos checkpoint、token table
@@ -212,7 +212,7 @@ manifest 的 bundle digest 和 deployment fingerprint 用于结构身份与部�
 
 运行时不会根据操作系统推断后端，也不会在 deployment 加载失败时回退到另一个后端。
 
-### 5.1 打包 Ascend 310P 模型
+### 5.2 打包 Ascend 310P 模型
 
 模型文件体积较大，不提交到 Git。使用打包工具从已准备好的 ZipVoice 交付目录生成标准 bundle：
 

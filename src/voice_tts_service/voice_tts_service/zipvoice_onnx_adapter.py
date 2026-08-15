@@ -1,8 +1,9 @@
-"""ZipVoice-Distill ONNX adapter for Ubuntu/CUDA hosts.
+"""ZipVoice-Distill ONNX adapter for Ubuntu CPU hosts.
 
-Reuses the 310P adapter's Chinese tokenizer, prompt profile, cross-fade
-concatenation, and Vocos vocoder. Replaces the Ascend OM bucket inference
-with onnxruntime dynamic-shape inference from the k2-fsa/ZipVoice upstream.
+Reuses the shared Chinese tokenizer, prompt profile, cross-fade concatenation,
+and Vocos vocoder from :mod:`voice_tts_service.zipvoice_shared`.  Replaces the
+Ascend OM bucket inference with onnxruntime CPU inference from the
+k2-fsa/ZipVoice upstream.
 """
 
 from __future__ import annotations
@@ -22,12 +23,8 @@ from inference_service.backends.errors import BackendLoadError as SessionLoadErr
 from inference_service.backends.lifecycle import PartialLoadRollback
 from inference_service.generic_runtime import NamedTensorRequest
 from inference_service.model_sessions.base import ModelSession
-
-from .errors import BackendLoadError
-from .zipvoice_310p_adapter import ZipVoiceAscendSession, _ChineseTokenizer, _PromptProfile
-
-_cross_fade_concat = ZipVoiceAscendSession._cross_fade_concat
-_timesteps = ZipVoiceAscendSession._timesteps
+from voice_tts_service.errors import BackendLoadError
+from voice_tts_service.zipvoice_shared import ChineseTokenizer, PromptProfile, cross_fade_concat, timesteps
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +32,7 @@ logger = logging.getLogger(__name__)
 class ZipVoiceOnnxSession(ModelSession):
     """Run the ZipVoice-Distill ONNX pipeline with onnxruntime on Ubuntu."""
 
-    def __init__(self, device_id: int = 0, *, prompt_profile: str = "default", **kwargs) -> None:
+    def __init__(self, *, prompt_profile: str = "default", **kwargs) -> None:
         super().__init__(
             "zipvoice-onnx",
             BackendCapabilities(
@@ -46,8 +43,8 @@ class ZipVoiceOnnxSession(ModelSession):
         self._root: Path | None = None
         self._prompt_profile_name = prompt_profile
         self._config: dict[str, Any] = {}
-        self._tokenizer: _ChineseTokenizer | None = None
-        self._prompt: _PromptProfile | None = None
+        self._tokenizer: ChineseTokenizer | None = None
+        self._prompt: PromptProfile | None = None
         self._vocos = None
         self._torch = None
         self._text_encoder = None
@@ -97,14 +94,15 @@ class ZipVoiceOnnxSession(ModelSession):
         except (ImportError, OSError) as exc:
             raise BackendLoadError(f"onnxruntime is unavailable: {exc}") from exc
 
+        config = self._config
         sess_opts = ort.SessionOptions()
-        sess_opts.inter_op_num_threads = 4
-        sess_opts.intra_op_num_threads = 4
+        sess_opts.inter_op_num_threads = int(config.get("inter_op_num_threads", 4))
+        sess_opts.intra_op_num_threads = int(config.get("intra_op_num_threads", 4))
 
         text_encoder_path = self._asset("text_encoder_path")
         fm_decoder_path = self._asset("fm_decoder_path")
 
-        providers = ["CPUExecutionProvider"]
+        providers = list(config.get("providers", ["CPUExecutionProvider"]))
         self._text_encoder = ort.InferenceSession(str(text_encoder_path), sess_options=sess_opts, providers=providers)
         self._fm_decoder = ort.InferenceSession(str(fm_decoder_path), sess_options=sess_opts, providers=providers)
         meta = self._fm_decoder.get_modelmeta().custom_metadata_map
@@ -134,8 +132,8 @@ class ZipVoiceOnnxSession(ModelSession):
             raise BackendLoadError("ZipVoice prompt profile tensor shapes are invalid")
         if features.shape[2] != self._feat_dim or not np.isfinite(features).all():
             raise BackendLoadError("ZipVoice prompt profile features are invalid")
-        self._prompt = _PromptProfile(tokens=tokens, features=features)
-        self._tokenizer = _ChineseTokenizer(self._asset("tokens_path"))
+        self._prompt = PromptProfile(tokens=tokens, features=features)
+        self._tokenizer = ChineseTokenizer(self._asset("tokens_path"))
         self._load_vocos()
 
     def _load_vocos(self) -> None:
@@ -184,17 +182,17 @@ class ZipVoiceOnnxSession(ModelSession):
 
         token_strings = self._tokenizer.text_to_tokens(text)
         chunks = self._tokenizer.chunk_tokens(token_strings, text_capacity)
-        timesteps = _timesteps(num_steps, t_shift)
+        ts = timesteps(num_steps, t_shift)
         rng = np.random.default_rng(int(config.get("seed", 42)))
-        waves = [self._synthesize_chunk(chunk, rng, timesteps) for chunk in chunks]
+        waves = [self._synthesize_chunk(chunk, rng, ts) for chunk in chunks]
         if not waves:
             raise SessionInferenceError("ZipVoice frontend produced no token chunks")
-        wave = _cross_fade_concat(waves, sample_rate, cross_fade_sec)
+        wave = cross_fade_concat(waves, sample_rate, cross_fade_sec)
         if wave.size == 0 or not np.isfinite(wave).all():
             raise SessionInferenceError("ZipVoice produced invalid audio")
         return {"tts.audio": np.ascontiguousarray(np.clip(wave, -1.0, 1.0), dtype=np.float32)}
 
-    def _synthesize_chunk(self, tokens: list[str], rng, timesteps: np.ndarray) -> np.ndarray:
+    def _synthesize_chunk(self, tokens: list[str], rng, ts: np.ndarray) -> np.ndarray:
         config = self._config
         speed = float(config.get("speed", 1.0))
         guidance_scale = float(config.get("guidance_scale", 3.0))
@@ -223,9 +221,9 @@ class ZipVoiceOnnxSession(ModelSession):
         copy_frames = min(prompt.frame_count, num_frames)
         speech_condition[:, :copy_frames, :] = prompt.features[:, :copy_frames, :]
 
-        for step in range(len(timesteps) - 1):
+        for step in range(len(ts) - 1):
             velocity = self._run_fm_decoder(
-                np.asarray(timesteps[step], dtype=np.float32),
+                np.asarray(ts[step], dtype=np.float32),
                 x,
                 text_condition,
                 speech_condition,
@@ -234,7 +232,7 @@ class ZipVoiceOnnxSession(ModelSession):
             velocity = np.asarray(velocity, dtype=np.float32).reshape(x.shape)
             if not np.isfinite(velocity).all():
                 raise SessionInferenceError("ZipVoice flow decoder produced NaN or Inf")
-            x += velocity * np.float32(timesteps[step + 1] - timesteps[step])
+            x += velocity * np.float32(ts[step + 1] - ts[step])
 
         generated = x[:, prompt.frame_count :, :]
         features = np.transpose(generated, (0, 2, 1)) / np.float32(feature_scale)

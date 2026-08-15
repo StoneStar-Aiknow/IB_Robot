@@ -23,7 +23,6 @@ def build_zipvoice_session(context: RuntimeContext) -> ModelSession:
         )
     if isinstance(deployment, TorchDeployment):
         return ZipVoiceOnnxSession(
-            device_id=int(options.get("device_id", VOICE_TTS_DEFAULTS["device_id"])),
             prompt_profile=str(options.get("prompt_profile", VOICE_TTS_DEFAULTS["prompt_profile"])),
         )
     raise ValueError(f"ZipVoice plugin does not support backend: {deployment.backend}")
