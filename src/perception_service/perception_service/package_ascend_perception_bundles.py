@@ -105,7 +105,7 @@ def _link(semantic: str, producer: str, consumer: str) -> DeviceLink:
 def _sam2_deployment(name: str, soc: str, candidate: str, decoder_name: str, batch: int) -> DeploymentSpec:
     encoder = _artifact(
         "encoder",
-        f"sam2.1_hiera_tiny/model_utils_work/candidates/{candidate}/sam2_encoder.om",
+        f"_work/sam2.1_hiera_tiny/candidates/{candidate}/sam2_encoder.om",
         _bindings(
             (_binding("image", 0, "float32", (1, 3, 1024, 1024), "NCHW", "image"),),
             (
@@ -138,7 +138,7 @@ def _sam2_deployment(name: str, soc: str, candidate: str, decoder_name: str, bat
     )
     decoder = _artifact(
         "decoder",
-        f"sam2.1_hiera_tiny/model_utils_work/candidates/{candidate}/{decoder_name}",
+        f"_work/sam2.1_hiera_tiny/candidates/{candidate}/{decoder_name}",
         _bindings(
             (
                 _binding("internal.image_embed", 0, "float32", (1, 256, 64, 64), "NCHW"),
@@ -178,7 +178,7 @@ def _sam2_deployment(name: str, soc: str, candidate: str, decoder_name: str, bat
 def _siglip_deployment(name: str, soc: str, candidate: str, text_name: str, vision_name: str, batch: int):
     vision = _artifact(
         "vision",
-        f"siglip2_so400m_patch14_384/model_utils_work/candidates/{candidate}/{vision_name}",
+        f"_work/siglip2_so400m_patch14_384/candidates/{candidate}/{vision_name}",
         _bindings(
             (_binding("host.siglip2.image", 0, "float32", (1, 3, 384, 384), "NCHW", "image"),),
             (
@@ -189,7 +189,7 @@ def _siglip_deployment(name: str, soc: str, candidate: str, text_name: str, visi
     )
     text = _artifact(
         "text",
-        f"siglip2_so400m_patch14_384/model_utils_work/candidates/{candidate}/{text_name}",
+        f"_work/siglip2_so400m_patch14_384/candidates/{candidate}/{text_name}",
         _bindings(
             (_binding("host.siglip2.input_ids", 0, "int64", (batch, 64), runtime_name="input_ids"),),
             (
@@ -202,7 +202,7 @@ def _siglip_deployment(name: str, soc: str, candidate: str, text_name: str, visi
 
 
 def _grounding_dino_deployment() -> DeploymentSpec:
-    root = "grounded_sam2_swint_ogc/model_utils_work/candidates/ascend_310p"
+    root = "_work/grounded_sam2_swint_ogc/candidates/ascend_310p"
     text_mask = _binding("text_token_mask", 2, "int64", (1, 8), runtime_name="text_token_mask")
     position_ids = _binding("position_ids", 3, "int64", (1, 8), runtime_name="position_ids")
     attention = _binding("text_self_attention_masks", 4, "int64", (1, 8, 8), runtime_name="text_self_attention_masks")
@@ -482,7 +482,7 @@ def _specs() -> dict[str, BundleSpec]:
             deployments=(_grounding_dino_deployment(),),
             assets=(
                 (
-                    "grounded_sam2_swint_ogc/model_utils_work/candidates/ascend_310p/encoder_tgt.npy",
+                    "_work/grounded_sam2_swint_ogc/candidates/ascend_310p/encoder_tgt.npy",
                     "assets/encoder_tgt.npy",
                 ),
                 (

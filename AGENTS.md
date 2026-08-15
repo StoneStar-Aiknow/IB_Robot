@@ -72,6 +72,12 @@ source .shrc_local
 **禁止在普通 commit 中直接提交 `libs/lerobot` 的修改**。如需提交 lerobot 改动，
 必须通过 `ibrobot-lerobot-patch` skill 导出为 patch 文件。
 
+### 模型转换中间产物
+
+转换工作目录（ONNX、HMONNX、TCIM 编译缓存、calibration、OM candidates 等）统一位于
+`models/_work/<bundle>/<exporter>/`，**禁止写入任何 model bundle**。发布 bundle 只包含
+manifest 引用的 artifacts 与 LeRobot 元数据；`_work` 目录可独立归档或删除。
+
 ### 提交范围
 
 - 只暂存和提交本次任务相关的文件，禁止 `git add .`

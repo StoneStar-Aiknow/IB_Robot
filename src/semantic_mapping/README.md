@@ -173,16 +173,17 @@ service bundles，也不要求 service semantic identities；service 模式仍�
 
 ```text
 models/
+├── _work/<bundle>/candidates/          # 转换中间产物，可随时归档/删除
 ├── sam2.1_hiera_tiny/{inference_manifest.json,assets/}
-├── ram_plus_swin_large_14m/{inference_manifest.json,assets/,model_utils_work/}
-├── siglip2_so400m_patch14_384/{inference_manifest.json,assets/,model_utils_work/}
-└── grounded_sam2_swint_ogc/{inference_manifest.json,assets/,model_utils_work/}
+├── ram_plus_swin_large_14m/{inference_manifest.json,assets/}
+├── siglip2_so400m_patch14_384/{inference_manifest.json,assets/}
+└── grounded_sam2_swint_ogc/{inference_manifest.json,assets/}
 ```
 
 RAM++ runtime 由 `third_party/wheels/recognize-anything/` 中受控的 `ibrobot-ram` wheel 提供；Grounding-DINO
 runtime 由 `third_party/wheels/groundingdino/` 中受控的 `ibrobot-groundingdino` 纯 Python wheel 提供；源码与权重分开管理。
-`model_utils_work/` 下的转换产物不是 production deployment。只有 manifest 声明并通过对应 conformance 的
-named deployment 才能在 production SSOT 中启用。
+`models/_work/` 下的转换产物不是 production deployment，也不属于任何 bundle。只有 manifest 声明并通过对应
+conformance 的 named deployment 才能在 production SSOT 中启用。
 
 映射清单使用各服务响应中经过规范化校验的 `ModelRuntimeInfo.semantic_identity_json`，SigLIP2 图像与文本查询还
 必须具有相同的 `embedding_space_id`、维度、归一化和双端预处理契约。backend、named deployment、deployment

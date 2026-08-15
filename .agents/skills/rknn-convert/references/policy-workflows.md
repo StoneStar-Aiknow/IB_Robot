@@ -21,7 +21,7 @@ python3 src/model_utils/model_utils/export_onnx_rknn.py \
     --deployment rknn_rk3588
 ```
 
-The exporter writes intermediate files below `<bundle>/model_utils_work/rknn`, requires the RKNN
+The exporter writes intermediate files below `models/_work/<bundle>/rknn`, requires the RKNN
 compiler to emit `<model>.rknn.abi.json`, copies the final artifact under the bundle's managed
 artifact directory, and calls `upsert_deployment()` to update `inference_manifest.json`.
 
@@ -68,8 +68,14 @@ SmolVLA uses three compiled modules plus host-side token embedding and state pro
 source .shrc_local
 python3 src/model_utils/model_utils/smolvla_export/export_rknn_modules.py \
     --model_path models/<smolvla_bundle> \
-    --output_dir models/<smolvla_bundle>
+    --output_dir models/_work/<smolvla_bundle>/rknn \
+    --bundle_root models/<smolvla_bundle>
 ```
+
+`--output_dir` is the work directory for ONNX, calibration data, and host artifacts;
+`--bundle_root` receives the LeRobot metadata and the unified manifest. Omitting
+`--bundle_root` keeps everything (including the manifest) in the work directory for
+experiments only.
 
 Compile the generated vision, prefill, and action ONNX files with the isolated helper. Each RKNN
 must retain its matching compiler ABI JSON.
@@ -80,19 +86,21 @@ must retain its matching compiler ABI JSON.
 source .shrc_local
 python3 src/model_utils/model_utils/smolvla_export/export_rknn_modules.py \
     --model_path models/<smolvla_bundle> \
-    --output_dir models/<smolvla_bundle> \
+    --output_dir models/_work/<smolvla_bundle>/rknn \
+    --bundle_root models/<smolvla_bundle> \
     --package_only \
     --deployment rknn_rk3588 \
     --target_soc rk3588 \
     --target_runtime rknn-lite2
 ```
 
-By default, package-only mode expects these files below `<output_dir>/onnx`:
+By default, package-only mode expects these files below the work directory `<output_dir>/onnx`:
 
 - `smolvla_vision.rknn` and `smolvla_vision.rknn.abi.json`
 - `smolvla_prefill.rknn` and `smolvla_prefill.rknn.abi.json`
 - `smolvla_action.rknn` and `smolvla_action.rknn.abi.json`
 
 Use `--vision_rknn`, `--vision_abi`, `--prefill_rknn`, `--prefill_abi`, `--action_rknn`, and
-`--action_abi` when compiler outputs are elsewhere. The packager also requires `token_embedding.pt`,
-`state_projection.pt`, and the original LeRobot metadata in the bundle.
+`--action_abi` when compiler outputs are elsewhere. The packager resolves `token_embedding.pt`
+and `state_projection.pt` from the work directory first and falls back to the bundle; the
+original LeRobot metadata must be in `--bundle_root`.

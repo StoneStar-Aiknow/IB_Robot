@@ -18,7 +18,7 @@ def parse_args():
     parser.add_argument("--pretrained_model", type=str, required=True, help="The path of pretrained model")
     parser.add_argument("--soc_version", type=str, required=True, help="The Ascend soc version")
     parser.add_argument(
-        "--work_dir", type=str, default=None, help="Build work directory (default: <bundle>/model_utils_work/ascend)"
+        "--work_dir", type=str, default=None, help="Build work directory (default: models/_work/<bundle>/ascend)"
     )
     parser.add_argument("--onnx_model_path", type=str, default=None, help="ONNX work output path")
     parser.add_argument("--om_model_path", type=str, default=None, help="ATC OM work output path")

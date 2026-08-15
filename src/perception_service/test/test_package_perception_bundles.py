@@ -45,7 +45,7 @@ def test_ram_plus_packager_promotes_available_ascend_om_deployments(tmp_path) ->
     root = tmp_path / spec.name
     _write_required_assets(root, spec)
     for compiled in spec.compiled:
-        candidate = root / compiled.source
+        candidate = root.parent / "_work" / root.name / compiled.source
         candidate.parent.mkdir(parents=True, exist_ok=True)
         candidate.write_bytes(compiled.deployment.encode())
 
@@ -65,7 +65,7 @@ def test_ram_plus_packager_promotes_available_ascend_om_deployments(tmp_path) ->
 
     compiled = spec.compiled[0]
     deployment = first.deployments[compiled.deployment]
-    candidate = root / compiled.source
+    candidate = root.parent / "_work" / root.name / compiled.source
     candidate.write_bytes(b"replacement-om")
     package_bundle(root, spec)
     third = load_inference_manifest(root, compiled.deployment).manifest

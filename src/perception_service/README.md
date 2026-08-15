@@ -266,8 +266,8 @@ SigLIP2 image/text 服务共享同一 bundle 与 embedding identity，但仍由�
 由 `third_party/wheels/recognize-anything/` 中固定上游 commit 和补丁构建的 `ibrobot-ram` wheel 提供；Grounding-DINO
 runtime 由 `third_party/wheels/groundingdino/` 中固定上游 commit 和补丁构建的 `ibrobot-groundingdino` 纯 Python wheel
 提供（Transformers 5 兼容补丁已固化进源码，运行时不再 monkey-patch `transformers.BertModel`）；源码不是模型
-资产。ONNX、OM 等未验证转换结果只能放在
-bundle 的 `model_utils_work/`，通过 conformance 与 promotion 后才可复制到不可变
+资产。ONNX、OM 等未验证转换结果只能放在 bundle 外的
+`models/_work/<bundle>/candidates/`，通过 conformance 与 promotion 后才可复制到不可变
 `artifacts/<backend>/<deployment>/generations/<uuid>/` 并注册为 named deployment。
 
 `RecognizeTags` 的 mask 输出按 mask 顺序扁平化，`mask_tag_counts` 描述每个 mask 对应的 slice。Adapter 固定过滤
@@ -276,7 +276,7 @@ RAM++ 颜色属性；调用方通过请求中的 `excluded_labels` 提供场景�
 帧级诊断，不用于替代局部物体标签。
 
 经 ABI 审核的 compiled-only 资产由 `perception_service.package_ascend_perception_bundles` 从
-`model_utils_work/candidates/ascend_*` 打包。SAM2 和 SigLIP2 提供 `ascend_310p`、`ascend_310b` deployment；
+`models/_work/<bundle>/candidates/ascend_*` 打包。SAM2 和 SigLIP2 提供 `ascend_310p`、`ascend_310b` deployment；
 Grounding DINO 当前只提供固定 720x1280、文本长度 8 的 `ascend_310p` deployment。多 OM pipeline 的中间 tensor
 通过 manifest `device_links` 保持在设备侧，service adapter 只负责模型语义预处理与最终输出后处理。
 

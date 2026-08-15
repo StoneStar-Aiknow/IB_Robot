@@ -4,6 +4,7 @@ set -euo pipefail
 WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 IMAGE="${HOUMO_IMAGE:-harbor.houmo.ai/toolchain/release:Dadao-xh2-v1.3.0-ubuntu24.04-x86.64}"
 OUTPUT_REL="${PI05_HMM_OUTPUT:-models/pi05_hmm_standard}"
+WORK_REL="${PI05_HMM_WORK:-models/_work/${OUTPUT_REL##*/}}"
 PIP_CACHE="${PIP_CACHE_DIR:-${HOME}/.cache/pip}"
 
 if [[ -z "${MODEL_BUNDLE_ROOT:-}" ]]; then
@@ -41,7 +42,7 @@ if ! git -C "${WORKSPACE}/libs/lerobot" merge-base --is-ancestor \
     exit 1
 fi
 
-mkdir -p "${WORKSPACE}/${OUTPUT_REL}/outputs"
+mkdir -p "${WORKSPACE}/${WORK_REL}/outputs"
 
 docker run --rm --device nvidia.com/gpu=all --ipc=host \
     -e IBR_HOUMO_IMAGE_ID="${IMAGE_ID}" \
@@ -62,12 +63,13 @@ docker run --rm --device nvidia.com/gpu=all --ipc=host \
             --repo-root /workspace \
             --model-path /work/models/pi05_libero_finetuned \
             --lerobot-src /workspace/libs/lerobot/src \
-            --output-dir /workspace/${OUTPUT_REL}/outputs/xh2
+            --output-dir /workspace/${WORK_REL}/outputs/xh2 \
+            --bundle-root /workspace/${OUTPUT_REL}
         python3 -m model_utils.pi05_export.build_hmm_modules \
-            --output-dir /workspace/${OUTPUT_REL}/outputs/xh2
+            --output-dir /workspace/${WORK_REL}/outputs/xh2
         python3 -m model_utils.pi05_export.package_hmm_modules \
             --bundle-root /workspace/${OUTPUT_REL} \
-            --output-dir /workspace/${OUTPUT_REL}/outputs/xh2 \
+            --output-dir /workspace/${WORK_REL}/outputs/xh2 \
             --deployment hmm \
             --target-soc lq50 \
             --target-runtime tcim-lite

@@ -35,11 +35,11 @@ Do not expose these references as separate skills.
 
 ## Required Workflow
 
-1. Export ONNX from the original LeRobot bundle in the main workspace environment.
+1. Export ONNX from the original LeRobot bundle in the main workspace environment. Intermediates go to `models/_work/<bundle>/rknn/` (exporter default), never inside the bundle.
 2. Compile ONNX to RKNN in the isolated `.venv-rknn` environment.
 3. Preserve the compiler-emitted `*.rknn.abi.json`; it is the source of runtime tensor names,
    indices, dtypes, shapes, and image layouts.
-4. Package the RKNN artifacts and ABI bindings into the original bundle.
+4. Package the RKNN artifacts and ABI bindings into the original bundle: pass `--bundle_root models/<policy_bundle>` with the work directory as `--output_dir`. The bundle receives only manifest-referenced artifacts and LeRobot metadata.
 5. Write or update the named deployment in `<bundle-root>/inference_manifest.json`.
 6. Configure a named inference pipeline that selects that deployment.
 7. Validate the strict manifest loader and, when available, the RK3588 runtime.

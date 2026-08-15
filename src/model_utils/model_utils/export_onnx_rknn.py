@@ -271,7 +271,7 @@ def parse_args():
         "--work_dir",
         type=str,
         default=None,
-        help="Build work directory (default: <bundle>/model_utils_work/rknn when a bundle is available)",
+        help="Build work directory (default: models/_work/<bundle>/rknn when a bundle is available)",
     )
 
     parser.add_argument(

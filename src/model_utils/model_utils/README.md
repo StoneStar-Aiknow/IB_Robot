@@ -37,10 +37,11 @@ Exporter / packager 负责：
 不要手工编辑 identity、revision、digest 或 bindings。Runtime 不读取模型文件计算内容 SHA；正式
 artifact 更新必须经过 packager。
 
-导出器默认把可重建的 ONNX、compiler output 和 ABI metadata 放在
-`<bundle>/model_utils_work/<backend>/`。最终 manifest 只引用打包到
+导出器默认把可重建的 ONNX、compiler output 和 ABI metadata 放在 bundle 外的
+`models/_work/<bundle>/<backend>/`。最终 manifest 只引用打包到
 `artifacts/<backend>/<deployment>/` 的运行时 artifact。ABI JSON 用于生成 bindings，属于
 构建输入或编译器输出，不是运行时 artifact；参数帮助中的 `ABI input` / `ABI output` 明确其方向。
+发布或归档 bundle 时不得携带 `_work` 中间产物。
 
 ## 环境
 
@@ -97,7 +98,7 @@ python3 src/model_utils/model_utils/export_onnx_atc.py \
 ```
 
 未显式指定输出时，ONNX 和 ATC OM 工作产物写入
-`<bundle>/model_utils_work/ascend/`；最终 OM 自动复制到
+`models/_work/<bundle>/ascend/`；最终 OM 自动复制到
 `artifacts/ascend/<deployment>/`。`--om_abi_path` 是已有的 compiler/runtime introspection
 JSON 输入，ATC 命令本身不生成该文件。
 
@@ -153,7 +154,7 @@ Hisilicon deployment 必须包含：
 - 可执行的 `worker` artifact，format `executable`
 - `policy` role 的完整 inputs/outputs bindings
 
-Hisilicon ONNX 默认写入 `<policy_bundle>/model_utils_work/hisilicon/`。
+Hisilicon ONNX 默认写入 `models/_work/<policy_bundle>/hisilicon/`。
 
 ## ACT RKNN
 
@@ -198,7 +199,7 @@ python3 src/model_utils/model_utils/export_onnx_rknn.py \
 `--rknn_abi_output`，否则 exporter 不会写入 deployment。图像 layout 由 ABI 显式声明，
 runtime 只对 `NHWC` image bindings 转换布局。
 
-从 checkpoint 导出时，工作产物默认写入 `<bundle>/model_utils_work/rknn/`；最终 RKNN
+从 checkpoint 导出时，工作产物默认写入 `models/_work/<bundle>/rknn/`；最终 RKNN
 自动复制到 `artifacts/rknn/<deployment>/`。`--rknn_abi_output` 是 converter 生成的输出。
 
 完整板端流程见 `docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md`。

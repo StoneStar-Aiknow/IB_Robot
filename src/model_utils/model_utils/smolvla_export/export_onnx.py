@@ -10,7 +10,7 @@ Usage:
   source .shrc_local
   python -m model_utils.smolvla_export.export_onnx \
       --policy-path models/smolvla/pretrained_model \
-      --output-dir models/smolvla/onnx
+      --output-dir models/_work/smolvla/onnx
 """
 
 from __future__ import annotations
@@ -23,6 +23,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from model_utils.export_paths import export_work_dir
 
 LOGGER = logging.getLogger(__name__)
 
@@ -289,7 +291,9 @@ def export_expert_onnx(wrapper, dummy_inputs, output_path, opset=17, dynamo=Fals
 def main():
     parser = argparse.ArgumentParser(description="Export SmolVLA to ONNX (VLM + Expert split)")
     parser.add_argument("--policy-path", type=str, required=True, help="Path to SmolVLA pretrained_model dir")
-    parser.add_argument("--output-dir", type=str, default=None, help="Output directory (default: <policy_path>/onnx)")
+    parser.add_argument(
+        "--output-dir", type=str, default=None, help="Output directory (default: models/_work/<policy>/onnx)"
+    )
     parser.add_argument("--device", type=str, default="cpu", help="Torch device for export")
     parser.add_argument("--opset", type=int, default=17, help="ONNX opset version")
     parser.add_argument("--dynamo", action="store_true", help="Use torch.onnx.dynamo_export (opset 18)")
@@ -303,8 +307,7 @@ def main():
     logging.basicConfig(level=getattr(logging, args.log_level.upper()))
 
     policy_path = Path(args.policy_path).expanduser().resolve()
-    output_dir = Path(args.output_dir or str(policy_path / "onnx")).expanduser().resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = export_work_dir(policy_path, "onnx", args.output_dir)
 
     vlm_onnx = output_dir / "smolvla_vlm.onnx"
     expert_onnx = output_dir / "smolvla_expert.onnx"

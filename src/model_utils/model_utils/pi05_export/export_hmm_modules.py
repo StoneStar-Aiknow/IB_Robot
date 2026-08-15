@@ -264,7 +264,7 @@ def _write_provenance(args: argparse.Namespace, output_dir: Path) -> None:
 def export_hmm(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     output_dir = Path(args.output_dir).resolve()
-    bundle_root = output_dir.parents[1]
+    bundle_root = Path(args.bundle_root).resolve() if args.bundle_root else output_dir.parents[1]
     copy_policy_metadata_bundle(args.model_path, bundle_root)
     onnx_dir = output_dir / "onnx"
     hmonnx_dir = output_dir / "hmonnx"
@@ -383,6 +383,11 @@ def main() -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--lerobot-src", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--bundle-root",
+        default=None,
+        help="Bundle root receiving LeRobot metadata (default: two levels above --output-dir)",
+    )
     parser.add_argument("--opset", type=int, default=17)
     parser.add_argument("--quant-type", default="w8a8h1_sefp")
     parser.add_argument("--seed", type=int, default=42)

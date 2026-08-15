@@ -31,12 +31,15 @@ Do not expose these references as separate skills.
 ## Required Workflow
 
 1. Use Houmo's current `houmo-examples-xh2` workflow to export, quantize, and compile the supported policy modules（详见 `references/compiler-outputs.md`）。
-2. Preserve the compiler-emitted TCIM `model.json` next to each `.hmm`; it is the source of runtime names, indices, dtypes, and shapes.
-3. Keep the original LeRobot bundle metadata read-only: `config.json`, processor JSON/state, tokenizer assets, and policy metadata.
-4. Create a path-only packaging spec for `package-hmm-deployment`（详见 `references/packaging-spec.md`）。
-5. Run the packager to write or update the bundle's only deployment manifest: `inference_manifest.json`.
-6. Configure a named inference pipeline that selects the generated deployment.
-7. Validate on the target or approved TCIM mocks.
+2. Write every conversion intermediate — ONNX, HMONNX, TCIM build caches, calibration data, `provenance.json` — to `models/_work/<bundle>/`, never inside a bundle. `convert_hmm.sh` does this by default (`SMOLVLA_HMM_WORK` / `PI05_HMM_WORK` overrides); manual runs must pass `--output-dir models/_work/...` plus `--bundle-root models/<bundle>`.
+3. Preserve the compiler-emitted TCIM `model.json` next to each `.hmm`; it is the source of runtime names, indices, dtypes, and shapes.
+4. Keep the original LeRobot bundle metadata read-only: `config.json`, processor JSON/state, tokenizer assets, and policy metadata.
+5. Create a path-only packaging spec for `package-hmm-deployment`（详见 `references/packaging-spec.md`）。
+6. Run the packager to write or update the bundle's only deployment manifest: `inference_manifest.json`. The bundle must end up containing only manifest-referenced artifacts plus LeRobot metadata.
+7. Configure a named inference pipeline that selects the generated deployment.
+8. Validate on the target or approved TCIM mocks.
+
+Bundle hygiene: before releasing or archiving a bundle, verify it contains no `onnx/`, `hmonnx/`, `calibration/`, `tcim/`, or `model_utils_work/` residue — those belong under `models/_work/` and can be archived or deleted independently.
 
 The packager owns artifact generations, bindings, execution order, device links, UUID/revision updates, lightweight structural identities, and strict-loader verification. Do not hand-edit generated manifest identities or tensor bindings.
 

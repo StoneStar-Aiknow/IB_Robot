@@ -147,14 +147,14 @@ def _specs() -> dict[str, BundleSpec]:
             compiled=(
                 CompiledSpec(
                     deployment="ascend_310p",
-                    source="model_utils_work/candidates/ascend_310p/ram_plus_310p.om",
+                    source="candidates/ascend_310p/ram_plus_310p.om",
                     artifact="artifacts/ascend_310p/ram_plus_310p.om",
                     target_soc="Ascend310P1",
                     bindings=RAM_PLUS_BINDINGS,
                 ),
                 CompiledSpec(
                     deployment="ascend_310b",
-                    source="model_utils_work/candidates/ascend_310b/ram_plus_swin_large_14m_fp16.om",
+                    source="candidates/ascend_310b/ram_plus_swin_large_14m_fp16.om",
                     artifact="artifacts/ascend_310b/ram_plus_swin_large_14m_fp16.om",
                     target_soc="Ascend310B1",
                     bindings=RAM_PLUS_BINDINGS,
@@ -256,8 +256,8 @@ def _asset_paths(root: Path) -> tuple[str, ...]:
 
 
 def _promote_compiled_artifact(root: Path, compiled: CompiledSpec) -> Path | None:
-    source = root / compiled.source
     artifact = root / compiled.artifact
+    source = root.parent / "_work" / root.name / compiled.source
     if source.is_file():
         artifact.parent.mkdir(parents=True, exist_ok=True)
         if not artifact.is_file() or _sha256(source) != _sha256(artifact):
