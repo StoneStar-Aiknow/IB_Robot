@@ -413,7 +413,7 @@ class SpeechDirectionNode(Node):
 
         # 两个平台仅在 executor 选择上分叉，随后共用 cumulative Host 增强器。
         stateful_backend = cfg.fullnet.backend.startswith("stateful_")
-        if cfg.fullnet.backend == "stateful_raw_acl":
+        if stateful_backend and cfg.fullnet.backend == "stateful_raw_acl":
             register_speech_direction_session_builder()
             bundle = Path(cfg.fullnet.inference_bundle)
             fullsubnet_manifest = load_inference_manifest(bundle, "ascend_310p_fullsubnet")
@@ -429,6 +429,15 @@ class SpeechDirectionNode(Node):
                 manifest_path=cfg.fullnet.stateful_manifest_path,
                 timing_enabled=cfg.diagnostics.fullsubnet_timing_enabled,
                 executor=SpeechDirectionRoleRunner(fullsubnet_session, fullsubnet_context),
+            )
+        elif stateful_backend:
+            fullnet = build_stateful_fullsubnet(
+                backend=cfg.fullnet.backend,
+                repo_dir=cfg.fullnet.repo_dir,
+                checkpoint_path=cfg.fullnet.ckpt,
+                manifest_path=cfg.fullnet.stateful_manifest_path,
+                device=cfg.fullnet.device,
+                timing_enabled=cfg.diagnostics.fullsubnet_timing_enabled,
             )
         else:
             # legacy 仅保留显式对照，不允许 stateful 构造失败后自动进入此分支。
