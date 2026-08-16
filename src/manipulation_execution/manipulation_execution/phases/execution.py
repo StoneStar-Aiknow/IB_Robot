@@ -545,23 +545,19 @@ class ExecutionPhase:
         release_after_success: bool = False,
         release_drop_height_m: float = -1.0,
     ) -> None:
-        current_joint_state = self._snapshot_joint_state()
-        if current_joint_state is None:
-            raise PickFlowError(
-                "JOINT_STATE_UNAVAILABLE",
-                f"no current joint state received from {self._joint_state_topic}",
-            )
+        candidate_seed = prepared.final_joint_state
         prepared = self._prepare_candidate(
             prepared.ranked,
             scene_base,
             goal_handle,
             deadline,
             apply_compensation=True,
-            initial_seed=current_joint_state,
+            initial_seed=candidate_seed,
         )
         plan = prepared.plan
         candidate = prepared.ranked.candidate
         final_grasp_joint_state = prepared.final_joint_state
+        current_joint_state = final_grasp_joint_state
         self._publish_feedback(goal_handle, state, "open", "opening gripper")
         self._run_primitive(
             goal_handle,

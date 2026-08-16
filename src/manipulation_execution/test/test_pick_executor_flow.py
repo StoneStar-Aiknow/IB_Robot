@@ -655,6 +655,7 @@ def test_close_gripper_is_immediate_after_descent_before_diagnostics():
     feedback: list[str] = []
     prepared = _full_prepared_candidate()
     joint_state = prepared.final_joint_state
+    live_joint_state = JointState()
     harness = SimpleNamespace(
         _config={
             "open_settle_sec": 0.0,
@@ -675,7 +676,7 @@ def test_close_gripper_is_immediate_after_descent_before_diagnostics():
         _joint_state_topic="/joint_states",
         get_logger=lambda: logger,
     )
-    harness._snapshot_joint_state = lambda: joint_state
+    harness._snapshot_joint_state = lambda: live_joint_state
     harness._validate_joint5_branch_continuity = lambda *_args: None
     prepare_calls = []
 
@@ -729,6 +730,7 @@ def test_close_gripper_is_immediate_after_descent_before_diagnostics():
     assert len(prepare_calls) == 2
     assert prepare_calls[0]["apply_compensation"] is True
     assert prepare_calls[0]["initial_seed"] is joint_state
+    assert prepare_calls[0]["initial_seed"] is not live_joint_state
     assert "apply_compensation" not in prepare_calls[1]
     assert prepare_calls[1]["enforce_contact_error"] is False
     assert prepare_calls[1]["enforce_fixed_finger_robust_gap"] is False
