@@ -15,12 +15,12 @@ from semantic_mapping.association import (
 )
 
 
-def _observation(position, stamp_ns, embedding, *, label="cup", confidence=0.8, candidates=()):
+def _observation(position, stamp_ns, embedding, *, label="cup", confidence=0.8, candidates=(), size=None):
     return SemanticObservation(
         label=label,
         confidence=confidence,
         position=np.asarray(position, dtype=np.float64),
-        size=np.array([0.08, 0.08, 0.12]),
+        size=np.array([0.08, 0.08, 0.12]) if size is None else np.asarray(size, dtype=np.float64),
         point_count=100,
         stamp_ns=stamp_ns,
         embedding=np.asarray(embedding, dtype=np.float32),
@@ -58,6 +58,19 @@ def test_siglip_identity_preserves_track_across_label_disagreement():
     assert second.attributes["label_evidence"] == {"cup": 1, "mug": 1}
 
 
+def test_geometry_size_jump_cannot_capture_existing_track():
+    tracker = SemanticTracker(
+        association_distance_m=0.5,
+        embedding_similarity_threshold=0.7,
+        max_size_ratio=4.0,
+    )
+    first = tracker.update(_observation([0.0, 0.0, 0.0], 1, [1.0, 0.0], label="brush", size=[0.05, 0.13, 0.03]))
+    floor_patch = tracker.update(_observation([0.1, 0.0, 0.0], 2, [1.0, 0.0], label="table", size=[0.75, 0.43, 0.04]))
+
+    assert floor_patch.object_id != first.object_id
+    assert len(tracker.tracks) == 2
+
+
 def test_track_label_alignment_prefers_high_confidence_over_raw_count():
     """Max-confidence-first election keeps a frequent weak label from beating a stronger label."""
     tracker = SemanticTracker(association_distance_m=0.5, embedding_similarity_threshold=0.7)
@@ -67,6 +80,19 @@ def test_track_label_alignment_prefers_high_confidence_over_raw_count():
 
     assert track.label == "banana"
     assert track.confidence == pytest.approx(0.95)
+
+
+def test_close_one_shot_confidence_does_not_replace_established_label():
+    tracker = SemanticTracker(
+        association_distance_m=0.5,
+        embedding_similarity_threshold=0.7,
+        label_switch_confidence_margin=0.05,
+    )
+    track = tracker.update(_observation([0.0, 0.0, 1.0], 1, [1.0, 0.0], label="chair", confidence=0.891))
+    track = tracker.update(_observation([0.01, 0.0, 1.0], 2, [1.0, 0.0], label="paper", confidence=0.900))
+
+    assert track.label == "chair"
+    assert track.confidence == pytest.approx(0.891)
 
 
 def test_cloud_refinement_confidence_is_preserved_across_new_observations():

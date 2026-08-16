@@ -208,8 +208,10 @@ robot:
       max_masks_per_batch: 8
     lifecycle:
       association_distance_m: 0.45
+      association_max_size_ratio: 4.0
       association_position_weight: 0.55
       embedding_similarity_threshold: 0.72
+      label_switch_confidence_margin: 0.05
       stale_after_sec: 10.0
       move_stability_m: 0.1
       move_confirmations: 2

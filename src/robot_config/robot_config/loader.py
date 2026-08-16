@@ -423,10 +423,13 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
 
     lifecycle = sections["lifecycle"]
     lifecycle_path = "semantic_mapping.lifecycle"
-    for key in ("association_distance_m", "stale_after_sec", "move_stability_m"):
+    for key in ("association_distance_m", "association_max_size_ratio", "stale_after_sec", "move_stability_m"):
         _positive_number(lifecycle, key, lifecycle_path, errors)
+    max_size_ratio = lifecycle.get("association_max_size_ratio")
+    if _is_finite_number(max_size_ratio) and float(max_size_ratio) < 1.0:
+        errors.append("semantic_mapping.lifecycle.association_max_size_ratio must be >= 1.0")
     _positive_integer(lifecycle, "move_confirmations", lifecycle_path, errors)
-    for key in ("association_position_weight", "embedding_similarity_threshold"):
+    for key in ("association_position_weight", "embedding_similarity_threshold", "label_switch_confidence_margin"):
         _unit_interval(lifecycle, key, lifecycle_path, errors)
 
     labels = sections["labels"]

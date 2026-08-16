@@ -114,6 +114,8 @@ class SemanticMappingNode(Node):
             association_distance_m=float(self.get_parameter("association_distance_m").value),
             embedding_similarity_threshold=float(self.get_parameter("embedding_similarity_threshold").value),
             position_weight=float(self.get_parameter("association_position_weight").value),
+            max_size_ratio=float(self.get_parameter("association_max_size_ratio").value),
+            label_switch_confidence_margin=float(self.get_parameter("label_switch_confidence_margin").value),
             stale_after_sec=float(self.get_parameter("stale_after_sec").value),
         )
         self._lifecycle = OnlineLifecycleCoordinator(
@@ -381,8 +383,10 @@ class SemanticMappingNode(Node):
             "min_mask_valid_depth_ratio": 0.2,
             "max_mask_overlap_ratio": 0.8,
             "association_distance_m": 0.45,
+            "association_max_size_ratio": 4.0,
             "association_position_weight": 0.55,
             "embedding_similarity_threshold": 0.72,
+            "label_switch_confidence_margin": 0.05,
             "min_label_confidence": 0.2,
             "max_label_candidates_per_mask": 5,
             "stale_after_sec": 10.0,

@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from robot_config.loader import load_robot_config, load_robot_config_dict, validate_config
+from robot_config.loader import (
+    load_robot_config,
+    load_robot_config_dict,
+    validate_config,
+    validate_semantic_mapping_config,
+)
 
 CONFIG_PATH = Path(__file__).parents[1] / "config" / "robots" / "lekiwi_mapping.yaml"
 FIXTURE_PATH = Path(__file__).parents[2] / "semantic_mapping" / "test" / "perception_bundle_fixture.py"
@@ -58,6 +63,8 @@ def test_disabled_semantic_mapping_contract_is_preserved() -> None:
     ]
     assert config.perception_services.enabled_services == ()
     assert config.semantic_mapping.label_refinement["enabled"] is False
+    assert config.semantic_mapping.lifecycle["association_max_size_ratio"] == 4.0
+    assert config.semantic_mapping.lifecycle["label_switch_confidence_margin"] == 0.05
     assert "sky" in config.semantic_mapping.labels["excluded_labels"]
     assert config.semantic_mapping.migration["grounded_sam2_node"] == "compatibility"
 
@@ -69,6 +76,20 @@ def test_enabled_semantic_mapping_contract_loads_and_validates(tmp_path: Path) -
     assert config.semantic_mapping.camera["peripheral"] == "realsense"
     assert "sky" in config.semantic_mapping.labels["excluded_labels"]
     assert validate_config(config) == []
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        ("association_max_size_ratio", 0.5, "association_max_size_ratio must be >= 1.0"),
+        ("label_switch_confidence_margin", 1.1, "label_switch_confidence_margin must be in"),
+    ],
+)
+def test_association_tuning_contract_fails_closed(tmp_path: Path, key: str, value: float, expected: str) -> None:
+    config = _enabled_config(tmp_path)
+    config["semantic_mapping"]["lifecycle"][key] = value
+
+    assert any(expected in error for error in validate_semantic_mapping_config(config))
 
 
 @pytest.mark.parametrize(

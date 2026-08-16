@@ -107,11 +107,15 @@ class SemanticTracker:
         association_distance_m: float = 0.45,
         embedding_similarity_threshold: float = 0.72,
         position_weight: float = 0.55,
+        max_size_ratio: float = 4.0,
+        label_switch_confidence_margin: float = 0.05,
         stale_after_sec: float = 10.0,
     ):
         self.association_distance_m = association_distance_m
         self.embedding_similarity_threshold = embedding_similarity_threshold
         self.position_weight = position_weight
+        self.max_size_ratio = max_size_ratio
+        self.label_switch_confidence_margin = label_switch_confidence_margin
         self.stale_after_ns = int(stale_after_sec * 1e9)
         self.tracks: dict[str, SemanticTrack] = {}
 
@@ -191,6 +195,14 @@ class SemanticTracker:
                     label,
                 ),
             )
+            current_label = match.label.casefold()
+            if (
+                winner != current_label
+                and current_label in label_evidence
+                and float(label_max_confidence[winner])
+                < float(label_max_confidence[current_label]) + self.label_switch_confidence_margin
+            ):
+                winner = current_label
             match.label = winner
             match.canonical_label = winner
             match.confidence = float(label_score_evidence[winner]) / int(label_evidence[winner])
@@ -312,6 +324,12 @@ class SemanticTracker:
             distance = float(np.linalg.norm(track.position - observation.position))
             if distance > self.association_distance_m:
                 continue
+            track_extent = float(np.linalg.norm(track.size))
+            observation_extent = float(np.linalg.norm(observation.size))
+            if min(track_extent, observation_extent) > 1e-6:
+                size_ratio = max(track_extent, observation_extent) / min(track_extent, observation_extent)
+                if size_ratio > self.max_size_ratio:
+                    continue
             similarity = cosine_similarity(track.embedding, observation.embedding)
             if observation.label.casefold() not in association_labels and similarity is None:
                 continue

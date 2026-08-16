@@ -84,10 +84,12 @@ class OfflineMappingNode(Node):
             "ground_max_footprint_m": 1.2,
             "max_object_distance_m": 2.5,
             "association_distance_m": 0.45,
+            "association_max_size_ratio": 4.0,
             "embedding_similarity_threshold": 0.72,
             "min_label_confidence": 0.2,
             "max_label_candidates_per_mask": 5,
             "association_position_weight": 0.55,
+            "label_switch_confidence_margin": 0.05,
             "caption_enabled": False,
             "caption_model_identity": "",
             "caption_prompt": "Describe this object concisely.",
@@ -162,6 +164,8 @@ class OfflineMappingNode(Node):
             association_distance_m=float(self.get_parameter("association_distance_m").value),
             embedding_similarity_threshold=float(self.get_parameter("embedding_similarity_threshold").value),
             position_weight=float(self.get_parameter("association_position_weight").value),
+            max_size_ratio=float(self.get_parameter("association_max_size_ratio").value),
+            label_switch_confidence_margin=float(self.get_parameter("label_switch_confidence_margin").value),
         )
         self._database = SemanticMapDatabase(self.get_parameter("database_path").value, self.manifest)
         now_ns = time.time_ns()
