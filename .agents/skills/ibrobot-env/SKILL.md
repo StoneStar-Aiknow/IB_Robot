@@ -1,6 +1,6 @@
 ---
 name: ibrobot-env
-description: "Handles environment setup and command execution in the main IB_Robot workspace. Use BEFORE running any scripts or ROS 2 commands to 'setup environment', 'source .shrc_local', 'set ROS_DOMAIN_ID', '环境变量', '环境初始化', '初始化环境', 'fix import errors', 'ModuleNotFoundError', or 'PYTHONPATH issues'. Triggers whenever environment inheritance is required for correct execution. For commands inside a git worktree (shared venv, worktree PYTHONPATH, mixed main-repo/worktree paths), use ibrobot-worktree-env instead."
+description: "Handles environment setup and command execution in the main IB_Robot workspace. Use BEFORE running any Python script, test, or ROS 2 command — covers 'run tests', 'pytest', '跑测试', '运行脚本', 'run script', 'setup environment', 'source .shrc_local', 'set ROS_DOMAIN_ID', '环境变量', '环境初始化', '初始化环境', 'fix import errors', 'ModuleNotFoundError', 'PYTHONPATH issues', and any urge to manually source ROS setup or export PYTHONPATH. Never hand-assemble the environment; .shrc_local is the single entry point. For commands inside a git worktree (shared venv, worktree PYTHONPATH, mixed main-repo/worktree paths), use ibrobot-worktree-env instead."
 ---
 
 # IB_Robot Environment Skill
@@ -52,6 +52,21 @@ source .shrc_local && ./scripts/build.sh
 - Sets `PYTHONPATH` including `libs/lerobot/src` and `src` directories.
 - Sources ROS 2 Humble setup.
 - Defines common aliases (`cb`, `cbp`, `src`, etc.).
+
+## Anti-Patterns (Never Hand-Assemble the Environment)
+
+When a command fails with an import error or `ros2: command not found`, do NOT try to repair the
+environment piece by piece. Partial fixes look workable but silently miss venv site-packages,
+workspace overlays, and path ordering:
+
+- `source /opt/ros/humble/setup.bash` — ROS 2 is loaded by `.shrc_local`; sourcing it alone yields
+  a partial environment without the venv and workspace overlays.
+- `export PYTHONPATH=<workspace>/src:<workspace>/libs/lerobot/src` — `.shrc_local` derives the
+  correct absolute paths, venv entries, and ordering.
+- `source venv/bin/activate` alone — still missing ROS 2, `PYTHONPATH`, and `install/` overlays.
+
+The only correct fix is to rerun the whole command as `source .shrc_local && <command>`. Inside a
+git worktree, load `ibrobot-worktree-env` instead of patching variables by hand.
 
 ## Common Error Resolution
 

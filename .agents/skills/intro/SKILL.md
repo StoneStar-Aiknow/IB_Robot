@@ -20,7 +20,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 | :--- | :--- |
 | **ibrobot-launch** | 分平台启动 Ubuntu/openEuler 或 OpenHarmony 板端机器人、仿真、推理与遥操作 |
 | **ibrobot-build** | 编译整个工作空间或指定 package（`colcon build`） |
-| **ibrobot-env** | 初始化运行环境，加载 `.shrc_local`、设置 `ROS_DOMAIN_ID` |
+| **ibrobot-env** | 初始化/修复运行环境：跑测试、运行脚本、ros2 命令前加载 `.shrc_local`，禁止手动拼装 PYTHONPATH/ROS 环境 |
 | **ibrobot-worktree-env** | 在 `git worktree` 中复用主仓库 venv，避免主仓库/worktree 混合环境导致测错分支 |
 | **ibrobot-architecture** | 理解 SSOT 架构设计、配置规范与数据流 |
 | **ibrobot-robot-skill-design** | 交互式设计机器人 skill，明确 anchor、动作空间、安全链路、catalog 暴露和验证计划 |
@@ -114,6 +114,7 @@ Agent 在触发本 skill 时，**必须首先**向用户展示以下欢迎文案
 设计一个新的机器人动作           → ibrobot-robot-skill-design
 让 Hermes 执行一个现有庆祝动作   → ibrobot-control
 初始化环境                      → ibrobot-env
+跑一下测试 / pytest             → ibrobot-env（环境前缀由它保证）
 在 worktree 中跑代码             → ibrobot-worktree-env
 提交代码                        → ibrobot-git-flow
 把 libs/lerobot 的改动做成 patch  → ibrobot-lerobot-patch

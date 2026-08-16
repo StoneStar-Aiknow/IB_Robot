@@ -1,6 +1,6 @@
 ---
 name: ibrobot-launch
-description: "Launch IB-Robot on Ubuntu/openEuler source workspaces or deployed OpenHarmony boards. Use for 'launch', 'run robot', 'start simulation', 'start system', '启动机器人', '运行仿真', '测试推理', 'test inference', '遥操作调试', 'teleop', 'start so101', 'RoboPi launch', or 'OpenHarmony launch'. Distinguishes native Ubuntu/openEuler build-and-launch from OpenHarmony /data/roboframe runtime launch."
+description: "Launch IB-Robot on Ubuntu/openEuler source workspaces or deployed OpenHarmony boards. Use for 'launch', 'run robot', 'start simulation', 'start system', '启动机器人', '运行仿真', '测试推理', 'test inference', '遥操作调试', 'teleop', 'start so101', 'RoboPi launch', 'OpenHarmony launch', 'mock test', 'contract test', 'mock 测试', or '契约测试'. Distinguishes native Ubuntu/openEuler build-and-launch from OpenHarmony /data/roboframe runtime launch."
 ---
 
 # IB-Robot Launch Skill

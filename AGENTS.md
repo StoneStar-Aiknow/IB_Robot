@@ -76,11 +76,27 @@ Signed-off-by: Name <email>  # 必须，使用 git commit -s
 
 ### 环境初始化
 
-执行任何 ROS 2 或项目相关命令前，必须先加载环境：
+执行任何 ROS 2 或项目相关命令前，必须先加载环境。Bash 工具的各次调用间**不保留**
+环境变量，因此 `source` 必须与目标命令放在**同一次调用**中：
 
 ```bash
-source .shrc_local
+source .shrc_local && <your_command>
 ```
+
+适用于 `python3`、`pytest`、`ros2`、`colcon`、`./scripts/*.sh` 等所有依赖项目环境的命令，
+包括跑测试、运行脚本、启动节点等场景。
+
+**禁止手动拼装环境**（部分加载看似可用，但路径、顺序、overlay 极易出错，环境必须整体
+交给 `.shrc_local`）：
+
+- 禁止 `source /opt/ros/*/setup.bash`（ROS 2 由 `.shrc_local` 统一加载）
+- 禁止手动 `export PYTHONPATH=src:libs/lerobot/src`（venv、源码、install overlay 的完整
+  路径与顺序由 `.shrc_local` 统一设置）
+- 禁止单独 `source venv/bin/activate`（同上）
+
+遇到 `ModuleNotFoundError`、`ros2: command not found` 等**环境类报错**时，不要自行构造
+环境变量修复：正确做法是加载 `ibrobot-env` skill 按其模式处理；在 git worktree 中则加载
+`ibrobot-worktree-env`。
 
 ### libs/lerobot 修改规则
 
@@ -127,10 +143,10 @@ manifest 引用的 artifacts 与 LeRobot 元数据；`_work` 目录可独立归�
 
 | 技能 | 触发场景 |
 |------|---------|
-| [ibrobot-env](.agents/skills/ibrobot-env) | 环境初始化、source .shrc_local、PYTHONPATH |
+| [ibrobot-env](.agents/skills/ibrobot-env) | 环境初始化与修复：跑测试/pytest、运行脚本、ros2 命令前加载 `source .shrc_local`、PYTHONPATH、环境类报错 |
 | [ibrobot-worktree-env](.agents/skills/ibrobot-worktree-env) | git worktree 环境复用主仓库 venv、避免主仓库/worktree 混合环境 |
 | [ibrobot-build](.agents/skills/ibrobot-build) | 编译、colcon build、构建错误 |
-| [ibrobot-launch](.agents/skills/ibrobot-launch) | 分平台启动 Ubuntu/openEuler 工作区或 OpenHarmony 板端机器人、仿真、推理、teleop |
+| [ibrobot-launch](.agents/skills/ibrobot-launch) | 分平台启动 Ubuntu/openEuler 工作区或 OpenHarmony 板端机器人、仿真、mock/契约测试、推理、teleop |
 | [ibrobot-architecture](.agents/skills/ibrobot-architecture) | 架构、SSOT、契约、robot_config、数据流 |
 | [ibrobot-robot-skill-design](.agents/skills/ibrobot-robot-skill-design) | 交互式设计/新增机器人 skill、Hermes/Agent 动作、真机验证方案 |
 | [ibrobot-control](.agents/skills/ibrobot-control) | Hermes/Agent 发现、校验、执行或取消现有机器人高层技能 |
