@@ -8,5 +8,7 @@ sam2==1.1.0
 timm>=1.0.15,<1.1.0
 fairscale==0.4.13
 supervision>=0.22.0
+# The audited GroundingDINO wheel is installed with --no-deps.
+pycocotools>=2.0.8,<3
 addict
 yapf==0.40.1
