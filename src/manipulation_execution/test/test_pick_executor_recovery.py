@@ -4,7 +4,7 @@ from typing import Any, cast
 import pytest
 
 from manipulation_execution.pick_executor_models import FlowState
-from manipulation_execution.pick_executor_node import PickExecutorNode, PickFlowError
+from manipulation_execution.pick_executor_node import PickCancelled, PickExecutorNode, PickFlowError
 
 
 def _prepared_candidate():
@@ -141,3 +141,36 @@ def test_retention_motion_or_verification_failure_runs_recovery(failure_stage: s
     assert len(recovery_calls) == 1
     assert recovery_calls[0][2] == "pick-test"
     assert state.pipeline_timings["subphase_recovery"] >= 0.0
+
+
+def test_retention_cancellation_does_not_run_recovery():
+    recovery_calls = []
+    harness = SimpleNamespace(
+        _config={"recover_after_retention_failure": True},
+        _publish_feedback=lambda *_args: None,
+        _move_branch_locked_pose=lambda *_args, **_kwargs: (_ for _ in ()).throw(PickCancelled()),
+        _verify=lambda *_args, **_kwargs: None,
+        _recover_after_retention_failure=lambda *args: recovery_calls.append(args),
+    )
+    prepared = SimpleNamespace(ranked=SimpleNamespace(index=7, candidate="candidate"))
+
+    with pytest.raises(PickCancelled):
+        PickExecutorNode._move_and_verify_retention(
+            cast(Any, harness),
+            "goal",
+            10.0,
+            FlowState(completed_phases=[]),
+            "pick-test",
+            "marker",
+            prepared,
+            phase="lift",
+            feedback_phase="lift",
+            feedback_detail="lifting verified target",
+            xyz=(0.12, -0.20, 0.10),
+            quaternion=(0.0, 0.0, 0.0, 1.0),
+            velocity_scaling=0.08,
+            seed="seed",
+            validate_orientation=False,
+        )
+
+    assert recovery_calls == []

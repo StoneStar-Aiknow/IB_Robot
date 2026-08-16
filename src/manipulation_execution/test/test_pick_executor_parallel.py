@@ -50,6 +50,41 @@ def test_parallel_candidate_preparation_preserves_ranked_order_and_worker_affini
     assert sorted(calls) == [(index, f"ik_{index % 3}", f"fk_{index % 3}") for index in range(8)]
 
 
+def test_kinematics_joint_state_filters_aggregate_hardware_feedback():
+    harness = SimpleNamespace(_arm_joint_names=["1", "2", "3", "4", "5"])
+    state = JointState()
+    state.name = ["2", "4", "1", "3", "5", "6", "7", "8", "9"]
+    state.position = [-0.2, 0.4, 0.1, 0.3, 0.5, 0.6, 1696.0, 2868.0, 2309.0]
+    state.velocity = [0.0] * 9
+    state.effort = [float("nan")] * 9
+
+    normalized = PickExecutorNode._kinematics_joint_state(cast(Any, harness), state)
+
+    assert normalized.name == ["1", "2", "3", "4", "5"]
+    assert list(normalized.position) == [0.1, -0.2, 0.3, 0.4, 0.5]
+    assert list(normalized.velocity) == []
+    assert list(normalized.effort) == []
+
+
+@pytest.mark.parametrize(
+    ("names", "positions", "message"),
+    [
+        (["1", "2"], [0.1], "names but"),
+        (["1", "1", "2", "3", "4", "5"], [0.1] * 6, "duplicate"),
+        (["1", "2", "3", "4"], [0.1] * 4, "missing configured arm joints"),
+        (["1", "2", "3", "4", "5"], [0.1, 0.2, float("nan"), 0.4, 0.5], "must be finite"),
+    ],
+)
+def test_kinematics_joint_state_rejects_invalid_input(names, positions, message):
+    harness = SimpleNamespace(_arm_joint_names=["1", "2", "3", "4", "5"])
+    state = JointState(name=names, position=positions)
+
+    with pytest.raises(PickFlowError, match=message) as exc_info:
+        PickExecutorNode._kinematics_joint_state(cast(Any, harness), state)
+
+    assert exc_info.value.code == "INVALID_JOINT_STATE"
+
+
 def test_worker_pool_verification_checks_every_configured_worker():
     logger = _Logger()
     harness = SimpleNamespace(

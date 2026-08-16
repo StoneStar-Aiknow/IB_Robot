@@ -69,24 +69,31 @@ def test_grasp_execution_config_accepts_repository_profile() -> None:
     assert grasp_execution["target_gripper"]["fixed_finger_robust_gap"]["measurement_tolerance_m"] == 0.001
     assert grasp_execution["contact_realign"]["max_iterations"] == 2
     assert grasp_execution["contact_realign"]["pregrasp_clearance_m"] == 0.030
+    assert grasp_execution["verifier_node"]["joint_current_topic"] == ""
+    assert grasp_execution["verifier_node"]["score_gripper_contact_success"] == 0.70
+    assert grasp_execution["verifier_node"]["score_success_threshold"] == 0.65
     assert grasp_execution["target_geometry"]["tabletop_clearance_m"] == -0.025
     assert grasp_execution["joint_state_topic"] == "/joint_states"
     assert config["moveit"]["joint_state_topic"] == "/arm_joint_state_broadcaster/joint_states"
     assert config["motion_mode"] == {
         "enabled": True,
         "navigation_enabled_on_startup": False,
-        "navigation_enabled_topic": "/motion_mode/navigation_enabled",
-        "navigation_mode_ack_topic": "/motion_mode/base_navigation_enabled",
-        "set_navigation_enabled_service": "/motion_mode/set_navigation_enabled",
+        "navigation_enabled_topic": "motion_mode/navigation_enabled",
+        "navigation_mode_ack_topic": "motion_mode/base_navigation_enabled",
+        "set_navigation_enabled_service": "motion_mode/set_navigation_enabled",
+        "controller_switch_service": "controller_manager/switch_controller",
+        "manipulation_controllers": ["arm_trajectory_controller", "gripper_trajectory_controller"],
+        "navigation_controllers": ["base_velocity_controller"],
         "transition_timeout_s": 2.0,
+        "bridge_heartbeat_timeout_s": 1.0,
     }
     assert config["control_modes"]["moveit_planning"]["controllers"] == [
         "joint_state_broadcaster",
         "arm_joint_state_broadcaster",
         "arm_trajectory_controller",
         "gripper_trajectory_controller",
-        "base_velocity_controller",
     ]
+    assert config["control_modes"]["moveit_planning"]["inactive_controllers"] == ["base_velocity_controller"]
     assert config["navigation"]["enabled"] is True
     assert config["navigation"]["nav2_bringup"]["enabled"] is False
     assert config["navigation"]["ekf_rtabmap"]["enabled"] is False
@@ -121,8 +128,12 @@ def test_grasp_execution_config_accepts_repository_profile() -> None:
     assert grasp_execution["planner_node"]["topk_num_grasps"] == 1000
     assert not any(key.startswith("remote_310p_") for key in grasp_execution["planner_node"])
     wrist = next(peripheral for peripheral in config["peripherals"] if peripheral.get("name") == "wrist")
-    assert wrist["enable_pointcloud"] is True
-    assert "pointcloud" in wrist["streams"]
+    assert wrist["serial_number"] == "349522071345"
+    assert wrist["initial_reset"] is False
+    assert wrist["enable_sync"] is False
+    assert wrist["align_depth"] is True
+    assert wrist["enable_pointcloud"] is False
+    assert wrist["streams"] == ["color", "depth"]
     assert all(
         observation["key"] != "observation.pointcloud.wrist" for observation in config["contract"]["observations"]
     )

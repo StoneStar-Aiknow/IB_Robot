@@ -11,7 +11,8 @@ result 必须返回 `actual_executor`。server 在 goal acceptance 时比对自�
 `PlaceObject` 使用相同 delegated 契约。`place_executor_node` 只接受 Gateway
 构造的 binding，并通过 `/embodied/execute_primitive` 复用受保护的
 `move_to_joint_positions` 和 `open_gripper`；不存在 direct place action client。
-放置先到固定 `place_container`（3 号电机 raw 1500）开爪，再只将 3 号电机移动到 raw 1600 做视觉确认，
+放置先到固定 `place_container`（3 号电机 raw 1500）开爪，再只将 3 号电机移动到 raw 1700
+（`verify_joint_position: -0.533825`）做视觉确认，
 最后返回 raw 1500。请求中的
 `container_name` 只作为运行时容器检测 query，不参与运动规划；`target_name` 和 `container_name` 原样作为
 Grounding-DINO 文本输入，颜色等描述词不得丢失。容器与目标存在多个候选时，执行器按置信度选择最高候选
@@ -87,7 +88,7 @@ goal 携带 `dispatch_binding`（task_id/root_task_id、共享 `task_budget`、e
 `named_targets` 中的静态配置键。
 
 放置反馈阶段包括 `preflight`、`move_to_place`、`release`、`move_to_verify`、`verify_place` 和
-`return_to_place`；抓取反馈阶段包括 `preflight`、`observe`、`planning`、`selecting`、`approach`、`pregrasp`、`descend`、
+`return_to_place`；抓取反馈阶段包括 `preflight`、`observe`、`planning`、`selecting`、`approach`、`descend`、
 `close`、`verify_close`、`probe_lift`、`verify_probe`、`lift` 和 `verify_lift`。
 
 只有最终抓取验证成功时 action 才返回 `success=true`。动作执行完成但验证失败或不确定分别返回
@@ -119,14 +120,14 @@ goal 携带 `dispatch_binding`（task_id/root_task_id、共享 `task_budget`、e
   base +Z 的安全半空间，再使用缓存的 mesh 凸包顶点和批量 NumPy 变换处理全部候选。固定姿态平移 sweep
   只计算两个端点，临界阈值附近再回退到单候选精确检查。
 - SO101 实际夹爪 STL 的 approach-to-grasp 桌面间隙，以及 joint5 分支修正后的 FK 接近轴/闭合轴硬校验。
-- 候选 FK 残差重排、pregrasp 高位接触点 realign 和最终 IK/FK 接触点补偿阈值。
+- 候选 FK 残差重排、approach 位接触点 realign 和进入 descend 前的最终 IK/FK 接触点补偿阈值。
 - IK/FK 准备完成后按候选规划姿态的固定爪前缘包络、目标体积质心距离、FK 接触点 XY/Z 质量和
   置信度做软重排；固定爪包络偏好不会单独硬拒绝候选。
 - 非对称单动夹爪先按规划姿态检查固定爪是否位于朝机器人底座的一侧，再按最终 IK 解的 FK 姿态
   复检；最终姿态镜像或缺少目标宽度范围时，在产生运动前拒绝该候选并继续准备其他候选。
 - 固定指 robust gap 使用最终 IK/FK 预测接触残差在 approach/descend 前完成硬门禁；下降成功后进入
   commit-to-grasp 状态，`close_gripper` 是下降成功后的第一条动作。低位实测改在闭爪后以 best-effort
-  方式记录；诊断异常不影响闭爪和后续验证，也不再回到 pregrasp 或切换候选。
+  方式记录；诊断异常不影响闭爪和后续验证，也不再回到安全过渡位或切换候选。
 - commanded/actual 位姿和接触点 residual 诊断；有 planner 输出目录时写入 `pick_pose_diagnostics.json`。
 - 抓取候选使用其 depth capture timestamp 查询 TF，不使用推理完成后的 latest TF；capture/latest/hand-eye
   变换写入 `pick_frame_diagnostics.json`。
@@ -134,9 +135,9 @@ goal 携带 `dispatch_binding`（task_id/root_task_id、共享 `task_budget`、e
   质心距离和综合分数。
 - 抓后验证策略。
 - `PickObject.Result.pipeline_timings_json` 返回 `phase_preflight`、`phase_observe`、`phase_planning`、
-  `phase_selecting`、`phase_open`、`phase_approach`、`phase_pregrasp`、`phase_descend`、`phase_close`、
+  `phase_selecting`、`phase_open`、`phase_approach`、`phase_descend`、`phase_close`、
   `phase_verify_close`、`phase_probe_lift`、`phase_verify_probe`、`phase_lift`、`phase_verify_lift` 和
-  `phase_release` 等正式反馈阶段墙钟；`subphase_contact_realign` 是包含在 approach/pregrasp 阶段内的
+  `phase_release` 等正式反馈阶段墙钟；`subphase_contact_realign` 是包含在 approach 阶段内的
   嵌套聚合耗时，`subphase_recovery` 是失败安全恢复的嵌套聚合耗时，二者不能与 phase 字段直接相加。
 
 `pick_object` skill 的 catalog manifest（`skill_catalog/config/skills/pick_object/`）负责把技能入口
@@ -168,12 +169,13 @@ manifest，并在 `expected_executor` / `actual_executor` 中比较 deployment n
   `min(goal.timeout_sec, deadline - now)` 作为实际 deadline；若预算在执行前已过期，立即返回
   `TASK_TIMEOUT`（`shared task budget expired before pick execution`）并 abort，不进入任何抓取阶段。
   预算在执行中过期由各阶段 deadline 自然截断。
-- 候选选定后，approach、pregrasp、contact realign、最终下降、probe lift 和 final lift 都沿用同一 joint5
+- 候选选定后，approach、内部安全下降过渡点、最终下降、probe lift 和 final lift 都沿用同一 joint5
   分支，并通过 `move_to_configuration` primitive 执行精确 IK 解；安全层检查完整关节顺序和限位。
 - 抓取前检查所有必需服务，缺失时不产生运动。
 - 最终 IK 解的 FK 固定爪朝向复检失败时，不执行该候选的 approach/descend/close。
-- 固定指间隙不足的候选只在批量候选准备阶段拒绝。到达 pregrasp 并完成在线接触补偿后，不再用第二次
-  robust-gap 复核触发撤回或候选 fallback；该结果降级为诊断，执行器继续 `descend` 和 `close_gripper`。
+- 固定指间隙不足的候选只在批量候选准备阶段拒绝。在 approach 完成在线接触补偿和最终安全检查后，
+  执行器进入 `descend`，依次经过内部安全过渡点、最终下降和 `close_gripper`，不再二次 realign、复核或
+  切换候选。内部过渡点仍沿用 `pregrasp` 配置和诊断标签，但不再作为反馈状态。
   闭爪后的 TF/pose/robust-gap 检查同样是 best-effort，不能中断 commit-to-grasp。
 - position-only IK 的 joint5 超出执行门限时，将 seed 翻转 `±π` 以交换固定指/活动指所在侧；最终 FK 接近轴、
   180° 对称闭合轴直线或固定指内侧检查失败时拒绝该候选，不再把 joint5 强制归零或停在 `±2.0` 边界。

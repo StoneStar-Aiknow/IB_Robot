@@ -73,7 +73,6 @@ class PickExecutorNode(
         "selecting": 0.32,
         "open": 0.38,
         "approach": 0.48,
-        "pregrasp": 0.54,
         "descend": 0.60,
         "close": 0.68,
         "verify_close": 0.74,

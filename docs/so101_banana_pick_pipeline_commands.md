@@ -1,14 +1,15 @@
-# SO101 腕部 RealSense 香蕉抓取操作指南
+# LeKiwi 腕部 RealSense 香蕉抓取操作指南
 
-本文用于 SO101 机械臂真机抓取：腕部 RealSense 采集 RGB-D，经 Grounding-DINO/SAM2、GraspGen 和
-MoveIt 完成目标检测、抓取规划、执行与验证。
+本文用于 LeKiwi 移动操作臂真机抓取（LeKiwi 全向底盘 + SO-101 follower 臂，由 `LeKiwiSystemHardware`
+插件统一驱动）：腕部 RealSense 采集 RGB-D，经 Grounding-DINO/SAM2、GraspGen 和 MoveIt 完成目标检测、
+抓取规划、执行与验证。抓取执行期间底盘保持静止，仅臂与夹爪运动。
 
 支持两个运行平台：
 
 | 平台 | Robot config | 推理后端 | 工作区 |
 |---|---|---|---|
-| 310P | `so101_handeye_realsense_grasp` | Ascend NPU | `/root/IB_Robot` |
-| PC | `so101_handeye_realsense_grasp_pc` | NVIDIA CUDA | `~/IB_Robot` |
+| 310P | `lekiwi_handeye_realsense_grasp` | Ascend NPU | `/root/IB_Robot` |
+| PC | `lekiwi_handeye_realsense_grasp_pc` | NVIDIA CUDA | `~/IB_Robot` |
 
 > **安全要求**：本文第 3.1、4.3、5.2 节会驱动真机。执行前必须清空工作区、确认急停可用，并由操作员对本次运动
 > 明确授权。失败、超时或机器人状态未知时禁止自动重试。
@@ -43,7 +44,8 @@ cd ~/IB_Robot
 ./scripts/download_perception_models.sh
 source .shrc_local
 colcon build --symlink-install --merge-install --packages-up-to \
-  embodied_bringup robot_skill_cli perception_service manipulation_execution
+  lekiwi_description lekiwi_hardware embodied_bringup robot_skill_cli \
+  perception_service manipulation_execution
 ```
 
 310P 上仓库通常位于 `/root/IB_Robot`，请相应替换 `cd` 路径。
@@ -52,15 +54,22 @@ colcon build --symlink-install --merge-install --packages-up-to \
 
 按平台修改对应文件：
 
-- 310P：`src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml`
-- PC：`src/robot_config/config/robots/so101_handeye_realsense_grasp_pc.yaml`
+- 310P：`src/robot_config/config/robots/lekiwi_handeye_realsense_grasp.yaml`
+- PC：`src/robot_config/config/robots/lekiwi_handeye_realsense_grasp_pc.yaml`
 
 启动前必须确认：
 
 - `ros2_control.port` 指向实际机械臂串口；
-- 腕部 RealSense 序列号正确；
+- 腕部 RealSense 使用 `rs-enumerate-devices` 或相机节点日志中的 librealsense serial 显式绑定；当前 310P
+  所接 D435i 为 `349522071345`，不要使用 USB sysfs descriptor serial；
 - 手眼标定值来自当前机械臂和相机组合；
 - 两份配置的硬件字段保持一致，只让推理后端存在平台差异。
+
+310P 必须使用飞书《310P RealSense 相机使能与部署指导》中定义的 Color-first
+`realsense2_camera 4.57.7`，让 RGB Camera 先于 Stereo Module 启动。YAML 参数本身不能改变 sensor
+启动顺序；系统仍加载原版 Depth-first wrapper 时，不得继续抓取。当前 310P 配置保持 `640x360@30`，并使用
+`initial_reset=false`、`enable_sync=false`、关闭 pointcloud/IMU。抓取链路逐项恢复 alignment，因为 planner
+必须消费 `/camera/wrist/aligned_depth_to_color/{image_raw,camera_info}`。
 
 ### 0.3 准备模型
 
@@ -118,7 +127,7 @@ source install/setup.bash
 ```bash
 test -e /dev/ttyACM0
 python3 scripts/check_handeye_preconditions.py \
-  --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml \
+  --robot-config src/robot_config/config/robots/lekiwi_handeye_realsense_grasp.yaml \
   --camera-name wrist \
   --check-files
 ```
@@ -128,7 +137,7 @@ PC：
 ```bash
 test -e /dev/ttyACM0
 python3 scripts/check_handeye_preconditions.py \
-  --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp_pc.yaml \
+  --robot-config src/robot_config/config/robots/lekiwi_handeye_realsense_grasp_pc.yaml \
   --camera-name wrist \
   --check-files
 ```
@@ -144,6 +153,8 @@ ros2 pkg prefix manipulation_execution
 ros2 pkg prefix embodied_bringup
 ros2 pkg prefix robot_moveit
 ros2 pkg prefix so101_hardware
+ros2 pkg prefix lekiwi_hardware
+ros2 pkg prefix lekiwi_description
 ```
 
 ### 1.3 清理残留节点
@@ -170,7 +181,7 @@ ros2 pkg prefix so101_hardware
 
 ```bash
 ros2 launch embodied_bringup embodied_pipeline.launch.py \
-  robot_config:=so101_handeye_realsense_grasp \
+  robot_config:=lekiwi_handeye_realsense_grasp \
   control_mode:=moveit_planning \
   use_sim:=false \
   moveit_display:=false \
@@ -182,7 +193,7 @@ PC：
 
 ```bash
 ros2 launch embodied_bringup embodied_pipeline.launch.py \
-  robot_config:=so101_handeye_realsense_grasp_pc \
+  robot_config:=lekiwi_handeye_realsense_grasp_pc \
   control_mode:=moveit_planning \
   use_sim:=false \
   moveit_display:=false \
@@ -192,7 +203,7 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 
 只做无运动诊断时，将 `authorize_motion` 改为 `false`，并且不要执行第 3.1、4.3、5.2 节。
 
-统一 launch 会启动 SO101 控制器、RealSense、MoveIt、感知服务、抓取 planner/verifier/executor、IK worker、
+统一 launch 会启动 LeKiwi 控制器（含 SO-101 follower 臂与底盘）、RealSense、MoveIt、感知服务、抓取 planner/verifier/executor、IK worker、
 Capability Gateway 和安全节点。无需再单独启动这些节点。
 
 等待以下关键日志：
@@ -246,7 +257,7 @@ pipeline 已稳定运行且配置未变化时，可以跳过本章，直接选�
 310P：
 
 ```bash
-robot-skill --config-name so101_handeye_realsense_grasp execute inspect_scene \
+robot-skill --config-name lekiwi_handeye_realsense_grasp execute inspect_scene \
   --task-id inspect-scene-001 \
   --timeout-sec 30
 ```
@@ -254,7 +265,7 @@ robot-skill --config-name so101_handeye_realsense_grasp execute inspect_scene \
 PC：
 
 ```bash
-robot-skill --config-name so101_handeye_realsense_grasp_pc execute inspect_scene \
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc execute inspect_scene \
   --task-id inspect-scene-001 \
   --timeout-sec 30
 ```
@@ -293,13 +304,13 @@ PC 在本机新终端执行；310P 必须 SSH 到运行 pipeline 的同一块板
 PC：
 
 ```bash
-hermes-robot --config-name so101_handeye_realsense_grasp_pc -- --cli
+hermes-robot --config-name lekiwi_handeye_realsense_grasp_pc -- --cli
 ```
 
 310P：
 
 ```bash
-hermes-robot --config-name so101_handeye_realsense_grasp -- --cli
+hermes-robot --config-name lekiwi_handeye_realsense_grasp -- --cli
 ```
 
 `hermes-robot` 会检查 Hermes、`ibrobot-control`、绑定配置、Gateway 状态和 Agent plan 接口。预检失败时停止，
@@ -350,10 +361,10 @@ cd ~/IB_Robot
 source .shrc_local
 export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
 source install/setup.bash
-robot-skill --config-name so101_handeye_realsense_grasp_pc status
-robot-skill --config-name so101_handeye_realsense_grasp_pc list-skills
-robot-skill --config-name so101_handeye_realsense_grasp_pc describe pick_object
-robot-skill --config-name so101_handeye_realsense_grasp_pc validate pick_object \
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc status
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc list-skills
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc describe pick_object
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc validate pick_object \
   --target-name banana
 ```
 
@@ -364,10 +375,10 @@ cd /root/IB_Robot
 source .shrc_local
 export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
 source install/setup.bash
-robot-skill --config-name so101_handeye_realsense_grasp status
-robot-skill --config-name so101_handeye_realsense_grasp list-skills
-robot-skill --config-name so101_handeye_realsense_grasp describe pick_object
-robot-skill --config-name so101_handeye_realsense_grasp validate pick_object \
+robot-skill --config-name lekiwi_handeye_realsense_grasp status
+robot-skill --config-name lekiwi_handeye_realsense_grasp list-skills
+robot-skill --config-name lekiwi_handeye_realsense_grasp describe pick_object
+robot-skill --config-name lekiwi_handeye_realsense_grasp validate pick_object \
   --target-name banana
 ```
 
@@ -385,7 +396,7 @@ cd ~/IB_Robot
 source .shrc_local
 export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
 source install/setup.bash
-robot-skill --config-name so101_handeye_realsense_grasp_pc execute pick_object \
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc execute pick_object \
   --task-id pick-marker-pc-001 \
   --target-name marker
 ```
@@ -397,7 +408,7 @@ cd /root/IB_Robot
 source .shrc_local
 export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
 source install/setup.bash
-robot-skill --config-name so101_handeye_realsense_grasp execute pick_object \
+robot-skill --config-name lekiwi_handeye_realsense_grasp execute pick_object \
   --task-id pick-marker-310p-001 \
   --target-name marker
 ```
@@ -416,7 +427,7 @@ task ID。
 需要取消当前任务时，在另一终端使用相同 task ID：
 
 ```bash
-robot-skill --config-name so101_handeye_realsense_grasp_pc cancel --task-id pick-marker-pc-001
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc cancel --task-id pick-marker-pc-001
 ```
 
 取消请求成功不等于机械臂已经停止，必须等待该任务进入 terminal 状态。

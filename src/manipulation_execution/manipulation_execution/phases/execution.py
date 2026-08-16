@@ -437,6 +437,8 @@ class ExecutionPhase:
                 prepared.ranked.index,
                 prepared.ranked.candidate,
             )
+        except PickCancelled:
+            raise
         except PickFlowError:
             if bool(self._config.get("recover_after_retention_failure", True)):
                 recovery_started = time.monotonic()
@@ -543,16 +545,23 @@ class ExecutionPhase:
         release_after_success: bool = False,
         release_drop_height_m: float = -1.0,
     ) -> None:
+        current_joint_state = self._snapshot_joint_state()
+        if current_joint_state is None:
+            raise PickFlowError(
+                "JOINT_STATE_UNAVAILABLE",
+                f"no current joint state received from {self._joint_state_topic}",
+            )
         prepared = self._prepare_candidate(
             prepared.ranked,
             scene_base,
             goal_handle,
             deadline,
-            initial_seed=prepared.final_joint_state,
+            apply_compensation=True,
+            initial_seed=current_joint_state,
         )
         plan = prepared.plan
         candidate = prepared.ranked.candidate
-        active_joint_state = prepared.final_joint_state
+        final_grasp_joint_state = prepared.final_joint_state
         self._publish_feedback(goal_handle, state, "open", "opening gripper")
         self._run_primitive(
             goal_handle,
@@ -571,13 +580,13 @@ class ExecutionPhase:
             plan.approach,
             plan.quaternion,
             float(self._config.get("approach_velocity_scaling", 0.05)),
-            active_joint_state,
+            current_joint_state,
         )
-        active_joint_state = approach_payload.joint_state
+        current_joint_state = approach_payload.joint_state
 
         realign_started = time.monotonic()
         try:
-            aligned_approach, active_joint_state = self._realign_contact(
+            aligned_approach, current_joint_state = self._realign_contact(
                 goal_handle,
                 deadline,
                 task_id,
@@ -586,7 +595,7 @@ class ExecutionPhase:
                 plan.quaternion,
                 plan.target_contact_ee,
                 float(self._config.get("approach_velocity_scaling", 0.05)),
-                active_joint_state,
+                current_joint_state,
             )
         finally:
             state.add_timing("subphase_contact_realign", time.monotonic() - realign_started)
@@ -600,95 +609,82 @@ class ExecutionPhase:
             plan.target_contact_ee,
         )
 
-        pregrasp = self._pregrasp_pose(prepared, scene_base)
-        self._publish_feedback(goal_handle, state, "pregrasp", "moving to safe target-relative pregrasp")
-        pregrasp_payload = self._move_branch_locked_pose(
-            goal_handle,
-            deadline,
-            task_id,
-            pregrasp,
-            plan.quaternion,
-            float(self._config.get("descend_velocity_scaling", 0.03)),
-            active_joint_state,
-        )
-        active_joint_state = pregrasp_payload.joint_state
-        realign_started = time.monotonic()
-        try:
-            aligned_pregrasp, active_joint_state = self._realign_contact(
-                goal_handle,
-                deadline,
-                task_id,
-                "pregrasp",
-                pregrasp,
-                plan.quaternion,
-                plan.target_contact_ee,
-                float(self._config.get("descend_velocity_scaling", 0.03)),
-                active_joint_state,
-            )
-        finally:
-            state.add_timing("subphase_contact_realign", time.monotonic() - realign_started)
-        self._record_pose_diagnostic(
-            goal_handle,
-            deadline,
-            state,
-            "pregrasp",
-            aligned_pregrasp,
-            plan.quaternion,
-            plan.target_contact_ee,
-        )
-        realign_delta_x = aligned_pregrasp[0] - pregrasp[0]
-        realign_delta_y = aligned_pregrasp[1] - pregrasp[1]
+        realign_delta_x = aligned_approach[0] - plan.approach[0]
+        realign_delta_y = aligned_approach[1] - plan.approach[1]
+        realign_delta_z = aligned_approach[2] - plan.approach[2]
         adjusted_plan = replace(
             plan,
-            approach=aligned_pregrasp,
-            grasp=(plan.grasp[0] + realign_delta_x, plan.grasp[1] + realign_delta_y, plan.grasp[2]),
-            lift=(plan.lift[0] + realign_delta_x, plan.lift[1] + realign_delta_y, plan.lift[2]),
+            approach=aligned_approach,
+            grasp=(
+                plan.grasp[0] + realign_delta_x,
+                plan.grasp[1] + realign_delta_y,
+                plan.grasp[2] + realign_delta_z,
+            ),
+            lift=(
+                plan.lift[0] + realign_delta_x,
+                plan.lift[1] + realign_delta_y,
+                plan.lift[2] + realign_delta_z,
+            ),
         )
+        # Contact compensation is complete. Re-run only IK/FK and safety checks
+        # after the measured XYZ correction; compensating again would undo it.
         prepared = self._prepare_candidate(
             replace(prepared.ranked, plan=adjusted_plan),
             scene_base,
             goal_handle,
             deadline,
-            apply_compensation=True,
+            enforce_contact_error=False,
             enforce_fixed_finger_robust_gap=False,
-            initial_seed=active_joint_state,
+            initial_seed=current_joint_state,
         )
         plan = prepared.plan
-        active_joint_state = prepared.final_joint_state
+        final_grasp_joint_state = prepared.final_joint_state
 
-        xy_align_delta = math.hypot(
-            plan.grasp[0] - aligned_pregrasp[0],
-            plan.grasp[1] - aligned_pregrasp[1],
-        )
-        align_tolerance = float(self._config.get("contact_compensation", {}).get("xy_tolerance_m", 0.003))
-        if xy_align_delta > align_tolerance:
-            self._publish_feedback(
-                goal_handle,
-                state,
-                "descend",
-                f"aligning XY to compensated grasp ({xy_align_delta:.4f}m at safe height)",
-            )
-            align_payload = self._move_branch_locked_pose(
+        pregrasp = self._pregrasp_pose(prepared, scene_base)
+        try:
+            self._publish_feedback(goal_handle, state, "descend", "moving through safe target-relative waypoint")
+            pregrasp_payload = self._move_branch_locked_pose(
                 goal_handle,
                 deadline,
                 task_id,
-                (plan.grasp[0], plan.grasp[1], aligned_pregrasp[2]),
+                pregrasp,
                 plan.quaternion,
                 float(self._config.get("descend_velocity_scaling", 0.03)),
-                active_joint_state,
+                current_joint_state,
             )
-            active_joint_state = align_payload.joint_state
+            current_joint_state = pregrasp_payload.joint_state
+            self._record_pose_diagnostic(
+                goal_handle,
+                deadline,
+                state,
+                "pregrasp",
+                pregrasp,
+                plan.quaternion,
+                plan.target_contact_ee,
+            )
 
-        self._publish_feedback(goal_handle, state, "descend", "descending to compensated grasp configuration")
-        self._run_primitive(
-            goal_handle,
-            deadline,
-            task_id,
-            "move_to_configuration",
-            joint_state=prepared.final_joint_state,
-            velocity_scaling=float(self._config.get("descend_velocity_scaling", 0.03)),
-            duration_sec=float(self._config.get("descend_duration_sec", 2.0)),
-        )
+            self._publish_feedback(goal_handle, state, "descend", "descending to compensated grasp configuration")
+            self._validate_joint5_branch_continuity(current_joint_state, final_grasp_joint_state)
+            self._run_primitive(
+                goal_handle,
+                deadline,
+                task_id,
+                "move_to_configuration",
+                joint_state=final_grasp_joint_state,
+                velocity_scaling=float(self._config.get("descend_velocity_scaling", 0.03)),
+                duration_sec=float(self._config.get("descend_duration_sec", 2.0)),
+            )
+            current_joint_state = final_grasp_joint_state
+        except PickCancelled:
+            raise
+        except PickFlowError:
+            recovery_started = time.monotonic()
+            try:
+                self._move_to_observe(goal_handle, deadline, state, task_id)
+                state.recovery_completed = True
+            finally:
+                state.add_timing("subphase_recovery", time.monotonic() - recovery_started)
+            raise
         self.get_logger().info(
             f"grasp prediction candidate={prepared.ranked.index} commanded_xyz={plan.grasp} "
             f"predicted_xyz={prepared.actual_ee_xyz} "
@@ -696,61 +692,63 @@ class ExecutionPhase:
             f"contact_xy_residual_m={prepared.contact_residual_xy_m:.4f} "
             f"contact_z_error_m={prepared.contact_z_error_m:.4f}"
         )
-        self._publish_feedback(goal_handle, state, "close", "closing gripper on target")
-        self._run_primitive(
-            goal_handle,
-            deadline,
-            task_id,
-            "close_gripper",
-            gripper_position=self._gripper_closed,
-        )
-        self._sleep_with_cancel(goal_handle, deadline, float(self._config.get("hold_sec", 0.8)))
-
-        # The grasp pose is now a committed physical state. Record diagnostics
-        # after closing so the measured gap cannot trigger a pre-close retreat.
-        grasp_measurement = self._record_pose_diagnostic(
-            goal_handle,
-            deadline,
-            state,
-            "grasp",
-            prepared.actual_ee_xyz,
-            prepared.actual_ee_quaternion,
-            plan.target_contact_ee,
-            planned_contact=plan.target_contact_base,
-        )
-        target_gripper = self._config.get("target_gripper", {})
-        robust_gap_config = target_gripper.get("fixed_finger_robust_gap", {})
-        if bool(robust_gap_config.get("enabled", False)) and prepared.fixed_finger_envelope is not None:
-            robust_gap = None
-            if grasp_measurement is not None:
-                contact_residual, actual_quaternion = grasp_measurement
-                robust_gap = fixed_finger_robust_gap(
-                    prepared.fixed_finger_envelope.fixed_gap_m,
-                    prepared.fixed_finger_envelope.target_gap_m,
-                    contact_residual,
-                    actual_quaternion,
-                    target_gripper.get("closing_axis_ee", [1.0, 0.0, 0.0]),
-                    max_target_gap_deficit_m=float(robust_gap_config.get("max_target_gap_deficit_m", 0.003)),
-                    measurement_tolerance_m=float(robust_gap_config.get("measurement_tolerance_m", 0.0)),
-                )
-            if robust_gap is not None and state.pose_diagnostics:
-                state.pose_diagnostics[-1].update(
-                    {
-                        "fixed_finger_contact_error_m": robust_gap.contact_error_along_closing_axis_m,
-                        "fixed_finger_effective_gap_m": robust_gap.effective_gap_m,
-                        "fixed_finger_required_gap_m": robust_gap.required_gap_m,
-                        "fixed_finger_robust_gap_passed": robust_gap.passed,
-                        "action": "record_fixed_finger_robust_gap",
-                    }
-                )
-                if state.debug_output_dir:
-                    output_path = Path(state.debug_output_dir) / "pick_pose_diagnostics.json"
-                    try:
-                        output_path.write_text(json.dumps(state.pose_diagnostics, indent=2) + "\n", encoding="utf-8")
-                    except OSError as exc:
-                        self.get_logger().warning(f"failed to write {output_path}: {exc}")
-
         try:
+            self._publish_feedback(goal_handle, state, "close", "closing gripper on target")
+            self._run_primitive(
+                goal_handle,
+                deadline,
+                task_id,
+                "close_gripper",
+                gripper_position=self._gripper_closed,
+            )
+            self._sleep_with_cancel(goal_handle, deadline, float(self._config.get("hold_sec", 0.8)))
+
+            # The grasp pose is now a committed physical state. Record diagnostics
+            # after closing so the measured gap cannot trigger a pre-close retreat.
+            grasp_measurement = self._record_pose_diagnostic(
+                goal_handle,
+                deadline,
+                state,
+                "grasp",
+                prepared.actual_ee_xyz,
+                prepared.actual_ee_quaternion,
+                plan.target_contact_ee,
+                planned_contact=plan.target_contact_base,
+            )
+            target_gripper = self._config.get("target_gripper", {})
+            robust_gap_config = target_gripper.get("fixed_finger_robust_gap", {})
+            if bool(robust_gap_config.get("enabled", False)) and prepared.fixed_finger_envelope is not None:
+                robust_gap = None
+                if grasp_measurement is not None:
+                    contact_residual, actual_quaternion = grasp_measurement
+                    robust_gap = fixed_finger_robust_gap(
+                        prepared.fixed_finger_envelope.fixed_gap_m,
+                        prepared.fixed_finger_envelope.target_gap_m,
+                        contact_residual,
+                        actual_quaternion,
+                        target_gripper.get("closing_axis_ee", [1.0, 0.0, 0.0]),
+                        max_target_gap_deficit_m=float(robust_gap_config.get("max_target_gap_deficit_m", 0.003)),
+                        measurement_tolerance_m=float(robust_gap_config.get("measurement_tolerance_m", 0.0)),
+                    )
+                if robust_gap is not None and state.pose_diagnostics:
+                    state.pose_diagnostics[-1].update(
+                        {
+                            "fixed_finger_contact_error_m": robust_gap.contact_error_along_closing_axis_m,
+                            "fixed_finger_effective_gap_m": robust_gap.effective_gap_m,
+                            "fixed_finger_required_gap_m": robust_gap.required_gap_m,
+                            "fixed_finger_robust_gap_passed": robust_gap.passed,
+                            "action": "record_fixed_finger_robust_gap",
+                        }
+                    )
+                    if state.debug_output_dir:
+                        output_path = Path(state.debug_output_dir) / "pick_pose_diagnostics.json"
+                        try:
+                            output_path.write_text(
+                                json.dumps(state.pose_diagnostics, indent=2) + "\n", encoding="utf-8"
+                            )
+                        except OSError as exc:
+                            self.get_logger().warning(f"failed to write {output_path}: {exc}")
+
             self._verify(
                 goal_handle,
                 deadline,
@@ -771,6 +769,8 @@ class ExecutionPhase:
                 plan.target_contact_ee,
                 planned_contact=plan.target_contact_base,
             )
+        except PickCancelled:
+            raise
         except PickFlowError:
             if bool(self._config.get("recover_after_close_failure", True)):
                 recovery_started = time.monotonic()
@@ -780,7 +780,7 @@ class ExecutionPhase:
                         deadline,
                         task_id,
                         prepared,
-                        aligned_pregrasp,
+                        pregrasp,
                         state,
                     )
                 finally:
@@ -804,9 +804,9 @@ class ExecutionPhase:
                     xyz=probe_xyz,
                     quaternion=plan.quaternion,
                     velocity_scaling=float(self._config.get("probe_lift_velocity_scaling", 0.02)),
-                    seed=active_joint_state,
+                    seed=current_joint_state,
                 )
-                active_joint_state = probe_payload.joint_state
+                current_joint_state = probe_payload.joint_state
                 self._record_pose_diagnostic(
                     goal_handle,
                     deadline,
@@ -830,10 +830,10 @@ class ExecutionPhase:
             xyz=plan.lift,
             quaternion=plan.quaternion,
             velocity_scaling=float(self._config.get("lift_velocity_scaling", 0.05)),
-            seed=active_joint_state,
+            seed=current_joint_state,
             validate_orientation=False,
         )
-        active_joint_state = lift_payload.joint_state
+        current_joint_state = lift_payload.joint_state
         self._record_pose_diagnostic(
             goal_handle,
             deadline,
@@ -851,7 +851,7 @@ class ExecutionPhase:
                     state,
                     task_id,
                     prepared,
-                    active_joint_state,
+                    current_joint_state,
                     release_drop_height_m,
                 )
             except PickCancelled:

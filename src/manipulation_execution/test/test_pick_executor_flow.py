@@ -88,6 +88,51 @@ def _prepared_candidate(index: int = 7):
     )
 
 
+def _full_prepared_candidate(index: int = 7) -> PreparedCandidate:
+    candidate = GraspCandidate()
+    candidate.confidence = 0.8
+    plan = CandidatePlan(
+        approach=(0.10, -0.20, 0.12),
+        grasp=(0.10, -0.20, 0.04),
+        lift=(0.10, -0.20, 0.10),
+        quaternion=(0.0, 0.0, 0.0, 1.0),
+        approach_axis=(0.0, 0.0, 1.0),
+        target_contact_ee=(0.0, 0.0, 0.0),
+        target_contact_base=(0.10, -0.20, 0.04),
+        target_width_m=0.013,
+        width_reason="test",
+        fixed_finger_target_gap_m=0.013,
+        target_width_min_base=(0.09, -0.20, 0.04),
+        target_width_max_base=(0.11, -0.20, 0.04),
+        topdown_score=1.0,
+    )
+    ranked = RankedCandidate(index=index, candidate=candidate, plan=plan, score=0.9)
+    return PreparedCandidate(
+        ranked=ranked,
+        plan=plan,
+        final_joint_state=JointState(),
+        actual_ee_xyz=plan.grasp,
+        actual_ee_quaternion=plan.quaternion,
+        contact_residual_xy_m=0.0,
+        contact_z_error_m=0.0,
+        approach_axis_error_deg=0.0,
+        closing_axis_error_deg=0.0,
+        tabletop_clearance_m=0.02,
+        mesh_min_z=0.04,
+        fixed_finger_envelope=FixedFingerEnvelope(
+            fixed_gap_m=0.0085,
+            moving_gap_m=0.01,
+            target_gap_m=0.013,
+            fixed_score=0.5,
+            moving_score=0.5,
+            score=0.5,
+        ),
+        fk_fixed_finger_base_side=None,
+        predicted_robust_gap_headroom_m=0.002,
+        selection_score=0.8,
+    )
+
+
 def _flow_harness(*, config: dict | None = None) -> SimpleNamespace:
     logger = _Logger()
     harness = SimpleNamespace(
@@ -608,49 +653,8 @@ def test_close_gripper_is_immediate_after_descent_before_diagnostics():
     logger = _Logger()
     primitives: list[str] = []
     feedback: list[str] = []
-    candidate = GraspCandidate()
-    candidate.confidence = 0.8
-    plan = CandidatePlan(
-        approach=(0.10, -0.20, 0.12),
-        grasp=(0.10, -0.20, 0.04),
-        lift=(0.10, -0.20, 0.10),
-        quaternion=(0.0, 0.0, 0.0, 1.0),
-        approach_axis=(0.0, 0.0, 1.0),
-        target_contact_ee=(0.0, 0.0, 0.0),
-        target_contact_base=(0.10, -0.20, 0.04),
-        target_width_m=0.013,
-        width_reason="test",
-        fixed_finger_target_gap_m=0.013,
-        target_width_min_base=(0.09, -0.20, 0.04),
-        target_width_max_base=(0.11, -0.20, 0.04),
-        topdown_score=1.0,
-    )
-    ranked = RankedCandidate(index=7, candidate=candidate, plan=plan, score=0.9)
-    joint_state = JointState()
-    prepared = PreparedCandidate(
-        ranked=ranked,
-        plan=plan,
-        final_joint_state=joint_state,
-        actual_ee_xyz=plan.grasp,
-        actual_ee_quaternion=plan.quaternion,
-        contact_residual_xy_m=0.0,
-        contact_z_error_m=0.0,
-        approach_axis_error_deg=0.0,
-        closing_axis_error_deg=0.0,
-        tabletop_clearance_m=0.02,
-        mesh_min_z=0.04,
-        fixed_finger_envelope=FixedFingerEnvelope(
-            fixed_gap_m=0.0085,
-            moving_gap_m=0.01,
-            target_gap_m=0.013,
-            fixed_score=0.5,
-            moving_score=0.5,
-            score=0.5,
-        ),
-        fk_fixed_finger_base_side=None,
-        predicted_robust_gap_headroom_m=0.002,
-        selection_score=0.8,
-    )
+    prepared = _full_prepared_candidate()
+    joint_state = prepared.final_joint_state
     harness = SimpleNamespace(
         _config={
             "open_settle_sec": 0.0,
@@ -668,8 +672,11 @@ def test_close_gripper_is_immediate_after_descent_before_diagnostics():
         },
         _gripper_open=1.0,
         _gripper_closed=0.0,
+        _joint_state_topic="/joint_states",
         get_logger=lambda: logger,
     )
+    harness._snapshot_joint_state = lambda: joint_state
+    harness._validate_joint5_branch_continuity = lambda *_args: None
     prepare_calls = []
 
     def prepare_candidate(selected, *_args, **kwargs):
@@ -717,72 +724,34 @@ def test_close_gripper_is_immediate_after_descent_before_diagnostics():
         )
 
     assert feedback[-2:] == ["descend", "close"]
+    assert "pregrasp" not in feedback
     assert primitives == ["open_gripper", "move_to_configuration", "close_gripper"]
     assert len(prepare_calls) == 2
-    assert "enforce_fixed_finger_robust_gap" not in prepare_calls[0]
+    assert prepare_calls[0]["apply_compensation"] is True
+    assert prepare_calls[0]["initial_seed"] is joint_state
+    assert "apply_compensation" not in prepare_calls[1]
+    assert prepare_calls[1]["enforce_contact_error"] is False
     assert prepare_calls[1]["enforce_fixed_finger_robust_gap"] is False
 
 
-def test_descend_aligns_xy_at_pregrasp_height_before_vertical_drop():
+def test_descend_uses_compensated_safe_waypoint_without_pregrasp_realign():
     class _ReachedClose(RuntimeError):
         pass
 
     logger = _Logger()
     primitives: list[str] = []
     branch_locked_calls: list[tuple] = []
-    candidate = GraspCandidate()
-    candidate.confidence = 0.8
-    plan = CandidatePlan(
-        approach=(0.10, -0.20, 0.12),
-        grasp=(0.10, -0.20, 0.04),
-        lift=(0.10, -0.20, 0.10),
-        quaternion=(0.0, 0.0, 0.0, 1.0),
-        approach_axis=(0.0, 0.0, 1.0),
-        target_contact_ee=(0.0, 0.0, 0.0),
-        target_contact_base=(0.10, -0.20, 0.04),
-        target_width_m=0.013,
-        width_reason="test",
-        fixed_finger_target_gap_m=0.013,
-        target_width_min_base=(0.09, -0.20, 0.04),
-        target_width_max_base=(0.11, -0.20, 0.04),
-        topdown_score=1.0,
-    )
-    ranked = RankedCandidate(index=3, candidate=candidate, plan=plan, score=0.9)
-    joint_state = JointState()
-    compensated_plan = replace(plan, grasp=(0.13, -0.20, 0.04))
-    prepared = PreparedCandidate(
-        ranked=ranked,
-        plan=plan,
-        final_joint_state=joint_state,
-        actual_ee_xyz=compensated_plan.grasp,
-        actual_ee_quaternion=plan.quaternion,
-        contact_residual_xy_m=0.001,
-        contact_z_error_m=0.0,
-        approach_axis_error_deg=0.0,
-        closing_axis_error_deg=0.0,
-        tabletop_clearance_m=0.02,
-        mesh_min_z=0.04,
-        fixed_finger_envelope=FixedFingerEnvelope(
-            fixed_gap_m=0.0085,
-            moving_gap_m=0.01,
-            target_gap_m=0.013,
-            fixed_score=0.5,
-            moving_score=0.5,
-            score=0.5,
-        ),
-        fk_fixed_finger_base_side=None,
-        predicted_robust_gap_headroom_m=0.002,
-        selection_score=0.8,
-    )
+    feedback: list[str] = []
+    events: list[tuple] = []
+    realign_phases: list[str] = []
+    prepared = _full_prepared_candidate(index=3)
+    joint_state = prepared.final_joint_state
     harness = SimpleNamespace(
         _config={
             "open_settle_sec": 0.0,
             "approach_velocity_scaling": 0.05,
             "descend_velocity_scaling": 0.03,
             "descend_duration_sec": 2.0,
-            "contact_compensation": {
-                "xy_tolerance_m": 0.003,
-            },
             "target_gripper": {
                 "closing_axis_ee": [1.0, 0.0, 0.0],
                 "fixed_finger_robust_gap": {
@@ -792,24 +761,35 @@ def test_descend_aligns_xy_at_pregrasp_height_before_vertical_drop():
         },
         _gripper_open=1.0,
         _gripper_closed=0.0,
+        _joint_state_topic="/joint_states",
         get_logger=lambda: logger,
     )
+    harness._snapshot_joint_state = lambda: joint_state
+    harness._validate_joint5_branch_continuity = lambda *_args: None
 
     def prepare_candidate(selected, *_args, **kwargs):
-        return replace(prepared, ranked=selected, plan=compensated_plan)
+        events.append(("prepare", len([event for event in events if event[0] == "prepare"]) + 1))
+        return replace(prepared, ranked=selected, plan=selected.plan, actual_ee_xyz=selected.plan.grasp)
 
     harness._prepare_candidate = prepare_candidate
-    harness._publish_feedback = lambda _goal, _state, phase, _detail: None
+    harness._publish_feedback = lambda _goal, _state, phase, _detail: feedback.append(phase)
     harness._sleep_with_cancel = lambda *_args: None
-    harness._pregrasp_pose = lambda *_args: (0.10, -0.20, 0.07)
-    harness._realign_contact = lambda _goal, _deadline, _task_id, _phase, xyz, _quaternion, *_args: (
-        xyz,
-        joint_state,
+    harness._pregrasp_pose = lambda selected, _scene: (
+        selected.plan.grasp[0],
+        selected.plan.grasp[1],
+        selected.plan.grasp[2] + 0.03,
     )
+
+    def realign_contact(_goal, _deadline, _task_id, phase, xyz, _quaternion, *_args):
+        realign_phases.append(phase)
+        return (xyz[0] + 0.03, xyz[1], xyz[2] + 0.01), joint_state
+
+    harness._realign_contact = realign_contact
     harness._record_pose_diagnostic = lambda *_args, **_kwargs: None
 
     def move_branch_locked_pose(_goal, _deadline, _task_id, xyz, _quaternion, _scaling, _seed):
         branch_locked_calls.append(xyz)
+        events.append(("move", xyz))
         return SimpleNamespace(joint_state=joint_state)
 
     harness._move_branch_locked_pose = move_branch_locked_pose
@@ -833,11 +813,135 @@ def test_descend_aligns_xy_at_pregrasp_height_before_vertical_drop():
             SimpleNamespace(),
         )
 
-    assert len(branch_locked_calls) == 3
+    assert len(branch_locked_calls) == 2
     assert branch_locked_calls[0] == (0.10, -0.20, 0.12)
-    assert branch_locked_calls[1] == (0.10, -0.20, 0.07)
-    assert branch_locked_calls[2] == (0.13, -0.20, 0.07)
+    assert branch_locked_calls[1] == pytest.approx((0.13, -0.20, 0.08))
+    assert events.index(("prepare", 2)) < events.index(("move", pytest.approx((0.13, -0.20, 0.08))))
+    assert realign_phases == ["approach"]
+    assert "pregrasp" not in feedback
     assert primitives == ["open_gripper", "move_to_configuration", "close_gripper"]
+
+
+def test_descend_failure_returns_to_observe_before_propagating_error():
+    logger = _Logger()
+    prepared = _full_prepared_candidate()
+    joint_state = prepared.final_joint_state
+    state = FlowState(completed_phases=[])
+    observe_calls: list[str] = []
+    harness = SimpleNamespace(
+        _config={
+            "open_settle_sec": 0.0,
+            "approach_velocity_scaling": 0.05,
+            "descend_velocity_scaling": 0.03,
+            "descend_duration_sec": 2.0,
+        },
+        _gripper_open=1.0,
+        _gripper_closed=0.0,
+        _joint_state_topic="/joint_states",
+        get_logger=lambda: logger,
+    )
+    harness._snapshot_joint_state = lambda: joint_state
+    harness._validate_joint5_branch_continuity = lambda *_args: None
+    harness._prepare_candidate = lambda selected, *_args, **_kwargs: replace(
+        prepared,
+        ranked=selected,
+        plan=selected.plan,
+    )
+    harness._publish_feedback = lambda *_args: None
+    harness._sleep_with_cancel = lambda *_args: None
+    harness._pregrasp_pose = lambda *_args: (0.10, -0.20, 0.07)
+    harness._move_branch_locked_pose = lambda *_args, **_kwargs: SimpleNamespace(joint_state=joint_state)
+    harness._realign_contact = lambda _goal, _deadline, _task_id, _phase, xyz, _quaternion, *_args: (
+        xyz,
+        joint_state,
+    )
+    harness._record_pose_diagnostic = lambda *_args, **_kwargs: None
+    harness._move_to_observe = lambda _goal, _deadline, _state, task_id: observe_calls.append(task_id)
+
+    def run_primitive(_goal, _deadline, _task_id, primitive_name, **_kwargs):
+        if primitive_name == "move_to_configuration":
+            raise PickFlowError("PRIMITIVE_FAILED", "descent failed")
+
+    harness._run_primitive = run_primitive
+
+    with pytest.raises(PickFlowError, match="descent failed"):
+        PickExecutorNode._execute_candidate(
+            cast(Any, harness),
+            None,
+            time.monotonic() + 5.0,
+            state,
+            "descent-failure-test",
+            "marker",
+            prepared,
+            SimpleNamespace(),
+        )
+
+    assert observe_calls == ["descent-failure-test"]
+    assert state.recovery_completed is True
+    assert state.pipeline_timings["subphase_recovery"] >= 0.0
+
+
+def test_cancel_after_close_does_not_enter_failure_recovery():
+    from manipulation_execution.pick_executor_node import PickCancelled
+
+    logger = _Logger()
+    prepared = _full_prepared_candidate()
+    joint_state = prepared.final_joint_state
+    recovery_calls: list[str] = []
+    sleep_calls = 0
+    harness = SimpleNamespace(
+        _config={
+            "open_settle_sec": 0.0,
+            "hold_sec": 0.8,
+            "approach_velocity_scaling": 0.05,
+            "descend_velocity_scaling": 0.03,
+            "descend_duration_sec": 2.0,
+            "recover_after_close_failure": True,
+        },
+        _gripper_open=1.0,
+        _gripper_closed=0.0,
+        _joint_state_topic="/joint_states",
+        get_logger=lambda: logger,
+    )
+    harness._snapshot_joint_state = lambda: joint_state
+    harness._validate_joint5_branch_continuity = lambda *_args: None
+    harness._prepare_candidate = lambda selected, *_args, **_kwargs: replace(
+        prepared,
+        ranked=selected,
+        plan=selected.plan,
+    )
+    harness._publish_feedback = lambda *_args: None
+
+    def sleep_with_cancel(*_args):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 2:
+            raise PickCancelled()
+
+    harness._sleep_with_cancel = sleep_with_cancel
+    harness._pregrasp_pose = lambda *_args: (0.10, -0.20, 0.07)
+    harness._move_branch_locked_pose = lambda *_args, **_kwargs: SimpleNamespace(joint_state=joint_state)
+    harness._realign_contact = lambda _goal, _deadline, _task_id, _phase, xyz, _quaternion, *_args: (
+        xyz,
+        joint_state,
+    )
+    harness._record_pose_diagnostic = lambda *_args, **_kwargs: None
+    harness._run_primitive = lambda *_args, **_kwargs: None
+    harness._recover_after_close_failure = lambda *_args: recovery_calls.append("recover")
+
+    with pytest.raises(PickCancelled):
+        PickExecutorNode._execute_candidate(
+            cast(Any, harness),
+            None,
+            time.monotonic() + 5.0,
+            FlowState(completed_phases=[]),
+            "cancel-test",
+            "marker",
+            prepared,
+            SimpleNamespace(),
+        )
+
+    assert recovery_calls == []
 
 
 def test_pick_result_serializes_pipeline_timings():
