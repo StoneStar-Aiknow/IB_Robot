@@ -291,46 +291,53 @@ hardware_interface::return_type LeKiwiSystemHardware::read(
   int read_len = sms_sts_.syncReadPacketTx(
     motor_ids_.data(), motor_ids_.size(), SMS_STS_PRESENT_POSITION_L, 2);
   if (read_len <= 0) {
-    RCLCPP_WARN_THROTTLE(rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
+    RCLCPP_ERROR_THROTTLE(rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
       "SyncRead PacketTx FAILED");
-    return hardware_interface::return_type::OK;
+    return hardware_interface::return_type::ERROR;
   }
 
+  auto next_positions = hw_positions_;
   for (size_t i = 0; i < motor_ids_.size(); i++) {
     u8 data[2];
-    if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) == 2) {
-      s16 pos = decode_motor_register(data[0], data[1]);
+    if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) != 2) {
+      RCLCPP_ERROR_THROTTLE(rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
+        "SyncRead position response missing for motor ID %d", motor_ids_[i]);
+      return hardware_interface::return_type::ERROR;
+    }
+    s16 pos = decode_motor_register(data[0], data[1]);
 
-      if (i < num_arm_joints_) {
-        // Arm: convert ticks to radians
-        hw_positions_[i] = ticks_to_radians(pos);
-      } else {
-        // Base: store raw position tick (accumulated rotation in wheel mode)
-        hw_positions_[i] = static_cast<double>(pos);
-      }
+    if (i < num_arm_joints_) {
+      // Arm: convert ticks to radians
+      next_positions[i] = ticks_to_radians(pos);
+    } else {
+      // Base: store raw position tick (accumulated rotation in wheel mode)
+      next_positions[i] = static_cast<double>(pos);
     }
   }
 
   // Also read speeds for arm motors
   read_len = sms_sts_.syncReadPacketTx(
     motor_ids_.data(), motor_ids_.size(), SMS_STS_PRESENT_SPEED_L, 2);
-  if (read_len > 0) {
-    for (size_t i = 0; i < motor_ids_.size(); i++) {
-      u8 data[2];
-      if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) == 2) {
-        s16 speed = decode_motor_register(data[0], data[1]);
-
-        if (i < num_arm_joints_) {
-          // Arm velocity in raw steps/s -> convert to rad/s
-          hw_velocities_[i] = steps_to_rad_s(speed);
-        } else {
-          // Base velocity: convert raw steps/s -> rad/s for ros2_control state interface
-          hw_velocities_[i] = steps_to_rad_s(speed);
-        }
-      }
-    }
+  if (read_len <= 0) {
+    RCLCPP_ERROR_THROTTLE(rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
+      "SyncRead speed PacketTx FAILED");
+    return hardware_interface::return_type::ERROR;
   }
 
+  auto next_velocities = hw_velocities_;
+  for (size_t i = 0; i < motor_ids_.size(); i++) {
+    u8 data[2];
+    if (sms_sts_.syncReadPacketRx(motor_ids_[i], data) != 2) {
+      RCLCPP_ERROR_THROTTLE(rclcpp::get_logger("LeKiwiSystemHardware"), steady_clock, 500,
+        "SyncRead speed response missing for motor ID %d", motor_ids_[i]);
+      return hardware_interface::return_type::ERROR;
+    }
+    s16 speed = decode_motor_register(data[0], data[1]);
+    next_velocities[i] = steps_to_rad_s(speed);
+  }
+
+  hw_positions_ = next_positions;
+  hw_velocities_ = next_velocities;
   return hardware_interface::return_type::OK;
 }
 

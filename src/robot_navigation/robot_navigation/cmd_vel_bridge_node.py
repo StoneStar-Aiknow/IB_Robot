@@ -17,7 +17,7 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Bool, Float64MultiArray
 from tf2_ros import TransformBroadcaster
 
 # Wheel mount angles (matching physical robot configuration)
@@ -102,6 +102,11 @@ class CmdVelBridgeNode(Node):
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("joint_states_topic", "/joint_states")
         self.declare_parameter("odom_topic", "/odom")
+        self.declare_parameter("motion_mode_enabled", False)
+        self.declare_parameter("navigation_enabled_on_startup", False)
+        self.declare_parameter("navigation_enabled_topic", "motion_mode/navigation_enabled")
+        self.declare_parameter("navigation_mode_ack_topic", "motion_mode/base_navigation_enabled")
+        self.declare_parameter("motion_mode_heartbeat_frequency", 10.0)
 
         self.wheel_radius = self.get_parameter("wheel_radius").value
         self.base_radius = self.get_parameter("base_radius").value
@@ -114,6 +119,11 @@ class CmdVelBridgeNode(Node):
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
         joint_states_topic = self.get_parameter("joint_states_topic").value
         odom_topic = self.get_parameter("odom_topic").value
+        self.motion_mode_enabled = bool(self.get_parameter("motion_mode_enabled").value)
+        navigation_enabled_on_startup = bool(self.get_parameter("navigation_enabled_on_startup").value)
+        navigation_enabled_topic = str(self.get_parameter("navigation_enabled_topic").value)
+        navigation_mode_ack_topic = str(self.get_parameter("navigation_mode_ack_topic").value)
+        motion_mode_heartbeat_frequency = max(float(self.get_parameter("motion_mode_heartbeat_frequency").value), 0.0)
 
         # ==================== State ====================
         # Target velocities from /cmd_vel
@@ -121,6 +131,7 @@ class CmdVelBridgeNode(Node):
         self.target_vy = 0.0
         self.target_vtheta = 0.0
         self.last_cmd_time: float | None = None
+        self.navigation_enabled = navigation_enabled_on_startup if self.motion_mode_enabled else True
 
         # Odometry state
         self.odom_x = 0.0
@@ -142,6 +153,11 @@ class CmdVelBridgeNode(Node):
             durability=DurabilityPolicy.VOLATILE,
             depth=10,
         )
+        qos_transient_local = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1,
+        )
 
         # ==================== Subscribers ====================
         self.cmd_vel_sub = self.create_subscription(
@@ -157,6 +173,23 @@ class CmdVelBridgeNode(Node):
             self.joint_states_callback,
             qos_best_effort,
         )
+
+        self.navigation_mode_sub = None
+        self.navigation_mode_ack_pub = None
+        self.navigation_mode_heartbeat_timer = None
+        if self.motion_mode_enabled:
+            self.navigation_mode_sub = self.create_subscription(
+                Bool,
+                navigation_enabled_topic,
+                self.navigation_mode_callback,
+                qos_transient_local,
+            )
+            self.navigation_mode_ack_pub = self.create_publisher(Bool, navigation_mode_ack_topic, qos_reliable)
+            if motion_mode_heartbeat_frequency > 0.0:
+                self.navigation_mode_heartbeat_timer = self.create_timer(
+                    1.0 / motion_mode_heartbeat_frequency,
+                    self._publish_navigation_mode_ack,
+                )
 
         # ==================== Publishers ====================
         self.wheel_cmd_pub = self.create_publisher(
@@ -181,15 +214,55 @@ class CmdVelBridgeNode(Node):
         self.get_logger().info(
             f"cmd_vel_bridge node started "
             f"(wheel_radius={self.wheel_radius}, base_radius={self.base_radius}, "
-            f"max_radps={self.max_radps}, freq={control_freq}Hz)"
+            f"max_radps={self.max_radps}, freq={control_freq}Hz, "
+            f"navigation_enabled={self.navigation_enabled})"
         )
 
     def cmd_vel_callback(self, msg: Twist) -> None:
         """Cache latest cmd_vel command."""
+        if self.motion_mode_enabled and not self.navigation_enabled:
+            return
         self.target_vx = msg.linear.x
         self.target_vy = msg.linear.y
         self.target_vtheta = msg.angular.z  # rad/s
         self.last_cmd_time = self.get_clock().now().nanoseconds / 1e9
+
+    def navigation_mode_callback(self, msg: Bool) -> None:
+        """Apply a motion-mode transition and acknowledge a zeroed command boundary."""
+        if not self.motion_mode_enabled:
+            return
+
+        self.navigation_enabled = bool(msg.data)
+        self._clear_target_velocity()
+        self._publish_wheel_command([0.0, 0.0, 0.0])
+
+        self._publish_navigation_mode_ack()
+        mode = "navigation" if self.navigation_enabled else "manipulation"
+        self.get_logger().info(f"Motion mode changed to {mode}; cached cmd_vel cleared")
+
+    def _publish_navigation_mode_ack(self) -> None:
+        if self.navigation_mode_ack_pub is None:
+            return
+        ack = Bool()
+        ack.data = self.navigation_enabled
+        self.navigation_mode_ack_pub.publish(ack)
+
+    def _clear_target_velocity(self) -> None:
+        self.target_vx = 0.0
+        self.target_vy = 0.0
+        self.target_vtheta = 0.0
+        self.last_cmd_time = None
+
+    def _publish_wheel_command(self, wheel_speeds: list[float]) -> None:
+        cmd_msg = Float64MultiArray()
+        cmd_msg.data = wheel_speeds
+        self.wheel_cmd_pub.publish(cmd_msg)
+
+    def publish_stop_boundary(self, repetitions: int = 3) -> None:
+        """Clear cached motion and repeat zero commands for graceful shutdown."""
+        self._clear_target_velocity()
+        for _ in range(max(1, repetitions)):
+            self._publish_wheel_command([0.0, 0.0, 0.0])
 
     def joint_states_callback(self, msg: JointState) -> None:
         """Cache wheel velocity feedback from joint_states.
@@ -219,14 +292,14 @@ class CmdVelBridgeNode(Node):
         vy = self.target_vy
         vtheta = self.target_vtheta
 
-        # Check timeout
-        if self.last_cmd_time is not None and (now - self.last_cmd_time) > self.cmd_timeout:
+        # Manipulation mode owns the arm and continuously holds the base at zero.
+        navigation_blocked = self.motion_mode_enabled and not self.navigation_enabled
+        command_timed_out = self.last_cmd_time is not None and (now - self.last_cmd_time) > self.cmd_timeout
+        if navigation_blocked or command_timed_out:
             vx = 0.0
             vy = 0.0
             vtheta = 0.0
-            self.target_vx = 0.0
-            self.target_vy = 0.0
-            self.target_vtheta = 0.0
+            self._clear_target_velocity()
         elif self.last_cmd_time is None:
             vx = 0.0
             vy = 0.0
@@ -241,9 +314,7 @@ class CmdVelBridgeNode(Node):
             self.max_radps,
         )
 
-        cmd_msg = Float64MultiArray()
-        cmd_msg.data = wheel_speeds
-        self.wheel_cmd_pub.publish(cmd_msg)
+        self._publish_wheel_command(wheel_speeds)
 
         # ---------- FK + Odometry: wheel feedback -> odom ----------
         if self.wheel_feedback is not None:
@@ -330,6 +401,9 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.publish_stop_boundary()
+        for _ in range(3):
+            rclpy.spin_once(node, timeout_sec=0.02)
         node.destroy_node()
         rclpy.shutdown()
 

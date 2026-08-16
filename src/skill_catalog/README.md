@@ -13,7 +13,7 @@ state, leases, task IDs, authorization, and action execution do not belong here.
 - `config/profiles/<profile>.yaml`: enabled package, selected implementation, and planner visibility.
 
 The current source-workspace profiles are `so101_single_arm`,
-`so101_handeye_realsense_grasp`, `so101_handeye_realsense_grasp_pc`, and `so101_rtp_distributed`. The shared stable
+`lekiwi_handeye_realsense_grasp`, `lekiwi_handeye_realsense_grasp_pc`, and `so101_rtp_distributed`. The shared stable
 implementation `so101_arm_v1` is selected by every enabled entry in both
 `so101_single_arm` and `so101_rtp_distributed`; the two profiles compile the
 same execution body, so their implementation content cannot drift through

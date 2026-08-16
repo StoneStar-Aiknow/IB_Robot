@@ -10,12 +10,24 @@ controller_manager:
     gripper_position_controller:
       type: position_controllers/JointGroupPositionController
 
+    # Arm trajectory controller (for MoveIt planning mode)
+    arm_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    # Gripper trajectory controller (for MoveIt planning mode)
+    gripper_trajectory_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
     # Base velocity controller (3 omniwheel joints)
     base_velocity_controller:
       type: velocity_controllers/JointGroupVelocityController
 
     # State broadcaster
     joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    # Arm-only state stream for MoveIt (excludes omniwheel joints 7-9)
+    arm_joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
 
 joint_state_broadcaster:
@@ -31,6 +43,20 @@ joint_state_broadcaster:
       - "8"
       - "9"
     publish_rate: 100.0
+
+arm_joint_state_broadcaster:
+  ros__parameters:
+    joints:
+      - "1"
+      - "2"
+      - "3"
+      - "4"
+      - "5"
+      - "6"
+    interfaces:
+      - position
+    publish_rate: 100.0
+    use_local_topics: true
 
 # Arm joints 1-5 (position control)
 arm_position_controller:
@@ -55,6 +81,34 @@ gripper_position_controller:
       - position
     state_interfaces:
       - position
+
+# Arm trajectory controller (joints 1-5, for MoveIt planning)
+arm_trajectory_controller:
+  ros__parameters:
+    joints:
+      - "1"
+      - "2"
+      - "3"
+      - "4"
+      - "5"
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+    allow_integration_in_goal_trajectories: true
+    allow_nonzero_velocity_at_trajectory_end: true
+
+# Gripper trajectory controller (joint 6, for MoveIt planning)
+gripper_trajectory_controller:
+  ros__parameters:
+    joints:
+      - "6"
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+    allow_integration_in_goal_trajectories: true
+    allow_nonzero_velocity_at_trajectory_end: true
 
 # Base joints 7-9 (velocity control)
 base_velocity_controller:

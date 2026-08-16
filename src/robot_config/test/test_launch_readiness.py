@@ -188,8 +188,23 @@ def test_generate_controller_spawners_uses_repository_timeout_aware_process_per_
         assert "--activate-as-group" not in cmd_text
 
 
+def test_generate_controller_spawners_supports_inactive_controller_group():
+    spawners = generate_controller_spawners(
+        ["arm_trajectory_controller"],
+        use_sim=False,
+        controller_manager_timeout=30.0,
+        inactive_controller_names=["base_velocity_controller"],
+    )
+
+    assert len(spawners) == 2
+    active_arguments = _text(spawners[0]._Node__arguments)
+    inactive_arguments = _text(spawners[1]._Node__arguments)
+    assert "--inactive" not in active_arguments
+    assert "--inactive" in inactive_arguments
+
+
 def test_real_hardware_controller_spawners_use_configured_readiness_timeout():
-    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "so101_handeye_realsense_grasp.yaml"
+    config_path = Path(__file__).resolve().parents[1] / "config" / "robots" / "lekiwi_handeye_realsense_grasp.yaml"
     robot_config = load_robot_config_dict(config_path)
     robot_config["default_control_mode"] = "moveit_planning"
 
@@ -202,10 +217,12 @@ def test_real_hardware_controller_spawners_use_configured_readiness_timeout():
 
     assert controller_names == [
         "joint_state_broadcaster",
+        "arm_joint_state_broadcaster",
         "arm_trajectory_controller",
         "gripper_trajectory_controller",
     ]
-    assert len(deferred_spawners) == len(controller_names)
+    assert len(deferred_spawners) == len(controller_names) + 1
+    assert "--inactive" in _text(deferred_spawners[-1]._Node__arguments)
     assert all(spawner.node_package == "robot_config" for spawner in deferred_spawners)
     assert all(spawner.node_executable == "controller_spawner" for spawner in deferred_spawners)
     assert all(node.node_executable != "controller_spawner" for node in nodes)

@@ -242,7 +242,8 @@ worker 使用被动等待，避免 NPU 请求完成后继续抢占 CPU。该配�
 支持容器放置验证的机器人在顶层 `robot.placement_execution` 声明唯一运行时配置。该配置维护 placement
 action、固定 1–5 号关节 `place_joint_positions`、移动时长、腕部 RGB topic、检测分割 endpoint、夹爪反馈超时，
 以及二维掩码包含验证的阈值和重采样次数；启用时缺少强制字段会在 launch 前失败。固定放置关节目标由
-`placement_execution.motion` 管理：到达 3 号电机 raw 1500 后开爪，随后只将 3 号电机移动到 raw 1600 做验证，
+`placement_execution.motion` 管理：到达 3 号电机 raw 1500 后开爪，随后只将 3 号电机移动到 raw 1700
+（`verify_joint_position: -0.533825`）做验证，
 最后恢复到 raw 1500。候选放置位规划、
 动态 IK/FK、深度/TF、持物门禁和恢复日志不属于该能力。
 
@@ -375,17 +376,34 @@ SO101 真机的 MoveIt 完成语义也由同一 robot YAML 的 `moveit` 域声�
 
 ```yaml
 moveit:
+  joint_state_topic: /arm_joint_state_broadcaster/joint_states
   motion_status_hold_s: 0.0
   motion_feedback_timeout_s: 0.3
   motion_feedback_tolerance_rad: 0.12
   motion_require_tf_sync: true
-  motion_hardware_feedback_topic: /so101_follower/joint_currents
+  # LeKiWiSystemHardware does not publish ibrobot_msgs/JointCurrent.
+  motion_hardware_feedback_topic: ""
 ```
 
-网关只在 MoveIt 终态之后同时看到新的硬件读取心跳、收敛关节样本和覆盖该样本时间戳的末端 TF 时
-返回成功，不再依赖固定 `0.3 s` sleep。由该屏障覆盖的 `contact_realign.settle_sec` 和
+配置硬件心跳话题时，网关只在 MoveIt 终态之后同时看到新的硬件读取心跳、收敛关节样本和覆盖该样本时间戳的末端 TF 时
+返回成功；LeKiWi 将该可选话题留空，使用新的收敛关节样本与 TF 屏障，不再依赖固定 `0.3 s` sleep。由该屏障覆盖的 `contact_realign.settle_sec` 和
 `pose_diagnostics.settle_sec` 可设为 `0.0`；相机与夹爪稳定等待不在此屏障覆盖范围内。仿真启动会
 清空硬件心跳话题，只保留关节与 TF 屏障。
+
+LeKiWi 抓取配置还使用顶层 `motion_mode` 作为常驻控制器的命令授权 SSOT：
+
+```yaml
+motion_mode:
+  enabled: true
+  navigation_enabled_on_startup: false
+  navigation_enabled_topic: /motion_mode/navigation_enabled
+  navigation_mode_ack_topic: /motion_mode/base_navigation_enabled
+  set_navigation_enabled_service: /motion_mode/set_navigation_enabled
+  transition_timeout_s: 2.0
+```
+
+`moveit_planning` 同时启动机械臂轨迹、夹爪轨迹、底盘速度、全量关节状态和机械臂专用关节状态控制器。
+任务切换只调用上述服务改变新命令的授权，不停止控制器或重启硬件节点。
 
 `robot.grasp_execution.prepared_candidate_scoring` 控制 IK/FK 后软排序。SO101 使用候选目标宽度区间和
 候选规划姿态计算固定指到目标前缘的间隙，并以动态 margin 为期望值计算包络分数。该分数与
@@ -740,7 +758,7 @@ WAV；它尚不支持请求级 prompt，调用时返回 `UNSUPPORTED_PROMPT`。�
 
 ### 真机手眼配置
 
-SO101 抓取使用同级独立配置 `config/robots/so101_handeye_realsense_grasp.yaml`。用户应直接在
+SO101 抓取使用同级独立配置 `config/robots/lekiwi_handeye_realsense_grasp.yaml`。用户应直接在
 这份 YAML 中填写从动臂串口、相机序列号和 leader 配置；`scripts/handeye_calibrator.py` 质量检查
 通过后会就地更新 `peripherals[name=wrist].transform`。多台物理机器人应分别复制独立 YAML，避免
 不同实例的端口和标定值互相覆盖。`config_path` 仍可用于加载 workspace 外部的完整 robot YAML，

@@ -133,7 +133,14 @@ def _generate_real_navigation(
     ekf_rtabmap_config = navigation_config.get("ekf_rtabmap", {})
     ekf_node_config = ekf_rtabmap_config.get("ekf", {})
     ekf_enabled = ekf_rtabmap_config.get("enabled", False) and ekf_node_config.get("enabled", True) and not use_sim
-    nodes.extend(generate_cmd_vel_nodes(navigation_config, ekf_enabled=ekf_enabled, use_sim=use_sim))
+    nodes.extend(
+        generate_cmd_vel_nodes(
+            navigation_config,
+            motion_mode_config=robot_config.get("motion_mode", {}),
+            ekf_enabled=ekf_enabled,
+            use_sim=use_sim,
+        )
+    )
 
     # 5. Voice-controlled navigation (Nav2 goal client + FunASR)
     nodes.extend(generate_voice_nav_nodes(navigation_config, use_sim=use_sim))

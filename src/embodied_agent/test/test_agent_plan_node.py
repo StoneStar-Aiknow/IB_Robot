@@ -380,7 +380,7 @@ def test_validate_plan_unexpected_error_returns_stable_failure_and_service_survi
     assert recovered.allowed is True
 
 
-@pytest.mark.parametrize("plan_rig", ["so101_handeye_realsense_grasp_pc"], indirect=True)
+@pytest.mark.parametrize("plan_rig", ["lekiwi_handeye_realsense_grasp_pc"], indirect=True)
 def test_marker_outputs_replay_uses_hermes_pick_contract_without_hardware(plan_rig):
     """Replay the saved marker planning evidence through the Agent plan boundary only."""
     repository_root = Path(__file__).parents[3]
@@ -456,7 +456,7 @@ def test_robot_skill_marker_outputs_replay_reaches_real_gateway_without_hardware
 
     repository_root = Path(__file__).parents[3]
     config_path = (
-        repository_root / "src" / "robot_config" / "config" / "robots" / "so101_handeye_realsense_grasp_pc.yaml"
+        repository_root / "src" / "robot_config" / "config" / "robots" / "lekiwi_handeye_realsense_grasp_pc.yaml"
     )
     evidence_path = (
         repository_root / "outputs" / "success_cloud_replay_20260806" / "current_phases_after_wait_future_fix.json"
@@ -648,6 +648,18 @@ def test_robot_skill_marker_outputs_replay_reaches_real_gateway_without_hardware
             task_id,
             "--timeout-sec",
             "240",
+            "--plan-id",
+            planned["plan_id"],
+            "--plan-digest",
+            planned["plan_digest"],
+            "--registry-epoch",
+            planned["registry_epoch"],
+            "--registry-generation",
+            str(planned["registry_generation"]),
+            "--registry-digest",
+            planned["registry_digest"],
+            "--expected-step-count",
+            str(len(planned["workflow_steps"])),
             jsonl=True,
         )
         terminal = events[-1]

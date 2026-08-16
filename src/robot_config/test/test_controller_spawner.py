@@ -55,6 +55,27 @@ def test_spawn_controller_forwards_explicit_timeouts(monkeypatch):
     assert calls[2][1][-2:] == (43.0, 42.0)
 
 
+def test_spawn_controller_can_leave_controller_inactive(monkeypatch):
+    monkeypatch.setattr(controller_spawner, "list_controllers", lambda *args: _controllers())
+    monkeypatch.setattr(controller_spawner, "load_controller", lambda *args: SimpleNamespace(ok=True))
+    monkeypatch.setattr(controller_spawner, "configure_controller", lambda *args: SimpleNamespace(ok=True))
+    monkeypatch.setattr(
+        controller_spawner,
+        "switch_controllers",
+        lambda *args: pytest.fail("inactive controller must not be activated"),
+    )
+
+    controller_spawner.spawn_controller(
+        _Node(),
+        "/controller_manager",
+        "base_velocity_controller",
+        10.0,
+        20.0,
+        30.0,
+        activate=False,
+    )
+
+
 def test_spawn_controller_accepts_already_active_controller(monkeypatch):
     monkeypatch.setattr(
         controller_spawner,

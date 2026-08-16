@@ -1,19 +1,21 @@
-# SO-101 grasp configuration with one gripper-mounted RealSense.
+# LeKiwi mobile-manipulator grasp configuration with one gripper-mounted RealSense.
 #
 # Hardware assumptions:
-# - SO-101 follower arm on /dev/ttyACM0
+# - LeKiwi omnidirectional base (joints 7/8/9) with SO-101 follower arm (joints 1-6)
+#   driven by the unified LeKiwiSystemHardware plugin
 # - follower joint calibration at ~/.calibrate/so101_follower_calibrate.json
-# - one RealSense connected to the 310P board, with the camera bracket mounted on SO101
-# - the RealSense moves rigidly with the gripper
+# - one RealSense connected to the 310P board, with the camera bracket mounted on
+#   the SO-101 gripper; the RealSense moves rigidly with the gripper
 # - no separate top/front fixed camera
+# - during grasp execution the base is held still; only arm + gripper move
 #
 # The camera is named "wrist" by role. The USB connection location does not
 # define the hand-eye type; the rigid transform parent does.
 
 robot:
-  name: so101_handeye_realsense_grasp
-  type: so101
-  robot_type: so_101
+  name: lekiwi_handeye_realsense_grasp
+  type: lekiwi
+  robot_type: lekiwi
 
   joints:
     arm:
@@ -24,20 +26,43 @@ robot:
       - "5"
     gripper:
       - "6"
-    all: ["1", "2", "3", "4", "5", "6"]
+    base:
+      - "7"
+      - "8"
+      - "9"
+    all: ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
 
   moveit:
     arm_group_name: arm
     base_link: base
     ee_link: gripper
     shoulder_link: shoulder
+    # MoveIt consumes only arm/gripper joints; the full /joint_states remains
+    # available to navigation and dataset consumers.
+    joint_state_topic: /arm_joint_state_broadcaster/joint_states
     # Return as soon as a post-terminal hardware read, converged joint sample,
     # and the corresponding robot_state_publisher TF are all observable.
     motion_status_hold_s: 0.0
     motion_feedback_timeout_s: 0.3
     motion_feedback_tolerance_rad: 0.12
     motion_require_tf_sync: true
-    motion_hardware_feedback_topic: /so101_follower/joint_currents
+    # LeKiWi read failures now return ERROR, so a fresh JointState can only
+    # follow a complete hardware read; no separate heartbeat topic is needed.
+    motion_hardware_feedback_topic: ""
+
+  # Controllers and hardware stay active across tasks. This control-plane gate
+  # changes which subsystem may accept new commands.
+  motion_mode:
+    enabled: true
+    navigation_enabled_on_startup: false
+    navigation_enabled_topic: motion_mode/navigation_enabled
+    navigation_mode_ack_topic: motion_mode/base_navigation_enabled
+    set_navigation_enabled_service: motion_mode/set_navigation_enabled
+    controller_switch_service: controller_manager/switch_controller
+    manipulation_controllers: [arm_trajectory_controller, gripper_trajectory_controller]
+    navigation_controllers: [base_velocity_controller]
+    transition_timeout_s: 2.0
+    bridge_heartbeat_timeout_s: 1.0
 
   skill_required_control_mode: "moveit_planning"
   semantic_mapping:
@@ -144,8 +169,8 @@ robot:
       # sit. The fitted tabletop plane measures 6 runs at z_base = -0.061 with a
       # 0.5 mm spread, plus one bad RANSAC fit at -0.069 (6.1 deg tilt); -0.08
       # clears the worst fit with margin. Sweeping lower adds no candidates.
-      # The real collision gate stays target_geometry.tabletop_filter, which is
-      # measured against the fitted plane and so does not drift with base height.
+      # The real collision gate stays target_geometry.tabletop_filter, which
+      # is measured against the fitted plane and so does not drift with base height.
       min_contact_z: -0.07
       min_approach_z: 0.04
       min_topdown_score: 0.0
@@ -253,13 +278,25 @@ robot:
     verifier_node:
       gripper_joint: "6"
       joint_state_topic: /joint_states
-      joint_current_topic: /so101_follower/joint_currents
+      # LeKiWi has no current publisher; the verifier uses calibrated gripper
+      # contact plus wrist visibility as the authoritative evidence.
+      joint_current_topic: ""
       wrist_depth_topic: /camera/wrist/aligned_depth_to_color/image_raw
       gripper_closed_position: 0.0
       # PC-compatible joint-6 position; 0.08 corresponds to the validated raw-tick contact boundary.
       gripper_contact_min_opening: 0.08
       gripper_no_contact_max_opening: 0.03
       current_contact_threshold_a: 0.08
+      score_gripper_contact_success: 0.70
+      score_gripper_contact_failure: 0.45
+      score_gripper_residual_success: 0.18
+      score_gripper_residual_failure: 0.12
+      score_current_contact_success: 0.0
+      score_current_contact_failure: 0.0
+      score_wrist_occlusion_success: 0.10
+      score_success_threshold: 0.65
+      score_failure_threshold: 0.55
+      score_margin_threshold: 0.20
     source_gripper: robotiq_2f_140
     source_contact_point: [0.0, 0.0, 0.195]
     adapter:
@@ -382,8 +419,11 @@ robot:
       description_cn: "用于手眼前置检查的 MoveIt 轨迹规划模式"
       controllers:
         - joint_state_broadcaster
+        - arm_joint_state_broadcaster
         - arm_trajectory_controller
         - gripper_trajectory_controller
+      inactive_controllers:
+        - base_velocity_controller
       inference:
         enabled: false
       executor:
@@ -394,6 +434,32 @@ robot:
         gripper_open_position: 1.0
         gripper_position_tolerance: 0.05
         joint_state_max_age_s: 0.25
+
+  # Keep only the low-level base bridge online in the grasp pipeline. Nav2,
+  # localization, voice routing, and RViz remain disabled in this profile.
+  navigation:
+    enabled: true
+    nav2_bringup:
+      enabled: false
+    ekf_rtabmap:
+      enabled: false
+    cmd_vel_bridge:
+      enabled: true
+      wheel_radius: 0.05
+      base_radius: 0.125
+      max_radps: 4.602
+      odom_frame: odom
+      base_frame: base_link
+      publish_tf: false
+      control_frequency: 50.0
+      cmd_timeout: 0.5
+      cmd_vel_topic: /cmd_vel
+      joint_states_topic: /joint_states
+      odom_topic: /odom
+    robot_navigation:
+      enabled: false
+    rviz:
+      enabled: false
 
   placement_execution:
     enabled: true
@@ -469,7 +535,7 @@ robot:
     entry_mode: hermes
     skill_catalog_source_mode: development
     skill_catalog_source_root: src/skill_catalog
-    skill_catalog_profile: so101_handeye_realsense_grasp
+    skill_catalog_profile: lekiwi_handeye_realsense_grasp
     debug_tracing: true
     task_input_topic: /voice_command
     task_command_topic: /embodied/task_command
@@ -526,10 +592,15 @@ robot:
         orientation: {x: -0.4740206645801369, y: -0.4668084047044082, z: -0.523033090590171, w: 0.532757645647648}
 
   ros2_control:
-    hardware_plugin: so101_hardware/SO101SystemHardware
+    hardware_plugin: lekiwi_hardware/LeKiwiSystemHardware
     port: /dev/ttyACM0
     calib_file: $(env HOME)/.calibrate/so101_follower_calibrate.json
+    # Arm + gripper joints driven as position (matches the SO101 stack).
     joint_names: ["1", "2", "3", "4", "5", "6"]
+    # Omni base wheel joints driven as velocity (LeKiwi-only).
+    velocity_joints: ["7", "8", "9"]
+    # Max base velocity in rad/s; matches base_vel_max_raw=3000 of STS3215.
+    base_vel_max_rad: 4.602
     # Semantic rest pose for upper layers; hardware activation holds the measured position.
     reset_positions:
       "1": 0.0
@@ -537,35 +608,45 @@ robot:
       "3": 1.5708
       "4": 0.7854
       "5": 0.0
-    urdf_path: $(find robot_description)/urdf/lerobot/so101/so101.urdf.xacro
-    controllers_config: $(find so101_hardware)/config/so101_controllers.yaml
+    urdf_path: $(find lekiwi_description)/urdf/lekiwi_assembled.urdf.xacro
+    controllers_config: $(find lekiwi_hardware)/config/lekiwi_controllers.yaml
     controllers:
       - joint_state_broadcaster
+      - arm_joint_state_broadcaster
       - arm_trajectory_controller
       - gripper_trajectory_controller
+      - base_velocity_controller
 
   peripherals:
     - type: camera
       name: wrist
       driver: realsense
-      serial_number: ""
-      # Force a USB hardware reset on every launch so a stale device handle
-      # from a prior unclean shutdown doesn't require a physical replug.
-      initial_reset: true
-      # 640x360 preserves the 16:9 contract shape while keeping aligned
-      # depth and pointcloud processing at the validated 30 Hz rate on 310P.
+      # librealsense serial for the 310P wrist D435i. Explicit binding avoids
+      # selecting another RealSense when multiple devices are connected.
+      # This is the librealsense serial reported by the currently installed
+      # D435i; it intentionally differs from the USB descriptor serial.
+      serial_number: "349522071345"
+      # The 310P Color-first wrapper provides deterministic sensor ordering;
+      # resetting here only changes timing and can make device selection flaky.
+      initial_reset: false
+      # 640x360 preserves the existing 16:9 contract shape while keeping
+      # aligned RGB-D processing at 30 Hz on 310P.
       width: 640
       height: 360
       fps: 30
       pixel_format: bgr8
+      # Grasp planning needs depth in RGB pixel coordinates. Keep alignment as
+      # the one pipeline-specific feature enabled after the raw RGB-D baseline.
       align_depth: true
-      enable_pointcloud: true
+      # The planner builds its scene cloud from aligned depth, so the driver
+      # pointcloud and hardware sync paths are unnecessary additional load.
+      enable_sync: false
+      enable_pointcloud: false
       enable_gyro: false
       enable_accel: false
       streams:
         - color
         - depth
-        - pointcloud
       frame_id: camera_wrist_link
       optical_frame_id: camera_wrist_optical_frame
       # Reused from the PC-validated eye-in-hand runtime configuration. This
@@ -692,6 +773,6 @@ robot:
   recording:
     bag_base_dir: "~/rosbag/episodes"
     storage: mcap
-    dataset_name: so101_handeye_realsense_grasp
+    dataset_name: lekiwi_handeye_realsense_grasp
     default_task: "check eye-in-hand calibration preconditions"
     task_family: calibration

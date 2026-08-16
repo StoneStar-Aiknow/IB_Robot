@@ -6,8 +6,8 @@ import yaml
 
 from robot_config.loader import load_robot_config_dict
 
-CONFIG = Path(__file__).parents[1] / "config" / "robots" / "so101_handeye_realsense_grasp.yaml"
-PC_CONFIG = Path(__file__).parents[1] / "config" / "robots" / "so101_handeye_realsense_grasp_pc.yaml"
+CONFIG = Path(__file__).parents[1] / "config" / "robots" / "lekiwi_handeye_realsense_grasp.yaml"
+PC_CONFIG = Path(__file__).parents[1] / "config" / "robots" / "lekiwi_handeye_realsense_grasp_pc.yaml"
 
 
 def _write_config(tmp_path: Path, mutate) -> Path:
@@ -71,6 +71,27 @@ def test_grasp_execution_config_accepts_repository_profile() -> None:
     assert grasp_execution["contact_realign"]["pregrasp_clearance_m"] == 0.030
     assert grasp_execution["target_geometry"]["tabletop_clearance_m"] == -0.025
     assert grasp_execution["joint_state_topic"] == "/joint_states"
+    assert config["moveit"]["joint_state_topic"] == "/arm_joint_state_broadcaster/joint_states"
+    assert config["motion_mode"] == {
+        "enabled": True,
+        "navigation_enabled_on_startup": False,
+        "navigation_enabled_topic": "/motion_mode/navigation_enabled",
+        "navigation_mode_ack_topic": "/motion_mode/base_navigation_enabled",
+        "set_navigation_enabled_service": "/motion_mode/set_navigation_enabled",
+        "transition_timeout_s": 2.0,
+    }
+    assert config["control_modes"]["moveit_planning"]["controllers"] == [
+        "joint_state_broadcaster",
+        "arm_joint_state_broadcaster",
+        "arm_trajectory_controller",
+        "gripper_trajectory_controller",
+        "base_velocity_controller",
+    ]
+    assert config["navigation"]["enabled"] is True
+    assert config["navigation"]["nav2_bringup"]["enabled"] is False
+    assert config["navigation"]["ekf_rtabmap"]["enabled"] is False
+    assert config["navigation"]["cmd_vel_bridge"]["enabled"] is True
+    assert config["navigation"]["robot_navigation"]["enabled"] is False
     assert grasp_execution["camera"]["rgb_topic"] == "/camera/wrist/image_raw"
     assert grasp_execution["state_wait"] == {
         "enabled": False,
@@ -122,7 +143,30 @@ def test_pc_profile_requires_final_fk_fixed_finger_inward_clearance() -> None:
     assert config["grasp_execution"]["target_gripper"]["fixed_finger_margin_m"] == 0.010
     assert config["grasp_execution"]["target_gripper"]["fixed_finger_margin_max_m"] == 0.016
     assert config["grasp_execution"]["target_gripper"]["fixed_finger_base_side"]["min_fk_inward_offset_m"] == 0.003
-    assert config["embodied"]["skill_catalog_profile"] == "so101_handeye_realsense_grasp_pc"
+    assert config["embodied"]["skill_catalog_profile"] == "lekiwi_handeye_realsense_grasp_pc"
+
+
+def test_lekiwi_controller_config_has_full_and_arm_only_state_streams() -> None:
+    path = Path(__file__).parents[2] / "lekiwi_hardware" / "config" / "lekiwi_controllers.yaml"
+    controller_config = yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    manager = controller_config["controller_manager"]["ros__parameters"]
+    assert manager["arm_joint_state_broadcaster"]["type"] == ("joint_state_broadcaster/JointStateBroadcaster")
+    assert controller_config["joint_state_broadcaster"]["ros__parameters"]["joints"] == [
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "6",
+        "7",
+        "8",
+        "9",
+    ]
+    arm_state = controller_config["arm_joint_state_broadcaster"]["ros__parameters"]
+    assert arm_state["joints"] == ["1", "2", "3", "4", "5", "6"]
+    assert arm_state["interfaces"] == ["position"]
+    assert arm_state["use_local_topics"] is True
 
 
 def test_grasp_execution_config_rejects_unknown_nested_key(tmp_path: Path) -> None:

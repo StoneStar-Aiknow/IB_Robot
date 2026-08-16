@@ -141,13 +141,16 @@ class GraspVerifierNode(Node):
             10,
             callback_group=cb_group,
         )
-        self.create_subscription(
-            JointCurrent,
-            self.get_parameter("joint_current_topic").value,
-            self._joint_current_cb,
-            10,
-            callback_group=cb_group,
-        )
+        joint_current_topic = str(self.get_parameter("joint_current_topic").value).strip()
+        self._joint_current_sub = None
+        if joint_current_topic:
+            self._joint_current_sub = self.create_subscription(
+                JointCurrent,
+                joint_current_topic,
+                self._joint_current_cb,
+                10,
+                callback_group=cb_group,
+            )
         self.create_subscription(
             Image,
             self.get_parameter("wrist_depth_topic").value,
@@ -160,7 +163,7 @@ class GraspVerifierNode(Node):
         self.get_logger().info(
             "GraspVerifier ready: service=~/verify_grasp "
             f"joint_state={self.get_parameter('joint_state_topic').value} "
-            f"current={self.get_parameter('joint_current_topic').value} "
+            f"current={joint_current_topic or 'disabled'} "
             f"wrist_depth={self.get_parameter('wrist_depth_topic').value}"
         )
 

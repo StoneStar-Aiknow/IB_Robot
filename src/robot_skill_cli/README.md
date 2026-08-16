@@ -191,8 +191,8 @@ pipeline 时显式授权。未授权状态下仍可使用 catalog、`status` 和
 
 ```bash
 hermes-robot --config-name so101_single_arm
-hermes-robot --config-name so101_handeye_realsense_grasp -- --cli
-hermes-robot --config-name so101_handeye_realsense_grasp_pc -- --cli
+hermes-robot --config-name lekiwi_handeye_realsense_grasp -- --cli
+hermes-robot --config-name lekiwi_handeye_realsense_grasp_pc -- --cli
 ```
 
 启动器要求 Hermes Agent `0.16.0` 或更新版本，并在启动前验证 `hermes`、`robot-skill`、安装空间中的

@@ -19,8 +19,8 @@ CATALOG_ROOT = Path(__file__).resolve().parents[1]
 ROBOT_CONFIG_DIR = ROOT / "robot_config" / "config" / "robots"
 PROFILES = (
     "so101_single_arm",
-    "so101_handeye_realsense_grasp",
-    "so101_handeye_realsense_grasp_pc",
+    "lekiwi_handeye_realsense_grasp",
+    "lekiwi_handeye_realsense_grasp_pc",
     "so101_rtp_distributed",
 )
 
@@ -30,7 +30,7 @@ def _context(config: dict, capability_digest: str) -> SkillCompileContext:
     execution = embodied.get("execution", {})
     endpoint = config.get("grasp_execution", {}).get("action_name", "/manipulation/execute_pick")
     delegated = {}
-    if config["name"] in {"so101_handeye_realsense_grasp", "so101_handeye_realsense_grasp_pc"}:
+    if config["name"] in {"lekiwi_handeye_realsense_grasp", "lekiwi_handeye_realsense_grasp_pc"}:
         descriptor = DelegatedExecutorDescriptor(
             name="grasp_pipeline",
             contract_version="1",
@@ -45,7 +45,7 @@ def _context(config: dict, capability_digest: str) -> SkillCompileContext:
             ).hexdigest(),
             # The catalog compiler only needs a complete identity. Runtime launch
             # performs the strict manifest validation against the selected bundle.
-            model_deployment_name="ascend_310p" if config["name"] == "so101_handeye_realsense_grasp" else "torch_cuda",
+            model_deployment_name="ascend_310p" if config["name"] == "lekiwi_handeye_realsense_grasp" else "torch_cuda",
             model_fingerprint="0" * 64,
             model_bundle_digest="1" * 64,
         )
@@ -158,7 +158,7 @@ def test_migrated_profile_preserves_legacy_templates_capabilities_and_visibility
             "greet_observe_raise",
             "happy_spin_upright",
         },
-        "so101_handeye_realsense_grasp": {
+        "lekiwi_handeye_realsense_grasp": {
             "inspect_scene",
             "recover_safe_pose",
             "recover_zero_pose",
@@ -168,7 +168,7 @@ def test_migrated_profile_preserves_legacy_templates_capabilities_and_visibility
             "pick_object",
             "place_in_container",
         },
-        "so101_handeye_realsense_grasp_pc": {
+        "lekiwi_handeye_realsense_grasp_pc": {
             "inspect_scene",
             "recover_safe_pose",
             "recover_zero_pose",

@@ -1,6 +1,6 @@
 schema_version: 1
 kind: delegated_executor
-robot: so101_handeye_realsense_grasp
+robot: lekiwi_handeye_realsense_grasp_pc
 executor: grasp_pipeline
 required_args:
 - target_name

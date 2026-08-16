@@ -22,6 +22,11 @@ def generate_launch_description():
     joint_names_arg = DeclareLaunchArgument(
         name="joint_names", description="Joint names for the arm group (space-separated, required)"
     )
+    joint_state_topic_arg = DeclareLaunchArgument(
+        name="joint_state_topic",
+        default_value="/joint_states",
+        description="Arm-only joint state topic consumed by MoveIt",
+    )
 
     # 4. 声明 MoveIt gateway 参数（从 robot_config 传入）
     arm_group_name_arg = DeclareLaunchArgument(
@@ -53,10 +58,40 @@ def generate_launch_description():
         default_value="",
         description="Hardware-read heartbeat topic required by the post-motion barrier",
     )
+    motion_mode_enabled_arg = DeclareLaunchArgument(name="motion_mode_enabled", default_value="False")
+    navigation_enabled_on_startup_arg = DeclareLaunchArgument(
+        name="navigation_enabled_on_startup", default_value="False"
+    )
+    navigation_enabled_topic_arg = DeclareLaunchArgument(
+        name="navigation_enabled_topic", default_value="motion_mode/navigation_enabled"
+    )
+    navigation_mode_ack_topic_arg = DeclareLaunchArgument(
+        name="navigation_mode_ack_topic", default_value="motion_mode/base_navigation_enabled"
+    )
+    set_navigation_enabled_service_arg = DeclareLaunchArgument(
+        name="set_navigation_enabled_service", default_value="motion_mode/set_navigation_enabled"
+    )
+    controller_switch_service_arg = DeclareLaunchArgument(
+        name="controller_switch_service", default_value="controller_manager/switch_controller"
+    )
+    motion_mode_manipulation_controllers_arg = DeclareLaunchArgument(
+        name="motion_mode_manipulation_controllers",
+        default_value="arm_trajectory_controller gripper_trajectory_controller",
+    )
+    motion_mode_navigation_controllers_arg = DeclareLaunchArgument(
+        name="motion_mode_navigation_controllers", default_value="base_velocity_controller"
+    )
+    motion_mode_transition_timeout_arg = DeclareLaunchArgument(
+        name="motion_mode_transition_timeout_s", default_value="2.0"
+    )
+    motion_mode_bridge_heartbeat_timeout_arg = DeclareLaunchArgument(
+        name="motion_mode_bridge_heartbeat_timeout_s", default_value="1.0"
+    )
 
     # get the argument value at runtime
     is_sim = LaunchConfiguration("is_sim")
     display = LaunchConfiguration("display")
+    joint_state_topic = LaunchConfiguration("joint_state_topic")
     arm_group_name = LaunchConfiguration("arm_group_name")
     base_link = LaunchConfiguration("base_link")
     ee_link = LaunchConfiguration("ee_link")
@@ -66,6 +101,16 @@ def generate_launch_description():
     motion_feedback_tolerance_rad = LaunchConfiguration("motion_feedback_tolerance_rad")
     motion_require_tf_sync = LaunchConfiguration("motion_require_tf_sync")
     motion_hardware_feedback_topic = LaunchConfiguration("motion_hardware_feedback_topic")
+    motion_mode_enabled = LaunchConfiguration("motion_mode_enabled")
+    navigation_enabled_on_startup = LaunchConfiguration("navigation_enabled_on_startup")
+    navigation_enabled_topic = LaunchConfiguration("navigation_enabled_topic")
+    navigation_mode_ack_topic = LaunchConfiguration("navigation_mode_ack_topic")
+    set_navigation_enabled_service = LaunchConfiguration("set_navigation_enabled_service")
+    controller_switch_service = LaunchConfiguration("controller_switch_service")
+    motion_mode_manipulation_controllers = LaunchConfiguration("motion_mode_manipulation_controllers")
+    motion_mode_navigation_controllers = LaunchConfiguration("motion_mode_navigation_controllers")
+    motion_mode_transition_timeout_s = LaunchConfiguration("motion_mode_transition_timeout_s")
+    motion_mode_bridge_heartbeat_timeout_s = LaunchConfiguration("motion_mode_bridge_heartbeat_timeout_s")
 
     # URDF
     robot_description_dir = get_package_share_directory("robot_description")
@@ -93,6 +138,7 @@ def generate_launch_description():
             {"use_sim_time": is_sim},
             {"publish_robot_description_semantic": True},
         ],
+        remappings=[("joint_states", joint_state_topic)],
         arguments=["--ros-args", "--log-level", "info"],
     )
 
@@ -112,6 +158,7 @@ def generate_launch_description():
             moveit_config.robot_description_kinematics,
             moveit_config.joint_limits,
         ],
+        remappings=[("joint_states", joint_state_topic)],
         condition=IfCondition(display),
     )
 
@@ -131,8 +178,28 @@ def generate_launch_description():
             {"motion_feedback_tolerance_rad": motion_feedback_tolerance_rad},
             {"motion_require_tf_sync": motion_require_tf_sync},
             {"motion_hardware_feedback_topic": motion_hardware_feedback_topic},
+            {"joint_state_topic": joint_state_topic},
+            {"motion_mode_enabled": motion_mode_enabled},
+            {"navigation_enabled_on_startup": navigation_enabled_on_startup},
+            {"navigation_enabled_topic": navigation_enabled_topic},
+            {"navigation_mode_ack_topic": navigation_mode_ack_topic},
+            {"set_navigation_enabled_service": set_navigation_enabled_service},
+            {"controller_switch_service": controller_switch_service},
+            {
+                "motion_mode_manipulation_controllers": PythonExpression(
+                    ["'", motion_mode_manipulation_controllers, "'.split()"]
+                )
+            },
+            {
+                "motion_mode_navigation_controllers": PythonExpression(
+                    ["'", motion_mode_navigation_controllers, "'.split()"]
+                )
+            },
+            {"motion_mode_transition_timeout_s": motion_mode_transition_timeout_s},
+            {"motion_mode_bridge_heartbeat_timeout_s": motion_mode_bridge_heartbeat_timeout_s},
             {"use_sim_time": is_sim},
         ],
+        remappings=[("joint_states", joint_state_topic)],
     )
 
     return LaunchDescription(
@@ -140,6 +207,7 @@ def generate_launch_description():
             is_sim_arg,
             display_arg,
             joint_names_arg,
+            joint_state_topic_arg,
             arm_group_name_arg,
             base_link_arg,
             ee_link_arg,
@@ -149,6 +217,16 @@ def generate_launch_description():
             motion_feedback_tolerance_arg,
             motion_require_tf_sync_arg,
             motion_hardware_feedback_topic_arg,
+            motion_mode_enabled_arg,
+            navigation_enabled_on_startup_arg,
+            navigation_enabled_topic_arg,
+            navigation_mode_ack_topic_arg,
+            set_navigation_enabled_service_arg,
+            controller_switch_service_arg,
+            motion_mode_manipulation_controllers_arg,
+            motion_mode_navigation_controllers_arg,
+            motion_mode_transition_timeout_arg,
+            motion_mode_bridge_heartbeat_timeout_arg,
             move_group_node,
             rviz_node,
             moveit_gateway_node,

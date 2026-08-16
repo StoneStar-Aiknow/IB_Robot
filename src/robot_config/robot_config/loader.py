@@ -184,6 +184,54 @@ def _unit_interval(section: dict[str, Any], key: str, path: str, errors: list[st
         errors.append(f"{path}.{key} must be in [0.0, 1.0]")
 
 
+def validate_motion_mode_config(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the namespaced arm/base controller-authorization contract."""
+    config = robot_config.get("motion_mode")
+    if config is None:
+        return []
+    if not isinstance(config, dict):
+        return ["motion_mode must be a mapping"]
+
+    errors: list[str] = []
+    enabled = config.get("enabled", False)
+    if not isinstance(enabled, bool):
+        return ["motion_mode.enabled must be a boolean"]
+    if not enabled:
+        return errors
+
+    if not isinstance(config.get("navigation_enabled_on_startup"), bool):
+        errors.append("motion_mode.navigation_enabled_on_startup must be explicitly set to a boolean")
+
+    endpoint_keys = (
+        "navigation_enabled_topic",
+        "navigation_mode_ack_topic",
+        "set_navigation_enabled_service",
+        "controller_switch_service",
+    )
+    for key in endpoint_keys:
+        value = config.get(key)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"motion_mode.{key} must be a non-empty relative ROS name")
+        elif value.startswith("/"):
+            errors.append(f"motion_mode.{key} must be relative so robot namespaces remain isolated")
+
+    controller_groups: dict[str, list[str]] = {}
+    for key in ("manipulation_controllers", "navigation_controllers"):
+        value = config.get(key)
+        if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
+            errors.append(f"motion_mode.{key} must be a non-empty list of controller names")
+            controller_groups[key] = []
+        else:
+            controller_groups[key] = value
+    overlap = set(controller_groups["manipulation_controllers"]) & set(controller_groups["navigation_controllers"])
+    if overlap:
+        errors.append("motion_mode controller groups must be disjoint: " + ", ".join(sorted(overlap)))
+
+    for key in ("transition_timeout_s", "bridge_heartbeat_timeout_s"):
+        _positive_number(config, key, "motion_mode", errors)
+    return errors
+
+
 def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
     """Validate the standalone semantic mapping SSOT contract."""
     config = robot_config.get("semantic_mapping")
@@ -966,6 +1014,7 @@ def load_robot_config_dict(config_path: str | Path | None = None) -> dict[str, A
     robot_config = copy.deepcopy(robot_data)
     validation_errors = validate_grasp_execution_config(robot_config.get("grasp_execution"))
     validation_errors.extend(validate_placement_execution_config(robot_config.get("placement_execution")))
+    validation_errors.extend(validate_motion_mode_config(robot_config))
     validation_errors.extend(_validate_embodied_skill_contract(robot_config))
     validation_errors.extend(_validate_skill_gateway_config(robot_config))
     try:

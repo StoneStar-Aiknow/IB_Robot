@@ -61,14 +61,14 @@ def test_load_catalog_uses_exported_config_resolver(monkeypatch):
 def test_pc_grasp_catalog_registers_enabled_delegated_executors(monkeypatch):
     from robot_skill_cli.catalog import load_capability_catalog
 
-    pc_config = CONFIG_PATH.parents[2] / "config" / "robots" / "so101_handeye_realsense_grasp_pc.yaml"
+    pc_config = CONFIG_PATH.parents[2] / "config" / "robots" / "lekiwi_handeye_realsense_grasp_pc.yaml"
     monkeypatch.setenv("WORKSPACE", str(pc_config.parents[4]))
 
     view = load_capability_catalog(config_path=pc_config)
 
-    assert view["robot_name"] == "so101_handeye_realsense_grasp_pc"
+    assert view["robot_name"] == "lekiwi_handeye_realsense_grasp_pc"
     assert load_robot_config_dict(pc_config)["embodied"]["skill_catalog_profile"] == (
-        "so101_handeye_realsense_grasp_pc"
+        "lekiwi_handeye_realsense_grasp_pc"
     )
     assert {skill["name"] for skill in view["skills"]} >= {"pick_object", "place_in_container"}
 

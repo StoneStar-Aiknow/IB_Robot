@@ -49,5 +49,5 @@ capability:
     - container_name
   recovery_policy: ask_user
 implementations:
-  so101_handeye_realsense_grasp: implementations/so101_handeye_realsense_grasp.yaml
-  so101_handeye_realsense_grasp_pc: implementations/so101_handeye_realsense_grasp_pc.yaml
+  lekiwi_handeye_realsense_grasp: implementations/lekiwi_handeye_realsense_grasp.yaml
+  lekiwi_handeye_realsense_grasp_pc: implementations/lekiwi_handeye_realsense_grasp_pc.yaml

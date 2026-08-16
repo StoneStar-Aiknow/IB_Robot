@@ -195,14 +195,14 @@ manifest，并在 `expected_executor` / `actual_executor` 中比较 deployment n
 
 ```bash
 source .shrc_local && source install/setup.bash && \
-robot-skill --config-name so101_handeye_realsense_grasp status
+robot-skill --config-name lekiwi_handeye_realsense_grasp status
 
 source .shrc_local && source install/setup.bash && \
-robot-skill --config-name so101_handeye_realsense_grasp validate pick_object \
+robot-skill --config-name lekiwi_handeye_realsense_grasp validate pick_object \
   --target-name banana --timeout-sec 240
 
 source .shrc_local && source install/setup.bash && \
-robot-skill --config-name so101_handeye_realsense_grasp execute pick_object \
+robot-skill --config-name lekiwi_handeye_realsense_grasp execute pick_object \
   --task-id pick-banana-001 --target-name banana --timeout-sec 240
 ```
 

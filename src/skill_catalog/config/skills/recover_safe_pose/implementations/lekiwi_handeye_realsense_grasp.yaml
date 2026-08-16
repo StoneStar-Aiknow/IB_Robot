@@ -1,7 +1,8 @@
 schema_version: 1
 kind: primitive_sequence
-robot: so101_handeye_realsense_grasp
+robot: lekiwi_handeye_realsense_grasp
 initial_gripper_state: none
 timeout_sec: 120.0
 primitive_sequence:
-- primitive_name: open_gripper
+- primitive_name: move_to_named_pose
+  pose_name: home

@@ -182,7 +182,7 @@ MoveIt 运动、恢复和抓后验证。推荐通过统一 robot-config bringup 
 
 ```bash
 source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && \
-robot-skill --config-name so101_handeye_realsense_grasp execute pick_object \
+robot-skill --config-name lekiwi_handeye_realsense_grasp execute pick_object \
   --task-id pick-marker-001 --target-name marker --timeout-sec 240
 ```
 

@@ -5,14 +5,17 @@ MoveIt 2 Gateway Node for IB-Robot.
 ROS Interfaces:
     Subscriptions:
         /cmd_pose (geometry_msgs/Pose) — fire-and-forget Pose commands
-        /joint_states (sensor_msgs/JointState)
+        configured arm-only joint state topic (sensor_msgs/JointState)
+        /motion_mode/base_navigation_enabled (std_msgs/Bool)
         configured hardware feedback heartbeat (ibrobot_msgs/JointCurrent)
     Publishers:
         /robot_status/ee_pose (geometry_msgs/PoseStamped) — 10 Hz
         /moveit_gateway/motion_status (std_msgs/String) — "idle" | "executing" | "succeeded" | "failed"
+        /motion_mode/navigation_enabled (std_msgs/Bool, transient local)
     Services:
         /moveit_gateway/move_to_pose (ibrobot_msgs/MoveToPose) — synchronous move (blocks until done)
         /moveit_gateway/move_to_configuration (ibrobot_msgs/MoveToConfiguration) — execute a validated IK solution
+        /motion_mode/set_navigation_enabled (std_srvs/SetBool) — switch arm/base command authorization
 """
 
 import math
@@ -21,14 +24,17 @@ import time
 
 import numpy as np
 import rclpy
+from controller_manager_msgs.srv import SwitchController
 from geometry_msgs.msg import Pose, PoseStamped
 from moveit_msgs.msg import Constraints, OrientationConstraint
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Header, String
+from std_msgs.msg import Bool, Header, String
+from std_srvs.srv import SetBool
 
 try:
     from ibrobot_msgs.msg import JointCurrent
@@ -65,6 +71,20 @@ class MoveItGateway(Node):
         self.declare_parameter("motion_feedback_tolerance_rad", 0.12)
         self.declare_parameter("motion_require_tf_sync", True)
         self.declare_parameter("motion_hardware_feedback_topic", "")
+        self.declare_parameter("joint_state_topic", "/joint_states")
+        self.declare_parameter("motion_mode_enabled", False)
+        self.declare_parameter("navigation_enabled_on_startup", False)
+        self.declare_parameter("navigation_enabled_topic", "motion_mode/navigation_enabled")
+        self.declare_parameter("navigation_mode_ack_topic", "motion_mode/base_navigation_enabled")
+        self.declare_parameter("set_navigation_enabled_service", "motion_mode/set_navigation_enabled")
+        self.declare_parameter("controller_switch_service", "controller_manager/switch_controller")
+        self.declare_parameter(
+            "motion_mode_manipulation_controllers",
+            ["arm_trajectory_controller", "gripper_trajectory_controller"],
+        )
+        self.declare_parameter("motion_mode_navigation_controllers", ["base_velocity_controller"])
+        self.declare_parameter("motion_mode_transition_timeout_s", 2.0)
+        self.declare_parameter("motion_mode_bridge_heartbeat_timeout_s", 1.0)
 
         self.group_name = self.get_parameter("arm_group_name").value
         self.base_link = self.get_parameter("base_link").value
@@ -79,7 +99,25 @@ class MoveItGateway(Node):
         self._motion_feedback_tolerance_rad = max(float(self.get_parameter("motion_feedback_tolerance_rad").value), 0.0)
         self._motion_require_tf_sync = bool(self.get_parameter("motion_require_tf_sync").value)
         self._motion_hardware_feedback_topic = str(self.get_parameter("motion_hardware_feedback_topic").value).strip()
+        self._joint_state_topic = str(self.get_parameter("joint_state_topic").value).strip()
+        self._motion_mode_enabled = bool(self.get_parameter("motion_mode_enabled").value)
+        navigation_enabled_on_startup = bool(self.get_parameter("navigation_enabled_on_startup").value)
+        self._navigation_enabled_topic = str(self.get_parameter("navigation_enabled_topic").value).strip()
+        self._navigation_mode_ack_topic = str(self.get_parameter("navigation_mode_ack_topic").value).strip()
+        self._set_navigation_enabled_service = str(self.get_parameter("set_navigation_enabled_service").value).strip()
+        self._controller_switch_service = str(self.get_parameter("controller_switch_service").value).strip()
+        self._motion_mode_manipulation_controllers = list(
+            self.get_parameter("motion_mode_manipulation_controllers").value
+        )
+        self._motion_mode_navigation_controllers = list(self.get_parameter("motion_mode_navigation_controllers").value)
+        self._motion_mode_transition_timeout_s = max(
+            float(self.get_parameter("motion_mode_transition_timeout_s").value), 0.0
+        )
+        self._motion_mode_bridge_heartbeat_timeout_s = max(
+            float(self.get_parameter("motion_mode_bridge_heartbeat_timeout_s").value), 0.0
+        )
         self._initialize_motion_coordinator()
+        self._navigation_enabled = navigation_enabled_on_startup if self._motion_mode_enabled else False
 
         self._joint_state_lock = threading.Lock()
         self._joint_state_sequence = 0
@@ -112,7 +150,7 @@ class MoveItGateway(Node):
         # 5. Publishers and Subscribers (using the reentrant group)
         self.joint_state_sub = self.create_subscription(
             JointState,
-            "/joint_states",
+            self._joint_state_topic,
             self.joint_state_callback,
             10,
             callback_group=self.callback_group,
@@ -141,6 +179,41 @@ class MoveItGateway(Node):
         # 6. Motion status publisher (for task_dispatch and external monitors)
         self.motion_status_pub = self.create_publisher(String, "/moveit_gateway/motion_status", 10)
         self._motion_status = "idle"
+
+        self.navigation_mode_pub = None
+        self.navigation_mode_ack_sub = None
+        self.set_navigation_enabled_srv = None
+        self.controller_switch_client = None
+        if self._motion_mode_enabled:
+            mode_qos = QoSProfile(
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                depth=1,
+            )
+            self.navigation_mode_pub = self.create_publisher(Bool, self._navigation_enabled_topic, mode_qos)
+            self.navigation_mode_ack_sub = self.create_subscription(
+                Bool,
+                self._navigation_mode_ack_topic,
+                self.navigation_mode_ack_callback,
+                10,
+                callback_group=self.callback_group,
+            )
+            self.set_navigation_enabled_srv = self.create_service(
+                SetBool,
+                self._set_navigation_enabled_service,
+                self._set_navigation_enabled_service_cb,
+                callback_group=self.callback_group,
+            )
+            self.controller_switch_client = self.create_client(
+                SwitchController,
+                self._controller_switch_service,
+                callback_group=self.callback_group,
+            )
+            self._publish_navigation_mode(self._navigation_enabled)
+            self.get_logger().info(
+                f"Persistent motion mode enabled: navigation_enabled={self._navigation_enabled}, "
+                f"service={self._set_navigation_enabled_service}"
+            )
 
         # 7. MoveToPose service (synchronous move, used by task_dispatch)
         if _HAS_MOVE_SERVICES:
@@ -512,7 +585,7 @@ class MoveItGateway(Node):
     def cmd_pose_callback(self, msg):
         token = self._claim_motion("cmd_pose")
         if token is None:
-            self.get_logger().warning("MoveIt gateway is busy; dropping /cmd_pose command")
+            self.get_logger().warning(f"{self._motion_claim_rejection_reason()}; dropping /cmd_pose command")
             return
 
         self._prepare_motion(token)
@@ -684,6 +757,7 @@ class MoveItGateway(Node):
     def _initialize_motion_coordinator(self):
         """Initialize gateway-level ownership for the shared MoveIt2 instance."""
         self._motion_lock = threading.Lock()
+        self._motion_mode_transition_lock = threading.Lock()
         self._motion_token_counter = 0
         self._active_motion_token = None
         self._active_motion_owner = None
@@ -691,11 +765,16 @@ class MoveItGateway(Node):
         self._active_motion_deferred = False
         self._active_motion_forced_result = None
         self._active_motion_finalizing = False
+        self._navigation_enabled = False
+        self._navigation_mode_ack_condition = threading.Condition()
+        self._base_navigation_enabled_ack = None
+        self._last_bridge_heartbeat_monotonic = time.monotonic()
+        self._motion_mode_fault = ""
 
     def _claim_motion(self, owner: str) -> int | None:
         """Atomically claim the shared MoveIt2 execution state."""
         with self._motion_lock:
-            if self._active_motion_token is not None:
+            if self._navigation_enabled or self._active_motion_token is not None:
                 return None
 
             self._motion_token_counter += 1
@@ -707,6 +786,163 @@ class MoveItGateway(Node):
             self._active_motion_forced_result = None
             self._active_motion_finalizing = False
             return token
+
+    def _motion_claim_rejection_reason(self) -> str:
+        with self._motion_lock:
+            if self._navigation_enabled:
+                return "Arm motion is disabled while navigation mode is active"
+            return "MoveIt gateway is busy"
+
+    def navigation_mode_ack_callback(self, msg: Bool) -> None:
+        """Record that the base bridge applied a mode and emitted the zero boundary."""
+        with self._navigation_mode_ack_condition:
+            self._base_navigation_enabled_ack = bool(msg.data)
+            self._last_bridge_heartbeat_monotonic = time.monotonic()
+            self._navigation_mode_ack_condition.notify_all()
+
+    def _publish_navigation_mode(self, enabled: bool) -> None:
+        msg = Bool()
+        msg.data = bool(enabled)
+        self.navigation_mode_pub.publish(msg)
+
+    def _wait_for_base_mode_ack(self, enabled: bool) -> bool:
+        deadline = time.monotonic() + self._motion_mode_transition_timeout_s
+        with self._navigation_mode_ack_condition:
+            while self._base_navigation_enabled_ack != enabled:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._navigation_mode_ack_condition.wait(timeout=remaining)
+        return True
+
+    def _request_base_mode(self, enabled: bool) -> bool:
+        with self._navigation_mode_ack_condition:
+            self._base_navigation_enabled_ack = None
+        self._publish_navigation_mode(enabled)
+        return self._wait_for_base_mode_ack(enabled)
+
+    def _switch_controllers(self, *, activate: list[str], deactivate: list[str]) -> bool:
+        if not activate and not deactivate:
+            return True
+        client = self.controller_switch_client
+        if client is None or not client.wait_for_service(timeout_sec=self._motion_mode_transition_timeout_s):
+            self.get_logger().error(f"Controller switch service unavailable: {self._controller_switch_service}")
+            return False
+
+        request = SwitchController.Request()
+        request.activate_controllers = list(activate)
+        request.deactivate_controllers = list(deactivate)
+        request.strictness = SwitchController.Request.STRICT
+        request.activate_asap = True
+        request.timeout = rclpy.duration.Duration(seconds=self._motion_mode_transition_timeout_s).to_msg()
+        future = client.call_async(request)
+        completed = threading.Event()
+        future.add_done_callback(lambda _future: completed.set())
+        if not completed.wait(timeout=self._motion_mode_transition_timeout_s + 0.1):
+            self.get_logger().error("Controller switch request timed out")
+            return False
+        try:
+            result = future.result()
+        except Exception as exc:
+            self.get_logger().error(f"Controller switch failed: {exc}")
+            return False
+        if result is None or not bool(result.ok):
+            self.get_logger().error("Controller manager rejected the motion-mode switch")
+            return False
+        return True
+
+    def _set_navigation_enabled_serialized(self, requested: bool, response):
+        with self._motion_lock:
+            current = self._navigation_enabled
+            if requested and not current:
+                if self._active_motion_token is not None:
+                    response.success = False
+                    response.message = "Cannot enable navigation while an arm motion is active"
+                    return response
+                self._navigation_enabled = True
+
+        if requested:
+            if current:
+                response.success = not bool(self._motion_mode_fault)
+                response.message = self._motion_mode_fault or "Navigation already enabled; arm commands are blocked"
+                return response
+
+            if not self._switch_controllers(
+                activate=[],
+                deactivate=self._motion_mode_manipulation_controllers,
+            ):
+                with self._motion_lock:
+                    self._navigation_enabled = False
+                response.success = False
+                response.message = "Failed to deactivate manipulation controllers"
+                return response
+            if not self._request_base_mode(True):
+                self._switch_controllers(
+                    activate=self._motion_mode_manipulation_controllers,
+                    deactivate=[],
+                )
+                with self._motion_lock:
+                    self._navigation_enabled = False
+                response.success = False
+                response.message = "Base bridge did not acknowledge navigation mode"
+                return response
+            if not self._switch_controllers(
+                activate=self._motion_mode_navigation_controllers,
+                deactivate=[],
+            ):
+                self._publish_navigation_mode(False)
+                self._switch_controllers(
+                    activate=self._motion_mode_manipulation_controllers,
+                    deactivate=[],
+                )
+                with self._motion_lock:
+                    self._navigation_enabled = False
+                response.success = False
+                response.message = "Failed to activate navigation controllers"
+                return response
+            self._motion_mode_fault = ""
+            response.success = True
+            response.message = "Navigation enabled; manipulation controllers are inactive"
+            return response
+
+        if not current:
+            response.success = True
+            response.message = "Manipulation already enabled; navigation controllers are inactive"
+            return response
+
+        if not self._request_base_mode(False):
+            response.success = False
+            response.message = "Arm commands remain blocked because the base bridge did not acknowledge stop"
+            return response
+        if not self._switch_controllers(
+            activate=self._motion_mode_manipulation_controllers,
+            deactivate=self._motion_mode_navigation_controllers,
+        ):
+            response.success = False
+            response.message = "Arm commands remain blocked because controller switching failed"
+            return response
+        with self._motion_lock:
+            self._navigation_enabled = False
+        self._motion_mode_fault = ""
+        response.success = True
+        response.message = "Manipulation enabled; navigation controllers are inactive"
+        return response
+
+    def _set_navigation_enabled_service_cb(self, request, response):
+        """Serialize controller ownership transitions across arm and base."""
+        if not self._motion_mode_enabled:
+            response.success = False
+            response.message = "Persistent motion mode is disabled"
+            return response
+
+        if not self._motion_mode_transition_lock.acquire(blocking=False):
+            response.success = False
+            response.message = "Another motion-mode transition is in progress"
+            return response
+        try:
+            return self._set_navigation_enabled_serialized(bool(request.data), response)
+        finally:
+            self._motion_mode_transition_lock.release()
 
     def _owns_motion(self, token: int) -> bool:
         with self._motion_lock:
@@ -811,6 +1047,27 @@ class MoveItGateway(Node):
 
     def _motion_watchdog_callback(self):
         """Finalize asynchronous or timed-out motion after MoveIt becomes idle."""
+        if self._motion_mode_enabled:
+            with self._motion_lock:
+                navigation_enabled = self._navigation_enabled
+            heartbeat_age = time.monotonic() - self._last_bridge_heartbeat_monotonic
+            if (
+                navigation_enabled
+                and self._motion_mode_bridge_heartbeat_timeout_s > 0.0
+                and heartbeat_age > self._motion_mode_bridge_heartbeat_timeout_s
+                and not self._motion_mode_fault
+                and self._motion_mode_transition_lock.acquire(blocking=False)
+            ):
+                try:
+                    if self._switch_controllers(
+                        activate=[],
+                        deactivate=self._motion_mode_navigation_controllers,
+                    ):
+                        self._motion_mode_fault = "Base bridge heartbeat lost; navigation controllers were stopped"
+                        self.get_logger().error(self._motion_mode_fault)
+                finally:
+                    self._motion_mode_transition_lock.release()
+
         with self._motion_lock:
             if self._active_motion_token is None or not self._active_motion_deferred or self._active_motion_finalizing:
                 return
@@ -839,7 +1096,7 @@ class MoveItGateway(Node):
         token = self._claim_motion("MoveToPose")
         if token is None:
             response.success = False
-            response.message = "MoveIt gateway is busy"
+            response.message = self._motion_claim_rejection_reason()
             response.execution_time_s = time.monotonic() - t0
             return response
 
@@ -884,7 +1141,7 @@ class MoveItGateway(Node):
         token = self._claim_motion("MoveToConfiguration")
         if token is None:
             response.success = False
-            response.message = "MoveIt gateway is busy"
+            response.message = self._motion_claim_rejection_reason()
             response.execution_time_s = time.monotonic() - t0
             return response
 

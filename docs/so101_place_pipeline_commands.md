@@ -1,17 +1,17 @@
-# SO101 固定位置释放与单关节观察位容器验证
+# LeKiwi 固定位置释放与单关节观察位容器验证
 
 `place_in_container` 不根据视觉结果规划候选放置位。它使用 robot YAML 中已经确认的固定关节目标执行释放，
 再用请求中的 `container_name` 检测指定容器，并用 `target_name` 检测释放后的物品。顺序如下：
 
 ```text
-place_container（3 号 raw 1500）→ open_gripper → 仅 3 号移动到 raw 1600 → 视觉验证 → 仅 3 号返回 raw 1500
+place_container（3 号 raw 1500）→ open_gripper → 仅 3 号移动到 raw 1700 → 视觉验证 → 仅 3 号返回 raw 1500
 ```
 
 `place_container` 只决定机械臂移动到哪里；`container_name` 只决定释放后 GDINO 检测哪个容器。指定容器不会
 改变放置轨迹，也不会触发容器位姿估计、IK 或放置位规划。验证阶段对容器和物品的分割 mask 做二维包含判定，
 要求物品中心位于容器区域内，且物品 mask 位于容器区域内的比例达到配置阈值。
 
-`place_container` 是已由操作员在真机上确认的固定关节目标，写在两个 SO101 robot YAML 的
+`place_container` 是已由操作员在真机上确认的固定关节目标，写在两个 LeKiwi robot YAML 的
 `placement_execution.motion.place_joint_positions` 中。当前释放目标（仅 1–5 号关节，弧度）为：
 
 ```text
@@ -23,7 +23,7 @@ place_container（3 号 raw 1500）→ open_gripper → 仅 3 号移动到 raw 1
 ```
 
 夹爪 6 号关节不属于放置位，流程在到位后单独调用 `open_gripper`。随后仅 3 号关节移动到验证目标
-`-0.687223`（raw 1600）后采集图像验证，验证完成后仅 3 号返回 `-0.840621`（raw 1500）。
+`-0.533825`（raw 1700）后采集图像验证，验证完成后仅 3 号返回 `-0.840621`（raw 1500）。
 不移动到 `observe_table`，也不读取 `/robot_status/ee_pose` 或写入笛卡尔 `named_poses.place_container`。
 
 ## 启动
@@ -41,7 +41,7 @@ source install/setup.bash
 
 ```bash
 ros2 launch embodied_bringup embodied_pipeline.launch.py \
-  robot_config:=so101_handeye_realsense_grasp \
+  robot_config:=lekiwi_handeye_realsense_grasp \
   control_mode:=moveit_planning \
   use_sim:=false \
   moveit_display:=false \
@@ -53,7 +53,7 @@ PC 启动命令（NVIDIA CUDA）：
 
 ```bash
 ros2 launch embodied_bringup embodied_pipeline.launch.py \
-  robot_config:=so101_handeye_realsense_grasp_pc \
+  robot_config:=lekiwi_handeye_realsense_grasp_pc \
   control_mode:=moveit_planning \
   use_sim:=false \
   moveit_display:=false \
@@ -66,7 +66,7 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
 - 停止 Hermes、任务规划器和其他动作调用方，确认 Gateway idle；
 - 物品已稳定夹持，人员和工具退出工作区；
 - robot YAML 中的固定 1–5 号关节目标已在现场验证，打开夹爪不会碰撞容器；
-- 3 号电机 raw 1600 的验证位能让腕部相机看到容器内部和释放后的物品；执行器会把释放后的 RGB、检测 mask、开爪
+- 3 号电机 raw 1700 的验证位能让腕部相机看到容器内部和释放后的物品；执行器会把释放后的 RGB、检测 mask、开爪
   JointState 和判定结果写入 `placement_execution.debug_output_root`，便于离线审计和重放；
 - 指定 `container_name` 后，视野中只检测到一个匹配该描述的目标容器；
 - 腕部相机能够看到容器内部，`target_name` 和 `container_name` 与现场物品、容器描述一致；`target_name` 会
@@ -82,13 +82,13 @@ Gateway 任务，CLI 强制要求提供唯一且非空的 `--task-id`；每次�
 310P：
 
 ```bash
-robot-skill --config-name so101_handeye_realsense_grasp \
+robot-skill --config-name lekiwi_handeye_realsense_grasp \
   validate place_in_container \
   --target-name "red marker" \
   --container-name "black bowl" \
   --timeout-sec 60
 
-robot-skill --config-name so101_handeye_realsense_grasp \
+robot-skill --config-name lekiwi_handeye_realsense_grasp \
   execute place_in_container \
   --target-name "red marker" \
   --container-name "black bowl" \
@@ -99,13 +99,13 @@ robot-skill --config-name so101_handeye_realsense_grasp \
 PC：
 
 ```bash
-robot-skill --config-name so101_handeye_realsense_grasp_pc \
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc \
   validate place_in_container \
   --target-name "red marker" \
   --container-name "black bowl" \
   --timeout-sec 60
 
-robot-skill --config-name so101_handeye_realsense_grasp_pc \
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc \
   execute place_in_container \
   --target-name "red marker" \
   --container-name "black bowl" \

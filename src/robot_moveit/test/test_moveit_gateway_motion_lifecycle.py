@@ -48,6 +48,40 @@ class FakePublisher:
         self.messages.append(message.data)
 
 
+class AckingModePublisher(FakePublisher):
+    def __init__(self, gateway):
+        super().__init__()
+        self.gateway = gateway
+
+    def publish(self, message):
+        super().publish(message)
+        self.gateway.navigation_mode_ack_callback(message)
+
+
+class DoneFuture:
+    def __init__(self, result):
+        self._result = result
+
+    def add_done_callback(self, callback):
+        callback(self)
+
+    def result(self):
+        return self._result
+
+
+class FakeControllerSwitchClient:
+    def __init__(self):
+        self.requests = []
+
+    @staticmethod
+    def wait_for_service(timeout_sec):
+        return timeout_sec >= 0.0
+
+    def call_async(self, request):
+        self.requests.append(request)
+        return DoneFuture(SimpleNamespace(ok=True))
+
+
 class FakeMoveIt2:
     def __init__(self):
         self._lock = threading.Lock()
@@ -120,6 +154,12 @@ def make_gateway():
     gateway._motion_feedback_tolerance_rad = 0.05
     gateway._motion_require_tf_sync = True
     gateway._motion_hardware_feedback_topic = "/so101_follower/joint_currents"
+    gateway._motion_mode_enabled = False
+    gateway._motion_mode_bridge_heartbeat_timeout_s = 1.0
+    gateway._controller_switch_service = "controller_manager/switch_controller"
+    gateway._motion_mode_manipulation_controllers = ["arm_trajectory_controller", "gripper_trajectory_controller"]
+    gateway._motion_mode_navigation_controllers = ["base_velocity_controller"]
+    gateway.controller_switch_client = FakeControllerSwitchClient()
     gateway._motion_status = "idle"
     gateway.motion_status_pub = FakePublisher()
     gateway.moveit2 = FakeMoveIt2()
@@ -147,6 +187,115 @@ def make_configuration_request():
 
 def make_response():
     return SimpleNamespace(success=None, message="", execution_time_s=0.0)
+
+
+def enable_motion_mode(gateway):
+    gateway._motion_mode_enabled = True
+    gateway._motion_mode_transition_timeout_s = 0.05
+    gateway._motion_mode_bridge_heartbeat_timeout_s = 1.0
+    gateway.navigation_mode_pub = AckingModePublisher(gateway)
+
+
+def make_set_bool_response():
+    return SimpleNamespace(success=None, message="")
+
+
+def test_navigation_mode_blocks_arm_requests_until_base_stop_is_acknowledged():
+    gateway = make_gateway()
+    enable_motion_mode(gateway)
+
+    enabled = gateway._set_navigation_enabled_service_cb(
+        SimpleNamespace(data=True),
+        make_set_bool_response(),
+    )
+
+    assert enabled.success is True
+    assert gateway._navigation_enabled is True
+    assert gateway._claim_motion("blocked") is None
+    assert gateway._motion_claim_rejection_reason() == "Arm motion is disabled while navigation mode is active"
+
+    disabled = gateway._set_navigation_enabled_service_cb(
+        SimpleNamespace(data=False),
+        make_set_bool_response(),
+    )
+
+    assert disabled.success is True
+    assert gateway._navigation_enabled is False
+    assert gateway.navigation_mode_pub.messages == [True, False]
+    assert [request.deactivate_controllers for request in gateway.controller_switch_client.requests] == [
+        ["arm_trajectory_controller", "gripper_trajectory_controller"],
+        [],
+        ["base_velocity_controller"],
+    ]
+    assert gateway._claim_motion("manipulation") is not None
+
+
+def test_navigation_mode_rejects_transition_while_arm_motion_is_owned():
+    gateway = make_gateway()
+    enable_motion_mode(gateway)
+    token = gateway._claim_motion("MoveToConfiguration")
+
+    response = gateway._set_navigation_enabled_service_cb(
+        SimpleNamespace(data=True),
+        make_set_bool_response(),
+    )
+
+    assert token is not None
+    assert response.success is False
+    assert response.message == "Cannot enable navigation while an arm motion is active"
+    assert gateway._navigation_enabled is False
+    assert gateway.navigation_mode_pub.messages == []
+
+
+def test_base_ack_timeout_keeps_arm_blocked_when_returning_to_manipulation():
+    gateway = make_gateway()
+    gateway._motion_mode_enabled = True
+    gateway._motion_mode_transition_timeout_s = 0.0
+    gateway._motion_mode_bridge_heartbeat_timeout_s = 1.0
+    gateway._navigation_enabled = True
+    gateway.navigation_mode_pub = FakePublisher()
+
+    response = gateway._set_navigation_enabled_service_cb(
+        SimpleNamespace(data=False),
+        make_set_bool_response(),
+    )
+
+    assert response.success is False
+    assert response.message == "Arm commands remain blocked because the base bridge did not acknowledge stop"
+    assert gateway._navigation_enabled is True
+    assert gateway.navigation_mode_pub.messages == [False]
+    assert gateway._claim_motion("blocked") is None
+
+
+def test_concurrent_motion_mode_transition_is_rejected():
+    gateway = make_gateway()
+    enable_motion_mode(gateway)
+    assert gateway._motion_mode_transition_lock.acquire(blocking=False)
+    try:
+        response = gateway._set_navigation_enabled_service_cb(
+            SimpleNamespace(data=True),
+            make_set_bool_response(),
+        )
+    finally:
+        gateway._motion_mode_transition_lock.release()
+
+    assert response.success is False
+    assert response.message == "Another motion-mode transition is in progress"
+    assert gateway.controller_switch_client.requests == []
+
+
+def test_bridge_heartbeat_loss_stops_navigation_controller():
+    gateway = make_gateway()
+    enable_motion_mode(gateway)
+    gateway._navigation_enabled = True
+    gateway._last_bridge_heartbeat_monotonic = time.monotonic() - 2.0
+
+    gateway._motion_watchdog_callback()
+
+    request = gateway.controller_switch_client.requests[-1]
+    assert request.activate_controllers == []
+    assert request.deactivate_controllers == ["base_velocity_controller"]
+    assert "heartbeat lost" in gateway._motion_mode_fault
 
 
 def test_concurrent_service_request_returns_busy_without_dispatch():

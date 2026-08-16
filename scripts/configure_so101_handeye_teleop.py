@@ -17,7 +17,7 @@ DEFAULT_ROBOT_CONFIG = (
     / "robot_config"
     / "config"
     / "robots"
-    / "so101_handeye_realsense_grasp.yaml"
+    / "lekiwi_handeye_realsense_grasp.yaml"
 )
 
 

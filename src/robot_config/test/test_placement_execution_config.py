@@ -5,8 +5,8 @@ import yaml
 
 from robot_config.loader import load_robot_config_dict
 
-CONFIG = Path(__file__).parent.parent / "config" / "robots" / "so101_handeye_realsense_grasp.yaml"
-PC_CONFIG = Path(__file__).parent.parent / "config" / "robots" / "so101_handeye_realsense_grasp_pc.yaml"
+CONFIG = Path(__file__).parent.parent / "config" / "robots" / "lekiwi_handeye_realsense_grasp.yaml"
+PC_CONFIG = Path(__file__).parent.parent / "config" / "robots" / "lekiwi_handeye_realsense_grasp_pc.yaml"
 
 
 def _write(tmp_path: Path, mutate) -> Path:
@@ -45,17 +45,17 @@ def test_repository_placement_contract_loads():
             "4": 1.497165,
             "5": -1.570790,
         },
-        "place_duration_sec": 10.0,
+        "place_duration_sec": 5.0,
         "post_release": {
             "verify_joint_name": "3",
-            "verify_joint_position": -0.687223,
+            "verify_joint_position": -0.533825,
             "verify_duration_sec": 2.0,
             "return_duration_sec": 2.0,
         },
     }
     assert "ik_service" not in placement
     assert "camera" not in placement
-    assert config["embodied"]["skill_catalog_profile"] == "so101_handeye_realsense_grasp"
+    assert config["embodied"]["skill_catalog_profile"] == "lekiwi_handeye_realsense_grasp"
 
 
 def test_pc_placement_contract_uses_grounding_masks_without_a_separate_segmenter():
@@ -74,7 +74,7 @@ def test_pc_placement_contract_uses_grounding_masks_without_a_separate_segmenter
     }
     assert placement["motion"]["post_release"] == {
         "verify_joint_name": "3",
-        "verify_joint_position": -0.687223,
+        "verify_joint_position": -0.533825,
         "verify_duration_sec": 2.0,
         "return_duration_sec": 2.0,
     }

@@ -70,7 +70,7 @@ def test_hermes_entry_does_not_launch_voice_routing_node():
             "safety": {},
             "planner": {},
             "perception": {},
-        }
+        },
     }
 
     nodes = generate_embodied_nodes(robot_config, active_control_mode="moveit_planning")
@@ -329,7 +329,7 @@ def test_launch_setup_passes_operator_motion_authorization(monkeypatch, authoriz
 
 def test_handeye_grasp_config_launches_pick_and_place_pipelines():
     config_path = (
-        Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_handeye_realsense_grasp.yaml"
+        Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_handeye_realsense_grasp.yaml"
     )
     config = load_robot_config_dict(config_path)
     assert config["grasp_execution"]["planner_node"]["enable_source_gripper_tabletop_sweep"] is False
@@ -402,10 +402,10 @@ def test_handeye_grasp_config_launches_pick_and_place_pipelines():
         "4": 1.497165,
         "5": -1.570790,
     }
-    assert placement_json["motion"]["place_duration_sec"] == 10.0
+    assert placement_json["motion"]["place_duration_sec"] == 5.0
     assert placement_json["motion"]["post_release"] == {
         "verify_joint_name": "3",
-        "verify_joint_position": -0.687223,
+        "verify_joint_position": -0.533825,
         "verify_duration_sec": 2.0,
         "return_duration_sec": 2.0,
     }
@@ -421,7 +421,7 @@ def test_handeye_grasp_config_launches_pick_and_place_pipelines():
 
 def test_pc_handeye_grasp_launch_uses_cuda_catalog_and_place_pipeline():
     config_path = (
-        Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_handeye_realsense_grasp_pc.yaml"
+        Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "lekiwi_handeye_realsense_grasp_pc.yaml"
     )
     config = load_robot_config_dict(config_path)
     config["embodied"]["enabled"] = True
@@ -442,7 +442,7 @@ def test_pc_handeye_grasp_launch_uses_cuda_catalog_and_place_pipeline():
     assert planner_model_dir.endswith("/models/grasp/graspgen_robotiq_2f_140")
     assert "$(env " not in planner_model_dir
     skill_params = _skill_executor_params(nodes)
-    assert _decode_launch_string(str(skill_params["skill_catalog_profile"])) == ("so101_handeye_realsense_grasp_pc")
+    assert _decode_launch_string(str(skill_params["skill_catalog_profile"])) == ("lekiwi_handeye_realsense_grasp_pc")
     assert _decode_launch_string(str(skill_params["place_action_name"])) == "/manipulation/execute_place"
 
 
@@ -450,6 +450,7 @@ def test_handeye_grasp_launch_auto_starts_parallel_ik_workers(monkeypatch, tmp_p
     module = _load_launch_module()
     monkeypatch.setattr(module, "get_package_share_directory", lambda _package: str(tmp_path))
     config = {
+        "moveit": {"joint_state_topic": "/arm_joint_state_broadcaster/joint_states"},
         "grasp_execution": {
             "enabled": True,
             "auto_start_dependencies": True,
@@ -458,13 +459,15 @@ def test_handeye_grasp_launch_auto_starts_parallel_ik_workers(monkeypatch, tmp_p
                 "worker_namespace_prefix": "/ik_worker",
                 "auto_start_workers": True,
             },
-        }
+        },
     }
 
     action = module._parallel_ik_worker_action(config, "false")
 
     assert action is not None
     assert action.__class__.__name__ == "IncludeLaunchDescription"
+    arguments = dict(action._IncludeLaunchDescription__launch_arguments)
+    assert arguments["joint_state_topic"] == "/arm_joint_state_broadcaster/joint_states"
 
 
 def test_source_workspace_profile_uses_absolute_development_catalog_root():

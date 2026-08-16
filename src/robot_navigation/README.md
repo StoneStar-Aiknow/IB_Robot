@@ -443,8 +443,10 @@ SIM_GUI=1 NAV_TEST_PROFILE=full colcon test --packages-select robot_config --bas
 |------|------|------|------|-----|------|
 | 订阅 | `/cmd_vel` | `geometry_msgs/Twist` | 输入 | Reliable | 速度指令 (vx, vy, vtheta) |
 | 订阅 | `/joint_states` | `sensor_msgs/JointState` | 输入 | Best Effort | 轮子反馈 (joints "7", "8", "9") |
+| 条件订阅 | `/motion_mode/navigation_enabled` | `std_msgs/Bool` | 输入 | Transient Local | 导航命令授权；抓取模式持续输出零速 |
 | 发布 | `/base_velocity_controller/commands` | `std_msgs/Float64MultiArray` | 输出 | Reliable | 原始轮速 [left, back, right] rad/s |
 | 发布 | `/odom` | `nav_msgs/Odometry` | 输出 | Reliable | 里程计 |
+| 条件发布 | `/motion_mode/base_navigation_enabled` | `std_msgs/Bool` | 输出 | Reliable | 已清除旧命令并输出零速的模式确认 |
 | 条件发布 | TF: `odom → base_link` | TransformStamped | 输出 | - | 仅当 `publish_tf: true` 时发布 |
 
 **参数**:
@@ -462,8 +464,15 @@ SIM_GUI=1 NAV_TEST_PROFILE=full colcon test --packages-select robot_config --bas
 | `cmd_vel_topic` | `/cmd_vel` | 订阅的速度指令话题 |
 | `joint_states_topic` | `/joint_states` | 订阅的关节状态话题（轮子反馈） |
 | `odom_topic` | `/odom` | 发布的里程计话题 |
+| `motion_mode_enabled` | `false` | 是否启用抓取/导航常驻互锁 |
+| `navigation_enabled_on_startup` | `true` | 互锁启用时的初始底盘授权状态 |
+| `navigation_enabled_topic` | `/motion_mode/navigation_enabled` | Gateway 发布的模式状态 |
+| `navigation_mode_ack_topic` | `/motion_mode/base_navigation_enabled` | 底盘模式确认话题 |
 
 **运动学**: 三个全向轮安装角度分别为 150°、-90°、30°（对应 joint 7/left, 8/back, 9/right）。IK 通过 3×3 矩阵 `M @ [vx, vy, vtheta]` 计算轮速，输出单位为 rad/s（ros2_control 速度指令接口）。FK 通过 M 的伪逆将轮子反馈还原为机体速度。超过 `max_radps` 时按比例缩放所有轮速。
+
+互锁启用后，抓取模式会忽略新的 `/cmd_vel` 并在每个控制周期发布三轮零速。任何模式切换都会先清除缓存速度，
+因此进入导航后必须收到一条新的 `/cmd_vel` 才会移动，旧的 Nav2 指令不会在切换后恢复执行。
 
 ## 关键词配置
 

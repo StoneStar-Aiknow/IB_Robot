@@ -138,6 +138,12 @@ robot:
       - id: semantic_gdino_confirmation
         enabled: false
         required: false
+      # GraspGen is a perception model like the five above: one typed endpoint over one
+      # named deployment. It is not bound to a semantic_mapping role - manipulation calls
+      # GenerateGrasps directly with a segmented object cloud.
+      - id: semantic_graspgen_grasps
+        enabled: false
+        required: false
 
   semantic_mapping:
     enabled: false
@@ -292,3 +298,8 @@ robot:
       object_cloud_topic: /semantic_mapping/object_cloud
       query_service: /semantic_mapping/get_objects
       target_service: /semantic_mapping/resolve_target
+    migration:
+      grounded_sam2_node: compatibility
+      grounded_sam2_snapshot: diagnostic_only
+      perception_service_node: general_scene
+      embedded_mapping_backend: disabled

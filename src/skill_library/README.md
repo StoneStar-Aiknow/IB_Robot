@@ -124,7 +124,8 @@ SO101 当前配置示例：
 `place_in_container` 同样只允许从 `/embodied/execute_skill` 进入。Gateway
 将完整 `DispatchBinding` 和 `placement_pipeline` identity 传给
 `/manipulation/execute_place`；放置执行器再把相同 binding 传给受保护的
-`move_to_joint_positions`/`open_gripper` primitive。放置阶段先在 3 号电机 raw 1500 开爪，再移动到 raw 1600
+`move_to_joint_positions`/`open_gripper` primitive。放置阶段先在 3 号电机 raw 1500 开爪，再移动到 raw 1700
+（`verify_joint_position: -0.533825`）
 验证，最后返回 raw 1500；视觉验证失败或不确定时，
 结果会明确保留“已释放/释放状态未知”，不会把它误报为普通未执行失败。
 
