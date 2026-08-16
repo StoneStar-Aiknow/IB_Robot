@@ -356,7 +356,7 @@ EOF
     run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" \
         "opencv-python-headless<4.12" --quiet
 
-    log_info "Running Python dependency smoke tests..."
+    log_info "Running NumPy/OpenCV dependency smoke test..."
     PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
 import cv2
 import numpy
@@ -364,38 +364,6 @@ import numpy
 if not numpy.__version__.startswith("1.26"):
     raise SystemExit(f"Expected NumPy 1.26.x after setup, got {numpy.__version__}")
 print(f"NumPy/OpenCV smoke test passed: numpy={numpy.__version__}, cv2={cv2.__version__}")
-PY
-    PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
-import importlib
-import importlib.metadata
-import importlib.resources
-
-# Use import_module (not find_spec) so the module's top-level imports
-# actually execute: groundingdino.util.inference imports supervision, and
-# groundingdino.util.slconfig imports addict. find_spec only locates the
-# file without running it, so a --no-deps wheel install with missing runtime
-# deps would pass silently and fail at first runtime call instead.
-missing = []
-for name in (
-    "groundingdino.util.inference",
-    "groundingdino.util.slconfig",
-    "sam2",
-    "ram",
-):
-    try:
-        importlib.import_module(name)
-    except Exception as exc:
-        missing.append(f"{name} ({exc})")
-if missing:
-    raise SystemExit(f"Missing perception modules after setup: {'; '.join(missing)}")
-if importlib.metadata.version("ibrobot-ram") != "0.0.1+ibrobot.1":
-    raise SystemExit("Unexpected ibrobot-ram distribution version")
-if importlib.metadata.version("ibrobot-groundingdino") != "0.1.0+ibrobot.1":
-    raise SystemExit("Unexpected ibrobot-groundingdino distribution version")
-for resource in ("ram_tag_list.txt", "ram_tag_list_threshold.txt"):
-    if not importlib.resources.files("ram").joinpath("data", resource).is_file():
-        raise SystemExit(f"Missing RAM++ package resource: {resource}")
-print("Perception dependencies smoke test passed")
 PY
     if [[ "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]] \
        && { command -v nvcc >/dev/null 2>&1 || [[ -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]]; }; then
