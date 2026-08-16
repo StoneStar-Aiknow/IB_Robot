@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "lib"))
 
 from comment_formatter import CommentFormatter
 from llm_reviewer import LLMCodeReviewer
+from verification_gate import extract_verified_commit, file_triggers_dual_docker_gate
 
 
 class CodeReviewer:
@@ -162,6 +163,53 @@ class CodeReviewer:
             )
         return checks
 
+    @staticmethod
+    def _build_verification_commit_checks(pr: dict, files: list[dict]) -> list[dict]:
+        """Bind required dual Docker verification evidence to the current PR head."""
+        gate_triggered = False
+        for file_info in files:
+            filename = file_info.get("filename") or file_info.get("new_path") or ""
+            patch = file_info.get("patch") or ""
+            if isinstance(patch, dict):
+                patch = patch.get("diff") or ""
+            if file_triggers_dual_docker_gate(filename, patch):
+                gate_triggered = True
+                break
+        if not gate_triggered:
+            return []
+
+        verified_commit = extract_verified_commit(pr.get("body") or "")
+        head_sha = (pr.get("head", {}).get("sha") or "").lower()
+        if verified_commit is None:
+            return [
+                {
+                    "id": "docker_verification_commit_missing",
+                    "severity": "error",
+                    "blocking_until_reviewed": True,
+                    "file": "PR description",
+                    "message": (
+                        "This PR requires dual Docker verification, but its description does not contain exactly one "
+                        "'**Verified commit:** `<40-character SHA>`' field. Record the commit tested by both platforms."
+                    ),
+                }
+            ]
+        if verified_commit != head_sha:
+            return [
+                {
+                    "id": "docker_verification_commit_mismatch",
+                    "severity": "error",
+                    "blocking_until_reviewed": True,
+                    "file": "PR description",
+                    "verified_commit": verified_commit,
+                    "head_sha": head_sha,
+                    "message": (
+                        f"Docker verification covers {verified_commit}, but the latest PR commit is {head_sha}. "
+                        "Re-run both Docker verifications on the latest commit and update the PR description."
+                    ),
+                }
+            ]
+        return []
+
     def extract_pr_info(self, pr_number: int, include_comments: bool = True) -> dict:
         """提取适合 review 场景的完整 PR 上下文"""
         pr = self.client.get_pull_request(pr_number)
@@ -172,6 +220,7 @@ class CodeReviewer:
         additions = sum(f.get("additions", 0) for f in files)
         deletions = sum(f.get("deletions", 0) for f in files)
         mandatory_review_checks = self._build_mandatory_review_checks(files)
+        mandatory_review_checks.extend(self._build_verification_commit_checks(pr, files))
         mandatory_review_checks.extend(self._build_ai_metadata_checks(pr, commits))
 
         changed_files = []

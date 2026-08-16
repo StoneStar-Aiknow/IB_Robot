@@ -38,6 +38,21 @@ the [bootstrap variant](references/bootstrap-variant.md) based on plain `ubuntu:
 - Only run this skill in a review session when the user explicitly asks the
   agent to perform the actual Ubuntu Docker setup/build verification.
 
+## Commit Binding for PR Verification
+
+When an author-side PR gate triggers both Docker skills, verification evidence
+must describe one exact committed tree:
+
+1. Require a clean worktree, then record `VERIFIED_COMMIT="$(git rev-parse HEAD)"`
+   before starting the first platform. Use the full 40-character SHA.
+2. Ubuntu and openEuler must both test that same commit. The local-copy mode is
+   allowed only after confirming there are no tracked or untracked source changes.
+3. Include `Verified commit: <full SHA>` in this skill's result. The PR workflow
+   converts it to the canonical `**Verified commit:** \`<full SHA>\`` field.
+4. After the run, require `git rev-parse HEAD` to still equal
+   `VERIFIED_COMMIT`. A new commit makes the result stale and both platforms
+   must be rerun; never carry the old SHA forward into a new PR description.
+
 ## Prerequisites
 
 - Docker CLI installed on the host (check with `command -v docker`).

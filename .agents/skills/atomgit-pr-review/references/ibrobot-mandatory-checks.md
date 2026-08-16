@@ -70,9 +70,14 @@
 - 对此类 PR，review 过程中应检查 **PR 描述中的 Verification 是否由开发者提供**，且必须同时覆盖：
   - Ubuntu 22.04 纯净 Docker 环境中的 `setup.sh + build.sh` 完整验证
   - openEuler Embedded 纯净 Docker 环境中的 `setup.sh + build.sh` 完整验证
+- PR 描述必须且只能包含一个标准字段 `**Verified commit:** \`<40位 SHA>\``。该 SHA 表示上述两个平台实际验证的同一个 commit。
+- 必须将该字段与提取上下文中的 `.pr.head_sha` 比对。`pr_review.py` 会自动生成：
+  - `docker_verification_commit_missing`：字段缺失、不是完整 40 位 SHA，或出现多个不同 SHA。
+  - `docker_verification_commit_mismatch`：验证 SHA 与 PR 当前最新 commit 不一致。
+- 两种情况都是阻塞性问题。尤其是作者在验证后又 push 新 commit 时，不得接受旧结果；必须要求作者在最新 `head_sha` 上重跑 Ubuntu 与 openEuler，并同步 PR 描述。
 - **review 默认只检查 PR 描述中由开发者声明的验证结果，禁止自动执行双平台 Docker 验证。**
 - "review / 审查 / 帮我看看 PR"本身不等于授权执行验证。禁止审查者代替开发者运行 `ibrobot-docker-verify` 或 `ibrobot-docker-verify-oee` 来补齐 PR 描述；只有当用户在当前请求中明确要求 agent 实际执行验证（例如"你来跑一下 Ubuntu/openEuler Docker 验证""帮我实际验证 setup/build"）时，才调用对应验证 skill。
-- 如果 PR 描述缺少任一平台验证说明，或只给出命令但没有结果，或验证没有覆盖 setup/build 两个阶段，都应视为**阻塞性 review 问题**，要求开发者补充。
+- 如果 PR 描述缺少任一平台验证说明，只给出命令但没有结果，验证没有覆盖 setup/build 两个阶段，或验证 commit 与最新 `head_sha` 不一致，都应视为**阻塞性 review 问题**，要求开发者补充或重跑。
 
 ## 4. openEuler AI 贡献元数据检查（阻塞性）
 

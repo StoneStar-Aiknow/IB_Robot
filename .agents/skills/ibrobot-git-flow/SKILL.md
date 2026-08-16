@@ -128,7 +128,7 @@ These add noise to git history, bloat the PR, and make the change set harder to 
 
 - If the staged changes modify a ROS package `package.xml` dependency declaration (`depend`, `exec_depend`, `build_depend`, `test_depend`, etc.), or global setup/build workflow files such as `scripts/setup.sh`, `scripts/build.sh`, `scripts/setup/platforms/*.sh`, `scripts/setup/verify_env.sh`, `scripts/install_ros.sh`, top-level `CMakeLists.txt`, top-level `pyproject.toml`, or `requirements/*.txt` (pip dependency files that affect setup/install), the eventual PR description must include real Ubuntu 22.04 and openEuler Embedded Docker `setup.sh + build.sh` verification results.
 - ROS package-local `setup.py` changes do **not** by themselves trigger this dual-platform setup/build gate. Examples that do not trigger it alone: console entry points, Python package metadata, or Python-only `install_requires` edits.
-- When the gate is triggered during commit preparation, explicitly remind the user before committing/pushing that dual-platform verification is required for the PR. Before creating or updating the PR description, call `ibrobot-docker-verify` and `ibrobot-docker-verify-oee` and include the real results. This is an author-side PR submission rule and does not apply to reviewer-side `atomgit-pr-review` flows.
+- When the gate is triggered during commit preparation, explicitly remind the user before committing/pushing that dual-platform verification is required for the PR. After the final commit is pushed, require a clean worktree, record the full `git rev-parse HEAD`, and make `ibrobot-docker-verify` and `ibrobot-docker-verify-oee` test that same commit. The PR description must contain exactly one `**Verified commit:** \`<40-character SHA>\`` field. PR creation/update must compare it with the remote branch or PR `head.sha`; any later push invalidates both results. This is an author-side PR submission rule and does not apply to reviewer-side `atomgit-pr-review` flows.
 
 ## Execution Steps
 
@@ -174,7 +174,7 @@ For root repository:
    - **If an existing PR is found**: The PR description is now stale. You **must** synchronize it:
      1. Run `python3 pr_management.py --pr <NUM> --fetch-info` to get full PR context (all commits + diff).
      2. Analyze all commits in the PR and regenerate a complete PR description (Chinese by default) covering all changes.
-     3. If the PR context triggers the verification gate, run `ibrobot-docker-verify` and `ibrobot-docker-verify-oee`, then include the real dual-platform verification results.
+      3. If the PR context triggers the verification gate, record the clean latest HEAD, run `ibrobot-docker-verify` and `ibrobot-docker-verify-oee` against that same commit, then include the real results and canonical `Verified commit` field. Any new push requires both runs again.
      4. Write the updated `description.json` and run `python3 pr_management.py --pr <NUM> --update-pr description.json`.
    - **If no existing PR**: Generate AtomGit PR link: `https://atomgit.com/<username>/IB_Robot/merge_requests/new?source_branch=<current-branch>` and compose PR description from commit message body.
 

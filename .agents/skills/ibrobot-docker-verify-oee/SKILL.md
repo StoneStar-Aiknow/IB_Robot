@@ -28,6 +28,19 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setu
 - review 默认只检查 PR 描述中开发者声明的 openEuler Embedded Verification。如果缺少或不完整，应作为阻塞性 review 问题要求开发者补充。
 - 只有当用户在当前请求中明确要求 agent 实际执行 openEuler / 双平台 Docker setup/build 验证时，才运行本 skill。
 
+## PR 验证的 Commit 绑定
+
+作者侧 PR 门禁触发两个 Docker skill 时，两平台必须验证同一个已提交代码树：
+
+1. 启动第一个平台前要求 worktree 干净，并记录完整 40 位
+   `VERIFIED_COMMIT="$(git rev-parse HEAD)"`。
+2. openEuler 与 Ubuntu 都必须验证该 commit。使用 `docker cp` 时也必须先确认没有 tracked 或
+   untracked 源码改动，不能让容器内容超出该 commit。
+3. 本 skill 的结果中写入 `Verified commit: <full SHA>`；PR 工作流会将其写成标准字段
+   `**Verified commit:** \`<full SHA>\``。
+4. 完成后再次检查 `git rev-parse HEAD`。若已产生新 commit，则旧结果立即失效，必须对最新
+   commit 重跑两个平台，禁止复用旧 SHA 更新 PR 描述。
+
 ## Prerequisites
 
 - 宿主机已安装 Docker CLI（检查 `command -v docker`）。

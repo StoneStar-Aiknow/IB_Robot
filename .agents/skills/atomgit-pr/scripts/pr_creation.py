@@ -16,6 +16,7 @@ import sys
 
 from ai_compliance import add_ai_disclosure, validate_commit_ai_model
 from atomgit_sdk import AtomGitClient, resolve_atomgit_context
+from verification_gate import file_triggers_dual_docker_gate, validate_verified_commit
 
 
 def run_git(args: list[str], cwd: str = None) -> str:
@@ -90,6 +91,28 @@ def get_changed_files(branch: str, base_branch: str = "master") -> list[str]:
     except Exception:
         output = run_git(["diff", "--name-only", f"{base_branch}...{branch}"])
     return [f for f in output.split("\n") if f.strip()]
+
+
+def dual_docker_gate_triggered(branch: str, base_branch: str, files: list[str]) -> bool:
+    """Return whether the PR diff requires commit-bound dual Docker verification."""
+    base_ref = get_best_base_ref(base_branch)
+    for filename in files:
+        patch = ""
+        if filename.endswith("/package.xml"):
+            try:
+                patch = run_git(["diff", "--unified=0", f"{base_ref}...{branch}", "--", filename])
+            except Exception:
+                patch = run_git(["diff", "--unified=0", f"{base_branch}...{branch}", "--", filename])
+        if file_triggers_dual_docker_gate(filename, patch):
+            return True
+    return False
+
+
+def get_remote_branch_head(branch: str) -> str:
+    output = run_git(["ls-remote", "--heads", "origin", f"refs/heads/{branch}"])
+    if not output:
+        raise ValueError(f"origin/{branch} does not exist; push the verified commit before creating the PR")
+    return output.split()[0].lower()
 
 
 def get_diff_stats(branch: str, base_branch: str = "master") -> dict:
@@ -244,6 +267,19 @@ def main():
         print(f"❌ AI 披露信息无效: {e}")
         sys.exit(1)
 
+    if dual_docker_gate_triggered(branch, args.base, files):
+        try:
+            local_head = run_git(["rev-parse", branch]).lower()
+            remote_head = get_remote_branch_head(branch)
+            if local_head != remote_head:
+                raise ValueError(
+                    f"local branch head {local_head} does not match origin/{branch} {remote_head}; push the latest commit first"
+                )
+            validate_verified_commit(description, remote_head)
+        except ValueError as e:
+            print(f"❌ 双 Docker 验证提交校验失败: {e}")
+            sys.exit(1)
+
     title = args.title or commits[0]["subject"]
     print(f"✓ 标题: {title}")
 
@@ -286,6 +322,9 @@ def main():
                 draft=args.draft,
             )
             pr_number = pr.get("number")
+            if dual_docker_gate_triggered(branch, args.base, files):
+                created_pr = api.get_pull_request(pr_number)
+                validate_verified_commit(description, created_pr.get("head", {}).get("sha", ""))
             pr_url = api.get_pr_url(pr_number)
 
             print()
