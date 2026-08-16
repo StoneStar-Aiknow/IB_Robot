@@ -27,11 +27,12 @@ ros2_control 和外设的统一机器人配置系统。
 
 ### ros2_control 启动门禁
 
-真机控制器由 `robot_config/controller_spawner` 串行加载、配置和激活；该入口修复 ROS 2 Humble 官方 spawner
-未向 `load_controller` 传递 service call timeout 的问题，并在调用超时后重新读取 lifecycle 状态，接受服务端
-已经完成的加载。随后统一的 `wait_for_controllers` 再确认 robot YAML 为当前控制模式声明的全部 controller 都是
-`active`，通过后才启动 MoveIt、teleop 或 task executor。发现、service call 和 switch 的等待上限都来自
-robot YAML 的 `robot.controller_startup_timeout.hardware`，不再维护第二套 hardware lifecycle readiness 判定。
+真机控制器由单个 `robot_config/controller_spawner` 进程逐个加载和配置，再通过一次 `switch_controller` 调用统一
+激活当前控制模式要求的 controller，并在同一次切换中停用配置为 inactive 的 controller，避免部分激活窗口。该入口
+修复 ROS 2 Humble 官方 spawner 未向 `load_controller` 传递 service call timeout 的问题，并在调用超时后重新读取
+lifecycle 状态，接受服务端已经完成的操作。组 spawner 成功退出即作为控制器启动屏障，通过后才启动 MoveIt、teleop
+或 task executor。发现、service call 和 switch 的等待上限都来自 robot YAML 的
+`robot.controller_startup_timeout.hardware`，不再维护第二套 hardware lifecycle readiness 判定。
 
 ## 架构
 

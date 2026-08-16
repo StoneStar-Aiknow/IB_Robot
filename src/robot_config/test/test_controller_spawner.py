@@ -52,7 +52,80 @@ def test_spawn_controller_forwards_explicit_timeouts(monkeypatch):
 
     assert calls[0][1][-2:] == (41.0, 42.0)
     assert calls[1][1][-2:] == (41.0, 42.0)
-    assert calls[2][1][-2:] == (43.0, 42.0)
+    assert calls[2][1][-2:] == (43.0, 43.0)
+
+
+def test_spawn_controllers_activates_prepared_controllers_in_one_switch(monkeypatch):
+    events = []
+    monkeypatch.setattr(controller_spawner, "list_controllers", lambda *args: _controllers())
+
+    def load(*args):
+        events.append(("load", args[2]))
+        return SimpleNamespace(ok=True)
+
+    def configure(*args):
+        events.append(("configure", args[2]))
+        return SimpleNamespace(ok=True)
+
+    def switch(*args):
+        events.append(("switch", args[2], args[3]))
+        return SimpleNamespace(ok=True)
+
+    monkeypatch.setattr(controller_spawner, "load_controller", load)
+    monkeypatch.setattr(controller_spawner, "configure_controller", configure)
+    monkeypatch.setattr(
+        controller_spawner,
+        "switch_controllers",
+        switch,
+    )
+
+    controller_spawner.spawn_controllers(
+        _Node(),
+        "/controller_manager",
+        ["joint_state_broadcaster", "arm_controller", "gripper_controller"],
+        [],
+        10.0,
+        20.0,
+        30.0,
+    )
+
+    assert events == [
+        ("load", "joint_state_broadcaster"),
+        ("configure", "joint_state_broadcaster"),
+        ("load", "arm_controller"),
+        ("configure", "arm_controller"),
+        ("load", "gripper_controller"),
+        ("configure", "gripper_controller"),
+        ("switch", [], ["joint_state_broadcaster", "arm_controller", "gripper_controller"]),
+    ]
+
+
+def test_spawn_controllers_switches_active_and_inactive_targets_together(monkeypatch):
+    monkeypatch.setattr(
+        controller_spawner,
+        "list_controllers",
+        lambda *args: _controllers(("arm_controller", "inactive"), ("base_controller", "active")),
+    )
+    calls = []
+    monkeypatch.setattr(
+        controller_spawner,
+        "switch_controllers",
+        lambda *args: calls.append(args) or SimpleNamespace(ok=True),
+    )
+
+    controller_spawner.spawn_controllers(
+        _Node(),
+        "/controller_manager",
+        ["arm_controller"],
+        ["base_controller"],
+        10.0,
+        20.0,
+        30.0,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][2] == ["base_controller"]
+    assert calls[0][3] == ["arm_controller"]
 
 
 def test_spawn_controller_can_leave_controller_inactive(monkeypatch):
@@ -196,3 +269,18 @@ def test_spawn_controller_rejects_lifecycle_failure(monkeypatch, failed_operatio
 
     with pytest.raises(RuntimeError, match=f"Failed to {failed_operation}"):
         controller_spawner.spawn_controller(_Node(), "/controller_manager", "arm_controller", 10.0, 20.0, 30.0)
+
+
+def test_parse_args_supports_active_and_inactive_controller_groups():
+    args = controller_spawner._parse_args(
+        [
+            "controller_spawner",
+            "joint_state_broadcaster",
+            "arm_controller",
+            "--inactive-controller",
+            "base_controller",
+        ]
+    )
+
+    assert args.controller_names == ["joint_state_broadcaster", "arm_controller"]
+    assert args.inactive_controller_names == ["base_controller"]

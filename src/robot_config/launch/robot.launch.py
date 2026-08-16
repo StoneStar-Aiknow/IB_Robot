@@ -258,8 +258,10 @@ def _serialize_process_startup(processes, sequence_name: str):
 
 
 def _controller_readiness_barrier(deferred_spawners, readiness_waiter):
-    """Use the last strict spawner as the barrier when this launch owns startup."""
-    return deferred_spawners[-1] if deferred_spawners else readiness_waiter
+    """Use the single strict group spawner as the owned-startup barrier."""
+    if len(deferred_spawners) > 1:
+        raise ValueError("Controller startup must use a single controller group spawner.")
+    return deferred_spawners[0] if deferred_spawners else readiness_waiter
 
 
 def _resolve_controller_startup_timeout(robot_config: dict, use_sim: bool) -> float:
