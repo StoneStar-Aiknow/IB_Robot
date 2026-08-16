@@ -369,6 +369,10 @@ def test_finalize_stops_recorder_saves_map_reindexes_then_generates_artifacts(tm
     assert archive == session_root.with_suffix(".tar.gz")
     manifest = json.loads((session_root / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "calibration_incomplete"
+    assert manifest["navigation_map"]["status"] == "pending_validation"
+    assert "Navigation map promotion status: `pending_validation`" in (session_root / "README.md").read_text(
+        encoding="utf-8"
+    )
     topics = {item["name"]: item for item in manifest["topics"]}
     assert topics["/camera/front/aligned_depth_to_color/image_raw"] == {
         "message_count": 10,
@@ -447,6 +451,44 @@ def test_deterministic_tar_gz_layout_and_checksums(tmp_path):
         dataset_capture.verify_checksums(root)
 
 
+def test_refresh_navigation_map_archive_records_promotion_result(tmp_path):
+    root = tmp_path / "dataset"
+    root.mkdir()
+    _write_bag(root, ("bag_0.mcap",))
+    _write_map(root)
+    (root / "bag" / "calibration_snapshot.json").write_text("{}\n", encoding="utf-8")
+    (root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "navigation_map": {
+                    "status": "pending_validation",
+                    "source_files": ["map/map.yaml", "map/map.pgm"],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (root / "README.md").write_text("Navigation map promotion status: `pending_validation`\n", encoding="utf-8")
+    dataset_capture.write_checksums(root)
+    target = tmp_path / "active" / "map"
+    target.parent.mkdir()
+    target.with_suffix(".yaml").write_bytes((root / "map" / "map.yaml").read_bytes())
+    target.with_suffix(".pgm").write_bytes((root / "map" / "map.pgm").read_bytes())
+
+    archive = dataset_capture._refresh_navigation_map_archive(
+        root,
+        "promoted",
+        source_prefix=root / "map" / "map",
+        target_prefix=target,
+    )
+
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["navigation_map"]["status"] == "promoted"
+    assert manifest["navigation_map"]["source_and_target_match"] is True
+    assert archive == root.with_suffix(".tar.gz")
+    dataset_capture.verify_checksums(root)
+
+
 def test_tar_rejects_dataset_without_saved_map(tmp_path):
     root = tmp_path / "dataset"
     root.mkdir()
@@ -476,30 +518,76 @@ def test_save_semantic_map_cli_finalizes_then_validates_dataset(tmp_path, monkey
     def verify(path):
         events.append(("verify", path))
 
+    def promote(path):
+        events.append(("promote", path))
+
     monkeypatch.setattr(dataset_capture, "finalize_dataset", finalize)
     monkeypatch.setattr(dataset_capture, "smoke_dataset", smoke, raising=False)
     monkeypatch.setattr(dataset_capture, "verify_checksums", verify, raising=False)
+    monkeypatch.setattr(dataset_capture, "promote_navigation_map", promote)
+    monkeypatch.setattr(
+        dataset_capture,
+        "_refresh_navigation_map_archive",
+        lambda session_root, status, **_kwargs: events.append(("refresh", session_root, status)) or archive,
+    )
 
     assert dataset_capture.main([]) == 0
     assert events == [
         ("finalize", Path("~/.ros/ibrobot/semantic_mapping/current.json")),
         ("verify", session_root),
         ("smoke", session_root),
+        ("promote", session_root / "map" / "map"),
+        ("refresh", session_root, "promoted"),
+        ("verify", session_root),
     ]
     assert "Semantic map saved" in capsys.readouterr().out
 
 
 def test_save_semantic_map_cli_fails_when_offline_validation_fails(tmp_path, monkeypatch):
+    state_file = tmp_path / "current.json"
+    state_file.write_text(json.dumps({"status": "finalized"}), encoding="utf-8")
     archive = (tmp_path / "session").with_suffix(".tar.gz")
     monkeypatch.setattr(dataset_capture, "finalize_dataset", lambda *_args, **_kwargs: archive)
+    monkeypatch.setattr(dataset_capture, "verify_checksums", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         dataset_capture,
         "smoke_dataset",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("no synchronized RGB-D frame")),
         raising=False,
     )
+    promoted = []
+    monkeypatch.setattr(dataset_capture, "promote_navigation_map", lambda path: promoted.append(path))
 
-    assert dataset_capture.main([]) == 1
+    assert dataset_capture.main(["--session-file", str(state_file)]) == 1
+    assert promoted == []
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["status"] == "semantic_map_offline_validation_failed"
+    assert state["failure_stage"] == "offline_validation"
+
+
+def test_save_semantic_map_cli_records_navigation_map_promotion_failure(tmp_path, monkeypatch):
+    state_file = tmp_path / "current.json"
+    state_file.write_text(json.dumps({"status": "finalized"}), encoding="utf-8")
+    archive = (tmp_path / "session").with_suffix(".tar.gz")
+    archive.write_bytes(b"compressed archive")
+    monkeypatch.setattr(dataset_capture, "finalize_dataset", lambda *_args, **_kwargs: archive)
+    monkeypatch.setattr(dataset_capture, "verify_checksums", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        dataset_capture,
+        "smoke_dataset",
+        lambda *_args, **_kwargs: {"calibration_status": "complete", "geometry_ready": True},
+    )
+    monkeypatch.setattr(
+        dataset_capture,
+        "promote_navigation_map",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("destination is not writable")),
+    )
+
+    assert dataset_capture.main(["--session-file", str(state_file)]) == 1
+
+    state = json.loads(state_file.read_text(encoding="utf-8"))
+    assert state["status"] == "navigation_map_promotion_failed"
+    assert state["promotion_error"] == "destination is not writable"
 
 
 def test_package_exposes_one_semantic_map_save_command():

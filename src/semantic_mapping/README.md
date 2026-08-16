@@ -41,8 +41,9 @@ ros2 run semantic_mapping save_semantic_map
 ```
 
 该命令停止 recorder、保存当前 slam_toolbox 地图、执行 MCAP reindex、生成标定快照和根目录元数据、
-校验 `SHA256SUMS` 与离线 RGB-D/历史 TF，最后以 gzip level 1 流式创建同名 `.tar.gz`。压缩过程不会先生成
-同尺寸的临时 `.tar`；任一步失败都会返回非零状态。
+校验 `SHA256SUMS` 与离线 RGB-D/历史 TF，并以 gzip level 1 流式创建同名 `.tar.gz`；归档和离线
+校验都成功后，才将同一 YAML/PGM 地图成对、失败可回滚地提升到 `~/.ros/ibrobot/maps/map.yaml` 和 `map.pgm`。
+压缩过程不会先生成同尺寸的临时 `.tar`；任一步失败都会返回非零状态。
 
 recorder 在 rosbag 启动前固定 MID-360 mount YAML 和当时存在的 approved camera artifact 字节与 SHA-256；
 finalizer 只读取这些 pinned bytes，不会重新读取可能已被替换的 `current/` 源文件。camera artifact 缺失时仍生成
@@ -68,6 +69,9 @@ manifest.json
 SHA256SUMS
 README.md
 ```
+
+默认导航地图只有在 checksum 和离线几何校验成功后才会更新；promotion 失败时 session handoff
+状态为 `navigation_map_promotion_failed`，原有默认地图保持不变。
 
 20 秒静止烟测只验证工程闭环，不评价地图质量：
 

@@ -12,6 +12,7 @@ import sys
 import tarfile
 import time
 from collections.abc import Callable, Iterable, Sequence
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -439,6 +440,70 @@ def _run_step(command: list[str], command_runner: Callable[..., CompletedCommand
         raise RuntimeError(f"command failed with return code {completed.returncode}: {' '.join(command)}")
 
 
+def promote_navigation_map(map_prefix: Path) -> Path:
+    """Make the validated session map the default map consumed by Nav2."""
+    from robot_navigation.save_lidar_map import promote_saved_map
+
+    target_prefix = Path.home() / ".ros" / "ibrobot" / "maps" / "map"
+    promote_saved_map(map_prefix, target_prefix)
+    return target_prefix
+
+
+def _record_save_failure(state_file: Path, status: str, stage: str, error: Exception) -> None:
+    """Keep the handoff diagnosable when a finalized save step fails."""
+    state_file = state_file.expanduser()
+    try:
+        state = _read_json(state_file)
+        state["status"] = status
+        state["failure_stage"] = stage
+        state["failure_error"] = str(error)
+        state["failure_at"] = _timestamp()
+        if stage == "navigation_map_promotion":
+            state["promotion_error"] = str(error)
+            state["promotion_failed_at"] = state["failure_at"]
+        state_file.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except (OSError, ValueError):
+        return
+
+
+def _refresh_navigation_map_archive(
+    session_root: Path,
+    status: str,
+    *,
+    source_prefix: Path,
+    target_prefix: Path | None = None,
+    error: Exception | None = None,
+) -> Path:
+    manifest_path = session_root / "manifest.json"
+    manifest = _read_json(manifest_path)
+    navigation_map = manifest.setdefault("navigation_map", {})
+    navigation_map["status"] = status
+    if error is not None:
+        navigation_map["error"] = str(error)
+    source_files = [source_prefix.with_suffix(".yaml"), source_prefix.with_suffix(".pgm")]
+    navigation_map["source_sha256"] = {_path.name: _sha256(_path) for _path in source_files}
+    if target_prefix is not None:
+        target_files = [target_prefix.with_suffix(".yaml"), target_prefix.with_suffix(".pgm")]
+        navigation_map["target_sha256"] = {_path.name: _sha256(_path) for _path in target_files}
+        navigation_map["source_and_target_match"] = all(
+            _sha256(source) == _sha256(target) for source, target in zip(source_files, target_files, strict=True)
+        )
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    readme_path = session_root / "README.md"
+    readme = readme_path.read_text(encoding="utf-8")
+    status_line = f"Navigation map promotion status: `{status}`\n"
+    marker = "Navigation map promotion status: `"
+    lines = readme.splitlines(keepends=True)
+    if any(line.startswith(marker) for line in lines):
+        lines = [status_line if line.startswith(marker) else line for line in lines]
+    else:
+        lines.append("\n" + status_line)
+    readme_path.write_text("".join(lines), encoding="utf-8")
+    write_checksums(session_root)
+    return create_deterministic_tar(session_root)
+
+
 def finalize_dataset(
     state_file: Path,
     *,
@@ -497,6 +562,14 @@ def finalize_dataset(
             "topic_validation": metadata["topic_validation"],
         },
         "map_files": map_files,
+        "navigation_map": {
+            "status": "pending_validation",
+            "target_files": [
+                "~/.ros/ibrobot/maps/map.yaml",
+                "~/.ros/ibrobot/maps/map.pgm",
+            ],
+            "source_files": map_files,
+        },
         "calibration_snapshot": "bag/calibration_snapshot.json",
         "camera_calibration_status": snapshot["artifacts"]["base_to_front_camera"]["status"],
     }
@@ -509,7 +582,10 @@ def finalize_dataset(
         f"Profile: `{state['profile']}`\n\n"
         f"Dataset status: `{snapshot['status']}`\n\n"
         "The `bag/` directory contains the reindexed MCAP recording and calibration snapshot. "
-        "The `map/` directory contains the slam_toolbox map saved from the same session.\n",
+        "The `map/` directory contains the slam_toolbox map saved from the same session. "
+        "After checksum and offline geometry validation, this exact YAML/PGM pair is promoted to "
+        "`~/.ros/ibrobot/maps/map.yaml` and `map.pgm` for Nav2.\n"
+        "Navigation map promotion status: `pending_validation`\n",
         encoding="utf-8",
     )
     write_checksums(session_root)
@@ -536,25 +612,66 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    map_prefix = Path(args.map_prefix).expanduser() if args.map_prefix else None
+    state_file = Path(args.session_file)
     try:
-        archive = finalize_dataset(
-            Path(args.session_file),
-            map_prefix=Path(args.map_prefix) if args.map_prefix else None,
-            stop_timeout_sec=args.stop_timeout,
-        )
+        try:
+            archive = finalize_dataset(state_file, map_prefix=map_prefix, stop_timeout_sec=args.stop_timeout)
+        except (KeyError, OSError, RuntimeError, TimeoutError, ValueError, yaml.YAMLError) as exc:
+            _record_save_failure(state_file, "semantic_map_finalization_failed", "finalization", exc)
+            raise
         session_root = archive.with_suffix("").with_suffix("")
-        verify_checksums(session_root)
-        smoke = smoke_dataset(
-            session_root,
-            topics=OfflineTopicContract(
-                "/camera/front/image_raw",
-                "/camera/front/aligned_depth_to_color/image_raw",
-                "/camera/front/camera_info",
-            ),
-        )
-        if not smoke["geometry_ready"]:
-            raise ValueError(f"offline validation failed: calibration_status={smoke['calibration_status']}")
-    except (KeyError, OSError, RuntimeError, TimeoutError, ValueError) as exc:
+        try:
+            verify_checksums(session_root)
+        except (OSError, ValueError) as exc:
+            _record_save_failure(state_file, "semantic_map_checksum_failed", "checksum_validation", exc)
+            raise
+        source_prefix = map_prefix or session_root / "map" / "map"
+        try:
+            smoke = smoke_dataset(
+                session_root,
+                topics=OfflineTopicContract(
+                    "/camera/front/image_raw",
+                    "/camera/front/aligned_depth_to_color/image_raw",
+                    "/camera/front/camera_info",
+                ),
+            )
+            if not smoke["geometry_ready"]:
+                raise ValueError(f"offline validation failed: calibration_status={smoke['calibration_status']}")
+        except (OSError, RuntimeError, ValueError, yaml.YAMLError) as exc:
+            _record_save_failure(state_file, "semantic_map_offline_validation_failed", "offline_validation", exc)
+            with suppress(OSError, KeyError, ValueError):
+                archive = _refresh_navigation_map_archive(
+                    session_root,
+                    "offline_validation_failed",
+                    source_prefix=source_prefix,
+                    error=exc,
+                )
+            raise
+        try:
+            target_prefix = promote_navigation_map(source_prefix)
+        except (OSError, RuntimeError, ValueError, yaml.YAMLError) as exc:
+            _record_save_failure(state_file, "navigation_map_promotion_failed", "navigation_map_promotion", exc)
+            with suppress(OSError, KeyError, ValueError):
+                archive = _refresh_navigation_map_archive(
+                    session_root,
+                    "promotion_failed",
+                    source_prefix=source_prefix,
+                    error=exc,
+                )
+            raise
+        try:
+            archive = _refresh_navigation_map_archive(
+                session_root,
+                "promoted",
+                source_prefix=source_prefix,
+                target_prefix=target_prefix,
+            )
+            verify_checksums(session_root)
+        except (KeyError, OSError, ValueError) as exc:
+            _record_save_failure(state_file, "navigation_map_audit_failed", "archive_refresh", exc)
+            raise
+    except (KeyError, OSError, RuntimeError, TimeoutError, ValueError, yaml.YAMLError) as exc:
         print(f"Semantic map save failed: {exc}", file=sys.stderr)
         return 1
     archive_size_gib = archive.stat().st_size / (1024**3)
