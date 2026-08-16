@@ -334,16 +334,18 @@ bundle 布局、adapter asset、named deployment 与 conformance 见
 `src/perception_service/README.md` 的 GraspGen 章节。GraspGen **不是** policy family，
 不出现在本文件末尾的策略支持矩阵中。
 
+除非另有说明，本节所有命令均在 IB_Robot 仓库根目录执行；所有项目内路径均相对于仓库根目录。
+
 ### 1. 导出八个 ONNX 子图
 
 ```bash
 source .shrc_local
 
 ros2 run model_utils graspgen-export-onnx \
-    --config /path/to/gripper.yaml \
-    --generator-checkpoint /path/to/generator.pth \
-    --discriminator-checkpoint /path/to/discriminator.pth \
-    --output-dir /path/to/onnx \
+    --config models/_work/graspgen_robotiq_2f_140/source/checkpoints/graspgen_robotiq_2f_140.yml \
+    --generator-checkpoint models/_work/graspgen_robotiq_2f_140/source/checkpoints/graspgen_robotiq_2f_140_gen.pth \
+    --discriminator-checkpoint models/_work/graspgen_robotiq_2f_140/source/checkpoints/graspgen_robotiq_2f_140_dis.pth \
+    --output-dir models/_work/graspgen_robotiq_2f_140/model_utils/onnx \
     --grasp-batch-size 1000
 ```
 
@@ -365,8 +367,8 @@ backend 用错误的分组驱动。遇到该报错时按本节重跑导出即可
 
 ```bash
 ros2 run model_utils graspgen-onnx-to-om \
-    --manifest /path/to/onnx/graspgen.onnx.json \
-    --output-dir /path/to/compiled_om \
+    --manifest models/_work/graspgen_robotiq_2f_140/model_utils/onnx/graspgen.onnx.json \
+    --output-dir models/_work/graspgen_robotiq_2f_140/model_utils/om \
     --soc-version Ascend310P3
 ```
 
@@ -382,10 +384,10 @@ device 检查 OM，并把 `<role>.om.abi.json` 写入 `--om-abi-dir`：
 
 ```bash
 ros2 run perception_service package_graspgen_ascend_bundle \
-    --bundle-root /path/to/graspgen_bundle \
-    --onnx-manifest /path/to/onnx/graspgen.onnx.json \
-    --om-dir /path/to/compiled_om \
-    --om-abi-dir /path/to/runtime_abi \
+    --bundle-root models/grasp/graspgen_robotiq_2f_140 \
+    --onnx-manifest models/_work/graspgen_robotiq_2f_140/model_utils/onnx/graspgen.onnx.json \
+    --om-dir models/_work/graspgen_robotiq_2f_140/model_utils/om \
+    --om-abi-dir models/_work/graspgen_robotiq_2f_140/model_utils/abi \
     --abi-device-id 0 \
     --soc-version Ascend310P3
 ```

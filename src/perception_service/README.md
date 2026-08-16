@@ -306,15 +306,21 @@ generic 感知服务不读取深度，因此其 `Detection2D` 只保证 bbox 与
 板端只依赖 NumPy、OpenCV、`inference_manifest`、`inference_service` 和 CANN ACL，不导入
 GroundingDINO、SAM2、TorchVision 或对应 CUDA 扩展。用仓库打包器从已验证候选生成独立 bundle：
 
+除非另有说明，本节所有命令均在 IB_Robot 仓库根目录执行；所有项目内路径均相对于仓库根目录。
+
 ```bash
 source .shrc_local
 ros2 run perception_service package_ascend_perception_bundles \
-  --models-root models/perception \
+  --models-root models \
   --family grounding_dino
 ros2 run perception_service package_ascend_perception_bundles \
-  --models-root models/perception \
+  --models-root models \
   --family sam2
 ```
+
+`--models-root` 必须与 robot config 的 bundle 根目录一致。打包器从 `models/_work/` 中读取已经验证的候选，
+并把发布 bundle 写到 `models/grounding_dino_swint_seq8_1280x720_ascend/` 和
+`models/sam2_hiera_tiny_ascend/`；它不执行 ONNX/OM 编译，也不会写回 `models/perception/` 旧布局。
 
 Grounding-DINO bundle 记录并校验 12 个 OM、`encoder_tgt.npy`、bundle-local WordPiece vocab 和 D2D links；
 SAM2 bundle 独立记录 encoder 与固定 batch-4 decoder。GroundingDINO 固定输入为
@@ -424,12 +430,14 @@ ONNX → OM → ABI → bundle 的三步流程：前两步 `graspgen-export-onnx
 `graspgen-onnx-to-om` 是 `model_utils` 的导出工具（见
 `src/model_utils/model_utils/README.md`）；第三步用本包的命令打包：
 
+除非另有说明，以下命令在 IB_Robot 仓库根目录执行；所有项目内路径均相对于仓库根目录。
+
 ```bash
 ros2 run perception_service package_graspgen_ascend_bundle \
-    --bundle-root /path/to/graspgen_bundle \
-    --onnx-manifest /path/to/onnx/graspgen.onnx.json \
-    --om-dir /path/to/compiled_om \
-    --om-abi-dir /path/to/runtime_abi \
+    --bundle-root models/grasp/graspgen_robotiq_2f_140 \
+    --onnx-manifest models/_work/graspgen_robotiq_2f_140/model_utils/onnx/graspgen.onnx.json \
+    --om-dir models/_work/graspgen_robotiq_2f_140/model_utils/om \
+    --om-abi-dir models/_work/graspgen_robotiq_2f_140/model_utils/abi \
     --soc-version Ascend310P3
 ```
 

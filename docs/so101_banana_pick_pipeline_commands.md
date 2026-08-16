@@ -6,10 +6,10 @@
 
 支持两个运行平台：
 
-| 平台 | Robot config | 推理后端 | 工作区 |
+| 平台 | Robot config | 推理后端 | 命令执行位置 |
 |---|---|---|---|
-| 310P | `lekiwi_handeye_realsense_grasp` | Ascend NPU | `/root/IB_Robot` |
-| PC | `lekiwi_handeye_realsense_grasp_pc` | NVIDIA CUDA | `~/IB_Robot` |
+| 310P | `lekiwi_handeye_realsense_grasp` | Ascend NPU | 仓库根目录 |
+| PC | `lekiwi_handeye_realsense_grasp_pc` | NVIDIA CUDA | 仓库根目录 |
 
 > **安全要求**：本文第 3.1、4.3、5.2 节会驱动真机。执行前必须清空工作区、确认急停可用，并由操作员对本次运动
 > 明确授权。失败、超时或机器人状态未知时禁止自动重试。
@@ -36,19 +36,27 @@
 
 ### 0.1 安装、下载和构建
 
+除非另有说明，本文所有命令均在 IB_Robot 仓库根目录执行；所有项目内路径均相对于仓库根目录。
+
 在目标运行平台执行：
 
 ```bash
-cd ~/IB_Robot
 ./scripts/setup.sh
-./scripts/download_perception_models.sh
 source .shrc_local
 colcon build --symlink-install --merge-install --packages-up-to \
   lekiwi_description lekiwi_hardware embodied_bringup robot_skill_cli \
   perception_service manipulation_execution
 ```
 
-310P 上仓库通常位于 `/root/IB_Robot`，请相应替换 `cd` 路径。
+PC 额外下载 Grounded-SAM2 Torch bundle：
+
+```bash
+./scripts/download_perception_models.sh --gdino-only
+```
+
+该脚本不下载 GraspGen checkpoint，也不生成 310P 的 OM bundle。`models/` 是被 Git 忽略的部署目录，fresh clone
+中不存在属于正常情况。310P 与 PC 必须分别按第 0.3 节下发或生成与 robot config 一致的 bundle，不能从另一
+平台的本地目录推断模型已经就绪。
 
 ### 0.2 填写硬件与标定配置
 
@@ -73,28 +81,49 @@ colcon build --symlink-install --merge-install --packages-up-to \
 
 ### 0.3 准备模型
 
-310P 使用以下部署：
+两端使用相同的逻辑模型，但 named deployment 和物理 bundle 不同：
+
+| 平台 | 用途 | Bundle | Named deployment | 准备方式 |
+|---|---|---|---|---|
+| PC | 检测与分割 | `models/grounded_sam2_swint_ogc/` | `torch_cuda` | `download_perception_models.sh --gdino-only` |
+| PC | GraspGen | `models/grasp/graspgen_robotiq_2f_140/` | `torch_cuda` | 从已审核 checkpoint 生成 |
+| 310P | Grounding-DINO | `models/grounding_dino_swint_seq8_1280x720_ascend/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
+| 310P | SAM2 | `models/sam2_hiera_tiny_ascend/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
+| 310P | GraspGen | `models/grasp/graspgen_robotiq_2f_140/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
+
+310P 不在板端临时编译模型。将发布流程产出的三个完整 bundle 同步到 `models/` 后检查：
 
 ```bash
-cd /root/IB_Robot
 test -f models/grounding_dino_swint_seq8_1280x720_ascend/inference_manifest.json
 test -f models/sam2_hiera_tiny_ascend/inference_manifest.json
 test -f models/grasp/graspgen_robotiq_2f_140/inference_manifest.json
 ```
 
-PC 使用 CUDA bundle。首次部署或 GraspGen 模型变化后重新生成 manifest：
+Ascend 感知 bundle 的 promotion 命令和候选目录约束见
+[`src/perception_service/README.md`](../src/perception_service/README.md#91-ascend-310p-抓取感知)；GraspGen 的
+ONNX、OM 与 bundle 打包流程见
+[`src/model_utils/model_utils/README.md`](../src/model_utils/model_utils/README.md#graspgen-ascend-packaging)。模型转换
+中间产物只能放在 `models/_work/`，不能写入上述发布 bundle。
+
+PC 首次部署时先确认 Grounded-SAM2 bundle。GraspGen checkpoint 不由感知模型下载脚本提供；从已审核模型源
+取得以下三个文件后，用 packager 复制到标准 bundle 并生成 manifest：
 
 ```bash
-cd ~/IB_Robot
 source .shrc_local
 test -f models/grounded_sam2_swint_ogc/inference_manifest.json
+
+GRASPGEN_SOURCE_ROOT=models/_work/graspgen_robotiq_2f_140/source
+test -f "$GRASPGEN_SOURCE_ROOT/checkpoints/graspgen_robotiq_2f_140.yml"
+test -f "$GRASPGEN_SOURCE_ROOT/checkpoints/graspgen_robotiq_2f_140_gen.pth"
+test -f "$GRASPGEN_SOURCE_ROOT/checkpoints/graspgen_robotiq_2f_140_dis.pth"
 ros2 run perception_service package_graspgen_torch_bundle \
-  --source-root models/grasp \
+  --source-root "$GRASPGEN_SOURCE_ROOT" \
   --bundle-root models/grasp/graspgen_robotiq_2f_140
 test -f models/grasp/graspgen_robotiq_2f_140/inference_manifest.json
 ```
 
-任一检查失败时，先补齐模型或部署包，不要继续启动真机抓取。
+`models/grasp/checkpoints/` 仅是旧部署的兼容输入布局，不是 fresh clone 应自带的仓库内容。任一检查失败时，先从
+已审核发布物补齐模型或重新执行对应 packager，不要继续启动真机抓取，也不要把 ignored 模型文件提交到 Git。
 
 ## 1. 每次启动前
 
@@ -103,7 +132,6 @@ test -f models/grasp/graspgen_robotiq_2f_140/inference_manifest.json
 310P：
 
 ```bash
-cd /root/IB_Robot
 source .shrc_local
 export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
 source install/setup.bash
@@ -112,7 +140,6 @@ source install/setup.bash
 PC：
 
 ```bash
-cd ~/IB_Robot
 source .shrc_local
 export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
 source install/setup.bash
@@ -326,23 +353,24 @@ hermes-robot --config-name lekiwi_handeye_realsense_grasp -- --cli
 严格按 status -> list-skills -> plan-workflow -> describe pick_object -> validate-plan 执行只读阶段。
 计划必须只有一个 pick_object step，target_name 必须是 banana。
 请展示完整 step 和参数、plan digest、registry identity 以及新的 task ID。
-在我明确回复“确认执行”之前，不要调用 confirm-plan 或 execute-plan。
+展示并 flush exact plan 后，立即使用同一 tuple 调用一次 confirm-plan 和 execute-plan，不等待二次确认。
+如果计划不正确，我会输入“别动”；收到停止指令后必须取消当前 Agent plan 并等待权威 terminal result。
 ```
 
 以下任一情况都必须停止：Gateway 未就绪、运动未授权、校验失败、计划增减步骤、目标参数不一致。
 
-### 4.3 确认执行
+### 4.3 展示后立即执行
 
-检查 exact plan、digest、registry identity 和新 task ID 后，在同一会话输入：
+Hermes 展示并 flush exact plan、digest、registry identity 和新 task ID 后，必须立即使用展示过的 plan token、
+digest 和 task ID 调用一次 `confirm-plan`，再用返回的 confirmation token 调用一次 `execute-plan`。
+`confirm-plan` 是 Gateway 对 exact plan/task tuple 的内部技术绑定，不是用户二次确认门禁。默认使用 Gateway
+task budget，不传 `--timeout-sec`；只有操作员明确要求更短预算时，才给两个命令传入相同 timeout。
 
-```text
-确认执行
-```
-
-Hermes 必须使用展示过的 plan token、digest 和 task ID 调用一次 `confirm-plan`，再用返回的 confirmation
-token 调用一次 `execute-plan`。默认使用 Gateway task budget，不传 `--timeout-sec`；只有操作员明确要求更短
-预算时，才给两个命令传入相同 timeout。失败、超时或状态未知时不得自动 replan 或重试；只有唯一 terminal
-result 能证明任务完成。如需取消，终止当前 `execute-plan`，或用同一 task ID 调用 `cancel-plan`。
+如果计划错误或需要停止，在同一 Hermes 会话输入“别动”。当前会话拥有运行中的 `execute-plan` 进程时，由该
+进程发起一次取消并等待 terminal result；只有当前会话不再拥有执行进程时，才使用 `cancel-plan`，并且必须同时
+携带展示过的 task ID、plan ID/digest、registry epoch/generation/digest 和 expected step count。不得只凭 task ID
+构造取消请求，也不得同时使用进程信号和外部 `cancel-plan`。失败、超时或状态未知时不得自动 replan 或重试；
+只有唯一 terminal result 能证明任务完成或已经取消。
 
 310P 的 Hermes 会话和 pipeline 必须位于同一块 310P，不能从 PC 本地另起会话跨机绕过 Gateway。
 
@@ -357,7 +385,6 @@ supervised-direct `pick_action_client`，也不直连 `/manipulation/execute_pic
 在新终端加载项目和 ROS 环境。PC 依次执行：
 
 ```bash
-cd ~/IB_Robot
 source .shrc_local
 export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
 source install/setup.bash
@@ -371,7 +398,6 @@ robot-skill --config-name lekiwi_handeye_realsense_grasp_pc validate pick_object
 310P 在板端依次执行：
 
 ```bash
-cd /root/IB_Robot
 source .shrc_local
 export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
 source install/setup.bash
@@ -392,7 +418,6 @@ robot-skill --config-name lekiwi_handeye_realsense_grasp validate pick_object \
 PC：
 
 ```bash
-cd ~/IB_Robot
 source .shrc_local
 export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
 source install/setup.bash
@@ -404,7 +429,6 @@ robot-skill --config-name lekiwi_handeye_realsense_grasp_pc execute pick_object 
 310P：
 
 ```bash
-cd /root/IB_Robot
 source .shrc_local
 export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
 source install/setup.bash
@@ -424,10 +448,16 @@ task ID。
 默认使用 Gateway 当前 task budget。只有需要更短预算时才添加 `--timeout-sec SEC`；不要超过 Gateway budget。
 每次执行必须使用新的 task ID。失败、超时或未收到 terminal result 时不得自动重试。
 
-需要取消当前任务时，在另一终端使用相同 task ID：
+需要取消当前任务时，在另一终端使用相同 task ID。PC：
 
 ```bash
 robot-skill --config-name lekiwi_handeye_realsense_grasp_pc cancel --task-id pick-marker-pc-001
+```
+
+310P：
+
+```bash
+robot-skill --config-name lekiwi_handeye_realsense_grasp cancel --task-id pick-marker-310p-001
 ```
 
 取消请求成功不等于机械臂已经停止，必须等待该任务进入 terminal 状态。
