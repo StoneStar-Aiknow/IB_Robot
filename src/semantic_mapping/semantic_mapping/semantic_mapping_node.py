@@ -35,7 +35,14 @@ from ibrobot_msgs.srv import (
     ResolveSemanticTarget,
 )
 
-from .association import LifecycleEvidence, SemanticObservation, SemanticTrack, SemanticTracker
+from .association import (
+    LifecycleEvidence,
+    SemanticObservation,
+    SemanticTrack,
+    SemanticTracker,
+    has_manual_label,
+    is_manually_actionable,
+)
 from .database import MappingRunRecord, SemanticMapDatabase, SemanticMapManifest
 from .frame_processor import MaskCandidate, filter_masks, prepare_frame
 from .geometry import (
@@ -112,9 +119,6 @@ class SemanticMappingNode(Node):
         self.min_points = int(self.get_parameter("min_points").value)
         self.depth_trunc_m = float(self.get_parameter("depth_trunc_m").value)
         self._label_aliases = parse_label_aliases(str(self.get_parameter("allowed_label_aliases_json").value))
-        self._actionable_labels = {
-            str(label).strip().casefold() for label in (self.get_parameter("actionable_labels").value or ())
-        }
         self.tf_timeout = Duration(seconds=float(self.get_parameter("tf_timeout_sec").value))
         self.mapping_backend = validate_mapping_backend(self.get_parameter("mapping_backend").value)
         self._last_validated_tf_stamp_ns = 0
@@ -458,7 +462,6 @@ class SemanticMappingNode(Node):
         for name, value in defaults.items():
             self.declare_parameter(name, value)
         self.declare_parameter("excluded_labels", Parameter.Type.STRING_ARRAY)
-        self.declare_parameter("actionable_labels", Parameter.Type.STRING_ARRAY)
         self._last_processed_ns = 0
 
     def _synchronized_callback(self, rgb_msg: Image, depth_msg: Image, info_msg: CameraInfo) -> None:
@@ -726,7 +729,12 @@ class SemanticMappingNode(Node):
             max_overlap_ratio=float(self.get_parameter("max_mask_overlap_ratio").value),
             depth_trunc_m=self.depth_trunc_m,
         )
-        detections = [detections[index] for index in accepted_indices]
+        # Unique-item ordering: largest masks claim their tracks first so a
+        # whole-object mask is preferred over any part mask of the same item.
+        detections = sorted(
+            (detections[index] for index in accepted_indices),
+            key=lambda detection: -int(np.count_nonzero(detection.mask)),
+        )
         self.get_logger().debug(
             "Mask filtering: "
             f"input={diagnostics.input_count}, accepted={diagnostics.accepted_count}, "
@@ -799,7 +807,7 @@ class SemanticMappingNode(Node):
                 embedding=embedding,
                 attributes={
                     "source_frame": camera_frame,
-                    "semantic_actionable": detection.label.casefold() in self._actionable_labels,
+                    "semantic_actionable": False,
                 },
                 canonical_label=detection.label.casefold(),
                 map_version=self._manifest.geometry_map_hash,
@@ -959,7 +967,7 @@ class SemanticMappingNode(Node):
             if observation.stamp_ns < self._semantic_commit_watermark_ns:
                 return None
             track = self._tracker.update(observation, excluded_object_ids=matched_object_ids)
-            track.attributes["semantic_actionable"] = track.label.casefold() in self._actionable_labels
+            track.attributes["semantic_actionable"] = is_manually_actionable(track)
             matched_object_ids.add(track.object_id)
             self._database.upsert(track, observation)
             self._semantic_commit_watermark_ns = max(self._semantic_commit_watermark_ns, observation.stamp_ns)
@@ -1181,13 +1189,14 @@ class SemanticMappingNode(Node):
             )
         with self._state_lock:
             captions = {}
+            labeled_tracks = [track for track in self._tracker.tracks.values() if has_manual_label(track)]
             if request.query_text:
-                for track in self._tracker.tracks.values():
+                for track in labeled_tracks:
                     caption = self._database.get_caption(track.object_id)
                     if caption is not None and caption.success:
                         captions[track.object_id] = caption.caption
             ranked = query_tracks(
-                list(self._tracker.tracks.values()),
+                labeled_tracks,
                 ObjectQuery(
                     object_ids=frozenset(request.object_ids),
                     canonical_label=request.label,
@@ -1319,7 +1328,8 @@ class SemanticMappingNode(Node):
 
     def _publish_map(self, stamp_ns: int | None = None) -> None:
         with self._state_lock:
-            self._map_pub.publish(self._map_message(list(self._tracker.tracks.values()), stamp_ns))
+            tracks = [track for track in self._tracker.tracks.values() if has_manual_label(track)]
+        self._map_pub.publish(self._map_message(tracks, stamp_ns))
 
     def _map_message(self, tracks, stamp_ns: int | None = None) -> SemanticObject3DArray:
         stamp = _time_message(self.get_clock().now().nanoseconds if stamp_ns is None else stamp_ns)
@@ -1338,7 +1348,7 @@ class SemanticMappingNode(Node):
         pose.pose.covariance[7] = covariance
         pose.pose.covariance[14] = covariance
         caption_record = self._database.get_caption(track.object_id)
-        semantic_actionable = track.label.casefold() in self._actionable_labels
+        semantic_actionable = is_manually_actionable(track)
         action_ready = track.active and semantic_actionable
         return SemanticObject3D(
             object_id=track.object_id,

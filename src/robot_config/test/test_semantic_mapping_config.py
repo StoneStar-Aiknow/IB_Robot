@@ -70,8 +70,8 @@ def test_disabled_semantic_mapping_contract_is_preserved() -> None:
     assert "sky" in config.semantic_mapping.labels["excluded_labels"]
     assert "plane" in config.semantic_mapping.labels["excluded_labels"]
     assert config.semantic_mapping.filtering["max_object_extent_m"] == 0.65
-    assert "paper box" in config.semantic_mapping.labels["allowed_labels"]["cardboard box"]
-    assert config.semantic_mapping.labels["actionable_labels"][:2] == ["banana", "cucumber"]
+    assert "allowed_labels" not in config.semantic_mapping.labels
+    assert "actionable_labels" not in config.semantic_mapping.labels
     assert config.semantic_mapping.migration["grounded_sam2_node"] == "compatibility"
 
 

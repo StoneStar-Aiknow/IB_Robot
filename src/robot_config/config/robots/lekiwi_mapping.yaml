@@ -219,30 +219,9 @@ robot:
       move_confirmations: 2
     labels:
       min_confidence: 0.2
-      max_candidates_per_mask: 20
+      max_candidates_per_mask: 5
       recurrence_count_ratio: 3.0
       high_confidence_override_margin: 0.08
-      allowed_labels:
-        banana: []
-        cucumber: []
-        cardboard box: [cardboard, carton, carton box, paper box]
-        box: []
-        crumpled paper: [paper ball]
-        marker: [marker pen]
-        chair: []
-        wheel: [tire]
-        robot arm: [robotic arm, manipulator]
-        table: [desk]
-        table leg: [desk leg]
-        drawer cabinet: [drawer, cabinet, file cabinet]
-        shelf: [shelving, rack, bookshelf]
-      actionable_labels:
-        - banana
-        - cucumber
-        - cardboard box
-        - box
-        - crumpled paper
-        - marker
       excluded_labels:
         # Scene background, generic concepts, shapes, and action-like RAM++ noise.
         - animal

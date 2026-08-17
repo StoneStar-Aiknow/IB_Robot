@@ -17,7 +17,7 @@ def _latest_run_id(connection: sqlite3.Connection) -> str:
     return str(row[0])
 
 
-def _load_results(database_path: Path, run_id: str | None) -> tuple[str, dict[int, list[dict]]]:
+def _load_results(database_path: Path, run_id: str | None) -> tuple[str, dict[int, list[dict]], dict[str, str]]:
     connection = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
@@ -33,10 +33,19 @@ def _load_results(database_path: Path, run_id: str | None) -> tuple[str, dict[in
             FROM semantic_observations
             JOIN semantic_objects USING (object_id)
             WHERE mapping_run_id = ?
+              AND json_type(semantic_objects.attributes_json, '$.manual_label') = 'object'
             ORDER BY source_stamp_ns, observation_id
             """,
             (selected_run,),
         ).fetchall()
+        canonical_of: dict[str, str] = {}
+        for row in connection.execute("SELECT object_id, attributes_json FROM semantic_objects").fetchall():
+            attributes = json.loads(row["attributes_json"])
+            manual = attributes.get("manual_label", {})
+            if isinstance(manual, dict):
+                for merged in manual.get("merged_object_ids", ()) or ():
+                    canonical_of[str(merged)] = str(row["object_id"])
+                canonical_of[str(row["object_id"])] = str(row["object_id"])
     finally:
         connection.close()
 
@@ -55,7 +64,7 @@ def _load_results(database_path: Path, run_id: str | None) -> tuple[str, dict[in
                 "source": source,
             }
         )
-    return selected_run, dict(by_stamp)
+    return selected_run, dict(by_stamp), canonical_of
 
 
 def _draw_label(image: np.ndarray, bbox: list[float], text: str, color: tuple[int, int, int], row: int) -> None:
@@ -82,6 +91,33 @@ def _draw_label(image: np.ndarray, bbox: list[float], text: str, color: tuple[in
     cv2.putText(image, text, (text_x + 3, text_y), font, scale, color, thickness, cv2.LINE_AA)
 
 
+def _draw_index_badge(image: np.ndarray, bbox: list[float], badge: str, color: tuple[int, int, int]) -> None:
+    """Draw the mask index inside the bbox so on-image masks pair with their label lines."""
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = [int(round(value)) for value in bbox]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(width - 1, x2), min(height - 1, y2)
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.62
+    thickness = 2
+    (text_width, text_height), baseline = cv2.getTextSize(badge, font, scale, thickness)
+    top_left = (x1 + 3, y1 + 3)
+    bottom_right = (min(width - 1, x1 + 3 + text_width + 8), min(height - 1, y1 + 3 + text_height + baseline + 8))
+    if bottom_right[1] - top_left[1] > y2 - y1 or bottom_right[0] - top_left[0] > x2 - x1:
+        scale, thickness = 0.45, 1
+        (text_width, text_height), baseline = cv2.getTextSize(badge, font, scale, thickness)
+        bottom_right = (
+            min(width - 1, x1 + 3 + text_width + 6),
+            min(height - 1, y1 + 3 + text_height + baseline + 6),
+        )
+        if bottom_right[1] - top_left[1] > y2 - y1 or bottom_right[0] - top_left[0] > x2 - x1:
+            return
+    cv2.rectangle(image, top_left, bottom_right, (20, 20, 20), cv2.FILLED)
+    cv2.putText(image, badge, (top_left[0] + 4, bottom_right[1] - 5), font, scale, color, thickness, cv2.LINE_AA)
+
+
 def render_final_labels(
     diagnostics_dir: str | Path,
     database_path: str | Path,
@@ -97,7 +133,7 @@ def render_final_labels(
     if not frame_dir.is_dir():
         raise FileNotFoundError(f"diagnostic frame directory does not exist: {frame_dir}")
 
-    selected_run, observations = _load_results(database, run_id)
+    selected_run, observations, canonical_of = _load_results(database, run_id)
     output_rgb = root / "final_labels"
     output_siglip = root / "final_labels_siglip"
     output_rgb.mkdir(parents=True, exist_ok=True)
@@ -129,15 +165,22 @@ def render_final_labels(
             siglip = rgb.copy()
 
         frame_observations = observations.get(stamp_ns, [])
-        accepted_masks = [int(index) for index in frame.get("accepted_masks", [])]
         masks = frame.get("masks", {})
+        candidates_by_object: dict[str, list[tuple[int, dict]]] = defaultdict(list)
+        for mask_index, mask in masks.items():
+            if not isinstance(mask, dict) or "bbox" not in mask:
+                continue
+            object_id = canonical_of.get(str(mask.get("object_id", "")), "")
+            if object_id:
+                candidates_by_object[object_id].append((int(mask_index), mask))
         if frame_observations:
             summary["frames_with_tracks"] += 1
-        for row, (mask_index, observation) in enumerate(zip(accepted_masks, frame_observations, strict=False)):
-            mask = masks.get(str(mask_index))
-            if not isinstance(mask, dict) or "bbox" not in mask:
+        for observation in frame_observations:
+            candidates = candidates_by_object.get(observation["object_id"], [])
+            if not candidates:
                 summary["unmatched_observations"] += 1
                 continue
+            mask_index, mask = max(candidates, key=lambda item: int(item[1].get("area", 0)))
             changed = observation["observed_label"].casefold() != observation["final_label"].casefold()
             source = observation["source"] if changed else "unchanged"
             color = colors[source]
@@ -146,12 +189,12 @@ def render_final_labels(
                 f" -> {observation['final_label']}:{observation['final_confidence']:.2f}"
                 f" [{source}] #{observation['object_id'][:8]}"
             )
-            _draw_label(rgb, mask["bbox"], text, color, row)
-            _draw_label(siglip, mask["bbox"], text, color, row)
+            _draw_label(rgb, mask["bbox"], text, color, 0)
+            _draw_label(siglip, mask["bbox"], text, color, 0)
+            _draw_index_badge(rgb, mask["bbox"], f"M{mask_index}", color)
+            _draw_index_badge(siglip, mask["bbox"], f"M{mask_index}", color)
             summary["annotations"] += 1
             summary["cloud_refined_annotations" if source == "cloud" else f"{source}_annotations"] += 1
-        if len(frame_observations) > len(accepted_masks):
-            summary["unmatched_observations"] += len(frame_observations) - len(accepted_masks)
         cv2.imwrite(str(output_rgb / f"{frame_path.stem}.jpg"), rgb)
         cv2.imwrite(str(output_siglip / f"{frame_path.stem}.jpg"), siglip)
         summary["frames_rendered"] += 1

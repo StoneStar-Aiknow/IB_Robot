@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .association import SemanticTrack
+from .association import SemanticTrack, has_manual_label
 from .representative_view import RepresentativeView
 
 _LABEL_PATTERN = re.compile(r"^[a-z0-9][a-z0-9 _-]{0,63}$")
@@ -174,6 +174,8 @@ class CloudLabelRefiner:
 
 def apply_refinement(track: SemanticTrack, result: LabelRefinementResult) -> None:
     """Apply an accepted refinement while retaining its auditable provenance."""
+    if has_manual_label(track):
+        raise ValueError("manual track labels cannot be replaced by automatic refinement")
     previous_label = track.label
     track.label = result.label
     track.canonical_label = result.label

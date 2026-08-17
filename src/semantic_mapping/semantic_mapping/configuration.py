@@ -98,7 +98,6 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
         "label_recurrence_count_ratio": labels.get("recurrence_count_ratio", 3.0),
         "label_high_confidence_override_margin": labels.get("high_confidence_override_margin", 0.08),
         "allowed_label_aliases_json": json.dumps(labels.get("allowed_labels", {}), sort_keys=True),
-        "actionable_labels": labels.get("actionable_labels", []),
         "excluded_labels": labels["excluded_labels"],
         "label_refinement_enabled": label_refinement["enabled"],
         "label_refinement_model": label_refinement["model"],

@@ -20,7 +20,7 @@ from rclpy.time import Time
 from ibrobot_msgs.srv import EncodeEmbeddings, GenerateMasks, RecognizeTags
 
 from .artifact_export import SemanticArtifactExporter
-from .association import SemanticObservation, SemanticTracker
+from .association import SemanticObservation, SemanticTracker, is_manually_actionable
 from .database import MappingRunRecord, SemanticMapDatabase
 from .frame_processor import MaskCandidate, filter_masks, prepare_frame
 from .geometry import (
@@ -113,7 +113,6 @@ class OfflineMappingNode(Node):
         for name, default in defaults.items():
             self.declare_parameter(name, default)
         self.declare_parameter("excluded_labels", Parameter.Type.STRING_ARRAY)
-        self.declare_parameter("actionable_labels", Parameter.Type.STRING_ARRAY)
 
         bag_path = self.get_parameter("bag_path").value
         if not bag_path:
@@ -166,9 +165,6 @@ class OfflineMappingNode(Node):
             raise ValueError("frame_sampling must be 'sequential' or 'uniform'")
         self._bridge = CvBridge()
         self._label_aliases = parse_label_aliases(str(self.get_parameter("allowed_label_aliases_json").value))
-        self._actionable_labels = {
-            str(label).strip().casefold() for label in (self.get_parameter("actionable_labels").value or ())
-        }
         self._tracker = SemanticTracker(
             association_distance_m=float(self.get_parameter("association_distance_m").value),
             embedding_similarity_threshold=float(self.get_parameter("embedding_similarity_threshold").value),
@@ -382,9 +378,15 @@ class OfflineMappingNode(Node):
         matched_ids = set()
         ground_accepted = []
         track_assignments = {}
+        # Unique-item ordering: process masks largest-first so the whole-object
+        # mask claims its track before any part mask of the same physical item.
+        decoded_masks = {
+            index: self._bridge.imgmsg_to_cv2(detections[index].mask, desired_encoding="mono8") for index in accepted
+        }
+        accepted = sorted(accepted, key=lambda index: -int(np.count_nonzero(decoded_masks[index])))
         for index in accepted:
             detection = detections[index]
-            mask = self._bridge.imgmsg_to_cv2(detection.mask, desired_encoding="mono8")
+            mask = decoded_masks[index]
             geometry = project_masked_depth(
                 mask,
                 frame.depth,
@@ -431,7 +433,7 @@ class OfflineMappingNode(Node):
                 attributes={
                     "source_frame": frame.camera_frame,
                     "offline": True,
-                    "semantic_actionable": label.casefold() in self._actionable_labels,
+                    "semantic_actionable": False,
                 },
                 label_candidates=ram_mask_candidates(
                     index,
@@ -445,7 +447,7 @@ class OfflineMappingNode(Node):
 
             def commit(observation=observation):
                 track = self._tracker.update(observation, excluded_object_ids=matched_ids)
-                track.attributes["semantic_actionable"] = track.label.casefold() in self._actionable_labels
+                track.attributes["semantic_actionable"] = is_manually_actionable(track)
                 matched_ids.add(track.object_id)
                 self._database.upsert(track, observation)
                 return track
