@@ -34,7 +34,7 @@ from .offline_bag import OfflineBagSource, OfflineTopicContract, RosbagReader, c
 from .pipeline import SerializedCommitter
 from .representative_view import OptionalCaptioner, RepresentativeViewStore
 from .runtime_identity import MappingRunPinMismatch, SemanticIdentity
-from .service_pipeline import ServiceFramePipeline, ram_mask_candidates, select_ram_label
+from .service_pipeline import ServiceFramePipeline, parse_label_aliases, ram_mask_candidates, select_ram_label
 
 
 class OfflineMappingNode(Node):
@@ -82,6 +82,7 @@ class OfflineMappingNode(Node):
             "ground_max_bottom_clearance_m": 0.15,
             "ground_max_object_height_m": 0.75,
             "ground_max_footprint_m": 1.2,
+            "max_object_extent_m": 0.65,
             "max_object_distance_m": 2.5,
             "association_distance_m": 0.45,
             "association_max_size_ratio": 4.0,
@@ -90,6 +91,9 @@ class OfflineMappingNode(Node):
             "max_label_candidates_per_mask": 5,
             "association_position_weight": 0.55,
             "label_switch_confidence_margin": 0.05,
+            "label_recurrence_count_ratio": 3.0,
+            "label_high_confidence_override_margin": 0.08,
+            "allowed_label_aliases_json": "",
             "caption_enabled": False,
             "caption_model_identity": "",
             "caption_prompt": "Describe this object concisely.",
@@ -109,6 +113,7 @@ class OfflineMappingNode(Node):
         for name, default in defaults.items():
             self.declare_parameter(name, default)
         self.declare_parameter("excluded_labels", Parameter.Type.STRING_ARRAY)
+        self.declare_parameter("actionable_labels", Parameter.Type.STRING_ARRAY)
 
         bag_path = self.get_parameter("bag_path").value
         if not bag_path:
@@ -160,12 +165,20 @@ class OfflineMappingNode(Node):
         else:
             raise ValueError("frame_sampling must be 'sequential' or 'uniform'")
         self._bridge = CvBridge()
+        self._label_aliases = parse_label_aliases(str(self.get_parameter("allowed_label_aliases_json").value))
+        self._actionable_labels = {
+            str(label).strip().casefold() for label in (self.get_parameter("actionable_labels").value or ())
+        }
         self._tracker = SemanticTracker(
             association_distance_m=float(self.get_parameter("association_distance_m").value),
             embedding_similarity_threshold=float(self.get_parameter("embedding_similarity_threshold").value),
             position_weight=float(self.get_parameter("association_position_weight").value),
             max_size_ratio=float(self.get_parameter("association_max_size_ratio").value),
             label_switch_confidence_margin=float(self.get_parameter("label_switch_confidence_margin").value),
+            label_recurrence_count_ratio=float(self.get_parameter("label_recurrence_count_ratio").value),
+            label_high_confidence_override_margin=float(
+                self.get_parameter("label_high_confidence_override_margin").value
+            ),
         )
         self._database = SemanticMapDatabase(self.get_parameter("database_path").value, self.manifest)
         now_ns = time.time_ns()
@@ -283,6 +296,7 @@ class OfflineMappingNode(Node):
                 max_bottom_clearance_m=float(self.get_parameter("ground_max_bottom_clearance_m").value),
                 max_object_height_m=float(self.get_parameter("ground_max_object_height_m").value),
                 max_footprint_m=float(self.get_parameter("ground_max_footprint_m").value),
+                max_object_extent_m=float(self.get_parameter("max_object_extent_m").value),
                 max_horizontal_distance_m=float(self.get_parameter("max_object_distance_m").value),
             )
 
@@ -393,7 +407,10 @@ class OfflineMappingNode(Node):
                 result.mask_tag_scores,
                 min_confidence,
                 excluded_labels,
+                self._label_aliases,
             )
+            if not label:
+                continue
             observation = SemanticObservation(
                 label=label,
                 canonical_label=label.casefold(),
@@ -411,18 +428,24 @@ class OfflineMappingNode(Node):
                 },
                 deployment_provenance=deployment_provenance,
                 mapping_run_id=self._run.run_id,
-                attributes={"source_frame": frame.camera_frame, "offline": True},
+                attributes={
+                    "source_frame": frame.camera_frame,
+                    "offline": True,
+                    "semantic_actionable": label.casefold() in self._actionable_labels,
+                },
                 label_candidates=ram_mask_candidates(
                     index,
                     result.mask_tag_counts,
                     result.mask_tags,
                     result.mask_tag_scores,
                     excluded_labels,
+                    self._label_aliases,
                 ),
             )
 
             def commit(observation=observation):
                 track = self._tracker.update(observation, excluded_object_ids=matched_ids)
+                track.attributes["semantic_actionable"] = track.label.casefold() in self._actionable_labels
                 matched_ids.add(track.object_id)
                 self._database.upsert(track, observation)
                 return track
@@ -549,6 +572,7 @@ class OfflineMappingNode(Node):
                 result.mask_tags,
                 result.mask_tag_scores,
                 self.get_parameter("excluded_labels").value or (),
+                self._label_aliases,
             )
             label = candidates[0][0] if candidates else "unassigned"
             score = candidates[0][1] if candidates else 0.0
@@ -630,6 +654,7 @@ class OfflineMappingNode(Node):
                                     result.mask_tags,
                                     result.mask_tag_scores,
                                     self.get_parameter("excluded_labels").value or (),
+                                    self._label_aliases,
                                 )
                             ],
                         }

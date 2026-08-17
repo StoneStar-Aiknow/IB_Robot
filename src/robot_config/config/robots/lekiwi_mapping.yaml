@@ -196,6 +196,8 @@ robot:
       ground_max_bottom_clearance_m: 0.15
       ground_max_object_height_m: 0.75
       ground_max_footprint_m: 1.2
+      # Robust 3D AABB edge limit for rejecting scene-scale SAM masks.
+      max_object_extent_m: 0.65
       max_object_distance_m: 2.5
     queue:
       sync_queue_size: 10
@@ -217,13 +219,39 @@ robot:
       move_confirmations: 2
     labels:
       min_confidence: 0.2
-      max_candidates_per_mask: 5
+      max_candidates_per_mask: 20
+      recurrence_count_ratio: 3.0
+      high_confidence_override_margin: 0.08
+      allowed_labels:
+        banana: []
+        cucumber: []
+        cardboard box: [cardboard, carton, carton box, paper box]
+        box: []
+        crumpled paper: [paper ball]
+        marker: [marker pen]
+        chair: []
+        wheel: [tire]
+        robot arm: [robotic arm, manipulator]
+        table: [desk]
+        table leg: [desk leg]
+        drawer cabinet: [drawer, cabinet, file cabinet]
+        shelf: [shelving, rack, bookshelf]
+      actionable_labels:
+        - banana
+        - cucumber
+        - cardboard box
+        - box
+        - crumpled paper
+        - marker
       excluded_labels:
         # Scene background, generic concepts, shapes, and action-like RAM++ noise.
         - animal
         - attach
         - bite
+        - bomb
+        - briefcase
         - building
+        - candle
         - cloud
         - cloudy
         - cloth
@@ -235,36 +263,44 @@ robot:
         - drive
         - eagle
         - face
+        - fighter jet
         - fly
         - floor
         - food
         - foot
         - fruit
+        - gun
         - hang
         - hand
         - hay
         - hot
         - image
         - iceberg
+        - jet
         - line
         - liquid
         - man
+        - missile
         - move
         - oval
         - person
         - photo
         - polygon
         - plastic
+        - plane
         - pole
         - rectangle
         - reflection
         - room
         - shape
         - sheet
+        - sign
         - sky
         - square
         - stack
+        - stop sign
         - stop light
+        - street sign
         - tear
         - tie
         - toothpaste
@@ -292,6 +328,13 @@ robot:
       scan_profile: fixed_d435_base_scan
       stand_off_distance_m: 0.8
       clearance_m: 0.2
+      track_state_updates_enabled: true
+      track_state_topic: /object_tracker/track_state
+      track_state_frame: odom
+      track_state_max_age_sec: 1.0
+      track_state_max_covariance_m2: 0.25
+      track_state_confirmation_gap_sec: 1.0
+      track_state_persist_interval_sec: 1.0
       footprint_ready_topic: /navigation/footprint_ready
       obstacle_map_ready_topic: /navigation/obstacle_map_ready
       reachability_ready_topic: /navigation/reachability_ready

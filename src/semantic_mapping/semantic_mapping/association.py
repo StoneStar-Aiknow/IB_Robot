@@ -15,12 +15,12 @@ LOST = "lost"
 ACTION_READY_STATES = {OBSERVED, MOVED}
 LIFECYCLE_STATES = {FROZEN, OBSERVED, STALE, MISSING, MOVED, LOST}
 _ALLOWED_TRANSITIONS = {
-    FROZEN: {OBSERVED},
+    FROZEN: {OBSERVED, MOVED},
     OBSERVED: {OBSERVED, MOVED, STALE, MISSING},
-    STALE: {OBSERVED, LOST},
-    MISSING: {MOVED, LOST},
-    MOVED: {OBSERVED},
-    LOST: {OBSERVED},
+    STALE: {OBSERVED, MOVED, LOST},
+    MISSING: {OBSERVED, MOVED, LOST},
+    MOVED: {MOVED, OBSERVED, STALE},
+    LOST: {OBSERVED, MOVED},
 }
 
 
@@ -109,6 +109,8 @@ class SemanticTracker:
         position_weight: float = 0.55,
         max_size_ratio: float = 4.0,
         label_switch_confidence_margin: float = 0.05,
+        label_recurrence_count_ratio: float = 3.0,
+        label_high_confidence_override_margin: float = 0.08,
         stale_after_sec: float = 10.0,
     ):
         self.association_distance_m = association_distance_m
@@ -116,6 +118,8 @@ class SemanticTracker:
         self.position_weight = position_weight
         self.max_size_ratio = max_size_ratio
         self.label_switch_confidence_margin = label_switch_confidence_margin
+        self.label_recurrence_count_ratio = label_recurrence_count_ratio
+        self.label_high_confidence_override_margin = label_high_confidence_override_margin
         self.stale_after_ns = int(stale_after_sec * 1e9)
         self.tracks: dict[str, SemanticTrack] = {}
 
@@ -203,6 +207,25 @@ class SemanticTracker:
                 < float(label_max_confidence[current_label]) + self.label_switch_confidence_margin
             ):
                 winner = current_label
+            recurring_label = max(
+                label_evidence,
+                key=lambda label: (
+                    int(label_evidence[label]),
+                    float(label_score_evidence.get(label, 0.0)),
+                    float(label_max_confidence.get(label, 0.0)),
+                    label,
+                ),
+            )
+            recurring_count = int(label_evidence[recurring_label])
+            winner_count = int(label_evidence[winner])
+            if (
+                recurring_label != winner
+                and recurring_count >= 3
+                and recurring_count >= self.label_recurrence_count_ratio * winner_count
+                and float(label_max_confidence[winner])
+                < float(label_max_confidence[recurring_label]) + self.label_high_confidence_override_margin
+            ):
+                winner = recurring_label
             match.label = winner
             match.canonical_label = winner
             match.confidence = float(label_score_evidence[winner]) / int(label_evidence[winner])
@@ -263,7 +286,7 @@ class SemanticTracker:
         now_ns = time.time_ns() if now_ns is None else now_ns
         changed = False
         for track in self.tracks.values():
-            if track.state == OBSERVED and now_ns - track.last_seen_ns > self.stale_after_ns:
+            if track.state in {OBSERVED, MOVED} and now_ns - track.last_seen_ns > self.stale_after_ns:
                 self.transition(
                     track.object_id,
                     STALE,
@@ -304,8 +327,12 @@ class SemanticTracker:
         return self.transition(object_id, MISSING, evidence)
 
     def mark_moved(self, object_id: str, position: np.ndarray, evidence: LifecycleEvidence) -> SemanticTrack:
+        previous_state = self.tracks[object_id].state
+        previous_position = self.tracks[object_id].position.copy()
         track = self.transition(object_id, MOVED, evidence)
         track.position = np.asarray(position, dtype=np.float64)
+        if previous_state == MOVED and not np.allclose(previous_position, track.position):
+            track.object_version += 1
         return track
 
     def mark_lost(self, object_id: str, evidence: LifecycleEvidence) -> SemanticTrack:

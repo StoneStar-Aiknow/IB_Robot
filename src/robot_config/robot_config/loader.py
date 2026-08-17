@@ -403,6 +403,7 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
         "ground_max_bottom_clearance_m",
         "ground_max_object_height_m",
         "ground_max_footprint_m",
+        "max_object_extent_m",
         "max_object_distance_m",
     ):
         if key in filtering:
@@ -437,6 +438,38 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
     labels_path = "semantic_mapping.labels"
     _unit_interval(labels, "min_confidence", labels_path, errors)
     _positive_integer(labels, "max_candidates_per_mask", labels_path, errors)
+    if "recurrence_count_ratio" in labels:
+        _positive_number(labels, "recurrence_count_ratio", labels_path, errors)
+        recurrence_ratio = labels.get("recurrence_count_ratio")
+        if _is_finite_number(recurrence_ratio) and float(recurrence_ratio) < 1.0:
+            errors.append(f"{labels_path}.recurrence_count_ratio must be >= 1.0")
+    if "high_confidence_override_margin" in labels:
+        _unit_interval(labels, "high_confidence_override_margin", labels_path, errors)
+    allowed_labels = labels.get("allowed_labels", {})
+    if not isinstance(allowed_labels, dict) or any(
+        not isinstance(canonical, str)
+        or not canonical.strip()
+        or not isinstance(aliases, list)
+        or any(not isinstance(alias, str) or not alias.strip() for alias in aliases)
+        for canonical, aliases in (allowed_labels.items() if isinstance(allowed_labels, dict) else ())
+    ):
+        errors.append(f"{labels_path}.allowed_labels must map non-empty canonical labels to string lists")
+        allowed_labels = {}
+    canonical_labels = {str(label).strip().casefold() for label in allowed_labels}
+    seen_aliases = {}
+    for canonical, aliases in allowed_labels.items():
+        for alias in [canonical, *aliases]:
+            normalized = alias.strip().casefold()
+            previous = seen_aliases.setdefault(normalized, canonical.strip().casefold())
+            if previous != canonical.strip().casefold():
+                errors.append(f"{labels_path}.allowed_labels alias {normalized!r} maps to multiple labels")
+    actionable_labels = labels.get("actionable_labels", [])
+    if not isinstance(actionable_labels, list) or any(
+        not isinstance(label, str) or not label.strip() for label in actionable_labels
+    ):
+        errors.append(f"{labels_path}.actionable_labels must be a list of non-empty strings")
+    elif not {label.strip().casefold() for label in actionable_labels} <= canonical_labels:
+        errors.append(f"{labels_path}.actionable_labels must reference canonical allowed_labels")
     excluded_labels = labels.get("excluded_labels")
     if not isinstance(excluded_labels, list) or any(
         not isinstance(label, str) or not label.strip() for label in excluded_labels
@@ -457,13 +490,24 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
     target_watch = sections["target_watch"]
     target_watch_path = "semantic_mapping.target_watch"
     _positive_integer(target_watch, "max_attempts", target_watch_path, errors)
-    for key in ("stand_off_distance_m", "clearance_m"):
+    if not isinstance(target_watch.get("track_state_updates_enabled"), bool):
+        errors.append(f"{target_watch_path}.track_state_updates_enabled must be a boolean")
+    for key in (
+        "stand_off_distance_m",
+        "clearance_m",
+        "track_state_max_age_sec",
+        "track_state_max_covariance_m2",
+        "track_state_confirmation_gap_sec",
+        "track_state_persist_interval_sec",
+    ):
         _positive_number(target_watch, key, target_watch_path, errors)
     for key in (
         "scan_profile",
         "footprint_ready_topic",
         "obstacle_map_ready_topic",
         "reachability_ready_topic",
+        "track_state_topic",
+        "track_state_frame",
     ):
         _required_string(target_watch, key, target_watch_path, errors)
 

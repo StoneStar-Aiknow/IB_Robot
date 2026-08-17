@@ -1,9 +1,17 @@
 from concurrent.futures import Future
 from types import SimpleNamespace
 
+import pytest
 from sensor_msgs.msg import Image
 
-from semantic_mapping.service_pipeline import ServiceFramePipeline, ram_mask_candidates, select_ram_label, split_batches
+from semantic_mapping.service_pipeline import (
+    ServiceFramePipeline,
+    canonicalize_label,
+    parse_label_aliases,
+    ram_mask_candidates,
+    select_ram_label,
+    split_batches,
+)
 
 
 class _Client:
@@ -260,3 +268,41 @@ def test_select_ram_label_skips_scene_exclusions():
         [0.95, 0.9, 0.82],
         ["animal", "image"],
     ) == (("banana", 0.82),)
+
+
+def test_allowed_label_aliases_canonicalize_deduplicate_and_reject_unknowns():
+    aliases = parse_label_aliases('{"cardboard box": ["carton", "paper box"], "crumpled paper": ["paper ball"]}')
+
+    assert ram_mask_candidates(
+        0,
+        [4],
+        ["carton", "paper box", "plane", "paper ball"],
+        [0.8, 0.9, 0.99, 0.7],
+        label_aliases=aliases,
+    ) == (("cardboard box", 0.9), ("crumpled paper", 0.7))
+    assert select_ram_label(
+        0,
+        [2],
+        ["plane", "gun"],
+        [0.99, 0.98],
+        0.2,
+        label_aliases=aliases,
+    ) == ("", 0.0)
+
+
+def test_allowed_label_aliases_reject_ambiguous_aliases():
+    with pytest.raises(ValueError, match="multiple canonical labels"):
+        parse_label_aliases('{"box": ["carton"], "cardboard box": ["carton"]}')
+
+
+def test_allowed_label_aliases_reject_non_string_aliases():
+    with pytest.raises(ValueError, match="non-empty labels to lists"):
+        parse_label_aliases('{"box": [42]}')
+
+
+def test_canonicalize_label_rejects_unknown_only_when_allowlist_is_configured():
+    aliases = parse_label_aliases('{"cardboard box": ["carton"]}')
+
+    assert canonicalize_label("Carton", aliases) == "cardboard box"
+    assert canonicalize_label("plane", aliases) == ""
+    assert canonicalize_label("Plane", {}) == "plane"

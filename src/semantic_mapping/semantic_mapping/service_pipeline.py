@@ -1,5 +1,6 @@
 """Non-blocking SAM2/RAM++ fan-out followed by bounded SigLIP2 batches."""
 
+import json
 import threading
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -8,24 +9,63 @@ from ibrobot_msgs.srv import EncodeEmbeddings, GenerateMasks, RecognizeTags
 from perception_service.model_contracts import MAX_MASK_BATCH
 
 
+def parse_label_aliases(value: str) -> dict[str, str]:
+    """Parse canonical-to-alias JSON into an alias-to-canonical lookup."""
+    if not value:
+        return {}
+    data = json.loads(value)
+    if not isinstance(data, dict):
+        raise ValueError("allowed label aliases must be a JSON object")
+    aliases = {}
+    for canonical, values in data.items():
+        if (
+            not isinstance(canonical, str)
+            or not canonical.strip()
+            or not isinstance(values, list)
+            or any(not isinstance(alias, str) or not alias.strip() for alias in values)
+        ):
+            raise ValueError("allowed label aliases must map non-empty labels to lists")
+        normalized_canonical = canonical.strip().casefold()
+        for alias in [canonical, *values]:
+            normalized_alias = alias.strip().casefold()
+            previous = aliases.setdefault(normalized_alias, normalized_canonical)
+            if previous != normalized_canonical:
+                raise ValueError(f"label alias {normalized_alias!r} maps to multiple canonical labels")
+    return aliases
+
+
+def canonicalize_label(label: str, label_aliases: dict[str, str]) -> str:
+    """Return a canonical label, or empty when a configured allowlist rejects it."""
+    normalized = str(label).strip().casefold()
+    if not label_aliases:
+        return normalized
+    return label_aliases.get(normalized, "")
+
+
 def ram_mask_candidates(
     mask_index: int,
     mask_tag_counts,
     mask_tags,
     mask_scores,
     excluded_labels=(),
+    label_aliases=None,
 ) -> tuple[tuple[str, float], ...]:
     if mask_index < 0 or mask_index >= len(mask_tag_counts):
         return ()
     start = sum(int(count) for count in mask_tag_counts[:mask_index])
     stop = start + int(mask_tag_counts[mask_index])
     excluded = {str(value).strip().casefold() for value in excluded_labels}
-    candidates = tuple(
-        (normalized, float(score))
-        for label, score in zip(mask_tags[start:stop], mask_scores[start:stop], strict=True)
-        if (normalized := str(label).strip()) and normalized.casefold() not in excluded
-    )
-    return tuple(sorted(candidates, key=lambda item: (-item[1], item[0].casefold())))
+    aliases = label_aliases or {}
+    candidates = {}
+    for label, score in zip(mask_tags[start:stop], mask_scores[start:stop], strict=True):
+        normalized = str(label).strip().casefold()
+        if not normalized or normalized in excluded:
+            continue
+        canonical = canonicalize_label(normalized, aliases)
+        if not canonical or canonical in excluded:
+            continue
+        candidates[canonical] = max(float(score), candidates.get(canonical, float("-inf")))
+    return tuple(sorted(candidates.items(), key=lambda item: (-item[1], item[0])))
 
 
 def select_ram_label(
@@ -35,12 +75,15 @@ def select_ram_label(
     mask_scores,
     min_confidence: float,
     excluded_labels=(),
+    label_aliases=None,
 ) -> tuple[str, float]:
     """Select the highest-confidence local RAM++ candidate for one mask."""
-    candidates = ram_mask_candidates(mask_index, mask_tag_counts, mask_tags, mask_scores, excluded_labels)
+    candidates = ram_mask_candidates(
+        mask_index, mask_tag_counts, mask_tags, mask_scores, excluded_labels, label_aliases
+    )
     if candidates and candidates[0][1] >= min_confidence:
         return candidates[0]
-    return "unlabeled", 0.0
+    return ("", 0.0) if label_aliases else ("unlabeled", 0.0)
 
 
 @dataclass(frozen=True)

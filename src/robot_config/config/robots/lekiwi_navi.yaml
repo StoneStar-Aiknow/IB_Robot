@@ -208,6 +208,64 @@ robot:
       enabled: false
       config_file: ""
 
+  object_tracking:
+    enabled: false
+    production_ready: false
+    frame_id: odom
+    camera:
+      rgb_topic: /camera/realsense/color/image_raw
+      aligned_depth_topic: /camera/realsense/aligned_depth_to_color/image_raw
+      camera_info_topic: /camera/realsense/color/camera_info
+      optical_frame: camera_color_optical_frame
+      sync_slop_ms: 33.0
+      queue_size: 10
+    depth:
+      scale: 0.001
+      min_m: 0.15
+      max_m: 8.0
+      min_valid_ratio: 0.2
+      central_fraction: 0.6
+    tracker:
+      max_prediction_s: 0.5
+      innovation_gate: 9.21
+      confirmation_interval_s: 2.0
+      max_reacquisition_attempts: 3
+      motion_window_samples: 3
+      min_object_displacement_m: 0.08
+      min_object_speed_mps: 0.05
+      motion_sigma_multiplier: 3.0
+      moving_confirmation_windows: 2
+      stationary_confirmation_windows: 2
+      max_motion_position_variance_m2: 0.25
+      max_motion_sample_gap_s: 3.0
+      robot_linear_motion_threshold_mps: 0.02
+      robot_angular_motion_threshold_rps: 0.05
+    interfaces:
+      start: /object_tracker/start_tracking
+      stop: /object_tracker/stop_tracking
+      state: /object_tracker/track_state
+      get_state: /object_tracker/get_track_state
+    following:
+      enabled: false
+      production_ready: false
+      stand_off_distance_m: 0.8
+      replan_displacement_m: 0.2
+      minimum_replan_interval_s: 1.0
+      cancellation_timeout_s: 2.0
+      action_timeout_s: 2.0
+      max_spin_attempts: 1
+      max_search_duration_s: 15.0
+      global_frame: map
+      target_frame: odom
+      base_frame: base_link
+      track_state_topic: /object_tracker/track_state
+      replan_heading_rad: 0.261799
+      target_timeout_s: 1.0
+      max_covariance_m2: 0.25
+      compute_path_action: /compute_path_to_pose
+      follow_path_action: /follow_path
+      controller_id: FollowPath
+
   simulation:
     platform: gazebo
     scene: null

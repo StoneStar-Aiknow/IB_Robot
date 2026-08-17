@@ -1,0 +1,9 @@
+string object_id
+string query_text
+float32 stand_off_distance_m
+---
+bool success
+string session_id
+string resolved_object_id
+uint8 initial_state
+string message

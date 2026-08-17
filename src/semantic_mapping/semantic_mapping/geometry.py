@@ -19,6 +19,7 @@ def is_ground_object(
     max_bottom_clearance_m: float,
     max_object_height_m: float,
     max_footprint_m: float,
+    max_object_extent_m: float,
     reference_position_xy: np.ndarray | None = None,
     max_horizontal_distance_m: float | None = None,
 ) -> bool:
@@ -30,6 +31,7 @@ def is_ground_object(
         lower[2] <= ground_height + max_bottom_clearance_m
         and upper[2] <= ground_height + max_object_height_m
         and max(upper[0] - lower[0], upper[1] - lower[1]) <= max_footprint_m
+        and float(np.max(upper - lower)) <= max_object_extent_m
     )
     if not supported or max_horizontal_distance_m is None:
         return supported
@@ -55,6 +57,7 @@ def select_geometry_mask_indices(
     max_bottom_clearance_m: float,
     max_object_height_m: float,
     max_footprint_m: float,
+    max_object_extent_m: float,
     max_horizontal_distance_m: float,
 ) -> list[int]:
     """Select SAM masks that are valid bounded objects near the robot base."""
@@ -79,6 +82,7 @@ def select_geometry_mask_indices(
             max_bottom_clearance_m=max_bottom_clearance_m,
             max_object_height_m=max_object_height_m,
             max_footprint_m=max_footprint_m,
+            max_object_extent_m=max_object_extent_m,
             reference_position_xy=reference_position_xy,
             max_horizontal_distance_m=max_horizontal_distance_m,
         ):

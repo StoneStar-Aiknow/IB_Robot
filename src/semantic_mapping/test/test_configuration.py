@@ -1,5 +1,6 @@
 """Tests for standalone semantic mapping SSOT parameter translation."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -44,11 +45,35 @@ def test_online_parameters_are_derived_from_top_level_ssot(tmp_path: Path) -> No
     assert parameters["max_masks_per_frame"] == 32
     assert parameters["max_masks_per_batch"] == 8
     assert parameters["max_object_distance_m"] == 2.5
+    assert parameters["max_object_extent_m"] == 0.65
     assert parameters["association_max_size_ratio"] == 4.0
     assert parameters["label_switch_confidence_margin"] == 0.05
+    assert parameters["label_recurrence_count_ratio"] == 3.0
+    assert parameters["label_high_confidence_override_margin"] == 0.08
+    assert json.loads(parameters["allowed_label_aliases_json"])["cardboard box"] == [
+        "cardboard",
+        "carton",
+        "carton box",
+        "paper box",
+    ]
+    assert parameters["actionable_labels"] == [
+        "banana",
+        "cucumber",
+        "cardboard box",
+        "box",
+        "crumpled paper",
+        "marker",
+    ]
     assert '"embedding_space_id":"siglip2-test-space:v1"' in parameters["siglip2_model_identity"]
     assert 0 < parameters["configuration_generation"] < 2**63
     assert parameters["target_service"] == "/semantic_mapping/resolve_target"
+    assert parameters["track_state_updates_enabled"] is True
+    assert parameters["track_state_topic"] == "/object_tracker/track_state"
+    assert parameters["track_state_max_age_sec"] == 1.0
+    assert parameters["track_state_max_covariance_m2"] == 0.25
+    assert parameters["track_state_frame"] == "odom"
+    assert parameters["track_state_confirmation_gap_sec"] == 1.0
+    assert parameters["track_state_persist_interval_sec"] == 1.0
     assert parameters["gdino_confirmation_service"] == ("/semantic_perception/semantic_gdino_confirmation")
 
 

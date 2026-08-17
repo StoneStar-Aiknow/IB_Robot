@@ -54,6 +54,7 @@ def test_ground_object_filter_keeps_supported_bounded_geometry():
         max_bottom_clearance_m=0.15,
         max_object_height_m=0.75,
         max_footprint_m=1.2,
+        max_object_extent_m=0.65,
     )
 
 
@@ -64,6 +65,7 @@ def test_ground_object_filter_rejects_elevated_and_floor_spanning_geometry():
         "max_bottom_clearance_m": 0.15,
         "max_object_height_m": 0.75,
         "max_footprint_m": 1.2,
+        "max_object_extent_m": 0.65,
     }
 
     assert not is_ground_object(elevated, 0.0, **options)
@@ -76,6 +78,7 @@ def test_ground_object_filter_rejects_geometry_far_from_reference_frame():
         "max_bottom_clearance_m": 0.15,
         "max_object_height_m": 0.75,
         "max_footprint_m": 1.2,
+        "max_object_extent_m": 0.65,
         "reference_position_xy": np.array([0.0, 0.0]),
         "max_horizontal_distance_m": 1.0,
     }
@@ -83,3 +86,16 @@ def test_ground_object_filter_rejects_geometry_far_from_reference_frame():
     assert not is_ground_object(nearby, 0.0, **options)
     options["max_horizontal_distance_m"] = 2.0
     assert is_ground_object(nearby, 0.0, **options)
+
+
+def test_ground_object_filter_rejects_scene_scale_extent():
+    oversized = _geometry([[0.0, 0.0, 0.01], [0.7, 0.2, 0.3], [0.35, 0.1, 0.15]])
+
+    assert not is_ground_object(
+        oversized,
+        0.0,
+        max_bottom_clearance_m=0.15,
+        max_object_height_m=0.75,
+        max_footprint_m=1.2,
+        max_object_extent_m=0.65,
+    )

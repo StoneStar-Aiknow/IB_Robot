@@ -65,7 +65,13 @@ def test_disabled_semantic_mapping_contract_is_preserved() -> None:
     assert config.semantic_mapping.label_refinement["enabled"] is False
     assert config.semantic_mapping.lifecycle["association_max_size_ratio"] == 4.0
     assert config.semantic_mapping.lifecycle["label_switch_confidence_margin"] == 0.05
+    assert config.semantic_mapping.target_watch["track_state_updates_enabled"] is True
+    assert config.semantic_mapping.target_watch["track_state_frame"] == "odom"
     assert "sky" in config.semantic_mapping.labels["excluded_labels"]
+    assert "plane" in config.semantic_mapping.labels["excluded_labels"]
+    assert config.semantic_mapping.filtering["max_object_extent_m"] == 0.65
+    assert "paper box" in config.semantic_mapping.labels["allowed_labels"]["cardboard box"]
+    assert config.semantic_mapping.labels["actionable_labels"][:2] == ["banana", "cucumber"]
     assert config.semantic_mapping.migration["grounded_sam2_node"] == "compatibility"
 
 
@@ -90,6 +96,37 @@ def test_association_tuning_contract_fails_closed(tmp_path: Path, key: str, valu
     config["semantic_mapping"]["lifecycle"][key] = value
 
     assert any(expected in error for error in validate_semantic_mapping_config(config))
+
+
+@pytest.mark.parametrize(
+    ("section", "key", "value", "expected"),
+    [
+        ("filtering", "max_object_extent_m", 0.0, "max_object_extent_m must be a finite number greater than zero"),
+        ("labels", "recurrence_count_ratio", 0.5, "recurrence_count_ratio must be >= 1.0"),
+        ("labels", "high_confidence_override_margin", 1.1, "high_confidence_override_margin must be in"),
+    ],
+)
+def test_geometry_and_label_tuning_contract_fails_closed(
+    tmp_path: Path, section: str, key: str, value: float, expected: str
+) -> None:
+    config = _enabled_config(tmp_path)
+    config["semantic_mapping"][section][key] = value
+
+    assert any(expected in error for error in validate_semantic_mapping_config(config))
+
+
+def test_allowed_label_aliases_and_actionable_labels_fail_closed(tmp_path: Path) -> None:
+    config = _enabled_config(tmp_path)
+    config["semantic_mapping"]["labels"]["allowed_labels"] = {
+        "box": ["carton"],
+        "cardboard box": ["carton"],
+    }
+    config["semantic_mapping"]["labels"]["actionable_labels"] = ["banana"]
+
+    errors = validate_semantic_mapping_config(config)
+
+    assert any("alias 'carton' maps to multiple labels" in error for error in errors)
+    assert any("actionable_labels must reference canonical allowed_labels" in error for error in errors)
 
 
 @pytest.mark.parametrize(
