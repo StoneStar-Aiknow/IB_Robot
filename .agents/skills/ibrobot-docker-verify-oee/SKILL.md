@@ -91,7 +91,41 @@ description: "在 openEuler Embedded (aarch64) Docker 容器中实际执行 setu
 
 - 禁止手动 `dnf install` / `pip install` / `sed` patch 脚本 / 手动配置 ROS 仓库。
 - 允许修复 chroot 基础设施（DNS、`/var/log`、`git safe.directory`）、通过环境变量传递镜像 URL。
+- 允许修复 `:env` 镜像自带的状态不一致基础包（RPM DB 与磁盘内容版本不符），
+  用 `dnf reinstall -y --nogpgcheck <pkg>` 把磁盘内容重新对齐到 RPM DB 已声明的状态。
+  这属于环境修复，不是"安装新软件"。详见 Base Image Integrity Pre-flight 与
+  [references/discipline.md](references/discipline.md)。
 - 完整的禁止/允许事项清单和论述见 [references/discipline.md](references/discipline.md)。
+
+## Base Image Integrity Pre-flight
+
+> **`:env` 镜像有时会自带状态不一致的基础包。**
+
+`swr.cn-north-4.myhuaweicloud.com/.../openeuler-ibrobot-dev:env` 是预装的
+openEuler Embedded rootfs。当镜像构建过程中基础包升级但 RPM DB 未同步刷新时，
+会出现"RPM 数据库记录版本 X，磁盘实际二进制 / soname 为版本 Y"的不一致状态。
+这种**原始镜像就已损坏**的状态会让 setup.sh 的 dnf 事务在尝试安装新子包（如
+`*-devel`）时失败：RPM 会按数据库记录创建指向"应当存在但磁盘上不存在"的 soname
+符号链接，导致后续编译 / 运行时找不到库。
+
+**典型示例（lz4）：**
+
+- RPM DB 标称：`lz4-1.9.4-2.oe2403`
+- 磁盘实际：`lz4 1.10.0`，`/usr/lib64/liblz4.so.1 -> liblz4.so.1.10.0`
+- `/usr/lib64/liblz4.so.1.9.4` 不存在，`/usr/lib64/liblz4.so` 不存在
+- `rpm -V lz4` 直接报告 `liblz4.so.1` 链接错误与 `liblz4.so.1.9.4` 缺失
+- setup.sh rosdep 解析 PCL/FLANN 依赖链时需安装 `flann-devel` → `lz4-devel`；
+  dnf 事务创建指向不存在的 `liblz4.so.1.9.4` 的 `/usr/lib64/liblz4.so`，导致
+  后续链接错误
+
+**处理策略：** 在 setup.sh 启动**之前**对已知易损坏包用 `rpm -V` 探测，
+若发现不一致就在 chroot 中用 `dnf reinstall -y --nogpgcheck <pkg> <pkg>-devel`
+重装。`reinstall` 不是"安装新软件"，而是把磁盘内容重新对齐到 RPM DB 已声明
+的状态——属于环境修复，不违反 Core Principle。完整流程见 Phase 3.5。
+
+**扩展规则：** lz4 是首个已知示例，不是封闭列表。当 setup.sh 因其他包出现
+"RPM DB 标称版本 vs 磁盘实际版本不一致"失败时，把该包加入 Phase 3.5 的
+易损坏包表，并追加对应的 `rpm -V` 检测与 `dnf reinstall` 修复步骤。
 
 ## Error Classification
 
@@ -117,6 +151,7 @@ corresponding phase section.
 | **1** | Ensure `:env` image is fresh (pull if >30 days old) | Image ready |
 | **2** | Start container, verify aarch64 emulation, fix chroot env (DNS, /var/log, git safe.directory) | Container ready |
 | **3** | Inspect chroot environment (git, python3, dnf, ROS 2) | Environment confirmed |
+| **3.5** | Verify & repair base image integrity (RPM DB vs on-disk binary mismatch) — see [Base Image Integrity Pre-flight](#base-image-integrity-pre-flight) | Base packages consistent |
 | **4** | Prepare workspace — **choose one mode** (docker cp or git clone) | `SOURCE_MODE` |
 | **5** | Run `setup.sh --yes --no-sudo`, capture log (20-40 min under qemu) | `/tmp/setup.log` |
 | **6** | Run `build.sh`, capture log | `/tmp/build.log` |
