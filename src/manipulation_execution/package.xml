@@ -3,7 +3,7 @@
 <package format="3">
   <name>manipulation_execution</name>
   <version>0.1.0</version>
-  <description>Closed-loop grasp execution for agent-facing IB-Robot skills</description>
+  <description>Closed-loop manipulation execution for agent-facing IB-Robot skills</description>
   <maintainer email="roboguru.92@gmail.com">IB-Robot Contributors</maintainer>
   <license>Apache-2.0</license>
 
@@ -15,6 +15,7 @@
   <depend>tf2_ros</depend>
   <depend>ibrobot_msgs</depend>
   <depend>embodied_common</depend>
+  <depend>skill_catalog</depend>
   <exec_depend>robot_description</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-scipy</exec_depend>

@@ -1,6 +1,7 @@
 """ROS 2 node for persistent open-vocabulary RGB-D semantic mapping."""
 
 import json
+import queue
 import threading
 import time
 import uuid
@@ -16,6 +17,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy, qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
@@ -36,19 +38,27 @@ from ibrobot_msgs.srv import (
 from .association import SemanticObservation, SemanticTrack, SemanticTracker
 from .database import MappingRunRecord, SemanticMapDatabase, SemanticMapManifest
 from .frame_processor import MaskCandidate, filter_masks, prepare_frame
-from .geometry import project_masked_depth, quaternion_matrix, transform_geometry
+from .geometry import (
+    is_ground_object,
+    project_masked_depth,
+    quaternion_matrix,
+    select_geometry_mask_indices,
+    transform_geometry,
+)
 from .hf_grounded_sam2 import HFGroundedSAM2
+from .label_refinement import CloudLabelRefiner, apply_refinement, record_refinement_rejection, should_refine_label
 from .online_lifecycle import OnlineLifecycleCoordinator
 from .pipeline import BoundedFrameQueue, SerializedCommitter
 from .pointcloud import xyz_to_pointcloud2
 from .query import ObjectQuery, query_tracks
+from .representative_view import RepresentativeViewStore
 from .runtime_identity import (
     MappingRunPinMismatch,
     RuntimeDiagnostic,
     SemanticIdentity,
     require_embedding_compatibility,
 )
-from .service_pipeline import ServiceFramePipeline
+from .service_pipeline import ServiceFramePipeline, ram_mask_candidates, select_ram_label
 from .siglip_encoder import SigLIPEncoder
 from .slam_readiness import evaluate_slam_readiness
 from .target_resolution import resolve_target
@@ -82,6 +92,13 @@ class SemanticMappingNode(Node):
         self._state_lock = threading.RLock()
         self._committer = SerializedCommitter()
         self._write_policy = SemanticWritePolicy()
+        self._representative_views = RepresentativeViewStore()
+        self._refinement_queue = queue.Queue(maxsize=32)
+        self._refinement_pending: set[str] = set()
+        self._refinement_attempted_stamp: dict[str, int] = {}
+        self._refinement_worker = None
+        self._label_refiner = None
+        self._refinement_shutdown = threading.Event()
         self._declare_parameters()
 
         self.global_frame = self.get_parameter("global_frame").value
@@ -97,6 +114,8 @@ class SemanticMappingNode(Node):
             association_distance_m=float(self.get_parameter("association_distance_m").value),
             embedding_similarity_threshold=float(self.get_parameter("embedding_similarity_threshold").value),
             position_weight=float(self.get_parameter("association_position_weight").value),
+            max_size_ratio=float(self.get_parameter("association_max_size_ratio").value),
+            label_switch_confidence_margin=float(self.get_parameter("label_switch_confidence_margin").value),
             stale_after_sec=float(self.get_parameter("stale_after_sec").value),
         )
         self._lifecycle = OnlineLifecycleCoordinator(
@@ -183,7 +202,9 @@ class SemanticMappingNode(Node):
                 self._sam_client,
                 self._ram_client,
                 self._siglip_client,
-                max_masks_per_batch=int(self.get_parameter("max_masks").value),
+                max_masks_per_batch=int(self.get_parameter("max_masks_per_batch").value),
+                excluded_labels=self.get_parameter("excluded_labels").value or (),
+                max_mask_candidates=int(self.get_parameter("max_label_candidates_per_mask").value),
             )
             gdino_endpoint = self.get_parameter("gdino_confirmation_service").value
             if gdino_endpoint:
@@ -288,6 +309,7 @@ class SemanticMappingNode(Node):
         self._queue_timer = self.create_timer(0.01, self._process_queued_frame)
         self._stale_timer = self.create_timer(1.0, self._stale_callback)
         self._publish_map()
+        self._start_label_refinement()
         self.get_logger().info(f"Semantic mapping ready; database={database_path}, global_frame={self.global_frame}")
 
     def _declare_parameters(self) -> None:
@@ -346,15 +368,27 @@ class SemanticMappingNode(Node):
             "text_threshold": 0.25,
             "depth_trunc_m": 4.0,
             "min_points": 30,
+            "ground_filter_enabled": True,
+            "ground_reference_frame": "base_link",
+            "ground_height_offset_m": 0.0,
+            "ground_max_bottom_clearance_m": 0.15,
+            "ground_max_object_height_m": 0.75,
+            "ground_max_footprint_m": 1.2,
+            "max_object_distance_m": 2.5,
             "min_frame_valid_depth_ratio": 0.05,
-            "max_masks": 8,
+            "max_masks_per_frame": 32,
+            "max_masks_per_batch": 8,
             "min_mask_pixels": 30,
             "min_mask_area_ratio": 0.0005,
             "min_mask_valid_depth_ratio": 0.2,
             "max_mask_overlap_ratio": 0.8,
             "association_distance_m": 0.45,
+            "association_max_size_ratio": 4.0,
             "association_position_weight": 0.55,
             "embedding_similarity_threshold": 0.72,
+            "label_switch_confidence_margin": 0.05,
+            "min_label_confidence": 0.2,
+            "max_label_candidates_per_mask": 5,
             "stale_after_sec": 10.0,
             "move_stability_m": 0.1,
             "move_confirmations": 2,
@@ -368,9 +402,17 @@ class SemanticMappingNode(Node):
             "gdino_text_encoder": "grounded_sam2_swint_ogc/assets/bert-base-uncased",
             "siglip_enabled": True,
             "siglip_model_path": "siglip2_so400m_patch14_384/assets/model",
+            "label_refinement_enabled": False,
+            "label_refinement_model": "",
+            "label_refinement_model_identity": "",
+            "label_refinement_prompt": "Identify the single physical object in this masked crop.",
+            "label_refinement_min_confidence": 0.8,
+            "label_refinement_trigger_below_confidence": 0.7,
+            "label_refinement_min_observations": 1,
         }
         for name, value in defaults.items():
             self.declare_parameter(name, value)
+        self.declare_parameter("excluded_labels", Parameter.Type.STRING_ARRAY)
         self._last_processed_ns = 0
 
     def _synchronized_callback(self, rgb_msg: Image, depth_msg: Image, info_msg: CameraInfo) -> None:
@@ -415,14 +457,68 @@ class SemanticMappingNode(Node):
             raise RuntimeError("mapping run admission is closed")
         if not all(client.service_is_ready() for client in (self._sam_client, self._ram_client, self._siglip_client)):
             raise RuntimeError("service-backed semantic perception is not ready")
+        depth = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
+        intrinsics = np.asarray(info_msg.k, dtype=np.float64).reshape(3, 3)
+        camera_frame = rgb_msg.header.frame_id or info_msg.header.frame_id
+        camera_transform = self._tf_buffer.lookup_transform(
+            self.global_frame,
+            camera_frame,
+            Time.from_msg(rgb_msg.header.stamp),
+            timeout=self.tf_timeout,
+        )
+        base_transform = self._tf_buffer.lookup_transform(
+            self.global_frame,
+            str(self.get_parameter("ground_reference_frame").value),
+            Time.from_msg(rgb_msg.header.stamp),
+            timeout=self.tf_timeout,
+        )
+        camera_translation = np.asarray(
+            [
+                camera_transform.transform.translation.x,
+                camera_transform.transform.translation.y,
+                camera_transform.transform.translation.z,
+            ]
+        )
+        camera_rotation = quaternion_matrix(
+            camera_transform.transform.rotation.x,
+            camera_transform.transform.rotation.y,
+            camera_transform.transform.rotation.z,
+            camera_transform.transform.rotation.w,
+        )
+        ground_height = float(base_transform.transform.translation.z) + float(
+            self.get_parameter("ground_height_offset_m").value
+        )
+        base_xy = np.asarray([base_transform.transform.translation.x, base_transform.transform.translation.y])
+
+        def mask_selector(detections):
+            return select_geometry_mask_indices(
+                detections,
+                lambda mask: self._bridge.imgmsg_to_cv2(mask, desired_encoding="mono8"),
+                depth,
+                intrinsics,
+                _depth_scale(depth_msg.encoding),
+                self.depth_trunc_m,
+                int(self.get_parameter("min_points").value),
+                camera_translation,
+                camera_rotation,
+                ground_height,
+                base_xy,
+                enabled=bool(self.get_parameter("ground_filter_enabled").value),
+                max_bottom_clearance_m=float(self.get_parameter("ground_max_bottom_clearance_m").value),
+                max_object_height_m=float(self.get_parameter("ground_max_object_height_m").value),
+                max_footprint_m=float(self.get_parameter("ground_max_footprint_m").value),
+                max_horizontal_distance_m=float(self.get_parameter("max_object_distance_m").value),
+            )
+
         result = self._service_pipeline.process(
             rgb_msg,
             mask_options={
-                "max_masks": int(self.get_parameter("max_masks").value),
+                "max_masks": int(self.get_parameter("max_masks_per_frame").value),
                 "min_mask_pixels": int(self.get_parameter("min_mask_pixels").value),
                 "min_mask_area_ratio": float(self.get_parameter("min_mask_area_ratio").value),
                 "max_overlap_ratio": float(self.get_parameter("max_mask_overlap_ratio").value),
             },
+            mask_selector=mask_selector,
         )
 
         def completed(future):
@@ -435,16 +531,33 @@ class SemanticMappingNode(Node):
                     raise
                 deployment_provenance = {role: value.to_dict() for role, value in provenances.items()}
                 embeddings = {int(item.mask_index): item for item in service_result.embeddings if item.success}
+                excluded_labels = self.get_parameter("excluded_labels").value or ()
                 detections = []
                 for index, message in enumerate(service_result.masks.detections):
                     encoded = embeddings.get(index)
+                    candidates = ram_mask_candidates(
+                        index,
+                        service_result.mask_tag_counts,
+                        service_result.mask_tags,
+                        service_result.mask_tag_scores,
+                        excluded_labels,
+                    )
+                    label, confidence = select_ram_label(
+                        index,
+                        service_result.mask_tag_counts,
+                        service_result.mask_tags,
+                        service_result.mask_tag_scores,
+                        float(self.get_parameter("min_label_confidence").value),
+                        excluded_labels,
+                    )
                     detections.append(
                         SimpleNamespace(
-                            label=(encoded.matched_label if encoded and encoded.matched_label else "unlabeled"),
-                            confidence=(float(encoded.matched_score) if encoded else float(message.confidence)),
+                            label=label,
+                            confidence=confidence,
                             bbox_xyxy=np.asarray(message.bbox, dtype=np.float32),
                             mask=self._bridge.imgmsg_to_cv2(message.mask, desired_encoding="mono8"),
                             embedding=(None if encoded is None else np.asarray(encoded.embedding, dtype=np.float32)),
+                            label_candidates=candidates,
                         )
                     )
                 self._process_frame(
@@ -460,6 +573,7 @@ class SemanticMappingNode(Node):
                     },
                     deployment_provenance=deployment_provenance,
                     mapping_run_id=self._run.run_id,
+                    geometry_prefiltered=True,
                 )
                 self._last_processed_ns = stamp_ns
             except Exception as exc:
@@ -481,6 +595,7 @@ class SemanticMappingNode(Node):
         semantic_identities=None,
         deployment_provenance=None,
         mapping_run_id="",
+        geometry_prefiltered=False,
     ) -> None:
         image_bgr = self._bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
         depth = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
@@ -544,7 +659,7 @@ class SemanticMappingNode(Node):
         accepted_indices, diagnostics = filter_masks(
             frame,
             [MaskCandidate(detection.mask, detection.confidence) for detection in detections],
-            max_masks=int(self.get_parameter("max_masks").value),
+            max_masks=int(self.get_parameter("max_masks_per_frame").value),
             min_mask_pixels=int(self.get_parameter("min_mask_pixels").value),
             min_mask_area_ratio=float(self.get_parameter("min_mask_area_ratio").value),
             min_valid_depth_ratio=float(self.get_parameter("min_mask_valid_depth_ratio").value),
@@ -560,6 +675,18 @@ class SemanticMappingNode(Node):
             f"limit={diagnostics.rejected_limit}"
         )
         frame_clouds = []
+        ground_transform = None
+        ground_height = None
+        if not geometry_prefiltered and bool(self.get_parameter("ground_filter_enabled").value):
+            ground_transform = self._tf_buffer.lookup_transform(
+                self.global_frame,
+                str(self.get_parameter("ground_reference_frame").value),
+                Time.from_msg(rgb_msg.header.stamp),
+                timeout=self.tf_timeout,
+            )
+            ground_height = float(ground_transform.transform.translation.z) + float(
+                self.get_parameter("ground_height_offset_m").value
+            )
         matched_object_ids = set()
         frame_scan_epoch = int(self.get_parameter("scan_epoch").value) if frame_scan_epoch is None else frame_scan_epoch
         admission = self._write_policy.admit(
@@ -584,6 +711,18 @@ class SemanticMappingNode(Node):
             if geometry is None:
                 continue
             world_geometry = transform_geometry(geometry, frame.translation, frame.rotation)
+            if ground_transform is not None and not is_ground_object(
+                world_geometry,
+                ground_height,
+                max_bottom_clearance_m=float(self.get_parameter("ground_max_bottom_clearance_m").value),
+                max_object_height_m=float(self.get_parameter("ground_max_object_height_m").value),
+                max_footprint_m=float(self.get_parameter("ground_max_footprint_m").value),
+                reference_position_xy=np.asarray(
+                    [ground_transform.transform.translation.x, ground_transform.transform.translation.y]
+                ),
+                max_horizontal_distance_m=float(self.get_parameter("max_object_distance_m").value),
+            ):
+                continue
             embedding = None
             if hasattr(detection, "embedding"):
                 embedding = detection.embedding
@@ -605,6 +744,7 @@ class SemanticMappingNode(Node):
                 semantic_identities=semantic_identities or {},
                 deployment_provenance=deployment_provenance or {},
                 mapping_run_id=mapping_run_id,
+                label_candidates=tuple(getattr(detection, "label_candidates", ())),
             )
 
             def commit_observation(observation=observation):
@@ -614,7 +754,20 @@ class SemanticMappingNode(Node):
                     self._database.upsert(track, observation)
                     return track
 
-            self._committer.commit(commit_observation)
+            track = self._committer.commit(commit_observation)
+            if bool(self.get_parameter("label_refinement_enabled").value):
+                with self._state_lock:
+                    self._representative_views.consider(
+                        self._representative_views.create(
+                            track.object_id,
+                            stamp_ns,
+                            detection.confidence,
+                            image_bgr,
+                            detection.mask,
+                            detection.bbox_xyxy,
+                        )
+                    )
+                self._enqueue_label_refinement(track)
             frame_clouds.append(world_geometry.points)
 
         if frame_clouds:
@@ -622,6 +775,116 @@ class SemanticMappingNode(Node):
                 xyz_to_pointcloud2(np.concatenate(frame_clouds), rgb_msg.header.stamp, self.global_frame)
             )
         self._publish_map(stamp_ns)
+
+    def _start_label_refinement(self) -> None:
+        if not bool(self.get_parameter("label_refinement_enabled").value):
+            return
+        try:
+            from embodied_common.vlm_api_client import VLMClient
+
+            self._label_refiner = CloudLabelRefiner(
+                VLMClient(),
+                model=str(self.get_parameter("label_refinement_model").value),
+                model_identity=str(self.get_parameter("label_refinement_model_identity").value),
+                prompt=str(self.get_parameter("label_refinement_prompt").value),
+                min_confidence=float(self.get_parameter("label_refinement_min_confidence").value),
+                excluded_labels=self.get_parameter("excluded_labels").value or (),
+            )
+        except Exception as exc:
+            self.get_logger().error(f"Cloud label refinement unavailable; RAM++ labels remain active: {exc}")
+            return
+        self._refinement_worker = threading.Thread(target=self._label_refinement_loop, daemon=True)
+        self._refinement_worker.start()
+
+    def _enqueue_label_refinement(self, track: SemanticTrack) -> None:
+        if self._label_refiner is None or track.observation_count < int(
+            self.get_parameter("label_refinement_min_observations").value
+        ):
+            return
+        excluded = self.get_parameter("excluded_labels").value or ()
+        with self._state_lock:
+            if (
+                not should_refine_label(
+                    track.label,
+                    track.confidence,
+                    excluded,
+                    float(self.get_parameter("label_refinement_trigger_below_confidence").value),
+                    inconsistent=len(track.attributes.get("label_evidence", {})) > 1,
+                )
+                or track.object_id in self._refinement_pending
+            ):
+                return
+            view = self._representative_views.get(track.object_id)
+            if view is None or view.stamp_ns <= self._refinement_attempted_stamp.get(track.object_id, 0):
+                return
+            try:
+                self._refinement_queue.put_nowait(track.object_id)
+                self._refinement_pending.add(track.object_id)
+            except queue.Full:
+                self.get_logger().warn("Cloud label refinement queue is full; keeping RAM++ label")
+
+    def _label_refinement_loop(self) -> None:
+        while not self._refinement_shutdown.is_set():
+            try:
+                object_id = self._refinement_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                with self._state_lock:
+                    view = self._representative_views.get(object_id)
+                    track = self._tracker.tracks.get(object_id)
+                    candidates = (
+                        ()
+                        if track is None
+                        else self._tracker.aggregated_label_candidates(
+                            track,
+                            excluded_labels=self.get_parameter("excluded_labels").value or (),
+                        )
+                    )
+                if view is None:
+                    continue
+                self._refinement_attempted_stamp[object_id] = view.stamp_ns
+                result = self._label_refiner.refine(view, candidates)
+                if self._refinement_shutdown.is_set():
+                    continue
+
+                def commit_refinement(object_id=object_id, result=result):
+                    with self._state_lock:
+                        track = self._tracker.tracks.get(object_id)
+                        if track is None:
+                            return
+                        apply_refinement(track, result)
+                        self._database.upsert(track)
+
+                self._committer.commit(commit_refinement)
+                self._publish_map()
+            except Exception as exc:
+                if self._refinement_shutdown.is_set():
+                    continue
+
+                def commit_rejection(object_id=object_id, candidates=candidates, error=exc):
+                    with self._state_lock:
+                        track = self._tracker.tracks.get(object_id)
+                        if track is None:
+                            return None
+                        record_refinement_rejection(
+                            track,
+                            candidates=candidates,
+                            model_identity=self._label_refiner.model_identity,
+                            error=error,
+                        )
+                        self._database.upsert(track)
+                        return track.label, track.confidence
+
+                ram_result = self._committer.commit(commit_rejection)
+                ram_summary = "missing track" if ram_result is None else f"{ram_result[0]!r}/{ram_result[1]:.3f}"
+                self.get_logger().warn(
+                    f"Cloud label refinement rejected for {object_id}; "
+                    f"RAM++={ram_summary}, candidates={list(candidates)}: {exc}"
+                )
+            finally:
+                with self._state_lock:
+                    self._refinement_pending.discard(object_id)
 
     def _stale_callback(self) -> None:
         with self._state_lock:
@@ -859,10 +1122,18 @@ class SemanticMappingNode(Node):
         )
 
     def destroy_node(self):
+        self._refinement_shutdown.set()
+        close_database = True
+        if self._refinement_worker is not None:
+            self._refinement_worker.join(timeout=5.0)
+            if self._refinement_worker.is_alive():
+                self.get_logger().warn("Cloud label refinement worker is still stopping; database remains open")
+                close_database = False
         if self._run is not None and self._run_admission_open:
             now_ns = time.time_ns()
             self._database.update_mapping_run_status(self._run.run_id, "paused", now_ns)
-        self._database.close()
+        if close_database:
+            self._database.close()
         return super().destroy_node()
 
 

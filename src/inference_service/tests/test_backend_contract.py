@@ -698,7 +698,7 @@ def test_descriptor_can_declare_model_support_without_policy_support():
 
 
 def test_descriptor_rejects_unknown_perception_family():
-    with pytest.raises(BackendRegistryError, match="unknown perception families") as error:
+    with pytest.raises(BackendRegistryError, match="unknown model families") as error:
         BackendDescriptor(
             name="ascend",
             factory="tests.fake_backend_factory:create_backend",
@@ -752,6 +752,7 @@ def test_static_registry_evidence_matches_declared_policy_matrix(backend):
         ("graspgen", "ascend"),
         ("sam2", "ascend"),
         ("grounding_dino", "ascend"),
+        ("fullsubnet_cumulative_stateful", "ascend"),
     ],
 )
 def test_registry_supports_declared_perception_deployments(tmp_path, family, backend):

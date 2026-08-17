@@ -150,8 +150,6 @@ setup_python_venv() {
     fi
 
     local pip_install=("${VENV_PYTHON}" -m pip install)
-    local installed_perception_deps=false
-    local installed_grasp_deps=false
     local ros_abi_constraints="${venv_path}/ros_abi_constraints.txt"
 
     # Upgrade pip
@@ -296,31 +294,49 @@ EOF
     run_cmd "${pip_install[@]}" --constraint "${ros_abi_constraints}" \
         -r "${WORKSPACE}/requirements/voice-tts.txt" --quiet
 
-    # Optional perception and manipulation dependencies are installed after the
-    # core dependency set and ABI pins so later setup steps cannot overwrite them.
-    if [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
-        log_info "Skipping Torch perception source packages on openEuler; the Ascend OM path uses core dependencies."
-    elif [[ "${INSTALL_PERCEPTION_DEPS:-false}" == true ]]; then
-        log_info "Installing optional perception dependencies (SAM2, Grounding-DINO)..."
-        run_cmd env SAM2_BUILD_CUDA="${SAM2_BUILD_CUDA:-0}" SAM2_BUILD_ALLOW_ERRORS=1 \
-            "${pip_install[@]}" --no-build-isolation --constraint "${ros_abi_constraints}" \
-            -r "${WORKSPACE}/requirements/perception.txt" --quiet
-        installed_perception_deps=true
-    else
-        log_info "Skipping optional perception dependencies. Re-run setup with --with-perception if needed."
+    # Perception runtime dependencies (SAM2, Grounding-DINO, RAM++, SigLIP2) are
+    # part of the default install contract: perception_service and
+    # semantic_mapping already build in the default workspace, and the audited
+    # RAM++ / GroundingDINO wheels ship in third_party/. Install them on every
+    # platform that runs the local workspace build, including openEuler Embedded
+    # (the Ascend OM path does not replace the Torch perception runtime).
+    local ram_wheel_root="${WORKSPACE}/third_party/wheels/recognize-anything/7cb804a"
+    local ram_wheel="${ram_wheel_root}/ibrobot_ram-0.0.1+ibrobot.1-py3-none-any.whl"
+    local gdino_wheel_root="${WORKSPACE}/third_party/wheels/groundingdino/313392a"
+    local gdino_wheel="${gdino_wheel_root}/ibrobot_groundingdino-0.1.0+ibrobot.1-py3-none-any.whl"
+    log_info "Installing perception dependencies (SAM2, Grounding-DINO, RAM++, SigLIP2)..."
+    run_cmd env SAM2_BUILD_CUDA="${SAM2_BUILD_CUDA:-0}" SAM2_BUILD_ALLOW_ERRORS=1 \
+        "${pip_install[@]}" --no-build-isolation --constraint "${ros_abi_constraints}" \
+        -r "${WORKSPACE}/requirements/perception.txt" --quiet
+    if ! (cd "${ram_wheel_root}" && sha256sum --check SHA256SUMS); then
+        log_error "RAM++ wheel checksum verification failed."
+        exit 1
     fi
+    run_cmd "${pip_install[@]}" --no-deps "${ram_wheel}" --quiet
+    if ! (cd "${gdino_wheel_root}" && sha256sum --check SHA256SUMS); then
+        log_error "GroundingDINO wheel checksum verification failed."
+        exit 1
+    fi
+    run_cmd "${pip_install[@]}" --no-deps "${gdino_wheel}" --quiet
 
-    if [[ "${INSTALL_GRASP_DEPS:-false}" == true && "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
-        log_warn "Skipping optional grasp dependencies on openEuler; GraspGen CUDA extensions are validated on Ubuntu only."
-    elif [[ "${INSTALL_GRASP_DEPS:-false}" == true ]]; then
-        log_info "Installing optional grasp dependencies (GraspGen)..."
+    # GraspGen runtime dependencies are part of the default install contract:
+    # manipulation_service is part of the default workspace build. Skip on
+    # openEuler Embedded because GraspGen's pointnet2_ops CUDA extension is
+    # validated on Ubuntu only; the Ascend OM path does not cover Torch grasp.
+    # Also skip on Ubuntu hosts without a CUDA toolkit (nvcc) so the default
+    # setup does not hard-fail on CPU-only machines — GraspGen's CUDA
+    # extension cannot be compiled without nvcc (same pattern as SAM2_BUILD_CUDA=0).
+    if [[ "${SETUP_PLATFORM_ID}" == "openeuler-embedded-24.03" ]]; then
+        log_warn "Skipping grasp dependencies on openEuler; GraspGen CUDA extensions are validated on Ubuntu only."
+    elif ! command -v nvcc >/dev/null 2>&1 && [[ ! -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]]; then
+        log_warn "No CUDA toolkit (nvcc) found; skipping GraspGen pointnet2_ops (grasp CUDA backend unavailable)."
+        log_warn "Install a CUDA toolkit and re-run ./scripts/setup.sh to enable the default grasp install."
+    else
+        log_info "Installing grasp dependencies (GraspGen)..."
         # shellcheck disable=SC1091
         source "${SCRIPT_DIR}/setup/install_graspgen_pip.sh"
         export ROS_ABI_CONSTRAINTS="${ros_abi_constraints}"
         install_graspgen_pip "${VENV_PYTHON}" -m pip install
-        installed_grasp_deps=true
-    else
-        log_info "Skipping optional grasp dependencies. Re-run setup with --with-grasp if needed."
     fi
 
     # Optional speech_direction report dependencies (Plotly/Matplotlib). Pure-Python.
@@ -340,7 +356,7 @@ EOF
     run_cmd "${pip_install[@]}" --force-reinstall "numpy==1.26.4" \
         "opencv-python-headless<4.12" --quiet
 
-    log_info "Running Python dependency smoke tests..."
+    log_info "Running NumPy/OpenCV dependency smoke test..."
     PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
 import cv2
 import numpy
@@ -349,23 +365,16 @@ if not numpy.__version__.startswith("1.26"):
     raise SystemExit(f"Expected NumPy 1.26.x after setup, got {numpy.__version__}")
 print(f"NumPy/OpenCV smoke test passed: numpy={numpy.__version__}, cv2={cv2.__version__}")
 PY
-    if [[ "${installed_perception_deps}" == true ]]; then
+    if [[ "${SETUP_PLATFORM_ID}" != "openeuler-embedded-24.03" ]] \
+       && { command -v nvcc >/dev/null 2>&1 || [[ -x "${CUDA_HOME:-/nonexistent}/bin/nvcc" ]]; }; then
         PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
-import importlib.util
+import importlib
 
-missing = [name for name in ("groundingdino", "sam2") if importlib.util.find_spec(name) is None]
-if missing:
-    raise SystemExit(f"Missing perception modules after optional install: {', '.join(missing)}")
-print("Perception optional dependencies smoke test passed")
-PY
-    fi
-    if [[ "${installed_grasp_deps}" == true ]]; then
-        PYTHONNOUSERSITE=1 "${VENV_PYTHON}" - <<'PY'
-import importlib.util
-
-if importlib.util.find_spec("grasp_gen") is None:
-    raise SystemExit("Missing grasp_gen after optional GraspGen install")
-print("GraspGen optional dependencies smoke test passed")
+try:
+    importlib.import_module("grasp_gen")
+except Exception as exc:
+    raise SystemExit(f"Missing grasp_gen after default grasp install: {exc}")
+print("Grasp dependencies smoke test passed")
 PY
     fi
 

@@ -60,7 +60,7 @@ After accepting the parent handoff, collect only choices that are not already re
    - `Existing ONNX`: compile the supplied ONNX, inspect ABI, and package.
    - `Resume compiled OM`: inspect and package an unchanged OM after copying its source ONNX and
      bundle to a compatible ACL host.
-2. Work directory: default `<model_path>/model_utils_work/ascend`.
+2. Work directory: default `models/_work/<bundle>/ascend` (outside the bundle).
 3. Deployment name: default to a descriptive target name such as `ascend_310p3`.
 4. ACL device ID for ABI inspection: default `0`.
 5. Optional ACL config path: unset unless the environment requires one.

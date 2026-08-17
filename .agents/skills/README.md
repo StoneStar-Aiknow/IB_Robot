@@ -7,9 +7,10 @@
 | 技能名称 | 分类 | 主要触发场景 (Triggers) |
 | :--- | :--- | :--- |
 | [intro](./intro) | 引导 | 「介绍」「有哪些功能」「help」「入门」「intro」等，作为所有 skill 的导航入口。 |
-| [ibrobot-env](./ibrobot-env) | 环境 | 加载 `.shrc_local`、设置 `ROS_DOMAIN_ID`、解决 `ModuleNotFoundError` 等。 |
+| [ibrobot-env](./ibrobot-env) | 环境 | 跑测试、运行脚本或 ROS 2 命令前加载 `.shrc_local`、设置 `ROS_DOMAIN_ID`、解决 `ModuleNotFoundError`；禁止手动拼装 ROS/PYTHONPATH 环境。 |
+| [ibrobot-worktree-env](./ibrobot-worktree-env) | 环境 | 在 `git worktree` 中复用主仓库 venv，避免主仓库/worktree 混合环境导致测错分支。 |
 | [ibrobot-build](./ibrobot-build) | 操作 | 执行项目编译 (`colcon build`)、构建特定 package 或修复编译错误。 |
-| [ibrobot-launch](./ibrobot-launch) | 操作 | 分平台启动 Ubuntu/openEuler 工作区或 OpenHarmony 板端机器人系统、仿真、推理与遥操作。 |
+| [ibrobot-launch](./ibrobot-launch) | 操作 | 分平台启动 Ubuntu/openEuler 工作区或 OpenHarmony 板端机器人系统、仿真、mock/契约测试、推理与遥操作。 |
 | [ibrobot-robot-skill-design](./ibrobot-robot-skill-design) | 操作 | 交互式设计机器人 skill，澄清 anchor/motion space/safety/catalog 暴露并生成验证计划。 |
 | [ibrobot-control](./ibrobot-control) | 操作 | Hermes/Agent 通过 `robot-skill` 发现、校验、执行或取消现有高层技能。 |
 | [oh-constraints](./oh-constraints) | 板端 | OpenHarmony 板端运行时约束汇总（toybox 命令缺失、musl libc、只读 rootfs、无 systemd、无 /usr/bin/env、LD_PRELOAD 干扰等），板端操作前必读。 |
@@ -23,12 +24,14 @@
 | [ibrobot-git-flow](./ibrobot-git-flow) | 工作流 | 提交代码、推送至个人仓库、确保符合 openEuler DCO/Commit 规范。 |
 | [ibrobot-docker-verify](./ibrobot-docker-verify) | 验证 | 在干净 Ubuntu 22.04 Docker 容器中端到端验证 setup.sh + build.sh。 |
 | [ibrobot-docker-verify-oee](./ibrobot-docker-verify-oee) | 验证 | 在 openEuler Embedded (aarch64) Docker 容器中端到端验证 setup.sh + build.sh。 |
+| [sync-github](./sync-github) | 工作流 | 将 IB_Robot 仓库的 origin 远端（个人 AtomGit fork）的 master 分支同步推送到 GitHub 远端。 |
+| [skill-creator](./skill-creator) | 工作流 | 新建/重构 Agent skill，按 agentskills.io 规范编写 SKILL.md，校验 frontmatter 与渐进式披露。 |
 | [oh-cross-build-ros-pkg](./oh-cross-build-ros-pkg) | 板端 | 为 OpenHarmony 板交叉编译移植第三方 ROS 2 包（如 usb_cam）。 |
 | [ohloha-build-pkg](./ohloha-build-pkg) | 板端 | 用 `tools_ohloha_pkgs` / `builder.sh` 交叉编译第三方包（bash、zsh、vim、ncurses 等）到 OpenHarmony 板端。 |
 | [oh-rebuild-kernel](./oh-rebuild-kernel) | 板端 | 重新编译并刷入 OpenHarmony 内核 (boot_linux.img)，启用 USB ACM 等驱动。 |
 | [deepwiki-config](./deepwiki-config) | 文档 | 根据 DeepWiki 目录结构生成 `deepwiki_processor.py` 所需的 `doc_config.json`。 |
 | [deepwiki-translator](./deepwiki-translator) | 文档 | 按 config-first 流程将 DeepWiki 英文 Markdown 翻译为中文文档。 |
-| [mermaid-syntax-validation](./mermaid-syntax-validation) | 文档 | 检查、修复并浏览器验证 Markdown/Sphinx Mermaid 图语法，确保发布 HTML
+| [mermaid-syntax-validation](./mermaid-syntax-validation) | 文档 | 检查、修复并浏览器验证 Markdown/Sphinx Mermaid 图语法，确保发布 HTML 不再渲染 Mermaid 错误 SVG。 |
 | [atomgit-collaboration](./atomgit-collaboration) | AtomGit | 拦截泛化的 PR / Issue / review / comment 请求，并路由到具体 AtomGit skill。 |
 | [atomgit-pr](./atomgit-pr) | AtomGit | 管理 PR 生命周期：创建、读取上下文、更新标题/描述、生成摘要。 |
 | [atomgit-issue](./atomgit-issue) | AtomGit | 管理 Issue 生命周期：创建、读取详情、更新内容、关闭/重开。 |
@@ -47,7 +50,8 @@
 ### 🤖 IB-Robot 核心操作
 这些技能旨在处理 IB-Robot 软件栈特有的日常开发任务。
 
-- **环境管理 ([ibrobot-env](./ibrobot-env))**: 确保 shell 上下文正确继承了项目特有的环境变量。
+- **环境管理 ([ibrobot-env](./ibrobot-env))**: 确保 shell 上下文正确继承了项目特有的环境变量。任何 `python3`/`pytest`/`ros2` 命令前统一走 `source .shrc_local &&`，环境类报错的唯一修复入口，禁止手动 source ROS setup 或 export PYTHONPATH。
+- **Worktree 环境 ([ibrobot-worktree-env](./ibrobot-worktree-env))**: 在 `git worktree` 中复用主仓库 venv，避免 source 主仓库 `.shrc_local` 造成的「worktree venv + 主仓库源码」混合环境，并给出验证脚本与已知限制清单。
 - **编译构建 ([ibrobot-build](./ibrobot-build))**: 封装了 ROS 2 复杂的编译参数，确保构建的一致性。
 - **系统启动 ([ibrobot-launch](./ibrobot-launch))**: 机器人系统的总入口，区分 Ubuntu/openEuler 源码工作区与 OpenHarmony `/data/roboframe` 板端运行时。
 - **机器人 Skill 设计 ([ibrobot-robot-skill-design](./ibrobot-robot-skill-design))**: 通过交互式流程把自然语言动作需求转成安全的 SSOT skill 设计，避免把观察位/目标位附近动作误实现为无语义锚点的关节轨迹；明确 anchor、动作空间、安全链路与 catalog 暴露。
@@ -115,7 +119,7 @@
 ## 如何增加新技能
 
 若要向本项目添加新技能，请遵循以下步骤：
-1. 在 `.agents/skills/` 下创建一个新目录。
-2. 添加 `SKILL.md` 文件，确保 `description` 字段采用 **if-then** 条件触发风格（包含中英双语关键词），并在涉及第三方平台时明确写出平台优先级。
-3. 编写技能所需的配套脚本（Python/Bash）或库文件。
-4. 更新此 `README.md` 文件，将新技能添加到清单表格中。
+1. 调用 [skill-creator](./skill-creator) 作为统一入口，并按其项目约定与校验清单执行。
+2. 在 `.agents/skills/` 下创建新目录和 `SKILL.md`；按需添加 `references/`、`scripts/` 等配套内容。
+3. 同步更新三份技能索引：`AGENTS.md` 的「Agent 技能索引」、本 `README.md` 的技能清单与分类说明、`.agents/skills/intro/SKILL.md` 的技能分类列表与使用示例。
+4. 使用 `skill-creator` 的 Validation Checklist 校验 frontmatter、description、渐进式披露和三索引一致性；任一索引未同步时不得提交。

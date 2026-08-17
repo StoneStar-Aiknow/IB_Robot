@@ -138,6 +138,12 @@ robot:
       - id: semantic_gdino_confirmation
         enabled: false
         required: false
+      # GraspGen is a perception model like the five above: one typed endpoint over one
+      # named deployment. It is not bound to a semantic_mapping role - manipulation calls
+      # GenerateGrasps directly with a segmented object cloud.
+      - id: semantic_graspgen_grasps
+        enabled: false
+        required: false
 
   semantic_mapping:
     enabled: false
@@ -180,10 +186,17 @@ robot:
       depth_trunc_m: 4.0
       min_points: 30
       min_frame_valid_depth_ratio: 0.05
-      min_mask_pixels: 30
-      min_mask_area_ratio: 0.0005
+      min_mask_pixels: 300
+      min_mask_area_ratio: 0.001
       min_mask_valid_depth_ratio: 0.2
       max_mask_overlap_ratio: 0.8
+      ground_filter_enabled: true
+      ground_reference_frame: base_link
+      ground_height_offset_m: 0.0
+      ground_max_bottom_clearance_m: 0.15
+      ground_max_object_height_m: 0.75
+      ground_max_footprint_m: 1.2
+      max_object_distance_m: 2.5
     queue:
       sync_queue_size: 10
       sync_slop_sec: 0.06
@@ -191,14 +204,89 @@ robot:
       processing_interval_sec: 0.5
       frame_capacity: 2
       policy: drop_oldest
+      max_masks_per_frame: 32
       max_masks_per_batch: 8
     lifecycle:
       association_distance_m: 0.45
+      association_max_size_ratio: 4.0
       association_position_weight: 0.55
       embedding_similarity_threshold: 0.72
+      label_switch_confidence_margin: 0.05
       stale_after_sec: 10.0
       move_stability_m: 0.1
       move_confirmations: 2
+    labels:
+      min_confidence: 0.2
+      max_candidates_per_mask: 5
+      excluded_labels:
+        # Scene background, generic concepts, shapes, and action-like RAM++ noise.
+        - animal
+        - attach
+        - bite
+        - building
+        - cloud
+        - cloudy
+        - cloth
+        - color
+        - container
+        - cube
+        - cylinder
+        - draw
+        - drive
+        - eagle
+        - face
+        - fly
+        - floor
+        - food
+        - foot
+        - fruit
+        - hang
+        - hand
+        - hay
+        - hot
+        - image
+        - iceberg
+        - line
+        - liquid
+        - man
+        - move
+        - oval
+        - person
+        - photo
+        - polygon
+        - plastic
+        - pole
+        - rectangle
+        - reflection
+        - room
+        - shape
+        - sheet
+        - sky
+        - square
+        - stack
+        - stop light
+        - tear
+        - tie
+        - toothpaste
+        - traffic light
+        - triangle
+        - unlabeled
+        - water
+        - wind
+    label_refinement:
+      enabled: false
+      model: gpt-5.6-sol
+      model_identity: xunxing/gpt-5.6-sol@az.gptplus5.com
+      prompt: >-
+        The left panel is the full indoor office/laboratory scene with the target highlighted in green and boxed in
+        red. The right panel is an enlarged masked crop of that target. Identify exactly one concrete, physically
+        manipulable item plausible in a robotics laboratory. Use the most specific common object noun supported by
+        the image. Prefer banana over food or fruit, trash can or bin over container or plastic, crumpled paper over
+        paper or cloth, and marker over cylinder. Never answer with a material, shape, color, visual attribute,
+        action, scene/background, or broad parent category. RAM++ candidates are weak hints and may all be wrong.
+      min_confidence: 0.8
+      trigger_below_confidence: 0.7
+      min_observations: 1
     target_watch:
       max_attempts: 3
       scan_profile: fixed_d435_base_scan
@@ -212,3 +300,8 @@ robot:
       object_cloud_topic: /semantic_mapping/object_cloud
       query_service: /semantic_mapping/get_objects
       target_service: /semantic_mapping/resolve_target
+    migration:
+      grounded_sam2_node: compatibility
+      grounded_sam2_snapshot: diagnostic_only
+      perception_service_node: general_scene
+      embedded_mapping_backend: disabled

@@ -16,6 +16,9 @@ def _joint_state(joint5: float) -> JointState:
 
 
 class _OrientationHarness:
+    _load_json_object = staticmethod(PickExecutorNode._load_json_object)
+    _load_home_joint_positions = classmethod(PickExecutorNode._load_home_joint_positions.__func__)
+    _validate_home_joint_config = PickExecutorNode._validate_home_joint_config
     _orientation_guard = PickExecutorNode._orientation_guard
     _orientation_limits = PickExecutorNode._orientation_limits
     _joint5_home_constraints = PickExecutorNode._joint5_home_constraints
@@ -37,7 +40,7 @@ class _OrientationHarness:
                     "approach_axis_ee": [0.0, 0.0, 1.0],
                     "closing_axis_180_symmetric": True,
                     "max_approach_error_deg": 25.0,
-                    "max_closing_error_deg": 20.0,
+                    "max_closing_error_deg": 27.0,
                 },
             }
         }
@@ -88,6 +91,24 @@ def test_orientation_guard_reseeds_joint5_until_fk_axes_match():
     assert corrected_joint5 is not None
     assert math.isclose(corrected_joint5, math.pi / 4.0, abs_tol=1e-8)
     assert payload.closing_axis_error_deg == 0.0
+
+
+def test_home_joint_positions_are_loaded_from_launch_json():
+    assert _OrientationHarness._load_home_joint_positions('{"1": 0, "5": 0.4}') == {"1": 0.0, "5": 0.4}
+
+
+def test_home_joint_positions_reject_non_finite_values():
+    with pytest.raises(ValueError, match="joint 5 must be finite"):
+        _OrientationHarness._load_home_joint_positions('{"5": NaN}')
+
+
+def test_joint5_guard_requires_home_position_during_startup_validation():
+    harness = _OrientationHarness()
+    harness._home_joint_positions = {}
+    harness._config["target_gripper"]["ik_orientation_guard"]["joint5_constraints_enabled"] = True
+
+    with pytest.raises(ValueError, match=r'reset_positions\["5"\] is required'):
+        harness._validate_home_joint_config()
 
 
 def _joint5_guard_harness(*, enabled: bool = True, stage_continuity: bool = True) -> _OrientationHarness:

@@ -43,12 +43,12 @@ python3 architecture_review.py --pr 123
 # 步骤3: 人类确认审查结果
 
 # 步骤4: 提交审查结果（⚠️ 必须指定 --ai-model）
-python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_arch_issues.json --ai-model claude-sonnet-4
+python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_arch_issues.json --ai-model glm-5.2
 ```
 
 **重要**: 
 - 在步骤3，你必须将审查结果展示给人类确认后再提交
-- **步骤4必须指定 `--ai-model` 参数**，使用你的真实模型名称（如 `claude-sonnet-4`、`gpt-4`、`gemini-pro`）
+- **步骤4必须指定 `--ai-model` 参数**，使用你的真实模型名称（如 `glm-5.2`、`glm-5.1`、`gpt-5.6-sol`、`gpt-5.6-terra`、`claude-fable-5`、`claude-opus-5`）
 - 文件名格式：`./tmp/{repo}_pr_{number}_arch_issues.json`
 
 ## ⚠️ 禁止本地重复执行 pre-commit 已覆盖的检查
@@ -125,86 +125,12 @@ python3 architecture_review.py --pr 123
 ### 提交架构审查
 
 ```bash
-python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_arch_issues.json --ai-model claude-sonnet-4
+python3 architecture_review.py --pr 123 --submit-review ./tmp/ib_robot_pr_123_arch_issues.json --ai-model glm-5.2
 ```
 
 ## ⚠️ JSON 格式规范
 
-**重要**: `arch_issues.json` 必须遵循以下格式，否则提交会失败。
-
-### 文件结构
-
-JSON 文件必须是一个**数组**，直接包含问题对象：
-
-```json
-[
-  {
-    "file": "path/to/file.py",
-    "line": 42,
-    "title": "问题标题",
-    ...
-  }
-]
-```
-
-**错误示例** ❌ (会导致 `AttributeError: 'str' object has no attribute 'get'`):
-```json
-{
-  "issues": [...],
-  "summary": {...}
-}
-```
-
-### 必填字段
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `file` | string | 文件路径（相对于项目根目录） |
-| `line` | int | 问题起始行号 |
-| `title` | string | 问题标题（简洁明了） |
-| `description` | string | 问题描述（可包含 `\n` 换行） |
-| `severity` | string | 严重性：`critical` / `error` / `warning` / `suggestion` |
-| `pillar` | string | 架构支柱：`ssot` / `contract` / `control_mode` / `tensormsg` / `ros2` / `python` / `docs` 等 |
-
-### 可选字段
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `fix` | string | 修复建议（可包含代码示例） |
-| `context_code` | string | 相关代码片段 |
-
-### 完整示例
-
-```json
-[
-  {
-    "file": "src/robot_config/robot_config/tools/camera_alignment.py",
-    "line": 1,
-    "title": "robot_config包职责蔓延：引入了389行重型交互式UI工具",
-    "description": "camera_alignment.py包含大量交互式UI逻辑...\n\n违反原则: Package-Specific Architecture Compliance\n\n影响:\n- 包职责边界模糊\n- 违背单一职责原则",
-    "severity": "critical",
-    "pillar": "python",
-    "fix": "将camera_alignment工具迁移到dataset_tools包:\n\n```\nsrc/dataset_tools/\n├── dataset_tools/\n│   ├── camera_alignment.py\n```\n\n理由:\n1. dataset_tools职责: Episode recording\n2. 数据流程: 校准 → 录制"
-  },
-  {
-    "file": "src/robot_config/robot_config/tools/camera_alignment.py",
-    "line": 18,
-    "title": "OpenCV模块加载逻辑应提取为独立工具模块",
-    "description": "包含约90行系统级路径搜索...",
-    "severity": "warning",
-    "pillar": "python",
-    "fix": "提取为opencv_utils.py模块"
-  }
-]
-```
-
-### 验证 JSON 格式
-
-提交前可以验证 JSON 格式：
-
-```bash
-python3 -m json.tool ./tmp/ib_robot_pr_123_arch_issues.json > /dev/null && echo "✅ JSON格式正确"
-```
+`arch_issues.json` 必须是数组格式（非对象），每项含 `file` / `line` / `title` / `description` / `severity` / `pillar` 必填字段。完整字段说明、JSON 示例和验证命令见 `references/json-format.md`。
 
 ## 架构问题严重性
 
@@ -212,3 +138,13 @@ python3 -m json.tool ./tmp/ib_robot_pr_123_arch_issues.json > /dev/null && echo 
 - 🟠 **error**: 重要架构问题
 - 🟡 **warning**: 架构建议改进
 - 💡 **suggestion**: 最佳实践建议
+
+## Internal References
+
+Read only the references needed for the current scenario:
+
+| Purpose | Reference |
+|---------|-----------|
+| arch_issues.json 完整字段说明、JSON 示例、验证命令 | `references/json-format.md` |
+
+Do not expose these references as separate skills.

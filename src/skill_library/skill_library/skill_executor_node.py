@@ -38,7 +38,7 @@ from embodied_common.dispatch_binding import (
 from embodied_common.primitive_contracts import PRIMITIVE_CONTRACT_DIGEST, PRIMITIVE_DESCRIPTORS
 from embodied_common.skill_request import derive_skill_task_id
 from embodied_common.workflow_contracts import CanonicalWorkflowStep, compute_workflow_digest, normalize_workflow_steps
-from ibrobot_msgs.action import ExecuteTaskPlan, PickObject, PrimitiveCommand, SkillCommand
+from ibrobot_msgs.action import ExecuteTaskPlan, PickObject, PlaceObject, PrimitiveCommand, SkillCommand
 from ibrobot_msgs.msg import SkillCapabilityStatus, SkillDiagnostic, SkillRegistryEvent, TaskStep
 from ibrobot_msgs.srv import (
     BeginWorkflowExecution,
@@ -348,7 +348,9 @@ class SkillExecutorNode(Node):
         self.declare_parameter("arm_trajectory_action_name", "/arm_trajectory_controller/follow_joint_trajectory")
         self.declare_parameter("task_executor_action_name", "/task_executor/execute_task_plan")
         self.declare_parameter("pick_action_name", "/manipulation/execute_pick")
+        self.declare_parameter("place_action_name", "/manipulation/execute_place")
         self.declare_parameter("grasp_execution_json", "{}")
+        self.declare_parameter("placement_execution_json", "{}")
         self.declare_parameter("move_configuration_service", "/moveit_gateway/move_to_configuration")
         self.declare_parameter("ee_pose_topic", "/robot_status/ee_pose")
         self.declare_parameter("joint_state_topic", "/joint_states")
@@ -415,7 +417,9 @@ class SkillExecutorNode(Node):
             self.get_parameter("task_executor_action_name").get_parameter_value().string_value
         )
         self._pick_action_name = self.get_parameter("pick_action_name").get_parameter_value().string_value
+        self._place_action_name = self.get_parameter("place_action_name").get_parameter_value().string_value
         self._grasp_execution = load_json_mapping(self.get_parameter("grasp_execution_json").value)
+        self._placement_execution = load_json_mapping(self.get_parameter("placement_execution_json").value)
         self._move_configuration_service = (
             self.get_parameter("move_configuration_service").get_parameter_value().string_value
         )
@@ -582,6 +586,7 @@ class SkillExecutorNode(Node):
             self, PrimitiveCommand, self._primitive_action_name, callback_group=callback_group
         )
         self._pick_client = ActionClient(self, PickObject, self._pick_action_name, callback_group=callback_group)
+        self._place_client = ActionClient(self, PlaceObject, self._place_action_name, callback_group=callback_group)
         self._move_configuration_client = self.create_client(
             MoveToConfiguration,
             self._move_configuration_service,
@@ -713,19 +718,38 @@ class SkillExecutorNode(Node):
         )
 
     def _delegated_executor_descriptors(self):
-        if self._skill_catalog_profile != "so101_handeye_realsense_grasp" and not any(
-            str(template.get("executor", "")).strip() == "grasp_pipeline" for template in self._skill_templates.values()
-        ):
-            return {}
-        descriptor = DelegatedExecutorDescriptor(
-            **delegated_executor_identity(
-                name="grasp_pipeline",
-                endpoint_name=self._pick_action_name,
-                configuration=self._grasp_execution,
-                **load_delegated_model_identity(self._grasp_execution),
+        descriptors = {}
+        executor_configs = {
+            "grasp_pipeline": (self._pick_action_name, self._grasp_execution),
+            "placement_pipeline": (self._place_action_name, self._placement_execution),
+        }
+        configured_executors = {
+            str(template.get("executor", "")).strip()
+            for template in self._skill_templates.values()
+            if str(template.get("executor", "")).strip()
+        }
+        if self._grasp_execution.get("enabled", False):
+            configured_executors.add("grasp_pipeline")
+        if self._placement_execution.get("enabled", False):
+            configured_executors.add("placement_pipeline")
+        for name in sorted(configured_executors):
+            endpoint_name, configuration = executor_configs.get(name, ("", {}))
+            if not endpoint_name:
+                continue
+            descriptor = DelegatedExecutorDescriptor(
+                **delegated_executor_identity(
+                    name=name,
+                    endpoint_name=endpoint_name,
+                    configuration=configuration,
+                    **(
+                        load_delegated_model_identity(configuration)
+                        if name == "grasp_pipeline"
+                        else {"model_deployment_name": "", "model_fingerprint": "", "model_bundle_digest": ""}
+                    ),
+                )
             )
-        )
-        return {descriptor.name: descriptor}
+            descriptors[descriptor.name] = descriptor
+        return descriptors
 
     @classmethod
     def _snapshot_policy_inputs(cls, snapshot):
@@ -1165,6 +1189,7 @@ class SkillExecutorNode(Node):
                         task_id=derive_skill_task_id(root_task_id, index),
                         skill_name=step.skill_name,
                         target_name=step.target_name,
+                        container_name=step.container_name,
                         place_name=step.place_name,
                         motion_direction=step.motion_direction,
                         motion_distance=step.motion_distance,
@@ -1742,6 +1767,7 @@ class SkillExecutorNode(Node):
         skill_name: str,
         target_name: str,
         place_name: str,
+        container_name: str = "",
         motion_direction: str = "",
         motion_distance: float = 0.0,
         dispatch_binding=None,
@@ -1754,6 +1780,7 @@ class SkillExecutorNode(Node):
             request.dispatch_binding = copy_binding(dispatch_binding)
         request.skill_name = skill_name
         request.target_name = target_name
+        request.container_name = container_name
         request.place_name = place_name
         request.motion_direction = motion_direction
         request.motion_distance = float(motion_distance)
@@ -2976,6 +3003,7 @@ class SkillExecutorNode(Node):
         # execute path only; diagnostic modes and post-success release are not
         # caller-controlled fields in the v1 catalog contract.
         pick_goal.mode = PickObject.Goal.MODE_EXECUTE
+        pick_goal.supervised_direct = False
         pick_goal.release_after_success = False
         pick_goal.release_drop_height_m = -1.0
         delegated_admission = self._active_skill_admission
@@ -3115,6 +3143,214 @@ class SkillExecutorNode(Node):
         goal_handle.succeed()
         return result
 
+    @staticmethod
+    def _place_public_error(place_result) -> str:
+        """Preserve the irreversible release state in the public error code."""
+        if str(place_result.error_code) in {
+            PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+            "PRIMITIVE_CANCEL_CLEANUP_TIMEOUT",
+        }:
+            return PRIMITIVE_CANCEL_CLEANUP_TIMEOUT
+        if int(place_result.release_status) == PlaceObject.Result.RELEASE_UNKNOWN:
+            return "PLACE_RELEASE_STATE_UNKNOWN"
+        if int(place_result.release_status) == PlaceObject.Result.RELEASE_RELEASED:
+            if int(place_result.verification_status) == PlaceObject.Result.VERIFICATION_FAILED:
+                return "PLACE_RELEASED_VERIFICATION_FAILED"
+            if int(place_result.verification_status) == PlaceObject.Result.VERIFICATION_UNCERTAIN:
+                return "PLACE_RELEASED_VERIFICATION_UNCERTAIN"
+            if int(place_result.verification_status) == PlaceObject.Result.VERIFICATION_NOT_RUN:
+                return "PLACE_RELEASED_VERIFICATION_NOT_RUN"
+        return "PLACE_NOT_RELEASED"
+
+    def _execute_place_skill(
+        self,
+        goal_handle,
+        template: dict,
+        *,
+        effective_timeout_sec: float | None = None,
+    ) -> SkillCommand.Result:
+        """Delegate placement while retaining the Gateway lease through terminal cleanup."""
+        goal = goal_handle.request
+        result = SkillCommand.Result()
+        timeout_sec = float(effective_timeout_sec or goal.timeout_sec or template.get("timeout_sec", 60.0))
+        if not self._place_client.wait_for_server(timeout_sec=self._rpc_timeout):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "PLACE_SERVER_UNAVAILABLE",
+                f"placement action server unavailable: {self._place_action_name}",
+            )
+
+        completed_phases: list[str] = []
+
+        def feedback_cb(feedback_msg) -> None:
+            place_feedback = feedback_msg.feedback
+            phase = str(place_feedback.phase)
+            if phase and (not completed_phases or completed_phases[-1] != phase):
+                completed_phases.append(phase)
+            feedback = SkillCommand.Feedback()
+            feedback.state = "executing"
+            feedback.detail = f"place:{phase}:{place_feedback.detail}"
+            goal_handle.publish_feedback(feedback)
+
+        place_goal = PlaceObject.Goal()
+        place_goal.dispatch_binding = copy_binding(goal.dispatch_binding)
+        place_goal.dispatch_binding.dispatch_nonce = uuid.uuid4().hex
+        bundle = self._active_runtime_bundle
+        executor = bundle.snapshot.delegated_executors.get("placement_pipeline")
+        if executor is None:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                [],
+                "SKILL_EXECUTOR_IDENTITY_MISMATCH",
+                "placement executor missing",
+            )
+        expected_executor = {
+            "name": executor.name,
+            "contract_version": executor.contract_version,
+            "endpoint_kind": executor.endpoint_kind,
+            "endpoint_name": executor.endpoint_name,
+            "configuration_digest": executor.configuration_digest,
+            "model_deployment_name": executor.model_deployment_name,
+            "model_fingerprint": executor.model_fingerprint,
+            "model_bundle_digest": executor.model_bundle_digest,
+        }
+        fill_delegated_executor_identity(place_goal.expected_executor, expected_executor)
+        place_goal.target_query = goal.target_name
+        place_goal.container_query = goal.container_name
+        place_goal.timeout_sec = timeout_sec
+
+        delegated_admission = self._active_skill_admission
+        delegated_nonce = place_goal.dispatch_binding.dispatch_nonce
+        cleanup_key = self._register_delegated_dispatch(
+            delegated_nonce,
+            delegated_admission,
+            place_goal.dispatch_binding,
+        )
+        delegated_terminal = False
+        late_cleanup = _LateCleanupConfirmation()
+        late_cleanup.add_callback(
+            lambda: self._confirm_delegated_terminal(delegated_admission, delegated_nonce, cleanup_key)
+        )
+        try:
+            send_future = self._place_client.send_goal_async(place_goal, feedback_callback=feedback_cb)
+            if not self._wait_for_future(send_future, timeout_sec=self._rpc_timeout):
+                late_cleanup.watch_goal_future(send_future, self._best_effort_cancel_goal)
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    completed_phases,
+                    PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    "placement goal response timed out: delegated execution state is unknown",
+                )
+            place_handle = send_future.result()
+            if place_handle is None or not place_handle.accepted:
+                delegated_terminal = True
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    completed_phases,
+                    "PLACE_GOAL_REJECTED",
+                    "placement executor rejected the goal",
+                )
+
+            result_future = place_handle.get_result_async()
+            deadline = time.monotonic() + timeout_sec
+            while rclpy.ok() and not result_future.done():
+                if goal_handle.is_cancel_requested:
+                    if not self._cancel_goal(place_handle, result_future, late_cleanup):
+                        return self._abort_skill(
+                            result,
+                            goal_handle,
+                            completed_phases,
+                            PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                            "placement cancellation state is unknown",
+                        )
+                    delegated_terminal = True
+                    break
+                if time.monotonic() >= deadline:
+                    if not self._cancel_goal(place_handle, result_future, late_cleanup):
+                        return self._abort_skill(
+                            result,
+                            goal_handle,
+                            completed_phases,
+                            PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                            "placement timeout cleanup state is unknown",
+                        )
+                    delegated_terminal = True
+                    break
+                time.sleep(0.05)
+            if not result_future.done():
+                return self._abort_skill(
+                    result,
+                    goal_handle,
+                    completed_phases,
+                    PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                    "placement execution state is unknown",
+                )
+            delegated_terminal = True
+            late_cleanup.confirm()
+            action_result = result_future.result()
+            place_result = action_result.result if action_result is not None else None
+        except Exception:
+            self.get_logger().error(f"delegated placement execution failed:\n{traceback.format_exc()}")
+            if (
+                "place_handle" in locals()
+                and place_handle is not None
+                and "result_future" in locals()
+                and self._cancel_goal(place_handle, result_future, late_cleanup)
+            ):
+                delegated_terminal = True
+            return self._abort_skill(
+                result,
+                goal_handle,
+                completed_phases,
+                PRIMITIVE_CANCEL_CLEANUP_TIMEOUT,
+                "delegated placement execution state is unknown",
+            )
+        finally:
+            if delegated_terminal:
+                late_cleanup.confirm()
+
+        result.executed_primitives = [f"placement_pipeline:{phase}" for phase in completed_phases]
+        if place_result is None:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                result.executed_primitives,
+                "MISSING_PLACE_RESULT",
+                "placement executor returned no result",
+            )
+        if not delegated_executor_identity_matches(place_result.actual_executor, expected_executor):
+            return self._abort_skill(
+                result,
+                goal_handle,
+                result.executed_primitives,
+                "SKILL_EXECUTOR_IDENTITY_MISMATCH",
+                "placement executor identity does not match the registry snapshot",
+            )
+        result.debug_output_dir = str(getattr(place_result, "debug_output_dir", ""))
+        if goal_handle.is_cancel_requested and place_result.error_code == "PLACE_CANCELLED":
+            return self._cancel_skill(result, goal_handle, result.executed_primitives, goal.skill_name)
+        if not place_result.success or not place_result.place_succeeded:
+            return self._abort_skill(
+                result,
+                goal_handle,
+                result.executed_primitives,
+                self._place_public_error(place_result),
+                place_result.message,
+            )
+
+        result.success = True
+        result.error_code = ""
+        result.message = place_result.message
+        self._set_result_catalog_identity(result)
+        result.diagnostics = []
+        goal_handle.succeed()
+        return result
+
     def _execute_skill(self, goal_handle):
         try:
             return self._execute_skill_gateway(goal_handle)
@@ -3139,6 +3375,7 @@ class SkillExecutorNode(Node):
             task_id=_binding_task_id(goal),
             skill_name=goal.skill_name,
             target_name=goal.target_name,
+            container_name=goal.container_name,
             place_name=goal.place_name,
             motion_direction=goal.motion_direction,
             motion_distance=goal.motion_distance,
@@ -3243,6 +3480,7 @@ class SkillExecutorNode(Node):
                 goal.skill_name,
                 goal.target_name,
                 goal.place_name,
+                container_name=goal.container_name,
                 motion_direction=goal.motion_direction,
                 motion_distance=goal.motion_distance,
                 dispatch_binding=goal.dispatch_binding,
@@ -3350,6 +3588,7 @@ class SkillExecutorNode(Node):
                 schema_version=1,
                 skill_name=goal.skill_name,
                 target_name=goal.target_name,
+                container_name=goal.container_name,
                 place_name=goal.place_name,
                 motion_direction=goal.motion_direction,
                 motion_distance=goal.motion_distance,
@@ -3434,6 +3673,7 @@ class SkillExecutorNode(Node):
                     task_id=binding.task_id,
                     skill_name=goal.skill_name,
                     target_name=goal.target_name,
+                    container_name=goal.container_name,
                     place_name=goal.place_name,
                     motion_direction=goal.motion_direction,
                     motion_distance=goal.motion_distance,
@@ -3479,6 +3719,7 @@ class SkillExecutorNode(Node):
                 goal.skill_name,
                 goal.target_name,
                 goal.place_name,
+                container_name=goal.container_name,
                 motion_direction=goal.motion_direction,
                 motion_distance=goal.motion_distance,
                 dispatch_binding=goal.dispatch_binding,
@@ -3577,6 +3818,7 @@ class SkillExecutorNode(Node):
                 goal.skill_name,
                 goal.target_name,
                 goal.place_name,
+                container_name=goal.container_name,
                 motion_direction=goal.motion_direction,
                 motion_distance=goal.motion_distance,
                 dispatch_binding=goal.dispatch_binding,
@@ -3593,6 +3835,12 @@ class SkillExecutorNode(Node):
         template = active_templates.get(goal.skill_name, {})
         if str(template.get("executor", "")).strip() == "grasp_pipeline":
             return self._execute_pick_skill(
+                goal_handle,
+                template,
+                effective_timeout_sec=effective_timeout_sec,
+            )
+        if str(template.get("executor", "")).strip() == "placement_pipeline":
+            return self._execute_place_skill(
                 goal_handle,
                 template,
                 effective_timeout_sec=effective_timeout_sec,
@@ -3945,7 +4193,17 @@ def main(args=None) -> None:
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
-        executor.spin()
+        # A client may disappear after its request times out.  Fast DDS then
+        # raises from ``send_response``; do not let that transport condition
+        # tear down the Gateway and all of its safety services.
+        while rclpy.ok():
+            try:
+                executor.spin_once()
+            except Exception as exc:
+                node.get_logger().error(
+                    "[skill_executor] ROS callback/response failed; keeping Gateway alive: "
+                    f"{exc}\n{traceback.format_exc()}"
+                )
     finally:
         executor.shutdown()
         node.destroy_node()

@@ -459,7 +459,8 @@ distributed cloud node separately with `inference_service cloud_inference.launch
 IB-Robot includes built-in AI programming agent skills to help Claude Code, Gemini CLI, OpenCode, and other AI Agents better understand the project architecture and development workflow. For available skills, see [.agents/skills/README.md](.agents/skills/README.md).
 
 The default interface for robot capability discovery and guarded execution is `robot-skill`, not MCP, raw `ros2`,
-primitive, MoveIt, or controller commands. Real motion requires explicit user confirmation, and a running Agent must
+primitive, MoveIt, or controller commands. Natural-language plans are shown and flushed before immediate Gateway
+admission and execution, and a running Agent must
 never enable `authorize_motion`.
 
 The default control path is:

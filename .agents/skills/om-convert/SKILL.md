@@ -174,6 +174,10 @@ evidence, ATC version, target, and resolution source.
 
 ## Shared Execution Rules
 
+- Conversion intermediates (ONNX, ABI JSON, ATC logs, OM candidates) are written to
+  `models/_work/<bundle>/<exporter>/` by exporter default, never inside a bundle. Perception OM
+  candidates live under `models/_work/<bundle>/candidates/`. Before releasing or archiving a
+  bundle, verify it contains only manifest-referenced artifacts plus required LeRobot metadata.
 - Load `source .shrc_local` before every project command; after a build, also load
   `source install/setup.sh` for runtime commands.
 - Generate Torch targets before testing OM accuracy. Target generation and OM deployment are expected

@@ -23,6 +23,17 @@ The project root is: `<project_root>`
 cd <project_root>
 ```
 
+## Internal References
+
+Read only the references needed for the current scenario:
+
+| Purpose | Reference |
+|---------|-----------|
+| Build troubleshooting（ROS_DOMAIN_ID 缺失、lerobot 导入失败、merge-install 报错等） | `references/troubleshooting.md` |
+| 特定 ROS 2 包的构建特性（robot_config / inference_service / so101_hardware） | `references/package-notes.md` |
+
+Do not expose these references as separate skills.
+
 ## Core Mandate: Environment Inheritance
 
 Every execution that depends on project environment variables (ROS 2 Humble, venv, PYTHONPATH, **ROS_DOMAIN_ID**) **MUST** be preceded by sourcing `.shrc_local` and (when needed) exporting `ROS_DOMAIN_ID` within the same shell context.
@@ -31,14 +42,8 @@ Every execution that depends on project environment variables (ROS 2 Humble, ven
 
 ### 1. Building the Project
 
-**Step 0: Change to project root (if not already there)**
 ```bash
 cd <project_root>
-```
-
-Building does NOT require ROS_DOMAIN_ID, but needs PYTHONPATH and other environment setup:
-
-```bash
 source .shrc_local && ./scripts/build.sh
 ```
 
@@ -51,11 +56,6 @@ source .shrc_local && colcon build --symlink-install --merge-install --packages-
 
 ### 2. Running Nodes or Launch Files
 
-**Step 0: Change to project root (if not already there)**
-```bash
-cd <project_root>
-```
-
 Any `ros2 run` or `ros2 launch` command **MUST** include both environment setup AND ROS_DOMAIN_ID:
 
 ```bash
@@ -63,11 +63,6 @@ source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 launch robot_config robot.
 ```
 
 ### 3. ROS 2 Commands
-
-**Step 0: Change to project root (if not already there)**
-```bash
-cd <project_root>
-```
 
 Any `ros2` command (topic list, node list, service call, etc.) also needs ROS_DOMAIN_ID:
 
@@ -163,115 +158,28 @@ The inference_service package requires:
 ### Pattern 1: After Code Changes
 
 ```bash
-# Build (no ROS_DOMAIN_ID)
 source .shrc_local && colcon build --symlink-install --merge-install --packages-select robot_config
 ```
 
 ### Pattern 2: Running Tests
 
 ```bash
-# Runtime (needs ROS_DOMAIN_ID)
 source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 test ...
 ```
 
 ### Pattern 3: Clean Build
 
 ```bash
-# Build (no ROS_DOMAIN_ID)
 source .shrc_local && rm -rf build install log && colcon build --symlink-install --merge-install --cmake-args -DCMAKE_BUILD_TYPE=Release
 ```
 
 ### Pattern 4: Launch System
 
 ```bash
-# Runtime (needs ROS_DOMAIN_ID)
 source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.zsh && ros2 launch robot_config robot.launch.py use_sim:=true
 ```
 
-## Troubleshooting
-
-### Issue: Controllers fail to spawn / Nodes cannot discover each other
-
-**Root Cause**: ROS_DOMAIN_ID not set, causing DDS discovery to use default domain (0)
-
-**Solution**: Always export ROS_DOMAIN_ID for runtime operations:
-```bash
-source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 launch ...
-```
-
-### Issue: ModuleNotFoundError: No module named 'lerobot'
-
-**Root Cause**: PYTHONPATH not set, .shrc_local not sourced in current shell
-
-**Solution**: Always source .shrc_local:
-```bash
-source .shrc_local && <your_command>
-```
-
-**Wrong** (won't work):
-```python
-# Bash call 1
-source .shrc_local
-
-# Bash call 2
-ros2 launch robot_config robot.launch.py  # ← PYTHONPATH and ROS_DOMAIN_ID lost!
-```
-
-**Correct**:
-```python
-# Single Bash call
-source .shrc_local && export ROS_DOMAIN_ID=42 && ros2 launch robot_config robot.launch.py
-```
-
-### Issue: colcon build error - "install directory was created with the layout 'merged'"
-
-**Root Cause**: Workspace uses merged install layout, but command doesn't include `--merge-install`
-
-**Solution**: Add `--merge-install` flag:
-```bash
-source .shrc_local && colcon build --symlink-install --merge-install --packages-select robot_config
-```
-
-### Issue: Build Errors - venv not found
-
-**Root Cause**: Virtual environment doesn't exist
-
-**Solution**: Run setup script first:
-```bash
-./scripts/setup.sh
-```
-
-### Issue: Import errors after build
-
-**Root Cause**: Environment not refreshed after build
-
-**Solution**: Source setup in same command:
-```bash
-source .shrc_local && colcon build --symlink-install --merge-install --packages-select robot_config && source install/setup.zsh && python3 -c "import lerobot; print('OK')"
-```
-
-## Package-Specific Build Notes
-
-### robot_config (Python package)
-```bash
-source .shrc_local && colcon build --symlink-install --merge-install --packages-select robot_config
-```
-- Fast build (~1 second)
-- Generates contracts at launch time (not build time)
-
-### inference_service (Python package)
-```bash
-source .shrc_local && colcon build --symlink-install --merge-install --packages-select inference_service
-```
-- Requires lerobot in PYTHONPATH
-- Depends on rosetta_interfaces
-
-### so101_hardware (C++ + Python)
-```bash
-source .shrc_local && colcon build --symlink-install --merge-install --packages-select so101_hardware
-```
-- Has C++ ros2_control component
-- Also has Python scripts
+遇到错误时参考 `references/troubleshooting.md`。特定包构建特性参考 `references/package-notes.md`。
 
 ## When to Use This Skill
 

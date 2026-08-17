@@ -373,6 +373,7 @@ class TaskExecutorNode(BaseTaskNode):
                 goal.dispatch_binding.workflow_step_index = skill_index
                 goal.skill_name = skill_name
                 goal.target_name = step.target_name
+                goal.container_name = step.container_name
                 goal.place_name = step.place_name
                 goal.motion_direction = step.motion_direction
                 goal.motion_distance = step.motion_distance

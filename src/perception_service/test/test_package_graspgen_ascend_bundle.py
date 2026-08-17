@@ -6,15 +6,15 @@
 #
 # http://www.apache.org/licenses/LICENSE-2.0
 
-"""GraspGen packages into a perception bundle, not a LeRobot policy bundle.
+"""GraspGen packages into a grasp-domain bundle, not a LeRobot policy bundle.
 
 The previous packager wrote ``config.json``, ``policy_preprocessor.json`` and
-``policy_postprocessor.json`` so that a perception model would survive the policy loader's
+``policy_postprocessor.json`` so that a non-policy model would survive the policy loader's
 LeRobot asset checks, and it wrote them before any of the eight OM ABIs had been read - so
 a missing artifact left a bundle that looked packaged and was not. These tests hold the
-replacement to the shape RAM++ and SigLIP2 already have: a ``kind="perception"``
-descriptor, the model's own constants in ``assets/adapter.json``, and nothing written at
-all until every role has been resolved.
+replacement to the generic runtime shape already used by staged models: the current
+compatibility descriptor, the model's own constants in ``assets/adapter.json``, and
+nothing written at all until every role has been resolved.
 """
 
 from __future__ import annotations

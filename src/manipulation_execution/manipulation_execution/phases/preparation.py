@@ -44,11 +44,63 @@ from manipulation_execution.so101_kinematics_guard import (
     joint5_within_abs_limit,
 )
 
-JOINT5_ORIENTATION_MAX_CLOSING_ERROR_DEG = 20.0
+JOINT5_ORIENTATION_MAX_CLOSING_ERROR_DEG = 27.0
 
 
 class PreparationPhase:
     """Convert ranked source candidates into executable target configurations."""
+
+    @classmethod
+    def _load_home_joint_positions(cls, raw_value: str) -> dict[str, float]:
+        positions = cls._load_json_object(raw_value)
+        normalized: dict[str, float] = {}
+        for name, value in positions.items():
+            position = float(value)
+            if not math.isfinite(position):
+                raise ValueError(f"HOME joint position for joint {name} must be finite")
+            normalized[str(name)] = position
+        return normalized
+
+    def _validate_home_joint_config(self) -> None:
+        guard = self._orientation_guard()
+        if bool(guard.get("joint5_constraints_enabled", False)) and "5" not in self._home_joint_positions:
+            raise ValueError(
+                'ros2_control.reset_positions["5"] is required when joint 5 orientation constraints are enabled'
+            )
+
+    def _kinematics_joint_state(self, joint_state: JointState) -> JointState:
+        """Build the position-only arm state accepted by MoveIt IK/FK services."""
+        names = [str(name) for name in joint_state.name]
+        positions = [float(position) for position in joint_state.position]
+        if len(names) != len(positions):
+            raise PickFlowError(
+                "INVALID_JOINT_STATE",
+                f"joint state has {len(names)} names but {len(positions)} positions",
+            )
+        if len(set(names)) != len(names):
+            raise PickFlowError("INVALID_JOINT_STATE", "joint state contains duplicate joint names")
+
+        position_by_name = dict(zip(names, positions, strict=True))
+        missing = [name for name in self._arm_joint_names if name not in position_by_name]
+        if missing:
+            raise PickFlowError(
+                "INVALID_JOINT_STATE",
+                f"joint state is missing configured arm joints: {', '.join(missing)}",
+            )
+        arm_positions = [position_by_name[name] for name in self._arm_joint_names]
+        if not all(math.isfinite(position) for position in arm_positions):
+            raise PickFlowError("INVALID_JOINT_STATE", "configured arm joint positions must be finite")
+
+        normalized = JointState()
+        normalized.header = joint_state.header
+        normalized.name = list(self._arm_joint_names)
+        normalized.position = arm_positions
+        # Do not forward velocity/effort from the aggregate hardware topic.
+        # MoveIt kinematics needs positions only, while LeKiwi publishes NaN
+        # effort and non-model base joints that can abort the service process.
+        normalized.velocity = []
+        normalized.effort = []
+        return normalized
 
     def _solve_ik(
         self,
@@ -68,7 +120,7 @@ class PreparationPhase:
         request.ik_request.pose_stamped.pose = pose
         request.ik_request.avoid_collisions = bool(ik_config.get("avoid_collisions", False))
         if seed is not None:
-            request.ik_request.robot_state.joint_state = seed
+            request.ik_request.robot_state.joint_state = self._kinematics_joint_state(seed)
         # The solver budget must stay small. LMA retries from a random joint
         # configuration whenever the seeded attempt fails and keeps retrying
         # until this timeout expires, which discards the joint5 seed the
@@ -88,7 +140,7 @@ class PreparationPhase:
         request = GetPositionFK.Request()
         request.header.frame_id = self._base_frame
         request.fk_link_names = [self._ee_frame]
-        request.robot_state.joint_state = joint_state
+        request.robot_state.joint_state = self._kinematics_joint_state(joint_state)
         future = client.call_async(request)
         response = self._wait_future(future, goal_handle, deadline, self._rpc_timeout, "FK", retryable=True)
         if int(response.error_code.val) != 1 or not response.pose_stamped:
@@ -388,12 +440,17 @@ class PreparationPhase:
                 retryable=True,
             ) from exc
         minimum_alignment = max(-1.0, min(1.0, float(base_side_config.get("min_alignment_cos", 0.0))))
+        minimum_fk_inward_offset = max(0.0, float(base_side_config.get("min_fk_inward_offset_m", 0.0)))
+        failures = []
         if alignment.alignment_cos < minimum_alignment:
+            failures.append(f"alignment={alignment.alignment_cos:.3f} < {minimum_alignment:.3f}")
+        if alignment.inward_offset_m < minimum_fk_inward_offset:
+            failures.append(f"inward_offset={alignment.inward_offset_m:.4f}m < {minimum_fk_inward_offset:.4f}m")
+        if failures:
             raise PickFlowError(
                 "FK_FIXED_FINGER_BASE_SIDE_REJECTED",
-                f"candidate {candidate_index}: final FK fixed finger is on the outer side "
-                f"(alignment={alignment.alignment_cos:.3f} < {minimum_alignment:.3f}, "
-                f"inward_offset={alignment.inward_offset_m:.4f}m)",
+                f"candidate {candidate_index}: final FK fixed finger does not have enough inward placement "
+                f"({', '.join(failures)})",
                 retryable=True,
             )
         return alignment
@@ -406,10 +463,13 @@ class PreparationPhase:
         deadline: float,
         *,
         apply_compensation: bool = False,
+        enforce_contact_error: bool = True,
+        enforce_fixed_finger_robust_gap: bool = True,
         initial_seed: JointState | None = None,
         ik_client=None,
         fk_client=None,
     ) -> PreparedCandidate:
+        del enforce_fixed_finger_robust_gap
         plan = ranked.plan
         compensation = self._config.get("contact_compensation", {})
         payload: IKPayload
@@ -494,7 +554,7 @@ class PreparationPhase:
                 z_error,
             )
 
-            if compensation_enabled:
+            if compensation_enabled and enforce_contact_error:
                 max_correction = max(0.0, float(compensation.get("max_correction_m", 0.03)))
                 residual_x = float(plan.target_contact_base[0] - predicted_contact[0])
                 residual_y = float(plan.target_contact_base[1] - predicted_contact[1])
@@ -506,7 +566,11 @@ class PreparationPhase:
                         retryable=True,
                     )
 
-        if compensation_enabled and abs(z_error) > float(compensation.get("max_z_error_m", 0.015)):
+        if (
+            compensation_enabled
+            and enforce_contact_error
+            and abs(z_error) > float(compensation.get("max_z_error_m", 0.015))
+        ):
             raise PickFlowError(
                 "CONTACT_Z_ERROR",
                 f"candidate {ranked.index}: contact z error {z_error:.4f}",

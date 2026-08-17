@@ -21,6 +21,7 @@ setup(
     license="Apache-2.0",
     entry_points={
         "console_scripts": [
+            "audio_playback_node = voice_tts_service.audio_playback_node:main",
             "package_zipvoice_310p = voice_tts_service.package_zipvoice_310p:main",
         ]
     },

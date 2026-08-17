@@ -7,6 +7,9 @@ description:
   category: manipulation
   when_to_use:
   - pick up a visible object identified by a text query
+  do_not_use:
+  - condition: the object is already held and must be placed into a visible container
+    instead_use: place_in_container
   aliases_zh:
   - 抓取物体
   - 拿起物体
@@ -37,4 +40,5 @@ capability:
     - target_name
   recovery_policy: ask_user
 implementations:
-  so101_handeye_realsense_grasp: implementations/so101_handeye_realsense_grasp.yaml
+  lekiwi_handeye_realsense_grasp: implementations/lekiwi_handeye_realsense_grasp.yaml
+  lekiwi_handeye_realsense_grasp_pc: implementations/lekiwi_handeye_realsense_grasp_pc.yaml

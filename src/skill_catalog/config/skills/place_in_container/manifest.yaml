@@ -1,0 +1,53 @@
+schema_version: 1
+name: place_in_container
+version: 1.0.0
+semantic_level: skill
+description:
+  summary: Move to the configured container, release the held object, and verify placement.
+  category: placement
+  when_to_use:
+  - place a held object into a visible container
+  - drop an object into the configured bin and verify it
+  do_not_use:
+  - condition: only open the gripper without container detection or verification
+    instead_use: open_gripper_skill
+  - condition: the object is not held and must first be detected and grasped
+    instead_use: pick_object
+  aliases_zh:
+  - 放进容器
+  - 放到盒子里
+  - 投入料框
+  aliases_en:
+  - place in container
+  - drop into bin
+  motion_scope:
+  - arm
+  - gripper
+  anchor_pose: none
+  intensity: moderate
+  duration_sec_estimate: 30.0
+  requires_motion_params: false
+  rule_entry: false
+capability:
+  schema_version: 1
+  summary: Move to the configured container, release the held object, and verify placement.
+  domain: manipulation
+  moves_robot: true
+  required_control_mode: moveit_planning
+  parameters:
+    type: object
+    additionalProperties: false
+    properties:
+      target_name:
+        type: string
+        freeform: true
+      container_name:
+        type: string
+        freeform: true
+    required:
+    - target_name
+    - container_name
+  recovery_policy: ask_user
+implementations:
+  lekiwi_handeye_realsense_grasp: implementations/lekiwi_handeye_realsense_grasp.yaml
+  lekiwi_handeye_realsense_grasp_pc: implementations/lekiwi_handeye_realsense_grasp_pc.yaml

@@ -34,6 +34,35 @@ def generate_localization_nodes(
     """
     nodes = []
 
+    slam_toolbox_config = nav_config.get("slam_toolbox", {})
+    if slam_toolbox_config.get("enabled", False) and not use_sim:
+        params_file = slam_toolbox_config.get("params_file", "")
+        parameters = [resolve_ros_path(params_file)] if params_file else []
+        parameters.append(
+            {
+                "use_sim_time": use_sim,
+                "base_frame": slam_toolbox_config.get("base_frame", "base_link"),
+                "odom_frame": slam_toolbox_config.get("odom_frame", "odom"),
+                "map_frame": slam_toolbox_config.get("map_frame", "map"),
+                "minimum_travel_distance": slam_toolbox_config.get("minimum_travel_distance", 0.5),
+                "minimum_travel_heading": slam_toolbox_config.get("minimum_travel_heading", 0.5),
+                "map_update_interval": slam_toolbox_config.get("map_update_interval", 10.0),
+                "min_laser_range": slam_toolbox_config.get("min_laser_range", 0.0),
+                "max_laser_range": slam_toolbox_config.get("max_laser_range", 25.0),
+            }
+        )
+        nodes.append(
+            Node(
+                package="slam_toolbox",
+                executable=slam_toolbox_config.get("executable", "async_slam_toolbox_node"),
+                name=slam_toolbox_config.get("node_name", "slam_toolbox"),
+                output="screen",
+                parameters=parameters,
+                remappings=[("scan", slam_toolbox_config.get("scan_topic", "/scan"))],
+            )
+        )
+        logger.info("Added slam_toolbox node")
+
     ekf_rtabmap_config = nav_config.get("ekf_rtabmap", {})
     ekf_rtabmap_enabled = ekf_rtabmap_config.get("enabled", False)
 

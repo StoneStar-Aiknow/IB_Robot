@@ -145,10 +145,12 @@ def _write_provenance(args: argparse.Namespace, output_dir: Path) -> Path:
 
 def export_hmm(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir).resolve()
+    bundle_root = Path(args.bundle_root).resolve() if args.bundle_root else output_dir
     rknn_args = argparse.Namespace(
         model_path=args.model_path,
         lerobot_src=args.lerobot_src,
         output_dir=str(output_dir),
+        bundle_root=str(bundle_root),
         device=args.device,
         image_height=args.image_height,
         image_width=args.image_width,
@@ -185,6 +187,9 @@ def main() -> None:
     parser.add_argument("--model-path", required=True)
     parser.add_argument("--lerobot-src", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--bundle-root", default=None, help="Bundle root receiving LeRobot metadata (default: --output-dir)"
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--image-height", type=int, default=512)
     parser.add_argument("--image-width", type=int, default=512)

@@ -5,13 +5,14 @@
 # You may obtain a copy of the License at
 #
 # http://www.apache.org/licenses/LICENSE-2.0
-"""Package the eight compiled GraspGen OM artifacts as a schema-v2 perception bundle.
+"""Package the eight compiled GraspGen OM artifacts as a schema-v2 grasp bundle.
 
 This bridges the Huawei GraspGen toolchain - which emits a flat ``graspgen.onnx.json``
-plus one OM per role - and the unified bundle the perception model service loads. GraspGen
-is a perception model, so the manifest carries a ``ModelDescriptor(kind="perception")``
-and the model's own constants live in ``assets/adapter.json`` beside the adapter identity.
-No LeRobot policy asset is written or required.
+plus one OM per role - and the unified bundle the generic model runtime loads. GraspGen
+belongs to the grasp model domain; the current runtime carries a
+``ModelDescriptor(kind="perception")`` only as its existing compatibility category.
+The model's own constants live in ``assets/adapter.json`` and no LeRobot policy asset is
+written or required.
 
 Only ``observation.object_points``, ``grasp.poses`` and ``grasp.confidence`` are external
 semantics. Everything the eight roles exchange is either an ``internal.*`` embedding
@@ -388,7 +389,7 @@ def _load_onnx_manifest(path: Path) -> dict[str, Any]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Package compiled GraspGen OM artifacts as a schema-v2 perception bundle.",
+        description="Package compiled GraspGen OM artifacts as a schema-v2 grasp-domain bundle.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--bundle-root", required=True, help="Target bundle directory.")
@@ -448,7 +449,7 @@ def main() -> int:
         abi_device_id=args.abi_device_id,
         acl_config_path=args.acl_config_path,
     )
-    print(f"GraspGen perception bundle written: {manifest_path}")
+    print(f"GraspGen bundle written: {manifest_path}")
     return 0
 
 

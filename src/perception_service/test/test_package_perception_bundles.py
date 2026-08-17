@@ -45,7 +45,7 @@ def test_ram_plus_packager_promotes_available_ascend_om_deployments(tmp_path) ->
     root = tmp_path / spec.name
     _write_required_assets(root, spec)
     for compiled in spec.compiled:
-        candidate = root / compiled.source
+        candidate = root.parent / "_work" / root.name / compiled.source
         candidate.parent.mkdir(parents=True, exist_ok=True)
         candidate.write_bytes(compiled.deployment.encode())
 
@@ -65,7 +65,7 @@ def test_ram_plus_packager_promotes_available_ascend_om_deployments(tmp_path) ->
 
     compiled = spec.compiled[0]
     deployment = first.deployments[compiled.deployment]
-    candidate = root / compiled.source
+    candidate = root.parent / "_work" / root.name / compiled.source
     candidate.write_bytes(b"replacement-om")
     package_bundle(root, spec)
     third = load_inference_manifest(root, compiled.deployment).manifest
@@ -87,6 +87,8 @@ def test_ram_plus_packager_omits_unavailable_ascend_deployment(tmp_path) -> None
 def test_grounded_sam2_bundle_uses_source_bound_architecture_config() -> None:
     spec = _specs()["grounded_sam2"]
 
+    assert (spec.model.family, spec.model.operation) == ("grounding_dino", "combined")
+    assert (spec.adapter["family"], spec.adapter["operation"]) == ("grounding_dino", "combined")
     assert "gdino_config" not in spec.adapter
     assert all(not path.endswith(".py") for path in spec.required_paths)
 

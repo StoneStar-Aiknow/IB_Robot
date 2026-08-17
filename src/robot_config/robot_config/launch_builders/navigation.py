@@ -110,13 +110,22 @@ def _generate_real_navigation(
         logger.info("Navigation disabled, skipping")
         return []
 
+    if "nav_stage" in robot_config:
+        _validate_global_localization_provider(robot_config["nav_stage"], navigation_config)
+    _validate_navigation_velocity_contract(robot_config, navigation_config)
+
     logger.info("Navigation enabled, generating nodes...")
     nodes = []
+
+    from robot_config.launch_builders.fast_lio import generate_fast_lio_nodes
+
+    nodes.extend(generate_fast_lio_nodes(navigation_config, use_sim=use_sim))
 
     # Lazy imports for sub-builders (only needed in real-hardware mode)
     from robot_config.launch_builders.cmd_vel import generate_cmd_vel_nodes
     from robot_config.launch_builders.localization import generate_localization_nodes
     from robot_config.launch_builders.nav2 import generate_nav2_nodes
+    from robot_config.launch_builders.navigation_command import generate_navigation_command_nodes
     from robot_config.launch_builders.static_tf import generate_static_tf_nodes
     from robot_config.launch_builders.voice_nav import generate_voice_nav_nodes
 
@@ -128,12 +137,20 @@ def _generate_real_navigation(
 
     # 3. Nav2 bringup
     nodes.extend(generate_nav2_nodes(navigation_config, use_sim=use_sim))
+    nodes.extend(generate_navigation_command_nodes(navigation_config, use_sim=use_sim))
 
     # 4. CmdVel bridge (needs to know if EKF is running)
     ekf_rtabmap_config = navigation_config.get("ekf_rtabmap", {})
     ekf_node_config = ekf_rtabmap_config.get("ekf", {})
     ekf_enabled = ekf_rtabmap_config.get("enabled", False) and ekf_node_config.get("enabled", True) and not use_sim
-    nodes.extend(generate_cmd_vel_nodes(navigation_config, ekf_enabled=ekf_enabled, use_sim=use_sim))
+    nodes.extend(
+        generate_cmd_vel_nodes(
+            navigation_config,
+            motion_mode_config=robot_config.get("motion_mode", {}),
+            ekf_enabled=ekf_enabled,
+            use_sim=use_sim,
+        )
+    )
 
     # 5. Voice-controlled navigation (Nav2 goal client + FunASR)
     nodes.extend(generate_voice_nav_nodes(navigation_config, use_sim=use_sim))
@@ -169,6 +186,40 @@ def _generate_real_navigation(
     return nodes
 
 
+def _validate_global_localization_provider(nav_stage: str, navigation_config: dict[str, Any]) -> None:
+    """Require exactly one stage-appropriate map-to-odom authority."""
+    slam_enabled = navigation_config.get("slam_toolbox", {}).get("enabled", False)
+    nav2_config = navigation_config.get("nav2_bringup", {})
+    nav2_enabled = nav2_config.get("enabled", False)
+    amcl_enabled = nav2_enabled and nav2_config.get("use_amcl", False)
+    valid = {
+        "mapping": slam_enabled and not nav2_enabled,
+        "navigation": not slam_enabled and amcl_enabled,
+    }
+
+    if not valid.get(nav_stage, False):
+        raise ValueError(
+            f"nav_stage '{nav_stage}' must enable exactly one matching global localization provider "
+            "(mapping=slam_toolbox, navigation=Nav2 AMCL)"
+        )
+
+
+def _validate_navigation_velocity_contract(robot_config: dict[str, Any], navigation_config: dict[str, Any]) -> None:
+    """Reject only the LiDAR dynamic chain that would bypass Collision Monitor."""
+    if robot_config.get("name") != "lekiwi_lidar":
+        return
+    nav2_config = navigation_config.get("nav2_bringup", {})
+    if not nav2_config.get("dyn_avoid_enabled", False):
+        return
+
+    bridge_topic = navigation_config.get("cmd_vel_bridge", {}).get("cmd_vel_topic", "/cmd_vel")
+    stop_topic = navigation_config.get("command_server", {}).get("stop_velocity_topic", "/cmd_vel_safe")
+    if bridge_topic != "/cmd_vel_safe":
+        raise ValueError("dynamic LiDAR navigation must use cmd_vel_topic=/cmd_vel_safe")
+    if stop_topic != bridge_topic:
+        raise ValueError("dynamic LiDAR navigation stop_velocity_topic must match cmd_vel_topic")
+
+
 def _generate_rviz_nodes(rviz_config: dict[str, Any], use_sim: bool = False) -> list:
     """Generate RViz2 visualization node."""
     import os
@@ -182,6 +233,8 @@ def _generate_rviz_nodes(rviz_config: dict[str, Any], use_sim: bool = False) -> 
             rviz_config_file = os.path.join(robot_navigation_share, "config", "config.rviz")
         except Exception:
             rviz_config_file = ""
+    else:
+        rviz_config_file = resolve_ros_path(rviz_config_file)
 
     if not rviz_config_file:
         return []

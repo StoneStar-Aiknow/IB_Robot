@@ -175,17 +175,31 @@ class RosBridge:
         return True
 
     @staticmethod
-    def _wait_future(future, timeout_sec: float) -> bool:
+    def _wait_future(future, timeout_sec: float, interrupt_event: threading.Event | None = None) -> bool:
         deadline = time.monotonic() + timeout_sec
-        while not future.done() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        return future.done()
+        while True:
+            if future.done():
+                return True
+            if interrupt_event is not None and interrupt_event.is_set():
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return False
+            time.sleep(min(0.01, remaining))
 
-    def wait_future(self, future, *, timeout_sec: float) -> bool:
-        return self._wait_future(future, timeout_sec)
+    def wait_future(self, future, *, timeout_sec: float, interrupt_event: threading.Event | None = None) -> bool:
+        return self._wait_future(future, timeout_sec, interrupt_event)
 
     def _call_service(self, client, request, *, service_name: str, timeout_sec: float):
-        if client is None or not client.wait_for_service(timeout_sec=timeout_sec):
+        try:
+            service_ready = client is not None and client.wait_for_service(timeout_sec=timeout_sec)
+        except Exception as exc:
+            raise BridgeError(
+                "ROS_UNAVAILABLE",
+                f"service unavailable: {service_name}: {exc}",
+                exit_code=EXIT_ROS_UNAVAILABLE,
+            ) from exc
+        if not service_ready:
             raise BridgeError(
                 "SERVER_UNAVAILABLE",
                 f"service unavailable: {service_name}",
@@ -284,6 +298,7 @@ class RosBridge:
         request.dispatch_binding.expected_registry_digest = identity[2]
         request.skill_name = payload["skill_name"]
         request.target_name = payload["target_name"]
+        request.container_name = str(payload.get("container_name", ""))
         request.place_name = payload["place_name"]
         request.motion_direction = payload["motion_direction"]
         request.motion_distance = float(payload["motion_distance"] or 0.0)
@@ -390,6 +405,7 @@ class RosBridge:
             "schema_version": int(step.schema_version),
             "skill_name": str(step.skill_name),
             "target_name": str(step.target_name),
+            "container_name": str(step.container_name),
             "place_name": str(step.place_name),
             "motion_direction": str(step.motion_direction),
             "motion_distance": float(step.motion_distance),
@@ -453,6 +469,7 @@ class RosBridge:
         message.schema_version = int(step.get("schema_version", 1))
         message.skill_name = str(step.get("skill_name", ""))
         message.target_name = str(step.get("target_name", ""))
+        message.container_name = str(step.get("container_name", ""))
         message.place_name = str(step.get("place_name", ""))
         message.motion_direction = str(step.get("motion_direction", ""))
         message.motion_distance = float(step.get("motion_distance", 0.0))
@@ -666,6 +683,7 @@ class RosBridge:
         goal.dispatch_binding.expected_registry_digest = str(payload.get("_registry_digest", ""))
         goal.skill_name = payload["skill_name"]
         goal.target_name = payload["target_name"]
+        goal.container_name = str(payload.get("container_name", ""))
         goal.place_name = payload["place_name"]
         goal.motion_direction = payload["motion_direction"]
         goal.motion_distance = float(payload["motion_distance"] or 0.0)

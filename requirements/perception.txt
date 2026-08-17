@@ -1,11 +1,14 @@
-# Optional dependencies for Grounding-DINO, SAM2, and SigLIP2 perception.
-# Install with:
-#   ./scripts/setup.sh --with-perception
-# or:
-#   python3 -m pip install -r requirements/perception.txt
+# Default perception runtime dependencies for Grounding-DINO, SAM2, RAM++, and
+# SigLIP2. Installed unconditionally by ./scripts/setup.sh (alongside the
+# audited RAM++ and GroundingDINO wheels from third_party/) because
+# perception_service and semantic_mapping are part of the default workspace
+# build and rely on these packages at runtime.
 
 sam2==1.1.0
-git+https://github.com/IDEA-Research/GroundingDINO.git@313392a91d987567198fea1279488370fe49d5d8#egg=groundingdino
-
-# RAM++ also requires the workspace source tree at
-# ram_models/recognize-anything and its checkpoint under models/perception.
+timm>=1.0.15,<1.1.0
+fairscale==0.4.13
+supervision>=0.22.0
+# The audited GroundingDINO wheel is installed with --no-deps.
+pycocotools>=2.0.8,<3
+addict
+yapf==0.40.1

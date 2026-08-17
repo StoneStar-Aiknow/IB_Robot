@@ -1,0 +1,27 @@
+upstream:
+  repository: https://github.com/IDEA-Research/GroundingDINO.git
+  commit: 313392a91d987567198fea1279488370fe49d5d8
+distribution:
+  name: ibrobot-groundingdino
+  version: 0.1.0+ibrobot.1
+  import_package: groundingdino
+  wheel: ../../../wheels/groundingdino/313392a/ibrobot_groundingdino-0.1.0+ibrobot.1-py3-none-any.whl
+build:
+  python: ">=3.10"
+  source_date_epoch: 1739846159
+  command: scripts/build_groundingdino_wheel.sh
+  env:
+    GROUNDINGDINO_SKIP_CUDA: "1"
+    GROUNDINGDINO_PACKAGE_NAME: ibrobot-groundingdino
+runtime:
+  transformers: 5.3.0
+  torch: ">=2.1"
+  torchvision: ">=0.16"
+  notes: >
+    Pure-Python wheel; the optional groundingdino._C CUDA op is not built. The
+    MultiScaleDeformableAttention forward falls back to the pure-PyTorch path
+    when _C is unavailable, including on CUDA tensors. Users requiring the
+    optimized CUDA op may build it from the upstream source tree separately.
+patches:
+  - file: 0001-transformers-5-runtime-compat.patch
+    purpose: Inline the Transformers 5 BertModel compat helpers into GroundingDINO source and gate the optional CUDA op so the audited wheel is monkey-patch free.

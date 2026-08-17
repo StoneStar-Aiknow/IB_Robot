@@ -45,10 +45,20 @@ capability:
     required: []
   recovery_policy: never_retry
 implementations:
-  so101_handeye_realsense_grasp: implementations/so101_handeye_realsense_grasp.yaml
+  lekiwi_handeye_realsense_grasp: implementations/lekiwi_handeye_realsense_grasp.yaml
+  lekiwi_handeye_realsense_grasp_pc: implementations/lekiwi_handeye_realsense_grasp_pc.yaml
   so101_arm_v1: implementations/so101_arm_v1.yaml
 description_variants:
-  so101_handeye_realsense_grasp:
+  lekiwi_handeye_realsense_grasp:
+    summary: Move to observe_table and acquire a scene view for planning.
+    category: observation
+    when_to_use:
+    - look at the table
+    - update scene understanding
+    motion_scope:
+    - arm
+    intensity: moderate
+  lekiwi_handeye_realsense_grasp_pc:
     summary: Move to observe_table and acquire a scene view for planning.
     category: observation
     when_to_use:

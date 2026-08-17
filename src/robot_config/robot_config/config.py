@@ -201,6 +201,8 @@ class VoiceTTSConfig:
     bundle_path: str = "models/voice_tts/zipvoice"
     deployment: str = ""
     service_name: str = "/voice_tts/synthesize"
+    playback_service_name: str = "/voice_tts/play"
+    playback_timeout_sec: float = 300.0
     prompt_profile: str = "default"
     segment_max_chars: int = 200
     segment_pause_ms: int = 150
@@ -225,6 +227,8 @@ class SemanticMappingConfig:
     filtering: dict[str, Any] = field(default_factory=dict)
     queue: dict[str, Any] = field(default_factory=dict)
     lifecycle: dict[str, Any] = field(default_factory=dict)
+    labels: dict[str, Any] = field(default_factory=dict)
+    label_refinement: dict[str, Any] = field(default_factory=dict)
     target_watch: dict[str, Any] = field(default_factory=dict)
     interfaces: dict[str, Any] = field(default_factory=dict)
 
@@ -252,6 +256,7 @@ class RobotConfig:
     skill_gateway: SkillGatewayRuntimeConfig = field(default_factory=SkillGatewayRuntimeConfig)
     semantic_mapping: SemanticMappingConfig = field(default_factory=SemanticMappingConfig)
     perception_services: "PerceptionRuntimeConfig | None" = None
+    placement_execution: dict[str, Any] = field(default_factory=dict)
 
     def get_camera(self, name: str) -> CameraConfig | None:
         """Get camera configuration by name."""

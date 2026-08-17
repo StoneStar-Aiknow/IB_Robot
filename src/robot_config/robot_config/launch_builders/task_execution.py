@@ -8,6 +8,7 @@ Planners send a sequence of TaskSteps; the executor delegates arm
 motion to moveit_gateway and gripper control to ros2_control.
 """
 
+from ament_index_python.packages import PackageNotFoundError, get_package_prefix
 from launch_ros.actions import Node
 
 from robot_config.utils import parse_bool
@@ -44,6 +45,14 @@ def generate_task_executor_node(robot_config, control_mode, use_sim=False):
     if not needs_task_executor:
         print(f"[robot_config] Task executor not needed for mode '{control_mode}'")
         return None
+
+    try:
+        get_package_prefix("task_dispatch")
+    except PackageNotFoundError as exc:
+        raise RuntimeError(
+            "MoveIt task execution requires the ROS package 'task_dispatch', but it is not present in the "
+            "sourced install space. Build robot_config with its runtime dependencies and source install/setup.sh."
+        ) from exc
 
     robot_config_path = robot_config.get("_config_path", "")
     if not robot_config_path:

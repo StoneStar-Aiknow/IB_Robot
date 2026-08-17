@@ -1,0 +1,285 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0c97506..1749c90 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -63,6 +63,10 @@ install(DIRECTORY
+ if(BUILD_TESTING)
+   find_package(ament_lint_auto REQUIRED)
+   ament_lint_auto_find_test_dependencies()
++
++  add_executable(target_geometry_test test/test_target_geometry.cpp)
++  target_include_directories(target_geometry_test PRIVATE include)
++  add_test(NAME target_geometry_test COMMAND target_geometry_test)
+ endif()
+ 
+ ament_package()
+\ No newline at end of file
+diff --git a/include/target_geometry.hpp b/include/target_geometry.hpp
+new file mode 100644
+index 0000000..d949f4e
+--- /dev/null
++++ b/include/target_geometry.hpp
+@@ -0,0 +1,103 @@
++#ifndef TARGET_GEOMETRY_HPP
++#define TARGET_GEOMETRY_HPP
++
++#include <algorithm>
++#include <array>
++#include <cmath>
++
++namespace fast_calib
++{
++
++struct Point3
++{
++    double x;
++    double y;
++    double z;
++};
++
++inline double distance(const Point3 &a, const Point3 &b)
++{
++    const double dx = a.x - b.x;
++    const double dy = a.y - b.y;
++    const double dz = a.z - b.z;
++    return std::sqrt(dx * dx + dy * dy + dz * dz);
++}
++
++inline bool has_rectangle_distance_spectrum(
++    const std::array<Point3, 4> &points, double width, double height, double tolerance)
++{
++    std::array<double, 6> actual{};
++    size_t index = 0;
++    for (size_t i = 0; i < points.size(); ++i)
++    {
++        for (size_t j = i + 1; j < points.size(); ++j)
++        {
++            actual[index++] = distance(points[i], points[j]);
++        }
++    }
++    std::sort(actual.begin(), actual.end());
++
++    const double diagonal = std::hypot(width, height);
++    std::array<double, 6> expected = {height, height, width, width, diagonal, diagonal};
++    std::sort(expected.begin(), expected.end());
++    for (size_t i = 0; i < actual.size(); ++i)
++    {
++        if (std::abs(actual[i] - expected[i]) >= tolerance)
++        {
++            return false;
++        }
++    }
++    return true;
++}
++
++inline bool recover_rectangle(
++    const std::array<Point3, 3> &measured, double width, double height, double tolerance,
++    std::array<Point3, 4> &recovered)
++{
++    size_t matches = 0;
++    for (size_t i = 0; i < measured.size(); ++i)
++    {
++        const size_t j = (i + 1) % measured.size();
++        const size_t k = (i + 2) % measured.size();
++        const Point3 &corner = measured[i];
++        const Point3 &first = measured[j];
++        const Point3 &second = measured[k];
++        const double first_length = distance(corner, first);
++        const double second_length = distance(corner, second);
++        const bool lengths_match =
++            (std::abs(first_length - width) < tolerance && std::abs(second_length - height) < tolerance) ||
++            (std::abs(first_length - height) < tolerance && std::abs(second_length - width) < tolerance);
++        if (!lengths_match)
++        {
++            continue;
++        }
++
++        const double dot =
++            (first.x - corner.x) * (second.x - corner.x) +
++            (first.y - corner.y) * (second.y - corner.y) +
++            (first.z - corner.z) * (second.z - corner.z);
++        const double max_abs_cosine = tolerance / std::min(width, height);
++        if (std::abs(dot) > max_abs_cosine * first_length * second_length)
++        {
++            continue;
++        }
++
++        const Point3 inferred = {
++            first.x + second.x - corner.x,
++            first.y + second.y - corner.y,
++            first.z + second.z - corner.z,
++        };
++        const std::array<Point3, 4> candidate = {corner, first, second, inferred};
++        if (!has_rectangle_distance_spectrum(candidate, width, height, tolerance))
++        {
++            continue;
++        }
++        recovered = candidate;
++        ++matches;
++    }
++    return matches == 1;
++}
++
++}  // namespace fast_calib
++
++#endif
+diff --git a/src/lidar_detect.hpp b/src/lidar_detect.hpp
+index 1118f95..a898134 100644
+--- a/src/lidar_detect.hpp
++++ b/src/lidar_detect.hpp
+@@ -23,6 +23,7 @@ which is included as part of this source code package.
+ #include <pcl/filters/extract_indices.h>
+ #include <pcl/io/ply_io.h>
+ #include "common_lib.h"
++#include "target_geometry.hpp"
+ 
+ class LidarDetect
+ {
+@@ -294,60 +295,31 @@ public:
+         if (center_cloud->size() == 3)
+         {
+             const double tolerance = 0.06;
+-            pcl::PointCloud<pcl::PointXYZ> recovered_pattern;
+-            size_t matching_patterns = 0;
+-            for (size_t i = 0; i < center_cloud->size(); ++i)
++            std::array<fast_calib::Point3, 3> measured;
++            for (size_t i = 0; i < measured.size(); ++i)
+             {
+-                for (size_t j = 0; j < center_cloud->size(); ++j)
+-                {
+-                    if (j == i) continue;
+-                    for (size_t k = j + 1; k < center_cloud->size(); ++k)
+-                    {
+-                        if (k == i) continue;
+-                        const auto &pi = center_cloud->points[i];
+-                        const auto &pj = center_cloud->points[j];
+-                        const auto &pk = center_cloud->points[k];
+-                        const auto distance = [](const pcl::PointXYZ &a, const pcl::PointXYZ &b) {
+-                            const double dx = a.x - b.x;
+-                            const double dy = a.y - b.y;
+-                            const double dz = a.z - b.z;
+-                            return std::sqrt(dx * dx + dy * dy + dz * dz);
+-                        };
+-                        const double dij = distance(pi, pj);
+-                        const double dik = distance(pi, pk);
+-                        const bool matches =
+-                            (std::abs(dij - circle_pattern_width_) < tolerance &&
+-                             std::abs(dik - circle_pattern_height_) < tolerance) ||
+-                            (std::abs(dij - circle_pattern_height_) < tolerance &&
+-                             std::abs(dik - circle_pattern_width_) < tolerance);
+-                        if (!matches) continue;
+-
+-                        pcl::PointXYZ inferred;
+-                        inferred.x = pj.x + pk.x - pi.x;
+-                        inferred.y = pj.y + pk.y - pi.y;
+-                        inferred.z = pj.z + pk.z - pi.z;
+-                        recovered_pattern.clear();
+-                        recovered_pattern.push_back(pi);
+-                        recovered_pattern.push_back(pj);
+-                        recovered_pattern.push_back(pk);
+-                        recovered_pattern.push_back(inferred);
+-                        matching_patterns++;
+-                    }
+-                }
++                const auto &point = center_cloud->points[i];
++                measured[i] = {point.x, point.y, point.z};
+             }
+-            if (matching_patterns == 1)
++            std::array<fast_calib::Point3, 4> recovered;
++            if (fast_calib::recover_rectangle(
++                    measured, circle_pattern_width_, circle_pattern_height_, tolerance, recovered))
+             {
+-                *center_cloud = recovered_pattern;
++                center_cloud->clear();
++                for (const auto &point : recovered)
++                {
++                    center_cloud->push_back(pcl::PointXYZ(point.x, point.y, point.z));
++                }
+                 const auto &inferred = center_cloud->points.back();
+                 RCLCPP_WARN(node_->get_logger(),
+                             "Recovered one missing hole center from a unique measured L pattern: (%.3f, %.3f, %.3f)",
+                             inferred.x, inferred.y, inferred.z);
+             }
+-            else if (center_cloud->size() != 4)
++            else
+             {
+                 RCLCPP_ERROR(node_->get_logger(),
+-                             "Unable to recover a unique four-hole pattern from %zu candidates (%zu matches).",
+-                             center_cloud->size(), matching_patterns);
++                             "Unable to recover a unique rectangular four-hole pattern from %zu candidates.",
++                             center_cloud->size());
+             }
+         }
+     }
+diff --git a/test/test_target_geometry.cpp b/test/test_target_geometry.cpp
+new file mode 100644
+index 0000000..c02f314
+--- /dev/null
++++ b/test/test_target_geometry.cpp
+@@ -0,0 +1,66 @@
++#include "target_geometry.hpp"
++
++#include <array>
++#include <cmath>
++#include <stdexcept>
++
++using fast_calib::Point3;
++
++namespace
++{
++
++void assert_close(double actual, double expected)
++{
++    if (std::abs(actual - expected) >= 1e-9)
++    {
++        throw std::runtime_error("values are not close");
++    }
++}
++
++void require(bool condition, const char *message)
++{
++    if (!condition)
++    {
++        throw std::runtime_error(message);
++    }
++}
++
++}  // namespace
++
++int main()
++{
++    constexpr double width = 0.50;
++    constexpr double height = 0.40;
++    constexpr double tolerance = 0.06;
++
++    const std::array<Point3, 3> valid_l = {
++        Point3{0.0, 0.0, 0.0}, Point3{width, 0.0, 0.0}, Point3{0.0, height, 0.0}};
++    std::array<Point3, 4> recovered{};
++    require(fast_calib::recover_rectangle(valid_l, width, height, tolerance, recovered),
++            "valid L pattern was rejected");
++    assert_close(recovered[3].x, width);
++    assert_close(recovered[3].y, height);
++
++    // Both arms have plausible lengths, but their 51-degree angle is not a board corner.
++    const std::array<Point3, 3> oblique_l = {
++        Point3{0.0, 0.0, 0.0},
++        Point3{width, 0.0, 0.0},
++        Point3{height * 0.629320391, height * 0.777145961, 0.0}};
++    require(!fast_calib::recover_rectangle(oblique_l, width, height, tolerance, recovered),
++            "oblique L pattern was accepted");
++
++    // Regression for a background-derived false observation seen in scene-02.
++    const std::array<Point3, 4> scene_02_false_pattern = {
++        Point3{0.0, 0.0, 0.0},
++        Point3{0.447, 0.0, 0.0},
++        Point3{-0.123793, 0.518245, 0.0},
++        Point3{0.323207, 0.518245, 0.0}};
++    require(!fast_calib::has_rectangle_distance_spectrum(scene_02_false_pattern, width, height, tolerance),
++            "scene-02 false distance spectrum was accepted");
++
++    const std::array<Point3, 4> rectangle = {
++        Point3{0.0, 0.0, 0.0}, Point3{width, 0.0, 0.0},
++        Point3{0.0, height, 0.0}, Point3{width, height, 0.0}};
++    require(fast_calib::has_rectangle_distance_spectrum(rectangle, width, height, tolerance),
++            "valid rectangle distance spectrum was rejected");
++}

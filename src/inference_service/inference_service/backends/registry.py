@@ -15,7 +15,18 @@ from inference_service.backends.types import InferenceBackend, RuntimeContext
 CANONICAL_BACKENDS = ("torch", "ascend", "hisilicon", "rknn", "hmm")
 POLICY_FAMILIES = frozenset({"act", "diffusion", "pi05", "smolvla"})
 NON_POLICY_MODEL_KINDS = frozenset({"perception", "generic"})
-MODEL_FAMILIES = frozenset({"ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo", "zipvoice"})
+MODEL_FAMILIES = frozenset(
+    {
+        "ram_plus",
+        "sam2",
+        "siglip2",
+        "grounding_dino",
+        "graspgen",
+        "dummy_echo",
+        "zipvoice",
+        "fullsubnet_cumulative_stateful",
+    }
+)
 # Kept as a public name for callers that classify the original perception families.
 PERCEPTION_FAMILIES = frozenset({"ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo"})
 # Canonical service-contract operations. A family's distinct contracts are carved out by
@@ -275,7 +286,7 @@ def _validate_ascend(deployment: Deployment) -> str | None:
     if not isinstance(deployment, CompiledDeployment):
         return "ascend requires a compiled deployment"
     runtime = deployment.target.runtime
-    if not (runtime.startswith("acl") or runtime.startswith("ascend")):
+    if not (runtime == "raw_acl" or runtime.startswith("acl") or runtime.startswith("ascend")):
         return f"target.runtime {runtime!r} must identify the Ascend ACL runtime family"
     invalid_formats = sorted({deployment.artifacts[role].format for role in deployment.execution} - {"om"})
     if invalid_formats:
@@ -348,20 +359,31 @@ STATIC_BACKEND_DESCRIPTORS: Mapping[str, BackendDescriptor] = MappingProxyType(
             name="torch",
             supported_policy_families=frozenset({"act", "diffusion", "pi05", "smolvla"}),
             supported_model_families=frozenset(
-                {"ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo"}
+                {"ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo", "zipvoice"}
             ),
             conformance_evidence=_policy_evidence("act", "diffusion", "pi05", "smolvla")
-            | _perception_evidence("ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo"),
+            | _perception_evidence("ram_plus", "sam2", "siglip2", "grounding_dino", "graspgen", "dummy_echo")
+            | _generic_evidence("zipvoice"),
             target_validator=_validate_torch,
         ),
         "ascend": BackendDescriptor(
             name="ascend",
             supported_policy_families=frozenset({"act", "pi05"}),
             supported_model_families=frozenset(
-                {"ram_plus", "graspgen", "sam2", "siglip2", "grounding_dino", "zipvoice"}
+                {
+                    "ram_plus",
+                    "graspgen",
+                    "sam2",
+                    "siglip2",
+                    "grounding_dino",
+                    "zipvoice",
+                    "fullsubnet_cumulative_stateful",
+                }
             ),
             conformance_evidence=_policy_evidence("act", "pi05")
-            | _perception_evidence("ram_plus", "graspgen", "sam2", "siglip2", "grounding_dino")
+            | _perception_evidence(
+                "ram_plus", "graspgen", "sam2", "siglip2", "grounding_dino", "fullsubnet_cumulative_stateful"
+            )
             | _generic_evidence("zipvoice"),
             target_validator=_validate_ascend,
         ),

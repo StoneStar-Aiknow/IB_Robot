@@ -55,9 +55,9 @@ class CompiledSpec:
 
 RAM_PLUS_BINDINGS = ArtifactBindings(
     inputs=(
-        TensorBinding(semantic="observation.image", index=0, dtype="float32", shape=(1, 3, 384, 384), layout="NCHW"),
+        TensorBinding(semantic="observation.image", index=0, dtype="float32", shape=(-1, 3, 384, 384), layout="NCHW"),
     ),
-    outputs=(TensorBinding(semantic="tag_logits", index=0, dtype="float32", shape=(1, 4585)),),
+    outputs=(TensorBinding(semantic="tag_logits", index=0, dtype="float32", shape=(-1, 4585)),),
 )
 
 
@@ -94,7 +94,10 @@ def _specs() -> dict[str, BundleSpec]:
                 "torch_module_loader": "perception_service.torch_model_loaders:load_sam2",
                 "checkpoint": "assets/sam2.1_hiera_tiny.pt",
                 "config": "configs/sam2.1/sam2.1_hiera_t.yaml",
-                "points_per_batch": 64,
+                "points_per_batch": 16,
+                "points_per_side": 64,
+                "pred_iou_thresh": 0.72,
+                "stability_score_thresh": 0.90,
             },
             model=ModelDescriptor(
                 kind="perception",
@@ -129,8 +132,8 @@ def _specs() -> dict[str, BundleSpec]:
             model=ModelDescriptor(
                 kind="perception",
                 family="ram_plus",
-                inputs=(_tensor("observation.image", "float32", (1, 3, 384, 384), "NCHW"),),
-                outputs=(_tensor("tag_logits", "float32", (1, 4585)),),
+                inputs=(_tensor("observation.image", "float32", (-1, 3, 384, 384), "NCHW"),),
+                outputs=(_tensor("tag_logits", "float32", (-1, 4585)),),
                 semantic_identity=_identity(
                     "ram-plus-swin-large-14m@v1", RAM_PLUS_PREPROCESSING, RAM_PLUS_POSTPROCESSING
                 ),
@@ -144,14 +147,14 @@ def _specs() -> dict[str, BundleSpec]:
             compiled=(
                 CompiledSpec(
                     deployment="ascend_310p",
-                    source="model_utils_work/candidates/ascend_310p/ram_plus_310p.om",
+                    source="candidates/ascend_310p/ram_plus_310p.om",
                     artifact="artifacts/ascend_310p/ram_plus_310p.om",
                     target_soc="Ascend310P1",
                     bindings=RAM_PLUS_BINDINGS,
                 ),
                 CompiledSpec(
                     deployment="ascend_310b",
-                    source="model_utils_work/candidates/ascend_310b/ram_plus_swin_large_14m_fp16.om",
+                    source="candidates/ascend_310b/ram_plus_swin_large_14m_fp16.om",
                     artifact="artifacts/ascend_310b/ram_plus_swin_large_14m_fp16.om",
                     target_soc="Ascend310B1",
                     bindings=RAM_PLUS_BINDINGS,
@@ -253,8 +256,8 @@ def _asset_paths(root: Path) -> tuple[str, ...]:
 
 
 def _promote_compiled_artifact(root: Path, compiled: CompiledSpec) -> Path | None:
-    source = root / compiled.source
     artifact = root / compiled.artifact
+    source = root.parent / "_work" / root.name / compiled.source
     if source.is_file():
         artifact.parent.mkdir(parents=True, exist_ok=True)
         if not artifact.is_file() or _sha256(source) != _sha256(artifact):

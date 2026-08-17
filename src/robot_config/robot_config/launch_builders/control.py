@@ -32,21 +32,25 @@ def generate_controller_spawners(
     use_sim=True,
     controller_manager_name="controller_manager",
     controller_manager_timeout=None,
+    inactive_controller_names=(),
 ):
     """Generate controller spawner nodes.
 
     Args:
-        controller_names: List of controller names to spawn
+        controller_names: Controller names to load, configure, and activate
         use_sim: Simulation mode (affects timeout and use_sim_time)
         controller_manager_name: Name of controller manager service
         controller_manager_timeout: Timeout for manager discovery and service calls
+        inactive_controller_names: Controller names to load/configure but leave inactive
 
     Returns:
         List of Node actions for controller spawners
     """
     is_sim = parse_bool(use_sim, default=True)
 
-    if not controller_names:
+    controller_names = list(controller_names)
+    inactive_controller_names = list(inactive_controller_names)
+    if not controller_names and not inactive_controller_names:
         return []
 
     timeout = float(controller_manager_timeout) if controller_manager_timeout is not None else (60 if is_sim else 10)
@@ -54,27 +58,35 @@ def generate_controller_spawners(
         raise ValueError("controller_manager_timeout must be greater than zero")
     service_call_timeout = min(timeout, 10.0)
     switch_timeout = min(timeout, 10.0)
-    return [
-        Node(
-            package="robot_config",
-            executable="controller_spawner",
-            name=f"spawner_{controller_name}",
-            parameters=[{"use_sim_time": is_sim}],
-            arguments=[
-                controller_name,
-                "--controller-manager",
-                controller_manager_name,
-                "--controller-manager-timeout",
-                str(timeout),
-                "--service-call-timeout",
-                str(service_call_timeout),
-                "--switch-timeout",
-                str(switch_timeout),
-            ],
-            output="screen",
+    spawners = []
+    for controller_name, inactive in [
+        *((name, False) for name in controller_names),
+        *((name, True) for name in inactive_controller_names),
+    ]:
+        arguments = [
+            controller_name,
+            "--controller-manager",
+            controller_manager_name,
+            "--controller-manager-timeout",
+            str(timeout),
+            "--service-call-timeout",
+            str(service_call_timeout),
+            "--switch-timeout",
+            str(switch_timeout),
+        ]
+        if inactive:
+            arguments.append("--inactive")
+        spawners.append(
+            Node(
+                package="robot_config",
+                executable="controller_spawner",
+                name=f"spawner_{controller_name}",
+                parameters=[{"use_sim_time": is_sim}],
+                arguments=arguments,
+                output="screen",
+            )
         )
-        for controller_name in controller_names
-    ]
+    return spawners
 
 
 def generate_ros2_control_nodes(
@@ -169,18 +181,24 @@ def generate_ros2_control_nodes(
             mode_config = control_modes[control_mode_name]
             if is_sim and mode_config.get("sim_controllers") is not None:
                 controller_names = mode_config.get("sim_controllers", [])
+                inactive_controller_names = mode_config.get("sim_inactive_controllers", [])
             elif not is_sim and mode_config.get("hardware_controllers") is not None:
                 controller_names = mode_config.get("hardware_controllers", [])
+                inactive_controller_names = mode_config.get("hardware_inactive_controllers", [])
             else:
                 controller_names = mode_config.get("controllers", [])
+                inactive_controller_names = mode_config.get("inactive_controllers", [])
             mode_description = mode_config.get("description", "No description")
             logger.info(f"Using control mode: {control_mode_name}")
             logger.info(f"  Description: {mode_description}")
             logger.info(f"  Controllers: {controller_names}")
+            logger.info(f"  Inactive controllers: {inactive_controller_names}")
         else:
             controller_names = []
+            inactive_controller_names = []
     else:
         controller_names = ros2_control_config.get("controllers", [])
+        inactive_controller_names = []
 
     controllers_config = resolve_ros_path(ros2_control_config.get("controllers_config"))
 
@@ -229,11 +247,12 @@ def generate_ros2_control_nodes(
                 )
             )
 
-            if is_auto_start and controller_names:
+            if is_auto_start and (controller_names or inactive_controller_names):
                 deferred_spawners = generate_controller_spawners(
                     controller_names,
                     use_sim=False,
                     controller_manager_timeout=controller_startup_timeout,
+                    inactive_controller_names=inactive_controller_names,
                 )
                 logger.info(f"Deferring {len(deferred_spawners)} controller spawners until hardware is active")
     else:
@@ -244,11 +263,12 @@ def generate_ros2_control_nodes(
         logger.info("Simulation mode: Gazebo provides controller_manager")
         logger.info(f"Controllers to spawn (deferred until after gz spawn): {controller_names}")
 
-        if is_auto_start and controller_names:
+        if is_auto_start and (controller_names or inactive_controller_names):
             deferred_spawners = generate_controller_spawners(
                 controller_names,
                 use_sim=True,
                 controller_manager_timeout=controller_startup_timeout,
+                inactive_controller_names=inactive_controller_names,
             )
             logger.info(f"Deferring {len(deferred_spawners)} controller spawners (handled by caller)")
 

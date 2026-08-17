@@ -1,0 +1,187 @@
+# LeKiwi MID-360 mapping with synchronized D435i dataset recording.
+robot:
+  name: lekiwi_semantic_mapping
+  type: lekiwi
+  robot_type: lekiwi
+
+  default_control_mode: teleop
+  mid360_mount_file: $(find robot_config)/config/hardware/lekiwi_mid360_mount.yaml
+
+  sensor_calibration:
+    artifacts:
+      base_to_front_camera: ~/.ros/ibrobot/calib/current/base_to_front_camera.yaml
+
+  joints:
+    base: ["7", "8", "9"]
+    all: ["7", "8", "9"]
+
+  control_modes:
+    teleop:
+      description: "Base mapping with synchronized MID-360 and D435i capture"
+      description_cn: "同步采集 MID-360 与 D435i 的底盘建图模式"
+      controllers: [joint_state_broadcaster, base_velocity_controller]
+      inference:
+        enabled: false
+        force_disable: true
+      executor:
+        type: topic
+        mode: teleop
+        queue_size: 100
+        control_frequency: 50.0
+
+  simulation:
+    platform: gazebo
+    scene: null
+
+  ros2_control:
+    hardware_plugin: lekiwi_hardware/LeKiwiSystemHardware
+    port: /dev/ttyACM0
+    velocity_joints: ["7", "8", "9"]
+    base_vel_max_rad: 4.602
+    urdf_path: $(find lekiwi_description)/urdf/lekiwi_assembled.urdf.xacro
+    controllers_config: $(find lekiwi_hardware)/config/lekiwi_base_controllers.yaml
+    xacro_mappings:
+      base_only: true
+
+  peripherals:
+    - type: lidar
+      name: mid360
+      driver: livox_mid360
+      frame_id: livox_frame
+      lidar_ip: 192.168.1.139
+      host_ip: 192.168.1.5
+      pointcloud_topic: /livox/lidar
+      imu_topic: /livox/imu
+      user_config_path: $(find livox_ros_driver2)/config/MID360_config.json
+      xfer_format: 1
+      multi_topic: 0
+      data_src: 0
+      publish_freq: 10.0
+      output_data_type: 0
+      cmdline_input_bd_code: livox0000000001
+      respawn: true
+      scan_converter:
+        enabled: true
+        queue_size: 1
+        pointcloud_topic: /cloud_registered_body
+        scan_topic: /scan
+        target_frame: body
+        transform_tolerance: 0.01
+        min_height: -0.20
+        max_height: 0.50
+        angle_min: -3.14159265
+        angle_max: 3.14159265
+        angle_increment: 0.00872665
+        scan_time: 0.10
+        range_min: 0.10
+        range_max: 8.0
+        use_inf: true
+        inf_epsilon: 1.0
+        respawn: true
+
+    - type: camera
+      name: front
+      driver: realsense
+      driver_camera_name: front
+      serial_number: ""
+      width: 640
+      height: 480
+      fps: 30
+      color_format: RGB8
+      depth_format: Z16
+      streams: [color, depth]
+      align_depth: true
+      enable_sync: true
+      initial_reset: false
+      enable_pointcloud: false
+      frame_id: camera_front_link
+      optical_frame_id: camera_front_optical_frame
+      # Keep the physical RealSense streams available for recording, but do not
+      # synthesize a simulated mount when the approved artifact is absent.
+      skip_urdf_without_transform: true
+      transform:
+        parent_frame: base_link
+        x: 0.0
+        y: 0.0
+        z: 0.0
+        roll: 0.0
+        pitch: 0.0
+        yaw: 0.0
+
+  navigation:
+    enabled: true
+    cmd_vel_bridge:
+      enabled: true
+      publish_odom: false
+      publish_tf: false
+      wheel_radius: 0.05
+      base_radius: 0.125
+      max_radps: 4.602
+      odom_frame: odom
+      base_frame: base_link
+      control_frequency: 50.0
+      cmd_timeout: 0.5
+      joint_states_topic: /joint_states
+      odom_topic: /wheel/odom
+    static_tfs: []
+    fast_lio:
+      enabled: true
+      params_file: $(find robot_config)/config/navigation/fast_lio_mid360.yaml
+      lidar_topic: /livox/lidar
+      imu_topic: /livox/imu
+      raw_odom_topic: /fast_lio/odometry_raw
+      output_topic: /odometry/filtered
+      source_odom_frame: camera_init
+      source_body_frame: body
+      odom_frame: odom
+      base_frame: base_link
+      publish_tf: true
+      planar_output: false
+      respawn: true
+    nav2_bringup:
+      enabled: false
+      use_amcl: false
+      map_file: $(env HOME)/.ros/ibrobot/maps/map.yaml
+      params_file: $(find robot_navigation)/config/nav2_params.yaml
+    slam_toolbox:
+      enabled: true
+      executable: async_slam_toolbox_node
+      node_name: slam_toolbox
+      scan_topic: /scan
+      base_frame: base_link
+      odom_frame: odom
+      map_frame: map
+      minimum_travel_distance: 0.05
+      minimum_travel_heading: 0.05
+      map_update_interval: 1.0
+      min_laser_range: 0.10
+      max_laser_range: 8.0
+
+  recording:
+    semantic_dataset: true
+    session_base_dir: ~/.ros/ibrobot/semantic_mapping
+    mapping_session_state_path: ~/.ros/ibrobot/semantic_mapping/current.json
+    storage: mcap
+    max_bag_size: 4294967296
+    max_cache_size: 104857600
+    qos_profile_overrides_path: $(find robot_config)/config/recording/semantic_mapping_qos.yaml
+    include_diagnostics: false
+    camera_info_topic: /camera/front/camera_info
+    topics:
+      - /livox/lidar
+      - /livox/imu
+      - /fast_lio/odometry_raw
+      - /odometry/filtered
+      - /cloud_registered_body
+      - /scan
+      - /map
+      - /wheel/odom
+      - /cmd_vel
+      - /camera/front/image_raw
+      - /camera/front/depth/image_rect_raw
+      - /camera/front/aligned_depth_to_color/image_raw
+      - /camera/front/camera_info
+      - /camera/front/depth/camera_info
+      - /camera/front/aligned_depth_to_color/camera_info
+      - /tf
+      - /tf_static

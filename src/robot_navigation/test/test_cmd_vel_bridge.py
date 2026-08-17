@@ -15,7 +15,7 @@ import rclpy
 from geometry_msgs.msg import Twist
 from rclpy.executors import SingleThreadedExecutor
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Bool, Float64MultiArray
 
 from robot_navigation.cmd_vel_bridge_node import (
     CmdVelBridgeNode,
@@ -59,6 +59,27 @@ def node_env():
 @pytest.fixture(scope="module")
 def node(node_env):
     return node_env["node"]
+
+
+class _MessageCollector:
+    def __init__(self):
+        self.messages = []
+
+    def publish(self, msg):
+        self.messages.append(msg)
+
+
+@pytest.fixture
+def mode_node(node_env):
+    """Isolated bridge instance with the persistent motion-mode path enabled."""
+    n = CmdVelBridgeNode()
+    n.destroy_timer(n.control_timer)
+    n.motion_mode_enabled = True
+    n.navigation_enabled = False
+    n.wheel_cmd_pub = _MessageCollector()
+    n.navigation_mode_ack_pub = _MessageCollector()
+    yield n
+    n.destroy_node()
 
 
 # ── helper ──────────────────────────────────────────────────────────────────
@@ -330,6 +351,56 @@ class TestCmdVelCallback:
         assert node.target_vy == 0.0
         assert node.target_vtheta == 0.0
 
+    def test_manipulation_mode_ignores_new_cmd_vel(self, mode_node):
+        msg = Twist()
+        msg.linear.x = 0.4
+        msg.angular.z = 0.2
+
+        mode_node.cmd_vel_callback(msg)
+
+        assert mode_node.target_vx == 0.0
+        assert mode_node.target_vtheta == 0.0
+        assert mode_node.last_cmd_time is None
+
+    def test_navigation_mode_requires_a_fresh_cmd_vel(self, mode_node):
+        mode_node.target_vx = 0.4
+        mode_node.last_cmd_time = 123.0
+
+        mode_node.navigation_mode_callback(Bool(data=True))
+
+        assert mode_node.navigation_enabled is True
+        assert mode_node.target_vx == 0.0
+        assert mode_node.last_cmd_time is None
+        assert list(mode_node.wheel_cmd_pub.messages[-1].data) == [0.0, 0.0, 0.0]
+        assert mode_node.navigation_mode_ack_pub.messages[-1].data is True
+
+        msg = Twist()
+        msg.linear.x = 0.1
+        mode_node.cmd_vel_callback(msg)
+        assert mode_node.target_vx == 0.1
+        assert mode_node.last_cmd_time is not None
+
+    def test_mode_ack_heartbeat_republishes_current_state(self, mode_node):
+        mode_node.navigation_enabled = True
+
+        mode_node._publish_navigation_mode_ack()
+
+        assert mode_node.navigation_mode_ack_pub.messages[-1].data is True
+
+    def test_shutdown_boundary_repeats_zero_wheel_command(self, mode_node):
+        mode_node.target_vx = 0.4
+        mode_node.last_cmd_time = 123.0
+
+        mode_node.publish_stop_boundary()
+
+        assert mode_node.target_vx == 0.0
+        assert mode_node.last_cmd_time is None
+        assert [list(message.data) for message in mode_node.wheel_cmd_pub.messages[-3:]] == [
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ]
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 7. TestJointStatesCallback
@@ -423,6 +494,40 @@ class TestControlLoop:
         assert msg is not None
         for val in msg.data:
             assert val == pytest.approx(0.0, abs=1e-10)
+
+    def test_manipulation_mode_clears_stale_command_and_publishes_zero(self, mode_node):
+        mode_node.target_vx = 1.0
+        mode_node.target_vy = 1.0
+        mode_node.target_vtheta = 1.0
+        mode_node.last_cmd_time = mode_node.get_clock().now().nanoseconds / 1e9
+
+        mode_node.control_loop()
+
+        assert list(mode_node.wheel_cmd_pub.messages[-1].data) == [0.0, 0.0, 0.0]
+        assert mode_node.target_vx == 0.0
+        assert mode_node.target_vy == 0.0
+        assert mode_node.target_vtheta == 0.0
+        assert mode_node.last_cmd_time is None
+
+    def test_switch_to_manipulation_emits_zero_before_ack(self, mode_node):
+        events = []
+
+        class RecordingPublisher:
+            def __init__(self, event):
+                self.event = event
+
+            def publish(self, msg):
+                value = list(msg.data) if self.event == "wheel" else msg.data
+                events.append((self.event, value))
+
+        mode_node.navigation_enabled = True
+        mode_node.target_vx = 0.5
+        mode_node.wheel_cmd_pub = RecordingPublisher("wheel")
+        mode_node.navigation_mode_ack_pub = RecordingPublisher("ack")
+
+        mode_node.navigation_mode_callback(Bool(data=False))
+
+        assert events == [("wheel", [0.0, 0.0, 0.0]), ("ack", False)]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

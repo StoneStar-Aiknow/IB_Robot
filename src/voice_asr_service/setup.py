@@ -15,7 +15,7 @@ setup(
         # launch 入口统一为 *.launch.py;被 launch 文件 import 的辅助模块
         # 应放在包目录(voice_asr_service/)而非 launch/,避免被此处 data_files 误捕获
         (os.path.join("share", package_name, "launch"), glob("launch/*.launch.py")),
-        (os.path.join("share", package_name, "config"), glob("config/*.yaml")),
+        (os.path.join("share", package_name, "config"), glob("config/*.yaml") + glob("config/*.json")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,

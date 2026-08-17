@@ -1,0 +1,37 @@
+fast_calib:
+  ros__parameters:
+    fx: 606.4765014648438
+    fy: 605.9666137695312
+    cx: 321.92156982421875
+    cy: 254.83572387695312
+    k1: 0.0
+    k2: 0.0
+    p1: 0.0
+    p2: 0.0
+    marker_size: 0.20
+    delta_width_qr_center: 0.55
+    delta_height_qr_center: 0.35
+    delta_width_circles: 0.50
+    delta_height_circles: 0.40
+    circle_radius: 0.13
+    x_min: -2.0
+    x_max: 2.0
+    y_min: -5.2
+    y_max: -4.3
+    z_min: 0.10
+    z_max: 1.60
+    prefer_vertical_plane: true
+    plane_distance_threshold: 0.01
+    plane_eps_angle: 0.35
+    normal_search_radius: 0.06
+    boundary_search_radius: 0.06
+    cluster_tolerance: 0.02
+    min_cluster_size: 12
+    circle_fit_distance_threshold: 0.01
+    circle_fit_error_threshold: 0.03
+    observation_only: true
+    scene_id: scene-04-test
+    lidar_topic: /cloud_dense_body
+    bag_path: /REPLACE_WITH_EXPORTED_CAPTURE/scene-04-test/dense_bag_v1
+    image_path: /REPLACE_WITH_EXPORTED_CAPTURE/scene-04-test/image.png
+    output_path: /REPLACE_WITH_OBSERVATION_OUTPUT/scene-04-test

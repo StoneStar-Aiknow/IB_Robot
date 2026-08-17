@@ -1,13 +1,14 @@
-# SO101 腕部 RealSense 手眼标定命令
+# LeKiwi 腕部 RealSense 手眼标定命令
 
-本文件记录 SO101 从动臂腕装 RealSense 重新标定的完整命令流程。
+本文件记录 LeKiwi（SO-101 从动臂腕装 RealSense）重新标定的完整命令流程。
 
 前提条件：
 
-- robot config：`src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml`
-- robot config 中的从动臂端口：`/dev/ttyACM1`
-- 主臂端口：通常为 `/dev/ttyACM0`，但必须以实际 USB 枚举为准
-- 腕部 RealSense 话题（`so101_handeye_realsense_grasp` 的实际 remap）：
+- robot config：`src/robot_config/config/robots/lekiwi_handeye_realsense_grasp.yaml`
+- robot config 中的从动臂端口：默认 `/dev/ttyACM0`
+- 主臂端口：示例使用 `/dev/ttyACM1`，但必须以实际 USB 枚举为准
+- 长期部署应改用 `/dev/serial/by-id/...`，避免重插后 ACM 编号互换
+- 腕部 RealSense 话题（`lekiwi_handeye_realsense_grasp` 的实际 remap）：
   - RGB：`/camera/wrist/image_raw`
   - 对齐深度图：`/camera/wrist/aligned_depth_to_color/image_raw`
   - CameraInfo：`/camera/wrist/aligned_depth_to_color/camera_info`
@@ -29,7 +30,7 @@
 
 不要在 Bash 中 source `install/setup.zsh`，请使用 `.shrc_local`。
 
-重要：真机启动使用 `robot_config:=so101_handeye_realsense_grasp`。启动前检查该 YAML；
+重要：真机启动使用 `robot_config:=lekiwi_handeye_realsense_grasp`。启动前检查该 YAML；
 它可能仍把 `ros2_control.port` 指到 `/dev/ttyACM0`。当 `/dev/ttyACM0`
 是主臂时，主臂会被当作从动臂写入 follower 标定并上电保持。硬件激活不会自动执行
 `reset_positions`，但端口选错仍可能损坏标定或导致后续控制指令作用于错误机械臂。
@@ -50,7 +51,7 @@ cd ~/IB_Robot && \
   source .shrc_local && \
   export ROS_DOMAIN_ID=218 && \
   python3 scripts/check_handeye_preconditions.py \
-    --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml \
+    --robot-config src/robot_config/config/robots/lekiwi_handeye_realsense_grasp.yaml \
     --camera-name wrist
 ```
 
@@ -74,8 +75,8 @@ cd ~/IB_Robot && \
 cd ~/IB_Robot && \
   source .shrc_local && \
   python3 scripts/configure_so101_handeye_teleop.py \
-    --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml \
-    --leader-port /dev/ttyACM0
+    --robot-config src/robot_config/config/robots/lekiwi_handeye_realsense_grasp.yaml \
+    --leader-port /dev/ttyACM1
 ```
 
 ```bash
@@ -83,7 +84,7 @@ cd ~/IB_Robot && \
   source .shrc_local && \
   export ROS_DOMAIN_ID=218 && \
   ros2 launch robot_config robot.launch.py \
-    robot_config:=so101_handeye_realsense_grasp \
+    robot_config:=lekiwi_handeye_realsense_grasp \
     control_mode:=teleop \
     use_sim:=false \
     moveit_display:=false
@@ -92,7 +93,7 @@ cd ~/IB_Robot && \
 如果启动日志出现 `WARNING: Teleop mode requested but teleoperation config not found`
 或 `Active device 'so101_leader' not found`，说明 robot YAML 中的
 `robot.teleoperation` 尚未正确配置，需先回到本节开头重新启用主臂配置。
-启动日志里必须看到加载 `so101_handeye_realsense_grasp.yaml`。
+启动日志里必须看到加载 `lekiwi_handeye_realsense_grasp.yaml`。
 
 等待以下输出：
 
@@ -184,7 +185,7 @@ topic 并按回车。若仍不刷新，把 Image display 的 QoS `Reliability` �
 cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 && ros2 topic list | grep -E 'color/image_raw|image_raw'
 ```
 
-当前 `so101_handeye_realsense_grasp` 应使用 `/camera/wrist/image_raw`。不要把
+当前 `lekiwi_handeye_realsense_grasp` 应使用 `/camera/wrist/image_raw`。不要把
 `/camera/camera/color/image_raw` 或 `/camera/wrist_camera/color/image_raw` 作为本流程默认输入。
 
 重要：RViz Image 显示、`handeye_calibrator --image-topic` 必须使用同一个 RGB topic；
@@ -236,7 +237,7 @@ cd ~/IB_Robot && \
     --max-reprojection 1.0 \
     --method park \
     --output-json outputs/handeye/wrist_handeye_new.json \
-    --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml \
+    --robot-config src/robot_config/config/robots/lekiwi_handeye_realsense_grasp.yaml \
     --camera-name wrist \
     --max-translation-std 0.01 \
     --max-rotation-rms 2.0 \
@@ -261,7 +262,7 @@ cd ~/IB_Robot && \
 
 ```text
 Quality check:
-  PASS: auto-wrote transform to src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml
+  PASS: auto-wrote transform to src/robot_config/config/robots/lekiwi_handeye_realsense_grasp.yaml
 ```
 
 如果质量不达标：
@@ -291,7 +292,7 @@ Quality check:
 `robot_config`。
 
 终端 A 和正式 `pick_executor_node` 都应读取同一份
-`src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml`。
+`src/robot_config/config/robots/lekiwi_handeye_realsense_grasp.yaml`。
 
 也可打开生成的 JSON 报告查看完整指标：
 

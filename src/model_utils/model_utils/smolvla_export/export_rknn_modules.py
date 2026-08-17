@@ -546,6 +546,17 @@ def _cache_semantic(name: str) -> str:
 # ── Main export ────────────────────────────────────────────────────────────
 
 
+def _bundle_root(args, out_dir: Path) -> Path:
+    """Return the bundle root that receives metadata and the manifest.
+
+    Defaults to ``out_dir`` so standalone runs keep working; pass
+    ``--bundle_root`` to keep conversion intermediates out of the bundle.
+    """
+
+    explicit = getattr(args, "bundle_root", None)
+    return Path(explicit).expanduser().resolve() if explicit else out_dir
+
+
 def export_all(args):
     set_seed(args.seed)
     device = resolve_device(args.device)
@@ -768,7 +779,7 @@ def export_all(args):
         json.dump(meta, f, indent=2, ensure_ascii=False)
     print(f"\n=== Meta info saved: {meta_file} ===")
 
-    copied = copy_policy_metadata_bundle(args.model_path, out_dir)
+    copied = copy_policy_metadata_bundle(args.model_path, _bundle_root(args, out_dir))
     print(f"  Copied {len(copied)} required LeRobot semantic files")
 
     print(f"\nDone! Output: {out_dir}")
@@ -788,12 +799,19 @@ def export_all(args):
 
 def _package_existing(args) -> None:
     out_dir = Path(args.output_dir).expanduser().resolve()
-    copy_policy_metadata_bundle(args.model_path, out_dir)
-    with (out_dir / "config.json").open(encoding="utf-8") as stream:
+    bundle_root = _bundle_root(args, out_dir)
+    copy_policy_metadata_bundle(args.model_path, bundle_root)
+    with (bundle_root / "config.json").open(encoding="utf-8") as stream:
         config = json.load(stream)
     onnx_dir = out_dir / "onnx"
+    embedding = out_dir / "token_embedding.pt"
+    state_projection = out_dir / "state_projection.pt"
+    if not embedding.is_file():
+        embedding = bundle_root / "token_embedding.pt"
+    if not state_projection.is_file():
+        state_projection = bundle_root / "state_projection.pt"
     manifest_path = write_smolvla_rknn_deployment(
-        out_dir,
+        bundle_root,
         config,
         vision_rknn=args.vision_rknn or onnx_dir / "smolvla_vision.rknn",
         vision_abi_path=args.vision_abi or onnx_dir / "smolvla_vision.rknn.abi.json",
@@ -801,8 +819,8 @@ def _package_existing(args) -> None:
         prefill_abi_path=args.prefill_abi or onnx_dir / "smolvla_prefill.rknn.abi.json",
         action_rknn=args.action_rknn or onnx_dir / "smolvla_action.rknn",
         action_abi_path=args.action_abi or onnx_dir / "smolvla_action.rknn.abi.json",
-        embedding_path=out_dir / "token_embedding.pt",
-        state_projection_path=out_dir / "state_projection.pt",
+        embedding_path=embedding,
+        state_projection_path=state_projection,
         deployment_name=args.deployment,
         target_soc=args.target_soc,
         target_runtime=args.target_runtime,
@@ -814,7 +832,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Export SmolVLA as 3 segmented ONNX modules for RKNN")
     parser.add_argument("--model_path", type=str, required=True, help="SmolVLA policy path")
     parser.add_argument("--lerobot_src", type=str, default=str(DEFAULT_LEROBOT_SRC))
-    parser.add_argument("--output_dir", type=str, default="models/smolvla_rknn", help="Output directory")
+    parser.add_argument("--output_dir", type=str, default="models/_work/smolvla/rknn", help="Work output directory")
+    parser.add_argument(
+        "--bundle_root",
+        type=str,
+        default=None,
+        help="Bundle root receiving LeRobot metadata and the unified manifest (default: same as --output_dir)",
+    )
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--image_height", type=int, default=512)
     parser.add_argument("--image_width", type=int, default=512)

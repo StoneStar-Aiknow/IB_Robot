@@ -14,11 +14,14 @@ setup(
     zip_safe=True,
     maintainer="IB-Robot Contributors",
     maintainer_email="roboguru.92@gmail.com",
-    description="Closed-loop grasp execution for agent-facing robot skills",
+    description="Closed-loop manipulation execution for agent-facing robot skills",
     license="Apache-2.0",
     entry_points={
         "console_scripts": [
+            "pick_action_client = manipulation_execution.pick_action_client:main",
             "pick_executor_node = manipulation_execution.pick_executor_node:main",
+            "place_executor_node = manipulation_execution.placement_executor_node:main",
+            "placement_replay = manipulation_execution.placement_replay:main",
         ],
     },
 )

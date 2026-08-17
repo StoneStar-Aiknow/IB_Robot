@@ -38,8 +38,9 @@ source install/local_setup.sh
 | `plan-workflow --text TEXT --workflow-json JSON --request-id ID` | 是 | 提交一份短时 typed Agent plan |
 | `validate-plan --plan-token TOKEN` | 是 | 对 exact snapshot 计划做只读逐步预检 |
 | `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID [--timeout-sec SEC]` | 是 | 校验身份/摘要/task_id 并冻结 `task_budget_sec`，转入 `CONFIRMED` |
-| `execute-plan --plan-token TOKEN --confirmation-token TOKEN --task-id ID [--timeout-sec SEC]` | 是 | 执行已确认的 Agent plan，必须复用 confirm 冻结的同一预算 |
-| `cancel-plan --task-id ID` | 是 | 通过 Agent plan action 的标准 CancelGoal 请求取消 |
+| `execute-plan ... --plan-id ID --plan-digest DIGEST --registry-* ... --expected-step-count N` | 是 | 执行已确认的 Agent plan，并以展示过的 tuple 校验终态 |
+| `cancel-plan --task-id ID --plan-id ID --plan-digest DIGEST --registry-* ... --expected-step-count N` | 是 | 请求取消并以展示过的 tuple 校验终态 |
+| `robot-skill-closed-loop ...` | 是 | 展示 Workflow 后立即执行，并验证「别动」和安全 continuation 门禁 |
 
 catalog-only 命令不初始化 `rclpy`，只读取本地归一化配置。runtime 命令只访问 Gateway status、
 `ValidateSkill`、`SkillCommand`、Agent plan services/actions 和标准 `CancelGoal` 接口。
@@ -71,10 +72,15 @@ robot-skill --config-name so101_single_arm confirm-plan \
   --plan-token PLAN_TOKEN --plan-digest PLAN_DIGEST --task-id agent-task-001
 # 可选 --timeout-sec 30 冻结一份小于等于 Gateway task budget 的预算
 robot-skill --config-name so101_single_arm execute-plan \
-  --plan-token PLAN_TOKEN --confirmation-token CONFIRMATION_TOKEN --task-id agent-task-001
+  --plan-token PLAN_TOKEN --confirmation-token CONFIRMATION_TOKEN --task-id agent-task-001 \
+  --plan-id PLAN_ID --plan-digest PLAN_DIGEST \
+  --registry-epoch REGISTRY_EPOCH --registry-generation REGISTRY_GENERATION \
+  --registry-digest REGISTRY_DIGEST --expected-step-count 1
 # execute-plan 必须传 confirm 时使用的同一 --timeout-sec；省略时两端都默认 Gateway task budget
 robot-skill --config-name so101_single_arm cancel-plan \
-  --task-id agent-task-001
+  --task-id agent-task-001 --plan-id PLAN_ID --plan-digest PLAN_DIGEST \
+  --registry-epoch REGISTRY_EPOCH --registry-generation REGISTRY_GENERATION \
+  --registry-digest REGISTRY_DIGEST --expected-step-count 1
 ```
 
 可用 typed flags 为 `--target-name`、`--place-name`、`--motion-direction`、`--motion-distance` 和
@@ -89,29 +95,44 @@ primitive sequence、目标绑定、关节值和 ROS transport 名称不属于 C
 
 ## 调用顺序
 
-传统单技能 Agent 必须按以下顺序工作：
+传统单技能低层 CLI 流程按以下顺序工作：
 
 1. `status`
 2. `list-skills`
 3. `describe SKILL`
 4. `validate SKILL`
-5. 获取用户明确的运动确认
-6. `execute SKILL --task-id ID`
+5. `execute SKILL --task-id ID`
 
 自然语言计划必须按以下顺序工作：
 
 1. `plan-workflow --text TEXT --workflow-json JSON --request-id ID`
 2. `validate-plan --plan-token TOKEN`
-3. 向用户展示步骤、参数、plan digest 和 registry identity，获取明确确认并生成 task ID
-4. `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID [--timeout-sec SEC]`
-5. `execute-plan --plan-token TOKEN --confirmation-token TOKEN --task-id ID [--timeout-sec SEC]`
+3. 向用户展示步骤、参数、plan digest、registry identity 和 fresh task ID，并 flush 输出
+4. 不等待二次确认，立即调用 `confirm-plan --plan-token TOKEN --plan-digest DIGEST --task-id ID [--timeout-sec SEC]`
+5. 立即调用 `execute-plan`，除 token、task ID 和相同 timeout 外，传入刚展示的 plan ID/digest、registry
+   epoch/generation/digest 和 expected step count
+
+这里的 `confirm-plan` 是 Gateway 对 exact plan/task tuple 的内部技术绑定，不是用户二次确认。用户在展示后
+说「别动」时，控制器必须把停止意图锁存到 goal 发送、goal acceptance 和执行阶段；goal 已可能提交时由唯一
+执行线程发起一次 action cancellation 并等待权威终态；不要同时从另一个进程调用 `cancel-plan`。pre-send stop
+必须抑制新 goal；只有能证明 fresh task 从未提交的 in-process controller 才不发送 CancelGoal，独立 CLI 必须
+对可能存在的幂等 retry goal 执行 convergence。`GoalStatus` 本身不足以证明安全结果：result 的 success/error、plan
+ID/digest、registry identity 和 completed step count 也必须与命令携带的展示 tuple 一致，否则按
+`SKILL_CANCEL_TIMEOUT`/未知状态 fail closed。已知的 uncertain-motion error 保留原始 code 并退出 15；只有身份
+或结构证明无效时才合成为 `SKILL_CANCEL_TIMEOUT`。
+
+`robot-skill-closed-loop --resume` 在当前基线明确拒绝。当前 ROS 契约只有 `completed_step_count` 遥测，没有
+server-owned continuation admission；客户端不得切片旧步骤并用新 task ID 绕过 Gateway。确定的
+`CANCELED + SKILL_CANCELLED` 终态后，用户可以提出一个独立的新 continuation 请求；成功、失败和未知状态
+都不授权自动继续。
 
 `confirm-plan` 与 `execute-plan` 共享可选的 `--timeout-sec`：省略时两端都默认使用 Gateway 当前
 `task_budget_sec`；显式给出时必须为有限正数且不超过 Gateway task budget。`confirm-plan` 把该值以 float32
 冻结进计划，`execute-plan` 必须传入**同一**值（float32 严格相等），否则协调器以 `SKILL_REQUEST_ID_CONFLICT`
-拒绝——这是为了防止执行阶段悄悄放大或缩小用户确认过的任务预算。
+拒绝——这是为了防止执行阶段悄悄放大或缩小展示并绑定过的任务预算。
 
-当前 `execute` 可用 SIGINT/SIGTERM 请求取消；另一个进程可使用 `cancel --task-id ID`。失败、timeout 或
+当前 `execute` 和 `execute-plan` 可用 SIGINT/SIGTERM 请求取消；另一个进程分别使用 `cancel` 或携带完整
+展示 tuple 的 `cancel-plan`。同一 Agent plan 不得同时使用 signal 和外部 `cancel-plan`。失败、timeout 或
 停止状态未知时不得自动重试。`SKILL_CANCEL_TIMEOUT` 表示机器人停止状态未知，不能表述为“已停止”。
 
 `validate` 与 `execute` 先以规范 payload 请求 Gateway：字符串去空白、方向小写，未提供 timeout 时使用
@@ -147,8 +168,8 @@ reason（没有冒号时两者都是该 code）。因此调用方应按 `error.c
 | `3` | Gateway、readiness 或 safety 拒绝 |
 | `4` | ROS/Gateway 不可用 |
 | `124` | timeout，可能包含停止状态未知 |
-| `130` | SIGINT 取消已收敛到 terminal |
-| `143` | SIGTERM 取消已收敛到 terminal |
+| `130` | direct `execute` 的 SIGINT 取消已收敛到 terminal |
+| `143` | direct `execute` 的 SIGTERM 取消已收敛到 terminal |
 
 上述 `3/4/124/130/143` 是 direct `validate/execute/cancel` 的兼容契约。Agent plan
 命令（`plan-workflow`、`validate-plan`、`confirm-plan`、`execute-plan`、`cancel-plan`）使用
@@ -170,12 +191,20 @@ pipeline 时显式授权。未授权状态下仍可使用 catalog、`status` 和
 
 ```bash
 hermes-robot --config-name so101_single_arm
+hermes-robot --config-name lekiwi_handeye_realsense_grasp -- --cli
+hermes-robot --config-name lekiwi_handeye_realsense_grasp_pc -- --cli
 ```
 
 启动器要求 Hermes Agent `0.16.0` 或更新版本，并在启动前验证 `hermes`、`robot-skill`、安装空间中的
 `ibrobot-control`、目标 robot config、Gateway control-plane status 以及全部 Agent plan service/action。
+启动时会将安装空间中的 `ibrobot-control` 幂等注册到当前 Hermes profile 的 `skills/` 目录；仅更新带有
+`robot_skill_cli` 所有权标记的副本，遇到同名的用户自管 skill 时会以 `AGENT_SKILL_CONFLICT` 退出。
 `motion_authorized=false` 不阻止 Hermes 启动，只会继续由 Gateway 拒绝运动。启动器仅设置精确
 `ROBOT_CONFIG` 并预加载 `ibrobot-control`；它不会启动/重启 pipeline、修改 ROS 参数或开启运动授权。
+进入 Hermes 会话后只调用启动器注入到 `PATH` 的 `robot-skill`，不得再传 `--config-name` 或
+`--config-path`。自然语言抓取与其他 motion Skill 使用同一套
+`status -> list-skills -> plan-workflow -> describe -> validate-plan -> confirm-plan -> execute-plan` 生命周期；
+抓取计划使用 `pick_object` 和必填的 `target_name`，Gateway 再将其委派给配置绑定的 `grasp_pipeline`。
 
 SO-101 真机的完整手动验证步骤见
 [`docs/hermes_so101_real_robot_manual_validation_zh.md`](../../docs/hermes_so101_real_robot_manual_validation_zh.md)。

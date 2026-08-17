@@ -186,21 +186,29 @@ class SpeechDirectionPipeline:
         # 已处理样本计数是会话唯一时钟，任何秒数都只能由它换算。
         self._samples_processed = 0
         self._diagnostics_error_reported = False
+        # close 契约：best-effort terminal。legacy 对照链路非并发，无推理竞态，
+        # 故不设禁新推理标志；仅靠 _cleanup_complete 挡重入，避免重复释放已成功资源。
+        self._cleanup_complete = False
 
-    def process_block(self, data: np.ndarray) -> HopResult:
+    def process_block(
+        self,
+        data: np.ndarray,
+        *,
+        capture_start_sample: int | None = None,
+    ) -> HopResult:
         """处理一个 hop 块(6, hop_size)。
 
         Args:
             data: (6, hop_size) float32,6 通道音频
+            capture_start_sample: 原始采集绝对起点；None 时兼容旧连续调用。
 
         Returns:
             HopResult
         """
         t0 = time.perf_counter()
-        # Pipeline 会话轴只覆盖实际送入处理链、并写入全程 WAV 的样本；
-        # ring buffer 上游丢失的样本不在此轴补洞，由基础 diagnostics 单独呈现 dropped。
-        raw_start_sample = self._samples_processed
-        raw6ch = data.T.astype(np.float32, copy=True)
+        if capture_start_sample is None:
+            capture_start_sample = self._samples_processed
+        raw_start_sample = int(capture_start_sample)
 
         # 1. 取 4ch(input_channels=[1,2,3,4],data 行索引即通道号)
         mic4 = data[np.array(self.input_channels), :].T.astype(np.float32)  # (hop, 4)
@@ -209,15 +217,8 @@ class SpeechDirectionPipeline:
         #    (FullNet 单 hop 增强有 STFT 边界效应致 RMS 偏低,需 ≥8192 上下文取中段)
         self._enh_buf4 = np.concatenate([self._enh_buf4, mic4], axis=0)
         if self._enh_buf4.shape[0] < self.enh_block_size:
-            # 冷启动仍记录完整 raw6ch；增强流尚无真实数据时明确留空，不补零。
-            self._samples_processed += mic4.shape[0]
-            self._enqueue_diagnostics(
-                raw_start_sample=raw_start_sample,
-                raw6ch=raw6ch,
-                enh_start_sample=None,
-                enh4ch=None,
-                metrics=None,
-            )
+            # raw 已由采集侧连续记录；增强窗口不足时只推进兼容时轴，不制造空维测包。
+            self._samples_processed = raw_start_sample + mic4.shape[0]
             return HopResult(
                 raw_start_sample=raw_start_sample,
                 enh_start_sample=None,
@@ -228,7 +229,9 @@ class SpeechDirectionPipeline:
         self._enh_buf4 = self._enh_buf4[-self.enh_block_size :]
         # 增强 4ch(整块),取中间 hop_size 段作为本 hop 输出
         # crm 当前未使用,enhance_4ch 仍返回该能力供未来维测在 DiagnosticsPacket 中携带
+        stage_start = time.perf_counter()
         enh4_full, _ = self.fullnet.enhance_4ch(self._enh_buf4)
+        fullsubnet_elapsed_ms = (time.perf_counter() - stage_start) * 1000
         center_start = (self.enh_block_size - self.hop_size) // 2
         enh4 = enh4_full[center_start : center_start + self.hop_size].copy()  # (hop, 4)
         enh_ch1 = enh4[:, 0].copy()  # (hop,) 增强 ch1
@@ -242,7 +245,9 @@ class SpeechDirectionPipeline:
             self._enh_full4_dropped += dropped.shape[0]
 
         # 3. 人声门控:Silero 4×512 子帧 VAD + RMS 灰区判据
+        stage_start = time.perf_counter()
         gate = self.speech_gate.process_hop(enh_ch1)
+        silero_vad_elapsed_ms = (time.perf_counter() - stage_start) * 1000
         vad_prob = gate.vad_prob
         is_gray_hop = gate.is_gray_hop
         rms = gate.rms
@@ -251,7 +256,9 @@ class SpeechDirectionPipeline:
         # 4. 灰区 hop 才做 SRP(4ch 已增强,直接 STFT + scores)
         scores_frame = None
         frame_doa = None
+        srp_elapsed_ms = 0.0
         if is_gray_hop:
+            stage_start = time.perf_counter()
             # BlockFramer:上一块 overlap + 当前块 → 4096 帧
             block4 = np.concatenate([self._prev_block, enh4], axis=0)  # (4096, 4)
             self._prev_block = enh4.copy()
@@ -260,14 +267,15 @@ class SpeechDirectionPipeline:
             # 单帧 scores
             scores_frame = self.srp.compute_all_scores(spec4)[0]  # (n_angles,)
             frame_doa = int(self.srp.angles[int(np.argmax(scores_frame))])
+            srp_elapsed_ms = (time.perf_counter() - stage_start) * 1000
         else:
             # 非灰区帧:prev_block 用增强 enh4 维持 overlap 连续性
             self._prev_block = enh4.copy()
 
         # 灰区 hop 时累积子帧 RMS(段结束 max RMS 判定用)。新段初始化必须先完成，
         # 因此把当前 hop 的 sub_rms 交给状态机在初始化后追加。
-        self._samples_processed += mic4.shape[0]
-        # 增强真实起点 = 当前滑窗会话起点 + 实际切片 center_start；奇数差值也不偏移。
+        self._samples_processed = raw_start_sample + mic4.shape[0]
+        # 增强真实起点 = 当前采集块终点回看增强窗口，再加实际中段切片偏移。
         window_start_sample = self._samples_processed - self.enh_block_size
         enh_start_sample = window_start_sample + center_start
         session_sample = enh_start_sample
@@ -281,6 +289,9 @@ class SpeechDirectionPipeline:
 
         # 7. 维测旁路共享同一整数采样位置，丢包或异常都不得反向影响算法。
         elapsed_ms = (time.perf_counter() - t0) * 1000
+        measured_stages_ms = fullsubnet_elapsed_ms + silero_vad_elapsed_ms + srp_elapsed_ms
+        # other 是入口至指标构造前的剩余同步开销，不包含诊断入队和后台写盘。
+        other_elapsed_ms = max(elapsed_ms - measured_stages_ms, 0.0)
         metrics = FrameMetrics(
             session_sample=session_sample,
             sample_count=self.hop_size,
@@ -292,10 +303,14 @@ class SpeechDirectionPipeline:
             frame_doa_degree=frame_doa,
             segment_doa_degree=seg_output,
             inference_elapsed_ms=elapsed_ms,
+            fullsubnet_elapsed_ms=fullsubnet_elapsed_ms,
+            silero_vad_elapsed_ms=silero_vad_elapsed_ms,
+            srp_elapsed_ms=srp_elapsed_ms,
+            other_elapsed_ms=other_elapsed_ms,
         )
         self._enqueue_diagnostics(
             raw_start_sample=raw_start_sample,
-            raw6ch=raw6ch,
+            raw6ch=None,
             enh_start_sample=enh_start_sample,
             enh4ch=enh4,
             metrics=metrics,
@@ -329,7 +344,7 @@ class SpeechDirectionPipeline:
         self,
         *,
         raw_start_sample: int,
-        raw6ch: np.ndarray,
+        raw6ch: np.ndarray | None,
         enh_start_sample: int | None,
         enh4ch: np.ndarray | None,
         metrics: FrameMetrics | None,
@@ -339,7 +354,7 @@ class SpeechDirectionPipeline:
             return
         packet = DiagnosticsPacket(
             raw_start_sample=raw_start_sample,
-            raw6ch=raw6ch,
+            raw6ch=raw6ch.copy() if raw6ch is not None else None,
             enh_start_sample=enh_start_sample,
             enh4ch=enh4ch.copy() if enh4ch is not None else None,
             metrics=metrics,
@@ -507,24 +522,57 @@ class SpeechDirectionPipeline:
         angle = int(self.srp.angles[int(np.argmax(acc))])
         return angle, acc
 
-    def reset(self):
-        """重置状态机与缓冲(冷启动 / 长停顿后复位)。"""
+    def _reset_temporal_context(self) -> None:
+        """清除只能跨连续样本复用的状态，不回退会话级输出序号。"""
         self._state = "IDLE"
         self._seg_scores = []
         self._seg_rms = []
         self._seg_sub_rms = []
         self._seg_start_sample = 0
         self._seg_last_gray_sample = 0
-        self._seg_seq = 0
-        self._output_seq = 0
-        self._seg_history = []
         self._enh_buf4 = np.zeros((0, 4), dtype=np.float32)
         self._enh_full4_blocks = []
         self._enh_full4_total = 0
         self._enh_full4_dropped = 0
         self._prev_block = np.zeros((self.hop_size, 4), dtype=np.float32)
-        # reset 属于同一 diagnostics 会话，处理流采样轴及旁路故障状态均不得回退。
         self.speech_gate.reset()
+
+    def reset_for_gap(self, *, next_capture_sample: int, dropped_samples: int) -> None:
+        """采集缺口后丢弃未完成段，并从新的绝对采样位置冷启动。"""
+        if dropped_samples < 0:
+            raise ValueError("dropped_samples 不能为负数")
+        self._reset_temporal_context()
+        self._samples_processed = int(next_capture_sample)
+
+    def reset(self):
+        """重置状态机与缓冲(冷启动 / 长停顿后复位)。"""
+        self._reset_temporal_context()
+        self._seg_seq = 0
+        self._output_seq = 0
+        self._seg_history = []
+
+    def close(self) -> None:
+        """best-effort terminal 关闭：尽力释放 legacy 增强器与 Silero，一个失败仍继续关闭另一个，末尾汇总异常。
+
+        重入只在清理已尝试完毕后才直接返回；属 best-effort terminal，非可重试。
+        """
+        if self._cleanup_complete:
+            # 清理已尝试完毕（含失败项），重入直接返回，避免重复释放已成功资源。
+            return
+        errors = []
+        try:
+            for component in (self.speech_gate, self.fullnet):
+                close = getattr(component, "close", None)
+                if close is None:
+                    continue
+                try:
+                    close()
+                except Exception as exc:
+                    errors.append(str(exc) or type(exc).__name__)
+        finally:
+            self._cleanup_complete = True
+        if errors:
+            raise RuntimeError("; ".join(errors))
 
     def get_segment_history(self) -> list[tuple[int, int, float, str]]:
         """返回段级输出历史:(output_seq, angle, hop_t, type) 列表。

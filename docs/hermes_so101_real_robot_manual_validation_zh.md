@@ -28,7 +28,7 @@ list_controllers` 仅用于只读检查控制器状态。
 - 每次真机启动必须显式传入 `moveit_display:=true`。
 - 不生成 keystore，不设置任何 `ROS_SECURITY_*` 环境变量，也不使用 SROS2 enclave。
 - `authorize_motion:=true` 只能由完成现场安全检查的操作员在启动命令中显式设置。
-- 执行运动前，必须检查控制器状态，并由用户确认 Hermes 展示的 exact plan。
+- 执行运动前，必须检查控制器状态；Hermes 必须展示并 flush exact plan 后立即执行。
 - 正常关闭或重启服务前，必须先通过 Hermes 执行 `recover_safe_pose` 并确认成功，然后才能运行
   `./scripts/cleanup_ros.sh`。
 
@@ -179,7 +179,7 @@ control plane 和 Agent plan 接口。它不会启动机器人，也不会替操
 必须严格按 ibrobot-control 流程执行：
 status -> list-skills -> plan-workflow -> describe -> validate-plan。
 请先展示完整 workflow steps、每步参数、plan digest、registry epoch/generation/digest
-和 fresh task ID。在我明确回复“确认执行”之前，不要调用 confirm-plan 或 execute-plan。
+和 fresh task ID。展示并 flush 后立即调用 confirm-plan 和 execute-plan，不等待二次确认。
 不要调用裸 ROS、MoveIt、controller 或 primitive。
 ```
 
@@ -200,14 +200,9 @@ Hermes 必须先完成以下只读阶段：
 - registry identity 与当前 Gateway status 一致；
 - task ID 是本次请求的新 ID。
 
-确认无误后，在 Hermes 中输入：
-
-```text
-确认执行
-```
-
-Hermes 随后应使用 exact tuple 执行一次 `confirm-plan`，再使用返回的 confirmation token 执行一次
-`execute-plan`。如果显式使用 `--timeout-sec`，confirm 和 execute 必须使用完全相同的值。
+展示后 Hermes 应立即使用 exact tuple 执行一次 `confirm-plan`，再使用返回的 confirmation token 执行一次
+`execute-plan`。如果计划不正确，立即输入「别动」。如果显式使用 `--timeout-sec`，confirm 和 execute 必须
+使用完全相同的值。
 
 等待唯一 terminal result。通过标准为：
 
@@ -228,16 +223,12 @@ executed_step_count: 1
 必须使用 recover_safe_pose，并严格执行
 status -> list-skills -> plan-workflow -> describe -> validate-plan。
 先展示完整 workflow steps、参数、plan digest、registry identity 和新的 task ID，
-等待我明确回复“确认执行”后，才能调用 confirm-plan 和 execute-plan。
+展示并 flush 后立即调用 confirm-plan 和 execute-plan，不等待二次确认。
 ```
 
-确认计划只有一个 `recover_safe_pose` step、validation allowed 且 identity 正确后输入：
-
-```text
-确认执行
-```
-
-必须等待 terminal result 返回 `success: true`，并现场确认机械臂已经回到安全原位。
+展示计划只有一个 `recover_safe_pose` step、validation allowed 且 identity 正确后，Hermes 应立即执行；如果
+计划不正确，立即输入「别动」。必须等待 terminal result 返回 `success: true`，并现场确认机械臂已经回到
+安全原位。
 
 ## 9. 正常关闭与重启
 
@@ -267,7 +258,10 @@ cd "$IBROBOT_WS"
 客户端执行：
 
 ```bash
-robot-skill --config-path "$ROBOT_CONFIG_PATH" cancel-plan --task-id "<TASK_ID>"
+robot-skill --config-path "$ROBOT_CONFIG_PATH" cancel-plan \
+  --task-id "<TASK_ID>" --plan-id "<PLAN_ID>" --plan-digest "<PLAN_DIGEST>" \
+  --registry-epoch "<REGISTRY_EPOCH>" --registry-generation "<REGISTRY_GENERATION>" \
+  --registry-digest "<REGISTRY_DIGEST>" --expected-step-count "<STEP_COUNT>"
 ```
 
 “取消请求已发送”不等于“机器人已停止”。停止状态未知时不得继续发送 `recover_safe_pose` 或任何其他动作，

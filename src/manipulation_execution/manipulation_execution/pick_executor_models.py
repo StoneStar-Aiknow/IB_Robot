@@ -67,6 +67,10 @@ class FlowState:
     released_after_success: bool = False
     pipeline_timings: dict[str, float] = field(default_factory=dict)
     candidate_selection_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    # Set when an execution-phase failure has already completed its safe
+    # recovery to the observation pose.  The outer retry loop uses this to
+    # avoid issuing a duplicate recovery motion.
+    recovery_completed: bool = False
     active_phase: str = field(default="", repr=False)
     active_phase_started_at: float = field(default=0.0, repr=False)
 

@@ -21,6 +21,14 @@ models:
     api_key_env: ALIYUN_API_KEY
     multimodal: true
 
+  # OpenAI-compatible multimodal endpoint used by the Xunxing gpt-5.6-sol route.
+  gpt-5.6-sol:
+    provider: openai_compatible
+    base_url: https://az.gptplus5.com/v1
+    api_key_env: XUNXING_API_KEY
+    multimodal: true
+    api_protocol: responses
+
   # Text-only LLM (images in the message are stripped before sending).
   # Replace base_url / model name / api_key_env with your own endpoint.
   my-llm:

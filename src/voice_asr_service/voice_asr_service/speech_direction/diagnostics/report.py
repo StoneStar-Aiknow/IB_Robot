@@ -17,6 +17,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+_TIMING_BREAKDOWN_FIELDS = (
+    "fullsubnet_elapsed_ms",
+    "silero_vad_elapsed_ms",
+    "srp_elapsed_ms",
+    "other_elapsed_ms",
+)
+
 
 class ReportTransactionError(RuntimeError):
     """双文件依次提交时无法完整生成报告。"""
@@ -281,7 +288,19 @@ def _validate_metric_records(
     }
     for line_number, record in enumerate(records, 1):
         location = f"{path}:line {line_number}"
-        _require_keys(record, location, required)
+        _require_keys(
+            record,
+            location,
+            required,
+            optional=set(_TIMING_BREAKDOWN_FIELDS)
+            | {
+                "model_batch_samples",
+                "processing_tick_samples",
+                "srp_hop_samples",
+                "stage_executed",
+                "vad_frame_samples",
+            },
+        )
         sample = _require_int(record["session_sample"], f"{location}.session_sample")
         _require_int(record["sample_count"], f"{location}.sample_count", minimum=1)
         _require_int(record["segment_seq"], f"{location}.segment_seq")
@@ -291,7 +310,18 @@ def _validate_metric_records(
         _require_ranged_number(record["rms"], f"{location}.rms")
         _require_doa(record["frame_doa_degree"], f"{location}.frame_doa_degree")
         _require_doa(record["segment_doa_degree"], f"{location}.segment_doa_degree")
-        _require_ranged_number(record["inference_elapsed_ms"], f"{location}.inference_elapsed_ms")
+        total_elapsed = _require_ranged_number(record["inference_elapsed_ms"], f"{location}.inference_elapsed_ms")
+        # 历史会话可完全不含分项；新会话必须四项齐全，禁止部分字段造成误判。
+        present_breakdown = [field for field in _TIMING_BREAKDOWN_FIELDS if field in record]
+        if present_breakdown and len(present_breakdown) != len(_TIMING_BREAKDOWN_FIELDS):
+            missing_breakdown = sorted(set(_TIMING_BREAKDOWN_FIELDS) - record.keys())
+            raise _fail(location, f"耗时分项字段必须全有或全无，缺少 {missing_breakdown}")
+        if present_breakdown:
+            breakdown = [
+                _require_ranged_number(record[field], f"{location}.{field}") for field in _TIMING_BREAKDOWN_FIELDS
+            ]
+            if not math.isclose(sum(breakdown), total_elapsed, rel_tol=1e-6, abs_tol=1e-6):
+                raise _fail(location, "耗时分项之和必须等于 inference_elapsed_ms")
         _require_derived_seconds(record["session_seconds"], sample, sample_rate, f"{location}.session_seconds")
         if previous is not None and sample <= previous:
             raise _fail(f"{location}.session_sample", "必须严格递增")
@@ -392,6 +422,7 @@ def load_session_report_data(session_dir: str | Path) -> SessionReportData:
             "gray_events",
             "recorder",
         },
+        optional={"capture", "timing_contract", "thresholds"},
     )
     schema_version = _require_int(manifest["schema_version"], f"{manifest_path}.schema_version", minimum=1)
     if schema_version != 1:
@@ -537,6 +568,7 @@ def load_session_report_data(session_dir: str | Path) -> SessionReportData:
         recorder,
         recorder_location,
         {"state", "disabled_reason", "disabled_session_sample", "disabled_session_seconds", "dropped_count"},
+        optional={"raw_ingest"},
     )
     recorder_state = _require_string(recorder["state"], f"{recorder_location}.state")
     if recorder_state != status:
@@ -614,22 +646,60 @@ def _coverage_rows(data: SessionReportData):
     )
 
 
+def _timing_breakdown_available(data: SessionReportData) -> bool:
+    """仅当每条指标都具有完整分项时绘制分项曲线。"""
+    return bool(data.frame_metrics) and all(
+        all(field in item for field in _TIMING_BREAKDOWN_FIELDS) for item in data.frame_metrics
+    )
+
+
+def _report_thresholds(data: SessionReportData) -> Mapping[str, float]:
+    """优先读取会话快照，否则读取当前 SpeechDirectionConfig，禁止 renderer 写死门限。"""
+    thresholds = data.manifest.get("thresholds")
+    if isinstance(thresholds, Mapping):
+        return {
+            str(key): float(value)
+            for key, value in thresholds.items()
+            if isinstance(value, int | float) and not isinstance(value, bool)
+        }
+    # 旧会话尚未记录 thresholds；这里复用正式配置对象，避免复制默认常量。
+    try:
+        from ..config import SpeechDirectionConfig
+
+        gray_region = SpeechDirectionConfig().gray_region
+        return {
+            "rms_threshold": float(gray_region.rms_threshold),
+            "vad_threshold": float(gray_region.vad_threshold),
+            "seg_max_rms_threshold": float(gray_region.seg_max_rms_threshold),
+        }
+    except (ImportError, AttributeError, TypeError, ValueError):
+        return {}
+
+
 def _build_matplotlib_figure(data: SessionReportData):
-    """构造四行严格共享 X 轴的 Matplotlib figure，供 PNG 与结构测试共用。"""
+    """构造五行严格共享 X 轴的 Matplotlib figure，供 PNG 与结构测试共用。"""
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(4, 1, figsize=(14, 11), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(14, 13), sharex=True)
     times = [float(item["session_seconds"]) for item in data.frame_metrics]
+    # RMS 与 VAD 的数值量纲不同，分别绘制以避免共轴缩放掩盖波动。
     axes[0].plot(times, [float(item["rms"]) for item in data.frame_metrics], label="RMS")
-    axes[0].plot(
+    axes[0].set_ylabel("RMS")
+    thresholds = _report_thresholds(data)
+    if "rms_threshold" in thresholds:
+        axes[0].axhline(thresholds["rms_threshold"], color="tab:red", linestyle="--", label="RMS threshold")
+    axes[1].plot(
         times,
         [float(item["vad_probability"]) for item in data.frame_metrics],
         label="VAD probability",
     )
-    axes[0].set_ylabel("RMS / VAD")
+    axes[1].set_ylabel("VAD probability")
+    axes[1].set_ylim(-0.05, 1.05)
+    if "vad_threshold" in thresholds:
+        axes[1].axhline(thresholds["vad_threshold"], color="tab:red", linestyle="--", label="VAD threshold")
 
     frame_points = [
         (float(item["session_seconds"]), item["frame_doa_degree"])
@@ -642,23 +712,32 @@ def _build_matplotlib_figure(data: SessionReportData):
         if item["segment_doa_degree"] is not None
     ]
     if frame_points:
-        axes[1].scatter(*zip(*frame_points, strict=True), s=14, label="frame DOA")
+        axes[2].scatter(*zip(*frame_points, strict=True), s=14, label="frame DOA")
     if segment_points:
-        axes[1].scatter(*zip(*segment_points, strict=True), s=70, marker="*", label="segment DOA")
-    axes[1].set_ylabel("DOA (deg)")
-    axes[1].set_ylim(-10, 370)
+        axes[2].scatter(*zip(*segment_points, strict=True), s=70, marker="*", label="segment DOA")
+    axes[2].set_ylabel("DOA (deg)")
+    axes[2].set_ylim(-10, 370)
 
-    axes[2].plot(
+    axes[3].plot(
         times,
         [float(item["inference_elapsed_ms"]) for item in data.frame_metrics],
-        label="inference elapsed",
+        label="total",
+        linewidth=2.0,
     )
-    axes[2].set_ylabel("latency (ms)")
+    if _timing_breakdown_available(data):
+        for field, label in (
+            ("fullsubnet_elapsed_ms", "FullSubNet"),
+            ("silero_vad_elapsed_ms", "Silero VAD"),
+            ("srp_elapsed_ms", "SRP"),
+            ("other_elapsed_ms", "other"),
+        ):
+            axes[3].plot(times, [float(item[field]) for item in data.frame_metrics], label=label)
+    axes[3].set_ylabel("latency (ms)")
 
     # coverage 逐卷单独绘制，真实缺口不会被折线跨接或补齐。
     for stream, intervals, y_value, color in _coverage_rows(data):
         for index, (start, end) in enumerate(intervals, 1):
-            axes[3].hlines(
+            axes[4].hlines(
                 y_value,
                 start / data.sample_rate,
                 end / data.sample_rate,
@@ -666,9 +745,9 @@ def _build_matplotlib_figure(data: SessionReportData):
                 color=color,
                 label=stream if index == 1 else None,
             )
-    axes[3].set_yticks((1.0, 2.0, 3.0), labels=("metrics", "enh4ch", "raw6ch"))
-    axes[3].set_ylabel("coverage")
-    axes[3].set_xlabel("session time (s)")
+    axes[4].set_yticks((1.0, 2.0, 3.0), labels=("metrics", "enh4ch", "raw6ch"))
+    axes[4].set_ylabel("coverage")
+    axes[4].set_xlabel("session time (s)")
 
     for axis in axes:
         # 灰区与分卷边界必须逐行落图，不能依赖视觉上跨 subplot 的全局装饰。
@@ -683,7 +762,7 @@ def _build_matplotlib_figure(data: SessionReportData):
             axis.axvline(boundary / data.sample_rate, color="gray", linestyle="--", alpha=0.7)
         axis.set_xlim(data.x_min_seconds, data.x_max_seconds)
         axis.grid(True, alpha=0.25)
-        if axis is not axes[3]:
+        if axis is not axes[4]:
             axis.legend(loc="upper right")
     fig.suptitle(_report_title(data), fontsize=10)
     fig.tight_layout(rect=(0, 0, 1, 0.96))
@@ -691,33 +770,50 @@ def _build_matplotlib_figure(data: SessionReportData):
 
 
 def _build_plotly_figure(data: SessionReportData):
-    """构造四行严格匹配 X 轴的 Plotly figure，供 HTML 与结构测试共用。"""
+    """构造五行严格匹配 X 轴的 Plotly figure，供 HTML 与结构测试共用。"""
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
     fig = make_subplots(
-        rows=4,
+        rows=5,
         cols=1,
         shared_xaxes=True,
-        subplot_titles=("RMS / VAD", "Frame / Segment DOA", "Inference latency", "Coverage"),
-        vertical_spacing=0.07,
+        subplot_titles=("RMS", "VAD probability", "Frame / Segment DOA", "Inference latency", "Coverage"),
+        vertical_spacing=0.05,
     )
     times = [float(item["session_seconds"]) for item in data.frame_metrics]
+    thresholds = _report_thresholds(data)
     fig.add_trace(
         go.Scatter(x=times, y=[item["rms"] for item in data.frame_metrics], mode="lines", name="RMS"), row=1, col=1
     )
+    if "rms_threshold" in thresholds:
+        fig.add_hline(
+            y=thresholds["rms_threshold"],
+            line={"color": "red", "dash": "dash"},
+            annotation_text="RMS threshold",
+            row=1,
+            col=1,
+        )
     fig.add_trace(
         go.Scatter(
             x=times, y=[item["vad_probability"] for item in data.frame_metrics], mode="lines", name="VAD probability"
         ),
-        row=1,
+        row=2,
         col=1,
     )
+    if "vad_threshold" in thresholds:
+        fig.add_hline(
+            y=thresholds["vad_threshold"],
+            line={"color": "red", "dash": "dash"},
+            annotation_text="VAD threshold",
+            row=2,
+            col=1,
+        )
     fig.add_trace(
         go.Scatter(
             x=times, y=[item["frame_doa_degree"] for item in data.frame_metrics], mode="markers", name="frame DOA"
         ),
-        row=2,
+        row=3,
         col=1,
     )
     fig.add_trace(
@@ -728,7 +824,7 @@ def _build_plotly_figure(data: SessionReportData):
             marker={"symbol": "star", "size": 10},
             name="segment DOA",
         ),
-        row=2,
+        row=3,
         col=1,
     )
     fig.add_trace(
@@ -736,11 +832,29 @@ def _build_plotly_figure(data: SessionReportData):
             x=times,
             y=[item["inference_elapsed_ms"] for item in data.frame_metrics],
             mode="lines",
-            name="inference elapsed",
+            line={"width": 3},
+            name="total",
         ),
-        row=3,
+        row=4,
         col=1,
     )
+    if _timing_breakdown_available(data):
+        for field, label in (
+            ("fullsubnet_elapsed_ms", "FullSubNet"),
+            ("silero_vad_elapsed_ms", "Silero VAD"),
+            ("srp_elapsed_ms", "SRP"),
+            ("other_elapsed_ms", "other"),
+        ):
+            fig.add_trace(
+                go.Scatter(
+                    x=times,
+                    y=[item[field] for item in data.frame_metrics],
+                    mode="lines",
+                    name=label,
+                ),
+                row=4,
+                col=1,
+            )
     for stream, intervals, y_value, color in _coverage_rows(data):
         for index, (start, end) in enumerate(intervals, 1):
             fig.add_trace(
@@ -752,11 +866,11 @@ def _build_plotly_figure(data: SessionReportData):
                     name=f"{stream} #{index}",
                     showlegend=index == 1,
                 ),
-                row=4,
+                row=5,
                 col=1,
             )
 
-    for row in range(1, 5):
+    for row in range(1, 6):
         for event in data.gray_events:
             fig.add_vrect(
                 x0=int(event["start_sample"]) / data.sample_rate,
@@ -776,14 +890,15 @@ def _build_plotly_figure(data: SessionReportData):
             )
     # shared_xaxes 负责交互联动；显式 matches/range 防止 Plotly 自动范围造成细微偏差。
     fig.layout.xaxis.update(matches=None)
-    for axis_name in ("xaxis", "xaxis2", "xaxis3", "xaxis4"):
+    for axis_name in ("xaxis", "xaxis2", "xaxis3", "xaxis4", "xaxis5"):
         fig.layout[axis_name].update(range=(data.x_min_seconds, data.x_max_seconds))
-    for axis_name in ("xaxis2", "xaxis3", "xaxis4"):
+    for axis_name in ("xaxis2", "xaxis3", "xaxis4", "xaxis5"):
         fig.layout[axis_name].update(matches="x")
-    fig.update_yaxes(range=(-10, 370), row=2, col=1)
-    fig.update_yaxes(tickvals=(1, 2, 3), ticktext=("metrics", "enh4ch", "raw6ch"), row=4, col=1)
-    fig.update_xaxes(title_text="session time (s)", row=4, col=1)
-    fig.update_layout(title=_report_title(data), height=1050)
+    fig.update_yaxes(range=(-0.05, 1.05), row=2, col=1)
+    fig.update_yaxes(range=(-10, 370), row=3, col=1)
+    fig.update_yaxes(tickvals=(1, 2, 3), ticktext=("metrics", "enh4ch", "raw6ch"), row=5, col=1)
+    fig.update_xaxes(title_text="session time (s)", row=5, col=1)
+    fig.update_layout(title=_report_title(data), height=1250)
     return fig
 
 

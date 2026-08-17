@@ -12,6 +12,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+from embodied_common.agent_terminal_contract import TERMINAL_GOAL_STATUSES, classify_agent_terminal
 from robot_skill_cli import __version__
 from robot_skill_cli.output import (
     EXIT_GATEWAY_REJECTED,
@@ -125,17 +126,29 @@ def _build_parser() -> argparse.ArgumentParser:
     execute_plan_parser.add_argument("--confirmation-token", required=True)
     execute_plan_parser.add_argument("--task-id", required=True)
     execute_plan_parser.add_argument("--timeout-sec", type=float)
+    _add_agent_terminal_expectation(execute_plan_parser)
     cancel_plan_parser = subparsers.add_parser("cancel-plan", help="cancel an active Agent plan by task ID")
     cancel_plan_parser.add_argument("--task-id", required=True)
+    _add_agent_terminal_expectation(cancel_plan_parser)
     return parser
 
 
 def _add_skill_parameters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--target-name")
+    parser.add_argument("--container-name")
     parser.add_argument("--place-name")
     parser.add_argument("--motion-direction")
     parser.add_argument("--motion-distance", type=float)
     parser.add_argument("--timeout-sec", type=float)
+
+
+def _add_agent_terminal_expectation(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--plan-id", required=True)
+    parser.add_argument("--plan-digest", required=True)
+    parser.add_argument("--registry-epoch", required=True)
+    parser.add_argument("--registry-generation", required=True, type=int)
+    parser.add_argument("--registry-digest", required=True)
+    parser.add_argument("--expected-step-count", required=True, type=int)
 
 
 def _run_catalog_command(args: argparse.Namespace, view: dict[str, Any]) -> dict:
@@ -172,6 +185,7 @@ def _validate_schema(skill: dict[str, Any], args: argparse.Namespace) -> None:
     required = set(parameters["required"])
     values = {
         "target_name": args.target_name,
+        "container_name": getattr(args, "container_name", None),
         "place_name": args.place_name,
         "motion_direction": args.motion_direction,
         "motion_distance": args.motion_distance,
@@ -247,6 +261,7 @@ def _prepare_request(
     payload = canonical_skill_payload(
         skill["name"],
         target_name=args.target_name,
+        container_name=args.container_name,
         place_name=args.place_name,
         motion_direction=args.motion_direction,
         motion_distance=0.0 if args.motion_distance is None else args.motion_distance,
@@ -413,6 +428,12 @@ def _agent_plan_payload_hash(args: argparse.Namespace, timeout_sec: float) -> st
         "confirmation_token": args.confirmation_token,
         "task_id": args.task_id.strip(),
         "timeout_sec": float(timeout_sec),
+        "plan_id": args.plan_id,
+        "plan_digest": args.plan_digest,
+        "registry_epoch": args.registry_epoch,
+        "registry_generation": int(args.registry_generation),
+        "registry_digest": args.registry_digest,
+        "expected_step_count": int(args.expected_step_count),
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
     return hashlib.sha256(encoded.encode()).hexdigest()
@@ -438,29 +459,113 @@ def _agent_result_event(task_id: str, payload_hash: str, data: dict[str, Any]) -
 
 
 def _converge_unknown_agent_goal(bridge, task_id: str, rpc_timeout: float) -> dict[str, Any] | None:
-    try:
-        cancel = bridge.cancel_agent_plan(task_id, timeout_sec=rpc_timeout)
-    except Exception:
-        cancel = {"accepted": False}
-    try:
-        terminal = bridge.get_agent_plan_result(task_id, timeout_sec=rpc_timeout)
-    except Exception:
-        return None
+    cancel_needed = True
+
+    def cancel() -> None:
+        nonlocal cancel_needed
+        try:
+            response = bridge.cancel_agent_plan(task_id, timeout_sec=rpc_timeout)
+            cancel_needed = not bool(response.get("accepted"))
+        except Exception:
+            cancel_needed = True
+
+    cancel()
+    deadline = time.monotonic() + rpc_timeout
+    while time.monotonic() < deadline:
+        try:
+            terminal = bridge.get_agent_plan_result(task_id, timeout_sec=rpc_timeout)
+        except Exception:
+            terminal = None
+        try:
+            status = int(terminal.get("status", 0)) if terminal is not None else 0
+        except (TypeError, ValueError):
+            status = 0
+        # action_msgs/GoalStatus terminal values: succeeded=4, canceled=5, aborted=6.
+        if status in TERMINAL_GOAL_STATUSES:
+            return terminal
+        if cancel_needed:
+            cancel()
+        remaining = deadline - time.monotonic()
+        if remaining > 0.0:
+            time.sleep(min(0.02, remaining))
+    return None
+
+
+def _unknown_agent_result() -> dict[str, Any]:
+    return {
+        "success": False,
+        "plan_id": "",
+        "plan_digest": "",
+        "workflow_digest": "",
+        "completed_step_count": 0,
+        "error_code": "SKILL_CANCEL_TIMEOUT",
+        "message": "robot stop state is unknown",
+        "actual_registry_epoch": "",
+        "actual_registry_generation": 0,
+        "actual_registry_digest": "",
+    }
+
+
+def _rejected_agent_result() -> dict[str, Any]:
+    return {
+        "success": False,
+        "plan_id": "",
+        "plan_digest": "",
+        "workflow_digest": "",
+        "completed_step_count": 0,
+        "error_code": "GOAL_REJECTED",
+        "message": "agent plan goal was rejected; the server never created this goal",
+        "actual_registry_epoch": "",
+        "actual_registry_generation": 0,
+        "actual_registry_digest": "",
+    }
+
+
+def _agent_terminal_expectation(args: argparse.Namespace) -> dict[str, Any]:
+    expectation = {
+        "plan_id": str(args.plan_id).strip(),
+        "plan_digest": str(args.plan_digest).strip(),
+        "registry_epoch": str(args.registry_epoch).strip(),
+        "registry_generation": int(args.registry_generation),
+        "registry_digest": str(args.registry_digest).strip(),
+        "step_count": int(args.expected_step_count),
+    }
+    if not all(expectation[key] for key in ("plan_id", "plan_digest", "registry_epoch", "registry_digest")):
+        raise _CliArgumentError("plan and registry identity fields must be non-empty")
+    if expectation["registry_generation"] <= 0:
+        raise _CliArgumentError("registry_generation must be positive")
+    if not 1 <= expectation["step_count"] <= 16:
+        raise _CliArgumentError("expected_step_count must be between 1 and 16")
+    return expectation
+
+
+def _agent_terminal_exit_code(terminal: dict[str, Any]) -> int:
     status = int(terminal.get("status", 0))
-    # action_msgs/GoalStatus terminal values: succeeded=4, canceled=5, aborted=6.
-    return terminal if status in {4, 5, 6} and (cancel.get("accepted") or status in {4, 5, 6}) else None
+    data = terminal.get("result", {}) or {}
+    success = bool(data.get("success"))
+    error_code = str(data.get("error_code", ""))
+    if status == 4 and success and not error_code:
+        return EXIT_SUCCESS
+    if status == 5 and not success and error_code == "SKILL_CANCELLED":
+        return _agent_error_exit_code(error_code)
+    if status == 6 and not success and error_code:
+        return _agent_error_exit_code(error_code)
+    return 15
+
+
+def _validated_agent_terminal(terminal: dict[str, Any], expectation: dict[str, Any]) -> dict[str, Any] | None:
+    data = terminal.get("result", {}) or {}
+    return dict(data) if classify_agent_terminal(terminal.get("status", 0), data, expectation) is not None else None
 
 
 def _run_execute_plan(args: argparse.Namespace, context, bridge) -> _CommandExit:
     task_id = args.task_id.strip()
     if not task_id:
         raise _CliArgumentError("task_id must be non-empty")
+    expectation = _agent_terminal_expectation(args)
     rpc_timeout = _plan_rpc_timeout(context)
-    status = bridge.get_status(task_id=task_id, payload_hash="", timeout_sec=_status_preflight_timeout(context))
-    timeout_sec = status["task_budget_sec"] if args.timeout_sec is None else args.timeout_sec
-    if not math.isfinite(timeout_sec) or timeout_sec <= 0.0 or timeout_sec > status["task_budget_sec"]:
-        raise _CliArgumentError("timeout_sec must be finite, positive, and within the Gateway task budget")
-    payload_hash = _agent_plan_payload_hash(args, timeout_sec)
+    timeout_sec = args.timeout_sec
+    payload_hash = ""
     output_lock = threading.Lock()
     terminal_written = False
 
@@ -478,98 +583,182 @@ def _run_execute_plan(args: argparse.Namespace, context, bridge) -> _CommandExit
             terminal_written = True
             print(json_dumps(_agent_result_event(task_id, payload_hash, data)), flush=True)
 
-    if not bridge.wait_for_execute_plan_server(timeout_sec=rpc_timeout):
-        raise _CommandError(
-            "SERVER_UNAVAILABLE", "agent plan action server unavailable", exit_code=EXIT_ROS_UNAVAILABLE
-        )
-    goal_future = bridge.send_agent_plan_goal(
-        plan_token=args.plan_token,
-        confirmation_token=args.confirmation_token,
-        task_id=task_id,
-        timeout_sec=timeout_sec,
-        feedback_callback=emit_feedback,
-    )
-    if not bridge.wait_future(goal_future, timeout_sec=rpc_timeout):
+    interrupted = {"signal": None}
+    interrupt_event = threading.Event()
+
+    def _handle_signal(signum, _frame) -> None:
+        if interrupted["signal"] is None:
+            interrupted["signal"] = signum
+        interrupt_event.set()
+
+    def converge_or_unknown() -> _CommandExit:
         terminal = _converge_unknown_agent_goal(bridge, task_id, rpc_timeout)
-        if terminal is None:
-            data = {
-                "success": False,
-                "plan_id": "",
-                "plan_digest": "",
-                "workflow_digest": "",
-                "completed_step_count": 0,
-                "error_code": "SKILL_CANCEL_TIMEOUT",
-                "message": "robot stop state is unknown",
-                "actual_registry_epoch": "",
-                "actual_registry_generation": 0,
-                "actual_registry_digest": "",
-            }
-            emit_result(data)
-            return _CommandExit(EXIT_TIMEOUT)
-        data = terminal["result"]
+        data = _validated_agent_terminal(terminal, expectation) if terminal is not None else None
+        if data is None:
+            emit_result(_unknown_agent_result())
+            return _CommandExit(15)
         emit_result(data)
-        return _CommandExit(_result_exit_code(data, agent=True))
-    goal_handle = goal_future.result()
-    if goal_handle is None or not goal_handle.accepted:
-        data = {
-            "success": False,
-            "plan_id": "",
-            "plan_digest": "",
-            "workflow_digest": "",
-            "completed_step_count": 0,
-            "error_code": "GOAL_REJECTED",
-            "message": "agent plan goal was rejected",
-            "actual_registry_epoch": "",
-            "actual_registry_generation": 0,
-            "actual_registry_digest": "",
-        }
-        emit_result(data)
-        return _CommandExit(13)
-    result_future = goal_handle.get_result_async()
-    deadline = time.monotonic() + timeout_sec + rpc_timeout
-    while not result_future.done() and time.monotonic() < deadline:
-        time.sleep(0.02)
-    if not result_future.done() and not bridge.cancel_goal(goal_handle, result_future, timeout_sec=rpc_timeout):
-        data = {
-            "success": False,
-            "plan_id": "",
-            "plan_digest": "",
-            "workflow_digest": "",
-            "completed_step_count": 0,
-            "error_code": "SKILL_CANCEL_TIMEOUT",
-            "message": "robot stop state is unknown",
-            "actual_registry_epoch": "",
-            "actual_registry_generation": 0,
-            "actual_registry_digest": "",
-        }
-        emit_result(data)
-        return _CommandExit(15)
-    result = result_future.result()
-    data = _public_agent_plan_result(result.result)
-    emit_result(data)
-    return _CommandExit(_result_exit_code(data, agent=True))
+        if classify_agent_terminal(terminal["status"], data, expectation) == "unknown":
+            return _CommandExit(15)
+        return _CommandExit(_agent_terminal_exit_code(terminal))
+
+    previous_handlers: dict[int, Any] = {}
+    try:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            previous_handlers[signum] = signal.signal(signum, _handle_signal)
+        try:
+            status = bridge.get_status(task_id=task_id, payload_hash="", timeout_sec=_status_preflight_timeout(context))
+        except Exception:
+            return converge_or_unknown()
+        timeout_sec = status["task_budget_sec"] if timeout_sec is None else timeout_sec
+        if not math.isfinite(timeout_sec) or timeout_sec <= 0.0 or timeout_sec > status["task_budget_sec"]:
+            raise _CliArgumentError("timeout_sec must be finite, positive, and within the Gateway task budget")
+        payload_hash = _agent_plan_payload_hash(args, timeout_sec)
+        if interrupt_event.is_set():
+            return converge_or_unknown()
+        deadline = time.monotonic() + rpc_timeout
+        server_ready = False
+        try:
+            while not interrupt_event.is_set() and time.monotonic() < deadline:
+                remaining = deadline - time.monotonic()
+                server_ready = bridge.wait_for_execute_plan_server(timeout_sec=min(0.02, remaining))
+                if server_ready:
+                    break
+                time.sleep(min(0.01, remaining))
+        except Exception:
+            server_ready = False
+        if interrupt_event.is_set():
+            return converge_or_unknown()
+        if not server_ready:
+            return converge_or_unknown()
+        if interrupt_event.is_set():
+            return converge_or_unknown()
+        try:
+            goal_future = bridge.send_agent_plan_goal(
+                plan_token=args.plan_token,
+                confirmation_token=args.confirmation_token,
+                task_id=task_id,
+                timeout_sec=timeout_sec,
+                feedback_callback=emit_feedback,
+            )
+        except Exception:
+            return converge_or_unknown()
+        try:
+            goal_ready = bridge.wait_future(
+                goal_future,
+                timeout_sec=rpc_timeout,
+                interrupt_event=interrupt_event,
+            )
+        except Exception:
+            return converge_or_unknown()
+        if not goal_ready:
+            return converge_or_unknown()
+        try:
+            goal_handle = goal_future.result()
+        except Exception:
+            return converge_or_unknown()
+        if goal_handle is None or not goal_handle.accepted:
+            if not interrupt_event.is_set():
+                emit_result(_rejected_agent_result())
+                return _CommandExit(13)
+            return converge_or_unknown()
+        try:
+            result_future = goal_handle.get_result_async()
+        except Exception:
+            return converge_or_unknown()
+        deadline = time.monotonic() + timeout_sec + rpc_timeout
+        while not result_future.done():
+            if interrupt_event.is_set():
+                return converge_or_unknown()
+            if time.monotonic() >= deadline:
+                return converge_or_unknown()
+            time.sleep(0.02)
+        try:
+            result = result_future.result()
+            data = _public_agent_plan_result(result.result)
+            terminal = {"status": int(result.status), "result": data}
+        except Exception:
+            return converge_or_unknown()
+        if int(terminal.get("status", 0)) not in TERMINAL_GOAL_STATUSES:
+            return converge_or_unknown()
+        validated = _validated_agent_terminal(terminal, expectation)
+        if validated is None:
+            emit_result(_unknown_agent_result())
+            return _CommandExit(15)
+        emit_result(validated)
+        if classify_agent_terminal(terminal["status"], validated, expectation) == "unknown":
+            return _CommandExit(15)
+        return _CommandExit(_agent_terminal_exit_code(terminal))
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def _run_cancel_plan(args: argparse.Namespace, context, bridge) -> dict[str, Any]:
     task_id = args.task_id.strip()
     if not task_id:
         raise _CliArgumentError("task_id must be non-empty")
+    expectation = _agent_terminal_expectation(args)
     timeout_sec = _plan_rpc_timeout(context)
-    cancel = bridge.cancel_agent_plan(task_id, timeout_sec=timeout_sec)
-    if not cancel["accepted"]:
-        raise _CommandError("GOAL_NOT_FOUND", "agent plan goal was not active", exit_code=13)
-    terminal = bridge.get_agent_plan_result(
-        task_id,
-        timeout_sec=context.view["timeout_policy"]["task_budget_sec"] + timeout_sec,
-    )
-    if int(terminal.get("status", 0)) not in {4, 5, 6}:
+    cancel_failed = False
+    cancel = {"accepted": False}
+
+    def cancel_once() -> None:
+        nonlocal cancel, cancel_failed
+        try:
+            cancel = bridge.cancel_agent_plan(task_id, timeout_sec=timeout_sec)
+            cancel_failed = False
+        except Exception:
+            cancel = {"accepted": False}
+            cancel_failed = True
+
+    cancel_once()
+    result_observed = False
+    terminal = None
+    deadline = time.monotonic() + context.view["timeout_policy"]["task_budget_sec"] + timeout_sec
+    while time.monotonic() < deadline:
+        try:
+            terminal = bridge.get_agent_plan_result(task_id, timeout_sec=timeout_sec)
+            result_observed = True
+        except Exception:
+            terminal = None
+        try:
+            status = int(terminal.get("status", 0)) if terminal is not None else 0
+        except (TypeError, ValueError):
+            status = 0
+        if status in TERMINAL_GOAL_STATUSES:
+            break
+        if not cancel.get("accepted"):
+            cancel_once()
+        remaining = deadline - time.monotonic()
+        if remaining > 0.0:
+            time.sleep(min(0.02, remaining))
+    if terminal is not None:
+        validated = _validated_agent_terminal(terminal, expectation)
+        if validated is not None:
+            classification = classify_agent_terminal(terminal["status"], validated, expectation)
+            if classification == "unknown":
+                raise _CommandError(
+                    str(validated["error_code"]),
+                    str(validated.get("message") or "robot stop state is unknown"),
+                    exit_code=15,
+                )
+            return {
+                "task_id": task_id,
+                "accepted": bool(cancel["accepted"]),
+                "terminal": True,
+                "goal_status": int(terminal["status"]),
+                "result": validated,
+            }
+    if result_observed:
         raise _CommandError("SKILL_CANCEL_TIMEOUT", "robot stop state is unknown", exit_code=15)
-    return {
-        "task_id": task_id,
-        "accepted": True,
-        "terminal": True,
-        "result": terminal["result"],
-    }
+    if cancel_failed:
+        raise _CommandError("SKILL_CANCEL_TIMEOUT", "robot stop state is unknown", exit_code=15)
+    if not cancel["accepted"]:
+        raise _CommandError(
+            "GOAL_NOT_FOUND", "agent plan goal was not active and no terminal proof exists", exit_code=13
+        )
+    raise _CommandError("SKILL_CANCEL_TIMEOUT", "robot stop state is unknown", exit_code=15)
 
 
 def _identity_status(bridge, task_id: str, payload_hash: str, timeout_sec: float) -> dict[str, Any]:

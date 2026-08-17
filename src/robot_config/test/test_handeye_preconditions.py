@@ -18,7 +18,7 @@ def _robot_config(name: str) -> Path:
 
 
 def test_gripper_mounted_realsense_config_passes_eye_in_hand_precheck():
-    result = precheck.run_precheck(_robot_config("so101_handeye_realsense_grasp.yaml"), camera_name="wrist")
+    result = precheck.run_precheck(_robot_config("lekiwi_handeye_realsense_grasp.yaml"), camera_name="wrist")
 
     assert result.passed
     assert [camera.name for camera in result.cameras] == ["wrist"]

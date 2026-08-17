@@ -64,8 +64,10 @@ CUDA 路径使用 pip 安装的 GraspGen：`manipulation_service` 在同一 Pyth
 
 - 使用 `local_cuda` 时当前环境需有可用 CUDA PyTorch；上游 `GraspGenSampler` 内部会把模型和点云移到 CUDA。
 - 使用 `ascend_local` 时需有可加载的 Ascend GraspGen manifest/OM bundle 和 ACL 运行环境。
-- 已通过 `./scripts/setup.sh --with-grasp` 安装 `grasp_gen` 和 `pointnet2_ops`。
-- GraspGen 模型文件在 `models/grasp/`，或通过 `GRASPGEN_MODEL_DIR` 指定。
+- 已通过 `./scripts/setup.sh` 默认安装 `grasp_gen` 和 `pointnet2_ops`（Ubuntu 默认安装；openEuler Embedded 因 CUDA 扩展限制跳过）。
+- GraspGen 运行 bundle 位于 `models/grasp/graspgen_robotiq_2f_140/`；其中
+  `assets/adapter.json` 声明 bundle-relative 配置和权重路径。旧的
+  `models/grasp/checkpoints/` 布局和 `GRASPGEN_MODEL_DIR` 仍作为兼容回退。
 - 已构建 `manipulation_service` 和 `ibrobot_msgs`。
 
 所有 ROS 调试命令都应在仓库根目录运行，并在同一条命令里完成环境初始化：
@@ -180,7 +182,7 @@ MoveIt 运动、恢复和抓后验证。推荐通过统一 robot-config bringup 
 
 ```bash
 source .shrc_local && export ROS_DOMAIN_ID=42 && source install/setup.bash && \
-robot-skill --config-name so101_handeye_realsense_grasp execute pick_object \
+robot-skill --config-name lekiwi_handeye_realsense_grasp execute pick_object \
   --task-id pick-marker-001 --target-name marker --timeout-sec 240
 ```
 

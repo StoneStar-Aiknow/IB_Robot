@@ -2,22 +2,44 @@
 
 本目录用于存放 **IB_Robot 对上游第三方依赖的受控定制内容**。
 
-当前目录下主要维护的是 LeRobot 的补丁栈：
+当前目录维护 LeRobot 补丁栈，以及由固定上游版本和补丁构建的第三方 wheel：
 
 ```text
 third_party/
-└── patches/
-    └── lerobot/
-        ├── INDEX.yaml
-        └── v0.5.1/
-            ├── 0001-*.patch
-            ├── 0002-*.patch
-            ├── ...
-            ├── manifest.yaml
-            ├── series.txt
-            ├── series.master-parity-candidates.txt
-            └── series.openharmony-5.1.0-musl.txt
+├── patches/
+│   ├── lerobot/
+│         ├── INDEX.yaml
+│         └── v0.5.1/
+│             ├── 0001-*.patch
+│             ├── 0002-*.patch
+│             ├── ...
+│             ├── manifest.yaml
+│             ├── series.txt
+│             ├── series.master-parity-candidates.txt
+│   │       └── series.openharmony-5.1.0-musl.txt
+│   ├── recognize-anything/<commit>/
+│   │   ├── manifest.yaml
+│   │   ├── series.txt
+│   │   └── 0001-*.patch
+│   └── groundingdino/<commit>/
+│       ├── manifest.yaml
+│       ├── series.txt
+│       └── 0001-*.patch
+└── wheels/
+    ├── recognize-anything/<commit>/
+    │   ├── ibrobot_ram-*.whl
+    │   └── SHA256SUMS
+    └── groundingdino/<commit>/
+        ├── ibrobot_groundingdino-*.whl
+        └── SHA256SUMS
 ```
+
+RAM++ wheel 通过 `scripts/build_ram_plus_wheel.sh` 从 manifest 固定的上游 commit 重建。GroundingDINO wheel 通过
+`scripts/build_groundingdino_wheel.sh` 从 manifest 固定的上游 commit 重建（`GROUNDINGDINO_SKIP_CUDA=1` 跳过 CUDA
+扩展，产出纯 Python wheel；`MultiScaleDeformableAttention` 在 `groundingdino._C` 不可用时回落到纯 PyTorch 实现，
+CUDA 用户如需最优性能可单独构建 `_C` 扩展）。setup 使用 `--no-deps` 安装这些 wheel，Python runtime 依赖仍由
+`requirements/perception.txt` 统一解析，避免第三方元数据覆盖
+IB_Robot 的 Torch、Transformers 和 ROS ABI 约束。
 
 ## 设计目标
 

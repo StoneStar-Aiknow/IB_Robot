@@ -31,6 +31,15 @@ class FrameMetrics:
     frame_doa_degree: int | None
     segment_doa_degree: int | None
     inference_elapsed_ms: float
+    fullsubnet_elapsed_ms: float
+    silero_vad_elapsed_ms: float
+    srp_elapsed_ms: float
+    other_elapsed_ms: float
+    processing_tick_samples: int | None = None
+    model_batch_samples: int | None = None
+    vad_frame_samples: int | None = None
+    srp_hop_samples: int | None = None
+    stage_executed: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -38,7 +47,7 @@ class DiagnosticsPacket:
     """一次后台写入所需的音频块和可选帧指标。"""
 
     raw_start_sample: int
-    raw6ch: np.ndarray
+    raw6ch: np.ndarray | None
     enh_start_sample: int | None
     enh4ch: np.ndarray | None
     metrics: FrameMetrics | None
@@ -72,6 +81,7 @@ class DiagnosticsRecorder:
         save_enh4ch: bool,
         save_frame_metrics: bool,
         save_gray_events: bool,
+        thresholds: dict[str, float] | None = None,
         queue_size: int = 128,
         drop_when_full: bool = True,
         on_disabled: DisabledCallback | None = None,
@@ -87,6 +97,7 @@ class DiagnosticsRecorder:
         self._save_enh4ch = save_enh4ch
         self._save_frame_metrics = save_frame_metrics
         self._save_gray_events = save_gray_events
+        self._thresholds = None if thresholds is None else {key: float(value) for key, value in thresholds.items()}
         # 参数仅保留配置接口兼容；实时维测旁路无论取值都禁止阻塞生产线程。
         del drop_when_full
         self._on_disabled = on_disabled
@@ -96,6 +107,13 @@ class DiagnosticsRecorder:
         # 同一 Condition 定义 start/enqueue/stop 的线性化边界，STOP 发布后绝不再接收包。
         self._condition = threading.Condition(threading.RLock())
         self._status = RecorderStatus(True, "not_started", None, None, 0)
+        self._raw_ingest_stats = {
+            "packets_accepted": 0,
+            "frames_accepted": 0,
+            "packets_dropped": 0,
+            "frames_dropped": 0,
+        }
+        self._capture_stats: dict[str, int] = {}
         self._manifest: SessionManifest | None = None
         self._writers: list[object] = []
         self._raw_writer: RollingAudioWriter | None = None
@@ -152,6 +170,29 @@ class DiagnosticsRecorder:
                 # 实时路径绝不能因维测磁盘吞吐不足而无限等待。
                 self._status = replace(self._status, dropped_count=self._status.dropped_count + 1)
                 return False
+
+    def enqueue_raw(self, *, start_sample: int, samples: np.ndarray) -> bool:
+        """采集线程非阻塞投递连续 raw，并按帧统计旁路丢弃。"""
+        packet = DiagnosticsPacket(start_sample, samples, None, None, None)
+        frame_count = int(samples.shape[0])
+        with self._condition:
+            if self._status.state != "recording" or self._stop_requested:
+                return False
+            try:
+                self._queue.put_nowait(packet)
+                self._raw_ingest_stats["packets_accepted"] += 1
+                self._raw_ingest_stats["frames_accepted"] += frame_count
+                return True
+            except queue.Full:
+                self._raw_ingest_stats["packets_dropped"] += 1
+                self._raw_ingest_stats["frames_dropped"] += frame_count
+                self._status = replace(self._status, dropped_count=self._status.dropped_count + 1)
+                return False
+
+    def update_capture_stats(self, stats: dict[str, int]) -> None:
+        """保存 runtime 终态快照；只在最终 Manifest 提交时落盘。"""
+        with self._condition:
+            self._capture_stats = {key: int(value) for key, value in stats.items()}
 
     def stop(self) -> None:
         """有限等待排空既有包，尽力关闭所有 writer，并保持并发幂等。"""
@@ -221,6 +262,7 @@ class DiagnosticsRecorder:
             save_enh4ch=self._save_enh4ch,
             save_frame_metrics=self._save_frame_metrics,
             save_gray_events=self._save_gray_events,
+            thresholds=self._thresholds,
         )
         self._manifest = manifest
         full_dir = self._session_dir / "audio" / "full"
@@ -294,7 +336,7 @@ class DiagnosticsRecorder:
     def _write_packet(self, packet: DiagnosticsPacket) -> None:
         """按 raw、enh、metrics、gray 四条独立开关路径顺序写入一个包。"""
         # 四路共享同一 packet，但任一路异常都交给 worker 统一永久禁用，避免部分失败后续写。
-        if self._raw_writer is not None:
+        if self._raw_writer is not None and packet.raw6ch is not None:
             self._raw_writer.write(
                 start_sample=packet.raw_start_sample,
                 samples=packet.raw6ch,
@@ -338,6 +380,11 @@ class DiagnosticsRecorder:
                 self._disable(error, None)
 
             try:
+                with self._condition:
+                    capture_stats = dict(self._capture_stats)
+                    raw_ingest_stats = dict(self._raw_ingest_stats)
+                manifest.set_capture_stats(capture_stats)
+                manifest.set_raw_ingest_stats(raw_ingest_stats)
                 manifest.set_gray_event_count(gray_count)
                 status = self.status
                 if status.state == "diagnostics_disabled":

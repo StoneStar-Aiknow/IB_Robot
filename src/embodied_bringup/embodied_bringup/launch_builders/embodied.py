@@ -9,6 +9,7 @@ from launch_ros.actions import Node
 from robot_config.loader import robot_config_digest
 from robot_config.logger_utils import get_colored_logger
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
+from robot_config.utils import resolve_ros_path
 
 logger = get_colored_logger("embodied_bringup")
 
@@ -83,6 +84,7 @@ def generate_embodied_nodes(
     teleoperation = robot_config.get("teleoperation", {})
     perception = embodied_config.get("perception", {})
     grasp_execution = robot_config.get("grasp_execution", {})
+    placement_execution = robot_config.get("placement_execution", {})
     perception_scene_sources = perception.get("scene_sources", {})
     perception_vlm_api = perception.get("vlm_api", {})
     perception_conversation = perception.get("conversation", {})
@@ -148,6 +150,8 @@ def generate_embodied_nodes(
         "task_executor_action_name": execution.get("task_executor_action_name", "/task_executor/execute_task_plan"),
         "pick_action_name": grasp_execution.get("action_name", "/manipulation/execute_pick"),
         "grasp_execution_json": json.dumps(grasp_execution),
+        "place_action_name": placement_execution.get("action_name", "/manipulation/execute_place"),
+        "placement_execution_json": json.dumps(placement_execution),
         "move_configuration_service": execution.get(
             "move_configuration_service", "/moveit_gateway/move_to_configuration"
         ),
@@ -243,6 +247,9 @@ def generate_embodied_nodes(
     if grasp_execution.get("enabled", False):
         camera = grasp_execution.get("camera", {})
         planner_params, planner_env = _node_runtime_settings(grasp_execution.get("planner_node", {}))
+        for field in ("local_manifest_path", "ascend_local_manifest_path"):
+            if planner_params.get(field):
+                planner_params[field] = resolve_ros_path(planner_params[field])
         verifier_params = grasp_execution.get("verifier_node", {})
         if grasp_execution.get("auto_start_dependencies", True):
             nodes.extend(
@@ -267,7 +274,11 @@ def generate_embodied_nodes(
                                 "legacy_detect_service": grasp_execution.get(
                                     "fallback_detect_service", "/grasp_planner/detect_and_segment"
                                 ),
-                                "model_dir": grasp_execution.get("model_bundle_path", ""),
+                                "model_dir": resolve_ros_path(
+                                    grasp_execution.get(
+                                        "planner_model_dir", grasp_execution.get("model_bundle_path", "")
+                                    )
+                                ),
                                 **planner_params,
                             }
                         ],
@@ -313,6 +324,32 @@ def generate_embodied_nodes(
                         "arm_joint_names_json": json.dumps(joint_config.get("arm", [])),
                         "gripper_open_position": execution.get("gripper_open_position", 1.0),
                         "gripper_closed_position": execution.get("gripper_closed_position", 0.0),
+                        "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
+                    }
+                ],
+            )
+        )
+    if placement_execution.get("enabled", False):
+        moveit_executor = robot_config.get("control_modes", {}).get("moveit_planning", {}).get("executor", {})
+        nodes.append(
+            Node(
+                package="manipulation_execution",
+                executable="place_executor_node",
+                name="placement_executor_node",
+                output="screen",
+                parameters=[
+                    {
+                        "action_name": placement_execution.get("action_name", "/manipulation/execute_place"),
+                        "primitive_action_name": embodied_config.get(
+                            "primitive_action_name", "/embodied/execute_primitive"
+                        ),
+                        "placement_execution_json": json.dumps(placement_execution),
+                        "gripper_joint_name": str(
+                            next(iter(robot_config.get("joints", {}).get("gripper", ["6"])), "6")
+                        ),
+                        "gripper_open_position": execution.get("gripper_open_position", 1.0),
+                        "gripper_closed_position": execution.get("gripper_closed_position", 0.0),
+                        "gripper_position_tolerance": moveit_executor.get("gripper_position_tolerance", 0.05),
                         "rpc_timeout_sec": timeout_policy["rpc_timeout_sec"],
                     }
                 ],

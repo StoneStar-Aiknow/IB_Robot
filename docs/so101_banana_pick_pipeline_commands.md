@@ -1,81 +1,178 @@
-# SO101 腕部 RealSense 抓取流水线
+# LeKiwi 腕部 RealSense 香蕉抓取操作指南
 
-面向 310P 板端和 PC 真机抓取调试的最小命令集：腕部 RealSense -> Grounding-DINO/SAM2 named deployments ->
-GraspGen -> MoveIt -> 可选抓取验证。两个平台使用相同硬件（SO101 机械臂 + 腕部 RealSense），
-仅推理硬件不同：310P 用 Ascend NPU，PC 用 NVIDIA CUDA。
+本文用于 LeKiwi 移动操作臂真机抓取（LeKiwi 全向底盘 + SO-101 follower 臂，由 `LeKiwiSystemHardware`
+插件统一驱动）：腕部 RealSense 采集 RGB-D，经 Grounding-DINO/SAM2、GraspGen 和 MoveIt 完成目标检测、
+抓取规划、执行与验证。抓取执行期间底盘保持静止，仅臂与夹爪运动。
 
-## 固定约定
+支持两个运行平台：
 
-- 仓库：`~/IB_Robot`
-- ROS 域：`ROS_DOMAIN_ID=218`
-- 单机抓取隔离：`ROS_LOCALHOST_ONLY=1`（pipeline、检查命令和客户端必须一致）
-- 310P robot config：`so101_handeye_realsense_grasp`（Ascend NPU 推理）
-- PC robot config：`so101_handeye_realsense_grasp_pc`（NVIDIA CUDA 推理）
-- 腕部 RGB：`/camera/wrist/image_raw`
-- 腕部对齐深度：`/camera/wrist/aligned_depth_to_color/image_raw`
-- 腕部 CameraInfo：`/camera/wrist/aligned_depth_to_color/camera_info`
-- 检测服务：`/perception/grasp/grounding_detect`
-- 抓取规划服务：`/grasp_planner/plan_grasp`
-- 抓取验证服务：`/grasp_verifier/verify_grasp`
-- 统一执行入口：`/manipulation/execute_pick`（`manipulation_execution/pick_executor_node`）
-- 外部抓取入口：`robot-skill execute pick_object`（Capability Gateway）
-- Hermes 控制面：`ibrobot-control` Agent Skill -> `robot-skill` -> ROS Capability Gateway
-- Hermes 抓取技能：`pick_object`，不要写成 `pick-object`
+| 平台 | Robot config | 推理后端 | 命令执行位置 |
+|---|---|---|---|
+| 310P | `lekiwi_handeye_realsense_grasp` | Ascend NPU | 仓库根目录 |
+| PC | `lekiwi_handeye_realsense_grasp_pc` | NVIDIA CUDA | 仓库根目录 |
 
-两个配置文件硬件部分完全相同（机械臂端口、腕部相机话题、手眼标定值），唯一差异是推理后端：
+> **安全要求**：本文第 3.1、4.3、5.2 节会驱动真机。执行前必须清空工作区、确认急停可用，并由操作员对本次运动
+> 明确授权。失败、超时或机器人状态未知时禁止自动重试。
 
-| 配置项 | 310P (`so101_handeye_realsense_grasp`) | PC (`so101_handeye_realsense_grasp_pc`) |
-|---|---|---|
-| GraspGen 后端 | `ascend_local` | `local_cuda` |
-| GraspGen 模型 | `/root/graspgen_310p_bundle` | `models/grasp/checkpoints/` |
-| 感知 bundle | `*_ascend` + `ascend_310p` deployment | `grounded_sam2_swint_ogc` + `torch_cuda` deployment |
-| 感知 service | `GroundingDINORawDetectPlugin` + `SegmentDetectionsPlugin` 分开 | `GroundingDetectPlugin` 合并 |
-| segment_service | `/perception/grasp/segment_detections` | `""`（inline，不需要单独 service） |
+## 执行顺序
 
-抓取配置只发布 RGB、对齐深度和 CameraInfo。GraspGen 会从对齐深度直接构造目标点云，因此不再启动
-未被抓取链消费的 ROS `PointCloud2` 发布/转发；大尺寸 RGB-D 消息由 RealSense 节点直接 remap 到稳定话题，
-避免多次冷启动后 Python relay 与 Fast DDS UDP 队列叠加。
+首次部署先完成第 0 章；除硬件、标定或模型发生变化外，完成后日常抓取可跳过。每次抓取按以下顺序执行：
 
-启动前必须检查对应 YAML 中的 `ros2_control.port`、相机序列号和手眼标定值。
-
-常用命令都从仓库根目录执行：
-
-```bash
-cd ~/IB_Robot
+```text
+选择平台并加载环境
+  -> 检查设备、标定和模型
+  -> 清理残留 ROS 节点
+  -> 启动统一 pipeline
+  -> 检查控制器、服务和相机
+  -> 可选：观测位/规划冒烟测试
+  -> 通过 Hermes 或公开技能 CLI 执行抓取
+  -> 核对 terminal result 和验证证据
 ```
 
-## 0. 首次准备
+日常操作以第 1～6 章为主。第 4 章适用于 Hermes 自然语言控制，第 5 章适用于操作员直接执行已明确选择的
+`pick_object` 技能；两者都经过 Capability Gateway。排障和调参见第 7、8 章。
 
-安装依赖并下载模型：
+## 0. 首次准备（完成后日常可跳过）
+
+### 0.1 安装、下载和构建
+
+除非另有说明，本文所有命令均在 IB_Robot 仓库根目录执行；所有项目内路径均相对于仓库根目录。
+
+在目标运行平台执行：
 
 ```bash
-./scripts/setup.sh --with-perception --with-grasp
-./scripts/download_perception_models.sh
+./scripts/setup.sh
+source .shrc_local
+colcon build --symlink-install --merge-install --packages-up-to \
+  lekiwi_description lekiwi_hardware embodied_bringup robot_skill_cli \
+  perception_service manipulation_execution
 ```
 
-构建完整抓取与 Hermes 调用链：
+PC 额外下载 Grounded-SAM2 Torch bundle：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && colcon build --symlink-install --merge-install --packages-up-to \
-  embodied_bringup robot_skill_cli perception_service manipulation_execution
+./scripts/download_perception_models.sh --gdino-only
 ```
 
-在 `src/robot_config/config/robots/``so101_handeye_realsense_grasp.yaml` 或
-`so101_handeye_realsense_grasp_pc.yaml` 中填写当前机器的硬件和标定值。
+该脚本不下载 GraspGen checkpoint，也不生成 310P 的 OM bundle。`models/` 是被 Git 忽略的部署目录，fresh clone
+中不存在属于正常情况。310P 与 PC 必须分别按第 0.3 节下发或生成与 robot config 一致的 bundle，不能从另一
+平台的本地目录推断模型已经就绪。
 
-310P 板端启动前先在本机执行静态 preflight，不会产生机械臂运动：
+### 0.2 填写硬件与标定配置
+
+按平台修改对应文件：
+
+- 310P：`src/robot_config/config/robots/lekiwi_handeye_realsense_grasp.yaml`
+- PC：`src/robot_config/config/robots/lekiwi_handeye_realsense_grasp_pc.yaml`
+
+启动前必须确认：
+
+- `ros2_control.port` 指向实际机械臂串口；
+- 腕部 RealSense 使用 `rs-enumerate-devices` 或相机节点日志中的 librealsense serial 显式绑定；当前 310P
+  所接 D435i 为 `349522071345`，不要使用 USB sysfs descriptor serial；
+- 手眼标定值来自当前机械臂和相机组合；
+- 两份配置的硬件字段保持一致，只让推理后端存在平台差异。
+
+310P 必须使用飞书《310P RealSense 相机使能与部署指导》中定义的 Color-first
+`realsense2_camera 4.57.7`，让 RGB Camera 先于 Stereo Module 启动。YAML 参数本身不能改变 sensor
+启动顺序；系统仍加载原版 Depth-first wrapper 时，不得继续抓取。当前 310P 配置保持 `640x360@30`，并使用
+`initial_reset=false`、`enable_sync=false`、关闭 pointcloud/IMU。抓取链路逐项恢复 alignment，因为 planner
+必须消费 `/camera/wrist/aligned_depth_to_color/{image_raw,camera_info}`。
+
+### 0.3 准备模型
+
+两端使用相同的逻辑模型，但 named deployment 和物理 bundle 不同：
+
+| 平台 | 用途 | Bundle | Named deployment | 准备方式 |
+|---|---|---|---|---|
+| PC | 检测与分割 | `models/grounded_sam2_swint_ogc/` | `torch_cuda` | `download_perception_models.sh --gdino-only` |
+| PC | GraspGen | `models/grasp/graspgen_robotiq_2f_140/` | `torch_cuda` | 从已审核 checkpoint 生成 |
+| 310P | Grounding-DINO | `models/grounding_dino_swint_seq8_1280x720_ascend/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
+| 310P | SAM2 | `models/sam2_hiera_tiny_ascend/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
+| 310P | GraspGen | `models/grasp/graspgen_robotiq_2f_140/` | `ascend_310p` | 下发已 promotion 的 compiled bundle |
+
+310P 不在板端临时编译模型。将发布流程产出的三个完整 bundle 同步到 `models/` 后检查：
 
 ```bash
-cd /root/IB_Robot && source .shrc_local
-test -f models/perception/grounding_dino_swint_seq8_1280x720_ascend/inference_manifest.json
-test -f models/perception/sam2_hiera_tiny_ascend/inference_manifest.json
-test -f /root/graspgen_310p_bundle/inference_manifest.json
+test -f models/grounding_dino_swint_seq8_1280x720_ascend/inference_manifest.json
+test -f models/sam2_hiera_tiny_ascend/inference_manifest.json
+test -f models/grasp/graspgen_robotiq_2f_140/inference_manifest.json
+```
+
+Ascend 感知 bundle 的 promotion 命令和候选目录约束见
+[`src/perception_service/README.md`](../src/perception_service/README.md#91-ascend-310p-抓取感知)；GraspGen 的
+ONNX、OM 与 bundle 打包流程见
+[`src/model_utils/model_utils/README.md`](../src/model_utils/model_utils/README.md#graspgen-ascend-packaging)。模型转换
+中间产物只能放在 `models/_work/`，不能写入上述发布 bundle。
+
+PC 首次部署时先确认 Grounded-SAM2 bundle。GraspGen checkpoint 不由感知模型下载脚本提供；从已审核模型源
+取得以下三个文件后，用 packager 复制到标准 bundle 并生成 manifest：
+
+```bash
+source .shrc_local
+test -f models/grounded_sam2_swint_ogc/inference_manifest.json
+
+GRASPGEN_SOURCE_ROOT=models/_work/graspgen_robotiq_2f_140/source
+test -f "$GRASPGEN_SOURCE_ROOT/checkpoints/graspgen_robotiq_2f_140.yml"
+test -f "$GRASPGEN_SOURCE_ROOT/checkpoints/graspgen_robotiq_2f_140_gen.pth"
+test -f "$GRASPGEN_SOURCE_ROOT/checkpoints/graspgen_robotiq_2f_140_dis.pth"
+ros2 run perception_service package_graspgen_torch_bundle \
+  --source-root "$GRASPGEN_SOURCE_ROOT" \
+  --bundle-root models/grasp/graspgen_robotiq_2f_140
+test -f models/grasp/graspgen_robotiq_2f_140/inference_manifest.json
+```
+
+`models/grasp/checkpoints/` 仅是旧部署的兼容输入布局，不是 fresh clone 应自带的仓库内容。任一检查失败时，先从
+已审核发布物补齐模型或重新执行对应 packager，不要继续启动真机抓取，也不要把 ignored 模型文件提交到 Git。
+
+## 1. 每次启动前
+
+### 1.1 在每个终端进入对应工作区并加载环境
+
+310P：
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
+source install/setup.bash
+```
+
+PC：
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
+source install/setup.bash
+```
+
+`pipeline`、检查命令和客户端的 `ROS_DOMAIN_ID`、`ROS_LOCALHOST_ONLY` 必须一致。
+
+### 1.2 静态预检
+
+310P：
+
+```bash
 test -e /dev/ttyACM0
-test -e /dev/video0
 python3 scripts/check_handeye_preconditions.py \
-  --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml \
+  --robot-config src/robot_config/config/robots/lekiwi_handeye_realsense_grasp.yaml \
   --camera-name wrist \
   --check-files
+```
+
+PC：
+
+```bash
+test -e /dev/ttyACM0
+python3 scripts/check_handeye_preconditions.py \
+  --robot-config src/robot_config/config/robots/lekiwi_handeye_realsense_grasp_pc.yaml \
+  --camera-name wrist \
+  --check-files
+```
+
+310P 还应确认 `/dev/video0` 以及安装空间：
+
+```bash
+test -e /dev/video0
 ros2 pkg prefix robot_config
 ros2 pkg prefix perception_service
 ros2 pkg prefix manipulation_service
@@ -83,46 +180,35 @@ ros2 pkg prefix manipulation_execution
 ros2 pkg prefix embodied_bringup
 ros2 pkg prefix robot_moveit
 ros2 pkg prefix so101_hardware
+ros2 pkg prefix lekiwi_hardware
+ros2 pkg prefix lekiwi_description
 ```
 
-PC 端 preflight 使用 CUDA bundle：
+### 1.3 清理残留节点
+
+上次启动被中断，或出现机器人不响应、重复 MoveIt action server 时执行：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local
-test -f models/perception/grounded_sam2_swint_ogc/inference_manifest.json
-test -f models/grasp/checkpoints/graspgen_robotiq_2f_140.yml
-test -f models/grasp/checkpoints/graspgen_robotiq_2f_140_gen.pth
-test -e /dev/ttyACM0
-python3 scripts/check_handeye_preconditions.py \
-  --robot-config src/robot_config/config/robots/so101_handeye_realsense_grasp_pc.yaml \
-  --camera-name wrist \
-  --check-files
-```
-
-任何命令失败都先补齐设备、标定文件、bundle 或板端构建，不要启动抓取执行。
-
-## 1. 清理残留节点
-
-上次启动被中断、机器人不响应、MoveIt action server 重复时执行：
-
-```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && \
 ./scripts/cleanup_ros.sh
 ```
 
-## 2. 启动服务
+然后确认现场满足以下条件：
 
-只使用统一 bringup，不再分别启动 robot、IK worker、planner、verifier 或 executor。
+- 人员、工具和无关物体已退出机械臂工作区；
+- 香蕉位于相机视野和机械臂工作空间内，周围有足够夹爪间隙；
+- 机械臂、夹爪和相机状态正常；
+- 急停可立即触达；
+- 本次任务使用新的 task ID。
 
-### 终端 A：统一抓取 pipeline
+## 2. 启动并检查 pipeline
 
-先确认工作区无人、急停可用、夹爪与桌面无干涉。第 4–8 节的监督式 action 会产生机械臂运动，
-因此操作员必须在启动时显式授权：
+### 2.1 终端 A：启动统一 pipeline
+
+310P：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
 ros2 launch embodied_bringup embodied_pipeline.launch.py \
-  robot_config:=so101_handeye_realsense_grasp \
+  robot_config:=lekiwi_handeye_realsense_grasp \
   control_mode:=moveit_planning \
   use_sim:=false \
   moveit_display:=false \
@@ -130,12 +216,11 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
   authorize_motion:=true
 ```
 
-PC 端把 `robot_config` 换成 `so101_handeye_realsense_grasp_pc`，其余参数不变：
+PC：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
 ros2 launch embodied_bringup embodied_pipeline.launch.py \
-  robot_config:=so101_handeye_realsense_grasp_pc \
+  robot_config:=lekiwi_handeye_realsense_grasp_pc \
   control_mode:=moveit_planning \
   use_sim:=false \
   moveit_display:=false \
@@ -143,17 +228,12 @@ ros2 launch embodied_bringup embodied_pipeline.launch.py \
   authorize_motion:=true
 ```
 
-切换平台只需改 `robot_config` 参数，不需要改任何代码或重新编译。
+只做无运动诊断时，将 `authorize_motion` 改为 `false`，并且不要执行第 3.1、4.3、5.2 节。
 
-该 launch 会自动启动：
+统一 launch 会启动 LeKiwi 控制器（含 SO-101 follower 臂与底盘）、RealSense、MoveIt、感知服务、抓取 planner/verifier/executor、IK worker、
+Capability Gateway 和安全节点。无需再单独启动这些节点。
 
-- SO101 ros2_control、RealSense、MoveIt 和 task executor。
-- `grasp_grounding_detect` 与 `grasp_segment_detections` generic model host。
-- `grasp_planner_node`、`grasp_verifier_node` 和唯一 `pick_executor_node`。
-- `robot.grasp_execution.ik.worker_count` 个隔离 IK/FK worker。
-- `skill_executor_node` 和 `safety_guard_node`，为抓取执行提供统一 primitive/安全路径。
-
-等待关键日志：
+等待以下关键日志：
 
 ```text
 Controllers are active
@@ -163,138 +243,230 @@ GraspPlannerNode ready
 PickExecutor ready: action=/manipulation/execute_pick ... ik_workers=4
 ```
 
-如果只需查看 Gateway/技能目录而不允许任何运动，把上述命令的 `authorize_motion` 设为
-`false`。该模式下不要运行第 4–8 节的 action 命令。
+### 2.2 终端 B：运行时检查
 
-腕部相机被大目标遮挡时不会单独判失败，只记录诊断证据。完整抓取由
-`robot.grasp_execution.verification: required` 要求验证服务；若服务未启动，正式 executor
-会在任何抓取动作前退出。
-
-### 终端 B：RViz，可选
+先按第 1.1 节重新设置同一平台和 ROS 环境，再执行：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && rviz2
+ros2 control list_controllers
+ros2 service list | grep -E 'grounding_detect|segment_detections|plan_grasp|compute_ik|compute_fk|move_to_configuration|verify_grasp'
+ros2 action info /move_action
+ros2 topic info /camera/wrist/image_raw
+ros2 topic info /camera/wrist/aligned_depth_to_color/image_raw
+ros2 topic info /camera/wrist/aligned_depth_to_color/camera_info
 ```
 
-添加 `Image` display，topic 选 `/camera/wrist/image_raw`，Reliability 设为 `Best Effort`。
+必须满足：
 
-## 3. 启动后检查
+- `joint_state_broadcaster`、`arm_trajectory_controller`、`gripper_trajectory_controller` 均为 `active`；
+- `/move_action` 只有一个 `/move_group` action server；
+- 检测、规划、IK/FK、运动和验证服务均可用；
+- RGB、对齐深度和 CameraInfo 均有发布者。
 
-运行时抓取几何配置：
+检查失败时不要发送抓取任务，转到第 7 章排障。
+
+可选启动 RViz：
 
 ```bash
-grep -A16 "target_gripper:" src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml
-# PC 端改为 so101_handeye_realsense_grasp_pc.yaml
+rviz2
 ```
 
-应确认内容等价于：
+查看 `/camera/wrist/image_raw` 时，将 `Image` display 的 Reliability 设为 `Best Effort`。
 
-```text
-fixed_finger_contact_ee: [-0.014, 0.0, -0.080]
-fixed_finger_margin_m: 0.006
-fixed_finger_margin_max_m: 0.012
-fixed_finger_margin_width_ref_m: 0.035
-fixed_finger_margin_width_gain: 0.25
-```
+## 3. 可选的分阶段验证
 
-`fixed_finger_contact_ee.z` 是 SO101 夹爪坐标系里的固定指接触深度，不是 base-Z 下压量。
-当 planner debug 模式为 `diagnostic` 或 `full` 时，可用 `prepared_candidate_ranking.json` 中的
-`target_width_m`、`fixed_finger_gap_m`、`fixed_finger_target_gap_m` 和 `moving_finger_gap_m`
-复核动态固定指 margin 的结果。
+pipeline 已稳定运行且配置未变化时，可以跳过本章，直接选择第 4 章 Hermes 流程或第 5 章单技能 CLI 流程。
 
-控制器：
+### 3.1 移动到观测姿态
+
+此命令会产生机械臂运动：
+
+310P：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && ros2 control list_controllers
+robot-skill --config-name lekiwi_handeye_realsense_grasp execute inspect_scene \
+  --task-id inspect-scene-001 \
+  --timeout-sec 30
 ```
 
-应看到：
-
-```text
-joint_state_broadcaster active
-arm_trajectory_controller active
-gripper_trajectory_controller active
-```
-
-服务和 action：
+PC：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && ros2 service list | grep -E 'grounding_detect|segment_detections|plan_grasp|compute_ik|compute_fk|move_to_configuration|verify_grasp'
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && ros2 action info /move_action
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc execute inspect_scene \
+  --task-id inspect-scene-001 \
+  --timeout-sec 30
 ```
 
-`/move_action` 必须只有一个 `/move_group` action server。若有多个，回到第 1 步清理。
+观测位姿和速度来自当前 robot config，客户端不应覆盖。
 
-相机：
+### 3.2 感知与规划冒烟测试
+
+首次启动、重启 pipeline、更换模型/标定/硬件，或出现 readiness 错误时建议执行。
+
+确认感知服务：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && ros2 topic info /camera/wrist/image_raw
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && ros2 topic info /camera/wrist/aligned_depth_to_color/image_raw
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && ros2 topic info /camera/wrist/aligned_depth_to_color/camera_info
+ros2 service list | grep -E '/perception/grasp/(grounding_detect|segment_detections)'
 ```
 
-## 4. 只移动到观测姿态
-
-公开 Gateway 已提供 `inspect_scene`，可用它移动到同一 SSOT 定义的观测位姿：
+只请求抓取规划，不执行运动：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
-  robot-skill --config-name so101_handeye_realsense_grasp execute inspect_scene \
-  --task-id inspect-scene-001 --timeout-sec 30
-```
-
-PC 端把配置名改为 `so101_handeye_realsense_grasp_pc`。观测位姿和速度来自正在运行的 robot config，
-不允许由测试客户端覆盖。
-
-## 5. 冒烟测试
-
-感知服务 readiness：
-
-```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && ros2 service list | \
-  grep -E '/perception/grasp/(grounding_detect|segment_detections)'
-```
-
-抓取规划：
-
-```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && ros2 service call /grasp_planner/plan_grasp ibrobot_msgs/srv/PlanGrasp \
+ros2 service call /grasp_planner/plan_grasp ibrobot_msgs/srv/PlanGrasp \
   "{text_prompt: 'banana', confidence_threshold: 0.1, grasp_threshold: 0.5, debug_output_mode: 'diagnostic'}"
 ```
 
-## 6. 仅规划，不抓取
+`PickObject.MODE_PLAN_ONLY` 是 Gateway 内部诊断模式，尚未作为外部 catalog 参数公开。Hermes 和生产调用方
+不得伪造 `dispatch_binding`、`dispatch_nonce` 或 `expected_executor` 直连 delegated action。
 
-`PickObject.MODE_PLAN_ONLY` 是 Gateway 内部 delegated action 的诊断模式，当前 v1 catalog 没有把它作为
-外部参数公开。调用方不得自行伪造 `dispatch_binding`、`dispatch_nonce` 或 `expected_executor` 来直连该
-action。需要无运动排障时，先保持 `authorize_motion:=false`，使用第 5 节的感知/规划服务；如需把完整候选
-筛选作为公开能力，必须先给 catalog、`SkillCommand` 和 Gateway 增加版本化参数契约。
+## 4. 通过 Hermes 执行抓取
 
-## 7. 完整抓取
+Hermes 是正式对外执行入口，复用第 2 章启动的同一套 pipeline，不得再启动 planner、executor 或 Gateway。
 
-只在第 5–6 步正常、现场安全检查完成且 pipeline 已由操作员显式授权后执行。先做只读校验：
+### 4.1 启动受控 Hermes CLI
 
-```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
-  robot-skill --config-name so101_handeye_realsense_grasp validate pick_object \
-  --target-name banana --timeout-sec 240
-```
+PC 在本机新终端执行；310P 必须 SSH 到运行 pipeline 的同一块板卡后执行。先按第 1.1 节设置平台与 ROS
+环境，再按所在平台启动。
 
-校验成功后，用全新 task ID 通过 Gateway 执行：
+PC：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
-  robot-skill --config-name so101_handeye_realsense_grasp execute pick_object \
-  --task-id pick-banana-001 --target-name banana --timeout-sec 240
+hermes-robot --config-name lekiwi_handeye_realsense_grasp_pc -- --cli
 ```
 
-候选阈值、IK worker 数、接触补偿、恢复、速度和验证策略全部来自启动正式 executor 时使用的
-`robot.grasp_execution`，Gateway 客户端不维护第二套参数。PC 端把配置名改为
-`so101_handeye_realsense_grasp_pc`。
+310P：
 
-固定指 robust-gap 只在批量候选准备阶段作为 hard gate。候选已经到达 pregrasp 并完成在线接触补偿后，
-复算结果仅记录诊断，不会再在下降闭爪前撤回或切换候选。
+```bash
+hermes-robot --config-name lekiwi_handeye_realsense_grasp -- --cli
+```
 
-通过标志包括 Gateway JSONL feedback 和唯一 terminal result，以及 executor 日志中的内部阶段：
+`hermes-robot` 会检查 Hermes、`ibrobot-control`、绑定配置、Gateway 状态和 Agent plan 接口。预检失败时停止，
+不要改用裸 `hermes --cli` 绕过。会话已绑定 robot config，Hermes 不得再次传入 `--config-name` 或
+`--config-path`。
+
+### 4.2 规划和校验
+
+在 Hermes CLI 输入：
+
+```text
+请使用 ibrobot-control 抓取 banana。
+严格按 status -> list-skills -> plan-workflow -> describe pick_object -> validate-plan 执行只读阶段。
+计划必须只有一个 pick_object step，target_name 必须是 banana。
+请展示完整 step 和参数、plan digest、registry identity 以及新的 task ID。
+展示并 flush exact plan 后，立即使用同一 tuple 调用一次 confirm-plan 和 execute-plan，不等待二次确认。
+如果计划不正确，我会输入“别动”；收到停止指令后必须取消当前 Agent plan 并等待权威 terminal result。
+```
+
+以下任一情况都必须停止：Gateway 未就绪、运动未授权、校验失败、计划增减步骤、目标参数不一致。
+
+### 4.3 展示后立即执行
+
+Hermes 展示并 flush exact plan、digest、registry identity 和新 task ID 后，必须立即使用展示过的 plan token、
+digest 和 task ID 调用一次 `confirm-plan`，再用返回的 confirmation token 调用一次 `execute-plan`。
+`confirm-plan` 是 Gateway 对 exact plan/task tuple 的内部技术绑定，不是用户二次确认门禁。默认使用 Gateway
+task budget，不传 `--timeout-sec`；只有操作员明确要求更短预算时，才给两个命令传入相同 timeout。
+
+如果计划错误或需要停止，在同一 Hermes 会话输入“别动”。当前会话拥有运行中的 `execute-plan` 进程时，由该
+进程发起一次取消并等待 terminal result；只有当前会话不再拥有执行进程时，才使用 `cancel-plan`，并且必须同时
+携带展示过的 task ID、plan ID/digest、registry epoch/generation/digest 和 expected step count。不得只凭 task ID
+构造取消请求，也不得同时使用进程信号和外部 `cancel-plan`。失败、超时或状态未知时不得自动 replan 或重试；
+只有唯一 terminal result 能证明任务完成或已经取消。
+
+310P 的 Hermes 会话和 pipeline 必须位于同一块 310P，不能从 PC 本地另起会话跨机绕过 Gateway。
+
+## 5. 通过公开技能直接执行抓取
+
+当操作员已经明确选择单个 `pick_object` 技能时，可以像执行 `place_in_container` 一样直接使用
+`robot-skill`。该入口仍由 Capability Gateway 完成契约校验、准入和动作分发，不使用
+supervised-direct `pick_action_client`，也不直连 `/manipulation/execute_pick`。
+
+### 5.1 只读检查
+
+在新终端加载项目和 ROS 环境。PC 依次执行：
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
+source install/setup.bash
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc status
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc list-skills
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc describe pick_object
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc validate pick_object \
+  --target-name banana
+```
+
+310P 在板端依次执行：
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
+source install/setup.bash
+robot-skill --config-name lekiwi_handeye_realsense_grasp status
+robot-skill --config-name lekiwi_handeye_realsense_grasp list-skills
+robot-skill --config-name lekiwi_handeye_realsense_grasp describe pick_object
+robot-skill --config-name lekiwi_handeye_realsense_grasp validate pick_object \
+  --target-name banana
+```
+
+确认 Gateway ready、catalog 中存在 `pick_object`，且 `validate` 返回允许执行。任一命令失败都立即停止，
+不得修改参数后自动重试。
+
+### 5.2 确认并执行
+
+操作员核对目标名称、现场安全条件满足，并对本次机械臂运动明确确认后，使用全新的 task ID 执行。
+
+PC：
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
+source install/setup.bash
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc execute pick_object \
+  --task-id pick-marker-pc-001 \
+  --target-name marker
+```
+
+310P：
+
+```bash
+source .shrc_local
+export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1
+source install/setup.bash
+robot-skill --config-name lekiwi_handeye_realsense_grasp execute pick_object \
+  --task-id pick-marker-310p-001 \
+  --target-name marker
+```
+
+> 必须先 `source .shrc_local` 与 `source install/setup.bash`。`skill_catalog` 位于
+> `build/skill_catalog/`，只有 source 了 `install/setup.bash` 才会进 `sys.path`；在裸
+> `(venv)` 里直接跑 `robot-skill` 会报 `ModuleNotFoundError: No module named
+> 'skill_catalog'`。客户端的 `ROS_DOMAIN_ID`、`ROS_LOCALHOST_ONLY` 必须与 pipeline 终端一致。
+
+`--target-name` 必须与实际目标一致；上例抓取 `marker`，抓取香蕉时改为 `banana`，并同步使用易识别的
+task ID。
+
+默认使用 Gateway 当前 task budget。只有需要更短预算时才添加 `--timeout-sec SEC`；不要超过 Gateway budget。
+每次执行必须使用新的 task ID。失败、超时或未收到 terminal result 时不得自动重试。
+
+需要取消当前任务时，在另一终端使用相同 task ID。PC：
+
+```bash
+robot-skill --config-name lekiwi_handeye_realsense_grasp_pc cancel --task-id pick-marker-pc-001
+```
+
+310P：
+
+```bash
+robot-skill --config-name lekiwi_handeye_realsense_grasp cancel --task-id pick-marker-310p-001
+```
+
+取消请求成功不等于机械臂已经停止，必须等待该任务进入 terminal 状态。
+
+## 6. 判断结果与检查证据
+
+### 6.1 成功标准
+
+必须同时看到持续 feedback 和唯一 terminal result：
 
 ```text
 {"event":"feedback", ...}
@@ -303,108 +475,95 @@ PIPELINE_TIMING stage=graspgen_request ...
 grasp verification phase=verify_lift ...
 ```
 
-如果 planner debug 模式为 `diagnostic` 或 `full`，执行后重点看同目录的：
+只有 terminal result 能证明任务已经收敛。超时、连接中断或没有 terminal result 时，任务状态视为未知，
+不得自动重试。
 
-- `pick_pose_diagnostics.json`：实际位姿误差和接触点 residual。
-- `grasp_verification.json`：close、3 cm probe lift 和最终 lift 的夹爪位置、电流及融合判定。
-- `pick_frame_diagnostics.json`：capture-time TF 查询时间戳和回退模式。
-- `prepared_candidate_ranking.json`：候选软排序和各评分项。
+### 6.2 自动抓后验证
 
-当前 executor 不生成独立的 SO101 execution HTML/SVG/PNG 预览。需要视觉排查 planner
-点云和源候选时，临时把
-`robot.grasp_execution.planner.debug_output_mode` 改为 `full`。
+正式 executor 会自动完成三个验证阶段：
 
-关键日志解释：
+1. `close`：闭爪后、抬升前确认夹持；
+2. `probe_lift`：以低速抬升 3 cm，检查是否立即滑脱；
+3. `lift`：抬升到 5 cm，确认目标仍在夹爪中。
 
-- `PIPELINE_TIMING stage=graspgen_request`：完整 `PlanGrasp` 请求耗时。
-- `PIPELINE_TIMING stage=candidate_geometry_ranking`：源排序、SO101 adapter、workspace/height/tabletop
-  等廉价几何门禁的合并耗时。
-- `PIPELINE_TIMING stage=candidate_ik_fk`：候选 IK/FK 准备耗时；同行的 `workers` 和 `candidates`
-  表示动态工作队列规模。
-- `IK worker verification passed`：主 MoveIt 与全部 worker 在共同 seed/验证位姿上结果一致；
-  `cached=true` 表示命中进程内缓存。
-- `pick candidate preparation failed ... code=...`：候选在 IK/FK、接触补偿、joint5、固定指侧或
-  最终网格门禁失败。
-- `prepared candidate rank: ...`：按固定爪包络、体积质心距离、IK/FK 接触误差、
-  robust-gap headroom 和 confidence 的综合软分排列执行顺序。
-- `contact realign phase=approach|pregrasp`：安全高度的接触点对齐 residual。
-- `grasp prediction candidate=...`：最终下降使用的 IK/FK 预测位姿、闭合轴误差和接触 residual。
-- executor 的 `phase=descend` 后必须直接出现 `phase=close`；`close_gripper` 是下降成功后的第一条动作。
-- `pose diagnostic label=grasp ... action=...`：闭爪后以 best-effort 记录低位 residual；`log_only_*` 不触发
-  横向 realign、候选切换，也不能中断闭爪或抓后验证。
-- `grasp verification phase=verify_close|verify_probe|verify_lift`：三阶段抓后验证证据。
-- `pick candidate failed ... code=...`：当前物理执行候选失败；`retryable=true` 时才可切换到下一个
-  已准备候选。
-- `post-success release completed`：成功验证后的低位释放已完成。
-- `pipeline_timings_json`：delegated executor 返回给 Gateway 的候选、尝试数、验证状态和分阶段计时。
+`STATUS_FAILED(0)` 或 `STATUS_UNCERTAIN(2)` 在 `verification: required` 策略下都会使任务失败。
+executor 会按 robot config 执行保守恢复，不会把恢复完成视为抓取成功。
 
-`prepared_candidate_ranking.json` 是上述软排序的结构化明细，仅在 planner debug 模式为
-`diagnostic` 或 `full` 时写出。
-
-如果固定指在目标前侧，仍可能出现固定指先碰边导致漏抓。此时不要只继续增大
-`fixed_finger_margin_max_m`，还要检查 `pick candidate preparation failed` 的
-`FK_FIXED_FINGER_BASE_SIDE_*` 错误、`prepared candidate rank` 和 `prepared_candidate_ranking.json`
-中的固定指内侧/包络评分。
-
-漏抓排查时不要漏看体积质心：`volume_xyz` 代表目标主体位置，比可见表面 `surface_xyz` 更适合判断物体是否在两指通道内。若 contact residual 看起来不大，但 `volume_xyz` 已经在固定指外侧或夹口外，仍会出现固定指先碰、活动指扫不回的漏抓。
-
-## 8. 抓取后验证
-
-正式 `pick_executor_node` 会自动在三个阶段调用验证服务：
-
-- `close`：闭合后、任何抬升前确认已经夹住；失败或不确定时保持夹爪闭合，先垂直撤回到
-  pregrasp 高度，再打开夹爪并返回观察位；该策略由 `recover_after_close_failure` 配置。
-- `probe_lift`：按 `probe_lift_velocity_scaling: 0.05` 抬升 `3 cm`，在低高度检查是否立即滑脱。
-- `lift`：当前正式流程抬升到 `5 cm`，确认目标仍在夹爪中；验证通过后再单独设计转运轨迹。
-
-任一阶段返回 `STATUS_FAILED(0)` 或 `STATUS_UNCERTAIN(2)` 时，`required` 策略都会输出
-`FLOW_RESULT success=False`，不会再把动作执行完成当成抓取成功。`optional` 仅允许在服务完全不可用时跳过；
-服务一旦返回明确结果，失败或不确定仍会使流程失败。close 恢复只把机械臂带回可重新规划的安全观察位，
-不会把本轮失败改成成功；`probe_lift` / `lift` 验证失败时，当前 SSOT 会在对应
-抬升位打开夹爪并返回观察位，由 `recover_after_retention_failure: true` 控制。
-
-需要单独检查当前夹持状态时，也可以手动调用：
+需要独立读取当前夹持状态时，可调用：
 
 ```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
-  ros2 service call /grasp_verifier/verify_grasp ibrobot_msgs/srv/VerifyGrasp \
+ros2 service call /grasp_verifier/verify_grasp ibrobot_msgs/srv/VerifyGrasp \
   "{task_id: 'pick_001', text_prompt: 'banana', expected_target_width_m: 0.035, post_grasp_wait_s: 0.2}"
 ```
 
-结果解释：
+结果含义：
 
-- `STATUS_SUCCESS(1)`：融合证据认为抓住。
-- `STATUS_FAILED(0)`：融合证据倾向没抓住。
-- `STATUS_UNCERTAIN(2)`：证据不足；重观察或保守重试，不要直接当失败。
+- `STATUS_SUCCESS(1)`：融合证据支持抓取成功；
+- `STATUS_FAILED(0)`：融合证据支持抓取失败；
+- `STATUS_UNCERTAIN(2)`：证据不足，应重新观察并人工决策。
 
-`evidence` 中重点看 `gripper_position`、`gripper_current_abs_a`、`wrist_visibility`。当 planner
-debug 模式为 `diagnostic` 或 `full` 时，正式 executor 会同时把完整结果写入
-`grasp_verification.json`。
+重点检查 `gripper_position`、`gripper_current_abs_a` 和 `wrist_visibility`。close-to-lift 阶段不会重新分割目标，
+因为夹爪靠近目标后会明显遮挡腕部相机。
 
-正式 executor 不在 close-to-lift 阶段重新运行目标分割。夹爪贴近目标后腕部视野严重遮挡，重新分割既会
-增加延迟，也容易产生错误质心；抓后判定统一由 `grasp_verifier_node` 的夹爪位置、电流和可见性证据完成。
+### 6.3 调试证据
 
-## 9. 常用调参
+当 `planner.debug_output_mode` 为 `diagnostic` 或 `full` 时，重点查看：
 
-所有会改变候选、安全门禁、IK/FK、速度、恢复或验证结果的参数都必须修改
-`src/robot_config/config/robots/` 下对应平台的 YAML（`so101_handeye_realsense_grasp.yaml` 或
-`so101_handeye_realsense_grasp_pc.yaml`）的 `robot.grasp_execution`，然后重启
-正式 executor。外部调用方只允许通过 Gateway catalog 选择目标和预算，禁止直连 delegated action 或用 CLI
-构造第二套运行配置。
+| 文件 | 用途 |
+|---|---|
+| `prepared_candidate_ranking.json` | 候选排序、固定指间隙和各评分项 |
+| `pick_pose_diagnostics.json` | 实际位姿误差和接触点 residual |
+| `pick_frame_diagnostics.json` | capture-time TF 时间戳和回退模式 |
+| `grasp_verification.json` | close、probe lift、最终 lift 的融合证据 |
 
-目标位置出现固定偏差时，不再通过监督式 CLI 注入单次 base-frame offset。保持未授权状态，通过第 5 节
-规划服务和 debug 输出判断偏差来自手眼标定、目标夹爪接触几何还是 IK/FK residual，再修改对应的 robot
-YAML SSOT 并重启 executor。不要根据单个目标的一次结果写入全局修正。
+需要点云和源候选时，临时将 `planner.debug_output_mode` 改为 `full` 并重启 pipeline。
 
-当前 v1 `pick_object` catalog 不公开连续重复、plan-only 或成功后低位释放。每次真机执行必须重新确认现场
-安全并使用全新 task ID；失败、timeout 或停止状态未知时不得自动重试。若确需 post-success release，应先
-扩展 catalog/`SkillCommand` 的版本化参数和 Gateway 转换，再由 Gateway 构造 delegated goal；不能直接填充
-`PickObject.release_after_success` 绕过准入链。
+抓取成功后的放置流程见 [so101_place_pipeline_commands.md](so101_place_pipeline_commands.md)。放置必须通过
+Capability Gateway 的 `place_in_container` 技能执行。
 
-最终抓取 X/Y 方向受 5-DOF 姿态误差影响时，优先在 robot YAML 中使用动态 IK/FK 接触点补偿，
-不要在监督式客户端中维护一次性 X/Y 偏移：
+## 7. 快速排障
+
+| 现象 | 检查与处理 |
+|---|---|
+| `GroundingDetect service not available` | 执行 `ros2 service list \| grep /perception/grasp`，检查感知 model host 日志 |
+| `GraspGen service is not available` | 执行 `ros2 service list \| grep /grasp_planner/plan_grasp`，检查模型 bundle 和 planner 日志 |
+| `No synchronized depth/CameraInfo` | 确认三路 `/camera/wrist/...` topic 均有发布者，清理重复相机或 relay 节点 |
+| `GraspGen returned zero candidates` | 使用 `debug_output_mode: full` 检查 mask/depth，再谨慎调整 planner 阈值 |
+| `Motion timed out after 60.0s` | 检查控制器和 `/joint_states`，确认状态后重启 pipeline |
+| `STATUS_ABORTED` 但控制器已完成 | 检查 `/move_action`；若存在多个 `/move_group`，清理残留节点后重启 |
+| 抓取位置固定偏差 | 运行手眼预检，核对 wrist transform、平台配置和 IK/FK residual |
+| 固定指先碰目标 | 检查 `FK_FIXED_FINGER_BASE_SIDE_*`、候选排序和 fixed-finger 包络，不要只增大 margin |
+
+关键日志的定位含义：
+
+- `PIPELINE_TIMING stage=graspgen_request`：完整 `PlanGrasp` 请求耗时；
+- `stage=candidate_geometry_ranking`：几何门禁和初步排序耗时；
+- `stage=candidate_ik_fk`：并行 IK/FK 候选准备耗时；
+- `IK worker verification passed`：主 MoveIt 与 worker 结果一致；
+- `pick candidate preparation failed ... code=...`：候选在执行前被安全或几何门禁拒绝；
+- `contact realign phase=...`：接触点补偿 residual；
+- `pick candidate failed ... retryable=...`：物理执行失败，只有 `retryable=true` 才允许 executor 换候选；
+- `grasp verification phase=...`：抓后验证证据；
+- `pipeline_timings_json`：返回 Gateway 的候选数、尝试数、验证状态和分阶段计时。
+
+## 8. 调参原则
+
+所有影响候选、安全门禁、IK/FK、速度、恢复和验证的参数，都只在对应 robot YAML 的
+`robot.grasp_execution` 中修改。修改后重启正式 executor。客户端不得维护第二套运行参数。
+
+优先检查以下配置块：
 
 ```yaml
+planner:
+  grasp_threshold: 0.20
+  debug_output_mode: diagnostic  # PC 当前值；310P 当前为 none
+
+candidate_selection:
+  max_candidates: 80
+
+ik:
+  worker_count: 4
+
 contact_compensation:
   enabled: true
   xy_tolerance_m: 0.003
@@ -413,220 +572,39 @@ contact_compensation:
   max_z_error_m: 0.020
 ```
 
-补偿同时调整 base-X 和 base-Y，Z 不补偿。若预测需要超过最大 X/Y 修正量，或未补偿的 Z 误差超过
-`contact_compensation.max_z_error_m`，候选会被拒绝；执行最终下降时会通过
-`/moveit_gateway/move_to_configuration` 使用同一组 IK 关节解。候选筛选和最终下降前都会基于该
-IK 解的 FK 姿态重新检查 SO101 网格桌面间隙。
+调参顺序：
 
-监督式真实抓取使用的桌面/高度保护：
+1. 先用诊断输出区分检测、深度、标定、几何门禁和 IK/FK 问题；
+2. 再修改对应 SSOT 参数并重启 pipeline；
+3. 用新 task ID 做一次受监督验证；
+4. 记录 terminal result 和证据，禁止根据单次结果写入全局偏移。
 
-```yaml
-candidate_selection:
-  min_contact_z: -0.045
-target_geometry:
-  tabletop_clearance_m: -0.020
-```
+补充约束：
 
-GraspGen 候选：
+- 接触补偿只调整 base-X/Y，不补偿 Z；超出修正量或 Z 误差上限的候选会被拒绝；
+- `max_candidates` 是送入 IK/FK 的预算，廉价几何门禁会先作用于全部候选；
+- `worker_count` 只并行候选准备，最终运动仍由主 MoveIt 串行执行；
+- 判断物体是否进入夹口时优先看 `volume_xyz`，不要只看可见表面的 `surface_xyz`；
+- `fixed_finger_contact_ee.z` 是夹爪坐标系内的接触深度，不是 base-Z 下压量；
+- 无运动排障使用第 3.2 节服务，不要绕过 Gateway 直连 delegated action。
 
-```yaml
-planner:
-  grasp_threshold: 0.5
-candidate_selection:
-  min_confidence: 0.0
-  max_candidates: 80
-```
+更完整的候选队列与评分说明见
+[so101_grasp_dynamic_ik_queue_optimization.md](so101_grasp_dynamic_ik_queue_optimization.md)。
 
-`candidate_selection.max_candidates` 是 IK/FK 检查预算。正式 executor 会先对 GraspGen 返回的全部候选做质心、top-down 和
-置信度重排，再对全部候选执行 fixed-finger side、workspace、height 和 SO101 tabletop 等廉价
-几何检查，最后只把排序靠前的 80 个通过者送入 IK/FK。这样不会因为前 80 个源候选被廉价门限
-拒绝而丢掉后续可执行候选；`<=0` 时会检查全部通过廉价门限的候选。
+## 接口速查
 
-`robot.grasp_execution.ik.worker_count: 4` 只并行候选准备。正式 executor 先从 `/joint_states` 固定一份共同
-IK seed，4 个独立 MoveIt worker 从共享动态队列领取候选，最后按原候选顺序汇总。最终抓取前的接触补偿、
-`move_to_configuration` 和所有运动仍走主 MoveIt 串行链路。设为 `0` 时退回主 `/compute_ik`、
-`/compute_fk` 服务串行准备。
+| 类型 | 名称 |
+|---|---|
+| 腕部 RGB | `/camera/wrist/image_raw` |
+| 对齐深度 | `/camera/wrist/aligned_depth_to_color/image_raw` |
+| CameraInfo | `/camera/wrist/aligned_depth_to_color/camera_info` |
+| 检测服务 | `/perception/grasp/grounding_detect` |
+| 抓取规划服务 | `/grasp_planner/plan_grasp` |
+| 抓取验证服务 | `/grasp_verifier/verify_grasp` |
+| 内部执行 action | `/manipulation/execute_pick` |
+| 外部抓取技能 | `pick_object` |
+| 外部放置技能 | `place_in_container` |
 
-Top-down 偏好：
-
-```yaml
-execution_scoring:
-  centroid_source: volume
-  contact_distance_weight: 1.0
-  topdown_weight: 0.35
-candidate_selection:
-  topdown_min_z: -0.25
-```
-
-关闭 top-down 和质心重排，回到 GraspGen 置信度顺序：
-
-```yaml
-execution_scoring:
-  contact_distance_weight: 0.0
-  topdown_weight: 0.0
-```
-
-临时只验证位置目标：
-
-```yaml
-ik:
-  check_orientation: false
-```
-
-只做感知排障时直接调用第 5 节的 `/grasp_planner/plan_grasp` 服务。`PickObject.MODE_PLAN_ONLY` 仍会执行
-正式 IK/FK 和安全筛选，不提供绕过 IK guard 的模式。
-
-调试输出级别：
-
-```yaml
-planner:
-  debug_output_mode: none        # 不写文件
-# debug_output_mode: diagnostic  # 只写 grasp_result.json
-# debug_output_mode: full        # 写点云和预览
-```
-
-启用 `target_geometry.tabletop_filter` 时不再强制 `full`；正式 executor 直接使用 `PlanGrasp` 响应中的
-execution table plane 做 SO101 网格 hard gate，不依赖 `scene_cloud.ply`。
-
-## 10. 常见问题
-
-`GroundingDetect service not available` 或 `segment_service_unavailable`：检查终端 A 的 generic model host：
-
-```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && ros2 service list | grep /perception/grasp
-```
-
-`GraspGen service is not available`：检查终端 A 的 planner 服务：
-
-```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && ros2 service list | grep /grasp_planner/plan_grasp
-```
-
-`No synchronized depth/CameraInfo for detection frame`：
-
-- 确认 generic model host 与可选 RViz 都使用 `/camera/wrist/...` 同一组 topic。
-- 确认三路相机 topic 都有发布者。
-- 若有重复节点或 topic 重名，回到第 1 步清理。
-
-`GraspGen returned zero candidates`：
-
-- 临时把 `robot.grasp_execution.planner.debug_output_mode` 改为 `full`，查看 mask、depth 和
-  `grasp_result.json`。
-- 临时降低 `robot.grasp_execution.planner.grasp_threshold`。
-- 必要时临时关闭服务端严格过滤做对比，但真机执行前必须保留执行侧 guard。
-
-`Motion timed out after 60.0s`：
-
-- 重启终端 A。
-- 检查控制器和 `/joint_states`。
-
-`STATUS_ABORTED` 但控制器像是完成了：
-
-- 检查 `/move_action` 是否有多个 `/move_group` action server。
-- 有重复就回到第 1 步清理。
-
-抓取位置偏差大：
-
-- 先运行 `scripts/check_handeye_preconditions.py`，并检查 robot YAML 中 wrist 相机 transform。
-- 确认启动配置与当前平台匹配（310P 用 `so101_handeye_realsense_grasp`，PC 用
-  `so101_handeye_realsense_grasp_pc`），正式 executor 会从同一 robot YAML 获取
-  相机变换和目标夹爪几何。
-- 若正式 executor 没有 `prepared candidate rank`、`grasp prediction candidate` 或
-  `pick candidate preparation failed` 日志，检查当前安装空间是否已重新构建。
-
-## 11. 启动 Hermes 抓取链路
-
-### 11.1 启动 pipeline
-
-Hermes 抓取复用同一组 pipeline 节点（planner、verifier、executor、IK worker），不要为 Hermes
-再启动第二组。310P 使用 Ascend NPU 板端推理，必须先从 PC 通过 SSH 登录 310P；PC 流程使用
-NVIDIA CUDA 本机推理，直接在 PC 终端执行。
-
-终端 A：先 SSH 登录 310P，再在板端启动完整 pipeline：
-
-```bash
-ssh root@<310p-ip>
-cd /root/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
-ros2 launch embodied_bringup embodied_pipeline.launch.py \
-  robot_config:=so101_handeye_realsense_grasp \
-  control_mode:=moveit_planning \
-  use_sim:=false \
-  moveit_display:=false \
-  with_embodied:=true \
-  authorize_motion:=true
-```
-
-终端 A：启动完整 pipeline（PC）：
-
-```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
-ros2 launch embodied_bringup embodied_pipeline.launch.py \
-  robot_config:=so101_handeye_realsense_grasp_pc \
-  control_mode:=moveit_planning \
-  use_sim:=false \
-  moveit_display:=false \
-  with_embodied:=true \
-  authorize_motion:=true
-```
-
-等待日志：
-
-```text
-Controllers are active
-MoveIt Gateway fully initialized
-TaskExecutor ready
-GraspPlannerNode ready
-PickExecutor ready: action=/manipulation/execute_pick ... ik_workers=4
-```
-
-### 11.2 启动 Hermes CLI
-
-对于 PC 流程，保持终端 A 的 pipeline 运行，另开 PC 终端 B，加载与 pipeline 相同的 ROS
-发现环境后启动交互式 Hermes CLI：
-
-```bash
-cd ~/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
-hermes --cli
-```
-
-对于 310P 流程，保持第一个 SSH 终端中的 pipeline 运行，另开 PC 终端 B，再次 SSH 登录
-同一块 310P，然后在 310P 上启动 Hermes CLI：
-
-```bash
-ssh root@<310p-ip>
-cd /root/IB_Robot && source .shrc_local && export ROS_DOMAIN_ID=218 ROS_LOCALHOST_ONLY=1 && source install/setup.bash && \
-hermes --cli
-```
-
-PC 和 310P 抓取都由 Hermes 使用 `ibrobot-control` 完成，不在 Hermes 终端手工执行裸 `ros2`、
-primitive、MoveIt 或 controller 运动命令。首先在 Hermes CLI 中输入无运动校验请求：
-
-```text
-请使用 ibrobot-control，针对 so101_handeye_realsense_grasp_pc 配置检查 Gateway 状态，
-依次完成 list-skills、describe pick_object 和 validate pick_object，目标是 banana。
-只校验，不要执行机械臂运动。
-```
-
-310P 的 Hermes CLI 使用同样的请求，但配置名必须改为
-`so101_handeye_realsense_grasp`。
-
-Hermes 应通过 `robot-skill` 按 `status -> list-skills -> describe -> validate` 顺序返回 Gateway 与
-`pick_object` 契约的实际校验结果。任一步失败、Gateway 未就绪或运动未授权时都停止，
-Hermes 不启动或重启 pipeline，也不修改 `authorize_motion`。
-
-### 11.3 在 Hermes CLI 中执行抓取
-
-只有终端 A 的 pipeline 已由操作员显式设置 `authorize_motion:=true`，且上一步 `validate`
-成功后，操作员才在同一 Hermes CLI 会话中给出本次明确的运动确认和全新 task ID：
-
-```text
-我已完成现场安全检查，并明确确认本次机械臂抓取运动。
-请继续使用 ibrobot-control，以 task ID pick-banana-001 执行刚才校验的
-pick_object，目标是 banana。失败、超时或停止状态未知时不要自动重试。
-```
-
-Hermes 应在 CLI 中展示 `robot-skill` 返回的 JSONL feedback 和唯一 terminal result。如需取消，
-应取消当前 execute 进程或使用同一 task ID；只有 terminal result 才能证明任务已收敛。
-
-两个平台的抓取目标和 task ID 都必须由操作员明确提供；310P 的 Hermes 会话与 pipeline
-必须保持在同一块 310P 上，不要在 PC 本地另起一个 Hermes 会话跨机绕过 Gateway。
+310P 的感知分割使用独立 `/perception/grasp/segment_detections` 服务；PC 的 CUDA deployment 在
+`grounding_detect` 内联完成分割。两种平台都只发布 RGB、对齐深度和 CameraInfo，GraspGen 直接从对齐深度
+构造目标点云，不需要额外的 ROS `PointCloud2` relay。

@@ -7,3 +7,11 @@ pypinyin==0.55.0
 # The ZipVoice Vocos checkpoint uses the project-pinned implementation in
 # voice_tts_service.vocos_backend.  Do not install PyPI vocos: its dependency
 # metadata can replace the workspace Torch/torchaudio ABI.
+
+# Ubuntu ONNX deployment: onnxruntime replaces Ascend ACL for Text Encoder
+# and Flow Decoder inference.  onnxruntime is already declared in
+# requirements/ubuntu-22.04.txt and requirements/openeuler-24.03.txt, so
+# it is not repeated here.  The ONNX adapter imports onnxruntime lazily at
+# load time and uses the project-pinned ChineseTokenizer (cn2an/jieba/
+# pypinyin above) and vocos_backend (torch only).  No additional voice-tts
+# specific dependencies are required.

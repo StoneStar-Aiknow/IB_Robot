@@ -1,22 +1,104 @@
 #!/usr/bin/env python3
 """
 AtomGit Review Resolution Workflow
-支持三种模式：
+支持以下模式：
 1. --fetch-comments: 获取检视意见（输出JSON）
 2. --apply-fixes: 应用修复方案（从JSON读取）
-3. --auto: 自动修复（调用LLM）
+3. --resume: 恢复待推送或待回复事务
+4. --reply-comment / --resolve-comment: 单条评论操作
 """
 
 import argparse
+import hashlib
 import json
 import os
+import re
+import shlex
+import signal
+import stat
 import subprocess
 import sys
+import tempfile
+import threading
+import uuid
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from atomgit_sdk import AtomGitClient, resolve_atomgit_context
 from atomgit_sdk.services import RepairService
+
+CODE_FIX_TYPES = frozenset({"code_fix", "delete_lines", "revert_file"})
+FIX_TYPES = CODE_FIX_TYPES | {"reply_only"}
+STATUS_SUCCESS = "success"
+STATUS_FAILED = "failed"
+STATUS_PENDING_PUSH = "pending_push"
+STATUS_PENDING_REPLIES = "pending_replies"
+STATE_SCHEMA_VERSION = 1
+REPLY_MARKER_PREFIX = "atomgit-review-resolution"
+
+
+@dataclass(frozen=True)
+class FileSnapshot:
+    existed: bool
+    content: bytes | None
+    mode: int | None
+
+
+@dataclass(frozen=True)
+class PRGitContext:
+    base_sha: str
+    head_sha: str
+    head_branch: str
+    source_push_url: str
+    source_ref: str
+
+
+@dataclass(frozen=True)
+class PlannedFix:
+    payload: dict
+    fix_type: str
+    rel_path: str | None
+    abs_path: str | None
+    target_sha: str | None
+    reply_payloads: tuple[dict, ...] = ()
+
+
+class WorkflowInterrupted(KeyboardInterrupt):
+    """A handled termination signal interrupted the current transaction."""
+
+
+@contextmanager
+def handle_termination_signals():
+    """Turn catchable process termination signals into cleanup-friendly interrupts."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    previous_handlers = {}
+    interrupt_pending = False
+
+    def interrupt(signum, _frame):
+        nonlocal interrupt_pending
+        if interrupt_pending:
+            return
+        interrupt_pending = True
+        raise WorkflowInterrupted(f"received {signal.Signals(signum).name}")
+
+    for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        signum = getattr(signal, name, None)
+        if signum is None:
+            continue
+        previous_handlers[signum] = signal.getsignal(signum)
+        signal.signal(signum, interrupt)
+
+    try:
+        yield
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 def load_config(config_path: str) -> dict:
@@ -32,7 +114,7 @@ def load_config(config_path: str) -> dict:
 
 def format_fix_reply(fix: dict, ai_model: str) -> str:
     """格式化修复回复"""
-    return f"""感谢您的审阅意见。已按要求完成修复，具体内容如下：
+    return f"""感谢您的审阅意见。已完成以下修复、折回对应提交并同步至本 PR：
 
 **修复方案**:
 {fix.get("fix_description", "")}
@@ -80,7 +162,7 @@ def format_revert_reply(fix: dict, ai_model: str) -> str:
 **处理结果**:
 {fix.get("fix_description", "")}
 
-已按要求回退该文件的修改，恢复到原仓库状态。
+已按要求回退该文件、折回对应提交并同步至本 PR。
 
 如有任何疑问，请随时提出。
 
@@ -96,7 +178,7 @@ def format_delete_lines_reply(fix: dict, ai_model: str) -> str:
 **处理结果**:
 {fix.get("fix_description", "")}
 
-已删除以下行号的内容: {lines_str}
+已删除以下行号的内容、折回对应提交并同步至本 PR: {lines_str}
 
 如有任何疑问，请随时提出。
 
@@ -106,13 +188,20 @@ def format_delete_lines_reply(fix: dict, ai_model: str) -> str:
 
 def apply_code_fix(file_path: str, original_code: str, fixed_code: str) -> None:
     """应用代码修复"""
+    if not original_code:
+        raise ValueError("original_code must be non-empty")
+
     with open(file_path, encoding="utf-8") as f:
         content = f.read()
 
-    new_content = content.replace(original_code, fixed_code)
-
-    if new_content == content:
-        raise Exception("无法找到原始代码。代码可能已更改。")
+    match_count = 0
+    search_from = 0
+    while (match_index := content.find(original_code, search_from)) != -1:
+        match_count += 1
+        search_from = match_index + 1
+    if match_count != 1:
+        raise ValueError(f"original_code must match exactly once, got {match_count}")
+    new_content = content.replace(original_code, fixed_code, 1)
 
     with open(file_path, "w", encoding="utf-8") as f:
         f.write(new_content)
@@ -121,55 +210,1452 @@ def apply_code_fix(file_path: str, original_code: str, fixed_code: str) -> None:
 
 
 def delete_specific_lines(file_path: str, line_numbers: list[int]) -> None:
-    """删除特定行"""
+    """删除特定行。
+
+    校验规则:
+    - 行号列表必须非空, 且全部为整数 (bool 不算)
+    - 每个行号必须在 1..len(lines) 范围内: 越界说明行号基于过期/错误的文件内容,
+      部分删除会产生误导性结果, 完全空转则会造成 files_fixed 非空却无 staged diff
+      的虚假闭环, 因此一律整体拒绝
+    - 重复行号去重后只删除一次
+    """
+    if not line_numbers:
+        raise ValueError("delete_lines must be a non-empty list")
+    for n in line_numbers:
+        if not isinstance(n, int) or isinstance(n, bool):
+            raise ValueError(f"delete_lines entries must be integers, got: {n!r}")
+
     with open(file_path, encoding="utf-8") as f:
         content = f.read()
 
     lines = content.split("\n")
-    line_numbers_sorted = sorted(line_numbers, reverse=True)
+    total = len(lines)
+    for n in set(line_numbers):
+        if not 1 <= n <= total:
+            raise ValueError(f"line number {n} out of range (file has {total} lines): {file_path}")
 
-    for line_num in line_numbers_sorted:
-        if 1 <= line_num <= len(lines):
-            del lines[line_num - 1]
-
-    new_content = "\n".join(lines)
+    unique_lines = sorted(set(line_numbers), reverse=True)
+    for line_num in unique_lines:
+        del lines[line_num - 1]
 
     with open(file_path, "w", encoding="utf-8") as f:
-        f.write(new_content)
+        f.write("\n".join(lines))
 
-    print(f"  ✓ 已删除 {file_path} 中的 {len(line_numbers)} 行")
-
-
-def revert_file(file_path: str) -> None:
-    """回退整个文件"""
-    result = subprocess.run(["git", "checkout", "HEAD", "--", file_path], capture_output=True, text=True)
-
-    if result.returncode != 0:
-        raise Exception(f"回退文件失败: {result.stderr}")
-
-    print(f"  ✓ 已回退文件 {file_path}")
+    print(f"  ✓ 已删除 {file_path} 中的 {len(unique_lines)} 行")
 
 
-def commit_fixes(work_dir: str, ai_model: str) -> None:
-    """提交修复"""
-    commit_message = f"fix: resolve review comments\n\nGenerated by ai@{ai_model}"
+def resolve_repo_path(work_dir: str, rel_path: str) -> str:
+    """把 repo 相对路径解析为绝对路径, 拒绝绝对路径和任何逃逸仓库根目录的写法。
 
-    result = subprocess.run(["git", "add", "."], cwd=work_dir, capture_output=True, text=True)
+    绝对化 work_dir 是必须的: 否则返回的路径是相对路径, 会以脚本进程 cwd 而非
+    work_dir 解析; revert_file 传给 git 的 pathspec 也会相对 cwd=work_dir 再拼一次。
 
-    if result.returncode != 0:
-        raise Exception(f"Git add 失败: {result.stderr}")
+    路径中任何一段是 symlink 都直接拒绝 (词法路径 != resolve 后路径即拒绝):
+    - 仓库内 symlink 指向外部文件可绕过检查, 让 open() 改写仓库外文件
+    - 指向仓库内部时, 写入的是真实目标文件, 但 git 暂存的是 symlink 路径,
+      可能没有任何 staged diff 却照发"已修复"回复
+    """
+    p = Path(rel_path)
+    if p.is_absolute() or ".." in p.parts:
+        raise ValueError(f"file_path must be a repo-relative path and must not escape repo root: {rel_path}")
+    root = Path(work_dir).resolve()
+    lexical = root / p
+    resolved = lexical.resolve()
+    if resolved != lexical:
+        raise ValueError(f"file_path traverses a symlink, which is not supported for fixes: {rel_path} -> {resolved}")
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        raise ValueError(f"file_path resolves outside repo root: {rel_path} -> {resolved}") from None
+    return str(resolved)
 
-    result = subprocess.run(
-        ["git", "commit", "--amend", "-m", commit_message],
+
+def literal_pathspec_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Return a Git environment that treats every pathspec as a literal path."""
+    env = os.environ.copy()
+    env["GIT_LITERAL_PATHSPECS"] = "1"
+    if extra:
+        env.update(extra)
+    return env
+
+
+def ensure_clean_index(work_dir: str) -> None:
+    """检查 index 是否已有 staged 内容; 若有则拒绝, 避免预先暂存的无关改动被卷入 fixup。
+
+    必须在任何文件修改之前调用: 否则脚本会先改写工作区、再因 index 脏而失败,
+    把仓库留在半修改状态。
+    """
+    pre_check = subprocess.run(
+        ["git", "diff", "--cached", "--quiet"],
         cwd=work_dir,
         capture_output=True,
         text=True,
     )
+    if pre_check.returncode == 1:
+        raise RuntimeError(
+            "index already has staged changes before applying fixes. "
+            "Please commit, stash, or `git restore --staged` them first, "
+            "then re-run this command. The script refuses to fold "
+            "pre-existing staged content into a fixup commit."
+        )
+    if pre_check.returncode != 0:
+        # 128/129 等命令错误 (如 work_dir 不是 git 仓库) 不能当作 index 干净, 否则
+        # 脚本会在未经校验的目录里开始改写文件
+        raise RuntimeError(
+            f"failed to check index state in {work_dir} "
+            f"(git diff --cached exited {pre_check.returncode}): {pre_check.stderr.strip()}"
+        )
 
+
+def ensure_clean_worktree(work_dir: str) -> None:
+    """拒绝任何已有 tracked unstaged 修改，避免 rebase 在 fixup 提交后才失败。"""
+    pre_check = subprocess.run(
+        ["git", "diff", "--quiet"],
+        cwd=work_dir,
+        capture_output=True,
+        text=True,
+    )
+    if pre_check.returncode == 1:
+        raise RuntimeError(
+            "tracked worktree already has unstaged changes before applying fixes. "
+            "Please commit, stash, or restore them first. The script does not "
+            "automatically stash user work before rewriting PR history."
+        )
+    if pre_check.returncode != 0:
+        raise RuntimeError(
+            f"failed to check tracked worktree state in {work_dir} "
+            f"(git diff exited {pre_check.returncode}): {pre_check.stderr.strip()}"
+        )
+
+
+def _git_state_path_exists(work_dir: str, state_name: str) -> bool:
+    result = subprocess.run(
+        ["git", "rev-parse", "--git-path", state_name],
+        cwd=work_dir,
+        capture_output=True,
+        text=True,
+    )
     if result.returncode != 0:
-        raise Exception(f"Git commit 失败: {result.stderr}")
+        raise RuntimeError(f"failed to inspect Git state {state_name}: {result.stderr.strip()}")
+    path = Path(result.stdout.strip())
+    if not path.is_absolute():
+        path = Path(work_dir).resolve() / path
+    return path.exists()
 
-    print("  ✓ 已提交修复 (git commit --amend)")
+
+def rebase_in_progress(work_dir: str) -> bool:
+    return _git_state_path_exists(work_dir, "rebase-merge") or _git_state_path_exists(work_dir, "rebase-apply")
+
+
+def ensure_no_rebase_in_progress(work_dir: str) -> None:
+    if rebase_in_progress(work_dir):
+        raise RuntimeError("a rebase is already in progress; finish or abort it before applying review fixes")
+
+
+def ensure_paths_tracked(work_dir: str, paths: list[str]) -> None:
+    result = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", *sorted(set(paths))],
+        cwd=work_dir,
+        env=literal_pathspec_env(),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "all code-fix paths must already be tracked by Git; refusing to stage an untracked or invalid path: "
+            f"{result.stderr.strip()}"
+        )
+
+
+def requested_fixup_target(fix: dict, default_fixup_target: str | None) -> str:
+    target = fix.get("fixup_target") if "fixup_target" in fix else default_fixup_target
+    if not isinstance(target, str) or not target.strip():
+        raise ValueError(
+            f"{fix.get('type', 'code_fix')} requires a non-empty fixup_target; "
+            "set it on each code-changing fix or explicitly pass --fixup-target for a homogeneous batch"
+        )
+    return target.strip()
+
+
+def validate_fix_fields(fix: dict, default_fixup_target: str | None = None) -> None:
+    """校验单个修复对象的必需字段, 给出可定位的错误信息。
+
+    所有修复类型都要求 comment_id: 每个修复对应一条 review 评论, 缺失时
+    code_fix 会静默提交代码却永不回复, reply_only 则完全空转却记成功。
+    """
+    fix_type = fix.get("type", "code_fix")
+    if fix_type not in FIX_TYPES:
+        raise ValueError(f"unknown fix type: {fix_type}")
+    rel = fix.get("file_path")
+    if fix_type in CODE_FIX_TYPES and (not isinstance(rel, str) or not rel):
+        raise ValueError(f"{fix_type} requires a non-empty string file_path")
+    if fix_type == "code_fix":
+        if not isinstance(fix.get("original_code"), str) or not isinstance(fix.get("fixed_code"), str):
+            raise ValueError("code_fix requires string original_code and fixed_code")
+        if not fix["original_code"]:
+            raise ValueError("code_fix requires non-empty original_code")
+    elif fix_type == "delete_lines":
+        line_numbers = fix.get("delete_lines")
+        if not isinstance(line_numbers, list) or not line_numbers:
+            raise ValueError("delete_lines fix requires a non-empty delete_lines list")
+        if any(not isinstance(line, int) or isinstance(line, bool) for line in line_numbers):
+            raise ValueError("delete_lines entries must all be integers")
+    elif fix_type == "reply_only" and (not isinstance(fix.get("reply"), str) or not fix["reply"]):
+        raise ValueError("reply_only requires a non-empty reply")
+    if fix_type in CODE_FIX_TYPES:
+        requested_fixup_target(fix, default_fixup_target)
+    if fix.get("comment_id") is None:
+        raise ValueError(f"{fix_type} requires comment_id (each fix maps to one review comment)")
+
+
+def snapshot_file(snapshot: dict[str, FileSnapshot], abs_path: str) -> None:
+    """记录文件本次运行前的内容、存在状态和权限，供事务失败时回滚。
+
+    只记录每个路径首次被修改前的状态: 同一文件的多次修复重放时,
+    回滚必须回到最初的运行前状态, 而不是中间状态。
+    """
+    if abs_path in snapshot:
+        return
+    try:
+        mode = os.lstat(abs_path).st_mode
+        with open(abs_path, "rb") as f:
+            snapshot[abs_path] = FileSnapshot(existed=True, content=f.read(), mode=mode)
+    except FileNotFoundError:
+        snapshot[abs_path] = FileSnapshot(existed=False, content=None, mode=None)
+
+
+def restore_snapshot(snapshot: dict[str, FileSnapshot]) -> list[str]:
+    """恢复快照中的文件内容、存在状态和权限，返回已恢复的路径列表。"""
+    restored = []
+    for path, file_snapshot in snapshot.items():
+        if not file_snapshot.existed:
+            if os.path.lexists(path):
+                os.remove(path)
+        else:
+            with open(path, "wb") as f:
+                f.write(file_snapshot.content or b"")
+            os.chmod(path, stat.S_IMODE(file_snapshot.mode or 0))
+        restored.append(path)
+    return restored
+
+
+def revert_file(file_path: str, work_dir: str, base_sha: str) -> None:
+    """把整个文件恢复到 PR base SHA；PR 新增文件则删除。"""
+    pathspec = os.path.relpath(file_path, Path(work_dir).resolve())
+    exists_at_base = subprocess.run(
+        ["git", "ls-tree", "--name-only", base_sha, "--", pathspec],
+        cwd=work_dir,
+        env=literal_pathspec_env(),
+        capture_output=True,
+        text=True,
+    )
+    if exists_at_base.returncode != 0:
+        raise RuntimeError(
+            f"检查 PR base 文件状态失败 ({pathspec}, git ls-tree exited {exists_at_base.returncode}): "
+            f"{exists_at_base.stderr.strip()}"
+        )
+
+    if exists_at_base.stdout.strip():
+        result = subprocess.run(
+            ["git", "checkout", base_sha, "--", pathspec],
+            cwd=work_dir,
+            env=literal_pathspec_env(),
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"回退文件失败: {result.stderr.strip()}")
+    else:
+        os.remove(file_path)
+
+    print(f"  ✓ 已将 {pathspec} 恢复到 PR base {base_sha[:12]}")
+
+
+class RepoStateNotNormalizedError(RuntimeError):
+    """修复事务失败且无法把分支/index/文件恢复到调用前状态。
+
+    外层捕获到此异常时不得再恢复文件快照: 分支历史与工作区已不一致,
+    盲目恢复会叠加反向 diff, 必须提示用户手动检查仓库状态。
+    """
+
+
+def _resolve_commit(work_dir: str, ref: str, description: str) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        cwd=work_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"{description} is not available as a local commit ({ref}): {result.stderr.strip()}")
+    return result.stdout.strip().lower()
+
+
+def _require_ancestor(work_dir: str, ancestor: str, descendant: str, description: str) -> None:
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", ancestor, descendant],
+        cwd=work_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 1:
+        raise RuntimeError(description)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"failed to validate Git ancestry {ancestor[:12]}..{descendant[:12]}: {result.stderr.strip()}"
+        )
+
+
+def ensure_no_merge_commits(work_dir: str, base_sha: str, head_sha: str = "HEAD") -> None:
+    """Refuse histories that a plain interactive rebase would silently linearize."""
+    merge_check = subprocess.run(
+        ["git", "rev-list", "--min-parents=2", f"{base_sha}..{head_sha}"],
+        cwd=work_dir,
+        capture_output=True,
+        text=True,
+    )
+    if merge_check.returncode != 0:
+        raise RuntimeError(f"failed to inspect PR history for merge commits: {merge_check.stderr.strip()}")
+    merge_oids = merge_check.stdout.split()
+    if merge_oids:
+        raise RuntimeError(
+            "PR history contains merge commits; refusing linear autosquash because it would change history topology: "
+            f"{', '.join(oid[:12] for oid in merge_oids[:3])}"
+        )
+
+
+def _normalize_git_repo_url(url: str) -> tuple[str, str] | None:
+    value = url.strip()
+    if not value:
+        return None
+    if "://" in value:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        path = parsed.path
+    else:
+        match = re.match(r"^(?:[^@/]+@)?([^:/]+):(.+)$", value)
+        if not match:
+            return None
+        host, path = match.groups()
+    normalized_path = path.strip("/")
+    if normalized_path.endswith(".git"):
+        normalized_path = normalized_path[:-4]
+    if not host or not normalized_path:
+        return None
+    return host.casefold(), normalized_path.casefold()
+
+
+def _repository_identities(repo_metadata: dict) -> set[tuple[str, str]]:
+    expected = {
+        identity
+        for key in ("ssh_url", "clone_url", "html_url", "url")
+        if isinstance(repo_metadata.get(key), str)
+        if (identity := _normalize_git_repo_url(repo_metadata[key])) is not None
+    }
+    full_name = repo_metadata.get("full_name")
+    if isinstance(full_name, str) and full_name:
+        hosts = {host for host, _path in expected} or {"atomgit.com"}
+        expected.update((host, full_name.strip("/").removesuffix(".git").casefold()) for host in hosts)
+    return expected
+
+
+def _find_source_push_url(work_dir: str, head_repo: dict) -> str:
+    expected = _repository_identities(head_repo)
+    full_name = head_repo.get("full_name")
+    if not expected:
+        raise RuntimeError("PR head metadata does not identify its source repository")
+
+    remotes = subprocess.run(
+        ["git", "remote"],
+        cwd=work_dir,
+        capture_output=True,
+        text=True,
+    )
+    if remotes.returncode != 0:
+        raise RuntimeError(f"failed to list Git remotes: {remotes.stderr.strip()}")
+
+    matches: list[tuple[str, str]] = []
+    for remote in remotes.stdout.splitlines():
+        urls = subprocess.run(
+            ["git", "remote", "get-url", "--push", "--all", remote],
+            cwd=work_dir,
+            capture_output=True,
+            text=True,
+        )
+        if urls.returncode != 0:
+            continue
+        push_urls = [url.strip() for url in urls.stdout.splitlines() if url.strip()]
+        matching_urls = [url for url in push_urls if _normalize_git_repo_url(url) in expected]
+        if not matching_urls:
+            continue
+        if len(push_urls) != 1:
+            raise RuntimeError(
+                f"remote {remote} has {len(push_urls)} push URLs and matches the PR source; "
+                "refusing an ambiguous or fan-out push configuration"
+            )
+        matches.append((remote, matching_urls[0]))
+
+    if not matches:
+        repo_name = full_name or ", ".join(f"{host}/{path}" for host, path in sorted(expected))
+        raise RuntimeError(
+            f"no local push remote matches the PR source repository {repo_name}; "
+            "add the source fork as a remote before applying code fixes"
+        )
+    if len(matches) != 1:
+        raise RuntimeError(
+            "multiple push targets match the PR source repository; refusing to guess: "
+            f"{', '.join(f'{remote}={url}' for remote, url in matches)}"
+        )
+    return matches[0][1]
+
+
+def load_pr_git_context(work_dir: str, api: RepairService, pr_number: int) -> PRGitContext:
+    """Load and validate immutable base/head/source data before any local write."""
+    pr = api.client.get_pull_request(pr_number)
+    if not isinstance(pr, dict):
+        raise RuntimeError("PR metadata response is not an object")
+    base = pr.get("base")
+    head = pr.get("head")
+    if not isinstance(base, dict) or not isinstance(head, dict):
+        raise RuntimeError("PR metadata is missing base/head objects")
+
+    base_sha = base.get("sha")
+    head_sha = head.get("sha")
+    head_branch = head.get("ref")
+    head_repo = head.get("repo")
+    for name, value in (("base.sha", base_sha), ("head.sha", head_sha)):
+        if not isinstance(value, str) or re.fullmatch(r"[0-9a-fA-F]{40,64}", value) is None:
+            raise RuntimeError(f"PR metadata is missing a full commit OID in {name}")
+    if not isinstance(head_branch, str) or not head_branch:
+        raise RuntimeError("PR metadata is missing head.ref")
+    if not isinstance(head_repo, dict):
+        raise RuntimeError("PR metadata is missing head.repo")
+
+    base_sha = base_sha.lower()
+    head_sha = head_sha.lower()
+    if _resolve_commit(work_dir, base_sha, "PR base SHA") != base_sha:
+        raise RuntimeError(f"local object for PR base SHA does not resolve exactly to {base_sha}")
+    if _resolve_commit(work_dir, head_sha, "PR head SHA") != head_sha:
+        raise RuntimeError(f"local object for PR head SHA does not resolve exactly to {head_sha}")
+    local_head = _resolve_commit(work_dir, "HEAD", "local HEAD")
+    if local_head != head_sha:
+        raise RuntimeError(
+            f"local HEAD {local_head[:12]} does not match PR head {head_sha[:12]}; "
+            "check out and update the PR source branch before applying fixes"
+        )
+
+    _require_ancestor(
+        work_dir,
+        base_sha,
+        local_head,
+        (
+            f"PR metadata base {base_sha[:12]} is not an ancestor of local HEAD {local_head[:12]}; "
+            "refusing to rebase onto a sibling or advanced target history"
+        ),
+    )
+    ensure_no_merge_commits(work_dir, base_sha, local_head)
+
+    branch_check = subprocess.run(
+        ["git", "check-ref-format", "--branch", head_branch],
+        cwd=work_dir,
+        capture_output=True,
+        text=True,
+    )
+    if branch_check.returncode != 0:
+        raise RuntimeError(f"PR head.ref is not a valid branch name: {head_branch}")
+
+    source_push_url = _find_source_push_url(work_dir, head_repo)
+    return PRGitContext(
+        base_sha=base_sha,
+        head_sha=head_sha,
+        head_branch=head_branch,
+        source_push_url=source_push_url,
+        source_ref=f"refs/heads/{head_branch}",
+    )
+
+
+def verify_fixup_target(work_dir: str, fixup_target: str, base_sha: str) -> str:
+    """验证目标 commit 位于不可变的 PR base SHA 与 HEAD 之间。
+
+    autosquash 只会重放 base SHA..HEAD 内的 commit; 目标在范围外 (如 base 本身、
+    另一条分支上的 commit) 时, fixup! commit 会被原样重放为普通 commit, 污染
+    PR 历史，因此必须在任何文件写入前拒绝。
+    """
+    target_sha = _resolve_commit(work_dir, fixup_target, "fixup target")
+    _require_ancestor(
+        work_dir,
+        base_sha,
+        "HEAD",
+        f"PR base SHA {base_sha[:12]} is not an ancestor of HEAD; refusing to rewrite history",
+    )
+
+    rng = subprocess.run(
+        ["git", "rev-list", f"{base_sha}..HEAD"],
+        cwd=work_dir,
+        capture_output=True,
+        text=True,
+    )
+    if rng.returncode != 0:
+        raise RuntimeError(f"failed to list {base_sha}..HEAD: {rng.stderr.strip()}")
+    if target_sha not in rng.stdout.split():
+        raise RuntimeError(
+            f"fixup target {fixup_target} ({target_sha[:12]}) is not within "
+            f"{base_sha}..HEAD, so autosquash cannot fold it back and it would "
+            f"be replayed as a normal fixup! commit. Pick a target from: "
+            f"git log --oneline {base_sha}..HEAD"
+        )
+    return target_sha
+
+
+def build_fix_plan(
+    fixes: list[dict],
+    work_dir: str,
+    base_sha: str | None,
+    default_fixup_target: str | None,
+) -> list[PlannedFix]:
+    plans = []
+    for fix in fixes:
+        fix_type = fix.get("type", "code_fix")
+        rel_path = fix.get("file_path") if fix_type in CODE_FIX_TYPES else None
+        abs_path = None
+        if fix_type in CODE_FIX_TYPES:
+            abs_path = resolve_repo_path(work_dir, rel_path)
+            rel_path = Path(abs_path).relative_to(Path(work_dir).resolve()).as_posix()
+        target_sha = None
+        if fix_type in CODE_FIX_TYPES:
+            if base_sha is None:
+                raise RuntimeError("code fixes require validated PR base metadata")
+            target_sha = verify_fixup_target(
+                work_dir,
+                requested_fixup_target(fix, default_fixup_target),
+                base_sha,
+            )
+        plans.append(
+            PlannedFix(
+                payload=fix,
+                fix_type=fix_type,
+                rel_path=rel_path,
+                abs_path=abs_path,
+                target_sha=target_sha,
+            )
+        )
+
+    plans_by_path: dict[str, list[PlannedFix]] = {}
+    for plan in plans:
+        if plan.rel_path is not None:
+            plans_by_path.setdefault(plan.rel_path, []).append(plan)
+
+    ambiguous = sorted(
+        path
+        for path, path_plans in plans_by_path.items()
+        if len({plan.target_sha for plan in path_plans if plan.target_sha is not None}) > 1
+    )
+    if ambiguous:
+        raise ValueError(
+            "one file cannot be staged into multiple fixup targets in a single non-interactive batch: "
+            f"{', '.join(ambiguous)}; split these fixes into separate confirmed runs"
+        )
+
+    merged_plans = []
+    emitted_paths = set()
+    for plan in plans:
+        if plan.rel_path is None:
+            merged_plans.append(plan)
+            continue
+        if plan.rel_path in emitted_paths:
+            continue
+        emitted_paths.add(plan.rel_path)
+        same_path = plans_by_path[plan.rel_path]
+        if len(same_path) == 1:
+            merged_plans.append(plan)
+            continue
+        if any(item.fix_type != "delete_lines" for item in same_path):
+            raise ValueError(
+                "multiple fixes for one file are unsafe unless every fix is delete_lines against the same snapshot: "
+                f"{plan.rel_path}; combine them into one confirmed patch"
+            )
+
+        merged_payload = dict(plan.payload)
+        merged_payload["delete_lines"] = sorted(
+            {line for item in same_path for line in item.payload["delete_lines"]},
+            reverse=True,
+        )
+        merged_plans.append(
+            PlannedFix(
+                payload=merged_payload,
+                fix_type="delete_lines",
+                rel_path=plan.rel_path,
+                abs_path=plan.abs_path,
+                target_sha=plan.target_sha,
+                reply_payloads=tuple(item.payload for item in same_path),
+            )
+        )
+    return merged_plans
+
+
+class FixTransaction:
+    """Own file snapshots, temporary fixup commits, and this run's rebase state."""
+
+    def __init__(
+        self,
+        work_dir: str,
+        base_sha: str,
+        plans: list[PlannedFix],
+        expected_head: str | None = None,
+    ):
+        self.work_dir = work_dir
+        self.base_sha = base_sha
+        self.plans = plans
+        self.expected_head = expected_head
+        self.paths = sorted({plan.rel_path for plan in plans if plan.rel_path is not None})
+        self.snapshot: dict[str, FileSnapshot] = {}
+        self.original_head = ""
+        self.rebase_started = False
+
+    def __enter__(self):
+        ensure_no_rebase_in_progress(self.work_dir)
+        ensure_clean_index(self.work_dir)
+        ensure_clean_worktree(self.work_dir)
+        self.original_head = _resolve_commit(self.work_dir, "HEAD", "local HEAD")
+        if self.expected_head is not None and self.original_head != self.expected_head:
+            raise RuntimeError(
+                f"local HEAD changed during preflight: expected {self.expected_head[:12]}, "
+                f"got {self.original_head[:12]}"
+            )
+        ensure_no_merge_commits(self.work_dir, self.base_sha, self.original_head)
+        for plan in self.plans:
+            if plan.abs_path is not None:
+                snapshot_file(self.snapshot, plan.abs_path)
+        return self
+
+    def commit_group(self, target_sha: str, group: list[PlannedFix]) -> None:
+        paths = sorted({plan.rel_path for plan in group if plan.rel_path is not None})
+        if not paths:
+            raise ValueError(f"fixup group {target_sha[:12]} has no files to stage")
+        add = subprocess.run(
+            ["git", "add", "--", *paths],
+            cwd=self.work_dir,
+            env=literal_pathspec_env(),
+            capture_output=True,
+            text=True,
+        )
+        if add.returncode != 0:
+            raise RuntimeError(f"Git add failed for fixup target {target_sha[:12]}: {add.stderr.strip()}")
+
+        diff = subprocess.run(
+            ["git", "diff", "--cached", "--quiet", "--", *paths],
+            cwd=self.work_dir,
+            env=literal_pathspec_env(),
+            capture_output=True,
+            text=True,
+        )
+        if diff.returncode == 0:
+            raise RuntimeError(
+                f"fixes for target {target_sha[:12]} produced no staged diff; refusing to create a false fixup"
+            )
+        if diff.returncode != 1:
+            raise RuntimeError(f"failed to inspect staged fixes for {target_sha[:12]}: {diff.stderr.strip()}")
+
+        commit = subprocess.run(
+            ["git", "commit", f"--fixup={target_sha}"],
+            cwd=self.work_dir,
+            capture_output=True,
+            text=True,
+        )
+        if commit.returncode != 0:
+            raise RuntimeError(f"Git commit --fixup failed for {target_sha[:12]}: {commit.stderr.strip()}")
+        print(f"  ✓ 已创建 fixup commit -> {target_sha[:12]} ({len(paths)} files)")
+
+    def autosquash(self) -> None:
+        ensure_no_merge_commits(self.work_dir, self.base_sha, "HEAD")
+        env = os.environ.copy()
+        env["GIT_SEQUENCE_EDITOR"] = "true"
+        self.rebase_started = True
+        result = subprocess.run(
+            ["git", "rebase", "-i", "--autosquash", self.base_sha],
+            cwd=self.work_dir,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"autosquash failed: {result.stderr.strip()}")
+        self.rebase_started = False
+
+        leftover = subprocess.run(
+            ["git", "log", "--format=%s", f"{self.base_sha}..HEAD"],
+            cwd=self.work_dir,
+            capture_output=True,
+            text=True,
+        )
+        if leftover.returncode != 0:
+            raise RuntimeError(f"failed to verify autosquash result: {leftover.stderr.strip()}")
+        residual = [subject for subject in leftover.stdout.splitlines() if subject.startswith("fixup!")]
+        if residual:
+            raise RuntimeError(
+                f"autosquash completed but {len(residual)} fixup commit(s) remain: {'; '.join(residual[:3])}"
+            )
+
+    def __exit__(self, exc_type, exc, _traceback):
+        if exc_type is None:
+            return False
+
+        cleanup_errors = []
+        history_normalized = False
+        try:
+            rebase_active = False
+            if self.rebase_started:
+                try:
+                    rebase_active = rebase_in_progress(self.work_dir)
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(f"failed to inspect rebase state: {cleanup_error}")
+
+            if rebase_active and not cleanup_errors:
+                try:
+                    abort = subprocess.run(
+                        ["git", "rebase", "--abort"],
+                        cwd=self.work_dir,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if abort.returncode != 0:
+                        cleanup_errors.append(f"git rebase --abort failed: {abort.stderr.strip()}")
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(f"git rebase --abort raised: {cleanup_error}")
+
+            if not cleanup_errors:
+                try:
+                    reset = subprocess.run(
+                        ["git", "reset", "--soft", self.original_head],
+                        cwd=self.work_dir,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if reset.returncode != 0:
+                        cleanup_errors.append(
+                            f"git reset --soft {self.original_head[:12]} failed: {reset.stderr.strip()}"
+                        )
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(f"git reset --soft raised: {cleanup_error}")
+
+            if not cleanup_errors:
+                try:
+                    unstage = subprocess.run(
+                        ["git", "restore", "--staged", "--", *self.paths],
+                        cwd=self.work_dir,
+                        env=literal_pathspec_env(),
+                        capture_output=True,
+                        text=True,
+                    )
+                    if unstage.returncode != 0:
+                        cleanup_errors.append(f"failed to unstage transaction paths: {unstage.stderr.strip()}")
+                    else:
+                        history_normalized = True
+                except BaseException as cleanup_error:
+                    cleanup_errors.append(f"unstaging transaction paths raised: {cleanup_error}")
+        finally:
+            if history_normalized:
+                try:
+                    restore_snapshot(self.snapshot)
+                except BaseException as restore_error:
+                    cleanup_errors.append(f"failed to restore file snapshots: {restore_error}")
+
+        if cleanup_errors:
+            raise RepoStateNotNormalizedError(
+                f"{exc}\nTransaction cleanup was incomplete: {'; '.join(cleanup_errors)}. "
+                "Do not re-run blindly; inspect git status and git log first."
+            ) from exc
+        return False
+
+
+def push_command(context: PRGitContext) -> list[str]:
+    return [
+        "git",
+        "push",
+        f"--force-with-lease={context.source_ref}:{context.head_sha}",
+        context.source_push_url,
+        f"HEAD:{context.source_ref}",
+    ]
+
+
+def push_and_verify(work_dir: str, context: PRGitContext) -> str:
+    """Push to the PR source ref with an OID-bound lease and verify the remote ref."""
+    new_head = _resolve_commit(work_dir, "HEAD", "rewritten HEAD")
+    result = subprocess.run(
+        push_command(context),
+        cwd=work_dir,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"push failed; explicit lease preserved the remote branch: {result.stderr.strip()}")
+
+    remote = subprocess.run(
+        ["git", "ls-remote", "--exit-code", "--refs", context.source_push_url, context.source_ref],
+        cwd=work_dir,
+        capture_output=True,
+        text=True,
+    )
+    if remote.returncode != 0:
+        raise RuntimeError(
+            "push returned success but the PR source ref could not be verified; no review replies were sent: "
+            f"{remote.stderr.strip()}"
+        )
+    remote_oids = {line.split()[0].lower() for line in remote.stdout.splitlines() if line.split()}
+    if remote_oids != {new_head}:
+        raise RuntimeError(
+            f"PR source ref verification mismatch: expected {new_head}, got {', '.join(sorted(remote_oids)) or 'none'}"
+        )
+    return new_head
+
+
+def read_remote_ref(work_dir: str, push_url: str, source_ref: str) -> str | None:
+    remote = subprocess.run(
+        ["git", "ls-remote", "--exit-code", "--refs", push_url, source_ref],
+        cwd=work_dir,
+        capture_output=True,
+        text=True,
+    )
+    if remote.returncode == 2:
+        return None
+    if remote.returncode != 0:
+        raise RuntimeError(f"failed to read remote ref {source_ref} from exact push URL: {remote.stderr.strip()}")
+    remote_oids = {line.split()[0].lower() for line in remote.stdout.splitlines() if line.split()}
+    if len(remote_oids) != 1:
+        raise RuntimeError(f"remote ref {source_ref} returned {len(remote_oids)} OIDs; refusing ambiguous resume state")
+    return remote_oids.pop()
+
+
+def resume_push(state_path: str, state: dict) -> None:
+    git_state = state.get("git")
+    if git_state is None:
+        return
+    work_dir = state["work_dir"]
+    old_head = git_state["old_head"]
+    new_head = git_state["new_head"]
+    if new_head is None:
+        raise RuntimeError("resume state does not contain rewritten git.new_head")
+
+    git_state["push_status"] = "pending"
+    state["status"] = STATUS_PENDING_PUSH
+    state["last_error"] = None
+    write_workflow_state(state_path, state)
+
+    local_head = _resolve_commit(work_dir, "HEAD", "local HEAD")
+    if local_head not in {old_head, new_head}:
+        raise RuntimeError(
+            f"local HEAD {local_head[:12]} is neither recorded old_head {old_head[:12]} nor new_head {new_head[:12]}"
+        )
+    if _resolve_commit(work_dir, new_head, "rewritten HEAD") != new_head:
+        raise RuntimeError(f"rewritten commit object {new_head} is not available locally")
+
+    remote_head = read_remote_ref(work_dir, git_state["push_url"], git_state["source_ref"])
+    if remote_head == new_head:
+        git_state["push_status"] = "verified"
+        state["status"] = STATUS_PENDING_REPLIES
+        state["last_error"] = None
+        write_workflow_state(state_path, state)
+        return
+    if remote_head != old_head:
+        raise RuntimeError(
+            "remote source ref is neither the recorded old_head nor new_head; refusing to overwrite concurrent work: "
+            f"{remote_head or 'missing'}"
+        )
+
+    command = [
+        "git",
+        "push",
+        f"--force-with-lease={git_state['source_ref']}:{old_head}",
+        git_state["push_url"],
+        f"{new_head}:{git_state['source_ref']}",
+    ]
+    result = subprocess.run(command, cwd=work_dir, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"resume push failed; explicit lease preserved the remote branch: {result.stderr.strip()}")
+    verified_head = read_remote_ref(work_dir, git_state["push_url"], git_state["source_ref"])
+    if verified_head != new_head:
+        raise RuntimeError(f"resume push verification mismatch: expected {new_head}, got {verified_head or 'missing'}")
+    git_state["push_status"] = "verified"
+    state["status"] = STATUS_PENDING_REPLIES
+    state["last_error"] = None
+    write_workflow_state(state_path, state)
+
+
+def format_fix_payload_reply(fix: dict, ai_model: str) -> str:
+    fix_type = fix.get("type", "code_fix")
+    if fix_type == "code_fix":
+        return format_fix_reply(fix, ai_model)
+    if fix_type == "delete_lines":
+        return format_delete_lines_reply(fix, ai_model)
+    if fix_type == "revert_file":
+        return format_revert_reply(fix, ai_model)
+    return format_logic_reply(fix, ai_model)
+
+
+def planned_reply_payloads(plan: PlannedFix) -> tuple[dict, ...]:
+    return plan.reply_payloads or (plan.payload,)
+
+
+def apply_planned_fix(plan: PlannedFix, work_dir: str, base_sha: str) -> None:
+    if plan.abs_path is None:
+        raise RuntimeError(f"{plan.fix_type} has no resolved file path")
+    if plan.fix_type == "code_fix":
+        apply_code_fix(plan.abs_path, plan.payload["original_code"], plan.payload["fixed_code"])
+    elif plan.fix_type == "delete_lines":
+        delete_specific_lines(plan.abs_path, plan.payload["delete_lines"])
+    elif plan.fix_type == "revert_file":
+        revert_file(plan.abs_path, work_dir, base_sha)
+    else:
+        raise RuntimeError(f"cannot apply non-code fix type: {plan.fix_type}")
+
+
+def canonical_comment_id(comment_id: object) -> str:
+    if isinstance(comment_id, bool) or not isinstance(comment_id, int | str):
+        raise ValueError(f"comment_id must be an integer or non-empty string, got {comment_id!r}")
+    value = str(comment_id).strip()
+    if not value:
+        raise ValueError("comment_id must not be empty")
+    return value
+
+
+def list_pr_comments(api: RepairService, pr_number: int) -> list[dict]:
+    """Use the SDK's PR-scoped comment list, with a client fallback for older services."""
+    get_comments = getattr(api, "get_pr_comments", None)
+    if callable(get_comments):
+        comments = get_comments(pr_number)
+    else:
+        get_all_comments = getattr(api.client, "get_all_pr_comments", None)
+        if callable(get_all_comments):
+            comments = get_all_comments(pr_number)
+        else:
+            get_comments = getattr(api.client, "get_pr_comments", None)
+            if not callable(get_comments):
+                raise RuntimeError("installed AtomGit SDK does not provide a PR-scoped comment listing method")
+            comments = get_comments(pr_number)
+    if not isinstance(comments, list):
+        raise RuntimeError("PR comments response is not a list")
+    return comments
+
+
+def _comment_pr_number(comment: dict) -> int | None:
+    for key in ("pull_request_number", "pr_number", "number"):
+        value = comment.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    pull_request = comment.get("pull_request")
+    if isinstance(pull_request, dict):
+        value = pull_request.get("number") or pull_request.get("id")
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.isdigit():
+            return int(value)
+    return None
+
+
+def validate_pr_comment_ids(api: RepairService, pr_number: int, comment_ids: list[object]) -> dict[str, dict]:
+    """Validate comment IDs against the PR-scoped, fully paginated SDK result."""
+    comments = list_pr_comments(api, pr_number)
+
+    metadata: dict[str, dict] = {}
+    for comment in comments:
+        if not isinstance(comment, dict) or comment.get("id") is None:
+            continue
+        try:
+            key = canonical_comment_id(comment["id"])
+        except ValueError:
+            continue
+        comment_pr_number = _comment_pr_number(comment)
+        if comment_pr_number is not None and comment_pr_number != pr_number:
+            continue
+        metadata[key] = {
+            "comment_id": comment["id"],
+            "discussion_id": comment.get("discussion_id"),
+            "comment_type": comment.get("comment_type"),
+            "path": comment.get("path") or comment.get("diff_file"),
+            "is_outdated": comment.get("is_outdated"),
+        }
+
+    requested = [canonical_comment_id(comment_id) for comment_id in comment_ids]
+    missing = sorted({comment_id for comment_id in requested if comment_id not in metadata})
+    if missing:
+        raise ValueError(f"comment_id values do not belong to target PR #{pr_number}: {', '.join(missing)}")
+    return {comment_id: metadata[comment_id] for comment_id in requested}
+
+
+def build_reply_specs(
+    plans: list[PlannedFix],
+    ai_model: str,
+    comment_metadata: dict[str, dict],
+) -> list[dict]:
+    specs = []
+    for plan in plans:
+        for payload in planned_reply_payloads(plan):
+            metadata = comment_metadata[canonical_comment_id(payload["comment_id"])]
+            specs.append(
+                {
+                    **metadata,
+                    "body": format_fix_payload_reply(payload, ai_model),
+                }
+            )
+    return specs
+
+
+def _timestamp() -> str:
+    return datetime.now().isoformat()
+
+
+def _reply_counts(state: dict) -> dict[str, int]:
+    replies = state.get("replies", [])
+    return {
+        "total": len(replies),
+        "pending": sum(entry.get("status") == "pending" for entry in replies),
+        "sent": sum(entry.get("status") == "sent" for entry in replies),
+    }
+
+
+def write_workflow_state(state_path: str | Path, state: dict) -> None:
+    """Atomically checkpoint a machine-readable workflow ledger."""
+    path = Path(state_path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state["updated_at"] = _timestamp()
+    state["reply_counts"] = _reply_counts(state)
+
+    fd, temporary_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as state_file:
+            json.dump(state, state_file, indent=2, ensure_ascii=False, sort_keys=True)
+            state_file.write("\n")
+            state_file.flush()
+            os.fsync(state_file.fileno())
+        os.replace(temporary_path, path)
+    except BaseException:
+        with suppress(FileNotFoundError):
+            os.remove(temporary_path)
+        raise
+
+
+def _state_repository(api: RepairService) -> dict[str, str]:
+    config = api.client.config
+    owner = getattr(config, "owner", None)
+    repo = getattr(config, "repo", None)
+    if not isinstance(owner, str) or not owner or not isinstance(repo, str) or not repo:
+        raise RuntimeError("SDK client configuration is missing repository owner/repo")
+    return {"owner": owner, "repo": repo}
+
+
+def create_workflow_state(
+    args,
+    api: RepairService,
+    reply_specs: list[dict],
+    context: PRGitContext | None,
+) -> tuple[str, dict]:
+    transaction_id = uuid.uuid4().hex
+    created_at = _timestamp()
+    replies = []
+    for index, spec in enumerate(reply_specs, 1):
+        unsigned_body = spec["body"]
+        content_hash = hashlib.sha256(unsigned_body.encode("utf-8")).hexdigest()
+        marker = f"<!-- {REPLY_MARKER_PREFIX}:{transaction_id}:{index}:{content_hash} -->"
+        body = f"{unsigned_body}\n\n{marker}"
+        replies.append(
+            {
+                "comment_id": spec["comment_id"],
+                "discussion_id": spec.get("discussion_id"),
+                "comment_type": spec.get("comment_type"),
+                "path": spec.get("path"),
+                "is_outdated": spec.get("is_outdated"),
+                "body": body,
+                "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                "marker": marker,
+                "status": "pending",
+                "attempts": 0,
+                "reply_id": None,
+                "last_error": None,
+            }
+        )
+
+    output_dir = Path(getattr(args, "output_dir", "./tmp")).resolve()
+    repository = _state_repository(api)
+    repo_slug = repository["repo"].lower().replace("-", "_")
+    state_path = output_dir / f"{repo_slug}_pr_{args.pr}_review_resolution_{transaction_id}.json"
+    git_state = None
+    status = STATUS_PENDING_REPLIES
+    if context is not None:
+        status = "applying"
+        git_state = {
+            "base_sha": context.base_sha,
+            "old_head": context.head_sha,
+            "new_head": None,
+            "push_url": context.source_push_url,
+            "source_ref": context.source_ref,
+            "head_branch": context.head_branch,
+            "push_status": "pending",
+        }
+    state = {
+        "schema_version": STATE_SCHEMA_VERSION,
+        "transaction_id": transaction_id,
+        "status": status,
+        "created_at": created_at,
+        "updated_at": created_at,
+        "state_file": str(state_path),
+        "repository": repository,
+        "pr_number": args.pr,
+        "work_dir": str(Path(args.work_dir).resolve()),
+        "reply_mode": args.reply_mode,
+        "git": git_state,
+        "replies": replies,
+        "last_error": None,
+    }
+    write_workflow_state(state_path, state)
+    return str(state_path), state
+
+
+def load_workflow_state(state_path: str | Path) -> dict:
+    path = Path(state_path).resolve()
+    with open(path, encoding="utf-8") as state_file:
+        state = json.load(state_file)
+    if not isinstance(state, dict):
+        raise ValueError("resume state must be a JSON object")
+    if state.get("schema_version") != STATE_SCHEMA_VERSION:
+        raise ValueError(f"unsupported resume state schema_version: {state.get('schema_version')!r}")
+    if not isinstance(state.get("transaction_id"), str) or not state["transaction_id"]:
+        raise ValueError("resume state is missing transaction_id")
+    if not isinstance(state.get("pr_number"), int):
+        raise ValueError("resume state is missing integer pr_number")
+    if state.get("reply_mode") not in {"threaded", "visible"}:
+        raise ValueError("resume state has invalid reply_mode")
+    repository = state.get("repository")
+    if not isinstance(repository, dict) or not all(
+        isinstance(repository.get(key), str) and repository[key] for key in ("owner", "repo")
+    ):
+        raise ValueError("resume state is missing repository owner/repo")
+    if not isinstance(state.get("work_dir"), str) or not state["work_dir"]:
+        raise ValueError("resume state is missing work_dir")
+    if state.get("status") not in {
+        "applying",
+        STATUS_PENDING_PUSH,
+        STATUS_PENDING_REPLIES,
+        STATUS_SUCCESS,
+        STATUS_FAILED,
+    }:
+        raise ValueError(f"resume state has invalid status: {state.get('status')!r}")
+
+    replies = state.get("replies")
+    if not isinstance(replies, list):
+        raise ValueError("resume state replies must be a list")
+    for index, entry in enumerate(replies, 1):
+        if not isinstance(entry, dict):
+            raise ValueError(f"resume reply #{index} is not an object")
+        canonical_comment_id(entry.get("comment_id"))
+        body = entry.get("body")
+        marker = entry.get("marker")
+        if not isinstance(body, str) or not isinstance(marker, str) or marker not in body:
+            raise ValueError(f"resume reply #{index} has invalid body/marker")
+        body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        if entry.get("body_sha256") != body_hash:
+            raise ValueError(f"resume reply #{index} body hash mismatch")
+        if entry.get("status") not in {"pending", "sent"}:
+            raise ValueError(f"resume reply #{index} has invalid status")
+
+    git_state = state.get("git")
+    if git_state is not None:
+        if not isinstance(git_state, dict):
+            raise ValueError("resume state git field must be an object or null")
+        for field in ("base_sha", "old_head"):
+            value = git_state.get(field)
+            if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{40,64}", value) is None:
+                raise ValueError(f"resume state git.{field} is not a full lowercase OID")
+        new_head = git_state.get("new_head")
+        if new_head is not None and (
+            not isinstance(new_head, str) or re.fullmatch(r"[0-9a-f]{40,64}", new_head) is None
+        ):
+            raise ValueError("resume state git.new_head is not a full lowercase OID or null")
+        if not isinstance(git_state.get("push_url"), str) or not git_state["push_url"]:
+            raise ValueError("resume state is missing exact git.push_url")
+        if _normalize_git_repo_url(git_state["push_url"]) is None:
+            raise ValueError("resume state git.push_url is not a supported Git URL")
+        source_ref = git_state.get("source_ref")
+        if not isinstance(source_ref, str) or not source_ref.startswith("refs/heads/"):
+            raise ValueError("resume state has invalid git.source_ref")
+        if git_state.get("push_status") not in {"pending", "verified"}:
+            raise ValueError("resume state has invalid git.push_status")
+        if state["status"] in {STATUS_PENDING_PUSH, STATUS_PENDING_REPLIES, STATUS_SUCCESS} and new_head is None:
+            raise ValueError(f"resume state status {state['status']} requires git.new_head")
+        if state["status"] in {STATUS_PENDING_REPLIES, STATUS_SUCCESS} and git_state["push_status"] != "verified":
+            raise ValueError(f"resume state status {state['status']} requires a verified push")
+    elif state["status"] == STATUS_PENDING_PUSH:
+        raise ValueError("resume state pending_push requires git metadata")
+    if state["status"] == STATUS_SUCCESS and any(entry["status"] != "sent" for entry in replies):
+        raise ValueError("resume state success requires every reply to be sent")
+    state["state_file"] = str(path)
+    return state
+
+
+def _remote_reply_for_entry(entry: dict, comments: list[dict]) -> dict | None:
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        body = comment.get("body")
+        if not isinstance(body, str):
+            continue
+        if entry["marker"] in body or hashlib.sha256(body.encode("utf-8")).hexdigest() == entry["body_sha256"]:
+            return comment
+    return None
+
+
+def reconcile_state_replies(api: RepairService, state_path: str, state: dict) -> None:
+    pending = [entry for entry in state["replies"] if entry["status"] == "pending"]
+    if not pending:
+        return
+    comments = list_pr_comments(api, state["pr_number"])
+    changed = False
+    for entry in pending:
+        remote_reply = _remote_reply_for_entry(entry, comments)
+        if remote_reply is None:
+            continue
+        entry["status"] = "sent"
+        entry["reply_id"] = remote_reply.get("id")
+        entry["last_error"] = None
+        changed = True
+    if changed:
+        write_workflow_state(state_path, state)
+
+
+def send_state_replies(api: RepairService, state_path: str, state: dict) -> bool:
+    try:
+        reconcile_state_replies(api, state_path, state)
+    except Exception as error:
+        state["last_error"] = f"reply reconciliation failed before send: {error}"
+        write_workflow_state(state_path, state)
+        raise
+    pending_count = sum(entry["status"] == "pending" for entry in state["replies"])
+    if pending_count:
+        print(f"\n💬 发送 {pending_count} 条待处理回复...")
+
+    for entry in state["replies"]:
+        if entry["status"] != "pending":
+            continue
+        entry["attempts"] += 1
+        entry["last_error"] = None
+        write_workflow_state(state_path, state)
+        try:
+            result = api.reply_to_comment(
+                state["pr_number"],
+                entry["comment_id"],
+                entry["body"],
+                reply_mode=state["reply_mode"],
+            )
+        except KeyboardInterrupt as error:
+            entry["last_error"] = str(error)
+            state["status"] = STATUS_PENDING_REPLIES
+            state["last_error"] = f"reply to comment {entry['comment_id']} interrupted: {error}"
+            write_workflow_state(state_path, state)
+            raise
+        except Exception as error:
+            entry["last_error"] = str(error)
+            state["status"] = STATUS_PENDING_REPLIES
+            state["last_error"] = f"reply to comment {entry['comment_id']} failed: {error}"
+            write_workflow_state(state_path, state)
+            print(f"  ✗ 回复评论 #{entry['comment_id']} 失败: {error}")
+            continue
+
+        result = result if isinstance(result, dict) else {}
+        entry["status"] = "sent"
+        entry["reply_id"] = result.get("note_id") or result.get("id")
+        entry["last_error"] = None
+        state["last_error"] = None
+        write_workflow_state(state_path, state)
+        print(f"  ✓ 已回复评论 #{entry['comment_id']}")
+
+    completed = all(entry["status"] == "sent" for entry in state["replies"])
+    state["status"] = STATUS_SUCCESS if completed else STATUS_PENDING_REPLIES
+    if completed:
+        state["last_error"] = None
+    write_workflow_state(state_path, state)
+    return completed
+
+
+def print_resume_state(state_path: str, state: dict) -> None:
+    summary = {
+        "state_file": str(Path(state_path).resolve()),
+        "status": state["status"],
+        "pr_number": state["pr_number"],
+        "reply_counts": _reply_counts(state),
+    }
+    print(f"   RESUME_STATE={json.dumps(summary, ensure_ascii=False, sort_keys=True)}")
+
+
+def execute_fix_batch(args, api: RepairService, fixes: list[dict]) -> str:
+    """Validate, apply, autosquash, optionally push, and finally reply."""
+    default_fixup_target = getattr(args, "fixup_target", None)
+
+    # Complete schema validation happens before Git state checks or file snapshots.
+    try:
+        for index, fix in enumerate(fixes, 1):
+            try:
+                validate_fix_fields(fix, default_fixup_target)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"fix #{index}: {error}") from error
+    except ValueError as error:
+        print(f"\n❌ 修复方案校验失败: {error}")
+        return STATUS_FAILED
+
+    has_code_fixes = any(fix.get("type", "code_fix") in CODE_FIX_TYPES for fix in fixes)
+    context = None
+    try:
+        if has_code_fixes:
+            context = load_pr_git_context(args.work_dir, api, args.pr)
+            if getattr(args, "base_branch", None):
+                print(
+                    "  ℹ️  --base-branch 已忽略; 本次范围校验和 autosquash 固定使用 "
+                    f"PR metadata base SHA {context.base_sha[:12]}"
+                )
+        plans = build_fix_plan(
+            fixes,
+            args.work_dir,
+            context.base_sha if context else None,
+            default_fixup_target,
+        )
+        comment_metadata = validate_pr_comment_ids(
+            api,
+            args.pr,
+            [payload["comment_id"] for plan in plans for payload in planned_reply_payloads(plan)],
+        )
+        if has_code_fixes and not args.dry_run:
+            code_paths = [plan.rel_path for plan in plans if plan.rel_path is not None]
+            ensure_no_rebase_in_progress(args.work_dir)
+            ensure_clean_index(args.work_dir)
+            ensure_clean_worktree(args.work_dir)
+            ensure_paths_tracked(args.work_dir, code_paths)
+    except (Exception, KeyboardInterrupt) as error:
+        print(f"\n❌ 写入前校验失败: {error}")
+        return STATUS_FAILED
+
+    reply_specs = build_reply_specs(plans, args.ai_model, comment_metadata)
+
+    if args.dry_run:
+        for plan in plans:
+            if plan.fix_type == "reply_only":
+                print(f"  [Dry Run] 将回复评论 #{plan.payload['comment_id']}")
+            else:
+                print(
+                    f"  [Dry Run] 将处理 {plan.rel_path} 并 fixup 到 "
+                    f"{plan.target_sha[:12] if plan.target_sha else 'N/A'}"
+                )
+        return STATUS_SUCCESS
+
+    try:
+        state_path, state = create_workflow_state(args, api, reply_specs, context)
+    except Exception as error:
+        print(f"\n❌ 无法创建可恢复状态文件: {error}")
+        return STATUS_FAILED
+
+    if not has_code_fixes:
+        try:
+            with handle_termination_signals():
+                completed = send_state_replies(api, state_path, state)
+        except (Exception, KeyboardInterrupt) as error:
+            state["status"] = STATUS_PENDING_REPLIES
+            state["last_error"] = str(error)
+            write_workflow_state(state_path, state)
+            print(f"\n⏸️  回复被中断，可恢复状态已保存: {error}")
+            print_resume_state(state_path, state)
+            return STATUS_PENDING_REPLIES
+        if not completed:
+            print("\n⏸️  状态: pending_replies")
+            print_resume_state(state_path, state)
+            return STATUS_PENDING_REPLIES
+        print_resume_state(state_path, state)
+        return STATUS_SUCCESS
+
+    code_plans = [plan for plan in plans if plan.fix_type in CODE_FIX_TYPES]
+    groups: dict[str, list[PlannedFix]] = {}
+    for plan in code_plans:
+        if plan.target_sha is None:
+            raise RuntimeError("validated code fix unexpectedly has no target SHA")
+        groups.setdefault(plan.target_sha, []).append(plan)
+
+    try:
+        with (
+            handle_termination_signals(),
+            FixTransaction(
+                args.work_dir,
+                context.base_sha,
+                code_plans,
+                expected_head=context.head_sha,
+            ) as transaction,
+        ):
+            for target_sha, group in groups.items():
+                for plan in group:
+                    apply_planned_fix(plan, args.work_dir, context.base_sha)
+                transaction.commit_group(target_sha, group)
+            transaction.autosquash()
+            new_head = _resolve_commit(args.work_dir, "HEAD", "rewritten HEAD")
+            state["git"]["new_head"] = new_head
+            state["status"] = STATUS_PENDING_PUSH
+            state["last_error"] = None
+            write_workflow_state(state_path, state)
+    except RepoStateNotNormalizedError as error:
+        state["status"] = STATUS_FAILED
+        state["last_error"] = str(error)
+        write_workflow_state(state_path, state)
+        print(f"\n❌ 修复事务失败且仓库未完全归位: {error}")
+        print_resume_state(state_path, state)
+        return STATUS_FAILED
+    except (Exception, KeyboardInterrupt) as error:
+        state["status"] = STATUS_FAILED
+        state["last_error"] = str(error)
+        write_workflow_state(state_path, state)
+        print(f"\n❌ 修复事务失败; 已恢复运行前的 HEAD、index、文件内容和权限: {error}")
+        print_resume_state(state_path, state)
+        return STATUS_FAILED
+
+    if not getattr(args, "push", False):
+        print("\n⏸️  状态: pending_push")
+        print("   本地 autosquash 已完成，尚未回复评论。使用状态文件恢复并完成推送/回复:")
+        print(f"   python3 review_resolution.py --resume {shlex.quote(state_path)}")
+        print_resume_state(state_path, state)
+        return STATUS_PENDING_PUSH
+
+    try:
+        with handle_termination_signals():
+            new_head = push_and_verify(args.work_dir, context)
+    except (Exception, KeyboardInterrupt) as error:
+        state["status"] = STATUS_PENDING_PUSH
+        state["last_error"] = str(error)
+        write_workflow_state(state_path, state)
+        print("\n⏸️  状态: pending_push")
+        print(f"   自动推送未完成或远端状态无法确认，未发送任何回复: {error}")
+        print(f"   使用状态文件安全检查远端并恢复: python3 review_resolution.py --resume {shlex.quote(state_path)}")
+        print_resume_state(state_path, state)
+        return STATUS_PENDING_PUSH
+
+    state["git"]["new_head"] = new_head
+    state["git"]["push_status"] = "verified"
+    state["status"] = STATUS_PENDING_REPLIES
+    state["last_error"] = None
+    write_workflow_state(state_path, state)
+    print(
+        f"\n✅ 已推送并验证 {context.source_push_url} {context.source_ref}: {context.head_sha[:12]} -> {new_head[:12]}"
+    )
+    try:
+        with handle_termination_signals():
+            completed = send_state_replies(api, state_path, state)
+    except (Exception, KeyboardInterrupt) as error:
+        state["status"] = STATUS_PENDING_REPLIES
+        state["last_error"] = str(error)
+        write_workflow_state(state_path, state)
+        print(f"\n⏸️  远端代码已更新，但回复阶段被中断: {error}")
+        print_resume_state(state_path, state)
+        return STATUS_PENDING_REPLIES
+    if not completed:
+        print("\n⏸️  远端代码已更新，部分回复仍待发送")
+        print_resume_state(state_path, state)
+        return STATUS_PENDING_REPLIES
+    print_resume_state(state_path, state)
+    return STATUS_SUCCESS
 
 
 def mode_fetch_comments(args, api: RepairService):
@@ -225,11 +1711,14 @@ def mode_fetch_comments(args, api: RepairService):
     print("  2. 生成修复方案 (fixes.json)")
     print("  3. ⚠️ 将修复方案以用户可读的格式展示给用户确认")
     print("  4. 用户确认后，运行提交命令")
-    print(f"\n     python3 review_resolution.py --pr {args.pr} --apply-fixes fixes.json --ai-model <your-model-name>")
+    print(
+        f"\n     python3 review_resolution.py --pr {args.pr} --apply-fixes fixes.json "
+        "--push --ai-model <your-model-name>"
+    )
 
 
-def mode_apply_fixes(args, api: RepairService):
-    """模式2: 应用修复方案"""
+def mode_apply_fixes(args, api: RepairService) -> str:
+    """模式2: 应用修复方案，返回 success / failed / pending 状态。"""
     print("\n" + "=" * 60)
     print("🔧 模式: 应用修复方案")
     print("=" * 60)
@@ -238,101 +1727,112 @@ def mode_apply_fixes(args, api: RepairService):
     with open(args.apply_fixes, encoding="utf-8") as f:
         fixes = json.load(f)
 
+    # 顶层必须是修复对象的数组: dict 会被 len() 计键、逐键迭代产生垃圾结果
+    if not isinstance(fixes, list) or not all(isinstance(fx, dict) for fx in fixes):
+        print("\n❌ fixes 文件顶层必须是修复对象 (object) 的 JSON 数组")
+        return STATUS_FAILED
+    if not fixes:
+        print("\n❌ fixes 文件为空数组; 没有任何需要应用的修复")
+        return STATUS_FAILED
+
     print(f"\n加载了 {len(fixes)} 个修复方案")
-
-    results = []
-    files_fixed = []
-
-    for i, fix in enumerate(fixes, 1):
-        print(f"\n[{i}/{len(fixes)}] 处理 {fix.get('file_path', 'N/A')}")
-
-        try:
-            fix_type = fix.get("type", "code_fix")
-            reply = ""  # 初始化 reply
-
-            if fix_type == "code_fix":
-                if args.dry_run:
-                    print(f"  [Dry Run] 将修复: {fix['file_path']}")
-                    reply = format_fix_reply(fix, args.ai_model)
-                else:
-                    apply_code_fix(fix["file_path"], fix["original_code"], fix["fixed_code"])
-                    files_fixed.append(fix["file_path"])
-                    reply = format_fix_reply(fix, args.ai_model)
-
-            elif fix_type == "delete_lines":
-                if args.dry_run:
-                    print(f"  [Dry Run] 将删除行: {fix['file_path']}")
-                    reply = format_delete_lines_reply(fix, args.ai_model)
-                else:
-                    delete_specific_lines(fix["file_path"], fix["delete_lines"])
-                    files_fixed.append(fix["file_path"])
-                    reply = format_delete_lines_reply(fix, args.ai_model)
-
-            elif fix_type == "revert_file":
-                if args.dry_run:
-                    print(f"  [Dry Run] 将回退: {fix['file_path']}")
-                    reply = format_revert_reply(fix, args.ai_model)
-                else:
-                    revert_file(fix["file_path"])
-                    files_fixed.append(fix["file_path"])
-                    reply = format_revert_reply(fix, args.ai_model)
-
-            elif fix_type == "reply_only":
-                reply = format_logic_reply(fix, args.ai_model)
-
-            else:
-                print(f"  ⚠️ 跳过未知的修复类型: {fix_type}")
-                results.append(
-                    {
-                        "file": fix.get("file_path", "N/A"),
-                        "comment_id": fix.get("comment_id"),
-                        "has_fix": False,
-                        "error": f"未知的修复类型: {fix_type}",
-                    }
-                )
-                continue
-
-            # 回复评论
-            if not args.dry_run and reply:
-                comment_id = fix.get("comment_id")
-                if comment_id:
-                    api.reply_to_comment(args.pr, comment_id, reply, reply_mode=args.reply_mode)
-                    print(f"  ✓ 已回复评论 #{comment_id}")
-
-            results.append(
-                {
-                    "file": fix.get("file_path", "N/A"),
-                    "comment_id": fix.get("comment_id"),
-                    "has_fix": True,
-                    "error": None,
-                }
-            )
-
-        except Exception as e:
-            print(f"  ✗ 处理失败: {e}")
-            results.append(
-                {
-                    "file": fix.get("file_path", "N/A"),
-                    "comment_id": fix.get("comment_id"),
-                    "has_fix": False,
-                    "error": str(e),
-                }
-            )
-
-    # 提交代码
-    if files_fixed and not args.dry_run:
-        print("\n📦 提交修复...")
-        commit_fixes(args.work_dir, args.ai_model)
+    status = execute_fix_batch(args, api, fixes)
 
     print("\n" + "=" * 60)
-    print("✅ 任务完成!")
+    if status == STATUS_SUCCESS:
+        print("✅ 任务完成!")
+    elif status == STATUS_PENDING_PUSH:
+        print("⏸️  任务等待推送 (pending_push); 未发送修复完成回复")
+    elif status == STATUS_PENDING_REPLIES:
+        print("⏸️  任务等待恢复回复 (pending_replies); 请使用输出的 --resume 状态文件")
+    else:
+        print("❌ 任务未完成 (详见上方日志)")
+    print("=" * 60)
+    print(f"\n🔗 PR 链接: {api.get_pr_url(args.pr)}")
+    return status
+
+
+def validate_resume_context(args, api: RepairService, state: dict) -> None:
+    repository = _state_repository(api)
+    if repository != state["repository"]:
+        raise ValueError(
+            "resume state repository does not match the configured SDK context: "
+            f"{state['repository']['owner']}/{state['repository']['repo']} != "
+            f"{repository['owner']}/{repository['repo']}"
+        )
+    if args.pr is not None and args.pr != state["pr_number"]:
+        raise ValueError(f"--pr {args.pr} does not match resume state PR #{state['pr_number']}")
+    args.pr = state["pr_number"]
+    if args.work_dir is not None and str(Path(args.work_dir).resolve()) != state["work_dir"]:
+        raise ValueError(
+            f"--work-dir resolves to {Path(args.work_dir).resolve()}, but resume state requires {state['work_dir']}"
+        )
+    args.work_dir = state["work_dir"]
+
+
+def validate_resume_pr_metadata(api: RepairService, state: dict) -> None:
+    git_state = state.get("git")
+    if git_state is None:
+        return
+    pr = api.client.get_pull_request(state["pr_number"])
+    if not isinstance(pr, dict) or not isinstance(pr.get("head"), dict):
+        raise RuntimeError("PR metadata response is missing head data during resume")
+    head = pr["head"]
+    head_sha = head.get("sha")
+    head_branch = head.get("ref")
+    head_repo = head.get("repo")
+    if not isinstance(head_sha, str) or head_sha.lower() not in {git_state["old_head"], git_state["new_head"]}:
+        raise RuntimeError("current PR head is neither the recorded old_head nor new_head")
+    if not isinstance(head_branch, str) or f"refs/heads/{head_branch}" != git_state["source_ref"]:
+        raise RuntimeError("current PR source ref does not match the resume state")
+    if not isinstance(head_repo, dict):
+        raise RuntimeError("current PR metadata is missing head.repo")
+    push_identity = _normalize_git_repo_url(git_state["push_url"])
+    if push_identity not in _repository_identities(head_repo):
+        raise RuntimeError("resume state push URL no longer matches the PR source repository")
+
+
+def mode_resume(args, api: RepairService) -> str:
+    """Resume an atomically checkpointed pending push/reply workflow."""
+    print("\n" + "=" * 60)
+    print("↻ 模式: 恢复待处理事务")
     print("=" * 60)
 
-    print("\n📊 统计:")
-    success_count = sum(1 for r in results if r["has_fix"])
-    print(f"  成功: {success_count}/{len(results)}")
-    print(f"  失败: {len(results) - success_count}/{len(results)}")
-    print(f"\n🔗 PR 链接: {api.get_pr_url(args.pr)}")
+    state_path = str(Path(args.resume).resolve())
+    state = load_workflow_state(state_path)
+    validate_resume_context(args, api, state)
+    if state["status"] in {"applying", STATUS_FAILED}:
+        raise RuntimeError(
+            f"state status {state['status']} is not resumable; no irreversible push/reply checkpoint is pending"
+        )
+
+    try:
+        with handle_termination_signals():
+            reconcile_state_replies(api, state_path, state)
+            pending_comment_ids = [entry["comment_id"] for entry in state["replies"] if entry["status"] == "pending"]
+            if pending_comment_ids:
+                validate_pr_comment_ids(api, state["pr_number"], pending_comment_ids)
+            validate_resume_pr_metadata(api, state)
+            resume_push(state_path, state)
+            completed = send_state_replies(api, state_path, state)
+    except (Exception, KeyboardInterrupt) as error:
+        if state.get("git") and state["git"].get("push_status") != "verified":
+            state["status"] = STATUS_PENDING_PUSH
+        else:
+            state["status"] = STATUS_PENDING_REPLIES
+        state["last_error"] = str(error)
+        write_workflow_state(state_path, state)
+        print(f"\n⏸️  恢复未完成: {error}")
+        print_resume_state(state_path, state)
+        return state["status"]
+
+    if not completed:
+        print("\n⏸️  部分回复仍待发送")
+        print_resume_state(state_path, state)
+        return STATUS_PENDING_REPLIES
+    print("\n✅ 推送已验证，所有回复均已完成")
+    print_resume_state(state_path, state)
+    return STATUS_SUCCESS
 
 
 def _load_reply_body(args) -> str:
@@ -351,6 +1851,7 @@ def mode_reply_comment(args, api: RepairService):
     print("=" * 60)
 
     reply_body = add_ai_signature(_load_reply_body(args), args.ai_model)
+    validate_pr_comment_ids(api, args.pr, [args.reply_comment])
     if args.dry_run:
         print(f"\n[Dry Run] 将回复评论 #{args.reply_comment}:\n{reply_body}")
         return
@@ -391,141 +1892,10 @@ def mode_resolve_comment(args, api: RepairService):
         api.resolve_discussion(args.pr, args.resolve_discussion, resolved)
         print(f"\n✅ 已更新 discussion {args.resolve_discussion}: resolved={resolved}")
     else:
+        validate_pr_comment_ids(api, args.pr, [args.resolve_comment])
         api.resolve_comment(args.pr, args.resolve_comment, resolved)
         print(f"\n✅ 已更新评论 #{args.resolve_comment}: resolved={resolved}")
     print(f"🔗 PR 链接: {api.get_pr_url(args.pr)}")
-
-
-def mode_auto(args, api: RepairService, config: dict):
-    """模式3: 自动修复（调用LLM）"""
-    print("\n" + "=" * 60)
-    print("🤖 模式: 自动修复（LLM驱动）")
-    print("=" * 60)
-
-    # 检查 LLM 配置
-    if not config.get("anthropic", {}).get("apiKey"):
-        print("\n❌ 自动模式需要配置 Anthropic API Key")
-        print("   请在 config.json 中添加:")
-        print("   {")
-        print('     "anthropic": {')
-        print('       "apiKey": "sk-ant-..."')
-        print("     }")
-        print("   }")
-        print("\n或者使用手动模式:")
-        print(f"   python3 review_resolution.py --pr {args.pr} --fetch-comments")
-        return
-
-    # 设置 API Key
-    api.anthropic_api_key = config["anthropic"]["apiKey"]
-    api.anthropic_base_url = config["anthropic"].get("baseUrl", "")
-    api.llm_model = args.llm_model
-
-    print("\n📝 获取未解决检视意见...")
-    comments = api.get_review_threads(
-        args.pr,
-        include_self_comments=args.include_self_comments,
-        include_bot_comments=args.include_bot_comments,
-    )
-
-    if not comments:
-        print("\n✅ 没有需要修复的检视意见")
-        return
-
-    print(f"\n找到 {len(comments)} 条未解决检视意见")
-
-    results = []
-    files_fixed = []
-
-    for i, comment in enumerate(comments, 1):
-        print(f"\n[{i}/{len(comments)}] 处理 {comment['path']}:{comment.get('line', 1)}")
-
-        try:
-            # 获取文件上下文
-            file_path = os.path.join(args.work_dir, comment["path"])
-            line_number = comment.get("line") or 1
-
-            try:
-                file_content = api.get_file_context(file_path, line_number)
-            except Exception:
-                file_content = ""
-
-            # 调用 LLM 生成修复
-            print("  ⏳ 调用 LLM 生成修复方案...")
-            fix = api.generate_fix(
-                {
-                    "file_path": comment["path"],
-                    "file_content": file_content,
-                    "review_comment": comment["body"],
-                    "line_number": line_number,
-                    "pr_diff": "",
-                }
-            )
-
-            if args.dry_run:
-                print(f"  [Dry Run] LLM 建议: {fix.fix_description or '仅回复'}")
-                continue
-
-            # 应用修复
-            if fix.has_fix:
-                if fix.needs_delete_lines:
-                    delete_specific_lines(file_path, fix.delete_lines)
-                elif fix.needs_revert_file:
-                    revert_file(file_path)
-                else:
-                    apply_code_fix(file_path, fix.original_code, fix.fixed_code)
-
-                files_fixed.append(comment["path"])
-
-                # 格式化回复
-                if fix.needs_delete_lines:
-                    reply = format_delete_lines_reply(
-                        {
-                            "fix_description": fix.fix_description,
-                            "delete_lines": fix.delete_lines,
-                        },
-                        args.ai_model,
-                    )
-                elif fix.needs_revert_file:
-                    reply = format_revert_reply({"fix_description": fix.fix_description}, args.ai_model)
-                else:
-                    reply = format_fix_reply(
-                        {
-                            "fix_description": fix.fix_description,
-                            "file_path": comment["path"],
-                            "original_code": fix.original_code,
-                            "fixed_code": fix.fixed_code,
-                        },
-                        args.ai_model,
-                    )
-            else:
-                reply = format_logic_reply({"reply": fix.reason}, args.ai_model)
-
-            # 回复评论
-            api.reply_to_comment(args.pr, comment["id"], reply, reply_mode=args.reply_mode)
-            print("  ✓ 已回复评论")
-
-            results.append({"file": comment["path"], "has_fix": fix.has_fix, "error": None})
-
-        except Exception as e:
-            print(f"  ✗ 处理失败: {e}")
-            results.append(
-                {
-                    "file": comment.get("path", "unknown"),
-                    "has_fix": False,
-                    "error": str(e),
-                }
-            )
-
-    # 提交代码
-    if files_fixed and not args.dry_run:
-        print("\n📦 提交修复...")
-        commit_fixes(args.work_dir, args.ai_model)
-
-    print("\n" + "=" * 60)
-    print("✅ 任务完成!")
-    print("=" * 60)
-
-    print(f"\n🔗 PR 链接: {api.get_pr_url(args.pr)}")
 
 
 def main():
@@ -546,7 +1916,7 @@ def main():
         metavar="JSON_FILE",
         help="模式2: 应用修复方案（从JSON读取）",
     )
-    mode_group.add_argument("--auto", action="store_true", help="模式3: 自动修复（调用LLM）")
+    mode_group.add_argument("--resume", type=str, metavar="STATE_FILE", help="模式3: 恢复 pending push/replies")
     mode_group.add_argument("--reply-comment", type=int, help="模式4: 回复指定 PR review 评论 ID")
     mode_group.add_argument("--resolve-comment", type=int, help="模式5: 按评论 ID 修改其 discussion 解决状态")
     mode_group.add_argument("--resolve-discussion", type=str, help="模式5: 按 discussion ID 修改解决状态")
@@ -561,7 +1931,24 @@ def main():
     parser.add_argument("--owner", type=str, help="目标仓库 owner，覆盖 config.json")
     parser.add_argument("--repo", type=str, help="目标仓库 repo，覆盖 config.json")
     parser.add_argument("--url", type=str, help="PR 链接，用于自动解析 owner/repo/PR 编号")
-    parser.add_argument("--work-dir", type=str, default=".", help="工作目录 (默认: 当前目录)")
+    parser.add_argument("--work-dir", type=str, default=None, help="工作目录 (默认: 当前目录；--resume 使用状态文件值)")
+    parser.add_argument(
+        "--fixup-target",
+        type=str,
+        default=None,
+        help="缺少逐项 fixup_target 时的显式批次 fallback (无默认值)",
+    )
+    parser.add_argument(
+        "--base-branch",
+        type=str,
+        default=None,
+        help="兼容旧命令，已忽略；脚本始终使用 PR metadata base SHA",
+    )
+    parser.add_argument(
+        "--push",
+        action="store_true",
+        help="确认使用 PR head 元数据和显式 OID lease 推送；成功验证远端后才回复评论",
+    )
     parser.add_argument("--reply-body", type=str, help="直接回复指定评论的正文")
     parser.add_argument("--reply-file", type=str, help="从文件读取直接回复正文")
     parser.add_argument(
@@ -594,29 +1981,35 @@ def main():
         help="输出目录 (默认: ./tmp)",
     )
     parser.add_argument("--ai-model", type=str, default="ai", help="AI模型名称，用于签名 (默认: ai)")
-    parser.add_argument(
-        "--llm-provider",
-        type=str,
-        default="anthropic",
-        help="LLM 提供商 (默认: anthropic)",
-    )
-    parser.add_argument(
-        "--llm-model",
-        type=str,
-        default="claude-sonnet-4-20250514",
-        help="LLM 模型名称 (默认: claude-sonnet-4-20250514)",
-    )
     parser.add_argument("--dry-run", action="store_true", help="仅显示计划，不执行")
 
     args = parser.parse_args()
 
+    if args.resume:
+        try:
+            resume_preview = load_workflow_state(args.resume)
+        except Exception as e:
+            print(f"\n❌ 无法读取恢复状态: {e}")
+            sys.exit(1)
+        state_repository = resume_preview["repository"]
+        if args.owner is None:
+            args.owner = state_repository["owner"]
+        if args.repo is None:
+            args.repo = state_repository["repo"]
+        if args.pr is None:
+            args.pr = resume_preview["pr_number"]
+        if args.work_dir is None:
+            args.work_dir = resume_preview["work_dir"]
+    elif args.work_dir is None:
+        args.work_dir = "."
+
     # 警告：如果使用默认的 ai-model，提醒指定真实模型名称
-    if args.ai_model == "ai":
+    if args.ai_model == "ai" and not args.resume:
         print("\n⚠️  警告: 未指定 --ai-model 参数，将使用默认值 'ai'")
         print("   建议指定真实模型名称，例如：")
-        print("   --ai-model claude-sonnet-4")
-        print("   --ai-model gpt-4")
-        print("   --ai-model gemini-pro")
+        print("   --ai-model glm-5.2")
+        print("   --ai-model gpt-5.6-sol")
+        print("   --ai-model claude-fable-5")
         print()
 
     # 默认行为：如果没有指定任何模式，则使用提取信息模式（AI Agent 友好）
@@ -624,7 +2017,7 @@ def main():
         [
             args.fetch_comments,
             args.apply_fixes,
-            args.auto,
+            args.resume,
             args.reply_comment,
             args.resolve_comment,
             args.resolve_discussion,
@@ -639,7 +2032,7 @@ def main():
 
     # 加载配置
     try:
-        config = load_config(args.config)
+        load_config(args.config)
     except FileNotFoundError:
         print(f"\n❌ 配置文件不存在: {args.config}")
         sys.exit(1)
@@ -653,34 +2046,50 @@ def main():
         print(f"\n❌ 解析仓库上下文失败: {e}")
         sys.exit(1)
 
-    if args.pr is None:
+    if args.pr is None and not args.resume:
         args.pr = parsed_url.get("pr_number")
-    if args.pr is None:
+    if args.pr is None and not args.resume:
         print("\n❌ 缺少 PR 编号。请通过 --pr 指定，或传入包含 PR 编号的 --url。")
         sys.exit(1)
 
     api = AtomGitClient(sdk_config)
     repair_service = RepairService(api)
 
-    print(f"\n📋 PR: #{args.pr}")
+    if args.pr is not None:
+        print(f"\n📋 PR: #{args.pr}")
+    else:
+        print(f"\n📋 恢复状态: {Path(args.resume).resolve()}")
     print(f"🏠 仓库: {api.config.owner}/{api.config.repo}")
     if args.url:
         print(f"🔗 链接: {args.url}")
     print(f"🤖 AI模型: {args.ai_model}")
-
-    if args.auto:
-        print(f"🧠 LLM模型: {args.llm_model} (provider: {args.llm_provider})")
 
     if args.dry_run:
         print("⚠️  Dry Run 模式（仅显示计划）")
 
     # 根据模式执行
     if args.fetch_comments:
-        mode_fetch_comments(args, repair_service)
+        try:
+            mode_fetch_comments(args, repair_service)
+        except Exception as e:
+            print(f"\n❌ 获取检视意见失败: {e}")
+            sys.exit(1)
     elif args.apply_fixes:
-        mode_apply_fixes(args, repair_service)
-    elif args.auto:
-        mode_auto(args, repair_service, config)
+        status = mode_apply_fixes(args, repair_service)
+        if status == STATUS_FAILED:
+            sys.exit(1)
+        if status in {STATUS_PENDING_PUSH, STATUS_PENDING_REPLIES}:
+            sys.exit(2)
+    elif args.resume:
+        try:
+            status = mode_resume(args, repair_service)
+        except Exception as e:
+            print(f"\n❌ 恢复失败: {e}")
+            sys.exit(1)
+        if status == STATUS_FAILED:
+            sys.exit(1)
+        if status in {STATUS_PENDING_PUSH, STATUS_PENDING_REPLIES}:
+            sys.exit(2)
     elif args.reply_comment:
         try:
             mode_reply_comment(args, repair_service)

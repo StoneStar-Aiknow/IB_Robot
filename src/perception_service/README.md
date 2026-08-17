@@ -176,10 +176,10 @@ embodied:
 ## 7. 抓取检测与分割
 
 抓取链使用 `inference_service.model_service_node` 承载强类型服务，不包含订阅相机快照的专用兼容节点。首次使用 PC Torch
-deployment 前安装可选依赖并下载模型：
+deployment 前安装默认依赖并下载模型：
 
 ```bash
-./scripts/setup.sh --with-perception
+./scripts/setup.sh
 ./scripts/download_perception_models.sh
 ```
 
@@ -255,20 +255,28 @@ provenance。Ascend OM 只能通过 schema-v2 manifest named deployment 进入 s
 wrapper 的 `backend=ascend_om` 路径不再提供。CUDA 不可用时必须在 SSOT 中选择另一个已经验证的 named
 deployment，节点不会自动切换 backend。
 
-感知模型与 ACT/PI0.5 使用相同的 bundle-first 结构。下载脚本直接生成四个 bundle 根目录：
-`models/perception/sam2.1_hiera_tiny/`、`models/perception/ram_plus_swin_large_14m/`、
-`models/perception/siglip2_so400m_patch14_384/` 和 `models/perception/grounded_sam2_swint_ogc/`。每个目录包含
+感知模型与 ACT/PI0.5 使用相同的 bundle-first 结构。下载脚本直接在 `models/` 顶层生成四个 bundle
+根目录：`models/sam2.1_hiera_tiny/`、`models/ram_plus_swin_large_14m/`、
+`models/siglip2_so400m_patch14_384/` 和 `models/grounded_sam2_swint_ogc/`。每个目录包含
 `inference_manifest.json`、`assets/adapter.json`、模型资产和 `torch_cpu`/`torch_cuda` named deployment。
 Grounding DINO Swin-T OGC 的网络结构配置由 `perception_service.grounding_dino_config` 常量绑定到软件版本，
 不作为模型资产复制进 bundle；bundle 仅保存 checkpoint、文本编码器和 SAM2 checkpoint 等运行资产。
 
-SigLIP2 image/text 服务共享同一 bundle 与 embedding identity，但仍由独立进程加载独立 session。RAM++ 仍从
-`ram_models/recognize-anything/` 导入上游 `ram` 源码；源码不是模型资产。ONNX、OM 等未验证转换结果只能放在
-bundle 的 `model_utils_work/`，通过 conformance 与 promotion 后才可复制到不可变
+SigLIP2 image/text 服务共享同一 bundle 与 embedding identity，但仍由独立进程加载独立 session。RAM++ runtime
+由 `third_party/wheels/recognize-anything/` 中固定上游 commit 和补丁构建的 `ibrobot-ram` wheel 提供；Grounding-DINO
+runtime 由 `third_party/wheels/groundingdino/` 中固定上游 commit 和补丁构建的 `ibrobot-groundingdino` 纯 Python wheel
+提供（Transformers 5 兼容补丁已固化进源码，运行时不再 monkey-patch `transformers.BertModel`）；源码不是模型
+资产。ONNX、OM 等未验证转换结果只能放在 bundle 外的
+`models/_work/<bundle>/candidates/`，通过 conformance 与 promotion 后才可复制到不可变
 `artifacts/<backend>/<deployment>/generations/<uuid>/` 并注册为 named deployment。
 
+`RecognizeTags` 的 mask 输出按 mask 顺序扁平化，`mask_tag_counts` 描述每个 mask 对应的 slice。Adapter 固定过滤
+RAM++ 颜色属性；调用方通过请求中的 `excluded_labels` 提供场景策略，服务在过滤后按 `max_mask_candidates`
+截断置信度有序候选。generic host 不读取 robot_config，也不内置办公室或实验室业务 blacklist。整图 tags 仅用于
+帧级诊断，不用于替代局部物体标签。
+
 经 ABI 审核的 compiled-only 资产由 `perception_service.package_ascend_perception_bundles` 从
-`model_utils_work/candidates/ascend_*` 打包。SAM2 和 SigLIP2 提供 `ascend_310p`、`ascend_310b` deployment；
+`models/_work/<bundle>/candidates/ascend_*` 打包。SAM2 和 SigLIP2 提供 `ascend_310p`、`ascend_310b` deployment；
 Grounding DINO 当前只提供固定 720x1280、文本长度 8 的 `ascend_310p` deployment。多 OM pipeline 的中间 tensor
 通过 manifest `device_links` 保持在设备侧，service adapter 只负责模型语义预处理与最终输出后处理。
 
@@ -298,15 +306,21 @@ generic 感知服务不读取深度，因此其 `Detection2D` 只保证 bbox 与
 板端只依赖 NumPy、OpenCV、`inference_manifest`、`inference_service` 和 CANN ACL，不导入
 GroundingDINO、SAM2、TorchVision 或对应 CUDA 扩展。用仓库打包器从已验证候选生成独立 bundle：
 
+除非另有说明，本节所有命令均在 IB_Robot 仓库根目录执行；所有项目内路径均相对于仓库根目录。
+
 ```bash
 source .shrc_local
 ros2 run perception_service package_ascend_perception_bundles \
-  --models-root models/perception \
+  --models-root models \
   --family grounding_dino
 ros2 run perception_service package_ascend_perception_bundles \
-  --models-root models/perception \
+  --models-root models \
   --family sam2
 ```
+
+`--models-root` 必须与 robot config 的 bundle 根目录一致。打包器从 `models/_work/` 中读取已经验证的候选，
+并把发布 bundle 写到 `models/grounding_dino_swint_seq8_1280x720_ascend/` 和
+`models/sam2_hiera_tiny_ascend/`；它不执行 ONNX/OM 编译，也不会写回 `models/perception/` 旧布局。
 
 Grounding-DINO bundle 记录并校验 12 个 OM、`encoder_tgt.npy`、bundle-local WordPiece vocab 和 D2D links；
 SAM2 bundle 独立记录 encoder 与固定 batch-4 decoder。GroundingDINO 固定输入为
@@ -318,11 +332,11 @@ SAM2 bundle 独立记录 encoder 与固定 batch-4 decoder。GroundingDINO 固�
 perception_services:
   services:
     - id: grasp_grounding
-      bundle_path: models/perception/grounding_dino_swint_seq8_1280x720_ascend
+      bundle_path: models/grounding_dino_swint_seq8_1280x720_ascend
       deployment: ascend_310p
       service_type: ibrobot_msgs/srv/GroundingDetect
     - id: grasp_segmentation
-      bundle_path: models/perception/sam2_hiera_tiny_ascend
+      bundle_path: models/sam2_hiera_tiny_ascend
       deployment: ascend_310p
       service_type: ibrobot_msgs/srv/SegmentDetections
 ```
@@ -389,19 +403,23 @@ outputs = [grasp.poses      float32 [-1, 4, 4],
 `grasp.poses` 是主机积分出来的，不绑定到任何 OM 输出张量。
 
 Runtime options 在通用 Ascend 的 `acl_config_path` / `device_id` 之外多接受一个
-`random_seed`，用于让去噪循环可复现；除此之外选项集合仍然是封闭的。GraspGen 没有 Torch
-deployment——八个 OM 与它们之间的主机数学是一个整体契约，未编译的 bundle 没有可回退的实现，
-`_new_graspgen_session` 会直接拒绝。
+`random_seed`，用于让去噪循环可复现；除此之外选项集合仍然是封闭的。统一 bundle 同时声明
+`torch_cuda` 与 `ascend_310p`；两者共享 adapter、配置和 checkpoint 身份，但运行时必须显式选择
+named deployment。Ascend 的八个 OM 与它们之间的主机数学仍是一个整体契约。
 
 ### 10.3 Bundle 与 promotion
 
-Bundle 是标准 perception bundle，不含任何 LeRobot 资产：
+Bundle 属于抓取模型域，不含任何 LeRobot 资产；当前通用运行时仍以
+`kind="perception"` 作为兼容分类，不代表它应放在 `models/perception/`：
 
 ```
-graspgen_bundle/
+models/grasp/graspgen_robotiq_2f_140/
   inference_manifest.json          # schema v2, model.kind=perception, family=graspgen
   assets/adapter.json              # family/identity + kappa, diffusion_steps,
                                    # grasp_batch_size, point_count, geometry
+  assets/graspgen_config.yml
+  assets/generator_checkpoint.pth
+  assets/discriminator_checkpoint.pth
   artifacts/ascend/ascend_310p/    # 八个 <role>.om
 ```
 
@@ -412,12 +430,14 @@ ONNX → OM → ABI → bundle 的三步流程：前两步 `graspgen-export-onnx
 `graspgen-onnx-to-om` 是 `model_utils` 的导出工具（见
 `src/model_utils/model_utils/README.md`）；第三步用本包的命令打包：
 
+除非另有说明，以下命令在 IB_Robot 仓库根目录执行；所有项目内路径均相对于仓库根目录。
+
 ```bash
 ros2 run perception_service package_graspgen_ascend_bundle \
-    --bundle-root /path/to/graspgen_bundle \
-    --onnx-manifest /path/to/onnx/graspgen.onnx.json \
-    --om-dir /path/to/compiled_om \
-    --om-abi-dir /path/to/runtime_abi \
+    --bundle-root models/grasp/graspgen_robotiq_2f_140 \
+    --onnx-manifest models/_work/graspgen_robotiq_2f_140/model_utils/onnx/graspgen.onnx.json \
+    --om-dir models/_work/graspgen_robotiq_2f_140/model_utils/om \
+    --om-abi-dir models/_work/graspgen_robotiq_2f_140/model_utils/abi \
     --soc-version Ascend310P3
 ```
 

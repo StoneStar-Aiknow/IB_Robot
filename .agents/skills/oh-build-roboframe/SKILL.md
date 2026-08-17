@@ -126,83 +126,17 @@ Do not restore the old behavior of directly copying host `libs/lerobot/src`.
 
 ## Typical Recovery Cases
 
-### Case 1: `libs/lerobot` submodule metadata is broken in `/tmp`
+常见的 4 种恢复场景（lerobot 子模块损坏、training 依赖残留、stale build cache、missing package at runtime）见 `references/troubleshooting.md`。
 
-Symptom:
+## Internal References
 
-```text
-fatal: not a git repository ... .git/modules/libs/lerobot
-```
+Read only the references needed for the current scenario:
 
-Correct action:
+| Purpose | Reference |
+|---------|-----------|
+| 4 种典型恢复场景（lerobot 子模块、training 依赖、stale cache、missing package） | `references/troubleshooting.md` |
 
-- fix `build_roboframe_oh.sh` so runtime staging can fall back to upstream clone
-- re-run the official build
-- do not manually inject `lerobot/src`
-
-### Case 2: runtime tree still imports training-only dependencies
-
-Symptoms include:
-
-- `ModuleNotFoundError: datasets`
-- `ModuleNotFoundError: pyarrow`
-- `ImportError ... av`
-
-Likely cause:
-
-- The dependencies archive is incomplete or the staged upstream LeRobot tree
-  is inconsistent
-
-Correct action:
-
-- rebuild with the official script
-- verify staged `install/lerobot/src`
-- redeploy the rebuilt `install/` tree
-
-### Case 3: stale build cache after install prefix change
-
-Symptom:
-
-```text
-The build time path "/data/ibrobot/install/controller_manager_msgs" doesn't exist.
-Either source a script for a different shell or set the environment variable
-"COLCON_CURRENT_PREFIX" explicitly.
-```
-
-Likely cause:
-
-- A previous build used a different `--custom-prefix` (e.g. `/data/ibrobot/install`),
-  and the stale `colcon_command_prefix_build.sh` in `build/` still references the
-  old path. Subsequent builds inherit the stale prefix and fail.
-
-Correct action:
-
-- remove `build/` and `install/` directories (they are Docker-owned, use the
-  alpine container pattern from the Canonical Build Command section)
-- re-run the official build with the default package list
-- **do NOT** exclude the failing package from `--packages` — the package itself
-  is fine, only the cache is stale
-
-### Case 4: missing package at runtime after deploy
-
-Symptom:
-
-```text
-ModuleNotFoundError: No module named 'embodied_common'
-package 'robot_description' not found, searching: [...]
-```
-
-Likely cause:
-
-- The build used a manually reduced `--packages` list that omitted a transitive
-  dependency (`embodied_common`, `voice_asr_service`) or a runtime data package
-  (`robot_description`, `robot_moveit`).
-
-Correct action:
-
-- rebuild with the default `PACKAGES` list (do not pass `--packages`)
-- the default list in `build_roboframe_oh.sh` is authoritative and includes
-  all required packages
+Do not expose these references as separate skills.
 
 ## Deployment Handoff
 

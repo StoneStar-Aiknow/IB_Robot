@@ -6,7 +6,7 @@
 
 | 入口 | 用途 | 主要接口 |
 |---|---|---|
-| `moveit_gateway.py` | 任务级绝对位姿与已验证关节目标规划，供 `task_dispatch`、抓取执行脚本或外部节点调用 | `/cmd_pose`、`/moveit_gateway/move_to_pose`、`/moveit_gateway/move_to_configuration`、`/robot_status/ee_pose` |
+| `moveit_gateway.py` | 任务级绝对位姿与已验证关节目标规划，供 `task_dispatch`、抓取执行脚本或外部节点调用 | `/cmd_pose`、`/moveit_gateway/move_to_pose`、`/moveit_gateway/move_to_configuration`、`/motion_mode/set_navigation_enabled`、`/robot_status/ee_pose` |
 | `so101_placo_servo_node.py` | SO101 遥操作 Cartesian 后端，使用 Placo QP 微分 IK 实现位置优先、姿态软跟踪 | velocity/pose 输入话题、`start`/`stop` 服务、`return_home` Action |
 | `so101_ik_workers.launch.py` | 为抓取候选准备启动隔离的 MoveIt IK/FK worker 进程；只保留 Kinematics capability，不允许规划或执行运动 | `/ik_worker_<n>/compute_ik`、`/ik_worker_<n>/compute_fk` |
 
@@ -58,7 +58,11 @@ ros2 launch robot_moveit so101_ik_workers.launch.py \
     use_sim_time:=false
 ```
 
-每个 worker 是独立 `move_group` 进程和独立 LMA solver 实例，订阅公共 `/joint_states`、`/tf` 和 `/tf_static`。worker 禁用了规划、轨迹执行和 planning-scene 修改 capability，只提供命名空间内的 `compute_ik`/`compute_fk`。
+每个 worker 是独立 `move_group` 进程和独立 LMA solver 实例。关节状态话题由
+`robot.moveit.joint_state_topic` 指定；LeKiWi 使用
+`/arm_joint_state_broadcaster/joint_states`，避免把 7-9 号轮子送入 SO101 MoveIt 模型。worker 同时订阅公共
+`/tf` 和 `/tf_static`，并禁用规划、轨迹执行和 planning-scene 修改 capability，只提供命名空间内的
+`compute_ik`/`compute_fk`。
 
 `manipulation_execution/pick_executor_node` 会把同一份 `/joint_states` 快照作为所有 worker 的 IK seed，
 让空闲 worker 从共享动态队列领取下一个候选，并按原候选顺序合并结果。最终接触补偿、关节解执行和
@@ -96,10 +100,24 @@ teleoperation:
 - **功能**: 实时发布末端执行器在 base 坐标系中的位姿
 
 ### 3. 关节状态同步
-- **订阅话题**: `/joint_states` (sensor_msgs/JointState)
+- **订阅话题**: `robot.moveit.joint_state_topic` (sensor_msgs/JointState，默认 `/joint_states`)
 - **功能**: 同步当前关节状态，作为 IK 求解的起始状态
 
-### 4. SO101 Placo Servo
+### 4. LeKiWi 常驻运动模式互锁
+
+当 `robot.motion_mode.enabled: true` 时，MoveIt Gateway 是抓取/导航命令授权的切换入口：
+
+| 接口 | 行为 |
+|---|---|
+| `/motion_mode/set_navigation_enabled` (`std_srvs/SetBool`) | `true` 进入导航，`false` 返回抓取 |
+| `/motion_mode/navigation_enabled` (`std_msgs/Bool`) | Transient Local 模式状态，供底盘桥接消费 |
+| `/motion_mode/base_navigation_enabled` (`std_msgs/Bool`) | 底盘清除旧命令并输出零速后的确认 |
+
+切到导航前 Gateway 会拒绝已有机械臂运动，随后先禁止新的 `/cmd_pose`、`MoveToPose` 和
+`MoveToConfiguration` 请求，再授权底盘。切回抓取时，Gateway 只有收到底盘零速确认后才重新接受机械臂请求；
+确认超时会保持机械臂禁用。整个过程不停止 `ros2_control` 控制器或硬件节点。
+
+### 5. SO101 Placo Servo
 - **配置文件**: `config/so101_placo_servo.yaml`
 - **输出话题**: `/arm_position_controller/commands`
 - **功能**: Placo QP 微分 IK 跟随命令侧 TCP/末端位置参考；关节限位和速度限位在 QP 内部约束。

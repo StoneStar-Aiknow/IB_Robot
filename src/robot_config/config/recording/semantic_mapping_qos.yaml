@@ -1,0 +1,59 @@
+/livox/lidar:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 10
+/livox/imu:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 100
+/cloud_registered_body:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 10
+/scan:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 10
+/camera/front/image_raw:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 10
+/camera/front/camera_info:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 10
+/camera/front/depth/image_rect_raw:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 10
+/camera/front/depth/camera_info:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 10
+/camera/front/aligned_depth_to_color/image_raw:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 10
+/camera/front/aligned_depth_to_color/camera_info:
+  reliability: best_effort
+  durability: volatile
+  history: keep_last
+  depth: 10
+/tf:
+  reliability: reliable
+  durability: volatile
+  history: keep_last
+  depth: 100
+/tf_static:
+  reliability: reliable
+  durability: transient_local
+  history: keep_all

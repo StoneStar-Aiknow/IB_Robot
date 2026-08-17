@@ -237,6 +237,22 @@ host_runtime:
 worker 使用被动等待，避免 NPU 请求完成后继续抢占 CPU。该配置只影响对应节点进程，不影响 MoveIt、
 相机驱动或其他机器人配置。
 
+## 已持物容器放置 SSOT
+
+支持容器放置验证的机器人在顶层 `robot.placement_execution` 声明唯一运行时配置。该配置维护 placement
+action、固定 1–5 号关节 `place_joint_positions`、移动时长、腕部 RGB topic、检测分割 endpoint、夹爪反馈超时，
+以及二维掩码包含验证的阈值和重采样次数；启用时缺少强制字段会在 launch 前失败。固定放置关节目标由
+`placement_execution.motion` 管理：到达 3 号电机 raw 1500 后开爪，随后只将 3 号电机移动到 raw 1700
+（`verify_joint_position: -0.533825`）做验证，
+最后恢复到 raw 1500。候选放置位规划、
+动态 IK/FK、深度/TF、持物门禁和恢复日志不属于该能力。
+
+公开技能由 `skill_catalog/config/skills/place_in_container` 和对应 profile 暴露，要求显式传入 `target_name` 和
+`container_name`，并通过 `placement_pipeline` 委托到 `/manipulation/execute_place`。执行器依次移动到固定
+`place_container`、打开夹爪、移动 3 号关节到验证位、进行视觉验证，最后返回释放位；`container_name` 只作为
+释放后容器检测 query，不改变固定运动，也不触发候选规划。成功要求夹爪反馈确认打开，并连续确认目标物品的
+二维分割区域位于指定容器区域内。夹爪 6 号关节只在释放阶段通过 `open_gripper` 单独控制。
+
 真机抓取配置可在 robot YAML 的 `robot.grasp_execution.target_gripper` 下声明目标夹爪几何。
 SO101 单动爪使用 `fixed_finger_contact_ee` 作为固定指侧参考点，`closing_axis_ee` 表示从固定指
 指向目标宽度中心的方向。`manipulation_execution/pick_executor_node` 会根据 GraspGen 候选的
@@ -256,8 +272,8 @@ effective_center = fixed_finger_contact_ee
 ```
 
 `fixed_finger_margin_m` 是额外远离固定指的基础安全距离，用于降低固定指先碰物体边缘或上表面的风险。
-当前 SO101 RealSense 抓取配置默认基础值为 `0.006 m`；目标窄于 `fixed_finger_margin_width_ref_m=0.035 m`
-时按 `fixed_finger_margin_width_gain=0.25` 增加安全余量，并由 `fixed_finger_margin_max_m=0.012 m` 封顶。
+当前 SO101 RealSense 抓取配置默认基础值为 `0.010 m`；目标窄于 `fixed_finger_margin_width_ref_m=0.035 m`
+时按 `fixed_finger_margin_width_gain=0.25` 增加安全余量，并由 `fixed_finger_margin_max_m=0.016 m` 封顶。
 
 `target_gripper.fixed_finger_base_side` 是独立的候选硬约束。启用后，执行器在 `base` 坐标系 XY 平面
 计算“目标宽度中心到固定指”与“目标宽度中心到 `reference_point_base`”的夹角余弦；低于
@@ -286,6 +302,10 @@ lift 和规划接触点，不改变相机测得的物体宽度端点。SO101 han
 验证过的 `[0.0, 0.0, -0.008]`；该值属于机器人/手眼执行几何，因此由 robot YAML 管理，action 客户端不提供
 覆盖参数。
 
+`execution_scoring.topdown_weight` 控制垂直向下抓取在源候选排序中的软加分。SO101 hand-eye
+profile 使用 `0.50`；`candidate_selection.topdown_weight` 保持相同值作为兼容回退。该权重只改变候选顺序，
+不跳过 workspace、桌面碰撞、IK/FK 或姿态门禁。
+
 `target_gripper.ik_orientation_guard` 约束 position-only IK 的实际 FK 朝向。SO101 的 joint5 对 TCP 位置
 几乎不产生梯度，因此超出执行门限时会保持在 seed 附近；执行器将超限 joint5 seed 翻转 `±π`，让固定指和
 活动指换侧，再比较 GraspGen 目标和实际 FK 的接近轴、180° 对称闭合轴直线及固定指内侧关系。当前配置使用：
@@ -299,8 +319,8 @@ ik_orientation_guard:
   joint5_limit_epsilon_rad: 0.001
   joint5_stage_continuity: true
   joint5_stage_max_delta_rad: 1.5707963267948966
-  max_approach_error_deg: 25.0
-  max_closing_error_deg: 20.0
+  max_approach_error_deg: 40.0
+  max_closing_error_deg: 30.0
   moveit_orientation_search:
     enabled: false
     approach_tolerance_deg: 15.0
@@ -317,7 +337,7 @@ joint5 当作抓取安全原点；候选选定以后，approach、pregrasp、gra
 MoveIt LMA 仍使用 `position_only_ik: true`。当前 SO101 profile 不启用
 `moveit_orientation_search`。OrientationConstraint
 不会为 5-DOF 机械臂创造额外自由度，反而可能把本应由最终 FK 门禁解释的姿态误差变成 `NO_IK_SOLUTION`。
-最终 IK/FK 结果仍必须通过 25°/20° 硬门禁。
+最终 IK/FK 结果仍必须通过硬门禁；310P 和 PC profile 均使用 40°/30°。
 
 可靠开口参数由 `prepared_candidate_scoring` 声明，因为准备阶段是从这个块里读取它们的：
 
@@ -356,17 +376,34 @@ SO101 真机的 MoveIt 完成语义也由同一 robot YAML 的 `moveit` 域声�
 
 ```yaml
 moveit:
+  joint_state_topic: /arm_joint_state_broadcaster/joint_states
   motion_status_hold_s: 0.0
   motion_feedback_timeout_s: 0.3
   motion_feedback_tolerance_rad: 0.12
   motion_require_tf_sync: true
-  motion_hardware_feedback_topic: /so101_follower/joint_currents
+  # LeKiWiSystemHardware does not publish ibrobot_msgs/JointCurrent.
+  motion_hardware_feedback_topic: ""
 ```
 
-网关只在 MoveIt 终态之后同时看到新的硬件读取心跳、收敛关节样本和覆盖该样本时间戳的末端 TF 时
-返回成功，不再依赖固定 `0.3 s` sleep。由该屏障覆盖的 `contact_realign.settle_sec` 和
+配置硬件心跳话题时，网关只在 MoveIt 终态之后同时看到新的硬件读取心跳、收敛关节样本和覆盖该样本时间戳的末端 TF 时
+返回成功；LeKiWi 将该可选话题留空，使用新的收敛关节样本与 TF 屏障，不再依赖固定 `0.3 s` sleep。由该屏障覆盖的 `contact_realign.settle_sec` 和
 `pose_diagnostics.settle_sec` 可设为 `0.0`；相机与夹爪稳定等待不在此屏障覆盖范围内。仿真启动会
 清空硬件心跳话题，只保留关节与 TF 屏障。
+
+LeKiWi 抓取配置还使用顶层 `motion_mode` 作为常驻控制器的命令授权 SSOT：
+
+```yaml
+motion_mode:
+  enabled: true
+  navigation_enabled_on_startup: false
+  navigation_enabled_topic: /motion_mode/navigation_enabled
+  navigation_mode_ack_topic: /motion_mode/base_navigation_enabled
+  set_navigation_enabled_service: /motion_mode/set_navigation_enabled
+  transition_timeout_s: 2.0
+```
+
+`moveit_planning` 同时启动机械臂轨迹、夹爪轨迹、底盘速度、全量关节状态和机械臂专用关节状态控制器。
+任务切换只调用上述服务改变新命令的授权，不停止控制器或重启硬件节点。
 
 `robot.grasp_execution.prepared_candidate_scoring` 控制 IK/FK 后软排序。SO101 使用候选目标宽度区间和
 候选规划姿态计算固定指到目标前缘的间隙，并以动态 margin 为期望值计算包络分数。该分数与
@@ -706,6 +743,8 @@ ros2 launch robot_config robot.launch.py \
 TTS 对外提供 `/voice_tts/synthesize` typed service。请求和响应携带音频字节而不是服务端文件路径，
 并通过文本、prompt、分段数和响应字节上限约束单个 DDS response。真实模型未就绪时服务返回
 `MODEL_NOT_READY`；部署身份和 readiness 由响应中的 `ModelRuntimeInfo` 报告。
+同一配置还启动 `/voice_tts/play` 服务，接收播放端本机 WAV 绝对路径，通过 ALSA 同步播放并返回明确的
+成功状态、错误码和消息；该播放节点不依赖模型 session。
 launch builder 只解析配置和创建节点，不提前打开模型 bundle。节点启动时校验 bundle 并加载 session，因而
 `exit_on_init_failure=false` 能在模型存储暂不可用时保留服务并返回 `MODEL_NOT_READY`；
 TTS 由通用 `inference_service/model_service_node` 承载，节点启动时加载 named deployment，节点退出时等待当前
@@ -719,7 +758,7 @@ WAV；它尚不支持请求级 prompt，调用时返回 `UNSUPPORTED_PROMPT`。�
 
 ### 真机手眼配置
 
-SO101 抓取使用同级独立配置 `config/robots/so101_handeye_realsense_grasp.yaml`。用户应直接在
+SO101 抓取使用同级独立配置 `config/robots/lekiwi_handeye_realsense_grasp.yaml`。用户应直接在
 这份 YAML 中填写从动臂串口、相机序列号和 leader 配置；`scripts/handeye_calibrator.py` 质量检查
 通过后会就地更新 `peripherals[name=wrist].transform`。多台物理机器人应分别复制独立 YAML，避免
 不同实例的端口和标定值互相覆盖。`config_path` 仍可用于加载 workspace 外部的完整 robot YAML，

@@ -127,6 +127,7 @@ class TaskEntryNode(Node):
         task.task_type = "unplanned"
         task.workflow_steps = []
         task.target_name = ""
+        task.container_name = ""
         task.place_name = ""
         task.motion_direction = ""
         task.motion_distance = 0.0

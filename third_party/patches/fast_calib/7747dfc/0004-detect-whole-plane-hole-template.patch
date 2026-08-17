@@ -1,0 +1,375 @@
+diff --git a/include/target_geometry.hpp b/include/target_geometry.hpp
+index 1ac78c9..4fd83a5 100644
+--- a/include/target_geometry.hpp
++++ b/include/target_geometry.hpp
+@@ -4,6 +4,8 @@
+ #include <algorithm>
+ #include <array>
+ #include <cmath>
++#include <limits>
++#include <vector>
+ 
+ namespace fast_calib
+ {
+@@ -15,6 +17,12 @@ struct Point3
+     double z;
+ };
+ 
++struct ScoredPoint
++{
++    Point3 point;
++    double score;
++};
++
+ inline double distance(const Point3 &a, const Point3 &b)
+ {
+     const double dx = a.x - b.x;
+@@ -98,6 +106,54 @@ inline bool recover_rectangle(
+     return matches == 1;
+ }
+ 
++inline bool select_unique_rectangle(
++    const std::vector<ScoredPoint> &candidates, double width, double height,
++    double distance_tolerance, double minimum_score_margin, std::array<Point3, 4> &selected)
++{
++    double best_score = -std::numeric_limits<double>::infinity();
++    double second_score = -std::numeric_limits<double>::infinity();
++    std::array<Point3, 4> best{};
++    for (size_t i = 0; i < candidates.size(); ++i)
++    {
++        for (size_t j = i + 1; j < candidates.size(); ++j)
++        {
++            for (size_t k = j + 1; k < candidates.size(); ++k)
++            {
++                for (size_t l = k + 1; l < candidates.size(); ++l)
++                {
++                    const std::array<Point3, 4> points = {
++                        candidates[i].point, candidates[j].point,
++                        candidates[k].point, candidates[l].point};
++                    if (!has_rectangle_distance_spectrum(points, width, height, distance_tolerance))
++                    {
++                        continue;
++                    }
++                    const double score = std::min({
++                        candidates[i].score, candidates[j].score,
++                        candidates[k].score, candidates[l].score});
++                    if (score > best_score)
++                    {
++                        second_score = best_score;
++                        best_score = score;
++                        best = points;
++                    }
++                    else if (score > second_score)
++                    {
++                        second_score = score;
++                    }
++                }
++            }
++        }
++    }
++    if (!std::isfinite(best_score) ||
++        (std::isfinite(second_score) && best_score - second_score < minimum_score_margin))
++    {
++        return false;
++    }
++    selected = best;
++    return true;
++}
++
+ }  // namespace fast_calib
+ 
+ #endif
+diff --git a/src/lidar_detect.hpp b/src/lidar_detect.hpp
+index a898134..a89a100 100644
+--- a/src/lidar_detect.hpp
++++ b/src/lidar_detect.hpp
+@@ -22,6 +22,10 @@ which is included as part of this source code package.
+ 
+ #include <pcl/filters/extract_indices.h>
+ #include <pcl/io/ply_io.h>
++#include <algorithm>
++#include <array>
++#include <limits>
++#include <vector>
+ #include "common_lib.h"
+ #include "target_geometry.hpp"
+ 
+@@ -208,120 +212,148 @@ public:
+         }
+         RCLCPP_INFO(node_->get_logger(), "Extracted %ld edge points.", edge_cloud_->size());
+         save2PLY(edge_cloud_, output_path_ + "edge_cloud.ply");
+-        // 5. 对边缘点进行聚类
++        // 5. Search the complete plane for circular gaps. A hole rim need not be an
++        // independent Euclidean cluster in a non-repetitive solid-state scan.
+         pcl::search::KdTree<pcl::PointXYZ>::Ptr tree(new pcl::search::KdTree<pcl::PointXYZ>);
+-        tree->setInputCloud(edge_cloud_);
+-
+-        std::vector<pcl::PointIndices> cluster_indices;
+-        pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+-        ec.setClusterTolerance(cluster_tolerance_);
+-        ec.setMinClusterSize(min_cluster_size_);
+-        ec.setMaxClusterSize(1000);   // 最大点数
+-        ec.setSearchMethod(tree);
+-        ec.setInputCloud(edge_cloud_);
+-        ec.extract(cluster_indices);
+-
+-        RCLCPP_INFO(node_->get_logger(), "Number of edge clusters: %ld", cluster_indices.size());
+-
+-        // 6. 对每个聚类进行圆拟合
+-        center_z0_cloud_->reserve(4);
+-        Eigen::Matrix3d R_inv = R.inverse();
+-
+-        // 对每个聚类进行圆拟合
+-        for (size_t i = 0; i < cluster_indices.size(); ++i)
++        tree->setInputCloud(aligned_cloud_);
++        std::vector<float> xs;
++        std::vector<float> ys;
++        xs.reserve(aligned_cloud_->size());
++        ys.reserve(aligned_cloud_->size());
++        for (const auto &point : *aligned_cloud_)
++        {
++            xs.push_back(point.x);
++            ys.push_back(point.y);
++        }
++        std::sort(xs.begin(), xs.end());
++        std::sort(ys.begin(), ys.end());
++        const size_t low_index = static_cast<size_t>(0.01 * (xs.size() - 1));
++        const size_t high_index = static_cast<size_t>(0.99 * (xs.size() - 1));
++        const double margin = circle_radius_ + 0.05;
++        const double resolution = 0.005;
++        const double low_x = xs[low_index] + margin;
++        const double high_x = xs[high_index] - margin;
++        const double low_y = ys[low_index] + margin;
++        const double high_y = ys[high_index] - margin;
++        const size_t width = high_x > low_x ? static_cast<size_t>((high_x - low_x) / resolution) + 1 : 0;
++        const size_t height = high_y > low_y ? static_cast<size_t>((high_y - low_y) / resolution) + 1 : 0;
++        std::vector<double> nearest(width * height, 0.0);
++        std::vector<int> indices(1);
++        std::vector<float> squared_distances(1);
++        for (size_t ix = 0; ix < width; ++ix)
+         {
+-            pcl::PointCloud<pcl::PointXYZ>::Ptr cluster(new pcl::PointCloud<pcl::PointXYZ>);
+-            for (const auto &idx : cluster_indices[i].indices)
++            for (size_t iy = 0; iy < height; ++iy)
+             {
+-                cluster->push_back(edge_cloud_->points[idx]);
++                const pcl::PointXYZ query(low_x + ix * resolution, low_y + iy * resolution, 0.0);
++                if (tree->nearestKSearch(query, 1, indices, squared_distances) == 1)
++                {
++                    nearest[ix * height + iy] = std::sqrt(squared_distances[0]);
++                }
+             }
++        }
+ 
+-            // 圆拟合
+-            pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
+-            pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+-            pcl::SACSegmentation<pcl::PointXYZ> seg;
+-            seg.setOptimizeCoefficients(true);
+-            seg.setModelType(pcl::SACMODEL_CIRCLE2D);
+-            seg.setMethodType(pcl::SAC_RANSAC);
+-            seg.setDistanceThreshold(circle_fit_distance_threshold_);
+-            seg.setMaxIterations(1000);     // 设置最大迭代次数
+-            seg.setInputCloud(cluster);
+-            seg.segment(*inliers, *coefficients);
+-
+-            if (inliers->indices.size() > 0)
++        std::vector<fast_calib::ScoredPoint> candidates;
++        for (size_t ix = 0; ix < width; ++ix)
++        {
++            for (size_t iy = 0; iy < height; ++iy)
+             {
+-                // 计算拟合误差
+-                double error = 0.0;
+-                for (const auto &idx : inliers->indices)
++                const double gap = nearest[ix * height + iy];
++                if (gap < 0.07 || gap > circle_radius_ + 0.05)
+                 {
+-                    double dx = cluster->points[idx].x - coefficients->values[0];
+-                    double dy = cluster->points[idx].y - coefficients->values[1];
+-                    double distance = sqrt(dx * dx + dy * dy) - circle_radius_; // 距离误差
+-                    error += abs(distance);
++                    continue;
+                 }
+-                error /= inliers->indices.size();
+-
+-                // 如果拟合误差较小，则认为是一个圆洞
+-                std::cout << "circle candidate: inliers=" << inliers->indices.size()
+-                          << " center=(" << coefficients->values[0] << ", " << coefficients->values[1]
+-                          << ") radius=" << coefficients->values[2] << " expected_radius_error=" << error
+-                          << std::endl;
+-                if (error < circle_fit_error_threshold_)
++                bool local_maximum = true;
++                for (size_t nx = ix > 8 ? ix - 8 : 0; nx <= std::min(width - 1, ix + 8) && local_maximum; ++nx)
+                 {
+-                    // 将恢复后的圆心坐标添加到点云中
+-                    pcl::PointXYZ center_point;
+-                    center_point.x = coefficients->values[0];
+-                    center_point.y = coefficients->values[1];
+-                    center_point.z = 0.0;
+-                    center_z0_cloud_->push_back(center_point);
+-
+-                    // 将圆心坐标逆变换回原始坐标系
+-                    Eigen::Vector3d aligned_point(center_point.x, center_point.y, center_point.z + average_z);
+-                    Eigen::Vector3d original_point = R_inv * aligned_point;
++                    for (size_t ny = iy > 8 ? iy - 8 : 0; ny <= std::min(height - 1, iy + 8); ++ny)
++                    {
++                        if (nearest[nx * height + ny] > gap)
++                        {
++                            local_maximum = false;
++                            break;
++                        }
++                    }
++                }
++                if (!local_maximum)
++                {
++                    continue;
++                }
+ 
+-                    pcl::PointXYZ center_point_origin;
+-                    center_point_origin.x = original_point.x();
+-                    center_point_origin.y = original_point.y();
+-                    center_point_origin.z = original_point.z();
+-                    center_cloud->points.push_back(center_point_origin);
+-                    std::cout << "accepted LiDAR center: (" << center_point_origin.x << ", "
+-                              << center_point_origin.y << ", " << center_point_origin.z << ")" << std::endl;
++                const pcl::PointXYZ center(low_x + ix * resolution, low_y + iy * resolution, 0.0);
++                std::vector<int> neighbors;
++                std::vector<float> neighbor_distances;
++                tree->radiusSearch(center, circle_radius_ + 0.05, neighbors, neighbor_distances);
++                int inner_points = 0;
++                int ring_points = 0;
++                std::array<bool, 16> covered{};
++                for (const int index : neighbors)
++                {
++                    const auto &point = aligned_cloud_->points[index];
++                    const double dx = point.x - center.x;
++                    const double dy = point.y - center.y;
++                    const double radius = std::hypot(dx, dy);
++                    if (radius < 0.085)
++                    {
++                        ++inner_points;
++                    }
++                    if (radius >= circle_radius_ - 0.035 && radius <= circle_radius_ + 0.035)
++                    {
++                        ++ring_points;
++                        int sector = static_cast<int>((std::atan2(dy, dx) + M_PI) / (2 * M_PI) * covered.size());
++                        sector = std::max(0, std::min(static_cast<int>(covered.size()) - 1, sector));
++                        covered[sector] = true;
++                    }
++                }
++                const int covered_sectors = static_cast<int>(std::count(covered.begin(), covered.end(), true));
++                if (covered_sectors < 8 || ring_points < 25)
++                {
++                    continue;
+                 }
++                const double score = covered_sectors * 12.0 + std::min(ring_points, 180) * 0.25 +
++                                     gap * 100.0 - inner_points * 0.8;
++                candidates.push_back({{center.x, center.y, 0.0}, score});
+             }
+         }
+-
+-        // A solid-state LiDAR may miss one rim at long range. Recover a single missing
+-        // center only when three measured centers form the configured L shape.
+-        if (center_cloud->size() == 3)
++        std::sort(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) {
++            return a.score > b.score;
++        });
++        std::vector<fast_calib::ScoredPoint> separated;
++        for (const auto &candidate : candidates)
+         {
+-            const double tolerance = 0.06;
+-            std::array<fast_calib::Point3, 3> measured;
+-            for (size_t i = 0; i < measured.size(); ++i)
++            const bool duplicate = std::any_of(separated.begin(), separated.end(), [&](const auto &old) {
++                return fast_calib::distance(candidate.point, old.point) < 0.10;
++            });
++            if (!duplicate)
+             {
+-                const auto &point = center_cloud->points[i];
+-                measured[i] = {point.x, point.y, point.z};
++                separated.push_back(candidate);
+             }
+-            std::array<fast_calib::Point3, 4> recovered;
+-            if (fast_calib::recover_rectangle(
+-                    measured, circle_pattern_width_, circle_pattern_height_, tolerance, recovered))
++            if (separated.size() == 40)
+             {
+-                center_cloud->clear();
+-                for (const auto &point : recovered)
+-                {
+-                    center_cloud->push_back(pcl::PointXYZ(point.x, point.y, point.z));
+-                }
+-                const auto &inferred = center_cloud->points.back();
+-                RCLCPP_WARN(node_->get_logger(),
+-                            "Recovered one missing hole center from a unique measured L pattern: (%.3f, %.3f, %.3f)",
+-                            inferred.x, inferred.y, inferred.z);
+-            }
+-            else
+-            {
+-                RCLCPP_ERROR(node_->get_logger(),
+-                             "Unable to recover a unique rectangular four-hole pattern from %zu candidates.",
+-                             center_cloud->size());
++                break;
+             }
+         }
++
++        std::array<fast_calib::Point3, 4> selected;
++        if (!fast_calib::select_unique_rectangle(
++                separated, circle_pattern_width_, circle_pattern_height_, 0.045, 1.0, selected))
++        {
++            RCLCPP_ERROR(node_->get_logger(),
++                         "Unable to select a unique four-hole rectangle from %zu whole-plane candidates.",
++                         separated.size());
++            return;
++        }
++
++        center_z0_cloud_->clear();
++        center_z0_cloud_->reserve(4);
++        Eigen::Matrix3d R_inv = R.inverse();
++        center_cloud->clear();
++        for (const auto &point : selected)
++        {
++            center_z0_cloud_->push_back(pcl::PointXYZ(point.x, point.y, 0.0));
++            const Eigen::Vector3d original = R_inv * Eigen::Vector3d(point.x, point.y, average_z);
++            center_cloud->push_back(pcl::PointXYZ(original.x(), original.y(), original.z()));
++        }
++        RCLCPP_INFO(node_->get_logger(), "Selected a unique whole-plane four-hole rectangle.");
+     }
+ 
+     // 获取中间结果的点云
+diff --git a/test/test_target_geometry.cpp b/test/test_target_geometry.cpp
+index 592807e..db51db6 100644
+--- a/test/test_target_geometry.cpp
++++ b/test/test_target_geometry.cpp
+@@ -3,6 +3,7 @@
+ #include <array>
+ #include <cmath>
+ #include <stdexcept>
++#include <vector>
+ 
+ using fast_calib::Point3;
+ 
+@@ -63,4 +64,22 @@ int main()
+         Point3{0.0, height, 0.0}, Point3{width, height, 0.0}};
+     require(fast_calib::has_rectangle_distance_spectrum(rectangle, width, height, tolerance),
+             "valid rectangle distance spectrum was rejected");
++
++    const std::vector<fast_calib::ScoredPoint> mixed_candidates = {
++        {{0.0, 0.0, 0.0}, 230.0}, {{width, 0.0, 0.0}, 225.0},
++        {{0.0, height, 0.0}, 220.0}, {{width, height, 0.0}, 215.0},
++        {{0.24, 0.11, 0.0}, 260.0}, {{0.83, 0.28, 0.0}, 250.0}};
++    std::array<Point3, 4> selected{};
++    require(fast_calib::select_unique_rectangle(
++                mixed_candidates, width, height, 0.045, 0.02, selected),
++            "unique board rectangle was not selected from mixed candidates");
++    require(fast_calib::has_rectangle_distance_spectrum(selected, width, height, 0.045),
++            "selected candidates do not form the configured rectangle");
++
++    const std::vector<fast_calib::ScoredPoint> missing_hole = {
++        {{0.0, 0.0, 0.0}, 230.0}, {{width, 0.0, 0.0}, 225.0},
++        {{0.0, height, 0.0}, 220.0}, {{0.24, 0.11, 0.0}, 260.0}};
++    require(!fast_calib::select_unique_rectangle(
++                missing_hole, width, height, 0.045, 0.02, selected),
++            "missing-hole candidates produced a rectangle");
+ }

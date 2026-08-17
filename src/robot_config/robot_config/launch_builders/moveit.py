@@ -69,6 +69,13 @@ def generate_moveit_nodes(robot_config, control_mode, use_sim=False, display=Tru
             motion_hardware_feedback_topic = (
                 "" if use_sim else str(robot_config["moveit"].get("motion_hardware_feedback_topic", "")).strip()
             )
+            joint_state_topic = str(robot_config["moveit"].get("joint_state_topic", "/joint_states")).strip()
+            motion_mode = robot_config.get("motion_mode", {})
+            motion_mode_enabled = bool(motion_mode.get("enabled", False))
+            if motion_mode_enabled and "navigation_enabled_on_startup" not in motion_mode:
+                raise ValueError(
+                    "robot.motion_mode.navigation_enabled_on_startup is required when motion_mode is enabled"
+                )
 
             # Include MoveIt launch file
             moveit_launch = IncludeLaunchDescription(
@@ -86,6 +93,36 @@ def generate_moveit_nodes(robot_config, control_mode, use_sim=False, display=Tru
                     "motion_feedback_tolerance_rad": str(motion_feedback_tolerance_rad),
                     "motion_require_tf_sync": str(motion_require_tf_sync),
                     "motion_hardware_feedback_topic": motion_hardware_feedback_topic,
+                    "joint_state_topic": joint_state_topic,
+                    "motion_mode_enabled": str(motion_mode_enabled),
+                    "navigation_enabled_on_startup": str(bool(motion_mode.get("navigation_enabled_on_startup", False))),
+                    "navigation_enabled_topic": str(
+                        motion_mode.get("navigation_enabled_topic", "motion_mode/navigation_enabled")
+                    ),
+                    "navigation_mode_ack_topic": str(
+                        motion_mode.get("navigation_mode_ack_topic", "motion_mode/base_navigation_enabled")
+                    ),
+                    "set_navigation_enabled_service": str(
+                        motion_mode.get("set_navigation_enabled_service", "motion_mode/set_navigation_enabled")
+                    ),
+                    "controller_switch_service": str(
+                        motion_mode.get("controller_switch_service", "controller_manager/switch_controller")
+                    ),
+                    "motion_mode_manipulation_controllers": " ".join(
+                        motion_mode.get(
+                            "manipulation_controllers",
+                            ["arm_trajectory_controller", "gripper_trajectory_controller"],
+                        )
+                    ),
+                    "motion_mode_navigation_controllers": " ".join(
+                        motion_mode.get("navigation_controllers", ["base_velocity_controller"])
+                    ),
+                    "motion_mode_transition_timeout_s": str(
+                        max(float(motion_mode.get("transition_timeout_s", 2.0)), 0.0)
+                    ),
+                    "motion_mode_bridge_heartbeat_timeout_s": str(
+                        max(float(motion_mode.get("bridge_heartbeat_timeout_s", 1.0)), 0.0)
+                    ),
                 }.items(),
             )
             actions.append(moveit_launch)

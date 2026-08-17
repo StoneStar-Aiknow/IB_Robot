@@ -10,6 +10,7 @@ from launch.actions import (
     IncludeLaunchDescription,
     OpaqueFunction,
     RegisterEventHandler,
+    SetEnvironmentVariable,
 )
 from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
@@ -119,6 +120,7 @@ def _parallel_ik_worker_action(config: dict, use_sim_time: str):
     if not namespace_prefix:
         raise ValueError("grasp_execution.ik.worker_namespace_prefix must not be empty")
     worker_launch_path = Path(get_package_share_directory("robot_moveit")) / "launch" / "so101_ik_workers.launch.py"
+    joint_state_topic = str(config.get("moveit", {}).get("joint_state_topic", "/joint_states")).strip()
     logger.info(f"Launching {worker_count} parallel grasp IK/FK workers under /{namespace_prefix}_<n>")
     return IncludeLaunchDescription(
         PythonLaunchDescriptionSource(str(worker_launch_path)),
@@ -126,6 +128,7 @@ def _parallel_ik_worker_action(config: dict, use_sim_time: str):
             "worker_count": str(worker_count),
             "namespace_prefix": namespace_prefix,
             "use_sim_time": use_sim_time,
+            "joint_state_topic": joint_state_topic,
         }.items(),
     )
 
@@ -219,6 +222,13 @@ def launch_setup(context, *_args, **_kwargs):
 def generate_launch_description():
     return LaunchDescription(
         [
+            # Fast DDS shared-memory segments can remain orphaned on the
+            # OpenHarmony board after a pipeline is stopped.  In that state a
+            # Python ActionServer may publish feedback/status while its service
+            # endpoints are not discoverable.  Keep the launch deterministic by
+            # using UDPv4 for the whole graph; all nodes inherit the same
+            # transport and action services remain discoverable after restart.
+            SetEnvironmentVariable("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4"),
             DeclareLaunchArgument("robot_config", default_value="so101_single_arm"),
             DeclareLaunchArgument("config_path", default_value=""),
             DeclareLaunchArgument("use_sim", default_value="false"),

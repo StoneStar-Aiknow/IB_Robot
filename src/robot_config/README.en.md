@@ -98,7 +98,7 @@ Capability metadata is explicit and is not derived from a primitive sequence. Ev
 | `summary` / `domain` | Non-empty strings |
 | `moves_robot` | Boolean |
 | `required_control_mode` | `teleop`, `model_inference`, or `moveit_planning`, exactly equal to global `skill_required_control_mode` |
-| `parameters` | Strict object schema: `type: object`, `additionalProperties: false`; only `target_name`, `place_name`, `motion_direction`, and `motion_distance`; unique `required` entries that name declared properties |
+| `parameters` | Strict object schema: `type: object`, `additionalProperties: false`; only `target_name`, `container_name`, `place_name`, `motion_direction`, and `motion_distance`; unique `required` entries that name declared properties |
 | `recovery_policy` | `never_retry`, `ask_user`, or `recover_safe_pose` |
 
 String parameter definitions permit only `type` and a non-empty `enum`; a `motion_direction` enum is limited to

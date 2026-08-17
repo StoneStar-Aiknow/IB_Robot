@@ -117,6 +117,7 @@ def workflow_step(
     *,
     skill_name: str,
     target_name: str = "",
+    container_name: str = "",
     place_name: str = "",
     motion_direction: str = "",
     motion_distance: float = 0.0,
@@ -126,6 +127,7 @@ def workflow_step(
     step.schema_version = 1
     step.skill_name = skill_name
     step.target_name = target_name
+    step.container_name = container_name
     step.place_name = place_name
     step.motion_direction = motion_direction
     step.motion_distance = float(motion_distance)

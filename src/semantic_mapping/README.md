@@ -3,15 +3,110 @@
 `semantic_mapping` 基于固定安装在底盘上的 D435 同步 RGB-D 数据构建独立、持久化的 3D 语义目标地图。它只依赖
 时间戳对应的 TF，不依赖 FAST-LIO、FAST-LIVO2 或其他 SLAM 的内部地图表示。
 
+## RGB-D LiDAR 数据采集
+
+联合采集使用独立 profile。开始前必须已批准 D435i/MID-360 标定，确保
+`~/.ros/ibrobot/calib/current/base_to_front_camera.yaml` 存在且状态为 `approved`。
+
+开发板终端 A 启动采集主链，并在保存结束前保持运行：
+
+```bash
+ros2 launch robot_config robot.launch.py \
+  robot_config:=lekiwi_semantic_mapping
+```
+
+该 profile 直接启用 MID-360、FAST-LIO、slam_toolbox、D435i 和 continuous MCAP 录制，不需要额外选择
+navigation stage 或录制开关，也不支持 episodic 录制。
+
+开发板终端 B 使用键盘遥控完成建图轨迹：
+
+```bash
+ros2 run teleop_twist_keyboard teleop_twist_keyboard
+```
+
+在同一 ROS domain 的 PC 端启动低带宽 RViz 预览：
+
+```bash
+ros2 launch semantic_mapping lekiwi_semantic_mapping_rviz.launch.py
+```
+
+开发板在本地将 RealSense RGB 压缩为 8 FPS、JPEG quality 70，并将 MID-360 registered cloud 限制为每帧
+6000 点。PC 侧 RViz 使用 `/semantic_mapping/preview/*` 观察低带宽图像和点云，同时订阅 `/map`、`/scan`、TF
+和 robot description；它不订阅 raw RGB、depth 或完整 registered cloud。
+
+完成同一条建图轨迹后，在 launch 仍运行时执行一个保存命令：
+
+```bash
+ros2 run semantic_mapping save_semantic_map
+```
+
+该命令停止 recorder、保存当前 slam_toolbox 地图、执行 MCAP reindex、生成标定快照和根目录元数据、
+校验 `SHA256SUMS` 与离线 RGB-D/历史 TF，最后以 gzip level 1 流式创建同名 `.tar.gz`。压缩过程不会先生成
+同尺寸的临时 `.tar`；任一步失败都会返回非零状态。
+
+recorder 在 rosbag 启动前固定 MID-360 mount YAML 和当时存在的 approved camera artifact 字节与 SHA-256；
+finalizer 只读取这些 pinned bytes，不会重新读取可能已被替换的 `current/` 源文件。camera artifact 缺失时仍生成
+bag、manifest、checksum 和压缩归档，但状态明确为 `calibration_incomplete`，且该 profile 不发布零值
+`base_link -> camera` 替代 TF。
+
+默认输出目录和归档为：
+
+```text
+~/.ros/ibrobot/semantic_mapping/lekiwi_semantic_mapping_<timestamp>/
+~/.ros/ibrobot/semantic_mapping/lekiwi_semantic_mapping_<timestamp>.tar.gz
+```
+
+当前 session handoff 保存在 `~/.ros/ibrobot/semantic_mapping/current.json`。session 目录包含：
+
+```text
+bag/*.mcap
+bag/metadata.yaml
+bag/calibration_snapshot.json
+map/map.yaml
+map/map.pgm
+manifest.json
+SHA256SUMS
+README.md
+```
+
+20 秒静止烟测只验证工程闭环，不评价地图质量：
+
+```bash
+# Terminal A: leave this launch running for the map save service.
+ros2 launch robot_config robot.launch.py \
+  robot_config:=lekiwi_semantic_mapping
+
+# Terminal B: wait about 20 seconds, then save and validate everything.
+sleep 20
+ros2 run semantic_mapping save_semantic_map
+```
+
+如果静止场景无法产生可保存地图，应保持 launch 运行并在 slam_toolbox 保存服务成功后再执行同一收尾命令；
+收尾流程只验证地图文件存在，不评价地图覆盖质量。烟测不运行任何语义模型。
+
+reindex 后的 `metadata.yaml` 是 topic/type/count 的唯一事实源。LiDAR、IMU、FAST-LIO raw/filtered odometry、
+registered cloud、scan、map、RGB、raw/aligned depth、三路 CameraInfo、`/tf` 和 `/tf_static` 必须类型匹配且非零。
+当前 mapping profile 禁止 cmd bridge 发布另一套 wheel odometry，且 20 秒静止烟测可以没有操作员命令，因此
+`/wheel/odom` 和 `/cmd_vel` 只做 reported/optional，不会造成无害的静止烟测失败；`/diagnostics` 不录制也不检查。
+metadata 有 per-file 时间时，顶层 start/duration 必须覆盖所有 split；旧 Humble metadata 没有 per-file 时间时只记录
+coverage unavailable。
+
+保存命令在同一个同步 RGB 时间戳验证 `map -> camera frame` 和 `map -> base_link`。若 snapshot 为
+`calibration_incomplete`，数据产物仍会保留用于诊断，但保存命令返回失败，不把它报告为可用语义地图。
+
 ## Data Flow
 
 1. 使用 `ApproximateTimeSynchronizer` 同步彩色图、对齐深度图和 `CameraInfo`。
-2. 默认通过服务并发运行 SAM2 盲扫和 RAM++ 打标，再批量调用 SigLIP2 编码与标签匹配。
+2. 默认通过服务并发运行 SAM2 盲扫和 RAM++ 打标，再批量调用 SigLIP2 为各 mask 生成视觉特征。
 3. 将 mask 内有效深度像素反投影至相机光学坐标系，并过滤深度离群点。
 4. 按 RGB 图像时间戳查询 `global_frame -> camera optical frame` TF。
 5. 将物体点云、中心点和世界坐标轴包围盒转换至 `global_frame`。
-6. 使用类别、世界坐标距离和 SigLIP 余弦相似度关联持久目标。
-7. 将目标状态和 SigLIP 特征写入独立 SQLite 数据库。
+6. 最终类别由 RAM++ 决定：服务端先应用颜色过滤和 SSOT 场景排除列表，再返回 top-5 候选，建图选择最高分局部标签；
+   没有局部候选时标记为 `unlabeled`，不回退到全图场景标签。
+7. 使用类别、世界坐标距离和 SigLIP 余弦相似度关联持久目标；SigLIP 不覆盖 RAM++ 标签。
+8. 将目标状态和 SigLIP 特征写入独立 SQLite 数据库。
+9. 可选的 `label_refinement` 对 `unlabeled`、低置信或场景排除类别选择代表视图，异步调用外部云端 VLM
+   返回严格 JSON 标签；失败时保留 RAM++ 标签，成功时记录模型、候选、旧标签和时间 provenance。
 
 ## Public Interfaces
 
@@ -59,12 +154,57 @@ semantic_mapping:
       gdino_confirmation: semantic_gdino_confirmation
 ```
 
-完整配置包含 persistence、mask/depth filtering、bounded queue/batch、lifecycle、target-watch 和 public interface
+完整配置包含 persistence、mask/depth filtering、bounded queue/batch、lifecycle、labels、target-watch 和 public interface
 参数，参考 `robot_config/config/robots/lekiwi_mapping.yaml`。模型 endpoint 的唯一配置源是顶层
 `perception_services.services`；每个 role 指向一个 enabled service ID，不再直接配置 backend、endpoint 或模型
 identity。service 模式下 loader 从 schema-v2 bundle manifest 取得 semantic identity，验证精确 service type 和 required/optional
 policy，并拒绝 SigLIP2 image/text embedding metadata 不兼容的配置。检查入库的 service entries 是 disabled
 templates，因此没有 production model assets 时 YAML 仍可加载；启用建图时必须提供有效 bundle 和 named deployment。
+
+`filtering` 默认启用 map-frame 地面物体过滤。节点使用地面支撑的 `base_link` TF 高度和水平位置作为每帧参考，
+只保留底部接近地面、顶部高度、水平 footprint 和本体距离在配置范围内的几何体，以排除天花板、墙面、
+远处物体和覆盖整片地面的 mask。service backend 在 SAM2 后、局部 RAM++ 和 SigLIP2 前执行该筛选，减少后续
+模型计算；其他底盘可通过 reference frame 和 offset 校准地面高度：
+
+```yaml
+filtering:
+  ground_filter_enabled: true
+  ground_reference_frame: base_link
+  ground_height_offset_m: 0.0
+  ground_max_bottom_clearance_m: 0.15
+  ground_max_object_height_m: 0.75
+  ground_max_footprint_m: 1.2
+  max_object_distance_m: 2.5
+```
+
+`labels` 是基础标签策略，不依赖云端复核是否启用。`excluded_labels` 在 RAM++ 服务截断候选前应用，
+`min_confidence` 决定局部标签是否降级为 `unlabeled`，`max_candidates_per_mask` 控制每个 mask 返回的候选数量：
+
+```yaml
+labels:
+  min_confidence: 0.2
+  max_candidates_per_mask: 5
+  excluded_labels: [sky, traffic light, food, fruit, container]
+```
+
+云端标签复核默认关闭，不是建图或查询 readiness gate。在线请求由独立 worker 执行，不阻塞 ROS executor；
+离线请求在帧融合结束后执行。基础 `labels.excluded_labels` 同时作为复核触发和响应禁止列表，低置信标签由
+`trigger_below_confidence` 触发：
+
+```yaml
+label_refinement:
+  enabled: false
+  model: gpt-5.6-sol
+  model_identity: xunxing/gpt-5.6-sol@az.gptplus5.com
+  prompt: <complete scene-specific review instructions>
+  min_confidence: 0.8
+  trigger_below_confidence: 0.7
+  min_observations: 1
+```
+
+启用前需按 `embodied_common/vlm_models.yaml` 配置多模态模型并设置对应 API key 环境变量。例如当前
+`gpt-5.6-sol` 的 Xunxing 路由使用 `XUNXING_API_KEY`；key 只允许通过环境变量提供，禁止写入 YAML。
+外部模型必须仅返回 `label` 和 `confidence` 两个 JSON 字段；`candidate_match` 由节点根据实际候选本地推导。
 
 在线和离线建图均有独立 launch 入口，不会启动 embodied runtime。在线入口按 role list 启动所有 enabled、
 referenced generic model services；离线入口只启动 SAM2、RAM++ 和 SigLIP2 image construction services。两者把
@@ -85,8 +225,15 @@ source .shrc_local
 export ROS_DOMAIN_ID=42
 ros2 launch semantic_mapping offline_mapping.launch.py \
   config_path:=/path/to/enabled-lekiwi-mapping.yaml \
-  bag_path:=/path/to/rosbag
+  bag_path:=/path/to/rosbag \
+  max_frames:=100 frame_sampling:=uniform
 ```
+
+`frame_sampling:=uniform` 在全部可用 RGB-D/TF 帧中均匀选择 `max_frames`，而默认 `sequential` 从开头连续处理。
+诊断指定时段时可使用 `start_frame` 跳过对应数量的可用帧。
+
+每帧候选总量和模型单批上限分别由 `queue.max_masks_per_frame` 与 `queue.max_masks_per_batch` 控制。默认保留
+32 个 SAM2 候选，并由流水线拆成最多 8 个 mask 的 RAM++/SigLIP2 请求，以提高地面小目标召回而不突破模型 ABI。
 
 旧 embedded mapping 路径仍支持 Hugging Face 格式的本地 Grounding DINO，但只用于显式迁移兼容：
 
@@ -109,7 +256,7 @@ service bundles，也不要求 service semantic identities；service 模式仍�
 ## Model Assets
 
 ```bash
-./scripts/setup.sh --with-perception
+./scripts/setup.sh
 ./scripts/download_perception_models.sh
 ```
 
@@ -117,15 +264,17 @@ service bundles，也不要求 service semantic identities；service 模式仍�
 
 ```text
 models/
+├── _work/<bundle>/candidates/          # 转换中间产物，可随时归档/删除
 ├── sam2.1_hiera_tiny/{inference_manifest.json,assets/}
-├── ram_plus_swin_large_14m/{inference_manifest.json,assets/,model_utils_work/}
-├── siglip2_so400m_patch14_384/{inference_manifest.json,assets/,model_utils_work/}
-└── grounded_sam2_swint_ogc/{inference_manifest.json,assets/,model_utils_work/}
+├── ram_plus_swin_large_14m/{inference_manifest.json,assets/}
+├── siglip2_so400m_patch14_384/{inference_manifest.json,assets/}
+└── grounded_sam2_swint_ogc/{inference_manifest.json,assets/}
 ```
 
-RAM++ 还需要 `ram_models/recognize-anything/` 上游源码树供 runtime 导入 `ram` 包；源码与权重分开管理。
-`model_utils_work/` 下的转换产物不是 production deployment。只有 manifest 声明并通过对应 conformance 的
-named deployment 才能在 production SSOT 中启用。
+RAM++ runtime 由 `third_party/wheels/recognize-anything/` 中受控的 `ibrobot-ram` wheel 提供；Grounding-DINO
+runtime 由 `third_party/wheels/groundingdino/` 中受控的 `ibrobot-groundingdino` 纯 Python wheel 提供；源码与权重分开管理。
+`models/_work/` 下的转换产物不是 production deployment，也不属于任何 bundle。只有 manifest 声明并通过对应
+conformance 的 named deployment 才能在 production SSOT 中启用。
 
 映射清单使用各服务响应中经过规范化校验的 `ModelRuntimeInfo.semantic_identity_json`，SigLIP2 图像与文本查询还
 必须具有相同的 `embedding_space_id`、维度、归一化和双端预处理契约。backend、named deployment、deployment
@@ -190,17 +339,15 @@ trip、fusion commit 和 end-to-end 的 P50/P95，同时报告 throughput 和 dr
 模式要求 throughput ≥ 1 frame/s。所有 stage-specific conformance 必须先通过。阈值是初始软件 gate，必须在
 目标硬件上记录实际报告后才能 promotion；当前未验证的 `ascend_om` 仍保持 not-ready。
 
-无需 ROS 或真实设备，可使用仓库中的 RealSense RGB-D fixture 运行真实模型验证：
+无需 ROS 或真实设备，可在 IB-Robot 仓库根目录使用 RealSense RGB-D fixture 运行模型验证：
 
 ```bash
-cd /data/Research/3D_semantic/Grounded-SAM-2
-PYTHONPATH=/home/xqw/Research/IB_Robot/src/semantic_mapping \
-  ../venv/bin/python \
-  /home/xqw/Research/IB_Robot/src/semantic_mapping/scripts/verify_rgbd_fixture.py \
-  --fixture /home/xqw/Research/IB_Robot/src/perception_service/test/fixtures/realsense_rgbd_frame \
-  --grounding-model /data/Research/3D_semantic/models/grounding-dino-tiny \
-  --sam-checkpoint /data/Research/3D_semantic/Grounded-SAM-2/checkpoints/sam2.1_hiera_large.pt \
-  --siglip-model models/siglip2_so400m_patch14_384/assets/model
+source .shrc_local
+python3 src/semantic_mapping/scripts/verify_rgbd_fixture.py \
+  --fixture src/perception_service/test/fixtures/realsense_rgbd_frame \
+  --grounding-model <grounding-dino-model-path> \
+  --sam-checkpoint <sam2-checkpoint-path> \
+  --siglip-model <siglip2-model-path>
 ```
 
 安装感知依赖后，也可验证 ROS 2 节点的同步订阅、TF、持久化和查询服务。先启动节点：
@@ -236,7 +383,7 @@ librealsense 设备 bag 应通过 `realsense2_camera` 的 `rosbag_filename` 参�
 
 ## Local Verification Evidence
 
-The following checks are reproducible without a 310P board:
+The following checks are reproducible without a development board:
 
 ```bash
 source .shrc_local && PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -q \
@@ -253,4 +400,4 @@ artifact diagnostics when their production contracts are not finalized.
 Migration evidence is represented by `semantic_mapping.migration_evidence`.
 It separates local gates from board-only gates and refuses a production-default
 switch until hardware conformance and timing evidence are present. No local
-test claims 310P ACL execution, OM numerical conformance, or production latency.
+test claims development-board ACL execution, OM numerical conformance, or production latency.

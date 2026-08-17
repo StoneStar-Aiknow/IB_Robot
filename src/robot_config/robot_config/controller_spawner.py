@@ -75,8 +75,10 @@ def spawn_controller(
     controller_manager_timeout: float,
     service_call_timeout: float,
     switch_timeout: float,
+    *,
+    activate: bool = True,
 ) -> None:
-    """Ensure one controller is loaded, configured, and active."""
+    """Ensure one controller is loaded/configured and optionally active."""
     state = _list_controller_state(
         node,
         controller_manager,
@@ -120,8 +122,19 @@ def spawn_controller(
                 if state is None:
                     raise RuntimeError(f"Failed to load controller '{controller_name}'")
 
-    if state == "active":
+    if state == "active" and activate:
         node.get_logger().info(f"Controller '{controller_name}' is already active")
+        return
+
+    if state == "active" and not activate:
+        response = _call_controller_manager(
+            switch_controllers,
+            (node, controller_manager, [controller_name], [], True, True, switch_timeout, service_call_timeout),
+            (node, controller_manager, [controller_name], [], True, True, switch_timeout),
+        )
+        if not response.ok:
+            raise RuntimeError(f"Failed to deactivate controller '{controller_name}'")
+        node.get_logger().info(f"Deactivated controller '{controller_name}'")
         return
 
     if state == "unconfigured":
@@ -160,6 +173,10 @@ def spawn_controller(
 
     if state != "inactive":
         raise RuntimeError(f"Controller '{controller_name}' has unsupported lifecycle state '{state}'")
+
+    if not activate:
+        node.get_logger().info(f"Configured controller '{controller_name}' in inactive state")
+        return
 
     try:
         response = _call_controller_manager(
@@ -227,6 +244,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         default=120.0,
         help="Controller-manager timeout for activation completion.",
     )
+    parser.add_argument(
+        "--inactive",
+        action="store_true",
+        help="Load and configure the controller without activating it.",
+    )
     return parser.parse_args(rclpy.utilities.remove_ros_args(args=argv)[1:])
 
 
@@ -252,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
             args.controller_manager_timeout,
             args.service_call_timeout,
             args.switch_timeout,
+            activate=not args.inactive,
         )
         return 0
     except (RuntimeError, ServiceNotFoundError) as exc:

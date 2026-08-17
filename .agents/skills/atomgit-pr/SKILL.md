@@ -64,7 +64,9 @@ Agent 在创建 PR 时，**必须**遵循 [PR #32](https://atomgit.com/openeuler
         *   禁止把 `git diff`、`git status`、文件列表这类仅用于查看变更的命令当作 Verification。
         *   对纯文档、注释、gitignore、纯元数据等**不涉及运行时行为**的提交，可以省略 Verification，而不是生硬补一个无意义小节。
         *   如果 PR 修改了 ROS 包的 `package.xml` 依赖声明，或修改了全局 setup/build 流程相关文件（如 `scripts/setup.sh`、`scripts/build.sh`、`scripts/setup/platforms/*.sh`、`scripts/setup/verify_env.sh`、`scripts/setup/python_venv.sh`、`scripts/install_ros.sh`、顶层 `CMakeLists.txt`、顶层 `pyproject.toml`、`requirements/*.txt` 等直接影响 pip/rosdep 依赖安装的文件），则 Verification **必须提供**，且必须包含基于 `ibrobot-docker-verify` 与 `ibrobot-docker-verify-oee` 的双平台纯净 Docker `setup.sh + build.sh` 完整验证结果。ROS 包内的 `setup.py` 普通改动（例如 console entry point、Python package metadata 或 Python-only `install_requires` 调整）不单独触发该双平台门禁；只有同一 PR 还修改了 `package.xml` 依赖声明或全局 setup/build 流程文件时才触发。
-        *   触发上述门禁时，Agent 在创建或更新 PR 描述前必须先调用 `ibrobot-docker-verify` 与 `ibrobot-docker-verify-oee` 实际执行双平台验证，并把真实结果写入 Verification。提交 PR 属于作者侧发布流程，不同于 review；不要把 review 的“只检查开发者声明”规则套用到本 skill。
+         *   触发上述门禁时，Agent 在创建或更新 PR 描述前必须先记录干净 worktree 的完整 `git rev-parse HEAD`，再调用 `ibrobot-docker-verify` 与 `ibrobot-docker-verify-oee` 验证同一个 commit。Verification 必须且只能包含一个标准字段 `**Verified commit:** \`<40位 SHA>\``，并写入两平台真实结果。
+         *   创建 PR 前，脚本会将该 SHA 与已推送的 `origin/<branch>` 最新 commit 比对；更新已有 PR 前，会与 AtomGit PR 的 `head.sha` 比对。缺失、不一致或验证后又产生新 commit 都会阻止创建/更新，必须在最新 commit 上重跑双平台验证。提交 PR 属于作者侧发布流程，不同于 review；不要把 review 的“只检查开发者声明”规则套用到本 skill。
+4.  **openEuler AI 贡献披露**：Agent 创建或更新 PR 时必须提供真实的 Agent 平台及版本、AI 模型名称及版本、Prompt 摘要、人工审查确认，以及第三方材料来源和许可证信息。模型字段只记录模型本身（如 `gpt-5.6-sol`），不携带 `xunxing/` 等 provider 前缀。脚本会生成标准披露块，要求至少一个 AI-assisted commit 包含 `Co-Authored-By`，并检查所有已披露 AI 参与的 commit 都与 PR 模型完全一致；缺失或不一致时阻止提交。纯人工 commit 不要求添加 AI trailer。禁止使用 `ai`、`agent`、`unknown` 等占位值。完整政策见 [openEuler 社区生成式AI工具使用与开源贡献策略](https://www.openeuler.openatom.cn/zh/community/ai-coding-assistants/)。
 
 ```bash
 # 1. 获取变更信息（仅用于分析变更，不可直接当作 Verification）
@@ -75,10 +77,15 @@ git diff upstream/master..HEAD
 # Mermaid 仅用于能显著提升理解的复杂流程或架构变更。
 # 如果变更影响用户使用方式，要判断并同步 README / 使用文档。
 # 如果 ROS 包 package.xml 依赖声明、全局 setup/build 流程或 requirements/*.txt 变更触发门禁，创建/更新 PR 前必须先执行：
-# ibrobot-docker-verify 与 ibrobot-docker-verify-oee，再写入真实结果。
+# 先记录干净 HEAD，再对同一 commit 执行 ibrobot-docker-verify 与
+# ibrobot-docker-verify-oee；描述中写入 **Verified commit:** `<40位 SHA>`。
 
 # 3. 创建 PR
-python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --title "feat(scope): technical summary" --description-file pr_description.md
+python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu \
+  --title "feat(scope): technical summary" --description-file pr_description.md \
+  --agent-tool "OpenCode 1.2.3" --ai-model "gpt-5.6-sol" \
+  --prompt-summary "Implement the requested feature and verify the affected workflows" \
+  --third-party-materials "无" --human-reviewed
 ```
 
 ### 基础用法
@@ -88,7 +95,11 @@ python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --title "f
 git remote -v
 
 # 步骤2: 创建 PR（章节按实际变更组织；Verification 仅在存在真实验证时提供）
-python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --title "fix: specific issue" --body "## Background\n...\n## Changes\n...\n## Impact\n..."
+python3 pr_creation.py --branch feat/my-feature --fork-owner BreezeWu --title "fix: specific issue" \
+  --body "## Background\n...\n## Changes\n...\n## Impact\n..." \
+  --agent-tool "OpenCode 1.2.3" --ai-model "gpt-5.6-sol" \
+  --prompt-summary "Fix the reported issue and add focused verification" \
+  --third-party-materials "无" --human-reviewed
 
 # 如果本次变更做过真实验证，再补充 Verification 小节，写清场景 / 方法 / 结果
 
@@ -111,6 +122,7 @@ python3 pr_management.py --pr 123 --fetch-info
 python3 pr_management.py --pr 123 --fetch-info --no-comments
 ```
 Agent 会读取生成的 `tmp/{repo}_pr_123_context.json`，其中默认包含提交记录、修改文件、代码 Diff (patch) 以及 PR 评论。
+`metadata.head_sha` 是更新描述时必须匹配的 PR 最新 commit；门禁触发后，旧 Docker 结果不能沿用到新的 SHA。
 
 **步骤 2: Agent 分析与同步**
 Agent 分析完 Diff 后，会生成一份 `description.json`:
@@ -122,7 +134,10 @@ Agent 分析完 Diff 后，会生成一份 `description.json`:
 ```
 然后运行同步命令：
 ```bash
-python3 pr_management.py --pr 123 --update-pr description.json
+python3 pr_management.py --pr 123 --update-pr description.json \
+  --agent-tool "OpenCode 1.2.3" --ai-model "gpt-5.6-sol" \
+  --prompt-summary "Synchronize the PR description with the complete branch diff" \
+  --third-party-materials "无" --human-reviewed
 ```
 
 ## API 说明
@@ -142,6 +157,11 @@ python3 pr_management.py --pr 123 --update-pr description.json
 - `--url`: AtomGit / GitCode 仓库或 PR 链接（可选，自动解析 `owner/repo`）
 - `--draft`: 创建草稿 PR（可选）
 - `--dry-run`: 仅显示计划，不创建
+- `--agent-tool`: Agent 平台名称及版本（必需）
+- `--ai-model`: AI 模型名称及版本（必需，不含 provider 前缀，必须与 commit trailer 一致）
+- `--prompt-summary`: 核心提示词或核心意图摘要（必需）
+- `--third-party-materials`: 第三方材料、来源及许可证；没有时明确写“无”（必需）
+- `--human-reviewed`: 确认开发者已人工审查；非 dry-run 创建时必需
 
 **示例**:
 ```bash
@@ -167,7 +187,8 @@ python3 pr_creation.py --branch feat/new-feature --fork-owner BreezeWu --title "
 - `--url`: PR 链接（可选，自动解析 `owner/repo/pr_number`）
 - `--output-dir`: JSON 输出目录 (默认: ./tmp)
 - `--no-comments`: 在 `--fetch-info` 模式下跳过 PR 评论抓取
-- `--ai-model`: 签名使用的 AI 名称 (默认: agent)
+- `--agent-tool` / `--ai-model` / `--prompt-summary` / `--third-party-materials`: 更新 PR 时必需的 openEuler AI 披露元数据
+- `--human-reviewed`: 确认开发者已人工审查；非 dry-run 更新时必需
 - `--dry-run`: 预览生成的描述但不执行更新
 
 ## PR 描述格式
@@ -183,12 +204,13 @@ PR 描述通常应包含与本次提交最相关的内容，而不是固定模�
 - **验证结果（可选）**：仅在存在真实验证时写清场景、方法与结果
 
 对于纯文档、注释、`.gitignore`、说明文字等不涉及运行时行为的 PR，可以不写 Verification。
-但若变更涉及 ROS 包 `package.xml` 依赖声明或全局 setup/build 流程（含 `requirements/*.txt`），Verification 为**必填**，且必须覆盖 Ubuntu 与 openEuler 纯净 Docker 的 `setup.sh + build.sh` 完整验证。ROS 包内 `setup.py` 普通改动不单独触发该门禁。创建或更新 PR 描述前，Agent 必须调用 `ibrobot-docker-verify` 和 `ibrobot-docker-verify-oee` 实际执行验证并写入真实结果；这条规则只适用于作者侧提交 PR 流程，不适用于 `atomgit-pr-review` 的 reviewer 审查流程。
+但若变更涉及 ROS 包 `package.xml` 依赖声明或全局 setup/build 流程（含 `requirements/*.txt`），Verification 为**必填**，且必须覆盖 Ubuntu 与 openEuler 纯净 Docker 的 `setup.sh + build.sh` 完整验证。ROS 包内 `setup.py` 普通改动不单独触发该门禁。创建或更新 PR 描述前，Agent 必须从干净 HEAD 记录完整 SHA，让 `ibrobot-docker-verify` 和 `ibrobot-docker-verify-oee` 验证该同一 commit，并写入唯一标准字段 `**Verified commit:** \`<40位 SHA>\``。脚本将此字段与远端分支或 PR 最新 commit 强制比对；这条规则只适用于作者侧提交 PR 流程，不适用于 `atomgit-pr-review` 的 reviewer 审查流程。
 
 ## 注意事项
 
 1. **分支命名**: 建议使用 `feat/`, `fix/`, `docs/`, `refactor/` 等前缀
-2. **提交信息**: 确保提交信息符合规范
-3. **代码审查**: 创建 PR 后等待代码审查
-4. **CI 检查**: 确保 CI 通过后再合并
-5. **跨仓库前提**: 创建 PR 时当前本地 worktree 仍需与目标仓库代码相匹配；`--owner/--repo/--url` 只负责切换 AtomGit API 目标，不会替你切换本地 Git 工作区
+2. **提交历史规范的唯一入口**: 创建或更新 PR 前，必须调用 `ibrobot-git-flow` 执行 commit hygiene 检查。提交格式、commit 数量、review 修复应折回已有 commit 还是作为独立新 commit，以及历史重写/推送方式，均以该 skill 的当前规则和例外为唯一事实来源；本 skill 不复制或覆盖这些判定。
+3. **AI 元数据一致性**: PR 的模型信息必须与所有 AI-assisted commit 的 `Co-Authored-By` 完全一致；脚本将不一致视为阻塞错误。
+4. **代码审查**: 创建 PR 后等待代码审查
+5. **CI 检查**: 确保 CI 通过后再合并
+6. **跨仓库前提**: 创建 PR 时当前本地 worktree 仍需与目标仓库代码相匹配；`--owner/--repo/--url` 只负责切换 AtomGit API 目标，不会替你切换本地 Git 工作区

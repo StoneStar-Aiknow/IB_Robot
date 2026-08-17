@@ -6,8 +6,9 @@
 # The SkillCommand name in v1 carries both Atomic Operator and Skill to limit
 # the IDL migration surface; admission reads semantic_level from the snapshot
 # and validates the v1 structural invariants. Callers must not self-report the
-# level. The four parameter fields target_name/place_name/motion_direction/
-# motion_distance must stay in sync with WorkflowStep and ValidateSkill.
+# level. The five parameter fields target_name/container_name/place_name/
+# motion_direction/motion_distance must stay in sync with WorkflowStep and
+# ValidateSkill.
 # dispatch_binding carries the full task/version envelope (task_id moved here).
 # timeout_sec is the per-catalog-entry request cap.
 #
@@ -21,6 +22,7 @@
 DispatchBinding dispatch_binding
 string skill_name
 string target_name
+string container_name
 string place_name
 string motion_direction
 float32 motion_distance
@@ -36,6 +38,7 @@ uint64 actual_registry_generation
 string actual_registry_digest
 string source_release_digest
 string provenance_digest
+string debug_output_dir
 SkillDiagnostic[] diagnostics
 ---
 # --- Feedback ---

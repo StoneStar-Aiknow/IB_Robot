@@ -71,9 +71,11 @@ MODEL_BUNDLE_ROOT=models/pi05 \
 ```
 
 `MODEL_BUNDLE_ROOT` 是必填 workspace 相对路径。输出默认为 `models/pi05_hmm_standard`，可通过
-`PI05_HMM_OUTPUT` 覆盖；为防止混入旧 HMONNX/TCIM 产物，输出路径已存在时脚本会拒绝运行。入口
+`PI05_HMM_OUTPUT` 覆盖；中间产物（ONNX、HMONNX、TCIM 编译缓存、calibration）写入
+`models/_work/<输出名>/`（`PI05_HMM_WORK` 可覆盖），不会进入 bundle。为防止混入旧
+HMONNX/TCIM 产物，输出路径已存在时脚本会拒绝运行。入口
 严格加载当前 checkpoint 和 patched LeRobot，使用 `transformers==5.3.0` 导出 native PaliGemma
-prefill 与 action-expert decode 图。容器中的 `torchao==0.17.0` 会在导入前卸载。输出目录中的
+prefill 与 action-expert decode 图。容器中的 `torchao==0.17.0` 会在导入前卸载。work 目录中的
 `provenance.json` 记录 checkpoint SHA-256、IB-Robot/LeRobot commit、镜像 ID、Transformers、
 xhquant 和 TCIM 版本。`embedding.pt["weight"]` 必须与当前 checkpoint 的
 `model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight` 完全一致。
@@ -104,7 +106,9 @@ MODEL_BUNDLE_ROOT=models/smolvla ./scripts/convert_hmm.sh smolvla
 
 `MODEL_BUNDLE_ROOT` 是必填的 workspace 相对路径，没有默认值。未设置、传入空值、绝对路径或
 不存在的目录时，脚本会在启动容器前失败。输出默认为 `models/smolvla_hmm_standard`，可通过
-`SMOLVLA_HMM_OUTPUT`、`SMOLVLA_EXPORT_DEVICE` 和 `HOUMO_IMAGE` 覆盖其他参数。脚本会校验仓库维护的
+`SMOLVLA_HMM_OUTPUT` 覆盖；ONNX、HMONNX、TCIM 编译缓存和 calibration 等中间产物写入
+`models/_work/<输出名>/`（`SMOLVLA_HMM_WORK` 可覆盖），bundle 只保留 manifest 引用的制品
+和 LeRobot 元数据。还可通过 `SMOLVLA_EXPORT_DEVICE` 和 `HOUMO_IMAGE` 覆盖其他参数。脚本会校验仓库维护的
 LeRobot v0.5.1 patch 分支和 clean 状态，在 Houmo 1.3.0 容器中导出 ONNX、执行 xhquant PTQ、
 调用 TCIM 编译三个 HMM，并通过 strict loader 生成和验证 `inference_manifest.json`。
 
@@ -118,7 +122,7 @@ action 图使用 CUDA float32，避免 denoise 分支在 fp16 tracing 时发生 
 prefill 在 CUDA 上使用 float16。PTQ calibration 文件直接保存对应 PyTorch dummy inputs，
 其中 action KV cache 来自同次 prefill 前向。
 
-输出目录还包含 `provenance.json`，记录 IB-Robot/LeRobot commit、checkpoint SHA-256、容器镜像、
+work 目录还包含 `provenance.json`，记录 IB-Robot/LeRobot commit、checkpoint SHA-256、容器镜像、
 依赖版本、导出 shape 和量化参数。该文件用于追溯转换来源，不替代 runtime manifest。
 
 ## 三、组装统一 Deployment

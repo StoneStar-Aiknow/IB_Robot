@@ -92,21 +92,26 @@ def test_offline_launch_passes_explicit_bag_and_shared_contract(tmp_path: Path) 
                 "config_path": str(_enabled_config(tmp_path)),
                 "bag_path": "/data/maps/run-1",
                 "storage_id": "mcap",
+                "start_frame": "120",
+                "frame_sampling": "uniform",
             }
         )
     )
 
-    assert len(actions) == 4
-    assert {vars(node)["_Node__node_name"] for node in actions[:-1]} == {
+    assert len(actions) == 5
+    assert {vars(node)["_Node__node_name"] for node in actions[:3]} == {
         "model_service_semantic_sam2_masks",
         "model_service_semantic_ram_plus_tags",
         "model_service_semantic_siglip2_image",
     }
-    node = actions[-1]
+    node = actions[-2]
     assert vars(node)["_Node__node_executable"] == "offline_mapping_node"
+    assert actions[-1].__class__.__name__ == "RegisterEventHandler"
     parameters = _node_parameters(node)
     assert parameters["bag_path"] == "/data/maps/run-1"
     assert parameters["storage_id"] == "mcap"
+    assert parameters["start_frame"] == 120
+    assert parameters["frame_sampling"] == "uniform"
     assert '"logical_model_revision":"sam2@v1"' in parameters["sam_model_identity"]
     generic_parameters = _node_parameters(actions[0])
     assert generic_parameters["require_semantic_identity"] is True

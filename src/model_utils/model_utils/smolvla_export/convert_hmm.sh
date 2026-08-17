@@ -4,6 +4,7 @@ set -euo pipefail
 WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 IMAGE="${HOUMO_IMAGE:-harbor.houmo.ai/toolchain/release:Dadao-xh2-v1.3.0-ubuntu24.04-x86.64}"
 OUTPUT_REL="${SMOLVLA_HMM_OUTPUT:-models/smolvla_hmm_standard}"
+WORK_REL="${SMOLVLA_HMM_WORK:-models/_work/${OUTPUT_REL##*/}}"
 DEVICE="${SMOLVLA_EXPORT_DEVICE:-cuda}"
 PIP_CACHE="${PIP_CACHE_DIR:-${HOME}/.cache/pip}"
 TRANSFORMERS_CANDIDATES="${SMOLVLA_TRANSFORMERS_CANDIDATES:-5.3.0 4.57.1}"
@@ -112,13 +113,14 @@ PY
             --repo-root /workspace \
             --model-path /workspace/${MODEL_BUNDLE_REL} \
             --lerobot-src /workspace/libs/lerobot/src \
-            --output-dir /workspace/${OUTPUT_REL} \
+            --output-dir /workspace/${WORK_REL} \
+            --bundle-root /workspace/${OUTPUT_REL} \
             --device ${DEVICE}
         python3 -m model_utils.smolvla_export.build_hmm_modules \
-            --output-dir /workspace/${OUTPUT_REL}
+            --output-dir /workspace/${WORK_REL}
         python3 -m model_utils.smolvla_export.package_hmm_modules \
             --bundle-root /workspace/${OUTPUT_REL} \
-            --output-dir /workspace/${OUTPUT_REL} \
+            --output-dir /workspace/${WORK_REL} \
             --deployment hmm \
             --target-soc lq50 \
             --target-runtime tcim-lite

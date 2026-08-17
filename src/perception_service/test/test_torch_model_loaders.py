@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from perception_service.torch_model_loaders import _GroundedSAM2Module, _SAM2Module, _SigLIP2Module
+from perception_service.torch_model_loaders import _GraspGenModule, _GroundedSAM2Module, _SAM2Module, _SigLIP2Module
 
 
 def test_sam2_module_preserves_empty_source_geometry() -> None:
@@ -107,3 +107,57 @@ def test_siglip2_module_supports_zero_length_unused_batches() -> None:
     assert image_outputs["text_embeddings"].shape == (0, 4)
     assert text_outputs["image_embeddings"].shape == (0, 4)
     assert text_outputs["text_embeddings"].shape == (3, 4)
+
+
+class _FakeGraspTensor:
+    def __init__(self, value):
+        self.value = np.asarray(value)
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        return self.value
+
+    def to(self, dtype):
+        return self.value.astype(dtype)
+
+    def __len__(self):
+        return len(self.value)
+
+
+class _FakeGraspTorch:
+    float32 = np.float32
+
+    @staticmethod
+    def empty(shape, dtype):
+        return _FakeGraspTensor(np.empty(shape, dtype=dtype))
+
+
+def test_graspgen_module_runs_once_and_preserves_empty_output_geometry(monkeypatch) -> None:
+    calls = []
+
+    def run_inference(points, sampler, **options):
+        calls.append((points, sampler, options))
+        return _FakeGraspTensor(np.empty((0,))), _FakeGraspTensor(np.empty((0,)))
+
+    monkeypatch.setattr("grasp_gen.grasp_server.GraspGenSampler.run_inference", run_inference)
+    module = _GraspGenModule(
+        "sampler",
+        SimpleNamespace(kappa=2.0, grasp_batch_size=1000),
+        _FakeGraspTorch(),
+    )
+
+    outputs = module({"observation.object_points": _FakeGraspTensor(np.ones((32, 3), dtype=np.float32))})
+
+    assert calls[0][0].shape == (32, 3)
+    assert calls[0][1] == "sampler"
+    assert calls[0][2]["topk_num_grasps"] == 1000
+    assert calls[0][2]["min_grasps"] == 1
+    assert calls[0][2]["max_tries"] == 1
+    assert calls[0][2]["remove_outliers"] is False
+    assert outputs["grasp.poses"].shape == (0, 4, 4)
+    assert outputs["grasp.confidence"].shape == (0,)

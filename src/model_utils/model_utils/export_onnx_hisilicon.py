@@ -102,7 +102,7 @@ def parse_args():
         "--work_dir",
         type=str,
         default=None,
-        help="ONNX work directory (default: <bundle>/model_utils_work/hisilicon)",
+        help="ONNX work directory (default: models/_work/<bundle>/hisilicon)",
     )
     parser.add_argument(
         "--bundle_output",

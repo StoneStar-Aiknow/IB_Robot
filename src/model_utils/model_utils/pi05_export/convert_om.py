@@ -101,7 +101,12 @@ def _has_atc_arg(extra_args: list[str], name: str) -> bool:
 
 
 def _default_om_output(manifest_dir: Path, role: str) -> Path:
-    return manifest_dir / "model_utils_work" / "ascend" / "pi05" / f"{role}.om"
+    """Default OM work output under ``models/_work`` so the bundle stays releasable."""
+
+    for models_root in manifest_dir.parents:
+        if models_root.name == "models":
+            return models_root / "_work" / manifest_dir.relative_to(models_root) / "ascend" / "pi05" / f"{role}.om"
+    return manifest_dir.parent / "_work" / manifest_dir.name / "ascend" / "pi05" / f"{role}.om"
 
 
 def _run_atc(
@@ -496,13 +501,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--vlm-om",
         type=str,
         default=None,
-        help="ATC VLM OM work output (default: <bundle>/model_utils_work/ascend/pi05/vlm.om).",
+        help="ATC VLM OM work output (default: models/_work/<bundle>/ascend/pi05/vlm.om).",
     )
     p.add_argument(
         "--ae-om",
         type=str,
         default=None,
-        help="ATC Action Expert OM work output (default: <bundle>/model_utils_work/ascend/pi05/action_expert.om).",
+        help="ATC Action Expert OM work output (default: models/_work/<bundle>/ascend/pi05/action_expert.om).",
     )
     p.add_argument(
         "--vlm-abi",

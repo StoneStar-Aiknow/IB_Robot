@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import struct
 import time
+import traceback
 from collections.abc import Sequence
 from contextlib import suppress
 from threading import RLock
@@ -12,11 +13,13 @@ from threading import RLock
 import rclpy
 from action_msgs.msg import GoalStatus
 from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
+from rclpy.action.server import GoalEvent
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
 from embodied_agent.agent_plan_store import AgentPlan, AgentPlanError, AgentPlanStore
+from embodied_common.agent_terminal_contract import stable_agent_execution_error_code
 from embodied_common.dispatch_binding import new_binding, workflow_step
 from embodied_common.skill_request import derive_skill_task_id
 from embodied_common.workflow_contracts import (
@@ -51,48 +54,6 @@ class _WorkflowStateUnknown(AgentPlanError):
 
 class _ExecutionAlreadyActive(AgentPlanError):
     """A retry observed an existing execution and must not mutate its state."""
-
-
-_STABLE_EXECUTION_CODES = {
-    "CAPABILITY_NOT_READY",
-    "CONTROL_MODE_MISMATCH",
-    "GATEWAY_FINALIZATION_FAILED",
-    "GOAL_NOT_FOUND",
-    "MOTION_NOT_AUTHORIZED",
-    "SKILL_BUSY",
-    "SKILL_CANCELLED",
-    "SKILL_CANCEL_TIMEOUT",
-    "SKILL_DISPATCH_NOT_AUTHORIZED",
-    "SKILL_EXECUTION_BUSY",
-    "SKILL_EXECUTOR_IDENTITY_MISMATCH",
-    "SKILL_LIMIT_VIOLATION",
-    "SKILL_REGISTRY_EPOCH_MISMATCH",
-    "SKILL_REGISTRY_NOT_READY",
-    "SKILL_REGISTRY_VERSION_MISMATCH",
-    "SKILL_REQUEST_ID_CONFLICT",
-    "SKILL_SCHEMA_INVALID",
-    "SKILL_SNAPSHOT_DIGEST_MISMATCH",
-    "SKILL_SNAPSHOT_NOT_RETAINED",
-    "SKILL_TASK_BUDGET_MISMATCH",
-    "SKILL_TASK_DEADLINE_EXPIRED",
-    "SKILL_WORKFLOW_DIGEST_MISMATCH",
-    "SKILL_WORKFLOW_LEASE_MISMATCH",
-    "SKILL_WORKFLOW_STEP_MISMATCH",
-    "TIMEOUT_EXCEEDS_POLICY",
-}
-
-
-def _stable_execution_error_code(error_code: str) -> str:
-    code = str(error_code).strip()
-    if code in _STABLE_EXECUTION_CODES:
-        return code
-    if code == "CANCEL_CLEANUP_TIMEOUT":
-        return "SKILL_CANCEL_TIMEOUT"
-    if "TIMEOUT" in code:
-        return "SKILL_TASK_DEADLINE_EXPIRED"
-    if "EXECUTOR" in code and ("IDENTITY" in code or "VERSION" in code):
-        return "SKILL_EXECUTOR_IDENTITY_MISMATCH"
-    return "CAPABILITY_NOT_READY"
 
 
 class AgentPlanNode(Node):
@@ -203,6 +164,24 @@ class AgentPlanNode(Node):
         return CancelResponse.ACCEPT
 
     @staticmethod
+    def _mark_replayed_canceled(goal_handle) -> None:
+        """Move a fresh idempotent replay through ROS 2's canceling state.
+
+        Uses ServerGoalHandle._update_state, private in rclpy; verified against
+        Humble at adoption time. Re-verify on rclpy upgrades (see
+        test_agent_plan_node replay-cancel tests).
+        """
+        if not goal_handle.is_cancel_requested:
+            update = getattr(goal_handle, "_update_state", None)
+            if update is None or not hasattr(goal_handle, "is_cancel_requested"):
+                raise AgentPlanError(
+                    "SKILL_CANCEL_TIMEOUT",
+                    "rclpy goal-handle API changed; replay cancel unavailable",
+                )
+            update(GoalEvent.CANCEL_GOAL)
+        goal_handle.canceled()
+
+    @staticmethod
     def _wait_future(future, timeout_sec: float) -> bool:
         deadline = time.monotonic() + timeout_sec
         while rclpy.ok() and not future.done() and time.monotonic() < deadline:
@@ -259,6 +238,12 @@ class AgentPlanNode(Node):
         diagnostic.message = message
         return diagnostic
 
+    def _log_unexpected_service_error(self, operation: str, exc: Exception) -> None:
+        self.get_logger().error(
+            f"[agent_plan] unexpected {operation} failure; keeping plan services available: {exc}\n"
+            f"{traceback.format_exc()}"
+        )
+
     @staticmethod
     def _copy_diagnostics(diagnostics: Sequence[SkillDiagnostic]) -> list[SkillDiagnostic]:
         return list(diagnostics)
@@ -288,6 +273,7 @@ class AgentPlanNode(Node):
         return workflow_step(
             skill_name=step.skill_name,
             target_name=step.target_name,
+            container_name=step.container_name,
             place_name=step.place_name,
             motion_direction=step.motion_direction,
             motion_distance=step.motion_distance,
@@ -302,6 +288,7 @@ class AgentPlanNode(Node):
                     schema_version=1,
                     skill_name=step.skill_name,
                     target_name=step.target_name,
+                    container_name=step.container_name,
                     place_name=step.place_name,
                     motion_direction=step.motion_direction.strip().lower(),
                     motion_distance=self._float32(step.motion_distance),
@@ -348,6 +335,12 @@ class AgentPlanNode(Node):
             response.error_code = exc.code
             response.message = str(exc)
             response.diagnostics = [self._diagnostic(exc.code, str(exc))]
+        except Exception as exc:
+            self._log_unexpected_service_error("plan", exc)
+            response.success = False
+            response.error_code = "CAPABILITY_NOT_READY"
+            response.message = "agent plan service is temporarily unavailable"
+            response.diagnostics = [self._diagnostic(response.error_code, response.message)]
         return response
 
     def _validate_step(self, plan: AgentPlan, step: CanonicalWorkflowStep):
@@ -358,6 +351,7 @@ class AgentPlanNode(Node):
         request.dispatch_binding.expected_registry_digest = plan.registry_digest
         request.skill_name = step.skill_name
         request.target_name = step.target_name
+        request.container_name = step.container_name
         request.place_name = step.place_name
         request.motion_direction = step.motion_direction
         request.motion_distance = step.motion_distance
@@ -413,6 +407,12 @@ class AgentPlanNode(Node):
             response.error_code = exc.code
             response.message = str(exc)
             response.diagnostics = [self._diagnostic(exc.code, str(exc))]
+        except Exception as exc:
+            self._log_unexpected_service_error("validation", exc)
+            response.allowed = False
+            response.error_code = "CAPABILITY_NOT_READY"
+            response.message = "agent plan validation is temporarily unavailable"
+            response.diagnostics = [self._diagnostic(response.error_code, response.message)]
         return response
 
     def _confirm_plan(self, request, response):
@@ -451,6 +451,12 @@ class AgentPlanNode(Node):
             response.error_code = exc.code
             response.message = str(exc)
             response.diagnostics = [self._diagnostic(exc.code, str(exc))]
+        except Exception as exc:
+            self._log_unexpected_service_error("confirmation", exc)
+            response.confirmed = False
+            response.error_code = "CAPABILITY_NOT_READY"
+            response.message = "agent plan confirmation is temporarily unavailable"
+            response.diagnostics = [self._diagnostic(response.error_code, response.message)]
         return response
 
     def _root_binding(self, plan: AgentPlan, task_id: str, execution):
@@ -488,6 +494,7 @@ class AgentPlanNode(Node):
         goal.dispatch_binding = binding
         goal.skill_name = step.skill_name
         goal.target_name = step.target_name
+        goal.container_name = step.container_name
         goal.place_name = step.place_name
         goal.motion_direction = step.motion_direction
         goal.motion_distance = step.motion_distance
@@ -532,14 +539,14 @@ class AgentPlanNode(Node):
             raise AgentPlanError("SKILL_CANCELLED", getattr(result, "message", "skill was canceled"))
         if terminal_status == GoalStatus.STATUS_ABORTED:
             raise AgentPlanError(
-                _stable_execution_error_code(getattr(result, "error_code", "")),
+                stable_agent_execution_error_code(getattr(result, "error_code", "")),
                 getattr(result, "message", "") or "skill action was aborted",
             )
         if result is None or terminal_status != GoalStatus.STATUS_SUCCEEDED:
             raise _ChildStateUnknown("SKILL_CANCEL_TIMEOUT", "skill terminal result is unknown")
         if not result.success:
             raise AgentPlanError(
-                _stable_execution_error_code(result.error_code if result is not None else ""),
+                stable_agent_execution_error_code(result.error_code if result is not None else ""),
                 result.message if result is not None else "skill result missing",
             )
         actual_identity = (
@@ -603,11 +610,13 @@ class AgentPlanNode(Node):
         result = ExecuteAgentPlan.Result()
         completed = 0
         plan = None
+        execution = None
         binding = None
         workflow_started = False
         try:
             status = self._gateway_status()
             with self._store_lock:
+                plan = self._store.get_for_execution(request.plan_token)
                 execution = self._store.accept_execution(
                     plan_token=request.plan_token,
                     confirmation_token=request.confirmation_token,
@@ -631,6 +640,8 @@ class AgentPlanNode(Node):
                 result.actual_registry_digest = plan.registry_digest
                 if result.success:
                     goal_handle.succeed()
+                elif result.error_code == "SKILL_CANCELLED":
+                    self._mark_replayed_canceled(goal_handle)
                 else:
                     goal_handle.abort()
                 return result
@@ -716,7 +727,7 @@ class AgentPlanNode(Node):
                     finalization_converged = False
             if not finalization_converged:
                 exc = AgentPlanError("SKILL_CANCEL_TIMEOUT", "workflow finalization state is unknown")
-            if plan is not None and finalization_converged:
+            if execution is not None and finalization_converged:
                 with self._store_lock, suppress(AgentPlanError):
                     self._store.mark_terminal(
                         plan_token=plan.plan_token,
@@ -751,7 +762,14 @@ def main(args=None) -> None:
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
     try:
-        executor.spin()
+        while rclpy.ok():
+            try:
+                executor.spin_once()
+            except Exception as exc:
+                node.get_logger().error(
+                    "[agent_plan] executor callback failed; keeping plan services available: "
+                    f"{exc}\n{traceback.format_exc()}"
+                )
     finally:
         executor.shutdown()
         node.destroy_node()

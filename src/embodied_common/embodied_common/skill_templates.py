@@ -44,7 +44,7 @@ DEFAULT_SKILL_TEMPLATES: dict[str, dict[str, Any]] = {
     },
 }
 
-SUPPORTED_SKILL_EXECUTORS = {"grasp_pipeline"}
+SUPPORTED_SKILL_EXECUTORS = {"grasp_pipeline", "placement_pipeline"}
 DEFAULT_ALLOWED_SKILLS = list(DEFAULT_SKILL_TEMPLATES.keys())
 
 

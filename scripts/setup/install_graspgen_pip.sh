@@ -27,10 +27,10 @@ PY
         return 0
     fi
 
-    log_error "--with-grasp requires a CUDA toolkit before installing GraspGen pointnet2_ops."
+    log_error "GraspGen pointnet2_ops requires a CUDA toolkit before installing."
     log_error "Set CUDA_HOME to a CUDA toolkit root with bin/nvcc, or install a matching toolkit"
     log_error "such as /usr/local/cuda-${torch_cuda_version:-<torch-cuda-version>}."
-    log_error "Use --with-perception without --with-grasp on CPU-only setup verification hosts."
+    log_error "GraspGen is now installed by default on Ubuntu; CPU-only hosts cannot build pointnet2_ops."
     return 1
 }
 

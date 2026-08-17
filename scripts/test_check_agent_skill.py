@@ -26,17 +26,18 @@ def test_canonical_skill_contract_passes():
     assert _load_checker().validate_skill(CANONICAL_SKILL) == []
 
 
-def test_checker_requires_confirmation_and_cancel_truthfulness(valid_skill):
+def test_checker_requires_immediate_binding_and_cancel_truthfulness(valid_skill):
     checker = _load_checker()
     content = valid_skill.read_text(encoding="utf-8")
-    content = content.replace("explicit user\n   motion confirmation", "operator approval")
-    content = content.replace("explicit user motion confirmation", "operator approval")
+    content = content.replace("Immediately bind that exact tuple once", "Bind the tuple later")
+    content = content.replace("not a second user confirmation gate", "a user confirmation gate")
     content = content.replace("Cancellation requested is not robot stopped", "Cancellation is complete")
     valid_skill.write_text(content, encoding="utf-8")
 
     errors = checker.validate_skill(valid_skill)
 
-    assert "missing explicit user motion confirmation requirement" in errors
+    assert "missing immediate internal plan binding requirement" in errors
+    assert "missing no-second-confirmation-gate requirement" in errors
     assert "missing cancellation truthfulness requirement" in errors
 
 
@@ -55,17 +56,17 @@ def test_checker_requires_plan_command_order_and_prohibitions(valid_skill):
     assert "missing prohibition: enable motion authorization" in errors
 
 
-def test_checker_requires_exact_display_before_confirmation(valid_skill):
+def test_checker_requires_exact_display_and_flush_before_binding(valid_skill):
     checker = _load_checker()
     content = valid_skill.read_text(encoding="utf-8")
     content = content.replace("exact ordered steps", "summary")
-    content = content.replace("explicit user\n   motion confirmation", "operator approval", 1)
+    content = content.replace("then flush the", "then continue", 1)
     valid_skill.write_text(content, encoding="utf-8")
 
     errors = checker.validate_skill(valid_skill)
 
     assert "workflow must display the exact plan, digest, registry identity, and fresh task ID" in errors
-    assert "explicit user motion confirmation must appear between validate-plan and confirm-plan" in errors
+    assert "plan presentation flush must appear between validate-plan and confirm-plan" in errors
 
 
 def test_checker_requires_plan_cancel_and_routing(valid_skill):

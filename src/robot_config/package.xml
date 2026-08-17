@@ -18,6 +18,15 @@
   <depend>embodied_common</depend>
   <depend>inference_manifest</depend>
   <depend>ament_index_python</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ros2bag</exec_depend>
+  <exec_depend>rosbag2_storage_mcap</exec_depend>
+  <exec_depend>robot_calibration</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+
+  <!-- MoveIt task-level execution (launched by launch_builders/task_execution.py) -->
+  <exec_depend>task_dispatch</exec_depend>
 
   <!-- Camera drivers (executed, not linked) -->
   <exec_depend>usb_cam</exec_depend>
@@ -26,6 +35,11 @@
   <exec_depend>rtabmap_launch</exec_depend>
   <exec_depend>depthimage_to_laserscan</exec_depend>
   <exec_depend>ldlidar_ros2</exec_depend>
+  <exec_depend>pointcloud_to_laserscan</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>livox_ros_driver2</exec_depend>
+  <exec_depend>fast_lio</exec_depend>
+  <exec_depend>rviz2</exec_depend>
   <exec_depend>joy</exec_depend>
   <exec_depend>joy_teleop</exec_depend>
   <exec_depend>robot_localization</exec_depend>

@@ -55,10 +55,19 @@ capability:
     - motion_distance
   recovery_policy: ask_user
 implementations:
-  so101_handeye_realsense_grasp: implementations/so101_handeye_realsense_grasp.yaml
+  lekiwi_handeye_realsense_grasp: implementations/lekiwi_handeye_realsense_grasp.yaml
+  lekiwi_handeye_realsense_grasp_pc: implementations/lekiwi_handeye_realsense_grasp_pc.yaml
   so101_arm_v1: implementations/so101_arm_v1.yaml
 description_variants:
-  so101_handeye_realsense_grasp:
+  lekiwi_handeye_realsense_grasp:
+    summary: Translate the end-effector by a requested direction and distance.
+    category: translation
+    when_to_use:
+    - make a small corrective end-effector move
+    motion_scope:
+    - arm
+    intensity: moderate
+  lekiwi_handeye_realsense_grasp_pc:
     summary: Translate the end-effector by a requested direction and distance.
     category: translation
     when_to_use:

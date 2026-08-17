@@ -43,13 +43,26 @@ revision 和轻量结构摘要，并允许 compiled artifact 声明内容 SHA-25
       },
       "execution": ["vlm", "action_expert"],
       "bindings": {},
-      "device_links": []
+      "device_links": [],
+      "state_links": {
+        "model": [
+          {
+            "input_semantic": "host.model.state_in",
+            "output_semantic": "host.model.state_out",
+            "initialization": "zero"
+          }
+        ]
+      }
     }
   }
 }
 ```
 
 实际 compiled deployment 必须提供完整 `bindings`；示例省略了 tensor 内容。
+`state_links` 是可选 deployment contract，用 semantic 配对 recurrent 输出与下一次调用输入；
+无状态的历史 v2 manifest 省略该字段，其 deployment fingerprint 保持不变。
+state link 两端必须是带显式 runtime index 的 `host.*` binding，并保持 dtype/shape 一致；
+它可以覆盖部分 execution role，但当前不能与 `device_links` 同时使用。
 张量 `shape` 使用 ONNX/ACL 语义：空数组 `[]` 表示 rank-0 scalar，`-1` 表示动态维度。
 
 ## Identity

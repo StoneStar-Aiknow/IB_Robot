@@ -81,8 +81,24 @@ def test_delegated_dispatch_nonce_is_forwarded_to_primitive() -> None:
 
     executor._run_primitive(object(), 1.0, "task", "move_to_named_pose")
 
-    assert executor._primitive_client.goals[0].dispatch_binding.dispatch_nonce == "delegated-nonce"
-    assert executor._primitive_client.goals[0].dispatch_binding.expected_registry_generation == 2
+    goal = executor._primitive_client.goals[0]
+    assert goal.dispatch_binding.dispatch_nonce == "delegated-nonce"
+    assert goal.dispatch_binding.expected_registry_generation == 2
+    assert goal.timeout_sec == 0.0
+
+
+def test_supervised_direct_primitive_uses_unique_external_root_binding() -> None:
+    executor = _PrimitiveHarness(success=True)
+    executor._supervised_direct = True
+    executor._direct_primitive_index = 0
+
+    executor._run_primitive(object(), 1.0, "task", "move_to_named_pose")
+
+    binding = executor._primitive_client.goals[0].dispatch_binding
+    assert binding.task_id == "task/primitive-1"
+    assert binding.root_task_id == "task/primitive-1"
+    assert binding.dispatch_nonce == ""
+    assert executor._primitive_client.goals[0].timeout_sec == pytest.approx(1.0)
 
 
 def test_pick_executor_rejects_identity_mismatch_and_requires_dispatch_nonce() -> None:
@@ -114,6 +130,35 @@ def test_pick_executor_rejects_identity_mismatch_and_requires_dispatch_nonce() -
     goal.timeout_sec = 5.0
     assert executor._handle_goal(goal).name == "ACCEPT"
     assert executor._dispatch_nonce == "nonce-1"
+
+
+def test_pick_executor_accepts_only_explicit_supervised_direct_goal_without_nonce() -> None:
+    executor = object.__new__(PickExecutorNode)
+    executor._clock = Clock()
+    executor._goal_lock = Lock()
+    executor._goal_active = False
+    executor._dispatch_nonce = ""
+    executor._dispatch_binding = None
+    executor._executor_identity = delegated_executor_identity(
+        name="grasp_pipeline", endpoint_name="/manipulation/execute_pick"
+    )
+    goal = PickObject.Goal()
+    goal.target_query = "banana"
+    fill_delegated_executor_identity(goal.expected_executor, executor._executor_identity)
+    goal.supervised_direct = True
+    goal.dispatch_binding.schema_version = 1
+    goal.dispatch_binding.task_id = "supervised-pick-1"
+    goal.dispatch_binding.root_task_id = "supervised-pick-1"
+    goal.dispatch_binding.expected_registry_epoch = "epoch-1"
+    goal.dispatch_binding.expected_registry_generation = 1
+    goal.dispatch_binding.expected_registry_digest = "digest-1"
+    goal.dispatch_binding.task_budget.schema_version = 1
+    now = executor.get_clock().now().nanoseconds / 1_000_000_000
+    goal.dispatch_binding.task_budget.started_at.sec = int(now)
+    goal.dispatch_binding.task_budget.deadline.sec = int(now + 10.0)
+    goal.timeout_sec = 5.0
+
+    assert executor._handle_goal(goal).name == "ACCEPT"
 
 
 def test_pick_goal_uuid_is_forwarded_as_internal_execution_token() -> None:

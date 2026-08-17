@@ -43,7 +43,7 @@ def resolve_voice_tts_path(path: str) -> str:
 
 
 def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
-    """Generate the shared model-service host for the ZipVoice plugin."""
+    """Generate the ZipVoice model host and local audio playback service."""
 
     config = robot_config.get("voice_tts", {})
     if not config.get("enabled", False):
@@ -90,5 +90,24 @@ def generate_voice_tts_nodes(robot_config: dict[str, Any]) -> list[Node]:
             name=node_name,
             output="screen",
             parameters=[node_params],
-        )
+        ),
+        Node(
+            package="voice_tts_service",
+            executable="audio_playback_node",
+            name=str(config.get("playback_node_name", "voice_tts_audio_player")),
+            output="screen",
+            parameters=[
+                {
+                    "service_name": str(
+                        config.get(
+                            "playback_service_name",
+                            defaults.get("playback_service_name", "/voice_tts/play"),
+                        )
+                    ),
+                    "timeout_sec": float(
+                        config.get("playback_timeout_sec", defaults.get("playback_timeout_sec", 300.0))
+                    ),
+                }
+            ],
+        ),
     ]

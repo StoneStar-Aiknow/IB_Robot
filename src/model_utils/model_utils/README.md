@@ -37,10 +37,11 @@ Exporter / packager 负责：
 不要手工编辑 identity、revision、digest 或 bindings。Runtime 不读取模型文件计算内容 SHA；正式
 artifact 更新必须经过 packager。
 
-导出器默认把可重建的 ONNX、compiler output 和 ABI metadata 放在
-`<bundle>/model_utils_work/<backend>/`。最终 manifest 只引用打包到
+导出器默认把可重建的 ONNX、compiler output 和 ABI metadata 放在 bundle 外的
+`models/_work/<bundle>/<backend>/`。最终 manifest 只引用打包到
 `artifacts/<backend>/<deployment>/` 的运行时 artifact。ABI JSON 用于生成 bindings，属于
 构建输入或编译器输出，不是运行时 artifact；参数帮助中的 `ABI input` / `ABI output` 明确其方向。
+发布或归档 bundle 时不得携带 `_work` 中间产物。
 
 ## 环境
 
@@ -97,7 +98,7 @@ python3 src/model_utils/model_utils/export_onnx_atc.py \
 ```
 
 未显式指定输出时，ONNX 和 ATC OM 工作产物写入
-`<bundle>/model_utils_work/ascend/`；最终 OM 自动复制到
+`models/_work/<bundle>/ascend/`；最终 OM 自动复制到
 `artifacts/ascend/<deployment>/`。`--om_abi_path` 是已有的 compiler/runtime introspection
 JSON 输入，ATC 命令本身不生成该文件。
 
@@ -153,7 +154,7 @@ Hisilicon deployment 必须包含：
 - 可执行的 `worker` artifact，format `executable`
 - `policy` role 的完整 inputs/outputs bindings
 
-Hisilicon ONNX 默认写入 `<policy_bundle>/model_utils_work/hisilicon/`。
+Hisilicon ONNX 默认写入 `models/_work/<policy_bundle>/hisilicon/`。
 
 ## ACT RKNN
 
@@ -198,7 +199,7 @@ python3 src/model_utils/model_utils/export_onnx_rknn.py \
 `--rknn_abi_output`，否则 exporter 不会写入 deployment。图像 layout 由 ABI 显式声明，
 runtime 只对 `NHWC` image bindings 转换布局。
 
-从 checkpoint 导出时，工作产物默认写入 `<bundle>/model_utils_work/rknn/`；最终 RKNN
+从 checkpoint 导出时，工作产物默认写入 `models/_work/<bundle>/rknn/`；最终 RKNN
 自动复制到 `artifacts/rknn/<deployment>/`。`--rknn_abi_output` 是 converter 生成的输出。
 
 完整板端流程见 `docs/OpenHarmony_EmbodiedAI_RKNN_Inference.md`。
@@ -326,11 +327,14 @@ python3 -m model_utils.pi05_export.convert_om \
 统一 `inference_manifest.json`。
 
 前两步（导出与编译）是 `model_utils` 的工具，记录在本节；**第 3 步打包由
-`perception_service` 提供**——GraspGen 是 `kind="perception"` 模型，bundle 的读者是
-perception_service 的 adapter 与 typed `GenerateGrasps` service，写者与读者同包。
+`perception_service` 提供**——GraspGen 的业务归属是抓取，模型目录固定在 `models/grasp/`；
+当前通用模型运行时暂时复用 `kind="perception"` 作为兼容分类，bundle 的读者是
+perception_service 中现有的 adapter 与 typed `GenerateGrasps` service。
 bundle 布局、adapter asset、named deployment 与 conformance 见
 `src/perception_service/README.md` 的 GraspGen 章节。GraspGen **不是** policy family，
 不出现在本文件末尾的策略支持矩阵中。
+
+除非另有说明，本节所有命令均在 IB_Robot 仓库根目录执行；所有项目内路径均相对于仓库根目录。
 
 ### 1. 导出八个 ONNX 子图
 
@@ -338,10 +342,10 @@ bundle 布局、adapter asset、named deployment 与 conformance 见
 source .shrc_local
 
 ros2 run model_utils graspgen-export-onnx \
-    --config /path/to/gripper.yaml \
-    --generator-checkpoint /path/to/generator.pth \
-    --discriminator-checkpoint /path/to/discriminator.pth \
-    --output-dir /path/to/onnx \
+    --config models/_work/graspgen_robotiq_2f_140/source/checkpoints/graspgen_robotiq_2f_140.yml \
+    --generator-checkpoint models/_work/graspgen_robotiq_2f_140/source/checkpoints/graspgen_robotiq_2f_140_gen.pth \
+    --discriminator-checkpoint models/_work/graspgen_robotiq_2f_140/source/checkpoints/graspgen_robotiq_2f_140_dis.pth \
+    --output-dir models/_work/graspgen_robotiq_2f_140/model_utils/onnx \
     --grasp-batch-size 1000
 ```
 
@@ -363,8 +367,8 @@ backend 用错误的分组驱动。遇到该报错时按本节重跑导出即可
 
 ```bash
 ros2 run model_utils graspgen-onnx-to-om \
-    --manifest /path/to/onnx/graspgen.onnx.json \
-    --output-dir /path/to/compiled_om \
+    --manifest models/_work/graspgen_robotiq_2f_140/model_utils/onnx/graspgen.onnx.json \
+    --output-dir models/_work/graspgen_robotiq_2f_140/model_utils/om \
     --soc-version Ascend310P3
 ```
 
@@ -380,10 +384,10 @@ device 检查 OM，并把 `<role>.om.abi.json` 写入 `--om-abi-dir`：
 
 ```bash
 ros2 run perception_service package_graspgen_ascend_bundle \
-    --bundle-root /path/to/graspgen_bundle \
-    --onnx-manifest /path/to/onnx/graspgen.onnx.json \
-    --om-dir /path/to/compiled_om \
-    --om-abi-dir /path/to/runtime_abi \
+    --bundle-root models/grasp/graspgen_robotiq_2f_140 \
+    --onnx-manifest models/_work/graspgen_robotiq_2f_140/model_utils/onnx/graspgen.onnx.json \
+    --om-dir models/_work/graspgen_robotiq_2f_140/model_utils/om \
+    --om-abi-dir models/_work/graspgen_robotiq_2f_140/model_utils/abi \
     --abi-device-id 0 \
     --soc-version Ascend310P3
 ```
@@ -394,8 +398,9 @@ device 的打包主机上需要提前生成全部 sidecar，并传入 `--no-insp
 runtime index 绑定 GraspGen semantic，并保留 ACL 实际暴露的 tensor name、dtype 和 shape。
 八个角色全部解析成功后才落盘，任一 OM 或 ABI 缺失都不会留下半成品 bundle。
 
-打包产物是 perception bundle，不含任何 LeRobot 资产（没有 `config.json` /
-`policy_preprocessor.json` / `policy_postprocessor.json`）；模型常量写在
+打包产物属于抓取模型域；当前通用运行时 manifest 暂时使用 `kind="perception"` 兼容分类。
+bundle 不含任何 LeRobot 资产（没有 `config.json` / `policy_preprocessor.json` /
+`policy_postprocessor.json`）；模型常量写在
 `assets/adapter.json` 里，由 `perception_service.graspgen_adapter.GraspGenAdapter`
 读回。参数含义与运行时配置见 `src/perception_service/README.md`。
 

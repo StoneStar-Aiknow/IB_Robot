@@ -103,6 +103,8 @@ def _build_cameras_urdf_from_yaml(
             continue
         if (periph.get("simulation") or {}).get("embedded_sensor", False):
             continue
+        if periph.get("skip_urdf_without_transform", False) and not periph.get("transform"):
+            continue
         name = periph["name"]
         frame_id = periph.get("frame_id", f"camera_{name}_frame")
 

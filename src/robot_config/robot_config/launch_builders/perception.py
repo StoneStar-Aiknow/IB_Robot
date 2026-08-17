@@ -9,13 +9,15 @@ This module handles:
 
 from __future__ import annotations
 
+import json
 import os
+import tempfile
 
 from launch_ros.actions import Node
 
 from robot_config.launch_builders.camera_isp_overrides import load_isp_override
 from robot_config.logger_utils import get_colored_logger
-from robot_config.utils import parse_bool
+from robot_config.utils import parse_bool, resolve_ros_path
 
 logger = get_colored_logger("robot_config.perception")
 
@@ -183,6 +185,11 @@ def generate_camera_nodes(robot_config, use_sim=False):
                 "unite_imu_method": 0,
             }
 
+            if "color_format" in periph:
+                driver_params["rgb_camera.color_format"] = periph["color_format"]
+            if "depth_format" in periph:
+                driver_params["depth_module.depth_format"] = periph["depth_format"]
+
             if "depth_width" in periph:
                 depth_w = periph["depth_width"]
                 depth_h = periph["depth_height"]
@@ -193,17 +200,16 @@ def generate_camera_nodes(robot_config, use_sim=False):
 
             logger.info(f"  RealSense driver params: {driver_params}")
 
-            depth_source_topic = (
-                f"{driver_topic_prefix}/aligned_depth_to_color/image_raw"
-                if align_depth
-                else f"{driver_topic_prefix}/depth/image_rect_raw"
+            raw_depth_source_topic = f"{driver_topic_prefix}/depth/image_rect_raw"
+            aligned_depth_source_topic = (
+                f"{driver_topic_prefix}/aligned_depth_to_color/image_raw" if align_depth else raw_depth_source_topic
             )
-            depth_target_topic = (
+            aligned_depth_target_topic = (
                 f"/camera/{name}/aligned_depth_to_color/image_raw"
                 if align_depth
                 else f"/camera/{name}/depth/image_rect_raw"
             )
-            depth_camera_info_source_topic = (
+            aligned_camera_info_source_topic = (
                 f"{driver_topic_prefix}/aligned_depth_to_color/camera_info"
                 if align_depth
                 else f"{driver_topic_prefix}/depth/camera_info"
@@ -217,9 +223,11 @@ def generate_camera_nodes(robot_config, use_sim=False):
                 driver_remappings.extend(
                     [
                         (f"{driver_topic_prefix}/color/image_raw", f"/camera/{name}/image_raw"),
-                        (depth_source_topic, depth_target_topic),
+                        (raw_depth_source_topic, f"/camera/{name}/depth/image_rect_raw"),
                     ]
                 )
+                if align_depth:
+                    driver_remappings.append((aligned_depth_source_topic, aligned_depth_target_topic))
                 if "pointcloud" in streams:
                     driver_remappings.append(
                         (
@@ -254,17 +262,23 @@ def generate_camera_nodes(robot_config, use_sim=False):
                     periph.get("optical_frame_id"),
                 ),
                 (
-                    depth_camera_info_source_topic,
-                    (
-                        f"/camera/{name}/aligned_depth_to_color/camera_info"
-                        if align_depth
-                        else f"/camera/{name}/depth/camera_info"
-                    ),
-                    f"{name}_{'aligned_depth_' if align_depth else 'depth_'}camera_info_relay",
+                    f"{driver_topic_prefix}/depth/camera_info",
+                    f"/camera/{name}/depth/camera_info",
+                    f"{name}_depth_camera_info_relay",
                     "sensor_msgs/msg/CameraInfo",
                     periph.get("optical_frame_id"),
                 ),
             ]
+            if align_depth:
+                relay_topics.append(
+                    (
+                        aligned_camera_info_source_topic,
+                        f"/camera/{name}/aligned_depth_to_color/camera_info",
+                        f"{name}_aligned_depth_camera_info_relay",
+                        "sensor_msgs/msg/CameraInfo",
+                        periph.get("optical_frame_id"),
+                    )
+                )
             if not direct_topic_remap:
                 relay_topics.extend(
                     [
@@ -276,7 +290,7 @@ def generate_camera_nodes(robot_config, use_sim=False):
                             periph.get("optical_frame_id"),
                         ),
                         (
-                            depth_source_topic,
+                            raw_depth_source_topic,
                             f"/camera/{name}/depth/image_rect_raw",
                             f"{name}_depth_image_relay",
                             "sensor_msgs/msg/Image",
@@ -287,8 +301,8 @@ def generate_camera_nodes(robot_config, use_sim=False):
                 if align_depth:
                     relay_topics.append(
                         (
-                            depth_source_topic,
-                            depth_target_topic,
+                            aligned_depth_source_topic,
+                            aligned_depth_target_topic,
                             f"{name}_aligned_depth_image_relay",
                             "sensor_msgs/msg/Image",
                             periph.get("optical_frame_id"),
@@ -305,6 +319,8 @@ def generate_camera_nodes(robot_config, use_sim=False):
                     )
                 )
             for source_topic, target_topic, relay_name, message_type, target_frame_id in relay_topics:
+                if source_topic == target_topic:
+                    continue
                 relay_args = [source_topic, target_topic, message_type]
                 if target_frame_id:
                     relay_args.append(target_frame_id)
@@ -353,7 +369,87 @@ def generate_lidar_nodes(robot_config, use_sim=False):
 
         name = periph["name"]
         driver = periph.get("driver", "")
+        if driver == "livox_mid360":
+            config_path = resolve_ros_path(periph["user_config_path"])
+            with open(config_path, encoding="utf-8") as config_file:
+                livox_config = json.load(config_file)
+
+            host_ip = periph["host_ip"]
+            host_net_info = livox_config["MID360"]["host_net_info"]
+            for key in ("cmd_data_ip", "push_msg_ip", "point_data_ip", "imu_data_ip"):
+                host_net_info[key] = host_ip
+            livox_config["lidar_configs"][0]["ip"] = periph["lidar_ip"]
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", prefix="ibrobot_mid360_", suffix=".json", delete=False, encoding="utf-8"
+            ) as runtime_config:
+                json.dump(livox_config, runtime_config, indent=2)
+
+            driver_params = {
+                "xfer_format": periph.get("xfer_format", 1),
+                "multi_topic": periph.get("multi_topic", 0),
+                "data_src": periph.get("data_src", 0),
+                "publish_freq": float(periph.get("publish_freq", 10.0)),
+                "output_data_type": periph.get("output_data_type", 0),
+                "frame_id": periph.get("frame_id", "livox_frame"),
+                "lvx_file_path": periph.get("lvx_file_path", "/tmp/livox_test.lvx"),
+                "user_config_path": runtime_config.name,
+                "cmdline_input_bd_code": periph.get("cmdline_input_bd_code", "livox0000000001"),
+                "use_sim_time": is_sim,
+            }
+            logger.info(f"Creating LiDAR node: {name} (driver={driver})")
+            nodes.append(
+                Node(
+                    package="livox_ros_driver2",
+                    executable="livox_ros_driver2_node",
+                    name=periph.get("node_name", "livox_lidar_publisher"),
+                    parameters=[driver_params],
+                    remappings=[
+                        ("/livox/lidar", periph.get("pointcloud_topic", "/livox/lidar")),
+                        ("/livox/imu", periph.get("imu_topic", "/livox/imu")),
+                    ],
+                    output="screen",
+                    respawn=bool(periph.get("respawn", True)),
+                )
+            )
+
+            scan_converter = periph.get("scan_converter", {})
+            if scan_converter.get("enabled", False):
+                scan_params = {
+                    "target_frame": scan_converter.get("target_frame", periph.get("frame_id", "livox_frame")),
+                    "transform_tolerance": scan_converter.get("transform_tolerance", 0.01),
+                    "min_height": scan_converter.get("min_height", -0.2),
+                    "max_height": scan_converter.get("max_height", 0.5),
+                    "angle_min": scan_converter.get("angle_min", -3.14159265),
+                    "angle_max": scan_converter.get("angle_max", 3.14159265),
+                    "angle_increment": scan_converter.get("angle_increment", 0.00872665),
+                    "scan_time": scan_converter.get("scan_time", 0.1),
+                    "range_min": scan_converter.get("range_min", 0.1),
+                    "range_max": scan_converter.get("range_max", 20.0),
+                    "use_inf": scan_converter.get("use_inf", True),
+                    "inf_epsilon": scan_converter.get("inf_epsilon", 1.0),
+                    "use_sim_time": is_sim,
+                }
+                if "queue_size" in scan_converter:
+                    scan_params["queue_size"] = int(scan_converter["queue_size"])
+                nodes.append(
+                    Node(
+                        package="pointcloud_to_laserscan",
+                        executable="pointcloud_to_laserscan_node",
+                        name=f"{name}_pointcloud_to_laserscan",
+                        parameters=[scan_params],
+                        remappings=[
+                            ("cloud_in", scan_converter.get("pointcloud_topic", "/cloud_registered_body")),
+                            ("scan", scan_converter.get("scan_topic", "/scan")),
+                        ],
+                        output="screen",
+                        respawn=bool(scan_converter.get("respawn", True)),
+                    )
+                )
+            continue
+
         if driver != "ldlidar":
+            logger.warning(f"Unsupported lidar driver '{driver}' for peripheral '{name}', skipping")
             continue
 
         params = dict(periph.get("params", {}))
@@ -465,6 +561,21 @@ def generate_tf_nodes(robot_config, use_sim=False):
         roll = transform.get("roll", 0.0)
         pitch = transform.get("pitch", 0.0)
         yaw = transform.get("yaw", 0.0)
+        quaternion = [transform.get(key) for key in ("qx", "qy", "qz", "qw")]
+
+        if all(value is not None for value in quaternion):
+            rotation_arguments = [
+                "--qx",
+                str(quaternion[0]),
+                "--qy",
+                str(quaternion[1]),
+                "--qz",
+                str(quaternion[2]),
+                "--qw",
+                str(quaternion[3]),
+            ]
+        else:
+            rotation_arguments = ["--roll", str(roll), "--pitch", str(pitch), "--yaw", str(yaw)]
 
         # Main frame TF
         nodes.append(
@@ -479,12 +590,7 @@ def generate_tf_nodes(robot_config, use_sim=False):
                     str(y),
                     "--z",
                     str(z),
-                    "--roll",
-                    str(roll),
-                    "--pitch",
-                    str(pitch),
-                    "--yaw",
-                    str(yaw),
+                    *rotation_arguments,
                     "--frame-id",
                     parent_frame,
                     "--child-frame-id",

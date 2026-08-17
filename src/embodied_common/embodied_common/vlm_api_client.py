@@ -44,7 +44,7 @@ def _parse_response_json(body: str) -> dict[str, Any]:
 
 
 class VLMAPIClient:
-    """Call an OpenAI-compatible chat-completions API."""
+    """Call an OpenAI-compatible Chat Completions or Responses API."""
 
     def __init__(
         self,
@@ -55,6 +55,7 @@ class VLMAPIClient:
         timeout_sec: float,
         temperature: float = 0.1,
         multimodal: bool = True,
+        api_protocol: str = "chat_completions",
     ) -> None:
         self._provider = provider
         self._base_url = base_url.rstrip("/")
@@ -63,6 +64,9 @@ class VLMAPIClient:
         self._timeout_sec = timeout_sec
         self._temperature = temperature
         self._multimodal = multimodal
+        if api_protocol not in {"chat_completions", "responses"}:
+            raise ValueError("api_protocol must be 'chat_completions' or 'responses'")
+        self._api_protocol = api_protocol
 
     def _build_headers(self) -> dict[str, str]:
         headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -89,8 +93,9 @@ class VLMAPIClient:
         headers: dict[str, str],
         timeout_sec: float,
     ) -> dict[str, Any]:
+        endpoint = "/responses" if self._api_protocol == "responses" else "/chat/completions"
         request = urllib.request.Request(
-            url=f"{self._base_url}/chat/completions",
+            url=f"{self._base_url}{endpoint}",
             data=json.dumps(payload).encode("utf-8"),
             headers=headers,
             method="POST",
@@ -118,17 +123,22 @@ class VLMAPIClient:
         if self._provider not in {"kimicode", "openai_compatible"}:
             raise RuntimeError(f"unsupported VLM API provider: {self._provider}")
 
-        payload = {
-            "model": self._model,
-            "messages": messages,
-            "temperature": 0.1,
-        }
+        if self._api_protocol == "responses":
+            payload = {"model": self._model, "input": self._responses_input(messages)}
+        else:
+            payload = {"model": self._model, "messages": messages, "temperature": 0.1}
         headers = self._build_headers()
         output_idle_timeout_sec = resolve_model_output_idle_timeout(
             configured_timeout_sec=self._timeout_sec,
             override_timeout_sec=timeout_sec,
         )
         response_json = self._http_post(payload, headers, output_idle_timeout_sec)
+
+        if self._api_protocol == "responses":
+            content = response_json.get("output_text") or self._responses_output_text(response_json)
+            if not isinstance(content, str) or not content.strip():
+                raise RuntimeError("VLM API returned empty content")
+            return content, response_json
 
         choices = response_json.get("choices", [])
         if not choices:
@@ -157,7 +167,7 @@ class VLMAPIClient:
         enable_thinking: bool = True,
         extra_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Call chat-completions; return status/content/tool_calls/reasoning/usage/timing dict."""
+        """Call the configured API protocol and normalize its result."""
         t_start = time.monotonic()
 
         def _err(msg: str) -> dict[str, Any]:
@@ -186,16 +196,18 @@ class VLMAPIClient:
                     stripped.append(msg)
             send_messages = stripped
 
-        payload: dict[str, Any] = {
-            "model": self._model,
-            "messages": send_messages,
-            "temperature": self._temperature,
-        }
+        if self._api_protocol == "responses":
+            payload = {"model": self._model, "input": self._responses_input(send_messages)}
+        else:
+            payload = {"model": self._model, "messages": send_messages, "temperature": self._temperature}
 
         if tools:
-            payload["tools"] = tools
+            payload["tools"] = self._responses_tools(tools) if self._api_protocol == "responses" else tools
         elif force_json:
-            payload["response_format"] = {"type": "json_object"}
+            if self._api_protocol == "responses":
+                payload["text"] = {"format": {"type": "json_object"}}
+            else:
+                payload["response_format"] = {"type": "json_object"}
 
         if not enable_thinking and "dashscope.aliyuncs.com" in self._base_url:
             payload["enable_thinking"] = False
@@ -218,17 +230,20 @@ class VLMAPIClient:
         except RuntimeError as exc:
             return _err(str(exc))
 
-        choices = response_json.get("choices", [])
-        if not choices:
-            return _err("VLM API returned no choices")
-        message = choices[0].get("message", {})
-
-        content = message.get("content") or ""
-        if isinstance(content, list):
-            content = "\n".join(str(item.get("text", "")) for item in content if item.get("type") == "text")
-
-        tool_calls = message.get("tool_calls") or []
-        reasoning = message.get("reasoning_content") or message.get("thinking") or ""
+        if self._api_protocol == "responses":
+            content = response_json.get("output_text") or self._responses_output_text(response_json)
+            tool_calls = self._responses_tool_calls(response_json)
+            reasoning = ""
+        else:
+            choices = response_json.get("choices", [])
+            if not choices:
+                return _err("VLM API returned no choices")
+            message = choices[0].get("message", {})
+            content = message.get("content") or ""
+            if isinstance(content, list):
+                content = "\n".join(str(item.get("text", "")) for item in content if item.get("type") == "text")
+            tool_calls = message.get("tool_calls") or []
+            reasoning = message.get("reasoning_content") or message.get("thinking") or ""
 
         # A valid response must carry either text content or tool calls; empty both is an error.
         if not content.strip() and not tool_calls:
@@ -236,8 +251,8 @@ class VLMAPIClient:
 
         usage_raw = response_json.get("usage", {})
         usage = {
-            "prompt_tokens": usage_raw.get("prompt_tokens", 0),
-            "completion_tokens": usage_raw.get("completion_tokens", 0),
+            "prompt_tokens": usage_raw.get("prompt_tokens", usage_raw.get("input_tokens", 0)),
+            "completion_tokens": usage_raw.get("completion_tokens", usage_raw.get("output_tokens", 0)),
             "total_tokens": usage_raw.get("total_tokens", 0),
         }
 
@@ -251,6 +266,53 @@ class VLMAPIClient:
             "timing_ms": int((time.monotonic() - t_start) * 1000),
             "error": None,
         }
+
+    @staticmethod
+    def _responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        converted = []
+        for message in messages:
+            content = message.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if item.get("type") == "text":
+                        parts.append({"type": "input_text", "text": str(item.get("text", ""))})
+                    elif item.get("type") == "image_url":
+                        image_url = item.get("image_url", {}).get("url", "")
+                        parts.append({"type": "input_image", "image_url": image_url})
+            else:
+                parts = [{"type": "input_text", "text": str(content)}]
+            converted.append({"role": message.get("role", "user"), "content": parts})
+        return converted
+
+    @staticmethod
+    def _responses_output_text(response: dict[str, Any]) -> str:
+        parts = []
+        for item in response.get("output", []):
+            for content in item.get("content", []):
+                if content.get("type") in {"output_text", "text"}:
+                    parts.append(str(content.get("text", "")))
+        return "\n".join(parts)
+
+    @staticmethod
+    def _responses_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        converted = []
+        for tool in tools:
+            function = tool.get("function") if tool.get("type") == "function" else None
+            converted.append({"type": "function", **function} if isinstance(function, dict) else tool)
+        return converted
+
+    @staticmethod
+    def _responses_tool_calls(response: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": item.get("call_id", item.get("id", "")),
+                "type": "function",
+                "function": {"name": item.get("name", ""), "arguments": item.get("arguments", "")},
+            }
+            for item in response.get("output", [])
+            if item.get("type") == "function_call"
+        ]
 
 
 def _load_yaml_config(yaml_path: pathlib.Path) -> dict[str, Any]:
@@ -315,6 +377,7 @@ class VLMClient:
                 timeout_sec=float(m.get("timeout_sec", self._defaults.get("timeout_sec", 90))),
                 temperature=float(m.get("temperature", self._defaults.get("temperature", 0.1))),
                 multimodal=bool(m.get("multimodal", True)),
+                api_protocol=str(m.get("api_protocol", "chat_completions")),
             )
         return self._client_cache[model_name]
 

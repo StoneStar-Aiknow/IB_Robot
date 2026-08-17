@@ -68,6 +68,7 @@ Launch Arguments:
     sim_platform: Optional CLI override for robot YAML simulation.platform
     auto_start_controllers: Automatically spawn controllers (default: true, set to false for debugging)
     control_mode: Override control mode from YAML (teleop, model_inference, moveit_planning, etc.). If empty, uses default_control_mode from config file
+    nav_stage: Select a navigation workflow stage (mapping or navigation)
     with_inference: Enable inference pipeline. If empty, auto-detects from control mode config
     inference_pipeline: Pipeline ID targeted by inference launch overrides
     inference_execution_mode: Override the targeted pipeline mode (monolithic or distributed)
@@ -113,6 +114,7 @@ from robot_config.launch_builders.perception_models import generate_perception_m
 from robot_config.launch_builders.recording import (
     generate_recording_nodes,
     generate_rerun_viewer_node,
+    resolve_recording_launch,
 )
 from robot_config.launch_builders.sim_backend import get_backend_caps, get_sim_backend
 from robot_config.launch_builders.teleop import generate_teleop_nodes
@@ -129,7 +131,7 @@ from robot_config.utils import parse_bool
 logger = get_colored_logger("robot_config.launch")
 
 
-def load_robot_config(robot_config_name, config_path_override=None):
+def load_robot_config(robot_config_name, config_path_override=None, nav_stage=""):
     """Load robot configuration from YAML file.
 
     Args:
@@ -154,7 +156,7 @@ def load_robot_config(robot_config_name, config_path_override=None):
     logger.info(f"Loading config from: {config_path}")
     logger.info(f"Config exists: {config_path.exists()}")
 
-    robot_config = load_robot_config_dict(config_path)
+    robot_config = load_robot_config_dict(config_path, nav_stage=nav_stage)
     logger.info(f"Loaded robot: {robot_config.get('name', 'UNKNOWN')}")
     logger.info(f"Peripherals: {len(robot_config.get('peripherals', []))}")
 
@@ -330,6 +332,7 @@ def launch_setup(context, *args, **kwargs):
     sim_platform_override = context.launch_configurations.get("sim_platform", "").strip().lower()
     auto_start_controllers = context.launch_configurations.get("auto_start_controllers", "true")
     control_mode_override = context.launch_configurations.get("control_mode", "")
+    nav_stage = context.launch_configurations.get("nav_stage", "").strip()
     voice_asr_auto_start_str = context.launch_configurations.get("voice_asr_auto_start", "")
     with_embodied_str = context.launch_configurations.get("with_embodied", "")
     with_perception_str = context.launch_configurations.get("with_perception", "")
@@ -343,13 +346,18 @@ def launch_setup(context, *args, **kwargs):
     logger.info(f"sim_platform: {sim_platform_override if sim_platform_override else '(from config)'}")
     logger.info(f"auto_start_controllers: {auto_start_controllers}")
     logger.info(f"control_mode: {control_mode_override if control_mode_override else '(from config)'}")
+    logger.info(f"nav_stage: {nav_stage if nav_stage else '(from config)'}")
     logger.info(f"voice_asr_auto_start: {voice_asr_auto_start_str}")
     logger.info(f"with_embodied: {with_embodied_str if with_embodied_str else '(from config)'}")
     logger.info(f"with_perception: {with_perception_str if with_perception_str else '(from config)'}")
 
     # ========== 2. Load robot configuration ==========
     try:
-        robot_config = load_robot_config(robot_config_name, config_path_override if config_path_override else None)
+        robot_config = load_robot_config(
+            robot_config_name,
+            config_path_override if config_path_override else None,
+            nav_stage,
+        )
     except Exception as e:
         logger.error(f"loading config: {e}")
         raise
@@ -776,18 +784,20 @@ def launch_setup(context, *args, **kwargs):
                     actions.append(task_node)
                 print("[robot_config] Task executor node added")
     except Exception as e:
-        print(f"[robot_config] ERROR generating task executor: {e}")
-        print("[robot_config] Continuing without task executor...")
+        logger.error(f"generating required task executor: {e}")
+        raise RuntimeError("MoveIt task executor setup failed; refusing to start an incomplete motion stack") from e
 
-    # ========== 12. Automatic Recording (if record:=true) ==========
+    # ========== 12. Automatic Recording ==========
     try:
         record_str = context.launch_configurations.get("record", "false")
-        record_enabled = parse_bool(record_str, default=False)
+        record_mode = context.launch_configurations.get("record_mode", "continuous")
+        record_enabled, record_mode = resolve_recording_launch(
+            robot_config,
+            requested=parse_bool(record_str, default=False),
+            mode=record_mode,
+        )
 
         if record_enabled:
-            # Get recording mode (continuous or episodic)
-            record_mode = context.launch_configurations.get("record_mode", "continuous")
-
             logger.info(f"========== Setting up Recording (mode: {record_mode}) ==========")
 
             # Generate recording nodes using the recording builder
@@ -803,7 +813,10 @@ def launch_setup(context, *args, **kwargs):
             logger.info(f"Recording disabled (record:={record_str})")
     except Exception as e:
         logger.error(f"setting up recording: {e}")
-        logger.info("Continuing without recording...")
+        if robot_config.get("recording", {}).get("semantic_dataset", False):
+            actions.append(EmitEvent(event=Shutdown(reason=f"semantic dataset recording setup failed: {e}")))
+        else:
+            logger.info("Continuing without recording...")
 
     # ========== 12. Recording Visualizer (optional rerun sidecar) ==========
     try:
@@ -884,6 +897,13 @@ def generate_launch_description():
                 "control_mode",
                 default_value="",
                 description="Override control mode from YAML (teleop, model_inference, or moveit_planning). If empty, uses default_control_mode from config file",
+            ),
+            DeclareLaunchArgument(
+                "nav_stage",
+                default_value="",
+                description=(
+                    "Select a navigation workflow stage: mapping or navigation. Empty uses default_nav_stage."
+                ),
             ),
             DeclareLaunchArgument(
                 "voice_asr_device_index",

@@ -79,7 +79,6 @@ flowchart TB
         PLUGIN["ModelServicePlugin<br/>typed service adapter"]
         GRASP_WRAPPER["GraspGenWrapper"]
         GRASP_LOCAL["Local GraspGen pipeline"]
-        GRASP_REMOTE["Remote310PInferenceClient"]
     end
 
     subgraph SSOT["模型部署与配置 SSOT"]
@@ -127,9 +126,7 @@ flowchart TB
     TTS_PLUGIN --> TTS_PIPELINE
     GRASP --> GRASP_WRAPPER
     GRASP_WRAPPER --> GRASP_LOCAL
-    GRASP_WRAPPER --> GRASP_REMOTE
     GRASP_LOCAL --> GRASP_PIPELINE
-    GRASP_REMOTE -->|"remote inference protocol"| REMOTE_SERVICE["Remote 310P service"]
 
     %% Distributed inference protocol
     POLICY <-->|"Distributed request / result / status topics"| CLOUD
@@ -158,8 +155,8 @@ PipelinePolicyNode 通过 `InferenceServingStatus` topic 回报本地状态；Gl
 各自创建独立实例并复用同一实现，但它们的 ROS 协议和业务 facade 保持不同。当前 Global Scheduler
 的 candidate 只包含 `PipelinePolicyNode` 的 open/dispatch/close/status endpoints，因此只调度 policy
 pipeline instance；感知、TTS 和本地 GraspGen instance 不进入 Scheduler。策略额外经过
-`InferencePipelineManager` 和 `InferencePipeline`；感知通过 typed `ModelServicePlugin`；GraspGen 的
-remote 310P 模式走独立远端协议，不属于本进程 `GenericModelPipeline` 调用链。
+`InferencePipelineManager` 和 `InferencePipeline`；感知通过 typed `ModelServicePlugin`；本地
+GraspGen instance 复用 `GenericModelPipeline` 调用链。
 
 `ModelSessionBuilderRegistry` 和 `BackendRegistry` 只参与启动期的 manifest/deployment 校验与 session
 构造，不是业务请求路径。`SequentialModelExecutor`、stages 和具体 `ModelSession` 是 Generic runtime

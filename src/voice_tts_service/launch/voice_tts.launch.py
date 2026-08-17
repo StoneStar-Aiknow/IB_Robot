@@ -13,6 +13,8 @@ def generate_launch_description():
             DeclareLaunchArgument("bundle_path", default_value=""),
             DeclareLaunchArgument("deployment", default_value=""),
             DeclareLaunchArgument("service_name", default_value="/voice_tts/synthesize"),
+            DeclareLaunchArgument("playback_service_name", default_value="/voice_tts/play"),
+            DeclareLaunchArgument("playback_timeout_sec", default_value="300.0"),
             LogInfo(
                 msg=(
                     "[voice_tts_service] Standalone launch is for debugging only. "
@@ -33,6 +35,18 @@ def generate_launch_description():
                         "service_type": "ibrobot_msgs/srv/SynthesizeSpeech",
                         "service_endpoint": LaunchConfiguration("service_name"),
                         "runtime_options_json": "{}",
+                    }
+                ],
+            ),
+            Node(
+                package="voice_tts_service",
+                executable="audio_playback_node",
+                name="voice_tts_audio_player",
+                output="screen",
+                parameters=[
+                    {
+                        "service_name": LaunchConfiguration("playback_service_name"),
+                        "timeout_sec": LaunchConfiguration("playback_timeout_sec"),
                     }
                 ],
             ),

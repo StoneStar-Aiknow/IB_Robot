@@ -1,11 +1,11 @@
 """音频采集 + worker 线程生命周期管理。
 
-speech_direction 链路所需的采集与 worker 管理:多通道环形缓冲、PyAudio blocking
-采集、worker 线程生命周期与共享状态。
+speech_direction 链路所需的采集与 worker 管理:多通道环形缓冲、arecord
+独立进程采集、worker 线程生命周期与共享状态。
 
 设计要点:
-    1. MultiChannelRingBuffer(多消费者):PyAudio 采集线程写入 6ch,worker 独立 reader。
-    2. AudioCapture:专用线程 blocking read,兼容 Ubuntu 22.04 的 PyAudio 0.2.11。
+    1. MultiChannelRingBuffer(多消费者):arecord 采集线程写入 6ch,worker 独立 reader。
+    2. AudioCapture:受控 arecord 子进程直接读取 ALSA hw 设备，绕过异常的 PyAudio 路径。
     3. SpeechDirectionRuntime:启动采集 + worker 线程,管理共享状态,优雅停止。
     4. feed_audio:离线模式外部灌入 6ch 音频(无设备时),pipeline 与实时同路径。
 """
@@ -13,21 +13,34 @@ speech_direction 链路所需的采集与 worker 管理:多通道环形缓冲、
 from __future__ import annotations
 
 import logging
+import subprocess
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
-try:
-    import pyaudio
 
-    _HAS_PYAUDIO = True
-except ImportError:
-    pyaudio = None
-    _HAS_PYAUDIO = False
+@dataclass(frozen=True)
+class RingWriteResult:
+    """一次 Ring 写入对应的完整采集区间和解码结果。"""
+
+    start_sample: int
+    end_sample: int
+    samples: np.ndarray  # (channels, frames)，包含本次完整输入
+
+
+@dataclass(frozen=True)
+class RingReadResult:
+    """一次 Ring 读取结果，采样位置使用原始采集绝对时轴。"""
+
+    start_sample: int
+    end_sample: int
+    samples: np.ndarray  # (channels, frames)
+    dropped_before: int
 
 
 class MultiChannelRingBuffer:
@@ -61,46 +74,65 @@ class MultiChannelRingBuffer:
         self._buf = np.zeros((channels, self.capacity), dtype=dtype)
         self._write_pos = 0  # 已写入的绝对帧数(单调递增,访问 _buf 时 % capacity)
         self._reader_pos: dict[int, int] = {}
+        self._reader_overwritten_frames: dict[int, int] = {}
+        self._reader_pending_dropped: dict[int, int] = {}
+        self._overwrite_events = 0
+        self._overwritten_frames = 0
         self._next_reader_id = 0
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
 
-    def write(self, data) -> None:
-        """写入音频数据。
+    def write(self, data) -> RingWriteResult:
+        """写入音频并返回完整输入对应的绝对采集区间。
 
         data: interleaved int16 bytes,或 (n_frames, channels)/(channels, n_frames) 数组。
-        单次写入超过容量时,只保留最后 capacity 帧(实时系统优先保新)。
+        单次写入超过容量时，Ring 只保留尾部，但绝对采集时轴仍按完整输入推进。
         """
         with self._cond:
-            frames = self._decode(data)  # (n_frames, channels) float32
-            n = frames.shape[0]
-            if n == 0:
-                return
-            # 单次写入超过容量:只保留最后 capacity 帧
-            if n > self.capacity:
-                frames = frames[-self.capacity :]
-                n = self.capacity
-            start = self._write_pos % self.capacity
-            end = start + n
+            decoded = self._decode(data)  # (n_frames, channels) float32
+            input_n = decoded.shape[0]
+            input_start = self._write_pos
+            input_end = input_start + input_n
+            result = RingWriteResult(
+                start_sample=input_start,
+                end_sample=input_end,
+                samples=decoded.T.copy(),
+            )
+            if input_n == 0:
+                return result
+
+            # 绝对采集位置必须按原始输入长度推进；Ring 只保留尾部不能改变会话时轴。
+            frames = decoded[-self.capacity :]
+            stored_n = frames.shape[0]
+            stored_start = input_end - stored_n
+            start = stored_start % self.capacity
+            end = start + stored_n
             if end <= self.capacity:
-                # 不回绕:一次写入(frames.T 形状 (channels, n))
+                # 不回绕:一次写入(frames.T 形状 (channels, stored_n))
                 self._buf[:, start:end] = frames.T
             else:
                 # 回绕:分两段写
                 first = self.capacity - start
                 self._buf[:, start:] = frames[:first].T
-                second = n - first
+                second = stored_n - first
                 self._buf[:, :second] = frames[first:].T
 
-            self._write_pos += n
+            self._write_pos = input_end
 
-            # 容量溢出:若写入量超过容量,丢弃最旧数据,把落后 reader 拉到合法下界
-            low = self._write_pos - self.capacity
+            # 容量溢出时显式累计每个 reader 被覆盖的帧数，禁止静默丢失。
+            low = max(0, self._write_pos - self.capacity)
             for rid in list(self._reader_pos):
-                if self._reader_pos[rid] < low:
+                old_pos = self._reader_pos[rid]
+                if old_pos < low:
+                    dropped = low - old_pos
                     self._reader_pos[rid] = low
+                    self._reader_overwritten_frames[rid] += dropped
+                    self._reader_pending_dropped[rid] += dropped
+                    self._overwrite_events += 1
+                    self._overwritten_frames += dropped
 
             self._cond.notify_all()
+            return result
 
     def _decode(self, data) -> np.ndarray:
         """bytes/int16/float → (n_frames, channels) float32,范围 [-1, 1]。"""
@@ -142,36 +174,39 @@ class MultiChannelRingBuffer:
             if start_latest:
                 self._reader_pos[rid] = self._write_pos
             else:
-                low = min(self._reader_pos.values()) if self._reader_pos else self._write_pos
-                self._reader_pos[rid] = max(low, self._write_pos - self.capacity)
+                self._reader_pos[rid] = max(0, self._write_pos - self.capacity)
+            self._reader_overwritten_frames[rid] = 0
+            self._reader_pending_dropped[rid] = 0
             return rid
 
-    def read(self, reader_id: int, n_frames: int, read_mode: str = "block", timeout: float = 1.0):
-        """读取 n_frames 帧。
-
-        Returns:
-            (channels, n_frames) float32;不足且 block 超时返回 None
-        """
+    def read_with_position(
+        self, reader_id: int, n_frames: int, read_mode: str = "block", timeout: float = 1.0
+    ) -> RingReadResult | None:
+        """读取数据并返回原始采集绝对位置；旧 read API 只返回 samples。"""
         deadline = time.monotonic() + timeout if read_mode == "block" else 0.0
         with self._cond:
             while True:
-                avail = self._write_pos - self._reader_pos.get(reader_id, 0)
+                rpos = self._reader_pos.get(reader_id, 0)
+                avail = self._write_pos - rpos
                 if avail >= n_frames:
-                    return self._read_n(reader_id, n_frames)
+                    return self._read_n_with_position(reader_id, n_frames)
                 if read_mode == "latest":
-                    return self._read_n(reader_id, avail) if avail > 0 else None
-                # block:等待新数据
+                    return self._read_n_with_position(reader_id, avail) if avail > 0 else None
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return None
                 self._cond.wait(timeout=remaining)
 
-    def _read_n(self, reader_id: int, n: int) -> np.ndarray | None:
-        """从 reader_pos 读 n 帧(可能回绕),返回 (channels, n)。"""
+    def read(self, reader_id: int, n_frames: int, read_mode: str = "block", timeout: float = 1.0):
+        """读取 n_frames 帧，保留旧 API 返回 ndarray 的兼容行为。"""
+        result = self.read_with_position(reader_id, n_frames, read_mode, timeout)
+        return None if result is None else result.samples
+
+    def _read_n_with_position(self, reader_id: int, n: int) -> RingReadResult | None:
+        """从 reader_pos 读取并返回区间；调用方必须持有 Condition 锁。"""
         if n <= 0:
             return None
-        if n > self.capacity:
-            n = self.capacity
+        n = min(n, self.capacity)
         rpos = self._reader_pos.get(reader_id, 0)
         out = np.zeros((self.channels, n), dtype=self.dtype)
         start = rpos % self.capacity
@@ -179,13 +214,37 @@ class MultiChannelRingBuffer:
         if end <= self.capacity:
             out[:] = self._buf[:, start:end]
         else:
-            # 回绕:分两段读
             first = self.capacity - start
             out[:, :first] = self._buf[:, start:]
             second = n - first
             out[:, first:] = self._buf[:, :second]
         self._reader_pos[reader_id] = rpos + n
-        return out
+        dropped = self._reader_pending_dropped.get(reader_id, 0)
+        self._reader_pending_dropped[reader_id] = 0
+        return RingReadResult(rpos, rpos + n, out, dropped)
+
+    def reader_stats(self, reader_id: int) -> dict[str, int]:
+        with self._lock:
+            pos = self._reader_pos.get(reader_id, self._write_pos)
+            return {
+                "position": pos,
+                "dropped_frames_total": self._reader_overwritten_frames.get(reader_id, 0),
+                "available_frames": max(0, self._write_pos - pos),
+            }
+
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "total_written_frames": self._write_pos,
+                "capacity_frames": self.capacity,
+                "overwrite_events": self._overwrite_events,
+                "overwritten_frames": self._overwritten_frames,
+            }
+
+    def _read_n(self, reader_id: int, n: int) -> np.ndarray | None:
+        """兼容旧内部调用，返回 (channels, n)。"""
+        result = self._read_n_with_position(reader_id, n)
+        return None if result is None else result.samples
 
     def total_written(self) -> int:
         """累计写入帧数(供诊断)。"""
@@ -194,251 +253,264 @@ class MultiChannelRingBuffer:
 
 
 class AudioCapture:
-    """ReSpeaker 多通道 blocking 采集器。
+    """通过受控 arecord 子进程采集 ReSpeaker 六通道原始 PCM。"""
 
-    设备查找内联在 _find_device(优先设备号,回退按名称搜索)。
-    blocking read 在专用 Python 线程中执行，避免 PyAudio 0.2.11 callback
-    C bridge 将异常异步注入 ROS executor。
-    """
+    _STDERR_LIMIT = 8192
 
     def __init__(
         self,
         config,
         ring_buffer: MultiChannelRingBuffer,
         on_fatal_error: Callable[[str], None] | None = None,
+        on_audio_chunk: Callable[[RingWriteResult], None] | None = None,
     ):
-        if not _HAS_PYAUDIO:
-            raise ImportError("未安装 pyaudio。请先安装系统依赖 portaudio19-dev,再 `pip install pyaudio`。")
-
         self.config = config
         self.ring_buffer = ring_buffer
         self.sample_rate = config.audio.sample_rate
         self.channels = config.audio.channels
         self.chunk_size = config.audio.chunk_size
-        self.device_index_cfg = config.audio.device_index
-        self.device_name = config.audio.device_name
+        self.arecord_device = config.audio.arecord_device
         self._on_fatal_error = on_fatal_error
+        self._on_audio_chunk = on_audio_chunk
+        self._raw_callback_error_reported = False
 
-        self._pa = None
-        self._stream = None
+        self._process: subprocess.Popen | None = None
         self._capture_thread: threading.Thread | None = None
+        self._stderr_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
+        self._stderr_lock = threading.Lock()
+        self._stderr_tail = bytearray()
         self._frames_captured = 0
-        self._overflow_count = 0
+        self._partial_bytes_dropped = 0
         self._running = False
         self._cleanup_pending = False
 
     def start(self):
-        """启动 blocking 采集流和专用读取线程。"""
+        """启动 arecord 和专用 stdout/stderr 读取线程。"""
         with self._lock:
             if self._cleanup_pending:
                 raise RuntimeError("音频采集存在未清理资源，请先调用 stop()")
             if self._running:
                 return
-            if self._stream is not None or self._capture_thread is not None or self._pa is not None:
+            if self._process is not None or self._capture_thread is not None or self._stderr_thread is not None:
                 raise RuntimeError("音频采集存在未清理资源，请先调用 stop()")
 
-            pa = pyaudio.PyAudio()
-            self._pa = pa
-            stream = None
+            argv = [
+                "arecord",
+                "-D",
+                self.arecord_device,
+                "-t",
+                "raw",
+                "-f",
+                "S16_LE",
+                "-r",
+                str(self.sample_rate),
+                "-c",
+                str(self.channels),
+            ]
+            logger.info(
+                "* capturing via arecord: %dch @ %dHz, device=%s", self.channels, self.sample_rate, self.arecord_device
+            )
             try:
-                device_index = self._find_device()
-                logger.info(
-                    "* capturing: %dch @ %dHz, blocking mode",
-                    self.channels,
-                    self.sample_rate,
+                process = subprocess.Popen(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    shell=False,
                 )
-                stream = pa.open(
-                    rate=self.sample_rate,
-                    format=pyaudio.get_format_from_width(2),
-                    channels=self.channels,
-                    input=True,
-                    output=False,
-                    input_device_index=device_index,
-                    frames_per_buffer=self.chunk_size,
-                )
-                stream.start_stream()
-            except Exception:
-                # 启动事务失败时完整回滚；清理异常只记录，不能覆盖原始启动异常。
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except Exception:
-                        logger.warning("回滚音频流失败", exc_info=True)
-                try:
-                    pa.terminate()
-                except Exception:
-                    logger.warning("回滚 PyAudio 失败", exc_info=True)
-                self._pa = None
-                raise
+            except FileNotFoundError as error:
+                raise RuntimeError("未找到 arecord，请安装 alsa-utils") from error
 
-            self._stream = stream
+            assert process.stdout is not None and process.stderr is not None
+            self._process = process
             self._stop_event.clear()
-            # 必须在线程启动前置为运行态，避免快速读取线程观察到旧状态。
+            self._stderr_tail.clear()
             self._running = True
-            try:
-                thread = threading.Thread(
-                    target=self._capture_loop,
-                    name="speech-direction-audio-capture",
-                    daemon=True,
-                )
-                self._capture_thread = thread
-                thread.start()
-            except Exception:
-                # Python 线程未成功启动，回滚已启动的 PortAudio 生命周期。
-                self._stop_event.set()
-                self._stream = None
-                self._capture_thread = None
-                self._pa = None
-                self._running = False
-                try:
-                    stream.stop_stream()
-                except Exception:
-                    logger.warning("回滚音频流 stop 失败", exc_info=True)
-                try:
-                    stream.close()
-                except Exception:
-                    logger.warning("回滚音频流 close 失败", exc_info=True)
-                try:
-                    pa.terminate()
-                except Exception:
-                    logger.warning("回滚 PyAudio 失败", exc_info=True)
-                raise
+            stderr_thread = threading.Thread(
+                target=self._drain_stderr,
+                args=(process.stderr,),
+                name="speech-direction-arecord-stderr",
+                daemon=True,
+            )
+            capture_thread = threading.Thread(
+                target=self._capture_loop,
+                args=(process,),
+                name="speech-direction-audio-capture",
+                daemon=True,
+            )
+            self._stderr_thread = stderr_thread
+            self._capture_thread = capture_thread
 
-    def _capture_loop(self) -> None:
-        """持续读取多通道 PCM；异常只通过受控回调上报。"""
         try:
-            while not self._stop_event.is_set():
-                with self._lock:
-                    stream = self._stream
-                if stream is None:
-                    return
-
-                # blocking read 不持有生命周期锁，确保 stop() 能关闭流解除阻塞。
-                data = stream.read(
-                    self.chunk_size,
-                    exception_on_overflow=False,
-                )
-                if self._stop_event.is_set():
-                    return
-                self.ring_buffer.write(data)
-                self._frames_captured += len(data) // (2 * self.channels)
-        except Exception as exc:
-            # stop_stream/close 用于解除阻塞，主动停止产生的异常不属于设备故障。
-            if not self._stop_event.is_set() and self._on_fatal_error is not None:
+            stderr_thread.start()
+            capture_thread.start()
+        except Exception:
+            # 线程启动失败时必须回收已打开的 ALSA 设备，不能遗留 arecord 占用设备。
+            self._stop_event.set()
+            self._terminate_process(process)
+            for pipe in (process.stdout, process.stderr):
                 try:
-                    self._on_fatal_error(f"音频采集读取失败: {exc}")
+                    pipe.close()
                 except Exception:
-                    # 外部 fatal 处理器不得击穿采集线程边界。
-                    logger.exception("音频采集 fatal 回调异常")
+                    logger.warning("回滚 arecord 管道失败", exc_info=True)
+            if stderr_thread.is_alive():
+                stderr_thread.join(timeout=1.0)
+            with self._lock:
+                self._process = None
+                self._capture_thread = None
+                self._stderr_thread = None
+                self._running = False
+            raise
+
+    def _capture_loop(self, process: subprocess.Popen) -> None:
+        """持续排空 raw stdout；短读按完整六通道采样帧拼接。"""
+        frame_bytes = self.channels * 2
+        read_bytes = self.chunk_size * frame_bytes
+        pending = bytearray()
+        failure: str | None = None
+        try:
+            assert process.stdout is not None
+            while not self._stop_event.is_set():
+                data = process.stdout.read(read_bytes)
+                if not data:
+                    break
+                pending.extend(data)
+                # pipe 的短读可能切在一个采样帧中间，只向 Ring 提交完整帧。
+                complete_bytes = len(pending) - len(pending) % frame_bytes
+                if complete_bytes == 0:
+                    continue
+                payload = bytes(pending[:complete_bytes])
+                del pending[:complete_bytes]
+                result = self.ring_buffer.write(payload)
+                self._frames_captured += result.end_sample - result.start_sample
+                if self._on_audio_chunk is not None and not self._raw_callback_error_reported:
+                    try:
+                        self._on_audio_chunk(result)
+                    except Exception:
+                        self._raw_callback_error_reported = True
+                        logger.exception("采集侧 raw 维测回调异常，已停用该旁路")
+        except Exception as error:
+            if not self._stop_event.is_set():
+                failure = f"读取 arecord PCM 失败: {error}"
         finally:
+            if pending:
+                self._partial_bytes_dropped += len(pending)
+                logger.warning("arecord EOF 丢弃不足一帧的尾部 %d 字节", len(pending))
+            if not self._stop_event.is_set():
+                try:
+                    return_code = process.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    return_code = process.poll()
+                if failure is None:
+                    failure = f"arecord 非预期退出，returncode={return_code}"
+                stderr = self._stderr_summary()
+                if stderr:
+                    failure = f"{failure}: {stderr}"
+                self._report_fatal(failure)
             with self._lock:
                 self._running = False
 
-    def _find_device(self) -> int:
-        """查找 ReSpeaker 输入设备索引(优先设备号,回退按名称搜索)。"""
-        p = self._pa
-        # 第一步:优先用设备号直接匹配
-        if (
-            self.device_index_cfg is not None
-            and self.device_index_cfg >= 0
-            and self.device_index_cfg < p.get_device_count()
-        ):
-            info = p.get_device_info_by_index(self.device_index_cfg)
-            if self.device_name in info.get("name", "") and info.get("maxInputChannels", 0) >= self.channels:
-                logger.info("use input device [%d]: %s", self.device_index_cfg, info.get("name"))
-                return self.device_index_cfg
+    def _drain_stderr(self, stderr) -> None:
+        """持续排空 stderr 并仅保留有界尾部，防止告警写满 pipe 阻塞采集。"""
+        try:
+            while True:
+                data = stderr.read(1024)
+                if not data:
+                    return
+                with self._stderr_lock:
+                    self._stderr_tail.extend(data)
+                    if len(self._stderr_tail) > self._STDERR_LIMIT:
+                        del self._stderr_tail[: len(self._stderr_tail) - self._STDERR_LIMIT]
+        except Exception:
+            if not self._stop_event.is_set():
+                logger.warning("读取 arecord stderr 失败", exc_info=True)
 
-        # 第二步:设备号无效,回退为按设备名搜索
-        logger.info("设备号 %s 无效或不是 ReSpeaker,回退为按设备名搜索...", self.device_index_cfg)
-        for i in range(p.get_device_count()):
-            info = p.get_device_info_by_index(i)
-            if self.device_name in info.get("name", "") and info.get("maxInputChannels", 0) >= self.channels:
-                logger.info("use input device [%d]: %s", i, info.get("name"))
-                return i
+    def _stderr_summary(self) -> str:
+        with self._stderr_lock:
+            return bytes(self._stderr_tail).decode("utf-8", errors="replace").strip()
 
-        raise RuntimeError("未找到 ReSpeaker 输入设备,请检查 USB 连接。")
+    def _report_fatal(self, reason: str) -> None:
+        if self._on_fatal_error is None:
+            return
+        try:
+            self._on_fatal_error(reason)
+        except Exception:
+            logger.exception("音频采集 fatal 回调异常")
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            process.wait()
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1.0)
 
     def stop(self):
-        """幂等停止采集线程并释放 PyAudio 资源。"""
+        """幂等停止 arecord，主动关闭引起的 EOF 不上报采集故障。"""
         with self._lock:
-            stream = self._stream
-            thread = self._capture_thread
-            pa = self._pa
-            if stream is None and thread is None and pa is None:
+            process = self._process
+            capture_thread = self._capture_thread
+            stderr_thread = self._stderr_thread
+            if process is None and capture_thread is None and stderr_thread is None:
                 return
+            # 必须先发布主动停止状态，再终止进程解除 stdout blocking read。
             self._stop_event.set()
-            self._stream = None
-            self._capture_thread = None
-            self._pa = None
 
-        cleanup_error = None
-        # 关闭 stream 用于解除另一个线程中的 blocking read；禁止持锁等待线程。
-        if stream is not None:
+        cleanup_error: Exception | None = None
+        if process is not None:
             try:
-                stream.stop_stream()
-            except Exception as exc:
-                cleanup_error = exc
-                logger.warning("停止音频流失败", exc_info=True)
-            try:
-                stream.close()
-            except Exception as exc:
-                if cleanup_error is None:
-                    cleanup_error = exc
-                logger.warning("关闭音频流失败", exc_info=True)
+                self._terminate_process(process)
+            except Exception as error:
+                cleanup_error = error
+                logger.warning("停止 arecord 失败", exc_info=True)
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception as error:
+                        if cleanup_error is None:
+                            cleanup_error = error
 
-        thread_alive = False
-        if thread is not None and thread is not threading.current_thread():
-            try:
+        alive = False
+        for thread in (capture_thread, stderr_thread):
+            if thread is not None and thread is not threading.current_thread():
                 thread.join(timeout=2.0)
-                thread_alive = thread.is_alive()
-                if thread_alive:
-                    logger.warning("音频采集线程在 2 秒内未退出")
-            except Exception as exc:
-                if cleanup_error is None:
-                    cleanup_error = exc
-                logger.warning("等待音频采集线程退出失败", exc_info=True)
-
-        if thread_alive:
-            # 未确认线程退出前不能 terminate PortAudio，也不能丢失生命周期句柄。
+                alive = alive or thread.is_alive()
+        if alive:
             with self._lock:
-                self._stream = stream
-                self._capture_thread = thread
-                self._pa = pa
-                self._running = True
                 self._cleanup_pending = True
-            if cleanup_error is not None:
-                raise cleanup_error
-            raise RuntimeError("音频采集线程在 2 秒内未退出，资源保留供后续 stop() 重试")
-
-        if pa is not None:
-            try:
-                pa.terminate()
-            except Exception as exc:
-                if cleanup_error is None:
-                    cleanup_error = exc
-                logger.warning("终止 PyAudio 失败", exc_info=True)
+            raise RuntimeError("arecord 采集线程在 2 秒内未退出，资源保留供后续 stop() 重试")
 
         with self._lock:
+            self._process = None
+            self._capture_thread = None
+            self._stderr_thread = None
             self._running = False
             self._cleanup_pending = False
         if cleanup_error is not None:
             raise cleanup_error
 
     def cleanup_pending(self) -> bool:
-        """是否仍持有待重试回收的 PortAudio 生命周期资源。"""
+        """是否仍持有待重试回收的 arecord 生命周期资源。"""
         with self._lock:
             return self._cleanup_pending
 
     def is_running(self) -> bool:
-        return self._running
+        with self._lock:
+            return self._running
 
     def stats(self) -> dict:
         """返回采集统计信息。"""
         return {
             "frames_captured": self._frames_captured,
-            "overflow_count": self._overflow_count,
+            "overflow_count": 0,
+            "partial_bytes_dropped": self._partial_bytes_dropped,
             "running": self._running,
         }
 
@@ -473,11 +545,15 @@ class SpeechDirectionRuntime:
         self._fatal_error_reported = False
         self._fatal_error_lock = threading.Lock()
 
-        # RingBuffer(4 秒缓冲,够 DOA overlap)
+        # 在线突发缓冲为 10 秒；离线 CUDA 回归允许 60 秒，避免测试调度抖动
+        # 被误判成算法丢帧。两者仍使用同一个 RingBuffer/worker 主流程。
         self.ring_buffer = MultiChannelRingBuffer(
-            capacity_frames=int(config.audio.sample_rate) * 4,
+            capacity_frames=int(config.audio.sample_rate) * (60 if not enable_capture else 10),
             channels=int(config.audio.channels),
         )
+        self._diagnostics = getattr(pipeline, "diagnostics", None)
+        self._pipeline_gap_count = 0
+        self._pipeline_gap_frames = 0
 
         # 实时采集是 device 模式的硬要求；构造失败必须传播给节点进入降级。
         self.capture: AudioCapture | None = None
@@ -487,6 +563,7 @@ class SpeechDirectionRuntime:
                     config,
                     self.ring_buffer,
                     on_fatal_error=self._report_fatal_error,
+                    on_audio_chunk=self._record_raw_chunk,
                 )
             except Exception as e:
                 reason = f"音频采集初始化失败: {e}"
@@ -496,6 +573,22 @@ class SpeechDirectionRuntime:
         self._running = False
         self._threads: list[threading.Thread] = []
         self._reader_id: int | None = None
+        self._pipeline_closed = False
+
+    def _record_raw_chunk(self, result: RingWriteResult) -> None:
+        """把采集侧完整 raw 块非阻塞投递到 diagnostics。"""
+        if self._diagnostics is not None:
+            self._diagnostics.enqueue_raw(
+                start_sample=result.start_sample,
+                samples=result.samples.T.copy(),
+            )
+
+    def _write_audio(self, data) -> RingWriteResult:
+        """统一 device/WAV/测试输入的绝对采样位置和 raw 记录路径。"""
+        result = self.ring_buffer.write(data)
+        if self.capture is None:
+            self._record_raw_chunk(result)
+        return result
 
     def _report_fatal_error(self, reason: str) -> None:
         """线程安全地向节点报告首个不可恢复错误。"""
@@ -564,15 +657,33 @@ class SpeechDirectionRuntime:
             hop_size,
             self.pipeline.sr,
         )
+        expected_sample: int | None = None
         try:
             while self._running:
-                # 从 RingBuffer 读 hop_size 帧 6ch(block 模式等够)
-                data = self.ring_buffer.read(self._reader_id, hop_size, read_mode="block", timeout=1.0)
-                if data is None or data.shape[1] == 0:
+                item = self.ring_buffer.read_with_position(self._reader_id, hop_size, read_mode="block", timeout=1.0)
+                if item is None or item.samples.shape[1] == 0:
                     continue
-                # data shape: (6, hop_size)
+                if expected_sample is not None and item.start_sample != expected_sample:
+                    gap_frames = max(0, item.start_sample - expected_sample)
+                    self._pipeline_gap_count += 1
+                    self._pipeline_gap_frames += gap_frames
+                    # Ring 覆盖后不能把不相邻音频继续拼进增强上下文和 STFT overlap。
+                    self.pipeline.reset_for_gap(
+                        next_capture_sample=item.start_sample,
+                        dropped_samples=gap_frames,
+                    )
+                    logger.warning(
+                        "RingBuffer 覆盖导致 pipeline 跳过 %d 帧(%.3fs)，从 sample=%d 冷启动",
+                        gap_frames,
+                        gap_frames / self.pipeline.sr,
+                        item.start_sample,
+                    )
                 try:
-                    self.pipeline.process_block(data)
+                    self.pipeline.process_block(
+                        item.samples,
+                        capture_start_sample=item.start_sample,
+                    )
+                    expected_sample = item.end_sample
                 except Exception as e:
                     reason = f"pipeline 处理异常: {e}"
                     logger.error(reason, exc_info=True)
@@ -591,7 +702,7 @@ class SpeechDirectionRuntime:
 
     def stop(self) -> None:
         """幂等停止线程并释放资源，即使单项清理失败也完成其余收尾。"""
-        if not self._running and self.capture is None and not self._threads:
+        if not self._running and self.capture is None and not self._threads and self._pipeline_closed:
             return
         logger.info("正在停止 SpeechDirection runtime...")
         self._running = False
@@ -608,16 +719,51 @@ class SpeechDirectionRuntime:
                 if not getattr(capture, "cleanup_pending", lambda: False)():
                     self.capture = None
         current_thread = threading.current_thread()
-        threads, self._threads = self._threads, []
-        for thread in threads:
-            # fatal 回调可能从 worker 间接触发销毁，禁止线程 join 自身。
-            if thread is not current_thread:
-                try:
-                    thread.join(timeout=2.0)
-                except Exception as exc:
-                    if cleanup_error is None:
-                        cleanup_error = exc
-                    logger.warning("等待 SpeechDirection worker 退出失败", exc_info=True)
+        remaining_threads: list[threading.Thread] = []
+        worker_alive = False
+        for thread in self._threads:
+            if thread is current_thread:
+                # fatal 回调可能从 worker 间接触发销毁，禁止线程 join 自身；
+                # 当前线程本身即未退出的 worker，计入 worker_alive 并保留句柄，
+                # 否则下方会误判"无存活 worker"而 close 与自身并发使用的 pipeline 资源。
+                remaining_threads.append(thread)
+                worker_alive = True
+                continue
+            try:
+                thread.join(timeout=2.0)
+            except Exception as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                logger.warning("等待 SpeechDirection worker 退出失败", exc_info=True)
+            if thread.is_alive():
+                # 仍存活的 worker 必须保留句柄：否则二次 stop() 看不到它，
+                # 会误判已全部退出而 close pipeline，与该 worker 的 NPU 推理竞态。
+                remaining_threads.append(thread)
+                worker_alive = True
+        # 只移除已确认退出的线程；仍存活 worker（含当前线程本身）保留在 self._threads，
+        # 二次 stop() 才能再次 join 它，直到全部退出后才允许 close。
+        self._threads = remaining_threads
+        if self._diagnostics is not None:
+            self._diagnostics.update_capture_stats(self.stats())
+        if worker_alive:
+            # 仍有 worker（含当前线程本身）可能在使用 pipeline，绝不能 close：
+            # close 会销毁 ACL buffer/dataset，与 worker 的 execute_bank 竞态导致
+            # use-after-free。保留资源供后续 stop() 重试，直到 worker 真正退出。
+            if cleanup_error is None:
+                cleanup_error = RuntimeError("SpeechDirection worker 未全部退出，pipeline 资源保留供后续 stop() 重试")
+            logger.warning("SpeechDirection worker 仍未退出，跳过 pipeline.close 避免竞态")
+        else:
+            try:
+                self.pipeline.close()
+            except Exception as exc:
+                # close 失败时不标记 _pipeline_closed：底层 close 各层为 best-effort，
+                # 是否能真正补做取决于各层 close 契约；runtime 此处仅避免把失败误标为成功。
+                if cleanup_error is None:
+                    cleanup_error = exc
+                logger.warning("关闭 speech_direction pipeline 失败", exc_info=True)
+            else:
+                # 仅 close 正常返回才标记，避免半失败后被早退条件挡住重试入口。
+                self._pipeline_closed = True
         logger.info("SpeechDirection runtime 已停止")
         if cleanup_error is not None:
             raise cleanup_error
@@ -630,7 +776,22 @@ class SpeechDirectionRuntime:
         """
         if not self._running:
             raise RuntimeError("runtime 未启动,请先调用 start()")
-        self.ring_buffer.write(data)
+        self._write_audio(data)
+
+    def stats(self) -> dict[str, int]:
+        """汇总采集、Ring 覆盖和 pipeline gap 统计。"""
+        ring = self.ring_buffer.stats()
+        frames_captured = ring["total_written_frames"]
+        if self.capture is not None:
+            frames_captured = int(self.capture.stats()["frames_captured"])
+        return {
+            "frames_captured": frames_captured,
+            "ring_capacity_frames": ring["capacity_frames"],
+            "ring_overwrite_events": ring["overwrite_events"],
+            "ring_overwritten_frames": ring["overwritten_frames"],
+            "pipeline_gap_count": self._pipeline_gap_count,
+            "pipeline_gap_frames": self._pipeline_gap_frames,
+        }
 
     def get_speech_direction(self, max_age_ms: int | None = None):
         """当前讲话方向:有段级角度且未过期 → 返回 angle,否则 None。

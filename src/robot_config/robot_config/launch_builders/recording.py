@@ -13,7 +13,9 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from launch.actions import ExecuteProcess
+from launch.actions import EmitEvent, ExecuteProcess, RegisterEventHandler
+from launch.event_handlers import OnProcessExit
+from launch.events import Shutdown
 from launch_ros.actions import Node
 
 from robot_config.logger_utils import get_colored_logger
@@ -21,6 +23,7 @@ from robot_config.utils import (
     resolve_gripper_joints_from_config,
     resolve_joint_names_from_config,
     resolve_lerobot_norm_mode,
+    resolve_ros_path,
 )
 
 
@@ -32,6 +35,35 @@ def _sanitize_dataset_name(value: str) -> str:
 
 
 logger = get_colored_logger("robot_config.recording")
+
+
+def build_semantic_preview_command() -> list[str]:
+    """Build the proven calibration preview command without launch-injected ROS arguments."""
+    return [
+        "ros2",
+        "run",
+        "robot_calibration",
+        "calib_capture_preview",
+        "--output-image-topic",
+        "/semantic_mapping/preview/image/compressed",
+        "--output-cloud-topic",
+        "/semantic_mapping/preview/cloud",
+        "--max-fps",
+        "8.0",
+        "--jpeg-quality",
+        "70",
+        "--max-points",
+        "6000",
+    ]
+
+
+def resolve_recording_launch(robot_config: dict, *, requested: bool, mode: str) -> tuple[bool, str]:
+    """Apply recording parameters without allowing semantic dataset profiles to run incomplete."""
+    if robot_config.get("recording", {}).get("semantic_dataset", False):
+        if mode != "continuous":
+            raise ValueError("semantic datasets require continuous recording")
+        return True, mode
+    return requested, mode
 
 
 def _record_cli_command(active_control_mode: str, *, scheduler_enabled: bool = False) -> str:
@@ -47,7 +79,7 @@ def generate_recording_nodes(
     record_mode: str = "continuous",
     *,
     scheduler_enabled: bool = False,
-) -> list[Node | ExecuteProcess]:
+) -> list[Node | ExecuteProcess | RegisterEventHandler]:
     """
     Generate recording nodes based on robot configuration and recording mode.
 
@@ -88,7 +120,7 @@ def generate_recording_nodes(
         return generate_continuous_recording_action(robot_config)
 
 
-def generate_continuous_recording_action(robot_config: dict) -> list[ExecuteProcess]:
+def generate_continuous_recording_action(robot_config: dict) -> list[Node | ExecuteProcess | RegisterEventHandler]:
     """
     Generate continuous recording action using ros2 bag record.
 
@@ -108,25 +140,128 @@ def generate_continuous_recording_action(robot_config: dict) -> list[ExecuteProc
     """
     logger.info("Using CONTINUOUS recording (ros2 bag record)")
 
-    # Auto-discover topics to record
-    topics = get_recording_topics(robot_config)
-
-    # Generate filename with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    robot_name = robot_config.get("name", "robot")
-    output_file = f"~/rosbag/{robot_name}_{timestamp}.mcap"
-
-    # Expand ~ to actual home directory
-    output_file = str(Path(output_file).expanduser())
+    rosbag_command = build_continuous_recording_command(robot_config, timestamp)
+    output_file = rosbag_command[rosbag_command.index("-o") + 1]
+    recording = robot_config.get("recording", {})
+    command = (
+        build_supervised_recording_command(robot_config, timestamp, rosbag_command)
+        if recording.get("semantic_dataset", False)
+        else rosbag_command
+    )
+    topics = get_recording_topics(robot_config)
 
     logger.info(f"Recording {len(topics)} topics to: {output_file}")
     logger.info(f"Topics: {topics}")
 
     # Create recording action
-    recording_action = ExecuteProcess(cmd=["ros2", "bag", "record", "-o", output_file] + topics, output="screen")
+    recording_action = ExecuteProcess(cmd=command, output="screen")
+    if recording.get("semantic_dataset", False):
+        return [
+            RegisterEventHandler(
+                event_handler=OnProcessExit(
+                    target_action=recording_action,
+                    on_exit=lambda event, _context: semantic_recording_exit_actions(event.returncode),
+                )
+            ),
+            recording_action,
+            ExecuteProcess(cmd=build_semantic_preview_command(), output="screen"),
+        ]
 
     logger.info("✓ Continuous recording action created")
     return [recording_action]
+
+
+def semantic_recording_exit_actions(returncode: int | None) -> list[EmitEvent]:
+    """Stop a semantic launch when its supervised recorder exits unexpectedly."""
+    if returncode in (None, 0):
+        return []
+    return [
+        EmitEvent(
+            event=Shutdown(reason=f"semantic dataset recorder exited with return code {returncode}"),
+        )
+    ]
+
+
+def build_continuous_recording_command(robot_config: dict, timestamp: str) -> list[str]:
+    """Build the profile-specific rosbag2 command without changing generic defaults."""
+    recording = robot_config.get("recording", {})
+    robot_name = robot_config.get("name", "robot")
+    if recording.get("semantic_dataset", False):
+        session_root = Path(recording.get("session_base_dir", "~/rosbag/semantic_mapping")).expanduser()
+        output_path = session_root / f"{robot_name}_{timestamp}" / "bag"
+    else:
+        output_path = Path(f"~/rosbag/{robot_name}_{timestamp}.mcap").expanduser()
+        return ["ros2", "bag", "record", "-o", str(output_path), *get_recording_topics(robot_config)]
+
+    command = ["ros2", "bag", "record", "-o", str(output_path)]
+    options = (
+        ("storage", "-s"),
+        ("max_bag_size", "--max-bag-size"),
+        ("max_bag_duration", "--max-bag-duration"),
+        ("max_cache_size", "--max-cache-size"),
+        ("compression_mode", "--compression-mode"),
+        ("compression_format", "--compression-format"),
+        ("qos_profile_overrides_path", "--qos-profile-overrides-path"),
+    )
+    for config_key, cli_flag in options:
+        value = recording.get(config_key)
+        if value in (None, ""):
+            continue
+        if config_key == "qos_profile_overrides_path":
+            value = resolve_ros_path(str(value))
+        command.extend([cli_flag, str(value)])
+    command.extend(get_recording_topics(robot_config))
+    return command
+
+
+def build_supervised_recording_command(
+    robot_config: dict,
+    timestamp: str,
+    rosbag_command: list[str] | None = None,
+) -> list[str]:
+    """Wrap semantic dataset recording with the minimal session supervisor."""
+    recording = robot_config.get("recording", {})
+    rosbag_command = rosbag_command or build_continuous_recording_command(robot_config, timestamp)
+    bag_path = Path(rosbag_command[rosbag_command.index("-o") + 1])
+    session_root = bag_path.parent
+    config_path = robot_config.get("_config_path")
+    if not config_path:
+        raise ValueError("semantic dataset recording requires robot_config['_config_path']")
+
+    mount_file = robot_config.get("mid360_mount_file")
+    if not mount_file:
+        raise ValueError("semantic dataset recording requires mid360_mount_file")
+    camera_file = robot_config.get("sensor_calibration", {}).get("artifacts", {}).get("base_to_front_camera", "")
+    state_path = Path(
+        recording.get("mapping_session_state_path", "~/.ros/ibrobot/semantic_mapping/current.json")
+    ).expanduser()
+    command = [
+        "ros2",
+        "run",
+        "robot_config",
+        "semantic_mapping_recorder",
+        "--session-id",
+        timestamp,
+        "--profile",
+        str(robot_config.get("name", "robot")),
+        "--robot-config",
+        str(Path(config_path).expanduser()),
+        "--session-root",
+        str(session_root),
+        "--state-file",
+        str(state_path),
+        "--mount-file",
+        resolve_ros_path(str(mount_file)),
+        "--camera-info-topic",
+        str(recording.get("camera_info_topic", "/camera/front/camera_info")),
+    ]
+    if camera_file:
+        command.extend(["--camera-file", resolve_ros_path(str(camera_file))])
+    for topic in get_recording_topics(robot_config):
+        command.extend(["--topic", topic])
+    command.extend(["--", *rosbag_command])
+    return command
 
 
 def generate_episodic_recording_node(
@@ -265,7 +400,7 @@ def generate_rerun_viewer_node(robot_config: dict) -> list[Node]:
     return [rerun_node]
 
 
-def find_workspace_root() -> str:
+def find_workspace_root() -> str | None:
     """
     Find IB_Robot workspace root directory.
 
@@ -298,6 +433,7 @@ def get_recording_topics(robot_config: dict) -> list[str]:
         >>> print(topics)
         ['/joint_states', '/arm_position_controller/commands', '/camera/cam0/image_raw', ...]
     """
+    recording = robot_config.get("recording", {})
     topics = []
 
     def _append(topic: str):
@@ -306,6 +442,12 @@ def get_recording_topics(robot_config: dict) -> list[str]:
         normalized = topic if topic.startswith("/") else f"/{topic}"
         if normalized not in topics:
             topics.append(normalized)
+
+    explicit_topics = recording.get("topics")
+    if explicit_topics is not None:
+        for topic in explicit_topics:
+            _append(topic)
+        return topics
 
     # Always record joint states for ros2_control-backed robots.
     _append("/joint_states")
@@ -332,8 +474,9 @@ def get_recording_topics(robot_config: dict) -> list[str]:
             _append(peripheral.get("topic", ""))
 
     # Diagnostics / navigation extras.
-    _append("/diagnostics")
-    for extra_topic in robot_config.get("recording", {}).get("extra_topics", []):
+    if recording.get("include_diagnostics", True):
+        _append("/diagnostics")
+    for extra_topic in recording.get("extra_topics", []):
         _append(extra_topic)
 
     return topics

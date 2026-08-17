@@ -36,6 +36,8 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
     filtering = mapping["filtering"]
     queue = mapping["queue"]
     lifecycle = mapping["lifecycle"]
+    labels = mapping["labels"]
+    label_refinement = mapping["label_refinement"]
     target_watch = mapping["target_watch"]
     interfaces = mapping["interfaces"]
     roles = perception["semantic_roles"]
@@ -68,7 +70,8 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
         "database_path": persistence["database_path"],
         "configuration_generation": generation,
         "sync_slop_sec": queue["sync_slop_sec"],
-        "max_masks": queue["max_masks_per_batch"],
+        "max_masks_per_frame": queue.get("max_masks_per_frame", 32),
+        "max_masks_per_batch": queue["max_masks_per_batch"],
         "min_mask_pixels": filtering["min_mask_pixels"],
         "min_mask_area_ratio": filtering["min_mask_area_ratio"],
         "min_mask_valid_depth_ratio": filtering["min_mask_valid_depth_ratio"],
@@ -76,9 +79,28 @@ def semantic_mapping_parameters(config: dict, *, offline: bool = False) -> dict:
         "min_frame_valid_depth_ratio": filtering["min_frame_valid_depth_ratio"],
         "depth_trunc_m": filtering["depth_trunc_m"],
         "min_points": filtering["min_points"],
+        "ground_filter_enabled": filtering.get("ground_filter_enabled", True),
+        "ground_reference_frame": filtering.get("ground_reference_frame", "base_link"),
+        "ground_height_offset_m": filtering.get("ground_height_offset_m", 0.0),
+        "ground_max_bottom_clearance_m": filtering.get("ground_max_bottom_clearance_m", 0.15),
+        "ground_max_object_height_m": filtering.get("ground_max_object_height_m", 0.75),
+        "ground_max_footprint_m": filtering.get("ground_max_footprint_m", 1.2),
+        "max_object_distance_m": filtering.get("max_object_distance_m", 2.5),
         "association_distance_m": lifecycle["association_distance_m"],
+        "association_max_size_ratio": lifecycle["association_max_size_ratio"],
         "embedding_similarity_threshold": lifecycle["embedding_similarity_threshold"],
         "association_position_weight": lifecycle["association_position_weight"],
+        "label_switch_confidence_margin": lifecycle["label_switch_confidence_margin"],
+        "min_label_confidence": labels["min_confidence"],
+        "max_label_candidates_per_mask": labels["max_candidates_per_mask"],
+        "excluded_labels": labels["excluded_labels"],
+        "label_refinement_enabled": label_refinement["enabled"],
+        "label_refinement_model": label_refinement["model"],
+        "label_refinement_model_identity": label_refinement["model_identity"],
+        "label_refinement_prompt": label_refinement["prompt"],
+        "label_refinement_min_confidence": label_refinement["min_confidence"],
+        "label_refinement_trigger_below_confidence": label_refinement["trigger_below_confidence"],
+        "label_refinement_min_observations": label_refinement["min_observations"],
     }
     if mapping_backend == "service":
         parameters.update(

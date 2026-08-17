@@ -1,18 +1,11 @@
 """RAM++ scene-tag recognition wrapper."""
 
-import sys
 from contextlib import nullcontext
-from dataclasses import dataclass
 
 import numpy as np
 
-from .model_utils import WORKSPACE_ROOT, inspect_backend, resolve_model_path
-
-
-@dataclass(frozen=True)
-class RecognizedTag:
-    label: str
-    score: float
+from .model_utils import inspect_backend, resolve_model_path
+from .ram_plus_adapter import RecognizedTag
 
 
 class RAMPlusWrapper:
@@ -44,9 +37,6 @@ class RAMPlusWrapper:
         if not self.checkpoint_path.is_file():
             raise FileNotFoundError(f"RAM++ checkpoint not found: {self.checkpoint_path}")
 
-        ram_root = WORKSPACE_ROOT / "ram_models" / "recognize-anything"
-        if str(ram_root) not in sys.path:
-            sys.path.insert(0, str(ram_root))
         try:
             import torch
             import torch.nn.functional as functional
@@ -95,38 +85,47 @@ class RAMPlusWrapper:
         torch = getattr(self, "_torch", None)
         return nullcontext() if torch is None else torch.inference_mode()
 
-    def recognize(self, image_rgb: np.ndarray, score_threshold: float = 0.0) -> list[RecognizedTag]:
-        if image_rgb.ndim != 3 or image_rgb.shape[2] != 3 or image_rgb.dtype != np.uint8:
-            raise ValueError("image must be an RGB uint8 HxWx3 array")
+    def recognize_batch(self, images_rgb: list[np.ndarray], score_threshold: float = 0.0) -> list[list[RecognizedTag]]:
+        if not images_rgb:
+            raise ValueError("at least one image is required")
+        for image_rgb in images_rgb:
+            if image_rgb.ndim != 3 or image_rgb.shape[2] != 3 or image_rgb.dtype != np.uint8:
+                raise ValueError("image must be an RGB uint8 HxWx3 array")
         from PIL import Image
 
-        tensor = self._transform(Image.fromarray(image_rgb))
-        if hasattr(tensor, "unsqueeze"):
-            tensor = tensor.unsqueeze(0)
-            if hasattr(tensor, "to"):
-                tensor = tensor.to(self.backend)
+        tensors = [self._transform(Image.fromarray(image_rgb)) for image_rgb in images_rgb]
+        if hasattr(tensors[0], "unsqueeze"):
+            tensor = self._torch.stack(tensors).to(self.backend)
+        else:
+            tensor = np.stack(tensors)
         with self._inference_context():
             logits = self._infer_logits(tensor)
         if hasattr(logits, "detach"):
             scores = logits.detach().float().cpu().numpy()
         else:
             scores = np.asarray(logits, dtype=np.float32)
-        scores = 1.0 / (1.0 + np.exp(-scores.reshape(-1)))
+        scores = 1.0 / (1.0 + np.exp(-scores))
+        if scores.ndim != 2 or scores.shape[0] != len(images_rgb):
+            raise RuntimeError("RAM++ batch logits have an unexpected shape")
 
-        model_thresholds = getattr(self._model, "class_threshold", np.zeros_like(scores))
+        model_thresholds = getattr(self._model, "class_threshold", np.zeros(scores.shape[1], dtype=np.float32))
         if hasattr(model_thresholds, "detach"):
             model_thresholds = model_thresholds.detach().float().cpu().numpy()
-        thresholds = np.asarray(model_thresholds, dtype=np.float32).reshape(-1)
+        thresholds = np.asarray(model_thresholds, dtype=np.float32).reshape(1, -1)
         if score_threshold > 0.0:
-            thresholds = np.full_like(scores, score_threshold)
-        if scores.shape != thresholds.shape:
-            raise RuntimeError("RAM++ logits and class thresholds have different lengths")
-
+            thresholds = np.full_like(thresholds, score_threshold)
         labels = np.asarray(self._model.tag_list).reshape(-1)
-        if labels.shape != scores.shape:
-            raise RuntimeError("RAM++ logits and tag list have different lengths")
-        indices = np.flatnonzero(scores > thresholds)
+        if scores.shape[1] != len(labels) or thresholds.shape[1] != len(labels):
+            raise RuntimeError("RAM++ batch logits and tag vocabulary have different lengths")
         deleted = set(int(index) for index in getattr(self._model, "delete_tag_index", []))
-        indices = [int(index) for index in indices if int(index) not in deleted]
-        indices.sort(key=lambda index: (-float(scores[index]), str(labels[index])))
-        return [RecognizedTag(str(labels[index]), float(scores[index])) for index in indices]
+        output = []
+        for row in scores:
+            indices = [int(index) for index in np.flatnonzero(row > thresholds[0]) if int(index) not in deleted]
+            indices.sort(key=lambda index: (-float(row[index]), str(labels[index])))
+            output.append([RecognizedTag(str(labels[index]), float(row[index])) for index in indices])
+        return output
+
+    def recognize(self, image_rgb: np.ndarray, score_threshold: float = 0.0) -> list[RecognizedTag]:
+        if image_rgb.ndim != 3 or image_rgb.shape[2] != 3 or image_rgb.dtype != np.uint8:
+            raise ValueError("image must be an RGB uint8 HxWx3 array")
+        return self.recognize_batch([image_rgb], score_threshold)[0]

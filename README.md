@@ -496,7 +496,7 @@ Hermes -> ibrobot-control Agent Skill -> robot-skill -> ROS Capability Gateway
 
 `robot_mcp` 兼容层已移除，统一通过 `robot-skill` 访问 Capability Gateway。
 
-SO-101 真机从启动、控制器检查、Hermes 自然语言确认执行到回原位和关闭的完整操作流程，见
+SO-101 真机从启动、控制器检查、Hermes 自然语言计划展示并立即执行到回原位和关闭的完整操作流程，见
 [`docs/hermes_so101_real_robot_manual_validation_zh.md`](docs/hermes_so101_real_robot_manual_validation_zh.md)。
 
 ### 发送 Agent 计划
@@ -521,7 +521,8 @@ robot-skill --config-name so101_single_arm plan-workflow \
 IB-Robot 内置 AI 编程代理技能，帮助 Claude Code、Gemini CLI、OpenCode 等 AI Agent 更好地理解项目架构和开发流程。可用技能详见 [.agents/skills/README.md](.agents/skills/README.md)。
 
 机器人能力发现和受控执行的默认接口是 `robot-skill`，而不是 MCP、裸 `ros2`、primitive、MoveIt 或
-controller 命令。执行真实动作前必须由用户明确确认，且运行中的 Agent 不得开启 `authorize_motion`。
+controller 命令。自然语言 Workflow 必须先展示并 flush，随后立即进入 Gateway 校验和执行；运行中的 Agent
+不得开启 `authorize_motion`。
 
 ### config.json 配置文件
 

@@ -4,9 +4,10 @@
 
 `voice_tts_service` 是 IB-Robot 的 ZipVoice 模型服务 plugin。它由 `inference_service` 的通用
 `model_service_node` 承载，接收文本和可选参考音色，调用显式选择的
-ZipVoice deployment，返回一个或多个可独立播放的单声道 WAV PCM16 音频段。
+ZipVoice deployment，返回一个或多个可独立播放的单声道 WAV PCM16 音频段，并提供播放服务所在主机的扬声器
+播放接口。
 
-本包只负责“文本转音频”，不负责扬声器播放、ASR、业务编排或通过 SSH 调用远端推理。
+本包负责“文本转音频”和播放端本机 WAV 文件，不负责 ASR、业务编排或通过 SSH 调用远端推理。
 
 ## 1. 包职责
 
@@ -18,11 +19,12 @@ ZipVoice deployment，返回一个或多个可独立播放的单声道 WAV PCM16
 4. 对长文本进行有界分段，并把模型输出统一封装为 WAV PCM16。
 5. 在 Ascend 310P 上编排 Text Encoder OM、Flow Decoder OM 和 CPU Vocos。
 6. 对请求大小、分段数量和响应音频大小设置明确上限。
+7. 通过 ALSA 和系统默认音频输出同步播放本机 WAV 文件，并返回稳定的成功或失败状态。
 
 不属于本包的职责：
 
 - 麦克风采集和语音识别。
-- 扬声器播放和音频设备管理。
+- 麦克风或扬声器设备的发现、热插拔和混音管理。
 - 机器人业务流程或对话状态管理。
 - 根据操作系统猜测模型后端，或在加载失败时静默切换后端。
 - 在运行时通过 SSH 执行模型推理。
@@ -33,7 +35,9 @@ ZipVoice deployment，返回一个或多个可独立播放的单声道 WAV PCM16
 | --- | --- |
 | 通用 ROS 宿主 | `inference_service/inference_service/model_service_node.py` |
 | TTS plugin | `voice_tts_service/voice_tts_service/model_service_plugin.py` |
+| 音频播放节点 | `voice_tts_service/voice_tts_service/audio_playback_node.py` |
 | 310P adapter | `voice_tts_service/zipvoice_310p_adapter.py` |
+| ONNX adapter (Ubuntu) | `voice_tts_service/zipvoice_onnx_adapter.py` |
 | 模型 bundle 工具 | `voice_tts_service/package_zipvoice_310p.py` |
 | 调试 launch | `launch/voice_tts.launch.py` |
 | 控制台入口 | `model_service_node = inference_service.model_service_node:main` |
@@ -57,6 +61,15 @@ ros2 launch voice_tts_service voice_tts.launch.py \
   deployment:=ascend_310p
 ```
 
+Ubuntu 主机可使用 ONNX 后端（onnxruntime + CPU Vocos），无需 Ascend 硬件：
+
+```bash
+source .shrc_local
+ros2 launch voice_tts_service voice_tts.launch.py \
+  bundle_path:=/path/to/zipvoice-bundle \
+  deployment:=ubuntu_onnx
+```
+
 ## 3. 数据流
 
 ```text
@@ -70,6 +83,15 @@ SynthesizeSpeech 请求
   -> 单声道 float PCM
   -> WAV PCM16 封装
   -> SynthesizedAudio[] 响应
+```
+
+播放链路与模型推理解耦：
+
+```text
+PlayAudioFile 请求（播放端本机绝对路径）
+  -> WAV 文件校验
+  -> ALSA aplay
+  -> success / error_code / message
 ```
 
 公共 `ModelSession` 串行执行模型推理，并统一管理准入、健康状态、失败状态和关闭等待。
@@ -108,7 +130,24 @@ ros2 service call /voice_tts/synthesize ibrobot_msgs/srv/SynthesizeSpeech \
 当前验证的 `ascend_310p` deployment 使用固定默认音色，不支持请求级音色克隆。传入参考音频时会返回
 `UNSUPPORTED_PROMPT`，不会静默忽略请求参数。
 
-### 4.2 模型生命周期
+### 4.2 音频播放
+
+| 项目 | 值 |
+| --- | --- |
+| 服务名 | `/voice_tts/play` |
+| 服务类型 | `ibrobot_msgs/srv/PlayAudioFile` |
+| 输入 | 播放服务所在机器上的 WAV 文件绝对路径 |
+
+服务同步等待整段音频播放完成，再返回 `success=true`。路径不存在、WAV 无效、ALSA 设备不可用、播放超时或
+`aplay` 返回非零状态时返回 `success=false`，并填写稳定的 `error_code` 和 `message`。服务不会通过 SSH 拉取
+文件，也不会解释调用端本机路径。
+
+```bash
+ros2 service call /voice_tts/play ibrobot_msgs/srv/PlayAudioFile \
+  "{file_path: '/tmp/voice_tts/output.wav'}"
+```
+
+### 4.3 模型生命周期
 
 | 阶段 | 类型 | 行为 |
 | --- | --- | --- |
@@ -157,6 +196,15 @@ bundle 必须满足：
 - `model.family` 为 `zipvoice`。
 - `deployment` 必须是 manifest 中存在的命名 deployment。
 
+### 5.1 已验证的 deployment
+
+| deployment | backend | 后端运行时 | 说明 |
+| --- | --- | --- | --- |
+| `ascend_310p` | ascend | ACL + OM | 310P 上编排 Text Encoder OM、Flow Decoder OM 和 CPU Vocos |
+| `ubuntu_onnx` | torch | onnxruntime + CPU | Ubuntu 主机用 onnxruntime 加载上游 ONNX 模型，复用 310P bundle 的 tokens/Vocos/prompt 资产 |
+
+`ubuntu_onnx` deployment 的 ONNX 模型从 [k2-fsa/ZipVoice](https://github.com/k2-fsa/ZipVoice) 上游获取（ModelScope 镜像），通过 `scripts/download_voice_tts_models.sh` 下载。该脚本同时生成 `zipvoice_onnx.json` 运行时配置和 `inference_manifest.json`（含 `ubuntu_onnx` deployment），使 bundle 可直接用于 `deployment:=ubuntu_onnx`。
+
 manifest 的 bundle digest 和 deployment fingerprint 用于结构身份与部署一致性，不读取模型文件内容，
 也不提供运行时防篡改。310P 打包工具会在复制前校验已知来源的 OM、Vocos checkpoint、token table
 和 golden fixture 的 SHA-256；运行时负责校验 manifest、路径安全、文件存在性和模型 ABI。正式部署如需
@@ -164,7 +212,7 @@ manifest 的 bundle digest 和 deployment fingerprint 用于结构身份与部�
 
 运行时不会根据操作系统推断后端，也不会在 deployment 加载失败时回退到另一个后端。
 
-### 5.1 打包 Ascend 310P 模型
+### 5.2 打包 Ascend 310P 模型
 
 模型文件体积较大，不提交到 Git。使用打包工具从已准备好的 ZipVoice 交付目录生成标准 bundle：
 
@@ -195,6 +243,8 @@ voice_tts:
   deployment: ascend_310p
 
   service_name: /voice_tts/synthesize
+  playback_service_name: /voice_tts/play
+  playback_timeout_sec: 300.0
 
   prompt_profile: default
   segment_max_chars: 200
@@ -216,6 +266,8 @@ voice_tts:
 | `enabled` | 是否由统一 `robot.launch.py` 启动 TTS 节点 |
 | `bundle_path` | ZipVoice bundle 路径 |
 | `deployment` | manifest 中的命名部署 |
+| `playback_service_name` | 本机 WAV 播放服务名 |
+| `playback_timeout_sec` | 单次同步播放超时 |
 | `prompt_profile` | 默认音色 profile |
 | `segment_max_chars` | 单个公共文本段的最大字符数 |
 | `max_request_chars` | 单次请求的最大字符数 |
@@ -256,6 +308,9 @@ voice_tts:
 | `INVALID_AUDIO_OUTPUT` | 模型输出为空或包含 NaN/Inf |
 | `UNSUPPORTED_PROMPT` | 所选 deployment 不支持请求级音色克隆 |
 | `INTERNAL_ERROR` | 未分类的服务内部错误 |
+
+播放接口还会返回 `INVALID_PATH`、`FILE_NOT_FOUND`、`NOT_A_FILE`、`UNSUPPORTED_FORMAT`、
+`INVALID_AUDIO_FILE`、`PLAYER_NOT_FOUND`、`PLAYBACK_TIMEOUT` 或 `PLAYBACK_FAILED`。
 
 ## 9. 测试与构建
 

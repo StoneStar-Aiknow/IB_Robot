@@ -6,7 +6,7 @@ import json
 import logging
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -35,6 +35,8 @@ from robot_config.observation_transport import (
     validate_robot_config_observation_transports,
 )
 from robot_config.perception_runtime_config import PerceptionRuntimeConfigError, parse_perception_runtime_config
+from robot_config.placement_execution_config import validate_placement_execution_config
+from robot_config.sensor_mount import apply_mid360_mount, normalize_mid360_mount
 from robot_config.timeout_policy import resolve_embodied_timeout_policy
 
 from .config_path import resolve_robot_config_path
@@ -54,6 +56,42 @@ _PARAMETER_SCHEMA_FIELDS = {"type", "additionalProperties", "properties", "requi
 _STRING_PARAMETER_FIELDS = {"type", "enum", "freeform"}
 _DISTANCE_PARAMETER_FIELDS = {"type", "exclusiveMinimum", "unit"}
 _VALID_DISTANCE_UNITS = {"meters", "degrees"}
+_NAV_STAGES = frozenset({"mapping", "navigation"})
+
+
+def _deep_merge_config(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    """Merge a mode overlay without sharing mutable values with the source YAML."""
+    result = copy.deepcopy(base)
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_config(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _resolve_nav_stage(robot_config: dict[str, Any], nav_stage: str) -> dict[str, Any]:
+    """Resolve the selected stage in a declared navigation workflow."""
+    stage_configs = robot_config.get("nav_stages")
+    if stage_configs is None:
+        if nav_stage:
+            raise ValueError("nav_stage is only supported by configs that declare nav_stages")
+        return robot_config
+    if not isinstance(stage_configs, dict) or set(stage_configs) != _NAV_STAGES:
+        raise ValueError(f"nav_stages must contain exactly {sorted(_NAV_STAGES)}")
+    if any(not isinstance(config, dict) for config in stage_configs.values()):
+        raise ValueError("each nav_stages entry must be a mapping")
+
+    default_stage = robot_config.get("default_nav_stage", "navigation")
+    resolved_stage = nav_stage or default_stage
+    if resolved_stage not in _NAV_STAGES:
+        raise ValueError(f"Unsupported nav_stage {resolved_stage!r}; expected one of {sorted(_NAV_STAGES)}")
+
+    base = copy.deepcopy(robot_config)
+    del base["nav_stages"]
+    resolved = _deep_merge_config(base, stage_configs[resolved_stage])
+    resolved["nav_stage"] = resolved_stage
+    return resolved
 
 
 def _normalize_digest_value(value: Any) -> Any:
@@ -183,6 +221,54 @@ def _unit_interval(section: dict[str, Any], key: str, path: str, errors: list[st
         errors.append(f"{path}.{key} must be in [0.0, 1.0]")
 
 
+def validate_motion_mode_config(robot_config: dict[str, Any]) -> list[str]:
+    """Validate the namespaced arm/base controller-authorization contract."""
+    config = robot_config.get("motion_mode")
+    if config is None:
+        return []
+    if not isinstance(config, dict):
+        return ["motion_mode must be a mapping"]
+
+    errors: list[str] = []
+    enabled = config.get("enabled", False)
+    if not isinstance(enabled, bool):
+        return ["motion_mode.enabled must be a boolean"]
+    if not enabled:
+        return errors
+
+    if not isinstance(config.get("navigation_enabled_on_startup"), bool):
+        errors.append("motion_mode.navigation_enabled_on_startup must be explicitly set to a boolean")
+
+    endpoint_keys = (
+        "navigation_enabled_topic",
+        "navigation_mode_ack_topic",
+        "set_navigation_enabled_service",
+        "controller_switch_service",
+    )
+    for key in endpoint_keys:
+        value = config.get(key)
+        if not isinstance(value, str) or not value.strip():
+            errors.append(f"motion_mode.{key} must be a non-empty relative ROS name")
+        elif value.startswith("/"):
+            errors.append(f"motion_mode.{key} must be relative so robot namespaces remain isolated")
+
+    controller_groups: dict[str, list[str]] = {}
+    for key in ("manipulation_controllers", "navigation_controllers"):
+        value = config.get(key)
+        if not isinstance(value, list) or not value or not all(isinstance(item, str) and item for item in value):
+            errors.append(f"motion_mode.{key} must be a non-empty list of controller names")
+            controller_groups[key] = []
+        else:
+            controller_groups[key] = value
+    overlap = set(controller_groups["manipulation_controllers"]) & set(controller_groups["navigation_controllers"])
+    if overlap:
+        errors.append("motion_mode controller groups must be disjoint: " + ", ".join(sorted(overlap)))
+
+    for key in ("transition_timeout_s", "bridge_heartbeat_timeout_s"):
+        _positive_number(config, key, "motion_mode", errors)
+    return errors
+
+
 def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
     """Validate the standalone semantic mapping SSOT contract."""
     config = robot_config.get("semantic_mapping")
@@ -207,6 +293,8 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
         "filtering",
         "queue",
         "lifecycle",
+        "labels",
+        "label_refinement",
         "target_watch",
         "interfaces",
     )
@@ -302,11 +390,29 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
         "max_mask_overlap_ratio",
     ):
         _unit_interval(filtering, key, filtering_path, errors)
+    if "ground_filter_enabled" in filtering and not isinstance(filtering["ground_filter_enabled"], bool):
+        errors.append("semantic_mapping.filtering.ground_filter_enabled must be a boolean")
+    if "ground_reference_frame" in filtering:
+        _required_string(filtering, "ground_reference_frame", filtering_path, errors)
+    if "ground_height_offset_m" in filtering:
+        offset = filtering["ground_height_offset_m"]
+        if isinstance(offset, bool) or not isinstance(offset, int | float):
+            errors.append("semantic_mapping.filtering.ground_height_offset_m must be a number")
+    for key in (
+        "ground_max_bottom_clearance_m",
+        "ground_max_object_height_m",
+        "ground_max_footprint_m",
+        "max_object_distance_m",
+    ):
+        if key in filtering:
+            _positive_number(filtering, key, filtering_path, errors)
 
     queue = sections["queue"]
     queue_path = "semantic_mapping.queue"
     for key in ("sync_queue_size", "frame_capacity", "max_masks_per_batch"):
         _positive_integer(queue, key, queue_path, errors)
+    if "max_masks_per_frame" in queue:
+        _positive_integer(queue, "max_masks_per_frame", queue_path, errors)
     for key in ("sync_slop_sec", "tf_timeout_sec", "processing_interval_sec"):
         _positive_number(queue, key, queue_path, errors)
     if queue.get("policy") not in {"drop_oldest", "drop_newest", "backpressure"}:
@@ -317,11 +423,35 @@ def validate_semantic_mapping_config(robot_config: dict[str, Any]) -> list[str]:
 
     lifecycle = sections["lifecycle"]
     lifecycle_path = "semantic_mapping.lifecycle"
-    for key in ("association_distance_m", "stale_after_sec", "move_stability_m"):
+    for key in ("association_distance_m", "association_max_size_ratio", "stale_after_sec", "move_stability_m"):
         _positive_number(lifecycle, key, lifecycle_path, errors)
+    max_size_ratio = lifecycle.get("association_max_size_ratio")
+    if _is_finite_number(max_size_ratio) and float(max_size_ratio) < 1.0:
+        errors.append("semantic_mapping.lifecycle.association_max_size_ratio must be >= 1.0")
     _positive_integer(lifecycle, "move_confirmations", lifecycle_path, errors)
-    for key in ("association_position_weight", "embedding_similarity_threshold"):
+    for key in ("association_position_weight", "embedding_similarity_threshold", "label_switch_confidence_margin"):
         _unit_interval(lifecycle, key, lifecycle_path, errors)
+
+    labels = sections["labels"]
+    labels_path = "semantic_mapping.labels"
+    _unit_interval(labels, "min_confidence", labels_path, errors)
+    _positive_integer(labels, "max_candidates_per_mask", labels_path, errors)
+    excluded_labels = labels.get("excluded_labels")
+    if not isinstance(excluded_labels, list) or any(
+        not isinstance(label, str) or not label.strip() for label in excluded_labels
+    ):
+        errors.append(f"{labels_path}.excluded_labels must be a list of non-empty strings")
+
+    label_refinement = sections["label_refinement"]
+    refinement_path = "semantic_mapping.label_refinement"
+    if not isinstance(label_refinement.get("enabled"), bool):
+        errors.append(f"{refinement_path}.enabled must be a boolean")
+    if label_refinement.get("enabled") is True:
+        for key in ("model", "model_identity", "prompt"):
+            _required_string(label_refinement, key, refinement_path, errors)
+    _unit_interval(label_refinement, "min_confidence", refinement_path, errors)
+    _unit_interval(label_refinement, "trigger_below_confidence", refinement_path, errors)
+    _positive_integer(label_refinement, "min_observations", refinement_path, errors)
 
     target_watch = sections["target_watch"]
     target_watch_path = "semantic_mapping.target_watch"
@@ -913,7 +1043,82 @@ def _validate_skill_gateway_config(robot_config: dict[str, Any]) -> list[str]:
     return errors
 
 
-def load_robot_config_dict(config_path: str | Path | None = None) -> dict[str, Any]:
+def _quaternion_multiply(left: list[float], right: list[float]) -> list[float]:
+    lx, ly, lz, lw = left
+    rx, ry, rz, rw = right
+    return [
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+        lw * rw - lx * rx - ly * ry - lz * rz,
+    ]
+
+
+def _normalized_quaternion(quaternion: list[float]) -> list[float]:
+    norm = math.sqrt(sum(value * value for value in quaternion))
+    if norm <= 1e-12:
+        raise ValueError("calibration rotation quaternion must be non-zero")
+    return [value / norm for value in quaternion]
+
+
+def _apply_approved_camera_calibration(robot_config: dict[str, Any]) -> None:
+    calibration = robot_config.get("sensor_calibration", {})
+    artifacts = calibration.get("artifacts", {}) if isinstance(calibration, dict) else {}
+    artifact_value = artifacts.get("base_to_front_camera") if isinstance(artifacts, dict) else None
+    if not artifact_value:
+        return
+
+    artifact_path = Path(resolve_ros_path(artifact_value)).expanduser()
+    if not artifact_path.is_file():
+        logger.info("Approved camera calibration is not installed: %s", artifact_path)
+        for camera in robot_config.get("peripherals", []):
+            if camera.get("type") == "camera" and camera.get("skip_urdf_without_transform", False):
+                camera.pop("transform", None)
+        return
+    try:
+        document = yaml.safe_load(artifact_path.read_bytes()) or {}
+        transform = document.get("transform", {})
+        if document.get("status") != "approved" or not isinstance(transform, dict):
+            raise ValueError("artifact is not an approved transform")
+        if transform.get("parent_frame") != "base_link":
+            raise ValueError("artifact parent_frame must be base_link")
+        translation = transform.get("translation")
+        rotation = transform.get("rotation_xyzw")
+        if not isinstance(translation, list) or len(translation) != 3:
+            raise ValueError("artifact translation must contain three values")
+        if not isinstance(rotation, list) or len(rotation) != 4:
+            raise ValueError("artifact rotation_xyzw must contain four values")
+        translation_values = cast(list[float], translation)
+        rotation_values = cast(list[float], rotation)
+        optical_inverse = [0.5, -0.5, 0.5, 0.5]
+        link_rotation = _normalized_quaternion(
+            _quaternion_multiply([float(value) for value in rotation_values], optical_inverse)
+        )
+        for camera in robot_config.get("peripherals", []):
+            if camera.get("type") == "camera" and camera.get("optical_frame_id") == transform.get("child_frame"):
+                camera["transform"].update(
+                    {
+                        "x": float(translation_values[0]),
+                        "y": float(translation_values[1]),
+                        "z": float(translation_values[2]),
+                        "qx": link_rotation[0],
+                        "qy": link_rotation[1],
+                        "qz": link_rotation[2],
+                        "qw": link_rotation[3],
+                    }
+                )
+                logger.info("Using approved camera calibration: %s", artifact_path)
+                return
+        raise ValueError("artifact child_frame does not match a configured camera optical frame")
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        raise ValueError(f"Invalid approved camera calibration {artifact_path}: {exc}") from exc
+
+
+def load_robot_config_dict(
+    config_path: str | Path | None = None,
+    *,
+    nav_stage: str = "",
+) -> dict[str, Any]:
     """Load robot configuration as a complete dict.
 
     This is the canonical loader for launch/builders/runtime consumers. It preserves
@@ -921,8 +1126,16 @@ def load_robot_config_dict(config_path: str | Path | None = None) -> dict[str, A
     downstream users that need provenance.
     """
     resolved_config_path, robot_data = _load_robot_section(resolve_robot_config_path(config_path=config_path))
-    robot_config = copy.deepcopy(robot_data)
+    robot_config = _resolve_nav_stage(copy.deepcopy(robot_data), nav_stage.strip())
+    mount_file = robot_config.get("mid360_mount_file")
+    if mount_file:
+        mount_path = Path(resolve_ros_path(mount_file)).expanduser()
+        with mount_path.open("r", encoding="utf-8") as stream:
+            robot_config = apply_mid360_mount(robot_config, normalize_mid360_mount(yaml.safe_load(stream) or {}))
+    _apply_approved_camera_calibration(robot_config)
     validation_errors = validate_grasp_execution_config(robot_config.get("grasp_execution"))
+    validation_errors.extend(validate_placement_execution_config(robot_config.get("placement_execution")))
+    validation_errors.extend(validate_motion_mode_config(robot_config))
     validation_errors.extend(_validate_embodied_skill_contract(robot_config))
     validation_errors.extend(_validate_skill_gateway_config(robot_config))
     try:
@@ -1108,6 +1321,8 @@ def load_voice_tts_config(data: dict[str, Any]) -> VoiceTTSConfig:
         bundle_path=resolve_ros_path(bundle_path) if bundle_path else "",
         deployment=data.get("deployment", defaults.deployment),
         service_name=data.get("service_name", defaults.service_name),
+        playback_service_name=data.get("playback_service_name", defaults.playback_service_name),
+        playback_timeout_sec=data.get("playback_timeout_sec", defaults.playback_timeout_sec),
         prompt_profile=data.get("prompt_profile", defaults.prompt_profile),
         segment_max_chars=data.get("segment_max_chars", defaults.segment_max_chars),
         segment_pause_ms=data.get("segment_pause_ms", defaults.segment_pause_ms),
@@ -1132,6 +1347,8 @@ def load_semantic_mapping_config(data: dict[str, Any]) -> SemanticMappingConfig:
         filtering=dict(data.get("filtering", {})),
         queue=dict(data.get("queue", {})),
         lifecycle=dict(data.get("lifecycle", {})),
+        labels=dict(data.get("labels", {})),
+        label_refinement=dict(data.get("label_refinement", {})),
         target_watch=dict(data.get("target_watch", {})),
         interfaces=dict(data.get("interfaces", {})),
     )
@@ -1259,6 +1476,9 @@ def load_robot_config(config_path: str | Path | None = None) -> RobotConfig:
         skill_gateway=skill_gateway,
         semantic_mapping=semantic_mapping,
         perception_services=perception_services,
+        placement_execution=robot_data.get("placement_execution", {})
+        if isinstance(robot_data.get("placement_execution", {}), dict)
+        else {},
     )
 
 
@@ -1397,6 +1617,8 @@ def validate_config(config: RobotConfig) -> list[str]:
     """
     errors = []
 
+    errors.extend(validate_placement_execution_config(getattr(config, "placement_execution", None)))
+
     semantic_mapping_dict = {
         "enabled": config.semantic_mapping.enabled,
         "camera": config.semantic_mapping.camera,
@@ -1406,6 +1628,8 @@ def validate_config(config: RobotConfig) -> list[str]:
         "filtering": config.semantic_mapping.filtering,
         "queue": config.semantic_mapping.queue,
         "lifecycle": config.semantic_mapping.lifecycle,
+        "labels": config.semantic_mapping.labels,
+        "label_refinement": config.semantic_mapping.label_refinement,
         "target_watch": config.semantic_mapping.target_watch,
         "interfaces": config.semantic_mapping.interfaces,
     }
@@ -1510,6 +1734,10 @@ def validate_config(config: RobotConfig) -> list[str]:
             errors.append("voice_tts.deployment is required when voice_tts.enabled is true")
         if not config.voice_tts.service_name.startswith("/"):
             errors.append("voice_tts.service_name must be an absolute ROS service name")
+        if not config.voice_tts.playback_service_name.startswith("/"):
+            errors.append("voice_tts.playback_service_name must be an absolute ROS service name")
+        if config.voice_tts.playback_timeout_sec <= 0:
+            errors.append("voice_tts.playback_timeout_sec must be positive")
         if not config.voice_tts.prompt_profile:
             errors.append("voice_tts.prompt_profile must be non-empty")
         positive_limits = {

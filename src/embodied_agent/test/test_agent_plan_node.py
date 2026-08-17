@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -47,7 +51,7 @@ def _workflow_request(request, *skill_names: str) -> None:
 
 
 @pytest.fixture
-def plan_rig():
+def plan_rig(request):
     if rclpy.ok():
         rclpy.shutdown()
     rclpy.init()
@@ -66,9 +70,12 @@ def plan_rig():
     from robot_config.loader import load_robot_config_dict
     from robot_skill_cli.catalog import compile_local_snapshot
 
-    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / "so101_single_arm.yaml"
+    config_name = getattr(request, "param", "so101_single_arm")
+    config_path = Path(__file__).parents[2] / "robot_config" / "config" / "robots" / f"{config_name}.yaml"
     snapshot = compile_local_snapshot(load_robot_config_dict(config_path), config_path)
     registry = ("epoch-test", 7, snapshot.registry_digest)
+
+    executed_goals = []
 
     def status_callback(_request, response):
         response.schema_version = 1
@@ -78,13 +85,15 @@ def plan_rig():
         response.rpc_timeout_sec = 1.0
         response.control_plane_ready = True
         response.control_plane_state = "READY"
-        capability = SkillCapabilityStatus()
-        capability.schema_version = 1
-        capability.name = "open_gripper_skill"
-        capability.semantic_level = "skill"
-        capability.planner_visible = True
-        capability.ready = True
-        response.capabilities = [capability]
+        response.capabilities = []
+        for skill_name in snapshot.planner_visible_skill_names:
+            capability = SkillCapabilityStatus()
+            capability.schema_version = 1
+            capability.name = skill_name
+            capability.semantic_level = snapshot.semantic_levels[skill_name]
+            capability.planner_visible = True
+            capability.ready = True
+            response.capabilities.append(capability)
         return response
 
     validation_control = {"registry": registry, "allowed": True}
@@ -107,6 +116,7 @@ def plan_rig():
         return response
 
     def execute_callback(goal_handle):
+        executed_goals.append(goal_handle.request)
         result = SkillCommand.Result()
         result.success = True
         result.message = "skill completed"
@@ -159,10 +169,13 @@ def plan_rig():
         yield SimpleNamespace(
             confirm_client=confirm_client,
             execute_client=execute_client,
+            node=plan_node,
             plan_client=plan_client,
+            plan_node=plan_node,
             registry=registry,
             validate_client=validate_client,
             validation_control=validation_control,
+            executed_goals=executed_goals,
         )
     finally:
         executor.shutdown(timeout_sec=1.0)
@@ -221,6 +234,61 @@ def test_plan_validate_confirm_execute_and_terminal_replay(plan_rig):
     assert replay.completed_step_count == 1
 
 
+def test_canceled_terminal_replay_preserves_canceled_goal_status(plan_rig):
+    plan_request = PlanAgentCommand.Request()
+    plan_request.schema_version = 1
+    plan_request.request_id = "request-canceled-replay"
+    plan_request.raw_command = "打开夹爪"
+    _workflow_request(plan_request, "open_gripper_skill")
+    planned = _future_result(plan_rig.plan_client.call_async(plan_request))
+
+    validate_request = ValidateAgentPlan.Request()
+    validate_request.schema_version = 1
+    validate_request.plan_token = planned.plan.plan_token
+    assert _future_result(plan_rig.validate_client.call_async(validate_request)).allowed is True
+
+    confirm_request = ConfirmAgentPlan.Request()
+    confirm_request.schema_version = 1
+    confirm_request.plan_token = planned.plan.plan_token
+    confirm_request.plan_digest = planned.plan.plan_digest
+    confirm_request.task_id = "agent-task-canceled-replay"
+    confirm_request.registry_epoch, confirm_request.registry_generation, confirm_request.registry_digest = (
+        plan_rig.registry
+    )
+    confirm_request.task_budget_sec = 5.0
+    confirmed = _future_result(plan_rig.confirm_client.call_async(confirm_request))
+
+    with plan_rig.node._store_lock:  # noqa: SLF001
+        execution = plan_rig.node._store.accept_execution(  # noqa: SLF001
+            plan_token=planned.plan.plan_token,
+            confirmation_token=confirmed.confirmation_token,
+            task_id=confirm_request.task_id,
+            registry_epoch=planned.plan.registry_epoch,
+            registry_generation=planned.plan.registry_generation,
+            registry_digest=planned.plan.registry_digest,
+            task_budget_sec=5.0,
+        )
+        plan_rig.node._store.mark_terminal(  # noqa: SLF001
+            plan_token=planned.plan.plan_token,
+            task_id=confirm_request.task_id,
+            execution_token=execution.execution_token,
+            terminal_code="SKILL_CANCELLED",
+            terminal_message="canceled",
+        )
+
+    goal = ExecuteAgentPlan.Goal()
+    goal.schema_version = 1
+    goal.plan_token = planned.plan.plan_token
+    goal.confirmation_token = confirmed.confirmation_token
+    goal.task_id = confirm_request.task_id
+    goal.timeout_sec = 5.0
+    handle = _future_result(plan_rig.execute_client.send_goal_async(goal))
+    replay = _future_result(handle.get_result_async())
+
+    assert replay.status == 5
+    assert replay.result.error_code == "SKILL_CANCELLED"
+
+
 def test_execute_rejects_budget_changed_after_confirmation(plan_rig):
     plan_request = PlanAgentCommand.Request()
     plan_request.schema_version = 1
@@ -256,6 +324,13 @@ def test_execute_rejects_budget_changed_after_confirmation(plan_rig):
 
     assert result.success is False
     assert result.error_code == "SKILL_REQUEST_ID_CONFLICT"
+    assert result.plan_id == planned.plan.plan_id
+    assert result.plan_digest == planned.plan.plan_digest
+    assert (result.actual_registry_epoch, result.actual_registry_generation, result.actual_registry_digest) == (
+        planned.plan.registry_epoch,
+        planned.plan.registry_generation,
+        planned.plan.registry_digest,
+    )
 
 
 def test_plan_service_returns_one_typed_ordered_multi_skill_workflow(plan_rig):
@@ -274,6 +349,337 @@ def test_plan_service_returns_one_typed_ordered_multi_skill_workflow(plan_rig):
     validate_request.plan_token = planned.plan.plan_token
     validated = _future_result(plan_rig.validate_client.call_async(validate_request))
     assert validated.allowed is True
+
+
+def test_validate_plan_unexpected_error_returns_stable_failure_and_service_survives(plan_rig, monkeypatch):
+    plan_request = PlanAgentCommand.Request()
+    plan_request.schema_version = 1
+    plan_request.request_id = "request-unexpected-validation-error"
+    plan_request.raw_command = "打开夹爪"
+    _workflow_request(plan_request, "open_gripper_skill")
+    planned = _future_result(plan_rig.plan_client.call_async(plan_request))
+    assert planned.success is True
+
+    original_validate_step = plan_rig.plan_node._validate_step
+
+    def fail_validation(*_args, **_kwargs):
+        raise RuntimeError("injected validation failure")
+
+    monkeypatch.setattr(plan_rig.plan_node, "_validate_step", fail_validation)
+    validate_request = ValidateAgentPlan.Request()
+    validate_request.schema_version = 1
+    validate_request.plan_token = planned.plan.plan_token
+    failed = _future_result(plan_rig.validate_client.call_async(validate_request))
+
+    assert failed.allowed is False
+    assert failed.error_code == "CAPABILITY_NOT_READY"
+    assert failed.message == "agent plan validation is temporarily unavailable"
+
+    monkeypatch.setattr(plan_rig.plan_node, "_validate_step", original_validate_step)
+    recovered = _future_result(plan_rig.validate_client.call_async(validate_request))
+    assert recovered.allowed is True
+
+
+@pytest.mark.parametrize("plan_rig", ["lekiwi_handeye_realsense_grasp_pc"], indirect=True)
+def test_marker_outputs_replay_uses_hermes_pick_contract_without_hardware(plan_rig):
+    """Replay the saved marker planning evidence through the Agent plan boundary only."""
+    repository_root = Path(__file__).parents[3]
+    evidence_path = (
+        repository_root / "outputs" / "success_cloud_replay_20260806" / "current_phases_after_wait_future_fix.json"
+    )
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["fixture"].endswith("20260717_103241_marker_1784255561600731369")
+    assert evidence["pr259"]["final_candidate_id"] == 82
+
+    request = PlanAgentCommand.Request()
+    request.schema_version = 1
+    request.request_id = "hermes-marker-outputs-offline"
+    request.raw_command = "用 outputs 的 marker 规划结果验证 Hermes 抓取通路（不启动真机）"
+    step = WorkflowStep()
+    step.schema_version = 1
+    step.skill_name = "pick_object"
+    step.target_name = "marker"
+    request.workflow_steps = [step]
+
+    planned = _future_result(plan_rig.plan_client.call_async(request))
+    assert planned.success is True
+    assert planned.plan.workflow_steps[0].skill_name == "pick_object"
+    assert planned.plan.workflow_steps[0].target_name == "marker"
+
+    validate_request = ValidateAgentPlan.Request()
+    validate_request.schema_version = 1
+    validate_request.plan_token = planned.plan.plan_token
+    validated = _future_result(plan_rig.validate_client.call_async(validate_request))
+    assert validated.allowed is True
+
+    confirm_request = ConfirmAgentPlan.Request()
+    confirm_request.schema_version = 1
+    confirm_request.plan_token = planned.plan.plan_token
+    confirm_request.plan_digest = planned.plan.plan_digest
+    confirm_request.task_id = "hermes-marker-outputs-task"
+    confirm_request.registry_epoch, confirm_request.registry_generation, confirm_request.registry_digest = (
+        plan_rig.registry
+    )
+    confirm_request.task_budget_sec = 5.0
+    confirmed = _future_result(plan_rig.confirm_client.call_async(confirm_request))
+    assert confirmed.confirmed is True
+
+    goal = ExecuteAgentPlan.Goal()
+    goal.schema_version = 1
+    goal.plan_token = planned.plan.plan_token
+    goal.confirmation_token = confirmed.confirmation_token
+    goal.task_id = confirm_request.task_id
+    goal.timeout_sec = 5.0
+    handle = _future_result(plan_rig.execute_client.send_goal_async(goal))
+    assert handle.accepted
+    result = _future_result(handle.get_result_async()).result
+
+    assert result.success is True
+    assert result.completed_step_count == 1
+    assert len(plan_rig.executed_goals) == 1
+    child = plan_rig.executed_goals[0]
+    assert child.skill_name == "pick_object"
+    assert child.target_name == "marker"
+    assert child.timeout_sec == pytest.approx(0.0)
+    assert child.dispatch_binding.expected_registry_digest == plan_rig.registry[2]
+
+
+def test_robot_skill_marker_outputs_replay_reaches_real_gateway_without_hardware(tmp_path):
+    """Run the Hermes-bound CLI lifecycle through the real Gateway and a replay-only pick server."""
+    allocated_domain = os.environ.get("IBROBOT_TEST_ROS_DOMAIN_ID", "")
+    assert allocated_domain.isdecimal() and os.environ.get("ROS_DOMAIN_ID") == allocated_domain
+    assert os.environ.get("ROS_LOCALHOST_ONLY") == "1"
+    robot_skill = shutil.which("robot-skill")
+    assert robot_skill is not None
+    if not rclpy.ok():
+        rclpy.init()
+
+    repository_root = Path(__file__).parents[3]
+    config_path = (
+        repository_root / "src" / "robot_config" / "config" / "robots" / "lekiwi_handeye_realsense_grasp_pc.yaml"
+    )
+    evidence_path = (
+        repository_root / "outputs" / "success_cloud_replay_20260806" / "current_phases_after_wait_future_fix.json"
+    )
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    candidate_id = int(evidence["pr259"]["final_candidate_id"])
+    assert candidate_id == 82
+
+    from embodied_common.dispatch_binding import fill_delegated_executor_identity
+    from ibrobot_msgs.action import PickObject
+    from robot_config.loader import load_robot_config_dict, robot_config_digest
+    from robot_config.timeout_policy import resolve_embodied_timeout_policy
+    from skill_library.skill_executor_node import SkillExecutorNode
+
+    config = load_robot_config_dict(config_path)
+    embodied = config["embodied"]
+    execution = embodied["execution"]
+    timeouts = resolve_embodied_timeout_policy(embodied)
+    catalog_root = repository_root / embodied["skill_catalog_source_root"]
+    mock_node = rclpy.create_node(f"hermes_marker_replay_{uuid.uuid4().hex}")
+    pick_goals = []
+
+    def validate_skill(request, response):
+        response.allowed = request.skill_name == "pick_object" and request.target_name == "marker"
+        response.reason = "offline replay allowed" if response.allowed else "unexpected replay request"
+        response.actual_registry_epoch = request.dispatch_binding.expected_registry_epoch
+        response.actual_registry_generation = request.dispatch_binding.expected_registry_generation
+        response.actual_registry_digest = request.dispatch_binding.expected_registry_digest
+        return response
+
+    mock_node.create_service(ValidateSkill, embodied["validate_skill_service"], validate_skill)
+
+    def execute_pick(goal_handle):
+        goal = goal_handle.request
+        pick_goals.append(goal)
+        result = PickObject.Result()
+        result.success = goal.target_query == "marker" and candidate_id == 82
+        result.message = f"offline marker planning replay selected candidate {candidate_id}"
+        result.attempts = 1
+        result.verification_status = PickObject.Result.VERIFICATION_NOT_RUN
+        result.debug_output_dir = evidence["fixture"]
+        result.completed_phases = ["planning", "selecting"]
+        result.candidate_index = candidate_id
+        fill_delegated_executor_identity(
+            result.actual_executor,
+            {
+                "name": goal.expected_executor.name,
+                "contract_version": goal.expected_executor.contract_version,
+                "endpoint_kind": goal.expected_executor.endpoint_kind,
+                "endpoint_name": goal.expected_executor.endpoint_name,
+                "configuration_digest": goal.expected_executor.configuration_digest,
+                "model_deployment_name": goal.expected_executor.model_deployment_name,
+                "model_fingerprint": goal.expected_executor.model_fingerprint,
+                "model_bundle_digest": goal.expected_executor.model_bundle_digest,
+            },
+        )
+        feedback = PickObject.Feedback()
+        feedback.phase = "planning"
+        feedback.detail = f"replaying {evidence_path}"
+        goal_handle.publish_feedback(feedback)
+        goal_handle.succeed()
+        return result
+
+    pick_server = ActionServer(mock_node, PickObject, config["grasp_execution"]["action_name"], execute_pick)
+    params = {
+        "active_control_mode": config["skill_required_control_mode"],
+        "arm_joint_names_json": json.dumps(config["joints"]["arm"]),
+        "config_digest": robot_config_digest(config),
+        "default_skill_timeout_sec": timeouts["default_skill_timeout_sec"],
+        "grasp_execution_json": json.dumps(config["grasp_execution"]),
+        "gripper_closed_position": execution["gripper_closed_position"],
+        "gripper_open_position": execution["gripper_open_position"],
+        "gripper_settle_sec": timeouts["gripper_settle_sec"],
+        "joint_limits_json": json.dumps(config["teleoperation"]["safety"]["joint_limits"]),
+        "model_idle_timeout_sec": timeouts["model_idle_timeout_sec"],
+        "motion_authorized": True,
+        "named_poses_json": json.dumps(embodied["named_poses"]),
+        "named_targets_json": json.dumps(embodied.get("named_targets", {})),
+        "pick_action_name": config["grasp_execution"]["action_name"],
+        "placement_execution_json": json.dumps(config["placement_execution"]),
+        "relative_motion_direction_mapping_json": json.dumps(execution["relative_motion_direction_mapping"]),
+        "relative_motion_reference_frame": execution["relative_motion_reference_frame"],
+        "relative_motion_step_m": execution["relative_motion_step_m"],
+        "robot_name": config["name"],
+        "robot_state_freshness_sec": timeouts["robot_state_freshness_sec"],
+        "rpc_timeout_sec": 1.0,
+        "scene_freshness_sec": timeouts["scene_freshness_sec"],
+        "skill_catalog_profile": embodied["skill_catalog_profile"],
+        "skill_catalog_source_mode": "development",
+        "skill_catalog_source_root": str(catalog_root),
+        "skill_required_control_mode": config["skill_required_control_mode"],
+        "task_budget_sec": timeouts["task_budget_sec"],
+        "workspace_json": json.dumps(embodied["safety"]["workspace"]),
+    }
+    gateway_node = SkillExecutorNode(
+        parameter_overrides=[Parameter(name, value=value) for name, value in params.items()],
+        node_name=f"hermes_marker_gateway_{uuid.uuid4().hex}",
+    )
+    agent_node = AgentPlanNode(parameter_overrides=[Parameter("rpc_timeout_sec", value=1.0)])
+    executor = MultiThreadedExecutor(num_threads=8)
+    for node in (mock_node, gateway_node, agent_node):
+        executor.add_node(node)
+    import threading
+
+    thread = threading.Thread(target=executor.spin, daemon=True)
+    thread.start()
+
+    from robot_skill_cli.hermes_launcher import _prepare_robot_skill_wrapper
+
+    wrapper_dir = _prepare_robot_skill_wrapper(
+        tmp_path / "hermes-workspace",
+        robot_skill,
+        os.environ.get("PYTHONPATH", ""),
+        config_path,
+        os.environ.copy(),
+    )
+    bound_robot_skill = wrapper_dir / "robot-skill"
+
+    def run_cli(*arguments: str, jsonl: bool = False):
+        completed = subprocess.run(
+            [bound_robot_skill, *arguments],
+            check=False,
+            capture_output=True,
+            env=os.environ.copy(),
+            text=True,
+            timeout=20.0,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        lines = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+        return lines if jsonl else lines[-1]
+
+    try:
+        rejected_override = subprocess.run(
+            [bound_robot_skill, "--config-name", "so101_single_arm", "status"],
+            check=False,
+            capture_output=True,
+            env=os.environ.copy(),
+            text=True,
+            timeout=20.0,
+        )
+        assert rejected_override.returncode == 2
+        assert "configuration is bound by hermes-robot" in rejected_override.stderr
+
+        status = run_cli("status")
+        assert status["data"]["control_plane_ready"] is True
+        assert status["data"]["motion_authorized"] is True
+
+        listing = run_cli("list-skills")
+        assert "pick_object" in {skill["name"] for skill in listing["data"]["skills"]}
+
+        plan = run_cli(
+            "plan-workflow",
+            "--request-id",
+            "hermes-marker-outputs-cli",
+            "--text",
+            "用之前的 outputs 验证 Hermes marker 抓取通路，不启动真机",
+            "--workflow-json",
+            json.dumps([{"skill_name": "pick_object", "target_name": "marker"}]),
+        )
+        planned = plan["data"]["plan"]
+        assert planned["workflow_steps"][0]["target_name"] == "marker"
+
+        description = run_cli("describe", "pick_object")
+        assert description["data"]["parameters"]["required"] == ["target_name"]
+
+        validated = run_cli("validate-plan", "--plan-token", planned["plan_token"])
+        assert validated["data"]["allowed"] is True
+        task_id = "hermes-marker-outputs-cli-task"
+        confirmed = run_cli(
+            "confirm-plan",
+            "--plan-token",
+            planned["plan_token"],
+            "--plan-digest",
+            planned["plan_digest"],
+            "--task-id",
+            task_id,
+            "--timeout-sec",
+            "240",
+        )
+        confirmation_token = confirmed["data"]["confirmation_token"]
+
+        events = run_cli(
+            "execute-plan",
+            "--plan-token",
+            planned["plan_token"],
+            "--confirmation-token",
+            confirmation_token,
+            "--task-id",
+            task_id,
+            "--timeout-sec",
+            "240",
+            "--plan-id",
+            planned["plan_id"],
+            "--plan-digest",
+            planned["plan_digest"],
+            "--registry-epoch",
+            planned["registry_epoch"],
+            "--registry-generation",
+            str(planned["registry_generation"]),
+            "--registry-digest",
+            planned["registry_digest"],
+            "--expected-step-count",
+            str(len(planned["workflow_steps"])),
+            jsonl=True,
+        )
+        terminal = events[-1]
+        assert terminal["event"] == "result"
+        assert terminal["data"]["success"] is True
+        assert terminal["data"]["completed_step_count"] == 1
+        assert len(pick_goals) == 1
+        assert pick_goals[0].target_query == "marker"
+        assert pick_goals[0].mode == PickObject.Goal.MODE_EXECUTE
+        assert pick_goals[0].release_after_success is False
+        assert pick_goals[0].dispatch_binding.dispatch_nonce
+        assert candidate_id == 82
+    finally:
+        executor.shutdown(timeout_sec=1.0)
+        thread.join(timeout=1.0)
+        pick_server.destroy()
+        for node in (agent_node, gateway_node, mock_node):
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 def test_confirm_plan_rejects_plan_that_was_not_validated(plan_rig):

@@ -5,6 +5,8 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from robot_skill_cli import hermes_launcher
 from robot_skill_cli.ros_bridge import BridgeError
 
@@ -38,6 +40,8 @@ def test_launcher_preflights_and_execs_hermes_without_changing_authorization(tmp
     monkeypatch.setattr(hermes_launcher, "_check_hermes_version", lambda _path: None)
     monkeypatch.setattr(hermes_launcher, "_check_robot_runtime", lambda _name, _path: config_path)
     monkeypatch.setattr(hermes_launcher, "_installed_skill_path", lambda: skill_path)
+    monkeypatch.setattr(hermes_launcher, "_hermes_skills_directory", lambda _path: tmp_path / "hermes-skills")
+    monkeypatch.setattr(hermes_launcher, "_check_hermes_skill_discovery", lambda _path: None)
     monkeypatch.setattr(os, "chdir", lambda path: calls.__setitem__("chdir", Path(path)))
     monkeypatch.setattr(
         os,
@@ -61,9 +65,8 @@ def test_launcher_preflights_and_execs_hermes_without_changing_authorization(tmp
     assert "export ROS_DOMAIN_ID=226" in wrapper.read_text(encoding="utf-8")
     assert environment["PATH"].split(os.pathsep)[0] == str(wrapper.parent)
     assert "authorize_motion" not in environment
-    assert (calls["chdir"] / ".agents" / "skills" / "ibrobot-control" / "SKILL.md").read_bytes() == (
-        skill_path.read_bytes()
-    )
+    registered_skill = tmp_path / "hermes-skills" / "ibrobot-control" / "SKILL.md"
+    assert registered_skill.read_bytes() == skill_path.read_bytes()
 
 
 def test_runtime_check_allows_unauthorized_motion_but_requires_agent_interfaces(tmp_path, monkeypatch) -> None:
@@ -118,6 +121,8 @@ def test_launcher_passes_hermes_chat_arguments_after_separator(tmp_path, monkeyp
     monkeypatch.setattr(hermes_launcher, "_check_hermes_version", lambda _path: None)
     monkeypatch.setattr(hermes_launcher, "_check_robot_runtime", lambda _name, _path: config_path)
     monkeypatch.setattr(hermes_launcher, "_installed_skill_path", lambda: skill_path)
+    monkeypatch.setattr(hermes_launcher, "_hermes_skills_directory", lambda _path: tmp_path / "hermes-skills")
+    monkeypatch.setattr(hermes_launcher, "_check_hermes_skill_discovery", lambda _path: None)
     monkeypatch.setattr(os, "chdir", lambda _path: None)
     monkeypatch.setattr(
         os,
@@ -152,6 +157,64 @@ def test_launcher_reports_gateway_timeout_without_traceback(monkeypatch, capsys)
 
     assert hermes_launcher.main(["--config-name", "test"]) == 5
     assert capsys.readouterr().err == "hermes-robot: RESULT_TIMEOUT: service response timed out\n"
+
+
+def test_register_hermes_skill_updates_only_launcher_managed_copy(tmp_path) -> None:
+    source = tmp_path / "source" / "SKILL.md"
+    source.parent.mkdir()
+    source.write_text("---\nname: ibrobot-control\n---\nold\n", encoding="utf-8")
+    skills_directory = tmp_path / "hermes" / "skills"
+
+    target = hermes_launcher._register_hermes_skill(source, skills_directory)
+    source.write_text("---\nname: ibrobot-control\n---\nnew\n", encoding="utf-8")
+    assert hermes_launcher._register_hermes_skill(source, skills_directory) == target
+
+    assert target.read_bytes() == source.read_bytes()
+    assert (target.parent / ".ibrobot-managed").read_text(encoding="utf-8") == ("robot_skill_cli:ibrobot-control\n")
+
+
+def test_register_hermes_skill_rejects_unmanaged_conflict(tmp_path) -> None:
+    source = tmp_path / "source" / "SKILL.md"
+    source.parent.mkdir()
+    source.write_text("---\nname: ibrobot-control\n---\nmanaged\n", encoding="utf-8")
+    target = tmp_path / "hermes" / "skills" / "ibrobot-control" / "SKILL.md"
+    target.parent.mkdir(parents=True)
+    target.write_text("---\nname: ibrobot-control\n---\nuser copy\n", encoding="utf-8")
+
+    with pytest.raises(hermes_launcher.LauncherError, match="unmanaged ibrobot-control") as error:
+        hermes_launcher._register_hermes_skill(source, tmp_path / "hermes" / "skills")
+
+    assert error.value.code == "AGENT_SKILL_CONFLICT"
+    assert "user copy" in target.read_text(encoding="utf-8")
+
+
+def test_hermes_skills_directory_uses_reported_active_profile(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "profiles" / "robot" / "config.yaml"
+    monkeypatch.setattr(
+        hermes_launcher.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=f"{config_path}\n"),
+    )
+
+    assert hermes_launcher._hermes_skills_directory("/bin/hermes") == config_path.parent / "skills"
+
+
+def test_hermes_skill_discovery_requires_enabled_skill(monkeypatch) -> None:
+    monkeypatch.setattr(
+        hermes_launcher.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="ibrobot-control  local  enabled\n"),
+    )
+    hermes_launcher._check_hermes_skill_discovery("/bin/hermes")
+
+    monkeypatch.setattr(
+        hermes_launcher.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="another-skill  local  enabled\n"),
+    )
+    with pytest.raises(hermes_launcher.LauncherError) as error:
+        hermes_launcher._check_hermes_skill_discovery("/bin/hermes")
+    assert error.value.code == "AGENT_SKILL_UNAVAILABLE"
 
 
 def test_robot_skill_wrapper_binds_config_and_ros_environment(tmp_path) -> None:

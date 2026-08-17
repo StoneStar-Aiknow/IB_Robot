@@ -1,0 +1,9 @@
+schema_version: 1
+kind: primitive_sequence
+robot: lekiwi_handeye_realsense_grasp
+initial_gripper_state: none
+timeout_sec: 120.0
+primitive_sequence:
+- primitive_name: move_relative_ee
+  motion_direction_from_request: true
+  motion_distance_from_request: true

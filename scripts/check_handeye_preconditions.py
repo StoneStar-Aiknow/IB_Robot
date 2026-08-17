@@ -13,7 +13,7 @@ from typing import Any
 
 import yaml
 
-DEFAULT_CONFIG = Path("src/robot_config/config/robots/so101_handeye_realsense_grasp.yaml")
+DEFAULT_CONFIG = Path("src/robot_config/config/robots/lekiwi_handeye_realsense_grasp.yaml")
 
 
 @dataclass(frozen=True)

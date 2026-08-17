@@ -1,0 +1,7 @@
+schema_version: "1.0"
+status: provisional
+parent_frame: base_link
+lidar_frame: livox_frame
+body_frame: body
+translation_m: [-0.08, 0.0, 0.20]
+rpy_deg: [0.0, 0.0, 90.0]

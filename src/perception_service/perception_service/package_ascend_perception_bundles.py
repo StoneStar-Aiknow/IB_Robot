@@ -105,7 +105,7 @@ def _link(semantic: str, producer: str, consumer: str) -> DeviceLink:
 def _sam2_deployment(name: str, soc: str, candidate: str, decoder_name: str, batch: int) -> DeploymentSpec:
     encoder = _artifact(
         "encoder",
-        f"sam2.1_hiera_tiny/model_utils_work/candidates/{candidate}/sam2_encoder.om",
+        f"_work/sam2.1_hiera_tiny/candidates/{candidate}/sam2_encoder.om",
         _bindings(
             (_binding("image", 0, "float32", (1, 3, 1024, 1024), "NCHW", "image"),),
             (
@@ -138,7 +138,7 @@ def _sam2_deployment(name: str, soc: str, candidate: str, decoder_name: str, bat
     )
     decoder = _artifact(
         "decoder",
-        f"sam2.1_hiera_tiny/model_utils_work/candidates/{candidate}/{decoder_name}",
+        f"_work/sam2.1_hiera_tiny/candidates/{candidate}/{decoder_name}",
         _bindings(
             (
                 _binding("internal.image_embed", 0, "float32", (1, 256, 64, 64), "NCHW"),
@@ -178,7 +178,7 @@ def _sam2_deployment(name: str, soc: str, candidate: str, decoder_name: str, bat
 def _siglip_deployment(name: str, soc: str, candidate: str, text_name: str, vision_name: str, batch: int):
     vision = _artifact(
         "vision",
-        f"siglip2_so400m_patch14_384/model_utils_work/candidates/{candidate}/{vision_name}",
+        f"_work/siglip2_so400m_patch14_384/candidates/{candidate}/{vision_name}",
         _bindings(
             (_binding("host.siglip2.image", 0, "float32", (1, 3, 384, 384), "NCHW", "image"),),
             (
@@ -189,7 +189,7 @@ def _siglip_deployment(name: str, soc: str, candidate: str, text_name: str, visi
     )
     text = _artifact(
         "text",
-        f"siglip2_so400m_patch14_384/model_utils_work/candidates/{candidate}/{text_name}",
+        f"_work/siglip2_so400m_patch14_384/candidates/{candidate}/{text_name}",
         _bindings(
             (_binding("host.siglip2.input_ids", 0, "int64", (batch, 64), runtime_name="input_ids"),),
             (
@@ -202,7 +202,7 @@ def _siglip_deployment(name: str, soc: str, candidate: str, text_name: str, visi
 
 
 def _grounding_dino_deployment() -> DeploymentSpec:
-    root = "grounded_sam2_swint_ogc/model_utils_work/candidates/ascend_310p"
+    root = "_work/grounded_sam2_swint_ogc/candidates/ascend_310p"
     text_mask = _binding("text_token_mask", 2, "int64", (1, 8), runtime_name="text_token_mask")
     position_ids = _binding("position_ids", 3, "int64", (1, 8), runtime_name="position_ids")
     attention = _binding("text_self_attention_masks", 4, "int64", (1, 8, 8), runtime_name="text_self_attention_masks")
@@ -232,7 +232,12 @@ def _grounding_dino_deployment() -> DeploymentSpec:
                         "float32",
                         shape,
                         "NCHW",
-                        f"src{index}",
+                        # The vision OM keeps the original input-projection node
+                        # names in its ACL descriptor.  These are intentionally
+                        # different from the shortened ``src<N>`` names exposed
+                        # by the flatten OM, so the manifest must bind the
+                        # producer's real runtime names here.
+                        f"/input_proj.{index}/input_proj.{index}.1/Add:0:src{index}",
                     )
                     for index, shape in enumerate(
                         ((1, 256, 90, 160), (1, 256, 45, 80), (1, 256, 23, 40), (1, 256, 12, 20))
@@ -250,7 +255,15 @@ def _grounding_dino_deployment() -> DeploymentSpec:
                         ((1, 256, 90, 160), (1, 256, 45, 80), (1, 256, 23, 40), (1, 256, 12, 20))
                     )
                 ),
-                (_binding("internal.visual_0", 0, "float32", (1, 19160, 256), runtime_name="visual"),),
+                (
+                    _binding(
+                        "internal.visual_0",
+                        0,
+                        "float32",
+                        (1, 19160, 256),
+                        runtime_name="/Concat_4:0:visual",
+                    ),
+                ),
             ),
         ),
     ]
@@ -469,7 +482,7 @@ def _specs() -> dict[str, BundleSpec]:
             deployments=(_grounding_dino_deployment(),),
             assets=(
                 (
-                    "grounded_sam2_swint_ogc/model_utils_work/candidates/ascend_310p/encoder_tgt.npy",
+                    "_work/grounded_sam2_swint_ogc/candidates/ascend_310p/encoder_tgt.npy",
                     "assets/encoder_tgt.npy",
                 ),
                 (
@@ -495,6 +508,14 @@ def _copy(source: Path, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     if not destination.is_file() or _sha256(source) != _sha256(destination):
         shutil.copy2(source, destination)
+
+
+def _packaged_source(models_root: Path, bundle_root: Path, source: str, destination: str) -> Path | None:
+    candidate = models_root / source
+    if candidate.is_file():
+        return candidate
+    packaged = bundle_root / destination
+    return packaged if packaged.is_file() else None
 
 
 def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
@@ -526,13 +547,24 @@ def package_bundle(models_root: Path, spec: BundleSpec) -> Path:
         encoding="utf-8",
     )
     for source, destination in spec.assets:
-        _copy(models_root / source, root / destination)
+        source_path = _packaged_source(models_root, root, source, destination)
+        destination_path = root / destination
+        if source_path is None:
+            raise FileNotFoundError(f"required Ascend bundle source is missing: {models_root / source}")
+        if source_path != destination_path:
+            _copy(source_path, destination_path)
 
     available = []
     for deployment in spec.deployments:
-        if all((models_root / artifact.source).is_file() for artifact in deployment.artifacts):
-            for artifact in deployment.artifacts:
-                _copy(models_root / artifact.source, root / artifact.destination)
+        artifact_sources = tuple(
+            _packaged_source(models_root, root, artifact.source, artifact.destination)
+            for artifact in deployment.artifacts
+        )
+        if all(source is not None for source in artifact_sources):
+            for artifact, source in zip(deployment.artifacts, artifact_sources, strict=True):
+                destination = root / artifact.destination
+                if source != destination:
+                    _copy(source, destination)
             available.append(deployment)
     if not available:
         raise FileNotFoundError(f"no complete Ascend deployment candidates are available for {spec.name}")

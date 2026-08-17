@@ -4,6 +4,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import yaml
 from rclpy.duration import Duration
 from rclpy.serialization import deserialize_message
 from rclpy.time import Time
@@ -47,6 +48,16 @@ class OfflineBagDiagnostics:
 def message_stamp_ns(message) -> int:
     stamp = message.header.stamp
     return int(stamp.sec) * 1_000_000_000 + int(stamp.nanosec)
+
+
+def uniform_sample(items, count: int):
+    values = list(items)
+    if count <= 0 or count >= len(values):
+        return values
+    if count == 1:
+        return values[:1]
+    last = len(values) - 1
+    return [values[round(index * last / (count - 1))] for index in range(count)]
 
 
 def create_run_manifest(
@@ -109,8 +120,12 @@ class RosbagReader:
         return {item.name: item.type for item in reader.get_all_topics_and_types()}
 
     def duration_ns(self) -> int:
-        metadata = self._open().get_metadata()
-        return int(metadata.duration.nanoseconds)
+        reader = self._open()
+        get_metadata = getattr(reader, "get_metadata", None)
+        if get_metadata is not None:
+            return int(get_metadata().duration.nanoseconds)
+        metadata = yaml.safe_load((Path(self.uri) / "metadata.yaml").read_text(encoding="utf-8"))
+        return int(metadata["rosbag2_bagfile_information"]["duration"]["nanoseconds"])
 
     def messages(self, topics: set[str]):
         import rosbag2_py
@@ -172,6 +187,13 @@ class OfflineBagSource:
         return buffer
 
     @staticmethod
+    def lookup_transform(tf_buffer: Buffer, target_frame: str, source_frame: str, stamp_ns: int):
+        try:
+            return tf_buffer.lookup_transform(target_frame, source_frame, Time(nanoseconds=stamp_ns))
+        except TransformException as exc:
+            raise ValueError(f"historical TF lookup failed at {stamp_ns}: {target_frame} -> {source_frame}") from exc
+
+    @staticmethod
     def _nearest(messages: list, stamp_ns: int, slop_ns: int, *, allow_zero: bool = False):
         candidates = []
         for message in messages:
@@ -185,7 +207,7 @@ class OfflineBagSource:
         difference, message = min(candidates, key=lambda item: item[0])
         return message if difference <= slop_ns else None
 
-    def frames(self, tf_buffer: Buffer):
+    def frames(self, tf_buffer: Buffer, *, require_camera_tf: bool = True):
         streams = defaultdict(list)
         selected = {self.topics.rgb, self.topics.aligned_depth, self.topics.camera_info}
         for topic, message, _ in self.reader.messages(selected):
@@ -206,10 +228,12 @@ class OfflineBagSource:
                 self.diagnostics.rejected_sync += 1
                 continue
             camera_frame = rgb.header.frame_id or camera_info.header.frame_id
-            try:
-                transform = tf_buffer.lookup_transform(self.global_frame, camera_frame, Time(nanoseconds=stamp_ns))
-            except TransformException:
-                self.diagnostics.rejected_tf += 1
-                continue
+            transform = None
+            if require_camera_tf:
+                try:
+                    transform = tf_buffer.lookup_transform(self.global_frame, camera_frame, Time(nanoseconds=stamp_ns))
+                except TransformException:
+                    self.diagnostics.rejected_tf += 1
+                    continue
             self.diagnostics.synchronized_frames += 1
             yield OfflineFrameMessages(rgb, depth, camera_info, transform, stamp_ns)

@@ -41,13 +41,21 @@ def generate_static_tf_nodes(
         rotation = tf_config.get("rotation", [0, 0, 0])
 
         args = [
+            "--x",
             str(translation[0]),
+            "--y",
             str(translation[1]),
+            "--z",
             str(translation[2]),
+            "--roll",
             str(rotation[0]),
+            "--pitch",
             str(rotation[1]),
+            "--yaw",
             str(rotation[2]),
+            "--frame-id",
             parent,
+            "--child-frame-id",
             child,
         ]
 

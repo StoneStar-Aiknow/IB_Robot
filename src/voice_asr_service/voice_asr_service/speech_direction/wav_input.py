@@ -81,18 +81,35 @@ class WavInput:
         self._running = False
 
     def _eof_padding_samples(self) -> int:
-        """计算 EOF 后需追加的静音样本数，复用现有 pipeline 自然结算段末。"""
+        """计算 EOF 后需追加的静音样本数，复用现有 pipeline 自然结算段末。
+
+        兼容两条链路:
+        - legacy 链路 (SpeechDirectionPipeline): 有 enh_block_size 滑窗,
+          需用静音把滑窗中心之后的样本推出,再补 seg_end_gap_s 让状态机吐末段方向。
+        - stateful 链路 (StreamingSpeechDirectionPipeline): 无滑窗,增量处理,
+          只需补 seg_end_gap_s 对应静音让 TemporalSpeechGate 输出末段方向。
+        """
         pipeline = self.runtime.pipeline
         hop_size = int(pipeline.hop_size)
-        enh_block_size = int(pipeline.enh_block_size)
         sample_rate = int(pipeline.sr)
-        end_gap_samples = math.ceil(float(pipeline.params.seg_end_gap_s) * sample_rate)
+        # 兼容两条链路的段末间隔参数名:
+        # legacy 用 seg_end_gap_s (秒), streaming 用 segment_end_gap_samples (样本)
+        params = pipeline.params
+        if hasattr(params, "segment_end_gap_samples"):
+            end_gap_samples = int(params.segment_end_gap_samples)
+        else:
+            end_gap_samples = math.ceil(float(params.seg_end_gap_s) * sample_rate)
+        end_gap_hops = math.ceil(end_gap_samples / hop_size)
 
-        # FullSubNet 从增强滑窗中间取一个 hop；窗口中心之后的输入仍需用静音推出。
+        # stateful 链路无 enh_block_size,跳过滑窗尾部填充
+        if not hasattr(pipeline, "enh_block_size"):
+            return end_gap_hops * hop_size
+
+        # legacy 链路: FullSubNet 从增强滑窗中间取一个 hop;窗口中心之后的输入仍需用静音推出
+        enh_block_size = int(pipeline.enh_block_size)
         center_start = (enh_block_size - hop_size) // 2
         enhancement_tail = max(0, enh_block_size - (center_start + hop_size))
         enhancement_tail_hops = math.ceil(enhancement_tail / hop_size)
-        end_gap_hops = math.ceil(end_gap_samples / hop_size)
         return (enhancement_tail_hops + end_gap_hops) * hop_size
 
     def _feed_eof_silence(self) -> None:

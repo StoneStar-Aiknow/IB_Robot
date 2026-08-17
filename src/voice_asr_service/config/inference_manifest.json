@@ -1,0 +1,314 @@
+{
+  "bundle": {
+    "digest": {
+      "algorithm": "sha256",
+      "scope": "structure",
+      "value": "1691f2212eae171a2a5aa177a518b9ba45e92f8d4cdb7742c1dbec9b4960a23f"
+    },
+    "files": [
+      {
+        "path": "assets/adapter.json"
+      }
+    ],
+    "name": "speech_direction",
+    "revision": 1,
+    "uuid": "b10fab1f-3e2b-42d1-a279-d3249ed31569"
+  },
+  "deployments": {
+    "ascend_310p_fullsubnet": {
+      "artifacts": {
+        "fullsubnet_fb": {
+          "format": "om",
+          "path": "artifacts/ascend/fullsubnet/fullsubnet_cum_stateful_fb_b4_t2_fp16.om"
+        },
+        "fullsubnet_sb": {
+          "format": "om",
+          "path": "artifacts/ascend/fullsubnet/fullsubnet_cum_stateful_sb_b4_t2_fp16.om"
+        }
+      },
+      "backend": "ascend",
+      "bindings": {
+        "fullsubnet_fb": {
+          "inputs": [
+            {
+              "dtype": "float32",
+              "index": 0,
+              "semantic": "host.fullsubnet.fb_spectrum",
+              "shape": [
+                4,
+                2,
+                257
+              ]
+            },
+            {
+              "dtype": "float32",
+              "index": 1,
+              "semantic": "host.fullsubnet.fb_hidden_in",
+              "shape": [
+                2,
+                4,
+                512
+              ]
+            },
+            {
+              "dtype": "float32",
+              "index": 2,
+              "semantic": "host.fullsubnet.fb_cell_in",
+              "shape": [
+                2,
+                4,
+                512
+              ]
+            }
+          ],
+          "outputs": [
+            {
+              "dtype": "float32",
+              "index": 0,
+              "semantic": "host.fullsubnet.fb_features",
+              "shape": [
+                4,
+                2,
+                257
+              ]
+            },
+            {
+              "dtype": "float32",
+              "index": 1,
+              "semantic": "host.fullsubnet.fb_hidden_out",
+              "shape": [
+                2,
+                4,
+                512
+              ]
+            },
+            {
+              "dtype": "float32",
+              "index": 2,
+              "semantic": "host.fullsubnet.fb_cell_out",
+              "shape": [
+                2,
+                4,
+                512
+              ]
+            }
+          ]
+        },
+        "fullsubnet_sb": {
+          "inputs": [
+            {
+              "dtype": "float32",
+              "index": 0,
+              "semantic": "host.fullsubnet.sb_features",
+              "shape": [
+                1028,
+                2,
+                32
+              ]
+            },
+            {
+              "dtype": "float32",
+              "index": 1,
+              "semantic": "host.fullsubnet.sb_hidden_in",
+              "shape": [
+                2,
+                1028,
+                384
+              ]
+            },
+            {
+              "dtype": "float32",
+              "index": 2,
+              "semantic": "host.fullsubnet.sb_cell_in",
+              "shape": [
+                2,
+                1028,
+                384
+              ]
+            }
+          ],
+          "outputs": [
+            {
+              "dtype": "float32",
+              "index": 0,
+              "semantic": "host.fullsubnet.sb_mask",
+              "shape": [
+                1028,
+                2,
+                2
+              ]
+            },
+            {
+              "dtype": "float32",
+              "index": 1,
+              "semantic": "host.fullsubnet.sb_hidden_out",
+              "shape": [
+                2,
+                1028,
+                384
+              ]
+            },
+            {
+              "dtype": "float32",
+              "index": 2,
+              "semantic": "host.fullsubnet.sb_cell_out",
+              "shape": [
+                2,
+                1028,
+                384
+              ]
+            }
+          ]
+        }
+      },
+      "device_links": [],
+      "execution": [
+        "fullsubnet_fb",
+        "fullsubnet_sb"
+      ],
+      "revision": 2,
+      "state_links": {
+        "fullsubnet_fb": [
+          {
+            "input_semantic": "host.fullsubnet.fb_hidden_in",
+            "output_semantic": "host.fullsubnet.fb_hidden_out",
+            "initialization": "zero"
+          },
+          {
+            "input_semantic": "host.fullsubnet.fb_cell_in",
+            "output_semantic": "host.fullsubnet.fb_cell_out",
+            "initialization": "zero"
+          }
+        ],
+        "fullsubnet_sb": [
+          {
+            "input_semantic": "host.fullsubnet.sb_hidden_in",
+            "output_semantic": "host.fullsubnet.sb_hidden_out",
+            "initialization": "zero"
+          },
+          {
+            "input_semantic": "host.fullsubnet.sb_cell_in",
+            "output_semantic": "host.fullsubnet.sb_cell_out",
+            "initialization": "zero"
+          }
+        ]
+      },
+      "target": {
+        "runtime": "raw_acl",
+        "soc": "Ascend310P1"
+      },
+      "uuid": "a6e75684-e26c-4b0d-8f1d-dcb20c438489"
+    },
+    "ascend_310p_silero": {
+      "artifacts": {
+        "silero_vad": {
+          "format": "om",
+          "path": "artifacts/ascend/silero_vad/silero_vad_v6_310p_mixed16.om"
+        }
+      },
+      "backend": "ascend",
+      "bindings": {
+        "silero_vad": {
+          "inputs": [
+            {
+              "dtype": "float32",
+              "index": 0,
+              "semantic": "host.silero.audio",
+              "shape": [
+                1,
+                576
+              ]
+            },
+            {
+              "dtype": "float32",
+              "index": 1,
+              "semantic": "host.silero.state_in",
+              "shape": [
+                2,
+                1,
+                128
+              ]
+            }
+          ],
+          "outputs": [
+            {
+              "dtype": "float32",
+              "index": 0,
+              "semantic": "host.silero.prob",
+              "shape": [
+                1,
+                1
+              ]
+            },
+            {
+              "dtype": "float32",
+              "index": 1,
+              "semantic": "host.silero.state_out",
+              "shape": [
+                2,
+                1,
+                128
+              ]
+            }
+          ]
+        }
+      },
+      "device_links": [],
+      "execution": [
+        "silero_vad"
+      ],
+      "revision": 2,
+      "state_links": {
+        "silero_vad": [
+          {
+            "input_semantic": "host.silero.state_in",
+            "output_semantic": "host.silero.state_out",
+            "initialization": "zero"
+          }
+        ]
+      },
+      "target": {
+        "runtime": "raw_acl",
+        "soc": "Ascend310P1"
+      },
+      "uuid": "6a4d7a7d-5fb8-4b60-8bce-79f0003315b4"
+    }
+  },
+  "model": {
+    "family": "fullsubnet_cumulative_stateful",
+    "inputs": [
+      {
+        "dtype": "float32",
+        "semantic": "observation.audio_4ch",
+        "shape": [
+          -1,
+          4
+        ]
+      }
+    ],
+    "kind": "perception",
+    "outputs": [
+      {
+        "dtype": "float32",
+        "semantic": "voice.vad_prob",
+        "shape": [
+          1
+        ]
+      },
+      {
+        "dtype": "float32",
+        "semantic": "voice.audio_enhanced_4ch",
+        "shape": [
+          -1,
+          4
+        ]
+      }
+    ],
+    "semantic_identity": {
+      "logical_model_revision": "fullsubnet_cumulative_stateful@v1",
+      "output_semantics": "cirm_decompressed_ola",
+      "preprocessing_contract": "cumulative_laplace_norm"
+    }
+  },
+  "schema_version": 2
+}

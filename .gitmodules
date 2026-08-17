@@ -15,3 +15,20 @@
 	url = https://gitcode.com/ib_robot/omni_wheel_controller.git
 	branch = main
 	ignore = dirty
+[submodule "libs/Livox-SDK2"]
+	path = libs/Livox-SDK2
+	url = https://github.com/Livox-SDK/Livox-SDK2.git
+	ignore = dirty
+[submodule "src/livox_ros_driver2"]
+	path = src/livox_ros_driver2
+	url = https://github.com/Livox-SDK/livox_ros_driver2.git
+	ignore = dirty
+[submodule "src/fast_lio"]
+	path = src/fast_lio
+	url = https://github.com/hku-mars/FAST_LIO.git
+	branch = ROS2
+	ignore = dirty
+[submodule "src/fast_calib"]
+	path = src/fast_calib
+	url = https://github.com/TommyBrownson/FAST-Calib_Ros2.git
+	ignore = dirty

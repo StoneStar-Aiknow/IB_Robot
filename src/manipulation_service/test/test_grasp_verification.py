@@ -112,6 +112,21 @@ def test_custom_weights_can_raise_success_threshold():
     assert result.success is False
 
 
+def test_no_current_profile_accepts_explicit_gripper_contact_without_occlusion():
+    weights = GraspVerificationWeights(
+        gripper_contact_success=0.70,
+        current_contact_success=0.0,
+        current_contact_failure=0.0,
+        success_threshold=0.65,
+    )
+
+    result = evaluate_grasp(_input(gripper_current_abs_a=None), weights=weights)
+
+    assert result.status == STATUS_SUCCESS
+    assert result.success is True
+    assert result.confidence == 0.70
+
+
 def test_wrist_depth_callback_defers_frame_processing():
     harness = SimpleNamespace(
         _lock=threading.Lock(),

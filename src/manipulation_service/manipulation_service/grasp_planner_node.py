@@ -923,12 +923,6 @@ class GraspPlannerNode(Node):
         self.declare_parameter("inference_backend", "local_cuda")
         self.declare_parameter("gripper_config", "graspgen_robotiq_2f_140.yml")
         self.declare_parameter("model_dir", "")
-        self.declare_parameter("remote_310p_host", "")
-        self.declare_parameter("remote_310p_port", 22)
-        self.declare_parameter("remote_310p_username", "root")
-        self.declare_parameter("remote_310p_password_env", "GRASPGEN_310P_PASSWORD")
-        self.declare_parameter("remote_310p_root", "/root/GraspGen")
-        self.declare_parameter("remote_310p_timeout_sec", 120.0)
         self.declare_parameter("local_manifest_path", "")
         self.declare_parameter("local_deployment_name", "")
         self.declare_parameter("ascend_local_manifest_path", "")
@@ -1020,12 +1014,6 @@ class GraspPlannerNode(Node):
             device=device,
             collision_gripper=collision_gripper,
             inference_backend=inference_backend,
-            remote_310p_host=self.get_parameter("remote_310p_host").get_parameter_value().string_value,
-            remote_310p_port=int(self.get_parameter("remote_310p_port").get_parameter_value().integer_value),
-            remote_310p_username=self.get_parameter("remote_310p_username").get_parameter_value().string_value,
-            remote_310p_password_env=self.get_parameter("remote_310p_password_env").get_parameter_value().string_value,
-            remote_310p_root=self.get_parameter("remote_310p_root").get_parameter_value().string_value,
-            remote_310p_timeout_sec=self.get_parameter("remote_310p_timeout_sec").get_parameter_value().double_value,
             local_manifest_path=self.get_parameter("local_manifest_path").get_parameter_value().string_value,
             local_deployment_name=self.get_parameter("local_deployment_name").get_parameter_value().string_value,
             ascend_local_manifest_path=self.get_parameter("ascend_local_manifest_path")

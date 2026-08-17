@@ -1,0 +1,40 @@
+diff --git a/include/IKFoM_toolkit/esekfom/esekfom.hpp b/include/IKFoM_toolkit/esekfom/esekfom.hpp
+index 7547584..ff867ce 100755
+--- a/include/IKFoM_toolkit/esekfom/esekfom.hpp
++++ b/include/IKFoM_toolkit/esekfom/esekfom.hpp
+@@ -39,6 +39,7 @@
+ #include <vector>
+ #include <cstdlib>
+ 
++#define BOOST_BIND_GLOBAL_PLACEHOLDERS
+ #include <boost/bind.hpp>
+ #include <Eigen/Core>
+ #include <Eigen/Geometry>
+diff --git a/src/laserMapping.cpp b/src/laserMapping.cpp
+index e5d9950..50443e6 100644
+--- a/src/laserMapping.cpp
++++ b/src/laserMapping.cpp
+@@ -386,6 +386,13 @@ bool sync_packages(MeasureGroup &meas)
+         return false;
+     }
+ 
++    // Navigation requires the newest complete scan, not an unbounded replay of
++    // scans accumulated while startup load temporarily exceeds the sensor rate.
++    while (!lidar_pushed && lidar_buffer.size() > 1) {
++        lidar_buffer.pop_front();
++        time_buffer.pop_front();
++    }
++
+     /*** push a lidar scan ***/
+     if(!lidar_pushed)
+     {
+@@ -920,7 +927,8 @@ public:
+         /*** ROS subscribe initialization ***/
+         if (p_pre->lidar_type == AVIA)
+         {
+-            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(lid_topic, 20, livox_pcl_cbk);
++            sub_pcl_livox_ = this->create_subscription<livox_ros_driver2::msg::CustomMsg>(
++                lid_topic, rclcpp::SensorDataQoS().keep_last(1), livox_pcl_cbk);
+         }
+         else
+         {

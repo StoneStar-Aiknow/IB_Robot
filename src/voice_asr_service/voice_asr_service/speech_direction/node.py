@@ -20,6 +20,7 @@ import math
 import os
 import threading
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -30,12 +31,19 @@ from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, ReliabilityPolicy
 
 from ibrobot_msgs.msg import SpeechDirection
+from inference_manifest import load_inference_manifest
+from inference_service.backends import RuntimeContext
+from inference_service.model_sessions import MODEL_SESSION_BUILDER_REGISTRY
 
+from ..model_session_builders import register_speech_direction_session_builder
 from .config import SpeechDirectionConfig
 from .diagnostics import DiagnosticsRecorder, RecorderStatus
 from .doa.srp_phat import StftSrpPhat
+from .enhancement.factory import build_stateful_fullsubnet
 from .enhancement.fullsubnet import FullSubNetEnhancer
+from .model_sessions import SpeechDirectionRoleRunner
 from .pipeline import DoaState, PipelineParams, SpeechDirectionPipeline, VadState
+from .pipeline_streaming import StreamingPipelineParams, StreamingSpeechDirectionPipeline
 from .runtime import SpeechDirectionRuntime
 from .speech_gate import SpeechGate
 from .wav_input import WavInput
@@ -47,8 +55,10 @@ POLL_PERIOD_SEC = 0.1
 
 _PARAMETER_TYPES = {
     "device_name_contains": Parameter.Type.STRING,
+    "arecord_device": Parameter.Type.STRING,
     "sample_rate": Parameter.Type.INTEGER,
     "mount_yaw_deg": Parameter.Type.DOUBLE,
+    "angle_step_degree": Parameter.Type.INTEGER,
     "input_source": Parameter.Type.STRING,
     "wav_path": Parameter.Type.STRING,
     "wav_replay_rate": Parameter.Type.DOUBLE,
@@ -56,6 +66,15 @@ _PARAMETER_TYPES = {
     "silero_vad_model_path": Parameter.Type.STRING,
     "fullsubnet_repo_dir": Parameter.Type.STRING,
     "fullsubnet_ckpt": Parameter.Type.STRING,
+    "fullsubnet_om_path": Parameter.Type.STRING,
+    "fullsubnet_stateful_fb_om_path": Parameter.Type.STRING,
+    "fullsubnet_stateful_sb_om_path": Parameter.Type.STRING,
+    "fullsubnet_stateful_manifest_path": Parameter.Type.STRING,
+    "speech_direction_inference_bundle": Parameter.Type.STRING,
+    "fullsubnet_device_id": Parameter.Type.INTEGER,
+    "fullsubnet_acl_config_path": Parameter.Type.STRING,
+    "silero_vad_backend": Parameter.Type.STRING,
+    "fullsubnet_backend": Parameter.Type.STRING,
     "speech_direction_max_age_ms": Parameter.Type.INTEGER,
     "channel_indices": Parameter.Type.INTEGER_ARRAY,
     "mic_positions": Parameter.Type.DOUBLE_ARRAY,
@@ -67,6 +86,7 @@ _PARAMETER_TYPES = {
     "diagnostics_save_gray_events": Parameter.Type.BOOL,
     "diagnostics_queue_size": Parameter.Type.INTEGER,
     "diagnostics_drop_when_full": Parameter.Type.BOOL,
+    "fullsubnet_timing_enabled": Parameter.Type.BOOL,
 }
 _PARAMETER_NAMES = tuple(_PARAMETER_TYPES)
 
@@ -140,6 +160,7 @@ def _convert_float_list(values: Mapping[str, Any], name: str) -> list[float]:
 def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirectionConfig:
     """将已读取的 ROS 参数校验并映射为算法配置。"""
     device_name = _require_non_empty_string(values, "device_name_contains")
+    arecord_device = _require_non_empty_string(values, "arecord_device")
     sample_rate = _convert_int(values, "sample_rate")
     if sample_rate != 16000:
         raise ValueError("参数 sample_rate 当前仅支持 16000 Hz")
@@ -169,19 +190,69 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     if not math.isfinite(wav_replay_rate) or wav_replay_rate <= 0:
         raise ValueError("参数 wav_replay_rate 必须是大于 0 的有限数")
 
-    fullsubnet_device = _require_string(values, "fullsubnet_device")
-    if fullsubnet_device not in {"auto", "cuda", "cpu"}:
-        raise ValueError("参数 fullsubnet_device 只能为 auto、cuda 或 cpu")
+    fullsubnet_device_raw = _require_string(values, "fullsubnet_device")
+    if fullsubnet_device_raw not in {"cuda", "cpu"}:
+        raise ValueError("参数 fullsubnet_device 只能为 cuda 或 cpu")
+    # 各 stateful 后端对 device 有硬性要求（见 factory），此处只做边界校验不做静默归一化。
+    fullsubnet_device = fullsubnet_device_raw
 
+    # 旧值只在配置边界归一化，主流程内部统一使用 canonical backend 名称。
+    silero_backend_aliases = {"om": "raw_acl", "raw_acl": "raw_acl", "onnx": "onnx"}
+    silero_backend_raw = _require_string(values, "silero_vad_backend")
+    if silero_backend_raw not in silero_backend_aliases:
+        raise ValueError("参数 silero_vad_backend 只能为 raw_acl、onnx 或兼容值 om")
+    silero_backend = silero_backend_aliases[silero_backend_raw]
+
+    fullsubnet_backend_aliases = {
+        "stateful_om": "stateful_raw_acl",
+        "stateful_raw_acl": "stateful_raw_acl",
+        "stateful_torch": "stateful_torch_cuda",
+        "stateful_torch_cuda": "stateful_torch_cuda",
+        "stateful_torch_cpu": "stateful_torch_cpu",
+        "om": "legacy_om",
+        "torch": "legacy_torch",
+        "legacy_om": "legacy_om",
+        "legacy_torch": "legacy_torch",
+    }
+    fullsubnet_backend_raw = _require_string(values, "fullsubnet_backend")
+    if fullsubnet_backend_raw not in fullsubnet_backend_aliases:
+        raise ValueError("参数 fullsubnet_backend 不是受支持的 stateful/legacy 后端")
+    fullsubnet_backend = fullsubnet_backend_aliases[fullsubnet_backend_raw]
+    stateful_backend = fullsubnet_backend.startswith("stateful_")
+    # stateful_raw_acl 使用拆分FB/SB模型；legacy_om 仅作为显式对照保留。
+    fullsubnet_om_path = _require_string(values, "fullsubnet_om_path", allow_empty=True)
+    stateful_fb_path = _require_string(values, "fullsubnet_stateful_fb_om_path", allow_empty=True)
+    stateful_sb_path = _require_string(values, "fullsubnet_stateful_sb_om_path", allow_empty=True)
+    stateful_manifest = _require_string(values, "fullsubnet_stateful_manifest_path", allow_empty=True)
+    fullsubnet_device_id = _convert_int(values, "fullsubnet_device_id")
+    if fullsubnet_device_id < 0:
+        raise ValueError("参数 fullsubnet_device_id 不能为负数")
+    fullsubnet_acl_config_path = _require_string(values, "fullsubnet_acl_config_path", allow_empty=True)
+    if fullsubnet_backend == "legacy_om" and not fullsubnet_om_path:
+        raise ValueError("fullsubnet_backend=legacy_om 时参数 fullsubnet_om_path 不能为空")
+    if fullsubnet_backend == "stateful_raw_acl" and not all((stateful_fb_path, stateful_sb_path, stateful_manifest)):
+        raise ValueError("fullsubnet_backend=stateful_raw_acl 时FB/SB OM和manifest均不能为空")
     silero_path = _require_non_empty_string(values, "silero_vad_model_path")
-    repo_dir = _require_non_empty_string(values, "fullsubnet_repo_dir")
-    ckpt_path = _require_non_empty_string(values, "fullsubnet_ckpt")
+    # Torch stateful/legacy 后端需要 repo 与 checkpoint，raw ACL 不依赖上游源码。
+    repo_dir = _require_string(values, "fullsubnet_repo_dir", allow_empty=True)
+    ckpt_path = _require_string(values, "fullsubnet_ckpt", allow_empty=True)
+    if (
+        stateful_backend
+        and fullsubnet_backend.startswith("stateful_torch")
+        and not all((repo_dir, ckpt_path, stateful_manifest))
+    ):
+        raise ValueError("stateful Torch 后端要求 repo、cumulative checkpoint 和 manifest")
     max_age_ms = _convert_int(values, "speech_direction_max_age_ms")
     if max_age_ms <= 0:
         raise ValueError("参数 speech_direction_max_age_ms 必须大于 0")
     mount_yaw_deg = _convert_float(values, "mount_yaw_deg")
     if not math.isfinite(mount_yaw_deg):
         raise ValueError("参数 mount_yaw_deg 必须是有限浮点数")
+
+    # SRP-PHAT 扫描角度步长(度)，360 必须能被其整除，否则候选角度无法均匀覆盖整圈。
+    angle_step_degree = _convert_int(values, "angle_step_degree")
+    if angle_step_degree <= 0 or 360 % angle_step_degree != 0:
+        raise ValueError("参数 angle_step_degree 必须为 360 的正整数约数（如 1、2、3、4、5、6、8、9、10...）")
 
     # 高通量维测契约拒绝 Python 的隐式类型兼容，避免 ROS 参数被静默改写。
     diagnostics_high_throughput_enabled = _require_bool(values, "diagnostics_high_throughput_enabled")
@@ -192,10 +263,12 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     diagnostics_save_gray_events = _require_bool(values, "diagnostics_save_gray_events")
     diagnostics_queue_size = _require_positive_int(values, "diagnostics_queue_size")
     diagnostics_drop_when_full = _require_bool(values, "diagnostics_drop_when_full")
+    fullsubnet_timing_enabled = _require_bool(values, "fullsubnet_timing_enabled")
 
     # 仅使用上述归一化变量构造配置，避免未校验输入进入算法链。
     cfg = SpeechDirectionConfig()
     cfg.audio.device_name = device_name
+    cfg.audio.arecord_device = arecord_device
     cfg.audio.sample_rate = sample_rate
     cfg.pipeline.sample_rate = sample_rate
     cfg.vad.sample_rate = sample_rate
@@ -210,10 +283,20 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     cfg.fullnet.repo_dir = repo_dir
     cfg.fullnet.ckpt = ckpt_path
     cfg.fullnet.device = fullsubnet_device
+    cfg.fullnet.backend = fullsubnet_backend
+    cfg.fullnet.om_path = fullsubnet_om_path
+    cfg.fullnet.stateful_fb_om_path = stateful_fb_path
+    cfg.fullnet.stateful_sb_om_path = stateful_sb_path
+    cfg.fullnet.stateful_manifest_path = stateful_manifest
+    cfg.fullnet.inference_bundle = _require_non_empty_string(values, "speech_direction_inference_bundle")
+    cfg.fullnet.device_id = fullsubnet_device_id
+    cfg.fullnet.acl_config_path = fullsubnet_acl_config_path
+    cfg.vad.backend = silero_backend
     cfg.input_source = input_source
     cfg.wav_path = wav_path
     cfg.wav_replay_rate = wav_replay_rate
     cfg.mount_yaw_deg = mount_yaw_deg
+    cfg.doa.angle_step_degree = angle_step_degree
     cfg.speech_direction_max_age_ms = max_age_ms
     cfg.diagnostics.high_throughput_enabled = diagnostics_high_throughput_enabled
     cfg.diagnostics.rollover_seconds = diagnostics_rollover_seconds
@@ -223,6 +306,7 @@ def build_config_from_parameter_values(values: Mapping[str, Any]) -> SpeechDirec
     cfg.diagnostics.save_gray_events = diagnostics_save_gray_events
     cfg.diagnostics.queue_size = diagnostics_queue_size
     cfg.diagnostics.drop_when_full = diagnostics_drop_when_full
+    cfg.diagnostics.fullsubnet_timing_enabled = fullsubnet_timing_enabled
     return cfg
 
 
@@ -253,10 +337,17 @@ class SpeechDirectionNode(Node):
 
         # ============================ 构建算法链(可能失败 → 降级)============================
         self._runtime: SpeechDirectionRuntime | None = None
+        self._model_sessions = []
         self._wav_input: WavInput | None = None
         self._diagnostics_recorder: DiagnosticsRecorder | None = None
         self._diagnostics_status = RecorderStatus(False, "disabled", None, None, 0)
         self._diagnostics_session_dir = ""
+        # destroy_node 可能被 finally 与外部生命周期重复或并发调用。
+        self._destroy_condition = threading.Condition(threading.RLock())
+        self._destroy_started = False
+        self._destroy_completed = False
+        self._destroy_owner_id: int | None = None
+        self._destroy_result = False
         self._last_published_seq_id: int | None = None  # 已发布的段序号,避免重复发布
 
         # 模型校验:缺失直接 raise FileNotFoundError 退出(对齐 perception_service 风格,
@@ -267,6 +358,12 @@ class SpeechDirectionNode(Node):
             cfg.vad.model_path,
             cfg.fullnet.repo_dir,
             cfg.fullnet.ckpt,
+            silero_backend=cfg.vad.backend,
+            fullsubnet_backend=cfg.fullnet.backend,
+            fullsubnet_om_path=cfg.fullnet.om_path,
+            fullsubnet_stateful_fb_om_path=cfg.fullnet.stateful_fb_om_path,
+            fullsubnet_stateful_sb_om_path=cfg.fullnet.stateful_sb_om_path,
+            fullsubnet_stateful_manifest_path=cfg.fullnet.stateful_manifest_path,
         )
 
         # 算法链构建:模型文件已就绪,此后的加载/推理失败才走降级(运行时故障降级策略)
@@ -314,12 +411,53 @@ class SpeechDirectionNode(Node):
         """
         cfg = self._config
 
-        # FullSubNet 增强(可能加载失败 → 抛异常 → 降级)
-        fullnet = FullSubNetEnhancer(
-            repo_dir=cfg.fullnet.repo_dir,
-            ckpt=cfg.fullnet.ckpt,
-            device=cfg.fullnet.device,
-        )
+        # 两个平台仅在 executor 选择上分叉，随后共用 cumulative Host 增强器。
+        stateful_backend = cfg.fullnet.backend.startswith("stateful_")
+        if stateful_backend and cfg.fullnet.backend == "stateful_raw_acl":
+            register_speech_direction_session_builder()
+            bundle = Path(cfg.fullnet.inference_bundle)
+            fullsubnet_manifest = load_inference_manifest(bundle, "ascend_310p_fullsubnet")
+            fullsubnet_context = RuntimeContext(
+                fullsubnet_manifest,
+                {"device_id": cfg.fullnet.device_id, "acl_config_path": cfg.fullnet.acl_config_path},
+            )
+            fullsubnet_session = MODEL_SESSION_BUILDER_REGISTRY.create(fullsubnet_context)
+            fullsubnet_session.load(fullsubnet_context)
+            self._model_sessions.append(fullsubnet_session)
+            fullnet = build_stateful_fullsubnet(
+                backend=cfg.fullnet.backend,
+                manifest_path=cfg.fullnet.stateful_manifest_path,
+                timing_enabled=cfg.diagnostics.fullsubnet_timing_enabled,
+                executor=SpeechDirectionRoleRunner(fullsubnet_session, fullsubnet_context),
+            )
+        elif stateful_backend:
+            fullnet = build_stateful_fullsubnet(
+                backend=cfg.fullnet.backend,
+                repo_dir=cfg.fullnet.repo_dir,
+                checkpoint_path=cfg.fullnet.ckpt,
+                manifest_path=cfg.fullnet.stateful_manifest_path,
+                device=cfg.fullnet.device,
+                timing_enabled=cfg.diagnostics.fullsubnet_timing_enabled,
+            )
+        else:
+            # legacy 仅保留显式对照，不允许 stateful 构造失败后自动进入此分支。
+            fullnet = FullSubNetEnhancer(
+                repo_dir=cfg.fullnet.repo_dir,
+                ckpt=cfg.fullnet.ckpt,
+                device=cfg.fullnet.device,
+            )
+
+        vad_runner = None
+        if cfg.fullnet.backend == "stateful_raw_acl" and cfg.vad.backend == "raw_acl":
+            vad_manifest = load_inference_manifest(Path(cfg.fullnet.inference_bundle), "ascend_310p_silero")
+            vad_context = RuntimeContext(
+                vad_manifest,
+                {"device_id": cfg.fullnet.device_id, "acl_config_path": cfg.fullnet.acl_config_path},
+            )
+            vad_session = MODEL_SESSION_BUILDER_REGISTRY.create(vad_context)
+            vad_session.load(vad_context)
+            self._model_sessions.append(vad_session)
+            vad_runner = SpeechDirectionRoleRunner(vad_session, vad_context)
 
         # 人声门控(复用 common/vad/silero)
         speech_gate = SpeechGate(
@@ -327,6 +465,8 @@ class SpeechDirectionNode(Node):
             sample_rate=cfg.vad.sample_rate,
             vad_threshold=cfg.gray_region.vad_threshold,
             rms_threshold=cfg.gray_region.rms_threshold,
+            backend=cfg.vad.backend,
+            silero_engine=vad_runner,
         )
 
         # SRP-PHAT(阵列几何与声学参数从配置传入,配置驱动)
@@ -343,21 +483,41 @@ class SpeechDirectionNode(Node):
             diag_freq_hi=cfg.doa.diag_pair_freq_max_hz,
         )
 
-        # pipeline 参数
-        params = PipelineParams(
-            sample_rate=cfg.pipeline.sample_rate,
-            frame_size=cfg.pipeline.frame_size,
-            hop_size=cfg.pipeline.hop_size,
-            input_channels=cfg.pipeline.input_channels,
-            seg_end_gap_s=cfg.gray_region.seg_end_gap_s,
-            min_seg_dur_s=cfg.gray_region.min_seg_dur_s,
-            min_accum_frames=cfg.gray_region.min_accum_frames,
-            max_accum_dur_s=cfg.gray_region.max_accum_dur_s,
-            seg_max_rms_threshold=cfg.gray_region.seg_max_rms_threshold,
-        )
-
         vad_state = VadState()
         doa_state = DoaState()
+
+        if stateful_backend:
+            # 两个平台统一使用 256 tick、512 T=2 模型批次和 4096/512 SRP。
+            streaming_params = StreamingPipelineParams(
+                sample_rate=cfg.pipeline.sample_rate,
+                processing_samples=cfg.pipeline.processing_hop_samples,
+                model_batch_samples=cfg.pipeline.model_batch_samples,
+                input_channels=tuple(cfg.pipeline.input_channels),
+                srp_frame_samples=cfg.doa.frame_size,
+                srp_hop_samples=cfg.doa.hop_size,
+                candidate_window_samples=round(0.064 * cfg.pipeline.sample_rate),
+                segment_end_gap_samples=math.ceil(cfg.gray_region.seg_end_gap_s * cfg.pipeline.sample_rate),
+                min_segment_samples=math.ceil(cfg.gray_region.min_seg_dur_s * cfg.pipeline.sample_rate),
+                min_accum_samples=cfg.gray_region.min_accum_frames * cfg.doa.hop_size,
+                max_accum_samples=math.ceil(cfg.gray_region.max_accum_dur_s * cfg.pipeline.sample_rate),
+                segment_max_rms_threshold=cfg.gray_region.seg_max_rms_threshold,
+            )
+            params = None
+        else:
+            # 旧 offline 链路只允许显式 legacy backend，不与 stateful 状态混用。
+            params = PipelineParams(
+                sample_rate=cfg.pipeline.sample_rate,
+                frame_size=cfg.pipeline.frame_size,
+                hop_size=cfg.pipeline.hop_size,
+                input_channels=cfg.pipeline.input_channels,
+                seg_end_gap_s=cfg.gray_region.seg_end_gap_s,
+                min_seg_dur_s=cfg.gray_region.min_seg_dur_s,
+                min_accum_frames=cfg.gray_region.min_accum_frames,
+                max_accum_dur_s=cfg.gray_region.max_accum_dur_s,
+                seg_max_rms_threshold=cfg.gray_region.seg_max_rms_threshold,
+            )
+            streaming_params = None
+        pipeline = None  # diagnostics 完成初始化后统一注入 pipeline
 
         # 高通量维测是旁路：关闭或初始化失败均不改变定位 pipeline 的健康状态。
         diagnostics = None
@@ -399,9 +559,24 @@ class SpeechDirectionNode(Node):
                 self.get_logger().warning(f"维测初始化失败,关闭维测: {reason}")
                 diagnostics = None
 
-        pipeline = SpeechDirectionPipeline(
-            fullnet, speech_gate, srp, params, vad_state, doa_state, diagnostics=diagnostics
-        )
+        if stateful_backend:
+            assert streaming_params is not None
+            pipeline = StreamingSpeechDirectionPipeline(
+                fullnet,
+                speech_gate.silero,
+                srp,
+                streaming_params,
+                vad_state,
+                doa_state,
+                vad_threshold=cfg.gray_region.vad_threshold,
+                rms_threshold=cfg.gray_region.rms_threshold,
+                diagnostics=diagnostics,
+            )
+        else:
+            assert params is not None
+            pipeline = SpeechDirectionPipeline(
+                fullnet, speech_gate, srp, params, vad_state, doa_state, diagnostics=diagnostics
+            )
 
         # runtime(input_source=wav 时 enable_capture=False)
         enable_capture = cfg.input_source == "device"
@@ -464,9 +639,6 @@ class SpeechDirectionNode(Node):
         # 按方向类型分流(对齐 SpeechDirection.msg 契约:stamp=最后音频样本时间):
         #   - mid_long_seg(长语音中间方向):用发布时刻,age≈0,低延迟响应正在说话的方向
         #   - seg_end(段末方向):用来源真实 age 还原段结束时刻,sound_follow 据此判过期
-        # 时钟域:age 用墙钟(time.time)算,stamp 用 ROS 钟(get_clock().now)构造;
-        # use_sim_time=false 下两钟同属系统时钟域,差值有效;use_sim_time=true(仿真/回放)
-        # 下两钟不同步,本实现不解决该混合域,仿真场景应 use_sim_time=false。
         ros_now = self.get_clock().now()
         direction_type = result.get("type")
         if direction_type == "seg_end":
@@ -481,6 +653,12 @@ class SpeechDirectionNode(Node):
         msg.azimuth_rad = float(ros_azimuth)
         msg.seq_id = int(seq_id)
         self._direction_pub.publish(msg)
+        # 段级 DOA 上报打印：类型/seq_id/阵列角/ROS方位角/age，便于与 sound_follow 侧对照
+        self.get_logger().info(
+            f"[段级DOA] type={direction_type} seq_id={seq_id} "
+            f"angle={float(angle):.1f}deg ros_azimuth={float(ros_azimuth):.3f}rad "
+            f"age_ms={result.get('age_ms', 0.0):.1f}"
+        )
 
     @staticmethod
     def _normalize_radians(angle: float) -> float:
@@ -561,33 +739,75 @@ class SpeechDirectionNode(Node):
 
     # ------------------------------------------------------------------ 资源清理
     def destroy_node(self) -> bool:
-        """关闭时完成全部资源收尾。
+        """关闭时完成全部资源收尾，并让并发调用共享同一结果。"""
+        condition = getattr(self, "_destroy_condition", None)
+        if condition is None:
+            # 兼容 object.__new__ 构造的生命周期单测，同时保持生产节点同一语义。
+            condition = threading.Condition(threading.RLock())
+            self._destroy_condition = condition
+            self._destroy_started = False
+            self._destroy_completed = False
+            self._destroy_owner_id = None
+            self._destroy_result = False
 
-        按 rclpy.shutdown 调度设计(单次调用),不做并发重入保护,对齐仓库其他节点
-        (perception_service / voice_asr_node)的惯例。如未来确有并发 destroy 需求再加锁。
-        """
+        current_id = threading.get_ident()
+        with condition:
+            if self._destroy_completed:
+                return self._destroy_result
+            if self._destroy_started:
+                if self._destroy_owner_id == current_id:
+                    # 同线程重入：外层清理尚未完成，无法等待自己。
+                    # 不伪造成功（不返回 True），保守返回 False 并记 warning。
+                    self.get_logger().warning("destroy_node 同线程重入，外层清理尚未完成")
+                    return False
+                while not self._destroy_completed:
+                    condition.wait()
+                return self._destroy_result
+            self._destroy_started = True
+            self._destroy_owner_id = current_id
+
         cleanup_error = None
-        if self._wav_input is not None:
+        result = False
+        try:
+            if self._wav_input is not None:
+                try:
+                    self._wav_input.stop()
+                except Exception as exc:
+                    cleanup_error = exc
+            if self._runtime is not None:
+                try:
+                    self._runtime.stop()
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+            for session in self._model_sessions:
+                try:
+                    session.close()
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+            # 在线节点只关闭高通量记录会话；报告生成严格留给离线 CLI。
+            if self._diagnostics_recorder is not None:
+                try:
+                    self._diagnostics_recorder.stop()
+                except Exception as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
             try:
-                self._wav_input.stop()
-            except Exception as exc:
-                cleanup_error = exc
-        if self._runtime is not None:
-            try:
-                self._runtime.stop()
+                result = super().destroy_node()
             except Exception as exc:
                 if cleanup_error is None:
                     cleanup_error = exc
-        # 在线节点只关闭高通量记录会话；报告生成严格留给离线 CLI。
-        if self._diagnostics_recorder is not None:
-            try:
-                self._diagnostics_recorder.stop()
-            except Exception as exc:
-                if cleanup_error is None:
-                    cleanup_error = exc
-        if cleanup_error is not None:
-            self.get_logger().error(f"清理异常: {cleanup_error}")
-        return super().destroy_node()
+            if cleanup_error is not None:
+                self.get_logger().error(f"清理异常: {cleanup_error}")
+            return result
+        finally:
+            # 结果发布与唤醒必须同处临界区，等待者不会观察到半完成状态。
+            with condition:
+                self._destroy_result = result
+                self._destroy_completed = True
+                self._destroy_owner_id = None
+                condition.notify_all()
 
 
 def main(args=None) -> None:

@@ -47,6 +47,7 @@ def test_workflow_preimage_matches_frozen_contract():
         "schema_version",
         "skill_name",
         "target_name",
+        "container_name",
         "place_name",
         "motion_direction",
         "motion_distance",

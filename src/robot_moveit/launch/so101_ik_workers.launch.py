@@ -33,6 +33,7 @@ def _launch_setup(context):
         raise ValueError("namespace_prefix must not be empty")
     use_sim_time = LaunchConfiguration("use_sim_time").perform(context).lower() in ("1", "true", "yes")
     log_level = LaunchConfiguration("log_level").perform(context)
+    joint_state_topic = LaunchConfiguration("joint_state_topic").perform(context)
 
     robot_description_dir = get_package_share_directory("robot_description")
     so101_urdf_path = os.path.join(robot_description_dir, "urdf", "lerobot", "so101", "so101.urdf.xacro")
@@ -63,7 +64,7 @@ def _launch_setup(context):
             output="screen",
             parameters=[moveit_config.to_dict(), common_parameters],
             remappings=[
-                ("joint_states", "/joint_states"),
+                ("joint_states", joint_state_topic),
                 ("tf", "/tf"),
                 ("tf_static", "/tf_static"),
             ],
@@ -87,6 +88,7 @@ def generate_launch_description():
                 description="Worker namespace prefix; services become /<prefix>_<index>/compute_ik and compute_fk",
             ),
             DeclareLaunchArgument("use_sim_time", default_value="false"),
+            DeclareLaunchArgument("joint_state_topic", default_value="/joint_states"),
             DeclareLaunchArgument("log_level", default_value="warn"),
             OpaqueFunction(function=_launch_setup),
         ]

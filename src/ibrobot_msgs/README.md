@@ -18,6 +18,7 @@
 | `task_type` | `string` | 规则规划后的任务类型 |
 | `workflow_steps` | `WorkflowStep[]` | 规划后的有序步骤；raw 请求可为空，planned 请求必须非空 |
 | `target_name` | `string` | 顶层目标提示，仅作规划输入，task executor 必须按各 `WorkflowStep` 自身参数执行 |
+| `container_name` | `string` | 顶层容器提示，仅作规划输入，task executor 必须按各 `WorkflowStep` 自身参数执行 |
 | `place_name` | `string` | 顶层放置位提示 |
 | `motion_direction` | `string` | 顶层相对运动方向提示 |
 | `motion_distance` | `float32` | 顶层相对运动距离提示 |
@@ -155,7 +156,7 @@ Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `Vali
 | 服务 | 职责 |
 | --- | --- |
 | `GenerateMasks` | SAM2 无 prompt 盲扫，返回与输入同尺寸的 `mono8` masks |
-| `RecognizeTags` | RAM++ 整图打标，不把标签直接绑定到某个 mask |
+| `RecognizeTags` | RAM++ 整图诊断标签；mask 请求按调用方 `excluded_labels` 过滤后返回 `max_mask_candidates` 个候选 |
 | `EncodeEmbeddings` | 一张图像最多 8 个 masks 的 SigLIP2 批量编码与候选标签匹配 |
 | `EncodeText` | 最多 16 条文本的 SigLIP2 查询时编码；不携带图像或持久 image embedding |
 | `GroundingDetect` | 显式图像输入的低频目标确认，不参与建图主链 |
@@ -163,6 +164,8 @@ Gateway 的高层动作边界是 `SkillCommand.action`，dry-run 边界是 `Vali
 
 所有新服务返回 `ModelRuntimeInfo`。`EncodeText` 返回瞬时、归一化的查询文本向量，供语义地图内部与私有
 image embedding 比较；持久对象 embedding 仍是语义地图私有数据，不进入对象快照消息。
+`RecognizeTags` 在 masks 为空时维持整图识别语义，即使 `include_image=false`，以兼容原有整图调用方；
+有 masks 时调用方可关闭整图识别，仅请求局部候选。
 
 ### `GraspCandidate.msg`
 
@@ -257,6 +260,7 @@ planned `TaskCommand.dispatch_binding` 的 exact snapshot。`schema_version` v1 
 | `schema_version` | `uint32` | schema 版本，v1 固定为 `1` |
 | `skill_name` | `string` | 兼容字段名，引用 atomic_operator 或 skill catalog entry |
 | `target_name` | `string` | 命名目标 |
+| `container_name` | `string` | 指定容器；对 `place_in_container` 是释放后的视觉检测 query |
 | `place_name` | `string` | 命名放置位 |
 | `motion_direction` | `string` | 相对运动方向 |
 | `motion_distance` | `float32` | 相对运动距离 |
@@ -330,6 +334,7 @@ identity；direct root `SkillCommand` 的 `root_lease_nonce` 与 `dispatch_nonce
 | `dispatch_binding` | 完整任务/版本信封（含 `task_id`、`task_budget` 与 exact registry identity） |
 | `skill_name` | 技能名（如 `pick_object`、`move_relative_ee`） |
 | `target_name` | 命名目标；对 `pick_object` 表示运行时视觉文本查询 |
+| `container_name` | 指定容器；对 `place_in_container` 表示释放后的视觉检测 query，不参与运动规划 |
 | `place_name` | 命名放置位 |
 | `motion_direction` | 相对运动方向（`forward` / `backward` / `left` / `right` / `up` / `down`） |
 | `motion_distance` | 相对运动距离（米） |
@@ -348,6 +353,7 @@ identity；direct root `SkillCommand` 的 `root_lease_nonce` 与 `dispatch_nonce
 | `actual_registry_digest` | 实际使用的 registry digest |
 | `source_release_digest` | source release digest |
 | `provenance_digest` | provenance digest |
+| `debug_output_dir` | delegated executor 产生的可重放证据目录；无调试输出时为空 |
 | `diagnostics` | `SkillDiagnostic[]` 结构化诊断 |
 
 **Feedback 字段**
@@ -408,10 +414,12 @@ identity；direct root `SkillCommand` 的 `root_lease_nonce` 与 `dispatch_nonce
 ### `PickObject.action`
 
 抓取闭环接口，由 `manipulation_execution/pick_executor_node` 提供，默认路径
-`/manipulation/execute_pick`。这是 delegated action：goal 必须携带 `dispatch_binding` 和
+`/manipulation/execute_pick`。通常这是 delegated action：goal 必须携带 `dispatch_binding` 和
 `expected_executor`，result 必须返回 `actual_executor`。delegated server 在接受请求前必须比对自身实际
-identity，不匹配时返回稳定 contract-version 错误，且不得仅凭 endpoint 名判断。`task_id` 移入
-`dispatch_binding`，抓取共享同一 root 的绝对 `task_budget`。
+identity，不匹配时 reject，且不得仅凭 endpoint 名判断。`task_id` 移入 `dispatch_binding`，抓取共享同一
+root 的绝对 `task_budget`。唯一例外是人工真机 bring-up 的 `supervised_direct=true`：它要求空
+`dispatch_nonce`，但仍必须携带从 live Gateway snapshot 取得的 exact registry/executor identity 和有效预算。
+Hermes 与 catalog dispatch 必须保持该字段为 `false` 并使用 Gateway 生成的非空 nonce。
 
 **Goal 字段**
 
@@ -421,6 +429,7 @@ identity，不匹配时返回稳定 contract-version 错误，且不得仅凭 en
 | `target_query` | 运行时视觉文本查询，不是静态 `named_targets` 键 |
 | `timeout_sec` | per-entry 超时上限，受 `task_budget` 剩余预算约束 |
 | `expected_executor` | `DelegatedExecutorIdentity`，调用方声明的期望 executor identity |
+| `supervised_direct` | 仅人工真机测试 client 为 `true`；Hermes/catalog 固定为 `false` |
 | `mode` | `MODE_EXECUTE`、`MODE_PLAN_ONLY` 或 `MODE_OBSERVE_ONLY` |
 | `release_after_success` | 验证成功后是否由正式 executor 执行安全释放 |
 | `release_drop_height_m` | 非负时先下降到指定高度再开爪；负值在最终 lift 位释放 |
@@ -475,7 +484,8 @@ embodied_agent 对 Hermes 自然语言流程公开的高层 action，端点名�
 不接触 root lease nonce。首次 accepted 执行必须携带未消费的 `confirmation_token` 并绑定 task id；相同
 token/task id 的重试可幂等返回既有 active/terminal 记录，不同 task id 返回 `SKILL_REQUEST_ID_CONFLICT`。
 任一 step 失败、取消、timeout 或 unknown stop 状态后，不再执行下一步，也不自动创建新 token/task id。
-`robot-skill cancel-plan --task-id ID` 通过标准 `CancelGoal` 接口取消本 action 的 root goal。
+`robot-skill cancel-plan` 通过标准 `CancelGoal` 接口取消本 action 的 root goal；CLI 同时要求 task ID、展示过的
+plan/registry identity 和 expected step count，用于校验随后返回的终态。
 
 ### `ConfirmAgentPlan.srv`
 
@@ -483,6 +493,22 @@ token/task id 的重试可幂等返回既有 active/terminal 记录，不同 tas
 `task_budget_sec`；该值必须为有限正数且不超过 Gateway task budget。成功响应返回
 `confirmation_token`、规范化后的 `confirmed_task_budget_sec` 以及冻结的 `task_budget_started_at/deadline`。
 执行 action 必须复用该精确绝对预算，确认到执行之间的等待会真实消耗预算。
+
+### `PlaceObject.action`
+
+已持物释放和视觉确认接口，由 `manipulation_execution/placement_executor_node` 提供，默认路径
+`/manipulation/execute_place`。该 action 移动到配置的固定容器位，打开夹爪，将配置的验证关节（当前为 3 号）
+移动到验证位进行视觉验证，最后返回固定释放位。
+
+| 字段 | 说明 |
+| --- | --- |
+| `target_query` | 释放后用于视觉检测的物品名称，必填 |
+| `container_query` | 释放后用于视觉检测的指定容器名称，必填；不改变固定释放位 |
+| `release_status` | `NOT_RELEASED`、`RELEASED` 或 `UNKNOWN`；不代表已进入容器 |
+| `verification_status` | 二维分割包含验证的 `SUCCESS`、`FAILED`、`UNCERTAIN` 或 `NOT_RUN` |
+| `place_succeeded` | 仅夹爪确认打开且目标物品连续确认位于容器区域内时为 true |
+| `completed_phases` | 包括 `move_to_place`、`release`、`move_to_verify`、`verify_place` 和 `return_to_place` |
+| `debug_output_dir` | 当前固定放置证据目录；包含版本化 manifest、开爪 JointState、RGB、检测 mask、判定和最终结果，可由 `placement_replay` 离线重放 |
 
 ### `ArmReturnHome.action`
 
@@ -601,6 +627,7 @@ TaskCommand/SkillCommand validation 时必须提供完整期望 identity；Workf
 | `dispatch_binding` | `DispatchBinding`，提供完整期望 registry identity（`root_lease_nonce` 仅用于关联） |
 | `skill_name` | 待执行技能名 |
 | `target_name` | 命名目标 |
+| `container_name` | 指定容器；对放置技能是释放后的视觉检测 query |
 | `place_name` | 命名放置位 |
 | `motion_direction` | `string`，相对运动方向 |
 | `motion_distance` | `float32`，相对运动距离 |
@@ -761,6 +788,11 @@ IK/FK 验证的 `sensor_msgs/JointState`，网关直接规划到同一组机械�
 服务端本地输入或输出路径。
 请求级 prompt 的可用性由 named deployment 的真实能力决定；不支持时返回 `UNSUPPORTED_PROMPT`，不会
 静默忽略 prompt。
+
+### `PlayAudioFile.srv`
+
+播放端本机 WAV 文件服务，由 `voice_tts_service` 提供。请求必须传入播放服务所在机器上的绝对路径；
+响应返回 `success`、稳定 `error_code` 和可诊断消息。接口同步等待播放完成，不负责跨主机传输音频文件。
 
 ---
 

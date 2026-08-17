@@ -1,0 +1,4 @@
+0001-parameterize-target-detection.patch
+0002-add-batch-observation-output.patch
+0003-harden-missing-hole-recovery.patch
+0004-detect-whole-plane-hole-template.patch

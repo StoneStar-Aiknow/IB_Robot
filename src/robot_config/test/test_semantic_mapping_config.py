@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 import yaml
 
-from robot_config.loader import load_robot_config, load_robot_config_dict, validate_config
+from robot_config.loader import (
+    load_robot_config,
+    load_robot_config_dict,
+    validate_config,
+    validate_semantic_mapping_config,
+)
 
 CONFIG_PATH = Path(__file__).parents[1] / "config" / "robots" / "lekiwi_mapping.yaml"
 FIXTURE_PATH = Path(__file__).parents[2] / "semantic_mapping" / "test" / "perception_bundle_fixture.py"
@@ -57,6 +62,10 @@ def test_disabled_semantic_mapping_contract_is_preserved() -> None:
         "semantic_graspgen_grasps",
     ]
     assert config.perception_services.enabled_services == ()
+    assert config.semantic_mapping.label_refinement["enabled"] is False
+    assert config.semantic_mapping.lifecycle["association_max_size_ratio"] == 4.0
+    assert config.semantic_mapping.lifecycle["label_switch_confidence_margin"] == 0.05
+    assert "sky" in config.semantic_mapping.labels["excluded_labels"]
     assert config.semantic_mapping.migration["grounded_sam2_node"] == "compatibility"
 
 
@@ -65,7 +74,22 @@ def test_enabled_semantic_mapping_contract_loads_and_validates(tmp_path: Path) -
 
     assert config.semantic_mapping.enabled is True
     assert config.semantic_mapping.camera["peripheral"] == "realsense"
+    assert "sky" in config.semantic_mapping.labels["excluded_labels"]
     assert validate_config(config) == []
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        ("association_max_size_ratio", 0.5, "association_max_size_ratio must be >= 1.0"),
+        ("label_switch_confidence_margin", 1.1, "label_switch_confidence_margin must be in"),
+    ],
+)
+def test_association_tuning_contract_fails_closed(tmp_path: Path, key: str, value: float, expected: str) -> None:
+    config = _enabled_config(tmp_path)
+    config["semantic_mapping"]["lifecycle"][key] = value
+
+    assert any(expected in error for error in validate_semantic_mapping_config(config))
 
 
 @pytest.mark.parametrize(
@@ -88,6 +112,10 @@ def test_enabled_semantic_mapping_contract_loads_and_validates(tmp_path: Path) -
             "max_masks_per_batch must be <= 8",
         ),
         (
+            lambda config: config["semantic_mapping"]["filtering"].update({"max_object_distance_m": 0.0}),
+            "max_object_distance_m must be a finite number greater than zero",
+        ),
+        (
             lambda config: config["semantic_mapping"]["perception"]["semantic_roles"].update(
                 {"siglip2_image": "missing"}
             ),
@@ -104,6 +132,14 @@ def test_enabled_semantic_mapping_contract_loads_and_validates(tmp_path: Path) -
                 {"mapping_backend": "embedded", "allow_legacy_embedded": False}
             ),
             "allow_legacy_embedded must be true",
+        ),
+        (
+            lambda config: config["semantic_mapping"]["labels"].update({"min_confidence": 1.1}),
+            "labels.min_confidence must be in",
+        ),
+        (
+            lambda config: config["semantic_mapping"]["labels"].update({"excluded_labels": "sky"}),
+            "labels.excluded_labels must be a list",
         ),
         (
             lambda config: config["semantic_mapping"].update(

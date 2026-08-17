@@ -77,3 +77,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for captured in captured_warnings:
         print(f"warning: {captured.message}")
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

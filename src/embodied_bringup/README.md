@@ -78,6 +78,6 @@ plan/validate/confirm/execute。完整启动、回原位和关停流程见
 ## 已知限制
 
 - 当前具身闭环要求 `control_mode:=moveit_planning` 或名称中包含 `moveit` 的兼容控制模式。
-- `so101_handeye_realsense_grasp` 可通过显式 `pick_object` 技能从 Hermes 调用完整抓取闭环。
+- `lekiwi_handeye_realsense_grasp` 可通过显式 `pick_object` 技能从 Hermes 调用完整抓取闭环。
 - 真机端口、相机和手眼标定直接维护在该 robot YAML 中；本 launch 与 `robot-skill` 应使用同一个
   `robot_config` 名称，workspace 外部完整 YAML 才需要显式传 `config_path`。
