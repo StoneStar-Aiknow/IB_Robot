@@ -254,6 +254,9 @@ The current `ascend_310p` deployment:
 - Runs Vocos with CPU PyTorch.
 - Produces 24 kHz mono WAV PCM16.
 - Supports Chinese, Arabic numbers, and common Chinese/English punctuation.
+- Input normalization removes Markdown formatting and control characters. Emoji and other unspoken symbols are
+  removed when adjacent to punctuation, otherwise replaced with a period to retain a pause. Line breaks also become
+  periods.
 - Rejects ASCII English words explicitly.
 - Uses a fixed bundle prompt and does not support request-scoped voice cloning.
 
