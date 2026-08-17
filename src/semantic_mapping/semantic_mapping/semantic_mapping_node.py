@@ -172,6 +172,12 @@ class SemanticMappingNode(Node):
         self._run_pin = None
         for track in self._database.load():
             self._tracker.add_track(track)
+        # Persisted mapping-session stamps protect the loaded map from replayed
+        # observations, but they must not order a fresh tracking session: the
+        # offline map was built on a different clock. TrackState freshness is
+        # enforced by the node-clock age gate, and ordering by this run's
+        # live perception stamps and per-session track-state watermarks.
+        self._live_seen_ns: dict[str, int] = {}
         self._semantic_commit_watermark_ns = max(
             (track.last_seen_ns for track in self._tracker.tracks.values()), default=0
         )
@@ -957,6 +963,7 @@ class SemanticMappingNode(Node):
             matched_object_ids.add(track.object_id)
             self._database.upsert(track, observation)
             self._semantic_commit_watermark_ns = max(self._semantic_commit_watermark_ns, observation.stamp_ns)
+            self._live_seen_ns[track.object_id] = max(self._live_seen_ns.get(track.object_id, 0), observation.stamp_ns)
             return track
 
     def _accept_track_state_order_locked(self, state: TrackState, stamp_ns: int) -> bool:
@@ -964,11 +971,15 @@ class SemanticMappingNode(Node):
         if track is None:
             return False
         watermark_ns = self._track_state_watermarks_ns.get(state.object_id, 0)
+        # Loaded maps carry the mapping session's last_seen stamps on a foreign
+        # clock; only this run's live perception and track-state watermarks
+        # order incoming track states for a fresh tracking session.
+        live_seen_ns = self._live_seen_ns.get(state.object_id, 0)
         current_session = self._track_state_session_ids.get(state.object_id)
         retired_sessions = self._retired_track_state_sessions.setdefault(state.object_id, set())
         if state.session_id in retired_sessions:
             return False
-        if stamp_ns <= max(track.last_seen_ns, watermark_ns):
+        if stamp_ns <= max(live_seen_ns, watermark_ns):
             self._lifecycle.reset_move_candidate(state.object_id)
             return False
         if current_session is not None and state.session_id != current_session:

@@ -45,6 +45,7 @@ class TemplateTracker:
         scales: tuple[float, ...] = _DEFAULT_SCALES,
         scale_jump_limit: float = 1.35,
         template_refresh_score: float = 0.9,
+        min_area_ratio: float = 0.25,
     ):
         if not 0.0 < match_threshold < 1.0:
             raise ValueError("match_threshold must be in (0, 1)")
@@ -52,6 +53,7 @@ class TemplateTracker:
         self.scales = tuple(float(s) for s in scales)
         self.scale_jump_limit = float(scale_jump_limit)
         self.template_refresh_score = float(template_refresh_score)
+        self.min_area_ratio = float(min_area_ratio)
         self._template: np.ndarray | None = None
         self._template_scale = 1.0
         self._bbox: tuple[float, float, float, float] | None = None
@@ -95,6 +97,12 @@ class TemplateTracker:
         if best is None or best.match_score < self.match_threshold:
             return None
         if best.scale > self._template_scale * self.scale_jump_limit:
+            return None
+        # Guard against template collapse: a shrinking match that keeps a high
+        # NCC score on a tiny sliver of texture is a classic runaway lock.
+        assert self._template is not None
+        template_area = float(self._template.shape[0] * self._template.shape[1])
+        if best.area < self.min_area_ratio * template_area:
             return None
 
         self._bbox = self._clip_bbox(gray, best.bbox)

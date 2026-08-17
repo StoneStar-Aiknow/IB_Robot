@@ -38,7 +38,7 @@ def _camera_at(x, y):
     return matrix
 
 
-def _make_pipeline(**overrides):
+def _make_pipeline(expected_depth_m=None, **overrides):
     session = SingleTargetSession()
     session.start("obj-1", navigation_ready=True, map_ready=True)
     classifier_kwargs = {
@@ -56,7 +56,7 @@ def _make_pipeline(**overrides):
     )
     frame = _frame_with_target((480, 640), (CX, CY))
     pipeline.template.initialize(frame, (CX - 30, CY - 30, CX + 30, CY + 30))
-    pipeline.initialize_filter((1.5, -0.4))
+    pipeline.initialize_filter((1.5, -0.4), expected_depth_m=expected_depth_m)
     return pipeline
 
 
@@ -109,7 +109,7 @@ def test_missing_depth_produces_prediction_only_snapshot():
 
     assert snapshot is not None
     assert not snapshot.measured
-    assert snapshot.reason == "visual_update_miss"
+    assert snapshot.reason == "acquisition_miss"
     assert pipeline.current_state is SessionState.ACQUIRING
 
 
@@ -195,3 +195,44 @@ def test_predict_only_advances_filter_without_visual():
     assert not snapshot.measured
     assert snapshot.reason == "missing_depth_or_transform"
     assert snapshot.bbox is not None
+
+
+def test_first_measurement_depth_mismatch_blocks_confirmation():
+    """A template locked onto background must not confirm the session."""
+    pipeline = _make_pipeline(expected_depth_m=1.0)
+
+    def background_depth(shape):
+        return np.full(shape, int(6.0 / 0.001), dtype=np.uint16)
+
+    snapshot = _run_observation(pipeline, stamp=1.0, depth=background_depth)
+
+    assert snapshot is not None
+    assert not snapshot.measured
+    assert snapshot.reason == "confirmation_depth_mismatch"
+    assert pipeline.current_state is SessionState.ACQUIRING
+
+
+def test_first_measurement_within_depth_tolerance_confirms():
+    pipeline = _make_pipeline(expected_depth_m=1.0)
+
+    def near_depth(shape):
+        return np.full(shape, int(1.2 / 0.001), dtype=np.uint16)
+
+    snapshot = _run_observation(pipeline, stamp=1.0, depth=near_depth)
+
+    assert snapshot is not None and snapshot.measured
+    assert pipeline.current_state is SessionState.TRACKING
+
+
+def test_depth_jump_between_measurements_is_rejected():
+    pipeline = _make_pipeline()
+    assert _run_observation(pipeline, stamp=1.0).measured
+
+    def far_depth(shape):
+        return np.full(shape, int(5.0 / 0.001), dtype=np.uint16)
+
+    snapshot = _run_observation(pipeline, stamp=1.05, depth=far_depth)
+
+    assert snapshot is not None
+    assert not snapshot.measured
+    assert snapshot.reason == "depth_jump"

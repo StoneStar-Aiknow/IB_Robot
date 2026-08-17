@@ -45,6 +45,7 @@ def _node(track, now_ns=10_000_000_000):
         _lifecycle=OnlineLifecycleCoordinator(tracker, move_distance_m=0.4, move_confirmations=2),
         _track_state_persisted_ns={},
         _track_state_watermarks_ns={},
+        _live_seen_ns={},
         _track_state_session_ids={},
         _retired_track_state_sessions={},
         _semantic_commit_watermark_ns=0,
@@ -192,11 +193,36 @@ def test_track_state_cannot_roll_back_newer_semantic_observation():
         )
     )
     node = _node(track)
+    node._live_seen_ns[track.object_id] = 9_700_000_000
 
     SemanticMappingNode._track_state_callback(node, _track_state(track.object_id, 1.0))
 
     assert node._database.upserts == []
     assert np.allclose(track.position, [4.0, 0.0, 0.7])
+
+
+def test_loaded_offline_map_stamp_does_not_block_fresh_tracking_session():
+    """A map built on a foreign clock must accept a new session's track states."""
+    tracker = SemanticTracker()
+    track = tracker.update(
+        SemanticObservation(
+            label="banana",
+            confidence=0.9,
+            position=np.zeros(3),
+            size=np.ones(3),
+            point_count=20,
+            stamp_ns=20_000_000_000,
+        )
+    )
+    assert track.last_seen_ns == 20_000_000_000
+    node = _node(track)
+
+    SemanticMappingNode._track_state_callback(node, _track_state(track.object_id, 1.0))
+    SemanticMappingNode._track_state_callback(node, _track_state(track.object_id, 1.02, stamp_ns=9_600_000_000))
+
+    assert track.state == MOVED
+    assert np.allclose(track.position, [2.01, 2.0, 0.0])
+    assert len(node._database.upserts) == 1
 
 
 def test_track_state_confirmation_rejects_retired_session_samples():

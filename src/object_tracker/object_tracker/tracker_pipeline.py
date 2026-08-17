@@ -83,18 +83,29 @@ class TrackerPipeline:
         self._last_processed_stamp_s: float | None = None
         self._visual_failures = 0
         self._last_motion: MotionEstimate | None = None
+        self._expected_depth_m: float | None = None
+        self._last_depth_m: float | None = None
+        self._anchor_area_depth: float | None = None
 
     @property
     def current_state(self) -> SessionState | None:
         session = self.session.session
         return session.state if session else None
 
-    def initialize_filter(self, position_odom: tuple[float, float]) -> None:
-        """Seed the Kalman filter from the first accepted measurement."""
+    def initialize_filter(self, position_odom: tuple[float, float], expected_depth_m: float | None = None) -> None:
+        """Seed the Kalman filter from the acquisition prior.
+
+        ``expected_depth_m`` is the depth of the semantic-map projection used
+        for local confirmation; the first accepted measurement must agree
+        with it before the session may transition to tracking.
+        """
         self.filter = ConstantVelocityFilter(position_odom)
         self._last_measured_stamp_s = None
         self._last_processed_stamp_s = None
         self._visual_failures = 0
+        self._expected_depth_m = float(expected_depth_m) if expected_depth_m else None
+        self._last_depth_m = None
+        self._anchor_area_depth = None
 
     def process_observation(
         self,
@@ -116,8 +127,10 @@ class TrackerPipeline:
             return None
 
         params = depth_params if depth_params is not None else DepthParams()
-        searching = state == SessionState.SEARCHING
-        radius = self.search_radius_reacquire_px if searching else self.search_radius_px
+        # Acquisition and reacquisition both search wide: the semantic prior
+        # is an aggregate map position and the live target may sit a fraction
+        # of a meter away from it in the image.
+        radius = self.search_radius_reacquire_px if state != SessionState.TRACKING else self.search_radius_px
         visual = self.template.update(gray, search_radius_px=radius)
         measurement = None
         quality: dict[str, float] = {}
@@ -147,9 +160,19 @@ class TrackerPipeline:
 
         if measurement is None:
             self._visual_failures += 1
-            return self._predict_only(stamp_s, reason=self._failure_reason(searching))
+            return self._predict_only(stamp_s, reason=self._failure_reason(state != SessionState.TRACKING))
 
         position_odom, depth_info, visual = measurement
+        depth_rejection = self._depth_gate_reason(depth_info.depth_m)
+        if depth_rejection is not None:
+            self._visual_failures += 1
+            return self._predict_only(stamp_s, reason=depth_rejection, quality=quality)
+
+        scale_rejection = self._scale_consistency_reason(visual, depth_info.depth_m)
+        if scale_rejection is not None:
+            self._visual_failures += 1
+            return self._predict_only(stamp_s, reason=scale_rejection, quality=quality)
+
         sigma = max(
             self.base_position_sigma_m,
             self.depth_sigma_scale * depth_info.mad_m
@@ -159,7 +182,8 @@ class TrackerPipeline:
         covariance = np.diag([sigma * sigma, sigma * sigma])
         if self._last_measured_stamp_s is None:
             # The first confirmed measurement re-seeds the filter: the projected
-            # map position is only a coarse acquisition prior.
+            # map position is only a coarse acquisition prior. Depth agreement
+            # with the semantic prior has already been enforced above.
             self.filter = ConstantVelocityFilter(position_odom)
             update = FilterUpdate(True, 0.0, "first_measurement")
         else:
@@ -174,6 +198,9 @@ class TrackerPipeline:
 
         self._visual_failures = 0
         self._last_measured_stamp_s = stamp_s
+        self._last_depth_m = depth_info.depth_m
+        if self._anchor_area_depth is None:
+            self._anchor_area_depth = max(visual.area, 1.0) * depth_info.depth_m
         state = self._transition_after_measurement()
         estimate = self._classify_motion(
             stamp_s,
@@ -211,9 +238,9 @@ class TrackerPipeline:
             self.filter.predict(dt)
         state = self.current_state
         if state == SessionState.ACQUIRING:
-            if self._visual_failures > self.max_visual_failures:
-                self.session.stop(self._session_id, "local confirmation failed")
-                return None
+            # Local confirmation is bounded by the node's acquisition window,
+            # not by the per-failure limit: the target may not be visible yet.
+            pass
         elif state == SessionState.TRACKING and self._visual_failures >= self.max_visual_failures:
             self.session.begin_search(self._session_id, reason)
             state = SessionState.SEARCHING
@@ -237,6 +264,42 @@ class TrackerPipeline:
             quality=quality or {},
             reason=reason,
         )
+
+    def _scale_consistency_reason(self, visual, depth_m: float) -> str | None:
+        """Reject apparent-size changes that a rigid target cannot produce.
+
+        A real object keeps ``box_area * depth`` approximately constant while
+        the camera translates; a template drifting onto background texture
+        breaks that conservation and is rejected here.
+        """
+        if self._anchor_area_depth is None:
+            return None
+        expected_area = self._anchor_area_depth / max(depth_m, 0.05)
+        if expected_area <= 1.0:
+            return None
+        if not 0.3 * expected_area <= visual.area <= 3.0 * expected_area:
+            return "scale_inconsistency"
+        return None
+
+    def _depth_gate_reason(self, depth_m: float) -> str | None:
+        """Gate measurements whose depth disagrees with the confirmation prior or jumps.
+
+        The first measurement must land near the semantic-map projection depth,
+        otherwise the template locked onto background and the session must not
+        be confirmed. Later measurements are bounded relative to the last
+        accepted depth so a drifting box cannot teleport the target.
+        """
+        if self._last_measured_stamp_s is None:
+            if self._expected_depth_m is not None:
+                tolerance = max(0.35, 0.3 * self._expected_depth_m)
+                if abs(depth_m - self._expected_depth_m) > tolerance:
+                    return "confirmation_depth_mismatch"
+            return None
+        if self._last_depth_m is not None:
+            tolerance = max(0.6, 0.5 * self._last_depth_m)
+            if abs(depth_m - self._last_depth_m) > tolerance:
+                return "depth_jump"
+        return None
 
     def _transition_after_measurement(self) -> SessionState:
         state = self.current_state
@@ -271,8 +334,11 @@ class TrackerPipeline:
             return 0.0
         return stamp_s - previous
 
-    def _failure_reason(self, searching: bool) -> str:
-        return "visual_reacquisition_miss" if searching else "visual_update_miss"
+    def _failure_reason(self, not_tracking: bool) -> str:
+        state = self.current_state
+        if state == SessionState.ACQUIRING:
+            return "acquisition_miss"
+        return "visual_reacquisition_miss" if not_tracking else "visual_update_miss"
 
     @property
     def _session_id(self) -> str:

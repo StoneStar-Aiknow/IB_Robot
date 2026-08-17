@@ -83,6 +83,9 @@ class TargetTrackerNode(LifecycleNode):
         self._robot_angular_speed = 0.0
         self._pending_target: dict | None = None
         self._acquisition_attempts = 0
+        self._reacquisition_attempts = 0
+        self._last_reacquisition_s: float | None = None
+        self._last_session_state: SessionState | None = None
         self._last_bbox: tuple[float, float, float, float] | None = None
         self._last_depth_m: float | None = None
         self._service_group = ReentrantCallbackGroup()
@@ -144,35 +147,44 @@ class TargetTrackerNode(LifecycleNode):
         return TransitionCallbackReturn.SUCCESS
 
     def on_activate(self, state):
-        rgb_sub = message_filters.Subscriber(
-            self, Image, str(self.get_parameter("rgb_topic").value), qos_profile=qos_profile_sensor_data
-        )
-        depth_sub = message_filters.Subscriber(
-            self, Image, str(self.get_parameter("aligned_depth_topic").value), qos_profile=qos_profile_sensor_data
-        )
-        self._synchronizer = message_filters.ApproximateTimeSynchronizer(
-            [rgb_sub, depth_sub],
-            queue_size=int(self.get_parameter("queue_size").value),
-            slop=float(self.get_parameter("sync_slop_sec").value),
-        )
-        self._synchronizer.registerCallback(self._synced_frame)
-        info_sub = self.create_subscription(
-            CameraInfo,
-            str(self.get_parameter("camera_info_topic").value),
-            self._camera_info_callback,
-            10,
-            qos_profile=qos_profile_sensor_data,
-            callback_group=self._sensor_group,
-        )
-        odom_sub = self.create_subscription(
-            Odometry,
-            str(self.get_parameter("odometry_topic").value),
-            self._odometry_callback,
-            10,
-            callback_group=self._sensor_group,
-        )
-        self._subs = [rgb_sub, depth_sub, info_sub, odom_sub]
-        return super().on_activate(state)
+        try:
+            self.get_logger().info("on_activate: creating sensor subscriptions")
+            rgb_sub = message_filters.Subscriber(
+                self, Image, str(self.get_parameter("rgb_topic").value), qos_profile=qos_profile_sensor_data
+            )
+            depth_sub = message_filters.Subscriber(
+                self, Image, str(self.get_parameter("aligned_depth_topic").value), qos_profile=qos_profile_sensor_data
+            )
+            self._synchronizer = message_filters.ApproximateTimeSynchronizer(
+                [rgb_sub, depth_sub],
+                queue_size=int(self.get_parameter("queue_size").value),
+                slop=float(self.get_parameter("sync_slop_sec").value),
+            )
+            self._synchronizer.registerCallback(self._synced_frame)
+            info_sub = self.create_subscription(
+                CameraInfo,
+                str(self.get_parameter("camera_info_topic").value),
+                self._camera_info_callback,
+                qos_profile=qos_profile_sensor_data,
+                callback_group=self._sensor_group,
+            )
+            odom_sub = self.create_subscription(
+                Odometry,
+                str(self.get_parameter("odometry_topic").value),
+                self._odometry_callback,
+                10,
+                callback_group=self._sensor_group,
+            )
+            self._subs = [rgb_sub, depth_sub, info_sub, odom_sub]
+            result = super().on_activate(state)
+            self.get_logger().info("on_activate: success")
+            return result
+        except Exception as error:  # noqa: BLE001 - surface transition failures in logs
+            self.get_logger().error(f"on_activate failed: {error}")
+            import traceback
+
+            self.get_logger().error(traceback.format_exc())
+            return TransitionCallbackReturn.FAILURE
 
     def on_deactivate(self, state):
         self._subs = []
@@ -271,6 +283,9 @@ class TargetTrackerNode(LifecycleNode):
         )
         self._pending_target = target
         self._acquisition_attempts = 0
+        self._reacquisition_attempts = 0
+        self._last_reacquisition_s = None
+        self._last_session_state = None
         self._last_bbox = None
         self._last_depth_m = None
 
@@ -373,7 +388,7 @@ class TargetTrackerNode(LifecycleNode):
         odom_frame = str(self.get_parameter("odom_frame").value)
         try:
             camera_to_odom = _transform_to_matrix(
-                self._tf_buffer.lookup_transform(odom_frame, optical_frame, stamp, timeout=Duration(seconds=0.05))
+                self._tf_buffer.lookup_transform(odom_frame, optical_frame, stamp, timeout=Duration(seconds=0.15))
             )
         except TransformException as error:
             self.get_logger().warn(f"camera-to-odom transform unavailable: {error}", throttle_duration_sec=5.0)
@@ -390,9 +405,39 @@ class TargetTrackerNode(LifecycleNode):
             return
 
         if self._pending_target is not None:
-            if not self._try_initialize(pipeline, gray, intrinsics, stamp, optical_frame, camera_to_odom):
-                return
-            self._pending_target = None
+            # While the session is ACQUIRING, re-project the semantic prior and
+            # re-initialize the template every frame: the target may not be
+            # visible yet, and the confirmation depth gate below rejects
+            # template locks onto background. Local confirmation requires a
+            # currently projectable prior — a stale template from an earlier
+            # frame must not confirm against a stale depth expectation.
+            if session.state == SessionState.ACQUIRING:
+                if not self._try_initialize(pipeline, gray, intrinsics, stamp, optical_frame, camera_to_odom):
+                    return
+            elif session.state == SessionState.SEARCHING and self._reacquisition_attempts < int(
+                self.get_parameter("max_reacquisition_attempts").value
+            ):
+                # Bounded, paced semantic reacquisition: fall back to the map
+                # prior instead of chasing a collapsed template. Depth from the
+                # last confirmed measurement bounds the reacquisition gate: a
+                # brief visual loss cannot double the target's range.
+                stamp_s = stamp.nanoseconds / 1e9
+                if self._last_reacquisition_s is None or stamp_s - self._last_reacquisition_s >= 1.0:
+                    self._reacquisition_attempts += 1
+                    self._last_reacquisition_s = stamp_s
+                    self.get_logger().info(
+                        f"visual reacquisition attempt {self._reacquisition_attempts} from semantic prior"
+                    )
+                    self._try_initialize(
+                        pipeline,
+                        gray,
+                        intrinsics,
+                        stamp,
+                        optical_frame,
+                        camera_to_odom,
+                        reacquisition=True,
+                        expected_depth_m=self._last_depth_m,
+                    )
 
         snapshot = pipeline.process_observation(
             stamp_s=stamp.nanoseconds / 1e9,
@@ -412,11 +457,21 @@ class TargetTrackerNode(LifecycleNode):
         )
         if snapshot is None:
             return
+        session_now = self._sessions.session
+        if (
+            session_now is not None
+            and session_now.state == SessionState.TRACKING
+            and self._last_session_state != SessionState.TRACKING
+        ):
+            self.get_logger().info(f"local identity confirmed for {session_now.object_id}; tracking started")
+            self._reacquisition_attempts = 0
+        if session_now is not None:
+            self._last_session_state = session_now.state
         if snapshot.bbox is not None:
             self._last_bbox = snapshot.bbox
         if snapshot.depth_m is not None:
             self._last_depth_m = snapshot.depth_m
-        self._publish_snapshot(snapshot, self._sessions.session)
+        self._publish_snapshot(snapshot, session_now)
 
     def _try_initialize(
         self,
@@ -426,6 +481,9 @@ class TargetTrackerNode(LifecycleNode):
         stamp,
         optical_frame: str,
         camera_to_odom: np.ndarray,
+        *,
+        reacquisition: bool = False,
+        expected_depth_m: float | None = None,
     ) -> bool:
         assert self._pending_target is not None
         self._acquisition_attempts += 1
@@ -440,7 +498,7 @@ class TargetTrackerNode(LifecycleNode):
         map_frame = str(self.get_parameter("map_frame").value)
         try:
             camera_to_map = self._tf_buffer.lookup_transform(
-                optical_frame, map_frame, stamp, timeout=Duration(seconds=0.05)
+                optical_frame, map_frame, stamp, timeout=Duration(seconds=0.15)
             )
         except TransformException as error:
             self.get_logger().warn(
@@ -477,9 +535,12 @@ class TargetTrackerNode(LifecycleNode):
         if not pipeline.template.initialize(gray, bbox):
             return False
         odom_homogeneous = camera_to_odom @ np.asarray([*point, 1.0])
-        pipeline.initialize_filter((float(odom_homogeneous[0]), float(odom_homogeneous[1])))
-        self.get_logger().info(
-            f"local confirmation initialized for {target['label']} at pixel ({u:.0f},{v:.0f}) depth {point[2]:.2f} m"
+        # Initial acquisition trusts the map prior's depth; reacquisition is
+        # bounded by the last confirmed measurement's depth instead.
+        depth_prior = expected_depth_m if reacquisition else float(point[2])
+        pipeline.initialize_filter(
+            (float(odom_homogeneous[0]), float(odom_homogeneous[1])),
+            expected_depth_m=depth_prior,
         )
         return True
 
