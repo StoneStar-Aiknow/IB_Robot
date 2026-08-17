@@ -66,3 +66,12 @@ source .shrc_local && colcon build --symlink-install --merge-install --packages-
 ```bash
 source .shrc_local && colcon build --symlink-install --merge-install --packages-select robot_config && source install/setup.zsh && python3 -c "import lerobot; print('OK')"
 ```
+
+## Issue: Link-time ABI / undefined symbol errors against ROS libraries
+
+If a colcon link error, `undefined symbol`, or ABI mismatch against a ROS library only
+reproduces on one distro (usually openEuler), it is the same class of problem as the
+launch-time ROS package version mismatch. Follow the hard rule in AGENTS.md
+("跨发行版 ROS 包版本一致性") and the playbook in
+[ibrobot-launch/references/troubleshooting.md](../../ibrobot-launch/references/troubleshooting.md)
+before adjusting build flags, link order, or source code.

@@ -98,6 +98,36 @@ source .shrc_local && <your_command>
 环境变量修复：正确做法是加载 `ibrobot-env` skill 按其模式处理；在 git worktree 中则加载
 `ibrobot-worktree-env`。
 
+### 跨发行版 ROS 包版本一致性（硬性规则）
+
+遇到 ROS 运行时错误且只在 Ubuntu 或只在 openEuler 一侧复现时（典型信号：
+`spawner: error: unrecognized arguments`、`--activate-as-group` 不被接受、ros2 二进制
+段错误、链接期 ABI/`undefined symbol` 报错、CLI flag 或服务接口行为不一致），
+**必须先比对两侧同名 `ros-humble-*` 包版本，再决定是否改代码**：
+
+- Ubuntu（deb）：`dpkg-query -W -f='${Package} ${Version}\n' 'ros-humble-*'`
+- openEuler（rpm）：`rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE}\n' 'ros-humble-*'`
+
+若两侧版本不一致，**禁止在代码里向低版本对齐作为兜底**（先例见 #67 / #105 / #187：
+`controller_manager` spawner 的 `--activate-as-group` 兼容性当时以代码降级临时收尾，
+后续同类问题必须走环境升级路径）。正确处置：
+
+1. 在 openEuler 侧卸载全部 ROS 包并重装：
+   ```bash
+   sudo dnf remove 'ros-humble-*'
+   ./scripts/setup.sh   # 内部调用 scripts/install_ros.sh
+   ```
+2. 升级完成后**再次**比对两侧同名包版本，确认一致（或 openEuler 严格更新）。
+3. 若升级后版本仍不一致（openEuler 仓库尚未同步 Ubuntu 上游版本），**不得**回退到
+   代码兜底，而是由用户向 openEuler ROS 包维护者提交 issue/PR 请求版本同步，并附上：
+   - 不一致的包名与两侧版本号（粘贴 dpkg / rpm 原始输出）
+   - 具体错误日志（如 `spawner: error: unrecognized arguments: ...` 整段及前后文）
+   - Ubuntu 侧对应的上游版本与 changelog 链接（packages.ubuntu.com / ROS index）
+   - 对 IB_Robot 的影响（哪条 launch / 哪个节点 / 哪个控制器失败）
+
+详细排查清单与样例日志见
+[`ibrobot-launch` troubleshooting](.agents/skills/ibrobot-launch/references/troubleshooting.md)。
+
 ### libs/lerobot 修改规则
 
 `libs/lerobot` 是 git submodule，通过 `third_party/patches/lerobot/` 的 patch 栈管理。
